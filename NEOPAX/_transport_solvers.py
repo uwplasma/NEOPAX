@@ -1066,6 +1066,14 @@ def _exact_stage_transpose_solve_compact_hook(vector_field: Callable):
     return solve_fn if callable(solve_fn) else None
 
 
+def _exact_stage_transpose_low_rank_factors_hook(vector_field: Callable):
+    owner = getattr(vector_field, "__self__", None)
+    if owner is None:
+        return None
+    factors_fn = getattr(owner, "exact_stage_transpose_low_rank_factors", None)
+    return factors_fn if callable(factors_fn) else None
+
+
 def _flat_rhs_with_lagged_response_factory(unravel, vector_field, args, kwargs, project_flat=None):
     species = _extract_species_from_args(args)
     _, eval_fn = _lagged_response_hooks(vector_field)
@@ -3243,6 +3251,7 @@ class _RadauAcceptedStepPhysicsContext:
     flat_rhs_flux_state_pullback_generic: Callable[[Any, Any, Any, Any], Any] | None = None
     flat_rhs_joint_generic_state_pullback: Callable[[Any, Any, Any, Any], Any] | None = None
     exact_stage_transpose_solve_compact: Callable[..., Any] | None = None
+    exact_stage_transpose_low_rank_factors: Callable[..., Any] | None = None
     lagged_response_reuse_mode: str = "retry_only"
     lagged_response_reuse_rtol: Any = 5.0e-2
     lagged_response_reuse_atol: Any = 1.0e-8
@@ -9059,6 +9068,121 @@ def _radau_radial_blocks_to_stage_stack(
     return jnp.concatenate(pieces, axis=1)
 
 
+def _radau_stage_to_radial_permutation_and_block_dim(
+    kernel_context: _RadauAcceptedStepKernelContext,
+):
+    """Permutation and block size for radial-block stage systems."""
+    layout = _radau_infer_radial_block_layout(kernel_context)
+    system_size = int(kernel_context.num_stages) * int(kernel_context.state_dim)
+    stage_indices = jnp.arange(system_size, dtype=kernel_context.dtype).reshape(
+        (int(kernel_context.num_stages), int(kernel_context.state_dim))
+    )
+    radial_permutation = _radau_stage_stack_to_radial_blocks(
+        kernel_context,
+        stage_indices,
+    ).reshape((-1,)).astype(jnp.int32)
+    radial_block_dim = int(kernel_context.num_stages) * int(layout.variables_per_cell)
+    return layout, radial_permutation, radial_block_dim
+
+
+def _radau_stage_matrix_to_radial_blocks(
+    kernel_context: _RadauAcceptedStepKernelContext,
+    matrix,
+):
+    """Convert a stage-major matrix into radial block-pair form."""
+    layout, radial_permutation, radial_block_dim = _radau_stage_to_radial_permutation_and_block_dim(
+        kernel_context
+    )
+    radial_matrix = matrix[radial_permutation[:, None], radial_permutation[None, :]]
+    radial_blocks = radial_matrix.reshape(
+        (
+            int(layout.n_radial),
+            radial_block_dim,
+            int(layout.n_radial),
+            radial_block_dim,
+        )
+    )
+    radial_blocks = jnp.transpose(radial_blocks, (0, 2, 1, 3))
+    return layout, radial_permutation, radial_block_dim, radial_matrix, radial_blocks
+
+
+def _radau_radial_block_tridiagonal_parts(radial_blocks):
+    """Extract lower/diagonal/upper block bands from radial block-pair form."""
+    n_radial = int(radial_blocks.shape[0])
+    block_indices = jnp.arange(n_radial, dtype=jnp.int32)
+    block_diagonal = radial_blocks[block_indices, block_indices]
+    zero_block = jnp.zeros_like(block_diagonal[:1])
+    block_lower = jnp.concatenate(
+        [zero_block, radial_blocks[block_indices[1:], block_indices[:-1]]],
+        axis=0,
+    )
+    block_upper = jnp.concatenate(
+        [radial_blocks[block_indices[:-1], block_indices[1:]], zero_block],
+        axis=0,
+    )
+    return block_lower, block_diagonal, block_upper
+
+
+def _radau_radial_off_tridiagonal_matrix(radial_blocks):
+    """Return the off-block-tridiagonal part in radial matrix ordering."""
+    n_radial = int(radial_blocks.shape[0])
+    row_ids = jnp.arange(n_radial, dtype=jnp.int32)[:, None]
+    col_ids = jnp.arange(n_radial, dtype=jnp.int32)[None, :]
+    off_tridiagonal_mask = jnp.abs(row_ids - col_ids) > 1
+    off_tridiagonal_blocks = jnp.where(
+        off_tridiagonal_mask[:, :, None, None],
+        radial_blocks,
+        jnp.zeros_like(radial_blocks),
+    )
+    return jnp.transpose(off_tridiagonal_blocks, (0, 2, 1, 3)).reshape(
+        (n_radial * int(radial_blocks.shape[2]), n_radial * int(radial_blocks.shape[3]))
+    )
+
+
+def _radau_solve_radial_block_tridiagonal_plus_low_rank(
+    kernel_context: _RadauAcceptedStepKernelContext,
+    radial_permutation,
+    radial_block_dim: int,
+    block_lower,
+    block_diagonal,
+    block_upper,
+    u_rank,
+    v_rank,
+    rhs,
+    *,
+    batched: bool = False,
+):
+    """Solve ``(B + U V.T) x = -rhs`` in radial ordering via Woodbury."""
+    rank = int(u_rank.shape[1])
+    rhs_arr = jnp.asarray(rhs, dtype=kernel_context.dtype)
+    system_size = int(kernel_context.num_stages) * int(kernel_context.state_dim)
+    rhs_rows = rhs_arr.reshape((-1, system_size)) if batched else rhs_arr.reshape((1, -1))
+    radial_rhs_rows = -rhs_rows[:, radial_permutation]
+
+    def _block_solve_columns(rhs_columns):
+        rhs_blocks = jnp.asarray(rhs_columns, dtype=kernel_context.dtype).reshape(
+            (-1, radial_block_dim, rhs_columns.shape[-1])
+        )
+        solution_blocks = _radau_block_tridiagonal_solve(
+            block_lower,
+            block_diagonal,
+            block_upper,
+            rhs_blocks,
+        )
+        return solution_blocks.reshape((-1, rhs_blocks.shape[-1]))
+
+    solved_u = _block_solve_columns(u_rank)
+    small_matrix = jnp.eye(rank, dtype=kernel_context.dtype) + v_rank.T @ solved_u
+    rhs_columns = radial_rhs_rows.T
+    base = _block_solve_columns(rhs_columns)
+    small_rhs = v_rank.T @ base
+    correction = jax.scipy.linalg.solve(small_matrix, small_rhs, assume_a="gen")
+    radial_solution_columns = base - solved_u @ correction
+    radial_solution_rows = radial_solution_columns.T
+    solution_rows = jnp.zeros_like(rhs_rows).at[:, radial_permutation].set(radial_solution_rows)
+    return solution_rows if batched else solution_rows[0]
+
+
 def _radau_solve_exact_stage_residual_transpose_block(
     kernel_context: _RadauAcceptedStepKernelContext,
     physics_context: _RadauAcceptedStepPhysicsContext,
@@ -9108,35 +9232,10 @@ def _radau_solve_exact_stage_residual_transpose_woodbury(
         primal_result,
         lagged_response,
     )
-    layout = _radau_infer_radial_block_layout(kernel_context)
-    stage_indices = jnp.arange(
-        int(kernel_context.num_stages) * int(kernel_context.state_dim),
-        dtype=kernel_context.dtype,
-    ).reshape((int(kernel_context.num_stages), int(kernel_context.state_dim)))
-    radial_permutation = _radau_stage_stack_to_radial_blocks(
-        kernel_context,
-        stage_indices,
-    ).reshape((-1,)).astype(jnp.int32)
-    radial_matrix = matrix[radial_permutation[:, None], radial_permutation[None, :]]
-    radial_block_dim = int(kernel_context.num_stages) * int(layout.variables_per_cell)
-    radial_blocks = radial_matrix.reshape(
-        (
-            int(layout.n_radial),
-            radial_block_dim,
-            int(layout.n_radial),
-            radial_block_dim,
-        )
+    _layout, radial_permutation, radial_block_dim, _radial_matrix, radial_blocks = (
+        _radau_stage_matrix_to_radial_blocks(kernel_context, matrix)
     )
-    radial_blocks = jnp.transpose(radial_blocks, (0, 2, 1, 3))
-    row_ids = jnp.arange(int(layout.n_radial), dtype=jnp.int32)[:, None]
-    col_ids = jnp.arange(int(layout.n_radial), dtype=jnp.int32)[None, :]
-    off_tridiagonal_mask = jnp.abs(row_ids - col_ids) > 1
-    off_tridiagonal_blocks = jnp.where(
-        off_tridiagonal_mask[:, :, None, None],
-        radial_blocks,
-        jnp.zeros_like(radial_blocks),
-    )
-    off_tridiagonal_matrix = jnp.transpose(off_tridiagonal_blocks, (0, 2, 1, 3)).reshape(radial_matrix.shape)
+    off_tridiagonal_matrix = _radau_radial_off_tridiagonal_matrix(radial_blocks)
     off_tridiagonal_u, off_tridiagonal_svals, off_tridiagonal_vh = jnp.linalg.svd(
         off_tridiagonal_matrix,
         full_matrices=False,
@@ -9146,16 +9245,8 @@ def _radau_solve_exact_stage_residual_transpose_woodbury(
     v_rank = off_tridiagonal_vh[:rank, :].T
 
     transpose_radial_blocks = jnp.swapaxes(jnp.swapaxes(radial_blocks, 0, 1), -1, -2)
-    block_indices = jnp.arange(int(layout.n_radial), dtype=jnp.int32)
-    block_diagonal = transpose_radial_blocks[block_indices, block_indices]
-    zero_block = jnp.zeros_like(block_diagonal[:1])
-    block_lower = jnp.concatenate(
-        [zero_block, transpose_radial_blocks[block_indices[1:], block_indices[:-1]]],
-        axis=0,
-    )
-    block_upper = jnp.concatenate(
-        [transpose_radial_blocks[block_indices[:-1], block_indices[1:]], zero_block],
-        axis=0,
+    block_lower, block_diagonal, block_upper = _radau_radial_block_tridiagonal_parts(
+        transpose_radial_blocks
     )
 
     # The residual decomposition above is for the primal radial matrix. The
@@ -9163,35 +9254,18 @@ def _radau_solve_exact_stage_residual_transpose_woodbury(
     u_transpose = v_rank
     v_transpose = u_rank
 
-    rhs_arr = jnp.asarray(rhs, dtype=kernel_context.dtype)
-    if batched:
-        rhs_rows = rhs_arr.reshape((-1, int(kernel_context.num_stages) * int(kernel_context.state_dim)))
-    else:
-        rhs_rows = rhs_arr.reshape((1, -1))
-    radial_rhs_rows = -rhs_rows[:, radial_permutation]
-
-    def _block_solve_columns(rhs_columns):
-        rhs_blocks = jnp.asarray(rhs_columns, dtype=kernel_context.dtype).reshape(
-            (int(layout.n_radial), radial_block_dim, -1)
-        )
-        solution_blocks = _radau_block_tridiagonal_solve(
-            block_lower,
-            block_diagonal,
-            block_upper,
-            rhs_blocks,
-        )
-        return solution_blocks.reshape((-1, rhs_blocks.shape[-1]))
-
-    solved_u = _block_solve_columns(u_transpose)
-    small_matrix = jnp.eye(rank, dtype=kernel_context.dtype) + v_transpose.T @ solved_u
-    rhs_columns = radial_rhs_rows.T
-    base = _block_solve_columns(rhs_columns)
-    small_rhs = v_transpose.T @ base
-    correction = jax.scipy.linalg.solve(small_matrix, small_rhs, assume_a="gen")
-    radial_solution_columns = base - solved_u @ correction
-    radial_solution_rows = radial_solution_columns.T
-    solution_rows = jnp.zeros_like(rhs_rows).at[:, radial_permutation].set(radial_solution_rows)
-    return solution_rows if batched else solution_rows[0]
+    return _radau_solve_radial_block_tridiagonal_plus_low_rank(
+        kernel_context,
+        radial_permutation,
+        radial_block_dim,
+        block_lower,
+        block_diagonal,
+        block_upper,
+        u_transpose,
+        v_transpose,
+        rhs,
+        batched=batched,
+    )
 
 
 def _radau_solve_exact_stage_residual_transpose_woodbury_matvec(
@@ -9228,36 +9302,10 @@ def _radau_solve_exact_stage_residual_transpose_woodbury_matvec(
     ).reshape((system_size, system_size))
     transpose_matrix = transpose_columns_as_rows.T
 
-    layout = _radau_infer_radial_block_layout(kernel_context)
-    stage_indices = jnp.arange(system_size, dtype=kernel_context.dtype).reshape(
-        (int(kernel_context.num_stages), int(kernel_context.state_dim))
+    _layout, radial_permutation, radial_block_dim, _radial_matrix, radial_blocks = (
+        _radau_stage_matrix_to_radial_blocks(kernel_context, transpose_matrix)
     )
-    radial_permutation = _radau_stage_stack_to_radial_blocks(
-        kernel_context,
-        stage_indices,
-    ).reshape((-1,)).astype(jnp.int32)
-    radial_matrix = transpose_matrix[radial_permutation[:, None], radial_permutation[None, :]]
-    radial_block_dim = int(kernel_context.num_stages) * int(layout.variables_per_cell)
-    radial_blocks = radial_matrix.reshape(
-        (
-            int(layout.n_radial),
-            radial_block_dim,
-            int(layout.n_radial),
-            radial_block_dim,
-        )
-    )
-    radial_blocks = jnp.transpose(radial_blocks, (0, 2, 1, 3))
-    row_ids = jnp.arange(int(layout.n_radial), dtype=jnp.int32)[:, None]
-    col_ids = jnp.arange(int(layout.n_radial), dtype=jnp.int32)[None, :]
-    off_tridiagonal_mask = jnp.abs(row_ids - col_ids) > 1
-    off_tridiagonal_blocks = jnp.where(
-        off_tridiagonal_mask[:, :, None, None],
-        radial_blocks,
-        jnp.zeros_like(radial_blocks),
-    )
-    off_tridiagonal_matrix = jnp.transpose(off_tridiagonal_blocks, (0, 2, 1, 3)).reshape(
-        radial_matrix.shape
-    )
+    off_tridiagonal_matrix = _radau_radial_off_tridiagonal_matrix(radial_blocks)
     off_tridiagonal_u, off_tridiagonal_svals, off_tridiagonal_vh = jnp.linalg.svd(
         off_tridiagonal_matrix,
         full_matrices=False,
@@ -9266,47 +9314,74 @@ def _radau_solve_exact_stage_residual_transpose_woodbury_matvec(
     u_rank = off_tridiagonal_u[:, :rank] * off_tridiagonal_svals[:rank][None, :]
     v_rank = off_tridiagonal_vh[:rank, :].T
 
-    block_indices = jnp.arange(int(layout.n_radial), dtype=jnp.int32)
-    block_diagonal = radial_blocks[block_indices, block_indices]
-    zero_block = jnp.zeros_like(block_diagonal[:1])
-    block_lower = jnp.concatenate(
-        [zero_block, radial_blocks[block_indices[1:], block_indices[:-1]]],
-        axis=0,
+    block_lower, block_diagonal, block_upper = _radau_radial_block_tridiagonal_parts(radial_blocks)
+    return _radau_solve_radial_block_tridiagonal_plus_low_rank(
+        kernel_context,
+        radial_permutation,
+        radial_block_dim,
+        block_lower,
+        block_diagonal,
+        block_upper,
+        u_rank,
+        v_rank,
+        rhs,
+        batched=batched,
     )
-    block_upper = jnp.concatenate(
-        [radial_blocks[block_indices[:-1], block_indices[1:]], zero_block],
-        axis=0,
+
+
+def _radau_solve_exact_stage_residual_transpose_er_coeff_woodbury_compact(
+    kernel_context: _RadauAcceptedStepKernelContext,
+    physics_context: _RadauAcceptedStepPhysicsContext,
+    carry_in: _RadauAcceptedStepCarry,
+    primal_result: _RadauAcceptedStepAttemptResult,
+    lagged_response,
+    *,
+    rhs,
+    batched: bool = False,
+):
+    """Production target: block-tridiagonal solve plus analytic Er-coeff correction.
+
+    The solver side intentionally only consumes already-built compact factors.
+    The equation system must provide the block-tridiagonal base bands and the
+    Er-ambipolar-coefficient low-rank factors. Keeping construction outside
+    this generic solver prevents this mode from falling back to dense matrix
+    materialization or in-JIT SVD.
+    """
+    factors_fn = physics_context.exact_stage_transpose_low_rank_factors
+    if factors_fn is None:
+        raise ValueError(
+            "reverse_stage_adjoint_solve_mode='woodbury_er_coeff_compact' requires "
+            "the equation system to implement exact_stage_transpose_low_rank_factors(...). "
+            "The dense/SVD Woodbury validation modes are intentionally not used here."
+        )
+    (
+        radial_permutation,
+        radial_block_dim,
+        block_lower,
+        block_diagonal,
+        block_upper,
+        u_rank,
+        v_rank,
+    ) = factors_fn(
+        kernel_context,
+        physics_context,
+        carry_in,
+        primal_result,
+        lagged_response,
+        rank=int(getattr(physics_context, "reverse_stage_adjoint_woodbury_rank", 24)),
     )
-
-    rhs_arr = jnp.asarray(rhs, dtype=kernel_context.dtype)
-    if batched:
-        rhs_rows = rhs_arr.reshape((-1, system_size))
-    else:
-        rhs_rows = rhs_arr.reshape((1, -1))
-    radial_rhs_rows = -rhs_rows[:, radial_permutation]
-
-    def _block_solve_columns(rhs_columns):
-        rhs_blocks = jnp.asarray(rhs_columns, dtype=kernel_context.dtype).reshape(
-            (int(layout.n_radial), radial_block_dim, -1)
-        )
-        solution_blocks = _radau_block_tridiagonal_solve(
-            block_lower,
-            block_diagonal,
-            block_upper,
-            rhs_blocks,
-        )
-        return solution_blocks.reshape((-1, rhs_blocks.shape[-1]))
-
-    solved_u = _block_solve_columns(u_rank)
-    small_matrix = jnp.eye(rank, dtype=kernel_context.dtype) + v_rank.T @ solved_u
-    rhs_columns = radial_rhs_rows.T
-    base = _block_solve_columns(rhs_columns)
-    small_rhs = v_rank.T @ base
-    correction = jax.scipy.linalg.solve(small_matrix, small_rhs, assume_a="gen")
-    radial_solution_columns = base - solved_u @ correction
-    radial_solution_rows = radial_solution_columns.T
-    solution_rows = jnp.zeros_like(rhs_rows).at[:, radial_permutation].set(radial_solution_rows)
-    return solution_rows if batched else solution_rows[0]
+    return _radau_solve_radial_block_tridiagonal_plus_low_rank(
+        kernel_context,
+        radial_permutation,
+        int(radial_block_dim),
+        block_lower,
+        block_diagonal,
+        block_upper,
+        u_rank,
+        v_rank,
+        rhs,
+        batched=batched,
+    )
 
 
 def _radau_solve_exact_stage_residual_transpose_compact(
@@ -9393,6 +9468,16 @@ def _radau_solve_exact_stage_residual_transpose(
             rhs=rhs,
             batched=False,
         )
+    if mode == "woodbury_er_coeff_compact":
+        return _radau_solve_exact_stage_residual_transpose_er_coeff_woodbury_compact(
+            kernel_context,
+            physics_context,
+            carry_in,
+            primal_result,
+            lagged_response,
+            rhs=rhs,
+            batched=False,
+        )
     if mode in {"gmres", "bicgstab"}:
         return _radau_solve_exact_stage_residual_transpose_iterative(
             kernel_context,
@@ -9466,6 +9551,16 @@ def _radau_solve_exact_stage_residual_transpose_batched(
         )
     if mode == "woodbury_matvec_compact":
         return _radau_solve_exact_stage_residual_transpose_woodbury_matvec(
+            kernel_context,
+            physics_context,
+            carry_in,
+            primal_result,
+            lagged_response,
+            rhs=rhs_arr,
+            batched=True,
+        )
+    if mode == "woodbury_er_coeff_compact":
+        return _radau_solve_exact_stage_residual_transpose_er_coeff_woodbury_compact(
             kernel_context,
             physics_context,
             carry_in,
@@ -14848,10 +14943,9 @@ def _build_prepared_radau_accepted_rollout(
         temperature_floor=temperature_floor,
     )
     dtype = flat_state0.dtype
-    density0 = getattr(state, "density", None)
-    pressure0 = getattr(state, "pressure", None)
-    er0 = getattr(state, "Er", None)
-    if density0 is not None and pressure0 is not None and er0 is not None:
+    packed_state0 = _pack_transport_state_arrays(state, species)
+    if isinstance(packed_state0, tuple) and len(packed_state0) == 3:
+        density0, pressure0, er0 = packed_state0
         density_size = int(np.prod(density0.shape))
         pressure_size = int(np.prod(pressure0.shape))
         er_size = int(np.prod(er0.shape))
@@ -15050,6 +15144,7 @@ def _build_prepared_radau_accepted_rollout(
         component="joint_generic",
     )
     exact_stage_transpose_solve_compact = _exact_stage_transpose_solve_compact_hook(vector_field)
+    exact_stage_transpose_low_rank_factors = _exact_stage_transpose_low_rank_factors_hook(vector_field)
     use_transport_lagged_response = rhs_mode in {"lagged_transport_response", "lagged_response"}
     reverse_stage_adjoint_solve_mode = str(
         getattr(solver, "reverse_stage_adjoint_solve_mode", "structured")
@@ -15059,6 +15154,15 @@ def _build_prepared_radau_accepted_rollout(
             "reverse_stage_adjoint_solve_mode='exact_block_compact' requires the equation system "
             "to implement solve_exact_stage_transpose_compact(...). The dense block fallback is "
             "disabled by design."
+        )
+    if (
+        reverse_stage_adjoint_solve_mode == "woodbury_er_coeff_compact"
+        and exact_stage_transpose_low_rank_factors is None
+    ):
+        raise ValueError(
+            "reverse_stage_adjoint_solve_mode='woodbury_er_coeff_compact' requires the equation system "
+            "to implement exact_stage_transpose_low_rank_factors(...). This mode is reserved for "
+            "the non-dense Er-ambipolar-coefficient Woodbury path."
         )
     if use_transport_lagged_response and build_lagged_response_raw is None:
         raise ValueError(
@@ -15217,6 +15321,7 @@ def _build_prepared_radau_accepted_rollout(
         flat_rhs_flux_state_pullback_generic=flat_rhs_flux_state_pullback_generic,
         flat_rhs_joint_generic_state_pullback=flat_rhs_joint_generic_state_pullback,
         exact_stage_transpose_solve_compact=exact_stage_transpose_solve_compact,
+        exact_stage_transpose_low_rank_factors=exact_stage_transpose_low_rank_factors,
         lagged_response_reuse_mode=str(getattr(solver, "lagged_response_reuse_mode", "retry_only")).strip().lower(),
         lagged_response_reuse_rtol=jnp.asarray(getattr(solver, "lagged_response_reuse_rtol", 5.0e-2), dtype=dtype),
         lagged_response_reuse_atol=jnp.asarray(getattr(solver, "lagged_response_reuse_atol", 1.0e-8), dtype=dtype),
@@ -15470,6 +15575,7 @@ class RADAUSolver(_RadauSolverConfig):
             component="flux",
         )
         exact_stage_transpose_solve_compact = _exact_stage_transpose_solve_compact_hook(vector_field)
+        exact_stage_transpose_low_rank_factors = _exact_stage_transpose_low_rank_factors_hook(vector_field)
         rhs_mode = str(getattr(self, "rhs_mode", "black_box")).strip().lower()
         reverse_stage_adjoint_solve_mode = str(
             getattr(self, "reverse_stage_adjoint_solve_mode", "structured")
@@ -15479,6 +15585,15 @@ class RADAUSolver(_RadauSolverConfig):
                 "reverse_stage_adjoint_solve_mode='exact_block_compact' requires the equation system "
                 "to implement solve_exact_stage_transpose_compact(...). The dense block fallback is "
                 "disabled by design."
+            )
+        if (
+            reverse_stage_adjoint_solve_mode == "woodbury_er_coeff_compact"
+            and exact_stage_transpose_low_rank_factors is None
+        ):
+            raise ValueError(
+                "reverse_stage_adjoint_solve_mode='woodbury_er_coeff_compact' requires the equation system "
+                "to implement exact_stage_transpose_low_rank_factors(...). This mode is reserved for "
+                "the non-dense Er-ambipolar-coefficient Woodbury path."
             )
         if rhs_mode not in {"black_box", "lagged_linear_state", "lagged_transport_response", "lagged_response"}:
             raise ValueError(
@@ -15655,6 +15770,7 @@ class RADAUSolver(_RadauSolverConfig):
             flat_rhs_direct_er_ambi_charge_flux_state_pullback=flat_rhs_direct_er_ambi_charge_flux_state_pullback,
             flat_rhs_flux_state_pullback=flat_rhs_flux_state_pullback,
             exact_stage_transpose_solve_compact=exact_stage_transpose_solve_compact,
+            exact_stage_transpose_low_rank_factors=exact_stage_transpose_low_rank_factors,
             lagged_response_reuse_mode=str(getattr(self, "lagged_response_reuse_mode", "retry_only")).strip().lower(),
             lagged_response_reuse_rtol=jnp.asarray(getattr(self, "lagged_response_reuse_rtol", 5.0e-2), dtype=dtype),
             lagged_response_reuse_atol=jnp.asarray(getattr(self, "lagged_response_reuse_atol", 1.0e-8), dtype=dtype),

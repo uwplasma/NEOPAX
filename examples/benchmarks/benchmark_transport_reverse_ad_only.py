@@ -5229,6 +5229,7 @@ def main() -> None:
             "exact_block_compact",
             "woodbury_compact",
             "woodbury_matvec_compact",
+            "woodbury_er_coeff_compact",
         ),
         default="structured",
         help=(
@@ -5239,7 +5240,8 @@ def main() -> None:
             "'exact_block_compact' requires a non-dense exact compact solve hook; "
             "'woodbury_compact' uses the experimental rank-truncated block-Woodbury solve; "
             "'woodbury_matvec_compact' builds the same Woodbury system from the compact "
-            "transpose matvec instead of jacfwd."
+            "transpose matvec instead of jacfwd; 'woodbury_er_coeff_compact' is the "
+            "production target that requires analytic Er-coefficient low-rank factors."
         ),
     )
     parser.add_argument(

@@ -250,6 +250,42 @@ The implementation target for `solve_exact_stage_transpose_compact(...)` is:
 This is the analogue of the compact VMEC/NTX block solve: not one objective at
 a time, not Krylov iteration, and not dense global materialization.
 
+The current code now separates the Woodbury solve machinery from how the
+low-rank factors are obtained:
+
+- `_radau_solve_radial_block_tridiagonal_plus_low_rank(...)` performs the
+  block-tridiagonal solve and rank-`k` Woodbury correction for one or many RHS
+  columns.
+- The existing `woodbury_compact` and `woodbury_matvec_compact` modes still
+  obtain `U,V` from dense/SVD validation paths. They are correctness oracles,
+  not the final optimization path.
+- `woodbury_er_coeff_compact` is reserved as the production target mode. It
+  requires an equation-system `exact_stage_transpose_low_rank_factors(...)`
+  hook and refuses to fall back to the dense/SVD validation paths.
+- The remaining production step is to build the Er-ambipolar-coefficient
+  low-rank factors directly, avoiding both dense global matrix construction and
+  in-JIT SVD.
+
+The production hook must return both pieces:
+
+```text
+B = exact block-tridiagonal radial stage-transpose base
+U,V = analytic low-rank Er-ambipolar-coefficient off-band correction
+```
+
+The analytic `U,V` part is constrained by the `ntss_like_midpoint` formula
+above. The still-missing implementation is the non-dense assembly of the
+block-tridiagonal base `B`; using the current dense/SVD or full-basis matvec
+paths to obtain `B` would reproduce the slow compile/runtime behavior we are
+trying to remove.
+
+Packed-layout note: the reverse prepared-rollout path must use component sizes
+from the packed solver state, not from the public full state. With quasi-neutral
+packing, electron density is removed and Er remains in the flat state. Using the
+full public density size mislabels the packed Er tail as density/extra structure
+and makes radial block diagnostics misleading. This was corrected before
+continuing the compact block-factor work.
+
 Initial infrastructure now exists in `_transport_solvers.py`:
 
 - `_radau_block_tridiagonal_solve(...)` solves block-tridiagonal systems with
@@ -307,3 +343,90 @@ Before promotion, the new mode must be compared against:
 
 The new mode is only acceptable if transport objective derivatives match the
 current good reverse/FD values at the same level as the `bicgstab` reference.
+
+## Local Stage Diagnostic: wHe Realtime Geometry
+
+Command shape:
+
+```text
+benchmark_transport_reverse_ad_only.py
+  --config examples/benchmarks/Solve_Transport_equations_wHe_radau_ntx_exact_lagged_runtime_vmec_realtime_geometry_benchmark.toml
+  --accepted-step-limit 1
+  --reverse-segment-length 1
+  --reverse-stage-adjoint-solve-mode bicgstab
+  --local-transpose-diagnostic-accepted-step 0
+  --stage-matvec-diagnostic
+```
+
+Current result after applying the projected-state pullback correction:
+
+```text
+compact_l2=1.028406e+00
+dense_l2=1.028406e+00
+compact_vs_dense_diff_l2=1.842066e-16
+compact_vs_dense_rel_err=1.791186e-16
+generic_vjp_rel_err=1.870954e-16
+explicit_rhs_state_rel_err=2.512159e-16
+split_rhs_state_rel_err=4.742437e-16
+```
+
+This confirms that the compact local transpose and explicit split pullbacks now
+match the dense/generic reference path to roundoff for the `wHe` realtime
+geometry diagnostic. The previous large mismatch in this case was caused by
+skipping the transpose of the state projection when building compact flat-state
+RHS pullbacks.
+
+The radial off-band attribution for this case is:
+
+```text
+state_dim=408
+block_count=51
+block_dim=56
+off_tridiagonal_l2=1.740960e-01
+off_tridiagonal_rel_l2=3.200945e-03
+off_tridiagonal_max_abs=8.184844e-03
+density_off_l2=0.000000e+00
+pressure_off_l2=0.000000e+00
+er_off_l2=1.740715e-01
+```
+
+The Er subterm split shows that the off-band coupling comes from the Er
+ambipolar coefficient path, not density, pressure, Er diffusion, or the
+charge-flux term:
+
+```text
+diffusion_off_l2=4.205719e-20
+ambipolar_off_l2=1.740715e-01
+coeff_off_l2=1.740715e-01
+charge_flux_off_l2=0.000000e+00
+```
+
+For the benchmark cases using `Er_permittivity_mode = "ntss_like_midpoint"`,
+this coefficient path is global because the Er ambipolar RHS uses one midpoint
+ion-density scalar:
+
+```text
+ni_mid = sum_a n_a[r_mid]
+coeffG = 95780 * B0_mid^2 / (ni_mid * psfactor_mid)
+Er_rhs_ambipolar = -Er_relax * coeffG * charge_flux * 1e-20
+```
+
+Therefore all Er radial rows depend on the same midpoint-density scalar. That
+is the mathematical source of the off-block-tridiagonal radial coupling and
+also why a low-rank Woodbury correction is the right compact direct solve
+structure.
+
+Low-rank Woodbury solve diagnostics for the same one-step system:
+
+```text
+rank12_rel=2.730600e-06
+rank16_rel=3.417019e-08
+rank24_rel=1.103071e-09
+rank32_rel=8.940431e-10
+rank48_rel=4.622310e-10
+```
+
+For this case, rank 24 is already effectively at the useful accuracy floor of
+the diagnostic. Higher rank improves only marginally because the remaining
+error is dominated by numerical conditioning/roundoff rather than missing
+low-rank modes.
