@@ -50,7 +50,7 @@ from ._state import (
     safe_density,
     safe_temperature,
 )
-from ._database import D11_POSITIVE_FLOOR
+from ._database import D11_POSITIVE_FLOOR, Monoenergetic
 from ._source_models import assemble_pressure_source_components, sum_source_components
 from ._model_api import (
     ModelCapabilities,
@@ -1855,6 +1855,29 @@ def _build_ntx_field_channels(rho: jax.Array, er_tilde: jax.Array, channels: dic
     return er, es, er_to_ertilde
 
 
+def _ntx_runtime_scan_to_neopax_monoenergetic(scan, *, a_b):
+    rho = jnp.asarray(scan.rho, dtype=jnp.float64)
+    nu_v = jnp.asarray(scan.nu_v, dtype=jnp.float64)
+    er = jnp.asarray(scan.Er, dtype=jnp.float64)
+    drds = jnp.asarray(scan.drds, dtype=jnp.float64)
+    d11 = jnp.asarray(scan.D11, dtype=jnp.float64) * drds[:, None, None] ** 2
+    d13 = jnp.asarray(scan.D13, dtype=jnp.float64) * drds[:, None, None]
+    d33 = jnp.asarray(scan.D33, dtype=jnp.float64) * nu_v[None, :, None]
+    a_b_value = jnp.asarray(a_b, dtype=jnp.float64)
+    radius = a_b_value * rho[:, None]
+    er_list = jnp.log10(jnp.maximum(1.0e-8, jnp.abs(er) / radius))
+    d11 = jnp.where(d11 > D11_POSITIVE_FLOOR, d11, D11_POSITIVE_FLOOR)
+    return Monoenergetic(
+        a_b=a_b_value,
+        rho=rho,
+        nu_log=jnp.log10(nu_v),
+        Er_list=er_list,
+        D11_log=jnp.log10(d11),
+        D13=d13,
+        D33=d33,
+    )
+
+
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True, eq=False)
 class NTXRuntimeScanChannels:
@@ -2289,7 +2312,7 @@ class NTXRuntimeScanTransportModel(TransportFluxModelBase):
             f"Er_tilde={int(er_tilde.shape[0])} "
             f"grid=({grid.n_theta},{grid.n_zeta},{grid.n_xi}) backend={str(self.surface_backend).strip().lower()}"
         )
-        return ntx.to_neopax_monoenergetic(scan, a_b=float(channels["a_b"]))
+        return _ntx_runtime_scan_to_neopax_monoenergetic(scan, a_b=float(channels["a_b"]))
 
     def with_static_channels(self) -> "NTXRuntimeScanTransportModel":
         if self.channels is not None:

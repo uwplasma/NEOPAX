@@ -30,6 +30,7 @@ from NEOPAX._transport_flux_models import (
     NTXExactLijRuntimeTransportModel,
     NTXRuntimeScanChannels,
     NTXRuntimeScanTransportModel,
+    _ntx_runtime_scan_to_neopax_monoenergetic,
     build_ntx_exact_lij_runtime_transport_model,
     build_ntx_runtime_scan_channels,
     build_ntx_runtime_scan_transport_model,
@@ -385,6 +386,32 @@ def test_build_ntx_runtime_scan_transport_model_can_skip_prebuild():
     assert model.database is None
     assert model.vmec_file == "wout.nc"
     assert model.boozer_file == "boozmn.nc"
+
+
+def test_ntx_runtime_scan_database_keeps_radius_local_er_axis():
+    scan = types.SimpleNamespace(
+        rho=jnp.asarray([0.25, 0.5]),
+        nu_v=jnp.asarray([1.0e-4, 1.0e-3]),
+        Er=jnp.asarray(
+            [
+                [1.0e-6, 2.0e-6],
+                [3.0e-6, 6.0e-6],
+            ]
+        ),
+        drds=jnp.asarray([2.0, 4.0]),
+        D11=jnp.ones((2, 2, 2)),
+        D13=2.0 * jnp.ones((2, 2, 2)),
+        D33=3.0 * jnp.ones((2, 2, 2)),
+    )
+
+    database = _ntx_runtime_scan_to_neopax_monoenergetic(scan, a_b=2.0)
+
+    expected_er_list = jnp.log10(jnp.maximum(1.0e-8, jnp.abs(scan.Er) / (2.0 * scan.rho[:, None])))
+    assert jnp.allclose(database.Er_list, expected_er_list)
+    assert not jnp.allclose(database.Er_list[1], database.Er_list[0] + jnp.log10(scan.rho[0] / scan.rho[1]))
+    assert jnp.allclose(10.0 ** database.D11_log, scan.D11 * scan.drds[:, None, None] ** 2)
+    assert jnp.allclose(database.D13, scan.D13 * scan.drds[:, None, None])
+    assert jnp.allclose(database.D33, scan.D33 * scan.nu_v[None, :, None])
 
 
 def test_build_ntx_exact_lij_runtime_transport_model_can_skip_preload():
