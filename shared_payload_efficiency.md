@@ -1,5 +1,93 @@
 # Shared Payload Efficiency
 
+## 2026-08-13 Exact `block` vs `bicgstab` 16-Step Timing And Values
+
+Run configuration:
+
+```text
+examples/benchmarks/Solve_Transport_equations_noHe_radau_ntx_exact_lagged_runtime_vmec_realtime_benchmark.toml
+--reverse-parameter-mode profiles_plus_realtime_geometry
+--reverse-geometry-parameter RBC:1:0,ZBS:1:0
+--realtime-geometry-gradient-path reverse_payload
+--objective all
+--accepted-step-limit 16
+--reverse-segment-length 4
+--reverse-rhs-transpose-mode explicit_ntx_interpolated
+--reverse-step-bwd-mode reduced_cotangent
+--full-transport-shared-payload-smoke
+```
+
+Both runs used the same schedule and support counts:
+
+```text
+segments=4, segment_length=4, residual_count=16, parameter_count=8
+support_reuse=4, support_rebuild=12
+```
+
+Timing comparison:
+
+| Component | `block` elapsed_s | `bicgstab` elapsed_s | `block - bicgstab` |
+| --- | ---: | ---: | ---: |
+| realtime geometry runtime build | `217.353` | `217.606` | `-0.253` |
+| realtime geometry solver components | `31.484` | `31.609` | `-0.125` |
+| support reverse profile-state vjp | `31.286` | `31.208` | `+0.078` |
+| support reverse initial carry vjp | `22.740` | `22.504` | `+0.236` |
+| support reverse realized-schedule vjp forward | `431.152` | `430.285` | `+0.867` |
+| support reverse segmented cotangent sweep | `1758.204` | `2014.368` | `-256.164` |
+| support reverse initial-cache support pullback | `643.112` | `643.382` | `-0.270` |
+| support reverse reduced carry bars expanded | `0.171` | `0.166` | `+0.005` |
+| support reverse initial state pullback | `81.139` | `80.978` | `+0.161` |
+| initial-Er root boundary compact pullback | `54.356` | `51.509` | `+2.847` |
+| support reverse profile parameter pullback | `0.196` | `0.204` | `-0.008` |
+| objective-table final VMEC parameter pullback | `13.697` | `13.853` | `-0.156` |
+| total run | `3453.605` | `3705.434` | `-251.829` |
+
+Per-segment timing:
+
+| Segment | `block` elapsed_s | `bicgstab` elapsed_s | Support reuse/rebuild |
+| --- | ---: | ---: | --- |
+| `4/4` | `985.473` | `1196.844` | `0 / 4` |
+| `3/4` | `111.377` | `126.113` | `2 / 2` |
+| `2/4` | `330.747` | `345.568` | `2 / 2` |
+| `1/4` | `330.607` | `345.841` | `0 / 4` |
+
+Notes:
+
+- `block` was faster than `bicgstab` by `251.829 s` total, about `6.8%`.
+- The segmented cotangent sweep was faster by `256.164 s`, about `12.7%`.
+- The first executed reverse segment still dominates because it includes a large XLA compile. The slow-compile alarm was about `4m04s` for `block` and `5m55s` for `bicgstab`.
+- The large `support reverse initial-cache support pullback` cost is essentially unchanged (`643 s`) and is outside the stage-adjoint solve mode choice.
+- Observed RAM monitor trace for the `bicgstab` run sat close to `47%` during the reverse work and dropped to about `10%` when the process finished. This is not a code-instrumented peak. The currently tested Woodbury paths did not improve this in practice: they used similar memory and were slower, because they still go through dense/SVD validation machinery. Therefore this RAM trace is evidence that the present exact-stage reverse family is heavy, not evidence that the current Woodbury implementation is already better.
+
+Derivative comparison:
+
+Across the two printed optimization API residual/Jacobian tables:
+
+```text
+common entries compared: 112
+max absolute difference: 1.659860e-06
+max relative difference: 1.150239e-04
+```
+
+The worst relative differences are on tiny `smooth_root_proxy` derivatives near
+machine zero. The largest meaningful absolute differences are:
+
+| Entry | `block` | `bicgstab` | Abs diff | Rel diff |
+| --- | ---: | ---: | ---: | ---: |
+| `d transport:softmax_Er / dtemperature_shape_power` | `3.5362624276528196e+00` | `3.5362607677924291e+00` | `1.659860e-06` | `4.693831e-07` |
+| `d transport:softmax_Er / dn0` | `-4.7372071028091174e+00` | `-4.7372059445518024e+00` | `1.158257e-06` | `2.445022e-07` |
+| `d transport:Er2_volume_average / dtemperature_shape_power` | `5.4946436756445031e+01` | `5.4946438108771410e+01` | `1.352326e-06` | `2.461170e-08` |
+| `d transport:Er2_volume_average / dn0` | `-6.1442935693371233e+01` | `-6.1442936636985735e+01` | `9.436145e-07` | `1.535762e-08` |
+| `d transport:softmax_Er / dT0` | `3.9104307061781909e+00` | `3.9104300296804584e+00` | `6.764977e-07` | `1.729982e-07` |
+
+Conclusion:
+
+- `block` and `bicgstab` are numerically equivalent for this benchmark at the
+  printed precision.
+- This makes `block` a valid exact reference for checking future compact direct-solve paths.
+- `block` is only modestly faster, and still not acceptable as the final compact
+  optimization path because it materializes dense stage Jacobians.
+
 ## Current Reverse Bottleneck
 
 The full-transport shared-payload reverse path is correctness-sensitive at the
@@ -22,6 +110,53 @@ The current good production-like benchmark uses:
 ```
 
 This path is the reference for the current reverse AD vs frozen FD tables.
+
+## 2026-08-14 Memory Monitor Note
+
+The latest attached monitor screenshot for the 30 GB machine shows RAM usage
+approximately flat near half of total memory during the 16-step shared-payload
+reverse run. Record this as:
+
+```text
+observed_ram_monitor_fraction ~= 0.5
+observed_ram_monitor_total_gb = 30
+observed_ram_monitor_used_gb ~= 15
+```
+
+This is a visual monitor estimate, not an instrumented peak RSS or GPU memory
+measurement. It should be used only for rough comparison with other runs on the
+same machine.
+
+The pasted log attached to this memory screenshot was a 16-step `block` run:
+
+```text
+--reverse-stage-adjoint-solve-mode block
+--accepted-step-limit 16
+--reverse-segment-length 4
+support reverse segmented cotangent sweep elapsed_s=1421.110
+total elapsed_s=3116.764
+```
+
+The command for the current Woodbury implementation, using rank 24, is:
+
+```bash
+python ./examples/benchmarks/benchmark_transport_reverse_ad_only.py \
+  --config ./examples/benchmarks/Solve_Transport_equations_noHe_radau_ntx_exact_lagged_runtime_vmec_realtime_benchmark.toml \
+  --reverse-parameter-mode profiles_plus_realtime_geometry \
+  --reverse-geometry-parameter RBC:1:0,ZBS:1:0 \
+  --realtime-geometry-gradient-path reverse_payload \
+  --objective all \
+  --accepted-step-limit 16 \
+  --radau-jacobian-reuse-mode legacy \
+  --timing-mode jit-warm \
+  --reverse-segment-length 4 \
+  --reverse-stage-adjoint-solve-mode woodbury_matvec_compact \
+  --reverse-stage-adjoint-woodbury-rank 24 \
+  --reverse-rhs-transpose-mode explicit_ntx_interpolated \
+  --reverse-step-bwd-mode reduced_cotangent \
+  --initial-Er-root-ad jax_selected_root \
+  --full-transport-shared-payload-smoke
+```
 
 ## Existing Solve Modes
 

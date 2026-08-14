@@ -2834,3 +2834,79 @@ If support bars remain exactly zero after finite objective primals:
    the selected NTX exact VMEC backend.
 3. Verify the reduced reverse pass produces nonzero stage residual cotangents
    for the objectives that should depend on NTX fluxes.
+
+## 2026-08-13: Woodbury compact reverse timing regression
+
+Latest tested command:
+
+```bash
+python ./examples/benchmarks/benchmark_transport_reverse_ad_only.py \
+  --config ./examples/benchmarks/Solve_Transport_equations_noHe_radau_ntx_exact_lagged_runtime_vmec_realtime_benchmark.toml \
+  --reverse-parameter-mode profiles_plus_realtime_geometry \
+  --reverse-geometry-parameter RBC:1:0,ZBS:1:0 \
+  --realtime-geometry-gradient-path reverse_payload \
+  --objective all \
+  --accepted-step-limit 16 \
+  --radau-jacobian-reuse-mode legacy \
+  --timing-mode jit-warm \
+  --reverse-segment-length 4 \
+  --reverse-stage-adjoint-solve-mode woodbury_er_coeff_compact \
+  --reverse-stage-adjoint-woodbury-rank 24 \
+  --reverse-rhs-transpose-mode explicit_ntx_interpolated \
+  --reverse-step-bwd-mode reduced_cotangent \
+  --initial-Er-root-ad jax_selected_root \
+  --full-transport-shared-payload-smoke
+```
+
+Observed timing regression:
+
+- `jit__radau_segment_reduced_cotangent_bwd_batched_with_support_call` compile alarm: `4m43.160605913s`
+- `support reverse segment 4/4 ready elapsed_s=1091.012`
+- `support reverse segment 3/4 ready elapsed_s=112.323`
+- `support reverse segment 2/4 ready elapsed_s=332.719`
+- `support reverse segment 1/4 ready elapsed_s=332.688`
+- `support reverse segmented cotangent sweep ready elapsed_s=1868.744`
+- `support reverse initial-cache support pullback ready elapsed_s=685.209`
+- full run elapsed: `4135.134 s`
+
+Observed correctness regression:
+
+- `transport:softmax_Er` profile derivatives do not match the saved 16-step reference.
+- The Woodbury compact lane should not be treated as a valid timing or memory improvement path in its current form.
+
+Comparison against the saved pre-Woodbury 16-step reduced-cotangent baseline:
+
+- baseline mode:
+
+  ```text
+  reverse_stage_adjoint_solve_mode=bicgstab
+  reverse_rhs_transpose_mode=explicit_ntx_interpolated
+  reverse_step_bwd_mode=reduced_cotangent
+  ```
+
+- representative saved mixed-case timings:
+  - `reverse_compile_plus_execute_s = 9.634324e+02`
+  - improved follow-up: `reverse_compile_plus_execute_s = 9.363880e+02`
+  - saved realtime support segmented sweep: `1509.917 s`
+
+Conclusion:
+
+- Changing the inner stage-adjoint solver to `woodbury_er_coeff_compact` was the wrong optimization target for this benchmark.
+- The dominant cost is still the compiled segment reverse kernel, especially the first compiled segment/rebuild-heavy path.
+- The current Woodbury compact path is slower, uses more memory in the observed run, and changes derivatives.
+
+Next timing plan:
+
+1. Return to the known-good reverse baseline:
+   - `--reverse-stage-adjoint-solve-mode bicgstab`
+   - `--reverse-rhs-transpose-mode explicit_ntx_interpolated`
+   - `--reverse-step-bwd-mode reduced_cotangent`
+2. Stop optimizing the inner stage-adjoint solver first.
+3. Target `_radau_segment_reduced_cotangent_bwd_batched_with_support_call` directly.
+4. Split rebuild-heavy and reuse-heavy accepted-step backward work into separate thinner compiled paths instead of carrying both in one large kernel.
+5. Keep objective batching, but move any objective-independent/support-accumulation work out of the hottest compiled segment kernel where possible.
+6. Judge each change against:
+   - segmented sweep time vs `1509.917 s` baseline,
+   - first segment compile/execution time,
+   - XLA peak allocation / `preallocated-temp`,
+   - derivative agreement with the saved reverse reference.

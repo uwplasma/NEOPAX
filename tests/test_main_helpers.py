@@ -537,6 +537,18 @@ def test_ntx_runtime_scan_transport_model_delegates_face_and_local_evaluators(mo
         calls.append(("face", self.database, state, face_state, kwargs))
         return "face_eval"
 
+    def fake_build_lagged(self, state, **kwargs):
+        calls.append(("build_lagged", self.database, state, kwargs))
+        return "face_lagged_response"
+
+    def fake_eval_lagged(self, state, lagged_response, **kwargs):
+        calls.append(("eval_lagged", self.database, state, lagged_response, kwargs))
+        return "lagged_face_fluxes"
+
+    def fake_pullback_lagged(self, state, lagged_response_bar, **kwargs):
+        calls.append(("pullback_lagged", self.database, state, lagged_response_bar, kwargs))
+        return "state_bar"
+
     monkeypatch.setattr(
         "NEOPAX._transport_flux_models.NTXDatabaseTransportModel.build_local_particle_flux_evaluator",
         fake_build_local,
@@ -545,11 +557,29 @@ def test_ntx_runtime_scan_transport_model_delegates_face_and_local_evaluators(mo
         "NEOPAX._transport_flux_models.NTXDatabaseTransportModel.evaluate_face_fluxes",
         fake_face,
     )
+    monkeypatch.setattr(
+        "NEOPAX._transport_flux_models.NTXDatabaseTransportModel.build_lagged_response",
+        fake_build_lagged,
+    )
+    monkeypatch.setattr(
+        "NEOPAX._transport_flux_models.NTXDatabaseTransportModel.evaluate_with_lagged_response",
+        fake_eval_lagged,
+    )
+    monkeypatch.setattr(
+        "NEOPAX._transport_flux_models.NTXDatabaseTransportModel.pullback_build_lagged_response",
+        fake_pullback_lagged,
+    )
 
     assert model.build_local_particle_flux_evaluator("state") == "local_eval"
     assert model.evaluate_face_fluxes("state", "face_state", marker=True) == "face_eval"
+    assert model.build_lagged_response("state", marker=True) == "face_lagged_response"
+    assert model.evaluate_with_lagged_response("state", "response", marker=True) == "lagged_face_fluxes"
+    assert model.pullback_build_lagged_response("state", "response_bar", marker=True) == "state_bar"
     assert calls[0] == ("local", "runtime_db", "state")
     assert calls[1] == ("face", "runtime_db", "state", "face_state", {"marker": True})
+    assert calls[2] == ("build_lagged", "runtime_db", "state", {"marker": True})
+    assert calls[3] == ("eval_lagged", "runtime_db", "state", "response", {"marker": True})
+    assert calls[4] == ("pullback_lagged", "runtime_db", "state", "response_bar", {"marker": True})
 
 
 def test_ntx_runtime_scan_transport_model_with_scan_inputs_preserves_channels_for_same_rho():

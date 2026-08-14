@@ -2368,6 +2368,19 @@ class NTXRuntimeScanTransportModel(TransportFluxModelBase):
     def evaluate_face_fluxes(self, state, face_state, **kwargs):
         return self._database_model().evaluate_face_fluxes(state, face_state, **kwargs)
 
+    def build_lagged_response(self, state, **kwargs):
+        return self._database_model().build_lagged_response(state, **kwargs)
+
+    def evaluate_with_lagged_response(self, state, lagged_response, **kwargs):
+        return self._database_model().evaluate_with_lagged_response(state, lagged_response, **kwargs)
+
+    def pullback_build_lagged_response(self, state, lagged_response_bar, **kwargs):
+        return self._database_model().pullback_build_lagged_response(
+            state,
+            lagged_response_bar,
+            **kwargs,
+        )
+
     def with_runtime_database(self) -> "NTXRuntimeScanTransportModel":
         if self.database is not None:
             return self
@@ -11051,8 +11064,19 @@ class FluxesRFileTransportModel(TransportFluxModelBase):
                 tangent_flux,
             )
 
-        current_basis = self._spectrax_fd_face_basis(state)
-        delta_basis = current_basis - lagged_response.reference_basis
+        # Freeze the lagged response in NEOPAX state-space around the reference
+        # state: use the basis map tangent at the reference rather than
+        # reevaluating the nonlinear basis at the current Newton iterate.
+        delta_state = jax.tree_util.tree_map(
+            lambda current, reference: current - reference,
+            state,
+            lagged_response.reference_state,
+        )
+        delta_basis = jax.jvp(
+            self._spectrax_fd_face_basis,
+            (lagged_response.reference_state,),
+            (delta_state,),
+        )[1]
         perturb_present = lagged_response.perturb_present[:, None, :]
         safe_delta = jnp.where(
             perturb_present[:, 0, :],
