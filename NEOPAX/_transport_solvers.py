@@ -1074,6 +1074,235 @@ def _exact_stage_transpose_low_rank_factors_hook(vector_field: Callable):
     return factors_fn if callable(factors_fn) else None
 
 
+def _ntss_midpoint_er_coeff_low_rank_factors_hook(
+    unpack_flat,
+    vector_field: Callable,
+    species: Any,
+):
+    """Return an analytic Er-coefficient low-rank factor hook when available.
+
+    For the NTSS-like midpoint permittivity model, the fixed-flux Er RHS depends
+    on all densities only through one midpoint scalar ``ni_mid``. That makes the
+    nonlocal part of the Radau stage transpose a low-rank correction with rank
+    bounded by the number of Radau stages.
+    """
+    owner = getattr(vector_field, "__self__", None)
+    if owner is None or not hasattr(owner, "_resolve_equations"):
+        return None
+    if not hasattr(owner, "_prepare_working_state") or not hasattr(owner, "_shared_flux_bc_kwargs"):
+        return None
+    shared_flux_model = getattr(owner, "shared_flux_model", None)
+    if shared_flux_model is None or not hasattr(shared_flux_model, "evaluate_with_lagged_response"):
+        return None
+    _density_eq, _temperature_eq, er_eq = owner._resolve_equations()
+    if er_eq is None:
+        return None
+    mode = str(getattr(er_eq, "permitivity_mode", "")).strip().lower()
+    if mode not in {"ntss_like_midpoint", "ntss_like", "ntssfusion_midpoint"}:
+        return None
+    density_indices_raw = getattr(er_eq, "ntss_density_indices", None)
+    if density_indices_raw is None:
+        return None
+    density_indices = tuple(int(index) for index in np.asarray(density_indices_raw).reshape((-1,)))
+    if not density_indices:
+        return None
+
+    eidx = _electron_density_index(species)
+    packed_density_indices = []
+    for index in density_indices:
+        if eidx is not None and index == eidx:
+            continue
+        packed_density_indices.append(index if eidx is None or index < eidx else index - 1)
+    packed_density_indices = tuple(packed_density_indices)
+    if not packed_density_indices:
+        return None
+
+    def _factors(
+        kernel_context,
+        physics_context,
+        carry_in,
+        primal_result,
+        lagged_response,
+        *,
+        rank: int,
+    ):
+        del rank
+        from ._transport_equations import _get_center_flux
+
+        layout, radial_permutation, radial_block_dim = _radau_stage_to_radial_permutation_and_block_dim(
+            kernel_context
+        )
+        active_er_size = int(layout.active_er_size)
+        if active_er_size <= 0:
+            raise ValueError("woodbury_er_coeff_compact requires active Er state variables.")
+
+        (
+            band_permutation,
+            band_block_dim,
+            block_lower,
+            block_diagonal,
+            block_upper,
+        ) = _radau_exact_stage_transpose_radial_bands_from_matvec(
+            kernel_context,
+            physics_context,
+            carry_in,
+            primal_result,
+            lagged_response,
+        )
+        if int(band_block_dim) != int(radial_block_dim):
+            raise ValueError("Radial band builder returned an inconsistent block dimension.")
+
+        stage_times, stage_states = _radau_exact_stage_times_states(
+            kernel_context,
+            carry_in,
+            primal_result,
+        )
+        del stage_times
+        n_radial = int(layout.n_radial)
+        density_species_count = int(layout.density_species_count)
+        if any(index < 0 or index >= density_species_count for index in packed_density_indices):
+            raise ValueError(
+                "woodbury_er_coeff_compact inferred packed density indices outside "
+                f"the Radau density layout: packed_indices={packed_density_indices}, "
+                f"density_species_count={density_species_count}."
+            )
+        density_end = int(kernel_context.density_size)
+        pressure_end = density_end + int(kernel_context.pressure_size)
+        er_start = pressure_end
+        mid_index = n_radial // 2
+        num_stages = int(kernel_context.num_stages)
+        state_dim = int(kernel_context.state_dim)
+        system_size = num_stages * state_dim
+        dtype = kernel_context.dtype
+
+        packed_density_indices_arr = jnp.asarray(packed_density_indices, dtype=jnp.int32)
+        full_density_indices_arr = jnp.asarray(density_indices, dtype=jnp.int32)
+
+        def _stage_er_coeff_profile(y_eval):
+            state_y = physics_context.unpack_flat(y_eval)
+            working_state, _eidx = owner._prepare_working_state(state_y)
+            flux_response = (
+                lagged_response.flux_response
+                if hasattr(lagged_response, "flux_response")
+                else lagged_response
+            )
+            shared_fluxes = shared_flux_model.evaluate_with_lagged_response(
+                working_state,
+                flux_response,
+                **owner._shared_flux_bc_kwargs(),
+            )
+            gamma = _get_center_flux(shared_fluxes, "Gamma")
+            charge_flux = er_eq._charge_flux_from_gamma(gamma)
+            if str(getattr(er_eq, "boundary_mode", "")).strip().lower() == "floating_ambipolar_edge":
+                charge_flux = charge_flux.at[-1].set(er_eq._charge_flux_faces_from_gamma(gamma)[-1])
+
+            ni_raw = jnp.sum(working_state.density[full_density_indices_arr, mid_index])
+            ni_floor = jnp.asarray(1.0e-30, dtype=dtype)
+            ni_active = ni_raw > ni_floor
+            ni_mid = jnp.maximum(ni_raw, ni_floor)
+            prefactor = (
+                jnp.where(ni_active, jnp.asarray(1.0, dtype=dtype), jnp.asarray(0.0, dtype=dtype))
+                *
+                jnp.asarray(getattr(er_eq, "Er_relax", 1.0), dtype=dtype)
+                * jnp.asarray(95780.0, dtype=dtype)
+                * jnp.asarray(getattr(er_eq, "ntss_B0_mid", 0.0), dtype=dtype) ** 2
+                / (
+                    ni_mid ** 2
+                    * jnp.asarray(getattr(er_eq, "ntss_psfactor_mid", 1.0), dtype=dtype)
+                )
+                * jnp.asarray(1.0e-20, dtype=dtype)
+            )
+            return prefactor * charge_flux
+
+        # Shape: (source_stage, er_radial_cell).
+        er_coeff_profiles = jax.vmap(_stage_er_coeff_profile)(stage_states)
+
+        u_stage = jnp.zeros((system_size, num_stages), dtype=dtype)
+        v_stage = jnp.zeros((system_size, num_stages), dtype=dtype)
+        stage_ids = jnp.arange(num_stages, dtype=jnp.int32)
+        radial_ids = jnp.arange(n_radial, dtype=jnp.int32)
+
+        def _fill_rank_column(carry, source_stage):
+            u_acc, v_acc = carry
+            row_stages = stage_ids
+            row_species = packed_density_indices_arr
+            row_positions = (
+                row_stages[:, None, None] * jnp.asarray(state_dim, dtype=jnp.int32)
+                + row_species[None, :, None] * jnp.asarray(n_radial, dtype=jnp.int32)
+                + jnp.asarray(mid_index, dtype=jnp.int32)
+            ).reshape((-1,))
+            row_values = (
+                -primal_result.trial_dt
+                * kernel_context.a[source_stage, row_stages][:, None]
+                * jnp.ones((num_stages, int(packed_density_indices_arr.shape[0])), dtype=dtype)
+            ).reshape((-1,))
+            u_acc = u_acc.at[row_positions, source_stage].set(row_values)
+
+            er_positions = (
+                source_stage * jnp.asarray(state_dim, dtype=jnp.int32)
+                + jnp.asarray(er_start, dtype=jnp.int32)
+                + radial_ids
+            )
+            v_acc = v_acc.at[er_positions, source_stage].set(er_coeff_profiles[source_stage])
+            return (u_acc, v_acc), None
+
+        (u_stage, v_stage), _ = jax.lax.scan(
+            _fill_rank_column,
+            (u_stage, v_stage),
+            jnp.arange(num_stages, dtype=jnp.int32),
+        )
+        u_rank = u_stage[radial_permutation, :]
+        v_rank = v_stage[radial_permutation, :]
+
+        # The band builder sees the full transpose operator. Remove the analytic
+        # low-rank contribution from its tridiagonal bands before adding U V.T
+        # through Woodbury, otherwise the band part would be counted twice.
+        def _low_rank_block(row_block, col_block):
+            row_start = row_block * jnp.asarray(radial_block_dim, dtype=jnp.int32)
+            col_start = col_block * jnp.asarray(radial_block_dim, dtype=jnp.int32)
+            u_block = jax.lax.dynamic_slice(
+                u_rank,
+                (row_start, jnp.asarray(0, dtype=jnp.int32)),
+                (radial_block_dim, num_stages),
+            )
+            v_block = jax.lax.dynamic_slice(
+                v_rank,
+                (col_start, jnp.asarray(0, dtype=jnp.int32)),
+                (radial_block_dim, num_stages),
+            )
+            return u_block @ v_block.T
+
+        block_ids = jnp.arange(n_radial, dtype=jnp.int32)
+        diag_correction = jax.vmap(lambda k: _low_rank_block(k, k))(block_ids)
+        zero_block = jnp.zeros_like(diag_correction[:1])
+        lower_correction = jnp.concatenate(
+            [
+                zero_block,
+                jax.vmap(lambda k: _low_rank_block(k, k - 1))(block_ids[1:]),
+            ],
+            axis=0,
+        )
+        upper_correction = jnp.concatenate(
+            [
+                jax.vmap(lambda k: _low_rank_block(k, k + 1))(block_ids[:-1]),
+                zero_block,
+            ],
+            axis=0,
+        )
+
+        return (
+            band_permutation,
+            int(band_block_dim),
+            block_lower - lower_correction,
+            block_diagonal - diag_correction,
+            block_upper - upper_correction,
+            u_rank,
+            v_rank,
+        )
+
+    return _factors
+
+
 def _flat_rhs_with_lagged_response_factory(unravel, vector_field, args, kwargs, project_flat=None):
     species = _extract_species_from_args(args)
     _, eval_fn = _lagged_response_hooks(vector_field)
@@ -15422,6 +15651,12 @@ def _build_prepared_radau_accepted_rollout(
     )
     exact_stage_transpose_solve_compact = _exact_stage_transpose_solve_compact_hook(vector_field)
     exact_stage_transpose_low_rank_factors = _exact_stage_transpose_low_rank_factors_hook(vector_field)
+    if exact_stage_transpose_low_rank_factors is None:
+        exact_stage_transpose_low_rank_factors = _ntss_midpoint_er_coeff_low_rank_factors_hook(
+            unpack_flat,
+            vector_field,
+            species,
+        )
     use_transport_lagged_response = rhs_mode in {"lagged_transport_response", "lagged_response"}
     reverse_stage_adjoint_solve_mode = str(
         getattr(solver, "reverse_stage_adjoint_solve_mode", "structured")
@@ -15844,6 +16079,12 @@ class RADAUSolver(_RadauSolverConfig):
         )
         exact_stage_transpose_solve_compact = _exact_stage_transpose_solve_compact_hook(vector_field)
         exact_stage_transpose_low_rank_factors = _exact_stage_transpose_low_rank_factors_hook(vector_field)
+        if exact_stage_transpose_low_rank_factors is None:
+            exact_stage_transpose_low_rank_factors = _ntss_midpoint_er_coeff_low_rank_factors_hook(
+                unpack_flat,
+                vector_field,
+                species,
+            )
         rhs_mode = str(getattr(self, "rhs_mode", "black_box")).strip().lower()
         reverse_stage_adjoint_solve_mode = str(
             getattr(self, "reverse_stage_adjoint_solve_mode", "structured")

@@ -158,6 +158,66 @@ python ./examples/benchmarks/benchmark_transport_reverse_ad_only.py \
   --full-transport-shared-payload-smoke
 ```
 
+## 2026-08-14 `woodbury_matvec_compact` Rank-24 16-Step Run
+
+Run mode:
+
+```text
+--reverse-stage-adjoint-solve-mode woodbury_matvec_compact
+--reverse-stage-adjoint-woodbury-rank 24
+--accepted-step-limit 16
+--reverse-segment-length 4
+```
+
+Observed timings:
+
+| Component | `woodbury_matvec_compact` elapsed_s | Newer `block` elapsed_s | Older `bicgstab` elapsed_s |
+| --- | ---: | ---: | ---: |
+| realtime geometry runtime build | `217.798` | `218.060` | `217.606` |
+| realtime geometry solver components | `31.707` | `31.674` | `31.609` |
+| support reverse profile-state vjp | `31.365` | `31.274` | `31.208` |
+| support reverse initial carry vjp | `22.592` | `22.630` | `22.504` |
+| support reverse realized-schedule vjp forward | `433.376` | `431.732` | `430.285` |
+| support reverse segmented cotangent sweep | `1840.513` | `1421.110` | `2014.368` |
+| support reverse initial-cache support pullback | `649.143` | `646.174` | `643.382` |
+| support reverse initial state pullback | `81.362` | `78.676` | `80.978` |
+| initial-Er root boundary compact pullback | `51.377` | `54.287` | `51.509` |
+| objective-table final VMEC parameter pullback | `14.159` | `13.517` | `13.853` |
+| total run | `3542.966` | `3116.764` | `3705.434` |
+
+Timing interpretation:
+
+- Compared with the newer `block` run attached with the memory screenshot,
+  `woodbury_matvec_compact` is slower by `426.202 s` total and `419.403 s` in
+  the segmented cotangent sweep.
+- Compared with the older saved `bicgstab` timing table, it is faster by
+  `162.468 s` total and `173.855 s` in the segmented cotangent sweep.
+- This confirms the current rank-24 Woodbury mode is a correctness experiment,
+  not the final efficiency win. It still pays too much compile/runtime overhead
+  from the matvec/SVD-style construction path.
+
+Derivative comparison against the newer exact `block` run:
+
+```text
+common printed Jacobian entries compared: 128
+max absolute difference: 9.510020660172813e-04
+```
+
+Largest absolute differences:
+
+| Entry | `woodbury_matvec_compact` | newer `block` | Abs diff | Rel diff |
+| --- | ---: | ---: | ---: | ---: |
+| `d transport:Er2_volume_average / dvmec:RBC:1:0` | `-6.4027761396697815e+02` | `-6.4027856496904417e+02` | `9.510021e-04` | `1.485294e-06` |
+| `d transport:Er2_volume_average / dvmec:ZBS:1:0` | `2.3683363067131035e+02` | `2.3683437561688766e+02` | `7.449456e-04` | `3.145428e-06` |
+| `d transport:softmax_Er / dvmec:RBC:1:0` | `-5.9293842886185210e+01` | `-5.9294180972770484e+01` | `3.380866e-04` | `5.701851e-06` |
+| `d transport:softmax_Er / dvmec:ZBS:1:0` | `1.7363305438804826e+01` | `1.7363571489179520e+01` | `2.660504e-04` | `1.532233e-05` |
+| `d transport:Er2_volume_average / dtemperature_shape_power` | `5.4946272544225238e+01` | `5.4946436756445031e+01` | `1.642122e-04` | `2.988587e-06` |
+
+The values are close, but the Woodbury truncation error is larger than the
+`block` vs `bicgstab` difference saved above (`1.659860e-06` max absolute
+difference). Rank 24 is therefore good as a diagnostic approximation, but it
+has not yet replaced the exact solver path for production correctness.
+
 ## Existing Solve Modes
 
 ### `structured`
