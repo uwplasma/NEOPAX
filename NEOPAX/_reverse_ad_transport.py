@@ -88,6 +88,7 @@ from ._transport_solvers import (
     _theta_prepare_lagged_response,
     _project_flat_state_if_needed,
     _radau_adaptive_final_y_realized_schedule_vjp_fwd,
+    _radau_adaptive_final_y_realized_schedule_vjp_fwd_from_schedule_artifact,
     _radau_align_tangent_tree_to_primal,
     _radau_carry_from_step_state,
     _radau_eval_rhs,
@@ -308,6 +309,9 @@ class RealtimeGeometryReverseStaticSetup:
     max_total_steps: int
     reverse_segment_length: int | None
     require_final_time: bool = False
+    # Optional compact scalar trace from the static schedule probe. This is
+    # intentionally not a per-step primal tape or an additional carry.
+    schedule_artifact: object | None = None
 
 
 @jax.tree_util.register_dataclass
@@ -2520,6 +2524,7 @@ def prepare_reverse_static_setup(
     reverse_stage_adjoint_iter_tol: float = 1.0e-10,
     reverse_stage_adjoint_woodbury_rank: int = 24,
     reverse_single_segment_vjp_forward_mode: str = "legacy",
+    reverse_schedule_artifact_mode: str = "legacy",
     max_reverse_accepted_steps: int | None = None,
 ) -> RealtimeGeometryReverseStaticSetup:
     state0_static = initial_state_for_parameter_vector(
@@ -2581,6 +2586,26 @@ def prepare_reverse_static_setup(
         or (requested_full_final_time and reverse_segment_length_eff is not None)
         or (requested_full_final_time and max_reverse_accepted_steps is not None)
     )
+    schedule_artifact = None
+    schedule_artifact_mode = str(reverse_schedule_artifact_mode).strip().lower()
+    if schedule_artifact_mode not in {"legacy", "reuse_static_probe"}:
+        raise ValueError(
+            "Unknown reverse_schedule_artifact_mode "
+            f"'{reverse_schedule_artifact_mode}'."
+        )
+    if schedule_artifact_mode == "reuse_static_probe" and not needs_schedule_probe:
+        raise ValueError(
+            "reverse_schedule_artifact_mode='reuse_static_probe' requires a static schedule probe."
+        )
+    if (
+        schedule_artifact_mode == "reuse_static_probe"
+        and str(reverse_single_segment_vjp_forward_mode).strip().lower()
+        == "reuse_adaptive_rollout"
+    ):
+        raise ValueError(
+            "reuse_static_probe already removes the adaptive rollout and cannot be combined "
+            "with reverse_single_segment_vjp_forward_mode='reuse_adaptive_rollout'."
+        )
     if needs_schedule_probe:
         probe_max_total_steps = max_total_steps
         probe_stop_after_accepted_steps = stop_after_accepted_steps
@@ -2659,6 +2684,15 @@ def prepare_reverse_static_setup(
                 reverse_lagged_branch_schedule=tuple(lagged_branch_schedule),
             ),
         )
+        if schedule_artifact_mode == "reuse_static_probe":
+            # Keep only the scalar adaptive schedule.  Do not retain
+            # final_step_state, final_carry, or any accepted-step carries/stages.
+            # Match the graph length used by the legacy manual VJP forward;
+            # the initial probe may have used a deliberately larger guard.
+            schedule_artifact = jax.tree_util.tree_map(
+                lambda value: value[:max_total_steps],
+                schedule_probe.trace,
+            )
     return RealtimeGeometryReverseStaticSetup(
         solver=solver,
         solve_vector_field=solve_vector_field_static,
@@ -2668,6 +2702,7 @@ def prepare_reverse_static_setup(
         max_total_steps=max_total_steps,
         reverse_segment_length=reverse_segment_length_eff,
         require_final_time=bool(requested_full_final_time and reverse_segment_length_eff is not None),
+        schedule_artifact=schedule_artifact,
     )
 
 
@@ -2772,6 +2807,11 @@ def prepare_realtime_geometry_support_segment_core_setup(
         reverse_single_segment_vjp_forward_mode=getattr(
             args,
             "reverse_single_segment_vjp_forward_mode",
+            "legacy",
+        ),
+        reverse_schedule_artifact_mode=getattr(
+            args,
+            "reverse_schedule_artifact_mode",
             "legacy",
         ),
     )
@@ -2911,13 +2951,33 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
     )
 
     phase_start = time.perf_counter()
-    final_y, residuals = _reverse_adaptive_final_y_realized_schedule_vjp_fwd(
-        reverse_setup.execution_context,
-        reverse_setup.max_total_steps,
-        reverse_setup.stop_after_accepted_steps,
-        reverse_setup.reverse_segment_length,
-        initial_carry,
-    )
+    schedule_artifact = getattr(reverse_setup, "schedule_artifact", None)
+    if schedule_artifact is None:
+        final_y, residuals = _reverse_adaptive_final_y_realized_schedule_vjp_fwd(
+            reverse_setup.execution_context,
+            reverse_setup.max_total_steps,
+            reverse_setup.stop_after_accepted_steps,
+            reverse_setup.reverse_segment_length,
+            initial_carry,
+        )
+    else:
+        print(
+            f"{progress_prefix} progress: support reverse reusing static schedule artifact "
+            "(no second adaptive rollout; no per-step carry tape)",
+            flush=True,
+        )
+        if isinstance(reverse_setup.execution_context, _ThetaReverseExecutionContext):
+            raise ValueError(
+                "reuse_static_probe is currently implemented only for the Radau reverse path."
+            )
+        final_y, residuals = _radau_adaptive_final_y_realized_schedule_vjp_fwd_from_schedule_artifact(
+            reverse_setup.execution_context,
+            reverse_setup.max_total_steps,
+            reverse_setup.stop_after_accepted_steps,
+            reverse_setup.reverse_segment_length,
+            initial_carry,
+            schedule_artifact,
+        )
     final_y, residuals = jax.block_until_ready((final_y, residuals))
     print(
         f"{progress_prefix} progress: support reverse realized-schedule vjp forward ready "

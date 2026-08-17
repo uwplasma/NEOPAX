@@ -416,6 +416,8 @@ class _ReverseStaticSetup:
     stop_after_accepted_steps: int | None
     max_total_steps: int
     reverse_segment_length: int | None
+    # Scalar schedule arrays only; no extra carry or per-step tape.
+    schedule_artifact: object | None = None
 
 
 def _replace_ntx_support_payload_in_model(model, support):
@@ -2157,6 +2159,7 @@ def _prepare_reverse_static_setup(
     reverse_stage_adjoint_iter_tol: float = 1.0e-10,
     reverse_stage_adjoint_woodbury_rank: int = 24,
     reverse_single_segment_vjp_forward_mode: str = "legacy",
+    reverse_schedule_artifact_mode: str = "legacy",
 ) -> _ReverseStaticSetup:
     state0_static = _initial_state_for_parameter_vector(
         parameter_values,
@@ -2201,6 +2204,26 @@ def _prepare_reverse_static_setup(
         if accepted_step_limit_override is not None
         else getattr(solver, "stop_after_accepted_steps", None)
     )
+    schedule_artifact = None
+    schedule_artifact_mode = str(reverse_schedule_artifact_mode).strip().lower()
+    if schedule_artifact_mode not in {"legacy", "reuse_static_probe"}:
+        raise ValueError(
+            "Unknown reverse_schedule_artifact_mode "
+            f"'{reverse_schedule_artifact_mode}'."
+        )
+    if schedule_artifact_mode == "reuse_static_probe" and stop_after_accepted_steps is None:
+        raise ValueError(
+            "reuse_static_probe requires --accepted-step-limit in this benchmark."
+        )
+    if (
+        schedule_artifact_mode == "reuse_static_probe"
+        and str(reverse_single_segment_vjp_forward_mode).strip().lower()
+        == "reuse_adaptive_rollout"
+    ):
+        raise ValueError(
+            "reuse_static_probe already removes the adaptive rollout and cannot be combined "
+            "with reverse_single_segment_vjp_forward_mode='reuse_adaptive_rollout'."
+        )
     max_total_steps = int(max(1, getattr(solver, "max_steps", 1)))
     if stop_after_accepted_steps is not None:
         max_total_steps = min(
@@ -2240,6 +2263,14 @@ def _prepare_reverse_static_setup(
                 reverse_lagged_branch_schedule=tuple(lagged_branch_schedule),
             ),
         )
+        if schedule_artifact_mode == "reuse_static_probe":
+            # Scalar schedule trace only; no carry or step/stage tape.
+            # Keep the same reduced graph length that legacy uses after its
+            # adaptive rollout, not the conservative probe guard length.
+            schedule_artifact = jax.tree_util.tree_map(
+                lambda value: value[:max_total_steps],
+                schedule_probe.trace,
+            )
     return _ReverseStaticSetup(
         solver=solver,
         solve_vector_field=solve_vector_field_static,
@@ -2248,6 +2279,7 @@ def _prepare_reverse_static_setup(
         stop_after_accepted_steps=stop_after_accepted_steps,
         max_total_steps=max_total_steps,
         reverse_segment_length=reverse_segment_length,
+        schedule_artifact=schedule_artifact,
     )
 
 
@@ -5274,6 +5306,17 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--reverse-schedule-artifact-mode",
+        choices=("legacy", "reuse_static_probe"),
+        default="legacy",
+        help=(
+            "Experimental Radau shared-payload mode. reuse_static_probe reuses "
+            "the compact adaptive schedule already built during reverse setup, "
+            "rather than executing a second adaptive schedule rollout in the "
+            "manual VJP forward. It stores no carries or per-step primal tape."
+        ),
+    )
+    parser.add_argument(
         "--reverse-stage-adjoint-woodbury-rank",
         type=int,
         default=24,
@@ -5500,6 +5543,14 @@ def main() -> None:
         ),
     )
     args = parser.parse_args()
+    if (
+        str(args.reverse_schedule_artifact_mode) == "reuse_static_probe"
+        and not bool(args.full_transport_shared_payload_smoke)
+    ):
+        raise SystemExit(
+            "[autodiff-gate] --reverse-schedule-artifact-mode reuse_static_probe is currently "
+            "implemented only for --full-transport-shared-payload-smoke."
+        )
     if int(args.reverse_stage_adjoint_iter_maxiter) <= 0:
         raise SystemExit("[autodiff-gate] --reverse-stage-adjoint-iter-maxiter must be positive.")
     if float(args.reverse_stage_adjoint_iter_tol) <= 0.0:

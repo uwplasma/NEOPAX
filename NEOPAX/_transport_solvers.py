@@ -14412,27 +14412,32 @@ def _radau_adaptive_final_y_realized_schedule_vjp(
     return rollout.final_carry.y
 
 
-def _radau_adaptive_final_y_realized_schedule_vjp_fwd(
+def _radau_adaptive_final_y_realized_schedule_vjp_fwd_from_schedule_artifact(
     execution_context: _RadauSolveExecutionContext,
     max_total_steps: int,
     stop_after_accepted_steps: int | None,
     reverse_segment_length: int | None,
     carry0: _RadauAcceptedStepCarry,
+    schedule_artifact: _RadauAdaptiveScheduleTrace,
+    *,
+    final_carry: _RadauAcceptedStepCarry | None = None,
 ):
-    rollout = _radau_adaptive_schedule_rollout(
-        execution_context,
-        carry0,
-        max_total_steps=max_total_steps,
-        stop_after_accepted_steps=stop_after_accepted_steps,
-    )
-    active_mask = jax.lax.stop_gradient(rollout.trace.active_mask)
-    accepted_mask = jax.lax.stop_gradient(rollout.trace.accepted_mask)
-    attempted_dts = jax.lax.stop_gradient(rollout.trace.attempted_dts)
-    next_dts = jax.lax.stop_gradient(rollout.trace.next_dts)
-    next_recent_reject_count = jax.lax.stop_gradient(rollout.trace.next_recent_reject_count)
-    next_regrowth_cooldown = jax.lax.stop_gradient(rollout.trace.next_regrowth_cooldown)
-    next_easy_growth_streak = jax.lax.stop_gradient(rollout.trace.next_easy_growth_streak)
-    next_lagged_response_valid = jax.lax.stop_gradient(rollout.trace.next_lagged_response_valid)
+    """Build reverse residuals from a previously computed adaptive schedule.
+
+    ``schedule_artifact`` deliberately contains only scalar attempt arrays.
+    It is not an accepted-step carry/stage tape: the existing segment kernels
+    still replay their slots, reconstruct each step's primal data during the
+    backward sweep, and produce the final carry.
+    """
+    trace = schedule_artifact
+    active_mask = jax.lax.stop_gradient(trace.active_mask)
+    accepted_mask = jax.lax.stop_gradient(trace.accepted_mask)
+    attempted_dts = jax.lax.stop_gradient(trace.attempted_dts)
+    next_dts = jax.lax.stop_gradient(trace.next_dts)
+    next_recent_reject_count = jax.lax.stop_gradient(trace.next_recent_reject_count)
+    next_regrowth_cooldown = jax.lax.stop_gradient(trace.next_regrowth_cooldown)
+    next_easy_growth_streak = jax.lax.stop_gradient(trace.next_easy_growth_streak)
+    next_lagged_response_valid = jax.lax.stop_gradient(trace.next_lagged_response_valid)
     segment_start_carries = None
     segmented_final_carry = None
     segmented_replay_arrays = None
@@ -14503,11 +14508,16 @@ def _radau_adaptive_final_y_realized_schedule_vjp_fwd(
         # Per-step carries are still reconstructed by the reverse segment
         # kernel; this does not retain a full accepted-step carry tape.
         if single_segment_mode == "reuse_adaptive_rollout" and segment_count == 1:
+            if final_carry is None:
+                raise ValueError(
+                    "reuse_adaptive_rollout is incompatible with a trace-only "
+                    "static schedule artifact."
+                )
             segment_start_carries = jax.tree_util.tree_map(
                 lambda value: jnp.expand_dims(value, axis=0),
                 carry0,
             )
-            segmented_final_carry = rollout.final_carry
+            segmented_final_carry = final_carry
         else:
             def _segment_forward(carry, xs):
                 segment_rollout = _radau_replay_realized_accepted_rollout(
@@ -14536,7 +14546,38 @@ def _radau_adaptive_final_y_realized_schedule_vjp_fwd(
         segmented_final_carry,
         segmented_replay_arrays,
     )
-    return rollout.final_carry.y, residuals
+    # Preserve the legacy VJP-forward primal exactly when it supplied the
+    # adaptive rollout's final carry.  The trace-only artifact mode instead
+    # uses the already-required segmented replay result.
+    if final_carry is not None:
+        return final_carry.y, residuals
+    if segmented_final_carry is None:
+        raise ValueError("A non-segmented schedule artifact requires final_carry.")
+    return segmented_final_carry.y, residuals
+
+
+def _radau_adaptive_final_y_realized_schedule_vjp_fwd(
+    execution_context: _RadauSolveExecutionContext,
+    max_total_steps: int,
+    stop_after_accepted_steps: int | None,
+    reverse_segment_length: int | None,
+    carry0: _RadauAcceptedStepCarry,
+):
+    rollout = _radau_adaptive_schedule_rollout(
+        execution_context,
+        carry0,
+        max_total_steps=max_total_steps,
+        stop_after_accepted_steps=stop_after_accepted_steps,
+    )
+    return _radau_adaptive_final_y_realized_schedule_vjp_fwd_from_schedule_artifact(
+        execution_context,
+        max_total_steps,
+        stop_after_accepted_steps,
+        reverse_segment_length,
+        carry0,
+        rollout.trace,
+        final_carry=rollout.final_carry,
+    )
 
 
 def _radau_adaptive_final_y_realized_schedule_vjp_bwd(
