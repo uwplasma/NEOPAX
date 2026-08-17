@@ -2815,6 +2815,14 @@ def prepare_realtime_geometry_support_segment_core_setup(
             "legacy",
         ),
     )
+    if (
+        str(getattr(args, "reverse_schedule_artifact_mode", "legacy")).strip().lower()
+        == "reuse_static_probe"
+        and getattr(reverse_setup, "schedule_artifact", None) is None
+    ):
+        raise RuntimeError(
+            "reuse_static_probe was requested, but reverse static setup returned no schedule artifact."
+        )
     early_geometry_diagnostics = (
         None
         if geometry_volume_diagnostics is None
@@ -4305,6 +4313,7 @@ def internal_realtime_geometry_transport_reverse_table_result_builder(
     reverse_stage_adjoint_iter_maxiter: int = 40,
     reverse_stage_adjoint_iter_tol: float = 1.0e-10,
     reverse_stage_adjoint_woodbury_rank: int = 24,
+    reverse_schedule_artifact_mode: str = "legacy",
     max_reverse_accepted_steps: int | None = None,
     progress_label: str | None = None,
     raw_block_solve: GeometryRawBlockSolve | None = None,
@@ -4403,12 +4412,25 @@ def internal_realtime_geometry_transport_reverse_table_result_builder(
             reverse_stage_adjoint_woodbury_rank=int(
                 opts.get("reverse_stage_adjoint_woodbury_rank", reverse_stage_adjoint_woodbury_rank)
             ),
+            reverse_schedule_artifact_mode=str(
+                opts.get("reverse_schedule_artifact_mode", reverse_schedule_artifact_mode)
+            ),
             max_reverse_accepted_steps=(
                 None
                 if active_max_reverse_accepted_steps is None
                 else int(active_max_reverse_accepted_steps)
             ),
         )
+        if (
+            str(opts.get("reverse_schedule_artifact_mode", reverse_schedule_artifact_mode))
+            .strip()
+            .lower()
+            == "reuse_static_probe"
+            and active_reverse_setup.schedule_artifact is None
+        ):
+            raise RuntimeError(
+                "reuse_static_probe was requested, but the internal table builder returned no schedule artifact."
+            )
         ntx_support_payload = (
             active_support_payload["ntx_support"]
             if active_support_payload is not None

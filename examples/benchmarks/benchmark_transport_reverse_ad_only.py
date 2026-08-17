@@ -2271,6 +2271,11 @@ def _prepare_reverse_static_setup(
                 lambda value: value[:max_total_steps],
                 schedule_probe.trace,
             )
+            print(
+                "[autodiff-gate] progress: static reverse schedule artifact retained "
+                f"attempt_slots={max_total_steps} (trace only; no carry tape)",
+                flush=True,
+            )
     return _ReverseStaticSetup(
         solver=solver,
         solve_vector_field=solve_vector_field_static,
@@ -3573,6 +3578,7 @@ def _run_realtime_geometry_optimization_api_smoke(
             reverse_stage_adjoint_solve_mode=str(args.reverse_stage_adjoint_solve_mode),
             reverse_rhs_transpose_mode=str(args.reverse_rhs_transpose_mode),
             reverse_step_bwd_mode=str(args.reverse_step_bwd_mode),
+            reverse_schedule_artifact_mode=str(args.reverse_schedule_artifact_mode),
             max_reverse_accepted_steps=(
                 None
                 if args.max_reverse_accepted_steps is None
