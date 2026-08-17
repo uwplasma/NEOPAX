@@ -3533,6 +3533,11 @@ def _run_realtime_geometry_optimization_api_smoke(
         flush=True,
     )
     if bool(getattr(args, "full_transport_shared_payload_smoke", False)):
+        print(
+            "[autodiff-gate] progress: full-transport reverse stage-adjoint "
+            f"solve mode={args.reverse_stage_adjoint_solve_mode}",
+            flush=True,
+        )
         geom_cfg = config.get("geometry", {})
         neoclassical_cfg = config.get("neoclassical", {})
         geometry_values0 = _baseline_geometry_delta_vector_for_specs(
@@ -5281,6 +5286,7 @@ def main() -> None:
             "structured",
             "bicgstab",
             "block",
+            "block_explicit_ntx_jacobian",
             "gmres",
             "exact_block_compact",
             "woodbury_compact",
@@ -5293,6 +5299,8 @@ def main() -> None:
             "transformed LU transpose approximation and is the lightweight default; "
             "'bicgstab' is the lower-memory exact iterative candidate; 'block' and "
             "'gmres' are correctness oracles but are memory/compile heavy; "
+            "'block_explicit_ntx_jacobian' keeps the exact block system but materializes "
+            "each fixed-lagged NTX stage Jacobian from the explicit state pullback; "
             "'exact_block_compact' requires a non-dense exact compact solve hook; "
             "'woodbury_compact' uses the experimental rank-truncated block-Woodbury solve; "
             "'woodbury_matvec_compact' builds the same Woodbury system from the compact "

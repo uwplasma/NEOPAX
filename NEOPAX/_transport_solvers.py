@@ -8058,7 +8058,11 @@ def _radau_exact_stage_residual_matrix(
     """
     stage_times, stage_states = _radau_exact_stage_times_states(kernel_context, carry_in, primal_result)
 
-    def _stage_jacobian(t_eval, y_eval):
+    matrix_mode = str(
+        getattr(physics_context, "reverse_stage_adjoint_solve_mode", "structured")
+    ).strip().lower()
+
+    def _stage_jacobian_generic(t_eval, y_eval):
         def _rhs_at_stage(y_value):
             return _radau_eval_rhs(
                 t_eval,
@@ -8070,7 +8074,37 @@ def _radau_exact_stage_residual_matrix(
 
         return jax.jacfwd(_rhs_at_stage)(y_eval)
 
-    stage_jacobians = jax.vmap(_stage_jacobian, in_axes=(0, 0))(stage_times, stage_states)
+    if matrix_mode == "block_explicit_ntx_jacobian":
+        if lagged_response is None or physics_context.flat_rhs_state_pullback is None:
+            raise ValueError(
+                "reverse_stage_adjoint_solve_mode='block_explicit_ntx_jacobian' requires "
+                "a lagged transport RHS with an explicit fixed-lagged state pullback."
+            )
+
+        output_basis = jnp.eye(kernel_context.state_dim, dtype=kernel_context.dtype)
+
+        def _stage_jacobian_explicit(t_eval, y_eval):
+            # For basis vector e_i, the explicit pullback returns J.T @ e_i,
+            # whose entries are row i of J.  Vmap therefore materializes the
+            # same J = d(rhs)/d(state) used by the generic jacfwd path.
+            return jax.vmap(
+                lambda rhs_bar: physics_context.flat_rhs_state_pullback(
+                    t_eval,
+                    y_eval,
+                    lagged_response,
+                    rhs_bar,
+                )
+            )(output_basis)
+
+        stage_jacobians = jax.vmap(_stage_jacobian_explicit, in_axes=(0, 0))(
+            stage_times,
+            stage_states,
+        )
+    else:
+        stage_jacobians = jax.vmap(_stage_jacobian_generic, in_axes=(0, 0))(
+            stage_times,
+            stage_states,
+        )
     eye_s = jnp.eye(kernel_context.num_stages, dtype=kernel_context.dtype)
     eye_n = jnp.eye(kernel_context.state_dim, dtype=kernel_context.dtype)
     block_system = (
@@ -9995,7 +10029,7 @@ def _radau_solve_exact_stage_residual_transpose(
             rhs=rhs,
             method=mode,
         )
-    if mode != "block":
+    if mode not in {"block", "block_explicit_ntx_jacobian"}:
         raise ValueError(f"Unknown reverse_stage_adjoint_solve_mode '{mode}'.")
     return _radau_solve_exact_stage_residual_transpose_block(
         kernel_context,
@@ -10086,7 +10120,7 @@ def _radau_solve_exact_stage_residual_transpose_batched(
             rhs=rhs_arr,
             method=mode,
         )
-    if mode != "block":
+    if mode not in {"block", "block_explicit_ntx_jacobian"}:
         raise ValueError(f"Unknown reverse_stage_adjoint_solve_mode '{mode}'.")
     return jax.vmap(
         lambda rhs_row: _radau_solve_exact_stage_residual_transpose_block(
