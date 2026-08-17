@@ -7591,20 +7591,28 @@ def _radau_exact_stage_residual_input_and_support_pullback_fused_ntx(
         carry_in,
         primal_result,
     )
-    state_bars, lagged_bars, support_bars = jax.vmap(
-        lambda t_eval, y_eval, residual_stage: pullback_fn(
+    # Keep the full support pytree inside each mapped stage.  Some VMEC/NTX
+    # payload leaves are dataclasses with validation in __post_init__, which
+    # cannot be reconstructed from vmap's abstract placeholder objects.  The
+    # reference path maps a flat leaf tuple for the same reason.
+    def _stage_pullback(t_eval, y_eval, residual_stage):
+        state_bar, lagged_bar, support_bar = pullback_fn(
             t_eval,
             y_eval,
             lagged_response,
             -residual_stage,
             support,
-        ),
+        )
+        return state_bar, lagged_bar, tuple(jax.tree_util.tree_leaves(support_bar))
+
+    state_bars, lagged_bars, support_bar_leaves = jax.vmap(
+        _stage_pullback,
         in_axes=(0, 0, 0),
     )(stage_times, stage_states, residual_stages)
     return (
         jnp.sum(state_bars, axis=0),
         _radau_sum_leading_axis_tree(lagged_bars),
-        _radau_sum_leading_axis_tree(support_bars),
+        tuple(jnp.sum(leaf, axis=0) for leaf in support_bar_leaves),
     )
 
 
