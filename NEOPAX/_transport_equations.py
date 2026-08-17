@@ -2351,6 +2351,158 @@ class ComposedEquationSystem:
         )
         return self._prepare_working_state_pullback(state, total_working_state_bar)
 
+    def pullback_evaluate_with_lagged_response_all(
+        self,
+        t,
+        state,
+        runtime,
+        lagged_response,
+        rhs_bar,
+        support,
+    ):
+        """Joint fixed-lagged RHS pullback for state, response, and NTX support.
+
+        This is an exact reverse-only convenience hook.  When the support
+        payload contains a realtime-geometry component, retain the existing
+        geometry pullback path: it differentiates the VMEC payload separately
+        and must not be replaced by a generic transport VJP.  For the normal
+        NTX-support-only path, evaluate shared fluxes and the RHS assembly
+        pullback once, then fan its common flux cotangent out to the three
+        existing exact flux-model pullbacks.
+        """
+        del t, runtime
+        support_ntx, geometry = self._split_realtime_geometry_payload(support)
+        if (
+            self.shared_flux_model is None
+            or lagged_response is None
+            or lagged_response.flux_response is None
+            or support_ntx is None
+        ):
+            return (
+                self.pullback_evaluate_with_lagged_response_state(
+                    0.0, state, None, lagged_response, rhs_bar
+                ),
+                self.pullback_evaluate_with_lagged_response(
+                    0.0, state, None, lagged_response, rhs_bar
+                ),
+                self.pullback_evaluate_with_lagged_response_support_payload(
+                    0.0, state, None, lagged_response, rhs_bar, support
+                ),
+            )
+
+        working_state, eidx = self._prepare_working_state(state)
+        shared_fluxes = self.shared_flux_model.evaluate_with_lagged_response(
+            working_state,
+            lagged_response.flux_response,
+            **self._shared_flux_bc_kwargs(),
+        )
+        direct_working_state_bar, flux_bar = self._pullback_shared_flux_rhs_state_and_fluxes(
+            state,
+            working_state,
+            eidx,
+            shared_fluxes,
+            rhs_bar,
+        )
+
+        flux_state_pullback_fn = getattr(
+            self.shared_flux_model,
+            "pullback_evaluate_with_lagged_response_state",
+            None,
+        )
+        if callable(flux_state_pullback_fn):
+            working_state_bar = flux_state_pullback_fn(
+                working_state,
+                lagged_response.flux_response,
+                flux_bar,
+                **self._shared_flux_bc_kwargs(),
+            )
+        else:
+            _, flux_state_pullback = jax.vjp(
+                lambda working_state_value: self.shared_flux_model.evaluate_with_lagged_response(
+                    working_state_value,
+                    lagged_response.flux_response,
+                    **self._shared_flux_bc_kwargs(),
+                ),
+                working_state,
+            )
+            (working_state_bar,) = flux_state_pullback(flux_bar)
+
+        response_pullback_fn = getattr(
+            self.shared_flux_model,
+            "pullback_evaluate_with_lagged_response",
+            None,
+        )
+        if callable(response_pullback_fn):
+            flux_response_bar = response_pullback_fn(
+                working_state,
+                lagged_response.flux_response,
+                flux_bar,
+                **self._shared_flux_bc_kwargs(),
+            )
+        else:
+            _, response_pullback = jax.vjp(
+                lambda response_value: self.shared_flux_model.evaluate_with_lagged_response(
+                    working_state,
+                    response_value,
+                    **self._shared_flux_bc_kwargs(),
+                ),
+                lagged_response.flux_response,
+            )
+            (flux_response_bar,) = response_pullback(flux_bar)
+
+        if geometry is not None:
+            # Geometry remains on the established VMEC payload reverse path.
+            # State and response above still shared their assembly traversal.
+            support_bar = self.pullback_evaluate_with_lagged_response_support_payload(
+                0.0,
+                state,
+                None,
+                lagged_response,
+                rhs_bar,
+                support,
+            )
+        else:
+            support_pullback_fn = getattr(
+                self.shared_flux_model,
+                "pullback_evaluate_with_lagged_response_support_payload",
+                None,
+            )
+            if callable(support_pullback_fn):
+                support_bar = support_pullback_fn(
+                    working_state,
+                    lagged_response.flux_response,
+                    flux_bar,
+                    support_ntx,
+                    **self._shared_flux_bc_kwargs(),
+                )
+            else:
+                support_delta0 = _float_delta_tree_like(support_ntx)
+                _, support_pullback = jax.vjp(
+                    lambda support_delta: self.shared_flux_model.with_support_payload(
+                        _add_float_delta_tree(support_ntx, support_delta)
+                    ).evaluate_with_lagged_response(
+                        working_state,
+                        lagged_response.flux_response,
+                        **self._shared_flux_bc_kwargs(),
+                    ),
+                    support_delta0,
+                )
+                (support_bar,) = support_pullback(flux_bar)
+
+        state_bar = self._prepare_working_state_pullback(
+            state,
+            jax.tree_util.tree_map(lambda a, b: a + b, direct_working_state_bar, working_state_bar),
+        )
+        return (
+            state_bar,
+            TransportLaggedResponse(flux_response=flux_response_bar),
+            (
+                support_bar
+                if geometry is not None
+                else _sanitize_float_delta_bar_tree(support_ntx, support_bar)
+            ),
+        )
+
     def pullback_evaluate_with_lagged_response_state_direct(self, t, state, runtime, lagged_response, rhs_bar):
         """State pullback through equation assembly with shared fluxes held fixed."""
         del t, runtime

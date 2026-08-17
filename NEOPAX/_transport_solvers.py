@@ -1058,6 +1058,14 @@ def _lagged_response_eval_support_pullback_hook(vector_field: Callable):
     return pullback_fn if callable(pullback_fn) else None
 
 
+def _lagged_response_eval_all_pullback_hook(vector_field: Callable):
+    owner = getattr(vector_field, "__self__", None)
+    if owner is None:
+        return None
+    pullback_fn = getattr(owner, "pullback_evaluate_with_lagged_response_all", None)
+    return pullback_fn if callable(pullback_fn) else None
+
+
 def _exact_stage_transpose_solve_compact_hook(vector_field: Callable):
     owner = getattr(vector_field, "__self__", None)
     if owner is None:
@@ -1392,6 +1400,44 @@ def _flat_rhs_lagged_response_support_pullback_factory(unravel, vector_field, ar
             support=support,
             **kwargs,
         )
+
+    return _pullback
+
+
+def _flat_rhs_lagged_response_all_pullback_factory(
+    unravel,
+    pack_flat,
+    vector_field,
+    args,
+    kwargs,
+    project_flat=None,
+):
+    """Flatten the combined exact fixed-lagged RHS pullback hook."""
+    pullback_fn = _lagged_response_eval_all_pullback_hook(vector_field)
+    if pullback_fn is None:
+        return None
+    unravel_bar = getattr(unravel, "cotangent", unravel)
+
+    def _pullback(t_value, flat_y, lagged_response, rhs_bar_flat, support):
+        projected_flat_y = _project_flat_state_if_needed(flat_y, project_flat)
+        state_y = unravel(projected_flat_y)
+        rhs_bar_state = unravel_bar(jnp.asarray(rhs_bar_flat, dtype=jnp.asarray(flat_y).dtype))
+        state_bar, lagged_response_bar, support_bar = pullback_fn(
+            t_value,
+            state_y,
+            *args,
+            lagged_response=lagged_response,
+            rhs_bar=rhs_bar_state,
+            support=support,
+            **kwargs,
+        )
+        projected_state_bar = pack_flat(state_bar)
+        if project_flat is None:
+            flat_state_bar = projected_state_bar
+        else:
+            _, project_pullback = jax.vjp(project_flat, flat_y)
+            (flat_state_bar,) = project_pullback(projected_state_bar)
+        return flat_state_bar, lagged_response_bar, support_bar
 
     return _pullback
 
@@ -3466,6 +3512,7 @@ class _RadauAcceptedStepPhysicsContext:
     flat_rhs_lagged_response_pullback: Callable[[Any, Any, Any, Any], Any] | None = None
     flat_rhs_build_support_pullback: Callable[[Any, Any, Any], Any] | None = None
     flat_rhs_lagged_response_support_pullback: Callable[[Any, Any, Any, Any, Any], Any] | None = None
+    flat_rhs_lagged_response_all_pullback: Callable[[Any, Any, Any, Any, Any], tuple[Any, Any, Any]] | None = None
     flat_rhs_state_pullback: Callable[[Any, Any, Any, Any], Any] | None = None
     flat_rhs_direct_state_pullback: Callable[[Any, Any, Any, Any], Any] | None = None
     flat_rhs_direct_state_pullback_generic: Callable[[Any, Any, Any, Any], Any] | None = None
@@ -3487,6 +3534,7 @@ class _RadauAcceptedStepPhysicsContext:
     reverse_direct_stage_adjoint: bool = False
     reverse_stage_adjoint_solve_mode: str = "structured"
     reverse_rhs_transpose_mode: str = "generic"
+    reverse_rhs_pullback_mode: str = "separate"
     reverse_stage_cotangent_mode: str = "full"
     reverse_step_bwd_mode: str = "current"
     reverse_stage_adjoint_memory_mode: str = "default"
@@ -5502,35 +5550,71 @@ def _execute_radau_accepted_step_next_reduced_cotangent_batched_bwd_with_support
             rhs=dz_bars.reshape((dz_bars.shape[0], -1)),
         )
 
-    residual_y_bars, _, residual_lagged_bars = jax.vmap(
-        lambda residual_bar: _radau_exact_stage_residual_input_pullback(
-            kernel_context,
-            physics_context,
-            carry_in,
-            primal_result,
-            lagged_response,
-            residual_bar,
-            compute_dt_bar=False,
-        )
-    )(residual_bars)
-    support_bar_leaves = jax.vmap(
-        lambda residual_bar: tuple(
-            jax.tree_util.tree_leaves(
-                _radau_sanitize_support_delta_bar_tree(
-                    support,
-                    _radau_exact_stage_residual_support_pullback(
-                        kernel_context,
-                        physics_context,
-                        carry_in,
-                        primal_result,
-                        lagged_response,
-                        residual_bar,
+    rhs_pullback_mode = str(
+        getattr(physics_context, "reverse_rhs_pullback_mode", "separate")
+    ).strip().lower()
+    if rhs_pullback_mode == "fused_ntx":
+        if physics_context.flat_rhs_lagged_response_all_pullback is None:
+            raise ValueError(
+                "reverse_rhs_pullback_mode='fused_ntx' requires the combined "
+                "fixed-lagged RHS pullback hook."
+            )
+        rhs_transpose_mode = str(
+            getattr(physics_context, "reverse_rhs_transpose_mode", "generic")
+        ).strip().lower()
+        cotangent_mode = str(
+            getattr(physics_context, "reverse_stage_cotangent_mode", "full")
+        ).strip().lower()
+        if rhs_transpose_mode not in {"explicit", "explicit_ntx_interpolated"} or cotangent_mode != "full":
+            raise ValueError(
+                "reverse_rhs_pullback_mode='fused_ntx' currently requires "
+                "reverse_rhs_transpose_mode='explicit_ntx_interpolated' and "
+                "reverse_stage_cotangent_mode='full'."
+            )
+        residual_y_bars, residual_lagged_bars, support_bars = jax.vmap(
+            lambda residual_bar: _radau_exact_stage_residual_input_and_support_pullback_fused_ntx(
+                kernel_context,
+                physics_context,
+                carry_in,
+                primal_result,
+                lagged_response,
+                residual_bar,
+                support,
+            )
+        )(residual_bars)
+        support_bar_leaves = tuple(jax.tree_util.tree_leaves(support_bars))
+    elif rhs_pullback_mode == "separate":
+        residual_y_bars, _, residual_lagged_bars = jax.vmap(
+            lambda residual_bar: _radau_exact_stage_residual_input_pullback(
+                kernel_context,
+                physics_context,
+                carry_in,
+                primal_result,
+                lagged_response,
+                residual_bar,
+                compute_dt_bar=False,
+            )
+        )(residual_bars)
+        support_bar_leaves = jax.vmap(
+            lambda residual_bar: tuple(
+                jax.tree_util.tree_leaves(
+                    _radau_sanitize_support_delta_bar_tree(
                         support,
-                    ),
+                        _radau_exact_stage_residual_support_pullback(
+                            kernel_context,
+                            physics_context,
+                            carry_in,
+                            primal_result,
+                            lagged_response,
+                            residual_bar,
+                            support,
+                        ),
+                    )
                 )
             )
-        )
-    )(residual_bars)
+        )(residual_bars)
+    else:
+        raise ValueError(f"Unknown reverse_rhs_pullback_mode '{rhs_pullback_mode}'.")
 
     y_bars = trial_y_bars + jnp.asarray(residual_y_bars, dtype=kernel_context.dtype)
     lagged_cache_bars = _add_tangent_trees(
@@ -7480,6 +7564,50 @@ def _radau_exact_stage_residual_support_pullback(
     return support_bar
 
 
+def _radau_exact_stage_residual_input_and_support_pullback_fused_ntx(
+    kernel_context: _RadauAcceptedStepKernelContext,
+    physics_context: _RadauAcceptedStepPhysicsContext,
+    carry_in: _RadauAcceptedStepCarry,
+    primal_result: _RadauAcceptedStepAttemptResult,
+    lagged_response,
+    residual_bar,
+    support,
+):
+    """Exact one-step RHS pullbacks with a shared NTX assembly traversal.
+
+    The combined owner hook receives ``-residual_stage`` because the Radau
+    residual is ``z - rhs``.  It returns the already signed state, lagged, and
+    support cotangents for each stage; summing stages is therefore equivalent
+    to the existing separate input and support pullbacks.
+    """
+    pullback_fn = physics_context.flat_rhs_lagged_response_all_pullback
+    if pullback_fn is None:
+        raise ValueError("fused_ntx requires the combined fixed-lagged RHS pullback hook.")
+    residual_stages = jnp.asarray(residual_bar, dtype=kernel_context.dtype).reshape(
+        (kernel_context.num_stages, kernel_context.state_dim)
+    )
+    stage_times, stage_states = _radau_exact_stage_times_states(
+        kernel_context,
+        carry_in,
+        primal_result,
+    )
+    state_bars, lagged_bars, support_bars = jax.vmap(
+        lambda t_eval, y_eval, residual_stage: pullback_fn(
+            t_eval,
+            y_eval,
+            lagged_response,
+            -residual_stage,
+            support,
+        ),
+        in_axes=(0, 0, 0),
+    )(stage_times, stage_states, residual_stages)
+    return (
+        jnp.sum(state_bars, axis=0),
+        _radau_sum_leading_axis_tree(lagged_bars),
+        _radau_sum_leading_axis_tree(support_bars),
+    )
+
+
 def _radau_exact_stage_residual_transpose_matvec(
     kernel_context: _RadauAcceptedStepKernelContext,
     physics_context: _RadauAcceptedStepPhysicsContext,
@@ -8074,7 +8202,19 @@ def _radau_exact_stage_residual_matrix(
 
         return jax.jacfwd(_rhs_at_stage)(y_eval)
 
-    if matrix_mode == "block_explicit_ntx_jacobian":
+    if matrix_mode == "block_frozen_forward_jacobian":
+        # Match the replayed primal Radau step: jacobian_out is its
+        # frozen/reference Jacobian (including that replay's accepted-step
+        # reuse decision), used for every Radau stage.  The scalar schedule
+        # artifact deliberately does not retain the original rollout's dense
+        # Jacobian cache, so this must not be described as a saved-forward
+        # Jacobian.  This is deliberately a forward-linearized reverse,
+        # rather than the exact converged-stage residual derivative.
+        stage_jacobians = jnp.broadcast_to(
+            jnp.asarray(primal_result.jacobian_out, dtype=kernel_context.dtype),
+            (kernel_context.num_stages, kernel_context.state_dim, kernel_context.state_dim),
+        )
+    elif matrix_mode == "block_explicit_ntx_jacobian":
         if lagged_response is None or physics_context.flat_rhs_state_pullback is None:
             raise ValueError(
                 "reverse_stage_adjoint_solve_mode='block_explicit_ntx_jacobian' requires "
@@ -10029,7 +10169,7 @@ def _radau_solve_exact_stage_residual_transpose(
             rhs=rhs,
             method=mode,
         )
-    if mode not in {"block", "block_explicit_ntx_jacobian"}:
+    if mode not in {"block", "block_explicit_ntx_jacobian", "block_frozen_forward_jacobian"}:
         raise ValueError(f"Unknown reverse_stage_adjoint_solve_mode '{mode}'.")
     return _radau_solve_exact_stage_residual_transpose_block(
         kernel_context,
@@ -10120,7 +10260,7 @@ def _radau_solve_exact_stage_residual_transpose_batched(
             rhs=rhs_arr,
             method=mode,
         )
-    if mode not in {"block", "block_explicit_ntx_jacobian"}:
+    if mode not in {"block", "block_explicit_ntx_jacobian", "block_frozen_forward_jacobian"}:
         raise ValueError(f"Unknown reverse_stage_adjoint_solve_mode '{mode}'.")
     return jax.vmap(
         lambda rhs_row: _radau_solve_exact_stage_residual_transpose_block(
@@ -15635,6 +15775,14 @@ def _build_prepared_radau_accepted_rollout(
         kwargs=kwargs,
         project_flat=project_flat,
     )
+    flat_rhs_lagged_response_all_pullback = _flat_rhs_lagged_response_all_pullback_factory(
+        unravel=unpack_flat,
+        pack_flat=pack_state,
+        vector_field=vector_field,
+        args=args,
+        kwargs=kwargs,
+        project_flat=project_flat,
+    )
     flat_rhs_state_pullback = _flat_rhs_state_pullback_factory(
         unravel=unpack_flat,
         pack_flat=pack_state,
@@ -15912,6 +16060,7 @@ def _build_prepared_radau_accepted_rollout(
         flat_rhs_lagged_response_pullback=flat_rhs_lagged_response_pullback,
         flat_rhs_build_support_pullback=flat_rhs_build_support_pullback,
         flat_rhs_lagged_response_support_pullback=flat_rhs_lagged_response_support_pullback,
+        flat_rhs_lagged_response_all_pullback=flat_rhs_lagged_response_all_pullback,
         flat_rhs_state_pullback=flat_rhs_state_pullback,
         flat_rhs_direct_state_pullback=flat_rhs_direct_state_pullback,
         flat_rhs_direct_state_pullback_generic=flat_rhs_direct_state_pullback_generic,
@@ -16085,6 +16234,14 @@ class RADAUSolver(_RadauSolverConfig):
         )
         flat_rhs_lagged_response_support_pullback = _flat_rhs_lagged_response_support_pullback_factory(
             unravel=unpack_flat,
+            vector_field=vector_field,
+            args=args,
+            kwargs=kwargs,
+            project_flat=project_flat,
+        )
+        flat_rhs_lagged_response_all_pullback = _flat_rhs_lagged_response_all_pullback_factory(
+            unravel=unpack_flat,
+            pack_flat=pack_state,
             vector_field=vector_field,
             args=args,
             kwargs=kwargs,
@@ -16361,6 +16518,7 @@ class RADAUSolver(_RadauSolverConfig):
             flat_rhs_lagged_response_pullback=flat_rhs_lagged_response_pullback,
             flat_rhs_build_support_pullback=flat_rhs_build_support_pullback,
             flat_rhs_lagged_response_support_pullback=flat_rhs_lagged_response_support_pullback,
+            flat_rhs_lagged_response_all_pullback=flat_rhs_lagged_response_all_pullback,
             flat_rhs_state_pullback=flat_rhs_state_pullback,
             flat_rhs_direct_state_pullback=flat_rhs_direct_state_pullback,
             flat_rhs_direct_density_state_pullback=flat_rhs_direct_density_state_pullback,

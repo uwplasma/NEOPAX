@@ -2152,6 +2152,7 @@ def _prepare_reverse_static_setup(
     reverse_direct_stage_adjoint: bool = False,
     reverse_stage_adjoint_solve_mode: str = "structured",
     reverse_rhs_transpose_mode: str = "generic",
+    reverse_rhs_pullback_mode: str = "separate",
     reverse_stage_cotangent_mode: str = "full",
     reverse_step_bwd_mode: str = "current",
     reverse_stage_adjoint_memory_mode: str = "default",
@@ -2190,6 +2191,7 @@ def _prepare_reverse_static_setup(
                 reverse_direct_stage_adjoint=True,
                 reverse_stage_adjoint_solve_mode=str(reverse_stage_adjoint_solve_mode),
                 reverse_rhs_transpose_mode=str(reverse_rhs_transpose_mode),
+                reverse_rhs_pullback_mode=str(reverse_rhs_pullback_mode),
                 reverse_stage_cotangent_mode=str(reverse_stage_cotangent_mode),
                 reverse_step_bwd_mode=str(reverse_step_bwd_mode),
                 reverse_stage_adjoint_memory_mode=str(reverse_stage_adjoint_memory_mode),
@@ -3535,7 +3537,8 @@ def _run_realtime_geometry_optimization_api_smoke(
     if bool(getattr(args, "full_transport_shared_payload_smoke", False)):
         print(
             "[autodiff-gate] progress: full-transport reverse stage-adjoint "
-            f"solve mode={args.reverse_stage_adjoint_solve_mode}",
+            f"solve mode={args.reverse_stage_adjoint_solve_mode} "
+            f"rhs_pullback_mode={args.reverse_rhs_pullback_mode}",
             flush=True,
         )
         geom_cfg = config.get("geometry", {})
@@ -3582,6 +3585,7 @@ def _run_realtime_geometry_optimization_api_smoke(
             initial_er_root_ad=str(args.initial_er_root_ad),
             reverse_stage_adjoint_solve_mode=str(args.reverse_stage_adjoint_solve_mode),
             reverse_rhs_transpose_mode=str(args.reverse_rhs_transpose_mode),
+            reverse_rhs_pullback_mode=str(args.reverse_rhs_pullback_mode),
             reverse_step_bwd_mode=str(args.reverse_step_bwd_mode),
             reverse_schedule_artifact_mode=str(args.reverse_schedule_artifact_mode),
             max_reverse_accepted_steps=(
@@ -3649,6 +3653,7 @@ def _run_realtime_geometry_optimization_api_smoke(
         "reverse_segment_length": None if args.reverse_segment_length is None else int(args.reverse_segment_length),
         "realtime_geometry_gradient_path": str(args.realtime_geometry_gradient_path),
         "initial_er_root_ad": str(args.initial_er_root_ad),
+        "reverse_rhs_pullback_mode": str(args.reverse_rhs_pullback_mode),
         "shared_payload_smoke": bool(getattr(args, "full_transport_shared_payload_smoke", False)),
         "shared_payload_note": (
             "Full transport shared-path smoke uses the internal realtime-geometry "
@@ -3998,6 +4003,7 @@ def _run_realtime_geometry_initial_carry_boundary_probe(
         reverse_direct_stage_adjoint=True,
         reverse_stage_adjoint_solve_mode=args.reverse_stage_adjoint_solve_mode,
         reverse_rhs_transpose_mode=args.reverse_rhs_transpose_mode,
+        reverse_rhs_pullback_mode=args.reverse_rhs_pullback_mode,
         reverse_stage_cotangent_mode=args.reverse_stage_cotangent_mode,
         reverse_step_bwd_mode=args.reverse_step_bwd_mode,
         reverse_stage_adjoint_memory_mode=args.reverse_stage_adjoint_memory_mode,
@@ -5287,6 +5293,7 @@ def main() -> None:
             "bicgstab",
             "block",
             "block_explicit_ntx_jacobian",
+            "block_frozen_forward_jacobian",
             "gmres",
             "exact_block_compact",
             "woodbury_compact",
@@ -5301,11 +5308,24 @@ def main() -> None:
             "'gmres' are correctness oracles but are memory/compile heavy; "
             "'block_explicit_ntx_jacobian' keeps the exact block system but materializes "
             "each fixed-lagged NTX stage Jacobian from the explicit state pullback; "
+            "'block_frozen_forward_jacobian' uses each replayed primal step's frozen "
+            "jacobian_out for every stage and is a non-exact comparison mode; "
             "'exact_block_compact' requires a non-dense exact compact solve hook; "
             "'woodbury_compact' uses the experimental rank-truncated block-Woodbury solve; "
             "'woodbury_matvec_compact' builds the same Woodbury system from the compact "
             "transpose matvec instead of jacfwd; 'woodbury_er_coeff_compact' uses compact "
             "radial bands plus a skinny Er-coefficient Woodbury correction."
+        ),
+    )
+    parser.add_argument(
+        "--reverse-rhs-pullback-mode",
+        choices=("separate", "fused_ntx"),
+        default="separate",
+        help=(
+            "Exact fixed-lagged RHS pullback dispatch. 'separate' preserves the "
+            "reference state/lagged/support calls. 'fused_ntx' is an opt-in "
+            "NEOPAX-only experiment that shares NTX shared-flux assembly; the "
+            "realtime-geometry payload path retains its established pullback."
         ),
     )
     parser.add_argument(
@@ -5650,6 +5670,7 @@ def main() -> None:
         reverse_direct_stage_adjoint=reverse_direct_stage_adjoint,
         reverse_stage_adjoint_solve_mode=str(args.reverse_stage_adjoint_solve_mode),
         reverse_rhs_transpose_mode=str(args.reverse_rhs_transpose_mode),
+        reverse_rhs_pullback_mode=str(args.reverse_rhs_pullback_mode),
         reverse_stage_cotangent_mode=str(args.reverse_stage_cotangent_mode),
         reverse_step_bwd_mode=str(args.reverse_step_bwd_mode),
         reverse_stage_adjoint_memory_mode=str(args.reverse_stage_adjoint_memory_mode),
