@@ -5695,6 +5695,34 @@ def _execute_radau_accepted_step_next_reduced_cotangent_batched_bwd_with_support
     )
 
 
+@partial(jax.jit, static_argnums=(0, 1, 2, 3), inline=False)
+def _execute_radau_accepted_step_next_reduced_cotangent_batched_bwd_with_support_call(
+    kernel_context: _RadauAcceptedStepKernelContext,
+    physics_context: _RadauAcceptedStepPhysicsContext,
+    context: _RadauAcceptedStepAttemptContext,
+    lagged_response_branch: str,
+    carry_in: _RadauAcceptedStepCarry,
+    next_reduced_bars: _RadauAcceptedStepReducedCotangent,
+    support,
+) -> tuple[_RadauAcceptedStepReducedCotangent, tuple[Any, ...]]:
+    """Exact batched step adjoint behind a non-inlined XLA call boundary.
+
+    This is an opt-in compilation-boundary variant of the existing exact
+    support-payload reduced-cotangent step reverse.  It deliberately changes
+    neither the primal reconstruction nor the adjoint equations.
+    """
+
+    return _execute_radau_accepted_step_next_reduced_cotangent_batched_bwd_with_support(
+        kernel_context,
+        physics_context,
+        context,
+        lagged_response_branch,
+        carry_in,
+        next_reduced_bars,
+        support,
+    )
+
+
 @partial(jax.jit, static_argnums=(0, 1), inline=False)
 def _radau_segment_reduced_cotangent_bwd_call(
     execution_context: _RadauSolveExecutionContext,
@@ -5729,7 +5757,6 @@ def _radau_segment_reduced_cotangent_bwd_call(
     zero_step_bwd = mode in {"zero_step_bwd", "step_bwd_zero", "zero_accepted_step_bwd"}
     force_reuse_bwd = mode in {"force_reuse_bwd", "reuse_bwd_only", "reuse_only_bwd"}
     force_rebuild_bwd = mode in {"force_rebuild_bwd", "rebuild_bwd_only", "rebuild_only_bwd"}
-
     def _slot_bwd(slot_reduced_bar, slot_xs):
         step_start_carry, slot_arrays = slot_xs
         if zero_step_bwd:
@@ -6373,6 +6400,14 @@ def _radau_segment_reduced_cotangent_bwd_batched_with_support_call(
     zero_step_bwd = mode in {"zero_step_bwd", "step_bwd_zero", "zero_accepted_step_bwd"}
     force_reuse_bwd = mode in {"force_reuse_bwd", "reuse_bwd_only", "reuse_only_bwd"}
     force_rebuild_bwd = mode in {"force_rebuild_bwd", "rebuild_bwd_only", "rebuild_only_bwd"}
+    step_bwd_mode = str(
+        getattr(execution_context.physics_context, "reverse_step_bwd_mode", "reduced_cotangent")
+    ).strip().lower()
+    use_step_call_boundary = step_bwd_mode in {
+        "reduced_cotangent_call_boundary",
+        "reduced_cotangent_step_call",
+        "call_boundary",
+    }
     zero_support_leaves = tuple(jax.tree_util.tree_leaves(_radau_zero_support_delta_tree_like(support)))
     objective_count = jnp.asarray(segment_reduced_bars.y).shape[0]
     zero_support_bar_leaves = tuple(
@@ -6401,6 +6436,16 @@ def _radau_segment_reduced_cotangent_bwd_batched_with_support_call(
             residual_carry = _radau_carry_with_forward_only_jvp_fields(carry_for_step)
 
             def _reuse_branch(_):
+                if use_step_call_boundary:
+                    return _execute_radau_accepted_step_next_reduced_cotangent_batched_bwd_with_support_call(
+                        execution_context.kernel_context,
+                        execution_context.physics_context,
+                        execution_context.attempt_context,
+                        "reuse",
+                        residual_carry,
+                        slot_reduced_bars,
+                        support,
+                    )
                 return _execute_radau_accepted_step_next_reduced_cotangent_batched_bwd_with_support(
                     execution_context.kernel_context,
                     execution_context.physics_context,
@@ -6412,6 +6457,16 @@ def _radau_segment_reduced_cotangent_bwd_batched_with_support_call(
                 )
 
             def _rebuild_branch(_):
+                if use_step_call_boundary:
+                    return _execute_radau_accepted_step_next_reduced_cotangent_batched_bwd_with_support_call(
+                        execution_context.kernel_context,
+                        execution_context.physics_context,
+                        execution_context.attempt_context,
+                        "rebuild",
+                        residual_carry,
+                        slot_reduced_bars,
+                        support,
+                    )
                 return _execute_radau_accepted_step_next_reduced_cotangent_batched_bwd_with_support(
                     execution_context.kernel_context,
                     execution_context.physics_context,
@@ -14809,6 +14864,7 @@ def _radau_adaptive_final_y_realized_schedule_vjp_bwd(
         ).strip().lower()
         reduced_cotangent_bwd = step_bwd_mode in {
             "reduced_cotangent",
+            "reduced_cotangent_call_boundary",
             "reduced_cotangent_lean_replay",
             "reduced_cotangent_recompute_replay",
             "lean_replay",

@@ -2879,6 +2879,7 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
     ).strip().lower()
     if step_bwd_mode not in {
         "reduced_cotangent",
+        "reduced_cotangent_call_boundary",
         "reduced_cotangent_lean_replay",
         "reduced_cotangent_recompute_replay",
         "lean_replay",

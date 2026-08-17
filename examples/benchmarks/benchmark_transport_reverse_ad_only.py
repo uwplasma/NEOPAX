@@ -1294,6 +1294,7 @@ def _reverse_all_objectives_multi_rhs_reduced_for_parameter_vector(
     ).strip().lower()
     if step_bwd_mode not in {
         "reduced_cotangent",
+        "reduced_cotangent_call_boundary",
         "reduced_cotangent_lean_replay",
         "reduced_cotangent_recompute_replay",
         "lean_replay",
@@ -1426,6 +1427,7 @@ def _reverse_objective_support_payload_bar_for_parameter_vector(
     ).strip().lower()
     if step_bwd_mode not in {
         "reduced_cotangent",
+        "reduced_cotangent_call_boundary",
         "reduced_cotangent_lean_replay",
         "reduced_cotangent_recompute_replay",
         "lean_replay",
@@ -1639,6 +1641,7 @@ def _reverse_objective_initial_state_bar(
     ).strip().lower()
     if step_bwd_mode not in {
         "reduced_cotangent",
+        "reduced_cotangent_call_boundary",
         "reduced_cotangent_lean_replay",
         "reduced_cotangent_recompute_replay",
         "lean_replay",
@@ -1816,6 +1819,7 @@ def _reverse_all_objectives_initial_state_boundary(
     ).strip().lower()
     if step_bwd_mode not in {
         "reduced_cotangent",
+        "reduced_cotangent_call_boundary",
         "reduced_cotangent_lean_replay",
         "reduced_cotangent_recompute_replay",
         "lean_replay",
@@ -3538,7 +3542,8 @@ def _run_realtime_geometry_optimization_api_smoke(
         print(
             "[autodiff-gate] progress: full-transport reverse stage-adjoint "
             f"solve mode={args.reverse_stage_adjoint_solve_mode} "
-            f"rhs_pullback_mode={args.reverse_rhs_pullback_mode}",
+            f"rhs_pullback_mode={args.reverse_rhs_pullback_mode} "
+            f"step_bwd_mode={args.reverse_step_bwd_mode}",
             flush=True,
         )
         geom_cfg = config.get("geometry", {})
@@ -5430,6 +5435,7 @@ def main() -> None:
             "current",
             "manual_split",
             "reduced_cotangent",
+            "reduced_cotangent_call_boundary",
             "reduced_cotangent_lean_replay",
             "reduced_cotangent_recompute_replay",
             "reduced_cotangent_host_segments",
@@ -5441,7 +5447,10 @@ def main() -> None:
             "split/manual accepted-step adjoint and currently routes through the "
             "same implementation while plumbing is validated. 'reduced_cotangent' "
             "uses a reduced final-state cotangent contract inside the segmented "
-            "accepted-step reverse scan. 'reduced_cotangent_lean_replay' stores "
+            "accepted-step reverse scan. 'reduced_cotangent_call_boundary' keeps "
+            "the same exact reduced-cotangent equations but places each batched "
+            "step-with-support adjoint behind a non-inlined JIT call boundary. "
+            "'reduced_cotangent_lean_replay' stores "
             "the per-slot replay tape after masking forward-only Radau cache fields. "
             "'reduced_cotangent_recompute_replay' recomputes each slot start from "
             "the segment checkpoint instead of storing the full per-slot carry tape. "
