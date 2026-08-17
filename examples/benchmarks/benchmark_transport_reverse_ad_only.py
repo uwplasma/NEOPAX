@@ -5261,6 +5261,17 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--reverse-single-segment-vjp-forward-mode",
+        choices=("legacy", "reuse_adaptive_rollout"),
+        default="legacy",
+        help=(
+            "Experimental one-segment-only VJP-forward setup. "
+            "reuse_adaptive_rollout reuses carry0 and the adaptive final carry, "
+            "skipping the otherwise redundant accepted-schedule replay. "
+            "Default legacy preserves the current path."
+        ),
+    )
+    parser.add_argument(
         "--reverse-stage-adjoint-woodbury-rank",
         type=int,
         default=24,

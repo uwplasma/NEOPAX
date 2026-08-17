@@ -3493,6 +3493,7 @@ class _RadauAcceptedStepPhysicsContext:
     reverse_stage_adjoint_iter_maxiter: int = 40
     reverse_stage_adjoint_iter_tol: float = 1.0e-10
     reverse_stage_adjoint_woodbury_rank: int = 24
+    reverse_single_segment_vjp_forward_mode: str = "legacy"
     reverse_lagged_branch_schedule: tuple[bool, ...] | None = None
 
 
@@ -14482,19 +14483,45 @@ def _radau_adaptive_final_y_realized_schedule_vjp_fwd(
             replay_next_lagged_response_valid.reshape((segment_count, segment_length)),
         )
 
-        def _segment_forward(carry, xs):
-            segment_rollout = _radau_replay_realized_accepted_rollout(
-                execution_context,
-                carry,
-                *xs,
+        single_segment_mode = str(
+            getattr(
+                execution_context.physics_context,
+                "reverse_single_segment_vjp_forward_mode",
+                "legacy",
             )
-            return segment_rollout.final_carry, carry
+        ).strip().lower()
+        if single_segment_mode not in {"legacy", "reuse_adaptive_rollout"}:
+            raise ValueError(
+                "Unknown reverse_single_segment_vjp_forward_mode "
+                f"'{single_segment_mode}'."
+            )
 
-        segmented_final_carry, segment_start_carries = jax.lax.scan(
-            _segment_forward,
-            carry0,
-            segmented_replay_arrays,
-        )
+        # Experimental opt-in: with exactly one segment, its start carry is
+        # already carry0 and its final carry is already the adaptive rollout
+        # result. Reuse those values instead of replaying the whole accepted
+        # schedule solely to construct the same two segment-level values.
+        # Per-step carries are still reconstructed by the reverse segment
+        # kernel; this does not retain a full accepted-step carry tape.
+        if single_segment_mode == "reuse_adaptive_rollout" and segment_count == 1:
+            segment_start_carries = jax.tree_util.tree_map(
+                lambda value: jnp.expand_dims(value, axis=0),
+                carry0,
+            )
+            segmented_final_carry = rollout.final_carry
+        else:
+            def _segment_forward(carry, xs):
+                segment_rollout = _radau_replay_realized_accepted_rollout(
+                    execution_context,
+                    carry,
+                    *xs,
+                )
+                return segment_rollout.final_carry, carry
+
+            segmented_final_carry, segment_start_carries = jax.lax.scan(
+                _segment_forward,
+                carry0,
+                segmented_replay_arrays,
+            )
     residuals = (
         carry0,
         active_mask,

@@ -8,6 +8,71 @@ This file collects the saved optimization-facing AD rows and the available FD
 references. Root-only ambipolarity and full time-evolution transport are kept
 separate because they are different maps.
 
+## 2026-08-17 Current Runtime: 16-Step Reverse AD vs Frozen-Root FD
+
+This is a new, separate table for the current clean runtime, not a replacement
+for the historical table below. It compares the reverse run in attachment
+`52544449-e29e-4f6c-bc2a-d233140cac7b/pasted-text.txt` with the frozen-root FD
+runs in attachment `68ec4a34-76b4-4b04-b8e2-25043283a041/pasted-text.txt`.
+
+- Reverse AD: `f5d22b9`, 16 accepted steps, `bicgstab`, segment length 4.
+- FD: accepted-step replay, frozen-linearized geometry and initial-`Er` root.
+- Parameters available in the pasted FD output: `n0`, `vmec:RBC:1:0`, and
+  `vmec:ZBS:1:0`.
+- `smooth_root_proxy` FD values are near zero, so relative errors are omitted.
+
+| Objective | Parameter | Reverse AD | FD | Abs diff | Rel diff |
+| --- | --- | ---: | ---: | ---: | ---: |
+| `transport:softmax_Er` | `n0` | `-4.7372059445518024e+00` | `-4.737153e+00` | `5.294455e-05` | `1.117645e-05` |
+| `transport:softmax_Er` | `vmec:RBC:1:0` | `-5.9294171360644114e+01` | `-5.929451e+01` | `3.386394e-04` | `5.711142e-06` |
+| `transport:softmax_Er` | `vmec:ZBS:1:0` | `1.7363563921683088e+01` | `1.736354e+01` | `2.392168e-05` | `1.377696e-06` |
+| `transport:smooth_root_proxy` | `n0` | `1.3140207886077174e-12` | `2.060242e-12` | `7.462212e-13` | not meaningful |
+| `transport:smooth_root_proxy` | `vmec:RBC:1:0` | `-1.5181833103128324e-11` | `-1.570778e-11` | `5.259469e-13` | not meaningful |
+| `transport:smooth_root_proxy` | `vmec:ZBS:1:0` | `6.4341188451947432e-12` | `1.022043e-11` | `3.786311e-12` | not meaningful |
+| `transport:Er_transition_left` | `n0` | `-1.4431430225336488e+00` | `-1.443123e+00` | `2.002253e-05` | `1.387445e-05` |
+| `transport:Er_transition_left` | `vmec:RBC:1:0` | `-2.0323526025367933e+01` | `-2.032336e+01` | `1.660254e-04` | `8.169189e-06` |
+| `transport:Er_transition_left` | `vmec:ZBS:1:0` | `1.4570485947972855e-01` | `1.455537e-01` | `1.511595e-04` | `1.038513e-03` |
+| `transport:Er_transition_right` | `n0` | `-1.6668910892926467e+00` | `-1.666926e+00` | `3.491071e-05` | `2.094317e-05` |
+| `transport:Er_transition_right` | `vmec:RBC:1:0` | `-2.2520000095719766e+01` | `-2.251924e+01` | `7.600957e-04` | `3.375317e-05` |
+| `transport:Er_transition_right` | `vmec:ZBS:1:0` | `1.0112381885185524e+00` | `1.011268e+00` | `2.981148e-05` | `2.947931e-05` |
+| `transport:Er2_volume_average` | `n0` | `-6.1442936636985735e+01` | `-6.144275e+01` | `1.866370e-04` | `3.037575e-06` |
+| `transport:Er2_volume_average` | `vmec:RBC:1:0` | `-6.4027857277260023e+02` | `-6.439559e+02` | `3.677327e+00` | `5.710526e-03` |
+| `transport:Er2_volume_average` | `vmec:ZBS:1:0` | `2.3683438177132660e+02` | `2.405000e+02` | `3.665618e+00` | `1.524166e-02` |
+| `transport:Er_volume_average` | `n0` | `-2.0463404184736076e+00` | `-2.046336e+00` | `4.418474e-06` | `2.159212e-06` |
+| `transport:Er_volume_average` | `vmec:RBC:1:0` | `-2.0502251533818249e+01` | `-2.043617e+01` | `6.608153e-02` | `3.233558e-03` |
+| `transport:Er_volume_average` | `vmec:ZBS:1:0` | `1.3012056495750357e+01` | `1.294637e+01` | `6.568650e-02` | `5.073738e-03` |
+| `transport:electron_temperature_volume_average_keV` | `n0` | `8.1424000230967408e-04` | `8.142367e-04` | `3.302310e-09` | `4.055712e-06` |
+| `transport:electron_temperature_volume_average_keV` | `vmec:RBC:1:0` | `-1.4246699858583421e-02` | `-1.473905e-02` | `4.923501e-04` | `3.340447e-02` |
+| `transport:electron_temperature_volume_average_keV` | `vmec:ZBS:1:0` | `-4.0362002587967301e-02` | `-4.080381e-02` | `4.418074e-04` | `1.082760e-02` |
+| `transport:total_pressure_volume_average` | `n0` | `8.0616879274542512e+00` | `8.061688e+00` | `7.254575e-08` | `8.998829e-09` |
+| `transport:total_pressure_volume_average` | `vmec:RBC:1:0` | `-7.2256082317058004e-02` | `-7.291633e-02` | `6.602477e-04` | `9.054867e-03` |
+| `transport:total_pressure_volume_average` | `vmec:ZBS:1:0` | `-2.3734153978905831e-01` | `-2.379263e-01` | `5.847602e-04` | `2.457737e-03` |
+| `transport:alpha_power_volume_average_mw_m3` | `n0` | `2.7876640348138404e-01` | `2.787664e-01` | `3.481384e-09` | `1.248854e-08` |
+| `transport:alpha_power_volume_average_mw_m3` | `vmec:RBC:1:0` | `-7.7627036193996983e-03` | `-7.763178e-03` | `4.743806e-07` | `6.110650e-05` |
+| `transport:alpha_power_volume_average_mw_m3` | `vmec:ZBS:1:0` | `-1.1437598028239352e-03` | `-1.143404e-03` | `3.558028e-07` | `3.111786e-04` |
+| `transport:bootstrap_current_softmax_abs_scaled` | `n0` | `-1.4697163840828864e-03` | `-1.468507e-03` | `1.209384e-06` | `8.235467e-04` |
+| `transport:bootstrap_current_softmax_abs_scaled` | `vmec:RBC:1:0` | `-1.7890068335937415e+00` | `-1.788703e+00` | `3.038336e-04` | `1.698625e-04` |
+| `transport:bootstrap_current_softmax_abs_scaled` | `vmec:ZBS:1:0` | `-6.2524365315469987e+00` | `-6.253120e+00` | `6.834685e-04` | `1.093004e-04` |
+
+### 2026-08-17 Current Runtime: `T0` Reverse AD vs Frozen-Root FD
+
+The FD values below are from the 16-step `T0` command recorded in the terminal
+output. Reverse AD values are the matching current run in attachment
+`52544449-e29e-4f6c-bc2a-d233140cac7b/pasted-text.txt`.
+
+| Objective | Reverse AD `d/dT0` | Frozen-root FD `d/dT0` | Abs diff | Rel diff |
+| --- | ---: | ---: | ---: | ---: |
+| `transport:softmax_Er` | `3.9104300296804584e+00` | `3.910435e+00` | `4.970320e-06` | `1.271040e-06` |
+| `transport:smooth_root_proxy` | `1.8756469174381453e-13` | `1.624273e-13` | `2.513739e-14` | not meaningful |
+| `transport:Er_transition_left` | `1.8372816062999480e+00` | `1.837278e+00` | `3.606300e-06` | `1.962849e-06` |
+| `transport:Er_transition_right` | `2.0017656379975195e+00` | `2.001785e+00` | `1.936200e-05` | `9.672369e-06` |
+| `transport:Er2_volume_average` | `6.5043986175639475e+01` | `6.504393e+01` | `5.617564e-05` | `8.636569e-07` |
+| `transport:Er_volume_average` | `9.3973858121025389e-01` | `9.397335e-01` | `5.081210e-06` | `5.407076e-06` |
+| `transport:electron_temperature_volume_average_keV` | `3.5561174373341170e-01` | `3.556117e-01` | `4.373341e-08` | `1.229808e-07` |
+| `transport:total_pressure_volume_average` | `1.8651780767713835e+00` | `1.865178e+00` | `7.677138e-08` | `4.116035e-08` |
+| `transport:alpha_power_volume_average_mw_m3` | `8.3728491250583875e-02` | `8.372849e-02` | `1.250584e-09` | `1.493618e-08` |
+| `transport:bootstrap_current_softmax_abs_scaled` | `2.3160616144396828e-01` | `2.316064e-01` | `2.385560e-07` | `1.030006e-06` |
+
 ## Current 16-Step Full-Transport Shared-Payload AD vs FD
 
 Current reverse AD source:
