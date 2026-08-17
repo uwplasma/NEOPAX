@@ -2156,6 +2156,7 @@ def _prepare_reverse_static_setup(
     reverse_stage_adjoint_iter_maxiter: int = 40,
     reverse_stage_adjoint_iter_tol: float = 1.0e-10,
     reverse_stage_adjoint_woodbury_rank: int = 24,
+    reverse_single_segment_vjp_forward_mode: str = "legacy",
 ) -> _ReverseStaticSetup:
     state0_static = _initial_state_for_parameter_vector(
         parameter_values,
@@ -2192,6 +2193,7 @@ def _prepare_reverse_static_setup(
                 reverse_stage_adjoint_iter_maxiter=int(reverse_stage_adjoint_iter_maxiter),
                 reverse_stage_adjoint_iter_tol=float(reverse_stage_adjoint_iter_tol),
                 reverse_stage_adjoint_woodbury_rank=int(reverse_stage_adjoint_woodbury_rank),
+                reverse_single_segment_vjp_forward_mode=str(reverse_single_segment_vjp_forward_mode),
             ),
         )
     stop_after_accepted_steps = (
