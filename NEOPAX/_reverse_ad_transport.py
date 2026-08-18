@@ -92,6 +92,7 @@ from ._transport_solvers import (
     _radau_align_tangent_tree_to_primal,
     _radau_carry_from_step_state,
     _radau_eval_rhs,
+    _execute_radau_accepted_step_next_reduced_cotangent_batched_bwd_with_support_call,
     _radau_segment_reduced_cotangent_bwd_batched_with_support_call,
     _radau_sanitize_support_delta_bar_tree,
     _radau_zero_support_delta_tree_like,
@@ -101,6 +102,23 @@ from ._transport_solvers import (
 def _reverse_tree_debug_enabled() -> bool:
     raw = str(os.environ.get("NEOPAX_REVERSE_TREE_DEBUG", "")).strip().lower()
     return raw in {"1", "true", "yes", "on"}
+
+
+def _jax_trace_cache_size(jitted_function) -> int | None:
+    """Return JAX's in-process trace-cache entry count when exposed.
+
+    This is diagnostics-only host inspection. It is deliberately labeled
+    "trace cache": it does not claim to measure the persistent XLA cache or
+    device execution time.
+    """
+
+    cache_size = getattr(jitted_function, "_cache_size", None)
+    if not callable(cache_size):
+        return None
+    try:
+        return int(cache_size())
+    except Exception:
+        return None
 
 
 TransportReverseReport = Mapping[str, object]
@@ -2519,6 +2537,9 @@ def prepare_reverse_static_setup(
     reverse_rhs_transpose_mode: str = "generic",
     reverse_rhs_pullback_mode: str = "separate",
     reverse_initial_cache_support_pullback_mode: str = "scalar",
+    reverse_rebuild_support_pullback_mode: str = "separate",
+    reverse_segment_jit_diagnostics: bool = False,
+    reverse_segment_start_replay_mode: str = "legacy",
     reverse_stage_cotangent_mode: str = "full",
     reverse_step_bwd_mode: str = "current",
     reverse_stage_adjoint_memory_mode: str = "default",
@@ -2539,6 +2560,38 @@ def prepare_reverse_static_setup(
     )
     prepared_components_static = prepare_transport_solver_components(dict(config), runtime, state0_static)
     solver = prepared_components_static["solver"]
+    reverse_segment_start_replay_mode = str(reverse_segment_start_replay_mode).strip().lower()
+    if reverse_segment_start_replay_mode not in {"legacy", "minimal"}:
+        raise ValueError(
+            "reverse_segment_start_replay_mode must be one of {'legacy', 'minimal'}."
+        )
+    if reverse_segment_start_replay_mode == "minimal" and not isinstance(solver, RADAUSolver):
+        raise ValueError(
+            "reverse_segment_start_replay_mode='minimal' is currently implemented only for RADAUSolver."
+        )
+    if reverse_segment_start_replay_mode == "minimal" and not reverse_direct_stage_adjoint:
+        raise ValueError(
+            "reverse_segment_start_replay_mode='minimal' requires reverse_direct_stage_adjoint=True."
+        )
+    reverse_rebuild_support_pullback_mode = str(
+        reverse_rebuild_support_pullback_mode
+    ).strip().lower()
+    if reverse_rebuild_support_pullback_mode not in {
+        "separate",
+        "ntx_batched_interpolated_faces",
+    }:
+        raise ValueError(
+            "reverse_rebuild_support_pullback_mode must be one of "
+            "{'separate', 'ntx_batched_interpolated_faces'}."
+        )
+    if (
+        reverse_rebuild_support_pullback_mode == "ntx_batched_interpolated_faces"
+        and not reverse_direct_stage_adjoint
+    ):
+        raise ValueError(
+            "reverse_rebuild_support_pullback_mode='ntx_batched_interpolated_faces' "
+            "requires reverse_direct_stage_adjoint=True."
+        )
     solve_vector_field_static = prepared_components_static["solve_vector_field"]
     prepared_rollout_static = _build_prepared_reverse_accepted_rollout(
         solver=solver,
@@ -2562,6 +2615,11 @@ def prepare_reverse_static_setup(
                 reverse_initial_cache_support_pullback_mode=str(
                     reverse_initial_cache_support_pullback_mode
                 ),
+                reverse_rebuild_support_pullback_mode=str(
+                    reverse_rebuild_support_pullback_mode
+                ),
+                reverse_segment_jit_diagnostics=bool(reverse_segment_jit_diagnostics),
+                reverse_segment_start_replay_mode=str(reverse_segment_start_replay_mode),
                 reverse_stage_cotangent_mode=str(reverse_stage_cotangent_mode),
                 reverse_step_bwd_mode=str(reverse_step_bwd_mode),
                 reverse_stage_adjoint_memory_mode=str(reverse_stage_adjoint_memory_mode),
@@ -2809,6 +2867,16 @@ def prepare_realtime_geometry_support_segment_core_setup(
             args,
             "reverse_initial_cache_support_pullback_mode",
             "scalar",
+        ),
+        reverse_rebuild_support_pullback_mode=getattr(
+            args,
+            "reverse_rebuild_support_pullback_mode",
+            "separate",
+        ),
+        reverse_segment_start_replay_mode=getattr(
+            args,
+            "reverse_segment_start_replay_mode",
+            "legacy",
         ),
         reverse_stage_cotangent_mode=support_probe_cotangent_mode,
         reverse_step_bwd_mode=args.reverse_step_bwd_mode,
@@ -3247,6 +3315,13 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
     initial_cache_support_bar_leaves_accum = tuple(jnp.zeros_like(leaf) for leaf in support_bar_leaves)
     support_reuse_count = 0
     support_rebuild_count = 0
+    segment_jit_diagnostics = bool(
+        getattr(
+            reverse_setup.execution_context.physics_context,
+            "reverse_segment_jit_diagnostics",
+            False,
+        )
+    )
     print(
         f"{progress_prefix} progress: support reverse segmented cotangent sweep start "
         f"segments={segment_count} segment_length="
@@ -3257,6 +3332,13 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
     phase_start = time.perf_counter()
     for segment_index in range(segment_count - 1, -1, -1):
         segment_phase_start = time.perf_counter()
+        if segment_jit_diagnostics:
+            cache_before = (
+                _jax_trace_cache_size(_radau_segment_reduced_cotangent_bwd_batched_with_support_call),
+                _jax_trace_cache_size(
+                    _execute_radau_accepted_step_next_reduced_cotangent_batched_bwd_with_support_call
+                ),
+            )
         segment_start_carry = _take_tree_axis0(segment_start_carries, segment_index)
         segment_arrays = _take_tree_axis0(segmented_replay_arrays, segment_index)
         reduced_bars, segment_support_bar_leaves = (
@@ -3272,6 +3354,13 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
         reduced_bars, segment_support_bar_leaves = jax.block_until_ready(
             (reduced_bars, segment_support_bar_leaves)
         )
+        if segment_jit_diagnostics:
+            cache_after = (
+                _jax_trace_cache_size(_radau_segment_reduced_cotangent_bwd_batched_with_support_call),
+                _jax_trace_cache_size(
+                    _execute_radau_accepted_step_next_reduced_cotangent_batched_bwd_with_support_call
+                ),
+            )
         support_bar_leaves = tuple(
             accumulated + increment
             for accumulated, increment in zip(support_bar_leaves, segment_support_bar_leaves)
@@ -3294,6 +3383,15 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
             f"support_rebuild={segment_support_rebuild_count}",
             flush=True,
         )
+        if segment_jit_diagnostics:
+            print(
+                f"{progress_prefix} diagnostic: support reverse segment "
+                f"{segment_index + 1}/{segment_count} jax_trace_cache "
+                f"outer={cache_before[0]}->{cache_after[0]} "
+                f"step_call={cache_before[1]}->{cache_after[1]} "
+                "(host diagnostic; not an XLA persistent-cache metric)",
+                flush=True,
+            )
     reduced_bars, support_bar_leaves = jax.block_until_ready((reduced_bars, support_bar_leaves))
     print(
         f"{progress_prefix} progress: support reverse segmented cotangent sweep ready "
@@ -4352,6 +4450,9 @@ def internal_realtime_geometry_transport_reverse_table_result_builder(
     reverse_rhs_transpose_mode: str = "explicit_ntx_interpolated",
     reverse_rhs_pullback_mode: str = "separate",
     reverse_initial_cache_support_pullback_mode: str = "scalar",
+    reverse_rebuild_support_pullback_mode: str = "separate",
+    reverse_segment_jit_diagnostics: bool = False,
+    reverse_segment_start_replay_mode: str = "legacy",
     reverse_stage_cotangent_mode: str = "full",
     reverse_step_bwd_mode: str = "reduced_cotangent",
     reverse_stage_adjoint_memory_mode: str = "default",
@@ -4449,6 +4550,18 @@ def internal_realtime_geometry_transport_reverse_table_result_builder(
                     "reverse_initial_cache_support_pullback_mode",
                     reverse_initial_cache_support_pullback_mode,
                 )
+            ),
+            reverse_rebuild_support_pullback_mode=str(
+                opts.get(
+                    "reverse_rebuild_support_pullback_mode",
+                    reverse_rebuild_support_pullback_mode,
+                )
+            ),
+            reverse_segment_jit_diagnostics=bool(
+                opts.get("reverse_segment_jit_diagnostics", reverse_segment_jit_diagnostics)
+            ),
+            reverse_segment_start_replay_mode=str(
+                opts.get("reverse_segment_start_replay_mode", reverse_segment_start_replay_mode)
             ),
             reverse_stage_cotangent_mode=str(opts.get("reverse_stage_cotangent_mode", reverse_stage_cotangent_mode)),
             reverse_step_bwd_mode=str(opts.get("reverse_step_bwd_mode", reverse_step_bwd_mode)),

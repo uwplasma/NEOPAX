@@ -3134,10 +3134,15 @@ class _RadauAcceptedStepReverseMinimalAttemptResult:
     trial_y: Any
     stage_history: Any
     jacobian_out: Any
+    cache_valid_out: Any
+    cache_dt_out: Any
+    cache_age_out: Any
     real_lu_out: Any
     real_piv_out: Any
     complex_lu_out: Any
     complex_piv_out: Any
+    theta_final: Any
+    newton_iter_count: Any
 
 
 @jax.tree_util.register_dataclass
@@ -3568,6 +3573,9 @@ class _RadauAcceptedStepPhysicsContext:
     reverse_rhs_transpose_mode: str = "generic"
     reverse_rhs_pullback_mode: str = "separate"
     reverse_initial_cache_support_pullback_mode: str = "scalar"
+    reverse_rebuild_support_pullback_mode: str = "separate"
+    reverse_segment_jit_diagnostics: bool = False
+    reverse_segment_start_replay_mode: str = "legacy"
     reverse_stage_cotangent_mode: str = "full"
     reverse_step_bwd_mode: str = "current"
     reverse_stage_adjoint_memory_mode: str = "default"
@@ -5688,20 +5696,55 @@ def _execute_radau_accepted_step_next_reduced_cotangent_batched_bwd_with_support
         y_bars = y_bars + rebuild_flat_bars + lagged_reference_y_bars
 
         if physics_context.flat_rhs_build_support_pullback is not None and not zero_rebuild_pullback:
-            rebuild_support_bar_leaves = jax.vmap(
-                lambda lagged_cache_bar: tuple(
+            rebuild_support_pullback_mode = str(
+                getattr(
+                    physics_context,
+                    "reverse_rebuild_support_pullback_mode",
+                    "separate",
+                )
+            ).strip().lower()
+            if rebuild_support_pullback_mode == "ntx_batched_interpolated_faces":
+                batched_pullback = (
+                    physics_context.flat_rhs_build_support_pullback_batched_interpolated_faces
+                )
+                if batched_pullback is None:
+                    raise RuntimeError(
+                        "ntx_batched_interpolated_faces rebuild support pullback was requested, "
+                        "but the active transport physics context does not expose that hook."
+                    )
+                # The dedicated NTX rule returns every support leaf with its
+                # leading objective axis already attached. Do not run the
+                # scalar sanitizer here: it deliberately restores primal
+                # shapes for non-float leaves and would discard that axis.
+                rebuild_support_bar_leaves = tuple(
                     jax.tree_util.tree_leaves(
-                        _radau_sanitize_support_delta_bar_tree(
+                        batched_pullback(
+                            carry_in.y,
+                            lagged_cache_bars,
                             support,
-                            physics_context.flat_rhs_build_support_pullback(
-                                carry_in.y,
-                                lagged_cache_bar,
-                                support,
-                            ),
                         )
                     )
                 )
-            )(lagged_cache_bars)
+            elif rebuild_support_pullback_mode == "separate":
+                rebuild_support_bar_leaves = jax.vmap(
+                    lambda lagged_cache_bar: tuple(
+                        jax.tree_util.tree_leaves(
+                            _radau_sanitize_support_delta_bar_tree(
+                                support,
+                                physics_context.flat_rhs_build_support_pullback(
+                                    carry_in.y,
+                                    lagged_cache_bar,
+                                    support,
+                                ),
+                            )
+                        )
+                    )
+                )(lagged_cache_bars)
+            else:
+                raise ValueError(
+                    "Unknown reverse_rebuild_support_pullback_mode "
+                    f"{rebuild_support_pullback_mode!r}."
+                )
             support_bar_leaves = tuple(
                 stage_leaf + rebuild_leaf
                 for stage_leaf, rebuild_leaf in zip(
@@ -5773,8 +5816,22 @@ def _radau_segment_reduced_cotangent_bwd_call(
             lagged_reference_y=jnp.zeros_like(carry_value.lagged_reference_y),
         )
 
+    start_replay_mode = str(
+        getattr(execution_context.physics_context, "reverse_segment_start_replay_mode", "legacy")
+    ).strip().lower()
+    if start_replay_mode not in {"legacy", "minimal"}:
+        raise ValueError(
+            "Unknown reverse_segment_start_replay_mode "
+            f"{start_replay_mode!r}."
+        )
+    slot_replay = (
+        _radau_replay_realized_accepted_slot_reverse_minimal
+        if start_replay_mode == "minimal"
+        else _radau_replay_realized_accepted_slot
+    )
+
     def _segment_collect_start_carries(carry, slot_xs):
-        next_carry, _ = _radau_replay_realized_accepted_slot(
+        next_carry, _ = slot_replay(
             execution_context,
             carry,
             *slot_xs,
@@ -6174,8 +6231,22 @@ def _radau_segment_reduced_cotangent_bwd_batched_call(
             ),
         )
 
+    start_replay_mode = str(
+        getattr(execution_context.physics_context, "reverse_segment_start_replay_mode", "legacy")
+    ).strip().lower()
+    if start_replay_mode not in {"legacy", "minimal"}:
+        raise ValueError(
+            "Unknown reverse_segment_start_replay_mode "
+            f"{start_replay_mode!r}."
+        )
+    slot_replay = (
+        _radau_replay_realized_accepted_slot_reverse_minimal
+        if start_replay_mode == "minimal"
+        else _radau_replay_realized_accepted_slot
+    )
+
     def _segment_collect_start_carries(carry, slot_xs):
-        next_carry, _ = _radau_replay_realized_accepted_slot(
+        next_carry, _ = slot_replay(
             execution_context,
             carry,
             *slot_xs,
@@ -6416,8 +6487,22 @@ def _radau_segment_reduced_cotangent_bwd_batched_with_support_call(
             ),
         )
 
+    start_replay_mode = str(
+        getattr(execution_context.physics_context, "reverse_segment_start_replay_mode", "legacy")
+    ).strip().lower()
+    if start_replay_mode not in {"legacy", "minimal"}:
+        raise ValueError(
+            "Unknown reverse_segment_start_replay_mode "
+            f"{start_replay_mode!r}."
+        )
+    slot_replay = (
+        _radau_replay_realized_accepted_slot_reverse_minimal
+        if start_replay_mode == "minimal"
+        else _radau_replay_realized_accepted_slot
+    )
+
     def _segment_collect_start_carries(carry, slot_xs):
-        next_carry, _ = _radau_replay_realized_accepted_slot(
+        next_carry, _ = slot_replay(
             execution_context,
             carry,
             *slot_xs,
@@ -6644,10 +6729,15 @@ def _execute_radau_accepted_step_attempt_reverse_minimal(
         trial_y,
         stage_history,
         jacobian_out,
+        cache_valid_out,
+        cache_dt_out,
+        cache_age_out,
         real_lu_out,
         real_piv_out,
         complex_lu_out,
         complex_piv_out,
+        theta_final,
+        newton_iter_count,
         lagged_response_out,
         lagged_reference_y_out,
     ) = _radau_single_step_primal_reverse_minimal(kernel_context, physics_context, carry_in, trial_dt)
@@ -6663,10 +6753,73 @@ def _execute_radau_accepted_step_attempt_reverse_minimal(
         trial_y=trial_y,
         stage_history=stage_history,
         jacobian_out=jacobian_out,
+        cache_valid_out=cache_valid_out,
+        cache_dt_out=cache_dt_out,
+        cache_age_out=cache_age_out,
         real_lu_out=real_lu_out,
         real_piv_out=real_piv_out,
         complex_lu_out=complex_lu_out,
         complex_piv_out=complex_piv_out,
+        theta_final=theta_final,
+        newton_iter_count=newton_iter_count,
+    )
+
+
+def _radau_next_carry_from_reverse_minimal_attempt(
+    kernel_context: _RadauAcceptedStepKernelContext,
+    physics_context: _RadauAcceptedStepPhysicsContext,
+    carry_in: _RadauAcceptedStepCarry,
+    context: _RadauAcceptedStepAttemptContext,
+    next_dt_value,
+    recent_reject_count_value,
+    regrowth_cooldown_value,
+    easy_growth_streak_value,
+    lagged_response_valid_value,
+) -> _RadauAcceptedStepCarry:
+    """Reconstruct the next fixed-schedule carry without adaptive diagnostics.
+
+    This is for the forward scan that obtains segment-start carries after the
+    accepted schedule is known.  Controller transitions are provided by that
+    schedule, so the adaptive error estimator and controller update performed
+    by the ordinary accepted-step attempt are deliberately not reconstructed.
+    ``prev_error`` is retained only as inert controller metadata; the minimal
+    fixed-schedule replay and reduced adjoint do not consume it.
+    """
+
+    carry_for_minimal = _radau_carry_with_forward_only_jvp_fields(carry_in)
+    trial_dt = jnp.minimum(carry_for_minimal.dt, context.t_final - carry_for_minimal.t)
+    minimal_result = _execute_radau_accepted_step_attempt_reverse_minimal(
+        kernel_context,
+        physics_context,
+        carry_for_minimal,
+        context,
+    )
+    accepted_y = _project_flat_state_if_needed(
+        minimal_result.trial_y,
+        physics_context.project_flat,
+    )
+    return dataclasses.replace(
+        minimal_result.carry_after_attempt,
+        t=carry_for_minimal.t + trial_dt,
+        y=accepted_y,
+        dt=next_dt_value,
+        prev_error=carry_in.prev_error,
+        prev_stages=minimal_result.stage_history,
+        prev_dt=minimal_result.trial_dt,
+        recent_reject_count=recent_reject_count_value,
+        regrowth_cooldown=regrowth_cooldown_value,
+        easy_growth_streak=easy_growth_streak_value,
+        lagged_response_valid=lagged_response_valid_value,
+        jacobian=minimal_result.jacobian_out,
+        cache_valid=minimal_result.cache_valid_out,
+        cache_dt=minimal_result.cache_dt_out,
+        cache_age=minimal_result.cache_age_out,
+        real_lu=minimal_result.real_lu_out,
+        real_piv=minimal_result.real_piv_out,
+        complex_lu=minimal_result.complex_lu_out,
+        complex_piv=minimal_result.complex_piv_out,
+        prev_theta_final=minimal_result.theta_final,
+        prev_newton_iter_count=minimal_result.newton_iter_count,
     )
 
 
@@ -11652,14 +11805,22 @@ def _radau_single_step_primal_reverse_minimal(
     )
     stages_final = subsolve_result.z_final.reshape((kernel_context.num_stages, kernel_context.state_dim))
     flat_next = flat_y + h_value * (kernel_context.b @ stages_final)
+    cache_valid_out = jnp.asarray(True)
+    cache_dt_out = h_value
+    cache_age_out = jnp.where(reuse_jacobian, cache_age + 1, jnp.asarray(0, dtype=jnp.int32))
     return (
         flat_next,
         subsolve_result.z_final,
         jacobian_ref,
+        cache_valid_out,
+        cache_dt_out,
+        cache_age_out,
         real_lu_out,
         real_piv_out,
         complex_lu_out,
         complex_piv_out,
+        subsolve_result.theta_final,
+        subsolve_result.iter_final,
         lagged_response,
         lagged_reference_y,
     )
@@ -13001,6 +13162,52 @@ def _radau_replay_realized_accepted_slot(
     return jax.lax.cond(active, _do_step, _skip, operand=None)
 
 
+def _radau_replay_realized_accepted_slot_reverse_minimal(
+    execution_context: _RadauSolveExecutionContext,
+    carry: _RadauAcceptedStepCarry,
+    active,
+    dt_value,
+    next_dt_value,
+    recent_reject_count_value,
+    regrowth_cooldown_value,
+    easy_growth_streak_value,
+    lagged_response_valid_value,
+):
+    """Replay one fixed accepted slot without adaptive-error diagnostics."""
+
+    dtype = execution_context.dtype
+
+    def _do_step(_):
+        carry_for_step = dataclasses.replace(carry, dt=dt_value)
+        next_carry = _radau_next_carry_from_reverse_minimal_attempt(
+            execution_context.kernel_context,
+            execution_context.physics_context,
+            carry_for_step,
+            execution_context.attempt_context,
+            next_dt_value,
+            recent_reject_count_value,
+            regrowth_cooldown_value,
+            easy_growth_streak_value,
+            lagged_response_valid_value,
+        )
+        return next_carry, (
+            next_carry.y,
+            next_carry.prev_error,
+            jnp.asarray(True),
+            dt_value,
+        )
+
+    def _skip(_):
+        return carry, (
+            carry.y,
+            jnp.asarray(jnp.inf, dtype=dtype),
+            jnp.asarray(False),
+            jnp.asarray(0.0, dtype=dtype),
+        )
+
+    return jax.lax.cond(active, _do_step, _skip, operand=None)
+
+
 def _radau_replay_realized_accepted_rollout(
     execution_context: _RadauSolveExecutionContext,
     carry0: _RadauAcceptedStepCarry,
@@ -13011,6 +13218,8 @@ def _radau_replay_realized_accepted_rollout(
     next_regrowth_cooldown,
     next_easy_growth_streak,
     next_lagged_response_valid,
+    *,
+    reverse_minimal: bool = False,
 ) -> _RadauAcceptedRolloutResult:
     """Replay only the realized accepted attempts from the primal adaptive run.
 
@@ -13018,8 +13227,14 @@ def _radau_replay_realized_accepted_rollout(
     restricted to the realized accepted-step map.
     """
 
+    slot_replay = (
+        _radau_replay_realized_accepted_slot_reverse_minimal
+        if bool(reverse_minimal)
+        else _radau_replay_realized_accepted_slot
+    )
+
     def _scan_body(carry, xs):
-        next_carry, scan_out = _radau_replay_realized_accepted_slot(
+        next_carry, scan_out = slot_replay(
             execution_context,
             carry,
             *xs,
@@ -14770,6 +14985,14 @@ def _radau_adaptive_final_y_realized_schedule_vjp_fwd_from_schedule_artifact(
                 "Unknown reverse_single_segment_vjp_forward_mode "
                 f"'{single_segment_mode}'."
             )
+        start_replay_mode = str(
+            getattr(execution_context.physics_context, "reverse_segment_start_replay_mode", "legacy")
+        ).strip().lower()
+        if start_replay_mode not in {"legacy", "minimal"}:
+            raise ValueError(
+                "Unknown reverse_segment_start_replay_mode "
+                f"'{start_replay_mode}'."
+            )
 
         # Experimental opt-in: with exactly one segment, its start carry is
         # already carry0 and its final carry is already the adaptive rollout
@@ -14794,6 +15017,7 @@ def _radau_adaptive_final_y_realized_schedule_vjp_fwd_from_schedule_artifact(
                     execution_context,
                     carry,
                     *xs,
+                    reverse_minimal=(start_replay_mode == "minimal"),
                 )
                 return segment_rollout.final_carry, carry
 
@@ -16194,6 +16418,12 @@ def _build_prepared_radau_accepted_rollout(
         reverse_initial_cache_support_pullback_mode=str(
             getattr(solver, "reverse_initial_cache_support_pullback_mode", "scalar")
         ).strip().lower(),
+        reverse_rebuild_support_pullback_mode=str(
+            getattr(solver, "reverse_rebuild_support_pullback_mode", "separate")
+        ).strip().lower(),
+        reverse_segment_jit_diagnostics=bool(
+            getattr(solver, "reverse_segment_jit_diagnostics", False)
+        ),
         reverse_stage_cotangent_mode=str(getattr(solver, "reverse_stage_cotangent_mode", "full")).strip().lower(),
         reverse_step_bwd_mode=str(getattr(solver, "reverse_step_bwd_mode", "current")).strip().lower(),
         reverse_stage_adjoint_memory_mode=str(getattr(solver, "reverse_stage_adjoint_memory_mode", "default")).strip().lower(),
@@ -16664,6 +16894,12 @@ class RADAUSolver(_RadauSolverConfig):
             reverse_initial_cache_support_pullback_mode=str(
                 getattr(self, "reverse_initial_cache_support_pullback_mode", "scalar")
             ).strip().lower(),
+            reverse_rebuild_support_pullback_mode=str(
+                getattr(self, "reverse_rebuild_support_pullback_mode", "separate")
+            ).strip().lower(),
+            reverse_segment_jit_diagnostics=bool(
+                getattr(self, "reverse_segment_jit_diagnostics", False)
+            ),
             reverse_stage_cotangent_mode=str(getattr(self, "reverse_stage_cotangent_mode", "full")).strip().lower(),
             reverse_step_bwd_mode=str(getattr(self, "reverse_step_bwd_mode", "current")).strip().lower(),
             reverse_stage_adjoint_memory_mode=str(getattr(self, "reverse_stage_adjoint_memory_mode", "default")).strip().lower(),

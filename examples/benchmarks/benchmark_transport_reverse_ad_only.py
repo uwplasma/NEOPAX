@@ -3544,6 +3544,9 @@ def _run_realtime_geometry_optimization_api_smoke(
             f"solve mode={args.reverse_stage_adjoint_solve_mode} "
             f"rhs_pullback_mode={args.reverse_rhs_pullback_mode} "
             f"initial_cache_support_pullback_mode={args.reverse_initial_cache_support_pullback_mode} "
+            f"rebuild_support_pullback_mode={args.reverse_rebuild_support_pullback_mode} "
+            f"segment_jit_diagnostics={args.reverse_segment_jit_diagnostics} "
+            f"segment_start_replay_mode={args.reverse_segment_start_replay_mode} "
             f"step_bwd_mode={args.reverse_step_bwd_mode}",
             flush=True,
         )
@@ -3595,6 +3598,11 @@ def _run_realtime_geometry_optimization_api_smoke(
             reverse_initial_cache_support_pullback_mode=str(
                 args.reverse_initial_cache_support_pullback_mode
             ),
+            reverse_rebuild_support_pullback_mode=str(
+                args.reverse_rebuild_support_pullback_mode
+            ),
+            reverse_segment_jit_diagnostics=bool(args.reverse_segment_jit_diagnostics),
+            reverse_segment_start_replay_mode=str(args.reverse_segment_start_replay_mode),
             reverse_step_bwd_mode=str(args.reverse_step_bwd_mode),
             reverse_schedule_artifact_mode=str(args.reverse_schedule_artifact_mode),
             max_reverse_accepted_steps=(
@@ -5346,6 +5354,37 @@ def main() -> None:
             "lax.map path. 'ntx_batched_interpolated_faces' is an exact, opt-in "
             "multi-objective NTX face-interpolation transpose; it is limited to the "
             "realtime interpolate_from_faces configuration and has no scalar fallback."
+        ),
+    )
+    parser.add_argument(
+        "--reverse-rebuild-support-pullback-mode",
+        choices=("separate", "ntx_batched_interpolated_faces"),
+        default="separate",
+        help=(
+            "Lagged-response rebuild support transpose inside each reverse step. "
+            "'separate' preserves the reference vmapped scalar path. "
+            "'ntx_batched_interpolated_faces' is an exact opt-in multi-objective "
+            "NTX face-interpolation transpose for the rebuild branch; it has no "
+            "fallback for unsupported response representations."
+        ),
+    )
+    parser.add_argument(
+        "--reverse-segment-jit-diagnostics",
+        action="store_true",
+        help=(
+            "Print JAX in-process trace-cache counters before/after each reverse segment. "
+            "Diagnostic only: it does not alter reverse computation and is not an XLA "
+            "persistent-cache metric."
+        ),
+    )
+    parser.add_argument(
+        "--reverse-segment-start-replay-mode",
+        choices=("legacy", "minimal"),
+        default="legacy",
+        help=(
+            "Segment-start carry reconstruction after the accepted schedule is fixed. "
+            "legacy preserves the full accepted-step replay. minimal uses the exact "
+            "reverse-minimal Radau reconstruction and skips unused adaptive diagnostics."
         ),
     )
     parser.add_argument(
