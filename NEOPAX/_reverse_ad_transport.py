@@ -2539,6 +2539,7 @@ def prepare_reverse_static_setup(
     reverse_initial_cache_support_pullback_mode: str = "scalar",
     reverse_rebuild_support_pullback_mode: str = "separate",
     reverse_segment_jit_diagnostics: bool = False,
+    reverse_segment_input_diagnostics: bool = False,
     reverse_segment_start_replay_mode: str = "legacy",
     reverse_stage_cotangent_mode: str = "full",
     reverse_step_bwd_mode: str = "current",
@@ -2619,6 +2620,7 @@ def prepare_reverse_static_setup(
                     reverse_rebuild_support_pullback_mode
                 ),
                 reverse_segment_jit_diagnostics=bool(reverse_segment_jit_diagnostics),
+                reverse_segment_input_diagnostics=bool(reverse_segment_input_diagnostics),
                 reverse_segment_start_replay_mode=str(reverse_segment_start_replay_mode),
                 reverse_stage_cotangent_mode=str(reverse_stage_cotangent_mode),
                 reverse_step_bwd_mode=str(reverse_step_bwd_mode),
@@ -2872,6 +2874,9 @@ def prepare_realtime_geometry_support_segment_core_setup(
             args,
             "reverse_rebuild_support_pullback_mode",
             "separate",
+        ),
+        reverse_segment_input_diagnostics=bool(
+            getattr(args, "reverse_segment_input_diagnostics", False)
         ),
         reverse_segment_start_replay_mode=getattr(
             args,
@@ -3322,6 +3327,13 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
             False,
         )
     )
+    segment_input_diagnostics = bool(
+        getattr(
+            reverse_setup.execution_context.physics_context,
+            "reverse_segment_input_diagnostics",
+            False,
+        )
+    )
     print(
         f"{progress_prefix} progress: support reverse segmented cotangent sweep start "
         f"segments={segment_count} segment_length="
@@ -3369,20 +3381,73 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
             accumulated + increment
             for accumulated, increment in zip(step_support_bar_leaves_accum, segment_support_bar_leaves)
         )
-        segment_lagged_valid = np.asarray(jax.device_get(segment_arrays[6])).reshape(-1)
-        segment_support_reuse_count = int(np.count_nonzero(segment_lagged_valid))
-        segment_support_rebuild_count = int(segment_lagged_valid.size - segment_support_reuse_count)
+        segment_active = np.asarray(jax.device_get(segment_arrays[0]), dtype=bool).reshape(-1)
+        # ``segment_arrays[6]`` is the validity *after* each slot.  The
+        # reverse branch instead selects reuse/rebuild from the validity in
+        # the carry entering that slot.  Shift the trace and prepend the
+        # segment-start carry so the printed counts describe the branch that
+        # actually ran.
+        segment_next_lagged_valid = np.asarray(
+            jax.device_get(segment_arrays[6]), dtype=bool
+        ).reshape(-1)
+        segment_start_lagged_valid = np.concatenate(
+            [
+                np.asarray(
+                    [bool(np.asarray(jax.device_get(segment_start_carry.lagged_response_valid)))],
+                    dtype=bool,
+                ),
+                segment_next_lagged_valid[:-1],
+            ]
+        )
+        active_start_lagged_valid = segment_start_lagged_valid[segment_active]
+        segment_support_reuse_count = int(np.count_nonzero(active_start_lagged_valid))
+        segment_support_rebuild_count = int(
+            active_start_lagged_valid.size - segment_support_reuse_count
+        )
         support_reuse_count += segment_support_reuse_count
         support_rebuild_count += segment_support_rebuild_count
         print(
             f"{progress_prefix} progress: support reverse segment "
             f"{segment_index + 1}/{segment_count} ready "
             f"elapsed_s={time.perf_counter() - segment_phase_start:.3f} "
-            f"active_steps={int(segment_lagged_valid.size)} "
+            f"active_steps={int(np.count_nonzero(segment_active))} "
             f"support_reuse={segment_support_reuse_count} "
             f"support_rebuild={segment_support_rebuild_count}",
             flush=True,
         )
+        if segment_input_diagnostics:
+            # The segment output was block_until_ready above. These reads are
+            # therefore diagnostic metadata transfers, not a synchronization
+            # inserted into the device reverse calculation.
+            segment_dt_np = np.asarray(
+                jax.device_get(segment_arrays[1]),
+                dtype=float,
+            ).reshape(-1)
+            active_dt_np = segment_dt_np[segment_active]
+            active_pattern = "".join("1" if flag else "0" for flag in segment_active)
+            lagged_pattern = "".join(
+                "R" if valid else "B"
+                for active, valid in zip(segment_active, segment_start_lagged_valid, strict=True)
+                if active
+            )
+            incoming_cache_valid = bool(
+                np.asarray(jax.device_get(segment_start_carry.cache_valid))
+            )
+            incoming_cache_age = int(
+                np.asarray(jax.device_get(segment_start_carry.cache_age))
+            )
+            dt_min = float(np.min(active_dt_np)) if active_dt_np.size else float("nan")
+            dt_max = float(np.max(active_dt_np)) if active_dt_np.size else float("nan")
+            print(
+                f"{progress_prefix} diagnostic: support reverse segment "
+                f"{segment_index + 1}/{segment_count} inputs "
+                f"active_pattern={active_pattern} lagged_pattern={lagged_pattern or '-'} "
+                f"dt_min={dt_min:.6e} dt_max={dt_max:.6e} "
+                f"incoming_cache_valid={incoming_cache_valid} "
+                f"incoming_cache_age={incoming_cache_age} "
+                "(host diagnostic after device completion)",
+                flush=True,
+            )
         if segment_jit_diagnostics:
             print(
                 f"{progress_prefix} diagnostic: support reverse segment "
@@ -4452,6 +4517,7 @@ def internal_realtime_geometry_transport_reverse_table_result_builder(
     reverse_initial_cache_support_pullback_mode: str = "scalar",
     reverse_rebuild_support_pullback_mode: str = "separate",
     reverse_segment_jit_diagnostics: bool = False,
+    reverse_segment_input_diagnostics: bool = False,
     reverse_segment_start_replay_mode: str = "legacy",
     reverse_stage_cotangent_mode: str = "full",
     reverse_step_bwd_mode: str = "reduced_cotangent",
@@ -4559,6 +4625,9 @@ def internal_realtime_geometry_transport_reverse_table_result_builder(
             ),
             reverse_segment_jit_diagnostics=bool(
                 opts.get("reverse_segment_jit_diagnostics", reverse_segment_jit_diagnostics)
+            ),
+            reverse_segment_input_diagnostics=bool(
+                opts.get("reverse_segment_input_diagnostics", reverse_segment_input_diagnostics)
             ),
             reverse_segment_start_replay_mode=str(
                 opts.get("reverse_segment_start_replay_mode", reverse_segment_start_replay_mode)

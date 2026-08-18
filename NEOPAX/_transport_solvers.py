@@ -3575,6 +3575,7 @@ class _RadauAcceptedStepPhysicsContext:
     reverse_initial_cache_support_pullback_mode: str = "scalar"
     reverse_rebuild_support_pullback_mode: str = "separate"
     reverse_segment_jit_diagnostics: bool = False
+    reverse_segment_input_diagnostics: bool = False
     reverse_segment_start_replay_mode: str = "legacy"
     reverse_stage_cotangent_mode: str = "full"
     reverse_step_bwd_mode: str = "current"
@@ -16424,6 +16425,9 @@ def _build_prepared_radau_accepted_rollout(
         reverse_segment_jit_diagnostics=bool(
             getattr(solver, "reverse_segment_jit_diagnostics", False)
         ),
+        reverse_segment_input_diagnostics=bool(
+            getattr(solver, "reverse_segment_input_diagnostics", False)
+        ),
         reverse_stage_cotangent_mode=str(getattr(solver, "reverse_stage_cotangent_mode", "full")).strip().lower(),
         reverse_step_bwd_mode=str(getattr(solver, "reverse_step_bwd_mode", "current")).strip().lower(),
         reverse_stage_adjoint_memory_mode=str(getattr(solver, "reverse_stage_adjoint_memory_mode", "default")).strip().lower(),
@@ -16899,6 +16903,9 @@ class RADAUSolver(_RadauSolverConfig):
             ).strip().lower(),
             reverse_segment_jit_diagnostics=bool(
                 getattr(self, "reverse_segment_jit_diagnostics", False)
+            ),
+            reverse_segment_input_diagnostics=bool(
+                getattr(self, "reverse_segment_input_diagnostics", False)
             ),
             reverse_stage_cotangent_mode=str(getattr(self, "reverse_stage_cotangent_mode", "full")).strip().lower(),
             reverse_step_bwd_mode=str(getattr(self, "reverse_step_bwd_mode", "current")).strip().lower(),

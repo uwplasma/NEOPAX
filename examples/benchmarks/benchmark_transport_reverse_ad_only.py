@@ -3546,6 +3546,7 @@ def _run_realtime_geometry_optimization_api_smoke(
             f"initial_cache_support_pullback_mode={args.reverse_initial_cache_support_pullback_mode} "
             f"rebuild_support_pullback_mode={args.reverse_rebuild_support_pullback_mode} "
             f"segment_jit_diagnostics={args.reverse_segment_jit_diagnostics} "
+            f"segment_input_diagnostics={args.reverse_segment_input_diagnostics} "
             f"segment_start_replay_mode={args.reverse_segment_start_replay_mode} "
             f"step_bwd_mode={args.reverse_step_bwd_mode}",
             flush=True,
@@ -3602,6 +3603,7 @@ def _run_realtime_geometry_optimization_api_smoke(
                 args.reverse_rebuild_support_pullback_mode
             ),
             reverse_segment_jit_diagnostics=bool(args.reverse_segment_jit_diagnostics),
+            reverse_segment_input_diagnostics=bool(args.reverse_segment_input_diagnostics),
             reverse_segment_start_replay_mode=str(args.reverse_segment_start_replay_mode),
             reverse_step_bwd_mode=str(args.reverse_step_bwd_mode),
             reverse_schedule_artifact_mode=str(args.reverse_schedule_artifact_mode),
@@ -5375,6 +5377,15 @@ def main() -> None:
             "Print JAX in-process trace-cache counters before/after each reverse segment. "
             "Diagnostic only: it does not alter reverse computation and is not an XLA "
             "persistent-cache metric."
+        ),
+    )
+    parser.add_argument(
+        "--reverse-segment-input-diagnostics",
+        action="store_true",
+        help=(
+            "After each already-synchronized reverse segment, print active slots, "
+            "accepted dt range, lagged reuse/rebuild pattern, and incoming Jacobian "
+            "cache metadata. Diagnostic only; it does not alter reverse computation."
         ),
     )
     parser.add_argument(
