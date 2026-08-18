@@ -8648,7 +8648,18 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                 prepared_delta0,
                 drds_delta0,
             )
-            return jax.vmap(local_pullback)(local_field_bars)
+            # ``prepared_delta0`` includes NTX pytrees with static dataclass
+            # metadata. Vmapping the raw pullback result asks JAX to batch and
+            # reconstruct that metadata (which is invalid). Map only its
+            # numeric leaves, then restore the unchanged pytree structure.
+            _, prepared_treedef = jax.tree_util.tree_flatten(prepared_delta0)
+
+            def _local_pullback_leaves(one_local_field_bars):
+                prepared_bar, drds_bar = local_pullback(one_local_field_bars)
+                return (*jax.tree_util.tree_leaves(prepared_bar), drds_bar)
+
+            batched_leaves = jax.vmap(_local_pullback_leaves)(local_field_bars)
+            return prepared_treedef.unflatten(batched_leaves[:-1]), batched_leaves[-1]
 
         def _accumulate_anchor(carry, anchor_pos):
             channels_carry, prepared_carry = carry
