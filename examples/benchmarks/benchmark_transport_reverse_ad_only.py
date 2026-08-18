@@ -3543,6 +3543,7 @@ def _run_realtime_geometry_optimization_api_smoke(
             "[autodiff-gate] progress: full-transport reverse stage-adjoint "
             f"solve mode={args.reverse_stage_adjoint_solve_mode} "
             f"rhs_pullback_mode={args.reverse_rhs_pullback_mode} "
+            f"initial_cache_support_pullback_mode={args.reverse_initial_cache_support_pullback_mode} "
             f"step_bwd_mode={args.reverse_step_bwd_mode}",
             flush=True,
         )
@@ -3591,6 +3592,9 @@ def _run_realtime_geometry_optimization_api_smoke(
             reverse_stage_adjoint_solve_mode=str(args.reverse_stage_adjoint_solve_mode),
             reverse_rhs_transpose_mode=str(args.reverse_rhs_transpose_mode),
             reverse_rhs_pullback_mode=str(args.reverse_rhs_pullback_mode),
+            reverse_initial_cache_support_pullback_mode=str(
+                args.reverse_initial_cache_support_pullback_mode
+            ),
             reverse_step_bwd_mode=str(args.reverse_step_bwd_mode),
             reverse_schedule_artifact_mode=str(args.reverse_schedule_artifact_mode),
             max_reverse_accepted_steps=(
@@ -5331,6 +5335,17 @@ def main() -> None:
             "reference state/lagged/support calls. 'fused_ntx' is an opt-in "
             "NEOPAX-only experiment that shares NTX shared-flux assembly; the "
             "realtime-geometry payload path retains its established pullback."
+        ),
+    )
+    parser.add_argument(
+        "--reverse-initial-cache-support-pullback-mode",
+        choices=("scalar", "ntx_batched_interpolated_faces"),
+        default="scalar",
+        help=(
+            "Initial lagged-cache support transpose. 'scalar' preserves the reference "
+            "lax.map path. 'ntx_batched_interpolated_faces' is an exact, opt-in "
+            "multi-objective NTX face-interpolation transpose; it is limited to the "
+            "realtime interpolate_from_faces configuration and has no scalar fallback."
         ),
     )
     parser.add_argument(

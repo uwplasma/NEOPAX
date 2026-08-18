@@ -1842,6 +1842,76 @@ class ComposedEquationSystem:
         (support_bar,) = support_delta_pullback(flux_response_bar)
         return _sanitize_float_delta_bar_tree(support, support_bar)
 
+    def pullback_build_lagged_response_support_payload_batched_interpolated_faces(
+        self,
+        state,
+        lagged_response_bars,
+        support,
+        **kwargs,
+    ):
+        """Batched counterpart for the exact NTX interpolated-face support lane.
+
+        The geometry branch remains a device VJP over its already-batched
+        cotangent leaves. The NTX branch is delegated to the dedicated local
+        multi-RHS implementation rather than mapped through the scalar rule.
+        """
+        support, geometry = self._split_realtime_geometry_payload(support)
+        if geometry is not None:
+            ntx_support_bar = self.pullback_build_lagged_response_support_payload_batched_interpolated_faces(
+                state,
+                lagged_response_bars,
+                support,
+                **kwargs,
+            )
+            working_state, _eidx = self._prepare_working_state(state)
+            flux_response_bars = (
+                None if lagged_response_bars is None else lagged_response_bars.flux_response
+            )
+            if flux_response_bars is None:
+                geometry_bar = jax.tree_util.tree_map(
+                    lambda leaf: jnp.broadcast_to(
+                        jnp.zeros_like(jnp.asarray(leaf)),
+                        (0,) + jnp.asarray(leaf).shape,
+                    ),
+                    geometry,
+                )
+            else:
+                geometry_bar = jax.vmap(
+                    lambda flux_response_bar: self._direct_geometry_build_lagged_response_bar(
+                        self.shared_flux_model,
+                        geometry,
+                        working_state,
+                        flux_response_bar,
+                    )
+                )(flux_response_bars)
+            # Both bars already carry the leading objective axis. The scalar
+            # payload sanitizer deliberately restores primal-shaped non-float
+            # leaves, which would discard that axis here.
+            return {"ntx_support": ntx_support_bar, "geometry": geometry_bar}
+
+        working_state, _eidx = self._prepare_working_state(state)
+        flux_response_bars = None if lagged_response_bars is None else lagged_response_bars.flux_response
+        if self.shared_flux_model is None or flux_response_bars is None:
+            raise NotImplementedError(
+                "batched interpolated-face support pullback requires an active shared flux response."
+            )
+        pullback_fn = getattr(
+            self.shared_flux_model,
+            "pullback_build_lagged_response_support_payload_batched_interpolated_faces",
+            None,
+        )
+        if not callable(pullback_fn):
+            raise NotImplementedError(
+                "The active shared flux model does not expose the batched interpolated-face "
+                "support pullback."
+            )
+        return pullback_fn(
+            working_state,
+            flux_response_bars,
+            support,
+            **self._shared_flux_call_kwargs(kwargs),
+        )
+
     def evaluate_with_lagged_response(self, t, state, runtime, lagged_response):
         del t, runtime
         return self._evaluate_state(state, lagged_response=lagged_response)

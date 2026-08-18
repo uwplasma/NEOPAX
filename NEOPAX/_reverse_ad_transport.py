@@ -2518,6 +2518,7 @@ def prepare_reverse_static_setup(
     reverse_stage_adjoint_solve_mode: str = "structured",
     reverse_rhs_transpose_mode: str = "generic",
     reverse_rhs_pullback_mode: str = "separate",
+    reverse_initial_cache_support_pullback_mode: str = "scalar",
     reverse_stage_cotangent_mode: str = "full",
     reverse_step_bwd_mode: str = "current",
     reverse_stage_adjoint_memory_mode: str = "default",
@@ -2558,6 +2559,9 @@ def prepare_reverse_static_setup(
                 reverse_stage_adjoint_solve_mode=str(reverse_stage_adjoint_solve_mode),
                 reverse_rhs_transpose_mode=str(reverse_rhs_transpose_mode),
                 reverse_rhs_pullback_mode=str(reverse_rhs_pullback_mode),
+                reverse_initial_cache_support_pullback_mode=str(
+                    reverse_initial_cache_support_pullback_mode
+                ),
                 reverse_stage_cotangent_mode=str(reverse_stage_cotangent_mode),
                 reverse_step_bwd_mode=str(reverse_step_bwd_mode),
                 reverse_stage_adjoint_memory_mode=str(reverse_stage_adjoint_memory_mode),
@@ -2801,6 +2805,11 @@ def prepare_realtime_geometry_support_segment_core_setup(
         reverse_stage_adjoint_solve_mode=args.reverse_stage_adjoint_solve_mode,
         reverse_rhs_transpose_mode=args.reverse_rhs_transpose_mode,
         reverse_rhs_pullback_mode=getattr(args, "reverse_rhs_pullback_mode", "separate"),
+        reverse_initial_cache_support_pullback_mode=getattr(
+            args,
+            "reverse_initial_cache_support_pullback_mode",
+            "scalar",
+        ),
         reverse_stage_cotangent_mode=support_probe_cotangent_mode,
         reverse_step_bwd_mode=args.reverse_step_bwd_mode,
         reverse_stage_adjoint_memory_mode=args.reverse_stage_adjoint_memory_mode,
@@ -3295,6 +3304,18 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
 
     initial_lagged_response_valid = bool(np.asarray(jax.device_get(carry0.lagged_response_valid)))
     build_support_pullback = reverse_setup.execution_context.physics_context.flat_rhs_build_support_pullback
+    initial_cache_support_pullback_mode = str(
+        getattr(
+            reverse_setup.execution_context.physics_context,
+            "reverse_initial_cache_support_pullback_mode",
+            "scalar",
+        )
+    ).strip().lower()
+    if initial_cache_support_pullback_mode not in {"scalar", "ntx_batched_interpolated_faces"}:
+        raise ValueError(
+            "Unknown reverse_initial_cache_support_pullback_mode "
+            f"{initial_cache_support_pullback_mode!r}."
+        )
     allow_initial_cache_support_pullback = cotangent_mode in {
         "full",
         "full_initial_cache_support_pullback",
@@ -3304,14 +3325,31 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
     initial_cache_pullback_skipped = False
     if initial_lagged_response_valid and build_support_pullback is not None and allow_initial_cache_support_pullback:
         phase_start = time.perf_counter()
-        initial_cache_support_bars = jax.lax.map(
-            lambda lagged_bar: build_support_pullback(
+        if initial_cache_support_pullback_mode == "ntx_batched_interpolated_faces":
+            batched_pullback = getattr(
+                reverse_setup.execution_context.physics_context,
+                "flat_rhs_build_support_pullback_batched_interpolated_faces",
+                None,
+            )
+            if batched_pullback is None:
+                raise RuntimeError(
+                    "ntx_batched_interpolated_faces was requested, but the active transport "
+                    "physics context does not expose the NTX batched support pullback."
+                )
+            initial_cache_support_bars = batched_pullback(
                 carry0.y,
-                lagged_bar,
+                reduced_bars.lagged_response_cache,
                 support_payload,
-            ),
-            reduced_bars.lagged_response_cache,
-        )
+            )
+        else:
+            initial_cache_support_bars = jax.lax.map(
+                lambda lagged_bar: build_support_pullback(
+                    carry0.y,
+                    lagged_bar,
+                    support_payload,
+                ),
+                reduced_bars.lagged_response_cache,
+            )
         initial_cache_support_bars = jax.block_until_ready(initial_cache_support_bars)
         initial_cache_support_bar_leaves = jax.tree_util.tree_leaves(initial_cache_support_bars)
         support_bar_leaves = tuple(
@@ -3328,7 +3366,8 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
         initial_cache_pullback_used = True
         print(
             f"{progress_prefix} progress: support reverse initial-cache support pullback ready "
-            f"elapsed_s={time.perf_counter() - phase_start:.3f}",
+            f"elapsed_s={time.perf_counter() - phase_start:.3f} "
+            f"mode={initial_cache_support_pullback_mode}",
             flush=True,
         )
     elif initial_lagged_response_valid and build_support_pullback is not None:
@@ -4312,6 +4351,7 @@ def internal_realtime_geometry_transport_reverse_table_result_builder(
     reverse_stage_adjoint_solve_mode: str = "bicgstab",
     reverse_rhs_transpose_mode: str = "explicit_ntx_interpolated",
     reverse_rhs_pullback_mode: str = "separate",
+    reverse_initial_cache_support_pullback_mode: str = "scalar",
     reverse_stage_cotangent_mode: str = "full",
     reverse_step_bwd_mode: str = "reduced_cotangent",
     reverse_stage_adjoint_memory_mode: str = "default",
@@ -4404,6 +4444,12 @@ def internal_realtime_geometry_transport_reverse_table_result_builder(
             ),
             reverse_rhs_transpose_mode=str(opts.get("reverse_rhs_transpose_mode", reverse_rhs_transpose_mode)),
             reverse_rhs_pullback_mode=str(opts.get("reverse_rhs_pullback_mode", reverse_rhs_pullback_mode)),
+            reverse_initial_cache_support_pullback_mode=str(
+                opts.get(
+                    "reverse_initial_cache_support_pullback_mode",
+                    reverse_initial_cache_support_pullback_mode,
+                )
+            ),
             reverse_stage_cotangent_mode=str(opts.get("reverse_stage_cotangent_mode", reverse_stage_cotangent_mode)),
             reverse_step_bwd_mode=str(opts.get("reverse_step_bwd_mode", reverse_step_bwd_mode)),
             reverse_stage_adjoint_memory_mode=str(

@@ -1050,6 +1050,18 @@ def _lagged_response_build_support_pullback_hook(vector_field: Callable):
     return pullback_fn if callable(pullback_fn) else None
 
 
+def _lagged_response_build_support_pullback_batched_interpolated_faces_hook(vector_field: Callable):
+    owner = getattr(vector_field, "__self__", None)
+    if owner is None:
+        return None
+    pullback_fn = getattr(
+        owner,
+        "pullback_build_lagged_response_support_payload_batched_interpolated_faces",
+        None,
+    )
+    return pullback_fn if callable(pullback_fn) else None
+
+
 def _lagged_response_eval_support_pullback_hook(vector_field: Callable):
     owner = getattr(vector_field, "__self__", None)
     if owner is None:
@@ -1374,6 +1386,25 @@ def _flat_rhs_build_support_pullback_factory(unravel, vector_field, args, kwargs
             support,
             **kwargs,
         )
+
+    return _pullback
+
+
+def _flat_rhs_build_support_pullback_batched_interpolated_faces_factory(
+    unravel,
+    vector_field,
+    args,
+    kwargs,
+    project_flat=None,
+):
+    pullback_fn = _lagged_response_build_support_pullback_batched_interpolated_faces_hook(vector_field)
+    if pullback_fn is None:
+        return None
+
+    def _pullback(flat_y, lagged_response_bars, support):
+        projected_flat_y = _project_flat_state_if_needed(flat_y, project_flat)
+        state_y = unravel(projected_flat_y)
+        return pullback_fn(state_y, lagged_response_bars, support, **kwargs)
 
     return _pullback
 
@@ -3511,6 +3542,7 @@ class _RadauAcceptedStepPhysicsContext:
     flat_rhs_with_lagged_response: Callable[[Any, Any, Any], Any]
     flat_rhs_lagged_response_pullback: Callable[[Any, Any, Any, Any], Any] | None = None
     flat_rhs_build_support_pullback: Callable[[Any, Any, Any], Any] | None = None
+    flat_rhs_build_support_pullback_batched_interpolated_faces: Callable[[Any, Any, Any], Any] | None = None
     flat_rhs_lagged_response_support_pullback: Callable[[Any, Any, Any, Any, Any], Any] | None = None
     flat_rhs_lagged_response_all_pullback: Callable[[Any, Any, Any, Any, Any], tuple[Any, Any, Any]] | None = None
     flat_rhs_state_pullback: Callable[[Any, Any, Any, Any], Any] | None = None
@@ -3535,6 +3567,7 @@ class _RadauAcceptedStepPhysicsContext:
     reverse_stage_adjoint_solve_mode: str = "structured"
     reverse_rhs_transpose_mode: str = "generic"
     reverse_rhs_pullback_mode: str = "separate"
+    reverse_initial_cache_support_pullback_mode: str = "scalar"
     reverse_stage_cotangent_mode: str = "full"
     reverse_step_bwd_mode: str = "current"
     reverse_stage_adjoint_memory_mode: str = "default"
@@ -15832,6 +15865,15 @@ def _build_prepared_radau_accepted_rollout(
         kwargs=kwargs,
         project_flat=project_flat,
     )
+    flat_rhs_build_support_pullback_batched_interpolated_faces = (
+        _flat_rhs_build_support_pullback_batched_interpolated_faces_factory(
+            unravel=unpack_flat,
+            vector_field=vector_field,
+            args=args,
+            kwargs=kwargs,
+            project_flat=project_flat,
+        )
+    )
     flat_rhs_lagged_response_support_pullback = _flat_rhs_lagged_response_support_pullback_factory(
         unravel=unpack_flat,
         vector_field=vector_field,
@@ -16123,6 +16165,9 @@ def _build_prepared_radau_accepted_rollout(
         flat_rhs_with_lagged_response=flat_rhs_with_lagged_response,
         flat_rhs_lagged_response_pullback=flat_rhs_lagged_response_pullback,
         flat_rhs_build_support_pullback=flat_rhs_build_support_pullback,
+        flat_rhs_build_support_pullback_batched_interpolated_faces=(
+            flat_rhs_build_support_pullback_batched_interpolated_faces
+        ),
         flat_rhs_lagged_response_support_pullback=flat_rhs_lagged_response_support_pullback,
         flat_rhs_lagged_response_all_pullback=flat_rhs_lagged_response_all_pullback,
         flat_rhs_state_pullback=flat_rhs_state_pullback,
@@ -16146,6 +16191,9 @@ def _build_prepared_radau_accepted_rollout(
         reverse_direct_stage_adjoint=bool(getattr(solver, "reverse_direct_stage_adjoint", False)),
         reverse_stage_adjoint_solve_mode=reverse_stage_adjoint_solve_mode,
         reverse_rhs_transpose_mode=str(getattr(solver, "reverse_rhs_transpose_mode", "generic")).strip().lower(),
+        reverse_initial_cache_support_pullback_mode=str(
+            getattr(solver, "reverse_initial_cache_support_pullback_mode", "scalar")
+        ).strip().lower(),
         reverse_stage_cotangent_mode=str(getattr(solver, "reverse_stage_cotangent_mode", "full")).strip().lower(),
         reverse_step_bwd_mode=str(getattr(solver, "reverse_step_bwd_mode", "current")).strip().lower(),
         reverse_stage_adjoint_memory_mode=str(getattr(solver, "reverse_stage_adjoint_memory_mode", "default")).strip().lower(),
@@ -16295,6 +16343,15 @@ class RADAUSolver(_RadauSolverConfig):
             args=args,
             kwargs=kwargs,
             project_flat=project_flat,
+        )
+        flat_rhs_build_support_pullback_batched_interpolated_faces = (
+            _flat_rhs_build_support_pullback_batched_interpolated_faces_factory(
+                unravel=unpack_flat,
+                vector_field=vector_field,
+                args=args,
+                kwargs=kwargs,
+                project_flat=project_flat,
+            )
         )
         flat_rhs_lagged_response_support_pullback = _flat_rhs_lagged_response_support_pullback_factory(
             unravel=unpack_flat,
@@ -16581,6 +16638,9 @@ class RADAUSolver(_RadauSolverConfig):
             flat_rhs_with_lagged_response=flat_rhs_with_lagged_response,
             flat_rhs_lagged_response_pullback=flat_rhs_lagged_response_pullback,
             flat_rhs_build_support_pullback=flat_rhs_build_support_pullback,
+            flat_rhs_build_support_pullback_batched_interpolated_faces=(
+                flat_rhs_build_support_pullback_batched_interpolated_faces
+            ),
             flat_rhs_lagged_response_support_pullback=flat_rhs_lagged_response_support_pullback,
             flat_rhs_lagged_response_all_pullback=flat_rhs_lagged_response_all_pullback,
             flat_rhs_state_pullback=flat_rhs_state_pullback,
@@ -16601,6 +16661,9 @@ class RADAUSolver(_RadauSolverConfig):
             reverse_direct_stage_adjoint=bool(getattr(self, "reverse_direct_stage_adjoint", False)),
             reverse_stage_adjoint_solve_mode=reverse_stage_adjoint_solve_mode,
             reverse_rhs_transpose_mode=str(getattr(self, "reverse_rhs_transpose_mode", "generic")).strip().lower(),
+            reverse_initial_cache_support_pullback_mode=str(
+                getattr(self, "reverse_initial_cache_support_pullback_mode", "scalar")
+            ).strip().lower(),
             reverse_stage_cotangent_mode=str(getattr(self, "reverse_stage_cotangent_mode", "full")).strip().lower(),
             reverse_step_bwd_mode=str(getattr(self, "reverse_step_bwd_mode", "current")).strip().lower(),
             reverse_stage_adjoint_memory_mode=str(getattr(self, "reverse_stage_adjoint_memory_mode", "default")).strip().lower(),
