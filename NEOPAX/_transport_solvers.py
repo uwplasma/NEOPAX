@@ -1094,6 +1094,12 @@ def _exact_stage_transpose_low_rank_factors_hook(vector_field: Callable):
     return factors_fn if callable(factors_fn) else None
 
 
+def _exact_stage_transpose_low_rank_correction_from_factors(factors_fn: Callable | None):
+    """Return an optional analytic correction builder attached to a factor hook."""
+    correction_fn = getattr(factors_fn, "ntss_midpoint_correction_factors", None)
+    return correction_fn if callable(correction_fn) else None
+
+
 def _ntss_midpoint_er_coeff_low_rank_factors_hook(
     unpack_flat,
     vector_field: Callable,
@@ -1137,16 +1143,13 @@ def _ntss_midpoint_er_coeff_low_rank_factors_hook(
     if not packed_density_indices:
         return None
 
-    def _factors(
+    def _correction_factors(
         kernel_context,
         physics_context,
         carry_in,
         primal_result,
         lagged_response,
-        *,
-        rank: int,
     ):
-        del rank
         from ._transport_equations import _get_center_flux
 
         layout, radial_permutation, radial_block_dim = _radau_stage_to_radial_permutation_and_block_dim(
@@ -1155,22 +1158,6 @@ def _ntss_midpoint_er_coeff_low_rank_factors_hook(
         active_er_size = int(layout.active_er_size)
         if active_er_size <= 0:
             raise ValueError("woodbury_er_coeff_compact requires active Er state variables.")
-
-        (
-            band_permutation,
-            band_block_dim,
-            block_lower,
-            block_diagonal,
-            block_upper,
-        ) = _radau_exact_stage_transpose_radial_bands_from_matvec(
-            kernel_context,
-            physics_context,
-            carry_in,
-            primal_result,
-            lagged_response,
-        )
-        if int(band_block_dim) != int(radial_block_dim):
-            raise ValueError("Radial band builder returned an inconsistent block dimension.")
 
         stage_times, stage_states = _radau_exact_stage_times_states(
             kernel_context,
@@ -1273,6 +1260,47 @@ def _ntss_midpoint_er_coeff_low_rank_factors_hook(
         )
         u_rank = u_stage[radial_permutation, :]
         v_rank = v_stage[radial_permutation, :]
+        return radial_permutation, int(radial_block_dim), u_rank, v_rank
+
+    def _factors(
+        kernel_context,
+        physics_context,
+        carry_in,
+        primal_result,
+        lagged_response,
+        *,
+        rank: int,
+    ):
+        del rank
+        (
+            radial_permutation,
+            radial_block_dim,
+            u_rank,
+            v_rank,
+        ) = _correction_factors(
+            kernel_context,
+            physics_context,
+            carry_in,
+            primal_result,
+            lagged_response,
+        )
+        (
+            band_permutation,
+            band_block_dim,
+            block_lower,
+            block_diagonal,
+            block_upper,
+        ) = _radau_exact_stage_transpose_radial_bands_from_matvec(
+            kernel_context,
+            physics_context,
+            carry_in,
+            primal_result,
+            lagged_response,
+        )
+        if int(band_block_dim) != int(radial_block_dim):
+            raise ValueError("Radial band builder returned an inconsistent block dimension.")
+        n_radial = int(_radau_infer_radial_block_layout(kernel_context).n_radial)
+        num_stages = int(kernel_context.num_stages)
 
         # The band builder sees the full transpose operator. Remove the analytic
         # low-rank contribution from its tridiagonal bands before adding U V.T
@@ -1320,6 +1348,10 @@ def _ntss_midpoint_er_coeff_low_rank_factors_hook(
             v_rank,
         )
 
+    # Keep the correction builder discoverable without changing the existing
+    # compact-factor hook contract.  The colored dense-block experiment needs
+    # only this analytic rank-3 piece, not the legacy band reconstruction.
+    setattr(_factors, "ntss_midpoint_correction_factors", _correction_factors)
     return _factors
 
 
@@ -3565,6 +3597,7 @@ class _RadauAcceptedStepPhysicsContext:
     flat_rhs_joint_generic_state_pullback: Callable[[Any, Any, Any, Any], Any] | None = None
     exact_stage_transpose_solve_compact: Callable[..., Any] | None = None
     exact_stage_transpose_low_rank_factors: Callable[..., Any] | None = None
+    exact_stage_transpose_low_rank_correction: Callable[..., Any] | None = None
     lagged_response_reuse_mode: str = "retry_only"
     lagged_response_reuse_rtol: Any = 5.0e-2
     lagged_response_reuse_atol: Any = 1.0e-8
@@ -9973,6 +10006,243 @@ def _radau_exact_stage_transpose_radial_bands_from_matvec(
     return radial_permutation, radial_block_dim, lower, diagonal, upper
 
 
+def _radau_exact_stage_transpose_radial_bands_from_colored_matvec(
+    kernel_context: _RadauAcceptedStepKernelContext,
+    physics_context: _RadauAcceptedStepPhysicsContext,
+    carry_in: _RadauAcceptedStepCarry,
+    primal_result: _RadauAcceptedStepAttemptResult,
+    lagged_response,
+    *,
+    low_rank_u=None,
+    low_rank_v=None,
+):
+    """Recover radial bands of the exact transpose stage operator by coloring.
+
+    In radial ordering, the local part of the accepted-step Radau transpose
+    operator has a block-tridiagonal stencil.  Blocks separated by three
+    radial cells therefore have disjoint output supports.  One simultaneous
+    basis direction for every block component of each of the three colors is
+    sufficient to recover all three local bands.
+
+    A nonlocal low-rank correction couples every block of the same color and
+    would otherwise contaminate the colored actions.  When supplied, its
+    ``U @ V.T`` action is removed *before* decoding the bands.  Callers may
+    omit the factors only when the operator is already block-tridiagonal.
+    """
+    layout, radial_permutation, radial_block_dim = (
+        _radau_stage_to_radial_permutation_and_block_dim(kernel_context)
+    )
+    n_radial = int(layout.n_radial)
+    system_size = int(kernel_context.num_stages) * int(kernel_context.state_dim)
+    color_count = 3
+    colored_direction_count = color_count * radial_block_dim
+    stage_times, stage_states = _radau_exact_stage_times_states(
+        kernel_context,
+        carry_in,
+        primal_result,
+    )
+
+    block_ids = jnp.arange(n_radial, dtype=jnp.int32)
+    component_ids = jnp.arange(radial_block_dim, dtype=jnp.int32)
+    seed_ids = (
+        (block_ids % jnp.asarray(color_count, dtype=jnp.int32))[:, None]
+        * jnp.asarray(radial_block_dim, dtype=jnp.int32)
+        + component_ids[None, :]
+    )
+    radial_columns = (
+        block_ids[:, None] * jnp.asarray(radial_block_dim, dtype=jnp.int32)
+        + component_ids[None, :]
+    )
+    radial_vectors = jnp.zeros(
+        (colored_direction_count, system_size),
+        dtype=kernel_context.dtype,
+    ).at[seed_ids.reshape((-1,)), radial_columns.reshape((-1,))].set(
+        jnp.asarray(1.0, dtype=kernel_context.dtype)
+    )
+    stage_vectors = jnp.zeros_like(radial_vectors).at[:, radial_permutation].set(
+        radial_vectors
+    )
+    # ``block`` defines its stage matrix through generic ``jax.jacfwd``.  Use
+    # the corresponding generic JAX VJP here, irrespective of the separately
+    # selected RHS pullback mode used elsewhere in the reverse step.  This is
+    # necessary for this candidate to reconstruct the same stage system as
+    # ``block`` rather than a nearby explicit-NTX derivative implementation.
+    matrix_physics_context = dataclasses.replace(
+        physics_context,
+        reverse_rhs_transpose_mode="generic",
+    )
+    stage_outputs = _radau_exact_stage_residual_transpose_matvec_batched(
+        kernel_context,
+        matrix_physics_context,
+        carry_in,
+        primal_result,
+        lagged_response,
+        stage_vectors,
+        stage_times=stage_times,
+        stage_states=stage_states,
+    )
+    radial_outputs = stage_outputs[:, radial_permutation].reshape(
+        (colored_direction_count, n_radial, radial_block_dim)
+    )
+    if (low_rank_u is None) != (low_rank_v is None):
+        raise ValueError("Colored Radau bands require both low_rank_u and low_rank_v, or neither.")
+    if low_rank_u is not None:
+        u_arr = jnp.asarray(low_rank_u, dtype=kernel_context.dtype).reshape((system_size, -1))
+        v_arr = jnp.asarray(low_rank_v, dtype=kernel_context.dtype).reshape((system_size, -1))
+        if int(u_arr.shape[1]) != int(v_arr.shape[1]):
+            raise ValueError("Colored Radau low-rank factors have inconsistent ranks.")
+        low_rank_outputs = (radial_vectors @ v_arr) @ u_arr.T
+        radial_outputs = radial_outputs - low_rank_outputs.reshape(
+            (colored_direction_count, n_radial, radial_block_dim)
+        )
+
+    radial_blocks = jnp.zeros(
+        (n_radial, n_radial, radial_block_dim, radial_block_dim),
+        dtype=kernel_context.dtype,
+    )
+
+    def _set_band(blocks, offset):
+        if offset < 0:
+            source_blocks = block_ids[1:]
+            target_blocks = block_ids[:-1]
+        elif offset > 0:
+            source_blocks = block_ids[:-1]
+            target_blocks = block_ids[1:]
+        else:
+            source_blocks = block_ids
+            target_blocks = block_ids
+        # ``seed_ids[source, q]`` selects the colored action whose input has
+        # component q at ``source``.  Its target block is the q-th column of
+        # the transpose-operator block, hence the final swap of its axes.
+        block_columns = radial_outputs[
+            seed_ids[source_blocks],
+            target_blocks[:, None],
+            :,
+        ]
+        block_values = jnp.swapaxes(block_columns, -1, -2)
+        return blocks.at[target_blocks, source_blocks].set(block_values)
+
+    radial_blocks = _set_band(radial_blocks, -1)
+    radial_blocks = _set_band(radial_blocks, 0)
+    radial_blocks = _set_band(radial_blocks, 1)
+    block_lower, block_diagonal, block_upper = _radau_radial_block_tridiagonal_parts(
+        radial_blocks
+    )
+    return radial_permutation, radial_block_dim, block_lower, block_diagonal, block_upper
+
+
+def _radau_radial_block_tridiagonal_matrix(block_lower, block_diagonal, block_upper):
+    """Materialize a radial block-tridiagonal matrix from its three bands."""
+    n_radial = int(block_diagonal.shape[0])
+    radial_block_dim = int(block_diagonal.shape[-1])
+    block_ids = jnp.arange(n_radial, dtype=jnp.int32)
+    blocks = jnp.zeros(
+        (n_radial, n_radial, radial_block_dim, radial_block_dim),
+        dtype=block_diagonal.dtype,
+    ).at[block_ids, block_ids].set(block_diagonal)
+    blocks = blocks.at[block_ids[1:], block_ids[:-1]].set(block_lower[1:])
+    blocks = blocks.at[block_ids[:-1], block_ids[1:]].set(block_upper[:-1])
+    return jnp.transpose(blocks, (0, 2, 1, 3)).reshape(
+        (n_radial * radial_block_dim, n_radial * radial_block_dim)
+    )
+
+
+def _radau_exact_stage_residual_transpose_matrix_colored_ntss_midpoint(
+    kernel_context: _RadauAcceptedStepKernelContext,
+    physics_context: _RadauAcceptedStepPhysicsContext,
+    carry_in: _RadauAcceptedStepCarry,
+    primal_result: _RadauAcceptedStepAttemptResult,
+    lagged_response,
+):
+    """Exact dense ``dR/dz`` transpose from colored local actions plus NTSS rank 3.
+
+    This is intentionally an internal validation constructor.  It keeps the
+    current dense block-solve representation while replacing the 306-direction
+    generic stage-Jacobian construction with 18 colored transpose actions and
+    the analytic NTSS midpoint correction.
+    """
+    correction_fn = physics_context.exact_stage_transpose_low_rank_correction
+    if correction_fn is None:
+        raise ValueError(
+            "colored_ntss_midpoint_block requires the analytic NTSS midpoint "
+            "stage-transpose correction hook."
+        )
+    radial_permutation, radial_block_dim, u_rank, v_rank = correction_fn(
+        kernel_context,
+        physics_context,
+        carry_in,
+        primal_result,
+        lagged_response,
+    )
+    (
+        colored_permutation,
+        colored_block_dim,
+        block_lower,
+        block_diagonal,
+        block_upper,
+    ) = _radau_exact_stage_transpose_radial_bands_from_colored_matvec(
+        kernel_context,
+        physics_context,
+        carry_in,
+        primal_result,
+        lagged_response,
+        low_rank_u=u_rank,
+        low_rank_v=v_rank,
+    )
+    if int(colored_block_dim) != int(radial_block_dim):
+        raise ValueError("Colored Radau bands have an inconsistent radial block dimension.")
+    # Both routines derive the permutation from the same static packed-state
+    # layout.  Avoid a value-dependent check inside JIT; the later exact matrix
+    # diagnostic verifies the resulting operator directly.
+    del colored_permutation
+    radial_matrix = (
+        _radau_radial_block_tridiagonal_matrix(
+            block_lower,
+            block_diagonal,
+            block_upper,
+        )
+        + jnp.asarray(u_rank, dtype=kernel_context.dtype)
+        @ jnp.asarray(v_rank, dtype=kernel_context.dtype).T
+    )
+    system_size = int(kernel_context.num_stages) * int(kernel_context.state_dim)
+    return jnp.zeros(
+        (system_size, system_size),
+        dtype=kernel_context.dtype,
+    ).at[radial_permutation[:, None], radial_permutation[None, :]].set(radial_matrix)
+
+
+def _radau_exact_stage_residual_colored_ntss_midpoint_matrix_error(
+    kernel_context: _RadauAcceptedStepKernelContext,
+    physics_context: _RadauAcceptedStepPhysicsContext,
+    carry_in: _RadauAcceptedStepCarry,
+    primal_result: _RadauAcceptedStepAttemptResult,
+    lagged_response,
+):
+    """Return device-side absolute and relative errors against generic ``block``."""
+    generic_transpose = _radau_exact_stage_residual_matrix(
+        kernel_context,
+        physics_context,
+        carry_in,
+        primal_result,
+        lagged_response,
+    ).T
+    colored_transpose = _radau_exact_stage_residual_transpose_matrix_colored_ntss_midpoint(
+        kernel_context,
+        physics_context,
+        carry_in,
+        primal_result,
+        lagged_response,
+    )
+    difference = colored_transpose - generic_transpose
+    max_abs = jnp.max(jnp.abs(difference))
+    generic_l2 = jnp.linalg.norm(generic_transpose)
+    relative_l2 = jnp.linalg.norm(difference) / jnp.maximum(
+        generic_l2,
+        jnp.asarray(jnp.finfo(kernel_context.dtype).tiny, dtype=kernel_context.dtype),
+    )
+    return max_abs, relative_l2
+
+
 def _radau_exact_stage_transpose_er_coeff_low_rank_factors_compact(
     kernel_context: _RadauAcceptedStepKernelContext,
     physics_context: _RadauAcceptedStepPhysicsContext,
@@ -10122,6 +10392,39 @@ def _radau_solve_exact_stage_residual_transpose_block(
         lagged_response,
     )
     return jnp.linalg.solve(matrix.T, -rhs_arr).reshape((-1,))
+
+
+def _radau_solve_exact_stage_residual_transpose_block_colored_ntss_midpoint(
+    kernel_context: _RadauAcceptedStepKernelContext,
+    physics_context: _RadauAcceptedStepPhysicsContext,
+    carry_in: _RadauAcceptedStepCarry,
+    primal_result: _RadauAcceptedStepAttemptResult,
+    lagged_response,
+    *,
+    rhs,
+    batched: bool = False,
+):
+    """Solve the exact dense transpose system reconstructed from colored actions.
+
+    This is deliberately *not* a Woodbury inverse.  The analytic NTSS midpoint
+    rank-three correction is used only to separate the nonlocal contribution
+    while recovering the local bands.  The final operator is materialized and
+    solved by the same dense block solve as ``block``.
+    """
+    system_size = int(kernel_context.num_stages) * int(kernel_context.state_dim)
+    rhs_arr = jnp.asarray(rhs, dtype=kernel_context.dtype)
+    rhs_rows = rhs_arr.reshape((-1, system_size)) if batched else rhs_arr.reshape((1, system_size))
+    transpose_matrix = _radau_exact_stage_residual_transpose_matrix_colored_ntss_midpoint(
+        kernel_context,
+        physics_context,
+        carry_in,
+        primal_result,
+        lagged_response,
+    )
+    # Passing all objectives as columns makes one dense multi-RHS solve.  This
+    # preserves the existing all-objective batching rather than scanning them.
+    solution_rows = jnp.linalg.solve(transpose_matrix, -rhs_rows.T).T
+    return solution_rows if batched else solution_rows[0]
 
 
 def _radau_solve_exact_stage_residual_transpose_woodbury(
@@ -10419,6 +10722,15 @@ def _radau_solve_exact_stage_residual_transpose(
             rhs=rhs,
             method=mode,
         )
+    if mode == "block_colored_ntss_midpoint":
+        return _radau_solve_exact_stage_residual_transpose_block_colored_ntss_midpoint(
+            kernel_context,
+            physics_context,
+            carry_in,
+            primal_result,
+            lagged_response,
+            rhs=rhs,
+        )
     if mode not in {"block", "block_explicit_ntx_jacobian", "block_frozen_forward_jacobian"}:
         raise ValueError(f"Unknown reverse_stage_adjoint_solve_mode '{mode}'.")
     return _radau_solve_exact_stage_residual_transpose_block(
@@ -10509,6 +10821,16 @@ def _radau_solve_exact_stage_residual_transpose_batched(
             lagged_response,
             rhs=rhs_arr,
             method=mode,
+        )
+    if mode == "block_colored_ntss_midpoint":
+        return _radau_solve_exact_stage_residual_transpose_block_colored_ntss_midpoint(
+            kernel_context,
+            physics_context,
+            carry_in,
+            primal_result,
+            lagged_response,
+            rhs=rhs_arr,
+            batched=True,
         )
     if mode not in {"block", "block_explicit_ntx_jacobian", "block_frozen_forward_jacobian"}:
         raise ValueError(f"Unknown reverse_stage_adjoint_solve_mode '{mode}'.")
@@ -16238,6 +16560,11 @@ def _build_prepared_radau_accepted_rollout(
             vector_field,
             species,
         )
+    exact_stage_transpose_low_rank_correction = (
+        _exact_stage_transpose_low_rank_correction_from_factors(
+            exact_stage_transpose_low_rank_factors
+        )
+    )
     use_transport_lagged_response = rhs_mode in {"lagged_transport_response", "lagged_response"}
     reverse_stage_adjoint_solve_mode = str(
         getattr(solver, "reverse_stage_adjoint_solve_mode", "structured")
@@ -16247,6 +16574,14 @@ def _build_prepared_radau_accepted_rollout(
             "reverse_stage_adjoint_solve_mode='exact_block_compact' requires the equation system "
             "to implement solve_exact_stage_transpose_compact(...). The dense block fallback is "
             "disabled by design."
+        )
+    if (
+        reverse_stage_adjoint_solve_mode == "block_colored_ntss_midpoint"
+        and exact_stage_transpose_low_rank_correction is None
+    ):
+        raise ValueError(
+            "reverse_stage_adjoint_solve_mode='block_colored_ntss_midpoint' requires "
+            "the analytic NTSS-midpoint stage-transpose correction."
         )
     if use_transport_lagged_response and build_lagged_response_raw is None:
         raise ValueError(
@@ -16410,6 +16745,7 @@ def _build_prepared_radau_accepted_rollout(
         flat_rhs_joint_generic_state_pullback=flat_rhs_joint_generic_state_pullback,
         exact_stage_transpose_solve_compact=exact_stage_transpose_solve_compact,
         exact_stage_transpose_low_rank_factors=exact_stage_transpose_low_rank_factors,
+        exact_stage_transpose_low_rank_correction=exact_stage_transpose_low_rank_correction,
         lagged_response_reuse_mode=str(getattr(solver, "lagged_response_reuse_mode", "retry_only")).strip().lower(),
         lagged_response_reuse_rtol=jnp.asarray(getattr(solver, "lagged_response_reuse_rtol", 5.0e-2), dtype=dtype),
         lagged_response_reuse_atol=jnp.asarray(getattr(solver, "lagged_response_reuse_atol", 1.0e-8), dtype=dtype),
@@ -16699,6 +17035,11 @@ class RADAUSolver(_RadauSolverConfig):
                 vector_field,
                 species,
             )
+        exact_stage_transpose_low_rank_correction = (
+            _exact_stage_transpose_low_rank_correction_from_factors(
+                exact_stage_transpose_low_rank_factors
+            )
+        )
         rhs_mode = str(getattr(self, "rhs_mode", "black_box")).strip().lower()
         reverse_stage_adjoint_solve_mode = str(
             getattr(self, "reverse_stage_adjoint_solve_mode", "structured")
@@ -16708,6 +17049,14 @@ class RADAUSolver(_RadauSolverConfig):
                 "reverse_stage_adjoint_solve_mode='exact_block_compact' requires the equation system "
                 "to implement solve_exact_stage_transpose_compact(...). The dense block fallback is "
                 "disabled by design."
+            )
+        if (
+            reverse_stage_adjoint_solve_mode == "block_colored_ntss_midpoint"
+            and exact_stage_transpose_low_rank_correction is None
+        ):
+            raise ValueError(
+                "reverse_stage_adjoint_solve_mode='block_colored_ntss_midpoint' requires "
+                "the analytic NTSS-midpoint stage-transpose correction."
             )
         if rhs_mode not in {"black_box", "lagged_linear_state", "lagged_transport_response", "lagged_response"}:
             raise ValueError(
@@ -16889,6 +17238,7 @@ class RADAUSolver(_RadauSolverConfig):
             flat_rhs_flux_state_pullback=flat_rhs_flux_state_pullback,
             exact_stage_transpose_solve_compact=exact_stage_transpose_solve_compact,
             exact_stage_transpose_low_rank_factors=exact_stage_transpose_low_rank_factors,
+            exact_stage_transpose_low_rank_correction=exact_stage_transpose_low_rank_correction,
             lagged_response_reuse_mode=str(getattr(self, "lagged_response_reuse_mode", "retry_only")).strip().lower(),
             lagged_response_reuse_rtol=jnp.asarray(getattr(self, "lagged_response_reuse_rtol", 5.0e-2), dtype=dtype),
             lagged_response_reuse_atol=jnp.asarray(getattr(self, "lagged_response_reuse_atol", 1.0e-8), dtype=dtype),

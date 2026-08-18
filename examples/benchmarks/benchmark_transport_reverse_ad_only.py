@@ -5311,6 +5311,7 @@ def main() -> None:
             "structured",
             "bicgstab",
             "block",
+            "block_colored_ntss_midpoint",
             "block_explicit_ntx_jacobian",
             "block_frozen_forward_jacobian",
             "gmres",
@@ -5325,6 +5326,10 @@ def main() -> None:
             "transformed LU transpose approximation and is the lightweight default; "
             "'bicgstab' is the lower-memory exact iterative candidate; 'block' and "
             "'gmres' are correctness oracles but are memory/compile heavy; "
+            "'block_colored_ntss_midpoint' is an isolated exact candidate for the "
+            "NTSS-midpoint model: it reconstructs the dense block transpose from "
+            "colored local actions plus the analytic rank-three correction, then "
+            "uses the same dense multi-RHS solve as 'block'; "
             "'block_explicit_ntx_jacobian' keeps the exact block system but materializes "
             "each fixed-lagged NTX stage Jacobian from the explicit state pullback; "
             "'block_frozen_forward_jacobian' uses each replayed primal step's frozen "
