@@ -11,6 +11,7 @@ from NEOPAX._entropy_models import get_entropy_model
 from NEOPAX._transport_flux_models import (
     AnalyticalTurbulentTransportModel,
     CombinedTransportFluxModel,
+    CombinedTransportLaggedResponse,
     FluxesRFileTransportModel,
     PowerAnalyticalTurbulentTransportModel,
     SpectraXTurbulenceFDLaggedResponse,
@@ -618,6 +619,59 @@ def test_combined_transport_flux_model_can_drop_turbulent_particle_flux():
     local_eval = model.build_local_particle_flux_evaluator(state=None)
     gamma_local = local_eval(0, 0.0)
     assert jnp.allclose(gamma_local, gamma_neo[:, 0] + gamma_classical[:, 0])
+
+
+def test_combined_joint_lagged_pullback_preserves_submodel_state_bars():
+    """The joint NTX hook must not forward BC kwargs or drop combined bars."""
+
+    class LinearLaggedModel:
+        def __init__(self, factor, *, joint=False):
+            self.factor = factor
+            self.joint = joint
+
+        def pullback_build_lagged_response(self, state, response_bar, **kwargs):
+            assert kwargs["bc_density"] == "density-bc"
+            assert kwargs["bc_temperature"] == "temperature-bc"
+            return self.factor * response_bar
+
+        def pullback_build_lagged_response_state_and_support_payload_batched_interpolated_faces(
+            self,
+            state,
+            response_bars,
+            support,
+        ):
+            assert self.joint
+            return self.factor * response_bars, 11.0 * response_bars
+
+    model = CombinedTransportFluxModel(
+        neoclassical_model=LinearLaggedModel(3.0, joint=True),
+        turbulent_model=LinearLaggedModel(5.0),
+        classical_model=LinearLaggedModel(7.0),
+    )
+    bars = jnp.asarray([2.0, -1.0])
+    state_bars, support_bars = (
+        model.pullback_build_lagged_response_state_and_support_payload_batched_interpolated_faces(
+            jnp.asarray(1.0),
+            CombinedTransportLaggedResponse(bars, bars, bars),
+            jnp.asarray(4.0),
+            bc_density="density-bc",
+            bc_temperature="temperature-bc",
+        )
+    )
+
+    assert jnp.allclose(state_bars, 15.0 * bars)
+    assert jnp.allclose(support_bars, 11.0 * bars)
+
+    state_bars_without_classical, _ = (
+        model.pullback_build_lagged_response_state_and_support_payload_batched_interpolated_faces(
+            jnp.asarray(1.0),
+            CombinedTransportLaggedResponse(bars, bars, None),
+            jnp.asarray(4.0),
+            bc_density="density-bc",
+            bc_temperature="temperature-bc",
+        )
+    )
+    assert jnp.allclose(state_bars_without_classical, 8.0 * bars)
 
 
 def test_calculate_fluxes_from_config_uses_flux_output_flags():
