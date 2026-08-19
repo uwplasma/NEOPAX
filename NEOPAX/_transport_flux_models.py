@@ -1040,6 +1040,70 @@ class CombinedTransportFluxModel(TransportFluxModelBase):
         # scalar sanitizer would drop that axis on non-float leaves.
         return pullback_fn(state, response_bars, support)
 
+    def pullback_build_lagged_response_state_and_support_payload_batched_interpolated_faces(
+        self,
+        state,
+        lagged_response_bars,
+        support,
+        **kwargs,
+    ):
+        """Joint batched transpose of the combined lagged-response build.
+
+        The NTX neoclassical component supplies the specialised joint
+        state/support rule.  Turbulent and classical models do not depend on
+        the NTX support payload, but their state cotangents are still part of
+        the combined response and must be added here.
+        """
+        pullback_fn = getattr(
+            self.neoclassical_model,
+            "pullback_build_lagged_response_state_and_support_payload_batched_interpolated_faces",
+            None,
+        )
+        if not callable(pullback_fn):
+            raise NotImplementedError(
+                "The active neoclassical model does not expose the batched joint "
+                "interpolated-face state/support pullback."
+            )
+        if lagged_response_bars is None:
+            raise ValueError("Combined joint lagged-response pullback requires response cotangents.")
+
+        neoclassical_state_bars, support_bars = pullback_fn(
+            state,
+            lagged_response_bars.neoclassical_response,
+            support,
+            **kwargs,
+        )
+
+        def _batched_state_pullback(model, response_bars):
+            if response_bars is None:
+                return jax.tree_util.tree_map(jnp.zeros_like, neoclassical_state_bars)
+            model_pullback = getattr(model, "pullback_build_lagged_response", None)
+            if callable(model_pullback):
+                return jax.vmap(
+                    lambda response_bar: model_pullback(state, response_bar, **kwargs)
+                )(response_bars)
+            _, generic_pullback = jax.vjp(
+                lambda state_value: model.build_lagged_response(state_value, **kwargs),
+                state,
+            )
+            return jax.vmap(lambda response_bar: generic_pullback(response_bar)[0])(response_bars)
+
+        turbulent_state_bars = _batched_state_pullback(
+            self.turbulent_model,
+            lagged_response_bars.turbulent_response,
+        )
+        classical_state_bars = _batched_state_pullback(
+            self.classical_model,
+            lagged_response_bars.classical_response,
+        )
+        state_bars = jax.tree_util.tree_map(
+            lambda neo_bar, turbulent_bar, classical_bar: neo_bar + turbulent_bar + classical_bar,
+            neoclassical_state_bars,
+            turbulent_state_bars,
+            classical_state_bars,
+        )
+        return state_bars, support_bars
+
     def evaluate_with_lagged_response(self, state, lagged_response, **kwargs):
         neo = (
             self.neoclassical_model(state)
