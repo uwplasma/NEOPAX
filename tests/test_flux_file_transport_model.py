@@ -26,22 +26,25 @@ from NEOPAX._state import TransportState
 
 
 def test_sum_float_delta_bar_trees_converts_prepared_static_float0_leaves():
-    """Joint prepared-support paths must safely combine JAX float0 bars."""
+    """Joint prepared-support paths retain mapped bar axes for static leaves."""
     primal = {
         "coefficient": jnp.asarray([2.0, -1.0]),
         "mode_index": jnp.asarray([1, 3], dtype=jnp.int32),
     }
-    float0_index_bar = jnp.zeros((2,), dtype=jax.dtypes.float0)
+    # The energy-map axis is present on every cotangent leaf, including the
+    # float0 cotangent of an integer/static prepared-system leaf.
+    float0_index_bar = jnp.zeros((2, 2), dtype=jax.dtypes.float0)
     total = _sum_float_delta_bar_trees(
         primal,
-        {"coefficient": jnp.asarray([1.0, 2.0]), "mode_index": float0_index_bar},
-        {"coefficient": jnp.asarray([-0.5, 3.0]), "mode_index": float0_index_bar},
-        {"coefficient": jnp.asarray([0.25, -1.0]), "mode_index": float0_index_bar},
-        {"coefficient": jnp.asarray([0.0, 0.5]), "mode_index": float0_index_bar},
+        {"coefficient": jnp.asarray([[1.0, 2.0], [0.0, 1.0]]), "mode_index": float0_index_bar},
+        {"coefficient": jnp.asarray([[-0.5, 3.0], [2.0, 0.0]]), "mode_index": float0_index_bar},
+        {"coefficient": jnp.asarray([[0.25, -1.0], [1.0, -2.0]]), "mode_index": float0_index_bar},
+        {"coefficient": jnp.asarray([[0.0, 0.5], [0.0, 1.0]]), "mode_index": float0_index_bar},
     )
-    assert jnp.allclose(total["coefficient"], jnp.asarray([0.75, 4.5]))
+    assert jnp.allclose(total["coefficient"], jnp.asarray([[0.75, 4.5], [3.0, 0.0]]))
+    assert total["mode_index"].shape == (2, 2)
     assert total["mode_index"].dtype == jnp.float64
-    assert jnp.allclose(total["mode_index"], jnp.zeros((2,)))
+    assert jnp.allclose(total["mode_index"], jnp.zeros((2, 2)))
 
 
 class DummySpecies:

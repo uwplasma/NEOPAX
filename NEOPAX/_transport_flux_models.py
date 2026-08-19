@@ -2079,15 +2079,34 @@ def _sum_float_delta_bar_trees(primal_tree, *bar_trees):
     Integer/static leaves of a prepared NTX system have no tangent space, so
     JAX represents their VJP result as ``float0``.  They must be made regular
     zero leaves before a joint pullback combines several derivative paths.
+
+    ``bar_trees`` here come from an energy ``lax.map`` and therefore have a
+    leading energy axis.  In particular, the zero substituted for a static
+    leaf must retain the *bar* shape, not the primal leaf shape; otherwise
+    rebuilding NTX's validated geometry dataclass mixes batched Fourier
+    coefficients with an unbatched mode array.
     """
+    def _sanitize_batched_leaf(primal_leaf, bar_leaf):
+        primal_arr = jnp.asarray(primal_leaf)
+        bar_arr = jnp.asarray(bar_leaf)
+        dtype = primal_arr.dtype if jnp.issubdtype(primal_arr.dtype, jnp.inexact) else jnp.float64
+        if bar_arr.dtype == jax.dtypes.float0:
+            return jnp.zeros(bar_arr.shape, dtype=dtype)
+        if jnp.issubdtype(primal_arr.dtype, jnp.inexact):
+            return jnp.asarray(bar_leaf, dtype=primal_arr.dtype)
+        return jnp.zeros(bar_arr.shape, dtype=dtype)
+
+    def _sanitize_batched_tree(bar_tree):
+        return jax.tree_util.tree_map(_sanitize_batched_leaf, primal_tree, bar_tree)
+
     if not bar_trees:
-        return _sanitize_float_delta_bar_tree(primal_tree, None)
-    total = _sanitize_float_delta_bar_tree(primal_tree, bar_trees[0])
+        return _float_delta_tree_like(primal_tree)
+    total = _sanitize_batched_tree(bar_trees[0])
     for bar_tree in bar_trees[1:]:
         total = jax.tree_util.tree_map(
             lambda left, right: left + right,
             total,
-            _sanitize_float_delta_bar_tree(primal_tree, bar_tree),
+            _sanitize_batched_tree(bar_tree),
         )
     return total
 
