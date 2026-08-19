@@ -2602,15 +2602,21 @@ def prepare_reverse_static_setup(
         "separate",
         "ntx_batched_interpolated_faces",
         "ntx_joint_implicit_interpolated_faces",
+        "ntx_joint_implicit_interpolated_faces_packed_support_adjoint",
     }:
         raise ValueError(
             "reverse_rebuild_support_pullback_mode must be one of "
             "{'separate', 'ntx_batched_interpolated_faces', "
-            "'ntx_joint_implicit_interpolated_faces'}."
+            "'ntx_joint_implicit_interpolated_faces', "
+            "'ntx_joint_implicit_interpolated_faces_packed_support_adjoint'}."
         )
     if (
         reverse_rebuild_support_pullback_mode
-        in {"ntx_batched_interpolated_faces", "ntx_joint_implicit_interpolated_faces"}
+        in {
+            "ntx_batched_interpolated_faces",
+            "ntx_joint_implicit_interpolated_faces",
+            "ntx_joint_implicit_interpolated_faces_packed_support_adjoint",
+        }
         and not reverse_direct_stage_adjoint
     ):
         raise ValueError(
