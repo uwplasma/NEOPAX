@@ -6325,12 +6325,18 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             first_base_epsi_hat_bar * (-epsi_hat_tangent / vth_a),
             axis=0,
         )
-        prepared_bar = _sum_float_delta_bar_trees(
-            prepared,
-            base_geometry_bar,
-            first_geometry_bar,
-            second_base_geometry_bar,
-            second_geometry_bar,
+        # Every energy evaluation differentiates the same prepared NTX
+        # system. Combine its four directional contributions, then reduce the
+        # mapped energy axis before returning a cotangent for that one system.
+        prepared_bar = jax.tree_util.tree_map(
+            lambda values: jnp.sum(values, axis=0),
+            _sum_float_delta_bar_trees(
+                prepared,
+                base_geometry_bar,
+                first_geometry_bar,
+                second_base_geometry_bar,
+                second_geometry_bar,
+            ),
         )
         # ``lax.map`` above leaves an energy axis on every direct ``drds``
         # contribution.  ``drds_value`` is one scalar at this anchor, so its
