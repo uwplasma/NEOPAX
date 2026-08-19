@@ -6649,7 +6649,7 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             jnp.sum(density_species_bar, axis=0),
         )
 
-    def _pullback_interpolated_moment_response_local_fields_and_prepared_support_and_drds(
+    def _pullback_interpolated_moment_response_local_fields_and_prepared_support_and_drds_flat_prepared(
         self,
         prepared,
         *,
@@ -6660,7 +6660,14 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         collisionality_kind,
         field_bars,
     ):
-        """Joint local state/support pullback for the interpolated NTX lane."""
+        """Joint local pullback, returning prepared-support leaves unflattened.
+
+        A prepared NTX system contains validated geometry dataclasses.  Do not
+        return those dataclasses through the nested species/objective ``vmap``
+        operations below: JAX batches their leaves one at a time and the
+        dataclass validation sees a temporary sentinel in static mode fields.
+        The caller rebuilds this static pytree after both maps complete.
+        """
 
         vthermal_local = get_v_thermal(self.species.mass, temperature_local)
         species_indices = jnp.arange(int(self.species.number_species), dtype=jnp.int32)
@@ -6712,7 +6719,7 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                 er_bar,
                 temperature_bar,
                 density_bar,
-                prepared_bar,
+                tuple(jax.tree_util.tree_leaves(prepared_bar)),
             )
 
         (
@@ -6720,7 +6727,7 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             er_species_bar,
             temperature_species_bar,
             density_species_bar,
-            prepared_geometry_species_bar,
+            prepared_geometry_species_bar_leaves,
         ) = jax.vmap(_per_species_pullback, in_axes=(0, 0))(
             species_indices,
             field_bars,
@@ -6730,10 +6737,7 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             jnp.sum(er_species_bar, axis=0),
             jnp.sum(temperature_species_bar, axis=0),
             jnp.sum(density_species_bar, axis=0),
-            jax.tree_util.tree_map(
-                lambda values: jnp.sum(values, axis=0),
-                prepared_geometry_species_bar,
-            ),
+            tuple(jnp.sum(values, axis=0) for values in prepared_geometry_species_bar_leaves),
         )
 
     def _lij_center(self, Er, temperature, density):
@@ -9279,14 +9283,15 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             density_local = jax.lax.dynamic_index_in_dim(
                 face_density, radius_index, axis=1, keepdims=False
             )
+            prepared_treedef = jax.tree_util.tree_structure(prepared)
             (
                 drds_local_bar,
                 er_local_bar,
                 temperature_local_bar,
                 density_local_bar,
-                prepared_local_bar,
+                prepared_local_bar_leaves,
             ) = jax.vmap(
-                lambda one_field_bars: self._pullback_interpolated_moment_response_local_fields_and_prepared_support_and_drds(
+                lambda one_field_bars: self._pullback_interpolated_moment_response_local_fields_and_prepared_support_and_drds_flat_prepared(
                     prepared,
                     drds_value=drds_value,
                     er_value=er_value,
@@ -9296,6 +9301,7 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                     field_bars=one_field_bars,
                 )
             )(local_field_bars)
+            prepared_local_bar = prepared_treedef.unflatten(prepared_local_bar_leaves)
             # Match the established scalar state transpose: the axis anchor
             # has a regularized response representation and contributes only
             # through its explicit reference-Er channel, not through a local
