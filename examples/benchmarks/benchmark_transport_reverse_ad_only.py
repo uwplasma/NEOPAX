@@ -5411,6 +5411,7 @@ def main() -> None:
             "separate",
             "ntx_batched_interpolated_faces",
             "ntx_joint_implicit_interpolated_faces",
+            "ntx_joint_implicit_interpolated_faces_packed_support_adjoint",
         ),
         default="separate",
         help=(
@@ -5421,7 +5422,10 @@ def main() -> None:
             "fallback for unsupported response representations. "
             "'ntx_joint_implicit_interpolated_faces' is the exact experimental "
             "mode that obtains rebuild state and NTX-support bars jointly from "
-            "the same local NTX implicit adjoint."
+            "the same local NTX implicit adjoint. "
+            "'ntx_joint_implicit_interpolated_faces_packed_support_adjoint' is "
+            "the same experimental joint lane, but uses NTX's separately tested "
+            "paired directional support-adjoint solve."
         ),
     )
     parser.add_argument(

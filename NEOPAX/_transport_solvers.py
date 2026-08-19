@@ -1463,6 +1463,7 @@ def _flat_rhs_build_state_and_support_pullback_batched_interpolated_faces_factor
     args,
     kwargs,
     project_flat=None,
+    packed_support_directional_adjoint: bool = False,
 ):
     """Flatten the exact joint NTX rebuild state/support pullback hook."""
     pullback_fn = _lagged_response_build_state_and_support_pullback_batched_interpolated_faces_hook(
@@ -1478,6 +1479,7 @@ def _flat_rhs_build_state_and_support_pullback_batched_interpolated_faces_factor
             state_y,
             lagged_response_bars,
             support,
+            packed_support_directional_adjoint=packed_support_directional_adjoint,
             **kwargs,
         )
         return jax.vmap(pack_flat)(state_bars), support_bars
@@ -5822,9 +5824,10 @@ def _execute_radau_accepted_step_next_reduced_cotangent_batched_bwd_with_support
                 "separate",
             )
         ).strip().lower()
-        joint_ntx_rebuild_pullback = (
-            rebuild_support_pullback_mode == "ntx_joint_implicit_interpolated_faces"
-        )
+        joint_ntx_rebuild_pullback = rebuild_support_pullback_mode in {
+            "ntx_joint_implicit_interpolated_faces",
+            "ntx_joint_implicit_interpolated_faces_packed_support_adjoint",
+        }
         zero_rebuild_pullback = cotangent_mode in {
             "zero_rebuild_pullback",
             "zero_lagged_rebuild",
@@ -5838,7 +5841,7 @@ def _execute_radau_accepted_step_next_reduced_cotangent_batched_bwd_with_support
             )
             if joint_pullback is None:
                 raise RuntimeError(
-                    "ntx_joint_implicit_interpolated_faces rebuild pullback was requested, "
+                    "joint NTX interpolated-face rebuild pullback was requested, "
                     "but the active transport physics context does not expose that hook."
                 )
             with _radau_reverse_profile_scope(
@@ -16893,6 +16896,12 @@ def _build_prepared_radau_accepted_rollout(
             args=args,
             kwargs=kwargs,
             project_flat=project_flat,
+            packed_support_directional_adjoint=(
+                str(getattr(solver, "reverse_rebuild_support_pullback_mode", "separate"))
+                .strip()
+                .lower()
+                == "ntx_joint_implicit_interpolated_faces_packed_support_adjoint"
+            ),
         )
     )
     flat_rhs_lagged_response_support_pullback = _flat_rhs_lagged_response_support_pullback_factory(
@@ -17408,6 +17417,12 @@ class RADAUSolver(_RadauSolverConfig):
                 args=args,
                 kwargs=kwargs,
                 project_flat=project_flat,
+                packed_support_directional_adjoint=(
+                    str(getattr(self, "reverse_rebuild_support_pullback_mode", "separate"))
+                    .strip()
+                    .lower()
+                    == "ntx_joint_implicit_interpolated_faces_packed_support_adjoint"
+                ),
             )
         )
         flat_rhs_lagged_response_support_pullback = _flat_rhs_lagged_response_support_pullback_factory(

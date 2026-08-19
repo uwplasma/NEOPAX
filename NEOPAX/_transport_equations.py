@@ -1947,6 +1947,9 @@ class ComposedEquationSystem:
             working_state,
             flux_response_bars,
             support,
+            packed_support_directional_adjoint=bool(
+                kwargs.pop("packed_support_directional_adjoint", False)
+            ),
             **self._shared_flux_call_kwargs(kwargs),
         )
         state_bars = jax.vmap(

@@ -1071,6 +1071,9 @@ class CombinedTransportFluxModel(TransportFluxModelBase):
             state,
             lagged_response_bars.neoclassical_response,
             support,
+            packed_support_directional_adjoint=bool(
+                kwargs.pop("packed_support_directional_adjoint", False)
+            ),
         )
 
         def _batched_state_pullback(model, response_bars):
@@ -6179,6 +6182,7 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         reference_epsi_hat,
         vth_a,
         field_bars,
+        packed_support_directional_adjoint: bool = False,
     ):
         """Joint exact local pullback for state primitives and prepared support.
 
@@ -6272,7 +6276,12 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                     ),
                 )
 
-            return ntx.solve_prepared_coefficient_vector_lowdot_two_pullbacks_with_prepared_and_aux(
+            lowdot_pullback = (
+                ntx.solve_prepared_coefficient_vector_lowdot_two_pullbacks_with_prepared_and_aux_packed_support_adjoint
+                if packed_support_directional_adjoint
+                else ntx.solve_prepared_coefficient_vector_lowdot_two_pullbacks_with_prepared_and_aux
+            )
+            return lowdot_pullback(
                 prepared,
                 ntx.MonoenergeticCase(nu_hat=nu_hat_value, epsi_hat=epsi_hat_value),
                 ntx.MonoenergeticCase(nu_hat=jnp.zeros_like(nu_hat_value), epsi_hat=epsi_dot),
@@ -6670,6 +6679,7 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         density_local,
         collisionality_kind,
         field_bars,
+        packed_support_directional_adjoint: bool = False,
     ):
         """Joint local pullback, returning prepared-support leaves unflattened.
 
@@ -6708,6 +6718,7 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                 reference_epsi_hat=reference_epsi_hat,
                 vth_a=vth_a,
                 field_bars=species_field_bars,
+                packed_support_directional_adjoint=packed_support_directional_adjoint,
             )
             (
                 implicit_drds_bar,
@@ -9153,6 +9164,8 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         state,
         lagged_response_bars,
         support,
+        *,
+        packed_support_directional_adjoint: bool = False,
     ):
         """Joint exact transpose of interpolated face state and NTX support.
 
@@ -9310,6 +9323,7 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                     density_local=density_local,
                     collisionality_kind=collisionality_kind,
                     field_bars=one_field_bars,
+                    packed_support_directional_adjoint=packed_support_directional_adjoint,
                 )
             )(local_field_bars)
             prepared_local_bar = prepared_treedef.unflatten(prepared_local_bar_leaves)
