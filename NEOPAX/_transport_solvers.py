@@ -7,6 +7,7 @@ Inspired by torax (https://github.com/google-deepmind/torax).
 """
 
 from typing import Callable, Any
+import contextlib
 import dataclasses
 from functools import partial
 import inspect
@@ -3638,6 +3639,7 @@ class _RadauAcceptedStepPhysicsContext:
     reverse_rebuild_support_pullback_mode: str = "separate"
     reverse_segment_jit_diagnostics: bool = False
     reverse_segment_input_diagnostics: bool = False
+    reverse_segment_profile_annotations: bool = False
     reverse_segment_start_replay_mode: str = "legacy"
     reverse_segment_primal_record_mode: str = "reconstruct"
     reverse_stage_cotangent_mode: str = "full"
@@ -3648,6 +3650,19 @@ class _RadauAcceptedStepPhysicsContext:
     reverse_stage_adjoint_woodbury_rank: int = 24
     reverse_single_segment_vjp_forward_mode: str = "legacy"
     reverse_lagged_branch_schedule: tuple[bool, ...] | None = None
+
+
+@contextlib.contextmanager
+def _radau_reverse_profile_scope(
+    physics_context: _RadauAcceptedStepPhysicsContext,
+    name: str,
+):
+    """Optionally retain XProf-visible labels in the compiled reverse segment."""
+    if bool(getattr(physics_context, "reverse_segment_profile_annotations", False)):
+        with jax.named_scope(name):
+            yield
+    else:
+        yield
 
 
 @jax.tree_util.register_dataclass
@@ -5015,13 +5030,16 @@ def _execute_radau_accepted_step_next_reduced_cotangent_bwd(
             return lhs_aligned
         return jax.tree_util.tree_map(lambda a, b: a + b, lhs_aligned, rhs_aligned)
 
-    lagged_response, _, _ = _radau_prepare_lagged_response(
-        kernel_context,
-        carry_for_linear_map,
-        physics_context.unpack_flat,
-        physics_context.project_flat,
-        physics_context.build_lagged_response,
-    )
+    with _radau_reverse_profile_scope(
+        physics_context, "reverse_segment/prepare_recorded_lagged_response"
+    ):
+        lagged_response, _, _ = _radau_prepare_lagged_response(
+            kernel_context,
+            carry_for_linear_map,
+            physics_context.unpack_flat,
+            physics_context.project_flat,
+            physics_context.build_lagged_response,
+        )
     if lagged_response is None:
         full_next_bar = dataclasses.replace(
             jax.tree_util.tree_map(_zero_tangent_like, primal_result.carry_after_attempt),
@@ -5170,13 +5188,16 @@ def _execute_radau_accepted_step_next_reduced_cotangent_bwd_with_support(
         lagged_response_valid=jnp.asarray(True),
         lagged_reference_y=primal_result.carry_after_attempt.lagged_reference_y,
     )
-    lagged_response, _, _ = _radau_prepare_lagged_response(
-        kernel_context,
-        carry_for_linear_map,
-        physics_context.unpack_flat,
-        physics_context.project_flat,
-        physics_context.build_lagged_response,
-    )
+    with _radau_reverse_profile_scope(
+        physics_context, "reverse_segment/prepare_recorded_lagged_response"
+    ):
+        lagged_response, _, _ = _radau_prepare_lagged_response(
+            kernel_context,
+            carry_for_linear_map,
+            physics_context.unpack_flat,
+            physics_context.project_flat,
+            physics_context.build_lagged_response,
+        )
     if lagged_response is None:
         return reduced_bar, _radau_zero_support_delta_tree_like(support)
 
@@ -5453,26 +5474,29 @@ def _execute_radau_accepted_step_next_reduced_cotangent_batched_bwd(
         * trial_y_bars[:, None, :]
     )
     memory_mode = str(getattr(physics_context, "reverse_stage_adjoint_memory_mode", "default")).strip().lower()
-    if memory_mode in {"stage_call_boundary", "call_boundary", "call_stage_adjoint"}:
-        residual_bars = jax.vmap(
-            lambda dz_bar: _radau_solve_exact_stage_residual_transpose(
+    with _radau_reverse_profile_scope(
+        physics_context, "reverse_segment/stage_adjoint_solve"
+    ):
+        if memory_mode in {"stage_call_boundary", "call_boundary", "call_stage_adjoint"}:
+            residual_bars = jax.vmap(
+                lambda dz_bar: _radau_solve_exact_stage_residual_transpose(
+                    kernel_context,
+                    physics_context,
+                    carry_in,
+                    primal_result,
+                    lagged_response,
+                    rhs=jnp.asarray(dz_bar, dtype=kernel_context.dtype).reshape((-1,)),
+                )
+            )(dz_bars)
+        else:
+            residual_bars = _radau_solve_exact_stage_residual_transpose_batched(
                 kernel_context,
                 physics_context,
                 carry_in,
                 primal_result,
                 lagged_response,
-                rhs=jnp.asarray(dz_bar, dtype=kernel_context.dtype).reshape((-1,)),
+                rhs=dz_bars.reshape((dz_bars.shape[0], -1)),
             )
-        )(dz_bars)
-    else:
-        residual_bars = _radau_solve_exact_stage_residual_transpose_batched(
-            kernel_context,
-            physics_context,
-            carry_in,
-            primal_result,
-            lagged_response,
-            rhs=dz_bars.reshape((dz_bars.shape[0], -1)),
-        )
 
     residual_y_bars, _, residual_lagged_bars = jax.vmap(
         lambda residual_bar: _radau_exact_stage_residual_input_pullback(
@@ -5511,12 +5535,19 @@ def _execute_radau_accepted_step_next_reduced_cotangent_batched_bwd(
         else:
             projected_y = _project_flat_state_if_needed(carry_in.y, physics_context.project_flat)
             rebuild_state = physics_context.unpack_flat(projected_y)
+
+            def _rebuild_state_pullback(lagged_cache_bar):
+                with _radau_reverse_profile_scope(
+                    physics_context, "reverse_segment/rebuild_lagged_response_transpose"
+                ):
+                    return physics_context.pullback_build_lagged_response(
+                        rebuild_state,
+                        lagged_cache_bar,
+                        reverse_stage_cotangent_mode=cotangent_mode,
+                    )
+
             rebuild_state_bars = jax.vmap(
-                lambda lagged_cache_bar: physics_context.pullback_build_lagged_response(
-                    rebuild_state,
-                    lagged_cache_bar,
-                    reverse_stage_cotangent_mode=cotangent_mode,
-                )
+                _rebuild_state_pullback
             )(lagged_cache_bars)
             rebuild_flat_bars = jax.vmap(physics_context.pack_flat)(rebuild_state_bars)
             if physics_context.project_flat is not None:
@@ -5629,26 +5660,29 @@ def _execute_radau_accepted_step_next_reduced_cotangent_batched_bwd_with_support
         * trial_y_bars[:, None, :]
     )
     memory_mode = str(getattr(physics_context, "reverse_stage_adjoint_memory_mode", "default")).strip().lower()
-    if memory_mode in {"stage_call_boundary", "call_boundary", "call_stage_adjoint"}:
-        residual_bars = jax.vmap(
-            lambda dz_bar: _radau_solve_exact_stage_residual_transpose(
+    with _radau_reverse_profile_scope(
+        physics_context, "reverse_segment/stage_adjoint_solve"
+    ):
+        if memory_mode in {"stage_call_boundary", "call_boundary", "call_stage_adjoint"}:
+            residual_bars = jax.vmap(
+                lambda dz_bar: _radau_solve_exact_stage_residual_transpose(
+                    kernel_context,
+                    physics_context,
+                    carry_in,
+                    primal_result,
+                    lagged_response,
+                    rhs=jnp.asarray(dz_bar, dtype=kernel_context.dtype).reshape((-1,)),
+                )
+            )(dz_bars)
+        else:
+            residual_bars = _radau_solve_exact_stage_residual_transpose_batched(
                 kernel_context,
                 physics_context,
                 carry_in,
                 primal_result,
                 lagged_response,
-                rhs=jnp.asarray(dz_bar, dtype=kernel_context.dtype).reshape((-1,)),
+                rhs=dz_bars.reshape((dz_bars.shape[0], -1)),
             )
-        )(dz_bars)
-    else:
-        residual_bars = _radau_solve_exact_stage_residual_transpose_batched(
-            kernel_context,
-            physics_context,
-            carry_in,
-            primal_result,
-            lagged_response,
-            rhs=dz_bars.reshape((dz_bars.shape[0], -1)),
-        )
 
     rhs_pullback_mode = str(
         getattr(physics_context, "reverse_rhs_pullback_mode", "separate")
@@ -5684,35 +5718,41 @@ def _execute_radau_accepted_step_next_reduced_cotangent_batched_bwd_with_support
         )(residual_bars)
         support_bar_leaves = tuple(jax.tree_util.tree_leaves(support_bars))
     elif rhs_pullback_mode == "separate":
-        residual_y_bars, _, residual_lagged_bars = jax.vmap(
-            lambda residual_bar: _radau_exact_stage_residual_input_pullback(
-                kernel_context,
-                physics_context,
-                carry_in,
-                primal_result,
-                lagged_response,
-                residual_bar,
-                compute_dt_bar=False,
-            )
-        )(residual_bars)
-        support_bar_leaves = jax.vmap(
-            lambda residual_bar: tuple(
-                jax.tree_util.tree_leaves(
-                    _radau_sanitize_support_delta_bar_tree(
-                        support,
-                        _radau_exact_stage_residual_support_pullback(
-                            kernel_context,
-                            physics_context,
-                            carry_in,
-                            primal_result,
-                            lagged_response,
-                            residual_bar,
+        with _radau_reverse_profile_scope(
+            physics_context, "reverse_segment/fixed_lagged_rhs_state_transpose"
+        ):
+            residual_y_bars, _, residual_lagged_bars = jax.vmap(
+                lambda residual_bar: _radau_exact_stage_residual_input_pullback(
+                    kernel_context,
+                    physics_context,
+                    carry_in,
+                    primal_result,
+                    lagged_response,
+                    residual_bar,
+                    compute_dt_bar=False,
+                )
+            )(residual_bars)
+        with _radau_reverse_profile_scope(
+            physics_context, "reverse_segment/fixed_lagged_rhs_support_transpose"
+        ):
+            support_bar_leaves = jax.vmap(
+                lambda residual_bar: tuple(
+                    jax.tree_util.tree_leaves(
+                        _radau_sanitize_support_delta_bar_tree(
                             support,
-                        ),
+                            _radau_exact_stage_residual_support_pullback(
+                                kernel_context,
+                                physics_context,
+                                carry_in,
+                                primal_result,
+                                lagged_response,
+                                residual_bar,
+                                support,
+                            ),
+                        )
                     )
                 )
-            )
-        )(residual_bars)
+            )(residual_bars)
     else:
         raise ValueError(f"Unknown reverse_rhs_pullback_mode '{rhs_pullback_mode}'.")
 
@@ -5741,12 +5781,19 @@ def _execute_radau_accepted_step_next_reduced_cotangent_batched_bwd_with_support
         else:
             projected_y = _project_flat_state_if_needed(carry_in.y, physics_context.project_flat)
             rebuild_state = physics_context.unpack_flat(projected_y)
+
+            def _rebuild_state_pullback_batched(lagged_cache_bar):
+                with _radau_reverse_profile_scope(
+                    physics_context, "reverse_segment/rebuild_lagged_response_transpose"
+                ):
+                    return physics_context.pullback_build_lagged_response(
+                        rebuild_state,
+                        lagged_cache_bar,
+                        reverse_stage_cotangent_mode=cotangent_mode,
+                    )
+
             rebuild_state_bars = jax.vmap(
-                lambda lagged_cache_bar: physics_context.pullback_build_lagged_response(
-                    rebuild_state,
-                    lagged_cache_bar,
-                    reverse_stage_cotangent_mode=cotangent_mode,
-                )
+                _rebuild_state_pullback_batched
             )(lagged_cache_bars)
             rebuild_flat_bars = jax.vmap(physics_context.pack_flat)(rebuild_state_bars)
             if physics_context.project_flat is not None:
@@ -5775,29 +5822,39 @@ def _execute_radau_accepted_step_next_reduced_cotangent_batched_bwd_with_support
                 # leading objective axis already attached. Do not run the
                 # scalar sanitizer here: it deliberately restores primal
                 # shapes for non-float leaves and would discard that axis.
-                rebuild_support_bar_leaves = tuple(
-                    jax.tree_util.tree_leaves(
-                        batched_pullback(
-                            carry_in.y,
-                            lagged_cache_bars,
-                            support,
-                        )
-                    )
-                )
-            elif rebuild_support_pullback_mode == "separate":
-                rebuild_support_bar_leaves = jax.vmap(
-                    lambda lagged_cache_bar: tuple(
+                with _radau_reverse_profile_scope(
+                    physics_context, "reverse_segment/rebuild_lagged_support_transpose"
+                ):
+                    rebuild_support_bar_leaves = tuple(
                         jax.tree_util.tree_leaves(
-                            _radau_sanitize_support_delta_bar_tree(
+                            batched_pullback(
+                                carry_in.y,
+                                lagged_cache_bars,
                                 support,
-                                physics_context.flat_rhs_build_support_pullback(
-                                    carry_in.y,
-                                    lagged_cache_bar,
-                                    support,
-                                ),
                             )
                         )
                     )
+            elif rebuild_support_pullback_mode == "separate":
+
+                def _rebuild_support_pullback(lagged_cache_bar):
+                    with _radau_reverse_profile_scope(
+                        physics_context, "reverse_segment/rebuild_lagged_support_transpose"
+                    ):
+                        return tuple(
+                            jax.tree_util.tree_leaves(
+                                _radau_sanitize_support_delta_bar_tree(
+                                    support,
+                                    physics_context.flat_rhs_build_support_pullback(
+                                        carry_in.y,
+                                        lagged_cache_bar,
+                                        support,
+                                    ),
+                                )
+                            )
+                        )
+
+                rebuild_support_bar_leaves = jax.vmap(
+                    _rebuild_support_pullback
                 )(lagged_cache_bars)
             else:
                 raise ValueError(

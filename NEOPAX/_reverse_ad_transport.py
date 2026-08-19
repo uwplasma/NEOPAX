@@ -2540,6 +2540,7 @@ def prepare_reverse_static_setup(
     reverse_rebuild_support_pullback_mode: str = "separate",
     reverse_segment_jit_diagnostics: bool = False,
     reverse_segment_input_diagnostics: bool = False,
+    reverse_segment_profile_annotations: bool = False,
     reverse_segment_start_replay_mode: str = "legacy",
     reverse_segment_primal_record_mode: str = "reconstruct",
     reverse_stage_cotangent_mode: str = "full",
@@ -2641,6 +2642,7 @@ def prepare_reverse_static_setup(
                 ),
                 reverse_segment_jit_diagnostics=bool(reverse_segment_jit_diagnostics),
                 reverse_segment_input_diagnostics=bool(reverse_segment_input_diagnostics),
+                reverse_segment_profile_annotations=bool(reverse_segment_profile_annotations),
                 reverse_segment_start_replay_mode=str(reverse_segment_start_replay_mode),
                 reverse_segment_primal_record_mode=str(reverse_segment_primal_record_mode),
                 reverse_stage_cotangent_mode=str(reverse_stage_cotangent_mode),
@@ -2951,6 +2953,23 @@ def prepare_realtime_geometry_support_segment_core_setup(
     )
 
 
+@contextlib.contextmanager
+def _reverse_profile_scope(reverse_setup: RealtimeGeometryReverseStaticSetup, name: str):
+    """Emit an XProf label only for the opt-in reverse trace mode."""
+    enabled = bool(
+        getattr(
+            reverse_setup.execution_context.physics_context,
+            "reverse_segment_profile_annotations",
+            False,
+        )
+    )
+    if enabled:
+        with jax.named_scope(name):
+            yield
+    else:
+        yield
+
+
 def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_vector(
     parameter_values,
     *,
@@ -3150,6 +3169,7 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
     objective_payload_bar_rows = []
     combined_geometry_payload = isinstance(support_payload, dict) and "geometry" in support_payload
     zero_payload_bar = _reverse_zero_support_delta_tree_like(reverse_setup.solver, support_payload)
+    phase_start = time.perf_counter()
     for objective_i in range(objective_count):
         objective_name = objective_labels[objective_i]
         if objective_name == "bootstrap_current_softmax_abs_scaled":
@@ -3341,6 +3361,14 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
         )
         for leaf_i in range(len(_zero_support_leaves))
     )
+    objective_values, final_y_bars, support_bar_leaves = jax.block_until_ready(
+        (objective_values, final_y_bars, support_bar_leaves)
+    )
+    print(
+        f"{progress_prefix} progress: support reverse final-objective cotangents ready "
+        f"elapsed_s={time.perf_counter() - phase_start:.3f}",
+        flush=True,
+    )
     objective_support_bar_leaves = support_bar_leaves
     step_support_bar_leaves_accum = tuple(jnp.zeros_like(leaf) for leaf in support_bar_leaves)
     initial_cache_support_bar_leaves_accum = tuple(jnp.zeros_like(leaf) for leaf in support_bar_leaves)
@@ -3514,31 +3542,34 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
     initial_cache_pullback_skipped = False
     if initial_lagged_response_valid and build_support_pullback is not None and allow_initial_cache_support_pullback:
         phase_start = time.perf_counter()
-        if initial_cache_support_pullback_mode == "ntx_batched_interpolated_faces":
-            batched_pullback = getattr(
-                reverse_setup.execution_context.physics_context,
-                "flat_rhs_build_support_pullback_batched_interpolated_faces",
-                None,
-            )
-            if batched_pullback is None:
-                raise RuntimeError(
-                    "ntx_batched_interpolated_faces was requested, but the active transport "
-                    "physics context does not expose the NTX batched support pullback."
+        with _reverse_profile_scope(
+            reverse_setup, "reverse_post_sweep/initial_cache_support_pullback"
+        ):
+            if initial_cache_support_pullback_mode == "ntx_batched_interpolated_faces":
+                batched_pullback = getattr(
+                    reverse_setup.execution_context.physics_context,
+                    "flat_rhs_build_support_pullback_batched_interpolated_faces",
+                    None,
                 )
-            initial_cache_support_bars = batched_pullback(
-                carry0.y,
-                reduced_bars.lagged_response_cache,
-                support_payload,
-            )
-        else:
-            initial_cache_support_bars = jax.lax.map(
-                lambda lagged_bar: build_support_pullback(
+                if batched_pullback is None:
+                    raise RuntimeError(
+                        "ntx_batched_interpolated_faces was requested, but the active transport "
+                        "physics context does not expose the NTX batched support pullback."
+                    )
+                initial_cache_support_bars = batched_pullback(
                     carry0.y,
-                    lagged_bar,
+                    reduced_bars.lagged_response_cache,
                     support_payload,
-                ),
-                reduced_bars.lagged_response_cache,
-            )
+                )
+            else:
+                initial_cache_support_bars = jax.lax.map(
+                    lambda lagged_bar: build_support_pullback(
+                        carry0.y,
+                        lagged_bar,
+                        support_payload,
+                    ),
+                    reduced_bars.lagged_response_cache,
+                )
         initial_cache_support_bars = jax.block_until_ready(initial_cache_support_bars)
         initial_cache_support_bar_leaves = jax.tree_util.tree_leaves(initial_cache_support_bars)
         support_bar_leaves = tuple(
@@ -3579,7 +3610,10 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
         flush=True,
     )
     phase_start = time.perf_counter()
-    initial_state_bars = jax.vmap(lambda carry0_bar: initial_state_pullback(carry0_bar)[0])(carry0_bars)
+    with _reverse_profile_scope(reverse_setup, "reverse_post_sweep/initial_state_pullback"):
+        initial_state_bars = jax.vmap(
+            lambda carry0_bar: initial_state_pullback(carry0_bar)[0]
+        )(carry0_bars)
     initial_state_bars = jax.block_until_ready(initial_state_bars)
     print(
         f"{progress_prefix} progress: support reverse initial state pullback ready "
@@ -3684,7 +3718,10 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
         initial_state_bars = pre_root_initial_state_bars
 
     phase_start = time.perf_counter()
-    gradient_matrix = jax.vmap(lambda state_bar: profile_state_pullback(state_bar)[0])(initial_state_bars)
+    with _reverse_profile_scope(reverse_setup, "reverse_post_sweep/profile_parameter_pullback"):
+        gradient_matrix = jax.vmap(
+            lambda state_bar: profile_state_pullback(state_bar)[0]
+        )(initial_state_bars)
     gradient_matrix = jax.block_until_ready(gradient_matrix)
     print(
         f"{progress_prefix} progress: support reverse profile parameter pullback ready "
@@ -3774,9 +3811,12 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
             )
 
         _, initial_geometry_pullback = jax.vjp(_initial_state_from_geometry_delta, geometry_delta0)
-        initial_geometry_bars = jax.vmap(
-            lambda state_bar: initial_geometry_pullback(state_bar)[0]
-        )(initial_state_bars)
+        with _reverse_profile_scope(
+            reverse_setup, "reverse_post_sweep/initial_profile_geometry_pullback"
+        ):
+            initial_geometry_bars = jax.vmap(
+                lambda state_bar: initial_geometry_pullback(state_bar)[0]
+            )(initial_state_bars)
         initial_geometry_bars = jax.block_until_ready(initial_geometry_bars)
         print(
             f"{progress_prefix} progress: support reverse initial-profile geometry pullback ready "
@@ -4551,6 +4591,7 @@ def internal_realtime_geometry_transport_reverse_table_result_builder(
     reverse_rebuild_support_pullback_mode: str = "separate",
     reverse_segment_jit_diagnostics: bool = False,
     reverse_segment_input_diagnostics: bool = False,
+    reverse_segment_profile_annotations: bool = False,
     reverse_segment_start_replay_mode: str = "legacy",
     reverse_segment_primal_record_mode: str = "reconstruct",
     reverse_stage_cotangent_mode: str = "full",
@@ -4683,6 +4724,12 @@ def internal_realtime_geometry_transport_reverse_table_result_builder(
             ),
             reverse_segment_input_diagnostics=bool(
                 opts.get("reverse_segment_input_diagnostics", reverse_segment_input_diagnostics)
+            ),
+            reverse_segment_profile_annotations=bool(
+                opts.get(
+                    "reverse_segment_profile_annotations",
+                    reverse_segment_profile_annotations,
+                )
             ),
             reverse_segment_start_replay_mode=str(
                 opts.get("reverse_segment_start_replay_mode", reverse_segment_start_replay_mode)

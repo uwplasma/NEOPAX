@@ -23,6 +23,31 @@ DEFAULT_NTX_EXACT_DERIVATIVE_PULLBACK_BOUNDARY = "inline"
 DEFAULT_NTX_EXACT_DERIVATIVE_PULLBACK_ALGEBRA = "ntx_helper"
 
 
+@contextlib.contextmanager
+def _maybe_reverse_segment_profiler_trace(trace_dir: str | None):
+    """Capture one benchmark evaluation for XProf without changing its math."""
+    if trace_dir in (None, ""):
+        yield
+        return
+    output_dir = Path(trace_dir).expanduser().resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
+    print(
+        "[autodiff-gate] progress: starting reverse-segment XProf trace "
+        f"directory={output_dir}",
+        flush=True,
+    )
+    jax.profiler.start_trace(str(output_dir), create_perfetto_trace=True)
+    try:
+        yield
+    finally:
+        jax.profiler.stop_trace()
+        print(
+            "[autodiff-gate] progress: reverse-segment XProf trace written "
+            f"directory={output_dir}",
+            flush=True,
+        )
+
+
 def _apply_transport_solver_backend_override(config: dict, backend_override: str | None) -> None:
     """Switch the benchmark TOML between solver backends without editing the file."""
     if backend_override in (None, "", "config"):
@@ -3605,6 +3630,9 @@ def _run_realtime_geometry_optimization_api_smoke(
             ),
             reverse_segment_jit_diagnostics=bool(args.reverse_segment_jit_diagnostics),
             reverse_segment_input_diagnostics=bool(args.reverse_segment_input_diagnostics),
+            reverse_segment_profile_annotations=bool(
+                args.reverse_segment_profiler_trace_dir
+            ),
             reverse_segment_start_replay_mode=str(args.reverse_segment_start_replay_mode),
             reverse_segment_primal_record_mode=str(args.reverse_segment_primal_record_mode),
             reverse_step_bwd_mode=str(args.reverse_step_bwd_mode),
@@ -3622,24 +3650,27 @@ def _run_realtime_geometry_optimization_api_smoke(
             context=table_context,
             options={"quiet": True},
         )
-        evaluation = evaluate_geometry_transport_realtime_geometry_least_squares(
-            config,
-            request=request,
-            terms=terms,
-            geometry_context=geometry_context,
-            parameter_values=parameter_values,
-            table_result_builder=table_result_builder,
-            objective_labels=objective_labels,
-            options={
-                "quiet": True,
-                "reverse_table_timing_diagnostics": bool(
-                    args.reverse_table_timing_diagnostics
-                ),
-            },
-            quiet_default=True,
-            geometry_max_iter=geom_cfg.get("vmec_max_iter"),
-            geometry_solver_device=str(geom_cfg.get("vmec_implicit_solver_device", "default")),
-        )
+        with _maybe_reverse_segment_profiler_trace(
+            args.reverse_segment_profiler_trace_dir
+        ):
+            evaluation = evaluate_geometry_transport_realtime_geometry_least_squares(
+                config,
+                request=request,
+                terms=terms,
+                geometry_context=geometry_context,
+                parameter_values=parameter_values,
+                table_result_builder=table_result_builder,
+                objective_labels=objective_labels,
+                options={
+                    "quiet": True,
+                    "reverse_table_timing_diagnostics": bool(
+                        args.reverse_table_timing_diagnostics
+                    ),
+                },
+                quiet_default=True,
+                geometry_max_iter=geom_cfg.get("vmec_max_iter"),
+                geometry_solver_device=str(geom_cfg.get("vmec_implicit_solver_device", "default")),
+            )
     else:
         runner = build_transport_realtime_geometry_least_squares_runner(
             config,
@@ -3683,6 +3714,7 @@ def _run_realtime_geometry_optimization_api_smoke(
         "reverse_segment_start_replay_mode": str(args.reverse_segment_start_replay_mode),
         "reverse_segment_primal_record_mode": str(args.reverse_segment_primal_record_mode),
         "reverse_table_timing_diagnostics": bool(args.reverse_table_timing_diagnostics),
+        "reverse_segment_profiler_trace_dir": args.reverse_segment_profiler_trace_dir,
         "shared_payload_smoke": bool(getattr(args, "full_transport_shared_payload_smoke", False)),
         "shared_payload_note": (
             "Full transport shared-path smoke uses the internal realtime-geometry "
@@ -5410,6 +5442,17 @@ def main() -> None:
             "Print host timing boundaries for reverse-table setup, transport-table "
             "execution, geometry-table execution, and final assembly. Diagnostic "
             "only; it does not change reverse math or retained payloads."
+        ),
+    )
+    parser.add_argument(
+        "--reverse-segment-profiler-trace-dir",
+        type=str,
+        default=None,
+        help=(
+            "Optional directory for an XProf trace of the normal reverse benchmark. "
+            "This enables XProf labels for the stage solve, fixed-lagged RHS "
+            "transposes, and rebuild transposes; it does not split the JIT or "
+            "change reverse mathematics."
         ),
     )
     parser.add_argument(
