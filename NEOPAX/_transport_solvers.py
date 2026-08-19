@@ -5165,16 +5165,6 @@ def _execute_radau_accepted_step_next_reduced_cotangent_bwd(
         if physics_context.pullback_build_lagged_response is None:
             raise ValueError("Lagged-response rebuild reverse branch requires pullback_build_lagged_response.")
         cotangent_mode = str(getattr(physics_context, "reverse_stage_cotangent_mode", "full")).strip().lower()
-        rebuild_support_pullback_mode = str(
-            getattr(
-                physics_context,
-                "reverse_rebuild_support_pullback_mode",
-                "separate",
-            )
-        ).strip().lower()
-        joint_ntx_rebuild_pullback = (
-            rebuild_support_pullback_mode == "ntx_joint_implicit_interpolated_faces"
-        )
         zero_rebuild_pullback = cotangent_mode in {
             "zero_rebuild_pullback",
             "zero_lagged_rebuild",
@@ -5579,16 +5569,6 @@ def _execute_radau_accepted_step_next_reduced_cotangent_batched_bwd(
         if physics_context.pullback_build_lagged_response is None:
             raise ValueError("Lagged-response rebuild reverse branch requires pullback_build_lagged_response.")
         cotangent_mode = str(getattr(physics_context, "reverse_stage_cotangent_mode", "full")).strip().lower()
-        rebuild_support_pullback_mode = str(
-            getattr(
-                physics_context,
-                "reverse_rebuild_support_pullback_mode",
-                "separate",
-            )
-        ).strip().lower()
-        joint_ntx_rebuild_pullback = (
-            rebuild_support_pullback_mode == "ntx_joint_implicit_interpolated_faces"
-        )
         zero_rebuild_pullback = cotangent_mode in {
             "zero_rebuild_pullback",
             "zero_lagged_rebuild",
@@ -5596,29 +5576,6 @@ def _execute_radau_accepted_step_next_reduced_cotangent_batched_bwd(
         }
         if zero_rebuild_pullback:
             rebuild_flat_bars = jnp.zeros_like(y_bars)
-        elif joint_ntx_rebuild_pullback:
-            joint_pullback = (
-                physics_context.flat_rhs_build_state_and_support_pullback_batched_interpolated_faces
-            )
-            if joint_pullback is None:
-                raise RuntimeError(
-                    "ntx_joint_implicit_interpolated_faces rebuild pullback was requested, "
-                    "but the active transport physics context does not expose that hook."
-                )
-            with _radau_reverse_profile_scope(
-                physics_context, "reverse_segment/rebuild_lagged_state_support_transpose"
-            ):
-                rebuild_flat_bars, rebuild_support_bars = joint_pullback(
-                    carry_in.y,
-                    lagged_cache_bars,
-                    support,
-                )
-            if physics_context.project_flat is not None:
-                _, project_pullback = jax.vjp(physics_context.project_flat, carry_in.y)
-                rebuild_flat_bars = jax.vmap(lambda bar: project_pullback(bar)[0])(
-                    rebuild_flat_bars
-                )
-            rebuild_support_bar_leaves = tuple(jax.tree_util.tree_leaves(rebuild_support_bars))
         else:
             projected_y = _project_flat_state_if_needed(carry_in.y, physics_context.project_flat)
             rebuild_state = physics_context.unpack_flat(projected_y)
@@ -5858,6 +5815,16 @@ def _execute_radau_accepted_step_next_reduced_cotangent_batched_bwd_with_support
         if physics_context.pullback_build_lagged_response is None:
             raise ValueError("Lagged-response rebuild reverse branch requires pullback_build_lagged_response.")
         cotangent_mode = str(getattr(physics_context, "reverse_stage_cotangent_mode", "full")).strip().lower()
+        rebuild_support_pullback_mode = str(
+            getattr(
+                physics_context,
+                "reverse_rebuild_support_pullback_mode",
+                "separate",
+            )
+        ).strip().lower()
+        joint_ntx_rebuild_pullback = (
+            rebuild_support_pullback_mode == "ntx_joint_implicit_interpolated_faces"
+        )
         zero_rebuild_pullback = cotangent_mode in {
             "zero_rebuild_pullback",
             "zero_lagged_rebuild",
@@ -5865,6 +5832,29 @@ def _execute_radau_accepted_step_next_reduced_cotangent_batched_bwd_with_support
         }
         if zero_rebuild_pullback:
             rebuild_flat_bars = jnp.zeros_like(y_bars)
+        elif joint_ntx_rebuild_pullback:
+            joint_pullback = (
+                physics_context.flat_rhs_build_state_and_support_pullback_batched_interpolated_faces
+            )
+            if joint_pullback is None:
+                raise RuntimeError(
+                    "ntx_joint_implicit_interpolated_faces rebuild pullback was requested, "
+                    "but the active transport physics context does not expose that hook."
+                )
+            with _radau_reverse_profile_scope(
+                physics_context, "reverse_segment/rebuild_lagged_state_support_transpose"
+            ):
+                rebuild_flat_bars, rebuild_support_bars = joint_pullback(
+                    carry_in.y,
+                    lagged_cache_bars,
+                    support,
+                )
+            if physics_context.project_flat is not None:
+                _, project_pullback = jax.vjp(physics_context.project_flat, carry_in.y)
+                rebuild_flat_bars = jax.vmap(lambda bar: project_pullback(bar)[0])(
+                    rebuild_flat_bars
+                )
+            rebuild_support_bar_leaves = tuple(jax.tree_util.tree_leaves(rebuild_support_bars))
         else:
             projected_y = _project_flat_state_if_needed(carry_in.y, physics_context.project_flat)
             rebuild_state = physics_context.unpack_flat(projected_y)
