@@ -6332,8 +6332,13 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             second_base_geometry_bar,
             second_geometry_bar,
         )
-        direct_drds_bar = (
-            base_drds_bar + first_drds_bar + second_base_drds_bar + second_drds_bar
+        # ``lax.map`` above leaves an energy axis on every direct ``drds``
+        # contribution.  ``drds_value`` is one scalar at this anchor, so its
+        # cotangent must sum that axis before the species/objective maps and
+        # the anchor scatter accumulation.
+        direct_drds_bar = jnp.sum(
+            base_drds_bar + first_drds_bar + second_base_drds_bar + second_drds_bar,
+            axis=0,
         )
         return (
             nu_hat_bar,
