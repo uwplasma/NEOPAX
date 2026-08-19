@@ -5407,14 +5407,21 @@ def main() -> None:
     )
     parser.add_argument(
         "--reverse-rebuild-support-pullback-mode",
-        choices=("separate", "ntx_batched_interpolated_faces"),
+        choices=(
+            "separate",
+            "ntx_batched_interpolated_faces",
+            "ntx_joint_implicit_interpolated_faces",
+        ),
         default="separate",
         help=(
             "Lagged-response rebuild support transpose inside each reverse step. "
             "'separate' preserves the reference vmapped scalar path. "
             "'ntx_batched_interpolated_faces' is an exact opt-in multi-objective "
             "NTX face-interpolation transpose for the rebuild branch; it has no "
-            "fallback for unsupported response representations."
+            "fallback for unsupported response representations. "
+            "'ntx_joint_implicit_interpolated_faces' is the exact experimental "
+            "mode that obtains rebuild state and NTX-support bars jointly from "
+            "the same local NTX implicit adjoint."
         ),
     )
     parser.add_argument(

@@ -9197,6 +9197,46 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                     field_bars=one_field_bars,
                 )
             )(local_field_bars)
+            # Match the established scalar state transpose: the axis anchor
+            # has a regularized response representation and contributes only
+            # through its explicit reference-Er channel, not through a local
+            # moment/support pullback.
+            is_axis_anchor = jnp.logical_and(
+                jnp.asarray(n_anchor >= 4),
+                jnp.logical_and(
+                    jnp.asarray(anchor_pos == 0, dtype=jnp.bool_),
+                    jnp.isclose(
+                        jax.lax.dynamic_index_in_dim(anchor_rho, 0, axis=0, keepdims=False),
+                        0.0,
+                    ),
+                ),
+            )
+
+            def _axis_zero(_):
+                return (
+                    jax.tree_util.tree_map(jnp.zeros_like, prepared_local_bar),
+                    jnp.zeros_like(drds_local_bar),
+                    jnp.zeros_like(er_local_bar),
+                    jnp.zeros_like(temperature_local_bar),
+                    jnp.zeros_like(density_local_bar),
+                )
+
+            def _non_axis(_):
+                return (
+                    prepared_local_bar,
+                    drds_local_bar,
+                    er_local_bar,
+                    temperature_local_bar,
+                    density_local_bar,
+                )
+
+            (
+                prepared_local_bar,
+                drds_local_bar,
+                er_local_bar,
+                temperature_local_bar,
+                density_local_bar,
+            ) = jax.lax.cond(is_axis_anchor, _axis_zero, _non_axis, operand=None)
             return (
                 radius_index,
                 prepared_local_bar,
