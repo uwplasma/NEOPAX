@@ -1071,7 +1071,6 @@ class CombinedTransportFluxModel(TransportFluxModelBase):
             state,
             lagged_response_bars.neoclassical_response,
             support,
-            **kwargs,
         )
 
         def _batched_state_pullback(model, response_bars):
