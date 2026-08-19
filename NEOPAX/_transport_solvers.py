@@ -1063,6 +1063,20 @@ def _lagged_response_build_support_pullback_batched_interpolated_faces_hook(vect
     return pullback_fn if callable(pullback_fn) else None
 
 
+def _lagged_response_build_state_and_support_pullback_batched_interpolated_faces_hook(
+    vector_field: Callable,
+):
+    owner = getattr(vector_field, "__self__", None)
+    if owner is None:
+        return None
+    pullback_fn = getattr(
+        owner,
+        "pullback_build_lagged_response_state_and_support_payload_batched_interpolated_faces",
+        None,
+    )
+    return pullback_fn if callable(pullback_fn) else None
+
+
 def _lagged_response_eval_support_pullback_hook(vector_field: Callable):
     owner = getattr(vector_field, "__self__", None)
     if owner is None:
@@ -1438,6 +1452,35 @@ def _flat_rhs_build_support_pullback_batched_interpolated_faces_factory(
         projected_flat_y = _project_flat_state_if_needed(flat_y, project_flat)
         state_y = unravel(projected_flat_y)
         return pullback_fn(state_y, lagged_response_bars, support, **kwargs)
+
+    return _pullback
+
+
+def _flat_rhs_build_state_and_support_pullback_batched_interpolated_faces_factory(
+    unravel,
+    pack_flat,
+    vector_field,
+    args,
+    kwargs,
+    project_flat=None,
+):
+    """Flatten the exact joint NTX rebuild state/support pullback hook."""
+    pullback_fn = _lagged_response_build_state_and_support_pullback_batched_interpolated_faces_hook(
+        vector_field
+    )
+    if pullback_fn is None:
+        return None
+
+    def _pullback(flat_y, lagged_response_bars, support):
+        projected_flat_y = _project_flat_state_if_needed(flat_y, project_flat)
+        state_y = unravel(projected_flat_y)
+        state_bars, support_bars = pullback_fn(
+            state_y,
+            lagged_response_bars,
+            support,
+            **kwargs,
+        )
+        return jax.vmap(pack_flat)(state_bars), support_bars
 
     return _pullback
 
@@ -3610,6 +3653,7 @@ class _RadauAcceptedStepPhysicsContext:
     flat_rhs_lagged_response_pullback: Callable[[Any, Any, Any, Any], Any] | None = None
     flat_rhs_build_support_pullback: Callable[[Any, Any, Any], Any] | None = None
     flat_rhs_build_support_pullback_batched_interpolated_faces: Callable[[Any, Any, Any], Any] | None = None
+    flat_rhs_build_state_and_support_pullback_batched_interpolated_faces: Callable[[Any, Any, Any], Any] | None = None
     flat_rhs_lagged_response_support_pullback: Callable[[Any, Any, Any, Any, Any], Any] | None = None
     flat_rhs_lagged_response_all_pullback: Callable[[Any, Any, Any, Any, Any], tuple[Any, Any, Any]] | None = None
     flat_rhs_state_pullback: Callable[[Any, Any, Any, Any], Any] | None = None
@@ -5121,6 +5165,16 @@ def _execute_radau_accepted_step_next_reduced_cotangent_bwd(
         if physics_context.pullback_build_lagged_response is None:
             raise ValueError("Lagged-response rebuild reverse branch requires pullback_build_lagged_response.")
         cotangent_mode = str(getattr(physics_context, "reverse_stage_cotangent_mode", "full")).strip().lower()
+        rebuild_support_pullback_mode = str(
+            getattr(
+                physics_context,
+                "reverse_rebuild_support_pullback_mode",
+                "separate",
+            )
+        ).strip().lower()
+        joint_ntx_rebuild_pullback = (
+            rebuild_support_pullback_mode == "ntx_joint_implicit_interpolated_faces"
+        )
         zero_rebuild_pullback = cotangent_mode in {
             "zero_rebuild_pullback",
             "zero_lagged_rebuild",
@@ -5532,6 +5586,29 @@ def _execute_radau_accepted_step_next_reduced_cotangent_batched_bwd(
         }
         if zero_rebuild_pullback:
             rebuild_flat_bars = jnp.zeros_like(y_bars)
+        elif joint_ntx_rebuild_pullback:
+            joint_pullback = (
+                physics_context.flat_rhs_build_state_and_support_pullback_batched_interpolated_faces
+            )
+            if joint_pullback is None:
+                raise RuntimeError(
+                    "ntx_joint_implicit_interpolated_faces rebuild pullback was requested, "
+                    "but the active transport physics context does not expose that hook."
+                )
+            with _radau_reverse_profile_scope(
+                physics_context, "reverse_segment/rebuild_lagged_state_support_transpose"
+            ):
+                rebuild_flat_bars, rebuild_support_bars = joint_pullback(
+                    carry_in.y,
+                    lagged_cache_bars,
+                    support,
+                )
+            if physics_context.project_flat is not None:
+                _, project_pullback = jax.vjp(physics_context.project_flat, carry_in.y)
+                rebuild_flat_bars = jax.vmap(lambda bar: project_pullback(bar)[0])(
+                    rebuild_flat_bars
+                )
+            rebuild_support_bar_leaves = tuple(jax.tree_util.tree_leaves(rebuild_support_bars))
         else:
             projected_y = _project_flat_state_if_needed(carry_in.y, physics_context.project_flat)
             rebuild_state = physics_context.unpack_flat(projected_y)
@@ -5801,14 +5878,11 @@ def _execute_radau_accepted_step_next_reduced_cotangent_batched_bwd_with_support
                 rebuild_flat_bars = jax.vmap(lambda bar: project_pullback(bar)[0])(rebuild_flat_bars)
         y_bars = y_bars + rebuild_flat_bars + lagged_reference_y_bars
 
-        if physics_context.flat_rhs_build_support_pullback is not None and not zero_rebuild_pullback:
-            rebuild_support_pullback_mode = str(
-                getattr(
-                    physics_context,
-                    "reverse_rebuild_support_pullback_mode",
-                    "separate",
-                )
-            ).strip().lower()
+        if (
+            physics_context.flat_rhs_build_support_pullback is not None
+            and not zero_rebuild_pullback
+            and not joint_ntx_rebuild_pullback
+        ):
             if rebuild_support_pullback_mode == "ntx_batched_interpolated_faces":
                 batched_pullback = (
                     physics_context.flat_rhs_build_support_pullback_batched_interpolated_faces
@@ -5861,6 +5935,14 @@ def _execute_radau_accepted_step_next_reduced_cotangent_batched_bwd_with_support
                     "Unknown reverse_rebuild_support_pullback_mode "
                     f"{rebuild_support_pullback_mode!r}."
                 )
+            support_bar_leaves = tuple(
+                stage_leaf + rebuild_leaf
+                for stage_leaf, rebuild_leaf in zip(
+                    support_bar_leaves,
+                    rebuild_support_bar_leaves,
+                )
+            )
+        elif joint_ntx_rebuild_pullback and not zero_rebuild_pullback:
             support_bar_leaves = tuple(
                 stage_leaf + rebuild_leaf
                 for stage_leaf, rebuild_leaf in zip(
@@ -16803,6 +16885,16 @@ def _build_prepared_radau_accepted_rollout(
             project_flat=project_flat,
         )
     )
+    flat_rhs_build_state_and_support_pullback_batched_interpolated_faces = (
+        _flat_rhs_build_state_and_support_pullback_batched_interpolated_faces_factory(
+            unravel=unpack_flat,
+            pack_flat=pack_state,
+            vector_field=vector_field,
+            args=args,
+            kwargs=kwargs,
+            project_flat=project_flat,
+        )
+    )
     flat_rhs_lagged_response_support_pullback = _flat_rhs_lagged_response_support_pullback_factory(
         unravel=unpack_flat,
         vector_field=vector_field,
@@ -17110,6 +17202,9 @@ def _build_prepared_radau_accepted_rollout(
         flat_rhs_build_support_pullback_batched_interpolated_faces=(
             flat_rhs_build_support_pullback_batched_interpolated_faces
         ),
+        flat_rhs_build_state_and_support_pullback_batched_interpolated_faces=(
+            flat_rhs_build_state_and_support_pullback_batched_interpolated_faces
+        ),
         flat_rhs_lagged_response_support_pullback=flat_rhs_lagged_response_support_pullback,
         flat_rhs_lagged_response_all_pullback=flat_rhs_lagged_response_all_pullback,
         flat_rhs_state_pullback=flat_rhs_state_pullback,
@@ -17299,6 +17394,16 @@ class RADAUSolver(_RadauSolverConfig):
         flat_rhs_build_support_pullback_batched_interpolated_faces = (
             _flat_rhs_build_support_pullback_batched_interpolated_faces_factory(
                 unravel=unpack_flat,
+                vector_field=vector_field,
+                args=args,
+                kwargs=kwargs,
+                project_flat=project_flat,
+            )
+        )
+        flat_rhs_build_state_and_support_pullback_batched_interpolated_faces = (
+            _flat_rhs_build_state_and_support_pullback_batched_interpolated_faces_factory(
+                unravel=unpack_flat,
+                pack_flat=pack_state,
                 vector_field=vector_field,
                 args=args,
                 kwargs=kwargs,
@@ -17605,6 +17710,9 @@ class RADAUSolver(_RadauSolverConfig):
             flat_rhs_build_support_pullback=flat_rhs_build_support_pullback,
             flat_rhs_build_support_pullback_batched_interpolated_faces=(
                 flat_rhs_build_support_pullback_batched_interpolated_faces
+            ),
+            flat_rhs_build_state_and_support_pullback_batched_interpolated_faces=(
+                flat_rhs_build_state_and_support_pullback_batched_interpolated_faces
             ),
             flat_rhs_lagged_response_support_pullback=flat_rhs_lagged_response_support_pullback,
             flat_rhs_lagged_response_all_pullback=flat_rhs_lagged_response_all_pullback,
