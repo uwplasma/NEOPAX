@@ -16,12 +16,32 @@ from NEOPAX._transport_flux_models import (
     PowerAnalyticalTurbulentTransportModel,
     SpectraXTurbulenceFDLaggedResponse,
     ReLUAnalyticalTurbulentTransportModel,
+    _sum_float_delta_bar_trees,
     build_fluxes_r_file_transport_model,
     read_flux_profile_file,
 )
 from NEOPAX._fem import cell_centered_from_faces, faces_from_cell_centered
 from NEOPAX._orchestrator import calculate_fluxes_from_config
 from NEOPAX._state import TransportState
+
+
+def test_sum_float_delta_bar_trees_converts_prepared_static_float0_leaves():
+    """Joint prepared-support paths must safely combine JAX float0 bars."""
+    primal = {
+        "coefficient": jnp.asarray([2.0, -1.0]),
+        "mode_index": jnp.asarray([1, 3], dtype=jnp.int32),
+    }
+    float0_index_bar = jnp.zeros((2,), dtype=jax.dtypes.float0)
+    total = _sum_float_delta_bar_trees(
+        primal,
+        {"coefficient": jnp.asarray([1.0, 2.0]), "mode_index": float0_index_bar},
+        {"coefficient": jnp.asarray([-0.5, 3.0]), "mode_index": float0_index_bar},
+        {"coefficient": jnp.asarray([0.25, -1.0]), "mode_index": float0_index_bar},
+        {"coefficient": jnp.asarray([0.0, 0.5]), "mode_index": float0_index_bar},
+    )
+    assert jnp.allclose(total["coefficient"], jnp.asarray([0.75, 4.5]))
+    assert total["mode_index"].dtype == jnp.float64
+    assert jnp.allclose(total["mode_index"], jnp.zeros((2,)))
 
 
 class DummySpecies:

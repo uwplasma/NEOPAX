@@ -2073,6 +2073,25 @@ def _sanitize_float_delta_bar_tree(primal_tree, bar_tree):
     return jax.tree_util.tree_map(_sanitize_leaf, primal_tree, bar_tree)
 
 
+def _sum_float_delta_bar_trees(primal_tree, *bar_trees):
+    """Add cotangent trees after converting ``float0`` leaves to zero.
+
+    Integer/static leaves of a prepared NTX system have no tangent space, so
+    JAX represents their VJP result as ``float0``.  They must be made regular
+    zero leaves before a joint pullback combines several derivative paths.
+    """
+    if not bar_trees:
+        return _sanitize_float_delta_bar_tree(primal_tree, None)
+    total = _sanitize_float_delta_bar_tree(primal_tree, bar_trees[0])
+    for bar_tree in bar_trees[1:]:
+        total = jax.tree_util.tree_map(
+            lambda left, right: left + right,
+            total,
+            _sanitize_float_delta_bar_tree(primal_tree, bar_tree),
+        )
+    return total
+
+
 def _face_flux_bar_with_interpolated_center_bars(face_output, flux_bar):
     def _is_scalar_bar(value) -> bool:
         arr = jnp.asarray(value)
@@ -6287,10 +6306,8 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             first_base_epsi_hat_bar * (-epsi_hat_tangent / vth_a),
             axis=0,
         )
-        prepared_bar = jax.tree_util.tree_map(
-            lambda base_value, first_value, second_base_value, second_value: (
-                base_value + first_value + second_base_value + second_value
-            ),
+        prepared_bar = _sum_float_delta_bar_trees(
+            prepared,
             base_geometry_bar,
             first_geometry_bar,
             second_base_geometry_bar,
