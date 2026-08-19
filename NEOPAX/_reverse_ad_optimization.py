@@ -2472,6 +2472,25 @@ def evaluate_geometry_transport_realtime_geometry_least_squares(
         )
 
     opts = {} if options is None else dict(options)
+    timing_diagnostics = bool(opts.get("reverse_table_timing_diagnostics", False))
+    outer_start = time.perf_counter()
+    previous_phase_time = outer_start
+
+    def _report_outer_phase(phase: str) -> None:
+        nonlocal previous_phase_time
+        if not timing_diagnostics:
+            return
+        now = time.perf_counter()
+        print(
+            "[autodiff-gate] timing: "
+            f"phase=optimization_table.{phase} "
+            f"elapsed_s={now - previous_phase_time:.3f} "
+            f"since_outer_start_s={now - outer_start:.3f} "
+            f"gap_since_previous_s={now - previous_phase_time:.3f}",
+            flush=True,
+        )
+        previous_phase_time = now
+
     parameter_values_arr = (
         jnp.zeros((len(request.parameter_set.specs),), dtype=jnp.float64)
         if parameter_values is None
@@ -2524,6 +2543,7 @@ def evaluate_geometry_transport_realtime_geometry_least_squares(
         except Exception:
             use_runtime_payload = False
         opts.setdefault("use_runtime_payload", use_runtime_payload)
+    _report_outer_phase("shared_raw_block_setup")
 
     backend_results: dict[ObjectiveFamily, ObjectiveTableResult] = {}
     t_start = time.perf_counter()
@@ -2542,6 +2562,7 @@ def evaluate_geometry_transport_realtime_geometry_least_squares(
             requested_transport_objectives,
             request.parameter_set,
         )
+        _report_outer_phase("transport_table")
 
     if "geometry" in grouped_terms:
         backend_results["geometry"] = geometry_full_ad_reverse_table(
@@ -2556,6 +2577,7 @@ def evaluate_geometry_transport_realtime_geometry_least_squares(
             solver_device=geometry_solver_device,
             raw_block_solve=shared_raw_block_solve,
         )
+        _report_outer_phase("geometry_table")
 
     result = assemble_least_squares_result(
         normalized_terms,
@@ -2564,6 +2586,7 @@ def evaluate_geometry_transport_realtime_geometry_least_squares(
     )
     residuals = jax.block_until_ready(result.residuals)
     jacobian = jax.block_until_ready(result.jacobian)
+    _report_outer_phase("assemble_and_synchronize")
     elapsed_s = time.perf_counter() - t_start
     return LeastSquaresEvaluation(
         result=result,

@@ -3630,7 +3630,12 @@ def _run_realtime_geometry_optimization_api_smoke(
             parameter_values=parameter_values,
             table_result_builder=table_result_builder,
             objective_labels=objective_labels,
-            options={"quiet": True},
+            options={
+                "quiet": True,
+                "reverse_table_timing_diagnostics": bool(
+                    args.reverse_table_timing_diagnostics
+                ),
+            },
             quiet_default=True,
             geometry_max_iter=geom_cfg.get("vmec_max_iter"),
             geometry_solver_device=str(geom_cfg.get("vmec_implicit_solver_device", "default")),
@@ -3677,6 +3682,7 @@ def _run_realtime_geometry_optimization_api_smoke(
         "reverse_rhs_pullback_mode": str(args.reverse_rhs_pullback_mode),
         "reverse_segment_start_replay_mode": str(args.reverse_segment_start_replay_mode),
         "reverse_segment_primal_record_mode": str(args.reverse_segment_primal_record_mode),
+        "reverse_table_timing_diagnostics": bool(args.reverse_table_timing_diagnostics),
         "shared_payload_smoke": bool(getattr(args, "full_transport_shared_payload_smoke", False)),
         "shared_payload_note": (
             "Full transport shared-path smoke uses the internal realtime-geometry "
@@ -5395,6 +5401,15 @@ def main() -> None:
             "After each already-synchronized reverse segment, print active slots, "
             "accepted dt range, lagged reuse/rebuild pattern, and incoming Jacobian "
             "cache metadata. Diagnostic only; it does not alter reverse computation."
+        ),
+    )
+    parser.add_argument(
+        "--reverse-table-timing-diagnostics",
+        action="store_true",
+        help=(
+            "Print host timing boundaries for reverse-table setup, transport-table "
+            "execution, geometry-table execution, and final assembly. Diagnostic "
+            "only; it does not change reverse math or retained payloads."
         ),
     )
     parser.add_argument(

@@ -3755,6 +3755,7 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
             for objective_i in range(objective_count)
         )
     if combined_geometry_payload:
+        phase_start = time.perf_counter()
         geometry = support_payload["geometry"]
         geometry_delta0 = _float_delta_tree_like(geometry)
 
@@ -3776,6 +3777,12 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
         initial_geometry_bars = jax.vmap(
             lambda state_bar: initial_geometry_pullback(state_bar)[0]
         )(initial_state_bars)
+        initial_geometry_bars = jax.block_until_ready(initial_geometry_bars)
+        print(
+            f"{progress_prefix} progress: support reverse initial-profile geometry pullback ready "
+            f"elapsed_s={time.perf_counter() - phase_start:.3f}",
+            flush=True,
+        )
         component_support_bars_by_name["initial_profile"] = tuple(
             {
                 "geometry": _sanitize_float_delta_bar_tree(
@@ -4582,6 +4589,25 @@ def internal_realtime_geometry_transport_reverse_table_result_builder(
     ) -> RealtimeGeometryTransportReverseTableResult:
         _validate_transport_reverse_parameter_set(parameter_set)
         opts = {} if options is None else dict(options)
+        timing_diagnostics = bool(opts.get("reverse_table_timing_diagnostics", False))
+        table_builder_start = time.perf_counter()
+        previous_phase_time = table_builder_start
+
+        def _report_table_builder_phase(phase: str) -> None:
+            nonlocal previous_phase_time
+            if not timing_diagnostics:
+                return
+            now = time.perf_counter()
+            prefix = progress_label or "[autodiff-gate]"
+            print(
+                f"{prefix} timing: phase=table_builder.{phase} "
+                f"elapsed_s={now - previous_phase_time:.3f} "
+                f"since_builder_start_s={now - table_builder_start:.3f} "
+                f"gap_since_previous_s={now - previous_phase_time:.3f}",
+                flush=True,
+            )
+            previous_phase_time = now
+
         active_accepted_step_limit = opts.get("accepted_step_limit", accepted_step_limit)
         active_reverse_segment_length = opts.get("reverse_segment_length", reverse_segment_length)
         active_max_reverse_accepted_steps = opts.get(
@@ -4597,6 +4623,7 @@ def internal_realtime_geometry_transport_reverse_table_result_builder(
         active_runtime = table_context.baseline_runtime
         active_support_payload = None
         use_runtime_payload = bool(opts.get("use_runtime_payload", active_raw_block_solve is None))
+        _report_table_builder_phase("prepare_builder_inputs")
         if active_raw_block_solve is not None and not use_runtime_payload:
             active_support_payload = build_neopax_geometry_and_ntx_exact_lij_support_from_state(
                 geometry_context,
@@ -4615,6 +4642,7 @@ def internal_realtime_geometry_transport_reverse_table_result_builder(
                 active_runtime,
                 active_support_payload["ntx_support"],
             )
+        _report_table_builder_phase("prepare_runtime_payload")
         active_reverse_setup = prepare_reverse_static_setup(
             active_profile_values,
             config=table_context.config,
@@ -4688,6 +4716,7 @@ def internal_realtime_geometry_transport_reverse_table_result_builder(
                 else int(active_max_reverse_accepted_steps)
             ),
         )
+        _report_table_builder_phase("prepare_reverse_static_setup")
         if (
             str(opts.get("reverse_schedule_artifact_mode", reverse_schedule_artifact_mode))
             .strip()
@@ -4715,6 +4744,7 @@ def internal_realtime_geometry_transport_reverse_table_result_builder(
             if combined_geometry_payload
             else ntx_support_payload
         )
+        _report_table_builder_phase("prepare_support_payload")
         support_result = realtime_geometry_support_cotangents_from_parameter_vector(
             profile_values=active_profile_values,
             config=table_context.config,
@@ -4725,6 +4755,8 @@ def internal_realtime_geometry_transport_reverse_table_result_builder(
             support_payload=support_payload,
             initial_er_root_ad=active_initial_er_root_ad,
         )
+        support_result = jax.block_until_ready(support_result)
+        _report_table_builder_phase("transport_support_cotangents")
         rows = _row_indices(objective_names)
         support_bars = tuple(support_result.support_bars[i] for i in rows)
         component_bars = {
@@ -4755,6 +4787,7 @@ def internal_realtime_geometry_transport_reverse_table_result_builder(
             active_baseline_geometry_deltas = jnp.zeros((len(vmec_specs),), dtype=jnp.float64)
         else:
             active_baseline_geometry_deltas = jnp.asarray(baseline_geometry_deltas, dtype=jnp.float64)
+        _report_table_builder_phase("prepare_transport_table_inputs")
         assembly = realtime_geometry_transport_reverse_table_from_payload_cotangents(
             objective_labels=objective_names,
             profile_parameter_labels=tuple(spec.label for spec in parameter_set.profile_specs),
@@ -4779,6 +4812,7 @@ def internal_realtime_geometry_transport_reverse_table_result_builder(
             return_branch_gradients=bool(opts.get("return_branch_gradients", False)),
             raw_block_solve=active_raw_block_solve,
         )
+        _report_table_builder_phase("transport_payload_to_geometry_table")
         return assembly.table_result
 
     return _builder
