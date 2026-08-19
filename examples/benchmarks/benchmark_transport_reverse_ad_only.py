@@ -3548,6 +3548,7 @@ def _run_realtime_geometry_optimization_api_smoke(
             f"segment_jit_diagnostics={args.reverse_segment_jit_diagnostics} "
             f"segment_input_diagnostics={args.reverse_segment_input_diagnostics} "
             f"segment_start_replay_mode={args.reverse_segment_start_replay_mode} "
+            f"segment_primal_record_mode={args.reverse_segment_primal_record_mode} "
             f"step_bwd_mode={args.reverse_step_bwd_mode}",
             flush=True,
         )
@@ -3605,6 +3606,7 @@ def _run_realtime_geometry_optimization_api_smoke(
             reverse_segment_jit_diagnostics=bool(args.reverse_segment_jit_diagnostics),
             reverse_segment_input_diagnostics=bool(args.reverse_segment_input_diagnostics),
             reverse_segment_start_replay_mode=str(args.reverse_segment_start_replay_mode),
+            reverse_segment_primal_record_mode=str(args.reverse_segment_primal_record_mode),
             reverse_step_bwd_mode=str(args.reverse_step_bwd_mode),
             reverse_schedule_artifact_mode=str(args.reverse_schedule_artifact_mode),
             max_reverse_accepted_steps=(
@@ -3673,6 +3675,8 @@ def _run_realtime_geometry_optimization_api_smoke(
         "realtime_geometry_gradient_path": str(args.realtime_geometry_gradient_path),
         "initial_er_root_ad": str(args.initial_er_root_ad),
         "reverse_rhs_pullback_mode": str(args.reverse_rhs_pullback_mode),
+        "reverse_segment_start_replay_mode": str(args.reverse_segment_start_replay_mode),
+        "reverse_segment_primal_record_mode": str(args.reverse_segment_primal_record_mode),
         "shared_payload_smoke": bool(getattr(args, "full_transport_shared_payload_smoke", False)),
         "shared_payload_note": (
             "Full transport shared-path smoke uses the internal realtime-geometry "
@@ -5401,6 +5405,19 @@ def main() -> None:
             "Segment-start carry reconstruction after the accepted schedule is fixed. "
             "legacy preserves the full accepted-step replay. minimal uses the exact "
             "reverse-minimal Radau reconstruction and skips unused adaptive diagnostics."
+        ),
+    )
+    parser.add_argument(
+        "--reverse-segment-primal-record-mode",
+        choices=("reconstruct", "reuse_segment_primal_record"),
+        default="reconstruct",
+        help=(
+            "Experimental exact bounded-memory segment mode. "
+            "reuse_segment_primal_record retains each minimal accepted-step primal "
+            "record only for the active reverse segment, so the step adjoint reuses "
+            "it instead of reconstructing the same accepted attempt. Requires "
+            "--reverse-segment-start-replay-mode minimal. Default reconstruct "
+            "preserves the current behavior."
         ),
     )
     parser.add_argument(

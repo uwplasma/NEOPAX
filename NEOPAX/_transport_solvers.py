@@ -3179,6 +3179,35 @@ class _RadauAcceptedStepReverseMinimalAttemptResult:
 
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True, eq=False)
+class _RadauAcceptedStepSegmentPrimalRecord:
+    """Segment-local primal data shared by fixed replay and exact reverse.
+
+    This deliberately excludes ``carry_after_attempt``.  The segment replay
+    needs only the fields below to construct its next carry, while the batched
+    direct adjoint needs the converged trial/stage data and post-attempt lagged
+    response fields.  Keeping this record rather than the complete carry
+    bounds temporary storage by the configured segment length.
+    """
+
+    trial_dt: Any
+    trial_y: Any
+    stage_history: Any
+    jacobian_out: Any
+    cache_valid_out: Any
+    cache_dt_out: Any
+    cache_age_out: Any
+    real_lu_out: Any
+    real_piv_out: Any
+    complex_lu_out: Any
+    complex_piv_out: Any
+    theta_final: Any
+    newton_iter_count: Any
+    lagged_response_cache: Any
+    lagged_reference_y: Any
+
+
+@jax.tree_util.register_dataclass
+@dataclasses.dataclass(frozen=True, eq=False)
 class _RadauAcceptedStepBackwardPayloadCandidate:
     t_start: Any
     y_start: Any
@@ -3610,6 +3639,7 @@ class _RadauAcceptedStepPhysicsContext:
     reverse_segment_jit_diagnostics: bool = False
     reverse_segment_input_diagnostics: bool = False
     reverse_segment_start_replay_mode: str = "legacy"
+    reverse_segment_primal_record_mode: str = "reconstruct"
     reverse_stage_cotangent_mode: str = "full"
     reverse_step_bwd_mode: str = "current"
     reverse_stage_adjoint_memory_mode: str = "default"
@@ -5509,12 +5539,13 @@ def _execute_radau_accepted_step_next_reduced_cotangent_batched_bwd(
     )
 
 
-def _execute_radau_accepted_step_next_reduced_cotangent_batched_bwd_with_support(
+def _execute_radau_accepted_step_next_reduced_cotangent_batched_bwd_with_support_from_primal_result(
     kernel_context: _RadauAcceptedStepKernelContext,
     physics_context: _RadauAcceptedStepPhysicsContext,
     context: _RadauAcceptedStepAttemptContext,
     lagged_response_branch: str,
     carry_in: _RadauAcceptedStepCarry,
+    primal_result: _RadauAcceptedStepReverseMinimalAttemptResult,
     next_reduced_bars: _RadauAcceptedStepReducedCotangent,
     support,
 ) -> tuple[_RadauAcceptedStepReducedCotangent, tuple[Any, ...]]:
@@ -5559,12 +5590,6 @@ def _execute_radau_accepted_step_next_reduced_cotangent_batched_bwd_with_support
 
     objective_count = jnp.asarray(next_reduced_bars.y).shape[0]
     zero_support_bar = _radau_zero_support_delta_tree_like(support)
-    primal_result = _execute_radau_accepted_step_attempt_reverse_minimal(
-        kernel_context,
-        physics_context,
-        carry_in,
-        context,
-    )
     carry_for_linear_map = dataclasses.replace(
         _radau_carry_with_forward_only_jvp_fields(carry_in),
         lagged_response_cache=primal_result.carry_after_attempt.lagged_response_cache,
@@ -5805,6 +5830,102 @@ def _execute_radau_accepted_step_next_reduced_cotangent_batched_bwd_with_support
     )
 
 
+def _radau_reverse_minimal_attempt_from_segment_primal_record(
+    carry_in: _RadauAcceptedStepCarry,
+    context: _RadauAcceptedStepAttemptContext,
+    record: _RadauAcceptedStepSegmentPrimalRecord,
+) -> _RadauAcceptedStepReverseMinimalAttemptResult:
+    """Adapt a segment record to the existing direct-adjoint primal contract."""
+    carry_after_attempt = dataclasses.replace(
+        carry_in,
+        lagged_response_cache=record.lagged_response_cache,
+        lagged_response_valid=jnp.asarray(context.use_transport_lagged_response),
+        lagged_reference_y=record.lagged_reference_y,
+    )
+    return _RadauAcceptedStepReverseMinimalAttemptResult(
+        carry_after_attempt=carry_after_attempt,
+        trial_dt=record.trial_dt,
+        trial_y=record.trial_y,
+        stage_history=record.stage_history,
+        jacobian_out=record.jacobian_out,
+        cache_valid_out=record.cache_valid_out,
+        cache_dt_out=record.cache_dt_out,
+        cache_age_out=record.cache_age_out,
+        real_lu_out=record.real_lu_out,
+        real_piv_out=record.real_piv_out,
+        complex_lu_out=record.complex_lu_out,
+        complex_piv_out=record.complex_piv_out,
+        theta_final=record.theta_final,
+        newton_iter_count=record.newton_iter_count,
+    )
+
+
+def _execute_radau_accepted_step_next_reduced_cotangent_batched_bwd_with_support(
+    kernel_context: _RadauAcceptedStepKernelContext,
+    physics_context: _RadauAcceptedStepPhysicsContext,
+    context: _RadauAcceptedStepAttemptContext,
+    lagged_response_branch: str,
+    carry_in: _RadauAcceptedStepCarry,
+    next_reduced_bars: _RadauAcceptedStepReducedCotangent,
+    support,
+) -> tuple[_RadauAcceptedStepReducedCotangent, tuple[Any, ...]]:
+    """Existing reconstructing batched support reverse path (default)."""
+    if support is None:
+        reduced_bars = _execute_radau_accepted_step_next_reduced_cotangent_batched_bwd(
+            kernel_context,
+            physics_context,
+            context,
+            lagged_response_branch,
+            carry_in,
+            next_reduced_bars,
+        )
+        return reduced_bars, tuple()
+    primal_result = _execute_radau_accepted_step_attempt_reverse_minimal(
+        kernel_context,
+        physics_context,
+        carry_in,
+        context,
+    )
+    return _execute_radau_accepted_step_next_reduced_cotangent_batched_bwd_with_support_from_primal_result(
+        kernel_context,
+        physics_context,
+        context,
+        lagged_response_branch,
+        carry_in,
+        primal_result,
+        next_reduced_bars,
+        support,
+    )
+
+
+def _execute_radau_accepted_step_next_reduced_cotangent_batched_bwd_with_support_from_segment_primal_record(
+    kernel_context: _RadauAcceptedStepKernelContext,
+    physics_context: _RadauAcceptedStepPhysicsContext,
+    context: _RadauAcceptedStepAttemptContext,
+    lagged_response_branch: str,
+    carry_in: _RadauAcceptedStepCarry,
+    primal_record: _RadauAcceptedStepSegmentPrimalRecord,
+    next_reduced_bars: _RadauAcceptedStepReducedCotangent,
+    support,
+) -> tuple[_RadauAcceptedStepReducedCotangent, tuple[Any, ...]]:
+    """Exact batched support reverse using the segment's already computed attempt."""
+    primal_result = _radau_reverse_minimal_attempt_from_segment_primal_record(
+        carry_in,
+        context,
+        primal_record,
+    )
+    return _execute_radau_accepted_step_next_reduced_cotangent_batched_bwd_with_support_from_primal_result(
+        kernel_context,
+        physics_context,
+        context,
+        lagged_response_branch,
+        carry_in,
+        primal_result,
+        next_reduced_bars,
+        support,
+    )
+
+
 @partial(jax.jit, static_argnums=(0, 1, 2, 3), inline=False)
 def _execute_radau_accepted_step_next_reduced_cotangent_batched_bwd_with_support_call(
     kernel_context: _RadauAcceptedStepKernelContext,
@@ -5828,6 +5949,30 @@ def _execute_radau_accepted_step_next_reduced_cotangent_batched_bwd_with_support
         context,
         lagged_response_branch,
         carry_in,
+        next_reduced_bars,
+        support,
+    )
+
+
+@partial(jax.jit, static_argnums=(0, 1, 2, 3), inline=False)
+def _execute_radau_accepted_step_next_reduced_cotangent_batched_bwd_with_support_from_segment_primal_record_call(
+    kernel_context: _RadauAcceptedStepKernelContext,
+    physics_context: _RadauAcceptedStepPhysicsContext,
+    context: _RadauAcceptedStepAttemptContext,
+    lagged_response_branch: str,
+    carry_in: _RadauAcceptedStepCarry,
+    primal_record: _RadauAcceptedStepSegmentPrimalRecord,
+    next_reduced_bars: _RadauAcceptedStepReducedCotangent,
+    support,
+) -> tuple[_RadauAcceptedStepReducedCotangent, tuple[Any, ...]]:
+    """Exact record-consuming step adjoint behind the existing call boundary."""
+    return _execute_radau_accepted_step_next_reduced_cotangent_batched_bwd_with_support_from_segment_primal_record(
+        kernel_context,
+        physics_context,
+        context,
+        lagged_response_branch,
+        carry_in,
+        primal_record,
         next_reduced_bars,
         support,
     )
@@ -6535,6 +6680,21 @@ def _radau_segment_reduced_cotangent_bwd_batched_with_support_call(
         else _radau_replay_realized_accepted_slot
     )
 
+    primal_record_mode = str(
+        getattr(execution_context.physics_context, "reverse_segment_primal_record_mode", "reconstruct")
+    ).strip().lower()
+    if primal_record_mode not in {"reconstruct", "reuse_segment_primal_record"}:
+        raise ValueError(
+            "Unknown reverse_segment_primal_record_mode "
+            f"{primal_record_mode!r}."
+        )
+    use_segment_primal_record = primal_record_mode == "reuse_segment_primal_record"
+    if use_segment_primal_record and start_replay_mode != "minimal":
+        raise ValueError(
+            "reverse_segment_primal_record_mode='reuse_segment_primal_record' "
+            "requires reverse_segment_start_replay_mode='minimal'."
+        )
+
     def _segment_collect_start_carries(carry, slot_xs):
         next_carry, _ = slot_replay(
             execution_context,
@@ -6543,11 +6703,28 @@ def _radau_segment_reduced_cotangent_bwd_batched_with_support_call(
         )
         return next_carry, carry
 
-    _, step_start_carries = jax.lax.scan(
-        _segment_collect_start_carries,
-        segment_start_carry,
-        segment_arrays,
-    )
+    if use_segment_primal_record:
+        def _segment_collect_start_carries_and_records(carry, slot_xs):
+            next_carry, primal_record = (
+                _radau_replay_realized_accepted_slot_reverse_minimal_with_primal_record(
+                    execution_context,
+                    carry,
+                    *slot_xs,
+                )
+            )
+            return next_carry, (carry, primal_record)
+
+        _, (step_start_carries, step_primal_records) = jax.lax.scan(
+            _segment_collect_start_carries_and_records,
+            segment_start_carry,
+            segment_arrays,
+        )
+    else:
+        _, step_start_carries = jax.lax.scan(
+            _segment_collect_start_carries,
+            segment_start_carry,
+            segment_arrays,
+        )
     mode = str(cotangent_mode).strip().lower()
     zero_step_bwd = mode in {"zero_step_bwd", "step_bwd_zero", "zero_accepted_step_bwd"}
     force_reuse_bwd = mode in {"force_reuse_bwd", "reuse_bwd_only", "reuse_only_bwd"}
@@ -6569,7 +6746,11 @@ def _radau_segment_reduced_cotangent_bwd_batched_with_support_call(
 
     def _slot_bwd(carry, slot_xs):
         slot_reduced_bars, support_bar_leaves = carry
-        step_start_carry, slot_arrays = slot_xs
+        if use_segment_primal_record:
+            step_start_carry, primal_record, slot_arrays = slot_xs
+        else:
+            step_start_carry, slot_arrays = slot_xs
+            primal_record = None
         if zero_step_bwd:
             return (_zero_reduced_cotangent_like(step_start_carry), support_bar_leaves), None
 
@@ -6587,13 +6768,35 @@ def _radau_segment_reduced_cotangent_bwd_batched_with_support_call(
             carry_for_step = dataclasses.replace(step_start_carry, dt=dt_value)
             residual_carry = _radau_carry_with_forward_only_jvp_fields(carry_for_step)
 
-            def _reuse_branch(_):
+            def _run_step_adjoint(lagged_response_branch):
+                if use_segment_primal_record:
+                    if use_step_call_boundary:
+                        return _execute_radau_accepted_step_next_reduced_cotangent_batched_bwd_with_support_from_segment_primal_record_call(
+                            execution_context.kernel_context,
+                            execution_context.physics_context,
+                            execution_context.attempt_context,
+                            lagged_response_branch,
+                            residual_carry,
+                            primal_record,
+                            slot_reduced_bars,
+                            support,
+                        )
+                    return _execute_radau_accepted_step_next_reduced_cotangent_batched_bwd_with_support_from_segment_primal_record(
+                        execution_context.kernel_context,
+                        execution_context.physics_context,
+                        execution_context.attempt_context,
+                        lagged_response_branch,
+                        residual_carry,
+                        primal_record,
+                        slot_reduced_bars,
+                        support,
+                    )
                 if use_step_call_boundary:
                     return _execute_radau_accepted_step_next_reduced_cotangent_batched_bwd_with_support_call(
                         execution_context.kernel_context,
                         execution_context.physics_context,
                         execution_context.attempt_context,
-                        "reuse",
+                        lagged_response_branch,
                         residual_carry,
                         slot_reduced_bars,
                         support,
@@ -6602,32 +6805,17 @@ def _radau_segment_reduced_cotangent_bwd_batched_with_support_call(
                     execution_context.kernel_context,
                     execution_context.physics_context,
                     execution_context.attempt_context,
-                    "reuse",
+                    lagged_response_branch,
                     residual_carry,
                     slot_reduced_bars,
                     support,
                 )
 
+            def _reuse_branch(_):
+                return _run_step_adjoint("reuse")
+
             def _rebuild_branch(_):
-                if use_step_call_boundary:
-                    return _execute_radau_accepted_step_next_reduced_cotangent_batched_bwd_with_support_call(
-                        execution_context.kernel_context,
-                        execution_context.physics_context,
-                        execution_context.attempt_context,
-                        "rebuild",
-                        residual_carry,
-                        slot_reduced_bars,
-                        support,
-                    )
-                return _execute_radau_accepted_step_next_reduced_cotangent_batched_bwd_with_support(
-                    execution_context.kernel_context,
-                    execution_context.physics_context,
-                    execution_context.attempt_context,
-                    "rebuild",
-                    residual_carry,
-                    slot_reduced_bars,
-                    support,
-                )
+                return _run_step_adjoint("rebuild")
 
             if force_reuse_bwd:
                 return _reuse_branch(None)
@@ -6655,10 +6843,15 @@ def _radau_segment_reduced_cotangent_bwd_batched_with_support_call(
         )
         return (step_start_reduced_bars, support_bar_leaves), None
 
+    slot_bwd_inputs = (
+        (step_start_carries, step_primal_records, segment_arrays)
+        if use_segment_primal_record
+        else (step_start_carries, segment_arrays)
+    )
     (segment_start_reduced_bars, segment_support_bar_leaves), _ = jax.lax.scan(
         _slot_bwd,
         (segment_reduced_bars, zero_support_bar_leaves),
-        (step_start_carries, segment_arrays),
+        slot_bwd_inputs,
         reverse=True,
     )
     return segment_start_reduced_bars, segment_support_bar_leaves
@@ -6796,6 +6989,92 @@ def _execute_radau_accepted_step_attempt_reverse_minimal(
         complex_piv_out=complex_piv_out,
         theta_final=theta_final,
         newton_iter_count=newton_iter_count,
+    )
+
+
+def _radau_segment_primal_record_from_reverse_minimal_attempt(
+    minimal_result: _RadauAcceptedStepReverseMinimalAttemptResult,
+) -> _RadauAcceptedStepSegmentPrimalRecord:
+    """Strip a reverse-minimal attempt to the segment fusion record."""
+    return _RadauAcceptedStepSegmentPrimalRecord(
+        trial_dt=minimal_result.trial_dt,
+        trial_y=minimal_result.trial_y,
+        stage_history=minimal_result.stage_history,
+        jacobian_out=minimal_result.jacobian_out,
+        cache_valid_out=minimal_result.cache_valid_out,
+        cache_dt_out=minimal_result.cache_dt_out,
+        cache_age_out=minimal_result.cache_age_out,
+        real_lu_out=minimal_result.real_lu_out,
+        real_piv_out=minimal_result.real_piv_out,
+        complex_lu_out=minimal_result.complex_lu_out,
+        complex_piv_out=minimal_result.complex_piv_out,
+        theta_final=minimal_result.theta_final,
+        newton_iter_count=minimal_result.newton_iter_count,
+        lagged_response_cache=minimal_result.carry_after_attempt.lagged_response_cache,
+        lagged_reference_y=minimal_result.carry_after_attempt.lagged_reference_y,
+    )
+
+
+def _radau_segment_primal_record_padding(
+    carry: _RadauAcceptedStepCarry,
+) -> _RadauAcceptedStepSegmentPrimalRecord:
+    """Shape-compatible inactive-slot record for a padded segment scan."""
+    return _RadauAcceptedStepSegmentPrimalRecord(
+        trial_dt=jnp.zeros_like(carry.dt),
+        trial_y=carry.y,
+        stage_history=carry.prev_stages,
+        jacobian_out=carry.jacobian,
+        cache_valid_out=carry.cache_valid,
+        cache_dt_out=carry.cache_dt,
+        cache_age_out=carry.cache_age,
+        real_lu_out=carry.real_lu,
+        real_piv_out=carry.real_piv,
+        complex_lu_out=carry.complex_lu,
+        complex_piv_out=carry.complex_piv,
+        theta_final=carry.prev_theta_final,
+        newton_iter_count=carry.prev_newton_iter_count,
+        lagged_response_cache=carry.lagged_response_cache,
+        lagged_reference_y=carry.lagged_reference_y,
+    )
+
+
+def _radau_next_carry_from_reverse_minimal_record(
+    physics_context: _RadauAcceptedStepPhysicsContext,
+    carry_in: _RadauAcceptedStepCarry,
+    record: _RadauAcceptedStepSegmentPrimalRecord,
+    *,
+    next_dt_value,
+    recent_reject_count_value,
+    regrowth_cooldown_value,
+    easy_growth_streak_value,
+    lagged_response_valid_value,
+) -> _RadauAcceptedStepCarry:
+    """Advance a fixed accepted carry from a previously computed primal record."""
+    accepted_y = _project_flat_state_if_needed(record.trial_y, physics_context.project_flat)
+    return dataclasses.replace(
+        carry_in,
+        t=carry_in.t + record.trial_dt,
+        y=accepted_y,
+        dt=next_dt_value,
+        prev_error=carry_in.prev_error,
+        prev_stages=record.stage_history,
+        prev_dt=record.trial_dt,
+        recent_reject_count=recent_reject_count_value,
+        regrowth_cooldown=regrowth_cooldown_value,
+        easy_growth_streak=easy_growth_streak_value,
+        lagged_response_cache=record.lagged_response_cache,
+        lagged_response_valid=lagged_response_valid_value,
+        lagged_reference_y=record.lagged_reference_y,
+        jacobian=record.jacobian_out,
+        cache_valid=record.cache_valid_out,
+        cache_dt=record.cache_dt_out,
+        cache_age=record.cache_age_out,
+        real_lu=record.real_lu_out,
+        real_piv=record.real_piv_out,
+        complex_lu=record.complex_lu_out,
+        complex_piv=record.complex_piv_out,
+        prev_theta_final=record.theta_final,
+        prev_newton_iter_count=record.newton_iter_count,
     )
 
 
@@ -13527,6 +13806,52 @@ def _radau_replay_realized_accepted_slot_reverse_minimal(
             jnp.asarray(False),
             jnp.asarray(0.0, dtype=dtype),
         )
+
+    return jax.lax.cond(active, _do_step, _skip, operand=None)
+
+
+def _radau_replay_realized_accepted_slot_reverse_minimal_with_primal_record(
+    execution_context: _RadauSolveExecutionContext,
+    carry: _RadauAcceptedStepCarry,
+    active,
+    dt_value,
+    next_dt_value,
+    recent_reject_count_value,
+    regrowth_cooldown_value,
+    easy_growth_streak_value,
+    lagged_response_valid_value,
+):
+    """Minimal accepted-slot replay that also returns its exact primal record.
+
+    This helper is intentionally not connected to the default segment path.
+    The later opt-in fusion mode will retain its record for only one segment
+    and consume it immediately in the reverse scan.
+    """
+
+    def _do_step(_):
+        carry_for_step = dataclasses.replace(carry, dt=dt_value)
+        carry_for_minimal = _radau_carry_with_forward_only_jvp_fields(carry_for_step)
+        minimal_result = _execute_radau_accepted_step_attempt_reverse_minimal(
+            execution_context.kernel_context,
+            execution_context.physics_context,
+            carry_for_minimal,
+            execution_context.attempt_context,
+        )
+        record = _radau_segment_primal_record_from_reverse_minimal_attempt(minimal_result)
+        next_carry = _radau_next_carry_from_reverse_minimal_record(
+            execution_context.physics_context,
+            carry_for_minimal,
+            record,
+            next_dt_value=next_dt_value,
+            recent_reject_count_value=recent_reject_count_value,
+            regrowth_cooldown_value=regrowth_cooldown_value,
+            easy_growth_streak_value=easy_growth_streak_value,
+            lagged_response_valid_value=lagged_response_valid_value,
+        )
+        return next_carry, record
+
+    def _skip(_):
+        return carry, _radau_segment_primal_record_padding(carry)
 
     return jax.lax.cond(active, _do_step, _skip, operand=None)
 

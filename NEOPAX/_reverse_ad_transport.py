@@ -2541,6 +2541,7 @@ def prepare_reverse_static_setup(
     reverse_segment_jit_diagnostics: bool = False,
     reverse_segment_input_diagnostics: bool = False,
     reverse_segment_start_replay_mode: str = "legacy",
+    reverse_segment_primal_record_mode: str = "reconstruct",
     reverse_stage_cotangent_mode: str = "full",
     reverse_step_bwd_mode: str = "current",
     reverse_stage_adjoint_memory_mode: str = "default",
@@ -2573,6 +2574,25 @@ def prepare_reverse_static_setup(
     if reverse_segment_start_replay_mode == "minimal" and not reverse_direct_stage_adjoint:
         raise ValueError(
             "reverse_segment_start_replay_mode='minimal' requires reverse_direct_stage_adjoint=True."
+        )
+    reverse_segment_primal_record_mode = str(
+        reverse_segment_primal_record_mode
+    ).strip().lower()
+    if reverse_segment_primal_record_mode not in {
+        "reconstruct",
+        "reuse_segment_primal_record",
+    }:
+        raise ValueError(
+            "reverse_segment_primal_record_mode must be one of "
+            "{'reconstruct', 'reuse_segment_primal_record'}."
+        )
+    if (
+        reverse_segment_primal_record_mode == "reuse_segment_primal_record"
+        and reverse_segment_start_replay_mode != "minimal"
+    ):
+        raise ValueError(
+            "reverse_segment_primal_record_mode='reuse_segment_primal_record' "
+            "requires reverse_segment_start_replay_mode='minimal'."
         )
     reverse_rebuild_support_pullback_mode = str(
         reverse_rebuild_support_pullback_mode
@@ -2622,6 +2642,7 @@ def prepare_reverse_static_setup(
                 reverse_segment_jit_diagnostics=bool(reverse_segment_jit_diagnostics),
                 reverse_segment_input_diagnostics=bool(reverse_segment_input_diagnostics),
                 reverse_segment_start_replay_mode=str(reverse_segment_start_replay_mode),
+                reverse_segment_primal_record_mode=str(reverse_segment_primal_record_mode),
                 reverse_stage_cotangent_mode=str(reverse_stage_cotangent_mode),
                 reverse_step_bwd_mode=str(reverse_step_bwd_mode),
                 reverse_stage_adjoint_memory_mode=str(reverse_stage_adjoint_memory_mode),
@@ -2882,6 +2903,11 @@ def prepare_realtime_geometry_support_segment_core_setup(
             args,
             "reverse_segment_start_replay_mode",
             "legacy",
+        ),
+        reverse_segment_primal_record_mode=getattr(
+            args,
+            "reverse_segment_primal_record_mode",
+            "reconstruct",
         ),
         reverse_stage_cotangent_mode=support_probe_cotangent_mode,
         reverse_step_bwd_mode=args.reverse_step_bwd_mode,
@@ -4519,6 +4545,7 @@ def internal_realtime_geometry_transport_reverse_table_result_builder(
     reverse_segment_jit_diagnostics: bool = False,
     reverse_segment_input_diagnostics: bool = False,
     reverse_segment_start_replay_mode: str = "legacy",
+    reverse_segment_primal_record_mode: str = "reconstruct",
     reverse_stage_cotangent_mode: str = "full",
     reverse_step_bwd_mode: str = "reduced_cotangent",
     reverse_stage_adjoint_memory_mode: str = "default",
@@ -4631,6 +4658,12 @@ def internal_realtime_geometry_transport_reverse_table_result_builder(
             ),
             reverse_segment_start_replay_mode=str(
                 opts.get("reverse_segment_start_replay_mode", reverse_segment_start_replay_mode)
+            ),
+            reverse_segment_primal_record_mode=str(
+                opts.get(
+                    "reverse_segment_primal_record_mode",
+                    reverse_segment_primal_record_mode,
+                )
             ),
             reverse_stage_cotangent_mode=str(opts.get("reverse_stage_cotangent_mode", reverse_stage_cotangent_mode)),
             reverse_step_bwd_mode=str(opts.get("reverse_step_bwd_mode", reverse_step_bwd_mode)),
