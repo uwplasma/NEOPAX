@@ -8408,9 +8408,20 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         reverse_segment_profile_annotations = bool(
             kwargs.pop("reverse_segment_profile_annotations", False)
         )
+        reuse_local_vjp_primal_anchor_response = bool(
+            kwargs.pop("reuse_local_vjp_primal_anchor_response", False)
+        )
         del kwargs
         face_response_bar = None if lagged_response_bar is None else lagged_response_bar.face_response
         center_response_bar = None if lagged_response_bar is None else lagged_response_bar.center_response
+        if (
+            reuse_local_vjp_primal_anchor_response
+            and not isinstance(face_response_bar, NTXInterpolatedMomentResponse)
+        ):
+            raise NotImplementedError(
+                "reuse_local_vjp_primal_anchor_response requires an "
+                "NTXInterpolatedMomentResponse face cotangent."
+            )
         if face_response_bar is not None:
             face_channels_bar = _float_delta_tree_like(support.face_channels)
             face_prepared_bar = _float_delta_tree_like(support.face_prepared)
@@ -8428,7 +8439,13 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             collisionality_kind = _collisionality_kind(self.collisionality_model)
             species_indices = jnp.arange(int(self.species.number_species), dtype=jnp.int32)
 
-            def _local_face_support_pullback(radius_index, local_field_bars, *, interpolated: bool):
+            def _local_face_support_pullback(
+                radius_index,
+                local_field_bars,
+                *,
+                interpolated: bool,
+                return_primal_response: bool = False,
+            ):
                 prepared = jax.tree_util.tree_map(
                     lambda arr: jax.lax.dynamic_index_in_dim(arr, radius_index, axis=0, keepdims=False),
                     support.face_prepared,
@@ -8494,7 +8511,7 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                     reverse_segment_profile_annotations,
                     "reverse_segment/rebuild_support/local_ntx_vjp_primal",
                 ):
-                    _, pullback = jax.vjp(
+                    primal_response, pullback = jax.vjp(
                         _response_from_support_delta,
                         prepared_delta0,
                         drds_delta0,
@@ -8503,7 +8520,10 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                     reverse_segment_profile_annotations,
                     "reverse_segment/rebuild_support/local_ntx_vjp_transpose",
                 ):
-                    return pullback(local_field_bars)
+                    prepared_bar, drds_bar = pullback(local_field_bars)
+                if return_primal_response:
+                    return primal_response, prepared_bar, drds_bar
+                return prepared_bar, drds_bar
 
             def _add_local_face_prepared_bar(prepared_bar, radius_index, local_bar):
                 return jax.tree_util.tree_map(
@@ -8520,6 +8540,147 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                 n_anchor = int(anchor_indices.shape[0])
                 response_field_bars = self._interpolated_response_field_bars(face_response_bar)
                 response_field_bar_tuple = _interpolated_response_field_bar_tuple(response_field_bars)
+
+                if reuse_local_vjp_primal_anchor_response:
+                    # The old path below computes every local anchor response
+                    # once for the coordinate transpose, then computes the
+                    # exact same primal values again as the forward half of
+                    # each local JAX VJP.  Keep the VJP primal output and use
+                    # it for the coordinate transpose instead.  The collected
+                    # array is temporary within this pullback and has the same
+                    # shape as the old `anchor_response`; no lagged cache or
+                    # checkpoint payload is enlarged.
+                    raw_anchor_response_bar = self._pullback_interpolated_anchor_response_fields(
+                        anchor_indices=anchor_indices,
+                        anchor_rho=anchor_rho,
+                        target_rho=target_rho,
+                        field_bars=response_field_bars,
+                    )
+                    raw_anchor_response_fields = _interpolated_response_field_bar_tuple(
+                        raw_anchor_response_bar
+                    )
+                    anchor_response_fields0 = tuple(
+                        jnp.zeros(
+                            (n_anchor,) + field_bar.shape[1:],
+                            dtype=field_bar.dtype,
+                        )
+                        for field_bar in response_field_bar_tuple
+                    )
+                    anchor_positions = jnp.arange(n_anchor, dtype=jnp.int32)
+
+                    def _accumulate_anchor_from_vjp(carry, anchor_pos):
+                        channels_carry, prepared_carry, anchor_fields_carry = carry
+                        radius_index = jax.lax.dynamic_index_in_dim(
+                            anchor_indices,
+                            anchor_pos,
+                            axis=0,
+                            keepdims=False,
+                        )
+                        local_field_bars = tuple(
+                            jax.lax.dynamic_index_in_dim(
+                                field_bar,
+                                anchor_pos,
+                                axis=0,
+                                keepdims=False,
+                            )
+                            for field_bar in raw_anchor_response_fields
+                        )
+                        local_response, prepared_local_bar, drds_local_bar = (
+                            _local_face_support_pullback(
+                                radius_index,
+                                local_field_bars,
+                                interpolated=True,
+                                return_primal_response=True,
+                            )
+                        )
+                        updated_anchor_fields = tuple(
+                            anchor_field.at[anchor_pos].set(local_field)
+                            for anchor_field, local_field in zip(
+                                anchor_fields_carry,
+                                local_response,
+                                strict=True,
+                            )
+                        )
+                        return (
+                            dataclasses.replace(
+                                channels_carry,
+                                drds=channels_carry.drds.at[radius_index].add(drds_local_bar),
+                            ),
+                            _add_local_face_prepared_bar(
+                                prepared_carry,
+                                radius_index,
+                                prepared_local_bar,
+                            ),
+                            updated_anchor_fields,
+                        ), None
+
+                    with _reverse_rebuild_profile_scope(
+                        reverse_segment_profile_annotations,
+                        "reverse_segment/rebuild_support/anchor_accumulation",
+                    ):
+                        (
+                            face_channels_bar,
+                            face_prepared_bar,
+                            raw_anchor_response_fields,
+                        ), _ = jax.lax.scan(
+                            _accumulate_anchor_from_vjp,
+                            (
+                                face_channels_bar,
+                                face_prepared_bar,
+                                anchor_response_fields0,
+                            ),
+                            anchor_positions,
+                        )
+                    # Match `_map_radius_axis_regularized_at_axis0`: axis
+                    # extrapolation is valid only when the first anchor is
+                    # actually at rho=0.  Face grids can begin away from the
+                    # axis, in which case the raw local responses are already
+                    # the reference values.
+                    if n_anchor < 4:
+                        anchor_response_fields = raw_anchor_response_fields
+                    else:
+                        anchor_response_fields = jax.lax.cond(
+                            jnp.isclose(anchor_rho[0], 0.0),
+                            lambda _: self._regularize_axis_radius0(
+                                raw_anchor_response_fields,
+                                anchor_rho,
+                            ),
+                            lambda _: raw_anchor_response_fields,
+                            operand=None,
+                        )
+                    target_rho_bar = jnp.zeros_like(target_rho)
+                    for anchor_field, field_bar in zip(
+                        anchor_response_fields,
+                        response_field_bar_tuple,
+                        strict=True,
+                    ):
+                        target_rho_bar = target_rho_bar + self._pullback_interpolate_anchor_target_rho(
+                            anchor_indices,
+                            anchor_field,
+                            target_rho,
+                            field_bar,
+                        )
+                    face_channels_bar = dataclasses.replace(
+                        face_channels_bar,
+                        rho=face_channels_bar.rho + target_rho_bar,
+                    )
+                    face_support_bar = _support_bar_from_face_bars(
+                        support,
+                        face_channels_bar,
+                        face_prepared_bar,
+                    )
+                    if center_response_bar is None:
+                        return face_support_bar
+                    center_support_bar = self.pullback_build_lagged_response_support_payload(
+                        state,
+                        NTXExactLijLaggedResponse(center_response=center_response_bar),
+                        support,
+                    )
+                    return jax.tree_util.tree_map(
+                        lambda lhs, rhs: lhs + rhs,
+                        face_support_bar,
+                        center_support_bar,
+                    )
 
                 def _per_anchor_forward(radius_index):
                     prepared = jax.tree_util.tree_map(

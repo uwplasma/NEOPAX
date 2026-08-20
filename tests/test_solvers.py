@@ -240,6 +240,52 @@ def test_radau_controller_holds_dt_after_a_very_difficult_accepted_step():
     assert float(info.growth) == pytest.approx(1.0)
 
 
+def test_flat_support_pullback_forwards_local_vjp_primal_reuse_flag():
+    """The isolated rebuild mode must reach the NTX support hook unchanged."""
+
+    observed = {}
+
+    class _Owner:
+        def vector_field(self, state):
+            return state
+
+        def pullback_build_lagged_response_support_payload(
+            self,
+            state,
+            lagged_response_bar,
+            support,
+            **kwargs,
+        ):
+            observed["state"] = state
+            observed["lagged_response_bar"] = lagged_response_bar
+            observed["support"] = support
+            observed["reuse"] = kwargs["reuse_local_vjp_primal_anchor_response"]
+            observed["profile_annotations"] = kwargs["reverse_segment_profile_annotations"]
+            return {"x": jnp.asarray(3.0)}
+
+    owner = _Owner()
+    pullback = transport_solvers._flat_rhs_build_support_pullback_factory(
+        lambda flat_state: flat_state,
+        owner.vector_field,
+        (),
+        {},
+    )
+    result = pullback(
+        jnp.asarray([2.0]),
+        jnp.asarray([5.0]),
+        {"x": jnp.asarray(7.0)},
+        reverse_segment_profile_annotations_override=True,
+        reuse_local_vjp_primal_anchor_response=True,
+    )
+
+    assert jnp.allclose(result["x"], jnp.asarray(3.0))
+    assert observed["reuse"] is True
+    assert observed["profile_annotations"] is True
+    assert jnp.allclose(observed["state"], jnp.asarray([2.0]))
+    assert jnp.allclose(observed["lagged_response_bar"], jnp.asarray([5.0]))
+    assert jnp.allclose(observed["support"]["x"], jnp.asarray(7.0))
+
+
 def test_radau_controller_keeps_the_moderate_cap_on_an_easy_accepted_step():
     _, info = _apply_radau_lean_timestep_controller(**_radau_controller_arguments(newton_iter_count=3))
     assert float(info.growth) == pytest.approx(1.5)

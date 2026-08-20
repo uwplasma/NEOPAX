@@ -2602,13 +2602,15 @@ def prepare_reverse_static_setup(
     ).strip().lower()
     if reverse_rebuild_support_pullback_mode not in {
         "separate",
+        "separate_reuse_local_vjp_primal",
         "ntx_batched_interpolated_faces",
         "ntx_joint_implicit_interpolated_faces",
         "ntx_joint_implicit_interpolated_faces_packed_support_adjoint",
     }:
         raise ValueError(
             "reverse_rebuild_support_pullback_mode must be one of "
-            "{'separate', 'ntx_batched_interpolated_faces', "
+            "{'separate', 'separate_reuse_local_vjp_primal', "
+            "'ntx_batched_interpolated_faces', "
             "'ntx_joint_implicit_interpolated_faces', "
             "'ntx_joint_implicit_interpolated_faces_packed_support_adjoint'}."
         )
@@ -3412,10 +3414,10 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
         rebuild_mode = str(
             getattr(physics_context, "reverse_rebuild_support_pullback_mode", "separate")
         ).strip().lower()
-        if rebuild_mode != "separate":
+        if rebuild_mode not in {"separate", "separate_reuse_local_vjp_primal"}:
             raise ValueError(
                 "reverse_rebuild_component_timing currently requires "
-                "reverse_rebuild_support_pullback_mode='separate'."
+                "a standard separate rebuild-support mode."
             )
         if physics_context.flat_rhs_build_support_pullback is None:
             raise RuntimeError(
@@ -3465,6 +3467,9 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
                     cache_bar,
                     support_payload,
                     reverse_segment_profile_annotations_override=False,
+                    reuse_local_vjp_primal_anchor_response=(
+                        rebuild_mode == "separate_reuse_local_vjp_primal"
+                    ),
                 )
                 return tuple(
                     jax.tree_util.tree_leaves(

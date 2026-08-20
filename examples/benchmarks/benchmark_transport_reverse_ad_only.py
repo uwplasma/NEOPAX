@@ -5410,6 +5410,7 @@ def main() -> None:
         "--reverse-rebuild-support-pullback-mode",
         choices=(
             "separate",
+            "separate_reuse_local_vjp_primal",
             "ntx_batched_interpolated_faces",
             "ntx_joint_implicit_interpolated_faces",
             "ntx_joint_implicit_interpolated_faces_packed_support_adjoint",
@@ -5418,6 +5419,9 @@ def main() -> None:
         help=(
             "Lagged-response rebuild support transpose inside each reverse step. "
             "'separate' preserves the reference vmapped scalar path. "
+            "'separate_reuse_local_vjp_primal' is an exact experimental variant "
+            "that uses the primal output of each existing local NTX VJP instead "
+            "of a separate anchor-response construction. "
             "'ntx_batched_interpolated_faces' is an exact opt-in multi-objective "
             "NTX face-interpolation transpose for the rebuild branch; it has no "
             "fallback for unsupported response representations. "

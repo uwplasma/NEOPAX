@@ -1434,6 +1434,7 @@ def _flat_rhs_build_support_pullback_factory(
         support,
         *,
         reverse_segment_profile_annotations_override: bool | None = None,
+        reuse_local_vjp_primal_anchor_response: bool = False,
     ):
         projected_flat_y = _project_flat_state_if_needed(
             flat_y,
@@ -1450,6 +1451,9 @@ def _flat_rhs_build_support_pullback_factory(
             lagged_response_bar,
             support,
             reverse_segment_profile_annotations=profile_annotations,
+            reuse_local_vjp_primal_anchor_response=bool(
+                reuse_local_vjp_primal_anchor_response
+            ),
             **kwargs,
         )
 
@@ -5937,7 +5941,10 @@ def _execute_radau_accepted_step_next_reduced_cotangent_batched_bwd_with_support
                             )
                         )
                     )
-            elif rebuild_support_pullback_mode == "separate":
+            elif rebuild_support_pullback_mode in {
+                "separate",
+                "separate_reuse_local_vjp_primal",
+            }:
 
                 def _rebuild_support_pullback(lagged_cache_bar):
                     with _radau_reverse_profile_scope(
@@ -5957,6 +5964,10 @@ def _execute_radau_accepted_step_next_reduced_cotangent_batched_bwd_with_support
                                                 "reverse_segment_profile_annotations",
                                                 False,
                                             )
+                                        ),
+                                        reuse_local_vjp_primal_anchor_response=(
+                                            rebuild_support_pullback_mode
+                                            == "separate_reuse_local_vjp_primal"
                                         ),
                                     ),
                                 )
