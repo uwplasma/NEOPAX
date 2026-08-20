@@ -77,6 +77,7 @@ from ._transport_solvers import (
     _make_radau_initial_step_state,
     _make_solver_state_transform,
     _radau_adaptive_schedule_rollout,
+    _radau_sanitize_support_delta_bar_tree,
     _theta_basic_accepted_step_attempt,
     _theta_basic_adaptive_schedule_rollout,
     _theta_basic_step_from_attempt_fn,
@@ -3453,13 +3454,29 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
         # JAX replace those leaves with sentinels during tracing.  The production
         # segment path captures this payload in its closure, so do the same here.
         def _support_transpose_batched(flat_y, cache_bars):
-            return jax.vmap(
-                lambda cache_bar: physics_context.flat_rhs_build_support_pullback(
+            # Match the production `separate` branch exactly: flatten the
+            # sanitized support cotangent *inside* vmap.  Returning the raw
+            # support tree would ask vmap to batch NTX static metadata such as
+            # Fourier-mode labels, which is not an operation the real segment
+            # ever performs.
+            def _one_support_transpose(cache_bar):
+                support_bar = physics_context.flat_rhs_build_support_pullback(
                     flat_y,
                     cache_bar,
                     support_payload,
                     reverse_segment_profile_annotations_override=False,
                 )
+                return tuple(
+                    jax.tree_util.tree_leaves(
+                        _radau_sanitize_support_delta_bar_tree(
+                            support_payload,
+                            support_bar,
+                        )
+                    )
+                )
+
+            return jax.vmap(
+                _one_support_transpose
             )(cache_bars)
 
         def _time_rebuild_component(name, compiled_fn, *component_args):
