@@ -8699,6 +8699,7 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                             "support_only_ntx_implicit_pullback currently requires "
                             "the interpolated NTX face response."
                         )
+                    prepared_treedef = jax.tree_util.tree_structure(prepared)
 
                     def _one_species_support_pullback(species_index, *species_field_bars):
                         reference_nu_hat, reference_epsi_hat, vth_a = (
@@ -8728,18 +8729,32 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                         # established scalar support path does at its outer
                         # support boundary. Otherwise JAX attempts to batch
                         # NTX's static Boozer metadata dataclass leaves.
+                        # Do not return the prepared dataclass itself through
+                        # this species ``vmap``: its VMEC/Boozer metadata
+                        # pytree reconstructors validate Python-level mode
+                        # arrays and cannot receive vmap batching sentinels.
+                        # The outer support tree needs exactly the same numeric
+                        # leaves, so carry those leaves through the map and
+                        # rebuild the dataclass only after summing species.
                         return (
-                            _sanitize_float_delta_bar_tree(prepared, prepared_bar),
+                            tuple(
+                                jax.tree_util.tree_leaves(
+                                    _sanitize_float_delta_bar_tree(prepared, prepared_bar)
+                                )
+                            ),
                             drds_bar,
                             primal_response,
                         )
 
-                    prepared_species_bars, drds_species_bars, primal_response = jax.vmap(
+                    prepared_species_bar_leaves, drds_species_bars, primal_response = jax.vmap(
                         _one_species_support_pullback
                     )(species_indices, *local_field_bars)
-                    prepared_bar = jax.tree_util.tree_map(
-                        lambda values: jnp.sum(values, axis=0),
-                        prepared_species_bars,
+                    prepared_bar = jax.tree_util.tree_unflatten(
+                        prepared_treedef,
+                        tuple(
+                            jnp.sum(values, axis=0)
+                            for values in prepared_species_bar_leaves
+                        ),
                     )
                     drds_bar = jnp.sum(drds_species_bars, axis=0)
                     if return_primal_response:
