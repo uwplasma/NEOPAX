@@ -8712,13 +8712,26 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                                 collisionality_kind=collisionality_kind,
                             )
                         )
-                        return self._pullback_interpolated_moment_prepared_support_and_drds_only(
+                        prepared_bar, drds_bar, primal_response = (
+                            self._pullback_interpolated_moment_prepared_support_and_drds_only(
                             prepared,
                             drds_value=drds_value,
                             reference_nu_hat=reference_nu_hat,
                             reference_epsi_hat=reference_epsi_hat,
                             vth_a=vth_a,
                             field_bars=species_field_bars,
+                            )
+                        )
+                        # This function is the direct output of a species
+                        # ``vmap``. Convert static/float0 prepared leaves to
+                        # ordinary numeric zero bars *before* batching, as the
+                        # established scalar support path does at its outer
+                        # support boundary. Otherwise JAX attempts to batch
+                        # NTX's static Boozer metadata dataclass leaves.
+                        return (
+                            _sanitize_float_delta_bar_tree(prepared, prepared_bar),
+                            drds_bar,
+                            primal_response,
                         )
 
                     prepared_species_bars, drds_species_bars, primal_response = jax.vmap(
