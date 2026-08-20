@@ -3448,12 +3448,16 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
                 )
             )(cache_bars)
 
-        def _support_transpose_batched(flat_y, cache_bars, payload):
+        # ``support_payload`` contains NTX geometry metadata with static leaves
+        # (for example Fourier-mode arrays).  Passing it as a JIT argument makes
+        # JAX replace those leaves with sentinels during tracing.  The production
+        # segment path captures this payload in its closure, so do the same here.
+        def _support_transpose_batched(flat_y, cache_bars):
             return jax.vmap(
                 lambda cache_bar: physics_context.flat_rhs_build_support_pullback(
                     flat_y,
                     cache_bar,
-                    payload,
+                    support_payload,
                     reverse_segment_profile_annotations_override=False,
                 )
             )(cache_bars)
@@ -3495,7 +3499,6 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
             jax.jit(_support_transpose_batched),
             diagnostic_carry.y,
             diagnostic_cache_bars,
-            support_payload,
         )
     print(
         f"{progress_prefix} progress: support reverse segmented cotangent sweep start "
