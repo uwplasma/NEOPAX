@@ -5273,6 +5273,17 @@ def main() -> None:
         reverse_ntx_prepared_solve_boundary="default",
     )
     parser.add_argument(
+        "--ntx-exact-derivative-pullback-algebra",
+        choices=("ntx_helper", "ntx_helper_lowdot_fused"),
+        default=DEFAULT_NTX_EXACT_DERIVATIVE_PULLBACK_ALGEBRA,
+        help=(
+            "Exact-runtime NTX local derivative pullback algebra. 'ntx_helper' "
+            "is the validated default. 'ntx_helper_lowdot_fused' is an isolated "
+            "experimental mode that fuses the base, d/dEr, and d/dlog(nu) local "
+            "contractions; it does not select the joint prepared-support path."
+        ),
+    )
+    parser.add_argument(
         "--ntx-radial-batch-size",
         type=int,
         default=None,

@@ -2811,8 +2811,11 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             "compact_vjp": "ntx_helper",
         }
         normalized = aliases.get(normalized, normalized)
-        if normalized != "ntx_helper":
-            raise ValueError("ntx_exact_derivative_pullback_algebra must be 'ntx_helper'.")
+        if normalized not in {"ntx_helper", "ntx_helper_lowdot_fused"}:
+            raise ValueError(
+                "ntx_exact_derivative_pullback_algebra must be 'ntx_helper' or "
+                "'ntx_helper_lowdot_fused'."
+            )
         return normalized
 
     def _map_radius_axis_hybrid(self, fn, radius_indices):
@@ -5213,7 +5216,7 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         normalized_pullback_algebra = self._normalize_derivative_pullback_algebra(
             self.derivative_pullback_algebra
         )
-        use_ntx_lowdot = normalized_pullback_algebra == "scalar_contract_lowdot_ntx"
+        use_ntx_lowdot = normalized_pullback_algebra == "ntx_helper_lowdot_fused"
         use_sequential_lowdot = (
             normalized_pullback_algebra == "scalar_contract_lowdot_sequential"
         )
@@ -6041,10 +6044,7 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             == "compact_vjp"
             and self._normalize_derivative_pullback_algebra(self.derivative_pullback_algebra)
             in {
-                "scalar_contract_lowdot",
-                "scalar_contract_lowdot_sequential",
-                "scalar_contract_lowdot_ntx",
-                "scalar_contract_lowdot_recompute",
+                "ntx_helper_lowdot_fused",
             }
         )
         if use_fused_lowdot_derivative_pullback:
