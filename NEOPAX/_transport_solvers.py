@@ -3704,6 +3704,7 @@ class _RadauAcceptedStepPhysicsContext:
     reverse_rebuild_support_pullback_mode: str = "separate"
     reverse_segment_jit_diagnostics: bool = False
     reverse_segment_input_diagnostics: bool = False
+    reverse_rebuild_component_timing: bool = False
     reverse_segment_profile_annotations: bool = False
     reverse_segment_start_replay_mode: str = "legacy"
     reverse_segment_primal_record_mode: str = "reconstruct"

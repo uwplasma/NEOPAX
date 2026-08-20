@@ -2540,6 +2540,7 @@ def prepare_reverse_static_setup(
     reverse_rebuild_support_pullback_mode: str = "separate",
     reverse_segment_jit_diagnostics: bool = False,
     reverse_segment_input_diagnostics: bool = False,
+    reverse_rebuild_component_timing: bool = False,
     reverse_segment_profile_annotations: bool = False,
     reverse_segment_start_replay_mode: str = "legacy",
     reverse_segment_primal_record_mode: str = "reconstruct",
@@ -2651,6 +2652,7 @@ def prepare_reverse_static_setup(
                 ),
                 reverse_segment_jit_diagnostics=bool(reverse_segment_jit_diagnostics),
                 reverse_segment_input_diagnostics=bool(reverse_segment_input_diagnostics),
+                reverse_rebuild_component_timing=bool(reverse_rebuild_component_timing),
                 reverse_segment_profile_annotations=bool(reverse_segment_profile_annotations),
                 reverse_segment_start_replay_mode=str(reverse_segment_start_replay_mode),
                 reverse_segment_primal_record_mode=str(reverse_segment_primal_record_mode),
@@ -3397,6 +3399,104 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
             False,
         )
     )
+    rebuild_component_timing = bool(
+        getattr(
+            reverse_setup.execution_context.physics_context,
+            "reverse_rebuild_component_timing",
+            False,
+        )
+    )
+    if rebuild_component_timing:
+        physics_context = reverse_setup.execution_context.physics_context
+        rebuild_mode = str(
+            getattr(physics_context, "reverse_rebuild_support_pullback_mode", "separate")
+        ).strip().lower()
+        if rebuild_mode != "separate":
+            raise ValueError(
+                "reverse_rebuild_component_timing currently requires "
+                "reverse_rebuild_support_pullback_mode='separate'."
+            )
+        if physics_context.flat_rhs_build_support_pullback is None:
+            raise RuntimeError(
+                "reverse_rebuild_component_timing requires the standard rebuild-support pullback hook."
+            )
+        diagnostic_segment_index = segment_count - 1
+        diagnostic_carry = _take_tree_axis0(segment_start_carries, diagnostic_segment_index)
+        diagnostic_cache_bars = _batched_zero_tangent_tree_like(
+            diagnostic_carry.lagged_response_cache,
+            objective_count,
+        )
+        diagnostic_cache_valid = bool(
+            np.asarray(jax.device_get(diagnostic_carry.lagged_response_valid))
+        )
+        if diagnostic_cache_valid:
+            raise RuntimeError(
+                "reverse_rebuild_component_timing selected a reuse carry; "
+                "the final segment must start on a rebuild carry."
+            )
+
+        def _state_transpose_batched(flat_y, cache_bars):
+            rebuild_state = physics_context.unpack_flat(
+                _project_flat_state_if_needed(flat_y, physics_context.project_flat)
+            )
+            return jax.vmap(
+                lambda cache_bar: physics_context.pullback_build_lagged_response(
+                    rebuild_state,
+                    cache_bar,
+                    reverse_stage_cotangent_mode=cotangent_mode,
+                    reverse_segment_profile_annotations=False,
+                )
+            )(cache_bars)
+
+        def _support_transpose_batched(flat_y, cache_bars, payload):
+            return jax.vmap(
+                lambda cache_bar: physics_context.flat_rhs_build_support_pullback(
+                    flat_y,
+                    cache_bar,
+                    payload,
+                    reverse_segment_profile_annotations_override=False,
+                )
+            )(cache_bars)
+
+        def _time_rebuild_component(name, compiled_fn, *component_args):
+            compile_start = time.perf_counter()
+            component_result = compiled_fn(*component_args)
+            component_result = jax.block_until_ready(component_result)
+            print(
+                f"{progress_prefix} diagnostic: reverse rebuild component "
+                f"segment={diagnostic_segment_index + 1}/{segment_count} "
+                f"name={name} compile_plus_execute_s={time.perf_counter() - compile_start:.3f}",
+                flush=True,
+            )
+            execution_start = time.perf_counter()
+            component_result = compiled_fn(*component_args)
+            jax.block_until_ready(component_result)
+            print(
+                f"{progress_prefix} diagnostic: reverse rebuild component "
+                f"segment={diagnostic_segment_index + 1}/{segment_count} "
+                f"name={name} warm_execute_s={time.perf_counter() - execution_start:.3f}",
+                flush=True,
+            )
+
+        print(
+            f"{progress_prefix} progress: timing one isolated standard rebuild "
+            f"segment={diagnostic_segment_index + 1}/{segment_count} objectives={objective_count} "
+            "(diagnostic extra work; values are not added to the reverse result)",
+            flush=True,
+        )
+        _time_rebuild_component(
+            "state_transpose",
+            jax.jit(_state_transpose_batched),
+            diagnostic_carry.y,
+            diagnostic_cache_bars,
+        )
+        _time_rebuild_component(
+            "support_transpose",
+            jax.jit(_support_transpose_batched),
+            diagnostic_carry.y,
+            diagnostic_cache_bars,
+            support_payload,
+        )
     print(
         f"{progress_prefix} progress: support reverse segmented cotangent sweep start "
         f"segments={segment_count} segment_length="
@@ -4600,6 +4700,7 @@ def internal_realtime_geometry_transport_reverse_table_result_builder(
     reverse_rebuild_support_pullback_mode: str = "separate",
     reverse_segment_jit_diagnostics: bool = False,
     reverse_segment_input_diagnostics: bool = False,
+    reverse_rebuild_component_timing: bool = False,
     reverse_segment_profile_annotations: bool = False,
     reverse_segment_start_replay_mode: str = "legacy",
     reverse_segment_primal_record_mode: str = "reconstruct",
@@ -4733,6 +4834,9 @@ def internal_realtime_geometry_transport_reverse_table_result_builder(
             ),
             reverse_segment_input_diagnostics=bool(
                 opts.get("reverse_segment_input_diagnostics", reverse_segment_input_diagnostics)
+            ),
+            reverse_rebuild_component_timing=bool(
+                opts.get("reverse_rebuild_component_timing", reverse_rebuild_component_timing)
             ),
             reverse_segment_profile_annotations=bool(
                 opts.get(

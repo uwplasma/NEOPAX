@@ -3630,6 +3630,7 @@ def _run_realtime_geometry_optimization_api_smoke(
             ),
             reverse_segment_jit_diagnostics=bool(args.reverse_segment_jit_diagnostics),
             reverse_segment_input_diagnostics=bool(args.reverse_segment_input_diagnostics),
+            reverse_rebuild_component_timing=bool(args.reverse_rebuild_component_timing),
             reverse_segment_profile_annotations=bool(
                 args.reverse_segment_profiler_trace_dir
             ),
@@ -5444,6 +5445,15 @@ def main() -> None:
             "After each already-synchronized reverse segment, print active slots, "
             "accepted dt range, lagged reuse/rebuild pattern, and incoming Jacobian "
             "cache metadata. Diagnostic only; it does not alter reverse computation."
+        ),
+    )
+    parser.add_argument(
+        "--reverse-rebuild-component-timing",
+        action="store_true",
+        help=(
+            "Diagnostic-only: separately JIT and time one representative rebuild "
+            "state transpose and support transpose with device synchronization. "
+            "This adds extra work and is not a normal reverse timing."
         ),
     )
     parser.add_argument(
