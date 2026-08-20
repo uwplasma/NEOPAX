@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 
-import os
 import functools
+import contextlib
+import os
 from typing import Any, Callable
 import abc
 import dataclasses
@@ -75,6 +76,16 @@ _INTERPOLATED_RESPONSE_FIELD_NAMES = (
     "dtransport_moments_d_log_nu_star",
 )
 from ._turbulence import get_Turbulent_Fluxes_Analytical, get_Turbulent_Fluxes_PowerOverN
+
+
+@contextlib.contextmanager
+def _reverse_rebuild_profile_scope(enabled: bool, name: str):
+    """Attach an XProf label without changing the compiled calculation."""
+    if enabled:
+        with jax.named_scope(name):
+            yield
+    else:
+        yield
 
 
 def _ntx_local_pullback_finite_debug_enabled() -> bool:
@@ -7632,6 +7643,9 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
 
     def pullback_build_lagged_response(self, state, lagged_response_bar, **kwargs):
         reverse_stage_cotangent_mode = str(kwargs.pop("reverse_stage_cotangent_mode", "full")).strip().lower()
+        reverse_segment_profile_annotations = bool(
+            kwargs.pop("reverse_segment_profile_annotations", False)
+        )
         del kwargs
         face_response_bar = None if lagged_response_bar is None else lagged_response_bar.face_response
         center_response_bar = None if lagged_response_bar is None else lagged_response_bar.center_response
@@ -7710,12 +7724,16 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             collisionality_kind = _collisionality_kind(self.collisionality_model)
             response_field_bars = self._interpolated_response_field_bars(face_response_bar)
             face_er_bar = jnp.asarray(face_response_bar.reference_er)
-            raw_anchor_response_bar = self._pullback_interpolated_anchor_response_fields(
-                anchor_indices=anchor_indices,
-                anchor_rho=anchor_rho,
-                target_rho=target_rho,
-                field_bars=response_field_bars,
-            )
+            with _reverse_rebuild_profile_scope(
+                reverse_segment_profile_annotations,
+                "reverse_segment/rebuild_state/interpolation_transpose",
+            ):
+                raw_anchor_response_bar = self._pullback_interpolated_anchor_response_fields(
+                    anchor_indices=anchor_indices,
+                    anchor_rho=anchor_rho,
+                    target_rho=target_rho,
+                    field_bars=response_field_bars,
+                )
             raw_anchor_response_fields = _interpolated_response_field_bar_tuple(raw_anchor_response_bar)
 
             face_density_bar = jnp.zeros_like(face_density0)
@@ -7840,20 +7858,24 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                                 jnp.zeros_like(density_local0),
                             )
                         else:
-                            (
-                                er_local_bar,
-                                temperature_local_bar,
-                                density_local_bar,
-                            ) = self._pullback_interpolated_moment_response_local_fields(
-                                prepared_local,
-                                drds_value=drds_value_local,
-                                er_value=er_local0,
-                                temperature_local=temperature_local0,
-                                density_local=density_local0,
-                                collisionality_kind=collisionality_kind,
-                                field_bars=local_field_bars,
-                                scan_species=scan_local_moment_pullback,
-                            )
+                            with _reverse_rebuild_profile_scope(
+                                reverse_segment_profile_annotations,
+                                "reverse_segment/rebuild_state/local_ntx_pullback",
+                            ):
+                                (
+                                    er_local_bar,
+                                    temperature_local_bar,
+                                    density_local_bar,
+                                ) = self._pullback_interpolated_moment_response_local_fields(
+                                    prepared_local,
+                                    drds_value=drds_value_local,
+                                    er_value=er_local0,
+                                    temperature_local=temperature_local0,
+                                    density_local=density_local0,
+                                    collisionality_kind=collisionality_kind,
+                                    field_bars=local_field_bars,
+                                    scan_species=scan_local_moment_pullback,
+                                )
                         return (
                             radius_index,
                             density_local_bar,
@@ -8383,6 +8405,9 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         support,
         **kwargs,
     ):
+        reverse_segment_profile_annotations = bool(
+            kwargs.pop("reverse_segment_profile_annotations", False)
+        )
         del kwargs
         face_response_bar = None if lagged_response_bar is None else lagged_response_bar.face_response
         center_response_bar = None if lagged_response_bar is None else lagged_response_bar.center_response
@@ -8465,12 +8490,20 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                         )
                     )(species_indices)
 
-                _, pullback = jax.vjp(
-                    _response_from_support_delta,
-                    prepared_delta0,
-                    drds_delta0,
-                )
-                return pullback(local_field_bars)
+                with _reverse_rebuild_profile_scope(
+                    reverse_segment_profile_annotations,
+                    "reverse_segment/rebuild_support/local_ntx_vjp_primal",
+                ):
+                    _, pullback = jax.vjp(
+                        _response_from_support_delta,
+                        prepared_delta0,
+                        drds_delta0,
+                    )
+                with _reverse_rebuild_profile_scope(
+                    reverse_segment_profile_annotations,
+                    "reverse_segment/rebuild_support/local_ntx_vjp_transpose",
+                ):
+                    return pullback(local_field_bars)
 
             def _add_local_face_prepared_bar(prepared_bar, radius_index, local_bar):
                 return jax.tree_util.tree_map(
@@ -8531,11 +8564,15 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                         )
                     )(species_indices)
 
-                anchor_response = self._map_radius_axis_regularized_at_axis0(
-                    _per_anchor_forward,
-                    anchor_indices,
-                    anchor_rho,
-                )
+                with _reverse_rebuild_profile_scope(
+                    reverse_segment_profile_annotations,
+                    "reverse_segment/rebuild_support/anchor_response_reconstruct",
+                ):
+                    anchor_response = self._map_radius_axis_regularized_at_axis0(
+                        _per_anchor_forward,
+                        anchor_indices,
+                        anchor_rho,
+                    )
                 anchor_response_fields = (
                     anchor_response[0],
                     anchor_response[1],
@@ -8543,25 +8580,37 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                     anchor_response[3],
                 )
 
-                target_rho_bar = jnp.zeros_like(target_rho)
-                for anchor_field, field_bar in zip(anchor_response_fields, response_field_bar_tuple, strict=True):
-                    target_rho_bar = target_rho_bar + self._pullback_interpolate_anchor_target_rho(
-                        anchor_indices,
-                        anchor_field,
-                        target_rho,
-                        field_bar,
-                    )
+                with _reverse_rebuild_profile_scope(
+                    reverse_segment_profile_annotations,
+                    "reverse_segment/rebuild_support/interpolation_transpose",
+                ):
+                    target_rho_bar = jnp.zeros_like(target_rho)
+                    for anchor_field, field_bar in zip(
+                        anchor_response_fields,
+                        response_field_bar_tuple,
+                        strict=True,
+                    ):
+                        target_rho_bar = target_rho_bar + self._pullback_interpolate_anchor_target_rho(
+                            anchor_indices,
+                            anchor_field,
+                            target_rho,
+                            field_bar,
+                        )
                 face_channels_bar = dataclasses.replace(
                     face_channels_bar,
                     rho=face_channels_bar.rho + target_rho_bar,
                 )
 
-                raw_anchor_response_bar = self._pullback_interpolated_anchor_response_fields(
-                    anchor_indices=anchor_indices,
-                    anchor_rho=anchor_rho,
-                    target_rho=target_rho,
-                    field_bars=response_field_bars,
-                )
+                with _reverse_rebuild_profile_scope(
+                    reverse_segment_profile_annotations,
+                    "reverse_segment/rebuild_support/interpolation_transpose",
+                ):
+                    raw_anchor_response_bar = self._pullback_interpolated_anchor_response_fields(
+                        anchor_indices=anchor_indices,
+                        anchor_rho=anchor_rho,
+                        target_rho=target_rho,
+                        field_bars=response_field_bars,
+                    )
                 raw_anchor_response_fields = _interpolated_response_field_bar_tuple(raw_anchor_response_bar)
                 anchor_positions = jnp.arange(n_anchor, dtype=jnp.int32)
 
@@ -8599,11 +8648,15 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                         _add_local_face_prepared_bar(prepared_carry, radius_index, prepared_local_bar),
                     ), None
 
-                (face_channels_bar, face_prepared_bar), _ = jax.lax.scan(
-                    _accumulate_anchor,
-                    (face_channels_bar, face_prepared_bar),
-                    anchor_positions,
-                )
+                with _reverse_rebuild_profile_scope(
+                    reverse_segment_profile_annotations,
+                    "reverse_segment/rebuild_support/anchor_accumulation",
+                ):
+                    (face_channels_bar, face_prepared_bar), _ = jax.lax.scan(
+                        _accumulate_anchor,
+                        (face_channels_bar, face_prepared_bar),
+                        anchor_positions,
+                    )
                 face_support_bar = _support_bar_from_face_bars(support, face_channels_bar, face_prepared_bar)
                 if center_response_bar is None:
                     return face_support_bar

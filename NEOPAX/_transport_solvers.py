@@ -1416,21 +1416,40 @@ def _flat_rhs_lagged_response_pullback_factory(unravel, vector_field, args, kwar
     return _pullback
 
 
-def _flat_rhs_build_support_pullback_factory(unravel, vector_field, args, kwargs, project_flat=None):
+def _flat_rhs_build_support_pullback_factory(
+    unravel,
+    vector_field,
+    args,
+    kwargs,
+    project_flat=None,
+    reverse_segment_profile_annotations: bool = False,
+):
     pullback_fn = _lagged_response_build_support_pullback_hook(vector_field)
     if pullback_fn is None:
         return None
 
-    def _pullback(flat_y, lagged_response_bar, support):
+    def _pullback(
+        flat_y,
+        lagged_response_bar,
+        support,
+        *,
+        reverse_segment_profile_annotations_override: bool | None = None,
+    ):
         projected_flat_y = _project_flat_state_if_needed(
             flat_y,
             project_flat,
         )
         state_y = unravel(projected_flat_y)
+        profile_annotations = (
+            bool(reverse_segment_profile_annotations)
+            if reverse_segment_profile_annotations_override is None
+            else bool(reverse_segment_profile_annotations_override)
+        )
         return pullback_fn(
             state_y,
             lagged_response_bar,
             support,
+            reverse_segment_profile_annotations=profile_annotations,
             **kwargs,
         )
 
@@ -5590,6 +5609,9 @@ def _execute_radau_accepted_step_next_reduced_cotangent_batched_bwd(
                         rebuild_state,
                         lagged_cache_bar,
                         reverse_stage_cotangent_mode=cotangent_mode,
+                        reverse_segment_profile_annotations=bool(
+                            getattr(physics_context, "reverse_segment_profile_annotations", False)
+                        ),
                     )
 
             rebuild_state_bars = jax.vmap(
@@ -5870,6 +5892,9 @@ def _execute_radau_accepted_step_next_reduced_cotangent_batched_bwd_with_support
                         rebuild_state,
                         lagged_cache_bar,
                         reverse_stage_cotangent_mode=cotangent_mode,
+                        reverse_segment_profile_annotations=bool(
+                            getattr(physics_context, "reverse_segment_profile_annotations", False)
+                        ),
                     )
 
             rebuild_state_bars = jax.vmap(
@@ -5925,6 +5950,13 @@ def _execute_radau_accepted_step_next_reduced_cotangent_batched_bwd_with_support
                                         carry_in.y,
                                         lagged_cache_bar,
                                         support,
+                                        reverse_segment_profile_annotations_override=bool(
+                                            getattr(
+                                                physics_context,
+                                                "reverse_segment_profile_annotations",
+                                                False,
+                                            )
+                                        ),
                                     ),
                                 )
                             )
@@ -16878,6 +16910,9 @@ def _build_prepared_radau_accepted_rollout(
         args=args,
         kwargs=kwargs,
         project_flat=project_flat,
+        reverse_segment_profile_annotations=bool(
+            getattr(solver, "reverse_segment_profile_annotations", False)
+        ),
     )
     flat_rhs_build_support_pullback_batched_interpolated_faces = (
         _flat_rhs_build_support_pullback_batched_interpolated_faces_factory(
@@ -17399,6 +17434,9 @@ class RADAUSolver(_RadauSolverConfig):
             args=args,
             kwargs=kwargs,
             project_flat=project_flat,
+            reverse_segment_profile_annotations=bool(
+                getattr(self, "reverse_segment_profile_annotations", False)
+            ),
         )
         flat_rhs_build_support_pullback_batched_interpolated_faces = (
             _flat_rhs_build_support_pullback_batched_interpolated_faces_factory(
