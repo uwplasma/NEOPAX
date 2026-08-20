@@ -2603,6 +2603,7 @@ def prepare_reverse_static_setup(
     if reverse_rebuild_support_pullback_mode not in {
         "separate",
         "separate_reuse_local_vjp_primal",
+        "separate_reuse_local_vjp_primal_support_only_ntx_implicit",
         "ntx_batched_interpolated_faces",
         "ntx_joint_implicit_interpolated_faces",
         "ntx_joint_implicit_interpolated_faces_packed_support_adjoint",
@@ -2610,6 +2611,7 @@ def prepare_reverse_static_setup(
         raise ValueError(
             "reverse_rebuild_support_pullback_mode must be one of "
             "{'separate', 'separate_reuse_local_vjp_primal', "
+            "'separate_reuse_local_vjp_primal_support_only_ntx_implicit', "
             "'ntx_batched_interpolated_faces', "
             "'ntx_joint_implicit_interpolated_faces', "
             "'ntx_joint_implicit_interpolated_faces_packed_support_adjoint'}."

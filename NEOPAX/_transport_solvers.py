@@ -1435,6 +1435,7 @@ def _flat_rhs_build_support_pullback_factory(
         *,
         reverse_segment_profile_annotations_override: bool | None = None,
         reuse_local_vjp_primal_anchor_response: bool = False,
+        support_only_ntx_implicit_pullback: bool = False,
         reverse_rebuild_inner_timing_component: str = "full",
     ):
         projected_flat_y = _project_flat_state_if_needed(
@@ -1454,6 +1455,10 @@ def _flat_rhs_build_support_pullback_factory(
                 reuse_local_vjp_primal_anchor_response
             ),
         )
+        # Preserve the existing model-hook contract in every default mode.
+        # The new keyword is meaningful only for the isolated opt-in path.
+        if support_only_ntx_implicit_pullback:
+            pullback_kwargs["support_only_ntx_implicit_pullback"] = True
         # Keep the ordinary support-pullback hook contract byte-for-byte
         # unchanged.  The selector exists only for the opt-in component timer.
         if str(reverse_rebuild_inner_timing_component).strip().lower() != "full":
@@ -5954,6 +5959,7 @@ def _execute_radau_accepted_step_next_reduced_cotangent_batched_bwd_with_support
             elif rebuild_support_pullback_mode in {
                 "separate",
                 "separate_reuse_local_vjp_primal",
+                "separate_reuse_local_vjp_primal_support_only_ntx_implicit",
             }:
 
                 def _rebuild_support_pullback(lagged_cache_bar):
@@ -5977,7 +5983,14 @@ def _execute_radau_accepted_step_next_reduced_cotangent_batched_bwd_with_support
                                         ),
                                         reuse_local_vjp_primal_anchor_response=(
                                             rebuild_support_pullback_mode
-                                            == "separate_reuse_local_vjp_primal"
+                                            in {
+                                                "separate_reuse_local_vjp_primal",
+                                                "separate_reuse_local_vjp_primal_support_only_ntx_implicit",
+                                            }
+                                        ),
+                                        support_only_ntx_implicit_pullback=(
+                                            rebuild_support_pullback_mode
+                                            == "separate_reuse_local_vjp_primal_support_only_ntx_implicit"
                                         ),
                                     ),
                                 )

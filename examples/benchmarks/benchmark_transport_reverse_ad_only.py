@@ -5422,6 +5422,7 @@ def main() -> None:
         choices=(
             "separate",
             "separate_reuse_local_vjp_primal",
+            "separate_reuse_local_vjp_primal_support_only_ntx_implicit",
             "ntx_batched_interpolated_faces",
             "ntx_joint_implicit_interpolated_faces",
             "ntx_joint_implicit_interpolated_faces_packed_support_adjoint",
@@ -5433,6 +5434,10 @@ def main() -> None:
             "'separate_reuse_local_vjp_primal' is an exact experimental variant "
             "that uses the primal output of each existing local NTX VJP instead "
             "of a separate anchor-response construction. "
+            "'separate_reuse_local_vjp_primal_support_only_ntx_implicit' is an "
+            "isolated exact experimental variant that retains that anchor-primal "
+            "reuse while omitting NTX case/profile bars unused by the rebuild "
+            "support transpose. "
             "'ntx_batched_interpolated_faces' is an exact opt-in multi-objective "
             "NTX face-interpolation transpose for the rebuild branch; it has no "
             "fallback for unsupported response representations. "

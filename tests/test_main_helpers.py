@@ -1,8 +1,10 @@
-from pathlib import Path
 import types
+from pathlib import Path
 
 import h5py
+import jax
 import jax.numpy as jnp
+from ntx import GridSpec, example_surface, prepare_monoenergetic_system
 
 from NEOPAX._orchestrator import (
     _build_database,
@@ -30,12 +32,148 @@ from NEOPAX._transport_flux_models import (
     NTXExactLijRuntimeTransportModel,
     NTXRuntimeScanChannels,
     NTXRuntimeScanTransportModel,
+    _sanitize_float_delta_bar_tree,
     _ntx_runtime_scan_to_neopax_monoenergetic,
     build_ntx_exact_lij_runtime_transport_model,
     build_ntx_runtime_scan_channels,
     build_ntx_runtime_scan_transport_model,
     get_transport_flux_model,
 )
+
+
+def test_ntx_exact_fused_lowdot_local_pullback_matches_ntx_helper():
+    """The opt-in fused local NTX path must preserve the scalar local bars."""
+    energy_grid = types.SimpleNamespace(
+        xWeights=jnp.asarray([0.2, 0.3, 0.5]),
+        L11_weight=jnp.asarray([1.0, 0.8, 1.2]),
+        L12_weight=jnp.asarray([0.1, -0.2, 0.3]),
+        L22_weight=jnp.asarray([0.9, 1.1, 0.7]),
+        L13_weight=jnp.asarray([0.4, 0.5, 0.6]),
+        L23_weight=jnp.asarray([-0.3, 0.2, 0.1]),
+        L33_weight=jnp.asarray([1.3, 0.6, 0.9]),
+        v_norm=jnp.asarray([1.7, 1.8, 1.9]),
+    )
+    common = dict(
+        species=object(),
+        energy_grid=energy_grid,
+        geometry=object(),
+        vmec_file=None,
+        boozer_file=None,
+    )
+    reference = NTXExactLijRuntimeTransportModel(**common)
+    fused = reference.with_derivative_pullback_algebra("ntx_helper_lowdot_fused")
+    prepared = prepare_monoenergetic_system(example_surface(), GridSpec(5, 5, 4))
+    field_bars = (
+        jnp.asarray(0.2),
+        jnp.asarray([0.4, -0.2, 0.1, 0.3, -0.5, 0.2]),
+        jnp.asarray([-0.3, 0.2, 0.4, -0.1, 0.5, 0.2]),
+        jnp.asarray([0.1, 0.3, -0.2, 0.5, -0.4, 0.2]),
+    )
+    kwargs = dict(
+        prepared=prepared,
+        drds_value=jnp.asarray(1.2),
+        reference_nu_hat=jnp.asarray([1.0e-2, 1.5e-2, 2.0e-2]),
+        reference_epsi_hat=jnp.asarray([1.0e-3, -2.0e-3, 1.5e-3]),
+        vth_a=jnp.asarray(2.3),
+        field_bars=field_bars,
+    )
+    reference_bars = reference._pullback_interpolated_moment_reduced_local_outputs(**kwargs)
+    fused_bars = fused._pullback_interpolated_moment_reduced_local_outputs(**kwargs)
+    for fused_bar, reference_bar in zip(fused_bars, reference_bars, strict=True):
+        assert jnp.allclose(fused_bar, reference_bar, rtol=1.0e-9, atol=1.0e-11)
+
+
+def test_ntx_exact_support_only_prepared_pullback_matches_joint_helper():
+    """The isolated rebuild helper preserves prepared, ``drds``, and primal fields."""
+    energy_grid = types.SimpleNamespace(
+        xWeights=jnp.asarray([0.2, 0.3, 0.5]),
+        L11_weight=jnp.asarray([1.0, 0.8, 1.2]),
+        L12_weight=jnp.asarray([0.1, -0.2, 0.3]),
+        L22_weight=jnp.asarray([0.9, 1.1, 0.7]),
+        L13_weight=jnp.asarray([0.4, 0.5, 0.6]),
+        L23_weight=jnp.asarray([-0.3, 0.2, 0.1]),
+        L33_weight=jnp.asarray([1.3, 0.6, 0.9]),
+        v_norm=jnp.asarray([1.7, 1.8, 1.9]),
+    )
+    model = NTXExactLijRuntimeTransportModel(
+        species=object(),
+        energy_grid=energy_grid,
+        geometry=object(),
+        vmec_file=None,
+        boozer_file=None,
+    )
+    prepared = prepare_monoenergetic_system(example_surface(), GridSpec(5, 5, 4))
+    kwargs = dict(
+        prepared=prepared,
+        drds_value=jnp.asarray(1.2),
+        reference_nu_hat=jnp.asarray([1.0e-2, 1.5e-2, 2.0e-2]),
+        reference_epsi_hat=jnp.asarray([1.0e-3, -2.0e-3, 1.5e-3]),
+        vth_a=jnp.asarray(2.3),
+        field_bars=(
+            jnp.asarray(0.2),
+            jnp.asarray([0.4, -0.2, 0.1, 0.3, -0.5, 0.2]),
+            jnp.asarray([-0.3, 0.2, 0.4, -0.1, 0.5, 0.2]),
+            jnp.asarray([0.1, 0.3, -0.2, 0.5, -0.4, 0.2]),
+        ),
+    )
+    joint = model._pullback_interpolated_moment_reduced_local_outputs_with_prepared_support_and_drds(
+        **kwargs
+    )
+    support_only = jax.jit(
+        lambda: model._pullback_interpolated_moment_prepared_support_and_drds_only(**kwargs)
+    )()
+    expected_primal = model._interpolated_moment_reduced_local_outputs_from_primitives(
+        prepared,
+        drds_value=kwargs["drds_value"],
+        nu_hat_a=kwargs["reference_nu_hat"],
+        epsi_hat_a=kwargs["reference_epsi_hat"],
+        vth_a=kwargs["vth_a"],
+    )
+    actual_prepared, actual_drds, actual_primal = support_only
+    for actual_leaf, expected_leaf in zip(
+        jax.tree_util.tree_leaves(actual_prepared),
+        jax.tree_util.tree_leaves(joint[3]),
+        strict=True,
+    ):
+        if jnp.issubdtype(jnp.asarray(expected_leaf).dtype, jnp.inexact):
+            assert jnp.allclose(actual_leaf, expected_leaf, rtol=1.0e-9, atol=1.0e-11)
+    assert jnp.allclose(actual_drds, joint[4], rtol=1.0e-9, atol=1.0e-11)
+    for actual_field, expected_field in zip(actual_primal, expected_primal, strict=True):
+        assert jnp.allclose(actual_field, expected_field, rtol=1.0e-9, atol=1.0e-11)
+
+    batched_field_bars = tuple(
+        jnp.stack([field_bar, field_bar], axis=0)
+        for field_bar in kwargs["field_bars"]
+    )
+    def _sanitized_support_only(first_bar, second_bar, third_bar, fourth_bar):
+        prepared_bar, drds_bar, primal_response = (
+            model._pullback_interpolated_moment_prepared_support_and_drds_only(
+                prepared,
+                drds_value=kwargs["drds_value"],
+                reference_nu_hat=kwargs["reference_nu_hat"],
+                reference_epsi_hat=kwargs["reference_epsi_hat"],
+                vth_a=kwargs["vth_a"],
+                field_bars=(first_bar, second_bar, third_bar, fourth_bar),
+            )
+        )
+        return (
+            *jax.tree_util.tree_leaves(
+                _sanitize_float_delta_bar_tree(prepared, prepared_bar)
+            ),
+            drds_bar,
+            *primal_response,
+        )
+
+    batched_support_only = jax.jit(jax.vmap(_sanitized_support_only))(
+        *batched_field_bars
+    )
+    expected_batched = tuple(
+        jnp.broadcast_to(value, (2,) + jnp.asarray(value).shape)
+        for value in _sanitized_support_only(*kwargs["field_bars"])
+    )
+    for actual_leaf, expected_leaf in zip(batched_support_only, expected_batched, strict=True):
+        if jnp.issubdtype(jnp.asarray(expected_leaf).dtype, jnp.inexact):
+            assert jnp.allclose(actual_leaf, expected_leaf, rtol=1.0e-9, atol=1.0e-11)
 
 
 def test_normalize_solver_config_prefers_transport_solver_section():

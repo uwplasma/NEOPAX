@@ -6374,6 +6374,181 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             direct_drds_bar,
         )
 
+    def _pullback_interpolated_moment_prepared_support_and_drds_only(
+        self,
+        prepared,
+        *,
+        drds_value,
+        reference_nu_hat,
+        reference_epsi_hat,
+        vth_a,
+        field_bars,
+    ):
+        """Exact prepared/``drds`` pullback without local state primitive bars.
+
+        This is the support-only counterpart of
+        ``_pullback_interpolated_moment_reduced_local_outputs_with_prepared_support_and_drds``.
+        The rebuild-support lane holds its local NTX case fixed, so requesting
+        ``nu_hat``, ``epsi_hat``, and ``vth_a`` cotangents there is unnecessary.
+        The NTX helper retains the same implicit adjoint and prepared-support
+        algebra while omitting those case/profile contractions.
+        """
+
+        ntx = _import_ntx()
+        (
+            _reference_log_nu_star_bar,
+            base_transport_moments_bar,
+            dtransport_moments_d_er_bar,
+            dtransport_moments_d_log_nu_star_bar,
+        ) = _interpolated_response_field_bar_tuple(field_bars)
+        epsi_hat_tangent = jnp.asarray(1.0e3, dtype=reference_epsi_hat.dtype) / (
+            self.energy_grid.v_norm * vth_a
+        )
+        energy_indices = jnp.arange(reference_nu_hat.shape[0], dtype=jnp.int32)
+
+        def _one_energy(args):
+            energy_index, nu_hat_value, epsi_hat_value, epsi_dot = args
+
+            def _bars_and_direct_drds(coefficients, first_coeff_dot, second_coeff_dot):
+                def _moment_pullback(coefficients_value, moment_bar):
+                    _, pullback = jax.vjp(
+                        lambda coefficient_value, drds_local: self._transport_moments_from_single_coefficient_vector(
+                            coefficient_value,
+                            drds_value=drds_local,
+                            energy_index=energy_index,
+                        ),
+                        coefficients_value,
+                        drds_value,
+                    )
+                    return pullback(moment_bar)
+
+                base_coefficient_bar, base_drds_bar = _moment_pullback(
+                    coefficients,
+                    base_transport_moments_bar,
+                )
+                first_coefficient_bar, first_drds_bar = _moment_pullback(
+                    coefficients,
+                    dtransport_moments_d_er_bar,
+                )
+                second_coefficient_bar, second_drds_bar = _moment_pullback(
+                    coefficients,
+                    dtransport_moments_d_log_nu_star_bar,
+                )
+
+                def _direct_drds_bar(coefficient_value, moment_bar):
+                    _, pullback = jax.vjp(
+                        lambda drds_local: self._transport_moments_from_single_coefficient_vector(
+                            coefficient_value,
+                            drds_value=drds_local,
+                            energy_index=energy_index,
+                        ),
+                        drds_value,
+                    )
+                    return pullback(moment_bar)[0]
+
+                _, first_drds_bar_dot = jax.jvp(
+                    lambda coefficient_value: _direct_drds_bar(
+                        coefficient_value,
+                        dtransport_moments_d_er_bar,
+                    ),
+                    (coefficients,),
+                    (first_coeff_dot,),
+                )
+                _, second_drds_bar_dot = jax.jvp(
+                    lambda coefficient_value: _direct_drds_bar(
+                        coefficient_value,
+                        dtransport_moments_d_log_nu_star_bar,
+                    ),
+                    (coefficients,),
+                    (second_coeff_dot,),
+                )
+                # The auxiliary carries the already-solved local response
+                # fields as well as the direct ``drds`` terms.  It avoids a
+                # second local forward response solely for anchor-coordinate
+                # interpolation.
+                return (
+                    base_coefficient_bar,
+                    first_coefficient_bar,
+                    second_coefficient_bar,
+                    (
+                        (
+                            base_drds_bar,
+                            first_drds_bar,
+                            first_drds_bar_dot,
+                            second_drds_bar,
+                            second_drds_bar_dot,
+                        ),
+                        coefficients,
+                        first_coeff_dot,
+                        second_coeff_dot,
+                    ),
+                )
+
+            return ntx.solve_prepared_coefficient_vector_lowdot_two_pullbacks_prepared_support_only_and_aux(
+                prepared,
+                ntx.MonoenergeticCase(nu_hat=nu_hat_value, epsi_hat=epsi_hat_value),
+                ntx.MonoenergeticCase(nu_hat=jnp.zeros_like(nu_hat_value), epsi_hat=epsi_dot),
+                ntx.MonoenergeticCase(nu_hat=nu_hat_value, epsi_hat=jnp.zeros_like(epsi_hat_value)),
+                _bars_and_direct_drds,
+            )
+
+        (
+            base_geometry_bar,
+            _first_base_geometry_bar,
+            first_geometry_bar,
+            second_base_geometry_bar,
+            second_geometry_bar,
+            auxiliary,
+        ) = jax.lax.map(
+            _one_energy,
+            (energy_indices, reference_nu_hat, reference_epsi_hat, epsi_hat_tangent),
+        )
+        (
+            direct_drds_bars,
+            coefficient_scan,
+            first_coefficient_dot_scan,
+            second_coefficient_dot_scan,
+        ) = auxiliary
+        base_drds_bar, _first_base_drds_bar, first_drds_bar, second_base_drds_bar, second_drds_bar = direct_drds_bars
+        prepared_bar = jax.tree_util.tree_map(
+            lambda values: jnp.sum(values, axis=0),
+            _sum_float_delta_bar_trees(
+                prepared,
+                base_geometry_bar,
+                first_geometry_bar,
+                second_base_geometry_bar,
+                second_geometry_bar,
+            ),
+        )
+        direct_drds_bar = jnp.sum(
+            base_drds_bar + first_drds_bar + second_base_drds_bar + second_drds_bar,
+            axis=0,
+        )
+        primal_response = (
+            self._log_nu_star_from_nu_hat(reference_nu_hat),
+            self._transport_moments_from_coefficient_scan(
+                coefficient_scan,
+                drds_value=drds_value,
+            ),
+            jax.jvp(
+                lambda values: self._transport_moments_from_coefficient_scan(
+                    values,
+                    drds_value=drds_value,
+                ),
+                (coefficient_scan,),
+                (first_coefficient_dot_scan,),
+            )[1],
+            jax.jvp(
+                lambda values: self._transport_moments_from_coefficient_scan(
+                    values,
+                    drds_value=drds_value,
+                ),
+                (coefficient_scan,),
+                (second_coefficient_dot_scan,),
+            )[1],
+        )
+        return prepared_bar, direct_drds_bar, primal_response
+
     def _pullback_local_scan_inputs_from_primitives(
         self,
         *,
@@ -8411,6 +8586,9 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         reuse_local_vjp_primal_anchor_response = bool(
             kwargs.pop("reuse_local_vjp_primal_anchor_response", False)
         )
+        support_only_ntx_implicit_pullback = bool(
+            kwargs.pop("support_only_ntx_implicit_pullback", False)
+        )
         reverse_rebuild_inner_timing_component = str(
             kwargs.pop("reverse_rebuild_inner_timing_component", "full")
         ).strip().lower()
@@ -8435,6 +8613,33 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                 "reuse_local_vjp_primal_anchor_response requires an "
                 "NTXInterpolatedMomentResponse face cotangent."
             )
+        if support_only_ntx_implicit_pullback and not reuse_local_vjp_primal_anchor_response:
+            raise ValueError(
+                "support_only_ntx_implicit_pullback requires "
+                "reuse_local_vjp_primal_anchor_response=True."
+            )
+        if support_only_ntx_implicit_pullback:
+            if not isinstance(face_response_bar, NTXInterpolatedMomentResponse):
+                raise NotImplementedError(
+                    "support_only_ntx_implicit_pullback requires an "
+                    "interpolated NTX face response."
+                )
+            if center_response_bar is not None:
+                raise NotImplementedError(
+                    "support_only_ntx_implicit_pullback requires center_response=None."
+                )
+            ntx = _import_ntx()
+            if not callable(
+                getattr(
+                    ntx,
+                    "solve_prepared_coefficient_vector_lowdot_two_pullbacks_prepared_support_only_and_aux",
+                    None,
+                )
+            ):
+                raise RuntimeError(
+                    "support_only_ntx_implicit_pullback requires the current NTX "
+                    "prepared-support-only helper."
+                )
         if face_response_bar is not None:
             face_channels_bar = _float_delta_tree_like(support.face_channels)
             face_prepared_bar = _float_delta_tree_like(support.face_prepared)
@@ -8488,6 +8693,46 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                     axis=1,
                     keepdims=False,
                 )
+                if support_only_ntx_implicit_pullback:
+                    if not interpolated:
+                        raise NotImplementedError(
+                            "support_only_ntx_implicit_pullback currently requires "
+                            "the interpolated NTX face response."
+                        )
+
+                    def _one_species_support_pullback(species_index, *species_field_bars):
+                        reference_nu_hat, reference_epsi_hat, vth_a = (
+                            self._interpolated_moment_local_scan_primitives(
+                                drds_value=drds_value,
+                                species_index=species_index,
+                                er_value=er_value,
+                                temperature_local=temperature_local,
+                                density_local=density_local,
+                                vthermal_local=vthermal_local,
+                                collisionality_kind=collisionality_kind,
+                            )
+                        )
+                        return self._pullback_interpolated_moment_prepared_support_and_drds_only(
+                            prepared,
+                            drds_value=drds_value,
+                            reference_nu_hat=reference_nu_hat,
+                            reference_epsi_hat=reference_epsi_hat,
+                            vth_a=vth_a,
+                            field_bars=species_field_bars,
+                        )
+
+                    prepared_species_bars, drds_species_bars, primal_response = jax.vmap(
+                        _one_species_support_pullback
+                    )(species_indices, *local_field_bars)
+                    prepared_bar = jax.tree_util.tree_map(
+                        lambda values: jnp.sum(values, axis=0),
+                        prepared_species_bars,
+                    )
+                    drds_bar = jnp.sum(drds_species_bars, axis=0)
+                    if return_primal_response:
+                        return primal_response, prepared_bar, drds_bar
+                    return prepared_bar, drds_bar
+
                 prepared_delta0 = _float_delta_tree_like(prepared)
                 drds_delta0 = jnp.zeros_like(drds_value)
 
