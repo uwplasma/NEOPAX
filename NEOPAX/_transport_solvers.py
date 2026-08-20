@@ -1435,6 +1435,7 @@ def _flat_rhs_build_support_pullback_factory(
         *,
         reverse_segment_profile_annotations_override: bool | None = None,
         reuse_local_vjp_primal_anchor_response: bool = False,
+        reverse_rebuild_inner_timing_component: str = "full",
     ):
         projected_flat_y = _project_flat_state_if_needed(
             flat_y,
@@ -1446,15 +1447,24 @@ def _flat_rhs_build_support_pullback_factory(
             if reverse_segment_profile_annotations_override is None
             else bool(reverse_segment_profile_annotations_override)
         )
-        return pullback_fn(
-            state_y,
-            lagged_response_bar,
-            support,
+        pullback_kwargs = dict(kwargs)
+        pullback_kwargs.update(
             reverse_segment_profile_annotations=profile_annotations,
             reuse_local_vjp_primal_anchor_response=bool(
                 reuse_local_vjp_primal_anchor_response
             ),
-            **kwargs,
+        )
+        # Keep the ordinary support-pullback hook contract byte-for-byte
+        # unchanged.  The selector exists only for the opt-in component timer.
+        if str(reverse_rebuild_inner_timing_component).strip().lower() != "full":
+            pullback_kwargs["reverse_rebuild_inner_timing_component"] = str(
+                reverse_rebuild_inner_timing_component
+            )
+        return pullback_fn(
+            state_y,
+            lagged_response_bar,
+            support,
+            **pullback_kwargs,
         )
 
     return _pullback

@@ -8411,7 +8411,20 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         reuse_local_vjp_primal_anchor_response = bool(
             kwargs.pop("reuse_local_vjp_primal_anchor_response", False)
         )
+        reverse_rebuild_inner_timing_component = str(
+            kwargs.pop("reverse_rebuild_inner_timing_component", "full")
+        ).strip().lower()
         del kwargs
+        if reverse_rebuild_inner_timing_component not in {
+            "full",
+            "local_ntx_vjp_and_accumulation",
+            "coordinate_rho_transpose",
+        }:
+            raise ValueError(
+                "reverse_rebuild_inner_timing_component must be one of "
+                "{'full', 'local_ntx_vjp_and_accumulation', "
+                "'coordinate_rho_transpose'}."
+            )
         face_response_bar = None if lagged_response_bar is None else lagged_response_bar.face_response
         center_response_bar = None if lagged_response_bar is None else lagged_response_bar.center_response
         if (
@@ -8542,6 +8555,39 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                 response_field_bar_tuple = _interpolated_response_field_bar_tuple(response_field_bars)
 
                 if reuse_local_vjp_primal_anchor_response:
+                    if reverse_rebuild_inner_timing_component == "coordinate_rho_transpose":
+                        # Diagnostic-only component boundary.  The coordinate
+                        # transpose depends on the anchor-response *shape*, not
+                        # on an NTX solve.  Reuse same-shaped, non-constant
+                        # slices of the incoming cotangent to keep the GPU
+                        # arithmetic live while measuring only the
+                        # interpolation-coordinate work.  This branch is
+                        # never selected by the normal reverse calculation.
+                        anchor_response_fields = tuple(
+                            jnp.take(field_bar, anchor_indices, axis=0)
+                            for field_bar in response_field_bar_tuple
+                        )
+                        target_rho_bar = jnp.zeros_like(target_rho)
+                        for anchor_field, field_bar in zip(
+                            anchor_response_fields,
+                            response_field_bar_tuple,
+                            strict=True,
+                        ):
+                            target_rho_bar = target_rho_bar + self._pullback_interpolate_anchor_target_rho(
+                                anchor_indices,
+                                anchor_field,
+                                target_rho,
+                                field_bar,
+                            )
+                        face_channels_bar = dataclasses.replace(
+                            face_channels_bar,
+                            rho=face_channels_bar.rho + target_rho_bar,
+                        )
+                        return _support_bar_from_face_bars(
+                            support,
+                            face_channels_bar,
+                            face_prepared_bar,
+                        )
                     # The old path below computes every local anchor response
                     # once for the coordinate transpose, then computes the
                     # exact same primal values again as the forward half of
@@ -8647,6 +8693,16 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                             ),
                             lambda _: raw_anchor_response_fields,
                             operand=None,
+                        )
+                    if reverse_rebuild_inner_timing_component == "local_ntx_vjp_and_accumulation":
+                        # Diagnostic-only: retain the exact anchor-value
+                        # interpolation transpose, local NTX VJP, and the
+                        # support-bar scatter/accumulation, while omitting only
+                        # the separate coordinate transpose below.
+                        return _support_bar_from_face_bars(
+                            support,
+                            face_channels_bar,
+                            face_prepared_bar,
                         )
                     target_rho_bar = jnp.zeros_like(target_rho)
                     for anchor_field, field_bar in zip(

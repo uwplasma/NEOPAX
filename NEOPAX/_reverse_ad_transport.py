@@ -3455,7 +3455,12 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
         # (for example Fourier-mode arrays).  Passing it as a JIT argument makes
         # JAX replace those leaves with sentinels during tracing.  The production
         # segment path captures this payload in its closure, so do the same here.
-        def _support_transpose_batched(flat_y, cache_bars):
+        def _support_transpose_batched(
+            flat_y,
+            cache_bars,
+            *,
+            inner_timing_component: str = "full",
+        ):
             # Match the production `separate` branch exactly: flatten the
             # sanitized support cotangent *inside* vmap.  Returning the raw
             # support tree would ask vmap to batch NTX static metadata such as
@@ -3470,6 +3475,7 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
                     reuse_local_vjp_primal_anchor_response=(
                         rebuild_mode == "separate_reuse_local_vjp_primal"
                     ),
+                    reverse_rebuild_inner_timing_component=inner_timing_component,
                 )
                 return tuple(
                     jax.tree_util.tree_leaves(
@@ -3522,6 +3528,36 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
             diagnostic_carry.y,
             diagnostic_cache_bars,
         )
+        if rebuild_mode == "separate_reuse_local_vjp_primal":
+            # These two launches deliberately introduce diagnostic-only XLA
+            # boundaries.  They use the exact production shapes and device
+            # operations, but are not part of the normal fused reverse path.
+            # No XProf/CUPTI trace, host callback, or retained reverse payload
+            # is involved.
+            _time_rebuild_component(
+                "anchor_value_transpose_local_ntx_vjp_and_accumulation",
+                jax.jit(
+                    lambda flat_y, cache_bars: _support_transpose_batched(
+                        flat_y,
+                        cache_bars,
+                        inner_timing_component="local_ntx_vjp_and_accumulation",
+                    )
+                ),
+                diagnostic_carry.y,
+                diagnostic_cache_bars,
+            )
+            _time_rebuild_component(
+                "coordinate_rho_transpose_only",
+                jax.jit(
+                    lambda flat_y, cache_bars: _support_transpose_batched(
+                        flat_y,
+                        cache_bars,
+                        inner_timing_component="coordinate_rho_transpose",
+                    )
+                ),
+                diagnostic_carry.y,
+                diagnostic_cache_bars,
+            )
     print(
         f"{progress_prefix} progress: support reverse segmented cotangent sweep start "
         f"segments={segment_count} segment_length="

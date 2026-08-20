@@ -261,6 +261,9 @@ def test_flat_support_pullback_forwards_local_vjp_primal_reuse_flag():
             observed["support"] = support
             observed["reuse"] = kwargs["reuse_local_vjp_primal_anchor_response"]
             observed["profile_annotations"] = kwargs["reverse_segment_profile_annotations"]
+            observed["inner_timing_component"] = kwargs[
+                "reverse_rebuild_inner_timing_component"
+            ]
             return {"x": jnp.asarray(3.0)}
 
     owner = _Owner()
@@ -276,14 +279,48 @@ def test_flat_support_pullback_forwards_local_vjp_primal_reuse_flag():
         {"x": jnp.asarray(7.0)},
         reverse_segment_profile_annotations_override=True,
         reuse_local_vjp_primal_anchor_response=True,
+        reverse_rebuild_inner_timing_component="local_ntx_vjp_and_accumulation",
     )
 
     assert jnp.allclose(result["x"], jnp.asarray(3.0))
     assert observed["reuse"] is True
     assert observed["profile_annotations"] is True
+    assert observed["inner_timing_component"] == "local_ntx_vjp_and_accumulation"
     assert jnp.allclose(observed["state"], jnp.asarray([2.0]))
     assert jnp.allclose(observed["lagged_response_bar"], jnp.asarray([5.0]))
     assert jnp.allclose(observed["support"]["x"], jnp.asarray(7.0))
+
+
+def test_flat_support_pullback_omits_inner_timing_selector_by_default():
+    """The diagnostic selector must not alter the normal model-hook contract."""
+
+    observed = {}
+
+    class _Owner:
+        def vector_field(self, state):
+            return state
+
+        def pullback_build_lagged_response_support_payload(
+            self,
+            state,
+            lagged_response_bar,
+            support,
+            **kwargs,
+        ):
+            del state, lagged_response_bar, support
+            observed.update(kwargs)
+            return {"x": jnp.asarray(0.0)}
+
+    owner = _Owner()
+    pullback = transport_solvers._flat_rhs_build_support_pullback_factory(
+        lambda flat_state: flat_state,
+        owner.vector_field,
+        (),
+        {},
+    )
+    pullback(jnp.asarray([1.0]), jnp.asarray([2.0]), {"x": jnp.asarray(3.0)})
+
+    assert "reverse_rebuild_inner_timing_component" not in observed
 
 
 def test_radau_controller_keeps_the_moderate_cap_on_an_easy_accepted_step():
