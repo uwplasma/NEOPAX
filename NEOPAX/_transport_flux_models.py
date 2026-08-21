@@ -8828,12 +8828,16 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             "local_ntx_vjp_and_accumulation",
             "local_ntx_vjp_primal",
             "local_ntx_vjp_transpose",
+            "local_ntx_vjp_transport_only",
+            "local_ntx_vjp_d_er_only",
+            "local_ntx_vjp_d_log_nu_star_only",
             "coordinate_rho_transpose",
         }:
             raise ValueError(
                 "reverse_rebuild_inner_timing_component must be one of "
                 "{'full', 'local_ntx_vjp_and_accumulation', 'local_ntx_vjp_primal', "
-                "'local_ntx_vjp_transpose', "
+                "'local_ntx_vjp_transpose', 'local_ntx_vjp_transport_only', "
+                "'local_ntx_vjp_d_er_only', 'local_ntx_vjp_d_log_nu_star_only', "
                 "'coordinate_rho_transpose'}."
             )
         face_response_bar = None if lagged_response_bar is None else lagged_response_bar.face_response
@@ -9044,6 +9048,34 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                     if return_primal_response:
                         return primal_response, zero_prepared_bar, zero_drds_bar
                     return zero_prepared_bar, zero_drds_bar
+
+                # Keep the exact production primal, but selectively zero the
+                # response cotangents for the diagnostic-only transpose
+                # partitions below.  The tuple order is fixed by
+                # ``_interpolated_moment_reduced_local_outputs_from_primitives``:
+                # (log_nu_star, transport, dtransport/dEr, dtransport/dlog_nu).
+                # These selectors never enter the normal reverse path.
+                if reverse_rebuild_inner_timing_component == "local_ntx_vjp_transport_only":
+                    local_field_bars = (
+                        jnp.zeros_like(local_field_bars[0]),
+                        local_field_bars[1],
+                        jnp.zeros_like(local_field_bars[2]),
+                        jnp.zeros_like(local_field_bars[3]),
+                    )
+                elif reverse_rebuild_inner_timing_component == "local_ntx_vjp_d_er_only":
+                    local_field_bars = (
+                        jnp.zeros_like(local_field_bars[0]),
+                        jnp.zeros_like(local_field_bars[1]),
+                        local_field_bars[2],
+                        jnp.zeros_like(local_field_bars[3]),
+                    )
+                elif reverse_rebuild_inner_timing_component == "local_ntx_vjp_d_log_nu_star_only":
+                    local_field_bars = (
+                        jnp.zeros_like(local_field_bars[0]),
+                        jnp.zeros_like(local_field_bars[1]),
+                        jnp.zeros_like(local_field_bars[2]),
+                        local_field_bars[3],
+                    )
                 with _reverse_rebuild_profile_scope(
                     reverse_segment_profile_annotations,
                     "reverse_segment/rebuild_support/local_ntx_vjp_transpose",
@@ -9209,7 +9241,12 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                             lambda _: raw_anchor_response_fields,
                             operand=None,
                         )
-                    if reverse_rebuild_inner_timing_component == "local_ntx_vjp_and_accumulation":
+                    if reverse_rebuild_inner_timing_component in {
+                        "local_ntx_vjp_and_accumulation",
+                        "local_ntx_vjp_transport_only",
+                        "local_ntx_vjp_d_er_only",
+                        "local_ntx_vjp_d_log_nu_star_only",
+                    }:
                         # Diagnostic-only: retain the exact anchor-value
                         # interpolation transpose, local NTX VJP, and the
                         # support-bar scatter/accumulation, while omitting only

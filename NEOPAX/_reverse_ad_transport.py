@@ -3515,11 +3515,55 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
                 flush=True,
             )
 
+        # This is the exact final realised segment with only the *rebuild*
+        # state/support transposes disabled.  It retains segment replay, the
+        # block stage-adjoint solve, fixed-lagged RHS state/support transposes,
+        # and all objective batching.  It therefore measures the portion that
+        # cannot be inferred from the isolated NTX support timer above.
+        #
+        # The alternate immutable execution context is diagnostic-only and is
+        # captured as a static JIT argument.  It never reaches the production
+        # reverse sweep below.
+        diagnostic_without_rebuild_context = dataclasses.replace(
+            reverse_setup.execution_context,
+            physics_context=dataclasses.replace(
+                physics_context,
+                reverse_stage_cotangent_mode="zero_rebuild_pullback",
+            ),
+        )
+        diagnostic_segment_arrays = _take_tree_axis0(
+            segmented_replay_arrays,
+            diagnostic_segment_index,
+        )
+
+        def _segment_reverse_without_rebuild_transposes(
+            segment_bars,
+            segment_carry,
+            segment_arrays,
+            support_value,
+        ):
+            return _radau_segment_reduced_cotangent_bwd_batched_with_support_call(
+                diagnostic_without_rebuild_context,
+                cotangent_mode,
+                segment_bars,
+                segment_carry,
+                segment_arrays,
+                support_value,
+            )
+
         print(
             f"{progress_prefix} progress: timing one isolated standard rebuild "
             f"segment={diagnostic_segment_index + 1}/{segment_count} objectives={objective_count} "
             "(diagnostic extra work; values are not added to the reverse result)",
             flush=True,
+        )
+        _time_rebuild_component(
+            "segment_reverse_without_rebuild_transposes",
+            _segment_reverse_without_rebuild_transposes,
+            reduced_bars,
+            diagnostic_carry,
+            diagnostic_segment_arrays,
+            support_payload,
         )
         _time_rebuild_component(
             "state_transpose",
@@ -3563,6 +3607,29 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
                 diagnostic_carry.y,
                 diagnostic_cache_bars,
             )
+            # Partition the existing local VJP transpose by its three
+            # transport response fields.  Each launch retains the production
+            # primal/VJP construction and anchor accumulation, but zeros the
+            # other response cotangents on device.  This is diagnostic-only:
+            # it deliberately does not alter the full combined pullback used
+            # by the reverse sweep.
+            for component_name, inner_component in (
+                ("local_ntx_vjp_transport_only", "local_ntx_vjp_transport_only"),
+                ("local_ntx_vjp_d_er_only", "local_ntx_vjp_d_er_only"),
+                ("local_ntx_vjp_d_log_nu_star_only", "local_ntx_vjp_d_log_nu_star_only"),
+            ):
+                _time_rebuild_component(
+                    component_name,
+                    jax.jit(
+                        lambda flat_y, cache_bars, inner_component=inner_component: _support_transpose_batched(
+                            flat_y,
+                            cache_bars,
+                            inner_timing_component=inner_component,
+                        )
+                    ),
+                    diagnostic_carry.y,
+                    diagnostic_cache_bars,
+                )
             _time_rebuild_component(
                 "coordinate_rho_transpose_only",
                 jax.jit(
