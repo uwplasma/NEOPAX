@@ -221,6 +221,77 @@ def test_ntx_exact_support_only_prepared_pullback_matches_joint_helper():
             assert jnp.allclose(actual_leaf, expected_leaf, rtol=1.0e-9, atol=1.0e-11)
 
 
+def test_joint_local_pullback_primal_output_preserves_existing_bars():
+    """The opt-in joint helper must add only the local primal response."""
+    model = NTXExactLijRuntimeTransportModel(
+        species=types.SimpleNamespace(number_species=1, mass=jnp.asarray([1.0])),
+        energy_grid=object(),
+        geometry=object(),
+        vmec_file=None,
+        boozer_file=None,
+    )
+    prepared = {"coefficient": jnp.asarray([2.0, -1.0])}
+    primal_response = (
+        jnp.asarray([0.25]),
+        jnp.asarray([[1.0, -2.0]]),
+        jnp.asarray([[3.0, 4.0]]),
+        jnp.asarray([[5.0, 6.0]]),
+    )
+    object.__setattr__(model, "_interpolated_moment_local_scan_primitives", lambda **_kwargs: (
+        jnp.asarray(1.0),
+        jnp.asarray(2.0),
+        jnp.asarray(3.0),
+    ))
+    object.__setattr__(model, "_pullback_interpolated_moment_reduced_local_outputs_with_prepared_support_and_drds", (
+        lambda prepared, **_kwargs: (
+            jnp.asarray(7.0),
+            jnp.asarray(8.0),
+            jnp.asarray(9.0),
+            {"coefficient": jnp.asarray([10.0, 11.0])},
+            jnp.asarray(12.0),
+        )
+    ))
+    object.__setattr__(model, "_pullback_local_scan_inputs_and_drds_from_primitives", lambda **_kwargs: (
+        jnp.asarray(13.0),
+        jnp.asarray(14.0),
+        jnp.asarray(15.0),
+        jnp.asarray(16.0),
+    ))
+    object.__setattr__(model, "_interpolated_moment_reduced_local_outputs_from_primitives", (
+        lambda *_args, **_kwargs: primal_response
+    ))
+    field_bars = (
+        jnp.asarray([0.1]),
+        jnp.asarray([[0.2, 0.3]]),
+        jnp.asarray([[0.4, 0.5]]),
+        jnp.asarray([[0.6, 0.7]]),
+    )
+    common = dict(
+        prepared=prepared,
+        drds_value=jnp.asarray(1.0),
+        er_value=jnp.asarray(2.0),
+        temperature_local=jnp.asarray(3.0),
+        density_local=jnp.asarray(4.0),
+        collisionality_kind="none",
+        field_bars=field_bars,
+    )
+    reference = model._pullback_interpolated_moment_response_local_fields_and_prepared_support_and_drds_flat_prepared(
+        **common
+    )
+    actual = model._pullback_interpolated_moment_response_local_fields_and_prepared_support_and_drds_flat_prepared(
+        **common,
+        return_primal_response=True,
+    )
+    for actual_leaf, reference_leaf in zip(actual[:5], reference, strict=True):
+        if isinstance(actual_leaf, tuple):
+            for actual_subleaf, reference_subleaf in zip(actual_leaf, reference_leaf, strict=True):
+                assert jnp.allclose(actual_subleaf, reference_subleaf)
+        else:
+            assert jnp.allclose(actual_leaf, reference_leaf)
+    for actual_field, expected_field in zip(actual[5], primal_response, strict=True):
+        assert jnp.allclose(actual_field, expected_field)
+
+
 def test_normalize_solver_config_prefers_transport_solver_section():
     config = {
         "transport_solver": {

@@ -2609,6 +2609,7 @@ def prepare_reverse_static_setup(
         "ntx_batched_interpolated_faces_reuse_local_vjp_primal",
         "ntx_joint_implicit_interpolated_faces",
         "ntx_joint_implicit_interpolated_faces_packed_support_adjoint",
+        "ntx_joint_implicit_interpolated_faces_reuse_local_vjp_primal",
     }:
         raise ValueError(
             "reverse_rebuild_support_pullback_mode must be one of "
@@ -2618,7 +2619,8 @@ def prepare_reverse_static_setup(
             "'ntx_batched_interpolated_faces', "
             "'ntx_batched_interpolated_faces_reuse_local_vjp_primal', "
             "'ntx_joint_implicit_interpolated_faces', "
-            "'ntx_joint_implicit_interpolated_faces_packed_support_adjoint'}."
+            "'ntx_joint_implicit_interpolated_faces_packed_support_adjoint', "
+            "'ntx_joint_implicit_interpolated_faces_reuse_local_vjp_primal'}."
         )
     if (
         reverse_rebuild_support_pullback_mode
@@ -2627,6 +2629,7 @@ def prepare_reverse_static_setup(
             "ntx_batched_interpolated_faces_reuse_local_vjp_primal",
             "ntx_joint_implicit_interpolated_faces",
             "ntx_joint_implicit_interpolated_faces_packed_support_adjoint",
+            "ntx_joint_implicit_interpolated_faces_reuse_local_vjp_primal",
         }
         and not reverse_direct_stage_adjoint
     ):

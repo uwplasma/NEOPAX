@@ -454,3 +454,26 @@ def test_radau_joint_rebuild_support_pullback_accumulates_batched_bars(monkeypat
     assert jnp.allclose(reduced_bars.lagged_reference_y, jnp.zeros((2, 1), dtype=dtype))
     assert len(support_leaves) == 1
     assert jnp.allclose(support_leaves[0], jnp.asarray([22.0, -11.0], dtype=dtype))
+
+    # The new selector must use its dedicated context hook, while preserving
+    # the same combined rebuild-state/support contract.
+    physics_context.reverse_rebuild_support_pullback_mode = (
+        "ntx_joint_implicit_interpolated_faces_reuse_local_vjp_primal"
+    )
+    physics_context.flat_rhs_build_state_and_support_pullback_batched_interpolated_faces_reuse_local_vjp_primal = (
+        joint_rebuild_pullback
+    )
+    reused_reduced_bars, reused_support_leaves = (
+        transport_solvers._execute_radau_accepted_step_next_reduced_cotangent_batched_bwd_with_support_from_primal_result(
+            kernel_context,
+            physics_context,
+            types.SimpleNamespace(),
+            "rebuild",
+            carry,
+            primal_result,
+            next_bars,
+            {"x": jnp.asarray(0.0, dtype=dtype)},
+        )
+    )
+    assert jnp.allclose(reused_reduced_bars.y, reduced_bars.y)
+    assert jnp.allclose(reused_support_leaves[0], support_leaves[0])

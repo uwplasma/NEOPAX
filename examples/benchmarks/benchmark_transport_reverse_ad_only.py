@@ -5428,6 +5428,7 @@ def main() -> None:
             "ntx_batched_interpolated_faces_reuse_local_vjp_primal",
             "ntx_joint_implicit_interpolated_faces",
             "ntx_joint_implicit_interpolated_faces_packed_support_adjoint",
+            "ntx_joint_implicit_interpolated_faces_reuse_local_vjp_primal",
         ),
         default="separate",
         help=(
@@ -5452,7 +5453,10 @@ def main() -> None:
             "the same local NTX implicit adjoint. "
             "'ntx_joint_implicit_interpolated_faces_packed_support_adjoint' is "
             "the same experimental joint lane, but uses NTX's separately tested "
-            "paired directional support-adjoint solve."
+            "paired directional support-adjoint solve. "
+            "'ntx_joint_implicit_interpolated_faces_reuse_local_vjp_primal' "
+            "keeps the joint state/support adjoint but reuses its local primal "
+            "response for the interpolation-coordinate transpose."
         ),
     )
     parser.add_argument(
