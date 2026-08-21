@@ -1051,6 +1051,231 @@ class CombinedTransportFluxModel(TransportFluxModelBase):
         # scalar sanitizer would drop that axis on non-float leaves.
         return pullback_fn(state, response_bars, support)
 
+    def pullback_build_lagged_response_support_payload_batched_interpolated_faces_reuse_local_vjp_primal(
+        self,
+        state,
+        lagged_response_bars,
+        support,
+    ):
+        """Batched interpolated-face transpose that reuses each VJP primal.
+
+        This is intentionally an isolated experimental helper.  Relative to
+        :meth:`pullback_build_lagged_response_support_payload_batched_interpolated_faces`,
+        each anchor obtains its primal response from the forward half of the
+        already-required local ``jax.vjp``.  That primal is then used for the
+        interpolation-coordinate transpose, rather than evaluating a separate
+        local NTX response solely for that purpose.  The local pullback is
+        still applied to the entire objective batch on device.
+        """
+        # This composite model only delegates the NTX part.  The concrete
+        # implementation below is intentionally unreachable here; it is kept
+        # temporarily while this helper is moved to the NTX flux model.
+        pullback_fn = getattr(
+            self.neoclassical_model,
+            "pullback_build_lagged_response_support_payload_batched_interpolated_faces_reuse_local_vjp_primal",
+            None,
+        )
+        if not callable(pullback_fn):
+            raise NotImplementedError(
+                "The active neoclassical model does not expose the batched interpolated-face "
+                "primal-reuse support pullback."
+            )
+        response_bars = None if lagged_response_bars is None else lagged_response_bars.neoclassical_response
+        return pullback_fn(state, response_bars, support)
+
+        # Kept below only until the following patch moves this implementation
+        # into the concrete NTX model; it is unreachable.
+        if not isinstance(lagged_response_bars, NTXExactLijLaggedResponse):
+            raise TypeError("batched NTX support pullback requires NTXExactLijLaggedResponse bars.")
+        face_response_bars = lagged_response_bars.face_response
+        if not isinstance(face_response_bars, NTXInterpolatedMomentResponse):
+            raise NotImplementedError(
+                "batched NTX support pullback currently requires interpolated face-response bars."
+            )
+        if lagged_response_bars.center_response is not None:
+            raise NotImplementedError(
+                "batched NTX support pullback currently requires center_response=None "
+                "(the interpolate_from_faces runtime lane)."
+            )
+
+        objective_count = int(jnp.asarray(face_response_bars.reference_er).shape[0])
+        face_state = build_face_transport_state(
+            state,
+            self.geometry,
+            bc_density=self.bc_density,
+            bc_temperature=self.bc_temperature,
+            density_floor=self.density_floor,
+            temperature_floor=self.temperature_floor,
+        )
+        face_density = safe_density(face_state.density, self.density_floor)
+        face_temperature = face_state.temperature
+        face_v_thermal = get_v_thermal(self.species.mass, face_temperature)
+        collisionality_kind = _collisionality_kind(self.collisionality_model)
+        species_indices = jnp.arange(int(self.species.number_species), dtype=jnp.int32)
+
+        def _batched_zero_like(tree):
+            return jax.tree_util.tree_map(
+                lambda leaf: jnp.broadcast_to(
+                    jnp.zeros_like(jnp.asarray(leaf)),
+                    (objective_count,) + jnp.asarray(leaf).shape,
+                ),
+                tree,
+            )
+
+        face_channels_bar = _batched_zero_like(_float_delta_tree_like(support.face_channels))
+        face_prepared_bar = _batched_zero_like(_float_delta_tree_like(support.face_prepared))
+        n_radius = int(face_state.Er.shape[0])
+        anchor_indices = self._response_anchor_indices(n_radius)
+        anchor_rho = jnp.asarray(self.geometry.r_grid_half, dtype=jnp.float64)[anchor_indices]
+        target_rho = jnp.asarray(support.face_channels.rho, dtype=jnp.float64)
+        n_anchor = int(anchor_indices.shape[0])
+
+        response_field_bars = jax.vmap(self._interpolated_response_field_bars)(face_response_bars)
+        response_field_bar_tuple = _interpolated_response_field_bar_tuple(response_field_bars)
+        raw_anchor_response_bar = jax.vmap(
+            lambda one_field_bars: self._pullback_interpolated_anchor_response_fields(
+                anchor_indices=anchor_indices,
+                anchor_rho=anchor_rho,
+                target_rho=target_rho,
+                field_bars=one_field_bars,
+            )
+        )(response_field_bars)
+        raw_anchor_response_fields = _interpolated_response_field_bar_tuple(raw_anchor_response_bar)
+        anchor_response_fields0 = tuple(
+            jnp.zeros((n_anchor,) + field_bar.shape[2:], dtype=field_bar.dtype)
+            for field_bar in raw_anchor_response_fields
+        )
+        anchor_positions = jnp.arange(n_anchor, dtype=jnp.int32)
+
+        def _local_face_support_pullback(radius_index, local_field_bars):
+            prepared = jax.tree_util.tree_map(
+                lambda arr: jax.lax.dynamic_index_in_dim(arr, radius_index, axis=0, keepdims=False),
+                support.face_prepared,
+            )
+            drds_value = jax.lax.dynamic_index_in_dim(
+                support.face_channels.drds, radius_index, axis=0, keepdims=False
+            )
+            er_value = jax.lax.dynamic_index_in_dim(face_state.Er, radius_index, axis=0, keepdims=False)
+            temperature_local = jax.lax.dynamic_index_in_dim(
+                face_temperature, radius_index, axis=1, keepdims=False
+            )
+            density_local = jax.lax.dynamic_index_in_dim(
+                face_density, radius_index, axis=1, keepdims=False
+            )
+            vthermal_local = jax.lax.dynamic_index_in_dim(
+                face_v_thermal, radius_index, axis=1, keepdims=False
+            )
+            prepared_delta0 = _float_delta_tree_like(prepared)
+            drds_delta0 = jnp.zeros_like(drds_value)
+
+            def _response_from_support_delta(prepared_delta, drds_delta):
+                prepared_value = _add_float_delta_tree(prepared, prepared_delta)
+                drds_local = drds_value + drds_delta
+                return jax.vmap(
+                    lambda species_index: self._build_interpolated_moment_response_local(
+                        prepared_value,
+                        drds_value=drds_local,
+                        species_index=species_index,
+                        er_value=er_value,
+                        temperature_local=temperature_local,
+                        density_local=density_local,
+                        vthermal_local=vthermal_local,
+                        collisionality_kind=collisionality_kind,
+                    )
+                )(species_indices)
+
+            primal_response, local_pullback = jax.vjp(
+                _response_from_support_delta,
+                prepared_delta0,
+                drds_delta0,
+            )
+            # Map only numeric leaves: NTX prepared trees contain static
+            # dataclass metadata that cannot carry an objective batch axis.
+            _, prepared_treedef = jax.tree_util.tree_flatten(prepared_delta0)
+
+            def _local_pullback_leaves(one_local_field_bars):
+                prepared_bar, drds_bar = local_pullback(one_local_field_bars)
+                return (*jax.tree_util.tree_leaves(prepared_bar), drds_bar)
+
+            batched_leaves = jax.vmap(_local_pullback_leaves)(local_field_bars)
+            return (
+                primal_response,
+                prepared_treedef.unflatten(batched_leaves[:-1]),
+                batched_leaves[-1],
+            )
+
+        def _accumulate_anchor(carry, anchor_pos):
+            channels_carry, prepared_carry, anchor_fields_carry = carry
+            radius_index = jax.lax.dynamic_index_in_dim(
+                anchor_indices, anchor_pos, axis=0, keepdims=False
+            )
+            local_field_bars = tuple(
+                jax.lax.dynamic_index_in_dim(field_bar, anchor_pos, axis=1, keepdims=False)
+                for field_bar in raw_anchor_response_fields
+            )
+            local_response, prepared_local_bar, drds_local_bar = _local_face_support_pullback(
+                radius_index,
+                local_field_bars,
+            )
+            updated_anchor_fields = tuple(
+                anchor_field.at[anchor_pos].set(local_field)
+                for anchor_field, local_field in zip(
+                    anchor_fields_carry,
+                    local_response,
+                    strict=True,
+                )
+            )
+            return (
+                dataclasses.replace(
+                    channels_carry,
+                    drds=channels_carry.drds.at[:, radius_index].add(drds_local_bar),
+                ),
+                jax.tree_util.tree_map(
+                    lambda arr, local_arr: arr.at[:, radius_index].add(local_arr),
+                    prepared_carry,
+                    prepared_local_bar,
+                ),
+                updated_anchor_fields,
+            ), None
+
+        (face_channels_bar, face_prepared_bar, raw_anchor_response_fields), _ = jax.lax.scan(
+            _accumulate_anchor,
+            (face_channels_bar, face_prepared_bar, anchor_response_fields0),
+            anchor_positions,
+        )
+        if n_anchor < 4:
+            anchor_response_fields = raw_anchor_response_fields
+        else:
+            anchor_response_fields = jax.lax.cond(
+                jnp.isclose(anchor_rho[0], 0.0),
+                lambda _: self._regularize_axis_radius0(raw_anchor_response_fields, anchor_rho),
+                lambda _: raw_anchor_response_fields,
+                operand=None,
+            )
+        target_rho_bar = jnp.zeros((objective_count,) + target_rho.shape, dtype=target_rho.dtype)
+        for anchor_field, field_bar in zip(
+            anchor_response_fields,
+            response_field_bar_tuple,
+            strict=True,
+        ):
+            target_rho_bar = target_rho_bar + jax.vmap(
+                lambda one_field_bar: self._pullback_interpolate_anchor_target_rho(
+                    anchor_indices,
+                    anchor_field,
+                    target_rho,
+                    one_field_bar,
+                )
+            )(field_bar)
+        face_channels_bar = dataclasses.replace(
+            face_channels_bar,
+            rho=face_channels_bar.rho + target_rho_bar,
+        )
+        return dataclasses.replace(
+            _batched_zero_like(_float_delta_tree_like(support)),
+            face_channels=face_channels_bar,
+            face_prepared=face_prepared_bar,
+        )
+
     def pullback_build_lagged_response_state_and_support_payload_batched_interpolated_faces(
         self,
         state,
@@ -9700,6 +9925,137 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             _batched_zero_like(_float_delta_tree_like(support)),
             face_channels=face_channels_bar,
             face_prepared=face_prepared_bar,
+        )
+
+    def pullback_build_lagged_response_support_payload_batched_interpolated_faces_reuse_local_vjp_primal(
+        self, state, lagged_response_bars, support,
+    ):
+        """Exact batched face transpose using the primal of each local VJP.
+
+        The temporary anchor responses have no objective axis.  The VJP
+        pullback alone is batched over objectives, so this keeps the existing
+        batched rule's device multi-RHS behavior while removing its separate
+        per-anchor NTX forward evaluation.
+        """
+        if not isinstance(lagged_response_bars, NTXExactLijLaggedResponse):
+            raise TypeError("batched NTX support pullback requires NTXExactLijLaggedResponse bars.")
+        face_response_bars = lagged_response_bars.face_response
+        if not isinstance(face_response_bars, NTXInterpolatedMomentResponse):
+            raise NotImplementedError("batched NTX support pullback requires interpolated face-response bars.")
+        if lagged_response_bars.center_response is not None:
+            raise NotImplementedError("batched NTX support pullback requires center_response=None.")
+        objective_count = int(jnp.asarray(face_response_bars.reference_er).shape[0])
+        face_state = build_face_transport_state(
+            state, self.geometry, bc_density=self.bc_density, bc_temperature=self.bc_temperature,
+            density_floor=self.density_floor, temperature_floor=self.temperature_floor,
+        )
+        face_density = safe_density(face_state.density, self.density_floor)
+        face_temperature = face_state.temperature
+        face_v_thermal = get_v_thermal(self.species.mass, face_temperature)
+        collisionality_kind = _collisionality_kind(self.collisionality_model)
+        species_indices = jnp.arange(int(self.species.number_species), dtype=jnp.int32)
+
+        def _batched_zero_like(tree):
+            return jax.tree_util.tree_map(
+                lambda leaf: jnp.broadcast_to(jnp.zeros_like(jnp.asarray(leaf)),
+                                               (objective_count,) + jnp.asarray(leaf).shape),
+                tree,
+            )
+
+        face_channels_bar = _batched_zero_like(_float_delta_tree_like(support.face_channels))
+        face_prepared_bar = _batched_zero_like(_float_delta_tree_like(support.face_prepared))
+        n_radius = int(face_state.Er.shape[0])
+        anchor_indices = self._response_anchor_indices(n_radius)
+        anchor_rho = jnp.asarray(self.geometry.r_grid_half, dtype=jnp.float64)[anchor_indices]
+        target_rho = jnp.asarray(support.face_channels.rho, dtype=jnp.float64)
+        n_anchor = int(anchor_indices.shape[0])
+        response_field_bars = jax.vmap(self._interpolated_response_field_bars)(face_response_bars)
+        response_field_bar_tuple = _interpolated_response_field_bar_tuple(response_field_bars)
+        raw_anchor_response_bar = jax.vmap(
+            lambda bars: self._pullback_interpolated_anchor_response_fields(
+                anchor_indices=anchor_indices, anchor_rho=anchor_rho,
+                target_rho=target_rho, field_bars=bars,
+            )
+        )(response_field_bars)
+        raw_anchor_response_fields = _interpolated_response_field_bar_tuple(raw_anchor_response_bar)
+        anchor_response_fields0 = tuple(
+            jnp.zeros((n_anchor,) + field_bar.shape[2:], dtype=field_bar.dtype)
+            for field_bar in raw_anchor_response_fields
+        )
+
+        def _one_anchor(radius_index, local_field_bars):
+            prepared = jax.tree_util.tree_map(
+                lambda arr: jax.lax.dynamic_index_in_dim(arr, radius_index, axis=0, keepdims=False),
+                support.face_prepared,
+            )
+            drds_value = jax.lax.dynamic_index_in_dim(support.face_channels.drds, radius_index, axis=0, keepdims=False)
+            er_value = jax.lax.dynamic_index_in_dim(face_state.Er, radius_index, axis=0, keepdims=False)
+            temperature_local = jax.lax.dynamic_index_in_dim(face_temperature, radius_index, axis=1, keepdims=False)
+            density_local = jax.lax.dynamic_index_in_dim(face_density, radius_index, axis=1, keepdims=False)
+            vthermal_local = jax.lax.dynamic_index_in_dim(face_v_thermal, radius_index, axis=1, keepdims=False)
+            prepared_delta0 = _float_delta_tree_like(prepared)
+            drds_delta0 = jnp.zeros_like(drds_value)
+
+            def _response(delta_prepared, delta_drds):
+                prepared_value = _add_float_delta_tree(prepared, delta_prepared)
+                return jax.vmap(
+                    lambda species_index: self._build_interpolated_moment_response_local(
+                        prepared_value, drds_value=drds_value + delta_drds,
+                        species_index=species_index, er_value=er_value,
+                        temperature_local=temperature_local, density_local=density_local,
+                        vthermal_local=vthermal_local, collisionality_kind=collisionality_kind,
+                    )
+                )(species_indices)
+
+            primal_response, pullback = jax.vjp(_response, prepared_delta0, drds_delta0)
+            _, treedef = jax.tree_util.tree_flatten(prepared_delta0)
+            def _pullback_leaves(one_bars):
+                prepared_bar, drds_bar = pullback(one_bars)
+                return (*jax.tree_util.tree_leaves(prepared_bar), drds_bar)
+            batched_leaves = jax.vmap(_pullback_leaves)(local_field_bars)
+            return primal_response, treedef.unflatten(batched_leaves[:-1]), batched_leaves[-1]
+
+        def _accumulate(carry, anchor_pos):
+            channels, prepared_bars, anchor_fields = carry
+            radius_index = jax.lax.dynamic_index_in_dim(anchor_indices, anchor_pos, axis=0, keepdims=False)
+            local_field_bars = tuple(
+                jax.lax.dynamic_index_in_dim(field_bar, anchor_pos, axis=1, keepdims=False)
+                for field_bar in raw_anchor_response_fields
+            )
+            local_response, local_prepared, local_drds = _one_anchor(radius_index, local_field_bars)
+            anchor_fields = tuple(
+                field.at[anchor_pos].set(value)
+                for field, value in zip(anchor_fields, local_response, strict=True)
+            )
+            return (
+                dataclasses.replace(channels, drds=channels.drds.at[:, radius_index].add(local_drds)),
+                jax.tree_util.tree_map(
+                    lambda values, local: values.at[:, radius_index].add(local), prepared_bars, local_prepared
+                ),
+                anchor_fields,
+            ), None
+
+        (face_channels_bar, face_prepared_bar, raw_anchor_fields), _ = jax.lax.scan(
+            _accumulate,
+            (face_channels_bar, face_prepared_bar, anchor_response_fields0),
+            jnp.arange(n_anchor, dtype=jnp.int32),
+        )
+        anchor_fields = raw_anchor_fields if n_anchor < 4 else jax.lax.cond(
+            jnp.isclose(anchor_rho[0], 0.0),
+            lambda _: self._regularize_axis_radius0(raw_anchor_fields, anchor_rho),
+            lambda _: raw_anchor_fields, operand=None,
+        )
+        target_rho_bar = jnp.zeros((objective_count,) + target_rho.shape, dtype=target_rho.dtype)
+        for anchor_field, field_bar in zip(anchor_fields, response_field_bar_tuple, strict=True):
+            target_rho_bar = target_rho_bar + jax.vmap(
+                lambda one_bar: self._pullback_interpolate_anchor_target_rho(
+                    anchor_indices, anchor_field, target_rho, one_bar
+                )
+            )(field_bar)
+        face_channels_bar = dataclasses.replace(face_channels_bar, rho=face_channels_bar.rho + target_rho_bar)
+        return dataclasses.replace(
+            _batched_zero_like(_float_delta_tree_like(support)),
+            face_channels=face_channels_bar, face_prepared=face_prepared_bar,
         )
 
     def pullback_build_lagged_response_state_and_support_payload_batched_interpolated_faces(

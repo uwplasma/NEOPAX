@@ -1912,6 +1912,52 @@ class ComposedEquationSystem:
             **self._shared_flux_call_kwargs(kwargs),
         )
 
+    def pullback_build_lagged_response_support_payload_batched_interpolated_faces_reuse_local_vjp_primal(
+        self, state, lagged_response_bars, support, **kwargs,
+    ):
+        """Geometry wrapper for the isolated batched/primal-reuse NTX rule."""
+        support, geometry = self._split_realtime_geometry_payload(support)
+        if geometry is not None:
+            ntx_support_bar = (
+                self.pullback_build_lagged_response_support_payload_batched_interpolated_faces_reuse_local_vjp_primal(
+                    state, lagged_response_bars, support, **kwargs,
+                )
+            )
+            working_state, _eidx = self._prepare_working_state(state)
+            flux_response_bars = None if lagged_response_bars is None else lagged_response_bars.flux_response
+            if flux_response_bars is None:
+                geometry_bar = jax.tree_util.tree_map(
+                    lambda leaf: jnp.broadcast_to(jnp.zeros_like(jnp.asarray(leaf)),
+                                                   (0,) + jnp.asarray(leaf).shape),
+                    geometry,
+                )
+            else:
+                geometry_bar = jax.vmap(
+                    lambda flux_response_bar: self._direct_geometry_build_lagged_response_bar(
+                        self.shared_flux_model, geometry, working_state, flux_response_bar,
+                    )
+                )(flux_response_bars)
+            return {"ntx_support": ntx_support_bar, "geometry": geometry_bar}
+        working_state, _eidx = self._prepare_working_state(state)
+        flux_response_bars = None if lagged_response_bars is None else lagged_response_bars.flux_response
+        if self.shared_flux_model is None or flux_response_bars is None:
+            raise NotImplementedError(
+                "batched primal-reuse interpolated-face support pullback requires an active shared flux response."
+            )
+        pullback_fn = getattr(
+            self.shared_flux_model,
+            "pullback_build_lagged_response_support_payload_batched_interpolated_faces_reuse_local_vjp_primal",
+            None,
+        )
+        if not callable(pullback_fn):
+            raise NotImplementedError(
+                "The active shared flux model does not expose the batched primal-reuse "
+                "interpolated-face support pullback."
+            )
+        return pullback_fn(
+            working_state, flux_response_bars, support, **self._shared_flux_call_kwargs(kwargs),
+        )
+
     def pullback_build_lagged_response_state_and_support_payload_batched_interpolated_faces(
         self,
         state,

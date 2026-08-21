@@ -697,6 +697,23 @@ def test_combined_joint_lagged_pullback_preserves_submodel_state_bars():
     assert jnp.allclose(state_bars_without_classical, 8.0 * bars)
 
 
+def test_combined_batched_primal_reuse_support_pullback_delegates_to_neoclassical():
+    class Neoclassical:
+        def pullback_build_lagged_response_support_payload_batched_interpolated_faces_reuse_local_vjp_primal(
+            self, state, response_bars, support
+        ):
+            return response_bars + support
+
+    model = CombinedTransportFluxModel(
+        neoclassical_model=Neoclassical(), turbulent_model=None, classical_model=None
+    )
+    bars = jnp.asarray([2.0, -1.0])
+    result = model.pullback_build_lagged_response_support_payload_batched_interpolated_faces_reuse_local_vjp_primal(
+        jnp.asarray(1.0), CombinedTransportLaggedResponse(bars, None, None), jnp.asarray(4.0)
+    )
+    assert jnp.allclose(result, bars + 4.0)
+
+
 def test_calculate_fluxes_from_config_uses_flux_output_flags():
     flux_model = lambda state: {"Gamma": jnp.asarray([[1.0]]), "Q": jnp.asarray([[2.0]]), "Upar": jnp.asarray([[3.0]])}
     config = {

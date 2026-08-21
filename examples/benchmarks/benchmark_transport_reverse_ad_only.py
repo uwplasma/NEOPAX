@@ -5424,6 +5424,7 @@ def main() -> None:
             "separate_reuse_local_vjp_primal",
             "separate_reuse_local_vjp_primal_support_only_ntx_implicit",
             "ntx_batched_interpolated_faces",
+            "ntx_batched_interpolated_faces_reuse_local_vjp_primal",
             "ntx_joint_implicit_interpolated_faces",
             "ntx_joint_implicit_interpolated_faces_packed_support_adjoint",
         ),
