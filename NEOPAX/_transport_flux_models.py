@@ -1056,6 +1056,7 @@ class CombinedTransportFluxModel(TransportFluxModelBase):
         state,
         lagged_response_bars,
         support,
+        **kwargs,
     ):
         """Batched interpolated-face transpose that reuses each VJP primal.
 
@@ -1067,7 +1068,11 @@ class CombinedTransportFluxModel(TransportFluxModelBase):
         local NTX response solely for that purpose.  The local pullback is
         still applied to the entire objective batch on device.
         """
-        # This composite model only delegates the NTX part.  The concrete
+        # This composite model only delegates the NTX part.  Boundary-condition
+        # kwargs belong to the outer transport equation and are not accepted by
+        # the local NTX helper, matching the established batched wrapper.
+        del kwargs
+        # The concrete
         # implementation below is intentionally unreachable here; it is kept
         # temporarily while this helper is moved to the NTX flux model.
         pullback_fn = getattr(

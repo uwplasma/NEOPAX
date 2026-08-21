@@ -709,7 +709,8 @@ def test_combined_batched_primal_reuse_support_pullback_delegates_to_neoclassica
     )
     bars = jnp.asarray([2.0, -1.0])
     result = model.pullback_build_lagged_response_support_payload_batched_interpolated_faces_reuse_local_vjp_primal(
-        jnp.asarray(1.0), CombinedTransportLaggedResponse(bars, None, None), jnp.asarray(4.0)
+        jnp.asarray(1.0), CombinedTransportLaggedResponse(bars, None, None), jnp.asarray(4.0),
+        bc_density="ignored", bc_temperature="ignored",
     )
     assert jnp.allclose(result, bars + 4.0)
 
