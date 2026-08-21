@@ -83,6 +83,51 @@ def test_ntx_exact_fused_lowdot_local_pullback_matches_ntx_helper():
         assert jnp.allclose(fused_bar, reference_bar, rtol=1.0e-9, atol=1.0e-11)
 
 
+def test_ntx_exact_factorized_two_directional_local_response_matches_generic_jvps():
+    """The isolated rebuild primitive must match the existing local response."""
+    energy_grid = types.SimpleNamespace(
+        xWeights=jnp.asarray([0.2, 0.3, 0.5]),
+        L11_weight=jnp.asarray([1.0, 0.8, 1.2]),
+        L12_weight=jnp.asarray([0.1, -0.2, 0.3]),
+        L22_weight=jnp.asarray([0.9, 1.1, 0.7]),
+        L13_weight=jnp.asarray([0.4, 0.5, 0.6]),
+        L23_weight=jnp.asarray([-0.3, 0.2, 0.1]),
+        L33_weight=jnp.asarray([1.3, 0.6, 0.9]),
+        v_norm=jnp.asarray([1.7, 1.8, 1.9]),
+    )
+    model = NTXExactLijRuntimeTransportModel(
+        species=object(),
+        energy_grid=energy_grid,
+        geometry=object(),
+        vmec_file=None,
+        boozer_file=None,
+    )
+    prepared = prepare_monoenergetic_system(example_surface(), GridSpec(3, 3, 2))
+    nu_hat = jnp.asarray([1.0e-2, 1.5e-2, 2.0e-2])
+    epsi_hat = jnp.asarray([1.0e-3, -2.0e-3, 1.5e-3])
+    vth_a = jnp.asarray(2.3)
+    drds = jnp.asarray(1.2)
+
+    def _response(prepared_value, drds_value, *, factorized):
+        return model._interpolated_moment_reduced_local_outputs_from_primitives(
+            prepared_value,
+            drds_value=drds_value,
+            nu_hat_a=nu_hat,
+            epsi_hat_a=epsi_hat,
+            vth_a=vth_a,
+            use_factorized_ntx_two_directional_prepared_vjp=factorized,
+        )
+
+    reference = _response(prepared, drds, factorized=False)
+    factorized = jax.jit(
+        lambda prepared_value, drds_value: _response(
+            prepared_value, drds_value, factorized=True
+        )
+    )(prepared, drds)
+    for actual, expected in zip(factorized, reference, strict=True):
+        assert jnp.allclose(actual, expected, rtol=1.0e-9, atol=1.0e-11)
+
+
 def test_ntx_exact_support_only_prepared_pullback_matches_joint_helper():
     """The isolated rebuild helper preserves prepared, ``drds``, and primal fields."""
     energy_grid = types.SimpleNamespace(

@@ -2604,6 +2604,7 @@ def prepare_reverse_static_setup(
         "separate",
         "separate_reuse_local_vjp_primal",
         "separate_reuse_local_vjp_primal_support_only_ntx_implicit",
+        "separate_reuse_local_vjp_primal_factorized_ntx_two_directional",
         "ntx_batched_interpolated_faces",
         "ntx_batched_interpolated_faces_reuse_local_vjp_primal",
         "ntx_joint_implicit_interpolated_faces",
@@ -2613,6 +2614,7 @@ def prepare_reverse_static_setup(
             "reverse_rebuild_support_pullback_mode must be one of "
             "{'separate', 'separate_reuse_local_vjp_primal', "
             "'separate_reuse_local_vjp_primal_support_only_ntx_implicit', "
+            "'separate_reuse_local_vjp_primal_factorized_ntx_two_directional', "
             "'ntx_batched_interpolated_faces', "
             "'ntx_batched_interpolated_faces_reuse_local_vjp_primal', "
             "'ntx_joint_implicit_interpolated_faces', "

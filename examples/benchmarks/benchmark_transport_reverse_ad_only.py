@@ -5423,6 +5423,7 @@ def main() -> None:
             "separate",
             "separate_reuse_local_vjp_primal",
             "separate_reuse_local_vjp_primal_support_only_ntx_implicit",
+            "separate_reuse_local_vjp_primal_factorized_ntx_two_directional",
             "ntx_batched_interpolated_faces",
             "ntx_batched_interpolated_faces_reuse_local_vjp_primal",
             "ntx_joint_implicit_interpolated_faces",
@@ -5439,6 +5440,10 @@ def main() -> None:
             "isolated exact experimental variant that retains that anchor-primal "
             "reuse while omitting NTX case/profile bars unused by the rebuild "
             "support transpose. "
+            "'separate_reuse_local_vjp_primal_factorized_ntx_two_directional' is an "
+            "isolated exact experimental rebuild-support mode: for each energy it "
+            "uses NTX's one-factorization base-plus-two-directional primitive and "
+            "its matching local prepared custom VJP. "
             "'ntx_batched_interpolated_faces' is an exact opt-in multi-objective "
             "NTX face-interpolation transpose for the rebuild branch; it has no "
             "fallback for unsupported response representations. "

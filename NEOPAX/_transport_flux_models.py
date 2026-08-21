@@ -3930,6 +3930,7 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         density_local,
         vthermal_local,
         collisionality_kind,
+        use_factorized_ntx_two_directional_prepared_vjp: bool = False,
     ):
         reference_nu_hat, reference_epsi_hat, vth_a = self._interpolated_moment_local_scan_primitives(
             drds_value=drds_value,
@@ -3946,6 +3947,9 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             nu_hat_a=reference_nu_hat,
             epsi_hat_a=reference_epsi_hat,
             vth_a=vth_a,
+            use_factorized_ntx_two_directional_prepared_vjp=(
+                use_factorized_ntx_two_directional_prepared_vjp
+            ),
         )
 
     def _interpolated_moment_reduced_local_outputs_from_primitives(
@@ -3956,7 +3960,16 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         nu_hat_a,
         epsi_hat_a,
         vth_a,
+        use_factorized_ntx_two_directional_prepared_vjp: bool = False,
     ):
+        if use_factorized_ntx_two_directional_prepared_vjp:
+            return self._interpolated_moment_reduced_local_outputs_from_factorized_ntx_two_directional(
+                prepared,
+                drds_value=drds_value,
+                nu_hat_a=nu_hat_a,
+                epsi_hat_a=epsi_hat_a,
+                vth_a=vth_a,
+            )
         return (
             self._log_nu_star_from_nu_hat(nu_hat_a),
             self._transport_moments_from_inputs(
@@ -3977,6 +3990,92 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                 drds_value=drds_value,
                 nu_hat_a=nu_hat_a,
                 epsi_hat_a=epsi_hat_a,
+            ),
+        )
+
+    def _interpolated_moment_reduced_local_outputs_from_factorized_ntx_two_directional(
+        self,
+        prepared,
+        *,
+        drds_value,
+        nu_hat_a,
+        epsi_hat_a,
+        vth_a,
+    ):
+        """Return the local interpolated response from one factorization per energy.
+
+        This isolated reverse-rebuild primitive replaces the base NTX solve plus
+        two generic JVPs with NTX's factorized base/two-directional helper.  Its
+        custom VJP retains those per-energy factors only for this local VJP;
+        it neither changes the normal forward path nor adds a timestep tape.
+        """
+        ntx = _import_ntx()
+        solve_three = getattr(
+            ntx,
+            "solve_prepared_coefficient_vector_two_directional_prepared_vjp",
+            None,
+        )
+        if not callable(solve_three):
+            raise RuntimeError(
+                "The factorized NTX rebuild-support mode requires "
+                "solve_prepared_coefficient_vector_two_directional_prepared_vjp."
+            )
+        energy_indices = jnp.arange(nu_hat_a.shape[0], dtype=jnp.int32)
+        epsi_hat_er_tangent = jnp.asarray(1.0e3, dtype=epsi_hat_a.dtype) / (
+            self.energy_grid.v_norm * vth_a
+        )
+
+        def _one_energy(args):
+            _energy_index, nu_hat_value, epsi_hat_value, epsi_er_tangent = args
+            return solve_three(
+                prepared,
+                ntx.MonoenergeticCase(nu_hat=nu_hat_value, epsi_hat=epsi_hat_value),
+                ntx.MonoenergeticCase(
+                    nu_hat=jnp.asarray(0.0, dtype=nu_hat_value.dtype),
+                    epsi_hat=epsi_er_tangent,
+                ),
+                ntx.MonoenergeticCase(
+                    nu_hat=nu_hat_value,
+                    epsi_hat=jnp.asarray(0.0, dtype=epsi_hat_value.dtype),
+                ),
+            )
+
+        coefficient_scan, er_coefficient_dot_scan, log_nu_coefficient_dot_scan = jax.lax.map(
+            _one_energy,
+            (energy_indices, nu_hat_a, epsi_hat_a, epsi_hat_er_tangent),
+        )
+
+        def _directional_moments_from_one(args):
+            coefficient_value, coefficient_dot, energy_index = args
+            return jax.jvp(
+                lambda coefficients: self._transport_moments_from_single_coefficient_vector(
+                    coefficients,
+                    drds_value=drds_value,
+                    energy_index=energy_index,
+                ),
+                (coefficient_value,),
+                (coefficient_dot,),
+            )[1]
+
+        return (
+            self._log_nu_star_from_nu_hat(nu_hat_a),
+            self._transport_moments_from_coefficient_scan(
+                coefficient_scan,
+                drds_value=drds_value,
+            ),
+            jnp.sum(
+                jax.lax.map(
+                    _directional_moments_from_one,
+                    (coefficient_scan, er_coefficient_dot_scan, energy_indices),
+                ),
+                axis=0,
+            ),
+            jnp.sum(
+                jax.lax.map(
+                    _directional_moments_from_one,
+                    (coefficient_scan, log_nu_coefficient_dot_scan, energy_indices),
+                ),
+                axis=0,
             ),
         )
 
@@ -8819,6 +8918,9 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         support_only_ntx_implicit_pullback = bool(
             kwargs.pop("support_only_ntx_implicit_pullback", False)
         )
+        factorized_ntx_two_directional_prepared_vjp = bool(
+            kwargs.pop("factorized_ntx_two_directional_prepared_vjp", False)
+        )
         reverse_rebuild_inner_timing_component = str(
             kwargs.pop("reverse_rebuild_inner_timing_component", "full")
         ).strip().lower()
@@ -8853,6 +8955,14 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         if support_only_ntx_implicit_pullback and not reuse_local_vjp_primal_anchor_response:
             raise ValueError(
                 "support_only_ntx_implicit_pullback requires "
+                "reuse_local_vjp_primal_anchor_response=True."
+            )
+        if (
+            factorized_ntx_two_directional_prepared_vjp
+            and not reuse_local_vjp_primal_anchor_response
+        ):
+            raise ValueError(
+                "factorized_ntx_two_directional_prepared_vjp requires "
                 "reuse_local_vjp_primal_anchor_response=True."
             )
         if support_only_ntx_implicit_pullback:
@@ -9015,6 +9125,9 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                                 density_local=density_local,
                                 vthermal_local=vthermal_local,
                                 collisionality_kind=collisionality_kind,
+                                use_factorized_ntx_two_directional_prepared_vjp=(
+                                    factorized_ntx_two_directional_prepared_vjp
+                                ),
                             )
                         )(species_indices)
                     return jax.vmap(
