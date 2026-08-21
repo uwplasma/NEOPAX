@@ -3552,6 +3552,18 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
                 diagnostic_cache_bars,
             )
             _time_rebuild_component(
+                "local_ntx_vjp_primal_only",
+                jax.jit(
+                    lambda flat_y, cache_bars: _support_transpose_batched(
+                        flat_y,
+                        cache_bars,
+                        inner_timing_component="local_ntx_vjp_primal",
+                    )
+                ),
+                diagnostic_carry.y,
+                diagnostic_cache_bars,
+            )
+            _time_rebuild_component(
                 "coordinate_rho_transpose_only",
                 jax.jit(
                     lambda flat_y, cache_bars: _support_transpose_batched(

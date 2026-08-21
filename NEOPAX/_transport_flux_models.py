@@ -8826,11 +8826,14 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         if reverse_rebuild_inner_timing_component not in {
             "full",
             "local_ntx_vjp_and_accumulation",
+            "local_ntx_vjp_primal",
+            "local_ntx_vjp_transpose",
             "coordinate_rho_transpose",
         }:
             raise ValueError(
                 "reverse_rebuild_inner_timing_component must be one of "
-                "{'full', 'local_ntx_vjp_and_accumulation', "
+                "{'full', 'local_ntx_vjp_and_accumulation', 'local_ntx_vjp_primal', "
+                "'local_ntx_vjp_transpose', "
                 "'coordinate_rho_transpose'}."
             )
         face_response_bar = None if lagged_response_bar is None else lagged_response_bar.face_response
@@ -9032,6 +9035,11 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                         prepared_delta0,
                         drds_delta0,
                     )
+                if reverse_rebuild_inner_timing_component == "local_ntx_vjp_primal":
+                    # Diagnostic-only: retain the exact local VJP primal but
+                    # skip its transpose and return shape-correct zero support
+                    # bars so the outer anchor scan remains valid.
+                    return _float_delta_tree_like(prepared), jnp.zeros_like(drds_value)
                 with _reverse_rebuild_profile_scope(
                     reverse_segment_profile_annotations,
                     "reverse_segment/rebuild_support/local_ntx_vjp_transpose",
