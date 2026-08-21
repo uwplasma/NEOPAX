@@ -9039,7 +9039,11 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                     # Diagnostic-only: retain the exact local VJP primal but
                     # skip its transpose and return shape-correct zero support
                     # bars so the outer anchor scan remains valid.
-                    return _float_delta_tree_like(prepared), jnp.zeros_like(drds_value)
+                    zero_prepared_bar = _float_delta_tree_like(prepared)
+                    zero_drds_bar = jnp.zeros_like(drds_value)
+                    if return_primal_response:
+                        return primal_response, zero_prepared_bar, zero_drds_bar
+                    return zero_prepared_bar, zero_drds_bar
                 with _reverse_rebuild_profile_scope(
                     reverse_segment_profile_annotations,
                     "reverse_segment/rebuild_support/local_ntx_vjp_transpose",
