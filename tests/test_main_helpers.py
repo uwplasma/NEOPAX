@@ -28,17 +28,154 @@ from NEOPAX._database_preprocessed import (
 from NEOPAX._monoenergetic_interpolators import monoenergetic_interpolation_kernel
 from NEOPAX._interpolators import get_Dij
 from NEOPAX._source_models import get_source_model
+from NEOPAX._species import Species
+from NEOPAX._state import TransportState
 from NEOPAX._transport_flux_models import (
     NTXExactLijRuntimeTransportModel,
+    NTXExactLijRuntimeSupport,
     NTXRuntimeScanChannels,
     NTXRuntimeScanTransportModel,
     _sanitize_float_delta_bar_tree,
     _ntx_runtime_scan_to_neopax_monoenergetic,
+    build_face_transport_state,
     build_ntx_exact_lij_runtime_transport_model,
     build_ntx_runtime_scan_channels,
     build_ntx_runtime_scan_transport_model,
     get_transport_flux_model,
 )
+
+
+def _tiny_ntx_runtime_channels(rho):
+    values = jnp.asarray(rho, dtype=jnp.float64)
+    ones = jnp.ones_like(values)
+    return NTXRuntimeScanChannels.from_mapping(
+        values,
+        {
+            "a_b": 1.0,
+            "psia": 1.0,
+            "b00": ones,
+            "r00": ones,
+            "boozer_i": ones,
+            "boozer_g": ones,
+            "iota": ones,
+            "drds": ones,
+            "dr_tildedr": ones,
+            "dr_tildeds": ones,
+            "fac_reference_to_sfincs_11": ones,
+            "fac_reference_to_sfincs_31": ones,
+            "fac_reference_to_sfincs_33": ones,
+            "fac_sfincs_to_dkes_11": ones,
+            "fac_sfincs_to_dkes_31": ones,
+            "fac_sfincs_to_dkes_33": ones,
+            "fac_dkes_to_d11star": ones,
+            "fac_dkes_to_d31star": ones,
+            "fac_dkes_to_d33star": ones,
+        },
+    )
+
+
+def _repeat_ntx_prepared(prepared, count):
+    return jax.tree_util.tree_map(
+        lambda *values: None if values[0] is None else jnp.stack(values, axis=0),
+        *([prepared] * count),
+    )
+
+
+def test_ntx_exact_runtime_lagged_face_response_matches_reference_and_finite_difference():
+    """The exact NTX face response must agree locally with its live face flux."""
+    geometry = types.SimpleNamespace(
+        a_b=1.0,
+        r_grid=jnp.asarray([0.3, 0.7]),
+        r_grid_half=jnp.asarray([0.1, 0.5, 0.9]),
+    )
+    species = Species(
+        number_species=2,
+        species_indices=jnp.asarray([0, 1]),
+        mass_mp=jnp.asarray([5.446e-4, 2.0]),
+        charge_qp=jnp.asarray([-1.0, 1.0]),
+        names=("e", "D"),
+    )
+    energy_grid = types.SimpleNamespace(
+        xWeights=jnp.asarray([0.2, 0.3, 0.5]),
+        L11_weight=jnp.asarray([1.0, 0.8, 1.2]),
+        L12_weight=jnp.asarray([0.1, -0.2, 0.3]),
+        L22_weight=jnp.asarray([0.9, 1.1, 0.7]),
+        L13_weight=jnp.asarray([0.4, 0.5, 0.6]),
+        L23_weight=jnp.asarray([-0.3, 0.2, 0.1]),
+        L33_weight=jnp.asarray([1.3, 0.6, 0.9]),
+        v_norm=jnp.asarray([1.7, 1.8, 1.9]),
+    )
+    prepared = prepare_monoenergetic_system(example_surface(), GridSpec(3, 3, 2))
+    support = NTXExactLijRuntimeSupport(
+        center_channels=_tiny_ntx_runtime_channels(geometry.r_grid),
+        face_channels=_tiny_ntx_runtime_channels(geometry.r_grid_half),
+        center_prepared=_repeat_ntx_prepared(prepared, 2),
+        face_prepared=_repeat_ntx_prepared(prepared, 3),
+        grid=GridSpec(3, 3, 2),
+    )
+    model = NTXExactLijRuntimeTransportModel(
+        species=species,
+        energy_grid=energy_grid,
+        geometry=geometry,
+        vmec_file=None,
+        boozer_file=None,
+        support=support,
+        center_response_mode="interpolate_from_faces",
+    )
+    state0 = TransportState(
+        density=jnp.asarray([[1.0, 1.15], [1.0, 1.15]]),
+        pressure=jnp.asarray([[1.3, 1.61], [1.1, 1.38]]),
+        Er=jnp.asarray([2.0e-4, 2.5e-4]),
+    )
+    direction = TransportState(
+        density=jnp.asarray([[0.03, -0.02], [0.02, -0.01]]),
+        pressure=jnp.asarray([[0.04, -0.03], [0.03, -0.02]]),
+        Er=jnp.asarray([1.0e-5, -0.8e-5]),
+    )
+
+    def face_fluxes_from_state(state):
+        faces = build_face_transport_state(state, geometry)
+        return model.evaluate_face_fluxes(state, faces)
+
+    response = model.build_lagged_response(state0)
+    lagged_at_reference = model.evaluate_with_lagged_response(state0, response)
+    direct_at_reference = face_fluxes_from_state(state0)
+    for name in ("Gamma", "Q", "Upar"):
+        assert jnp.allclose(
+            lagged_at_reference[f"{name}_faces"],
+            direct_at_reference[name],
+            rtol=3.0e-6,
+            atol=1.0e-12,
+        )
+
+    epsilon = jnp.asarray(1.0e-4)
+    state_plus = jax.tree_util.tree_map(
+        lambda value, delta: value + epsilon * delta,
+        state0,
+        direction,
+    )
+    state_minus = jax.tree_util.tree_map(
+        lambda value, delta: value - epsilon * delta,
+        state0,
+        direction,
+    )
+    finite_difference = jax.tree_util.tree_map(
+        lambda plus, minus: (plus - minus) / (2.0 * epsilon),
+        face_fluxes_from_state(state_plus),
+        face_fluxes_from_state(state_minus),
+    )
+    lagged_direction = jax.tree_util.tree_map(
+        lambda value, reference: value - reference,
+        model.evaluate_with_lagged_response(state_plus, response),
+        lagged_at_reference,
+    )
+    for name in ("Gamma", "Q", "Upar"):
+        assert jnp.allclose(
+            lagged_direction[f"{name}_faces"] / epsilon,
+            finite_difference[name],
+            rtol=2.0e-2,
+            atol=1.0e-8,
+        )
 
 
 def test_ntx_exact_fused_lowdot_local_pullback_matches_ntx_helper():
@@ -290,6 +427,175 @@ def test_joint_local_pullback_primal_output_preserves_existing_bars():
             assert jnp.allclose(actual_leaf, reference_leaf)
     for actual_field, expected_field in zip(actual[5], primal_response, strict=True):
         assert jnp.allclose(actual_field, expected_field)
+
+
+def test_scalar_joint_local_pullback_mock_retains_outer_objective_batch_only():
+    """The scalar joint primitive is trace-once under an outer RHS batch.
+
+    This is deliberately a tiny mocked contract test.  It guards the intended
+    next rebuild route: state and support bars are returned together by the
+    scalar local primitive, while the caller alone owns the objective/RHS
+    axis.  No production NTX solve, transport rollout, profiling, or file
+    output is involved.
+    """
+    model = NTXExactLijRuntimeTransportModel(
+        species=types.SimpleNamespace(number_species=1, mass=jnp.asarray([1.0])),
+        energy_grid=object(),
+        geometry=object(),
+        vmec_file=None,
+        boozer_file=None,
+    )
+    prepared = {"coefficient": jnp.asarray([2.0, -1.0])}
+    calls = {"joint_lowdot_contract": 0}
+
+    object.__setattr__(model, "_interpolated_moment_local_scan_primitives", lambda **_kwargs: (
+        jnp.asarray(1.0),
+        jnp.asarray(2.0),
+        jnp.asarray(3.0),
+    ))
+
+    def _joint_lowdot_contract(prepared_value, **_kwargs):
+        calls["joint_lowdot_contract"] += 1
+        return (
+            jnp.asarray(7.0),
+            jnp.asarray(8.0),
+            jnp.asarray(9.0),
+            {"coefficient": jnp.asarray([10.0, 11.0])},
+            jnp.asarray(12.0),
+        )
+
+    object.__setattr__(
+        model,
+        "_pullback_interpolated_moment_reduced_local_outputs_with_prepared_support_and_drds",
+        _joint_lowdot_contract,
+    )
+    object.__setattr__(model, "_pullback_local_scan_inputs_and_drds_from_primitives", lambda **_kwargs: (
+        jnp.asarray(13.0),
+        jnp.asarray(14.0),
+        jnp.asarray(15.0),
+        jnp.asarray(16.0),
+    ))
+
+    common = dict(
+        prepared=prepared,
+        drds_value=jnp.asarray(1.0),
+        er_value=jnp.asarray(2.0),
+        temperature_local=jnp.asarray(3.0),
+        density_local=jnp.asarray(4.0),
+        collisionality_kind="none",
+    )
+    one_rhs = (
+        jnp.asarray([0.1]),
+        jnp.asarray([[0.2, 0.3]]),
+        jnp.asarray([[0.4, 0.5]]),
+        jnp.asarray([[0.6, 0.7]]),
+    )
+
+    def _one_objective(*field_bars):
+        return model._pullback_interpolated_moment_response_local_fields_and_prepared_support_and_drds_flat_prepared(
+            **common,
+            field_bars=field_bars,
+        )
+
+    single = _one_objective(*one_rhs)
+    assert calls["joint_lowdot_contract"] == 1
+    assert jnp.allclose(single[0], 25.0)  # implicit + direct drds bars
+    assert jnp.allclose(single[1], 14.0)
+    assert jnp.allclose(single[2], 15.0)
+    assert jnp.allclose(single[3], 16.0)
+    assert jnp.allclose(single[4][0], jnp.asarray([10.0, 11.0]))
+
+    objective_count = 20
+    calls["joint_lowdot_contract"] = 0
+    batched_rhs = tuple(
+        jnp.broadcast_to(value, (objective_count,) + value.shape)
+        for value in one_rhs
+    )
+    batched = jax.jit(jax.vmap(_one_objective))(*batched_rhs)
+
+    # Python mock calls occur while JAX traces the one scalar body.  This
+    # proves the objective axis is supplied by the outer vmap rather than a
+    # host loop or an inner objective-specific helper construction.
+    assert calls["joint_lowdot_contract"] == 1
+    for actual, expected in zip(batched[:4], single[:4], strict=True):
+        assert actual.shape[0] == objective_count
+        assert jnp.allclose(actual, jnp.broadcast_to(expected, actual.shape))
+    assert batched[4][0].shape[0] == objective_count
+    assert jnp.allclose(
+        batched[4][0],
+        jnp.broadcast_to(single[4][0], batched[4][0].shape),
+    )
+
+
+def test_scalar_joint_local_pullback_mock_matches_existing_state_pullback():
+    """Joint local bars retain the established scalar state-bar contract."""
+    model = NTXExactLijRuntimeTransportModel(
+        species=types.SimpleNamespace(number_species=1, mass=jnp.asarray([1.0])),
+        energy_grid=object(),
+        geometry=object(),
+        vmec_file=None,
+        boozer_file=None,
+    )
+    prepared = {"coefficient": jnp.asarray([2.0, -1.0])}
+    object.__setattr__(model, "_interpolated_moment_local_scan_primitives", lambda **_kwargs: (
+        jnp.asarray(1.0),
+        jnp.asarray(2.0),
+        jnp.asarray(3.0),
+    ))
+    object.__setattr__(model, "_pullback_interpolated_moment_reduced_local_outputs", lambda *_args, **_kwargs: (
+        jnp.asarray(8.0),
+        jnp.asarray(9.0),
+        jnp.asarray(10.0),
+    ))
+    object.__setattr__(model, "_pullback_local_scan_inputs_from_primitives", lambda **_kwargs: (
+        jnp.asarray(14.0),
+        jnp.asarray(15.0),
+        jnp.asarray(16.0),
+    ))
+    object.__setattr__(model, "_pullback_interpolated_moment_reduced_local_outputs_with_prepared_support_and_drds", (
+        lambda prepared_value, **_kwargs: (
+            jnp.asarray(8.0),
+            jnp.asarray(9.0),
+            jnp.asarray(10.0),
+            {"coefficient": jnp.asarray([10.0, 11.0])},
+            jnp.asarray(12.0),
+        )
+    ))
+    object.__setattr__(model, "_pullback_local_scan_inputs_and_drds_from_primitives", lambda **_kwargs: (
+        jnp.asarray(25.0),
+        jnp.asarray(14.0),
+        jnp.asarray(15.0),
+        jnp.asarray(16.0),
+    ))
+    field_bars = (
+        jnp.asarray([0.1]),
+        jnp.asarray([[0.2, 0.3]]),
+        jnp.asarray([[0.4, 0.5]]),
+        jnp.asarray([[0.6, 0.7]]),
+    )
+    common = dict(
+        prepared=prepared,
+        drds_value=jnp.asarray(1.0),
+        er_value=jnp.asarray(2.0),
+        temperature_local=jnp.asarray(3.0),
+        density_local=jnp.asarray(4.0),
+        collisionality_kind="none",
+        field_bars=field_bars,
+    )
+
+    state_bars = model._pullback_interpolated_moment_response_local_fields(**common)
+    joint_bars = (
+        model._pullback_interpolated_moment_response_local_fields_and_prepared_support_and_drds_flat_prepared(
+            **common
+        )
+    )
+
+    for joint_state_bar, state_bar in zip(joint_bars[1:4], state_bars, strict=True):
+        assert jnp.allclose(joint_state_bar, state_bar)
+    # The scalar joint contract includes both the primitive-mediated drds bar
+    # and the direct transport-moment drds bar.
+    assert jnp.allclose(joint_bars[0], 37.0)
+    assert jnp.allclose(joint_bars[4][0], jnp.asarray([10.0, 11.0]))
 
 
 def test_normalize_solver_config_prefers_transport_solver_section():

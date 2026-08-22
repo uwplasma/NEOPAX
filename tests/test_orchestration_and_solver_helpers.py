@@ -1,6 +1,7 @@
 import dataclasses
 from types import SimpleNamespace
 
+import jax
 import jax.numpy as jnp
 
 import NEOPAX._orchestrator as main_module
@@ -242,6 +243,117 @@ def test_ntx_local_particle_flux_evaluator_passes_bc_constraints(monkeypatch):
     assert jnp.allclose(captured["kwargs"]["density_right_grad_constraint"], jnp.array([0.1, 0.2, 0.3]))
     assert jnp.allclose(captured["kwargs"]["temperature_right_constraint"], jnp.array([5.0, 6.0, 7.0]))
     assert float(captured["er_profile"][1]) == 9.0
+
+
+def test_ntx_database_lagged_face_response_matches_reference_and_finite_difference(monkeypatch):
+    """The database lagged response must be the JVP of its face-flux path.
+
+    This uses a nonlinear stand-in for the database interpolation so that the
+    finite-difference comparison exercises density, temperature, Er, and face
+    gradient dependence rather than passing trivially for a linear flux.
+    """
+    species = _dummy_species()
+    geometry = SimpleNamespace(
+        r_grid_half=jnp.asarray([0.0, 0.25, 0.65, 1.0]),
+        r_grid=jnp.asarray([0.125, 0.45, 0.825]),
+    )
+    state0 = TransportState(
+        density=jnp.asarray(
+            [[1.2, 1.4, 1.7], [0.8, 0.9, 1.1], [0.5, 0.6, 0.75]]
+        ),
+        pressure=jnp.asarray(
+            [[2.4, 3.08, 4.25], [1.04, 1.26, 1.65], [0.45, 0.66, 0.975]]
+        ),
+        Er=jnp.asarray([0.15, 0.22, 0.31]),
+    )
+    direction = TransportState(
+        density=jnp.asarray(
+            [[0.06, -0.03, 0.04], [-0.02, 0.05, -0.01], [0.03, 0.01, -0.02]]
+        ),
+        pressure=jnp.asarray(
+            [[0.08, -0.04, 0.05], [-0.03, 0.06, -0.02], [0.02, 0.03, -0.01]]
+        ),
+        Er=jnp.asarray([0.02, -0.01, 0.03]),
+    )
+
+    def fake_face_database_fluxes(
+        species_arg,
+        energy_grid_arg,
+        geometry_arg,
+        database_arg,
+        er_faces,
+        temperature_faces,
+        density_faces,
+        dndr_faces,
+        dtdr_faces,
+        **kwargs,
+    ):
+        del species_arg, energy_grid_arg, geometry_arg, database_arg, kwargs
+        er_by_species = er_faces[None, :]
+        gamma = (
+            density_faces * er_by_species
+            + 0.3 * dndr_faces
+            + 0.1 * temperature_faces**2
+        )
+        heat = density_faces * temperature_faces**2 + 0.2 * dtdr_faces * er_by_species
+        upar = er_by_species**2 + 0.4 * density_faces * dtdr_faces
+        return None, gamma, heat, upar
+
+    monkeypatch.setattr(
+        flux_models_module,
+        "get_Neoclassical_Fluxes_Faces",
+        fake_face_database_fluxes,
+    )
+    model = flux_models_module.NTXDatabaseTransportModel(
+        species=species,
+        energy_grid="grid",
+        geometry=geometry,
+        database="database",
+    )
+
+    def face_fluxes_from_state(state):
+        face_state = flux_models_module.build_face_transport_state(state, geometry)
+        return model.evaluate_face_fluxes(state, face_state)
+
+    response = model.build_lagged_response(state0)
+    lagged_at_reference = model.evaluate_with_lagged_response(state0, response)
+    direct_at_reference = face_fluxes_from_state(state0)
+    for name in ("Gamma", "Q", "Upar"):
+        assert jnp.allclose(
+            lagged_at_reference[f"{name}_faces"],
+            direct_at_reference[name],
+            rtol=1.0e-6,
+            atol=1.0e-6,
+        )
+
+    epsilon = jnp.asarray(1.0e-3)
+    state_plus = jax.tree_util.tree_map(
+        lambda value, delta: value + epsilon * delta,
+        state0,
+        direction,
+    )
+    state_minus = jax.tree_util.tree_map(
+        lambda value, delta: value - epsilon * delta,
+        state0,
+        direction,
+    )
+    finite_difference = jax.tree_util.tree_map(
+        lambda plus, minus: (plus - minus) / (2.0 * epsilon),
+        face_fluxes_from_state(state_plus),
+        face_fluxes_from_state(state_minus),
+    )
+    lagged_direction = jax.tree_util.tree_map(
+        lambda value, reference: value - reference,
+        model.evaluate_with_lagged_response(state_plus, response),
+        lagged_at_reference,
+    )
+    for name in ("Gamma", "Q", "Upar"):
+        assert jnp.allclose(
+            lagged_direction[f"{name}_faces"] / epsilon,
+            finite_difference[name],
+            rtol=3.0e-3,
+            atol=3.0e-4,
+        )
 
 
 def test_pack_and_unpack_transport_state_arrays_restore_electron_row():

@@ -95,6 +95,8 @@ from ._transport_solvers import (
     _radau_eval_rhs,
     _execute_radau_accepted_step_next_reduced_cotangent_batched_bwd_with_support_call,
     _radau_segment_reduced_cotangent_bwd_batched_with_support_call,
+    _radau_segment_replay_minimal_with_primal_records_call,
+    _radau_segment_reduced_cotangent_bwd_batched_with_support_from_primal_records_call,
     _radau_sanitize_support_delta_bar_tree,
     _radau_zero_support_delta_tree_like,
 )
@@ -120,6 +122,18 @@ def _jax_trace_cache_size(jitted_function) -> int | None:
         return int(cache_size())
     except Exception:
         return None
+
+
+def _logical_tree_nbytes(tree: object) -> int:
+    """Logical array payload size without transferring device buffers."""
+    total = 0
+    for leaf in jax.tree_util.tree_leaves(tree):
+        shape = getattr(leaf, "shape", None)
+        dtype = getattr(leaf, "dtype", None)
+        if shape is None or dtype is None:
+            continue
+        total += int(np.prod(tuple(shape), dtype=np.int64)) * int(np.dtype(dtype).itemsize)
+    return total
 
 
 TransportReverseReport = Mapping[str, object]
@@ -3519,6 +3533,7 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
                 f"name={name} warm_execute_s={time.perf_counter() - execution_start:.3f}",
                 flush=True,
             )
+            return component_result
 
         # This is the exact final realised segment with only the *rebuild*
         # state/support transposes disabled.  It retains segment replay, the
@@ -3541,6 +3556,10 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
             diagnostic_segment_index,
         )
 
+        diagnostic_record_mode = str(
+            getattr(physics_context, "reverse_segment_primal_record_mode", "reconstruct")
+        ).strip().lower()
+
         def _segment_reverse_without_rebuild_transposes(
             segment_bars,
             segment_carry,
@@ -3559,9 +3578,61 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
         print(
             f"{progress_prefix} progress: timing one isolated standard rebuild "
             f"segment={diagnostic_segment_index + 1}/{segment_count} objectives={objective_count} "
+            f"production_record_mode={diagnostic_record_mode} "
             "(diagnostic extra work; values are not added to the reverse result)",
             flush=True,
         )
+        if diagnostic_record_mode == "reuse_segment_primal_record":
+            # The production segment kernel deliberately fuses these two scans.
+            # Separate them only here so their exact record-mode shapes can be
+            # inspected. They are not additive production timings.
+            record_replay_result = _time_rebuild_component(
+                "record_replay_minimal_with_primal_records",
+                lambda segment_carry, segment_arrays: _radau_segment_replay_minimal_with_primal_records_call(
+                    reverse_setup.execution_context,
+                    segment_carry,
+                    segment_arrays,
+                ),
+                diagnostic_carry,
+                diagnostic_segment_arrays,
+            )
+            _, diagnostic_step_start_carries, diagnostic_step_primal_records = record_replay_result
+            record_payload_bytes = _logical_tree_nbytes(diagnostic_step_primal_records)
+            record_slot_count = int(jax.tree_util.tree_leaves(diagnostic_segment_arrays)[0].shape[0])
+            print(
+                f"{progress_prefix} diagnostic: reverse segment primal record "
+                f"segment={diagnostic_segment_index + 1}/{segment_count} "
+                f"logical_payload_bytes={record_payload_bytes} "
+                f"logical_payload_mib={record_payload_bytes / (1024 ** 2):.3f} "
+                f"slots={record_slot_count} "
+                f"logical_bytes_per_slot={record_payload_bytes / max(record_slot_count, 1):.1f} "
+                "(logical array payload only; this is not a peak-memory measurement)",
+                flush=True,
+            )
+            _time_rebuild_component(
+                "record_consuming_reverse_without_rebuild_transposes",
+                lambda segment_bars, step_start_carries, step_primal_records, segment_arrays, support_value:
+                _radau_segment_reduced_cotangent_bwd_batched_with_support_from_primal_records_call(
+                    diagnostic_without_rebuild_context,
+                    cotangent_mode,
+                    segment_bars,
+                    step_start_carries,
+                    step_primal_records,
+                    segment_arrays,
+                    support_value,
+                ),
+                reduced_bars,
+                diagnostic_step_start_carries,
+                diagnostic_step_primal_records,
+                diagnostic_segment_arrays,
+                support_payload,
+            )
+        else:
+            print(
+                f"{progress_prefix} diagnostic: record-specific timings skipped "
+                "because production_record_mode is not reuse_segment_primal_record",
+                flush=True,
+            )
         _time_rebuild_component(
             "segment_reverse_without_rebuild_transposes",
             _segment_reverse_without_rebuild_transposes,

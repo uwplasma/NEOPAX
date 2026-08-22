@@ -327,6 +327,61 @@ def test_flat_support_pullback_omits_inner_timing_selector_by_default():
     assert "support_only_ntx_implicit_pullback" not in observed
 
 
+def test_segment_primal_record_bwd_avoids_second_minimal_attempt_reconstruction(monkeypatch):
+    """The record route must consume the replayed primal, not reconstruct it again.
+
+    This is deliberately a tiny routing test: the full numerical direct-adjoint
+    contract is covered elsewhere, while this protects the exact structural
+    property relevant to reverse cost.  No Radau/NTX solve is performed.
+    """
+
+    observed = {"minimal_attempt_calls": 0, "record_adapter_calls": 0}
+    sentinel_primal = object()
+
+    def _minimal_attempt(*_args):
+        observed["minimal_attempt_calls"] += 1
+        return sentinel_primal
+
+    def _record_adapter(*_args):
+        observed["record_adapter_calls"] += 1
+        return sentinel_primal
+
+    def _from_primal(*args):
+        assert args[5] is sentinel_primal
+        return "reduced-bars", ("support-bars",)
+
+    monkeypatch.setattr(
+        transport_solvers,
+        "_execute_radau_accepted_step_attempt_reverse_minimal",
+        _minimal_attempt,
+    )
+    monkeypatch.setattr(
+        transport_solvers,
+        "_radau_reverse_minimal_attempt_from_segment_primal_record",
+        _record_adapter,
+    )
+    monkeypatch.setattr(
+        transport_solvers,
+        "_execute_radau_accepted_step_next_reduced_cotangent_batched_bwd_with_support_from_primal_result",
+        _from_primal,
+    )
+
+    common_args = (object(), object(), object(), "rebuild", object(), object(), object())
+    reconstruct_result = (
+        transport_solvers._execute_radau_accepted_step_next_reduced_cotangent_batched_bwd_with_support(
+            *common_args
+        )
+    )
+    record_result = (
+        transport_solvers._execute_radau_accepted_step_next_reduced_cotangent_batched_bwd_with_support_from_segment_primal_record(
+            object(), object(), object(), "rebuild", object(), object(), object(), object()
+        )
+    )
+
+    assert reconstruct_result == record_result == ("reduced-bars", ("support-bars",))
+    assert observed == {"minimal_attempt_calls": 1, "record_adapter_calls": 1}
+
+
 def test_radau_controller_keeps_the_moderate_cap_on_an_easy_accepted_step():
     _, info = _apply_radau_lean_timestep_controller(**_radau_controller_arguments(newton_iter_count=3))
     assert float(info.growth) == pytest.approx(1.5)

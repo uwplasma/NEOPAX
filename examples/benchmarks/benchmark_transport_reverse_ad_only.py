@@ -5483,7 +5483,10 @@ def main() -> None:
         help=(
             "Diagnostic-only: separately JIT and time one representative rebuild "
             "state transpose and support transpose with device synchronization. "
-            "This adds extra work and is not a normal reverse timing."
+            "With --reverse-segment-primal-record-mode reuse_segment_primal_record, "
+            "also reports the logical record payload and separately times record replay "
+            "and record-consuming reverse without rebuild transposes. This adds extra "
+            "work and is not a normal reverse timing."
         ),
     )
     parser.add_argument(

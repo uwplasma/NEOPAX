@@ -7099,6 +7099,136 @@ def _radau_segment_reduced_cotangent_bwd_batched_with_support_call(
     return segment_start_reduced_bars, segment_support_bar_leaves
 
 
+@partial(jax.jit, static_argnums=(0,), inline=False)
+def _radau_segment_replay_minimal_with_primal_records_call(
+    execution_context: _RadauSolveExecutionContext,
+    segment_start_carry: _RadauAcceptedStepCarry,
+    segment_arrays,
+) -> tuple[_RadauAcceptedStepCarry, _RadauAcceptedStepCarry, _RadauAcceptedStepSegmentPrimalRecord]:
+    """Diagnostic boundary for the segment-local record-producing replay.
+
+    This is deliberately separate from the production fused segment kernel.
+    It exists only to measure the exact minimal replay which creates the
+    bounded records consumed by the record-mode reverse path.
+    """
+
+    def _collect(carry, slot_xs):
+        next_carry, record = _radau_replay_realized_accepted_slot_reverse_minimal_with_primal_record(
+            execution_context,
+            carry,
+            *slot_xs,
+        )
+        return next_carry, (carry, record)
+
+    final_carry, (step_start_carries, step_primal_records) = jax.lax.scan(
+        _collect,
+        segment_start_carry,
+        segment_arrays,
+    )
+    return final_carry, step_start_carries, step_primal_records
+
+
+@partial(jax.jit, static_argnums=(0, 1), inline=False)
+def _radau_segment_reduced_cotangent_bwd_batched_with_support_from_primal_records_call(
+    execution_context: _RadauSolveExecutionContext,
+    cotangent_mode: str,
+    segment_reduced_bars: _RadauAcceptedStepReducedCotangent,
+    step_start_carries: _RadauAcceptedStepCarry,
+    step_primal_records: _RadauAcceptedStepSegmentPrimalRecord,
+    segment_arrays,
+    support,
+) -> tuple[_RadauAcceptedStepReducedCotangent, tuple[Any, ...]]:
+    """Diagnostic record-consuming reverse boundary.
+
+    The production kernel intentionally fuses replay and reverse.  This
+    diagnostic-only call takes already-created records so its time can be
+    reported separately without changing production execution.
+    """
+    mode = str(cotangent_mode).strip().lower()
+    zero_step_bwd = mode in {"zero_step_bwd", "step_bwd_zero", "zero_accepted_step_bwd"}
+    force_reuse_bwd = mode in {"force_reuse_bwd", "reuse_bwd_only", "reuse_only_bwd"}
+    force_rebuild_bwd = mode in {"force_rebuild_bwd", "rebuild_bwd_only", "rebuild_only_bwd"}
+    step_bwd_mode = str(
+        getattr(execution_context.physics_context, "reverse_step_bwd_mode", "reduced_cotangent")
+    ).strip().lower()
+    use_step_call_boundary = step_bwd_mode in {
+        "reduced_cotangent_call_boundary",
+        "reduced_cotangent_step_call",
+        "call_boundary",
+    }
+    zero_support_leaves = tuple(jax.tree_util.tree_leaves(_radau_zero_support_delta_tree_like(support)))
+    objective_count = jnp.asarray(segment_reduced_bars.y).shape[0]
+    zero_support_bar_leaves = tuple(
+        jnp.broadcast_to(jnp.asarray(leaf)[None, ...], (objective_count,) + jnp.asarray(leaf).shape)
+        for leaf in zero_support_leaves
+    )
+
+    def _slot_bwd(carry, slot_xs):
+        slot_reduced_bars, support_bar_leaves = carry
+        step_start_carry, primal_record, slot_arrays = slot_xs
+        if zero_step_bwd:
+            return (slot_reduced_bars, support_bar_leaves), None
+        active, dt_value, *_ = slot_arrays
+
+        def _do_step_bwd(_):
+            residual_carry = _radau_carry_with_forward_only_jvp_fields(
+                dataclasses.replace(step_start_carry, dt=dt_value)
+            )
+
+            def _run(branch):
+                if use_step_call_boundary:
+                    return _execute_radau_accepted_step_next_reduced_cotangent_batched_bwd_with_support_from_segment_primal_record_call(
+                        execution_context.kernel_context,
+                        execution_context.physics_context,
+                        execution_context.attempt_context,
+                        branch,
+                        residual_carry,
+                        primal_record,
+                        slot_reduced_bars,
+                        support,
+                    )
+                return _execute_radau_accepted_step_next_reduced_cotangent_batched_bwd_with_support_from_segment_primal_record(
+                    execution_context.kernel_context,
+                    execution_context.physics_context,
+                    execution_context.attempt_context,
+                    branch,
+                    residual_carry,
+                    primal_record,
+                    slot_reduced_bars,
+                    support,
+                )
+
+            if force_reuse_bwd:
+                return _run("reuse")
+            if force_rebuild_bwd:
+                return _run("rebuild")
+            return jax.lax.cond(
+                residual_carry.lagged_response_valid,
+                lambda _: _run("reuse"),
+                lambda _: _run("rebuild"),
+                operand=None,
+            )
+
+        def _skip(_):
+            return slot_reduced_bars, zero_support_bar_leaves
+
+        step_reduced_bars, step_support_bar_leaves = jax.lax.cond(
+            active, _do_step_bwd, _skip, operand=None
+        )
+        return (
+            step_reduced_bars,
+            tuple(a + b for a, b in zip(support_bar_leaves, step_support_bar_leaves)),
+        ), None
+
+    (segment_start_reduced_bars, segment_support_bar_leaves), _ = jax.lax.scan(
+        _slot_bwd,
+        (segment_reduced_bars, zero_support_bar_leaves),
+        (step_start_carries, step_primal_records, segment_arrays),
+        reverse=True,
+    )
+    return segment_start_reduced_bars, segment_support_bar_leaves
+
+
 @partial(jax.jit, static_argnums=(0, 1, 2, 3), inline=False)
 def _execute_radau_accepted_step_next_carry_vjp_lagged_branch_bwd_call(
     kernel_context: _RadauAcceptedStepKernelContext,
