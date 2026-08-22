@@ -8958,6 +8958,9 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         factorized_ntx_two_directional_prepared_vjp = bool(
             kwargs.pop("factorized_ntx_two_directional_prepared_vjp", False)
         )
+        geometry_only_prepared_pullback = bool(
+            kwargs.pop("geometry_only_prepared_pullback", False)
+        )
         reverse_rebuild_inner_timing_component = str(
             kwargs.pop("reverse_rebuild_inner_timing_component", "full")
         ).strip().lower()
@@ -9002,6 +9005,17 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                 "factorized_ntx_two_directional_prepared_vjp requires "
                 "reuse_local_vjp_primal_anchor_response=True."
             )
+        if geometry_only_prepared_pullback:
+            if not reuse_local_vjp_primal_anchor_response:
+                raise ValueError(
+                    "geometry_only_prepared_pullback requires "
+                    "reuse_local_vjp_primal_anchor_response=True."
+                )
+            if support_only_ntx_implicit_pullback or factorized_ntx_two_directional_prepared_vjp:
+                raise ValueError(
+                    "geometry_only_prepared_pullback is a standalone generic-VJP "
+                    "mode and cannot be combined with an NTX custom support rule."
+                )
         if support_only_ntx_implicit_pullback:
             if not isinstance(face_response_bar, NTXInterpolatedMomentResponse):
                 raise NotImplementedError(
@@ -9180,15 +9194,80 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                         )
                     )(species_indices)
 
-                with _reverse_rebuild_profile_scope(
-                    reverse_segment_profile_annotations,
-                    "reverse_segment/rebuild_support/local_ntx_vjp_primal",
-                ):
-                    primal_response, pullback = jax.vjp(
-                        _response_from_support_delta,
-                        prepared_delta0,
-                        drds_delta0,
-                    )
+                if geometry_only_prepared_pullback:
+                    # ``d_theta`` and ``d_zeta`` are generated solely from the
+                    # fixed GridSpec.  The runtime payload changes only the
+                    # sampled GeometryOnGrid fields, so making the full
+                    # PreparedMonoenergeticSystem an AD input wastes a dense
+                    # operator transpose whose upstream tangent is exactly
+                    # zero. Keep those operators (and the source surface) in
+                    # the closure and expose only geometry plus ``drds``.
+                    geometry_delta0 = _float_delta_tree_like(prepared.geometry)
+
+                    def _response_from_geometry_delta(geometry_delta, drds_delta):
+                        prepared_value = dataclasses.replace(
+                            prepared,
+                            geometry=_add_float_delta_tree(
+                                prepared.geometry,
+                                geometry_delta,
+                            ),
+                        )
+                        drds_local = drds_value + drds_delta
+                        if interpolated:
+                            return jax.vmap(
+                                lambda species_index: self._build_interpolated_moment_response_local(
+                                    prepared_value,
+                                    drds_value=drds_local,
+                                    species_index=species_index,
+                                    er_value=er_value,
+                                    temperature_local=temperature_local,
+                                    density_local=density_local,
+                                    vthermal_local=vthermal_local,
+                                    collisionality_kind=collisionality_kind,
+                                )
+                            )(species_indices)
+                        return jax.vmap(
+                            lambda species_index: self._build_coefficient_response_local(
+                                prepared_value,
+                                drds_value=drds_local,
+                                species_index=species_index,
+                                er_value=er_value,
+                                temperature_local=temperature_local,
+                                density_local=density_local,
+                                vthermal_local=vthermal_local,
+                                collisionality_kind=collisionality_kind,
+                            )
+                        )(species_indices)
+
+                    with _reverse_rebuild_profile_scope(
+                        reverse_segment_profile_annotations,
+                        "reverse_segment/rebuild_support/local_ntx_vjp_primal",
+                    ):
+                        primal_response, geometry_pullback = jax.vjp(
+                            _response_from_geometry_delta,
+                            geometry_delta0,
+                            drds_delta0,
+                        )
+
+                    def pullback(local_bars):
+                        geometry_bar, drds_bar = geometry_pullback(local_bars)
+                        return (
+                            dataclasses.replace(
+                                _float_delta_tree_like(prepared),
+                                geometry=geometry_bar,
+                            ),
+                            drds_bar,
+                        )
+                else:
+                    with _reverse_rebuild_profile_scope(
+                        reverse_segment_profile_annotations,
+                        "reverse_segment/rebuild_support/local_ntx_vjp_primal",
+                    ):
+                        primal_response, pullback = jax.vjp(
+                            _response_from_support_delta,
+                            prepared_delta0,
+                            drds_delta0,
+                        )
                 if reverse_rebuild_inner_timing_component == "local_ntx_vjp_primal":
                     # Diagnostic-only: retain the exact local VJP primal but
                     # skip its transpose and return shape-correct zero support
