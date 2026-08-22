@@ -6735,6 +6735,7 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         reference_epsi_hat,
         vth_a,
         field_bars,
+        geometry_implicit_ntx_two_directional: bool = False,
     ):
         """Exact prepared/``drds`` pullback without local state primitive bars.
 
@@ -6743,7 +6744,10 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         The rebuild-support lane holds its local NTX case fixed, so requesting
         ``nu_hat``, ``epsi_hat``, and ``vth_a`` cotangents there is unnecessary.
         The NTX helper retains the same implicit adjoint and prepared-support
-        algebra while omitting those case/profile contractions.
+        algebra while omitting those case/profile contractions.  The optional
+        geometry-only branch is a separate experimental representation: it
+        requests only ``GeometryOnGrid`` bars from NTX and restores a complete
+        prepared-tree bar with fixed leaves zeroed by NEOPAX.
         """
 
         ntx = _import_ntx()
@@ -6836,7 +6840,12 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                     ),
                 )
 
-            return ntx.solve_prepared_coefficient_vector_lowdot_two_pullbacks_prepared_support_only_and_aux(
+            helper = (
+                ntx.solve_prepared_coefficient_vector_lowdot_two_pullbacks_geometry_support_only_and_aux
+                if geometry_implicit_ntx_two_directional
+                else ntx.solve_prepared_coefficient_vector_lowdot_two_pullbacks_prepared_support_only_and_aux
+            )
+            return helper(
                 prepared,
                 ntx.MonoenergeticCase(nu_hat=nu_hat_value, epsi_hat=epsi_hat_value),
                 ntx.MonoenergeticCase(nu_hat=jnp.zeros_like(nu_hat_value), epsi_hat=epsi_dot),
@@ -6862,16 +6871,32 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             second_coefficient_dot_scan,
         ) = auxiliary
         base_drds_bar, _first_base_drds_bar, first_drds_bar, second_base_drds_bar, second_drds_bar = direct_drds_bars
-        prepared_bar = jax.tree_util.tree_map(
-            lambda values: jnp.sum(values, axis=0),
-            _sum_float_delta_bar_trees(
-                prepared,
-                base_geometry_bar,
-                first_geometry_bar,
-                second_base_geometry_bar,
-                second_geometry_bar,
-            ),
-        )
+        if geometry_implicit_ntx_two_directional:
+            geometry_bar = jax.tree_util.tree_map(
+                lambda values: jnp.sum(values, axis=0),
+                _sum_float_delta_bar_trees(
+                    prepared.geometry,
+                    base_geometry_bar,
+                    first_geometry_bar,
+                    second_base_geometry_bar,
+                    second_geometry_bar,
+                ),
+            )
+            prepared_bar = dataclasses.replace(
+                _float_delta_tree_like(prepared),
+                geometry=geometry_bar,
+            )
+        else:
+            prepared_bar = jax.tree_util.tree_map(
+                lambda values: jnp.sum(values, axis=0),
+                _sum_float_delta_bar_trees(
+                    prepared,
+                    base_geometry_bar,
+                    first_geometry_bar,
+                    second_base_geometry_bar,
+                    second_geometry_bar,
+                ),
+            )
         direct_drds_bar = jnp.sum(
             base_drds_bar + first_drds_bar + second_base_drds_bar + second_drds_bar,
             axis=0,
@@ -8961,6 +8986,9 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         geometry_only_prepared_pullback = bool(
             kwargs.pop("geometry_only_prepared_pullback", False)
         )
+        geometry_implicit_ntx_two_directional_pullback = bool(
+            kwargs.pop("geometry_implicit_ntx_two_directional_pullback", False)
+        )
         reverse_rebuild_inner_timing_component = str(
             kwargs.pop("reverse_rebuild_inner_timing_component", "full")
         ).strip().lower()
@@ -9016,27 +9044,45 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                     "geometry_only_prepared_pullback is a standalone generic-VJP "
                     "mode and cannot be combined with an NTX custom support rule."
                 )
-        if support_only_ntx_implicit_pullback:
+        if geometry_implicit_ntx_two_directional_pullback:
+            if not reuse_local_vjp_primal_anchor_response:
+                raise ValueError(
+                    "geometry_implicit_ntx_two_directional_pullback requires "
+                    "reuse_local_vjp_primal_anchor_response=True."
+                )
+            if (
+                support_only_ntx_implicit_pullback
+                or factorized_ntx_two_directional_prepared_vjp
+                or geometry_only_prepared_pullback
+            ):
+                raise ValueError(
+                    "geometry_implicit_ntx_two_directional_pullback is a standalone "
+                    "NTX custom support rule."
+                )
+        if support_only_ntx_implicit_pullback or geometry_implicit_ntx_two_directional_pullback:
             if not isinstance(face_response_bar, NTXInterpolatedMomentResponse):
                 raise NotImplementedError(
-                    "support_only_ntx_implicit_pullback requires an "
+                    "geometry/support-only NTX implicit pullback requires an "
                     "interpolated NTX face response."
                 )
             if center_response_bar is not None:
                 raise NotImplementedError(
-                    "support_only_ntx_implicit_pullback requires center_response=None."
+                    "geometry/support-only NTX implicit pullback requires center_response=None."
                 )
             ntx = _import_ntx()
             if not callable(
                 getattr(
                     ntx,
-                    "solve_prepared_coefficient_vector_lowdot_two_pullbacks_prepared_support_only_and_aux",
+                    (
+                        "solve_prepared_coefficient_vector_lowdot_two_pullbacks_geometry_support_only_and_aux"
+                        if geometry_implicit_ntx_two_directional_pullback
+                        else "solve_prepared_coefficient_vector_lowdot_two_pullbacks_prepared_support_only_and_aux"
+                    ),
                     None,
                 )
             ):
                 raise RuntimeError(
-                    "support_only_ntx_implicit_pullback requires the current NTX "
-                    "prepared-support-only helper."
+                    "The selected NTX implicit support pullback requires the current NTX helper."
                 )
         if face_response_bar is not None:
             face_channels_bar = _float_delta_tree_like(support.face_channels)
@@ -9091,10 +9137,10 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                     axis=1,
                     keepdims=False,
                 )
-                if support_only_ntx_implicit_pullback:
+                if support_only_ntx_implicit_pullback or geometry_implicit_ntx_two_directional_pullback:
                     if not interpolated:
                         raise NotImplementedError(
-                            "support_only_ntx_implicit_pullback currently requires "
+                            "geometry/support-only NTX implicit pullback currently requires "
                             "the interpolated NTX face response."
                         )
                     prepared_treedef = jax.tree_util.tree_structure(prepared)
@@ -9119,6 +9165,9 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                             reference_epsi_hat=reference_epsi_hat,
                             vth_a=vth_a,
                             field_bars=species_field_bars,
+                            geometry_implicit_ntx_two_directional=(
+                                geometry_implicit_ntx_two_directional_pullback
+                            ),
                             )
                         )
                         # This function is the direct output of a species

@@ -393,3 +393,98 @@ its graph size; it does not claim to remove the required NTX response work.
 A small NTX equivalence test compares the grouped geometry-only rule with a
 full VJP holding other prepared leaves fixed. The selector must be compared
 with the cache-disabled current-best benchmark before becoming preferred.
+
+### Follow-up candidate: geometry-only *implicit* support pullback
+
+The fixed-grid generic-VJP selector above was measured and rejected: it did
+not improve the current-best path.  It remains isolated and is not the next
+candidate.
+
+There is a distinct, untested route already available in NTX:
+`solve_prepared_coefficient_vector_lowdot_two_pullbacks_with_geometry_and_aux`.
+It uses NTX's explicit grouped implicit-adjoint algebra, but returns only
+`GeometryOnGrid` bars rather than complete `PreparedMonoenergeticSystem` bars.
+For the runtime support builder this is sufficient: the remaining prepared
+leaves (`surface`, `grid`, `d_theta`, and `d_zeta`) are fixed by the configured
+grid and have zero runtime-geometry cotangent.  NEOPAX can reconstruct the
+usual prepared-tree bar with those leaves set to zero.
+
+This differs from the rejected `prepared_support_only` and factorized modes:
+those called the same grouped core with `include_prepared=True`, forcing
+complete prepared and directional-prepared gradient construction.  The
+geometry helper takes the `include_geometry=True` path, using
+`_geometry_gradient_from_adjoint` and
+`_directional_geometry_gradient_from_adjoint` instead.  It retains the exact
+base, `d/dEr`, and `d/dlog(nu*)` implicit adjoints—so it does not promise to
+remove those mathematically required solves—but avoids building cotangents for
+the fixed prepared operator leaves.
+
+An in-memory NTX test now proves that this helper's five geometry bars are the
+exact geometry projection of the full prepared helper, and that its returned
+primal coefficient/tangent auxiliary is identical.  No production NEOPAX
+selector has been added yet.
+
+If implemented, it must be an opt-in mode (suggested name:
+`separate_reuse_local_vjp_primal_geometry_implicit_ntx_two_directional`) and
+must preserve the existing scalar objective lane and outer device `vmap`.  It
+must first receive a NEOPAX mock/full-output equivalence test, then one
+cache-disabled benchmark.  Reject it if it regresses first-segment compilation
+or warm support-transpose timing relative to
+`separate_reuse_local_vjp_primal`.
+
+#### Implementation plan for the geometry-only implicit candidate
+
+1. **Keep the baseline dispatch unchanged.** Add a new rebuild selector only;
+   `separate_reuse_local_vjp_primal` remains byte-for-byte on its existing
+   generic-VJP branch.  Validate that the new selector requires the current
+   interpolated face response, no centre-response cotangent, and
+   `reuse_local_vjp_primal_anchor_response=True`, exactly as the existing
+   support-only implicit branch does.
+2. **Add a geometry-only support adapter in NEOPAX.** Mirror
+   `_pullback_interpolated_moment_prepared_support_and_drds_only`, retaining
+   its coefficient bars, explicit direct-`drds` terms, energy `lax.map`, and
+   returned primal response.  Replace only the NTX call with
+   `solve_prepared_coefficient_vector_lowdot_two_pullbacks_with_geometry_and_aux`.
+   Sum its base/first/second geometry bars and construct the required prepared
+   bar as `zero_like(prepared)` with that summed value in `.geometry`.
+3. **Preserve device batching.** The geometry adapter returns numeric leaves
+   before the existing species `vmap`, using the current sanitisation/rebuild
+   convention.  It does not introduce a Python loop, a `lax.map` over
+   objectives, an objective RHS axis, or a retained factor/timestep payload.
+4. **Add proof tests before exposing the CLI.** The completed NTX test proves
+   geometry projection and auxiliary equality.  Add NEOPAX tests for (a) the
+   reconstructed prepared bar having zero fixed leaves, (b) equality of the
+   complete local response/pullback against the current full-prepared helper
+   on a small real prepared NTX system, and (c) arbitrary batched objective
+   leading dimensions without a shape or species-vmap change.
+5. **Wire the selector and verify one benchmark.** Add it to static setup,
+   benchmark choices, and progress output.  Run the current cache-disabled
+   16-step record-mode command with only the new selector substituted.  Compare
+   derivatives, first-segment compile time, warm support-transpose timing, and
+   total sweep.  Reject the selector unless it improves the support transpose
+   without a material compile regression.
+
+#### Implementation and proof status
+
+The initial use of NTX's public geometry helper was rejected during testing:
+that helper returns case/profile bars as well as geometry bars, so it would
+perform unused contractions.  Instead NTX now has a new isolated public helper
+`solve_prepared_coefficient_vector_lowdot_two_pullbacks_geometry_support_only_and_aux`.
+It invokes the existing grouped core with `include_geometry=True` and
+`support_only=True`; it returns exactly the five geometry bars plus auxiliary.
+
+While adding it, the exact comparison found that the existing support-only
+branch selected `_directional_prepared_gradient_from_adjoint` unconditionally.
+The branch now selects `_directional_geometry_gradient_from_adjoint` when
+`include_geometry=True`.  This does not alter the established prepared-only
+support helper.  Focused in-memory tests pass:
+
+* NTX: three geometry/full and geometry-support-only equivalence tests;
+* NEOPAX: the complete local support adapter agrees with the prepared-support
+  path for active geometry bars, direct `drds` bar, and reused primal response.
+  A second NEOPAX test applies the adapter to two objective cotangent lanes with
+  `jax.vmap` after the production static-leaf sanitisation; it preserves the
+  leading objective axis without a host or serial-objective path.
+
+The new NEOPAX selector is wired but remains unbenchmarked and opt-in.  No
+claim of timing improvement is made until the one cache-disabled comparison.

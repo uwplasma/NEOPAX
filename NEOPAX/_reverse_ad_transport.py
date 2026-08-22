@@ -2618,6 +2618,7 @@ def prepare_reverse_static_setup(
         "separate",
         "separate_reuse_local_vjp_primal",
         "separate_reuse_local_vjp_primal_geometry_only_prepared",
+        "separate_reuse_local_vjp_primal_geometry_implicit_ntx_two_directional",
         "separate_reuse_local_vjp_primal_support_only_ntx_implicit",
         "separate_reuse_local_vjp_primal_factorized_ntx_two_directional",
         "ntx_batched_interpolated_faces",
@@ -2630,6 +2631,7 @@ def prepare_reverse_static_setup(
             "reverse_rebuild_support_pullback_mode must be one of "
             "{'separate', 'separate_reuse_local_vjp_primal', "
             "'separate_reuse_local_vjp_primal_geometry_only_prepared', "
+            "'separate_reuse_local_vjp_primal_geometry_implicit_ntx_two_directional', "
             "'separate_reuse_local_vjp_primal_support_only_ntx_implicit', "
             "'separate_reuse_local_vjp_primal_factorized_ntx_two_directional', "
             "'ntx_batched_interpolated_faces', "
@@ -3444,6 +3446,7 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
             "separate",
             "separate_reuse_local_vjp_primal",
             "separate_reuse_local_vjp_primal_geometry_only_prepared",
+            "separate_reuse_local_vjp_primal_geometry_implicit_ntx_two_directional",
         }:
             raise ValueError(
                 "reverse_rebuild_component_timing currently requires "
@@ -3507,11 +3510,16 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
                         in {
                             "separate_reuse_local_vjp_primal",
                             "separate_reuse_local_vjp_primal_geometry_only_prepared",
+                            "separate_reuse_local_vjp_primal_geometry_implicit_ntx_two_directional",
                         }
                     ),
                     geometry_only_prepared_pullback=(
                         rebuild_mode
                         == "separate_reuse_local_vjp_primal_geometry_only_prepared"
+                    ),
+                    geometry_implicit_ntx_two_directional_pullback=(
+                        rebuild_mode
+                        == "separate_reuse_local_vjp_primal_geometry_implicit_ntx_two_directional"
                     ),
                     reverse_rebuild_inner_timing_component=inner_timing_component,
                 )
@@ -3670,6 +3678,7 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
         if rebuild_mode in {
             "separate_reuse_local_vjp_primal",
             "separate_reuse_local_vjp_primal_geometry_only_prepared",
+            "separate_reuse_local_vjp_primal_geometry_implicit_ntx_two_directional",
         }:
             # These two launches deliberately introduce diagnostic-only XLA
             # boundaries.  They use the exact production shapes and device

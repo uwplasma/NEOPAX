@@ -5423,6 +5423,7 @@ def main() -> None:
             "separate",
             "separate_reuse_local_vjp_primal",
             "separate_reuse_local_vjp_primal_geometry_only_prepared",
+            "separate_reuse_local_vjp_primal_geometry_implicit_ntx_two_directional",
             "separate_reuse_local_vjp_primal_support_only_ntx_implicit",
             "separate_reuse_local_vjp_primal_factorized_ntx_two_directional",
             "ntx_batched_interpolated_faces",
@@ -5442,6 +5443,10 @@ def main() -> None:
             "runtime-grid-fixed variant of that mode: it differentiates the local "
             "NTX response with respect to GeometryOnGrid and drds only, keeping "
             "the fixed d_theta/d_zeta operators outside the VJP. "
+            "'separate_reuse_local_vjp_primal_geometry_implicit_ntx_two_directional' "
+            "is an isolated exact NTX implicit-adjoint variant returning only "
+            "GeometryOnGrid support bars while retaining the same local primal "
+            "response reuse. "
             "'separate_reuse_local_vjp_primal_support_only_ntx_implicit' is an "
             "isolated exact experimental variant that retains that anchor-primal "
             "reuse while omitting NTX case/profile bars unused by the rebuild "

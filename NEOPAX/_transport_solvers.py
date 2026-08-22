@@ -1444,6 +1444,7 @@ def _flat_rhs_build_support_pullback_factory(
         support_only_ntx_implicit_pullback: bool = False,
         factorized_ntx_two_directional_prepared_vjp: bool = False,
         geometry_only_prepared_pullback: bool = False,
+        geometry_implicit_ntx_two_directional_pullback: bool = False,
         reverse_rebuild_inner_timing_component: str = "full",
     ):
         projected_flat_y = _project_flat_state_if_needed(
@@ -1471,6 +1472,8 @@ def _flat_rhs_build_support_pullback_factory(
             pullback_kwargs["factorized_ntx_two_directional_prepared_vjp"] = True
         if geometry_only_prepared_pullback:
             pullback_kwargs["geometry_only_prepared_pullback"] = True
+        if geometry_implicit_ntx_two_directional_pullback:
+            pullback_kwargs["geometry_implicit_ntx_two_directional_pullback"] = True
         # Keep the ordinary support-pullback hook contract byte-for-byte
         # unchanged.  The selector exists only for the opt-in component timer.
         if str(reverse_rebuild_inner_timing_component).strip().lower() != "full":
@@ -5992,6 +5995,7 @@ def _execute_radau_accepted_step_next_reduced_cotangent_batched_bwd_with_support
                 "separate_reuse_local_vjp_primal_support_only_ntx_implicit",
                 "separate_reuse_local_vjp_primal_factorized_ntx_two_directional",
                 "separate_reuse_local_vjp_primal_geometry_only_prepared",
+                "separate_reuse_local_vjp_primal_geometry_implicit_ntx_two_directional",
             }:
 
                 def _rebuild_support_pullback(lagged_cache_bar):
@@ -6020,6 +6024,7 @@ def _execute_radau_accepted_step_next_reduced_cotangent_batched_bwd_with_support
                                                 "separate_reuse_local_vjp_primal_support_only_ntx_implicit",
                                                 "separate_reuse_local_vjp_primal_factorized_ntx_two_directional",
                                                 "separate_reuse_local_vjp_primal_geometry_only_prepared",
+                                                "separate_reuse_local_vjp_primal_geometry_implicit_ntx_two_directional",
                                             }
                                         ),
                                         support_only_ntx_implicit_pullback=(
@@ -6033,6 +6038,10 @@ def _execute_radau_accepted_step_next_reduced_cotangent_batched_bwd_with_support
                                         geometry_only_prepared_pullback=(
                                             rebuild_support_pullback_mode
                                             == "separate_reuse_local_vjp_primal_geometry_only_prepared"
+                                        ),
+                                        geometry_implicit_ntx_two_directional_pullback=(
+                                            rebuild_support_pullback_mode
+                                            == "separate_reuse_local_vjp_primal_geometry_implicit_ntx_two_directional"
                                         ),
                                     ),
                                 )
