@@ -498,6 +498,22 @@ def test_native_multi_rhs_support_retains_local_drds_case_chain():
                 "Native matrix-RHS prepared-support low-dot mismatch in "
                 f"{component_name}."
             ) from error
+        native_component_epsi_hat = _native_component_case_bars[1]
+        native_component_drds = (
+            _native_component_direct_drds
+            + jnp.sum(native_component_epsi_hat * epsi_per_drds, axis=1)
+        )
+        try:
+            _assert_float_tree_allclose(
+                native_component_drds[0],
+                _expected_component_drds,
+                rtol=5e-9,
+            )
+        except AssertionError as error:
+            raise AssertionError(
+                "Native matrix-RHS drds support-chain mismatch in "
+                f"{component_name}."
+            ) from error
 
     for rhs_index, field_bars in enumerate(scalar_field_bars):
         _response_value, pullback = jax.vjp(_response, prepared, drds)
