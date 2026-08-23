@@ -7026,6 +7026,7 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         field_bars,
         native_factorized_ntx_rhs: bool = False,
         return_case_bars: bool = False,
+        include_second_direction_base_prepared: bool = True,
     ):
         """Batched exact prepared/``drds`` transpose for one local species.
 
@@ -7215,14 +7216,31 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                 direct_drds_bars,
                 primal_outputs,
             ) = mapped_outputs
-        prepared_bars = jax.tree_util.tree_map(
-            lambda values: jnp.sum(values, axis=0),
-            _sum_float_delta_bar_trees(
-                prepared,
+        # ``second_base_prepared_bars`` is the extra base pullback required
+        # for the *nu_hat case bar* of d/dlog(nu_hat), because that tangent is
+        # itself nu_hat.  It is not a prepared-system derivative: the local
+        # prepared payload holds nu_hat fixed.  Keep the historical default
+        # for existing private callers, while the native exactness adapter
+        # explicitly excludes it.
+        prepared_bar_terms = (
+            (
+                base_prepared_bars,
+                first_prepared_bars,
+                second_prepared_bars,
+            )
+            if not include_second_direction_base_prepared
+            else (
                 base_prepared_bars,
                 first_prepared_bars,
                 second_base_prepared_bars,
                 second_prepared_bars,
+            )
+        )
+        prepared_bars = jax.tree_util.tree_map(
+            lambda values: jnp.sum(values, axis=0),
+            _sum_float_delta_bar_trees(
+                prepared,
+                *prepared_bar_terms,
             ),
         )
         (
@@ -7337,6 +7355,7 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             field_bars=field_bars,
             native_factorized_ntx_rhs=True,
             return_case_bars=return_case_bars,
+            include_second_direction_base_prepared=False,
         )
 
     def _pullback_local_scan_inputs_from_primitives(

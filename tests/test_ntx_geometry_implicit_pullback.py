@@ -448,10 +448,11 @@ def test_native_multi_rhs_support_retains_local_drds_case_chain():
             prepared,
             drds_value=drds,
             reference_nu_hat=reference_nu_hat,
-            reference_epsi_hat=reference_epsi_hat,
-            vth_a=vth_a,
-            field_bars=component_batch,
-        )
+                reference_epsi_hat=reference_epsi_hat,
+                vth_a=vth_a,
+                field_bars=component_batch,
+                include_second_direction_base_prepared=False,
+            )
         (
             native_component_prepared,
             _native_component_direct_drds,
