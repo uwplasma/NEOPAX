@@ -6992,6 +6992,7 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         reference_epsi_hat,
         vth_a,
         field_bars,
+        native_factorized_ntx_rhs: bool = False,
     ):
         """Batched exact prepared/``drds`` transpose for one local species.
 
@@ -7007,15 +7008,21 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         """
 
         ntx = _import_ntx()
+        helper_name = (
+            "solve_prepared_coefficient_vector_lowdot_two_pullbacks_"
+            "prepared_support_only_native_multi_rhs_and_aux"
+            if native_factorized_ntx_rhs
+            else "solve_prepared_coefficient_vector_lowdot_two_pullbacks_"
+            "prepared_support_only_multi_rhs_and_aux"
+        )
         multi_rhs_helper = getattr(
             ntx,
-            "solve_prepared_coefficient_vector_lowdot_two_pullbacks_"
-            "prepared_support_only_multi_rhs_and_aux",
+            helper_name,
             None,
         )
         if not callable(multi_rhs_helper):
             raise RuntimeError(
-                "The multi-RHS prepared-support pullback requires the current NTX helper."
+                "The selected multi-RHS prepared-support pullback requires the current NTX helper."
             )
         (
             _reference_log_nu_star_bars,
@@ -7173,6 +7180,33 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             )[1],
         )
         return prepared_bars, direct_drds_bars, primal_response
+
+    def _pullback_interpolated_moment_prepared_support_and_drds_only_native_multi_rhs(
+        self,
+        prepared,
+        *,
+        drds_value,
+        reference_nu_hat,
+        reference_epsi_hat,
+        vth_a,
+        field_bars,
+    ):
+        """Private adapter for NTX's native matrix-RHS support helper.
+
+        This is deliberately not a reverse-dispatch hook.  It exists solely
+        for the exact small-model comparison before any experimental selector
+        is considered.
+        """
+
+        return self._pullback_interpolated_moment_prepared_support_and_drds_only_multi_rhs(
+            prepared,
+            drds_value=drds_value,
+            reference_nu_hat=reference_nu_hat,
+            reference_epsi_hat=reference_epsi_hat,
+            vth_a=vth_a,
+            field_bars=field_bars,
+            native_factorized_ntx_rhs=True,
+        )
 
     def _pullback_local_scan_inputs_from_primitives(
         self,

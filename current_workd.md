@@ -45,6 +45,65 @@ segments.
    only after those tests pass; reject the selector if either compilation or
    warm support-transpose time regresses.
 
+### Native matrix-RHS prerequisite (step 1, implemented; unselected)
+
+The former ``multi_rhs_shared_primal`` helper was not a native matrix-RHS
+implementation: after sharing the primal residual, it used ``jax.vmap`` to
+re-enter the complete scalar low-dot support pullback once per objective.
+That selector is rejected and remains unchanged.
+
+Step 1 of the replacement is now an NTX-private factorized primitive,
+``_solve_factorized_multi_rhs_directional_adjoint_field_pair``.  It accepts
+field adjoints with axes ``(mode, unknown, rhs, physical_direction)``, packs
+only ``rhs * physical_direction`` as trailing columns of the one
+block-tridiagonal transpose solve, and restores the axes immediately.  It
+contains no objective loop, ``lax.map``, or local factor retention.  A tiny
+prepared-system test compares it with the explicit packed-column reference;
+the test has been added but is intentionally not run in the local workspace.
+
+The next implementation step is to route the base and directional prepared
+support adjoint fields through this primitive before invoking the final
+prepared-gradient contractions.  No NEOPAX dispatch or CLI selector has been
+changed by this prerequisite.
+
+### Native field construction (step 2, implemented; unselected)
+
+NTX now has the separate helper
+``solve_prepared_coefficient_vector_lowdot_two_pullbacks_prepared_support_only_native_multi_rhs_and_aux``.
+It performs one primal/factorized local solve, two objective-independent
+physical forward directions, and packs the following objective-dependent
+transpose fields as matrix RHS columns:
+
+- the base coefficient adjoints;
+- the two directional base adjoints; and
+- the two directional ``lambda_dot`` adjoints.
+
+Only after those factorized solves does it ``vmap`` the final exact
+prepared-gradient algebra over the RHS axis.  It never vmaps or scans the
+scalar implicit low-dot helper.  The helper is exported by NTX only; there is
+no NEOPAX adapter, selector, CLI choice, or benchmark dispatch yet.
+
+Two tiny prepared-system pytest gates have been added: one validates the raw
+packed directional transpose against explicitly packed columns, and one
+compares all five returned prepared-support trees against the established
+scalar helper for 1, 2, and 4 RHS columns.  They must be run on the remote
+NTX environment before this helper is wired into NEOPAX.
+
+### Private NEOPAX adapter (step 3, implemented; unselected)
+
+The existing rejected multi-RHS adapter now has an explicit private companion,
+``_pullback_interpolated_moment_prepared_support_and_drds_only_native_multi_rhs``.
+It calls only the new native NTX helper.  The established adapter retains its
+original helper and default argument; reverse dispatch, physics contexts, and
+CLI validation do not reference the companion.
+
+The existing one-energy local test now also compares this native adapter with
+the scalar support-only adapter for prepared bars, ``drds`` bars, and the
+unbatched primal interpolation response.  This remains a local tiny-model
+test: no transport rollout, persistent cache, profile, or output path is
+involved.  Only after both NTX and NEOPAX exact gates pass may an opt-in
+rebuild-support selector be considered.
+
 ### Important feasibility gate
 
 The prior source audit shows that merely joining NEOPAX's current state and
@@ -1014,3 +1073,73 @@ to the segment accumulator.  Thus the existing joint selector already has
 the required "no separate geometry/support transpose" semantics.  The work
 is to replace only its costly NEOPAX joint-adapter layout, not to create a
 second Radau dispatch mode.
+
+#### Compact joint-carry benchmark result: reject for performance
+
+The cache-disabled 16-step, segment-length-4 benchmark reached the repaired
+compact selector but regressed: its first-segment compilation was about 3m36
+(established best: about 2m11) and segment 4/4 was 953s (best: about 590s).
+Keep this selector isolated; it is not a timing improvement and must not
+replace the current best mode.
+
+### Next plan: true matrix-RHS joint lowdot support extension
+
+The current best rebuild path is exact but constructs two independent local
+NTX reverse graphs: the fast lowdot state/profile path and the generic
+prepared-support VJP.  The rejected joint selectors removed the generic VJP
+but instead wrapped a complete scalar prepared-support lowdot graph in an
+objective `vmap`.  They therefore built the expensive full directional
+prepared algebra once per objective.
+
+The next isolated mode must not repeat either structure.
+
+1. **Residual audit.** Identify the base, Er-direction, and log-nu-direction
+   adjoint fields already formed by the fast state lowdot calculation.  Keep
+   them as numeric, local-to-one-anchor residuals only; do not add a segment
+   tape or change the existing helper.
+
+2. **NTX matrix-RHS extension.** Add a separate NTX helper whose objective
+   RHS is a trailing matrix axis in the factorized adjoint sweeps.  It reuses
+   the state lowdot base factorization and base adjoints, then calculates only
+   the full directional fields and directional adjoints which prepared
+   geometry/support derivatives require.  It returns numeric prepared/support
+   leaves and direct `drds` bars; it must contain no outer objective `vmap` of
+   a scalar full helper.
+
+3. **NEOPAX adapter.** Add one new rebuild selector that calls this helper
+   once per local anchor/species and accumulates its numeric leaves on device.
+   It must bypass the generic support VJP but leave every established mode,
+   including `separate_reuse_local_vjp_primal`, unchanged.
+
+4. **Proof and gate.** Use only small in-memory array/mock tests locally to
+   compare one, two, and four RHS against the sum of current best state and
+   support bars.  After those pass, run one remote cache-disabled 16-step,
+   segment-length-4 benchmark.  Reject the selector on any compile or warm
+   rebuild regression.
+
+#### Step 1 audit result: exact reusable boundary
+
+The fast `ntx_helper_lowdot_fused` state path invokes
+`solve_prepared_coefficient_vector_lowdot_two_pullbacks` once per local
+energy/species/objective.  Its core forms one local primal factorization,
+full primal fields, two forward *low-mode* directions, and a matrix adjoint
+for the two directional coefficient bars.  It deliberately contracts and
+discards the base adjoint instead of materialising it, and returns no
+factorization or adjoint residual to NEOPAX.
+
+The current separate support path independently invokes
+`jax.vjp(_response_from_support_delta, ...)`.  That creates a second local
+prepared-system primal/factorization and prepared-support reverse graph.  So
+the best current path really does repeat the NTX implicit system work.
+
+The rejected joint helper avoided that separate generic VJP, but called the
+full prepared-support lowdot core through an objective `vmap`; it therefore
+materialised full directional fields and prepared bars for each objective.
+The earlier `multi_rhs_shared_primal` helper also does not solve this: it
+shares only primal residuals, then `vmap`s scalar support adjoints.
+
+The exact new helper must expose and reuse: (a) the primal factorization and
+full primal fields, (b) a materialised base lambda pair, and (c) the existing
+two-direction lambda matrix.  It must add only the full directional primal
+fields and lambda-dot fields required for prepared bars, with objective RHS
+as factor-solve columns rather than an outer scalar-helper `vmap`.

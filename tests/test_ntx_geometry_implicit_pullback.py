@@ -235,6 +235,13 @@ def test_multi_rhs_prepared_support_adapter_matches_scalar_local_pullbacks():
             **args,
         )
     )
+    native_prepared, native_drds, native_primal = (
+        model._pullback_interpolated_moment_prepared_support_and_drds_only_native_multi_rhs(
+            prepared,
+            field_bars=batched_field_bars,
+            **args,
+        )
+    )
     for rhs_index, field_bars in enumerate(scalar_field_bars):
         expected_prepared, expected_drds, expected_primal = (
             model._pullback_interpolated_moment_prepared_support_and_drds_only(
@@ -249,6 +256,12 @@ def test_multi_rhs_prepared_support_adapter_matches_scalar_local_pullbacks():
         )
         _assert_float_tree_allclose(actual_drds[rhs_index], expected_drds)
         _assert_float_tree_allclose(actual_primal, expected_primal)
+        _assert_float_tree_allclose(
+            jax.tree_util.tree_map(lambda value: value[rhs_index], native_prepared),
+            expected_prepared,
+        )
+        _assert_float_tree_allclose(native_drds[rhs_index], expected_drds)
+        _assert_float_tree_allclose(native_primal, expected_primal)
 
 
 def test_compact_local_coefficient_record_matches_ordinary_response():
