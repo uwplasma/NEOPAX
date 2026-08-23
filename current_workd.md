@@ -1175,11 +1175,11 @@ best mode without that comparison.
 #### Wiring correction before benchmark
 
 The first native-selector benchmark correctly stopped before XLA compilation:
-the Radau vector field is bound to `CombinedTransportFluxModel`, whereas the
-new forwarding method had initially been added only to the inner
-`NTXExactLijRuntimeTransportModel`.  Consequently the Radau factory resolved
-the native hook to `None`.  The outer composite forwarding method is now
-present and delegates only to the inner native method, matching the existing
-batched-mode wrappers.  A pure mock test checks that the composite hook
-forwards the state, NTX response bars, and support payload exactly once.  No
+the Radau vector field is bound to `ComposedEquationSystem`, with the
+`CombinedTransportFluxModel` and inner `NTXExactLijRuntimeTransportModel`
+below it.  The first correction added the composite forwarding method but
+missed the equation-system forwarding method, so the Radau factory still
+resolved the native hook to `None`.  Both outer forwarding methods are now
+present and delegate only to the inner native method, matching the existing
+batched-mode wrappers.  Pure mock tests check each forwarding boundary.  No
 established selector is changed.
