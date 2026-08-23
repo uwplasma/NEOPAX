@@ -24,7 +24,10 @@ def _small_runtime_model(n_energy=1):
         model,
         "energy_grid",
         SimpleNamespace(
-            v_norm=1.0,
+            # The production energy grid carries one normalized speed per
+            # energy.  Keep that axis in the small two-energy fixture so its
+            # ``lax.map`` reference path has the same contract.
+            v_norm=jnp.linspace(0.9, 1.1, n_energy),
             xWeights=weights,
             L11_weight=weights,
             L12_weight=weights,
