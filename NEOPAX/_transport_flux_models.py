@@ -1147,6 +1147,34 @@ class CombinedTransportFluxModel(TransportFluxModelBase):
         response_bars = None if lagged_response_bars is None else lagged_response_bars.neoclassical_response
         return pullback_fn(state, response_bars, support)
 
+    def pullback_build_lagged_response_support_payload_batched_interpolated_faces_multi_rhs_shared_primal(
+        self,
+        state,
+        lagged_response_bars,
+        support,
+        **kwargs,
+    ):
+        """Forward the isolated local-NTX multi-RHS support transpose.
+
+        The Radau vector field belongs to this composite model, while the
+        specialised factor-sharing rule belongs to its exact-NTX component.
+        Like the existing batched wrappers, outer boundary-condition keywords
+        are intentionally not passed to the local NTX helper.
+        """
+        del kwargs
+        pullback_fn = getattr(
+            self.neoclassical_model,
+            "pullback_build_lagged_response_support_payload_batched_interpolated_faces_multi_rhs_shared_primal",
+            None,
+        )
+        if not callable(pullback_fn):
+            raise NotImplementedError(
+                "The active neoclassical model does not expose the batched interpolated-face "
+                "multi-RHS shared-primal support pullback."
+            )
+        response_bars = None if lagged_response_bars is None else lagged_response_bars.neoclassical_response
+        return pullback_fn(state, response_bars, support)
+
     def pullback_build_lagged_response_state_and_support_payload_batched_interpolated_faces(
         self,
         state,
