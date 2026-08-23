@@ -89,6 +89,9 @@ compares all five returned prepared-support trees against the established
 scalar helper for 1, 2, and 4 RHS columns.  They must be run on the remote
 NTX environment before this helper is wired into NEOPAX.
 
+Remote NTX gate result (2026-08-23): **passed**.  The packed-column and native
+support tests completed as ``4 passed`` (1, 2, and 4 RHS support comparisons).
+
 ### Private NEOPAX adapter (step 3, implemented; unselected)
 
 The existing rejected multi-RHS adapter now has an explicit private companion,
@@ -1143,3 +1146,28 @@ full primal fields, (b) a materialised base lambda pair, and (c) the existing
 two-direction lambda matrix.  It must add only the full directional primal
 fields and lambda-dot fields required for prepared bars, with objective RHS
 as factor-solve columns rather than an outer scalar-helper `vmap`.
+
+#### Native matrix-RHS implementation and local gates
+
+The NTX implementation is now exposed only through the new explicit rebuild
+selector:
+
+`ntx_batched_interpolated_faces_native_multi_rhs_shared_primal`
+
+It is separate from the rejected older
+`ntx_batched_interpolated_faces_multi_rhs_shared_primal` selector.  The new
+NTX helper packs the implicit adjoint columns in the factorized adjoint solve
+and applies an objective batch only to the final prepared-gradient
+contraction.  The selector does not change any default or the established
+best `separate_reuse_local_vjp_primal` path.
+
+Exact small-system gates have passed remotely:
+
+* NTX native matrix-RHS packing and support-only helper: 4 tests passed.
+* NEOPAX private prepared-support adapter versus the scalar local pullbacks:
+  1 test passed.
+
+These are algebra/axis checks only.  A cache-disabled transport benchmark is
+still required to determine whether the native packed graph improves or
+regresses compilation and execution.  Do not promote it over the established
+best mode without that comparison.

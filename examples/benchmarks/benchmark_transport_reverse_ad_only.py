@@ -5429,6 +5429,7 @@ def main() -> None:
             "ntx_batched_interpolated_faces",
             "ntx_batched_interpolated_faces_reuse_local_vjp_primal",
             "ntx_batched_interpolated_faces_multi_rhs_shared_primal",
+            "ntx_batched_interpolated_faces_native_multi_rhs_shared_primal",
             "ntx_joint_implicit_interpolated_faces",
             "ntx_joint_implicit_interpolated_faces_packed_support_adjoint",
             "ntx_joint_implicit_interpolated_faces_reuse_local_vjp_primal",
@@ -5463,7 +5464,11 @@ def main() -> None:
             "'ntx_batched_interpolated_faces_multi_rhs_shared_primal' is an "
             "isolated exact experiment: per anchor/species it shares NTX's local "
             "primal factorisation and two forward case directions across the "
-            "device-resident objective RHS batch. "
+            "objective RHS batch through the older objective-vmapped support rule. "
+            "'ntx_batched_interpolated_faces_native_multi_rhs_shared_primal' is "
+            "the separate native matrix-RHS experiment: it packs all implicit "
+            "adjoint RHS columns before the final support-gradient contraction "
+            "without a scalar objective VJP loop. "
             "'ntx_joint_implicit_interpolated_faces' is the exact experimental "
             "mode that obtains rebuild state and NTX-support bars jointly from "
             "the same local NTX implicit adjoint. "

@@ -10849,7 +10849,7 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         )
 
     def pullback_build_lagged_response_support_payload_batched_interpolated_faces_multi_rhs_shared_primal(
-        self, state, lagged_response_bars, support,
+        self, state, lagged_response_bars, support, *, native_factorized_ntx_rhs: bool = False,
     ):
         """Experimental exact batched support transpose with local NTX sharing.
 
@@ -10938,15 +10938,18 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                         collisionality_kind=collisionality_kind,
                     )
                 )
-                prepared_bar, drds_bar, primal_response = (
-                    self._pullback_interpolated_moment_prepared_support_and_drds_only_multi_rhs(
-                        prepared,
-                        drds_value=drds_value,
-                        reference_nu_hat=reference_nu_hat,
-                        reference_epsi_hat=reference_epsi_hat,
-                        vth_a=vth_a,
-                        field_bars=species_field_bars,
-                    )
+                local_support_pullback = (
+                    self._pullback_interpolated_moment_prepared_support_and_drds_only_native_multi_rhs
+                    if native_factorized_ntx_rhs
+                    else self._pullback_interpolated_moment_prepared_support_and_drds_only_multi_rhs
+                )
+                prepared_bar, drds_bar, primal_response = local_support_pullback(
+                    prepared,
+                    drds_value=drds_value,
+                    reference_nu_hat=reference_nu_hat,
+                    reference_epsi_hat=reference_epsi_hat,
+                    vth_a=vth_a,
+                    field_bars=species_field_bars,
                 )
                 return (
                     # The multi-RHS NTX helper already converts static/float0
@@ -11014,6 +11017,23 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             _batched_zero_like(_float_delta_tree_like(support)),
             face_channels=face_channels_bar,
             face_prepared=face_prepared_bar,
+        )
+
+    def pullback_build_lagged_response_support_payload_batched_interpolated_faces_native_multi_rhs_shared_primal(
+        self, state, lagged_response_bars, support,
+    ):
+        """Opt-in native matrix-RHS counterpart of the rejected prior helper.
+
+        This method is intentionally separate so the former experimental
+        selector retains its original dispatch and remains an independent
+        timing reference.
+        """
+
+        return self.pullback_build_lagged_response_support_payload_batched_interpolated_faces_multi_rhs_shared_primal(
+            state,
+            lagged_response_bars,
+            support,
+            native_factorized_ntx_rhs=True,
         )
 
     def pullback_build_lagged_response_state_and_support_payload_batched_interpolated_faces(
