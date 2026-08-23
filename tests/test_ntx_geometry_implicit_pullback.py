@@ -269,7 +269,6 @@ def test_multi_rhs_prepared_support_adapter_matches_scalar_local_pullbacks():
     profiling side effect.
     """
 
-    model = _small_runtime_model(n_energy=1)
     prepared = ntx.prepare_monoenergetic_system(
         ntx.example_surface(),
         ntx.GridSpec(5, 5, 4),
@@ -292,46 +291,136 @@ def test_multi_rhs_prepared_support_adapter_matches_scalar_local_pullbacks():
         jnp.stack([field_bars[field_index] for field_bars in scalar_field_bars])
         for field_index in range(4)
     )
-    args = dict(
-        drds_value=jnp.asarray(1.2),
-        reference_nu_hat=jnp.asarray([1.0e-2]),
-        reference_epsi_hat=jnp.asarray([1.0e-3]),
-        vth_a=jnp.asarray([1.1]),
-    )
-    actual_prepared, actual_drds, actual_primal = (
-        model._pullback_interpolated_moment_prepared_support_and_drds_only_multi_rhs(
-            prepared,
-            field_bars=batched_field_bars,
-            **args,
+    # The transport benchmark uses an energy scan, whereas the original
+    # gate covered only one energy.  Exercise both shapes: an error in the
+    # energy reduction can leave profile bars apparently correct while
+    # corrupting a geometry-only prepared leaf.
+    for n_energy in (1, 2):
+        model = _small_runtime_model(n_energy=n_energy)
+        args = dict(
+            drds_value=jnp.asarray(1.2),
+            reference_nu_hat=jnp.linspace(1.0e-2, 1.8e-2, n_energy),
+            reference_epsi_hat=jnp.linspace(1.0e-3, 2.0e-3, n_energy),
+            vth_a=jnp.linspace(1.1, 1.2, n_energy),
         )
-    )
-    native_prepared, native_drds, native_primal = (
-        model._pullback_interpolated_moment_prepared_support_and_drds_only_native_multi_rhs(
-            prepared,
-            field_bars=batched_field_bars,
-            **args,
-        )
-    )
-    for rhs_index, field_bars in enumerate(scalar_field_bars):
-        expected_prepared, expected_drds, expected_primal = (
-            model._pullback_interpolated_moment_prepared_support_and_drds_only(
+        actual_prepared, actual_drds, actual_primal = (
+            model._pullback_interpolated_moment_prepared_support_and_drds_only_multi_rhs(
                 prepared,
-                field_bars=field_bars,
+                field_bars=batched_field_bars,
                 **args,
             )
         )
-        _assert_float_tree_allclose(
-            jax.tree_util.tree_map(lambda value: value[rhs_index], actual_prepared),
-            expected_prepared,
+        native_prepared, native_drds, native_primal = (
+            model._pullback_interpolated_moment_prepared_support_and_drds_only_native_multi_rhs(
+                prepared,
+                field_bars=batched_field_bars,
+                **args,
+            )
         )
-        _assert_float_tree_allclose(actual_drds[rhs_index], expected_drds)
-        _assert_float_tree_allclose(actual_primal, expected_primal)
+        for rhs_index, field_bars in enumerate(scalar_field_bars):
+            expected_prepared, expected_drds, expected_primal = (
+                model._pullback_interpolated_moment_prepared_support_and_drds_only(
+                    prepared,
+                    field_bars=field_bars,
+                    **args,
+                )
+            )
+            _assert_float_tree_allclose(
+                jax.tree_util.tree_map(lambda value: value[rhs_index], actual_prepared),
+                expected_prepared,
+            )
+            _assert_float_tree_allclose(actual_drds[rhs_index], expected_drds)
+            _assert_float_tree_allclose(actual_primal, expected_primal)
+            _assert_float_tree_allclose(
+                jax.tree_util.tree_map(lambda value: value[rhs_index], native_prepared),
+                expected_prepared,
+            )
+            _assert_float_tree_allclose(native_drds[rhs_index], expected_drds)
+            _assert_float_tree_allclose(native_primal, expected_primal)
+
+
+def test_native_multi_rhs_support_retains_local_drds_case_chain():
+    """The native support rule must include ``drds -> epsi_hat`` exactly.
+
+    The former native selector only compared against a support-only NTX
+    oracle, which deliberately holds the local case fixed.  This miniature
+    response instead makes ``epsi_hat`` depend on ``drds`` and compares the
+    corrected native case bars plus their primitive transpose to the actual
+    local response VJP.  It is in-memory only and has no transport rollout.
+    """
+
+    model = _small_runtime_model(n_energy=2)
+    prepared = ntx.prepare_monoenergetic_system(
+        ntx.example_surface(),
+        ntx.GridSpec(5, 5, 4),
+    )
+    epsi_per_drds = jnp.asarray([1.0e-3, 1.6e-3])
+
+    def _mock_local_primitives(*, drds_value, **_unused):
+        return (
+            jnp.asarray([1.0e-2, 1.8e-2]),
+            epsi_per_drds * drds_value,
+            jnp.asarray(1.1),
+        )
+
+    object.__setattr__(model, "_interpolated_moment_local_scan_primitives", _mock_local_primitives)
+    scalar_field_bars = (
+        (
+            jnp.asarray(0.0),
+            jnp.asarray([0.3, -0.2, 0.1, 0.4, -0.1, 0.2]),
+            jnp.asarray([-0.3, 0.1, 0.2, -0.2, 0.3, -0.1]),
+            jnp.asarray([0.2, 0.4, -0.3, 0.1, 0.2, -0.4]),
+        ),
+        (
+            jnp.asarray(0.0),
+            jnp.asarray([-0.1, 0.2, 0.3, -0.4, 0.5, -0.2]),
+            jnp.asarray([0.4, -0.3, 0.2, 0.1, -0.5, 0.3]),
+            jnp.asarray([-0.2, 0.3, 0.4, -0.1, 0.2, 0.5]),
+        ),
+    )
+    batched_field_bars = tuple(
+        jnp.stack([bars[field_index] for bars in scalar_field_bars])
+        for field_index in range(4)
+    )
+    drds = jnp.asarray(1.2)
+    reference_nu_hat, reference_epsi_hat, vth_a = _mock_local_primitives(
+        drds_value=drds,
+    )
+    (
+        native_prepared,
+        native_direct_drds,
+        _native_primal,
+        (_native_nu_hat, native_epsi_hat, _native_vth_a),
+    ) = model._pullback_interpolated_moment_prepared_support_and_drds_only_native_multi_rhs(
+        prepared,
+        drds_value=drds,
+        reference_nu_hat=reference_nu_hat,
+        reference_epsi_hat=reference_epsi_hat,
+        vth_a=vth_a,
+        field_bars=batched_field_bars,
+    )
+    native_drds = native_direct_drds + jnp.sum(native_epsi_hat * epsi_per_drds, axis=1)
+
+    def _response(prepared_value, drds_value):
+        return model._build_interpolated_moment_response_local(
+            prepared_value,
+            drds_value=drds_value,
+            species_index=0,
+            er_value=jnp.asarray(0.0),
+            temperature_local=jnp.asarray([1.0]),
+            density_local=jnp.asarray([1.0]),
+            vthermal_local=jnp.asarray([1.1]),
+            collisionality_kind="unused",
+        )
+
+    for rhs_index, field_bars in enumerate(scalar_field_bars):
+        _response_value, pullback = jax.vjp(_response, prepared, drds)
+        expected_prepared, expected_drds = pullback(field_bars)
         _assert_float_tree_allclose(
             jax.tree_util.tree_map(lambda value: value[rhs_index], native_prepared),
             expected_prepared,
         )
         _assert_float_tree_allclose(native_drds[rhs_index], expected_drds)
-        _assert_float_tree_allclose(native_primal, expected_primal)
 
 
 def test_compact_local_coefficient_record_matches_ordinary_response():

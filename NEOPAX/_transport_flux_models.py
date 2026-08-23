@@ -7137,7 +7137,13 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                     ),
                 )
 
-            primal_outputs, support_result = multi_rhs_helper(
+            helper_kwargs = dict(return_primal_outputs=True)
+            if native_factorized_ntx_rhs:
+                # The native matrix-RHS helper can return the already-formed
+                # case bars.  The normal support-only helper deliberately
+                # omits them, so retain its original contract unchanged.
+                helper_kwargs["return_case_bars"] = True
+            helper_result = multi_rhs_helper(
                 prepared,
                 ntx.MonoenergeticCase(nu_hat=nu_hat_value, epsi_hat=epsi_hat_value),
                 ntx.MonoenergeticCase(
@@ -7147,22 +7153,39 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                     nu_hat=nu_hat_value, epsi_hat=jnp.zeros_like(epsi_hat_value)
                 ),
                 _bars_and_direct_drds,
-                return_primal_outputs=True,
+                **helper_kwargs,
             )
+            if native_factorized_ntx_rhs:
+                primal_outputs, support_result, case_bar_components = helper_result
+                return (*support_result[:-1], support_result[-1], primal_outputs, case_bar_components)
+            primal_outputs, support_result = helper_result
             return (*support_result[:-1], support_result[-1], primal_outputs)
 
-        (
-            base_prepared_bars,
-            first_base_prepared_bars,
-            first_prepared_bars,
-            second_base_prepared_bars,
-            second_prepared_bars,
-            direct_drds_bars,
-            primal_outputs,
-        ) = jax.lax.map(
+        mapped_outputs = jax.lax.map(
             _one_energy,
             (energy_indices, reference_nu_hat, reference_epsi_hat, epsi_hat_tangent),
         )
+        if native_factorized_ntx_rhs:
+            (
+                base_prepared_bars,
+                first_base_prepared_bars,
+                first_prepared_bars,
+                second_base_prepared_bars,
+                second_prepared_bars,
+                direct_drds_bars,
+                primal_outputs,
+                native_case_bar_components,
+            ) = mapped_outputs
+        else:
+            (
+                base_prepared_bars,
+                first_base_prepared_bars,
+                first_prepared_bars,
+                second_base_prepared_bars,
+                second_prepared_bars,
+                direct_drds_bars,
+                primal_outputs,
+            ) = mapped_outputs
         prepared_bars = jax.tree_util.tree_map(
             lambda values: jnp.sum(values, axis=0),
             _sum_float_delta_bar_trees(
@@ -7211,6 +7234,51 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                 (second_coefficient_dot_scan,),
             )[1],
         )
+        if native_factorized_ntx_rhs:
+            (
+                base_nu_hat_bars,
+                base_epsi_hat_bars,
+                _first_base_nu_hat_bars,
+                first_base_epsi_hat_bars,
+                first_nu_hat_bars,
+                first_epsi_hat_bars,
+                second_base_nu_hat_bars,
+                second_base_epsi_hat_bars,
+                second_nu_hat_bars,
+                second_epsi_hat_bars,
+            ) = native_case_bar_components
+            # ``lax.map`` left energy first, whereas the local scan primitive
+            # receives one RHS batch of energy values.  This is the same
+            # contraction used by the full joint state/support pullback.
+            nu_hat_bars = jnp.swapaxes(
+                self._pullback_log_nu_star_from_nu_hat(
+                    reference_nu_hat,
+                    _reference_log_nu_star_bars,
+                )
+                + base_nu_hat_bars
+                + first_nu_hat_bars
+                + second_base_nu_hat_bars
+                + second_nu_hat_bars,
+                0,
+                1,
+            )
+            epsi_hat_bars = jnp.swapaxes(
+                base_epsi_hat_bars
+                + first_epsi_hat_bars
+                + second_base_epsi_hat_bars
+                + second_epsi_hat_bars,
+                0,
+                1,
+            )
+            vth_a_bars = jnp.sum(
+                first_base_epsi_hat_bars * (-epsi_hat_tangent[:, None] / vth_a),
+                axis=0,
+            )
+            return prepared_bars, direct_drds_bars, primal_response, (
+                nu_hat_bars,
+                epsi_hat_bars,
+                vth_a_bars,
+            )
         return prepared_bars, direct_drds_bars, primal_response
 
     def _pullback_interpolated_moment_prepared_support_and_drds_only_native_multi_rhs(
@@ -10975,7 +11043,7 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                     if native_factorized_ntx_rhs
                     else self._pullback_interpolated_moment_prepared_support_and_drds_only_multi_rhs
                 )
-                prepared_bar, drds_bar, primal_response = local_support_pullback(
+                local_result = local_support_pullback(
                     prepared,
                     drds_value=drds_value,
                     reference_nu_hat=reference_nu_hat,
@@ -10983,6 +11051,29 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                     vth_a=vth_a,
                     field_bars=species_field_bars,
                 )
+                if native_factorized_ntx_rhs:
+                    (
+                        prepared_bar,
+                        drds_bar,
+                        primal_response,
+                        (nu_hat_bars, epsi_hat_bars, vth_a_bars),
+                    ) = local_result
+                    primitive_drds_bar, _er_bar, _temperature_bar, _density_bar = jax.vmap(
+                        lambda nu_hat_bar, epsi_hat_bar, vth_a_bar: self._pullback_local_scan_inputs_and_drds_from_primitives(
+                            drds_value=drds_value,
+                            species_index=species_index,
+                            er_value=er_value,
+                            temperature_local=temperature_local,
+                            density_local=density_local,
+                            collisionality_kind=collisionality_kind,
+                            reference_nu_hat_bar=nu_hat_bar,
+                            reference_epsi_hat_bar=epsi_hat_bar,
+                            vth_a_bar=vth_a_bar,
+                        )
+                    )(nu_hat_bars, epsi_hat_bars, vth_a_bars)
+                    drds_bar = drds_bar + primitive_drds_bar
+                else:
+                    prepared_bar, drds_bar, primal_response = local_result
                 return (
                     # The multi-RHS NTX helper already converts static/float0
                     # prepared leaves into explicit zero arrays carrying the

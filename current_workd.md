@@ -1183,3 +1183,69 @@ resolved the native hook to `None`.  Both outer forwarding methods are now
 present and delegate only to the inner native method, matching the existing
 batched-mode wrappers.  Pure mock tests check each forwarding boundary.  No
 established selector is changed.
+
+#### Native matrix-RHS benchmark result: exact run completes, reject for total timing
+
+The cache-disabled 16-step, segment-length-4 native matrix-RHS selector
+completed and returned finite full transport/geometry rows.  It reduced the
+already-compiled rebuild-heavy segments, but increased first-segment compile
+cost enough to lose overall:
+
+| Metric | Established best | Native matrix-RHS |
+| --- | ---: | ---: |
+| First segment XLA compile | about 2m11 | 5m00 |
+| Segment 4/4 | 590s | 923s |
+| Segment 3/4 | 77s | 46s |
+| Segment 2/4 | 228s | 136s |
+| Segment 1/4 | 228s | 136s |
+| Reverse segment sweep | 1123s | 1241s |
+
+Thus the packed solves reduce warm rebuild execution but enlarge the enclosing
+segment XLA graph.  Keep the selector isolated and do not use it as the
+current best.  Any follow-up must preserve the packed runtime algebra while
+moving it behind a compilation boundary or reducing the generated segment
+graph; simply promoting this selector would regress total time.
+
+The completed run also rejects this selector on exactness.  Against the
+established `separate_reuse_local_vjp_primal` run, all 60 transport
+profile-parameter rows (`n0`, `T0`, and the four shape parameters) printed
+bitwise identically, but every VMEC transport row differed.  Representative
+relative differences were: `softmax_Er/RBC` 7.46e-2,
+`softmax_Er/ZBS` 2.37e-1, `Er2_volume_average/RBC` 3.07e-2,
+`Er2_volume_average/ZBS` 7.53e-2, `Er_volume_average/RBC` 1.42e-1,
+and `Er_transition_left/ZBS` 9.62e0.  Therefore the small local adapter
+oracle did not cover the complete support-to-VMEC geometry chain used by the
+new outer batched route.  Do not use or further benchmark this selector
+without a whole-support geometry equivalence test.
+
+#### Root cause of the native VMEC mismatch and corrected next step
+
+The native selector calls NTX's deliberately narrow
+``prepared_support_only`` helper.  That helper returns a prepared-system bar
+and the direct ``drds`` bar, but intentionally discards the cotangents of the
+local NTX case ``(nu_hat, epsi_hat)`` and its ``vth_a`` scale.  The established
+``separate_reuse_local_vjp_primal`` path instead differentiates the complete
+local response with respect to ``(prepared, drds)``.  Its ``drds`` transpose
+therefore includes the chain
+
+``drds -> (nu_hat, epsi_hat, vth_a) -> local NTX response``.
+
+This missing chain is the concrete reason the native run preserves all
+profile rows but changes only the VMEC rows.  It is not a numerical tolerance
+issue and it does not require another NTX primal or adjoint solve.
+
+The correction remains isolated: extend the existing native matrix-RHS
+low-dot helper to return its already-available batched case bars; then apply
+their NEOPAX transpose with
+``_pullback_local_scan_inputs_and_drds_from_primitives`` and add that result
+to the direct ``drds`` bar.  The exact local test must compare this corrected
+result against the real generic local ``jax.vjp`` of the response (including
+the primitive chain), with one and two energies and multiple RHS.  Only after
+that gate passes may it be benchmarked.
+
+The compile-time task is separate: this exactness correction should retain
+the native execution saving but cannot by itself promise a smaller HLO.  Once
+the local VJP gate is exact, measure a device-only non-inline call boundary
+on the corrected native helper using a small mock lowering before asking for
+another transport benchmark.  Do not use a host callback, a full tape, or a
+serial objective scan.
