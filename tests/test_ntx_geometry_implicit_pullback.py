@@ -389,6 +389,16 @@ def test_native_multi_rhs_support_retains_local_drds_case_chain():
     reference_nu_hat, reference_epsi_hat, vth_a = _mock_local_primitives(
         drds_value=drds,
     )
+    scalar_prepared, _scalar_direct_drds, _scalar_primal = (
+        model._pullback_interpolated_moment_prepared_support_and_drds_only_multi_rhs(
+            prepared,
+            drds_value=drds,
+            reference_nu_hat=reference_nu_hat,
+            reference_epsi_hat=reference_epsi_hat,
+            vth_a=vth_a,
+            field_bars=batched_field_bars,
+        )
+    )
     (
         native_prepared,
         native_direct_drds,
@@ -420,6 +430,12 @@ def test_native_multi_rhs_support_retains_local_drds_case_chain():
     for rhs_index, field_bars in enumerate(scalar_field_bars):
         _response_value, pullback = jax.vjp(_response, prepared, drds)
         expected_prepared, expected_drds = pullback(field_bars)
+        # Establish whether a discrepancy is in the native matrix-RHS
+        # translation or in the shared support-only low-dot algebra itself.
+        _assert_float_tree_allclose(
+            jax.tree_util.tree_map(lambda value: value[rhs_index], scalar_prepared),
+            expected_prepared,
+        )
         _assert_float_tree_allclose(
             jax.tree_util.tree_map(lambda value: value[rhs_index], native_prepared),
             expected_prepared,
