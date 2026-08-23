@@ -1192,12 +1192,20 @@ class CombinedTransportFluxModel(TransportFluxModelBase):
         reuse_local_vjp_primal_anchor_response = bool(
             kwargs.pop("reuse_local_vjp_primal_anchor_response", False)
         )
+        compact_prepared_support_carry = bool(
+            kwargs.pop("compact_prepared_support_carry", False)
+        )
         pullback_fn = getattr(
             self.neoclassical_model,
             (
+                "pullback_build_lagged_response_state_and_support_payload_"
+                "batched_interpolated_faces_reuse_local_vjp_primal_compact_prepared_carry"
+                if compact_prepared_support_carry
+                else (
                 "pullback_build_lagged_response_state_and_support_payload_batched_interpolated_faces_reuse_local_vjp_primal"
                 if reuse_local_vjp_primal_anchor_response
                 else "pullback_build_lagged_response_state_and_support_payload_batched_interpolated_faces"
+                )
             ),
             None,
         )
@@ -1261,6 +1269,23 @@ class CombinedTransportFluxModel(TransportFluxModelBase):
             lagged_response_bars,
             support,
             reuse_local_vjp_primal_anchor_response=True,
+            **kwargs,
+        )
+
+    def pullback_build_lagged_response_state_and_support_payload_batched_interpolated_faces_reuse_local_vjp_primal_compact_prepared_carry(
+        self,
+        state,
+        lagged_response_bars,
+        support,
+        **kwargs,
+    ):
+        """Opt-in joint lowdot wrapper with a compact prepared scan carry."""
+        return self.pullback_build_lagged_response_state_and_support_payload_batched_interpolated_faces(
+            state,
+            lagged_response_bars,
+            support,
+            reuse_local_vjp_primal_anchor_response=True,
+            compact_prepared_support_carry=True,
             **kwargs,
         )
 
@@ -10965,6 +10990,7 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         *,
         packed_support_directional_adjoint: bool = False,
         reuse_local_vjp_primal_anchor_response: bool = False,
+        compact_prepared_support_carry: bool = False,
     ):
         """Joint exact transpose of interpolated face state and NTX support.
 
@@ -11014,6 +11040,46 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         face_channels_bar = _batched_zero_like(_float_delta_tree_like(support.face_channels))
         face_prepared_bar = _batched_zero_like(_float_delta_tree_like(support.face_prepared))
         n_radius = int(face_state.Er.shape[0])
+
+        # The joint lowdot call returns a local prepared cotangent for every
+        # active objective RHS.  Keeping that pytree as a scan carry creates a
+        # separate carry component and scatter for every prepared leaf.  The
+        # compact selector instead carries one numeric
+        # ``(objective, radius, local-prepared-width)`` array and reconstructs
+        # the identical pytree only after the anchor scan.  This changes no
+        # NTX algebra and retains no data beyond this one rebuild pullback.
+        prepared_treedef = jax.tree_util.tree_structure(support.face_prepared)
+        if compact_prepared_support_carry:
+            prepared_primal_leaves = tuple(jax.tree_util.tree_leaves(support.face_prepared))
+            prepared_bar_template_leaves = tuple(jax.tree_util.tree_leaves(face_prepared_bar))
+            prepared_local_shapes = tuple(
+                jnp.asarray(leaf).shape[1:] for leaf in prepared_primal_leaves
+            )
+            if any(
+                jnp.asarray(leaf).ndim < 1 or int(jnp.asarray(leaf).shape[0]) != n_radius
+                for leaf in prepared_primal_leaves
+            ):
+                raise NotImplementedError(
+                    "compact joint prepared-support carry requires every face_prepared "
+                    "leaf to have the common leading radius axis."
+                )
+            prepared_local_sizes = tuple(
+                int(jnp.asarray(leaf).size // n_radius) for leaf in prepared_primal_leaves
+            )
+            prepared_local_width = int(sum(prepared_local_sizes))
+            prepared_packed_dtype = jnp.result_type(
+                *(jnp.asarray(leaf).dtype for leaf in prepared_bar_template_leaves)
+            )
+            face_prepared_flat_bar = jnp.zeros(
+                (objective_count, n_radius, prepared_local_width),
+                dtype=prepared_packed_dtype,
+            )
+        else:
+            prepared_primal_leaves = None
+            prepared_bar_template_leaves = None
+            prepared_local_shapes = None
+            prepared_local_sizes = None
+            face_prepared_flat_bar = None
         anchor_indices = self._response_anchor_indices(n_radius)
         anchor_rho = jnp.asarray(self.geometry.r_grid_half, dtype=jnp.float64)[anchor_indices]
         target_rho = jnp.asarray(support.face_channels.rho, dtype=jnp.float64)
@@ -11107,7 +11173,6 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             density_local = jax.lax.dynamic_index_in_dim(
                 face_density, radius_index, axis=1, keepdims=False
             )
-            prepared_treedef = jax.tree_util.tree_structure(prepared)
             local_pullback = jax.vmap(
                 lambda one_field_bars: self._pullback_interpolated_moment_response_local_fields_and_prepared_support_and_drds_flat_prepared(
                     prepared,
@@ -11133,7 +11198,6 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                 if reuse_local_vjp_primal_anchor_response
                 else None
             )
-            prepared_local_bar = prepared_treedef.unflatten(prepared_local_bar_leaves)
             # Match the established scalar state transpose: the axis anchor
             # has a regularized response representation and contributes only
             # through its explicit reference-Er channel, not through a local
@@ -11151,7 +11215,7 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
 
             def _axis_zero(_):
                 return (
-                    jax.tree_util.tree_map(jnp.zeros_like, prepared_local_bar),
+                    tuple(jnp.zeros_like(leaf) for leaf in prepared_local_bar_leaves),
                     jnp.zeros_like(drds_local_bar),
                     jnp.zeros_like(er_local_bar),
                     jnp.zeros_like(temperature_local_bar),
@@ -11160,7 +11224,7 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
 
             def _non_axis(_):
                 return (
-                    prepared_local_bar,
+                    prepared_local_bar_leaves,
                     drds_local_bar,
                     er_local_bar,
                     temperature_local_bar,
@@ -11168,7 +11232,7 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                 )
 
             (
-                prepared_local_bar,
+                prepared_local_bar_leaves,
                 drds_local_bar,
                 er_local_bar,
                 temperature_local_bar,
@@ -11176,7 +11240,7 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             ) = jax.lax.cond(is_axis_anchor, _axis_zero, _non_axis, operand=None)
             return (
                 radius_index,
-                prepared_local_bar,
+                prepared_local_bar_leaves,
                 drds_local_bar,
                 er_local_bar,
                 temperature_local_bar,
@@ -11195,7 +11259,7 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             ) = carry
             (
                 radius_index,
-                prepared_local_bar,
+                prepared_local_bar_leaves,
                 drds_local_bar,
                 er_local_bar,
                 temperature_local_bar,
@@ -11216,10 +11280,22 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                     channels_carry,
                     drds=channels_carry.drds.at[:, radius_index].add(drds_local_bar),
                 ),
-                jax.tree_util.tree_map(
-                    lambda arr, local_arr: arr.at[:, radius_index].add(local_arr),
-                    prepared_carry,
-                    prepared_local_bar,
+                (
+                    prepared_carry.at[:, radius_index].add(
+                        jnp.concatenate(
+                            tuple(
+                                jnp.reshape(local_leaf, (objective_count, -1))
+                                for local_leaf in prepared_local_bar_leaves
+                            ),
+                            axis=1,
+                        )
+                    )
+                    if compact_prepared_support_carry
+                    else jax.tree_util.tree_map(
+                        lambda arr, local_arr: arr.at[:, radius_index].add(local_arr),
+                        prepared_carry,
+                        prepared_treedef.unflatten(prepared_local_bar_leaves),
+                    )
                 ),
                 density_carry.at[:, :, radius_index].add(density_local_bar),
                 temperature_carry.at[:, :, radius_index].add(temperature_local_bar),
@@ -11234,10 +11310,15 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             )
             for field_bar in response_field_bar_tuple
         )
+        face_prepared_scan_bar = (
+            face_prepared_flat_bar
+            if compact_prepared_support_carry
+            else face_prepared_bar
+        )
 
         (
             face_channels_bar,
-            face_prepared_bar,
+            face_prepared_scan_bar,
             face_density_bar,
             face_temperature_bar,
             face_er_bar,
@@ -11254,6 +11335,27 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             ),
             anchor_positions,
         )
+
+        if compact_prepared_support_carry:
+            face_prepared_bar = face_prepared_scan_bar
+            prepared_bar_leaves = []
+            offset = 0
+            for bar_template_leaf, local_shape, local_size in zip(
+                prepared_bar_template_leaves,
+                prepared_local_shapes,
+                prepared_local_sizes,
+                strict=True,
+            ):
+                prepared_bar_leaves.append(
+                    jnp.reshape(
+                        face_prepared_bar[:, :, offset : offset + local_size],
+                        (objective_count, n_radius) + local_shape,
+                    ).astype(jnp.asarray(bar_template_leaf).dtype)
+                )
+                offset += local_size
+            face_prepared_bar = prepared_treedef.unflatten(prepared_bar_leaves)
+        else:
+            face_prepared_bar = face_prepared_scan_bar
 
         if reuse_local_vjp_primal_anchor_response:
             if n_anchor < 4:
@@ -11331,6 +11433,23 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             lagged_response_bars,
             support,
             reuse_local_vjp_primal_anchor_response=True,
+            **kwargs,
+        )
+
+    def pullback_build_lagged_response_state_and_support_payload_batched_interpolated_faces_reuse_local_vjp_primal_compact_prepared_carry(
+        self,
+        state,
+        lagged_response_bars,
+        support,
+        **kwargs,
+    ):
+        """Joint lowdot pullback with a single numeric prepared-bar carry."""
+        return self.pullback_build_lagged_response_state_and_support_payload_batched_interpolated_faces(
+            state,
+            lagged_response_bars,
+            support,
+            reuse_local_vjp_primal_anchor_response=True,
+            compact_prepared_support_carry=True,
             **kwargs,
         )
 

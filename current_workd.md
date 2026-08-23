@@ -118,6 +118,32 @@ through the dedicated batched support hook but remains unbenchmarked; the
 first cache-disabled benchmark must compare objective/gradient values before
 timings are interpreted.
 
+### Benchmark result: multi-RHS shared-primal selector rejected (2026-08-23)
+
+The cache-disabled 16-step benchmark completed its segmented sweep with this
+new selector and regressed relative to the established record-mode best:
+
+| Segment | New multi-RHS selector | Established record-mode best |
+|---|---:|---:|
+| `4/4` (four rebuilds; compile plus execution) | `869.372 s` | `590.420 s` |
+| `3/4` (one rebuild) | `75.270 s` | `77.001 s` |
+| `2/4` (three rebuilds) | `222.447 s` | `228.237 s` |
+| `1/4` (three rebuilds) | `222.942 s` | `227.755 s` |
+| Sweep | `1390.039 s` | `1123.413 s` |
+
+The first-segment slow-compile alarm was about `4m11s`, versus the former
+roughly `2m11s` record-mode baseline. The modest warm improvements in the
+later segments do not offset this regression.
+
+Source review explains why: the helper creates one local primal/factor
+residual, but then uses ``jax.vmap(_one_rhs)``. Each lane re-enters the
+scalar low-dot core and still forms the four exact cotangent-dependent
+adjoint field families (`lambda1`, `lambda3`, `lambda1_dot`, and
+`lambda3_dot`). It is therefore not the promised single matrix-RHS adjoint
+solve; it only shares the objective-independent primal setup. The wider
+mapped graph accounts for the compile regression. This selector is rejected
+for timing and must not replace the current best mode.
+
 ## Compact coefficient-record implementation status (2026-08-22)
 
 The first internal portion is implemented but **not selectable** by the
@@ -761,3 +787,219 @@ extrapolated coefficient vector. A later consumer must use the existing
 interpolation transpose (which gives that raw axis slot zero cotangent); this
 preserves the no-extra-solve invariant and prevents a nonphysical axis record
 from entering the support adjoint.
+
+### Current next work: make the prepared-lowdot joint path structurally small
+
+#### Re-audit conclusion
+
+The intended mathematical primitive already exists in NTX:
+`solve_prepared_coefficient_vector_lowdot_two_pullbacks_with_prepared_and_aux`.
+For one local NTX system and one response cotangent it returns both the usual
+case/state bars and the prepared-support bars from the same primal
+factorisation and grouped base/two-directional adjoint calculation.
+
+The established best reverse mode does **not** use that joint primitive.  It
+uses the case-only lowdot helper in the scalar state transpose and a separate
+generic JAX VJP in the scalar support transpose.  This is the remaining local
+duplication.
+
+The previously benchmarked joint modes did use the joint primitive, but in a
+costly layout.  At each anchor they apply the local joint helper under an
+objective `vmap`, then carry the resulting objective-batched complete prepared
+support pytree through the anchor `lax.scan`.  This widens the whole segment
+HLO with every differentiable prepared leaf and with the objective axis.  The
+cache-disabled regressions (roughly 3--4 minute first-segment compile and
+worse total reverse timings) reject that *layout*, not the mathematical joint
+lowdot rule.
+
+#### Plan and gates
+
+1. **Mock structural proof before production changes.** Create an in-memory,
+   numeric-pytree mock that has the same nesting, objective axis, anchor scan,
+   scatter accumulation, and output packing as the joint support route, but
+   replaces NTX solves by small array algebra. Compare Jaxpr/abstract carry
+   shapes for:
+   - the rejected anchor-scan-with-objective-batched-support layout; and
+   - a proposed scalar-per-RHS joint layout.
+   This test must use no real NTX/transport solve, no GPU compile, no profile,
+   and no filesystem output. If batching still places the objective axis on
+   the scan carry, the proposed rewrite is rejected before production code.
+
+2. **Only if the mock establishes a smaller carry, add an opt-in compact
+   scalar joint adapter.** It will call the existing prepared-lowdot helper
+   once per local scalar RHS and return numeric state bars plus only active
+   prepared geometry/support leaves. It must not return validated NTX
+   dataclasses through `vmap`, and it must not allocate/carry a full generic
+   prepared delta tree for inactive/static leaves.
+
+3. **Wire it at the Radau rebuild boundary without changing the best mode.**
+   The new selector must replace the *pair* of rebuild state/support calls for
+   that selector only. `separate_reuse_local_vjp_primal` remains unchanged.
+   Objective batching stays on device; there is no host loop, serial objective
+   scan, full accepted-path tape, or factorisation record.
+
+4. **Exactness gates.** With small in-memory fixtures, compare the new joint
+   adapter against the sum of the established state-lowdot and scalar generic
+   support paths for: state bars, every active support leaf, direct `drds`,
+   interpolation-coordinate bars, and arbitrary objective batch sizes.
+
+5. **Benchmark gate.** Only after all tests pass, run one cache-disabled
+   16-step benchmark on the remote machine. Reject the selector if either the
+   first segment compilation or warm support-transpose timing regresses. The
+   compact coefficient-record route remains a separate fallback: it can remove
+   repeated forward directional solves from the current best support path, but
+   it does not combine state and support into one prepared-lowdot call.
+
+#### Step 1 result: scalar-RHS relocation alone is rejected
+
+The new pure-array structural test
+`test_joint_lowdot_scalar_rhs_layout_does_not_hide_rhs_axis_from_anchor_scan`
+compares the rejected anchor-major objective-batched route with the tempting
+rewrite that places `vmap` outside a scalar anchor scan.  It inspects only
+JAX's abstract scan body shapes.  Both layouts have the same scan carries:
+state `(n_rhs, 2)` and support `(n_rhs, 5)` in the mock.  This is expected:
+JAX's batching rule pushes the outer `vmap` axis into `lax.scan`.
+
+Therefore merely relocating the objective `vmap` cannot reduce compilation or
+memory and must not be implemented as a production selector.  A viable joint
+path has to change what is carried/accumulated, not merely where `vmap` is
+written.  The next investigation must determine whether the prepared-lowdot
+support contribution can be reduced directly into a compact runtime-geometry
+cotangent, rather than carrying the complete prepared-support tree through
+the anchor scan.
+
+#### Step 2 result: do not pull prepared support through VMEC per rebuild
+
+That proposed compaction is not valid for this path.  The final
+`geometry_payload_pullback_from_param_vector_raw_block_transpose` deliberately
+receives the *summed* NTX support-payload cotangent after the complete transport
+reverse sweep.  It builds the payload-to-VMEC-state VJP once and then applies
+the VMEC raw-block transpose once for all objective RHS.
+
+The NTX prepared leaves are not merely fixed scaffolding: `surface`,
+`geometry`, `d_theta`, and `d_zeta` are built by
+`prepare_monoenergetic_system` from VMEC/Boozer surfaces.  Collapsing their
+bars to a runtime-geometry cotangent inside each Radau rebuild would require
+executing that VMEC/Boozer payload pullback inside every rebuilt step.  That
+would duplicate the expensive geometry graph and defeats the current
+one-final-pullback design.
+
+The external payload pullback already filters inactive float leaves after the
+sweep.  Repacking those same leaves earlier would not remove their floating
+array volume or the objective axis from the segment scan.  Hence this route is
+rejected without production changes.  The remaining viable exact optimisation
+is to reduce the *local NTX work* before those necessary payload bars are
+formed (for example the bounded compact coefficient-record consumer), not to
+move the VMEC payload contraction into the segment.
+
+#### Step 3 audit: what the local joint prepared-lowdot helper already shares
+
+The local joint helper is not doing a second ordinary NTX primal or a second
+base implicit adjoint. Its grouped core calls `_prepared_implicit_vjp_primal`
+once, producing the base coefficient modes, factorisation, `f1_full`, and
+`f3_full`. The base prepared support bar and ordinary state bars both reuse
+the same `lambda1` and `lambda3` transpose solves.
+
+The additional work is required by the response representation itself. The
+interpolated response has a base moment field plus `d/dEr` and
+`d/dlog(nu*)` fields. Exact prepared-support differentiation therefore needs
+five distinct contractions: the base support bar; a base and directional bar
+for `d/dEr`; and a base and directional bar for `d/dlog(nu*)`.
+
+The directional terms require full directional NTX mode fields and directional
+adjoints (`f1_dot`, `f3_dot`, `lambda1_dot`, and `lambda3_dot`). The fast
+case-only lowdot route needs only low-order mode contractions for state bars,
+so it does not construct those full fields. They cannot be made free merely
+by placing geometry in the same call.
+
+This explains the rejected joint modes: they did share the base factorisation,
+but exposed necessary full directional geometry algebra and prepared bars in
+an already large objective-batched segment graph. There is no source evidence
+of an accidental second base NTX solve to remove in that helper.
+
+#### Step 2 implementation: compact numeric prepared-support scan carry
+
+The existing joint adapter now accepts the private static flag
+`compact_prepared_support_carry`. It leaves the scalar joint lowdot call
+unchanged: that call still returns state/case bars, direct `drds`, and all
+prepared bars together. Only its anchor-scan accumulator changes.
+
+Instead of carrying a pytree of objective-batched `face_prepared` arrays, the
+compact branch carries one numeric array with layout
+`(objective, face-radius, sum(local prepared-leaf sizes))`. Each anchor packs
+the existing local prepared bars and applies one radius scatter; after the
+scan, the exact original prepared pytree is reconstructed with its original
+bar dtypes and shapes. It adds no tape, factor payload, host work, or serial
+objective loop.
+
+The new wrapper is exposed only through the opt-in selector
+`ntx_joint_implicit_interpolated_faces_reuse_local_vjp_primal_compact_prepared_carry`.
+`separate_reuse_local_vjp_primal` and all existing joint modes retain their
+previous implementations.  The selector takes the joint Radau branch, so it
+does not invoke either separate rebuild hook.
+
+The dependency-free mock
+`tests/test_joint_lowdot_compact_carry_mock.py` verifies that the packed
+accumulation/unpacking is exactly equal to the original per-leaf scatter.  It
+passed locally without an NTX or transport solve.  `py_compile` and `git diff
+--check` also pass.  This establishes layout equivalence only; the remote
+benchmark remains the gate for whether the reduced scan carry helps the XLA
+compile or warm rebuild time.
+
+### Active plan: joint lowdot replaces the separate rebuild support transpose
+
+This plan uses the already exact local primitive
+`solve_prepared_coefficient_vector_lowdot_two_pullbacks_with_prepared_and_aux`.
+It is **not** a new NTX differentiation rule and it does not change the
+current best selector.
+
+For a new opt-in rebuild selector, every rebuilt local NTX response must use
+the joint primitive once and return both state/case bars and prepared
+geometry/support bars.  That selector must not dispatch either
+`pullback_build_lagged_response` followed by
+`flat_rhs_build_support_pullback`, nor the generic `jax.vjp` support path.
+The support bars are accumulated through the segment exactly as today and are
+passed once, after the reverse sweep, to the existing payload/VMEC pullback.
+
+1. **Dispatch proof.** Introduce a narrow joint-only selector and a pure
+   mock/structural test that records the invoked rebuild hooks.  It must prove
+   the selector calls the joint lowdot hook and never calls the separate
+   state or support hooks.  The current best selector is a control and must
+   remain byte-for-byte on its existing dispatch branch.
+
+2. **Compact joint adapter.** Refactor only the NEOPAX adapter around the
+   existing scalar joint lowdot call.  It may batch numeric leaves on device,
+   but it must not return or carry static NTX dataclass metadata, invoke a
+   host loop, or use a serial objective scan.  The adapter returns the same
+   state bar and active float support leaves as the two established separate
+   paths.  It must retain the axis-anchor zero rule and the existing single
+   final geometry payload pullback.
+
+3. **Exactness tests.** On small in-memory fixtures, compare all state leaves,
+   all active prepared/support leaves, `drds`, and interpolation-coordinate
+   bars against the sum of current state-lowdot plus generic-support paths for
+   one, two, and four objective RHS.  These tests use no full transport run,
+   profile dump, or XLA dump.
+
+4. **Benchmark gate.** Only after the above passes, run one remote
+   cache-disabled 16-step benchmark.  Reject the selector if first-segment
+   compilation or warm rebuilt-support time regresses.  No default or current
+   best mode will be changed based on this experiment.
+
+#### Step 1 result: existing joint selector already has the required dispatch
+
+No new Radau selector is required for the dispatch part.  The existing
+`ntx_joint_implicit_interpolated_faces` family enters the
+`joint_ntx_rebuild_pullback` branch in `_transport_solvers.py`.  That branch
+calls exactly one joint hook,
+`flat_rhs_build_state_and_support_pullback_batched_interpolated_faces`, and
+receives `(rebuild_flat_bars, rebuild_support_bars)` together.
+
+The separate rebuild state hook is in the `else` branch and is therefore not
+called.  The generic/batched separate support hook is guarded by
+`not joint_ntx_rebuild_pullback` and is likewise not called.  The following
+`elif joint_ntx_rebuild_pullback` only adds the already-returned support bars
+to the segment accumulator.  Thus the existing joint selector already has
+the required "no separate geometry/support transpose" semantics.  The work
+is to replace only its costly NEOPAX joint-adapter layout, not to create a
+second Radau dispatch mode.

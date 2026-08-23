@@ -610,6 +610,83 @@ def test_scalar_joint_local_pullback_mock_matches_existing_state_pullback():
     assert jnp.allclose(joint_bars[4][0], jnp.asarray([10.0, 11.0]))
 
 
+def test_joint_lowdot_scalar_rhs_layout_does_not_hide_rhs_axis_from_anchor_scan():
+    """Reject a merely relocated objective ``vmap`` as a compile optimisation.
+
+    The rejected joint prepared-lowdot route carries objective-batched support
+    leaves through its anchor scan.  A tempting rewrite is to make the anchor
+    function scalar in the objective RHS and wrap it in ``vmap`` outside the
+    scan.  JAX's scan batching rule pushes that outer axis back into the scan
+    carry, so this rewrite alone cannot make the segment HLO smaller.
+
+    This is a pure-array, in-memory structural test: no transport or NTX
+    solver is constructed or executed, and ``make_jaxpr`` does not compile for
+    a device or write files.
+    """
+    objective_count = 3
+    anchor_count = 4
+    rhs = jnp.arange(objective_count * anchor_count, dtype=jnp.float64).reshape(
+        objective_count, anchor_count
+    )
+    anchors = jnp.arange(anchor_count, dtype=jnp.int32)
+
+    def _joint_with_batched_scan_carry(rhs_values):
+        def _body(carry, anchor):
+            state_bar, support_bar = carry
+            local_bar = jax.lax.dynamic_index_in_dim(rhs_values, anchor, axis=1)
+            return (
+                state_bar + local_bar[:, None],
+                {"geometry": support_bar["geometry"] + local_bar[:, None]},
+            ), None
+
+        return jax.lax.scan(
+            _body,
+            (
+                jnp.zeros((objective_count, 2), dtype=rhs_values.dtype),
+                {"geometry": jnp.zeros((objective_count, 5), dtype=rhs_values.dtype)},
+            ),
+            anchors,
+        )[0]
+
+    def _scalar_rhs_then_outer_vmap(rhs_values):
+        def _one_rhs(one_rhs):
+            def _body(carry, anchor):
+                state_bar, support_bar = carry
+                local_bar = jax.lax.dynamic_index_in_dim(one_rhs, anchor, axis=0)
+                return (
+                    state_bar + local_bar,
+                    {"geometry": support_bar["geometry"] + local_bar},
+                ), None
+
+            return jax.lax.scan(
+                _body,
+                (
+                    jnp.zeros((2,), dtype=one_rhs.dtype),
+                    {"geometry": jnp.zeros((5,), dtype=one_rhs.dtype)},
+                ),
+                anchors,
+            )[0]
+
+        return jax.vmap(_one_rhs)(rhs_values)
+
+    def _scan_carry_shapes(function):
+        closed = jax.make_jaxpr(function)(rhs)
+        scan_equations = [eqn for eqn in closed.jaxpr.eqns if eqn.primitive.name == "scan"]
+        assert len(scan_equations) == 1
+        scan = scan_equations[0]
+        carry_count = scan.params["num_carry"]
+        body = scan.params["jaxpr"].jaxpr
+        return tuple(
+            tuple(invar.aval.shape)
+            for invar in body.invars[:carry_count]
+        )
+
+    # The proposed outer-vmap arrangement has exactly the same batched carry
+    # shapes: moving the vmap syntactically is not a valid production change.
+    assert _scan_carry_shapes(_joint_with_batched_scan_carry) == ((3, 2), (3, 5))
+    assert _scan_carry_shapes(_scalar_rhs_then_outer_vmap) == ((3, 2), (3, 5))
+
+
 def test_normalize_solver_config_prefers_transport_solver_section():
     config = {
         "transport_solver": {

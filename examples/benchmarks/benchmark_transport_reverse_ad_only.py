@@ -5432,6 +5432,7 @@ def main() -> None:
             "ntx_joint_implicit_interpolated_faces",
             "ntx_joint_implicit_interpolated_faces_packed_support_adjoint",
             "ntx_joint_implicit_interpolated_faces_reuse_local_vjp_primal",
+            "ntx_joint_implicit_interpolated_faces_reuse_local_vjp_primal_compact_prepared_carry",
         ),
         default="separate",
         help=(
@@ -5471,7 +5472,11 @@ def main() -> None:
             "paired directional support-adjoint solve. "
             "'ntx_joint_implicit_interpolated_faces_reuse_local_vjp_primal' "
             "keeps the joint state/support adjoint but reuses its local primal "
-            "response for the interpolation-coordinate transpose."
+            "response for the interpolation-coordinate transpose. "
+            "'ntx_joint_implicit_interpolated_faces_reuse_local_vjp_primal_compact_prepared_carry' "
+            "keeps that same joint lowdot calculation while packing only the "
+            "prepared-support anchor-scan carry; it is an isolated exact "
+            "compile-layout experiment."
         ),
     )
     parser.add_argument(

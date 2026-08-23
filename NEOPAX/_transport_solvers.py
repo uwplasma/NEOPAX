@@ -1080,6 +1080,7 @@ def _lagged_response_build_state_and_support_pullback_batched_interpolated_faces
     vector_field: Callable,
     *,
     reuse_local_vjp_primal: bool = False,
+    compact_prepared_support_carry: bool = False,
 ):
     owner = getattr(vector_field, "__self__", None)
     if owner is None:
@@ -1087,9 +1088,14 @@ def _lagged_response_build_state_and_support_pullback_batched_interpolated_faces
     pullback_fn = getattr(
         owner,
         (
+            "pullback_build_lagged_response_state_and_support_payload_"
+            "batched_interpolated_faces_reuse_local_vjp_primal_compact_prepared_carry"
+            if compact_prepared_support_carry
+            else (
             "pullback_build_lagged_response_state_and_support_payload_batched_interpolated_faces_reuse_local_vjp_primal"
             if reuse_local_vjp_primal
             else "pullback_build_lagged_response_state_and_support_payload_batched_interpolated_faces"
+            )
         ),
         None,
     )
@@ -1543,11 +1549,13 @@ def _flat_rhs_build_state_and_support_pullback_batched_interpolated_faces_factor
     project_flat=None,
     packed_support_directional_adjoint: bool = False,
     reuse_local_vjp_primal: bool = False,
+    compact_prepared_support_carry: bool = False,
 ):
     """Flatten the exact joint NTX rebuild state/support pullback hook."""
     pullback_fn = _lagged_response_build_state_and_support_pullback_batched_interpolated_faces_hook(
         vector_field,
         reuse_local_vjp_primal=reuse_local_vjp_primal,
+        compact_prepared_support_carry=compact_prepared_support_carry,
     )
     if pullback_fn is None:
         return None
@@ -3753,6 +3761,7 @@ class _RadauAcceptedStepPhysicsContext:
     flat_rhs_build_support_pullback_batched_interpolated_faces_multi_rhs_shared_primal: Callable[[Any, Any, Any], Any] | None = None
     flat_rhs_build_state_and_support_pullback_batched_interpolated_faces: Callable[[Any, Any, Any], Any] | None = None
     flat_rhs_build_state_and_support_pullback_batched_interpolated_faces_reuse_local_vjp_primal: Callable[[Any, Any, Any], Any] | None = None
+    flat_rhs_build_state_and_support_pullback_batched_interpolated_faces_reuse_local_vjp_primal_compact_prepared_carry: Callable[[Any, Any, Any], Any] | None = None
     flat_rhs_lagged_response_support_pullback: Callable[[Any, Any, Any, Any, Any], Any] | None = None
     flat_rhs_lagged_response_all_pullback: Callable[[Any, Any, Any, Any, Any], tuple[Any, Any, Any]] | None = None
     flat_rhs_state_pullback: Callable[[Any, Any, Any, Any], Any] | None = None
@@ -5931,6 +5940,7 @@ def _execute_radau_accepted_step_next_reduced_cotangent_batched_bwd_with_support
             "ntx_joint_implicit_interpolated_faces",
             "ntx_joint_implicit_interpolated_faces_packed_support_adjoint",
             "ntx_joint_implicit_interpolated_faces_reuse_local_vjp_primal",
+            "ntx_joint_implicit_interpolated_faces_reuse_local_vjp_primal_compact_prepared_carry",
         }
         zero_rebuild_pullback = cotangent_mode in {
             "zero_rebuild_pullback",
@@ -5941,10 +5951,15 @@ def _execute_radau_accepted_step_next_reduced_cotangent_batched_bwd_with_support
             rebuild_flat_bars = jnp.zeros_like(y_bars)
         elif joint_ntx_rebuild_pullback:
             joint_pullback = (
-                physics_context.flat_rhs_build_state_and_support_pullback_batched_interpolated_faces_reuse_local_vjp_primal
+                physics_context.flat_rhs_build_state_and_support_pullback_batched_interpolated_faces_reuse_local_vjp_primal_compact_prepared_carry
                 if rebuild_support_pullback_mode
-                == "ntx_joint_implicit_interpolated_faces_reuse_local_vjp_primal"
-                else physics_context.flat_rhs_build_state_and_support_pullback_batched_interpolated_faces
+                == "ntx_joint_implicit_interpolated_faces_reuse_local_vjp_primal_compact_prepared_carry"
+                else (
+                    physics_context.flat_rhs_build_state_and_support_pullback_batched_interpolated_faces_reuse_local_vjp_primal
+                    if rebuild_support_pullback_mode
+                    == "ntx_joint_implicit_interpolated_faces_reuse_local_vjp_primal"
+                    else physics_context.flat_rhs_build_state_and_support_pullback_batched_interpolated_faces
+                )
             )
             if joint_pullback is None:
                 raise RuntimeError(
@@ -17416,6 +17431,18 @@ def _build_prepared_radau_accepted_rollout(
             reuse_local_vjp_primal=True,
         )
     )
+    flat_rhs_build_state_and_support_pullback_batched_interpolated_faces_reuse_local_vjp_primal_compact_prepared_carry = (
+        _flat_rhs_build_state_and_support_pullback_batched_interpolated_faces_factory(
+            unravel=unpack_flat,
+            pack_flat=pack_state,
+            vector_field=vector_field,
+            args=args,
+            kwargs=kwargs,
+            project_flat=project_flat,
+            reuse_local_vjp_primal=True,
+            compact_prepared_support_carry=True,
+        )
+    )
     flat_rhs_lagged_response_support_pullback = _flat_rhs_lagged_response_support_pullback_factory(
         unravel=unpack_flat,
         vector_field=vector_field,
@@ -17739,6 +17766,9 @@ def _build_prepared_radau_accepted_rollout(
         flat_rhs_build_state_and_support_pullback_batched_interpolated_faces_reuse_local_vjp_primal=(
             flat_rhs_build_state_and_support_pullback_batched_interpolated_faces_reuse_local_vjp_primal
         ),
+        flat_rhs_build_state_and_support_pullback_batched_interpolated_faces_reuse_local_vjp_primal_compact_prepared_carry=(
+            flat_rhs_build_state_and_support_pullback_batched_interpolated_faces_reuse_local_vjp_primal_compact_prepared_carry
+        ),
         flat_rhs_lagged_response_support_pullback=flat_rhs_lagged_response_support_pullback,
         flat_rhs_lagged_response_all_pullback=flat_rhs_lagged_response_all_pullback,
         flat_rhs_state_pullback=flat_rhs_state_pullback,
@@ -17978,6 +18008,18 @@ class RADAUSolver(_RadauSolverConfig):
                 kwargs=kwargs,
                 project_flat=project_flat,
                 reuse_local_vjp_primal=True,
+            )
+        )
+        flat_rhs_build_state_and_support_pullback_batched_interpolated_faces_reuse_local_vjp_primal_compact_prepared_carry = (
+            _flat_rhs_build_state_and_support_pullback_batched_interpolated_faces_factory(
+                unravel=unpack_flat,
+                pack_flat=pack_state,
+                vector_field=vector_field,
+                args=args,
+                kwargs=kwargs,
+                project_flat=project_flat,
+                reuse_local_vjp_primal=True,
+                compact_prepared_support_carry=True,
             )
         )
         flat_rhs_lagged_response_support_pullback = _flat_rhs_lagged_response_support_pullback_factory(
@@ -18296,6 +18338,9 @@ class RADAUSolver(_RadauSolverConfig):
             ),
             flat_rhs_build_state_and_support_pullback_batched_interpolated_faces_reuse_local_vjp_primal=(
                 flat_rhs_build_state_and_support_pullback_batched_interpolated_faces_reuse_local_vjp_primal
+            ),
+            flat_rhs_build_state_and_support_pullback_batched_interpolated_faces_reuse_local_vjp_primal_compact_prepared_carry=(
+                flat_rhs_build_state_and_support_pullback_batched_interpolated_faces_reuse_local_vjp_primal_compact_prepared_carry
             ),
             flat_rhs_lagged_response_support_pullback=flat_rhs_lagged_response_support_pullback,
             flat_rhs_lagged_response_all_pullback=flat_rhs_lagged_response_all_pullback,
