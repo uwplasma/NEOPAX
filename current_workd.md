@@ -238,6 +238,36 @@ current NTX work or violate the bounded-memory requirement. The disconnected
 record implementation remains isolated while the next timing direction is
 selected from a different proven operation.
 
+## Native matrix-RHS exactness correction (2026-08-23; unselected)
+
+The native matrix-RHS path was fast in later segments but did not reproduce
+the geometry/support derivatives.  A small local discriminator isolated the
+failure to the ``dtransport_moments_d_er`` channel, including the scalar
+prepared-support low-dot oracle.  The missing quantity is the directional
+coefficient cotangent:
+
+``d/dcase [ pullback(moment_from_coefficients, moment_bar) ]``.
+
+The low-dot implementation differentiated the NTX primal and adjoint fields
+but held that cotangent constant.  The native path consequently omitted the
+mixed moment/NTX term; it was not a native-RHS packing error.
+
+The correction is intentionally limited to the unselected native adapter:
+
+1. NEOPAX forms the two directional coefficient-cotangent batches alongside
+   the already-existing directional ``drds`` batches.
+2. NTX accepts these as an optional fifth callback result and carries them
+   through the directional coefficient pullback and prepared-gradient JVP.
+3. Existing four-item callbacks receive zero tangents, so
+   ``separate_reuse_local_vjp_primal`` retains its prior callback path and
+   dispatch.
+
+This adds algebraic tangent contractions only; it adds no NTX primal solve,
+factorisation, host work, objective loop, checkpoint record, or persistent
+output.  Required next gate: the CPU-only in-memory native-versus-actual-local
+VJP test for one and two energies, followed by the remote GPU benchmark only
+if exactness passes.
+
 ## Scope and non-negotiable constraints
 
 - Preserve the exact transport/reverse mathematics.

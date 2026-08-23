@@ -7094,11 +7094,31 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                 base_coefficient_bars, base_drds_bars = _moment_pullback_batched(
                     coefficients, base_transport_moments_bars
                 )
-                first_coefficient_bars, first_drds_bars = _moment_pullback_batched(
-                    coefficients, dtransport_moments_d_er_bars
+                (
+                    first_coefficient_bars,
+                    first_drds_bars,
+                ), (
+                    first_coefficient_bars_dot,
+                    first_drds_bars_dot,
+                ) = jax.jvp(
+                    lambda coefficient_value: _moment_pullback_batched(
+                        coefficient_value, dtransport_moments_d_er_bars
+                    ),
+                    (coefficients,),
+                    (first_coeff_dot,),
                 )
-                second_coefficient_bars, second_drds_bars = _moment_pullback_batched(
-                    coefficients, dtransport_moments_d_log_nu_star_bars
+                (
+                    second_coefficient_bars,
+                    second_drds_bars,
+                ), (
+                    second_coefficient_bars_dot,
+                    second_drds_bars_dot,
+                ) = jax.jvp(
+                    lambda coefficient_value: _moment_pullback_batched(
+                        coefficient_value, dtransport_moments_d_log_nu_star_bars
+                    ),
+                    (coefficients,),
+                    (second_coeff_dot,),
                 )
 
                 def _direct_drds_bars(coefficient_value, moment_bars):
@@ -7139,6 +7159,10 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                         first_drds_bars_dot,
                         second_drds_bars,
                         second_drds_bars_dot,
+                    ),
+                    (
+                        first_coefficient_bars_dot,
+                        second_coefficient_bars_dot,
                     ),
                 )
 
