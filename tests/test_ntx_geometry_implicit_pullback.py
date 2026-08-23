@@ -456,6 +456,28 @@ def test_native_multi_rhs_support_retains_local_drds_case_chain():
         expected_component_prepared, _expected_component_drds = component_pullback(
             component_field_bars
         )
+        if component_name == "dtransport_moments_d_er":
+            (
+                _full_nu_hat,
+                _full_epsi_hat,
+                _full_vth_a,
+                full_prepared,
+                _full_direct_drds,
+            ) = model._pullback_interpolated_moment_reduced_local_outputs_with_prepared_support_and_drds(
+                prepared,
+                drds_value=drds,
+                reference_nu_hat=reference_nu_hat,
+                reference_epsi_hat=reference_epsi_hat,
+                vth_a=vth_a,
+                field_bars=component_field_bars,
+            )
+            try:
+                _assert_float_tree_allclose(full_prepared, expected_component_prepared)
+            except AssertionError as error:
+                raise AssertionError(
+                    "Full low-dot prepared pullback mismatch in "
+                    "dtransport_moments_d_er."
+                ) from error
         try:
             _assert_float_tree_allclose(
                 jax.tree_util.tree_map(lambda value: value[0], component_prepared),
