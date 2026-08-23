@@ -11327,7 +11327,7 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             _accumulate_anchor,
             (
                 face_channels_bar,
-                face_prepared_bar,
+                face_prepared_scan_bar,
                 face_density_bar,
                 face_temperature_bar,
                 face_er_bar,

@@ -25,6 +25,8 @@ def test_compact_joint_prepared_carry_matches_leaf_scatter_mock():
         prepared,
     )
 
+    packed_indices = []
+    packed_updates = []
     for radius_index, scale in ((1, 1.0), (3, -0.5), (1, 2.0)):
         local_leaves = tuple(
             scale
@@ -38,12 +40,26 @@ def test_compact_joint_prepared_carry_matches_leaf_scatter_mock():
             legacy,
             treedef.unflatten(local_leaves),
         )
-        packed = packed.at[:, radius_index].add(
+        packed_indices.append(radius_index)
+        packed_updates.append(
             jnp.concatenate(
                 tuple(jnp.reshape(local, (objective_count, -1)) for local in local_leaves),
                 axis=1,
             )
         )
+
+    def _packed_scan_step(carry, scan_input):
+        radius_index, local_update = scan_input
+        return carry.at[:, radius_index].add(local_update), None
+
+    packed, _ = jax.lax.scan(
+        _packed_scan_step,
+        packed,
+        (
+            jnp.asarray(packed_indices, dtype=jnp.int32),
+            jnp.stack(packed_updates),
+        ),
+    )
 
     compact_leaves = []
     offset = 0
