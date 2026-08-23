@@ -7319,9 +7319,13 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                 1,
             )
             epsi_hat_bars = jnp.swapaxes(
+                # The second base bar is for the second physical direction
+                # ``(nu_hat, 0)``.  Its epsilon component therefore multiplies
+                # that direction's constant zero epsilon slot, rather than
+                # the primal epsilon coordinate.  Do not route it through
+                # ``drds -> epsi_hat``.
                 base_epsi_hat_bars
                 + first_epsi_hat_bars
-                + second_base_epsi_hat_bars
                 + second_epsi_hat_bars,
                 0,
                 1,
