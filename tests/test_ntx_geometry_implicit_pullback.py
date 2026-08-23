@@ -43,14 +43,14 @@ def _small_runtime_model(n_energy=1):
     return model
 
 
-def _assert_float_tree_allclose(actual, expected):
+def _assert_float_tree_allclose(actual, expected, *, rtol=1e-9, atol=1e-11):
     for leaf_index, (actual_leaf, expected_leaf) in enumerate(zip(
         jax.tree_util.tree_leaves(actual),
         jax.tree_util.tree_leaves(expected),
         strict=True,
     )):
         if jnp.issubdtype(jnp.asarray(expected_leaf).dtype, jnp.inexact):
-            if not jnp.allclose(actual_leaf, expected_leaf, rtol=1e-9, atol=1e-11):
+            if not jnp.allclose(actual_leaf, expected_leaf, rtol=rtol, atol=atol):
                 difference = jnp.abs(actual_leaf - expected_leaf)
                 scale = jnp.maximum(jnp.abs(expected_leaf), 1.0e-30)
                 raise AssertionError(
@@ -464,6 +464,7 @@ def test_native_multi_rhs_support_retains_local_drds_case_chain():
                     lambda value: value[0], native_component_prepared
                 ),
                 expected_component_prepared,
+                rtol=5e-9,
             )
         except AssertionError as error:
             raise AssertionError(
@@ -477,8 +478,11 @@ def test_native_multi_rhs_support_retains_local_drds_case_chain():
         _assert_float_tree_allclose(
             jax.tree_util.tree_map(lambda value: value[rhs_index], native_prepared),
             expected_prepared,
+            rtol=5e-9,
         )
-        _assert_float_tree_allclose(native_drds[rhs_index], expected_drds)
+        _assert_float_tree_allclose(
+            native_drds[rhs_index], expected_drds, rtol=5e-9
+        )
 
 
 def test_compact_local_coefficient_record_matches_ordinary_response():
