@@ -1171,3 +1171,15 @@ These are algebra/axis checks only.  A cache-disabled transport benchmark is
 still required to determine whether the native packed graph improves or
 regresses compilation and execution.  Do not promote it over the established
 best mode without that comparison.
+
+#### Wiring correction before benchmark
+
+The first native-selector benchmark correctly stopped before XLA compilation:
+the Radau vector field is bound to `CombinedTransportFluxModel`, whereas the
+new forwarding method had initially been added only to the inner
+`NTXExactLijRuntimeTransportModel`.  Consequently the Radau factory resolved
+the native hook to `None`.  The outer composite forwarding method is now
+present and delegates only to the inner native method, matching the existing
+batched-mode wrappers.  A pure mock test checks that the composite hook
+forwards the state, NTX response bars, and support payload exactly once.  No
+established selector is changed.

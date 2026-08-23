@@ -7,6 +7,7 @@ import jax.numpy as jnp
 import ntx
 
 from NEOPAX._transport_flux_models import (
+    CombinedTransportFluxModel,
     NTXExactLijRuntimeTransportModel,
     _sanitize_float_delta_bar_tree,
 )
@@ -46,6 +47,39 @@ def _assert_float_tree_allclose(actual, expected):
     ):
         if jnp.issubdtype(jnp.asarray(expected_leaf).dtype, jnp.inexact):
             assert jnp.allclose(actual_leaf, expected_leaf, rtol=1e-9, atol=1e-11)
+
+
+def test_native_multi_rhs_composite_forwarding_hook_is_exposed_to_radau():
+    """The vector-field owner must expose the native inner NTX hook.
+
+    Radau owns a :class:`CombinedTransportFluxModel` method, rather than the
+    exact-NTX component method directly.  This pure mock prevents a missing
+    outer forwarding wrapper from becoming a late reverse-segment failure.
+    """
+
+    calls = []
+
+    class _InnerNTX:
+        def pullback_build_lagged_response_support_payload_batched_interpolated_faces_native_multi_rhs_shared_primal(
+            self,
+            state,
+            response_bars,
+            support,
+        ):
+            calls.append((state, response_bars, support))
+            return "native-result"
+
+    composite = object.__new__(CombinedTransportFluxModel)
+    object.__setattr__(composite, "neoclassical_model", _InnerNTX())
+    response = SimpleNamespace(neoclassical_response="ntx-bars")
+
+    assert composite.pullback_build_lagged_response_support_payload_batched_interpolated_faces_native_multi_rhs_shared_primal(
+        "state",
+        response,
+        "support",
+        ignored_outer_keyword=True,
+    ) == "native-result"
+    assert calls == [("state", "ntx-bars", "support")]
 
 
 def test_geometry_implicit_local_support_pullback_matches_prepared_support_path():
