@@ -7025,6 +7025,7 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         vth_a,
         field_bars,
         native_factorized_ntx_rhs: bool = False,
+        return_case_bars: bool = False,
     ):
         """Batched exact prepared/``drds`` transpose for one local species.
 
@@ -7138,7 +7139,7 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                 )
 
             helper_kwargs = dict(return_primal_outputs=True)
-            if native_factorized_ntx_rhs:
+            if native_factorized_ntx_rhs and return_case_bars:
                 # The native matrix-RHS helper can return the already-formed
                 # case bars.  The normal support-only helper deliberately
                 # omits them, so retain its original contract unchanged.
@@ -7155,7 +7156,7 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                 _bars_and_direct_drds,
                 **helper_kwargs,
             )
-            if native_factorized_ntx_rhs:
+            if native_factorized_ntx_rhs and return_case_bars:
                 primal_outputs, support_result, case_bar_components = helper_result
                 return (*support_result[:-1], support_result[-1], primal_outputs, case_bar_components)
             primal_outputs, support_result = helper_result
@@ -7165,7 +7166,7 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             _one_energy,
             (energy_indices, reference_nu_hat, reference_epsi_hat, epsi_hat_tangent),
         )
-        if native_factorized_ntx_rhs:
+        if native_factorized_ntx_rhs and return_case_bars:
             (
                 base_prepared_bars,
                 first_base_prepared_bars,
@@ -7290,6 +7291,7 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         reference_epsi_hat,
         vth_a,
         field_bars,
+        return_case_bars: bool = False,
     ):
         """Private adapter for NTX's native matrix-RHS support helper.
 
@@ -7306,6 +7308,7 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             vth_a=vth_a,
             field_bars=field_bars,
             native_factorized_ntx_rhs=True,
+            return_case_bars=return_case_bars,
         )
 
     def _pullback_local_scan_inputs_from_primitives(
@@ -11043,6 +11046,9 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                     if native_factorized_ntx_rhs
                     else self._pullback_interpolated_moment_prepared_support_and_drds_only_multi_rhs
                 )
+                local_kwargs = {}
+                if native_factorized_ntx_rhs:
+                    local_kwargs["return_case_bars"] = True
                 local_result = local_support_pullback(
                     prepared,
                     drds_value=drds_value,
@@ -11050,6 +11056,7 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                     reference_epsi_hat=reference_epsi_hat,
                     vth_a=vth_a,
                     field_bars=species_field_bars,
+                    **local_kwargs,
                 )
                 if native_factorized_ntx_rhs:
                     (

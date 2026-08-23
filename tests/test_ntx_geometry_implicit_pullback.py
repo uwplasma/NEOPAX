@@ -398,6 +398,7 @@ def test_native_multi_rhs_support_retains_local_drds_case_chain():
         reference_epsi_hat=reference_epsi_hat,
         vth_a=vth_a,
         field_bars=batched_field_bars,
+        return_case_bars=True,
     )
     native_drds = native_direct_drds + jnp.sum(native_epsi_hat * epsi_per_drds, axis=1)
 
