@@ -44,13 +44,21 @@ def _small_runtime_model(n_energy=1):
 
 
 def _assert_float_tree_allclose(actual, expected):
-    for actual_leaf, expected_leaf in zip(
+    for leaf_index, (actual_leaf, expected_leaf) in enumerate(zip(
         jax.tree_util.tree_leaves(actual),
         jax.tree_util.tree_leaves(expected),
         strict=True,
-    ):
+    )):
         if jnp.issubdtype(jnp.asarray(expected_leaf).dtype, jnp.inexact):
-            assert jnp.allclose(actual_leaf, expected_leaf, rtol=1e-9, atol=1e-11)
+            if not jnp.allclose(actual_leaf, expected_leaf, rtol=1e-9, atol=1e-11):
+                difference = jnp.abs(actual_leaf - expected_leaf)
+                scale = jnp.maximum(jnp.abs(expected_leaf), 1.0e-30)
+                raise AssertionError(
+                    "float tree mismatch: "
+                    f"leaf={leaf_index} "
+                    f"max_abs={float(jnp.max(difference)):.16e} "
+                    f"max_rel={float(jnp.max(difference / scale)):.16e}"
+                )
 
 
 def test_native_multi_rhs_composite_forwarding_hook_is_exposed_to_radau():
