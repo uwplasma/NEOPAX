@@ -7235,7 +7235,7 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                 (second_coefficient_dot_scan,),
             )[1],
         )
-        if native_factorized_ntx_rhs:
+        if native_factorized_ntx_rhs and return_case_bars:
             (
                 base_nu_hat_bars,
                 base_epsi_hat_bars,
