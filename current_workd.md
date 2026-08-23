@@ -946,6 +946,17 @@ passed locally without an NTX or transport solve.  `py_compile` and `git diff
 benchmark remains the gate for whether the reduced scan carry helps the XLA
 compile or warm rebuild time.
 
+#### Dispatch repair after the first remote attempt
+
+The first compact-selector benchmark stopped before the reverse segment
+compiled.  Its `RuntimeError` was caused by a missing forwarding method on
+the outer `TransportEquationSystem`: the Radau vector field is bound to that
+object, not directly to the flux model.  The compact method existed on the
+flux-model layers but was therefore invisible to the hook resolver.  The
+outer forwarding method is now present and forwards to the existing
+local-primal-reuse implementation with the compact flag.  It does not alter
+the default or the current best selector.
+
 ### Active plan: joint lowdot replaces the separate rebuild support transpose
 
 This plan uses the already exact local primitive
