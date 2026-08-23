@@ -1249,3 +1249,40 @@ the local VJP gate is exact, measure a device-only non-inline call boundary
 on the corrected native helper using a small mock lowering before asking for
 another transport benchmark.  Do not use a host callback, a full tape, or a
 serial objective scan.
+
+### Current plan: exact native shared-field support path, then compile reduction
+
+**Scope guard.** The established exact bounded-memory selector remains
+`separate_reuse_local_vjp_primal`.  All work below stays behind the isolated
+native selector.  It must not add a host transfer, a Python/objective loop,
+a persistent per-step tape, or an additional NTX factorization/adjoint solve.
+
+1. **Find the exact missing prepared-support term.** The new local VJP gate
+   established that the scalar `prepared_support_only` algebra already differs
+   from the true local response VJP, before native matrix-RHS packing is used.
+   Split that gate into base, `d/dEr`, and `d/dlog(nu)` output cotangents and
+   compare each prepared bar to the real local VJP.  This identifies the one
+   omitted/misweighted low-dot support term without a transport rollout.
+
+2. **Correct the algebra at the shared-field level.** Express the identified
+   term from the already available native primal, base-adjoint, directional-
+   adjoint, and lambda-dot fields.  Pack all objective cotangents as trailing
+   matrix-RHS columns.  The result must match the full local VJP for both one
+   and two energies, multiple RHS, and the `drds -> epsi_hat` primitive chain.
+   The scalar routine remains a test oracle; it is not used in the benchmark
+   mode.
+
+3. **Only then address compilation structure.** Before another transport run,
+   lower a small in-memory native kernel and compare its generated JAX/XLA
+   structure against the current native selector.  A compile reduction is
+   acceptable only if it preserves the one shared matrix-RHS factorization and
+   does not inline a full prepared-support reverse graph once per Radau slot.
+   Candidate: split the already-known realized lagged pattern into static
+   reuse/rebuild segment variants, so XLA does not compile both giant branches
+   in every reverse slot.  This is bounded by segment patterns, independent of
+   total accepted-step count.
+
+4. **Promotion gate.** Run small CPU algebra tests, then the GPU transport
+   benchmark only after exactness passes.  Reject the isolated selector unless
+   it reproduces the established derivative table and improves total compiled
+   and warm reverse timing.  No default changes before that result.

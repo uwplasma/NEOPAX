@@ -427,6 +427,46 @@ def test_native_multi_rhs_support_retains_local_drds_case_chain():
             collisionality_kind="unused",
         )
 
+    # The complete RHS below is linear.  Gate its three NTX-dependent output
+    # channels independently so a failure identifies the low-dot term that
+    # needs correction, rather than merely reporting a summed prepared bar.
+    component_names = (
+        "transport_moments",
+        "dtransport_moments_d_er",
+        "dtransport_moments_d_log_nu_star",
+    )
+    reference_field_bars = scalar_field_bars[0]
+    for field_index, component_name in zip((1, 2, 3), component_names, strict=True):
+        component_field_bars = tuple(
+            value if index == field_index else jnp.zeros_like(value)
+            for index, value in enumerate(reference_field_bars)
+        )
+        component_batch = tuple(value[None, ...] for value in component_field_bars)
+        component_prepared, _component_drds, _component_primal = (
+            model._pullback_interpolated_moment_prepared_support_and_drds_only_multi_rhs(
+                prepared,
+                drds_value=drds,
+                reference_nu_hat=reference_nu_hat,
+                reference_epsi_hat=reference_epsi_hat,
+                vth_a=vth_a,
+                field_bars=component_batch,
+            )
+        )
+        _response_value, component_pullback = jax.vjp(_response, prepared, drds)
+        expected_component_prepared, _expected_component_drds = component_pullback(
+            component_field_bars
+        )
+        try:
+            _assert_float_tree_allclose(
+                jax.tree_util.tree_map(lambda value: value[0], component_prepared),
+                expected_component_prepared,
+            )
+        except AssertionError as error:
+            raise AssertionError(
+                "Scalar prepared-support low-dot mismatch in "
+                f"{component_name}."
+            ) from error
+
     for rhs_index, field_bars in enumerate(scalar_field_bars):
         _response_value, pullback = jax.vjp(_response, prepared, drds)
         expected_prepared, expected_drds = pullback(field_bars)
