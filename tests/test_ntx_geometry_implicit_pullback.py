@@ -441,6 +441,18 @@ def test_native_multi_rhs_support_retains_local_drds_case_chain():
         )
         component_batch = tuple(value[None, ...] for value in component_field_bars)
         (
+            generic_component_prepared,
+            _generic_component_direct_drds,
+            _generic_component_primal,
+        ) = model._pullback_interpolated_moment_prepared_support_and_drds_only_multi_rhs(
+            prepared,
+            drds_value=drds,
+            reference_nu_hat=reference_nu_hat,
+            reference_epsi_hat=reference_epsi_hat,
+            vth_a=vth_a,
+            field_bars=component_batch,
+        )
+        (
             native_component_prepared,
             _native_component_direct_drds,
             _native_component_primal,
@@ -458,6 +470,20 @@ def test_native_multi_rhs_support_retains_local_drds_case_chain():
         expected_component_prepared, _expected_component_drds = component_pullback(
             component_field_bars
         )
+        try:
+            _assert_float_tree_allclose(
+                jax.tree_util.tree_map(
+                    lambda value: value[0], generic_component_prepared
+                ),
+                expected_component_prepared,
+                rtol=5e-9,
+            )
+        except AssertionError as error:
+            raise AssertionError(
+                "Generic corrected low-dot mismatch in "
+                f"{component_name}; the remaining issue is shared algebra, "
+                "not native matrix-RHS packing."
+            ) from error
         try:
             _assert_float_tree_allclose(
                 jax.tree_util.tree_map(
