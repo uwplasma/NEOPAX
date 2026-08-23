@@ -7063,8 +7063,12 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             dtransport_moments_d_er_bars,
             dtransport_moments_d_log_nu_star_bars,
         ) = _interpolated_response_field_bar_tuple(field_bars)
-        epsi_hat_tangent = jnp.asarray(1.0e3, dtype=reference_epsi_hat.dtype) / (
-            self.energy_grid.v_norm * vth_a
+        # The local thermal speed is scalar, while the following ``lax.map``
+        # iterates over energy.  Materialize the energy axis before mapping.
+        epsi_hat_tangent = jnp.broadcast_to(
+            jnp.asarray(1.0e3, dtype=reference_epsi_hat.dtype)
+            / (self.energy_grid.v_norm * vth_a),
+            reference_epsi_hat.shape,
         )
         energy_indices = jnp.arange(reference_nu_hat.shape[0], dtype=jnp.int32)
 
