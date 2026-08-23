@@ -106,11 +106,17 @@ pullback. A cache-disabled GPU benchmark and any CLI selector remain forbidden
 until that comparison passes; reject the selector if either compilation or
 warm support-transpose time regresses.
 
-The exact small-model NEOPAX test has been added but deliberately not run in
-the local WSL environment. It uses one energy and NTX's existing ``5 x 5 x 4``
-tiny prepared system; it compares the multi-RHS adapter with the scalar helper
-for two RHS columns and does not execute a transport rollout, profile, cache,
-or output writer. It is the next required remote-machine gate.
+The exact small-model NEOPAX test has passed on the remote machine. It uses one
+energy and NTX's existing ``5 x 5 x 4`` tiny prepared system; it compared the
+multi-RHS adapter with the scalar helper for two RHS columns and did not
+execute a transport rollout, profile, cache, or output writer.
+
+The resulting selector is now available only as
+``ntx_batched_interpolated_faces_multi_rhs_shared_primal``. It creates no
+fallback and does not modify the current best mode. It is structurally wired
+through the dedicated batched support hook but remains unbenchmarked; the
+first cache-disabled benchmark must compare objective/gradient values before
+timings are interpreted.
 
 ## Compact coefficient-record implementation status (2026-08-22)
 

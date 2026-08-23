@@ -1510,14 +1510,19 @@ def _flat_rhs_build_support_pullback_batched_interpolated_faces_factory(
     kwargs,
     project_flat=None,
     reuse_local_vjp_primal: bool = False,
+    multi_rhs_shared_primal: bool = False,
 ):
     owner = getattr(vector_field, "__self__", None)
-    pullback_fn = getattr(
-        owner,
-        "pullback_build_lagged_response_support_payload_batched_interpolated_faces_reuse_local_vjp_primal"
-        if reuse_local_vjp_primal else "pullback_build_lagged_response_support_payload_batched_interpolated_faces",
-        None,
+    pullback_name = (
+        "pullback_build_lagged_response_support_payload_batched_interpolated_faces_multi_rhs_shared_primal"
+        if multi_rhs_shared_primal
+        else (
+            "pullback_build_lagged_response_support_payload_batched_interpolated_faces_reuse_local_vjp_primal"
+            if reuse_local_vjp_primal
+            else "pullback_build_lagged_response_support_payload_batched_interpolated_faces"
+        )
     )
+    pullback_fn = getattr(owner, pullback_name, None)
     if pullback_fn is None:
         return None
 
@@ -3745,6 +3750,7 @@ class _RadauAcceptedStepPhysicsContext:
     flat_rhs_build_support_pullback: Callable[[Any, Any, Any], Any] | None = None
     flat_rhs_build_support_pullback_batched_interpolated_faces: Callable[[Any, Any, Any], Any] | None = None
     flat_rhs_build_support_pullback_batched_interpolated_faces_reuse_local_vjp_primal: Callable[[Any, Any, Any], Any] | None = None
+    flat_rhs_build_support_pullback_batched_interpolated_faces_multi_rhs_shared_primal: Callable[[Any, Any, Any], Any] | None = None
     flat_rhs_build_state_and_support_pullback_batched_interpolated_faces: Callable[[Any, Any, Any], Any] | None = None
     flat_rhs_build_state_and_support_pullback_batched_interpolated_faces_reuse_local_vjp_primal: Callable[[Any, Any, Any], Any] | None = None
     flat_rhs_lagged_response_support_pullback: Callable[[Any, Any, Any, Any, Any], Any] | None = None
@@ -5990,15 +5996,25 @@ def _execute_radau_accepted_step_next_reduced_cotangent_batched_bwd_with_support
             and not zero_rebuild_pullback
             and not joint_ntx_rebuild_pullback
         ):
-            if rebuild_support_pullback_mode in {"ntx_batched_interpolated_faces", "ntx_batched_interpolated_faces_reuse_local_vjp_primal"}:
+            if rebuild_support_pullback_mode in {
+                "ntx_batched_interpolated_faces",
+                "ntx_batched_interpolated_faces_reuse_local_vjp_primal",
+                "ntx_batched_interpolated_faces_multi_rhs_shared_primal",
+            }:
                 batched_pullback = (
-                    physics_context.flat_rhs_build_support_pullback_batched_interpolated_faces_reuse_local_vjp_primal
-                    if rebuild_support_pullback_mode == "ntx_batched_interpolated_faces_reuse_local_vjp_primal"
-                    else physics_context.flat_rhs_build_support_pullback_batched_interpolated_faces
+                    physics_context.flat_rhs_build_support_pullback_batched_interpolated_faces_multi_rhs_shared_primal
+                    if rebuild_support_pullback_mode
+                    == "ntx_batched_interpolated_faces_multi_rhs_shared_primal"
+                    else (
+                        physics_context.flat_rhs_build_support_pullback_batched_interpolated_faces_reuse_local_vjp_primal
+                        if rebuild_support_pullback_mode
+                        == "ntx_batched_interpolated_faces_reuse_local_vjp_primal"
+                        else physics_context.flat_rhs_build_support_pullback_batched_interpolated_faces
+                    )
                 )
                 if batched_pullback is None:
                     raise RuntimeError(
-                        "ntx_batched_interpolated_faces rebuild support pullback was requested, "
+                        "the requested batched NTX rebuild support pullback was requested, "
                         "but the active transport physics context does not expose that hook."
                     )
                 # The dedicated NTX rule returns every support leaf with its
@@ -17367,6 +17383,12 @@ def _build_prepared_radau_accepted_rollout(
             project_flat=project_flat, reuse_local_vjp_primal=True,
         )
     )
+    flat_rhs_build_support_pullback_batched_interpolated_faces_multi_rhs_shared_primal = (
+        _flat_rhs_build_support_pullback_batched_interpolated_faces_factory(
+            unravel=unpack_flat, vector_field=vector_field, args=args, kwargs=kwargs,
+            project_flat=project_flat, multi_rhs_shared_primal=True,
+        )
+    )
     flat_rhs_build_state_and_support_pullback_batched_interpolated_faces = (
         _flat_rhs_build_state_and_support_pullback_batched_interpolated_faces_factory(
             unravel=unpack_flat,
@@ -17708,6 +17730,9 @@ def _build_prepared_radau_accepted_rollout(
         flat_rhs_build_support_pullback_batched_interpolated_faces_reuse_local_vjp_primal=(
             flat_rhs_build_support_pullback_batched_interpolated_faces_reuse_local_vjp_primal
         ),
+        flat_rhs_build_support_pullback_batched_interpolated_faces_multi_rhs_shared_primal=(
+            flat_rhs_build_support_pullback_batched_interpolated_faces_multi_rhs_shared_primal
+        ),
         flat_rhs_build_state_and_support_pullback_batched_interpolated_faces=(
             flat_rhs_build_state_and_support_pullback_batched_interpolated_faces
         ),
@@ -17920,6 +17945,12 @@ class RADAUSolver(_RadauSolverConfig):
             _flat_rhs_build_support_pullback_batched_interpolated_faces_factory(
                 unravel=unpack_flat, vector_field=vector_field, args=args, kwargs=kwargs,
                 project_flat=project_flat, reuse_local_vjp_primal=True,
+            )
+        )
+        flat_rhs_build_support_pullback_batched_interpolated_faces_multi_rhs_shared_primal = (
+            _flat_rhs_build_support_pullback_batched_interpolated_faces_factory(
+                unravel=unpack_flat, vector_field=vector_field, args=args, kwargs=kwargs,
+                project_flat=project_flat, multi_rhs_shared_primal=True,
             )
         )
         flat_rhs_build_state_and_support_pullback_batched_interpolated_faces = (
@@ -18256,6 +18287,9 @@ class RADAUSolver(_RadauSolverConfig):
             ),
             flat_rhs_build_support_pullback_batched_interpolated_faces_reuse_local_vjp_primal=(
                 flat_rhs_build_support_pullback_batched_interpolated_faces_reuse_local_vjp_primal
+            ),
+            flat_rhs_build_support_pullback_batched_interpolated_faces_multi_rhs_shared_primal=(
+                flat_rhs_build_support_pullback_batched_interpolated_faces_multi_rhs_shared_primal
             ),
             flat_rhs_build_state_and_support_pullback_batched_interpolated_faces=(
                 flat_rhs_build_state_and_support_pullback_batched_interpolated_faces

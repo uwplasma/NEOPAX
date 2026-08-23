@@ -5428,6 +5428,7 @@ def main() -> None:
             "separate_reuse_local_vjp_primal_factorized_ntx_two_directional",
             "ntx_batched_interpolated_faces",
             "ntx_batched_interpolated_faces_reuse_local_vjp_primal",
+            "ntx_batched_interpolated_faces_multi_rhs_shared_primal",
             "ntx_joint_implicit_interpolated_faces",
             "ntx_joint_implicit_interpolated_faces_packed_support_adjoint",
             "ntx_joint_implicit_interpolated_faces_reuse_local_vjp_primal",
@@ -5458,6 +5459,10 @@ def main() -> None:
             "'ntx_batched_interpolated_faces' is an exact opt-in multi-objective "
             "NTX face-interpolation transpose for the rebuild branch; it has no "
             "fallback for unsupported response representations. "
+            "'ntx_batched_interpolated_faces_multi_rhs_shared_primal' is an "
+            "isolated exact experiment: per anchor/species it shares NTX's local "
+            "primal factorisation and two forward case directions across the "
+            "device-resident objective RHS batch. "
             "'ntx_joint_implicit_interpolated_faces' is the exact experimental "
             "mode that obtains rebuild state and NTX-support bars jointly from "
             "the same local NTX implicit adjoint. "
