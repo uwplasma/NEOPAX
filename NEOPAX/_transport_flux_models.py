@@ -10890,11 +10890,14 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                     )
                 )
                 return (
-                    tuple(
-                        jax.tree_util.tree_leaves(
-                            _sanitize_float_delta_bar_tree(prepared, prepared_bar)
-                        )
-                    ),
+                    # The multi-RHS NTX helper already converts static/float0
+                    # prepared leaves into explicit zero arrays carrying the
+                    # RHS axis.  Applying the scalar sanitizer here would
+                    # replace only static metadata (for example Fourier mode
+                    # arrays) by unbatched zeros while retaining batched
+                    # floating geometry arrays, violating NTX dataclass shape
+                    # invariants during this species ``vmap``.
+                    tuple(jax.tree_util.tree_leaves(prepared_bar)),
                     drds_bar,
                     primal_response,
                 )
