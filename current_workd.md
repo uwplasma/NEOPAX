@@ -1,5 +1,149 @@
 # Reverse AD timing work: current state and plan
 
+## Current next work: local NTX multi-RHS shared-adjoint investigation (2026-08-23)
+
+### Objective
+
+For one rebuilt NTX anchor, avoid independently constructing the local
+implicit-solve context for the state (`nu_hat`/`epsi_hat`) and prepared-support
+geometry pullbacks. The target is one unbatched local NTX factorisation and
+primal mode solve, with all objective cotangents handled as device-resident
+right-hand-side columns. This must remain exact and bounded to the active
+anchor/rebuild invocation: nothing is retained across accepted steps or
+segments.
+
+### Constraints
+
+- `separate_reuse_local_vjp_primal` remains byte-for-byte dispatch-equivalent
+  unless a new selector is explicitly chosen.
+- No full factor tape, host callback, host objective loop, `lax.map`, or serial
+  objective scan.
+- The number of objectives is an input dimension, not a fixed benchmark
+  assumption; the implementation must support any positive RHS-column count.
+- Do not repeat the rejected NEOPAX joint state/support wrapper, which carried
+  objective-batched support pytrees through the anchor scan and enlarged the
+  segment compilation.
+
+### Implementation plan
+
+1. Add in-memory NTX-only tests on a tiny prepared system. They compare a
+   candidate multi-RHS local implicit pullback against `vmap` of the existing
+   scalar helper for one, two, and several RHS columns, including all returned
+   state and prepared-support bars. The test also inspects the traced program
+   to ensure factorisation inputs are unbatched and no host/serial objective
+   path is introduced.
+2. Only if that gate passes, add a new private NTX multi-RHS helper. It must
+   factorise once, solve the primal and the two physical derivative directions
+   once, and use batched linear-system RHS only for cotangent-dependent
+   transpose solves.
+3. Add a private NEOPAX per-anchor adapter that consumes this helper and emits
+   the existing state and support accumulation inputs. It must not return the
+   objective-independent primal response through an objective `vmap` and must
+   not replace the current best dispatch.
+4. Add exact small-model NEOPAX equivalence tests and only then expose a new
+   opt-in rebuild-support selector. A cache-disabled GPU benchmark is permitted
+   only after those tests pass; reject the selector if either compilation or
+   warm support-transpose time regresses.
+
+### Important feasibility gate
+
+The prior source audit shows that merely joining NEOPAX's current state and
+support wrappers can save at most the already-small state transpose. The
+expensive prepared-support path additionally differentiates the two response
+derivative fields. Therefore this work proceeds only if the NTX multi-RHS
+helper removes a proven repeated local factorisation/transpose operation. If
+the tiny traced test shows that JAX already shares it, no selector will be
+implemented and this direction will be recorded as rejected.
+
+### Status: NTX helper and private NEOPAX adapter implemented; not selectable
+
+The first implementation is now in NTX only:
+`solve_prepared_coefficient_vector_lowdot_two_pullbacks_prepared_support_only_multi_rhs_and_aux`.
+It calls the existing low-dot core once with `return_primal_residuals=True`,
+then vmaps only the cotangent-dependent support-adjoint portion while passing
+the same unbatched local primal/factor residual to every RHS. It returns the
+same five prepared-support trees and auxiliary output, each with a leading RHS
+axis. The residual is local to the call and is not returned.
+
+An in-memory tiny-grid test compares it with the established scalar
+support-only helper for 1, 2, and 4 RHS columns and passes. It uses no profile,
+XLA dump, cache, or output directory. The helper is exported by NTX but no
+NEOPAX selector calls it yet; the established best path is unchanged.
+
+### Three-pass adapter audit (2026-08-23)
+
+1. The NTX helper has the required bounded lifetime: its `primal_residuals`
+   include the local modes/factors and directional primal modes, but are
+   created before the RHS `vmap`, closed over only by that local call, and are
+   neither returned nor stored in a segment payload. The exact support adjoint
+   remains per RHS, which is necessary because each objective supplies a
+   different cotangent.
+2. The existing NEOPAX `ntx_batched_interpolated_faces` route cannot simply be
+   reused: it builds a generic raw-solver `jax.vjp` and batches that pullback.
+   A new private adapter is required to construct the three coefficient-bar
+   batches from interpolated response bars and call the new NTX helper at each
+   anchor. It will carry only the already-required batched support bars through
+   the anchor scan.
+3. The prior `separate_reuse_local_vjp_primal_factorized_ntx_two_directional`
+   mode is not equivalent to this helper. It changes the response forward
+   primitive to a factorized three-output custom-VJP, then differentiates it
+   generically. It does not supply one `primal_residuals` object to all support
+   RHS adjoints. The new helper therefore removes a concrete repeated local
+   primal/factorisation operation that that earlier selector did not remove.
+
+The private NEOPAX adapter is now present as
+`_pullback_interpolated_moment_prepared_support_and_drds_only_multi_rhs`, and
+the corresponding unselected face-support method is
+`pullback_build_lagged_response_support_payload_batched_interpolated_faces_multi_rhs_shared_primal`.
+For one anchor/species it passes the complete objective RHS batch to the NTX
+helper, receives an unbatched primal response for interpolation, and returns
+only objective-batched prepared/``drds`` bars. It does not alter any existing
+selector, CLI option, or dispatch.
+
+The remaining gates are exact equivalence and compilation risk. The adapter
+must be compared on an in-memory small model with the current scalar support
+pullback. A cache-disabled GPU benchmark and any CLI selector remain forbidden
+until that comparison passes; reject the selector if either compilation or
+warm support-transpose time regresses.
+
+The exact small-model NEOPAX test has been added but deliberately not run in
+the local WSL environment. It uses one energy and NTX's existing ``5 x 5 x 4``
+tiny prepared system; it compares the multi-RHS adapter with the scalar helper
+for two RHS columns and does not execute a transport rollout, profile, cache,
+or output writer. It is the next required remote-machine gate.
+
+## Compact coefficient-record implementation status (2026-08-22)
+
+The first internal portion is implemented but **not selectable** by the
+benchmark, so it cannot affect the established best path. An opt-in NTX
+companion builder returns the normal lagged response and a compact record of
+only the base, `d/dEr`, and `d/dlog(nu*)` coefficient vectors. A separate
+reverse-minimal Radau replay helper invokes that builder only at the ordinary
+lagged-response rebuild point; reuse and inactive slots return zero records.
+
+This uses a new private segment-record pytree, leaving the current
+`reuse_segment_primal_record` signature, storage, and dispatch unchanged. The
+in-memory checks cover local response/record equality, full small-model
+ordinary-versus-recorded lagged-response equality, and the Radau
+rebuild/reuse paired-result contract. All pass in WSL `mygpuenv`, without
+profiles, XLA dumps, or temporary output. The next step is a record-consuming
+support-transpose helper; there is intentionally no CLI selector or GPU run
+until that consumer has an equivalence test.
+
+### Consumer feasibility audit
+
+The compact coefficient arrays alone cannot power an exact prepared-support
+transpose. NTX's support-only implicit rule needs the full primal mode vectors
+and factorized block system (`f1_full`, `f3_full`, LU/pivots, lower, and upper)
+to form the three base/directional adjoints. The saved five-value coefficient
+vectors cannot reconstruct those quantities. Rebuilding them is exactly the
+current support-transpose work, while retaining them across a segment is the
+previously rejected multi-GiB factor-tape approach. Consequently, no consumer
+or selector will be added for this record: doing so would either duplicate the
+current NTX work or violate the bounded-memory requirement. The disconnected
+record implementation remains isolated while the next timing direction is
+selected from a different proven operation.
+
 ## Scope and non-negotiable constraints
 
 - Preserve the exact transport/reverse mathematics.
@@ -486,5 +630,128 @@ support helper.  Focused in-memory tests pass:
   `jax.vmap` after the production static-leaf sanitisation; it preserves the
   leading objective axis without a host or serial-objective path.
 
-The new NEOPAX selector is wired but remains unbenchmarked and opt-in.  No
-claim of timing improvement is made until the one cache-disabled comparison.
+The new NEOPAX selector is wired and remains opt-in.  It was benchmarked in
+the cache-disabled comparison recorded below.
+
+#### Benchmark result: reject geometry-only implicit support mode
+
+The cache-disabled 16-step record-mode benchmark was run with
+`separate_reuse_local_vjp_primal_geometry_implicit_ntx_two_directional`.
+It selected the intended mode, but regressed materially:
+
+* first reverse-segment compilation alarm: about `3m12s`;
+* final `4/4` segment: `776.249 s`;
+* established record-mode best final `4/4` segment: about `590.420 s`.
+
+The exactness and batching tests remain useful, but this selector is rejected
+for performance.  Keep it opt-in for reference; do not use it as a baseline or
+modify the current-best generic local-VJP path because of this experiment.
+
+#### Planned opt-in experiment: compact segment coefficient records
+
+This is distinct from the rejected implicit helper modes.  The established
+generic support VJP reconstructs, for each local anchor, the NTX coefficient
+primal and its two case-direction coefficient tangents before transposing
+them with respect to support.  The ordinary segment replay computes those
+values as solver/JVP intermediates while constructing its lagged response,
+but the current response API discards them.  The experiment is to add an
+opt-in local-response adapter that returns those existing intermediates in a
+compact record containing only, for rebuilt anchors:
+
+* the base coefficient vector;
+* the `d/dEr` coefficient tangent; and
+* the `d/dlog(nu*)` coefficient tangent.
+
+For the present shape (48 anchors, 3 species, 4 energies, 5 coefficients),
+these three float64 records are approximately 70 KiB per rebuilt accepted
+step.  They are intentionally not NTX LU/factor payloads (about 4.8 GiB per
+step in the earlier audit) and are retained only in the existing bounded
+segment record, never over the complete accepted-step trajectory.
+
+Implementation gates:
+
+1. Audit the current replay/primal-record structures to prove the three
+   arrays can be emitted from the already-executed local response path without
+   a second NTX call and with a static, segment-bounded shape.
+2. Add a new opt-in record mode.  The default and
+   `separate_reuse_local_vjp_primal` must remain unchanged.
+3. Add a reverse-only support-adjoint interface that consumes the recorded
+   coefficient arrays, rebuilds only the required local operator/factorisation
+   for support bars, and does not rerun the base plus two tangent forward
+   solves.  It must retain the existing outer device objective `vmap` and add
+   no host or serial-objective operation.
+4. Prove exact local bars and complete Radau support bars against the current
+   generic VJP with in-memory tests.  Test arbitrary objective-batch sizes.
+5. Benchmark cache-disabled only after these checks pass.  The immediate
+   measured target is the current local-primal component (~18 s per rebuild),
+   not an unsupported promise to remove the whole ~57 s support transpose.
+
+#### Step 1 audit result: record source and boundary
+
+The existing `reuse_segment_primal_record` already retains a bounded
+`_RadauAcceptedStepSegmentPrimalRecord` per slot and consumes it directly in
+the segment reverse scan.  It currently stores the accepted trial/stage data,
+Radau factors, and `NTXExactLijLaggedResponse`, but no NTX coefficient scan.
+The response cache itself contains only interpolated moment values
+(`log(nu*)`, moments, `d/dEr`, and `d/dlog(nu*)`), not anchor coefficient
+vectors.
+
+`_build_axis_lagged_response` calls
+`_build_interpolated_moment_response_local` at each anchor.  That local
+function evaluates one base coefficient scan and two JVP solve paths, but it
+returns only four moment fields.  Therefore appending a record at the Radau
+layer would require a second NTX evaluation and is rejected.
+
+The valid record source is instead an opt-in variant of that local response
+function: it must expose the base coefficient scan and the two coefficient
+tangent scans *from the same base/JVP evaluations* used to form the ordinary
+four moment fields.  The normal response builder and current-best reverse
+mode remain unchanged.  The next design step is to prove this adapter can
+preserve exact moment values and static output shape before wiring it into the
+segment record.
+
+#### Step 2 implementation: local compact-record adapter
+
+`_interpolated_moment_reduced_local_outputs_with_coefficient_record_from_primitives`
+now exists as a private, opt-in companion of the ordinary local response
+builder.  It returns the unchanged four response fields plus
+`_NTXInterpolatedMomentCoefficientRecord` containing the base, `d/dEr`, and
+`d/dlog(nu*)` coefficient scans.  Its two tangents use the same derivative
+mode override as the ordinary derivative-field routines; their moment fields
+are then formed directly from the emitted coefficient tangents.
+
+The ordinary `_build_interpolated_moment_response_local` path has not been
+modified or redirected.  A focused in-memory test compares all four returned
+moment fields to the ordinary local builder at `1e-9` relative tolerance over
+two energy nodes, checks the three `(n_energy, 5)` record arrays, and traces
+the record through `jax.eval_shape` to validate its registered static pytree
+structure.  The adapter is not yet wired into `NTXExactLijLaggedResponse`,
+the Radau segment record, or any benchmark selector.  Therefore it cannot
+affect the current best benchmark.
+
+#### Step 3a implementation: isolated response-plus-record builder
+
+The NTX runtime model now has an opt-in
+`build_lagged_response_with_compact_coefficient_record(state)` companion.  It
+creates the ordinary interpolated face response and a separate private
+`_NTXExactLijLaggedResponseCoefficientRecord` from the same local base/JVP
+work.  The existing `NTXExactLijLaggedResponse` dataclass, normal
+`build_lagged_response`, carry cache, and all active selectors remain
+unchanged.
+
+The companion is deliberately limited to `interpolate_from_faces` and the
+interpolated response-anchor lane.  It does not pretend that direct full-radius
+coefficient responses feed the current support transpose.  The new record is
+not yet passed into Radau; the next required step is a dedicated, opt-in
+segment-replay hook and a reverse support-adjoint consumer.  That hook must
+keep the record bounded by segment length and must never add it to the normal
+lagged-response carry.
+
+During the post-implementation source review, the rho=0 anchor case required
+one correction. The ordinary builder skips that local NTX solve and
+regularizes only response fields from the next three anchors. The compact
+record now contains an explicit zero placeholder at that slot rather than an
+extrapolated coefficient vector. A later consumer must use the existing
+interpolation transpose (which gives that raw axis slot zero cotangent); this
+preserves the no-extra-solve invariant and prevents a nonphysical axis record
+from entering the support adjoint.

@@ -380,6 +380,22 @@ class NTXInterpolatedMomentResponse:
 
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True, eq=False)
+class _NTXInterpolatedMomentCoefficientRecord:
+    """Compact local NTX primitives for an opt-in segment record.
+
+    The three arrays are emitted by the same base/JVP local response
+    evaluation that produces :class:`NTXInterpolatedMomentResponse`.  They
+    deliberately contain coefficient values only, never an NTX factorisation.
+    This private record is not part of the ordinary lagged-response cache.
+    """
+
+    coefficient_scan: jax.Array
+    dcoefficient_scan_d_er: jax.Array
+    dcoefficient_scan_d_log_nu_star: jax.Array
+
+
+@jax.tree_util.register_dataclass
+@dataclasses.dataclass(frozen=True, eq=False)
 class _NTXInterpolatedMomentResponseFieldBars:
     reference_log_nu_star: jax.Array
     reference_transport_moments: jax.Array
@@ -400,6 +416,19 @@ def _interpolated_response_field_bar_tuple(
 class NTXExactLijLaggedResponse:
         face_response: Any = None
         center_response: Any = None
+
+
+@jax.tree_util.register_dataclass
+@dataclasses.dataclass(frozen=True, eq=False)
+class _NTXExactLijLaggedResponseCoefficientRecord:
+    """Compact anchor coefficients emitted only by the opt-in record builder.
+
+    The leading axis is the response-anchor axis; this object is intentionally
+    separate from :class:`NTXExactLijLaggedResponse` so ordinary carry caches
+    and all established reverse modes retain their current pytree layout.
+    """
+
+    face_anchor_coefficients: _NTXInterpolatedMomentCoefficientRecord
 
 
 @jax.tree_util.register_dataclass
@@ -963,6 +992,36 @@ class CombinedTransportFluxModel(TransportFluxModelBase):
             classical_response=self.classical_model.build_lagged_response(state, **kwargs),
         )
 
+    def build_lagged_response_with_compact_coefficient_record(self, state, **kwargs):
+        """Opt-in companion that preserves the ordinary combined response."""
+
+        build_with_record = getattr(
+            self.neoclassical_model,
+            "build_lagged_response_with_compact_coefficient_record",
+            None,
+        )
+        if not callable(build_with_record):
+            raise NotImplementedError(
+                "The active neoclassical model does not expose compact coefficient records."
+            )
+        neoclassical_response, coefficient_record = build_with_record(state)
+        return (
+            CombinedTransportLaggedResponse(
+                neoclassical_response=neoclassical_response,
+                turbulent_response=self.turbulent_model.build_lagged_response(state, **kwargs),
+                classical_response=self.classical_model.build_lagged_response(state, **kwargs),
+            ),
+            coefficient_record,
+        )
+
+    def compact_coefficient_record_zero(self):
+        zero_fn = getattr(self.neoclassical_model, "compact_coefficient_record_zero", None)
+        if not callable(zero_fn):
+            raise NotImplementedError(
+                "The active neoclassical model does not expose compact coefficient records."
+            )
+        return zero_fn()
+
     def pullback_build_lagged_response(self, state, lagged_response_bar, **kwargs):
         def _submodel_pullback(model, response_bar):
             if response_bar is None:
@@ -1087,199 +1146,6 @@ class CombinedTransportFluxModel(TransportFluxModelBase):
             )
         response_bars = None if lagged_response_bars is None else lagged_response_bars.neoclassical_response
         return pullback_fn(state, response_bars, support)
-
-        # Kept below only until the following patch moves this implementation
-        # into the concrete NTX model; it is unreachable.
-        if not isinstance(lagged_response_bars, NTXExactLijLaggedResponse):
-            raise TypeError("batched NTX support pullback requires NTXExactLijLaggedResponse bars.")
-        face_response_bars = lagged_response_bars.face_response
-        if not isinstance(face_response_bars, NTXInterpolatedMomentResponse):
-            raise NotImplementedError(
-                "batched NTX support pullback currently requires interpolated face-response bars."
-            )
-        if lagged_response_bars.center_response is not None:
-            raise NotImplementedError(
-                "batched NTX support pullback currently requires center_response=None "
-                "(the interpolate_from_faces runtime lane)."
-            )
-
-        objective_count = int(jnp.asarray(face_response_bars.reference_er).shape[0])
-        face_state = build_face_transport_state(
-            state,
-            self.geometry,
-            bc_density=self.bc_density,
-            bc_temperature=self.bc_temperature,
-            density_floor=self.density_floor,
-            temperature_floor=self.temperature_floor,
-        )
-        face_density = safe_density(face_state.density, self.density_floor)
-        face_temperature = face_state.temperature
-        face_v_thermal = get_v_thermal(self.species.mass, face_temperature)
-        collisionality_kind = _collisionality_kind(self.collisionality_model)
-        species_indices = jnp.arange(int(self.species.number_species), dtype=jnp.int32)
-
-        def _batched_zero_like(tree):
-            return jax.tree_util.tree_map(
-                lambda leaf: jnp.broadcast_to(
-                    jnp.zeros_like(jnp.asarray(leaf)),
-                    (objective_count,) + jnp.asarray(leaf).shape,
-                ),
-                tree,
-            )
-
-        face_channels_bar = _batched_zero_like(_float_delta_tree_like(support.face_channels))
-        face_prepared_bar = _batched_zero_like(_float_delta_tree_like(support.face_prepared))
-        n_radius = int(face_state.Er.shape[0])
-        anchor_indices = self._response_anchor_indices(n_radius)
-        anchor_rho = jnp.asarray(self.geometry.r_grid_half, dtype=jnp.float64)[anchor_indices]
-        target_rho = jnp.asarray(support.face_channels.rho, dtype=jnp.float64)
-        n_anchor = int(anchor_indices.shape[0])
-
-        response_field_bars = jax.vmap(self._interpolated_response_field_bars)(face_response_bars)
-        response_field_bar_tuple = _interpolated_response_field_bar_tuple(response_field_bars)
-        raw_anchor_response_bar = jax.vmap(
-            lambda one_field_bars: self._pullback_interpolated_anchor_response_fields(
-                anchor_indices=anchor_indices,
-                anchor_rho=anchor_rho,
-                target_rho=target_rho,
-                field_bars=one_field_bars,
-            )
-        )(response_field_bars)
-        raw_anchor_response_fields = _interpolated_response_field_bar_tuple(raw_anchor_response_bar)
-        anchor_response_fields0 = tuple(
-            jnp.zeros((n_anchor,) + field_bar.shape[2:], dtype=field_bar.dtype)
-            for field_bar in raw_anchor_response_fields
-        )
-        anchor_positions = jnp.arange(n_anchor, dtype=jnp.int32)
-
-        def _local_face_support_pullback(radius_index, local_field_bars):
-            prepared = jax.tree_util.tree_map(
-                lambda arr: jax.lax.dynamic_index_in_dim(arr, radius_index, axis=0, keepdims=False),
-                support.face_prepared,
-            )
-            drds_value = jax.lax.dynamic_index_in_dim(
-                support.face_channels.drds, radius_index, axis=0, keepdims=False
-            )
-            er_value = jax.lax.dynamic_index_in_dim(face_state.Er, radius_index, axis=0, keepdims=False)
-            temperature_local = jax.lax.dynamic_index_in_dim(
-                face_temperature, radius_index, axis=1, keepdims=False
-            )
-            density_local = jax.lax.dynamic_index_in_dim(
-                face_density, radius_index, axis=1, keepdims=False
-            )
-            vthermal_local = jax.lax.dynamic_index_in_dim(
-                face_v_thermal, radius_index, axis=1, keepdims=False
-            )
-            prepared_delta0 = _float_delta_tree_like(prepared)
-            drds_delta0 = jnp.zeros_like(drds_value)
-
-            def _response_from_support_delta(prepared_delta, drds_delta):
-                prepared_value = _add_float_delta_tree(prepared, prepared_delta)
-                drds_local = drds_value + drds_delta
-                return jax.vmap(
-                    lambda species_index: self._build_interpolated_moment_response_local(
-                        prepared_value,
-                        drds_value=drds_local,
-                        species_index=species_index,
-                        er_value=er_value,
-                        temperature_local=temperature_local,
-                        density_local=density_local,
-                        vthermal_local=vthermal_local,
-                        collisionality_kind=collisionality_kind,
-                    )
-                )(species_indices)
-
-            primal_response, local_pullback = jax.vjp(
-                _response_from_support_delta,
-                prepared_delta0,
-                drds_delta0,
-            )
-            # Map only numeric leaves: NTX prepared trees contain static
-            # dataclass metadata that cannot carry an objective batch axis.
-            _, prepared_treedef = jax.tree_util.tree_flatten(prepared_delta0)
-
-            def _local_pullback_leaves(one_local_field_bars):
-                prepared_bar, drds_bar = local_pullback(one_local_field_bars)
-                return (*jax.tree_util.tree_leaves(prepared_bar), drds_bar)
-
-            batched_leaves = jax.vmap(_local_pullback_leaves)(local_field_bars)
-            return (
-                primal_response,
-                prepared_treedef.unflatten(batched_leaves[:-1]),
-                batched_leaves[-1],
-            )
-
-        def _accumulate_anchor(carry, anchor_pos):
-            channels_carry, prepared_carry, anchor_fields_carry = carry
-            radius_index = jax.lax.dynamic_index_in_dim(
-                anchor_indices, anchor_pos, axis=0, keepdims=False
-            )
-            local_field_bars = tuple(
-                jax.lax.dynamic_index_in_dim(field_bar, anchor_pos, axis=1, keepdims=False)
-                for field_bar in raw_anchor_response_fields
-            )
-            local_response, prepared_local_bar, drds_local_bar = _local_face_support_pullback(
-                radius_index,
-                local_field_bars,
-            )
-            updated_anchor_fields = tuple(
-                anchor_field.at[anchor_pos].set(local_field)
-                for anchor_field, local_field in zip(
-                    anchor_fields_carry,
-                    local_response,
-                    strict=True,
-                )
-            )
-            return (
-                dataclasses.replace(
-                    channels_carry,
-                    drds=channels_carry.drds.at[:, radius_index].add(drds_local_bar),
-                ),
-                jax.tree_util.tree_map(
-                    lambda arr, local_arr: arr.at[:, radius_index].add(local_arr),
-                    prepared_carry,
-                    prepared_local_bar,
-                ),
-                updated_anchor_fields,
-            ), None
-
-        (face_channels_bar, face_prepared_bar, raw_anchor_response_fields), _ = jax.lax.scan(
-            _accumulate_anchor,
-            (face_channels_bar, face_prepared_bar, anchor_response_fields0),
-            anchor_positions,
-        )
-        if n_anchor < 4:
-            anchor_response_fields = raw_anchor_response_fields
-        else:
-            anchor_response_fields = jax.lax.cond(
-                jnp.isclose(anchor_rho[0], 0.0),
-                lambda _: self._regularize_axis_radius0(raw_anchor_response_fields, anchor_rho),
-                lambda _: raw_anchor_response_fields,
-                operand=None,
-            )
-        target_rho_bar = jnp.zeros((objective_count,) + target_rho.shape, dtype=target_rho.dtype)
-        for anchor_field, field_bar in zip(
-            anchor_response_fields,
-            response_field_bar_tuple,
-            strict=True,
-        ):
-            target_rho_bar = target_rho_bar + jax.vmap(
-                lambda one_field_bar: self._pullback_interpolate_anchor_target_rho(
-                    anchor_indices,
-                    anchor_field,
-                    target_rho,
-                    one_field_bar,
-                )
-            )(field_bar)
-        face_channels_bar = dataclasses.replace(
-            face_channels_bar,
-            rho=face_channels_bar.rho + target_rho_bar,
-        )
-        return dataclasses.replace(
-            _batched_zero_like(_float_delta_tree_like(support)),
-            face_channels=face_channels_bar,
-            face_prepared=face_prepared_bar,
-        )
 
     def pullback_build_lagged_response_state_and_support_payload_batched_interpolated_faces(
         self,
@@ -4014,6 +3880,144 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                 nu_hat_a=nu_hat_a,
                 epsi_hat_a=epsi_hat_a,
             ),
+        )
+
+    def _interpolated_moment_reduced_local_outputs_with_coefficient_record_from_primitives(
+        self,
+        prepared,
+        *,
+        drds_value,
+        nu_hat_a,
+        epsi_hat_a,
+        vth_a,
+    ):
+        """Return the ordinary local response plus compact coefficient primitives.
+
+        This is deliberately separate from the ordinary response routine.  It
+        follows its base solve and its two case-direction JVPs, but retains the
+        coefficient-vector outputs of those computations rather than only the
+        resulting transport moments.  It is intended solely for a future
+        segment-bounded replay record; no NTX factorisation is retained.
+        """
+
+        coefficient_scan = self._coefficient_scan_from_inputs(
+            prepared,
+            nu_hat_a,
+            epsi_hat_a,
+        )
+        # The active NTX-exact lane accepts only ``direct`` (including its
+        # aliases), so retain the ordinary solver selection exactly.  Keeping
+        # this explicit prevents a future unsupported derivative-mode branch
+        # from silently giving the record path different primal coefficients.
+        self._normalize_derivative_mode(self.derivative_mode)
+        derivative_mode_override = None
+        energy_indices = jnp.arange(nu_hat_a.shape[0], dtype=jnp.int32)
+        epsi_hat_er_tangent = jnp.asarray(1.0e3, dtype=epsi_hat_a.dtype) / (
+            self.energy_grid.v_norm * vth_a
+        )
+
+        def _directional_coefficient_scans_one_energy(args):
+            _energy_index, nu_hat_value, epsi_hat_value, epsi_er_tangent = args
+
+            def _coefficient_value(nu_value, epsi_value):
+                return self._single_coefficient_vector_from_inputs(
+                    prepared,
+                    nu_value,
+                    epsi_value,
+                    derivative_mode_override=derivative_mode_override,
+                )
+
+            _, er_coefficient_dot = jax.jvp(
+                _coefficient_value,
+                (nu_hat_value, epsi_hat_value),
+                (
+                    jnp.asarray(0.0, dtype=nu_hat_value.dtype),
+                    epsi_er_tangent,
+                ),
+            )
+            _, log_nu_coefficient_dot = jax.jvp(
+                _coefficient_value,
+                (nu_hat_value, epsi_hat_value),
+                (
+                    nu_hat_value,
+                    jnp.asarray(0.0, dtype=epsi_hat_value.dtype),
+                ),
+            )
+            return er_coefficient_dot, log_nu_coefficient_dot
+
+        er_coefficient_dot_scan, log_nu_coefficient_dot_scan = jax.lax.map(
+            _directional_coefficient_scans_one_energy,
+            (energy_indices, nu_hat_a, epsi_hat_a, epsi_hat_er_tangent),
+        )
+
+        def _directional_moments_one_energy(args):
+            coefficient_value, coefficient_dot, energy_index = args
+            return jax.jvp(
+                lambda coefficients: self._transport_moments_from_single_coefficient_vector(
+                    coefficients,
+                    drds_value=drds_value,
+                    energy_index=energy_index,
+                ),
+                (coefficient_value,),
+                (coefficient_dot,),
+            )[1]
+
+        response = (
+            self._log_nu_star_from_nu_hat(nu_hat_a),
+            self._transport_moments_from_coefficient_scan(
+                coefficient_scan,
+                drds_value=drds_value,
+            ),
+            jnp.sum(
+                jax.lax.map(
+                    _directional_moments_one_energy,
+                    (coefficient_scan, er_coefficient_dot_scan, energy_indices),
+                ),
+                axis=0,
+            ),
+            jnp.sum(
+                jax.lax.map(
+                    _directional_moments_one_energy,
+                    (coefficient_scan, log_nu_coefficient_dot_scan, energy_indices),
+                ),
+                axis=0,
+            ),
+        )
+        return response, _NTXInterpolatedMomentCoefficientRecord(
+            coefficient_scan=coefficient_scan,
+            dcoefficient_scan_d_er=er_coefficient_dot_scan,
+            dcoefficient_scan_d_log_nu_star=log_nu_coefficient_dot_scan,
+        )
+
+    def _build_interpolated_moment_response_local_with_coefficient_record(
+        self,
+        prepared,
+        *,
+        drds_value,
+        species_index: int,
+        er_value,
+        temperature_local,
+        density_local,
+        vthermal_local,
+        collisionality_kind,
+    ):
+        """Opt-in companion of the ordinary local interpolated response."""
+
+        reference_nu_hat, reference_epsi_hat, vth_a = self._interpolated_moment_local_scan_primitives(
+            drds_value=drds_value,
+            species_index=species_index,
+            er_value=er_value,
+            temperature_local=temperature_local,
+            density_local=density_local,
+            vthermal_local=vthermal_local,
+            collisionality_kind=collisionality_kind,
+        )
+        return self._interpolated_moment_reduced_local_outputs_with_coefficient_record_from_primitives(
+            prepared,
+            drds_value=drds_value,
+            nu_hat_a=reference_nu_hat,
+            epsi_hat_a=reference_epsi_hat,
+            vth_a=vth_a,
         )
 
     def _interpolated_moment_reduced_local_outputs_from_factorized_ntx_two_directional(
@@ -6926,6 +6930,197 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         )
         return prepared_bar, direct_drds_bar, primal_response
 
+    def _pullback_interpolated_moment_prepared_support_and_drds_only_multi_rhs(
+        self,
+        prepared,
+        *,
+        drds_value,
+        reference_nu_hat,
+        reference_epsi_hat,
+        vth_a,
+        field_bars,
+    ):
+        """Batched exact prepared/``drds`` transpose for one local species.
+
+        The leading axis of ``field_bars`` is an arbitrary on-device RHS
+        batch.  For every energy, NTX constructs the local primal/factor
+        residual once and applies the exact support-only low-dot adjoint to
+        that RHS batch.  The factors are consumed before this method returns;
+        the unbatched coefficient scans are returned solely to construct the
+        already-required anchor response for interpolation.
+
+        This is a private building block.  It is not selected by any current
+        transport/reverse mode.
+        """
+
+        ntx = _import_ntx()
+        multi_rhs_helper = getattr(
+            ntx,
+            "solve_prepared_coefficient_vector_lowdot_two_pullbacks_"
+            "prepared_support_only_multi_rhs_and_aux",
+            None,
+        )
+        if not callable(multi_rhs_helper):
+            raise RuntimeError(
+                "The multi-RHS prepared-support pullback requires the current NTX helper."
+            )
+        (
+            _reference_log_nu_star_bars,
+            base_transport_moments_bars,
+            dtransport_moments_d_er_bars,
+            dtransport_moments_d_log_nu_star_bars,
+        ) = _interpolated_response_field_bar_tuple(field_bars)
+        epsi_hat_tangent = jnp.asarray(1.0e3, dtype=reference_epsi_hat.dtype) / (
+            self.energy_grid.v_norm * vth_a
+        )
+        energy_indices = jnp.arange(reference_nu_hat.shape[0], dtype=jnp.int32)
+
+        def _one_energy(args):
+            energy_index, nu_hat_value, epsi_hat_value, epsi_dot = args
+
+            def _bars_and_direct_drds(coefficients, first_coeff_dot, second_coeff_dot):
+                def _moment_pullback_batched(coefficients_value, moment_bars):
+                    def _one_rhs(moment_bar):
+                        _, pullback = jax.vjp(
+                            lambda coefficient_value, drds_local: self._transport_moments_from_single_coefficient_vector(
+                                coefficient_value,
+                                drds_value=drds_local,
+                                energy_index=energy_index,
+                            ),
+                            coefficients_value,
+                            drds_value,
+                        )
+                        return pullback(moment_bar)
+
+                    return jax.vmap(_one_rhs)(moment_bars)
+
+                base_coefficient_bars, base_drds_bars = _moment_pullback_batched(
+                    coefficients, base_transport_moments_bars
+                )
+                first_coefficient_bars, first_drds_bars = _moment_pullback_batched(
+                    coefficients, dtransport_moments_d_er_bars
+                )
+                second_coefficient_bars, second_drds_bars = _moment_pullback_batched(
+                    coefficients, dtransport_moments_d_log_nu_star_bars
+                )
+
+                def _direct_drds_bars(coefficient_value, moment_bars):
+                    def _one_rhs(moment_bar):
+                        _, pullback = jax.vjp(
+                            lambda drds_local: self._transport_moments_from_single_coefficient_vector(
+                                coefficient_value,
+                                drds_value=drds_local,
+                                energy_index=energy_index,
+                            ),
+                            drds_value,
+                        )
+                        return pullback(moment_bar)[0]
+
+                    return jax.vmap(_one_rhs)(moment_bars)
+
+                _, first_drds_bars_dot = jax.jvp(
+                    lambda coefficient_value: _direct_drds_bars(
+                        coefficient_value, dtransport_moments_d_er_bars
+                    ),
+                    (coefficients,),
+                    (first_coeff_dot,),
+                )
+                _, second_drds_bars_dot = jax.jvp(
+                    lambda coefficient_value: _direct_drds_bars(
+                        coefficient_value, dtransport_moments_d_log_nu_star_bars
+                    ),
+                    (coefficients,),
+                    (second_coeff_dot,),
+                )
+                return (
+                    base_coefficient_bars,
+                    first_coefficient_bars,
+                    second_coefficient_bars,
+                    (
+                        base_drds_bars,
+                        first_drds_bars,
+                        first_drds_bars_dot,
+                        second_drds_bars,
+                        second_drds_bars_dot,
+                    ),
+                )
+
+            primal_outputs, support_result = multi_rhs_helper(
+                prepared,
+                ntx.MonoenergeticCase(nu_hat=nu_hat_value, epsi_hat=epsi_hat_value),
+                ntx.MonoenergeticCase(
+                    nu_hat=jnp.zeros_like(nu_hat_value), epsi_hat=epsi_dot
+                ),
+                ntx.MonoenergeticCase(
+                    nu_hat=nu_hat_value, epsi_hat=jnp.zeros_like(epsi_hat_value)
+                ),
+                _bars_and_direct_drds,
+                return_primal_outputs=True,
+            )
+            return (*support_result[:-1], support_result[-1], primal_outputs)
+
+        (
+            base_prepared_bars,
+            first_base_prepared_bars,
+            first_prepared_bars,
+            second_base_prepared_bars,
+            second_prepared_bars,
+            direct_drds_bars,
+            primal_outputs,
+        ) = jax.lax.map(
+            _one_energy,
+            (energy_indices, reference_nu_hat, reference_epsi_hat, epsi_hat_tangent),
+        )
+        prepared_bars = jax.tree_util.tree_map(
+            lambda values: jnp.sum(values, axis=0),
+            _sum_float_delta_bar_trees(
+                prepared,
+                base_prepared_bars,
+                first_prepared_bars,
+                second_base_prepared_bars,
+                second_prepared_bars,
+            ),
+        )
+        (
+            base_drds_bars,
+            _first_base_drds_bars,
+            first_drds_bars,
+            second_base_drds_bars,
+            second_drds_bars,
+        ) = direct_drds_bars
+        direct_drds_bars = jnp.sum(
+            base_drds_bars
+            + first_drds_bars
+            + second_base_drds_bars
+            + second_drds_bars,
+            axis=0,
+        )
+        coefficient_scan, first_coefficient_dot_scan, second_coefficient_dot_scan = primal_outputs
+        primal_response = (
+            self._log_nu_star_from_nu_hat(reference_nu_hat),
+            self._transport_moments_from_coefficient_scan(
+                coefficient_scan,
+                drds_value=drds_value,
+            ),
+            jax.jvp(
+                lambda values: self._transport_moments_from_coefficient_scan(
+                    values,
+                    drds_value=drds_value,
+                ),
+                (coefficient_scan,),
+                (first_coefficient_dot_scan,),
+            )[1],
+            jax.jvp(
+                lambda values: self._transport_moments_from_coefficient_scan(
+                    values,
+                    drds_value=drds_value,
+                ),
+                (coefficient_scan,),
+                (second_coefficient_dot_scan,),
+            )[1],
+        )
+        return prepared_bars, direct_drds_bars, primal_response
+
     def _pullback_local_scan_inputs_from_primitives(
         self,
         *,
@@ -8145,6 +8340,182 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             _per_radius,
             radius_indices,
             jnp.asarray(radius_coordinates, dtype=jnp.float64),
+        )
+
+    def _build_axis_lagged_response_with_coefficient_record(
+        self,
+        *,
+        channels,
+        prepared_all,
+        radius_coordinates,
+        Er,
+        temperature,
+        density,
+        v_thermal,
+    ):
+        """Build the interpolated face response and compact local coefficients.
+
+        This is deliberately an opt-in companion to
+        :meth:`_build_axis_lagged_response`.  It is limited to the established
+        interpolated-anchor lane: carrying coefficient scans for the direct
+        full-radius coefficient-response lane would neither feed the current
+        support transpose nor reduce an NTX solve.
+        """
+
+        collisionality_kind = _collisionality_kind(self.collisionality_model)
+        species_indices = jnp.arange(int(self.species.number_species), dtype=jnp.int32)
+        n_radius = int(Er.shape[0])
+        anchor_indices = self._response_anchor_indices(n_radius)
+        if int(anchor_indices.shape[0]) >= n_radius:
+            raise NotImplementedError(
+                "compact coefficient records currently require the interpolated "
+                "response-anchor lane."
+            )
+        target_rho = jnp.asarray(channels.rho, dtype=jnp.float64)
+
+        def _per_anchor(radius_index):
+            prepared = jax.tree_util.tree_map(
+                lambda arr: jax.lax.dynamic_index_in_dim(arr, radius_index, axis=0, keepdims=False),
+                prepared_all,
+            )
+            drds_value = jax.lax.dynamic_index_in_dim(channels.drds, radius_index, axis=0, keepdims=False)
+            er_value = jax.lax.dynamic_index_in_dim(Er, radius_index, axis=0, keepdims=False)
+            temperature_local = jax.lax.dynamic_index_in_dim(temperature, radius_index, axis=1, keepdims=False)
+            density_local = jax.lax.dynamic_index_in_dim(density, radius_index, axis=1, keepdims=False)
+            vthermal_local = jax.lax.dynamic_index_in_dim(v_thermal, radius_index, axis=1, keepdims=False)
+            return jax.vmap(
+                lambda species_index: self._build_interpolated_moment_response_local_with_coefficient_record(
+                    prepared,
+                    drds_value=drds_value,
+                    species_index=species_index,
+                    er_value=er_value,
+                    temperature_local=temperature_local,
+                    density_local=density_local,
+                    vthermal_local=vthermal_local,
+                    collisionality_kind=collisionality_kind,
+                )
+            )(species_indices)
+
+        anchor_rho = jnp.asarray(radius_coordinates, dtype=jnp.float64)[anchor_indices]
+        anchor_response, anchor_coefficients = self._map_radius_axis_regularized_at_axis0(
+            _per_anchor,
+            anchor_indices,
+            anchor_rho,
+        )
+        # At rho=0 the ordinary builder skips the local NTX solve and
+        # regularizes only the four response fields from anchors 1--3.  Those
+        # extrapolated coefficient leaves are not a physical local primal and
+        # must never enter a later support adjoint.  The corresponding
+        # interpolation transpose gives the raw axis response a zero bar, so a
+        # zero placeholder makes that contract explicit without an extra NTX
+        # solve or a record-only axis evaluation.
+        if int(anchor_indices.shape[0]) >= 4:
+            anchor_coefficients = jax.lax.cond(
+                jnp.isclose(anchor_rho[0], 0.0),
+                lambda _: jax.tree_util.tree_map(
+                    lambda value: value.at[0].set(jnp.zeros_like(value[0])),
+                    anchor_coefficients,
+                ),
+                lambda _: anchor_coefficients,
+                operand=None,
+            )
+        response = NTXInterpolatedMomentResponse(
+            reference_er=Er,
+            reference_log_nu_star=jnp.swapaxes(
+                self._interpolate_anchor_values(anchor_indices, anchor_response[0], target_rho),
+                0,
+                1,
+            ),
+            reference_transport_moments=jnp.swapaxes(
+                self._interpolate_anchor_values(anchor_indices, anchor_response[1], target_rho),
+                0,
+                1,
+            ),
+            dtransport_moments_d_er=jnp.swapaxes(
+                self._interpolate_anchor_values(anchor_indices, anchor_response[2], target_rho),
+                0,
+                1,
+            ),
+            dtransport_moments_d_log_nu_star=jnp.swapaxes(
+                self._interpolate_anchor_values(anchor_indices, anchor_response[3], target_rho),
+                0,
+                1,
+            ),
+        )
+        return response, anchor_coefficients
+
+    def build_lagged_response_with_compact_coefficient_record(self, state):
+        """Return the usual lagged response plus a segment-eligible face record.
+
+        This method is not a replacement for ``build_lagged_response``.  The
+        solver will select it only under a future dedicated record mode, so no
+        normal rollout or established reverse benchmark gains a new carry leaf.
+        """
+
+        if self._resolved_center_response_mode() != "interpolate_from_faces":
+            raise NotImplementedError(
+                "compact coefficient records currently require center_response_mode="
+                "'interpolate_from_faces'."
+            )
+        density = safe_density(state.density, self.density_floor)
+        temperature = state.temperature
+        support = self._static_support()
+        face_state = build_face_transport_state(
+            state,
+            self.geometry,
+            bc_density=self.bc_density,
+            bc_temperature=self.bc_temperature,
+            density_floor=self.density_floor,
+            temperature_floor=self.temperature_floor,
+        )
+        face_density = safe_density(face_state.density, self.density_floor)
+        face_temperature = face_state.temperature
+        face_v_thermal = get_v_thermal(self.species.mass, face_temperature)
+        face_response, face_anchor_coefficients = (
+            self._build_axis_lagged_response_with_coefficient_record(
+                channels=support.face_channels,
+                prepared_all=support.face_prepared,
+                radius_coordinates=self.geometry.r_grid_half,
+                Er=face_state.Er,
+                temperature=face_temperature,
+                density=face_density,
+                v_thermal=face_v_thermal,
+            )
+        )
+        del density, temperature
+        return (
+            NTXExactLijLaggedResponse(face_response=face_response, center_response=None),
+            _NTXExactLijLaggedResponseCoefficientRecord(
+                face_anchor_coefficients=face_anchor_coefficients,
+            ),
+        )
+
+    def compact_coefficient_record_zero(self):
+        """Return a shape-only zero record without an NTX solve.
+
+        Radau uses this solely for slots that reuse an already-cached lagged
+        response. It supplies the static branch shape for ``lax.cond`` while
+        keeping the record out of the regular carry.
+        """
+
+        if self._resolved_center_response_mode() != "interpolate_from_faces":
+            raise NotImplementedError(
+                "compact coefficient records currently require center_response_mode="
+                "'interpolate_from_faces'."
+            )
+        support = self._static_support()
+        n_radius = int(jnp.asarray(support.face_channels.rho).shape[0])
+        n_anchor = int(self._response_anchor_indices(n_radius).shape[0])
+        n_species = int(self.species.number_species)
+        n_energy = int(jnp.asarray(self.energy_grid.xWeights).shape[0])
+        dtype = jnp.asarray(support.face_channels.rho).dtype
+        zero_scan = jnp.zeros((n_anchor, n_species, n_energy, 5), dtype=dtype)
+        return _NTXExactLijLaggedResponseCoefficientRecord(
+            face_anchor_coefficients=_NTXInterpolatedMomentCoefficientRecord(
+                coefficient_scan=zero_scan,
+                dcoefficient_scan_d_er=jnp.zeros_like(zero_scan),
+                dcoefficient_scan_d_log_nu_star=jnp.zeros_like(zero_scan),
+            )
         )
 
     def build_lagged_response(self, state, **kwargs):
@@ -10388,6 +10759,171 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         return dataclasses.replace(
             _batched_zero_like(_float_delta_tree_like(support)),
             face_channels=face_channels_bar, face_prepared=face_prepared_bar,
+        )
+
+    def pullback_build_lagged_response_support_payload_batched_interpolated_faces_multi_rhs_shared_primal(
+        self, state, lagged_response_bars, support,
+    ):
+        """Experimental exact batched support transpose with local NTX sharing.
+
+        This private opt-in path is deliberately separate from the established
+        ``separate_reuse_local_vjp_primal`` route.  At one anchor/species it
+        forms NTX's primal modes, factorisation, and the two forward
+        case-direction solves once; the prepared-support adjoints then carry
+        only the objective RHS axis.  The temporary factorisation never leaves
+        that local helper and no state is retained across anchors or steps.
+
+        It is intentionally not selected by a CLI/reverse-mode dispatch until
+        an exact comparison is performed on the benchmark machine.
+        """
+        if not isinstance(lagged_response_bars, NTXExactLijLaggedResponse):
+            raise TypeError("batched NTX support pullback requires NTXExactLijLaggedResponse bars.")
+        face_response_bars = lagged_response_bars.face_response
+        if not isinstance(face_response_bars, NTXInterpolatedMomentResponse):
+            raise NotImplementedError("batched NTX support pullback requires interpolated face-response bars.")
+        if lagged_response_bars.center_response is not None:
+            raise NotImplementedError("batched NTX support pullback requires center_response=None.")
+
+        objective_count = int(jnp.asarray(face_response_bars.reference_er).shape[0])
+        face_state = build_face_transport_state(
+            state, self.geometry, bc_density=self.bc_density, bc_temperature=self.bc_temperature,
+            density_floor=self.density_floor, temperature_floor=self.temperature_floor,
+        )
+        face_density = safe_density(face_state.density, self.density_floor)
+        face_temperature = face_state.temperature
+        face_v_thermal = get_v_thermal(self.species.mass, face_temperature)
+        collisionality_kind = _collisionality_kind(self.collisionality_model)
+        species_indices = jnp.arange(int(self.species.number_species), dtype=jnp.int32)
+
+        def _batched_zero_like(tree):
+            return jax.tree_util.tree_map(
+                lambda leaf: jnp.broadcast_to(
+                    jnp.zeros_like(jnp.asarray(leaf)),
+                    (objective_count,) + jnp.asarray(leaf).shape,
+                ),
+                tree,
+            )
+
+        face_channels_bar = _batched_zero_like(_float_delta_tree_like(support.face_channels))
+        face_prepared_bar = _batched_zero_like(_float_delta_tree_like(support.face_prepared))
+        n_radius = int(face_state.Er.shape[0])
+        anchor_indices = self._response_anchor_indices(n_radius)
+        anchor_rho = jnp.asarray(self.geometry.r_grid_half, dtype=jnp.float64)[anchor_indices]
+        target_rho = jnp.asarray(support.face_channels.rho, dtype=jnp.float64)
+        n_anchor = int(anchor_indices.shape[0])
+        response_field_bars = jax.vmap(self._interpolated_response_field_bars)(face_response_bars)
+        response_field_bar_tuple = _interpolated_response_field_bar_tuple(response_field_bars)
+        raw_anchor_response_bar = jax.vmap(
+            lambda bars: self._pullback_interpolated_anchor_response_fields(
+                anchor_indices=anchor_indices, anchor_rho=anchor_rho,
+                target_rho=target_rho, field_bars=bars,
+            )
+        )(response_field_bars)
+        raw_anchor_response_fields = _interpolated_response_field_bar_tuple(raw_anchor_response_bar)
+        anchor_response_fields0 = tuple(
+            jnp.zeros((n_anchor,) + field_bar.shape[2:], dtype=field_bar.dtype)
+            for field_bar in raw_anchor_response_fields
+        )
+
+        def _one_anchor(radius_index, local_field_bars):
+            prepared = jax.tree_util.tree_map(
+                lambda arr: jax.lax.dynamic_index_in_dim(arr, radius_index, axis=0, keepdims=False),
+                support.face_prepared,
+            )
+            drds_value = jax.lax.dynamic_index_in_dim(
+                support.face_channels.drds, radius_index, axis=0, keepdims=False,
+            )
+            er_value = jax.lax.dynamic_index_in_dim(face_state.Er, radius_index, axis=0, keepdims=False)
+            temperature_local = jax.lax.dynamic_index_in_dim(face_temperature, radius_index, axis=1, keepdims=False)
+            density_local = jax.lax.dynamic_index_in_dim(face_density, radius_index, axis=1, keepdims=False)
+            vthermal_local = jax.lax.dynamic_index_in_dim(face_v_thermal, radius_index, axis=1, keepdims=False)
+            prepared_treedef = jax.tree_util.tree_structure(prepared)
+
+            def _one_species(species_index, *species_field_bars):
+                reference_nu_hat, reference_epsi_hat, vth_a = (
+                    self._interpolated_moment_local_scan_primitives(
+                        drds_value=drds_value,
+                        species_index=species_index,
+                        er_value=er_value,
+                        temperature_local=temperature_local,
+                        density_local=density_local,
+                        vthermal_local=vthermal_local,
+                        collisionality_kind=collisionality_kind,
+                    )
+                )
+                prepared_bar, drds_bar, primal_response = (
+                    self._pullback_interpolated_moment_prepared_support_and_drds_only_multi_rhs(
+                        prepared,
+                        drds_value=drds_value,
+                        reference_nu_hat=reference_nu_hat,
+                        reference_epsi_hat=reference_epsi_hat,
+                        vth_a=vth_a,
+                        field_bars=species_field_bars,
+                    )
+                )
+                return (
+                    tuple(
+                        jax.tree_util.tree_leaves(
+                            _sanitize_float_delta_bar_tree(prepared, prepared_bar)
+                        )
+                    ),
+                    drds_bar,
+                    primal_response,
+                )
+
+            prepared_species_bar_leaves, drds_species_bars, primal_response = jax.vmap(
+                _one_species,
+                in_axes=(0,) + (1,) * len(local_field_bars),
+            )(species_indices, *local_field_bars)
+            prepared_bar = prepared_treedef.unflatten(
+                tuple(jnp.sum(values, axis=0) for values in prepared_species_bar_leaves)
+            )
+            return primal_response, prepared_bar, jnp.sum(drds_species_bars, axis=0)
+
+        def _accumulate(carry, anchor_pos):
+            channels, prepared_bars, anchor_fields = carry
+            radius_index = jax.lax.dynamic_index_in_dim(anchor_indices, anchor_pos, axis=0, keepdims=False)
+            local_field_bars = tuple(
+                jax.lax.dynamic_index_in_dim(field_bar, anchor_pos, axis=1, keepdims=False)
+                for field_bar in raw_anchor_response_fields
+            )
+            local_response, local_prepared, local_drds = _one_anchor(radius_index, local_field_bars)
+            anchor_fields = tuple(
+                field.at[anchor_pos].set(value)
+                for field, value in zip(anchor_fields, local_response, strict=True)
+            )
+            return (
+                dataclasses.replace(channels, drds=channels.drds.at[:, radius_index].add(local_drds)),
+                jax.tree_util.tree_map(
+                    lambda values, local: values.at[:, radius_index].add(local),
+                    prepared_bars, local_prepared,
+                ),
+                anchor_fields,
+            ), None
+
+        (face_channels_bar, face_prepared_bar, raw_anchor_fields), _ = jax.lax.scan(
+            _accumulate,
+            (face_channels_bar, face_prepared_bar, anchor_response_fields0),
+            jnp.arange(n_anchor, dtype=jnp.int32),
+        )
+        anchor_fields = raw_anchor_fields if n_anchor < 4 else jax.lax.cond(
+            jnp.isclose(anchor_rho[0], 0.0),
+            lambda _: self._regularize_axis_radius0(raw_anchor_fields, anchor_rho),
+            lambda _: raw_anchor_fields,
+            operand=None,
+        )
+        target_rho_bar = jnp.zeros((objective_count,) + target_rho.shape, dtype=target_rho.dtype)
+        for anchor_field, field_bar in zip(anchor_fields, response_field_bar_tuple, strict=True):
+            target_rho_bar = target_rho_bar + jax.vmap(
+                lambda one_bar: self._pullback_interpolate_anchor_target_rho(
+                    anchor_indices, anchor_field, target_rho, one_bar,
+                )
+            )(field_bar)
+        face_channels_bar = dataclasses.replace(face_channels_bar, rho=face_channels_bar.rho + target_rho_bar)
+        return dataclasses.replace(
+            _batched_zero_like(_float_delta_tree_like(support)),
+            face_channels=face_channels_bar,
+            face_prepared=face_prepared_bar,
         )
 
     def pullback_build_lagged_response_state_and_support_payload_batched_interpolated_faces(

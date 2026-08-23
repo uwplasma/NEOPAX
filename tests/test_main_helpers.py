@@ -121,6 +121,7 @@ def test_ntx_exact_runtime_lagged_face_response_matches_reference_and_finite_dif
         boozer_file=None,
         support=support,
         center_response_mode="interpolate_from_faces",
+        response_anchor_count=2,
     )
     state0 = TransportState(
         density=jnp.asarray([[1.0, 1.15], [1.0, 1.15]]),
@@ -138,6 +139,17 @@ def test_ntx_exact_runtime_lagged_face_response_matches_reference_and_finite_dif
         return model.evaluate_face_fluxes(state, faces)
 
     response = model.build_lagged_response(state0)
+    recorded_response, compact_record = model.build_lagged_response_with_compact_coefficient_record(state0)
+    for ordinary_leaf, recorded_leaf in zip(
+        jax.tree_util.tree_leaves(response),
+        jax.tree_util.tree_leaves(recorded_response),
+        strict=True,
+    ):
+        if jnp.issubdtype(jnp.asarray(ordinary_leaf).dtype, jnp.inexact):
+            assert jnp.allclose(recorded_leaf, ordinary_leaf, rtol=1.0e-9, atol=1.0e-11)
+    assert compact_record.face_anchor_coefficients.coefficient_scan.shape == (2, 2, 3, 5)
+    assert compact_record.face_anchor_coefficients.dcoefficient_scan_d_er.shape == (2, 2, 3, 5)
+    assert compact_record.face_anchor_coefficients.dcoefficient_scan_d_log_nu_star.shape == (2, 2, 3, 5)
     lagged_at_reference = model.evaluate_with_lagged_response(state0, response)
     direct_at_reference = face_fluxes_from_state(state0)
     for name in ("Gamma", "Q", "Upar"):

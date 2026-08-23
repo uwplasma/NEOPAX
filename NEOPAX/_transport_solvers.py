@@ -923,6 +923,19 @@ def _lagged_response_hooks(vector_field: Callable):
     return None, None
 
 
+def _lagged_response_compact_coefficient_record_hooks(vector_field: Callable):
+    """Return the optional one-build compact-record hooks from the model."""
+
+    owner = getattr(vector_field, "__self__", None)
+    if owner is None:
+        return None, None
+    build_fn = getattr(owner, "build_lagged_response_with_compact_coefficient_record", None)
+    zero_fn = getattr(owner, "compact_coefficient_record_zero", None)
+    if callable(build_fn) and callable(zero_fn):
+        return build_fn, zero_fn
+    return None, None
+
+
 def _lagged_response_pullback_hook(vector_field: Callable):
     owner = getattr(vector_field, "__self__", None)
     if owner is None:
@@ -3316,6 +3329,20 @@ class _RadauAcceptedStepSegmentPrimalRecord:
 
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True, eq=False)
+class _RadauAcceptedStepSegmentCompactCoefficientRecord:
+    """Opt-in segment record holding the ordinary primal record plus NTX coefficients.
+
+    The compact coefficient data exists only in the experimental replay path;
+    keeping it in a separate pytree avoids changing the current-best segment
+    replay's inputs, compiled signature, or memory use.
+    """
+
+    primal_record: _RadauAcceptedStepSegmentPrimalRecord
+    coefficient_record: Any
+
+
+@jax.tree_util.register_dataclass
+@dataclasses.dataclass(frozen=True, eq=False)
 class _RadauAcceptedStepBackwardPayloadCandidate:
     t_start: Any
     y_start: Any
@@ -3718,7 +3745,6 @@ class _RadauAcceptedStepPhysicsContext:
     flat_rhs_build_support_pullback: Callable[[Any, Any, Any], Any] | None = None
     flat_rhs_build_support_pullback_batched_interpolated_faces: Callable[[Any, Any, Any], Any] | None = None
     flat_rhs_build_support_pullback_batched_interpolated_faces_reuse_local_vjp_primal: Callable[[Any, Any, Any], Any] | None = None
-    flat_rhs_build_support_pullback_batched_interpolated_faces_reuse_local_vjp_primal: Callable[[Any, Any, Any], Any] | None = None
     flat_rhs_build_state_and_support_pullback_batched_interpolated_faces: Callable[[Any, Any, Any], Any] | None = None
     flat_rhs_build_state_and_support_pullback_batched_interpolated_faces_reuse_local_vjp_primal: Callable[[Any, Any, Any], Any] | None = None
     flat_rhs_lagged_response_support_pullback: Callable[[Any, Any, Any, Any, Any], Any] | None = None
@@ -3743,6 +3769,8 @@ class _RadauAcceptedStepPhysicsContext:
     lagged_response_reuse_rtol: Any = 5.0e-2
     lagged_response_reuse_atol: Any = 1.0e-8
     reverse_direct_stage_adjoint: bool = False
+    build_lagged_response_with_compact_coefficient_record: Callable[[Any], tuple[Any, Any]] | None = None
+    compact_coefficient_record_zero: Any = None
     reverse_stage_adjoint_solve_mode: str = "structured"
     reverse_rhs_transpose_mode: str = "generic"
     reverse_rhs_pullback_mode: str = "separate"
@@ -7382,6 +7410,68 @@ def _execute_radau_accepted_step_attempt_reverse_minimal(
     )
 
 
+def _execute_radau_accepted_step_attempt_reverse_minimal_with_compact_coefficient_record(
+    kernel_context: _RadauAcceptedStepKernelContext,
+    physics_context: _RadauAcceptedStepPhysicsContext,
+    carry_in: _RadauAcceptedStepCarry,
+    context: _RadauAcceptedStepAttemptContext,
+) -> tuple[_RadauAcceptedStepReverseMinimalAttemptResult, Any]:
+    """Experimental reverse-minimal attempt retaining one rebuild's NTX coefficients.
+
+    This calls the same nonlinear Radau step as the standard helper.  On a
+    lagged-response rebuild, the response and coefficient record come from a
+    *single* transport-model call; cached-response slots carry only the
+    shape-compatible zero record.
+    """
+    trial_dt = jnp.minimum(carry_in.dt, context.t_final - carry_in.t)
+    (
+        trial_y,
+        stage_history,
+        jacobian_out,
+        cache_valid_out,
+        cache_dt_out,
+        cache_age_out,
+        real_lu_out,
+        real_piv_out,
+        complex_lu_out,
+        complex_piv_out,
+        theta_final,
+        newton_iter_count,
+        lagged_response_out,
+        lagged_reference_y_out,
+        compact_coefficient_record,
+    ) = _radau_single_step_primal_reverse_minimal(
+        kernel_context,
+        physics_context,
+        carry_in,
+        trial_dt,
+        return_compact_coefficient_record=True,
+    )
+    carry_after_attempt = dataclasses.replace(
+        carry_in,
+        lagged_response_cache=lagged_response_out,
+        lagged_response_valid=jnp.asarray(context.use_transport_lagged_response),
+        lagged_reference_y=lagged_reference_y_out,
+    )
+    minimal_result = _RadauAcceptedStepReverseMinimalAttemptResult(
+        carry_after_attempt=carry_after_attempt,
+        trial_dt=trial_dt,
+        trial_y=trial_y,
+        stage_history=stage_history,
+        jacobian_out=jacobian_out,
+        cache_valid_out=cache_valid_out,
+        cache_dt_out=cache_dt_out,
+        cache_age_out=cache_age_out,
+        real_lu_out=real_lu_out,
+        real_piv_out=real_piv_out,
+        complex_lu_out=complex_lu_out,
+        complex_piv_out=complex_piv_out,
+        theta_final=theta_final,
+        newton_iter_count=newton_iter_count,
+    )
+    return minimal_result, compact_coefficient_record
+
+
 def _radau_segment_primal_record_from_reverse_minimal_attempt(
     minimal_result: _RadauAcceptedStepReverseMinimalAttemptResult,
 ) -> _RadauAcceptedStepSegmentPrimalRecord:
@@ -7964,6 +8054,49 @@ def _radau_prepare_lagged_response(
         )
         return lagged_response, lagged_reference_y, lagged_response_reused
     return None, carry_in.y, lagged_response_reused
+
+
+def _radau_prepare_lagged_response_with_compact_coefficient_record(
+    kernel_context: _RadauAcceptedStepKernelContext,
+    carry_in: _RadauAcceptedStepCarry,
+    unpack_flat: Callable[[Any], Any],
+    project_flat: Callable[[Any], Any] | None,
+    build_lagged_response_with_record: Callable[[Any], tuple[Any, Any]],
+    zero_record_factory: Callable[[], Any],
+) -> tuple[Any, Any, Any, Any]:
+    """Prepare one lagged response and an optional segment-only record.
+
+    The response builder is called only on the existing rebuild branch. The
+    reuse branch returns a preallocated zero record solely to keep the JAX
+    conditional shape-static; it never enters the normal carry.
+    """
+
+    zero_record = zero_record_factory()
+    if not kernel_context.use_transport_lagged_response:
+        return None, carry_in.y, jnp.asarray(False), zero_record
+    flat_y = carry_in.y
+    lagged_response_reused = jnp.asarray(carry_in.lagged_response_valid)
+
+    def _reuse_cached(_):
+        return carry_in.lagged_response_cache, zero_record
+
+    def _rebuild_cached(_):
+        candidate_state = unpack_flat(_project_flat_state_if_needed(flat_y, project_flat))
+        return build_lagged_response_with_record(candidate_state)
+
+    lagged_response, coefficient_record = jax.lax.cond(
+        carry_in.lagged_response_valid,
+        _reuse_cached,
+        _rebuild_cached,
+        operand=None,
+    )
+    lagged_reference_y = jax.lax.cond(
+        carry_in.lagged_response_valid,
+        lambda _: carry_in.lagged_reference_y,
+        lambda _: flat_y,
+        operand=None,
+    )
+    return lagged_response, lagged_reference_y, lagged_response_reused, coefficient_record
 
 
 def _radau_eval_rhs(
@@ -12639,6 +12772,8 @@ def _radau_single_step_primal_reverse_minimal(
     physics_context: _RadauAcceptedStepPhysicsContext,
     carry_in: _RadauAcceptedStepCarry,
     h_value,
+    *,
+    return_compact_coefficient_record: bool = False,
 ):
     """Reverse-only primal step data needed by the accepted-step adjoint.
 
@@ -12662,13 +12797,35 @@ def _radau_single_step_primal_reverse_minimal(
     real_piv_cache = carry_in.real_piv
     complex_lu_cache = carry_in.complex_lu
     complex_piv_cache = carry_in.complex_piv
-    lagged_response, lagged_reference_y, _lagged_response_reused = _radau_prepare_lagged_response(
-        kernel_context,
-        carry_in,
-        physics_context.unpack_flat,
-        physics_context.project_flat,
-        physics_context.build_lagged_response,
-    )
+    if return_compact_coefficient_record:
+        if (
+            physics_context.build_lagged_response_with_compact_coefficient_record is None
+            or physics_context.compact_coefficient_record_zero is None
+        ):
+            raise ValueError(
+                "The compact coefficient record replay requires transport-model compact-record hooks."
+            )
+        (
+            lagged_response,
+            lagged_reference_y,
+            _lagged_response_reused,
+            compact_coefficient_record,
+        ) = _radau_prepare_lagged_response_with_compact_coefficient_record(
+            kernel_context,
+            carry_in,
+            physics_context.unpack_flat,
+            physics_context.project_flat,
+            physics_context.build_lagged_response_with_compact_coefficient_record,
+            physics_context.compact_coefficient_record_zero,
+        )
+    else:
+        lagged_response, lagged_reference_y, _lagged_response_reused = _radau_prepare_lagged_response(
+            kernel_context,
+            carry_in,
+            physics_context.unpack_flat,
+            physics_context.project_flat,
+            physics_context.build_lagged_response,
+        )
 
     def _rhs_eval(t_eval, y_eval):
         return _radau_eval_rhs(
@@ -12800,7 +12957,7 @@ def _radau_single_step_primal_reverse_minimal(
     cache_valid_out = jnp.asarray(True)
     cache_dt_out = h_value
     cache_age_out = jnp.where(reuse_jacobian, cache_age + 1, jnp.asarray(0, dtype=jnp.int32))
-    return (
+    result = (
         flat_next,
         subsolve_result.z_final,
         jacobian_ref,
@@ -12816,6 +12973,9 @@ def _radau_single_step_primal_reverse_minimal(
         lagged_response,
         lagged_reference_y,
     )
+    if return_compact_coefficient_record:
+        return (*result, compact_coefficient_record)
+    return result
 
 
 def _radau_fixed_dt_accepted_rollout(
@@ -14242,6 +14402,64 @@ def _radau_replay_realized_accepted_slot_reverse_minimal_with_primal_record(
 
     def _skip(_):
         return carry, _radau_segment_primal_record_padding(carry)
+
+    return jax.lax.cond(active, _do_step, _skip, operand=None)
+
+
+def _radau_replay_realized_accepted_slot_reverse_minimal_with_compact_coefficient_record(
+    execution_context: _RadauSolveExecutionContext,
+    carry: _RadauAcceptedStepCarry,
+    active,
+    dt_value,
+    next_dt_value,
+    recent_reject_count_value,
+    regrowth_cooldown_value,
+    easy_growth_streak_value,
+    lagged_response_valid_value,
+):
+    """Opt-in minimal replay returning a compact NTX coefficient record.
+
+    This is deliberately separate from the established primal-record helper.
+    Inactive and reuse slots return zero coefficient arrays, so the record is
+    bounded by segment length and never becomes a cross-segment tape.
+    """
+    zero_record_factory = execution_context.physics_context.compact_coefficient_record_zero
+    if zero_record_factory is None:
+        raise ValueError("Compact coefficient record replay requires a model-provided zero record.")
+    zero_record = zero_record_factory()
+
+    def _do_step(_):
+        carry_for_step = dataclasses.replace(carry, dt=dt_value)
+        carry_for_minimal = _radau_carry_with_forward_only_jvp_fields(carry_for_step)
+        minimal_result, coefficient_record = (
+            _execute_radau_accepted_step_attempt_reverse_minimal_with_compact_coefficient_record(
+                execution_context.kernel_context,
+                execution_context.physics_context,
+                carry_for_minimal,
+                execution_context.attempt_context,
+            )
+        )
+        primal_record = _radau_segment_primal_record_from_reverse_minimal_attempt(minimal_result)
+        next_carry = _radau_next_carry_from_reverse_minimal_record(
+            execution_context.physics_context,
+            carry_for_minimal,
+            primal_record,
+            next_dt_value=next_dt_value,
+            recent_reject_count_value=recent_reject_count_value,
+            regrowth_cooldown_value=regrowth_cooldown_value,
+            easy_growth_streak_value=easy_growth_streak_value,
+            lagged_response_valid_value=lagged_response_valid_value,
+        )
+        return next_carry, _RadauAcceptedStepSegmentCompactCoefficientRecord(
+            primal_record=primal_record,
+            coefficient_record=coefficient_record,
+        )
+
+    def _skip(_):
+        return carry, _RadauAcceptedStepSegmentCompactCoefficientRecord(
+            primal_record=_radau_segment_primal_record_padding(carry),
+            coefficient_record=zero_record,
+        )
 
     return jax.lax.cond(active, _do_step, _skip, operand=None)
 
@@ -17105,6 +17323,10 @@ def _build_prepared_radau_accepted_rollout(
 
     flat_rhs = _flat_rhs_factory(unpack_flat, vector_field, args, kwargs, project_flat=project_flat)
     build_lagged_response_raw, _ = _lagged_response_hooks(vector_field)
+    (
+        build_lagged_response_with_compact_coefficient_record,
+        compact_coefficient_record_zero,
+    ) = _lagged_response_compact_coefficient_record_hooks(vector_field)
     pullback_build_lagged_response = _lagged_response_pullback_hook(vector_field)
     flat_rhs_with_lagged_response_raw = _flat_rhs_with_lagged_response_factory(
         unravel=unpack_flat,
@@ -17472,6 +17694,10 @@ def _build_prepared_radau_accepted_rollout(
         project_flat=project_flat,
         build_lagged_response=build_lagged_response,
         pullback_build_lagged_response=pullback_build_lagged_response,
+        build_lagged_response_with_compact_coefficient_record=(
+            build_lagged_response_with_compact_coefficient_record
+        ),
+        compact_coefficient_record_zero=compact_coefficient_record_zero,
         flat_rhs=flat_rhs,
         flat_rhs_with_lagged_response=flat_rhs_with_lagged_response,
         flat_rhs_lagged_response_pullback=flat_rhs_lagged_response_pullback,
@@ -17652,6 +17878,10 @@ class RADAUSolver(_RadauSolverConfig):
         )
         flat_rhs = _flat_rhs_factory(unpack_flat, vector_field, args, kwargs, project_flat=project_flat)
         build_lagged_response_raw, _ = _lagged_response_hooks(vector_field)
+        (
+            build_lagged_response_with_compact_coefficient_record,
+            compact_coefficient_record_zero,
+        ) = _lagged_response_compact_coefficient_record_hooks(vector_field)
         pullback_build_lagged_response = _lagged_response_pullback_hook(vector_field)
         flat_rhs_with_lagged_response_raw = _flat_rhs_with_lagged_response_factory(
             unravel=unpack_flat,
@@ -18013,6 +18243,10 @@ class RADAUSolver(_RadauSolverConfig):
             project_flat=project_flat,
             build_lagged_response=build_lagged_response,
             pullback_build_lagged_response=pullback_build_lagged_response,
+            build_lagged_response_with_compact_coefficient_record=(
+                build_lagged_response_with_compact_coefficient_record
+            ),
+            compact_coefficient_record_zero=compact_coefficient_record_zero,
             flat_rhs=flat_rhs,
             flat_rhs_with_lagged_response=flat_rhs_with_lagged_response,
             flat_rhs_lagged_response_pullback=flat_rhs_lagged_response_pullback,
