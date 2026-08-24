@@ -1327,9 +1327,9 @@ current total-time baseline.
 
 1. **Compact the native temporary contract.** In a new isolated helper, retain
    the same primal/factorization and matrix-RHS adjoint fields, but return one
-   final prepared bar rather than five directional prepared trees.  Return only
-   the three required case-chain quantities (final nu bar, final epsi bar, and
-   the first-direction epsi bar for the vth chain), rather than ten components.
+   final prepared bar rather than five directional prepared trees. Retain the
+   existing small case-component contract, so NEOPAX uses its proven case-chain
+   combination unchanged.
    Implemented as isolated selector
    `ntx_batched_interpolated_faces_native_multi_rhs_compact_shared_primal`.
 2. **Stream energy accumulation.** Replace the mapped stack of large

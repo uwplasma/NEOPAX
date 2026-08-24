@@ -7425,39 +7425,7 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                 (second_coefficient_dot_scan,),
             )[1],
         )
-        if native_compact_ntx_rhs and return_case_bars:
-            (
-                nu_hat_case_bars,
-                epsi_hat_case_bars,
-                first_base_epsi_hat_bars,
-            ) = native_case_bar_components
-            log_nu_weights = jnp.asarray(
-                self.energy_grid.xWeights, dtype=reference_nu_hat.dtype
-            )
-            log_nu_weights = log_nu_weights / jnp.maximum(
-                jnp.sum(log_nu_weights), 1.0e-30
-            )
-            safe_nu_hat = jnp.maximum(reference_nu_hat, 1.0e-30)
-            active_nu_hat = jnp.asarray(
-                reference_nu_hat >= 1.0e-30, dtype=reference_nu_hat.dtype
-            )
-            log_nu_star_nu_hat_bars = (
-                active_nu_hat * log_nu_weights / safe_nu_hat
-            )[:, None] * _reference_log_nu_star_bars[None, :]
-            nu_hat_bars = jnp.swapaxes(
-                log_nu_star_nu_hat_bars + nu_hat_case_bars, 0, 1
-            )
-            epsi_hat_bars = jnp.swapaxes(epsi_hat_case_bars, 0, 1)
-            vth_a_bars = jnp.sum(
-                first_base_epsi_hat_bars * (-epsi_hat_tangent[:, None] / vth_a[:, None]),
-                axis=0,
-            )
-            return prepared_bars, direct_drds_bars, primal_response, (
-                nu_hat_bars,
-                epsi_hat_bars,
-                vth_a_bars,
-            )
-        if native_factorized_ntx_rhs and return_case_bars:
+        if (native_factorized_ntx_rhs or native_compact_ntx_rhs) and return_case_bars:
             (
                 base_nu_hat_bars,
                 base_epsi_hat_bars,
