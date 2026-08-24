@@ -286,13 +286,13 @@ def test_multi_rhs_prepared_support_adapter_matches_scalar_local_pullbacks():
     )
     scalar_field_bars = (
         (
-            jnp.asarray(0.0),
+            jnp.asarray(0.13),
             jnp.asarray([0.3, -0.2, 0.1, 0.4, -0.1, 0.2]),
             jnp.asarray([-0.3, 0.1, 0.2, -0.2, 0.3, -0.1]),
             jnp.asarray([0.2, 0.4, -0.3, 0.1, 0.2, -0.4]),
         ),
         (
-            jnp.asarray(0.0),
+            jnp.asarray(-0.31),
             jnp.asarray([-0.1, 0.2, 0.3, -0.4, 0.5, -0.2]),
             jnp.asarray([0.4, -0.3, 0.2, 0.1, -0.5, 0.3]),
             jnp.asarray([-0.2, 0.3, 0.4, -0.1, 0.2, 0.5]),

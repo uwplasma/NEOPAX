@@ -7306,11 +7306,25 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             # ``lax.map`` left energy first, whereas the local scan primitive
             # receives one RHS batch of energy values.  This is the same
             # contraction used by the full joint state/support pullback.
+            # ``reference_log_nu_star`` is one energy-averaged scalar per
+            # objective.  Form its transpose explicitly as (energy, rhs):
+            # the scalar helper is intentionally unbatched and would otherwise
+            # align an objective axis with the energy axis.
+            log_nu_weights = jnp.asarray(
+                self.energy_grid.xWeights, dtype=reference_nu_hat.dtype
+            )
+            log_nu_weights = log_nu_weights / jnp.maximum(
+                jnp.sum(log_nu_weights), 1.0e-30
+            )
+            safe_nu_hat = jnp.maximum(reference_nu_hat, 1.0e-30)
+            active_nu_hat = jnp.asarray(
+                reference_nu_hat >= 1.0e-30, dtype=reference_nu_hat.dtype
+            )
+            log_nu_star_nu_hat_bars = (
+                active_nu_hat * log_nu_weights / safe_nu_hat
+            )[:, None] * _reference_log_nu_star_bars[None, :]
             nu_hat_bars = jnp.swapaxes(
-                self._pullback_log_nu_star_from_nu_hat(
-                    reference_nu_hat,
-                    _reference_log_nu_star_bars,
-                )
+                log_nu_star_nu_hat_bars
                 + base_nu_hat_bars
                 + first_nu_hat_bars
                 + second_base_nu_hat_bars
