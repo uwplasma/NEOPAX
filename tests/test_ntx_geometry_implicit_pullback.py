@@ -297,6 +297,12 @@ def test_multi_rhs_prepared_support_adapter_matches_scalar_local_pullbacks():
             jnp.asarray([0.4, -0.3, 0.2, 0.1, -0.5, 0.3]),
             jnp.asarray([-0.2, 0.3, 0.4, -0.1, 0.2, 0.5]),
         ),
+        (
+            jnp.asarray(0.21),
+            jnp.asarray([0.2, -0.4, 0.5, -0.3, 0.1, 0.3]),
+            jnp.asarray([-0.5, 0.2, -0.1, 0.3, 0.4, -0.2]),
+            jnp.asarray([0.1, -0.3, 0.2, 0.5, -0.4, 0.3]),
+        ),
     )
     batched_field_bars = tuple(
         jnp.stack([field_bars[field_index] for field_bars in scalar_field_bars])
