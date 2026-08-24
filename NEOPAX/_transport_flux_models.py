@@ -7052,6 +7052,7 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         field_bars,
         native_factorized_ntx_rhs: bool = False,
         native_compact_ntx_rhs: bool = False,
+        stream_native_compact_energy: bool = False,
         return_case_bars: bool = False,
         include_second_direction_base_prepared: bool = True,
     ):
@@ -7223,7 +7224,11 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             primal_outputs, support_result = helper_result
             return (*support_result[:-1], support_result[-1], primal_outputs)
 
-        if native_compact_ntx_rhs and return_case_bars:
+        if (
+            native_compact_ntx_rhs
+            and return_case_bars
+            and stream_native_compact_energy
+        ):
             # The full native helper returns five objective-batched prepared
             # trees per energy.  The compact helper has already reduced that
             # to one, so accumulate it while scanning energy rather than

@@ -1335,8 +1335,10 @@ current total-time baseline.
 2. **Stream energy accumulation.** Replace the mapped stack of large
    energy-by-objective prepared bars with a `lax.scan` carry.  The objective
    axis remains matrix-RHS batched; this only prevents energy intermediates
-   from remaining live until a later reduction. Implemented for the compact
-   selector: only small primal/case arrays retain an energy axis.
+   from remaining live until a later reduction. **Deferred:** the first scan
+   implementation did not reproduce the mapped native case bars, so it is not
+   selected. The compact selector retains the proven 5-to-1 prepared-return
+   reduction while its energy reduction stays on the exact mapped reference.
 3. **Local gates first.** Use only small in-memory CPU mock equivalence tests
    and lowering-size checks.  Require identical bars and no additional NTX
    factorization, no host transfer, no persistent timestep tape, and no
