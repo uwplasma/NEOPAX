@@ -439,7 +439,10 @@ def test_compact_and_reused_drds_native_multi_rhs_adapters_match_full_native_ada
     reused_drds = model._pullback_interpolated_moment_prepared_support_and_drds_only_native_multi_rhs_reuse_moment_drds_jvp(
         prepared, **args
     )
-    for candidate in (compact, reused_drds):
+    compact_residual = model._pullback_interpolated_moment_prepared_support_and_drds_only_native_multi_rhs_compact_residual_reuse_moment_drds_jvp(
+        prepared, **args
+    )
+    for candidate in (compact, reused_drds, compact_residual):
         _assert_float_tree_allclose(candidate[0], full[0])
         _assert_float_tree_allclose(candidate[1], full[1])
         _assert_float_tree_allclose(candidate[2], full[2])

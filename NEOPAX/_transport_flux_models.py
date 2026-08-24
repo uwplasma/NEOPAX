@@ -1249,6 +1249,27 @@ class CombinedTransportFluxModel(TransportFluxModelBase):
         )
         return pullback_fn(state, response_bars, support)
 
+    def pullback_build_lagged_response_support_payload_batched_interpolated_faces_native_multi_rhs_compact_residual_reuse_moment_drds_jvp_shared_primal(
+        self, state, lagged_response_bars, support, **kwargs,
+    ):
+        """Forward the isolated split-residual native support rule."""
+        del kwargs
+        pullback_fn = getattr(
+            self.neoclassical_model,
+            "pullback_build_lagged_response_support_payload_batched_interpolated_faces_"
+            "native_multi_rhs_compact_residual_reuse_moment_drds_jvp_shared_primal",
+            None,
+        )
+        if not callable(pullback_fn):
+            raise NotImplementedError(
+                "The active neoclassical model does not expose the split-residual "
+                "native support pullback."
+            )
+        response_bars = (
+            None if lagged_response_bars is None else lagged_response_bars.neoclassical_response
+        )
+        return pullback_fn(state, response_bars, support)
+
     def pullback_build_lagged_response_state_and_support_payload_batched_interpolated_faces(
         self,
         state,
@@ -7068,6 +7089,7 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         field_bars,
         native_factorized_ntx_rhs: bool = False,
         native_compact_ntx_rhs: bool = False,
+        native_compact_residual_ntx_rhs: bool = False,
         reuse_joint_moment_drds_jvp: bool = False,
         stream_native_compact_energy: bool = False,
         return_case_bars: bool = False,
@@ -7089,14 +7111,19 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         ntx = _import_ntx()
         helper_name = (
             "solve_prepared_coefficient_vector_lowdot_two_pullbacks_"
-            "prepared_support_only_native_multi_rhs_compact_and_aux"
-            if native_compact_ntx_rhs
+            "prepared_support_only_native_multi_rhs_compact_residual_and_aux"
+            if native_compact_residual_ntx_rhs
             else (
                 "solve_prepared_coefficient_vector_lowdot_two_pullbacks_"
-                "prepared_support_only_native_multi_rhs_and_aux"
-                if native_factorized_ntx_rhs
-                else "solve_prepared_coefficient_vector_lowdot_two_pullbacks_"
-                "prepared_support_only_multi_rhs_and_aux"
+                "prepared_support_only_native_multi_rhs_compact_and_aux"
+                if native_compact_ntx_rhs
+                else (
+                    "solve_prepared_coefficient_vector_lowdot_two_pullbacks_"
+                    "prepared_support_only_native_multi_rhs_and_aux"
+                    if native_factorized_ntx_rhs
+                    else "solve_prepared_coefficient_vector_lowdot_two_pullbacks_"
+                    "prepared_support_only_multi_rhs_and_aux"
+                )
             )
         )
         multi_rhs_helper = getattr(
@@ -7597,6 +7624,57 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             vth_a=vth_a,
             field_bars=field_bars,
             native_factorized_ntx_rhs=True,
+            reuse_joint_moment_drds_jvp=True,
+            return_case_bars=return_case_bars,
+            include_second_direction_base_prepared=False,
+        )
+
+    def _pullback_interpolated_moment_prepared_support_and_drds_only_native_multi_rhs_compact_residual(
+        self,
+        prepared,
+        *,
+        drds_value,
+        reference_nu_hat,
+        reference_epsi_hat,
+        vth_a,
+        field_bars,
+        return_case_bars: bool = False,
+    ):
+        """Private split-residual adapter; no reverse selector calls it yet."""
+        return self._pullback_interpolated_moment_prepared_support_and_drds_only_multi_rhs(
+            prepared,
+            drds_value=drds_value,
+            reference_nu_hat=reference_nu_hat,
+            reference_epsi_hat=reference_epsi_hat,
+            vth_a=vth_a,
+            field_bars=field_bars,
+            native_factorized_ntx_rhs=True,
+            native_compact_residual_ntx_rhs=True,
+            return_case_bars=return_case_bars,
+            include_second_direction_base_prepared=False,
+        )
+
+    def _pullback_interpolated_moment_prepared_support_and_drds_only_native_multi_rhs_compact_residual_reuse_moment_drds_jvp(
+        self,
+        prepared,
+        *,
+        drds_value,
+        reference_nu_hat,
+        reference_epsi_hat,
+        vth_a,
+        field_bars,
+        return_case_bars: bool = False,
+    ):
+        """Split-residual adapter retaining the validated moment-``drds`` reuse."""
+        return self._pullback_interpolated_moment_prepared_support_and_drds_only_multi_rhs(
+            prepared,
+            drds_value=drds_value,
+            reference_nu_hat=reference_nu_hat,
+            reference_epsi_hat=reference_epsi_hat,
+            vth_a=vth_a,
+            field_bars=field_bars,
+            native_factorized_ntx_rhs=True,
+            native_compact_residual_ntx_rhs=True,
             reuse_joint_moment_drds_jvp=True,
             return_case_bars=return_case_bars,
             include_second_direction_base_prepared=False,
@@ -11334,21 +11412,34 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                         collisionality_kind=collisionality_kind,
                     )
                 )
-                local_support_pullback = (
-                    self._pullback_interpolated_moment_prepared_support_and_drds_only_native_multi_rhs_compact
-                    if native_compact_ntx_rhs
-                    else (
-                        self._pullback_interpolated_moment_prepared_support_and_drds_only_native_multi_rhs_reuse_moment_drds_jvp
+                if native_compact_residual_ntx_rhs:
+                    local_support_pullback = (
+                        self._pullback_interpolated_moment_prepared_support_and_drds_only_native_multi_rhs_compact_residual_reuse_moment_drds_jvp
                         if reuse_joint_moment_drds_jvp
-                        else (
-                        self._pullback_interpolated_moment_prepared_support_and_drds_only_native_multi_rhs
-                        if native_factorized_ntx_rhs
-                        else self._pullback_interpolated_moment_prepared_support_and_drds_only_multi_rhs
-                        )
+                        else self._pullback_interpolated_moment_prepared_support_and_drds_only_native_multi_rhs_compact_residual
                     )
-                )
+                elif native_compact_ntx_rhs:
+                    local_support_pullback = (
+                        self._pullback_interpolated_moment_prepared_support_and_drds_only_native_multi_rhs_compact
+                    )
+                elif reuse_joint_moment_drds_jvp:
+                    local_support_pullback = (
+                        self._pullback_interpolated_moment_prepared_support_and_drds_only_native_multi_rhs_reuse_moment_drds_jvp
+                    )
+                elif native_factorized_ntx_rhs:
+                    local_support_pullback = (
+                        self._pullback_interpolated_moment_prepared_support_and_drds_only_native_multi_rhs
+                    )
+                else:
+                    local_support_pullback = (
+                        self._pullback_interpolated_moment_prepared_support_and_drds_only_multi_rhs
+                    )
                 local_kwargs = {}
-                if native_factorized_ntx_rhs or native_compact_ntx_rhs:
+                if (
+                    native_factorized_ntx_rhs
+                    or native_compact_ntx_rhs
+                    or native_compact_residual_ntx_rhs
+                ):
                     local_kwargs["return_case_bars"] = True
                 local_result = local_support_pullback(
                     prepared,
@@ -11359,7 +11450,11 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                     field_bars=species_field_bars,
                     **local_kwargs,
                 )
-                if native_factorized_ntx_rhs or native_compact_ntx_rhs:
+                if (
+                    native_factorized_ntx_rhs
+                    or native_compact_ntx_rhs
+                    or native_compact_residual_ntx_rhs
+                ):
                     (
                         prepared_bar,
                         drds_bar,
@@ -11492,6 +11587,19 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         return self.pullback_build_lagged_response_support_payload_batched_interpolated_faces_multi_rhs_shared_primal(
             state, lagged_response_bars, support,
             native_factorized_ntx_rhs=True,
+            reuse_joint_moment_drds_jvp=True,
+        )
+
+    def pullback_build_lagged_response_support_payload_batched_interpolated_faces_native_multi_rhs_compact_residual_reuse_moment_drds_jvp_shared_primal(
+        self, state, lagged_response_bars, support,
+    ):
+        """Opt-in split-residual version of the validated native drds rule."""
+        return self.pullback_build_lagged_response_support_payload_batched_interpolated_faces_multi_rhs_shared_primal(
+            state,
+            lagged_response_bars,
+            support,
+            native_factorized_ntx_rhs=True,
+            native_compact_residual_ntx_rhs=True,
             reuse_joint_moment_drds_jvp=True,
         )
 

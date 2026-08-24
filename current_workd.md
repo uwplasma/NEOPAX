@@ -1325,6 +1325,20 @@ peak memory and first-segment compilation.  The established
 `separate_reuse_local_vjp_primal` selector remains unchanged and is still the
 current total-time baseline.
 
+### Deferred, retained option: static lagged-pattern specialization
+
+Static reuse/rebuild-pattern segment dispatch remains a valid compile-only
+candidate, but it is **not the next experiment**.  The immediate target is to
+retain the one grouped native NTX adjoint that gives the now-exact
+approximately `46s`/`135s` warm execution, while reducing its compiled graph
+and live temporary footprint toward the lower-compile/memory reference mode.
+The reference mode is a graph-shape comparison only: do **not** revert to
+separate NTX state/support adjoints or a separate geometry JVP.  The next
+investigation must instead compact/fuse the grouped adjoint's internal
+post-adjoint contractions and output temporaries, with small in-memory
+lowerings and exact local derivative tests.  Do not implement static pattern
+specialization until that grouped-adjoint graph-boundary comparison is done.
+
 1. **Compact the native temporary contract.** In a new isolated helper, retain
    the same primal/factorization and matrix-RHS adjoint fields, but return one
    final prepared bar rather than five directional prepared trees. Retain the
@@ -1348,3 +1362,216 @@ current total-time baseline.
    reuse/rebuild segment-pattern specialization as a separate subsequent
    compile-only change; it is bounded by `2**segment_length`, not accepted-step
    count.
+
+### Timing attribution correction: native `drds`-JVP reuse (2026-08-24)
+
+The lower warm timings first appeared in the **derivative-corrected**
+`ntx_batched_interpolated_faces_native_multi_rhs_shared_primal` mode, after
+the sequence of native support corrections for retained directional coefficient
+cotangents, the `log(nu*)` base term, and the objective-batched `log(nu*)`
+support-coordinate pullback.  That corrected selector predates both the
+compact-return and `drds`-JVP-reuse variants.
+
+| Selector / result | First-segment compile | 3/4 (one rebuild) | 2/4 and 1/4 (three rebuilds) |
+| --- | ---: | ---: | ---: |
+| Derivative-corrected `...native_multi_rhs_shared_primal` | about `5m00s` | `46s` | `136s` |
+| `...native_multi_rhs_reuse_moment_drds_jvp_shared_primal` | about `4m34s` | `45.950s` | `135.024s`, `134.821s` |
+
+Therefore the later low times are a property of the existing native
+matrix-RHS execution framework, **not evidence that reusing the two local
+`drds` JVPs caused a further warm-execution reduction**.  The reuse variation
+only removes a source-level duplicate directional moment-JVP expression.  In
+the full segment compilation it has not reduced peak RAM (about 55% of 30 GiB)
+or materially reduced first-segment compilation (still about 4--5 minutes).
+It remains isolated and must not be presented as the cause of the native
+warm-segment gain.
+
+#### Derivative gate for the `drds`-JVP-reuse native selector
+
+The completed cache-disabled `...native_multi_rhs_reuse_moment_drds_jvp_shared_primal`
+run was compared row-by-row with the completed **derivative-corrected native
+shared-primal** run (the reference that already had the approximately
+`46s`/`136s` warm timings).  All 128 Jacobian rows have matching labels.  The
+largest relative difference is `7.73e-11`
+(`geometry:boozer_qi_objective / dvmec:ZBS:1:0`); no row exceeds `1e-10`
+relative difference.  Thus this isolated variation preserves the corrected
+native derivative table to floating-point roundoff.  The older native run
+before the later derivative corrections is deliberately not a comparison
+oracle because its VMEC geometry rows differ materially.
+
+#### Mandatory base for subsequent grouped-adjoint work
+
+All subsequent compile-graph and peak-memory work must start from the
+derivative-validated isolated selector
+`ntx_batched_interpolated_faces_native_multi_rhs_reuse_moment_drds_jvp_shared_primal`.
+It retains the one grouped native NTX adjoint, the matrix-RHS execution
+structure, and the validated `45.950s`/`135.024s`/`134.821s` warm segment
+measurements.  Do not redirect this work to `separate_reuse_local_vjp_primal`,
+the compact-native selectors, or a joint/geometry-only selector.  Those modes
+are comparison references only and must remain independent opt-ins.
+
+### Current grouped-adjoint compile/RAM finding (2026-08-24)
+
+The current base selector retains one grouped NTX primal/factorization and
+matrix-RHS implicit-adjoint solve in
+`_lowdot_two_pullback_native_multi_rhs_adjoint_fields`.  That part is the
+source of the validated warm execution and must remain unchanged.
+
+The compile/RAM expansion occurs **after** that grouped solve.  The native
+helper `solve_prepared_coefficient_vector_lowdot_two_pullbacks_prepared_support_only_native_multi_rhs_and_aux`
+still executes:
+
+```text
+jax.vmap(_one_rhs)
+  base:        _prepared_gradient_from_adjoint(...)
+  d/dEr:       _directional_prepared_gradient_from_adjoint(...)
+  d/dlog(nu):  _directional_prepared_gradient_from_adjoint(...)
+```
+
+Each of those prepared-gradient routines contains a generic JAX VJP over the
+complete prepared residual.  Thus the factorized NTX adjoint is grouped, but
+the complete prepared-support transpose is still generated as an
+objective-batched AD graph.  The compact-return selector combines the three
+large prepared trees only **after** they have been constructed, and the
+`drds`-JVP reuse removes only an upstream moment contraction.  Neither can
+shrink this dominant graph.
+
+The next viable modification is therefore a new, isolated **native
+multi-RHS prepared-support transpose** in NTX.  It must accept the existing
+grouped base/directional adjoint fields with a trailing RHS axis and directly
+form only the final exact prepared/support bar (plus the existing small
+case/`drds` bars).  It must replace—not wrap—the `_one_rhs` `vmap` above.
+It must keep one grouped NTX adjoint, avoid an objective loop/host transfer,
+and be first proven against the present helper using small in-memory tests and
+Jaxpr/lowering-size checks.  Only then should NEOPAX select it as a new opt-in
+variant of the validated `drds`-reuse mode.
+
+### Active implementation plan: compact grouped native prepared transpose
+
+**Starting point.** All work starts from the derivative-validated
+`ntx_batched_interpolated_faces_native_multi_rhs_reuse_moment_drds_jvp_shared_primal`
+mode.  That selector and every existing selector remain unchanged until the
+new path passes every gate below.
+
+1. **Contract and oracle.** Define an NTX-private helper whose inputs are the
+   existing grouped base/directional primal and adjoint fields with a trailing
+   objective-RHS axis.  Its output is exactly the current final combined
+   prepared bar, direct `drds` bar, primal response, and compact case bars.
+   Add tiny in-memory tests against the present native helper for one and
+   multiple RHS columns; test both physical directions and all differentiable
+   prepared leaves.
+2. **Replace the expensive finalisation only.** Implement a native RHS-axis
+   prepared-support contraction that replaces the current `jax.vmap(_one_rhs)`
+   over one base and two directional generic prepared-residual AD transposes.
+   It must retain the one grouped primal/factorisation/matrix-RHS adjoint
+   build, use no host/objective loop, and construct only the final combined
+   prepared bar rather than five full objective-batched prepared trees.
+3. **Graph gate before transport wiring.** On a small in-memory fixture,
+   compare the helper's Jaxpr/lowering structure with the current native helper:
+   no objective-vmapped generic prepared VJP, no additional factorisation or
+   NTX solve, and no widened input/output contract.  Exact values must match
+   at floating-point roundoff.
+4. **Isolated NEOPAX selector.** Add a separately named opt-in rebuild mode
+   that calls the new helper but retains the current `drds`-reuse primitive and
+   case-chain handling.  Do not change defaults or the current validated mode.
+5. **Promotion gate.** Run the same remote cache-disabled 16-step benchmark;
+   accept only if derivatives match the 128-row reference and compile/RAM fall
+   without regressing the current roughly `46s`/`135s` warm rebuild timings.
+
+#### Implementation status (2026-08-24)
+
+Step 1 is complete locally.  NTX now has the private
+`_combined_prepared_gradient_from_adjoint_multi_rhs_oracle` and a small
+one-/three-RHS test.  It consumes the already grouped primal and
+matrix-RHS-adjoint fields and verifies the final combined prepared bar against
+the existing compact native contract.  The test passed in WSL without a
+transport rollout, cache/profile output, or file dump.  No benchmark selector
+calls this helper yet, so the validated `drds`-reuse mode and every other mode
+are unchanged.
+
+The source audit also establishes an important constraint for Step 2:
+`jax.vmap(_one_rhs)` is a device-batched transform, not a Python/serial loop.
+Simply replacing it by a scan would increase warm execution.  Likewise, an
+`inline=False` call boundary could reduce the parent Radau module's live graph,
+but it can add device-call/fusion overhead and therefore is not a guaranteed
+warm-time improvement.  The only no-extra-NTX-solve route that can reduce both
+the temporary graph and preserve the grouped computation is an explicit
+RHS-axis transpose for the fixed prepared residual.  Step 2 will derive that
+transpose from the existing residual/operator algebra; it must not merely wrap
+the current generic VJP.
+
+#### Step 2 implementation in progress
+
+The first exact implementation is now in NTX, still unselected:
+
+* `_compact_prepared_residual_inputs` isolates the residual's true dynamic
+  dependence: geometry for the direct coefficient/source terms, `d_theta`,
+  `d_zeta`, and `block_parameters` for dense block construction.
+* `_compact_prepared_gradient_from_adjoint` differentiates the fixed residual
+  only to that tuple; `_compact_prepared_bar_to_prepared` performs the small
+  final chain back to `PreparedMonoenergeticSystem` once.
+* The two low-dot directional terms use the same split residual algebra, then
+  add their compact bars before that final prepared pullback.
+* A new NTX opt-in helper
+  `...native_multi_rhs_compact_residual_and_aux` implements the full
+  matrix-RHS contract. It is not yet exposed in NEOPAX, so it cannot alter the
+  current benchmark path.
+* The compact pytree structure is derived directly from the compact residual
+  input tuple—not by executing a throw-away scalar residual VJP—so this path
+  does not add an unconsumed transpose while tracing the matrix-RHS kernel.
+
+Small one-/three-RHS exact tests compare (a) each split base/directional
+prepared cotangent and (b) the new helper's full compact result—including its
+case components—against the established native compact contract. They pass
+locally. The next task is the in-memory graph gate; only if that shows the
+expected removal of the prepared-construction chain from the dense residual
+transpose will a new NEOPAX opt-in mode be wired.
+
+#### Graph gate and NEOPAX-local wiring result
+
+The small in-memory Jaxpr gate passes: the split helper has fewer traced
+equations than the existing compact native helper while retaining the same
+output arity.  This is the intended structural reduction; it does not add an
+NTX factorization, an adjoint solve, a host transfer, or an objective scan.
+
+The helper is now routed through the NEOPAX **local** interpolated-moment
+adapter, including the validated `reuse_joint_moment_drds_jvp=True` chain. A
+CPU small-model NEOPAX equality test confirms its prepared bar, `drds` bar,
+primal response, and case components match the established native helper.
+It remains deliberately absent from `reverse_rebuild_support_pullback_mode`:
+the next isolated change is the outer reverse selector/factory wiring, after
+which the remote cache-disabled derivative and timing gate can be run.
+
+#### Outer selector wiring complete
+
+The new isolated selector is now:
+
+`ntx_batched_interpolated_faces_native_multi_rhs_compact_residual_reuse_moment_drds_jvp_shared_primal`
+
+It is accepted by the benchmark parser and reverse setup validation, selects a
+dedicated flattened support-pullback factory/hook, forwards through the
+composite transport model, and invokes the split-residual native NTX adapter
+with the existing `drds`-reuse setting. Existing selector names, defaults, and
+their factory paths remain unchanged. Static compilation and the CPU local
+adapter equality gate pass. The next action is the remote cache-disabled
+16-step benchmark, comparing its derivative table and compile/RAM/warm segment
+times to the validated `...native_multi_rhs_reuse_moment_drds_jvp_shared_primal`
+reference.
+
+#### Three-pass audit (2026-08-24)
+
+1. **Mathematics:** the compact residual includes the direct coefficient term,
+   both source terms, every lower/diagonal/upper block contribution, the
+   nullspace-row conditioning, and both low-dot directions.  The final compact
+   input pullback sums direct-geometry and block-parameter paths back to the
+   same prepared leaves as the original all-in-one VJP.
+2. **RHS/temporary contract:** objective columns remain in one device `vmap`.
+   The split path does not introduce a Python loop, `lax.scan`, host transfer,
+   extra factorization, or extra NTX adjoint solve. One-/three-RHS exact gates
+   cover its full compact prepared and case-bar contract.
+3. **Integration:** the NTX re-exports and NEOPAX local adapter compile clean.
+   The isolated outer selector is now present in reverse-mode validation, the
+   dispatch factory, both prepared-Radau context construction paths, and the
+   benchmark parser. Existing selector strings and their branches remain
+   unchanged, so the current derivative-validated selector cannot be
+   contaminated.
