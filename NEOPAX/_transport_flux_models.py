@@ -7052,6 +7052,7 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         field_bars,
         native_factorized_ntx_rhs: bool = False,
         native_compact_ntx_rhs: bool = False,
+        reuse_joint_moment_drds_jvp: bool = False,
         stream_native_compact_energy: bool = False,
         return_case_bars: bool = False,
         include_second_direction_base_prepared: bool = True,
@@ -7155,34 +7156,38 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                     (second_coeff_dot,),
                 )
 
-                def _direct_drds_bars(coefficient_value, moment_bars):
-                    def _one_rhs(moment_bar):
-                        _, pullback = jax.vjp(
-                            lambda drds_local: self._transport_moments_from_single_coefficient_vector(
-                                coefficient_value,
-                                drds_value=drds_local,
-                                energy_index=energy_index,
-                            ),
-                            drds_value,
-                        )
-                        return pullback(moment_bar)[0]
+                if not reuse_joint_moment_drds_jvp:
+                    def _direct_drds_bars(coefficient_value, moment_bars):
+                        def _one_rhs(moment_bar):
+                            _, pullback = jax.vjp(
+                                lambda drds_local: self._transport_moments_from_single_coefficient_vector(
+                                    coefficient_value,
+                                    drds_value=drds_local,
+                                    energy_index=energy_index,
+                                ),
+                                drds_value,
+                            )
+                            return pullback(moment_bar)[0]
 
-                    return jax.vmap(_one_rhs)(moment_bars)
+                        return jax.vmap(_one_rhs)(moment_bars)
 
-                _, first_drds_bars_dot = jax.jvp(
-                    lambda coefficient_value: _direct_drds_bars(
-                        coefficient_value, dtransport_moments_d_er_bars
-                    ),
-                    (coefficients,),
-                    (first_coeff_dot,),
-                )
-                _, second_drds_bars_dot = jax.jvp(
-                    lambda coefficient_value: _direct_drds_bars(
-                        coefficient_value, dtransport_moments_d_log_nu_star_bars
-                    ),
-                    (coefficients,),
-                    (second_coeff_dot,),
-                )
+                    # Kept as the established path.  The opt-in native mode
+                    # below reuses the identical drds tangent returned by the
+                    # joint coefficient/drds moment pullback JVP above.
+                    _, first_drds_bars_dot = jax.jvp(
+                        lambda coefficient_value: _direct_drds_bars(
+                            coefficient_value, dtransport_moments_d_er_bars
+                        ),
+                        (coefficients,),
+                        (first_coeff_dot,),
+                    )
+                    _, second_drds_bars_dot = jax.jvp(
+                        lambda coefficient_value: _direct_drds_bars(
+                            coefficient_value, dtransport_moments_d_log_nu_star_bars
+                        ),
+                        (coefficients,),
+                        (second_coeff_dot,),
+                    )
                 return (
                     base_coefficient_bars,
                     first_coefficient_bars,
@@ -7544,6 +7549,39 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             field_bars=field_bars,
             native_factorized_ntx_rhs=True,
             native_compact_ntx_rhs=True,
+            return_case_bars=return_case_bars,
+            include_second_direction_base_prepared=False,
+        )
+
+    def _pullback_interpolated_moment_prepared_support_and_drds_only_native_multi_rhs_reuse_moment_drds_jvp(
+        self,
+        prepared,
+        *,
+        drds_value,
+        reference_nu_hat,
+        reference_epsi_hat,
+        vth_a,
+        field_bars,
+        return_case_bars: bool = False,
+    ):
+        """Native matrix-RHS adapter without duplicate local ``drds`` JVPs.
+
+        The joint moment pullback already produces the directional ``drds``
+        cotangents needed by the exact low-dot chain.  This isolated variant
+        reuses those values instead of differentiating a second, drds-only
+        VJP.  It preserves the native factorization, objective RHS batch, and
+        complete return contract of the existing native adapter.
+        """
+
+        return self._pullback_interpolated_moment_prepared_support_and_drds_only_multi_rhs(
+            prepared,
+            drds_value=drds_value,
+            reference_nu_hat=reference_nu_hat,
+            reference_epsi_hat=reference_epsi_hat,
+            vth_a=vth_a,
+            field_bars=field_bars,
+            native_factorized_ntx_rhs=True,
+            reuse_joint_moment_drds_jvp=True,
             return_case_bars=return_case_bars,
             include_second_direction_base_prepared=False,
         )

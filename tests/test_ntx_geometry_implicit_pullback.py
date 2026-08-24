@@ -356,8 +356,8 @@ def test_multi_rhs_prepared_support_adapter_matches_scalar_local_pullbacks():
             _assert_float_tree_allclose(native_primal, expected_primal)
 
 
-def test_compact_native_multi_rhs_adapter_matches_full_native_adapter():
-    """Compacting the NTX return payload changes neither local cotangent."""
+def test_compact_and_reused_drds_native_multi_rhs_adapters_match_full_native_adapter():
+    """Opt-in native payload and drds reductions preserve local cotangents."""
 
     model = _small_runtime_model(n_energy=2)
     prepared = ntx.prepare_monoenergetic_system(
@@ -391,10 +391,14 @@ def test_compact_native_multi_rhs_adapter_matches_full_native_adapter():
     compact = model._pullback_interpolated_moment_prepared_support_and_drds_only_native_multi_rhs_compact(
         prepared, **args
     )
-    _assert_float_tree_allclose(compact[0], full[0])
-    _assert_float_tree_allclose(compact[1], full[1])
-    _assert_float_tree_allclose(compact[2], full[2])
-    _assert_float_tree_allclose(compact[3], full[3])
+    reused_drds = model._pullback_interpolated_moment_prepared_support_and_drds_only_native_multi_rhs_reuse_moment_drds_jvp(
+        prepared, **args
+    )
+    for candidate in (compact, reused_drds):
+        _assert_float_tree_allclose(candidate[0], full[0])
+        _assert_float_tree_allclose(candidate[1], full[1])
+        _assert_float_tree_allclose(candidate[2], full[2])
+        _assert_float_tree_allclose(candidate[3], full[3])
 
 
 def test_native_multi_rhs_support_retains_local_drds_case_chain():
