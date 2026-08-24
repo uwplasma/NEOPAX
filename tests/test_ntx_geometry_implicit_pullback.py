@@ -1,6 +1,7 @@
 """Exact local checks for the opt-in geometry-only NTX support pullback."""
 
 from types import SimpleNamespace
+import inspect
 
 import jax
 import jax.numpy as jnp
@@ -228,6 +229,34 @@ def test_native_multi_rhs_compact_residual_factory_finds_vector_field_owner_hook
     assert callable(pullback)
     assert pullback("state", SimpleNamespace(flux_response="flux-bars"), "support") == "compact-residual-result"
     assert calls == [("state", "flux-bars", "support")]
+
+
+def test_native_multi_rhs_compact_residual_physical_wrapper_forwards_its_flag():
+    """The outer physical hook must reach the compact-residual local adapter."""
+
+    calls = []
+
+    class _PhysicalLike:
+        def pullback_build_lagged_response_support_payload_batched_interpolated_faces_multi_rhs_shared_primal(
+            self, state, response_bars, support, **kwargs,
+        ):
+            calls.append((state, response_bars, support, kwargs))
+            return "compact-residual-result"
+
+    method = NTXExactLijRuntimeTransportModel.pullback_build_lagged_response_support_payload_batched_interpolated_faces_multi_rhs_shared_primal
+    assert "native_compact_residual_ntx_rhs" in inspect.signature(method).parameters
+    wrapper = NTXExactLijRuntimeTransportModel.pullback_build_lagged_response_support_payload_batched_interpolated_faces_native_multi_rhs_compact_residual_reuse_moment_drds_jvp_shared_primal
+    assert wrapper(_PhysicalLike(), "state", "response-bars", "support") == "compact-residual-result"
+    assert calls == [(
+        "state",
+        "response-bars",
+        "support",
+        {
+            "native_factorized_ntx_rhs": True,
+            "native_compact_residual_ntx_rhs": True,
+            "reuse_joint_moment_drds_jvp": True,
+        },
+    )]
 
 
 def test_geometry_implicit_local_support_pullback_matches_prepared_support_path():

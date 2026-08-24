@@ -7249,7 +7249,11 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                 )
 
             helper_kwargs = dict(return_primal_outputs=True)
-            if (native_factorized_ntx_rhs or native_compact_ntx_rhs) and return_case_bars:
+            if (
+                native_factorized_ntx_rhs
+                or native_compact_ntx_rhs
+                or native_compact_residual_ntx_rhs
+            ) and return_case_bars:
                 # The native matrix-RHS helper can return the already-formed
                 # case bars.  The normal support-only helper deliberately
                 # omits them, so retain its original contract unchanged.
@@ -7266,7 +7270,11 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                 _bars_and_direct_drds,
                 **helper_kwargs,
             )
-            if (native_factorized_ntx_rhs or native_compact_ntx_rhs) and return_case_bars:
+            if (
+                native_factorized_ntx_rhs
+                or native_compact_ntx_rhs
+                or native_compact_residual_ntx_rhs
+            ) and return_case_bars:
                 primal_outputs, support_result, case_bar_components = helper_result
                 return (*support_result[:-1], support_result[-1], primal_outputs, case_bar_components)
             primal_outputs, support_result = helper_result
@@ -7366,14 +7374,21 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                 (energy_indices, reference_nu_hat, reference_epsi_hat, epsi_hat_tangent),
             )
             compact_energy_streamed = False
-        if native_compact_ntx_rhs and return_case_bars and not compact_energy_streamed:
+        if (
+            native_compact_ntx_rhs or native_compact_residual_ntx_rhs
+        ) and return_case_bars and not compact_energy_streamed:
             (
                 compact_prepared_bars,
                 direct_drds_bars,
                 primal_outputs,
                 native_case_bar_components,
             ) = mapped_outputs
-        elif native_factorized_ntx_rhs and return_case_bars and not native_compact_ntx_rhs:
+        elif (
+            native_factorized_ntx_rhs
+            and return_case_bars
+            and not native_compact_ntx_rhs
+            and not native_compact_residual_ntx_rhs
+        ):
             (
                 base_prepared_bars,
                 first_base_prepared_bars,
@@ -7384,7 +7399,10 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                 primal_outputs,
                 native_case_bar_components,
             ) = mapped_outputs
-        elif not (native_compact_ntx_rhs and return_case_bars):
+        elif not (
+            (native_compact_ntx_rhs or native_compact_residual_ntx_rhs)
+            and return_case_bars
+        ):
             (
                 base_prepared_bars,
                 first_base_prepared_bars,
@@ -7402,7 +7420,8 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         # explicitly excludes it.
         prepared_bar_terms = (
             (compact_prepared_bars,)
-            if native_compact_ntx_rhs and return_case_bars
+            if (native_compact_ntx_rhs or native_compact_residual_ntx_rhs)
+            and return_case_bars
             else
             (
                 base_prepared_bars,
@@ -7473,7 +7492,11 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                 (second_coefficient_dot_scan,),
             )[1],
         )
-        if (native_factorized_ntx_rhs or native_compact_ntx_rhs) and return_case_bars:
+        if (
+            native_factorized_ntx_rhs
+            or native_compact_ntx_rhs
+            or native_compact_residual_ntx_rhs
+        ) and return_case_bars:
             (
                 base_nu_hat_bars,
                 base_epsi_hat_bars,
@@ -11323,6 +11346,7 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
     def pullback_build_lagged_response_support_payload_batched_interpolated_faces_multi_rhs_shared_primal(
         self, state, lagged_response_bars, support, *, native_factorized_ntx_rhs: bool = False,
         native_compact_ntx_rhs: bool = False,
+        native_compact_residual_ntx_rhs: bool = False,
         reuse_joint_moment_drds_jvp: bool = False,
     ):
         """Experimental exact batched support transpose with local NTX sharing.
