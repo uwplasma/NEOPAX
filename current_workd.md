@@ -1575,3 +1575,160 @@ reference.
    benchmark parser. Existing selector strings and their branches remain
    unchanged, so the current derivative-validated selector cannot be
    contaminated.
+
+### Corrected next plan: native batched prepared-support transpose
+
+#### Result of the compact-residual experiment
+
+The isolated selector
+`ntx_batched_interpolated_faces_native_multi_rhs_compact_residual_reuse_moment_drds_jvp_shared_primal`
+now executes through the complete outer forwarding chain.  Its first remote
+segment compiled in approximately `4m44s`, its one-rebuild warm segment was
+`45.331s`, and its observed peak host RAM remained approximately the same as
+the validated native baseline.  Therefore it preserves the useful grouped
+matrix-RHS execution but **does not** meet the compile/RAM objective.  It must
+remain an independent opt-in experiment and must not replace the baseline.
+
+The precise reason is that the helper first forms compact RHS cotangents with
+`jax.vmap(_one_rhs_compact_residual)`, then performs a second
+`jax.vmap(_one_compact_bar_to_prepared)`.  That latter transform applies the
+compact-input-to-full-prepared VJP once per objective column and XLA inlines
+it into the same Radau segment module.  Splitting the residual inputs alone
+does not remove the objective-batched final support-transpose graph.
+
+#### Non-negotiable mathematical contract
+
+Do **not** replace the final support transpose by one scalar/combined
+cotangent: that would return only a weighted sum of objective gradients and
+would be wrong whenever more than one objective is requested.  The desired
+operation is the exact native matrix-RHS transpose
+
+```text
+prepared_support_bars = J_prepared^T @ C
+```
+
+where `C` has one column per requested objective.  The output must retain the
+leading RHS/objective axis, but the implementation must form it directly,
+without a generic prepared VJP or JVP being transformed once per column.
+
+#### Implementation plan
+
+1. **Freeze the reference contract.** Keep
+   `ntx_batched_interpolated_faces_native_multi_rhs_reuse_moment_drds_jvp_shared_primal`
+   as the only baseline.  Add/retain small NTX one- and three-RHS tests that
+   compare the final prepared bars, `drds` bars, primal response, and all ten
+   case components at roundoff.  No existing selector or default changes.
+
+2. **Map the prepared-support dependency exactly.** Starting from the already
+   grouped fields returned by `_lowdot_two_pullback_native_multi_rhs_adjoint_fields`,
+   classify each contribution to `J_prepared^T @ C`: direct coefficient
+   geometry term, source term, lower/diagonal/upper block terms, `d_theta`,
+   `d_zeta`, and `block_parameters`/geometry chain.  Verify the nullspace row
+   and both low-dot directions before writing a new rule.
+
+3. **Implement a private native RHS-axis transpose in NTX.** It must consume
+   the trailing-RHS primal and adjoint fields and use matrix contractions over
+   that axis to construct the final prepared/support bars.  It must replace
+   both compact-residual `vmap`s; it may not call
+   `_prepared_gradient_from_adjoint`,
+   `_directional_prepared_gradient_from_adjoint`, or
+   `_compact_prepared_bar_to_prepared` under an objective `vmap`.  It must add
+   no factorization, primal solve, implicit-adjoint solve, host transfer, or
+   Python objective loop.
+
+4. **Handle the compact-input chain natively.** The hard part is the shared
+   `block_parameters`/geometry mapping.  Supply a dedicated batched transpose
+   for that mapping, again returning one bar per RHS.  Do not materialize an
+   explicit full Jacobian and do not use `scan` as a memory workaround: both
+   would either increase memory or sacrifice the validated warm execution.
+
+5. **Prove graph and value properties locally.** On small in-memory fixtures,
+   compare the new helper against the frozen reference for one and three RHS.
+   Add a structural Jaxpr gate that verifies no objective-batched generic
+   prepared VJP/JVP remains and that no additional factorized NTX solve is
+   introduced.  These are CPU/mock tests only; do not run a transport rollout
+   locally or emit XLA/profile/output files.
+
+6. **Wire a new isolated NEOPAX selector only after the gates pass.** Preserve
+   the existing `drds`-reuse/matrix-RHS route and use a distinct selector
+   name.  Remote acceptance requires: the 128-row derivative table matches
+   the validated reference, compile time and RAM decrease materially, and the
+   approximately `46s`/`135s` warm segment timings do not regress.
+
+An `inline=False` call boundary remains only a separately measurable fallback:
+it can hide graph size from the parent segment but may add call/fusion overhead
+and does not by itself remove the repeated transpose.  Do not implement it as
+the substitute for Step 3.
+
+#### Step 2 progress: direct dense-block RHS transpose
+
+The first production component of the replacement is now implemented privately
+in NTX as `_fixed_residual_block_coefficient_bars_multi_rhs`.  It computes the
+lower/diagonal/upper dense-block coefficient cotangents directly with the RHS
+axis retained as `(mode, rhs, coefficient, spatial)`.  It includes both
+primal fields and the nullspace-row replacement exactly, and makes no
+factorization, solve, generic VJP, JVP, or objective `vmap` call.
+
+A small CPU-only one-/three-RHS test compares that component against an
+independent generic packed-block VJP oracle at roundoff.  It passes.  This is
+only the block-residual portion: source/direct-coefficient geometry terms and
+the block-parameter-to-prepared chain still need their own native
+RHS-preserving transposes before a selectable NEOPAX mode is justified.
+
+### Next step: VMEC-only native geometry transpose
+
+Keep `ntx_batched_interpolated_faces_native_multi_rhs_reuse_moment_drds_jvp_shared_primal`
+as the derivative-validated reference; do not modify it. The new route stays a
+separate opt-in experiment.
+
+The NTX primal, factorization, and grouped matrix-RHS implicit adjoints are
+already shared. The remaining compile/RAM graph is the generic reverse of the
+local map `VMEC Fourier coefficients -> sampled NTX geometry -> transport`.
+It is not a VMEC equilibrium solve or VMEC adjoint.
+
+1. Freeze a small VMEC primitive-bar reference against the generic geometry
+   VJP.
+2. Add native RHS-axis pullbacks for `radial_drift_spatial`, `volume_prime`,
+   and `b2_mean`.
+3. Apply each VMEC Fourier grid-evaluation transpose directly to batched field
+   bars.
+4. Map those bars to selected runtime parameters, retaining the RHS axis.
+5. Run one-/three-RHS VMEC equality gates against the grouped-native reference.
+6. Only then add a distinct selector; accept remotely only if the 128-row
+   derivative table matches, warm timing remains ~46s/~135s, and compile/RAM
+   decrease materially.
+
+Boozer stays on its established generic route initially. No step may add an
+NTX solve/factorization, objective scan, host transfer, or default change.
+
+#### VMEC coefficient rule: base and low-dot contract now gated
+
+The private NTX VMEC rule is now complete through the local coefficient
+boundary.  It directly contracts the fixed residual blocks, source terms,
+and direct transport coefficients to VMEC sampled-field bars, then applies
+the Fourier transposes to the six traceable VMEC coefficient arrays.  The
+low-dot companion accepts the existing primal/directional fields and has no
+NTX solve or factorization of its own.
+
+Two CPU-only one-/three-RHS gates now compare that rule with the established
+generic chain
+
+```text
+VMEC coefficient arrays -> prepare_monoenergetic_system -> compact prepared VJP
+```
+
+for both the base cotangent and its low-dot directional derivative.  Both pass
+at roundoff.  These tests use only small in-memory VMEC fixtures; they do not
+run transport, use a GPU, or emit files.
+
+The next integration boundary is not the NTX solve.  The benchmark uses
+`ntx_exact_surface_backend = "vmec"`, and its payload reverse currently
+reverses the traceable VMEC field-table construction from the local coefficient
+arrays back to the converged VMEC state generically.  A new opt-in route must
+therefore insert the native coefficient bars at that *state-bar* boundary and
+then reuse the existing raw-block VMEC transpose.  It cannot simply replace
+`face_prepared` with a coefficient dictionary: the existing payload contract
+requires a VMEC-state cotangent.  The next implementation task is a batched
+native transpose of the traceable VMEC field-table/interpolation map.  The
+current best selector remains unchanged until that state-bar equality gate
+passes.
