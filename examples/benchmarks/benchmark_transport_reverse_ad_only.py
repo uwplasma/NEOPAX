@@ -5430,6 +5430,7 @@ def main() -> None:
             "ntx_batched_interpolated_faces_reuse_local_vjp_primal",
             "ntx_batched_interpolated_faces_multi_rhs_shared_primal",
             "ntx_batched_interpolated_faces_native_multi_rhs_shared_primal",
+            "ntx_batched_interpolated_faces_native_multi_rhs_compact_shared_primal",
             "ntx_joint_implicit_interpolated_faces",
             "ntx_joint_implicit_interpolated_faces_packed_support_adjoint",
             "ntx_joint_implicit_interpolated_faces_reuse_local_vjp_primal",
@@ -5469,6 +5470,9 @@ def main() -> None:
             "the separate native matrix-RHS experiment: it packs all implicit "
             "adjoint RHS columns before the final support-gradient contraction "
             "without a scalar objective VJP loop. "
+            "'ntx_batched_interpolated_faces_native_multi_rhs_compact_shared_primal' "
+            "uses the same native matrix-RHS algebra but compacts its temporary "
+            "prepared and case-bar payload before NEOPAX reduces over energy. "
             "'ntx_joint_implicit_interpolated_faces' is the exact experimental "
             "mode that obtains rebuild state and NTX-support bars jointly from "
             "the same local NTX implicit adjoint. "

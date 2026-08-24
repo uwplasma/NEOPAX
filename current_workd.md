@@ -1316,3 +1316,33 @@ a persistent per-step tape, or an additional NTX factorization/adjoint solve.
    benchmark only after exactness passes.  Reject the isolated selector unless
    it reproduces the established derivative table and improves total compiled
    and warm reverse timing.  No default changes before that result.
+
+### Current plan: compact native matrix-RHS return path
+
+The corrected native selector now reproduces the established transport
+derivatives, and reduces later rebuild-heavy segment execution, but it raises
+peak memory and first-segment compilation.  The established
+`separate_reuse_local_vjp_primal` selector remains unchanged and is still the
+current total-time baseline.
+
+1. **Compact the native temporary contract.** In a new isolated helper, retain
+   the same primal/factorization and matrix-RHS adjoint fields, but return one
+   final prepared bar rather than five directional prepared trees.  Return only
+   the three required case-chain quantities (final nu bar, final epsi bar, and
+   the first-direction epsi bar for the vth chain), rather than ten components.
+   Implemented as isolated selector
+   `ntx_batched_interpolated_faces_native_multi_rhs_compact_shared_primal`.
+2. **Stream energy accumulation.** Replace the mapped stack of large
+   energy-by-objective prepared bars with a `lax.scan` carry.  The objective
+   axis remains matrix-RHS batched; this only prevents energy intermediates
+   from remaining live until a later reduction. Implemented for the compact
+   selector: only small primal/case arrays retain an energy axis.
+3. **Local gates first.** Use only small in-memory CPU mock equivalence tests
+   and lowering-size checks.  Require identical bars and no additional NTX
+   factorization, no host transfer, no persistent timestep tape, and no
+   objective serial loop.
+4. **Compile structure second.** If the compact graph is smaller, test an
+   isolated native call boundary in the mock lowering.  Treat static
+   reuse/rebuild segment-pattern specialization as a separate subsequent
+   compile-only change; it is bounded by `2**segment_length`, not accepted-step
+   count.

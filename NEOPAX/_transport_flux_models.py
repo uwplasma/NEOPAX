@@ -1207,6 +1207,32 @@ class CombinedTransportFluxModel(TransportFluxModelBase):
         )
         return pullback_fn(state, response_bars, support)
 
+    def pullback_build_lagged_response_support_payload_batched_interpolated_faces_native_multi_rhs_compact_shared_primal(
+        self,
+        state,
+        lagged_response_bars,
+        support,
+        **kwargs,
+    ):
+        """Forward the compact native matrix-RHS NTX support transpose."""
+
+        del kwargs
+        pullback_fn = getattr(
+            self.neoclassical_model,
+            "pullback_build_lagged_response_support_payload_batched_interpolated_faces_"
+            "native_multi_rhs_compact_shared_primal",
+            None,
+        )
+        if not callable(pullback_fn):
+            raise NotImplementedError(
+                "The active neoclassical model does not expose the compact native "
+                "matrix-RHS interpolated-face support pullback."
+            )
+        response_bars = (
+            None if lagged_response_bars is None else lagged_response_bars.neoclassical_response
+        )
+        return pullback_fn(state, response_bars, support)
+
     def pullback_build_lagged_response_state_and_support_payload_batched_interpolated_faces(
         self,
         state,
@@ -7025,6 +7051,7 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         vth_a,
         field_bars,
         native_factorized_ntx_rhs: bool = False,
+        native_compact_ntx_rhs: bool = False,
         return_case_bars: bool = False,
         include_second_direction_base_prepared: bool = True,
     ):
@@ -7044,10 +7071,15 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         ntx = _import_ntx()
         helper_name = (
             "solve_prepared_coefficient_vector_lowdot_two_pullbacks_"
-            "prepared_support_only_native_multi_rhs_and_aux"
-            if native_factorized_ntx_rhs
-            else "solve_prepared_coefficient_vector_lowdot_two_pullbacks_"
-            "prepared_support_only_multi_rhs_and_aux"
+            "prepared_support_only_native_multi_rhs_compact_and_aux"
+            if native_compact_ntx_rhs
+            else (
+                "solve_prepared_coefficient_vector_lowdot_two_pullbacks_"
+                "prepared_support_only_native_multi_rhs_and_aux"
+                if native_factorized_ntx_rhs
+                else "solve_prepared_coefficient_vector_lowdot_two_pullbacks_"
+                "prepared_support_only_multi_rhs_and_aux"
+            )
         )
         multi_rhs_helper = getattr(
             ntx,
@@ -7168,7 +7200,7 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                 )
 
             helper_kwargs = dict(return_primal_outputs=True)
-            if native_factorized_ntx_rhs and return_case_bars:
+            if (native_factorized_ntx_rhs or native_compact_ntx_rhs) and return_case_bars:
                 # The native matrix-RHS helper can return the already-formed
                 # case bars.  The normal support-only helper deliberately
                 # omits them, so retain its original contract unchanged.
@@ -7185,17 +7217,110 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                 _bars_and_direct_drds,
                 **helper_kwargs,
             )
-            if native_factorized_ntx_rhs and return_case_bars:
+            if (native_factorized_ntx_rhs or native_compact_ntx_rhs) and return_case_bars:
                 primal_outputs, support_result, case_bar_components = helper_result
                 return (*support_result[:-1], support_result[-1], primal_outputs, case_bar_components)
             primal_outputs, support_result = helper_result
             return (*support_result[:-1], support_result[-1], primal_outputs)
 
-        mapped_outputs = jax.lax.map(
-            _one_energy,
-            (energy_indices, reference_nu_hat, reference_epsi_hat, epsi_hat_tangent),
-        )
-        if native_factorized_ntx_rhs and return_case_bars:
+        if native_compact_ntx_rhs and return_case_bars:
+            # The full native helper returns five objective-batched prepared
+            # trees per energy.  The compact helper has already reduced that
+            # to one, so accumulate it while scanning energy rather than
+            # materialising an energy-by-objective prepared payload and
+            # reducing it afterwards.  RHS remain matrix columns throughout.
+            first_output = _one_energy(
+                (
+                    energy_indices[0],
+                    reference_nu_hat[0],
+                    reference_epsi_hat[0],
+                    epsi_hat_tangent[0],
+                )
+            )
+            (
+                first_prepared_bars,
+                first_direct_drds_bars,
+                first_primal_outputs,
+                first_case_bar_components,
+            ) = first_output
+
+            def _sanitize_rhs_prepared_leaf(primal_leaf, bar_leaf):
+                primal_arr = jnp.asarray(primal_leaf)
+                bar_arr = jnp.asarray(bar_leaf)
+                dtype = (
+                    primal_arr.dtype
+                    if jnp.issubdtype(primal_arr.dtype, jnp.inexact)
+                    else jnp.float64
+                )
+                if bar_arr.dtype == jax.dtypes.float0:
+                    return jnp.zeros(bar_arr.shape, dtype=dtype)
+                if jnp.issubdtype(primal_arr.dtype, jnp.inexact):
+                    return jnp.asarray(bar_leaf, dtype=primal_arr.dtype)
+                # Preserve the RHS axis for static prepared leaves.  The
+                # scalar sanitizer intentionally removes it, which is wrong
+                # for this matrix-RHS accumulator.
+                return jnp.zeros(bar_arr.shape, dtype=dtype)
+
+            first_prepared_bars = jax.tree_util.tree_map(
+                _sanitize_rhs_prepared_leaf, prepared, first_prepared_bars
+            )
+
+            def _accumulate_energy(carry, args):
+                prepared_accum, drds_accum = carry
+                prepared_value, drds_value, primal_value, case_value = _one_energy(args)
+                prepared_value = jax.tree_util.tree_map(
+                    _sanitize_rhs_prepared_leaf, prepared, prepared_value
+                )
+                return (
+                    jax.tree_util.tree_map(
+                        lambda total, value: total + value,
+                        prepared_accum,
+                        prepared_value,
+                    ),
+                    tuple(
+                        total + value
+                        for total, value in zip(drds_accum, drds_value, strict=True)
+                    ),
+                ), (primal_value, case_value)
+
+            (
+                compact_prepared_bars,
+                direct_drds_bars,
+            ), (tail_primal_outputs, tail_case_bar_components) = jax.lax.scan(
+                _accumulate_energy,
+                (first_prepared_bars, first_direct_drds_bars),
+                (
+                    energy_indices[1:],
+                    reference_nu_hat[1:],
+                    reference_epsi_hat[1:],
+                    epsi_hat_tangent[1:],
+                ),
+            )
+            primal_outputs = jax.tree_util.tree_map(
+                lambda first, tail: jnp.concatenate((first[None, ...], tail), axis=0),
+                first_primal_outputs,
+                tail_primal_outputs,
+            )
+            native_case_bar_components = jax.tree_util.tree_map(
+                lambda first, tail: jnp.concatenate((first[None, ...], tail), axis=0),
+                first_case_bar_components,
+                tail_case_bar_components,
+            )
+            compact_energy_streamed = True
+        else:
+            mapped_outputs = jax.lax.map(
+                _one_energy,
+                (energy_indices, reference_nu_hat, reference_epsi_hat, epsi_hat_tangent),
+            )
+            compact_energy_streamed = False
+        if native_compact_ntx_rhs and return_case_bars and not compact_energy_streamed:
+            (
+                compact_prepared_bars,
+                direct_drds_bars,
+                primal_outputs,
+                native_case_bar_components,
+            ) = mapped_outputs
+        elif native_factorized_ntx_rhs and return_case_bars and not native_compact_ntx_rhs:
             (
                 base_prepared_bars,
                 first_base_prepared_bars,
@@ -7206,7 +7331,7 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                 primal_outputs,
                 native_case_bar_components,
             ) = mapped_outputs
-        else:
+        elif not (native_compact_ntx_rhs and return_case_bars):
             (
                 base_prepared_bars,
                 first_base_prepared_bars,
@@ -7223,6 +7348,9 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         # for existing private callers, while the native exactness adapter
         # explicitly excludes it.
         prepared_bar_terms = (
+            (compact_prepared_bars,)
+            if native_compact_ntx_rhs and return_case_bars
+            else
             (
                 base_prepared_bars,
                 first_prepared_bars,
@@ -7236,13 +7364,16 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                 second_prepared_bars,
             )
         )
-        prepared_bars = jax.tree_util.tree_map(
-            lambda values: jnp.sum(values, axis=0),
-            _sum_float_delta_bar_trees(
-                prepared,
-                *prepared_bar_terms,
-            ),
-        )
+        if native_compact_ntx_rhs and return_case_bars and compact_energy_streamed:
+            prepared_bars = compact_prepared_bars
+        else:
+            prepared_bars = jax.tree_util.tree_map(
+                lambda values: jnp.sum(values, axis=0),
+                _sum_float_delta_bar_trees(
+                    prepared,
+                    *prepared_bar_terms,
+                ),
+            )
         (
             base_drds_bars,
             _first_base_drds_bars,
@@ -7253,19 +7384,18 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         # As for the prepared bar above, the second base term belongs only to
         # the nu_hat case cotangent of the log-nu direction. ``drds`` is not
         # that direction, so the native exact adapter excludes it.
-        direct_drds_bars = jnp.sum(
-            (
-                base_drds_bars + first_drds_bars + second_drds_bars
-                if not include_second_direction_base_prepared
-                else (
-                    base_drds_bars
-                    + first_drds_bars
-                    + second_base_drds_bars
-                    + second_drds_bars
-                )
-            ),
-            axis=0,
+        direct_drds_bars = (
+            base_drds_bars + first_drds_bars + second_drds_bars
+            if not include_second_direction_base_prepared
+            else (
+                base_drds_bars
+                + first_drds_bars
+                + second_base_drds_bars
+                + second_drds_bars
+            )
         )
+        if not (native_compact_ntx_rhs and return_case_bars and compact_energy_streamed):
+            direct_drds_bars = jnp.sum(direct_drds_bars, axis=0)
         coefficient_scan, first_coefficient_dot_scan, second_coefficient_dot_scan = primal_outputs
         primal_response = (
             self._log_nu_star_from_nu_hat(reference_nu_hat),
@@ -7290,6 +7420,38 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                 (second_coefficient_dot_scan,),
             )[1],
         )
+        if native_compact_ntx_rhs and return_case_bars:
+            (
+                nu_hat_case_bars,
+                epsi_hat_case_bars,
+                first_base_epsi_hat_bars,
+            ) = native_case_bar_components
+            log_nu_weights = jnp.asarray(
+                self.energy_grid.xWeights, dtype=reference_nu_hat.dtype
+            )
+            log_nu_weights = log_nu_weights / jnp.maximum(
+                jnp.sum(log_nu_weights), 1.0e-30
+            )
+            safe_nu_hat = jnp.maximum(reference_nu_hat, 1.0e-30)
+            active_nu_hat = jnp.asarray(
+                reference_nu_hat >= 1.0e-30, dtype=reference_nu_hat.dtype
+            )
+            log_nu_star_nu_hat_bars = (
+                active_nu_hat * log_nu_weights / safe_nu_hat
+            )[:, None] * _reference_log_nu_star_bars[None, :]
+            nu_hat_bars = jnp.swapaxes(
+                log_nu_star_nu_hat_bars + nu_hat_case_bars, 0, 1
+            )
+            epsi_hat_bars = jnp.swapaxes(epsi_hat_case_bars, 0, 1)
+            vth_a_bars = jnp.sum(
+                first_base_epsi_hat_bars * (-epsi_hat_tangent[:, None] / vth_a),
+                axis=0,
+            )
+            return prepared_bars, direct_drds_bars, primal_response, (
+                nu_hat_bars,
+                epsi_hat_bars,
+                vth_a_bars,
+            )
         if native_factorized_ntx_rhs and return_case_bars:
             (
                 base_nu_hat_bars,
@@ -7381,6 +7543,32 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             vth_a=vth_a,
             field_bars=field_bars,
             native_factorized_ntx_rhs=True,
+            return_case_bars=return_case_bars,
+            include_second_direction_base_prepared=False,
+        )
+
+    def _pullback_interpolated_moment_prepared_support_and_drds_only_native_multi_rhs_compact(
+        self,
+        prepared,
+        *,
+        drds_value,
+        reference_nu_hat,
+        reference_epsi_hat,
+        vth_a,
+        field_bars,
+        return_case_bars: bool = False,
+    ):
+        """Compact-return counterpart of the native matrix-RHS adapter."""
+
+        return self._pullback_interpolated_moment_prepared_support_and_drds_only_multi_rhs(
+            prepared,
+            drds_value=drds_value,
+            reference_nu_hat=reference_nu_hat,
+            reference_epsi_hat=reference_epsi_hat,
+            vth_a=vth_a,
+            field_bars=field_bars,
+            native_factorized_ntx_rhs=True,
+            native_compact_ntx_rhs=True,
             return_case_bars=return_case_bars,
             include_second_direction_base_prepared=False,
         )
@@ -11027,6 +11215,7 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
 
     def pullback_build_lagged_response_support_payload_batched_interpolated_faces_multi_rhs_shared_primal(
         self, state, lagged_response_bars, support, *, native_factorized_ntx_rhs: bool = False,
+        native_compact_ntx_rhs: bool = False,
     ):
         """Experimental exact batched support transpose with local NTX sharing.
 
@@ -11116,12 +11305,16 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                     )
                 )
                 local_support_pullback = (
-                    self._pullback_interpolated_moment_prepared_support_and_drds_only_native_multi_rhs
-                    if native_factorized_ntx_rhs
-                    else self._pullback_interpolated_moment_prepared_support_and_drds_only_multi_rhs
+                    self._pullback_interpolated_moment_prepared_support_and_drds_only_native_multi_rhs_compact
+                    if native_compact_ntx_rhs
+                    else (
+                        self._pullback_interpolated_moment_prepared_support_and_drds_only_native_multi_rhs
+                        if native_factorized_ntx_rhs
+                        else self._pullback_interpolated_moment_prepared_support_and_drds_only_multi_rhs
+                    )
                 )
                 local_kwargs = {}
-                if native_factorized_ntx_rhs:
+                if native_factorized_ntx_rhs or native_compact_ntx_rhs:
                     local_kwargs["return_case_bars"] = True
                 local_result = local_support_pullback(
                     prepared,
@@ -11132,7 +11325,7 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                     field_bars=species_field_bars,
                     **local_kwargs,
                 )
-                if native_factorized_ntx_rhs:
+                if native_factorized_ntx_rhs or native_compact_ntx_rhs:
                     (
                         prepared_bar,
                         drds_bar,
@@ -11238,6 +11431,24 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             lagged_response_bars,
             support,
             native_factorized_ntx_rhs=True,
+        )
+
+    def pullback_build_lagged_response_support_payload_batched_interpolated_faces_native_multi_rhs_compact_shared_primal(
+        self, state, lagged_response_bars, support,
+    ):
+        """Opt-in compact-return native matrix-RHS support transpose.
+
+        The NTX factorisation and objective RHS batch are identical to the
+        existing native selector.  Only its transient return payload is
+        compacted before NEOPAX reduces over energy.
+        """
+
+        return self.pullback_build_lagged_response_support_payload_batched_interpolated_faces_multi_rhs_shared_primal(
+            state,
+            lagged_response_bars,
+            support,
+            native_factorized_ntx_rhs=True,
+            native_compact_ntx_rhs=True,
         )
 
     def pullback_build_lagged_response_state_and_support_payload_batched_interpolated_faces(

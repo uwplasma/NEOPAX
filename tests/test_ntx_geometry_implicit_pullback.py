@@ -356,6 +356,45 @@ def test_multi_rhs_prepared_support_adapter_matches_scalar_local_pullbacks():
             _assert_float_tree_allclose(native_primal, expected_primal)
 
 
+def test_compact_native_multi_rhs_adapter_matches_full_native_adapter():
+    """Compacting the NTX return payload changes neither local cotangent."""
+
+    model = _small_runtime_model(n_energy=2)
+    prepared = ntx.prepare_monoenergetic_system(
+        ntx.example_surface(), ntx.GridSpec(5, 5, 4)
+    )
+    field_bars = (
+        jnp.asarray([0.13, -0.31, 0.21]),
+        jnp.asarray([[0.3, -0.2, 0.1, 0.4, -0.1, 0.2],
+                     [-0.1, 0.2, 0.3, -0.4, 0.5, -0.2],
+                     [0.2, -0.4, 0.5, -0.3, 0.1, 0.3]]),
+        jnp.asarray([[-0.3, 0.1, 0.2, -0.2, 0.3, -0.1],
+                     [0.4, -0.3, 0.2, 0.1, -0.5, 0.3],
+                     [-0.5, 0.2, -0.1, 0.3, 0.4, -0.2]]),
+        jnp.asarray([[0.2, 0.4, -0.3, 0.1, 0.2, -0.4],
+                     [-0.2, 0.3, 0.4, -0.1, 0.2, 0.5],
+                     [0.1, -0.3, 0.2, 0.5, -0.4, 0.3]]),
+    )
+    args = dict(
+        drds_value=jnp.asarray(1.2),
+        reference_nu_hat=jnp.asarray([1.0e-2, 1.8e-2]),
+        reference_epsi_hat=jnp.asarray([1.0e-3, 2.0e-3]),
+        vth_a=jnp.asarray([1.1, 1.2]),
+        field_bars=field_bars,
+        return_case_bars=True,
+    )
+    full = model._pullback_interpolated_moment_prepared_support_and_drds_only_native_multi_rhs(
+        prepared, **args
+    )
+    compact = model._pullback_interpolated_moment_prepared_support_and_drds_only_native_multi_rhs_compact(
+        prepared, **args
+    )
+    _assert_float_tree_allclose(compact[0], full[0])
+    _assert_float_tree_allclose(compact[1], full[1])
+    _assert_float_tree_allclose(compact[2], full[2])
+    _assert_float_tree_allclose(compact[3], full[3])
+
+
 def test_native_multi_rhs_support_retains_local_drds_case_chain():
     """The native support rule must include ``drds -> epsi_hat`` exactly.
 

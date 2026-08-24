@@ -1518,9 +1518,15 @@ def _flat_rhs_build_support_pullback_batched_interpolated_faces_factory(
     reuse_local_vjp_primal: bool = False,
     multi_rhs_shared_primal: bool = False,
     native_multi_rhs_shared_primal: bool = False,
+    native_multi_rhs_compact_shared_primal: bool = False,
 ):
     owner = getattr(vector_field, "__self__", None)
-    if native_multi_rhs_shared_primal:
+    if native_multi_rhs_compact_shared_primal:
+        pullback_name = (
+            "pullback_build_lagged_response_support_payload_batched_interpolated_faces_"
+            "native_multi_rhs_compact_shared_primal"
+        )
+    elif native_multi_rhs_shared_primal:
         pullback_name = (
             "pullback_build_lagged_response_support_payload_batched_interpolated_faces_"
             "native_multi_rhs_shared_primal"
@@ -3769,6 +3775,7 @@ class _RadauAcceptedStepPhysicsContext:
     flat_rhs_build_support_pullback_batched_interpolated_faces_reuse_local_vjp_primal: Callable[[Any, Any, Any], Any] | None = None
     flat_rhs_build_support_pullback_batched_interpolated_faces_multi_rhs_shared_primal: Callable[[Any, Any, Any], Any] | None = None
     flat_rhs_build_support_pullback_batched_interpolated_faces_native_multi_rhs_shared_primal: Callable[[Any, Any, Any], Any] | None = None
+    flat_rhs_build_support_pullback_batched_interpolated_faces_native_multi_rhs_compact_shared_primal: Callable[[Any, Any, Any], Any] | None = None
     flat_rhs_build_state_and_support_pullback_batched_interpolated_faces: Callable[[Any, Any, Any], Any] | None = None
     flat_rhs_build_state_and_support_pullback_batched_interpolated_faces_reuse_local_vjp_primal: Callable[[Any, Any, Any], Any] | None = None
     flat_rhs_build_state_and_support_pullback_batched_interpolated_faces_reuse_local_vjp_primal_compact_prepared_carry: Callable[[Any, Any, Any], Any] | None = None
@@ -6026,8 +6033,15 @@ def _execute_radau_accepted_step_next_reduced_cotangent_batched_bwd_with_support
                 "ntx_batched_interpolated_faces_reuse_local_vjp_primal",
                 "ntx_batched_interpolated_faces_multi_rhs_shared_primal",
                 "ntx_batched_interpolated_faces_native_multi_rhs_shared_primal",
+                "ntx_batched_interpolated_faces_native_multi_rhs_compact_shared_primal",
             }:
                 if rebuild_support_pullback_mode == (
+                    "ntx_batched_interpolated_faces_native_multi_rhs_compact_shared_primal"
+                ):
+                    batched_pullback = (
+                        physics_context.flat_rhs_build_support_pullback_batched_interpolated_faces_native_multi_rhs_compact_shared_primal
+                    )
+                elif rebuild_support_pullback_mode == (
                     "ntx_batched_interpolated_faces_native_multi_rhs_shared_primal"
                 ):
                     batched_pullback = (
@@ -17432,6 +17446,12 @@ def _build_prepared_radau_accepted_rollout(
             project_flat=project_flat, native_multi_rhs_shared_primal=True,
         )
     )
+    flat_rhs_build_support_pullback_batched_interpolated_faces_native_multi_rhs_compact_shared_primal = (
+        _flat_rhs_build_support_pullback_batched_interpolated_faces_factory(
+            unravel=unpack_flat, vector_field=vector_field, args=args, kwargs=kwargs,
+            project_flat=project_flat, native_multi_rhs_compact_shared_primal=True,
+        )
+    )
     flat_rhs_build_state_and_support_pullback_batched_interpolated_faces = (
         _flat_rhs_build_state_and_support_pullback_batched_interpolated_faces_factory(
             unravel=unpack_flat,
@@ -17791,6 +17811,9 @@ def _build_prepared_radau_accepted_rollout(
         flat_rhs_build_support_pullback_batched_interpolated_faces_native_multi_rhs_shared_primal=(
             flat_rhs_build_support_pullback_batched_interpolated_faces_native_multi_rhs_shared_primal
         ),
+        flat_rhs_build_support_pullback_batched_interpolated_faces_native_multi_rhs_compact_shared_primal=(
+            flat_rhs_build_support_pullback_batched_interpolated_faces_native_multi_rhs_compact_shared_primal
+        ),
         flat_rhs_build_state_and_support_pullback_batched_interpolated_faces=(
             flat_rhs_build_state_and_support_pullback_batched_interpolated_faces
         ),
@@ -18018,6 +18041,12 @@ class RADAUSolver(_RadauSolverConfig):
             _flat_rhs_build_support_pullback_batched_interpolated_faces_factory(
                 unravel=unpack_flat, vector_field=vector_field, args=args, kwargs=kwargs,
                 project_flat=project_flat, native_multi_rhs_shared_primal=True,
+            )
+        )
+        flat_rhs_build_support_pullback_batched_interpolated_faces_native_multi_rhs_compact_shared_primal = (
+            _flat_rhs_build_support_pullback_batched_interpolated_faces_factory(
+                unravel=unpack_flat, vector_field=vector_field, args=args, kwargs=kwargs,
+                project_flat=project_flat, native_multi_rhs_compact_shared_primal=True,
             )
         )
         flat_rhs_build_state_and_support_pullback_batched_interpolated_faces = (
@@ -18372,6 +18401,9 @@ class RADAUSolver(_RadauSolverConfig):
             ),
             flat_rhs_build_support_pullback_batched_interpolated_faces_native_multi_rhs_shared_primal=(
                 flat_rhs_build_support_pullback_batched_interpolated_faces_native_multi_rhs_shared_primal
+            ),
+            flat_rhs_build_support_pullback_batched_interpolated_faces_native_multi_rhs_compact_shared_primal=(
+                flat_rhs_build_support_pullback_batched_interpolated_faces_native_multi_rhs_compact_shared_primal
             ),
             flat_rhs_build_state_and_support_pullback_batched_interpolated_faces=(
                 flat_rhs_build_state_and_support_pullback_batched_interpolated_faces

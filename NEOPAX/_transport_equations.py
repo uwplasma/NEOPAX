@@ -2072,6 +2072,59 @@ class ComposedEquationSystem:
             **self._shared_flux_call_kwargs(kwargs),
         )
 
+    def pullback_build_lagged_response_support_payload_batched_interpolated_faces_native_multi_rhs_compact_shared_primal(
+        self, state, lagged_response_bars, support, **kwargs,
+    ):
+        """Geometry wrapper for the compact native matrix-RHS NTX rule."""
+
+        support, geometry = self._split_realtime_geometry_payload(support)
+        if geometry is not None:
+            ntx_support_bar = (
+                self.pullback_build_lagged_response_support_payload_batched_interpolated_faces_native_multi_rhs_compact_shared_primal(
+                    state, lagged_response_bars, support, **kwargs,
+                )
+            )
+            working_state, _eidx = self._prepare_working_state(state)
+            flux_response_bars = (
+                None if lagged_response_bars is None else lagged_response_bars.flux_response
+            )
+            geometry_bar = jax.tree_util.tree_map(
+                lambda leaf: jnp.broadcast_to(
+                    jnp.zeros_like(jnp.asarray(leaf)),
+                    (0,) + jnp.asarray(leaf).shape,
+                ),
+                geometry,
+            ) if flux_response_bars is None else jax.vmap(
+                lambda flux_response_bar: self._direct_geometry_build_lagged_response_bar(
+                    self.shared_flux_model, geometry, working_state, flux_response_bar,
+                )
+            )(flux_response_bars)
+            return {"ntx_support": ntx_support_bar, "geometry": geometry_bar}
+
+        working_state, _eidx = self._prepare_working_state(state)
+        flux_response_bars = (
+            None if lagged_response_bars is None else lagged_response_bars.flux_response
+        )
+        if self.shared_flux_model is None or flux_response_bars is None:
+            raise NotImplementedError(
+                "compact native matrix-RHS interpolated-face support pullback requires an active "
+                "shared flux response."
+            )
+        pullback_fn = getattr(
+            self.shared_flux_model,
+            "pullback_build_lagged_response_support_payload_batched_interpolated_faces_"
+            "native_multi_rhs_compact_shared_primal",
+            None,
+        )
+        if not callable(pullback_fn):
+            raise NotImplementedError(
+                "The active shared flux model does not expose the compact native matrix-RHS "
+                "interpolated-face support pullback."
+            )
+        return pullback_fn(
+            working_state, flux_response_bars, support, **self._shared_flux_call_kwargs(kwargs),
+        )
+
     def pullback_build_lagged_response_state_and_support_payload_batched_interpolated_faces(
         self,
         state,
