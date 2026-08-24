@@ -150,6 +150,30 @@ def test_native_multi_rhs_equation_system_forwarding_hook_is_exposed_to_radau():
     assert calls == [("state", "flux-bars", "support")]
 
 
+def test_native_multi_rhs_reused_drds_equation_system_forwarding_hook_is_exposed_to_radau():
+    """The Radau vector-field owner reaches the dedicated reuse hook."""
+
+    calls = []
+
+    class _SharedFlux:
+        def pullback_build_lagged_response_support_payload_batched_interpolated_faces_native_multi_rhs_reuse_moment_drds_jvp_shared_primal(
+            self, state, response_bars, support,
+        ):
+            calls.append((state, response_bars, support))
+            return "reused-drds-result"
+
+    equations = object.__new__(ComposedEquationSystem)
+    object.__setattr__(equations, "shared_flux_model", _SharedFlux())
+    object.__setattr__(equations, "_split_realtime_geometry_payload", lambda support: (support, None))
+    object.__setattr__(equations, "_prepare_working_state", lambda state: (state, None))
+    object.__setattr__(equations, "_shared_flux_call_kwargs", lambda kwargs: {})
+    response = SimpleNamespace(flux_response="flux-bars")
+    assert equations.pullback_build_lagged_response_support_payload_batched_interpolated_faces_native_multi_rhs_reuse_moment_drds_jvp_shared_primal(
+        "state", response, "support", ignored_outer_keyword=True,
+    ) == "reused-drds-result"
+    assert calls == [("state", "flux-bars", "support")]
+
+
 def test_geometry_implicit_local_support_pullback_matches_prepared_support_path():
     """The new representation changes no active support or response value."""
 
