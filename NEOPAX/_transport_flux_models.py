@@ -7444,7 +7444,7 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             )
             epsi_hat_bars = jnp.swapaxes(epsi_hat_case_bars, 0, 1)
             vth_a_bars = jnp.sum(
-                first_base_epsi_hat_bars * (-epsi_hat_tangent[:, None] / vth_a),
+                first_base_epsi_hat_bars * (-epsi_hat_tangent[:, None] / vth_a[:, None]),
                 axis=0,
             )
             return prepared_bars, direct_drds_bars, primal_response, (
@@ -7507,7 +7507,7 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                 1,
             )
             vth_a_bars = jnp.sum(
-                first_base_epsi_hat_bars * (-epsi_hat_tangent[:, None] / vth_a),
+                first_base_epsi_hat_bars * (-epsi_hat_tangent[:, None] / vth_a[:, None]),
                 axis=0,
             )
             return prepared_bars, direct_drds_bars, primal_response, (
