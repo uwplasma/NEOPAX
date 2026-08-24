@@ -7479,8 +7479,10 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                 0,
                 1,
             )
+            vth_a_energy = jnp.broadcast_to(vth_a, reference_epsi_hat.shape)
             vth_a_bars = jnp.sum(
-                first_base_epsi_hat_bars * (-epsi_hat_tangent[:, None] / vth_a[:, None]),
+                first_base_epsi_hat_bars
+                * (-epsi_hat_tangent[:, None] / vth_a_energy[:, None]),
                 axis=0,
             )
             return prepared_bars, direct_drds_bars, primal_response, (

@@ -379,7 +379,9 @@ def test_compact_native_multi_rhs_adapter_matches_full_native_adapter():
         drds_value=jnp.asarray(1.2),
         reference_nu_hat=jnp.asarray([1.0e-2, 1.8e-2]),
         reference_epsi_hat=jnp.asarray([1.0e-3, 2.0e-3]),
-        vth_a=jnp.asarray([1.1, 1.2]),
+        # Production supplies one species thermal speed; the local energy
+        # scan must broadcast this scalar before attaching the RHS axis.
+        vth_a=jnp.asarray(1.1),
         field_bars=field_bars,
         return_case_bars=True,
     )
