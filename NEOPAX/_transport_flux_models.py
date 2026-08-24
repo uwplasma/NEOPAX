@@ -1207,6 +1207,22 @@ class CombinedTransportFluxModel(TransportFluxModelBase):
         )
         return pullback_fn(state, response_bars, support)
 
+    def pullback_build_lagged_response_support_payload_batched_interpolated_faces_native_multi_rhs_reuse_moment_drds_jvp_shared_primal(
+        self, state, lagged_response_bars, support, **kwargs,
+    ):
+        """Forward the isolated native matrix-RHS drds-JVP reuse rule."""
+        del kwargs
+        pullback_fn = getattr(
+            self.neoclassical_model,
+            "pullback_build_lagged_response_support_payload_batched_interpolated_faces_"
+            "native_multi_rhs_reuse_moment_drds_jvp_shared_primal",
+            None,
+        )
+        if not callable(pullback_fn):
+            raise NotImplementedError("The active neoclassical model does not expose the native drds-JVP reuse support pullback.")
+        response_bars = None if lagged_response_bars is None else lagged_response_bars.neoclassical_response
+        return pullback_fn(state, response_bars, support)
+
     def pullback_build_lagged_response_support_payload_batched_interpolated_faces_native_multi_rhs_compact_shared_primal(
         self,
         state,
@@ -11229,6 +11245,7 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
     def pullback_build_lagged_response_support_payload_batched_interpolated_faces_multi_rhs_shared_primal(
         self, state, lagged_response_bars, support, *, native_factorized_ntx_rhs: bool = False,
         native_compact_ntx_rhs: bool = False,
+        reuse_joint_moment_drds_jvp: bool = False,
     ):
         """Experimental exact batched support transpose with local NTX sharing.
 
@@ -11321,9 +11338,13 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                     self._pullback_interpolated_moment_prepared_support_and_drds_only_native_multi_rhs_compact
                     if native_compact_ntx_rhs
                     else (
+                        self._pullback_interpolated_moment_prepared_support_and_drds_only_native_multi_rhs_reuse_moment_drds_jvp
+                        if reuse_joint_moment_drds_jvp
+                        else (
                         self._pullback_interpolated_moment_prepared_support_and_drds_only_native_multi_rhs
                         if native_factorized_ntx_rhs
                         else self._pullback_interpolated_moment_prepared_support_and_drds_only_multi_rhs
+                        )
                     )
                 )
                 local_kwargs = {}
@@ -11462,6 +11483,16 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             support,
             native_factorized_ntx_rhs=True,
             native_compact_ntx_rhs=True,
+        )
+
+    def pullback_build_lagged_response_support_payload_batched_interpolated_faces_native_multi_rhs_reuse_moment_drds_jvp_shared_primal(
+        self, state, lagged_response_bars, support,
+    ):
+        """Opt-in native matrix-RHS transpose without duplicate drds JVPs."""
+        return self.pullback_build_lagged_response_support_payload_batched_interpolated_faces_multi_rhs_shared_primal(
+            state, lagged_response_bars, support,
+            native_factorized_ntx_rhs=True,
+            reuse_joint_moment_drds_jvp=True,
         )
 
     def pullback_build_lagged_response_state_and_support_payload_batched_interpolated_faces(

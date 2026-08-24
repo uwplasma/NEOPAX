@@ -94,6 +94,27 @@ def test_native_multi_rhs_composite_forwarding_hook_is_exposed_to_radau():
     assert calls == [("state", "ntx-bars", "support")]
 
 
+def test_native_multi_rhs_reused_drds_composite_forwarding_hook_is_exposed_to_radau():
+    """The new selector reaches only its dedicated inner hook."""
+
+    calls = []
+
+    class _InnerNTX:
+        def pullback_build_lagged_response_support_payload_batched_interpolated_faces_native_multi_rhs_reuse_moment_drds_jvp_shared_primal(
+            self, state, response_bars, support,
+        ):
+            calls.append((state, response_bars, support))
+            return "reused-drds-result"
+
+    composite = object.__new__(CombinedTransportFluxModel)
+    object.__setattr__(composite, "neoclassical_model", _InnerNTX())
+    response = SimpleNamespace(neoclassical_response="ntx-bars")
+    assert composite.pullback_build_lagged_response_support_payload_batched_interpolated_faces_native_multi_rhs_reuse_moment_drds_jvp_shared_primal(
+        "state", response, "support", ignored_outer_keyword=True,
+    ) == "reused-drds-result"
+    assert calls == [("state", "ntx-bars", "support")]
+
+
 def test_native_multi_rhs_equation_system_forwarding_hook_is_exposed_to_radau():
     """The real Radau vector-field owner forwards the native hook once."""
 

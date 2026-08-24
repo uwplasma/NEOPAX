@@ -2626,6 +2626,7 @@ def prepare_reverse_static_setup(
         "ntx_batched_interpolated_faces_multi_rhs_shared_primal",
         "ntx_batched_interpolated_faces_native_multi_rhs_shared_primal",
         "ntx_batched_interpolated_faces_native_multi_rhs_compact_shared_primal",
+        "ntx_batched_interpolated_faces_native_multi_rhs_reuse_moment_drds_jvp_shared_primal",
         "ntx_joint_implicit_interpolated_faces",
         "ntx_joint_implicit_interpolated_faces_packed_support_adjoint",
         "ntx_joint_implicit_interpolated_faces_reuse_local_vjp_primal",
@@ -2643,6 +2644,7 @@ def prepare_reverse_static_setup(
             "'ntx_batched_interpolated_faces_multi_rhs_shared_primal', "
             "'ntx_batched_interpolated_faces_native_multi_rhs_shared_primal', "
             "'ntx_batched_interpolated_faces_native_multi_rhs_compact_shared_primal', "
+            "'ntx_batched_interpolated_faces_native_multi_rhs_reuse_moment_drds_jvp_shared_primal', "
             "'ntx_joint_implicit_interpolated_faces', "
             "'ntx_joint_implicit_interpolated_faces_packed_support_adjoint', "
             "'ntx_joint_implicit_interpolated_faces_reuse_local_vjp_primal', "
@@ -2656,6 +2658,7 @@ def prepare_reverse_static_setup(
             "ntx_batched_interpolated_faces_multi_rhs_shared_primal",
             "ntx_batched_interpolated_faces_native_multi_rhs_shared_primal",
             "ntx_batched_interpolated_faces_native_multi_rhs_compact_shared_primal",
+            "ntx_batched_interpolated_faces_native_multi_rhs_reuse_moment_drds_jvp_shared_primal",
             "ntx_joint_implicit_interpolated_faces",
             "ntx_joint_implicit_interpolated_faces_packed_support_adjoint",
             "ntx_joint_implicit_interpolated_faces_reuse_local_vjp_primal",

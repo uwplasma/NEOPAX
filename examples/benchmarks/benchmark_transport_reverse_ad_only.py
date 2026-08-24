@@ -5431,6 +5431,7 @@ def main() -> None:
             "ntx_batched_interpolated_faces_multi_rhs_shared_primal",
             "ntx_batched_interpolated_faces_native_multi_rhs_shared_primal",
             "ntx_batched_interpolated_faces_native_multi_rhs_compact_shared_primal",
+            "ntx_batched_interpolated_faces_native_multi_rhs_reuse_moment_drds_jvp_shared_primal",
             "ntx_joint_implicit_interpolated_faces",
             "ntx_joint_implicit_interpolated_faces_packed_support_adjoint",
             "ntx_joint_implicit_interpolated_faces_reuse_local_vjp_primal",
@@ -5473,6 +5474,9 @@ def main() -> None:
             "'ntx_batched_interpolated_faces_native_multi_rhs_compact_shared_primal' "
             "uses the same native matrix-RHS algebra but compacts its temporary "
             "prepared and case-bar payload before NEOPAX reduces over energy. "
+            "'ntx_batched_interpolated_faces_native_multi_rhs_reuse_moment_drds_jvp_shared_primal' "
+            "uses the native matrix-RHS algebra while reusing the directional drds "
+            "JVPs already returned by its joint local moment pullback. "
             "'ntx_joint_implicit_interpolated_faces' is the exact experimental "
             "mode that obtains rebuild state and NTX-support bars jointly from "
             "the same local NTX implicit adjoint. "
