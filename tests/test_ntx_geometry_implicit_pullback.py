@@ -12,7 +12,10 @@ from NEOPAX._transport_flux_models import (
     _sanitize_float_delta_bar_tree,
 )
 from NEOPAX._transport_equations import ComposedEquationSystem
-from NEOPAX._transport_solvers import _radau_prepare_lagged_response_with_compact_coefficient_record
+from NEOPAX._transport_solvers import (
+    _flat_rhs_build_support_pullback_batched_interpolated_faces_factory,
+    _radau_prepare_lagged_response_with_compact_coefficient_record,
+)
 
 
 def _small_runtime_model(n_energy=1):
@@ -171,6 +174,59 @@ def test_native_multi_rhs_reused_drds_equation_system_forwarding_hook_is_exposed
     assert equations.pullback_build_lagged_response_support_payload_batched_interpolated_faces_native_multi_rhs_reuse_moment_drds_jvp_shared_primal(
         "state", response, "support", ignored_outer_keyword=True,
     ) == "reused-drds-result"
+    assert calls == [("state", "flux-bars", "support")]
+
+
+def test_native_multi_rhs_compact_residual_equation_system_forwarding_hook_is_exposed_to_radau():
+    """The split-residual selector must be exposed by the vector-field owner."""
+
+    calls = []
+
+    class _SharedFlux:
+        def pullback_build_lagged_response_support_payload_batched_interpolated_faces_native_multi_rhs_compact_residual_reuse_moment_drds_jvp_shared_primal(
+            self, state, response_bars, support,
+        ):
+            calls.append((state, response_bars, support))
+            return "compact-residual-result"
+
+    equations = object.__new__(ComposedEquationSystem)
+    object.__setattr__(equations, "shared_flux_model", _SharedFlux())
+    object.__setattr__(equations, "_split_realtime_geometry_payload", lambda support: (support, None))
+    object.__setattr__(equations, "_prepare_working_state", lambda state: (state, None))
+    object.__setattr__(equations, "_shared_flux_call_kwargs", lambda kwargs: {})
+    response = SimpleNamespace(flux_response="flux-bars")
+    assert equations.pullback_build_lagged_response_support_payload_batched_interpolated_faces_native_multi_rhs_compact_residual_reuse_moment_drds_jvp_shared_primal(
+        "state", response, "support", ignored_outer_keyword=True,
+    ) == "compact-residual-result"
+    assert calls == [("state", "flux-bars", "support")]
+
+
+def test_native_multi_rhs_compact_residual_factory_finds_vector_field_owner_hook():
+    """Catch a missing owner wrapper before a compiled reverse segment starts."""
+
+    calls = []
+
+    class _SharedFlux:
+        def pullback_build_lagged_response_support_payload_batched_interpolated_faces_native_multi_rhs_compact_residual_reuse_moment_drds_jvp_shared_primal(
+            self, state, response_bars, support,
+        ):
+            calls.append((state, response_bars, support))
+            return "compact-residual-result"
+
+    equations = object.__new__(ComposedEquationSystem)
+    object.__setattr__(equations, "shared_flux_model", _SharedFlux())
+    object.__setattr__(equations, "_split_realtime_geometry_payload", lambda support: (support, None))
+    object.__setattr__(equations, "_prepare_working_state", lambda state: (state, None))
+    object.__setattr__(equations, "_shared_flux_call_kwargs", lambda kwargs: {})
+    pullback = _flat_rhs_build_support_pullback_batched_interpolated_faces_factory(
+        unravel=lambda value: value,
+        vector_field=equations.vector_field,
+        args=(),
+        kwargs={},
+        native_multi_rhs_compact_residual_reuse_moment_drds_jvp_shared_primal=True,
+    )
+    assert callable(pullback)
+    assert pullback("state", SimpleNamespace(flux_response="flux-bars"), "support") == "compact-residual-result"
     assert calls == [("state", "flux-bars", "support")]
 
 
