@@ -2888,6 +2888,9 @@ def _run_realtime_geometry_support_segment_probe(
         profile_gradient_matrix = support_cotangent_result.profile_gradient_matrix
         support_bars = support_cotangent_result.support_bars
         support_component_bars_by_name = support_cotangent_result.support_component_bars_by_name
+        native_vmec_face_coefficient_bars = (
+            support_cotangent_result.native_vmec_face_coefficient_bars
+        )
         support_reuse_count = support_cotangent_result.support_reuse_count
         support_rebuild_count = support_cotangent_result.support_rebuild_count
         initial_cache_pullback_used = support_cotangent_result.initial_cache_pullback_used
@@ -2970,6 +2973,7 @@ def _run_realtime_geometry_support_segment_probe(
             geometry_param_specs=geometry_param_specs,
             support_bars=tuple(support_bars),
             support_component_bars_by_name=support_component_bars_by_name,
+            native_vmec_face_coefficient_bars=native_vmec_face_coefficient_bars,
             include_component_pullbacks=include_component_pullbacks,
             combined_geometry_payload=combined_geometry_payload,
             n_r=int(geom_cfg.get("n_radial", 51)),

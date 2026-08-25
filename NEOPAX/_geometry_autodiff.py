@@ -7,7 +7,7 @@ import time
 from copy import deepcopy
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Sequence
+from typing import Any, Mapping, Sequence
 
 import jax
 import jax.numpy as jnp
@@ -4760,6 +4760,7 @@ def geometry_payload_pullback_from_param_vector_raw_block_transpose(
     return_state_bars: bool = False,
     extra_state_bars: object | None = None,
     extra_state_bars_factory=None,
+    native_vmec_face_coefficient_bars: Mapping[str, object] | None = None,
     return_raw_block_solve: bool = False,
 ) -> object:
     """Pull transport payload cotangents back to VMEC boundary harmonics.
@@ -4773,6 +4774,14 @@ def geometry_payload_pullback_from_param_vector_raw_block_transpose(
     return the assembled VMEC-state cotangent batch.  ``extra_state_bars`` or
     ``extra_state_bars_factory`` lets fused callers append already-assembled
     VMEC-state cotangents before the same compact raw-block transpose.
+
+    ``native_vmec_face_coefficient_bars`` is an isolated opt-in bridge for
+    NTX's grouped low-dot adjoint.  Its values are batched cotangents of the
+    six traceable VMEC surface coefficient arrays at the face sampling used
+    to build ``face_prepared``.  They are pulled back only through that small
+    VMEC-state-to-surface-coefficient map, then appended to the existing
+    raw-block state-bar batch.  This deliberately does not alter the normal
+    payload/support VJP route.
     """
 
     if not payload_bars:
@@ -4877,6 +4886,50 @@ def geometry_payload_pullback_from_param_vector_raw_block_transpose(
             r00_boozer_surface_sampling=r00_boozer_surface_sampling,
             r00_booz_constants_grids=geometry_booz_constants_grids,
             r00_booz_mode00=geometry_booz_mode00,
+        )
+
+    def _native_vmec_face_coefficients_from_state(state_inner):
+        """Return the exact face-surface coefficient tuple used by NTX.
+
+        Keep this construction beside ``ntx_support_from_state`` so the
+        radial sampling cannot silently drift from the VMEC support builder.
+        It intentionally excludes ``prepare_monoenergetic_system`` and every
+        transport/NTX solve: native NTX has already supplied these bars.
+        """
+
+        rho_center_sample = np.linspace(0.0, 1.0, int(n_r), dtype=float)
+        if int(n_r) > 1:
+            rho_face_sample = np.concatenate(
+                [
+                    np.asarray([0.0], dtype=float),
+                    0.5 * (rho_center_sample[:-1] + rho_center_sample[1:]),
+                    np.asarray([1.0], dtype=float),
+                ],
+                axis=0,
+            )
+        else:
+            rho_face_sample = np.asarray([0.0, 1.0], dtype=float)
+        backend_key = str(surface_backend).strip().lower()
+        if backend_key not in {"vmec", "vmec_jax"}:
+            raise ValueError(
+                "native_vmec_face_coefficient_bars requires the vmec surface backend."
+            )
+        surfaces = _traceable_vmec_surfaces_from_state(
+            context,
+            state_inner,
+            s_values=_positive_transport_s_values_from_rho(rho_face_sample),
+        )
+        names = (
+            "b_cos",
+            "jacobian_cos",
+            "b_sub_theta_cos",
+            "b_sub_zeta_cos",
+            "b_sup_theta_cos",
+            "b_sup_zeta_cos",
+        )
+        return tuple(
+            jnp.stack([jnp.asarray(getattr(surface, name)) for surface in surfaces], axis=0)
+            for name in names
         )
 
     zero_like_state = jax.tree_util.tree_map(jnp.zeros_like, state)
@@ -5320,7 +5373,14 @@ def geometry_payload_pullback_from_param_vector_raw_block_transpose(
             )
         return jnp.swapaxes(gradient_columns, 0, 1)
 
-    streamed_gradient_matrix = _try_compact_payload_tangent_contract_to_param_matrix()
+    # The compact payload contraction only knows support-payload leaves.  The
+    # isolated native coefficient bars live outside that tree, so selecting
+    # the experimental bridge must use the raw-block state transpose below.
+    streamed_gradient_matrix = (
+        None
+        if native_vmec_face_coefficient_bars is not None
+        else _try_compact_payload_tangent_contract_to_param_matrix()
+    )
     if streamed_gradient_matrix is not None:
         if progress_label is not None:
             arr = np.asarray(jax.device_get(streamed_gradient_matrix))
@@ -5341,6 +5401,52 @@ def geometry_payload_pullback_from_param_vector_raw_block_transpose(
         return streamed_gradient_matrix
 
     raw_block_state_bar_batch = _payload_raw_block_state_bar_batch()
+
+    if native_vmec_face_coefficient_bars is not None:
+        native_names = (
+            "b_cos",
+            "jacobian_cos",
+            "b_sub_theta_cos",
+            "b_sub_zeta_cos",
+            "b_sup_theta_cos",
+            "b_sup_zeta_cos",
+        )
+        missing_native_names = tuple(
+            name for name in native_names if name not in native_vmec_face_coefficient_bars
+        )
+        if missing_native_names:
+            raise ValueError(
+                "native_vmec_face_coefficient_bars is missing "
+                f"{missing_native_names}."
+            )
+        native_bar_tuple = tuple(
+            jnp.asarray(native_vmec_face_coefficient_bars[name]) for name in native_names
+        )
+        native_rhs_count = int(native_bar_tuple[0].shape[0])
+        if native_rhs_count != len(payload_bars):
+            raise ValueError(
+                "native VMEC coefficient RHS count must match payload bars: "
+                f"got {native_rhs_count}, expected {len(payload_bars)}."
+            )
+        for name, bars in zip(native_names, native_bar_tuple, strict=True):
+            if bars.ndim < 2:
+                raise ValueError(
+                    f"native VMEC coefficient bars for {name} need RHS and face axes."
+                )
+        _native_primal, native_coeff_pullback = jax.vjp(
+            _native_vmec_face_coefficients_from_state,
+            state,
+        )
+        del _native_primal
+        native_state_bar_batch = jax.vmap(
+            lambda *one_rhs_bars: native_coeff_pullback(one_rhs_bars)[0]
+        )(*native_bar_tuple)
+        _print_state_bar_batch_finiteness("native_vmec_face_coefficients", native_state_bar_batch)
+        raw_block_state_bar_batch = jax.tree_util.tree_map(
+            lambda payload_bar, native_bar: payload_bar + native_bar,
+            raw_block_state_bar_batch,
+            native_state_bar_batch,
+        )
 
     if extra_state_bars is None and extra_state_bars_factory is not None:
         raw_block_state_bar_batch = jax.block_until_ready(raw_block_state_bar_batch)

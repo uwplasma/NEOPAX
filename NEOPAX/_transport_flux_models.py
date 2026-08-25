@@ -1223,6 +1223,25 @@ class CombinedTransportFluxModel(TransportFluxModelBase):
         response_bars = None if lagged_response_bars is None else lagged_response_bars.neoclassical_response
         return pullback_fn(state, response_bars, support)
 
+    def pullback_build_lagged_response_support_payload_batched_interpolated_faces_native_multi_rhs_reuse_moment_drds_jvp_shared_primal_with_vmec_coefficients(
+        self, state, lagged_response_bars, support, **kwargs,
+    ):
+        """Forward the parallel native VMEC coefficient cotangent channel."""
+
+        del kwargs
+        pullback_fn = getattr(
+            self.neoclassical_model,
+            "pullback_build_lagged_response_support_payload_batched_interpolated_faces_"
+            "native_multi_rhs_reuse_moment_drds_jvp_shared_primal_with_vmec_coefficients",
+            None,
+        )
+        if not callable(pullback_fn):
+            raise NotImplementedError(
+                "The active neoclassical model does not expose native VMEC coefficient bars."
+            )
+        response_bars = None if lagged_response_bars is None else lagged_response_bars.neoclassical_response
+        return pullback_fn(state, response_bars, support)
+
     def pullback_build_lagged_response_support_payload_batched_interpolated_faces_native_multi_rhs_compact_shared_primal(
         self,
         state,
@@ -7091,6 +7110,7 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         native_compact_ntx_rhs: bool = False,
         native_compact_residual_ntx_rhs: bool = False,
         reuse_joint_moment_drds_jvp: bool = False,
+        return_native_vmec_coefficient_bars: bool = False,
         stream_native_compact_energy: bool = False,
         return_case_bars: bool = False,
         include_second_direction_base_prepared: bool = True,
@@ -7109,6 +7129,10 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         """
 
         ntx = _import_ntx()
+        if return_native_vmec_coefficient_bars and not native_factorized_ntx_rhs:
+            raise ValueError(
+                "Native VMEC coefficient bars require the native matrix-RHS NTX helper."
+            )
         helper_name = (
             "solve_prepared_coefficient_vector_lowdot_two_pullbacks_"
             "prepared_support_only_native_multi_rhs_compact_residual_and_aux"
@@ -7249,6 +7273,13 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                 )
 
             helper_kwargs = dict(return_primal_outputs=True)
+            if return_native_vmec_coefficient_bars:
+                # NTX's coefficient return uses the compact primal-prepared
+                # view.  The grouped primal/factorisation and matrix-RHS
+                # adjoint are unchanged; only the returned prepared payload
+                # is reduced before crossing this local boundary.
+                helper_kwargs["_compact_result"] = True
+                helper_kwargs["return_vmec_coefficient_bars"] = True
             if (
                 native_factorized_ntx_rhs
                 or native_compact_ntx_rhs
@@ -7275,6 +7306,20 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                 or native_compact_ntx_rhs
                 or native_compact_residual_ntx_rhs
             ) and return_case_bars:
+                if return_native_vmec_coefficient_bars:
+                    (
+                        primal_outputs,
+                        support_result,
+                        case_bar_components,
+                        native_vmec_coefficient_bars,
+                    ) = helper_result
+                    return (
+                        *support_result[:-1],
+                        support_result[-1],
+                        primal_outputs,
+                        case_bar_components,
+                        native_vmec_coefficient_bars,
+                    )
                 primal_outputs, support_result, case_bar_components = helper_result
                 return (*support_result[:-1], support_result[-1], primal_outputs, case_bar_components)
             primal_outputs, support_result = helper_result
@@ -7374,7 +7419,15 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                 (energy_indices, reference_nu_hat, reference_epsi_hat, epsi_hat_tangent),
             )
             compact_energy_streamed = False
-        if (
+        if return_native_vmec_coefficient_bars:
+            (
+                compact_prepared_bars,
+                direct_drds_bars,
+                primal_outputs,
+                native_case_bar_components,
+                native_vmec_coefficient_bars,
+            ) = mapped_outputs
+        elif (
             native_compact_ntx_rhs or native_compact_residual_ntx_rhs
         ) and return_case_bars and not compact_energy_streamed:
             (
@@ -7420,7 +7473,11 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         # explicitly excludes it.
         prepared_bar_terms = (
             (compact_prepared_bars,)
-            if (native_compact_ntx_rhs or native_compact_residual_ntx_rhs)
+            if (
+                native_compact_ntx_rhs
+                or native_compact_residual_ntx_rhs
+                or return_native_vmec_coefficient_bars
+            )
             and return_case_bars
             else
             (
@@ -7556,11 +7613,20 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                 * (-epsi_hat_tangent[:, None] / vth_a_energy[:, None]),
                 axis=0,
             )
-            return prepared_bars, direct_drds_bars, primal_response, (
+            result = (prepared_bars, direct_drds_bars, primal_response, (
                 nu_hat_bars,
                 epsi_hat_bars,
                 vth_a_bars,
-            )
+            ))
+            if return_native_vmec_coefficient_bars:
+                return (
+                    *result,
+                    jax.tree_util.tree_map(
+                        lambda values: jnp.sum(values, axis=0),
+                        native_vmec_coefficient_bars,
+                    ),
+                )
+            return result
         return prepared_bars, direct_drds_bars, primal_response
 
     def _pullback_interpolated_moment_prepared_support_and_drds_only_native_multi_rhs(
@@ -7648,6 +7714,39 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             field_bars=field_bars,
             native_factorized_ntx_rhs=True,
             reuse_joint_moment_drds_jvp=True,
+            return_case_bars=return_case_bars,
+            include_second_direction_base_prepared=False,
+        )
+
+    def _pullback_interpolated_moment_prepared_support_and_drds_only_native_multi_rhs_reuse_moment_drds_jvp_with_vmec_coefficients(
+        self,
+        prepared,
+        *,
+        drds_value,
+        reference_nu_hat,
+        reference_epsi_hat,
+        vth_a,
+        field_bars,
+        return_case_bars: bool = False,
+    ):
+        """Return the validated native support bar plus VMEC coefficient bars.
+
+        This is intentionally private and unselected.  It retains the same
+        grouped low-dot NTX adjoint as the current fast ``drds``-reuse mode,
+        but exposes the already-available coefficient cotangent in a parallel
+        channel instead of asking NEOPAX to differentiate the prepared tree.
+        """
+
+        return self._pullback_interpolated_moment_prepared_support_and_drds_only_multi_rhs(
+            prepared,
+            drds_value=drds_value,
+            reference_nu_hat=reference_nu_hat,
+            reference_epsi_hat=reference_epsi_hat,
+            vth_a=vth_a,
+            field_bars=field_bars,
+            native_factorized_ntx_rhs=True,
+            reuse_joint_moment_drds_jvp=True,
+            return_native_vmec_coefficient_bars=True,
             return_case_bars=return_case_bars,
             include_second_direction_base_prepared=False,
         )
@@ -11348,6 +11447,7 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         native_compact_ntx_rhs: bool = False,
         native_compact_residual_ntx_rhs: bool = False,
         reuse_joint_moment_drds_jvp: bool = False,
+        return_native_vmec_coefficient_bars: bool = False,
     ):
         """Experimental exact batched support transpose with local NTX sharing.
 
@@ -11391,6 +11491,23 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
 
         face_channels_bar = _batched_zero_like(_float_delta_tree_like(support.face_channels))
         face_prepared_bar = _batched_zero_like(_float_delta_tree_like(support.face_prepared))
+        native_vmec_coefficient_bar = None
+        if return_native_vmec_coefficient_bars:
+            surface = support.face_prepared.surface
+            native_vmec_coefficient_bar = {
+                name: jnp.zeros(
+                    (objective_count,) + jnp.asarray(getattr(surface, name)).shape,
+                    dtype=jnp.asarray(getattr(surface, name)).dtype,
+                )
+                for name in (
+                    "b_cos",
+                    "jacobian_cos",
+                    "b_sub_theta_cos",
+                    "b_sub_zeta_cos",
+                    "b_sup_theta_cos",
+                    "b_sup_zeta_cos",
+                )
+            }
         n_radius = int(face_state.Er.shape[0])
         anchor_indices = self._response_anchor_indices(n_radius)
         anchor_rho = jnp.asarray(self.geometry.r_grid_half, dtype=jnp.float64)[anchor_indices]
@@ -11446,6 +11563,10 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                     local_support_pullback = (
                         self._pullback_interpolated_moment_prepared_support_and_drds_only_native_multi_rhs_compact
                     )
+                elif return_native_vmec_coefficient_bars:
+                    local_support_pullback = (
+                        self._pullback_interpolated_moment_prepared_support_and_drds_only_native_multi_rhs_reuse_moment_drds_jvp_with_vmec_coefficients
+                    )
                 elif reuse_joint_moment_drds_jvp:
                     local_support_pullback = (
                         self._pullback_interpolated_moment_prepared_support_and_drds_only_native_multi_rhs_reuse_moment_drds_jvp
@@ -11463,6 +11584,7 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                     native_factorized_ntx_rhs
                     or native_compact_ntx_rhs
                     or native_compact_residual_ntx_rhs
+                    or return_native_vmec_coefficient_bars
                 ):
                     local_kwargs["return_case_bars"] = True
                 local_result = local_support_pullback(
@@ -11478,13 +11600,23 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                     native_factorized_ntx_rhs
                     or native_compact_ntx_rhs
                     or native_compact_residual_ntx_rhs
+                    or return_native_vmec_coefficient_bars
                 ):
-                    (
-                        prepared_bar,
-                        drds_bar,
-                        primal_response,
-                        (nu_hat_bars, epsi_hat_bars, vth_a_bars),
-                    ) = local_result
+                    if return_native_vmec_coefficient_bars:
+                        (
+                            prepared_bar,
+                            drds_bar,
+                            primal_response,
+                            (nu_hat_bars, epsi_hat_bars, vth_a_bars),
+                            vmec_coefficient_bars,
+                        ) = local_result
+                    else:
+                        (
+                            prepared_bar,
+                            drds_bar,
+                            primal_response,
+                            (nu_hat_bars, epsi_hat_bars, vth_a_bars),
+                        ) = local_result
                     primitive_drds_bar, _er_bar, _temperature_bar, _density_bar = jax.vmap(
                         lambda nu_hat_bar, epsi_hat_bar, vth_a_bar: self._pullback_local_scan_inputs_and_drds_from_primitives(
                             drds_value=drds_value,
@@ -11501,7 +11633,7 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                     drds_bar = drds_bar + primitive_drds_bar
                 else:
                     prepared_bar, drds_bar, primal_response = local_result
-                return (
+                result = (
                     # The multi-RHS NTX helper already converts static/float0
                     # prepared leaves into explicit zero arrays carrying the
                     # RHS axis.  Applying the scalar sanitizer here would
@@ -11513,24 +11645,53 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                     drds_bar,
                     primal_response,
                 )
+                if return_native_vmec_coefficient_bars:
+                    return (*result, vmec_coefficient_bars)
+                return result
 
-            prepared_species_bar_leaves, drds_species_bars, primal_response = jax.vmap(
+            species_result = jax.vmap(
                 _one_species,
                 in_axes=(0,) + (1,) * len(local_field_bars),
             )(species_indices, *local_field_bars)
+            if return_native_vmec_coefficient_bars:
+                (
+                    prepared_species_bar_leaves,
+                    drds_species_bars,
+                    primal_response,
+                    vmec_species_coefficient_bars,
+                ) = species_result
+            else:
+                prepared_species_bar_leaves, drds_species_bars, primal_response = species_result
             prepared_bar = prepared_treedef.unflatten(
                 tuple(jnp.sum(values, axis=0) for values in prepared_species_bar_leaves)
             )
-            return primal_response, prepared_bar, jnp.sum(drds_species_bars, axis=0)
+            result = (primal_response, prepared_bar, jnp.sum(drds_species_bars, axis=0))
+            if return_native_vmec_coefficient_bars:
+                return (
+                    *result,
+                    jax.tree_util.tree_map(
+                        lambda values: jnp.sum(values, axis=0),
+                        vmec_species_coefficient_bars,
+                    ),
+                )
+            return result
 
         def _accumulate(carry, anchor_pos):
-            channels, prepared_bars, anchor_fields = carry
+            channels, prepared_bars, anchor_fields, coefficient_bars = carry
             radius_index = jax.lax.dynamic_index_in_dim(anchor_indices, anchor_pos, axis=0, keepdims=False)
             local_field_bars = tuple(
                 jax.lax.dynamic_index_in_dim(field_bar, anchor_pos, axis=1, keepdims=False)
                 for field_bar in raw_anchor_response_fields
             )
-            local_response, local_prepared, local_drds = _one_anchor(radius_index, local_field_bars)
+            anchor_result = _one_anchor(radius_index, local_field_bars)
+            if return_native_vmec_coefficient_bars:
+                local_response, local_prepared, local_drds, local_coefficient_bars = anchor_result
+                coefficient_bars = {
+                    name: values.at[:, radius_index].add(local_coefficient_bars[name])
+                    for name, values in coefficient_bars.items()
+                }
+            else:
+                local_response, local_prepared, local_drds = anchor_result
             anchor_fields = tuple(
                 field.at[anchor_pos].set(value)
                 for field, value in zip(anchor_fields, local_response, strict=True)
@@ -11542,11 +11703,12 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                     prepared_bars, local_prepared,
                 ),
                 anchor_fields,
+                coefficient_bars,
             ), None
 
-        (face_channels_bar, face_prepared_bar, raw_anchor_fields), _ = jax.lax.scan(
+        (face_channels_bar, face_prepared_bar, raw_anchor_fields, native_vmec_coefficient_bar), _ = jax.lax.scan(
             _accumulate,
-            (face_channels_bar, face_prepared_bar, anchor_response_fields0),
+            (face_channels_bar, face_prepared_bar, anchor_response_fields0, native_vmec_coefficient_bar),
             jnp.arange(n_anchor, dtype=jnp.int32),
         )
         anchor_fields = raw_anchor_fields if n_anchor < 4 else jax.lax.cond(
@@ -11563,11 +11725,14 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                 )
             )(field_bar)
         face_channels_bar = dataclasses.replace(face_channels_bar, rho=face_channels_bar.rho + target_rho_bar)
-        return dataclasses.replace(
+        support_bar = dataclasses.replace(
             _batched_zero_like(_float_delta_tree_like(support)),
             face_channels=face_channels_bar,
             face_prepared=face_prepared_bar,
         )
+        if return_native_vmec_coefficient_bars:
+            return support_bar, native_vmec_coefficient_bar
+        return support_bar
 
     def pullback_build_lagged_response_support_payload_batched_interpolated_faces_native_multi_rhs_shared_primal(
         self, state, lagged_response_bars, support,
@@ -11612,6 +11777,25 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             state, lagged_response_bars, support,
             native_factorized_ntx_rhs=True,
             reuse_joint_moment_drds_jvp=True,
+        )
+
+    def pullback_build_lagged_response_support_payload_batched_interpolated_faces_native_multi_rhs_reuse_moment_drds_jvp_shared_primal_with_vmec_coefficients(
+        self, state, lagged_response_bars, support,
+    ):
+        """Return normal support bars plus NTX-native face coefficient bars.
+
+        The second result is deliberately out-of-band: it is a cotangent of
+        VMEC face surface coefficients, not a leaf of the primal NTX support
+        payload.  The reverse transport kernel must route it separately.
+        """
+
+        return self.pullback_build_lagged_response_support_payload_batched_interpolated_faces_multi_rhs_shared_primal(
+            state,
+            lagged_response_bars,
+            support,
+            native_factorized_ntx_rhs=True,
+            reuse_joint_moment_drds_jvp=True,
+            return_native_vmec_coefficient_bars=True,
         )
 
     def pullback_build_lagged_response_support_payload_batched_interpolated_faces_native_multi_rhs_compact_residual_reuse_moment_drds_jvp_shared_primal(

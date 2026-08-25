@@ -1520,10 +1520,16 @@ def _flat_rhs_build_support_pullback_batched_interpolated_faces_factory(
     native_multi_rhs_shared_primal: bool = False,
     native_multi_rhs_compact_shared_primal: bool = False,
     native_multi_rhs_reuse_moment_drds_jvp_shared_primal: bool = False,
+    native_multi_rhs_reuse_moment_drds_jvp_shared_primal_with_vmec_coefficients: bool = False,
     native_multi_rhs_compact_residual_reuse_moment_drds_jvp_shared_primal: bool = False,
 ):
     owner = getattr(vector_field, "__self__", None)
-    if native_multi_rhs_compact_residual_reuse_moment_drds_jvp_shared_primal:
+    if native_multi_rhs_reuse_moment_drds_jvp_shared_primal_with_vmec_coefficients:
+        pullback_name = (
+            "pullback_build_lagged_response_support_payload_batched_interpolated_faces_"
+            "native_multi_rhs_reuse_moment_drds_jvp_shared_primal_with_vmec_coefficients"
+        )
+    elif native_multi_rhs_compact_residual_reuse_moment_drds_jvp_shared_primal:
         pullback_name = (
             "pullback_build_lagged_response_support_payload_batched_interpolated_faces_"
             "native_multi_rhs_compact_residual_reuse_moment_drds_jvp_shared_primal"
@@ -3789,6 +3795,7 @@ class _RadauAcceptedStepPhysicsContext:
     flat_rhs_build_support_pullback_batched_interpolated_faces_native_multi_rhs_shared_primal: Callable[[Any, Any, Any], Any] | None = None
     flat_rhs_build_support_pullback_batched_interpolated_faces_native_multi_rhs_compact_shared_primal: Callable[[Any, Any, Any], Any] | None = None
     flat_rhs_build_support_pullback_batched_interpolated_faces_native_multi_rhs_reuse_moment_drds_jvp_shared_primal: Callable[[Any, Any, Any], Any] | None = None
+    flat_rhs_build_support_pullback_batched_interpolated_faces_native_multi_rhs_reuse_moment_drds_jvp_shared_primal_with_vmec_coefficients: Callable[[Any, Any, Any], Any] | None = None
     flat_rhs_build_support_pullback_batched_interpolated_faces_native_multi_rhs_compact_residual_reuse_moment_drds_jvp_shared_primal: Callable[[Any, Any, Any], Any] | None = None
     flat_rhs_build_state_and_support_pullback_batched_interpolated_faces: Callable[[Any, Any, Any], Any] | None = None
     flat_rhs_build_state_and_support_pullback_batched_interpolated_faces_reuse_local_vjp_primal: Callable[[Any, Any, Any], Any] | None = None
@@ -5810,6 +5817,29 @@ def _execute_radau_accepted_step_next_reduced_cotangent_batched_bwd_with_support
 
     objective_count = jnp.asarray(next_reduced_bars.y).shape[0]
     zero_support_bar = _radau_zero_support_delta_tree_like(support)
+    collect_native_vmec_coefficients = (
+        str(
+            getattr(
+                physics_context,
+                "reverse_rebuild_support_pullback_mode",
+                "separate",
+            )
+        ).strip().lower()
+        == "ntx_batched_interpolated_faces_native_multi_rhs_reuse_moment_drds_jvp_shared_primal_with_vmec_coefficients"
+    )
+    native_vmec_zero_leaves = (
+        tuple(
+            jnp.broadcast_to(
+                jnp.asarray(leaf)[None, ...],
+                (objective_count,) + jnp.asarray(leaf).shape,
+            )
+            for leaf in jax.tree_util.tree_leaves(
+                _radau_zero_native_vmec_face_coefficient_bars(support)
+            )
+        )
+        if collect_native_vmec_coefficients
+        else tuple()
+    )
     carry_for_linear_map = dataclasses.replace(
         _radau_carry_with_forward_only_jvp_fields(carry_in),
         lagged_response_cache=primal_result.carry_after_attempt.lagged_response_cache,
@@ -5836,7 +5866,7 @@ def _execute_radau_accepted_step_next_reduced_cotangent_batched_bwd_with_support
             jnp.broadcast_to(jnp.asarray(leaf)[None, ...], (objective_count,) + jnp.asarray(leaf).shape)
             for leaf in jax.tree_util.tree_leaves(zero_support_bar)
         )
-        return reduced_bars, zero_support_leaves
+        return reduced_bars, (*zero_support_leaves, *native_vmec_zero_leaves)
 
     trial_y_bars = jnp.asarray(next_reduced_bars.y, dtype=kernel_context.dtype)
     if physics_context.project_flat is not None:
@@ -5944,6 +5974,8 @@ def _execute_radau_accepted_step_next_reduced_cotangent_batched_bwd_with_support
             )(residual_bars)
     else:
         raise ValueError(f"Unknown reverse_rhs_pullback_mode '{rhs_pullback_mode}'.")
+    if collect_native_vmec_coefficients:
+        support_bar_leaves = (*support_bar_leaves, *native_vmec_zero_leaves)
 
     y_bars = trial_y_bars + jnp.asarray(residual_y_bars, dtype=kernel_context.dtype)
     lagged_cache_bars = _add_tangent_trees(
@@ -6050,8 +6082,15 @@ def _execute_radau_accepted_step_next_reduced_cotangent_batched_bwd_with_support
                 "ntx_batched_interpolated_faces_native_multi_rhs_compact_shared_primal",
                 "ntx_batched_interpolated_faces_native_multi_rhs_reuse_moment_drds_jvp_shared_primal",
                 "ntx_batched_interpolated_faces_native_multi_rhs_compact_residual_reuse_moment_drds_jvp_shared_primal",
+                "ntx_batched_interpolated_faces_native_multi_rhs_reuse_moment_drds_jvp_shared_primal_with_vmec_coefficients",
             }:
                 if rebuild_support_pullback_mode == (
+                    "ntx_batched_interpolated_faces_native_multi_rhs_reuse_moment_drds_jvp_shared_primal_with_vmec_coefficients"
+                ):
+                    batched_pullback = (
+                        physics_context.flat_rhs_build_support_pullback_batched_interpolated_faces_native_multi_rhs_reuse_moment_drds_jvp_shared_primal_with_vmec_coefficients
+                    )
+                elif rebuild_support_pullback_mode == (
                     "ntx_batched_interpolated_faces_native_multi_rhs_compact_residual_reuse_moment_drds_jvp_shared_primal"
                 ):
                     batched_pullback = (
@@ -7120,7 +7159,28 @@ def _radau_segment_reduced_cotangent_bwd_batched_with_support_call(
         "reduced_cotangent_step_call",
         "call_boundary",
     }
-    zero_support_leaves = tuple(jax.tree_util.tree_leaves(_radau_zero_support_delta_tree_like(support)))
+    collect_native_vmec_coefficients = (
+        str(
+            getattr(
+                execution_context.physics_context,
+                "reverse_rebuild_support_pullback_mode",
+                "separate",
+            )
+        ).strip().lower()
+        == "ntx_batched_interpolated_faces_native_multi_rhs_reuse_moment_drds_jvp_shared_primal_with_vmec_coefficients"
+    )
+    zero_support_leaves = tuple(
+        jax.tree_util.tree_leaves(_radau_zero_support_delta_tree_like(support))
+    )
+    if collect_native_vmec_coefficients:
+        zero_support_leaves = (
+            *zero_support_leaves,
+            *tuple(
+                jax.tree_util.tree_leaves(
+                    _radau_zero_native_vmec_face_coefficient_bars(support)
+                )
+            ),
+        )
     objective_count = jnp.asarray(segment_reduced_bars.y).shape[0]
     zero_support_bar_leaves = tuple(
         jnp.broadcast_to(jnp.asarray(leaf)[None, ...], (objective_count,) + jnp.asarray(leaf).shape)
@@ -8661,6 +8721,31 @@ def _radau_zero_support_delta_tree_like(primal):
         return jnp.zeros(arr.shape, dtype=jnp.float64)
 
     return jax.tree_util.tree_map(_zero_leaf, primal)
+
+
+def _radau_zero_native_vmec_face_coefficient_bars(support):
+    """Zero parallel VMEC-face coefficient bars for the opt-in native mode.
+
+    These are deliberately not inserted into ``support``: they are
+    cotangents of the traceable VMEC surface coefficients, rather than of a
+    primal support-payload leaf.  Keeping them as appended carrier leaves lets
+    the established Radau scan accumulate them without changing any default
+    support-tree contract.
+    """
+
+    ntx_support = support["ntx_support"] if isinstance(support, dict) else support
+    surface = ntx_support.face_prepared.surface
+    return {
+        name: jnp.zeros_like(jnp.asarray(getattr(surface, name)))
+        for name in (
+            "b_cos",
+            "jacobian_cos",
+            "b_sub_theta_cos",
+            "b_sub_zeta_cos",
+            "b_sup_theta_cos",
+            "b_sup_zeta_cos",
+        )
+    }
 
 
 def _radau_sanitize_support_delta_bar_tree(primal, bar):
@@ -17486,6 +17571,13 @@ def _build_prepared_radau_accepted_rollout(
             project_flat=project_flat, native_multi_rhs_reuse_moment_drds_jvp_shared_primal=True,
         )
     )
+    flat_rhs_build_support_pullback_batched_interpolated_faces_native_multi_rhs_reuse_moment_drds_jvp_shared_primal_with_vmec_coefficients = (
+        _flat_rhs_build_support_pullback_batched_interpolated_faces_factory(
+            unravel=unpack_flat, vector_field=vector_field, args=args, kwargs=kwargs,
+            project_flat=project_flat,
+            native_multi_rhs_reuse_moment_drds_jvp_shared_primal_with_vmec_coefficients=True,
+        )
+    )
     flat_rhs_build_support_pullback_batched_interpolated_faces_native_multi_rhs_compact_residual_reuse_moment_drds_jvp_shared_primal = (
         _flat_rhs_build_support_pullback_batched_interpolated_faces_factory(
             unravel=unpack_flat, vector_field=vector_field, args=args, kwargs=kwargs,
@@ -17858,6 +17950,9 @@ def _build_prepared_radau_accepted_rollout(
         flat_rhs_build_support_pullback_batched_interpolated_faces_native_multi_rhs_reuse_moment_drds_jvp_shared_primal=(
             flat_rhs_build_support_pullback_batched_interpolated_faces_native_multi_rhs_reuse_moment_drds_jvp_shared_primal
         ),
+        flat_rhs_build_support_pullback_batched_interpolated_faces_native_multi_rhs_reuse_moment_drds_jvp_shared_primal_with_vmec_coefficients=(
+            flat_rhs_build_support_pullback_batched_interpolated_faces_native_multi_rhs_reuse_moment_drds_jvp_shared_primal_with_vmec_coefficients
+        ),
         flat_rhs_build_support_pullback_batched_interpolated_faces_native_multi_rhs_compact_residual_reuse_moment_drds_jvp_shared_primal=(
             flat_rhs_build_support_pullback_batched_interpolated_faces_native_multi_rhs_compact_residual_reuse_moment_drds_jvp_shared_primal
         ),
@@ -18100,6 +18195,13 @@ class RADAUSolver(_RadauSolverConfig):
             _flat_rhs_build_support_pullback_batched_interpolated_faces_factory(
                 unravel=unpack_flat, vector_field=vector_field, args=args, kwargs=kwargs,
                 project_flat=project_flat, native_multi_rhs_reuse_moment_drds_jvp_shared_primal=True,
+            )
+        )
+        flat_rhs_build_support_pullback_batched_interpolated_faces_native_multi_rhs_reuse_moment_drds_jvp_shared_primal_with_vmec_coefficients = (
+            _flat_rhs_build_support_pullback_batched_interpolated_faces_factory(
+                unravel=unpack_flat, vector_field=vector_field, args=args, kwargs=kwargs,
+                project_flat=project_flat,
+                native_multi_rhs_reuse_moment_drds_jvp_shared_primal_with_vmec_coefficients=True,
             )
         )
         flat_rhs_build_support_pullback_batched_interpolated_faces_native_multi_rhs_compact_residual_reuse_moment_drds_jvp_shared_primal = (
@@ -18467,6 +18569,9 @@ class RADAUSolver(_RadauSolverConfig):
             ),
             flat_rhs_build_support_pullback_batched_interpolated_faces_native_multi_rhs_reuse_moment_drds_jvp_shared_primal=(
                 flat_rhs_build_support_pullback_batched_interpolated_faces_native_multi_rhs_reuse_moment_drds_jvp_shared_primal
+            ),
+            flat_rhs_build_support_pullback_batched_interpolated_faces_native_multi_rhs_reuse_moment_drds_jvp_shared_primal_with_vmec_coefficients=(
+                flat_rhs_build_support_pullback_batched_interpolated_faces_native_multi_rhs_reuse_moment_drds_jvp_shared_primal_with_vmec_coefficients
             ),
             flat_rhs_build_support_pullback_batched_interpolated_faces_native_multi_rhs_compact_residual_reuse_moment_drds_jvp_shared_primal=(
                 flat_rhs_build_support_pullback_batched_interpolated_faces_native_multi_rhs_compact_residual_reuse_moment_drds_jvp_shared_primal

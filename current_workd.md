@@ -1750,3 +1750,31 @@ obtain an end-to-end AD/FD comparison on the existing derivative-validated
 native selector. Only if it shows a material geometry-gradient error should we
 derive a native scalar contraction that reproduces the generic reduction
 structure while retaining the shared NTX solves.
+
+#### In-progress AD comparison bridge (2026-08-25)
+
+The isolated comparison route is now being threaded as a *parallel* result:
+the existing support payload bar remains unchanged, while the NTX native
+low-dot helper returns a separate batched dictionary of face VMEC coefficient
+bars.  NEOPAX can map that dictionary through the exact traceable
+VMEC-state-to-face-coefficient VJP and add the resulting state bar before the
+existing raw-block transpose.  The local NTX, flux-model, composed-equation,
+and raw-block endpoints are implemented and remain unselected.
+
+The segmented Radau carrier is now complete.  It accumulates the six native
+coefficient-bar arrays in parallel with (not inside) the ordinary support tree,
+then the existing raw-block VMEC payload transpose maps them from all face
+surfaces to the converged VMEC state.  The comparison selector is deliberately
+separate:
+
+```text
+ntx_batched_interpolated_faces_native_multi_rhs_reuse_moment_drds_jvp_shared_primal_with_vmec_coefficients
+```
+
+It uses the same grouped low-dot NTX solve/factorization and the same normal
+support transpose as the current `reuse_moment_drds_jvp_shared_primal` mode;
+the only added path is the post-NTX coefficient-to-VMEC-state VJP.  Existing
+modes and defaults are untouched.  The next action is one remote all-objective
+AD/FD comparison using this selector.  Compare its table to the established
+`reuse_moment_drds_jvp_shared_primal` table before treating the approximately
+`1e-7` small-fixture discrepancy as acceptable.

@@ -78,6 +78,7 @@ from ._transport_solvers import (
     _make_solver_state_transform,
     _radau_adaptive_schedule_rollout,
     _radau_sanitize_support_delta_bar_tree,
+    _radau_zero_native_vmec_face_coefficient_bars,
     _theta_basic_accepted_step_attempt,
     _theta_basic_adaptive_schedule_rollout,
     _theta_basic_step_from_attempt_fn,
@@ -302,6 +303,10 @@ class RealtimeGeometrySupportCotangentResult:
     support_rebuild_count: int
     initial_cache_pullback_used: bool
     initial_cache_pullback_skipped: bool
+    # Isolated native-NTX VMEC coefficient bars.  These are intentionally
+    # outside ``support_bars`` because they are cotangents of the traceable
+    # face surfaces, not of support-payload leaves.
+    native_vmec_face_coefficient_bars: Mapping[str, object] | None = None
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -2628,6 +2633,7 @@ def prepare_reverse_static_setup(
         "ntx_batched_interpolated_faces_native_multi_rhs_compact_shared_primal",
         "ntx_batched_interpolated_faces_native_multi_rhs_reuse_moment_drds_jvp_shared_primal",
         "ntx_batched_interpolated_faces_native_multi_rhs_compact_residual_reuse_moment_drds_jvp_shared_primal",
+        "ntx_batched_interpolated_faces_native_multi_rhs_reuse_moment_drds_jvp_shared_primal_with_vmec_coefficients",
         "ntx_joint_implicit_interpolated_faces",
         "ntx_joint_implicit_interpolated_faces_packed_support_adjoint",
         "ntx_joint_implicit_interpolated_faces_reuse_local_vjp_primal",
@@ -2647,6 +2653,7 @@ def prepare_reverse_static_setup(
             "'ntx_batched_interpolated_faces_native_multi_rhs_compact_shared_primal', "
             "'ntx_batched_interpolated_faces_native_multi_rhs_reuse_moment_drds_jvp_shared_primal', "
             "'ntx_batched_interpolated_faces_native_multi_rhs_compact_residual_reuse_moment_drds_jvp_shared_primal', "
+            "'ntx_batched_interpolated_faces_native_multi_rhs_reuse_moment_drds_jvp_shared_primal_with_vmec_coefficients', "
             "'ntx_joint_implicit_interpolated_faces', "
             "'ntx_joint_implicit_interpolated_faces_packed_support_adjoint', "
             "'ntx_joint_implicit_interpolated_faces_reuse_local_vjp_primal', "
@@ -2662,6 +2669,7 @@ def prepare_reverse_static_setup(
             "ntx_batched_interpolated_faces_native_multi_rhs_compact_shared_primal",
             "ntx_batched_interpolated_faces_native_multi_rhs_reuse_moment_drds_jvp_shared_primal",
             "ntx_batched_interpolated_faces_native_multi_rhs_compact_residual_reuse_moment_drds_jvp_shared_primal",
+            "ntx_batched_interpolated_faces_native_multi_rhs_reuse_moment_drds_jvp_shared_primal_with_vmec_coefficients",
             "ntx_joint_implicit_interpolated_faces",
             "ntx_joint_implicit_interpolated_faces_packed_support_adjoint",
             "ntx_joint_implicit_interpolated_faces_reuse_local_vjp_primal",
@@ -3367,6 +3375,28 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
         ),
     )
     _zero_support_leaves, support_treedef = jax.tree_util.tree_flatten(zero_payload_bar)
+    native_vmec_mode = (
+        str(
+            getattr(
+                reverse_setup.execution_context.physics_context,
+                "reverse_rebuild_support_pullback_mode",
+                "separate",
+            )
+        ).strip().lower()
+        == "ntx_batched_interpolated_faces_native_multi_rhs_reuse_moment_drds_jvp_shared_primal_with_vmec_coefficients"
+    )
+    native_vmec_zero_bars = (
+        _radau_zero_native_vmec_face_coefficient_bars(support_payload)
+        if native_vmec_mode
+        else None
+    )
+    if native_vmec_zero_bars is None:
+        native_vmec_treedef = None
+        native_vmec_zero_leaves = tuple()
+    else:
+        native_vmec_zero_leaves, native_vmec_treedef = jax.tree_util.tree_flatten(
+            native_vmec_zero_bars
+        )
     objective_payload_bar_leaves = tuple(
         jax.tree_util.tree_leaves(payload_bar)
         for payload_bar in objective_payload_bar_rows
@@ -3421,6 +3451,17 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
         )
         for leaf_i in range(len(_zero_support_leaves))
     )
+    if native_vmec_zero_leaves:
+        support_bar_leaves = (
+            *support_bar_leaves,
+            *tuple(
+                jnp.broadcast_to(
+                    jnp.asarray(leaf)[None, ...],
+                    (objective_count,) + jnp.asarray(leaf).shape,
+                )
+                for leaf in native_vmec_zero_leaves
+            ),
+        )
     objective_values, final_y_bars, support_bar_leaves = jax.block_until_ready(
         (objective_values, final_y_bars, support_bar_leaves)
     )
@@ -3893,6 +3934,27 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
         flush=True,
     )
 
+    # The normal support-payload contract ends here.  The experimental native
+    # VMEC bars were carried in parallel through the segment scan solely so
+    # their transpose can be applied below; do not expose them to the legacy
+    # initial-cache/root support pullbacks.
+    native_vmec_face_coefficient_bars = None
+    if native_vmec_treedef is not None:
+        native_leaf_start = len(_zero_support_leaves)
+        native_vmec_face_coefficient_bars = native_vmec_treedef.unflatten(
+            tuple(support_bar_leaves[native_leaf_start:])
+        )
+        support_bar_leaves = tuple(support_bar_leaves[:native_leaf_start])
+        objective_support_bar_leaves = tuple(
+            objective_support_bar_leaves[:native_leaf_start]
+        )
+        step_support_bar_leaves_accum = tuple(
+            step_support_bar_leaves_accum[:native_leaf_start]
+        )
+        initial_cache_support_bar_leaves_accum = tuple(
+            initial_cache_support_bar_leaves_accum[:native_leaf_start]
+        )
+
     initial_lagged_response_valid = bool(np.asarray(jax.device_get(carry0.lagged_response_valid)))
     build_support_pullback = reverse_setup.execution_context.physics_context.flat_rhs_build_support_pullback
     initial_cache_support_pullback_mode = str(
@@ -4229,6 +4291,7 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
         support_rebuild_count,
         initial_cache_pullback_used,
         initial_cache_pullback_skipped,
+        native_vmec_face_coefficient_bars,
     )
 
 
@@ -4272,13 +4335,13 @@ def realtime_geometry_support_cotangents_from_parameter_vector(
         support_payload=support_payload,
         initial_er_root_ad=initial_er_root_ad,
     )
-    if not isinstance(callback_result, tuple) or len(callback_result) != 8:
+    if not isinstance(callback_result, tuple) or len(callback_result) not in {8, 9}:
         raise TypeError(
-            "reverse_all_objectives_support_payload_bar must return an 8-tuple: "
+            "reverse_all_objectives_support_payload_bar must return an 8- or 9-tuple: "
             "(objective_values, profile_gradient_matrix, support_bars, "
             "support_component_bars_by_name, support_reuse_count, "
             "support_rebuild_count, initial_cache_pullback_used, "
-            "initial_cache_pullback_skipped)."
+            "initial_cache_pullback_skipped[, native_vmec_face_coefficient_bars])."
         )
     (
         objective_values,
@@ -4289,15 +4352,26 @@ def realtime_geometry_support_cotangents_from_parameter_vector(
         support_rebuild_count,
         initial_cache_pullback_used,
         initial_cache_pullback_skipped,
+        *native_vmec_result,
     ) = callback_result
+    native_vmec_face_coefficient_bars = (
+        native_vmec_result[0] if native_vmec_result else None
+    )
     if block_until_ready:
-        objective_values, profile_gradient_matrix, support_bars, support_component_bars_by_name = (
+        (
+            objective_values,
+            profile_gradient_matrix,
+            support_bars,
+            support_component_bars_by_name,
+            native_vmec_face_coefficient_bars,
+        ) = (
             jax.block_until_ready(
                 (
                     objective_values,
                     profile_gradient_matrix,
                     support_bars,
                     support_component_bars_by_name,
+                    native_vmec_face_coefficient_bars,
                 )
             )
         )
@@ -4310,6 +4384,7 @@ def realtime_geometry_support_cotangents_from_parameter_vector(
         support_rebuild_count=int(support_rebuild_count),
         initial_cache_pullback_used=bool(initial_cache_pullback_used),
         initial_cache_pullback_skipped=bool(initial_cache_pullback_skipped),
+        native_vmec_face_coefficient_bars=native_vmec_face_coefficient_bars,
     )
 
 
@@ -4559,6 +4634,7 @@ def run_internal_realtime_geometry_support_segment_probe(
         geometry_param_specs=geometry_param_specs,
         support_bars=tuple(support_cotangent_result.support_bars),
         support_component_bars_by_name=support_cotangent_result.support_component_bars_by_name,
+        native_vmec_face_coefficient_bars=support_cotangent_result.native_vmec_face_coefficient_bars,
         include_component_pullbacks=bool(getattr(args, "realtime_geometry_component_pullbacks", False)),
         combined_geometry_payload=core_setup.combined_geometry_payload,
         n_r=int(geom_cfg.get("n_radial", 51)),
@@ -5184,6 +5260,14 @@ def internal_realtime_geometry_transport_reverse_table_result_builder(
         _report_table_builder_phase("transport_support_cotangents")
         rows = _row_indices(objective_names)
         support_bars = tuple(support_result.support_bars[i] for i in rows)
+        native_vmec_face_coefficient_bars = (
+            None
+            if support_result.native_vmec_face_coefficient_bars is None
+            else jax.tree_util.tree_map(
+                lambda value: jnp.asarray(value)[jnp.asarray(rows, dtype=jnp.int32)],
+                support_result.native_vmec_face_coefficient_bars,
+            )
+        )
         component_bars = {
             name: tuple(values[i] for i in rows)
             for name, values in support_result.support_component_bars_by_name.items()
@@ -5224,6 +5308,7 @@ def internal_realtime_geometry_transport_reverse_table_result_builder(
             geometry_param_specs=vmec_specs,
             support_bars=support_bars,
             support_component_bars_by_name=component_bars,
+            native_vmec_face_coefficient_bars=native_vmec_face_coefficient_bars,
             include_component_pullbacks=False,
             combined_geometry_payload=combined_geometry_payload,
             n_r=int(opts.get("n_r", n_r)),
@@ -5250,6 +5335,7 @@ def realtime_geometry_payload_pullback_result(
     geometry_param_specs: Sequence[tuple[str, int, int]],
     support_bars: Sequence[object],
     support_component_bars_by_name: Mapping[str, Sequence[object]] | None = None,
+    native_vmec_face_coefficient_bars: Mapping[str, object] | None = None,
     include_component_pullbacks: bool = False,
     combined_geometry_payload: bool = True,
     n_r: int = 51,
@@ -5279,6 +5365,28 @@ def realtime_geometry_payload_pullback_result(
             *tuple(component_bars[component_name]),
         )
 
+    # Component reports add payload RHS rows, whereas the native coefficient
+    # route currently represents the total transport-support transpose only.
+    # Pad those diagnostic-only component rows with zeros so the raw-block
+    # bridge retains its one-RHS-per-payload-row contract.
+    if native_vmec_face_coefficient_bars is not None and support_component_names:
+        native_vmec_face_coefficient_bars = jax.tree_util.tree_map(
+            lambda value: jnp.concatenate(
+                (
+                    jnp.asarray(value),
+                    jnp.zeros(
+                        (
+                            len(geometry_pullback_payload_bars) - len(tuple(support_bars)),
+                        )
+                        + jnp.asarray(value).shape[1:],
+                        dtype=jnp.asarray(value).dtype,
+                    ),
+                ),
+                axis=0,
+            ),
+            native_vmec_face_coefficient_bars,
+        )
+
     geometry_gradient_result = geometry_payload_pullback_from_param_vector_raw_block_transpose(
         geometry_context,
         baseline_geometry_deltas,
@@ -5295,6 +5403,7 @@ def realtime_geometry_payload_pullback_result(
         progress_label=progress_label,
         return_branch_gradients=bool(return_branch_gradients),
         raw_block_solve=raw_block_solve,
+        native_vmec_face_coefficient_bars=native_vmec_face_coefficient_bars,
     )
     geometry_gradient_result = jax.block_until_ready(geometry_gradient_result)
     objective_count = int(len(tuple(support_bars)))
@@ -5352,6 +5461,7 @@ def realtime_geometry_transport_reverse_table_from_payload_cotangents(
     geometry_param_specs: Sequence[tuple[str, int, int]],
     support_bars: Sequence[object],
     support_component_bars_by_name: Mapping[str, Sequence[object]] | None = None,
+    native_vmec_face_coefficient_bars: Mapping[str, object] | None = None,
     include_component_pullbacks: bool = False,
     combined_geometry_payload: bool = True,
     n_r: int = 51,
@@ -5373,6 +5483,7 @@ def realtime_geometry_transport_reverse_table_from_payload_cotangents(
         geometry_param_specs=geometry_param_specs,
         support_bars=support_bars,
         support_component_bars_by_name=support_component_bars_by_name,
+        native_vmec_face_coefficient_bars=native_vmec_face_coefficient_bars,
         include_component_pullbacks=include_component_pullbacks,
         combined_geometry_payload=combined_geometry_payload,
         n_r=n_r,
