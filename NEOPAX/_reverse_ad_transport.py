@@ -2718,7 +2718,7 @@ def reverse_initial_carry_from_state_with_static_setup(
                 operand=None,
             )
 
-            def _zero_lagged_bar():
+            def _zero_lagged_bar(_):
                 return _radau_align_tangent_tree_to_primal(
                     None, initial_lagged_response
                 )

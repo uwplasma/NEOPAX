@@ -2143,3 +2143,10 @@ shared-total-bar algebra gate
 CPU with no transport rollout, profile, or filesystem output (`1 passed`,
 2026-08-25). A remote full reverse/FD comparison is still required before
 this opt-in selector can be considered validated for the benchmark.
+
+**First remote selection attempt:** the new mode reached the post-sweep
+adapter after completing all four reverse segments, then stopped before the
+native joint hook because its zero RHS-lagged `lax.cond` branch had a
+zero-argument signature. The branch now accepts the required operand. This is
+a control-flow wiring fix only; it does not change either cotangent formula or
+the established modes. Re-run the same remote command after updating NEOPAX.
