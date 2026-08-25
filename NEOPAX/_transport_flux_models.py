@@ -7111,6 +7111,7 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         native_compact_residual_ntx_rhs: bool = False,
         reuse_joint_moment_drds_jvp: bool = False,
         return_native_vmec_coefficient_bars: bool = False,
+        native_vmec_coefficient_bars_only: bool = False,
         stream_native_compact_energy: bool = False,
         return_case_bars: bool = False,
         include_second_direction_base_prepared: bool = True,
@@ -7132,6 +7133,10 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         if return_native_vmec_coefficient_bars and not native_factorized_ntx_rhs:
             raise ValueError(
                 "Native VMEC coefficient bars require the native matrix-RHS NTX helper."
+            )
+        if native_vmec_coefficient_bars_only and not return_native_vmec_coefficient_bars:
+            raise ValueError(
+                "native_vmec_coefficient_bars_only requires native VMEC coefficient bars."
             )
         helper_name = (
             "solve_prepared_coefficient_vector_lowdot_two_pullbacks_"
@@ -7280,6 +7285,9 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                 # is reduced before crossing this local boundary.
                 helper_kwargs["_compact_result"] = True
                 helper_kwargs["return_vmec_coefficient_bars"] = True
+                helper_kwargs["native_vmec_coefficient_bars_only"] = bool(
+                    native_vmec_coefficient_bars_only
+                )
             if (
                 native_factorized_ntx_rhs
                 or native_compact_ntx_rhs
@@ -7728,6 +7736,7 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         vth_a,
         field_bars,
         return_case_bars: bool = False,
+        native_vmec_coefficient_bars_only: bool = False,
     ):
         """Return the validated native support bar plus VMEC coefficient bars.
 
@@ -7747,6 +7756,7 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             native_factorized_ntx_rhs=True,
             reuse_joint_moment_drds_jvp=True,
             return_native_vmec_coefficient_bars=True,
+            native_vmec_coefficient_bars_only=native_vmec_coefficient_bars_only,
             return_case_bars=return_case_bars,
             include_second_direction_base_prepared=False,
         )
