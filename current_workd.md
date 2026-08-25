@@ -1883,3 +1883,13 @@ call, so NTX does not invoke its alternative `er_hat / transport_psi_scale`
 path.  It must therefore remain zero in the strict replacement-contract
 gate; adding a native bar for it would be dead graph payload, not a missing
 derivative.
+
+Current repair under test: the native combined low-dot helper previously
+projected its base, epsilon-directional, and nu-directional primitive bars to
+VMEC coefficients separately, then added the three coefficient pytrees.  The
+strict complete-contract gate found a `b_cos` mismatch of about `9.8e-6` on a
+value of about `55`, despite each isolated base/directional gate passing.
+The helper now sums those three primitive-bar dictionaries first and executes
+one sampled-field/Fourier transpose.  This mirrors the combined prepared VJP
+contraction order and removes two duplicate VMEC reverse projections without
+changing the NTX primal, forward-direction solves, or implicit adjoints.
