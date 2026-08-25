@@ -30,6 +30,7 @@ from NEOPAX._geometry_autodiff import (
     _ntx_runtime_channel_payload_bars,
 )
 from NEOPAX._reverse_ad_transport import (
+    _initial_lagged_response_joint_state_and_support_pullback,
     _merge_rebuild_ntx_channels_into_generic_payload_bar,
     _objective_vector_vjp_rows,
     _take_batched_pytree_row,
@@ -228,6 +229,49 @@ def test_take_batched_pytree_row_slices_dataclass_leaves():
         face_prepared=jnp.asarray([12.0]),
     )
     _assert_float_tree_allclose(actual, expected)
+
+
+def test_initial_joint_lagged_pullback_retains_rhs_induced_support_bar():
+    """The initial support bar must use cache plus initial-RHS lagged bars."""
+
+    # Small exact analogue of the initial-carry graph:
+    # lagged = 2 * state + 3 * support; rhs = 5 * lagged;
+    # carry = (state + rhs, lagged-cache).  The carry cotangent reaches the
+    # lagged response through both the cache and RHS paths.
+    state = jnp.asarray([0.4, -0.7])
+    support = jnp.asarray([1.1, -0.2])
+    carry_y_bar = jnp.asarray([0.6, -0.3])
+    cache_bar = jnp.asarray([-0.4, 0.9])
+
+    def carry_from_state_and_support(state_value, support_value):
+        lagged = 2.0 * state_value + 3.0 * support_value
+        return state_value + 5.0 * lagged, lagged
+
+    _, full_pullback = jax.vjp(carry_from_state_and_support, state, support)
+    expected_state_bar, expected_support_bar = full_pullback((carry_y_bar, cache_bar))
+    rhs_lagged_bar = 5.0 * carry_y_bar
+
+    def joint_pullback(flat_y, total_lagged_bars, support_payload):
+        del flat_y, support_payload
+        return 2.0 * total_lagged_bars, 3.0 * total_lagged_bars
+
+    joint_state_bar, joint_support_bar = (
+        _initial_lagged_response_joint_state_and_support_pullback(
+            flat_y=state,
+            cache_lagged_bars=cache_bar,
+            rhs_lagged_bars=rhs_lagged_bar,
+            support_payload=support,
+            joint_pullback=joint_pullback,
+        )
+    )
+    # Add the direct carry-to-state contribution, as the real initial-carry
+    # reverse does before its lagged-response transpose.
+    joint_state_bar = joint_state_bar + carry_y_bar
+    assert jnp.allclose(joint_state_bar, expected_state_bar, rtol=1e-12, atol=1e-12)
+    assert jnp.allclose(joint_support_bar, expected_support_bar, rtol=1e-12, atol=1e-12)
+
+    # The present split support-only path would omit this real contribution.
+    assert not jnp.allclose(3.0 * cache_bar, expected_support_bar)
 
 
 def test_native_vmec_coefficient_tangent_contraction_matches_vjp_duality():
@@ -1021,6 +1065,124 @@ def test_native_vmec_face_rebuild_er_drds_chain_matches_local_response_vjp(
         assert jnp.allclose(
             native_er[rhs_index], expected_er, rtol=1e-10, atol=1e-12
         ), component_name
+
+
+def test_native_joint_local_multi_rhs_matches_explicit_state_support_vjp():
+    """Native joint local bars equal explicit state/prepared VJPs per RHS.
+
+    This is the numerical gate for the unselected initial-carry adapter.  It
+    deliberately stops at one prepared system: there is no support build,
+    interpolation, Radau step, VMEC solve, profile, or filesystem output.
+    The Python loops are oracle-only; the implementation under test receives
+    the complete on-device RHS batch at once.
+    """
+
+    model = _small_runtime_model(n_energy=2)
+    object.__setattr__(model, "er_v_floor", None)
+    object.__setattr__(
+        model,
+        "species",
+        Species(
+            number_species=2,
+            species_indices=jnp.asarray([0, 1]),
+            mass_mp=jnp.asarray([2.0, 5.446e-4]),
+            charge_qp=jnp.asarray([1.0, -1.0]),
+            names=("ion", "e"),
+        ),
+    )
+    _surface, prepared = _small_vmec_prepared()
+    drds_value = jnp.asarray(1.2)
+    er_value = jnp.asarray(-2.7e-3)
+    temperature_local = jnp.asarray([1.4, 1.1])
+    density_local = jnp.asarray([0.9, 0.9])
+    collisionality_kind = _collisionality_kind("default")
+    rhs_fields = (
+        jnp.asarray([0.17, -0.23]),
+        jnp.asarray(
+            [[0.3, -0.2, 0.1, 0.4, -0.1, 0.2],
+             [-0.1, 0.2, 0.3, -0.4, 0.5, -0.2]]
+        ),
+        jnp.asarray(
+            [[-0.3, 0.1, 0.2, -0.2, 0.3, -0.1],
+             [0.4, -0.3, 0.2, 0.1, -0.5, 0.3]]
+        ),
+        jnp.asarray(
+            [[0.2, 0.4, -0.3, 0.1, 0.2, -0.4],
+             [-0.2, 0.3, 0.4, -0.1, 0.2, 0.5]]
+        ),
+    )
+    # Species is the leading axis expected by the local joint helper; RHS is
+    # next, and remains the matrix dimension passed to NTX.
+    field_bars = tuple(
+        jnp.stack((values, -0.7 * values), axis=0) for values in rhs_fields
+    )
+    actual = (
+        model._pullback_interpolated_moment_response_local_fields_and_prepared_support_and_drds_flat_prepared(
+            prepared,
+            drds_value=drds_value,
+            er_value=er_value,
+            temperature_local=temperature_local,
+            density_local=density_local,
+            collisionality_kind=collisionality_kind,
+            field_bars=field_bars,
+            native_factorized_ntx_rhs=True,
+            reuse_joint_moment_drds_jvp=True,
+        )
+    )
+
+    def _add_trees(*trees):
+        return jax.tree_util.tree_map(lambda *leaves: sum(leaves), *trees)
+
+    rhs_count = int(field_bars[0].shape[1])
+    expected_rows = []
+    for rhs_index in range(rhs_count):
+        species_rows = []
+        for species_index in range(int(model.species.number_species)):
+            def _local_response(
+                prepared_value,
+                drds_local,
+                er_local,
+                temperature_value,
+                density_value,
+            ):
+                return model._build_interpolated_moment_response_local(
+                    prepared_value,
+                    drds_value=drds_local,
+                    species_index=species_index,
+                    er_value=er_local,
+                    temperature_local=temperature_value,
+                    density_local=density_value,
+                    vthermal_local=get_v_thermal(model.species.mass, temperature_value),
+                    collisionality_kind=collisionality_kind,
+                )
+
+            _, pullback = jax.vjp(
+                _local_response,
+                prepared,
+                drds_value,
+                er_value,
+                temperature_local,
+                density_local,
+            )
+            species_rows.append(
+                pullback(tuple(field[species_index, rhs_index] for field in field_bars))
+            )
+        expected_rows.append(_add_trees(*species_rows))
+
+    expected_prepared = jax.tree_util.tree_map(
+        lambda *leaves: jnp.stack(leaves),
+        *(row[0] for row in expected_rows),
+    )
+    expected_state = tuple(
+        jnp.stack([row[index] for row in expected_rows])
+        for index in range(1, 5)
+    )
+    _assert_float_tree_allclose(actual[:4], expected_state, rtol=1e-9, atol=1e-11)
+    _assert_float_tree_allclose(
+        actual[4], tuple(jax.tree_util.tree_leaves(expected_prepared)),
+        rtol=1e-9,
+        atol=1e-11,
+    )
 
 
 def test_native_vmec_face_rebuild_accumulation_matches_generic_prepared_vjp():

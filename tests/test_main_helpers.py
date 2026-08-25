@@ -610,6 +610,88 @@ def test_scalar_joint_local_pullback_mock_matches_existing_state_pullback():
     assert jnp.allclose(joint_bars[4][0], jnp.asarray([10.0, 11.0]))
 
 
+def test_native_joint_local_adapter_keeps_objective_rhs_inside_ntx_mock():
+    """The native joint adapter calls NTX once per species, not per RHS.
+
+    This is intentionally a pure mocked layout gate.  It verifies the only
+    structural property needed before a remote numerical oracle: the local
+    helper receives a species-major, objective-batched field cotangent and
+    returns objective-major state/support bars.  No NTX solve, transport
+    rollout, device compilation, or file output is involved.
+    """
+    model = NTXExactLijRuntimeTransportModel(
+        species=types.SimpleNamespace(number_species=2, mass=jnp.asarray([1.0, 2.0])),
+        energy_grid=types.SimpleNamespace(v_norm=jnp.asarray([1.0])),
+        geometry=object(),
+        vmec_file=None,
+        boozer_file=None,
+    )
+    calls = []
+    object.__setattr__(
+        model,
+        "_interpolated_moment_local_scan_primitives",
+        lambda **_kwargs: (jnp.asarray([1.0]), jnp.asarray([2.0]), jnp.asarray(3.0)),
+    )
+
+    def _native_support_only(_prepared, *, field_bars, **_kwargs):
+        calls.append(tuple(jnp.asarray(value).shape for value in field_bars))
+        rhs_count = field_bars[0].shape[0]
+        rhs = jnp.arange(rhs_count, dtype=jnp.float64)
+        return (
+            {"coefficient": jnp.stack((rhs + 1.0, rhs + 2.0), axis=1)},
+            rhs + 0.5,
+            None,
+            (
+                jnp.broadcast_to((rhs + 2.0)[:, None], (rhs_count, 1)),
+                jnp.broadcast_to((rhs + 3.0)[:, None], (rhs_count, 1)),
+                rhs + 4.0,
+            ),
+        )
+
+    object.__setattr__(
+        model,
+        "_pullback_interpolated_moment_prepared_support_and_drds_only_multi_rhs",
+        _native_support_only,
+    )
+    object.__setattr__(
+        model,
+        "_pullback_local_scan_inputs_and_drds_from_primitives",
+        lambda *, reference_nu_hat_bar, reference_epsi_hat_bar, vth_a_bar, **_kwargs: (
+            5.0 * reference_nu_hat_bar[:, 0],
+            7.0 * reference_epsi_hat_bar[:, 0],
+            11.0 * vth_a_bar,
+            13.0 * vth_a_bar,
+        ),
+    )
+    rhs_count = 3
+    field_bars = tuple(
+        jnp.arange(2 * rhs_count * 2, dtype=jnp.float64).reshape(2, rhs_count, 2)
+        for _ in range(4)
+    )
+    result = model._pullback_interpolated_moment_response_local_fields_and_prepared_support_and_drds_flat_prepared(
+        {"coefficient": jnp.asarray([0.0, 0.0])},
+        drds_value=jnp.asarray(1.0),
+        er_value=jnp.asarray(2.0),
+        temperature_local=jnp.asarray([3.0, 4.0]),
+        density_local=jnp.asarray([5.0, 6.0]),
+        collisionality_kind="none",
+        field_bars=field_bars,
+        native_factorized_ntx_rhs=True,
+        reuse_joint_moment_drds_jvp=True,
+    )
+    # ``vmap`` traces the species body once.  Its native field argument still
+    # has the complete RHS leading axis, proving objective batching was not
+    # placed outside NTX.
+    assert calls == [((rhs_count, 2),) * 4]
+    drds_bar, er_bar, temperature_bar, density_bar, prepared_leaves = result
+    rhs = jnp.arange(rhs_count, dtype=jnp.float64)
+    assert jnp.allclose(drds_bar, 2.0 * (5.0 * (rhs + 2.0) + rhs + 0.5))
+    assert jnp.allclose(er_bar, 2.0 * 7.0 * (rhs + 3.0))
+    assert jnp.allclose(temperature_bar, 2.0 * 11.0 * (rhs + 4.0))
+    assert jnp.allclose(density_bar, 2.0 * 13.0 * (rhs + 4.0))
+    assert prepared_leaves[0].shape == (rhs_count, 2)
+
+
 def test_joint_lowdot_scalar_rhs_layout_does_not_hide_rhs_axis_from_anchor_scan():
     """Reject a merely relocated objective ``vmap`` as a compile optimisation.
 

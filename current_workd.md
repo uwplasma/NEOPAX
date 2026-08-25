@@ -2020,3 +2020,100 @@ unvalidated boundary is the Radau segment carrier/rebuild split or contraction
 of the accumulated native face-coefficient bars against the traceable
 VMEC-state tangent.  If it fails, the mismatch is inside the native custom
 low-dot coefficient rule for radially varying VMEC surfaces.
+
+### Next work: joint initial-carry reverse (2026-08-25)
+
+The current post-sweep initial work is structurally split despite sharing the
+same initial lagged response:
+
+1. `initial_cache_support_pullback` applies the batched support transpose to
+   `reduced_bars.lagged_response_cache`, producing support/geometry bars.
+2. The initial-carry custom VJP first adds the cache cotangent to the
+   lagged-response cotangent induced by the initial Radau RHS/stage bars, then
+   pulls that total only to the initial state.
+
+This means the support transpose sees only one part of the total lagged
+cotangent while the state route separately traverses the same initial
+lagged-response dependency.  The measured costs are approximately 137 s and
+138 s, whereas the forward initial-carry construction is about 28 s.
+
+Plan:
+
+1. Define a small, in-memory joint-contract oracle.  Given initial state,
+   support, cache bars, and RHS-induced lagged bars, it must reproduce the
+   VJP of an explicit state-and-support initial-carry function.  It must use no rollout,
+   profiler, dump, or temporary output.
+2. Add an opt-in initial-carry custom rule that exposes the **total** lagged
+   cotangent once, then applies one batched NTX support transpose and derives
+   the accompanying state bar from the same local response rule.
+3. Keep the existing initial-cache mode and every rebuild selector untouched.
+   The new route is selected independently and falls back to the established
+   path by default.
+4. Add separate timers for (a) RHS-to-lagged cotangent formation, (b) the
+   shared initial lagged transpose, and (c) state/support result assembly.
+   A remote benchmark is permitted only after the small equality oracle
+   passes.
+
+The essential constraint is that this may not merely wrap the current two
+large pullbacks: that would preserve both NTX graphs and can increase compile
+time and RAM.  The shared primitive must be below the split, at the initial
+lagged-response pullback boundary.
+
+**Follow-up audit correction:** the required joint primitive already exists.
+`_flat_rhs_build_state_and_support_pullback_batched_interpolated_faces_factory`
+wraps `pullback_build_lagged_response_state_and_support_payload_...`, which
+returns both batched state bars and support bars from a single local NTX
+implicit-adjoint construction.  The segment implementation can select this
+hook, but the post-sweep initial-carry path does not: its custom VJP uses the
+state-only `lagged_pullback_fn`, while `initial_cache_support_pullback` calls
+the support-only hook separately.  Therefore the next change is not a new
+NTX rule.  It is an initial-carry-specific adapter which exposes the total
+initial lagged cotangent (`cache bar + RHS/stage-induced lagged bar`) to this
+existing joint hook and then routes its two outputs to the existing state and
+support accumulators.  This is the only route worth implementing; it avoids
+the previous failed wide-joint graph by reusing the already bounded local
+joint adapter.
+
+**Three-pass feasibility audit:** this adapter is not yet usable for the
+current validated fast selector.  The existing joint hooks cover only the
+generic/reuse-local-VJP support variants.  The selected fast route,
+`ntx_batched_interpolated_faces_native_multi_rhs_reuse_moment_drds_jvp_`
+`shared_primal_with_vmec_coefficients`, exposes a support-only multi-RHS
+contract; it has no corresponding joint state-and-support hook.  Routing the
+initial carry through an existing generic joint hook would therefore change
+the selected NTX algebra and could reproduce the compile/RAM regressions seen
+for previous joint segment selectors.
+
+Also, the current split path sends the total lagged cotangent to the
+state-only pullback, but sends only the explicit cache cotangent to the
+support-only pullback.  A mathematically complete joint rule would add the
+initial-RHS-induced support contribution.  It must be compared against a
+generic state-and-support VJP before it can be called an optimisation of the
+validated reference.  The next safe implementation step is consequently a
+small native multi-RHS joint-adapter oracle, not benchmark wiring.
+
+**Implementation status (2026-08-25):** the native joint local helper now
+keeps the objective axis inside the NTX matrix-RHS call. The first draft was
+incorrect because it still wrapped that helper in an outer objective `vmap`;
+that would have constructed scalar NTX pullbacks and could not deliver the
+intended factor reuse. The corrected path transposes only
+`(objective, species, ...) -> (species, objective, ...)` at the local anchor
+boundary, while preserving objective-major output bars. It remains unselected
+and is not wired into the initial-carry reverse yet.
+
+The local CPU gate
+`test_native_joint_local_adapter_keeps_objective_rhs_inside_ntx_mock` passed
+on 2026-08-25 (`1 passed, 33 deselected`, 10.13 s). It is a mocked in-memory
+layout/contract test: it proves one native call receives all RHS per species
+and that output state/support bars retain the objective axis. It does not run
+an NTX solve or a transport rollout. The next required gate is a compact
+state-and-support numerical oracle suitable for the remote machine; do not
+select the new hook before that equality check passes.
+
+**Numerical gate prepared, not run locally:**
+`test_native_joint_local_multi_rhs_matches_explicit_state_support_vjp` compares
+the new two-species/two-RHS native local joint output (prepared, `drds`, Er,
+temperature, and density bars) to explicit per-species/per-RHS `jax.vjp` calls
+of the same local response. It has no transport rollout or filesystem side
+effects, but does execute real NTX solves. Per the local-test constraint it
+must run only on the remote test machine, not WSL.

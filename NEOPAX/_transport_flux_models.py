@@ -8130,6 +8130,8 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         field_bars,
         packed_support_directional_adjoint: bool = False,
         return_primal_response: bool = False,
+        native_factorized_ntx_rhs: bool = False,
+        reuse_joint_moment_drds_jvp: bool = False,
     ):
         """Joint local pullback, returning prepared-support leaves unflattened.
 
@@ -8155,21 +8157,44 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                     collisionality_kind=collisionality_kind,
                 )
             )
-            (
-                reference_nu_hat_bar,
-                reference_epsi_hat_bar,
-                vth_a_bar,
-                prepared_bar,
-                direct_drds_bar,
-            ) = self._pullback_interpolated_moment_reduced_local_outputs_with_prepared_support_and_drds(
-                prepared,
-                drds_value=drds_value,
-                reference_nu_hat=reference_nu_hat,
-                reference_epsi_hat=reference_epsi_hat,
-                vth_a=vth_a,
-                field_bars=species_field_bars,
-                packed_support_directional_adjoint=packed_support_directional_adjoint,
-            )
+            if native_factorized_ntx_rhs:
+                (
+                    prepared_bar,
+                    direct_drds_bar,
+                    _primal_response,
+                    (
+                        reference_nu_hat_bar,
+                        reference_epsi_hat_bar,
+                        vth_a_bar,
+                    ),
+                ) = self._pullback_interpolated_moment_prepared_support_and_drds_only_multi_rhs(
+                    prepared,
+                    drds_value=drds_value,
+                    reference_nu_hat=reference_nu_hat,
+                    reference_epsi_hat=reference_epsi_hat,
+                    vth_a=vth_a,
+                    field_bars=species_field_bars,
+                    native_factorized_ntx_rhs=True,
+                    reuse_joint_moment_drds_jvp=reuse_joint_moment_drds_jvp,
+                    return_case_bars=True,
+                    include_second_direction_base_prepared=False,
+                )
+            else:
+                (
+                    reference_nu_hat_bar,
+                    reference_epsi_hat_bar,
+                    vth_a_bar,
+                    prepared_bar,
+                    direct_drds_bar,
+                ) = self._pullback_interpolated_moment_reduced_local_outputs_with_prepared_support_and_drds(
+                    prepared,
+                    drds_value=drds_value,
+                    reference_nu_hat=reference_nu_hat,
+                    reference_epsi_hat=reference_epsi_hat,
+                    vth_a=vth_a,
+                    field_bars=species_field_bars,
+                    packed_support_directional_adjoint=packed_support_directional_adjoint,
+                )
             (
                 implicit_drds_bar,
                 er_bar,
@@ -11833,6 +11858,8 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         packed_support_directional_adjoint: bool = False,
         reuse_local_vjp_primal_anchor_response: bool = False,
         compact_prepared_support_carry: bool = False,
+        native_factorized_ntx_rhs: bool = False,
+        reuse_joint_moment_drds_jvp: bool = False,
     ):
         """Joint exact transpose of interpolated face state and NTX support.
 
@@ -12015,19 +12042,47 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             density_local = jax.lax.dynamic_index_in_dim(
                 face_density, radius_index, axis=1, keepdims=False
             )
-            local_pullback = jax.vmap(
-                lambda one_field_bars: self._pullback_interpolated_moment_response_local_fields_and_prepared_support_and_drds_flat_prepared(
-                    prepared,
-                    drds_value=drds_value,
-                    er_value=er_value,
-                    temperature_local=temperature_local,
-                    density_local=density_local,
-                    collisionality_kind=collisionality_kind,
-                    field_bars=one_field_bars,
-                    packed_support_directional_adjoint=packed_support_directional_adjoint,
-                    return_primal_response=reuse_local_vjp_primal_anchor_response,
+            if native_factorized_ntx_rhs:
+                # ``local_field_bars`` is objective-major here.  Preserve
+                # that entire RHS matrix through the native NTX helper: an
+                # outer objective ``vmap`` would trace one scalar NTX
+                # pullback per objective and defeat both the factor reuse and
+                # the purpose of this separate initial-carry path.  The local
+                # helper is species-major, so transpose only those two batch
+                # axes; its returned state/support bars remain objective-major.
+                native_local_field_bars = tuple(
+                    jnp.swapaxes(field_bar, 0, 1)
+                    for field_bar in local_field_bars
                 )
-            )(local_field_bars)
+                local_pullback = (
+                    self._pullback_interpolated_moment_response_local_fields_and_prepared_support_and_drds_flat_prepared(
+                        prepared,
+                        drds_value=drds_value,
+                        er_value=er_value,
+                        temperature_local=temperature_local,
+                        density_local=density_local,
+                        collisionality_kind=collisionality_kind,
+                        field_bars=native_local_field_bars,
+                        packed_support_directional_adjoint=packed_support_directional_adjoint,
+                        return_primal_response=reuse_local_vjp_primal_anchor_response,
+                        native_factorized_ntx_rhs=True,
+                        reuse_joint_moment_drds_jvp=reuse_joint_moment_drds_jvp,
+                    )
+                )
+            else:
+                local_pullback = jax.vmap(
+                    lambda one_field_bars: self._pullback_interpolated_moment_response_local_fields_and_prepared_support_and_drds_flat_prepared(
+                        prepared,
+                        drds_value=drds_value,
+                        er_value=er_value,
+                        temperature_local=temperature_local,
+                        density_local=density_local,
+                        collisionality_kind=collisionality_kind,
+                        field_bars=one_field_bars,
+                        packed_support_directional_adjoint=packed_support_directional_adjoint,
+                        return_primal_response=reuse_local_vjp_primal_anchor_response,
+                    )
+                )(local_field_bars)
             (
                 drds_local_bar,
                 er_local_bar,
@@ -12035,11 +12090,17 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                 density_local_bar,
                 prepared_local_bar_leaves,
             ) = local_pullback[:5]
-            local_response = (
-                jax.tree_util.tree_map(lambda leaf: leaf[0], local_pullback[5])
-                if reuse_local_vjp_primal_anchor_response
-                else None
-            )
+            if reuse_local_vjp_primal_anchor_response:
+                # The generic route has an outer objective axis and all
+                # primal responses are identical, whereas the native route
+                # above intentionally has no such axis.
+                local_response = (
+                    local_pullback[5]
+                    if native_factorized_ntx_rhs
+                    else jax.tree_util.tree_map(lambda leaf: leaf[0], local_pullback[5])
+                )
+            else:
+                local_response = None
             # Match the established scalar state transpose: the axis anchor
             # has a regularized response representation and contributes only
             # through its explicit reference-Er channel, not through a local
@@ -12292,6 +12353,29 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             support,
             reuse_local_vjp_primal_anchor_response=True,
             compact_prepared_support_carry=True,
+            **kwargs,
+        )
+
+    def pullback_build_lagged_response_state_and_support_payload_batched_interpolated_faces_native_multi_rhs_reuse_moment_drds_jvp_shared_primal(
+        self,
+        state,
+        lagged_response_bars,
+        support,
+        **kwargs,
+    ):
+        """Native matrix-RHS joint state/support transpose for initial carry.
+
+        This is intentionally separate from the established generic joint
+        selectors.  It reuses the native support helper's returned case bars
+        to form state bars, so it does not request a second NTX solve.
+        """
+
+        return self.pullback_build_lagged_response_state_and_support_payload_batched_interpolated_faces(
+            state,
+            lagged_response_bars,
+            support,
+            native_factorized_ntx_rhs=True,
+            reuse_joint_moment_drds_jvp=True,
             **kwargs,
         )
 

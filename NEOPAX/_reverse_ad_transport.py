@@ -199,6 +199,31 @@ def _take_batched_pytree_row(tree, row_index: int):
     )
 
 
+def _initial_lagged_response_joint_state_and_support_pullback(
+    *,
+    flat_y,
+    cache_lagged_bars,
+    rhs_lagged_bars,
+    support_payload,
+    joint_pullback,
+):
+    """Apply one joint lagged-response transpose to the total initial bar.
+
+    The initial carry has two paths into its lagged response: its explicit
+    cache cotangent and the cotangent induced by the initial Radau RHS/stage
+    values.  The joint NTX hook must receive their sum; splitting them drops
+    the latter's support/geometry contribution or rebuilds the same local
+    transpose twice.
+    """
+
+    total_lagged_bars = jax.tree_util.tree_map(
+        lambda cache_bar, rhs_bar: cache_bar + rhs_bar,
+        cache_lagged_bars,
+        rhs_lagged_bars,
+    )
+    return joint_pullback(flat_y, total_lagged_bars, support_payload)
+
+
 TransportReverseReport = Mapping[str, object]
 TransportReverseReportRunner = Callable[[], TransportReverseReport]
 TransportReverseSupportSegmentExecutor = Callable[[object, bool], TransportReverseReport]
