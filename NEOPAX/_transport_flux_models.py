@@ -1309,10 +1309,16 @@ class CombinedTransportFluxModel(TransportFluxModelBase):
         compact_prepared_support_carry = bool(
             kwargs.pop("compact_prepared_support_carry", False)
         )
+        native_multi_rhs_reuse_moment_drds_jvp_shared_primal = bool(
+            kwargs.pop("native_multi_rhs_reuse_moment_drds_jvp_shared_primal", False)
+        )
         pullback_fn = getattr(
             self.neoclassical_model,
             (
                 "pullback_build_lagged_response_state_and_support_payload_"
+                "batched_interpolated_faces_native_multi_rhs_reuse_moment_drds_jvp_shared_primal"
+                if native_multi_rhs_reuse_moment_drds_jvp_shared_primal
+                else "pullback_build_lagged_response_state_and_support_payload_"
                 "batched_interpolated_faces_reuse_local_vjp_primal_compact_prepared_carry"
                 if compact_prepared_support_carry
                 else (
@@ -1369,6 +1375,28 @@ class CombinedTransportFluxModel(TransportFluxModelBase):
             classical_state_bars,
         )
         return state_bars, support_bars
+
+    def pullback_build_lagged_response_state_and_support_payload_batched_interpolated_faces_native_multi_rhs_reuse_moment_drds_jvp_shared_primal(
+        self,
+        state,
+        lagged_response_bars,
+        support,
+        **kwargs,
+    ):
+        """Forward the isolated native matrix-RHS joint pullback.
+
+        This is deliberately a separate entry point for the post-sweep
+        initial-carry experiment. Existing rebuild selectors continue to use
+        their established generic joint hooks.
+        """
+
+        return self.pullback_build_lagged_response_state_and_support_payload_batched_interpolated_faces(
+            state,
+            lagged_response_bars,
+            support,
+            native_multi_rhs_reuse_moment_drds_jvp_shared_primal=True,
+            **kwargs,
+        )
 
     def pullback_build_lagged_response_state_and_support_payload_batched_interpolated_faces_reuse_local_vjp_primal(
         self,

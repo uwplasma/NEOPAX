@@ -2117,3 +2117,29 @@ temperature, and density bars) to explicit per-species/per-RHS `jax.vjp` calls
 of the same local response. It has no transport rollout or filesystem side
 effects, but does execute real NTX solves. Per the local-test constraint it
 must run only on the remote test machine, not WSL.
+
+**Joint-hook propagation status:** the validated native local joint helper is
+now exposed separately through `CombinedTransportFluxModel`,
+`ComposedEquationSystem`, and the flattened solver physics context. The
+existing rebuild selectors do not select it. The pure forwarding gate
+`test_combined_native_joint_lagged_pullback_selects_native_hook_only` passed
+on 2026-08-25 (`1 passed, 29 deselected`, 8.54 s). The remaining work is to
+replace the post-sweep pair of initial-cache support and initial-state
+pullbacks with a single manual initial-carry adapter that passes the total
+lagged cotangent to this hook.
+
+**Initial joint adapter implementation (2026-08-25):** a new, unselected
+`reverse_initial_cache_support_pullback_mode` value,
+`ntx_native_joint_state_and_support`, now constructs the initial carry through
+the same primal path but retains a private manual reverse closure. After the
+segmented sweep it forms the exact total initial lagged cotangent
+`cache + RHS/stage-induced`, calls the existing native multi-RHS joint hook
+once, and accumulates its state and support results together. The legacy
+`scalar` and `ntx_batched_interpolated_faces` initial modes retain their exact
+existing benchmark-local VJP and support-only code paths; the benchmark
+delegates to the new core adapter only for the explicit new selector. The
+shared-total-bar algebra gate
+`test_initial_joint_lagged_pullback_retains_rhs_induced_support_bar` passed on
+CPU with no transport rollout, profile, or filesystem output (`1 passed`,
+2026-08-25). A remote full reverse/FD comparison is still required before
+this opt-in selector can be considered validated for the benchmark.

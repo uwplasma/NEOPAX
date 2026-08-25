@@ -185,6 +185,7 @@ from NEOPAX._reverse_ad_transport import (  # noqa: E402
     realtime_geometry_transport_reverse_support_segment_executor,
     realtime_geometry_transport_reverse_diagnostic_gradient_entries,
     realtime_geometry_transport_reverse_metadata_entries,
+    reverse_initial_carry_from_state_with_static_setup as _core_reverse_initial_carry_from_state_with_static_setup,
     transport_reverse_table_report_entries,
 )
 from NEOPAX._transport_flux_models import (  # noqa: E402
@@ -919,8 +920,23 @@ def _reverse_initial_carry_from_state_with_static_setup(
     solve_vector_field,
     species,
     prepared_rollout_static,
+    return_native_joint_pullback: bool = False,
 ):
     """Build the initial carry with a reverse-local model-aware lagged pullback."""
+
+    # Preserve the benchmark's legacy local custom-VJP exactly for every
+    # established selector.  Only the new explicit opt-in uses the core
+    # adapter, which exposes the joint state/support result unavailable from
+    # a normal ``jax.vjp`` closure over state alone.
+    if return_native_joint_pullback:
+        return _core_reverse_initial_carry_from_state_with_static_setup(
+            solver=solver,
+            state=state,
+            solve_vector_field=solve_vector_field,
+            species=species,
+            prepared_rollout_static=prepared_rollout_static,
+            return_native_joint_pullback=True,
+        )
 
     temperature_active_mask, fixed_temperature_profile = _extract_fixed_temperature_projection(solve_vector_field)
     density_floor, temperature_floor = _extract_state_regularization(solve_vector_field)
@@ -5430,13 +5446,20 @@ def main() -> None:
     )
     parser.add_argument(
         "--reverse-initial-cache-support-pullback-mode",
-        choices=("scalar", "ntx_batched_interpolated_faces"),
+        choices=(
+            "scalar",
+            "ntx_batched_interpolated_faces",
+            "ntx_native_joint_state_and_support",
+        ),
         default="scalar",
         help=(
             "Initial lagged-cache support transpose. 'scalar' preserves the reference "
             "lax.map path. 'ntx_batched_interpolated_faces' is an exact, opt-in "
             "multi-objective NTX face-interpolation transpose; it is limited to the "
-            "realtime interpolate_from_faces configuration and has no scalar fallback."
+            "realtime interpolate_from_faces configuration and has no scalar fallback. "
+            "'ntx_native_joint_state_and_support' is a separate opt-in path that "
+            "uses one native multi-RHS initial lagged transpose for both state and "
+            "support cotangents."
         ),
     )
     parser.add_argument(

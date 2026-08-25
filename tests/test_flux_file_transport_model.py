@@ -697,6 +697,34 @@ def test_combined_joint_lagged_pullback_preserves_submodel_state_bars():
     assert jnp.allclose(state_bars_without_classical, 8.0 * bars)
 
 
+def test_combined_native_joint_lagged_pullback_selects_native_hook_only():
+    """The initial-carry native hook is isolated from existing joint modes."""
+
+    class NativeJointModel:
+        def pullback_build_lagged_response_state_and_support_payload_batched_interpolated_faces_native_multi_rhs_reuse_moment_drds_jvp_shared_primal(
+            self, state, response_bars, support, **kwargs
+        ):
+            assert kwargs["packed_support_directional_adjoint"] is False
+            del state
+            return 3.0 * response_bars, 5.0 * support
+
+    model = CombinedTransportFluxModel(
+        neoclassical_model=NativeJointModel(),
+        turbulent_model=None,
+        classical_model=None,
+    )
+    bars = jnp.asarray([2.0, -1.0])
+    state_bars, support_bars = (
+        model.pullback_build_lagged_response_state_and_support_payload_batched_interpolated_faces_native_multi_rhs_reuse_moment_drds_jvp_shared_primal(
+            jnp.asarray(1.0),
+            CombinedTransportLaggedResponse(bars, None, None),
+            jnp.asarray(4.0),
+        )
+    )
+    assert jnp.allclose(state_bars, 3.0 * bars)
+    assert jnp.allclose(support_bars, jnp.asarray(20.0))
+
+
 def test_combined_batched_primal_reuse_support_pullback_delegates_to_neoclassical():
     class Neoclassical:
         def pullback_build_lagged_response_support_payload_batched_interpolated_faces_reuse_local_vjp_primal(

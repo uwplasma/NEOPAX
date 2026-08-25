@@ -2371,6 +2371,7 @@ def reverse_initial_carry_from_state_with_static_setup(
     solve_vector_field,
     species,
     prepared_rollout_static,
+    return_native_joint_pullback: bool = False,
 ):
     """Build the initial carry with the validated reverse-local lagged pullback."""
 
@@ -2625,7 +2626,168 @@ def reverse_initial_carry_from_state_with_static_setup(
         (state_bar,) = state_pullback(flat_bar)
         return (state_bar,)
 
+    def _native_joint_batched_pullback(residual, carry_bars, support_payload):
+        """Manual initial-carry reverse using one batched state/support hook.
+
+        This private closure is intentionally available only through the
+        opt-in return path below.  It mirrors the established custom-VJP
+        algebra until the initial lagged-response dependency, then replaces
+        that state-only pullback with the native joint state/support hook.
+        """
+
+        state_value, flat_state0, lagged_state0, initial_lagged_response = residual
+        if initial_lagged_response is None:
+            raise NotImplementedError(
+                "Native joint initial-carry pullback requires an initial lagged response."
+            )
+        joint_pullback = getattr(
+            physics_context,
+            "flat_rhs_build_state_and_support_pullback_batched_interpolated_faces_"
+            "native_multi_rhs_reuse_moment_drds_jvp_shared_primal",
+            None,
+        )
+        if joint_pullback is None:
+            raise NotImplementedError(
+                "Native joint initial-carry pullback requires the native flattened "
+                "state/support hook."
+            )
+        _, unpack_flat, _unpack_packed, _pack_state, project_flat = _make_solver_state_transform(
+            state_value,
+            species,
+            temperature_active_mask=temperature_active_mask,
+            fixed_temperature_profile=fixed_temperature_profile,
+            density_floor=density_floor,
+            temperature_floor=temperature_floor,
+        )
+
+        def _tree_max_abs(tree):
+            values = []
+            for leaf in jax.tree_util.tree_leaves(tree):
+                arr = jnp.asarray(leaf)
+                if arr.dtype == jax.dtypes.float0:
+                    continue
+                if jnp.issubdtype(arr.dtype, jnp.number):
+                    values.append(jnp.max(jnp.abs(arr)))
+            if not values:
+                return jnp.asarray(0.0, dtype=flat_state0.dtype)
+            return jnp.max(jnp.stack([jnp.asarray(value, dtype=flat_state0.dtype) for value in values]))
+
+        def _one_direct_and_lagged_bar(carry_bar):
+            direct_flat_bar = (
+                jnp.asarray(carry_bar.y) + jnp.asarray(carry_bar.lagged_reference_y)
+            )
+            prev_stages_bar = jnp.asarray(carry_bar.prev_stages).reshape(
+                (kernel_context.num_stages, -1)
+            )
+            rhs_bar = jnp.sum(prev_stages_bar, axis=0)
+
+            def _zero_flat_bar():
+                return jnp.zeros_like(flat_state0)
+
+            def _rhs_state_pullback_fallback(lagged_response_value):
+                def _rhs_from_flat(flat_value):
+                    return _radau_eval_rhs(
+                        initial_carry_static.t,
+                        flat_value,
+                        lagged_response_value,
+                        physics_context.flat_rhs,
+                        physics_context.flat_rhs_with_lagged_response,
+                    )
+
+                _, rhs_pullback = jax.vjp(_rhs_from_flat, flat_state0)
+                return rhs_pullback(rhs_bar)[0]
+
+            def _nonzero_rhs_state_pullback(_):
+                if physics_context.flat_rhs_state_pullback is not None:
+                    rhs_flat_bar_value = physics_context.flat_rhs_state_pullback(
+                        initial_carry_static.t,
+                        flat_state0,
+                        initial_lagged_response,
+                        rhs_bar,
+                    )
+                    if project_flat is not None:
+                        _, project_pullback = jax.vjp(project_flat, flat_state0)
+                        rhs_flat_bar_value = project_pullback(rhs_flat_bar_value)[0]
+                    return rhs_flat_bar_value
+                return _rhs_state_pullback_fallback(initial_lagged_response)
+
+            direct_flat_bar = direct_flat_bar + jax.lax.cond(
+                _tree_max_abs(rhs_bar) > 0.0,
+                _nonzero_rhs_state_pullback,
+                lambda _: _zero_flat_bar(),
+                operand=None,
+            )
+
+            def _zero_lagged_bar():
+                return _radau_align_tangent_tree_to_primal(
+                    None, initial_lagged_response
+                )
+
+            def _nonzero_rhs_lagged_pullback(_):
+                if physics_context.flat_rhs_lagged_response_pullback is not None:
+                    return physics_context.flat_rhs_lagged_response_pullback(
+                        initial_carry_static.t,
+                        flat_state0,
+                        initial_lagged_response,
+                        rhs_bar,
+                    )
+
+                def _rhs_from_flat_and_lagged(flat_value, lagged_value):
+                    return _radau_eval_rhs(
+                        initial_carry_static.t,
+                        flat_value,
+                        lagged_value,
+                        physics_context.flat_rhs,
+                        physics_context.flat_rhs_with_lagged_response,
+                    )
+
+                _, rhs_pullback = jax.vjp(
+                    _rhs_from_flat_and_lagged,
+                    flat_state0,
+                    initial_lagged_response,
+                )
+                return rhs_pullback(rhs_bar)[1]
+
+            rhs_lagged_bar = jax.lax.cond(
+                _tree_max_abs(rhs_bar) > 0.0,
+                _nonzero_rhs_lagged_pullback,
+                _zero_lagged_bar,
+                operand=None,
+            )
+            return direct_flat_bar, rhs_lagged_bar
+
+        direct_flat_bars, rhs_lagged_bars = jax.vmap(
+            _one_direct_and_lagged_bar
+        )(carry_bars)
+        lagged_flat_bars, support_bars = (
+            _initial_lagged_response_joint_state_and_support_pullback(
+                flat_y=flat_state0,
+                cache_lagged_bars=carry_bars.lagged_response_cache,
+                rhs_lagged_bars=rhs_lagged_bars,
+                support_payload=support_payload,
+                joint_pullback=joint_pullback,
+            )
+        )
+        if project_flat is not None:
+            _, project_pullback = jax.vjp(project_flat, flat_state0)
+            lagged_flat_bars = jax.vmap(project_pullback)(lagged_flat_bars)[0]
+        total_flat_bars = direct_flat_bars + lagged_flat_bars
+        _, state_pullback = jax.vjp(_flat_state_from_state, state_value)
+        state_bars = jax.vmap(lambda flat_bar: state_pullback(flat_bar)[0])(
+            total_flat_bars
+        )
+        return state_bars, support_bars
+
     _build_initial_carry.defvjp(_build_initial_carry_fwd, _build_initial_carry_bwd)
+    if return_native_joint_pullback:
+        carry0, residual = _build_initial_carry_fwd(state)
+
+        def _pullback(carry_bars, support_payload):
+            return _native_joint_batched_pullback(
+                residual, carry_bars, support_payload
+            )
+
+        return carry0, _pullback
     return _build_initial_carry(state)
 
 
@@ -3252,11 +3414,39 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
             prepared_rollout_static=reverse_setup.prepared_rollout,
         )
 
+    initial_cache_support_pullback_mode = str(
+        getattr(
+            reverse_setup.execution_context.physics_context,
+            "reverse_initial_cache_support_pullback_mode",
+            "scalar",
+        )
+    ).strip().lower()
+    use_native_joint_initial_carry_pullback = (
+        initial_cache_support_pullback_mode
+        == "ntx_native_joint_state_and_support"
+    )
     phase_start = time.perf_counter()
-    initial_carry, initial_state_pullback = jax.vjp(_carry_from_state, initial_state)
+    if use_native_joint_initial_carry_pullback:
+        initial_carry, initial_state_pullback = (
+            dependencies.reverse_initial_carry_from_state_with_static_setup(
+                solver=reverse_setup.solver,
+                state=initial_state,
+                solve_vector_field=reverse_setup.solve_vector_field,
+                species=runtime.species,
+                prepared_rollout_static=reverse_setup.prepared_rollout,
+                return_native_joint_pullback=True,
+            )
+        )
+        initial_carry_vjp_label = "native joint forward"
+    else:
+        initial_carry, initial_state_pullback = jax.vjp(
+            _carry_from_state, initial_state
+        )
+        initial_carry_vjp_label = "vjp"
     initial_carry = jax.block_until_ready(initial_carry)
     print(
-        f"{progress_prefix} progress: support reverse initial carry vjp ready "
+        f"{progress_prefix} progress: support reverse initial carry "
+        f"{initial_carry_vjp_label} ready "
         f"elapsed_s={time.perf_counter() - phase_start:.3f}",
         flush=True,
     )
@@ -4159,14 +4349,11 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
 
     initial_lagged_response_valid = bool(np.asarray(jax.device_get(carry0.lagged_response_valid)))
     build_support_pullback = reverse_setup.execution_context.physics_context.flat_rhs_build_support_pullback
-    initial_cache_support_pullback_mode = str(
-        getattr(
-            reverse_setup.execution_context.physics_context,
-            "reverse_initial_cache_support_pullback_mode",
-            "scalar",
-        )
-    ).strip().lower()
-    if initial_cache_support_pullback_mode not in {"scalar", "ntx_batched_interpolated_faces"}:
+    if initial_cache_support_pullback_mode not in {
+        "scalar",
+        "ntx_batched_interpolated_faces",
+        "ntx_native_joint_state_and_support",
+    }:
         raise ValueError(
             "Unknown reverse_initial_cache_support_pullback_mode "
             f"{initial_cache_support_pullback_mode!r}."
@@ -4176,9 +4363,30 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
         "full_initial_cache_support_pullback",
         "initial_cache_support_pullback",
     }
+    if use_native_joint_initial_carry_pullback and not initial_lagged_response_valid:
+        raise RuntimeError(
+            "ntx_native_joint_state_and_support requires a valid initial "
+            "lagged response."
+        )
+    if use_native_joint_initial_carry_pullback and getattr(
+        reverse_setup.execution_context.physics_context,
+        "flat_rhs_build_state_and_support_pullback_batched_interpolated_faces_"
+        "native_multi_rhs_reuse_moment_drds_jvp_shared_primal",
+        None,
+    ) is None:
+        raise RuntimeError(
+            "ntx_native_joint_state_and_support was requested, but the active "
+            "transport physics context does not expose the native joint "
+            "state/support pullback."
+        )
     initial_cache_pullback_used = False
     initial_cache_pullback_skipped = False
-    if initial_lagged_response_valid and build_support_pullback is not None and allow_initial_cache_support_pullback:
+    if (
+        initial_lagged_response_valid
+        and build_support_pullback is not None
+        and allow_initial_cache_support_pullback
+        and not use_native_joint_initial_carry_pullback
+    ):
         phase_start = time.perf_counter()
         with _reverse_profile_scope(
             reverse_setup, "reverse_post_sweep/initial_cache_support_pullback"
@@ -4228,7 +4436,11 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
             f"mode={initial_cache_support_pullback_mode}",
             flush=True,
         )
-    elif initial_lagged_response_valid and build_support_pullback is not None:
+    elif (
+        initial_lagged_response_valid
+        and build_support_pullback is not None
+        and not use_native_joint_initial_carry_pullback
+    ):
         initial_cache_pullback_skipped = True
 
     def _full_carry_bar_from_reduced(reduced_bar):
@@ -4249,12 +4461,47 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
     )
     phase_start = time.perf_counter()
     with _reverse_profile_scope(reverse_setup, "reverse_post_sweep/initial_state_pullback"):
-        initial_state_bars = jax.vmap(
-            lambda carry0_bar: initial_state_pullback(carry0_bar)[0]
-        )(carry0_bars)
-    initial_state_bars = jax.block_until_ready(initial_state_bars)
+        if use_native_joint_initial_carry_pullback:
+            if not allow_initial_cache_support_pullback:
+                raise ValueError(
+                    "ntx_native_joint_state_and_support requires the full initial "
+                    "cache support pullback cotangent mode."
+                )
+            initial_state_bars, initial_joint_support_bars = initial_state_pullback(
+                carry0_bars,
+                support_payload,
+            )
+        else:
+            initial_state_bars = jax.vmap(
+                lambda carry0_bar: initial_state_pullback(carry0_bar)[0]
+            )(carry0_bars)
+            initial_joint_support_bars = None
+    if initial_joint_support_bars is not None:
+        initial_state_bars, initial_joint_support_bars = jax.block_until_ready(
+            (initial_state_bars, initial_joint_support_bars)
+        )
+        initial_joint_support_bar_leaves = jax.tree_util.tree_leaves(
+            initial_joint_support_bars
+        )
+        support_bar_leaves = tuple(
+            accumulated + increment
+            for accumulated, increment in zip(
+                support_bar_leaves, initial_joint_support_bar_leaves
+            )
+        )
+        initial_cache_support_bar_leaves_accum = tuple(
+            accumulated + increment
+            for accumulated, increment in zip(
+                initial_cache_support_bar_leaves_accum,
+                initial_joint_support_bar_leaves,
+            )
+        )
+        initial_cache_pullback_used = True
+    else:
+        initial_state_bars = jax.block_until_ready(initial_state_bars)
     print(
-        f"{progress_prefix} progress: support reverse initial state pullback ready "
+        f"{progress_prefix} progress: support reverse initial "
+        f"{'joint state/support' if initial_joint_support_bars is not None else 'state'} pullback ready "
         f"elapsed_s={time.perf_counter() - phase_start:.3f}",
         flush=True,
     )

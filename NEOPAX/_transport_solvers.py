@@ -1081,6 +1081,7 @@ def _lagged_response_build_state_and_support_pullback_batched_interpolated_faces
     *,
     reuse_local_vjp_primal: bool = False,
     compact_prepared_support_carry: bool = False,
+    native_multi_rhs_reuse_moment_drds_jvp_shared_primal: bool = False,
 ):
     owner = getattr(vector_field, "__self__", None)
     if owner is None:
@@ -1089,6 +1090,9 @@ def _lagged_response_build_state_and_support_pullback_batched_interpolated_faces
         owner,
         (
             "pullback_build_lagged_response_state_and_support_payload_"
+            "batched_interpolated_faces_native_multi_rhs_reuse_moment_drds_jvp_shared_primal"
+            if native_multi_rhs_reuse_moment_drds_jvp_shared_primal
+            else "pullback_build_lagged_response_state_and_support_payload_"
             "batched_interpolated_faces_reuse_local_vjp_primal_compact_prepared_carry"
             if compact_prepared_support_carry
             else (
@@ -1583,12 +1587,16 @@ def _flat_rhs_build_state_and_support_pullback_batched_interpolated_faces_factor
     packed_support_directional_adjoint: bool = False,
     reuse_local_vjp_primal: bool = False,
     compact_prepared_support_carry: bool = False,
+    native_multi_rhs_reuse_moment_drds_jvp_shared_primal: bool = False,
 ):
     """Flatten the exact joint NTX rebuild state/support pullback hook."""
     pullback_fn = _lagged_response_build_state_and_support_pullback_batched_interpolated_faces_hook(
         vector_field,
         reuse_local_vjp_primal=reuse_local_vjp_primal,
         compact_prepared_support_carry=compact_prepared_support_carry,
+        native_multi_rhs_reuse_moment_drds_jvp_shared_primal=(
+            native_multi_rhs_reuse_moment_drds_jvp_shared_primal
+        ),
     )
     if pullback_fn is None:
         return None
@@ -3800,6 +3808,7 @@ class _RadauAcceptedStepPhysicsContext:
     flat_rhs_build_state_and_support_pullback_batched_interpolated_faces: Callable[[Any, Any, Any], Any] | None = None
     flat_rhs_build_state_and_support_pullback_batched_interpolated_faces_reuse_local_vjp_primal: Callable[[Any, Any, Any], Any] | None = None
     flat_rhs_build_state_and_support_pullback_batched_interpolated_faces_reuse_local_vjp_primal_compact_prepared_carry: Callable[[Any, Any, Any], Any] | None = None
+    flat_rhs_build_state_and_support_pullback_batched_interpolated_faces_native_multi_rhs_reuse_moment_drds_jvp_shared_primal: Callable[[Any, Any, Any], Any] | None = None
     flat_rhs_lagged_response_support_pullback: Callable[[Any, Any, Any, Any, Any], Any] | None = None
     flat_rhs_lagged_response_all_pullback: Callable[[Any, Any, Any, Any, Any], tuple[Any, Any, Any]] | None = None
     flat_rhs_state_pullback: Callable[[Any, Any, Any, Any], Any] | None = None
@@ -17626,6 +17635,17 @@ def _build_prepared_radau_accepted_rollout(
             compact_prepared_support_carry=True,
         )
     )
+    flat_rhs_build_state_and_support_pullback_batched_interpolated_faces_native_multi_rhs_reuse_moment_drds_jvp_shared_primal = (
+        _flat_rhs_build_state_and_support_pullback_batched_interpolated_faces_factory(
+            unravel=unpack_flat,
+            pack_flat=pack_state,
+            vector_field=vector_field,
+            args=args,
+            kwargs=kwargs,
+            project_flat=project_flat,
+            native_multi_rhs_reuse_moment_drds_jvp_shared_primal=True,
+        )
+    )
     flat_rhs_lagged_response_support_pullback = _flat_rhs_lagged_response_support_pullback_factory(
         unravel=unpack_flat,
         vector_field=vector_field,
@@ -17967,6 +17987,9 @@ def _build_prepared_radau_accepted_rollout(
         flat_rhs_build_state_and_support_pullback_batched_interpolated_faces_reuse_local_vjp_primal_compact_prepared_carry=(
             flat_rhs_build_state_and_support_pullback_batched_interpolated_faces_reuse_local_vjp_primal_compact_prepared_carry
         ),
+        flat_rhs_build_state_and_support_pullback_batched_interpolated_faces_native_multi_rhs_reuse_moment_drds_jvp_shared_primal=(
+            flat_rhs_build_state_and_support_pullback_batched_interpolated_faces_native_multi_rhs_reuse_moment_drds_jvp_shared_primal
+        ),
         flat_rhs_lagged_response_support_pullback=flat_rhs_lagged_response_support_pullback,
         flat_rhs_lagged_response_all_pullback=flat_rhs_lagged_response_all_pullback,
         flat_rhs_state_pullback=flat_rhs_state_pullback,
@@ -18250,6 +18273,17 @@ class RADAUSolver(_RadauSolverConfig):
                 project_flat=project_flat,
                 reuse_local_vjp_primal=True,
                 compact_prepared_support_carry=True,
+            )
+        )
+        flat_rhs_build_state_and_support_pullback_batched_interpolated_faces_native_multi_rhs_reuse_moment_drds_jvp_shared_primal = (
+            _flat_rhs_build_state_and_support_pullback_batched_interpolated_faces_factory(
+                unravel=unpack_flat,
+                pack_flat=pack_state,
+                vector_field=vector_field,
+                args=args,
+                kwargs=kwargs,
+                project_flat=project_flat,
+                native_multi_rhs_reuse_moment_drds_jvp_shared_primal=True,
             )
         )
         flat_rhs_lagged_response_support_pullback = _flat_rhs_lagged_response_support_pullback_factory(
@@ -18586,6 +18620,9 @@ class RADAUSolver(_RadauSolverConfig):
             ),
             flat_rhs_build_state_and_support_pullback_batched_interpolated_faces_reuse_local_vjp_primal_compact_prepared_carry=(
                 flat_rhs_build_state_and_support_pullback_batched_interpolated_faces_reuse_local_vjp_primal_compact_prepared_carry
+            ),
+            flat_rhs_build_state_and_support_pullback_batched_interpolated_faces_native_multi_rhs_reuse_moment_drds_jvp_shared_primal=(
+                flat_rhs_build_state_and_support_pullback_batched_interpolated_faces_native_multi_rhs_reuse_moment_drds_jvp_shared_primal
             ),
             flat_rhs_lagged_response_support_pullback=flat_rhs_lagged_response_support_pullback,
             flat_rhs_lagged_response_all_pullback=flat_rhs_lagged_response_all_pullback,

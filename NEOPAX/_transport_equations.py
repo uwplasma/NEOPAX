@@ -2289,6 +2289,9 @@ class ComposedEquationSystem:
         local NTX implicit-adjoint construction; this wrapper only translates
         the working-state and realtime-geometry payload boundaries.
         """
+        native_multi_rhs_reuse_moment_drds_jvp_shared_primal = bool(
+            kwargs.pop("native_multi_rhs_reuse_moment_drds_jvp_shared_primal", False)
+        )
         support, geometry = self._split_realtime_geometry_payload(support)
         working_state, _eidx = self._prepare_working_state(state)
         flux_response_bars = None if lagged_response_bars is None else lagged_response_bars.flux_response
@@ -2298,7 +2301,13 @@ class ComposedEquationSystem:
             )
         pullback_fn = getattr(
             self.shared_flux_model,
-            "pullback_build_lagged_response_state_and_support_payload_batched_interpolated_faces",
+            (
+                "pullback_build_lagged_response_state_and_support_payload_"
+                "batched_interpolated_faces_native_multi_rhs_reuse_moment_drds_jvp_shared_primal"
+                if native_multi_rhs_reuse_moment_drds_jvp_shared_primal
+                else "pullback_build_lagged_response_state_and_support_payload_"
+                "batched_interpolated_faces"
+            ),
             None,
         )
         if not callable(pullback_fn):
@@ -2329,6 +2338,23 @@ class ComposedEquationSystem:
             )
         )(flux_response_bars)
         return state_bars, {"ntx_support": ntx_support_bar, "geometry": geometry_bar}
+
+    def pullback_build_lagged_response_state_and_support_payload_batched_interpolated_faces_native_multi_rhs_reuse_moment_drds_jvp_shared_primal(
+        self,
+        state,
+        lagged_response_bars,
+        support,
+        **kwargs,
+    ):
+        """Forward the native joint pullback without changing rebuild modes."""
+
+        return self.pullback_build_lagged_response_state_and_support_payload_batched_interpolated_faces(
+            state,
+            lagged_response_bars,
+            support,
+            native_multi_rhs_reuse_moment_drds_jvp_shared_primal=True,
+            **kwargs,
+        )
 
     def pullback_build_lagged_response_state_and_support_payload_batched_interpolated_faces_reuse_local_vjp_primal(
         self,
