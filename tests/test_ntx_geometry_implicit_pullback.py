@@ -172,10 +172,12 @@ def test_native_vmec_coefficient_tangent_contraction_matches_vjp_duality():
     coefficient_bars = (
         jnp.asarray([[0.2, -0.4], [0.7, 0.1], [-0.3, 0.5]]),
         jnp.asarray([[[0.1, 0.2], [-0.5, 0.3]], [[0.4, -0.2], [0.6, 0.1]], [[-0.3, 0.7], [0.2, -0.6]]]),
+        jnp.asarray([0.6, -0.2, 0.9]),
     )
     coefficient_tangents = (
         jnp.asarray([1.5, -0.8]),
         jnp.asarray([[0.3, -0.1], [0.9, 0.2]]),
+        jnp.asarray(1.7),
     )
     actual = _native_vmec_coefficient_tangent_contraction(
         coefficient_bars, coefficient_tangents
@@ -184,6 +186,7 @@ def test_native_vmec_coefficient_tangent_contraction_matches_vjp_duality():
         [
             jnp.vdot(coefficient_bars[0][row], coefficient_tangents[0])
             + jnp.vdot(coefficient_bars[1][row], coefficient_tangents[1])
+            + jnp.vdot(coefficient_bars[2][row], coefficient_tangents[2])
             for row in range(3)
         ]
     )

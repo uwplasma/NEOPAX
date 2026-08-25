@@ -1893,3 +1893,12 @@ The helper now sums those three primitive-bar dictionaries first and executes
 one sampled-field/Fourier transpose.  This mirrors the combined prepared VJP
 contraction order and removes two duplicate VMEC reverse projections without
 changing the NTX primal, forward-direction solves, or implicit adjoints.
+
+Result of the first gate: this reduction-order change did **not** satisfy the
+strict complete-contract equality.  It moved the synthetic `b_cos` result
+only from `55.13340248` to `55.13340163`, while the generic prepared VJP is
+`55.13339269` (about `1.6e-7` relative).  Do not use this small discrepancy to
+justify a transport benchmark or relax the strict gate.  It predates `b0` and
+is far too small to explain the material RBC/ZBS transport-row discrepancy;
+the next audit must isolate the three low-dot components at the actual fused
+fields and separately verify the newly restored `b0` state chain.
