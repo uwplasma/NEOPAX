@@ -18,7 +18,10 @@ from NEOPAX._transport_solvers import (
     _flat_rhs_build_support_pullback_batched_interpolated_faces_factory,
     _radau_prepare_lagged_response_with_compact_coefficient_record,
 )
-from NEOPAX._geometry_autodiff import _ntx_runtime_channel_payload_bars
+from NEOPAX._geometry_autodiff import (
+    _native_vmec_coefficient_tangent_contraction,
+    _ntx_runtime_channel_payload_bars,
+)
 from NEOPAX._reverse_ad_transport import (
     _merge_rebuild_ntx_channels_into_generic_payload_bar,
     _objective_vector_vjp_rows,
@@ -161,6 +164,30 @@ def test_grouped_objective_vjp_rows_match_scalar_objective_gradients():
     )
     assert jnp.allclose(values, objective_vector(primal), rtol=1e-12, atol=1e-12)
     assert jnp.allclose(grouped_bars, expected_bars, rtol=1e-12, atol=1e-12)
+
+
+def test_native_vmec_coefficient_tangent_contraction_matches_vjp_duality():
+    """The compact tangent term equals the corresponding coefficient VJP dot."""
+
+    coefficient_bars = (
+        jnp.asarray([[0.2, -0.4], [0.7, 0.1], [-0.3, 0.5]]),
+        jnp.asarray([[[0.1, 0.2], [-0.5, 0.3]], [[0.4, -0.2], [0.6, 0.1]], [[-0.3, 0.7], [0.2, -0.6]]]),
+    )
+    coefficient_tangents = (
+        jnp.asarray([1.5, -0.8]),
+        jnp.asarray([[0.3, -0.1], [0.9, 0.2]]),
+    )
+    actual = _native_vmec_coefficient_tangent_contraction(
+        coefficient_bars, coefficient_tangents
+    )
+    expected = jnp.asarray(
+        [
+            jnp.vdot(coefficient_bars[0][row], coefficient_tangents[0])
+            + jnp.vdot(coefficient_bars[1][row], coefficient_tangents[1])
+            for row in range(3)
+        ]
+    )
+    assert jnp.allclose(actual, expected, rtol=1e-12, atol=1e-12)
 
 
 def test_native_vmec_bridge_forwards_bridge_only_flag_to_local_ntx_helper():

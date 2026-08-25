@@ -4755,6 +4755,43 @@ def _ntx_runtime_channel_payload_bars(support_bars: Sequence[object]) -> tuple[t
     )
 
 
+def _native_vmec_coefficient_tangent_contraction(
+    native_bars: Sequence[object],
+    coefficient_tangents: Sequence[object],
+):
+    """Contract batched native coefficient bars with one state tangent.
+
+    ``native_bars`` has a leading objective/RHS axis; coefficient tangents do
+    not. This is the forward-tangent dual of the native coefficient VJP used
+    by the raw-state fallback, and lets the compact VMEC parameter-tangent
+    route retain the same contribution without materializing state bars.
+    """
+
+    if len(native_bars) != len(coefficient_tangents):
+        raise ValueError("Native VMEC bar/tangent tuple lengths must match.")
+    if not native_bars:
+        raise ValueError("Native VMEC coefficient tangent contraction requires bars.")
+    rhs_count = int(jnp.asarray(native_bars[0]).shape[0])
+    result = jnp.zeros((rhs_count,), dtype=jnp.asarray(native_bars[0]).dtype)
+    for coefficient_bars, coefficient_tangent in zip(
+        native_bars, coefficient_tangents, strict=True
+    ):
+        coefficient_bars = jnp.asarray(coefficient_bars)
+        coefficient_tangent = jnp.asarray(coefficient_tangent)
+        if coefficient_bars.ndim < 2:
+            raise ValueError("Native VMEC coefficient bars need RHS and coefficient axes.")
+        if coefficient_bars.shape[1:] != coefficient_tangent.shape:
+            raise ValueError(
+                "Native VMEC coefficient bar/tangent shapes must agree after the RHS axis: "
+                f"got {coefficient_bars.shape} and {coefficient_tangent.shape}."
+            )
+        result = result + jnp.sum(
+            coefficient_bars * coefficient_tangent[None, ...],
+            axis=tuple(range(1, coefficient_bars.ndim)),
+        )
+    return result
+
+
 def geometry_payload_pullback_from_param_vector_raw_block_transpose(
     context: GeometryAutodiffContext,
     param_deltas,
@@ -5418,6 +5455,52 @@ def geometry_payload_pullback_from_param_vector_raw_block_transpose(
         support_bars = tuple(payload_bar["ntx_support"] for payload_bar in payload_bars)
         geometry_setup = _payload_branch_pullback_setup("geometry", geometry_from_state, geometry_bars)
         support_setup = _payload_branch_pullback_setup("ntx_support", ntx_support_from_state, support_bars)
+        native_bar_tuple = None
+        if native_vmec_face_coefficient_bars is not None:
+            native_names = (
+                "b_cos",
+                "jacobian_cos",
+                "b_sub_theta_cos",
+                "b_sub_zeta_cos",
+                "b_sup_theta_cos",
+                "b_sup_zeta_cos",
+            )
+            missing_native_names = tuple(
+                name for name in native_names if name not in native_vmec_face_coefficient_bars
+            )
+            if missing_native_names:
+                raise ValueError(
+                    "native_vmec_face_coefficient_bars is missing "
+                    f"{missing_native_names}."
+                )
+            native_bar_tuple = tuple(
+                jnp.asarray(native_vmec_face_coefficient_bars[name])
+                for name in native_names
+            )
+            native_rhs_count = int(native_bar_tuple[0].shape[0])
+            if native_rhs_count != len(payload_bars):
+                raise ValueError(
+                    "native VMEC coefficient RHS count must match payload bars: "
+                    f"got {native_rhs_count}, expected {len(payload_bars)}."
+                )
+            for name, bars in zip(native_names, native_bar_tuple, strict=True):
+                if bars.ndim < 2:
+                    raise ValueError(
+                        f"native VMEC coefficient bars for {name} need RHS and face axes."
+                    )
+
+        def _native_coefficient_tangent_contraction(state_tangent):
+            if native_bar_tuple is None:
+                return jnp.zeros((len(payload_bars),), dtype=jnp.float64)
+            _, native_coefficient_tangents = jax.jvp(
+                _native_vmec_face_coefficients_from_state,
+                (state,),
+                (state_tangent,),
+            )
+            return _native_vmec_coefficient_tangent_contraction(
+                native_bar_tuple,
+                native_coefficient_tangents,
+            )
         if not param_entries:
             return jnp.zeros((len(payload_bars), 0), dtype=jnp.float64)
         param_tangent_batch = _implicit_param_tangent_batch()
@@ -5434,6 +5517,7 @@ def geometry_payload_pullback_from_param_vector_raw_block_transpose(
             return (
                 geometry_setup["tangent_contraction"](state_tangent)
                 + support_setup["tangent_contraction"](state_tangent)
+                + _native_coefficient_tangent_contraction(state_tangent)
             )
 
         gradient_columns = jax.lax.map(
@@ -5442,19 +5526,17 @@ def geometry_payload_pullback_from_param_vector_raw_block_transpose(
         )
         if progress_label is not None:
             print(
-                f"{progress_label} compact_payload_tangent_contract=True",
+                f"{progress_label} compact_payload_tangent_contract=True "
+                f"native_vmec_coefficient_tangent_contract={native_bar_tuple is not None}",
                 flush=True,
             )
         return jnp.swapaxes(gradient_columns, 0, 1)
 
-    # The compact payload contraction only knows support-payload leaves.  The
-    # isolated native coefficient bars live outside that tree, so selecting
-    # the experimental bridge must use the raw-block state transpose below.
-    streamed_gradient_matrix = (
-        None
-        if native_vmec_face_coefficient_bars is not None
-        else _try_compact_payload_tangent_contract_to_param_matrix()
-    )
+    # Native face-coefficient bars are contracted against the same implicit
+    # state tangents as the ordinary payload leaves. This keeps the bridge on
+    # the compact tangent route and avoids materializing the large VMEC
+    # state-bar batch used by the raw transpose fallback.
+    streamed_gradient_matrix = _try_compact_payload_tangent_contract_to_param_matrix()
     if streamed_gradient_matrix is not None:
         if progress_label is not None:
             arr = np.asarray(jax.device_get(streamed_gradient_matrix))
