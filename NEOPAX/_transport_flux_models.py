@@ -11587,6 +11587,8 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                     or return_native_vmec_coefficient_bars
                 ):
                     local_kwargs["return_case_bars"] = True
+                if return_native_vmec_coefficient_bars:
+                    local_kwargs["native_vmec_coefficient_bars_only"] = True
                 local_result = local_support_pullback(
                     prepared,
                     drds_value=drds_value,

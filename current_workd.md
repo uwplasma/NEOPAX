@@ -1771,10 +1771,20 @@ separate:
 ntx_batched_interpolated_faces_native_multi_rhs_reuse_moment_drds_jvp_shared_primal_with_vmec_coefficients
 ```
 
-It uses the same grouped low-dot NTX solve/factorization and the same normal
-support transpose as the current `reuse_moment_drds_jvp_shared_primal` mode;
-the only added path is the post-NTX coefficient-to-VMEC-state VJP.  Existing
-modes and defaults are untouched.  The next action is one remote all-objective
-AD/FD comparison using this selector.  Compare its table to the established
-`reuse_moment_drds_jvp_shared_primal` table before treating the approximately
-`1e-7` small-fixture discrepancy as acceptable.
+It uses the same grouped low-dot NTX solve/factorization as the current
+`reuse_moment_drds_jvp_shared_primal` mode.  Its payload reverse is now split:
+the generic VJP carries only runtime channels, while the native VMEC
+coefficient bars replace the entire `face_prepared` branch.  This is the
+required substitution for reducing the generic prepared-system compile/RAM
+graph; it must never add both contributions. The special NTX helper now also
+has a bridge-only return: it still forms the same grouped matrix-RHS adjoints
+and native coefficient bars, but omits the generic prepared-gradient
+contraction and returns a shape-compatible zero prepared payload to preserve
+the current Radau ABI. Existing modes and defaults are untouched.
+
+Next: run the small one-/three-RHS NTX gate confirming that bridge-only bars
+match the regular native coefficient output and that its prepared payload is
+zero. Then run the NEOPAX structural channel-only gate. Only after those pass,
+use the isolated remote selector for AD/FD and compile/RAM measurement. A
+later ABI change can remove the now-zero prepared carrier leaves entirely if
+they remain a material memory cost.

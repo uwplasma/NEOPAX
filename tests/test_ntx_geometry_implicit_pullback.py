@@ -17,6 +17,7 @@ from NEOPAX._transport_solvers import (
     _flat_rhs_build_support_pullback_batched_interpolated_faces_factory,
     _radau_prepare_lagged_response_with_compact_coefficient_record,
 )
+from NEOPAX._geometry_autodiff import _ntx_runtime_channel_payload_bars
 
 
 def _small_runtime_model(n_energy=1):
@@ -63,6 +64,42 @@ def _assert_float_tree_allclose(actual, expected, *, rtol=1e-9, atol=1e-11):
                     f"max_abs={float(jnp.max(difference)):.16e} "
                     f"max_rel={float(jnp.max(difference / scale)):.16e}"
                 )
+
+
+def test_native_vmec_coefficient_bridge_excludes_generic_prepared_cotangents():
+    """The experimental bridge must leave ``face_prepared`` out of its VJP.
+
+    This is deliberately a pure object test: the production state/bar equality
+    needs the VMEX stack, but this gate catches the structural regression that
+    previously staged both the generic prepared transpose and native VMEC
+    coefficient transpose in the same compiled segment.
+    """
+
+    support_bars = (
+        SimpleNamespace(
+            center_channels=(jnp.asarray([1.0]),),
+            face_channels=(jnp.asarray([2.0]),),
+            center_prepared="center-prepared-must-not-pass",
+            face_prepared="face-prepared-must-not-pass",
+        ),
+        SimpleNamespace(
+            center_channels=(jnp.asarray([3.0]),),
+            face_channels=(jnp.asarray([4.0]),),
+            center_prepared="second-center-prepared-must-not-pass",
+            face_prepared="second-face-prepared-must-not-pass",
+        ),
+    )
+
+    actual = _ntx_runtime_channel_payload_bars(support_bars)
+    assert len(actual) == 2
+    _assert_float_tree_allclose(
+        actual,
+        (
+            (support_bars[0].center_channels, support_bars[0].face_channels),
+            (support_bars[1].center_channels, support_bars[1].face_channels),
+        ),
+    )
+    assert "prepared" not in repr(actual).lower()
 
 
 def test_native_multi_rhs_composite_forwarding_hook_is_exposed_to_radau():

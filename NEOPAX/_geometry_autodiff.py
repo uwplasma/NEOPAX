@@ -4740,6 +4740,21 @@ def build_neopax_geometry_and_ntx_exact_lij_support_from_state(
     return {"geometry": geometry, "ntx_support": support}
 
 
+def _ntx_runtime_channel_payload_bars(support_bars: Sequence[object]) -> tuple[tuple[object, object], ...]:
+    """Project support cotangents onto the non-prepared runtime channels.
+
+    The native VMEC-coefficient bridge owns the complete ``face_prepared``
+    transpose.  Keeping this projection separate makes the replacement
+    boundary explicit and prevents a future caller from accidentally staging
+    the generic prepared-system VJP alongside the native coefficient VJP.
+    """
+
+    return tuple(
+        (support_bar.center_channels, support_bar.face_channels)
+        for support_bar in support_bars
+    )
+
+
 def geometry_payload_pullback_from_param_vector_raw_block_transpose(
     context: GeometryAutodiffContext,
     param_deltas,
@@ -4778,10 +4793,10 @@ def geometry_payload_pullback_from_param_vector_raw_block_transpose(
     ``native_vmec_face_coefficient_bars`` is an isolated opt-in bridge for
     NTX's grouped low-dot adjoint.  Its values are batched cotangents of the
     six traceable VMEC surface coefficient arrays at the face sampling used
-    to build ``face_prepared``.  They are pulled back only through that small
-    VMEC-state-to-surface-coefficient map, then appended to the existing
-    raw-block state-bar batch.  This deliberately does not alter the normal
-    payload/support VJP route.
+    to build ``face_prepared``.  In this opt-in route they replace the entire
+    generic prepared-system branch: the normal payload VJP retains only NTX
+    runtime channels, while these bars use the direct coefficient-to-state
+    VJP before the same raw-block transpose.
     """
 
     if not payload_bars:
@@ -4886,6 +4901,66 @@ def geometry_payload_pullback_from_param_vector_raw_block_transpose(
             r00_boozer_surface_sampling=r00_boozer_surface_sampling,
             r00_booz_constants_grids=geometry_booz_constants_grids,
             r00_booz_mode00=geometry_booz_mode00,
+        )
+
+    def ntx_support_channels_from_state(state_inner):
+        """Return only the NTX runtime channels, never ``face_prepared``.
+
+        This is the replacement boundary for the native coefficient route.
+        Its matching coefficient bars already represent the complete
+        ``prepare_monoenergetic_system`` chain, so rebuilding that prepared
+        system in the generic payload VJP would duplicate both its derivative
+        and its compilation graph.
+        """
+
+        geometry_inner = geometry_from_state(state_inner)
+        rho_center = (
+            jnp.asarray(geometry_inner.r_grid, dtype=jnp.float64)
+            / jnp.asarray(geometry_inner.a_b, dtype=jnp.float64)
+        )
+        rho_face = (
+            jnp.asarray(geometry_inner.r_grid_half, dtype=jnp.float64)
+            / jnp.asarray(geometry_inner.a_b, dtype=jnp.float64)
+        )
+        ntx_psia = jnp.asarray(geometry_inner.Psia_value, dtype=jnp.float64) / (2.0 * jnp.pi)
+        rho_center_sample = np.linspace(0.0, 1.0, int(rho_center.shape[0]), dtype=float)
+        if int(rho_face.shape[0]) > 1:
+            rho_face_sample = np.concatenate(
+                [
+                    np.asarray([0.0], dtype=float),
+                    0.5 * (rho_center_sample[:-1] + rho_center_sample[1:]),
+                    np.asarray([1.0], dtype=float),
+                ],
+                axis=0,
+            )
+        else:
+            rho_face_sample = np.asarray([0.0, 1.0], dtype=float)
+        r00_support_rho_np = np.unique(
+            np.concatenate([rho_center_sample, rho_face_sample], axis=0)
+        )
+        r00_support_rho = jnp.asarray(r00_support_rho_np, dtype=jnp.float64)
+        r00_support = _boozer_rmnc00_from_state_at_rho(
+            context,
+            state_inner,
+            r00_support_rho_np,
+            boozer_surface_sampling=r00_boozer_surface_sampling,
+            booz_constants_grids=geometry_booz_constants_grids,
+            booz_mode00=geometry_booz_mode00,
+        )
+        r00_interp = interpax.Interpolator1D(r00_support_rho, r00_support, extrap=True)
+        return (
+            _build_ntx_runtime_channels_from_geometry(
+                geometry_inner,
+                rho=rho_center,
+                psia=ntx_psia,
+                r00=r00_interp(rho_center),
+            ),
+            _build_ntx_runtime_channels_from_geometry(
+                geometry_inner,
+                rho=rho_face,
+                psia=ntx_psia,
+                r00=r00_interp(rho_face),
+            ),
         )
 
     def _native_vmec_face_coefficients_from_state(state_inner):
@@ -5294,11 +5369,22 @@ def geometry_payload_pullback_from_param_vector_raw_block_transpose(
             # the support compile/execution does not overlap the geometry
             # state-bar batch.  This preserves the same cotangent sum and final
             # raw-block transpose while reducing peak device memory.
-            support_state_bar_batch = _state_bar_batch_from_payload_branch(
-                "ntx_support",
-                ntx_support_from_state,
-                support_bars,
-            )
+            if native_vmec_face_coefficient_bars is None:
+                support_state_bar_batch = _state_bar_batch_from_payload_branch(
+                    "ntx_support",
+                    ntx_support_from_state,
+                    support_bars,
+                )
+            else:
+                # Native coefficient bars replace the *entire* prepared
+                # system branch.  Keep only the runtime channels in the
+                # generic VJP, so it cannot stage NTX preparation again.
+                support_channel_bars = _ntx_runtime_channel_payload_bars(support_bars)
+                support_state_bar_batch = _state_bar_batch_from_payload_branch(
+                    "ntx_support_channels",
+                    ntx_support_channels_from_state,
+                    support_channel_bars,
+                )
             geometry_state_bar_batch = _state_bar_batch_from_payload_branch(
                 "geometry",
                 geometry_from_state,
@@ -5311,11 +5397,18 @@ def geometry_payload_pullback_from_param_vector_raw_block_transpose(
             )
             _print_state_bar_batch_finiteness("combined", state_bar_batch)
         else:
-            state_bar_batch = _state_bar_batch_from_payload_branch(
-                "ntx_support",
-                ntx_support_from_state,
-                tuple(payload_bars),
-            )
+            if native_vmec_face_coefficient_bars is None:
+                state_bar_batch = _state_bar_batch_from_payload_branch(
+                    "ntx_support",
+                    ntx_support_from_state,
+                    tuple(payload_bars),
+                )
+            else:
+                state_bar_batch = _state_bar_batch_from_payload_branch(
+                    "ntx_support_channels",
+                    ntx_support_channels_from_state,
+                    _ntx_runtime_channel_payload_bars(tuple(payload_bars)),
+                )
             _print_state_bar_batch_finiteness("combined", state_bar_batch)
 
         if return_branch_gradients and combined_payload:
