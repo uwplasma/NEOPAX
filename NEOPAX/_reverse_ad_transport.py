@@ -137,6 +137,37 @@ def _logical_tree_nbytes(tree: object) -> int:
     return total
 
 
+def _merge_rebuild_ntx_channels_into_generic_payload_bar(
+    generic_payload_bar: Mapping[str, object],
+    rebuild_payload_bar: Mapping[str, object],
+) -> dict[str, object]:
+    """Retain generic prepared bars while adding rebuild runtime channels.
+
+    The native VMEC coefficient bridge supplies only the rebuild
+    ``face_prepared`` contribution. This helper assembles the complementary
+    generic payload for the one ordinary support VJP: its prepared bars are
+    retained verbatim, while both NTX runtime-channel trees receive the
+    rebuild cotangent.
+    """
+
+    generic_ntx = generic_payload_bar["ntx_support"]
+    rebuild_ntx = rebuild_payload_bar["ntx_support"]
+    return {
+        "geometry": generic_payload_bar["geometry"],
+        "ntx_support": dataclasses.replace(
+            generic_ntx,
+            center_channels=_add_float_delta_tree(
+                generic_ntx.center_channels,
+                rebuild_ntx.center_channels,
+            ),
+            face_channels=_add_float_delta_tree(
+                generic_ntx.face_channels,
+                rebuild_ntx.face_channels,
+            ),
+        ),
+    }
+
+
 TransportReverseReport = Mapping[str, object]
 TransportReverseReportRunner = Callable[[], TransportReverseReport]
 TransportReverseSupportSegmentExecutor = Callable[[object, bool], TransportReverseReport]
@@ -4194,12 +4225,62 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
             accumulated + increment
             for accumulated, increment in zip(support_bar_leaves, initial_er_root_support_bar_leaves)
         )
-    support_bars = tuple(
-        support_treedef.unflatten(
-            [jnp.asarray(leaf)[objective_i] for leaf in support_bar_leaves]
+    # The native VMEC-coefficient route replaces only the *rebuild face
+    # prepared-system* contribution.  Objective, initial-cache, and
+    # initial-Er-root prepared bars still require the ordinary payload VJP.
+    # Keep those generic bars, but fold the rebuild runtime-channel bars into
+    # them before that one VJP.  This is deliberately a single full support
+    # pullback: a previous version used a second channels-only Boozer VJP,
+    # which both dropped the generic prepared bars and caused a large peak
+    # allocation after the segment sweep.
+    if native_vmec_treedef is None:
+        support_bars = tuple(
+            support_treedef.unflatten(
+                [jnp.asarray(leaf)[objective_i] for leaf in support_bar_leaves]
+            )
+            for objective_i in range(objective_count)
         )
-        for objective_i in range(objective_count)
-    )
+    else:
+        zero_initial_er_root_leaves = tuple(
+            jnp.zeros_like(leaf) for leaf in support_bar_leaves
+        )
+        generic_support_bar_leaves = tuple(
+            objective_bar + initial_cache_bar + initial_er_root_bar
+            for objective_bar, initial_cache_bar, initial_er_root_bar in zip(
+                objective_support_bar_leaves,
+                initial_cache_support_bar_leaves_accum,
+                (
+                    initial_er_root_support_bar_leaves
+                    if initial_er_root_support_bars is not None
+                    else zero_initial_er_root_leaves
+                ),
+                strict=True,
+            )
+        )
+        generic_support_bars = tuple(
+            support_treedef.unflatten(
+                [jnp.asarray(leaf)[objective_i] for leaf in generic_support_bar_leaves]
+            )
+            for objective_i in range(objective_count)
+        )
+        rebuild_support_bars = tuple(
+            support_treedef.unflatten(
+                [jnp.asarray(leaf)[objective_i] for leaf in step_support_bar_leaves_accum]
+            )
+            for objective_i in range(objective_count)
+        )
+
+        support_bars = tuple(
+            _merge_rebuild_ntx_channels_into_generic_payload_bar(
+                generic_bar, rebuild_bar
+            )
+            for generic_bar, rebuild_bar in zip(
+                generic_support_bars, rebuild_support_bars, strict=True
+            )
+        )
+        # Do not retain the large generic/rebuild payload trees while the
+        # later VMEC raw-block pullback is staged.
+        del generic_support_bars, rebuild_support_bars, generic_support_bar_leaves
     component_support_bars_by_name = {
         "objective_explicit": tuple(
             support_treedef.unflatten(

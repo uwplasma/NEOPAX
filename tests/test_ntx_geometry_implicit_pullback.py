@@ -1,6 +1,7 @@
 """Exact local checks for the opt-in geometry-only NTX support pullback."""
 
 from types import SimpleNamespace
+import dataclasses
 import inspect
 
 import jax
@@ -18,6 +19,17 @@ from NEOPAX._transport_solvers import (
     _radau_prepare_lagged_response_with_compact_coefficient_record,
 )
 from NEOPAX._geometry_autodiff import _ntx_runtime_channel_payload_bars
+from NEOPAX._reverse_ad_transport import (
+    _merge_rebuild_ntx_channels_into_generic_payload_bar,
+)
+
+
+@dataclasses.dataclass(frozen=True)
+class _MockSupportBar:
+    center_channels: object
+    face_channels: object
+    center_prepared: object
+    face_prepared: object
 
 
 def _small_runtime_model(n_energy=1):
@@ -66,14 +78,8 @@ def _assert_float_tree_allclose(actual, expected, *, rtol=1e-9, atol=1e-11):
                 )
 
 
-def test_native_vmec_coefficient_bridge_excludes_generic_prepared_cotangents():
-    """The experimental bridge must leave ``face_prepared`` out of its VJP.
-
-    This is deliberately a pure object test: the production state/bar equality
-    needs the VMEX stack, but this gate catches the structural regression that
-    previously staged both the generic prepared transpose and native VMEC
-    coefficient transpose in the same compiled segment.
-    """
+def test_native_vmec_coefficient_bridge_extracts_runtime_channels_only():
+    """The diagnostic channel projection cannot retain prepared leaves."""
 
     support_bars = (
         SimpleNamespace(
@@ -100,6 +106,38 @@ def test_native_vmec_coefficient_bridge_excludes_generic_prepared_cotangents():
         ),
     )
     assert "prepared" not in repr(actual).lower()
+
+
+def test_native_vmec_bridge_merges_rebuild_channels_without_dropping_generic_prepared():
+    """Native rebuild coefficients must not erase cache/objective prepared bars."""
+
+    generic_ntx = _MockSupportBar(
+        center_channels=(jnp.asarray([1.0, -2.0]),),
+        face_channels=(jnp.asarray([3.0, 4.0]),),
+        center_prepared="retain-center-prepared",
+        face_prepared="retain-face-prepared",
+    )
+    rebuild_ntx = _MockSupportBar(
+        center_channels=(jnp.asarray([0.2, 0.3]),),
+        face_channels=(jnp.asarray([-0.4, 0.5]),),
+        center_prepared="native-replaces-only-this-center-branch",
+        face_prepared="native-replaces-only-this-face-branch",
+    )
+    merged = _merge_rebuild_ntx_channels_into_generic_payload_bar(
+        {"geometry": "retain-geometry", "ntx_support": generic_ntx},
+        {"geometry": "rebuild-geometry-is-handled-elsewhere", "ntx_support": rebuild_ntx},
+    )
+    assert merged["geometry"] == "retain-geometry"
+    assert merged["ntx_support"].center_prepared == "retain-center-prepared"
+    assert merged["ntx_support"].face_prepared == "retain-face-prepared"
+    _assert_float_tree_allclose(
+        merged["ntx_support"].center_channels,
+        (jnp.asarray([1.2, -1.7]),),
+    )
+    _assert_float_tree_allclose(
+        merged["ntx_support"].face_channels,
+        (jnp.asarray([2.6, 4.5]),),
+    )
 
 
 def test_native_vmec_bridge_forwards_bridge_only_flag_to_local_ntx_helper():

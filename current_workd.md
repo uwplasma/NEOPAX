@@ -1772,19 +1772,33 @@ ntx_batched_interpolated_faces_native_multi_rhs_reuse_moment_drds_jvp_shared_pri
 ```
 
 It uses the same grouped low-dot NTX solve/factorization as the current
-`reuse_moment_drds_jvp_shared_primal` mode.  Its payload reverse is now split:
-the generic VJP carries only runtime channels, while the native VMEC
-coefficient bars replace the entire `face_prepared` branch.  This is the
-required substitution for reducing the generic prepared-system compile/RAM
-graph; it must never add both contributions. The special NTX helper now also
+`reuse_moment_drds_jvp_shared_primal` mode. The special NTX helper now also
 has a bridge-only return: it still forms the same grouped matrix-RHS adjoints
 and native coefficient bars, but omits the generic prepared-gradient
 contraction and returns a shape-compatible zero prepared payload to preserve
 the current Radau ABI. Existing modes and defaults are untouched.
 
-Next: run the small one-/three-RHS NTX gate confirming that bridge-only bars
-match the regular native coefficient output and that its prepared payload is
-zero. Then run the NEOPAX structural channel-only gate. Only after those pass,
-use the isolated remote selector for AD/FD and compile/RAM measurement. A
-later ABI change can remove the now-zero prepared carrier leaves entirely if
-they remain a material memory cost.
+#### Repair: preserve generic post-sweep prepared bars (2026-08-25)
+
+The first VMEC bridge integration was invalid. It treated native coefficient
+bars as a replacement for the *entire* generic support pullback and ran a
+second channels-only Boozer VJP. That dropped the generic `face_prepared`
+cotangents from objective/initial-cache/initial-Er-root paths and caused the
+observed post-sweep Boozer OOM.
+
+The repair keeps the selector isolated and uses one ordinary support VJP:
+
+```text
+generic objective + cache + root payload bars
+  + rebuild center/face runtime-channel bars
+  -> one normal NTX-support-to-VMEC-state VJP
+
+native rebuild face-coefficient bars
+  -> direct coefficient-to-VMEC-state VJP
+```
+
+Thus only the rebuild `face_prepared` contribution is replaced; all generic
+prepared contributions remain exact. No extra NTX solve/factorization or
+channels-only Boozer VJP is introduced. The current reference drds-reuse
+selector remains untouched. Next gate: run the isolated selector remotely and
+compare its AD table against the reference before interpreting compile/RAM.
