@@ -1732,3 +1732,21 @@ requires a VMEC-state cotangent.  The next implementation task is a batched
 native transpose of the traceable VMEC field-table/interpolation map.  The
 current best selector remains unchanged until that state-bar equality gate
 passes.
+
+#### Native VMEC coefficient-return discrepancy (2026-08-25)
+
+The private NTX opt-in return `return_vmec_coefficient_bars=True` was compared
+strictly with the existing prepared-system VJP chained back to the same small
+`VmecSurface`. The base and directional helper gates pass independently at
+roundoff, but the combined low-dot return differs on this ill-conditioned
+fixture (the `b_cos` bar is roughly `1e-7` relative). The discrepancy is in
+the post-adjoint VMEC coefficient contraction; it adds no NTX primal,
+factorization, or implicit-adjoint solve.
+
+This route is not wired to NEOPAX and must remain unselected. Do not relax the
+strict equality gate or replace the native contraction with the full generic
+prepared VJP, because that would defeat the compile/RAM objective. First
+obtain an end-to-end AD/FD comparison on the existing derivative-validated
+native selector. Only if it shows a material geometry-gradient error should we
+derive a native scalar contraction that reproduces the generic reduction
+structure while retaining the shared NTX solves.
