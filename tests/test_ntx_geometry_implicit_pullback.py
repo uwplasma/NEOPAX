@@ -1165,6 +1165,77 @@ def test_native_vmec_face_rebuild_accumulation_matches_generic_prepared_vjp():
             rtol=1e-10, atol=1e-12,
         ), name
 
+    # This is the exact post-NTX replacement used by the geometry bridge.
+    # The generic route contracts ``face_prepared`` bars with a JVP of
+    # ``prepare_monoenergetic_system(face_surface(state))``.  The native route
+    # contracts the parallel coefficient bars with the JVP of just those same
+    # face coefficients.  Use one common, two-direction state tangent and
+    # require row-by-row equality for the complete two-RHS accumulation.
+    def _surfaces_from_mock_state(mock_state):
+        first, second = mock_state
+        return tuple(
+            dataclasses.replace(
+                face_surface,
+                b_cos=face_surface.b_cos + first * jnp.asarray([0.11, -0.07]),
+                jacobian_cos=face_surface.jacobian_cos + second * jnp.asarray([0.05, 0.03]),
+                b_sub_theta_cos=face_surface.b_sub_theta_cos + first * jnp.asarray([-0.02, 0.04]),
+                b_sub_zeta_cos=face_surface.b_sub_zeta_cos + second * jnp.asarray([0.06, -0.01]),
+                b_sup_theta_cos=face_surface.b_sup_theta_cos + first * jnp.asarray([0.03, 0.02]),
+                b_sup_zeta_cos=face_surface.b_sup_zeta_cos + second * jnp.asarray([-0.04, 0.05]),
+                b0=face_surface.b0 + first * 0.09 - second * 0.06,
+            )
+            for face_surface in face_surfaces
+        )
+
+    def _prepared_from_mock_state(mock_state):
+        return _stack_prepared(
+            tuple(
+                ntx.prepare_monoenergetic_system(face_surface, grid)
+                for face_surface in _surfaces_from_mock_state(mock_state)
+            )
+        )
+
+    def _coefficient_tuple_from_mock_state(mock_state):
+        surfaces = _surfaces_from_mock_state(mock_state)
+        return tuple(
+            jnp.stack([jnp.asarray(getattr(face_surface, name)) for face_surface in surfaces])
+            for name in names
+        )
+
+    mock_state = (jnp.asarray(0.0), jnp.asarray(0.0))
+    mock_tangent = (jnp.asarray(0.37), jnp.asarray(-0.29))
+    _, prepared_tangent = jax.jvp(
+        _prepared_from_mock_state,
+        (mock_state,),
+        (mock_tangent,),
+    )
+    prepared_bar_leaves = jax.tree_util.tree_leaves(generic.face_prepared)
+    prepared_tangent_leaves = jax.tree_util.tree_leaves(prepared_tangent)
+    generic_jvp_contraction = []
+    for rhs_index in range(2):
+        total = jnp.asarray(0.0)
+        for bar_leaf, tangent_leaf in zip(
+            prepared_bar_leaves, prepared_tangent_leaves, strict=True
+        ):
+            tangent_array = jnp.asarray(tangent_leaf)
+            if jnp.issubdtype(tangent_array.dtype, jnp.inexact):
+                total = total + jnp.vdot(jnp.asarray(bar_leaf)[rhs_index], tangent_array)
+        generic_jvp_contraction.append(total)
+    native_jvp_contraction = _native_vmec_coefficient_tangent_contraction(
+        tuple(jnp.asarray(native_bars[name]) for name in names),
+        jax.jvp(
+            _coefficient_tuple_from_mock_state,
+            (mock_state,),
+            (mock_tangent,),
+        )[1],
+    )
+    assert jnp.allclose(
+        native_jvp_contraction,
+        jnp.stack(generic_jvp_contraction),
+        rtol=1e-10,
+        atol=1e-12,
+    )
+
 
 def test_native_multi_rhs_support_retains_local_drds_case_chain():
     """The native support rule must include ``drds -> epsi_hat`` exactly.
