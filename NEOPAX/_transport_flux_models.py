@@ -8195,22 +8195,44 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                     field_bars=species_field_bars,
                     packed_support_directional_adjoint=packed_support_directional_adjoint,
                 )
-            (
-                implicit_drds_bar,
-                er_bar,
-                temperature_bar,
-                density_bar,
-            ) = self._pullback_local_scan_inputs_and_drds_from_primitives(
-                drds_value=drds_value,
-                species_index=species_index,
-                er_value=er_value,
-                temperature_local=temperature_local,
-                density_local=density_local,
-                collisionality_kind=collisionality_kind,
-                reference_nu_hat_bar=reference_nu_hat_bar,
-                reference_epsi_hat_bar=reference_epsi_hat_bar,
-                vth_a_bar=vth_a_bar,
-            )
+            def _primitive_pullback(nu_hat_bar, epsi_hat_bar, vth_bar):
+                return self._pullback_local_scan_inputs_and_drds_from_primitives(
+                    drds_value=drds_value,
+                    species_index=species_index,
+                    er_value=er_value,
+                    temperature_local=temperature_local,
+                    density_local=density_local,
+                    collisionality_kind=collisionality_kind,
+                    reference_nu_hat_bar=nu_hat_bar,
+                    reference_epsi_hat_bar=epsi_hat_bar,
+                    vth_a_bar=vth_bar,
+                )
+
+            if native_factorized_ntx_rhs:
+                # NTX returns native case bars with a leading matrix-RHS
+                # axis.  This is only the cheap primitive-chain transpose;
+                # batching it here preserves the single native NTX adjoint.
+                (
+                    implicit_drds_bar,
+                    er_bar,
+                    temperature_bar,
+                    density_bar,
+                ) = jax.vmap(_primitive_pullback)(
+                    reference_nu_hat_bar,
+                    reference_epsi_hat_bar,
+                    vth_a_bar,
+                )
+            else:
+                (
+                    implicit_drds_bar,
+                    er_bar,
+                    temperature_bar,
+                    density_bar,
+                ) = _primitive_pullback(
+                    reference_nu_hat_bar,
+                    reference_epsi_hat_bar,
+                    vth_a_bar,
+                )
             pullback_result = (
                 implicit_drds_bar + direct_drds_bar,
                 er_bar,

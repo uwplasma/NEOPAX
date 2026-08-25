@@ -657,8 +657,8 @@ def test_native_joint_local_adapter_keeps_objective_rhs_inside_ntx_mock():
         model,
         "_pullback_local_scan_inputs_and_drds_from_primitives",
         lambda *, reference_nu_hat_bar, reference_epsi_hat_bar, vth_a_bar, **_kwargs: (
-            5.0 * reference_nu_hat_bar[:, 0],
-            7.0 * reference_epsi_hat_bar[:, 0],
+            5.0 * jnp.sum(reference_nu_hat_bar),
+            7.0 * jnp.sum(reference_epsi_hat_bar),
             11.0 * vth_a_bar,
             13.0 * vth_a_bar,
         ),
