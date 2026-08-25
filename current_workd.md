@@ -1802,3 +1802,16 @@ prepared contributions remain exact. No extra NTX solve/factorization or
 channels-only Boozer VJP is introduced. The current reference drds-reuse
 selector remains untouched. Next gate: run the isolated selector remotely and
 compare its AD table against the reference before interpreting compile/RAM.
+
+#### Grouped final-objective terminal cotangents (2026-08-25)
+
+The `support reverse final-objective cotangents` phase was independent of the
+rebuild selector and still constructed one final-state VJP and one
+explicit-geometry VJP for each ordinary objective. A separate opt-in
+`reverse_final_objective_cotangent_mode="grouped_vjp"` now constructs one
+vector-valued VJP for all non-bootstrap objectives and maps its pullback over
+the on-device objective basis. Bootstrap remains on its existing compact Upar
+state/support/geometry rule. `scalar` remains the default/reference mode.
+
+The mechanical vector-VJP row extraction has a small pure equality gate;
+before timing it remotely, compare grouped and scalar objective/gradient rows.

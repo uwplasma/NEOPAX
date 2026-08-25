@@ -21,6 +21,7 @@ from NEOPAX._transport_solvers import (
 from NEOPAX._geometry_autodiff import _ntx_runtime_channel_payload_bars
 from NEOPAX._reverse_ad_transport import (
     _merge_rebuild_ntx_channels_into_generic_payload_bar,
+    _objective_vector_vjp_rows,
 )
 
 
@@ -138,6 +139,28 @@ def test_native_vmec_bridge_merges_rebuild_channels_without_dropping_generic_pre
         merged["ntx_support"].face_channels,
         (jnp.asarray([2.6, 4.5]),),
     )
+
+
+def test_grouped_objective_vjp_rows_match_scalar_objective_gradients():
+    """The grouped terminal-rule algebra preserves independent objective rows."""
+
+    primal = jnp.asarray([0.4, -0.7, 1.2])
+
+    def objective_vector(value):
+        return jnp.asarray(
+            [
+                value[0] ** 2 + value[1],
+                value[0] * value[2] - jnp.sin(value[1]),
+                jnp.sum(value**3),
+            ]
+        )
+
+    values, grouped_bars = _objective_vector_vjp_rows(objective_vector, primal)
+    expected_bars = jnp.stack(
+        [jax.grad(lambda value, row=row: objective_vector(value)[row])(primal) for row in range(3)]
+    )
+    assert jnp.allclose(values, objective_vector(primal), rtol=1e-12, atol=1e-12)
+    assert jnp.allclose(grouped_bars, expected_bars, rtol=1e-12, atol=1e-12)
 
 
 def test_native_vmec_bridge_forwards_bridge_only_flag_to_local_ntx_helper():

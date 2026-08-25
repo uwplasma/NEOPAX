@@ -2182,6 +2182,7 @@ def _prepare_reverse_static_setup(
     reverse_stage_adjoint_solve_mode: str = "structured",
     reverse_rhs_transpose_mode: str = "generic",
     reverse_rhs_pullback_mode: str = "separate",
+    reverse_final_objective_cotangent_mode: str = "scalar",
     reverse_stage_cotangent_mode: str = "full",
     reverse_step_bwd_mode: str = "current",
     reverse_stage_adjoint_memory_mode: str = "default",
@@ -2221,6 +2222,9 @@ def _prepare_reverse_static_setup(
                 reverse_stage_adjoint_solve_mode=str(reverse_stage_adjoint_solve_mode),
                 reverse_rhs_transpose_mode=str(reverse_rhs_transpose_mode),
                 reverse_rhs_pullback_mode=str(reverse_rhs_pullback_mode),
+                reverse_final_objective_cotangent_mode=str(
+                    reverse_final_objective_cotangent_mode
+                ),
                 reverse_stage_cotangent_mode=str(reverse_stage_cotangent_mode),
                 reverse_step_bwd_mode=str(reverse_step_bwd_mode),
                 reverse_stage_adjoint_memory_mode=str(reverse_stage_adjoint_memory_mode),
@@ -3640,6 +3644,9 @@ def _run_realtime_geometry_optimization_api_smoke(
             ),
             reverse_segment_start_replay_mode=str(args.reverse_segment_start_replay_mode),
             reverse_segment_primal_record_mode=str(args.reverse_segment_primal_record_mode),
+            reverse_final_objective_cotangent_mode=str(
+                args.reverse_final_objective_cotangent_mode
+            ),
             reverse_step_bwd_mode=str(args.reverse_step_bwd_mode),
             reverse_schedule_artifact_mode=str(args.reverse_schedule_artifact_mode),
             max_reverse_accepted_steps=(
@@ -5178,6 +5185,17 @@ def main() -> None:
             "least-squares API through the direct JAX table-result builder and then "
             "exit. This uses the same validated grouped reverse runner but does not "
             "write the normal benchmark report."
+        ),
+    )
+    parser.add_argument(
+        "--reverse-final-objective-cotangent-mode",
+        choices=("scalar", "grouped_vjp"),
+        default="scalar",
+        help=(
+            "Terminal objective-cotangent construction for the segmented realtime "
+            "geometry reverse path. 'scalar' preserves the per-objective VJPs. "
+            "'grouped_vjp' groups all non-bootstrap objectives into one final-state "
+            "VJP and one explicit-geometry VJP; bootstrap keeps its compact rule."
         ),
     )
     parser.add_argument(

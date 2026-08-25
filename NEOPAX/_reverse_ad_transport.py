@@ -168,6 +168,20 @@ def _merge_rebuild_ntx_channels_into_generic_payload_bar(
     }
 
 
+def _objective_vector_vjp_rows(objective_vector_fn: Callable[[object], object], primal):
+    """Return vector objective values and one input cotangent per output row."""
+
+    values, pullback = jax.vjp(objective_vector_fn, primal)
+    values = jnp.asarray(values)
+    if values.ndim != 1:
+        raise ValueError(
+            "Grouped final-objective VJP requires a rank-one objective vector; "
+            f"got shape {values.shape}."
+        )
+    basis = jnp.eye(int(values.shape[0]), dtype=values.dtype)
+    return values, jax.vmap(lambda cotangent: pullback(cotangent)[0])(basis)
+
+
 TransportReverseReport = Mapping[str, object]
 TransportReverseReportRunner = Callable[[], TransportReverseReport]
 TransportReverseSupportSegmentExecutor = Callable[[object, bool], TransportReverseReport]
@@ -2595,6 +2609,7 @@ def prepare_reverse_static_setup(
     reverse_segment_profile_annotations: bool = False,
     reverse_segment_start_replay_mode: str = "legacy",
     reverse_segment_primal_record_mode: str = "reconstruct",
+    reverse_final_objective_cotangent_mode: str = "scalar",
     reverse_stage_cotangent_mode: str = "full",
     reverse_step_bwd_mode: str = "current",
     reverse_stage_adjoint_memory_mode: str = "default",
@@ -2646,6 +2661,14 @@ def prepare_reverse_static_setup(
         raise ValueError(
             "reverse_segment_primal_record_mode='reuse_segment_primal_record' "
             "requires reverse_segment_start_replay_mode='minimal'."
+        )
+    reverse_final_objective_cotangent_mode = str(
+        reverse_final_objective_cotangent_mode
+    ).strip().lower()
+    if reverse_final_objective_cotangent_mode not in {"scalar", "grouped_vjp"}:
+        raise ValueError(
+            "reverse_final_objective_cotangent_mode must be one of "
+            "{'scalar', 'grouped_vjp'}."
         )
     reverse_rebuild_support_pullback_mode = str(
         reverse_rebuild_support_pullback_mode
@@ -2744,6 +2767,9 @@ def prepare_reverse_static_setup(
                 reverse_segment_profile_annotations=bool(reverse_segment_profile_annotations),
                 reverse_segment_start_replay_mode=str(reverse_segment_start_replay_mode),
                 reverse_segment_primal_record_mode=str(reverse_segment_primal_record_mode),
+                reverse_final_objective_cotangent_mode=(
+                    reverse_final_objective_cotangent_mode
+                ),
                 reverse_stage_cotangent_mode=str(reverse_stage_cotangent_mode),
                 reverse_step_bwd_mode=str(reverse_step_bwd_mode),
                 reverse_stage_adjoint_memory_mode=str(reverse_stage_adjoint_memory_mode),
@@ -3010,6 +3036,11 @@ def prepare_realtime_geometry_support_segment_core_setup(
             "reverse_segment_primal_record_mode",
             "reconstruct",
         ),
+        reverse_final_objective_cotangent_mode=getattr(
+            args,
+            "reverse_final_objective_cotangent_mode",
+            "scalar",
+        ),
         reverse_stage_cotangent_mode=support_probe_cotangent_mode,
         reverse_step_bwd_mode=args.reverse_step_bwd_mode,
         reverse_stage_adjoint_memory_mode=args.reverse_stage_adjoint_memory_mode,
@@ -3268,10 +3299,93 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
     objective_payload_bar_rows = []
     combined_geometry_payload = isinstance(support_payload, dict) and "geometry" in support_payload
     zero_payload_bar = _reverse_zero_support_delta_tree_like(reverse_setup.solver, support_payload)
+    final_objective_cotangent_mode = str(
+        getattr(
+            reverse_setup.execution_context.physics_context,
+            "reverse_final_objective_cotangent_mode",
+            "scalar",
+        )
+    ).strip().lower()
+    if final_objective_cotangent_mode not in {"scalar", "grouped_vjp"}:
+        raise ValueError(
+            "Unknown reverse_final_objective_cotangent_mode "
+            f"{final_objective_cotangent_mode!r}."
+        )
+    bootstrap_objective_name = "bootstrap_current_softmax_abs_scaled"
+    ordinary_objective_indices = tuple(
+        objective_i
+        for objective_i, objective_name in enumerate(objective_labels)
+        if objective_name != bootstrap_objective_name
+    )
+    grouped_objective_values: dict[int, object] = {}
+    grouped_final_y_bars: dict[int, object] = {}
+    grouped_geometry_bars: dict[int, object] = {}
     phase_start = time.perf_counter()
+    if final_objective_cotangent_mode == "grouped_vjp" and ordinary_objective_indices:
+        # The scalar reference path constructs one VJP for every ordinary
+        # terminal objective.  Group them here, but leave bootstrap on its
+        # compact NTX-specific rule below.
+        def _ordinary_objective_vector_from_final_y(final_y_value):
+            final_state = reverse_setup.prepared_rollout.physics_context.unpack_flat(
+                final_y_value
+            )
+            return jnp.stack(
+                tuple(
+                    dependencies.objective_scalar_by_index(final_state, runtime, objective_i)
+                    for objective_i in ordinary_objective_indices
+                ),
+                axis=0,
+            )
+
+        ordinary_values, ordinary_final_y_bars = _objective_vector_vjp_rows(
+            _ordinary_objective_vector_from_final_y,
+            final_y_for_objective,
+        )
+        grouped_objective_values = {
+            objective_i: ordinary_values[row_i]
+            for row_i, objective_i in enumerate(ordinary_objective_indices)
+        }
+        grouped_final_y_bars = {
+            objective_i: ordinary_final_y_bars[row_i]
+            for row_i, objective_i in enumerate(ordinary_objective_indices)
+        }
+        if combined_geometry_payload:
+            final_state_for_geometry = (
+                reverse_setup.prepared_rollout.physics_context.unpack_flat(
+                    final_y_for_objective
+                )
+            )
+            geometry = support_payload["geometry"]
+            geometry_delta0 = _float_delta_tree_like(geometry)
+
+            def _ordinary_objective_vector_from_geometry_delta(geometry_delta):
+                runtime_with_geometry = dataclasses.replace(
+                    runtime,
+                    geometry=_add_float_delta_tree(geometry, geometry_delta),
+                )
+                return jnp.stack(
+                    tuple(
+                        dependencies.objective_scalar_by_index(
+                            final_state_for_geometry,
+                            runtime_with_geometry,
+                            objective_i,
+                        )
+                        for objective_i in ordinary_objective_indices
+                    ),
+                    axis=0,
+                )
+
+            _, ordinary_geometry_bars = _objective_vector_vjp_rows(
+                _ordinary_objective_vector_from_geometry_delta,
+                geometry_delta0,
+            )
+            grouped_geometry_bars = {
+                objective_i: ordinary_geometry_bars[row_i]
+                for row_i, objective_i in enumerate(ordinary_objective_indices)
+            }
     for objective_i in range(objective_count):
         objective_name = objective_labels[objective_i]
-        if objective_name == "bootstrap_current_softmax_abs_scaled":
+        if objective_name == bootstrap_objective_name:
             final_state_for_bootstrap = reverse_setup.prepared_rollout.physics_context.unpack_flat(
                 final_y_for_objective
             )
@@ -3350,33 +3464,47 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
                 )
             continue
 
-        def _objective_from_final_y(final_y_value, objective_index=objective_i):
-            final_state = reverse_setup.prepared_rollout.physics_context.unpack_flat(final_y_value)
-            return dependencies.objective_scalar_by_index(final_state, runtime, objective_index)
+        if final_objective_cotangent_mode == "grouped_vjp":
+            objective_value = grouped_objective_values[objective_i]
+            final_y_bar = grouped_final_y_bars[objective_i]
+        else:
+            def _objective_from_final_y(final_y_value, objective_index=objective_i):
+                final_state = reverse_setup.prepared_rollout.physics_context.unpack_flat(final_y_value)
+                return dependencies.objective_scalar_by_index(final_state, runtime, objective_index)
 
-        objective_value, objective_pullback = jax.vjp(_objective_from_final_y, final_y_for_objective)
-        objective_values_rows.append(objective_value)
-        final_y_bar_rows.append(objective_pullback(jnp.ones_like(objective_value))[0])
-        if combined_geometry_payload:
-            final_state_for_geometry = reverse_setup.prepared_rollout.physics_context.unpack_flat(
-                final_y_for_objective
+            objective_value, objective_pullback = jax.vjp(
+                _objective_from_final_y, final_y_for_objective
             )
-            geometry = support_payload["geometry"]
-            geometry_delta0 = _float_delta_tree_like(geometry)
-
-            def _objective_from_geometry_delta(geometry_delta, objective_index=objective_i):
-                runtime_with_geometry = dataclasses.replace(
-                    runtime,
-                    geometry=_add_float_delta_tree(geometry, geometry_delta),
+            final_y_bar = objective_pullback(jnp.ones_like(objective_value))[0]
+        objective_values_rows.append(objective_value)
+        final_y_bar_rows.append(final_y_bar)
+        if combined_geometry_payload:
+            if final_objective_cotangent_mode == "grouped_vjp":
+                geometry_objective_bar = grouped_geometry_bars[objective_i]
+            else:
+                final_state_for_geometry = reverse_setup.prepared_rollout.physics_context.unpack_flat(
+                    final_y_for_objective
                 )
-                return dependencies.objective_scalar_by_index(
-                    final_state_for_geometry,
-                    runtime_with_geometry,
-                    objective_index,
-                )
+                geometry = support_payload["geometry"]
+                geometry_delta0 = _float_delta_tree_like(geometry)
 
-            _, geometry_objective_pullback = jax.vjp(_objective_from_geometry_delta, geometry_delta0)
-            (geometry_objective_bar,) = geometry_objective_pullback(jnp.ones_like(objective_value))
+                def _objective_from_geometry_delta(geometry_delta, objective_index=objective_i):
+                    runtime_with_geometry = dataclasses.replace(
+                        runtime,
+                        geometry=_add_float_delta_tree(geometry, geometry_delta),
+                    )
+                    return dependencies.objective_scalar_by_index(
+                        final_state_for_geometry,
+                        runtime_with_geometry,
+                        objective_index,
+                    )
+
+                _, geometry_objective_pullback = jax.vjp(
+                    _objective_from_geometry_delta, geometry_delta0
+                )
+                (geometry_objective_bar,) = geometry_objective_pullback(
+                    jnp.ones_like(objective_value)
+                )
             objective_payload_bar_rows.append(
                 {
                     "geometry": _sanitize_float_delta_bar_tree(geometry, geometry_objective_bar),
@@ -3498,7 +3626,8 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
     )
     print(
         f"{progress_prefix} progress: support reverse final-objective cotangents ready "
-        f"elapsed_s={time.perf_counter() - phase_start:.3f}",
+        f"elapsed_s={time.perf_counter() - phase_start:.3f} "
+        f"mode={final_objective_cotangent_mode}",
         flush=True,
     )
     objective_support_bar_leaves = support_bar_leaves
@@ -5126,6 +5255,7 @@ def internal_realtime_geometry_transport_reverse_table_result_builder(
     reverse_segment_profile_annotations: bool = False,
     reverse_segment_start_replay_mode: str = "legacy",
     reverse_segment_primal_record_mode: str = "reconstruct",
+    reverse_final_objective_cotangent_mode: str = "scalar",
     reverse_stage_cotangent_mode: str = "full",
     reverse_step_bwd_mode: str = "reduced_cotangent",
     reverse_stage_adjoint_memory_mode: str = "default",
@@ -5273,6 +5403,12 @@ def internal_realtime_geometry_transport_reverse_table_result_builder(
                 opts.get(
                     "reverse_segment_primal_record_mode",
                     reverse_segment_primal_record_mode,
+                )
+            ),
+            reverse_final_objective_cotangent_mode=str(
+                opts.get(
+                    "reverse_final_objective_cotangent_mode",
+                    reverse_final_objective_cotangent_mode,
                 )
             ),
             reverse_stage_cotangent_mode=str(opts.get("reverse_stage_cotangent_mode", reverse_stage_cotangent_mode)),
