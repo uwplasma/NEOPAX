@@ -11516,6 +11516,7 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                     "b_sub_zeta_cos",
                     "b_sup_theta_cos",
                     "b_sup_zeta_cos",
+                    "b0",
                 )
             }
         n_radius = int(face_state.Er.shape[0])

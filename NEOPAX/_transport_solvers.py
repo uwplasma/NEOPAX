@@ -8745,6 +8745,7 @@ def _radau_zero_native_vmec_face_coefficient_bars(support):
             "b_sub_zeta_cos",
             "b_sup_theta_cos",
             "b_sup_zeta_cos",
+            "b0",
         )
     }
 

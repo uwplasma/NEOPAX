@@ -5037,6 +5037,7 @@ def geometry_payload_pullback_from_param_vector_raw_block_transpose(
             "b_sub_zeta_cos",
             "b_sup_theta_cos",
             "b_sup_zeta_cos",
+            "b0",
         )
         return tuple(
             jnp.stack([jnp.asarray(getattr(surface, name)) for surface in surfaces], axis=0)
@@ -5464,6 +5465,7 @@ def geometry_payload_pullback_from_param_vector_raw_block_transpose(
                 "b_sub_zeta_cos",
                 "b_sup_theta_cos",
                 "b_sup_zeta_cos",
+                "b0",
             )
             missing_native_names = tuple(
                 name for name in native_names if name not in native_vmec_face_coefficient_bars
@@ -5566,6 +5568,7 @@ def geometry_payload_pullback_from_param_vector_raw_block_transpose(
             "b_sub_zeta_cos",
             "b_sup_theta_cos",
             "b_sup_zeta_cos",
+            "b0",
         )
         missing_native_names = tuple(
             name for name in native_names if name not in native_vmec_face_coefficient_bars

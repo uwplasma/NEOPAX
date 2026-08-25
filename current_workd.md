@@ -1815,3 +1815,71 @@ state/support/geometry rule. `scalar` remains the default/reference mode.
 
 The mechanical vector-VJP row extraction has a small pure equality gate;
 before timing it remotely, compare grouped and scalar objective/gradient rows.
+
+#### Next work: complete native VMEC-surface replacement contract (2026-08-25)
+
+The remote run of
+
+```text
+ntx_batched_interpolated_faces_native_multi_rhs_reuse_moment_drds_jvp_shared_primal_with_vmec_coefficients
+```
+
+completed without the post-sweep OOM and retained the desired rebuild execution
+times, but its transport `RBC`/`ZBS` derivatives differ materially from the
+validated generic `reuse_moment_drds_jvp_shared_primal` reference.  This is
+not evidence of a second NTX adjoint or a duplicate coefficient term.
+
+The selector passes `native_vmec_coefficient_bars_only=True` into NTX.  NTX
+therefore returns a zero generic `face_prepared` cotangent and returns native
+bars only for six Fourier arrays (`b_cos`, `jacobian_cos`, `b_sub_theta_cos`,
+`b_sub_zeta_cos`, `b_sup_theta_cos`, and `b_sup_zeta_cos`).  Those six bars
+replace the rebuild `face_prepared` contribution.  The generic objective,
+initial-cache, and initial-Er-root support bars remain present by design.
+
+The first concrete audit finding is that the local fixed residual depends on
+the six sampled Fourier fields *and* the independent `b0` scalar.  The old
+native conversion silently discarded the latter. Other VMEC-surface leaves
+are retained in the full-surface gate and must prove to have zero local
+prepared cotangent before they are excluded. The bridge therefore remains
+experimental until it matches the reference/FD table.
+
+Plan:
+
+1. **Define the exact replacement boundary.** Enumerate every dynamic
+   `VmecSurface` leaf consumed by the VMEC preparation graph and add a small
+   NTX gate that compares the *entire* native low-dot surface bar (base plus
+   both directional terms, arbitrary RHS count) with the ordinary prepared
+   VJP.  The existing six-coefficient tests are retained but are insufficient.
+2. **Extend the native NTX return contract.** Return the missing scalar
+   VMEC-surface cotangents through the same fixed-adjoint/low-dot algebra as
+   the six coefficient bars.  Do not reinstate the full generic prepared-bar
+   tree or add another NTX primal/factorization/adjoint.
+3. **Route the full compact surface bar in NEOPAX.** Replace only rebuild
+   `face_prepared` with this complete native surface contract; retain ordinary
+   objective, cache, root, and runtime-channel support cotangents.  Contract
+   the full native surface bar against the existing implicit VMEC state
+   tangents on the compact path.
+4. **Prove equivalence before a remote transport run.** Add small in-memory
+   NTX and NEOPAX gates for base/directional/full-low-dot equality and for the
+   merge boundary.  No rollout, GPU benchmark, profile dump, or temporary
+   XLA output is permitted in local tests.
+5. **Remote validation sequence.** First compare the full AD table with the
+   validated generic drds-reuse reference; then run the existing RBC/ZBS FD
+   comparison.  Only if both agree will this selector become a candidate for
+   compile/RAM optimisation.  The reference selector remains untouched.
+
+Implementation status: the first concrete missing leaf, `VmecSurface.b0`, is
+now carried by the native NTX dictionary and through the NEOPAX face-surface
+tangent contraction. `b0` is an independent scalar used directly in the NTX
+transport coefficients; it was present in the native primitive cotangent but
+was silently discarded by the old Fourier-only conversion. Base,
+directional, and combined-contract tests now include it. The remaining
+full-surface gate is deliberately strict; no tolerance has been relaxed.
+
+Audit correction: `transport_psi_scale` is a dynamic `VmecSurface` leaf, but
+it is *not* consumed by this local prepared NTX solve.  NEOPAX resolves and
+passes `MonoenergeticCase(epsi_hat=...)` explicitly at every local runtime
+call, so NTX does not invoke its alternative `er_hat / transport_psi_scale`
+path.  It must therefore remain zero in the strict replacement-contract
+gate; adding a native bar for it would be dead graph payload, not a missing
+derivative.
