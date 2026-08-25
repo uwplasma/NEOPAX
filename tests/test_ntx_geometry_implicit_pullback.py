@@ -153,8 +153,8 @@ def test_native_vmec_coefficient_bridge_extracts_runtime_channels_only():
     assert "prepared" not in repr(actual).lower()
 
 
-def test_native_vmec_bridge_merges_rebuild_channels_without_dropping_generic_prepared():
-    """Native rebuild coefficients must not erase cache/objective prepared bars."""
+def test_native_vmec_bridge_merges_rebuild_channels_and_direct_geometry():
+    """Native coefficients replace only face-prepared, never direct geometry."""
 
     generic_ntx = _MockSupportBar(
         center_channels=(jnp.asarray([1.0, -2.0]),),
@@ -169,10 +169,12 @@ def test_native_vmec_bridge_merges_rebuild_channels_without_dropping_generic_pre
         face_prepared="native-replaces-only-this-face-branch",
     )
     merged = _merge_rebuild_ntx_channels_into_generic_payload_bar(
-        {"geometry": "retain-geometry", "ntx_support": generic_ntx},
-        {"geometry": "rebuild-geometry-is-handled-elsewhere", "ntx_support": rebuild_ntx},
+        {"geometry": {"direct": jnp.asarray([1.3, -0.4])}, "ntx_support": generic_ntx},
+        {"geometry": {"direct": jnp.asarray([-0.2, 0.7])}, "ntx_support": rebuild_ntx},
     )
-    assert merged["geometry"] == "retain-geometry"
+    _assert_float_tree_allclose(
+        merged["geometry"], {"direct": jnp.asarray([1.1, 0.3])}
+    )
     assert merged["ntx_support"].center_prepared == "retain-center-prepared"
     assert merged["ntx_support"].face_prepared == "retain-face-prepared"
     _assert_float_tree_allclose(

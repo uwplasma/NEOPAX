@@ -141,19 +141,27 @@ def _merge_rebuild_ntx_channels_into_generic_payload_bar(
     generic_payload_bar: Mapping[str, object],
     rebuild_payload_bar: Mapping[str, object],
 ) -> dict[str, object]:
-    """Retain generic prepared bars while adding rebuild runtime channels.
+    """Retain generic prepared bars while adding rebuild-only contributions.
 
     The native VMEC coefficient bridge supplies only the rebuild
     ``face_prepared`` contribution. This helper assembles the complementary
     generic payload for the one ordinary support VJP: its prepared bars are
-    retained verbatim, while both NTX runtime-channel trees receive the
-    rebuild cotangent.
+    retained verbatim, while both NTX runtime-channel trees and the separate
+    direct-geometry payload receive their rebuild cotangent.
+
+    ``rebuild_ntx`` is the native replacement boundary, but
+    ``rebuild_payload_bar["geometry"]`` is not: it contains the direct
+    geometry dependence of the lagged response.  Dropping it loses a real
+    transport-to-VMEC contribution for every rebuild step.
     """
 
     generic_ntx = generic_payload_bar["ntx_support"]
     rebuild_ntx = rebuild_payload_bar["ntx_support"]
     return {
-        "geometry": generic_payload_bar["geometry"],
+        "geometry": _add_float_delta_tree(
+            generic_payload_bar["geometry"],
+            rebuild_payload_bar["geometry"],
+        ),
         "ntx_support": dataclasses.replace(
             generic_ntx,
             center_channels=_add_float_delta_tree(
