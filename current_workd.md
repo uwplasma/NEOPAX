@@ -1902,3 +1902,121 @@ justify a transport benchmark or relax the strict gate.  It predates `b0` and
 is far too small to explain the material RBC/ZBS transport-row discrepancy;
 the next audit must isolate the three low-dot components at the actual fused
 fields and separately verify the newly restored `b0` state chain.
+
+#### `b0` reverse-payload result (2026-08-25)
+
+The native-VMEC selector was rerun after routing the native `b0` cotangent:
+
+```text
+ntx_batched_interpolated_faces_native_multi_rhs_reuse_moment_drds_jvp_shared_primal_with_vmec_coefficients
+```
+
+The desired warm reverse execution behaviour remained, but the material
+transport-objective VMEC rows did **not** move from the earlier native result.
+The validated generic `reuse_moment_drds_jvp_shared_primal` reference and the
+new native result are:
+
+| objective | RBC reference | RBC native | ZBS reference | ZBS native |
+| --- | ---: | ---: | ---: | ---: |
+| `softmax_Er` | -59.29418 | -47.16818 | 17.36357 | 27.70411 |
+| `Er_transition_left` | -20.32353 | -11.96894 | 0.14571 | 7.91715 |
+| `Er_transition_right` | -22.52000 | -13.86698 | 1.01124 | 9.05793 |
+| `Er2_volume_average` | -640.27857 | -579.81062 | 236.83438 | 327.35410 |
+| `Er_volume_average` | -20.50225 | -19.55786 | 13.01206 | 13.98852 |
+| `bootstrap_current_softmax_abs_scaled` | -1.78901 | -1.79714 | -6.25244 | -6.26012 |
+
+All profile rows and pure geometry-objective rows are unchanged.  Thus `b0`
+was a genuine missing local native channel, but its contribution is negligible
+for this case and cannot explain the material RBC/ZBS transport discrepancy.
+The selector remains an execution-time experiment only; do not use it for a
+validated geometry gradient until the remaining rebuild-to-VMEC bridge term is
+identified and the table agrees with both the generic reference and FD.
+
+#### Replacement-boundary audit (2026-08-25)
+
+The subsequent code audit rules out three proposed explanations for the
+remaining material transport-row mismatch:
+
+1. **Face sampling is not drifting.** Both the ordinary support builder and
+   `_native_vmec_face_coefficients_from_state` derive the same centre/face
+   sampling from `n_r`, apply `_positive_transport_s_values_from_rho`, and use
+   `_traceable_vmec_surfaces_from_state` for the `vmec` backend.
+2. **The generic payload is not being discarded wholesale.** In native mode,
+   `_merge_rebuild_ntx_channels_into_generic_payload_bar` retains the ordinary
+   objective, initial-cache, and initial-root prepared bars.  It adds only the
+   rebuild runtime-channel bars and replaces only rebuild `face_prepared`.
+3. **There is no additional active scalar surface channel to add.** The local
+   prepared NTX residual reads the VMEC surface through sampled `b`, its
+   derivatives, Jacobian/covariant/contravariant fields, radial drift, and
+   `b0`.  The explicit runtime case supplies `epsi_hat`, so
+   `transport_psi_scale` has no local path; `iota` is retained metadata in
+   `GeometryOnGrid` but is not read by the fixed NTX operator or coefficient
+   formulas for a `VmecSurface`.
+
+The unresolved problem is therefore narrower and more important: the native
+path is a re-derived fixed-residual/low-dot transpose, not merely a different
+unflattening of the generic prepared VJP.  Its strict combined low-dot VMEC
+test already disagrees with the generic prepared VJP at about `1.6e-7`
+relative.  That isolated error is too small to explain the transport table,
+but it proves that the native replacement has not yet been established as an
+exact contract.  The next required gate is a small **NEOPAX face-rebuild
+integration oracle**: compare the complete generic `face_prepared` bar,
+chained through the same traceable VMEC face surfaces, against the native
+coefficient bar for each low-dot component (primal response, `d/dEr`, and
+`d/dlog(nu*)`) before any further remote transport run.  This identifies
+whether the material loss arises inside the local multi-energy/low-dot
+assembly or only when its face bar is inserted into the payload bridge.
+
+**Gate result (CPU, 2026-08-25):** all three fixed-`epsi_hat` component cases
+passed with the expected-failure marker disabled (`--runxfail`). This proves
+only that the native multi-energy low-dot coefficient bars equal the generic
+`face_prepared -> VmecSurface` VJP when the local NTX electric-field input is
+held fixed. It does **not** cover the physical `Er * drds -> epsi_hat` chain.
+Since the material table disagreement is limited to Er-dependent objectives,
+that omitted chain is the primary suspect; a separate local Er/drds oracle is
+required before assigning the mismatch to the downstream payload bridge.
+
+**Er/drds-chain gate result (CPU, 2026-08-25):** the three-component oracle
+(`transport_moments`, `d/dEr`, and `d/dlog(nu*)`) passed with
+`--runxfail`, using the production `get_v_thermal` convention and the full
+`Er * drds -> epsi_hat` reverse chain.  Therefore the native local NTX case
+bars, their `drds` contribution, and their `Er` contribution agree with the
+generic local response VJP.  The Er-only transport-table disagreement is
+**not** an omitted or duplicated `Er -> epsi_hat` factor.  The remaining
+candidate boundary is after this local result: converting the native VMEC
+coefficient bars into the traceable VMEC-state/payload cotangent, or merging
+that cotangent with the generic rebuild payload.
+
+**Expanded local surface-contract result (CPU, 2026-08-25):** the strict
+`native_vmec_face_rebuild_component_oracle` was rerun for all three actual
+low-dot response components and passed (`3 passed`).  It verifies the native
+coefficient return against the ordinary `face_prepared -> VmecSurface` VJP,
+including `b0`, and verifies that every other omitted differentiable
+`VmecSurface` field has a zero bar in the explicit-`epsi_hat` contract.  In
+combination with the Er/drds-chain gate, this rules out local NTX algebra,
+the `Er * drds -> epsi_hat` chain, and an omitted sampled surface field as
+the source of the material transport-objective discrepancy.
+
+**Audit correction:** the fast generic drds-reuse selector and the native
+VMEC-coefficient selector both explicitly use
+`include_second_direction_base_prepared=False`.  The compact native contract
+therefore does not drop a term that the validated reference retains; do not
+add that term.
+
+**Multi-face rebuild-accumulation audit (CPU, 2026-08-25):** the initial
+`native_vmec_face_rebuild_accumulation` pass used three face indices but
+accidentally broadcast the same prepared VMEC surface to each one.  It did
+prove the RHS/anchor carrier ordering and that the native helper returns a
+zero `face_prepared` payload, but it did **not** prove the radial face-surface
+case used in production.  The gate now constructs three distinct sampled VMEC
+coefficient surfaces and independently VJPs each face.  It continues to
+exercise two selected anchors, two species, two energy points, two objective
+RHS rows, and the production anchor interpolation transpose.  This distinct-
+surface gate is the next required small CPU test.
+
+Only after it passes can the local custom pullback be considered established
+through the complete rebuild support boundary.  If it passes, the remaining
+unvalidated boundary is the Radau segment carrier/rebuild split or contraction
+of the accumulated native face-coefficient bars against the traceable
+VMEC-state tangent.  If it fails, the mismatch is inside the native custom
+low-dot coefficient rule for radially varying VMEC surfaces.

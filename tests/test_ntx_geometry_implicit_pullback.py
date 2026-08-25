@@ -3,16 +3,23 @@
 from types import SimpleNamespace
 import dataclasses
 import inspect
+from pathlib import Path
 
 import jax
 import jax.numpy as jnp
 import ntx
+import pytest
 
 from NEOPAX._transport_flux_models import (
     CombinedTransportFluxModel,
+    NTXExactLijRuntimeSupport,
     NTXExactLijRuntimeTransportModel,
+    NTXRuntimeScanChannels,
     _sanitize_float_delta_bar_tree,
 )
+from NEOPAX._neoclassical import _collisionality_kind
+from NEOPAX._species import Species
+from NEOPAX._state import TransportState, get_v_thermal
 from NEOPAX._transport_equations import ComposedEquationSystem
 from NEOPAX._transport_solvers import (
     _flat_rhs_build_support_pullback_batched_interpolated_faces_factory,
@@ -62,6 +69,40 @@ def _small_runtime_model(n_energy=1):
     object.__setattr__(model, "scan_batch_size", None)
     object.__setattr__(model, "use_remat", False)
     return model
+
+
+def _small_vmec_prepared():
+    """A traceable VMEC prepared system for native-bridge contract gates."""
+
+    surface = ntx.VmecSurface(
+        path=Path("native-bridge-fixture.nc"),
+        requested_psi_n=0.2,
+        psi_n=0.2,
+        nfp=2,
+        ns=3,
+        mpol=2,
+        ntor=1,
+        total_mode_count=2,
+        loaded_mode_count=2,
+        iota=jnp.asarray(0.6),
+        m=jnp.asarray([0, 1]),
+        n=jnp.asarray([0, 1]),
+        b_cos=jnp.asarray([1.0, 0.1]),
+        jacobian_cos=jnp.asarray([1.0, 0.02]),
+        b_sub_theta_cos=jnp.asarray([0.2, 0.01]),
+        b_sub_zeta_cos=jnp.asarray([1.1, 0.03]),
+        b_sup_theta_cos=jnp.asarray([0.3, 0.04]),
+        b_sup_zeta_cos=jnp.asarray([1.2, 0.05]),
+        b0=jnp.asarray(1.0),
+        psi_a_hat=jnp.asarray(1.0),
+        phi_edge=jnp.asarray(1.0),
+        r_n=jnp.asarray(0.5),
+        r_hat=jnp.asarray(0.5),
+        dpsi_hat_dr_hat=jnp.asarray(1.0),
+        dr_hat_dpsi_hat=jnp.asarray(1.0),
+        transport_psi_scale=jnp.asarray(1.0),
+    )
+    return surface, ntx.prepare_monoenergetic_system(surface, ntx.GridSpec(5, 5, 4))
 
 
 def _assert_float_tree_allclose(actual, expected, *, rtol=1e-9, atol=1e-11):
@@ -695,6 +736,434 @@ def test_compact_and_reused_drds_native_multi_rhs_adapters_match_full_native_ada
         _assert_float_tree_allclose(candidate[1], full[1])
         _assert_float_tree_allclose(candidate[2], full[2])
         _assert_float_tree_allclose(candidate[3], full[3])
+
+
+@pytest.mark.parametrize(
+    ("field_index", "component_name"),
+    (
+        (1, "transport_moments"),
+        (2, "dtransport_moments_d_er"),
+        (3, "dtransport_moments_d_log_nu_star"),
+    ),
+)
+def test_native_vmec_face_rebuild_component_oracle_matches_prepared_vjp(
+    field_index,
+    component_name,
+):
+    """Compare each actual NEOPAX low-dot component at the replacement boundary.
+
+    This is the missing integration-level oracle: it retains the production
+    local multi-energy/moment assembly but stops before interpolation, a Radau
+    step, a VMEC solve, or any filesystem output.  It asks whether the native
+    coefficient return is exactly the `face_prepared -> VmecSurface` VJP for
+    one response component.
+    """
+
+    model = _small_runtime_model(n_energy=2)
+    surface, prepared = _small_vmec_prepared()
+    all_field_bars = (
+        jnp.asarray([0.0, 0.0]),
+        jnp.asarray(
+            [[0.3, -0.2, 0.1, 0.4, -0.1, 0.2],
+             [-0.1, 0.2, 0.3, -0.4, 0.5, -0.2]]
+        ),
+        jnp.asarray(
+            [[-0.3, 0.1, 0.2, -0.2, 0.3, -0.1],
+             [0.4, -0.3, 0.2, 0.1, -0.5, 0.3]]
+        ),
+        jnp.asarray(
+            [[0.2, 0.4, -0.3, 0.1, 0.2, -0.4],
+             [-0.2, 0.3, 0.4, -0.1, 0.2, 0.5]]
+        ),
+    )
+    field_bars = tuple(
+        value if index == field_index else jnp.zeros_like(value)
+        for index, value in enumerate(all_field_bars)
+    )
+    args = dict(
+        drds_value=jnp.asarray(1.2),
+        reference_nu_hat=jnp.asarray([1.0e-2, 1.8e-2]),
+        reference_epsi_hat=jnp.asarray([1.0e-3, 2.0e-3]),
+        vth_a=jnp.asarray(1.1),
+        field_bars=field_bars,
+        return_case_bars=True,
+    )
+    prepared_bar, _drds_bar, _primal, _case_bars, native_bars = (
+        model._pullback_interpolated_moment_prepared_support_and_drds_only_native_multi_rhs_reuse_moment_drds_jvp_with_vmec_coefficients(
+            prepared,
+            native_vmec_coefficient_bars_only=False,
+            **args,
+        )
+    )
+    _, surface_pullback = jax.vjp(
+        lambda surface_value: ntx.prepare_monoenergetic_system(
+            surface_value, prepared.grid
+        ),
+        surface,
+    )
+    names = (
+        "b_cos",
+        "jacobian_cos",
+        "b_sub_theta_cos",
+        "b_sub_zeta_cos",
+        "b_sup_theta_cos",
+        "b_sup_zeta_cos",
+        "b0",
+    )
+    expected = tuple(
+        surface_pullback(
+            jax.tree_util.tree_map(lambda value: value[rhs_index], prepared_bar)
+        )[0]
+        for rhs_index in range(int(jnp.asarray(field_bars[0]).shape[0]))
+    )
+    for name in names:
+        expected_value = jnp.stack([getattr(value, name) for value in expected])
+        actual_value = jnp.asarray(native_bars[name])
+        if not jnp.allclose(actual_value, expected_value, rtol=1e-10, atol=1e-12):
+            difference = jnp.abs(actual_value - expected_value)
+            scale = jnp.maximum(jnp.abs(expected_value), 1.0e-30)
+            raise AssertionError(
+                f"{component_name} {name}: "
+                f"max_abs={float(jnp.max(difference)):.16e} "
+                f"max_rel={float(jnp.max(difference / scale)):.16e}"
+            )
+    # The native bridge exposes precisely the seven coefficient fields above.
+    # Prove that every other differentiable VmecSurface field has no local
+    # prepared-system cotangent in the explicit-epsi_hat transport contract;
+    # otherwise this bridge would silently omit a state-dependent channel.
+    for name in (
+        "requested_psi_n",
+        "psi_n",
+        "nfp",
+        "iota",
+        "psi_a_hat",
+        "phi_edge",
+        "r_n",
+        "r_hat",
+        "dpsi_hat_dr_hat",
+        "dr_hat_dpsi_hat",
+        "aminor_p",
+        "psi_p",
+        "transport_psi_scale",
+    ):
+        values = tuple(getattr(value, name) for value in expected)
+        if values[0] is None:
+            continue
+        expected_value = jnp.stack([jnp.asarray(value) for value in values])
+        if jnp.issubdtype(expected_value.dtype, jnp.inexact):
+            assert jnp.allclose(expected_value, 0.0, rtol=0.0, atol=1e-12), (
+                component_name,
+                name,
+                expected_value,
+            )
+
+
+@pytest.mark.parametrize(
+    ("field_index", "component_name"),
+    (
+        (1, "transport_moments"),
+        (2, "dtransport_moments_d_er"),
+        (3, "dtransport_moments_d_log_nu_star"),
+    ),
+)
+def test_native_vmec_face_rebuild_er_drds_chain_matches_local_response_vjp(
+    field_index,
+    component_name,
+):
+    """Exercise ``Er * drds -> epsi_hat`` through the native local reverse.
+
+    Unlike the coefficient-only oracle above, this starts with the physical
+    local inputs and includes the return-case-bars chain back through
+    ``_pullback_local_scan_inputs_and_drds_from_primitives``.  It remains a
+    tiny in-memory two-energy check and does not construct a transport state
+    or solve VMEC.
+    """
+
+    model = _small_runtime_model(n_energy=2)
+    # The actual code reads this only if a velocity floor is configured.
+    object.__setattr__(model, "er_v_floor", None)
+    # ``_nu_over_vnew_local`` is jitted, so the fixture must use NEOPAX's
+    # registered Species pytree rather than a host-only SimpleNamespace.
+    object.__setattr__(
+        model,
+        "species",
+        Species(
+            # Although this gate evaluates ion index zero only, lax.cond
+            # traces the Zeff collisionality branch too.  That branch needs
+            # a physical electron lane, so retain the smallest valid pair.
+            number_species=2,
+            species_indices=jnp.asarray([0, 1]),
+            mass_mp=jnp.asarray([2.0, 5.446e-4]),
+            charge_qp=jnp.asarray([1.0, -1.0]),
+            names=("ion", "e"),
+        ),
+    )
+    _surface, prepared = _small_vmec_prepared()
+    drds_value = jnp.asarray(1.2)
+    er_value = jnp.asarray(-2.7e-3)
+    temperature_local = jnp.asarray([1.4, 1.1])
+    density_local = jnp.asarray([0.9, 0.9])
+    # Match the production helper exactly.  In particular, temperatures are
+    # stored in keV and Species.mass is in SI units.
+    vthermal_local = get_v_thermal(model.species.mass, temperature_local)
+    collisionality_kind = _collisionality_kind("default")
+    all_field_bars = (
+        jnp.asarray([0.0, 0.0]),
+        jnp.asarray(
+            [[0.3, -0.2, 0.1, 0.4, -0.1, 0.2],
+             [-0.1, 0.2, 0.3, -0.4, 0.5, -0.2]]
+        ),
+        jnp.asarray(
+            [[-0.3, 0.1, 0.2, -0.2, 0.3, -0.1],
+             [0.4, -0.3, 0.2, 0.1, -0.5, 0.3]]
+        ),
+        jnp.asarray(
+            [[0.2, 0.4, -0.3, 0.1, 0.2, -0.4],
+             [-0.2, 0.3, 0.4, -0.1, 0.2, 0.5]]
+        ),
+    )
+    field_bars = tuple(
+        value if index == field_index else jnp.zeros_like(value)
+        for index, value in enumerate(all_field_bars)
+    )
+    nu_hat, epsi_hat, vth_a = model._interpolated_moment_local_scan_primitives(
+        drds_value=drds_value,
+        species_index=0,
+        er_value=er_value,
+        temperature_local=temperature_local,
+        density_local=density_local,
+        vthermal_local=vthermal_local,
+        collisionality_kind=collisionality_kind,
+    )
+    (
+        native_prepared,
+        native_direct_drds,
+        _native_primal,
+        (native_nu_bar, native_epsi_bar, native_vth_a_bar),
+    ) = model._pullback_interpolated_moment_prepared_support_and_drds_only_native_multi_rhs_reuse_moment_drds_jvp(
+        prepared,
+        drds_value=drds_value,
+        reference_nu_hat=nu_hat,
+        reference_epsi_hat=epsi_hat,
+        vth_a=vth_a,
+        field_bars=field_bars,
+        return_case_bars=True,
+    )
+    (
+        native_primitive_drds,
+        native_er,
+        _native_temperature,
+        _native_density,
+    ) = jax.vmap(
+        lambda nu_bar, epsi_bar, vth_bar: model._pullback_local_scan_inputs_and_drds_from_primitives(
+            drds_value=drds_value,
+            species_index=0,
+            er_value=er_value,
+            temperature_local=temperature_local,
+            density_local=density_local,
+            collisionality_kind=collisionality_kind,
+            reference_nu_hat_bar=nu_bar,
+            reference_epsi_hat_bar=epsi_bar,
+            vth_a_bar=vth_bar,
+        )
+    )(native_nu_bar, native_epsi_bar, native_vth_a_bar)
+
+    def _local_response(prepared_value, drds_local, er_local):
+        return model._build_interpolated_moment_response_local(
+            prepared_value,
+            drds_value=drds_local,
+            species_index=0,
+            er_value=er_local,
+            temperature_local=temperature_local,
+            density_local=density_local,
+            vthermal_local=vthermal_local,
+            collisionality_kind=collisionality_kind,
+        )
+
+    _value, pullback = jax.vjp(_local_response, prepared, drds_value, er_value)
+    for rhs_index in range(int(jnp.asarray(field_bars[0]).shape[0])):
+        _expected_prepared, expected_drds, expected_er = pullback(
+            tuple(value[rhs_index] for value in field_bars)
+        )
+        # The fixed-epsi component oracle already establishes the prepared
+        # surface path.  This gate isolates the previously omitted physical
+        # ``Er * drds -> epsi_hat`` case chain; some unrelated prepared leaves
+        # carry NaNs for this deliberately tiny collision fixture.
+        assert jnp.allclose(
+            native_direct_drds[rhs_index] + native_primitive_drds[rhs_index],
+            expected_drds,
+            rtol=1e-10,
+            atol=1e-12,
+        ), component_name
+        assert jnp.allclose(
+            native_er[rhs_index], expected_er, rtol=1e-10, atol=1e-12
+        ), component_name
+
+
+def test_native_vmec_face_rebuild_accumulation_matches_generic_prepared_vjp():
+    """Compare the real native replacement boundary without a transport rollout.
+
+    The earlier component oracle proves one local ``face_prepared`` system.
+    This gate adds the production face-anchor interpolation, species sum, and
+    objective/RHS batching, then checks that converting the generic stacked
+    prepared cotangent to VMEC surface coefficients equals the native stacked
+    coefficient return.  It deliberately has no VMEC solve or raw-block
+    pullback: the two sides receive identical fixed traceable surfaces.
+    """
+
+    surface, _prepared = _small_vmec_prepared()
+    grid = ntx.GridSpec(5, 5, 4)
+    geometry = SimpleNamespace(
+        a_b=jnp.asarray(1.0),
+        r_grid=jnp.asarray([0.3, 0.7]),
+        r_grid_half=jnp.asarray([0.1, 0.5, 0.9]),
+    )
+
+    def _channels(rho):
+        rho = jnp.asarray(rho, dtype=jnp.float64)
+        ones = jnp.ones_like(rho)
+        return NTXRuntimeScanChannels.from_mapping(
+            rho,
+            {
+                "a_b": 1.0, "psia": 1.0, "b00": ones, "r00": ones,
+                "boozer_i": ones, "boozer_g": ones, "iota": ones,
+                "drds": ones, "dr_tildedr": ones, "dr_tildeds": ones,
+                "fac_reference_to_sfincs_11": ones,
+                "fac_reference_to_sfincs_31": ones,
+                "fac_reference_to_sfincs_33": ones,
+                "fac_sfincs_to_dkes_11": ones,
+                "fac_sfincs_to_dkes_31": ones,
+                "fac_sfincs_to_dkes_33": ones,
+                "fac_dkes_to_d11star": ones,
+                "fac_dkes_to_d31star": ones,
+                "fac_dkes_to_d33star": ones,
+            },
+        )
+
+    # Unlike the earlier carrier-only version of this gate, each face must
+    # have a distinct prepared VMEC surface.  The production support builder
+    # does exactly that, and a re-derived native coefficient rule could agree
+    # on repeated copies while failing once Fourier data vary with radius.
+    face_surfaces = tuple(
+        dataclasses.replace(
+            surface,
+            b_cos=surface.b_cos + jnp.asarray([0.03 * face, -0.01 * face]),
+            jacobian_cos=surface.jacobian_cos + jnp.asarray([0.02 * face, 0.004 * face]),
+            b_sub_theta_cos=surface.b_sub_theta_cos + jnp.asarray([0.01 * face, -0.003 * face]),
+            b_sub_zeta_cos=surface.b_sub_zeta_cos + jnp.asarray([-0.02 * face, 0.005 * face]),
+            b_sup_theta_cos=surface.b_sup_theta_cos + jnp.asarray([0.015 * face, 0.002 * face]),
+            b_sup_zeta_cos=surface.b_sup_zeta_cos + jnp.asarray([-0.01 * face, 0.003 * face]),
+            b0=surface.b0 + jnp.asarray(0.02 * face),
+        )
+        for face in range(3)
+    )
+    face_prepared_values = tuple(
+        ntx.prepare_monoenergetic_system(face_surface, grid)
+        for face_surface in face_surfaces
+    )
+
+    def _stack_prepared(values):
+        return jax.tree_util.tree_map(
+            lambda *leaves: (
+                None if leaves[0] is None
+                else jnp.stack([jnp.asarray(leaf) for leaf in leaves], axis=0)
+            ),
+            *values,
+        )
+
+    support = NTXExactLijRuntimeSupport(
+        center_channels=_channels(geometry.r_grid),
+        face_channels=_channels(geometry.r_grid_half),
+        center_prepared=_stack_prepared(face_prepared_values[:2]),
+        face_prepared=_stack_prepared(face_prepared_values),
+        grid=grid,
+    )
+    species = Species(
+        number_species=2,
+        species_indices=jnp.asarray([0, 1]),
+        mass_mp=jnp.asarray([5.446e-4, 2.0]),
+        charge_qp=jnp.asarray([-1.0, 1.0]),
+        names=("e", "D"),
+    )
+    energy_grid = SimpleNamespace(
+        xWeights=jnp.asarray([0.4, 0.6]),
+        L11_weight=jnp.asarray([1.0, 0.8]),
+        L12_weight=jnp.asarray([0.1, -0.2]),
+        L22_weight=jnp.asarray([0.9, 1.1]),
+        L13_weight=jnp.asarray([0.4, 0.5]),
+        L23_weight=jnp.asarray([-0.3, 0.2]),
+        L33_weight=jnp.asarray([1.3, 0.6]),
+        v_norm=jnp.asarray([0.9, 1.1]),
+    )
+    model = NTXExactLijRuntimeTransportModel(
+        species=species, energy_grid=energy_grid, geometry=geometry,
+        vmec_file=None, boozer_file=None, support=support,
+        center_response_mode="interpolate_from_faces", response_anchor_count=2,
+    )
+    state = TransportState(
+        density=jnp.asarray([[1.0, 1.15], [1.0, 1.15]]),
+        pressure=jnp.asarray([[1.3, 1.61], [1.1, 1.38]]),
+        Er=jnp.asarray([2.0e-4, 2.5e-4]),
+    )
+    response_bars = jax.tree_util.tree_map(
+        lambda value: jnp.stack(
+            (jnp.full_like(jnp.asarray(value), 0.17),
+             jnp.full_like(jnp.asarray(value), -0.23)),
+            axis=0,
+        ),
+        model.build_lagged_response(state),
+    )
+    generic = model.pullback_build_lagged_response_support_payload_batched_interpolated_faces_multi_rhs_shared_primal(
+        state, response_bars, support,
+        native_factorized_ntx_rhs=True,
+        reuse_joint_moment_drds_jvp=True,
+    )
+    native_support, native_bars = (
+        model.pullback_build_lagged_response_support_payload_batched_interpolated_faces_native_multi_rhs_reuse_moment_drds_jvp_shared_primal_with_vmec_coefficients(
+            state, response_bars, support,
+        )
+    )
+    _assert_float_tree_allclose(
+        native_support.face_channels, generic.face_channels,
+        rtol=1e-10, atol=1e-12,
+    )
+    # This selector deliberately carries the face-prepared contribution only
+    # through ``native_bars``.  A nonzero generic prepared payload here would
+    # double-count it when the later VMEC-state bridge is applied.
+    _assert_float_tree_allclose(
+        native_support.face_prepared,
+        jax.tree_util.tree_map(jnp.zeros_like, native_support.face_prepared),
+        rtol=0.0,
+        atol=0.0,
+    )
+    names = (
+        "b_cos", "jacobian_cos", "b_sub_theta_cos", "b_sub_zeta_cos",
+        "b_sup_theta_cos", "b_sup_zeta_cos", "b0",
+    )
+    expected_by_name = {name: [] for name in names}
+    for rhs_index in range(2):
+        expected_by_face = {name: [] for name in names}
+        for face_index in range(3):
+            _, surface_pullback = jax.vjp(
+                lambda surface_value: ntx.prepare_monoenergetic_system(
+                    surface_value, grid
+                ),
+                face_surfaces[face_index],
+            )
+            prepared_bar = jax.tree_util.tree_map(
+                lambda value: jnp.asarray(value)[rhs_index, face_index],
+                generic.face_prepared,
+            )
+            surface_bar = surface_pullback(prepared_bar)[0]
+            for name in names:
+                expected_by_face[name].append(jnp.asarray(getattr(surface_bar, name)))
+        for name in names:
+            expected_by_name[name].append(jnp.stack(expected_by_face[name], axis=0))
+    for name in names:
+        assert jnp.allclose(
+            native_bars[name], jnp.stack(expected_by_name[name], axis=0),
+            rtol=1e-10, atol=1e-12,
+        ), name
 
 
 def test_native_multi_rhs_support_retains_local_drds_case_chain():
