@@ -1131,7 +1131,13 @@ def test_native_joint_local_multi_rhs_matches_explicit_state_support_vjp():
     )
 
     def _add_trees(*trees):
-        return jax.tree_util.tree_map(lambda *leaves: sum(leaves), *trees)
+        def _add_leaves(*leaves):
+            first = jnp.asarray(leaves[0])
+            if first.dtype == jax.dtypes.float0:
+                return first
+            return sum(leaves[1:], first)
+
+        return jax.tree_util.tree_map(_add_leaves, *trees)
 
     rhs_count = int(field_bars[0].shape[1])
     expected_rows = []
@@ -1169,9 +1175,14 @@ def test_native_joint_local_multi_rhs_matches_explicit_state_support_vjp():
             )
         expected_rows.append(_add_trees(*species_rows))
 
+    def _stack_rhs_leaves(*leaves):
+        first = jnp.asarray(leaves[0])
+        if first.dtype == jax.dtypes.float0:
+            return first
+        return jnp.stack(leaves)
+
     expected_prepared = jax.tree_util.tree_map(
-        lambda *leaves: jnp.stack(leaves),
-        *(row[0] for row in expected_rows),
+        _stack_rhs_leaves, *(row[0] for row in expected_rows)
     )
     expected_state = tuple(
         jnp.stack([row[index] for row in expected_rows])
