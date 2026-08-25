@@ -32,9 +32,11 @@ from NEOPAX._geometry_autodiff import (
 from NEOPAX._reverse_ad_transport import (
     _merge_rebuild_ntx_channels_into_generic_payload_bar,
     _objective_vector_vjp_rows,
+    _take_batched_pytree_row,
 )
 
 
+@jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True)
 class _MockSupportBar:
     center_channels: object
@@ -207,6 +209,25 @@ def test_grouped_objective_vjp_rows_match_scalar_objective_gradients():
     )
     assert jnp.allclose(values, objective_vector(primal), rtol=1e-12, atol=1e-12)
     assert jnp.allclose(grouped_bars, expected_bars, rtol=1e-12, atol=1e-12)
+
+
+def test_take_batched_pytree_row_slices_dataclass_leaves():
+    """Grouped geometry bars are pytrees, not directly subscriptable arrays."""
+
+    rows = _MockSupportBar(
+        center_channels=(jnp.asarray([[1.0, 2.0], [3.0, 4.0]]),),
+        face_channels=(jnp.asarray([[5.0], [6.0]]),),
+        center_prepared=jnp.asarray([[7.0, 8.0], [9.0, 10.0]]),
+        face_prepared=jnp.asarray([[11.0], [12.0]]),
+    )
+    actual = _take_batched_pytree_row(rows, 1)
+    expected = _MockSupportBar(
+        center_channels=(jnp.asarray([3.0, 4.0]),),
+        face_channels=(jnp.asarray([6.0]),),
+        center_prepared=jnp.asarray([9.0, 10.0]),
+        face_prepared=jnp.asarray([12.0]),
+    )
+    _assert_float_tree_allclose(actual, expected)
 
 
 def test_native_vmec_coefficient_tangent_contraction_matches_vjp_duality():

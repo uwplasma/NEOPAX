@@ -190,6 +190,15 @@ def _objective_vector_vjp_rows(objective_vector_fn: Callable[[object], object], 
     return values, jax.vmap(lambda cotangent: pullback(cotangent)[0])(basis)
 
 
+def _take_batched_pytree_row(tree, row_index: int):
+    """Extract one leading objective row from every leaf of a pytree."""
+
+    return jax.tree_util.tree_map(
+        lambda value: jnp.asarray(value)[row_index],
+        tree,
+    )
+
+
 TransportReverseReport = Mapping[str, object]
 TransportReverseReportRunner = Callable[[], TransportReverseReport]
 TransportReverseSupportSegmentExecutor = Callable[[object, bool], TransportReverseReport]
@@ -3388,7 +3397,7 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
                 geometry_delta0,
             )
             grouped_geometry_bars = {
-                objective_i: ordinary_geometry_bars[row_i]
+                objective_i: _take_batched_pytree_row(ordinary_geometry_bars, row_i)
                 for row_i, objective_i in enumerate(ordinary_objective_indices)
             }
     for objective_i in range(objective_count):
