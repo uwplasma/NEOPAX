@@ -8,8 +8,10 @@ printing resident-memory data immediately after each completed evaluation.
 
 from __future__ import annotations
 
+import gc
 from pathlib import Path
 import sys
+import time
 
 import jax
 import numpy as np
@@ -20,18 +22,9 @@ if str(ROOT) not in sys.path:
 
 from NEOPAX import optimization as opt  # noqa: E402
 from optimize_geometry_qi_max_er_initial_root import (  # noqa: E402
-    ESS_ALPHA,
-    GEOMETRY_FAMILIES,
-    GEOMETRY_MAX_ITER,
     MAX_MODE_SCHEDULE,
-    QI_MBOZ,
-    QI_NBOZ,
-    ROOT_OPTIONS,
-    SCALE_MODE,
-    SOLVER_DEVICE,
-    SURFACES,
-    TRANSPORT_CONFIG,
-    terms,
+    SEED_INPUT,
+    build_initial_root_problem,
 )
 
 
@@ -42,23 +35,7 @@ REPEATS = 8
 def main() -> int:
     if not np.isscalar(MAX_MODE_SCHEDULE):
         raise ValueError("The memory test requires one fixed MAX_MODE_SCHEDULE value.")
-    active_terms = tuple(term for term in terms if float(term[2]) != 0.0)
-    problem = opt.geometry_initial_er_root_only_least_squares_problem(
-        TRANSPORT_CONFIG,
-        active_terms,
-        max_mode=int(MAX_MODE_SCHEDULE),
-        include_profiles=False,
-        families=GEOMETRY_FAMILIES,
-        scale_mode=SCALE_MODE,
-        ess_alpha=ESS_ALPHA,
-        mboz=QI_MBOZ,
-        nboz=QI_NBOZ,
-        surfaces=tuple(float(s) for s in SURFACES),
-        geometry_max_iter=GEOMETRY_MAX_ITER,
-        geometry_solver_device=SOLVER_DEVICE,
-        device=SOLVER_DEVICE,
-        root_options=ROOT_OPTIONS,
-    )
+    problem = build_initial_root_problem(SEED_INPUT, int(MAX_MODE_SCHEDULE))
     x = np.asarray(jax.device_get(problem.x0), dtype=float)
     first_bytes: int | None = None
 
@@ -83,9 +60,21 @@ def main() -> int:
         f"parameter_count={problem.parameter_count}",
         flush=True,
     )
+    for warmup_index in range(WARMUP):
+        print(f"[memory test] warmup={warmup_index} starting", flush=True)
+        started = time.perf_counter()
+        evaluation = problem.evaluate(x)
+        jax.block_until_ready((evaluation.residuals, evaluation.jacobian))
+        del evaluation
+        gc.collect()
+        print(
+            f"[memory test] warmup={warmup_index} complete "
+            f"elapsed_s={time.perf_counter() - started:.3f}",
+            flush=True,
+        )
     opt.repeated_evaluation_memory_samples(
         problem,
-        warmup=WARMUP,
+        warmup=0,
         repeats=REPEATS,
         scaled_parameter_values=x,
         on_sample=report,

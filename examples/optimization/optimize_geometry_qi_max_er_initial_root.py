@@ -76,6 +76,29 @@ def max_mode_schedule_values():
     return tuple(int(value) for value in MAX_MODE_SCHEDULE)
 
 
+def build_initial_root_problem(vmec_input, max_mode: int):
+    """Build the shared geometry + initial-Er optimizer problem for one stage."""
+
+    active_terms = tuple(term for term in terms if float(term[2]) != 0.0)
+    return opt.geometry_initial_er_root_only_least_squares_problem(
+        TRANSPORT_CONFIG,
+        active_terms,
+        vmec_input=vmec_input,
+        max_mode=int(max_mode),
+        include_profiles=False,
+        families=GEOMETRY_FAMILIES,
+        scale_mode=SCALE_MODE,
+        ess_alpha=ESS_ALPHA,
+        mboz=QI_MBOZ,
+        nboz=QI_NBOZ,
+        surfaces=tuple(float(s) for s in SURFACES),
+        geometry_max_iter=GEOMETRY_MAX_ITER,
+        geometry_solver_device=SOLVER_DEVICE,
+        device=SOLVER_DEVICE,
+        root_options=ROOT_OPTIONS,
+    )
+
+
 # --------------------------- objective functions ---------------------------
 qi = opt.geometry.boozer_qi_objective
 qi_maxj_1 = opt.geometry.boozer_maxj_objective
@@ -500,7 +523,6 @@ def write_outputs(optimized_input, initial_input, initial_problem, initial_x, fi
 
 # --------------------------- continuation ladder ----------------------------
 def main() -> int:
-    active_terms = tuple(term for term in terms if float(term[2]) != 0.0)
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     x = None
     current_input = SEED_INPUT
@@ -515,23 +537,7 @@ def main() -> int:
     max_mode_schedule = max_mode_schedule_values()
     for max_mode in max_mode_schedule:
         print(f"\n===== NEOPAX geometry QI + max-Er stage, max_mode={max_mode} =====", flush=True)
-        problem = opt.geometry_initial_er_root_only_least_squares_problem(
-            TRANSPORT_CONFIG,
-            active_terms,
-            vmec_input=current_input,
-            max_mode=max_mode,
-            include_profiles=False,
-            families=GEOMETRY_FAMILIES,
-            scale_mode=SCALE_MODE,
-            ess_alpha=ESS_ALPHA,
-            mboz=QI_MBOZ,
-            nboz=QI_NBOZ,
-            surfaces=tuple(float(s) for s in SURFACES),
-            geometry_max_iter=GEOMETRY_MAX_ITER,
-            geometry_solver_device=SOLVER_DEVICE,
-            device=SOLVER_DEVICE,
-            root_options=ROOT_OPTIONS,
-        )
+        problem = build_initial_root_problem(current_input, max_mode)
         if x is None or len(x) != problem.parameter_count:
             x = np.asarray(jax.device_get(problem.x0), dtype=float)
         print(
