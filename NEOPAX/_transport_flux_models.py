@@ -1312,6 +1312,12 @@ class CombinedTransportFluxModel(TransportFluxModelBase):
         native_multi_rhs_reuse_moment_drds_jvp_shared_primal = bool(
             kwargs.pop("native_multi_rhs_reuse_moment_drds_jvp_shared_primal", False)
         )
+        native_multi_rhs_reuse_moment_drds_jvp_shared_primal_with_vmec_coefficients_no_prepared_carry = bool(
+            kwargs.pop(
+                "native_multi_rhs_reuse_moment_drds_jvp_shared_primal_with_vmec_coefficients_no_prepared_carry",
+                False,
+            )
+        )
         return_native_vmec_coefficient_bars = bool(
             kwargs.pop("return_native_vmec_coefficient_bars", False)
         )
@@ -1319,6 +1325,10 @@ class CombinedTransportFluxModel(TransportFluxModelBase):
             self.neoclassical_model,
             (
                 "pullback_build_lagged_response_state_and_support_payload_"
+                "batched_interpolated_faces_native_multi_rhs_reuse_moment_drds_jvp_shared_primal"
+                "_with_vmec_coefficients_no_prepared_carry"
+                if native_multi_rhs_reuse_moment_drds_jvp_shared_primal_with_vmec_coefficients_no_prepared_carry
+                else "pullback_build_lagged_response_state_and_support_payload_"
                 "batched_interpolated_faces_native_multi_rhs_reuse_moment_drds_jvp_shared_primal"
                 if native_multi_rhs_reuse_moment_drds_jvp_shared_primal
                 else "pullback_build_lagged_response_state_and_support_payload_"
@@ -1418,6 +1428,21 @@ class CombinedTransportFluxModel(TransportFluxModelBase):
             lagged_response_bars,
             support,
             native_multi_rhs_reuse_moment_drds_jvp_shared_primal=True,
+            return_native_vmec_coefficient_bars=True,
+            **kwargs,
+        )
+
+    def pullback_build_lagged_response_state_and_support_payload_batched_interpolated_faces_native_multi_rhs_reuse_moment_drds_jvp_shared_primal_with_vmec_coefficients_no_prepared_carry(
+        self, state, lagged_response_bars, support, **kwargs,
+    ):
+        """Forward the compact native VMEC-coefficient joint contract."""
+        kwargs.pop("return_native_vmec_coefficient_bars", None)
+        return self.pullback_build_lagged_response_state_and_support_payload_batched_interpolated_faces(
+            state,
+            lagged_response_bars,
+            support,
+            native_multi_rhs_reuse_moment_drds_jvp_shared_primal=True,
+            native_multi_rhs_reuse_moment_drds_jvp_shared_primal_with_vmec_coefficients_no_prepared_carry=True,
             return_native_vmec_coefficient_bars=True,
             **kwargs,
         )

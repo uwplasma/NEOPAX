@@ -2337,3 +2337,9 @@ remote timing run.
 retained-channel gate were run in WSL with `JAX_PLATFORMS=cpu` and no pytest
 cache provider.  They exercise only the new dispatch and one small prepared
 NTX system; no transport rollout, profiler, or temporary dump is involved.
+
+**First remote wiring result:** the reverse segments completed; the run then
+stopped at the initial boundary because the new composed-equation wrapper
+looked for a corresponding `CombinedTransportFluxModel` method which had not
+been added.  The missing forwarding wrapper is now implemented.  This is a
+dispatch-only correction and does not change the native NTX/VMEC algebra.
