@@ -2199,6 +2199,7 @@ def _prepare_reverse_static_setup(
     reverse_rhs_transpose_mode: str = "generic",
     reverse_rhs_pullback_mode: str = "separate",
     reverse_final_objective_cotangent_mode: str = "scalar",
+    reverse_bootstrap_cotangent_mode: str = "separate",
     reverse_stage_cotangent_mode: str = "full",
     reverse_step_bwd_mode: str = "current",
     reverse_stage_adjoint_memory_mode: str = "default",
@@ -2241,6 +2242,7 @@ def _prepare_reverse_static_setup(
                 reverse_final_objective_cotangent_mode=str(
                     reverse_final_objective_cotangent_mode
                 ),
+                reverse_bootstrap_cotangent_mode=str(reverse_bootstrap_cotangent_mode),
                 reverse_stage_cotangent_mode=str(reverse_stage_cotangent_mode),
                 reverse_step_bwd_mode=str(reverse_step_bwd_mode),
                 reverse_stage_adjoint_memory_mode=str(reverse_stage_adjoint_memory_mode),
@@ -3663,6 +3665,9 @@ def _run_realtime_geometry_optimization_api_smoke(
             reverse_segment_primal_record_mode=str(args.reverse_segment_primal_record_mode),
             reverse_final_objective_cotangent_mode=str(
                 args.reverse_final_objective_cotangent_mode
+            ),
+            reverse_bootstrap_cotangent_mode=str(
+                args.reverse_bootstrap_cotangent_mode
             ),
             reverse_step_bwd_mode=str(args.reverse_step_bwd_mode),
             reverse_schedule_artifact_mode=str(args.reverse_schedule_artifact_mode),
@@ -5213,6 +5218,17 @@ def main() -> None:
             "geometry reverse path. 'scalar' preserves the per-objective VJPs. "
             "'grouped_vjp' groups all non-bootstrap objectives into one final-state "
             "VJP and one explicit-geometry VJP; bootstrap keeps its compact rule."
+        ),
+    )
+    parser.add_argument(
+        "--reverse-bootstrap-cotangent-mode",
+        choices=("separate", "joint_local_vjp"),
+        default="separate",
+        help=(
+            "Bootstrap terminal-cotangent rule. 'separate' preserves the "
+            "established state/support/geometry local VJPs. 'joint_local_vjp' "
+            "uses one joint local VJP per radius for the combined realtime "
+            "geometry payload. This is opt-in."
         ),
     )
     parser.add_argument(

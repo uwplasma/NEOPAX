@@ -49,6 +49,54 @@ class _MockSupportBar:
     face_prepared: object
 
 
+@jax.tree_util.register_dataclass
+@dataclasses.dataclass(frozen=True)
+class _ToyBootstrapGeometry:
+    """Minimal differentiable geometry payload for the terminal-VJP gate."""
+
+    scale: object
+
+
+@jax.tree_util.register_dataclass
+@dataclasses.dataclass(frozen=True)
+class _ToyBootstrapChannels:
+    """Only the sparse ``drds`` channel touched by the compact helper."""
+
+    drds: object
+
+
+@jax.tree_util.register_dataclass
+@dataclasses.dataclass(frozen=True)
+class _ToyBootstrapSupport:
+    center_channels: object
+    face_channels: object
+    center_prepared: object
+    face_prepared: object
+
+
+@dataclasses.dataclass(frozen=True)
+class _ToyBootstrapModel:
+    """Small analytic model exercising the real compact-helper contracts."""
+
+    geometry: object
+    support: object
+
+    def with_support_payload(self, support):
+        return dataclasses.replace(self, support=support)
+
+    def _momentum_corrected_upar_one_radius(self, state, radius_index, *, support=None):
+        support = self.support if support is None else support
+        prepared = support.center_prepared[0][radius_index]
+        drds = support.center_channels.drds[radius_index]
+        # Keep state, sparse support, and geometry genuinely coupled, while
+        # remaining a no-rollout analytic fixture.
+        return (
+            state.pressure[:, radius_index] * (1.0 + prepared)
+            + state.density[:, radius_index] * drds
+            + self.geometry.scale * (prepared + 0.5 * drds)
+        )
+
+
 def _small_runtime_model(n_energy=1):
     """Construct only the moment-weight state needed by the local adapter."""
 
@@ -127,6 +175,57 @@ def _assert_float_tree_allclose(actual, expected, *, rtol=1e-9, atol=1e-11):
                     f"max_abs={float(jnp.max(difference)):.16e} "
                     f"max_rel={float(jnp.max(difference / scale)):.16e}"
                 )
+
+
+def test_joint_momentum_corrected_upar_pullback_matches_separate_helpers():
+    """One local bootstrap VJP preserves the three established contracts.
+
+    This is deliberately analytic and contains no transport rollout, VMEC
+    solve, profiler, or filesystem activity.  It exercises the exact sparse
+    prepared-plus-``drds`` support layout used by the production helper.
+    """
+
+    geometry = _ToyBootstrapGeometry(scale=jnp.asarray(1.7))
+    support = _ToyBootstrapSupport(
+        center_channels=_ToyBootstrapChannels(
+            drds=jnp.asarray([0.8, 1.1]),
+        ),
+        face_channels=(jnp.asarray([0.2, -0.4]),),
+        center_prepared=(jnp.asarray([0.3, -0.25]),),
+        face_prepared=(jnp.asarray([0.1, 0.5, -0.2]),),
+    )
+    model = _ToyBootstrapModel(geometry=geometry, support=support)
+    state = TransportState(
+        density=jnp.asarray([[1.0, 1.2], [0.9, 1.1]]),
+        pressure=jnp.asarray([[1.3, 1.5], [1.1, 1.4]]),
+        Er=jnp.asarray([2.0e-4, 2.5e-4]),
+    )
+    upar_bar = jnp.asarray([[0.4, -0.3], [-0.2, 0.5]])
+
+    state_expected = (
+        NTXExactLijRuntimeTransportModel.pullback_momentum_corrected_upar_state_by_radius(
+            model, state, upar_bar
+        )
+    )
+    support_expected = (
+        NTXExactLijRuntimeTransportModel.pullback_momentum_corrected_upar_support_by_radius(
+            model, state, upar_bar, support
+        )
+    )
+    geometry_expected = (
+        NTXExactLijRuntimeTransportModel.pullback_momentum_corrected_upar_geometry_by_radius(
+            model, state, upar_bar, geometry, support
+        )
+    )
+    state_actual, support_actual, geometry_actual = (
+        NTXExactLijRuntimeTransportModel.pullback_momentum_corrected_upar_state_support_geometry_by_radius(
+            model, state, upar_bar, geometry, support
+        )
+    )
+
+    _assert_float_tree_allclose(state_actual, state_expected, rtol=1e-12, atol=1e-12)
+    _assert_float_tree_allclose(support_actual, support_expected, rtol=1e-12, atol=1e-12)
+    _assert_float_tree_allclose(geometry_actual, geometry_expected, rtol=1e-12, atol=1e-12)
 
 
 def test_native_vmec_coefficient_bridge_extracts_runtime_channels_only():

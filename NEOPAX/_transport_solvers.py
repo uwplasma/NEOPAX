@@ -3910,6 +3910,7 @@ class _RadauAcceptedStepPhysicsContext:
     reverse_segment_start_replay_mode: str = "legacy"
     reverse_segment_primal_record_mode: str = "reconstruct"
     reverse_final_objective_cotangent_mode: str = "scalar"
+    reverse_bootstrap_cotangent_mode: str = "separate"
     reverse_stage_cotangent_mode: str = "full"
     reverse_step_bwd_mode: str = "current"
     reverse_stage_adjoint_memory_mode: str = "default"

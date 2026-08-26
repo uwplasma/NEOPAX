@@ -2950,6 +2950,7 @@ def prepare_reverse_static_setup(
     reverse_segment_start_replay_mode: str = "legacy",
     reverse_segment_primal_record_mode: str = "reconstruct",
     reverse_final_objective_cotangent_mode: str = "scalar",
+    reverse_bootstrap_cotangent_mode: str = "separate",
     reverse_stage_cotangent_mode: str = "full",
     reverse_step_bwd_mode: str = "current",
     reverse_stage_adjoint_memory_mode: str = "default",
@@ -3009,6 +3010,12 @@ def prepare_reverse_static_setup(
         raise ValueError(
             "reverse_final_objective_cotangent_mode must be one of "
             "{'scalar', 'grouped_vjp'}."
+        )
+    reverse_bootstrap_cotangent_mode = str(reverse_bootstrap_cotangent_mode).strip().lower()
+    if reverse_bootstrap_cotangent_mode not in {"separate", "joint_local_vjp"}:
+        raise ValueError(
+            "reverse_bootstrap_cotangent_mode must be one of "
+            "{'separate', 'joint_local_vjp'}."
         )
     reverse_rebuild_support_pullback_mode = str(
         reverse_rebuild_support_pullback_mode
@@ -3111,6 +3118,7 @@ def prepare_reverse_static_setup(
                 reverse_final_objective_cotangent_mode=(
                     reverse_final_objective_cotangent_mode
                 ),
+                reverse_bootstrap_cotangent_mode=reverse_bootstrap_cotangent_mode,
                 reverse_stage_cotangent_mode=str(reverse_stage_cotangent_mode),
                 reverse_step_bwd_mode=str(reverse_step_bwd_mode),
                 reverse_stage_adjoint_memory_mode=str(reverse_stage_adjoint_memory_mode),
@@ -3709,6 +3717,18 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
             "Unknown reverse_final_objective_cotangent_mode "
             f"{final_objective_cotangent_mode!r}."
         )
+    bootstrap_cotangent_mode = str(
+        getattr(
+            reverse_setup.execution_context.physics_context,
+            "reverse_bootstrap_cotangent_mode",
+            "separate",
+        )
+    ).strip().lower()
+    if bootstrap_cotangent_mode not in {"separate", "joint_local_vjp"}:
+        raise ValueError(
+            "Unknown reverse_bootstrap_cotangent_mode "
+            f"{bootstrap_cotangent_mode!r}."
+        )
     bootstrap_objective_name = "bootstrap_current_softmax_abs_scaled"
     ordinary_objective_indices = tuple(
         objective_i
@@ -3822,12 +3842,20 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
                 "pullback_momentum_corrected_upar_geometry_by_radius",
                 None,
             )
+            joint_pullback_fn = getattr(
+                neoclassical_model,
+                "pullback_momentum_corrected_upar_state_support_geometry_by_radius",
+                None,
+            )
             if not callable(corrected_fluxes_fn):
                 raise NotImplementedError(
                     "bootstrap_current_softmax_abs_scaled requires realtime NTX "
                     "evaluate_momentum_corrected_fluxes for compact full-transport AD."
                 )
-            if not callable(state_pullback_fn) or not callable(support_pullback_fn):
+            if (
+                bootstrap_cotangent_mode == "separate"
+                and (not callable(state_pullback_fn) or not callable(support_pullback_fn))
+            ):
                 raise NotImplementedError(
                     "bootstrap_current_softmax_abs_scaled requires compact corrected-Upar "
                     "state and support pullbacks on the realtime NTX model."
@@ -3838,7 +3866,35 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
                 runtime,
                 corrected_fluxes,
             )
-            final_state_bar = state_pullback_fn(final_state_for_bootstrap, upar_bar)
+            use_joint_bootstrap_pullback = (
+                bootstrap_cotangent_mode == "joint_local_vjp"
+                and combined_geometry_payload
+            )
+            if bootstrap_cotangent_mode == "joint_local_vjp" and not combined_geometry_payload:
+                raise NotImplementedError(
+                    "reverse_bootstrap_cotangent_mode='joint_local_vjp' requires "
+                    "the combined realtime geometry payload."
+                )
+            if use_joint_bootstrap_pullback:
+                if not callable(joint_pullback_fn):
+                    raise NotImplementedError(
+                        "reverse_bootstrap_cotangent_mode='joint_local_vjp' requires "
+                        "the compact joint corrected-Upar pullback on the realtime NTX model."
+                    )
+                geometry = support_payload["geometry"]
+                ntx_support = support_payload["ntx_support"]
+                (
+                    final_state_bar,
+                    support_bar_leaves,
+                    geometry_objective_bar,
+                ) = joint_pullback_fn(
+                    final_state_for_bootstrap,
+                    upar_bar,
+                    geometry,
+                    ntx_support,
+                )
+            else:
+                final_state_bar = state_pullback_fn(final_state_for_bootstrap, upar_bar)
             _, unpack_pullback = jax.vjp(
                 reverse_setup.prepared_rollout.physics_context.unpack_flat,
                 final_y_for_objective,
@@ -3846,24 +3902,25 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
             final_y_bar_rows.append(unpack_pullback(final_state_bar)[0])
             objective_values_rows.append(objective_value)
             if combined_geometry_payload:
-                if not callable(geometry_pullback_fn):
+                if not use_joint_bootstrap_pullback and not callable(geometry_pullback_fn):
                     raise NotImplementedError(
                         "bootstrap_current_softmax_abs_scaled requires compact corrected-Upar "
                         "geometry pullback for combined realtime geometry payloads."
                     )
-                geometry = support_payload["geometry"]
-                ntx_support = support_payload["ntx_support"]
-                geometry_objective_bar = geometry_pullback_fn(
-                    final_state_for_bootstrap,
-                    upar_bar,
-                    geometry,
-                    ntx_support,
-                )
-                support_bar_leaves = support_pullback_fn(
-                    final_state_for_bootstrap,
-                    upar_bar,
-                    ntx_support,
-                )
+                if not use_joint_bootstrap_pullback:
+                    geometry = support_payload["geometry"]
+                    ntx_support = support_payload["ntx_support"]
+                    geometry_objective_bar = geometry_pullback_fn(
+                        final_state_for_bootstrap,
+                        upar_bar,
+                        geometry,
+                        ntx_support,
+                    )
+                    support_bar_leaves = support_pullback_fn(
+                        final_state_for_bootstrap,
+                        upar_bar,
+                        ntx_support,
+                    )
                 _, ntx_treedef = jax.tree_util.tree_flatten(ntx_support)
                 objective_payload_bar_rows.append(
                     {
@@ -6000,6 +6057,7 @@ def internal_realtime_geometry_transport_reverse_table_result_builder(
     reverse_segment_start_replay_mode: str = "legacy",
     reverse_segment_primal_record_mode: str = "reconstruct",
     reverse_final_objective_cotangent_mode: str = "scalar",
+    reverse_bootstrap_cotangent_mode: str = "separate",
     reverse_stage_cotangent_mode: str = "full",
     reverse_step_bwd_mode: str = "reduced_cotangent",
     reverse_stage_adjoint_memory_mode: str = "default",
@@ -6156,6 +6214,12 @@ def internal_realtime_geometry_transport_reverse_table_result_builder(
                 opts.get(
                     "reverse_final_objective_cotangent_mode",
                     reverse_final_objective_cotangent_mode,
+                )
+            ),
+            reverse_bootstrap_cotangent_mode=str(
+                opts.get(
+                    "reverse_bootstrap_cotangent_mode",
+                    reverse_bootstrap_cotangent_mode,
                 )
             ),
             reverse_stage_cotangent_mode=str(opts.get("reverse_stage_cotangent_mode", reverse_stage_cotangent_mode)),

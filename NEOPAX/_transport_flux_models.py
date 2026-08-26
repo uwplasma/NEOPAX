@@ -9121,6 +9121,202 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         geometry_flat_bar, _ = jax.lax.scan(_accumulate, _zero_flat_like(), radius_indices)
         return _split_flat_geometry(geometry_flat_bar)
 
+    def pullback_momentum_corrected_upar_state_support_geometry_by_radius(
+        self,
+        state,
+        upar_bar,
+        geometry,
+        support,
+    ):
+        """Joint compact Upar pullback with one local VJP per radius.
+
+        This is deliberately an opt-in companion to the three established
+        state/support/geometry helpers above.  The support contract is the
+        same sparse center-prepared-plus-``drds`` contract used by the
+        existing support helper; all other support leaves remain zero.
+        """
+
+        upar_bar = jnp.asarray(upar_bar, dtype=state.pressure.dtype)
+        radius_count = int(upar_bar.shape[-1])
+        radius_indices = jnp.arange(radius_count, dtype=jnp.int32)
+
+        def _zero_like_leaf(leaf):
+            arr = jnp.asarray(leaf)
+            if jnp.issubdtype(arr.dtype, jnp.inexact):
+                return jnp.zeros_like(arr)
+            return jnp.zeros(arr.shape, dtype=jnp.float64)
+
+        def _add_trees(left, right):
+            return jax.tree_util.tree_map(lambda a, b: a + b, left, right)
+
+        def _zero_tree_leaves(tree):
+            return tuple(_zero_like_leaf(leaf) for leaf in jax.tree_util.tree_leaves(tree))
+
+        center_channels_bar0 = _float_delta_tree_like(support.center_channels)
+        center_prepared_bar_leaves0 = _zero_tree_leaves(support.center_prepared)
+        face_channels_bar_leaves = _zero_tree_leaves(support.face_channels)
+        face_prepared_bar_leaves = _zero_tree_leaves(support.face_prepared)
+        geometry_delta0 = _float_delta_tree_like(geometry)
+        geometry_delta_leaves0, geometry_delta_treedef = jax.tree_util.tree_flatten(
+            geometry_delta0
+        )
+        geometry_delta_shapes = tuple(jnp.asarray(leaf).shape for leaf in geometry_delta_leaves0)
+        geometry_delta_sizes = tuple(int(jnp.asarray(leaf).size) for leaf in geometry_delta_leaves0)
+        geometry_flat_delta0 = jnp.concatenate(
+            [jnp.ravel(jnp.asarray(leaf)) for leaf in geometry_delta_leaves0]
+        )
+
+        def _split_flat_vector(flat, sizes, shapes, treedef):
+            leaves = []
+            offset = 0
+            for size, shape in zip(sizes, shapes, strict=True):
+                leaves.append(jnp.reshape(flat[offset : offset + size], shape))
+                offset += size
+            return treedef.unflatten(leaves), flat[offset]
+
+        def _split_flat_geometry(flat):
+            leaves = []
+            offset = 0
+            for size, shape in zip(geometry_delta_sizes, geometry_delta_shapes, strict=True):
+                leaves.append(jnp.reshape(flat[offset : offset + size], shape))
+                offset += size
+            return geometry_delta_treedef.unflatten(leaves)
+
+        def _accumulate(carry, radius_index):
+            state_carry, channels_carry, prepared_leaf_carry, geometry_flat_carry = carry
+            prepared = jax.tree_util.tree_map(
+                lambda arr: jax.lax.dynamic_index_in_dim(arr, radius_index, axis=0, keepdims=False),
+                support.center_prepared,
+            )
+            drds_value = jax.lax.dynamic_index_in_dim(
+                support.center_channels.drds,
+                radius_index,
+                axis=0,
+                keepdims=False,
+            )
+            prepared_delta0 = _float_delta_tree_like(prepared)
+            prepared_delta_leaves0, prepared_delta_treedef = jax.tree_util.tree_flatten(
+                prepared_delta0
+            )
+            prepared_delta_shapes = tuple(
+                jnp.asarray(leaf).shape for leaf in prepared_delta_leaves0
+            )
+            prepared_delta_sizes = tuple(
+                int(jnp.asarray(leaf).size) for leaf in prepared_delta_leaves0
+            )
+            support_flat_delta0 = jnp.concatenate(
+                [jnp.ravel(jnp.asarray(leaf)) for leaf in prepared_delta_leaves0]
+                + [jnp.ravel(jnp.zeros_like(drds_value))]
+            )
+
+            def _upar_from_local_inputs(
+                state_value,
+                support_flat_delta,
+                geometry_flat_delta,
+            ):
+                prepared_delta, drds_delta = _split_flat_vector(
+                    support_flat_delta,
+                    prepared_delta_sizes,
+                    prepared_delta_shapes,
+                    prepared_delta_treedef,
+                )
+
+                def _add_local_prepared_delta(full, local_delta):
+                    full_arr = jnp.asarray(full)
+                    if not jnp.issubdtype(full_arr.dtype, jnp.inexact):
+                        return full
+                    return full_arr.at[radius_index].add(
+                        jnp.asarray(local_delta, dtype=full_arr.dtype)
+                    )
+
+                support_value = dataclasses.replace(
+                    support,
+                    center_prepared=jax.tree_util.tree_map(
+                        _add_local_prepared_delta,
+                        support.center_prepared,
+                        prepared_delta,
+                    ),
+                    center_channels=dataclasses.replace(
+                        support.center_channels,
+                        drds=support.center_channels.drds.at[radius_index].add(drds_delta),
+                    ),
+                )
+                geometry_value = _add_float_delta_tree(
+                    geometry,
+                    _split_flat_geometry(geometry_flat_delta),
+                )
+                model = dataclasses.replace(self, geometry=geometry_value, support=support_value)
+                return model._momentum_corrected_upar_one_radius(
+                    state_value,
+                    radius_index,
+                    support=support_value,
+                )
+
+            _, pullback = jax.vjp(
+                _upar_from_local_inputs,
+                state,
+                support_flat_delta0,
+                geometry_flat_delta0,
+            )
+            local_bar = jax.lax.dynamic_index_in_dim(
+                upar_bar,
+                radius_index,
+                axis=1,
+                keepdims=False,
+            )
+            state_bar, support_flat_bar, geometry_flat_bar = pullback(local_bar)
+            prepared_flat_size = int(sum(prepared_delta_sizes))
+            drds_bar = support_flat_bar[prepared_flat_size]
+
+            updated_prepared_leaves = []
+            offset = 0
+            for carry_leaf, size, shape in zip(
+                prepared_leaf_carry,
+                prepared_delta_sizes,
+                prepared_delta_shapes,
+                strict=True,
+            ):
+                local_prepared_bar = jnp.reshape(
+                    support_flat_bar[offset : offset + size], shape
+                )
+                updated_prepared_leaves.append(
+                    carry_leaf.at[radius_index].add(local_prepared_bar)
+                )
+                offset += size
+
+            return (
+                _add_trees(state_carry, state_bar),
+                dataclasses.replace(
+                    channels_carry,
+                    drds=channels_carry.drds.at[radius_index].add(drds_bar),
+                ),
+                tuple(updated_prepared_leaves),
+                geometry_flat_carry + geometry_flat_bar,
+            ), None
+
+        (
+            state_bar,
+            center_channels_bar,
+            center_prepared_bar_leaves,
+            geometry_flat_bar,
+        ), _ = jax.lax.scan(
+            _accumulate,
+            (
+                jax.tree_util.tree_map(_zero_like_leaf, state),
+                center_channels_bar0,
+                center_prepared_bar_leaves0,
+                jnp.zeros_like(geometry_flat_delta0),
+            ),
+            radius_indices,
+        )
+        support_bar_leaves = (
+            tuple(jax.tree_util.tree_leaves(center_channels_bar))
+            + face_channels_bar_leaves
+            + tuple(center_prepared_bar_leaves)
+            + face_prepared_bar_leaves
+        )
+        return state_bar, support_bar_leaves, _split_flat_geometry(geometry_flat_bar)
+
     def _build_axis_lagged_response(
         self,
         *,

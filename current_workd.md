@@ -2390,3 +2390,44 @@ profile, XLA dump, cache, or result files, and is intentionally opt-in because
 it adds one segment plus one support and one state transpose of diagnostic
 work.  The established standard initial selector and the accepted native
 rebuild selector remain unchanged.
+
+### Planned terminal bootstrap compact-pullback fusion (2026-08-26)
+
+The final-objective timing diagnostic isolates the 76.98 s terminal phase:
+ordinary final-state and explicit-geometry objective VJPs account for about
+7.3 s, while `bootstrap_current_softmax_abs_scaled` accounts for about
+67.3 s.  The bootstrap implementation currently invokes three independent
+per-radius scans over the same `_momentum_corrected_upar_one_radius` map:
+state, support, and geometry.  Each scan constructs its own local VJP.
+
+Plan:
+
+1. Add an unselected model helper that creates one local VJP per radius with
+   `(state_delta, support_delta, geometry_delta)` as differentiable inputs,
+   applies the existing Upar cotangent once, and returns the three existing
+   output contracts.  Preserve the current three individual helper methods.
+2. Add a separate final-objective selector, defaulting to the current three
+   helpers.  The selector must be outside the Radau segment JIT and must
+   return the same `final_y_bar`, support-payload bar, and geometry bar trees.
+3. Add a small no-rollout oracle that compares the joint result leaf-for-leaf
+   with the three current helpers for multiple nonzero sparse Upar bars.
+4. Add an opt-in timing line around the bootstrap helper, then benchmark only
+   after the exact-tree oracle passes.
+
+**Implementation status:** step 1 is implemented as
+`pullback_momentum_corrected_upar_state_support_geometry_by_radius`.  It
+shares exactly one local VJP per radius and retains the sparse
+center-prepared-plus-`drds` support contract.  Step 2 is wired as the
+unselected `--reverse-bootstrap-cotangent-mode joint_local_vjp`; the default
+remains `separate`.  A no-rollout analytic oracle compares all three returned
+trees to the established three-helper implementation.  Static compilation and
+`git diff --check` pass.  The Windows Python installation lacks pytest and
+the attempted WSL CPU gate was blocked before launch by
+`Wsl/Service/CreateInstance/E_ACCESSDENIED`; no production computation or
+filesystem dump was run locally.
+
+Scope and non-goals: this shares NTX/momentum primal and VJP residual work
+*within the terminal bootstrap objective only*.  It cannot reuse those values
+in a Radau reverse segment, because each segment differentiates a different
+lagged-response map at a different accepted-step state.  It does not change
+the selected rebuild mode, segment equations, initial boundary, or defaults.
