@@ -2108,6 +2108,7 @@ def evaluate_geometry_initial_er_root_only_least_squares_benchmark_tables(
     geometry_step_size: float | None = None,
     geometry_solver_device: str | None = "default",
     root_options: Mapping[str, object] | None = None,
+    raw_block_stage=None,
 ) -> LeastSquaresEvaluation:
     """Evaluate mixed objectives using only benchmark-validated table backends."""
 
@@ -2157,6 +2158,7 @@ def evaluate_geometry_initial_er_root_only_least_squares_benchmark_tables(
                 tuple(spec.as_tuple() for spec in parameter_set.vmec_boundary_specs),
                 max_iter=geometry_max_iter,
                 solver_device=geometry_solver_device,
+                stage=raw_block_stage,
             )
             transport_result = geometry_active_initial_er_root_only_reverse_table(
                 config=config,

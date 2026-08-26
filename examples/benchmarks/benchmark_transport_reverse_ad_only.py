@@ -1336,6 +1336,7 @@ def _reverse_all_objectives_multi_rhs_reduced_for_parameter_vector(
     if step_bwd_mode not in {
         "reduced_cotangent",
         "reduced_cotangent_call_boundary",
+        "reduced_cotangent_call_boundary_common_branch_hoist",
         "reduced_cotangent_lean_replay",
         "reduced_cotangent_recompute_replay",
         "lean_replay",
@@ -1469,6 +1470,7 @@ def _reverse_objective_support_payload_bar_for_parameter_vector(
     if step_bwd_mode not in {
         "reduced_cotangent",
         "reduced_cotangent_call_boundary",
+        "reduced_cotangent_call_boundary_common_branch_hoist",
         "reduced_cotangent_lean_replay",
         "reduced_cotangent_recompute_replay",
         "lean_replay",
@@ -1683,6 +1685,7 @@ def _reverse_objective_initial_state_bar(
     if step_bwd_mode not in {
         "reduced_cotangent",
         "reduced_cotangent_call_boundary",
+        "reduced_cotangent_call_boundary_common_branch_hoist",
         "reduced_cotangent_lean_replay",
         "reduced_cotangent_recompute_replay",
         "lean_replay",
@@ -1861,6 +1864,7 @@ def _reverse_all_objectives_initial_state_boundary(
     if step_bwd_mode not in {
         "reduced_cotangent",
         "reduced_cotangent_call_boundary",
+        "reduced_cotangent_call_boundary_common_branch_hoist",
         "reduced_cotangent_lean_replay",
         "reduced_cotangent_recompute_replay",
         "lean_replay",
@@ -5767,6 +5771,7 @@ def main() -> None:
             "manual_split",
             "reduced_cotangent",
             "reduced_cotangent_call_boundary",
+            "reduced_cotangent_call_boundary_common_branch_hoist",
             "reduced_cotangent_lean_replay",
             "reduced_cotangent_recompute_replay",
             "reduced_cotangent_host_segments",

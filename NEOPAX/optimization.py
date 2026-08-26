@@ -18,6 +18,7 @@ from ._geometry_autodiff import (
     boundary_param_entries,
     build_neopax_geometry_and_ntx_exact_lij_support_from_state,
     build_geometry_autodiff_context,
+    geometry_raw_block_stage,
     geometry_raw_block_solve_from_param_vector,
 )
 from ._constants import elementary_charge
@@ -216,6 +217,7 @@ class GeometryInitialErRootLeastSquaresProblem:
     geometry_step_size: float | None = None
     geometry_solver_device: str | None = "default"
     root_options: Mapping[str, object] | None = None
+    raw_block_stage: object | None = None
 
     @property
     def parameter_count(self) -> int:
@@ -318,6 +320,7 @@ class GeometryInitialErRootLeastSquaresProblem:
             geometry_step_size=self.geometry_step_size,
             geometry_solver_device=self.geometry_solver_device,
             root_options=self.root_options,
+            raw_block_stage=self.raw_block_stage,
         )
         result = _assemble_mixed_initial_er_root_result(
             self.terms,
@@ -1206,6 +1209,15 @@ def geometry_initial_er_root_only_least_squares_problem(
     if geometry_solver_device is None:
         geometry_solver_device = geom_cfg.get("vmec_implicit_solver_device", "default")
     normalized_terms = _normalize_initial_er_root_least_squares_terms(terms)
+    raw_block_stage = (
+        None
+        if geometry_parameterization is None
+        else geometry_raw_block_stage(
+            context,
+            tuple(spec.as_tuple() for spec in geometry_parameterization.specs),
+            max_iter=geometry_max_iter,
+        )
+    )
     return GeometryInitialErRootLeastSquaresProblem(
         config=config_eff,
         context=context,
@@ -1234,6 +1246,7 @@ def geometry_initial_er_root_only_least_squares_problem(
         geometry_step_size=geometry_step_size,
         geometry_solver_device=geometry_solver_device,
         root_options=None if root_options is None else dict(root_options),
+        raw_block_stage=raw_block_stage,
     )
 
 

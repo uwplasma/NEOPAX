@@ -3490,6 +3490,7 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
     if step_bwd_mode not in {
         "reduced_cotangent",
         "reduced_cotangent_call_boundary",
+        "reduced_cotangent_call_boundary_common_branch_hoist",
         "reduced_cotangent_lean_replay",
         "reduced_cotangent_recompute_replay",
         "lean_replay",
@@ -4153,7 +4154,8 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
     print(
         f"{progress_prefix} progress: support reverse final-objective cotangents ready "
         f"elapsed_s={time.perf_counter() - phase_start:.3f} "
-        f"mode={final_objective_cotangent_mode}",
+        f"ordinary_mode={final_objective_cotangent_mode} "
+        f"bootstrap_mode={bootstrap_cotangent_mode}",
         flush=True,
     )
     if phase_timing_diagnostics:

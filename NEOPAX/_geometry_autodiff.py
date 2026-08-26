@@ -780,6 +780,46 @@ class GeometryRawBlockSolve:
     param_entries: tuple[dict[str, Any], ...]
 
 
+@dataclasses.dataclass(frozen=True, slots=True)
+class GeometryRawBlockStage:
+    """Static VMEX raw-block setup reused by one optimization stage.
+
+    Boundary coefficients remain dynamic inputs to
+    :func:`geometry_raw_block_solve_from_param_vector`.  This object contains
+    only the VMEX implicit configuration and the fixed parameter layout, so
+    reusing it cannot change the primal or reverse-AD mathematics.
+    """
+
+    implicit: Any
+    implicit_cfg: Any
+    param_entries: tuple[dict[str, Any], ...]
+
+
+def geometry_raw_block_stage(
+    context: "GeometryAutodiffContext",
+    param_specs: Sequence[tuple[str, int, int]],
+    *,
+    max_iter: int | None = None,
+) -> GeometryRawBlockStage:
+    """Build immutable raw-block configuration for a fixed optimization stage."""
+
+    if not _using_current_vmec_jax_context(context):
+        raise ValueError("geometry_raw_block_stage requires the current VMEX implicit AD lane.")
+    implicit = _import_vmec_jax_implicit()
+    config_kwargs = {
+        "ns": int(context.static.resolution.ns),
+        "mode": "cli",
+        "multigrid": True,
+    }
+    if max_iter is not None:
+        config_kwargs["max_iterations"] = int(max_iter)
+    return GeometryRawBlockStage(
+        implicit=implicit,
+        implicit_cfg=implicit.make_config(context.indata, **config_kwargs),
+        param_entries=boundary_param_entries(context, param_specs),
+    )
+
+
 def _stop_gradient_if_jax_value(leaf):
     try:
         return jax.lax.stop_gradient(leaf)
@@ -794,19 +834,39 @@ def geometry_raw_block_solve_from_param_vector(
     *,
     max_iter: int | None = None,
     solver_device: str | None = None,
+    stage: GeometryRawBlockStage | None = None,
 ) -> GeometryRawBlockSolve:
     """Solve VMEC once and keep the raw-block transpose auxiliary data."""
 
     if not _using_current_vmec_jax_context(context):
         raise ValueError("geometry_raw_block_solve_from_param_vector requires the current VMEX implicit AD lane.")
-    param_entries = boundary_param_entries(context, param_specs)
-    implicit, implicit_params, implicit_cfg = _current_implicit_params_cfg_for_param_vector(
-        context,
-        jnp.asarray(param_deltas, dtype=jnp.float64),
-        param_entries,
-        max_iter=max_iter,
-        solver_device=solver_device,
-    )
+    normalized_specs = tuple((str(family).strip().upper(), int(m), int(n)) for family, m, n in param_specs)
+    if stage is None:
+        param_entries = boundary_param_entries(context, normalized_specs)
+        implicit, implicit_params, implicit_cfg = _current_implicit_params_cfg_for_param_vector(
+            context,
+            jnp.asarray(param_deltas, dtype=jnp.float64),
+            param_entries,
+            max_iter=max_iter,
+            solver_device=solver_device,
+        )
+    else:
+        param_entries = stage.param_entries
+        staged_specs = tuple(
+            (str(entry["family"]).strip().upper(), int(entry["m"]), int(entry["n"]))
+            for entry in param_entries
+        )
+        if staged_specs != normalized_specs:
+            raise ValueError("GeometryRawBlockStage parameter layout does not match param_specs.")
+        implicit = stage.implicit
+        implicit_cfg = stage.implicit_cfg
+        implicit_params = _implicit_params_with_boundary_deltas(
+            context,
+            implicit,
+            jnp.asarray(param_deltas, dtype=jnp.float64),
+            param_entries,
+            solver_device=solver_device,
+        )
     # The raw-block transpose below differentiates the residual with respect to
     # the full VMEC parameter pytree and then extracts requested harmonic
     # columns.  It does not need the traced construction history from the

@@ -5842,6 +5842,231 @@ def _execute_radau_accepted_step_next_reduced_cotangent_batched_bwd(
     )
 
 
+def _radau_fixed_lagged_step_reverse_common(
+    kernel_context: _RadauAcceptedStepKernelContext,
+    physics_context: _RadauAcceptedStepPhysicsContext,
+    carry_in: _RadauAcceptedStepCarry,
+    primal_result: _RadauAcceptedStepReverseMinimalAttemptResult,
+    lagged_response,
+    next_reduced_bars: _RadauAcceptedStepReducedCotangent,
+    support,
+    *,
+    collect_native_vmec_coefficients: bool,
+    native_vmec_zero_leaves: tuple[Any, ...],
+) -> tuple[Any, Any, Any, tuple[Any, ...]]:
+    """Run the branch-independent part of one reduced step transpose.
+
+    The reuse and rebuild paths have identical stage-adjoint and fixed-lagged
+    RHS transposes.  Keeping this as a separate pure helper is the first part
+    of hoisting that common graph out of the per-slot ``lax.cond``.  Its return
+    values are transient slot values: none are added to the segment record or
+    to the reverse scan carry.
+    """
+
+    def _add_tangent_trees(lhs, rhs, primal):
+        lhs_aligned = _radau_align_tangent_tree_to_primal(lhs, primal)
+        rhs_aligned = _radau_align_tangent_tree_to_primal(rhs, primal)
+        if lhs_aligned is None:
+            return rhs_aligned
+        if rhs_aligned is None:
+            return lhs_aligned
+        return jax.tree_util.tree_map(lambda a, b: a + b, lhs_aligned, rhs_aligned)
+
+    carry_for_linear_map = dataclasses.replace(
+        _radau_carry_with_forward_only_jvp_fields(carry_in),
+        lagged_response_cache=primal_result.carry_after_attempt.lagged_response_cache,
+        lagged_response_valid=jnp.asarray(True),
+        lagged_reference_y=primal_result.carry_after_attempt.lagged_reference_y,
+    )
+    trial_y_bars = jnp.asarray(next_reduced_bars.y, dtype=kernel_context.dtype)
+    if physics_context.project_flat is not None:
+        _, project_pullback = jax.vjp(physics_context.project_flat, primal_result.trial_y)
+        trial_y_bars = jax.vmap(lambda bar: project_pullback(bar)[0])(trial_y_bars)
+    dz_bars = primal_result.trial_dt * kernel_context.b[None, :, None] * trial_y_bars[:, None, :]
+    memory_mode = str(getattr(physics_context, "reverse_stage_adjoint_memory_mode", "default")).strip().lower()
+    with _radau_reverse_profile_scope(physics_context, "reverse_segment/stage_adjoint_solve"):
+        if memory_mode in {"stage_call_boundary", "call_boundary", "call_stage_adjoint"}:
+            residual_bars = jax.vmap(
+                lambda dz_bar: _radau_solve_exact_stage_residual_transpose(
+                    kernel_context, physics_context, carry_in, primal_result, lagged_response,
+                    rhs=jnp.asarray(dz_bar, dtype=kernel_context.dtype).reshape((-1,)),
+                )
+            )(dz_bars)
+        else:
+            residual_bars = _radau_solve_exact_stage_residual_transpose_batched(
+                kernel_context, physics_context, carry_in, primal_result, lagged_response,
+                rhs=dz_bars.reshape((dz_bars.shape[0], -1)),
+            )
+    rhs_pullback_mode = str(getattr(physics_context, "reverse_rhs_pullback_mode", "separate")).strip().lower()
+    if rhs_pullback_mode == "fused_ntx":
+        if physics_context.flat_rhs_lagged_response_all_pullback is None:
+            raise ValueError("reverse_rhs_pullback_mode='fused_ntx' requires the combined fixed-lagged RHS pullback hook.")
+        rhs_transpose_mode = str(getattr(physics_context, "reverse_rhs_transpose_mode", "generic")).strip().lower()
+        cotangent_mode = str(getattr(physics_context, "reverse_stage_cotangent_mode", "full")).strip().lower()
+        if rhs_transpose_mode not in {"explicit", "explicit_ntx_interpolated"} or cotangent_mode != "full":
+            raise ValueError("reverse_rhs_pullback_mode='fused_ntx' currently requires reverse_rhs_transpose_mode='explicit_ntx_interpolated' and reverse_stage_cotangent_mode='full'.")
+        residual_y_bars, residual_lagged_bars, support_bars = jax.vmap(
+            lambda residual_bar: _radau_exact_stage_residual_input_and_support_pullback_fused_ntx(
+                kernel_context, physics_context, carry_in, primal_result, lagged_response, residual_bar, support,
+            )
+        )(residual_bars)
+        support_bar_leaves = tuple(jax.tree_util.tree_leaves(support_bars))
+    elif rhs_pullback_mode == "separate":
+        with _radau_reverse_profile_scope(physics_context, "reverse_segment/fixed_lagged_rhs_state_transpose"):
+            residual_y_bars, _, residual_lagged_bars = jax.vmap(
+                lambda residual_bar: _radau_exact_stage_residual_input_pullback(
+                    kernel_context, physics_context, carry_in, primal_result, lagged_response, residual_bar, compute_dt_bar=False,
+                )
+            )(residual_bars)
+        with _radau_reverse_profile_scope(physics_context, "reverse_segment/fixed_lagged_rhs_support_transpose"):
+            support_bar_leaves = jax.vmap(
+                lambda residual_bar: tuple(jax.tree_util.tree_leaves(_radau_sanitize_support_delta_bar_tree(
+                    support, _radau_exact_stage_residual_support_pullback(
+                        kernel_context, physics_context, carry_in, primal_result, lagged_response, residual_bar, support,
+                    ),
+                )))
+            )(residual_bars)
+    else:
+        raise ValueError(f"Unknown reverse_rhs_pullback_mode '{rhs_pullback_mode}'.")
+    if collect_native_vmec_coefficients:
+        support_bar_leaves = (*support_bar_leaves, *native_vmec_zero_leaves)
+    y_bars = trial_y_bars + jnp.asarray(residual_y_bars, dtype=kernel_context.dtype)
+    lagged_cache_bars = _add_tangent_trees(
+        residual_lagged_bars, next_reduced_bars.lagged_response_cache, carry_for_linear_map.lagged_response_cache,
+    )
+    lagged_reference_y_bars = jnp.asarray(next_reduced_bars.lagged_reference_y, dtype=kernel_context.dtype)
+    return y_bars, lagged_cache_bars, lagged_reference_y_bars, support_bar_leaves
+
+
+def _radau_fixed_lagged_step_reverse_common_from_segment_primal_record(
+    kernel_context: _RadauAcceptedStepKernelContext,
+    physics_context: _RadauAcceptedStepPhysicsContext,
+    context: _RadauAcceptedStepAttemptContext,
+    carry_in: _RadauAcceptedStepCarry,
+    primal_record: _RadauAcceptedStepSegmentPrimalRecord,
+    next_reduced_bars: _RadauAcceptedStepReducedCotangent,
+    support,
+    *,
+    collect_native_vmec_coefficients: bool,
+    native_vmec_zero_leaves: tuple[Any, ...],
+) -> tuple[_RadauAcceptedStepReverseMinimalAttemptResult, Any, tuple[Any, Any, Any, tuple[Any, ...]]] | None:
+    """Prepare the common transpose once from an existing segment record.
+
+    This is intentionally record-consuming only: it reconstructs no primal
+    attempt and returns no new record.  The following wiring step will invoke
+    it before the dynamic reuse/rebuild conditional.
+    """
+    primal_result = _radau_reverse_minimal_attempt_from_segment_primal_record(
+        carry_in,
+        context,
+        primal_record,
+    )
+    carry_for_linear_map = dataclasses.replace(
+        _radau_carry_with_forward_only_jvp_fields(carry_in),
+        lagged_response_cache=primal_result.carry_after_attempt.lagged_response_cache,
+        lagged_response_valid=jnp.asarray(True),
+        lagged_reference_y=primal_result.carry_after_attempt.lagged_reference_y,
+    )
+    lagged_response, _, _ = _radau_prepare_lagged_response(
+        kernel_context,
+        carry_for_linear_map,
+        physics_context.unpack_flat,
+        physics_context.project_flat,
+        physics_context.build_lagged_response,
+    )
+    if lagged_response is None:
+        return None
+    common = _radau_fixed_lagged_step_reverse_common(
+        kernel_context,
+        physics_context,
+        carry_in,
+        primal_result,
+        lagged_response,
+        next_reduced_bars,
+        support,
+        collect_native_vmec_coefficients=collect_native_vmec_coefficients,
+        native_vmec_zero_leaves=native_vmec_zero_leaves,
+    )
+    return primal_result, lagged_response, common
+
+
+def _radau_finish_native_vmec_rebuild_from_common(
+    kernel_context: _RadauAcceptedStepKernelContext,
+    physics_context: _RadauAcceptedStepPhysicsContext,
+    carry_in: _RadauAcceptedStepCarry,
+    lagged_response_branch: str,
+    common: tuple[Any, Any, Any, tuple[Any, ...]],
+    support,
+) -> tuple[_RadauAcceptedStepReducedCotangent, tuple[Any, ...]]:
+    """Finish the active native-VMEC rebuild mode after its shared transpose.
+
+    This deliberately supports only the already validated native multi-RHS
+    VMEC-coefficient mode.  It is the branch-local suffix needed by the
+    compilation-reduction experiment; the generic implementation remains the
+    fallback for every other support mode.
+    """
+    y_bars, lagged_cache_bars, lagged_reference_y_bars, support_bar_leaves = common
+    objective_count = jnp.asarray(y_bars).shape[0]
+    if lagged_response_branch == "rebuild":
+        if physics_context.pullback_build_lagged_response is None:
+            raise ValueError("Lagged-response rebuild reverse branch requires pullback_build_lagged_response.")
+        rebuild_state = physics_context.unpack_flat(
+            _project_flat_state_if_needed(carry_in.y, physics_context.project_flat)
+        )
+
+        def _state_pullback(lagged_cache_bar):
+            return physics_context.pullback_build_lagged_response(
+                rebuild_state,
+                lagged_cache_bar,
+                reverse_stage_cotangent_mode=str(
+                    getattr(physics_context, "reverse_stage_cotangent_mode", "full")
+                ).strip().lower(),
+                reverse_segment_profile_annotations=bool(
+                    getattr(physics_context, "reverse_segment_profile_annotations", False)
+                ),
+            )
+
+        with _radau_reverse_profile_scope(
+            physics_context, "reverse_segment/rebuild_lagged_response_transpose"
+        ):
+            rebuild_flat_bars = jax.vmap(physics_context.pack_flat)(
+                jax.vmap(_state_pullback)(lagged_cache_bars)
+            )
+        if physics_context.project_flat is not None:
+            _, project_pullback = jax.vjp(physics_context.project_flat, carry_in.y)
+            rebuild_flat_bars = jax.vmap(lambda bar: project_pullback(bar)[0])(rebuild_flat_bars)
+        native_pullback = (
+            physics_context.flat_rhs_build_support_pullback_batched_interpolated_faces_native_multi_rhs_reuse_moment_drds_jvp_shared_primal_with_vmec_coefficients
+        )
+        if native_pullback is None:
+            raise RuntimeError("native VMEC rebuild support pullback was requested but is unavailable.")
+        with _radau_reverse_profile_scope(
+            physics_context, "reverse_segment/rebuild_lagged_support_transpose"
+        ):
+            rebuild_support_bar_leaves = tuple(jax.tree_util.tree_leaves(
+                native_pullback(carry_in.y, lagged_cache_bars, support)
+            ))
+        support_bar_leaves = tuple(
+            stage_leaf + rebuild_leaf
+            for stage_leaf, rebuild_leaf in zip(support_bar_leaves, rebuild_support_bar_leaves)
+        )
+        y_bars = y_bars + rebuild_flat_bars + lagged_reference_y_bars
+        zero_cache = _radau_align_tangent_tree_to_primal(None, carry_in.lagged_response_cache)
+        lagged_cache_bars = jax.tree_util.tree_map(
+            lambda leaf: jnp.broadcast_to(jnp.asarray(leaf)[None, ...], (objective_count,) + jnp.asarray(leaf).shape),
+            zero_cache,
+        )
+        lagged_reference_y_bars = jnp.zeros(
+            (objective_count,) + jnp.shape(carry_in.lagged_reference_y),
+            dtype=jnp.asarray(carry_in.lagged_reference_y).dtype,
+        )
+    return _RadauAcceptedStepReducedCotangent(
+        y=y_bars,
+        lagged_response_cache=lagged_cache_bars,
+        lagged_reference_y=lagged_reference_y_bars,
+    ), support_bar_leaves
+
+
 def _execute_radau_accepted_step_next_reduced_cotangent_batched_bwd_with_support_from_primal_result(
     kernel_context: _RadauAcceptedStepKernelContext,
     physics_context: _RadauAcceptedStepPhysicsContext,
@@ -7232,6 +7457,7 @@ def _radau_segment_reduced_cotangent_bwd_batched_with_support_call(
     ).strip().lower()
     use_step_call_boundary = step_bwd_mode in {
         "reduced_cotangent_call_boundary",
+        "reduced_cotangent_call_boundary_common_branch_hoist",
         "reduced_cotangent_step_call",
         "call_boundary",
     }
@@ -7244,6 +7470,15 @@ def _radau_segment_reduced_cotangent_bwd_batched_with_support_call(
             )
         ).strip().lower()
         == "ntx_batched_interpolated_faces_native_multi_rhs_reuse_moment_drds_jvp_shared_primal_with_vmec_coefficients"
+    )
+    use_common_branch_hoist = (
+        step_bwd_mode
+        in {
+            "reduced_cotangent_common_branch_hoist",
+            "reduced_cotangent_call_boundary_common_branch_hoist",
+        }
+        and use_segment_primal_record
+        and collect_native_vmec_coefficients
     )
     zero_support_leaves = tuple(
         jax.tree_util.tree_leaves(_radau_zero_support_delta_tree_like(support))
@@ -7286,6 +7521,43 @@ def _radau_segment_reduced_cotangent_bwd_batched_with_support_call(
         def _do_step_bwd(_):
             carry_for_step = dataclasses.replace(step_start_carry, dt=dt_value)
             residual_carry = _radau_carry_with_forward_only_jvp_fields(carry_for_step)
+
+            if use_common_branch_hoist:
+                prepared_common = (
+                    _radau_fixed_lagged_step_reverse_common_from_segment_primal_record(
+                        execution_context.kernel_context,
+                        execution_context.physics_context,
+                        execution_context.attempt_context,
+                        residual_carry,
+                        primal_record,
+                        slot_reduced_bars,
+                        support,
+                        collect_native_vmec_coefficients=collect_native_vmec_coefficients,
+                        native_vmec_zero_leaves=native_vmec_zero_leaves,
+                    )
+                )
+                if prepared_common is not None:
+                    _, _, common = prepared_common
+                    return jax.lax.cond(
+                        residual_carry.lagged_response_valid,
+                        lambda _: _radau_finish_native_vmec_rebuild_from_common(
+                            execution_context.kernel_context,
+                            execution_context.physics_context,
+                            residual_carry,
+                            "reuse",
+                            common,
+                            support,
+                        ),
+                        lambda _: _radau_finish_native_vmec_rebuild_from_common(
+                            execution_context.kernel_context,
+                            execution_context.physics_context,
+                            residual_carry,
+                            "rebuild",
+                            common,
+                            support,
+                        ),
+                        operand=None,
+                    )
 
             def _run_step_adjoint(lagged_response_branch):
                 if use_segment_primal_record:
@@ -7430,6 +7702,7 @@ def _radau_segment_reduced_cotangent_bwd_batched_with_support_from_primal_record
     ).strip().lower()
     use_step_call_boundary = step_bwd_mode in {
         "reduced_cotangent_call_boundary",
+        "reduced_cotangent_call_boundary_common_branch_hoist",
         "reduced_cotangent_step_call",
         "call_boundary",
     }
@@ -16659,6 +16932,7 @@ def _radau_adaptive_final_y_realized_schedule_vjp_bwd(
         reduced_cotangent_bwd = step_bwd_mode in {
             "reduced_cotangent",
             "reduced_cotangent_call_boundary",
+            "reduced_cotangent_call_boundary_common_branch_hoist",
             "reduced_cotangent_lean_replay",
             "reduced_cotangent_recompute_replay",
             "lean_replay",
