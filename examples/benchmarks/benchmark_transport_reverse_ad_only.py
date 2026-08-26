@@ -3655,6 +3655,7 @@ def _run_realtime_geometry_optimization_api_smoke(
             reverse_segment_jit_diagnostics=bool(args.reverse_segment_jit_diagnostics),
             reverse_segment_input_diagnostics=bool(args.reverse_segment_input_diagnostics),
             reverse_rebuild_component_timing=bool(args.reverse_rebuild_component_timing),
+            reverse_phase_timing_diagnostics=bool(args.reverse_phase_timing_diagnostics),
             reverse_segment_profile_annotations=bool(
                 args.reverse_segment_profiler_trace_dir
             ),
@@ -5586,6 +5587,18 @@ def main() -> None:
             "also reports the logical record payload and separately times record replay "
             "and record-consuming reverse without rebuild transposes. This adds extra "
             "work and is not a normal reverse timing."
+        ),
+    )
+    parser.add_argument(
+        "--reverse-phase-timing-diagnostics",
+        action="store_true",
+        help=(
+            "Diagnostic-only: split already-required final-objective and initial-carry "
+            "reverse phases into synchronized components. It also repeats the first "
+            "reverse segment and each standard initial pullback once after their "
+            "production call to report warm execution separately from first-call "
+            "compile-plus-execute. The repeats are discarded and add diagnostic work; "
+            "they do not change gradients, cache behavior, or write trace files."
         ),
     )
     parser.add_argument(

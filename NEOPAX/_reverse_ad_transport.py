@@ -2945,6 +2945,7 @@ def prepare_reverse_static_setup(
     reverse_segment_jit_diagnostics: bool = False,
     reverse_segment_input_diagnostics: bool = False,
     reverse_rebuild_component_timing: bool = False,
+    reverse_phase_timing_diagnostics: bool = False,
     reverse_segment_profile_annotations: bool = False,
     reverse_segment_start_replay_mode: str = "legacy",
     reverse_segment_primal_record_mode: str = "reconstruct",
@@ -3103,6 +3104,7 @@ def prepare_reverse_static_setup(
                 reverse_segment_jit_diagnostics=bool(reverse_segment_jit_diagnostics),
                 reverse_segment_input_diagnostics=bool(reverse_segment_input_diagnostics),
                 reverse_rebuild_component_timing=bool(reverse_rebuild_component_timing),
+                reverse_phase_timing_diagnostics=bool(reverse_phase_timing_diagnostics),
                 reverse_segment_profile_annotations=bool(reverse_segment_profile_annotations),
                 reverse_segment_start_replay_mode=str(reverse_segment_start_replay_mode),
                 reverse_segment_primal_record_mode=str(reverse_segment_primal_record_mode),
@@ -3716,6 +3718,16 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
     grouped_objective_values: dict[int, object] = {}
     grouped_final_y_bars: dict[int, object] = {}
     grouped_geometry_bars: dict[int, object] = {}
+    phase_timing_diagnostics = bool(
+        getattr(
+            reverse_setup.execution_context.physics_context,
+            "reverse_phase_timing_diagnostics",
+            False,
+        )
+    )
+    final_objective_state_elapsed = 0.0
+    final_objective_geometry_elapsed = 0.0
+    final_objective_bootstrap_elapsed = 0.0
     phase_start = time.perf_counter()
     if final_objective_cotangent_mode == "grouped_vjp" and ordinary_objective_indices:
         # The scalar reference path constructs one VJP for every ordinary
@@ -3733,10 +3745,16 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
                 axis=0,
             )
 
+        component_start = time.perf_counter()
         ordinary_values, ordinary_final_y_bars = _objective_vector_vjp_rows(
             _ordinary_objective_vector_from_final_y,
             final_y_for_objective,
         )
+        if phase_timing_diagnostics:
+            ordinary_values, ordinary_final_y_bars = jax.block_until_ready(
+                (ordinary_values, ordinary_final_y_bars)
+            )
+            final_objective_state_elapsed += time.perf_counter() - component_start
         grouped_objective_values = {
             objective_i: ordinary_values[row_i]
             for row_i, objective_i in enumerate(ordinary_objective_indices)
@@ -3771,10 +3789,14 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
                     axis=0,
                 )
 
+            component_start = time.perf_counter()
             _, ordinary_geometry_bars = _objective_vector_vjp_rows(
                 _ordinary_objective_vector_from_geometry_delta,
                 geometry_delta0,
             )
+            if phase_timing_diagnostics:
+                ordinary_geometry_bars = jax.block_until_ready(ordinary_geometry_bars)
+                final_objective_geometry_elapsed += time.perf_counter() - component_start
             grouped_geometry_bars = {
                 objective_i: _take_batched_pytree_row(ordinary_geometry_bars, row_i)
                 for row_i, objective_i in enumerate(ordinary_objective_indices)
@@ -3782,6 +3804,7 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
     for objective_i in range(objective_count):
         objective_name = objective_labels[objective_i]
         if objective_name == bootstrap_objective_name:
+            component_start = time.perf_counter()
             final_state_for_bootstrap = reverse_setup.prepared_rollout.physics_context.unpack_flat(
                 final_y_for_objective
             )
@@ -3858,12 +3881,25 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
                 objective_payload_bar_rows.append(
                     support_treedef.unflatten(tuple(support_bar_leaves))
                 )
+            if phase_timing_diagnostics:
+                objective_value, final_y_bar_rows[-1], objective_payload_bar_rows[-1] = (
+                    jax.block_until_ready(
+                        (
+                            objective_value,
+                            final_y_bar_rows[-1],
+                            objective_payload_bar_rows[-1],
+                        )
+                    )
+                )
+                objective_values_rows[-1] = objective_value
+                final_objective_bootstrap_elapsed += time.perf_counter() - component_start
             continue
 
         if final_objective_cotangent_mode == "grouped_vjp":
             objective_value = grouped_objective_values[objective_i]
             final_y_bar = grouped_final_y_bars[objective_i]
         else:
+            component_start = time.perf_counter()
             def _objective_from_final_y(final_y_value, objective_index=objective_i):
                 final_state = reverse_setup.prepared_rollout.physics_context.unpack_flat(final_y_value)
                 return dependencies.objective_scalar_by_index(final_state, runtime, objective_index)
@@ -3872,12 +3908,16 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
                 _objective_from_final_y, final_y_for_objective
             )
             final_y_bar = objective_pullback(jnp.ones_like(objective_value))[0]
+            if phase_timing_diagnostics:
+                final_y_bar = jax.block_until_ready(final_y_bar)
+                final_objective_state_elapsed += time.perf_counter() - component_start
         objective_values_rows.append(objective_value)
         final_y_bar_rows.append(final_y_bar)
         if combined_geometry_payload:
             if final_objective_cotangent_mode == "grouped_vjp":
                 geometry_objective_bar = grouped_geometry_bars[objective_i]
             else:
+                component_start = time.perf_counter()
                 final_state_for_geometry = reverse_setup.prepared_rollout.physics_context.unpack_flat(
                     final_y_for_objective
                 )
@@ -3901,6 +3941,9 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
                 (geometry_objective_bar,) = geometry_objective_pullback(
                     jnp.ones_like(objective_value)
                 )
+                if phase_timing_diagnostics:
+                    geometry_objective_bar = jax.block_until_ready(geometry_objective_bar)
+                    final_objective_geometry_elapsed += time.perf_counter() - component_start
             objective_payload_bar_rows.append(
                 {
                     "geometry": _sanitize_float_delta_bar_tree(geometry, geometry_objective_bar),
@@ -4026,6 +4069,16 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
         f"mode={final_objective_cotangent_mode}",
         flush=True,
     )
+    if phase_timing_diagnostics:
+        print(
+            f"{progress_prefix} diagnostic: final-objective cotangent components "
+            f"state_vjp_s={final_objective_state_elapsed:.3f} "
+            f"geometry_vjp_s={final_objective_geometry_elapsed:.3f} "
+            f"bootstrap_compact_s={final_objective_bootstrap_elapsed:.3f} "
+            f"assembly_and_sync_s={time.perf_counter() - phase_start - final_objective_state_elapsed - final_objective_geometry_elapsed - final_objective_bootstrap_elapsed:.3f} "
+            f"(synchronized existing work; no duplicate objective VJPs)",
+            flush=True,
+        )
     objective_support_bar_leaves = support_bar_leaves
     step_support_bar_leaves_accum = tuple(jnp.zeros_like(leaf) for leaf in support_bar_leaves)
     initial_cache_support_bar_leaves_accum = tuple(jnp.zeros_like(leaf) for leaf in support_bar_leaves)
@@ -4052,6 +4105,11 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
             False,
         )
     )
+    # This diagnostic deliberately uses the existing first real segment as
+    # the compile-plus-execute measurement, then repeats that *same* segment
+    # once with its original input to expose its warm device time.  The repeat
+    # is discarded; it is intentionally opt-in because it costs one segment.
+    phase_timing_segment_warm_pending = phase_timing_diagnostics
     if rebuild_component_timing:
         physics_context = reverse_setup.execution_context.physics_context
         rebuild_mode = str(
@@ -4378,6 +4436,7 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
             )
         segment_start_carry = _take_tree_axis0(segment_start_carries, segment_index)
         segment_arrays = _take_tree_axis0(segmented_replay_arrays, segment_index)
+        segment_reduced_bars_input = reduced_bars
         reduced_bars, segment_support_bar_leaves = (
             _reverse_segment_reduced_cotangent_bwd_batched_with_support_call(
                 reverse_setup.execution_context,
@@ -4391,6 +4450,29 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
         reduced_bars, segment_support_bar_leaves = jax.block_until_ready(
             (reduced_bars, segment_support_bar_leaves)
         )
+        if phase_timing_segment_warm_pending:
+            first_call_elapsed = time.perf_counter() - segment_phase_start
+            warm_start = time.perf_counter()
+            warm_reduced_bars, warm_support_bar_leaves = (
+                _reverse_segment_reduced_cotangent_bwd_batched_with_support_call(
+                    reverse_setup.execution_context,
+                    cotangent_mode,
+                    segment_reduced_bars_input,
+                    segment_start_carry,
+                    segment_arrays,
+                    support_payload,
+                )
+            )
+            # Keep no reference to the diagnostic output after synchronization.
+            jax.block_until_ready((warm_reduced_bars, warm_support_bar_leaves))
+            print(
+                f"{progress_prefix} diagnostic: reverse segment "
+                f"{segment_index + 1}/{segment_count} first_call_compile_plus_execute_s={first_call_elapsed:.3f} "
+                f"warm_execute_s={time.perf_counter() - warm_start:.3f} "
+                "(one discarded duplicate segment; no gradient/result change)",
+                flush=True,
+            )
+            phase_timing_segment_warm_pending = False
         if segment_jit_diagnostics:
             cache_after = (
                 _jax_trace_cache_size(_radau_segment_reduced_cotangent_bwd_batched_with_support_call),
@@ -4585,6 +4667,7 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
         )
     initial_cache_pullback_used = False
     initial_cache_pullback_skipped = False
+    initial_cache_support_warm_call = None
     if (
         initial_lagged_response_valid
         and build_support_pullback is not None
@@ -4600,6 +4683,13 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
         ):
             initial_native_vmec_bars = None
             if use_rebuild_dispatch_initial_cache_pullback:
+                if phase_timing_diagnostics:
+                    initial_cache_support_warm_call = lambda: _initial_cache_support_pullback_from_rebuild_dispatch(
+                        physics_context=reverse_setup.execution_context.physics_context,
+                        flat_y=carry0.y,
+                        lagged_response_bars=reduced_bars.lagged_response_cache,
+                        support_payload=support_payload,
+                    )
                 initial_cache_support_bars, initial_native_vmec_bars = (
                     _initial_cache_support_pullback_from_rebuild_dispatch(
                         physics_context=reverse_setup.execution_context.physics_context,
@@ -4619,12 +4709,27 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
                         "ntx_batched_interpolated_faces was requested, but the active transport "
                         "physics context does not expose the NTX batched support pullback."
                     )
+                if phase_timing_diagnostics:
+                    initial_cache_support_warm_call = lambda: batched_pullback(
+                        carry0.y,
+                        reduced_bars.lagged_response_cache,
+                        support_payload,
+                    )
                 initial_cache_support_bars = batched_pullback(
                     carry0.y,
                     reduced_bars.lagged_response_cache,
                     support_payload,
                 )
             else:
+                if phase_timing_diagnostics:
+                    initial_cache_support_warm_call = lambda: jax.lax.map(
+                        lambda lagged_bar: build_support_pullback(
+                            carry0.y,
+                            lagged_bar,
+                            support_payload,
+                        ),
+                        reduced_bars.lagged_response_cache,
+                    )
                 initial_cache_support_bars = jax.lax.map(
                     lambda lagged_bar: build_support_pullback(
                         carry0.y,
@@ -4672,12 +4777,23 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
                 )
             )
         initial_cache_pullback_used = True
+        initial_cache_compile_plus_execute_elapsed = time.perf_counter() - phase_start
         print(
             f"{progress_prefix} progress: support reverse initial-cache support pullback ready "
-            f"elapsed_s={time.perf_counter() - phase_start:.3f} "
+            f"elapsed_s={initial_cache_compile_plus_execute_elapsed:.3f} "
             f"mode={initial_cache_support_pullback_mode}",
             flush=True,
         )
+        if initial_cache_support_warm_call is not None:
+            warm_start = time.perf_counter()
+            jax.block_until_ready(initial_cache_support_warm_call())
+            print(
+                f"{progress_prefix} diagnostic: initial-cache support pullback "
+                f"compile_plus_execute_s={initial_cache_compile_plus_execute_elapsed:.3f} "
+                f"warm_execute_s={time.perf_counter() - warm_start:.3f} "
+                "(one discarded duplicate; no gradient/result change)",
+                flush=True,
+            )
     elif (
         initial_lagged_response_valid
         and build_support_pullback is not None
@@ -4707,6 +4823,7 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
     phase_start = time.perf_counter()
     initial_native_ntx_elapsed = None
     initial_direct_geometry_elapsed = None
+    initial_state_warm_call = None
     with _reverse_profile_scope(reverse_setup, "reverse_post_sweep/initial_state_pullback"):
         if (
             use_native_joint_initial_carry_pullback
@@ -4778,9 +4895,10 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
                 initial_state_bars, initial_joint_support_bars = initial_joint_result
                 initial_joint_native_vmec_bars = None
         else:
-            initial_state_bars = jax.vmap(
+            initial_state_warm_call = lambda: jax.vmap(
                 lambda carry0_bar: initial_state_pullback(carry0_bar)[0]
             )(carry0_bars)
+            initial_state_bars = initial_state_warm_call()
             initial_joint_support_bars = None
             initial_joint_native_vmec_bars = None
     if initial_joint_support_bars is not None:
@@ -4817,12 +4935,23 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
         initial_cache_pullback_used = True
     else:
         initial_state_bars = jax.block_until_ready(initial_state_bars)
+    initial_state_compile_plus_execute_elapsed = time.perf_counter() - phase_start
     print(
         f"{progress_prefix} progress: support reverse initial "
         f"{'joint state/support' if initial_joint_support_bars is not None else 'state'} pullback ready "
-        f"elapsed_s={time.perf_counter() - phase_start:.3f}",
+        f"elapsed_s={initial_state_compile_plus_execute_elapsed:.3f}",
         flush=True,
     )
+    if phase_timing_diagnostics and initial_state_warm_call is not None:
+        warm_start = time.perf_counter()
+        jax.block_until_ready(initial_state_warm_call())
+        print(
+            f"{progress_prefix} diagnostic: initial state pullback "
+            f"compile_plus_execute_s={initial_state_compile_plus_execute_elapsed:.3f} "
+            f"warm_execute_s={time.perf_counter() - warm_start:.3f} "
+            "(one discarded duplicate; no gradient/result change)",
+            flush=True,
+        )
     if initial_native_ntx_elapsed is not None:
         print(
             f"{progress_prefix} diagnostic: split initial pullback "
@@ -5866,6 +5995,7 @@ def internal_realtime_geometry_transport_reverse_table_result_builder(
     reverse_segment_jit_diagnostics: bool = False,
     reverse_segment_input_diagnostics: bool = False,
     reverse_rebuild_component_timing: bool = False,
+    reverse_phase_timing_diagnostics: bool = False,
     reverse_segment_profile_annotations: bool = False,
     reverse_segment_start_replay_mode: str = "legacy",
     reverse_segment_primal_record_mode: str = "reconstruct",
@@ -6003,6 +6133,9 @@ def internal_realtime_geometry_transport_reverse_table_result_builder(
             ),
             reverse_rebuild_component_timing=bool(
                 opts.get("reverse_rebuild_component_timing", reverse_rebuild_component_timing)
+            ),
+            reverse_phase_timing_diagnostics=bool(
+                opts.get("reverse_phase_timing_diagnostics", reverse_phase_timing_diagnostics)
             ),
             reverse_segment_profile_annotations=bool(
                 opts.get(

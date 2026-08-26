@@ -2376,3 +2376,17 @@ and the Windows virtual environment has no pytest installed, so this new
 test has not yet been executed locally.  The next allowed execution is the
 small WSL CPU pytest gate once WSL is available; no production benchmark was
 run locally.
+
+### Opt-in reverse phase timing diagnostic (2026-08-26)
+
+`--reverse-phase-timing-diagnostics` is an observation-only benchmark flag.
+It does not select a new pullback mode.  It reports synchronized component
+times for final-objective cotangents (ordinary state VJP, explicit geometry
+VJP, compact bootstrap rule, and assembly), then repeats exactly one already
+executed reverse segment and the two ordinary initial pullbacks once to print
+their warm execution time next to their production first-call
+compile-plus-execute time.  All repeated values are discarded.  It creates no
+profile, XLA dump, cache, or result files, and is intentionally opt-in because
+it adds one segment plus one support and one state transpose of diagnostic
+work.  The established standard initial selector and the accepted native
+rebuild selector remain unchanged.
