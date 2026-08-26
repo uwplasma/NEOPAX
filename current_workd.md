@@ -2343,3 +2343,36 @@ stopped at the initial boundary because the new composed-equation wrapper
 looked for a corresponding `CombinedTransportFluxModel` method which had not
 been added.  The missing forwarding wrapper is now implemented.  This is a
 dispatch-only correction and does not change the native NTX/VMEC algebra.
+
+### Initial pullback timing audit and fused RHS experiment (2026-08-26)
+
+The reported `native_ntx_state_support_s` is not solely the native NTX
+state/support contraction.  Before that contraction, the initial custom
+pullback vmaps over objectives and independently invokes:
+
+1. `flat_rhs_state_pullback`, which reconstructs the transport state,
+   evaluates the fixed-lagged shared fluxes, and transposes RHS assembly; and
+2. `flat_rhs_lagged_response_pullback`, which reconstructs the same state,
+   evaluates the same fixed-lagged shared fluxes, and transposes the same RHS
+   assembly again to obtain the response cotangent.
+
+The outer direct VMEC geometry transpose is only about 5--6 s, so it cannot
+explain the roughly 328 s native label.  The `no_prepared_carry` mode was
+therefore the wrong target for this timing; it remains isolated and is not a
+replacement for the established split-native path.
+
+An unselected selector,
+`ntx_native_joint_state_and_ntx_support_split_geometry_vmec_fused_rhs`, now
+uses a new exact `state_and_response` fixed-lagged RHS hook.  It shares the
+state reconstruction, fixed-lagged shared-flux evaluation, and RHS assembly
+transpose once per objective, then feeds the returned response bars into the
+unchanged native NTX/VMEC build-support contraction.  It does not change the
+rebuild selector, the lowdot NTX solver, the direct VMEC geometry transpose,
+or any existing initial selector.
+
+Static compilation and whitespace checks pass.  A no-rollout mock dispatch
+test was added, but the local WSL service denied creation of a test instance
+and the Windows virtual environment has no pytest installed, so this new
+test has not yet been executed locally.  The next allowed execution is the
+small WSL CPU pytest gate once WSL is available; no production benchmark was
+run locally.

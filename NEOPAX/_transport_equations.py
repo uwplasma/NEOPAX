@@ -3057,6 +3057,94 @@ class ComposedEquationSystem:
         )
         return self._prepare_working_state_pullback(state, total_working_state_bar)
 
+    def pullback_evaluate_with_lagged_response_state_and_response(
+        self, t, state, runtime, lagged_response, rhs_bar
+    ):
+        """Joint fixed-lagged RHS transpose for state and response only.
+
+        The initial reverse needs these two bars before its native NTX
+        build/support transpose.  Sharing RHS assembly here avoids the two
+        formerly independent state and response pullbacks, without adding a
+        support or geometry transpose to this graph.
+        """
+        del t, runtime
+        if (
+            self.shared_flux_model is None
+            or lagged_response is None
+            or lagged_response.flux_response is None
+        ):
+            _, pullback = jax.vjp(
+                lambda state_value, response_value: self._evaluate_state(
+                    state_value, lagged_response=response_value
+                ),
+                state,
+                lagged_response,
+            )
+            return pullback(rhs_bar)
+
+        working_state, eidx = self._prepare_working_state(state)
+        shared_fluxes = self.shared_flux_model.evaluate_with_lagged_response(
+            working_state,
+            lagged_response.flux_response,
+            **self._shared_flux_bc_kwargs(),
+        )
+        direct_working_state_bar, flux_bar = self._pullback_shared_flux_rhs_state_and_fluxes(
+            state, working_state, eidx, shared_fluxes, rhs_bar
+        )
+        state_pullback_fn = getattr(
+            self.shared_flux_model,
+            "pullback_evaluate_with_lagged_response_state",
+            None,
+        )
+        if callable(state_pullback_fn):
+            working_state_bar = state_pullback_fn(
+                working_state,
+                lagged_response.flux_response,
+                flux_bar,
+                **self._shared_flux_bc_kwargs(),
+            )
+        else:
+            _, state_pullback = jax.vjp(
+                lambda state_value: self.shared_flux_model.evaluate_with_lagged_response(
+                    state_value,
+                    lagged_response.flux_response,
+                    **self._shared_flux_bc_kwargs(),
+                ),
+                working_state,
+            )
+            (working_state_bar,) = state_pullback(flux_bar)
+        response_pullback_fn = getattr(
+            self.shared_flux_model,
+            "pullback_evaluate_with_lagged_response",
+            None,
+        )
+        if callable(response_pullback_fn):
+            response_bar = response_pullback_fn(
+                working_state,
+                lagged_response.flux_response,
+                flux_bar,
+                **self._shared_flux_bc_kwargs(),
+            )
+        else:
+            _, response_pullback = jax.vjp(
+                lambda response_value: self.shared_flux_model.evaluate_with_lagged_response(
+                    working_state,
+                    response_value,
+                    **self._shared_flux_bc_kwargs(),
+                ),
+                lagged_response.flux_response,
+            )
+            (response_bar,) = response_pullback(flux_bar)
+        state_bar = self._prepare_working_state_pullback(
+            state,
+            jax.tree_util.tree_map(
+                lambda direct_bar, flux_state_bar: direct_bar + flux_state_bar,
+                direct_working_state_bar,
+                working_state_bar,
+            ),
+        )
+        return state_bar, TransportLaggedResponse(flux_response=response_bar)
+
     def pullback_evaluate_with_lagged_response_all(
         self,
         t,

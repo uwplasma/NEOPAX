@@ -2423,6 +2423,7 @@ def reverse_initial_carry_from_state_with_static_setup(
     return_native_joint_pullback: bool = False,
     return_native_split_joint_pullback: bool = False,
     return_native_split_joint_no_prepared_carry: bool = False,
+    return_native_split_joint_fused_rhs_pullback: bool = False,
 ):
     """Build the initial carry with the validated reverse-local lagged pullback."""
 
@@ -2694,6 +2695,7 @@ def reverse_initial_carry_from_state_with_static_setup(
         use_split_joint = bool(
             return_native_split_joint_pullback
             or return_native_split_joint_no_prepared_carry
+            or return_native_split_joint_fused_rhs_pullback
         )
         joint_pullback = getattr(
             physics_context,
@@ -2744,6 +2746,45 @@ def reverse_initial_carry_from_state_with_static_setup(
                 (kernel_context.num_stages, -1)
             )
             rhs_bar = jnp.sum(prev_stages_bar, axis=0)
+
+            if return_native_split_joint_fused_rhs_pullback:
+                fused_rhs_pullback = getattr(
+                    physics_context,
+                    "flat_rhs_state_and_lagged_response_pullback",
+                    None,
+                )
+                if fused_rhs_pullback is None:
+                    raise NotImplementedError(
+                        "Fused native initial pullback requires the fixed-lagged "
+                        "RHS state/response hook."
+                    )
+
+                def _zero_fused_rhs_bar(_):
+                    return (
+                        jnp.zeros_like(flat_state0),
+                        _radau_align_tangent_tree_to_primal(
+                            None, initial_lagged_response
+                        ),
+                    )
+
+                def _nonzero_fused_rhs_bar(_):
+                    return fused_rhs_pullback(
+                        initial_carry_static.t,
+                        flat_state0,
+                        initial_lagged_response,
+                        rhs_bar,
+                    )
+
+                rhs_state_bar, rhs_lagged_bar = jax.lax.cond(
+                    _tree_max_abs(rhs_bar) > 0.0,
+                    _nonzero_fused_rhs_bar,
+                    _zero_fused_rhs_bar,
+                    operand=None,
+                )
+                if project_flat is not None:
+                    _, project_pullback = jax.vjp(project_flat, flat_state0)
+                    rhs_state_bar = project_pullback(rhs_state_bar)[0]
+                return direct_flat_bar + rhs_state_bar, rhs_lagged_bar
 
             def _zero_flat_bar():
                 return jnp.zeros_like(flat_state0)
@@ -2872,6 +2913,7 @@ def reverse_initial_carry_from_state_with_static_setup(
         return_native_joint_pullback
         or return_native_split_joint_pullback
         or return_native_split_joint_no_prepared_carry
+        or return_native_split_joint_fused_rhs_pullback
     ):
         carry0, residual = _build_initial_carry_fwd(state)
 
@@ -3526,6 +3568,10 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
         initial_cache_support_pullback_mode
         == "ntx_native_joint_state_and_ntx_support_split_geometry_vmec_no_prepared_carry"
     )
+    use_native_split_joint_fused_rhs_initial_carry_pullback = (
+        initial_cache_support_pullback_mode
+        == "ntx_native_joint_state_and_ntx_support_split_geometry_vmec_fused_rhs"
+    )
     use_rebuild_dispatch_initial_cache_pullback = (
         initial_cache_support_pullback_mode == "rebuild_dispatch"
     )
@@ -3534,6 +3580,7 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
         use_native_joint_initial_carry_pullback
         or use_native_split_joint_initial_carry_pullback
         or use_native_split_joint_no_prepared_carry_initial_carry_pullback
+        or use_native_split_joint_fused_rhs_initial_carry_pullback
     ):
         initial_carry, initial_state_pullback = (
             dependencies.reverse_initial_carry_from_state_with_static_setup(
@@ -3548,6 +3595,9 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
                 ),
                 return_native_split_joint_no_prepared_carry=(
                     use_native_split_joint_no_prepared_carry_initial_carry_pullback
+                ),
+                return_native_split_joint_fused_rhs_pullback=(
+                    use_native_split_joint_fused_rhs_initial_carry_pullback
                 ),
             )
         )
@@ -4469,6 +4519,7 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
         "ntx_native_joint_state_and_support",
         "ntx_native_joint_state_and_ntx_support_split_geometry_vmec",
         "ntx_native_joint_state_and_ntx_support_split_geometry_vmec_no_prepared_carry",
+        "ntx_native_joint_state_and_ntx_support_split_geometry_vmec_fused_rhs",
         "rebuild_dispatch",
     }:
         raise ValueError(
@@ -4484,6 +4535,7 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
         use_native_joint_initial_carry_pullback
         or use_native_split_joint_initial_carry_pullback
         or use_native_split_joint_no_prepared_carry_initial_carry_pullback
+        or use_native_split_joint_fused_rhs_initial_carry_pullback
     ) and not initial_lagged_response_valid:
         raise RuntimeError(
             "ntx_native_joint_state_and_support requires a valid initial "
@@ -4510,6 +4562,16 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
             "compact split native initial pullback was requested, but the active "
             "transport physics context does not expose the compact NTX/VMEC hook."
         )
+    if use_native_split_joint_fused_rhs_initial_carry_pullback and getattr(
+        reverse_setup.execution_context.physics_context,
+        "flat_rhs_state_and_lagged_response_pullback",
+        None,
+    ) is None:
+        raise RuntimeError(
+            "fused split native initial pullback was requested, but the active "
+            "transport physics context does not expose the fused fixed-lagged "
+            "RHS state/response hook."
+        )
     if use_native_joint_initial_carry_pullback and getattr(
         reverse_setup.execution_context.physics_context,
         "flat_rhs_build_state_and_support_pullback_batched_interpolated_faces_"
@@ -4530,6 +4592,7 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
         and not use_native_joint_initial_carry_pullback
         and not use_native_split_joint_initial_carry_pullback
         and not use_native_split_joint_no_prepared_carry_initial_carry_pullback
+        and not use_native_split_joint_fused_rhs_initial_carry_pullback
     ):
         phase_start = time.perf_counter()
         with _reverse_profile_scope(
@@ -4621,6 +4684,7 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
         and not use_native_joint_initial_carry_pullback
         and not use_native_split_joint_initial_carry_pullback
         and not use_native_split_joint_no_prepared_carry_initial_carry_pullback
+        and not use_native_split_joint_fused_rhs_initial_carry_pullback
     ):
         initial_cache_pullback_skipped = True
 
@@ -4648,6 +4712,7 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
             use_native_joint_initial_carry_pullback
             or use_native_split_joint_initial_carry_pullback
             or use_native_split_joint_no_prepared_carry_initial_carry_pullback
+            or use_native_split_joint_fused_rhs_initial_carry_pullback
         ):
             if not allow_initial_cache_support_pullback:
                 raise ValueError(
@@ -4658,6 +4723,7 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
             if (
                 use_native_split_joint_initial_carry_pullback
                 or use_native_split_joint_no_prepared_carry_initial_carry_pullback
+                or use_native_split_joint_fused_rhs_initial_carry_pullback
             ):
                 (
                     initial_state_bars,

@@ -23,6 +23,7 @@ from NEOPAX._state import TransportState, get_v_thermal
 from NEOPAX._transport_equations import ComposedEquationSystem
 from NEOPAX._transport_solvers import (
     _flat_rhs_build_support_pullback_batched_interpolated_faces_factory,
+    _flat_rhs_state_and_lagged_response_pullback_factory,
     _lagged_response_build_state_and_support_pullback_batched_interpolated_faces_hook,
     _radau_prepare_lagged_response_with_compact_coefficient_record,
 )
@@ -528,6 +529,40 @@ def test_native_split_joint_no_prepared_carry_hook_selects_only_its_wrapper():
     assert callable(hook)
     assert hook("state", "bars", "support") == "compact-result"
     assert calls == [("state", "bars", "support", {})]
+
+
+def test_fused_fixed_lagged_state_response_factory_calls_one_owner_hook():
+    """The initial-only selector cannot silently revert to two RHS hooks."""
+
+    calls = []
+
+    class _Owner:
+        def vector_field(self):
+            return None
+
+        def pullback_evaluate_with_lagged_response_state_and_response(
+            self, t_value, state, *args, lagged_response, rhs_bar, **kwargs
+        ):
+            calls.append((t_value, state, lagged_response, rhs_bar, args, kwargs))
+            return state * 2.0, {"lagged": rhs_bar * -3.0}
+
+    owner = _Owner()
+    pullback = _flat_rhs_state_and_lagged_response_pullback_factory(
+        unravel=lambda value: value,
+        pack_flat=lambda value: value,
+        vector_field=owner.vector_field,
+        args=(),
+        kwargs={},
+    )
+    state_bar, lagged_bar = pullback(
+        jnp.asarray(0.25),
+        jnp.asarray([1.0, -2.0]),
+        {"lagged": jnp.asarray([4.0, 5.0])},
+        jnp.asarray([0.3, -0.7]),
+    )
+    assert jnp.allclose(state_bar, jnp.asarray([2.0, -4.0]))
+    assert jnp.allclose(lagged_bar["lagged"], jnp.asarray([-0.9, 2.1]))
+    assert len(calls) == 1
 
 
 def test_native_multi_rhs_compact_residual_equation_system_forwarding_hook_is_exposed_to_radau():

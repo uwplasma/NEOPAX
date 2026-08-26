@@ -1737,6 +1737,41 @@ def _flat_rhs_state_pullback_factory(unravel, pack_flat, vector_field, args, kwa
     return _pullback
 
 
+def _flat_rhs_state_and_lagged_response_pullback_factory(
+    unravel, pack_flat, vector_field, args, kwargs, project_flat=None
+):
+    """Flatten the fused fixed-lagged RHS state/response transpose hook."""
+    owner = getattr(vector_field, "__self__", None)
+    pullback_fn = getattr(
+        owner, "pullback_evaluate_with_lagged_response_state_and_response", None
+    )
+    if not callable(pullback_fn):
+        return None
+    unravel_bar = getattr(unravel, "cotangent", unravel)
+
+    def _pullback(t_value, flat_y, lagged_response, rhs_bar_flat):
+        projected_flat_y = _project_flat_state_if_needed(flat_y, project_flat)
+        state_y = unravel(projected_flat_y)
+        rhs_bar_state = unravel_bar(
+            jnp.asarray(rhs_bar_flat, dtype=jnp.asarray(flat_y).dtype)
+        )
+        state_bar, lagged_bar = pullback_fn(
+            t_value,
+            state_y,
+            *args,
+            lagged_response=lagged_response,
+            rhs_bar=rhs_bar_state,
+            **kwargs,
+        )
+        projected_state_bar = pack_flat(state_bar)
+        if project_flat is None:
+            return projected_state_bar, lagged_bar
+        _, project_pullback = jax.vjp(project_flat, flat_y)
+        return project_pullback(projected_state_bar)[0], lagged_bar
+
+    return _pullback
+
+
 def _flat_rhs_split_state_pullback_factory(
     unravel,
     pack_flat,
@@ -3839,6 +3874,7 @@ class _RadauAcceptedStepPhysicsContext:
     flat_rhs_build_state_and_ntx_support_pullback_batched_interpolated_faces_native_multi_rhs_reuse_moment_drds_jvp_shared_primal_with_vmec_coefficients_no_prepared_carry: Callable[[Any, Any, Any], Any] | None = None
     flat_rhs_lagged_response_support_pullback: Callable[[Any, Any, Any, Any, Any], Any] | None = None
     flat_rhs_lagged_response_all_pullback: Callable[[Any, Any, Any, Any, Any], tuple[Any, Any, Any]] | None = None
+    flat_rhs_state_and_lagged_response_pullback: Callable[[Any, Any, Any, Any], tuple[Any, Any]] | None = None
     flat_rhs_state_pullback: Callable[[Any, Any, Any, Any], Any] | None = None
     flat_rhs_direct_state_pullback: Callable[[Any, Any, Any, Any], Any] | None = None
     flat_rhs_direct_state_pullback_generic: Callable[[Any, Any, Any, Any], Any] | None = None
@@ -17711,6 +17747,16 @@ def _build_prepared_radau_accepted_rollout(
         kwargs=kwargs,
         project_flat=project_flat,
     )
+    flat_rhs_state_and_lagged_response_pullback = (
+        _flat_rhs_state_and_lagged_response_pullback_factory(
+            unravel=unpack_flat,
+            pack_flat=pack_state,
+            vector_field=vector_field,
+            args=args,
+            kwargs=kwargs,
+            project_flat=project_flat,
+        )
+    )
     flat_rhs_state_pullback = _flat_rhs_state_pullback_factory(
         unravel=unpack_flat,
         pack_flat=pack_state,
@@ -18048,6 +18094,7 @@ def _build_prepared_radau_accepted_rollout(
         ),
         flat_rhs_lagged_response_support_pullback=flat_rhs_lagged_response_support_pullback,
         flat_rhs_lagged_response_all_pullback=flat_rhs_lagged_response_all_pullback,
+        flat_rhs_state_and_lagged_response_pullback=flat_rhs_state_and_lagged_response_pullback,
         flat_rhs_state_pullback=flat_rhs_state_pullback,
         flat_rhs_direct_state_pullback=flat_rhs_direct_state_pullback,
         flat_rhs_direct_state_pullback_generic=flat_rhs_direct_state_pullback_generic,
@@ -18378,6 +18425,16 @@ class RADAUSolver(_RadauSolverConfig):
             args=args,
             kwargs=kwargs,
             project_flat=project_flat,
+        )
+        flat_rhs_state_and_lagged_response_pullback = (
+            _flat_rhs_state_and_lagged_response_pullback_factory(
+                unravel=unpack_flat,
+                pack_flat=pack_state,
+                vector_field=vector_field,
+                args=args,
+                kwargs=kwargs,
+                project_flat=project_flat,
+            )
         )
         flat_rhs_state_pullback = _flat_rhs_state_pullback_factory(
             unravel=unpack_flat,
@@ -18710,6 +18767,7 @@ class RADAUSolver(_RadauSolverConfig):
             ),
             flat_rhs_lagged_response_support_pullback=flat_rhs_lagged_response_support_pullback,
             flat_rhs_lagged_response_all_pullback=flat_rhs_lagged_response_all_pullback,
+            flat_rhs_state_and_lagged_response_pullback=flat_rhs_state_and_lagged_response_pullback,
             flat_rhs_state_pullback=flat_rhs_state_pullback,
             flat_rhs_direct_state_pullback=flat_rhs_direct_state_pullback,
             flat_rhs_direct_density_state_pullback=flat_rhs_direct_density_state_pullback,
