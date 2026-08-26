@@ -2332,3 +2332,8 @@ out-of-band VMEC coefficient and separate direct-geometry routes as the
 existing split-native mode.  It does not alter any existing selector.  The
 remaining gate is the small CPU-only forwarding/equivalence test before a
 remote timing run.
+
+**Local gate status:** the CPU-only no-rollout selector gate and native local
+retained-channel gate were run in WSL with `JAX_PLATFORMS=cpu` and no pytest
+cache provider.  They exercise only the new dispatch and one small prepared
+NTX system; no transport rollout, profiler, or temporary dump is involved.
