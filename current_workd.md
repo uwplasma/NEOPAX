@@ -71,6 +71,11 @@ NTX's `build_ntx_neopax_scan_from_surfaces` for the live inputs, while its
 file-loader route remains the fallback. A CPU-only in-memory model-construction
 gate passes; no NTX scan or transport benchmark was run locally.
 
+Review correction: live channel scalars ``a_b`` and ``psia`` must remain JAX
+arrays through scan conversion. Their former Python ``float`` conversion was
+removed before any remote scan is attempted; otherwise a traced VMEC payload
+would fail with a concretization error.
+
 Next: check fixed-state file-backed versus live scan parity remotely, then add
 provider-neutral reverse payload selection. No scan-database cotangent is wired
 into the established Radau reverse sweep yet.

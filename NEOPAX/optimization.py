@@ -162,6 +162,7 @@ def repeated_evaluation_memory_samples(
     repeats: int = 5,
     warmup: int = 1,
     scaled_parameter_values=None,
+    on_sample: Callable[[RepeatedEvaluationMemorySample], None] | None = None,
 ) -> tuple[RepeatedEvaluationMemorySample, ...]:
     """Measure retained process memory across identical optimizer evaluations.
 
@@ -194,15 +195,16 @@ def repeated_evaluation_memory_samples(
         elapsed_s = time.perf_counter() - started
         del evaluation, residuals, jacobian
         gc.collect()
-        samples.append(
-            RepeatedEvaluationMemorySample(
-                iteration=iteration,
-                elapsed_s=float(elapsed_s),
-                resident_memory_bytes=_process_resident_memory_bytes(),
-                residual_norm=residual_norm,
-                jacobian_shape=jacobian_shape,
-            )
+        sample = RepeatedEvaluationMemorySample(
+            iteration=iteration,
+            elapsed_s=float(elapsed_s),
+            resident_memory_bytes=_process_resident_memory_bytes(),
+            residual_norm=residual_norm,
+            jacobian_shape=jacobian_shape,
         )
+        samples.append(sample)
+        if on_sample is not None:
+            on_sample(sample)
     return tuple(samples)
 
 

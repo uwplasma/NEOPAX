@@ -2372,8 +2372,11 @@ class NTXRuntimeScanChannels:
         rho = _as_float_array(rho, name="rho_scan")
         return cls(
             rho=rho,
-            a_b=float(channels["a_b"]),
-            psia=float(channels["psia"]),
+            # These are Python floats for the file-backed model but traced
+            # scalars for a live VMEC payload.  Do not concretize them here:
+            # the scan database must remain connected to geometry.
+            a_b=jnp.asarray(channels["a_b"], dtype=jnp.float64),
+            psia=jnp.asarray(channels["psia"], dtype=jnp.float64),
             b00=jnp.asarray(channels["b00"], dtype=jnp.float64),
             r00=jnp.asarray(channels["r00"], dtype=jnp.float64),
             boozer_i=jnp.asarray(channels["boozer_i"], dtype=jnp.float64),
@@ -2830,7 +2833,10 @@ class NTXRuntimeScanTransportModel(TransportFluxModelBase):
             f"Er_tilde={int(er_tilde.shape[0])} "
             f"grid=({grid.n_theta},{grid.n_zeta},{grid.n_xi}) backend={str(self.surface_backend).strip().lower()}"
         )
-        return _ntx_runtime_scan_to_neopax_monoenergetic(scan, a_b=float(channels["a_b"]))
+        return _ntx_runtime_scan_to_neopax_monoenergetic(
+            scan,
+            a_b=jnp.asarray(channels["a_b"], dtype=jnp.float64),
+        )
 
     def with_static_channels(self) -> "NTXRuntimeScanTransportModel":
         if self.channels is not None:

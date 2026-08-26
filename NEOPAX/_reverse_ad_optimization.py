@@ -2109,6 +2109,7 @@ def evaluate_geometry_initial_er_root_only_least_squares_benchmark_tables(
     geometry_solver_device: str | None = "default",
     root_options: Mapping[str, object] | None = None,
     raw_block_stage=None,
+    geometry_progress: bool = False,
 ) -> LeastSquaresEvaluation:
     """Evaluate mixed objectives using only benchmark-validated table backends."""
 
@@ -2177,7 +2178,7 @@ def evaluate_geometry_initial_er_root_only_least_squares_benchmark_tables(
                 surface_backend=str(surface_backend),
                 max_iter=geometry_max_iter,
                 solver_device=geometry_solver_device,
-                progress_label="[optimization] initial-Er root geometry payload pullback:",
+                progress_label=root_runner_options.get("progress_label"),
                 raw_block_solve=shared_raw_block_solve,
                 options=root_runner_options,
             )
@@ -2226,6 +2227,7 @@ def evaluate_geometry_initial_er_root_only_least_squares_benchmark_tables(
             final_vmec_pullback_mode="raw_block_transpose",
             solver_device=geometry_solver_device,
             raw_block_solve=shared_raw_block_solve,
+            progress=bool(geometry_progress),
         )
 
     result = assemble_least_squares_result(
@@ -2964,6 +2966,7 @@ def geometry_full_ad_reverse_table(
     final_vmec_pullback_mode: str = "raw_block_transpose",
     solver_device: str | None = "default",
     raw_block_solve=None,
+    progress: bool = True,
 ) -> ObjectiveTableResult:
     """Evaluate the validated full-geometry reverse table for optimization terms.
 
@@ -3009,6 +3012,7 @@ def geometry_full_ad_reverse_table(
         final_vmec_pullback_mode=final_vmec_pullback_mode,
         solver_device=solver_device,
         raw_block_solve=raw_block_solve,
+        progress=bool(progress),
     )
     objective_values = jnp.stack(
         [jnp.asarray(values_by_name[name], dtype=jnp.float64).reshape(()) for name in canonical_objectives]

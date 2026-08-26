@@ -113,13 +113,16 @@ def test_repeated_evaluation_memory_samples_release_evaluations(monkeypatch):
     memory = iter((100, 110, 120))
     monkeypatch.setattr(optimization, "_process_resident_memory_bytes", lambda: next(memory))
     problem = Problem()
+    reported = []
     samples = optimization.repeated_evaluation_memory_samples(
         problem,
         warmup=1,
         repeats=3,
+        on_sample=reported.append,
     )
 
     assert problem.calls == 4
     assert [sample.resident_memory_bytes for sample in samples] == [100, 110, 120]
+    assert reported == list(samples)
     assert all(sample.residual_norm == 3.0 for sample in samples)
     assert all(sample.jacobian_shape == (1, 1) for sample in samples)
