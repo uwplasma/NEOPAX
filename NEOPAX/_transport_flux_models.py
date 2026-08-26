@@ -2732,6 +2732,7 @@ class NTXRuntimeScanTransportModel(TransportFluxModelBase):
     bc_density: Any = None
     bc_temperature: Any = None
     channels: NTXRuntimeScanChannels | None = None
+    scan_surfaces: tuple[Any, ...] | None = None
     database: Any = None
 
     def _scan_axes(self) -> tuple[jax.Array, jax.Array, jax.Array]:
@@ -2759,6 +2760,20 @@ class NTXRuntimeScanTransportModel(TransportFluxModelBase):
         _, loader = _build_ntx_surface_loader(self.vmec_file, self.boozer_file, surface_backend=self.surface_backend)
         return loader
 
+    def _scan_surfaces(self, ntx, rho):
+        """Return supplied live surfaces or the legacy file-backed surfaces.
+
+        The explicit-surface route is deliberately a narrow forward boundary:
+        it lets realtime VMEC provide the already-built scan surfaces without
+        changing the file-backed runtime-database behaviour.
+        """
+        if self.scan_surfaces is not None:
+            if len(self.scan_surfaces) != int(rho.shape[0]):
+                raise ValueError("Provided ntx_scan_surfaces length does not match rho_scan.")
+            return self.scan_surfaces
+        loader = self._surface_loader(ntx)
+        return tuple(loader(float(rho_value)) for rho_value in rho)
+
     def _build_runtime_database(self):
         if self.database is not None:
             return self.database
@@ -2773,8 +2788,8 @@ class NTXRuntimeScanTransportModel(TransportFluxModelBase):
             n_zeta=int(self.n_zeta),
             n_xi=int(self.n_xi),
         )
-        scan = ntx.build_ntx_neopax_scan(
-            self._surface_loader(ntx),
+        scan = ntx.build_ntx_neopax_scan_from_surfaces(
+            self._scan_surfaces(ntx, rho),
             rho=rho,
             nu_v=nu_v,
             Es=es,
@@ -2835,12 +2850,17 @@ class NTXRuntimeScanTransportModel(TransportFluxModelBase):
         new_er_tilde = self.er_tilde_scan if er_tilde_scan is None else er_tilde_scan
 
         new_channels = self.channels
-        if self.channels is not None and rho_scan is not None:
+        new_scan_surfaces = self.scan_surfaces
+        if rho_scan is not None:
             old_rho = _as_float_array(self.rho_scan, name="rho_scan")
             candidate_rho = _as_float_array(new_rho, name="rho_scan")
             same_rho = old_rho.shape == candidate_rho.shape and bool(jnp.allclose(old_rho, candidate_rho))
             if not same_rho:
-                new_channels = None
+                if self.channels is not None:
+                    new_channels = None
+                # Explicit live surfaces are paired one-for-one with the scan
+                # radii; never silently reuse them on a changed axis.
+                new_scan_surfaces = None
 
         return dataclasses.replace(
             self,
@@ -2848,6 +2868,7 @@ class NTXRuntimeScanTransportModel(TransportFluxModelBase):
             nu_v_scan=new_nu_v,
             er_tilde_scan=new_er_tilde,
             channels=new_channels,
+            scan_surfaces=new_scan_surfaces,
             database=None if clear_database else self.database,
         )
 
@@ -14883,6 +14904,7 @@ def build_ntx_runtime_scan_transport_model(
     bc_density=None,
     bc_temperature=None,
     ntx_scan_channels=None,
+    ntx_scan_surfaces=None,
     preload_channels=False,
     prebuild_database=True,
     **kwargs,
@@ -14892,8 +14914,8 @@ def build_ntx_runtime_scan_transport_model(
         species=species,
         energy_grid=energy_grid,
         geometry=geometry,
-        vmec_file=str(vmec_file),
-        boozer_file=str(boozer_file),
+        vmec_file=None if vmec_file is None else str(vmec_file),
+        boozer_file=None if boozer_file is None else str(boozer_file),
         rho_scan=ntx_scan_rho,
         nu_v_scan=ntx_scan_nu_v,
         er_tilde_scan=ntx_scan_er_tilde,
@@ -14906,6 +14928,7 @@ def build_ntx_runtime_scan_transport_model(
         bc_density=bc_density,
         bc_temperature=bc_temperature,
         channels=ntx_scan_channels,
+        scan_surfaces=None if ntx_scan_surfaces is None else tuple(ntx_scan_surfaces),
         database=None,
     )
     if preload_channels:

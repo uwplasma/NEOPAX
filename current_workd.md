@@ -1,5 +1,80 @@
 # Reverse AD timing work: current state and plan
 
+## New planned work: realtime VMEC → NTX scan database payload (2026-08-26)
+
+### Audited current state
+
+`ntx_scan_runtime` and realtime VMEC exist, but are not connected in the
+realtime-geometry runtime builder.  The ordinary scan model builds channels
+and NTX surfaces from configured VMEC/Boozer files.  Conversely,
+`build_runtime_context_for_vmec_state()` clears those file fields and only
+special-cases `ntx_exact_lij_runtime` by injecting
+`ntx_exact_lij_support`.  Therefore a realtime-geometry configuration cannot
+currently make an `ntx_scan_runtime` database from the live VMEC state.
+
+The shared Radau reverse machinery is already the correct owner of this work:
+it accepts a support payload and accumulates its cotangent across the initial
+root and all accepted steps.  The exact-NTX setup is presently hard-coded in
+the provider-selection layer, not in the Radau equations.
+
+### Required design
+
+Keep the benchmark CLI and all Radau options unchanged.  TOML
+`[neoclassical].flux_model` selects the payload provider:
+
+- `ntx_exact_lij_runtime`: existing live VMEC prepared-support provider;
+- `ntx_scan_runtime`: new live VMEC scan-database provider;
+- other models: existing no-special-payload behaviour unless they opt in.
+
+The database provider must construct its database once per outer geometry
+payload, use database interpolation during roots and transport steps, and
+receive one accumulated database-coefficient cotangent after the reverse
+sweep.  It must not rebuild the database or retain a scan tape per Radau step.
+
+### Staged plan
+
+1. **Forward-only live database payload.** Add a private live-VMEC scan
+   support object and a builder accepting `GeometryAutodiffContext`, solved
+   VMEC state, and NEOPAX geometry.  It must supply live scan channels/surfaces
+   to `NTXRuntimeScanTransportModel` without file loaders.  Add a tiny
+   in-memory structural gate; do not run a production scan locally.
+2. **TOML/provider dispatch.** Extend only
+   `build_runtime_context_for_vmec_state()` and the current support-payload
+   selection boundary so `flux_model = "ntx_scan_runtime"` selects that live
+   payload.  The existing benchmark script and reverse CLI remain unchanged.
+   Exact-runtime selection and ordinary file-backed scan operation remain
+   untouched.
+3. **Forward parity gate.** On the benchmark machine, compare a fixed VMEC
+   state using the file-backed scan and the live payload scan at identical
+   scan nodes and database-interpolated transport values.
+4. **Database payload reverse contract.** Make the existing payload envelope
+   provider-neutral (`geometry` plus model payload), and accumulate a compact
+   database-coefficient bar through root and segmented Radau reverse.  Do not
+   alter the accepted exact-NTX support route.
+5. **Custom scan pullback.** Implement an opt-in bounded scan-builder reverse:
+   database coefficient bars are processed in scan-node chunks and contracted
+   through NTX's existing implicit adjoint, then mapped to the live VMEC
+   geometry channels.  No scan-node tape is carried through time steps.
+6. **Validation and timing.** Tiny equivalence/duality gates first; then one
+   remote reverse/FD comparison and timing run using the same benchmark script
+   with only the TOML changed.  Accept only if exact-runtime modes remain
+   unchanged and database geometry derivatives agree with FD.
+
+### Implementation status
+
+The forward boundary and TOML dispatch are now in place, unselected by the
+existing exact-runtime benchmarks. `build_ntx_runtime_scan_inputs_from_vmec_state`
+constructs live traceable VMEC scan surfaces and matching runtime channels at
+the configured `ntx_scan_rho`; `build_runtime_context_for_vmec_state()` injects
+them only when `flux_model = "ntx_scan_runtime"`. The existing scan model uses
+NTX's `build_ntx_neopax_scan_from_surfaces` for the live inputs, while its
+file-loader route remains the fallback. A CPU-only in-memory model-construction
+gate passes; no NTX scan or transport benchmark was run locally.
+
+Next: check fixed-state file-backed versus live scan parity remotely, then add
+provider-neutral reverse payload selection. No scan-database cotangent is wired
+into the established Radau reverse sweep yet.
+
 ## In progress: split native initial state/support transpose
 
 The rejected wide initial mode staged NTX state/support and direct realtime

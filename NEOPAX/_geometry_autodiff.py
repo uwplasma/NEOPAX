@@ -4520,6 +4520,92 @@ def _build_ntx_center_prepared_from_vmec_state(
     return jax.tree_util.tree_map(_stack_optional, *center_prepared_tuple)
 
 
+def build_ntx_runtime_scan_inputs_from_vmec_state(
+    context: GeometryAutodiffContext,
+    state,
+    geometry,
+    *,
+    rho_scan,
+    surface_backend: str = "vmec",
+):
+    """Build live VMEC scan surfaces and normalization channels for NTX DB.
+
+    This is the forward-only counterpart of the exact-Lij runtime-support
+    builder.  It intentionally returns the ordinary scan inputs, rather than
+    a new transport model: the existing ``ntx_scan_runtime`` model remains the
+    sole owner of NTX scan construction and database interpolation.
+    """
+    _ensure_local_stack_on_path()
+    ntx_src = _repo_root() / "NTX" / "src"
+    ntx_src_str = str(ntx_src)
+    if ntx_src.exists() and ntx_src_str not in sys.path:
+        sys.path.insert(0, ntx_src_str)
+    import ntx
+
+    rho = jnp.asarray(rho_scan, dtype=jnp.float64)
+    if rho.ndim != 1:
+        raise ValueError("ntx_scan_rho must be one-dimensional for realtime VMEC scan input.")
+    if not bool(jnp.all((rho > 0.0) & (rho <= 1.0))):
+        raise ValueError("ntx_scan_rho values must satisfy 0 < rho <= 1.")
+
+    rho_np = np.asarray(rho, dtype=float)
+    s_values = _positive_transport_s_values_from_rho(rho_np)
+    backend = str(surface_backend).strip().lower()
+    if backend in {"vmec", "vmec_jax"}:
+        surfaces = _traceable_vmec_surfaces_from_state(context, state, s_values=s_values)
+    elif backend in {"auto", "booz", "boozer", "boozmn", "booz_xform", "booz_xform_jax"}:
+        surfaces_fn = getattr(ntx, "surfaces_from_vmec_jax_state", None)
+        if surfaces_fn is None:
+            try:
+                from ntx._vmec_jax_surfaces import surfaces_from_vmec_jax_state as surfaces_fn
+            except ImportError:
+                surface_fn = getattr(ntx, "surface_from_vmec_jax_state")
+                surfaces = tuple(
+                    surface_fn(
+                        state=state,
+                        static=context.static,
+                        indata=context.indata,
+                        signgs=context.signgs,
+                        s=s_value,
+                    )
+                    for s_value in s_values
+                )
+            else:
+                surfaces = surfaces_fn(
+                    state=state,
+                    static=context.static,
+                    indata=context.indata,
+                    signgs=context.signgs,
+                    s_values=s_values,
+                    mboz=int(context.mboz),
+                    nboz=int(context.nboz),
+                    psi_p=jnp.abs(jnp.asarray(geometry.Psia_value, dtype=jnp.float64) / (2.0 * jnp.pi)),
+                )
+        else:
+            surfaces = surfaces_fn(
+                state=state,
+                static=context.static,
+                indata=context.indata,
+                signgs=context.signgs,
+                s_values=s_values,
+                mboz=int(context.mboz),
+                nboz=int(context.nboz),
+                psi_p=jnp.abs(jnp.asarray(geometry.Psia_value, dtype=jnp.float64) / (2.0 * jnp.pi)),
+            )
+    else:
+        raise ValueError(
+            "ntx_scan_surface_backend for realtime geometry must be one of "
+            "'vmec', 'booz', or 'auto'."
+        )
+
+    psia = jnp.asarray(geometry.Psia_value, dtype=jnp.float64) / (2.0 * jnp.pi)
+    r00 = _boozer_rmnc00_from_state_at_rho(context, state, rho_np)
+    return (
+        _build_ntx_runtime_channels_from_geometry(geometry, rho=rho, psia=psia, r00=r00),
+        tuple(surfaces),
+    )
+
+
 def build_ntx_exact_lij_support_from_vmec_state(
     context: GeometryAutodiffContext,
     state,
@@ -5817,7 +5903,8 @@ def build_runtime_context_for_vmec_state(
     config_eff["geometry"]["vmec_file"] = None
     config_eff["geometry"]["boozer_file"] = None
     neoclassical_cfg = dict(config_eff.get("neoclassical", {}))
-    if str(neoclassical_cfg.get("flux_model", "")).strip().lower() == "ntx_exact_lij_runtime":
+    flux_model_name = str(neoclassical_cfg.get("flux_model", "")).strip().lower()
+    if flux_model_name == "ntx_exact_lij_runtime":
         neoclassical_cfg["ntx_exact_lij_support"] = build_ntx_exact_lij_support_from_vmec_state(
             context,
             state_vmec,
@@ -5828,6 +5915,23 @@ def build_runtime_context_for_vmec_state(
             surface_backend=str(neoclassical_cfg.get("ntx_exact_surface_backend", "booz")),
         )
         neoclassical_cfg["preload_support"] = False
+        neoclassical_cfg["vmec_file"] = None
+        neoclassical_cfg["boozer_file"] = None
+        config_eff["neoclassical"] = neoclassical_cfg
+    elif flux_model_name == "ntx_scan_runtime":
+        if "ntx_scan_rho" not in neoclassical_cfg:
+            raise ValueError(
+                "ntx_scan_runtime with realtime geometry requires neoclassical.ntx_scan_rho."
+            )
+        scan_channels, scan_surfaces = build_ntx_runtime_scan_inputs_from_vmec_state(
+            context,
+            state_vmec,
+            geometry,
+            rho_scan=neoclassical_cfg["ntx_scan_rho"],
+            surface_backend=str(neoclassical_cfg.get("ntx_scan_surface_backend", "vmec")),
+        )
+        neoclassical_cfg["ntx_scan_channels"] = scan_channels
+        neoclassical_cfg["ntx_scan_surfaces"] = scan_surfaces
         neoclassical_cfg["vmec_file"] = None
         neoclassical_cfg["boozer_file"] = None
         config_eff["neoclassical"] = neoclassical_cfg

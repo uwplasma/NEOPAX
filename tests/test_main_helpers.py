@@ -1119,6 +1119,28 @@ def test_build_ntx_runtime_scan_transport_model_can_skip_prebuild():
     assert model.boozer_file == "boozmn.nc"
 
 
+def test_ntx_runtime_scan_model_accepts_live_scan_inputs_without_files():
+    """Realtime VMEC may supply explicit scan surfaces instead of files."""
+    surfaces = (object(), object())
+    model = build_ntx_runtime_scan_transport_model(
+        species="species",
+        energy_grid="grid",
+        geometry="geometry",
+        vmec_file=None,
+        boozer_file=None,
+        ntx_scan_rho=[0.25, 0.5],
+        ntx_scan_nu_v=[1.0e-4, 1.0e-3],
+        ntx_scan_er_tilde=[0.0, 1.0e-4],
+        ntx_scan_channels=_tiny_ntx_runtime_channels([0.25, 0.5]),
+        ntx_scan_surfaces=surfaces,
+        prebuild_database=False,
+    )
+
+    assert model.vmec_file is None
+    assert model.boozer_file is None
+    assert model._scan_surfaces(None, jnp.asarray([0.25, 0.5])) == surfaces
+
+
 def test_ntx_runtime_scan_database_keeps_radius_local_er_axis():
     scan = types.SimpleNamespace(
         rho=jnp.asarray([0.25, 0.5]),

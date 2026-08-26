@@ -55,7 +55,9 @@ IOTA_WEIGHT = 1.0
 MIRROR_WEIGHT = 100.0
 MAX_ER_WEIGHT = 0.6
 
-NFEV = 40
+# Focused memory-audit run: the audit below performs the substantive repeated
+# evaluations; one SciPy evaluation only confirms the usual driver wiring.
+NFEV = 1
 FTOL = 1.0e-6
 XTOL = 1.0e-10
 GEOMETRY_MAX_ITER = None
@@ -64,7 +66,7 @@ ROOT_OPTIONS = {}
 # Set this to a positive value to audit retained memory across identical
 # geometry + initial-Er-root evaluations before starting SciPy. It does not
 # change the residual/Jacobian path or the optimization itself.
-MEMORY_AUDIT_REPEATS = 0
+MEMORY_AUDIT_REPEATS = 8
 MEMORY_AUDIT_WARMUP = 1
 
 MAKE_WOUT_PLOTS = True
