@@ -2816,40 +2816,22 @@ def reverse_initial_carry_from_state_with_static_setup(
             _one_direct_and_lagged_bar
         )(carry_bars)
         if use_split_joint:
-            owner = getattr(solve_vector_field, "__self__", None)
-            direct_geometry_pullback = getattr(
-                owner,
-                "pullback_build_lagged_response_direct_geometry_payload_"
-                "batched_interpolated_faces",
-                None,
+            # Do not call the direct geometry transpose here.  This closure is
+            # itself differentiated/traced by the initial carry custom VJP;
+            # an ordinary Python call would therefore inline VMEC geometry
+            # into the native NTX graph.  Return the total lagged cotangent so
+            # the outer orchestration can run that independent transpose as a
+            # separate executable after this NTX-only contraction is ready.
+            total_lagged_bars = jax.tree_util.tree_map(
+                lambda cache_bar, rhs_bar: cache_bar + rhs_bar,
+                carry_bars.lagged_response_cache,
+                rhs_lagged_bars,
             )
-            if not callable(direct_geometry_pullback):
-                raise NotImplementedError(
-                    "Split native initial pullback requires the direct geometry hook."
-                )
-
-            def _split_joint_pullback(flat_y, total_lagged_bars, payload):
-                flat_bars, ntx_support_bars, coefficient_bars = joint_pullback(
-                    flat_y, total_lagged_bars, payload
-                )
-                geometry_bars = direct_geometry_pullback(
-                    lagged_state0, total_lagged_bars, payload
-                )
-                return (
-                    flat_bars,
-                    {"ntx_support": ntx_support_bars, "geometry": geometry_bars},
-                    coefficient_bars,
-                )
-
-            lagged_flat_bars, support_bars, native_vmec_coefficient_bars = (
-                _initial_lagged_response_joint_state_and_support_pullback(
-                    flat_y=flat_state0,
-                    cache_lagged_bars=carry_bars.lagged_response_cache,
-                    rhs_lagged_bars=rhs_lagged_bars,
-                    support_payload=support_payload,
-                    joint_pullback=_split_joint_pullback,
-                )
-            )
+            (
+                lagged_flat_bars,
+                support_bars,
+                native_vmec_coefficient_bars,
+            ) = joint_pullback(flat_state0, total_lagged_bars, support_payload)
         else:
             lagged_flat_bars, support_bars = (
                 _initial_lagged_response_joint_state_and_support_pullback(
@@ -2869,7 +2851,12 @@ def reverse_initial_carry_from_state_with_static_setup(
             total_flat_bars
         )
         if use_split_joint:
-            return state_bars, support_bars, native_vmec_coefficient_bars
+            return (
+                state_bars,
+                support_bars,
+                native_vmec_coefficient_bars,
+                total_lagged_bars,
+            )
         return state_bars, support_bars
 
     _build_initial_carry.defvjp(_build_initial_carry_fwd, _build_initial_carry_bwd)
@@ -4613,6 +4600,8 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
         flush=True,
     )
     phase_start = time.perf_counter()
+    initial_native_ntx_elapsed = None
+    initial_direct_geometry_elapsed = None
     with _reverse_profile_scope(reverse_setup, "reverse_post_sweep/initial_state_pullback"):
         if use_native_joint_initial_carry_pullback or use_native_split_joint_initial_carry_pullback:
             if not allow_initial_cache_support_pullback:
@@ -4624,9 +4613,53 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
             if use_native_split_joint_initial_carry_pullback:
                 (
                     initial_state_bars,
-                    initial_joint_support_bars,
+                    initial_joint_ntx_support_bars,
                     initial_joint_native_vmec_bars,
+                    initial_joint_total_lagged_bars,
                 ) = initial_joint_result
+                # Materialize the native NTX-only contraction before entering
+                # the direct VMEC geometry transpose.  These are deliberately
+                # two top-level JAX dispatches, not two Python calls within a
+                # traced custom-VJP rule.
+                (
+                    initial_state_bars,
+                    initial_joint_ntx_support_bars,
+                    initial_joint_native_vmec_bars,
+                    initial_joint_total_lagged_bars,
+                ) = jax.block_until_ready(
+                    (
+                        initial_state_bars,
+                        initial_joint_ntx_support_bars,
+                        initial_joint_native_vmec_bars,
+                        initial_joint_total_lagged_bars,
+                    )
+                )
+                initial_native_ntx_elapsed = time.perf_counter() - phase_start
+                direct_geometry_pullback = getattr(
+                    getattr(reverse_setup.solve_vector_field, "__self__", None),
+                    "pullback_build_lagged_response_direct_geometry_payload_"
+                    "batched_interpolated_faces",
+                    None,
+                )
+                if not callable(direct_geometry_pullback):
+                    raise RuntimeError(
+                        "split native initial pullback requires the direct geometry hook."
+                    )
+                initial_joint_geometry_bars = direct_geometry_pullback(
+                    initial_state,
+                    initial_joint_total_lagged_bars,
+                    support_payload,
+                )
+                initial_joint_geometry_bars = jax.block_until_ready(
+                    initial_joint_geometry_bars
+                )
+                initial_direct_geometry_elapsed = (
+                    time.perf_counter() - phase_start - initial_native_ntx_elapsed
+                )
+                initial_joint_support_bars = {
+                    "ntx_support": initial_joint_ntx_support_bars,
+                    "geometry": initial_joint_geometry_bars,
+                }
             else:
                 initial_state_bars, initial_joint_support_bars = initial_joint_result
                 initial_joint_native_vmec_bars = None
@@ -4676,6 +4709,13 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
         f"elapsed_s={time.perf_counter() - phase_start:.3f}",
         flush=True,
     )
+    if initial_native_ntx_elapsed is not None:
+        print(
+            f"{progress_prefix} diagnostic: split initial pullback "
+            f"native_ntx_state_support_s={initial_native_ntx_elapsed:.3f} "
+            f"direct_geometry_s={initial_direct_geometry_elapsed:.3f}",
+            flush=True,
+        )
     initial_er_root_support_bars = None
     if initial_er_root_enabled:
         phase_start = time.perf_counter()
