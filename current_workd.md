@@ -2150,3 +2150,91 @@ native joint hook because its zero RHS-lagged `lax.cond` branch had a
 zero-argument signature. The branch now accepts the required operand. This is
 a control-flow wiring fix only; it does not change either cotangent formula or
 the established modes. Re-run the same remote command after updating NEOPAX.
+
+**Outcome / do not select (2026-08-26):** that joint initial-carry mode did
+run after the control-flow fix, but took 664.694 s for the combined initial
+state/support pullback (versus roughly 137 s + 138 s for the established
+split path) and raised peak RAM substantially.  It is therefore a rejected,
+opt-in experiment.  The cause is structural: the native joint hook includes
+the direct outer-geometry VJP in the same objective-batched compiled graph.
+It is not an improvement and must not replace the default or drds-reuse mode.
+
+### Next work: initial edge using the established rebuild dispatch (2026-08-26)
+
+The desired route is *not* the rejected wide joint hook.  The initial cache
+is a zero-time graph edge:
+
+```
+y0 -- build_lagged_response --> cache0 -- initial RHS --> carry0
+```
+
+The reverse segments correctly stop at independent bars for `y0` and
+`cache0`; one transpose of the `y0 -> cache0` edge is mathematically required
+after the sweep.  It does not require a root solve, a virtual accepted step,
+or a second primal NTX solve.
+
+Plan for a new, unselected mode, tentatively named
+`rebuild_dispatch`:
+
+1. Audit the exact split rebuild route used by the active
+   `reverse_rebuild_support_pullback_mode`: the established state custom
+   pullback plus that mode's support pullback.  Define a small structural
+   oracle that proves the initial adapter supplies the same `state`, cache
+   cotangent, and support payload as a rebuild edge.
+2. Add an **initial-only** selector that reuses that dispatch outside the
+   segment JIT.  State remains the validated state-only lagged custom VJP;
+   support is selected from the active rebuild-mode hook.  Do not call the
+   native state-and-support joint hook and do not put direct geometry inside a
+   combined objective-batched graph.
+3. Handle native VMEC coefficient bars explicitly at this boundary.  The
+   current fast rebuild mode returns its VMEC face coefficients out of band;
+   the initial adapter must merge them through the existing geometry bridge,
+   rather than accidentally exposing them as generic support leaves.
+4. Compare the new mode against the current split initial route on small
+   in-memory tests.  Only after equality passes, request one remote benchmark
+   to measure initial-cache, initial-state, JIT time, and peak RAM.  Defaults,
+   the drds-reuse rebuild mode, and the rejected joint mode remain unchanged.
+
+Expected scope: this can remove the *generic* initial support graph and reuse
+the fast rebuild support implementation.  It cannot remove the one required
+initial-cache transpose or promise a one-NTX-adjoint result; whether it lowers
+the observed ~275 s must be measured before any claim of improvement.
+
+**Implementation status:** `rebuild_dispatch` is now an explicit, unselected
+initial-cache selector.  It dispatches through the active separate batched
+rebuild support hook, while leaving the initial state custom VJP unchanged.
+For the current VMEC-coefficient rebuild mode, it preserves the out-of-band
+face-coefficient bars and accumulates them with the segment-produced channel
+before the existing raw-block geometry bridge.  The small no-rollout dispatch
+gate passed on WSL CPU (`1 passed, 30 deselected`, 2026-08-26).  A numerical
+equivalence test against the existing initial support selector is required
+before a remote benchmark.
+
+**Initial-dispatch contract gate:** the selector is now checked for both
+contracts without an NTX solve or a transport rollout: (a) the ordinary
+batched result is passed through unchanged, and (b) the VMEC variant returns
+the ordinary support payload and out-of-band coefficient payload separately.
+The two CPU-only mock tests passed (`2 passed, 30 deselected`, 2026-08-26).
+They establish dispatch and carrier semantics; the first remote run must still
+compare the resulting AD table with the established drds-reuse reference.
+
+**Three-pass review (2026-08-26):**
+
+1. The selector maps only the already-exposed separate batched rebuild hooks;
+   unsupported scalar or joint rebuild selectors fail explicitly instead of
+   silently changing algebra.  Existing initial selectors do not enter this
+   branch.
+2. The native VMEC result initially exposed a double-counting hazard: its
+   normal payload includes a generic prepared-face bar while its separate
+   coefficient channel replaces that same rebuild-face term.  The selector
+   now routes that payload into `step_support_bar_leaves_accum`, exactly like
+   a segment rebuild, and keeps it out of the generic initial-cache
+   accumulator.  The final existing merge therefore retains direct geometry
+   and runtime channels once, with face coefficients supplied once by the
+   native channel.
+3. The selector remains outside the Radau segment JIT and does not change the
+   initial state custom VJP, root path, defaults, or the rejected native joint
+   mode.  Python compilation and whitespace checks pass; the small dispatch
+   gate remains CPU-only and passed.  The remaining required test is numerical
+   equivalence of a real initial response for the non-native batched contract,
+   followed separately by the native VMEC coefficient route.

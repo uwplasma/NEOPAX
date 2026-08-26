@@ -30,6 +30,7 @@ from NEOPAX._geometry_autodiff import (
     _ntx_runtime_channel_payload_bars,
 )
 from NEOPAX._reverse_ad_transport import (
+    _initial_cache_support_pullback_from_rebuild_dispatch,
     _initial_lagged_response_joint_state_and_support_pullback,
     _merge_rebuild_ntx_channels_into_generic_payload_bar,
     _objective_vector_vjp_rows,
@@ -272,6 +273,60 @@ def test_initial_joint_lagged_pullback_retains_rhs_induced_support_bar():
 
     # The present split support-only path would omit this real contribution.
     assert not jnp.allclose(3.0 * cache_bar, expected_support_bar)
+
+
+def test_initial_rebuild_dispatch_uses_active_hook_and_keeps_vmec_channel_separate():
+    """The initial-edge selector mirrors the separate rebuild hook contract."""
+
+    calls = []
+
+    def native_hook(flat_y, lagged_bars, support):
+        calls.append((flat_y, lagged_bars, support))
+        return {"support": lagged_bars + support}, {"b_cos": 2.0 * lagged_bars}
+
+    context = SimpleNamespace(
+        reverse_rebuild_support_pullback_mode=(
+            "ntx_batched_interpolated_faces_native_multi_rhs_reuse_moment_drds_jvp_"
+            "shared_primal_with_vmec_coefficients"
+        ),
+        flat_rhs_build_support_pullback_batched_interpolated_faces_native_multi_rhs_reuse_moment_drds_jvp_shared_primal_with_vmec_coefficients=native_hook,
+    )
+    support_bars, native_bars = _initial_cache_support_pullback_from_rebuild_dispatch(
+        physics_context=context,
+        flat_y=jnp.asarray([1.0, 2.0]),
+        lagged_response_bars=jnp.asarray([0.3, -0.4]),
+        support_payload=jnp.asarray([0.5, 0.7]),
+    )
+    assert len(calls) == 1
+    assert jnp.allclose(support_bars["support"], jnp.asarray([0.8, 0.3]))
+    assert jnp.allclose(native_bars["b_cos"], jnp.asarray([0.6, -0.8]))
+
+
+def test_initial_rebuild_dispatch_matches_ordinary_batched_support_contract():
+    """Non-native initial dispatch is exactly its active rebuild hook."""
+
+    def ordinary_hook(flat_y, lagged_bars, support):
+        return {
+            "state_marker": flat_y * 0.0,
+            "support": 1.7 * lagged_bars - 0.25 * support,
+        }
+
+    context = SimpleNamespace(
+        reverse_rebuild_support_pullback_mode="ntx_batched_interpolated_faces",
+        flat_rhs_build_support_pullback_batched_interpolated_faces=ordinary_hook,
+    )
+    flat_y = jnp.asarray([0.4, -0.8])
+    lagged_bars = jnp.asarray([[0.3, -0.4], [0.2, 0.6]])
+    support = jnp.asarray([1.1, -0.7])
+    expected = ordinary_hook(flat_y, lagged_bars, support)
+    actual, native_bars = _initial_cache_support_pullback_from_rebuild_dispatch(
+        physics_context=context,
+        flat_y=flat_y,
+        lagged_response_bars=lagged_bars,
+        support_payload=support,
+    )
+    _assert_float_tree_allclose(actual, expected)
+    assert native_bars is None
 
 
 def test_native_vmec_coefficient_tangent_contraction_matches_vjp_duality():

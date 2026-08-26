@@ -176,6 +176,55 @@ def _merge_rebuild_ntx_channels_into_generic_payload_bar(
     }
 
 
+_BATCHED_REBUILD_SUPPORT_HOOK_NAMES = {
+    "ntx_batched_interpolated_faces": "flat_rhs_build_support_pullback_batched_interpolated_faces",
+    "ntx_batched_interpolated_faces_reuse_local_vjp_primal": "flat_rhs_build_support_pullback_batched_interpolated_faces_reuse_local_vjp_primal",
+    "ntx_batched_interpolated_faces_multi_rhs_shared_primal": "flat_rhs_build_support_pullback_batched_interpolated_faces_multi_rhs_shared_primal",
+    "ntx_batched_interpolated_faces_native_multi_rhs_shared_primal": "flat_rhs_build_support_pullback_batched_interpolated_faces_native_multi_rhs_shared_primal",
+    "ntx_batched_interpolated_faces_native_multi_rhs_compact_shared_primal": "flat_rhs_build_support_pullback_batched_interpolated_faces_native_multi_rhs_compact_shared_primal",
+    "ntx_batched_interpolated_faces_native_multi_rhs_reuse_moment_drds_jvp_shared_primal": "flat_rhs_build_support_pullback_batched_interpolated_faces_native_multi_rhs_reuse_moment_drds_jvp_shared_primal",
+    "ntx_batched_interpolated_faces_native_multi_rhs_compact_residual_reuse_moment_drds_jvp_shared_primal": "flat_rhs_build_support_pullback_batched_interpolated_faces_native_multi_rhs_compact_residual_reuse_moment_drds_jvp_shared_primal",
+    "ntx_batched_interpolated_faces_native_multi_rhs_reuse_moment_drds_jvp_shared_primal_with_vmec_coefficients": "flat_rhs_build_support_pullback_batched_interpolated_faces_native_multi_rhs_reuse_moment_drds_jvp_shared_primal_with_vmec_coefficients",
+}
+
+_NATIVE_VMEC_REBUILD_SUPPORT_MODE = (
+    "ntx_batched_interpolated_faces_native_multi_rhs_reuse_moment_drds_jvp_shared_primal_with_vmec_coefficients"
+)
+
+
+def _initial_cache_support_pullback_from_rebuild_dispatch(
+    *, physics_context, flat_y, lagged_response_bars, support_payload
+):
+    """Run the active separate batched rebuild-support hook on the initial edge.
+
+    This deliberately does not select a state/support joint hook.  Its output
+    matches the normal rebuild support contract, with the VMEC coefficient
+    channel retained separately when the active rebuild selector provides it.
+    """
+
+    rebuild_mode = str(
+        getattr(physics_context, "reverse_rebuild_support_pullback_mode", "separate")
+    ).strip().lower()
+    hook_name = _BATCHED_REBUILD_SUPPORT_HOOK_NAMES.get(rebuild_mode)
+    if hook_name is None:
+        raise ValueError(
+            "reverse_initial_cache_support_pullback_mode='rebuild_dispatch' "
+            "requires a separate batched rebuild support mode; got "
+            f"{rebuild_mode!r}."
+        )
+    pullback = getattr(physics_context, hook_name, None)
+    if pullback is None:
+        raise RuntimeError(
+            "rebuild_dispatch was requested, but the active transport physics "
+            f"context does not expose {hook_name}."
+        )
+    result = pullback(flat_y, lagged_response_bars, support_payload)
+    if rebuild_mode == _NATIVE_VMEC_REBUILD_SUPPORT_MODE:
+        support_bars, native_vmec_coefficient_bars = result
+        return support_bars, native_vmec_coefficient_bars
+    return result, None
+
+
 def _objective_vector_vjp_rows(objective_vector_fn: Callable[[object], object], primal):
     """Return vector objective values and one input cotangent per output row."""
 
@@ -3425,6 +3474,9 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
         initial_cache_support_pullback_mode
         == "ntx_native_joint_state_and_support"
     )
+    use_rebuild_dispatch_initial_cache_pullback = (
+        initial_cache_support_pullback_mode == "rebuild_dispatch"
+    )
     phase_start = time.perf_counter()
     if use_native_joint_initial_carry_pullback:
         initial_carry, initial_state_pullback = (
@@ -4353,6 +4405,7 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
         "scalar",
         "ntx_batched_interpolated_faces",
         "ntx_native_joint_state_and_support",
+        "rebuild_dispatch",
     }:
         raise ValueError(
             "Unknown reverse_initial_cache_support_pullback_mode "
@@ -4391,7 +4444,17 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
         with _reverse_profile_scope(
             reverse_setup, "reverse_post_sweep/initial_cache_support_pullback"
         ):
-            if initial_cache_support_pullback_mode == "ntx_batched_interpolated_faces":
+            initial_native_vmec_bars = None
+            if use_rebuild_dispatch_initial_cache_pullback:
+                initial_cache_support_bars, initial_native_vmec_bars = (
+                    _initial_cache_support_pullback_from_rebuild_dispatch(
+                        physics_context=reverse_setup.execution_context.physics_context,
+                        flat_y=carry0.y,
+                        lagged_response_bars=reduced_bars.lagged_response_cache,
+                        support_payload=support_payload,
+                    )
+                )
+            elif initial_cache_support_pullback_mode == "ntx_batched_interpolated_faces":
                 batched_pullback = getattr(
                     reverse_setup.execution_context.physics_context,
                     "flat_rhs_build_support_pullback_batched_interpolated_faces",
@@ -4418,17 +4481,42 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
                 )
         initial_cache_support_bars = jax.block_until_ready(initial_cache_support_bars)
         initial_cache_support_bar_leaves = jax.tree_util.tree_leaves(initial_cache_support_bars)
-        support_bar_leaves = tuple(
-            accumulated + increment
-            for accumulated, increment in zip(support_bar_leaves, initial_cache_support_bar_leaves)
-        )
-        initial_cache_support_bar_leaves_accum = tuple(
-            accumulated + increment
-            for accumulated, increment in zip(
-                initial_cache_support_bar_leaves_accum,
-                initial_cache_support_bar_leaves,
+        if initial_native_vmec_bars is not None:
+            if native_vmec_face_coefficient_bars is None:
+                raise RuntimeError(
+                    "rebuild_dispatch received native VMEC coefficient bars, but "
+                    "the active reverse sweep did not allocate the matching channel."
+                )
+            native_vmec_face_coefficient_bars = jax.tree_util.tree_map(
+                lambda accumulated, increment: accumulated + increment,
+                native_vmec_face_coefficient_bars,
+                jax.block_until_ready(initial_native_vmec_bars),
             )
-        )
+            # The native VMEC channel replaces the face-prepared contribution
+            # of this lagged rebuild.  Keep this payload in the same rebuild
+            # accumulator as segment rebuilds, so the final bridge merges its
+            # runtime/direct-geometry leaves but does not add its generic
+            # prepared-face bar a second time.
+            step_support_bar_leaves_accum = tuple(
+                accumulated + increment
+                for accumulated, increment in zip(
+                    step_support_bar_leaves_accum,
+                    initial_cache_support_bar_leaves,
+                )
+            )
+        else:
+            support_bar_leaves = tuple(
+                accumulated + increment
+                for accumulated, increment in zip(
+                    support_bar_leaves, initial_cache_support_bar_leaves)
+            )
+            initial_cache_support_bar_leaves_accum = tuple(
+                accumulated + increment
+                for accumulated, increment in zip(
+                    initial_cache_support_bar_leaves_accum,
+                    initial_cache_support_bar_leaves,
+                )
+            )
         initial_cache_pullback_used = True
         print(
             f"{progress_prefix} progress: support reverse initial-cache support pullback ready "

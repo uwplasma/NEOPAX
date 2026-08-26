@@ -5450,6 +5450,7 @@ def main() -> None:
             "scalar",
             "ntx_batched_interpolated_faces",
             "ntx_native_joint_state_and_support",
+            "rebuild_dispatch",
         ),
         default="scalar",
         help=(
@@ -5459,7 +5460,9 @@ def main() -> None:
             "realtime interpolate_from_faces configuration and has no scalar fallback. "
             "'ntx_native_joint_state_and_support' is a separate opt-in path that "
             "uses one native multi-RHS initial lagged transpose for both state and "
-            "support cotangents."
+            "support cotangents. 'rebuild_dispatch' is an initial-edge-only opt-in "
+            "that reuses the active separate batched rebuild-support selector; it "
+            "does not select the wide joint state/support experiment."
         ),
     )
     parser.add_argument(
