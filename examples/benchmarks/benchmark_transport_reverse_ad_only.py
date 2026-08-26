@@ -5600,7 +5600,9 @@ def main() -> None:
         action="store_true",
         help=(
             "Diagnostic-only: separately JIT and time one representative rebuild "
-            "state transpose and support transpose with device synchronization. "
+            "state transpose and the exact selected support transpose with device "
+            "synchronization. Supports the standard separate modes and the native "
+            "multi-RHS grouped rebuild modes. "
             "With --reverse-segment-primal-record-mode reuse_segment_primal_record, "
             "also reports the logical record payload and separately times record replay "
             "and record-consuming reverse without rebuild transposes. This adds extra "

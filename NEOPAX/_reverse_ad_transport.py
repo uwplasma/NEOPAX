@@ -4202,19 +4202,45 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
         rebuild_mode = str(
             getattr(physics_context, "reverse_rebuild_support_pullback_mode", "separate")
         ).strip().lower()
-        if rebuild_mode not in {
+        separate_rebuild_modes = {
             "separate",
             "separate_reuse_local_vjp_primal",
             "separate_reuse_local_vjp_primal_geometry_only_prepared",
             "separate_reuse_local_vjp_primal_geometry_implicit_ntx_two_directional",
-        }:
+        }
+        native_batched_rebuild_modes = {
+            "ntx_batched_interpolated_faces_native_multi_rhs_reuse_moment_drds_jvp_shared_primal",
+            "ntx_batched_interpolated_faces_native_multi_rhs_reuse_moment_drds_jvp_shared_primal_with_vmec_coefficients",
+        }
+        if rebuild_mode not in separate_rebuild_modes | native_batched_rebuild_modes:
             raise ValueError(
-                "reverse_rebuild_component_timing currently requires "
-                "a standard separate rebuild-support mode."
+                "reverse_rebuild_component_timing currently requires a standard "
+                "separate rebuild-support mode or the native multi-RHS grouped mode."
             )
-        if physics_context.flat_rhs_build_support_pullback is None:
+        if (
+            rebuild_mode in separate_rebuild_modes
+            and physics_context.flat_rhs_build_support_pullback is None
+        ):
             raise RuntimeError(
                 "reverse_rebuild_component_timing requires the standard rebuild-support pullback hook."
+            )
+        native_batched_support_pullback = None
+        if rebuild_mode == (
+            "ntx_batched_interpolated_faces_native_multi_rhs_reuse_moment_drds_jvp_shared_primal"
+        ):
+            native_batched_support_pullback = (
+                physics_context.flat_rhs_build_support_pullback_batched_interpolated_faces_native_multi_rhs_reuse_moment_drds_jvp_shared_primal
+            )
+        elif rebuild_mode == (
+            "ntx_batched_interpolated_faces_native_multi_rhs_reuse_moment_drds_jvp_shared_primal_with_vmec_coefficients"
+        ):
+            native_batched_support_pullback = (
+                physics_context.flat_rhs_build_support_pullback_batched_interpolated_faces_native_multi_rhs_reuse_moment_drds_jvp_shared_primal_with_vmec_coefficients
+            )
+        if rebuild_mode in native_batched_rebuild_modes and native_batched_support_pullback is None:
+            raise RuntimeError(
+                "reverse_rebuild_component_timing requires the selected native "
+                "multi-RHS rebuild-support pullback hook."
             )
         diagnostic_segment_index = segment_count - 1
         diagnostic_carry = _take_tree_axis0(segment_start_carries, diagnostic_segment_index)
@@ -4254,6 +4280,24 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
             *,
             inner_timing_component: str = "full",
         ):
+            if rebuild_mode in native_batched_rebuild_modes:
+                if inner_timing_component != "full":
+                    raise ValueError(
+                        "native multi-RHS component timing exposes only the exact "
+                        "combined support transpose."
+                    )
+                # This is the production native branch verbatim: the selected
+                # NTX helper already receives the complete objective RHS batch.
+                # Do not wrap it in another vmap or sanitize it as a scalar tree.
+                return tuple(
+                    jax.tree_util.tree_leaves(
+                        native_batched_support_pullback(
+                            flat_y,
+                            cache_bars,
+                            support_payload,
+                        )
+                    )
+                )
             # Match the production `separate` branch exactly: flatten the
             # sanitized support cotangent *inside* vmap.  Returning the raw
             # support tree would ask vmap to batch NTX static metadata such as
@@ -4364,6 +4408,11 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
             "(diagnostic extra work; values are not added to the reverse result)",
             flush=True,
         )
+        print(
+            f"{progress_prefix} diagnostic: reverse rebuild timing mode={rebuild_mode} "
+            "component modules are measured separately and are not additive",
+            flush=True,
+        )
         if diagnostic_record_mode == "reuse_segment_primal_record":
             # The production segment kernel deliberately fuses these two scans.
             # Separate them only here so their exact record-mode shapes can be
@@ -4430,7 +4479,11 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
             diagnostic_cache_bars,
         )
         _time_rebuild_component(
-            "support_transpose",
+            (
+                "native_multi_rhs_support_transpose"
+                if rebuild_mode in native_batched_rebuild_modes
+                else "support_transpose"
+            ),
             jax.jit(_support_transpose_batched),
             diagnostic_carry.y,
             diagnostic_cache_bars,
