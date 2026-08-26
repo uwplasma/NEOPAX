@@ -7433,7 +7433,31 @@ def _radau_segment_reduced_cotangent_bwd_batched_with_support_from_primal_record
         "reduced_cotangent_step_call",
         "call_boundary",
     }
-    zero_support_leaves = tuple(jax.tree_util.tree_leaves(_radau_zero_support_delta_tree_like(support)))
+    # Keep this diagnostic carrier structurally identical to the production
+    # segment kernel.  The native VMEC-coefficient rebuild mode appends its
+    # out-of-band face-coefficient bars to the ordinary support leaves.
+    collect_native_vmec_coefficients = (
+        str(
+            getattr(
+                execution_context.physics_context,
+                "reverse_rebuild_support_pullback_mode",
+                "separate",
+            )
+        ).strip().lower()
+        == "ntx_batched_interpolated_faces_native_multi_rhs_reuse_moment_drds_jvp_shared_primal_with_vmec_coefficients"
+    )
+    zero_support_leaves = tuple(
+        jax.tree_util.tree_leaves(_radau_zero_support_delta_tree_like(support))
+    )
+    if collect_native_vmec_coefficients:
+        zero_support_leaves = (
+            *zero_support_leaves,
+            *tuple(
+                jax.tree_util.tree_leaves(
+                    _radau_zero_native_vmec_face_coefficient_bars(support)
+                )
+            ),
+        )
     objective_count = jnp.asarray(segment_reduced_bars.y).shape[0]
     zero_support_bar_leaves = tuple(
         jnp.broadcast_to(jnp.asarray(leaf)[None, ...], (objective_count,) + jnp.asarray(leaf).shape)
