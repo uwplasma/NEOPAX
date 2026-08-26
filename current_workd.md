@@ -2479,3 +2479,10 @@ square `3*n_species` system only for the production three-species contract.
 The value oracle now uses a JAX-pytree energy grid, a JAX-pytree geometry, and
 three kinetic species.  This changes test scaffolding only; it does not alter
 the selected NTX, bootstrap, or Radau paths.
+
+**Step-2 implementation status:** the new opt-in
+`--reverse-bootstrap-cotangent-mode joint_local_vjp_upar_only` now feeds the
+Upar-only primal into the existing scalar bootstrap reduction, then uses the
+same existing joint local state/support/geometry pullback as
+`joint_local_vjp`.  `separate` and `joint_local_vjp` remain byte-for-byte
+selection alternatives; no reverse-segment or initial-cache route is changed.

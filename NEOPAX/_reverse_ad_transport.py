@@ -3012,10 +3012,14 @@ def prepare_reverse_static_setup(
             "{'scalar', 'grouped_vjp'}."
         )
     reverse_bootstrap_cotangent_mode = str(reverse_bootstrap_cotangent_mode).strip().lower()
-    if reverse_bootstrap_cotangent_mode not in {"separate", "joint_local_vjp"}:
+    if reverse_bootstrap_cotangent_mode not in {
+        "separate",
+        "joint_local_vjp",
+        "joint_local_vjp_upar_only",
+    }:
         raise ValueError(
             "reverse_bootstrap_cotangent_mode must be one of "
-            "{'separate', 'joint_local_vjp'}."
+            "{'separate', 'joint_local_vjp', 'joint_local_vjp_upar_only'}."
         )
     reverse_rebuild_support_pullback_mode = str(
         reverse_rebuild_support_pullback_mode
@@ -3724,7 +3728,11 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
             "separate",
         )
     ).strip().lower()
-    if bootstrap_cotangent_mode not in {"separate", "joint_local_vjp"}:
+    if bootstrap_cotangent_mode not in {
+        "separate",
+        "joint_local_vjp",
+        "joint_local_vjp_upar_only",
+    }:
         raise ValueError(
             "Unknown reverse_bootstrap_cotangent_mode "
             f"{bootstrap_cotangent_mode!r}."
@@ -3831,6 +3839,11 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
             flux_model = getattr(getattr(runtime, "models", None), "flux", None)
             neoclassical_model = getattr(flux_model, "neoclassical_model", flux_model)
             corrected_fluxes_fn = getattr(neoclassical_model, "evaluate_momentum_corrected_fluxes", None)
+            upar_only_fn = getattr(
+                neoclassical_model,
+                "evaluate_momentum_corrected_upar_only",
+                None,
+            )
             state_pullback_fn = getattr(neoclassical_model, "pullback_momentum_corrected_upar_state_by_radius", None)
             support_pullback_fn = getattr(
                 neoclassical_model,
@@ -3847,10 +3860,18 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
                 "pullback_momentum_corrected_upar_state_support_geometry_by_radius",
                 None,
             )
-            if not callable(corrected_fluxes_fn):
+            use_upar_only_primal = (
+                bootstrap_cotangent_mode == "joint_local_vjp_upar_only"
+            )
+            if not use_upar_only_primal and not callable(corrected_fluxes_fn):
                 raise NotImplementedError(
                     "bootstrap_current_softmax_abs_scaled requires realtime NTX "
                     "evaluate_momentum_corrected_fluxes for compact full-transport AD."
+                )
+            if use_upar_only_primal and not callable(upar_only_fn):
+                raise NotImplementedError(
+                    "reverse_bootstrap_cotangent_mode='joint_local_vjp_upar_only' "
+                    "requires evaluate_momentum_corrected_upar_only on the realtime NTX model."
                 )
             if (
                 bootstrap_cotangent_mode == "separate"
@@ -3860,25 +3881,34 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
                     "bootstrap_current_softmax_abs_scaled requires compact corrected-Upar "
                     "state and support pullbacks on the realtime NTX model."
                 )
-            corrected_fluxes = corrected_fluxes_fn(final_state_for_bootstrap)
+            corrected_fluxes = (
+                {"Upar": upar_only_fn(final_state_for_bootstrap)}
+                if use_upar_only_primal
+                else corrected_fluxes_fn(final_state_for_bootstrap)
+            )
             objective_value, upar_bar = bootstrap_current_softmax_abs_value_and_upar_bar(
                 final_state_for_bootstrap,
                 runtime,
                 corrected_fluxes,
             )
             use_joint_bootstrap_pullback = (
-                bootstrap_cotangent_mode == "joint_local_vjp"
+                bootstrap_cotangent_mode
+                in {"joint_local_vjp", "joint_local_vjp_upar_only"}
                 and combined_geometry_payload
             )
-            if bootstrap_cotangent_mode == "joint_local_vjp" and not combined_geometry_payload:
+            if (
+                bootstrap_cotangent_mode
+                in {"joint_local_vjp", "joint_local_vjp_upar_only"}
+                and not combined_geometry_payload
+            ):
                 raise NotImplementedError(
-                    "reverse_bootstrap_cotangent_mode='joint_local_vjp' requires "
+                    "joint local bootstrap modes require "
                     "the combined realtime geometry payload."
                 )
             if use_joint_bootstrap_pullback:
                 if not callable(joint_pullback_fn):
                     raise NotImplementedError(
-                        "reverse_bootstrap_cotangent_mode='joint_local_vjp' requires "
+                    "joint local bootstrap modes require "
                         "the compact joint corrected-Upar pullback on the realtime NTX model."
                     )
                 geometry = support_payload["geometry"]

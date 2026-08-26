@@ -5222,13 +5222,15 @@ def main() -> None:
     )
     parser.add_argument(
         "--reverse-bootstrap-cotangent-mode",
-        choices=("separate", "joint_local_vjp"),
+        choices=("separate", "joint_local_vjp", "joint_local_vjp_upar_only"),
         default="separate",
         help=(
             "Bootstrap terminal-cotangent rule. 'separate' preserves the "
             "established state/support/geometry local VJPs. 'joint_local_vjp' "
             "uses one joint local VJP per radius for the combined realtime "
-            "geometry payload. This is opt-in."
+            "geometry payload. 'joint_local_vjp_upar_only' additionally uses "
+            "the verified Upar-only primal for the scalar bootstrap value. "
+            "Both joint modes are opt-in."
         ),
     )
     parser.add_argument(
