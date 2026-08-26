@@ -2431,3 +2431,44 @@ Scope and non-goals: this shares NTX/momentum primal and VJP residual work
 in a Radau reverse segment, because each segment differentiates a different
 lagged-response map at a different accepted-step state.  It does not change
 the selected rebuild mode, segment equations, initial boundary, or defaults.
+
+### Planned terminal bootstrap Upar-primal reduction (2026-08-26)
+
+After the joint local-VJP selector reduced the bootstrap compact phase from
+about `67.34 s` to `44.96 s`, one possible remaining duplication is the
+separate `evaluate_momentum_corrected_fluxes(final_state)` call used only to
+obtain Upar for the scalar bootstrap value.  The joint reverse helper then
+evaluates local corrected Upar again while constructing its VJPs.
+
+This cannot safely be claimed as a direct "reuse the VJP primal" change:
+the scalar objective needs the complete, regularized radius vector before it
+produces `upar_bar`, whereas each local VJP consumes its radius bar.  Keeping
+all local VJP closures/residuals until that later reduction would trade the
+duplicate primal for potentially very large retained NTX residuals.  A single
+global VJP would likewise risk rebuilding the large graph that the local rule
+avoids.
+
+Plan:
+
+1. Add a no-rollout value oracle for an **Upar-only** evaluator.  It must
+   reproduce the Upar returned by `evaluate_momentum_corrected_fluxes`,
+   including `_regularize_center_fluxes_axis0`, exactly.
+2. On a tiny in-memory lowering, compare the Upar-only evaluator with the
+   full flux evaluator.  Proceed only if it removes material work rather than
+   merely dropping inexpensive output arrays; it must not add a global VJP,
+   retain local VJP residuals, or change objective batching.
+3. If the structural gate is favorable, add a new bootstrap selector that
+   feeds `{\"Upar\": upar_only}` to the existing compact objective while
+   retaining the current joint local pullback.  The current
+   `joint_local_vjp` selector remains unchanged.
+4. Compare value and all terminal bars against `joint_local_vjp` in a small
+   gate, then measure the terminal component timing remotely.  Reject the
+   selector if compile size, retained memory, or warm time regresses.
+
+**Step-1 implementation status:** an unselected
+`evaluate_momentum_corrected_upar_only` evaluator now performs the same local
+momentum-matrix and correction solve, returns only Upar, and applies the same
+radius-axis regularization as the full evaluator.  It deliberately bypasses
+the Gamma/Q-only `get_corrected_fluxes` postprocessing.  The existing small
+fixed-surface no-rollout gate now compares it directly to the full evaluator's
+`Upar`.  It has not been wired to a benchmark selector yet.

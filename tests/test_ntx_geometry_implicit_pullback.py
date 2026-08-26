@@ -1568,6 +1568,14 @@ def test_native_vmec_face_rebuild_accumulation_matches_generic_prepared_vjp():
         pressure=jnp.asarray([[1.3, 1.61], [1.1, 1.38]]),
         Er=jnp.asarray([2.0e-4, 2.5e-4]),
     )
+    # The bootstrap-only primal may omit Gamma/Q/qpar/Upar2, but must retain
+    # exactly the regularized Upar consumed by the production objective.
+    _assert_float_tree_allclose(
+        model.evaluate_momentum_corrected_upar_only(state),
+        model.evaluate_momentum_corrected_fluxes(state)["Upar"],
+        rtol=1e-10,
+        atol=1e-12,
+    )
     response_bars = jax.tree_util.tree_map(
         lambda value: jnp.stack(
             (jnp.full_like(jnp.asarray(value), 0.17),

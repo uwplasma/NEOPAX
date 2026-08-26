@@ -8537,6 +8537,165 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             "Upar": upar,
         }
 
+    def evaluate_momentum_corrected_upar_only(self, state):
+        """Evaluate only the regularized momentum-corrected Upar field.
+
+        This is intentionally separate from :meth:`evaluate_momentum_corrected_fluxes`.
+        The bootstrap objective consumes only Upar, whereas the general flux
+        evaluator also constructs Gamma, Q, qpar, and Upar2.  In particular,
+        this avoids the per-species ``get_corrected_fluxes`` work that is
+        needed exclusively for Gamma/Q after the common momentum correction
+        solve is available.  It is not selected by the ordinary flux path.
+        """
+
+        evaluated = build_evaluated_transport_state(
+            state,
+            self.geometry,
+            bc_density=self.bc_density,
+            bc_temperature=self.bc_temperature,
+            density_floor=self.density_floor,
+            temperature_floor=self.temperature_floor,
+        )
+        density = evaluated.center.density
+        temperature = evaluated.center.temperature
+        dndr = evaluated.density_grad_center
+        dTdr = evaluated.temperature_grad_center
+        A1 = jax.vmap(
+            lambda charge, density_a, temperature_a, dndr_a, dTdr_a: get_Thermodynamical_Forces_A1(
+                charge,
+                density_a,
+                temperature_a,
+                dndr_a,
+                dTdr_a,
+                state.Er,
+            )
+        )(self.species.charge, density, temperature, dndr, dTdr)
+        A2 = jax.vmap(get_Thermodynamical_Forces_A2)(temperature, dTdr)
+        A3 = get_Thermodynamical_Forces_A3(state.Er)
+
+        support = self._static_support()
+        collisionality_kind = _collisionality_kind(self.collisionality_model)
+        v_thermal = get_v_thermal(self.species.mass, temperature)
+        n_species = int(self.species.number_species)
+        species_indices = jnp.arange(n_species, dtype=jnp.int32)
+        radius_indices = jnp.arange(state.Er.shape[0], dtype=jnp.int32)
+
+        def _momentum_matrices_per_radius(radius_index):
+            prepared = jax.tree_util.tree_map(
+                lambda arr: jax.lax.dynamic_index_in_dim(arr, radius_index, axis=0, keepdims=False),
+                support.center_prepared,
+            )
+            drds_value = jax.lax.dynamic_index_in_dim(
+                support.center_channels.drds, radius_index, axis=0, keepdims=False
+            )
+            er_value = jax.lax.dynamic_index_in_dim(state.Er, radius_index, axis=0, keepdims=False)
+            temperature_local = jax.lax.dynamic_index_in_dim(temperature, radius_index, axis=1, keepdims=False)
+            density_local = jax.lax.dynamic_index_in_dim(density, radius_index, axis=1, keepdims=False)
+            vthermal_local = jax.lax.dynamic_index_in_dim(v_thermal, radius_index, axis=1, keepdims=False)
+            return jax.vmap(
+                lambda species_index: self._solve_momentum_matrices_prepared_local(
+                    prepared,
+                    drds_value=drds_value,
+                    species_index=species_index,
+                    er_value=er_value,
+                    temperature_local=temperature_local,
+                    density_local=density_local,
+                    vthermal_local=vthermal_local,
+                    collisionality_kind=collisionality_kind,
+                )
+            )(species_indices)
+
+        lij_by_radius, eij_by_radius, nu_av_by_radius = self._map_radius_axis_regularized_at_axis0(
+            _momentum_matrices_per_radius,
+            radius_indices,
+            self.geometry.r_grid,
+        )
+
+        def _rhs_one(species_index, lij_species, radius_index):
+            return jnp.stack(
+                [
+                    -(
+                        lij_species[2, 0] * A1[species_index, radius_index]
+                        + lij_species[2, 1] * A2[species_index, radius_index]
+                        + lij_species[2, 2] * A3[radius_index]
+                    ),
+                    -(
+                        (2.5 * lij_species[2, 0] - lij_species[3, 0]) * A1[species_index, radius_index]
+                        + (2.5 * lij_species[2, 1] - lij_species[3, 1]) * A2[species_index, radius_index]
+                        + (2.5 * lij_species[2, 2] - lij_species[3, 2]) * A3[radius_index]
+                    ),
+                    -(
+                        (4.375 * lij_species[2, 0] - 3.5 * lij_species[3, 0] + 0.5 * lij_species[4, 0])
+                        * A1[species_index, radius_index]
+                        + (4.375 * lij_species[2, 1] - 3.5 * lij_species[3, 1] + 0.5 * lij_species[4, 1])
+                        * A2[species_index, radius_index]
+                        + (4.375 * lij_species[2, 2] - 3.5 * lij_species[3, 2] + 0.5 * lij_species[4, 2])
+                        * A3[radius_index]
+                    ),
+                ]
+            )
+
+        def _upar_per_radius(radius_index, lij_radius, eij_radius, nu_av_radius):
+            cm_ab, cn_ab, tau = jax.vmap(
+                jax.vmap(
+                    get_Collision_Operator_terms,
+                    in_axes=(None, None, 0, None, None, None, None),
+                ),
+                in_axes=(None, 0, None, None, None, None, None),
+            )(
+                self.species,
+                species_indices,
+                species_indices,
+                radius_index,
+                temperature,
+                density,
+                v_thermal,
+            )
+            rhs = jax.vmap(_rhs_one, in_axes=(0, 0, None))(
+                species_indices, lij_radius, radius_index
+            )
+            matrix_rows = jax.vmap(
+                get_Matrix,
+                in_axes=(None, None, 0, None, 0, 0, None, None, None, None),
+            )(
+                self.energy_grid,
+                self.geometry,
+                species_indices,
+                radius_index,
+                lij_radius,
+                eij_radius,
+                cm_ab,
+                cn_ab,
+                tau,
+                v_thermal,
+            )
+            operator = lineax.MatrixLinearOperator(
+                jnp.reshape(
+                    matrix_rows,
+                    (matrix_rows.shape[0] * matrix_rows.shape[1], matrix_rows.shape[2]),
+                )
+            )
+            solution = lineax.linear_solve(
+                operator, jnp.reshape(rhs, rhs.shape[0] * rhs.shape[1])
+            )
+            correction = jnp.reshape(solution.value, (n_species, 3))
+            # This is exactly the Upar component returned by
+            # ``get_corrected_fluxes`` after the common correction solve.
+            return correction[:, 0] * density[:, radius_index]
+
+        upar_by_radius = jax.vmap(
+            _upar_per_radius,
+            in_axes=(0, 0, 0, 0),
+        )(radius_indices, lij_by_radius, eij_by_radius, nu_av_by_radius)
+        upar = jnp.swapaxes(upar_by_radius, 0, 1)
+        return jnp.swapaxes(
+            self._regularize_axis_radius0(
+                jnp.swapaxes(upar, 0, 1), self.geometry.r_grid
+            ),
+            0,
+            1,
+        )
+
     def evaluate_momentum_corrected_fluxes(self, state) -> dict:
         """Evaluate realtime NTX fluxes with momentum-corrected parallel flow.
 
