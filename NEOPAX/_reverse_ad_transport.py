@@ -2421,6 +2421,7 @@ def reverse_initial_carry_from_state_with_static_setup(
     species,
     prepared_rollout_static,
     return_native_joint_pullback: bool = False,
+    return_native_split_joint_pullback: bool = False,
 ):
     """Build the initial carry with the validated reverse-local lagged pullback."""
 
@@ -2689,10 +2690,16 @@ def reverse_initial_carry_from_state_with_static_setup(
             raise NotImplementedError(
                 "Native joint initial-carry pullback requires an initial lagged response."
             )
+        use_split_joint = bool(return_native_split_joint_pullback)
         joint_pullback = getattr(
             physics_context,
-            "flat_rhs_build_state_and_support_pullback_batched_interpolated_faces_"
-            "native_multi_rhs_reuse_moment_drds_jvp_shared_primal",
+            (
+                "flat_rhs_build_state_and_ntx_support_pullback_batched_interpolated_faces_"
+                "native_multi_rhs_reuse_moment_drds_jvp_shared_primal_with_vmec_coefficients"
+                if use_split_joint
+                else "flat_rhs_build_state_and_support_pullback_batched_interpolated_faces_"
+                "native_multi_rhs_reuse_moment_drds_jvp_shared_primal"
+            ),
             None,
         )
         if joint_pullback is None:
@@ -2808,15 +2815,51 @@ def reverse_initial_carry_from_state_with_static_setup(
         direct_flat_bars, rhs_lagged_bars = jax.vmap(
             _one_direct_and_lagged_bar
         )(carry_bars)
-        lagged_flat_bars, support_bars = (
-            _initial_lagged_response_joint_state_and_support_pullback(
+        if use_split_joint:
+            owner = getattr(solve_vector_field, "__self__", None)
+            direct_geometry_pullback = getattr(
+                owner,
+                "pullback_build_lagged_response_direct_geometry_payload_"
+                "batched_interpolated_faces",
+                None,
+            )
+            if not callable(direct_geometry_pullback):
+                raise NotImplementedError(
+                    "Split native initial pullback requires the direct geometry hook."
+                )
+
+            def _split_joint_pullback(flat_y, total_lagged_bars, payload):
+                flat_bars, ntx_support_bars, coefficient_bars = joint_pullback(
+                    flat_y, total_lagged_bars, payload
+                )
+                geometry_bars = direct_geometry_pullback(
+                    lagged_state0, total_lagged_bars, payload
+                )
+                return (
+                    flat_bars,
+                    {"ntx_support": ntx_support_bars, "geometry": geometry_bars},
+                    coefficient_bars,
+                )
+
+            lagged_flat_bars, support_bars, native_vmec_coefficient_bars = (
+                _initial_lagged_response_joint_state_and_support_pullback(
+                    flat_y=flat_state0,
+                    cache_lagged_bars=carry_bars.lagged_response_cache,
+                    rhs_lagged_bars=rhs_lagged_bars,
+                    support_payload=support_payload,
+                    joint_pullback=_split_joint_pullback,
+                )
+            )
+        else:
+            lagged_flat_bars, support_bars = (
+                _initial_lagged_response_joint_state_and_support_pullback(
                 flat_y=flat_state0,
                 cache_lagged_bars=carry_bars.lagged_response_cache,
                 rhs_lagged_bars=rhs_lagged_bars,
                 support_payload=support_payload,
                 joint_pullback=joint_pullback,
+                )
             )
-        )
         if project_flat is not None:
             _, project_pullback = jax.vjp(project_flat, flat_state0)
             lagged_flat_bars = jax.vmap(project_pullback)(lagged_flat_bars)[0]
@@ -2825,10 +2868,12 @@ def reverse_initial_carry_from_state_with_static_setup(
         state_bars = jax.vmap(lambda flat_bar: state_pullback(flat_bar)[0])(
             total_flat_bars
         )
+        if use_split_joint:
+            return state_bars, support_bars, native_vmec_coefficient_bars
         return state_bars, support_bars
 
     _build_initial_carry.defvjp(_build_initial_carry_fwd, _build_initial_carry_bwd)
-    if return_native_joint_pullback:
+    if return_native_joint_pullback or return_native_split_joint_pullback:
         carry0, residual = _build_initial_carry_fwd(state)
 
         def _pullback(carry_bars, support_payload):
@@ -3474,11 +3519,15 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
         initial_cache_support_pullback_mode
         == "ntx_native_joint_state_and_support"
     )
+    use_native_split_joint_initial_carry_pullback = (
+        initial_cache_support_pullback_mode
+        == "ntx_native_joint_state_and_ntx_support_split_geometry_vmec"
+    )
     use_rebuild_dispatch_initial_cache_pullback = (
         initial_cache_support_pullback_mode == "rebuild_dispatch"
     )
     phase_start = time.perf_counter()
-    if use_native_joint_initial_carry_pullback:
+    if use_native_joint_initial_carry_pullback or use_native_split_joint_initial_carry_pullback:
         initial_carry, initial_state_pullback = (
             dependencies.reverse_initial_carry_from_state_with_static_setup(
                 solver=reverse_setup.solver,
@@ -3487,6 +3536,9 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
                 species=runtime.species,
                 prepared_rollout_static=reverse_setup.prepared_rollout,
                 return_native_joint_pullback=True,
+                return_native_split_joint_pullback=(
+                    use_native_split_joint_initial_carry_pullback
+                ),
             )
         )
         initial_carry_vjp_label = "native joint forward"
@@ -4405,6 +4457,7 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
         "scalar",
         "ntx_batched_interpolated_faces",
         "ntx_native_joint_state_and_support",
+        "ntx_native_joint_state_and_ntx_support_split_geometry_vmec",
         "rebuild_dispatch",
     }:
         raise ValueError(
@@ -4416,10 +4469,20 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
         "full_initial_cache_support_pullback",
         "initial_cache_support_pullback",
     }
-    if use_native_joint_initial_carry_pullback and not initial_lagged_response_valid:
+    if (use_native_joint_initial_carry_pullback or use_native_split_joint_initial_carry_pullback) and not initial_lagged_response_valid:
         raise RuntimeError(
             "ntx_native_joint_state_and_support requires a valid initial "
             "lagged response."
+        )
+    if use_native_split_joint_initial_carry_pullback and getattr(
+        reverse_setup.execution_context.physics_context,
+        "flat_rhs_build_state_and_ntx_support_pullback_batched_interpolated_faces_"
+        "native_multi_rhs_reuse_moment_drds_jvp_shared_primal_with_vmec_coefficients",
+        None,
+    ) is None:
+        raise RuntimeError(
+            "split native initial pullback was requested, but the active transport "
+            "physics context does not expose the compact NTX/VMEC hook."
         )
     if use_native_joint_initial_carry_pullback and getattr(
         reverse_setup.execution_context.physics_context,
@@ -4439,6 +4502,7 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
         and build_support_pullback is not None
         and allow_initial_cache_support_pullback
         and not use_native_joint_initial_carry_pullback
+        and not use_native_split_joint_initial_carry_pullback
     ):
         phase_start = time.perf_counter()
         with _reverse_profile_scope(
@@ -4528,6 +4592,7 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
         initial_lagged_response_valid
         and build_support_pullback is not None
         and not use_native_joint_initial_carry_pullback
+        and not use_native_split_joint_initial_carry_pullback
     ):
         initial_cache_pullback_skipped = True
 
@@ -4549,21 +4614,28 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
     )
     phase_start = time.perf_counter()
     with _reverse_profile_scope(reverse_setup, "reverse_post_sweep/initial_state_pullback"):
-        if use_native_joint_initial_carry_pullback:
+        if use_native_joint_initial_carry_pullback or use_native_split_joint_initial_carry_pullback:
             if not allow_initial_cache_support_pullback:
                 raise ValueError(
                     "ntx_native_joint_state_and_support requires the full initial "
                     "cache support pullback cotangent mode."
                 )
-            initial_state_bars, initial_joint_support_bars = initial_state_pullback(
-                carry0_bars,
-                support_payload,
-            )
+            initial_joint_result = initial_state_pullback(carry0_bars, support_payload)
+            if use_native_split_joint_initial_carry_pullback:
+                (
+                    initial_state_bars,
+                    initial_joint_support_bars,
+                    initial_joint_native_vmec_bars,
+                ) = initial_joint_result
+            else:
+                initial_state_bars, initial_joint_support_bars = initial_joint_result
+                initial_joint_native_vmec_bars = None
         else:
             initial_state_bars = jax.vmap(
                 lambda carry0_bar: initial_state_pullback(carry0_bar)[0]
             )(carry0_bars)
             initial_joint_support_bars = None
+            initial_joint_native_vmec_bars = None
     if initial_joint_support_bars is not None:
         initial_state_bars, initial_joint_support_bars = jax.block_until_ready(
             (initial_state_bars, initial_joint_support_bars)
@@ -4584,6 +4656,17 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
                 initial_joint_support_bar_leaves,
             )
         )
+        if initial_joint_native_vmec_bars is not None:
+            if native_vmec_face_coefficient_bars is None:
+                raise RuntimeError(
+                    "split native initial pullback returned VMEC coefficient bars, "
+                    "but the active rebuild mode did not allocate that channel."
+                )
+            native_vmec_face_coefficient_bars = jax.tree_util.tree_map(
+                lambda accumulated, increment: accumulated + increment,
+                native_vmec_face_coefficient_bars,
+                initial_joint_native_vmec_bars,
+            )
         initial_cache_pullback_used = True
     else:
         initial_state_bars = jax.block_until_ready(initial_state_bars)

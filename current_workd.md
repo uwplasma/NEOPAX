@@ -1,5 +1,15 @@
 # Reverse AD timing work: current state and plan
 
+## In progress: split native initial state/support transpose
+
+The rejected wide initial mode staged NTX state/support and direct realtime
+geometry in one objective-batched graph. The new unselected mode
+`ntx_native_joint_state_and_ntx_support_split_geometry_vmec` obtains state
+bars, NTX support bars, and native VMEC coefficient bars from one native
+matrix-RHS lowdot contraction, then evaluates only direct geometry separately.
+It preserves the out-of-band VMEC bridge and leaves existing selectors alone.
+It still requires benchmark-machine AD and timing comparison.
+
 ## Current next work: local NTX multi-RHS shared-adjoint investigation (2026-08-23)
 
 ### Objective
@@ -2217,6 +2227,24 @@ the ordinary support payload and out-of-band coefficient payload separately.
 The two CPU-only mock tests passed (`2 passed, 30 deselected`, 2026-08-26).
 They establish dispatch and carrier semantics; the first remote run must still
 compare the resulting AD table with the established drds-reuse reference.
+
+**Remote outcome / reject `rebuild_dispatch` as a performance route:** the
+initial support phase measured 182.023 s and the unchanged initial state phase
+measured 140.744 s.  This selector only substituted the support-side hook; it
+could not eliminate the state-side NTX transpose.  It must remain an opt-in
+comparison mode, not the proposed improvement.
+
+**Correct next implementation:** the fast reverse-step mode uses the native
+lowdot/multi-RHS NTX primitive only for support, while the state side invokes
+the ordinary `pullback_build_lagged_response`.  The initial edge currently
+does the same two calls.  A useful joint mode must therefore share exactly
+the native NTX state + NTX-support contraction, but keep the outer direct
+geometry transpose as a separate post-call operation.  The previous joint
+mode was slow because it placed that direct geometry VJP inside the same
+objective-batched graph.  The missing helper is a narrow native joint
+lowdot return that also carries the existing out-of-band VMEC coefficient
+bars.  It will be a new unselected mode and will not alter the current
+drds-reuse or `rebuild_dispatch` routes.
 
 **Three-pass review (2026-08-26):**
 
