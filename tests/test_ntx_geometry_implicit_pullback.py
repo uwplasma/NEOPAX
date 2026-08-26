@@ -18,6 +18,7 @@ from NEOPAX._transport_flux_models import (
     _sanitize_float_delta_bar_tree,
 )
 from NEOPAX._neoclassical import _collisionality_kind
+from NEOPAX._energy_grid_models import StandardLaguerreEnergyGrid
 from NEOPAX._species import Species
 from NEOPAX._state import TransportState, get_v_thermal
 from NEOPAX._transport_equations import ComposedEquationSystem
@@ -55,6 +56,17 @@ class _ToyBootstrapGeometry:
     """Minimal differentiable geometry payload for the terminal-VJP gate."""
 
     scale: object
+
+
+@jax.tree_util.register_dataclass
+@dataclasses.dataclass(frozen=True)
+class _TestMomentumGeometry:
+    """Minimum JAX-pytree geometry accepted by the momentum matrix JIT."""
+
+    a_b: object
+    r_grid: object
+    r_grid_half: object
+    Bsqav: object
 
 
 @jax.tree_util.register_dataclass
@@ -1476,10 +1488,11 @@ def test_native_vmec_face_rebuild_accumulation_matches_generic_prepared_vjp():
 
     surface, _prepared = _small_vmec_prepared()
     grid = ntx.GridSpec(5, 5, 4)
-    geometry = SimpleNamespace(
+    geometry = _TestMomentumGeometry(
         a_b=jnp.asarray(1.0),
         r_grid=jnp.asarray([0.3, 0.7]),
         r_grid_half=jnp.asarray([0.1, 0.5, 0.9]),
+        Bsqav=jnp.asarray([1.2, 1.3]),
     )
 
     def _channels(rho):
@@ -1542,36 +1555,25 @@ def test_native_vmec_face_rebuild_accumulation_matches_generic_prepared_vjp():
         grid=grid,
     )
     species = Species(
-        number_species=2,
-        species_indices=jnp.asarray([0, 1]),
-        mass_mp=jnp.asarray([5.446e-4, 2.0]),
-        charge_qp=jnp.asarray([-1.0, 1.0]),
-        names=("e", "D"),
+        # The hard-coded three-Sonine momentum correction is square only
+        # for three kinetic species; this mirrors the production contract.
+        number_species=3,
+        species_indices=jnp.asarray([0, 1, 2]),
+        mass_mp=jnp.asarray([5.446e-4, 2.0, 3.0]),
+        charge_qp=jnp.asarray([-1.0, 1.0, 2.0]),
+        names=("e", "D", "He"),
     )
-    energy_grid = SimpleNamespace(
-        xWeights=jnp.asarray([0.4, 0.6]),
-        L11_weight=jnp.asarray([1.0, 0.8]),
-        L12_weight=jnp.asarray([0.1, -0.2]),
-        L22_weight=jnp.asarray([0.9, 1.1]),
-        L13_weight=jnp.asarray([0.4, 0.5]),
-        L23_weight=jnp.asarray([-0.3, 0.2]),
-        L33_weight=jnp.asarray([1.3, 0.6]),
-        L24_weight=jnp.asarray([0.2, 0.3]),
-        L25_weight=jnp.asarray([0.1, -0.2]),
-        L43_weight=jnp.asarray([0.7, 0.4]),
-        L44_weight=jnp.asarray([0.6, 0.8]),
-        L45_weight=jnp.asarray([-0.1, 0.3]),
-        L55_weight=jnp.asarray([0.9, 0.5]),
-        v_norm=jnp.asarray([0.9, 1.1]),
-    )
+    # ``get_Matrix`` is JIT compiled, so this needs the same JAX-pytree
+    # energy-grid object used by production rather than a SimpleNamespace.
+    energy_grid = StandardLaguerreEnergyGrid(n_x=2)
     model = NTXExactLijRuntimeTransportModel(
         species=species, energy_grid=energy_grid, geometry=geometry,
         vmec_file=None, boozer_file=None, support=support,
         center_response_mode="interpolate_from_faces", response_anchor_count=2,
     )
     state = TransportState(
-        density=jnp.asarray([[1.0, 1.15], [1.0, 1.15]]),
-        pressure=jnp.asarray([[1.3, 1.61], [1.1, 1.38]]),
+        density=jnp.asarray([[1.0, 1.15], [1.0, 1.15], [0.8, 0.9]]),
+        pressure=jnp.asarray([[1.3, 1.61], [1.1, 1.38], [0.7, 0.87]]),
         Er=jnp.asarray([2.0e-4, 2.5e-4]),
     )
     # The bootstrap-only primal may omit Gamma/Q/qpar/Upar2, but must retain

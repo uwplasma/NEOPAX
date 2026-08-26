@@ -2472,3 +2472,10 @@ radius-axis regularization as the full evaluator.  It deliberately bypasses
 the Gamma/Q-only `get_corrected_fluxes` postprocessing.  The existing small
 fixed-surface no-rollout gate now compares it directly to the full evaluator's
 `Upar`.  It has not been wired to a benchmark selector yet.
+
+**Oracle fixture correction:** the first small fixture had two kinetic
+species, while the existing three-Sonine momentum-correction assembly forms a
+square `3*n_species` system only for the production three-species contract.
+The value oracle now uses a JAX-pytree energy grid, a JAX-pytree geometry, and
+three kinetic species.  This changes test scaffolding only; it does not alter
+the selected NTX, bootstrap, or Radau paths.
