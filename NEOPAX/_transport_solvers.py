@@ -7480,6 +7480,19 @@ def _radau_segment_reduced_cotangent_bwd_batched_with_support_call(
         and use_segment_primal_record
         and collect_native_vmec_coefficients
     )
+    native_vmec_zero_leaves = (
+        tuple(
+            jnp.broadcast_to(
+                jnp.asarray(leaf)[None, ...],
+                (jnp.asarray(segment_reduced_bars.y).shape[0],) + jnp.asarray(leaf).shape,
+            )
+            for leaf in jax.tree_util.tree_leaves(
+                _radau_zero_native_vmec_face_coefficient_bars(support)
+            )
+        )
+        if collect_native_vmec_coefficients
+        else tuple()
+    )
     zero_support_leaves = tuple(
         jax.tree_util.tree_leaves(_radau_zero_support_delta_tree_like(support))
     )

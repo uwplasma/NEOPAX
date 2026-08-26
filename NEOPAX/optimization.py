@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import dataclasses
 import copy
+import gc
+import os
 import time
 from collections.abc import Sequence
 from typing import Callable, Mapping
@@ -95,6 +97,113 @@ class GeometryLeastSquaresTerm:
     @property
     def residual_label(self) -> str:
         return self.label or self.objective.label
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class RepeatedEvaluationMemorySample:
+    """One fully materialized optimizer evaluation in a memory audit."""
+
+    iteration: int
+    elapsed_s: float
+    resident_memory_bytes: int | None
+    residual_norm: float
+    jacobian_shape: tuple[int, int]
+
+
+def _process_resident_memory_bytes() -> int | None:
+    """Return the current process working set without requiring ``psutil``.
+
+    This deliberately measures the whole process: JAX/XLA executable and device
+    allocations are native allocations, so Python allocation tracers alone are
+    not useful for the optimizer-retention investigation.
+    """
+
+    if os.name == "nt":
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            class _ProcessMemoryCountersEx(ctypes.Structure):
+                _fields_ = [
+                    ("cb", wintypes.DWORD),
+                    ("PageFaultCount", wintypes.DWORD),
+                    ("PeakWorkingSetSize", ctypes.c_size_t),
+                    ("WorkingSetSize", ctypes.c_size_t),
+                    ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
+                    ("QuotaPagedPoolUsage", ctypes.c_size_t),
+                    ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
+                    ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+                    ("PagefileUsage", ctypes.c_size_t),
+                    ("PeakPagefileUsage", ctypes.c_size_t),
+                    ("PrivateUsage", ctypes.c_size_t),
+                ]
+
+            counters = _ProcessMemoryCountersEx()
+            counters.cb = ctypes.sizeof(counters)
+            ok = ctypes.windll.psapi.GetProcessMemoryInfo(
+                ctypes.windll.kernel32.GetCurrentProcess(),
+                ctypes.byref(counters),
+                counters.cb,
+            )
+            return int(counters.WorkingSetSize) if ok else None
+        except (AttributeError, OSError):
+            return None
+    try:
+        with open("/proc/self/statm", encoding="ascii") as stream:
+            resident_pages = int(stream.read().split()[1])
+        return resident_pages * int(os.sysconf("SC_PAGE_SIZE"))
+    except (FileNotFoundError, IndexError, OSError, ValueError):
+        return None
+
+
+def repeated_evaluation_memory_samples(
+    problem,
+    *,
+    repeats: int = 5,
+    warmup: int = 1,
+    scaled_parameter_values=None,
+) -> tuple[RepeatedEvaluationMemorySample, ...]:
+    """Measure retained process memory across identical optimizer evaluations.
+
+    ``warmup`` evaluations are excluded so the caller can distinguish first-use
+    compilation from growth that continues across identical geometry plus
+    initial-Er-root trials. This is diagnostic-only: it calls the existing
+    ``problem.evaluate`` unchanged and retains neither its arrays nor VJP data.
+    """
+
+    if int(repeats) != repeats or int(repeats) < 1:
+        raise ValueError("repeats must be a positive integer.")
+    if int(warmup) != warmup or int(warmup) < 0:
+        raise ValueError("warmup must be a non-negative integer.")
+    x = problem.x0 if scaled_parameter_values is None else scaled_parameter_values
+    for _ in range(int(warmup)):
+        evaluation = problem.evaluate(x)
+        jax.block_until_ready((evaluation.residuals, evaluation.jacobian))
+        del evaluation
+    gc.collect()
+
+    samples = []
+    for iteration in range(int(repeats)):
+        started = time.perf_counter()
+        evaluation = problem.evaluate(x)
+        residuals, jacobian = jax.block_until_ready(
+            (evaluation.residuals, evaluation.jacobian)
+        )
+        residual_norm = float(np.linalg.norm(np.asarray(jax.device_get(residuals))))
+        jacobian_shape = tuple(int(size) for size in jacobian.shape)
+        elapsed_s = time.perf_counter() - started
+        del evaluation, residuals, jacobian
+        gc.collect()
+        samples.append(
+            RepeatedEvaluationMemorySample(
+                iteration=iteration,
+                elapsed_s=float(elapsed_s),
+                resident_memory_bytes=_process_resident_memory_bytes(),
+                residual_norm=residual_norm,
+                jacobian_shape=jacobian_shape,
+            )
+        )
+    return tuple(samples)
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -1761,6 +1870,7 @@ __all__ = [
     "GeometryFullTransportLeastSquaresProblem",
     "GeometryLeastSquaresProblem",
     "ProfileFullTransportLeastSquaresProblem",
+    "RepeatedEvaluationMemorySample",
     "full_transport_profile_least_squares_problem",
     "geometry_full_transport_least_squares_problem",
     "geometry",
@@ -1768,6 +1878,7 @@ __all__ = [
     "geometry_initial_er_root_only_least_squares_problem",
     "geometry_least_squares_problem",
     "least_squares",
+    "repeated_evaluation_memory_samples",
     "transformed_geometry_objective",
     "transformed_transport_objective",
     "transport",

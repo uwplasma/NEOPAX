@@ -61,6 +61,11 @@ XTOL = 1.0e-10
 GEOMETRY_MAX_ITER = None
 SOLVER_DEVICE = "default"
 ROOT_OPTIONS = {}
+# Set this to a positive value to audit retained memory across identical
+# geometry + initial-Er-root evaluations before starting SciPy. It does not
+# change the residual/Jacobian path or the optimization itself.
+MEMORY_AUDIT_REPEATS = 0
+MEMORY_AUDIT_WARMUP = 1
 
 MAKE_WOUT_PLOTS = True
 MAKE_J_POLAR_PLOTS = True
@@ -539,6 +544,27 @@ def main() -> int:
             f"parameters={list(problem.parameter_labels)}",
             flush=True,
         )
+        if MEMORY_AUDIT_REPEATS > 0:
+            samples = opt.repeated_evaluation_memory_samples(
+                problem,
+                repeats=MEMORY_AUDIT_REPEATS,
+                warmup=MEMORY_AUDIT_WARMUP,
+                scaled_parameter_values=x,
+            )
+            first_bytes = samples[0].resident_memory_bytes
+            for sample in samples:
+                delta_mib = (
+                    None
+                    if first_bytes is None or sample.resident_memory_bytes is None
+                    else (sample.resident_memory_bytes - first_bytes) / 2**20
+                )
+                delta_text = "unavailable" if delta_mib is None else f"{delta_mib:+.1f} MiB"
+                print(
+                    f"[memory audit] trial={sample.iteration} "
+                    f"elapsed_s={sample.elapsed_s:.3f} rss_delta={delta_text} "
+                    f"residual_norm={sample.residual_norm:.6e}",
+                    flush=True,
+                )
         if initial_problem is None:
             initial_problem = problem
             initial_x = np.asarray(x, dtype=float).copy()

@@ -5,6 +5,7 @@ from types import SimpleNamespace
 import jax.numpy as jnp
 
 from NEOPAX import _geometry_autodiff as geometry_ad
+from NEOPAX import optimization
 
 
 def test_raw_block_solve_uses_prebuilt_stage_without_rebuilding_config(monkeypatch):
@@ -91,3 +92,34 @@ def test_raw_block_stage_rejects_a_different_parameter_layout(monkeypatch):
         assert "parameter layout" in str(exc)
     else:
         raise AssertionError("Expected the mismatched staged layout to be rejected.")
+
+
+def test_repeated_evaluation_memory_samples_release_evaluations(monkeypatch):
+    """The audit must invoke the existing evaluator without retaining results."""
+
+    class Problem:
+        x0 = jnp.asarray([0.0])
+
+        def __init__(self):
+            self.calls = 0
+
+        def evaluate(self, _x):
+            self.calls += 1
+            return SimpleNamespace(
+                residuals=jnp.asarray([3.0]),
+                jacobian=jnp.asarray([[4.0]]),
+            )
+
+    memory = iter((100, 110, 120))
+    monkeypatch.setattr(optimization, "_process_resident_memory_bytes", lambda: next(memory))
+    problem = Problem()
+    samples = optimization.repeated_evaluation_memory_samples(
+        problem,
+        warmup=1,
+        repeats=3,
+    )
+
+    assert problem.calls == 4
+    assert [sample.resident_memory_bytes for sample in samples] == [100, 110, 120]
+    assert all(sample.residual_norm == 3.0 for sample in samples)
+    assert all(sample.jacobian_shape == (1, 1) for sample in samples)
