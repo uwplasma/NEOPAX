@@ -1556,6 +1556,12 @@ def test_native_vmec_face_rebuild_accumulation_matches_generic_prepared_vjp():
         L13_weight=jnp.asarray([0.4, 0.5]),
         L23_weight=jnp.asarray([-0.3, 0.2]),
         L33_weight=jnp.asarray([1.3, 0.6]),
+        L24_weight=jnp.asarray([0.2, 0.3]),
+        L25_weight=jnp.asarray([0.1, -0.2]),
+        L43_weight=jnp.asarray([0.7, 0.4]),
+        L44_weight=jnp.asarray([0.6, 0.8]),
+        L45_weight=jnp.asarray([-0.1, 0.3]),
+        L55_weight=jnp.asarray([0.9, 0.5]),
         v_norm=jnp.asarray([0.9, 1.1]),
     )
     model = NTXExactLijRuntimeTransportModel(
