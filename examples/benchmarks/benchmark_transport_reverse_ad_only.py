@@ -5451,6 +5451,7 @@ def main() -> None:
             "ntx_batched_interpolated_faces",
             "ntx_native_joint_state_and_support",
             "ntx_native_joint_state_and_ntx_support_split_geometry_vmec",
+            "ntx_native_joint_state_and_ntx_support_split_geometry_vmec_no_prepared_carry",
             "rebuild_dispatch",
         ),
         default="scalar",
@@ -5463,7 +5464,10 @@ def main() -> None:
             "uses one native multi-RHS initial lagged transpose for both state and "
             "support cotangents. 'ntx_native_joint_state_and_ntx_support_split_geometry_vmec' "
             "shares that native NTX transpose but executes direct geometry separately and "
-            "returns VMEC coefficient bars out of band. 'rebuild_dispatch' is an initial-edge-only opt-in "
+            "returns VMEC coefficient bars out of band. "
+            "'ntx_native_joint_state_and_ntx_support_split_geometry_vmec_no_prepared_carry' "
+            "uses that same algebra while omitting the VMEC-replaced zero generic "
+            "prepared cotangent from the anchor scan. 'rebuild_dispatch' is an initial-edge-only opt-in "
             "that reuses the active separate batched rebuild-support selector; it "
             "does not select the wide joint state/support experiment."
         ),

@@ -23,6 +23,7 @@ from NEOPAX._state import TransportState, get_v_thermal
 from NEOPAX._transport_equations import ComposedEquationSystem
 from NEOPAX._transport_solvers import (
     _flat_rhs_build_support_pullback_batched_interpolated_faces_factory,
+    _lagged_response_build_state_and_support_pullback_batched_interpolated_faces_hook,
     _radau_prepare_lagged_response_with_compact_coefficient_record,
 )
 from NEOPAX._geometry_autodiff import (
@@ -502,6 +503,31 @@ def test_native_multi_rhs_reused_drds_equation_system_forwarding_hook_is_exposed
         "state", response, "support", ignored_outer_keyword=True,
     ) == "reused-drds-result"
     assert calls == [("state", "flux-bars", "support")]
+
+
+def test_native_split_joint_no_prepared_carry_hook_selects_only_its_wrapper():
+    """The compact initial mode cannot silently select the older joint hook."""
+
+    calls = []
+
+    class _Owner:
+        def vector_field(self):
+            return None
+
+        def pullback_build_lagged_response_state_and_ntx_support_payload_batched_interpolated_faces_native_multi_rhs_reuse_moment_drds_jvp_shared_primal_with_vmec_coefficients_no_prepared_carry(
+            self, state, bars, support, **kwargs,
+        ):
+            calls.append((state, bars, support, kwargs))
+            return "compact-result"
+
+    owner = _Owner()
+    hook = _lagged_response_build_state_and_support_pullback_batched_interpolated_faces_hook(
+        owner.vector_field,
+        native_multi_rhs_reuse_moment_drds_jvp_shared_primal_with_vmec_coefficients_no_prepared_carry=True,
+    )
+    assert callable(hook)
+    assert hook("state", "bars", "support") == "compact-result"
+    assert calls == [("state", "bars", "support", {})]
 
 
 def test_native_multi_rhs_compact_residual_equation_system_forwarding_hook_is_exposed_to_radau():
@@ -1249,6 +1275,58 @@ def test_native_joint_local_multi_rhs_matches_explicit_state_support_vjp():
         rtol=1e-9,
         atol=1e-11,
     )
+
+
+def test_native_joint_local_vmec_contract_omits_only_zero_prepared_carry():
+    """The compact joint local contract retains all non-prepared channels.
+
+    This is deliberately a single local NTX system.  It proves the new carry
+    reduction changes only the generic prepared return, which the native VMEC
+    coefficient channel replaces, without starting a support build or a
+    transport rollout.
+    """
+
+    model = _small_runtime_model(n_energy=2)
+    object.__setattr__(model, "er_v_floor", None)
+    object.__setattr__(
+        model,
+        "species",
+        Species(
+            number_species=2,
+            species_indices=jnp.asarray([0, 1]),
+            mass_mp=jnp.asarray([2.0, 5.446e-4]),
+            charge_qp=jnp.asarray([1.0, -1.0]),
+            names=("ion", "e"),
+        ),
+    )
+    _surface, prepared = _small_vmec_prepared()
+    field_values = (
+        jnp.asarray([0.17, -0.23]),
+        jnp.asarray([[0.3, -0.2, 0.1, 0.4, -0.1, 0.2], [-0.1, 0.2, 0.3, -0.4, 0.5, -0.2]]),
+        jnp.asarray([[-0.3, 0.1, 0.2, -0.2, 0.3, -0.1], [0.4, -0.3, 0.2, 0.1, -0.5, 0.3]]),
+        jnp.asarray([[0.2, 0.4, -0.3, 0.1, 0.2, -0.4], [-0.2, 0.3, 0.4, -0.1, 0.2, 0.5]]),
+    )
+    field_bars = tuple(jnp.stack((values, -0.7 * values), axis=0) for values in field_values)
+    kwargs = dict(
+        drds_value=jnp.asarray(1.2),
+        er_value=jnp.asarray(-2.7e-3),
+        temperature_local=jnp.asarray([1.4, 1.1]),
+        density_local=jnp.asarray([0.9, 0.9]),
+        collisionality_kind=_collisionality_kind("default"),
+        field_bars=field_bars,
+        native_factorized_ntx_rhs=True,
+        reuse_joint_moment_drds_jvp=True,
+        return_native_vmec_coefficient_bars=True,
+    )
+    full = model._pullback_interpolated_moment_response_local_fields_and_prepared_support_and_drds_flat_prepared(
+        prepared, **kwargs
+    )
+    compact = model._pullback_interpolated_moment_response_local_fields_and_prepared_support_and_drds_flat_prepared(
+        prepared, omit_generic_prepared_carry=True, **kwargs
+    )
+    _assert_float_tree_allclose(compact[:4], full[:4])
+    assert compact[4] == ()
+    _assert_float_tree_allclose(compact[5], full[5])
 
 
 def test_native_vmec_face_rebuild_accumulation_matches_generic_prepared_vjp():

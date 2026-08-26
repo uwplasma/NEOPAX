@@ -10,6 +10,44 @@ matrix-RHS lowdot contraction, then evaluates only direct geometry separately.
 It preserves the out-of-band VMEC bridge and leaves existing selectors alone.
 It still requires benchmark-machine AD and timing comparison.
 
+### Result and next plan (2026-08-26)
+
+The full reverse/FD result matches the established drds-reuse mode over all
+128 reported Jacobian entries (maximum relative difference `4.01e-9`).  The
+first split implementation was still traced as one graph and cost `354 s`.
+Moving direct geometry outside that custom-VJP graph produced two real
+dispatches:
+
+- native NTX state + NTX support + VMEC coefficients: `302.913 s`;
+- direct geometry only: `4.986 s`.
+
+Thus direct geometry is not the remaining problem.  The current selector is
+still opt-in and not a replacement for the established separate initial path
+(about `275 s` combined).
+
+The next work is limited to the native NTX contraction:
+
+1. Audit the native joint helper against the native support-only helper.  In
+   the VMEC-coefficient route, the latter requests
+   `native_vmec_coefficient_bars_only=True`, but the joint helper still
+   allocates, scans, and scatters the entire generic `face_prepared` cotangent
+   pytree.  Verify which leaves are identically zero and which are required by
+   the final support bridge.
+2. Add a new unselected native-joint variant that omits that generic prepared
+   carry when VMEC coefficients are the selected representation.  It must
+   retain the exact native coefficient channel and all non-prepared support
+   bars, while returning zero-shaped generic prepared bars only at the API
+   boundary if required by the payload contract.
+3. Use tiny in-memory tests/JAXPR checks to establish equality with the
+   existing native joint result and verify the prepared scan carry has been
+   removed.  No production transport run or profiling output is allowed
+   locally.
+4. Add a benchmark-only component print for this new native variant, then run
+   it remotely once.  Accept it only if derivatives remain at the established
+   level and native NTX time drops below the separate-path combined cost;
+   otherwise retain the current accepted mode and instrument the local NTX
+   factorized solve/lowdot contractions next.
+
 ## Current next work: local NTX multi-RHS shared-adjoint investigation (2026-08-23)
 
 ### Objective
@@ -2266,3 +2304,31 @@ drds-reuse or `rebuild_dispatch` routes.
    gate remains CPU-only and passed.  The remaining required test is numerical
    equivalence of a real initial response for the non-native batched contract,
    followed separately by the native VMEC coefficient route.
+
+### Native joint carry audit (2026-08-26)
+
+The VMEC-coefficient native lowdot contract already suppresses the generic
+prepared derivative algebra in NTX: with
+`native_vmec_coefficient_bars_only=True`, NTX returns a shape-compatible zero
+prepared tree and routes the complete prepared-system geometry contribution
+through the separate native VMEC coefficient bars.  The joint NEOPAX helper,
+however, still unconditionally carries that all-zero `face_prepared` pytree
+through the anchor `lax.scan`, scatters every leaf at every anchor, and
+reconstructs it into the output support payload.
+
+The next opt-in variant must omit this generic prepared scan carry whenever
+the native VMEC-coefficient-only contract is active.  It must retain the
+native coefficient carry, `drds`, `Er`, density, temperature, interpolation,
+and state/case chains.  A shape-compatible zero `face_prepared` payload may
+be constructed only at the external support-result boundary, preserving the
+existing ABI.  This is an outer NEOPAX graph/carry reduction; it does not
+alter the NTX solve, its factorization, or the VMEC coefficient math.
+
+**Implementation status:** a separate initial-cache selector,
+`ntx_native_joint_state_and_ntx_support_split_geometry_vmec_no_prepared_carry`,
+is now wired from the benchmark CLI through the Radau factory and composed
+equation-system wrapper to the compact native joint helper.  It uses the same
+out-of-band VMEC coefficient and separate direct-geometry routes as the
+existing split-native mode.  It does not alter any existing selector.  The
+remaining gate is the small CPU-only forwarding/equivalence test before a
+remote timing run.

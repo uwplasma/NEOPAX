@@ -2407,6 +2407,51 @@ class ComposedEquationSystem:
         )(working_state_bars)
         return state_bars, ntx_support_bar, native_vmec_coefficient_bars
 
+    def pullback_build_lagged_response_state_and_ntx_support_payload_batched_interpolated_faces_native_multi_rhs_reuse_moment_drds_jvp_shared_primal_with_vmec_coefficients_no_prepared_carry(
+        self,
+        state,
+        lagged_response_bars,
+        support,
+        **kwargs,
+    ):
+        """Native state/NTX-support pullback with no generic prepared scan carry."""
+        support_ntx, _geometry = self._split_realtime_geometry_payload(support)
+        working_state, _eidx = self._prepare_working_state(state)
+        flux_response_bars = (
+            None if lagged_response_bars is None else lagged_response_bars.flux_response
+        )
+        if self.shared_flux_model is None or flux_response_bars is None:
+            raise NotImplementedError(
+                "split native compact pullback requires an active shared flux response."
+            )
+        pullback_fn = getattr(
+            self.shared_flux_model,
+            "pullback_build_lagged_response_state_and_support_payload_"
+            "batched_interpolated_faces_native_multi_rhs_reuse_moment_drds_jvp_"
+            "shared_primal_with_vmec_coefficients_no_prepared_carry",
+            None,
+        )
+        if not callable(pullback_fn):
+            raise NotImplementedError(
+                "The active shared flux model does not expose the compact native "
+                "VMEC coefficient state/NTX-support pullback."
+            )
+        working_state_bars, ntx_support_bar, native_vmec_coefficient_bars = pullback_fn(
+            working_state,
+            flux_response_bars,
+            support_ntx,
+            packed_support_directional_adjoint=bool(
+                kwargs.pop("packed_support_directional_adjoint", False)
+            ),
+            **self._shared_flux_call_kwargs(kwargs),
+        )
+        state_bars = jax.vmap(
+            lambda working_state_bar: self._prepare_working_state_pullback(
+                state, working_state_bar
+            )
+        )(working_state_bars)
+        return state_bars, ntx_support_bar, native_vmec_coefficient_bars
+
     def pullback_build_lagged_response_direct_geometry_payload_batched_interpolated_faces(
         self, state, lagged_response_bars, support, **kwargs,
     ):

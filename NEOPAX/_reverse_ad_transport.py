@@ -2422,6 +2422,7 @@ def reverse_initial_carry_from_state_with_static_setup(
     prepared_rollout_static,
     return_native_joint_pullback: bool = False,
     return_native_split_joint_pullback: bool = False,
+    return_native_split_joint_no_prepared_carry: bool = False,
 ):
     """Build the initial carry with the validated reverse-local lagged pullback."""
 
@@ -2690,11 +2691,18 @@ def reverse_initial_carry_from_state_with_static_setup(
             raise NotImplementedError(
                 "Native joint initial-carry pullback requires an initial lagged response."
             )
-        use_split_joint = bool(return_native_split_joint_pullback)
+        use_split_joint = bool(
+            return_native_split_joint_pullback
+            or return_native_split_joint_no_prepared_carry
+        )
         joint_pullback = getattr(
             physics_context,
             (
                 "flat_rhs_build_state_and_ntx_support_pullback_batched_interpolated_faces_"
+                "native_multi_rhs_reuse_moment_drds_jvp_shared_primal_with_vmec_coefficients"
+                "_no_prepared_carry"
+                if return_native_split_joint_no_prepared_carry
+                else "flat_rhs_build_state_and_ntx_support_pullback_batched_interpolated_faces_"
                 "native_multi_rhs_reuse_moment_drds_jvp_shared_primal_with_vmec_coefficients"
                 if use_split_joint
                 else "flat_rhs_build_state_and_support_pullback_batched_interpolated_faces_"
@@ -2860,7 +2868,11 @@ def reverse_initial_carry_from_state_with_static_setup(
         return state_bars, support_bars
 
     _build_initial_carry.defvjp(_build_initial_carry_fwd, _build_initial_carry_bwd)
-    if return_native_joint_pullback or return_native_split_joint_pullback:
+    if (
+        return_native_joint_pullback
+        or return_native_split_joint_pullback
+        or return_native_split_joint_no_prepared_carry
+    ):
         carry0, residual = _build_initial_carry_fwd(state)
 
         def _pullback(carry_bars, support_payload):
@@ -3510,11 +3522,19 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
         initial_cache_support_pullback_mode
         == "ntx_native_joint_state_and_ntx_support_split_geometry_vmec"
     )
+    use_native_split_joint_no_prepared_carry_initial_carry_pullback = (
+        initial_cache_support_pullback_mode
+        == "ntx_native_joint_state_and_ntx_support_split_geometry_vmec_no_prepared_carry"
+    )
     use_rebuild_dispatch_initial_cache_pullback = (
         initial_cache_support_pullback_mode == "rebuild_dispatch"
     )
     phase_start = time.perf_counter()
-    if use_native_joint_initial_carry_pullback or use_native_split_joint_initial_carry_pullback:
+    if (
+        use_native_joint_initial_carry_pullback
+        or use_native_split_joint_initial_carry_pullback
+        or use_native_split_joint_no_prepared_carry_initial_carry_pullback
+    ):
         initial_carry, initial_state_pullback = (
             dependencies.reverse_initial_carry_from_state_with_static_setup(
                 solver=reverse_setup.solver,
@@ -3525,6 +3545,9 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
                 return_native_joint_pullback=True,
                 return_native_split_joint_pullback=(
                     use_native_split_joint_initial_carry_pullback
+                ),
+                return_native_split_joint_no_prepared_carry=(
+                    use_native_split_joint_no_prepared_carry_initial_carry_pullback
                 ),
             )
         )
@@ -4445,6 +4468,7 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
         "ntx_batched_interpolated_faces",
         "ntx_native_joint_state_and_support",
         "ntx_native_joint_state_and_ntx_support_split_geometry_vmec",
+        "ntx_native_joint_state_and_ntx_support_split_geometry_vmec_no_prepared_carry",
         "rebuild_dispatch",
     }:
         raise ValueError(
@@ -4456,7 +4480,11 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
         "full_initial_cache_support_pullback",
         "initial_cache_support_pullback",
     }
-    if (use_native_joint_initial_carry_pullback or use_native_split_joint_initial_carry_pullback) and not initial_lagged_response_valid:
+    if (
+        use_native_joint_initial_carry_pullback
+        or use_native_split_joint_initial_carry_pullback
+        or use_native_split_joint_no_prepared_carry_initial_carry_pullback
+    ) and not initial_lagged_response_valid:
         raise RuntimeError(
             "ntx_native_joint_state_and_support requires a valid initial "
             "lagged response."
@@ -4470,6 +4498,17 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
         raise RuntimeError(
             "split native initial pullback was requested, but the active transport "
             "physics context does not expose the compact NTX/VMEC hook."
+        )
+    if use_native_split_joint_no_prepared_carry_initial_carry_pullback and getattr(
+        reverse_setup.execution_context.physics_context,
+        "flat_rhs_build_state_and_ntx_support_pullback_batched_interpolated_faces_"
+        "native_multi_rhs_reuse_moment_drds_jvp_shared_primal_with_vmec_coefficients_"
+        "no_prepared_carry",
+        None,
+    ) is None:
+        raise RuntimeError(
+            "compact split native initial pullback was requested, but the active "
+            "transport physics context does not expose the compact NTX/VMEC hook."
         )
     if use_native_joint_initial_carry_pullback and getattr(
         reverse_setup.execution_context.physics_context,
@@ -4490,6 +4529,7 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
         and allow_initial_cache_support_pullback
         and not use_native_joint_initial_carry_pullback
         and not use_native_split_joint_initial_carry_pullback
+        and not use_native_split_joint_no_prepared_carry_initial_carry_pullback
     ):
         phase_start = time.perf_counter()
         with _reverse_profile_scope(
@@ -4580,6 +4620,7 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
         and build_support_pullback is not None
         and not use_native_joint_initial_carry_pullback
         and not use_native_split_joint_initial_carry_pullback
+        and not use_native_split_joint_no_prepared_carry_initial_carry_pullback
     ):
         initial_cache_pullback_skipped = True
 
@@ -4603,14 +4644,21 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
     initial_native_ntx_elapsed = None
     initial_direct_geometry_elapsed = None
     with _reverse_profile_scope(reverse_setup, "reverse_post_sweep/initial_state_pullback"):
-        if use_native_joint_initial_carry_pullback or use_native_split_joint_initial_carry_pullback:
+        if (
+            use_native_joint_initial_carry_pullback
+            or use_native_split_joint_initial_carry_pullback
+            or use_native_split_joint_no_prepared_carry_initial_carry_pullback
+        ):
             if not allow_initial_cache_support_pullback:
                 raise ValueError(
                     "ntx_native_joint_state_and_support requires the full initial "
                     "cache support pullback cotangent mode."
                 )
             initial_joint_result = initial_state_pullback(carry0_bars, support_payload)
-            if use_native_split_joint_initial_carry_pullback:
+            if (
+                use_native_split_joint_initial_carry_pullback
+                or use_native_split_joint_no_prepared_carry_initial_carry_pullback
+            ):
                 (
                     initial_state_bars,
                     initial_joint_ntx_support_bars,

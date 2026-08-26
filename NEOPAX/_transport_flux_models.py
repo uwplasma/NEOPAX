@@ -8185,6 +8185,7 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         native_factorized_ntx_rhs: bool = False,
         reuse_joint_moment_drds_jvp: bool = False,
         return_native_vmec_coefficient_bars: bool = False,
+        omit_generic_prepared_carry: bool = False,
     ):
         """Joint local pullback, returning prepared-support leaves unflattened.
 
@@ -8204,6 +8205,10 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         if return_native_vmec_coefficient_bars and return_primal_response:
             raise ValueError(
                 "native VMEC coefficient bars cannot be combined with local-primal reuse."
+            )
+        if omit_generic_prepared_carry and not return_native_vmec_coefficient_bars:
+            raise ValueError(
+                "omitting the generic prepared carry requires native VMEC coefficient bars."
             )
 
         def _per_species_pullback(species_index, species_field_bars):
@@ -8314,12 +8319,17 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                     reference_epsi_hat_bar,
                     vth_a_bar,
                 )
+            prepared_leaves = (
+                ()
+                if omit_generic_prepared_carry
+                else tuple(jax.tree_util.tree_leaves(prepared_bar))
+            )
             pullback_result = (
                 implicit_drds_bar + direct_drds_bar,
                 er_bar,
                 temperature_bar,
                 density_bar,
-                tuple(jax.tree_util.tree_leaves(prepared_bar)),
+                prepared_leaves,
             )
             if return_native_vmec_coefficient_bars:
                 return (*pullback_result, native_vmec_coefficient_bars)
@@ -8344,12 +8354,17 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             density_species_bar,
             prepared_geometry_species_bar_leaves,
         ) = mapped_pullback[:5]
+        prepared_leaves = (
+            ()
+            if omit_generic_prepared_carry
+            else tuple(jnp.sum(values, axis=0) for values in prepared_geometry_species_bar_leaves)
+        )
         pullback_result = (
             jnp.sum(drds_species_bar, axis=0),
             jnp.sum(er_species_bar, axis=0),
             jnp.sum(temperature_species_bar, axis=0),
             jnp.sum(density_species_bar, axis=0),
-            tuple(jnp.sum(values, axis=0) for values in prepared_geometry_species_bar_leaves),
+            prepared_leaves,
         )
         if return_native_vmec_coefficient_bars:
             return (
@@ -11973,6 +11988,7 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         native_factorized_ntx_rhs: bool = False,
         reuse_joint_moment_drds_jvp: bool = False,
         return_native_vmec_coefficient_bars: bool = False,
+        omit_generic_prepared_carry: bool = False,
     ):
         """Joint exact transpose of interpolated face state and NTX support.
 
@@ -12020,10 +12036,18 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         collisionality_kind = _collisionality_kind(self.collisionality_model)
         species_indices = jnp.arange(int(self.species.number_species), dtype=jnp.int32)
         face_channels_bar = _batched_zero_like(_float_delta_tree_like(support.face_channels))
-        face_prepared_bar = _batched_zero_like(_float_delta_tree_like(support.face_prepared))
+        face_prepared_bar = (
+            None
+            if omit_generic_prepared_carry
+            else _batched_zero_like(_float_delta_tree_like(support.face_prepared))
+        )
         if return_native_vmec_coefficient_bars and not native_factorized_ntx_rhs:
             raise ValueError(
                 "native VMEC coefficient bars require the native matrix-RHS NTX path."
+            )
+        if omit_generic_prepared_carry and not return_native_vmec_coefficient_bars:
+            raise ValueError(
+                "omitting the generic prepared carry requires native VMEC coefficient bars."
             )
         native_vmec_coefficient_bar = None
         if return_native_vmec_coefficient_bars:
@@ -12053,7 +12077,13 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         # the identical pytree only after the anchor scan.  This changes no
         # NTX algebra and retains no data beyond this one rebuild pullback.
         prepared_treedef = jax.tree_util.tree_structure(support.face_prepared)
-        if compact_prepared_support_carry:
+        if omit_generic_prepared_carry:
+            prepared_primal_leaves = None
+            prepared_bar_template_leaves = None
+            prepared_local_shapes = None
+            prepared_local_sizes = None
+            face_prepared_flat_bar = None
+        elif compact_prepared_support_carry:
             prepared_primal_leaves = tuple(jax.tree_util.tree_leaves(support.face_prepared))
             prepared_bar_template_leaves = tuple(jax.tree_util.tree_leaves(face_prepared_bar))
             prepared_local_shapes = tuple(
@@ -12205,6 +12235,7 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                         return_native_vmec_coefficient_bars=(
                             return_native_vmec_coefficient_bars
                         ),
+                        omit_generic_prepared_carry=omit_generic_prepared_carry,
                     )
                 )
             else:
@@ -12342,20 +12373,24 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                     drds=channels_carry.drds.at[:, radius_index].add(drds_local_bar),
                 ),
                 (
-                    prepared_carry.at[:, radius_index].add(
-                        jnp.concatenate(
-                            tuple(
-                                jnp.reshape(local_leaf, (objective_count, -1))
-                                for local_leaf in prepared_local_bar_leaves
-                            ),
-                            axis=1,
+                    None
+                    if omit_generic_prepared_carry
+                    else (
+                        prepared_carry.at[:, radius_index].add(
+                            jnp.concatenate(
+                                tuple(
+                                    jnp.reshape(local_leaf, (objective_count, -1))
+                                    for local_leaf in prepared_local_bar_leaves
+                                ),
+                                axis=1,
+                            )
                         )
-                    )
-                    if compact_prepared_support_carry
-                    else jax.tree_util.tree_map(
-                        lambda arr, local_arr: arr.at[:, radius_index].add(local_arr),
-                        prepared_carry,
-                        prepared_treedef.unflatten(prepared_local_bar_leaves),
+                        if compact_prepared_support_carry
+                        else jax.tree_util.tree_map(
+                            lambda arr, local_arr: arr.at[:, radius_index].add(local_arr),
+                            prepared_carry,
+                            prepared_treedef.unflatten(prepared_local_bar_leaves),
+                        )
                     )
                 ),
                 density_carry.at[:, :, radius_index].add(density_local_bar),
@@ -12373,9 +12408,13 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             for field_bar in response_field_bar_tuple
         )
         face_prepared_scan_bar = (
-            face_prepared_flat_bar
-            if compact_prepared_support_carry
-            else face_prepared_bar
+            None
+            if omit_generic_prepared_carry
+            else (
+                face_prepared_flat_bar
+                if compact_prepared_support_carry
+                else face_prepared_bar
+            )
         )
 
         (
@@ -12400,7 +12439,9 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             anchor_positions,
         )
 
-        if compact_prepared_support_carry:
+        if omit_generic_prepared_carry:
+            face_prepared_bar = _batched_zero_like(_float_delta_tree_like(support.face_prepared))
+        elif compact_prepared_support_carry:
             face_prepared_bar = face_prepared_scan_bar
             prepared_bar_leaves = []
             offset = 0
@@ -12563,6 +12604,26 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             native_factorized_ntx_rhs=True,
             reuse_joint_moment_drds_jvp=True,
             return_native_vmec_coefficient_bars=True,
+            **kwargs,
+        )
+
+    def pullback_build_lagged_response_state_and_support_payload_batched_interpolated_faces_native_multi_rhs_reuse_moment_drds_jvp_shared_primal_with_vmec_coefficients_no_prepared_carry(
+        self,
+        state,
+        lagged_response_bars,
+        support,
+        **kwargs,
+    ):
+        """Opt-in native joint transpose without a zero prepared scan carry."""
+        kwargs.pop("return_native_vmec_coefficient_bars", None)
+        return self.pullback_build_lagged_response_state_and_support_payload_batched_interpolated_faces(
+            state,
+            lagged_response_bars,
+            support,
+            native_factorized_ntx_rhs=True,
+            reuse_joint_moment_drds_jvp=True,
+            return_native_vmec_coefficient_bars=True,
+            omit_generic_prepared_carry=True,
             **kwargs,
         )
 
