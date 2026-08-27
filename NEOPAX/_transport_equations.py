@@ -1625,6 +1625,33 @@ class ComposedEquationSystem:
         composite fluxes and includes the direct geometry terms from transport
         equation assembly.
         """
+        exact_pullback = getattr(
+            self.shared_flux_model, "pullback_direct_rhs_support_payload", None
+        )
+        if callable(exact_pullback) and isinstance(support, dict) and "ntx_support" in support:
+            working_state, _ = self._prepare_working_state(state)
+            shared_fluxes = self.shared_flux_model(working_state)
+            flux_bar = self.pullback_shared_fluxes(state, shared_fluxes, rhs_bar)
+            ntx_support_bar = exact_pullback(
+                working_state, flux_bar, support["ntx_support"]
+            )
+            geometry = support["geometry"]
+            geometry_delta0 = _float_delta_tree_like(geometry)
+            _, geometry_pullback = jax.vjp(
+                lambda geometry_delta: self.with_realtime_geometry_support_payload(
+                    {"geometry": _add_float_delta_tree(geometry, geometry_delta),
+                     "ntx_support": support["ntx_support"]}
+                )(t, state, runtime),
+                geometry_delta0,
+            )
+            (geometry_bar,) = geometry_pullback(rhs_bar)
+            return {
+                "geometry": _sanitize_float_delta_bar_tree(geometry, geometry_bar),
+                "ntx_support": _sanitize_float_delta_bar_tree(
+                    support["ntx_support"], ntx_support_bar
+                ),
+            }
+
         support_delta0 = _float_delta_tree_like(support)
         _, support_pullback = jax.vjp(
             lambda support_delta: self.with_realtime_geometry_support_payload(

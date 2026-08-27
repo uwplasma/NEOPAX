@@ -898,6 +898,16 @@ class CombinedTransportFluxModel(TransportFluxModelBase):
         }
         return out
 
+    def pullback_direct_rhs_support_payload(self, state, flux_bar, support):
+        pullback_fn = getattr(self.neoclassical_model, "pullback_direct_rhs_support_payload", None)
+        if not callable(pullback_fn):
+            return None
+        response = self.build_lagged_response(state)
+        response_bar = self.pullback_evaluate_with_lagged_response(
+            state, response, flux_bar
+        )
+        return pullback_fn(state, response_bar.neoclassical_response, support)
+
     def build_local_particle_flux_evaluator(self, state):
         neo_eval = self.neoclassical_model.build_local_particle_flux_evaluator(state)
         turb_eval = self.turbulent_model.build_local_particle_flux_evaluator(state)
@@ -3136,6 +3146,13 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         """
 
         return dataclasses.replace(self, support=support)
+
+    def pullback_direct_rhs_support_payload(self, state, flux_bar, support):
+        """Black-box exact-Lij support transpose via the established lowdot rule."""
+        response = self.with_support_payload(support).build_lagged_response(state)
+        return self.with_support_payload(support).pullback_evaluate_with_lagged_response_support_payload(
+            state, response, flux_bar, support
+        )
 
     def with_transport_resolution(self, *, n_theta=None, n_zeta=None, n_xi=None) -> "NTXExactLijRuntimeTransportModel":
         return dataclasses.replace(

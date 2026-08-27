@@ -2050,6 +2050,7 @@ def geometry_active_initial_er_root_only_reverse_table_optimization(
     if optimization_stage is None:
         assembly_result = payload_operator(**payload_args)
     else:
+        payload_args.pop("raw_block_solve")
         assembly_result = payload_operator(dynamic_payload, **payload_args)
 
     geometry_gradient_matrix = jnp.asarray(assembly_result.table_result.geometry_gradient_matrix)
