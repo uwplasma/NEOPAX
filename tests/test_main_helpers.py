@@ -22,6 +22,11 @@ from NEOPAX._reverse_ad_initial_er import (
     realtime_geometry_reverse_support_payload_for_runtime,
     runtime_with_geometry_payload,
     runtime_with_realtime_geometry_payload,
+    runtime_with_realtime_geometry_reverse_support_payload,
+)
+from NEOPAX._reverse_ad_transport import (
+    prepare_realtime_geometry_support_segment_core_setup,
+    realtime_geometry_payload_pullback_result,
 )
 from NEOPAX._monoenergetic import (
     MONOENERGETIC_KIND_GENERIC,
@@ -1385,6 +1390,116 @@ def test_tagged_realtime_payload_round_trips_live_ntx_scan_model():
     assert actual.models.flux.database is new_database
 
 
+def test_live_ntx_scan_reverse_support_replacement_clears_cached_database():
+    """The reverse payload cannot accidentally treat the scan cache as input."""
+
+    surfaces = (object(), object())
+    channels = _tiny_ntx_runtime_channels([0.25, 0.5])
+    model = build_ntx_runtime_scan_transport_model(
+        species="species", energy_grid="grid", geometry="old_geometry",
+        vmec_file=None, boozer_file=None,
+        ntx_scan_rho=[0.25, 0.5], ntx_scan_nu_v=[1.0e-4, 1.0e-3],
+        ntx_scan_er_tilde=[0.0, 1.0e-4], ntx_scan_channels=channels,
+        ntx_scan_surfaces=surfaces, prebuild_database=False,
+    )
+    cached_database = object()
+    runtime = RuntimeContext(
+        species="species", energy_grid="grid", geometry="old_geometry",
+        database=cached_database, solver_parameters={},
+        models=Models(flux=dataclasses.replace(model, database=cached_database)),
+    )
+
+    actual = runtime_with_realtime_geometry_reverse_support_payload(
+        runtime,
+        {"geometry": "new_geometry", "channels": channels, "surfaces": surfaces},
+    )
+
+    assert actual.geometry == "new_geometry"
+    assert actual.models.flux.database is None
+    assert actual.database is None
+
+
+def test_reverse_setup_selects_live_scan_payload_without_exact_support_lookup():
+    """Setup reaches the generic scan tree before any exact-NTX lookup."""
+
+    surfaces = (object(), object())
+    channels = _tiny_ntx_runtime_channels([0.25, 0.5])
+    model = build_ntx_runtime_scan_transport_model(
+        species="species", energy_grid="grid", geometry="geometry",
+        vmec_file=None, boozer_file=None,
+        ntx_scan_rho=[0.25, 0.5], ntx_scan_nu_v=[1.0e-4, 1.0e-3],
+        ntx_scan_er_tilde=[0.0, 1.0e-4], ntx_scan_channels=channels,
+        ntx_scan_surfaces=surfaces, prebuild_database=False,
+    )
+    runtime = RuntimeContext(
+        species="species", energy_grid="grid", geometry="geometry",
+        database=None, solver_parameters={}, models=Models(flux=model),
+    )
+    args = types.SimpleNamespace(
+        realtime_geometry_gradient_path="reverse_payload",
+        reverse_stage_cotangent_mode="full",
+        initial_er_root_ad="off",
+        accepted_step_limit=None,
+        reverse_segment_length=1,
+        reverse_stage_adjoint_solve_mode="block",
+        reverse_rhs_transpose_mode="generic",
+        reverse_step_bwd_mode="reduced_cotangent_call_boundary",
+        reverse_stage_adjoint_memory_mode="legacy",
+        reverse_stage_adjoint_iter_maxiter=1,
+        reverse_stage_adjoint_iter_tol=1.0e-8,
+        reverse_rebuild_support_pullback_mode="separate",
+        reverse_initial_cache_support_pullback_mode="scalar",
+    )
+    captured = {}
+
+    def _unexpected_exact_lookup(_runtime):
+        raise AssertionError("scan setup must not request an exact NTX support payload")
+
+    def _prepare(_profile_values, **kwargs):
+        captured.update(kwargs)
+        return types.SimpleNamespace(schedule_artifact=None)
+
+    setup = prepare_realtime_geometry_support_segment_core_setup(
+        args=args, config={}, baseline_values=jnp.asarray([]), baseline_runtime=runtime,
+        baseline_state="state", profile_cfg={}, neoclassical_cfg={}, parameter_order=(),
+        find_ntx_support_payload=_unexpected_exact_lookup,
+        prepare_reverse_static_setup=_prepare,
+    )
+
+    assert setup.payload_kind == "ntx_scan_runtime"
+    assert set(setup.support_payload) == {"geometry", "channels", "surfaces"}
+    assert captured["runtime"] is runtime
+
+
+def test_payload_transpose_forwards_live_scan_contract(monkeypatch):
+    """The outer transport wrapper forwards scan metadata to the VMEC seam."""
+
+    captured = {}
+
+    def _fake_transpose(*_args, **kwargs):
+        captured.update(kwargs)
+        return jnp.asarray([[1.0]])
+
+    monkeypatch.setattr(
+        "NEOPAX._reverse_ad_transport.geometry_payload_pullback_from_param_vector_raw_block_transpose",
+        _fake_transpose,
+    )
+    result = realtime_geometry_payload_pullback_result(
+        geometry_context="context",
+        baseline_geometry_deltas=jnp.asarray([0.0]),
+        geometry_param_specs=(("RBC", 1, 0),),
+        support_bars=({"geometry": "g", "ntx_scan_runtime": "scan"},),
+        payload_kind="ntx_scan_runtime",
+        scan_rho=(0.25, 0.5),
+        scan_surface_backend="vmec",
+    )
+
+    assert captured["payload_kind"] == "ntx_scan_runtime"
+    assert captured["scan_rho"] == (0.25, 0.5)
+    assert captured["scan_surface_backend"] == "vmec"
+    assert jnp.allclose(result.geometry_gradient_matrix, jnp.asarray([[1.0]]))
+
+
 def test_live_ntx_scan_payload_rebuild_keeps_channel_jvp(monkeypatch):
     """A support payload regenerates the database through the live NTX seam."""
 
@@ -1467,7 +1582,7 @@ def test_live_ntx_scan_payload_rebuild_keeps_channel_jvp(monkeypatch):
     # floor, so its derivative is correctly zero.  The non-clamped column
     # retains the analytic ``-da_b / (a_b log(10))`` radius chain.
     expected_tangent = jnp.where(
-        database > -8.0,
+        jnp.asarray([0.0, 1.0e-4])[None, :] != 0.0,
         -0.2 / (2.0 * jnp.log(10.0)),
         0.0,
     )

@@ -40,6 +40,7 @@ from ._reverse_ad_optimization import (
     evaluate_geometry_transport_realtime_geometry_least_squares,
     evaluate_transport_realtime_geometry_least_squares,
     evaluate_geometry_initial_er_root_only_least_squares_benchmark_tables,
+    evaluate_geometry_initial_er_root_only_least_squares_optimization,
     geometry,
     normalize_transport_objective_names,
     realtime_geometry_transport_reverse_table_request,
@@ -47,6 +48,7 @@ from ._reverse_ad_optimization import (
     scale_least_squares_evaluation_columns,
     transport,
 )
+from ._optimization_initial_root_stage import initial_root_stage_layout
 from ._reverse_ad_parameters import (
     PROFILE_PARAMETER_ORDER,
     ProfileParameterSpec,
@@ -329,6 +331,7 @@ class GeometryInitialErRootLeastSquaresProblem:
     geometry_solver_device: str | None = "default"
     root_options: Mapping[str, object] | None = None
     raw_block_stage: object | None = None
+    optimization_stage_layout: object | None = None
     reverse_stage_mode: str = "off"
 
     @property
@@ -413,7 +416,12 @@ class GeometryInitialErRootLeastSquaresProblem:
             scaled_values = jnp.asarray(scaled_parameter_values, dtype=jnp.float64)
         physical_values = self._scaled_to_physical(scaled_values)
         base_terms = _base_terms_for_mixed_initial_er_root(self.terms)
-        base_evaluation = evaluate_geometry_initial_er_root_only_least_squares_benchmark_tables(
+        evaluator = (
+            evaluate_geometry_initial_er_root_only_least_squares_benchmark_tables
+            if self.reverse_stage_mode == "off"
+            else evaluate_geometry_initial_er_root_only_least_squares_optimization
+        )
+        base_evaluation = evaluator(
             self.config,
             parameter_set=self.parameter_set,
             parameter_values=physical_values,
@@ -1264,12 +1272,6 @@ def geometry_initial_er_root_only_least_squares_problem(
     mode = str(reverse_stage_mode).strip().lower()
     if mode not in {"off", "vmex_like"}:
         raise ValueError("reverse_stage_mode must be 'off' or 'vmex_like'.")
-    if mode != "off":
-        raise NotImplementedError(
-            "reverse_stage_mode='vmex_like' is not available until both the "
-            "initial-root and payload-to-VMEC persistent operators are installed."
-        )
-
     config_eff = _prepare_initial_er_root_config(config, device=device, vmec_input=vmec_input)
     geom_cfg = config_eff.get("geometry", {})
     neoclassical_cfg = config_eff.get("neoclassical", {})
@@ -1340,6 +1342,18 @@ def geometry_initial_er_root_only_least_squares_problem(
             max_iter=geometry_max_iter,
         )
     )
+    optimization_stage_layout = None
+    if mode == "vmex_like":
+        optimization_stage_layout = initial_root_stage_layout(
+            config=config_eff,
+            objective_names=tuple(term.objective.name for term in terms),
+            geometry_param_specs=tuple(spec.as_tuple() for spec in geometry_parameterization.specs),
+            n_r=n_r,
+            n_theta=n_theta,
+            n_zeta=n_zeta,
+            n_xi=n_xi,
+            surface_backend=surface_backend,
+        )
     return GeometryInitialErRootLeastSquaresProblem(
         config=config_eff,
         context=context,
@@ -1369,6 +1383,7 @@ def geometry_initial_er_root_only_least_squares_problem(
         geometry_solver_device=geometry_solver_device,
         root_options=None if root_options is None else dict(root_options),
         raw_block_stage=raw_block_stage,
+        optimization_stage_layout=optimization_stage_layout,
         reverse_stage_mode=mode,
     )
 

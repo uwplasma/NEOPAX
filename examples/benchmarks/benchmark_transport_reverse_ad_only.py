@@ -146,6 +146,7 @@ from NEOPAX._reverse_ad_initial_er import (  # noqa: E402
     initial_er_selected_root_profile as _core_initial_er_selected_root_profile,
     runtime_with_geometry_payload as _core_runtime_with_geometry_payload,
     runtime_with_ntx_support_payload as _core_runtime_with_ntx_support_payload,
+    runtime_with_realtime_geometry_reverse_support_payload as _core_runtime_with_realtime_geometry_reverse_support_payload,
 )
 from NEOPAX._reverse_ad_parameters import (  # noqa: E402
     PROFILE_PARAMETER_ORDER,
@@ -467,6 +468,12 @@ def _replace_ntx_support_payload_in_model(model, support):
 
 def _runtime_with_ntx_support_payload(runtime, support):
     return _core_runtime_with_ntx_support_payload(runtime, support)
+
+
+def _runtime_with_realtime_geometry_reverse_support_payload(runtime, support_payload):
+    return _core_runtime_with_realtime_geometry_reverse_support_payload(
+        runtime, support_payload
+    )
 
 
 def _replace_geometry_payload_in_model(model, geometry):
@@ -1653,6 +1660,9 @@ def _reverse_all_objectives_support_payload_bar_for_parameter_vector(
         ),
         runtime_with_geometry_payload=_runtime_with_geometry_payload,
         runtime_with_ntx_support_payload=_runtime_with_ntx_support_payload,
+        runtime_with_realtime_geometry_reverse_support_payload=(
+            _runtime_with_realtime_geometry_reverse_support_payload
+        ),
     )
     return realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_vector(
         parameter_values,

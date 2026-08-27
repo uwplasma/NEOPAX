@@ -4945,6 +4945,9 @@ def geometry_payload_pullback_from_param_vector_raw_block_transpose(
     payload_bars: Sequence[Any],
     *,
     combined_payload: bool,
+    payload_kind: str = "ntx_exact",
+    scan_rho=None,
+    scan_surface_backend: str = "vmec",
     n_r: int,
     n_theta: int,
     n_zeta: int,
@@ -5069,6 +5072,15 @@ def geometry_payload_pullback_from_param_vector_raw_block_transpose(
             booz_mode_indices=geometry_booz_mode_indices,
         )
 
+    payload_kind = str(payload_kind).strip().lower()
+    if payload_kind not in {"ntx_exact", "ntx_scan_runtime"}:
+        raise ValueError(
+            "payload_kind must be 'ntx_exact' or 'ntx_scan_runtime'; "
+            f"got {payload_kind!r}."
+        )
+    if payload_kind == "ntx_scan_runtime" and not combined_payload:
+        raise ValueError("ntx_scan_runtime payload transpose requires combined_payload=True.")
+
     def ntx_support_from_state(state_inner):
         geometry_inner = geometry_from_state(state_inner)
         return build_ntx_exact_lij_support_from_vmec_state(
@@ -5084,6 +5096,35 @@ def geometry_payload_pullback_from_param_vector_raw_block_transpose(
             r00_booz_constants_grids=geometry_booz_constants_grids,
             r00_booz_mode00=geometry_booz_mode00,
         )
+
+    if payload_kind == "ntx_scan_runtime":
+        if scan_rho is None:
+            raise ValueError("ntx_scan_runtime payload transpose requires scan_rho.")
+
+        def runtime_scan_payload_from_state(state_inner):
+            geometry_inner = geometry_from_state(state_inner)
+            channels, surfaces = build_ntx_runtime_scan_inputs_from_vmec_state(
+                context,
+                state_inner,
+                geometry_inner,
+                rho_scan=scan_rho,
+                surface_backend=scan_surface_backend,
+            )
+            # The live scan's database is rebuilt from this whole payload.  Do
+            # not split geometry into a second branch: doing so would make the
+            # scan-cache reconstruction depend on only part of its primal
+            # inputs and would double-count its geometry chain.
+            return {
+                "geometry": geometry_inner,
+                "channels": channels,
+                "surfaces": surfaces,
+            }
+
+        support_branch_name = "ntx_scan_runtime"
+        support_from_state = runtime_scan_payload_from_state
+    else:
+        support_branch_name = "ntx_support"
+        support_from_state = ntx_support_from_state
 
     def ntx_support_channels_from_state(state_inner):
         """Return only the NTX runtime channels, never ``face_prepared``.
@@ -5545,16 +5586,26 @@ def geometry_payload_pullback_from_param_vector_raw_block_transpose(
     def _payload_raw_block_state_bar_batch():
         geometry_state_bar_batch = None
         support_state_bar_batch = None
-        if combined_payload:
+        if combined_payload and payload_kind == "ntx_scan_runtime":
+            # A scan support bar is already the complete live runtime input
+            # tree (geometry + channels + surfaces).  One VJP of that tree is
+            # the exact transpose of the forward scan construction.
+            state_bar_batch = _state_bar_batch_from_payload_branch(
+                support_branch_name,
+                support_from_state,
+                tuple(payload_bars),
+            )
+            _print_state_bar_batch_finiteness("combined_scan", state_bar_batch)
+        elif combined_payload:
             geometry_bars = tuple(payload_bar["geometry"] for payload_bar in payload_bars)
-            support_bars = tuple(payload_bar["ntx_support"] for payload_bar in payload_bars)
+            support_bars = tuple(payload_bar[support_branch_name] for payload_bar in payload_bars)
             # Build the heavy NTX support VJP before the lighter geometry VJP so
             # the support compile/execution does not overlap the geometry
             # state-bar batch.  This preserves the same cotangent sum and final
             # raw-block transpose while reducing peak device memory.
             support_state_bar_batch = _state_bar_batch_from_payload_branch(
-                "ntx_support",
-                ntx_support_from_state,
+                support_branch_name,
+                support_from_state,
                 support_bars,
             )
             geometry_state_bar_batch = _state_bar_batch_from_payload_branch(
@@ -5570,12 +5621,21 @@ def geometry_payload_pullback_from_param_vector_raw_block_transpose(
             _print_state_bar_batch_finiteness("combined", state_bar_batch)
         else:
             state_bar_batch = _state_bar_batch_from_payload_branch(
-                "ntx_support",
-                ntx_support_from_state,
+                support_branch_name,
+                support_from_state,
                 tuple(payload_bars),
             )
             _print_state_bar_batch_finiteness("combined", state_bar_batch)
 
+        if return_branch_gradients and combined_payload and payload_kind == "ntx_scan_runtime":
+            zero_branch = jax.tree_util.tree_map(jnp.zeros_like, state_bar_batch)
+            return jax.tree_util.tree_map(
+                lambda geometry_bar, scan_bar: jnp.concatenate(
+                    [geometry_bar, scan_bar, scan_bar], axis=0
+                ),
+                zero_branch,
+                state_bar_batch,
+            )
         if return_branch_gradients and combined_payload:
             return jax.tree_util.tree_map(
                 lambda geometry_bar, support_bar, total_bar: jnp.concatenate(
@@ -5591,6 +5651,7 @@ def geometry_payload_pullback_from_param_vector_raw_block_transpose(
     def _try_compact_payload_tangent_contract_to_param_matrix():
         if (
             not combined_payload
+            or payload_kind == "ntx_scan_runtime"
             or return_branch_gradients
             or return_state_bars
             or extra_state_bars is not None
@@ -5599,9 +5660,11 @@ def geometry_payload_pullback_from_param_vector_raw_block_transpose(
         ):
             return None
         geometry_bars = tuple(payload_bar["geometry"] for payload_bar in payload_bars)
-        support_bars = tuple(payload_bar["ntx_support"] for payload_bar in payload_bars)
+        support_bars = tuple(payload_bar[support_branch_name] for payload_bar in payload_bars)
         geometry_setup = _payload_branch_pullback_setup("geometry", geometry_from_state, geometry_bars)
-        support_setup = _payload_branch_pullback_setup("ntx_support", ntx_support_from_state, support_bars)
+        support_setup = _payload_branch_pullback_setup(
+            support_branch_name, support_from_state, support_bars
+        )
         native_bar_tuple = None
         if native_vmec_face_coefficient_bars is not None:
             native_names = (
@@ -5814,11 +5877,17 @@ def geometry_payload_pullback_from_param_vector_raw_block_transpose(
             flush=True,
         )
     gradient_matrix = _param_vector_gradient_from_implicit_param_grads(param_bar_batch, param_entries)
+    if return_branch_gradients and combined_payload and payload_kind == "ntx_scan_runtime":
+        return {
+            "geometry": jnp.zeros_like(gradient_matrix),
+            support_branch_name: gradient_matrix,
+            "combined": gradient_matrix,
+        }
     if return_branch_gradients and combined_payload:
         row_count = len(payload_bars)
         return {
             "geometry": gradient_matrix[:row_count],
-            "ntx_support": gradient_matrix[row_count : 2 * row_count],
+            support_branch_name: gradient_matrix[row_count : 2 * row_count],
             "combined": gradient_matrix[2 * row_count :],
         }
     return gradient_matrix

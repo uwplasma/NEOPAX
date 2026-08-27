@@ -40,8 +40,11 @@ from ._reverse_ad_initial_er import (
     initial_er_charge_flux_residual_scalar,
     initial_er_charge_flux_residuals,
     initial_er_selected_root_profile,
+    realtime_geometry_payload_for_runtime,
+    realtime_geometry_reverse_support_payload_for_runtime,
     runtime_with_geometry_payload,
     runtime_with_ntx_support_payload,
+    runtime_with_realtime_geometry_reverse_support_payload,
 )
 from ._reverse_ad_parameters import (
     PROFILE_PARAMETER_ORDER,
@@ -422,6 +425,7 @@ class RealtimeGeometrySupportSegmentCoreSetup:
     """Reusable setup for the realtime-geometry segmented support reverse core."""
 
     combined_geometry_payload: bool
+    payload_kind: str
     ntx_surface_backend: str
     ntx_support_payload: object
     support_payload: object
@@ -467,6 +471,7 @@ class RealtimeGeometrySupportReverseDependencies:
     compact_initial_er_ntx_support_pullback_leaves: Callable[..., object]
     runtime_with_geometry_payload: Callable[[object, object], object]
     runtime_with_ntx_support_payload: Callable[[object, object], object]
+    runtime_with_realtime_geometry_reverse_support_payload: Callable[[object, object], object]
 
     def __post_init__(self) -> None:
         for field in dataclasses.fields(self):
@@ -3298,6 +3303,9 @@ def default_realtime_geometry_support_reverse_dependencies() -> RealtimeGeometry
         compact_initial_er_ntx_support_pullback_leaves=compact_initial_er_ntx_support_pullback_leaves,
         runtime_with_geometry_payload=runtime_with_geometry_payload,
         runtime_with_ntx_support_payload=runtime_with_ntx_support_payload,
+        runtime_with_realtime_geometry_reverse_support_payload=(
+            runtime_with_realtime_geometry_reverse_support_payload
+        ),
     )
 
 
@@ -3352,12 +3360,53 @@ def prepare_realtime_geometry_support_segment_core_setup(
     parameter_labels = tuple(str(name) for name in parameter_order)
     combined_geometry_payload = str(args.realtime_geometry_gradient_path) == "reverse_payload"
     ntx_surface_backend = str(neoclassical_cfg.get("ntx_exact_surface_backend", "booz"))
-    ntx_support_payload = find_ntx_support_payload(baseline_runtime)
-    support_payload = (
-        {"geometry": baseline_runtime.geometry, "ntx_support": ntx_support_payload}
-        if combined_geometry_payload
-        else ntx_support_payload
-    )
+    runtime_payload = realtime_geometry_payload_for_runtime(baseline_runtime)
+    payload_kind = str(runtime_payload["kind"])
+    if payload_kind == "ntx_exact":
+        # Preserve the established exact tree and call boundary unchanged.
+        ntx_support_payload = find_ntx_support_payload(baseline_runtime)
+        support_payload = (
+            {"geometry": baseline_runtime.geometry, "ntx_support": ntx_support_payload}
+            if combined_geometry_payload
+            else ntx_support_payload
+        )
+    elif payload_kind == "ntx_scan_runtime":
+        if not combined_geometry_payload:
+            raise ValueError(
+                "ntx_scan_runtime reverse requires "
+                "--realtime-geometry-gradient-path reverse_payload."
+            )
+        rebuild_mode = str(
+            getattr(args, "reverse_rebuild_support_pullback_mode", "separate")
+        ).strip().lower()
+        initial_cache_mode = str(
+            getattr(args, "reverse_initial_cache_support_pullback_mode", "scalar")
+        ).strip().lower()
+        if rebuild_mode != "separate" or initial_cache_mode != "scalar":
+            raise ValueError(
+                "ntx_scan_runtime currently supports only the generic "
+                "reverse support selectors: "
+                "--reverse-rebuild-support-pullback-mode separate and "
+                "--reverse-initial-cache-support-pullback-mode scalar. "
+                "The ntx_* selectors require a prepared exact-NTX system."
+            )
+        final_cotangent_mode = str(
+            getattr(args, "reverse_final_objective_cotangent_mode", "scalar")
+        ).strip().lower()
+        if final_cotangent_mode != "scalar":
+            raise ValueError(
+                "ntx_scan_runtime currently requires "
+                "--reverse-final-objective-cotangent-mode scalar."
+            )
+        ntx_support_payload = None
+        support_payload = realtime_geometry_reverse_support_payload_for_runtime(
+            baseline_runtime
+        )
+    else:
+        raise NotImplementedError(
+            "Realtime geometry segmented reverse currently supports "
+            f"ntx_exact and ntx_scan_runtime payloads; got {payload_kind!r}."
+        )
     profile_values = baseline_values[: len(parameter_labels)]
     support_probe_cotangent_mode = str(args.reverse_stage_cotangent_mode)
     reverse_setup = prepare_reverse_static_setup(
@@ -3433,6 +3482,7 @@ def prepare_realtime_geometry_support_segment_core_setup(
     )
     return RealtimeGeometrySupportSegmentCoreSetup(
         combined_geometry_payload=combined_geometry_payload,
+        payload_kind=payload_kind,
         ntx_surface_backend=ntx_surface_backend,
         ntx_support_payload=ntx_support_payload,
         support_payload=support_payload,
@@ -3839,7 +3889,10 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
             }
     for objective_i in range(objective_count):
         objective_name = objective_labels[objective_i]
-        if objective_name == bootstrap_objective_name:
+        if (
+            objective_name == bootstrap_objective_name
+            and "ntx_support" in support_payload
+        ):
             component_start = time.perf_counter()
             final_state_for_bootstrap = reverse_setup.prepared_rollout.physics_context.unpack_flat(
                 final_y_for_objective
@@ -4008,7 +4061,7 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
                 final_objective_state_elapsed += time.perf_counter() - component_start
         objective_values_rows.append(objective_value)
         final_y_bar_rows.append(final_y_bar)
-        if combined_geometry_payload:
+        if combined_geometry_payload and "ntx_support" in support_payload:
             if final_objective_cotangent_mode == "grouped_vjp":
                 geometry_objective_bar = grouped_geometry_bars[objective_i]
             else:
@@ -4044,6 +4097,45 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
                     "geometry": _sanitize_float_delta_bar_tree(geometry, geometry_objective_bar),
                     "ntx_support": zero_payload_bar["ntx_support"],
                 }
+            )
+        elif combined_geometry_payload:
+            if final_objective_cotangent_mode == "grouped_vjp":
+                raise NotImplementedError(
+                    "ntx_scan_runtime currently requires "
+                    "reverse_final_objective_cotangent_mode='scalar'."
+                )
+            component_start = time.perf_counter()
+            final_state_for_support = reverse_setup.prepared_rollout.physics_context.unpack_flat(
+                final_y_for_objective
+            )
+            support_delta0 = _float_delta_tree_like(support_payload)
+
+            def _objective_from_support_delta(support_delta, objective_index=objective_i):
+                runtime_with_support = (
+                    dependencies.runtime_with_realtime_geometry_reverse_support_payload(
+                        runtime,
+                        _add_float_delta_tree(support_payload, support_delta),
+                    )
+                )
+                return dependencies.objective_scalar_by_index(
+                    final_state_for_support,
+                    runtime_with_support,
+                    objective_index,
+                )
+
+            _, support_objective_pullback = jax.vjp(
+                _objective_from_support_delta, support_delta0
+            )
+            (support_objective_bar,) = support_objective_pullback(
+                jnp.ones_like(objective_value)
+            )
+            if phase_timing_diagnostics:
+                support_objective_bar = jax.block_until_ready(support_objective_bar)
+                final_objective_geometry_elapsed += time.perf_counter() - component_start
+            objective_payload_bar_rows.append(
+                _sanitize_float_delta_bar_tree(
+                    support_payload, support_objective_bar
+                )
             )
         else:
             objective_payload_bar_rows.append(zero_payload_bar)
@@ -5159,7 +5251,7 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
             state_residual_bars,
         )
 
-        if combined_geometry_payload:
+        if combined_geometry_payload and "ntx_support" in support_payload:
             geometry = support_payload["geometry"]
             ntx_support = support_payload["ntx_support"]
             geometry_delta0 = _float_delta_tree_like(geometry)
@@ -5193,6 +5285,35 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
             )
             initial_er_root_support_bars = (
                 tuple(jax.tree_util.tree_leaves(geometry_bars)) + tuple(ntx_bar_leaves)
+            )
+        elif combined_geometry_payload:
+            # A live NTX scan has no prepared exact-support compact rule.  Its
+            # complete differentiable support tree is small and explicit:
+            # geometry, scan channels, and scan surfaces.  Rebuild the scan
+            # runtime from that tree so the database cache remains internal.
+            support_delta0 = _float_delta_tree_like(support_payload)
+
+            def _residuals_from_support_delta(support_delta):
+                runtime_with_support = (
+                    dependencies.runtime_with_realtime_geometry_reverse_support_payload(
+                        runtime,
+                        _add_float_delta_tree(support_payload, support_delta),
+                    )
+                )
+                return dependencies.initial_er_charge_flux_residuals(
+                    pre_root_initial_state,
+                    er_profile,
+                    runtime=runtime_with_support,
+                )
+
+            _, support_pullback = jax.vjp(
+                _residuals_from_support_delta, support_delta0
+            )
+            batched_support_bars = jax.vmap(
+                lambda residual_bar: support_pullback(residual_bar)[0]
+            )(residual_bars)
+            initial_er_root_support_bars = tuple(
+                jax.tree_util.tree_leaves(batched_support_bars)
             )
         else:
             initial_er_root_support_bars = dependencies.compact_initial_er_ntx_support_pullback_leaves(
@@ -5336,7 +5457,7 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
             )
             for objective_i in range(objective_count)
         )
-    if combined_geometry_payload:
+    if combined_geometry_payload and "ntx_support" in support_payload:
         phase_start = time.perf_counter()
         geometry = support_payload["geometry"]
         geometry_delta0 = _float_delta_tree_like(geometry)
@@ -5390,6 +5511,59 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
                 "ntx_support": support_bar["ntx_support"],
             }
             for objective_i, support_bar in enumerate(support_bars)
+        )
+    elif combined_geometry_payload:
+        # Keep the initial-profile contribution in the same scan support tree
+        # as the reverse-step and selected-root contributions.  This is a
+        # generic VJP of the ordinary initialization path, not an additional
+        # NTX adjoint or an independent database cotangent.
+        phase_start = time.perf_counter()
+        support_delta0 = _float_delta_tree_like(support_payload)
+
+        def _initial_state_from_support_delta(support_delta):
+            runtime_with_support = (
+                dependencies.runtime_with_realtime_geometry_reverse_support_payload(
+                    runtime,
+                    _add_float_delta_tree(support_payload, support_delta),
+                )
+            )
+            return dependencies.initial_state_for_parameter_vector(
+                parameter_values,
+                config=config,
+                initial_er_root_ad="off",
+                baseline_state=baseline_state,
+                profile_cfg=profile_cfg,
+                runtime=runtime_with_support,
+            )
+
+        _, initial_support_pullback = jax.vjp(
+            _initial_state_from_support_delta, support_delta0
+        )
+        initial_support_bars = jax.vmap(
+            lambda state_bar: initial_support_pullback(state_bar)[0]
+        )(initial_state_bars)
+        initial_support_bars = jax.block_until_ready(initial_support_bars)
+        print(
+            f"{progress_prefix} progress: support reverse initial-profile scan payload pullback ready "
+            f"elapsed_s={time.perf_counter() - phase_start:.3f}",
+            flush=True,
+        )
+        initial_support_rows = tuple(
+            _take_tree_axis0(initial_support_bars, objective_i)
+            for objective_i in range(objective_count)
+        )
+        component_support_bars_by_name["initial_profile"] = tuple(
+            _sanitize_float_delta_bar_tree(support_payload, initial_support_row)
+            for initial_support_row in initial_support_rows
+        )
+        support_bars = tuple(
+            _sanitize_float_delta_bar_tree(
+                support_payload,
+                dependencies.add_trees(support_bar, initial_support_row),
+            )
+            for support_bar, initial_support_row in zip(
+                support_bars, initial_support_rows, strict=True
+            )
         )
     return (
         objective_values,
@@ -5746,6 +5920,9 @@ def run_internal_realtime_geometry_support_segment_probe(
         native_vmec_face_coefficient_bars=support_cotangent_result.native_vmec_face_coefficient_bars,
         include_component_pullbacks=bool(getattr(args, "realtime_geometry_component_pullbacks", False)),
         combined_geometry_payload=core_setup.combined_geometry_payload,
+        payload_kind=core_setup.payload_kind,
+        scan_rho=neoclassical_cfg.get("ntx_scan_rho"),
+        scan_surface_backend=str(neoclassical_cfg.get("ntx_scan_surface_backend", "vmec")),
         n_r=int(geom_cfg.get("n_radial", 51)),
         n_theta=int(neoclassical_cfg.get("ntx_exact_n_theta", 25)),
         n_zeta=int(neoclassical_cfg.get("ntx_exact_n_zeta", 25)),
@@ -6465,6 +6642,9 @@ def realtime_geometry_payload_pullback_result(
     native_vmec_face_coefficient_bars: Mapping[str, object] | None = None,
     include_component_pullbacks: bool = False,
     combined_geometry_payload: bool = True,
+    payload_kind: str = "ntx_exact",
+    scan_rho=None,
+    scan_surface_backend: str = "vmec",
     n_r: int = 51,
     n_theta: int = 25,
     n_zeta: int = 25,
@@ -6520,6 +6700,9 @@ def realtime_geometry_payload_pullback_result(
         tuple(geometry_param_specs),
         geometry_pullback_payload_bars,
         combined_payload=combined_geometry_payload,
+        payload_kind=payload_kind,
+        scan_rho=scan_rho,
+        scan_surface_backend=scan_surface_backend,
         n_r=int(n_r),
         n_theta=int(n_theta),
         n_zeta=int(n_zeta),
@@ -6548,6 +6731,15 @@ def realtime_geometry_payload_pullback_result(
         return total_matrix, component_matrices
 
     if isinstance(geometry_gradient_result, Mapping):
+        # The public report predates the live scan and keeps the historical
+        # ``ntx_support_branch`` field name.  Select the actual internal
+        # payload branch here; the combined matrix remains the authoritative
+        # geometry derivative in both cases.
+        support_branch_key = (
+            "ntx_scan_runtime"
+            if str(payload_kind).strip().lower() == "ntx_scan_runtime"
+            else "ntx_support"
+        )
         geometry_gradient_matrix, component_gradient_matrices = _split_component_rows(
             geometry_gradient_result["combined"]
         )
@@ -6555,7 +6747,7 @@ def realtime_geometry_payload_pullback_result(
             geometry_gradient_result.get("geometry")
         )
         ntx_support_branch_gradient_matrix, component_ntx_support_branch_matrices = _split_component_rows(
-            geometry_gradient_result.get("ntx_support")
+            geometry_gradient_result.get(support_branch_key)
         )
     else:
         geometry_gradient_matrix, component_gradient_matrices = _split_component_rows(
@@ -6591,6 +6783,9 @@ def realtime_geometry_transport_reverse_table_from_payload_cotangents(
     native_vmec_face_coefficient_bars: Mapping[str, object] | None = None,
     include_component_pullbacks: bool = False,
     combined_geometry_payload: bool = True,
+    payload_kind: str = "ntx_exact",
+    scan_rho=None,
+    scan_surface_backend: str = "vmec",
     n_r: int = 51,
     n_theta: int = 25,
     n_zeta: int = 25,
@@ -6613,6 +6808,9 @@ def realtime_geometry_transport_reverse_table_from_payload_cotangents(
         native_vmec_face_coefficient_bars=native_vmec_face_coefficient_bars,
         include_component_pullbacks=include_component_pullbacks,
         combined_geometry_payload=combined_geometry_payload,
+        payload_kind=payload_kind,
+        scan_rho=scan_rho,
+        scan_surface_backend=scan_surface_backend,
         n_r=n_r,
         n_theta=n_theta,
         n_zeta=n_zeta,

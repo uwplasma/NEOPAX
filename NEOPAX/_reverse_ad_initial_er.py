@@ -353,6 +353,68 @@ def runtime_with_realtime_geometry_payload(runtime, payload):
     raise ValueError(f"Unknown realtime geometry payload kind {kind!r}.")
 
 
+def runtime_with_realtime_geometry_reverse_support_payload(runtime, support_payload):
+    """Rebuild ``runtime`` from the differentiable reverse support leaves.
+
+    Unlike :func:`runtime_with_realtime_geometry_payload`, this accepts the
+    payload tree owned by a reverse VJP.  In particular, a live NTX scan has
+    no database leaf here: the database is regenerated from the supplied
+    geometry, channels, and surfaces.  This keeps the cache on the primal
+    side of the contract and gives later reverse boundaries one model-aware
+    replacement function.
+    """
+
+    if not isinstance(support_payload, dict):
+        raise TypeError("realtime geometry reverse support payload must be a mapping.")
+    payload = realtime_geometry_payload_for_runtime(runtime)
+    kind = str(payload["kind"])
+    if kind == "ntx_scan_runtime":
+        required = {"geometry", "channels", "surfaces"}
+        missing = required.difference(support_payload)
+        if missing:
+            raise ValueError(
+                "Live NTX scan reverse support payload is missing "
+                f"{sorted(missing)!r}."
+            )
+        return runtime_with_realtime_geometry_payload(
+            runtime,
+            {
+                "kind": kind,
+                "geometry": support_payload["geometry"],
+                "channels": support_payload["channels"],
+                "surfaces": support_payload["surfaces"],
+                # Deliberately clear the old cache. ``with_runtime_scan_payload``
+                # rebuilds it through the live NTX scan when the model is used.
+                "database": None,
+            },
+        )
+    if kind == "ntx_exact":
+        required = {"geometry", "ntx_support"}
+        missing = required.difference(support_payload)
+        if missing:
+            raise ValueError(
+                "Exact NTX reverse support payload is missing "
+                f"{sorted(missing)!r}."
+            )
+        return runtime_with_realtime_geometry_payload(
+            runtime,
+            {"kind": kind, **support_payload},
+        )
+    if kind == "ntx_database":
+        required = {"geometry", "database"}
+        missing = required.difference(support_payload)
+        if missing:
+            raise ValueError(
+                "NTX database reverse support payload is missing "
+                f"{sorted(missing)!r}."
+            )
+        return runtime_with_realtime_geometry_payload(
+            runtime,
+            {"kind": kind, **support_payload},
+        )
+    raise ValueError(f"Unknown realtime geometry payload kind {kind!r}.")
+
+
 def runtime_with_geometry_payload(runtime, geometry):
     """Return runtime with transport geometry payload replaced everywhere needed."""
 
