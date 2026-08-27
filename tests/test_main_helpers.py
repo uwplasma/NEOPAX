@@ -1,3 +1,4 @@
+import dataclasses
 import types
 from pathlib import Path
 
@@ -18,6 +19,7 @@ from NEOPAX._orchestrator import (
 )
 from NEOPAX._reverse_ad_initial_er import (
     realtime_geometry_payload_for_runtime,
+    realtime_geometry_reverse_support_payload_for_runtime,
     runtime_with_geometry_payload,
     runtime_with_realtime_geometry_payload,
 )
@@ -1299,6 +1301,88 @@ def test_ntx_runtime_scan_model_accepts_live_scan_inputs_without_files():
     assert model.vmec_file is None
     assert model.boozer_file is None
     assert model._scan_surfaces(None, jnp.asarray([0.25, 0.5])) == surfaces
+
+
+def test_ntx_runtime_scan_payload_replacement_clears_only_stale_database():
+    """A realtime scan replacement retains live inputs and never file loaders."""
+    old_surfaces = (object(), object())
+    new_surfaces = (object(), object())
+    old_channels = _tiny_ntx_runtime_channels([0.25, 0.5])
+    new_channels = _tiny_ntx_runtime_channels([0.25, 0.5])
+    model = build_ntx_runtime_scan_transport_model(
+        species="species",
+        energy_grid="grid",
+        geometry="old_geometry",
+        vmec_file=None,
+        boozer_file=None,
+        ntx_scan_rho=[0.25, 0.5],
+        ntx_scan_nu_v=[1.0e-4, 1.0e-3],
+        ntx_scan_er_tilde=[0.0, 1.0e-4],
+        ntx_scan_channels=old_channels,
+        ntx_scan_surfaces=old_surfaces,
+        prebuild_database=False,
+    )
+    stale_database = object()
+    model = dataclasses.replace(model, database=stale_database)
+
+    actual = model.with_runtime_scan_payload(
+        geometry="new_geometry",
+        channels=new_channels,
+        scan_surfaces=new_surfaces,
+    )
+
+    assert actual.geometry == "new_geometry"
+    assert actual.channels is new_channels
+    assert actual.scan_surfaces == new_surfaces
+    assert actual.database is None
+    assert actual.vmec_file is None
+    assert actual.boozer_file is None
+
+
+def test_tagged_realtime_payload_round_trips_live_ntx_scan_model():
+    """The tagged reverse seam keeps live NTX scan inputs, not a static DB."""
+    surfaces = (object(), object())
+    channels = _tiny_ntx_runtime_channels([0.25, 0.5])
+    model = build_ntx_runtime_scan_transport_model(
+        species="species", energy_grid="grid", geometry="old_geometry",
+        vmec_file=None, boozer_file=None,
+        ntx_scan_rho=[0.25, 0.5], ntx_scan_nu_v=[1.0e-4, 1.0e-3],
+        ntx_scan_er_tilde=[0.0, 1.0e-4], ntx_scan_channels=channels,
+        ntx_scan_surfaces=surfaces, prebuild_database=False,
+    )
+    database = object()
+    model = dataclasses.replace(model, database=database)
+    runtime = RuntimeContext(
+        species="species", energy_grid="grid", geometry="old_geometry",
+        database=database, solver_parameters={}, models=Models(flux=model),
+    )
+
+    payload = realtime_geometry_payload_for_runtime(runtime)
+    assert payload["kind"] == "ntx_scan_runtime"
+    assert payload["channels"] is channels
+    assert payload["surfaces"] == surfaces
+    assert payload["database"] is database
+    support_payload = realtime_geometry_reverse_support_payload_for_runtime(runtime)
+    assert set(support_payload) == {"geometry", "channels", "surfaces"}
+    assert support_payload["channels"] is channels
+    assert support_payload["surfaces"] == surfaces
+
+    new_surfaces = (object(), object())
+    new_database = object()
+    actual = runtime_with_realtime_geometry_payload(
+        runtime,
+        {
+            **payload,
+            "geometry": "new_geometry",
+            "surfaces": new_surfaces,
+            "database": new_database,
+        },
+    )
+    assert actual.geometry == "new_geometry"
+    assert actual.database is new_database
+    assert actual.models.flux.channels is channels
+    assert actual.models.flux.scan_surfaces == new_surfaces
+    assert actual.models.flux.database is new_database
 
 
 def test_ntx_runtime_scan_database_keeps_radius_local_er_axis():

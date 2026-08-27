@@ -2761,6 +2761,81 @@ class NTXRuntimeScanTransportModel(TransportFluxModelBase):
     scan_surfaces: tuple[Any, ...] | None = None
     database: Any = None
 
+    def with_runtime_scan_payload(
+        self,
+        *,
+        geometry,
+        channels: NTXRuntimeScanChannels,
+        scan_surfaces: tuple[Any, ...],
+        database=None,
+    ) -> "NTXRuntimeScanTransportModel":
+        """Replace the complete live NTX-scan input payload.
+
+        Realtime VMEC supplies all three coupled inputs: transport geometry,
+        scan channels, and the corresponding traceable NTX surfaces.  A cached
+        database is valid only for that same triple.  Passing ``database=None``
+        intentionally clears it, so the existing ``with_runtime_database``
+        route rebuilds it through the live NTX scan rather than a file-backed
+        database loader.
+        """
+
+        rho, _, _ = self._scan_axes()
+        if channels.rho.shape != rho.shape:
+            raise ValueError("Runtime scan payload channel rho grid does not match rho_scan.")
+        if len(scan_surfaces) != int(rho.shape[0]):
+            raise ValueError("Runtime scan payload surface count does not match rho_scan.")
+        return dataclasses.replace(
+            self,
+            geometry=geometry,
+            channels=channels,
+            scan_surfaces=tuple(scan_surfaces),
+            database=database,
+            vmec_file=None,
+            boozer_file=None,
+        )
+
+    def with_support_payload(self, support_payload):
+        """Rebuild this model from a differentiable live-scan payload.
+
+        Unlike the file-backed database model, the database is intentionally
+        *not* an independent support leaf here.  The payload supplies the
+        realtime VMEC geometry, live scan channels, and live scan surfaces;
+        the existing NTX scan builder regenerates the database from those
+        inputs.  This is the same construction used by the forward runtime.
+        """
+
+        if not isinstance(support_payload, dict):
+            raise TypeError("Live NTX scan support payload must be a mapping.")
+        required = ("geometry", "channels", "surfaces")
+        missing = tuple(name for name in required if name not in support_payload)
+        if missing:
+            raise ValueError(f"Live NTX scan support payload is missing {missing!r}.")
+        return self.with_runtime_scan_payload(
+            geometry=support_payload["geometry"],
+            channels=support_payload["channels"],
+            scan_surfaces=support_payload["surfaces"],
+            database=None,
+        ).with_runtime_database()
+
+    def pullback_build_lagged_response_support_payload(
+        self,
+        state,
+        lagged_response_bar,
+        support_payload,
+        **kwargs,
+    ):
+        """VJP through the live NTX scan/database rebuild for one Radau bar."""
+
+        support_delta0 = _float_delta_tree_like(support_payload)
+        _, pullback = jax.vjp(
+            lambda support_delta: self.with_support_payload(
+                _add_float_delta_tree(support_payload, support_delta)
+            ).build_lagged_response(state, **kwargs),
+            support_delta0,
+        )
+        (support_bar,) = pullback(lagged_response_bar)
+        return _sanitize_float_delta_bar_tree(support_payload, support_bar)
+
     def _scan_axes(self) -> tuple[jax.Array, jax.Array, jax.Array]:
         rho = _as_float_array(self.rho_scan, name="rho_scan")
         nu_v = _as_float_array(self.nu_v_scan, name="nu_v_scan", positive=True)
@@ -2830,8 +2905,11 @@ class NTXRuntimeScanTransportModel(TransportFluxModelBase):
             Er_to_Ertilde=er_to_ertilde,
             dr_tildedr=jnp.asarray(channels["dr_tildedr"], dtype=jnp.float64),
             dr_tildeds=jnp.asarray(channels["dr_tildeds"], dtype=jnp.float64),
-            a_b=float(channels["a_b"]),
-            psia=float(channels["psia"]),
+            # Keep these as arrays.  The runtime scan is also the realtime
+            # geometry reverse payload, where converting a channel tracer to
+            # Python ``float`` would cut (or reject) its derivative.
+            a_b=jnp.asarray(channels["a_b"], dtype=jnp.float64),
+            psia=jnp.asarray(channels["psia"], dtype=jnp.float64),
             b00=jnp.asarray(channels["b00"], dtype=jnp.float64),
             r00=jnp.asarray(channels["r00"], dtype=jnp.float64),
             boozer_i=jnp.asarray(channels["boozer_i"], dtype=jnp.float64),
@@ -12048,6 +12126,7 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         native_compact_residual_ntx_rhs: bool = False,
         reuse_joint_moment_drds_jvp: bool = False,
         return_native_vmec_coefficient_bars: bool = False,
+        native_vmec_direct_directional_product_rule: bool = False,
     ):
         """Experimental exact batched support transpose with local NTX sharing.
 
@@ -12190,6 +12269,9 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                     local_kwargs["return_case_bars"] = True
                 if return_native_vmec_coefficient_bars:
                     local_kwargs["native_vmec_coefficient_bars_only"] = True
+                    local_kwargs["native_vmec_direct_directional_product_rule"] = (
+                        native_vmec_direct_directional_product_rule
+                    )
                 local_result = local_support_pullback(
                     prepared,
                     drds_value=drds_value,

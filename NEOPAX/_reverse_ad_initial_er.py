@@ -13,6 +13,7 @@ from ._monoenergetic import database_with_geometry_scale
 from ._transport_flux_models import (
     DENSITY_STATE_TO_PHYSICAL,
     NTXDatabaseTransportModel,
+    NTXRuntimeScanTransportModel,
     _add_float_delta_tree,
     _collisionality_kind,
     _extract_right_constraints,
@@ -193,6 +194,19 @@ def find_database_payload_in_model(model):
     return None
 
 
+def find_ntx_runtime_scan_model_in_model(model):
+    """Return the nested live NTX scan model, if the runtime owns one."""
+
+    if isinstance(model, NTXRuntimeScanTransportModel):
+        return model
+    if dataclasses.is_dataclass(model) and not isinstance(model, type):
+        for field in dataclasses.fields(model):
+            found = find_ntx_runtime_scan_model_in_model(getattr(model, field.name))
+            if found is not None:
+                return found
+    return None
+
+
 def realtime_geometry_payload_for_runtime(runtime):
     """Return the additive tagged geometry payload for a supported runtime.
 
@@ -201,6 +215,15 @@ def realtime_geometry_payload_for_runtime(runtime):
     without changing the legacy exact payload shape.
     """
 
+    runtime_scan = find_ntx_runtime_scan_model_in_model(runtime.models.flux)
+    if runtime_scan is not None:
+        return {
+            "kind": "ntx_scan_runtime",
+            "geometry": runtime.geometry,
+            "channels": runtime_scan.channels,
+            "surfaces": runtime_scan.scan_surfaces,
+            "database": runtime_scan.database,
+        }
     database = find_database_payload_in_model(runtime.models.flux)
     if database is not None:
         return {
@@ -215,6 +238,35 @@ def realtime_geometry_payload_for_runtime(runtime):
     }
 
 
+def realtime_geometry_reverse_support_payload_for_runtime(runtime):
+    """Return only the differentiable support leaves for a runtime payload.
+
+    A live runtime scan deliberately excludes its cached database: it is
+    regenerated from geometry/channels/surfaces by the NTX scan model during
+    the support VJP.  Keeping the cache out prevents it becoming an unrelated
+    independent cotangent leaf.
+    """
+
+    payload = realtime_geometry_payload_for_runtime(runtime)
+    if payload["kind"] == "ntx_scan_runtime":
+        return {
+            "geometry": payload["geometry"],
+            "channels": payload["channels"],
+            "surfaces": payload["surfaces"],
+        }
+    if payload["kind"] == "ntx_exact":
+        return {
+            "geometry": payload["geometry"],
+            "ntx_support": payload["ntx_support"],
+        }
+    if payload["kind"] == "ntx_database":
+        return {
+            "geometry": payload["geometry"],
+            "database": payload["database"],
+        }
+    raise ValueError(f"Unknown realtime geometry payload kind {payload['kind']!r}.")
+
+
 def _replace_database_payload_in_model(model, database):
     if model is None or not dataclasses.is_dataclass(model) or isinstance(model, type):
         return model, False
@@ -226,6 +278,28 @@ def _replace_database_payload_in_model(model, database):
         value = getattr(model, field.name)
         if dataclasses.is_dataclass(value) and not isinstance(value, type):
             replacement, child_changed = _replace_database_payload_in_model(value, database)
+            if child_changed:
+                updates[field.name] = replacement
+                changed = True
+    return (dataclasses.replace(model, **updates), True) if changed else (model, False)
+
+
+def _replace_ntx_runtime_scan_payload_in_model(model, payload):
+    if model is None or not dataclasses.is_dataclass(model) or isinstance(model, type):
+        return model, False
+    if isinstance(model, NTXRuntimeScanTransportModel):
+        return model.with_runtime_scan_payload(
+            geometry=payload["geometry"],
+            channels=payload["channels"],
+            scan_surfaces=payload["surfaces"],
+            database=payload.get("database"),
+        ), True
+    updates = {}
+    changed = False
+    for field in dataclasses.fields(model):
+        value = getattr(model, field.name)
+        if dataclasses.is_dataclass(value) and not isinstance(value, type):
+            replacement, child_changed = _replace_ntx_runtime_scan_payload_in_model(value, payload)
             if child_changed:
                 updates[field.name] = replacement
                 changed = True
@@ -262,6 +336,19 @@ def runtime_with_realtime_geometry_payload(runtime, payload):
             runtime_with_geometry,
             database=database,
             models=dataclasses.replace(runtime_with_geometry.models, flux=flux_model),
+        )
+    if kind == "ntx_scan_runtime":
+        flux_model, changed = _replace_ntx_runtime_scan_payload_in_model(
+            runtime.models.flux,
+            payload,
+        )
+        if not changed:
+            raise ValueError("No live NTX runtime scan model was found in the runtime.")
+        return dataclasses.replace(
+            runtime,
+            geometry=payload["geometry"],
+            database=payload.get("database"),
+            models=dataclasses.replace(runtime.models, flux=flux_model),
         )
     raise ValueError(f"Unknown realtime geometry payload kind {kind!r}.")
 

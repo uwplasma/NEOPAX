@@ -1,4 +1,13 @@
-# Realtime-geometry reverse path for `ntx_database`
+# Realtime-geometry reverse path for `ntx_scan_runtime`
+
+> **Correction (current work):** this plan originally conflated the static
+> file-backed `ntx_database` model with the requested live realtime scan
+> model. The active target is `ntx_scan_runtime`. Its forward path constructs
+> channels and surfaces from each realtime VMEC state, runs
+> `build_ntx_neopax_scan_from_surfaces`, and then converts that live NTX scan
+> to the runtime database. The static-wrapper notes below are historical and
+> are not an implementation route for this target. The next implementation
+> starts from `NTXRuntimeScanTransportModel`, not `NTXDatabaseTransportModel`.
 
 ## Objective
 
@@ -61,8 +70,19 @@ close.
 * The symmetric tagged runtime replacement is implemented too: it replaces
   both geometry and the database wrapper for database payloads, and delegates
   to the established geometry-plus-support replacement for exact payloads.
-* It deliberately does not yet route database configurations through the
-  reverse setup.  That remains behind the small-oracle tests below.
+* Reverse static setup now classifies the tagged payload before any
+  exact-support lookup.  Database payloads construct the generic
+  ``{"geometry", "database"}`` support tree, and exact-only selectors are
+  rejected at setup rather than failing later inside a prepared-NTX hook.
+* `NTXDatabaseTransportModel` now exposes the ordinary generic
+  `pullback_build_lagged_response_support_payload` hook.  It is a VJP of the
+  existing database lagged-response calculation with respect to that tagged
+  pure payload; it does not introduce a database-specific NTX solve, file
+  access, or prepared-system rule.
+* The final geometry-to-VMEC raw-block payload transpose and the selected-root
+  support boundary are still exact-runtime-specific.  Until their generic
+  database counterparts are added, database reverse is deliberately stopped
+  before a full benchmark can produce a partial geometry derivative.
 * `preprocessed_ntss` is explicitly unsupported for realtime replacement
   until its non-scale geometry fit channels can be reconstructed exactly.
 
