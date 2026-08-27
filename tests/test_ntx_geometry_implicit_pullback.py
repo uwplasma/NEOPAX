@@ -39,6 +39,7 @@ from NEOPAX._reverse_ad_transport import (
     _initial_lagged_response_joint_state_and_support_pullback,
     _merge_rebuild_ntx_channels_into_generic_payload_bar,
     _objective_vector_vjp_rows,
+    _realized_reverse_slot_branches,
     _take_batched_pytree_row,
 )
 
@@ -954,6 +955,20 @@ def test_mock_native_per_energy_call_boundary_is_a_distinct_hlo_call():
     plain_hlo = plain.lower(values).compiler_ir(dialect="hlo").as_hlo_text()
     bounded_hlo = bounded.lower(values).compiler_ir(dialect="hlo").as_hlo_text()
     assert bounded_hlo.count("call(") == plain_hlo.count("call(") + 1
+
+
+def test_realized_reverse_slot_branches_dispatch_only_active_slots_in_reverse_order():
+    """Host dispatch reads only the fixed schedule, never objective data."""
+
+    assert _realized_reverse_slot_branches(
+        [True, True, False, True],
+        [True, False, True, True],
+        False,
+    ) == (
+        (3, "reuse"),
+        (1, "reuse"),
+        (0, "rebuild"),
+    )
 
 
 def test_native_split_joint_no_prepared_carry_hook_selects_only_its_wrapper():

@@ -262,6 +262,32 @@ def _take_batched_pytree_row(tree, row_index: int):
     )
 
 
+def _realized_reverse_slot_branches(
+    slot_active,
+    slot_next_lagged_valid,
+    segment_start_lagged_valid: bool,
+):
+    """Return the exact host dispatch order for a realized segment schedule.
+
+    This is intentionally NumPy-only metadata handling: it never receives a
+    state, objective cotangent, support payload, or NTX value. Reverse-time
+    dependencies still flow entirely through device-resident step launches.
+    """
+
+    active = np.asarray(slot_active, dtype=bool).reshape(-1)
+    next_valid = np.asarray(slot_next_lagged_valid, dtype=bool).reshape(-1)
+    if active.shape != next_valid.shape:
+        raise ValueError("realized reverse schedule arrays must have matching shapes.")
+    start_valid = np.concatenate(
+        [np.asarray([bool(segment_start_lagged_valid)], dtype=bool), next_valid[:-1]]
+    )
+    return tuple(
+        (slot_index, "reuse" if start_valid[slot_index] else "rebuild")
+        for slot_index in range(active.size - 1, -1, -1)
+        if active[slot_index]
+    )
+
+
 def _initial_lagged_response_joint_state_and_support_pullback(
     *,
     flat_y,
@@ -4773,22 +4799,16 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
         slot_next_lagged_valid = np.asarray(
             jax.device_get(segment_arrays[6]), dtype=bool
         ).reshape(-1)
-        slot_start_lagged_valid = np.concatenate(
-            [
-                np.asarray(
-                    [bool(np.asarray(jax.device_get(segment_carry.lagged_response_valid)))],
-                    dtype=bool,
-                ),
-                slot_next_lagged_valid[:-1],
-            ]
-        )
         segment_support_bars = tuple(
             jnp.zeros_like(leaf) for leaf in support_bar_leaves
         )
         reduced_value = segment_next_reduced_bars
-        for slot_index in range(slot_active.size - 1, -1, -1):
-            if not slot_active[slot_index]:
-                continue
+        realized_branches = _realized_reverse_slot_branches(
+            slot_active,
+            slot_next_lagged_valid,
+            bool(np.asarray(jax.device_get(segment_carry.lagged_response_valid))),
+        )
+        for slot_index, branch in realized_branches:
             step_start_carry = _take_tree_axis0(step_start_carries, slot_index)
             carry_for_step = _radau_carry_with_forward_only_jvp_fields(
                 dataclasses.replace(
@@ -4797,7 +4817,6 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
                 )
             )
             step_primal_record = _take_tree_axis0(step_primal_records, slot_index)
-            branch = "reuse" if slot_start_lagged_valid[slot_index] else "rebuild"
             reduced_value, step_support_bars = (
                 _execute_radau_accepted_step_next_reduced_cotangent_batched_bwd_with_support_from_segment_primal_record_call(
                     reverse_setup.execution_context.kernel_context,

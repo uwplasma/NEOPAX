@@ -2780,3 +2780,25 @@ wired, along with the deliberately opt-in selector:
 This is exactly the validated direct-directional native path with only the
 per-energy device-call boundary added. It is not promoted and has not yet had
 a remote cache-disabled benchmark. Both CPU gates must pass before one is run.
+
+### Host static reuse/rebuild dispatch (2026-08-27)
+
+The per-energy call-boundary experiment compiled in about three minutes, so
+it is rejected: an XLA call remains in the same compiled module and does not
+remove the native low-dot graph from compiler work.
+
+The next opt-in topology is
+`reduced_cotangent_host_static_branches`. It uses the existing minimal segment
+replay to produce device-resident step carries and primal records, reads only
+the small realized active/reuse boolean schedule to the host, and launches the
+existing record-consuming static `reuse` or `rebuild` step adjoint. Therefore
+there are at most three relevant device executables for any segment length:
+one replay executable, one reuse step executable, and one rebuild step
+executable. Objective/RHS batching, state/support bars, records, and NTX work
+remain on device; no factor record, objective loop, or changed equation is
+introduced. This is materially different from static pattern unrolling: it
+does not create `2**segment_length` compiled patterns.
+
+Before a remote run, the NumPy-only schedule gate must pass. Exact full reverse
+equality remains the remote acceptance check, alongside total compilation and
+warm execution.
