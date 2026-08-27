@@ -11,6 +11,8 @@ import dataclasses
 from collections.abc import Callable, Sequence
 from typing import Any
 
+from ._geometry_autodiff import GeometryRawBlockSolve, GeometryRawBlockStage
+
 
 @dataclasses.dataclass(frozen=True, slots=True)
 class InitialRootStageLayout:
@@ -38,6 +40,65 @@ class GeometryInitialRootOptimizationStage:
     layout: InitialRootStageLayout
     root_to_payload: Callable[..., Any]
     payload_to_vmec: Callable[..., Any]
+
+
+def build_geometry_initial_root_optimization_stage(
+    *,
+    layout: InitialRootStageLayout,
+    raw_block_stage: GeometryRawBlockStage,
+    root_to_payload_impl: Callable[..., Any],
+    payload_to_vmec_impl: Callable[..., Any],
+) -> GeometryInitialRootOptimizationStage:
+    """Build persistent optimization callables without retaining trial data."""
+
+    def root_to_payload(dynamic_raw_payload, /, **kwargs):
+        return root_to_payload_impl(
+            raw_block_solve=raw_block_solve_from_dynamic_payload(raw_block_stage, dynamic_raw_payload),
+            **kwargs,
+        )
+
+    def payload_to_vmec(dynamic_raw_payload, /, **kwargs):
+        return payload_to_vmec_impl(
+            raw_block_solve=raw_block_solve_from_dynamic_payload(raw_block_stage, dynamic_raw_payload),
+            **kwargs,
+        )
+
+    return GeometryInitialRootOptimizationStage(
+        layout=layout,
+        root_to_payload=root_to_payload,
+        payload_to_vmec=payload_to_vmec,
+    )
+
+
+def raw_block_dynamic_payload(raw_block_solve: GeometryRawBlockSolve) -> tuple[Any, Any, Any]:
+    """Return only the trial-dependent leaves of one shared raw-block solve."""
+
+    return (
+        raw_block_solve.implicit_params,
+        raw_block_solve.state,
+        raw_block_solve.dof_mask,
+    )
+
+
+def raw_block_solve_from_dynamic_payload(
+    raw_block_stage: GeometryRawBlockStage,
+    payload: tuple[Any, Any, Any],
+) -> GeometryRawBlockSolve:
+    """Rebuild the established raw-block container at an AD boundary.
+
+    The stage owns only immutable VMEX setup; every payload element comes from
+    the current trial and is therefore never retained across evaluations.
+    """
+
+    implicit_params, state, dof_mask = payload
+    return GeometryRawBlockSolve(
+        implicit=raw_block_stage.implicit,
+        implicit_params=implicit_params,
+        implicit_cfg=raw_block_stage.implicit_cfg,
+        state=state,
+        dof_mask=dof_mask,
+        param_entries=raw_block_stage.param_entries,
+    )
 
 
 def initial_root_stage_layout(

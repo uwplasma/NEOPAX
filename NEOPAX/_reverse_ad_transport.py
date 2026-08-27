@@ -563,6 +563,26 @@ class _ThetaReverseScheduleTrace:
     attempted_dts: Any
     next_dts: Any
     step_ts: Any
+
+
+def _initial_direct_rhs_support_pullback_batched(
+    *, carry0, carry0_bars, kernel_context, flat_rhs_direct_support_pullback, support_payload
+):
+    """Transpose the one direct RHS evaluation used to construct carry zero."""
+    if flat_rhs_direct_support_pullback is None:
+        return None
+    objective_count = int(jnp.asarray(carry0_bars.prev_stages).shape[0])
+    rhs_bars = jnp.sum(
+        jnp.asarray(carry0_bars.prev_stages).reshape(
+            (objective_count, int(kernel_context.num_stages), -1)
+        ),
+        axis=1,
+    )
+    return jax.vmap(
+        lambda rhs_bar: flat_rhs_direct_support_pullback(
+            carry0.t, carry0.y, rhs_bar, support_payload
+        )
+    )(rhs_bars)
     next_recent_reject_count: Any
     next_regrowth_cooldown: Any
     next_easy_growth_streak: Any
@@ -5068,6 +5088,39 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
         f"elapsed_s={time.perf_counter() - phase_start:.3f}",
         flush=True,
     )
+    # Black-box transport has no initial lagged cache.  Its initial carry
+    # still contains one direct RHS evaluation, whose support cotangent is the
+    # sum of the stored stage bars (the same contraction used by the initial
+    # carry custom VJP).  Keep this separate from the state VJP below.
+    physics_context = reverse_setup.execution_context.physics_context
+    direct_initial_support_bar_leaves = None
+    if (
+        not bool(getattr(reverse_setup.prepared_rollout.kernel_context, "use_transport_lagged_response", False))
+        and getattr(physics_context, "flat_rhs_direct_support_pullback", None) is not None
+    ):
+        phase_start = time.perf_counter()
+        direct_initial_support_bars = _initial_direct_rhs_support_pullback_batched(
+            carry0=carry0,
+            carry0_bars=carry0_bars,
+            kernel_context=reverse_setup.prepared_rollout.kernel_context,
+            flat_rhs_direct_support_pullback=physics_context.flat_rhs_direct_support_pullback,
+            support_payload=support_payload,
+        )
+        direct_initial_support_bars = jax.block_until_ready(direct_initial_support_bars)
+        direct_initial_support_bar_leaves = tuple(
+            jax.tree_util.tree_leaves(direct_initial_support_bars)
+        )
+        support_bar_leaves = tuple(
+            accumulated + increment
+            for accumulated, increment in zip(
+                support_bar_leaves, direct_initial_support_bar_leaves, strict=True
+            )
+        )
+        print(
+            f"{progress_prefix} progress: support reverse initial direct-RHS support pullback ready "
+            f"elapsed_s={time.perf_counter() - phase_start:.3f}",
+            flush=True,
+        )
     phase_start = time.perf_counter()
     initial_native_ntx_elapsed = None
     initial_direct_geometry_elapsed = None
@@ -5450,6 +5503,13 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
             for objective_i in range(objective_count)
         ),
     }
+    if direct_initial_support_bar_leaves is not None:
+        component_support_bars_by_name["initial_direct_rhs"] = tuple(
+            support_treedef.unflatten(
+                [jnp.asarray(leaf)[objective_i] for leaf in direct_initial_support_bar_leaves]
+            )
+            for objective_i in range(objective_count)
+        )
     if initial_er_root_support_bars is not None:
         component_support_bars_by_name["initial_er_root"] = tuple(
             support_treedef.unflatten(

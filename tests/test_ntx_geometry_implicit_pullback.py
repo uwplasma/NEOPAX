@@ -35,6 +35,7 @@ from NEOPAX._geometry_autodiff import (
 )
 from NEOPAX._reverse_ad_transport import (
     _initial_cache_support_pullback_from_rebuild_dispatch,
+    _initial_direct_rhs_support_pullback_batched,
     _initial_lagged_response_joint_state_and_support_pullback,
     _merge_rebuild_ntx_channels_into_generic_payload_bar,
     _objective_vector_vjp_rows,
@@ -674,6 +675,28 @@ def test_black_box_direct_stage_support_uses_direct_rhs_hook_without_lagged_cach
     )
     assert jnp.allclose(result, -20.0)
     assert len(calls) == 1
+
+
+def test_black_box_initial_direct_rhs_support_contracts_each_objective():
+    """Carry-zero support uses the same stage-bar contraction as its VJP."""
+
+    carry0 = SimpleNamespace(t=jnp.asarray(1.5), y=jnp.asarray([2.0, 3.0]))
+    carry0_bars = SimpleNamespace(
+        prev_stages=jnp.asarray(
+            [
+                [[1.0, 2.0], [3.0, 4.0]],
+                [[-2.0, 1.0], [5.0, -3.0]],
+            ]
+        )
+    )
+    result = _initial_direct_rhs_support_pullback_batched(
+        carry0=carry0,
+        carry0_bars=carry0_bars,
+        kernel_context=SimpleNamespace(num_stages=2),
+        flat_rhs_direct_support_pullback=lambda _t, _y, rhs_bar, support: support * jnp.sum(rhs_bar),
+        support_payload=jnp.asarray(0.5),
+    )
+    assert jnp.allclose(result, jnp.asarray([5.0, 0.5]))
 
 
 def test_native_multi_rhs_equation_system_forwarding_hook_is_exposed_to_radau():
