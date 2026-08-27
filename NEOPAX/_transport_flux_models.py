@@ -7216,6 +7216,7 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         reuse_joint_moment_drds_jvp: bool = False,
         return_native_vmec_coefficient_bars: bool = False,
         native_vmec_coefficient_bars_only: bool = False,
+        native_vmec_direct_directional_product_rule: bool = False,
         stream_native_compact_energy: bool = False,
         return_case_bars: bool = False,
         include_second_direction_base_prepared: bool = True,
@@ -7391,6 +7392,9 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                 helper_kwargs["return_vmec_coefficient_bars"] = True
                 helper_kwargs["native_vmec_coefficient_bars_only"] = bool(
                     native_vmec_coefficient_bars_only
+                )
+                helper_kwargs["native_vmec_direct_directional_product_rule"] = bool(
+                    native_vmec_direct_directional_product_rule
                 )
             if (
                 native_factorized_ntx_rhs
@@ -7841,6 +7845,7 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         field_bars,
         return_case_bars: bool = False,
         native_vmec_coefficient_bars_only: bool = False,
+        native_vmec_direct_directional_product_rule: bool = False,
     ):
         """Return the validated native support bar plus VMEC coefficient bars.
 
@@ -7861,6 +7866,9 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             reuse_joint_moment_drds_jvp=True,
             return_native_vmec_coefficient_bars=True,
             native_vmec_coefficient_bars_only=native_vmec_coefficient_bars_only,
+            native_vmec_direct_directional_product_rule=(
+                native_vmec_direct_directional_product_rule
+            ),
             return_case_bars=return_case_bars,
             include_second_direction_base_prepared=False,
         )
@@ -12368,6 +12376,26 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             native_factorized_ntx_rhs=True,
             reuse_joint_moment_drds_jvp=True,
             return_native_vmec_coefficient_bars=True,
+        )
+
+    def pullback_build_lagged_response_support_payload_batched_interpolated_faces_native_multi_rhs_reuse_moment_drds_jvp_shared_primal_with_vmec_coefficients_direct_directional_product_rule(
+        self, state, lagged_response_bars, support,
+    ):
+        """Private opt-in forwarding the exact direct directional NTX rule.
+
+        This differs from the established VMEC-coefficient hook only in the
+        post-adjoint directional primitive contraction inside NTX.  The
+        grouped NTX solve, factorisation, matrix-RHS adjoint and coefficient
+        bridge are otherwise identical.
+        """
+        return self.pullback_build_lagged_response_support_payload_batched_interpolated_faces_multi_rhs_shared_primal(
+            state,
+            lagged_response_bars,
+            support,
+            native_factorized_ntx_rhs=True,
+            reuse_joint_moment_drds_jvp=True,
+            return_native_vmec_coefficient_bars=True,
+            native_vmec_direct_directional_product_rule=True,
         )
 
     def pullback_build_lagged_response_support_payload_batched_interpolated_faces_native_multi_rhs_compact_residual_reuse_moment_drds_jvp_shared_primal(

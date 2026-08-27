@@ -487,6 +487,7 @@ def test_native_vmec_bridge_forwards_bridge_only_flag_to_local_ntx_helper():
         _pullback_interpolated_moment_prepared_support_and_drds_only_native_multi_rhs_reuse_moment_drds_jvp_with_vmec_coefficients
     )
     assert "native_vmec_coefficient_bars_only" in inspect.signature(method).parameters
+    assert "native_vmec_direct_directional_product_rule" in inspect.signature(method).parameters
     result = method(
         _Model(),
         "prepared",
@@ -497,10 +498,12 @@ def test_native_vmec_bridge_forwards_bridge_only_flag_to_local_ntx_helper():
         field_bars="bars",
         return_case_bars=True,
         native_vmec_coefficient_bars_only=True,
+        native_vmec_direct_directional_product_rule=True,
     )
     assert result == "native-result"
     assert captured["return_native_vmec_coefficient_bars"] is True
     assert captured["native_vmec_coefficient_bars_only"] is True
+    assert captured["native_vmec_direct_directional_product_rule"] is True
     assert captured["return_case_bars"] is True
 
 

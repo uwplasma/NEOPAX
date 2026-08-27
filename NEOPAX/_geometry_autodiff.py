@@ -3205,7 +3205,6 @@ def geometry_full_ad_objective_table_pullback_from_param_vector(
     solver_device: str | None = None,
     raw_block_solve: GeometryRawBlockSolve | None = None,
     return_state_bars: bool = False,
-    progress: bool = True,
 ) -> tuple[dict[str, jnp.ndarray], object]:
     """Return geometry objective values and objective cotangents.
 
@@ -3253,12 +3252,7 @@ def geometry_full_ad_objective_table_pullback_from_param_vector(
         if tree is not None:
             _ready(tree)
         now = time.perf_counter()
-        if progress:
-            print(
-                f"[geometry-fd-ad] progress: objective_table {label} "
-                f"elapsed_s={now - phase_start:.3f}",
-                flush=True,
-            )
+        print(f"[geometry-fd-ad] progress: objective_table {label} elapsed_s={now - phase_start:.3f}", flush=True)
         phase_start = now
 
     final_mode = str(final_vmec_pullback_mode).strip().lower()

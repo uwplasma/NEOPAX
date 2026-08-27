@@ -1,19 +1,19 @@
 #!/usr/bin/env python
-"""Repeated-evaluation memory test for geometry plus initial-Er objectives.
+"""Memory test for geometry plus all four initial-Er root objective rows.
 
-This test intentionally does not call SciPy. It builds one optimizer problem,
-warms it once, and evaluates the identical parameter vector eight times while
-printing resident-memory data immediately after each completed evaluation.
+The problem is built by the matching optimization example, so it uses its
+max-Er, left/right transition, and bootstrap-current terms and root options.
+No SciPy iteration is run.
 """
 
 from __future__ import annotations
 
 import gc
 import io
+from contextlib import redirect_stdout
 from pathlib import Path
 import sys
 import time
-from contextlib import redirect_stdout
 
 import jax
 import numpy as np
@@ -23,10 +23,10 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from NEOPAX import optimization as opt  # noqa: E402
-from optimize_geometry_qi_max_er_initial_root import (  # noqa: E402
+from optimize_geometry_qi_max_er_transition_bootstrap_initial_root import (  # noqa: E402
     MAX_MODE_SCHEDULE,
     SEED_INPUT,
-    build_initial_root_problem,
+    build_transition_bootstrap_initial_root_problem,
 )
 
 
@@ -35,7 +35,7 @@ REPEATS = 8
 
 
 class QuietProblem:
-    """Suppress pre-existing reverse-AD diagnostic prints for this test only."""
+    """Suppress existing reverse-AD diagnostics only for this memory test."""
 
     def __init__(self, problem):
         self._problem = problem
@@ -49,24 +49,23 @@ class QuietProblem:
             return self._problem.evaluate(x)
 
 
+def _live_jax_array_count() -> int | None:
+    probe = getattr(jax, "live_arrays", None)
+    if probe is None:
+        return None
+    try:
+        return len(probe())
+    except Exception:
+        return None
+
+
 def main() -> int:
     if not np.isscalar(MAX_MODE_SCHEDULE):
         raise ValueError("The memory test requires one fixed MAX_MODE_SCHEDULE value.")
-    problem = build_initial_root_problem(SEED_INPUT, int(MAX_MODE_SCHEDULE))
+    problem = build_transition_bootstrap_initial_root_problem(SEED_INPUT, int(MAX_MODE_SCHEDULE))
     quiet_problem = QuietProblem(problem)
     x = np.asarray(jax.device_get(problem.x0), dtype=float)
     first_bytes: int | None = None
-
-    def live_jax_array_count() -> int | None:
-        """Count arrays retained by JAX, when supported by this JAX release."""
-
-        probe = getattr(jax, "live_arrays", None)
-        if probe is None:
-            return None
-        try:
-            return len(probe())
-        except Exception:
-            return None
 
     def report(sample) -> None:
         nonlocal first_bytes
@@ -78,7 +77,7 @@ def main() -> int:
             else (sample.resident_memory_bytes - first_bytes) / 2**20
         )
         delta_text = "unavailable" if delta_mib is None else f"{delta_mib:+.1f} MiB"
-        live_arrays = live_jax_array_count()
+        live_arrays = _live_jax_array_count()
         live_text = "unavailable" if live_arrays is None else str(live_arrays)
         print(
             f"[memory test] trial={sample.iteration} elapsed_s={sample.elapsed_s:.3f} "
@@ -88,8 +87,8 @@ def main() -> int:
         )
 
     print(
-        f"[memory test] warmup={WARMUP} repeats={REPEATS} "
-        f"parameter_count={problem.parameter_count}",
+        "[memory test] objectives=maxEr,Er_left,Er_right,J_bootstrap "
+        f"warmup={WARMUP} repeats={REPEATS} parameter_count={problem.parameter_count}",
         flush=True,
     )
     for warmup_index in range(WARMUP):

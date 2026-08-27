@@ -2566,3 +2566,129 @@ Upar-only primal into the existing scalar bootstrap reduction, then uses the
 same existing joint local state/support/geometry pullback as
 `joint_local_vjp`.  `separate` and `joint_local_vjp` remain byte-for-byte
 selection alternatives; no reverse-segment or initial-cache route is changed.
+
+### Planned exact directional native-VMEC contraction (2026-08-27)
+
+**Purpose.** Preserve the currently validated grouped NTX mode
+`ntx_batched_interpolated_faces_native_multi_rhs_reuse_moment_drds_jvp_shared_primal_with_vmec_coefficients`
+while targeting only its remaining post-adjoint compilation graph.
+
+The grouped NTX primal, factorization, matrix-RHS adjoint solve, source and
+coefficient contractions, VMEC coefficient conversion, and both low-dot
+directions are already the required mathematics and must remain unchanged.
+The good approximately `43 s` / `127 s` warm rebuild timings come from that
+structure.  This plan does **not** revisit the rejected compact-residual or
+joint-prepared selectors.
+
+The remaining candidate is the pair of directional `jax.jvp` calls through
+the native primitive-bar map.  A replacement is permitted only as an exact
+RHS-preserving contraction of the same derivative:
+
+`d[primitive_bars(nu, epsi, f, lambda, coefficient_bar)]`
+
+for each of the two existing low-dot directions.  It is not another NTX solve,
+not a change to the physical derivative, and not a VMEC equilibrium solve.
+
+Plan:
+
+1. Freeze the current selected VMEC-coefficient route as the numerical oracle,
+   including one- and three-RHS primitive bars and the final VMEC coefficient
+   channels.
+2. Enumerate every directional term in the native primitive map: fixed block
+   residual, source fields, direct transport coefficients, block-parameter
+   chain, and all VMEC sampled-field/Fourier channels.  Do not implement until
+   every term has an explicit oracle.
+3. Add a private NTX RHS-axis directional contraction that preserves the same
+   trailing RHS shape and reduction order where practical.  It must not call
+   the generic prepared VJP/JVP, add a factorization or solve, retain a primal
+   tape, or alter current selectors.
+4. Require strict small CPU equality gates against the existing current helper
+   for one and three RHS, for base and both low-dot directions, before any
+   NEOPAX dispatch is added.
+5. Only after those gates pass, add a distinct opt-in NEOPAX selector and use
+   the existing cache-disabled remote benchmark.  Accept it only if the
+   128-row derivative reference remains unchanged, compile/RAM decrease, and
+   the established warm rebuild times do not regress.  The current selector
+   remains untouched regardless of the result.
+
+**Status:** planned only.  No selector, equation, or current benchmark path
+has been modified by this plan.
+
+#### Step 1 audit: frozen oracle contract
+
+The selected native-VMEC route is now explicitly the oracle for this work;
+the new rule must match it, not the older compact-residual experiment.  Its
+existing no-rollout gates cover:
+
+* each individual low-dot response channel (`transport_moments`,
+  `dtransport_moments_d_er`, and `dtransport_moments_d_log_nu_star`) against
+  the ordinary `prepare_monoenergetic_system` VJP;
+* the physical `Er * drds -> epsi_hat` case chain;
+* complete face-anchor/species/objective accumulation against the generic
+  prepared-VJP route; and
+* the final VMEC coefficient tangent contraction, including `b0`.
+
+The direct NTX component tests additionally freeze the fixed block residual,
+block-parameter, source, and direct transport-coefficient contractions for
+one and three RHS.  These are the reference terms for the next derivation.
+No new selector is enabled at this stage.
+
+#### Step 2 audit: complete directional primitive inventory
+
+The two current directional calculations are JVPs of the same fixed-geometry
+map, with differentiable arguments
+`(nu_hat, epsi_hat, f1_full, f3_full, lambda1, lambda3, coefficient_bar)`.
+`prepared.surface`, `prepared.geometry`, the grid, and the VMEC
+sampled-field-to-Fourier map are fixed in those JVPs.  Consequently the exact
+replacement has the following finite inventory:
+
+1. **Fixed residual blocks.** Differentiate the bilinear
+   `-lambda.T @ A @ f` contribution with respect to both primal fields and
+   both adjoint fields.  Preserve the existing mode-zero nullspace row.
+2. **Block-parameter chain.** Apply the already direct
+   coefficient-to-parameter transpose to the directional block bars, plus its
+   explicit `epsi_hat` derivative in the diagonal theta/zeta coefficients.
+3. **Fixed residual sources.** Differentiate the two source bars with respect
+   to `lambda1` and `lambda3` only.
+4. **Direct transport coefficients.** Differentiate their fixed-mode
+   primitive bars with respect to `f1`, `f3`, `nu_hat`, and
+   `coefficient_bar`, including `b0`, `volume_prime`, `b2_mean`, and radial
+   drift contributions.
+5. **VMEC conversion.** Sum the preceding primitive directional bars first,
+   then apply the existing linear sampled-field/Fourier transpose once.  This
+   conversion has no directional geometry input in the current JVP, so it is
+   not itself differentiated.
+
+There is no hidden NTX factorization, implicit solve, generic prepared VJP,
+or VMEC equilibrium derivative in this inventory.  The next implementation
+must cover all five items; implementing only the block residual would change
+the derivative and is therefore forbidden.
+
+#### Step 3 implementation status: private direct product rule
+
+NTX now has the private helper
+`_directional_native_vmec_coefficient_bars_from_fixed_adjoint_multi_rhs_direct`.
+It leaves the existing JVP helper intact as the oracle and does not change any
+public API or NEOPAX selector.  Its construction is restricted to direct
+product rules: two bilinear block contractions, the explicit epsilon block
+term, directional sources, and fixed-mode direct-coefficient contributions,
+followed by one existing VMEC conversion.  It does not factorize or solve an
+NTX system.
+
+The corresponding one-/three-RHS NTX unit gate compares this direct result to
+the existing JVP helper.  Syntax parsing and whitespace checks pass locally.
+The local WSL service denied test-instance creation in this session, but the
+same CPU gate completed on the external checkout:
+`2 passed, 85 deselected in 9.62s`.  No production benchmark, dump, profile,
+or cache operation was run.
+
+#### Opt-in wiring status
+
+The NTX helper now accepts the private static flag
+`native_vmec_direct_directional_product_rule`.  With the flag false (the
+default), it follows the existing JVP route unchanged.  With it true, it uses
+the direct primitive contraction for both low-dot directions but retains the
+same combined VMEC conversion.  A second one-/three-RHS NTX gate compares the
+complete high-level native helper with this flag on and off.  The NEOPAX local
+model adapter forwards the same private flag, but no reverse selector or CLI
+mode has been added yet: passing the high-level NTX gate is required first.
