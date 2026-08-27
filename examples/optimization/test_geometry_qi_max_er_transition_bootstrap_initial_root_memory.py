@@ -67,22 +67,44 @@ class EvaluationStructureCounter:
     def __init__(self) -> None:
         self.raw_block_solve_calls = 0
         self.selected_root_calls = 0
+        self.checkpoint_rss_bytes: dict[str, int | None] = {}
 
     def reset(self) -> None:
         self.raw_block_solve_calls = 0
         self.selected_root_calls = 0
+        self.checkpoint_rss_bytes = {}
 
-    def context(self):
+    def context(self, *, checkpoints: bool = False):
         raw_block_solve = reverse_optimization.geometry_raw_block_solve_from_param_vector
         selected_root = reverse_optimization.initial_er_selected_root_profile
+        payload_builder = reverse_optimization.build_neopax_geometry_and_ntx_exact_lij_support_from_state
+        payload_pullback = reverse_optimization.realtime_geometry_transport_reverse_table_from_payload_cotangents
+
+        def record(name: str) -> None:
+            if checkpoints:
+                self.checkpoint_rss_bytes[name] = opt._process_resident_memory_bytes()
 
         def count_raw_block_solve(*args, **kwargs):
             self.raw_block_solve_calls += 1
-            return raw_block_solve(*args, **kwargs)
+            result = raw_block_solve(*args, **kwargs)
+            record("raw_block_solve")
+            return result
 
         def count_selected_root(*args, **kwargs):
             self.selected_root_calls += 1
-            return selected_root(*args, **kwargs)
+            result = selected_root(*args, **kwargs)
+            record("selected_root")
+            return result
+
+        def count_payload_builder(*args, **kwargs):
+            result = payload_builder(*args, **kwargs)
+            record("geometry_ntx_payload")
+            return result
+
+        def count_payload_pullback(*args, **kwargs):
+            result = payload_pullback(*args, **kwargs)
+            record("payload_to_vmec")
+            return result
 
         return (
             patch.object(
@@ -94,6 +116,16 @@ class EvaluationStructureCounter:
                 reverse_optimization,
                 "initial_er_selected_root_profile",
                 count_selected_root,
+            ),
+            patch.object(
+                reverse_optimization,
+                "build_neopax_geometry_and_ntx_exact_lij_support_from_state",
+                count_payload_builder,
+            ),
+            patch.object(
+                reverse_optimization,
+                "realtime_geometry_transport_reverse_table_from_payload_cotangents",
+                count_payload_pullback,
             ),
         )
 
@@ -165,6 +197,14 @@ def main() -> int:
             "after every measured evaluation."
         ),
     )
+    parser.add_argument(
+        "--diagnose-checkpoints",
+        action="store_true",
+        help=(
+            "Report the RSS delta immediately after the existing raw VMEC solve, "
+            "geometry/NTX payload build, selected root, and payload-to-VMEC pullback."
+        ),
+    )
     args = parser.parse_args()
     if args.warmup < 0 or args.repeats < 1:
         raise ValueError("--warmup must be non-negative and --repeats must be positive.")
@@ -179,6 +219,7 @@ def main() -> int:
     quiet_problem = QuietProblem(problem)
     x = np.asarray(jax.device_get(problem.x0), dtype=float)
     first_bytes: int | None = None
+    first_checkpoint_bytes: dict[str, int | None] = {}
     structure_counter = EvaluationStructureCounter()
 
     def report(sample) -> None:
@@ -206,6 +247,27 @@ def main() -> int:
             ),
             flush=True,
         )
+        if args.diagnose_checkpoints:
+            checkpoint_text = []
+            for name in (
+                "raw_block_solve",
+                "geometry_ntx_payload",
+                "selected_root",
+                "payload_to_vmec",
+            ):
+                checkpoint_bytes = structure_counter.checkpoint_rss_bytes.get(name)
+                if name not in first_checkpoint_bytes:
+                    first_checkpoint_bytes[name] = checkpoint_bytes
+                base_bytes = first_checkpoint_bytes[name]
+                if checkpoint_bytes is None or base_bytes is None:
+                    value = "unavailable"
+                else:
+                    value = f"{(checkpoint_bytes - base_bytes) / 2**20:+.1f}"
+                checkpoint_text.append(f"{name}={value}MiB")
+            print(
+                "[memory test] checkpoint_rss_delta " + " ".join(checkpoint_text),
+                flush=True,
+            )
 
     print(
         f"[memory test] mode={args.mode} objectives=maxEr,Er_left,Er_right,J_bootstrap "
@@ -221,7 +283,11 @@ def main() -> int:
         print(f"[memory test] warmup={warmup_index} starting", flush=True)
         started = time.perf_counter()
         structure_counter.reset()
-        patchers = structure_counter.context() if args.diagnose_structure else ()
+        patchers = (
+            structure_counter.context(checkpoints=args.diagnose_checkpoints)
+            if args.diagnose_structure or args.diagnose_checkpoints
+            else ()
+        )
         for patcher in patchers:
             patcher.start()
         try:
@@ -237,10 +303,10 @@ def main() -> int:
             f"elapsed_s={time.perf_counter() - started:.3f}",
             flush=True,
         )
-    if args.diagnose_structure:
+    if args.diagnose_structure or args.diagnose_checkpoints:
         for iteration in range(args.repeats):
             structure_counter.reset()
-            patchers = structure_counter.context()
+            patchers = structure_counter.context(checkpoints=args.diagnose_checkpoints)
             for patcher in patchers:
                 patcher.start()
             try:
