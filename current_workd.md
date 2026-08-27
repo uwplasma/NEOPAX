@@ -2744,6 +2744,7 @@ Plan:
    regression of the grouped warm timings.
 
 **Implementation status:** the NTX CPU oracle passed for one and three RHS
-(`2 passed`).  A separate opt-in NEOPAX selector is now being wired; the
-selected fast path remains unchanged.  Its remaining gates are a mock
-NEOPAX dispatch test, then one remote cache-disabled comparison.
+(`2 passed`), and the NEOPAX mock dispatch gate passed (`2 passed`).  The new
+selector retains the existing direct directional contraction as well as the
+new exact coefficient contraction.  The selected fast path remains unchanged.
+The next gate is one remote cache-disabled comparison.

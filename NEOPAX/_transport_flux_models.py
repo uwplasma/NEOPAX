@@ -12613,9 +12613,9 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         """Opt-in exact replacement of the upstream coefficient VJP/JVP pair.
 
         The grouped primal, NTX factorisation, matrix-RHS adjoints and native
-        VMEC bridge are identical to the validated selector.  Only the
-        coefficient-to-retained-mode transpose and its low-dot tangent use
-        NTX's direct RHS-axis algebra.
+        VMEC bridge are identical to the validated fast selector.  This keeps
+        its post-adjoint direct directional contractions and additionally
+        replaces the earlier coefficient-to-retained-mode VJP/JVP nest.
         """
         return self.pullback_build_lagged_response_support_payload_batched_interpolated_faces_multi_rhs_shared_primal(
             state,
@@ -12624,6 +12624,7 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             native_factorized_ntx_rhs=True,
             reuse_joint_moment_drds_jvp=True,
             return_native_vmec_coefficient_bars=True,
+            native_vmec_direct_directional_product_rule=True,
             native_direct_coefficient_pullback=True,
         )
 
