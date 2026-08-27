@@ -1385,6 +1385,87 @@ def test_tagged_realtime_payload_round_trips_live_ntx_scan_model():
     assert actual.models.flux.database is new_database
 
 
+def test_live_ntx_scan_payload_rebuild_keeps_channel_jvp(monkeypatch):
+    """A support payload regenerates the database through the live NTX seam."""
+
+    @dataclasses.dataclass(frozen=True)
+    class _FakeScan:
+        rho: object
+        nu_v: object
+        Er: object
+        drds: object
+        D11: object
+        D13: object
+        D33: object
+        Er_tilde: object = None
+        Er_to_Ertilde: object = None
+        dr_tildedr: object = None
+        dr_tildeds: object = None
+        a_b: object = None
+        psia: object = None
+        b00: object = None
+        r00: object = None
+        boozer_i: object = None
+        boozer_g: object = None
+        iota: object = None
+        fac_reference_to_sfincs_11: object = None
+        fac_reference_to_sfincs_31: object = None
+        fac_reference_to_sfincs_33: object = None
+        fac_monkes_to_sfincs_11: object = None
+        fac_monkes_to_sfincs_31: object = None
+        fac_monkes_to_sfincs_33: object = None
+        fac_sfincs_to_dkes_11: object = None
+        fac_sfincs_to_dkes_31: object = None
+        fac_sfincs_to_dkes_33: object = None
+        fac_dkes_to_d11star: object = None
+        fac_dkes_to_d31star: object = None
+        fac_dkes_to_d33star: object = None
+
+    class _FakeNTX:
+        class GridSpec:
+            def __init__(self, **kwargs):
+                self.__dict__.update(kwargs)
+
+        @staticmethod
+        def build_ntx_neopax_scan_from_surfaces(surfaces, *, rho, nu_v, Er, drds, **kwargs):
+            assert len(surfaces) == int(rho.shape[0])
+            shape = (rho.shape[0], nu_v.shape[0], Er.shape[1])
+            return _FakeScan(
+                rho=rho,
+                nu_v=nu_v,
+                Er=Er,
+                drds=drds,
+                D11=jnp.broadcast_to(drds[:, None, None], shape),
+                D13=jnp.broadcast_to(2.0 * drds[:, None, None], shape),
+                D33=jnp.ones(shape),
+            )
+
+    monkeypatch.setattr("NEOPAX._transport_flux_models._import_ntx", lambda: _FakeNTX)
+    surfaces = (object(), object())
+    channels = _tiny_ntx_runtime_channels([0.25, 0.5])
+    model = build_ntx_runtime_scan_transport_model(
+        species="species", energy_grid="grid", geometry="geometry",
+        vmec_file=None, boozer_file=None,
+        ntx_scan_rho=[0.25, 0.5], ntx_scan_nu_v=[1.0e-4, 1.0e-3],
+        ntx_scan_er_tilde=[0.0, 1.0e-4], ntx_scan_channels=channels,
+        ntx_scan_surfaces=surfaces, prebuild_database=False,
+    )
+
+    def _database_from_ab(a_b):
+        updated_channels = dataclasses.replace(channels, a_b=a_b)
+        return model.with_support_payload(
+            {"geometry": "geometry", "channels": updated_channels, "surfaces": surfaces}
+        ).database
+
+    database, tangent = jax.jvp(
+        lambda a_b: _database_from_ab(a_b).Er_list,
+        (jnp.asarray(2.0),),
+        (jnp.asarray(0.2),),
+    )
+    assert jnp.all(jnp.isfinite(database))
+    assert jnp.allclose(tangent, -0.2 / (2.0 * jnp.log(10.0)))
+
+
 def test_ntx_runtime_scan_database_keeps_radius_local_er_axis():
     scan = types.SimpleNamespace(
         rho=jnp.asarray([0.25, 0.5]),

@@ -68,6 +68,7 @@ FTOL = 1.0e-6
 XTOL = 1.0e-10
 GEOMETRY_MAX_ITER = None
 SOLVER_DEVICE = "default"
+REVERSE_STAGE_MODE = "off"
 ROOT_OPTIONS = {
     "Er_transition_left_index": ER_TRANSITION_LEFT_INDEX,
     "Er_transition_right_index": ER_TRANSITION_RIGHT_INDEX,
@@ -107,6 +108,7 @@ def build_transition_bootstrap_initial_root_problem(vmec_input, max_mode: int):
         geometry_solver_device=SOLVER_DEVICE,
         device=SOLVER_DEVICE,
         root_options=ROOT_OPTIONS,
+        reverse_stage_mode=REVERSE_STAGE_MODE,
     )
 
 

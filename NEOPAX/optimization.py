@@ -329,6 +329,7 @@ class GeometryInitialErRootLeastSquaresProblem:
     geometry_solver_device: str | None = "default"
     root_options: Mapping[str, object] | None = None
     raw_block_stage: object | None = None
+    reverse_stage_mode: str = "off"
 
     @property
     def parameter_count(self) -> int:
@@ -1251,6 +1252,7 @@ def geometry_initial_er_root_only_least_squares_problem(
     geometry_solver_device: str | None = "default",
     device: str | None = "default",
     root_options: Mapping[str, object] | None = None,
+    reverse_stage_mode: str = "off",
 ) -> GeometryInitialErRootLeastSquaresProblem:
     """Build an optimizer problem for geometry terms plus initial-Er root terms.
 
@@ -1258,6 +1260,15 @@ def geometry_initial_er_root_only_least_squares_problem(
     least-squares terms in the optimization script, while this helper owns the
     transport runtime setup and validated reverse-table calls.
     """
+
+    mode = str(reverse_stage_mode).strip().lower()
+    if mode not in {"off", "vmex_like"}:
+        raise ValueError("reverse_stage_mode must be 'off' or 'vmex_like'.")
+    if mode != "off":
+        raise NotImplementedError(
+            "reverse_stage_mode='vmex_like' is not available until both the "
+            "initial-root and payload-to-VMEC persistent operators are installed."
+        )
 
     config_eff = _prepare_initial_er_root_config(config, device=device, vmec_input=vmec_input)
     geom_cfg = config_eff.get("geometry", {})
@@ -1358,6 +1369,7 @@ def geometry_initial_er_root_only_least_squares_problem(
         geometry_solver_device=geometry_solver_device,
         root_options=None if root_options is None else dict(root_options),
         raw_block_stage=raw_block_stage,
+        reverse_stage_mode=mode,
     )
 
 

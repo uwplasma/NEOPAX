@@ -513,8 +513,19 @@ def test_native_vmec_bridge_forwards_bridge_only_flag_to_local_ntx_helper():
         NTXExactLijRuntimeTransportModel.
         _pullback_interpolated_moment_prepared_support_and_drds_only_native_multi_rhs_reuse_moment_drds_jvp_with_vmec_coefficients
     )
+    # This is the next hop used by the selected direct-directional rebuild
+    # mode.  Keep the keyword at this boundary: otherwise the failure occurs
+    # only after the expensive Radau reverse-segment trace has started.
+    batched_method = (
+        NTXExactLijRuntimeTransportModel.
+        pullback_build_lagged_response_support_payload_batched_interpolated_faces_multi_rhs_shared_primal
+    )
     assert "native_vmec_coefficient_bars_only" in inspect.signature(method).parameters
     assert "native_vmec_direct_directional_product_rule" in inspect.signature(method).parameters
+    assert (
+        "native_vmec_direct_directional_product_rule"
+        in inspect.signature(batched_method).parameters
+    )
     result = method(
         _Model(),
         "prepared",
