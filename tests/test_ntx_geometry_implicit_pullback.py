@@ -648,7 +648,7 @@ def test_black_box_direct_stage_support_uses_direct_rhs_hook_without_lagged_cach
 
     def _direct_hook(t_value, flat_y, rhs_bar, support):
         calls.append((t_value, flat_y, rhs_bar, support))
-        return rhs_bar * support
+        return jnp.sum(rhs_bar) * support
 
     kernel = SimpleNamespace(
         num_stages=1,
