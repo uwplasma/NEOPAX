@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import gc
 import io
+import argparse
 from contextlib import redirect_stdout
 from pathlib import Path
 import sys
@@ -23,6 +24,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from NEOPAX import optimization as opt  # noqa: E402
+import optimize_geometry_qi_max_er_transition_bootstrap_initial_root as example  # noqa: E402
 from optimize_geometry_qi_max_er_transition_bootstrap_initial_root import (  # noqa: E402
     MAX_MODE_SCHEDULE,
     SEED_INPUT,
@@ -60,9 +62,17 @@ def _live_jax_array_count() -> int | None:
 
 
 def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--mode", choices=("off", "vmex_like"), default="off")
+    args = parser.parse_args()
     if not np.isscalar(MAX_MODE_SCHEDULE):
         raise ValueError("The memory test requires one fixed MAX_MODE_SCHEDULE value.")
-    problem = build_transition_bootstrap_initial_root_problem(SEED_INPUT, int(MAX_MODE_SCHEDULE))
+    previous_mode = example.REVERSE_STAGE_MODE
+    try:
+        example.REVERSE_STAGE_MODE = args.mode
+        problem = build_transition_bootstrap_initial_root_problem(SEED_INPUT, int(MAX_MODE_SCHEDULE))
+    finally:
+        example.REVERSE_STAGE_MODE = previous_mode
     quiet_problem = QuietProblem(problem)
     x = np.asarray(jax.device_get(problem.x0), dtype=float)
     first_bytes: int | None = None
@@ -87,7 +97,7 @@ def main() -> int:
         )
 
     print(
-        "[memory test] objectives=maxEr,Er_left,Er_right,J_bootstrap "
+        f"[memory test] mode={args.mode} objectives=maxEr,Er_left,Er_right,J_bootstrap "
         f"warmup={WARMUP} repeats={REPEATS} parameter_count={problem.parameter_count}",
         flush=True,
     )
