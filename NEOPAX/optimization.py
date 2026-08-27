@@ -42,6 +42,7 @@ from ._reverse_ad_optimization import (
     evaluate_geometry_initial_er_root_only_least_squares_benchmark_tables,
     evaluate_geometry_initial_er_root_only_least_squares_optimization,
     geometry,
+    normalize_least_squares_terms,
     normalize_transport_objective_names,
     realtime_geometry_transport_reverse_table_request,
     geometry_full_ad_reverse_table,
@@ -1344,9 +1345,10 @@ def geometry_initial_er_root_only_least_squares_problem(
     )
     optimization_stage_layout = None
     if mode == "vmex_like":
+        normalized_stage_terms = normalize_least_squares_terms(terms)
         optimization_stage_layout = initial_root_stage_layout(
             config=config_eff,
-            objective_names=tuple(term.objective.name for term in terms),
+            objective_names=tuple(term.objective.name for term in normalized_stage_terms),
             geometry_param_specs=tuple(spec.as_tuple() for spec in geometry_parameterization.specs),
             n_r=n_r,
             n_theta=n_theta,
