@@ -699,6 +699,53 @@ def test_black_box_initial_direct_rhs_support_contracts_each_objective():
     assert jnp.allclose(result, jnp.asarray([5.0, 0.5]))
 
 
+def test_black_box_exact_direct_support_split_matches_generic_payload_vjp():
+    """The exact split is a partition of the generic support VJP.
+
+    The geometry leg is deliberately evaluated with ``ntx_support`` held
+    fixed.  This small analytic owner proves both the equality and the
+    no-double-count contract without a transport rollout or an NTX solve.
+    """
+
+    class _ExactFluxOwner:
+        def __call__(self, _state):
+            return jnp.asarray(3.0)
+
+        def pullback_direct_rhs_support_payload(self, _state, flux_bar, _support):
+            # Exact NTX support contribution only: 2 * ntx_support.
+            return 2.0 * flux_bar
+
+    equations = object.__new__(ComposedEquationSystem)
+    object.__setattr__(equations, "shared_flux_model", _ExactFluxOwner())
+    object.__setattr__(equations, "_prepare_working_state", lambda state: (state, None))
+    object.__setattr__(equations, "pullback_shared_fluxes", lambda _state, _fluxes, rhs_bar: rhs_bar)
+    seen_payloads = []
+
+    def _rebuild(payload):
+        seen_payloads.append(payload)
+        # This represents the direct equation geometry term plus the exact
+        # NTX response supplied separately by the owner above.
+        return lambda _t, _state, _runtime: payload["geometry"] + 2.0 * payload["ntx_support"]
+
+    object.__setattr__(equations, "with_realtime_geometry_support_payload", _rebuild)
+    support = {"geometry": jnp.asarray(5.0), "ntx_support": jnp.asarray(7.0)}
+    actual = equations.pullback_direct_rhs_support_payload(
+        jnp.asarray(0.0), None, None, jnp.asarray(11.0), support
+    )
+    _, generic_pullback = jax.vjp(
+        lambda geometry, ntx_support: geometry + 2.0 * ntx_support,
+        support["geometry"],
+        support["ntx_support"],
+    )
+    expected_geometry, expected_ntx_support = generic_pullback(jnp.asarray(11.0))
+    assert jnp.allclose(actual["geometry"], expected_geometry)
+    assert jnp.allclose(actual["ntx_support"], expected_ntx_support)
+    assert all(
+        jnp.array_equal(payload["ntx_support"], support["ntx_support"])
+        for payload in seen_payloads
+    )
+
+
 def test_native_multi_rhs_equation_system_forwarding_hook_is_exposed_to_radau():
     """The real Radau vector-field owner forwards the native hook once."""
 

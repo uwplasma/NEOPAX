@@ -1628,7 +1628,12 @@ class ComposedEquationSystem:
         exact_pullback = getattr(
             self.shared_flux_model, "pullback_direct_rhs_support_payload", None
         )
-        if callable(exact_pullback) and isinstance(support, dict) and "ntx_support" in support:
+        if (
+            callable(exact_pullback)
+            and isinstance(support, dict)
+            and "geometry" in support
+            and "ntx_support" in support
+        ):
             working_state, _ = self._prepare_working_state(state)
             shared_fluxes = self.shared_flux_model(working_state)
             flux_bar = self.pullback_shared_fluxes(state, shared_fluxes, rhs_bar)

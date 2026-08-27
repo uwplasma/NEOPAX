@@ -899,11 +899,23 @@ class CombinedTransportFluxModel(TransportFluxModelBase):
         return out
 
     def pullback_direct_rhs_support_payload(self, state, flux_bar, support):
+        """Return the neoclassical direct-support bar for a black-box RHS.
+
+        ``support`` is a live payload, so its response must be built by the
+        payload-owning neoclassical model too.  Building it through ``self``
+        would accidentally use the composite's original (static) support for
+        the interpolation primal while differentiating the supplied payload.
+        """
         pullback_fn = getattr(self.neoclassical_model, "pullback_direct_rhs_support_payload", None)
         if not callable(pullback_fn):
             return None
-        response = self.build_lagged_response(state)
-        response_bar = self.pullback_evaluate_with_lagged_response(
+        replace_payload = getattr(self.neoclassical_model, "with_support_payload", None)
+        if not callable(replace_payload):
+            return None
+        payload_model = replace_payload(support)
+        composite = dataclasses.replace(self, neoclassical_model=payload_model)
+        response = composite.build_lagged_response(state)
+        response_bar = composite.pullback_evaluate_with_lagged_response(
             state, response, flux_bar
         )
         return pullback_fn(state, response_bar.neoclassical_response, support)
