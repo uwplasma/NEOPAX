@@ -2709,3 +2709,40 @@ adjoint, native VMEC bridge, direct geometry contribution, and existing
 selectors are unchanged. The next gates are the CPU mock dispatch test and a
 remote cache-disabled AD/timing comparison. It is not yet an accepted
 performance mode.
+
+### Planned exact coefficient-transpose contraction (2026-08-27)
+
+**Base:** retain the derivative-validated grouped native selector and its
+matrix-RHS factorized NTX adjoint.  Do not alter any existing selector.
+
+The direct directional VMEC primitive rule removed only the *post-adjoint*
+JVP.  Its remote timing did not materially reduce compilation.  A subsequent
+three-pass audit found an earlier, distinct nested AD region in the same
+selected helper:
+
+1. base coefficient bars use `vmap(_coefficient_mode_pullback)`, where the
+   scalar helper is a generic VJP of `coefficients_from_modes`;
+2. each of the two low-dot directions applies `jax.jvp` through that generic
+   VJP, again under an RHS `vmap`.
+
+This occurs before construction of the matrix-RHS adjoint fields.  It is not
+the rejected outer segment branching, static schedule, compact residual,
+prepared payload, or VMEC primitive experiment.
+
+Plan:
+
+1. Add private, RHS-preserving exact formulas for the transpose of the five
+   transport coefficients with respect to retained `f1`, `f3`, and `nu_hat`.
+2. Add its exact low-dot product rule.  The mode-field tangents are zero at
+   this level because this *transpose* is independent of the primal modes;
+   the only physical tangent is the explicit `nu_hat**-1` Spitzer term.
+3. Verify one- and three-RHS base and directional values against the existing
+   generic VJP/JVP oracle on a tiny CPU system.
+4. Only after that gate passes, thread a private NTX flag through the native
+   helper, add a distinct NEOPAX selector, and request one remote benchmark.
+   Promotion requires unchanged derivative table, lower compile/RAM, and no
+   regression of the grouped warm timings.
+
+**Implementation status:** steps 1--2 are now private NTX code only.  The
+selected NEOPAX path is unchanged.  The CPU oracle gate is the next required
+step before any selector or benchmark command exists.
