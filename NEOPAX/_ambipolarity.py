@@ -1271,13 +1271,7 @@ def register_ambipolarity_model(name: str, func):
     AMBIPOLARITY_MODEL_REGISTRY[str(name).strip().lower()] = func
 
 
-def _ambipolarity_local_charge_flux_setup(
-    state,
-    params,
-    flux_model,
-    amb_cfg=None,
-    local_particle_flux_evaluator=None,
-):
+def _ambipolarity_local_charge_flux_setup(state, params, flux_model, amb_cfg=None):
     """Return common local ambipolar residual closures for JAX radial root solves."""
     import dataclasses
 
@@ -1297,13 +1291,11 @@ def _ambipolarity_local_charge_flux_setup(
             skip_axis_root = False
 
     flux_mode = _normalize_ambipolar_flux_mode(amb_cfg, params)
-    local_particle_flux = None
-    if flux_mode == "ambipolar_local":
-        local_particle_flux = (
-            local_particle_flux_evaluator
-            if local_particle_flux_evaluator is not None
-            else flux_model.build_local_particle_flux_evaluator(state)
-        )
+    local_particle_flux = (
+        flux_model.build_local_particle_flux_evaluator(state)
+        if flux_mode == "ambipolar_local"
+        else None
+    )
 
     def _evaluate_gamma_and_entropy(i, er):
         if local_particle_flux is not None:
@@ -1336,16 +1328,7 @@ def _ambipolarity_local_charge_flux_setup(
     return n_radial, skip_axis_root, local_particle_flux, gamma_func_factory, entropy_func_factory
 
 
-def solve_ambipolarity_roots_radial_jax(
-    state,
-    config,
-    params,
-    model_name,
-    flux_model,
-    entropy_model,
-    amb_cfg,
-    local_particle_flux_evaluator=None,
-):
+def solve_ambipolarity_roots_radial_jax(state, config, params, model_name, flux_model, entropy_model, amb_cfg):
     """JAX-returning ambipolar root solve for AD benchmark boundaries.
 
     This mirrors the full radial vmap path used by ``solve_ambipolarity_roots_radial``
@@ -1382,13 +1365,7 @@ def solve_ambipolarity_roots_radial_jax(
         _local_particle_flux,
         gamma_func_factory,
         entropy_func_factory,
-    ) = _ambipolarity_local_charge_flux_setup(
-        state,
-        params,
-        flux_model,
-        amb_cfg,
-        local_particle_flux_evaluator=local_particle_flux_evaluator,
-    )
+    ) = _ambipolarity_local_charge_flux_setup(state, params, flux_model, amb_cfg)
     del _local_particle_flux
 
     root_finder = AMBIPOLARITY_MODEL_REGISTRY.get(str(model_name).strip().lower())

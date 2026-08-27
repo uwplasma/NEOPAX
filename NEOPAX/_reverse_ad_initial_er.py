@@ -52,20 +52,7 @@ def initial_er_root_setup(config: dict, runtime):
     return amb_cfg, model_name, entropy_model, params
 
 
-def _initial_er_local_particle_flux_evaluator(state, *, runtime, stage=None):
-    """Return staged or legacy local particle-flux evaluation for root AD."""
-
-    if stage is None:
-        return runtime.models.flux.build_local_particle_flux_evaluator(state)
-    stage.validate_runtime(runtime)
-    return stage.adapter.local_particle_flux_evaluator(
-        state,
-        geometry=runtime.geometry,
-        support=find_ntx_support_payload(runtime),
-    )
-
-
-def initial_er_selected_root_profile(state, *, config: dict, runtime, stage=None):
+def initial_er_selected_root_profile(state, *, config: dict, runtime):
     """Return the selected ambipolar Er profile and finite-root mask."""
 
     amb_cfg, model_name, entropy_model, params = initial_er_root_setup(config, runtime)
@@ -77,27 +64,18 @@ def initial_er_selected_root_profile(state, *, config: dict, runtime, stage=None
         flux_model=runtime.models.flux,
         entropy_model=entropy_model,
         amb_cfg=amb_cfg,
-        local_particle_flux_evaluator=_initial_er_local_particle_flux_evaluator(
-            state,
-            runtime=runtime,
-            stage=stage,
-        ),
     )
     best_roots = jnp.asarray(best_roots, dtype=state.Er.dtype)
     finite_mask = jnp.isfinite(best_roots)
     return jnp.where(finite_mask, best_roots, state.Er), finite_mask
 
 
-def initial_er_charge_flux_residuals(state, er_profile, *, runtime, stage=None):
+def initial_er_charge_flux_residuals(state, er_profile, *, runtime):
     """Return charge-weighted particle-flux residuals at the selected root."""
 
     charge_qp = jnp.asarray(runtime.species.charge_qp)
     state_with_er = dataclasses.replace(state, Er=er_profile)
-    local_particle_flux = _initial_er_local_particle_flux_evaluator(
-        state_with_er,
-        runtime=runtime,
-        stage=stage,
-    )
+    local_particle_flux = runtime.models.flux.build_local_particle_flux_evaluator(state_with_er)
     if local_particle_flux is None:
         raise ValueError("Initial-Er root AD requires a local particle-flux evaluator.")
 
@@ -109,23 +87,19 @@ def initial_er_charge_flux_residuals(state, er_profile, *, runtime, stage=None):
     return jax.lax.map(_residual_i, indices)
 
 
-def initial_er_charge_flux_residual_scalar(state, er_profile, radius_index, *, runtime, stage=None):
+def initial_er_charge_flux_residual_scalar(state, er_profile, radius_index, *, runtime):
     """Return one scalar charge-flux residual for compact transposition."""
 
     charge_qp = jnp.asarray(runtime.species.charge_qp)
     state_with_er = dataclasses.replace(state, Er=er_profile)
-    local_particle_flux = _initial_er_local_particle_flux_evaluator(
-        state_with_er,
-        runtime=runtime,
-        stage=stage,
-    )
+    local_particle_flux = runtime.models.flux.build_local_particle_flux_evaluator(state_with_er)
     if local_particle_flux is None:
         raise ValueError("Initial-Er root AD requires a local particle-flux evaluator.")
     gamma = local_particle_flux(radius_index, er_profile[radius_index])
     return jnp.sum(charge_qp * gamma)
 
 
-def initial_er_charge_flux_residual_er_derivative(state, er_profile, *, runtime, stage=None):
+def initial_er_charge_flux_residual_er_derivative(state, er_profile, *, runtime):
     """Return d residual / d Er at each radius for selected-root AD."""
 
     charge_qp = jnp.asarray(runtime.species.charge_qp)
@@ -134,11 +108,7 @@ def initial_er_charge_flux_residual_er_derivative(state, er_profile, *, runtime,
     def _residual_i_er(i, er_value):
         er_eval = er_profile.at[i].set(er_value)
         state_with_er = dataclasses.replace(state, Er=er_eval)
-        local_particle_flux = _initial_er_local_particle_flux_evaluator(
-            state_with_er,
-            runtime=runtime,
-            stage=stage,
-        )
+        local_particle_flux = runtime.models.flux.build_local_particle_flux_evaluator(state_with_er)
         if local_particle_flux is None:
             raise ValueError("Initial-Er root AD requires a local particle-flux evaluator.")
         gamma = local_particle_flux(i, er_value)
@@ -221,6 +191,28 @@ def find_database_payload_in_model(model):
             if found is not None:
                 return found
     return None
+
+
+def realtime_geometry_payload_for_runtime(runtime):
+    """Return the additive tagged geometry payload for a supported runtime.
+
+    This is intentionally not yet consumed by the established exact reverse
+    setup.  It gives database reverse setup a pure model capability boundary
+    without changing the legacy exact payload shape.
+    """
+
+    database = find_database_payload_in_model(runtime.models.flux)
+    if database is not None:
+        return {
+            "kind": "ntx_database",
+            "geometry": runtime.geometry,
+            "database": database,
+        }
+    return {
+        "kind": "ntx_exact",
+        "geometry": runtime.geometry,
+        "ntx_support": find_ntx_support_payload(runtime),
+    }
 
 
 def runtime_with_geometry_payload(runtime, geometry):

@@ -16,7 +16,10 @@ from NEOPAX._orchestrator import (
     Models,
     RuntimeContext,
 )
-from NEOPAX._reverse_ad_initial_er import runtime_with_geometry_payload
+from NEOPAX._reverse_ad_initial_er import (
+    realtime_geometry_payload_for_runtime,
+    runtime_with_geometry_payload,
+)
 from NEOPAX._monoenergetic import (
     MONOENERGETIC_KIND_GENERIC,
     MONOENERGETIC_KIND_PREPROCESSED_3D_NTSS1D_FIXED,
@@ -964,6 +967,35 @@ def test_runtime_geometry_replacement_rebuilds_database_scale():
         actual.models.flux.database.Er_list,
         database.Er_list + jnp.log10(0.5),
     )
+
+
+def test_realtime_geometry_payload_tags_database_without_exact_support_lookup():
+    database = Monoenergetic(
+        a_b=jnp.asarray(2.0),
+        rho=jnp.asarray([0.1, 0.3, 0.6, 0.9, 1.0]),
+        nu_log=jnp.asarray([-2.0]),
+        Er_list=jnp.asarray([[1.0]] * 5),
+        D11_log=jnp.zeros((5, 1, 1)),
+        D13=jnp.zeros((5, 1, 1)),
+        D33=jnp.zeros((5, 1, 1)),
+    )
+    geometry = types.SimpleNamespace(a_b=jnp.asarray(2.0))
+    model = NTXDatabaseTransportModel("species", "grid", geometry, database)
+    runtime = RuntimeContext(
+        species="species",
+        energy_grid="grid",
+        geometry=geometry,
+        database=database,
+        solver_parameters={},
+        models=Models(flux=model),
+    )
+
+    actual = realtime_geometry_payload_for_runtime(runtime)
+
+    assert actual["kind"] == "ntx_database"
+    assert actual["geometry"] is geometry
+    assert actual["database"] is database
+    assert "ntx_support" not in actual
 
 
 def test_monoenergetic_interpolation_kernel_defaults_to_generic():

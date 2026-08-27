@@ -1393,7 +1393,6 @@ def geometry_active_initial_er_root_only_reverse_table(
     raw_block_solve=None,
     support_payload_override=None,
     options: Mapping[str, object] | None = None,
-    reverse_stage=None,
 ) -> ObjectiveTableResult:
     """Return compact initial-Er objective table for active realtime geometry.
 
@@ -1474,7 +1473,6 @@ def geometry_active_initial_er_root_only_reverse_table(
             pre_root_state,
             config=dict(config),
             runtime=runtime_for_geometry,
-            stage=reverse_stage,
         )
         er_profile = jnp.asarray(er_profile, dtype=pre_root_state.Er.dtype)
         finite_mask = jnp.asarray(finite_mask, dtype=bool)
@@ -1551,7 +1549,6 @@ def geometry_active_initial_er_root_only_reverse_table(
             pre_root_state,
             er_profile,
             runtime=runtime_for_geometry,
-            stage=reverse_stage,
         )
         safe_dres_der = jnp.where(
             jnp.abs(dres_der) > jnp.asarray(1.0e-30, dtype=dres_der.dtype),
@@ -1564,15 +1561,7 @@ def geometry_active_initial_er_root_only_reverse_table(
             0.0,
         )
         state_residual_bars = compact_initial_er_state_pullback(
-            residual_scalar_fn=lambda state_value, er_value, radius_index, *, runtime: (
-                initial_er_charge_flux_residual_scalar(
-                    state_value,
-                    er_value,
-                    radius_index,
-                    runtime=runtime,
-                    stage=reverse_stage,
-                )
-            ),
+            residual_scalar_fn=initial_er_charge_flux_residual_scalar,
             state=pre_root_state,
             er_profile=er_profile,
             residual_bars=residual_bars,
@@ -1611,7 +1600,6 @@ def geometry_active_initial_er_root_only_reverse_table(
                 pre_root_state,
                 er_profile,
                 runtime=runtime_with_geometry,
-                stage=reverse_stage,
             )
 
         _, geometry_residual_pullback = jax.vjp(
@@ -2121,7 +2109,6 @@ def evaluate_geometry_initial_er_root_only_least_squares_benchmark_tables(
     geometry_solver_device: str | None = "default",
     root_options: Mapping[str, object] | None = None,
     raw_block_stage=None,
-    reverse_stage=None,
 ) -> LeastSquaresEvaluation:
     """Evaluate mixed objectives using only benchmark-validated table backends."""
 
@@ -2193,7 +2180,6 @@ def evaluate_geometry_initial_er_root_only_least_squares_benchmark_tables(
                 progress_label="[optimization] initial-Er root geometry payload pullback:",
                 raw_block_solve=shared_raw_block_solve,
                 options=root_runner_options,
-                reverse_stage=reverse_stage,
             )
             transport_values, transport_jacobian = jax.block_until_ready(
                 (transport_result.values, transport_result.jacobian)

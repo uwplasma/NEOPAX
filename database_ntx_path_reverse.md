@@ -55,6 +55,9 @@ close.
 * Step 1 / scale-only portion of step 2 is implemented locally: generic and
   preprocessed table objects now have a pure `a_b` replacement helper, and
   `runtime_with_geometry_payload()` uses it for `NTXDatabaseTransportModel`.
+* The tagged runtime-payload selector is also implemented locally but is not
+  connected to the exact reverse setup yet; it identifies database runtime
+  payloads without attempting an exact-NTX support lookup.
 * It deliberately does not yet route database configurations through the
   reverse setup.  That remains behind the small-oracle tests below.
 * `preprocessed_ntss` is explicitly unsupported for realtime replacement

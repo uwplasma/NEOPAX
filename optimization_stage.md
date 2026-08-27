@@ -1,209 +1,123 @@
-# Persistent reverse-AD stage for optimization
+# Optimization-stage plan: existing payload boundaries only
 
-## Purpose
+## Goal
 
-Stop the observed per-evaluation RSS growth in NEOPAX optimization runs while
-preserving the existing reverse-AD equations, numerical results, and
-benchmark-good reverse route.
+Eliminate a sustained RSS increase across NEOPAX least-squares evaluations
+without changing the established reverse-AD mathematics, numerical benchmark
+results, forward solvers, initial-Er root solve, or NTX exact-Lij flux model.
 
-This is deliberately **not** an optimizer-wide fused JIT.  It follows the
-useful VMEX principle: create bounded residual/reverse kernels once per
-optimization stage, then pass changing numerical inputs to those kernels on
-each least-squares evaluation.
-
-The first implementation scope is the already implemented
-`ntx_exact_lij_runtime` reverse-AD path and the geometry + initial-Er-root
-objectives:
-
-- maximum Er;
-- left and right Er transition objectives;
-- bootstrap current;
-- geometry objectives in the same least-squares problem.
-
-Full time-evolved transport is a later phase of this same design.  It must not
-be implemented by reusing an initial-root-only kernel in a different
-mathematical context.
-
-## Non-negotiable invariants
-
-1. Geometry is evaluated once per transport/root evaluation and its result is
-   shared by all geometry and initial-root residuals.
-2. The staged and unstaged routes use the same equations and reverse payload
-   assembly.  This work does not alter reverse-AD mathematics or target
-   numerical values.
-3. The benchmark-good public route remains the reference:
-
-   ```text
-   geometry_active_initial_er_root_only_reverse_table
-     -> realtime_geometry_transport_reverse_table_from_payload_cotangents
-     -> realtime_geometry_payload_pullback_result
-   ```
-
-4. Normal reverse-AD benchmarks retain their current behavior when no stage is
-   supplied.  They must not silently opt into a different derivative path.
-5. There is one source of truth for transport, ambipolarity, and payload
-   reverse mathematics.  Do not create copied optimization-only physics
-   functions.
-6. A model whose reverse-AD adapter has not been implemented must fail clearly.
-   It must never silently fall back to another model or derivative route.
-
-## Why a stage is needed
-
-Current initial-root residual helpers call
-`build_local_particle_flux_evaluator(state_with_er)`.  The resulting local
-function captures the changing state in a Python/JAX closure.  Repeating this
-construction inside reverse transformations can retain new native compiled or
-AD-executable state per least-squares evaluation.
-
-Wrapping that existing closure in a larger `jax.jit` is not a solution: it
-would still capture a different state per evaluation and can create an even
-larger graph.  Nor is the plan to rewrite every custom VJP as `jax.grad`.
-
-Instead, the few repeated reverse boundaries must expose pure functions with
-explicit numerical inputs, for example:
-
-```python
-local_charge_residual(
-    transport_state, er_profile, support_payload, static_model_data
-) -> residual
-```
-
-The stage owns bounded JVP/VJP/Jacobian kernels for these functions.  Changing
-DoFs, profiles, Er, VMEC state, or Radau acceptance masks is data flowing into
-an existing kernel; it does not create a new stage.
-
-## Model selection and adapter boundary
-
-Introduce a private `TransportReverseStageAdapter` protocol.  Adapter choice
-is made once, during construction of the optimization stage, from the TOML
-selected flux model and its static layout.
-
-Initial registry behavior:
+The reference route is the existing benchmark route:
 
 ```text
-ntx_exact_lij_runtime -> ExactLijReverseStageAdapter
-ntx_database          -> clear NotImplementedError until its AD path exists
-ntx_runtime_scan      -> clear NotImplementedError until its AD path exists
-other model           -> clear NotImplementedError
+geometry_active_initial_er_root_only_reverse_table
+  -> realtime_geometry_transport_reverse_table_from_payload_cotangents
+  -> realtime_geometry_payload_pullback_result
+  -> geometry_payload_pullback_from_param_vector_raw_block_transpose
+  -> VMEC raw-block transpose
 ```
 
-This distinction is essential.  `NTXExactLijRuntimeSupport` and
-`compact_initial_er_ntx_support_pullback_leaves` are exact-Lij-specific;
-database and runtime-scan models use different local evaluator/support
-construction.  They must later receive dedicated adapters which implement the
-same protocol, not be forced through the exact-Lij payload type.
+## Fixed rules
 
-The protocol has separate entry points for:
+1. Initial-Er root solving and `build_local_particle_flux_evaluator` are not
+   changed.  No JIT, adapter, or alternate function is inserted below the
+   existing payload-cotangent boundary.
+2. The exact NTX-Lij flux equations and all forward transport solver code are
+   not changed.
+3. The benchmark's existing NTX-support/geometry pullback and VMEC raw-block
+   transpose remain the only reverse boundaries that staging may touch.
+4. The default benchmark path is literally the pre-stage call path.  It does
+   not receive a stage argument, wrapper, lambda, or changed closure.
+5. Geometry is solved exactly once per mixed geometry + initial-root
+   evaluation and shared by all objective rows.
+6. A stage may retain static configuration and compiled boundary executables;
+   it may never retain a trial's VMEC state, payload cotangents, numerical VJP
+   pullback, rooted state, or optimizer DoFs.
 
-- initial-Er root local residual and its compact reverse contribution;
-- full transport vector-field/support work and its reverse contribution;
-- static metadata used to key/validate the stage.
+## Actual boundary to stage
 
-Sharing static model data or cached kernels between these operations is fine.
-Sharing an initial-root mathematical kernel with full transport is not.
+The transport-specific heavy work is the NTX-support state pullback assembled
+inside `geometry_payload_pullback_from_param_vector_raw_block_transpose`, in
+particular the `ntx_support` branch of
+`_state_bar_batch_from_payload_branch`.  That branch maps the existing
+support-payload cotangent rows back to VMEC-state rows, then the existing VMEC
+raw-block transpose maps those rows to geometry DoFs.
 
-## Public API shape
+The initial-root calculation only supplies payload cotangents to this path. It
+is not a staging boundary.
 
-Keep the existing reverse entry points and add an optional private stage
-argument at their narrowest useful boundary:
+## Stage shape
 
-```python
-geometry_active_initial_er_root_only_reverse_table(..., stage=None)
-evaluate_geometry_initial_er_root_only_least_squares_benchmark_tables(..., stage=None)
-realtime_geometry_transport_reverse_table_from_payload_cotangents(..., stage=None)
-realtime_geometry_payload_pullback_result(..., stage=None)
+`GeometryPayloadPullbackStage` is built once when the geometry + initial-root
+least-squares problem is built.  It contains only:
+
+- geometry context and fixed VMEC parameter layout;
+- the existing `GeometryRawBlockStage` configuration;
+- fixed grid/resolution/model configuration selected before the run;
+- a bounded cache of existing payload-boundary executables keyed only by the
+  structural payload layout and active-leaf signature.
+
+It does not select a new physics model or alter TOML/CLI modes.  TOML and the
+existing CLI/config preparation choose the model, derivative options, root
+method, and solver settings exactly as before.
+
+For each trial, the staged boundary receives dynamically:
+
+```text
+VMEC state / raw-block solve
+payload cotangent rows
+geometry DoF vector
 ```
 
-`stage=None` takes the present implementation route.  A supplied stage invokes
-the selected adapter only at the repeated residual/payload boundary; it does
-not replace the outer reverse-table assembly.
+It returns the same VMEC-state cotangent rows and applies the same existing
+raw-block transpose.  A numerical VJP pullback is rebuilt for the current
+primal values as required for correctness; only executable/static-function
+lifecycle may be reused.
 
-The optimization problem builds one `GeometryTransportReverseStage` once per
-optimization stage and passes it to evaluations.  The stage is private
-optimization lifecycle machinery, not a second physics implementation.
+## Implementation order
 
-## Implementation phases
+1. Restore and lock the old root/flux/default benchmark path.  This is a
+   prerequisite, not a compatibility branch.
+2. Extract only the current `ntx_support` payload-state pullback setup into a
+   private helper with explicit arguments for the current VMEC state and
+   batched payload cotangent leaves.  Copy no physics formula and do not alter
+   the existing custom-VJP rule; move the existing boundary as-is.
+3. Add `GeometryPayloadPullbackStage` around that helper.  Its optional
+   compiled boundary uses the same existing payload pullback rule and has only
+   structural/static closure inputs.
+4. Thread the optional stage only through
+   `realtime_geometry_payload_pullback_result` and
+   `geometry_payload_pullback_from_param_vector_raw_block_transpose`.
+   No root/flux function signature changes.
+5. Make optimization explicitly opt in to the stage.  Benchmark scripts keep
+   the pre-stage route by default.  Do not auto-enable a stage from objective
+   type.
+6. Verify staged versus unstaged objective values, payload gradients, and
+   geometry Jacobian rows for max-Er, Er-left, Er-right, and bootstrap current.
+7. Only after equality checks pass, use one large-machine repeated-evaluation
+   run to check cold compile time, warm time, and RSS slope.
 
-### Phase 1 — map and freeze the exact-Lij boundary
+## TOML/CLI behavior
 
-1. Record the exact current call chain for the four initial-root objectives.
-2. Identify every state-capturing evaluator/VJP construction within that
-   chain, separately from the existing compact exact-Lij payload pullback.
-3. Add equality tests for residuals and Jacobian rows at representative
-   parameter vectors before changing behavior.
+The stage is a lifecycle setting, not a physics setting.  It must be enabled
+explicitly by the optimization caller (eventually an optimization CLI option)
+and must use the already resolved TOML/CLI configuration.  The initial scope
+requires the existing `ntx_exact_lij_runtime` payload route.  If a selected
+model has no established equivalent payload reverse boundary, stage creation
+must fail clearly rather than switch models or equations.
 
-### Phase 2 — pure exact-Lij adapter operations
+## Full transport later
 
-1. Add exact-Lij adapter operations accepting state, Er, support, and other
-   changing values explicitly.
-2. Make these operations call the existing exact-Lij flux/root mathematics;
-   do not duplicate formulas or alter root selection rules.
-3. Keep the current state-capturing helper as the unstaged compatibility path
-   until staged/unstaged agreement is verified.
+Full Radau transport is out of scope until the geometry + initial-root stage
+is correct.  Its adaptive accepted-step count is represented by masks inside a
+fixed `max_total_steps` scan, so it can later use a stage with the same
+principle: fixed structural configuration, dynamic numerical state/masks, and
+only its already benchmarked custom-VJP/payload boundaries.
 
-### Phase 3 — persistent bounded kernels
+## Acceptance criteria
 
-1. Implement `GeometryTransportReverseStage` with the exact-Lij adapter and
-   static configuration validation.
-2. Create the bounded residual and reverse kernels once at stage construction.
-3. Ensure DoFs and all changing numerical values are dynamic array inputs.
-4. Do not place the entire SciPy least-squares loop, geometry solve, or all
-   optimization iterations inside one JIT.
-
-### Phase 4 — integrate the initial-root least-squares route
-
-1. Thread the optional stage through the existing benchmark-good reverse table
-   route.
-2. Construct the stage once in the geometry + initial-Er-root least-squares
-   problem.
-3. Preserve the existing one shared raw geometry solve for mixed geometry and
-   root objectives.
-4. Leave benchmark callers unstaged by default.
-
-### Phase 5 — validate exact-Lij initial-root optimization
-
-Before requesting a user-scale optimization run, perform local small-scope
-comparisons of staged and unstaged results:
-
-- objective/residual values;
-- Jacobian rows and selected directional derivatives;
-- payload cotangents where exposed;
-- one cold-stage compile time and repeated warm evaluation time.
-
-Then run one four-objective repeated-evaluation acceptance test.  Report RSS
-after each evaluation, but treat the result as an acceptance criterion rather
-than a diagnostic detour.  Acceptance requires no sustained material RSS slope
-after warmup and agreement within established derivative tolerances.
-
-## Full transport extension
-
-The Radau implementation uses a fixed-size `lax.scan(max_total_steps)` with
-`active_mask` and `accepted_mask`.  Therefore a different number of accepted
-steps is dynamic data and does not, by itself, require a new stage or
-compilation.
-
-When extending to full transport:
-
-1. add a full-transport entry point to the exact-Lij adapter;
-2. use the same static-stage key, including solver layout and
-   `max_total_steps`;
-3. keep adaptive acceptance/failure masks dynamic;
-4. compare staged and unstaged full-transport reverse outputs before enabling
-   staged optimization;
-5. later add database and runtime-scan adapters only after their own
-   reverse-AD implementations and benchmark comparisons exist.
-
-## Performance and correctness expectations
-
-- Normal benchmark path: no expected compilation or execution change when
-  `stage=None`.
-- Staged optimization path: a deliberate one-time compile/setup cost per
-  static stage is expected.
-- Warm staged evaluations should avoid repeated graph/executable retention;
-  this is the memory objective, not a guaranteed speedup.
-- A changed TOML static configuration (model kind, grid/layout/species,
-  solver shape, or `max_total_steps`) creates a new stage before a run.
-- Changed optimization DoFs, profiles, Er values, VMEC state, and accepted-step
-  count must not create a new stage.
-- Any change that would alter benchmark derivative values or reverse-AD
-  mathematics requires explicit review before implementation.
+- no root, flux, forward-solver, or benchmark-default-path change;
+- staged/unstaged residuals and Jacobian rows agree within existing benchmark
+  tolerances;
+- one shared geometry solve per transport evaluation;
+- no sustained post-warmup RSS growth in the four-objective acceptance run;
+- cold compilation and warm execution are reported separately.
