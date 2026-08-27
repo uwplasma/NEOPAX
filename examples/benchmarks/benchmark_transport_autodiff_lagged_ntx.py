@@ -47,7 +47,11 @@ import NEOPAX
 from NEOPAX._constants import elementary_charge
 from NEOPAX._orchestrator import build_runtime_context, prepare_transport_solver_components, run_transport
 from NEOPAX._profiles import AnalyticalProfileModel
-from NEOPAX._transport_flux_models import DENSITY_STATE_TO_PHYSICAL, PRESSURE_SOURCE_STATE_TO_MW_M3
+from NEOPAX._transport_flux_models import (
+    DENSITY_STATE_TO_PHYSICAL,
+    PRESSURE_SOURCE_STATE_TO_MW_M3,
+    compute_net_total_power_volume_average_mw_m3,
+)
 from NEOPAX._transport_solvers import (
     _RadauAcceptedStepAttemptContext,
     _extract_fixed_temperature_projection,
@@ -88,7 +92,7 @@ ALLOWED_PARAMETERS = {"n0", "T0", "density_shape_power", "temperature_shape_powe
 PROFILE_VECTOR_PARAMETERS = ("n0", "T0", "density_shape_power", "temperature_shape_power")
 OBJECTIVE_LABELS = [
     "softmax_Er",
-    "smooth_root_proxy",
+    "net_total_power_volume_average_mw_m3",
     "Er_transition_left",
     "Er_transition_right",
     "Er2_volume_average",
@@ -290,6 +294,16 @@ def _alpha_power_volume_average(final_state, runtime) -> jax.Array:
     return _volume_average(alpha_mw_m3, runtime.geometry)
 
 
+def _net_total_power_volume_average(final_state, runtime) -> jax.Array:
+    source_models = runtime.models.source or {}
+    pressure_source_model = source_models.get("temperature") if isinstance(source_models, dict) else None
+    return compute_net_total_power_volume_average_mw_m3(
+        final_state,
+        pressure_source_model,
+        runtime.geometry,
+    )
+
+
 def _electron_temperature_volume_average(final_state, runtime) -> jax.Array:
     species_idx = getattr(runtime.species, "species_idx", {})
     electron_idx = species_idx.get("e", 0)
@@ -338,7 +352,6 @@ def _bootstrap_current_softmax_abs_scaled(
 
 def _objective_vector(final_state, runtime) -> jax.Array:
     er = jnp.asarray(final_state.Er)
-    rho = jnp.asarray(runtime.geometry.rho_grid, dtype=er.dtype)
     transition_left = er[max(0, min(20, int(er.shape[-1]) - 1))]
     transition_right = er[max(0, min(21, int(er.shape[-1]) - 1))]
     er2_vol = _volume_average(er * er, runtime.geometry)
@@ -350,7 +363,7 @@ def _objective_vector(final_state, runtime) -> jax.Array:
     return jnp.stack(
         [
             _softmax_objective(er),
-            _smooth_root_proxy(er, rho),
+            _net_total_power_volume_average(final_state, runtime),
             transition_left,
             transition_right,
             er2_vol,

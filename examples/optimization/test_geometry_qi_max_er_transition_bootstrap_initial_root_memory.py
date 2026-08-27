@@ -14,6 +14,7 @@ import argparse
 from dataclasses import replace
 from contextlib import redirect_stdout
 import ctypes
+import importlib
 import os
 from pathlib import Path
 import sys
@@ -69,17 +70,20 @@ class EvaluationStructureCounter:
         self.raw_block_solve_calls = 0
         self.selected_root_calls = 0
         self.checkpoint_rss_bytes: dict[str, int | None] = {}
+        self.vmex_jit_cache_sizes: dict[str, int | None] = {}
 
     def reset(self) -> None:
         self.raw_block_solve_calls = 0
         self.selected_root_calls = 0
         self.checkpoint_rss_bytes = {}
+        self.vmex_jit_cache_sizes = {}
 
     def context(
         self,
         *,
         checkpoints: bool = False,
         optimization_raw_block_stage=None,
+        vmex_cache_sizes: bool = False,
     ):
         raw_block_solve = reverse_optimization.geometry_raw_block_solve_from_param_vector
         selected_root = reverse_optimization.initial_er_selected_root_profile
@@ -90,12 +94,29 @@ class EvaluationStructureCounter:
             if checkpoints:
                 self.checkpoint_rss_bytes[name] = opt._process_resident_memory_bytes()
 
+        def record_vmex_cache_sizes(implicit) -> None:
+            if not vmex_cache_sizes:
+                return
+            module_name = f"{implicit.__name__.rsplit('.', 1)[0]}.solver"
+            try:
+                solver = importlib.import_module(module_name)
+            except (ImportError, AttributeError):
+                return
+            for name in ("_block_lane", "_while_lane"):
+                cache_size = getattr(getattr(solver, name, None), "_cache_size", None)
+                if callable(cache_size):
+                    try:
+                        self.vmex_jit_cache_sizes[name] = int(cache_size())
+                    except Exception:
+                        self.vmex_jit_cache_sizes[name] = None
+
         def count_raw_block_solve(*args, **kwargs):
             self.raw_block_solve_calls += 1
             if optimization_raw_block_stage is not None:
                 kwargs["stage"] = optimization_raw_block_stage.raw_block_stage
                 kwargs["solve_with_aux_runner"] = optimization_raw_block_stage.solve_with_aux_runner
             result = raw_block_solve(*args, **kwargs)
+            record_vmex_cache_sizes(result.implicit)
             record("raw_block_solve")
             return result
 
@@ -222,6 +243,11 @@ def main() -> int:
             "Benchmark/default evaluations remain eager and unchanged."
         ),
     )
+    parser.add_argument(
+        "--diagnose-vmex-caches",
+        action="store_true",
+        help="Report VMEX solver JIT trace-cache sizes after each raw-block solve.",
+    )
     args = parser.parse_args()
     if args.warmup < 0 or args.repeats < 1:
         raise ValueError("--warmup must be non-negative and --repeats must be positive.")
@@ -294,6 +320,12 @@ def main() -> int:
                 "[memory test] checkpoint_rss_delta " + " ".join(checkpoint_text),
                 flush=True,
             )
+        if args.diagnose_vmex_caches:
+            entries = " ".join(
+                f"{name}={value if value is not None else 'unavailable'}"
+                for name, value in sorted(structure_counter.vmex_jit_cache_sizes.items())
+            )
+            print(f"[memory test] vmex_jit_cache_sizes {entries or 'unavailable'}", flush=True)
 
     print(
         f"[memory test] mode={args.mode} objectives=maxEr,Er_left,Er_right,J_bootstrap "
@@ -315,8 +347,14 @@ def main() -> int:
             structure_counter.context(
                 checkpoints=args.diagnose_checkpoints,
                 optimization_raw_block_stage=optimization_raw_block_stage,
+                vmex_cache_sizes=args.diagnose_vmex_caches,
             )
-            if args.diagnose_structure or args.diagnose_checkpoints or args.persistent_raw_solve_jit
+            if (
+                args.diagnose_structure
+                or args.diagnose_checkpoints
+                or args.diagnose_vmex_caches
+                or args.persistent_raw_solve_jit
+            )
             else ()
         )
         for patcher in patchers:
@@ -334,12 +372,18 @@ def main() -> int:
             f"elapsed_s={time.perf_counter() - started:.3f}",
             flush=True,
         )
-    if args.diagnose_structure or args.diagnose_checkpoints or args.persistent_raw_solve_jit:
+    if (
+        args.diagnose_structure
+        or args.diagnose_checkpoints
+        or args.diagnose_vmex_caches
+        or args.persistent_raw_solve_jit
+    ):
         for iteration in range(args.repeats):
             structure_counter.reset()
             patchers = structure_counter.context(
                 checkpoints=args.diagnose_checkpoints,
                 optimization_raw_block_stage=optimization_raw_block_stage,
+                vmex_cache_sizes=args.diagnose_vmex_caches,
             )
             for patcher in patchers:
                 patcher.start()

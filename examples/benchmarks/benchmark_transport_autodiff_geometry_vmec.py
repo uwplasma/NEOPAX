@@ -176,7 +176,7 @@ def main() -> None:
     else:
         labels = [
             "softmax_Er",
-            "smooth_root_proxy",
+            "net_total_power_volume_average_mw_m3",
             "Er2_volume_average",
             "Er_volume_average",
             "electron_temperature_volume_average_keV",
