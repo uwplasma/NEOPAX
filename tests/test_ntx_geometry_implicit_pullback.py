@@ -26,6 +26,7 @@ from NEOPAX._transport_solvers import (
     _flat_rhs_build_support_pullback_batched_interpolated_faces_factory,
     _flat_rhs_state_and_lagged_response_pullback_factory,
     _lagged_response_build_state_and_support_pullback_batched_interpolated_faces_hook,
+    _radau_exact_stage_residual_support_pullback,
     _radau_prepare_lagged_response_with_compact_coefficient_record,
 )
 from NEOPAX._geometry_autodiff import (
@@ -597,6 +598,82 @@ def test_native_multi_rhs_reused_drds_composite_forwarding_hook_is_exposed_to_ra
         "state", response, "support", ignored_outer_keyword=True,
     ) == "reused-drds-result"
     assert calls == [("state", "ntx-bars", "support")]
+
+
+def test_black_box_direct_support_replacement_dispatches_only_payload_owner():
+    """Direct black-box support preserves unrelated composite submodels.
+
+    This is deliberately a dataclass-only gate: it validates the capability
+    dispatch without constructing a transport rollout, VMEC surface, or NTX
+    solve.
+    """
+
+    @dataclasses.dataclass(frozen=True)
+    class _PayloadOwner:
+        payload: object = None
+
+        def with_support_payload(self, payload):
+            return dataclasses.replace(self, payload=payload)
+
+    @dataclasses.dataclass(frozen=True)
+    class _Passive:
+        label: str
+
+    @dataclasses.dataclass(frozen=True)
+    class _Composite:
+        neoclassical_model: object
+        turbulent_model: object
+        classical_model: object
+
+    original = _Composite(_PayloadOwner(), _Passive("turb"), _Passive("classical"))
+    scan_payload = {"geometry": "g", "channels": "c", "surfaces": "s"}
+    scan_replaced = ComposedEquationSystem._flux_model_with_realtime_support_payload(
+        original, scan_payload
+    )
+    assert scan_replaced.neoclassical_model.payload is scan_payload
+    assert scan_replaced.turbulent_model is original.turbulent_model
+    assert scan_replaced.classical_model is original.classical_model
+
+    exact_payload = {"geometry": "g", "ntx_support": "prepared-support"}
+    exact_replaced = ComposedEquationSystem._flux_model_with_realtime_support_payload(
+        original, exact_payload
+    )
+    assert exact_replaced.neoclassical_model.payload == "prepared-support"
+
+
+def test_black_box_direct_stage_support_uses_direct_rhs_hook_without_lagged_cache():
+    """A one-stage mock proves black-box support is no longer silently zero."""
+
+    calls = []
+
+    def _direct_hook(t_value, flat_y, rhs_bar, support):
+        calls.append((t_value, flat_y, rhs_bar, support))
+        return rhs_bar * support
+
+    kernel = SimpleNamespace(
+        num_stages=1,
+        state_dim=1,
+        dtype=jnp.float64,
+        c=jnp.asarray([0.0]),
+        a=jnp.asarray([[0.0]]),
+    )
+    physics = SimpleNamespace(flat_rhs_direct_support_pullback=_direct_hook)
+    carry = SimpleNamespace(t=jnp.asarray(2.0), y=jnp.asarray([7.0]))
+    primal = SimpleNamespace(
+        stage_history=jnp.asarray([0.0]),
+        trial_dt=jnp.asarray(3.0),
+    )
+    result = _radau_exact_stage_residual_support_pullback(
+        kernel,
+        physics,
+        carry,
+        primal,
+        None,
+        jnp.asarray([5.0]),
+        jnp.asarray(4.0),
+    )
+    assert jnp.allclose(result, -20.0)
+    assert len(calls) == 1
 
 
 def test_native_multi_rhs_equation_system_forwarding_hook_is_exposed_to_radau():

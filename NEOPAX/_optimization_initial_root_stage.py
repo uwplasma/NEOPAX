@@ -63,10 +63,10 @@ def initial_root_stage_layout(
     return InitialRootStageLayout(
         objective_names=tuple(str(name) for name in objective_names),
         geometry_param_specs=tuple(tuple(spec) for spec in geometry_param_specs),
-        n_r=int(n_r),
-        n_theta=int(n_theta),
-        n_zeta=int(n_zeta),
-        n_xi=int(n_xi),
+        n_r=-1 if n_r is None else int(n_r),
+        n_theta=-1 if n_theta is None else int(n_theta),
+        n_zeta=-1 if n_zeta is None else int(n_zeta),
+        n_xi=-1 if n_xi is None else int(n_xi),
         surface_backend=str(surface_backend),
         flux_model=flux_model,
     )

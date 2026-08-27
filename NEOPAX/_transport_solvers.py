@@ -1125,6 +1125,15 @@ def _lagged_response_eval_support_pullback_hook(vector_field: Callable):
     return pullback_fn if callable(pullback_fn) else None
 
 
+def _direct_rhs_support_pullback_hook(vector_field: Callable):
+    """Optional direct-RHS support transpose for black-box transport."""
+    owner = getattr(vector_field, "__self__", None)
+    if owner is None:
+        return None
+    pullback_fn = getattr(owner, "pullback_direct_rhs_support_payload", None)
+    return pullback_fn if callable(pullback_fn) else None
+
+
 def _lagged_response_eval_all_pullback_hook(vector_field: Callable):
     owner = getattr(vector_field, "__self__", None)
     if owner is None:
@@ -1670,6 +1679,28 @@ def _flat_rhs_lagged_response_support_pullback_factory(unravel, vector_field, ar
             rhs_bar=rhs_bar_state,
             support=support,
             **kwargs,
+        )
+
+    return _pullback
+
+
+def _flat_rhs_direct_support_pullback_factory(
+    unravel, vector_field, args, kwargs, project_flat=None
+):
+    """Flatten the owner-level black-box support transpose."""
+    pullback_fn = _direct_rhs_support_pullback_hook(vector_field)
+    if pullback_fn is None:
+        return None
+    unravel_bar = getattr(unravel, "cotangent", unravel)
+
+    def _pullback(t_value, flat_y, rhs_bar_flat, support):
+        projected_flat_y = _project_flat_state_if_needed(flat_y, project_flat)
+        state_y = unravel(projected_flat_y)
+        rhs_bar_state = unravel_bar(
+            jnp.asarray(rhs_bar_flat, dtype=jnp.asarray(flat_y).dtype)
+        )
+        return pullback_fn(
+            t_value, state_y, *args, rhs_bar=rhs_bar_state, support=support, **kwargs
         )
 
     return _pullback
@@ -3881,6 +3912,7 @@ class _RadauAcceptedStepPhysicsContext:
     flat_rhs_build_state_and_ntx_support_pullback_batched_interpolated_faces_native_multi_rhs_reuse_moment_drds_jvp_shared_primal_with_vmec_coefficients: Callable[[Any, Any, Any], Any] | None = None
     flat_rhs_build_state_and_ntx_support_pullback_batched_interpolated_faces_native_multi_rhs_reuse_moment_drds_jvp_shared_primal_with_vmec_coefficients_no_prepared_carry: Callable[[Any, Any, Any], Any] | None = None
     flat_rhs_lagged_response_support_pullback: Callable[[Any, Any, Any, Any, Any], Any] | None = None
+    flat_rhs_direct_support_pullback: Callable[[Any, Any, Any, Any], Any] | None = None
     flat_rhs_lagged_response_all_pullback: Callable[[Any, Any, Any, Any, Any], tuple[Any, Any, Any]] | None = None
     flat_rhs_state_and_lagged_response_pullback: Callable[[Any, Any, Any, Any], tuple[Any, Any]] | None = None
     flat_rhs_state_pullback: Callable[[Any, Any, Any, Any], Any] | None = None
@@ -5475,9 +5507,6 @@ def _execute_radau_accepted_step_next_reduced_cotangent_bwd_with_support(
             physics_context.project_flat,
             physics_context.build_lagged_response,
         )
-    if lagged_response is None:
-        return reduced_bar, _radau_zero_support_delta_tree_like(support)
-
     trial_y_bar = next_reduced_bar.y
     if physics_context.project_flat is not None:
         _, project_pullback = jax.vjp(physics_context.project_flat, primal_result.trial_y)
@@ -5590,9 +5619,6 @@ def _execute_radau_accepted_step_support_cotangent_bwd(
         physics_context.project_flat,
         physics_context.build_lagged_response,
     )
-    if lagged_response is None:
-        return _radau_zero_support_delta_tree_like(support)
-
     trial_y_bar = next_reduced_bar.y
     if physics_context.project_flat is not None:
         _, project_pullback = jax.vjp(physics_context.project_flat, primal_result.trial_y)
@@ -6181,11 +6207,31 @@ def _execute_radau_accepted_step_next_reduced_cotangent_batched_bwd_with_support
             carry_in,
             next_reduced_bars,
         )
-        zero_support_leaves = tuple(
-            jnp.broadcast_to(jnp.asarray(leaf)[None, ...], (objective_count,) + jnp.asarray(leaf).shape)
-            for leaf in jax.tree_util.tree_leaves(zero_support_bar)
-        )
-        return reduced_bars, (*zero_support_leaves, *native_vmec_zero_leaves)
+        if physics_context.flat_rhs_direct_support_pullback is None:
+            support_bar_leaves = tuple(
+                jnp.broadcast_to(
+                    jnp.asarray(leaf)[None, ...],
+                    (objective_count,) + jnp.asarray(leaf).shape,
+                )
+                for leaf in jax.tree_util.tree_leaves(zero_support_bar)
+            )
+        else:
+            support_bar_leaves = jax.vmap(
+                lambda next_reduced_bar: tuple(
+                    jax.tree_util.tree_leaves(
+                        _execute_radau_accepted_step_support_cotangent_bwd(
+                            kernel_context,
+                            physics_context,
+                            context,
+                            lagged_response_branch,
+                            carry_in,
+                            next_reduced_bar,
+                            support,
+                        )
+                    )
+                )
+            )(next_reduced_bars)
+        return reduced_bars, (*support_bar_leaves, *native_vmec_zero_leaves)
 
     trial_y_bars = jnp.asarray(next_reduced_bars.y, dtype=kernel_context.dtype)
     if physics_context.project_flat is not None:
@@ -9203,11 +9249,7 @@ def _radau_exact_stage_residual_support_pullback(
 ):
     """Cotangent wrt realtime NTX support from RHS evaluations in one Radau step."""
 
-    if (
-        lagged_response is None
-        or support is None
-        or physics_context.flat_rhs_lagged_response_support_pullback is None
-    ):
+    if support is None:
         return _radau_zero_support_delta_tree_like(support)
 
     residual_stages = jnp.asarray(residual_bar, dtype=kernel_context.dtype).reshape(
@@ -9216,6 +9258,37 @@ def _radau_exact_stage_residual_support_pullback(
     stages_final = primal_result.stage_history.reshape((kernel_context.num_stages, kernel_context.state_dim))
     stage_times = carry_in.t + kernel_context.c * primal_result.trial_dt
     stage_states = carry_in.y[None, :] + primal_result.trial_dt * (kernel_context.a @ stages_final)
+
+    # Black-box transport has no lagged cache to transpose.  Its support
+    # dependence is instead in the direct RHS itself.  Keep this branch
+    # isolated so the established fixed-lagged transpose remains unchanged.
+    if lagged_response is None:
+        if physics_context.flat_rhs_direct_support_pullback is None:
+            return _radau_zero_support_delta_tree_like(support)
+
+        def _direct_stage_support_pullback(accumulated_bar, stage_inputs):
+            t_eval, y_eval, rhs_bar_eval = stage_inputs
+            stage_support_bar = _radau_sanitize_support_delta_bar_tree(
+                support,
+                physics_context.flat_rhs_direct_support_pullback(
+                    t_eval, y_eval, -rhs_bar_eval, support
+                ),
+            )
+            return _radau_add_support_delta_trees(
+                accumulated_bar, stage_support_bar, support
+            ), None
+
+        support_bar0 = _radau_zero_support_delta_tree_like(support)
+        support_bar, _ = jax.lax.scan(
+            _direct_stage_support_pullback,
+            support_bar0,
+            (stage_times, stage_states, residual_stages),
+        )
+        return support_bar
+
+    if physics_context.flat_rhs_lagged_response_support_pullback is None:
+        return _radau_zero_support_delta_tree_like(support)
+
     def _stage_support_pullback(accumulated_bar, stage_inputs):
         t_eval, y_eval, rhs_bar_eval = stage_inputs
         stage_support_bar = _radau_sanitize_support_delta_bar_tree(
@@ -18090,6 +18163,13 @@ def _build_prepared_radau_accepted_rollout(
         kwargs=kwargs,
         project_flat=project_flat,
     )
+    flat_rhs_direct_support_pullback = _flat_rhs_direct_support_pullback_factory(
+        unravel=unpack_flat,
+        vector_field=vector_field,
+        args=args,
+        kwargs=kwargs,
+        project_flat=project_flat,
+    )
     flat_rhs_lagged_response_all_pullback = _flat_rhs_lagged_response_all_pullback_factory(
         unravel=unpack_flat,
         pack_flat=pack_state,
@@ -18447,6 +18527,7 @@ def _build_prepared_radau_accepted_rollout(
             flat_rhs_build_state_and_ntx_support_pullback_batched_interpolated_faces_native_multi_rhs_reuse_moment_drds_jvp_shared_primal_with_vmec_coefficients_no_prepared_carry
         ),
         flat_rhs_lagged_response_support_pullback=flat_rhs_lagged_response_support_pullback,
+        flat_rhs_direct_support_pullback=flat_rhs_direct_support_pullback,
         flat_rhs_lagged_response_all_pullback=flat_rhs_lagged_response_all_pullback,
         flat_rhs_state_and_lagged_response_pullback=flat_rhs_state_and_lagged_response_pullback,
         flat_rhs_state_pullback=flat_rhs_state_pullback,
@@ -19130,6 +19211,7 @@ class RADAUSolver(_RadauSolverConfig):
                 flat_rhs_build_state_and_ntx_support_pullback_batched_interpolated_faces_native_multi_rhs_reuse_moment_drds_jvp_shared_primal_with_vmec_coefficients_no_prepared_carry
             ),
             flat_rhs_lagged_response_support_pullback=flat_rhs_lagged_response_support_pullback,
+            flat_rhs_direct_support_pullback=flat_rhs_direct_support_pullback,
             flat_rhs_lagged_response_all_pullback=flat_rhs_lagged_response_all_pullback,
             flat_rhs_state_and_lagged_response_pullback=flat_rhs_state_and_lagged_response_pullback,
             flat_rhs_state_pullback=flat_rhs_state_pullback,

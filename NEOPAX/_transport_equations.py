@@ -1551,6 +1551,90 @@ class ComposedEquationSystem:
             shared_flux_model=flux_model if len(equations) >= 1 else None,
         )
 
+    @staticmethod
+    def _flux_model_with_realtime_support_payload(model, support_payload):
+        """Replace only the neoclassical subtree that owns a live payload.
+
+        This is deliberately a capability boundary rather than a list of flux
+        model names.  A composite keeps its non-neoclassical models intact;
+        a model that implements ``with_support_payload`` owns the replacement.
+        Models without that capability are geometry-only participants and are
+        already handled by :meth:`with_geometry_payload`.
+        """
+        if model is None or not dataclasses.is_dataclass(model):
+            return model
+        if all(
+            hasattr(model, name)
+            for name in ("neoclassical_model", "turbulent_model", "classical_model")
+        ):
+            neoclassical_model = ComposedEquationSystem._flux_model_with_realtime_support_payload(
+                model.neoclassical_model, support_payload
+            )
+            if neoclassical_model is model.neoclassical_model:
+                return model
+            return dataclasses.replace(model, neoclassical_model=neoclassical_model)
+        replace_payload = support_payload
+        # The exact model's established API owns the ``ntx_support`` inner
+        # payload; the live scan model owns the complete map because its
+        # channels and surfaces are also differentiable inputs.
+        if isinstance(support_payload, dict) and "ntx_support" in support_payload:
+            replace_payload = support_payload["ntx_support"]
+        replace_fn = getattr(model, "with_support_payload", None)
+        return replace_fn(replace_payload) if callable(replace_fn) else model
+
+    def with_realtime_geometry_support_payload(self, support_payload):
+        """Return the direct-RHS system reconstructed from a live payload.
+
+        This is used only by black-box reverse support differentiation.  The
+        lagged-response paths keep their established support hooks.
+        """
+        geometry = (
+            support_payload.get("geometry")
+            if isinstance(support_payload, dict)
+            else None
+        )
+        base = self.with_geometry_payload(geometry) if geometry is not None else self
+        flux_model = self._flux_model_with_realtime_support_payload(
+            base.shared_flux_model, support_payload
+        )
+        if flux_model is base.shared_flux_model:
+            return base
+        equations = build_equation_system(
+            config=base.config,
+            species=base.species,
+            field=geometry if geometry is not None else self._flux_model_geometry(flux_model),
+            flux_model=flux_model,
+            source_models=base.source_models,
+            solver_cfg=base.solver_cfg,
+            boundary_models=base.boundary_models,
+        )
+        return dataclasses.replace(
+            base,
+            equations=tuple(equations),
+            density_equation=next((eq for eq in equations if getattr(eq, "name", None) == "density"), None),
+            temperature_equation=next((eq for eq in equations if getattr(eq, "name", None) == "temperature"), None),
+            er_equation=next((eq for eq in equations if getattr(eq, "name", None) == "Er"), None),
+            shared_flux_model=flux_model,
+        )
+
+    def pullback_direct_rhs_support_payload(self, t, state, runtime, rhs_bar, support):
+        """Generic black-box RHS transpose with respect to realtime support.
+
+        Specific models may replace their support reconstruction behind the
+        same capability.  This equation-level fallback preserves arbitrary
+        composite fluxes and includes the direct geometry terms from transport
+        equation assembly.
+        """
+        support_delta0 = _float_delta_tree_like(support)
+        _, support_pullback = jax.vjp(
+            lambda support_delta: self.with_realtime_geometry_support_payload(
+                _add_float_delta_tree(support, support_delta)
+            )(t, state, runtime),
+            support_delta0,
+        )
+        (support_bar,) = support_pullback(rhs_bar)
+        return _sanitize_float_delta_bar_tree(support, support_bar)
+
     def _prepare_working_state(self, state):
         working_state = state
         eidx = None

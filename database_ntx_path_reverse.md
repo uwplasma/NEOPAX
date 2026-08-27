@@ -106,3 +106,34 @@ CPU/mocked tests must establish:
 Only after the structural tests pass, run a small scan-runtime reverse smoke
 on the benchmark machine, then compare one profile and one VMEC-coefficient
 AD derivative to central FD before running `--objective all`.
+
+## Black-box direct-RHS support reverse
+
+Black-box transport has no lagged response cache.  Its geometry support bar
+must therefore come from the direct RHS at every Radau stage, not from the
+lagged rebuild/cache transpose.
+
+Implemented first seam:
+
+1. Radau now has a separate optional `flat_rhs_direct_support_pullback`.
+   It is called only when the realized stage has no lagged response; all
+   existing fixed-lagged exact-NTX paths are unchanged.
+2. The equation system reconstructs the live support payload before taking
+   the direct RHS VJP.  In a composite, only the neoclassical payload-owning
+   model is replaced; turbulence and classical models remain present and can
+   contribute their direct geometry dependence through the rebuilt equation
+   system.
+3. The contract is model-capability based: models exposing
+   `with_support_payload` receive their appropriate payload (exact NTX gets
+   `ntx_support`; live scan gets `{geometry, channels, surfaces}`); models
+   without that capability remain generic geometry participants.
+
+Still required before a remote benchmark:
+
+* wire the black-box support payload through the public realtime-geometry
+  reverse setup (the current exact/scan lagged setup does not yet select it);
+* add the exact-NTX direct-RHS prepared-lowdot override.  Until then exact
+  black-box uses the correct generic RHS VJP, not the performance rule used
+  by lagged exact NTX;
+* validate one direct-RHS stage against a direct local VJP and then an AD/FD
+  coefficient check remotely.
