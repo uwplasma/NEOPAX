@@ -19211,7 +19211,10 @@ class RADAUSolver(_RadauSolverConfig):
                 flat_rhs_build_state_and_ntx_support_pullback_batched_interpolated_faces_native_multi_rhs_reuse_moment_drds_jvp_shared_primal_with_vmec_coefficients_no_prepared_carry
             ),
             flat_rhs_lagged_response_support_pullback=flat_rhs_lagged_response_support_pullback,
-            flat_rhs_direct_support_pullback=flat_rhs_direct_support_pullback,
+            # A normal forward solve does not need a support transpose.  The
+            # reverse prepared-context builder supplies this callback when a
+            # reverse sweep actually requests black-box support bars.
+            flat_rhs_direct_support_pullback=None,
             flat_rhs_lagged_response_all_pullback=flat_rhs_lagged_response_all_pullback,
             flat_rhs_state_and_lagged_response_pullback=flat_rhs_state_and_lagged_response_pullback,
             flat_rhs_state_pullback=flat_rhs_state_pullback,
