@@ -5227,7 +5227,7 @@ def main() -> None:
     parser.add_argument(
         "--reverse-bootstrap-cotangent-mode",
         choices=("separate", "joint_local_vjp", "joint_local_vjp_upar_only"),
-        default="separate",
+        default="joint_local_vjp_upar_only",
         help=(
             "Bootstrap terminal-cotangent rule. 'separate' preserves the "
             "established state/support/geometry local VJPs. 'joint_local_vjp' "
@@ -5299,11 +5299,11 @@ def main() -> None:
     parser.add_argument(
         "--initial-Er-root-ad",
         dest="initial_er_root_ad",
-        default="off",
+        default="jax_selected_root",
         choices=("off", "jax_selected_root"),
         help=(
-            "Opt-in AD treatment for ambipolar initial Er. 'off' preserves the "
-            "validated benchmark behavior. 'jax_selected_root' recomputes the "
+            "AD treatment for ambipolar initial Er. 'off' preserves the "
+            "reference boundary behaviour. 'jax_selected_root' recomputes the "
             "same selected best-root profile with a JAX-returning root path so "
             "the initial-Er boundary can participate in VJP/JVP diagnostics."
         ),
@@ -5330,16 +5330,16 @@ def main() -> None:
         ntx_exact_derivative_mode=DEFAULT_NTX_EXACT_DERIVATIVE_MODE,
         ntx_exact_derivative_field_pullback_mode=DEFAULT_NTX_EXACT_DERIVATIVE_FIELD_PULLBACK_MODE,
         ntx_exact_derivative_pullback_boundary=DEFAULT_NTX_EXACT_DERIVATIVE_PULLBACK_BOUNDARY,
-        ntx_exact_derivative_pullback_algebra=DEFAULT_NTX_EXACT_DERIVATIVE_PULLBACK_ALGEBRA,
+        ntx_exact_derivative_pullback_algebra="ntx_helper_lowdot_fused",
         reverse_ntx_prepared_solve_boundary="default",
     )
     parser.add_argument(
         "--ntx-exact-derivative-pullback-algebra",
         choices=("ntx_helper", "ntx_helper_lowdot_fused"),
-        default=DEFAULT_NTX_EXACT_DERIVATIVE_PULLBACK_ALGEBRA,
+        default="ntx_helper_lowdot_fused",
         help=(
             "Exact-runtime NTX local derivative pullback algebra. 'ntx_helper' "
-            "is the validated default. 'ntx_helper_lowdot_fused' is an isolated "
+            "is the reference helper. 'ntx_helper_lowdot_fused' is the selected "
             "experimental mode that fuses the base, d/dEr, and d/dlog(nu) local "
             "contractions; it does not select the joint prepared-support path."
         ),
@@ -5435,10 +5435,10 @@ def main() -> None:
             "woodbury_matvec_compact",
             "woodbury_er_coeff_compact",
         ),
-        default="structured",
+        default="block",
         help=(
             "Reverse stage-adjoint linear solve. 'structured' uses the Radau "
-            "transformed LU transpose approximation and is the lightweight default; "
+            "transformed LU transpose approximation and is the lightweight reference; "
             "'bicgstab' is the lower-memory exact iterative candidate; 'block' and "
             "'gmres' are correctness oracles but are memory/compile heavy; "
             "'block_colored_ntss_midpoint' is an isolated exact candidate for the "
@@ -5478,7 +5478,7 @@ def main() -> None:
             "ntx_native_joint_state_and_ntx_support_split_geometry_vmec_fused_rhs",
             "rebuild_dispatch",
         ),
-        default="scalar",
+        default="ntx_batched_interpolated_faces",
         help=(
             "Initial lagged-cache support transpose. 'scalar' preserves the reference "
             "lax.map path. 'ntx_batched_interpolated_faces' is an exact, opt-in "
@@ -5523,7 +5523,10 @@ def main() -> None:
             "ntx_joint_implicit_interpolated_faces_reuse_local_vjp_primal",
             "ntx_joint_implicit_interpolated_faces_reuse_local_vjp_primal_compact_prepared_carry",
         ),
-        default="separate",
+        default=(
+            "ntx_batched_interpolated_faces_native_multi_rhs_reuse_moment_drds_jvp_"
+            "shared_primal_with_vmec_coefficients_direct_directional_product_rule"
+        ),
         help=(
             "Lagged-response rebuild support transpose inside each reverse step. "
             "'separate' preserves the reference vmapped scalar path. "
@@ -5652,7 +5655,7 @@ def main() -> None:
     parser.add_argument(
         "--reverse-segment-start-replay-mode",
         choices=("legacy", "minimal"),
-        default="legacy",
+        default="minimal",
         help=(
             "Segment-start carry reconstruction after the accepted schedule is fixed. "
             "legacy preserves the full accepted-step replay. minimal uses the exact "
@@ -5662,14 +5665,14 @@ def main() -> None:
     parser.add_argument(
         "--reverse-segment-primal-record-mode",
         choices=("reconstruct", "reuse_segment_primal_record"),
-        default="reconstruct",
+        default="reuse_segment_primal_record",
         help=(
             "Experimental exact bounded-memory segment mode. "
             "reuse_segment_primal_record retains each minimal accepted-step primal "
             "record only for the active reverse segment, so the step adjoint reuses "
             "it instead of reconstructing the same accepted attempt. Requires "
-            "--reverse-segment-start-replay-mode minimal. Default reconstruct "
-            "preserves the current behavior."
+            "--reverse-segment-start-replay-mode minimal. 'reconstruct' preserves "
+            "the earlier reference behaviour."
         ),
     )
     parser.add_argument(
@@ -5686,9 +5689,9 @@ def main() -> None:
     parser.add_argument(
         "--reverse-schedule-artifact-mode",
         choices=("legacy", "reuse_static_probe"),
-        default="legacy",
+        default="reuse_static_probe",
         help=(
-            "Experimental Radau shared-payload mode. reuse_static_probe reuses "
+            "Radau shared-payload mode. reuse_static_probe reuses "
             "the compact adaptive schedule already built during reverse setup, "
             "rather than executing a second adaptive schedule rollout in the "
             "manual VJP forward. It stores no carries or per-step primal tape."
@@ -5703,7 +5706,7 @@ def main() -> None:
     parser.add_argument(
         "--reverse-rhs-transpose-mode",
         choices=("generic", "explicit_ntx_interpolated"),
-        default="generic",
+        default="explicit_ntx_interpolated",
         help=(
             "RHS-state transpose used inside exact reverse stage-adjoint matvecs. "
             "'generic' is the known-good JAX VJP reference; "
@@ -5780,10 +5783,10 @@ def main() -> None:
             "reduced_cotangent_recompute_replay",
             "reduced_cotangent_host_segments",
         ),
-        default="current",
+        default="reduced_cotangent_call_boundary",
         help=(
             "Accepted-step backward implementation selector. 'current' keeps the "
-            "existing reverse path. 'manual_split' is reserved for the upcoming "
+            "earlier reference reverse path. 'manual_split' is reserved for the upcoming "
             "split/manual accepted-step adjoint and currently routes through the "
             "same implementation while plumbing is validated. 'reduced_cotangent' "
             "uses a reduced final-state cotangent contract inside the segmented "

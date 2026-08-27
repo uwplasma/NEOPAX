@@ -215,6 +215,57 @@ def realtime_geometry_payload_for_runtime(runtime):
     }
 
 
+def _replace_database_payload_in_model(model, database):
+    if model is None or not dataclasses.is_dataclass(model) or isinstance(model, type):
+        return model, False
+    if isinstance(model, NTXDatabaseTransportModel):
+        return dataclasses.replace(model, database=database), True
+    updates = {}
+    changed = False
+    for field in dataclasses.fields(model):
+        value = getattr(model, field.name)
+        if dataclasses.is_dataclass(value) and not isinstance(value, type):
+            replacement, child_changed = _replace_database_payload_in_model(value, database)
+            if child_changed:
+                updates[field.name] = replacement
+                changed = True
+    return (dataclasses.replace(model, **updates), True) if changed else (model, False)
+
+
+def runtime_with_realtime_geometry_payload(runtime, payload):
+    """Replace a runtime from the tagged exact/database geometry payload.
+
+    The tag is Python setup metadata, not a traced JAX value.  This helper is
+    additive: the established exact callers continue to use their existing
+    geometry/support replacement functions unchanged.
+    """
+
+    if not isinstance(payload, dict):
+        raise TypeError("realtime geometry payload must be a mapping.")
+    kind = str(payload.get("kind", "")).strip().lower()
+    if kind == "ntx_exact":
+        return runtime_with_ntx_support_payload(
+            runtime_with_geometry_payload(runtime, payload["geometry"]),
+            payload["ntx_support"],
+        )
+    if kind == "ntx_database":
+        geometry = payload["geometry"]
+        database = payload["database"]
+        runtime_with_geometry = runtime_with_geometry_payload(runtime, geometry)
+        flux_model, changed = _replace_database_payload_in_model(
+            runtime_with_geometry.models.flux,
+            database,
+        )
+        if not changed:
+            raise ValueError("No NTX database transport model was found in the runtime.")
+        return dataclasses.replace(
+            runtime_with_geometry,
+            database=database,
+            models=dataclasses.replace(runtime_with_geometry.models, flux=flux_model),
+        )
+    raise ValueError(f"Unknown realtime geometry payload kind {kind!r}.")
+
+
 def runtime_with_geometry_payload(runtime, geometry):
     """Return runtime with transport geometry payload replaced everywhere needed."""
 

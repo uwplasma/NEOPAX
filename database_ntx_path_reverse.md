@@ -58,6 +58,9 @@ close.
 * The tagged runtime-payload selector is also implemented locally but is not
   connected to the exact reverse setup yet; it identifies database runtime
   payloads without attempting an exact-NTX support lookup.
+* The symmetric tagged runtime replacement is implemented too: it replaces
+  both geometry and the database wrapper for database payloads, and delegates
+  to the established geometry-plus-support replacement for exact payloads.
 * It deliberately does not yet route database configurations through the
   reverse setup.  That remains behind the small-oracle tests below.
 * `preprocessed_ntss` is explicitly unsupported for realtime replacement
