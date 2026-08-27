@@ -72,6 +72,8 @@ class EvaluationStructureCounter:
         self.checkpoint_rss_bytes: dict[str, int | None] = {}
         self.vmex_jit_cache_sizes: dict[str, int | None] = {}
         self.jax_dispatch_cache_size: int | None = None
+        self.raw_solve_dispatch_before: int | None = None
+        self.raw_solve_dispatch_after: int | None = None
 
     def reset(self) -> None:
         self.raw_block_solve_calls = 0
@@ -79,6 +81,8 @@ class EvaluationStructureCounter:
         self.checkpoint_rss_bytes = {}
         self.vmex_jit_cache_sizes = {}
         self.jax_dispatch_cache_size = None
+        self.raw_solve_dispatch_before = None
+        self.raw_solve_dispatch_after = None
 
     def context(
         self,
@@ -87,6 +91,8 @@ class EvaluationStructureCounter:
         optimization_raw_block_stage=None,
         vmex_cache_sizes: bool = False,
         jax_dispatch_cache: bool = False,
+        raw_solve_dispatch: bool = False,
+        raw_implicit=None,
     ):
         raw_block_solve = reverse_optimization.geometry_raw_block_solve_from_param_vector
         selected_root = reverse_optimization.initial_er_selected_root_profile
@@ -123,6 +129,14 @@ class EvaluationStructureCounter:
                 self.jax_dispatch_cache_size = int(info.currsize)
             except (AttributeError, ImportError):
                 self.jax_dispatch_cache_size = None
+
+        def dispatch_cache_size() -> int | None:
+            try:
+                from jax._src import dispatch
+
+                return int(dispatch.xla_primitive_callable.cache_info().currsize)
+            except (AttributeError, ImportError):
+                return None
 
         def count_raw_block_solve(*args, **kwargs):
             self.raw_block_solve_calls += 1
@@ -164,7 +178,7 @@ class EvaluationStructureCounter:
             record("payload_to_vmec")
             return result
 
-        return (
+        patchers = [
             patch.object(
                 reverse_optimization,
                 "geometry_raw_block_solve_from_param_vector",
@@ -185,7 +199,21 @@ class EvaluationStructureCounter:
                 "realtime_geometry_transport_reverse_table_from_payload_cotangents",
                 count_payload_pullback,
             ),
-        )
+        ]
+        if raw_solve_dispatch and raw_implicit is not None:
+            original_solve = raw_implicit.solve_implicit_with_aux
+
+            def count_implicit_solve(*args, **kwargs):
+                self.raw_solve_dispatch_before = dispatch_cache_size()
+                result = original_solve(*args, **kwargs)
+                jax.block_until_ready(result)
+                self.raw_solve_dispatch_after = dispatch_cache_size()
+                return result
+
+            patchers.append(
+                patch.object(raw_implicit, "solve_implicit_with_aux", count_implicit_solve)
+            )
+        return tuple(patchers)
 
 
 def _live_jax_array_count() -> int | None:
@@ -286,6 +314,11 @@ def main() -> int:
         action="store_true",
         help="Report JAX's exposed primitive-dispatch cache size after each raw solve.",
     )
+    parser.add_argument(
+        "--diagnose-raw-solve-dispatch",
+        action="store_true",
+        help="Split the JAX dispatch-cache count immediately before/after VMEX solve_implicit_with_aux.",
+    )
     args = parser.parse_args()
     if args.warmup < 0 or args.repeats < 1:
         raise ValueError("--warmup must be non-negative and --repeats must be positive.")
@@ -371,6 +404,15 @@ def main() -> int:
                 + ("unavailable" if value is None else str(value)),
                 flush=True,
             )
+        if args.diagnose_raw_solve_dispatch:
+            before = structure_counter.raw_solve_dispatch_before
+            after = structure_counter.raw_solve_dispatch_after
+            print(
+                "[memory test] raw_solve_dispatch_cache "
+                f"before={before if before is not None else 'unavailable'} "
+                f"after={after if after is not None else 'unavailable'}",
+                flush=True,
+            )
 
     print(
         f"[memory test] mode={args.mode} objectives=maxEr,Er_left,Er_right,J_bootstrap "
@@ -399,12 +441,15 @@ def main() -> int:
                 optimization_raw_block_stage=optimization_raw_block_stage,
                 vmex_cache_sizes=args.diagnose_vmex_caches,
                 jax_dispatch_cache=args.diagnose_jax_dispatch_cache,
+                raw_solve_dispatch=args.diagnose_raw_solve_dispatch,
+                raw_implicit=getattr(problem.raw_block_stage, "implicit", None),
             )
             if (
                 args.diagnose_structure
                 or args.diagnose_checkpoints
                 or args.diagnose_vmex_caches
                 or args.diagnose_jax_dispatch_cache
+                or args.diagnose_raw_solve_dispatch
                 or args.persistent_raw_solve_jit
             )
             else ()
@@ -429,6 +474,7 @@ def main() -> int:
         or args.diagnose_checkpoints
         or args.diagnose_vmex_caches
         or args.diagnose_jax_dispatch_cache
+        or args.diagnose_raw_solve_dispatch
         or args.persistent_raw_solve_jit
     ):
         for iteration in range(args.repeats):
@@ -438,6 +484,8 @@ def main() -> int:
                 optimization_raw_block_stage=optimization_raw_block_stage,
                 vmex_cache_sizes=args.diagnose_vmex_caches,
                 jax_dispatch_cache=args.diagnose_jax_dispatch_cache,
+                raw_solve_dispatch=args.diagnose_raw_solve_dispatch,
+                raw_implicit=getattr(problem.raw_block_stage, "implicit", None),
             )
             for patcher in patchers:
                 patcher.start()
