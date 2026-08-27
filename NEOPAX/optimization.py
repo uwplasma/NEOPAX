@@ -41,6 +41,8 @@ from ._reverse_ad_optimization import (
     evaluate_transport_realtime_geometry_least_squares,
     evaluate_geometry_initial_er_root_only_least_squares_benchmark_tables,
     evaluate_geometry_initial_er_root_only_least_squares_optimization,
+    _optimization_root_to_payload_cotangents,
+    _optimization_payload_to_vmec_table,
     geometry,
     normalize_least_squares_terms,
     normalize_transport_objective_names,
@@ -49,7 +51,10 @@ from ._reverse_ad_optimization import (
     scale_least_squares_evaluation_columns,
     transport,
 )
-from ._optimization_initial_root_stage import initial_root_stage_layout
+from ._optimization_initial_root_stage import (
+    build_geometry_initial_root_optimization_stage,
+    initial_root_stage_layout,
+)
 from ._reverse_ad_parameters import (
     PROFILE_PARAMETER_ORDER,
     ProfileParameterSpec,
@@ -333,6 +338,7 @@ class GeometryInitialErRootLeastSquaresProblem:
     root_options: Mapping[str, object] | None = None
     raw_block_stage: object | None = None
     optimization_stage_layout: object | None = None
+    optimization_stage: object | None = None
     reverse_stage_mode: str = "off"
 
     @property
@@ -442,6 +448,7 @@ class GeometryInitialErRootLeastSquaresProblem:
             geometry_solver_device=self.geometry_solver_device,
             root_options=self.root_options,
             raw_block_stage=self.raw_block_stage,
+            **({} if self.reverse_stage_mode == "off" else {"optimization_stage": self.optimization_stage}),
         )
         result = _assemble_mixed_initial_er_root_result(
             self.terms,
@@ -1344,6 +1351,7 @@ def geometry_initial_er_root_only_least_squares_problem(
         )
     )
     optimization_stage_layout = None
+    optimization_stage = None
     if mode == "vmex_like":
         normalized_stage_terms = normalize_least_squares_terms(terms)
         optimization_stage_layout = initial_root_stage_layout(
@@ -1355,6 +1363,14 @@ def geometry_initial_er_root_only_least_squares_problem(
             n_zeta=n_zeta,
             n_xi=n_xi,
             surface_backend=surface_backend,
+        )
+        if raw_block_stage is None:
+            raise ValueError("vmex_like initial-root optimization requires VMEC boundary parameters.")
+        optimization_stage = build_geometry_initial_root_optimization_stage(
+            layout=optimization_stage_layout,
+            raw_block_stage=raw_block_stage,
+            root_to_payload_impl=_optimization_root_to_payload_cotangents,
+            payload_to_vmec_impl=_optimization_payload_to_vmec_table,
         )
     return GeometryInitialErRootLeastSquaresProblem(
         config=config_eff,
@@ -1386,6 +1402,7 @@ def geometry_initial_er_root_only_least_squares_problem(
         root_options=None if root_options is None else dict(root_options),
         raw_block_stage=raw_block_stage,
         optimization_stage_layout=optimization_stage_layout,
+        optimization_stage=optimization_stage,
         reverse_stage_mode=mode,
     )
 

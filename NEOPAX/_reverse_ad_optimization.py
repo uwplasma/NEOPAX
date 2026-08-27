@@ -58,6 +58,7 @@ from ._reverse_ad_transport import (
     realtime_geometry_transport_reverse_table_request,
     transport_realtime_geometry_reverse_table,
 )
+from ._optimization_initial_root_stage import raw_block_dynamic_payload
 
 
 ObjectiveFamily = Literal["transport", "geometry", "regularization"]
@@ -1936,6 +1937,7 @@ def geometry_active_initial_er_root_only_reverse_table_optimization(
     raw_block_solve=None,
     support_payload_override=None,
     options: Mapping[str, object] | None = None,
+    optimization_stage=None,
 ) -> ObjectiveTableResult:
     """Return compact initial-Er objective table for active realtime geometry.
 
@@ -1991,12 +1993,9 @@ def geometry_active_initial_er_root_only_reverse_table_optimization(
 
     profile_specs = tuple(parameter_set.profile_specs)
 
-    (
-        objective_values,
-        profile_gradient_matrix_for_payload,
-        support_bars,
-        objective_count,
-    ) = _optimization_root_to_payload_cotangents(
+    root_operator = _optimization_root_to_payload_cotangents if optimization_stage is None else optimization_stage.root_to_payload
+    dynamic_payload = None if raw_block_solve is None else raw_block_dynamic_payload(raw_block_solve)
+    root_args = dict(
         config=config,
         requested_objectives=requested_objectives,
         runtime=runtime,
@@ -2005,18 +2004,25 @@ def geometry_active_initial_er_root_only_reverse_table_optimization(
         geometry_context=geometry_context,
         n_r=n_r, n_theta=n_theta, n_zeta=n_zeta, n_xi=n_xi,
         surface_backend=surface_backend,
-        raw_block_solve=raw_block_solve,
         support_payload=support_payload,
         use_runtime_payload=use_runtime_payload,
         profile_specs=profile_specs,
         options=options,
     )
+    if optimization_stage is None:
+        root_args["raw_block_solve"] = raw_block_solve
+        root_result = root_operator(**root_args)
+    else:
+        root_result = root_operator(dynamic_payload, **root_args)
+    (
+        objective_values, profile_gradient_matrix_for_payload, support_bars, objective_count,
+    ) = root_result
     objective_values, profile_gradient_matrix_for_payload, support_bars = jax.block_until_ready(
         (objective_values, profile_gradient_matrix_for_payload, support_bars)
     )
 
     geometry_param_tuples = tuple(spec.as_tuple() for spec in vmec_specs)
-    assembly_result = _optimization_payload_to_vmec_table(
+    payload_args = dict(
         objective_labels=requested_objectives,
         profile_parameter_labels=tuple(spec.name for spec in profile_specs),
         geometry_parameter_labels=tuple(spec.label for spec in vmec_specs),
@@ -2040,6 +2046,11 @@ def geometry_active_initial_er_root_only_reverse_table_optimization(
         raw_block_solve=raw_block_solve,
         return_branch_gradients=False,
     )
+    payload_operator = _optimization_payload_to_vmec_table if optimization_stage is None else optimization_stage.payload_to_vmec
+    if optimization_stage is None:
+        assembly_result = payload_operator(**payload_args)
+    else:
+        assembly_result = payload_operator(dynamic_payload, **payload_args)
 
     geometry_gradient_matrix = jnp.asarray(assembly_result.table_result.geometry_gradient_matrix)
     profile_gradient_matrix = jnp.asarray(assembly_result.table_result.profile_gradient_matrix)
@@ -2730,6 +2741,7 @@ def evaluate_geometry_initial_er_root_only_least_squares_optimization(
     geometry_solver_device: str | None = "default",
     root_options: Mapping[str, object] | None = None,
     raw_block_stage=None,
+    optimization_stage=None,
 ) -> LeastSquaresEvaluation:
     """Evaluate mixed objectives using only benchmark-validated table backends."""
 
@@ -2801,6 +2813,7 @@ def evaluate_geometry_initial_er_root_only_least_squares_optimization(
                 progress_label="[optimization] initial-Er root geometry payload pullback:",
                 raw_block_solve=shared_raw_block_solve,
                 options=root_runner_options,
+                optimization_stage=optimization_stage,
             )
             transport_values, transport_jacobian = jax.block_until_ready(
                 (transport_result.values, transport_result.jacobian)
