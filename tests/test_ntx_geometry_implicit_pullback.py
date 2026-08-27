@@ -40,6 +40,7 @@ from NEOPAX._reverse_ad_transport import (
     _merge_rebuild_ntx_channels_into_generic_payload_bar,
     _objective_vector_vjp_rows,
     _realized_reverse_slot_branches,
+    _run_realized_reverse_slot_dispatch,
     _take_batched_pytree_row,
 )
 
@@ -969,6 +970,36 @@ def test_realized_reverse_slot_branches_dispatch_only_active_slots_in_reverse_or
         (1, "reuse"),
         (0, "rebuild"),
     )
+
+
+def test_realized_reverse_slot_dispatch_preserves_branch_and_device_value_order():
+    """A no-transport oracle for the static host-dispatch seam."""
+
+    calls = []
+
+    def _step(slot_index, branch, carry, record, reduced):
+        calls.append((slot_index, branch, int(carry), int(record), int(reduced)))
+        increment = jnp.asarray(slot_index + (10 if branch == "rebuild" else 1))
+        return reduced + increment, (increment,)
+
+    reduced, support = _run_realized_reverse_slot_dispatch(
+        slot_active=[True, True, False, True],
+        slot_next_lagged_valid=[True, False, True, True],
+        segment_start_lagged_valid=False,
+        step_start_carries=jnp.asarray([10, 20, 30, 40]),
+        step_primal_records=jnp.asarray([1, 2, 3, 4]),
+        next_reduced_bars=jnp.asarray(5),
+        initial_support_bars=(jnp.asarray(0),),
+        take_axis0=lambda values, index: values[index],
+        step_fn=_step,
+    )
+    assert calls == [
+        (3, "reuse", 40, 4, 5),
+        (1, "reuse", 20, 2, 9),
+        (0, "rebuild", 10, 1, 11),
+    ]
+    assert int(reduced) == 21
+    assert int(support[0]) == 16
 
 
 def test_native_split_joint_no_prepared_carry_hook_selects_only_its_wrapper():

@@ -288,6 +288,50 @@ def _realized_reverse_slot_branches(
     )
 
 
+def _run_realized_reverse_slot_dispatch(
+    *,
+    slot_active,
+    slot_next_lagged_valid,
+    segment_start_lagged_valid: bool,
+    step_start_carries,
+    step_primal_records,
+    next_reduced_bars,
+    initial_support_bars,
+    take_axis0: Callable[[object, int], object],
+    step_fn: Callable[[int, str, object, object, object], tuple[object, tuple[object, ...]]],
+):
+    """Apply static reuse/rebuild launches in exact reverse-time order.
+
+    ``step_fn`` owns the device computation; this helper owns only the tiny
+    realized schedule and the dependency-preserving Python dispatch.  Keeping
+    this seam explicit permits a no-transport mock oracle for the new mode.
+    """
+
+    reduced_value = next_reduced_bars
+    support_bars = initial_support_bars
+    for slot_index, branch in _realized_reverse_slot_branches(
+        slot_active,
+        slot_next_lagged_valid,
+        segment_start_lagged_valid,
+    ):
+        reduced_value, step_support_bars = step_fn(
+            slot_index,
+            branch,
+            take_axis0(step_start_carries, slot_index),
+            take_axis0(step_primal_records, slot_index),
+            reduced_value,
+        )
+        support_bars = tuple(
+            accumulated + increment
+            for accumulated, increment in zip(
+                support_bars,
+                step_support_bars,
+                strict=True,
+            )
+        )
+    return reduced_value, support_bars
+
+
 def _initial_lagged_response_joint_state_and_support_pullback(
     *,
     flat_y,
@@ -4802,22 +4846,17 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
         segment_support_bars = tuple(
             jnp.zeros_like(leaf) for leaf in support_bar_leaves
         )
-        reduced_value = segment_next_reduced_bars
-        realized_branches = _realized_reverse_slot_branches(
-            slot_active,
-            slot_next_lagged_valid,
-            bool(np.asarray(jax.device_get(segment_carry.lagged_response_valid))),
-        )
-        for slot_index, branch in realized_branches:
-            step_start_carry = _take_tree_axis0(step_start_carries, slot_index)
+        def _run_static_step(
+            slot_index,
+            branch,
+            step_start_carry,
+            step_primal_record,
+            reduced_value,
+        ):
             carry_for_step = _radau_carry_with_forward_only_jvp_fields(
-                dataclasses.replace(
-                    step_start_carry,
-                    dt=segment_arrays[1][slot_index],
-                )
+                dataclasses.replace(step_start_carry, dt=segment_arrays[1][slot_index])
             )
-            step_primal_record = _take_tree_axis0(step_primal_records, slot_index)
-            reduced_value, step_support_bars = (
+            return (
                 _execute_radau_accepted_step_next_reduced_cotangent_batched_bwd_with_support_from_segment_primal_record_call(
                     reverse_setup.execution_context.kernel_context,
                     reverse_setup.execution_context.physics_context,
@@ -4829,15 +4868,21 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
                     support_payload,
                 )
             )
-            segment_support_bars = tuple(
-                accumulated + increment
-                for accumulated, increment in zip(
-                    segment_support_bars,
-                    step_support_bars,
-                    strict=True,
-                )
+        return jax.block_until_ready(
+            _run_realized_reverse_slot_dispatch(
+                slot_active=slot_active,
+                slot_next_lagged_valid=slot_next_lagged_valid,
+                segment_start_lagged_valid=bool(
+                    np.asarray(jax.device_get(segment_carry.lagged_response_valid))
+                ),
+                step_start_carries=step_start_carries,
+                step_primal_records=step_primal_records,
+                next_reduced_bars=segment_next_reduced_bars,
+                initial_support_bars=segment_support_bars,
+                take_axis0=_take_tree_axis0,
+                step_fn=_run_static_step,
             )
-        return jax.block_until_ready((reduced_value, segment_support_bars))
+        )
 
     phase_start = time.perf_counter()
     for segment_index in range(segment_count - 1, -1, -1):

@@ -2799,6 +2799,7 @@ remain on device; no factor record, objective loop, or changed equation is
 introduced. This is materially different from static pattern unrolling: it
 does not create `2**segment_length` compiled patterns.
 
-Before a remote run, the NumPy-only schedule gate must pass. Exact full reverse
-equality remains the remote acceptance check, alongside total compilation and
-warm execution.
+Before a remote run, two no-transport gates must pass: schedule decoding and
+a dispatcher oracle that checks reverse ordering, branch selection, carry
+dependency, and support accumulation. Exact full reverse equality remains the
+remote acceptance check, alongside total compilation and warm execution.
