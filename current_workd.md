@@ -2743,6 +2743,7 @@ Plan:
    Promotion requires unchanged derivative table, lower compile/RAM, and no
    regression of the grouped warm timings.
 
-**Implementation status:** steps 1--2 are now private NTX code only.  The
-selected NEOPAX path is unchanged.  The CPU oracle gate is the next required
-step before any selector or benchmark command exists.
+**Implementation status:** the NTX CPU oracle passed for one and three RHS
+(`2 passed`).  A separate opt-in NEOPAX selector is now being wired; the
+selected fast path remains unchanged.  Its remaining gates are a mock
+NEOPAX dispatch test, then one remote cache-disabled comparison.

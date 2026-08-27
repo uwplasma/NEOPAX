@@ -1331,6 +1331,27 @@ class CombinedTransportFluxModel(TransportFluxModelBase):
         )
         return pullback_fn(state, response_bars, support)
 
+    def pullback_build_lagged_response_support_payload_batched_interpolated_faces_native_multi_rhs_reuse_moment_drds_jvp_shared_primal_with_vmec_coefficients_direct_coefficient_pullback(
+        self, state, lagged_response_bars, support, **kwargs,
+    ):
+        """Forward the opt-in direct coefficient-transpose rule."""
+        del kwargs
+        pullback_fn = getattr(
+            self.neoclassical_model,
+            "pullback_build_lagged_response_support_payload_batched_interpolated_faces_"
+            "native_multi_rhs_reuse_moment_drds_jvp_shared_primal_with_vmec_coefficients_"
+            "direct_coefficient_pullback",
+            None,
+        )
+        if not callable(pullback_fn):
+            raise NotImplementedError(
+                "The active neoclassical model does not expose the direct coefficient rule."
+            )
+        response_bars = (
+            None if lagged_response_bars is None else lagged_response_bars.neoclassical_response
+        )
+        return pullback_fn(state, response_bars, support)
+
     def pullback_build_lagged_response_support_payload_batched_interpolated_faces_native_multi_rhs_compact_shared_primal(
         self,
         state,
@@ -7391,6 +7412,7 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         return_native_vmec_coefficient_bars: bool = False,
         native_vmec_coefficient_bars_only: bool = False,
         native_vmec_direct_directional_product_rule: bool = False,
+        native_direct_coefficient_pullback: bool = False,
         stream_native_compact_energy: bool = False,
         return_case_bars: bool = False,
         include_second_direction_base_prepared: bool = True,
@@ -7569,6 +7591,9 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                 )
                 helper_kwargs["native_vmec_direct_directional_product_rule"] = bool(
                     native_vmec_direct_directional_product_rule
+                )
+                helper_kwargs["native_direct_coefficient_pullback"] = bool(
+                    native_direct_coefficient_pullback
                 )
             if (
                 native_factorized_ntx_rhs
@@ -8020,6 +8045,7 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         return_case_bars: bool = False,
         native_vmec_coefficient_bars_only: bool = False,
         native_vmec_direct_directional_product_rule: bool = False,
+        native_direct_coefficient_pullback: bool = False,
     ):
         """Return the validated native support bar plus VMEC coefficient bars.
 
@@ -8043,6 +8069,7 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             native_vmec_direct_directional_product_rule=(
                 native_vmec_direct_directional_product_rule
             ),
+            native_direct_coefficient_pullback=native_direct_coefficient_pullback,
             return_case_bars=return_case_bars,
             include_second_direction_base_prepared=False,
         )
@@ -12200,6 +12227,7 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         reuse_joint_moment_drds_jvp: bool = False,
         return_native_vmec_coefficient_bars: bool = False,
         native_vmec_direct_directional_product_rule: bool = False,
+        native_direct_coefficient_pullback: bool = False,
     ):
         """Experimental exact batched support transpose with local NTX sharing.
 
@@ -12344,6 +12372,9 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                     local_kwargs["native_vmec_coefficient_bars_only"] = True
                     local_kwargs["native_vmec_direct_directional_product_rule"] = (
                         native_vmec_direct_directional_product_rule
+                    )
+                    local_kwargs["native_direct_coefficient_pullback"] = (
+                        native_direct_coefficient_pullback
                     )
                 local_result = local_support_pullback(
                     prepared,
@@ -12574,6 +12605,26 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             reuse_joint_moment_drds_jvp=True,
             return_native_vmec_coefficient_bars=True,
             native_vmec_direct_directional_product_rule=True,
+        )
+
+    def pullback_build_lagged_response_support_payload_batched_interpolated_faces_native_multi_rhs_reuse_moment_drds_jvp_shared_primal_with_vmec_coefficients_direct_coefficient_pullback(
+        self, state, lagged_response_bars, support,
+    ):
+        """Opt-in exact replacement of the upstream coefficient VJP/JVP pair.
+
+        The grouped primal, NTX factorisation, matrix-RHS adjoints and native
+        VMEC bridge are identical to the validated selector.  Only the
+        coefficient-to-retained-mode transpose and its low-dot tangent use
+        NTX's direct RHS-axis algebra.
+        """
+        return self.pullback_build_lagged_response_support_payload_batched_interpolated_faces_multi_rhs_shared_primal(
+            state,
+            lagged_response_bars,
+            support,
+            native_factorized_ntx_rhs=True,
+            reuse_joint_moment_drds_jvp=True,
+            return_native_vmec_coefficient_bars=True,
+            native_direct_coefficient_pullback=True,
         )
 
     def pullback_build_lagged_response_support_payload_batched_interpolated_faces_native_multi_rhs_compact_residual_reuse_moment_drds_jvp_shared_primal(

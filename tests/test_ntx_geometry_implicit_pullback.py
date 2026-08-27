@@ -444,6 +444,33 @@ def test_initial_rebuild_dispatch_selects_direct_native_vmec_hook():
     assert jnp.allclose(native_bars["b_cos"], jnp.asarray([0.9, -1.2]))
 
 
+def test_initial_rebuild_dispatch_selects_direct_coefficient_native_vmec_hook():
+    """The coefficient-transpose selector cannot fall back after setup."""
+
+    calls = []
+
+    def direct_hook(flat_y, lagged_bars, support):
+        calls.append((flat_y, lagged_bars, support))
+        return {"support": lagged_bars + support}, {"b_cos": 4.0 * lagged_bars}
+
+    context = SimpleNamespace(
+        reverse_rebuild_support_pullback_mode=(
+            "ntx_batched_interpolated_faces_native_multi_rhs_reuse_moment_drds_jvp_"
+            "shared_primal_with_vmec_coefficients_direct_coefficient_pullback"
+        ),
+        flat_rhs_build_support_pullback_batched_interpolated_faces_native_multi_rhs_reuse_moment_drds_jvp_shared_primal_with_vmec_coefficients_direct_coefficient_pullback=direct_hook,
+    )
+    support_bars, native_bars = _initial_cache_support_pullback_from_rebuild_dispatch(
+        physics_context=context,
+        flat_y=jnp.asarray([1.0, 2.0]),
+        lagged_response_bars=jnp.asarray([0.3, -0.4]),
+        support_payload=jnp.asarray([0.5, 0.7]),
+    )
+    assert len(calls) == 1
+    assert jnp.allclose(support_bars["support"], jnp.asarray([0.8, 0.3]))
+    assert jnp.allclose(native_bars["b_cos"], jnp.asarray([1.2, -1.6]))
+
+
 def test_initial_rebuild_dispatch_matches_ordinary_batched_support_contract():
     """Non-native initial dispatch is exactly its active rebuild hook."""
 
@@ -833,6 +860,40 @@ def test_direct_directional_vmec_composite_and_equation_hooks_are_exposed_to_rad
     assert equations.pullback_build_lagged_response_support_payload_batched_interpolated_faces_native_multi_rhs_reuse_moment_drds_jvp_shared_primal_with_vmec_coefficients_direct_directional_product_rule(
         "state", equation_response, "support", ignored_outer_keyword=True,
     ) == "direct-result"
+    assert calls == [
+        ("state", "ntx-bars", "support"),
+        ("state", "ntx-bars", "support"),
+    ]
+
+
+def test_direct_coefficient_vmec_composite_and_equation_hooks_are_exposed_to_radau():
+    """The coefficient-transpose selector is wired through both wrappers."""
+
+    calls = []
+
+    class _InnerNTX:
+        def pullback_build_lagged_response_support_payload_batched_interpolated_faces_native_multi_rhs_reuse_moment_drds_jvp_shared_primal_with_vmec_coefficients_direct_coefficient_pullback(
+            self, state, response_bars, support,
+        ):
+            calls.append((state, response_bars, support))
+            return "direct-coefficient-result"
+
+    composite = object.__new__(CombinedTransportFluxModel)
+    object.__setattr__(composite, "neoclassical_model", _InnerNTX())
+    combined_response = SimpleNamespace(neoclassical_response="ntx-bars")
+    assert composite.pullback_build_lagged_response_support_payload_batched_interpolated_faces_native_multi_rhs_reuse_moment_drds_jvp_shared_primal_with_vmec_coefficients_direct_coefficient_pullback(
+        "state", combined_response, "support", ignored_outer_keyword=True,
+    ) == "direct-coefficient-result"
+
+    equations = object.__new__(ComposedEquationSystem)
+    object.__setattr__(equations, "shared_flux_model", composite)
+    object.__setattr__(equations, "_split_realtime_geometry_payload", lambda support: (support, None))
+    object.__setattr__(equations, "_prepare_working_state", lambda state: (state, None))
+    object.__setattr__(equations, "_shared_flux_call_kwargs", lambda kwargs: {})
+    equation_response = SimpleNamespace(flux_response=combined_response)
+    assert equations.pullback_build_lagged_response_support_payload_batched_interpolated_faces_native_multi_rhs_reuse_moment_drds_jvp_shared_primal_with_vmec_coefficients_direct_coefficient_pullback(
+        "state", equation_response, "support", ignored_outer_keyword=True,
+    ) == "direct-coefficient-result"
     assert calls == [
         ("state", "ntx-bars", "support"),
         ("state", "ntx-bars", "support"),

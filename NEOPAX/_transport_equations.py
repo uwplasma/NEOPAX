@@ -2338,6 +2338,60 @@ class ComposedEquationSystem:
             working_state, flux_response_bars, support, **self._shared_flux_call_kwargs(kwargs),
         )
 
+    def pullback_build_lagged_response_support_payload_batched_interpolated_faces_native_multi_rhs_reuse_moment_drds_jvp_shared_primal_with_vmec_coefficients_direct_coefficient_pullback(
+        self, state, lagged_response_bars, support, **kwargs,
+    ):
+        """Opt-in VMEC bridge with NTX's direct coefficient transpose.
+
+        The realtime-geometry split and direct geometry contribution are the
+        same as the established native VMEC path; only NTX's affine
+        coefficient VJP/JVP nest is replaced.
+        """
+        support, geometry = self._split_realtime_geometry_payload(support)
+        if geometry is not None:
+            ntx_support_bar, native_vmec_coefficient_bars = (
+                self.pullback_build_lagged_response_support_payload_batched_interpolated_faces_native_multi_rhs_reuse_moment_drds_jvp_shared_primal_with_vmec_coefficients_direct_coefficient_pullback(
+                    state, lagged_response_bars, support, **kwargs,
+                )
+            )
+            working_state, _eidx = self._prepare_working_state(state)
+            flux_response_bars = None if lagged_response_bars is None else lagged_response_bars.flux_response
+            geometry_bar = jax.tree_util.tree_map(
+                lambda leaf: jnp.broadcast_to(
+                    jnp.zeros_like(jnp.asarray(leaf)), (0,) + jnp.asarray(leaf).shape
+                ),
+                geometry,
+            ) if flux_response_bars is None else jax.vmap(
+                lambda flux_response_bar: self._direct_geometry_build_lagged_response_bar(
+                    self.shared_flux_model, geometry, working_state, flux_response_bar,
+                )
+            )(flux_response_bars)
+            return (
+                {"ntx_support": ntx_support_bar, "geometry": geometry_bar},
+                native_vmec_coefficient_bars,
+            )
+
+        working_state, _eidx = self._prepare_working_state(state)
+        flux_response_bars = None if lagged_response_bars is None else lagged_response_bars.flux_response
+        if self.shared_flux_model is None or flux_response_bars is None:
+            raise NotImplementedError(
+                "native VMEC coefficient support pullback requires an active shared flux response."
+            )
+        pullback_fn = getattr(
+            self.shared_flux_model,
+            "pullback_build_lagged_response_support_payload_batched_interpolated_faces_"
+            "native_multi_rhs_reuse_moment_drds_jvp_shared_primal_with_vmec_coefficients_"
+            "direct_coefficient_pullback",
+            None,
+        )
+        if not callable(pullback_fn):
+            raise NotImplementedError(
+                "The active shared flux model does not expose the direct coefficient transpose rule."
+            )
+        return pullback_fn(
+            working_state, flux_response_bars, support, **self._shared_flux_call_kwargs(kwargs),
+        )
+
     def pullback_build_lagged_response_support_payload_batched_interpolated_faces_native_multi_rhs_compact_residual_reuse_moment_drds_jvp_shared_primal(
         self, state, lagged_response_bars, support, **kwargs,
     ):
