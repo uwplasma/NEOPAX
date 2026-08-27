@@ -1242,6 +1242,29 @@ class CombinedTransportFluxModel(TransportFluxModelBase):
         response_bars = None if lagged_response_bars is None else lagged_response_bars.neoclassical_response
         return pullback_fn(state, response_bars, support)
 
+    def pullback_build_lagged_response_support_payload_batched_interpolated_faces_native_multi_rhs_reuse_moment_drds_jvp_shared_primal_with_vmec_coefficients_direct_directional_product_rule(
+        self, state, lagged_response_bars, support, **kwargs,
+    ):
+        """Forward the opt-in direct directional VMEC-coefficient rule."""
+
+        del kwargs
+        pullback_fn = getattr(
+            self.neoclassical_model,
+            "pullback_build_lagged_response_support_payload_batched_interpolated_faces_"
+            "native_multi_rhs_reuse_moment_drds_jvp_shared_primal_with_vmec_coefficients_"
+            "direct_directional_product_rule",
+            None,
+        )
+        if not callable(pullback_fn):
+            raise NotImplementedError(
+                "The active neoclassical model does not expose the direct native "
+                "VMEC coefficient rule."
+            )
+        response_bars = (
+            None if lagged_response_bars is None else lagged_response_bars.neoclassical_response
+        )
+        return pullback_fn(state, response_bars, support)
+
     def pullback_build_lagged_response_support_payload_batched_interpolated_faces_native_multi_rhs_compact_shared_primal(
         self,
         state,
@@ -14681,10 +14704,28 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             Er=state_bar_acc.Er + state_bar.Er,
         )
 
-    def build_local_particle_flux_evaluator(self, state):
+    def local_particle_flux_from_state_support(
+        self,
+        state,
+        radius_index,
+        er_value,
+        *,
+        geometry,
+        support,
+    ):
+        """Evaluate one exact-Lij local particle-flux row from explicit inputs.
+
+        This is the same local algebra used by
+        :meth:`build_local_particle_flux_evaluator`, but state, geometry, and
+        support are explicit inputs rather than captured by the returned
+        evaluator closure.  Keeping this boundary explicit is required before
+        optimization can own a persistent, bounded reverse kernel.  It does
+        not change the default evaluator API or its mathematics.
+        """
+
         evaluated = build_evaluated_transport_state(
             state,
-            self.geometry,
+            geometry,
             bc_density=self.bc_density,
             bc_temperature=self.bc_temperature,
             density_floor=self.density_floor,
@@ -14692,7 +14733,6 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         )
         density = evaluated.center.density
         temperature = evaluated.center.temperature
-        support = self._static_support()
         center_prepared = support.center_prepared
         center_drds = support.center_channels.drds
         collisionality_kind = _collisionality_kind(self.collisionality_model)
@@ -14701,48 +14741,62 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         dndr_all = evaluated.density_grad_center
         dTdr_all = evaluated.temperature_grad_center
 
-        def evaluator(radius_index, er_value):
-            radius_index = jnp.asarray(radius_index, dtype=jnp.int32)
-            er_scalar = jnp.asarray(er_value, dtype=state.Er.dtype)
-            prepared = jax.tree_util.tree_map(
-                lambda arr: jax.lax.dynamic_index_in_dim(arr, radius_index, axis=0, keepdims=False),
-                center_prepared,
+        radius_index = jnp.asarray(radius_index, dtype=jnp.int32)
+        er_scalar = jnp.asarray(er_value, dtype=state.Er.dtype)
+        prepared = jax.tree_util.tree_map(
+            lambda arr: jax.lax.dynamic_index_in_dim(arr, radius_index, axis=0, keepdims=False),
+            center_prepared,
+        )
+        drds_value = jax.lax.dynamic_index_in_dim(center_drds, radius_index, axis=0, keepdims=False)
+        temperature_local = jax.lax.dynamic_index_in_dim(temperature, radius_index, axis=1, keepdims=False)
+        density_local = jax.lax.dynamic_index_in_dim(density, radius_index, axis=1, keepdims=False)
+        vthermal_local = jax.lax.dynamic_index_in_dim(v_thermal, radius_index, axis=1, keepdims=False)
+        er_profile = state.Er.at[radius_index].set(er_scalar)
+        lij = jax.vmap(
+            lambda species_index: self._solve_lij_prepared_local(
+                prepared,
+                drds_value=drds_value,
+                species_index=species_index,
+                er_value=er_scalar,
+                temperature_local=temperature_local,
+                density_local=density_local,
+                vthermal_local=vthermal_local,
+                collisionality_kind=collisionality_kind,
+                derivative_mode_override="direct",
             )
-            drds_value = jax.lax.dynamic_index_in_dim(center_drds, radius_index, axis=0, keepdims=False)
-            temperature_local = jax.lax.dynamic_index_in_dim(temperature, radius_index, axis=1, keepdims=False)
-            density_local = jax.lax.dynamic_index_in_dim(density, radius_index, axis=1, keepdims=False)
-            vthermal_local = jax.lax.dynamic_index_in_dim(v_thermal, radius_index, axis=1, keepdims=False)
-            er_profile = state.Er.at[radius_index].set(er_scalar)
-            lij = jax.vmap(
-                lambda species_index: self._solve_lij_prepared_local(
-                    prepared,
-                    drds_value=drds_value,
-                    species_index=species_index,
-                    er_value=er_scalar,
-                    temperature_local=temperature_local,
-                    density_local=density_local,
-                    vthermal_local=vthermal_local,
-                    collisionality_kind=collisionality_kind,
-                    derivative_mode_override="direct",
-                )
-            )(species_indices)
-            a1 = jax.vmap(
-                lambda charge, density_a, temperature_a, dndr_a, dTdr_a: get_Thermodynamical_Forces_A1(
-                    charge,
-                    density_a,
-                    temperature_a,
-                    dndr_a,
-                    dTdr_a,
-                    er_profile,
-                )
-            )(self.species.charge, density, temperature, dndr_all, dTdr_all)
-            a2 = jax.vmap(get_Thermodynamical_Forces_A2)(temperature, dTdr_all)
-            a3 = get_Thermodynamical_Forces_A3(er_profile)
-            density_phys = DENSITY_STATE_TO_PHYSICAL * density_local
-            return -density_phys * (
-                lij[:, 0, 0] * jax.lax.dynamic_index_in_dim(a1, radius_index, axis=1, keepdims=False)
-                + lij[:, 0, 1] * jax.lax.dynamic_index_in_dim(a2, radius_index, axis=1, keepdims=False)
-                + lij[:, 0, 2] * jax.lax.dynamic_index_in_dim(a3, radius_index, axis=0, keepdims=False)
+        )(species_indices)
+        a1 = jax.vmap(
+            lambda charge, density_a, temperature_a, dndr_a, dTdr_a: get_Thermodynamical_Forces_A1(
+                charge,
+                density_a,
+                temperature_a,
+                dndr_a,
+                dTdr_a,
+                er_profile,
+            )
+        )(self.species.charge, density, temperature, dndr_all, dTdr_all)
+        a2 = jax.vmap(get_Thermodynamical_Forces_A2)(temperature, dTdr_all)
+        a3 = get_Thermodynamical_Forces_A3(er_profile)
+        density_phys = DENSITY_STATE_TO_PHYSICAL * density_local
+        return -density_phys * (
+            lij[:, 0, 0] * jax.lax.dynamic_index_in_dim(a1, radius_index, axis=1, keepdims=False)
+            + lij[:, 0, 1] * jax.lax.dynamic_index_in_dim(a2, radius_index, axis=1, keepdims=False)
+            + lij[:, 0, 2] * jax.lax.dynamic_index_in_dim(a3, radius_index, axis=0, keepdims=False)
+        )
+
+    def build_local_particle_flux_evaluator(self, state):
+        """Return the legacy local-evaluator closure for unstaged callers."""
+
+        geometry = self.geometry
+        support = self._static_support()
+
+        def evaluator(radius_index, er_value):
+            return self.local_particle_flux_from_state_support(
+                state,
+                radius_index,
+                er_value,
+                geometry=geometry,
+                support=support,
             )
 
         return evaluator

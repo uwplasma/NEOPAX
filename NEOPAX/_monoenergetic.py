@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+import dataclasses
 from typing import Any
+
+import jax.numpy as jnp
 
 from ._database import Monoenergetic, Monoenergetic3D, MonoenergeticLogErNoR
 from ._database_ntss_preprocessed import NTSSPreprocessedMonoenergetic
@@ -99,3 +102,72 @@ def monoenergetic_database_kind(database: Any) -> str:
         if isinstance(database, cls):
             return kind
     return MONOENERGETIC_KIND_GENERIC
+
+
+def database_with_geometry_scale(database: Any, a_b: Any) -> Any:
+    """Return a pure database view rebuilt for a new geometry scale.
+
+    The database file contains fixed coefficient values.  Its interpolation
+    coordinates and radius limits, however, contain ``a_b``.  A realtime
+    geometry reverse must therefore not replace only the model geometry while
+    retaining the old database object.
+
+    This deliberately supports only the formats whose complete scale
+    dependence is represented by their existing pytree leaves.  The NTSS
+    preprocessed format additionally receives geometry-derived fit channels
+    at load time and needs its own full reconstruction contract.
+    """
+
+    if isinstance(database, NTSSPreprocessedMonoenergetic):
+        raise ValueError(
+            "Realtime geometry replacement for preprocessed_ntss databases "
+            "is not implemented: its fit channels depend on more than a_b."
+        )
+
+    old_a_b = jnp.asarray(database.a_b)
+    new_a_b = jnp.asarray(a_b, dtype=old_a_b.dtype)
+    log_scale_shift = jnp.log10(
+        jnp.maximum(old_a_b, 1.0e-30) / jnp.maximum(new_a_b, 1.0e-30)
+    )
+
+    if isinstance(database, Monoenergetic):
+        return dataclasses.replace(
+            database,
+            a_b=new_a_b,
+            Er_list=database.Er_list + log_scale_shift,
+            low_limit_r=jnp.asarray(1.0e-3, dtype=new_a_b.dtype) * new_a_b,
+            r1_lim=new_a_b * database.rho[1],
+            rmn2_lim=new_a_b * database.rho[-2],
+            r1=database.rho[0] * new_a_b,
+            r2=database.rho[1] * new_a_b,
+            r3=database.rho[2] * new_a_b,
+            rnm3=database.rho[-3] * new_a_b,
+            rnm2=database.rho[-2] * new_a_b,
+            rnm1=database.rho[-1] * new_a_b,
+        )
+
+    if isinstance(
+        database,
+        (
+            PreprocessedMonoenergetic3D,
+            PreprocessedMonoenergetic3DNTSSRadius,
+        ),
+    ):
+        updates = {
+            "a_b": new_a_b,
+            "r_grid": new_a_b * database.rho,
+            "Er_grid": database.Er_grid + log_scale_shift,
+            "low_limit_r": jnp.asarray(1.0e-3, dtype=new_a_b.dtype) * new_a_b,
+        }
+        if isinstance(database, PreprocessedMonoenergetic3DNTSSRadiusNTSS1D):
+            updates["Er_grid_ntss1d"] = jnp.where(
+                jnp.isfinite(database.Er_grid_ntss1d),
+                database.Er_grid_ntss1d + log_scale_shift,
+                database.Er_grid_ntss1d,
+            )
+        return dataclasses.replace(database, **updates)
+
+    raise TypeError(
+        "Unsupported monoenergetic database type for realtime geometry "
+        f"replacement: {type(database).__name__}."
+    )

@@ -647,6 +647,40 @@ def test_native_multi_rhs_reused_drds_equation_system_forwarding_hook_is_exposed
     assert calls == [("state", "flux-bars", "support")]
 
 
+def test_direct_directional_vmec_composite_and_equation_hooks_are_exposed_to_radau():
+    """Prevent an inner-only direct selector from failing after setup."""
+
+    calls = []
+
+    class _InnerNTX:
+        def pullback_build_lagged_response_support_payload_batched_interpolated_faces_native_multi_rhs_reuse_moment_drds_jvp_shared_primal_with_vmec_coefficients_direct_directional_product_rule(
+            self, state, response_bars, support,
+        ):
+            calls.append((state, response_bars, support))
+            return "direct-result"
+
+    composite = object.__new__(CombinedTransportFluxModel)
+    object.__setattr__(composite, "neoclassical_model", _InnerNTX())
+    combined_response = SimpleNamespace(neoclassical_response="ntx-bars")
+    assert composite.pullback_build_lagged_response_support_payload_batched_interpolated_faces_native_multi_rhs_reuse_moment_drds_jvp_shared_primal_with_vmec_coefficients_direct_directional_product_rule(
+        "state", combined_response, "support", ignored_outer_keyword=True,
+    ) == "direct-result"
+
+    equations = object.__new__(ComposedEquationSystem)
+    object.__setattr__(equations, "shared_flux_model", composite)
+    object.__setattr__(equations, "_split_realtime_geometry_payload", lambda support: (support, None))
+    object.__setattr__(equations, "_prepare_working_state", lambda state: (state, None))
+    object.__setattr__(equations, "_shared_flux_call_kwargs", lambda kwargs: {})
+    equation_response = SimpleNamespace(flux_response=combined_response)
+    assert equations.pullback_build_lagged_response_support_payload_batched_interpolated_faces_native_multi_rhs_reuse_moment_drds_jvp_shared_primal_with_vmec_coefficients_direct_directional_product_rule(
+        "state", equation_response, "support", ignored_outer_keyword=True,
+    ) == "direct-result"
+    assert calls == [
+        ("state", "ntx-bars", "support"),
+        ("state", "ntx-bars", "support"),
+    ]
+
+
 def test_native_split_joint_no_prepared_carry_hook_selects_only_its_wrapper():
     """The compact initial mode cannot silently select the older joint hook."""
 

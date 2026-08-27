@@ -9,8 +9,10 @@ import jax.numpy as jnp
 
 from ._ambipolarity import solve_ambipolarity_roots_radial_jax
 from ._entropy_models import get_entropy_model
+from ._monoenergetic import database_with_geometry_scale
 from ._transport_flux_models import (
     DENSITY_STATE_TO_PHYSICAL,
+    NTXDatabaseTransportModel,
     _add_float_delta_tree,
     _collisionality_kind,
     _extract_right_constraints,
@@ -50,7 +52,20 @@ def initial_er_root_setup(config: dict, runtime):
     return amb_cfg, model_name, entropy_model, params
 
 
-def initial_er_selected_root_profile(state, *, config: dict, runtime):
+def _initial_er_local_particle_flux_evaluator(state, *, runtime, stage=None):
+    """Return staged or legacy local particle-flux evaluation for root AD."""
+
+    if stage is None:
+        return runtime.models.flux.build_local_particle_flux_evaluator(state)
+    stage.validate_runtime(runtime)
+    return stage.adapter.local_particle_flux_evaluator(
+        state,
+        geometry=runtime.geometry,
+        support=find_ntx_support_payload(runtime),
+    )
+
+
+def initial_er_selected_root_profile(state, *, config: dict, runtime, stage=None):
     """Return the selected ambipolar Er profile and finite-root mask."""
 
     amb_cfg, model_name, entropy_model, params = initial_er_root_setup(config, runtime)
@@ -62,18 +77,27 @@ def initial_er_selected_root_profile(state, *, config: dict, runtime):
         flux_model=runtime.models.flux,
         entropy_model=entropy_model,
         amb_cfg=amb_cfg,
+        local_particle_flux_evaluator=_initial_er_local_particle_flux_evaluator(
+            state,
+            runtime=runtime,
+            stage=stage,
+        ),
     )
     best_roots = jnp.asarray(best_roots, dtype=state.Er.dtype)
     finite_mask = jnp.isfinite(best_roots)
     return jnp.where(finite_mask, best_roots, state.Er), finite_mask
 
 
-def initial_er_charge_flux_residuals(state, er_profile, *, runtime):
+def initial_er_charge_flux_residuals(state, er_profile, *, runtime, stage=None):
     """Return charge-weighted particle-flux residuals at the selected root."""
 
     charge_qp = jnp.asarray(runtime.species.charge_qp)
     state_with_er = dataclasses.replace(state, Er=er_profile)
-    local_particle_flux = runtime.models.flux.build_local_particle_flux_evaluator(state_with_er)
+    local_particle_flux = _initial_er_local_particle_flux_evaluator(
+        state_with_er,
+        runtime=runtime,
+        stage=stage,
+    )
     if local_particle_flux is None:
         raise ValueError("Initial-Er root AD requires a local particle-flux evaluator.")
 
@@ -85,19 +109,23 @@ def initial_er_charge_flux_residuals(state, er_profile, *, runtime):
     return jax.lax.map(_residual_i, indices)
 
 
-def initial_er_charge_flux_residual_scalar(state, er_profile, radius_index, *, runtime):
+def initial_er_charge_flux_residual_scalar(state, er_profile, radius_index, *, runtime, stage=None):
     """Return one scalar charge-flux residual for compact transposition."""
 
     charge_qp = jnp.asarray(runtime.species.charge_qp)
     state_with_er = dataclasses.replace(state, Er=er_profile)
-    local_particle_flux = runtime.models.flux.build_local_particle_flux_evaluator(state_with_er)
+    local_particle_flux = _initial_er_local_particle_flux_evaluator(
+        state_with_er,
+        runtime=runtime,
+        stage=stage,
+    )
     if local_particle_flux is None:
         raise ValueError("Initial-Er root AD requires a local particle-flux evaluator.")
     gamma = local_particle_flux(radius_index, er_profile[radius_index])
     return jnp.sum(charge_qp * gamma)
 
 
-def initial_er_charge_flux_residual_er_derivative(state, er_profile, *, runtime):
+def initial_er_charge_flux_residual_er_derivative(state, er_profile, *, runtime, stage=None):
     """Return d residual / d Er at each radius for selected-root AD."""
 
     charge_qp = jnp.asarray(runtime.species.charge_qp)
@@ -106,7 +134,11 @@ def initial_er_charge_flux_residual_er_derivative(state, er_profile, *, runtime)
     def _residual_i_er(i, er_value):
         er_eval = er_profile.at[i].set(er_value)
         state_with_er = dataclasses.replace(state, Er=er_eval)
-        local_particle_flux = runtime.models.flux.build_local_particle_flux_evaluator(state_with_er)
+        local_particle_flux = _initial_er_local_particle_flux_evaluator(
+            state_with_er,
+            runtime=runtime,
+            stage=stage,
+        )
         if local_particle_flux is None:
             raise ValueError("Initial-Er root AD requires a local particle-flux evaluator.")
         gamma = local_particle_flux(i, er_value)
@@ -153,6 +185,12 @@ def runtime_with_ntx_support_payload(runtime, support):
 def _replace_geometry_payload_in_model(model, geometry):
     if model is None or not dataclasses.is_dataclass(model) or isinstance(model, type):
         return model, False
+    if isinstance(model, NTXDatabaseTransportModel):
+        return dataclasses.replace(
+            model,
+            geometry=geometry,
+            database=database_with_geometry_scale(model.database, geometry.a_b),
+        ), True
     updates = {}
     changed = False
     for field in dataclasses.fields(model):
@@ -172,13 +210,28 @@ def _replace_geometry_payload_in_model(model, geometry):
     return dataclasses.replace(model, **updates), True
 
 
+def find_database_payload_in_model(model):
+    """Return the rebuilt database owned by a nested database flux model."""
+
+    if isinstance(model, NTXDatabaseTransportModel):
+        return model.database
+    if dataclasses.is_dataclass(model) and not isinstance(model, type):
+        for field in dataclasses.fields(model):
+            found = find_database_payload_in_model(getattr(model, field.name))
+            if found is not None:
+                return found
+    return None
+
+
 def runtime_with_geometry_payload(runtime, geometry):
     """Return runtime with transport geometry payload replaced everywhere needed."""
 
     flux_model, _changed = _replace_geometry_payload_in_model(runtime.models.flux, geometry)
+    database = find_database_payload_in_model(flux_model)
     return dataclasses.replace(
         runtime,
         geometry=geometry,
+        database=runtime.database if database is None else database,
         models=dataclasses.replace(runtime.models, flux=flux_model),
     )
 

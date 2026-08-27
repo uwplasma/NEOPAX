@@ -23,6 +23,7 @@ from ._geometry_autodiff import (
     geometry_raw_block_stage,
     geometry_raw_block_solve_from_param_vector,
 )
+from ._optimization_reverse_stage import geometry_transport_reverse_stage
 from ._constants import elementary_charge
 from ._orchestrator import build_runtime_context
 from ._orchestrator import run_config
@@ -329,6 +330,7 @@ class GeometryInitialErRootLeastSquaresProblem:
     geometry_solver_device: str | None = "default"
     root_options: Mapping[str, object] | None = None
     raw_block_stage: object | None = None
+    reverse_stage: object | None = None
 
     @property
     def parameter_count(self) -> int:
@@ -432,6 +434,7 @@ class GeometryInitialErRootLeastSquaresProblem:
             geometry_solver_device=self.geometry_solver_device,
             root_options=self.root_options,
             raw_block_stage=self.raw_block_stage,
+            reverse_stage=self.reverse_stage,
         )
         result = _assemble_mixed_initial_er_root_result(
             self.terms,
@@ -1329,6 +1332,19 @@ def geometry_initial_er_root_only_least_squares_problem(
             max_iter=geometry_max_iter,
         )
     )
+    has_initial_er_root_terms = any(
+        isinstance(term, LeastSquaresTerm) and term.objective.family == "transport"
+        for term in normalized_terms
+    )
+    reverse_stage = (
+        geometry_transport_reverse_stage(
+            config=config_eff,
+            runtime=runtime,
+            radial_count=int(n_r if n_r is not None else geom_cfg.get("n_radial", 51)),
+        )
+        if has_initial_er_root_terms
+        else None
+    )
     return GeometryInitialErRootLeastSquaresProblem(
         config=config_eff,
         context=context,
@@ -1358,6 +1374,7 @@ def geometry_initial_er_root_only_least_squares_problem(
         geometry_solver_device=geometry_solver_device,
         root_options=None if root_options is None else dict(root_options),
         raw_block_stage=raw_block_stage,
+        reverse_stage=reverse_stage,
     )
 
 

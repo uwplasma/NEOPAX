@@ -13,15 +13,21 @@ from NEOPAX._orchestrator import (
     _load_ntss_reference_profiles,
     _normalize_solver_config,
     _resolve_reference_path,
+    Models,
+    RuntimeContext,
 )
+from NEOPAX._reverse_ad_initial_er import runtime_with_geometry_payload
 from NEOPAX._monoenergetic import (
     MONOENERGETIC_KIND_GENERIC,
     MONOENERGETIC_KIND_PREPROCESSED_3D_NTSS1D_FIXED,
     MONOENERGETIC_KIND_PREPROCESSED_3D_RADIAL_NTSS1D,
     load_monoenergetic_database,
+    database_with_geometry_scale,
     monoenergetic_database_kind,
 )
+from NEOPAX._database import Monoenergetic
 from NEOPAX._database_preprocessed import (
+    PreprocessedMonoenergetic3D,
     PreprocessedMonoenergetic3DNTSSRadiusNTSS1D,
     PreprocessedMonoenergetic3DNTSSRadiusNTSS1DFixedNU,
 )
@@ -31,6 +37,7 @@ from NEOPAX._source_models import get_source_model
 from NEOPAX._species import Species
 from NEOPAX._state import TransportState
 from NEOPAX._transport_flux_models import (
+    NTXDatabaseTransportModel,
     NTXExactLijRuntimeTransportModel,
     NTXExactLijRuntimeSupport,
     NTXRuntimeScanChannels,
@@ -867,6 +874,96 @@ def test_monoenergetic_database_kind_prefers_most_specific_subclass():
     ntss1d = object.__new__(PreprocessedMonoenergetic3DNTSSRadiusNTSS1D)
     assert monoenergetic_database_kind(fixed) == MONOENERGETIC_KIND_PREPROCESSED_3D_NTSS1D_FIXED
     assert monoenergetic_database_kind(ntss1d) == MONOENERGETIC_KIND_PREPROCESSED_3D_RADIAL_NTSS1D
+
+
+def test_database_with_geometry_scale_rebuilds_generic_scale_coordinates():
+    database = Monoenergetic(
+        a_b=jnp.asarray(2.0),
+        rho=jnp.asarray([0.1, 0.3, 0.6, 0.9, 1.0]),
+        nu_log=jnp.asarray([-2.0, -1.0]),
+        Er_list=jnp.asarray([[1.0, 2.0]] * 5),
+        D11_log=jnp.zeros((5, 2, 2)),
+        D13=jnp.zeros((5, 2, 2)),
+        D33=jnp.zeros((5, 2, 2)),
+    )
+
+    actual = database_with_geometry_scale(database, jnp.asarray(4.0))
+
+    assert jnp.allclose(actual.a_b, 4.0)
+    assert jnp.allclose(actual.Er_list, database.Er_list + jnp.log10(0.5))
+    assert jnp.allclose(actual.low_limit_r, 4.0e-3)
+    assert jnp.allclose(actual.r1_lim, 4.0 * database.rho[1])
+    assert jnp.allclose(actual.rnm1, 4.0 * database.rho[-1])
+    assert actual.D11_log is database.D11_log
+
+    _, tangent = jax.jvp(
+        lambda scale: database_with_geometry_scale(database, scale).Er_list,
+        (jnp.asarray(2.0),),
+        (jnp.asarray(0.2),),
+    )
+    assert jnp.allclose(tangent, -0.2 / (2.0 * jnp.log(10.0)))
+
+
+def test_database_with_geometry_scale_rebuilds_preprocessed_coordinates():
+    database = PreprocessedMonoenergetic3D(
+        a_b=jnp.asarray(2.0),
+        rho=jnp.asarray([0.2, 0.5, 0.8]),
+        r_grid=jnp.asarray([0.4, 1.0, 1.6]),
+        nu_log=jnp.asarray([-2.0]),
+        Er_grid=jnp.asarray([[1.0, 2.0]] * 3),
+        D11_log=jnp.zeros((3, 1, 2)),
+        D13=jnp.zeros((3, 1, 2)),
+        D33=jnp.zeros((3, 1, 2)),
+        Er_lower_limit=jnp.asarray(1.0e-8),
+        low_limit_r=jnp.asarray(2.0e-3),
+        del_r=jnp.asarray(1.0e-3),
+    )
+
+    actual = database_with_geometry_scale(database, jnp.asarray(4.0))
+
+    assert jnp.allclose(actual.r_grid, 4.0 * database.rho)
+    assert jnp.allclose(actual.Er_grid, database.Er_grid + jnp.log10(0.5))
+    assert jnp.allclose(actual.low_limit_r, 4.0e-3)
+    assert actual.D33 is database.D33
+
+
+def test_runtime_geometry_replacement_rebuilds_database_scale():
+    database = Monoenergetic(
+        a_b=jnp.asarray(2.0),
+        rho=jnp.asarray([0.1, 0.3, 0.6, 0.9, 1.0]),
+        nu_log=jnp.asarray([-2.0]),
+        Er_list=jnp.asarray([[1.0]] * 5),
+        D11_log=jnp.zeros((5, 1, 1)),
+        D13=jnp.zeros((5, 1, 1)),
+        D33=jnp.zeros((5, 1, 1)),
+    )
+    old_geometry = types.SimpleNamespace(a_b=jnp.asarray(2.0))
+    new_geometry = types.SimpleNamespace(a_b=jnp.asarray(4.0))
+    model = NTXDatabaseTransportModel(
+        species="species",
+        energy_grid="grid",
+        geometry=old_geometry,
+        database=database,
+    )
+    runtime = RuntimeContext(
+        species="species",
+        energy_grid="grid",
+        geometry=old_geometry,
+        database=database,
+        solver_parameters={},
+        models=Models(flux=model),
+    )
+
+    actual = runtime_with_geometry_payload(runtime, new_geometry)
+
+    assert actual.geometry is new_geometry
+    assert actual.models.flux.geometry is new_geometry
+    assert jnp.allclose(actual.models.flux.database.a_b, 4.0)
+    assert actual.database is actual.models.flux.database
+    assert jnp.allclose(
+        actual.models.flux.database.Er_list,
+        database.Er_list + jnp.log10(0.5),
+    )
 
 
 def test_monoenergetic_interpolation_kernel_defaults_to_generic():
