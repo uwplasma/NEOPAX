@@ -191,6 +191,7 @@ _BATCHED_REBUILD_SUPPORT_HOOK_NAMES = {
     "ntx_batched_interpolated_faces_native_multi_rhs_reuse_moment_drds_jvp_shared_primal_with_vmec_coefficients": "flat_rhs_build_support_pullback_batched_interpolated_faces_native_multi_rhs_reuse_moment_drds_jvp_shared_primal_with_vmec_coefficients",
     "ntx_batched_interpolated_faces_native_multi_rhs_reuse_moment_drds_jvp_shared_primal_with_vmec_coefficients_direct_directional_product_rule": "flat_rhs_build_support_pullback_batched_interpolated_faces_native_multi_rhs_reuse_moment_drds_jvp_shared_primal_with_vmec_coefficients_direct_directional_product_rule",
     "ntx_batched_interpolated_faces_native_multi_rhs_reuse_moment_drds_jvp_shared_primal_with_vmec_coefficients_direct_coefficient_pullback": "flat_rhs_build_support_pullback_batched_interpolated_faces_native_multi_rhs_reuse_moment_drds_jvp_shared_primal_with_vmec_coefficients_direct_coefficient_pullback",
+    "ntx_batched_interpolated_faces_native_multi_rhs_reuse_moment_drds_jvp_shared_primal_with_vmec_coefficients_direct_directional_product_rule_per_energy_call_boundary": "flat_rhs_build_support_pullback_batched_interpolated_faces_native_multi_rhs_reuse_moment_drds_jvp_shared_primal_with_vmec_coefficients_direct_directional_product_rule_per_energy_call_boundary",
 }
 
 _NATIVE_VMEC_REBUILD_SUPPORT_MODES = frozenset(
@@ -198,6 +199,7 @@ _NATIVE_VMEC_REBUILD_SUPPORT_MODES = frozenset(
         "ntx_batched_interpolated_faces_native_multi_rhs_reuse_moment_drds_jvp_shared_primal_with_vmec_coefficients",
         "ntx_batched_interpolated_faces_native_multi_rhs_reuse_moment_drds_jvp_shared_primal_with_vmec_coefficients_direct_directional_product_rule",
         "ntx_batched_interpolated_faces_native_multi_rhs_reuse_moment_drds_jvp_shared_primal_with_vmec_coefficients_direct_coefficient_pullback",
+        "ntx_batched_interpolated_faces_native_multi_rhs_reuse_moment_drds_jvp_shared_primal_with_vmec_coefficients_direct_directional_product_rule_per_energy_call_boundary",
     }
 )
 
@@ -3083,6 +3085,7 @@ def prepare_reverse_static_setup(
         "ntx_batched_interpolated_faces_native_multi_rhs_reuse_moment_drds_jvp_shared_primal_with_vmec_coefficients",
         "ntx_batched_interpolated_faces_native_multi_rhs_reuse_moment_drds_jvp_shared_primal_with_vmec_coefficients_direct_directional_product_rule",
         "ntx_batched_interpolated_faces_native_multi_rhs_reuse_moment_drds_jvp_shared_primal_with_vmec_coefficients_direct_coefficient_pullback",
+        "ntx_batched_interpolated_faces_native_multi_rhs_reuse_moment_drds_jvp_shared_primal_with_vmec_coefficients_direct_directional_product_rule_per_energy_call_boundary",
         "ntx_joint_implicit_interpolated_faces",
         "ntx_joint_implicit_interpolated_faces_packed_support_adjoint",
         "ntx_joint_implicit_interpolated_faces_reuse_local_vjp_primal",
@@ -3105,6 +3108,7 @@ def prepare_reverse_static_setup(
             "'ntx_batched_interpolated_faces_native_multi_rhs_reuse_moment_drds_jvp_shared_primal_with_vmec_coefficients', "
             "'ntx_batched_interpolated_faces_native_multi_rhs_reuse_moment_drds_jvp_shared_primal_with_vmec_coefficients_direct_directional_product_rule', "
             "'ntx_batched_interpolated_faces_native_multi_rhs_reuse_moment_drds_jvp_shared_primal_with_vmec_coefficients_direct_coefficient_pullback', "
+            "'ntx_batched_interpolated_faces_native_multi_rhs_reuse_moment_drds_jvp_shared_primal_with_vmec_coefficients_direct_directional_product_rule_per_energy_call_boundary', "
             "'ntx_joint_implicit_interpolated_faces', "
             "'ntx_joint_implicit_interpolated_faces_packed_support_adjoint', "
             "'ntx_joint_implicit_interpolated_faces_reuse_local_vjp_primal', "
@@ -3123,6 +3127,7 @@ def prepare_reverse_static_setup(
             "ntx_batched_interpolated_faces_native_multi_rhs_reuse_moment_drds_jvp_shared_primal_with_vmec_coefficients",
             "ntx_batched_interpolated_faces_native_multi_rhs_reuse_moment_drds_jvp_shared_primal_with_vmec_coefficients_direct_directional_product_rule",
             "ntx_batched_interpolated_faces_native_multi_rhs_reuse_moment_drds_jvp_shared_primal_with_vmec_coefficients_direct_coefficient_pullback",
+            "ntx_batched_interpolated_faces_native_multi_rhs_reuse_moment_drds_jvp_shared_primal_with_vmec_coefficients_direct_directional_product_rule_per_energy_call_boundary",
             "ntx_joint_implicit_interpolated_faces",
             "ntx_joint_implicit_interpolated_faces_packed_support_adjoint",
             "ntx_joint_implicit_interpolated_faces_reuse_local_vjp_primal",

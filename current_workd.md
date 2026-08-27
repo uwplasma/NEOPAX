@@ -2748,3 +2748,35 @@ Plan:
 selector retains the existing direct directional contraction as well as the
 new exact coefficient contraction.  The selected fast path remains unchanged.
 The next gate is one remote cache-disabled comparison.
+
+### Re-audit after direct coefficient experiment (2026-08-27)
+
+The direct coefficient selector retained the desired warm segment values but
+compiled in about three minutes, so it is not a compile-time success and must
+remain opt-in.  The native VMEC-coefficient route already omits the generic
+prepared-bar return, and the direct directional and direct coefficient rules
+remove two smaller nested AD regions.  Since neither materially changes the
+first segment compile, the remaining dominant graph is the grouped native
+per-energy low-dot/factorized-adjoint operation itself, traced inline through
+the `lax.map` in the local flux-model support pullback.
+
+The next isolated hypothesis is a **per-energy non-inline JAX call boundary**
+around that complete local native operation.  This is different from the
+previous Radau-step/branch call-boundary modes: those left the native
+per-energy body in the same compiled step computation.  A pure array mock
+now verifies the required lowering property (one additional HLO call inside
+the mapped body, exact identical result) before any production selector is
+wired.  It makes no host transfer, serial objective loop, retained factor
+payload, or mathematical change.  The production selector remains unchanged
+until the mock gate passes and a separate opt-in mode is wired.
+
+#### Per-energy call-boundary implementation status
+
+The pure lowering gate and a small local native-VMEC equality gate are now
+wired, along with the deliberately opt-in selector:
+
+`ntx_batched_interpolated_faces_native_multi_rhs_reuse_moment_drds_jvp_shared_primal_with_vmec_coefficients_direct_directional_product_rule_per_energy_call_boundary`
+
+This is exactly the validated direct-directional native path with only the
+per-energy device-call boundary added. It is not promoted and has not yet had
+a remote cache-disabled benchmark. Both CPU gates must pass before one is run.

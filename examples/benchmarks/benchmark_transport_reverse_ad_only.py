@@ -5535,6 +5535,7 @@ def main() -> None:
             "ntx_batched_interpolated_faces_native_multi_rhs_reuse_moment_drds_jvp_shared_primal_with_vmec_coefficients",
             "ntx_batched_interpolated_faces_native_multi_rhs_reuse_moment_drds_jvp_shared_primal_with_vmec_coefficients_direct_directional_product_rule",
             "ntx_batched_interpolated_faces_native_multi_rhs_reuse_moment_drds_jvp_shared_primal_with_vmec_coefficients_direct_coefficient_pullback",
+            "ntx_batched_interpolated_faces_native_multi_rhs_reuse_moment_drds_jvp_shared_primal_with_vmec_coefficients_direct_directional_product_rule_per_energy_call_boundary",
             "ntx_batched_interpolated_faces_native_multi_rhs_compact_residual_reuse_moment_drds_jvp_shared_primal",
             "ntx_joint_implicit_interpolated_faces",
             "ntx_joint_implicit_interpolated_faces_packed_support_adjoint",
@@ -5593,6 +5594,8 @@ def main() -> None:
             "native primitive JVPs with the separately validated direct product rule. "
             "'ntx_batched_interpolated_faces_native_multi_rhs_reuse_moment_drds_jvp_shared_primal_with_vmec_coefficients_direct_coefficient_pullback' "
             "instead replaces the upstream affine coefficient transpose and its two directional contractions. "
+            "'ntx_batched_interpolated_faces_native_multi_rhs_reuse_moment_drds_jvp_shared_primal_with_vmec_coefficients_direct_directional_product_rule_per_energy_call_boundary' "
+            "keeps the validated local algebra but lowers each energy operation as a non-inline device call. "
             "'ntx_joint_implicit_interpolated_faces' is the exact experimental "
             "mode that obtains rebuild state and NTX-support bars jointly from "
             "the same local NTX implicit adjoint. "

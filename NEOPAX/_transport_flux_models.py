@@ -1352,6 +1352,27 @@ class CombinedTransportFluxModel(TransportFluxModelBase):
         )
         return pullback_fn(state, response_bars, support)
 
+    def pullback_build_lagged_response_support_payload_batched_interpolated_faces_native_multi_rhs_reuse_moment_drds_jvp_shared_primal_with_vmec_coefficients_direct_directional_product_rule_per_energy_call_boundary(
+        self, state, lagged_response_bars, support, **kwargs,
+    ):
+        """Forward the local non-inline call-boundary experiment."""
+        del kwargs
+        pullback_fn = getattr(
+            self.neoclassical_model,
+            "pullback_build_lagged_response_support_payload_batched_interpolated_faces_"
+            "native_multi_rhs_reuse_moment_drds_jvp_shared_primal_with_vmec_coefficients_"
+            "direct_directional_product_rule_per_energy_call_boundary",
+            None,
+        )
+        if not callable(pullback_fn):
+            raise NotImplementedError(
+                "The active neoclassical model does not expose the local call-boundary rule."
+            )
+        response_bars = (
+            None if lagged_response_bars is None else lagged_response_bars.neoclassical_response
+        )
+        return pullback_fn(state, response_bars, support)
+
     def pullback_build_lagged_response_support_payload_batched_interpolated_faces_native_multi_rhs_compact_shared_primal(
         self,
         state,
@@ -7413,6 +7434,7 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         native_vmec_coefficient_bars_only: bool = False,
         native_vmec_direct_directional_product_rule: bool = False,
         native_direct_coefficient_pullback: bool = False,
+        native_per_energy_call_boundary: bool = False,
         stream_native_compact_energy: bool = False,
         return_case_bars: bool = False,
         include_second_direction_base_prepared: bool = True,
@@ -7640,6 +7662,12 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             primal_outputs, support_result = helper_result
             return (*support_result[:-1], support_result[-1], primal_outputs)
 
+        per_energy_pullback = (
+            jax.jit(_one_energy, inline=False)
+            if native_per_energy_call_boundary
+            else _one_energy
+        )
+
         if (
             native_compact_ntx_rhs
             and return_case_bars
@@ -7650,7 +7678,7 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             # to one, so accumulate it while scanning energy rather than
             # materialising an energy-by-objective prepared payload and
             # reducing it afterwards.  RHS remain matrix columns throughout.
-            first_output = _one_energy(
+            first_output = per_energy_pullback(
                 (
                     energy_indices[0],
                     reference_nu_hat[0],
@@ -7688,7 +7716,7 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
 
             def _accumulate_energy(carry, args):
                 prepared_accum, drds_accum = carry
-                prepared_value, drds_value, primal_value, case_value = _one_energy(args)
+                prepared_value, drds_value, primal_value, case_value = per_energy_pullback(args)
                 prepared_value = jax.tree_util.tree_map(
                     _sanitize_rhs_prepared_leaf, prepared, prepared_value
                 )
@@ -7730,7 +7758,7 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             compact_energy_streamed = True
         else:
             mapped_outputs = jax.lax.map(
-                _one_energy,
+                per_energy_pullback,
                 (energy_indices, reference_nu_hat, reference_epsi_hat, epsi_hat_tangent),
             )
             compact_energy_streamed = False
@@ -8046,6 +8074,7 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         native_vmec_coefficient_bars_only: bool = False,
         native_vmec_direct_directional_product_rule: bool = False,
         native_direct_coefficient_pullback: bool = False,
+        native_per_energy_call_boundary: bool = False,
     ):
         """Return the validated native support bar plus VMEC coefficient bars.
 
@@ -8070,6 +8099,7 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                 native_vmec_direct_directional_product_rule
             ),
             native_direct_coefficient_pullback=native_direct_coefficient_pullback,
+            native_per_energy_call_boundary=native_per_energy_call_boundary,
             return_case_bars=return_case_bars,
             include_second_direction_base_prepared=False,
         )
@@ -12228,6 +12258,7 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         return_native_vmec_coefficient_bars: bool = False,
         native_vmec_direct_directional_product_rule: bool = False,
         native_direct_coefficient_pullback: bool = False,
+        native_per_energy_call_boundary: bool = False,
     ):
         """Experimental exact batched support transpose with local NTX sharing.
 
@@ -12375,6 +12406,9 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                     )
                     local_kwargs["native_direct_coefficient_pullback"] = (
                         native_direct_coefficient_pullback
+                    )
+                    local_kwargs["native_per_energy_call_boundary"] = (
+                        native_per_energy_call_boundary
                     )
                 local_result = local_support_pullback(
                     prepared,
@@ -12626,6 +12660,21 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             return_native_vmec_coefficient_bars=True,
             native_vmec_direct_directional_product_rule=True,
             native_direct_coefficient_pullback=True,
+        )
+
+    def pullback_build_lagged_response_support_payload_batched_interpolated_faces_native_multi_rhs_reuse_moment_drds_jvp_shared_primal_with_vmec_coefficients_direct_directional_product_rule_per_energy_call_boundary(
+        self, state, lagged_response_bars, support,
+    ):
+        """Keep the validated grouped algebra behind a per-energy XLA call."""
+        return self.pullback_build_lagged_response_support_payload_batched_interpolated_faces_multi_rhs_shared_primal(
+            state,
+            lagged_response_bars,
+            support,
+            native_factorized_ntx_rhs=True,
+            reuse_joint_moment_drds_jvp=True,
+            return_native_vmec_coefficient_bars=True,
+            native_vmec_direct_directional_product_rule=True,
+            native_per_energy_call_boundary=True,
         )
 
     def pullback_build_lagged_response_support_payload_batched_interpolated_faces_native_multi_rhs_compact_residual_reuse_moment_drds_jvp_shared_primal(

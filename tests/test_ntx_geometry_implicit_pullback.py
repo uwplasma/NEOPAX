@@ -866,6 +866,40 @@ def test_direct_directional_vmec_composite_and_equation_hooks_are_exposed_to_rad
     ]
 
 
+def test_per_energy_call_boundary_vmec_composite_and_equation_hooks_are_exposed_to_radau():
+    """The local HLO-boundary selector must not silently fall back."""
+
+    calls = []
+
+    class _InnerNTX:
+        def pullback_build_lagged_response_support_payload_batched_interpolated_faces_native_multi_rhs_reuse_moment_drds_jvp_shared_primal_with_vmec_coefficients_direct_directional_product_rule_per_energy_call_boundary(
+            self, state, response_bars, support,
+        ):
+            calls.append((state, response_bars, support))
+            return "per-energy-boundary-result"
+
+    composite = object.__new__(CombinedTransportFluxModel)
+    object.__setattr__(composite, "neoclassical_model", _InnerNTX())
+    combined_response = SimpleNamespace(neoclassical_response="ntx-bars")
+    assert composite.pullback_build_lagged_response_support_payload_batched_interpolated_faces_native_multi_rhs_reuse_moment_drds_jvp_shared_primal_with_vmec_coefficients_direct_directional_product_rule_per_energy_call_boundary(
+        "state", combined_response, "support", ignored_outer_keyword=True,
+    ) == "per-energy-boundary-result"
+
+    equations = object.__new__(ComposedEquationSystem)
+    object.__setattr__(equations, "shared_flux_model", composite)
+    object.__setattr__(equations, "_split_realtime_geometry_payload", lambda support: (support, None))
+    object.__setattr__(equations, "_prepare_working_state", lambda state: (state, None))
+    object.__setattr__(equations, "_shared_flux_call_kwargs", lambda kwargs: {})
+    equation_response = SimpleNamespace(flux_response=combined_response)
+    assert equations.pullback_build_lagged_response_support_payload_batched_interpolated_faces_native_multi_rhs_reuse_moment_drds_jvp_shared_primal_with_vmec_coefficients_direct_directional_product_rule_per_energy_call_boundary(
+        "state", equation_response, "support", ignored_outer_keyword=True,
+    ) == "per-energy-boundary-result"
+    assert calls == [
+        ("state", "ntx-bars", "support"),
+        ("state", "ntx-bars", "support"),
+    ]
+
+
 def test_direct_coefficient_vmec_composite_and_equation_hooks_are_exposed_to_radau():
     """The coefficient-transpose selector is wired through both wrappers."""
 
@@ -898,6 +932,28 @@ def test_direct_coefficient_vmec_composite_and_equation_hooks_are_exposed_to_rad
         ("state", "ntx-bars", "support"),
         ("state", "ntx-bars", "support"),
     ]
+
+
+def test_mock_native_per_energy_call_boundary_is_a_distinct_hlo_call():
+    """A local boundary stays inside the mapped body without changing values.
+
+    This is deliberately a pure array/HLO-structure gate, not a transport or
+    NTX production run.  The extra call in the bounded lowering is the
+    property needed before applying the same boundary around the expensive
+    native per-energy support operation.
+    """
+
+    def _local_energy_work(value):
+        return (jnp.sin(value) @ value + jnp.cos(value),)
+
+    plain = jax.jit(lambda values: jax.lax.map(_local_energy_work, values))
+    bounded_work = jax.jit(_local_energy_work, inline=False)
+    bounded = jax.jit(lambda values: jax.lax.map(bounded_work, values))
+    values = jnp.ones((3, 4, 4), dtype=jnp.float64)
+    assert jnp.allclose(bounded(values)[0], plain(values)[0])
+    plain_hlo = plain.lower(values).compiler_ir(dialect="hlo").as_hlo_text()
+    bounded_hlo = bounded.lower(values).compiler_ir(dialect="hlo").as_hlo_text()
+    assert bounded_hlo.count("call(") == plain_hlo.count("call(") + 1
 
 
 def test_native_split_joint_no_prepared_carry_hook_selects_only_its_wrapper():
@@ -1313,6 +1369,53 @@ def test_compact_and_reused_drds_native_multi_rhs_adapters_match_full_native_ada
         _assert_float_tree_allclose(candidate[1], full[1])
         _assert_float_tree_allclose(candidate[2], full[2])
         _assert_float_tree_allclose(candidate[3], full[3])
+
+
+def test_native_per_energy_call_boundary_matches_unbounded_native_vmec_pullback():
+    """The local compilation boundary preserves native support and face bars.
+
+    This is one small local NTX gate, not a transport rollout.  It covers the
+    exact direct-directional algebra selected by the experimental boundary.
+    """
+
+    model = _small_runtime_model(n_energy=2)
+    _surface, prepared = _small_vmec_prepared()
+    field_bars = (
+        jnp.asarray([0.0, 0.0]),
+        jnp.asarray(
+            [[0.3, -0.2, 0.1, 0.4, -0.1, 0.2],
+             [-0.1, 0.2, 0.3, -0.4, 0.5, -0.2]]
+        ),
+        jnp.asarray(
+            [[-0.3, 0.1, 0.2, -0.2, 0.3, -0.1],
+             [0.4, -0.3, 0.2, 0.1, -0.5, 0.3]]
+        ),
+        jnp.asarray(
+            [[0.2, 0.4, -0.3, 0.1, 0.2, -0.4],
+             [-0.2, 0.3, 0.4, -0.1, 0.2, 0.5]]
+        ),
+    )
+    args = dict(
+        drds_value=jnp.asarray(1.2),
+        reference_nu_hat=jnp.asarray([1.0e-2, 1.8e-2]),
+        reference_epsi_hat=jnp.asarray([1.0e-3, 2.0e-3]),
+        vth_a=jnp.asarray(1.1),
+        field_bars=field_bars,
+        return_case_bars=True,
+        native_vmec_coefficient_bars_only=True,
+        native_vmec_direct_directional_product_rule=True,
+    )
+    ordinary = model._pullback_interpolated_moment_prepared_support_and_drds_only_native_multi_rhs_reuse_moment_drds_jvp_with_vmec_coefficients(
+        prepared,
+        native_per_energy_call_boundary=False,
+        **args,
+    )
+    bounded = model._pullback_interpolated_moment_prepared_support_and_drds_only_native_multi_rhs_reuse_moment_drds_jvp_with_vmec_coefficients(
+        prepared,
+        native_per_energy_call_boundary=True,
+        **args,
+    )
+    _assert_float_tree_allclose(bounded, ordinary)
 
 
 @pytest.mark.parametrize(
