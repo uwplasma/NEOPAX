@@ -194,8 +194,8 @@ def _trim_native_heap() -> bool:
         return False
 
 
-def _one_cache_cleared_sample(problem, x, iteration: int):
-    """Evaluate the unchanged problem, then clear cache state before RSS sampling."""
+def _one_cleanup_sample(problem, x, iteration: int, *, clear_jax_caches: bool, trim_native_heap: bool):
+    """Evaluate unchanged math, then apply explicitly selected diagnostic cleanup."""
 
     started = time.perf_counter()
     evaluation = problem.evaluate(x)
@@ -207,9 +207,10 @@ def _one_cache_cleared_sample(problem, x, iteration: int):
     elapsed_s = time.perf_counter() - started
     del evaluation, residuals, jacobian
     gc.collect()
-    jax.clear_caches()
+    if clear_jax_caches:
+        jax.clear_caches()
     gc.collect()
-    heap_trimmed = _trim_native_heap()
+    heap_trimmed = _trim_native_heap() if trim_native_heap else None
     return (
         opt.RepeatedEvaluationMemorySample(
             iteration=iteration,
@@ -236,9 +237,13 @@ def main() -> int:
         "--clear-jax-caches",
         action="store_true",
         help=(
-            "Diagnostic only: clear JAX compilation caches and trim free native heap "
-            "after every measured evaluation."
+            "Diagnostic only: clear JAX compilation caches after every measured evaluation."
         ),
+    )
+    parser.add_argument(
+        "--trim-native-heap",
+        action="store_true",
+        help="Diagnostic only: call glibc malloc_trim after every measured evaluation.",
     )
     parser.add_argument(
         "--diagnose-checkpoints",
@@ -345,9 +350,14 @@ def main() -> int:
         f"warmup={args.warmup} repeats={args.repeats} parameter_count={problem.parameter_count}",
         flush=True,
     )
-    if args.clear_jax_caches:
+    if args.clear_jax_caches or args.trim_native_heap:
+        cleanup_parts = []
+        if args.clear_jax_caches:
+            cleanup_parts.append("jax.clear_caches")
+        if args.trim_native_heap:
+            cleanup_parts.append("malloc_trim")
         print(
-            "[memory test] diagnostic_cleanup=jax.clear_caches+malloc_trim after each trial",
+            "[memory test] diagnostic_cleanup=" + "+".join(cleanup_parts) + " after each trial",
             flush=True,
         )
     if args.persistent_raw_solve_jit:
@@ -401,9 +411,13 @@ def main() -> int:
             for patcher in patchers:
                 patcher.start()
             try:
-                if args.clear_jax_caches:
-                    sample, heap_trimmed = _one_cache_cleared_sample(
-                        quiet_problem, x, iteration
+                if args.clear_jax_caches or args.trim_native_heap:
+                    sample, heap_trimmed = _one_cleanup_sample(
+                        quiet_problem,
+                        x,
+                        iteration,
+                        clear_jax_caches=args.clear_jax_caches,
+                        trim_native_heap=args.trim_native_heap,
                     )
                 else:
                     samples = opt.repeated_evaluation_memory_samples(
@@ -420,11 +434,18 @@ def main() -> int:
             report(sample)
             if heap_trimmed is not None:
                 print(f"[memory test] trial={iteration} native_heap_trimmed={heap_trimmed}", flush=True)
-    elif args.clear_jax_caches:
+    elif args.clear_jax_caches or args.trim_native_heap:
         for iteration in range(args.repeats):
-            sample, heap_trimmed = _one_cache_cleared_sample(quiet_problem, x, iteration)
+            sample, heap_trimmed = _one_cleanup_sample(
+                quiet_problem,
+                x,
+                iteration,
+                clear_jax_caches=args.clear_jax_caches,
+                trim_native_heap=args.trim_native_heap,
+            )
             report(sample)
-            print(f"[memory test] trial={iteration} native_heap_trimmed={heap_trimmed}", flush=True)
+            if heap_trimmed is not None:
+                print(f"[memory test] trial={iteration} native_heap_trimmed={heap_trimmed}", flush=True)
     else:
         opt.repeated_evaluation_memory_samples(
             quiet_problem,
