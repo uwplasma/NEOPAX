@@ -213,6 +213,50 @@ def compute_total_power_mw(state, species, pressure_source_model, geometry, fall
     return jnp.where(total_power < 0.0, fallback, total_power)
 
 
+def compute_net_total_power_volume_average_mw_m3(state, pressure_source_model, geometry):
+    """Return the signed volume-averaged total source power density.
+
+    This is an optimization observable, not the positive power scale used by
+    turbulence closures.  In particular it deliberately preserves a negative
+    net value and therefore must not use ``compute_total_power_mw``'s 3-MW
+    fallback.
+    """
+    dtype = state.density.dtype
+    zero = jnp.asarray(0.0, dtype=dtype)
+    if pressure_source_model is None or geometry is None:
+        return zero
+    raw_sources = pressure_source_model(state)
+    if not isinstance(raw_sources, dict):
+        return zero
+
+    net_power_density = None
+    alpha_power = raw_sources.get("AlphaPower")
+    if alpha_power is not None:
+        net_power_density = jnp.asarray(alpha_power, dtype=dtype)
+
+    pbrems = raw_sources.get("PBrems")
+    if pbrems is not None:
+        pbrems_arr = jnp.asarray(pbrems, dtype=dtype)
+        net_power_density = -pbrems_arr if net_power_density is None else net_power_density - pbrems_arr
+
+    for key in ("heating", "external_heating", "ecrh", "icrh", "nbi", "ohmic_heating"):
+        value = raw_sources.get(key)
+        if value is None:
+            continue
+        value_arr = jnp.asarray(value, dtype=dtype)
+        net_power_density = value_arr if net_power_density is None else net_power_density + value_arr
+
+    if net_power_density is None:
+        return zero
+    power_density_mw_m3 = PRESSURE_SOURCE_STATE_TO_MW_M3 * net_power_density
+    volume = jnp.trapezoid(jnp.asarray(geometry.Vprime, dtype=dtype), x=jnp.asarray(geometry.r_grid, dtype=dtype))
+    integral = jnp.trapezoid(
+        power_density_mw_m3 * jnp.asarray(geometry.Vprime, dtype=dtype),
+        x=jnp.asarray(geometry.r_grid, dtype=dtype),
+    )
+    return integral / jnp.maximum(volume, jnp.asarray(1.0e-30, dtype=dtype))
+
+
 def compute_total_power_breakdown_mw(state, pressure_source_model, geometry):
     if pressure_source_model is None or geometry is None:
         return {}

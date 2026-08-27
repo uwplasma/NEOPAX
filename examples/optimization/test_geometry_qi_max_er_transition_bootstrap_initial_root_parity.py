@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Compare benchmark and optimization-only initial-root residual/Jacobian rows.
+"""Compare benchmark and persistent-raw-solve initial-root rows for parity.
 
 No SciPy iteration is run.  The two problems use the same four-objective terms,
 VMEC input, and initial scaled DoF vector.
@@ -37,8 +37,8 @@ def _evaluate(problem, x):
     return jax.block_until_ready((result.residuals, result.jacobian))
 
 
-def _stable_raw_callback_context(problem):
-    """Apply only the opt-in VMEX callback identity retention for this test."""
+def _persistent_raw_solve_context(problem):
+    """Apply only the opt-in persistent VMEX raw-solve boundary for this test."""
 
     stage = geometry_raw_block_optimization_stage(
         problem.context,
@@ -47,7 +47,7 @@ def _stable_raw_callback_context(problem):
     )
     original = reverse_optimization.geometry_raw_block_solve_from_param_vector
 
-    def stable_raw_block_solve(*args, **kwargs):
+    def persistent_raw_block_solve(*args, **kwargs):
         kwargs["stage"] = stage.raw_block_stage
         kwargs["solve_with_aux_runner"] = stage.solve_with_aux_runner
         return original(*args, **kwargs)
@@ -55,7 +55,7 @@ def _stable_raw_callback_context(problem):
     return patch.object(
         reverse_optimization,
         "geometry_raw_block_solve_from_param_vector",
-        stable_raw_block_solve,
+        persistent_raw_block_solve,
     )
 
 
@@ -66,7 +66,7 @@ def main() -> int:
     staged = _build()
     x = np.asarray(jax.device_get(benchmark.x0), dtype=float)
     off_residuals, off_jacobian = _evaluate(benchmark, x)
-    with _stable_raw_callback_context(staged):
+    with _persistent_raw_solve_context(staged):
         staged_residuals, staged_jacobian = _evaluate(staged, x)
     residual_delta = np.asarray(jax.device_get(staged_residuals - off_residuals), dtype=float)
     jacobian_delta = np.asarray(jax.device_get(staged_jacobian - off_jacobian), dtype=float)

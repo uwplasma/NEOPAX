@@ -53,6 +53,7 @@ from ._reverse_ad_transport import (
     TransportReverseReportRunner,
     TransportReverseTableResultBuilder,
     bootstrap_current_softmax_abs_scaled,
+    net_total_power_volume_average,
     normalize_transport_objective_names,
     realtime_geometry_transport_reverse_table_from_payload_cotangents,
     realtime_geometry_transport_reverse_table_request,
@@ -204,7 +205,7 @@ class ObjectiveCotangentTable:
 
 INITIAL_ER_ROOT_ONLY_OBJECTIVES: tuple[str, ...] = (
     "softmax_Er",
-    "smooth_root_proxy",
+    "net_total_power_volume_average_mw_m3",
     "Er_transition_left",
     "Er_transition_right",
     "Er2_volume_average",
@@ -722,10 +723,7 @@ def _initial_er_root_only_objective_values(
     opts = {} if options is None else options
     er = jnp.asarray(state.Er)
     geometry = runtime.geometry
-    rho_grid = jnp.asarray(geometry.rho_grid, dtype=er.dtype)
     softmax_beta = float(opts.get("softmax_Er_beta", 16.0))
-    smooth_root_beta = float(opts.get("smooth_root_proxy_beta", 24.0))
-    smooth_root_eps = float(opts.get("smooth_root_proxy_eps", 1.0e-4))
     transition_left_index = int(opts.get("Er_transition_left_index", 20))
     transition_right_index = int(opts.get("Er_transition_right_index", 21))
 
@@ -737,15 +735,8 @@ def _initial_er_root_only_objective_values(
         if name == "softmax_Er":
             beta = jnp.asarray(softmax_beta, dtype=er.dtype)
             return jax.scipy.special.logsumexp(beta * er) / beta
-        if name == "smooth_root_proxy":
-            beta = jnp.asarray(smooth_root_beta, dtype=er.dtype)
-            eps = jnp.asarray(smooth_root_eps, dtype=er.dtype)
-            smooth_abs = jnp.sqrt(er * er + eps * eps)
-            weights = jnp.exp(-beta * smooth_abs)
-            return jnp.sum(rho_grid * weights) / jnp.maximum(
-                jnp.sum(weights),
-                jnp.asarray(1.0e-30, dtype=er.dtype),
-            )
+        if name == "net_total_power_volume_average_mw_m3":
+            return net_total_power_volume_average(state, runtime)
         if name == "Er_transition_left":
             return _er_at_index(transition_left_index)
         if name == "Er_transition_right":

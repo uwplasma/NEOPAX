@@ -798,11 +798,12 @@ class GeometryRawBlockStage:
 
 @dataclasses.dataclass(frozen=True, slots=True)
 class GeometryRawBlockOptimizationStage:
-    """Optimization-only persistent VMEX callback for one static raw-block stage.
+    """Optimization-only persistent VMEX raw-solve kernel for one stage.
 
     The contained raw-block stage is the established benchmark setup.  The
-    additional runner is opt-in and retains only VMEX's opaque forward callback
-    identity; it does not alter the VMEC solve or its custom reverse rule.
+    additional runner is opt-in and JIT-compiles only the opaque VMEX forward
+    callback for this fixed configuration.  It does not include Boozer, NTX,
+    ambipolarity, or any VMEC reverse/pullback calculation.
     """
 
     raw_block_stage: GeometryRawBlockStage
@@ -840,7 +841,7 @@ def geometry_raw_block_optimization_stage(
     *,
     max_iter: int | None = None,
 ) -> GeometryRawBlockOptimizationStage:
-    """Create the opt-in stable VMEX callback for a fixed optimizer stage."""
+    """Create the opt-in persistent VMEX raw-solve kernel for one stage."""
 
     raw_stage = geometry_raw_block_stage(context, param_specs, max_iter=max_iter)
     factory = getattr(raw_stage.implicit, "make_solve_implicit_with_aux_runner", None)
@@ -875,7 +876,10 @@ def geometry_raw_block_optimization_stage(
                 raise
     return GeometryRawBlockOptimizationStage(
         raw_block_stage=raw_stage,
-        solve_with_aux_runner=runner,
+        # This is deliberately the smallest VMEX-like persistent stage
+        # boundary: one fixed-shape parameter pytree in and the opaque VMEC
+        # state/mask out.  The benchmark/default call remains eager.
+        solve_with_aux_runner=jax.jit(runner, inline=False),
     )
 
 

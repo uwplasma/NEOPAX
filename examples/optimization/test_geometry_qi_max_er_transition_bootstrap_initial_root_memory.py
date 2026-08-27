@@ -215,11 +215,11 @@ def main() -> int:
         ),
     )
     parser.add_argument(
-        "--stable-vmex-callback",
+        "--persistent-raw-solve-jit",
         action="store_true",
         help=(
-            "Use the optimization-only, stage-bound VMEX raw-solve callback. "
-            "The benchmark/default raw-solve call remains unchanged."
+            "Use the optimization-only JIT compiled VMEX raw-solve boundary. "
+            "Benchmark/default evaluations remain eager and unchanged."
         ),
     )
     args = parser.parse_args()
@@ -236,9 +236,9 @@ def main() -> int:
     quiet_problem = QuietProblem(problem)
     x = np.asarray(jax.device_get(problem.x0), dtype=float)
     optimization_raw_block_stage = None
-    if args.stable_vmex_callback:
+    if args.persistent_raw_solve_jit:
         if not problem.parameter_set.vmec_boundary_specs:
-            raise ValueError("--stable-vmex-callback requires VMEC boundary parameters.")
+            raise ValueError("--persistent-raw-solve-jit requires VMEC boundary parameters.")
         optimization_raw_block_stage = geometry_raw_block_optimization_stage(
             problem.context,
             tuple(spec.as_tuple() for spec in problem.parameter_set.vmec_boundary_specs),
@@ -305,8 +305,8 @@ def main() -> int:
             "[memory test] diagnostic_cleanup=jax.clear_caches+malloc_trim after each trial",
             flush=True,
         )
-    if args.stable_vmex_callback:
-        print("[memory test] raw_solve_callback=stable_optimization_only", flush=True)
+    if args.persistent_raw_solve_jit:
+        print("[memory test] raw_solve_boundary=persistent_optimization_jit", flush=True)
     for warmup_index in range(args.warmup):
         print(f"[memory test] warmup={warmup_index} starting", flush=True)
         started = time.perf_counter()
@@ -316,7 +316,7 @@ def main() -> int:
                 checkpoints=args.diagnose_checkpoints,
                 optimization_raw_block_stage=optimization_raw_block_stage,
             )
-            if args.diagnose_structure or args.diagnose_checkpoints or args.stable_vmex_callback
+            if args.diagnose_structure or args.diagnose_checkpoints or args.persistent_raw_solve_jit
             else ()
         )
         for patcher in patchers:
@@ -334,7 +334,7 @@ def main() -> int:
             f"elapsed_s={time.perf_counter() - started:.3f}",
             flush=True,
         )
-    if args.diagnose_structure or args.diagnose_checkpoints or args.stable_vmex_callback:
+    if args.diagnose_structure or args.diagnose_checkpoints or args.persistent_raw_solve_jit:
         for iteration in range(args.repeats):
             structure_counter.reset()
             patchers = structure_counter.context(

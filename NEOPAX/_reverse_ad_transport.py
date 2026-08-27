@@ -56,6 +56,7 @@ from ._reverse_ad_parameters import (
 from ._transport_flux_models import (
     DENSITY_STATE_TO_PHYSICAL,
     PRESSURE_SOURCE_STATE_TO_MW_M3,
+    compute_net_total_power_volume_average_mw_m3,
     _add_float_delta_tree,
     _float_delta_tree_like,
     _sanitize_float_delta_bar_tree,
@@ -603,7 +604,7 @@ class _ThetaReverseScheduleRolloutResult:
 
 TRANSPORT_REVERSE_OBJECTIVE_LABELS: tuple[str, ...] = (
     "softmax_Er",
-    "smooth_root_proxy",
+    "net_total_power_volume_average_mw_m3",
     "Er_transition_left",
     "Er_transition_right",
     "Er2_volume_average",
@@ -826,6 +827,17 @@ def alpha_power_volume_average(final_state, runtime) -> jax.Array:
     return volume_average(alpha_mw_m3, runtime.geometry)
 
 
+def net_total_power_volume_average(final_state, runtime) -> jax.Array:
+    """Signed volume average of alpha, bremsstrahlung, and external power."""
+    source_models = runtime.models.source or {}
+    pressure_source_model = source_models.get("temperature") if isinstance(source_models, dict) else None
+    return compute_net_total_power_volume_average_mw_m3(
+        final_state,
+        pressure_source_model,
+        runtime.geometry,
+    )
+
+
 def electron_temperature_volume_average(final_state, runtime) -> jax.Array:
     species_idx = getattr(runtime.species, "species_idx", {})
     electron_idx = species_idx.get("e", 0)
@@ -921,9 +933,8 @@ def objective_scalar_by_index(final_state, runtime, objective_index: int):
     er = jnp.asarray(final_state.Er)
     if objective_name == "softmax_Er":
         return softmax_objective(er)
-    if objective_name == "smooth_root_proxy":
-        rho = jnp.asarray(runtime.geometry.rho_grid, dtype=er.dtype)
-        return smooth_root_proxy(er, rho)
+    if objective_name == "net_total_power_volume_average_mw_m3":
+        return net_total_power_volume_average(final_state, runtime)
     if objective_name == "Er_transition_left":
         return er[max(0, min(20, int(er.shape[-1]) - 1))]
     if objective_name == "Er_transition_right":

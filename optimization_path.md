@@ -94,13 +94,20 @@ only free native heap removed that slope, so this is native callback/executable
 cache retention, not live JAX arrays or a retained physical solution.
 
 VMEX's one-shot `solve_implicit_with_aux` constructs a fresh
-`functools.partial(_host_solve_and_mask, cfg)` on each call.  That fresh
-callback identity is passed to `jax.pure_callback`, so JAX cannot reuse the
-corresponding native callback executable across optimizer evaluations.  The
-opt-in implementation is therefore a VMEX factory that binds this callback
-once per immutable stage and a NEOPAX optimization-only raw-block stage that
-passes its runner explicitly.  The one-shot benchmark call remains the
-default, unchanged.
+`functools.partial(_host_solve_and_mask, cfg)` on each call.  This was a
+plausible callback-cache candidate, but an optimization-only stable-callback
+experiment had exact residual/Jacobian parity and **still** grew by `+679 MiB`
+on its second measured call.  It is therefore rejected and removed; callback
+identity alone is not the retaining cache.  The one-shot benchmark call
+remains unchanged.
+
+The next implementation is the actual VMEX-style boundary: retain one small
+`jax.jit` kernel per optimization stage for
+`ImplicitParams -> solve_implicit_with_aux -> (VMEC state, dof mask)`.  It
+contains no Boozer, NTX, ambipolarity, bootstrap, or reverse payload work;
+those remain on their benchmark paths.  This changes only compilation
+lifetime, not the raw-block primal or transpose mathematics, and requires
+residual/Jacobian parity before its memory measurement.
 
 Date: 2026-07-30
 

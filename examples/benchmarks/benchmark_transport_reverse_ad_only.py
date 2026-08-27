@@ -123,7 +123,7 @@ from benchmark_transport_forward_fd_lane import (  # noqa: E402
     _objective_vector,
     _parameterized_profile_set,
     _prepare_benchmark_config,
-    _smooth_root_proxy,
+    _net_total_power_volume_average,
     _softmax_objective,
     _total_pressure_volume_average,
     _volume_average,
@@ -378,9 +378,8 @@ def _objective_scalar_by_index(final_state, runtime, objective_index: int):
     er = jnp.asarray(final_state.Er)
     if objective_name == "softmax_Er":
         return _softmax_objective(er)
-    if objective_name == "smooth_root_proxy":
-        rho = jnp.asarray(runtime.geometry.rho_grid, dtype=er.dtype)
-        return _smooth_root_proxy(er, rho)
+    if objective_name == "net_total_power_volume_average_mw_m3":
+        return _net_total_power_volume_average(final_state, runtime)
     if objective_name == "Er_transition_left":
         return er[max(0, min(20, int(er.shape[-1]) - 1))]
     if objective_name == "Er_transition_right":
