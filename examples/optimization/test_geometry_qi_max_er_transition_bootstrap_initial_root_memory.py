@@ -11,6 +11,7 @@ from __future__ import annotations
 import gc
 import io
 import argparse
+from dataclasses import replace
 from contextlib import redirect_stdout
 from pathlib import Path
 import sys
@@ -198,12 +199,7 @@ def main() -> int:
             finally:
                 for patcher in reversed(patchers):
                     patcher.stop()
-            report(samples[0].__class__(
-                iteration=iteration,
-                elapsed_s=samples[0].elapsed_s,
-                resident_memory_bytes=samples[0].resident_memory_bytes,
-                residual_norm=samples[0].residual_norm,
-            ))
+            report(replace(samples[0], iteration=iteration))
     else:
         opt.repeated_evaluation_memory_samples(
             quiet_problem,

@@ -6108,6 +6108,32 @@ def _radau_finish_native_vmec_rebuild_from_common(
     ), support_bar_leaves
 
 
+@partial(jax.jit, static_argnums=(0, 1, 2), inline=False)
+def _radau_finish_native_vmec_rebuild_from_common_call(
+    kernel_context: _RadauAcceptedStepKernelContext,
+    physics_context: _RadauAcceptedStepPhysicsContext,
+    lagged_response_branch: str,
+    carry_in: _RadauAcceptedStepCarry,
+    common: tuple[Any, Any, Any, tuple[Any, ...]],
+    support,
+) -> tuple[_RadauAcceptedStepReducedCotangent, tuple[Any, ...]]:
+    """Keep the branch-local native rebuild suffix out of the scan body.
+
+    This is deliberately an opt-in boundary for the already-hoisted native
+    VMEC path.  It preserves the shared stage transpose and all rebuild
+    mathematics, while giving XLA a separate callable computation for the
+    state/support/VMEC suffix.
+    """
+    return _radau_finish_native_vmec_rebuild_from_common(
+        kernel_context,
+        physics_context,
+        carry_in,
+        lagged_response_branch,
+        common,
+        support,
+    )
+
+
 def _execute_radau_accepted_step_next_reduced_cotangent_batched_bwd_with_support_from_primal_result(
     kernel_context: _RadauAcceptedStepKernelContext,
     physics_context: _RadauAcceptedStepPhysicsContext,
@@ -7529,6 +7555,7 @@ def _radau_segment_reduced_cotangent_bwd_batched_with_support_call(
     use_step_call_boundary = step_bwd_mode in {
         "reduced_cotangent_call_boundary",
         "reduced_cotangent_call_boundary_common_branch_hoist",
+        "reduced_cotangent_call_boundary_common_branch_hoist_rebuild_call",
         "reduced_cotangent_step_call",
         "call_boundary",
     }
@@ -7550,6 +7577,7 @@ def _radau_segment_reduced_cotangent_bwd_batched_with_support_call(
         in {
             "reduced_cotangent_common_branch_hoist",
             "reduced_cotangent_call_boundary_common_branch_hoist",
+            "reduced_cotangent_call_boundary_common_branch_hoist_rebuild_call",
         }
         and use_segment_primal_record
         and collect_native_vmec_coefficients
@@ -7625,24 +7653,32 @@ def _radau_segment_reduced_cotangent_bwd_batched_with_support_call(
                 )
                 if prepared_common is not None:
                     _, _, common = prepared_common
+
+                    def _finish_common(branch):
+                        if step_bwd_mode == (
+                            "reduced_cotangent_call_boundary_common_branch_hoist_rebuild_call"
+                        ):
+                            return _radau_finish_native_vmec_rebuild_from_common_call(
+                                execution_context.kernel_context,
+                                execution_context.physics_context,
+                                branch,
+                                residual_carry,
+                                common,
+                                support,
+                            )
+                        return _radau_finish_native_vmec_rebuild_from_common(
+                            execution_context.kernel_context,
+                            execution_context.physics_context,
+                            residual_carry,
+                            branch,
+                            common,
+                            support,
+                        )
+
                     return jax.lax.cond(
                         residual_carry.lagged_response_valid,
-                        lambda _: _radau_finish_native_vmec_rebuild_from_common(
-                            execution_context.kernel_context,
-                            execution_context.physics_context,
-                            residual_carry,
-                            "reuse",
-                            common,
-                            support,
-                        ),
-                        lambda _: _radau_finish_native_vmec_rebuild_from_common(
-                            execution_context.kernel_context,
-                            execution_context.physics_context,
-                            residual_carry,
-                            "rebuild",
-                            common,
-                            support,
-                        ),
+                        lambda _: _finish_common("reuse"),
+                        lambda _: _finish_common("rebuild"),
                         operand=None,
                     )
 
