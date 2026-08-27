@@ -1727,7 +1727,8 @@ def _optimization_root_to_payload_cotangents(
     *, config, requested_objectives, runtime, profile_values_arr,
     pre_root_state_from_profile_values, geometry_context, n_r, n_theta,
     n_zeta, n_xi, surface_backend, raw_block_solve, support_payload,
-    use_runtime_payload, profile_specs, options,
+    use_runtime_payload, profile_specs, options, boozer_surface_sampling=None,
+    r00_boozer_surface_sampling=None,
 ):
     if use_runtime_payload:
         baseline_geometry = support_payload["geometry"]
@@ -1741,6 +1742,8 @@ def _optimization_root_to_payload_cotangents(
             n_zeta=int(n_zeta),
             n_xi=int(n_xi),
             surface_backend=str(surface_backend),
+            boozer_surface_sampling=boozer_surface_sampling,
+            r00_boozer_surface_sampling=r00_boozer_surface_sampling,
         )
         baseline_geometry = current_payload["geometry"]
         baseline_ntx_support = current_payload["ntx_support"]

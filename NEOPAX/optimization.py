@@ -16,6 +16,8 @@ import jax.numpy as jnp
 import numpy as np
 
 from ._geometry_autodiff import (
+    _boozer_surface_indices_and_rho,
+    _neopax_geometry_requested_sample_rho,
     _input_with_boundary_deltas,
     boundary_param_entries,
     build_neopax_geometry_and_ntx_exact_lij_support_from_state,
@@ -1373,6 +1375,22 @@ def geometry_initial_er_root_only_least_squares_problem(
         )
         stage_profile_specs = tuple(ProfileParameterSpec(name) for name in PROFILE_PARAMETER_ORDER)
         stage_support_payload = find_ntx_support_payload(runtime)
+        stage_n_r = int(n_r if n_r is not None else geom_cfg.get("n_radial", 51))
+        stage_boozer_surface_sampling = _boozer_surface_indices_and_rho(
+            context.static,
+            _neopax_geometry_requested_sample_rho(context, n_r=stage_n_r),
+        )
+        stage_r00_center = np.linspace(0.0, 1.0, stage_n_r, dtype=float)
+        stage_r00_faces = (
+            np.asarray([0.0, 1.0], dtype=float)
+            if stage_n_r == 1
+            else np.concatenate(
+                [np.asarray([0.0]), 0.5 * (stage_r00_center[:-1] + stage_r00_center[1:]), np.asarray([1.0])]
+            )
+        )
+        stage_r00_boozer_surface_sampling = _boozer_surface_indices_and_rho(
+            context.static, np.unique(np.concatenate([stage_r00_center, stage_r00_faces]))
+        )
 
         def _stage_pre_root_state(profile_values):
             return initial_state_for_parameter_vector(
@@ -1384,13 +1402,15 @@ def geometry_initial_er_root_only_least_squares_problem(
             return _optimization_root_to_payload_cotangents(
                 config=config_eff, requested_objectives=stage_transport_objectives, runtime=runtime,
                 profile_values_arr=profile_values, pre_root_state_from_profile_values=_stage_pre_root_state,
-                geometry_context=context, n_r=int(n_r if n_r is not None else geom_cfg.get("n_radial", 51)),
+                geometry_context=context, n_r=stage_n_r,
                 n_theta=int(n_theta if n_theta is not None else neoclassical_cfg.get("ntx_exact_n_theta", 25)),
                 n_zeta=int(n_zeta if n_zeta is not None else neoclassical_cfg.get("ntx_exact_n_zeta", 25)),
                 n_xi=int(n_xi if n_xi is not None else neoclassical_cfg.get("ntx_exact_n_xi", 64)),
                 surface_backend=str(surface_backend or neoclassical_cfg.get("ntx_exact_surface_backend", "vmec")),
                 raw_block_solve=raw_block_solve, support_payload=stage_support_payload,
                 use_runtime_payload=False, profile_specs=stage_profile_specs, options=dict(root_options or {}),
+                boozer_surface_sampling=stage_boozer_surface_sampling,
+                r00_boozer_surface_sampling=stage_r00_boozer_surface_sampling,
             )
 
         def _stage_payload(raw_block_solve, geometry_deltas, values, profile_gradient, support_bars):

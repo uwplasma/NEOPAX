@@ -4870,10 +4870,14 @@ def build_neopax_geometry_and_ntx_exact_lij_support_from_state(
     n_xi: int,
     surface_backend: str = "booz",
     progress_label: str | None = None,
+    boozer_surface_sampling=None,
+    r00_boozer_surface_sampling=None,
 ):
     """Build the realtime transport geometry payload from an already-solved VMEC state."""
 
-    geometry = _build_neopax_geometry_from_state(context, state, n_r=n_r)
+    geometry = _build_neopax_geometry_from_state(
+        context, state, n_r=n_r, boozer_surface_sampling=boozer_surface_sampling
+    )
     support = build_ntx_exact_lij_support_from_vmec_state(
         context,
         state,
@@ -4882,6 +4886,7 @@ def build_neopax_geometry_and_ntx_exact_lij_support_from_state(
         n_zeta=int(n_zeta),
         n_xi=int(n_xi),
         surface_backend=str(surface_backend),
+        r00_boozer_surface_sampling=r00_boozer_surface_sampling,
     )
     return {"geometry": geometry, "ntx_support": support}
 
