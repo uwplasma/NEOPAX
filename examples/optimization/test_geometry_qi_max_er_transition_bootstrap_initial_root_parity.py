@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Compare benchmark and persistent raw-parameter-update rows for parity.
+"""Compare benchmark and optimization-vector-stage rows for parity.
 
 No SciPy iteration is run.  The two problems use the same four-objective terms,
 VMEC input, and initial scaled DoF vector.
@@ -11,7 +11,6 @@ import io
 from contextlib import redirect_stdout
 from pathlib import Path
 import sys
-from unittest.mock import patch
 
 import jax
 import numpy as np
@@ -21,14 +20,17 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 import optimize_geometry_qi_max_er_transition_bootstrap_initial_root as example  # noqa: E402
-from NEOPAX import _reverse_ad_optimization as reverse_optimization  # noqa: E402
-from NEOPAX._geometry_autodiff import geometry_raw_block_optimization_stage  # noqa: E402
 
 
-def _build():
-    return example.build_transition_bootstrap_initial_root_problem(
-        example.SEED_INPUT, int(example.MAX_MODE_SCHEDULE)
-    )
+def _build(mode: str = "off"):
+    previous_mode = example.REVERSE_STAGE_MODE
+    example.REVERSE_STAGE_MODE = mode
+    try:
+        return example.build_transition_bootstrap_initial_root_problem(
+            example.SEED_INPUT, int(example.MAX_MODE_SCHEDULE)
+        )
+    finally:
+        example.REVERSE_STAGE_MODE = previous_mode
 
 
 def _evaluate(problem, x):
@@ -37,39 +39,14 @@ def _evaluate(problem, x):
     return jax.block_until_ready((result.residuals, result.jacobian))
 
 
-def _persistent_raw_parameter_context(problem):
-    """Apply only the opt-in persistent VMEX parameter-update map for this test."""
-
-    stage = geometry_raw_block_optimization_stage(
-        problem.context,
-        tuple(spec.as_tuple() for spec in problem.parameter_set.vmec_boundary_specs),
-        max_iter=problem.geometry_max_iter,
-        solver_device=problem.geometry_solver_device,
-    )
-    original = reverse_optimization.geometry_raw_block_solve_from_param_vector
-
-    def persistent_raw_parameter_solve(*args, **kwargs):
-        kwargs["stage"] = stage.raw_block_stage
-        kwargs["implicit_params_from_deltas_runner"] = stage.implicit_params_from_deltas_runner
-        kwargs["state_mask_stop_gradient_runner"] = stage.state_mask_stop_gradient_runner
-        return original(*args, **kwargs)
-
-    return patch.object(
-        reverse_optimization,
-        "geometry_raw_block_solve_from_param_vector",
-        persistent_raw_parameter_solve,
-    )
-
-
 def main() -> int:
     if not np.isscalar(example.MAX_MODE_SCHEDULE):
         raise ValueError("The parity test requires one fixed MAX_MODE_SCHEDULE value.")
     benchmark = _build()
-    staged = _build()
+    staged = _build("optimization")
     x = np.asarray(jax.device_get(benchmark.x0), dtype=float)
     off_residuals, off_jacobian = _evaluate(benchmark, x)
-    with _persistent_raw_parameter_context(staged):
-        staged_residuals, staged_jacobian = _evaluate(staged, x)
+    staged_residuals, staged_jacobian = _evaluate(staged, x)
     residual_delta = np.asarray(jax.device_get(staged_residuals - off_residuals), dtype=float)
     jacobian_delta = np.asarray(jax.device_get(staged_jacobian - off_jacobian), dtype=float)
     print(f"[parity] residual_max_abs={np.max(np.abs(residual_delta)):.16e}", flush=True)

@@ -13,8 +13,15 @@ from collections.abc import Callable, Sequence
 from typing import Any
 
 import jax
+import jax.numpy as jnp
 
 from ._geometry_autodiff import GeometryRawBlockSolve, GeometryRawBlockStage
+from ._reverse_ad_parameters import (
+    PROFILE_PARAMETER_ORDER,
+    ProfileParameterSpec,
+    ReverseADParameterSet,
+    VmecBoundaryParameterSpec,
+)
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -43,6 +50,65 @@ class GeometryInitialRootOptimizationStage:
     layout: InitialRootStageLayout
     root_to_payload: Callable[..., Any]
     payload_to_vmec: Callable[..., Any]
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class ParameterVectorOptimizationStage:
+    """Persistent fixed-layout maps at the optimizer/reverse-AD boundary.
+
+    This stage owns no physics calculation.  Its two kernels only scale an
+    optimizer vector and unpack the fixed profile/VMEC subvectors required by
+    the established reverse-table evaluator.
+    """
+
+    scaled_to_physical: Callable[[Any], Any]
+    unpack: Callable[[Any, Any], tuple[Any, Any, Any]]
+
+
+def build_parameter_vector_optimization_stage(
+    *,
+    parameter_set: ReverseADParameterSet,
+    optimizer_scale,
+) -> ParameterVectorOptimizationStage:
+    """Create fixed-shape vector maps without entering any physics kernel."""
+
+    specs = tuple(parameter_set.specs)
+    scale = jnp.asarray(optimizer_scale, dtype=jnp.float64)
+    if scale.shape != (len(specs),):
+        raise ValueError(
+            "optimizer_scale must have one entry per reverse-AD parameter; "
+            f"got {scale.shape}, expected ({len(specs)},)."
+        )
+    vmec_indices = jnp.asarray(
+        [i for i, spec in enumerate(specs) if isinstance(spec, VmecBoundaryParameterSpec)],
+        dtype=jnp.int32,
+    )
+    profile_sources = jnp.asarray(
+        [i for i, spec in enumerate(specs) if isinstance(spec, ProfileParameterSpec)],
+        dtype=jnp.int32,
+    )
+    profile_lookup = {name: i for i, name in enumerate(PROFILE_PARAMETER_ORDER)}
+    profile_targets = jnp.asarray(
+        [profile_lookup[spec.name] for spec in specs if isinstance(spec, ProfileParameterSpec)],
+        dtype=jnp.int32,
+    )
+
+    @jax.jit
+    def scaled_to_physical(scaled_values):
+        return jnp.asarray(scaled_values, dtype=jnp.float64) * scale
+
+    @jax.jit
+    def unpack(parameter_values, baseline_profile_values):
+        values = jnp.asarray(parameter_values, dtype=jnp.float64)
+        profiles = jnp.asarray(baseline_profile_values, dtype=jnp.float64)
+        active_profiles = profiles.at[profile_targets].set(jnp.take(values, profile_sources))
+        vmec_values = jnp.take(values, vmec_indices)
+        return active_profiles, vmec_values, jnp.concatenate((active_profiles, vmec_values))
+
+    return ParameterVectorOptimizationStage(
+        scaled_to_physical=scaled_to_physical,
+        unpack=unpack,
+    )
 
 
 @dataclasses.dataclass(slots=True)

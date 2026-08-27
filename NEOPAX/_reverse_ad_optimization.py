@@ -2494,6 +2494,7 @@ def evaluate_geometry_initial_er_root_only_least_squares_benchmark_tables(
     geometry_solver_device: str | None = "default",
     root_options: Mapping[str, object] | None = None,
     raw_block_stage=None,
+    parameter_vector_optimization_stage=None,
 ) -> LeastSquaresEvaluation:
     """Evaluate mixed objectives using only benchmark-validated table backends."""
 
@@ -2515,28 +2516,42 @@ def evaluate_geometry_initial_er_root_only_least_squares_benchmark_tables(
     t_start = time.perf_counter()
 
     if "transport" in grouped_terms:
-        active_profile_values = _active_profile_values_from_parameter_vector(
-            parameter_set,
-            parameter_values_arr,
-            baseline_profile_values,
-        )
-        requested_transport_objectives = _unique_objective_names(grouped_terms["transport"])
-        if parameter_set.vmec_boundary_specs:
-            vmec_parameter_values = vmec_parameter_values_from_parameter_vector(
+        if parameter_vector_optimization_stage is None:
+            active_profile_values = _active_profile_values_from_parameter_vector(
                 parameter_set,
                 parameter_values_arr,
+                baseline_profile_values,
             )
+            vmec_parameter_values = None
+            transport_parameter_values = None
+        else:
+            (
+                active_profile_values,
+                vmec_parameter_values,
+                transport_parameter_values,
+            ) = parameter_vector_optimization_stage.unpack(
+                parameter_values_arr,
+                baseline_profile_values,
+            )
+        requested_transport_objectives = _unique_objective_names(grouped_terms["transport"])
+        if parameter_set.vmec_boundary_specs:
+            if vmec_parameter_values is None:
+                vmec_parameter_values = vmec_parameter_values_from_parameter_vector(
+                    parameter_set,
+                    parameter_values_arr,
+                )
             transport_parameter_set = ReverseADParameterSet(
                 profile_specs=tuple(ProfileParameterSpec(name) for name in PROFILE_PARAMETER_ORDER),
                 vmec_boundary_specs=tuple(parameter_set.vmec_boundary_specs),
             )
-            transport_parameter_values = jnp.concatenate(
-                [
-                    jnp.asarray(active_profile_values, dtype=parameter_values_arr.dtype),
-                    jnp.asarray(vmec_parameter_values, dtype=parameter_values_arr.dtype),
-                ],
-                axis=0,
-            )
+            if transport_parameter_values is None:
+                transport_parameter_values = jnp.concatenate(
+                    [
+                        jnp.asarray(active_profile_values, dtype=parameter_values_arr.dtype),
+                        jnp.asarray(vmec_parameter_values, dtype=parameter_values_arr.dtype),
+                    ],
+                    axis=0,
+                )
             shared_raw_block_solve = geometry_raw_block_solve_from_param_vector(
                 geometry_context,
                 vmec_parameter_values,

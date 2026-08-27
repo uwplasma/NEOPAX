@@ -55,6 +55,7 @@ from ._reverse_ad_optimization import (
     transport,
 )
 from ._optimization_initial_root_stage import (
+    build_parameter_vector_optimization_stage,
     build_compiled_geometry_initial_root_stage,
     build_geometry_initial_root_optimization_stage,
     initial_root_stage_layout,
@@ -343,6 +344,7 @@ class GeometryInitialErRootLeastSquaresProblem:
     raw_block_stage: object | None = None
     optimization_stage_layout: object | None = None
     optimization_stage: object | None = None
+    parameter_vector_optimization_stage: object | None = None
     reverse_stage_mode: str = "off"
 
     @property
@@ -425,14 +427,12 @@ class GeometryInitialErRootLeastSquaresProblem:
             scaled_values = self.x0
         else:
             scaled_values = jnp.asarray(scaled_parameter_values, dtype=jnp.float64)
-        physical_values = self._scaled_to_physical(scaled_values)
+        if self.parameter_vector_optimization_stage is None:
+            physical_values = self._scaled_to_physical(scaled_values)
+        else:
+            physical_values = self.parameter_vector_optimization_stage.scaled_to_physical(scaled_values)
         base_terms = _base_terms_for_mixed_initial_er_root(self.terms)
-        evaluator = (
-            evaluate_geometry_initial_er_root_only_least_squares_benchmark_tables
-            if self.reverse_stage_mode == "off"
-            else evaluate_geometry_initial_er_root_only_least_squares_optimization
-        )
-        base_evaluation = evaluator(
+        base_evaluation = evaluate_geometry_initial_er_root_only_least_squares_benchmark_tables(
             self.config,
             parameter_set=self.parameter_set,
             parameter_values=physical_values,
@@ -452,7 +452,7 @@ class GeometryInitialErRootLeastSquaresProblem:
             geometry_solver_device=self.geometry_solver_device,
             root_options=self.root_options,
             raw_block_stage=self.raw_block_stage,
-            **({} if self.reverse_stage_mode == "off" else {"optimization_stage": self.optimization_stage}),
+            parameter_vector_optimization_stage=self.parameter_vector_optimization_stage,
         )
         result = _assemble_mixed_initial_er_root_result(
             self.terms,
@@ -1282,13 +1282,8 @@ def geometry_initial_er_root_only_least_squares_problem(
     """
 
     mode = str(reverse_stage_mode).strip().lower()
-    if mode not in {"off", "vmex_like"}:
-        raise ValueError("reverse_stage_mode must be 'off' or 'vmex_like'.")
-    if mode == "vmex_like":
-        raise NotImplementedError(
-            "reverse_stage_mode='vmex_like' is disabled while the incomplete "
-            "outer-JIT experiment is replaced by retained existing reverse kernels."
-        )
+    if mode not in {"off", "optimization"}:
+        raise ValueError("reverse_stage_mode must be 'off' or 'optimization'.")
     config_eff = _prepare_initial_er_root_config(config, device=device, vmec_input=vmec_input)
     geom_cfg = config_eff.get("geometry", {})
     neoclassical_cfg = config_eff.get("neoclassical", {})
@@ -1361,6 +1356,26 @@ def geometry_initial_er_root_only_least_squares_problem(
     )
     optimization_stage_layout = None
     optimization_stage = None
+    parameter_vector_optimization_stage = None
+    if mode == "optimization":
+        parameter_vector_optimization_stage = build_parameter_vector_optimization_stage(
+            parameter_set=parameter_set,
+            optimizer_scale=(
+                geometry_parameterization.x_scale
+                if not profile_specs
+                else jnp.asarray(
+                    [
+                        profile_scales[PROFILE_PARAMETER_ORDER.index(spec.name)]
+                        if isinstance(spec, ProfileParameterSpec)
+                        else geometry_parameterization.x_scale[
+                            geometry_parameterization.specs.index(spec)
+                        ]
+                        for spec in parameter_set.specs
+                    ],
+                    dtype=jnp.float64,
+                )
+            ),
+        )
     if mode == "vmex_like":
         normalized_stage_terms = normalize_least_squares_terms(terms)
         optimization_stage_layout = initial_root_stage_layout(
@@ -1474,6 +1489,7 @@ def geometry_initial_er_root_only_least_squares_problem(
         raw_block_stage=raw_block_stage,
         optimization_stage_layout=optimization_stage_layout,
         optimization_stage=optimization_stage,
+        parameter_vector_optimization_stage=parameter_vector_optimization_stage,
         reverse_stage_mode=mode,
     )
 

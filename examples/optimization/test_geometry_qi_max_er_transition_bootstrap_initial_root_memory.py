@@ -280,7 +280,7 @@ def _one_cleanup_sample(problem, x, iteration: int, *, clear_jax_caches: bool, t
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--mode", choices=("off", "vmex_like"), default="off")
+    parser.add_argument("--mode", choices=("off", "optimization"), default="off")
     parser.add_argument("--warmup", type=int, default=DEFAULT_WARMUP)
     parser.add_argument("--repeats", type=int, default=DEFAULT_REPEATS)
     parser.add_argument(
