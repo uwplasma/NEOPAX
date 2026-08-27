@@ -51,6 +51,7 @@ def _persistent_raw_parameter_context(problem):
     def persistent_raw_parameter_solve(*args, **kwargs):
         kwargs["stage"] = stage.raw_block_stage
         kwargs["implicit_params_from_deltas_runner"] = stage.implicit_params_from_deltas_runner
+        kwargs["state_mask_stop_gradient_runner"] = stage.state_mask_stop_gradient_runner
         return original(*args, **kwargs)
 
     return patch.object(

@@ -810,6 +810,7 @@ class GeometryRawBlockOptimizationStage:
     raw_block_stage: GeometryRawBlockStage
     base_implicit_params: Any
     implicit_params_from_deltas_runner: Callable[[Any], Any]
+    state_mask_stop_gradient_runner: Callable[[Any, Any], tuple[Any, Any]]
     solve_with_aux_runner: Callable[[Any], tuple[Any, Any]]
 
 
@@ -885,10 +886,17 @@ def geometry_raw_block_optimization_stage(
         )
 
     def implicit_params_from_deltas_runner(param_deltas):
-        return _implicit_params_from_base_with_boundary_deltas(
+        params = _implicit_params_from_base_with_boundary_deltas(
             base_implicit_params,
             param_deltas,
             raw_stage.param_entries,
+        )
+        return jax.tree_util.tree_map(jax.lax.stop_gradient, params)
+
+    def state_mask_stop_gradient_runner(state, dof_mask):
+        return (
+            jax.tree_util.tree_map(jax.lax.stop_gradient, state),
+            jax.tree_util.tree_map(jax.lax.stop_gradient, dof_mask),
         )
 
     return GeometryRawBlockOptimizationStage(
@@ -900,6 +908,10 @@ def geometry_raw_block_optimization_stage(
         # optimization evaluation.
         implicit_params_from_deltas_runner=jax.jit(
             implicit_params_from_deltas_runner,
+            inline=False,
+        ),
+        state_mask_stop_gradient_runner=jax.jit(
+            state_mask_stop_gradient_runner,
             inline=False,
         ),
         # This is deliberately the smallest VMEX-like persistent stage
@@ -945,12 +957,14 @@ def geometry_raw_block_solve_from_param_vector(
     solve_with_aux_runner: Callable[[Any], tuple[Any, Any]] | None = None,
     base_implicit_params=None,
     implicit_params_from_deltas_runner: Callable[[Any], Any] | None = None,
+    state_mask_stop_gradient_runner: Callable[[Any, Any], tuple[Any, Any]] | None = None,
 ) -> GeometryRawBlockSolve:
     """Solve VMEC once and keep the raw-block transpose auxiliary data."""
 
     if not _using_current_vmec_jax_context(context):
         raise ValueError("geometry_raw_block_solve_from_param_vector requires the current VMEX implicit AD lane.")
     normalized_specs = tuple((str(family).strip().upper(), int(m), int(n)) for family, m, n in param_specs)
+    params_already_stop_gradiented = False
     if stage is None:
         param_entries = boundary_param_entries(context, normalized_specs)
         implicit, implicit_params, implicit_cfg = _current_implicit_params_cfg_for_param_vector(
@@ -970,6 +984,7 @@ def geometry_raw_block_solve_from_param_vector(
             raise ValueError("GeometryRawBlockStage parameter layout does not match param_specs.")
         implicit = stage.implicit
         implicit_cfg = stage.implicit_cfg
+        params_already_stop_gradiented = implicit_params_from_deltas_runner is not None
         if implicit_params_from_deltas_runner is not None:
             implicit_params = implicit_params_from_deltas_runner(
                 jnp.asarray(param_deltas, dtype=jnp.float64)
@@ -994,13 +1009,17 @@ def geometry_raw_block_solve_from_param_vector(
     # optimizer's compact parameter vector to the full VMEC input arrays.  Cutting
     # that ancestry keeps the payload/state VJPs from scaling with the number of
     # selected boundary harmonics.
-    implicit_params = jax.tree_util.tree_map(_stop_gradient_if_jax_value, implicit_params)
+    if not params_already_stop_gradiented:
+        implicit_params = jax.tree_util.tree_map(_stop_gradient_if_jax_value, implicit_params)
     if solve_with_aux_runner is None:
         state, dof_mask = implicit.solve_implicit_with_aux(implicit_params, implicit_cfg)
     else:
         state, dof_mask = solve_with_aux_runner(implicit_params)
-    state = jax.tree_util.tree_map(_stop_gradient_if_jax_value, state)
-    dof_mask = jax.tree_util.tree_map(_stop_gradient_if_jax_value, dof_mask)
+    if state_mask_stop_gradient_runner is None:
+        state = jax.tree_util.tree_map(_stop_gradient_if_jax_value, state)
+        dof_mask = jax.tree_util.tree_map(_stop_gradient_if_jax_value, dof_mask)
+    else:
+        state, dof_mask = state_mask_stop_gradient_runner(state, dof_mask)
     return GeometryRawBlockSolve(
         implicit=implicit,
         implicit_params=implicit_params,

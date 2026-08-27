@@ -17205,6 +17205,7 @@ def _radau_adaptive_final_y_realized_schedule_vjp_bwd(
             "final_state",
             "reduced_cotangent_host_segments",
             "host_segments",
+            "reduced_cotangent_host_static_branches",
         }
         lean_reduced_replay_tape = step_bwd_mode in {
             "reduced_cotangent_lean_replay",

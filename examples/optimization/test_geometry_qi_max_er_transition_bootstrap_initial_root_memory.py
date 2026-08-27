@@ -148,6 +148,9 @@ class EvaluationStructureCounter:
                     kwargs["implicit_params_from_deltas_runner"] = (
                         optimization_raw_block_stage.implicit_params_from_deltas_runner
                     )
+                    kwargs["state_mask_stop_gradient_runner"] = (
+                        optimization_raw_block_stage.state_mask_stop_gradient_runner
+                    )
                 elif reuse_base_implicit_params:
                     kwargs["base_implicit_params"] = optimization_raw_block_stage.base_implicit_params
                 else:

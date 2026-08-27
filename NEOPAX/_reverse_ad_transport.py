@@ -97,8 +97,10 @@ from ._transport_solvers import (
     _radau_adaptive_final_y_realized_schedule_vjp_fwd_from_schedule_artifact,
     _radau_align_tangent_tree_to_primal,
     _radau_carry_from_step_state,
+    _radau_carry_with_forward_only_jvp_fields,
     _radau_eval_rhs,
     _execute_radau_accepted_step_next_reduced_cotangent_batched_bwd_with_support_call,
+    _execute_radau_accepted_step_next_reduced_cotangent_batched_bwd_with_support_from_segment_primal_record_call,
     _radau_segment_reduced_cotangent_bwd_batched_with_support_call,
     _radau_segment_replay_minimal_with_primal_records_call,
     _radau_segment_reduced_cotangent_bwd_batched_with_support_from_primal_records_call,
@@ -3591,6 +3593,7 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
         "reduced_cotangent_call_boundary_common_branch_hoist",
         "reduced_cotangent_call_boundary_common_branch_hoist_rebuild_call",
         "reduced_cotangent_call_boundary_common_branch_hoist_common_call_rebuild_call",
+        "reduced_cotangent_host_static_branches",
         "reduced_cotangent_lean_replay",
         "reduced_cotangent_recompute_replay",
         "lean_replay",
@@ -3609,6 +3612,29 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
 
     def _take_tree_axis0(tree, index: int):
         return jax.tree_util.tree_map(lambda value: value[index], tree)
+
+    host_static_branch_dispatch = step_bwd_mode == "reduced_cotangent_host_static_branches"
+    if host_static_branch_dispatch:
+        record_mode = str(
+            getattr(
+                reverse_setup.execution_context.physics_context,
+                "reverse_segment_primal_record_mode",
+                "reconstruct",
+            )
+        ).strip().lower()
+        replay_mode = str(
+            getattr(
+                reverse_setup.execution_context.physics_context,
+                "reverse_segment_start_replay_mode",
+                "legacy",
+            )
+        ).strip().lower()
+        if record_mode != "reuse_segment_primal_record" or replay_mode != "minimal":
+            raise ValueError(
+                "reduced_cotangent_host_static_branches requires "
+                "reverse_segment_primal_record_mode='reuse_segment_primal_record' "
+                "and reverse_segment_start_replay_mode='minimal'."
+            )
 
     def _batched_zero_tangent_tree_like(primal_tree, batch_size: int):
         zero_tree = _reverse_align_tangent_tree_to_primal(
@@ -4721,6 +4747,79 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
         f"objectives={objective_count} cotangent_mode={cotangent_mode}",
         flush=True,
     )
+
+    def _run_host_static_branch_segment(
+        segment_carry,
+        segment_arrays,
+        segment_next_reduced_bars,
+    ):
+        """Run one realized segment through two static device executables.
+
+        Only the already-realized boolean schedule crosses to the host.  The
+        carries, primal records, objective-RHS bars, support bars, and every
+        NTX calculation remain device arrays.  This deliberately removes the
+        dynamic reuse/rebuild ``lax.cond`` and its enclosing reverse scan from
+        the compiled reverse module rather than adding another inner call.
+        """
+
+        _, step_start_carries, step_primal_records = (
+            _radau_segment_replay_minimal_with_primal_records_call(
+                reverse_setup.execution_context,
+                segment_carry,
+                segment_arrays,
+            )
+        )
+        slot_active = np.asarray(jax.device_get(segment_arrays[0]), dtype=bool).reshape(-1)
+        slot_next_lagged_valid = np.asarray(
+            jax.device_get(segment_arrays[6]), dtype=bool
+        ).reshape(-1)
+        slot_start_lagged_valid = np.concatenate(
+            [
+                np.asarray(
+                    [bool(np.asarray(jax.device_get(segment_carry.lagged_response_valid)))],
+                    dtype=bool,
+                ),
+                slot_next_lagged_valid[:-1],
+            ]
+        )
+        segment_support_bars = tuple(
+            jnp.zeros_like(leaf) for leaf in support_bar_leaves
+        )
+        reduced_value = segment_next_reduced_bars
+        for slot_index in range(slot_active.size - 1, -1, -1):
+            if not slot_active[slot_index]:
+                continue
+            step_start_carry = _take_tree_axis0(step_start_carries, slot_index)
+            carry_for_step = _radau_carry_with_forward_only_jvp_fields(
+                dataclasses.replace(
+                    step_start_carry,
+                    dt=segment_arrays[1][slot_index],
+                )
+            )
+            step_primal_record = _take_tree_axis0(step_primal_records, slot_index)
+            branch = "reuse" if slot_start_lagged_valid[slot_index] else "rebuild"
+            reduced_value, step_support_bars = (
+                _execute_radau_accepted_step_next_reduced_cotangent_batched_bwd_with_support_from_segment_primal_record_call(
+                    reverse_setup.execution_context.kernel_context,
+                    reverse_setup.execution_context.physics_context,
+                    reverse_setup.execution_context.attempt_context,
+                    branch,
+                    carry_for_step,
+                    step_primal_record,
+                    reduced_value,
+                    support_payload,
+                )
+            )
+            segment_support_bars = tuple(
+                accumulated + increment
+                for accumulated, increment in zip(
+                    segment_support_bars,
+                    step_support_bars,
+                    strict=True,
+                )
+            )
+        return jax.block_until_ready((reduced_value, segment_support_bars))
+
     phase_start = time.perf_counter()
     for segment_index in range(segment_count - 1, -1, -1):
         segment_phase_start = time.perf_counter()
@@ -4734,20 +4833,27 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
         segment_start_carry = _take_tree_axis0(segment_start_carries, segment_index)
         segment_arrays = _take_tree_axis0(segmented_replay_arrays, segment_index)
         segment_reduced_bars_input = reduced_bars
-        reduced_bars, segment_support_bar_leaves = (
-            _reverse_segment_reduced_cotangent_bwd_batched_with_support_call(
-                reverse_setup.execution_context,
-                cotangent_mode,
-                reduced_bars,
+        if host_static_branch_dispatch:
+            reduced_bars, segment_support_bar_leaves = _run_host_static_branch_segment(
                 segment_start_carry,
                 segment_arrays,
-                support_payload,
+                reduced_bars,
             )
-        )
-        reduced_bars, segment_support_bar_leaves = jax.block_until_ready(
-            (reduced_bars, segment_support_bar_leaves)
-        )
-        if phase_timing_segment_warm_pending:
+        else:
+            reduced_bars, segment_support_bar_leaves = (
+                _reverse_segment_reduced_cotangent_bwd_batched_with_support_call(
+                    reverse_setup.execution_context,
+                    cotangent_mode,
+                    reduced_bars,
+                    segment_start_carry,
+                    segment_arrays,
+                    support_payload,
+                )
+            )
+            reduced_bars, segment_support_bar_leaves = jax.block_until_ready(
+                (reduced_bars, segment_support_bar_leaves)
+            )
+        if phase_timing_segment_warm_pending and not host_static_branch_dispatch:
             first_call_elapsed = time.perf_counter() - segment_phase_start
             warm_start = time.perf_counter()
             warm_reduced_bars, warm_support_bar_leaves = (

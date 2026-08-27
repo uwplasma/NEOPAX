@@ -5804,6 +5804,7 @@ def main() -> None:
             "reduced_cotangent_call_boundary_common_branch_hoist",
             "reduced_cotangent_call_boundary_common_branch_hoist_rebuild_call",
             "reduced_cotangent_call_boundary_common_branch_hoist_common_call_rebuild_call",
+            "reduced_cotangent_host_static_branches",
             "reduced_cotangent_lean_replay",
             "reduced_cotangent_recompute_replay",
             "reduced_cotangent_host_segments",
@@ -5828,7 +5829,10 @@ def main() -> None:
             "the segment checkpoint instead of storing the full per-slot carry tape. "
             "'reduced_cotangent_host_segments' is only "
             "for split-vjp timing and orchestrates segment backward kernels outside "
-            "the monolithic rollout-bwd JIT."
+            "the monolithic rollout-bwd JIT. "
+            "'reduced_cotangent_host_static_branches' replays each segment once, "
+            "then dispatches the already-known reuse/rebuild schedule to one of two "
+            "device-resident record-consuming step adjoints."
         ),
     )
     parser.add_argument(
