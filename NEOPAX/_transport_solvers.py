@@ -6024,6 +6024,37 @@ def _radau_fixed_lagged_step_reverse_common_from_segment_primal_record(
     return primal_result, lagged_response, common
 
 
+@partial(jax.jit, static_argnums=(0, 1, 2, 7), inline=False)
+def _radau_fixed_lagged_step_reverse_common_from_segment_primal_record_call(
+    kernel_context: _RadauAcceptedStepKernelContext,
+    physics_context: _RadauAcceptedStepPhysicsContext,
+    context: _RadauAcceptedStepAttemptContext,
+    carry_in: _RadauAcceptedStepCarry,
+    primal_record: _RadauAcceptedStepSegmentPrimalRecord,
+    next_reduced_bars: _RadauAcceptedStepReducedCotangent,
+    support,
+    collect_native_vmec_coefficients: bool,
+    native_vmec_zero_leaves: tuple[Any, ...],
+) -> tuple[_RadauAcceptedStepReverseMinimalAttemptResult, Any, tuple[Any, Any, Any, tuple[Any, ...]]] | None:
+    """Place the shared record-based transpose behind one scan call boundary.
+
+    Unlike the previous whole-step boundary, this computation is called once
+    before selecting reuse versus rebuild.  Its objective-batched stage solve
+    and fixed-lagged state/support transposes are unchanged.
+    """
+    return _radau_fixed_lagged_step_reverse_common_from_segment_primal_record(
+        kernel_context,
+        physics_context,
+        context,
+        carry_in,
+        primal_record,
+        next_reduced_bars,
+        support,
+        collect_native_vmec_coefficients=collect_native_vmec_coefficients,
+        native_vmec_zero_leaves=native_vmec_zero_leaves,
+    )
+
+
 def _radau_finish_native_vmec_rebuild_from_common(
     kernel_context: _RadauAcceptedStepKernelContext,
     physics_context: _RadauAcceptedStepPhysicsContext,
@@ -7556,6 +7587,7 @@ def _radau_segment_reduced_cotangent_bwd_batched_with_support_call(
         "reduced_cotangent_call_boundary",
         "reduced_cotangent_call_boundary_common_branch_hoist",
         "reduced_cotangent_call_boundary_common_branch_hoist_rebuild_call",
+        "reduced_cotangent_call_boundary_common_branch_hoist_common_call_rebuild_call",
         "reduced_cotangent_step_call",
         "call_boundary",
     }
@@ -7578,16 +7610,17 @@ def _radau_segment_reduced_cotangent_bwd_batched_with_support_call(
             "reduced_cotangent_common_branch_hoist",
             "reduced_cotangent_call_boundary_common_branch_hoist",
             "reduced_cotangent_call_boundary_common_branch_hoist_rebuild_call",
+            "reduced_cotangent_call_boundary_common_branch_hoist_common_call_rebuild_call",
         }
         and use_segment_primal_record
         and collect_native_vmec_coefficients
     )
-    if step_bwd_mode == (
-        "reduced_cotangent_call_boundary_common_branch_hoist_rebuild_call"
-    ) and not use_common_branch_hoist:
+    if step_bwd_mode in {
+        "reduced_cotangent_call_boundary_common_branch_hoist_rebuild_call",
+        "reduced_cotangent_call_boundary_common_branch_hoist_common_call_rebuild_call",
+    } and not use_common_branch_hoist:
         raise ValueError(
-            "reverse_step_bwd_mode='reduced_cotangent_call_boundary_common_"
-            "branch_hoist_rebuild_call' requires "
+            "the common-branch-hoist call-boundary reverse step modes require "
             "reverse_segment_primal_record_mode='reuse_segment_primal_record' "
             "and a native VMEC-coefficient rebuild support mode."
         )
@@ -7647,26 +7680,44 @@ def _radau_segment_reduced_cotangent_bwd_batched_with_support_call(
             residual_carry = _radau_carry_with_forward_only_jvp_fields(carry_for_step)
 
             if use_common_branch_hoist:
-                prepared_common = (
-                    _radau_fixed_lagged_step_reverse_common_from_segment_primal_record(
-                        execution_context.kernel_context,
-                        execution_context.physics_context,
-                        execution_context.attempt_context,
-                        residual_carry,
-                        primal_record,
-                        slot_reduced_bars,
-                        support,
-                        collect_native_vmec_coefficients=collect_native_vmec_coefficients,
-                        native_vmec_zero_leaves=native_vmec_zero_leaves,
+                if step_bwd_mode == (
+                    "reduced_cotangent_call_boundary_common_branch_hoist_common_call_rebuild_call"
+                ):
+                    prepared_common = (
+                        _radau_fixed_lagged_step_reverse_common_from_segment_primal_record_call(
+                            execution_context.kernel_context,
+                            execution_context.physics_context,
+                            execution_context.attempt_context,
+                            residual_carry,
+                            primal_record,
+                            slot_reduced_bars,
+                            support,
+                            collect_native_vmec_coefficients,
+                            native_vmec_zero_leaves,
+                        )
                     )
-                )
+                else:
+                    prepared_common = (
+                        _radau_fixed_lagged_step_reverse_common_from_segment_primal_record(
+                            execution_context.kernel_context,
+                            execution_context.physics_context,
+                            execution_context.attempt_context,
+                            residual_carry,
+                            primal_record,
+                            slot_reduced_bars,
+                            support,
+                            collect_native_vmec_coefficients=collect_native_vmec_coefficients,
+                            native_vmec_zero_leaves=native_vmec_zero_leaves,
+                        )
+                    )
                 if prepared_common is not None:
                     _, _, common = prepared_common
 
                     def _finish_common(branch):
-                        if step_bwd_mode == (
-                            "reduced_cotangent_call_boundary_common_branch_hoist_rebuild_call"
-                        ):
+                        if step_bwd_mode in {
+                            "reduced_cotangent_call_boundary_common_branch_hoist_rebuild_call",
+                            "reduced_cotangent_call_boundary_common_branch_hoist_common_call_rebuild_call",
+                        }:
                             return _radau_finish_native_vmec_rebuild_from_common_call(
                                 execution_context.kernel_context,
                                 execution_context.physics_context,

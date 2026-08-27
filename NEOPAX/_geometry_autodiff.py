@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import dataclasses
+import functools
 import importlib
 import sys
 import time
@@ -843,14 +844,38 @@ def geometry_raw_block_optimization_stage(
 
     raw_stage = geometry_raw_block_stage(context, param_specs, max_iter=max_iter)
     factory = getattr(raw_stage.implicit, "make_solve_implicit_with_aux_runner", None)
-    if not callable(factory):
-        raise RuntimeError(
-            "The VMEX backend does not expose make_solve_implicit_with_aux_runner; "
-            "the optimization-only persistent raw-block callback is unavailable."
+    if callable(factory):
+        runner = factory(raw_stage.implicit_cfg)
+    else:
+        # Compatibility path for an installed VMEX checkout that predates the
+        # additive public factory.  This reproduces ``solve_implicit_with_aux``
+        # exactly, but binds the otherwise per-call ``partial`` once for this
+        # optimization-only stage.  It is deliberately isolated here rather
+        # than changing VMEX's benchmark/default one-shot entrypoint.
+        host_solve = getattr(raw_stage.implicit, "_host_solve_and_mask", None)
+        state_struct = getattr(raw_stage.implicit, "_state_struct", None)
+        host_errors = getattr(raw_stage.implicit, "_HOST_ERROR", None)
+        if not callable(host_solve) or not callable(state_struct):
+            raise RuntimeError(
+                "The VMEX backend exposes neither make_solve_implicit_with_aux_runner "
+                "nor the established solve_implicit_with_aux callback internals."
+            )
+        callback = functools.partial(host_solve, raw_stage.implicit_cfg)
+        result_struct = (
+            state_struct(raw_stage.implicit_cfg),
+            state_struct(raw_stage.implicit_cfg),
         )
+
+        def runner(params):
+            try:
+                return jax.pure_callback(callback, result_struct, params)
+            except Exception:
+                if host_errors:
+                    raise host_errors.pop() from None
+                raise
     return GeometryRawBlockOptimizationStage(
         raw_block_stage=raw_stage,
-        solve_with_aux_runner=factory(raw_stage.implicit_cfg),
+        solve_with_aux_runner=runner,
     )
 
 
