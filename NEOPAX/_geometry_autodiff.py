@@ -7,7 +7,7 @@ import time
 from copy import deepcopy
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Mapping, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 import jax
 import jax.numpy as jnp
@@ -795,6 +795,19 @@ class GeometryRawBlockStage:
     param_entries: tuple[dict[str, Any], ...]
 
 
+@dataclasses.dataclass(frozen=True, slots=True)
+class GeometryRawBlockOptimizationStage:
+    """Optimization-only persistent VMEX callback for one static raw-block stage.
+
+    The contained raw-block stage is the established benchmark setup.  The
+    additional runner is opt-in and retains only VMEX's opaque forward callback
+    identity; it does not alter the VMEC solve or its custom reverse rule.
+    """
+
+    raw_block_stage: GeometryRawBlockStage
+    solve_with_aux_runner: Callable[[Any], tuple[Any, Any]]
+
+
 def geometry_raw_block_stage(
     context: "GeometryAutodiffContext",
     param_specs: Sequence[tuple[str, int, int]],
@@ -820,6 +833,27 @@ def geometry_raw_block_stage(
     )
 
 
+def geometry_raw_block_optimization_stage(
+    context: "GeometryAutodiffContext",
+    param_specs: Sequence[tuple[str, int, int]],
+    *,
+    max_iter: int | None = None,
+) -> GeometryRawBlockOptimizationStage:
+    """Create the opt-in stable VMEX callback for a fixed optimizer stage."""
+
+    raw_stage = geometry_raw_block_stage(context, param_specs, max_iter=max_iter)
+    factory = getattr(raw_stage.implicit, "make_solve_implicit_with_aux_runner", None)
+    if not callable(factory):
+        raise RuntimeError(
+            "The VMEX backend does not expose make_solve_implicit_with_aux_runner; "
+            "the optimization-only persistent raw-block callback is unavailable."
+        )
+    return GeometryRawBlockOptimizationStage(
+        raw_block_stage=raw_stage,
+        solve_with_aux_runner=factory(raw_stage.implicit_cfg),
+    )
+
+
 def _stop_gradient_if_jax_value(leaf):
     try:
         return jax.lax.stop_gradient(leaf)
@@ -835,6 +869,7 @@ def geometry_raw_block_solve_from_param_vector(
     max_iter: int | None = None,
     solver_device: str | None = None,
     stage: GeometryRawBlockStage | None = None,
+    solve_with_aux_runner: Callable[[Any], tuple[Any, Any]] | None = None,
 ) -> GeometryRawBlockSolve:
     """Solve VMEC once and keep the raw-block transpose auxiliary data."""
 
@@ -874,7 +909,10 @@ def geometry_raw_block_solve_from_param_vector(
     # that ancestry keeps the payload/state VJPs from scaling with the number of
     # selected boundary harmonics.
     implicit_params = jax.tree_util.tree_map(_stop_gradient_if_jax_value, implicit_params)
-    state, dof_mask = implicit.solve_implicit_with_aux(implicit_params, implicit_cfg)
+    if solve_with_aux_runner is None:
+        state, dof_mask = implicit.solve_implicit_with_aux(implicit_params, implicit_cfg)
+    else:
+        state, dof_mask = solve_with_aux_runner(implicit_params)
     state = jax.tree_util.tree_map(_stop_gradient_if_jax_value, state)
     dof_mask = jax.tree_util.tree_map(_stop_gradient_if_jax_value, dof_mask)
     return GeometryRawBlockSolve(

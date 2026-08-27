@@ -83,6 +83,25 @@ The next diagnostic step must instead locate native/JAX allocations made below
 the already-correct reverse boundaries, while proving the one-solve topology
 on every measured call.
 
+### Step 3 diagnostic result and implementation target
+
+The two-call checkpoint run isolated the retained memory to the existing VMEX
+raw-block solve: its RSS had risen by `+909.7 MiB` before the selected-root
+call, while the selected-root checkpoint was unchanged.  The final
+payload-to-VMEC pullback released part of the temporary working set, leaving
+the observed `+659.1 MiB` process-RSS slope.  Clearing JAX caches and trimming
+only free native heap removed that slope, so this is native callback/executable
+cache retention, not live JAX arrays or a retained physical solution.
+
+VMEX's one-shot `solve_implicit_with_aux` constructs a fresh
+`functools.partial(_host_solve_and_mask, cfg)` on each call.  That fresh
+callback identity is passed to `jax.pure_callback`, so JAX cannot reuse the
+corresponding native callback executable across optimizer evaluations.  The
+opt-in implementation is therefore a VMEX factory that binds this callback
+once per immutable stage and a NEOPAX optimization-only raw-block stage that
+passes its runner explicitly.  The one-shot benchmark call remains the
+default, unchanged.
+
 Date: 2026-07-30
 
 ## Guiding Rule

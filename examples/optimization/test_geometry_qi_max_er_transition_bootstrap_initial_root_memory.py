@@ -29,6 +29,7 @@ if str(ROOT) not in sys.path:
 
 from NEOPAX import optimization as opt  # noqa: E402
 from NEOPAX import _reverse_ad_optimization as reverse_optimization  # noqa: E402
+from NEOPAX._geometry_autodiff import geometry_raw_block_optimization_stage  # noqa: E402
 import optimize_geometry_qi_max_er_transition_bootstrap_initial_root as example  # noqa: E402
 from optimize_geometry_qi_max_er_transition_bootstrap_initial_root import (  # noqa: E402
     MAX_MODE_SCHEDULE,
@@ -74,7 +75,12 @@ class EvaluationStructureCounter:
         self.selected_root_calls = 0
         self.checkpoint_rss_bytes = {}
 
-    def context(self, *, checkpoints: bool = False):
+    def context(
+        self,
+        *,
+        checkpoints: bool = False,
+        optimization_raw_block_stage=None,
+    ):
         raw_block_solve = reverse_optimization.geometry_raw_block_solve_from_param_vector
         selected_root = reverse_optimization.initial_er_selected_root_profile
         payload_builder = reverse_optimization.build_neopax_geometry_and_ntx_exact_lij_support_from_state
@@ -86,6 +92,9 @@ class EvaluationStructureCounter:
 
         def count_raw_block_solve(*args, **kwargs):
             self.raw_block_solve_calls += 1
+            if optimization_raw_block_stage is not None:
+                kwargs["stage"] = optimization_raw_block_stage.raw_block_stage
+                kwargs["solve_with_aux_runner"] = optimization_raw_block_stage.solve_with_aux_runner
             result = raw_block_solve(*args, **kwargs)
             record("raw_block_solve")
             return result
@@ -205,6 +214,14 @@ def main() -> int:
             "geometry/NTX payload build, selected root, and payload-to-VMEC pullback."
         ),
     )
+    parser.add_argument(
+        "--stable-vmex-callback",
+        action="store_true",
+        help=(
+            "Use the optimization-only, stage-bound VMEX raw-solve callback. "
+            "The benchmark/default raw-solve call remains unchanged."
+        ),
+    )
     args = parser.parse_args()
     if args.warmup < 0 or args.repeats < 1:
         raise ValueError("--warmup must be non-negative and --repeats must be positive.")
@@ -218,6 +235,15 @@ def main() -> int:
         example.REVERSE_STAGE_MODE = previous_mode
     quiet_problem = QuietProblem(problem)
     x = np.asarray(jax.device_get(problem.x0), dtype=float)
+    optimization_raw_block_stage = None
+    if args.stable_vmex_callback:
+        if not problem.parameter_set.vmec_boundary_specs:
+            raise ValueError("--stable-vmex-callback requires VMEC boundary parameters.")
+        optimization_raw_block_stage = geometry_raw_block_optimization_stage(
+            problem.context,
+            tuple(spec.as_tuple() for spec in problem.parameter_set.vmec_boundary_specs),
+            max_iter=problem.geometry_max_iter,
+        )
     first_bytes: int | None = None
     first_checkpoint_bytes: dict[str, int | None] = {}
     structure_counter = EvaluationStructureCounter()
@@ -279,13 +305,18 @@ def main() -> int:
             "[memory test] diagnostic_cleanup=jax.clear_caches+malloc_trim after each trial",
             flush=True,
         )
+    if args.stable_vmex_callback:
+        print("[memory test] raw_solve_callback=stable_optimization_only", flush=True)
     for warmup_index in range(args.warmup):
         print(f"[memory test] warmup={warmup_index} starting", flush=True)
         started = time.perf_counter()
         structure_counter.reset()
         patchers = (
-            structure_counter.context(checkpoints=args.diagnose_checkpoints)
-            if args.diagnose_structure or args.diagnose_checkpoints
+            structure_counter.context(
+                checkpoints=args.diagnose_checkpoints,
+                optimization_raw_block_stage=optimization_raw_block_stage,
+            )
+            if args.diagnose_structure or args.diagnose_checkpoints or args.stable_vmex_callback
             else ()
         )
         for patcher in patchers:
@@ -303,10 +334,13 @@ def main() -> int:
             f"elapsed_s={time.perf_counter() - started:.3f}",
             flush=True,
         )
-    if args.diagnose_structure or args.diagnose_checkpoints:
+    if args.diagnose_structure or args.diagnose_checkpoints or args.stable_vmex_callback:
         for iteration in range(args.repeats):
             structure_counter.reset()
-            patchers = structure_counter.context(checkpoints=args.diagnose_checkpoints)
+            patchers = structure_counter.context(
+                checkpoints=args.diagnose_checkpoints,
+                optimization_raw_block_stage=optimization_raw_block_stage,
+            )
             for patcher in patchers:
                 patcher.start()
             try:
