@@ -1463,7 +1463,15 @@ def test_live_ntx_scan_payload_rebuild_keeps_channel_jvp(monkeypatch):
         (jnp.asarray(0.2),),
     )
     assert jnp.all(jnp.isfinite(database))
-    assert jnp.allclose(tangent, -0.2 / (2.0 * jnp.log(10.0)))
+    # The zero ``Er_tilde`` column is clamped at the database's log-space
+    # floor, so its derivative is correctly zero.  The non-clamped column
+    # retains the analytic ``-da_b / (a_b log(10))`` radius chain.
+    expected_tangent = jnp.where(
+        database > -8.0,
+        -0.2 / (2.0 * jnp.log(10.0)),
+        0.0,
+    )
+    assert jnp.allclose(tangent, expected_tangent)
 
 
 def test_ntx_runtime_scan_database_keeps_radius_local_er_axis():
