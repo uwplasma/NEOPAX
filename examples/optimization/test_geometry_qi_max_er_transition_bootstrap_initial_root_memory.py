@@ -71,12 +71,14 @@ class EvaluationStructureCounter:
         self.selected_root_calls = 0
         self.checkpoint_rss_bytes: dict[str, int | None] = {}
         self.vmex_jit_cache_sizes: dict[str, int | None] = {}
+        self.jax_dispatch_cache_size: int | None = None
 
     def reset(self) -> None:
         self.raw_block_solve_calls = 0
         self.selected_root_calls = 0
         self.checkpoint_rss_bytes = {}
         self.vmex_jit_cache_sizes = {}
+        self.jax_dispatch_cache_size = None
 
     def context(
         self,
@@ -84,6 +86,7 @@ class EvaluationStructureCounter:
         checkpoints: bool = False,
         optimization_raw_block_stage=None,
         vmex_cache_sizes: bool = False,
+        jax_dispatch_cache: bool = False,
     ):
         raw_block_solve = reverse_optimization.geometry_raw_block_solve_from_param_vector
         selected_root = reverse_optimization.initial_er_selected_root_profile
@@ -110,6 +113,17 @@ class EvaluationStructureCounter:
                     except Exception:
                         self.vmex_jit_cache_sizes[name] = None
 
+        def record_jax_dispatch_cache() -> None:
+            if not jax_dispatch_cache:
+                return
+            try:
+                from jax._src import dispatch
+
+                info = dispatch.xla_primitive_callable.cache_info()
+                self.jax_dispatch_cache_size = int(info.currsize)
+            except (AttributeError, ImportError):
+                self.jax_dispatch_cache_size = None
+
         def count_raw_block_solve(*args, **kwargs):
             self.raw_block_solve_calls += 1
             if optimization_raw_block_stage is not None:
@@ -119,6 +133,7 @@ class EvaluationStructureCounter:
             if checkpoints:
                 jax.block_until_ready((result.state, result.dof_mask))
             record_vmex_cache_sizes(result.implicit)
+            record_jax_dispatch_cache()
             record("raw_block_solve")
             return result
 
@@ -266,6 +281,11 @@ def main() -> int:
         action="store_true",
         help="Report VMEX solver JIT trace-cache sizes after each raw-block solve.",
     )
+    parser.add_argument(
+        "--diagnose-jax-dispatch-cache",
+        action="store_true",
+        help="Report JAX's exposed primitive-dispatch cache size after each raw solve.",
+    )
     args = parser.parse_args()
     if args.warmup < 0 or args.repeats < 1:
         raise ValueError("--warmup must be non-negative and --repeats must be positive.")
@@ -344,6 +364,13 @@ def main() -> int:
                 for name, value in sorted(structure_counter.vmex_jit_cache_sizes.items())
             )
             print(f"[memory test] vmex_jit_cache_sizes {entries or 'unavailable'}", flush=True)
+        if args.diagnose_jax_dispatch_cache:
+            value = structure_counter.jax_dispatch_cache_size
+            print(
+                "[memory test] jax_dispatch_cache_size="
+                + ("unavailable" if value is None else str(value)),
+                flush=True,
+            )
 
     print(
         f"[memory test] mode={args.mode} objectives=maxEr,Er_left,Er_right,J_bootstrap "
@@ -371,11 +398,13 @@ def main() -> int:
                 checkpoints=args.diagnose_checkpoints,
                 optimization_raw_block_stage=optimization_raw_block_stage,
                 vmex_cache_sizes=args.diagnose_vmex_caches,
+                jax_dispatch_cache=args.diagnose_jax_dispatch_cache,
             )
             if (
                 args.diagnose_structure
                 or args.diagnose_checkpoints
                 or args.diagnose_vmex_caches
+                or args.diagnose_jax_dispatch_cache
                 or args.persistent_raw_solve_jit
             )
             else ()
@@ -399,6 +428,7 @@ def main() -> int:
         args.diagnose_structure
         or args.diagnose_checkpoints
         or args.diagnose_vmex_caches
+        or args.diagnose_jax_dispatch_cache
         or args.persistent_raw_solve_jit
     ):
         for iteration in range(args.repeats):
@@ -407,6 +437,7 @@ def main() -> int:
                 checkpoints=args.diagnose_checkpoints,
                 optimization_raw_block_stage=optimization_raw_block_stage,
                 vmex_cache_sizes=args.diagnose_vmex_caches,
+                jax_dispatch_cache=args.diagnose_jax_dispatch_cache,
             )
             for patcher in patchers:
                 patcher.start()
