@@ -1,5 +1,88 @@
 # Optimization Path Plan
 
+## Current Restart Plan: Bound Existing Reverse Kernels
+
+### Objective
+
+Eliminate the repeated-RSS slope in geometry + initial-ambipolar-`Er`/bootstrap
+least-squares optimization while retaining the benchmark-validated reverse-AD
+mathematics and one shared VMEC geometry solve per trial.
+
+### Non-negotiable constraints
+
+- The benchmark/main reverse-AD path remains unchanged: no changed control flow,
+  default arguments, formulas, solver settings, custom derivative rules, or
+  benchmark numerical references.
+- Geometry is evaluated once per mixed trial and shared by geometry and
+  initial-root/ambipolarity/bootstrap objectives.
+- Do not add an optimizer-wide fused JIT or JIT inside local VMEC/Boozer/NTX/
+  root physics functions.
+- Initial scope is the fixed exact-Lij, four-objective case: `maxEr`,
+  `Er_left`, `Er_right`, and `J_bootstrap`. Full transport is a later,
+  independent stage.
+
+### Why the previous staged attempt is rejected
+
+Retained Python wrappers do not retain JAX executables. They preserved
+numerical parity but remained slower and showed RSS growth. Wrapping the whole
+root/geometry/Boozer path in an outer JIT is also rejected: it forces setup
+operations outside their established benchmark/custom-VJP structure into one
+new trace.
+
+### Implementation sequence
+
+1. Remove/disable the incomplete optimization-only outer-JIT route and its
+   associated experimental Boozer-precompute plumbing. Preserve the benchmark
+   route verbatim.
+2. Audit VMEX persistent optimizer callbacks and the corresponding *existing*
+   NEOPAX reverse kernels/factories. Identify which executable/cache object is
+   recreated or retained per repeated initial-root evaluation.
+3. Add diagnostics around the existing correct path only: RSS, live JAX-array
+   count, available JAX trace-cache sizes, and identities/counts of existing
+   reverse kernel objects.
+4. Build a new optimization-only stage that creates and retains those existing
+   lower-level benchmark kernels once per fixed TOML/model/objective/VMEC
+   layout. Do not copy VMEC/Boozer/NTX/root physics and do not wrap those
+   preparation paths in a new outer JIT.
+5. Each trial supplies fresh dynamic geometry/support/root data to the retained
+   kernels. The existing payload-to-VMEC pullback remains the final reverse
+   boundary.
+
+### Required acceptance checks
+
+Before any memory comparison:
+
+1. Four-objective residual/Jacobian parity against the unchanged benchmark
+   path.
+2. Explicit confirmation of one shared `raw_block_solve` per mixed trial.
+3. Stable retained-kernel/cache identity across three repeated calls.
+
+Then compare eight repeated calls of the benchmark/default route and the new
+stage. Accept the stage only if RSS no longer has a material per-evaluation
+slope and warm execution is not regressed.
+
+### Step 2 audit result
+
+The exact initial-root benchmark path currently has no retained, outer root
+executable to reuse. `initial_er_selected_root_profile` calls
+`solve_ambipolarity_roots_radial_jax`, whose fixed-shape work is expressed with
+`jax.vmap`/`jax.lax.map`; it does **not** create `jax.jit` objects. The separate
+host-facing ambipolarity entrypoint does create short-lived `jax.jit` closures,
+but it is not called by this reverse-AD path and is not a candidate for this
+fix.
+
+The VMEC raw-block static setup is already retained by
+`GeometryRawBlockStage`, built once when the least-squares problem is created.
+For every mixed evaluation the benchmark evaluator creates exactly one dynamic
+`GeometryRawBlockSolve`, then passes that same solve first through the
+initial-root transport table and then through the geometry table. Therefore a
+new root wrapper, a new outer JIT, or a second geometry cache would not address
+the observed slope and must not be introduced.
+
+The next diagnostic step must instead locate native/JAX allocations made below
+the already-correct reverse boundaries, while proving the one-solve topology
+on every measured call.
+
 Date: 2026-07-30
 
 ## Guiding Rule

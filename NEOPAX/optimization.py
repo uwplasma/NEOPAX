@@ -1284,6 +1284,11 @@ def geometry_initial_er_root_only_least_squares_problem(
     mode = str(reverse_stage_mode).strip().lower()
     if mode not in {"off", "vmex_like"}:
         raise ValueError("reverse_stage_mode must be 'off' or 'vmex_like'.")
+    if mode == "vmex_like":
+        raise NotImplementedError(
+            "reverse_stage_mode='vmex_like' is disabled while the incomplete "
+            "outer-JIT experiment is replaced by retained existing reverse kernels."
+        )
     config_eff = _prepare_initial_er_root_config(config, device=device, vmec_input=vmec_input)
     geom_cfg = config_eff.get("geometry", {})
     neoclassical_cfg = config_eff.get("neoclassical", {})

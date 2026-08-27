@@ -45,6 +45,26 @@ class GeometryInitialRootOptimizationStage:
     payload_to_vmec: Callable[..., Any]
 
 
+@dataclasses.dataclass(slots=True)
+class LazyStageArtifacts:
+    """One-time structural artifacts derived from the first trial raw state.
+
+    This container must never retain the raw solve itself or any trial arrays.
+    It may retain only caller-validated structural Boozer constants/index maps.
+    """
+
+    booz_constants_grids: Any = None
+    booz_mode_indices: Any = None
+    initialized: bool = False
+
+    def initialize(self, *, booz_constants_grids: Any, booz_mode_indices: Any) -> None:
+        if self.initialized:
+            return
+        self.booz_constants_grids = booz_constants_grids
+        self.booz_mode_indices = booz_mode_indices
+        self.initialized = True
+
+
 def build_geometry_initial_root_optimization_stage(
     *,
     layout: InitialRootStageLayout,
