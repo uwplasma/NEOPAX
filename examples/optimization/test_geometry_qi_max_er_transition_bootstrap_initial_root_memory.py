@@ -116,6 +116,8 @@ class EvaluationStructureCounter:
                 kwargs["stage"] = optimization_raw_block_stage.raw_block_stage
                 kwargs["solve_with_aux_runner"] = optimization_raw_block_stage.solve_with_aux_runner
             result = raw_block_solve(*args, **kwargs)
+            if checkpoints:
+                jax.block_until_ready((result.state, result.dof_mask))
             record_vmex_cache_sizes(result.implicit)
             record("raw_block_solve")
             return result
@@ -123,16 +125,27 @@ class EvaluationStructureCounter:
         def count_selected_root(*args, **kwargs):
             self.selected_root_calls += 1
             result = selected_root(*args, **kwargs)
+            if checkpoints:
+                jax.block_until_ready(result)
             record("selected_root")
             return result
 
         def count_payload_builder(*args, **kwargs):
             result = payload_builder(*args, **kwargs)
+            if checkpoints:
+                jax.block_until_ready(result)
             record("geometry_ntx_payload")
             return result
 
         def count_payload_pullback(*args, **kwargs):
             result = payload_pullback(*args, **kwargs)
+            if checkpoints:
+                jax.block_until_ready(
+                    (
+                        result.table_result.objective_values,
+                        result.table_result.geometry_gradient_matrix,
+                    )
+                )
             record("payload_to_vmec")
             return result
 
