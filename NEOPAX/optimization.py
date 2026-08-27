@@ -27,6 +27,7 @@ from ._constants import elementary_charge
 from ._orchestrator import build_runtime_context
 from ._orchestrator import run_config
 from ._reverse_ad_initial_er import (
+    find_ntx_support_payload,
     initial_er_selected_root_profile,
     runtime_with_geometry_payload,
     runtime_with_ntx_support_payload,
@@ -52,6 +53,7 @@ from ._reverse_ad_optimization import (
     transport,
 )
 from ._optimization_initial_root_stage import (
+    build_compiled_geometry_initial_root_stage,
     build_geometry_initial_root_optimization_stage,
     initial_root_stage_layout,
 )
@@ -1366,11 +1368,55 @@ def geometry_initial_er_root_only_least_squares_problem(
         )
         if raw_block_stage is None:
             raise ValueError("vmex_like initial-root optimization requires VMEC boundary parameters.")
-        optimization_stage = build_geometry_initial_root_optimization_stage(
+        stage_transport_objectives = tuple(
+            term.objective.name for term in normalized_stage_terms if term.objective.family == "transport"
+        )
+        stage_profile_specs = tuple(ProfileParameterSpec(name) for name in PROFILE_PARAMETER_ORDER)
+        stage_support_payload = find_ntx_support_payload(runtime)
+
+        def _stage_pre_root_state(profile_values):
+            return initial_state_for_parameter_vector(
+                profile_values, config=config_eff, initial_er_root_ad="off",
+                baseline_state=baseline_state, profile_cfg=config_eff.get("profiles", {}), runtime=runtime,
+            )
+
+        def _stage_root(raw_block_solve, profile_values):
+            return _optimization_root_to_payload_cotangents(
+                config=config_eff, requested_objectives=stage_transport_objectives, runtime=runtime,
+                profile_values_arr=profile_values, pre_root_state_from_profile_values=_stage_pre_root_state,
+                geometry_context=context, n_r=int(n_r if n_r is not None else geom_cfg.get("n_radial", 51)),
+                n_theta=int(n_theta if n_theta is not None else neoclassical_cfg.get("ntx_exact_n_theta", 25)),
+                n_zeta=int(n_zeta if n_zeta is not None else neoclassical_cfg.get("ntx_exact_n_zeta", 25)),
+                n_xi=int(n_xi if n_xi is not None else neoclassical_cfg.get("ntx_exact_n_xi", 64)),
+                surface_backend=str(surface_backend or neoclassical_cfg.get("ntx_exact_surface_backend", "vmec")),
+                raw_block_solve=raw_block_solve, support_payload=stage_support_payload,
+                use_runtime_payload=False, profile_specs=stage_profile_specs, options=dict(root_options or {}),
+            )
+
+        def _stage_payload(raw_block_solve, geometry_deltas, values, profile_gradient, support_bars):
+            return _optimization_payload_to_vmec_table(
+                objective_labels=stage_transport_objectives,
+                profile_parameter_labels=tuple(spec.name for spec in stage_profile_specs),
+                geometry_parameter_labels=tuple(spec.label for spec in parameter_set.vmec_boundary_specs),
+                objective_values=values, profile_gradient_matrix=profile_gradient,
+                geometry_context=context, baseline_geometry_deltas=geometry_deltas,
+                geometry_param_specs=tuple(spec.as_tuple() for spec in parameter_set.vmec_boundary_specs),
+                support_bars=support_bars, support_component_bars_by_name={},
+                include_component_pullbacks=False, combined_geometry_payload=True,
+                n_r=int(n_r if n_r is not None else geom_cfg.get("n_radial", 51)),
+                n_theta=int(n_theta if n_theta is not None else neoclassical_cfg.get("ntx_exact_n_theta", 25)),
+                n_zeta=int(n_zeta if n_zeta is not None else neoclassical_cfg.get("ntx_exact_n_zeta", 25)),
+                n_xi=int(n_xi if n_xi is not None else neoclassical_cfg.get("ntx_exact_n_xi", 64)),
+                surface_backend=str(surface_backend or neoclassical_cfg.get("ntx_exact_surface_backend", "vmec")),
+                max_iter=geometry_max_iter, solver_device=geometry_solver_device,
+                progress_label=None, raw_block_solve=raw_block_solve, return_branch_gradients=False,
+            )
+
+        optimization_stage = build_compiled_geometry_initial_root_stage(
             layout=optimization_stage_layout,
             raw_block_stage=raw_block_stage,
-            root_to_payload_impl=_optimization_root_to_payload_cotangents,
-            payload_to_vmec_impl=_optimization_payload_to_vmec_table,
+            root_impl=_stage_root,
+            payload_impl=_stage_payload,
         )
     return GeometryInitialErRootLeastSquaresProblem(
         config=config_eff,

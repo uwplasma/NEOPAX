@@ -8,8 +8,11 @@ the established root, payload, and VMEC reverse rules.
 from __future__ import annotations
 
 import dataclasses
+import functools
 from collections.abc import Callable, Sequence
 from typing import Any
+
+import jax
 
 from ._geometry_autodiff import GeometryRawBlockSolve, GeometryRawBlockStage
 
@@ -63,10 +66,67 @@ def build_geometry_initial_root_optimization_stage(
             **kwargs,
         )
 
+    # These wrappers are intentionally left un-jitted here: their ``kwargs``
+    # mix static Python configuration with dynamic numerical values.  The
+    # compiled stage is installed only through the fixed-signature factory.
     return GeometryInitialRootOptimizationStage(
         layout=layout,
         root_to_payload=root_to_payload,
         payload_to_vmec=payload_to_vmec,
+    )
+
+
+def compiled_initial_root_stage_operators(
+    *,
+    raw_block_stage: GeometryRawBlockStage,
+    root_impl: Callable[[tuple[Any, Any, Any], Any], Any],
+    payload_impl: Callable[[tuple[Any, Any, Any], Any, Any, Any], Any],
+) -> tuple[Callable[..., Any], Callable[..., Any]]:
+    """Create the two fixed-signature compiled optimization operators.
+
+    ``raw_block_stage`` is captured once.  Every numerical value is supplied
+    through the explicit dynamic payload arguments; no trial object is held by
+    the compiled closures.
+    """
+
+    del raw_block_stage  # Static ownership is established by the bound impls.
+    return jax.jit(root_impl), jax.jit(payload_impl)
+
+
+def build_compiled_geometry_initial_root_stage(
+    *,
+    layout: InitialRootStageLayout,
+    raw_block_stage: GeometryRawBlockStage,
+    root_impl: Callable[[GeometryRawBlockSolve, Any], Any],
+    payload_impl: Callable[[GeometryRawBlockSolve, Any, Any, Any, Any], Any],
+) -> GeometryInitialRootOptimizationStage:
+    """Build the VMEX-like fixed-signature compiled stage.
+
+    ``root_impl`` and ``payload_impl`` close only over stage-static objects.
+    The raw solve is reconstructed from fresh dynamic leaves for every call.
+    """
+
+    def root_operator(dynamic_raw_payload, profile_values):
+        raw_block_solve = raw_block_solve_from_dynamic_payload(raw_block_stage, dynamic_raw_payload)
+        return root_impl(raw_block_solve, profile_values)
+
+    def payload_operator(
+        dynamic_raw_payload, geometry_deltas, objective_values, profile_gradient_matrix, support_bars
+    ):
+        raw_block_solve = raw_block_solve_from_dynamic_payload(raw_block_stage, dynamic_raw_payload)
+        return payload_impl(
+            raw_block_solve, geometry_deltas, objective_values, profile_gradient_matrix, support_bars
+        )
+
+    root_jit, payload_jit = compiled_initial_root_stage_operators(
+        raw_block_stage=raw_block_stage,
+        root_impl=root_operator,
+        payload_impl=payload_operator,
+    )
+    return GeometryInitialRootOptimizationStage(
+        layout=layout,
+        root_to_payload=root_jit,
+        payload_to_vmec=payload_jit,
     )
 
 

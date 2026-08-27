@@ -2013,7 +2013,7 @@ def geometry_active_initial_er_root_only_reverse_table_optimization(
         root_args["raw_block_solve"] = raw_block_solve
         root_result = root_operator(**root_args)
     else:
-        root_result = root_operator(dynamic_payload, **root_args)
+        root_result = root_operator(dynamic_payload, profile_values_arr)
     (
         objective_values, profile_gradient_matrix_for_payload, support_bars, objective_count,
     ) = root_result
@@ -2050,8 +2050,13 @@ def geometry_active_initial_er_root_only_reverse_table_optimization(
     if optimization_stage is None:
         assembly_result = payload_operator(**payload_args)
     else:
-        payload_args.pop("raw_block_solve")
-        assembly_result = payload_operator(dynamic_payload, **payload_args)
+        assembly_result = payload_operator(
+            dynamic_payload,
+            baseline_geometry_deltas,
+            objective_values,
+            profile_gradient_matrix_for_payload,
+            support_bars,
+        )
 
     geometry_gradient_matrix = jnp.asarray(assembly_result.table_result.geometry_gradient_matrix)
     profile_gradient_matrix = jnp.asarray(assembly_result.table_result.profile_gradient_matrix)
