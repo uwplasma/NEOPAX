@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Compare benchmark and retained-raw-parameter initial-root rows for parity.
+"""Compare benchmark and persistent raw-parameter-update rows for parity.
 
 No SciPy iteration is run.  The two problems use the same four-objective terms,
 VMEC input, and initial scaled DoF vector.
@@ -38,7 +38,7 @@ def _evaluate(problem, x):
 
 
 def _persistent_raw_parameter_context(problem):
-    """Apply only the opt-in retained VMEX base-parameter setup for this test."""
+    """Apply only the opt-in persistent VMEX parameter-update map for this test."""
 
     stage = geometry_raw_block_optimization_stage(
         problem.context,
@@ -50,7 +50,7 @@ def _persistent_raw_parameter_context(problem):
 
     def persistent_raw_parameter_solve(*args, **kwargs):
         kwargs["stage"] = stage.raw_block_stage
-        kwargs["base_implicit_params"] = stage.base_implicit_params
+        kwargs["implicit_params_from_deltas_runner"] = stage.implicit_params_from_deltas_runner
         return original(*args, **kwargs)
 
     return patch.object(

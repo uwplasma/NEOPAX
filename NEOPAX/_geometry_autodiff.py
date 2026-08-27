@@ -809,6 +809,7 @@ class GeometryRawBlockOptimizationStage:
 
     raw_block_stage: GeometryRawBlockStage
     base_implicit_params: Any
+    implicit_params_from_deltas_runner: Callable[[Any], Any]
     solve_with_aux_runner: Callable[[Any], tuple[Any, Any]]
 
 
@@ -877,12 +878,29 @@ def geometry_raw_block_optimization_stage(
                 if host_errors:
                     raise host_errors.pop() from None
                 raise
-    return GeometryRawBlockOptimizationStage(
-        raw_block_stage=raw_stage,
-        base_implicit_params=_implicit_params_from_input(
+    base_implicit_params = _implicit_params_from_input(
             context,
             raw_stage.implicit,
             solver_device=solver_device,
+        )
+
+    def implicit_params_from_deltas_runner(param_deltas):
+        return _implicit_params_from_base_with_boundary_deltas(
+            base_implicit_params,
+            param_deltas,
+            raw_stage.param_entries,
+        )
+
+    return GeometryRawBlockOptimizationStage(
+        raw_block_stage=raw_stage,
+        base_implicit_params=base_implicit_params,
+        # The boundary-update scatter map has a fixed parameter layout.  Keep
+        # its primitive lowering inside one stage-owned executable instead of
+        # creating eager dispatch entries for every selected harmonic on every
+        # optimization evaluation.
+        implicit_params_from_deltas_runner=jax.jit(
+            implicit_params_from_deltas_runner,
+            inline=False,
         ),
         # This is deliberately the smallest VMEX-like persistent stage
         # boundary: one fixed-shape parameter pytree in and the opaque VMEC
@@ -926,6 +944,7 @@ def geometry_raw_block_solve_from_param_vector(
     stage: GeometryRawBlockStage | None = None,
     solve_with_aux_runner: Callable[[Any], tuple[Any, Any]] | None = None,
     base_implicit_params=None,
+    implicit_params_from_deltas_runner: Callable[[Any], Any] | None = None,
 ) -> GeometryRawBlockSolve:
     """Solve VMEC once and keep the raw-block transpose auxiliary data."""
 
@@ -951,7 +970,11 @@ def geometry_raw_block_solve_from_param_vector(
             raise ValueError("GeometryRawBlockStage parameter layout does not match param_specs.")
         implicit = stage.implicit
         implicit_cfg = stage.implicit_cfg
-        if base_implicit_params is None:
+        if implicit_params_from_deltas_runner is not None:
+            implicit_params = implicit_params_from_deltas_runner(
+                jnp.asarray(param_deltas, dtype=jnp.float64)
+            )
+        elif base_implicit_params is None:
             implicit_params = _implicit_params_with_boundary_deltas(
                 context,
                 implicit,
