@@ -13,6 +13,8 @@ import io
 import argparse
 from dataclasses import replace
 from contextlib import redirect_stdout
+import ctypes
+import os
 from pathlib import Path
 import sys
 import time
@@ -106,6 +108,45 @@ def _live_jax_array_count() -> int | None:
         return None
 
 
+def _trim_native_heap() -> bool:
+    """Ask glibc to return currently free heap pages for this diagnostic only."""
+
+    if os.name == "nt":
+        return False
+    try:
+        return bool(ctypes.CDLL("libc.so.6").malloc_trim(0))
+    except OSError:
+        return False
+
+
+def _one_cache_cleared_sample(problem, x, iteration: int):
+    """Evaluate the unchanged problem, then clear cache state before RSS sampling."""
+
+    started = time.perf_counter()
+    evaluation = problem.evaluate(x)
+    residuals, jacobian = jax.block_until_ready(
+        (evaluation.residuals, evaluation.jacobian)
+    )
+    residual_norm = float(np.linalg.norm(np.asarray(jax.device_get(residuals))))
+    jacobian_shape = tuple(int(size) for size in jacobian.shape)
+    elapsed_s = time.perf_counter() - started
+    del evaluation, residuals, jacobian
+    gc.collect()
+    jax.clear_caches()
+    gc.collect()
+    heap_trimmed = _trim_native_heap()
+    return (
+        opt.RepeatedEvaluationMemorySample(
+            iteration=iteration,
+            elapsed_s=float(elapsed_s),
+            resident_memory_bytes=opt._process_resident_memory_bytes(),
+            residual_norm=residual_norm,
+            jacobian_shape=jacobian_shape,
+        ),
+        heap_trimmed,
+    )
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--mode", choices=("off", "vmex_like"), default="off")
@@ -115,6 +156,14 @@ def main() -> int:
         "--diagnose-structure",
         action="store_true",
         help="Report benchmark-path raw VMEC solve and selected-root call counts per evaluation.",
+    )
+    parser.add_argument(
+        "--clear-jax-caches",
+        action="store_true",
+        help=(
+            "Diagnostic only: clear JAX compilation caches and trim free native heap "
+            "after every measured evaluation."
+        ),
     )
     args = parser.parse_args()
     if args.warmup < 0 or args.repeats < 1:
@@ -163,6 +212,11 @@ def main() -> int:
         f"warmup={args.warmup} repeats={args.repeats} parameter_count={problem.parameter_count}",
         flush=True,
     )
+    if args.clear_jax_caches:
+        print(
+            "[memory test] diagnostic_cleanup=jax.clear_caches+malloc_trim after each trial",
+            flush=True,
+        )
     for warmup_index in range(args.warmup):
         print(f"[memory test] warmup={warmup_index} starting", flush=True)
         started = time.perf_counter()
@@ -190,16 +244,30 @@ def main() -> int:
             for patcher in patchers:
                 patcher.start()
             try:
-                samples = opt.repeated_evaluation_memory_samples(
-                    quiet_problem,
-                    warmup=0,
-                    repeats=1,
-                    scaled_parameter_values=x,
-                )
+                if args.clear_jax_caches:
+                    sample, heap_trimmed = _one_cache_cleared_sample(
+                        quiet_problem, x, iteration
+                    )
+                else:
+                    samples = opt.repeated_evaluation_memory_samples(
+                        quiet_problem,
+                        warmup=0,
+                        repeats=1,
+                        scaled_parameter_values=x,
+                    )
+                    sample = replace(samples[0], iteration=iteration)
+                    heap_trimmed = None
             finally:
                 for patcher in reversed(patchers):
                     patcher.stop()
-            report(replace(samples[0], iteration=iteration))
+            report(sample)
+            if heap_trimmed is not None:
+                print(f"[memory test] trial={iteration} native_heap_trimmed={heap_trimmed}", flush=True)
+    elif args.clear_jax_caches:
+        for iteration in range(args.repeats):
+            sample, heap_trimmed = _one_cache_cleared_sample(quiet_problem, x, iteration)
+            report(sample)
+            print(f"[memory test] trial={iteration} native_heap_trimmed={heap_trimmed}", flush=True)
     else:
         opt.repeated_evaluation_memory_samples(
             quiet_problem,

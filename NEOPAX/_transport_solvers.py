@@ -7582,6 +7582,15 @@ def _radau_segment_reduced_cotangent_bwd_batched_with_support_call(
         and use_segment_primal_record
         and collect_native_vmec_coefficients
     )
+    if step_bwd_mode == (
+        "reduced_cotangent_call_boundary_common_branch_hoist_rebuild_call"
+    ) and not use_common_branch_hoist:
+        raise ValueError(
+            "reverse_step_bwd_mode='reduced_cotangent_call_boundary_common_"
+            "branch_hoist_rebuild_call' requires "
+            "reverse_segment_primal_record_mode='reuse_segment_primal_record' "
+            "and a native VMEC-coefficient rebuild support mode."
+        )
     native_vmec_zero_leaves = (
         tuple(
             jnp.broadcast_to(
