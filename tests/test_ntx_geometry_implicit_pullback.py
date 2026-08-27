@@ -415,6 +415,33 @@ def test_initial_rebuild_dispatch_uses_active_hook_and_keeps_vmec_channel_separa
     assert jnp.allclose(native_bars["b_cos"], jnp.asarray([0.6, -0.8]))
 
 
+def test_initial_rebuild_dispatch_selects_direct_native_vmec_hook():
+    """The direct product-rule selector cannot fall back to the old hook."""
+
+    calls = []
+
+    def direct_hook(flat_y, lagged_bars, support):
+        calls.append((flat_y, lagged_bars, support))
+        return {"support": lagged_bars + support}, {"b_cos": 3.0 * lagged_bars}
+
+    context = SimpleNamespace(
+        reverse_rebuild_support_pullback_mode=(
+            "ntx_batched_interpolated_faces_native_multi_rhs_reuse_moment_drds_jvp_"
+            "shared_primal_with_vmec_coefficients_direct_directional_product_rule"
+        ),
+        flat_rhs_build_support_pullback_batched_interpolated_faces_native_multi_rhs_reuse_moment_drds_jvp_shared_primal_with_vmec_coefficients_direct_directional_product_rule=direct_hook,
+    )
+    support_bars, native_bars = _initial_cache_support_pullback_from_rebuild_dispatch(
+        physics_context=context,
+        flat_y=jnp.asarray([1.0, 2.0]),
+        lagged_response_bars=jnp.asarray([0.3, -0.4]),
+        support_payload=jnp.asarray([0.5, 0.7]),
+    )
+    assert len(calls) == 1
+    assert jnp.allclose(support_bars["support"], jnp.asarray([0.8, 0.3]))
+    assert jnp.allclose(native_bars["b_cos"], jnp.asarray([0.9, -1.2]))
+
+
 def test_initial_rebuild_dispatch_matches_ordinary_batched_support_contract():
     """Non-native initial dispatch is exactly its active rebuild hook."""
 

@@ -5516,6 +5516,7 @@ def main() -> None:
             "ntx_batched_interpolated_faces_native_multi_rhs_compact_shared_primal",
             "ntx_batched_interpolated_faces_native_multi_rhs_reuse_moment_drds_jvp_shared_primal",
             "ntx_batched_interpolated_faces_native_multi_rhs_reuse_moment_drds_jvp_shared_primal_with_vmec_coefficients",
+            "ntx_batched_interpolated_faces_native_multi_rhs_reuse_moment_drds_jvp_shared_primal_with_vmec_coefficients_direct_directional_product_rule",
             "ntx_batched_interpolated_faces_native_multi_rhs_compact_residual_reuse_moment_drds_jvp_shared_primal",
             "ntx_joint_implicit_interpolated_faces",
             "ntx_joint_implicit_interpolated_faces_packed_support_adjoint",
@@ -5566,6 +5567,9 @@ def main() -> None:
             "is the isolated AD-comparison variant of that native mode: it carries "
             "the grouped NTX face-coefficient bars to the existing VMEC raw-block "
             "transpose and replaces the generic face-prepared support branch. "
+            "'ntx_batched_interpolated_faces_native_multi_rhs_reuse_moment_drds_jvp_shared_primal_with_vmec_coefficients_direct_directional_product_rule' "
+            "uses the same grouped NTX/VMEC path but replaces only its two post-adjoint "
+            "native primitive JVPs with the separately validated direct product rule. "
             "'ntx_joint_implicit_interpolated_faces' is the exact experimental "
             "mode that obtains rebuild state and NTX-support bars jointly from "
             "the same local NTX implicit adjoint. "

@@ -185,10 +185,14 @@ _BATCHED_REBUILD_SUPPORT_HOOK_NAMES = {
     "ntx_batched_interpolated_faces_native_multi_rhs_reuse_moment_drds_jvp_shared_primal": "flat_rhs_build_support_pullback_batched_interpolated_faces_native_multi_rhs_reuse_moment_drds_jvp_shared_primal",
     "ntx_batched_interpolated_faces_native_multi_rhs_compact_residual_reuse_moment_drds_jvp_shared_primal": "flat_rhs_build_support_pullback_batched_interpolated_faces_native_multi_rhs_compact_residual_reuse_moment_drds_jvp_shared_primal",
     "ntx_batched_interpolated_faces_native_multi_rhs_reuse_moment_drds_jvp_shared_primal_with_vmec_coefficients": "flat_rhs_build_support_pullback_batched_interpolated_faces_native_multi_rhs_reuse_moment_drds_jvp_shared_primal_with_vmec_coefficients",
+    "ntx_batched_interpolated_faces_native_multi_rhs_reuse_moment_drds_jvp_shared_primal_with_vmec_coefficients_direct_directional_product_rule": "flat_rhs_build_support_pullback_batched_interpolated_faces_native_multi_rhs_reuse_moment_drds_jvp_shared_primal_with_vmec_coefficients_direct_directional_product_rule",
 }
 
-_NATIVE_VMEC_REBUILD_SUPPORT_MODE = (
-    "ntx_batched_interpolated_faces_native_multi_rhs_reuse_moment_drds_jvp_shared_primal_with_vmec_coefficients"
+_NATIVE_VMEC_REBUILD_SUPPORT_MODES = frozenset(
+    {
+        "ntx_batched_interpolated_faces_native_multi_rhs_reuse_moment_drds_jvp_shared_primal_with_vmec_coefficients",
+        "ntx_batched_interpolated_faces_native_multi_rhs_reuse_moment_drds_jvp_shared_primal_with_vmec_coefficients_direct_directional_product_rule",
+    }
 )
 
 
@@ -219,7 +223,7 @@ def _initial_cache_support_pullback_from_rebuild_dispatch(
             f"context does not expose {hook_name}."
         )
     result = pullback(flat_y, lagged_response_bars, support_payload)
-    if rebuild_mode == _NATIVE_VMEC_REBUILD_SUPPORT_MODE:
+    if rebuild_mode in _NATIVE_VMEC_REBUILD_SUPPORT_MODES:
         support_bars, native_vmec_coefficient_bars = result
         return support_bars, native_vmec_coefficient_bars
     return result, None
@@ -3039,6 +3043,7 @@ def prepare_reverse_static_setup(
         "ntx_batched_interpolated_faces_native_multi_rhs_reuse_moment_drds_jvp_shared_primal",
         "ntx_batched_interpolated_faces_native_multi_rhs_compact_residual_reuse_moment_drds_jvp_shared_primal",
         "ntx_batched_interpolated_faces_native_multi_rhs_reuse_moment_drds_jvp_shared_primal_with_vmec_coefficients",
+        "ntx_batched_interpolated_faces_native_multi_rhs_reuse_moment_drds_jvp_shared_primal_with_vmec_coefficients_direct_directional_product_rule",
         "ntx_joint_implicit_interpolated_faces",
         "ntx_joint_implicit_interpolated_faces_packed_support_adjoint",
         "ntx_joint_implicit_interpolated_faces_reuse_local_vjp_primal",
@@ -3059,6 +3064,7 @@ def prepare_reverse_static_setup(
             "'ntx_batched_interpolated_faces_native_multi_rhs_reuse_moment_drds_jvp_shared_primal', "
             "'ntx_batched_interpolated_faces_native_multi_rhs_compact_residual_reuse_moment_drds_jvp_shared_primal', "
             "'ntx_batched_interpolated_faces_native_multi_rhs_reuse_moment_drds_jvp_shared_primal_with_vmec_coefficients', "
+            "'ntx_batched_interpolated_faces_native_multi_rhs_reuse_moment_drds_jvp_shared_primal_with_vmec_coefficients_direct_directional_product_rule', "
             "'ntx_joint_implicit_interpolated_faces', "
             "'ntx_joint_implicit_interpolated_faces_packed_support_adjoint', "
             "'ntx_joint_implicit_interpolated_faces_reuse_local_vjp_primal', "
@@ -3075,6 +3081,7 @@ def prepare_reverse_static_setup(
             "ntx_batched_interpolated_faces_native_multi_rhs_reuse_moment_drds_jvp_shared_primal",
             "ntx_batched_interpolated_faces_native_multi_rhs_compact_residual_reuse_moment_drds_jvp_shared_primal",
             "ntx_batched_interpolated_faces_native_multi_rhs_reuse_moment_drds_jvp_shared_primal_with_vmec_coefficients",
+            "ntx_batched_interpolated_faces_native_multi_rhs_reuse_moment_drds_jvp_shared_primal_with_vmec_coefficients_direct_directional_product_rule",
             "ntx_joint_implicit_interpolated_faces",
             "ntx_joint_implicit_interpolated_faces_packed_support_adjoint",
             "ntx_joint_implicit_interpolated_faces_reuse_local_vjp_primal",
@@ -4069,7 +4076,7 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
                 "separate",
             )
         ).strip().lower()
-        == "ntx_batched_interpolated_faces_native_multi_rhs_reuse_moment_drds_jvp_shared_primal_with_vmec_coefficients"
+        in _NATIVE_VMEC_REBUILD_SUPPORT_MODES
     )
     native_vmec_zero_bars = (
         _radau_zero_native_vmec_face_coefficient_bars(support_payload)
@@ -4213,6 +4220,7 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
         native_batched_rebuild_modes = {
             "ntx_batched_interpolated_faces_native_multi_rhs_reuse_moment_drds_jvp_shared_primal",
             "ntx_batched_interpolated_faces_native_multi_rhs_reuse_moment_drds_jvp_shared_primal_with_vmec_coefficients",
+            "ntx_batched_interpolated_faces_native_multi_rhs_reuse_moment_drds_jvp_shared_primal_with_vmec_coefficients_direct_directional_product_rule",
         }
         if rebuild_mode not in separate_rebuild_modes | native_batched_rebuild_modes:
             raise ValueError(
@@ -4238,6 +4246,12 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
         ):
             native_batched_support_pullback = (
                 physics_context.flat_rhs_build_support_pullback_batched_interpolated_faces_native_multi_rhs_reuse_moment_drds_jvp_shared_primal_with_vmec_coefficients
+            )
+        elif rebuild_mode == (
+            "ntx_batched_interpolated_faces_native_multi_rhs_reuse_moment_drds_jvp_shared_primal_with_vmec_coefficients_direct_directional_product_rule"
+        ):
+            native_batched_support_pullback = (
+                physics_context.flat_rhs_build_support_pullback_batched_interpolated_faces_native_multi_rhs_reuse_moment_drds_jvp_shared_primal_with_vmec_coefficients_direct_directional_product_rule
             )
         if rebuild_mode in native_batched_rebuild_modes and native_batched_support_pullback is None:
             raise RuntimeError(

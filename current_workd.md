@@ -2692,3 +2692,20 @@ same combined VMEC conversion.  A second one-/three-RHS NTX gate compares the
 complete high-level native helper with this flag on and off.  The NEOPAX local
 model adapter forwards the same private flag, but no reverse selector or CLI
 mode has been added yet: passing the high-level NTX gate is required first.
+
+#### Direct directional selector status
+
+The physical primitive oracle and high-level one-/three-RHS gate now pass.
+The latter keeps strict primitive-space agreement and permits only bounded
+final VMEC Fourier contraction noise (`rtol=1e-5`, `atol=5e-6`) after sampled
+primitive cancellation. A separate rebuild selector is now wired:
+
+`ntx_batched_interpolated_faces_native_multi_rhs_reuse_moment_drds_jvp_shared_primal_with_vmec_coefficients_direct_directional_product_rule`
+
+It has its own flux-model, transport-equation, flat-Radau-hook, validation,
+and CLI dispatch. It selects only the two explicit post-adjoint directional
+primitive contractions; the grouped NTX primal/factorization/matrix-RHS
+adjoint, native VMEC bridge, direct geometry contribution, and existing
+selectors are unchanged. The next gates are the CPU mock dispatch test and a
+remote cache-disabled AD/timing comparison. It is not yet an accepted
+performance mode.
