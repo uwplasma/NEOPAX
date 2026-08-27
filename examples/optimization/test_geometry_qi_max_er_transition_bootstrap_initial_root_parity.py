@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Compare benchmark and persistent-raw-solve initial-root rows for parity.
+"""Compare benchmark and retained-raw-parameter initial-root rows for parity.
 
 No SciPy iteration is run.  The two problems use the same four-objective terms,
 VMEC input, and initial scaled DoF vector.
@@ -37,25 +37,26 @@ def _evaluate(problem, x):
     return jax.block_until_ready((result.residuals, result.jacobian))
 
 
-def _persistent_raw_solve_context(problem):
-    """Apply only the opt-in persistent VMEX raw-solve boundary for this test."""
+def _persistent_raw_parameter_context(problem):
+    """Apply only the opt-in retained VMEX base-parameter setup for this test."""
 
     stage = geometry_raw_block_optimization_stage(
         problem.context,
         tuple(spec.as_tuple() for spec in problem.parameter_set.vmec_boundary_specs),
         max_iter=problem.geometry_max_iter,
+        solver_device=problem.geometry_solver_device,
     )
     original = reverse_optimization.geometry_raw_block_solve_from_param_vector
 
-    def persistent_raw_block_solve(*args, **kwargs):
+    def persistent_raw_parameter_solve(*args, **kwargs):
         kwargs["stage"] = stage.raw_block_stage
-        kwargs["solve_with_aux_runner"] = stage.solve_with_aux_runner
+        kwargs["base_implicit_params"] = stage.base_implicit_params
         return original(*args, **kwargs)
 
     return patch.object(
         reverse_optimization,
         "geometry_raw_block_solve_from_param_vector",
-        persistent_raw_block_solve,
+        persistent_raw_parameter_solve,
     )
 
 
@@ -66,7 +67,7 @@ def main() -> int:
     staged = _build()
     x = np.asarray(jax.device_get(benchmark.x0), dtype=float)
     off_residuals, off_jacobian = _evaluate(benchmark, x)
-    with _persistent_raw_solve_context(staged):
+    with _persistent_raw_parameter_context(staged):
         staged_residuals, staged_jacobian = _evaluate(staged, x)
     residual_delta = np.asarray(jax.device_get(staged_residuals - off_residuals), dtype=float)
     jacobian_delta = np.asarray(jax.device_get(staged_jacobian - off_jacobian), dtype=float)

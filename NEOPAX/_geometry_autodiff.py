@@ -798,15 +798,17 @@ class GeometryRawBlockStage:
 
 @dataclasses.dataclass(frozen=True, slots=True)
 class GeometryRawBlockOptimizationStage:
-    """Optimization-only persistent VMEX raw-solve kernel for one stage.
+    """Optimization-only persistent VMEX parameter setup for one stage.
 
     The contained raw-block stage is the established benchmark setup.  The
-    additional runner is opt-in and JIT-compiles only the opaque VMEX forward
-    callback for this fixed configuration.  It does not include Boozer, NTX,
-    ambipolarity, or any VMEC reverse/pullback calculation.
+    base implicit parameters are the unchanged VMEX input pytree placed once
+    on the selected solver device; each evaluation applies only its dynamic
+    boundary deltas.  The optional runner is retained for the separate
+    callback-boundary experiment.
     """
 
     raw_block_stage: GeometryRawBlockStage
+    base_implicit_params: Any
     solve_with_aux_runner: Callable[[Any], tuple[Any, Any]]
 
 
@@ -840,8 +842,9 @@ def geometry_raw_block_optimization_stage(
     param_specs: Sequence[tuple[str, int, int]],
     *,
     max_iter: int | None = None,
+    solver_device: str | None = None,
 ) -> GeometryRawBlockOptimizationStage:
-    """Create the opt-in persistent VMEX raw-solve kernel for one stage."""
+    """Create opt-in persistent VMEX setup for one fixed optimizer stage."""
 
     raw_stage = geometry_raw_block_stage(context, param_specs, max_iter=max_iter)
     factory = getattr(raw_stage.implicit, "make_solve_implicit_with_aux_runner", None)
@@ -876,6 +879,11 @@ def geometry_raw_block_optimization_stage(
                 raise
     return GeometryRawBlockOptimizationStage(
         raw_block_stage=raw_stage,
+        base_implicit_params=_implicit_params_from_input(
+            context,
+            raw_stage.implicit,
+            solver_device=solver_device,
+        ),
         # This is deliberately the smallest VMEX-like persistent stage
         # boundary: one fixed-shape parameter pytree in and the opaque VMEC
         # state/mask out.  The benchmark/default call remains eager.
@@ -890,6 +898,24 @@ def _stop_gradient_if_jax_value(leaf):
         return leaf
 
 
+def _implicit_params_from_base_with_boundary_deltas(
+    base_params,
+    param_deltas,
+    param_entries: Sequence[dict[str, Any]],
+):
+    """Apply dynamic optimizer boundary deltas to one retained VMEX pytree."""
+
+    updates: dict[str, Any] = {}
+    deltas = jnp.asarray(param_deltas, dtype=jnp.float64)
+    for i, entry in enumerate(param_entries):
+        field_name = entry["input_field"]
+        base = updates.get(field_name)
+        if base is None:
+            base = getattr(base_params, field_name)
+        updates[field_name] = base.at[int(entry["n_offset"]), int(entry["m_index"])].add(deltas[i])
+    return dataclasses.replace(base_params, **updates)
+
+
 def geometry_raw_block_solve_from_param_vector(
     context: "GeometryAutodiffContext",
     param_deltas,
@@ -899,6 +925,7 @@ def geometry_raw_block_solve_from_param_vector(
     solver_device: str | None = None,
     stage: GeometryRawBlockStage | None = None,
     solve_with_aux_runner: Callable[[Any], tuple[Any, Any]] | None = None,
+    base_implicit_params=None,
 ) -> GeometryRawBlockSolve:
     """Solve VMEC once and keep the raw-block transpose auxiliary data."""
 
@@ -924,13 +951,20 @@ def geometry_raw_block_solve_from_param_vector(
             raise ValueError("GeometryRawBlockStage parameter layout does not match param_specs.")
         implicit = stage.implicit
         implicit_cfg = stage.implicit_cfg
-        implicit_params = _implicit_params_with_boundary_deltas(
-            context,
-            implicit,
-            jnp.asarray(param_deltas, dtype=jnp.float64),
-            param_entries,
-            solver_device=solver_device,
-        )
+        if base_implicit_params is None:
+            implicit_params = _implicit_params_with_boundary_deltas(
+                context,
+                implicit,
+                jnp.asarray(param_deltas, dtype=jnp.float64),
+                param_entries,
+                solver_device=solver_device,
+            )
+        else:
+            implicit_params = _implicit_params_from_base_with_boundary_deltas(
+                base_implicit_params,
+                jnp.asarray(param_deltas, dtype=jnp.float64),
+                param_entries,
+            )
     # The raw-block transpose below differentiates the residual with respect to
     # the full VMEC parameter pytree and then extracts requested harmonic
     # columns.  It does not need the traced construction history from the

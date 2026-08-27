@@ -89,6 +89,7 @@ class EvaluationStructureCounter:
         *,
         checkpoints: bool = False,
         optimization_raw_block_stage=None,
+        reuse_base_implicit_params: bool = False,
         vmex_cache_sizes: bool = False,
         jax_dispatch_cache: bool = False,
         raw_solve_dispatch: bool = False,
@@ -142,7 +143,10 @@ class EvaluationStructureCounter:
             self.raw_block_solve_calls += 1
             if optimization_raw_block_stage is not None:
                 kwargs["stage"] = optimization_raw_block_stage.raw_block_stage
-                kwargs["solve_with_aux_runner"] = optimization_raw_block_stage.solve_with_aux_runner
+                if reuse_base_implicit_params:
+                    kwargs["base_implicit_params"] = optimization_raw_block_stage.base_implicit_params
+                else:
+                    kwargs["solve_with_aux_runner"] = optimization_raw_block_stage.solve_with_aux_runner
             result = raw_block_solve(*args, **kwargs)
             if checkpoints:
                 jax.block_until_ready((result.state, result.dof_mask))
@@ -305,6 +309,14 @@ def main() -> int:
         ),
     )
     parser.add_argument(
+        "--persistent-raw-params",
+        action="store_true",
+        help=(
+            "Use the optimization-only retained VMEX base-parameter pytree; "
+            "only boundary deltas are rebuilt per evaluation."
+        ),
+    )
+    parser.add_argument(
         "--diagnose-vmex-caches",
         action="store_true",
         help="Report VMEX solver JIT trace-cache sizes after each raw-block solve.",
@@ -333,13 +345,14 @@ def main() -> int:
     quiet_problem = QuietProblem(problem)
     x = np.asarray(jax.device_get(problem.x0), dtype=float)
     optimization_raw_block_stage = None
-    if args.persistent_raw_solve_jit:
+    if args.persistent_raw_solve_jit or args.persistent_raw_params:
         if not problem.parameter_set.vmec_boundary_specs:
             raise ValueError("--persistent-raw-solve-jit requires VMEC boundary parameters.")
         optimization_raw_block_stage = geometry_raw_block_optimization_stage(
             problem.context,
             tuple(spec.as_tuple() for spec in problem.parameter_set.vmec_boundary_specs),
             max_iter=problem.geometry_max_iter,
+            solver_device=problem.geometry_solver_device,
         )
     first_bytes: int | None = None
     first_checkpoint_bytes: dict[str, int | None] = {}
@@ -431,6 +444,8 @@ def main() -> int:
         )
     if args.persistent_raw_solve_jit:
         print("[memory test] raw_solve_boundary=persistent_optimization_jit", flush=True)
+    if args.persistent_raw_params:
+        print("[memory test] raw_parameter_setup=persistent_optimization_base", flush=True)
     for warmup_index in range(args.warmup):
         print(f"[memory test] warmup={warmup_index} starting", flush=True)
         started = time.perf_counter()
@@ -439,6 +454,7 @@ def main() -> int:
             structure_counter.context(
                 checkpoints=args.diagnose_checkpoints,
                 optimization_raw_block_stage=optimization_raw_block_stage,
+                reuse_base_implicit_params=args.persistent_raw_params,
                 vmex_cache_sizes=args.diagnose_vmex_caches,
                 jax_dispatch_cache=args.diagnose_jax_dispatch_cache,
                 raw_solve_dispatch=args.diagnose_raw_solve_dispatch,
@@ -451,6 +467,7 @@ def main() -> int:
                 or args.diagnose_jax_dispatch_cache
                 or args.diagnose_raw_solve_dispatch
                 or args.persistent_raw_solve_jit
+                or args.persistent_raw_params
             )
             else ()
         )
@@ -476,12 +493,14 @@ def main() -> int:
         or args.diagnose_jax_dispatch_cache
         or args.diagnose_raw_solve_dispatch
         or args.persistent_raw_solve_jit
+        or args.persistent_raw_params
     ):
         for iteration in range(args.repeats):
             structure_counter.reset()
             patchers = structure_counter.context(
                 checkpoints=args.diagnose_checkpoints,
                 optimization_raw_block_stage=optimization_raw_block_stage,
+                reuse_base_implicit_params=args.persistent_raw_params,
                 vmex_cache_sizes=args.diagnose_vmex_caches,
                 jax_dispatch_cache=args.diagnose_jax_dispatch_cache,
                 raw_solve_dispatch=args.diagnose_raw_solve_dispatch,
