@@ -6035,14 +6035,14 @@ def _radau_fixed_lagged_step_reverse_common_from_segment_primal_record_call(
     support,
     collect_native_vmec_coefficients: bool,
     native_vmec_zero_leaves: tuple[Any, ...],
-) -> tuple[_RadauAcceptedStepReverseMinimalAttemptResult, Any, tuple[Any, Any, Any, tuple[Any, ...]]] | None:
+) -> tuple[Any, Any, Any, tuple[Any, ...]] | None:
     """Place the shared record-based transpose behind one scan call boundary.
 
     Unlike the previous whole-step boundary, this computation is called once
     before selecting reuse versus rebuild.  Its objective-batched stage solve
     and fixed-lagged state/support transposes are unchanged.
     """
-    return _radau_fixed_lagged_step_reverse_common_from_segment_primal_record(
+    prepared_common = _radau_fixed_lagged_step_reverse_common_from_segment_primal_record(
         kernel_context,
         physics_context,
         context,
@@ -6053,6 +6053,12 @@ def _radau_fixed_lagged_step_reverse_common_from_segment_primal_record_call(
         collect_native_vmec_coefficients=collect_native_vmec_coefficients,
         native_vmec_zero_leaves=native_vmec_zero_leaves,
     )
+    if prepared_common is None:
+        return None
+    # The reconstructed primal and lagged response are needed only inside the
+    # common calculation.  Do not make them call outputs: that would enlarge
+    # the scan/body interface without contributing to either suffix.
+    return prepared_common[2]
 
 
 def _radau_finish_native_vmec_rebuild_from_common(
@@ -7683,7 +7689,7 @@ def _radau_segment_reduced_cotangent_bwd_batched_with_support_call(
                 if step_bwd_mode == (
                     "reduced_cotangent_call_boundary_common_branch_hoist_common_call_rebuild_call"
                 ):
-                    prepared_common = (
+                    common = (
                         _radau_fixed_lagged_step_reverse_common_from_segment_primal_record_call(
                             execution_context.kernel_context,
                             execution_context.physics_context,
@@ -7710,8 +7716,8 @@ def _radau_segment_reduced_cotangent_bwd_batched_with_support_call(
                             native_vmec_zero_leaves=native_vmec_zero_leaves,
                         )
                     )
-                if prepared_common is not None:
-                    _, _, common = prepared_common
+                    common = None if prepared_common is None else prepared_common[2]
+                if common is not None:
 
                     def _finish_common(branch):
                         if step_bwd_mode in {

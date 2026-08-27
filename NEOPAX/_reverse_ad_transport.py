@@ -3569,6 +3569,7 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
         "reduced_cotangent_call_boundary",
         "reduced_cotangent_call_boundary_common_branch_hoist",
         "reduced_cotangent_call_boundary_common_branch_hoist_rebuild_call",
+        "reduced_cotangent_call_boundary_common_branch_hoist_common_call_rebuild_call",
         "reduced_cotangent_lean_replay",
         "reduced_cotangent_recompute_replay",
         "lean_replay",

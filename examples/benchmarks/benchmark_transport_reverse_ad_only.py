@@ -1345,6 +1345,7 @@ def _reverse_all_objectives_multi_rhs_reduced_for_parameter_vector(
         "reduced_cotangent_call_boundary",
         "reduced_cotangent_call_boundary_common_branch_hoist",
         "reduced_cotangent_call_boundary_common_branch_hoist_rebuild_call",
+        "reduced_cotangent_call_boundary_common_branch_hoist_common_call_rebuild_call",
         "reduced_cotangent_lean_replay",
         "reduced_cotangent_recompute_replay",
         "lean_replay",
@@ -1480,6 +1481,7 @@ def _reverse_objective_support_payload_bar_for_parameter_vector(
         "reduced_cotangent_call_boundary",
         "reduced_cotangent_call_boundary_common_branch_hoist",
         "reduced_cotangent_call_boundary_common_branch_hoist_rebuild_call",
+        "reduced_cotangent_call_boundary_common_branch_hoist_common_call_rebuild_call",
         "reduced_cotangent_lean_replay",
         "reduced_cotangent_recompute_replay",
         "lean_replay",
@@ -1699,6 +1701,7 @@ def _reverse_objective_initial_state_bar(
         "reduced_cotangent_call_boundary",
         "reduced_cotangent_call_boundary_common_branch_hoist",
         "reduced_cotangent_call_boundary_common_branch_hoist_rebuild_call",
+        "reduced_cotangent_call_boundary_common_branch_hoist_common_call_rebuild_call",
         "reduced_cotangent_lean_replay",
         "reduced_cotangent_recompute_replay",
         "lean_replay",
@@ -1879,6 +1882,7 @@ def _reverse_all_objectives_initial_state_boundary(
         "reduced_cotangent_call_boundary",
         "reduced_cotangent_call_boundary_common_branch_hoist",
         "reduced_cotangent_call_boundary_common_branch_hoist_rebuild_call",
+        "reduced_cotangent_call_boundary_common_branch_hoist_common_call_rebuild_call",
         "reduced_cotangent_lean_replay",
         "reduced_cotangent_recompute_replay",
         "lean_replay",
@@ -5794,6 +5798,7 @@ def main() -> None:
             "reduced_cotangent_call_boundary",
             "reduced_cotangent_call_boundary_common_branch_hoist",
             "reduced_cotangent_call_boundary_common_branch_hoist_rebuild_call",
+            "reduced_cotangent_call_boundary_common_branch_hoist_common_call_rebuild_call",
             "reduced_cotangent_lean_replay",
             "reduced_cotangent_recompute_replay",
             "reduced_cotangent_host_segments",
@@ -5808,6 +5813,10 @@ def main() -> None:
             "accepted-step reverse scan. 'reduced_cotangent_call_boundary' keeps "
             "the same exact reduced-cotangent equations but places each batched "
             "step-with-support adjoint behind a non-inlined JIT call boundary. "
+            "'reduced_cotangent_call_boundary_common_branch_hoist_common_call_rebuild_call' "
+            "is the native-VMEC opt-in that keeps the shared record-based "
+            "stage/state/support transpose outside the segment scan before the "
+            "reuse/rebuild selection. "
             "'reduced_cotangent_lean_replay' stores "
             "the per-slot replay tape after masking forward-only Radau cache fields. "
             "'reduced_cotangent_recompute_replay' recomputes each slot start from "
