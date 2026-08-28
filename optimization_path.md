@@ -1,5 +1,105 @@
 # Optimization Path Plan
 
+## Verified Payload-Stage Plan — 2026-08-28
+
+### Measured cause
+
+For the fixed four-objective geometry + initial-root case
+(`maxEr`, `Er_left`, `Er_right`, `J_bootstrap`), one complete repeated
+evaluation produces the following JAX dispatch-cache growth:
+
+| Existing boundary | Entries added per evaluation |
+| --- | ---: |
+| shared raw VMEX solve | 1 |
+| selected initial-`Er` root | 1 |
+| payload-to-VMEC reverse table | **13** |
+| final objective/table assembly | 3 |
+
+The process RSS rises by about 0.68 GiB per evaluation while `jax.live_arrays`
+is flat and the evaluation still performs exactly one raw VMEC solve and one
+selected-root solve. The transport-specific slope is therefore primarily in
+the payload-to-VMEC reverse table, not in geometry-vector extraction, VMEC
+parameter setup, or duplicated geometry/root calculations.
+
+The payload table calls the established
+`geometry_payload_pullback_from_param_vector_raw_block_transpose` route. That
+route recreates Python closures and JAX `vjp`/`jvp` transform identities for
+the geometry + NTX support payload on every optimization evaluation. JAX then
+retains executable/dispatch entries for those fresh identities. This matches
+why geometry-only objectives show much less growth and why adding
+ambipolarity/bootstrap objectives exposes it strongly.
+
+### Invariants
+
+- The benchmark reverse-AD path is unchanged: same payload builder, custom
+  derivative rules, raw-block transpose, root selection, numerical values,
+  and benchmark interfaces.
+- Each mixed evaluation retains one shared VMEC solve and one selected-root
+  evaluation. No geometry calculation is duplicated per objective or DoF.
+- No optimizer-wide fused JIT and no JIT is introduced inside VMEC, Boozer,
+  NTX, flux, or root physics functions.
+- The fixed TOML selects the flux model before a stage is built. The stage is
+  keyed by model/layout and is rebuilt only when a new problem is built with a
+  different TOML/model/grid/VMEC parameter layout.
+- The first implementation is only the exact-Lij four-objective initial-root
+  case. Full time-dependent transport is a separate later stage because its
+  accepted-step topology can vary.
+
+### Implementation plan
+
+1. **Remove rejected experiments from the proposed optimization route.**
+   The vector-only and split raw-parameter JIT experiments did not reduce the
+   cache slope. Do not make them the example default.
+
+2. **Factor a payload-stage factory from the existing payload pullback.**
+   Add an optimization-only factory, suffixed `_optimization`, which creates
+   once per fixed stage the closure identities and structural metadata now
+   recreated inside `geometry_payload_pullback_from_param_vector_raw_block_transpose`:
+   fixed radial/Boozer sampling, fixed Boozer mode indices/constants where
+   verified state-independent, payload-tree paths, active float-leaf layout,
+   and compact-support routing.
+
+3. **Keep all trial data dynamic.**
+   The persistent callable accepts the current raw VMEC state/parameters/mask,
+   current support cotangent batch, and current objective/profile values. It
+   must never retain an evaluation's state, geometry payload, NTX payload,
+   root solution, support bars, or optimizer vector.
+
+4. **Use the existing reverse operations unchanged.**
+   The staged callable invokes the same existing geometry/NTX payload mapping,
+   its existing VJP/JVP rules, and the same final
+   `implicit_state_pullback_multi_rhs_raw_block_transpose`. It changes object
+   lifetime and tracing boundaries only; it does not alter reverse-AD math or
+   benchmark reference values.
+
+5. **Expose it only through an explicit optimization mode.**
+   `off` remains the benchmark/default evaluator. The optimization example
+   switches to the stage only after acceptance checks pass. The public
+   benchmark scripts and their payload functions keep their present behavior.
+
+6. **Validate before measuring memory.**
+   Compare residuals and the complete four-row Jacobian against `off` at the
+   same vector. Use the existing tolerance (absolute residual parity; tiny
+   floating reduction-level Jacobian differences only). Confirm one raw solve
+   and one root solve.
+
+7. **Acceptance memory run.**
+   After parity, repeat the three-evaluation memory command. The payload-table
+   cache count must remain fixed after warmup; only then assess RSS slope and
+   warm execution time. If the payload count is flat but RSS still rises, the
+   next diagnostic starts *inside* the already persistent payload operator,
+   rather than adding a wider JIT.
+
+### Expected performance/correctness effect
+
+The stage has a one-time compilation/setup cost for its fixed layout. Warm
+execution should avoid creating the 13 payload dispatch entries per optimizer
+evaluation and should not add a large traced graph: VMEC, Boozer, NTX, and root
+algorithms remain behind their existing reverse/custom-VJP boundaries. Because
+the mathematical functions and cotangents are identical, derivative benchmark
+values are expected to remain unchanged within existing floating-point
+reduction tolerance.
+
 ## Current Restart Plan: Bound Existing Reverse Kernels
 
 ### Objective
