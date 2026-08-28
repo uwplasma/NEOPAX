@@ -427,8 +427,15 @@ class GeometryInitialErRootLeastSquaresProblem:
             scaled_values = jnp.asarray(scaled_parameter_values, dtype=jnp.float64)
         physical_values = self._scaled_to_physical(scaled_values)
         base_terms = _base_terms_for_mixed_initial_er_root(self.terms)
-        base_evaluation = evaluate_geometry_initial_er_root_only_least_squares_benchmark_tables(
-            self.config,
+        # ``off`` is the benchmark reference path.  ``optimization`` is an
+        # explicit, separately implemented route; it is intentionally opt-in
+        # so benchmark call graphs and reverse functions remain untouched.
+        evaluator = (
+            evaluate_geometry_initial_er_root_only_least_squares_benchmark_tables
+            if self.reverse_stage_mode == "off"
+            else evaluate_geometry_initial_er_root_only_least_squares_optimization
+        )
+        evaluator_kwargs = dict(
             parameter_set=self.parameter_set,
             parameter_values=physical_values,
             terms=base_terms,
@@ -448,6 +455,9 @@ class GeometryInitialErRootLeastSquaresProblem:
             root_options=self.root_options,
             raw_block_stage=self.raw_block_stage,
         )
+        if self.reverse_stage_mode == "optimization":
+            evaluator_kwargs["optimization_stage"] = self.optimization_stage
+        base_evaluation = evaluator(self.config, **evaluator_kwargs)
         result = _assemble_mixed_initial_er_root_result(
             self.terms,
             base_evaluation=base_evaluation,
@@ -1276,9 +1286,9 @@ def geometry_initial_er_root_only_least_squares_problem(
     """
 
     mode = str(reverse_stage_mode).strip().lower()
-    if mode not in {"off", "vmex_like"}:
+    if mode not in {"off", "optimization", "vmex_like"}:
         raise ValueError(
-            "reverse_stage_mode must be 'off' or 'vmex_like'."
+            "reverse_stage_mode must be 'off', 'optimization', or 'vmex_like'."
         )
     if mode == "vmex_like":
         raise NotImplementedError(

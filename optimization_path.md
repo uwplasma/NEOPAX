@@ -1,5 +1,77 @@
 # Optimization Path Plan
 
+## Active Plan: Initial-Er Transport Reverse Stage — 2026-08-28
+
+This section supersedes the earlier raw-VMEX and payload-stage hypotheses
+below. Those sections are retained as history, not implementation instructions.
+
+### Evidence and scope
+
+The fixed 24-geometry-DoF initial-root case has now been split without changing
+the normal evaluator:
+
+| Isolated path | Repeated RSS result | Conclusion |
+| --- | ---: | --- |
+| Raw VMEX solve, including scaled-to-physical and VMEC-vector setup | `+0.0 MiB` over three warm calls | Not the retaining path. |
+| QI/Boozer geometry objectives only | `+34.6 MiB` on the second call | Not the material slope. |
+| Three initial-Er transport objectives only | `+473.8 MiB` on the second call | Dominant retaining path. |
+
+The transport-only case still executes exactly one raw VMEX solve and one
+selected initial-Er root. Its JAX dispatch cache grows by eleven entries on
+each evaluated point: selected-root, compact root-state transpose,
+root-geometry residual VJP and batched pullback, NTX-support pullback, and
+final payload assembly. The geometry-only case does not show this behaviour.
+
+Initial scope is the fixed initial-Er ambipolarity transport objectives:
+`maxEr`, transition-left, transition-right, and bootstrap current. Full
+time-dependent transport remains a separate later stage.
+
+### Constraints
+
+- The benchmark/default `reverse_stage_mode="off"` path and its reverse
+  functions remain unchanged: no changed math, numerics, custom-VJP rule,
+  call order, benchmark API, or reference values.
+- Every mixed evaluation retains one raw VMEX solve and one selected root; no
+  geometry, NTX, flux, or root calculation is repeated per objective or DoF.
+- No optimizer-wide fused JIT and no new JIT inside VMEC, Boozer, NTX, flux,
+  or root physics. The previous whole-root JIT is rejected: it doubled warmup
+  compilation and did not eliminate RSS growth.
+- The TOML-selected model is fixed for a stage. A changed model/grid/objective
+  layout builds a new stage before the run, never during it.
+
+### Implementation
+
+1. Add opt-in `reverse_stage_mode="optimization"`. `"off"` stays the default
+   and continues to call `geometry_active_initial_er_root_only_reverse_table`.
+   The new route calls a separate `_optimization` implementation only.
+2. In that optimization-only implementation, replace per-evaluation nested
+   `jax.vjp`/`jax.vmap` functions with module-level operators for generic Er
+   objectives, root-state residuals, root-geometry residuals, and NTX-support
+   pullbacks. All changing state/payload inputs are explicit arguments.
+3. Pass baseline geometry/support dynamically but stop them at exactly the
+   existing derivative partition. Only current direct geometry-delta, state,
+   and support derivatives contribute.
+4. Let the stage retain only stable operator identities and fixed
+   objective/model/layout metadata. It must never retain a trial's VMEC state,
+   root, geometry payload, NTX support, residual, cotangent, or optimizer
+   vector. Keep raw-block transpose and payload-to-VMEC functions unchanged.
+5. Add no new `jax.jit` initially. This route is meant to prevent reverse
+   closure retracing, not create a large compiled graph. A bounded JIT is
+   considered only after independent parity, compile, warm-time, and RSS data.
+
+### Mandatory acceptance gates
+
+1. Compare all four residuals with `off` at the identical optimizer vector.
+2. Compare the full four-by-24 Jacobian with `off`; only existing
+   reduction-order noise (about `1e-10` absolute) is allowed.
+3. Prove one raw VMEX solve and one selected root per mixed evaluation.
+4. After one warmup, repeat transport-only and four-objective evaluations.
+   Cache counts must stabilize and RSS must have no material iteration slope.
+   Warm time must not regress against `off`.
+
+If this does not stabilize memory, reject it without modifying the benchmark
+route and investigate only the remaining measured operator.
+
 ## Verified Payload-Stage Plan — 2026-08-28
 
 ### Measured cause
