@@ -5,6 +5,7 @@ from types import SimpleNamespace
 import jax.numpy as jnp
 
 from NEOPAX import _geometry_autodiff as geometry_ad
+from NEOPAX import _optimization_initial_root_stage as initial_root_stage
 from NEOPAX import optimization
 
 
@@ -126,3 +127,32 @@ def test_repeated_evaluation_memory_samples_release_evaluations(monkeypatch):
     assert reported == list(samples)
     assert all(sample.residual_norm == 3.0 for sample in samples)
     assert all(sample.jacobian_shape == (1, 1) for sample in samples)
+
+
+def test_initial_root_reverse_stage_owns_only_callable_kernel_identities():
+    layout = initial_root_stage.InitialRootStageLayout(
+        objective_names=("maxEr", "J_bootstrap"),
+        geometry_param_specs=(("RBC", 1, 0),),
+        n_r=51,
+        n_theta=25,
+        n_zeta=25,
+        n_xi=64,
+        surface_backend="vmec",
+        flux_model="ntx_exact_lij_runtime",
+    )
+
+    def kernel(*args):
+        return args
+
+    stage = initial_root_stage.build_initial_root_reverse_optimization_stage(
+        layout=layout,
+        corrected_bootstrap_fluxes=kernel,
+        bootstrap_state_pullback=kernel,
+        bootstrap_geometry_pullback=kernel,
+        bootstrap_support_pullback=kernel,
+        root_geometry_residual_pullback=kernel,
+    )
+
+    assert stage.layout is layout
+    assert stage.kernels.corrected_bootstrap_fluxes is kernel
+    assert stage.kernels.root_geometry_residual_pullback is kernel

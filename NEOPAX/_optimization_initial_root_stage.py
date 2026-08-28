@@ -48,6 +48,65 @@ class GeometryInitialRootOptimizationStage:
     payload_to_vmec: Callable[..., Any]
 
 
+@dataclasses.dataclass(frozen=True, slots=True)
+class InitialRootReverseKernelSet:
+    """Stable identities for the measured initial-root reverse boundaries.
+
+    Every callable receives the current trial data explicitly.  In particular,
+    it may not close over a trial geometry, state, support payload, root, or
+    cotangent.  The final root-geometry callable preserves the benchmark's
+    derivative partition: it returns geometry bars for the supplied residual
+    bars, with geometry delta as its only differentiated numerical input.
+    """
+
+    corrected_bootstrap_fluxes: Callable[..., Any]
+    bootstrap_state_pullback: Callable[..., Any]
+    bootstrap_geometry_pullback: Callable[..., Any]
+    bootstrap_support_pullback: Callable[..., Any]
+    root_geometry_residual_pullback: Callable[..., Any]
+
+    def __post_init__(self) -> None:
+        for field in dataclasses.fields(self):
+            if not callable(getattr(self, field.name)):
+                raise TypeError(f"{field.name} must be callable.")
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class InitialRootReverseOptimizationStage:
+    """Optimization-only owner of bounded initial-root reverse kernels.
+
+    ``layout`` and ``kernels`` are stage-static. Trial data is deliberately
+    absent from this object and must be passed to a kernel at invocation.
+    This is not an outer JIT boundary.
+    """
+
+    layout: InitialRootStageLayout
+    kernels: InitialRootReverseKernelSet
+
+
+def build_initial_root_reverse_optimization_stage(
+    *,
+    layout: InitialRootStageLayout,
+    corrected_bootstrap_fluxes: Callable[..., Any],
+    bootstrap_state_pullback: Callable[..., Any],
+    bootstrap_geometry_pullback: Callable[..., Any],
+    bootstrap_support_pullback: Callable[..., Any],
+    root_geometry_residual_pullback: Callable[..., Any],
+) -> InitialRootReverseOptimizationStage:
+    """Build the explicit non-jitted stage for the measured cache owners."""
+
+    return InitialRootReverseOptimizationStage(
+        layout=layout,
+        kernels=InitialRootReverseKernelSet(
+            corrected_bootstrap_fluxes=corrected_bootstrap_fluxes,
+            bootstrap_state_pullback=bootstrap_state_pullback,
+            bootstrap_geometry_pullback=bootstrap_geometry_pullback,
+            bootstrap_support_pullback=bootstrap_support_pullback,
+            root_geometry_residual_pullback=root_geometry_residual_pullback,
+        ),
+    )
+
+
 @dataclasses.dataclass(slots=True)
 class LazyStageArtifacts:
     """One-time structural artifacts derived from the first trial raw state.
