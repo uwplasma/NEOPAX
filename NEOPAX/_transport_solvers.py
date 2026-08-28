@@ -1922,9 +1922,39 @@ def _solver_error_norm(err_vec, flat_ref, flat_candidate, atol: float, rtol: flo
     return jnp.sqrt(jnp.mean(normalized * normalized) + 1.0e-30)
 
 
-def _lagged_response_global_reuse_metric(current_flat, reference_flat, atol: float, rtol: float):
+def _lagged_response_global_reuse_metric(
+    current_flat,
+    reference_flat,
+    atol: float,
+    rtol: float,
+    *,
+    norm: str = "rms",
+):
+    """Return the scaled state drift used to decide lagged-response reuse.
+
+    ``rms`` preserves the historical controller behaviour.  ``max`` is a
+    componentwise guard: every state component must remain within its scaled
+    tolerance before a response based at ``reference_flat`` can be reused.
+    """
     delta_flat = current_flat - reference_flat
-    return _solver_error_norm(delta_flat, reference_flat, current_flat, atol=atol, rtol=rtol)
+    if norm == "rms":
+        return _solver_error_norm(
+            delta_flat, reference_flat, current_flat, atol=atol, rtol=rtol
+        )
+    if norm == "max":
+        scale = atol + rtol * jnp.maximum(jnp.abs(reference_flat), jnp.abs(current_flat))
+        return jnp.max(jnp.abs(delta_flat) / scale)
+    raise ValueError(f"Unsupported lagged-response drift norm '{norm}'.")
+
+
+def _lagged_response_reuse_uses_global_drift(mode: str) -> bool:
+    return mode in {"global_state_drift", "global_state_drift_max"}
+
+
+def _lagged_response_drift_norm(mode: str) -> str:
+    if mode == "global_state_drift_max":
+        return "max"
+    return "rms"
 
 
 def _make_radau_initial_step_state(
@@ -2920,12 +2950,13 @@ def _apply_radau_lean_timestep_controller(
         t_new = step_state.t + trial_dt
         accepted_y = _project_flat_state_if_needed(trial_y, project_flat)
         next_dt_accept = jnp.clip(trial_dt * growth, dt_min, dt_max)
-        lagged_reuse_global = lagged_response_reuse_mode == "global_state_drift"
+        lagged_reuse_global = _lagged_response_reuse_uses_global_drift(lagged_response_reuse_mode)
         lagged_reuse_metric = _lagged_response_global_reuse_metric(
             accepted_y,
             step_state.lagged_reference_y,
             atol=lagged_response_reuse_atol,
             rtol=lagged_response_reuse_rtol,
+            norm=_lagged_response_drift_norm(lagged_response_reuse_mode),
         )
         keep_lagged_response = jnp.logical_and(
             jnp.asarray(use_transport_lagged_response),
@@ -3346,11 +3377,13 @@ class _RadauSolverConfig(TransportSolver):
             "state": "global_state_drift",
             "global": "global_state_drift",
             "state_drift": "global_state_drift",
+            "state_drift_max": "global_state_drift_max",
+            "global_max": "global_state_drift_max",
         }
         lagged_reuse_mode_norm = lagged_reuse_aliases.get(lagged_reuse_mode_norm, lagged_reuse_mode_norm)
-        if lagged_reuse_mode_norm not in {"retry_only", "global_state_drift"}:
+        if lagged_reuse_mode_norm not in {"retry_only", "global_state_drift", "global_state_drift_max"}:
             raise ValueError(
-                "lagged_response_reuse_mode must be one of: retry_only, global_state_drift"
+                "lagged_response_reuse_mode must be one of: retry_only, global_state_drift, global_state_drift_max"
             )
         object.__setattr__(self, "lagged_response_reuse_mode", lagged_reuse_mode_norm)
         object.__setattr__(self, "lagged_response_reuse_rtol", float(lagged_response_reuse_rtol))
@@ -13822,12 +13855,14 @@ def _radau_fixed_dt_accepted_rollout(
         )
         keep_lagged_response = jnp.asarray(False)
         if kernel_context.use_transport_lagged_response:
-            lagged_reuse_global = getattr(physics_context, "lagged_response_reuse_mode", "retry_only") == "global_state_drift"
+            lagged_reuse_mode = getattr(physics_context, "lagged_response_reuse_mode", "retry_only")
+            lagged_reuse_global = _lagged_response_reuse_uses_global_drift(lagged_reuse_mode)
             lagged_reuse_metric = _lagged_response_global_reuse_metric(
                 step_map_result.accepted_y,
                 carry.lagged_reference_y,
                 atol=jnp.asarray(getattr(physics_context, "lagged_response_reuse_atol", 1.0e-8), dtype=kernel_context.dtype),
                 rtol=jnp.asarray(getattr(physics_context, "lagged_response_reuse_rtol", 5.0e-2), dtype=kernel_context.dtype),
+                norm=_lagged_response_drift_norm(lagged_reuse_mode),
             )
             keep_lagged_response = jnp.logical_and(
                 jnp.asarray(True),
@@ -13897,12 +13932,14 @@ def _radau_replay_realized_accepted_step_map_rollout(
             )
             keep_lagged_response = jnp.asarray(False)
             if kernel_context.use_transport_lagged_response:
-                lagged_reuse_global = getattr(physics_context, "lagged_response_reuse_mode", "retry_only") == "global_state_drift"
+                lagged_reuse_mode = getattr(physics_context, "lagged_response_reuse_mode", "retry_only")
+                lagged_reuse_global = _lagged_response_reuse_uses_global_drift(lagged_reuse_mode)
                 lagged_reuse_metric = _lagged_response_global_reuse_metric(
                     step_map_result.accepted_y,
                     carry.lagged_reference_y,
                     atol=jnp.asarray(getattr(physics_context, "lagged_response_reuse_atol", 1.0e-8), dtype=dtype),
                     rtol=jnp.asarray(getattr(physics_context, "lagged_response_reuse_rtol", 5.0e-2), dtype=dtype),
+                    norm=_lagged_response_drift_norm(lagged_reuse_mode),
                 )
                 keep_lagged_response = jnp.logical_and(
                     jnp.asarray(True),
@@ -13979,12 +14016,14 @@ def _radau_forward_fd_fixed_dt_accepted_rollout(
         )
         keep_lagged_response = jnp.asarray(False)
         if kernel_context.use_transport_lagged_response:
-            lagged_reuse_global = getattr(physics_context, "lagged_response_reuse_mode", "retry_only") == "global_state_drift"
+            lagged_reuse_mode = getattr(physics_context, "lagged_response_reuse_mode", "retry_only")
+            lagged_reuse_global = _lagged_response_reuse_uses_global_drift(lagged_reuse_mode)
             lagged_reuse_metric = _lagged_response_global_reuse_metric(
                 step_map_result.accepted_y,
                 step_map_result.next_carry.lagged_reference_y,
                 atol=jnp.asarray(getattr(physics_context, "lagged_response_reuse_atol", 1.0e-8), dtype=dtype),
                 rtol=jnp.asarray(getattr(physics_context, "lagged_response_reuse_rtol", 5.0e-2), dtype=dtype),
+                norm=_lagged_response_drift_norm(lagged_reuse_mode),
             )
             keep_lagged_response = jnp.logical_and(
                 jnp.asarray(True),
@@ -14052,12 +14091,14 @@ def _radau_forward_fd_replay_realized_accepted_rollout(
             )
             keep_lagged_response = jnp.asarray(False)
             if kernel_context.use_transport_lagged_response:
-                lagged_reuse_global = getattr(physics_context, "lagged_response_reuse_mode", "retry_only") == "global_state_drift"
+                lagged_reuse_mode = getattr(physics_context, "lagged_response_reuse_mode", "retry_only")
+                lagged_reuse_global = _lagged_response_reuse_uses_global_drift(lagged_reuse_mode)
                 lagged_reuse_metric = _lagged_response_global_reuse_metric(
                     step_map_result.accepted_y,
                     step_map_result.next_carry.lagged_reference_y,
                     atol=jnp.asarray(getattr(physics_context, "lagged_response_reuse_atol", 1.0e-8), dtype=dtype),
                     rtol=jnp.asarray(getattr(physics_context, "lagged_response_reuse_rtol", 5.0e-2), dtype=dtype),
+                    norm=_lagged_response_drift_norm(lagged_reuse_mode),
                 )
                 keep_lagged_response = jnp.logical_and(
                     jnp.asarray(True),
@@ -14383,12 +14424,13 @@ def _radau_fixed_dt_schedule_rollout_scan_step(
             attempt_result.trial_y,
             execution_context.project_flat,
         )
-        lagged_reuse_global = execution_context.lagged_response_reuse_mode == "global_state_drift"
+        lagged_reuse_global = _lagged_response_reuse_uses_global_drift(execution_context.lagged_response_reuse_mode)
         lagged_reuse_metric = _lagged_response_global_reuse_metric(
             accepted_y,
             step_state_attempt.lagged_reference_y,
             atol=execution_context.lagged_response_reuse_atol,
             rtol=execution_context.lagged_response_reuse_rtol,
+            norm=_lagged_response_drift_norm(execution_context.lagged_response_reuse_mode),
         )
         keep_lagged_response = jnp.logical_and(
             jnp.asarray(execution_context.use_transport_lagged_response),
@@ -19767,12 +19809,14 @@ class _ThetaNewtonSolverConfig(_ThetaSolverConfig):
             "retry": "retry_only",
             "global": "global_state_drift",
             "drift": "global_state_drift",
+            "global_max": "global_state_drift_max",
+            "drift_max": "global_state_drift_max",
         }
         lagged_reuse_mode_norm = lagged_reuse_aliases.get(lagged_reuse_mode_norm, lagged_reuse_mode_norm)
-        if lagged_reuse_mode_norm not in {"retry_only", "global_state_drift"}:
+        if lagged_reuse_mode_norm not in {"retry_only", "global_state_drift", "global_state_drift_max"}:
             raise ValueError(
                 "theta_lagged_response_reuse_mode must be one of: "
-                "retry_only, global_state_drift"
+                "retry_only, global_state_drift, global_state_drift_max"
             )
         object.__setattr__(self, "lagged_response_reuse_mode", lagged_reuse_mode_norm)
         object.__setattr__(self, "lagged_response_reuse_rtol", float(lagged_response_reuse_rtol))
@@ -20072,12 +20116,13 @@ def _theta_prepare_lagged_response(
     reuse_state = step_state.reuse_state
     lagged_response_reused = jnp.asarray(False)
     can_reuse = reuse_state.lagged_response_valid
-    if lagged_response_reuse_mode == "global_state_drift":
+    if _lagged_response_reuse_uses_global_drift(lagged_response_reuse_mode):
         lagged_reuse_metric = _lagged_response_global_reuse_metric(
             candidate_flat,
             reuse_state.lagged_reference_y,
             atol=lagged_response_reuse_atol,
             rtol=lagged_response_reuse_rtol,
+            norm=_lagged_response_drift_norm(lagged_response_reuse_mode),
         )
         can_reuse = jnp.logical_and(can_reuse, lagged_reuse_metric <= jnp.asarray(1.0, dtype=candidate_flat.dtype))
     if lagged_response_reuse_mode == "retry_only":
@@ -20879,7 +20924,7 @@ def _theta_newton_accepted_step_attempt(
         jacobian_reused=can_reuse_linearization,
         lagged_response_cache_out=lagged_response,
         lagged_response_valid_out=jnp.asarray(
-            use_transport_lagged_response and (lagged_response_reuse_mode == "global_state_drift")
+            use_transport_lagged_response and _lagged_response_reuse_uses_global_drift(lagged_response_reuse_mode)
         ),
         lagged_reference_y_out=flat_y,
         jacobian_out=frozen_system,

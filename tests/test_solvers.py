@@ -36,6 +36,26 @@ def _base_solver_parameters(**overrides):
     return params
 
 
+def test_lagged_response_global_state_drift_max_uses_componentwise_max_norm():
+    """A single out-of-tolerance component must invalidate max-norm reuse."""
+
+    reference = jnp.zeros(4)
+    current = jnp.asarray([1.2, 0.0, 0.0, 0.0])
+    rms = transport_solvers._lagged_response_global_reuse_metric(
+        current, reference, atol=1.0, rtol=0.0, norm="rms"
+    )
+    max_norm = transport_solvers._lagged_response_global_reuse_metric(
+        current, reference, atol=1.0, rtol=0.0, norm="max"
+    )
+
+    assert float(rms) < 1.0
+    assert float(max_norm) == pytest.approx(1.2)
+    assert transport_solvers._lagged_response_reuse_uses_global_drift(
+        "global_state_drift_max"
+    )
+    assert transport_solvers._lagged_response_drift_norm("global_state_drift_max") == "max"
+
+
 def test_build_time_solver_theta_newton_backend():
     pytest.importorskip("diffrax")
     solver = build_time_solver(_base_solver_parameters(transport_solver_backend="theta_newton"))
@@ -76,6 +96,23 @@ def test_build_time_solver_radau_backend():
     assert float(solver.t0) == 0.0
     assert float(solver.t1) == 1.0
     assert solver.rhs_mode == "black_box"
+
+
+@pytest.mark.parametrize("backend", ["radau", "theta_newton"])
+def test_build_time_solver_accepts_global_state_drift_max(backend):
+    pytest.importorskip("diffrax")
+    reuse_key = (
+        "lagged_response_reuse_mode"
+        if backend == "radau"
+        else "theta_lagged_response_reuse_mode"
+    )
+    solver = build_time_solver(
+        _base_solver_parameters(
+            transport_solver_backend=backend,
+            **{reuse_key: "global_state_drift_max"},
+        )
+    )
+    assert solver.lagged_response_reuse_mode == "global_state_drift_max"
 
 
 def test_build_time_solver_radau_accepts_lagged_rhs_mode():
