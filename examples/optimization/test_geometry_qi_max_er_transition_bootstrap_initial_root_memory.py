@@ -96,6 +96,7 @@ class EvaluationStructureCounter:
         self.transport_dispatch_caches: dict[str, int | None] = {}
         self.payload_dispatch_caches: dict[str, int | None] = {}
         self.support_reverse_dispatch_caches: dict[str, int | None] = {}
+        self.support_reverse_rss_bytes: dict[str, int | None] = {}
 
     def reset(self) -> None:
         self.raw_block_solve_calls = 0
@@ -110,6 +111,7 @@ class EvaluationStructureCounter:
         self.transport_dispatch_caches = {}
         self.payload_dispatch_caches = {}
         self.support_reverse_dispatch_caches = {}
+        self.support_reverse_rss_bytes = {}
 
     def context(
         self,
@@ -126,6 +128,7 @@ class EvaluationStructureCounter:
         transport_dispatch: bool = False,
         payload_dispatch: bool = False,
         support_reverse_dispatch: bool = False,
+        support_reverse_rss: bool = False,
         raw_implicit=None,
     ):
         raw_block_solve = reverse_optimization.geometry_raw_block_solve_from_param_vector
@@ -192,6 +195,8 @@ class EvaluationStructureCounter:
         def record_support_reverse_dispatch(label: str) -> None:
             if support_reverse_dispatch:
                 self.support_reverse_dispatch_caches[str(label)] = dispatch_cache_size()
+            if support_reverse_rss:
+                self.support_reverse_rss_bytes[str(label)] = opt._process_resident_memory_bytes()
 
         original_scaled_to_physical = opt.GeometryInitialErRootLeastSquaresProblem._scaled_to_physical
         original_active_profile_values = reverse_optimization._active_profile_values_from_parameter_vector
@@ -274,7 +279,7 @@ class EvaluationStructureCounter:
             return result
 
         def count_support_reverse(*args, **kwargs):
-            if support_reverse_dispatch:
+            if support_reverse_dispatch or support_reverse_rss:
                 kwargs["dispatch_cache_probe"] = record_support_reverse_dispatch
             return support_reverse(*args, **kwargs)
 
@@ -497,6 +502,14 @@ def main() -> int:
             "it constructs payload cotangents."
         ),
     )
+    parser.add_argument(
+        "--diagnose-support-reverse-rss",
+        action="store_true",
+        help=(
+            "Report process RSS at the existing support-reverse probe labels; "
+            "diagnostic only and does not alter reverse calculations."
+        ),
+    )
     args = parser.parse_args()
     if args.warmup < 0 or args.repeats < 1:
         raise ValueError("--warmup must be non-negative and --repeats must be positive.")
@@ -529,6 +542,7 @@ def main() -> int:
         )
     first_bytes: int | None = None
     first_checkpoint_bytes: dict[str, int | None] = {}
+    first_support_reverse_rss_bytes: dict[str, int | None] = {}
     structure_counter = EvaluationStructureCounter()
 
     def report(sample) -> None:
@@ -632,6 +646,19 @@ def main() -> int:
                 f"[memory test] support_reverse_dispatch_cache {entries or 'unavailable'}",
                 flush=True,
             )
+        if args.diagnose_support_reverse_rss:
+            entries = []
+            for name, value in structure_counter.support_reverse_rss_bytes.items():
+                baseline = first_support_reverse_rss_bytes.setdefault(name, value)
+                if value is None or baseline is None:
+                    delta = "unavailable"
+                else:
+                    delta = f"{(value - baseline) / 2**20:+.1f}MiB"
+                entries.append(f"{name}={delta}")
+            print(
+                f"[memory test] support_reverse_rss_delta {' '.join(entries) or 'unavailable'}",
+                flush=True,
+            )
 
     print(
         f"[memory test] mode={args.mode} objective_set={args.objective_set} "
@@ -672,6 +699,7 @@ def main() -> int:
                 transport_dispatch=args.diagnose_transport_dispatch,
                 payload_dispatch=args.diagnose_payload_dispatch,
                 support_reverse_dispatch=args.diagnose_support_reverse_dispatch,
+                support_reverse_rss=args.diagnose_support_reverse_rss,
                 raw_implicit=getattr(problem.raw_block_stage, "implicit", None),
             )
             if (
@@ -681,6 +709,7 @@ def main() -> int:
                 or args.diagnose_jax_dispatch_cache
                 or args.diagnose_payload_dispatch
                 or args.diagnose_support_reverse_dispatch
+                or args.diagnose_support_reverse_rss
                 or args.diagnose_raw_solve_dispatch
                 or args.persistent_raw_solve_jit
                 or args.persistent_raw_params
