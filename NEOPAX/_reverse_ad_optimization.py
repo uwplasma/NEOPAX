@@ -829,6 +829,7 @@ class InitialErTransportReverseStage:
 
     payload_adapter: InitialErTransportPayloadAdapter
     selected_root: Callable[..., Any]
+    selected_root_strict: Callable[..., Any]
     state_pullback: Callable[..., Any]
     geometry_pullback: Callable[..., Any]
     support_pullback: Callable[..., Any]
@@ -911,6 +912,16 @@ def build_initial_er_transport_reverse_stage(
     return InitialErTransportReverseStage(
         payload_adapter=payload_adapter,
         selected_root=jax.jit(_selected_root, inline=False),
+        # The ordinary root experiment showed that this boundary saves a
+        # further cache entry, but its compiled reductions perturbed the
+        # selected root enough to fail strict benchmark parity. Keep an
+        # explicitly named strict CPU variant; it changes neither benchmark
+        # code nor the ordinary optimization experiment.
+        selected_root_strict=jax.jit(
+            _selected_root,
+            inline=False,
+            compiler_options={"xla_cpu_enable_fast_math": False},
+        ),
         state_pullback=jax.jit(_state_pullback, inline=False),
         geometry_pullback=jax.jit(_geometry_pullback, inline=False),
         support_pullback=jax.jit(_support_pullback, inline=False),
@@ -1914,6 +1925,7 @@ def _optimization_root_to_payload_cotangents(
     r00_boozer_surface_sampling=None,
     transport_reverse_stage: InitialErTransportReverseStage | None = None,
     use_selected_root_kernel: bool = False,
+    use_strict_selected_root_kernel: bool = False,
 ):
     transport_payload_adapter = (
         None if transport_reverse_stage is None else transport_reverse_stage.payload_adapter
@@ -1961,7 +1973,12 @@ def _optimization_root_to_payload_cotangents(
             runtime=runtime_for_geometry,
         )
     else:
-        er_profile, finite_mask = transport_reverse_stage.selected_root(
+        selected_root = (
+            transport_reverse_stage.selected_root_strict
+            if use_strict_selected_root_kernel
+            else transport_reverse_stage.selected_root
+        )
+        er_profile, finite_mask = selected_root(
             pre_root_state,
             geometry_leaves,
             support_leaves,
@@ -2196,6 +2213,7 @@ def geometry_active_initial_er_root_only_reverse_table_optimization(
     optimization_stage=None,
     transport_reverse_stage: InitialErTransportReverseStage | None = None,
     use_selected_root_kernel: bool = False,
+    use_strict_selected_root_kernel: bool = False,
     payload_assembly_stage=None,
 ) -> ObjectiveTableResult:
     """Return compact initial-Er objective table for active realtime geometry.
@@ -2269,6 +2287,7 @@ def geometry_active_initial_er_root_only_reverse_table_optimization(
         options=options,
         transport_reverse_stage=transport_reverse_stage,
         use_selected_root_kernel=use_selected_root_kernel,
+        use_strict_selected_root_kernel=use_strict_selected_root_kernel,
     )
     if optimization_stage is None:
         root_args["raw_block_solve"] = raw_block_solve
@@ -3015,6 +3034,7 @@ def evaluate_geometry_initial_er_root_only_least_squares_optimization(
     optimization_stage=None,
     transport_reverse_stage: InitialErTransportReverseStage | None = None,
     use_selected_root_kernel: bool = False,
+    use_strict_selected_root_kernel: bool = False,
     payload_assembly_stage=None,
 ) -> LeastSquaresEvaluation:
     """Evaluate mixed objectives using only benchmark-validated table backends."""
@@ -3090,6 +3110,7 @@ def evaluate_geometry_initial_er_root_only_least_squares_optimization(
                 optimization_stage=optimization_stage,
                 transport_reverse_stage=transport_reverse_stage,
                 use_selected_root_kernel=use_selected_root_kernel,
+                use_strict_selected_root_kernel=use_strict_selected_root_kernel,
                 payload_assembly_stage=payload_assembly_stage,
             )
             transport_values, transport_jacobian = jax.block_until_ready(

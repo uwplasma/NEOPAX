@@ -7,6 +7,7 @@ VMEC input, and initial scaled DoF vector.
 
 from __future__ import annotations
 
+import argparse
 import io
 from contextlib import redirect_stdout
 from pathlib import Path
@@ -40,15 +41,29 @@ def _evaluate(problem, x):
 
 
 def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--mode",
+        choices=(
+            "optimization",
+            "optimization_root_experiment",
+            "optimization_root_strict_experiment",
+            "optimization_payload_experiment",
+        ),
+        default="optimization",
+        help="Opt-in implementation to compare against the unchanged off benchmark.",
+    )
+    args = parser.parse_args()
     if not np.isscalar(example.MAX_MODE_SCHEDULE):
         raise ValueError("The parity test requires one fixed MAX_MODE_SCHEDULE value.")
     benchmark = _build()
-    staged = _build("optimization")
+    staged = _build(args.mode)
     x = np.asarray(jax.device_get(benchmark.x0), dtype=float)
     off_residuals, off_jacobian = _evaluate(benchmark, x)
     staged_residuals, staged_jacobian = _evaluate(staged, x)
     residual_delta = np.asarray(jax.device_get(staged_residuals - off_residuals), dtype=float)
     jacobian_delta = np.asarray(jax.device_get(staged_jacobian - off_jacobian), dtype=float)
+    print(f"[parity] mode={args.mode}", flush=True)
     print(f"[parity] residual_max_abs={np.max(np.abs(residual_delta)):.16e}", flush=True)
     print(f"[parity] jacobian_max_abs={np.max(np.abs(jacobian_delta)):.16e}", flush=True)
     np.testing.assert_allclose(staged_residuals, off_residuals, rtol=1.0e-11, atol=1.0e-12)

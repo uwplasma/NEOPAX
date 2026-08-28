@@ -413,6 +413,7 @@ def main() -> int:
             "off",
             "optimization",
             "optimization_root_experiment",
+            "optimization_root_strict_experiment",
             "optimization_payload_experiment",
             "vmex_like",
         ),
