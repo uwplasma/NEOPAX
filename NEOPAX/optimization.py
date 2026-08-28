@@ -463,15 +463,23 @@ class GeometryInitialErRootLeastSquaresProblem:
             "optimization",
             "optimization_root_experiment",
             "optimization_root_strict_experiment",
+            "optimization_root_per_radius_experiment",
             "optimization_payload_experiment",
         }:
             evaluator_kwargs["transport_reverse_stage"] = self.optimization_stage
             evaluator_kwargs["use_selected_root_kernel"] = (
                 self.reverse_stage_mode
-                in {"optimization_root_experiment", "optimization_root_strict_experiment"}
+                in {
+                    "optimization_root_experiment",
+                    "optimization_root_strict_experiment",
+                    "optimization_root_per_radius_experiment",
+                }
             )
             evaluator_kwargs["use_strict_selected_root_kernel"] = (
                 self.reverse_stage_mode == "optimization_root_strict_experiment"
+            )
+            evaluator_kwargs["use_per_radius_selected_root_kernel"] = (
+                self.reverse_stage_mode == "optimization_root_per_radius_experiment"
             )
             if self.payload_assembly_stage is not None:
                 evaluator_kwargs["payload_assembly_stage"] = self.payload_assembly_stage
@@ -1309,13 +1317,14 @@ def geometry_initial_er_root_only_least_squares_problem(
         "optimization",
         "optimization_root_experiment",
         "optimization_root_strict_experiment",
+        "optimization_root_per_radius_experiment",
         "optimization_payload_experiment",
         "vmex_like",
     }:
         raise ValueError(
             "reverse_stage_mode must be 'off', 'optimization', "
             "'optimization_root_experiment', 'optimization_root_strict_experiment', "
-            "'optimization_payload_experiment', or 'vmex_like'."
+            "'optimization_root_per_radius_experiment', 'optimization_payload_experiment', or 'vmex_like'."
         )
     if mode == "vmex_like":
         raise NotImplementedError(
@@ -1399,6 +1408,7 @@ def geometry_initial_er_root_only_least_squares_problem(
         "optimization",
         "optimization_root_experiment",
         "optimization_root_strict_experiment",
+        "optimization_root_per_radius_experiment",
         "optimization_payload_experiment",
     }:
         stage_support_payload = find_ntx_support_payload(runtime)

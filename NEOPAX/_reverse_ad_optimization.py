@@ -16,7 +16,9 @@ from typing import Any, Literal
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 
+from ._ambipolarity import AMBIPOLARITY_MODEL_REGISTRY, _ambipolarity_local_charge_flux_setup
 from ._constants import elementary_charge
 from ._reverse_ad_parameters import (
     PROFILE_PARAMETER_ORDER,
@@ -41,6 +43,7 @@ from ._reverse_ad_initial_er import (
     initial_er_charge_flux_residual_er_derivative,
     initial_er_charge_flux_residual_scalar,
     initial_er_charge_flux_residuals,
+    initial_er_root_setup,
     initial_er_selected_root_profile,
     runtime_with_geometry_payload,
     runtime_with_ntx_support_payload,
@@ -830,6 +833,7 @@ class InitialErTransportReverseStage:
     payload_adapter: InitialErTransportPayloadAdapter
     selected_root: Callable[..., Any]
     selected_root_strict: Callable[..., Any]
+    selected_root_per_radius: Callable[..., Any]
     state_pullback: Callable[..., Any]
     geometry_pullback: Callable[..., Any]
     support_pullback: Callable[..., Any]
@@ -870,6 +874,118 @@ def build_initial_er_transport_reverse_stage(
             config=dict(config),
             runtime=_runtime_from_leaves(geometry_leaves, support_leaves),
         )
+
+    # This deliberately lives only in the optimization stage.  The benchmark
+    # implementation retains its existing radial lax.map route unchanged.
+    # Here each radius is an independently cached bounded computation, rather
+    # than compiling the whole selected-root profile as one program.
+    try:
+        stage_r_grid = np.asarray(runtime.geometry.r_grid_half)
+        skip_axis_root = bool(stage_r_grid.size and abs(float(stage_r_grid[0])) <= 1.0e-14)
+    except Exception:
+        skip_axis_root = False
+
+    def _single_radius_root(state, radius_index, geometry_leaves, support_leaves):
+        runtime_current = _runtime_from_leaves(geometry_leaves, support_leaves)
+        amb_cfg, model_name, _entropy_model, params = initial_er_root_setup(
+            dict(config), runtime_current
+        )
+        (
+            _n_radial,
+            _runtime_skip_axis_root,
+            _local_particle_flux,
+            gamma_func_factory,
+            entropy_func_factory,
+        ) = _ambipolarity_local_charge_flux_setup(
+            state,
+            params,
+            runtime_current.models.flux,
+            amb_cfg,
+        )
+        del _n_radial, _runtime_skip_axis_root, _local_particle_flux
+        root_finder = AMBIPOLARITY_MODEL_REGISTRY.get(str(model_name).strip().lower())
+        if root_finder is None:
+            raise ValueError(f"Unknown ambipolarity model: {model_name}")
+        model_name_normalized = str(model_name).strip().lower()
+
+        if model_name_normalized in ("two_stage", "adaptive"):
+            max_roots = int(amb_cfg.get("er_ambipolar_max_roots", 3))
+            zero_roots = jnp.full((max_roots,), jnp.nan, dtype=jnp.float64).at[0].set(0.0)
+            zero_entropies = jnp.zeros((max_roots,), dtype=jnp.float64)
+            zero_best = jnp.asarray(0.0, dtype=jnp.float64)
+            zero_count = jnp.asarray(1, dtype=jnp.int32)
+
+            def _skip_center(_):
+                return zero_roots, zero_entropies, zero_best, zero_count
+
+            def _run_root_finder(_):
+                arguments = {
+                    "Er_range": (
+                        float(amb_cfg.get("er_ambipolar_scan_min", -20.0)),
+                        float(amb_cfg.get("er_ambipolar_scan_max", 20.0)),
+                    ),
+                    "n_coarse": int(amb_cfg.get("er_ambipolar_n_coarse", 24)),
+                    "n_refine": int(amb_cfg.get("er_ambipolar_n_refine", 8)),
+                    "max_roots": max_roots,
+                    "tol": float(amb_cfg.get("er_ambipolar_tol", 1.0e-6)),
+                    "x_tol": float(amb_cfg.get("er_ambipolar_x_tol", 1.0e-6)),
+                    "maxiter": int(amb_cfg.get("er_ambipolar_maxiter", 12)),
+                    "er_scan_batch_mode": amb_cfg.get("er_ambipolar_scan_batch_mode", "vmap"),
+                    "er_scan_batch_size": amb_cfg.get("er_ambipolar_scan_batch_size"),
+                    "Gamma_func": gamma_func_factory(radius_index),
+                    "entropy_func": entropy_func_factory(radius_index),
+                }
+                if model_name_normalized == "adaptive":
+                    arguments.update(
+                        {
+                            "n_init": int(amb_cfg.get("er_ambipolar_adaptive_n_init", 16)),
+                            "n_subdiv": int(amb_cfg.get("er_ambipolar_adaptive_n_subdiv", 2)),
+                            "n_rounds": int(amb_cfg.get("er_ambipolar_adaptive_n_rounds", 2)),
+                            "max_brackets": int(amb_cfg.get("er_ambipolar_adaptive_max_brackets", 24)),
+                        }
+                    )
+                    arguments.pop("n_coarse", None)
+                return root_finder(**arguments)
+
+            if skip_axis_root:
+                return jax.lax.cond(
+                    jnp.asarray(radius_index, dtype=jnp.int32) == 0,
+                    _skip_center,
+                    _run_root_finder,
+                    operand=None,
+                )
+            return _run_root_finder(None)
+
+        if model_name_normalized in ("multistart", "multistart_clustered"):
+            return root_finder(
+                Gamma_func=gamma_func_factory(radius_index),
+                entropy_func=entropy_func_factory(radius_index),
+                Er_range=(
+                    float(amb_cfg.get("er_ambipolar_scan_min", -20.0)),
+                    float(amb_cfg.get("er_ambipolar_scan_max", 20.0)),
+                ),
+                n_starts=int(amb_cfg.get("er_ambipolar_n_starts", 32)),
+                tol=float(amb_cfg.get("er_ambipolar_tol", 1.0e-6)),
+                maxiter=int(amb_cfg.get("er_ambipolar_maxiter", 12)),
+                cluster_tol=float(amb_cfg.get("er_ambipolar_cluster_tol", 1.0e-3)),
+            )
+        raise ValueError(f"Ambipolarity model '{model_name}' not recognized or not implemented.")
+
+    single_radius_root = jax.jit(_single_radius_root, inline=False)
+
+    def _selected_root_per_radius(state, geometry_leaves, support_leaves):
+        root_rows = tuple(
+            single_radius_root(
+                state,
+                jnp.asarray(radius_index, dtype=jnp.int32),
+                geometry_leaves,
+                support_leaves,
+            )
+            for radius_index in range(int(jnp.asarray(state.Er).shape[0]))
+        )
+        best_roots = jnp.stack(tuple(row[2] for row in root_rows))
+        finite_mask = jnp.isfinite(best_roots)
+        return jnp.where(finite_mask, best_roots, state.Er), finite_mask
 
     def _geometry_pullback(
         state,
@@ -922,6 +1038,7 @@ def build_initial_er_transport_reverse_stage(
             inline=False,
             compiler_options={"xla_cpu_enable_fast_math": False},
         ),
+        selected_root_per_radius=_selected_root_per_radius,
         state_pullback=jax.jit(_state_pullback, inline=False),
         geometry_pullback=jax.jit(_geometry_pullback, inline=False),
         support_pullback=jax.jit(_support_pullback, inline=False),
@@ -1926,6 +2043,7 @@ def _optimization_root_to_payload_cotangents(
     transport_reverse_stage: InitialErTransportReverseStage | None = None,
     use_selected_root_kernel: bool = False,
     use_strict_selected_root_kernel: bool = False,
+    use_per_radius_selected_root_kernel: bool = False,
 ):
     transport_payload_adapter = (
         None if transport_reverse_stage is None else transport_reverse_stage.payload_adapter
@@ -1974,9 +2092,13 @@ def _optimization_root_to_payload_cotangents(
         )
     else:
         selected_root = (
-            transport_reverse_stage.selected_root_strict
-            if use_strict_selected_root_kernel
-            else transport_reverse_stage.selected_root
+            transport_reverse_stage.selected_root_per_radius
+            if use_per_radius_selected_root_kernel
+            else (
+                transport_reverse_stage.selected_root_strict
+                if use_strict_selected_root_kernel
+                else transport_reverse_stage.selected_root
+            )
         )
         er_profile, finite_mask = selected_root(
             pre_root_state,
@@ -2214,6 +2336,7 @@ def geometry_active_initial_er_root_only_reverse_table_optimization(
     transport_reverse_stage: InitialErTransportReverseStage | None = None,
     use_selected_root_kernel: bool = False,
     use_strict_selected_root_kernel: bool = False,
+    use_per_radius_selected_root_kernel: bool = False,
     payload_assembly_stage=None,
 ) -> ObjectiveTableResult:
     """Return compact initial-Er objective table for active realtime geometry.
@@ -2288,6 +2411,7 @@ def geometry_active_initial_er_root_only_reverse_table_optimization(
         transport_reverse_stage=transport_reverse_stage,
         use_selected_root_kernel=use_selected_root_kernel,
         use_strict_selected_root_kernel=use_strict_selected_root_kernel,
+        use_per_radius_selected_root_kernel=use_per_radius_selected_root_kernel,
     )
     if optimization_stage is None:
         root_args["raw_block_solve"] = raw_block_solve
@@ -3035,6 +3159,7 @@ def evaluate_geometry_initial_er_root_only_least_squares_optimization(
     transport_reverse_stage: InitialErTransportReverseStage | None = None,
     use_selected_root_kernel: bool = False,
     use_strict_selected_root_kernel: bool = False,
+    use_per_radius_selected_root_kernel: bool = False,
     payload_assembly_stage=None,
 ) -> LeastSquaresEvaluation:
     """Evaluate mixed objectives using only benchmark-validated table backends."""
@@ -3111,6 +3236,7 @@ def evaluate_geometry_initial_er_root_only_least_squares_optimization(
                 transport_reverse_stage=transport_reverse_stage,
                 use_selected_root_kernel=use_selected_root_kernel,
                 use_strict_selected_root_kernel=use_strict_selected_root_kernel,
+                use_per_radius_selected_root_kernel=use_per_radius_selected_root_kernel,
                 payload_assembly_stage=payload_assembly_stage,
             )
             transport_values, transport_jacobian = jax.block_until_ready(
