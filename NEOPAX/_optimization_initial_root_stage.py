@@ -8,11 +8,8 @@ the established root, payload, and VMEC reverse rules.
 from __future__ import annotations
 
 import dataclasses
-import functools
 from collections.abc import Callable, Sequence
 from typing import Any
-
-import jax
 
 from ._geometry_autodiff import (
     GeometryRawBlockSolve,
@@ -88,10 +85,7 @@ class InitialRootReverseOptimizationStage:
 class InitialRootReverseDependencies:
     """Existing benchmark operations used by optimization-only adapters."""
 
-    add_float_delta_tree: Callable[..., Any]
-    runtime_with_geometry_payload: Callable[..., Any]
-    runtime_with_ntx_support_payload: Callable[..., Any]
-    initial_er_charge_flux_residuals: Callable[..., Any]
+    root_geometry_residual_pullback: Callable[..., Any]
 
     def __post_init__(self) -> None:
         for field in dataclasses.fields(self):
@@ -99,53 +93,19 @@ class InitialRootReverseDependencies:
                 raise TypeError(f"{field.name} must be callable.")
 
 
-def _root_geometry_residual_pullback_optimization(
-    pre_root_state,
-    er_profile,
-    current_geometry,
-    current_support,
-    residual_bars,
-    geometry_delta,
-    *,
-    runtime_static,
-    dependencies: InitialRootReverseDependencies,
-):
-    """Exact benchmark delta-only root-geometry VJP, for a bounded stage.
-
-    The VJP has *one* differentiated primal, ``geometry_delta``.  The current
-    state, selected root, geometry, and support are deliberately captured by
-    the local residual function exactly as they are in the benchmark path.
-    This function is the body of one optimization-only JIT boundary; it is
-    not an all-input VJP and does not change the benchmark implementation.
-    """
-
-    def residuals_from_geometry_delta(delta):
-        geometry = dependencies.add_float_delta_tree(current_geometry, delta)
-        runtime = dependencies.runtime_with_geometry_payload(runtime_static, geometry)
-        runtime = dependencies.runtime_with_ntx_support_payload(runtime, current_support)
-        return dependencies.initial_er_charge_flux_residuals(
-            pre_root_state,
-            er_profile,
-            runtime=runtime,
-        )
-
-    _, pullback = jax.vjp(residuals_from_geometry_delta, geometry_delta)
-    return jax.vmap(lambda bars: pullback(bars)[0])(residual_bars)
-
-
 def build_initial_root_reverse_kernels_optimization(
     *,
     neoclassical_model: Any,
-    runtime_static: Any,
     dependencies: InitialRootReverseDependencies,
 ) -> InitialRootReverseKernelSet:
     """Create stable optimization-only adapters for the measured boundaries.
 
-    ``neoclassical_model`` and ``runtime_static`` are stage-static. Each
-    returned callable receives current trial data explicitly. The root-
-    geometry adapter is one bounded optimization-only compilation boundary,
-    but preserves the benchmark's narrow delta-only VJP internally. It does
-    not turn the operation into an all-input VJP.
+    ``neoclassical_model`` is stage-static. Each returned callable receives
+    the current trial's state, geometry, support, and cotangents explicitly.
+    The root-geometry adapter delegates to the *narrow*, delta-only benchmark
+    pullback supplied by the caller. It deliberately does not turn that into
+    an all-input VJP with stopped arguments: such a rewrite would enlarge the
+    transformed argument tree and has not been shown to improve cache reuse.
     """
 
     if not dataclasses.is_dataclass(neoclassical_model):
@@ -202,13 +162,24 @@ def build_initial_root_reverse_kernels_optimization(
             support,
         )
 
-    root_geometry_residual_pullback_optimization = jax.jit(
-        functools.partial(
-            _root_geometry_residual_pullback_optimization,
-            runtime_static=runtime_static,
-            dependencies=dependencies,
+    def root_geometry_residual_pullback_optimization(
+        pre_root_state,
+        er_profile,
+        current_geometry,
+        current_support,
+        residual_bars,
+        geometry_delta,
+    ):
+        """Return geometry bars through the benchmark's delta-only VJP."""
+
+        return dependencies.root_geometry_residual_pullback(
+            pre_root_state,
+            er_profile,
+            current_geometry,
+            current_support,
+            residual_bars,
+            geometry_delta,
         )
-    )
 
     return InitialRootReverseKernelSet(
         corrected_bootstrap_fluxes=corrected_bootstrap_fluxes_optimization,

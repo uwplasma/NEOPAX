@@ -180,14 +180,12 @@ def test_initial_root_reverse_kernel_adapters_keep_trial_geometry_and_support_dy
             return ("support", state, bars, support, self.geometry, self.support)
 
     dependencies = initial_root_stage.InitialRootReverseDependencies(
-        add_float_delta_tree=lambda base, delta: base + delta,
-        runtime_with_geometry_payload=lambda _runtime, geometry: geometry,
-        runtime_with_ntx_support_payload=lambda geometry, support: (geometry, support),
-        initial_er_charge_flux_residuals=lambda _state, er, *, runtime: runtime[0] + er[0],
+        root_geometry_residual_pullback=(
+            lambda _state, _er, _geometry, _support, bars, _delta: bars
+        ),
     )
     kernels = initial_root_stage.build_initial_root_reverse_kernels_optimization(
         neoclassical_model=Model(geometry="static-geometry", support="static-support"),
-        runtime_static=object(),
         dependencies=dependencies,
     )
 
