@@ -44,12 +44,21 @@ DEFAULT_REPEATS = 8
 
 
 def _terms_for_objective_set(objective_set: str):
-    """Keep geometry terms and select transport rows for branch attribution."""
+    """Select exactly one geometry/initial-root reverse branch for attribution."""
 
     selected = []
     for term in example.terms:
         objective = getattr(term[0], "objective", term[0])
-        if objective.family != "transport":
+        is_transport = objective.family == "transport"
+        if objective_set == "geometry_only":
+            if not is_transport:
+                selected.append(term)
+            continue
+        if objective_set == "transport_er_only":
+            if is_transport and objective.name != "bootstrap_current_softmax_abs_scaled":
+                selected.append(term)
+            continue
+        if not is_transport:
             selected.append(term)
             continue
         is_bootstrap = objective.name == "bootstrap_current_softmax_abs_scaled"
@@ -401,9 +410,18 @@ def main() -> int:
     parser.add_argument("--mode", choices=("off", "vmex_like"), default="off")
     parser.add_argument(
         "--objective-set",
-        choices=("all", "er_only", "bootstrap_only"),
+        choices=(
+            "all",
+            "er_only",
+            "bootstrap_only",
+            "geometry_only",
+            "transport_er_only",
+        ),
         default="all",
-        help="Keep geometry terms and select all, Er-only, or bootstrap-only transport rows.",
+        help=(
+            "Select all rows; geometry plus Er-only or bootstrap-only rows; or exactly "
+            "geometry-only / Er-transport-only rows for memory attribution."
+        ),
     )
     parser.add_argument("--warmup", type=int, default=DEFAULT_WARMUP)
     parser.add_argument("--repeats", type=int, default=DEFAULT_REPEATS)
