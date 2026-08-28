@@ -211,3 +211,39 @@ def test_initial_root_reverse_kernel_adapters_keep_trial_geometry_and_support_dy
         jnp.zeros((2,)),
     )
     assert jnp.array_equal(geometry_bars, jnp.asarray([[1.0, 2.0], [3.0, 4.0]]))
+
+
+def test_initial_er_transport_payload_adapter_rebuilds_only_floating_trial_leaves():
+    baseline = {
+        "geometry": {
+            "metric": jnp.asarray([1.0, 2.0]),
+            "mode_numbers": jnp.asarray([0, 1], dtype=jnp.int32),
+            "label": "fixed",
+        },
+        "ntx_support": {
+            "coefficients": jnp.asarray([[3.0]]),
+            "radial_index": jnp.asarray([4], dtype=jnp.int32),
+        },
+    }
+    adapter = initial_root_stage.InitialErTransportPayloadAdapter.from_payload(baseline)
+
+    trial = {
+        "geometry": {
+            "metric": jnp.asarray([5.0, 6.0]),
+            "mode_numbers": jnp.asarray([0, 1], dtype=jnp.int32),
+            "label": "fixed",
+        },
+        "ntx_support": {
+            "coefficients": jnp.asarray([[7.0]]),
+            "radial_index": jnp.asarray([4], dtype=jnp.int32),
+        },
+    }
+    geometry_leaves, support_leaves = adapter.dynamic_leaves(trial)
+    rebuilt = adapter.rebuild(geometry_leaves, support_leaves)
+
+    assert len(geometry_leaves) == 1
+    assert len(support_leaves) == 1
+    assert jnp.array_equal(rebuilt["geometry"]["metric"], trial["geometry"]["metric"])
+    assert jnp.array_equal(rebuilt["ntx_support"]["coefficients"], trial["ntx_support"]["coefficients"])
+    assert rebuilt["geometry"]["label"] == "fixed"
+    assert jnp.array_equal(rebuilt["geometry"]["mode_numbers"], baseline["geometry"]["mode_numbers"])

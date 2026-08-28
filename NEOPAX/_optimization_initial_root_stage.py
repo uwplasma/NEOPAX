@@ -11,6 +11,9 @@ import dataclasses
 from collections.abc import Callable, Sequence
 from typing import Any
 
+import jax
+import jax.numpy as jnp
+
 from ._geometry_autodiff import (
     GeometryRawBlockSolve,
     GeometryRawBlockStage,
@@ -29,6 +32,110 @@ class InitialRootStageLayout:
     n_xi: int
     surface_backend: str
     flux_model: str
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class FloatingPayloadLeafLayout:
+    """Fixed payload structure with only inexact leaves supplied per trial.
+
+    Geometry and NTX support dataclasses contain both numerical arrays and
+    static metadata (mode indices, dimensions, and Python configuration).  A
+    full-pytree JAX argument is therefore not a valid optimization boundary:
+    JAX replaces static leaves while tracing reverse transforms.  This layout
+    keeps that metadata stage-static and exposes only floating-point leaves as
+    trial inputs.
+
+    It is deliberately an optimization-only utility.  The benchmark reverse
+    path continues to receive its existing geometry/support payloads.
+    """
+
+    treedef: Any
+    floating_mask: tuple[bool, ...]
+    static_leaves: tuple[Any, ...]
+
+    @staticmethod
+    def _is_floating_leaf(leaf: Any) -> bool:
+        try:
+            dtype = jnp.asarray(leaf).dtype
+        except (TypeError, ValueError):
+            return False
+        return bool(jnp.issubdtype(dtype, jnp.inexact))
+
+    @classmethod
+    def from_template(cls, payload: Any) -> "FloatingPayloadLeafLayout":
+        leaves, treedef = jax.tree_util.tree_flatten(payload)
+        floating_mask = tuple(cls._is_floating_leaf(leaf) for leaf in leaves)
+        static_leaves = tuple(
+            None if is_floating else leaf
+            for leaf, is_floating in zip(leaves, floating_mask, strict=True)
+        )
+        return cls(
+            treedef=treedef,
+            floating_mask=floating_mask,
+            static_leaves=static_leaves,
+        )
+
+    def floating_leaves(self, payload: Any) -> tuple[Any, ...]:
+        leaves, treedef = jax.tree_util.tree_flatten(payload)
+        if treedef != self.treedef or len(leaves) != len(self.floating_mask):
+            raise ValueError("Initial-Er optimization payload structure changed within a stage.")
+        return tuple(
+            jnp.asarray(leaf)
+            for leaf, is_floating in zip(leaves, self.floating_mask, strict=True)
+            if is_floating
+        )
+
+    def rebuild(self, floating_leaves: tuple[Any, ...]) -> Any:
+        expected_count = sum(self.floating_mask)
+        if len(floating_leaves) != expected_count:
+            raise ValueError(
+                "Initial-Er optimization floating payload leaf count changed: "
+                f"got {len(floating_leaves)}, expected {expected_count}."
+            )
+        dynamic_leaves = iter(floating_leaves)
+        leaves = tuple(
+            next(dynamic_leaves) if is_floating else static_leaf
+            for is_floating, static_leaf in zip(
+                self.floating_mask, self.static_leaves, strict=True
+            )
+        )
+        return self.treedef.unflatten(leaves)
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class InitialErTransportPayloadAdapter:
+    """Stage-owned, trial-data-free adapter for geometry and NTX support."""
+
+    geometry_layout: FloatingPayloadLeafLayout
+    support_layout: FloatingPayloadLeafLayout
+
+    @classmethod
+    def from_payload(cls, payload: dict[str, Any]) -> "InitialErTransportPayloadAdapter":
+        try:
+            geometry = payload["geometry"]
+            support = payload["ntx_support"]
+        except KeyError as exc:
+            raise ValueError("Initial-Er transport payload requires geometry and ntx_support.") from exc
+        return cls(
+            geometry_layout=FloatingPayloadLeafLayout.from_template(geometry),
+            support_layout=FloatingPayloadLeafLayout.from_template(support),
+        )
+
+    def dynamic_leaves(self, payload: dict[str, Any]) -> tuple[tuple[Any, ...], tuple[Any, ...]]:
+        return (
+            self.geometry_layout.floating_leaves(payload["geometry"]),
+            self.support_layout.floating_leaves(payload["ntx_support"]),
+        )
+
+    def rebuild(
+        self,
+        geometry_leaves: tuple[Any, ...],
+        support_leaves: tuple[Any, ...],
+    ) -> dict[str, Any]:
+        return {
+            "geometry": self.geometry_layout.rebuild(geometry_leaves),
+            "ntx_support": self.support_layout.rebuild(support_leaves),
+        }
 
 
 @dataclasses.dataclass(frozen=True, slots=True)

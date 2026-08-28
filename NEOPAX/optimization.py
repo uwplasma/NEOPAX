@@ -44,7 +44,6 @@ from ._reverse_ad_optimization import (
     evaluate_transport_realtime_geometry_least_squares,
     evaluate_geometry_initial_er_root_only_least_squares_benchmark_tables,
     evaluate_geometry_initial_er_root_only_least_squares_optimization,
-    build_initial_er_root_optimization_operators,
     _optimization_root_to_payload_cotangents,
     _optimization_payload_to_vmec_table,
     geometry,
@@ -56,6 +55,7 @@ from ._reverse_ad_optimization import (
     transport,
 )
 from ._optimization_initial_root_stage import (
+    InitialErTransportPayloadAdapter,
     build_compiled_geometry_initial_root_stage,
     build_geometry_initial_root_optimization_stage,
     initial_root_stage_layout,
@@ -457,7 +457,7 @@ class GeometryInitialErRootLeastSquaresProblem:
             raw_block_stage=self.raw_block_stage,
         )
         if self.reverse_stage_mode == "optimization":
-            evaluator_kwargs["optimization_stage"] = self.optimization_stage
+            evaluator_kwargs["transport_payload_adapter"] = self.optimization_stage
         base_evaluation = evaluator(self.config, **evaluator_kwargs)
         result = _assemble_mixed_initial_er_root_result(
             self.terms,
@@ -1369,18 +1369,13 @@ def geometry_initial_er_root_only_least_squares_problem(
     optimization_stage_layout = None
     optimization_stage = None
     if mode == "optimization":
-        transport_objectives = tuple(
-            term.objective.name
-            for term in normalized_terms
-            if isinstance(term, LeastSquaresTerm)
-            and term.objective.family == "transport"
-            and term.objective.name != "bootstrap_current_softmax_abs_scaled"
-        )
-        optimization_stage = build_initial_er_root_optimization_operators(
-            runtime=runtime,
-            generic_objectives=transport_objectives,
-            options=root_options,
-        )
+        stage_support_payload = find_ntx_support_payload(runtime)
+        if not isinstance(stage_support_payload, dict):
+            stage_support_payload = {
+                "geometry": runtime.geometry,
+                "ntx_support": stage_support_payload,
+            }
+        optimization_stage = InitialErTransportPayloadAdapter.from_payload(stage_support_payload)
     if mode == "vmex_like":
         normalized_stage_terms = normalize_least_squares_terms(terms)
         optimization_stage_layout = initial_root_stage_layout(

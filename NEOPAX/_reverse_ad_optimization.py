@@ -59,6 +59,7 @@ from ._reverse_ad_transport import (
     realtime_geometry_transport_reverse_table_request,
     transport_realtime_geometry_reverse_table,
 )
+from ._optimization_initial_root_stage import raw_block_dynamic_payload
 
 
 ObjectiveFamily = Literal["transport", "geometry", "regularization"]
@@ -764,6 +765,56 @@ def _initial_er_root_only_objective_values(
     return jnp.stack([_one(name) for name in names])
 
 
+_DIRECT_INITIAL_ER_OBJECTIVES = frozenset(
+    ("softmax_Er", "Er_transition_left", "Er_transition_right")
+)
+
+
+def _direct_initial_er_objective_values_and_state_bars(
+    state,
+    objective_names: Sequence[str],
+    *,
+    options: Mapping[str, object] | None = None,
+):
+    """Return exact Er-only objective values and their state cotangent rows.
+
+    These three objectives depend only on the selected Er vector.  Their
+    closed-form rows are algebraically identical to the generic VJP used by
+    the benchmark path, but avoid constructing that VJP in the opt-in
+    optimization route.  Geometry and NTX-support direct bars are exactly
+    zero for this restricted objective set.
+    """
+
+    names = tuple(objective_names)
+    unsupported = tuple(name for name in names if name not in _DIRECT_INITIAL_ER_OBJECTIVES)
+    if unsupported:
+        raise ValueError(f"Direct initial-Er rows do not support {unsupported!r}.")
+    opts = {} if options is None else options
+    er = jnp.asarray(state.Er)
+    beta = jnp.asarray(float(opts.get("softmax_Er_beta", 16.0)), dtype=er.dtype)
+    left_index = max(0, min(int(opts.get("Er_transition_left_index", 20)), int(er.shape[0]) - 1))
+    right_index = max(0, min(int(opts.get("Er_transition_right_index", 21)), int(er.shape[0]) - 1))
+
+    def _zero_leaf(leaf):
+        return jnp.zeros_like(jnp.asarray(leaf))
+
+    zero_state = jax.tree_util.tree_map(_zero_leaf, state)
+    values = []
+    rows = []
+    for name in names:
+        if name == "softmax_Er":
+            values.append(jax.scipy.special.logsumexp(beta * er) / beta)
+            er_bar = jax.nn.softmax(beta * er)
+        elif name == "Er_transition_left":
+            values.append(er[left_index])
+            er_bar = jnp.zeros_like(er).at[left_index].set(1.0)
+        else:
+            values.append(er[right_index])
+            er_bar = jnp.zeros_like(er).at[right_index].set(1.0)
+        rows.append(dataclasses.replace(zero_state, Er=er_bar))
+    return jnp.stack(values), _stack_tree_rows(rows)
+
+
 def initial_er_root_only_reverse_table(
     request: InitialErRootOnlyReverseTableRequest,
 ) -> ObjectiveTableResult:
@@ -1038,24 +1089,15 @@ def initial_er_root_only_objective_cotangent_table(
     generic_direct_geometry_bars = None
     generic_value_lookup = {name: i for i, name in enumerate(generic_objectives)}
     if generic_objectives:
-        if reverse_operators is None:
-            generic_values, objective_pullback = jax.vjp(
-                _values_from_rooted_state_and_geometry,
-                rooted_state,
-                geometry_delta0,
-            )
-        else:
-            generic_values, objective_pullback = jax.vjp(
-                reverse_operators.generic_objective_values,
-                rooted_state,
-                geometry_delta0,
-                reverse_operators.geometry_layout.extract_floating(baseline_geometry),
-                reverse_operators.support_layout.extract_floating(baseline_ntx_support),
-            )
+        generic_values, objective_pullback = jax.vjp(
+            _values_from_rooted_state_and_geometry,
+            rooted_state,
+            geometry_delta0,
+        )
         generic_basis = jnp.eye(len(generic_objectives), dtype=jnp.asarray(generic_values).dtype)
-        generic_bars = jax.vmap(lambda cotangent: objective_pullback(cotangent))(generic_basis)
-        generic_rooted_state_bars = generic_bars[0]
-        generic_direct_geometry_bars = generic_bars[1]
+        generic_rooted_state_bars, generic_direct_geometry_bars = jax.vmap(
+            lambda cotangent: objective_pullback(cotangent)
+        )(generic_basis)
 
     bootstrap_row = None
     if _BOOTSTRAP_CURRENT_OBJECTIVE in requested_objectives:
@@ -1762,119 +1804,13 @@ def _optimization_payload_to_vmec_table(
     )
 
 
-@dataclasses.dataclass(frozen=True, slots=True)
-class _FloatLeafPytreeLayout:
-    """Rebuild a payload pytree from dynamic floating leaves only.
-
-    NTX payload objects carry static metadata that cannot be a VJP argument.
-    This layout retains just that static skeleton; each trial supplies every
-    floating leaf explicitly.  It therefore avoids both a full-pytree VJP and
-    a closure over the current trial payload.
-    """
-
-    treedef: Any
-    floating: tuple[bool, ...]
-    static_leaves: tuple[Any, ...]
-
-    @classmethod
-    def from_template(cls, tree):
-        leaves, treedef = jax.tree_util.tree_flatten(tree)
-        floating = []
-        static_leaves = []
-        for leaf in leaves:
-            arr = jnp.asarray(leaf)
-            is_floating = bool(jnp.issubdtype(arr.dtype, jnp.inexact))
-            floating.append(is_floating)
-            static_leaves.append(None if is_floating else leaf)
-        return cls(treedef=treedef, floating=tuple(floating), static_leaves=tuple(static_leaves))
-
-    def extract_floating(self, tree) -> tuple[Any, ...]:
-        leaves, treedef = jax.tree_util.tree_flatten(tree)
-        if treedef != self.treedef or len(leaves) != len(self.floating):
-            raise ValueError("Initial-Er optimization payload structure changed within one stage.")
-        return tuple(jnp.asarray(leaf) for leaf, is_floating in zip(leaves, self.floating, strict=True) if is_floating)
-
-    def rebuild(self, floating_leaves: tuple[Any, ...]):
-        expected = sum(self.floating)
-        if len(floating_leaves) != expected:
-            raise ValueError(
-                "Initial-Er optimization floating payload leaf count changed; "
-                f"got {len(floating_leaves)}, expected {expected}."
-            )
-        dynamic_iter = iter(floating_leaves)
-        leaves = [
-            next(dynamic_iter) if is_floating else static_leaf
-            for is_floating, static_leaf in zip(self.floating, self.static_leaves, strict=True)
-        ]
-        return self.treedef.unflatten(leaves)
-
-
-@dataclasses.dataclass(frozen=True, slots=True)
-class InitialErRootOptimizationOperators:
-    """Stable optimization-only VJP operators for a fixed initial-Er stage."""
-
-    geometry_layout: _FloatLeafPytreeLayout
-    support_layout: _FloatLeafPytreeLayout
-    generic_objective_values: Callable[..., Any]
-    root_geometry_residuals: Callable[..., Any]
-
-
-def build_initial_er_root_optimization_operators(
-    *, runtime, generic_objectives: Sequence[str], options: Mapping[str, object] | None
-) -> InitialErRootOptimizationOperators:
-    """Build stable narrow-VJP operators without retaining trial payloads."""
-
-    support_payload = find_ntx_support_payload(runtime)
-    if not isinstance(support_payload, dict):
-        support_payload = {"geometry": runtime.geometry, "ntx_support": support_payload}
-    geometry_layout = _FloatLeafPytreeLayout.from_template(support_payload["geometry"])
-    support_layout = _FloatLeafPytreeLayout.from_template(support_payload["ntx_support"])
-    names = tuple(str(name) for name in generic_objectives)
-    stage_options = None if options is None else dict(options)
-
-    def generic_objective_values(state_value, geometry_delta, geometry_leaves, support_leaves):
-        geometry_base = geometry_layout.rebuild(geometry_leaves)
-        support_base = support_layout.rebuild(support_leaves)
-        geometry = _add_float_delta_tree(
-            jax.tree_util.tree_map(jax.lax.stop_gradient, geometry_base), geometry_delta
-        )
-        support = jax.tree_util.tree_map(jax.lax.stop_gradient, support_base)
-        runtime_with_geometry = runtime_with_geometry_payload(runtime, geometry)
-        runtime_with_geometry = runtime_with_ntx_support_payload(runtime_with_geometry, support)
-        return _initial_er_root_only_objective_values(
-            state_value, runtime_with_geometry, names, options=stage_options
-        )
-
-    def root_geometry_residuals(pre_root_state, er_profile, geometry_delta, geometry_leaves, support_leaves):
-        geometry_base = geometry_layout.rebuild(geometry_leaves)
-        support_base = support_layout.rebuild(support_leaves)
-        geometry = _add_float_delta_tree(
-            jax.tree_util.tree_map(jax.lax.stop_gradient, geometry_base), geometry_delta
-        )
-        support = jax.tree_util.tree_map(jax.lax.stop_gradient, support_base)
-        runtime_with_geometry = runtime_with_geometry_payload(runtime, geometry)
-        runtime_with_geometry = runtime_with_ntx_support_payload(runtime_with_geometry, support)
-        return initial_er_charge_flux_residuals(
-            jax.tree_util.tree_map(jax.lax.stop_gradient, pre_root_state),
-            jax.lax.stop_gradient(er_profile),
-            runtime=runtime_with_geometry,
-        )
-
-    return InitialErRootOptimizationOperators(
-        geometry_layout=geometry_layout,
-        support_layout=support_layout,
-        generic_objective_values=generic_objective_values,
-        root_geometry_residuals=root_geometry_residuals,
-    )
-
-
 def _optimization_root_to_payload_cotangents(
     *, config, requested_objectives, runtime, profile_values_arr,
     pre_root_state_from_profile_values, geometry_context, n_r, n_theta,
     n_zeta, n_xi, surface_backend, raw_block_solve, support_payload,
     use_runtime_payload, profile_specs, options, boozer_surface_sampling=None,
     r00_boozer_surface_sampling=None,
-    reverse_operators: InitialErRootOptimizationOperators | None = None,
+    transport_payload_adapter=None,
 ):
     if use_runtime_payload:
         baseline_geometry = support_payload["geometry"]
@@ -1893,9 +1829,18 @@ def _optimization_root_to_payload_cotangents(
         )
         baseline_geometry = current_payload["geometry"]
         baseline_ntx_support = current_payload["ntx_support"]
+    if transport_payload_adapter is not None:
+        stage_payload = transport_payload_adapter.rebuild(
+            *transport_payload_adapter.dynamic_leaves(
+                {"geometry": baseline_geometry, "ntx_support": baseline_ntx_support}
+            )
+        )
+        baseline_geometry = stage_payload["geometry"]
+        baseline_ntx_support = stage_payload["ntx_support"]
     runtime_for_geometry = runtime_with_geometry_payload(runtime, baseline_geometry)
     runtime_for_geometry = runtime_with_ntx_support_payload(runtime_for_geometry, baseline_ntx_support)
     geometry_delta0 = _float_delta_tree_like(baseline_geometry)
+    use_direct_er_rows = transport_payload_adapter is not None
 
     pre_root_state = pre_root_state_from_profile_values(profile_values_arr)
     er_profile, finite_mask = initial_er_selected_root_profile(
@@ -1925,7 +1870,23 @@ def _optimization_root_to_payload_cotangents(
     generic_rooted_state_bars = None
     generic_direct_geometry_bars = None
     generic_value_lookup = {name: i for i, name in enumerate(generic_objectives)}
-    if generic_objectives:
+    if generic_objectives and use_direct_er_rows and all(
+        name in _DIRECT_INITIAL_ER_OBJECTIVES for name in generic_objectives
+    ):
+        generic_values, generic_rooted_state_bars = _direct_initial_er_objective_values_and_state_bars(
+            rooted_state,
+            generic_objectives,
+            options=options,
+        )
+        generic_direct_geometry_bars = _float_delta_tree_like(baseline_geometry)
+        generic_direct_geometry_bars = jax.tree_util.tree_map(
+            lambda leaf: jnp.broadcast_to(
+                leaf,
+                (len(generic_objectives),) + jnp.asarray(leaf).shape,
+            ),
+            generic_direct_geometry_bars,
+        )
+    elif generic_objectives:
         generic_values, objective_pullback = jax.vjp(
             _values_from_rooted_state_and_geometry,
             rooted_state,
@@ -2031,26 +1992,13 @@ def _optimization_root_to_payload_cotangents(
             runtime=runtime_with_geometry,
         )
 
-    if reverse_operators is None:
-        _, geometry_residual_pullback = jax.vjp(
-            _residuals_from_geometry_delta,
-            geometry_delta0,
-        )
-        residual_geometry_bars = jax.vmap(
-            lambda residual_bar: geometry_residual_pullback(residual_bar)[0]
-        )(residual_bars)
-    else:
-        _, geometry_residual_pullback = jax.vjp(
-            reverse_operators.root_geometry_residuals,
-            pre_root_state,
-            er_profile,
-            geometry_delta0,
-            reverse_operators.geometry_layout.extract_floating(baseline_geometry),
-            reverse_operators.support_layout.extract_floating(baseline_ntx_support),
-        )
-        residual_geometry_bars = jax.vmap(
-            lambda residual_bar: geometry_residual_pullback(residual_bar)[2]
-        )(residual_bars)
+    _, geometry_residual_pullback = jax.vjp(
+        _residuals_from_geometry_delta,
+        geometry_delta0,
+    )
+    residual_geometry_bars = jax.vmap(
+        lambda residual_bar: geometry_residual_pullback(residual_bar)[0]
+    )(residual_bars)
     geometry_bars = _add_trees(direct_geometry_bars, residual_geometry_bars)
 
     ntx_runtime = runtime_with_geometry_payload(runtime_for_geometry, baseline_geometry)
@@ -2100,6 +2048,7 @@ def geometry_active_initial_er_root_only_reverse_table_optimization(
     support_payload_override=None,
     options: Mapping[str, object] | None = None,
     optimization_stage=None,
+    transport_payload_adapter=None,
 ) -> ObjectiveTableResult:
     """Return compact initial-Er objective table for active realtime geometry.
 
@@ -2155,6 +2104,8 @@ def geometry_active_initial_er_root_only_reverse_table_optimization(
 
     profile_specs = tuple(parameter_set.profile_specs)
 
+    root_operator = _optimization_root_to_payload_cotangents if optimization_stage is None else optimization_stage.root_to_payload
+    dynamic_payload = None if raw_block_solve is None else raw_block_dynamic_payload(raw_block_solve)
     root_args = dict(
         config=config,
         requested_objectives=requested_objectives,
@@ -2168,10 +2119,13 @@ def geometry_active_initial_er_root_only_reverse_table_optimization(
         use_runtime_payload=use_runtime_payload,
         profile_specs=profile_specs,
         options=options,
-        reverse_operators=optimization_stage,
+        transport_payload_adapter=transport_payload_adapter,
     )
-    root_args["raw_block_solve"] = raw_block_solve
-    root_result = _optimization_root_to_payload_cotangents(**root_args)
+    if optimization_stage is None:
+        root_args["raw_block_solve"] = raw_block_solve
+        root_result = root_operator(**root_args)
+    else:
+        root_result = root_operator(dynamic_payload, profile_values_arr)
     (
         objective_values, profile_gradient_matrix_for_payload, support_bars, objective_count,
     ) = root_result
@@ -2204,7 +2158,17 @@ def geometry_active_initial_er_root_only_reverse_table_optimization(
         raw_block_solve=raw_block_solve,
         return_branch_gradients=False,
     )
-    assembly_result = _optimization_payload_to_vmec_table(**payload_args)
+    payload_operator = _optimization_payload_to_vmec_table if optimization_stage is None else optimization_stage.payload_to_vmec
+    if optimization_stage is None:
+        assembly_result = payload_operator(**payload_args)
+    else:
+        assembly_result = payload_operator(
+            dynamic_payload,
+            baseline_geometry_deltas,
+            objective_values,
+            profile_gradient_matrix_for_payload,
+            support_bars,
+        )
 
     geometry_gradient_matrix = jnp.asarray(assembly_result.table_result.geometry_gradient_matrix)
     profile_gradient_matrix = jnp.asarray(assembly_result.table_result.profile_gradient_matrix)
@@ -2896,6 +2860,7 @@ def evaluate_geometry_initial_er_root_only_least_squares_optimization(
     root_options: Mapping[str, object] | None = None,
     raw_block_stage=None,
     optimization_stage=None,
+    transport_payload_adapter=None,
 ) -> LeastSquaresEvaluation:
     """Evaluate mixed objectives using only benchmark-validated table backends."""
 
@@ -2968,6 +2933,7 @@ def evaluate_geometry_initial_er_root_only_least_squares_optimization(
                 raw_block_solve=shared_raw_block_solve,
                 options=root_runner_options,
                 optimization_stage=optimization_stage,
+                transport_payload_adapter=transport_payload_adapter,
             )
             transport_values, transport_jacobian = jax.block_until_ready(
                 (transport_result.values, transport_result.jacobian)
