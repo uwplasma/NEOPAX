@@ -42,6 +42,29 @@ live JAX arrays.
 The payload pullback is entered after the large transport-support/root cache
 contribution already exists. Its own tangent map adds only one entry.
 
+## Narrow-geometry contract (implementation audit)
+
+The benchmark root-geometry reverse uses a **geometry-delta-only** VJP:
+the current pre-root state, selected `Er`, and NTX support are captured as
+primal context, and only a zero-shaped floating geometry delta is
+differentiated.  This is reverse AD, not finite differencing.  It is the
+correct partition because the state and support contributions are accumulated
+by their own compact pullbacks.
+
+An initial optimization-only adapter made all of those values explicit VJP
+arguments and applied `stop_gradient` to the non-geometry arguments.  The
+resulting numbers would be equivalent, but the transformed function has a
+larger input/cotangent tree.  It was removed before integration.  The stage
+adapter now delegates to the unchanged narrow delta-only pullback contract.
+
+This also establishes a limitation: retaining a Python stage callable alone
+cannot remove the cache slope, because the benchmark compact operations still
+create their own `jax.vjp` transformations per evaluation.  A valid next
+boundary must preserve the narrow geometry-delta VJP while making the *actual
+inner transformed kernels* reusable.  Do not replace it with a joint/direct
+state-support-geometry VJP merely to obtain a stable Python function identity;
+that risks a larger compilation and memory graph.
+
 ## Rejected causes
 
 - No duplicated geometry calculation per objective or DoF.
