@@ -1913,6 +1913,7 @@ def _optimization_root_to_payload_cotangents(
     use_runtime_payload, profile_specs, options, boozer_surface_sampling=None,
     r00_boozer_surface_sampling=None,
     transport_reverse_stage: InitialErTransportReverseStage | None = None,
+    use_selected_root_kernel: bool = False,
 ):
     transport_payload_adapter = (
         None if transport_reverse_stage is None else transport_reverse_stage.payload_adapter
@@ -1953,7 +1954,7 @@ def _optimization_root_to_payload_cotangents(
     use_direct_er_rows = transport_payload_adapter is not None
 
     pre_root_state = pre_root_state_from_profile_values(profile_values_arr)
-    if transport_reverse_stage is None:
+    if transport_reverse_stage is None or not use_selected_root_kernel:
         er_profile, finite_mask = initial_er_selected_root_profile(
             pre_root_state,
             config=dict(config),
@@ -2194,6 +2195,7 @@ def geometry_active_initial_er_root_only_reverse_table_optimization(
     options: Mapping[str, object] | None = None,
     optimization_stage=None,
     transport_reverse_stage: InitialErTransportReverseStage | None = None,
+    use_selected_root_kernel: bool = False,
     payload_assembly_stage=None,
 ) -> ObjectiveTableResult:
     """Return compact initial-Er objective table for active realtime geometry.
@@ -2266,6 +2268,7 @@ def geometry_active_initial_er_root_only_reverse_table_optimization(
         profile_specs=profile_specs,
         options=options,
         transport_reverse_stage=transport_reverse_stage,
+        use_selected_root_kernel=use_selected_root_kernel,
     )
     if optimization_stage is None:
         root_args["raw_block_solve"] = raw_block_solve
@@ -3011,6 +3014,7 @@ def evaluate_geometry_initial_er_root_only_least_squares_optimization(
     raw_block_stage=None,
     optimization_stage=None,
     transport_reverse_stage: InitialErTransportReverseStage | None = None,
+    use_selected_root_kernel: bool = False,
     payload_assembly_stage=None,
 ) -> LeastSquaresEvaluation:
     """Evaluate mixed objectives using only benchmark-validated table backends."""
@@ -3085,6 +3089,7 @@ def evaluate_geometry_initial_er_root_only_least_squares_optimization(
                 options=root_runner_options,
                 optimization_stage=optimization_stage,
                 transport_reverse_stage=transport_reverse_stage,
+                use_selected_root_kernel=use_selected_root_kernel,
                 payload_assembly_stage=payload_assembly_stage,
             )
             transport_values, transport_jacobian = jax.block_until_ready(
