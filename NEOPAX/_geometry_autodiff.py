@@ -958,11 +958,14 @@ def geometry_raw_block_solve_from_param_vector(
     base_implicit_params=None,
     implicit_params_from_deltas_runner: Callable[[Any], Any] | None = None,
     state_mask_stop_gradient_runner: Callable[[Any, Any], tuple[Any, Any]] | None = None,
+    dispatch_cache_probe: Callable[[str], None] | None = None,
 ) -> GeometryRawBlockSolve:
     """Solve VMEC once and keep the raw-block transpose auxiliary data."""
 
     if not _using_current_vmec_jax_context(context):
         raise ValueError("geometry_raw_block_solve_from_param_vector requires the current VMEX implicit AD lane.")
+    if dispatch_cache_probe is not None:
+        dispatch_cache_probe("raw_entry")
     normalized_specs = tuple((str(family).strip().upper(), int(m), int(n)) for family, m, n in param_specs)
     params_already_stop_gradiented = False
     if stage is None:
@@ -1003,6 +1006,8 @@ def geometry_raw_block_solve_from_param_vector(
                 jnp.asarray(param_deltas, dtype=jnp.float64),
                 param_entries,
             )
+    if dispatch_cache_probe is not None:
+        dispatch_cache_probe("after_parameter_setup")
     # The raw-block transpose below differentiates the residual with respect to
     # the full VMEC parameter pytree and then extracts requested harmonic
     # columns.  It does not need the traced construction history from the
@@ -1011,15 +1016,21 @@ def geometry_raw_block_solve_from_param_vector(
     # selected boundary harmonics.
     if not params_already_stop_gradiented:
         implicit_params = jax.tree_util.tree_map(_stop_gradient_if_jax_value, implicit_params)
+    if dispatch_cache_probe is not None:
+        dispatch_cache_probe("before_vmex_solve")
     if solve_with_aux_runner is None:
         state, dof_mask = implicit.solve_implicit_with_aux(implicit_params, implicit_cfg)
     else:
         state, dof_mask = solve_with_aux_runner(implicit_params)
+    if dispatch_cache_probe is not None:
+        dispatch_cache_probe("after_vmex_solve")
     if state_mask_stop_gradient_runner is None:
         state = jax.tree_util.tree_map(_stop_gradient_if_jax_value, state)
         dof_mask = jax.tree_util.tree_map(_stop_gradient_if_jax_value, dof_mask)
     else:
         state, dof_mask = state_mask_stop_gradient_runner(state, dof_mask)
+    if dispatch_cache_probe is not None:
+        dispatch_cache_probe("after_state_mask")
     return GeometryRawBlockSolve(
         implicit=implicit,
         implicit_params=implicit_params,

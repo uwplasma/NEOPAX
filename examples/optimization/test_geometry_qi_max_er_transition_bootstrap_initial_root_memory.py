@@ -74,6 +74,7 @@ class EvaluationStructureCounter:
         self.jax_dispatch_cache_size: int | None = None
         self.raw_solve_dispatch_before: int | None = None
         self.raw_solve_dispatch_after: int | None = None
+        self.raw_wrapper_dispatch_caches: dict[str, int | None] = {}
 
     def reset(self) -> None:
         self.raw_block_solve_calls = 0
@@ -83,6 +84,7 @@ class EvaluationStructureCounter:
         self.jax_dispatch_cache_size = None
         self.raw_solve_dispatch_before = None
         self.raw_solve_dispatch_after = None
+        self.raw_wrapper_dispatch_caches = {}
 
     def context(
         self,
@@ -94,6 +96,7 @@ class EvaluationStructureCounter:
         vmex_cache_sizes: bool = False,
         jax_dispatch_cache: bool = False,
         raw_solve_dispatch: bool = False,
+        raw_wrapper_dispatch: bool = False,
         raw_implicit=None,
     ):
         raw_block_solve = reverse_optimization.geometry_raw_block_solve_from_param_vector
@@ -140,8 +143,14 @@ class EvaluationStructureCounter:
             except (AttributeError, ImportError):
                 return None
 
+        def record_raw_wrapper_dispatch(label: str) -> None:
+            if raw_wrapper_dispatch:
+                self.raw_wrapper_dispatch_caches[str(label)] = dispatch_cache_size()
+
         def count_raw_block_solve(*args, **kwargs):
             self.raw_block_solve_calls += 1
+            if raw_wrapper_dispatch:
+                kwargs["dispatch_cache_probe"] = record_raw_wrapper_dispatch
             if optimization_raw_block_stage is not None:
                 kwargs["stage"] = optimization_raw_block_stage.raw_block_stage
                 if jit_boundary_parameter_updates:
@@ -347,6 +356,11 @@ def main() -> int:
         action="store_true",
         help="Split the JAX dispatch-cache count immediately before/after VMEX solve_implicit_with_aux.",
     )
+    parser.add_argument(
+        "--diagnose-raw-wrapper-dispatch",
+        action="store_true",
+        help="Report JAX dispatch-cache sizes at exact raw-block wrapper boundaries.",
+    )
     args = parser.parse_args()
     if args.warmup < 0 or args.repeats < 1:
         raise ValueError("--warmup must be non-negative and --repeats must be positive.")
@@ -446,6 +460,12 @@ def main() -> int:
                 f"after={after if after is not None else 'unavailable'}",
                 flush=True,
             )
+        if args.diagnose_raw_wrapper_dispatch:
+            entries = " ".join(
+                f"{name}={value if value is not None else 'unavailable'}"
+                for name, value in structure_counter.raw_wrapper_dispatch_caches.items()
+            )
+            print(f"[memory test] raw_wrapper_dispatch_cache {entries or 'unavailable'}", flush=True)
 
     print(
         f"[memory test] mode={args.mode} objectives=maxEr,Er_left,Er_right,J_bootstrap "
@@ -481,6 +501,7 @@ def main() -> int:
                 vmex_cache_sizes=args.diagnose_vmex_caches,
                 jax_dispatch_cache=args.diagnose_jax_dispatch_cache,
                 raw_solve_dispatch=args.diagnose_raw_solve_dispatch,
+                raw_wrapper_dispatch=args.diagnose_raw_wrapper_dispatch,
                 raw_implicit=getattr(problem.raw_block_stage, "implicit", None),
             )
             if (
@@ -530,6 +551,7 @@ def main() -> int:
                 vmex_cache_sizes=args.diagnose_vmex_caches,
                 jax_dispatch_cache=args.diagnose_jax_dispatch_cache,
                 raw_solve_dispatch=args.diagnose_raw_solve_dispatch,
+                raw_wrapper_dispatch=args.diagnose_raw_wrapper_dispatch,
                 raw_implicit=getattr(problem.raw_block_stage, "implicit", None),
             )
             for patcher in patchers:
