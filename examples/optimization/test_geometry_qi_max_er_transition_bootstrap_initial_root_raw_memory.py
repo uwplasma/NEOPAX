@@ -7,8 +7,11 @@ same VMEC boundary vector from its initial point, and repeatedly invokes only
 ``geometry_raw_block_solve_from_param_vector``.  There are no QI objectives,
 Er roots, NTX calculations, transport residuals, or reverse pullbacks.
 
-The test answers one question: can the raw VMEX/JAX boundary alone retain the
-memory seen after each full least-squares evaluation?
+Every trial recreates the scaled-to-physical and physical-to-VMEC-vector
+plumbing from the host optimizer vector before invoking the solve.  The test
+therefore answers one question: can the raw VMEX/JAX boundary, including its
+per-evaluation parameter setup, retain the memory seen after each full
+least-squares evaluation?
 """
 
 from __future__ import annotations
@@ -57,8 +60,17 @@ def _live_jax_array_count() -> int | None:
         return None
 
 
-def _run_raw_solve(problem, vmec_values, vmec_specs) -> None:
-    """Execute exactly the benchmark raw solve, then release its result."""
+def _run_raw_solve(problem, host_scaled_values, vmec_specs) -> None:
+    """Recreate the benchmark VMEC input setup, solve, then release its result."""
+
+    # This intentionally mirrors ``GeometryInitialErRootLeastSquaresProblem.evaluate``:
+    # the optimizer supplies a host array, from which every evaluation creates its
+    # physical mixed vector and the compact VMEC boundary vector.
+    physical_values = problem._scaled_to_physical(host_scaled_values)
+    vmec_values = reverse_optimization.vmec_parameter_values_from_parameter_vector(
+        problem.parameter_set,
+        physical_values,
+    )
 
     raw = geometry_raw_block_solve_from_param_vector(
         problem.context,
@@ -93,11 +105,7 @@ def main() -> int:
     )
     if problem.raw_block_stage is None:
         raise RuntimeError("The matching optimization problem did not create a raw VMEX stage.")
-    physical_values = problem._scaled_to_physical(problem.x0)
-    vmec_values = reverse_optimization.vmec_parameter_values_from_parameter_vector(
-        problem.parameter_set,
-        physical_values,
-    )
+    host_scaled_values = np.asarray(jax.device_get(problem.x0), dtype=float)
     vmec_specs = tuple(spec.as_tuple() for spec in problem.parameter_set.vmec_boundary_specs)
     if len(vmec_specs) != problem.parameter_count:
         raise RuntimeError(
@@ -114,7 +122,7 @@ def main() -> int:
     for index in range(args.warmup):
         print(f"[raw memory test] warmup={index} starting", flush=True)
         started = time.perf_counter()
-        _run_raw_solve(problem, vmec_values, vmec_specs)
+        _run_raw_solve(problem, host_scaled_values, vmec_specs)
         gc.collect()
         print(
             f"[raw memory test] warmup={index} complete elapsed_s={time.perf_counter() - started:.3f}",
@@ -124,7 +132,7 @@ def main() -> int:
     first_rss: int | None = None
     for index in range(args.repeats):
         started = time.perf_counter()
-        _run_raw_solve(problem, vmec_values, vmec_specs)
+        _run_raw_solve(problem, host_scaled_values, vmec_specs)
         gc.collect()
         rss = opt._process_resident_memory_bytes()
         if first_rss is None:
