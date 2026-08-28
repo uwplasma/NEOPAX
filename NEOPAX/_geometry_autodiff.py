@@ -5193,6 +5193,7 @@ def geometry_payload_pullback_from_param_vector_raw_block_transpose(
     native_vmec_face_coefficient_bars: Mapping[str, object] | None = None,
     return_raw_block_solve: bool = False,
     structural_artifacts: GeometryPayloadStructuralArtifacts | None = None,
+    dispatch_cache_probe=None,
 ) -> object:
     """Pull transport payload cotangents back to VMEC boundary harmonics.
 
@@ -5214,6 +5215,13 @@ def geometry_payload_pullback_from_param_vector_raw_block_transpose(
     objective/initial-cache prepared-system bars and all runtime channels.
     """
 
+    def _probe(label: str) -> None:
+        # Test-only instrumentation is threaded in explicitly by the memory
+        # harness. It is never supplied by benchmark/default callers.
+        if dispatch_cache_probe is not None:
+            dispatch_cache_probe(str(label))
+
+    _probe("payload_pullback_entry")
     if not payload_bars:
         raise ValueError("payload_bars must contain at least one objective cotangent tree.")
     if not _using_current_vmec_jax_context(context):
@@ -5301,6 +5309,7 @@ def geometry_payload_pullback_from_param_vector_raw_block_transpose(
         geometry_booz_constants_grids = structural_artifacts.booz_constants_grids
         geometry_booz_mode_indices = structural_artifacts.booz_mode_indices
         geometry_booz_mode00 = structural_artifacts.booz_mode00
+    _probe("after_payload_structure")
 
     def geometry_from_state(state_inner):
         return _build_neopax_geometry_from_state(
@@ -5844,16 +5853,20 @@ def geometry_payload_pullback_from_param_vector_raw_block_transpose(
             # the support compile/execution does not overlap the geometry
             # state-bar batch.  This preserves the same cotangent sum and final
             # raw-block transpose while reducing peak device memory.
+            _probe("before_ntx_support_state_bars")
             support_state_bar_batch = _state_bar_batch_from_payload_branch(
                 support_branch_name,
                 support_from_state,
                 support_bars,
             )
+            _probe("after_ntx_support_state_bars")
+            _probe("before_geometry_state_bars")
             geometry_state_bar_batch = _state_bar_batch_from_payload_branch(
                 "geometry",
                 geometry_from_state,
                 geometry_bars,
             )
+            _probe("after_geometry_state_bars")
             state_bar_batch = jax.tree_util.tree_map(
                 lambda geometry_bar, support_bar: geometry_bar + support_bar,
                 geometry_state_bar_batch,
@@ -6008,7 +6021,9 @@ def geometry_payload_pullback_from_param_vector_raw_block_transpose(
             )
         return streamed_gradient_matrix
 
+    _probe("before_payload_state_bar_batch")
     raw_block_state_bar_batch = _payload_raw_block_state_bar_batch()
+    _probe("after_payload_state_bar_batch")
 
     if native_vmec_face_coefficient_bars is not None:
         native_names = (
@@ -6081,6 +6096,7 @@ def geometry_payload_pullback_from_param_vector_raw_block_transpose(
             extra_state_bars,
         )
 
+    _probe("before_raw_block_transpose")
     param_bar_batch = implicit.implicit_state_pullback_multi_rhs_raw_block_transpose(
         implicit_params,
         implicit_cfg,
@@ -6089,6 +6105,7 @@ def geometry_payload_pullback_from_param_vector_raw_block_transpose(
         raw_block_state_bar_batch,
         probe_chunk_size=1,
     )
+    _probe("after_raw_block_transpose")
     if progress_label is not None:
         param_bar_leaves = jax.tree_util.tree_leaves(param_bar_batch)
         first_bad = None

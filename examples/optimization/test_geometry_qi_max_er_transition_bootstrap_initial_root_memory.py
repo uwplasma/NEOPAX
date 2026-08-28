@@ -77,6 +77,7 @@ class EvaluationStructureCounter:
         self.raw_wrapper_dispatch_caches: dict[str, int | None] = {}
         self.pre_raw_dispatch_caches: dict[str, int | None] = {}
         self.transport_dispatch_caches: dict[str, int | None] = {}
+        self.payload_dispatch_caches: dict[str, int | None] = {}
 
     def reset(self) -> None:
         self.raw_block_solve_calls = 0
@@ -89,6 +90,7 @@ class EvaluationStructureCounter:
         self.raw_wrapper_dispatch_caches = {}
         self.pre_raw_dispatch_caches = {}
         self.transport_dispatch_caches = {}
+        self.payload_dispatch_caches = {}
 
     def context(
         self,
@@ -103,6 +105,7 @@ class EvaluationStructureCounter:
         raw_wrapper_dispatch: bool = False,
         pre_raw_dispatch: bool = False,
         transport_dispatch: bool = False,
+        payload_dispatch: bool = False,
         raw_implicit=None,
     ):
         raw_block_solve = reverse_optimization.geometry_raw_block_solve_from_param_vector
@@ -160,6 +163,10 @@ class EvaluationStructureCounter:
         def record_transport_dispatch(label: str) -> None:
             if transport_dispatch:
                 self.transport_dispatch_caches[str(label)] = dispatch_cache_size()
+
+        def record_payload_dispatch(label: str) -> None:
+            if payload_dispatch:
+                self.payload_dispatch_caches[str(label)] = dispatch_cache_size()
 
         original_scaled_to_physical = opt.GeometryInitialErRootLeastSquaresProblem._scaled_to_physical
         original_active_profile_values = reverse_optimization._active_profile_values_from_parameter_vector
@@ -227,6 +234,8 @@ class EvaluationStructureCounter:
             return result
 
         def count_payload_pullback(*args, **kwargs):
+            if payload_dispatch:
+                kwargs["dispatch_cache_probe"] = record_payload_dispatch
             result = payload_pullback(*args, **kwargs)
             if checkpoints:
                 jax.block_until_ready(
@@ -431,6 +440,14 @@ def main() -> int:
         action="store_true",
         help="Report dispatch-cache sizes after the root and payload/reverse transport boundaries.",
     )
+    parser.add_argument(
+        "--diagnose-payload-dispatch",
+        action="store_true",
+        help=(
+            "Split the existing payload reverse pullback at the support VJP, "
+            "geometry VJP, and raw-block-transpose boundaries."
+        ),
+    )
     args = parser.parse_args()
     if args.warmup < 0 or args.repeats < 1:
         raise ValueError("--warmup must be non-negative and --repeats must be positive.")
@@ -548,6 +565,12 @@ def main() -> int:
                 for name, value in structure_counter.transport_dispatch_caches.items()
             )
             print(f"[memory test] transport_dispatch_cache {entries or 'unavailable'}", flush=True)
+        if args.diagnose_payload_dispatch:
+            entries = " ".join(
+                f"{name}={value if value is not None else 'unavailable'}"
+                for name, value in structure_counter.payload_dispatch_caches.items()
+            )
+            print(f"[memory test] payload_dispatch_cache {entries or 'unavailable'}", flush=True)
 
     print(
         f"[memory test] mode={args.mode} objectives=maxEr,Er_left,Er_right,J_bootstrap "
@@ -586,6 +609,7 @@ def main() -> int:
                 raw_wrapper_dispatch=args.diagnose_raw_wrapper_dispatch,
                 pre_raw_dispatch=args.diagnose_pre_raw_dispatch,
                 transport_dispatch=args.diagnose_transport_dispatch,
+                payload_dispatch=args.diagnose_payload_dispatch,
                 raw_implicit=getattr(problem.raw_block_stage, "implicit", None),
             )
             if (
@@ -593,6 +617,7 @@ def main() -> int:
                 or args.diagnose_checkpoints
                 or args.diagnose_vmex_caches
                 or args.diagnose_jax_dispatch_cache
+                or args.diagnose_payload_dispatch
                 or args.diagnose_raw_solve_dispatch
                 or args.persistent_raw_solve_jit
                 or args.persistent_raw_params
@@ -620,6 +645,7 @@ def main() -> int:
         or args.diagnose_checkpoints
         or args.diagnose_vmex_caches
         or args.diagnose_jax_dispatch_cache
+        or args.diagnose_payload_dispatch
         or args.diagnose_raw_solve_dispatch
         or args.persistent_raw_solve_jit
         or args.persistent_raw_params
@@ -638,6 +664,7 @@ def main() -> int:
                 raw_wrapper_dispatch=args.diagnose_raw_wrapper_dispatch,
                 pre_raw_dispatch=args.diagnose_pre_raw_dispatch,
                 transport_dispatch=args.diagnose_transport_dispatch,
+                payload_dispatch=args.diagnose_payload_dispatch,
                 raw_implicit=getattr(problem.raw_block_stage, "implicit", None),
             )
             for patcher in patchers:

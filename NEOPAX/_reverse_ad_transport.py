@@ -3734,16 +3734,25 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
 
     phase_start = time.perf_counter()
     pre_root_initial_state, profile_state_pullback = jax.vjp(_state_from_profiles, parameter_values)
-    initial_state = (
-        dependencies.state_with_initial_er_root_ad(
+    # The reverse boundary below implements the selected-root implicit
+    # pullback explicitly.  Keep the forward root result here so that
+    # boundary does not repeat the same radial root solve just to recover its
+    # primal value and finite-root mask.
+    initial_er_root_primal = None
+    if initial_er_root_enabled:
+        initial_er_root_primal = dependencies.initial_er_selected_root_profile(
             pre_root_initial_state,
             config=config,
             runtime=runtime,
-            mode=initial_er_root_ad,
         )
-        if initial_er_root_enabled
-        else pre_root_initial_state
-    )
+        initial_state = dataclasses.replace(
+            pre_root_initial_state,
+            Er=jnp.asarray(
+                initial_er_root_primal[0], dtype=pre_root_initial_state.Er.dtype
+            ),
+        )
+    else:
+        initial_state = pre_root_initial_state
     initial_state = jax.block_until_ready(initial_state)
     print(
         f"{progress_prefix} progress: support reverse profile-state vjp ready "
@@ -5462,16 +5471,16 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
     initial_er_root_support_bars = None
     if initial_er_root_enabled:
         phase_start = time.perf_counter()
-        root_selection_start = phase_start
-        er_profile, finite_mask = dependencies.initial_er_selected_root_profile(
-            pre_root_initial_state,
-            config=config,
-            runtime=runtime,
-        )
+        if initial_er_root_primal is None:
+            raise RuntimeError(
+                "Initial-Er root reverse boundary requires the forward selected-root primal."
+            )
+        er_profile, finite_mask = initial_er_root_primal
 
         er_profile = jnp.asarray(er_profile, dtype=pre_root_initial_state.Er.dtype)
         finite_mask = jnp.asarray(finite_mask, dtype=bool)
 
+        root_linearization_start = time.perf_counter()
         dres_der = dependencies.initial_er_charge_flux_residual_er_derivative(
             pre_root_initial_state,
             er_profile,
@@ -5487,7 +5496,7 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
             -jnp.asarray(initial_state_bars.Er) / safe_dres_der[None, :],
             0.0,
         )
-        root_selection_and_linearization_elapsed = time.perf_counter() - root_selection_start
+        root_linearization_elapsed = time.perf_counter() - root_linearization_start
 
         root_state_pullback_start = time.perf_counter()
         state_residual_bars = dependencies.compact_initial_er_state_pullback(
@@ -5623,8 +5632,8 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
 
             print(
                 f"{progress_prefix} diagnostic: initial-Er root boundary components "
-                f"root_selection_and_linearization_s="
-                f"{root_selection_and_linearization_elapsed:.3f} "
+                "reused_forward_selected_root_s=0.000 "
+                f"root_linearization_s={root_linearization_elapsed:.3f} "
                 f"state_residual_transpose_s={root_state_pullback_elapsed:.3f} "
                 f"direct_geometry_transpose_s={_root_component_time(root_geometry_pullback_elapsed)} "
                 f"ntx_support_transpose_s={_root_component_time(root_ntx_support_pullback_elapsed)} "
@@ -6963,6 +6972,7 @@ def realtime_geometry_payload_pullback_result(
     raw_block_solve: GeometryRawBlockSolve | None = None,
     return_branch_gradients: bool = True,
     structural_artifacts=None,
+    dispatch_cache_probe=None,
 ) -> RealtimeGeometryPayloadPullbackResult:
     """Pull transport support-payload cotangents back to VMEC boundary harmonics.
 
@@ -7023,6 +7033,7 @@ def realtime_geometry_payload_pullback_result(
         raw_block_solve=raw_block_solve,
         native_vmec_face_coefficient_bars=native_vmec_face_coefficient_bars,
         structural_artifacts=structural_artifacts,
+        dispatch_cache_probe=dispatch_cache_probe,
     )
     geometry_gradient_result = jax.block_until_ready(geometry_gradient_result)
     objective_count = int(len(tuple(support_bars)))
@@ -7106,6 +7117,7 @@ def realtime_geometry_transport_reverse_table_from_payload_cotangents(
     raw_block_solve: GeometryRawBlockSolve | None = None,
     return_branch_gradients: bool = True,
     structural_artifacts=None,
+    dispatch_cache_probe=None,
 ) -> RealtimeGeometryTransportReverseAssemblyResult:
     """Assemble the JAX transport reverse table from support-payload cotangents."""
 
@@ -7132,6 +7144,7 @@ def realtime_geometry_transport_reverse_table_from_payload_cotangents(
         raw_block_solve=raw_block_solve,
         return_branch_gradients=bool(return_branch_gradients),
         structural_artifacts=structural_artifacts,
+        dispatch_cache_probe=dispatch_cache_probe,
     )
     table_result = realtime_geometry_transport_reverse_table_result(
         objective_labels=objective_labels,

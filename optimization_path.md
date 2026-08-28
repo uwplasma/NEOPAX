@@ -22,12 +22,13 @@ the payload-to-VMEC reverse table, not in geometry-vector extraction, VMEC
 parameter setup, or duplicated geometry/root calculations.
 
 The payload table calls the established
-`geometry_payload_pullback_from_param_vector_raw_block_transpose` route. That
-route recreates Python closures and JAX `vjp`/`jvp` transform identities for
-the geometry + NTX support payload on every optimization evaluation. JAX then
-retains executable/dispatch entries for those fresh identities. This matches
-why geometry-only objectives show much less growth and why adding
-ambipolarity/bootstrap objectives exposes it strongly.
+`geometry_payload_pullback_from_param_vector_raw_block_transpose` route.
+The measurements prove that the +13 entries occur somewhere inside that
+payload reverse boundary, but they do **not** yet identify which internal
+operation owns them. In particular, reusing the fixed Boozer/grid metadata
+did not change the count or RSS slope, so that hypothesis is rejected. The
+next step is diagnostic-only instrumentation around the existing support VJP,
+geometry VJP, and raw-block transpose boundaries.
 
 ### Invariants
 
@@ -51,13 +52,10 @@ ambipolarity/bootstrap objectives exposes it strongly.
    The vector-only and split raw-parameter JIT experiments did not reduce the
    cache slope. Do not make them the example default.
 
-2. **Factor a payload-stage factory from the existing payload pullback.**
-   Add an optimization-only factory, suffixed `_optimization`, which creates
-   once per fixed stage the closure identities and structural metadata now
-   recreated inside `geometry_payload_pullback_from_param_vector_raw_block_transpose`:
-   fixed radial/Boozer sampling, fixed Boozer mode indices/constants where
-   verified state-independent, payload-tree paths, active float-leaf layout,
-   and compact-support routing.
+2. **Identify the exact internal payload boundary before factoring anything.**
+   The earlier structural-artifact reuse experiment is not a solution and
+   must not become the optimization default. Instrument the existing payload
+   pullback first; only the measured owner may be made persistent.
 
 3. **Keep all trial data dynamic.**
    The persistent callable accepts the current raw VMEC state/parameters/mask,
