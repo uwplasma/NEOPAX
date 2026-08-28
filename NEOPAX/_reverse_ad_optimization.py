@@ -1760,7 +1760,6 @@ def _optimization_root_to_payload_cotangents(
     n_zeta, n_xi, surface_backend, raw_block_solve, support_payload,
     use_runtime_payload, profile_specs, options, boozer_surface_sampling=None,
     r00_boozer_surface_sampling=None,
-    root_reverse_kernels=None,
 ):
     if use_runtime_payload:
         baseline_geometry = support_payload["geometry"]
@@ -1907,34 +1906,23 @@ def _optimization_root_to_payload_cotangents(
     else:
         profile_gradient_matrix_for_payload = profile_gradient_all
 
-    if root_reverse_kernels is None:
-        # Established optimization/benchmark-compatible path; keep verbatim.
-        def _residuals_from_geometry_delta(geometry_delta):
-            geometry = _add_float_delta_tree(baseline_geometry, geometry_delta)
-            runtime_with_geometry = runtime_with_geometry_payload(runtime_for_geometry, geometry)
-            runtime_with_geometry = runtime_with_ntx_support_payload(runtime_with_geometry, baseline_ntx_support)
-            return initial_er_charge_flux_residuals(
-                pre_root_state,
-                er_profile,
-                runtime=runtime_with_geometry,
-            )
-
-        _, geometry_residual_pullback = jax.vjp(
-            _residuals_from_geometry_delta,
-            geometry_delta0,
-        )
-        residual_geometry_bars = jax.vmap(
-            lambda residual_bar: geometry_residual_pullback(residual_bar)[0]
-        )(residual_bars)
-    else:
-        residual_geometry_bars = root_reverse_kernels.root_geometry_residual_pullback(
+    def _residuals_from_geometry_delta(geometry_delta):
+        geometry = _add_float_delta_tree(baseline_geometry, geometry_delta)
+        runtime_with_geometry = runtime_with_geometry_payload(runtime_for_geometry, geometry)
+        runtime_with_geometry = runtime_with_ntx_support_payload(runtime_with_geometry, baseline_ntx_support)
+        return initial_er_charge_flux_residuals(
             pre_root_state,
             er_profile,
-            baseline_geometry,
-            baseline_ntx_support,
-            residual_bars,
-            geometry_delta0,
+            runtime=runtime_with_geometry,
         )
+
+    _, geometry_residual_pullback = jax.vjp(
+        _residuals_from_geometry_delta,
+        geometry_delta0,
+    )
+    residual_geometry_bars = jax.vmap(
+        lambda residual_bar: geometry_residual_pullback(residual_bar)[0]
+    )(residual_bars)
     geometry_bars = _add_trees(direct_geometry_bars, residual_geometry_bars)
 
     ntx_runtime = runtime_with_geometry_payload(runtime_for_geometry, baseline_geometry)
@@ -1984,7 +1972,6 @@ def geometry_active_initial_er_root_only_reverse_table_optimization(
     support_payload_override=None,
     options: Mapping[str, object] | None = None,
     optimization_stage=None,
-    root_reverse_kernels=None,
 ) -> ObjectiveTableResult:
     """Return compact initial-Er objective table for active realtime geometry.
 
@@ -2055,7 +2042,6 @@ def geometry_active_initial_er_root_only_reverse_table_optimization(
         use_runtime_payload=use_runtime_payload,
         profile_specs=profile_specs,
         options=options,
-        root_reverse_kernels=root_reverse_kernels,
     )
     if optimization_stage is None:
         root_args["raw_block_solve"] = raw_block_solve
