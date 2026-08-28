@@ -1386,6 +1386,7 @@ def geometry_active_initial_er_root_only_reverse_table(
     support_payload_override=None,
     options: Mapping[str, object] | None = None,
     payload_optimization_stage=None,
+    dispatch_cache_probe=None,
 ) -> ObjectiveTableResult:
     """Return compact initial-Er objective table for active realtime geometry.
 
@@ -1396,6 +1397,12 @@ def geometry_active_initial_er_root_only_reverse_table(
     raw-block payload pullback used by the realtime reverse benchmark.
     """
 
+    def _probe(label: str) -> None:
+        # Test-only instrumentation. Default/benchmark calls leave this unset.
+        if dispatch_cache_probe is not None:
+            dispatch_cache_probe(str(label))
+
+    _probe("support_reverse_entry")
     requested_objectives = normalize_initial_er_root_only_objective_names(objective_names)
     parameter_values_arr = jnp.asarray(parameter_values)
     profile_values_arr = jnp.asarray(profile_values)
@@ -1459,14 +1466,17 @@ def geometry_active_initial_er_root_only_reverse_table(
             baseline_ntx_support = current_payload["ntx_support"]
         runtime_for_geometry = runtime_with_geometry_payload(runtime, baseline_geometry)
         runtime_for_geometry = runtime_with_ntx_support_payload(runtime_for_geometry, baseline_ntx_support)
+        _probe("after_support_payload_setup")
         geometry_delta0 = _float_delta_tree_like(baseline_geometry)
 
         pre_root_state = pre_root_state_from_profile_values(profile_values_arr)
+        _probe("before_selected_root")
         er_profile, finite_mask = initial_er_selected_root_profile(
             pre_root_state,
             config=dict(config),
             runtime=runtime_for_geometry,
         )
+        _probe("after_selected_root")
         er_profile = jnp.asarray(er_profile, dtype=pre_root_state.Er.dtype)
         finite_mask = jnp.asarray(finite_mask, dtype=bool)
         rooted_state = dataclasses.replace(pre_root_state, Er=er_profile)
@@ -1490,18 +1500,23 @@ def geometry_active_initial_er_root_only_reverse_table(
         generic_direct_geometry_bars = None
         generic_value_lookup = {name: i for i, name in enumerate(generic_objectives)}
         if generic_objectives:
+            _probe("before_generic_objective_vjp")
             generic_values, objective_pullback = jax.vjp(
                 _values_from_rooted_state_and_geometry,
                 rooted_state,
                 geometry_delta0,
             )
+            _probe("after_generic_objective_vjp")
             generic_basis = jnp.eye(len(generic_objectives), dtype=jnp.asarray(generic_values).dtype)
+            _probe("before_generic_objective_vmap")
             generic_rooted_state_bars, generic_direct_geometry_bars = jax.vmap(
                 lambda cotangent: objective_pullback(cotangent)
             )(generic_basis)
+            _probe("after_generic_objective_vmap")
 
         bootstrap_row = None
         if _BOOTSTRAP_CURRENT_OBJECTIVE in requested_objectives:
+            _probe("before_bootstrap_cotangent")
             bootstrap_row = _compact_bootstrap_current_root_objective_cotangent(
                 rooted_state=rooted_state,
                 runtime_for_geometry=runtime_for_geometry,
@@ -1509,6 +1524,7 @@ def geometry_active_initial_er_root_only_reverse_table(
                 baseline_ntx_support=baseline_ntx_support,
                 geometry_delta0=geometry_delta0,
             )
+            _probe("after_bootstrap_cotangent")
 
         objective_value_rows = []
         rooted_state_bar_rows = []
@@ -1553,6 +1569,7 @@ def geometry_active_initial_er_root_only_reverse_table(
             -jnp.asarray(rooted_state_bars.Er) / safe_dres_der[None, :],
             0.0,
         )
+        _probe("before_root_state_pullback")
         state_residual_bars = compact_initial_er_state_pullback(
             residual_scalar_fn=initial_er_charge_flux_residual_scalar,
             state=pre_root_state,
@@ -1560,6 +1577,7 @@ def geometry_active_initial_er_root_only_reverse_table(
             residual_bars=residual_bars,
             runtime=runtime_for_geometry,
         )
+        _probe("after_root_state_pullback")
         direct_pre_root_state_bars = dataclasses.replace(
             rooted_state_bars,
             Er=jnp.zeros_like(rooted_state_bars.Er),
@@ -1567,6 +1585,7 @@ def geometry_active_initial_er_root_only_reverse_table(
         pre_root_state_bars = _add_trees(direct_pre_root_state_bars, state_residual_bars)
 
         if profile_specs:
+            _probe("before_profile_pullback")
             _, profile_pullback = jax.vjp(
                 pre_root_state_from_profile_values,
                 profile_values_arr,
@@ -1574,6 +1593,7 @@ def geometry_active_initial_er_root_only_reverse_table(
             profile_gradient_all = jax.vmap(lambda state_bar: profile_pullback(state_bar)[0])(
                 pre_root_state_bars
             )
+            _probe("after_profile_pullback")
         else:
             profile_gradient_all = jnp.zeros((objective_count, 0), dtype=jnp.asarray(objective_values).dtype)
         canonical_profile_lookup = {name: i for i, name in enumerate(PROFILE_PARAMETER_ORDER)}
@@ -1595,16 +1615,20 @@ def geometry_active_initial_er_root_only_reverse_table(
                 runtime=runtime_with_geometry,
             )
 
+        _probe("before_root_geometry_pullback")
         _, geometry_residual_pullback = jax.vjp(
             _residuals_from_geometry_delta,
             geometry_delta0,
         )
+        _probe("after_root_geometry_vjp")
         residual_geometry_bars = jax.vmap(
             lambda residual_bar: geometry_residual_pullback(residual_bar)[0]
         )(residual_bars)
+        _probe("after_root_geometry_pullback")
         geometry_bars = _add_trees(direct_geometry_bars, residual_geometry_bars)
 
         ntx_runtime = runtime_with_geometry_payload(runtime_for_geometry, baseline_geometry)
+        _probe("before_root_ntx_support_pullback")
         ntx_bar_leaves = compact_initial_er_ntx_support_pullback_leaves(
             runtime=ntx_runtime,
             state=pre_root_state,
@@ -1612,6 +1636,7 @@ def geometry_active_initial_er_root_only_reverse_table(
             residual_bars=residual_bars,
             support=baseline_ntx_support,
         )
+        _probe("after_root_ntx_support_pullback")
         _, ntx_treedef = jax.tree_util.tree_flatten(baseline_ntx_support)
         ntx_bars = ntx_treedef.unflatten(tuple(ntx_bar_leaves))
         support_bars = []
@@ -1634,6 +1659,7 @@ def geometry_active_initial_er_root_only_reverse_table(
     objective_values, profile_gradient_matrix_for_payload, support_bars = jax.block_until_ready(
         (objective_values, profile_gradient_matrix_for_payload, support_bars)
     )
+    _probe("after_payload_cotangents_ready")
 
     geometry_param_tuples = tuple(spec.as_tuple() for spec in vmec_specs)
     structural_artifacts = None

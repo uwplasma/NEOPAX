@@ -78,6 +78,7 @@ class EvaluationStructureCounter:
         self.pre_raw_dispatch_caches: dict[str, int | None] = {}
         self.transport_dispatch_caches: dict[str, int | None] = {}
         self.payload_dispatch_caches: dict[str, int | None] = {}
+        self.support_reverse_dispatch_caches: dict[str, int | None] = {}
 
     def reset(self) -> None:
         self.raw_block_solve_calls = 0
@@ -91,6 +92,7 @@ class EvaluationStructureCounter:
         self.pre_raw_dispatch_caches = {}
         self.transport_dispatch_caches = {}
         self.payload_dispatch_caches = {}
+        self.support_reverse_dispatch_caches = {}
 
     def context(
         self,
@@ -106,12 +108,14 @@ class EvaluationStructureCounter:
         pre_raw_dispatch: bool = False,
         transport_dispatch: bool = False,
         payload_dispatch: bool = False,
+        support_reverse_dispatch: bool = False,
         raw_implicit=None,
     ):
         raw_block_solve = reverse_optimization.geometry_raw_block_solve_from_param_vector
         selected_root = reverse_optimization.initial_er_selected_root_profile
         payload_builder = reverse_optimization.build_neopax_geometry_and_ntx_exact_lij_support_from_state
         payload_pullback = reverse_optimization.realtime_geometry_transport_reverse_table_from_payload_cotangents
+        support_reverse = reverse_optimization.geometry_active_initial_er_root_only_reverse_table
 
         def record(name: str) -> None:
             if checkpoints:
@@ -167,6 +171,10 @@ class EvaluationStructureCounter:
         def record_payload_dispatch(label: str) -> None:
             if payload_dispatch:
                 self.payload_dispatch_caches[str(label)] = dispatch_cache_size()
+
+        def record_support_reverse_dispatch(label: str) -> None:
+            if support_reverse_dispatch:
+                self.support_reverse_dispatch_caches[str(label)] = dispatch_cache_size()
 
         original_scaled_to_physical = opt.GeometryInitialErRootLeastSquaresProblem._scaled_to_physical
         original_active_profile_values = reverse_optimization._active_profile_values_from_parameter_vector
@@ -248,6 +256,11 @@ class EvaluationStructureCounter:
             record("payload_to_vmec")
             return result
 
+        def count_support_reverse(*args, **kwargs):
+            if support_reverse_dispatch:
+                kwargs["dispatch_cache_probe"] = record_support_reverse_dispatch
+            return support_reverse(*args, **kwargs)
+
         patchers = [
             patch.object(
                 reverse_optimization,
@@ -268,6 +281,11 @@ class EvaluationStructureCounter:
                 reverse_optimization,
                 "realtime_geometry_transport_reverse_table_from_payload_cotangents",
                 count_payload_pullback,
+            ),
+            patch.object(
+                reverse_optimization,
+                "geometry_active_initial_er_root_only_reverse_table",
+                count_support_reverse,
             ),
         ]
         if pre_raw_dispatch:
@@ -448,6 +466,14 @@ def main() -> int:
             "geometry VJP, and raw-block-transpose boundaries."
         ),
     )
+    parser.add_argument(
+        "--diagnose-support-reverse-dispatch",
+        action="store_true",
+        help=(
+            "Split the existing initial-root transport-support reverse before "
+            "it constructs payload cotangents."
+        ),
+    )
     args = parser.parse_args()
     if args.warmup < 0 or args.repeats < 1:
         raise ValueError("--warmup must be non-negative and --repeats must be positive.")
@@ -571,6 +597,15 @@ def main() -> int:
                 for name, value in structure_counter.payload_dispatch_caches.items()
             )
             print(f"[memory test] payload_dispatch_cache {entries or 'unavailable'}", flush=True)
+        if args.diagnose_support_reverse_dispatch:
+            entries = " ".join(
+                f"{name}={value if value is not None else 'unavailable'}"
+                for name, value in structure_counter.support_reverse_dispatch_caches.items()
+            )
+            print(
+                f"[memory test] support_reverse_dispatch_cache {entries or 'unavailable'}",
+                flush=True,
+            )
 
     print(
         f"[memory test] mode={args.mode} objectives=maxEr,Er_left,Er_right,J_bootstrap "
@@ -610,6 +645,7 @@ def main() -> int:
                 pre_raw_dispatch=args.diagnose_pre_raw_dispatch,
                 transport_dispatch=args.diagnose_transport_dispatch,
                 payload_dispatch=args.diagnose_payload_dispatch,
+                support_reverse_dispatch=args.diagnose_support_reverse_dispatch,
                 raw_implicit=getattr(problem.raw_block_stage, "implicit", None),
             )
             if (
@@ -618,6 +654,7 @@ def main() -> int:
                 or args.diagnose_vmex_caches
                 or args.diagnose_jax_dispatch_cache
                 or args.diagnose_payload_dispatch
+                or args.diagnose_support_reverse_dispatch
                 or args.diagnose_raw_solve_dispatch
                 or args.persistent_raw_solve_jit
                 or args.persistent_raw_params
@@ -646,6 +683,7 @@ def main() -> int:
         or args.diagnose_vmex_caches
         or args.diagnose_jax_dispatch_cache
         or args.diagnose_payload_dispatch
+        or args.diagnose_support_reverse_dispatch
         or args.diagnose_raw_solve_dispatch
         or args.persistent_raw_solve_jit
         or args.persistent_raw_params
@@ -665,6 +703,7 @@ def main() -> int:
                 pre_raw_dispatch=args.diagnose_pre_raw_dispatch,
                 transport_dispatch=args.diagnose_transport_dispatch,
                 payload_dispatch=args.diagnose_payload_dispatch,
+                support_reverse_dispatch=args.diagnose_support_reverse_dispatch,
                 raw_implicit=getattr(problem.raw_block_stage, "implicit", None),
             )
             for patcher in patchers:
