@@ -828,6 +828,7 @@ class InitialErTransportReverseStage:
     """
 
     payload_adapter: InitialErTransportPayloadAdapter
+    selected_root: Callable[..., Any]
     state_pullback: Callable[..., Any]
     geometry_pullback: Callable[..., Any]
     support_pullback: Callable[..., Any]
@@ -837,6 +838,7 @@ def build_initial_er_transport_reverse_stage(
     *,
     runtime,
     payload_adapter: InitialErTransportPayloadAdapter,
+    config: Mapping[str, object],
 ) -> InitialErTransportReverseStage:
     """Build the three fixed-signature transport reverse kernels once.
 
@@ -858,6 +860,13 @@ def build_initial_er_transport_reverse_stage(
             state=state,
             er_profile=er_profile,
             residual_bars=residual_bars,
+            runtime=_runtime_from_leaves(geometry_leaves, support_leaves),
+        )
+
+    def _selected_root(state, geometry_leaves, support_leaves):
+        return initial_er_selected_root_profile(
+            state,
+            config=dict(config),
             runtime=_runtime_from_leaves(geometry_leaves, support_leaves),
         )
 
@@ -901,6 +910,7 @@ def build_initial_er_transport_reverse_stage(
 
     return InitialErTransportReverseStage(
         payload_adapter=payload_adapter,
+        selected_root=jax.jit(_selected_root, inline=False),
         state_pullback=jax.jit(_state_pullback, inline=False),
         geometry_pullback=jax.jit(_geometry_pullback, inline=False),
         support_pullback=jax.jit(_support_pullback, inline=False),
@@ -1943,11 +1953,18 @@ def _optimization_root_to_payload_cotangents(
     use_direct_er_rows = transport_payload_adapter is not None
 
     pre_root_state = pre_root_state_from_profile_values(profile_values_arr)
-    er_profile, finite_mask = initial_er_selected_root_profile(
-        pre_root_state,
-        config=dict(config),
-        runtime=runtime_for_geometry,
-    )
+    if transport_reverse_stage is None:
+        er_profile, finite_mask = initial_er_selected_root_profile(
+            pre_root_state,
+            config=dict(config),
+            runtime=runtime_for_geometry,
+        )
+    else:
+        er_profile, finite_mask = transport_reverse_stage.selected_root(
+            pre_root_state,
+            geometry_leaves,
+            support_leaves,
+        )
     er_profile = jnp.asarray(er_profile, dtype=pre_root_state.Er.dtype)
     finite_mask = jnp.asarray(finite_mask, dtype=bool)
     rooted_state = dataclasses.replace(pre_root_state, Er=er_profile)
