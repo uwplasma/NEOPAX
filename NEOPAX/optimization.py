@@ -1371,8 +1371,9 @@ def geometry_initial_er_root_only_least_squares_problem(
     if mode == "optimization":
         transport_objectives = tuple(
             term.objective.name
-            for term in normalize_least_squares_terms(normalized_terms)
-            if term.objective.family == "transport"
+            for term in normalized_terms
+            if isinstance(term, LeastSquaresTerm)
+            and term.objective.family == "transport"
             and term.objective.name != "bootstrap_current_softmax_abs_scaled"
         )
         optimization_stage = build_initial_er_root_optimization_operators(
