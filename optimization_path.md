@@ -32,6 +32,12 @@ did not change the count or RSS slope, so that hypothesis is rejected. The
 next step is diagnostic-only instrumentation around the existing compact
 support/root reverse that creates the payload cotangents.
 
+The next measurement split that reverse further: bootstrap creates four
+entries; the root-geometry residual VJP creates four and its batched
+pullback one; the NTX-support pullback creates zero. The remaining bootstrap
+sub-call probe identifies the exact compact bootstrap kernel that needs an
+optimization-only persistent boundary.
+
 ### Invariants
 
 - The benchmark reverse-AD path is unchanged: same payload builder, custom

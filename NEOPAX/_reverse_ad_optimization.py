@@ -669,6 +669,7 @@ def _compact_bootstrap_current_root_objective_cotangent(
     baseline_geometry,
     baseline_ntx_support,
     geometry_delta0,
+    dispatch_cache_probe=None,
 ):
     """Compact cotangent row for bootstrap current at the selected initial Er root."""
 
@@ -689,16 +690,28 @@ def _compact_bootstrap_current_root_objective_cotangent(
             "state, geometry, and support pullbacks on the realtime NTX model."
         )
 
+    def _probe(label: str) -> None:
+        if dispatch_cache_probe is not None:
+            dispatch_cache_probe(str(label))
+
+    _probe("before_bootstrap_corrected_fluxes")
     corrected_fluxes = corrected_fluxes_fn(rooted_state)
+    _probe("after_bootstrap_corrected_fluxes")
     value, flux_bar = _bootstrap_current_softmax_abs_value_and_flux_bar(
         state=rooted_state,
         runtime=runtime_for_geometry,
         fluxes=corrected_fluxes,
     )
     upar_bar = flux_bar["Upar_neo"]
+    _probe("before_bootstrap_state_pullback")
     state_bar = state_pullback_fn(rooted_state, upar_bar)
+    _probe("after_bootstrap_state_pullback")
+    _probe("before_bootstrap_geometry_pullback")
     geometry_bar = geometry_pullback_fn(rooted_state, upar_bar, baseline_geometry, baseline_ntx_support)
+    _probe("after_bootstrap_geometry_pullback")
+    _probe("before_bootstrap_ntx_support_pullback")
     support_bar_leaves = support_pullback_fn(rooted_state, upar_bar, baseline_ntx_support)
+    _probe("after_bootstrap_ntx_support_pullback")
     _, support_treedef = jax.tree_util.tree_flatten(baseline_ntx_support)
     support_bar = support_treedef.unflatten(tuple(support_bar_leaves))
     return value, state_bar, geometry_bar, support_bar
@@ -1523,6 +1536,7 @@ def geometry_active_initial_er_root_only_reverse_table(
                 baseline_geometry=baseline_geometry,
                 baseline_ntx_support=baseline_ntx_support,
                 geometry_delta0=geometry_delta0,
+                dispatch_cache_probe=dispatch_cache_probe,
             )
             _probe("after_bootstrap_cotangent")
 
