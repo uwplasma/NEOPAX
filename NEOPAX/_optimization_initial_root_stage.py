@@ -153,6 +153,27 @@ def build_initial_root_reverse_kernels_optimization(
     momentum-corrected model and initial-Er residual.
     """
 
+    if not dataclasses.is_dataclass(neoclassical_model):
+        raise TypeError(
+            "The optimization-only initial-root adapters require a dataclass "
+            "neoclassical model so current geometry/support can be supplied "
+            "with dataclasses.replace."
+        )
+    required_methods = (
+        "evaluate_momentum_corrected_fluxes",
+        "pullback_momentum_corrected_upar_state_by_radius",
+        "pullback_momentum_corrected_upar_geometry_by_radius",
+        "pullback_momentum_corrected_upar_support_by_radius",
+    )
+    missing_methods = tuple(
+        name for name in required_methods if not callable(getattr(neoclassical_model, name, None))
+    )
+    if missing_methods:
+        raise TypeError(
+            "The optimization-only initial-root adapters require corrected "
+            f"bootstrap callbacks; missing {missing_methods!r}."
+        )
+
     def _model_for_trial(geometry, support):
         return dataclasses.replace(
             neoclassical_model,
