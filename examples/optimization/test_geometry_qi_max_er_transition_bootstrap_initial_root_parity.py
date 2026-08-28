@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Compare benchmark and payload-stage four-row evaluations for parity.
+"""Baseline repeat parity harness for the four-row evaluation.
 
 No SciPy iteration is run.  The two problems use the same four-objective terms,
 VMEC input, and initial scaled DoF vector.
@@ -43,7 +43,10 @@ def main() -> int:
     if not np.isscalar(example.MAX_MODE_SCHEDULE):
         raise ValueError("The parity test requires one fixed MAX_MODE_SCHEDULE value.")
     benchmark = _build()
-    staged = _build("payload_optimization")
+    # The rejected payload-artifact route is no longer selectable. This
+    # harness remains the parity baseline and will compare `off` with the new
+    # bounded optimization stage once that stage is implemented.
+    staged = _build("off")
     x = np.asarray(jax.device_get(benchmark.x0), dtype=float)
     off_residuals, off_jacobian = _evaluate(benchmark, x)
     staged_residuals, staged_jacobian = _evaluate(staged, x)

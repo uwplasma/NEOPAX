@@ -55,7 +55,6 @@ from ._reverse_ad_optimization import (
     transport,
 )
 from ._optimization_initial_root_stage import (
-    build_geometry_payload_optimization_stage,
     build_compiled_geometry_initial_root_stage,
     build_geometry_initial_root_optimization_stage,
     initial_root_stage_layout,
@@ -344,7 +343,6 @@ class GeometryInitialErRootLeastSquaresProblem:
     raw_block_stage: object | None = None
     optimization_stage_layout: object | None = None
     optimization_stage: object | None = None
-    payload_optimization_stage: object | None = None
     reverse_stage_mode: str = "off"
 
     @property
@@ -449,7 +447,6 @@ class GeometryInitialErRootLeastSquaresProblem:
             geometry_solver_device=self.geometry_solver_device,
             root_options=self.root_options,
             raw_block_stage=self.raw_block_stage,
-            payload_optimization_stage=self.payload_optimization_stage,
         )
         result = _assemble_mixed_initial_er_root_result(
             self.terms,
@@ -1279,9 +1276,9 @@ def geometry_initial_er_root_only_least_squares_problem(
     """
 
     mode = str(reverse_stage_mode).strip().lower()
-    if mode not in {"off", "payload_optimization", "vmex_like"}:
+    if mode not in {"off", "vmex_like"}:
         raise ValueError(
-            "reverse_stage_mode must be 'off', 'payload_optimization', or 'vmex_like'."
+            "reverse_stage_mode must be 'off' or 'vmex_like'."
         )
     if mode == "vmex_like":
         raise NotImplementedError(
@@ -1360,17 +1357,6 @@ def geometry_initial_er_root_only_least_squares_problem(
     )
     optimization_stage_layout = None
     optimization_stage = None
-    payload_optimization_stage = None
-    if mode == "payload_optimization":
-        payload_optimization_stage = build_geometry_payload_optimization_stage(
-            geometry_context=context,
-            n_r=int(n_r if n_r is not None else geom_cfg.get("n_radial", 51)),
-            n_theta=int(n_theta if n_theta is not None else neoclassical_cfg.get("ntx_exact_n_theta", 25)),
-            n_zeta=int(n_zeta if n_zeta is not None else neoclassical_cfg.get("ntx_exact_n_zeta", 25)),
-            n_xi=int(n_xi if n_xi is not None else neoclassical_cfg.get("ntx_exact_n_xi", 64)),
-            surface_backend=str(surface_backend or neoclassical_cfg.get("ntx_exact_surface_backend", "vmec")),
-            flux_model=str(neoclassical_cfg.get("flux_model", "ntx_database")),
-        )
     if mode == "vmex_like":
         normalized_stage_terms = normalize_least_squares_terms(terms)
         optimization_stage_layout = initial_root_stage_layout(
@@ -1484,7 +1470,6 @@ def geometry_initial_er_root_only_least_squares_problem(
         raw_block_stage=raw_block_stage,
         optimization_stage_layout=optimization_stage_layout,
         optimization_stage=optimization_stage,
-        payload_optimization_stage=payload_optimization_stage,
         reverse_stage_mode=mode,
     )
 

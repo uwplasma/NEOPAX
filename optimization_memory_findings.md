@@ -73,6 +73,7 @@ and no warm-execution regression.
 1. **Remove the rejected payload-artifact route from the proposed solution.**
    It may remain available only as a diagnostic until it is deleted, but it
    must not be selected by an optimization example or treated as a memory fix.
+   **Completed:** it is no longer an accepted builder or memory-harness mode.
 
 2. **Define an optimization-only boundary API.**
    Add a fixed-layout stage, keyed by the existing TOML-selected flux model,
