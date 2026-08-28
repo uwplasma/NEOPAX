@@ -57,6 +57,7 @@ from ._reverse_ad_optimization import (
 )
 from ._optimization_initial_root_stage import (
     InitialErTransportPayloadAdapter,
+    build_initial_root_payload_assembly_stage,
     build_compiled_geometry_initial_root_stage,
     build_geometry_initial_root_optimization_stage,
     initial_root_stage_layout,
@@ -345,6 +346,7 @@ class GeometryInitialErRootLeastSquaresProblem:
     raw_block_stage: object | None = None
     optimization_stage_layout: object | None = None
     optimization_stage: object | None = None
+    payload_assembly_stage: object | None = None
     reverse_stage_mode: str = "off"
 
     @property
@@ -459,6 +461,7 @@ class GeometryInitialErRootLeastSquaresProblem:
         )
         if self.reverse_stage_mode == "optimization":
             evaluator_kwargs["transport_reverse_stage"] = self.optimization_stage
+            evaluator_kwargs["payload_assembly_stage"] = self.payload_assembly_stage
         base_evaluation = evaluator(self.config, **evaluator_kwargs)
         result = _assemble_mixed_initial_er_root_result(
             self.terms,
@@ -1380,6 +1383,44 @@ def geometry_initial_er_root_only_least_squares_problem(
             runtime=runtime,
             payload_adapter=InitialErTransportPayloadAdapter.from_payload(stage_support_payload),
         )
+        if raw_block_stage is None:
+            raise ValueError("optimization initial-root stage requires VMEC boundary parameters.")
+        stage_transport_objectives = tuple(
+            term.objective.name
+            for term in normalized_terms
+            if term.objective.family == "transport"
+        )
+
+        def _stage_payload(raw_block_solve, geometry_deltas, values, profile_gradient, support_bars):
+            return _optimization_payload_to_vmec_table(
+                objective_labels=stage_transport_objectives,
+                profile_parameter_labels=tuple(spec.name for spec in profile_specs),
+                geometry_parameter_labels=tuple(spec.label for spec in parameter_set.vmec_boundary_specs),
+                objective_values=values,
+                profile_gradient_matrix=profile_gradient,
+                geometry_context=context,
+                baseline_geometry_deltas=geometry_deltas,
+                geometry_param_specs=tuple(spec.as_tuple() for spec in parameter_set.vmec_boundary_specs),
+                support_bars=support_bars,
+                support_component_bars_by_name={},
+                include_component_pullbacks=False,
+                combined_geometry_payload=True,
+                n_r=int(n_r if n_r is not None else geom_cfg.get("n_radial", 51)),
+                n_theta=int(n_theta if n_theta is not None else neoclassical_cfg.get("ntx_exact_n_theta", 25)),
+                n_zeta=int(n_zeta if n_zeta is not None else neoclassical_cfg.get("ntx_exact_n_zeta", 25)),
+                n_xi=int(n_xi if n_xi is not None else neoclassical_cfg.get("ntx_exact_n_xi", 64)),
+                surface_backend=str(surface_backend or neoclassical_cfg.get("ntx_exact_surface_backend", "vmec")),
+                max_iter=geometry_max_iter,
+                solver_device=geometry_solver_device,
+                progress_label=None,
+                raw_block_solve=raw_block_solve,
+                return_branch_gradients=False,
+            )
+
+        payload_assembly_stage = build_initial_root_payload_assembly_stage(
+            raw_block_stage=raw_block_stage,
+            payload_to_vmec_impl=_stage_payload,
+        )
     if mode == "vmex_like":
         normalized_stage_terms = normalize_least_squares_terms(terms)
         optimization_stage_layout = initial_root_stage_layout(
@@ -1493,6 +1534,7 @@ def geometry_initial_er_root_only_least_squares_problem(
         raw_block_stage=raw_block_stage,
         optimization_stage_layout=optimization_stage_layout,
         optimization_stage=optimization_stage,
+        payload_assembly_stage=payload_assembly_stage,
         reverse_stage_mode=mode,
     )
 

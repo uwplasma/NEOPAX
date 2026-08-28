@@ -153,6 +153,13 @@ class GeometryInitialRootOptimizationStage:
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
+class InitialRootPayloadAssemblyStage:
+    """Persistent final payload-to-VMEC transpose for one optimization stage."""
+
+    payload_to_vmec: Callable[..., Any]
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
 class InitialRootReverseKernelSet:
     """Stable identities for the measured initial-root reverse boundaries.
 
@@ -386,6 +393,41 @@ def compiled_initial_root_stage_operators(
 
     del raw_block_stage  # Static ownership is established by the bound impls.
     return jax.jit(root_impl), jax.jit(payload_impl)
+
+
+def build_initial_root_payload_assembly_stage(
+    *,
+    raw_block_stage: GeometryRawBlockStage,
+    payload_to_vmec_impl: Callable[[GeometryRawBlockSolve, Any, Any, Any, Any], Any],
+) -> InitialRootPayloadAssemblyStage:
+    """Compile only the final existing payload-to-VMEC boundary.
+
+    The raw VMEC solution is reconstructed from the shared dynamic raw payload.
+    No root solve, objective calculation, or transport reverse operation is
+    included in this boundary.
+    """
+
+    def payload_operator(
+        dynamic_raw_payload,
+        geometry_deltas,
+        objective_values,
+        profile_gradient_matrix,
+        support_bars,
+    ):
+        raw_block_solve = raw_block_solve_from_dynamic_payload(
+            raw_block_stage, dynamic_raw_payload
+        )
+        return payload_to_vmec_impl(
+            raw_block_solve,
+            geometry_deltas,
+            objective_values,
+            profile_gradient_matrix,
+            support_bars,
+        )
+
+    return InitialRootPayloadAssemblyStage(
+        payload_to_vmec=jax.jit(payload_operator, inline=False)
+    )
 
 
 def build_compiled_geometry_initial_root_stage(

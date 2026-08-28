@@ -2177,6 +2177,7 @@ def geometry_active_initial_er_root_only_reverse_table_optimization(
     options: Mapping[str, object] | None = None,
     optimization_stage=None,
     transport_reverse_stage: InitialErTransportReverseStage | None = None,
+    payload_assembly_stage=None,
 ) -> ObjectiveTableResult:
     """Return compact initial-Er objective table for active realtime geometry.
 
@@ -2286,8 +2287,12 @@ def geometry_active_initial_er_root_only_reverse_table_optimization(
         raw_block_solve=raw_block_solve,
         return_branch_gradients=False,
     )
-    payload_operator = _optimization_payload_to_vmec_table if optimization_stage is None else optimization_stage.payload_to_vmec
-    if optimization_stage is None:
+    payload_operator = (
+        _optimization_payload_to_vmec_table
+        if optimization_stage is None and payload_assembly_stage is None
+        else (optimization_stage.payload_to_vmec if optimization_stage is not None else payload_assembly_stage.payload_to_vmec)
+    )
+    if optimization_stage is None and payload_assembly_stage is None:
         assembly_result = payload_operator(**payload_args)
     else:
         assembly_result = payload_operator(
@@ -2989,6 +2994,7 @@ def evaluate_geometry_initial_er_root_only_least_squares_optimization(
     raw_block_stage=None,
     optimization_stage=None,
     transport_reverse_stage: InitialErTransportReverseStage | None = None,
+    payload_assembly_stage=None,
 ) -> LeastSquaresEvaluation:
     """Evaluate mixed objectives using only benchmark-validated table backends."""
 
@@ -3062,6 +3068,7 @@ def evaluate_geometry_initial_er_root_only_least_squares_optimization(
                 options=root_runner_options,
                 optimization_stage=optimization_stage,
                 transport_reverse_stage=transport_reverse_stage,
+                payload_assembly_stage=payload_assembly_stage,
             )
             transport_values, transport_jacobian = jax.block_until_ready(
                 (transport_result.values, transport_result.jacobian)
