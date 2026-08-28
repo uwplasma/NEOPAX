@@ -30,6 +30,7 @@ from ._orchestrator import build_runtime_context
 from ._orchestrator import run_config
 from ._reverse_ad_initial_er import (
     find_ntx_support_payload,
+    initial_er_charge_flux_residuals,
     initial_er_selected_root_profile,
     runtime_with_geometry_payload,
     runtime_with_ntx_support_payload,
@@ -55,6 +56,8 @@ from ._reverse_ad_optimization import (
     transport,
 )
 from ._optimization_initial_root_stage import (
+    InitialRootReverseDependencies,
+    build_initial_root_reverse_kernels_optimization,
     build_compiled_geometry_initial_root_stage,
     build_geometry_initial_root_optimization_stage,
     initial_root_stage_layout,
@@ -77,7 +80,7 @@ from ._reverse_ad_transport import (
     realtime_geometry_transport_reverse_table_context,
     run_internal_realtime_geometry_support_segment_probe,
 )
-from ._transport_flux_models import DENSITY_STATE_TO_PHYSICAL
+from ._transport_flux_models import DENSITY_STATE_TO_PHYSICAL, _add_float_delta_tree
 from .api import prepare_config
 
 
@@ -427,7 +430,12 @@ class GeometryInitialErRootLeastSquaresProblem:
             scaled_values = jnp.asarray(scaled_parameter_values, dtype=jnp.float64)
         physical_values = self._scaled_to_physical(scaled_values)
         base_terms = _base_terms_for_mixed_initial_er_root(self.terms)
-        base_evaluation = evaluate_geometry_initial_er_root_only_least_squares_benchmark_tables(
+        evaluator = (
+            evaluate_geometry_initial_er_root_only_least_squares_benchmark_tables
+            if self.reverse_stage_mode == "off"
+            else evaluate_geometry_initial_er_root_only_least_squares_optimization
+        )
+        base_evaluation = evaluator(
             self.config,
             parameter_set=self.parameter_set,
             parameter_values=physical_values,
@@ -447,6 +455,11 @@ class GeometryInitialErRootLeastSquaresProblem:
             geometry_solver_device=self.geometry_solver_device,
             root_options=self.root_options,
             raw_block_stage=self.raw_block_stage,
+            **(
+                {}
+                if self.reverse_stage_mode == "off"
+                else {"root_reverse_kernels": self.optimization_stage}
+            ),
         )
         result = _assemble_mixed_initial_er_root_result(
             self.terms,
@@ -1276,9 +1289,9 @@ def geometry_initial_er_root_only_least_squares_problem(
     """
 
     mode = str(reverse_stage_mode).strip().lower()
-    if mode not in {"off", "vmex_like"}:
+    if mode not in {"off", "root_geometry_optimization", "vmex_like"}:
         raise ValueError(
-            "reverse_stage_mode must be 'off' or 'vmex_like'."
+            "reverse_stage_mode must be 'off', 'root_geometry_optimization', or 'vmex_like'."
         )
     if mode == "vmex_like":
         raise NotImplementedError(
@@ -1357,6 +1370,18 @@ def geometry_initial_er_root_only_least_squares_problem(
     )
     optimization_stage_layout = None
     optimization_stage = None
+    if mode == "root_geometry_optimization":
+        flux_model = getattr(runtime.models.flux, "neoclassical_model", runtime.models.flux)
+        optimization_stage = build_initial_root_reverse_kernels_optimization(
+            neoclassical_model=flux_model,
+            runtime_static=runtime,
+            dependencies=InitialRootReverseDependencies(
+                add_float_delta_tree=_add_float_delta_tree,
+                runtime_with_geometry_payload=runtime_with_geometry_payload,
+                runtime_with_ntx_support_payload=runtime_with_ntx_support_payload,
+                initial_er_charge_flux_residuals=initial_er_charge_flux_residuals,
+            ),
+        )
     if mode == "vmex_like":
         normalized_stage_terms = normalize_least_squares_terms(terms)
         optimization_stage_layout = initial_root_stage_layout(

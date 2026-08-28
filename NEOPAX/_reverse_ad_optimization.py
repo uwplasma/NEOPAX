@@ -2796,6 +2796,7 @@ def evaluate_geometry_initial_er_root_only_least_squares_optimization(
     root_options: Mapping[str, object] | None = None,
     raw_block_stage=None,
     optimization_stage=None,
+    root_reverse_kernels=None,
 ) -> LeastSquaresEvaluation:
     """Evaluate mixed objectives using only benchmark-validated table backends."""
 
@@ -2868,6 +2869,7 @@ def evaluate_geometry_initial_er_root_only_least_squares_optimization(
                 raw_block_solve=shared_raw_block_solve,
                 options=root_runner_options,
                 optimization_stage=optimization_stage,
+                root_reverse_kernels=root_reverse_kernels,
             )
             transport_values, transport_jacobian = jax.block_until_ready(
                 (transport_result.values, transport_result.jacobian)
