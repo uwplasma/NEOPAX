@@ -782,76 +782,6 @@ class GeometryRawBlockSolve:
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
-class GeometryPayloadStructuralArtifacts:
-    """Fixed payload-pullback metadata for one VMEC/Boozer stage.
-
-    These fields describe only grid, mode, and transform structure.  They do
-    not contain a trial VMEC state, geometry/NTX payload, objective value, or
-    cotangent.
-    """
-
-    geometry_requested_sample_rho: Any
-    geometry_boozer_surface_sampling: Any
-    r00_boozer_surface_sampling: Any
-    booz_constants_grids: Any
-    booz_mode_indices: tuple[int | None, int | None]
-    booz_mode00: int
-
-
-def geometry_payload_structural_artifacts_from_state(
-    context: "GeometryAutodiffContext",
-    state,
-    *,
-    n_r: int,
-) -> GeometryPayloadStructuralArtifacts:
-    """Create reusable payload structure without retaining ``state``.
-
-    Boozer transform constants and grids are determined by the fixed VMEC
-    layout.  The supplied state is used only to construct the backend input
-    required by the existing constants factory; it is intentionally absent
-    from the returned object.
-    """
-
-    requested_sample_rho = _neopax_geometry_requested_sample_rho(context, n_r=int(n_r))
-    geometry_sampling = _boozer_surface_indices_and_rho(context.static, requested_sample_rho)
-    r00_center = np.linspace(0.0, 1.0, int(n_r), dtype=float)
-    r00_faces = (
-        np.asarray([0.0, 1.0], dtype=float)
-        if int(n_r) == 1
-        else np.concatenate(
-            [np.asarray([0.0]), 0.5 * (r00_center[:-1] + r00_center[1:]), np.asarray([1.0])]
-        )
-    )
-    r00_sampling = _boozer_surface_indices_and_rho(
-        context.static,
-        np.unique(np.concatenate([r00_center, r00_faces])),
-    )
-    inputs = _booz_xform_inputs_from_state(
-        state=state,
-        static=context.static,
-        indata=context.indata,
-        signgs=context.signgs,
-        flux=context.flux,
-    )
-    constants_grids = _booz_constants_and_grids_for_inputs(context, inputs)
-    _constants, grids = constants_grids
-    mode00 = _find_boozer_mode_index(grids.xm_b, grids.xn_b, m_value=0, n_value=0)
-    if mode00 is None:
-        raise ValueError("Boozer grids are missing the (0,0) mode.")
-    return GeometryPayloadStructuralArtifacts(
-        geometry_requested_sample_rho=requested_sample_rho,
-        geometry_boozer_surface_sampling=geometry_sampling,
-        r00_boozer_surface_sampling=r00_sampling,
-        booz_constants_grids=constants_grids,
-        booz_mode_indices=(
-            mode00,
-            _find_boozer_mode_index(grids.xm_b, grids.xn_b, m_value=1, n_value=0),
-        ),
-        booz_mode00=mode00,
-    )
-
-
-@dataclasses.dataclass(frozen=True, slots=True)
 class GeometryRawBlockStage:
     """Static VMEX raw-block setup reused by one optimization stage.
 
@@ -5192,7 +5122,6 @@ def geometry_payload_pullback_from_param_vector_raw_block_transpose(
     extra_state_bars_factory=None,
     native_vmec_face_coefficient_bars: Mapping[str, object] | None = None,
     return_raw_block_solve: bool = False,
-    structural_artifacts: GeometryPayloadStructuralArtifacts | None = None,
     dispatch_cache_probe=None,
 ) -> object:
     """Pull transport payload cotangents back to VMEC boundary harmonics.
@@ -5245,10 +5174,9 @@ def geometry_payload_pullback_from_param_vector_raw_block_transpose(
         raise AttributeError(
             "The active VMEC backend does not expose implicit_state_pullback_multi_rhs_raw_block_transpose."
         )
-    if structural_artifacts is None:
-        # Keep the benchmark/default preparation path verbatim.  The
-        # optimization-only stage supplies ``structural_artifacts`` explicitly
-        # and is the only route that may reuse this metadata.
+    # Benchmark/default payload preparation. The rejected optimization-only
+    # structural-artifact reuse route has been removed.
+    if True:  # Keep the established benchmark preparation block verbatim.
         geometry_requested_sample_rho = _neopax_geometry_requested_sample_rho(context, n_r=int(n_r))
         geometry_boozer_surface_sampling = _boozer_surface_indices_and_rho(
             context.static,
@@ -5302,13 +5230,6 @@ def geometry_payload_pullback_from_param_vector_raw_block_transpose(
                 n_value=0,
             ),
         )
-    else:
-        geometry_requested_sample_rho = structural_artifacts.geometry_requested_sample_rho
-        geometry_boozer_surface_sampling = structural_artifacts.geometry_boozer_surface_sampling
-        r00_boozer_surface_sampling = structural_artifacts.r00_boozer_surface_sampling
-        geometry_booz_constants_grids = structural_artifacts.booz_constants_grids
-        geometry_booz_mode_indices = structural_artifacts.booz_mode_indices
-        geometry_booz_mode00 = structural_artifacts.booz_mode00
     _probe("after_payload_structure")
 
     def geometry_from_state(state_inner):

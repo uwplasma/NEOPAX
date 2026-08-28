@@ -1398,7 +1398,6 @@ def geometry_active_initial_er_root_only_reverse_table(
     raw_block_solve=None,
     support_payload_override=None,
     options: Mapping[str, object] | None = None,
-    payload_optimization_stage=None,
     dispatch_cache_probe=None,
 ) -> ObjectiveTableResult:
     """Return compact initial-Er objective table for active realtime geometry.
@@ -1676,9 +1675,6 @@ def geometry_active_initial_er_root_only_reverse_table(
     _probe("after_payload_cotangents_ready")
 
     geometry_param_tuples = tuple(spec.as_tuple() for spec in vmec_specs)
-    structural_artifacts = None
-    if payload_optimization_stage is not None and raw_block_solve is not None:
-        structural_artifacts = payload_optimization_stage.initialize_from_raw_state(raw_block_solve.state)
     assembly_result = realtime_geometry_transport_reverse_table_from_payload_cotangents(
         objective_labels=requested_objectives,
         profile_parameter_labels=tuple(spec.name for spec in profile_specs),
@@ -1702,7 +1698,6 @@ def geometry_active_initial_er_root_only_reverse_table(
         progress_label=progress_label,
         raw_block_solve=raw_block_solve,
         return_branch_gradients=False,
-        structural_artifacts=structural_artifacts,
     )
 
     geometry_gradient_matrix = jnp.asarray(assembly_result.table_result.geometry_gradient_matrix)
@@ -1737,7 +1732,6 @@ def _optimization_payload_to_vmec_table(
     combined_geometry_payload, return_branch_gradients,
     n_r, n_theta, n_zeta, n_xi, surface_backend, max_iter,
     solver_device, progress_label, raw_block_solve,
-    structural_artifacts=None,
 ):
     """Optimization-only boundary around the established payload pullback."""
     return realtime_geometry_transport_reverse_table_from_payload_cotangents(
@@ -1757,7 +1751,6 @@ def _optimization_payload_to_vmec_table(
         surface_backend=str(surface_backend), max_iter=max_iter,
         solver_device=solver_device, progress_label=progress_label,
         raw_block_solve=raw_block_solve, return_branch_gradients=return_branch_gradients,
-        structural_artifacts=structural_artifacts,
     )
 
 
@@ -2541,7 +2534,6 @@ def evaluate_geometry_initial_er_root_only_least_squares_benchmark_tables(
     geometry_solver_device: str | None = "default",
     root_options: Mapping[str, object] | None = None,
     raw_block_stage=None,
-    payload_optimization_stage=None,
 ) -> LeastSquaresEvaluation:
     """Evaluate mixed objectives using only benchmark-validated table backends."""
 
@@ -2613,7 +2605,6 @@ def evaluate_geometry_initial_er_root_only_least_squares_benchmark_tables(
                 progress_label="[optimization] initial-Er root geometry payload pullback:",
                 raw_block_solve=shared_raw_block_solve,
                 options=root_runner_options,
-                payload_optimization_stage=payload_optimization_stage,
             )
             transport_values, transport_jacobian = jax.block_until_ready(
                 (transport_result.values, transport_result.jacobian)

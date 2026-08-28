@@ -15,10 +15,8 @@ from typing import Any
 import jax
 
 from ._geometry_autodiff import (
-    GeometryPayloadStructuralArtifacts,
     GeometryRawBlockSolve,
     GeometryRawBlockStage,
-    geometry_payload_structural_artifacts_from_state,
 )
 
 
@@ -68,56 +66,6 @@ class LazyStageArtifacts:
         self.booz_constants_grids = booz_constants_grids
         self.booz_mode_indices = booz_mode_indices
         self.initialized = True
-
-
-@dataclasses.dataclass(slots=True)
-class GeometryPayloadOptimizationStage:
-    """Optimization-only owner of fixed payload-pullback structure.
-
-    Initialization occurs once from the first raw VMEC state.  The stored
-    result excludes that state and all evaluation-specific payload data.
-    """
-
-    geometry_context: Any
-    n_r: int
-    n_theta: int
-    n_zeta: int
-    n_xi: int
-    surface_backend: str
-    flux_model: str
-    artifacts: GeometryPayloadStructuralArtifacts | None = None
-
-    def initialize_from_raw_state(self, state) -> GeometryPayloadStructuralArtifacts:
-        if self.artifacts is None:
-            self.artifacts = geometry_payload_structural_artifacts_from_state(
-                self.geometry_context,
-                state,
-                n_r=int(self.n_r),
-            )
-        return self.artifacts
-
-
-def build_geometry_payload_optimization_stage(
-    *,
-    geometry_context: Any,
-    n_r: int,
-    n_theta: int,
-    n_zeta: int,
-    n_xi: int,
-    surface_backend: str,
-    flux_model: str,
-) -> GeometryPayloadOptimizationStage:
-    """Create an empty per-layout stage; trial data is supplied later."""
-
-    return GeometryPayloadOptimizationStage(
-        geometry_context=geometry_context,
-        n_r=int(n_r),
-        n_theta=int(n_theta),
-        n_zeta=int(n_zeta),
-        n_xi=int(n_xi),
-        surface_backend=str(surface_backend),
-        flux_model=str(flux_model),
-    )
 
 
 def build_geometry_initial_root_optimization_stage(
