@@ -59,7 +59,10 @@ from ._reverse_ad_transport import (
     realtime_geometry_transport_reverse_table_request,
     transport_realtime_geometry_reverse_table,
 )
-from ._optimization_initial_root_stage import raw_block_dynamic_payload
+from ._optimization_initial_root_stage import (
+    InitialErTransportPayloadAdapter,
+    raw_block_dynamic_payload,
+)
 
 
 ObjectiveFamily = Literal["transport", "geometry", "regularization"]
@@ -813,6 +816,95 @@ def _direct_initial_er_objective_values_and_state_bars(
             er_bar = jnp.zeros_like(er).at[right_index].set(1.0)
         rows.append(dataclasses.replace(zero_state, Er=er_bar))
     return jnp.stack(values), _stack_tree_rows(rows)
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class InitialErTransportReverseStage:
+    """Persistent, bounded reverse kernels for one initial-Er optimization stage.
+
+    The benchmark route does not construct this object.  Each kernel receives
+    all current numerical data explicitly; geometry/support metadata stays in
+    ``payload_adapter`` and is never traced as a dynamic JAX argument.
+    """
+
+    payload_adapter: InitialErTransportPayloadAdapter
+    state_pullback: Callable[..., Any]
+    geometry_pullback: Callable[..., Any]
+    support_pullback: Callable[..., Any]
+
+
+def build_initial_er_transport_reverse_stage(
+    *,
+    runtime,
+    payload_adapter: InitialErTransportPayloadAdapter,
+) -> InitialErTransportReverseStage:
+    """Build the three fixed-signature transport reverse kernels once.
+
+    This is intentionally below the optimizer and VMEC boundaries: each
+    kernel covers one existing compact reverse operation only.  No objective
+    assembly, geometry solve, or payload-to-VMEC pullback is fused into it.
+    """
+
+    def _runtime_from_leaves(geometry_leaves, support_leaves):
+        payload = payload_adapter.rebuild(geometry_leaves, support_leaves)
+        runtime_with_geometry = runtime_with_geometry_payload(runtime, payload["geometry"])
+        return runtime_with_ntx_support_payload(
+            runtime_with_geometry, payload["ntx_support"]
+        )
+
+    def _state_pullback(state, er_profile, residual_bars, geometry_leaves, support_leaves):
+        return compact_initial_er_state_pullback(
+            residual_scalar_fn=initial_er_charge_flux_residual_scalar,
+            state=state,
+            er_profile=er_profile,
+            residual_bars=residual_bars,
+            runtime=_runtime_from_leaves(geometry_leaves, support_leaves),
+        )
+
+    def _geometry_pullback(
+        state,
+        er_profile,
+        residual_bars,
+        geometry_delta,
+        geometry_leaves,
+        support_leaves,
+    ):
+        payload = payload_adapter.rebuild(geometry_leaves, support_leaves)
+        geometry_base = jax.tree_util.tree_map(jax.lax.stop_gradient, payload["geometry"])
+        support_base = jax.tree_util.tree_map(jax.lax.stop_gradient, payload["ntx_support"])
+
+        def _residuals_from_delta(delta):
+            trial_geometry = _add_float_delta_tree(geometry_base, delta)
+            runtime_with_geometry = runtime_with_geometry_payload(runtime, trial_geometry)
+            runtime_with_geometry = runtime_with_ntx_support_payload(
+                runtime_with_geometry, support_base
+            )
+            return initial_er_charge_flux_residuals(
+                jax.tree_util.tree_map(jax.lax.stop_gradient, state),
+                jax.lax.stop_gradient(er_profile),
+                runtime=runtime_with_geometry,
+            )
+
+        _, pullback = jax.vjp(_residuals_from_delta, geometry_delta)
+        return jax.vmap(lambda bars: pullback(bars)[0])(residual_bars)
+
+    def _support_pullback(state, er_profile, residual_bars, geometry_leaves, support_leaves):
+        payload = payload_adapter.rebuild(geometry_leaves, support_leaves)
+        runtime_with_geometry = runtime_with_geometry_payload(runtime, payload["geometry"])
+        return compact_initial_er_ntx_support_pullback_leaves(
+            runtime=runtime_with_geometry,
+            state=state,
+            er_profile=er_profile,
+            residual_bars=residual_bars,
+            support=payload["ntx_support"],
+        )
+
+    return InitialErTransportReverseStage(
+        payload_adapter=payload_adapter,
+        state_pullback=jax.jit(_state_pullback, inline=False),
+        geometry_pullback=jax.jit(_geometry_pullback, inline=False),
+        support_pullback=jax.jit(_support_pullback, inline=False),
+    )
 
 
 def initial_er_root_only_reverse_table(
@@ -1810,8 +1902,11 @@ def _optimization_root_to_payload_cotangents(
     n_zeta, n_xi, surface_backend, raw_block_solve, support_payload,
     use_runtime_payload, profile_specs, options, boozer_surface_sampling=None,
     r00_boozer_surface_sampling=None,
-    transport_payload_adapter=None,
+    transport_reverse_stage: InitialErTransportReverseStage | None = None,
 ):
+    transport_payload_adapter = (
+        None if transport_reverse_stage is None else transport_reverse_stage.payload_adapter
+    )
     if use_runtime_payload:
         baseline_geometry = support_payload["geometry"]
         baseline_ntx_support = support_payload["ntx_support"]
@@ -1837,6 +1932,11 @@ def _optimization_root_to_payload_cotangents(
         )
         baseline_geometry = stage_payload["geometry"]
         baseline_ntx_support = stage_payload["ntx_support"]
+        geometry_leaves, support_leaves = transport_payload_adapter.dynamic_leaves(
+            {"geometry": baseline_geometry, "ntx_support": baseline_ntx_support}
+        )
+    else:
+        geometry_leaves = support_leaves = None
     runtime_for_geometry = runtime_with_geometry_payload(runtime, baseline_geometry)
     runtime_for_geometry = runtime_with_ntx_support_payload(runtime_for_geometry, baseline_ntx_support)
     geometry_delta0 = _float_delta_tree_like(baseline_geometry)
@@ -1950,13 +2050,22 @@ def _optimization_root_to_payload_cotangents(
         -jnp.asarray(rooted_state_bars.Er) / safe_dres_der[None, :],
         0.0,
     )
-    state_residual_bars = compact_initial_er_state_pullback(
-        residual_scalar_fn=initial_er_charge_flux_residual_scalar,
-        state=pre_root_state,
-        er_profile=er_profile,
-        residual_bars=residual_bars,
-        runtime=runtime_for_geometry,
-    )
+    if transport_reverse_stage is None:
+        state_residual_bars = compact_initial_er_state_pullback(
+            residual_scalar_fn=initial_er_charge_flux_residual_scalar,
+            state=pre_root_state,
+            er_profile=er_profile,
+            residual_bars=residual_bars,
+            runtime=runtime_for_geometry,
+        )
+    else:
+        state_residual_bars = transport_reverse_stage.state_pullback(
+            pre_root_state,
+            er_profile,
+            residual_bars,
+            geometry_leaves,
+            support_leaves,
+        )
     direct_pre_root_state_bars = dataclasses.replace(
         rooted_state_bars,
         Er=jnp.zeros_like(rooted_state_bars.Er),
@@ -1992,23 +2101,42 @@ def _optimization_root_to_payload_cotangents(
             runtime=runtime_with_geometry,
         )
 
-    _, geometry_residual_pullback = jax.vjp(
-        _residuals_from_geometry_delta,
-        geometry_delta0,
-    )
-    residual_geometry_bars = jax.vmap(
-        lambda residual_bar: geometry_residual_pullback(residual_bar)[0]
-    )(residual_bars)
+    if transport_reverse_stage is None:
+        _, geometry_residual_pullback = jax.vjp(
+            _residuals_from_geometry_delta,
+            geometry_delta0,
+        )
+        residual_geometry_bars = jax.vmap(
+            lambda residual_bar: geometry_residual_pullback(residual_bar)[0]
+        )(residual_bars)
+    else:
+        residual_geometry_bars = transport_reverse_stage.geometry_pullback(
+            pre_root_state,
+            er_profile,
+            residual_bars,
+            geometry_delta0,
+            geometry_leaves,
+            support_leaves,
+        )
     geometry_bars = _add_trees(direct_geometry_bars, residual_geometry_bars)
 
     ntx_runtime = runtime_with_geometry_payload(runtime_for_geometry, baseline_geometry)
-    ntx_bar_leaves = compact_initial_er_ntx_support_pullback_leaves(
-        runtime=ntx_runtime,
-        state=pre_root_state,
-        er_profile=er_profile,
-        residual_bars=residual_bars,
-        support=baseline_ntx_support,
-    )
+    if transport_reverse_stage is None:
+        ntx_bar_leaves = compact_initial_er_ntx_support_pullback_leaves(
+            runtime=ntx_runtime,
+            state=pre_root_state,
+            er_profile=er_profile,
+            residual_bars=residual_bars,
+            support=baseline_ntx_support,
+        )
+    else:
+        ntx_bar_leaves = transport_reverse_stage.support_pullback(
+            pre_root_state,
+            er_profile,
+            residual_bars,
+            geometry_leaves,
+            support_leaves,
+        )
     _, ntx_treedef = jax.tree_util.tree_flatten(baseline_ntx_support)
     ntx_bars = ntx_treedef.unflatten(tuple(ntx_bar_leaves))
     support_bars = []
@@ -2048,7 +2176,7 @@ def geometry_active_initial_er_root_only_reverse_table_optimization(
     support_payload_override=None,
     options: Mapping[str, object] | None = None,
     optimization_stage=None,
-    transport_payload_adapter=None,
+    transport_reverse_stage: InitialErTransportReverseStage | None = None,
 ) -> ObjectiveTableResult:
     """Return compact initial-Er objective table for active realtime geometry.
 
@@ -2119,7 +2247,7 @@ def geometry_active_initial_er_root_only_reverse_table_optimization(
         use_runtime_payload=use_runtime_payload,
         profile_specs=profile_specs,
         options=options,
-        transport_payload_adapter=transport_payload_adapter,
+        transport_reverse_stage=transport_reverse_stage,
     )
     if optimization_stage is None:
         root_args["raw_block_solve"] = raw_block_solve
@@ -2860,7 +2988,7 @@ def evaluate_geometry_initial_er_root_only_least_squares_optimization(
     root_options: Mapping[str, object] | None = None,
     raw_block_stage=None,
     optimization_stage=None,
-    transport_payload_adapter=None,
+    transport_reverse_stage: InitialErTransportReverseStage | None = None,
 ) -> LeastSquaresEvaluation:
     """Evaluate mixed objectives using only benchmark-validated table backends."""
 
@@ -2933,7 +3061,7 @@ def evaluate_geometry_initial_er_root_only_least_squares_optimization(
                 raw_block_solve=shared_raw_block_solve,
                 options=root_runner_options,
                 optimization_stage=optimization_stage,
-                transport_payload_adapter=transport_payload_adapter,
+                transport_reverse_stage=transport_reverse_stage,
             )
             transport_values, transport_jacobian = jax.block_until_ready(
                 (transport_result.values, transport_result.jacobian)
