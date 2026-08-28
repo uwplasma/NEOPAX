@@ -1375,6 +1375,7 @@ def geometry_initial_er_root_only_least_squares_problem(
     )
     optimization_stage_layout = None
     optimization_stage = None
+    payload_assembly_stage = None
     if mode in {"optimization", "optimization_payload_experiment"}:
         stage_support_payload = find_ntx_support_payload(runtime)
         if not isinstance(stage_support_payload, dict):
