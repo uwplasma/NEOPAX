@@ -739,6 +739,7 @@ def main() -> int:
         or args.diagnose_jax_dispatch_cache
         or args.diagnose_payload_dispatch
         or args.diagnose_support_reverse_dispatch
+        or args.diagnose_support_reverse_rss
         or args.diagnose_raw_solve_dispatch
         or args.persistent_raw_solve_jit
         or args.persistent_raw_params
@@ -759,6 +760,7 @@ def main() -> int:
                 transport_dispatch=args.diagnose_transport_dispatch,
                 payload_dispatch=args.diagnose_payload_dispatch,
                 support_reverse_dispatch=args.diagnose_support_reverse_dispatch,
+                support_reverse_rss=args.diagnose_support_reverse_rss,
                 raw_implicit=getattr(problem.raw_block_stage, "implicit", None),
             )
             for patcher in patchers:
