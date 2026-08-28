@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Memory test for geometry plus all four initial-Er root objective rows.
+"""Memory test for geometry plus selected initial-Er root objective rows.
 
 The problem is built by the matching optimization example, so it uses its
 max-Er, left/right transition, and bootstrap-current terms and root options.
@@ -41,6 +41,23 @@ from optimize_geometry_qi_max_er_transition_bootstrap_initial_root import (  # n
 
 DEFAULT_WARMUP = 1
 DEFAULT_REPEATS = 8
+
+
+def _terms_for_objective_set(objective_set: str):
+    """Keep geometry terms and select transport rows for branch attribution."""
+
+    selected = []
+    for term in example.terms:
+        objective = getattr(term[0], "objective", term[0])
+        if objective.family != "transport":
+            selected.append(term)
+            continue
+        is_bootstrap = objective.name == "bootstrap_current_softmax_abs_scaled"
+        if objective_set == "all" or (objective_set == "er_only" and not is_bootstrap) or (
+            objective_set == "bootstrap_only" and is_bootstrap
+        ):
+            selected.append(term)
+    return selected
 
 
 class QuietProblem:
@@ -377,6 +394,12 @@ def _one_cleanup_sample(problem, x, iteration: int, *, clear_jax_caches: bool, t
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--mode", choices=("off", "vmex_like"), default="off")
+    parser.add_argument(
+        "--objective-set",
+        choices=("all", "er_only", "bootstrap_only"),
+        default="all",
+        help="Keep geometry terms and select all, Er-only, or bootstrap-only transport rows.",
+    )
     parser.add_argument("--warmup", type=int, default=DEFAULT_WARMUP)
     parser.add_argument("--repeats", type=int, default=DEFAULT_REPEATS)
     parser.add_argument(
@@ -480,11 +503,14 @@ def main() -> int:
     if not np.isscalar(MAX_MODE_SCHEDULE):
         raise ValueError("The memory test requires one fixed MAX_MODE_SCHEDULE value.")
     previous_mode = example.REVERSE_STAGE_MODE
+    previous_terms = example.terms
     try:
         example.REVERSE_STAGE_MODE = args.mode
+        example.terms = _terms_for_objective_set(args.objective_set)
         problem = build_transition_bootstrap_initial_root_problem(SEED_INPUT, int(MAX_MODE_SCHEDULE))
     finally:
         example.REVERSE_STAGE_MODE = previous_mode
+        example.terms = previous_terms
     quiet_problem = QuietProblem(problem)
     x = np.asarray(jax.device_get(problem.x0), dtype=float)
     optimization_raw_block_stage = None
@@ -608,7 +634,7 @@ def main() -> int:
             )
 
     print(
-        f"[memory test] mode={args.mode} objectives=maxEr,Er_left,Er_right,J_bootstrap "
+        f"[memory test] mode={args.mode} objective_set={args.objective_set} "
         f"warmup={args.warmup} repeats={args.repeats} parameter_count={problem.parameter_count}",
         flush=True,
     )
