@@ -84,6 +84,143 @@ class InitialRootReverseOptimizationStage:
     kernels: InitialRootReverseKernelSet
 
 
+@dataclasses.dataclass(frozen=True, slots=True)
+class InitialRootReverseDependencies:
+    """Existing benchmark operations used by optimization-only adapters."""
+
+    add_float_delta_tree: Callable[..., Any]
+    runtime_with_geometry_payload: Callable[..., Any]
+    runtime_with_ntx_support_payload: Callable[..., Any]
+    initial_er_charge_flux_residuals: Callable[..., Any]
+
+    def __post_init__(self) -> None:
+        for field in dataclasses.fields(self):
+            if not callable(getattr(self, field.name)):
+                raise TypeError(f"{field.name} must be callable.")
+
+
+def _stop_gradient_tree(tree):
+    return jax.tree_util.tree_map(
+        lambda leaf: jax.lax.stop_gradient(leaf) if hasattr(leaf, "dtype") else leaf,
+        tree,
+    )
+
+
+def _root_geometry_residuals_optimization(
+    pre_root_state,
+    er_profile,
+    baseline_geometry,
+    baseline_support,
+    geometry_delta,
+    *,
+    runtime_static,
+    dependencies: InitialRootReverseDependencies,
+):
+    """Stable all-input residual callable with the benchmark derivative split.
+
+    The benchmark differentiates only the geometry-delta argument here. The
+    other trial values are explicit primal inputs but are stopped, so a VJP of
+    this stable callable has precisely the same active derivative path.
+    """
+
+    geometry = dependencies.add_float_delta_tree(
+        _stop_gradient_tree(baseline_geometry),
+        geometry_delta,
+    )
+    runtime = dependencies.runtime_with_geometry_payload(runtime_static, geometry)
+    runtime = dependencies.runtime_with_ntx_support_payload(
+        runtime,
+        _stop_gradient_tree(baseline_support),
+    )
+    return dependencies.initial_er_charge_flux_residuals(
+        _stop_gradient_tree(pre_root_state),
+        jax.lax.stop_gradient(er_profile),
+        runtime=runtime,
+    )
+
+
+def build_initial_root_reverse_kernels_optimization(
+    *,
+    neoclassical_model: Any,
+    runtime_static: Any,
+    dependencies: InitialRootReverseDependencies,
+) -> InitialRootReverseKernelSet:
+    """Create stable optimization-only adapters for the measured boundaries.
+
+    ``neoclassical_model`` and ``runtime_static`` are stage-static. Each
+    returned callable receives the current trial's state, geometry, support,
+    and cotangents explicitly. The formulas remain those of the existing
+    momentum-corrected model and initial-Er residual.
+    """
+
+    def _model_for_trial(geometry, support):
+        return dataclasses.replace(
+            neoclassical_model,
+            geometry=geometry,
+            support=support,
+        )
+
+    def corrected_bootstrap_fluxes_optimization(rooted_state, geometry, support):
+        return _model_for_trial(geometry, support).evaluate_momentum_corrected_fluxes(
+            rooted_state
+        )
+
+    def bootstrap_state_pullback_optimization(rooted_state, upar_bar, geometry, support):
+        return _model_for_trial(geometry, support).pullback_momentum_corrected_upar_state_by_radius(
+            rooted_state,
+            upar_bar,
+        )
+
+    def bootstrap_geometry_pullback_optimization(rooted_state, upar_bar, geometry, support):
+        return _model_for_trial(geometry, support).pullback_momentum_corrected_upar_geometry_by_radius(
+            rooted_state,
+            upar_bar,
+            geometry,
+            support,
+        )
+
+    def bootstrap_support_pullback_optimization(rooted_state, upar_bar, geometry, support):
+        return _model_for_trial(geometry, support).pullback_momentum_corrected_upar_support_by_radius(
+            rooted_state,
+            upar_bar,
+            support,
+        )
+
+    root_geometry_residuals = functools.partial(
+        _root_geometry_residuals_optimization,
+        runtime_static=runtime_static,
+        dependencies=dependencies,
+    )
+
+    def root_geometry_residual_pullback_optimization(
+        pre_root_state,
+        er_profile,
+        baseline_geometry,
+        baseline_support,
+        residual_bars,
+        geometry_delta,
+    ):
+        """Return geometry bars using the benchmark's delta-only VJP split."""
+
+        _, pullback = jax.vjp(
+            root_geometry_residuals,
+            pre_root_state,
+            er_profile,
+            baseline_geometry,
+            baseline_support,
+            geometry_delta,
+        )
+        return jax.vmap(lambda bars: pullback(bars)[4])(residual_bars)
+
+    return InitialRootReverseKernelSet(
+        corrected_bootstrap_fluxes=corrected_bootstrap_fluxes_optimization,
+        bootstrap_state_pullback=bootstrap_state_pullback_optimization,
+        bootstrap_geometry_pullback=bootstrap_geometry_pullback_optimization,
+        bootstrap_support_pullback=bootstrap_support_pullback_optimization,
+        root_geometry_residual_pullback=root_geometry_residual_pullback_optimization,
+    )
+
+
 def build_initial_root_reverse_optimization_stage(
     *,
     layout: InitialRootStageLayout,

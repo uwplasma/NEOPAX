@@ -1,5 +1,6 @@
 """Unit checks for optimization-only reuse of VMEX raw-block setup."""
 
+import dataclasses
 from types import SimpleNamespace
 
 import jax.numpy as jnp
@@ -156,3 +157,59 @@ def test_initial_root_reverse_stage_owns_only_callable_kernel_identities():
     assert stage.layout is layout
     assert stage.kernels.corrected_bootstrap_fluxes is kernel
     assert stage.kernels.root_geometry_residual_pullback is kernel
+
+
+def test_initial_root_reverse_kernel_adapters_keep_trial_geometry_and_support_dynamic():
+    @dataclasses.dataclass(frozen=True)
+    class Model:
+        geometry: object
+        support: object
+
+        def evaluate_momentum_corrected_fluxes(self, state):
+            return ("flux", state, self.geometry, self.support)
+
+        def pullback_momentum_corrected_upar_state_by_radius(self, state, bars):
+            return ("state", state, bars, self.geometry, self.support)
+
+        def pullback_momentum_corrected_upar_geometry_by_radius(
+            self, state, bars, geometry, support
+        ):
+            return ("geometry", state, bars, geometry, support, self.geometry, self.support)
+
+        def pullback_momentum_corrected_upar_support_by_radius(self, state, bars, support):
+            return ("support", state, bars, support, self.geometry, self.support)
+
+    dependencies = initial_root_stage.InitialRootReverseDependencies(
+        add_float_delta_tree=lambda base, delta: base + delta,
+        runtime_with_geometry_payload=lambda _runtime, geometry: geometry,
+        runtime_with_ntx_support_payload=lambda geometry, support: (geometry, support),
+        initial_er_charge_flux_residuals=lambda _state, er, *, runtime: runtime[0] + er[0],
+    )
+    kernels = initial_root_stage.build_initial_root_reverse_kernels_optimization(
+        neoclassical_model=Model(geometry="static-geometry", support="static-support"),
+        runtime_static=object(),
+        dependencies=dependencies,
+    )
+
+    assert kernels.corrected_bootstrap_fluxes("state", "geometry", "support") == (
+        "flux", "state", "geometry", "support"
+    )
+    assert kernels.bootstrap_state_pullback("state", "bars", "geometry", "support") == (
+        "state", "state", "bars", "geometry", "support"
+    )
+    assert kernels.bootstrap_geometry_pullback("state", "bars", "geometry", "support") == (
+        "geometry", "state", "bars", "geometry", "support", "geometry", "support"
+    )
+    assert kernels.bootstrap_support_pullback("state", "bars", "geometry", "support") == (
+        "support", "state", "bars", "support", "geometry", "support"
+    )
+
+    geometry_bars = kernels.root_geometry_residual_pullback(
+        jnp.asarray([0.0]),
+        jnp.asarray([2.0]),
+        jnp.asarray([3.0, 4.0]),
+        jnp.asarray([0.0]),
+        jnp.asarray([[1.0, 2.0], [3.0, 4.0]]),
+        jnp.zeros((2,)),
+    )
+    assert jnp.array_equal(geometry_bars, jnp.asarray([[1.0, 2.0], [3.0, 4.0]]))
