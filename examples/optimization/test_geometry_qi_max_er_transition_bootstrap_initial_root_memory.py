@@ -407,7 +407,17 @@ def _one_cleanup_sample(problem, x, iteration: int, *, clear_jax_caches: bool, t
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--mode", choices=("off", "optimization", "vmex_like"), default="off")
+    parser.add_argument(
+        "--mode",
+        choices=(
+            "off",
+            "optimization",
+            "optimization_root_experiment",
+            "optimization_payload_experiment",
+            "vmex_like",
+        ),
+        default="off",
+    )
     parser.add_argument(
         "--objective-set",
         choices=(
