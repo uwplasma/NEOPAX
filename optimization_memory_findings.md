@@ -68,6 +68,48 @@ Acceptance: four-row residual/Jacobian parity versus `off`, one VMEX/root solve
 per evaluation, no new entries at these boundaries after warmup, no RSS slope,
 and no warm-execution regression.
 
+## Implementation plan
+
+1. **Remove the rejected payload-artifact route from the proposed solution.**
+   It may remain available only as a diagnostic until it is deleted, but it
+   must not be selected by an optimization example or treated as a memory fix.
+
+2. **Define an optimization-only boundary API.**
+   Add a fixed-layout stage, keyed by the existing TOML-selected flux model,
+   objective layout, radial/grid layout, and VMEC parameter layout. It owns
+   stable function identities, not trial values. Its dynamic input bundle is
+   the current rooted state, pre-root state, geometry, NTX support, residual
+   bars, bootstrap `Upar` bars, and geometry delta.
+
+3. **Implement the five measured operators behind that API.**
+   They reproduce the established operations exactly: corrected bootstrap
+   fluxes; bootstrap state, geometry, and support pullbacks; and the
+   root-geometry residual VJP plus its batched application. Reuse existing
+   formulas/callbacks. The root-geometry boundary must preserve the existing
+   derivative partition: geometry delta is the differentiated input and the
+   current state/support inputs are dynamic but not differentiated. Do not
+   replace it with a broad all-input VJP.
+
+4. **Connect an explicit optimization mode only.**
+   `off` continues to invoke the current benchmark route verbatim. The new
+   stage is built once per optimization problem and used only by the geometry
+   plus initial-root exact-Lij example. No outer fused JIT is introduced.
+
+5. **Verify correctness and topology.**
+   Compare all four residual rows and Jacobian rows to `off`; retain the
+   existing floating-point tolerance. Verify one raw solve and one selected
+   root per evaluation.
+
+6. **Verify the intended memory behavior.**
+   Run the existing two- and three-repeat diagnostic. Each measured bootstrap
+   and root-geometry boundary must have a flat dispatch-cache count after
+   warmup. Then compare warm elapsed time; reject the stage if it trades the
+   RSS slope for a material warm-time regression.
+
+7. **Only then consider full transport.**
+   Its accepted-step path can vary, so it needs a separate fixed-topology
+   stage design rather than being attached to this initial-root stage.
+
 ## Relevant files
 
 - `NEOPAX/_reverse_ad_optimization.py`: mixed initial-root table and bootstrap
