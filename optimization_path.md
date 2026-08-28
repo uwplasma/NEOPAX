@@ -17,18 +17,20 @@ evaluation produces the following JAX dispatch-cache growth:
 
 The process RSS rises by about 0.68 GiB per evaluation while `jax.live_arrays`
 is flat and the evaluation still performs exactly one raw VMEC solve and one
-selected-root solve. The transport-specific slope is therefore primarily in
-the payload-to-VMEC reverse table, not in geometry-vector extraction, VMEC
-parameter setup, or duplicated geometry/root calculations.
+selected-root solve. The initial boundary attribution to the payload-to-VMEC
+table was too coarse: an internal probe shows that table is entered after most
+of the new entries already exist. The dominant source is instead the preceding
+transport-support/root reverse that constructs the payload cotangents; it is
+not geometry-vector extraction, VMEC parameter setup, or duplicated
+geometry/root calculations.
 
 The payload table calls the established
 `geometry_payload_pullback_from_param_vector_raw_block_transpose` route.
-The measurements prove that the +13 entries occur somewhere inside that
-payload reverse boundary, but they do **not** yet identify which internal
-operation owns them. In particular, reusing the fixed Boozer/grid metadata
+The measurements show that only the final few entries occur in this boundary;
+the larger part is created before entry. Reusing fixed Boozer/grid metadata
 did not change the count or RSS slope, so that hypothesis is rejected. The
-next step is diagnostic-only instrumentation around the existing support VJP,
-geometry VJP, and raw-block transpose boundaries.
+next step is diagnostic-only instrumentation around the existing compact
+support/root reverse that creates the payload cotangents.
 
 ### Invariants
 

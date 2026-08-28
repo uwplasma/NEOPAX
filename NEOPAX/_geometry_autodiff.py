@@ -5903,6 +5903,7 @@ def geometry_payload_pullback_from_param_vector_raw_block_transpose(
         return state_bar_batch
 
     def _try_compact_payload_tangent_contract_to_param_matrix():
+        _probe("compact_tangent_contract_entry")
         if (
             not combined_payload
             or payload_kind == "ntx_scan_runtime"
@@ -5915,10 +5916,14 @@ def geometry_payload_pullback_from_param_vector_raw_block_transpose(
             return None
         geometry_bars = tuple(payload_bar["geometry"] for payload_bar in payload_bars)
         support_bars = tuple(payload_bar[support_branch_name] for payload_bar in payload_bars)
+        _probe("before_compact_geometry_setup")
         geometry_setup = _payload_branch_pullback_setup("geometry", geometry_from_state, geometry_bars)
+        _probe("after_compact_geometry_setup")
+        _probe("before_compact_ntx_support_setup")
         support_setup = _payload_branch_pullback_setup(
             support_branch_name, support_from_state, support_bars
         )
+        _probe("after_compact_ntx_support_setup")
         native_bar_tuple = None
         if native_vmec_face_coefficient_bars is not None:
             native_names = (
@@ -5985,17 +5990,21 @@ def geometry_payload_pullback_from_param_vector_raw_block_transpose(
                 + _native_coefficient_tangent_contraction(state_tangent)
             )
 
+        _probe("before_compact_tangent_map")
         gradient_columns = jax.lax.map(
             _single_gradient_column,
             param_tangent_batch,
         )
+        _probe("after_compact_tangent_map")
         if progress_label is not None:
             print(
                 f"{progress_label} compact_payload_tangent_contract=True "
                 f"native_vmec_coefficient_tangent_contract={native_bar_tuple is not None}",
                 flush=True,
             )
-        return jnp.swapaxes(gradient_columns, 0, 1)
+        result = jnp.swapaxes(gradient_columns, 0, 1)
+        _probe("after_compact_tangent_contract")
+        return result
 
     # Native face-coefficient bars are contracted against the same implicit
     # state tangents as the ordinary payload leaves. This keeps the bridge on
