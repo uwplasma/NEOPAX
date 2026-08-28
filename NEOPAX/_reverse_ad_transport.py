@@ -5462,6 +5462,7 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
     initial_er_root_support_bars = None
     if initial_er_root_enabled:
         phase_start = time.perf_counter()
+        root_selection_start = phase_start
         er_profile, finite_mask = dependencies.initial_er_selected_root_profile(
             pre_root_initial_state,
             config=config,
@@ -5486,7 +5487,9 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
             -jnp.asarray(initial_state_bars.Er) / safe_dres_der[None, :],
             0.0,
         )
+        root_selection_and_linearization_elapsed = time.perf_counter() - root_selection_start
 
+        root_state_pullback_start = time.perf_counter()
         state_residual_bars = dependencies.compact_initial_er_state_pullback(
             residual_scalar_fn=dependencies.initial_er_charge_flux_residual_scalar,
             state=pre_root_initial_state,
@@ -5494,6 +5497,9 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
             residual_bars=residual_bars,
             runtime=runtime,
         )
+        if phase_timing_diagnostics:
+            state_residual_bars = jax.block_until_ready(state_residual_bars)
+        root_state_pullback_elapsed = time.perf_counter() - root_state_pullback_start
         direct_initial_state_bars = dataclasses.replace(
             initial_state_bars,
             Er=jnp.zeros_like(initial_state_bars.Er),
@@ -5503,6 +5509,8 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
             state_residual_bars,
         )
 
+        root_geometry_pullback_elapsed = None
+        root_ntx_support_pullback_elapsed = None
         if combined_geometry_payload and "ntx_support" in support_payload:
             geometry = support_payload["geometry"]
             ntx_support = support_payload["ntx_support"]
@@ -5523,17 +5531,29 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
                     runtime=runtime_with_geometry,
                 )
 
+            root_geometry_pullback_start = time.perf_counter()
             _, geometry_pullback = jax.vjp(_residuals_from_geometry_delta, geometry_delta0)
             geometry_bars = jax.vmap(lambda residual_bar: geometry_pullback(residual_bar)[0])(
                 residual_bars
             )
+            if phase_timing_diagnostics:
+                geometry_bars = jax.block_until_ready(geometry_bars)
+            root_geometry_pullback_elapsed = (
+                time.perf_counter() - root_geometry_pullback_start
+            )
             ntx_runtime = dependencies.runtime_with_geometry_payload(runtime, geometry)
+            root_ntx_support_pullback_start = time.perf_counter()
             ntx_bar_leaves = dependencies.compact_initial_er_ntx_support_pullback_leaves(
                 runtime=ntx_runtime,
                 state=pre_root_initial_state,
                 er_profile=er_profile,
                 residual_bars=residual_bars,
                 support=ntx_support,
+            )
+            if phase_timing_diagnostics:
+                ntx_bar_leaves = jax.block_until_ready(ntx_bar_leaves)
+            root_ntx_support_pullback_elapsed = (
+                time.perf_counter() - root_ntx_support_pullback_start
             )
             initial_er_root_support_bars = (
                 tuple(jax.tree_util.tree_leaves(geometry_bars)) + tuple(ntx_bar_leaves)
@@ -5555,25 +5575,39 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
                 return dependencies.initial_er_charge_flux_residuals(
                     pre_root_initial_state,
                     er_profile,
-                    runtime=runtime_with_support,
-                )
+                runtime=runtime_with_support,
+            )
 
+            root_geometry_pullback_start = time.perf_counter()
             _, support_pullback = jax.vjp(
                 _residuals_from_support_delta, support_delta0
             )
             batched_support_bars = jax.vmap(
                 lambda residual_bar: support_pullback(residual_bar)[0]
             )(residual_bars)
+            if phase_timing_diagnostics:
+                batched_support_bars = jax.block_until_ready(batched_support_bars)
+            root_geometry_pullback_elapsed = (
+                time.perf_counter() - root_geometry_pullback_start
+            )
             initial_er_root_support_bars = tuple(
                 jax.tree_util.tree_leaves(batched_support_bars)
             )
         else:
+            root_ntx_support_pullback_start = time.perf_counter()
             initial_er_root_support_bars = dependencies.compact_initial_er_ntx_support_pullback_leaves(
                 runtime=runtime,
                 state=pre_root_initial_state,
                 er_profile=er_profile,
                 residual_bars=residual_bars,
                 support=support_payload,
+            )
+            if phase_timing_diagnostics:
+                initial_er_root_support_bars = jax.block_until_ready(
+                    initial_er_root_support_bars
+                )
+            root_ntx_support_pullback_elapsed = (
+                time.perf_counter() - root_ntx_support_pullback_start
             )
         pre_root_initial_state_bars, initial_er_root_support_bars = jax.block_until_ready(
             (pre_root_initial_state_bars, initial_er_root_support_bars)
@@ -5583,6 +5617,20 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
             f"elapsed_s={time.perf_counter() - phase_start:.3f}",
             flush=True,
         )
+        if phase_timing_diagnostics:
+            def _root_component_time(value):
+                return "n/a" if value is None else f"{value:.3f}"
+
+            print(
+                f"{progress_prefix} diagnostic: initial-Er root boundary components "
+                f"root_selection_and_linearization_s="
+                f"{root_selection_and_linearization_elapsed:.3f} "
+                f"state_residual_transpose_s={root_state_pullback_elapsed:.3f} "
+                f"direct_geometry_transpose_s={_root_component_time(root_geometry_pullback_elapsed)} "
+                f"ntx_support_transpose_s={_root_component_time(root_ntx_support_pullback_elapsed)} "
+                "(diagnostic synchronization only; no duplicate pullbacks or result change)",
+                flush=True,
+            )
         initial_state_bars = pre_root_initial_state_bars
 
     phase_start = time.perf_counter()
