@@ -2048,7 +2048,12 @@ def _optimization_root_to_payload_cotangents(
     use_selected_root_kernel: bool = False,
     use_strict_selected_root_kernel: bool = False,
     use_per_radius_selected_root_kernel: bool = False,
+    dispatch_cache_probe=None,
 ):
+    def _probe(label: str) -> None:
+        if dispatch_cache_probe is not None:
+            dispatch_cache_probe(str(label))
+
     transport_payload_adapter = (
         None if transport_reverse_stage is None else transport_reverse_stage.payload_adapter
     )
@@ -2089,11 +2094,13 @@ def _optimization_root_to_payload_cotangents(
 
     pre_root_state = pre_root_state_from_profile_values(profile_values_arr)
     if transport_reverse_stage is None or not use_selected_root_kernel:
+        _probe("before_benchmark_selected_root")
         er_profile, finite_mask = initial_er_selected_root_profile(
             pre_root_state,
             config=dict(config),
             runtime=runtime_for_geometry,
         )
+        _probe("after_benchmark_selected_root")
     else:
         selected_root = (
             transport_reverse_stage.selected_root_per_radius
@@ -2104,11 +2111,13 @@ def _optimization_root_to_payload_cotangents(
                 else transport_reverse_stage.selected_root
             )
         )
+        _probe("before_experimental_selected_root")
         er_profile, finite_mask = selected_root(
             pre_root_state,
             geometry_leaves,
             support_leaves,
         )
+        _probe("after_experimental_selected_root")
     er_profile = jnp.asarray(er_profile, dtype=pre_root_state.Er.dtype)
     finite_mask = jnp.asarray(finite_mask, dtype=bool)
     rooted_state = dataclasses.replace(pre_root_state, Er=er_profile)
@@ -2212,6 +2221,7 @@ def _optimization_root_to_payload_cotangents(
         0.0,
     )
     if transport_reverse_stage is None:
+        _probe("before_compact_state_pullback")
         state_residual_bars = compact_initial_er_state_pullback(
             residual_scalar_fn=initial_er_charge_flux_residual_scalar,
             state=pre_root_state,
@@ -2220,6 +2230,7 @@ def _optimization_root_to_payload_cotangents(
             runtime=runtime_for_geometry,
         )
     else:
+        _probe("before_compact_state_pullback")
         state_residual_bars = transport_reverse_stage.state_pullback(
             pre_root_state,
             er_profile,
@@ -2227,6 +2238,7 @@ def _optimization_root_to_payload_cotangents(
             geometry_leaves,
             support_leaves,
         )
+    _probe("after_compact_state_pullback")
     direct_pre_root_state_bars = dataclasses.replace(
         rooted_state_bars,
         Er=jnp.zeros_like(rooted_state_bars.Er),
@@ -2234,6 +2246,7 @@ def _optimization_root_to_payload_cotangents(
     pre_root_state_bars = _add_trees(direct_pre_root_state_bars, state_residual_bars)
 
     if profile_specs:
+        _probe("before_profile_pullback")
         _, profile_pullback = jax.vjp(
             pre_root_state_from_profile_values,
             profile_values_arr,
@@ -2241,6 +2254,7 @@ def _optimization_root_to_payload_cotangents(
         profile_gradient_all = jax.vmap(lambda state_bar: profile_pullback(state_bar)[0])(
             pre_root_state_bars
         )
+        _probe("after_profile_pullback")
     else:
         profile_gradient_all = jnp.zeros((objective_count, 0), dtype=jnp.asarray(objective_values).dtype)
     canonical_profile_lookup = {name: i for i, name in enumerate(PROFILE_PARAMETER_ORDER)}
@@ -2263,6 +2277,7 @@ def _optimization_root_to_payload_cotangents(
         )
 
     if transport_reverse_stage is None:
+        _probe("before_compact_geometry_pullback")
         _, geometry_residual_pullback = jax.vjp(
             _residuals_from_geometry_delta,
             geometry_delta0,
@@ -2271,6 +2286,7 @@ def _optimization_root_to_payload_cotangents(
             lambda residual_bar: geometry_residual_pullback(residual_bar)[0]
         )(residual_bars)
     else:
+        _probe("before_compact_geometry_pullback")
         residual_geometry_bars = transport_reverse_stage.geometry_pullback(
             pre_root_state,
             er_profile,
@@ -2279,10 +2295,12 @@ def _optimization_root_to_payload_cotangents(
             geometry_leaves,
             support_leaves,
         )
+    _probe("after_compact_geometry_pullback")
     geometry_bars = _add_trees(direct_geometry_bars, residual_geometry_bars)
 
     ntx_runtime = runtime_with_geometry_payload(runtime_for_geometry, baseline_geometry)
     if transport_reverse_stage is None:
+        _probe("before_compact_ntx_support_pullback")
         ntx_bar_leaves = compact_initial_er_ntx_support_pullback_leaves(
             runtime=ntx_runtime,
             state=pre_root_state,
@@ -2291,6 +2309,7 @@ def _optimization_root_to_payload_cotangents(
             support=baseline_ntx_support,
         )
     else:
+        _probe("before_compact_ntx_support_pullback")
         ntx_bar_leaves = transport_reverse_stage.support_pullback(
             pre_root_state,
             er_profile,
@@ -2298,6 +2317,7 @@ def _optimization_root_to_payload_cotangents(
             geometry_leaves,
             support_leaves,
         )
+    _probe("after_compact_ntx_support_pullback")
     _, ntx_treedef = jax.tree_util.tree_flatten(baseline_ntx_support)
     ntx_bars = ntx_treedef.unflatten(tuple(ntx_bar_leaves))
     support_bars = []
@@ -2423,6 +2443,7 @@ def geometry_active_initial_er_root_only_reverse_table_optimization(
         use_selected_root_kernel=use_selected_root_kernel,
         use_strict_selected_root_kernel=use_strict_selected_root_kernel,
         use_per_radius_selected_root_kernel=use_per_radius_selected_root_kernel,
+        dispatch_cache_probe=dispatch_cache_probe,
     )
     if optimization_stage is None:
         root_args["raw_block_solve"] = raw_block_solve
