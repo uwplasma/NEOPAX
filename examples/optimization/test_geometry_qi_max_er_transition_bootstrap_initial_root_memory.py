@@ -317,6 +317,8 @@ class EvaluationStructureCounter:
 
         def count_geometry_table(*args, **kwargs):
             record_geometry_dispatch("geometry_table_entry")
+            if geometry_dispatch:
+                kwargs["dispatch_cache_probe"] = record_geometry_dispatch
             result = geometry_table(*args, **kwargs)
             record_geometry_dispatch("geometry_table_return")
             return result

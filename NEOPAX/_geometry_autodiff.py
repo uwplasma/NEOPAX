@@ -3359,6 +3359,7 @@ def geometry_full_ad_objective_table_pullback_from_param_vector(
     solver_device: str | None = None,
     raw_block_solve: GeometryRawBlockSolve | None = None,
     return_state_bars: bool = False,
+    dispatch_cache_probe=None,
 ) -> tuple[dict[str, jnp.ndarray], object]:
     """Return geometry objective values and objective cotangents.
 
@@ -3374,6 +3375,11 @@ def geometry_full_ad_objective_table_pullback_from_param_vector(
     skipped and the second return value is the VMEC-state cotangent tree.
     """
 
+    def _probe(label: str) -> None:
+        if dispatch_cache_probe is not None:
+            dispatch_cache_probe(str(label))
+
+    _probe("geometry_pullback_entry")
     param_deltas = jnp.asarray(param_deltas, dtype=jnp.float64)
     cotangents = jnp.asarray(objective_cotangents, dtype=jnp.float64)
     if cotangents.ndim == 1:
@@ -3428,6 +3434,7 @@ def geometry_full_ad_objective_table_pullback_from_param_vector(
         if str(lane).strip().lower() != "ad" or not _using_current_vmec_jax_context(context):
             raise ValueError("raw_block_transpose final VMEC pullback requires the current VMEX implicit AD lane.")
         if raw_block_solve is None:
+            _probe("before_geometry_raw_block_solve")
             raw_block_solve = geometry_raw_block_solve_from_param_vector(
                 context,
                 param_deltas,
@@ -3435,6 +3442,7 @@ def geometry_full_ad_objective_table_pullback_from_param_vector(
                 max_iter=max_iter,
                 solver_device=solver_device,
             )
+            _probe("after_geometry_raw_block_solve")
         implicit = raw_block_solve.implicit
         implicit_params = raw_block_solve.implicit_params
         implicit_cfg = raw_block_solve.implicit_cfg
@@ -3509,6 +3517,7 @@ def geometry_full_ad_objective_table_pullback_from_param_vector(
         return out
 
     booz, booz_state_pullback = jax.vjp(booz_output_from_state, state)
+    _probe("after_boozer_vjp")
     _progress("booz_xform vjp ready", booz)
     values_by_name: dict[str, jnp.ndarray] = {}
 
@@ -3527,6 +3536,7 @@ def geometry_full_ad_objective_table_pullback_from_param_vector(
         return jnp.stack([jnp.asarray(values[name], dtype=jnp.float64).reshape(()) for name in vmec_names])
 
     vmec_values, vmec_state_pullback = jax.vjp(vmec_vector, state)
+    _probe("after_vmec_objective_vjp")
     values_by_name.update({f"vmec_{name}": vmec_values[i] for i, name in enumerate(vmec_names)})
     vmec_basis = jax.vmap(lambda cot: vmec_state_pullback(cot)[0])(
         jnp.eye(len(vmec_names), dtype=jnp.float64)
@@ -3563,6 +3573,7 @@ def geometry_full_ad_objective_table_pullback_from_param_vector(
         return jnp.asarray(_vmec_state_field(state_inner, "Rcos", "R_cos")[-1, mode00], dtype=jnp.float64).reshape(())
 
     aspect_proxy_value, aspect_proxy_state_pullback = jax.vjp(boozer_aspect_proxy, state)
+    _probe("after_aspect_proxy_vjp")
     values_by_name["boozer_aspect_proxy"] = aspect_proxy_value
     aspect_proxy_unit_state_bar = aspect_proxy_state_pullback(jnp.asarray(1.0, dtype=jnp.float64))[0]
     aspect_proxy_state_bar = _tree_scale_unit_cotangent(
@@ -3589,6 +3600,7 @@ def geometry_full_ad_objective_table_pullback_from_param_vector(
         )
 
     j_qi_maxj_values, j_qi_maxj_pullback = jax.vjp(j_qi_maxj_vector, booz)
+    _probe("after_qi_maxj_vjp")
     values_by_name.update(
         {name: j_qi_maxj_values[i] for i, name in enumerate(j_qi_maxj_names)}
     )
@@ -3603,6 +3615,7 @@ def geometry_full_ad_objective_table_pullback_from_param_vector(
 
     booz_bar = _tree_add_all(boozer_bar, j_qi_maxj_boozer_bar)
     boozer_state_bar = jax.vmap(lambda booz_cotangent: booz_state_pullback(booz_cotangent)[0])(booz_bar)
+    _probe("after_boozer_state_pullback")
     _progress("booz cotangents pulled to state", boozer_state_bar)
 
     state_bar = _tree_add_all(vmec_state_bar, boozer_state_bar, aspect_proxy_state_bar)
@@ -3621,6 +3634,7 @@ def geometry_full_ad_objective_table_pullback_from_param_vector(
             state_bar,
             probe_chunk_size=1,
         )
+        _probe("after_geometry_raw_block_transpose")
         gradient_matrix = _param_vector_gradient_from_implicit_param_grads(param_bar_batch, param_entries)
     elif final_mode in {"lax_map", "sequential"}:
         gradient_matrix = jax.lax.map(lambda state_cotangent: state_pullback(state_cotangent)[0], state_bar)

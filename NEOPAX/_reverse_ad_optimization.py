@@ -4159,6 +4159,7 @@ def geometry_full_ad_reverse_table(
     final_vmec_pullback_mode: str = "raw_block_transpose",
     solver_device: str | None = "default",
     raw_block_solve=None,
+    dispatch_cache_probe=None,
 ) -> ObjectiveTableResult:
     """Evaluate the validated full-geometry reverse table for optimization terms.
 
@@ -4204,6 +4205,7 @@ def geometry_full_ad_reverse_table(
         final_vmec_pullback_mode=final_vmec_pullback_mode,
         solver_device=solver_device,
         raw_block_solve=raw_block_solve,
+        dispatch_cache_probe=dispatch_cache_probe,
     )
     objective_values = jnp.stack(
         [jnp.asarray(values_by_name[name], dtype=jnp.float64).reshape(()) for name in canonical_objectives]
