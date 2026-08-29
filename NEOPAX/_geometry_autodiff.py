@@ -5121,6 +5121,7 @@ def geometry_payload_pullback_from_param_vector_raw_block_transpose(
     extra_state_bars: object | None = None,
     extra_state_bars_factory=None,
     native_vmec_face_coefficient_bars: Mapping[str, object] | None = None,
+    prepared_static=None,
     return_raw_block_solve: bool = False,
     dispatch_cache_probe=None,
 ) -> object:
@@ -5174,9 +5175,10 @@ def geometry_payload_pullback_from_param_vector_raw_block_transpose(
         raise AttributeError(
             "The active VMEC backend does not expose implicit_state_pullback_multi_rhs_raw_block_transpose."
         )
-    # Benchmark/default payload preparation. The rejected optimization-only
-    # structural-artifact reuse route has been removed.
-    if True:  # Keep the established benchmark preparation block verbatim.
+    # Benchmark/default payload preparation remains verbatim when no prepared
+    # artifact is supplied. The optional artifact is used only by the opt-in
+    # optimization payload stage and contains structural data only.
+    if prepared_static is None:
         geometry_requested_sample_rho = _neopax_geometry_requested_sample_rho(context, n_r=int(n_r))
         geometry_boozer_surface_sampling = _boozer_surface_indices_and_rho(
             context.static,
@@ -5230,6 +5232,13 @@ def geometry_payload_pullback_from_param_vector_raw_block_transpose(
                 n_value=0,
             ),
         )
+    else:
+        geometry_requested_sample_rho = prepared_static.geometry_requested_sample_rho
+        geometry_boozer_surface_sampling = prepared_static.geometry_boozer_surface_sampling
+        r00_boozer_surface_sampling = prepared_static.r00_boozer_surface_sampling
+        geometry_booz_constants_grids = prepared_static.booz_constants_grids
+        geometry_booz_mode_indices = prepared_static.geometry_booz_mode_indices
+        geometry_booz_mode00 = prepared_static.r00_booz_mode00
     _probe("after_payload_structure")
 
     def geometry_from_state(state_inner):

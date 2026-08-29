@@ -16,6 +16,31 @@ the normal evaluator:
 | QI/Boozer geometry objectives only | `+34.6 MiB` on the second call | Not the material slope. |
 | Three initial-Er transport objectives only | `+473.8 MiB` on the second call | Dominant retaining path. |
 
+### Payload-stage continuation — 2026-08-29
+
+The accepted opt-in bounded root/reverse stage reduces the transport-only
+repeated slope to about `+349 MiB` per evaluation, but does not make it flat.
+The raw VMEC transpose is already isolated and flat. The remaining work is the
+payload reverse region that maps geometry and NTX-support cotangents to VMEC
+state cotangents.
+
+1. Define an optimization-only prepared-payload contract: stage-static VMEX /
+   Boozer surface sampling, mode indices, and structural constants; dynamic
+   raw state, parameter deltas, objective values, profile gradients, and
+   support cotangents. Do not retain a trial state or cotangent in the stage.
+2. Build those structural artifacts once per optimization problem and thread
+   them only through a separately named optimization payload route. The
+   benchmark payload function and `reverse_stage_mode="off"` are unchanged.
+3. Split the existing payload reverse at its established VMEC-state-cotangent
+   return point. The raw VMEC transpose remains its current isolated boundary;
+   no whole payload/VMEC/Boozer JIT is introduced.
+4. Bind persistent bounded geometry and NTX-support pullback callables to that
+   prepared context. Their numerical operations and derivative partitions must
+   be the existing ones, in the same order.
+5. Check staged residual/Jacobian parity against `off`, then repeat the
+   transport-only memory test. Retain rejected experiments under their explicit
+   modes; never change the benchmark route to make an experiment pass.
+
 The transport-only case still executes exactly one raw VMEX solve and one
 selected initial-Er root. Its JAX dispatch cache grows by eleven entries on
 each evaluated point: selected-root, compact root-state transpose,

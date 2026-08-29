@@ -2011,7 +2011,7 @@ def _optimization_payload_to_vmec_table(
     support_component_bars_by_name, include_component_pullbacks,
     combined_geometry_payload, return_branch_gradients,
     n_r, n_theta, n_zeta, n_xi, surface_backend, max_iter,
-    solver_device, progress_label, raw_block_solve,
+    solver_device, progress_label, raw_block_solve, prepared_payload_static=None,
 ):
     """Optimization-only boundary around the established payload pullback."""
     return realtime_geometry_transport_reverse_table_from_payload_cotangents(
@@ -2031,6 +2031,7 @@ def _optimization_payload_to_vmec_table(
         surface_backend=str(surface_backend), max_iter=max_iter,
         solver_device=solver_device, progress_label=progress_label,
         raw_block_solve=raw_block_solve, return_branch_gradients=return_branch_gradients,
+        prepared_payload_static=prepared_payload_static,
     )
 
 
@@ -2338,6 +2339,7 @@ def geometry_active_initial_er_root_only_reverse_table_optimization(
     use_strict_selected_root_kernel: bool = False,
     use_per_radius_selected_root_kernel: bool = False,
     payload_assembly_stage=None,
+    prepared_payload_static=None,
 ) -> ObjectiveTableResult:
     """Return compact initial-Er objective table for active realtime geometry.
 
@@ -2449,6 +2451,7 @@ def geometry_active_initial_er_root_only_reverse_table_optimization(
         progress_label=progress_label,
         raw_block_solve=raw_block_solve,
         return_branch_gradients=False,
+        prepared_payload_static=prepared_payload_static,
     )
     payload_operator = (
         _optimization_payload_to_vmec_table
@@ -3161,6 +3164,7 @@ def evaluate_geometry_initial_er_root_only_least_squares_optimization(
     use_strict_selected_root_kernel: bool = False,
     use_per_radius_selected_root_kernel: bool = False,
     payload_assembly_stage=None,
+    prepared_payload_static=None,
 ) -> LeastSquaresEvaluation:
     """Evaluate mixed objectives using only benchmark-validated table backends."""
 
@@ -3238,6 +3242,7 @@ def evaluate_geometry_initial_er_root_only_least_squares_optimization(
                 use_strict_selected_root_kernel=use_strict_selected_root_kernel,
                 use_per_radius_selected_root_kernel=use_per_radius_selected_root_kernel,
                 payload_assembly_stage=payload_assembly_stage,
+                prepared_payload_static=prepared_payload_static,
             )
             transport_values, transport_jacobian = jax.block_until_ready(
                 (transport_result.values, transport_result.jacobian)

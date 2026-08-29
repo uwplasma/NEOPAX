@@ -160,6 +160,40 @@ class InitialRootPayloadAssemblyStage:
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
+class PreparedInitialRootPayloadStatic:
+    """Stage-static VMEX/Boozer data for the optimization payload reverse.
+
+    These values describe only a fixed problem layout: requested rho samples,
+    surface-index maps, Boozer constants/grids, and fixed mode indices.  They
+    must be produced before optimization starts and must never contain a raw
+    VMEC state, geometry payload, NTX support payload, root, or cotangent.
+    """
+
+    geometry_requested_sample_rho: Any
+    geometry_boozer_surface_sampling: Any
+    r00_boozer_surface_sampling: Any
+    booz_constants_grids: Any
+    geometry_booz_mode_indices: tuple[int | None, int | None]
+    r00_booz_mode00: int | None
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class PreparedInitialRootPayloadStage:
+    """Optimization-only payload stage with explicit dynamic trial inputs.
+
+    ``payload_to_state_bars`` receives the current raw VMEC solve and support
+    cotangents. ``state_bars_to_vmec`` receives the resulting VMEC-state bars.
+    Keeping these boundaries distinct preserves the benchmark raw-block
+    transpose while allowing the heavy payload reverse to own only immutable
+    structural metadata.
+    """
+
+    static: PreparedInitialRootPayloadStatic
+    payload_to_state_bars: Callable[..., Any]
+    state_bars_to_vmec: Callable[..., Any]
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
 class InitialRootReverseKernelSet:
     """Stable identities for the measured initial-root reverse boundaries.
 

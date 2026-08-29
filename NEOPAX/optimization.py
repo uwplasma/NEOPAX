@@ -57,6 +57,7 @@ from ._reverse_ad_optimization import (
 )
 from ._optimization_initial_root_stage import (
     InitialErTransportPayloadAdapter,
+    PreparedInitialRootPayloadStatic,
     build_initial_root_payload_assembly_stage,
     build_compiled_geometry_initial_root_stage,
     build_geometry_initial_root_optimization_stage,
@@ -346,6 +347,7 @@ class GeometryInitialErRootLeastSquaresProblem:
     raw_block_stage: object | None = None
     optimization_stage_layout: object | None = None
     optimization_stage: object | None = None
+    prepared_payload_static: object | None = None
     payload_assembly_stage: object | None = None
     reverse_stage_mode: str = "off"
 
@@ -470,6 +472,7 @@ class GeometryInitialErRootLeastSquaresProblem:
             evaluator_kwargs["use_selected_root_kernel"] = (
                 self.reverse_stage_mode
                 in {
+                    "optimization",
                     "optimization_root_experiment",
                     "optimization_root_strict_experiment",
                     "optimization_root_per_radius_experiment",
@@ -483,6 +486,8 @@ class GeometryInitialErRootLeastSquaresProblem:
             )
             if self.payload_assembly_stage is not None:
                 evaluator_kwargs["payload_assembly_stage"] = self.payload_assembly_stage
+            if self.prepared_payload_static is not None:
+                evaluator_kwargs["prepared_payload_static"] = self.prepared_payload_static
         base_evaluation = evaluator(self.config, **evaluator_kwargs)
         result = _assemble_mixed_initial_er_root_result(
             self.terms,
@@ -1242,6 +1247,64 @@ def _prepare_initial_er_root_config(config_path, *, device: str | None, vmec_inp
     return config
 
 
+def _prepare_initial_root_payload_static(
+    context,
+    *,
+    n_r: int,
+) -> PreparedInitialRootPayloadStatic | None:
+    """Build immutable VMEX/Boozer payload metadata for one opt-in stage.
+
+    This performs only host-side layout selection from ``context``. It does
+    not receive, solve for, or retain a trial VMEC state or any cotangent.
+    """
+
+    geometry_requested_sample_rho = _neopax_geometry_requested_sample_rho(
+        context, n_r=int(n_r)
+    )
+    geometry_boozer_surface_sampling = _boozer_surface_indices_and_rho(
+        context.static, geometry_requested_sample_rho
+    )
+    center_sample = np.linspace(0.0, 1.0, int(n_r), dtype=float)
+    if int(n_r) > 1:
+        face_sample = np.concatenate(
+            (
+                np.asarray((0.0,), dtype=float),
+                0.5 * (center_sample[:-1] + center_sample[1:]),
+                np.asarray((1.0,), dtype=float),
+            )
+        )
+    else:
+        face_sample = np.asarray((0.0, 1.0), dtype=float)
+    r00_boozer_surface_sampling = _boozer_surface_indices_and_rho(
+        context.static, np.unique(np.concatenate((center_sample, face_sample)))
+    )
+    grids = context.booz_grids
+    if grids is None or context.booz_constants is None:
+        # Keep the current accepted root/reverse stage usable for contexts
+        # whose Boozer backend does not expose reusable structural artifacts.
+        # The prepared payload route will reject that layout explicitly when
+        # it is enabled, rather than changing the existing evaluator.
+        return None
+    xm_b = np.asarray(jax.device_get(grids.xm_b), dtype=int)
+    xn_b = np.asarray(jax.device_get(grids.xn_b), dtype=int)
+
+    def _mode_index(m_value: int, n_value: int) -> int | None:
+        matches = np.flatnonzero((xm_b == int(m_value)) & (xn_b == int(n_value)))
+        return None if matches.size == 0 else int(matches[0])
+
+    mode00 = _mode_index(0, 0)
+    if mode00 is None:
+        raise ValueError("Boozer grids are missing the (0, 0) mode.")
+    return PreparedInitialRootPayloadStatic(
+        geometry_requested_sample_rho=geometry_requested_sample_rho,
+        geometry_boozer_surface_sampling=geometry_boozer_surface_sampling,
+        r00_boozer_surface_sampling=r00_boozer_surface_sampling,
+        booz_constants_grids=(context.booz_constants, context.booz_grids),
+        geometry_booz_mode_indices=(mode00, _mode_index(1, 0)),
+        r00_booz_mode00=mode00,
+    )
+
+
 def _profile_values_from_config(config: dict, dtype) -> jnp.ndarray:
     profiles = config.get("profiles", {})
     defaults = {
@@ -1403,6 +1466,7 @@ def geometry_initial_er_root_only_least_squares_problem(
     )
     optimization_stage_layout = None
     optimization_stage = None
+    prepared_payload_static = None
     payload_assembly_stage = None
     if mode in {
         "optimization",
@@ -1421,6 +1485,10 @@ def geometry_initial_er_root_only_least_squares_problem(
             runtime=runtime,
             payload_adapter=InitialErTransportPayloadAdapter.from_payload(stage_support_payload),
             config=config_eff,
+        )
+        prepared_payload_static = _prepare_initial_root_payload_static(
+            context,
+            n_r=int(n_r if n_r is not None else geom_cfg.get("n_radial", 51)),
         )
     if mode == "optimization_payload_experiment":
         if raw_block_stage is None:
@@ -1574,6 +1642,7 @@ def geometry_initial_er_root_only_least_squares_problem(
         raw_block_stage=raw_block_stage,
         optimization_stage_layout=optimization_stage_layout,
         optimization_stage=optimization_stage,
+        prepared_payload_static=prepared_payload_static,
         payload_assembly_stage=payload_assembly_stage,
         reverse_stage_mode=mode,
     )
