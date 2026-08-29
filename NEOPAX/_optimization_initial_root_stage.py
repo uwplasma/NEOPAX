@@ -489,6 +489,33 @@ def build_initial_root_payload_assembly_stage(
     compiled_payload_operator = None
     support_bars_layout: FloatingPayloadLeafLayout | None = None
     cached_active_payload_layout = None
+    static_dof_mask = None
+
+    def _freeze_dof_mask(dof_mask):
+        """Make VMEX's fixed raw-block mask concrete for its host helpers."""
+
+        def _freeze_leaf(leaf):
+            try:
+                return np.asarray(jax.device_get(leaf)).copy()
+            except (TypeError, ValueError):
+                return leaf
+
+        return jax.tree_util.tree_map(_freeze_leaf, dof_mask)
+
+    def _validate_dof_mask(dof_mask):
+        if static_dof_mask is None:  # pragma: no cover - guarded by caller
+            raise RuntimeError("Initial-Er payload stage has no static VMEX DoF mask.")
+        current_leaves, current_tree = jax.tree_util.tree_flatten(dof_mask)
+        static_leaves, static_tree = jax.tree_util.tree_flatten(static_dof_mask)
+        if current_tree != static_tree or len(current_leaves) != len(static_leaves):
+            raise ValueError("VMEX DoF-mask structure changed within an optimization stage.")
+        for current, expected in zip(current_leaves, static_leaves, strict=True):
+            try:
+                current_host = np.asarray(jax.device_get(current))
+            except (TypeError, ValueError):
+                continue
+            if not np.array_equal(current_host, expected):
+                raise ValueError("VMEX DoF-mask values changed within an optimization stage.")
 
     def _compile_payload_operator(active_payload_layout):
         """Bind an already-inspected leaf layout into one numerical kernel."""
@@ -502,8 +529,16 @@ def build_initial_root_payload_assembly_stage(
         ):
             if support_bars_layout is None:  # pragma: no cover - guarded by caller
                 raise RuntimeError("Initial-Er payload stage has no support-bar layout.")
-            raw_block_solve = raw_block_solve_from_dynamic_payload(
-                raw_block_stage, dynamic_raw_payload
+            if static_dof_mask is None:  # pragma: no cover - guarded by caller
+                raise RuntimeError("Initial-Er payload stage has no static VMEX DoF mask.")
+            implicit_params, state = dynamic_raw_payload
+            raw_block_solve = GeometryRawBlockSolve(
+                implicit=raw_block_stage.implicit,
+                implicit_params=implicit_params,
+                implicit_cfg=raw_block_stage.implicit_cfg,
+                state=state,
+                dof_mask=static_dof_mask,
+                param_entries=raw_block_stage.param_entries,
             )
             support_bars = support_bars_layout.rebuild(support_bars_floating_leaves)
             return payload_to_vmec_impl(
@@ -529,6 +564,7 @@ def build_initial_root_payload_assembly_stage(
 
         nonlocal cached_static, compiled_payload_operator
         nonlocal support_bars_layout, cached_active_payload_layout
+        nonlocal static_dof_mask
         if cached_static is None and prepared_static_factory is not None:
             raw_block_solve = raw_block_solve_from_dynamic_payload(
                 raw_block_stage, dynamic_raw_payload
@@ -557,6 +593,10 @@ def build_initial_root_payload_assembly_stage(
             support_bars_layout = FloatingPayloadLeafLayout.from_template(support_bars)
         else:
             support_bars_layout.validate_static_structure(support_bars)
+        if static_dof_mask is None:
+            static_dof_mask = _freeze_dof_mask(dynamic_raw_payload[2])
+        else:
+            _validate_dof_mask(dynamic_raw_payload[2])
         support_bars_floating_leaves = support_bars_layout.floating_leaves(support_bars)
         active_payload_layout = (
             None
@@ -570,7 +610,7 @@ def build_initial_root_payload_assembly_stage(
             cached_active_payload_layout = active_payload_layout
             compiled_payload_operator = _compile_payload_operator(active_payload_layout)
         return compiled_payload_operator(
-            dynamic_raw_payload,
+            (dynamic_raw_payload[0], dynamic_raw_payload[1]),
             geometry_deltas,
             objective_values,
             profile_gradient_matrix,

@@ -565,6 +565,7 @@ def _build_flux_model(config: dict, species, energy_grid, geometry, database, so
         if "classical" in config
         else None
     )
+    solver_cfg = _normalize_solver_config(config)
 
     if neoclassical_name == "fluxes_r_file":
         neoclassical_model = neoclassical_factory(
@@ -585,6 +586,13 @@ def _build_flux_model(config: dict, species, energy_grid, geometry, database, so
         runtime_kwargs.setdefault("temperature_floor", neoclassical_cfg.get("temperature_floor"))
         if neoclassical_name == "ntx_exact_lij_runtime":
             runtime_kwargs.setdefault("preload_support", True)
+            # The exact model retains two internal response primitives, but
+            # their selection is now owned by the universal transport policy.
+            runtime_kwargs["ntx_exact_center_response_mode"] = (
+                "center_local_response"
+                if solver_cfg["transport_center_flux_mode"] == "direct"
+                else "interpolate_from_faces"
+            )
         neoclassical_model = neoclassical_factory(
             species,
             energy_grid,
@@ -763,17 +771,11 @@ def _build_flux_model(config: dict, species, energy_grid, geometry, database, so
             else ZeroTransportModel()
         )
     )
-    solver_cfg = _normalize_solver_config(config)
     include_turbulent_particle_flux = bool(
         solver_cfg.get(
             "include_turbulent_particle_flux",
             solver_cfg.get("turbulence_include_particle_flux", True),
         )
-    )
-    transport_flux_cfg = config.get("transport_flux", {})
-    has_explicit_center_flux_mode = (
-        isinstance(transport_flux_cfg, dict)
-        and "center_flux_mode" in transport_flux_cfg
     )
     return build_transport_flux_model(
         neoclassical_model,
@@ -781,14 +783,7 @@ def _build_flux_model(config: dict, species, energy_grid, geometry, database, so
         classical_model,
         include_turbulent_particle_flux=include_turbulent_particle_flux,
         geometry=geometry,
-        # Keep existing model-specific behaviour untouched until a config opts
-        # into the universal representation policy.  In particular, legacy
-        # exact-NTX response settings remain compatibility metadata for now.
-        center_flux_mode=(
-            solver_cfg["transport_center_flux_mode"]
-            if has_explicit_center_flux_mode
-            else "direct"
-        ),
+        center_flux_mode=solver_cfg["transport_center_flux_mode"],
     )
 
 

@@ -1263,9 +1263,21 @@ def test_build_flux_model_passes_runtime_ntx_scan_inputs(monkeypatch):
     assert captured["ntx_scan_runtime"]["kwargs"]["vmec_file"] == "wout.nc"
     assert captured["ntx_scan_runtime"]["kwargs"]["boozer_file"] == "boozmn.nc"
     assert captured["ntx_scan_runtime"]["kwargs"]["ntx_scan_rho"] == [0.25, 0.5]
+    assert out["center_flux_mode"] == "direct"
 
 
-def test_build_flux_model_passes_runtime_ntx_exact_lij_inputs(monkeypatch):
+@pytest.mark.parametrize(
+    ("center_flux_mode", "expected_exact_mode"),
+    [
+        ("direct", "center_local_response"),
+        ("interpolate_from_faces", "interpolate_from_faces"),
+    ],
+)
+def test_build_flux_model_passes_runtime_ntx_exact_lij_inputs(
+    monkeypatch,
+    center_flux_mode,
+    expected_exact_mode,
+):
     captured = {}
 
     def fake_get_transport_flux_model(name):
@@ -1299,6 +1311,7 @@ def test_build_flux_model_passes_runtime_ntx_exact_lij_inputs(monkeypatch):
                 "ntx_exact_n_zeta": 21,
                 "ntx_exact_n_xi": 48,
             },
+            "transport_flux": {"center_flux_mode": center_flux_mode},
             "turbulence": {"flux_model": "none"},
             "classical": {"flux_model": "none"},
         },
@@ -1313,6 +1326,11 @@ def test_build_flux_model_passes_runtime_ntx_exact_lij_inputs(monkeypatch):
     assert captured["ntx_exact_lij_runtime"]["kwargs"]["vmec_file"] == "wout.nc"
     assert captured["ntx_exact_lij_runtime"]["kwargs"]["boozer_file"] == "boozmn.nc"
     assert captured["ntx_exact_lij_runtime"]["kwargs"]["ntx_exact_n_theta"] == 19
+    assert (
+        captured["ntx_exact_lij_runtime"]["kwargs"]["ntx_exact_center_response_mode"]
+        == expected_exact_mode
+    )
+    assert out["center_flux_mode"] == center_flux_mode
 
 
 def test_build_ntx_runtime_scan_transport_model_can_skip_prebuild():
