@@ -416,6 +416,7 @@ def main() -> int:
             "optimization_root_strict_experiment",
             "optimization_root_per_radius_experiment",
             "optimization_payload_experiment",
+            "optimization_payload_root_experiment",
             "vmex_like",
         ),
         default="off",
