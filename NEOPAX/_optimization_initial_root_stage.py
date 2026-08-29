@@ -433,6 +433,8 @@ def build_initial_root_payload_assembly_stage(
     *,
     raw_block_stage: GeometryRawBlockStage,
     payload_to_vmec_impl: Callable[[GeometryRawBlockSolve, Any, Any, Any, Any], Any],
+    prepared_static: Any = None,
+    prepared_static_factory: Callable[[Any], Any] | None = None,
 ) -> InitialRootPayloadAssemblyStage:
     """Compile only the final existing payload-to-VMEC boundary.
 
@@ -441,7 +443,10 @@ def build_initial_root_payload_assembly_stage(
     included in this boundary.
     """
 
-    def payload_operator(
+    cached_static = prepared_static
+    compiled_payload_operator = None
+
+    def _payload_operator(
         dynamic_raw_payload,
         geometry_deltas,
         objective_values,
@@ -457,10 +462,47 @@ def build_initial_root_payload_assembly_stage(
             objective_values,
             profile_gradient_matrix,
             support_bars,
+            prepared_static=cached_static,
+        )
+
+    def payload_operator(
+        dynamic_raw_payload,
+        geometry_deltas,
+        objective_values,
+        profile_gradient_matrix,
+        support_bars,
+    ):
+        """Lazily bind structural artifacts before compiling this boundary."""
+
+        nonlocal cached_static, compiled_payload_operator
+        if cached_static is None and prepared_static_factory is not None:
+            raw_block_solve = raw_block_solve_from_dynamic_payload(
+                raw_block_stage, dynamic_raw_payload
+            )
+            cached_static = prepared_static_factory(raw_block_solve.state)
+        if cached_static is None:
+            # This backend has no reusable structural artifact. Preserve the
+            # established eager optimization path rather than tracing host
+            # VMEX/Boozer setup through a JIT.
+            return _payload_operator(
+                dynamic_raw_payload,
+                geometry_deltas,
+                objective_values,
+                profile_gradient_matrix,
+                support_bars,
+            )
+        if compiled_payload_operator is None:
+            compiled_payload_operator = jax.jit(_payload_operator, inline=False)
+        return compiled_payload_operator(
+            dynamic_raw_payload,
+            geometry_deltas,
+            objective_values,
+            profile_gradient_matrix,
+            support_bars,
         )
 
     return InitialRootPayloadAssemblyStage(
-        payload_to_vmec=jax.jit(payload_operator, inline=False)
+        payload_to_vmec=payload_operator
     )
 
 

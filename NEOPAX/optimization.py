@@ -16,6 +16,8 @@ import jax.numpy as jnp
 import numpy as np
 
 from ._geometry_autodiff import (
+    _booz_constants_and_grids_for_inputs,
+    _booz_xform_inputs_from_state,
     _boozer_surface_indices_and_rho,
     _neopax_geometry_requested_sample_rho,
     _input_with_boundary_deltas,
@@ -1252,6 +1254,7 @@ def _prepare_initial_root_payload_static(
     context,
     *,
     n_r: int,
+    state=None,
 ) -> PreparedInitialRootPayloadStatic | None:
     """Build immutable VMEX/Boozer payload metadata for one opt-in stage.
 
@@ -1279,8 +1282,18 @@ def _prepare_initial_root_payload_static(
     r00_boozer_surface_sampling = _boozer_surface_indices_and_rho(
         context.static, np.unique(np.concatenate((center_sample, face_sample)))
     )
+    booz_constants = context.booz_constants
     grids = context.booz_grids
-    if grids is None or context.booz_constants is None:
+    if (grids is None or booz_constants is None) and state is not None:
+        inputs = _booz_xform_inputs_from_state(
+            state=state,
+            static=context.static,
+            indata=context.indata,
+            signgs=context.signgs,
+            flux=context.flux,
+        )
+        booz_constants, grids = _booz_constants_and_grids_for_inputs(context, inputs)
+    if grids is None or booz_constants is None:
         # Keep the current accepted root/reverse stage usable for contexts
         # whose Boozer backend does not expose reusable structural artifacts.
         # The prepared payload route will reject that layout explicitly when
@@ -1300,7 +1313,7 @@ def _prepare_initial_root_payload_static(
         geometry_requested_sample_rho=geometry_requested_sample_rho,
         geometry_boozer_surface_sampling=geometry_boozer_surface_sampling,
         r00_boozer_surface_sampling=r00_boozer_surface_sampling,
-        booz_constants_grids=(context.booz_constants, context.booz_grids),
+        booz_constants_grids=(booz_constants, grids),
         geometry_booz_mode_indices=(mode00, _mode_index(1, 0)),
         r00_booz_mode00=mode00,
     )
@@ -1500,7 +1513,15 @@ def geometry_initial_er_root_only_least_squares_problem(
             if term.objective.family == "transport"
         )
 
-        def _stage_payload(raw_block_solve, geometry_deltas, values, profile_gradient, support_bars):
+        def _stage_payload(
+            raw_block_solve,
+            geometry_deltas,
+            values,
+            profile_gradient,
+            support_bars,
+            *,
+            prepared_static=None,
+        ):
             return _optimization_payload_to_vmec_table(
                 objective_labels=stage_transport_objectives,
                 profile_parameter_labels=tuple(spec.name for spec in profile_specs),
@@ -1523,13 +1544,19 @@ def geometry_initial_er_root_only_least_squares_problem(
                 solver_device=geometry_solver_device,
                 progress_label=None,
                 raw_block_solve=raw_block_solve,
-                prepared_payload_static=prepared_payload_static,
+                prepared_payload_static=prepared_static,
                 return_branch_gradients=False,
             )
 
         payload_assembly_stage = build_initial_root_payload_assembly_stage(
             raw_block_stage=raw_block_stage,
             payload_to_vmec_impl=_stage_payload,
+            prepared_static=prepared_payload_static,
+            prepared_static_factory=lambda state: _prepare_initial_root_payload_static(
+                context,
+                n_r=int(n_r if n_r is not None else geom_cfg.get("n_radial", 51)),
+                state=state,
+            ),
         )
     if mode == "vmex_like":
         normalized_stage_terms = normalize_least_squares_terms(terms)

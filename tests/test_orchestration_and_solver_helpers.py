@@ -77,12 +77,13 @@ def test_build_flux_model_passes_boundary_conditions_and_particle_flux_toggle(mo
 
         return factory
 
-    def fake_build_transport_flux_model(neo, turb, classical, include_turbulent_particle_flux=True):
+    def fake_build_transport_flux_model(neo, turb, classical, include_turbulent_particle_flux=True, **kwargs):
         return {
             "neo": neo,
             "turb": turb,
             "classical": classical,
             "include_turbulent_particle_flux": include_turbulent_particle_flux,
+            **kwargs,
         }
 
     monkeypatch.setattr(main_module, "get_transport_flux_model", fake_get_transport_flux_model)
@@ -98,6 +99,7 @@ def test_build_flux_model_passes_boundary_conditions_and_particle_flux_toggle(mo
     )
 
     assert out["include_turbulent_particle_flux"] is False
+    assert out["center_flux_mode"] == "direct"
     assert out["neo"] == "neo_model_instance"
     assert out["turb"] == "none_instance"
     assert out["classical"] == "none_instance"

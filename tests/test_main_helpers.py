@@ -1228,11 +1228,12 @@ def test_build_flux_model_passes_runtime_ntx_scan_inputs(monkeypatch):
     monkeypatch.setattr("NEOPAX._orchestrator.get_transport_flux_model", fake_get_transport_flux_model)
     monkeypatch.setattr(
         "NEOPAX._orchestrator.build_transport_flux_model",
-        lambda neo, turb, classical, include_turbulent_particle_flux=True: {
+        lambda neo, turb, classical, include_turbulent_particle_flux=True, **kwargs: {
             "neo": neo,
             "turb": turb,
             "classical": classical,
             "include_turbulent_particle_flux": include_turbulent_particle_flux,
+            **kwargs,
         },
     )
 
@@ -1277,11 +1278,12 @@ def test_build_flux_model_passes_runtime_ntx_exact_lij_inputs(monkeypatch):
     monkeypatch.setattr("NEOPAX._orchestrator.get_transport_flux_model", fake_get_transport_flux_model)
     monkeypatch.setattr(
         "NEOPAX._orchestrator.build_transport_flux_model",
-        lambda neo, turb, classical, include_turbulent_particle_flux=True: {
+        lambda neo, turb, classical, include_turbulent_particle_flux=True, **kwargs: {
             "neo": neo,
             "turb": turb,
             "classical": classical,
             "include_turbulent_particle_flux": include_turbulent_particle_flux,
+            **kwargs,
         },
     )
 

@@ -770,11 +770,25 @@ def _build_flux_model(config: dict, species, energy_grid, geometry, database, so
             solver_cfg.get("turbulence_include_particle_flux", True),
         )
     )
+    transport_flux_cfg = config.get("transport_flux", {})
+    has_explicit_center_flux_mode = (
+        isinstance(transport_flux_cfg, dict)
+        and "center_flux_mode" in transport_flux_cfg
+    )
     return build_transport_flux_model(
         neoclassical_model,
         turbulence_model,
         classical_model,
         include_turbulent_particle_flux=include_turbulent_particle_flux,
+        geometry=geometry,
+        # Keep existing model-specific behaviour untouched until a config opts
+        # into the universal representation policy.  In particular, legacy
+        # exact-NTX response settings remain compatibility metadata for now.
+        center_flux_mode=(
+            solver_cfg["transport_center_flux_mode"]
+            if has_explicit_center_flux_mode
+            else "direct"
+        ),
     )
 
 

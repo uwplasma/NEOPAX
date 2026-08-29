@@ -906,12 +906,83 @@ class CombinedTransportFluxModel(TransportFluxModelBase):
     turbulent_model: TransportFluxModelBase
     classical_model: TransportFluxModelBase
     include_turbulent_particle_flux: bool = True
+    geometry: Any = None
+    center_flux_mode: str = "direct"
+
+    def __post_init__(self):
+        mode = str(self.center_flux_mode).strip().lower()
+        aliases = {
+            "default": "direct",
+            "direct_center": "direct",
+            "interpolate": "interpolate_from_faces",
+            "interpolate_faces": "interpolate_from_faces",
+        }
+        mode = aliases.get(mode, mode)
+        if mode not in {"direct", "interpolate_from_faces"}:
+            raise ValueError(
+                "center_flux_mode must be one of: direct, interpolate_from_faces"
+            )
+        object.__setattr__(self, "center_flux_mode", mode)
 
     @staticmethod
     def _zero_like_flux(reference, fallback=0):
         if reference is not None:
             return jnp.zeros_like(jnp.asarray(reference))
         return fallback
+
+    def _canonical_face_fluxes(self, state):
+        """Evaluate total face fluxes under one stable public key convention."""
+
+        if self.geometry is None:
+            raise ValueError(
+                "center_flux_mode='interpolate_from_faces' requires the composite "
+                "transport flux model to carry its geometry."
+            )
+        face_state = build_face_transport_state(
+            state,
+            self.geometry,
+            bc_density=getattr(self.neoclassical_model, "bc_density", None),
+            bc_temperature=getattr(self.neoclassical_model, "bc_temperature", None),
+        )
+        raw_face_fluxes = self.evaluate_face_fluxes(state, face_state)
+        if raw_face_fluxes is None:
+            raise ValueError(
+                "center_flux_mode='interpolate_from_faces' requires all active "
+                "transport flux models to provide face fluxes."
+            )
+
+        def _face_value(name):
+            value = raw_face_fluxes.get(f"{name}_faces", raw_face_fluxes.get(name))
+            if value is None:
+                raise ValueError(
+                    "center_flux_mode='interpolate_from_faces' requires face "
+                    f"flux '{name}'."
+                )
+            return value
+
+        return {name: _face_value(name) for name in ("Gamma", "Q", "Upar")}
+
+    @staticmethod
+    def _centres_from_faces(face_fluxes):
+        return {
+            name: jax.vmap(cell_centered_from_faces)(face_fluxes[name])
+            for name in ("Gamma", "Q", "Upar")
+        }
+
+    def _apply_center_flux_mode(self, fluxes, face_fluxes):
+        """Apply the universal centre representation without changing faces."""
+
+        if self.center_flux_mode == "direct":
+            return fluxes
+        if face_fluxes is None:
+            raise ValueError(
+                "center_flux_mode='interpolate_from_faces' requires lagged face fluxes."
+            )
+        centres = self._centres_from_faces(face_fluxes)
+        out = dict(fluxes)
+        out.update(centres)
+        out.update({f"{name}_faces": value for name, value in face_fluxes.items()})
+        return out
 
     def __call__(self, state, *args, **kwargs) -> dict:
         # Only pass 'state' to the model instances, as expected by their __call__
@@ -940,7 +1011,9 @@ class CombinedTransportFluxModel(TransportFluxModelBase):
             "Q_classical":     classical.get("Q", 0),
             "Upar_classical":  classical.get("Upar", 0),
         }
-        return out
+        if self.center_flux_mode == "direct":
+            return out
+        return self._apply_center_flux_mode(out, self._canonical_face_fluxes(state))
 
     def pullback_direct_rhs_support_payload(self, state, flux_bar, support):
         """Return the neoclassical direct-support bar for a black-box RHS.
@@ -1701,7 +1774,12 @@ class CombinedTransportFluxModel(TransportFluxModelBase):
                     "Upar_classical_faces": classical.get("Upar_faces", 0),
                 }
             )
-        return out
+        lagged_face_fluxes = None
+        if all(f"{name}_faces" in out for name in ("Gamma", "Q", "Upar")):
+            lagged_face_fluxes = {
+                name: out[f"{name}_faces"] for name in ("Gamma", "Q", "Upar")
+            }
+        return self._apply_center_flux_mode(out, lagged_face_fluxes)
 
     def pullback_evaluate_with_lagged_response(self, state, lagged_response, flux_bar, **kwargs):
         def _submodel_pullback(model, subresponse, subflux_bar):
@@ -16658,7 +16736,9 @@ def build_transport_flux_model(neo_model: TransportFluxModelBase,
                               turb_model: TransportFluxModelBase,
                               classical_model: TransportFluxModelBase = None,
                               *,
-                              include_turbulent_particle_flux: bool = True) -> CombinedTransportFluxModel:
+                              include_turbulent_particle_flux: bool = True,
+                              geometry: Any = None,
+                              center_flux_mode: str = "direct") -> CombinedTransportFluxModel:
     """
     Build the composed transport model from explicit model instances.
     All models must be constructed up front by the orchestrator.
@@ -16670,6 +16750,8 @@ def build_transport_flux_model(neo_model: TransportFluxModelBase,
         turb_model,
         classical_model,
         include_turbulent_particle_flux=bool(include_turbulent_particle_flux),
+        geometry=geometry,
+        center_flux_mode=center_flux_mode,
     )
 
 register_transport_flux_model(

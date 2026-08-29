@@ -81,6 +81,83 @@ class DummyFluxModel:
         return {"Gamma": self.gamma, "Q": self.q, "Upar": self.upar}
 
 
+def test_combined_flux_model_applies_interpolate_from_faces_to_black_box_centres():
+    """The universal mode owns the centre representation, not a submodel."""
+
+    class _CentreAndFaceModel:
+        def __call__(self, state):
+            del state
+            centre = jnp.asarray([[10.0, 20.0], [30.0, 40.0]])
+            return {"Gamma": centre, "Q": 2.0 * centre, "Upar": 3.0 * centre}
+
+        def evaluate_face_fluxes(self, state, face_state, **kwargs):
+            del state, face_state, kwargs
+            face = jnp.asarray([[1.0, 3.0, 5.0], [2.0, 4.0, 6.0]])
+            return {"Gamma": face, "Q": 2.0 * face, "Upar": 3.0 * face}
+
+    state = TransportState(
+        density=jnp.ones((2, 2)),
+        pressure=jnp.ones((2, 2)),
+        Er=jnp.zeros(2),
+    )
+    model = _CentreAndFaceModel()
+    combined = CombinedTransportFluxModel(
+        model,
+        model,
+        model,
+        geometry=DummyGeometry(),
+        center_flux_mode="interpolate_from_faces",
+    )
+
+    out = combined(state)
+    expected_faces = 3.0 * jnp.asarray([[1.0, 3.0, 5.0], [2.0, 4.0, 6.0]])
+    expected_centres = jax.vmap(cell_centered_from_faces)(expected_faces)
+
+    assert jnp.allclose(out["Gamma_faces"], expected_faces)
+    assert jnp.allclose(out["Gamma"], expected_centres)
+
+
+def test_combined_lagged_flux_model_applies_interpolate_from_faces_to_centres():
+    """Lagged and black-box composite primals share the centre policy."""
+
+    class _LaggedCentreAndFaceModel:
+        def __call__(self, state):
+            del state
+            centre = jnp.asarray([[10.0, 20.0], [30.0, 40.0]])
+            return {"Gamma": centre, "Q": 2.0 * centre, "Upar": 3.0 * centre}
+
+        def build_lagged_response(self, state, **kwargs):
+            del state, kwargs
+            return object()
+
+        def evaluate_with_lagged_response(self, state, lagged_response, **kwargs):
+            del lagged_response, kwargs
+            out = self(state)
+            face = jnp.asarray([[1.0, 3.0, 5.0], [2.0, 4.0, 6.0]])
+            out.update({"Gamma_faces": face, "Q_faces": 2.0 * face, "Upar_faces": 3.0 * face})
+            return out
+
+    state = TransportState(
+        density=jnp.ones((2, 2)),
+        pressure=jnp.ones((2, 2)),
+        Er=jnp.zeros(2),
+    )
+    model = _LaggedCentreAndFaceModel()
+    combined = CombinedTransportFluxModel(
+        model,
+        model,
+        model,
+        geometry=DummyGeometry(),
+        center_flux_mode="interpolate_from_faces",
+    )
+
+    out = combined.evaluate_with_lagged_response(state, combined.build_lagged_response(state))
+    expected_faces = 3.0 * jnp.asarray([[1.0, 3.0, 5.0], [2.0, 4.0, 6.0]])
+
+    assert jnp.allclose(out["Gamma_faces"], expected_faces)
+    assert jnp.allclose(out["Gamma"], jax.vmap(cell_centered_from_faces)(expected_faces))
+
+
 def test_transport_flux_base_lagged_response_is_flux_linearization():
     from NEOPAX._transport_flux_models import TransportFluxModelBase
 
