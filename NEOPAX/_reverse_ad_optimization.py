@@ -1100,7 +1100,15 @@ def build_initial_er_transport_reverse_stage(
         ),
         selected_root_per_radius=_selected_root_per_radius,
         selected_root_scan=_selected_root_scan,
-        residual_er_derivative_scan=_residual_er_derivative_scan,
+        # The derivative scan is a separate, fixed-shape local-flux kernel.
+        # Keeping this executable persistent prevents the bootstrap-initialized
+        # flux route from creating a fresh set of native dispatches per
+        # optimizer evaluation.  It excludes the root finder, VMEC, Boozer,
+        # NTX payload construction, and all objective pullbacks.
+        residual_er_derivative_scan=jax.jit(
+            _residual_er_derivative_scan,
+            inline=False,
+        ),
         state_pullback=jax.jit(_state_pullback, inline=False),
         geometry_pullback=jax.jit(_geometry_pullback, inline=False),
         support_pullback=jax.jit(_support_pullback, inline=False),
