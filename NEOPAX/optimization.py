@@ -1513,6 +1513,7 @@ def geometry_initial_er_root_only_least_squares_problem(
             for term in normalized_terms
             if term.objective.family == "transport"
         )
+        stage_profile_parameter_labels = tuple(PROFILE_PARAMETER_ORDER)
 
         def _stage_payload(
             raw_block_solve,
@@ -1526,7 +1527,10 @@ def geometry_initial_er_root_only_least_squares_problem(
         ):
             return _optimization_payload_to_vmec_table(
                 objective_labels=stage_transport_objectives,
-                profile_parameter_labels=tuple(spec.name for spec in profile_specs),
+                # Initial-Er transport cotangents always contain the fixed
+                # internal profile-response columns, even when the outer
+                # optimization exposes geometry DoFs only.
+                profile_parameter_labels=stage_profile_parameter_labels,
                 geometry_parameter_labels=tuple(spec.label for spec in parameter_set.vmec_boundary_specs),
                 objective_values=values,
                 profile_gradient_matrix=profile_gradient,

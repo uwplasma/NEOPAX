@@ -356,6 +356,30 @@ def test_ntx_database_lagged_face_response_matches_reference_and_finite_differen
             atol=1.0e-6,
         )
 
+    # This is the transport-RHS boundary: a rebuild anchor must agree with the
+    # black-box composite whether the universal policy keeps direct centres or
+    # reconstructs them from the canonical face fluxes.
+    for center_flux_mode in ("direct", "interpolate_from_faces"):
+        combined = flux_models_module.CombinedTransportFluxModel(
+            neoclassical_model=model,
+            turbulent_model=flux_models_module.ZeroTransportModel(),
+            classical_model=flux_models_module.ZeroTransportModel(),
+            geometry=geometry,
+            center_flux_mode=center_flux_mode,
+        )
+        combined_lagged = combined.evaluate_with_lagged_response(
+            state0,
+            combined.build_lagged_response(state0),
+        )
+        combined_black_box = combined(state0)
+        for name in ("Gamma", "Q", "Upar"):
+            assert jnp.allclose(
+                combined_lagged[name],
+                combined_black_box[name],
+                rtol=1.0e-6,
+                atol=1.0e-6,
+            )
+
     epsilon = jnp.asarray(1.0e-3)
     state_plus = jax.tree_util.tree_map(
         lambda value, delta: value + epsilon * delta,
