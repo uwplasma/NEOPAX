@@ -476,6 +476,7 @@ class GeometryInitialErRootLeastSquaresProblem:
                     "optimization_root_experiment",
                     "optimization_root_strict_experiment",
                     "optimization_root_per_radius_experiment",
+                    "optimization_payload_experiment",
                 }
             )
             evaluator_kwargs["use_strict_selected_root_kernel"] = (
@@ -1522,6 +1523,7 @@ def geometry_initial_er_root_only_least_squares_problem(
                 solver_device=geometry_solver_device,
                 progress_label=None,
                 raw_block_solve=raw_block_solve,
+                prepared_payload_static=prepared_payload_static,
                 return_branch_gradients=False,
             )
 

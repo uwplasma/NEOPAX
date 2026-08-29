@@ -5,6 +5,7 @@ from pathlib import Path
 import h5py
 import jax
 import jax.numpy as jnp
+import pytest
 from ntx import GridSpec, example_surface, prepare_monoenergetic_system
 
 from NEOPAX._orchestrator import (
@@ -824,6 +825,51 @@ def test_normalize_solver_config_falls_back_to_legacy_solver_section():
     assert out["integrator"] == "radau"
     assert out["density_floor"] == 1.0e-6
     assert out["turbulence_flux_model"] == "turbulent_power_analytical"
+
+
+@pytest.mark.parametrize(
+    ("configured", "expected"),
+    [
+        ("direct", "direct"),
+        ("direct_center", "direct"),
+        ("interpolate_from_faces", "interpolate_from_faces"),
+        ("interpolate_faces", "interpolate_from_faces"),
+    ],
+)
+def test_normalize_solver_config_resolves_universal_center_flux_mode(configured, expected):
+    config = {
+        "transport_flux": {"center_flux_mode": configured},
+        "neoclassical": {"flux_model": "ntx_scan_runtime"},
+    }
+
+    assert _normalize_solver_config(config)["transport_center_flux_mode"] == expected
+
+
+def test_normalize_solver_config_maps_exact_ntx_center_response_mode_as_compatibility_alias():
+    config = {
+        "neoclassical": {
+            "flux_model": "ntx_exact_lij_runtime",
+            "ntx_exact_center_response_mode": "interpolate_from_faces",
+        },
+    }
+
+    assert (
+        _normalize_solver_config(config)["transport_center_flux_mode"]
+        == "interpolate_from_faces"
+    )
+
+
+def test_normalize_solver_config_rejects_conflicting_universal_and_exact_ntx_center_modes():
+    config = {
+        "transport_flux": {"center_flux_mode": "direct"},
+        "neoclassical": {
+            "flux_model": "ntx_exact_lij_runtime",
+            "ntx_exact_center_response_mode": "interpolate_from_faces",
+        },
+    }
+
+    with pytest.raises(ValueError, match="conflicts"):
+        _normalize_solver_config(config)
 
 
 def test_resolve_reference_path_handles_relative_paths(tmp_path, monkeypatch):

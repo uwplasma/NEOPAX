@@ -74,6 +74,70 @@ def load_config(path):
     return toml.loads(text)
 
 
+def _normalize_transport_center_flux_mode(mode: object) -> str:
+    """Normalize the universal transport face/centre representation policy.
+
+    This is deliberately independent of the flux-model family and RHS mode.
+    Evaluation paths will consume the normalized value in a subsequent
+    representation-layer refactor; defining it here lets configurations carry
+    one unambiguous policy before that wiring changes any physics.
+    """
+
+    normalized = "direct" if mode in (None, "") else str(mode).strip().lower()
+    aliases = {
+        "default": "direct",
+        "direct_center": "direct",
+        "direct_centers": "direct",
+        "center_local_response": "direct",
+        "interpolate": "interpolate_from_faces",
+        "interpolate_faces": "interpolate_from_faces",
+        "interpolate_face_fluxes": "interpolate_from_faces",
+        "face_interpolated": "interpolate_from_faces",
+    }
+    normalized = aliases.get(normalized, normalized)
+    if normalized not in {"direct", "interpolate_from_faces"}:
+        raise ValueError(
+            "transport_flux.center_flux_mode must be one of: "
+            "direct, interpolate_from_faces"
+        )
+    return normalized
+
+
+def _resolve_transport_center_flux_mode(config: dict) -> str:
+    """Resolve the universal transport representation with exact-NTX fallback.
+
+    ``ntx_exact_center_response_mode`` remains a compatibility alias only for
+    the exact NTX model.  A universal setting always wins, provided it agrees
+    with an explicitly supplied legacy setting.
+    """
+
+    flux_cfg = config.get("transport_flux", {})
+    if flux_cfg is None:
+        flux_cfg = {}
+    if not isinstance(flux_cfg, dict):
+        raise ValueError("transport_flux must be a TOML table.")
+    has_universal_mode = "center_flux_mode" in flux_cfg
+    universal_mode = _normalize_transport_center_flux_mode(
+        flux_cfg.get("center_flux_mode")
+    )
+
+    neo_cfg = config.get("neoclassical", {})
+    if not isinstance(neo_cfg, dict):
+        return universal_mode
+    neo_name = str(neo_cfg.get("flux_model", neo_cfg.get("model", ""))).strip().lower()
+    legacy_mode = neo_cfg.get("ntx_exact_center_response_mode")
+    if neo_name != "ntx_exact_lij_runtime" or legacy_mode is None:
+        return universal_mode
+
+    legacy_as_universal = _normalize_transport_center_flux_mode(legacy_mode)
+    if has_universal_mode and universal_mode != legacy_as_universal:
+        raise ValueError(
+            "transport_flux.center_flux_mode conflicts with "
+            "neoclassical.ntx_exact_center_response_mode."
+        )
+    return universal_mode if has_universal_mode else legacy_as_universal
+
+
 def _normalized_general_device(config: dict) -> str:
     general_cfg = config.get("general", {})
     if not isinstance(general_cfg, dict):
@@ -171,6 +235,7 @@ def _normalize_solver_config(config: dict) -> dict:
     solver_cfg["integrator"] = solver_cfg["transport_solver_backend"]
     solver_cfg["neoclassical_flux_model"] = config.get("neoclassical", {}).get("flux_model", "none")
     solver_cfg["turbulence_flux_model"] = config.get("turbulence", {}).get("flux_model", "none")
+    solver_cfg["transport_center_flux_mode"] = _resolve_transport_center_flux_mode(config)
     solver_cfg.setdefault("Er_relax", 1.0)
     solver_cfg.setdefault("DEr", 1.0)
     solver_cfg.setdefault("density_floor", 1.0e-6)
