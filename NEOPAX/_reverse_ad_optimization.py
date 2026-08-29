@@ -839,6 +839,7 @@ class InitialErTransportReverseStage:
     selected_root_strict: Callable[..., Any]
     selected_root_per_radius: Callable[..., Any]
     selected_root_scan: Callable[..., Any]
+    residual_er_derivative_scan: Callable[..., Any]
     state_pullback: Callable[..., Any]
     geometry_pullback: Callable[..., Any]
     support_pullback: Callable[..., Any]
@@ -1006,6 +1007,36 @@ def build_initial_er_transport_reverse_stage(
         finite_mask = jnp.isfinite(best_roots)
         return jnp.where(finite_mask, best_roots, state.Er), finite_mask
 
+    def _residual_er_derivative_scan_body(carry, radius_index):
+        state, er_profile, geometry_leaves, support_leaves = carry
+        runtime_current = _runtime_from_leaves(geometry_leaves, support_leaves)
+        charge_qp = jnp.asarray(runtime_current.species.charge_qp)
+
+        def _residual_i_er(er_value):
+            er_eval = er_profile.at[radius_index].set(er_value)
+            state_with_er = dataclasses.replace(state, Er=er_eval)
+            local_particle_flux = runtime_current.models.flux.build_local_particle_flux_evaluator(
+                state_with_er
+            )
+            if local_particle_flux is None:
+                raise ValueError("Initial-Er root AD requires a local particle-flux evaluator.")
+            gamma = local_particle_flux(radius_index, er_value)
+            return jnp.sum(charge_qp * gamma)
+
+        derivative = jax.grad(_residual_i_er)(er_profile[radius_index])
+        return carry, derivative
+
+    def _residual_er_derivative_scan(state, er_profile, geometry_leaves, support_leaves):
+        """Exact persistent scan form of the benchmark local Er derivative."""
+
+        radius_indices = jnp.arange(er_profile.shape[0], dtype=jnp.int32)
+        _, derivatives = jax.lax.scan(
+            _residual_er_derivative_scan_body,
+            (state, er_profile, geometry_leaves, support_leaves),
+            radius_indices,
+        )
+        return derivatives
+
     def _selected_root_per_radius(state, geometry_leaves, support_leaves):
         root_rows = tuple(
             single_radius_root(
@@ -1073,6 +1104,7 @@ def build_initial_er_transport_reverse_stage(
         ),
         selected_root_per_radius=_selected_root_per_radius,
         selected_root_scan=_selected_root_scan,
+        residual_er_derivative_scan=_residual_er_derivative_scan,
         state_pullback=jax.jit(_state_pullback, inline=False),
         geometry_pullback=jax.jit(_geometry_pullback, inline=False),
         support_pullback=jax.jit(_support_pullback, inline=False),
@@ -2244,11 +2276,21 @@ def _optimization_root_to_payload_cotangents(
     direct_geometry_bars = _stack_tree_rows(direct_geometry_bar_rows)
     direct_ntx_support_bars = _stack_tree_rows(direct_ntx_support_bar_rows)
 
-    dres_der = initial_er_charge_flux_residual_er_derivative(
-        pre_root_state,
-        er_profile,
-        runtime=runtime_for_geometry,
-    )
+    _probe("before_residual_er_derivative")
+    if transport_reverse_stage is not None and use_scan_selected_root_kernel:
+        dres_der = transport_reverse_stage.residual_er_derivative_scan(
+            pre_root_state,
+            er_profile,
+            geometry_leaves,
+            support_leaves,
+        )
+    else:
+        dres_der = initial_er_charge_flux_residual_er_derivative(
+            pre_root_state,
+            er_profile,
+            runtime=runtime_for_geometry,
+        )
+    _probe("after_residual_er_derivative")
     safe_dres_der = jnp.where(
         jnp.abs(dres_der) > jnp.asarray(1.0e-30, dtype=dres_der.dtype),
         dres_der,
