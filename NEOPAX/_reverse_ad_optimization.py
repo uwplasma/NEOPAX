@@ -2343,6 +2343,7 @@ def geometry_active_initial_er_root_only_reverse_table_optimization(
     use_per_radius_selected_root_kernel: bool = False,
     payload_assembly_stage=None,
     prepared_payload_static=None,
+    dispatch_cache_probe=None,
 ) -> ObjectiveTableResult:
     """Return compact initial-Er objective table for active realtime geometry.
 
@@ -2353,6 +2354,11 @@ def geometry_active_initial_er_root_only_reverse_table_optimization(
     raw-block payload pullback used by the realtime reverse benchmark.
     """
 
+    def _probe(label: str) -> None:
+        if dispatch_cache_probe is not None:
+            dispatch_cache_probe(str(label))
+
+    _probe("optimization_transport_entry")
     requested_objectives = normalize_initial_er_root_only_objective_names(objective_names)
     parameter_values_arr = jnp.asarray(parameter_values)
     profile_values_arr = jnp.asarray(profile_values)
@@ -2420,8 +2426,10 @@ def geometry_active_initial_er_root_only_reverse_table_optimization(
     )
     if optimization_stage is None:
         root_args["raw_block_solve"] = raw_block_solve
+        _probe("before_root_to_payload")
         root_result = root_operator(**root_args)
     else:
+        _probe("before_root_to_payload")
         root_result = root_operator(dynamic_payload, profile_values_arr)
     (
         objective_values, profile_gradient_matrix_for_payload, support_bars, objective_count,
@@ -2429,6 +2437,7 @@ def geometry_active_initial_er_root_only_reverse_table_optimization(
     objective_values, profile_gradient_matrix_for_payload, support_bars = jax.block_until_ready(
         (objective_values, profile_gradient_matrix_for_payload, support_bars)
     )
+    _probe("after_root_to_payload")
 
     geometry_param_tuples = tuple(spec.as_tuple() for spec in vmec_specs)
     payload_args = dict(
@@ -2462,8 +2471,10 @@ def geometry_active_initial_er_root_only_reverse_table_optimization(
         else (optimization_stage.payload_to_vmec if optimization_stage is not None else payload_assembly_stage.payload_to_vmec)
     )
     if optimization_stage is None and payload_assembly_stage is None:
+        _probe("before_payload_to_vmec")
         assembly_result = payload_operator(**payload_args)
     else:
+        _probe("before_payload_to_vmec")
         assembly_result = payload_operator(
             dynamic_payload,
             baseline_geometry_deltas,
@@ -2471,6 +2482,7 @@ def geometry_active_initial_er_root_only_reverse_table_optimization(
             profile_gradient_matrix_for_payload,
             support_bars,
         )
+    _probe("after_payload_to_vmec")
 
     geometry_gradient_matrix = jnp.asarray(assembly_result.table_result.geometry_gradient_matrix)
     profile_gradient_matrix = jnp.asarray(assembly_result.table_result.profile_gradient_matrix)
@@ -2488,11 +2500,14 @@ def geometry_active_initial_er_root_only_reverse_table_optimization(
                 raise TypeError(f"Unsupported reverse-AD parameter spec type: {type(spec).__name__}.")
         jacobian_rows.append(jnp.stack(columns))
 
-    return ObjectiveTableResult(
+    _probe("before_transport_table_assembly")
+    result = ObjectiveTableResult(
         objective_names=requested_objectives,
         values=objective_values,
         jacobian=jnp.stack(jacobian_rows, axis=0),
     )
+    _probe("after_transport_table_assembly")
+    return result
 
 
 
@@ -3168,9 +3183,15 @@ def evaluate_geometry_initial_er_root_only_least_squares_optimization(
     use_per_radius_selected_root_kernel: bool = False,
     payload_assembly_stage=None,
     prepared_payload_static=None,
+    dispatch_cache_probe=None,
 ) -> LeastSquaresEvaluation:
     """Evaluate mixed objectives using only benchmark-validated table backends."""
 
+    def _probe(label: str) -> None:
+        if dispatch_cache_probe is not None:
+            dispatch_cache_probe(str(label))
+
+    _probe("optimization_evaluator_entry")
     normalized_terms = normalize_least_squares_terms(terms)
     grouped_terms = group_least_squares_terms_by_family(normalized_terms)
     unsupported_families = tuple(
@@ -3211,6 +3232,7 @@ def evaluate_geometry_initial_er_root_only_least_squares_optimization(
                 ],
                 axis=0,
             )
+            _probe("before_raw_block_solve")
             shared_raw_block_solve = geometry_raw_block_solve_from_param_vector(
                 geometry_context,
                 vmec_parameter_values,
@@ -3219,6 +3241,8 @@ def evaluate_geometry_initial_er_root_only_least_squares_optimization(
                 solver_device=geometry_solver_device,
                 stage=raw_block_stage,
             )
+            _probe("after_raw_block_solve")
+            _probe("before_optimization_transport_table")
             transport_result = geometry_active_initial_er_root_only_reverse_table_optimization(
                 config=config,
                 objective_names=requested_transport_objectives,
@@ -3246,6 +3270,7 @@ def evaluate_geometry_initial_er_root_only_least_squares_optimization(
                 use_per_radius_selected_root_kernel=use_per_radius_selected_root_kernel,
                 payload_assembly_stage=payload_assembly_stage,
                 prepared_payload_static=prepared_payload_static,
+                dispatch_cache_probe=dispatch_cache_probe,
             )
             transport_values, transport_jacobian = jax.block_until_ready(
                 (transport_result.values, transport_result.jacobian)
@@ -3260,6 +3285,7 @@ def evaluate_geometry_initial_er_root_only_least_squares_optimization(
                 target_parameter_set=parameter_set,
                 objective_names=requested_transport_objectives,
             )
+            _probe("after_optimization_transport_table")
         else:
             transport_table = initial_er_root_only_objective_cotangent_table(
                 config=config,
