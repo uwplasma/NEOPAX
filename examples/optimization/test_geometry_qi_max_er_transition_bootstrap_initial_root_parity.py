@@ -83,7 +83,11 @@ def main() -> int:
         f"{np.max(jacobian_relative_delta):.16e} index={jacobian_relative_index}",
         flush=True,
     )
-    if args.mode in {"optimization", "optimization_root_experiment"}:
+    if args.mode in {
+        "optimization",
+        "optimization_root_experiment",
+        "optimization_payload_experiment",
+    }:
         # The accepted persistent-root stage has the same equations and
         # branch-selection rules as ``off`` but changes compiled evaluation
         # boundaries. The observed worst relative Jacobian difference is

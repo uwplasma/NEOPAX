@@ -476,6 +476,7 @@ def build_initial_root_payload_assembly_stage(
     payload_to_vmec_impl: Callable[[GeometryRawBlockSolve, Any, Any, Any, Any], Any],
     prepared_static: Any = None,
     prepared_static_factory: Callable[[Any], Any] | None = None,
+    active_payload_layout_factory: Callable[[Any], Any] | None = None,
 ) -> InitialRootPayloadAssemblyStage:
     """Compile only the final existing payload-to-VMEC boundary.
 
@@ -487,28 +488,35 @@ def build_initial_root_payload_assembly_stage(
     cached_static = prepared_static
     compiled_payload_operator = None
     support_bars_layout: FloatingPayloadLeafLayout | None = None
+    cached_active_payload_layout = None
 
-    def _payload_operator(
-        dynamic_raw_payload,
-        geometry_deltas,
-        objective_values,
-        profile_gradient_matrix,
-        support_bars_floating_leaves,
-    ):
-        if support_bars_layout is None:  # pragma: no cover - guarded by caller
-            raise RuntimeError("Initial-Er payload stage has no support-bar layout.")
-        raw_block_solve = raw_block_solve_from_dynamic_payload(
-            raw_block_stage, dynamic_raw_payload
-        )
-        support_bars = support_bars_layout.rebuild(support_bars_floating_leaves)
-        return payload_to_vmec_impl(
-            raw_block_solve,
+    def _compile_payload_operator(active_payload_layout):
+        """Bind an already-inspected leaf layout into one numerical kernel."""
+
+        def _payload_operator(
+            dynamic_raw_payload,
             geometry_deltas,
             objective_values,
             profile_gradient_matrix,
-            support_bars,
-            prepared_static=cached_static,
-        )
+            support_bars_floating_leaves,
+        ):
+            if support_bars_layout is None:  # pragma: no cover - guarded by caller
+                raise RuntimeError("Initial-Er payload stage has no support-bar layout.")
+            raw_block_solve = raw_block_solve_from_dynamic_payload(
+                raw_block_stage, dynamic_raw_payload
+            )
+            support_bars = support_bars_layout.rebuild(support_bars_floating_leaves)
+            return payload_to_vmec_impl(
+                raw_block_solve,
+                geometry_deltas,
+                objective_values,
+                profile_gradient_matrix,
+                support_bars,
+                prepared_static=cached_static,
+                prepared_active_payload_leaves=active_payload_layout,
+            )
+
+        return jax.jit(_payload_operator, inline=False)
 
     def payload_operator(
         dynamic_raw_payload,
@@ -519,7 +527,8 @@ def build_initial_root_payload_assembly_stage(
     ):
         """Lazily bind structural artifacts before compiling this boundary."""
 
-        nonlocal cached_static, compiled_payload_operator, support_bars_layout
+        nonlocal cached_static, compiled_payload_operator
+        nonlocal support_bars_layout, cached_active_payload_layout
         if cached_static is None and prepared_static_factory is not None:
             raw_block_solve = raw_block_solve_from_dynamic_payload(
                 raw_block_stage, dynamic_raw_payload
@@ -539,6 +548,7 @@ def build_initial_root_payload_assembly_stage(
                 profile_gradient_matrix,
                 support_bars,
                 prepared_static=None,
+                prepared_active_payload_leaves=None,
             )
         if support_bars_layout is None:
             # This layout owns no evaluation data: it freezes only the fixed
@@ -548,8 +558,17 @@ def build_initial_root_payload_assembly_stage(
         else:
             support_bars_layout.validate_static_structure(support_bars)
         support_bars_floating_leaves = support_bars_layout.floating_leaves(support_bars)
-        if compiled_payload_operator is None:
-            compiled_payload_operator = jax.jit(_payload_operator, inline=False)
+        active_payload_layout = (
+            None
+            if active_payload_layout_factory is None
+            else active_payload_layout_factory(support_bars)
+        )
+        if (
+            compiled_payload_operator is None
+            or active_payload_layout != cached_active_payload_layout
+        ):
+            cached_active_payload_layout = active_payload_layout
+            compiled_payload_operator = _compile_payload_operator(active_payload_layout)
         return compiled_payload_operator(
             dynamic_raw_payload,
             geometry_deltas,

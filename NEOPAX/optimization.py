@@ -21,6 +21,7 @@ from ._geometry_autodiff import (
     _boozer_surface_indices_and_rho,
     _neopax_geometry_requested_sample_rho,
     _input_with_boundary_deltas,
+    initial_root_payload_active_leaf_layout,
     boundary_param_entries,
     build_neopax_geometry_and_ntx_exact_lij_support_from_state,
     build_geometry_autodiff_context,
@@ -1521,6 +1522,7 @@ def geometry_initial_er_root_only_least_squares_problem(
             support_bars,
             *,
             prepared_static=None,
+            prepared_active_payload_leaves=None,
         ):
             return _optimization_payload_to_vmec_table(
                 objective_labels=stage_transport_objectives,
@@ -1545,6 +1547,7 @@ def geometry_initial_er_root_only_least_squares_problem(
                 progress_label=None,
                 raw_block_solve=raw_block_solve,
                 prepared_payload_static=prepared_static,
+                prepared_active_payload_leaves=prepared_active_payload_leaves,
                 return_branch_gradients=False,
             )
 
@@ -1557,6 +1560,7 @@ def geometry_initial_er_root_only_least_squares_problem(
                 n_r=int(n_r if n_r is not None else geom_cfg.get("n_radial", 51)),
                 state=state,
             ),
+            active_payload_layout_factory=initial_root_payload_active_leaf_layout,
         )
     if mode == "vmex_like":
         normalized_stage_terms = normalize_least_squares_terms(terms)

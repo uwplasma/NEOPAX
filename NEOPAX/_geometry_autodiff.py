@@ -5097,6 +5097,62 @@ def _native_vmec_coefficient_tangent_contraction(
     return result
 
 
+def initial_root_payload_active_leaf_layout(
+    payload_bars: Sequence[Mapping[str, Any]],
+    *,
+    support_branch_name: str = "ntx_support",
+) -> tuple[tuple[str, tuple[int, ...]], ...]:
+    """Return the current nonzero floating-cotangent layout outside a JIT.
+
+    The production payload pullback deliberately performs this inspection on
+    host values: it avoids tracing VJPs for payload leaves whose cotangent is
+    identically zero.  An optimization stage may reuse a compiled numerical
+    kernel only after this data-dependent decision has been made.  The return
+    value contains indices only, never trial arrays, and is therefore safe to
+    capture as stage-static metadata.
+    """
+
+    payload_bars = tuple(payload_bars)
+    if not payload_bars:
+        raise ValueError("Initial-Er payload layout requires at least one cotangent row.")
+    layouts = []
+    for branch_name in ("geometry", str(support_branch_name)):
+        try:
+            template = payload_bars[0][branch_name]
+        except (KeyError, TypeError) as exc:
+            raise ValueError(
+                f"Initial-Er payload cotangents are missing branch {branch_name!r}."
+            ) from exc
+        template_leaves = jax.tree_util.tree_leaves(template)
+        floating_indices = tuple(
+            leaf_i
+            for leaf_i, leaf in enumerate(template_leaves)
+            if jnp.issubdtype(jnp.asarray(leaf).dtype, jnp.inexact)
+        )
+        active_indices = []
+        for leaf_i in floating_indices:
+            leaf_active = False
+            for payload_bar in payload_bars:
+                leaf = jax.tree_util.tree_leaves(payload_bar[branch_name])[leaf_i]
+                leaf_array = jnp.asarray(leaf)
+                finite_host = np.asarray(jax.device_get(jnp.isfinite(leaf_array)))
+                if not bool(np.all(finite_host)):
+                    raise FloatingPointError(
+                        f"nonfinite payload cotangent reached {branch_name} leaf {leaf_i}; "
+                        "rerun the benchmark diagnostics to inspect first_nonfinite_leaf."
+                    )
+                active_host = np.asarray(
+                    jax.device_get(jnp.abs(leaf_array) > 0.0)
+                )
+                if bool(np.any(active_host)):
+                    leaf_active = True
+                    break
+            if leaf_active:
+                active_indices.append(leaf_i)
+        layouts.append((branch_name, tuple(active_indices)))
+    return tuple(layouts)
+
+
 def geometry_payload_pullback_from_param_vector_raw_block_transpose(
     context: GeometryAutodiffContext,
     param_deltas,
@@ -5124,6 +5180,7 @@ def geometry_payload_pullback_from_param_vector_raw_block_transpose(
     prepared_static=None,
     return_raw_block_solve: bool = False,
     dispatch_cache_probe=None,
+    prepared_active_payload_leaves: tuple[tuple[str, tuple[int, ...]], ...] | None = None,
 ) -> object:
     """Pull transport payload cotangents back to VMEC boundary harmonics.
 
@@ -5519,31 +5576,51 @@ def geometry_payload_pullback_from_param_vector_raw_block_transpose(
         payload_bar_leaves_by_objective = tuple(
             jax.tree_util.tree_leaves(payload_bar) for payload_bar in branch_bars
         )
-        active_float_leaf_indices = []
-        for leaf_i in float_leaf_indices:
-            leaf_has_bar = False
-            for objective_i in range(len(branch_bars)):
-                bar_leaf = payload_bar_leaves_by_objective[objective_i][leaf_i]
-                bar_arr = jnp.asarray(bar_leaf)
-                is_active = np.any(
-                    np.asarray(
-                        jax.device_get(
-                            jnp.logical_and(jnp.isfinite(bar_arr), jnp.abs(bar_arr) > 0.0)
+        prepared_active_lookup = (
+            None
+            if prepared_active_payload_leaves is None
+            else dict(prepared_active_payload_leaves)
+        )
+        if prepared_active_lookup is not None and branch_name in prepared_active_lookup:
+            # The optimization-only stage performed the exact host-side
+            # finite/nonzero inspection before entering its bounded JIT.
+            # Indices are structural metadata, while all cotangent arrays
+            # below stay dynamic compiled inputs.
+            active_float_leaf_indices = tuple(prepared_active_lookup[branch_name])
+            invalid_indices = tuple(
+                leaf_i for leaf_i in active_float_leaf_indices if leaf_i not in float_leaf_indices
+            )
+            if invalid_indices:
+                raise ValueError(
+                    f"Prepared payload layout for {branch_name} contains non-floating leaves "
+                    f"{invalid_indices}."
+                )
+        else:
+            active_float_leaf_indices = []
+            for leaf_i in float_leaf_indices:
+                leaf_has_bar = False
+                for objective_i in range(len(branch_bars)):
+                    bar_leaf = payload_bar_leaves_by_objective[objective_i][leaf_i]
+                    bar_arr = jnp.asarray(bar_leaf)
+                    is_active = np.any(
+                        np.asarray(
+                            jax.device_get(
+                                jnp.logical_and(jnp.isfinite(bar_arr), jnp.abs(bar_arr) > 0.0)
+                            )
                         )
                     )
-                )
-                has_nonfinite = np.any(np.asarray(jax.device_get(~jnp.isfinite(bar_arr))))
-                if bool(has_nonfinite):
-                    raise FloatingPointError(
-                        f"nonfinite payload cotangent reached {branch_name} leaf {leaf_i}; "
-                        "rerun the benchmark diagnostics to inspect first_nonfinite_leaf."
-                    )
-                if bool(is_active):
-                    leaf_has_bar = True
-                    break
-            if leaf_has_bar:
-                active_float_leaf_indices.append(leaf_i)
-        active_float_leaf_indices = tuple(active_float_leaf_indices)
+                    has_nonfinite = np.any(np.asarray(jax.device_get(~jnp.isfinite(bar_arr))))
+                    if bool(has_nonfinite):
+                        raise FloatingPointError(
+                            f"nonfinite payload cotangent reached {branch_name} leaf {leaf_i}; "
+                            "rerun the benchmark diagnostics to inspect first_nonfinite_leaf."
+                        )
+                    if bool(is_active):
+                        leaf_has_bar = True
+                        break
+                if leaf_has_bar:
+                    active_float_leaf_indices.append(leaf_i)
+            active_float_leaf_indices = tuple(active_float_leaf_indices)
         if progress_label is not None:
             print(
                 f"{progress_label} {branch_name}_active_float_leaves={len(active_float_leaf_indices)}",
