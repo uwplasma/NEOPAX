@@ -474,23 +474,15 @@ class GeometryInitialErRootLeastSquaresProblem:
             "optimization_root_per_radius_experiment",
             "optimization_payload_experiment",
         }:
-            evaluator_kwargs["transport_reverse_stage"] = self.optimization_stage
-            evaluator_kwargs["use_selected_root_kernel"] = (
-                self.reverse_stage_mode
-                in {
-                    "optimization",
-                    "optimization_root_experiment",
-                    "optimization_root_strict_experiment",
-                    "optimization_root_per_radius_experiment",
-                    "optimization_payload_experiment",
-                }
-            )
-            evaluator_kwargs["use_strict_selected_root_kernel"] = (
-                self.reverse_stage_mode == "optimization_root_strict_experiment"
-            )
-            evaluator_kwargs["use_per_radius_selected_root_kernel"] = (
-                self.reverse_stage_mode == "optimization_root_per_radius_experiment"
-            )
+            if self.reverse_stage_mode != "optimization_payload_experiment":
+                evaluator_kwargs["transport_reverse_stage"] = self.optimization_stage
+                evaluator_kwargs["use_selected_root_kernel"] = True
+                evaluator_kwargs["use_strict_selected_root_kernel"] = (
+                    self.reverse_stage_mode == "optimization_root_strict_experiment"
+                )
+                evaluator_kwargs["use_per_radius_selected_root_kernel"] = (
+                    self.reverse_stage_mode == "optimization_root_per_radius_experiment"
+                )
             if self.payload_assembly_stage is not None:
                 evaluator_kwargs["payload_assembly_stage"] = self.payload_assembly_stage
             if self.prepared_payload_static is not None:
@@ -1491,7 +1483,6 @@ def geometry_initial_er_root_only_least_squares_problem(
         "optimization_root_experiment",
         "optimization_root_strict_experiment",
         "optimization_root_per_radius_experiment",
-        "optimization_payload_experiment",
     }:
         stage_support_payload = find_ntx_support_payload(runtime)
         if not isinstance(stage_support_payload, dict):
@@ -1504,6 +1495,13 @@ def geometry_initial_er_root_only_least_squares_problem(
             payload_adapter=InitialErTransportPayloadAdapter.from_payload(stage_support_payload),
             config=config_eff,
         )
+    if mode in {
+        "optimization",
+        "optimization_root_experiment",
+        "optimization_root_strict_experiment",
+        "optimization_root_per_radius_experiment",
+        "optimization_payload_experiment",
+    }:
         prepared_payload_static = _prepare_initial_root_payload_static(
             context,
             n_r=int(n_r if n_r is not None else geom_cfg.get("n_radial", 51)),
