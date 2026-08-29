@@ -13,6 +13,7 @@ from typing import Any
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 
 from ._geometry_autodiff import (
     GeometryRawBlockSolve,
@@ -65,8 +66,21 @@ class FloatingPayloadLeafLayout:
     def from_template(cls, payload: Any) -> "FloatingPayloadLeafLayout":
         leaves, treedef = jax.tree_util.tree_flatten(payload)
         floating_mask = tuple(cls._is_floating_leaf(leaf) for leaf in leaves)
+
+        def _freeze_static_leaf(leaf: Any) -> Any:
+            """Keep scalar layout fields concrete across a JIT boundary."""
+
+            try:
+                host_leaf = jax.device_get(leaf)
+                host_array = np.asarray(host_leaf)
+            except (TypeError, ValueError):
+                return leaf
+            if host_array.ndim == 0:
+                return host_array.item()
+            return leaf
+
         static_leaves = tuple(
-            None if is_floating else leaf
+            None if is_floating else _freeze_static_leaf(leaf)
             for leaf, is_floating in zip(leaves, floating_mask, strict=True)
         )
         return cls(
@@ -100,6 +114,33 @@ class FloatingPayloadLeafLayout:
             )
         )
         return self.treedef.unflatten(leaves)
+
+    def validate_static_structure(self, payload: Any) -> None:
+        """Reject a stage whose non-floating layout values changed."""
+
+        leaves, treedef = jax.tree_util.tree_flatten(payload)
+        if treedef != self.treedef or len(leaves) != len(self.floating_mask):
+            raise ValueError("Initial-Er optimization payload structure changed within a stage.")
+        for leaf, is_floating, expected in zip(
+            leaves, self.floating_mask, self.static_leaves, strict=True
+        ):
+            if is_floating:
+                continue
+            # Only scalar non-floating values need to be concretized for the
+            # compiled stage (for example ``n_r``).  Non-scalar static leaves
+            # are structural metadata captured by the stage and are not
+            # compared here: array equality would itself introduce an invalid
+            # traced boolean.
+            try:
+                observed = np.asarray(jax.device_get(leaf))
+                reference = np.asarray(expected)
+            except (TypeError, ValueError):
+                continue
+            if observed.ndim == 0 and reference.ndim == 0:
+                if observed.item() != reference.item():
+                    raise ValueError(
+                        "Initial-Er optimization static payload value changed within a stage."
+                    )
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -445,17 +486,21 @@ def build_initial_root_payload_assembly_stage(
 
     cached_static = prepared_static
     compiled_payload_operator = None
+    support_bars_layout: FloatingPayloadLeafLayout | None = None
 
     def _payload_operator(
         dynamic_raw_payload,
         geometry_deltas,
         objective_values,
         profile_gradient_matrix,
-        support_bars,
+        support_bars_floating_leaves,
     ):
+        if support_bars_layout is None:  # pragma: no cover - guarded by caller
+            raise RuntimeError("Initial-Er payload stage has no support-bar layout.")
         raw_block_solve = raw_block_solve_from_dynamic_payload(
             raw_block_stage, dynamic_raw_payload
         )
+        support_bars = support_bars_layout.rebuild(support_bars_floating_leaves)
         return payload_to_vmec_impl(
             raw_block_solve,
             geometry_deltas,
@@ -474,7 +519,7 @@ def build_initial_root_payload_assembly_stage(
     ):
         """Lazily bind structural artifacts before compiling this boundary."""
 
-        nonlocal cached_static, compiled_payload_operator
+        nonlocal cached_static, compiled_payload_operator, support_bars_layout
         if cached_static is None and prepared_static_factory is not None:
             raw_block_solve = raw_block_solve_from_dynamic_payload(
                 raw_block_stage, dynamic_raw_payload
@@ -484,13 +529,25 @@ def build_initial_root_payload_assembly_stage(
             # This backend has no reusable structural artifact. Preserve the
             # established eager optimization path rather than tracing host
             # VMEX/Boozer setup through a JIT.
-            return _payload_operator(
-                dynamic_raw_payload,
+            raw_block_solve = raw_block_solve_from_dynamic_payload(
+                raw_block_stage, dynamic_raw_payload
+            )
+            return payload_to_vmec_impl(
+                raw_block_solve,
                 geometry_deltas,
                 objective_values,
                 profile_gradient_matrix,
                 support_bars,
+                prepared_static=None,
             )
+        if support_bars_layout is None:
+            # This layout owns no evaluation data: it freezes only the fixed
+            # support schema and scalar metadata such as n_r.  The floating
+            # cotangent leaves below remain explicit JIT inputs per trial.
+            support_bars_layout = FloatingPayloadLeafLayout.from_template(support_bars)
+        else:
+            support_bars_layout.validate_static_structure(support_bars)
+        support_bars_floating_leaves = support_bars_layout.floating_leaves(support_bars)
         if compiled_payload_operator is None:
             compiled_payload_operator = jax.jit(_payload_operator, inline=False)
         return compiled_payload_operator(
@@ -498,7 +555,7 @@ def build_initial_root_payload_assembly_stage(
             geometry_deltas,
             objective_values,
             profile_gradient_matrix,
-            support_bars,
+            support_bars_floating_leaves,
         )
 
     return InitialRootPayloadAssemblyStage(

@@ -402,6 +402,10 @@ class JVPTransportFluxResponse:
 class FaceJVPTransportFluxResponse:
         reference_state: Any
         reference_face_flux: dict
+        # Some models (notably the NTX database model) have a distinct direct
+        # centre primitive in addition to their face primitive.  Keep its
+        # anchor so a lagged response can preserve that representation.
+        reference_flux: dict | None = None
 
 
 @jax.tree_util.register_dataclass
@@ -982,6 +986,45 @@ class CombinedTransportFluxModel(TransportFluxModelBase):
         out = dict(fluxes)
         out.update(centres)
         out.update({f"{name}_faces": value for name, value in face_fluxes.items()})
+        return out
+
+    @staticmethod
+    def _centre_bar_to_face_bar(centre_bar):
+        """Transpose ``cell_centered_from_faces`` for a species-profile bar."""
+
+        centre_bar = jnp.asarray(centre_bar)
+        face_template = jnp.zeros(
+            centre_bar.shape[:-1] + (centre_bar.shape[-1] + 1,),
+            dtype=centre_bar.dtype,
+        )
+        _, pullback = jax.vjp(
+            lambda faces: jax.vmap(cell_centered_from_faces)(faces),
+            face_template,
+        )
+        return pullback(centre_bar)[0]
+
+    def _apply_center_flux_mode_pullback(self, flux_bar):
+        """Map universal interpolated-centre cotangents to face cotangents."""
+
+        if self.center_flux_mode == "direct":
+            return flux_bar
+        out = dict(flux_bar)
+        for name in ("Gamma", "Q", "Upar"):
+            centre_bar = out.get(name, None)
+            if centre_bar is None:
+                continue
+            centre_bar = jnp.asarray(centre_bar)
+            if centre_bar.ndim == 0 or centre_bar.dtype == jax.dtypes.float0:
+                continue
+            face_name = f"{name}_faces"
+            face_bar = self._centre_bar_to_face_bar(centre_bar)
+            existing_face_bar = out.get(face_name, None)
+            if existing_face_bar is not None:
+                existing_face_bar = jnp.asarray(existing_face_bar)
+                if existing_face_bar.ndim != 0 and existing_face_bar.dtype != jax.dtypes.float0:
+                    face_bar = face_bar + existing_face_bar
+            out[name] = jnp.zeros_like(centre_bar)
+            out[face_name] = face_bar
         return out
 
     def __call__(self, state, *args, **kwargs) -> dict:
@@ -1782,6 +1825,8 @@ class CombinedTransportFluxModel(TransportFluxModelBase):
         return self._apply_center_flux_mode(out, lagged_face_fluxes)
 
     def pullback_evaluate_with_lagged_response(self, state, lagged_response, flux_bar, **kwargs):
+        flux_bar = self._apply_center_flux_mode_pullback(flux_bar)
+
         def _submodel_pullback(model, subresponse, subflux_bar):
             if subresponse is None:
                 return None
@@ -1933,6 +1978,8 @@ class CombinedTransportFluxModel(TransportFluxModelBase):
         support,
         **kwargs,
     ):
+        flux_bar = self._apply_center_flux_mode_pullback(flux_bar)
+
         def _is_missing_bar(value):
             if value is None:
                 return True
@@ -2025,6 +2072,8 @@ class CombinedTransportFluxModel(TransportFluxModelBase):
         return _sanitize_float_delta_bar_tree(support, support_bar)
 
     def pullback_evaluate_with_lagged_response_state(self, state, lagged_response, flux_bar, **kwargs):
+        flux_bar = self._apply_center_flux_mode_pullback(flux_bar)
+
         def _zero_state_bar():
             return jax.tree_util.tree_map(jnp.zeros_like, state)
 
@@ -2308,6 +2357,7 @@ class NTXDatabaseTransportModel(TransportFluxModelBase):
                 bc_density=self.bc_density,
                 bc_temperature=self.bc_temperature,
             ),
+            reference_flux=self(state),
         )
 
     def evaluate_with_lagged_response(self, state, lagged_response, **kwargs):
@@ -2342,7 +2392,21 @@ class NTXDatabaseTransportModel(TransportFluxModelBase):
             lagged_response.reference_face_flux,
             tangent_face_flux,
         )
-        return self._fluxes_from_face_fluxes(face_fluxes)
+        out = self._fluxes_from_face_fluxes(face_fluxes)
+        if lagged_response.reference_flux is not None:
+            tangent_flux = jax.jvp(
+                self.__call__,
+                (lagged_response.reference_state,),
+                (delta_state,),
+            )[1]
+            out.update(
+                jax.tree_util.tree_map(
+                    lambda reference, tangent: reference + tangent,
+                    lagged_response.reference_flux,
+                    tangent_flux,
+                )
+            )
+        return out
 
 
 def _as_float_array(value, *, name: str, positive: bool = False) -> jax.Array:
@@ -16488,7 +16552,7 @@ class ReLUAnalyticalTurbulentTransportModel(TransportFluxModelBase):
         relu_base = kT - crit_T * jnp.sign(kT)
         q = jnp.where(
             jnp.abs(kT) < crit_T,
-            jnp.asarray(1.0e-16, dtype=dtype),
+            jnp.asarray(0.0, dtype=dtype),
             slope_T * _signed_power(relu_base),
         )
         return gamma, q

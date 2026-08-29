@@ -248,7 +248,7 @@ def test_ntx_local_particle_flux_evaluator_passes_bc_constraints(monkeypatch):
 
 
 def test_ntx_database_lagged_face_response_matches_reference_and_finite_difference(monkeypatch):
-    """The database lagged response must be the JVP of its face-flux path.
+    """The database lagged response preserves direct centres and face JVPs.
 
     This uses a nonlinear stand-in for the database interpolation so that the
     finite-difference comparison exercises density, temperature, Er, and face
@@ -301,10 +301,32 @@ def test_ntx_database_lagged_face_response_matches_reference_and_finite_differen
         upar = er_by_species**2 + 0.4 * density_faces * dtdr_faces
         return None, gamma, heat, upar
 
+    def fake_center_database_fluxes(
+        species_arg,
+        energy_grid_arg,
+        geometry_arg,
+        database_arg,
+        er,
+        temperature,
+        density,
+        **kwargs,
+    ):
+        del species_arg, energy_grid_arg, geometry_arg, database_arg, kwargs
+        er_by_species = er[None, :]
+        gamma = density * er_by_species + 0.1 * temperature**2
+        heat = density * temperature**2 + 0.2 * er_by_species**2
+        upar = er_by_species * temperature + 0.3 * density**2
+        return None, gamma, heat, upar
+
     monkeypatch.setattr(
         flux_models_module,
         "get_Neoclassical_Fluxes_Faces",
         fake_face_database_fluxes,
+    )
+    monkeypatch.setattr(
+        flux_models_module,
+        "get_Neoclassical_Fluxes",
+        fake_center_database_fluxes,
     )
     model = flux_models_module.NTXDatabaseTransportModel(
         species=species,
@@ -321,6 +343,12 @@ def test_ntx_database_lagged_face_response_matches_reference_and_finite_differen
     lagged_at_reference = model.evaluate_with_lagged_response(state0, response)
     direct_at_reference = face_fluxes_from_state(state0)
     for name in ("Gamma", "Q", "Upar"):
+        assert jnp.allclose(
+            lagged_at_reference[name],
+            model(state0)[name],
+            rtol=1.0e-6,
+            atol=1.0e-6,
+        )
         assert jnp.allclose(
             lagged_at_reference[f"{name}_faces"],
             direct_at_reference[name],
@@ -349,7 +377,18 @@ def test_ntx_database_lagged_face_response_matches_reference_and_finite_differen
         model.evaluate_with_lagged_response(state_plus, response),
         lagged_at_reference,
     )
+    center_finite_difference = jax.tree_util.tree_map(
+        lambda plus, minus: (plus - minus) / (2.0 * epsilon),
+        model(state_plus),
+        model(state_minus),
+    )
     for name in ("Gamma", "Q", "Upar"):
+        assert jnp.allclose(
+            lagged_direction[name] / epsilon,
+            center_finite_difference[name],
+            rtol=3.0e-3,
+            atol=3.0e-4,
+        )
         assert jnp.allclose(
             lagged_direction[f"{name}_faces"] / epsilon,
             finite_difference[name],

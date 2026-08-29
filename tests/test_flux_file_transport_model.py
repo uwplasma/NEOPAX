@@ -13,6 +13,7 @@ from NEOPAX._transport_flux_models import (
     CombinedTransportFluxModel,
     CombinedTransportLaggedResponse,
     FluxesRFileTransportModel,
+    JVPTransportFluxResponse,
     PowerAnalyticalTurbulentTransportModel,
     SpectraXTurbulenceFDLaggedResponse,
     ReLUAnalyticalTurbulentTransportModel,
@@ -156,6 +157,68 @@ def test_combined_lagged_flux_model_applies_interpolate_from_faces_to_centres():
 
     assert jnp.allclose(out["Gamma_faces"], expected_faces)
     assert jnp.allclose(out["Gamma"], jax.vmap(cell_centered_from_faces)(expected_faces))
+
+
+def test_combined_lagged_pullback_transposes_interpolated_centres_to_faces():
+    """The universal centre policy must have the matching AD transpose."""
+
+    class _ResponseModel:
+        def build_lagged_response(self, state, **kwargs):
+            del kwargs
+            return JVPTransportFluxResponse(reference_state=state, reference_flux={})
+
+        def evaluate_with_lagged_response(self, state, response, **kwargs):
+            del state, kwargs
+            density = response.reference_state.density
+            face = jnp.concatenate(
+                (density[:, :1], density),
+                axis=1,
+            )
+            return {
+                "Gamma": 10.0 * density,
+                "Q": 20.0 * density,
+                "Upar": 30.0 * density,
+                "Gamma_faces": face,
+                "Q_faces": 2.0 * face,
+                "Upar_faces": 3.0 * face,
+            }
+
+    state = TransportState(
+        density=jnp.asarray([[1.0, 2.0], [3.0, 4.0]]),
+        pressure=jnp.ones((2, 2)),
+        Er=jnp.zeros(2),
+    )
+    model = _ResponseModel()
+    combined = CombinedTransportFluxModel(
+        model,
+        model,
+        model,
+        geometry=DummyGeometry(),
+        center_flux_mode="interpolate_from_faces",
+    )
+    response = combined.build_lagged_response(state)
+    output = combined.evaluate_with_lagged_response(state, response)
+    output_bar = jax.tree_util.tree_map(jnp.zeros_like, output)
+    gamma_bar = jnp.asarray([[2.0, -1.0], [0.5, 3.0]])
+    output_bar["Gamma"] = gamma_bar
+
+    _, pullback = jax.vjp(
+        lambda response_value: combined.evaluate_with_lagged_response(state, response_value),
+        response,
+    )
+    expected = pullback(output_bar)[0]
+    actual = combined.pullback_evaluate_with_lagged_response(
+        state,
+        response,
+        {"Gamma": gamma_bar},
+    )
+
+    for expected_leaf, actual_leaf in zip(
+        jax.tree_util.tree_leaves(expected),
+        jax.tree_util.tree_leaves(actual),
+        strict=True,
+    ):
+        assert jnp.allclose(actual_leaf, expected_leaf)
 
 
 def test_transport_flux_base_lagged_response_is_flux_linearization():
@@ -659,6 +722,11 @@ def test_relu_analytical_turbulent_transport_model_thresholds_fluxes():
         {
             "species_idx": {"e": 0},
             "species_indices": jnp.array([0, 1]),
+            "names": ("e", "D"),
+            "number_species": 2,
+            # The ReLU model converts gyro-Bohm amplitudes to physical units
+            # using a non-electron reference species.
+            "mass_mp": jnp.array([1.0 / 1836.0, 2.0]),
         },
     )()
     field = DummyGeometry()
