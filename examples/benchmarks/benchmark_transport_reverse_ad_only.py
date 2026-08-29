@@ -3574,6 +3574,7 @@ def _run_realtime_geometry_optimization_api_smoke(
             LeastSquaresTerm(geometry_objectives.vmec_iota_mean),
             LeastSquaresTerm(geometry_objectives.vmec_magnetic_well),
             LeastSquaresTerm(geometry_objectives.vmec_mirror_ratio),
+            LeastSquaresTerm(geometry_objectives.vmec_dmerc_stability_softmax),
         )
     if bool(getattr(args, "full_transport_shared_payload_smoke", False)):
         geom_cfg_for_context = config.get("geometry", {})
@@ -3942,6 +3943,7 @@ def _run_initial_er_root_only_optimization_api_smoke(
                 LeastSquaresTerm(geometry_objectives.vmec_iota_mean),
                 LeastSquaresTerm(geometry_objectives.vmec_magnetic_well),
                 LeastSquaresTerm(geometry_objectives.vmec_mirror_ratio),
+                LeastSquaresTerm(geometry_objectives.vmec_dmerc_stability_softmax),
             )
             evaluation = evaluate_geometry_initial_er_root_only_least_squares_benchmark_tables(
                 config,

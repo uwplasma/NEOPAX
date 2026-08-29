@@ -51,10 +51,12 @@ from NEOPAX._reverse_ad_initial_er import (  # noqa: E402
     initial_er_charge_flux_residuals,
 )
 from NEOPAX._geometry_autodiff import (  # noqa: E402
+    _geometry_full_ad_objectives_from_state,
     _implicit_params_with_boundary_deltas,
     boundary_param_entries,
     build_runtime_context_for_geometry_param,
     build_runtime_context_for_vmec_state,
+    geometry_observable_names_for_kind,
 )
 from NEOPAX._orchestrator import (  # noqa: E402
     _execution_device_context,
@@ -221,13 +223,19 @@ def _objectives_on_realtime_geometry_frozen_trace(
     return _objective_vector(replay["final_state"], runtime), replay
 
 
-def _runtime_for_geometry_delta(config: dict[str, Any], geometry_parameter: str, delta_value):
+def _runtime_for_geometry_delta(
+    config: dict[str, Any],
+    geometry_parameter: str,
+    delta_value,
+    *,
+    return_vmec_state: bool = False,
+):
     geom_cfg = config.get("geometry", {})
     geometry_context = _geometry_context_from_config(config, geometry_parameter)
     specs = _geometry_param_specs_from_parameter_name(geometry_parameter)
     if len(specs) != 1:
         raise ValueError("This FD benchmark currently expects one geometry parameter.")
-    return build_runtime_context_for_geometry_param(
+    result = build_runtime_context_for_geometry_param(
         config,
         geometry_context,
         jnp.asarray(delta_value, dtype=jnp.float64),
@@ -236,7 +244,20 @@ def _runtime_for_geometry_delta(config: dict[str, Any], geometry_parameter: str,
         max_iter=geom_cfg.get("vmec_max_iter"),
         step_size=geom_cfg.get("vmec_step_size"),
         jacobian_penalty=float(geom_cfg.get("vmec_jacobian_penalty", 1.0e3)),
+        return_vmec_state=return_vmec_state,
     )
+    if return_vmec_state:
+        runtime, transport_state, state_vmec = result
+        return runtime, transport_state, state_vmec, geometry_context
+    return result
+
+
+def _geometry_full_objective_vector(context, state_vmec) -> jax.Array:
+    """Canonical scalar geometry rows shared with the reverse-table path."""
+
+    names = geometry_observable_names_for_kind("geometry_full_ad_objectives")
+    values = _geometry_full_ad_objectives_from_state(context, state_vmec)
+    return jnp.stack([jnp.asarray(values[name], dtype=jnp.float64).reshape(()) for name in names])
 
 
 def _param_unit_tangent_like(params, entry: dict[str, Any]):
@@ -390,6 +411,7 @@ def _geometry_fd_objectives(
     baseline_er_profile=None,
     baseline_residual=None,
     baseline_dres_der=None,
+    include_vmec_main_geometry_objectives: bool = False,
 ):
     if str(geometry_fd_lane).strip().lower() == "frozen_linearized":
         if frozen_linearized_bundle is None:
@@ -401,9 +423,21 @@ def _geometry_fd_objectives(
             step_scale=float(geometry_delta) - baseline_delta,
             fixed_initial_er=fixed_initial_er,
         )
+        state_vmec = jax.tree.map(
+            lambda value, tangent: value
+            + jnp.asarray(float(geometry_delta) - baseline_delta, dtype=jnp.float64) * tangent,
+            frozen_linearized_bundle["state_star"],
+            frozen_linearized_bundle["state_tangent"],
+        )
+        geometry_context = frozen_linearized_bundle["context"]
     else:
-        runtime, baseline_state = _runtime_for_geometry_delta(config, geometry_parameter, geometry_delta)
-    return _objectives_on_realtime_geometry_frozen_trace(
+        runtime, baseline_state, state_vmec, geometry_context = _runtime_for_geometry_delta(
+            config,
+            geometry_parameter,
+            geometry_delta,
+            return_vmec_state=True,
+        )
+    transport_objectives, replay = _objectives_on_realtime_geometry_frozen_trace(
         config=config,
         runtime=runtime,
         baseline_state=baseline_state,
@@ -417,6 +451,11 @@ def _geometry_fd_objectives(
         baseline_residual=baseline_residual,
         baseline_dres_der=baseline_dres_der,
     )
+    if not include_vmec_main_geometry_objectives:
+        return transport_objectives, replay
+    return jnp.concatenate(
+        [transport_objectives, _geometry_full_objective_vector(geometry_context, state_vmec)]
+    ), replay
 
 
 def _root_only_objective_names(raw: str) -> tuple[str, ...]:
@@ -593,6 +632,16 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--include-vmec-main-geometry-objectives",
+        action="store_true",
+        help=(
+            "Append the shared VMEX-main geometry table rows (including QI, "
+            "max-J, and the scalar physical-Mercier softmax objective) to the "
+            "transport FD vector. This is valid only for a realtime geometry "
+            "parameter. For reverse-AD parity, use --geometry-fd-lane nonlinear_resolve."
+        ),
+    )
+    parser.add_argument(
         "--initial-Er-root-ad",
         dest="initial_er_root_ad",
         default="off",
@@ -680,6 +729,12 @@ def main() -> None:
     geometry_fd_lane = str(args.geometry_fd_lane).strip().lower()
     parameter_is_profile = parameter_name in PARAMETER_ORDER
     root_only_fd = bool(args.initial_er_root_only_fd)
+    include_vmec_main_geometry_objectives = bool(args.include_vmec_main_geometry_objectives)
+    if include_vmec_main_geometry_objectives and (parameter_is_profile or root_only_fd):
+        raise SystemExit(
+            "--include-vmec-main-geometry-objectives requires a full-transport "
+            "realtime geometry parameter; it is not defined for profile or root-only FD."
+        )
     frozen_linearized_bundle = None
     if parameter_is_profile or geometry_fd_lane != "frozen_linearized":
         baseline_runtime, baseline_state = build_runtime_context(config)
@@ -922,6 +977,35 @@ def main() -> None:
         args.accepted_step_limit,
     )
     baseline_objectives = _objective_vector(_baseline_final_state, baseline_runtime)
+    objective_labels = tuple(OBJECTIVE_LABELS)
+    if include_vmec_main_geometry_objectives:
+        baseline_delta = float(config.get("geometry", {}).get("vmec_param_delta", 0.0))
+        if geometry_fd_lane == "frozen_linearized":
+            if frozen_linearized_bundle is None:
+                raise ValueError("Missing frozen-linearized geometry bundle.")
+            baseline_vmec_state = frozen_linearized_bundle["state_star"]
+            baseline_geometry_context = frozen_linearized_bundle["context"]
+        else:
+            _runtime_unused, _state_unused, baseline_vmec_state, baseline_geometry_context = (
+                _runtime_for_geometry_delta(
+                    config,
+                    parameter_name,
+                    baseline_delta,
+                    return_vmec_state=True,
+                )
+            )
+        baseline_objectives = jnp.concatenate(
+            [
+                baseline_objectives,
+                _geometry_full_objective_vector(
+                    baseline_geometry_context, baseline_vmec_state
+                ),
+            ]
+        )
+        objective_labels = (
+            *objective_labels,
+            *geometry_observable_names_for_kind("geometry_full_ad_objectives"),
+        )
     baseline_objectives = jax.block_until_ready(baseline_objectives)
     full_root_fd_lane = str(args.initial_er_root_fd_root_lane).strip().lower()
     if full_root_fd_lane == "frozen_linearized" and initial_er_root_ad == "off":
@@ -1046,6 +1130,7 @@ def main() -> None:
             baseline_er_profile=baseline_er_profile,
             baseline_residual=baseline_residual,
             baseline_dres_der=baseline_dres_der,
+            include_vmec_main_geometry_objectives=include_vmec_main_geometry_objectives,
         )
         print(
             "[autodiff-gate] progress: running fixed-final-state explicit geometry FD diagnostic",
@@ -1088,6 +1173,7 @@ def main() -> None:
             baseline_er_profile=baseline_er_profile,
             baseline_residual=baseline_residual,
             baseline_dres_der=baseline_dres_der,
+            include_vmec_main_geometry_objectives=include_vmec_main_geometry_objectives,
         )
         baseline_geometry_final_state_fd = (
             _objective_vector(plus_replay["final_state"], baseline_runtime)
@@ -1318,7 +1404,8 @@ def main() -> None:
         "ntx_exact_surface_backend": str(
             config.get("neoclassical", {}).get("ntx_exact_surface_backend", "booz")
         ),
-        "objective_labels": list(OBJECTIVE_LABELS),
+        "objective_labels": list(objective_labels),
+        "transport_objective_labels": list(OBJECTIVE_LABELS),
         "objective_values": baseline_np.tolist(),
         "gradient_fd": gradient_np.tolist(),
         "fixed_final_state_objective_geometry_fd": None
@@ -1369,10 +1456,10 @@ def main() -> None:
         f"root_fd_lane={full_root_fd_lane}"
     )
     print("[autodiff-gate] objective values:")
-    for label, value in zip(OBJECTIVE_LABELS, baseline_np.tolist()):
+    for label, value in zip(objective_labels, baseline_np.tolist()):
         print(f"  - {label}: value={float(value):.16e}")
     print("[autodiff-gate] objective finite-difference gradients:")
-    for label, value in zip(OBJECTIVE_LABELS, gradient_np.tolist()):
+    for label, value in zip(objective_labels, gradient_np.tolist()):
         print(f"  - {label}: fd={float(value):.6e}")
     if fixed_final_state_geometry_fd_np is not None:
         print("[autodiff-gate] fixed-final-state explicit geometry finite-difference gradients:")

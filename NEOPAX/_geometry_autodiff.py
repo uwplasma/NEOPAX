@@ -1115,6 +1115,25 @@ def geometry_raw_block_transpose_from_state_bars(
     return _param_vector_gradient_from_implicit_param_grads(param_bar_batch, raw_block_solve.param_entries)
 
 
+def geometry_qi_maxj_baseline_pitches(
+    context: GeometryAutodiffContext,
+    raw_block_solve: GeometryRawBlockSolve,
+) -> jnp.ndarray:
+    """Select and freeze common physical pitches for one geometry stage.
+
+    Well membership is discrete.  This helper is therefore called once on the
+    baseline converged equilibrium, outside the differentiated objective; the
+    returned physical pitches are retained unchanged for every QI/max-J AD
+    evaluation in that stage.
+    """
+    # Do not call VMEX's state-native ``boozer_bmnc_state`` here.  NEOPAX's
+    # geometry table already has a traceable booz_xform lane and QI/max-J must
+    # consume that same spectrum, rather than perform a second Boozer
+    # construction solely to select its fixed physical pitches.
+    booz = _boozer_output_from_state(context, raw_block_solve.state)
+    return _qi_maxj_common_pitches_from_boozer(context, booz)
+
+
 def _boundary_with_boundary_deltas(
     context: "GeometryAutodiffContext",
     param_deltas,
@@ -1233,6 +1252,7 @@ class GeometryAutodiffContext:
     pressure: jnp.ndarray
     surface_s: tuple[float, ...]
     surface_indices: jnp.ndarray
+    qi_maxj_trapping_depths: tuple[float, ...]
     mboz: int
     nboz: int
     booz_constants: Any
@@ -1353,7 +1373,17 @@ def build_geometry_autodiff_context(
     mboz: int | None = None,
     nboz: int | None = None,
     surface_s: Sequence[float] = (0.25, 0.5, 0.75),
+    qi_maxj_trapping_depths: Sequence[float] = (0.35, 0.55, 0.75),
 ) -> GeometryAutodiffContext:
+    depths = tuple(float(value) for value in qi_maxj_trapping_depths)
+    if not depths or any(
+        not np.isfinite(value) or value <= 0.0 or value >= 1.0
+        for value in depths
+    ):
+        raise ValueError(
+            "qi_maxj_trapping_depths must contain finite values strictly "
+            "between zero and one."
+        )
     vmec_backend = _import_vmec_jax()
     booz_api = _import_booz_xform_jax_api()
 
@@ -1438,6 +1468,7 @@ def build_geometry_autodiff_context(
         pressure=jnp.asarray(fixed_context["pressure"]),
         surface_s=tuple(float(val) for val in surface_s),
         surface_indices=jnp.asarray(surface_indices, dtype=jnp.int32),
+        qi_maxj_trapping_depths=depths,
         mboz=resolved_mboz,
         nboz=resolved_nboz,
         booz_constants=booz_constants,
@@ -1759,6 +1790,16 @@ def _vmec_dmerc_profile_from_state(
     context: GeometryAutodiffContext,
     state,
 ) -> jnp.ndarray:
+    if _using_current_vmec_jax_context(context):
+        # VMEX main owns a pure-JAX, state/runtime Mercier reconstruction.
+        # It is the AD-compatible replacement for the old backend's WOUT/
+        # finite-difference-only diagnostic and does not require Boozer data.
+        stability = _import_vmec_module("core.stability")
+        return jnp.asarray(
+            stability.d_merc_state(state, context.static.runtime),
+            dtype=jnp.float64,
+        )
+
     vmec_jax = _import_vmec_jax()
     try:
         mercier_terms_from_state = _resolve_vmec_attr(
@@ -1780,6 +1821,65 @@ def _vmec_dmerc_profile_from_state(
         # an AD-transparent state function. Keep the scalar-observable smoke
         # gate running while making this diagnostic contribution neutral.
         return jnp.zeros_like(jnp.asarray(context.static.s, dtype=jnp.float64))
+
+
+def vmec_mercier_stability_residual_from_state(
+    context: GeometryAutodiffContext,
+    state,
+    *,
+    margin: float = 0.0,
+    smoothing: float = 1.0e-6,
+) -> jnp.ndarray:
+    """VMEX-main physical Mercier residual rows for the reverse-AD table.
+
+    The returned vector is precisely VMEX main's smooth instability residual
+    on ``DMerc[2:-1]``.  It is intentionally not reduced to a mean or a
+    sampled scalar: an optimization table can weight its radial rows exactly
+    as the VMEX examples do.
+    """
+    if not _using_current_vmec_jax_context(context):
+        raise _vmec_dmerc_unavailable_error()
+    stability = _import_vmec_module("core.stability")
+    return jnp.asarray(
+        stability.mercier_stability_residual(
+            state,
+            context.static.runtime,
+            margin=float(margin),
+            smoothing=float(smoothing),
+        ),
+        dtype=jnp.float64,
+    )
+
+
+def vmec_mercier_stability_softmax_objective_from_state(
+    context: GeometryAutodiffContext,
+    state,
+    *,
+    margin: float = 0.0,
+    smoothing: float = 1.0e-6,
+    temperature: float = 1.0e-3,
+) -> jnp.ndarray:
+    """Smooth worst-surface physical Mercier-instability objective.
+
+    VMEX main supplies the physically meaningful, already-smoothed violation
+    residual at every valid interior surface.  This function reduces that
+    vector with softmax weights rather than exporting radial rows: it is zero
+    when every residual is zero and approaches the largest unstable-surface
+    residual as ``temperature`` tends to zero.
+    """
+    if temperature <= 0.0:
+        raise ValueError(f"Mercier softmax temperature must be positive, got {temperature}.")
+    residuals = vmec_mercier_stability_residual_from_state(
+        context,
+        state,
+        margin=margin,
+        smoothing=smoothing,
+    )
+    if int(residuals.size) == 0:
+        return jnp.asarray(0.0, dtype=jnp.float64)
+    scale = jnp.asarray(temperature, dtype=residuals.dtype)
+    weights = jax.nn.softmax(residuals / scale)
+    return jnp.sum(weights * residuals)
 
 
 def _vmec_scalar_observables_from_state(
@@ -2150,47 +2250,99 @@ def _vmec_j_invariant_qi_maxj_objectives_from_state(
     )
 
 
+def _qi_maxj_common_pitches_from_boozer(
+    context: GeometryAutodiffContext,
+    booz,
+) -> jnp.ndarray:
+    """Choose the frozen QI/max-J pitches from NEOPAX's Boozer spectrum.
+
+    This is deliberately a post-processing operation on ``booz_xform``
+    output.  Calling ``common_trapped_pitches_state`` would construct a
+    second, VMEX-native Boozer spectrum just to select the pitch values.
+    """
+    maxj = _import_vmec_module("core.maxj")
+    bmnc_b = jnp.asarray(booz["bmnc_b"], dtype=jnp.float64)
+    bmns_b = jnp.asarray(booz.get("bmns_b", jnp.zeros_like(bmnc_b)), dtype=jnp.float64)
+    xm_b = jnp.asarray(booz["ixm_b"], dtype=jnp.float64)
+    xn_b = jnp.asarray(booz["ixn_b"], dtype=jnp.float64)
+    iota_b = jnp.asarray(booz["iota_b"], dtype=jnp.float64)
+
+    # Use the same physical Boozer-angle field-line convention as VMEX main's
+    # ``common_trapped_pitches_state``, but obtain |B| from the one existing
+    # NEOPAX booz_xform result.  This calculation is outside the differentiated
+    # residual: trapped-well membership and the selected pitch are fixed at
+    # the stage baseline.
+    nalpha = 9
+    points_per_period = 64
+    num_periods = 4
+    alpha = jnp.asarray(2.0 * np.pi * np.arange(nalpha) / nalpha, dtype=bmnc_b.dtype)
+    phi = jnp.asarray(
+        2.0 * np.pi * np.arange(points_per_period * num_periods)
+        / (int(context.cfg.nfp) * points_per_period),
+        dtype=bmnc_b.dtype,
+    )
+    theta = alpha[None, :, None] + iota_b[:, None, None] * phi[None, None, :]
+    angle = theta[..., None] * xm_b - phi[None, None, :, None] * xn_b
+    bmag = (
+        jnp.einsum("sapm,sm->sap", jnp.cos(angle), bmnc_b)
+        + jnp.einsum("sapm,sm->sap", jnp.sin(angle), bmns_b)
+    )
+    pitches = maxj.common_trapped_pitches(
+        jnp.swapaxes(bmag, 1, 2), context.qi_maxj_trapping_depths
+    )
+    return jax.lax.stop_gradient(jnp.asarray(pitches, dtype=jnp.float64))
+
+
 def _vmec_j_invariant_qi_maxj_objectives_from_boozer(
     context: GeometryAutodiffContext,
     booz,
     *,
     include_qi: bool,
     include_maxj: bool,
+    pitches=None,
 ) -> dict[str, jnp.ndarray]:
-    """Keep the existing Boozer path and only swap the QI/max-J post-processing."""
+    """Evaluate VMEX-main QI/max-J directly from the existing booz_xform output."""
 
-    vmec_backend = _import_vmec_jax()
-    helper = getattr(vmec_backend, "j_invariant_qi_maxj_residual_from_boozer", None)
-    if helper is None:
-        raise AttributeError(
-            "The active VMEC backend does not expose j_invariant_qi_maxj_residual_from_boozer. "
-            "This benchmark path is intentionally restricted to the existing Boozer output plus "
-            "the VMEX J-based QI/max-J post-processing."
-        )
-
-    gi_b = jnp.asarray(booz["bvco_b"], dtype=jnp.float64) + (
-        jnp.asarray(booz["iota_b"], dtype=jnp.float64) * jnp.asarray(booz["buco_b"], dtype=jnp.float64)
-    )
+    qi = _import_vmec_module("core.qi")
+    maxj = _import_vmec_module("core.maxj")
+    if pitches is None:
+        # The ordinary objective lane has no stage auxiliary payload.  The
+        # value remains non-differentiated, while the specialized table
+        # pullback below supplies one baseline value explicitly.
+        pitches = _qi_maxj_common_pitches_from_boozer(context, booz)
+    else:
+        pitches = jax.lax.stop_gradient(jnp.asarray(pitches, dtype=jnp.float64))
     surface_indices = np.asarray(context.surface_indices, dtype=np.int32).reshape(-1)
     s_half = 0.5 * (
         np.asarray(context.static.s[:-1], dtype=float)
         + np.asarray(context.static.s[1:], dtype=float)
     )
     s_b = jnp.asarray(s_half[surface_indices], dtype=jnp.float64)
-    diagnostics = helper(
+    inputs = dict(
         bmnc_b=booz["bmnc_b"],
         xm_b=booz["ixm_b"],
         xn_b=booz["ixn_b"],
         iota_b=booz["iota_b"],
-        gi_b=gi_b,
-        s_b=s_b,
+        G_b=booz["bvco_b"],
+        I_b=booz["buco_b"],
         nfp=int(context.cfg.nfp),
-        include_qi=bool(include_qi),
-        include_maxj=bool(include_maxj),
+        pitch=pitches,
+    )
+    if "bmns_b" in booz:
+        inputs["bmns_b"] = booz["bmns_b"]
+    qi_total = (
+        qi.j_invariant_qi_residual_from_boozer(**inputs)["total"]
+        if include_qi else jnp.asarray(0.0, dtype=jnp.float64)
+    )
+    maxj_total = (
+        maxj.maximum_j_residual_from_boozer(
+            **inputs, psi_b=s_b, psi_edge=jnp.asarray(1.0, dtype=jnp.float64)
+        )["total"]
+        if include_maxj else jnp.asarray(0.0, dtype=jnp.float64)
     )
     return {
-        "qi_objective": jnp.asarray(diagnostics.get("qi_objective", 0.0), dtype=jnp.float64),
-        "maxj_objective": jnp.asarray(diagnostics.get("maxj_objective", 0.0), dtype=jnp.float64),
+        "qi_objective": jnp.asarray(qi_total, dtype=jnp.float64),
+        "maxj_objective": jnp.asarray(maxj_total, dtype=jnp.float64),
     }
 
 
@@ -2239,6 +2391,9 @@ def _geometry_full_ad_objectives_from_state(
         out[f"boozer_{name}"] = jnp.asarray(value, dtype=jnp.float64)
     out["boozer_qi_objective"] = jnp.asarray(qi_maxj["qi_objective"], dtype=jnp.float64)
     out["boozer_maxj_objective"] = jnp.asarray(qi_maxj["maxj_objective"], dtype=jnp.float64)
+    out["vmec_dmerc_stability_softmax"] = (
+        vmec_mercier_stability_softmax_objective_from_state(context, state)
+    )
     return out
 
 
@@ -2646,6 +2801,7 @@ def _observable_names_for_kind(observable_kind: str) -> list[str]:
             "boozer_b10_over_b00_mean",
             "boozer_qi_objective",
             "boozer_maxj_objective",
+            "vmec_dmerc_stability_softmax",
         ]
     if kind == "vmec_iotaf_scalar_observables":
         return ["iotas_1", "iotas_2", "iotaf_first", "iotaf_q1", "iotaf_mid", "iotaf_q3", "iotaf_edge", "iota_mean"]
@@ -3519,11 +3675,16 @@ def geometry_full_ad_objective_table_pullback_from_param_vector(
         "magnetic_well",
         "mirror_ratio",
         "beta_volume",
+        "dmerc_stability_softmax",
     )
     vmec_indices = tuple(names.index(f"vmec_{name}") for name in vmec_names)
 
     def vmec_vector(state_inner):
         values = _vmec_core_scalar_objectives_from_state(context, state_inner)
+        values = dict(values)
+        values["dmerc_stability_softmax"] = (
+            vmec_mercier_stability_softmax_objective_from_state(context, state_inner)
+        )
         return jnp.stack([jnp.asarray(values[name], dtype=jnp.float64).reshape(()) for name in vmec_names])
 
     vmec_values, vmec_state_pullback = jax.vjp(vmec_vector, state)
@@ -3573,6 +3734,13 @@ def geometry_full_ad_objective_table_pullback_from_param_vector(
 
     j_qi_maxj_names = ("boozer_qi_objective", "boozer_maxj_objective")
     j_qi_maxj_indices = tuple(names.index(name) for name in j_qi_maxj_names)
+    # Select the physical trapped-particle population once from this already
+    # computed booz_xform output.  The inner VJP below then treats it as fixed;
+    # it neither differentiates pitch selection nor invokes VMEX's separate
+    # state-native Boozer transform.
+    j_qi_maxj_pitches = _qi_maxj_common_pitches_from_boozer(
+        context, booz_with_modes(booz)
+    )
 
     def j_qi_maxj_vector(booz_inner):
         values = _vmec_j_invariant_qi_maxj_objectives_from_boozer(
@@ -3580,6 +3748,7 @@ def geometry_full_ad_objective_table_pullback_from_param_vector(
             booz_with_modes(booz_inner),
             include_qi=True,
             include_maxj=True,
+            pitches=j_qi_maxj_pitches,
         )
         return jnp.stack(
             [
@@ -3632,6 +3801,69 @@ def geometry_full_ad_objective_table_pullback_from_param_vector(
         )
     _progress("final vmec parameter pullback ready", gradient_matrix)
     return values_by_name, gradient_matrix
+
+
+def geometry_dmerc_stability_reverse_table_from_param_vector(
+    context: GeometryAutodiffContext,
+    param_deltas,
+    param_specs: Sequence[tuple[str, int, int]],
+    *,
+    margin: float = 0.0,
+    smoothing: float = 1.0e-6,
+    max_iter: int | None = None,
+    solver_device: str | None = None,
+    raw_block_solve: GeometryRawBlockSolve | None = None,
+) -> tuple[tuple[str, ...], jnp.ndarray, jnp.ndarray]:
+    """Return one physical-Mercier residual and reverse row per interior surface.
+
+    Unlike the legacy sampled DMerc observables, this preserves VMEX main's
+    complete ``DMerc[2:-1]`` softplus residual vector.  The VMEC solve is
+    supplied by, or built as, one raw-block stage and the resulting state bars
+    use the same batched raw-block transpose as the geometry table.
+    """
+    if not _using_current_vmec_jax_context(context):
+        raise _vmec_dmerc_unavailable_error()
+    if raw_block_solve is None:
+        raw_block_solve = geometry_raw_block_solve_from_param_vector(
+            context,
+            jnp.asarray(param_deltas, dtype=jnp.float64),
+            param_specs,
+            max_iter=max_iter,
+            solver_device=solver_device,
+        )
+
+    def _rows_from_state(state_inner):
+        return vmec_mercier_stability_residual_from_state(
+            context,
+            state_inner,
+            margin=margin,
+            smoothing=smoothing,
+        )
+
+    values, state_pullback = jax.vjp(_rows_from_state, raw_block_solve.state)
+    values = jnp.asarray(values, dtype=jnp.float64)
+    expected_count = int(jnp.asarray(context.static.s).size) - 3
+    if values.ndim != 1 or int(values.size) != expected_count:
+        raise ValueError(
+            "VMEX mercier_stability_residual must return one row for each "
+            f"DMerc[2:-1] entry; expected {expected_count}, got {values.shape}."
+        )
+    state_bar_batch = jax.vmap(lambda cotangent: state_pullback(cotangent)[0])(
+        jnp.eye(expected_count, dtype=values.dtype)
+    )
+    param_bar_batch = geometry_raw_block_transpose_from_state_bars(
+        raw_block_solve,
+        state_bar_batch,
+        probe_chunk_size=1,
+    )
+    gradient_matrix = _param_vector_gradient_from_implicit_param_grads(
+        param_bar_batch, raw_block_solve.param_entries
+    )
+    names = tuple(
+        f"vmec_dmerc_stability_s{surface_index}"
+        for surface_index in range(2, int(jnp.asarray(context.static.s).size) - 1)
+    )
+    return names, values, gradient_matrix
 
 
 def geometry_observable_multi_rhs_pullback_from_param_vector(
@@ -6198,6 +6430,7 @@ def build_runtime_context_for_geometry_param(
     max_iter: int | None = None,
     step_size: float | None = None,
     jacobian_penalty: float = 1.0e3,
+    return_vmec_state: bool = False,
 ):
     state_vmec = _solve_state_for_single_param(
         context,
@@ -6207,12 +6440,15 @@ def build_runtime_context_for_geometry_param(
         step_size=step_size,
         jacobian_penalty=jacobian_penalty,
     )
-    return build_runtime_context_for_vmec_state(
+    runtime, transport_state = build_runtime_context_for_vmec_state(
         config,
         context,
         state_vmec,
         n_r=n_r,
     )
+    if return_vmec_state:
+        return runtime, transport_state, state_vmec
+    return runtime, transport_state
 
 
 def build_runtime_context_for_vmec_state(
