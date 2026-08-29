@@ -76,12 +76,15 @@ from ._reverse_ad_parameters import (
     vmex_boundary_parameterization,
 )
 from ._reverse_ad_transport import (
+    RealtimeGeometryPayloadPullbackResult,
+    RealtimeGeometryTransportReverseAssemblyResult,
     TRANSPORT_REVERSE_OBJECTIVE_LABELS,
     internal_realtime_geometry_transport_reverse_table_result_builder,
     initial_state_for_parameter_vector,
     realtime_geometry_transport_reverse_grouped_inputs,
     realtime_geometry_transport_reverse_support_segment_executor,
     realtime_geometry_transport_reverse_table_context,
+    realtime_geometry_transport_reverse_table_result,
     run_internal_realtime_geometry_support_segment_probe,
 )
 from ._transport_flux_models import DENSITY_STATE_TO_PHYSICAL
@@ -1552,7 +1555,33 @@ def geometry_initial_er_root_only_least_squares_problem(
                 raw_block_solve=raw_block_solve,
                 prepared_payload_static=prepared_static,
                 prepared_active_payload_leaves=prepared_active_payload_leaves,
+                return_raw_matrices=True,
                 return_branch_gradients=False,
+            )
+
+        def _stage_payload_result_from_kernel(kernel_result):
+            values, profile_gradient, geometry_gradient = kernel_result
+            table_result = realtime_geometry_transport_reverse_table_result(
+                objective_labels=stage_transport_objectives,
+                profile_parameter_labels=stage_profile_parameter_labels,
+                geometry_parameter_labels=tuple(
+                    spec.label for spec in parameter_set.vmec_boundary_specs
+                ),
+                objective_values=values,
+                profile_gradient_matrix=profile_gradient,
+                geometry_gradient_matrix=geometry_gradient,
+            )
+            payload_result = RealtimeGeometryPayloadPullbackResult(
+                geometry_gradient_matrix=geometry_gradient,
+                geometry_branch_gradient_matrix=None,
+                ntx_support_branch_gradient_matrix=None,
+                component_gradient_matrices={},
+                component_geometry_branch_matrices={},
+                component_ntx_support_branch_matrices={},
+            )
+            return RealtimeGeometryTransportReverseAssemblyResult(
+                table_result=table_result,
+                payload_pullback_result=payload_result,
             )
 
         payload_assembly_stage = build_initial_root_payload_assembly_stage(
@@ -1565,6 +1594,7 @@ def geometry_initial_er_root_only_least_squares_problem(
                 state=state,
             ),
             active_payload_layout_factory=initial_root_payload_active_leaf_layout,
+            result_from_kernel=_stage_payload_result_from_kernel,
         )
     if mode == "vmex_like":
         normalized_stage_terms = normalize_least_squares_terms(terms)

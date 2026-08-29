@@ -2012,7 +2012,7 @@ def _optimization_payload_to_vmec_table(
     combined_geometry_payload, return_branch_gradients,
     n_r, n_theta, n_zeta, n_xi, surface_backend, max_iter,
     solver_device, progress_label, raw_block_solve, prepared_payload_static=None,
-    prepared_active_payload_leaves=None,
+    prepared_active_payload_leaves=None, return_raw_matrices: bool = False,
 ):
     """Optimization-only boundary around the established payload pullback."""
     return realtime_geometry_transport_reverse_table_from_payload_cotangents(
@@ -2034,6 +2034,7 @@ def _optimization_payload_to_vmec_table(
         raw_block_solve=raw_block_solve, return_branch_gradients=return_branch_gradients,
         prepared_payload_static=prepared_payload_static,
         prepared_active_payload_leaves=prepared_active_payload_leaves,
+        return_raw_matrices=return_raw_matrices,
     )
 
 

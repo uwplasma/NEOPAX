@@ -6974,6 +6974,7 @@ def realtime_geometry_payload_pullback_result(
     dispatch_cache_probe=None,
     prepared_payload_static=None,
     prepared_active_payload_leaves=None,
+    return_gradient_matrix: bool = False,
 ) -> RealtimeGeometryPayloadPullbackResult:
     """Pull transport support-payload cotangents back to VMEC boundary harmonics.
 
@@ -7080,6 +7081,12 @@ def realtime_geometry_payload_pullback_result(
         component_geometry_branch_matrices = {}
         component_ntx_support_branch_matrices = {}
 
+    if return_gradient_matrix:
+        # Optimization-only numerical boundary: returning the raw matrix
+        # avoids constructing host/report dataclasses inside a JIT. The
+        # default public path still returns the unchanged rich result below.
+        return geometry_gradient_matrix
+
     return RealtimeGeometryPayloadPullbackResult(
         geometry_gradient_matrix=geometry_gradient_matrix,
         geometry_branch_gradient_matrix=geometry_branch_gradient_matrix,
@@ -7121,6 +7128,7 @@ def realtime_geometry_transport_reverse_table_from_payload_cotangents(
     dispatch_cache_probe=None,
     prepared_payload_static=None,
     prepared_active_payload_leaves=None,
+    return_raw_matrices: bool = False,
 ) -> RealtimeGeometryTransportReverseAssemblyResult:
     """Assemble the JAX transport reverse table from support-payload cotangents."""
 
@@ -7149,7 +7157,14 @@ def realtime_geometry_transport_reverse_table_from_payload_cotangents(
         dispatch_cache_probe=dispatch_cache_probe,
         prepared_payload_static=prepared_payload_static,
         prepared_active_payload_leaves=prepared_active_payload_leaves,
+        return_gradient_matrix=return_raw_matrices,
     )
+    if return_raw_matrices:
+        return (
+            jnp.asarray(objective_values),
+            jnp.asarray(profile_gradient_matrix),
+            jnp.asarray(payload_pullback_result),
+        )
     table_result = realtime_geometry_transport_reverse_table_result(
         objective_labels=objective_labels,
         profile_parameter_labels=profile_parameter_labels,

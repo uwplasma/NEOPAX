@@ -477,6 +477,7 @@ def build_initial_root_payload_assembly_stage(
     prepared_static: Any = None,
     prepared_static_factory: Callable[[Any], Any] | None = None,
     active_payload_layout_factory: Callable[[Any], Any] | None = None,
+    result_from_kernel: Callable[[Any], Any] | None = None,
 ) -> InitialRootPayloadAssemblyStage:
     """Compile only the final existing payload-to-VMEC boundary.
 
@@ -609,13 +610,14 @@ def build_initial_root_payload_assembly_stage(
         ):
             cached_active_payload_layout = active_payload_layout
             compiled_payload_operator = _compile_payload_operator(active_payload_layout)
-        return compiled_payload_operator(
+        kernel_result = compiled_payload_operator(
             (dynamic_raw_payload[0], dynamic_raw_payload[1]),
             geometry_deltas,
             objective_values,
             profile_gradient_matrix,
             support_bars_floating_leaves,
         )
+        return kernel_result if result_from_kernel is None else result_from_kernel(kernel_result)
 
     return InitialRootPayloadAssemblyStage(
         payload_to_vmec=payload_operator

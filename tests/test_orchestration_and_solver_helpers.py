@@ -187,23 +187,23 @@ def test_extract_right_constraints_handles_bc_types():
     state_arr = jnp.array([[1.0, 2.0], [3.0, 4.0]])
 
     rv, rg = flux_models_module._extract_right_constraints(None, state_arr)
-    assert jnp.allclose(rv, jnp.array([2.0, 4.0]))
+    assert jnp.allclose(rv, jnp.array([2.5, 4.5]))
     assert jnp.allclose(rg, jnp.zeros(2))
 
     bc_neumann = BoundaryConditionModel(dr=1.0, right_type="neumann", right_gradient=jnp.array([0.5, -0.5]))
     rv, rg = flux_models_module._extract_right_constraints(bc_neumann, state_arr)
-    assert jnp.allclose(rv, jnp.array([2.0, 4.0]))
+    assert jnp.allclose(rv, jnp.array([2.5, 4.5]))
     assert jnp.allclose(rg, jnp.array([0.5, -0.5]))
 
     bc_robin = BoundaryConditionModel(dr=1.0, right_type="robin", right_decay_length=jnp.array([2.0, 4.0]))
     rv, rg = flux_models_module._extract_right_constraints(bc_robin, state_arr)
-    assert jnp.allclose(rv, jnp.array([2.0, 4.0]))
-    assert jnp.allclose(rg, jnp.array([-1.0, -1.0]))
+    assert jnp.allclose(rv, jnp.array([2.5, 4.5]))
+    assert jnp.allclose(rg, jnp.array([-1.25, -1.125]))
 
 
 def test_ntx_local_particle_flux_evaluator_passes_bc_constraints(monkeypatch):
     species = _dummy_species()
-    geometry = SimpleNamespace()
+    geometry = SimpleNamespace(r_grid_half=jnp.asarray([0.0, 0.5, 1.0]))
     state = _dummy_state()
 
     captured = {}
