@@ -1003,32 +1003,34 @@ def build_initial_er_transport_reverse_stage(
         finite_mask = jnp.isfinite(best_roots)
         return jnp.where(finite_mask, best_roots, state.Er), finite_mask
 
-    def _residual_er_derivative_scan_body(carry, radius_index):
-        state, er_profile, geometry_leaves, support_leaves = carry
-        runtime_current = _runtime_from_leaves(geometry_leaves, support_leaves)
-        charge_qp = jnp.asarray(runtime_current.species.charge_qp)
-
-        def _residual_i_er(er_value):
-            er_eval = er_profile.at[radius_index].set(er_value)
-            state_with_er = dataclasses.replace(state, Er=er_eval)
-            local_particle_flux = runtime_current.models.flux.build_local_particle_flux_evaluator(
-                state_with_er
-            )
-            if local_particle_flux is None:
-                raise ValueError("Initial-Er root AD requires a local particle-flux evaluator.")
-            gamma = local_particle_flux(radius_index, er_value)
-            return jnp.sum(charge_qp * gamma)
-
-        derivative = jax.grad(_residual_i_er)(er_profile[radius_index])
-        return carry, derivative
-
     def _residual_er_derivative_scan(state, er_profile, geometry_leaves, support_leaves):
         """Exact persistent scan form of the benchmark local Er derivative."""
 
+        runtime_current = _runtime_from_leaves(geometry_leaves, support_leaves)
+        charge_qp = jnp.asarray(runtime_current.species.charge_qp)
+        # The local evaluator itself replaces ``state.Er[radius_index]`` by
+        # its scalar argument.  Building it once from the selected profile is
+        # therefore algebraically identical to rebuilding it inside every
+        # scalar derivative, while keeping its nested NTX solver identity
+        # bounded for this optimization-only stage.
+        state_with_er = dataclasses.replace(state, Er=er_profile)
+        local_particle_flux = runtime_current.models.flux.build_local_particle_flux_evaluator(
+            state_with_er
+        )
+        if local_particle_flux is None:
+            raise ValueError("Initial-Er root AD requires a local particle-flux evaluator.")
+        def _body(carry, radius_index):
+            def _residual_i_er(er_value):
+                gamma = local_particle_flux(radius_index, er_value)
+                return jnp.sum(charge_qp * gamma)
+
+            derivative = jax.grad(_residual_i_er)(er_profile[radius_index])
+            return carry, derivative
+
         radius_indices = jnp.arange(er_profile.shape[0], dtype=jnp.int32)
         _, derivatives = jax.lax.scan(
-            _residual_er_derivative_scan_body,
-            (state, er_profile, geometry_leaves, support_leaves),
+            _body,
+            None,
             radius_indices,
         )
         return derivatives
@@ -1100,15 +1102,7 @@ def build_initial_er_transport_reverse_stage(
         ),
         selected_root_per_radius=_selected_root_per_radius,
         selected_root_scan=_selected_root_scan,
-        # The derivative scan is a separate, fixed-shape local-flux kernel.
-        # Keeping this executable persistent prevents the bootstrap-initialized
-        # flux route from creating a fresh set of native dispatches per
-        # optimizer evaluation.  It excludes the root finder, VMEC, Boozer,
-        # NTX payload construction, and all objective pullbacks.
-        residual_er_derivative_scan=jax.jit(
-            _residual_er_derivative_scan,
-            inline=False,
-        ),
+        residual_er_derivative_scan=_residual_er_derivative_scan,
         state_pullback=jax.jit(_state_pullback, inline=False),
         geometry_pullback=jax.jit(_geometry_pullback, inline=False),
         support_pullback=jax.jit(_support_pullback, inline=False),
