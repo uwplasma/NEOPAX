@@ -834,6 +834,7 @@ class InitialErTransportReverseStage:
     selected_root: Callable[..., Any]
     selected_root_strict: Callable[..., Any]
     selected_root_per_radius: Callable[..., Any]
+    selected_root_scan: Callable[..., Any]
     state_pullback: Callable[..., Any]
     geometry_pullback: Callable[..., Any]
     support_pullback: Callable[..., Any]
@@ -973,6 +974,34 @@ def build_initial_er_transport_reverse_stage(
 
     single_radius_root = jax.jit(_single_radius_root, inline=False)
 
+    def _root_scan_body(carry, radius_index):
+        state, geometry_leaves, support_leaves = carry
+        root_row = _single_radius_root(
+            state,
+            radius_index,
+            geometry_leaves,
+            support_leaves,
+        )
+        return carry, root_row
+
+    def _selected_root_scan(state, geometry_leaves, support_leaves):
+        """Run the benchmark radius solver through one stable scan body.
+
+        This is deliberately not JIT-wrapped.  It preserves one profile solve
+        and the original per-radius root finder while moving the mapped body
+        identity from a fresh benchmark closure to the optimization stage.
+        """
+
+        radius_indices = jnp.arange(state.Er.shape[0], dtype=jnp.int32)
+        _, root_rows = jax.lax.scan(
+            _root_scan_body,
+            (state, geometry_leaves, support_leaves),
+            radius_indices,
+        )
+        best_roots = jnp.asarray(root_rows[2], dtype=state.Er.dtype)
+        finite_mask = jnp.isfinite(best_roots)
+        return jnp.where(finite_mask, best_roots, state.Er), finite_mask
+
     def _selected_root_per_radius(state, geometry_leaves, support_leaves):
         root_rows = tuple(
             single_radius_root(
@@ -1039,6 +1068,7 @@ def build_initial_er_transport_reverse_stage(
             compiler_options={"xla_cpu_enable_fast_math": False},
         ),
         selected_root_per_radius=_selected_root_per_radius,
+        selected_root_scan=_selected_root_scan,
         state_pullback=jax.jit(_state_pullback, inline=False),
         geometry_pullback=jax.jit(_geometry_pullback, inline=False),
         support_pullback=jax.jit(_support_pullback, inline=False),
@@ -2048,6 +2078,7 @@ def _optimization_root_to_payload_cotangents(
     use_selected_root_kernel: bool = False,
     use_strict_selected_root_kernel: bool = False,
     use_per_radius_selected_root_kernel: bool = False,
+    use_scan_selected_root_kernel: bool = False,
     dispatch_cache_probe=None,
 ):
     def _probe(label: str) -> None:
@@ -2103,12 +2134,16 @@ def _optimization_root_to_payload_cotangents(
         _probe("after_benchmark_selected_root")
     else:
         selected_root = (
-            transport_reverse_stage.selected_root_per_radius
-            if use_per_radius_selected_root_kernel
+            transport_reverse_stage.selected_root_scan
+            if use_scan_selected_root_kernel
             else (
-                transport_reverse_stage.selected_root_strict
-                if use_strict_selected_root_kernel
-                else transport_reverse_stage.selected_root
+                transport_reverse_stage.selected_root_per_radius
+                if use_per_radius_selected_root_kernel
+                else (
+                    transport_reverse_stage.selected_root_strict
+                    if use_strict_selected_root_kernel
+                    else transport_reverse_stage.selected_root
+                )
             )
         )
         _probe("before_experimental_selected_root")
@@ -2361,6 +2396,7 @@ def geometry_active_initial_er_root_only_reverse_table_optimization(
     use_selected_root_kernel: bool = False,
     use_strict_selected_root_kernel: bool = False,
     use_per_radius_selected_root_kernel: bool = False,
+    use_scan_selected_root_kernel: bool = False,
     payload_assembly_stage=None,
     prepared_payload_static=None,
     dispatch_cache_probe=None,
@@ -2443,6 +2479,7 @@ def geometry_active_initial_er_root_only_reverse_table_optimization(
         use_selected_root_kernel=use_selected_root_kernel,
         use_strict_selected_root_kernel=use_strict_selected_root_kernel,
         use_per_radius_selected_root_kernel=use_per_radius_selected_root_kernel,
+        use_scan_selected_root_kernel=use_scan_selected_root_kernel,
         dispatch_cache_probe=dispatch_cache_probe,
     )
     if optimization_stage is None:
@@ -3202,6 +3239,7 @@ def evaluate_geometry_initial_er_root_only_least_squares_optimization(
     use_selected_root_kernel: bool = False,
     use_strict_selected_root_kernel: bool = False,
     use_per_radius_selected_root_kernel: bool = False,
+    use_scan_selected_root_kernel: bool = False,
     payload_assembly_stage=None,
     prepared_payload_static=None,
     dispatch_cache_probe=None,
@@ -3289,6 +3327,7 @@ def evaluate_geometry_initial_er_root_only_least_squares_optimization(
                 use_selected_root_kernel=use_selected_root_kernel,
                 use_strict_selected_root_kernel=use_strict_selected_root_kernel,
                 use_per_radius_selected_root_kernel=use_per_radius_selected_root_kernel,
+                use_scan_selected_root_kernel=use_scan_selected_root_kernel,
                 payload_assembly_stage=payload_assembly_stage,
                 prepared_payload_static=prepared_payload_static,
                 dispatch_cache_probe=dispatch_cache_probe,

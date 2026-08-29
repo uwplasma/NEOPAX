@@ -75,6 +75,7 @@ def main() -> int:
             "optimization_payload_experiment",
             "optimization_payload_root_experiment",
             "optimization_payload_root_strict_experiment",
+            "optimization_payload_root_scan_experiment",
             "optimization_payload_reverse_experiment",
         ),
         default="optimization",
@@ -121,6 +122,7 @@ def main() -> int:
         "optimization_payload_experiment",
         "optimization_payload_root_experiment",
         "optimization_payload_root_strict_experiment",
+        "optimization_payload_root_scan_experiment",
         "optimization_payload_reverse_experiment",
     }:
         # The accepted persistent-root stage has the same equations and

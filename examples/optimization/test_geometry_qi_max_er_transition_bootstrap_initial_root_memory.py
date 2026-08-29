@@ -438,6 +438,7 @@ def main() -> int:
             "optimization_payload_experiment",
             "optimization_payload_root_experiment",
             "optimization_payload_root_strict_experiment",
+            "optimization_payload_root_scan_experiment",
             "optimization_payload_reverse_experiment",
             "vmex_like",
         ),

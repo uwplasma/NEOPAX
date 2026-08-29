@@ -475,6 +475,7 @@ class GeometryInitialErRootLeastSquaresProblem:
             "optimization_payload_experiment",
             "optimization_payload_root_experiment",
             "optimization_payload_root_strict_experiment",
+            "optimization_payload_root_scan_experiment",
             "optimization_payload_reverse_experiment",
         }:
             if self.reverse_stage_mode != "optimization_payload_experiment":
@@ -491,6 +492,9 @@ class GeometryInitialErRootLeastSquaresProblem:
                 )
                 evaluator_kwargs["use_per_radius_selected_root_kernel"] = (
                     self.reverse_stage_mode == "optimization_root_per_radius_experiment"
+                )
+                evaluator_kwargs["use_scan_selected_root_kernel"] = (
+                    self.reverse_stage_mode == "optimization_payload_root_scan_experiment"
                 )
             if self.payload_assembly_stage is not None:
                 evaluator_kwargs["payload_assembly_stage"] = self.payload_assembly_stage
@@ -1403,6 +1407,7 @@ def geometry_initial_er_root_only_least_squares_problem(
         "optimization_payload_experiment",
         "optimization_payload_root_experiment",
         "optimization_payload_root_strict_experiment",
+        "optimization_payload_root_scan_experiment",
         "optimization_payload_reverse_experiment",
         "vmex_like",
     }:
@@ -1411,6 +1416,7 @@ def geometry_initial_er_root_only_least_squares_problem(
             "'optimization_root_experiment', 'optimization_root_strict_experiment', "
             "'optimization_root_per_radius_experiment', 'optimization_payload_experiment', "
             "'optimization_payload_root_experiment', 'optimization_payload_root_strict_experiment', "
+            "'optimization_payload_root_scan_experiment', "
             "'optimization_payload_reverse_experiment', "
             "or 'vmex_like'."
         )
@@ -1500,6 +1506,7 @@ def geometry_initial_er_root_only_least_squares_problem(
         "optimization_root_per_radius_experiment",
         "optimization_payload_root_experiment",
         "optimization_payload_root_strict_experiment",
+        "optimization_payload_root_scan_experiment",
         "optimization_payload_reverse_experiment",
     }:
         stage_support_payload = find_ntx_support_payload(runtime)
@@ -1521,6 +1528,7 @@ def geometry_initial_er_root_only_least_squares_problem(
         "optimization_payload_experiment",
         "optimization_payload_root_experiment",
         "optimization_payload_root_strict_experiment",
+        "optimization_payload_root_scan_experiment",
         "optimization_payload_reverse_experiment",
     }:
         prepared_payload_static = _prepare_initial_root_payload_static(
@@ -1531,6 +1539,7 @@ def geometry_initial_er_root_only_least_squares_problem(
         "optimization_payload_experiment",
         "optimization_payload_root_experiment",
         "optimization_payload_root_strict_experiment",
+        "optimization_payload_root_scan_experiment",
         "optimization_payload_reverse_experiment",
     }:
         if raw_block_stage is None:
