@@ -27,6 +27,7 @@ from ._geometry_autodiff import (
     build_geometry_autodiff_context,
     geometry_raw_block_stage,
     geometry_raw_block_solve_from_param_vector,
+    geometry_raw_block_transpose_optimization_stage,
 )
 from ._constants import elementary_charge
 from ._orchestrator import build_runtime_context
@@ -355,6 +356,7 @@ class GeometryInitialErRootLeastSquaresProblem:
     optimization_stage: object | None = None
     prepared_payload_static: object | None = None
     payload_assembly_stage: object | None = None
+    raw_block_transpose_optimization_stage: object | None = None
     reverse_stage_mode: str = "off"
 
     @property
@@ -476,6 +478,7 @@ class GeometryInitialErRootLeastSquaresProblem:
             "optimization_payload_root_experiment",
             "optimization_payload_root_strict_experiment",
             "optimization_payload_root_scan_experiment",
+            "optimization_payload_root_scan_geometry_experiment",
             "optimization_payload_reverse_experiment",
         }:
             if self.reverse_stage_mode != "optimization_payload_experiment":
@@ -494,12 +497,19 @@ class GeometryInitialErRootLeastSquaresProblem:
                     self.reverse_stage_mode == "optimization_root_per_radius_experiment"
                 )
                 evaluator_kwargs["use_scan_selected_root_kernel"] = (
-                    self.reverse_stage_mode == "optimization_payload_root_scan_experiment"
+                    self.reverse_stage_mode in {
+                        "optimization_payload_root_scan_experiment",
+                        "optimization_payload_root_scan_geometry_experiment",
+                    }
                 )
             if self.payload_assembly_stage is not None:
                 evaluator_kwargs["payload_assembly_stage"] = self.payload_assembly_stage
             if self.prepared_payload_static is not None:
                 evaluator_kwargs["prepared_payload_static"] = self.prepared_payload_static
+            if self.raw_block_transpose_optimization_stage is not None:
+                evaluator_kwargs["raw_block_transpose_optimization_stage"] = (
+                    self.raw_block_transpose_optimization_stage
+                )
         base_evaluation = evaluator(self.config, **evaluator_kwargs)
         result = _assemble_mixed_initial_er_root_result(
             self.terms,
@@ -1408,6 +1418,7 @@ def geometry_initial_er_root_only_least_squares_problem(
         "optimization_payload_root_experiment",
         "optimization_payload_root_strict_experiment",
         "optimization_payload_root_scan_experiment",
+        "optimization_payload_root_scan_geometry_experiment",
         "optimization_payload_reverse_experiment",
         "vmex_like",
     }:
@@ -1417,6 +1428,7 @@ def geometry_initial_er_root_only_least_squares_problem(
             "'optimization_root_per_radius_experiment', 'optimization_payload_experiment', "
             "'optimization_payload_root_experiment', 'optimization_payload_root_strict_experiment', "
             "'optimization_payload_root_scan_experiment', "
+            "'optimization_payload_root_scan_geometry_experiment', "
             "'optimization_payload_reverse_experiment', "
             "or 'vmex_like'."
         )
@@ -1486,6 +1498,7 @@ def geometry_initial_er_root_only_least_squares_problem(
     if geometry_solver_device is None:
         geometry_solver_device = geom_cfg.get("vmec_implicit_solver_device", "default")
     normalized_terms = _normalize_initial_er_root_least_squares_terms(terms)
+    raw_block_transpose_stage = None
     raw_block_stage = (
         None
         if geometry_parameterization is None
@@ -1495,6 +1508,12 @@ def geometry_initial_er_root_only_least_squares_problem(
             max_iter=geometry_max_iter,
         )
     )
+    if mode == "optimization_payload_root_scan_geometry_experiment":
+        if raw_block_stage is None:
+            raise ValueError("geometry transpose stage requires VMEC boundary parameters.")
+        raw_block_transpose_stage = geometry_raw_block_transpose_optimization_stage(
+            raw_block_stage
+        )
     optimization_stage_layout = None
     optimization_stage = None
     prepared_payload_static = None
@@ -1507,6 +1526,7 @@ def geometry_initial_er_root_only_least_squares_problem(
         "optimization_payload_root_experiment",
         "optimization_payload_root_strict_experiment",
         "optimization_payload_root_scan_experiment",
+        "optimization_payload_root_scan_geometry_experiment",
         "optimization_payload_reverse_experiment",
     }:
         stage_support_payload = find_ntx_support_payload(runtime)
@@ -1529,6 +1549,7 @@ def geometry_initial_er_root_only_least_squares_problem(
         "optimization_payload_root_experiment",
         "optimization_payload_root_strict_experiment",
         "optimization_payload_root_scan_experiment",
+        "optimization_payload_root_scan_geometry_experiment",
         "optimization_payload_reverse_experiment",
     }:
         prepared_payload_static = _prepare_initial_root_payload_static(
@@ -1540,6 +1561,7 @@ def geometry_initial_er_root_only_least_squares_problem(
         "optimization_payload_root_experiment",
         "optimization_payload_root_strict_experiment",
         "optimization_payload_root_scan_experiment",
+        "optimization_payload_root_scan_geometry_experiment",
         "optimization_payload_reverse_experiment",
     }:
         if raw_block_stage is None:
@@ -1744,6 +1766,7 @@ def geometry_initial_er_root_only_least_squares_problem(
         optimization_stage=optimization_stage,
         prepared_payload_static=prepared_payload_static,
         payload_assembly_stage=payload_assembly_stage,
+        raw_block_transpose_optimization_stage=raw_block_transpose_stage,
         reverse_stage_mode=mode,
     )
 

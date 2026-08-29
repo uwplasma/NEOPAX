@@ -3135,6 +3135,27 @@ def evaluate_geometry_initial_er_root_only_least_squares_benchmark_tables(
             )
 
     if "geometry" in grouped_terms:
+        # Geometry-only optimization stages still need the same one shared
+        # raw VMEX solve as mixed stages.  Construct it through the fixed
+        # stage setup so the optional bounded transpose below sees precisely
+        # the configuration it owns; the benchmark ``off`` path does not use
+        # this branch.
+        if (
+            shared_raw_block_solve is None
+            and raw_block_transpose_optimization_stage is not None
+        ):
+            geometry_parameter_values = vmec_parameter_values_from_parameter_vector(
+                parameter_set,
+                parameter_values_arr,
+            )
+            shared_raw_block_solve = geometry_raw_block_solve_from_param_vector(
+                geometry_context,
+                geometry_parameter_values,
+                tuple(spec.as_tuple() for spec in parameter_set.vmec_boundary_specs),
+                max_iter=geometry_max_iter,
+                solver_device=geometry_solver_device,
+                stage=raw_block_stage,
+            )
         backend_results["geometry"] = geometry_full_ad_reverse_table(
             context=geometry_context,
             parameter_set=parameter_set,
@@ -3146,6 +3167,8 @@ def evaluate_geometry_initial_er_root_only_least_squares_benchmark_tables(
             final_vmec_pullback_mode="raw_block_transpose",
             solver_device=geometry_solver_device,
             raw_block_solve=shared_raw_block_solve,
+            raw_block_transpose_optimization_stage=raw_block_transpose_optimization_stage,
+            dispatch_cache_probe=dispatch_cache_probe,
         )
 
     result = assemble_least_squares_result(
@@ -3284,6 +3307,7 @@ def evaluate_geometry_initial_er_root_only_least_squares_optimization(
     use_scan_selected_root_kernel: bool = False,
     payload_assembly_stage=None,
     prepared_payload_static=None,
+    raw_block_transpose_optimization_stage=None,
     dispatch_cache_probe=None,
 ) -> LeastSquaresEvaluation:
     """Evaluate mixed objectives using only benchmark-validated table backends."""
@@ -4159,6 +4183,7 @@ def geometry_full_ad_reverse_table(
     final_vmec_pullback_mode: str = "raw_block_transpose",
     solver_device: str | None = "default",
     raw_block_solve=None,
+    raw_block_transpose_optimization_stage=None,
     dispatch_cache_probe=None,
 ) -> ObjectiveTableResult:
     """Evaluate the validated full-geometry reverse table for optimization terms.
@@ -4205,6 +4230,7 @@ def geometry_full_ad_reverse_table(
         final_vmec_pullback_mode=final_vmec_pullback_mode,
         solver_device=solver_device,
         raw_block_solve=raw_block_solve,
+        raw_block_transpose_optimization_stage=raw_block_transpose_optimization_stage,
         dispatch_cache_probe=dispatch_cache_probe,
     )
     objective_values = jnp.stack(

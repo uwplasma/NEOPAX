@@ -814,6 +814,69 @@ class GeometryRawBlockOptimizationStage:
     solve_with_aux_runner: Callable[[Any], tuple[Any, Any]]
 
 
+@dataclasses.dataclass(slots=True)
+class GeometryRawBlockTransposeOptimizationStage:
+    """Persistent, bounded VMEX transpose kernel for one optimizer stage.
+
+    VMEX's public raw-block transpose helper intentionally constructs its
+    residual/VJP setup for each one-shot call.  That is correct for benchmark
+    use, but it creates new native dispatch executables in repeated geometry
+    optimization evaluations.  This stage captures *only* the fixed VMEX
+    configuration and the verified, non-differentiable DoF mask.  The current
+    implicit parameters, converged state, and batched state cotangents remain
+    explicit inputs to the small compiled transpose boundary.
+
+    It is never used by the benchmark/default path.
+    """
+
+    implicit: Any
+    implicit_cfg: Any
+    param_entries: tuple[dict[str, Any], ...]
+    static_dof_mask: Any = None
+    runner: Callable[[Any, Any, Any], Any] | None = None
+
+
+def _frozen_dof_mask_copy(dof_mask):
+    """Return a concrete copy suitable for VMEX's structural raw-block code."""
+
+    def _freeze(leaf):
+        try:
+            return np.asarray(jax.device_get(leaf)).copy()
+        except (TypeError, ValueError):
+            return leaf
+
+    return jax.tree_util.tree_map(_freeze, dof_mask)
+
+
+def _validate_frozen_dof_mask(current, expected) -> None:
+    """Reject a structural change instead of silently recompiling a stage."""
+
+    current_leaves, current_tree = jax.tree_util.tree_flatten(current)
+    expected_leaves, expected_tree = jax.tree_util.tree_flatten(expected)
+    if current_tree != expected_tree or len(current_leaves) != len(expected_leaves):
+        raise ValueError("VMEX DoF-mask structure changed within an optimization stage.")
+    for actual, reference in zip(current_leaves, expected_leaves, strict=True):
+        try:
+            actual_host = np.asarray(jax.device_get(actual))
+            reference_host = np.asarray(reference)
+        except (TypeError, ValueError):
+            continue
+        if not np.array_equal(actual_host, reference_host):
+            raise ValueError("VMEX DoF-mask values changed within an optimization stage.")
+
+
+def geometry_raw_block_transpose_optimization_stage(
+    raw_block_stage: GeometryRawBlockStage,
+) -> GeometryRawBlockTransposeOptimizationStage:
+    """Create an empty lazy transpose stage for one fixed VMEX layout."""
+
+    return GeometryRawBlockTransposeOptimizationStage(
+        implicit=raw_block_stage.implicit,
+        implicit_cfg=raw_block_stage.implicit_cfg,
+        param_entries=raw_block_stage.param_entries,
+    )
+
+
 def geometry_raw_block_stage(
     context: "GeometryAutodiffContext",
     param_specs: Sequence[tuple[str, int, int]],
@@ -1096,6 +1159,7 @@ def geometry_raw_block_transpose_from_state_bars(
     state_bar_batch,
     *,
     probe_chunk_size: int = 1,
+    optimization_stage: GeometryRawBlockTransposeOptimizationStage | None = None,
 ) -> jnp.ndarray:
     """Pull a batch of VMEC-state cotangents back to raw boundary parameters."""
 
@@ -1104,14 +1168,52 @@ def geometry_raw_block_transpose_from_state_bars(
         raise AttributeError(
             "The active VMEC backend does not expose implicit_state_pullback_multi_rhs_raw_block_transpose."
         )
-    param_bar_batch = implicit.implicit_state_pullback_multi_rhs_raw_block_transpose(
-        raw_block_solve.implicit_params,
-        raw_block_solve.implicit_cfg,
-        raw_block_solve.state,
-        raw_block_solve.dof_mask,
-        state_bar_batch,
-        probe_chunk_size=int(probe_chunk_size),
-    )
+    if optimization_stage is None:
+        param_bar_batch = implicit.implicit_state_pullback_multi_rhs_raw_block_transpose(
+            raw_block_solve.implicit_params,
+            raw_block_solve.implicit_cfg,
+            raw_block_solve.state,
+            raw_block_solve.dof_mask,
+            state_bar_batch,
+            probe_chunk_size=int(probe_chunk_size),
+        )
+    else:
+        if optimization_stage.implicit is not implicit:
+            raise ValueError("Raw-block transpose stage belongs to a different VMEX backend.")
+        if optimization_stage.implicit_cfg is not raw_block_solve.implicit_cfg:
+            raise ValueError("Raw-block transpose stage belongs to a different VMEX configuration.")
+        if optimization_stage.param_entries != raw_block_solve.param_entries:
+            raise ValueError("Raw-block transpose stage parameter layout changed.")
+        if optimization_stage.static_dof_mask is None:
+            optimization_stage.static_dof_mask = _frozen_dof_mask_copy(raw_block_solve.dof_mask)
+            stage_cfg = optimization_stage.implicit_cfg
+            stage_dof_mask = optimization_stage.static_dof_mask
+
+            def _transpose_operator(params, state, state_bars):
+                return implicit.implicit_state_pullback_multi_rhs_raw_block_transpose(
+                    params,
+                    stage_cfg,
+                    state,
+                    stage_dof_mask,
+                    state_bars,
+                    probe_chunk_size=int(probe_chunk_size),
+                )
+
+            # This is intentionally a narrow bounded kernel: no VMEC solve,
+            # Boozer transform, NTX evaluation, root solve, or objective graph
+            # is traced through this boundary.
+            optimization_stage.runner = jax.jit(_transpose_operator, inline=False)
+        else:
+            _validate_frozen_dof_mask(
+                raw_block_solve.dof_mask, optimization_stage.static_dof_mask
+            )
+        if optimization_stage.runner is None:  # pragma: no cover - defensive
+            raise RuntimeError("Raw-block transpose optimization stage was not initialized.")
+        param_bar_batch = optimization_stage.runner(
+            raw_block_solve.implicit_params,
+            raw_block_solve.state,
+            state_bar_batch,
+        )
     return _param_vector_gradient_from_implicit_param_grads(param_bar_batch, raw_block_solve.param_entries)
 
 
@@ -3358,6 +3460,7 @@ def geometry_full_ad_objective_table_pullback_from_param_vector(
     final_vmec_pullback_mode: str = "raw_block_transpose",
     solver_device: str | None = None,
     raw_block_solve: GeometryRawBlockSolve | None = None,
+    raw_block_transpose_optimization_stage: GeometryRawBlockTransposeOptimizationStage | None = None,
     return_state_bars: bool = False,
     dispatch_cache_probe=None,
 ) -> tuple[dict[str, jnp.ndarray], object]:
@@ -3626,16 +3729,13 @@ def geometry_full_ad_objective_table_pullback_from_param_vector(
             raise AttributeError(
                 "The active VMEC backend does not expose implicit_state_pullback_multi_rhs_raw_block_transpose."
             )
-        param_bar_batch = implicit.implicit_state_pullback_multi_rhs_raw_block_transpose(
-            implicit_params,
-            implicit_cfg,
-            state,
-            dof_mask,
+        gradient_matrix = geometry_raw_block_transpose_from_state_bars(
+            raw_block_solve,
             state_bar,
             probe_chunk_size=1,
+            optimization_stage=raw_block_transpose_optimization_stage,
         )
         _probe("after_geometry_raw_block_transpose")
-        gradient_matrix = _param_vector_gradient_from_implicit_param_grads(param_bar_batch, param_entries)
     elif final_mode in {"lax_map", "sequential"}:
         gradient_matrix = jax.lax.map(lambda state_cotangent: state_pullback(state_cotangent)[0], state_bar)
     elif final_mode == "vmap":
