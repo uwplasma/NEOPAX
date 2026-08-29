@@ -372,10 +372,18 @@ def test_ntx_database_lagged_face_response_matches_reference_and_finite_differen
             combined.build_lagged_response(state0),
         )
         combined_black_box = combined(state0)
+        face_state = flux_models_module.build_face_transport_state(state0, geometry)
+        combined_black_box_faces = combined.evaluate_face_fluxes(state0, face_state)
         for name in ("Gamma", "Q", "Upar"):
             assert jnp.allclose(
                 combined_lagged[name],
                 combined_black_box[name],
+                rtol=1.0e-6,
+                atol=1.0e-6,
+            )
+            assert jnp.allclose(
+                combined_lagged[f"{name}_faces"],
+                combined_black_box_faces[name],
                 rtol=1.0e-6,
                 atol=1.0e-6,
             )

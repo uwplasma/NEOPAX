@@ -23,15 +23,38 @@ if str(ROOT) not in sys.path:
 import optimize_geometry_qi_max_er_transition_bootstrap_initial_root as example  # noqa: E402
 
 
-def _build(mode: str = "off"):
+def _terms_for_objective_set(objective_set: str):
+    """Match the memory harness's row selection for an exact parity check."""
+
+    selected = []
+    for term in example.terms:
+        objective = getattr(term[0], "objective", term[0])
+        is_transport = objective.family == "transport"
+        if objective_set == "transport_er_only":
+            if is_transport and objective.name != "bootstrap_current_softmax_abs_scaled":
+                selected.append(term)
+        elif objective_set == "er_only":
+            if not is_transport or objective.name != "bootstrap_current_softmax_abs_scaled":
+                selected.append(term)
+        elif objective_set == "all":
+            selected.append(term)
+        else:  # pragma: no cover - argparse validates the public choices.
+            raise ValueError(f"Unsupported objective set {objective_set!r}.")
+    return selected
+
+
+def _build(mode: str = "off", objective_set: str = "all"):
     previous_mode = example.REVERSE_STAGE_MODE
+    previous_terms = example.terms
     example.REVERSE_STAGE_MODE = mode
+    example.terms = _terms_for_objective_set(objective_set)
     try:
         return example.build_transition_bootstrap_initial_root_problem(
             example.SEED_INPUT, int(example.MAX_MODE_SCHEDULE)
         )
     finally:
         example.REVERSE_STAGE_MODE = previous_mode
+        example.terms = previous_terms
 
 
 def _evaluate(problem, x):
@@ -54,11 +77,17 @@ def main() -> int:
         default="optimization",
         help="Opt-in implementation to compare against the unchanged off benchmark.",
     )
+    parser.add_argument(
+        "--objective-set",
+        choices=("all", "er_only", "transport_er_only"),
+        default="all",
+        help="Use the same row selection as the memory test.",
+    )
     args = parser.parse_args()
     if not np.isscalar(example.MAX_MODE_SCHEDULE):
         raise ValueError("The parity test requires one fixed MAX_MODE_SCHEDULE value.")
-    benchmark = _build()
-    staged = _build(args.mode)
+    benchmark = _build(objective_set=args.objective_set)
+    staged = _build(args.mode, objective_set=args.objective_set)
     x = np.asarray(jax.device_get(benchmark.x0), dtype=float)
     off_residuals, off_jacobian = _evaluate(benchmark, x)
     staged_residuals, staged_jacobian = _evaluate(staged, x)
@@ -75,7 +104,7 @@ def main() -> int:
     jacobian_relative_index = tuple(
         int(index) for index in np.unravel_index(np.argmax(jacobian_relative_delta), jacobian_relative_delta.shape)
     )
-    print(f"[parity] mode={args.mode}", flush=True)
+    print(f"[parity] mode={args.mode} objective_set={args.objective_set}", flush=True)
     print(f"[parity] residual_max_abs={np.max(np.abs(residual_delta)):.16e}", flush=True)
     print(f"[parity] jacobian_max_abs={np.max(np.abs(jacobian_delta)):.16e}", flush=True)
     print(
