@@ -474,6 +474,7 @@ class GeometryInitialErRootLeastSquaresProblem:
             "optimization_root_per_radius_experiment",
             "optimization_payload_experiment",
             "optimization_payload_root_experiment",
+            "optimization_payload_root_strict_experiment",
             "optimization_payload_reverse_experiment",
         }:
             if self.reverse_stage_mode != "optimization_payload_experiment":
@@ -483,7 +484,10 @@ class GeometryInitialErRootLeastSquaresProblem:
                     != "optimization_payload_reverse_experiment"
                 )
                 evaluator_kwargs["use_strict_selected_root_kernel"] = (
-                    self.reverse_stage_mode == "optimization_root_strict_experiment"
+                    self.reverse_stage_mode in {
+                        "optimization_root_strict_experiment",
+                        "optimization_payload_root_strict_experiment",
+                    }
                 )
                 evaluator_kwargs["use_per_radius_selected_root_kernel"] = (
                     self.reverse_stage_mode == "optimization_root_per_radius_experiment"
@@ -1398,6 +1402,7 @@ def geometry_initial_er_root_only_least_squares_problem(
         "optimization_root_per_radius_experiment",
         "optimization_payload_experiment",
         "optimization_payload_root_experiment",
+        "optimization_payload_root_strict_experiment",
         "optimization_payload_reverse_experiment",
         "vmex_like",
     }:
@@ -1405,7 +1410,8 @@ def geometry_initial_er_root_only_least_squares_problem(
             "reverse_stage_mode must be 'off', 'optimization', "
             "'optimization_root_experiment', 'optimization_root_strict_experiment', "
             "'optimization_root_per_radius_experiment', 'optimization_payload_experiment', "
-            "'optimization_payload_root_experiment', 'optimization_payload_reverse_experiment', "
+            "'optimization_payload_root_experiment', 'optimization_payload_root_strict_experiment', "
+            "'optimization_payload_reverse_experiment', "
             "or 'vmex_like'."
         )
     if mode == "vmex_like":
@@ -1493,6 +1499,7 @@ def geometry_initial_er_root_only_least_squares_problem(
         "optimization_root_strict_experiment",
         "optimization_root_per_radius_experiment",
         "optimization_payload_root_experiment",
+        "optimization_payload_root_strict_experiment",
         "optimization_payload_reverse_experiment",
     }:
         stage_support_payload = find_ntx_support_payload(runtime)
@@ -1513,6 +1520,7 @@ def geometry_initial_er_root_only_least_squares_problem(
         "optimization_root_per_radius_experiment",
         "optimization_payload_experiment",
         "optimization_payload_root_experiment",
+        "optimization_payload_root_strict_experiment",
         "optimization_payload_reverse_experiment",
     }:
         prepared_payload_static = _prepare_initial_root_payload_static(
@@ -1522,6 +1530,7 @@ def geometry_initial_er_root_only_least_squares_problem(
     if mode in {
         "optimization_payload_experiment",
         "optimization_payload_root_experiment",
+        "optimization_payload_root_strict_experiment",
         "optimization_payload_reverse_experiment",
     }:
         if raw_block_stage is None:
