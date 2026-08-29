@@ -64,9 +64,25 @@ def main() -> int:
     staged_residuals, staged_jacobian = _evaluate(staged, x)
     residual_delta = np.asarray(jax.device_get(staged_residuals - off_residuals), dtype=float)
     jacobian_delta = np.asarray(jax.device_get(staged_jacobian - off_jacobian), dtype=float)
+    off_jacobian_np = np.asarray(jax.device_get(off_jacobian), dtype=float)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        jacobian_relative_delta = np.abs(jacobian_delta) / np.abs(off_jacobian_np)
+    jacobian_relative_delta = np.where(
+        np.abs(off_jacobian_np) == 0.0,
+        np.where(np.abs(jacobian_delta) == 0.0, 0.0, np.inf),
+        jacobian_relative_delta,
+    )
+    jacobian_relative_index = tuple(
+        int(index) for index in np.unravel_index(np.argmax(jacobian_relative_delta), jacobian_relative_delta.shape)
+    )
     print(f"[parity] mode={args.mode}", flush=True)
     print(f"[parity] residual_max_abs={np.max(np.abs(residual_delta)):.16e}", flush=True)
     print(f"[parity] jacobian_max_abs={np.max(np.abs(jacobian_delta)):.16e}", flush=True)
+    print(
+        "[parity] jacobian_max_relative="
+        f"{np.max(jacobian_relative_delta):.16e} index={jacobian_relative_index}",
+        flush=True,
+    )
     np.testing.assert_allclose(staged_residuals, off_residuals, rtol=1.0e-11, atol=1.0e-12)
     # Separate evaluations can differ in floating-point reduction order on
     # tiny Jacobian entries; this remains far below reverse-AD significance.
