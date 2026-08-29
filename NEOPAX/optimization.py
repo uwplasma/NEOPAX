@@ -474,10 +474,14 @@ class GeometryInitialErRootLeastSquaresProblem:
             "optimization_root_per_radius_experiment",
             "optimization_payload_experiment",
             "optimization_payload_root_experiment",
+            "optimization_payload_reverse_experiment",
         }:
             if self.reverse_stage_mode != "optimization_payload_experiment":
                 evaluator_kwargs["transport_reverse_stage"] = self.optimization_stage
-                evaluator_kwargs["use_selected_root_kernel"] = True
+                evaluator_kwargs["use_selected_root_kernel"] = (
+                    self.reverse_stage_mode
+                    != "optimization_payload_reverse_experiment"
+                )
                 evaluator_kwargs["use_strict_selected_root_kernel"] = (
                     self.reverse_stage_mode == "optimization_root_strict_experiment"
                 )
@@ -1394,13 +1398,15 @@ def geometry_initial_er_root_only_least_squares_problem(
         "optimization_root_per_radius_experiment",
         "optimization_payload_experiment",
         "optimization_payload_root_experiment",
+        "optimization_payload_reverse_experiment",
         "vmex_like",
     }:
         raise ValueError(
             "reverse_stage_mode must be 'off', 'optimization', "
             "'optimization_root_experiment', 'optimization_root_strict_experiment', "
             "'optimization_root_per_radius_experiment', 'optimization_payload_experiment', "
-            "'optimization_payload_root_experiment', or 'vmex_like'."
+            "'optimization_payload_root_experiment', 'optimization_payload_reverse_experiment', "
+            "or 'vmex_like'."
         )
     if mode == "vmex_like":
         raise NotImplementedError(
@@ -1487,6 +1493,7 @@ def geometry_initial_er_root_only_least_squares_problem(
         "optimization_root_strict_experiment",
         "optimization_root_per_radius_experiment",
         "optimization_payload_root_experiment",
+        "optimization_payload_reverse_experiment",
     }:
         stage_support_payload = find_ntx_support_payload(runtime)
         if not isinstance(stage_support_payload, dict):
@@ -1506,12 +1513,17 @@ def geometry_initial_er_root_only_least_squares_problem(
         "optimization_root_per_radius_experiment",
         "optimization_payload_experiment",
         "optimization_payload_root_experiment",
+        "optimization_payload_reverse_experiment",
     }:
         prepared_payload_static = _prepare_initial_root_payload_static(
             context,
             n_r=int(n_r if n_r is not None else geom_cfg.get("n_radial", 51)),
         )
-    if mode in {"optimization_payload_experiment", "optimization_payload_root_experiment"}:
+    if mode in {
+        "optimization_payload_experiment",
+        "optimization_payload_root_experiment",
+        "optimization_payload_reverse_experiment",
+    }:
         if raw_block_stage is None:
             raise ValueError("optimization initial-root stage requires VMEC boundary parameters.")
         stage_transport_objectives = tuple(

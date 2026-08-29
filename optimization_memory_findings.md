@@ -1,5 +1,64 @@
 # Initial-root optimization memory handoff
 
+## Saved checkpoint — 2026-08-29: accepted root boundary and payload combination
+
+### Decision restored
+
+There are three different root treatments.  They must not be conflated:
+
+1. **Benchmark primal selected-root path.**  This remains the source of truth
+   and is used unchanged by `reverse_stage_mode="off"`.
+2. **Compact root-reverse boundary.**  The existing compact state/support
+   pullbacks use `jax.lax.scan` over radii and have bounded JIT wrappers around
+   those pullback kernels.  This is the optimization-only root boundary that
+   was accepted with approximately `1.5e-7` maximum absolute Jacobian
+   difference (about `1.3e-7` relative at its largest entry).  It does *not*
+   JIT the primal selected-root calculation.
+3. **Outer/primal selected-root JIT experiments.**  These use
+   `jax.jit(_selected_root)` around the entire selected-root profile, or JIT
+   each radius separately.  Both are rejected.  They can change the selected
+   Er branch itself; their failure is not reduction-order derivative noise.
+
+### Why `optimization_payload_root_experiment` failed
+
+The payload stage itself was validated.  In `er_only` parity it produced zero
+residual difference and a Jacobian difference of about `4.47e-9` absolute
+(`1.96e-8` relative).  Its repeated RSS slope also improved from roughly
+`+503 MiB/evaluation` (`off`) to roughly `+172 MiB/evaluation`.
+
+The combined `optimization_payload_root_experiment` incorrectly enabled the
+rejected *outer primal* selected-root JIT.  It therefore selected/evaluated a
+different Er result, producing a residual difference of `3.058e-1` and a
+Jacobian difference of `2.246e1`.  This is invalid; it is not a payload
+problem and must never become the optimization default.
+
+### Current next experiment — not yet validated
+
+`optimization_payload_reverse_experiment` is wired in the current worktree to
+combine only the accepted pieces:
+
+- benchmark primal selected-root calculation (`use_selected_root_kernel=False`);
+- established compact root reverse/pullback `lax.scan` kernels;
+- validated optimization-only payload assembly stage.
+
+It leaves `off` and all benchmark functions unchanged.  Required sequence:
+
+```bash
+python ./examples/optimization/test_geometry_qi_max_er_transition_bootstrap_initial_root_parity.py --mode optimization_payload_reverse_experiment --objective-set er_only
+```
+
+Only if this passes may the corresponding three-repeat memory test be run:
+
+```bash
+python ./examples/optimization/test_geometry_qi_max_er_transition_bootstrap_initial_root_memory.py --mode optimization_payload_reverse_experiment --objective-set er_only --repeats 3 --diagnose-structure --diagnose-jax-dispatch-cache
+```
+
+Do not use `optimization`, `optimization_payload_root_experiment`,
+`optimization_root_experiment`, `optimization_root_strict_experiment`, or
+`optimization_root_per_radius_experiment` as a correctness baseline for the
+initial-Er rows.  They retain diagnostic experiments involving the rejected
+outer/per-radius primal-root treatments.
+
 ## Reproduction
 
 ```bash

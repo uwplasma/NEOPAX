@@ -51,6 +51,24 @@ Initial scope is the fixed initial-Er ambipolarity transport objectives:
 `maxEr`, transition-left, transition-right, and bootstrap current. Full
 time-dependent transport remains a separate later stage.
 
+### Root-boundary correction — 2026-08-29
+
+The accepted `~1e-7` optimization-only numerical envelope belongs to the
+existing compact root reverse/pullback kernels, which use `lax.scan` over
+radii. It does **not** authorize an outer JIT around the primal selected-root
+profile.
+
+The outer selected-root and per-radius experiments changed the selected Er
+result (`~3.06e-1` residual and `~2.25e1` Jacobian mismatch) and are rejected.
+The payload stage itself is valid (`0` residual mismatch and about `4.5e-9`
+maximum absolute Jacobian mismatch for `er_only`) and lowers the observed
+slope from roughly `+503` to `+172 MiB/evaluation` in that test.
+
+The pending `optimization_payload_reverse_experiment` combines the validated
+payload stage with the compact reverse kernels while retaining the benchmark
+primal root call. It requires parity before a memory run; `off` remains
+unchanged.
+
 ### Constraints
 
 - The benchmark/default `reverse_stage_mode="off"` path and its reverse

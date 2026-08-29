@@ -74,6 +74,7 @@ def main() -> int:
             "optimization_root_per_radius_experiment",
             "optimization_payload_experiment",
             "optimization_payload_root_experiment",
+            "optimization_payload_reverse_experiment",
         ),
         default="optimization",
         help="Opt-in implementation to compare against the unchanged off benchmark.",
@@ -118,6 +119,7 @@ def main() -> int:
         "optimization_root_experiment",
         "optimization_payload_experiment",
         "optimization_payload_root_experiment",
+        "optimization_payload_reverse_experiment",
     }:
         # The accepted persistent-root stage has the same equations and
         # branch-selection rules as ``off`` but changes compiled evaluation
