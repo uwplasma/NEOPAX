@@ -80,6 +80,28 @@ def _apply_transport_solver_backend_override(config: dict, backend_override: str
             )
 
 
+def _apply_geometry_qi_maxj_backend_override(
+    config: dict, backend_override: str | None
+) -> None:
+    """Select the static QI/max-J objective backend without editing the TOML."""
+
+    if backend_override in (None, "", "config"):
+        return
+    backend = str(backend_override).strip().lower()
+    if backend not in {"old", "new"}:
+        raise ValueError("QI/max-J backend override must be 'old', 'new', or 'config'.")
+    geometry_cfg = config.setdefault("geometry", {})
+    configured = geometry_cfg.get("qi_maxj")
+    if configured is None:
+        qi_maxj_cfg: dict[str, object] = {}
+    elif isinstance(configured, dict):
+        qi_maxj_cfg = dict(configured)
+    else:
+        raise TypeError("geometry.qi_maxj must be a TOML table / mapping.")
+    qi_maxj_cfg["backend"] = backend
+    geometry_cfg["qi_maxj"] = qi_maxj_cfg
+
+
 def _run_transport_solver_forward_smoke(*, args, solver, solve_vector_field, runtime, baseline_state) -> None:
     phase_start = time.perf_counter()
     print(
@@ -5340,6 +5362,17 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--geometry-qi-maxj-backend",
+        choices=("config", "old", "new"),
+        default="config",
+        help=(
+            "Select the static realtime-geometry QI/max-J objective backend. "
+            "'config' preserves geometry.qi_maxj.backend from the TOML (or its "
+            "legacy default); 'new' selects the VMEX-main physical fixed-pitch "
+            "matched-well objectives."
+        ),
+    )
+    parser.add_argument(
         "--accepted-step-limit",
         type=int,
         default=None,
@@ -6007,6 +6040,7 @@ def main() -> None:
         radau_jacobian_reuse_mode=args.radau_jacobian_reuse_mode,
     )
     _apply_transport_solver_backend_override(config, args.transport_solver_backend_override)
+    _apply_geometry_qi_maxj_backend_override(config, args.geometry_qi_maxj_backend)
     if bool(args.transport_solver_forward_smoke) and args.accepted_step_limit is not None:
         config.setdefault("transport_solver", {})["stop_after_accepted_steps"] = int(args.accepted_step_limit)
     neoclassical_cfg = config.setdefault("neoclassical", {})

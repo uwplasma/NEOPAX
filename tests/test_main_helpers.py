@@ -1,4 +1,6 @@
 import dataclasses
+import importlib.util
+import sys
 import types
 from pathlib import Path
 
@@ -62,6 +64,33 @@ from NEOPAX._transport_flux_models import (
     build_ntx_runtime_scan_transport_model,
     get_transport_flux_model,
 )
+
+
+def test_reverse_benchmark_qi_maxj_backend_cli_override(monkeypatch):
+    """The reverse benchmark can opt into VMEX-main QI/max-J without TOML edits."""
+
+    benchmark_path = (
+        Path(__file__).resolve().parents[1]
+        / "examples"
+        / "benchmarks"
+        / "benchmark_transport_reverse_ad_only.py"
+    )
+    monkeypatch.syspath_prepend(str(benchmark_path.parent))
+    spec = importlib.util.spec_from_file_location(
+        "_reverse_ad_benchmark_cli_under_test", benchmark_path
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    monkeypatch.setitem(sys.modules, spec.name, module)
+    spec.loader.exec_module(module)
+
+    config = {"geometry": {"qi_maxj": {"new_mboz": 12}}}
+    module._apply_geometry_qi_maxj_backend_override(config, "new")
+
+    assert config["geometry"]["qi_maxj"] == {
+        "new_mboz": 12,
+        "backend": "new",
+    }
 
 
 def _tiny_ntx_runtime_channels(rho):
