@@ -19,6 +19,7 @@ from ._geometry_autodiff import (
     GeometryRawBlockSolve,
     GeometryRawBlockStage,
 )
+from ._transport_flux_models import _float_delta_tree_like
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -364,10 +365,29 @@ def build_initial_root_bootstrap_kernels_optimization(
             state_bar, support_bars, geometry_bar_leaves = compiled_joint(
                 rooted_state, upar_bar, geometry_leaves, support_leaves
             )
+            # A geometry *cotangent* has the delta tree's non-floating leaves,
+            # not the primal geometry's metadata. Rebuild those from a fresh
+            # zero cotangent template; using the primal static leaves here
+            # would inject strings/bytes into the later tangent contraction.
+            geometry_bar_template = _float_delta_tree_like(geometry)
+            template_leaves, template_treedef = jax.tree_util.tree_flatten(
+                geometry_bar_template
+            )
+            dynamic_leaves = iter(geometry_bar_leaves)
+            geometry_bar = template_treedef.unflatten(
+                tuple(
+                    next(dynamic_leaves) if is_floating else leaf
+                    for leaf, is_floating in zip(
+                        template_leaves,
+                        payload_adapter.geometry_layout.floating_mask,
+                        strict=True,
+                    )
+                )
+            )
             return (
                 state_bar,
                 support_bars,
-                payload_adapter.geometry_layout.rebuild(geometry_bar_leaves),
+                geometry_bar,
             )
 
         # The separate callbacks are not used by the current joint stage, but
