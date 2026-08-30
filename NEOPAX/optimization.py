@@ -16,6 +16,7 @@ import jax.numpy as jnp
 import numpy as np
 
 from ._geometry_autodiff import (
+    QImaxJBackendSettings,
     _booz_constants_and_grids_for_inputs,
     _booz_xform_inputs_from_state,
     _boozer_surface_indices_and_rho,
@@ -28,6 +29,7 @@ from ._geometry_autodiff import (
     geometry_raw_block_stage,
     geometry_raw_block_solve_from_param_vector,
     geometry_raw_block_transpose_optimization_stage,
+    normalize_qi_maxj_backend_settings,
 )
 from ._constants import elementary_charge
 from ._orchestrator import build_runtime_context
@@ -90,6 +92,27 @@ from ._reverse_ad_transport import (
 )
 from ._transport_flux_models import DENSITY_STATE_TO_PHYSICAL
 from .api import prepare_config
+
+
+def _resolve_qi_maxj_settings(
+    geometry_config: Mapping[str, object],
+    explicit: QImaxJBackendSettings | Mapping[str, object] | None,
+) -> QImaxJBackendSettings:
+    """Resolve the static QI/max-J selection for an optimization build.
+
+    An explicit Python argument wins.  Otherwise an optimization TOML may use
+    ``[geometry.qi_maxj]``; generic CLI overrides can consequently select a
+    backend with ``--set geometry.qi_maxj.backend=new``.
+    """
+
+    if explicit is not None:
+        return normalize_qi_maxj_backend_settings(explicit)
+    configured = geometry_config.get("qi_maxj")
+    if configured is None:
+        return normalize_qi_maxj_backend_settings()
+    if not isinstance(configured, Mapping):
+        raise TypeError("geometry.qi_maxj must be a TOML table / mapping.")
+    return normalize_qi_maxj_backend_settings(configured)
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -1195,13 +1218,14 @@ def geometry_least_squares_problem(
     families: str | Sequence[str] | None = "RBC,ZBS",
     scale_mode: str = "ess",
     ess_alpha: float = 1.0,
-    mboz: int = 18,
-    nboz: int = 18,
+    mboz: int | None = None,
+    nboz: int | None = None,
     surfaces: Sequence[float] = (0.1, 0.28, 0.46, 0.64, 0.82, 1.0),
     lane: str = "ad",
     max_iter: int | None = None,
     step_size: float | None = None,
     solver_device: str | None = "default",
+    qi_maxj_settings: QImaxJBackendSettings | Mapping[str, object] | None = None,
 ) -> GeometryLeastSquaresProblem:
     """Build a VMEX-style geometry least-squares problem.
 
@@ -1209,14 +1233,16 @@ def geometry_least_squares_problem(
     ``parameters`` such as ``"RBC:1:0,ZBS:1:0"`` for diagnostic runs.
     """
 
+    qi_maxj_settings_eff = normalize_qi_maxj_backend_settings(qi_maxj_settings)
     context = build_geometry_autodiff_context(
         vmec_input,
         param_family="RBC",
         param_m=1,
         param_n=0,
-        mboz=int(mboz),
-        nboz=int(nboz),
+        mboz=18 if mboz is None and qi_maxj_settings_eff.backend == "old" else mboz,
+        nboz=18 if nboz is None and qi_maxj_settings_eff.backend == "old" else nboz,
         surface_s=tuple(float(s) for s in surfaces),
+        qi_maxj_settings=qi_maxj_settings_eff,
     )
     if parameters is not None:
         specs = parse_vmec_boundary_parameter_specs(
@@ -1384,8 +1410,8 @@ def geometry_initial_er_root_only_least_squares_problem(
     families: str | Sequence[str] | None = "RBC,ZBS",
     scale_mode: str = "ess",
     ess_alpha: float = 1.0,
-    mboz: int = 18,
-    nboz: int = 18,
+    mboz: int | None = None,
+    nboz: int | None = None,
     surfaces: Sequence[float] = (0.1, 0.28, 0.46, 0.64, 0.82, 1.0),
     n_r: int | None = None,
     n_theta: int | None = None,
@@ -1399,6 +1425,7 @@ def geometry_initial_er_root_only_least_squares_problem(
     device: str | None = "default",
     root_options: Mapping[str, object] | None = None,
     reverse_stage_mode: str = "off",
+    qi_maxj_settings: QImaxJBackendSettings | Mapping[str, object] | None = None,
 ) -> GeometryInitialErRootLeastSquaresProblem:
     """Build an optimizer problem for geometry terms plus initial-Er root terms.
 
@@ -1439,6 +1466,7 @@ def geometry_initial_er_root_only_least_squares_problem(
         )
     config_eff = _prepare_initial_er_root_config(config, device=device, vmec_input=vmec_input)
     geom_cfg = config_eff.get("geometry", {})
+    qi_maxj_settings_eff = _resolve_qi_maxj_settings(geom_cfg, qi_maxj_settings)
     neoclassical_cfg = config_eff.get("neoclassical", {})
     vmec_input_eff = geom_cfg.get("vmec_input_file")
     if vmec_input_eff is None:
@@ -1448,9 +1476,10 @@ def geometry_initial_er_root_only_least_squares_problem(
         param_family="RBC",
         param_m=1,
         param_n=0,
-        mboz=int(mboz),
-        nboz=int(nboz),
+        mboz=18 if mboz is None and qi_maxj_settings_eff.backend == "old" else mboz,
+        nboz=18 if nboz is None and qi_maxj_settings_eff.backend == "old" else nboz,
         surface_s=tuple(float(s) for s in surfaces),
+        qi_maxj_settings=qi_maxj_settings_eff,
     )
     if parameters is not None:
         specs = parse_vmec_boundary_parameter_specs(
@@ -1954,8 +1983,8 @@ def geometry_full_transport_least_squares_problem(
     families: str | Sequence[str] | None = "RBC,ZBS",
     scale_mode: str = "ess",
     ess_alpha: float = 1.0,
-    mboz: int = 18,
-    nboz: int = 18,
+    mboz: int | None = None,
+    nboz: int | None = None,
     surfaces: Sequence[float] = (0.1, 0.28, 0.46, 0.64, 0.82, 1.0),
     n_r: int | None = None,
     n_theta: int | None = None,
@@ -1980,6 +2009,7 @@ def geometry_full_transport_least_squares_problem(
     reverse_stage_adjoint_iter_tol: float = 1.0e-10,
     reverse_stage_adjoint_woodbury_rank: int = 24,
     max_reverse_accepted_steps: int | None = None,
+    qi_maxj_settings: QImaxJBackendSettings | Mapping[str, object] | None = None,
 ) -> GeometryFullTransportLeastSquaresProblem:
     """Build a geometry-only optimizer problem for full Radau transport objectives."""
 
@@ -1990,6 +2020,7 @@ def geometry_full_transport_least_squares_problem(
     if vmec_input is not None:
         config_eff.setdefault("geometry", {})["vmec_input_file"] = str(vmec_input)
     geom_cfg = config_eff.get("geometry", {})
+    qi_maxj_settings_eff = _resolve_qi_maxj_settings(geom_cfg, qi_maxj_settings)
     neoclassical_cfg = config_eff.get("neoclassical", {})
     vmec_input_eff = geom_cfg.get("vmec_input_file")
     if vmec_input_eff is None:
@@ -1999,9 +2030,10 @@ def geometry_full_transport_least_squares_problem(
         param_family="RBC",
         param_m=1,
         param_n=0,
-        mboz=int(mboz),
-        nboz=int(nboz),
+        mboz=18 if mboz is None and qi_maxj_settings_eff.backend == "old" else mboz,
+        nboz=18 if nboz is None and qi_maxj_settings_eff.backend == "old" else nboz,
         surface_s=tuple(float(s) for s in surfaces),
+        qi_maxj_settings=qi_maxj_settings_eff,
     )
     if parameters is not None:
         specs = parse_vmec_boundary_parameter_specs(

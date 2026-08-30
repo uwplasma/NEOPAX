@@ -484,6 +484,12 @@ def main() -> int:
     parser.add_argument("--warmup", type=int, default=DEFAULT_WARMUP)
     parser.add_argument("--repeats", type=int, default=DEFAULT_REPEATS)
     parser.add_argument(
+        "--qi-maxj-backend",
+        choices=("old", "new"),
+        default="old",
+        help="Select the QI/max-J backend for this repeated-evaluation measurement.",
+    )
+    parser.add_argument(
         "--diagnose-structure",
         action="store_true",
         help="Report benchmark-path raw VMEC solve and selected-root call counts per evaluation.",
@@ -606,13 +612,16 @@ def main() -> int:
         raise ValueError("The memory test requires one fixed MAX_MODE_SCHEDULE value.")
     previous_mode = example.REVERSE_STAGE_MODE
     previous_terms = example.terms
+    previous_qi_maxj_settings = example.QI_MAXJ_SETTINGS
     try:
         example.REVERSE_STAGE_MODE = args.mode
         example.terms = _terms_for_objective_set(args.objective_set)
+        example.QI_MAXJ_SETTINGS = {"backend": args.qi_maxj_backend}
         problem = build_transition_bootstrap_initial_root_problem(SEED_INPUT, int(MAX_MODE_SCHEDULE))
     finally:
         example.REVERSE_STAGE_MODE = previous_mode
         example.terms = previous_terms
+        example.QI_MAXJ_SETTINGS = previous_qi_maxj_settings
     quiet_problem = QuietProblem(problem)
     x = np.asarray(jax.device_get(problem.x0), dtype=float)
     optimization_raw_block_stage = None
@@ -769,6 +778,7 @@ def main() -> int:
 
     print(
         f"[memory test] mode={args.mode} objective_set={args.objective_set} "
+        f"qi_maxj_backend={args.qi_maxj_backend} "
         f"warmup={args.warmup} repeats={args.repeats} parameter_count={problem.parameter_count}",
         flush=True,
     )

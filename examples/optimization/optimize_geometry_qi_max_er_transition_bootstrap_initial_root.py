@@ -35,6 +35,7 @@ SURFACES = np.asarray(
     [1 / 51, 5 / 51, 10 / 51, 15 / 51, 20 / 51, 25 / 51, 30 / 51, 35 / 51, 40 / 51, 45 / 51, 51 / 51],
     dtype=float,
 )
+# Legacy J-contour plotting remains on its original diagnostic resolution.
 QI_MBOZ = 18
 QI_NBOZ = 18
 
@@ -69,6 +70,10 @@ XTOL = 1.0e-10
 GEOMETRY_MAX_ITER = None
 SOLVER_DEVICE = "default"
 REVERSE_STAGE_MODE = "off"
+# ``None`` uses an optional [geometry.qi_maxj] table in TRANSPORT_CONFIG.
+# Set {"backend": "old"} or {"backend": "new", ...} here to make this
+# optimization script's choice explicit instead.
+QI_MAXJ_SETTINGS = None
 ROOT_OPTIONS = {
     "Er_transition_left_index": ER_TRANSITION_LEFT_INDEX,
     "Er_transition_right_index": ER_TRANSITION_RIGHT_INDEX,
@@ -101,14 +106,17 @@ def build_transition_bootstrap_initial_root_problem(vmec_input, max_mode: int):
         families=GEOMETRY_FAMILIES,
         scale_mode=SCALE_MODE,
         ess_alpha=ESS_ALPHA,
-        mboz=QI_MBOZ,
-        nboz=QI_NBOZ,
+        # Leave resolution unset: old preserves this example's historical
+        # 18/18 backend default; new takes its configured 8/8 stage default.
+        mboz=None,
+        nboz=None,
         surfaces=tuple(float(s) for s in SURFACES),
         geometry_max_iter=GEOMETRY_MAX_ITER,
         geometry_solver_device=SOLVER_DEVICE,
         device=SOLVER_DEVICE,
         root_options=ROOT_OPTIONS,
         reverse_stage_mode=REVERSE_STAGE_MODE,
+        qi_maxj_settings=QI_MAXJ_SETTINGS,
     )
 
 

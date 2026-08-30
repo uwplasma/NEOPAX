@@ -46,11 +46,13 @@ def _terms_for_objective_set(objective_set: str):
     return selected
 
 
-def _build(mode: str = "off", objective_set: str = "all"):
+def _build(mode: str = "off", objective_set: str = "all", qi_maxj_backend: str = "old"):
     previous_mode = example.REVERSE_STAGE_MODE
     previous_terms = example.terms
+    previous_qi_maxj_settings = example.QI_MAXJ_SETTINGS
     example.REVERSE_STAGE_MODE = mode
     example.terms = _terms_for_objective_set(objective_set)
+    example.QI_MAXJ_SETTINGS = {"backend": qi_maxj_backend}
     try:
         return example.build_transition_bootstrap_initial_root_problem(
             example.SEED_INPUT, int(example.MAX_MODE_SCHEDULE)
@@ -58,6 +60,7 @@ def _build(mode: str = "off", objective_set: str = "all"):
     finally:
         example.REVERSE_STAGE_MODE = previous_mode
         example.terms = previous_terms
+        example.QI_MAXJ_SETTINGS = previous_qi_maxj_settings
 
 
 def _evaluate(problem, x):
@@ -91,11 +94,17 @@ def main() -> int:
         default="all",
         help="Use the same row selection as the memory test.",
     )
+    parser.add_argument(
+        "--qi-maxj-backend",
+        choices=("old", "new"),
+        default="old",
+        help="Build both benchmark and optimization evaluations with one selected QI/max-J backend.",
+    )
     args = parser.parse_args()
     if not np.isscalar(example.MAX_MODE_SCHEDULE):
         raise ValueError("The parity test requires one fixed MAX_MODE_SCHEDULE value.")
-    benchmark = _build(objective_set=args.objective_set)
-    staged = _build(args.mode, objective_set=args.objective_set)
+    benchmark = _build(objective_set=args.objective_set, qi_maxj_backend=args.qi_maxj_backend)
+    staged = _build(args.mode, objective_set=args.objective_set, qi_maxj_backend=args.qi_maxj_backend)
     x = np.asarray(jax.device_get(benchmark.x0), dtype=float)
     off_residuals, off_jacobian = _evaluate(benchmark, x)
     staged_residuals, staged_jacobian = _evaluate(staged, x)
@@ -112,7 +121,11 @@ def main() -> int:
     jacobian_relative_index = tuple(
         int(index) for index in np.unravel_index(np.argmax(jacobian_relative_delta), jacobian_relative_delta.shape)
     )
-    print(f"[parity] mode={args.mode} objective_set={args.objective_set}", flush=True)
+    print(
+        f"[parity] mode={args.mode} objective_set={args.objective_set} "
+        f"qi_maxj_backend={args.qi_maxj_backend}",
+        flush=True,
+    )
     print(f"[parity] residual_max_abs={np.max(np.abs(residual_delta)):.16e}", flush=True)
     print(f"[parity] jacobian_max_abs={np.max(np.abs(jacobian_delta)):.16e}", flush=True)
     print(

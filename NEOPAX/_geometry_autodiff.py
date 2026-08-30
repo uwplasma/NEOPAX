@@ -16,6 +16,115 @@ import interpax
 import numpy as np
 
 
+@dataclasses.dataclass(frozen=True, slots=True)
+class QImaxJBackendSettings:
+    """Static QI/max-J objective selection and resolution settings.
+
+    ``backend='old'`` denotes the established one-period
+    ``omnigenity_j`` surrogate.  ``backend='new'`` denotes VMEX-main's
+    physical fixed-pitch, matched-well QI/max-J functions.  This object is
+    deliberately static: a run selects one mathematical objective before it
+    traces or compiles any reverse-AD code.
+
+    The old fields record the exact legacy defaults.  The new fields default
+    to the VMEX QI/max-J continuation's max-mode-three physical resolution,
+    with the legacy normalized maximum-J target requested for NEOPAX.
+
+    Optimization TOML files may provide these fields under
+    ``[geometry.qi_maxj]``.  An explicit ``qi_maxj_settings=`` builder
+    argument overrides that table.
+    """
+
+    backend: str = "old"
+
+    # Established omnigenity_j surrogate settings.
+    old_nphi: int = 101
+    old_nalpha: int = 51
+    old_n_bounce: int = 66
+    old_nphi_int: int = 128
+    old_p_j: float = 1.0
+    old_p_lambda: float = 1.0
+    old_maxj_target: float = -0.06
+    old_maxj_pairing: str = "same_alpha"
+
+    # Frozen common-pitch selection for the new physical functions.
+    pitch_mboz: int = 12
+    pitch_nboz: int = 12
+    pitch_nalpha: int = 9
+    pitch_points_per_period: int = 64
+    pitch_num_periods: int = 4
+    trapping_depths: tuple[float, ...] = (0.35, 0.55, 0.75)
+
+    # New physical QI/max-J values: VMEX's max-mode-three action grid.
+    new_mboz: int = 8
+    new_nboz: int = 8
+    # Retained for VMEX-stage provenance.  NEOPAX's shared booz_xform API has
+    # no oversample argument, so this value cannot alter that single transform.
+    new_oversample: int = 2
+    new_nalpha: int = 5
+    new_points_per_period: int = 24
+    new_num_periods: int = 6
+    new_max_wells: int | None = 16
+    new_quadrature_order: int = 16
+    new_maxj_target: float = -0.06
+
+
+def normalize_qi_maxj_backend_settings(
+    settings: QImaxJBackendSettings | Mapping[str, Any] | None = None,
+) -> QImaxJBackendSettings:
+    """Return validated static settings for one QI/max-J backend.
+
+    Mappings are accepted so later TOML/CLI plumbing can pass a small
+    override dictionary without creating a second configuration format.
+    This routine does not select or execute either backend yet.
+    """
+
+    if settings is None:
+        resolved = QImaxJBackendSettings()
+    elif isinstance(settings, QImaxJBackendSettings):
+        resolved = settings
+    elif isinstance(settings, Mapping):
+        values = dict(settings)
+        if "trapping_depths" in values:
+            values["trapping_depths"] = tuple(float(value) for value in values["trapping_depths"])
+        resolved = QImaxJBackendSettings(**values)
+    else:
+        raise TypeError("qi_maxj_settings must be QImaxJBackendSettings, a mapping, or None.")
+
+    backend = str(resolved.backend).strip().lower()
+    if backend not in {"old", "new"}:
+        raise ValueError("qi_maxj backend must be 'old' or 'new'.")
+    if backend != resolved.backend:
+        resolved = dataclasses.replace(resolved, backend=backend)
+
+    positive_fields = (
+        "old_nphi", "old_nalpha", "old_n_bounce", "old_nphi_int",
+        "pitch_mboz", "pitch_nboz", "pitch_nalpha", "pitch_points_per_period",
+        "pitch_num_periods", "new_mboz", "new_nboz", "new_oversample",
+        "new_nalpha", "new_points_per_period", "new_num_periods",
+        "new_quadrature_order",
+    )
+    if any(int(getattr(resolved, name)) <= 0 for name in positive_fields):
+        raise ValueError("QI/max-J grid and Boozer resolutions must be positive.")
+    if resolved.new_max_wells is not None and int(resolved.new_max_wells) <= 0:
+        raise ValueError("new_max_wells must be positive or None.")
+    if not resolved.trapping_depths or any(
+        not np.isfinite(value) or value <= 0.0 or value >= 1.0
+        for value in resolved.trapping_depths
+    ):
+        raise ValueError("trapping_depths must be finite values strictly between zero and one.")
+    if str(resolved.old_maxj_pairing) not in {"all_to_all", "same_alpha", "soft_local"}:
+        raise ValueError("old_maxj_pairing must be 'all_to_all', 'same_alpha', or 'soft_local'.")
+    if not all(np.isfinite(value) for value in (
+        resolved.old_p_j,
+        resolved.old_p_lambda,
+        resolved.old_maxj_target,
+        resolved.new_maxj_target,
+    )):
+        raise ValueError("QI/max-J powers and targets must be finite.")
+    return resolved
+
+
 def _repo_root() -> Path:
     return Path(__file__).resolve().parents[2]
 
@@ -1238,6 +1347,9 @@ def geometry_qi_maxj_baseline_pitches(
     # geometry table already has a traceable booz_xform lane and QI/max-J must
     # consume that same spectrum, rather than perform a second Boozer
     # construction solely to select its fixed physical pitches.
+    if context.qi_maxj_settings.backend == "old":
+        # The compatibility objective does not use physical trapped pitches.
+        return jnp.zeros((0,), dtype=jnp.float64)
     booz = _boozer_output_from_state(context, raw_block_solve.state)
     return _qi_maxj_common_pitches_from_boozer(context, booz)
 
@@ -1361,6 +1473,7 @@ class GeometryAutodiffContext:
     surface_s: tuple[float, ...]
     surface_indices: jnp.ndarray
     qi_maxj_trapping_depths: tuple[float, ...]
+    qi_maxj_settings: QImaxJBackendSettings
     mboz: int
     nboz: int
     booz_constants: Any
@@ -1481,9 +1594,17 @@ def build_geometry_autodiff_context(
     mboz: int | None = None,
     nboz: int | None = None,
     surface_s: Sequence[float] = (0.25, 0.5, 0.75),
-    qi_maxj_trapping_depths: Sequence[float] = (0.35, 0.55, 0.75),
+    qi_maxj_trapping_depths: Sequence[float] | None = None,
+    qi_maxj_settings: QImaxJBackendSettings | Mapping[str, Any] | None = None,
 ) -> GeometryAutodiffContext:
-    depths = tuple(float(value) for value in qi_maxj_trapping_depths)
+    backend_settings = normalize_qi_maxj_backend_settings(qi_maxj_settings)
+    depths = tuple(
+        float(value)
+        for value in (
+            backend_settings.trapping_depths
+            if qi_maxj_trapping_depths is None else qi_maxj_trapping_depths
+        )
+    )
     if not depths or any(
         not np.isfinite(value) or value <= 0.0 or value >= 1.0
         for value in depths
@@ -1492,6 +1613,10 @@ def build_geometry_autodiff_context(
             "qi_maxj_trapping_depths must contain finite values strictly "
             "between zero and one."
         )
+    # Keep the context's reported settings identical to the effective pitch
+    # selection values, including callers of the older explicit argument.
+    if depths != backend_settings.trapping_depths:
+        backend_settings = dataclasses.replace(backend_settings, trapping_depths=depths)
     vmec_backend = _import_vmec_jax()
     booz_api = _import_booz_xform_jax_api()
 
@@ -1542,11 +1667,24 @@ def build_geometry_autodiff_context(
     except Exception:
         s_half = 0.5 * (np.asarray(static.s[:-1], dtype=float) + np.asarray(static.s[1:], dtype=float))
         surface_indices = [int(np.argmin(np.abs(s_half - float(val)))) for val in surface_s]
+    # A new physical-QI run uses VMEX's max-mode-three Boozer spectrum unless
+    # the caller explicitly selects another resolution.  The established old
+    # backend retains NEOPAX's previous automatic resolution behavior.
+    requested_mboz = (
+        backend_settings.new_mboz
+        if backend_settings.backend == "new" and mboz is None
+        else mboz
+    )
+    requested_nboz = (
+        backend_settings.new_nboz
+        if backend_settings.backend == "new" and nboz is None
+        else nboz
+    )
     resolved_mboz, resolved_nboz = _resolve_booz_resolution_defaults(
         static=static,
         cfg=cfg,
-        mboz=mboz,
-        nboz=nboz,
+        mboz=requested_mboz,
+        nboz=requested_nboz,
     )
     if fixed_context.get("booz_inputs") is None:
         booz_constants, booz_grids = None, None
@@ -1577,6 +1715,7 @@ def build_geometry_autodiff_context(
         surface_s=tuple(float(val) for val in surface_s),
         surface_indices=jnp.asarray(surface_indices, dtype=jnp.int32),
         qi_maxj_trapping_depths=depths,
+        qi_maxj_settings=backend_settings,
         mboz=resolved_mboz,
         nboz=resolved_nboz,
         booz_constants=booz_constants,
@@ -2368,6 +2507,9 @@ def _qi_maxj_common_pitches_from_boozer(
     output.  Calling ``common_trapped_pitches_state`` would construct a
     second, VMEX-native Boozer spectrum just to select the pitch values.
     """
+    settings = context.qi_maxj_settings
+    if settings.backend != "new":
+        raise ValueError("Physical QI/max-J pitches are only defined for backend='new'.")
     maxj = _import_vmec_module("core.maxj")
     bmnc_b = jnp.asarray(booz["bmnc_b"], dtype=jnp.float64)
     bmns_b = jnp.asarray(booz.get("bmns_b", jnp.zeros_like(bmnc_b)), dtype=jnp.float64)
@@ -2380,9 +2522,9 @@ def _qi_maxj_common_pitches_from_boozer(
     # NEOPAX booz_xform result.  This calculation is outside the differentiated
     # residual: trapped-well membership and the selected pitch are fixed at
     # the stage baseline.
-    nalpha = 9
-    points_per_period = 64
-    num_periods = 4
+    nalpha = settings.pitch_nalpha
+    points_per_period = settings.pitch_points_per_period
+    num_periods = settings.pitch_num_periods
     alpha = jnp.asarray(2.0 * np.pi * np.arange(nalpha) / nalpha, dtype=bmnc_b.dtype)
     phi = jnp.asarray(
         2.0 * np.pi * np.arange(points_per_period * num_periods)
@@ -2396,7 +2538,7 @@ def _qi_maxj_common_pitches_from_boozer(
         + jnp.einsum("sapm,sm->sap", jnp.sin(angle), bmns_b)
     )
     pitches = maxj.common_trapped_pitches(
-        jnp.swapaxes(bmag, 1, 2), context.qi_maxj_trapping_depths
+        jnp.swapaxes(bmag, 1, 2), settings.trapping_depths
     )
     return jax.lax.stop_gradient(jnp.asarray(pitches, dtype=jnp.float64))
 
@@ -2409,7 +2551,41 @@ def _vmec_j_invariant_qi_maxj_objectives_from_boozer(
     include_maxj: bool,
     pitches=None,
 ) -> dict[str, jnp.ndarray]:
-    """Evaluate VMEX-main QI/max-J directly from the existing booz_xform output."""
+    """Evaluate the selected QI/max-J backend from the existing Boozer output."""
+
+    settings = context.qi_maxj_settings
+    if settings.backend == "old":
+        # Compatibility path: the copied legacy helper consumes this exact
+        # Boozer spectrum; it does not invoke VMEC or Boozer itself.
+        from ._omnigenity import j_invariant_qi_maxj_residual_from_boozer
+
+        gi_b = jnp.asarray(booz["bvco_b"], dtype=jnp.float64) + (
+            jnp.asarray(booz["iota_b"], dtype=jnp.float64)
+            * jnp.asarray(booz["buco_b"], dtype=jnp.float64)
+        )
+        legacy = j_invariant_qi_maxj_residual_from_boozer(
+            bmnc_b=booz["bmnc_b"],
+            xm_b=booz["ixm_b"],
+            xn_b=booz["ixn_b"],
+            iota_b=booz["iota_b"],
+            gi_b=gi_b,
+            s_b=jnp.asarray(context.surface_s, dtype=jnp.float64),
+            nfp=int(context.cfg.nfp),
+            nphi=settings.old_nphi,
+            nalpha=settings.old_nalpha,
+            n_bounce=settings.old_n_bounce,
+            p_j=settings.old_p_j,
+            p_lambda=settings.old_p_lambda,
+            nphi_int=settings.old_nphi_int,
+            target_maxj=settings.old_maxj_target,
+            include_qi=include_qi,
+            include_maxj=include_maxj,
+            maxj_pairing=settings.old_maxj_pairing,
+        )
+        return {
+            "qi_objective": jnp.asarray(legacy["qi_objective"], dtype=jnp.float64),
+            "maxj_objective": jnp.asarray(legacy["maxj_objective"], dtype=jnp.float64),
+        }
 
     qi = _import_vmec_module("core.qi")
     maxj = _import_vmec_module("core.maxj")
@@ -2439,12 +2615,27 @@ def _vmec_j_invariant_qi_maxj_objectives_from_boozer(
     if "bmns_b" in booz:
         inputs["bmns_b"] = booz["bmns_b"]
     qi_total = (
-        qi.j_invariant_qi_residual_from_boozer(**inputs)["total"]
+        qi.j_invariant_qi_residual_from_boozer(
+            **inputs,
+            nalpha=settings.new_nalpha,
+            points_per_period=settings.new_points_per_period,
+            num_periods=settings.new_num_periods,
+            max_wells=settings.new_max_wells,
+            quadrature_order=settings.new_quadrature_order,
+        )["total"]
         if include_qi else jnp.asarray(0.0, dtype=jnp.float64)
     )
     maxj_total = (
         maxj.maximum_j_residual_from_boozer(
-            **inputs, psi_b=s_b, psi_edge=jnp.asarray(1.0, dtype=jnp.float64)
+            **inputs,
+            psi_b=s_b,
+            psi_edge=jnp.asarray(1.0, dtype=jnp.float64),
+            target=settings.new_maxj_target,
+            nalpha=settings.new_nalpha,
+            points_per_period=settings.new_points_per_period,
+            num_periods=settings.new_num_periods,
+            max_wells=settings.new_max_wells,
+            quadrature_order=settings.new_quadrature_order,
         )["total"]
         if include_maxj else jnp.asarray(0.0, dtype=jnp.float64)
     )
@@ -3858,8 +4049,10 @@ def geometry_full_ad_objective_table_pullback_from_param_vector(
     # computed booz_xform output.  The inner VJP below then treats it as fixed;
     # it neither differentiates pitch selection nor invokes VMEX's separate
     # state-native Boozer transform.
-    j_qi_maxj_pitches = _qi_maxj_common_pitches_from_boozer(
-        context, booz_with_modes(booz)
+    j_qi_maxj_pitches = (
+        _qi_maxj_common_pitches_from_boozer(context, booz_with_modes(booz))
+        if context.qi_maxj_settings.backend == "new"
+        else None
     )
 
     def j_qi_maxj_vector(booz_inner):
