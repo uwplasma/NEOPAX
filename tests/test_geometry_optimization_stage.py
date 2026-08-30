@@ -8,6 +8,49 @@ import jax.numpy as jnp
 from NEOPAX import _geometry_autodiff as geometry_ad
 from NEOPAX import _optimization_initial_root_stage as initial_root_stage
 from NEOPAX import optimization
+from NEOPAX._reverse_ad_optimization import normalize_geometry_full_ad_objective_names
+
+
+def test_local_vmex_mercier_softmax_adapter_uses_state_runtime_path(monkeypatch):
+    """The old VMEX branch exposes DMerc without WOUT or Boozer data."""
+
+    runtime = object()
+    calls = {}
+
+    class _Stability:
+        @staticmethod
+        def mercier_stability_softmax(state, received_runtime, *, margin, smoothing, temperature):
+            calls.update(
+                state=state,
+                runtime=received_runtime,
+                margin=margin,
+                smoothing=smoothing,
+                temperature=temperature,
+            )
+            return jnp.asarray(2.5e-4)
+
+    monkeypatch.setattr(geometry_ad, "_import_vmec_module", lambda name: _Stability)
+    context = SimpleNamespace(static=SimpleNamespace(runtime=runtime))
+    value = geometry_ad.vmec_mercier_stability_softmax_objective_from_state(
+        context, "converged-state"
+    )
+
+    assert jnp.allclose(value, jnp.asarray(2.5e-4))
+    assert calls == {
+        "state": "converged-state",
+        "runtime": runtime,
+        "margin": 0.0,
+        "smoothing": 1.0e-6,
+        "temperature": 1.0e-3,
+    }
+
+
+def test_local_vmex_mercier_softmax_is_a_full_geometry_objective_row():
+    names = geometry_ad.geometry_observable_names_for_kind("geometry_full_ad_objectives")
+    assert names[-1] == "vmec_dmerc_stability_softmax"
+    assert normalize_geometry_full_ad_objective_names(("dmerc",)) == (
+        "vmec_dmerc_stability_softmax",
+    )
 
 
 def test_raw_block_solve_uses_prebuilt_stage_without_rebuilding_config(monkeypatch):

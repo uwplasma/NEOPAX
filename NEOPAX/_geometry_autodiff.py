@@ -62,6 +62,7 @@ _CURRENT_VMEX_MODULE_ALIASES = {
     "optimize": ("core.optimize",),
     "setup": ("core.setup",),
     "solver": ("core.solver",),
+    "stability": ("core.stability",),
     "statephysics": ("core.statephysics",),
     "wout": ("core.wout",),
 }
@@ -1861,6 +1862,21 @@ def _vmec_dmerc_profile_from_state(
     context: GeometryAutodiffContext,
     state,
 ) -> jnp.ndarray:
+    # The local VMEX branch supplies the same state/runtime reconstruction as
+    # VMEX main.  Prefer it whenever present: unlike the historical WOUT
+    # diagnostic it remains inside the JAX trace and is therefore valid for a
+    # VMEC-state cotangent.
+    try:
+        stability = _import_vmec_module("stability")
+        d_merc_state = getattr(stability, "d_merc_state")
+    except (AttributeError, ModuleNotFoundError):
+        d_merc_state = None
+    if d_merc_state is not None:
+        return jnp.asarray(
+            d_merc_state(state, context.static.runtime),
+            dtype=jnp.float64,
+        )
+
     vmec_jax = _import_vmec_jax()
     try:
         mercier_terms_from_state = _resolve_vmec_attr(
@@ -1882,6 +1898,38 @@ def _vmec_dmerc_profile_from_state(
         # an AD-transparent state function. Keep the scalar-observable smoke
         # gate running while making this diagnostic contribution neutral.
         return jnp.zeros_like(jnp.asarray(context.static.s, dtype=jnp.float64))
+
+
+def vmec_mercier_stability_softmax_objective_from_state(
+    context: GeometryAutodiffContext,
+    state,
+    *,
+    margin: float = 0.0,
+    smoothing: float = 1.0e-6,
+    temperature: float = 1.0e-3,
+) -> jnp.ndarray:
+    """Return VMEX's pure-JAX smooth worst-surface Mercier violation.
+
+    This is deliberately a scalar reduction of VMEX's interior DMerc
+    residual, rather than the old sampled diagnostic rows.  It has no WOUT or
+    Boozer dependency and contributes a regular VMEC-state cotangent to the
+    existing raw-block transpose.
+    """
+
+    stability = _import_vmec_module("stability")
+    objective = getattr(stability, "mercier_stability_softmax", None)
+    if objective is None:
+        raise _vmec_dmerc_unavailable_error()
+    return jnp.asarray(
+        objective(
+            state,
+            context.static.runtime,
+            margin=float(margin),
+            smoothing=float(smoothing),
+            temperature=float(temperature),
+        ),
+        dtype=jnp.float64,
+    )
 
 
 def _vmec_scalar_observables_from_state(
@@ -2341,6 +2389,9 @@ def _geometry_full_ad_objectives_from_state(
         out[f"boozer_{name}"] = jnp.asarray(value, dtype=jnp.float64)
     out["boozer_qi_objective"] = jnp.asarray(qi_maxj["qi_objective"], dtype=jnp.float64)
     out["boozer_maxj_objective"] = jnp.asarray(qi_maxj["maxj_objective"], dtype=jnp.float64)
+    out["vmec_dmerc_stability_softmax"] = (
+        vmec_mercier_stability_softmax_objective_from_state(context, state)
+    )
     return out
 
 
@@ -2748,6 +2799,7 @@ def _observable_names_for_kind(observable_kind: str) -> list[str]:
             "boozer_b10_over_b00_mean",
             "boozer_qi_objective",
             "boozer_maxj_objective",
+            "vmec_dmerc_stability_softmax",
         ]
     if kind == "vmec_iotaf_scalar_observables":
         return ["iotas_1", "iotas_2", "iotaf_first", "iotaf_q1", "iotaf_mid", "iotaf_q3", "iotaf_edge", "iota_mean"]
@@ -3631,11 +3683,16 @@ def geometry_full_ad_objective_table_pullback_from_param_vector(
         "magnetic_well",
         "mirror_ratio",
         "beta_volume",
+        "dmerc_stability_softmax",
     )
     vmec_indices = tuple(names.index(f"vmec_{name}") for name in vmec_names)
 
     def vmec_vector(state_inner):
         values = _vmec_core_scalar_objectives_from_state(context, state_inner)
+        values = dict(values)
+        values["dmerc_stability_softmax"] = (
+            vmec_mercier_stability_softmax_objective_from_state(context, state_inner)
+        )
         return jnp.stack([jnp.asarray(values[name], dtype=jnp.float64).reshape(()) for name in vmec_names])
 
     vmec_values, vmec_state_pullback = jax.vjp(vmec_vector, state)
