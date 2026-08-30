@@ -68,7 +68,10 @@ FTOL = 1.0e-6
 XTOL = 1.0e-10
 GEOMETRY_MAX_ITER = None
 SOLVER_DEVICE = "default"
-REVERSE_STAGE_MODE = "off"
+# This exact geometry + max-Er + transition + bootstrap initial-root path was
+# validated with flat repeated-evaluation RSS in the staged lane below.  Keep
+# ``off`` available as the unchanged benchmark/reference mode.
+REVERSE_STAGE_MODE = "optimization_payload_root_scan_geometry_experiment"
 ROOT_OPTIONS = {
     "Er_transition_left_index": ER_TRANSITION_LEFT_INDEX,
     "Er_transition_right_index": ER_TRANSITION_RIGHT_INDEX,
@@ -80,6 +83,11 @@ MAKE_B_AXIS_PLOTS = True
 MAKE_BOOZER_B_CONTOUR_PLOTS = True
 MAKE_INITIAL_PLOTS = False
 SAVE_INITIAL_ER_PROFILE_EARLY = False
+# Diagnostic only: append current process RSS to each SciPy residual evaluation.
+# It does not affect the objective, Jacobian, or optimizer choices.
+REPORT_RSS_EACH_EVALUATION = True
+
+_SCIPY_RSS_BASELINE_BYTES: int | None = None
 
 
 def max_mode_schedule_values():
@@ -155,6 +163,7 @@ terms = [
 
 # --------------------------- reporting / outputs ---------------------------
 def iteration_diagnostics(evaluation):
+    global _SCIPY_RSS_BASELINE_BYTES
     values = {
         label: float(np.asarray(jax.device_get(value), dtype=float))
         for label, value in evaluation.result.objective_values.items()
@@ -187,7 +196,7 @@ def iteration_diagnostics(evaluation):
         "bootstrap_current_softmax_abs_scaled",
         "bootstrap_current_penalty",
     )
-    return (
+    diagnostic = (
         f"aspect_ratio={value('geometry:vmec_aspect_ratio', 'vmec_aspect_ratio'):.8e} "
         f"iota_mean={value('geometry:vmec_iota_mean', 'vmec_iota_mean'):.8e} "
         f"mirror_ratio={value('geometry:vmec_mirror_ratio', 'vmec_mirror_ratio'):.8e} "
@@ -205,6 +214,15 @@ def iteration_diagnostics(evaluation):
         f"bootstrap={value('transport:bootstrap_current_softmax_abs_scaled', 'bootstrap_current_softmax_abs_scaled'):.8e} "
         f"bootstrap_residual={bootstrap_residual:.8e}"
     )
+    if not REPORT_RSS_EACH_EVALUATION:
+        return diagnostic
+    rss_bytes = opt._process_resident_memory_bytes()
+    if rss_bytes is None:
+        return diagnostic + " rss_delta=unavailable"
+    if _SCIPY_RSS_BASELINE_BYTES is None:
+        _SCIPY_RSS_BASELINE_BYTES = int(rss_bytes)
+    rss_delta_mib = (int(rss_bytes) - _SCIPY_RSS_BASELINE_BYTES) / 2**20
+    return diagnostic + f" rss_delta={rss_delta_mib:+.1f}MiB"
 
 
 def report(tag, problem, x):
@@ -550,6 +568,7 @@ def write_outputs(optimized_input, initial_input, initial_problem, initial_x, fi
 
 # --------------------------- continuation ladder ----------------------------
 def main() -> int:
+    global _SCIPY_RSS_BASELINE_BYTES
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     x = None
     current_input = SEED_INPUT
@@ -582,6 +601,7 @@ def main() -> int:
                 save_er_profile(problem, x, initial_dir, "initial")
                 initial_er_profile_saved = True
         report("initial", problem, x)
+        _SCIPY_RSS_BASELINE_BYTES = None
         last_result = opt.least_squares(
             problem,
             max_nfev=NFEV,
