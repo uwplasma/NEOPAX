@@ -918,7 +918,8 @@ def build_initial_er_transport_reverse_stage(
     )
     bootstrap_kernels = (
         build_initial_root_bootstrap_kernels_optimization(
-            neoclassical_model=neoclassical_model
+            neoclassical_model=neoclassical_model,
+            payload_adapter=payload_adapter,
         )
         if dataclasses.is_dataclass(neoclassical_model)
         and all(callable(getattr(neoclassical_model, name, None)) for name in bootstrap_method_names)

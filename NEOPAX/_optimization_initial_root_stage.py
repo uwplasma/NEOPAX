@@ -258,6 +258,7 @@ class InitialRootBootstrapKernelSet:
 def build_initial_root_bootstrap_kernels_optimization(
     *,
     neoclassical_model: Any,
+    payload_adapter: InitialErTransportPayloadAdapter | None = None,
 ) -> InitialRootBootstrapKernelSet:
     """Bind stable identities to the established corrected-bootstrap calls."""
 
@@ -284,20 +285,20 @@ def build_initial_root_bootstrap_kernels_optimization(
     def _model_for_trial(geometry, support):
         return dataclasses.replace(neoclassical_model, geometry=geometry, support=support)
 
-    def corrected_bootstrap_fluxes(rooted_state, geometry, support):
+    def _corrected_bootstrap_fluxes(rooted_state, geometry, support):
         return _model_for_trial(geometry, support).evaluate_momentum_corrected_fluxes(rooted_state)
 
-    def bootstrap_state_pullback(rooted_state, upar_bar, geometry, support):
+    def _bootstrap_state_pullback(rooted_state, upar_bar, geometry, support):
         return _model_for_trial(geometry, support).pullback_momentum_corrected_upar_state_by_radius(
             rooted_state, upar_bar
         )
 
-    def bootstrap_geometry_pullback(rooted_state, upar_bar, geometry, support):
+    def _bootstrap_geometry_pullback(rooted_state, upar_bar, geometry, support):
         return _model_for_trial(geometry, support).pullback_momentum_corrected_upar_geometry_by_radius(
             rooted_state, upar_bar, geometry, support
         )
 
-    def bootstrap_support_pullback(rooted_state, upar_bar, geometry, support):
+    def _bootstrap_support_pullback(rooted_state, upar_bar, geometry, support):
         return _model_for_trial(geometry, support).pullback_momentum_corrected_upar_support_by_radius(
             rooted_state, upar_bar, support
         )
@@ -308,19 +309,82 @@ def build_initial_root_bootstrap_kernels_optimization(
         None,
     )
 
-    def bootstrap_joint_pullback(rooted_state, upar_bar, geometry, support):
+    def _bootstrap_joint_pullback(rooted_state, upar_bar, geometry, support):
         return _model_for_trial(geometry, support).pullback_momentum_corrected_upar_state_support_geometry_by_radius(
             rooted_state, upar_bar, geometry, support
         )
+
+    # The benchmark route keeps its dynamic model calls. For an optimization
+    # stage, carry only floating geometry/support leaves across two narrow,
+    # persistent compiled boundaries. This avoids constructing a new bound NTX
+    # method identity on every least-squares evaluation.
+    if payload_adapter is None:
+        corrected_bootstrap_fluxes = _corrected_bootstrap_fluxes
+        bootstrap_state_pullback = _bootstrap_state_pullback
+        bootstrap_geometry_pullback = _bootstrap_geometry_pullback
+        bootstrap_support_pullback = _bootstrap_support_pullback
+        bootstrap_joint_pullback = (
+            _bootstrap_joint_pullback if callable(joint_pullback_fn) else None
+        )
+    else:
+        def _compiled_corrected(rooted_state, geometry_leaves, support_leaves):
+            payload = payload_adapter.rebuild(geometry_leaves, support_leaves)
+            return _corrected_bootstrap_fluxes(
+                rooted_state, payload["geometry"], payload["ntx_support"]
+            )
+
+        compiled_corrected = jax.jit(_compiled_corrected, inline=False)
+
+        def corrected_bootstrap_fluxes(rooted_state, geometry, support):
+            geometry_leaves, support_leaves = payload_adapter.dynamic_leaves(
+                {"geometry": geometry, "ntx_support": support}
+            )
+            return compiled_corrected(rooted_state, geometry_leaves, support_leaves)
+
+        def _compiled_joint(rooted_state, upar_bar, geometry_leaves, support_leaves):
+            payload = payload_adapter.rebuild(geometry_leaves, support_leaves)
+            state_bar, support_bars, geometry_bar = _bootstrap_joint_pullback(
+                rooted_state,
+                upar_bar,
+                payload["geometry"],
+                payload["ntx_support"],
+            )
+            return (
+                state_bar,
+                support_bars,
+                payload_adapter.geometry_layout.floating_leaves(geometry_bar),
+            )
+
+        compiled_joint = jax.jit(_compiled_joint, inline=False)
+
+        def bootstrap_joint_pullback(rooted_state, upar_bar, geometry, support):
+            geometry_leaves, support_leaves = payload_adapter.dynamic_leaves(
+                {"geometry": geometry, "ntx_support": support}
+            )
+            state_bar, support_bars, geometry_bar_leaves = compiled_joint(
+                rooted_state, upar_bar, geometry_leaves, support_leaves
+            )
+            return (
+                state_bar,
+                support_bars,
+                payload_adapter.geometry_layout.rebuild(geometry_bar_leaves),
+            )
+
+        # The separate callbacks are not used by the current joint stage, but
+        # retain their benchmark-equivalent definitions for callers that need
+        # them in a future objective configuration.
+        bootstrap_state_pullback = _bootstrap_state_pullback
+        bootstrap_geometry_pullback = _bootstrap_geometry_pullback
+        bootstrap_support_pullback = _bootstrap_support_pullback
+        if not callable(joint_pullback_fn):
+            bootstrap_joint_pullback = None
 
     return InitialRootBootstrapKernelSet(
         corrected_bootstrap_fluxes=corrected_bootstrap_fluxes,
         bootstrap_state_pullback=bootstrap_state_pullback,
         bootstrap_geometry_pullback=bootstrap_geometry_pullback,
         bootstrap_support_pullback=bootstrap_support_pullback,
-        bootstrap_joint_pullback=(
-            bootstrap_joint_pullback if callable(joint_pullback_fn) else None
-        ),
+        bootstrap_joint_pullback=bootstrap_joint_pullback,
     )
 
 
