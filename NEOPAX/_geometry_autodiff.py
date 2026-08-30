@@ -635,18 +635,24 @@ def _implicit_params_from_input(context: "GeometryAutodiffContext", implicit, so
             "implicit solver device must be one of 'default', 'auto', 'cpu', or 'gpu'."
         )
 
-    return implicit.ImplicitParams(
-        rbc=_arr(context.indata.rbc),
-        rbs=_arr(context.indata.rbs),
-        zbc=_arr(context.indata.zbc),
-        zbs=_arr(context.indata.zbs),
-        phiedge=_arr(context.indata.phiedge),
-        pres_scale=_arr(context.indata.pres_scale),
-        curtor=_arr(context.indata.curtor),
-        am=_arr(context.indata.am),
-        ai=_arr(context.indata.ai),
-        ac=_arr(context.indata.ac),
-    )
+    # Let VMEX define the complete parameter schema. VMEX-main adds
+    # auxiliary-profile fields such as ``ac_aux_f``; hard-coding the old
+    # constructor list here makes NEOPAX incompatible with that backend.
+    params = implicit.params_from_input(context.indata)
+    try:
+        fields = dataclasses.fields(params)
+    except TypeError as exc:  # pragma: no cover - VMEX contract guard.
+        raise TypeError("VMEX params_from_input must return a dataclass instance.") from exc
+    updates = {}
+    for field in fields:
+        value = getattr(params, field.name)
+        try:
+            updates[field.name] = _arr(value)
+        except (TypeError, ValueError):
+            # Structural/non-numeric VMEX fields remain exactly as produced by
+            # its factory.
+            continue
+    return dataclasses.replace(params, **updates)
 
 
 def _implicit_params_with_boundary_delta(context: "GeometryAutodiffContext", implicit, param_delta, *, solver_device: str | None = None):
