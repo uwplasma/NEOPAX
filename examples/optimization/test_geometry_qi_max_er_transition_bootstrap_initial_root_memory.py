@@ -107,6 +107,7 @@ class EvaluationStructureCounter:
         self.support_reverse_dispatch_caches: dict[str, int | None] = {}
         self.support_reverse_rss_bytes: dict[str, int | None] = {}
         self.optimization_stage_dispatch_caches: dict[str, int | None] = {}
+        self.geometry_dispatch_caches: dict[str, int | None] = {}
 
     def reset(self) -> None:
         self.raw_block_solve_calls = 0
@@ -123,6 +124,7 @@ class EvaluationStructureCounter:
         self.support_reverse_dispatch_caches = {}
         self.support_reverse_rss_bytes = {}
         self.optimization_stage_dispatch_caches = {}
+        self.geometry_dispatch_caches = {}
 
     def context(
         self,
@@ -141,6 +143,7 @@ class EvaluationStructureCounter:
         support_reverse_dispatch: bool = False,
         support_reverse_rss: bool = False,
         optimization_stage_dispatch: bool = False,
+        geometry_dispatch: bool = False,
         raw_implicit=None,
     ):
         raw_block_solve = reverse_optimization.geometry_raw_block_solve_from_param_vector
@@ -149,6 +152,7 @@ class EvaluationStructureCounter:
         payload_pullback = reverse_optimization.realtime_geometry_transport_reverse_table_from_payload_cotangents
         support_reverse = reverse_optimization.geometry_active_initial_er_root_only_reverse_table
         optimization_evaluator = opt.evaluate_geometry_initial_er_root_only_least_squares_optimization
+        geometry_table = reverse_optimization.geometry_full_ad_reverse_table
 
         def record(name: str) -> None:
             if checkpoints:
@@ -214,6 +218,10 @@ class EvaluationStructureCounter:
         def record_optimization_stage_dispatch(label: str) -> None:
             if optimization_stage_dispatch:
                 self.optimization_stage_dispatch_caches[str(label)] = dispatch_cache_size()
+
+        def record_geometry_dispatch(label: str) -> None:
+            if geometry_dispatch:
+                self.geometry_dispatch_caches[str(label)] = dispatch_cache_size()
 
         original_scaled_to_physical = opt.GeometryInitialErRootLeastSquaresProblem._scaled_to_physical
         original_active_profile_values = reverse_optimization._active_profile_values_from_parameter_vector
@@ -307,6 +315,14 @@ class EvaluationStructureCounter:
             record_optimization_stage_dispatch("optimization_evaluator_return")
             return result
 
+        def count_geometry_table(*args, **kwargs):
+            record_geometry_dispatch("geometry_table_entry")
+            if geometry_dispatch:
+                kwargs["dispatch_cache_probe"] = record_geometry_dispatch
+            result = geometry_table(*args, **kwargs)
+            record_geometry_dispatch("geometry_table_return")
+            return result
+
         patchers = [
             patch.object(
                 reverse_optimization,
@@ -337,6 +353,11 @@ class EvaluationStructureCounter:
                 opt,
                 "evaluate_geometry_initial_er_root_only_least_squares_optimization",
                 count_optimization_evaluator,
+            ),
+            patch.object(
+                reverse_optimization,
+                "geometry_full_ad_reverse_table",
+                count_geometry_table,
             ),
         ]
         if pre_raw_dispatch:
@@ -439,6 +460,7 @@ def main() -> int:
             "optimization_payload_root_experiment",
             "optimization_payload_root_strict_experiment",
             "optimization_payload_root_scan_experiment",
+            "optimization_payload_root_scan_geometry_experiment",
             "optimization_payload_reverse_experiment",
             "vmex_like",
         ),
@@ -571,6 +593,11 @@ def main() -> int:
             "For optimization-only modes, split the dispatch-cache count across "
             "the root reverse, payload stage, geometry table, and final assembly."
         ),
+    )
+    parser.add_argument(
+        "--diagnose-geometry-dispatch",
+        action="store_true",
+        help="Report dispatch-cache size immediately before and after the geometry reverse table.",
     )
     args = parser.parse_args()
     if args.warmup < 0 or args.repeats < 1:
@@ -730,6 +757,15 @@ def main() -> int:
                 f"[memory test] optimization_stage_dispatch_cache {entries or 'unavailable'}",
                 flush=True,
             )
+        if args.diagnose_geometry_dispatch:
+            entries = " ".join(
+                f"{name}={value if value is not None else 'unavailable'}"
+                for name, value in structure_counter.geometry_dispatch_caches.items()
+            )
+            print(
+                f"[memory test] geometry_dispatch_cache {entries or 'unavailable'}",
+                flush=True,
+            )
 
     print(
         f"[memory test] mode={args.mode} objective_set={args.objective_set} "
@@ -772,6 +808,7 @@ def main() -> int:
                 support_reverse_dispatch=args.diagnose_support_reverse_dispatch,
                 support_reverse_rss=args.diagnose_support_reverse_rss,
                 optimization_stage_dispatch=args.diagnose_optimization_stage_dispatch,
+                geometry_dispatch=args.diagnose_geometry_dispatch,
                 raw_implicit=getattr(problem.raw_block_stage, "implicit", None),
             )
             if (
@@ -783,6 +820,7 @@ def main() -> int:
                 or args.diagnose_support_reverse_dispatch
                 or args.diagnose_support_reverse_rss
                 or args.diagnose_optimization_stage_dispatch
+                or args.diagnose_geometry_dispatch
                 or args.diagnose_raw_solve_dispatch
                 or args.persistent_raw_solve_jit
                 or args.persistent_raw_params
@@ -814,6 +852,7 @@ def main() -> int:
         or args.diagnose_support_reverse_dispatch
         or args.diagnose_support_reverse_rss
         or args.diagnose_optimization_stage_dispatch
+        or args.diagnose_geometry_dispatch
         or args.diagnose_raw_solve_dispatch
         or args.persistent_raw_solve_jit
         or args.persistent_raw_params
@@ -836,6 +875,7 @@ def main() -> int:
                 support_reverse_dispatch=args.diagnose_support_reverse_dispatch,
                 support_reverse_rss=args.diagnose_support_reverse_rss,
                 optimization_stage_dispatch=args.diagnose_optimization_stage_dispatch,
+                geometry_dispatch=args.diagnose_geometry_dispatch,
                 raw_implicit=getattr(problem.raw_block_stage, "implicit", None),
             )
             for patcher in patchers:

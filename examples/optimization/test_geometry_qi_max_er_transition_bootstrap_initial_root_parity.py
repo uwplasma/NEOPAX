@@ -30,7 +30,10 @@ def _terms_for_objective_set(objective_set: str):
     for term in example.terms:
         objective = getattr(term[0], "objective", term[0])
         is_transport = objective.family == "transport"
-        if objective_set == "transport_er_only":
+        if objective_set == "geometry_only":
+            if not is_transport:
+                selected.append(term)
+        elif objective_set == "transport_er_only":
             if is_transport and objective.name != "bootstrap_current_softmax_abs_scaled":
                 selected.append(term)
         elif objective_set == "er_only":
@@ -76,6 +79,7 @@ def main() -> int:
             "optimization_payload_root_experiment",
             "optimization_payload_root_strict_experiment",
             "optimization_payload_root_scan_experiment",
+            "optimization_payload_root_scan_geometry_experiment",
             "optimization_payload_reverse_experiment",
         ),
         default="optimization",
@@ -83,7 +87,7 @@ def main() -> int:
     )
     parser.add_argument(
         "--objective-set",
-        choices=("all", "er_only", "transport_er_only"),
+        choices=("all", "er_only", "geometry_only", "transport_er_only"),
         default="all",
         help="Use the same row selection as the memory test.",
     )
@@ -123,6 +127,7 @@ def main() -> int:
         "optimization_payload_root_experiment",
         "optimization_payload_root_strict_experiment",
         "optimization_payload_root_scan_experiment",
+        "optimization_payload_root_scan_geometry_experiment",
         "optimization_payload_reverse_experiment",
     }:
         # The accepted persistent-root stage has the same equations and
