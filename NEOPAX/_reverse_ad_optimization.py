@@ -723,6 +723,24 @@ def _compact_bootstrap_current_root_objective_cotangent(
         fluxes=corrected_fluxes,
     )
     upar_bar = flux_bar["Upar_neo"]
+    joint_pullback_fn = (
+        None
+        if optimization_bootstrap_kernels is None
+        else optimization_bootstrap_kernels.bootstrap_joint_pullback
+    )
+    if joint_pullback_fn is not None:
+        _probe("before_bootstrap_joint_pullback")
+        state_bar, support_bar_leaves, geometry_bar = joint_pullback_fn(
+            rooted_state,
+            upar_bar,
+            baseline_geometry,
+            baseline_ntx_support,
+        )
+        _probe("after_bootstrap_joint_pullback")
+        _, support_treedef = jax.tree_util.tree_flatten(baseline_ntx_support)
+        support_bar = support_treedef.unflatten(tuple(support_bar_leaves))
+        return value, state_bar, geometry_bar, support_bar
+
     _probe("before_bootstrap_state_pullback")
     if optimization_bootstrap_kernels is None:
         state_bar = state_pullback_fn(rooted_state, upar_bar)

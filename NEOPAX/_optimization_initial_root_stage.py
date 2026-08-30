@@ -246,10 +246,12 @@ class InitialRootBootstrapKernelSet:
     bootstrap_state_pullback: Callable[..., Any]
     bootstrap_geometry_pullback: Callable[..., Any]
     bootstrap_support_pullback: Callable[..., Any]
+    bootstrap_joint_pullback: Callable[..., Any] | None
 
     def __post_init__(self) -> None:
         for field in dataclasses.fields(self):
-            if not callable(getattr(self, field.name)):
+            value = getattr(self, field.name)
+            if value is not None and not callable(value):
                 raise TypeError(f"{field.name} must be callable.")
 
 
@@ -300,11 +302,25 @@ def build_initial_root_bootstrap_kernels_optimization(
             rooted_state, upar_bar, support
         )
 
+    joint_pullback_fn = getattr(
+        neoclassical_model,
+        "pullback_momentum_corrected_upar_state_support_geometry_by_radius",
+        None,
+    )
+
+    def bootstrap_joint_pullback(rooted_state, upar_bar, geometry, support):
+        return _model_for_trial(geometry, support).pullback_momentum_corrected_upar_state_support_geometry_by_radius(
+            rooted_state, upar_bar, geometry, support
+        )
+
     return InitialRootBootstrapKernelSet(
         corrected_bootstrap_fluxes=corrected_bootstrap_fluxes,
         bootstrap_state_pullback=bootstrap_state_pullback,
         bootstrap_geometry_pullback=bootstrap_geometry_pullback,
         bootstrap_support_pullback=bootstrap_support_pullback,
+        bootstrap_joint_pullback=(
+            bootstrap_joint_pullback if callable(joint_pullback_fn) else None
+        ),
     )
 
 
