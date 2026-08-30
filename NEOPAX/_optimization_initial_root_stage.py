@@ -235,6 +235,80 @@ class PreparedInitialRootPayloadStage:
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
+class InitialRootBootstrapKernelSet:
+    """Stable corrected-bootstrap callbacks for one optimization stage.
+
+    Geometry, support, state, and cotangents are explicit arguments.  The
+    stage retains only the model structure, never data from a trial.
+    """
+
+    corrected_bootstrap_fluxes: Callable[..., Any]
+    bootstrap_state_pullback: Callable[..., Any]
+    bootstrap_geometry_pullback: Callable[..., Any]
+    bootstrap_support_pullback: Callable[..., Any]
+
+    def __post_init__(self) -> None:
+        for field in dataclasses.fields(self):
+            if not callable(getattr(self, field.name)):
+                raise TypeError(f"{field.name} must be callable.")
+
+
+def build_initial_root_bootstrap_kernels_optimization(
+    *,
+    neoclassical_model: Any,
+) -> InitialRootBootstrapKernelSet:
+    """Bind stable identities to the established corrected-bootstrap calls."""
+
+    if not dataclasses.is_dataclass(neoclassical_model):
+        raise TypeError(
+            "The optimization-only initial-root bootstrap adapters require a "
+            "dataclass neoclassical model."
+        )
+    required_methods = (
+        "evaluate_momentum_corrected_fluxes",
+        "pullback_momentum_corrected_upar_state_by_radius",
+        "pullback_momentum_corrected_upar_geometry_by_radius",
+        "pullback_momentum_corrected_upar_support_by_radius",
+    )
+    missing_methods = tuple(
+        name for name in required_methods if not callable(getattr(neoclassical_model, name, None))
+    )
+    if missing_methods:
+        raise TypeError(
+            "The optimization-only initial-root bootstrap adapters require corrected "
+            f"bootstrap callbacks; missing {missing_methods!r}."
+        )
+
+    def _model_for_trial(geometry, support):
+        return dataclasses.replace(neoclassical_model, geometry=geometry, support=support)
+
+    def corrected_bootstrap_fluxes(rooted_state, geometry, support):
+        return _model_for_trial(geometry, support).evaluate_momentum_corrected_fluxes(rooted_state)
+
+    def bootstrap_state_pullback(rooted_state, upar_bar, geometry, support):
+        return _model_for_trial(geometry, support).pullback_momentum_corrected_upar_state_by_radius(
+            rooted_state, upar_bar
+        )
+
+    def bootstrap_geometry_pullback(rooted_state, upar_bar, geometry, support):
+        return _model_for_trial(geometry, support).pullback_momentum_corrected_upar_geometry_by_radius(
+            rooted_state, upar_bar, geometry, support
+        )
+
+    def bootstrap_support_pullback(rooted_state, upar_bar, geometry, support):
+        return _model_for_trial(geometry, support).pullback_momentum_corrected_upar_support_by_radius(
+            rooted_state, upar_bar, support
+        )
+
+    return InitialRootBootstrapKernelSet(
+        corrected_bootstrap_fluxes=corrected_bootstrap_fluxes,
+        bootstrap_state_pullback=bootstrap_state_pullback,
+        bootstrap_geometry_pullback=bootstrap_geometry_pullback,
+        bootstrap_support_pullback=bootstrap_support_pullback,
+    )
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
 class InitialRootReverseKernelSet:
     """Stable identities for the measured initial-root reverse boundaries.
 
@@ -297,59 +371,9 @@ def build_initial_root_reverse_kernels_optimization(
     transformed argument tree and has not been shown to improve cache reuse.
     """
 
-    if not dataclasses.is_dataclass(neoclassical_model):
-        raise TypeError(
-            "The optimization-only initial-root adapters require a dataclass "
-            "neoclassical model so current geometry/support can be supplied "
-            "with dataclasses.replace."
-        )
-    required_methods = (
-        "evaluate_momentum_corrected_fluxes",
-        "pullback_momentum_corrected_upar_state_by_radius",
-        "pullback_momentum_corrected_upar_geometry_by_radius",
-        "pullback_momentum_corrected_upar_support_by_radius",
+    bootstrap_kernels = build_initial_root_bootstrap_kernels_optimization(
+        neoclassical_model=neoclassical_model
     )
-    missing_methods = tuple(
-        name for name in required_methods if not callable(getattr(neoclassical_model, name, None))
-    )
-    if missing_methods:
-        raise TypeError(
-            "The optimization-only initial-root adapters require corrected "
-            f"bootstrap callbacks; missing {missing_methods!r}."
-        )
-
-    def _model_for_trial(geometry, support):
-        return dataclasses.replace(
-            neoclassical_model,
-            geometry=geometry,
-            support=support,
-        )
-
-    def corrected_bootstrap_fluxes_optimization(rooted_state, geometry, support):
-        return _model_for_trial(geometry, support).evaluate_momentum_corrected_fluxes(
-            rooted_state
-        )
-
-    def bootstrap_state_pullback_optimization(rooted_state, upar_bar, geometry, support):
-        return _model_for_trial(geometry, support).pullback_momentum_corrected_upar_state_by_radius(
-            rooted_state,
-            upar_bar,
-        )
-
-    def bootstrap_geometry_pullback_optimization(rooted_state, upar_bar, geometry, support):
-        return _model_for_trial(geometry, support).pullback_momentum_corrected_upar_geometry_by_radius(
-            rooted_state,
-            upar_bar,
-            geometry,
-            support,
-        )
-
-    def bootstrap_support_pullback_optimization(rooted_state, upar_bar, geometry, support):
-        return _model_for_trial(geometry, support).pullback_momentum_corrected_upar_support_by_radius(
-            rooted_state,
-            upar_bar,
-            support,
-        )
 
     def root_geometry_residual_pullback_optimization(
         pre_root_state,
@@ -371,10 +395,10 @@ def build_initial_root_reverse_kernels_optimization(
         )
 
     return InitialRootReverseKernelSet(
-        corrected_bootstrap_fluxes=corrected_bootstrap_fluxes_optimization,
-        bootstrap_state_pullback=bootstrap_state_pullback_optimization,
-        bootstrap_geometry_pullback=bootstrap_geometry_pullback_optimization,
-        bootstrap_support_pullback=bootstrap_support_pullback_optimization,
+        corrected_bootstrap_fluxes=bootstrap_kernels.corrected_bootstrap_fluxes,
+        bootstrap_state_pullback=bootstrap_kernels.bootstrap_state_pullback,
+        bootstrap_geometry_pullback=bootstrap_kernels.bootstrap_geometry_pullback,
+        bootstrap_support_pullback=bootstrap_kernels.bootstrap_support_pullback,
         root_geometry_residual_pullback=root_geometry_residual_pullback_optimization,
     )
 

@@ -64,6 +64,8 @@ from ._reverse_ad_transport import (
 )
 from ._optimization_initial_root_stage import (
     InitialErTransportPayloadAdapter,
+    InitialRootBootstrapKernelSet,
+    build_initial_root_bootstrap_kernels_optimization,
     raw_block_dynamic_payload,
 )
 
@@ -675,33 +677,45 @@ def _compact_bootstrap_current_root_objective_cotangent(
     baseline_geometry,
     baseline_ntx_support,
     geometry_delta0,
+    optimization_bootstrap_kernels: InitialRootBootstrapKernelSet | None = None,
     dispatch_cache_probe=None,
 ):
     """Compact cotangent row for bootstrap current at the selected initial Er root."""
 
-    flux_model = getattr(getattr(runtime_for_geometry, "models", None), "flux", None)
-    neoclassical_model = getattr(flux_model, "neoclassical_model", flux_model)
-    corrected_fluxes_fn = getattr(neoclassical_model, "evaluate_momentum_corrected_fluxes", None)
-    state_pullback_fn = getattr(neoclassical_model, "pullback_momentum_corrected_upar_state_by_radius", None)
-    support_pullback_fn = getattr(neoclassical_model, "pullback_momentum_corrected_upar_support_by_radius", None)
-    geometry_pullback_fn = getattr(neoclassical_model, "pullback_momentum_corrected_upar_geometry_by_radius", None)
-    if not callable(corrected_fluxes_fn):
-        raise NotImplementedError(
-            "bootstrap_current_softmax_abs_scaled requires realtime NTX "
-            "evaluate_momentum_corrected_fluxes for compact root AD."
-        )
-    if not callable(state_pullback_fn) or not callable(support_pullback_fn) or not callable(geometry_pullback_fn):
-        raise NotImplementedError(
-            "bootstrap_current_softmax_abs_scaled requires compact corrected-Upar "
-            "state, geometry, and support pullbacks on the realtime NTX model."
-        )
+    if optimization_bootstrap_kernels is None:
+        flux_model = getattr(getattr(runtime_for_geometry, "models", None), "flux", None)
+        neoclassical_model = getattr(flux_model, "neoclassical_model", flux_model)
+        corrected_fluxes_fn = getattr(neoclassical_model, "evaluate_momentum_corrected_fluxes", None)
+        state_pullback_fn = getattr(neoclassical_model, "pullback_momentum_corrected_upar_state_by_radius", None)
+        support_pullback_fn = getattr(neoclassical_model, "pullback_momentum_corrected_upar_support_by_radius", None)
+        geometry_pullback_fn = getattr(neoclassical_model, "pullback_momentum_corrected_upar_geometry_by_radius", None)
+        if not callable(corrected_fluxes_fn):
+            raise NotImplementedError(
+                "bootstrap_current_softmax_abs_scaled requires realtime NTX "
+                "evaluate_momentum_corrected_fluxes for compact root AD."
+            )
+        if not callable(state_pullback_fn) or not callable(support_pullback_fn) or not callable(geometry_pullback_fn):
+            raise NotImplementedError(
+                "bootstrap_current_softmax_abs_scaled requires compact corrected-Upar "
+                "state, geometry, and support pullbacks on the realtime NTX model."
+            )
+    else:
+        corrected_fluxes_fn = optimization_bootstrap_kernels.corrected_bootstrap_fluxes
+        state_pullback_fn = optimization_bootstrap_kernels.bootstrap_state_pullback
+        geometry_pullback_fn = optimization_bootstrap_kernels.bootstrap_geometry_pullback
+        support_pullback_fn = optimization_bootstrap_kernels.bootstrap_support_pullback
 
     def _probe(label: str) -> None:
         if dispatch_cache_probe is not None:
             dispatch_cache_probe(str(label))
 
     _probe("before_bootstrap_corrected_fluxes")
-    corrected_fluxes = corrected_fluxes_fn(rooted_state)
+    if optimization_bootstrap_kernels is None:
+        corrected_fluxes = corrected_fluxes_fn(rooted_state)
+    else:
+        corrected_fluxes = corrected_fluxes_fn(
+            rooted_state, baseline_geometry, baseline_ntx_support
+        )
     _probe("after_bootstrap_corrected_fluxes")
     value, flux_bar = _bootstrap_current_softmax_abs_value_and_flux_bar(
         state=rooted_state,
@@ -710,13 +724,27 @@ def _compact_bootstrap_current_root_objective_cotangent(
     )
     upar_bar = flux_bar["Upar_neo"]
     _probe("before_bootstrap_state_pullback")
-    state_bar = state_pullback_fn(rooted_state, upar_bar)
+    if optimization_bootstrap_kernels is None:
+        state_bar = state_pullback_fn(rooted_state, upar_bar)
+    else:
+        state_bar = state_pullback_fn(
+            rooted_state, upar_bar, baseline_geometry, baseline_ntx_support
+        )
     _probe("after_bootstrap_state_pullback")
     _probe("before_bootstrap_geometry_pullback")
-    geometry_bar = geometry_pullback_fn(rooted_state, upar_bar, baseline_geometry, baseline_ntx_support)
+    geometry_bar = geometry_pullback_fn(
+        rooted_state, upar_bar, baseline_geometry, baseline_ntx_support
+    )
     _probe("after_bootstrap_geometry_pullback")
     _probe("before_bootstrap_ntx_support_pullback")
-    support_bar_leaves = support_pullback_fn(rooted_state, upar_bar, baseline_ntx_support)
+    if optimization_bootstrap_kernels is None:
+        support_bar_leaves = support_pullback_fn(
+            rooted_state, upar_bar, baseline_ntx_support
+        )
+    else:
+        support_bar_leaves = support_pullback_fn(
+            rooted_state, upar_bar, baseline_geometry, baseline_ntx_support
+        )
     _probe("after_bootstrap_ntx_support_pullback")
     _, support_treedef = jax.tree_util.tree_flatten(baseline_ntx_support)
     support_bar = support_treedef.unflatten(tuple(support_bar_leaves))
@@ -831,6 +859,7 @@ class InitialErTransportReverseStage:
     """
 
     payload_adapter: InitialErTransportPayloadAdapter
+    bootstrap_kernels: InitialRootBootstrapKernelSet | None
     selected_root: Callable[..., Any]
     selected_root_strict: Callable[..., Any]
     selected_root_per_radius: Callable[..., Any]
@@ -860,6 +889,23 @@ def build_initial_er_transport_reverse_stage(
         return runtime_with_ntx_support_payload(
             runtime_with_geometry, payload["ntx_support"]
         )
+
+    flux_model = getattr(getattr(runtime, "models", None), "flux", None)
+    neoclassical_model = getattr(flux_model, "neoclassical_model", flux_model)
+    bootstrap_method_names = (
+        "evaluate_momentum_corrected_fluxes",
+        "pullback_momentum_corrected_upar_state_by_radius",
+        "pullback_momentum_corrected_upar_geometry_by_radius",
+        "pullback_momentum_corrected_upar_support_by_radius",
+    )
+    bootstrap_kernels = (
+        build_initial_root_bootstrap_kernels_optimization(
+            neoclassical_model=neoclassical_model
+        )
+        if dataclasses.is_dataclass(neoclassical_model)
+        and all(callable(getattr(neoclassical_model, name, None)) for name in bootstrap_method_names)
+        else None
+    )
 
     def _state_pullback(state, er_profile, residual_bars, geometry_leaves, support_leaves):
         return compact_initial_er_state_pullback(
@@ -1003,34 +1049,32 @@ def build_initial_er_transport_reverse_stage(
         finite_mask = jnp.isfinite(best_roots)
         return jnp.where(finite_mask, best_roots, state.Er), finite_mask
 
+    def _residual_er_derivative_scan_body(carry, radius_index):
+        state, er_profile, geometry_leaves, support_leaves = carry
+        runtime_current = _runtime_from_leaves(geometry_leaves, support_leaves)
+        charge_qp = jnp.asarray(runtime_current.species.charge_qp)
+
+        def _residual_i_er(er_value):
+            er_eval = er_profile.at[radius_index].set(er_value)
+            state_with_er = dataclasses.replace(state, Er=er_eval)
+            local_particle_flux = runtime_current.models.flux.build_local_particle_flux_evaluator(
+                state_with_er
+            )
+            if local_particle_flux is None:
+                raise ValueError("Initial-Er root AD requires a local particle-flux evaluator.")
+            gamma = local_particle_flux(radius_index, er_value)
+            return jnp.sum(charge_qp * gamma)
+
+        derivative = jax.grad(_residual_i_er)(er_profile[radius_index])
+        return carry, derivative
+
     def _residual_er_derivative_scan(state, er_profile, geometry_leaves, support_leaves):
         """Exact persistent scan form of the benchmark local Er derivative."""
 
-        runtime_current = _runtime_from_leaves(geometry_leaves, support_leaves)
-        charge_qp = jnp.asarray(runtime_current.species.charge_qp)
-        # The local evaluator itself replaces ``state.Er[radius_index]`` by
-        # its scalar argument.  Building it once from the selected profile is
-        # therefore algebraically identical to rebuilding it inside every
-        # scalar derivative, while keeping its nested NTX solver identity
-        # bounded for this optimization-only stage.
-        state_with_er = dataclasses.replace(state, Er=er_profile)
-        local_particle_flux = runtime_current.models.flux.build_local_particle_flux_evaluator(
-            state_with_er
-        )
-        if local_particle_flux is None:
-            raise ValueError("Initial-Er root AD requires a local particle-flux evaluator.")
-        def _body(carry, radius_index):
-            def _residual_i_er(er_value):
-                gamma = local_particle_flux(radius_index, er_value)
-                return jnp.sum(charge_qp * gamma)
-
-            derivative = jax.grad(_residual_i_er)(er_profile[radius_index])
-            return carry, derivative
-
         radius_indices = jnp.arange(er_profile.shape[0], dtype=jnp.int32)
         _, derivatives = jax.lax.scan(
-            _body,
-            None,
+            _residual_er_derivative_scan_body,
+            (state, er_profile, geometry_leaves, support_leaves),
             radius_indices,
         )
         return derivatives
@@ -1089,6 +1133,7 @@ def build_initial_er_transport_reverse_stage(
 
     return InitialErTransportReverseStage(
         payload_adapter=payload_adapter,
+        bootstrap_kernels=bootstrap_kernels,
         selected_root=jax.jit(_selected_root, inline=False),
         # The ordinary root experiment showed that this boundary saves a
         # further cache entry, but its compiled reductions perturbed the
@@ -2244,6 +2289,11 @@ def _optimization_root_to_payload_cotangents(
             baseline_geometry=baseline_geometry,
             baseline_ntx_support=baseline_ntx_support,
             geometry_delta0=geometry_delta0,
+            optimization_bootstrap_kernels=(
+                None
+                if transport_reverse_stage is None
+                else transport_reverse_stage.bootstrap_kernels
+            ),
         )
 
     objective_value_rows = []
