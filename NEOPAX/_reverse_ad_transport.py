@@ -3563,6 +3563,11 @@ def prepare_realtime_geometry_support_segment_core_setup(
             "reverse_final_objective_cotangent_mode",
             "scalar",
         ),
+        reverse_bootstrap_cotangent_mode=getattr(
+            args,
+            "reverse_bootstrap_cotangent_mode",
+            "separate",
+        ),
         reverse_stage_cotangent_mode=support_probe_cotangent_mode,
         reverse_step_bwd_mode=args.reverse_step_bwd_mode,
         reverse_stage_adjoint_memory_mode=args.reverse_stage_adjoint_memory_mode,

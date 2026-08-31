@@ -2219,6 +2219,15 @@ def _prepare_reverse_static_setup(
     reverse_stage_adjoint_solve_mode: str = "structured",
     reverse_rhs_transpose_mode: str = "generic",
     reverse_rhs_pullback_mode: str = "separate",
+    reverse_initial_cache_support_pullback_mode: str = "scalar",
+    reverse_rebuild_support_pullback_mode: str = "separate",
+    reverse_segment_jit_diagnostics: bool = False,
+    reverse_segment_input_diagnostics: bool = False,
+    reverse_rebuild_component_timing: bool = False,
+    reverse_phase_timing_diagnostics: bool = False,
+    reverse_segment_profile_annotations: bool = False,
+    reverse_segment_start_replay_mode: str = "legacy",
+    reverse_segment_primal_record_mode: str = "reconstruct",
     reverse_final_objective_cotangent_mode: str = "scalar",
     reverse_bootstrap_cotangent_mode: str = "separate",
     reverse_stage_cotangent_mode: str = "full",
@@ -2260,6 +2269,25 @@ def _prepare_reverse_static_setup(
                 reverse_stage_adjoint_solve_mode=str(reverse_stage_adjoint_solve_mode),
                 reverse_rhs_transpose_mode=str(reverse_rhs_transpose_mode),
                 reverse_rhs_pullback_mode=str(reverse_rhs_pullback_mode),
+                reverse_initial_cache_support_pullback_mode=str(
+                    reverse_initial_cache_support_pullback_mode
+                ),
+                reverse_rebuild_support_pullback_mode=str(
+                    reverse_rebuild_support_pullback_mode
+                ),
+                reverse_segment_jit_diagnostics=bool(reverse_segment_jit_diagnostics),
+                reverse_segment_input_diagnostics=bool(reverse_segment_input_diagnostics),
+                reverse_rebuild_component_timing=bool(reverse_rebuild_component_timing),
+                reverse_phase_timing_diagnostics=bool(reverse_phase_timing_diagnostics),
+                reverse_segment_profile_annotations=bool(
+                    reverse_segment_profile_annotations
+                ),
+                reverse_segment_start_replay_mode=str(
+                    reverse_segment_start_replay_mode
+                ),
+                reverse_segment_primal_record_mode=str(
+                    reverse_segment_primal_record_mode
+                ),
                 reverse_final_objective_cotangent_mode=str(
                     reverse_final_objective_cotangent_mode
                 ),

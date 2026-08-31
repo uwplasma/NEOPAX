@@ -1550,6 +1550,11 @@ def test_reverse_setup_selects_live_scan_payload_without_exact_support_lookup():
         reverse_stage_adjoint_iter_tol=1.0e-8,
         reverse_rebuild_support_pullback_mode="separate",
         reverse_initial_cache_support_pullback_mode="scalar",
+        reverse_segment_input_diagnostics=True,
+        reverse_segment_start_replay_mode="minimal",
+        reverse_segment_primal_record_mode="reuse_segment_primal_record",
+        reverse_final_objective_cotangent_mode="scalar",
+        reverse_bootstrap_cotangent_mode="joint_local_vjp_upar_only",
     )
     captured = {}
 
@@ -1570,6 +1575,11 @@ def test_reverse_setup_selects_live_scan_payload_without_exact_support_lookup():
     assert setup.payload_kind == "ntx_scan_runtime"
     assert set(setup.support_payload) == {"geometry", "channels", "surfaces"}
     assert captured["runtime"] is runtime
+    assert captured["reverse_initial_cache_support_pullback_mode"] == "scalar"
+    assert captured["reverse_rebuild_support_pullback_mode"] == "separate"
+    assert captured["reverse_segment_start_replay_mode"] == "minimal"
+    assert captured["reverse_segment_primal_record_mode"] == "reuse_segment_primal_record"
+    assert captured["reverse_bootstrap_cotangent_mode"] == "joint_local_vjp_upar_only"
 
 
 def test_payload_transpose_forwards_live_scan_contract(monkeypatch):
