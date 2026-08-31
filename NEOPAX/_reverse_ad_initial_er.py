@@ -16,15 +16,12 @@ from ._transport_flux_models import (
     NTXRuntimeScanTransportModel,
     _add_float_delta_tree,
     _collisionality_kind,
-    _extract_right_constraints,
     _float_delta_tree_like,
+    build_evaluated_transport_state,
     get_Thermodynamical_Forces_A1,
     get_Thermodynamical_Forces_A2,
     get_Thermodynamical_Forces_A3,
-    get_gradient_density,
-    get_gradient_temperature,
     get_v_thermal,
-    safe_density,
 )
 
 
@@ -504,40 +501,29 @@ def compact_initial_er_ntx_support_pullback_leaves(
             f"residual_bars.shape={residual_bars.shape}, er_profile.shape={er_profile.shape}."
         )
     objective_count = int(residual_bars.shape[0])
-    density = safe_density(state.density)
-    temperature = state.temperature
+    # Match ``NTXExactLijRuntimeTransportModel.build_local_particle_flux_evaluator``
+    # exactly.  In particular, the wHe initial state has an inactive He
+    # density at its configured floor.  The compact rule previously used the
+    # global default floor and manually reconstructed gradients, whereas the
+    # primal evaluator uses this model's configured floors, fixed-species
+    # projection, and boundary treatment.  That mismatch made the compact
+    # drds transpose nonfinite although the primal root residual was finite.
+    evaluated = build_evaluated_transport_state(
+        state,
+        model.geometry,
+        bc_density=model.bc_density,
+        bc_temperature=model.bc_temperature,
+        density_floor=model.density_floor,
+        temperature_floor=model.temperature_floor,
+    )
+    density = evaluated.center.density
+    temperature = evaluated.center.temperature
     v_thermal = get_v_thermal(model.species.mass, temperature)
     species_indices = jnp.arange(int(model.species.number_species), dtype=jnp.int32)
     charge_qp = jnp.asarray(runtime.species.charge_qp, dtype=state.Er.dtype)
     collisionality_kind = _collisionality_kind(model.collisionality_model)
-    density_right_constraint, density_right_grad_constraint = _extract_right_constraints(
-        model.bc_density,
-        density,
-    )
-    temperature_right_constraint, temperature_right_grad_constraint = _extract_right_constraints(
-        model.bc_temperature,
-        temperature,
-    )
-    dndr_all = jax.vmap(
-        lambda density_a, right_value, right_grad: get_gradient_density(
-            density_a,
-            model.geometry.r_grid,
-            model.geometry.r_grid_half,
-            model.geometry.dr,
-            right_face_constraint=right_value,
-            right_face_grad_constraint=right_grad,
-        )
-    )(density, density_right_constraint, density_right_grad_constraint)
-    dTdr_all = jax.vmap(
-        lambda temperature_a, right_value, right_grad: get_gradient_temperature(
-            temperature_a,
-            model.geometry.r_grid,
-            model.geometry.r_grid_half,
-            model.geometry.dr,
-            right_face_constraint=right_value,
-            right_face_grad_constraint=right_grad,
-        )
-    )(temperature, temperature_right_constraint, temperature_right_grad_constraint)
+    dndr_all = evaluated.density_grad_center
+    dTdr_all = evaluated.temperature_grad_center
 
     radius_indices = jnp.arange(er_profile.shape[0], dtype=jnp.int32)
 
