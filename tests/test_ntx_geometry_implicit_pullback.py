@@ -17,7 +17,11 @@ from NEOPAX._transport_flux_models import (
     NTXRuntimeScanChannels,
     _sanitize_float_delta_bar_tree,
 )
-from NEOPAX._neoclassical import _collisionality_kind, get_Matrix
+from NEOPAX._neoclassical import (
+    _collisionality_kind,
+    get_Matrix,
+    get_corrected_fluxes,
+)
 from NEOPAX._energy_grid_models import StandardLaguerreEnergyGrid
 from NEOPAX._species import Species
 from NEOPAX._state import TransportState, get_v_thermal
@@ -150,6 +154,43 @@ def test_momentum_correction_matrix_is_square_for_four_species():
 
     assert rows.shape == (n_species, 3, n_species * 3)
     assert matrix.shape == (n_species * 3, n_species * 3)
+
+
+def test_momentum_corrected_fluxes_accept_four_collision_species():
+    """Each correction contribution is evaluated for one collision species.
+
+    This is the second half of the wHe (four-species) bootstrap contract:
+    the correction vector has three Sonine entries, while the outer vmap is
+    over the four collision-species indices.
+    """
+
+    n_species = 4
+    geometry = _TestMomentumGeometry(
+        a_b=jnp.asarray(1.0),
+        r_grid=jnp.asarray([0.5]),
+        r_grid_half=jnp.asarray([0.25, 0.75]),
+        Bsqav=jnp.asarray([1.2]),
+    )
+    grid = StandardLaguerreEnergyGrid(n_x=2)
+    lij = jnp.reshape(jnp.linspace(0.1, 1.5, 15), (5, 3))
+    eij = jnp.reshape(jnp.linspace(0.2, 0.8, 15), (5, 3))
+    cm_ab = jnp.ones((n_species, n_species, 3, 3), dtype=jnp.float64)
+    cn_ab = 0.2 * jnp.ones((n_species, n_species, 3, 3), dtype=jnp.float64)
+    tau = jnp.ones((n_species, n_species), dtype=jnp.float64)
+    correction = jnp.reshape(jnp.linspace(0.01, 0.12, 12), (n_species, 3))
+    v_thermal = jnp.ones((n_species, 1), dtype=jnp.float64)
+    density = jnp.ones((n_species, 1), dtype=jnp.float64)
+    temperature = 2.0 * jnp.ones((n_species, 1), dtype=jnp.float64)
+    gradients = 0.1 * jnp.ones((n_species, 1), dtype=jnp.float64)
+
+    outputs = get_corrected_fluxes(
+        grid, geometry, jnp.asarray(0, dtype=jnp.int32), 0,
+        lij, eij, jnp.ones(3), cm_ab, cn_ab, tau, correction,
+        v_thermal, density, temperature, gradients, gradients,
+        jnp.ones(1), jnp.asarray([-1.0, 1.0, 1.0, 2.0]), gradients, gradients,
+    )
+
+    assert all(bool(jnp.all(jnp.isfinite(value))) for value in outputs)
 
 
 def _small_runtime_model(n_energy=1):

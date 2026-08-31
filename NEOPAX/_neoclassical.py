@@ -788,7 +788,10 @@ def get_corrected_fluxes(grid, field, a, r_index, Lij, Eij, nu_av, CM_ab, CN_ab,
     # get vector for correction
     M, add1, add2, add3, add4 = jax.vmap(
         get_correction_matrix,
-        in_axes=(None, None, None, 0, None, None, None, None, None, None, None, None, None, None, None, None, None)
+        # Vectorize over collision species ``b``.  Mapping ``coeff`` instead
+        # happened to broadcast for three species, but passed a length-four
+        # correction vector into the 3-Sonine matvec in the wHe case.
+        in_axes=(None, None, 0, None, None, None, None, None, None, None, None, None, None, None, None, None, None)
     )(
         grid, a, jnp.arange(density.shape[0]), coeff, nucoeff, CM_ab, CN_ab, sum, tau, factor, correction, r_index,
         dndr, dTdr, temperature, density, charge
