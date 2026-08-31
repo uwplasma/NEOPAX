@@ -3558,8 +3558,7 @@ def geometry_full_ad_objective_table_pullback_from_param_vector(
     requested_names = () if requested_objective_names is None else tuple(
         str(name).strip() for name in requested_objective_names
     )
-    if "vmec_dmerc_stability_softmax" in requested_names:
-        raise _vmec_dmerc_unavailable_error()
+    include_dmerc = "vmec_dmerc_stability_softmax" in requested_names
 
     phase_start = time.perf_counter()
 
@@ -3690,11 +3689,16 @@ def geometry_full_ad_objective_table_pullback_from_param_vector(
         "magnetic_well",
         "mirror_ratio",
         "beta_volume",
-    )
+    ) + (("dmerc_stability_softmax",) if include_dmerc else ())
     vmec_indices = tuple(names.index(f"vmec_{name}") for name in vmec_names)
 
     def vmec_vector(state_inner):
         values = _vmec_core_scalar_objectives_from_state(context, state_inner)
+        if include_dmerc:
+            values = dict(values)
+            values["dmerc_stability_softmax"] = (
+                vmec_mercier_stability_softmax_objective_from_state(context, state_inner)
+            )
         return jnp.stack([jnp.asarray(values[name], dtype=jnp.float64).reshape(()) for name in vmec_names])
 
     vmec_values, vmec_state_pullback = jax.vjp(vmec_vector, state)

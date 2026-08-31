@@ -21,10 +21,14 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 import optimize_geometry_qi_max_er_transition_bootstrap_initial_root as example  # noqa: E402
+from NEOPAX import optimization as opt  # noqa: E402
 
 
 def _terms_for_objective_set(objective_set: str):
     """Match the memory harness's row selection for an exact parity check."""
+
+    if objective_set == "dmerc_only":
+        return [(opt.geometry.vmec_dmerc_stability_softmax, 0.0, 1.0)]
 
     selected = []
     for term in example.terms:
@@ -87,9 +91,9 @@ def main() -> int:
     )
     parser.add_argument(
         "--objective-set",
-        choices=("all", "er_only", "geometry_only", "transport_er_only"),
+        choices=("all", "er_only", "geometry_only", "transport_er_only", "dmerc_only"),
         default="all",
-        help="Use the same row selection as the memory test.",
+        help="Use the same row selection as the memory test, including the pure-JAX DMerc softmax row.",
     )
     args = parser.parse_args()
     if not np.isscalar(example.MAX_MODE_SCHEDULE):

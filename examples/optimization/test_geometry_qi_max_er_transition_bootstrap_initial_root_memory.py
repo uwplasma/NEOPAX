@@ -46,6 +46,9 @@ DEFAULT_REPEATS = 8
 def _terms_for_objective_set(objective_set: str):
     """Select exactly one geometry/initial-root reverse branch for attribution."""
 
+    if objective_set == "dmerc_only":
+        return [(opt.geometry.vmec_dmerc_stability_softmax, 0.0, 1.0)]
+
     selected = []
     for term in example.terms:
         objective = getattr(term[0], "objective", term[0])
@@ -474,11 +477,12 @@ def main() -> int:
             "bootstrap_only",
             "geometry_only",
             "transport_er_only",
+            "dmerc_only",
         ),
         default="all",
         help=(
             "Select all rows; geometry plus Er-only or bootstrap-only rows; or exactly "
-            "geometry-only / Er-transport-only rows for memory attribution."
+            "geometry-only / Er-transport-only / DMerc-only rows for memory attribution."
         ),
     )
     parser.add_argument("--warmup", type=int, default=DEFAULT_WARMUP)
