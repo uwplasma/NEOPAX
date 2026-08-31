@@ -75,14 +75,15 @@ therefore conservative at that displayed precision.
 | `alpha_power_volume_average_mw_m3` | 2.784006908e-01 | 2.784007000e-01 | 9.225e-09 | 3.314e-08 | -4.131147899e-01 | -4.131148000e-01 | 1.007e-08 | 2.438e-08 |
 | `bootstrap_current_softmax_abs_scaled` | -1.159988826e-03 | -1.159535000e-03 | 4.538e-07 | 3.912e-04 | -3.524600220e+00 | -3.524605000e+00 | 4.780e-06 | 1.356e-06 |
 
-## RBC:1:0 frozen-geometry FD diagnostic
+## RBC:1:0 frozen-geometry FD validation
 
-This run used `geometry-fd-lane=frozen_linearized` and the frozen initial-Er
-root lane. Unlike the two profile-direction validations above, its reported
-primal transport values do **not** equal the reverse benchmark baseline.
-Consequently this table is an audit record, not a reverse-AD validation: the
-geometry-FD baseline construction must be reconciled before interpreting its
-derivative errors as an AD error.
+The earlier frozen-geometry FD implementation used an implicit-VMEC primal
+state while reverse AD used the configured forward-VMEC state. Its historical
+results are retained below only as an audit record. The corrected lane now
+uses the forward state as its zero point and obtains only the raw-block
+tangent/structural mask from the implicit system.
+
+### Historical, misaligned baseline (superseded)
 
 | objective | primal abs. mismatch | primal rel. mismatch | reverse AD | frozen geometry FD | abs. error | rel. error |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
@@ -96,3 +97,23 @@ derivative errors as an AD error.
 | `total_pressure_volume_average` | 4.208e-04 | 1.230e-05 | -7.263592449e-02 | -7.309052000e-02 | 4.546e-04 | 6.259e-03 |
 | `alpha_power_volume_average_mw_m3` | 1.707e-05 | 2.897e-05 | -1.155935849e-02 | -1.259516000e-02 | 1.036e-03 | 8.961e-02 |
 | `bootstrap_current_softmax_abs_scaled` | 3.043e-04 | 2.100e-04 | -1.772347606e+00 | -1.768463000e+00 | 3.885e-03 | 2.192e-03 |
+
+### Corrected forward-state baseline
+
+The corrected FD primal values agree with the reverse benchmark baseline to
+at worst `1.1e-08` relative (`Er2_volume_average`); all other primal relative
+mismatches are below `3.6e-09`. The FD values below are printed to six decimal
+places, so the listed errors are conservative at that precision.
+
+| objective | reverse AD d/RBC:1:0 | corrected frozen FD | abs. error | rel. error |
+| --- | ---: | ---: | ---: | ---: |
+| `softmax_Er` | -5.154810523e+01 | -5.154823000e+01 | 1.248e-04 | 2.420e-06 |
+| `net_total_power_volume_average_mw_m3` | -1.139421760e-02 | -1.139414000e-02 | 7.760e-08 | 6.810e-06 |
+| `Er_transition_left` | -2.031208973e+01 | -2.031183000e+01 | 2.597e-04 | 1.279e-05 |
+| `Er_transition_right` | -2.250572114e+01 | -2.250562000e+01 | 1.011e-04 | 4.494e-06 |
+| `Er2_volume_average` | -7.368603713e+02 | -7.404802000e+02 | 3.620e+00 | 4.913e-03 |
+| `Er_volume_average` | -4.059681295e+00 | -3.995130000e+00 | 6.455e-02 | 1.590e-02 |
+| `electron_temperature_volume_average_keV` | -1.325461832e-02 | -1.353714000e-02 | 2.825e-04 | 2.132e-02 |
+| `total_pressure_volume_average` | -7.263592449e-02 | -7.300137000e-02 | 3.654e-04 | 5.031e-03 |
+| `alpha_power_volume_average_mw_m3` | -1.155935849e-02 | -1.155964000e-02 | 2.815e-07 | 2.435e-05 |
+| `bootstrap_current_softmax_abs_scaled` | -1.772347606e+00 | -1.772034000e+00 | 3.136e-04 | 1.769e-04 |

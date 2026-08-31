@@ -750,7 +750,16 @@ def get_Matrix(grid, field, a, r_index, Lij, Eij, CM_ab, CN_ab, tau, v_thermal):
     #Get a 3x3 for each species
     M = jax.vmap(get_A_matrix, in_axes=(None, None, 0, None, None, None, None, None, None, None, None))(
         grid, a, jnp.arange(v_thermal.shape[0]), coeff, nucoeff, CN_ab, sum, tau, v_thermal, field, r_index)
-    M = jax.lax.reshape(M, (M.shape[0], M.shape[1] * M.shape[2]), (1, 0, 2))
+    # ``M`` is indexed as (collision species, Sonine row, Sonine column).
+    # Keep the Sonine row as the output row and concatenate the collision
+    # species/Sonine-column block into the output column.  The previous target
+    # shape used ``M.shape[0]`` for the row count, which happened to be correct
+    # only for three kinetic species; four-species (wHe) runs then produced a
+    # 16x12 operator for a length-12 RHS.
+    M = jnp.reshape(
+        jnp.transpose(M, (1, 0, 2)),
+        (M.shape[1], M.shape[0] * M.shape[2]),
+    )
     return M
 
 
