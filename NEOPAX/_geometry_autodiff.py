@@ -3515,6 +3515,7 @@ def geometry_full_ad_objective_table_pullback_from_param_vector(
     raw_block_transpose_optimization_stage: GeometryRawBlockTransposeOptimizationStage | None = None,
     return_state_bars: bool = False,
     dispatch_cache_probe=None,
+    requested_objective_names: Sequence[str] | None = None,
 ) -> tuple[dict[str, jnp.ndarray], object]:
     """Return geometry objective values and objective cotangents.
 
@@ -3553,6 +3554,12 @@ def geometry_full_ad_objective_table_pullback_from_param_vector(
             f"Expected objective cotangents with {len(names)} columns for geometry_full_ad_objectives; "
             f"got {int(cotangents.shape[1])}."
         )
+
+    requested_names = () if requested_objective_names is None else tuple(
+        str(name).strip() for name in requested_objective_names
+    )
+    if "vmec_dmerc_stability_softmax" in requested_names:
+        raise _vmec_dmerc_unavailable_error()
 
     phase_start = time.perf_counter()
 
@@ -3683,16 +3690,11 @@ def geometry_full_ad_objective_table_pullback_from_param_vector(
         "magnetic_well",
         "mirror_ratio",
         "beta_volume",
-        "dmerc_stability_softmax",
     )
     vmec_indices = tuple(names.index(f"vmec_{name}") for name in vmec_names)
 
     def vmec_vector(state_inner):
         values = _vmec_core_scalar_objectives_from_state(context, state_inner)
-        values = dict(values)
-        values["dmerc_stability_softmax"] = (
-            vmec_mercier_stability_softmax_objective_from_state(context, state_inner)
-        )
         return jnp.stack([jnp.asarray(values[name], dtype=jnp.float64).reshape(()) for name in vmec_names])
 
     vmec_values, vmec_state_pullback = jax.vjp(vmec_vector, state)
