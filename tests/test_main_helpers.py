@@ -1340,6 +1340,10 @@ def test_build_flux_model_passes_runtime_ntx_exact_lij_inputs(
                 "ntx_exact_n_zeta": 21,
                 "ntx_exact_n_xi": 48,
             },
+            "transport_solver": {
+                "density_floor": 2.5e-6,
+                "temperature_floor": 7.5e-6,
+            },
             "transport_flux": {"center_flux_mode": center_flux_mode},
             "turbulence": {"flux_model": "none"},
             "classical": {"flux_model": "none"},
@@ -1355,6 +1359,8 @@ def test_build_flux_model_passes_runtime_ntx_exact_lij_inputs(
     assert captured["ntx_exact_lij_runtime"]["kwargs"]["vmec_file"] == "wout.nc"
     assert captured["ntx_exact_lij_runtime"]["kwargs"]["boozer_file"] == "boozmn.nc"
     assert captured["ntx_exact_lij_runtime"]["kwargs"]["ntx_exact_n_theta"] == 19
+    assert captured["ntx_exact_lij_runtime"]["kwargs"]["density_floor"] == 2.5e-6
+    assert captured["ntx_exact_lij_runtime"]["kwargs"]["temperature_floor"] == 7.5e-6
     assert (
         captured["ntx_exact_lij_runtime"]["kwargs"]["ntx_exact_center_response_mode"]
         == expected_exact_mode

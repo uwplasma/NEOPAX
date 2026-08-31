@@ -592,8 +592,17 @@ def _build_flux_model(config: dict, species, energy_grid, geometry, database, so
         runtime_kwargs.setdefault("collisionality_model", neoclassical_cfg.get("collisionality_model", "default"))
         runtime_kwargs.setdefault("bc_density", bc_density)
         runtime_kwargs.setdefault("bc_temperature", bc_temperature)
-        runtime_kwargs.setdefault("density_floor", neoclassical_cfg.get("density_floor", 1.0e-6))
-        runtime_kwargs.setdefault("temperature_floor", neoclassical_cfg.get("temperature_floor"))
+        # The NTX runtime model evaluates its own state reconstruction for the
+        # momentum-correction/bootstrap objective.  Use the transport-solver
+        # floors unless the neoclassical block explicitly overrides them.
+        runtime_kwargs.setdefault(
+            "density_floor",
+            neoclassical_cfg.get("density_floor", solver_cfg.get("density_floor", 1.0e-6)),
+        )
+        runtime_kwargs.setdefault(
+            "temperature_floor",
+            neoclassical_cfg.get("temperature_floor", solver_cfg.get("temperature_floor")),
+        )
         if neoclassical_name == "ntx_exact_lij_runtime":
             runtime_kwargs.setdefault("preload_support", True)
             # The exact model retains two internal response primitives, but
