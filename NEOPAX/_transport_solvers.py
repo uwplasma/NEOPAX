@@ -1944,7 +1944,17 @@ def _lagged_response_global_reuse_metric(
         )
     if norm == "max":
         scale = atol + rtol * jnp.maximum(jnp.abs(reference_flat), jnp.abs(current_flat))
-        return jnp.max(jnp.abs(delta_flat) / scale)
+        # A zero absolute and relative tolerance is a useful strict test mode:
+        # only exactly unchanged components may be reused. Avoid ``0 / 0`` for
+        # those components, while any nonzero change gets an infinite metric.
+        safe_scale = jnp.where(scale > 0, scale, jnp.ones_like(scale))
+        scaled_delta = jnp.abs(delta_flat) / safe_scale
+        scaled_delta = jnp.where(
+            scale > 0,
+            scaled_delta,
+            jnp.where(jnp.abs(delta_flat) == 0, jnp.zeros_like(scaled_delta), jnp.full_like(scaled_delta, jnp.inf)),
+        )
+        return jnp.max(scaled_delta)
     raise ValueError(f"Unsupported lagged-response drift norm '{norm}'.")
 
 
@@ -21122,7 +21132,12 @@ def _theta_newton_accepted_step_attempt(
         lagged_response_valid_out=jnp.asarray(
             use_transport_lagged_response and _lagged_response_reuse_uses_global_drift(lagged_response_reuse_mode)
         ),
-        lagged_reference_y_out=flat_y,
+        # The response can have been globally reused from an older accepted
+        # state. Preserve its actual anchor: recording ``flat_y`` here would
+        # make the next drift check measure from a state at which this cache
+        # was never constructed, allowing cumulative reuse. Radau maintains
+        # the same cache/anchor invariant in its accepted-step carry.
+        lagged_reference_y_out=attempt_context.lagged_reference_y,
         jacobian_out=frozen_system,
         cache_valid_out=jnp.asarray(True),
         cache_dt_out=h_value,

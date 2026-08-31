@@ -1,3 +1,4 @@
+import dataclasses
 import types
 
 import jax.numpy as jnp
@@ -56,6 +57,125 @@ def test_lagged_response_global_state_drift_max_uses_componentwise_max_norm():
         "global_state_drift_max"
     )
     assert transport_solvers._lagged_response_drift_norm("global_state_drift_max") == "max"
+    assert float(
+        transport_solvers._lagged_response_global_reuse_metric(
+            reference, reference, atol=0.0, rtol=0.0, norm="max"
+        )
+    ) == 0.0
+    assert bool(
+        jnp.isinf(
+            transport_solvers._lagged_response_global_reuse_metric(
+                current, reference, atol=0.0, rtol=0.0, norm="max"
+            )
+        )
+    )
+
+
+def test_theta_global_max_rebuilds_at_new_accepted_step_start():
+    """A tight global-max threshold cannot accidentally retain the old anchor."""
+
+    state_dim = 1
+    dtype = jnp.float64
+    step_state = transport_solvers._theta_initial_step_state(
+        jnp.asarray(0.1, dtype=dtype),
+        jnp.asarray([1.0], dtype=dtype),
+        jnp.asarray(0.01, dtype=dtype),
+        state_dim,
+        dtype,
+        lagged_response_cache=jnp.asarray([0.0], dtype=dtype),
+        lagged_response_valid=True,
+    )
+    step_state = dataclasses.replace(
+        step_state,
+        reuse_state=dataclasses.replace(
+            step_state.reuse_state,
+            lagged_reference_y=jnp.asarray([0.0], dtype=dtype),
+        ),
+    )
+
+    response, reference, reused = transport_solvers._theta_prepare_lagged_response(
+        step_state,
+        use_transport_lagged_response=True,
+        lagged_response_reuse_mode="global_state_drift_max",
+        lagged_response_reuse_rtol=1.0e-7,
+        lagged_response_reuse_atol=1.0e-8,
+        unpack_flat=lambda value: value,
+        project_flat=None,
+        build_lagged_response=lambda value: 10.0 * value,
+    )
+
+    assert not bool(reused)
+    assert jnp.array_equal(reference, jnp.asarray([1.0], dtype=dtype))
+    assert jnp.array_equal(response, jnp.asarray([10.0], dtype=dtype))
+
+
+def test_theta_preserves_actual_anchor_after_global_response_reuse():
+    """The cache anchor must not drift forward when the response is reused."""
+
+    dtype = jnp.float32
+    identity = jnp.eye(1, dtype=dtype)
+    step_state = transport_solvers._theta_initial_step_state(
+        jnp.asarray(0.1, dtype=dtype),
+        jnp.asarray([0.05], dtype=dtype),
+        jnp.asarray(0.01, dtype=dtype),
+        1,
+        dtype,
+        lagged_response_cache=jnp.asarray([0.0], dtype=dtype),
+        lagged_response_valid=True,
+    )
+    step_state = dataclasses.replace(
+        step_state,
+        reuse_state=dataclasses.replace(
+            step_state.reuse_state,
+            lagged_reference_y=jnp.asarray([0.0], dtype=dtype),
+        ),
+    )
+    response, reference, reused = transport_solvers._theta_prepare_lagged_response(
+        step_state,
+        use_transport_lagged_response=True,
+        lagged_response_reuse_mode="global_state_drift_max",
+        lagged_response_reuse_rtol=0.0,
+        lagged_response_reuse_atol=0.1,
+        unpack_flat=lambda value: value,
+        project_flat=None,
+        build_lagged_response=lambda value: value,
+    )
+    context = transport_solvers._ThetaAttemptContext(
+        t=jnp.asarray(0.1, dtype=dtype),
+        y=step_state.y,
+        trial_dt=jnp.asarray(0.01, dtype=dtype),
+        t_new=jnp.asarray(0.11, dtype=dtype),
+        f_old=step_state.y * step_state.y,
+        lagged_response=response,
+        lagged_reference_y=reference,
+        lagged_response_reused=reused,
+        reuse_state=step_state.reuse_state,
+    )
+    result = transport_solvers._theta_newton_accepted_step_attempt(
+        context,
+        predictor_mode="euler",
+        n_linearized_solves=1,
+        theta=jnp.asarray(1.0, dtype=dtype),
+        one=jnp.asarray(1.0, dtype=dtype),
+        identity_n=identity,
+        flat_rhs=lambda _t, y: y * y,
+        flat_rhs_with_lagged_response=lambda _t, y, response: response * response + 2.0 * response * (y - response),
+        use_lagged_linear_response=False,
+        use_transport_lagged_response=True,
+        lagged_response_reuse_mode="global_state_drift_max",
+        jacobian_reuse_rtol=jnp.asarray(0.1, dtype=dtype),
+        max_jacobian_age=jnp.asarray(8, dtype=jnp.int32),
+        delta_reduction_factor=jnp.asarray(0.5, dtype=dtype),
+        tau_min=jnp.asarray(0.01, dtype=dtype),
+        project_flat=None,
+        dtype=dtype,
+        tol=jnp.asarray(1.0e-6, dtype=dtype),
+        maxiter=jnp.asarray(4, dtype=jnp.int32),
+        debug_newton_trace=False,
+    )
+
+    assert bool(reused)
+    assert jnp.array_equal(result.lagged_reference_y_out, jnp.asarray([0.0], dtype=dtype))
 
 
 def test_build_time_solver_theta_newton_backend():
