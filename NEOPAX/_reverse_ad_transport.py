@@ -143,6 +143,65 @@ def _logical_tree_nbytes(tree: object) -> int:
     return total
 
 
+def _pytree_path_label(path) -> str:
+    """Format a JAX pytree path for host-only reverse diagnostics."""
+    parts: list[str] = []
+    for key in path:
+        if hasattr(key, "name"):
+            parts.append(str(key.name))
+        elif hasattr(key, "key"):
+            parts.append(str(key.key))
+        elif hasattr(key, "idx"):
+            parts.append(str(key.idx))
+        else:
+            parts.append(str(key))
+    return ".".join(parts)
+
+
+def _batched_support_first_nonfinite_leaves(
+    batched_leaves: Sequence[object],
+    leaf_labels: Sequence[str],
+    objective_count: int,
+) -> tuple[tuple[int, str] | None, ...]:
+    """Return each objective row's first bad support leaf without copying bars.
+
+    This transfers only one boolean per objective row and leaf.  It is used
+    solely by the host diagnostic path after a segment has already completed.
+    """
+    if len(batched_leaves) != len(leaf_labels):
+        raise ValueError("Support diagnostic leaves do not match their pytree paths.")
+    row_finite = []
+    for leaf in batched_leaves:
+        value = jnp.asarray(leaf)
+        if value.dtype == jax.dtypes.float0 or not jnp.issubdtype(value.dtype, jnp.inexact):
+            row_finite.append(jnp.ones((objective_count,), dtype=bool))
+            continue
+        if value.ndim < 1 or int(value.shape[0]) != int(objective_count):
+            raise ValueError(
+                "Batched support diagnostic leaf does not have objective rows: "
+                f"shape={value.shape}, objectives={objective_count}."
+            )
+        axes = tuple(range(1, value.ndim))
+        row_finite.append(
+            jnp.isfinite(value)
+            if not axes
+            else jnp.all(jnp.isfinite(value), axis=axes)
+        )
+    finite_rows = tuple(np.asarray(value, dtype=bool) for value in jax.device_get(tuple(row_finite)))
+    first_bad: list[tuple[int, str] | None] = []
+    for objective_i in range(objective_count):
+        match = next(
+            (
+                (leaf_i, leaf_labels[leaf_i])
+                for leaf_i, finite in enumerate(finite_rows)
+                if not bool(finite[objective_i])
+            ),
+            None,
+        )
+        first_bad.append(match)
+    return tuple(first_bad)
+
+
 def _merge_rebuild_ntx_channels_into_generic_payload_bar(
     generic_payload_bar: Mapping[str, object],
     rebuild_payload_bar: Mapping[str, object],
@@ -4321,7 +4380,13 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
             dtype=jnp.asarray(segmented_final_carry.lagged_reference_y).dtype,
         ),
     )
-    _zero_support_leaves, support_treedef = jax.tree_util.tree_flatten(zero_payload_bar)
+    support_path_leaves, support_treedef = jax.tree_util.tree_flatten_with_path(
+        zero_payload_bar
+    )
+    _zero_support_leaves = tuple(leaf for _path, leaf in support_path_leaves)
+    support_leaf_labels = tuple(
+        _pytree_path_label(path) for path, _leaf in support_path_leaves
+    )
     native_vmec_mode = (
         str(
             getattr(
@@ -4940,6 +5005,23 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
             reduced_bars, segment_support_bar_leaves = jax.block_until_ready(
                 (reduced_bars, segment_support_bar_leaves)
             )
+        if segment_input_diagnostics:
+            segment_bad_rows = _batched_support_first_nonfinite_leaves(
+                segment_support_bar_leaves[: len(_zero_support_leaves)],
+                support_leaf_labels,
+                objective_count,
+            )
+            for objective_i, first_bad in enumerate(segment_bad_rows):
+                if first_bad is None:
+                    continue
+                leaf_i, leaf_label = first_bad
+                print(
+                    f"{progress_prefix} diagnostic: support reverse segment "
+                    f"{segment_index + 1}/{segment_count} first_nonfinite "
+                    f"objective={objective_labels[objective_i]} "
+                    f"leaf={leaf_i}:{leaf_label}",
+                    flush=True,
+                )
         if phase_timing_segment_warm_pending and not host_static_branch_dispatch:
             first_call_elapsed = time.perf_counter() - segment_phase_start
             warm_start = time.perf_counter()

@@ -3007,6 +3007,32 @@ def _run_realtime_geometry_support_segment_probe(
                             flush=True,
                         )
                         break
+                    # The root is a sum of independently accumulated support
+                    # contributions.  Report the first bad leaf of each
+                    # component here, before any geometry pullback is staged,
+                    # so a segmented-reverse failure can be assigned to the
+                    # terminal objective, step rebuild, initial cache/direct
+                    # RHS, or initial-Er-root contribution.
+                    for component_name, component_rows in (
+                        support_component_bars_by_name.items()
+                    ):
+                        component_diagnostics = _payload_branch_diagnostics(
+                            component_rows[objective_i]
+                        )
+                        component_root = component_diagnostics["root"]
+                        component_summary = component_root["summary"]
+                        if component_summary["all_floating_leaves_finite"]:
+                            continue
+                        nonfinite_leaves = component_root["first_nonfinite_leaves"]
+                        first_nonfinite = (
+                            None if not nonfinite_leaves else nonfinite_leaves[0]
+                        )
+                        print(
+                            f"      bad component={component_name} "
+                            f"l2={component_root['l2']:.6e} "
+                            f"first_nonfinite_leaf={first_nonfinite}",
+                            flush=True,
+                        )
             if not pre_support_all_finite:
                 raise FloatingPointError(
                     "Realtime geometry payload pullback skipped because transport reverse "
