@@ -48,6 +48,9 @@ OBJECTIVE_ALIASES = {
     "b10_over_b00_mean": "boozer_b10_over_b00_mean",
     "qi_objective": "boozer_qi_objective",
     "maxj_objective": "boozer_maxj_objective",
+    "dmerc": "vmec_dmerc_stability_softmax",
+    "mercier": "vmec_dmerc_stability_softmax",
+    "dmerc_softmax": "vmec_dmerc_stability_softmax",
 }
 
 
@@ -340,7 +343,14 @@ def main() -> None:
     )
     parser.add_argument("--vmec-input", default=str(DEFAULT_VMEC_INPUT))
     parser.add_argument("--parameter", default="RBC:1:0")
-    parser.add_argument("--objective", default="boozer_qi_objective")
+    parser.add_argument(
+        "--objective",
+        default="boozer_qi_objective",
+        help=(
+            "Objective-table name or alias; use dmerc for "
+            "vmec_dmerc_stability_softmax."
+        ),
+    )
     parser.add_argument("--fd-rel-step", type=float, default=3e-7)
     parser.add_argument("--fd-abs-step", type=float, default=1e-10)
     parser.add_argument("--reference-fd", type=float, default=None)

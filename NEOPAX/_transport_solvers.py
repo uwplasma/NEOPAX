@@ -19828,6 +19828,94 @@ class _ThetaNewtonSolverConfig(_ThetaSolverConfig):
 
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True, eq=False)
+class _T3DOuterThetaSolverConfig(_ThetaSolverConfig):
+    """Configuration for the benchmark-only T3D-style outer theta loop.
+
+    This is deliberately separate from :class:`_ThetaNewtonSolverConfig`.
+    Its nonlinear contract is ``build response -> one linear solve -> RMS
+    check -> rebuild response`` at a fixed physical time target, rather than
+    Newton corrections of one residual.  The implementation is introduced in
+    a later step; keeping the validated configuration here makes its intended
+    semantics explicit without changing existing theta backends.
+    """
+
+    outer_maxiter: int = 4
+    outer_rms_threshold: float = 2.0e-2
+    outer_rms_tolerance: float = 1.0e-1
+    dt_adjust: float = 2.0
+    dt_max: float = jnp.inf
+    dt_increase_threshold: float = 5.0e-3
+
+    def __init__(
+        self,
+        t0: float = 0.0,
+        t1: float = 1.0,
+        dt: float = 1.0e-2,
+        min_step: float = 1.0e-14,
+        theta_implicit: float = 1.0,
+        predictor_mode: str = "linearized",
+        rhs_mode: str = "lagged_transport_response",
+        use_predictor_corrector: bool = False,
+        n_corrector_steps: int = 1,
+        tol: float = 1.0e-8,
+        outer_maxiter: int = 4,
+        outer_rms_threshold: float = 2.0e-2,
+        outer_rms_tolerance: float = 1.0e-1,
+        dt_adjust: float = 2.0,
+        dt_max: float | None = None,
+        dt_increase_threshold: float | None = None,
+        max_steps: int = 20000,
+        stop_after_accepted_steps: int | None = None,
+        debug_walltime_attempts: bool = False,
+        debug_stage_markers: bool = False,
+        save_n=None,
+    ):
+        super().__init__(
+            t0=t0,
+            t1=t1,
+            dt=dt,
+            min_step=min_step,
+            theta_implicit=theta_implicit,
+            predictor_mode=predictor_mode,
+            rhs_mode=rhs_mode,
+            use_predictor_corrector=use_predictor_corrector,
+            n_corrector_steps=n_corrector_steps,
+            tol=tol,
+            max_steps=max_steps,
+            stop_after_accepted_steps=stop_after_accepted_steps,
+            debug_walltime_attempts=debug_walltime_attempts,
+            debug_stage_markers=debug_stage_markers,
+            save_n=save_n,
+        )
+        if int(outer_maxiter) < 1:
+            raise ValueError("t3d_outer_maxiter must be at least one.")
+        if float(outer_rms_threshold) < 0.0:
+            raise ValueError("t3d_outer_rms_threshold must be non-negative.")
+        if float(outer_rms_tolerance) < float(outer_rms_threshold):
+            raise ValueError(
+                "t3d_outer_rms_tolerance must be greater than or equal to "
+                "t3d_outer_rms_threshold."
+            )
+        if float(dt_adjust) <= 1.0:
+            raise ValueError("t3d_outer_dt_adjust must be greater than one.")
+        if dt_max is None:
+            dt_max = max(float(dt), float(t1) - float(t0))
+        if float(dt_max) < float(dt):
+            raise ValueError("t3d_outer_dt_max must be at least the initial dt.")
+        if dt_increase_threshold is None:
+            dt_increase_threshold = float(outer_rms_threshold) / 4.0
+        if float(dt_increase_threshold) < 0.0:
+            raise ValueError("t3d_outer_dt_increase_threshold must be non-negative.")
+        object.__setattr__(self, "outer_maxiter", int(outer_maxiter))
+        object.__setattr__(self, "outer_rms_threshold", float(outer_rms_threshold))
+        object.__setattr__(self, "outer_rms_tolerance", float(outer_rms_tolerance))
+        object.__setattr__(self, "dt_adjust", float(dt_adjust))
+        object.__setattr__(self, "dt_max", float(dt_max))
+        object.__setattr__(self, "dt_increase_threshold", float(dt_increase_threshold))
+
+
+@jax.tree_util.register_dataclass
+@dataclasses.dataclass(frozen=True, eq=False)
 class _ThetaStepState:
     t: Any
     y: Any

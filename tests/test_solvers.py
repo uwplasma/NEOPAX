@@ -10,6 +10,7 @@ from NEOPAX._transport_solvers import (
     NewtonThetaMethodSolver,
     RADAUSolver,
     ThetaMethodSolver,
+    _T3DOuterThetaSolverConfig,
     _apply_radau_lean_timestep_controller,
     _RadauStepState,
     build_time_solver,
@@ -63,6 +64,37 @@ def test_build_time_solver_theta_newton_backend():
     assert float(solver.t0) == 0.0
     assert float(solver.t1) == 1.0
     assert solver.rhs_mode == "black_box"
+
+
+def test_t3d_outer_theta_config_has_t3d_outer_iteration_contract():
+    config = _T3DOuterThetaSolverConfig(
+        t0=0.0,
+        t1=1.0,
+        dt=0.1,
+        outer_maxiter=4,
+        outer_rms_threshold=2.0e-2,
+        outer_rms_tolerance=1.0e-1,
+        dt_adjust=2.0,
+    )
+    assert config.rhs_mode == "lagged_transport_response"
+    assert config.outer_maxiter == 4
+    assert config.outer_rms_threshold == pytest.approx(2.0e-2)
+    assert config.outer_rms_tolerance == pytest.approx(1.0e-1)
+    assert config.dt_adjust == pytest.approx(2.0)
+    assert config.dt_increase_threshold == pytest.approx(5.0e-3)
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    [
+        ({"outer_maxiter": 0}, "at least one"),
+        ({"outer_rms_threshold": 0.2, "outer_rms_tolerance": 0.1}, "greater than or equal"),
+        ({"dt_adjust": 1.0}, "greater than one"),
+    ],
+)
+def test_t3d_outer_theta_config_rejects_invalid_outer_controls(kwargs, message):
+    with pytest.raises(ValueError, match=message):
+        _T3DOuterThetaSolverConfig(t0=0.0, t1=1.0, dt=0.1, **kwargs)
 
 
 def test_build_time_solver_theta_backend_accepts_shared_lagged_rhs_mode():
