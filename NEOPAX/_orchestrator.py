@@ -235,6 +235,16 @@ def _normalize_solver_config(config: dict) -> dict:
     solver_cfg["integrator"] = solver_cfg["transport_solver_backend"]
     solver_cfg["neoclassical_flux_model"] = config.get("neoclassical", {}).get("flux_model", "none")
     solver_cfg["turbulence_flux_model"] = config.get("turbulence", {}).get("flux_model", "none")
+    backend = str(solver_cfg["transport_solver_backend"]).strip().lower()
+    if backend == "theta_t3d_outer":
+        configured_rhs_mode = str(
+            solver_cfg.get("theta_rhs_mode", solver_cfg.get("rhs_mode", "lagged_transport_response"))
+        ).strip().lower()
+        if configured_rhs_mode not in {"lagged_transport_response", "lagged_response"}:
+            raise ValueError(
+                "theta_t3d_outer requires theta_rhs_mode='lagged_transport_response'."
+            )
+        solver_cfg["theta_rhs_mode"] = "lagged_transport_response"
     solver_cfg["transport_center_flux_mode"] = _resolve_transport_center_flux_mode(config)
     solver_cfg.setdefault("Er_relax", 1.0)
     solver_cfg.setdefault("DEr", 1.0)

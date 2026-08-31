@@ -49,11 +49,11 @@ MIRROR_TARGET = 0.19
 MAX_ER_TARGET = 25.0
 
 QI_WEIGHT = 1.0
-MAXJ_WEIGHT = 0.00005
+MAXJ_WEIGHT = 0.0001
 ASPECT_WEIGHT = 1.0
 IOTA_WEIGHT = 1.0
 MIRROR_WEIGHT = 100.0
-MAX_ER_WEIGHT = 0.6
+MAX_ER_WEIGHT = 0.5
 
 NFEV = 40
 FTOL = 1.0e-6
@@ -122,7 +122,7 @@ terms = [
     (mirror_penalization, 0.0, MIRROR_WEIGHT),
     (opt.geometry.vmec_aspect_ratio, ASPECT_TARGET, ASPECT_WEIGHT),
     (opt.geometry.vmec_iota_mean, IOTA_TARGET, IOTA_WEIGHT),
-    (softmax_er, MAX_ER_TARGET, MAX_ER_WEIGHT),
+    # (softmax_er, MAX_ER_TARGET, MAX_ER_WEIGHT),
 ]
 
 

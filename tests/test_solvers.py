@@ -9,6 +9,7 @@ from NEOPAX._transport_solvers import (
     DiffraxSolver,
     NewtonThetaMethodSolver,
     RADAUSolver,
+    T3DOuterThetaMethodSolver,
     ThetaMethodSolver,
     _T3DOuterThetaSolverConfig,
     _apply_radau_lean_timestep_controller,
@@ -66,6 +67,52 @@ def test_build_time_solver_theta_newton_backend():
     assert solver.rhs_mode == "black_box"
 
 
+def test_build_time_solver_t3d_outer_theta_backend():
+    pytest.importorskip("diffrax")
+    solver = build_time_solver(
+        _base_solver_parameters(
+            transport_solver_backend="theta_t3d_outer",
+            theta_rhs_mode="lagged_transport_response",
+        )
+    )
+    assert isinstance(solver, T3DOuterThetaMethodSolver)
+    assert solver.rhs_mode == "lagged_transport_response"
+
+
+def test_t3d_outer_theta_solver_rebuilds_lagged_response_before_accepting_time():
+    class QuadraticLaggedField:
+        def __init__(self):
+            self.anchors = []
+
+        def __call__(self, _t, y):
+            return y * y
+
+        def build_lagged_response(self, y):
+            self.anchors.append(float(y[0]))
+            return y
+
+        def evaluate_with_lagged_response(self, _t, y, *, lagged_response):
+            return lagged_response * lagged_response + 2.0 * lagged_response * (y - lagged_response)
+
+    field = QuadraticLaggedField()
+    solver = T3DOuterThetaMethodSolver(
+        t0=0.0,
+        t1=0.1,
+        dt=0.1,
+        theta_implicit=1.0,
+        outer_maxiter=2,
+        outer_rms_threshold=1.0e-8,
+        outer_rms_tolerance=1.0e-2,
+        max_steps=4,
+    )
+    out = solver.solve(jnp.asarray([1.0]), field.__call__)
+
+    assert field.anchors == pytest.approx([1.0, 1.125])
+    assert int(out["n_steps"]) == 1
+    assert float(out["final_time"]) == pytest.approx(0.1)
+    assert int(out["t3d_outer_iterations"]) == 2
+
+
 def test_t3d_outer_theta_config_has_t3d_outer_iteration_contract():
     config = _T3DOuterThetaSolverConfig(
         t0=0.0,
@@ -95,6 +142,64 @@ def test_t3d_outer_theta_config_has_t3d_outer_iteration_contract():
 def test_t3d_outer_theta_config_rejects_invalid_outer_controls(kwargs, message):
     with pytest.raises(ValueError, match=message):
         _T3DOuterThetaSolverConfig(t0=0.0, t1=1.0, dt=0.1, **kwargs)
+
+
+def test_t3d_outer_theta_rebuilds_response_at_endpoint_iterates():
+    anchors = []
+
+    def build_response(anchor):
+        anchors.append(float(anchor[0]))
+        return anchor
+
+    def direct_rhs(_t, y):
+        return y * y
+
+    def lagged_rhs(_t, y, response):
+        return response * response + 2.0 * response * (y - response)
+
+    result = transport_solvers._t3d_outer_theta_fixed_target(
+        y_start=jnp.asarray([1.0]),
+        t_start=jnp.asarray(0.0),
+        dt=jnp.asarray(0.1),
+        theta=jnp.asarray(1.0),
+        flat_rhs=direct_rhs,
+        flat_rhs_with_lagged_response=lagged_rhs,
+        build_lagged_response_at_flat=build_response,
+        rms_fn=lambda trial, anchor: jnp.linalg.norm(trial - anchor),
+        outer_maxiter=2,
+        outer_rms_threshold=1.0e-8,
+        outer_rms_tolerance=1.0e-2,
+    )
+
+    # The first response is built at y_n.  The second is built at the first
+    # candidate endpoint, while the theta left endpoint remains y_n.
+    assert anchors == pytest.approx([1.0, 1.125])
+    assert result.outer_iterations == 2
+    assert not result.converged
+    assert result.accepted
+    assert not result.failed
+    assert float(result.trial_y[0]) == pytest.approx(1.127016129, rel=1.0e-8)
+
+
+def test_t3d_outer_theta_reports_failure_without_advancing_step_start():
+    y_start = jnp.asarray([1.0])
+    result = transport_solvers._t3d_outer_theta_fixed_target(
+        y_start=y_start,
+        t_start=jnp.asarray(0.0),
+        dt=jnp.asarray(0.1),
+        theta=jnp.asarray(1.0),
+        flat_rhs=lambda _t, y: y * y,
+        flat_rhs_with_lagged_response=lambda _t, y, response: response * response + 2.0 * response * (y - response),
+        build_lagged_response_at_flat=lambda anchor: anchor,
+        rms_fn=lambda trial, anchor: jnp.linalg.norm(trial - anchor),
+        outer_maxiter=1,
+        outer_rms_threshold=1.0e-12,
+        outer_rms_tolerance=1.0e-12,
+    )
+
+    assert result.failed
+    assert not result.accepted
+    assert jnp.array_equal(y_start, jnp.asarray([1.0]))
 
 
 def test_build_time_solver_theta_backend_accepts_shared_lagged_rhs_mode():

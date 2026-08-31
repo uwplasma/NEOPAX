@@ -19,7 +19,7 @@ from NEOPAX import optimization as opt  # noqa: E402
 
 
 # --------------------------- inputs / parameters ---------------------------
-SEED_INPUT = ROOT / "examples" / "inputs" / "input.QI_nfp2_initial"
+SEED_INPUT = ROOT / "examples" / "inputs" / "input.QI_nfp2_newNT_opt_hires"
 TRANSPORT_CONFIG = (
     ROOT
     / "examples"
@@ -53,14 +53,14 @@ PROFILE_PHYSICAL_UPPER = {
 MAX_ER_TARGET = 25.0
 ER_TRANSITION_LEFT_INDEX = 25
 ER_TRANSITION_RIGHT_INDEX = 26
-ER_TRANSITION_LEFT_TARGET = 26.0
+ER_TRANSITION_LEFT_TARGET = 25.0
 ER_TRANSITION_RIGHT_TARGET = -10.0
 BOOTSTRAP_LIMIT_SCALED = 0.1  # 10 kA/m^2 in the scaled bootstrap-current objective.
 
-MAX_ER_WEIGHT = 1.0
-ER_TRANSITION_LEFT_WEIGHT = 100.0
-ER_TRANSITION_RIGHT_WEIGHT = 100.0
-BOOTSTRAP_WEIGHT = 1.0
+MAX_ER_WEIGHT = 10.0
+ER_TRANSITION_LEFT_WEIGHT = 0.1
+ER_TRANSITION_RIGHT_WEIGHT = 0.1
+BOOTSTRAP_WEIGHT = 10.0
 
 NFEV = 40
 FTOL = 1.0e-6
@@ -86,9 +86,9 @@ bootstrap_penalty = opt.transformed_transport_objective(
 
 terms = [
     (opt.transport.softmax_Er, MAX_ER_TARGET, MAX_ER_WEIGHT),
-    #(opt.transport.Er_transition_left, ER_TRANSITION_LEFT_TARGET, ER_TRANSITION_LEFT_WEIGHT),
-    #(opt.transport.Er_transition_right, ER_TRANSITION_RIGHT_TARGET, ER_TRANSITION_RIGHT_WEIGHT),
-    #(bootstrap_penalty, 0.0, BOOTSTRAP_WEIGHT),
+    (opt.transport.Er_transition_left, ER_TRANSITION_LEFT_TARGET, ER_TRANSITION_LEFT_WEIGHT),
+    (opt.transport.Er_transition_right, ER_TRANSITION_RIGHT_TARGET, ER_TRANSITION_RIGHT_WEIGHT),
+    (bootstrap_penalty, 0.0, BOOTSTRAP_WEIGHT),
 ]
 
 

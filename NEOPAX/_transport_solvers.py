@@ -28,6 +28,7 @@ ODE_SOLVER_BACKENDS = {
     "radau",
     "theta",
     "theta_newton",
+    "theta_t3d_outer",
 }
 
 
@@ -20423,6 +20424,113 @@ def _theta_residual_from_trial_rhs(*, y_proj, flat_y, h_value, theta, f_old, f_n
     return y_proj - flat_y - h_value * ((one - theta) * f_old + theta * f_new)
 
 
+@dataclasses.dataclass(frozen=True)
+class _T3DOuterThetaAttemptResult:
+    """Result of T3D-style outer relinearization at one fixed time target."""
+
+    trial_y: Any
+    converged: bool
+    accepted: bool
+    failed: bool
+    outer_iterations: int
+    rms: Any
+    step_start_response: Any
+    last_response: Any
+
+
+def _t3d_outer_theta_fixed_target(
+    *,
+    y_start,
+    t_start,
+    dt,
+    theta,
+    flat_rhs,
+    flat_rhs_with_lagged_response,
+    build_lagged_response_at_flat,
+    rms_fn,
+    outer_maxiter: int,
+    outer_rms_threshold,
+    outer_rms_tolerance,
+    project_flat=None,
+    step_start_response=None,
+):
+    """Perform T3D's response-rebuild outer loop at one theta time target.
+
+    Each outer pass builds a response at the current *candidate endpoint*, then
+    makes precisely one linear theta update.  ``y_start`` remains the left
+    endpoint of the time discretization throughout.  The caller owns physical
+    time advancement and retry handling, so a failed result cannot accidentally
+    advance time or overwrite the accepted state.
+    """
+
+    y_start = _project_flat_state_if_needed(y_start, project_flat)
+    dtype = y_start.dtype
+    t_new = jnp.asarray(t_start, dtype=dtype) + jnp.asarray(dt, dtype=dtype)
+    h_value = jnp.asarray(dt, dtype=dtype)
+    theta_value = jnp.asarray(theta, dtype=dtype)
+    one = jnp.asarray(1.0, dtype=dtype)
+    identity = jnp.eye(y_start.shape[0], dtype=dtype)
+    f_old = flat_rhs(t_start, y_start)
+    anchor_y = y_start
+    latest_response = None
+    initial_response = step_start_response
+    latest_rms = jnp.asarray(jnp.inf, dtype=dtype)
+
+    for outer_index in range(int(outer_maxiter)):
+        response = (
+            initial_response
+            if outer_index == 0 and initial_response is not None
+            else build_lagged_response_at_flat(anchor_y)
+        )
+        if outer_index == 0:
+            initial_response = response
+
+        def response_rhs(y_value):
+            y_projected = _project_flat_state_if_needed(y_value, project_flat)
+            return flat_rhs_with_lagged_response(t_new, y_projected, response)
+
+        f_anchor = response_rhs(anchor_y)
+        jacobian_anchor = jax.jacfwd(response_rhs)(anchor_y)
+        system = identity - theta_value * h_value * jacobian_anchor
+        rhs = (
+            y_start
+            + h_value * (one - theta_value) * f_old
+            + theta_value * h_value * (f_anchor - jacobian_anchor @ anchor_y)
+        )
+        trial_y = _project_flat_state_if_needed(jnp.linalg.solve(system, rhs), project_flat)
+        latest_rms = jnp.asarray(rms_fn(trial_y, anchor_y), dtype=dtype)
+        latest_response = response
+        converged = bool(jax.device_get(latest_rms <= jnp.asarray(outer_rms_threshold, dtype=dtype)))
+        final_iteration = outer_index + 1 == int(outer_maxiter)
+        accepted = converged or (
+            final_iteration
+            and bool(jax.device_get(latest_rms <= jnp.asarray(outer_rms_tolerance, dtype=dtype)))
+        )
+        if accepted:
+            return _T3DOuterThetaAttemptResult(
+                trial_y=trial_y,
+                converged=converged,
+                accepted=True,
+                failed=False,
+                outer_iterations=outer_index + 1,
+                rms=latest_rms,
+                step_start_response=initial_response,
+                last_response=latest_response,
+            )
+        anchor_y = trial_y
+
+    return _T3DOuterThetaAttemptResult(
+        trial_y=anchor_y,
+        converged=False,
+        accepted=False,
+        failed=True,
+        outer_iterations=int(outer_maxiter),
+        rms=latest_rms,
+        step_start_response=initial_response,
+        last_response=latest_response,
+    )
+
+
 def _theta_linearized_corrector_guess(
     attempt_context: _ThetaAttemptContext,
     *,
@@ -22270,6 +22378,162 @@ class ThetaMethodSolver(_ThetaSolverConfig):
         )
 
 
+class T3DOuterThetaMethodSolver(_T3DOuterThetaSolverConfig):
+    """Benchmark solver with T3D-style outer response relinearization.
+
+    This deliberately uses a Python control loop: FD file-flux response
+    construction is an externally visible benchmark event, and keeping the
+    loop explicit makes the accepted-step/retry contract auditable.
+    """
+
+    def solve(self, state, vector_field: Callable, *args, **kwargs):
+        species = _extract_species_from_args(args)
+        temperature_active_mask, fixed_temperature_profile = _extract_fixed_temperature_projection(vector_field)
+        density_floor, temperature_floor = _extract_state_regularization(vector_field)
+        state = _project_state_to_quasi_neutrality(
+            state,
+            species,
+            temperature_active_mask=temperature_active_mask,
+            fixed_temperature_profile=fixed_temperature_profile,
+            density_floor=density_floor,
+            temperature_floor=temperature_floor,
+        )
+        flat_state, unpack_flat, _unpack_packed, _pack_state, project_flat = _make_solver_state_transform(
+            state,
+            species,
+            temperature_active_mask=temperature_active_mask,
+            fixed_temperature_profile=fixed_temperature_profile,
+            density_floor=density_floor,
+            temperature_floor=temperature_floor,
+        )
+        rhs_mode = str(self.rhs_mode).strip().lower()
+        if rhs_mode not in {"lagged_transport_response", "lagged_response"}:
+            raise ValueError(
+                "theta_t3d_outer requires theta_rhs_mode='lagged_transport_response'."
+            )
+        build_lagged_response, _ = _lagged_response_hooks(vector_field)
+        if build_lagged_response is None:
+            raise ValueError(
+                "theta_t3d_outer requires a vector field with "
+                "build_lagged_response(...) and evaluate_with_lagged_response(...)."
+            )
+        dtype = flat_state.dtype
+        flat_rhs = _flat_rhs_factory(unpack_flat, vector_field, args, kwargs, project_flat=project_flat)
+        flat_rhs_with_lagged_response = _flat_rhs_with_lagged_response_factory(
+            unravel=unpack_flat,
+            vector_field=vector_field,
+            args=args,
+            kwargs=kwargs,
+            project_flat=project_flat,
+        )
+
+        def _build_at_flat(flat_y):
+            return build_lagged_response(
+                unpack_flat(_project_flat_state_if_needed(flat_y, project_flat))
+            )
+
+        def _t3d_rms(trial_y, anchor_y):
+            scale = jnp.maximum(jnp.abs(anchor_y), jnp.asarray(1.0e-30, dtype=dtype))
+            return jnp.sqrt(jnp.mean(jnp.square((trial_y - anchor_y) / scale)))
+
+        t_value = jnp.asarray(self.t0, dtype=dtype)
+        t_final = jnp.asarray(self.t1, dtype=dtype)
+        dt_value = jnp.minimum(jnp.asarray(self.dt, dtype=dtype), jnp.asarray(self.dt_max, dtype=dtype))
+        min_step = jnp.asarray(self.min_step, dtype=dtype)
+        theta = jnp.asarray(self.theta_implicit, dtype=dtype)
+        ys = [flat_state]
+        ts = [t_value]
+        dts = [jnp.asarray(0.0, dtype=dtype)]
+        accepted = [jnp.asarray(False)]
+        failed = [jnp.asarray(False)]
+        fail_codes = [jnp.asarray(0, dtype=jnp.int32)]
+        accepted_steps = 0
+        failed_step = False
+        fail_code = 0
+        last_result = None
+
+        while (
+            accepted_steps < int(self.max_steps)
+            and float(jax.device_get(t_value)) < float(jax.device_get(t_final)) - 1.0e-15
+        ):
+            y_start = flat_state
+            h_value = jnp.minimum(dt_value, t_final - t_value)
+            retry_start_response = None
+            while True:
+                result = _t3d_outer_theta_fixed_target(
+                    y_start=y_start,
+                    t_start=t_value,
+                    dt=h_value,
+                    theta=theta,
+                    flat_rhs=flat_rhs,
+                    flat_rhs_with_lagged_response=flat_rhs_with_lagged_response,
+                    build_lagged_response_at_flat=_build_at_flat,
+                    rms_fn=_t3d_rms,
+                    outer_maxiter=self.outer_maxiter,
+                    outer_rms_threshold=self.outer_rms_threshold,
+                    outer_rms_tolerance=self.outer_rms_tolerance,
+                    project_flat=project_flat,
+                    step_start_response=retry_start_response,
+                )
+                last_result = result
+                retry_start_response = result.step_start_response
+                if result.accepted:
+                    flat_state = result.trial_y
+                    t_value = t_value + h_value
+                    accepted_steps += 1
+                    ys.append(flat_state)
+                    ts.append(t_value)
+                    dts.append(h_value)
+                    accepted.append(jnp.asarray(True))
+                    failed.append(jnp.asarray(False))
+                    fail_codes.append(jnp.asarray(0, dtype=jnp.int32))
+                    if float(jax.device_get(result.rms)) < self.dt_increase_threshold:
+                        dt_value = jnp.minimum(
+                            dt_value * jnp.asarray(2.0, dtype=dtype),
+                            jnp.asarray(self.dt_max, dtype=dtype),
+                        )
+                    break
+                h_value = h_value / jnp.asarray(self.dt_adjust, dtype=dtype)
+                if float(jax.device_get(h_value)) < float(jax.device_get(min_step)):
+                    failed_step = True
+                    fail_code = 1
+                    break
+            if failed_step:
+                break
+
+        ys_saved = jnp.stack(ys)
+        ts_saved = jnp.stack(ts)
+        dts_saved = jnp.stack(dts)
+        accepted_saved = jnp.stack(accepted)
+        failed_saved = jnp.stack(failed)
+        fail_codes_saved = jnp.stack(fail_codes)
+        zero = jnp.asarray(0.0, dtype=dtype)
+        inf = jnp.asarray(jnp.inf, dtype=dtype)
+        last_rms = inf if last_result is None else jnp.asarray(last_result.rms, dtype=dtype)
+        out = _finalize_custom_solver_output(
+            ys_saved, ts_saved, dts_saved, accepted_saved, failed_saved, fail_codes_saved,
+            flat_state, t_value,
+            jnp.asarray(not failed_step), jnp.asarray(failed_step),
+            jnp.asarray(fail_code, dtype=jnp.int32), jnp.asarray(accepted_steps, dtype=jnp.int32),
+            dt_value, jnp.asarray(last_result is not None and last_result.accepted),
+            jnp.asarray(last_result is not None and last_result.converged), last_rms,
+            jnp.asarray(fail_code, dtype=jnp.int32), jnp.asarray(failed_step),
+            jnp.asarray(False), jnp.asarray(False), jnp.asarray(True), jnp.asarray(True),
+            jnp.asarray(0 if last_result is None else last_result.outer_iterations, dtype=jnp.int32),
+            last_rms, zero, zero, jnp.asarray(False), jnp.asarray(False), jnp.asarray(False),
+            jnp.asarray(False), jnp.asarray(False), jnp.asarray(False), None, unpack_flat, state, species,
+            temperature_active_mask=temperature_active_mask,
+            fixed_temperature_profile=fixed_temperature_profile,
+            density_floor=density_floor,
+            temperature_floor=temperature_floor,
+        )
+        out["t3d_outer_iterations"] = jnp.asarray(
+            0 if last_result is None else last_result.outer_iterations, dtype=jnp.int32
+        )
+        out["t3d_outer_rms"] = last_rms
+        return out
+
+
 class NewtonThetaMethodSolver(_ThetaNewtonSolverConfig):
     def solve(self, state, vector_field: Callable, *args, **kwargs):
         STATUS_FAILED = 0
@@ -22577,6 +22841,30 @@ def build_time_solver(solver_parameters: Any, solver_override: Any = None) -> Tr
             debug_stage_markers=bool(_cfg_get("debug_stage_markers", False)),
             save_n=save_n,
         )
+    if backend == "theta_t3d_outer":
+        return T3DOuterThetaMethodSolver(
+            t0=t0,
+            t1=t1,
+            dt=dt,
+            min_step=float(_cfg_get("min_step", 1.0e-14)),
+            theta_implicit=float(_cfg_get("theta_implicit", 1.0)),
+            predictor_mode=str(_cfg_get("theta_predictor_mode", "linearized")),
+            rhs_mode=str(_cfg_get("theta_rhs_mode", generic_rhs_mode)),
+            tol=float(_cfg_get("nonlinear_solver_tol", _cfg_get("tol", 1.0e-8))),
+            outer_maxiter=int(_cfg_get("t3d_outer_maxiter", 4)),
+            outer_rms_threshold=float(_cfg_get("t3d_outer_rms_threshold", 2.0e-2)),
+            outer_rms_tolerance=float(_cfg_get("t3d_outer_rms_tolerance", 1.0e-1)),
+            dt_adjust=float(_cfg_get("t3d_outer_dt_adjust", 2.0)),
+            dt_max=float(_cfg_get("t3d_outer_dt_max", max(t1 - t0, dt))),
+            dt_increase_threshold=float(
+                _cfg_get("t3d_outer_dt_increase_threshold", _cfg_get("t3d_outer_rms_threshold", 2.0e-2) / 4.0)
+            ),
+            max_steps=int(_cfg_get("max_steps", 20000)),
+            stop_after_accepted_steps=stop_after_accepted_steps,
+            debug_walltime_attempts=bool(_cfg_get("debug_walltime_attempts", False)),
+            debug_stage_markers=bool(_cfg_get("debug_stage_markers", False)),
+            save_n=save_n,
+        )
     if backend == "radau":
         return RADAUSolver(
             t0=t0,
@@ -22638,3 +22926,4 @@ register_time_solver("diffrax_dopri5", lambda **kw: DiffraxSolver(_get_diffrax_i
 register_time_solver("radau", lambda **kw: RADAUSolver(**kw))
 register_time_solver("theta", lambda **kw: ThetaMethodSolver(**kw))
 register_time_solver("theta_newton", lambda **kw: NewtonThetaMethodSolver(**kw))
+register_time_solver("theta_t3d_outer", lambda **kw: T3DOuterThetaMethodSolver(**kw))

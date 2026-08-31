@@ -827,6 +827,35 @@ def test_normalize_solver_config_falls_back_to_legacy_solver_section():
     assert out["turbulence_flux_model"] == "turbulent_power_analytical"
 
 
+def test_normalize_solver_config_t3d_outer_uses_lagged_response_for_any_flux_model():
+    config = {
+        "transport_solver": {"transport_solver_backend": "theta_t3d_outer"},
+        "turbulence": {"flux_model": "turbulent_power_analytical"},
+    }
+
+    out = _normalize_solver_config(config)
+    assert out["theta_rhs_mode"] == "lagged_transport_response"
+
+
+@pytest.mark.parametrize(
+    "rhs_mode",
+    [
+        "black_box",
+        "lagged_linear_state",
+    ],
+)
+def test_normalize_solver_config_t3d_outer_rejects_non_transport_lagged_rhs(rhs_mode):
+    with pytest.raises(ValueError, match="lagged_transport_response"):
+        _normalize_solver_config(
+            {
+                "transport_solver": {
+                    "transport_solver_backend": "theta_t3d_outer",
+                    "theta_rhs_mode": rhs_mode,
+                },
+            }
+        )
+
+
 @pytest.mark.parametrize(
     ("configured", "expected"),
     [
