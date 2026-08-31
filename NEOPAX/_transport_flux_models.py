@@ -9104,7 +9104,7 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             1,
         )
 
-    def evaluate_momentum_corrected_fluxes(self, state) -> dict:
+    def evaluate_momentum_corrected_fluxes(self, state, *, diagnostics: bool = False) -> dict:
         """Evaluate realtime NTX fluxes with momentum-corrected parallel flow.
 
         This uses the same realtime NTX prepared support as the uncorrected
@@ -9234,12 +9234,15 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                 tau,
                 v_thermal,
             )
-            operator = lineax.MatrixLinearOperator(
-                jnp.reshape(matrix_rows, (matrix_rows.shape[0] * matrix_rows.shape[1], matrix_rows.shape[2]))
+            matrix = jnp.reshape(
+                matrix_rows,
+                (matrix_rows.shape[0] * matrix_rows.shape[1], matrix_rows.shape[2]),
             )
-            solution = lineax.linear_solve(operator, jnp.reshape(rhs, rhs.shape[0] * rhs.shape[1]))
+            rhs_flat = jnp.reshape(rhs, rhs.shape[0] * rhs.shape[1])
+            operator = lineax.MatrixLinearOperator(matrix)
+            solution = lineax.linear_solve(operator, rhs_flat)
             correction = jnp.reshape(solution.value, (n_species, 3))
-            return jax.vmap(
+            corrected = jax.vmap(
                 get_corrected_fluxes,
                 in_axes=(
                     None,
@@ -9285,11 +9288,21 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                 dndr,
                 dTdr,
             )
+            if diagnostics:
+                return (*corrected, matrix, rhs_flat, correction, matrix @ solution.value - rhs_flat)
+            return corrected
 
-        gamma_by_radius, q_by_radius, upar_by_radius, qpar_by_radius, upar2_by_radius = jax.vmap(
-            _correction_per_radius,
-            in_axes=(0, 0, 0, 0),
+        corrected_by_radius = jax.vmap(
+            _correction_per_radius, in_axes=(0, 0, 0, 0)
         )(radius_indices, lij_by_radius, eij_by_radius, nu_av_by_radius)
+        if diagnostics:
+            (
+                gamma_by_radius, q_by_radius, upar_by_radius, qpar_by_radius, upar2_by_radius,
+                correction_matrix_by_radius, correction_rhs_by_radius,
+                correction_solution_by_radius, correction_residual_by_radius,
+            ) = corrected_by_radius
+        else:
+            gamma_by_radius, q_by_radius, upar_by_radius, qpar_by_radius, upar2_by_radius = corrected_by_radius
         gamma = jnp.swapaxes(gamma_by_radius, 0, 1)
         q = jnp.swapaxes(q_by_radius, 0, 1)
         upar = jnp.swapaxes(upar_by_radius, 0, 1)
@@ -9298,7 +9311,7 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         gamma, q, upar = self._regularize_center_fluxes_axis0(gamma, q, upar)
         qpar = self._regularize_axis_radius0(jnp.swapaxes(qpar, 0, 1), self.geometry.r_grid)
         upar2 = self._regularize_axis_radius0(jnp.swapaxes(upar2, 0, 1), self.geometry.r_grid)
-        return {
+        result = {
             "Gamma": gamma,
             "Q": q,
             "Upar": upar,
@@ -9308,6 +9321,16 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             "qpar_neo": jnp.swapaxes(qpar, 0, 1),
             "Upar2_neo": jnp.swapaxes(upar2, 0, 1),
         }
+        if diagnostics:
+            result["momentum_correction_diagnostics"] = {
+                "matrix_by_radius": correction_matrix_by_radius,
+                "rhs_by_radius": correction_rhs_by_radius,
+                "solution_by_radius": correction_solution_by_radius,
+                "residual_by_radius": correction_residual_by_radius,
+                "density": density,
+                "temperature": temperature,
+            }
+        return result
 
     def _momentum_corrected_upar_one_radius(self, state, radius_index, *, support=None):
         """Local corrected-Upar evaluator used by compact bootstrap pullbacks."""

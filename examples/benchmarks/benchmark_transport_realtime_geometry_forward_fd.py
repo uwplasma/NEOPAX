@@ -568,6 +568,45 @@ def _root_only_er_fd_diagnostics(minus_state, baseline_state, plus_state, h: flo
     }
 
 
+def _print_bootstrap_correction_diagnostics(final_state, runtime) -> None:
+    """Print conditioning evidence for the realtime NTX bootstrap solve."""
+
+    flux_model = getattr(getattr(runtime, "models", None), "flux", None)
+    neoclassical_model = getattr(flux_model, "neoclassical_model", flux_model)
+    evaluator = getattr(neoclassical_model, "evaluate_momentum_corrected_fluxes", None)
+    if not callable(evaluator):
+        print("[autodiff-gate] bootstrap correction diagnostic unavailable: no realtime NTX evaluator", flush=True)
+        return
+    result = evaluator(final_state, diagnostics=True)
+    payload = result["momentum_correction_diagnostics"]
+    matrix = np.asarray(jax.device_get(payload["matrix_by_radius"]), dtype=float)
+    rhs = np.asarray(jax.device_get(payload["rhs_by_radius"]), dtype=float)
+    solution = np.asarray(jax.device_get(payload["solution_by_radius"]), dtype=float)
+    residual = np.asarray(jax.device_get(payload["residual_by_radius"]), dtype=float)
+    density = np.asarray(jax.device_get(payload["density"]), dtype=float)
+    temperature = np.asarray(jax.device_get(payload["temperature"]), dtype=float)
+    upar = np.asarray(jax.device_get(result["Upar_neo"]), dtype=float)
+    condition = np.asarray([np.linalg.cond(value) for value in matrix], dtype=float)
+    residual_norm = np.linalg.norm(residual, axis=1)
+    rhs_norm = np.linalg.norm(rhs, axis=1)
+    worst = int(np.nanargmax(condition))
+    print(
+        "[autodiff-gate] bootstrap correction diagnostic: "
+        f"matrix_cond_min={np.nanmin(condition):.6e} matrix_cond_max={np.nanmax(condition):.6e} "
+        f"worst_radius_index={worst} rhs_l2={rhs_norm[worst]:.6e} "
+        f"residual_l2={residual_norm[worst]:.6e} solution_abs_max={np.nanmax(np.abs(solution)):.6e}",
+        flush=True,
+    )
+    for species_index in range(density.shape[0]):
+        print(
+            "[autodiff-gate] bootstrap correction species "
+            f"index={species_index} density_min={np.nanmin(density[species_index]):.6e} "
+            f"temperature_min={np.nanmin(temperature[species_index]):.6e} "
+            f"upar_abs_max={np.nanmax(np.abs(upar[species_index])):.6e}",
+            flush=True,
+        )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
@@ -617,6 +656,19 @@ def main() -> None:
         ),
     )
     parser.add_argument("--radau-jacobian-reuse-mode", default=None)
+    parser.add_argument(
+        "--diagnose-bootstrap-correction",
+        action="store_true",
+        help=(
+            "After the baseline rollout, rerun only the momentum-corrected NTX "
+            "bootstrap evaluator and print its correction-system diagnostics."
+        ),
+    )
+    parser.add_argument(
+        "--diagnose-bootstrap-correction-only",
+        action="store_true",
+        help="Run the baseline rollout and bootstrap-correction diagnostic, then stop before FD endpoints.",
+    )
     parser.add_argument(
         "--split-payload-fd-diagnostic",
         action="store_true",
@@ -956,6 +1008,11 @@ def main() -> None:
     )
     baseline_objectives = _objective_vector(_baseline_final_state, baseline_runtime)
     baseline_objectives = jax.block_until_ready(baseline_objectives)
+    if args.diagnose_bootstrap_correction or args.diagnose_bootstrap_correction_only:
+        print("[autodiff-gate] progress: diagnosing baseline bootstrap correction", flush=True)
+        _print_bootstrap_correction_diagnostics(_baseline_final_state, baseline_runtime)
+    if args.diagnose_bootstrap_correction_only:
+        return
     full_root_fd_lane = str(args.initial_er_root_fd_root_lane).strip().lower()
     if full_root_fd_lane == "frozen_linearized" and initial_er_root_ad == "off":
         raise SystemExit(
