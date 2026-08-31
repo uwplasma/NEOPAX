@@ -1512,7 +1512,8 @@ def geometry_initial_er_root_only_least_squares_problem(
         if raw_block_stage is None:
             raise ValueError("geometry transpose stage requires VMEC boundary parameters.")
         raw_block_transpose_stage = geometry_raw_block_transpose_optimization_stage(
-            raw_block_stage
+            raw_block_stage,
+            context=context,
         )
     optimization_stage_layout = None
     optimization_stage = None

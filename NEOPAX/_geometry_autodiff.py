@@ -835,6 +835,7 @@ class GeometryRawBlockTransposeOptimizationStage:
     param_entries: tuple[dict[str, Any], ...]
     static_dof_mask: Any = None
     runner: Callable[[Any, Any, Any], Any] | None = None
+    dmerc_softmax_runner: Callable[[Any], Any] | None = None
 
 
 def _frozen_dof_mask_copy(dof_mask):
@@ -868,13 +869,26 @@ def _validate_frozen_dof_mask(current, expected) -> None:
 
 def geometry_raw_block_transpose_optimization_stage(
     raw_block_stage: GeometryRawBlockStage,
+    *,
+    context: "GeometryAutodiffContext" | None = None,
 ) -> GeometryRawBlockTransposeOptimizationStage:
-    """Create an empty lazy transpose stage for one fixed VMEX layout."""
+    """Create persistent transpose and optional DMerc kernels for one stage."""
+
+    dmerc_softmax_runner = None
+    if context is not None:
+        # The VMEX runtime is fixed for this optimization stage while the
+        # converged state remains dynamic. Keeping this JIT callable alive
+        # avoids recreating a Mercier-softmax VJP executable every evaluation.
+        def _dmerc_softmax(state):
+            return vmec_mercier_stability_softmax_objective_from_state(context, state)
+
+        dmerc_softmax_runner = jax.jit(_dmerc_softmax, inline=False)
 
     return GeometryRawBlockTransposeOptimizationStage(
         implicit=raw_block_stage.implicit,
         implicit_cfg=raw_block_stage.implicit_cfg,
         param_entries=raw_block_stage.param_entries,
+        dmerc_softmax_runner=dmerc_softmax_runner,
     )
 
 
@@ -3696,8 +3710,13 @@ def geometry_full_ad_objective_table_pullback_from_param_vector(
         values = _vmec_core_scalar_objectives_from_state(context, state_inner)
         if include_dmerc:
             values = dict(values)
+            dmerc_runner = None if raw_block_transpose_optimization_stage is None else (
+                raw_block_transpose_optimization_stage.dmerc_softmax_runner
+            )
             values["dmerc_stability_softmax"] = (
                 vmec_mercier_stability_softmax_objective_from_state(context, state_inner)
+                if dmerc_runner is None
+                else dmerc_runner(state_inner)
             )
         return jnp.stack([jnp.asarray(values[name], dtype=jnp.float64).reshape(()) for name in vmec_names])
 
