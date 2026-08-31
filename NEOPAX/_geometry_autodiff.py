@@ -835,7 +835,7 @@ class GeometryRawBlockTransposeOptimizationStage:
     param_entries: tuple[dict[str, Any], ...]
     static_dof_mask: Any = None
     runner: Callable[[Any, Any, Any], Any] | None = None
-    dmerc_softmax_runner: Callable[[Any], Any] | None = None
+    dmerc_softmax_value_and_grad_runner: Callable[[Any], tuple[Any, Any]] | None = None
 
 
 def _frozen_dof_mask_copy(dof_mask):
@@ -874,7 +874,7 @@ def geometry_raw_block_transpose_optimization_stage(
 ) -> GeometryRawBlockTransposeOptimizationStage:
     """Create persistent transpose and optional DMerc kernels for one stage."""
 
-    dmerc_softmax_runner = None
+    dmerc_softmax_value_and_grad_runner = None
     if context is not None:
         # The VMEX runtime is fixed for this optimization stage while the
         # converged state remains dynamic. Keeping this JIT callable alive
@@ -882,13 +882,16 @@ def geometry_raw_block_transpose_optimization_stage(
         def _dmerc_softmax(state):
             return vmec_mercier_stability_softmax_objective_from_state(context, state)
 
-        dmerc_softmax_runner = jax.jit(_dmerc_softmax, inline=False)
+        dmerc_softmax_value_and_grad_runner = jax.jit(
+            jax.value_and_grad(_dmerc_softmax),
+            inline=False,
+        )
 
     return GeometryRawBlockTransposeOptimizationStage(
         implicit=raw_block_stage.implicit,
         implicit_cfg=raw_block_stage.implicit_cfg,
         param_entries=raw_block_stage.param_entries,
-        dmerc_softmax_runner=dmerc_softmax_runner,
+        dmerc_softmax_value_and_grad_runner=dmerc_softmax_value_and_grad_runner,
     )
 
 
@@ -3703,21 +3706,11 @@ def geometry_full_ad_objective_table_pullback_from_param_vector(
         "magnetic_well",
         "mirror_ratio",
         "beta_volume",
-    ) + (("dmerc_stability_softmax",) if include_dmerc else ())
+    )
     vmec_indices = tuple(names.index(f"vmec_{name}") for name in vmec_names)
 
     def vmec_vector(state_inner):
         values = _vmec_core_scalar_objectives_from_state(context, state_inner)
-        if include_dmerc:
-            values = dict(values)
-            dmerc_runner = None if raw_block_transpose_optimization_stage is None else (
-                raw_block_transpose_optimization_stage.dmerc_softmax_runner
-            )
-            values["dmerc_stability_softmax"] = (
-                vmec_mercier_stability_softmax_objective_from_state(context, state_inner)
-                if dmerc_runner is None
-                else dmerc_runner(state_inner)
-            )
         return jnp.stack([jnp.asarray(values[name], dtype=jnp.float64).reshape(()) for name in vmec_names])
 
     vmec_values, vmec_state_pullback = jax.vjp(vmec_vector, state)
@@ -3728,6 +3721,33 @@ def geometry_full_ad_objective_table_pullback_from_param_vector(
     )
     vmec_state_bar = _tree_weighted_basis_sum(vmec_basis, cotangents[:, vmec_indices])
     _progress("vmec objective cotangents ready", vmec_state_bar)
+
+    dmerc_state_bar = None
+    if include_dmerc:
+        dmerc_index = names.index("vmec_dmerc_stability_softmax")
+        dmerc_runner = None if raw_block_transpose_optimization_stage is None else (
+            raw_block_transpose_optimization_stage.dmerc_softmax_value_and_grad_runner
+        )
+        if dmerc_runner is None:
+            dmerc_value, dmerc_pullback = jax.vjp(
+                lambda state_inner: vmec_mercier_stability_softmax_objective_from_state(
+                    context,
+                    state_inner,
+                ),
+                state,
+            )
+            dmerc_unit_state_bar = dmerc_pullback(jnp.asarray(1.0, dtype=jnp.float64))[0]
+        else:
+            dmerc_value, dmerc_unit_state_bar = dmerc_runner(state)
+        values_by_name["vmec_dmerc_stability_softmax"] = jnp.asarray(
+            dmerc_value,
+            dtype=jnp.float64,
+        ).reshape(())
+        dmerc_state_bar = _tree_scale_unit_cotangent(
+            dmerc_unit_state_bar,
+            cotangents[:, dmerc_index],
+        )
+        _progress("DMerc softmax cotangent ready", dmerc_state_bar)
 
     boozer_light_names = (
         "iota_b_mean",
@@ -3803,7 +3823,10 @@ def geometry_full_ad_objective_table_pullback_from_param_vector(
     _probe("after_boozer_state_pullback")
     _progress("booz cotangents pulled to state", boozer_state_bar)
 
-    state_bar = _tree_add_all(vmec_state_bar, boozer_state_bar, aspect_proxy_state_bar)
+    state_bars = [vmec_state_bar, boozer_state_bar, aspect_proxy_state_bar]
+    if dmerc_state_bar is not None:
+        state_bars.append(dmerc_state_bar)
+    state_bar = _tree_add_all(*state_bars)
     if bool(return_state_bars):
         return values_by_name, state_bar
     if final_mode == "raw_block_transpose":

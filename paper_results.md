@@ -53,3 +53,24 @@ with respect to every profile scalar.
 These are reverse-AD values. The frozen-VMEC finite-difference script now
 writes `vmec_dmerc_stability_softmax_value` and
 `vmec_dmerc_stability_softmax_gradient_fd` into its JSON report.
+
+## Transport-profile frozen-root FD validation
+
+Both FD runs used the same accepted 16-step replay and
+`initial-Er-root-fd-root-lane=frozen_linearized`, matching the reverse rule's
+local implicit derivative of the already selected Er root. FD values below
+are the values printed by the benchmark (six decimal places); the errors are
+therefore conservative at that displayed precision.
+
+| objective | n0 reverse | n0 FD | n0 abs. error | n0 rel. error | temperature-shape-alpha reverse | temperature-shape-alpha FD | alpha abs. error | alpha rel. error |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `softmax_Er` | -4.254537962e+00 | -4.254502000e+00 | 3.596e-05 | 8.453e-06 | 1.349473746e+01 | 1.349478000e+01 | 4.254e-05 | 3.153e-06 |
+| `net_total_power_volume_average_mw_m3` | 2.380614903e-01 | 2.380615000e-01 | 9.671e-09 | 4.063e-08 | -3.930424945e-01 | -3.930425000e-01 | 5.461e-09 | 1.389e-08 |
+| `Er_transition_left` | -1.446224096e+00 | -1.446190000e+00 | 3.410e-05 | 2.358e-05 | 1.610225123e+01 | 1.610224000e+01 | 1.123e-05 | 6.972e-07 |
+| `Er_transition_right` | -1.670120187e+00 | -1.670138000e+00 | 1.781e-05 | 1.067e-05 | 1.629469337e+01 | 1.629478000e+01 | 8.663e-05 | 5.316e-06 |
+| `Er2_volume_average` | -7.327513062e+01 | -7.327482000e+01 | 3.106e-04 | 4.239e-06 | 1.472109251e+02 | 1.472106000e+02 | 3.251e-04 | 2.209e-06 |
+| `Er_volume_average` | -5.210499823e-02 | -5.210322000e-02 | 1.778e-06 | 3.413e-05 | 2.666639555e+00 | 2.666646000e+00 | 6.445e-06 | 2.417e-06 |
+| `electron_temperature_volume_average_keV` | 5.199775151e-04 | 5.199775000e-04 | 1.512e-11 | 2.909e-08 | -3.043767461e+00 | -3.043767000e+00 | 4.607e-07 | 1.514e-07 |
+| `total_pressure_volume_average` | 8.060491843e+00 | 8.060492000e+00 | 1.574e-07 | 1.953e-08 | -1.451917398e+01 | -1.451917000e+01 | 3.981e-06 | 2.742e-07 |
+| `alpha_power_volume_average_mw_m3` | 2.784006908e-01 | 2.784007000e-01 | 9.225e-09 | 3.314e-08 | -4.131147899e-01 | -4.131148000e-01 | 1.007e-08 | 2.438e-08 |
+| `bootstrap_current_softmax_abs_scaled` | -1.159988826e-03 | -1.159535000e-03 | 4.538e-07 | 3.912e-04 | -3.524600220e+00 | -3.524605000e+00 | 4.780e-06 | 1.356e-06 |
