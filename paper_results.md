@@ -74,3 +74,25 @@ therefore conservative at that displayed precision.
 | `total_pressure_volume_average` | 8.060491843e+00 | 8.060492000e+00 | 1.574e-07 | 1.953e-08 | -1.451917398e+01 | -1.451917000e+01 | 3.981e-06 | 2.742e-07 |
 | `alpha_power_volume_average_mw_m3` | 2.784006908e-01 | 2.784007000e-01 | 9.225e-09 | 3.314e-08 | -4.131147899e-01 | -4.131148000e-01 | 1.007e-08 | 2.438e-08 |
 | `bootstrap_current_softmax_abs_scaled` | -1.159988826e-03 | -1.159535000e-03 | 4.538e-07 | 3.912e-04 | -3.524600220e+00 | -3.524605000e+00 | 4.780e-06 | 1.356e-06 |
+
+## RBC:1:0 frozen-geometry FD diagnostic
+
+This run used `geometry-fd-lane=frozen_linearized` and the frozen initial-Er
+root lane. Unlike the two profile-direction validations above, its reported
+primal transport values do **not** equal the reverse benchmark baseline.
+Consequently this table is an audit record, not a reverse-AD validation: the
+geometry-FD baseline construction must be reconciled before interpreting its
+derivative errors as an AD error.
+
+| objective | primal abs. mismatch | primal rel. mismatch | reverse AD | frozen geometry FD | abs. error | rel. error |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `softmax_Er` | 1.326e-02 | 6.465e-04 | -5.154810523e+01 | -5.102169000e+01 | 5.264e-01 | 1.021e-02 |
+| `net_total_power_volume_average_mw_m3` | 1.825e-05 | 3.625e-05 | -1.139421760e-02 | -1.243262000e-02 | 1.038e-03 | 9.113e-02 |
+| `Er_transition_left` | 1.094e-03 | 6.171e-05 | -2.031208973e+01 | -2.030807000e+01 | 4.020e-03 | 1.979e-04 |
+| `Er_transition_right` | 1.111e-03 | 6.047e-05 | -2.250572114e+01 | -2.250010000e+01 | 5.621e-03 | 2.498e-04 |
+| `Er2_volume_average` | 5.831e-01 | 2.468e-03 | -7.368603713e+02 | -7.515035000e+02 | 1.464e+01 | 1.987e-02 |
+| `Er_volume_average` | 1.691e-04 | 4.925e-05 | -4.059681295e+00 | -2.216080000e+01 | 1.810e+01 | 4.459e+00 |
+| `electron_temperature_volume_average_keV` | 2.422e-04 | 3.689e-05 | -1.325461832e-02 | -1.311081000e-02 | 1.438e-04 | 1.085e-02 |
+| `total_pressure_volume_average` | 4.208e-04 | 1.230e-05 | -7.263592449e-02 | -7.309052000e-02 | 4.546e-04 | 6.259e-03 |
+| `alpha_power_volume_average_mw_m3` | 1.707e-05 | 2.897e-05 | -1.155935849e-02 | -1.259516000e-02 | 1.036e-03 | 8.961e-02 |
+| `bootstrap_current_softmax_abs_scaled` | 3.043e-04 | 2.100e-04 | -1.772347606e+00 | -1.768463000e+00 | 3.885e-03 | 2.192e-03 |

@@ -52,6 +52,7 @@ from NEOPAX._reverse_ad_initial_er import (  # noqa: E402
 )
 from NEOPAX._geometry_autodiff import (  # noqa: E402
     _implicit_params_with_boundary_deltas,
+    _solve_state_for_single_param,
     boundary_param_entries,
     build_runtime_context_for_geometry_param,
     build_runtime_context_for_vmec_state,
@@ -330,8 +331,40 @@ def _frozen_linearized_vmec_geometry_bundle(
         cfg_kwargs["max_iterations"] = int(geom_cfg["vmec_max_iter"])
     cfg = im.make_config(geometry_context.indata, **cfg_kwargs)
 
-    print("[autodiff-gate] progress: baseline implicit VMEC solve for frozen-linearized geometry FD", flush=True)
-    state_star, dof_mask = im.solve_implicit_with_aux(params, cfg)
+    # The transport reverse benchmark's primal is built with the configured
+    # forward VMEC lane.  The frozen FD must use that *same* state as its zero
+    # point: using solve_implicit_with_aux() here instead gives a different
+    # nonlinear solve path and therefore a different transport/NTX baseline
+    # before the +/- h tangent endpoints are even formed.
+    print(
+        "[autodiff-gate] progress: baseline forward VMEC solve for "
+        "frozen-linearized geometry FD",
+        flush=True,
+    )
+    state_star = _solve_state_for_single_param(
+        geometry_context,
+        jnp.asarray(baseline_delta, dtype=jnp.float64),
+        lane=str(geom_cfg.get("vmec_lane", "forward")).strip().lower(),
+        max_iter=geom_cfg.get("vmec_max_iter"),
+        step_size=geom_cfg.get("vmec_step_size"),
+        jacobian_penalty=float(geom_cfg.get("vmec_jacobian_penalty", 1.0e3)),
+        solver_device=solver_device,
+    )
+
+    # The raw-block tangent needs the structural evolved-DOF mask, not the
+    # implicit solver's primal state.  VMEX defines that mask from the
+    # residual's structural support, so evaluate it at the forward state and
+    # retain the forward state above as the actual linearization point.
+    if not hasattr(im, "_dof_mask"):
+        raise RuntimeError(
+            "Frozen-linearized transport FD requires VMEX implicit._dof_mask "
+            "to form a raw-block tangent at the forward VMEC state."
+        )
+    dof_mask = im._dof_mask(
+        state_star,
+        im.runtime_from_params(params, cfg),
+        cfg,
+    )
     param_tangent = _param_unit_tangent_like(params0, entry)
     state_tangent = _manual_implicit_forward_state_tangent(
         params=params,
