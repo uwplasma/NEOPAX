@@ -3471,7 +3471,16 @@ def prepare_realtime_geometry_support_segment_core_setup(
     if geometry_volume_diagnostics is not None and not callable(geometry_volume_diagnostics):
         raise TypeError("geometry_volume_diagnostics must be callable when provided.")
     parameter_labels = tuple(str(name) for name in parameter_order)
-    combined_geometry_payload = str(args.realtime_geometry_gradient_path) == "reverse_payload"
+    # ``support_segment_probe`` is not a support-only local-VJP check.  It
+    # executes the production segmented reverse accumulation, then inspects
+    # its payload cotangents before the VMEC pullback.  It must therefore use
+    # the same combined geometry/NTX tree as ``reverse_payload``; otherwise
+    # the native rebuild bridge receives a bare NTX support tree while its
+    # merge contract requires ``{"geometry", "ntx_support"}``.
+    combined_geometry_payload = str(args.realtime_geometry_gradient_path) in {
+        "reverse_payload",
+        "support_segment_probe",
+    }
     ntx_surface_backend = str(neoclassical_cfg.get("ntx_exact_surface_backend", "booz"))
     runtime_payload = realtime_geometry_payload_for_runtime(baseline_runtime)
     payload_kind = str(runtime_payload["kind"])

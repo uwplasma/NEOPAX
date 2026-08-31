@@ -1521,7 +1521,7 @@ def test_live_ntx_scan_reverse_support_replacement_clears_cached_database():
 
 
 def test_reverse_setup_selects_live_scan_payload_without_exact_support_lookup():
-    """Setup reaches the generic scan tree before any exact-NTX lookup."""
+    """The segment probe uses the combined live scan tree without exact lookup."""
 
     surfaces = (object(), object())
     channels = _tiny_ntx_runtime_channels([0.25, 0.5])
@@ -1537,7 +1537,7 @@ def test_reverse_setup_selects_live_scan_payload_without_exact_support_lookup():
         database=None, solver_parameters={}, models=Models(flux=model),
     )
     args = types.SimpleNamespace(
-        realtime_geometry_gradient_path="reverse_payload",
+        realtime_geometry_gradient_path="support_segment_probe",
         reverse_stage_cotangent_mode="full",
         initial_er_root_ad="off",
         accepted_step_limit=None,
