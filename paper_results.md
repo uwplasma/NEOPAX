@@ -117,3 +117,39 @@ places, so the listed errors are conservative at that precision.
 | `total_pressure_volume_average` | -7.263592449e-02 | -7.300137000e-02 | 3.654e-04 | 5.031e-03 |
 | `alpha_power_volume_average_mw_m3` | -1.155935849e-02 | -1.155964000e-02 | 2.815e-07 | 2.435e-05 |
 | `bootstrap_current_softmax_abs_scaled` | -1.772347606e+00 | -1.772034000e+00 | 3.136e-04 | 1.769e-04 |
+
+## wHe realtime-geometry frozen-linearized FD results
+
+Recorded from `Solve_Transport_equations_wHe_radau_ntx_exact_lagged_runtime_vmec_realtime_geometry_benchmark.toml`
+with the accepted 16-step replay, frozen-linearized geometry lane, and
+frozen-linearized selected-root lane. The four-species momentum-correction
+selector fix is included. The pasted run completed the first three profile
+parameters; the remaining loop entries are intentionally not inferred here.
+
+Baseline objective values:
+
+| objective | value |
+| --- | ---: |
+| `softmax_Er` | 2.0480070668676280e+01 |
+| `net_total_power_volume_average_mw_m3` | 5.0826535626276426e-01 |
+| `Er_transition_left` | 1.7728042470417037e+01 |
+| `Er_transition_right` | 1.8374574669825218e+01 |
+| `Er2_volume_average` | 2.3861229649415688e+02 |
+| `Er_volume_average` | -3.4490162721552524e+00 |
+| `electron_temperature_volume_average_keV` | 6.5641845786291553e+00 |
+| `total_pressure_volume_average` | 3.4212729678180352e+01 |
+| `alpha_power_volume_average_mw_m3` | 5.8937225590716658e-01 |
+| `bootstrap_current_softmax_abs_scaled` | 1.4479788427078408e+00 |
+
+| objective | d/n0 FD | d/T0 FD | d/density-shape-power FD |
+| --- | ---: | ---: | ---: |
+| `softmax_Er` | -4.405941e+00 | 3.693007e+00 | -9.766809e-02 |
+| `net_total_power_volume_average_mw_m3` | 2.408879e-01 | 8.140385e-02 | 9.949851e-04 |
+| `Er_transition_left` | -1.447162e+00 | 1.837081e+00 | -1.280441e-02 |
+| `Er_transition_right` | -1.670833e+00 | 2.001425e+00 | -1.821576e-02 |
+| `Er2_volume_average` | -1.136820e-01 | 2.953277e+01 | 2.908472e+00 |
+| `Er_volume_average` | -4.691384e+00 | 2.484746e+00 | -1.133473e-01 |
+| `electron_temperature_volume_average_keV` | 2.627422e-04 | 3.553105e-01 | -1.731593e-05 |
+| `total_pressure_volume_average` | 8.059606e+00 | 1.864677e+00 | 2.442594e-01 |
+| `alpha_power_volume_average_mw_m3` | 2.790502e-01 | 8.360589e-02 | 2.354167e-03 |
+| `bootstrap_current_softmax_abs_scaled` | -9.391406e-04 | 2.307464e-01 | -1.320395e-02 |

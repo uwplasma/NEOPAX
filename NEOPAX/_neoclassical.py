@@ -33,7 +33,7 @@ from ._monoenergetic import (
 from ._monoenergetic_interpolators import monoenergetic_interpolation_kernel
 from ._species import get_Thermodynamical_Forces_A1, get_Thermodynamical_Forces_A2, get_Thermodynamical_Forces_A3
 from ._cell_variable import get_gradient_density, get_gradient_temperature
-from ._state import get_v_thermal
+from ._state import JOULE_PER_KEV, get_v_thermal
 
 DENSITY_STATE_TO_PHYSICAL = 1.0e20
 TEMPERATURE_STATE_TO_PHYSICAL = 1.0e3
@@ -769,9 +769,61 @@ def get_Matrix(grid, field, a, r_index, Lij, Eij, CM_ab, CN_ab, tau, v_thermal):
     return M
 
 
-@jit 
+@jit
+def _ntss_radial_flux_correction_terms(
+    field,
+    a,
+    r_index,
+    sum,
+    add1,
+    add2,
+    add3,
+    add4,
+    nu_av,
+    A1,
+    A2,
+    dTdr,
+    temperature,
+    mass,
+    charge,
+):
+    """Return NTSSfusion's added particle/heat flux velocities.
+
+    NTSSfusion stores temperature in eV and charge as ``Z``.  NEOPAX stores
+    temperature in keV and charge in Coulomb, so the common prefactor is
+    written directly in SI here.  The two returned quantities are ``Gamma/n``
+    and ``Q/(n T)`` respectively; their outer state-unit factors belong to
+    :func:`get_corrected_fluxes`.
+    """
+
+    temperature_joule = temperature[a, r_index] * JOULE_PER_KEV
+    prefactor = (
+        mass[a]
+        * temperature_joule
+        * field.G_PS[r_index]
+        / jnp.square(charge[a] * field.B0[r_index])
+    )
+    dln_temperature = dTdr[a, r_index] / temperature[a, r_index]
+    particle = prefactor * (
+        add1
+        - dln_temperature * sum[0, 1]
+        - add3
+        + A1[a, r_index] * nu_av[0] / 1.5
+        + A2[a, r_index] * nu_av[1] / 1.5
+    )
+    heat = prefactor * (
+        add2
+        - dln_temperature * (2.5 * sum[0, 1] - sum[1, 1])
+        - add4
+        + A1[a, r_index] * nu_av[1] / 1.5
+        + A2[a, r_index] * nu_av[2] / 1.5
+    )
+    return particle, heat
+
+
+@jit
 def get_corrected_fluxes(grid, field, a, r_index, Lij, Eij, nu_av, CM_ab, CN_ab, tau, correction,
-                         v_thermal, density, temperature, A1, A2, A3, charge, dndr, dTdr):
+                         v_thermal, density, temperature, A1, A2, A3, mass, charge, dndr, dTdr):
     coeff=jnp.zeros((3,3))
     nucoeff=jnp.zeros((3,3))
     #Get coeff matrices for the correction
@@ -807,14 +859,28 @@ def get_corrected_fluxes(grid, field, a, r_index, Lij, Eij, nu_av, CM_ab, CN_ab,
     ADD2 = jnp.sum(add2)
     ADD3 = jnp.sum(add3)
     ADD4 = jnp.sum(add4)
+    particle_ps, heat_ps = _ntss_radial_flux_correction_terms(
+        field,
+        a,
+        r_index,
+        sum,
+        ADD1,
+        ADD2,
+        ADD3,
+        ADD4,
+        nu_av,
+        A1,
+        A2,
+        dTdr,
+        temperature,
+        mass,
+        charge,
+    )
     # calculate corrected fluxes for species a
     Gamma = density[a, r_index] * (-(Lij.at[0, 0].get() * A1[a, r_index] + Lij.at[0, 1].get() * A2[a, r_index] + Lij.at[0, 2].get() * A3[r_index])
-        + C.at[0].get())
-    #+mass[a]*temperature[a,r_index]*G_PS[r_index]/elementary_charge/jnp.power(charge[a]*B0,2)*(ADD1-A2[a,r_index]*sum.at[0,1].get()
-    #-ADD3+A1[a,r_index]*nu_av.at[0].get()/1.5+A2[a,r_index]*nu_av.at[1].get()/1.5))
+        + C.at[0].get() + particle_ps)
     Q = temperature[a, r_index] * density[a, r_index] * (-(Lij.at[1, 0].get() * A1[a, r_index] + Lij.at[1, 1].get() * A2[a, r_index] + Lij.at[1, 2].get() * A3[r_index])
-    +C.at[1].get())#+species.mass[a]*species.temperature[a,r_index]*G_PS[r_index]/elementary_charge/jnp.power(species.charge[a]*B0,2)*(ADD2-species.A2[a,r_index]*(2.5*sum.at[0,1].get()-sum.at[1,1].get())
-    #-ADD4+species.A1[a,r_index]*nu_av.at[1].get()/1.5+species.A2[a,r_index]*nu_av.at[2].get()/1.5))
+    +C.at[1].get() + heat_ps)
     Upar = correction.at[a, 0].get() * density[a, r_index]
     qpar = correction.at[a, 1].get()
     Upar2 = correction.at[a, 2].get()
@@ -825,7 +891,7 @@ def get_corrected_fluxes(grid, field, a, r_index, Lij, Eij, nu_av, CM_ab, CN_ab,
 @jit
 #Get momentum correction at one radial position
 def get_momentum_Correction(grid, field, r_index, Lij, Eij, nu_av,
-                            v_thermal, density, temperature, A1, A2, A3, charge, dndr, dTdr):
+                            v_thermal, density, temperature, A1, A2, A3, mass, charge, dndr, dTdr):
     #Get collisional operator expansion matrix for a radial position
     n_species = density.shape[0]
     species_indices = jnp.arange(n_species)
@@ -847,9 +913,9 @@ def get_momentum_Correction(grid, field, r_index, Lij, Eij, nu_av,
     corr = jnp.reshape(solution.value, (CM_ab.shape[0], CM_ab.shape[-1]))
     #Now we need to get corrected fluxes
     #Then we apply correction to fluxes for each species in a function similar to the one for getting matrix M 
-    Gamma, Q, Upar, qpar, Upar2 = jax.vmap(get_corrected_fluxes, in_axes=(None, None, None, 0, None, 0, 0, 0, None, None, None, None, None, None, None, None, None, None, None, None, None, None))(
+    Gamma, Q, Upar, qpar, Upar2 = jax.vmap(get_corrected_fluxes, in_axes=(None, None, None, 0, None, 0, 0, 0, None, None, None, None, None, None, None, None, None, None, None, None, None))(
         grid, field, species_indices, r_index, Lij, Eij, nu_av, CM_ab, CN_ab, tau, corr,
-        v_thermal, density, temperature, A1, A2, A3, charge, dndr, dTdr)
+        v_thermal, density, temperature, A1, A2, A3, mass, charge, dndr, dTdr)
     return Gamma, Q, Upar, qpar, Upar2
 
 
@@ -951,7 +1017,7 @@ def get_Neoclassical_Fluxes_With_Momentum_Correction(
         in_axes=(None, None, 0, 1, 1, 1, None, None, None, None, None, None, None, None, None, None)
     )(
         grid, field, radial_indices, Lij, Eij, nu_weighted_average,
-        v_thermal, density, temperature, A1, A2, A3, species.charge, dndr, dTdr
+        v_thermal, density, temperature, A1, A2, A3, species.mass, species.charge, dndr, dTdr
     )
     # correction is (Gamma, Q, Upar, qpar, Upar2)
     return correction  #, Lij, Eij, nu_weighted_average

@@ -355,21 +355,6 @@ def test_build_time_solver_radau_backend():
     assert solver.rhs_mode == "black_box"
 
 
-def test_build_time_solver_radau_accepts_response_controller_contracts():
-    pytest.importorskip("diffrax")
-    solver = build_time_solver(
-        _base_solver_parameters(
-            transport_solver_backend="radau",
-            radau_lagged_response_trust_mode="next_step_cap",
-            radau_lagged_response_trust_rtol=0.03,
-            radau_lagged_response_defect_mode="endpoint_diagnostic",
-        )
-    )
-    assert solver.lagged_response_trust_mode == "next_step_cap"
-    assert solver.lagged_response_trust_rtol == pytest.approx(0.03)
-    assert solver.lagged_response_defect_mode == "endpoint_diagnostic"
-
-
 @pytest.mark.parametrize("backend", ["radau", "theta_newton"])
 def test_build_time_solver_accepts_global_state_drift_max(backend):
     pytest.importorskip("diffrax")
@@ -409,6 +394,50 @@ def test_build_time_solver_radau_accepts_shared_lagged_rhs_mode():
     )
     assert isinstance(solver, RADAUSolver)
     assert solver.rhs_mode == "lagged_linear_state"
+
+
+def test_build_time_solver_radau_accepts_endpoint_defect_correction():
+    solver = build_time_solver(
+        _base_solver_parameters(
+            transport_solver_backend="radau",
+            radau_rhs_mode="lagged_transport_response",
+            radau_lagged_response_correction_mode="endpoint_defect",
+        )
+    )
+    assert isinstance(solver, RADAUSolver)
+    assert solver.lagged_response_correction_mode == "endpoint_defect"
+
+
+def test_radau_endpoint_defect_correction_requires_transport_lagged_response():
+    with pytest.raises(ValueError, match="requires radau_rhs_mode='lagged_transport_response'"):
+        RADAUSolver(lagged_response_correction_mode="endpoint_defect")
+
+
+def test_radau_endpoint_defect_correction_runs_on_nonlinear_lagged_rhs():
+    class QuadraticLaggedField:
+        def __call__(self, _t, y):
+            return y * y
+
+        def build_lagged_response(self, y):
+            return y
+
+        def evaluate_with_lagged_response(self, _t, y, *, lagged_response):
+            return lagged_response * lagged_response + 2.0 * lagged_response * (y - lagged_response)
+
+    solver = RADAUSolver(
+        t0=0.0,
+        t1=0.05,
+        dt=0.01,
+        rtol=1.0e-5,
+        atol=1.0e-8,
+        rhs_mode="lagged_transport_response",
+        lagged_response_correction_mode="endpoint_defect",
+        maxiter=8,
+        max_steps=32,
+    )
+    out = solver.solve(jnp.asarray([0.1]), QuadraticLaggedField().__call__)
+    assert int(out["n_steps"]) > 0
+    assert jnp.all(jnp.isfinite(out["final_state"]))
 
 
 def test_build_time_solver_legacy_integrator_fallback():

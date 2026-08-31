@@ -19,6 +19,7 @@ from NEOPAX._transport_flux_models import (
 )
 from NEOPAX._neoclassical import (
     _collisionality_kind,
+    _ntss_radial_flux_correction_terms,
     get_A_matrix,
     get_Matrix,
     get_correction_matrix,
@@ -77,6 +78,8 @@ class _TestMomentumGeometry:
     r_grid: object
     r_grid_half: object
     Bsqav: object
+    G_PS: object
+    B0: object
 
 
 @jax.tree_util.register_dataclass
@@ -128,6 +131,8 @@ def test_momentum_correction_matrix_is_square_for_four_species():
         r_grid=jnp.asarray([0.5]),
         r_grid_half=jnp.asarray([0.25, 0.75]),
         Bsqav=jnp.asarray([1.2]),
+        G_PS=jnp.asarray([1.0]),
+        B0=jnp.asarray([1.0]),
     )
     grid = StandardLaguerreEnergyGrid(n_x=2)
     lij = jnp.eye(5, dtype=jnp.float64)
@@ -172,6 +177,8 @@ def test_four_species_momentum_blocks_use_species_equality_not_sonine_indices():
         r_grid=jnp.asarray([0.5]),
         r_grid_half=jnp.asarray([0.25, 0.75]),
         Bsqav=jnp.asarray([1.0]),
+        G_PS=jnp.asarray([1.0]),
+        B0=jnp.asarray([1.0]),
     )
     grid = StandardLaguerreEnergyGrid(n_x=2)
     coeff = jnp.eye(3, dtype=jnp.float64)
@@ -239,6 +246,8 @@ def test_momentum_corrected_fluxes_accept_four_collision_species():
         r_grid=jnp.asarray([0.5]),
         r_grid_half=jnp.asarray([0.25, 0.75]),
         Bsqav=jnp.asarray([1.2]),
+        G_PS=jnp.asarray([1.0]),
+        B0=jnp.asarray([1.0]),
     )
     grid = StandardLaguerreEnergyGrid(n_x=2)
     lij = jnp.reshape(jnp.linspace(0.1, 1.5, 15), (5, 3))
@@ -256,10 +265,57 @@ def test_momentum_corrected_fluxes_accept_four_collision_species():
         grid, geometry, jnp.asarray(0, dtype=jnp.int32), 0,
         lij, eij, jnp.ones(3), cm_ab, cn_ab, tau, correction,
         v_thermal, density, temperature, gradients, gradients,
-        jnp.ones(1), jnp.asarray([-1.0, 1.0, 1.0, 2.0]), gradients, gradients,
+        jnp.ones(1), jnp.ones(n_species), jnp.asarray([-1.0, 1.0, 1.0, 2.0]), gradients, gradients,
     )
 
     assert all(bool(jnp.all(jnp.isfinite(value))) for value in outputs)
+
+
+def test_ntss_radial_flux_correction_terms_match_taguchi_formula():
+    """Port the four additive Taguchi terms without changing Upar."""
+
+    geometry = _TestMomentumGeometry(
+        a_b=jnp.asarray(1.0),
+        r_grid=jnp.asarray([0.5]),
+        r_grid_half=jnp.asarray([0.25, 0.75]),
+        Bsqav=jnp.asarray([1.0]),
+        G_PS=jnp.asarray([1.7]),
+        B0=jnp.asarray([2.3]),
+    )
+    temperature = jnp.asarray([[1.2], [2.4]], dtype=jnp.float64)
+    mass = jnp.asarray([2.0, 3.0], dtype=jnp.float64)
+    charge = jnp.asarray([-1.5, 2.0], dtype=jnp.float64)
+    dtdr = jnp.asarray([[0.3], [-0.4]], dtype=jnp.float64)
+    a1 = jnp.asarray([[0.8], [-0.6]], dtype=jnp.float64)
+    a2 = jnp.asarray([[0.2], [0.5]], dtype=jnp.float64)
+    sum_matrix = jnp.asarray(
+        [[0.1, 0.4, 0.0], [0.0, 0.3, 0.0], [0.0, 0.0, 0.0]],
+        dtype=jnp.float64,
+    )
+    add1, add2, add3, add4 = (0.7, -0.2, 0.15, -0.35)
+    nu_av = jnp.asarray([0.9, 1.1, 1.3], dtype=jnp.float64)
+
+    particle, heat = _ntss_radial_flux_correction_terms(
+        geometry, 1, 0, sum_matrix, add1, add2, add3, add4, nu_av,
+        a1, a2, dtdr, temperature, mass, charge,
+    )
+    from NEOPAX._state import JOULE_PER_KEV
+
+    prefactor = (
+        mass[1] * temperature[1, 0] * JOULE_PER_KEV * geometry.G_PS[0]
+        / (charge[1] * geometry.B0[0]) ** 2
+    )
+    expected_particle = prefactor * (
+        add1 - dtdr[1, 0] / temperature[1, 0] * sum_matrix[0, 1] - add3
+        + a1[1, 0] * nu_av[0] / 1.5 + a2[1, 0] * nu_av[1] / 1.5
+    )
+    expected_heat = prefactor * (
+        add2 - dtdr[1, 0] / temperature[1, 0]
+        * (2.5 * sum_matrix[0, 1] - sum_matrix[1, 1]) - add4
+        + a1[1, 0] * nu_av[1] / 1.5 + a2[1, 0] * nu_av[2] / 1.5
+    )
+    assert jnp.allclose(particle, expected_particle, rtol=1.0e-12, atol=1.0e-30)
+    assert jnp.allclose(heat, expected_heat, rtol=1.0e-12, atol=1.0e-30)
 
 
 def _small_runtime_model(n_energy=1):
@@ -2074,6 +2130,8 @@ def test_native_vmec_face_rebuild_accumulation_matches_generic_prepared_vjp():
         r_grid=jnp.asarray([0.3, 0.7]),
         r_grid_half=jnp.asarray([0.1, 0.5, 0.9]),
         Bsqav=jnp.asarray([1.2, 1.3]),
+        G_PS=jnp.asarray([1.0, 1.0]),
+        B0=jnp.asarray([1.0, 1.0]),
     )
 
     def _channels(rho):

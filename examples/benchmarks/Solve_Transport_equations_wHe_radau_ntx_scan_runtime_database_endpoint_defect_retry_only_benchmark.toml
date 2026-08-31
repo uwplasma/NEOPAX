@@ -1,0 +1,194 @@
+# Forward-only w-He Radau endpoint-defect experiment using the same runtime-built
+# NTX scan database and physics setup as the theta database benchmark.  This
+# isolates one direct NTX endpoint RHS evaluation plus one corrected Radau
+# resolve with retry-only reuse of the NTX AD response.
+
+[general]
+mode = "transport"
+
+[geometry]
+vmec_file = "./examples/inputs/wout_QI_nfp2_newNT_opt_hires.nc"
+boozer_file = "./examples/inputs/boozermn_wout_QI_nfp2_newNT_opt_hires.nc"
+n_radial = 51
+
+[neoclassical]
+flux_model = "ntx_scan_runtime"
+entropy_model = "ntx_scan_runtime"
+ntx_scan_rho = [0.12247,0.25,0.375,0.5,0.625,0.75,0.875]
+ntx_scan_nu_v = [3.0e-7,1.0e-6,3.0e-6,1.0e-5,3.0e-5,1.0e-4,3.0e-4,1.0e-3,3.0e-3,1.0e-2,3.0e-2,1.0e-1,3.0e-1,1.0e+0,3.0e+0,1.0e+1]
+ntx_scan_er_tilde = [0.0,3.0e-6,1.0e-5,3.0e-5,1.0e-4,3.0e-4,1.0e-3,3.0e-3,1.0e-2,3.0e-2,1.0e-1]
+ntx_scan_n_theta = 25
+ntx_scan_n_zeta = 31
+ntx_scan_n_xi = 64
+ntx_scan_surface_backend = "vmec"
+
+[ambipolarity]
+er_ambipolar_method = "two_stage"
+er_ambipolar_flux_mode = "ambipolar_local"
+er_ambipolar_scan_min = -50.0
+er_ambipolar_scan_max = 50.0
+er_ambipolar_n_coarse = 80
+er_ambipolar_n_refine = 8
+er_ambipolar_max_roots = 3
+er_ambipolar_tol = 1.0e-6
+er_ambipolar_x_tol = 1.0e-6
+er_ambipolar_maxiter = 12
+er_ambipolar_blocksize = 1
+er_ambipolar_scan_batch_mode = "vmap"
+er_ambipolar_scan_batch_size = 20
+er_ambipolar_overlay_reference_er = true
+er_ambipolar_reference_er_file = "./examples/inputs/NTSS_Test_Initial_scaled_flux.h5"
+er_ambipolar_reference_er_label = "reference Er"
+er_ambipolar_plot = true
+er_ambipolar_output_dir = "./outputs/my_ambipolarity_run_scaled_flux_ntx_scan_runtime_database_wHe_radau_endpoint_defect"
+er_initialization_preprocess_boundary_state = false
+
+[turbulence]
+flux_model = "turbulent_power_analytical"
+chi_density = [6.5e-05,6.5e-05,6.5e-05,6.5e-05]
+chi_temperature = [0.0065,0.0065,0.0065,0.0065]
+
+[classical]
+flux_model = "none"
+
+[energy_grid]
+n_x = 4
+
+[species]
+n_species = 4
+names = ["e","D","T","He"]
+mass_mp = [0.000544617,2.0,3.0,4.0]
+charge_qp = [-1.0,1.0,1.0,2.0]
+
+[profiles]
+model = "standard_analytical"
+n0 = 4.21
+n_edge = 0.6
+T0 = 17.8
+T_edge = 0.7
+c_density = [1.0,0.5,0.5,0.0]
+c_temperature = [1.0,1.0,1.0,1.0]
+density_shape_power = 10.0
+temperature_shape_power = 2.0
+n_scale = [0.65,0.65,0.65,0.0]
+T_scale = 0.7
+er_initialization_mode = "ambipolar_min_entropy"
+er0_scale = 100.0
+er0_peak_rho = 0.8
+
+[boundary.density.left]
+type = "neumann"
+
+[boundary.density.left.gradient]
+default = 0.0
+
+[boundary.density.right]
+type = "dirichlet"
+
+[boundary.density.right.value]
+e = 0.39
+D = 0.195
+T = 0.195
+He = 0.0
+
+[boundary.temperature.left]
+type = "neumann"
+
+[boundary.temperature.left.gradient]
+default = 0.0
+
+[boundary.temperature.right]
+type = "robin"
+
+[boundary.temperature.right.value]
+default = 1.0
+
+[boundary.temperature.right.decay_length]
+default = 0.05
+
+[boundary.Er.left]
+type = "dirichlet"
+value = 0.0
+
+[boundary.Er.right]
+type = "floating_ambipolar_edge"
+
+[equations]
+toggle_density = [false,false,false,true]
+toggle_temperature = [true,true,true,false]
+toggle_Er = true
+
+[sources]
+temperature = ["power_exchange","dt_reaction","fusion_power_fraction_electrons","bremsstrahlung_radiation"]
+density = ["dt_reaction"]
+
+[sources.parameters.power_exchange]
+mode = "exclude_frozen"
+coulomb_log_mode = "ntssfusion"
+
+[sources.parameters.bremsstrahlung_radiation]
+coefficient_mode = "neopax"
+delta_zeff = 0.0
+
+[transport_solver]
+density_floor = 1.0e-6
+temperature_floor = 1.0e-6
+transport_solver_backend = "radau"
+integrator = "radau"
+center_flux_mode = "interpolate_from_faces"
+radau_rhs_mode = "lagged_response"
+radau_lagged_response_correction_mode = "endpoint_defect"
+radau_num_stages = 7
+nonlinear_solver_tol = 1.0e-7
+nonlinear_solver_maxiter = 20
+radau_newton_tol_mode = "hairer"
+radau_newton_fnewt_mode = "hairer"
+radau_error_estimator = "embedded2_ntss_transport_scale"
+radau_controller_mode = "hairer_lean_transport_discounted"
+radau_predictor_mode = "collocation_transport_weighted"
+# Rebuild the response at every new physical step; retain it only when the
+# adaptive controller rejects and retries that same step with a smaller dt.
+lagged_response_reuse_mode = "retry_only"
+t0 = 0.0
+t_final = 20.0
+dt = 1.0e-8
+rtol = 1.0e-6
+atol = 1.0e-8
+max_step = 1.0
+min_step = 1.0e-14
+max_steps = 20000
+throw = false
+debug_stage_markers = true
+debug_walltime_attempts = true
+debug_nonfinite_rhs_components = false
+debug_disable_jit = false
+save_n = 10
+
+temperature_include_work_term = true
+temperature_include_neo_convection = true
+temperature_include_turbulent_convection = false
+temperature_include_classical_convection = false
+temperature_convection_reconstruction = "closure_face_flux"
+temperature_heat_flux_reconstruction = "closure_face_flux"
+
+Er_source_mode = "ambipolar_local"
+work_source_mode = "local"
+Er_relax = 0.1
+DEr = 2.0
+Er_permittivity_mode = "ntss_like_midpoint"
+
+[transport_output]
+transport_print_summary = true
+transport_plot = true
+transport_write_hdf5 = true
+transport_compare_ambipolarity_residual = false
+transport_scan_ambipolarity_residual = false
+transport_overlay_reference_er = true
+transport_initial_reference_file = "./examples/inputs/NTSS_Test_Initial_scaled_flux.h5"
+transport_initial_reference_label = "Initial NTSS"
+transport_final_reference_file = "./examples/inputs/NTSS_Test_Final_flux_scaled_wHe.h5"
+transport_final_reference_label = "Final NTSS"
+transport_output_dir = "./outputs/transport_solver_radau_wHe_ntx_scan_runtime_database_endpoint_defect"
+transport_plot_n_times = -1
+
+

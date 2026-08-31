@@ -3194,11 +3194,7 @@ class _RadauSolverConfig(TransportSolver):
     lagged_response_reuse_mode: str = "retry_only"
     lagged_response_reuse_rtol: float = 5.0e-2
     lagged_response_reuse_atol: float = 1.0e-8
-    lagged_response_trust_mode: str = "off"
-    lagged_response_trust_rtol: float = 5.0e-2
-    lagged_response_trust_atol: float = 1.0e-8
-    lagged_response_trust_max_drift: float = 1.0
-    lagged_response_trust_safety_factor: float = 0.9
+    lagged_response_correction_mode: str = "none"
     lagged_response_defect_mode: str = "off"
     lagged_response_defect_rtol: float = 1.0e-6
     lagged_response_defect_atol: float = 1.0e-8
@@ -3239,11 +3235,7 @@ class _RadauSolverConfig(TransportSolver):
         lagged_response_reuse_mode: str = "retry_only",
         lagged_response_reuse_rtol: float = 5.0e-2,
         lagged_response_reuse_atol: float = 1.0e-8,
-        lagged_response_trust_mode: str = "off",
-        lagged_response_trust_rtol: float = 5.0e-2,
-        lagged_response_trust_atol: float = 1.0e-8,
-        lagged_response_trust_max_drift: float = 1.0,
-        lagged_response_trust_safety_factor: float = 0.9,
+        lagged_response_correction_mode: str = "none",
         lagged_response_defect_mode: str = "off",
         lagged_response_defect_rtol: float = 1.0e-6,
         lagged_response_defect_atol: float = 1.0e-8,
@@ -3419,20 +3411,27 @@ class _RadauSolverConfig(TransportSolver):
         object.__setattr__(self, "lagged_response_reuse_mode", lagged_reuse_mode_norm)
         object.__setattr__(self, "lagged_response_reuse_rtol", float(lagged_response_reuse_rtol))
         object.__setattr__(self, "lagged_response_reuse_atol", float(lagged_response_reuse_atol))
-        trust_mode_norm = str(lagged_response_trust_mode).strip().lower()
-        trust_mode_aliases = {"none": "off", "disabled": "off", "next": "next_step_cap", "cap": "next_step_cap"}
-        trust_mode_norm = trust_mode_aliases.get(trust_mode_norm, trust_mode_norm)
-        if trust_mode_norm not in {"off", "next_step_cap"}:
-            raise ValueError("radau_lagged_response_trust_mode must be one of: off, next_step_cap")
-        if float(lagged_response_trust_max_drift) <= 0.0:
-            raise ValueError("radau_lagged_response_trust_max_drift must be positive")
-        if not 0.0 < float(lagged_response_trust_safety_factor) <= 1.0:
-            raise ValueError("radau_lagged_response_trust_safety_factor must lie in (0, 1]")
-        object.__setattr__(self, "lagged_response_trust_mode", trust_mode_norm)
-        object.__setattr__(self, "lagged_response_trust_rtol", float(lagged_response_trust_rtol))
-        object.__setattr__(self, "lagged_response_trust_atol", float(lagged_response_trust_atol))
-        object.__setattr__(self, "lagged_response_trust_max_drift", float(lagged_response_trust_max_drift))
-        object.__setattr__(self, "lagged_response_trust_safety_factor", float(lagged_response_trust_safety_factor))
+        correction_mode_norm = str(lagged_response_correction_mode).strip().lower()
+        correction_mode_aliases = {
+            "off": "none",
+            "disabled": "none",
+            "endpoint": "endpoint_defect",
+            "defect": "endpoint_defect",
+        }
+        correction_mode_norm = correction_mode_aliases.get(correction_mode_norm, correction_mode_norm)
+        if correction_mode_norm not in {"none", "endpoint_defect"}:
+            raise ValueError(
+                "radau_lagged_response_correction_mode must be one of: none, endpoint_defect"
+            )
+        if correction_mode_norm != "none" and str(rhs_mode).strip().lower() not in {
+            "lagged_transport_response",
+            "lagged_response",
+        }:
+            raise ValueError(
+                "radau_lagged_response_correction_mode='endpoint_defect' requires "
+                "radau_rhs_mode='lagged_transport_response'."
+            )
+        object.__setattr__(self, "lagged_response_correction_mode", correction_mode_norm)
         defect_mode_norm = str(lagged_response_defect_mode).strip().lower()
         defect_mode_aliases = {"none": "off", "disabled": "off", "endpoint": "endpoint_diagnostic", "diagnostic": "endpoint_diagnostic", "next": "endpoint_next_step_cap", "cap": "endpoint_next_step_cap"}
         defect_mode_norm = defect_mode_aliases.get(defect_mode_norm, defect_mode_norm)
@@ -3922,6 +3921,19 @@ class _RadauStageSubsolveInputs:
     real_piv_out: Any
     complex_lu_out: Any
     complex_piv_out: Any
+    endpoint_defect_correction: Any = None
+
+
+@jax.tree_util.register_dataclass
+@dataclasses.dataclass(frozen=True, eq=False)
+class _RadauEndpointDefectCorrection:
+    """Path-local nonlinear correction built from one direct endpoint RHS value."""
+
+    direction: Any
+    inverse_scale_squared: Any
+    inverse_direction_norm_squared: Any
+    defect: Any
+    active: Any
 
 
 @jax.tree_util.register_dataclass
@@ -3989,6 +4001,7 @@ class _RadauAcceptedStepKernelContext:
     zero_scalar: Any
     debug_newton_trace: Any
     use_transport_lagged_response: Any
+    lagged_response_correction_mode: str
 
 
 @dataclasses.dataclass(frozen=True, eq=False)
@@ -8685,8 +8698,6 @@ def _radau_attempt_step_forward_solver(
         lagged_response_reuse_atol=execution_context.lagged_response_reuse_atol,
         project_flat=execution_context.project_flat,
     )
-
-
 def _radau_attempt_step_with_payload(
     execution_context: _RadauSolveExecutionContext,
     step_state: _RadauStepState,
@@ -8968,6 +8979,61 @@ def _radau_eval_rhs(
     return flat_rhs(t_eval, y_eval)
 
 
+def _radau_build_endpoint_defect_correction(
+    kernel_context: _RadauAcceptedStepKernelContext,
+    physics_context: _RadauAcceptedStepPhysicsContext,
+    *,
+    flat_y,
+    t_value,
+    h_value,
+    flat_endpoint,
+    lagged_response,
+) -> _RadauEndpointDefectCorrection:
+    """Construct a first-order-anchor-preserving endpoint defect correction.
+
+    The direct RHS is evaluated only at the stiffly-accurate Radau endpoint.
+    The quadratic path coordinate makes the correction and its first state
+    derivative vanish at the lagged-response anchor.
+    """
+    endpoint_time = t_value + h_value
+    direct_endpoint_rhs = physics_context.flat_rhs(endpoint_time, flat_endpoint)
+    lagged_endpoint_rhs = _radau_eval_rhs(
+        endpoint_time,
+        flat_endpoint,
+        lagged_response,
+        physics_context.flat_rhs,
+        physics_context.flat_rhs_with_lagged_response,
+    )
+    direction = flat_endpoint - flat_y
+    state_scale = kernel_context.atol + kernel_context.rtol * jnp.maximum(
+        jnp.abs(flat_y),
+        jnp.abs(flat_endpoint),
+    )
+    safe_scale = jnp.maximum(state_scale, kernel_context.tiny_scalar)
+    inverse_scale_squared = jnp.reciprocal(safe_scale * safe_scale)
+    direction_norm_squared = jnp.sum(
+        inverse_scale_squared * direction * direction
+    )
+    active = direction_norm_squared > kernel_context.tiny_scalar
+    inverse_direction_norm_squared = jnp.where(
+        active,
+        jnp.reciprocal(direction_norm_squared),
+        kernel_context.zero_scalar,
+    )
+    defect = jnp.where(
+        active,
+        direct_endpoint_rhs - lagged_endpoint_rhs,
+        jnp.zeros_like(direct_endpoint_rhs),
+    )
+    return _RadauEndpointDefectCorrection(
+        direction=direction,
+        inverse_scale_squared=inverse_scale_squared,
+        inverse_direction_norm_squared=inverse_direction_norm_squared,
+        defect=defect,
+        active=active,
+    )
+
+
 def _radau_residual_norm(
     kernel_context: _RadauAcceptedStepKernelContext,
     residual_vec,
@@ -9017,6 +9083,7 @@ def _radau_evaluate_stage_model(
     f0,
     jacobian_ref,
     lagged_response,
+    endpoint_defect_correction: _RadauEndpointDefectCorrection | None = None,
 ):
     stages = z_flat.reshape((kernel_context.num_stages, kernel_context.state_dim))
     stage_states = flat_y[None, :] + h_value * (kernel_context.a @ stages)
@@ -9038,6 +9105,22 @@ def _radau_evaluate_stage_model(
     else:
         stage_times = t_value + kernel_context.c * h_value
         evals = jax.vmap(physics_context.flat_rhs, in_axes=(0, 0))(stage_times, stage_states)
+    if endpoint_defect_correction is not None:
+        state_delta = stage_states - flat_y[None, :]
+        weighted_direction = (
+            endpoint_defect_correction.inverse_scale_squared
+            * endpoint_defect_correction.direction
+        )
+        path_coordinate = jnp.sum(state_delta * weighted_direction[None, :], axis=1)
+        path_coordinate = (
+            path_coordinate * endpoint_defect_correction.inverse_direction_norm_squared
+        )
+        path_coordinate = jnp.where(
+            endpoint_defect_correction.active,
+            path_coordinate,
+            jnp.zeros_like(path_coordinate),
+        )
+        evals = evals + (path_coordinate * path_coordinate)[:, None] * endpoint_defect_correction.defect[None, :]
     return stages, evals
 
 
@@ -9052,6 +9135,7 @@ def _radau_stage_residual(
     f0,
     jacobian_ref,
     lagged_response,
+    endpoint_defect_correction: _RadauEndpointDefectCorrection | None = None,
 ):
     stages, evals = _radau_evaluate_stage_model(
         kernel_context,
@@ -9063,6 +9147,7 @@ def _radau_stage_residual(
         f0=f0,
         jacobian_ref=jacobian_ref,
         lagged_response=lagged_response,
+        endpoint_defect_correction=endpoint_defect_correction,
     )
     return (stages - evals).reshape((-1,))
 
@@ -9118,6 +9203,7 @@ def _radau_debug_nonfinite_stage_residual(
         f0=inputs.f0,
         jacobian_ref=inputs.jacobian_ref,
         lagged_response=inputs.lagged_response,
+        endpoint_defect_correction=inputs.endpoint_defect_correction,
     )
     stage_states = inputs.flat_y[None, :] + inputs.h_value * (kernel_context.a @ stages)
     residual_matrix = stages - evals
@@ -13466,6 +13552,30 @@ def _radau_single_step_primal(
         physics_context,
         subsolve_inputs,
     )
+    if kernel_context.lagged_response_correction_mode == "endpoint_defect":
+        predictor_stages = subsolve_result.z_final.reshape(
+            (kernel_context.num_stages, kernel_context.state_dim)
+        )
+        predictor_endpoint = flat_y + h_value * (kernel_context.b @ predictor_stages)
+        endpoint_defect_correction = _radau_build_endpoint_defect_correction(
+            kernel_context,
+            physics_context,
+            flat_y=flat_y,
+            t_value=t_value,
+            h_value=h_value,
+            flat_endpoint=predictor_endpoint,
+            lagged_response=lagged_response,
+        )
+        corrected_subsolve_inputs = dataclasses.replace(
+            subsolve_inputs,
+            z0=subsolve_result.z_final,
+            endpoint_defect_correction=endpoint_defect_correction,
+        )
+        subsolve_result = _radau_run_stage_subsolve_from_inputs(
+            kernel_context,
+            physics_context,
+            corrected_subsolve_inputs,
+        )
     stages_final = subsolve_result.z_final.reshape((kernel_context.num_stages, kernel_context.state_dim))
     if kernel_context.debug_newton_trace:
         jax.debug.print(
@@ -18728,6 +18838,9 @@ def _build_prepared_radau_accepted_rollout(
         zero_scalar=zero_scalar,
         debug_newton_trace=bool(debug_newton_trace),
         use_transport_lagged_response=bool(use_transport_lagged_response),
+        lagged_response_correction_mode=str(
+            getattr(solver, "lagged_response_correction_mode", "none")
+        ).strip().lower(),
     )
     physics_context = _RadauAcceptedStepPhysicsContext(
         unpack_flat=unpack_flat,
@@ -19432,6 +19545,9 @@ class RADAUSolver(_RadauSolverConfig):
             zero_scalar=zero_scalar,
             debug_newton_trace=bool(debug_newton_trace),
             use_transport_lagged_response=bool(use_transport_lagged_response),
+            lagged_response_correction_mode=str(
+                getattr(self, "lagged_response_correction_mode", "none")
+            ).strip().lower(),
         )
         physics_context = _RadauAcceptedStepPhysicsContext(
             unpack_flat=unpack_flat,
@@ -22956,11 +23072,9 @@ def build_time_solver(solver_parameters: Any, solver_override: Any = None) -> Tr
             lagged_response_reuse_mode=str(_cfg_get("lagged_response_reuse_mode", "retry_only")),
             lagged_response_reuse_rtol=float(_cfg_get("lagged_response_reuse_rtol", 5.0e-2)),
             lagged_response_reuse_atol=float(_cfg_get("lagged_response_reuse_atol", 1.0e-8)),
-            lagged_response_trust_mode=str(_cfg_get("radau_lagged_response_trust_mode", "off")),
-            lagged_response_trust_rtol=float(_cfg_get("radau_lagged_response_trust_rtol", 5.0e-2)),
-            lagged_response_trust_atol=float(_cfg_get("radau_lagged_response_trust_atol", 1.0e-8)),
-            lagged_response_trust_max_drift=float(_cfg_get("radau_lagged_response_trust_max_drift", 1.0)),
-            lagged_response_trust_safety_factor=float(_cfg_get("radau_lagged_response_trust_safety_factor", 0.9)),
+            lagged_response_correction_mode=str(
+                _cfg_get("radau_lagged_response_correction_mode", "none")
+            ),
             lagged_response_defect_mode=str(_cfg_get("radau_lagged_response_defect_mode", "off")),
             lagged_response_defect_rtol=float(_cfg_get("radau_lagged_response_defect_rtol", 1.0e-6)),
             lagged_response_defect_atol=float(_cfg_get("radau_lagged_response_defect_atol", 1.0e-8)),

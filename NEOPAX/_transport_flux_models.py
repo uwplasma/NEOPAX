@@ -9265,6 +9265,7 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                     None,
                     None,
                     None,
+                    None,
                 ),
             )(
                 self.energy_grid,
@@ -9284,6 +9285,7 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                 A1,
                 A2,
                 A3,
+                self.species.mass,
                 self.species.charge,
                 dndr,
                 dTdr,
@@ -9477,6 +9479,7 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                 None,
                 None,
                 None,
+                None,
             ),
         )(
             self.energy_grid,
@@ -9496,6 +9499,7 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             A1,
             A2,
             A3,
+            self.species.mass,
             self.species.charge,
             dndr,
             dTdr,
