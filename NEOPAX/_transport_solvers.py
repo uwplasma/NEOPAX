@@ -3194,6 +3194,16 @@ class _RadauSolverConfig(TransportSolver):
     lagged_response_reuse_mode: str = "retry_only"
     lagged_response_reuse_rtol: float = 5.0e-2
     lagged_response_reuse_atol: float = 1.0e-8
+    lagged_response_trust_mode: str = "off"
+    lagged_response_trust_rtol: float = 5.0e-2
+    lagged_response_trust_atol: float = 1.0e-8
+    lagged_response_trust_max_drift: float = 1.0
+    lagged_response_trust_safety_factor: float = 0.9
+    lagged_response_defect_mode: str = "off"
+    lagged_response_defect_rtol: float = 1.0e-6
+    lagged_response_defect_atol: float = 1.0e-8
+    lagged_response_defect_max_norm: float = 1.0
+    lagged_response_defect_safety_factor: float = 0.9
     max_steps: int = 20000
     stop_after_accepted_steps: int | None = None
     n_steps: int = 0
@@ -3229,6 +3239,16 @@ class _RadauSolverConfig(TransportSolver):
         lagged_response_reuse_mode: str = "retry_only",
         lagged_response_reuse_rtol: float = 5.0e-2,
         lagged_response_reuse_atol: float = 1.0e-8,
+        lagged_response_trust_mode: str = "off",
+        lagged_response_trust_rtol: float = 5.0e-2,
+        lagged_response_trust_atol: float = 1.0e-8,
+        lagged_response_trust_max_drift: float = 1.0,
+        lagged_response_trust_safety_factor: float = 0.9,
+        lagged_response_defect_mode: str = "off",
+        lagged_response_defect_rtol: float = 1.0e-6,
+        lagged_response_defect_atol: float = 1.0e-8,
+        lagged_response_defect_max_norm: float = 1.0,
+        lagged_response_defect_safety_factor: float = 0.9,
         max_steps: int = 20000,
         stop_after_accepted_steps: int | None = None,
         debug_stage_markers: bool = False,
@@ -3399,6 +3419,34 @@ class _RadauSolverConfig(TransportSolver):
         object.__setattr__(self, "lagged_response_reuse_mode", lagged_reuse_mode_norm)
         object.__setattr__(self, "lagged_response_reuse_rtol", float(lagged_response_reuse_rtol))
         object.__setattr__(self, "lagged_response_reuse_atol", float(lagged_response_reuse_atol))
+        trust_mode_norm = str(lagged_response_trust_mode).strip().lower()
+        trust_mode_aliases = {"none": "off", "disabled": "off", "next": "next_step_cap", "cap": "next_step_cap"}
+        trust_mode_norm = trust_mode_aliases.get(trust_mode_norm, trust_mode_norm)
+        if trust_mode_norm not in {"off", "next_step_cap"}:
+            raise ValueError("radau_lagged_response_trust_mode must be one of: off, next_step_cap")
+        if float(lagged_response_trust_max_drift) <= 0.0:
+            raise ValueError("radau_lagged_response_trust_max_drift must be positive")
+        if not 0.0 < float(lagged_response_trust_safety_factor) <= 1.0:
+            raise ValueError("radau_lagged_response_trust_safety_factor must lie in (0, 1]")
+        object.__setattr__(self, "lagged_response_trust_mode", trust_mode_norm)
+        object.__setattr__(self, "lagged_response_trust_rtol", float(lagged_response_trust_rtol))
+        object.__setattr__(self, "lagged_response_trust_atol", float(lagged_response_trust_atol))
+        object.__setattr__(self, "lagged_response_trust_max_drift", float(lagged_response_trust_max_drift))
+        object.__setattr__(self, "lagged_response_trust_safety_factor", float(lagged_response_trust_safety_factor))
+        defect_mode_norm = str(lagged_response_defect_mode).strip().lower()
+        defect_mode_aliases = {"none": "off", "disabled": "off", "endpoint": "endpoint_diagnostic", "diagnostic": "endpoint_diagnostic", "next": "endpoint_next_step_cap", "cap": "endpoint_next_step_cap"}
+        defect_mode_norm = defect_mode_aliases.get(defect_mode_norm, defect_mode_norm)
+        if defect_mode_norm not in {"off", "endpoint_diagnostic", "endpoint_next_step_cap"}:
+            raise ValueError("radau_lagged_response_defect_mode must be one of: off, endpoint_diagnostic, endpoint_next_step_cap")
+        if float(lagged_response_defect_max_norm) <= 0.0:
+            raise ValueError("radau_lagged_response_defect_max_norm must be positive")
+        if not 0.0 < float(lagged_response_defect_safety_factor) <= 1.0:
+            raise ValueError("radau_lagged_response_defect_safety_factor must lie in (0, 1]")
+        object.__setattr__(self, "lagged_response_defect_mode", defect_mode_norm)
+        object.__setattr__(self, "lagged_response_defect_rtol", float(lagged_response_defect_rtol))
+        object.__setattr__(self, "lagged_response_defect_atol", float(lagged_response_defect_atol))
+        object.__setattr__(self, "lagged_response_defect_max_norm", float(lagged_response_defect_max_norm))
+        object.__setattr__(self, "lagged_response_defect_safety_factor", float(lagged_response_defect_safety_factor))
         object.__setattr__(self, "max_steps", int(max(1, max_steps)))
         if stop_after_accepted_steps is not None:
             stop_after_accepted_steps = int(max(1, stop_after_accepted_steps))
@@ -22908,6 +22956,16 @@ def build_time_solver(solver_parameters: Any, solver_override: Any = None) -> Tr
             lagged_response_reuse_mode=str(_cfg_get("lagged_response_reuse_mode", "retry_only")),
             lagged_response_reuse_rtol=float(_cfg_get("lagged_response_reuse_rtol", 5.0e-2)),
             lagged_response_reuse_atol=float(_cfg_get("lagged_response_reuse_atol", 1.0e-8)),
+            lagged_response_trust_mode=str(_cfg_get("radau_lagged_response_trust_mode", "off")),
+            lagged_response_trust_rtol=float(_cfg_get("radau_lagged_response_trust_rtol", 5.0e-2)),
+            lagged_response_trust_atol=float(_cfg_get("radau_lagged_response_trust_atol", 1.0e-8)),
+            lagged_response_trust_max_drift=float(_cfg_get("radau_lagged_response_trust_max_drift", 1.0)),
+            lagged_response_trust_safety_factor=float(_cfg_get("radau_lagged_response_trust_safety_factor", 0.9)),
+            lagged_response_defect_mode=str(_cfg_get("radau_lagged_response_defect_mode", "off")),
+            lagged_response_defect_rtol=float(_cfg_get("radau_lagged_response_defect_rtol", 1.0e-6)),
+            lagged_response_defect_atol=float(_cfg_get("radau_lagged_response_defect_atol", 1.0e-8)),
+            lagged_response_defect_max_norm=float(_cfg_get("radau_lagged_response_defect_max_norm", 1.0)),
+            lagged_response_defect_safety_factor=float(_cfg_get("radau_lagged_response_defect_safety_factor", 0.9)),
             max_steps=int(_cfg_get("max_steps", 20000)),
             stop_after_accepted_steps=stop_after_accepted_steps,
             debug_stage_markers=bool(_cfg_get("debug_stage_markers", False)),

@@ -19,7 +19,9 @@ from NEOPAX._transport_flux_models import (
 )
 from NEOPAX._neoclassical import (
     _collisionality_kind,
+    get_A_matrix,
     get_Matrix,
+    get_correction_matrix,
     get_corrected_fluxes,
 )
 from NEOPAX._energy_grid_models import StandardLaguerreEnergyGrid
@@ -154,6 +156,73 @@ def test_momentum_correction_matrix_is_square_for_four_species():
 
     assert rows.shape == (n_species, 3, n_species * 3)
     assert matrix.shape == (n_species * 3, n_species * 3)
+
+
+def test_four_species_momentum_blocks_use_species_equality_not_sonine_indices():
+    """The fourth species must not alias the final Sonine index.
+
+    NTSSfusion distinguishes the diagonal ``a == b`` block explicitly.  A
+    3-by-3 Sonine identity cannot implement that predicate once there are four
+    kinetic species.
+    """
+
+    n_species = 4
+    geometry = _TestMomentumGeometry(
+        a_b=jnp.asarray(1.0),
+        r_grid=jnp.asarray([0.5]),
+        r_grid_half=jnp.asarray([0.25, 0.75]),
+        Bsqav=jnp.asarray([1.0]),
+    )
+    grid = StandardLaguerreEnergyGrid(n_x=2)
+    coeff = jnp.eye(3, dtype=jnp.float64)
+    nucoeff = jnp.zeros((3, 3), dtype=jnp.float64)
+    cm_ab = jnp.ones((n_species, n_species, 3, 3), dtype=jnp.float64)
+    cn_ab = 0.2 * jnp.ones((n_species, n_species, 3, 3), dtype=jnp.float64)
+    tau = jnp.ones((n_species, n_species), dtype=jnp.float64)
+    v_thermal = jnp.ones((n_species, 1), dtype=jnp.float64)
+    sonine = grid.Sonine_expansion
+    factor = 2.0
+
+    # ``a=3, b=2`` is an off-diagonal species block.  The old ``I[a,b]``
+    # selector was clipped by JAX to I[2,2] and incorrectly made it diagonal.
+    actual = get_A_matrix(
+        grid, jnp.asarray(3), jnp.asarray(2), coeff, nucoeff, cn_ab,
+        jnp.zeros((3, 3)), tau, v_thermal, geometry, 0,
+    )
+    expected = -factor * jnp.multiply(coeff.T @ cn_ab[3, 2], sonine)
+    assert jnp.allclose(actual, expected, rtol=1.0e-12, atol=1.0e-12)
+
+    # The matching fourth-species diagonal must still take the diagonal block
+    # (the only valid use of the 3-by-3 Sonine identity in this expression).
+    diagonal_sum = 0.3 * jnp.eye(3, dtype=jnp.float64)
+    diagonal = get_A_matrix(
+        grid, jnp.asarray(3), jnp.asarray(3), coeff, nucoeff, cn_ab,
+        diagonal_sum, tau, v_thermal, geometry, 0,
+    )
+    expected_diagonal = jnp.eye(3) - factor * jnp.multiply(
+        coeff.T @ diagonal_sum, sonine
+    )
+    assert jnp.allclose(diagonal, expected_diagonal, rtol=1.0e-12, atol=1.0e-12)
+
+    correction = jnp.ones((n_species, 3), dtype=jnp.float64)
+    density = jnp.ones((n_species, 1), dtype=jnp.float64)
+    temperature = 2.0 * jnp.ones((n_species, 1), dtype=jnp.float64)
+    dndr = jnp.zeros((n_species, 1), dtype=jnp.float64)
+    dtdr = jnp.asarray([[0.1], [0.2], [0.3], [0.4]], dtype=jnp.float64)
+    charge = jnp.asarray([-1.0, 1.0, 1.0, 2.0], dtype=jnp.float64)
+    correction_term, add1, *_ = get_correction_matrix(
+        grid, jnp.asarray(3), jnp.asarray(2), coeff, nucoeff, cm_ab, cn_ab,
+        jnp.zeros((3, 3)), tau, factor, correction, 0, dndr, dtdr,
+        temperature, density, charge,
+    )
+    expected_term = -factor * ((coeff.T @ cn_ab[3, 2]) @ sonine)
+    expected_add1 = (
+        dtdr[3, 0] / temperature[3, 0]
+        - charge[3] / charge[2] * temperature[2, 0] / temperature[3, 0]
+        * dtdr[2, 0] / temperature[2, 0]
+    )
+    assert jnp.allclose(correction_term, expected_term, rtol=1.0e-12, atol=1.0e-12)
+    assert jnp.allclose(add1, expected_add1, rtol=1.0e-12, atol=1.0e-12)
 
 
 def test_momentum_corrected_fluxes_accept_four_collision_species():

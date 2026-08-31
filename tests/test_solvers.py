@@ -355,6 +355,21 @@ def test_build_time_solver_radau_backend():
     assert solver.rhs_mode == "black_box"
 
 
+def test_build_time_solver_radau_accepts_response_controller_contracts():
+    pytest.importorskip("diffrax")
+    solver = build_time_solver(
+        _base_solver_parameters(
+            transport_solver_backend="radau",
+            radau_lagged_response_trust_mode="next_step_cap",
+            radau_lagged_response_trust_rtol=0.03,
+            radau_lagged_response_defect_mode="endpoint_diagnostic",
+        )
+    )
+    assert solver.lagged_response_trust_mode == "next_step_cap"
+    assert solver.lagged_response_trust_rtol == pytest.approx(0.03)
+    assert solver.lagged_response_defect_mode == "endpoint_diagnostic"
+
+
 @pytest.mark.parametrize("backend", ["radau", "theta_newton"])
 def test_build_time_solver_accepts_global_state_drift_max(backend):
     pytest.importorskip("diffrax")

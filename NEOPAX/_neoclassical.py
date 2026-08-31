@@ -683,8 +683,12 @@ def get_A_matrix(grid, a, b, coeff, nucoeff, CN, sum, tau, v_thermal, field, r_i
     I=jnp.identity(3)
     A=jnp.zeros((3,3))
     factor = 2. / jnp.power(v_thermal[a, r_index], 2) / field.Bsqav[r_index]
-    A = (I - factor * jnp.multiply(jnp.matmul(jnp.transpose(coeff), sum) + nucoeff, grid.Sonine_expansion)) * I.at[a, b].get() \
-        - factor * jnp.multiply(jnp.matmul(jnp.transpose(coeff), CN.at[a, b, :, :].get() / tau.at[a, b].get()), grid.Sonine_expansion) * (1. - I.at[a, b].get())
+    # ``I`` lives in Sonine-moment space.  It must not be used to decide
+    # whether two *species* are equal: doing so aliases species index 3 to
+    # the final Sonine index and corrupts the four-species (wHe) system.
+    same_species = jnp.equal(a, b).astype(coeff.dtype)
+    A = (I - factor * jnp.multiply(jnp.matmul(jnp.transpose(coeff), sum) + nucoeff, grid.Sonine_expansion)) * same_species \
+        - factor * jnp.multiply(jnp.matmul(jnp.transpose(coeff), CN.at[a, b, :, :].get() / tau.at[a, b].get()), grid.Sonine_expansion) * (1. - same_species)
     #A=A.at[0,0].set(I.at[a,b].get()*(1.-factor*(jnp.sum(coeff.at[:,0].get()*sum.at[:,0].get())+nucoeff.at[0,0].get())*Sonine_expansion.at[0].get())-factor*jnp.sum(coeff.at[:,0].get()*CN.at[a,b,:,0].get())/tau.at[a,b].get()*Sonine_expansion.at[0].get()*(1.-I.at[a,b].get()))
     #A=A.at[0,1].set(I.at[a,b].get()*(-factor*(jnp.sum(coeff.at[:,0].get()*sum.at[:,1].get())+nucoeff.at[1,0].get())*Sonine_expansion.at[1].get())-factor*jnp.sum(coeff.at[:,0].get()*CN.at[a,b,:,1].get())/tau.at[a,b].get()*Sonine_expansion.at[1].get()*(1.-I.at[a,b].get()))
     #A=A.at[0,2].set(I.at[a,b].get()*(-factor*(jnp.sum(coeff.at[:,0].get()*sum.at[:,2].get())+nucoeff.at[2,0].get())*Sonine_expansion.at[2].get())-factor*jnp.sum(coeff.at[:,0].get()*CN.at[a,b,:,2].get())/tau.at[a,b].get()*Sonine_expansion.at[2].get()*(1.-I.at[a,b].get()))
@@ -700,24 +704,26 @@ def get_A_matrix(grid, a, b, coeff, nucoeff, CN, sum, tau, v_thermal, field, r_i
 #auxilir matrix to construct matrix for species a
 def get_correction_matrix(grid, a, b, coeff, nucoeff, CM, CN, sum, tau, factor, correction, r_index,
                          dndr, dTdr, temperature, density, charge):
-    I = jnp.identity(3)
+    # The Sonine identity has no role in the species-diagonal predicate.
+    # Keep that predicate explicit, as in NTSSfusion's ``ia == ib`` branch.
+    same_species = jnp.equal(a, b).astype(coeff.dtype)
     A = -factor * jnp.matmul(jnp.matmul(jnp.transpose(coeff), sum) + nucoeff,
-                            jnp.multiply(grid.Sonine_expansion, correction.at[b].get())) * I.at[a, b].get() \
+                            jnp.multiply(grid.Sonine_expansion, correction.at[b].get())) * same_species \
         - factor * jnp.matmul(jnp.matmul(jnp.transpose(coeff), CN.at[a, b, :, :].get() / tau.at[a, b].get()),
-                            jnp.multiply(grid.Sonine_expansion, correction.at[b].get())) * (1. - I.at[a, b].get())
-    add1 = (1. - I.at[a, b].get()) * (
+                            jnp.multiply(grid.Sonine_expansion, correction.at[b].get())) * (1. - same_species)
+    add1 = (1. - same_species) * (
         dndr[a, r_index] / density[a, r_index] + dTdr[a, r_index] / temperature[a, r_index]
         - charge[a] / charge[b] * temperature[b, r_index] / temperature[a, r_index]
-        * (dndr[b, r_index] / density[b, r_index] + dndr[b, r_index] / density[b, r_index])
+        * (dndr[b, r_index] / density[b, r_index] + dTdr[b, r_index] / temperature[b, r_index])
     ) * CM.at[a, b, 0, 0].get() / tau.at[a, b].get()
-    add2 = (1. - I.at[a, b].get()) * (
+    add2 = (1. - same_species) * (
         dndr[a, r_index] / density[a, r_index] + dTdr[a, r_index] / temperature[a, r_index]
         - charge[a] / charge[b] * temperature[b, r_index] / temperature[a, r_index]
-        * (dndr[b, r_index] / density[b, r_index] + dndr[b, r_index] / density[b, r_index])
+        * (dndr[b, r_index] / density[b, r_index] + dTdr[b, r_index] / temperature[b, r_index])
     ) * (2.5 * CM.at[a, b, 0, 0].get() - CM.at[a, b, 1, 0].get()) / tau.at[a, b].get()
-    add3 = (1. - I.at[a, b].get()) * charge[a] / charge[b] * temperature[b, r_index] / temperature[a, r_index] \
+    add3 = (1. - same_species) * charge[a] / charge[b] * temperature[b, r_index] / temperature[a, r_index] \
         * (dTdr[b, r_index] / temperature[b, r_index]) * CN.at[a, b, 0, 1].get() / tau.at[a, b].get()
-    add4 = (1. - I.at[a, b].get()) * charge[a] / charge[b] * temperature[b, r_index] / temperature[a, r_index] \
+    add4 = (1. - same_species) * charge[a] / charge[b] * temperature[b, r_index] / temperature[a, r_index] \
         * (dTdr[b, r_index] / temperature[b, r_index]) * (2.5 * CN.at[a, b, 0, 1].get() - CN.at[a, b, 1, 1].get()) / tau.at[a, b].get()
     return A, add1, add2, add3, add4
 
