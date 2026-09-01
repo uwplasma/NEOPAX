@@ -8,6 +8,7 @@ import NEOPAX._transport_solvers as transport_solvers
 
 from NEOPAX._transport_solvers import (
     DiffraxSolver,
+    LIMMWBaselineSolver,
     NewtonThetaMethodSolver,
     RADAUSolver,
     T3DOuterThetaMethodSolver,
@@ -37,6 +38,509 @@ def _base_solver_parameters(**overrides):
     }
     params.update(overrides)
     return params
+
+
+def test_limm_w_config_keeps_current_flux_and_jacobian_reuse_separate():
+    """LIMM-W may reuse its matrix, but never its physical RHS anchor."""
+
+    config = transport_solvers._LIMMWSolverConfig(
+        order=5,
+        jacobian_reuse_mode="global_state_drift_max",
+    )
+
+    assert config.order == 5
+    assert config.jacobian_reuse_mode == "global_state_drift_max"
+    assert not hasattr(config, "rhs_mode")
+
+
+@pytest.mark.parametrize("order", [0, 6])
+def test_limm_w_config_rejects_unsupported_order(order):
+    with pytest.raises(ValueError, match="limm_w_order"):
+        transport_solvers._LIMMWSolverConfig(order=order)
+
+
+def test_limm_w_published_o16_configuration_is_limited_to_vendored_orders():
+    assert transport_solvers._LIMMWSolverConfig(order=3, coefficient_family="o16_published").coefficient_family == "o16_published"
+    with pytest.raises(ValueError, match="currently support"):
+        transport_solvers._LIMMWSolverConfig(order=4, coefficient_family="o16_published")
+
+
+@pytest.mark.parametrize("order", [1, 2, 3, 4, 5])
+def test_limm_w_baseline_coefficients_satisfy_variable_step_order_conditions(order):
+    """The private baseline is a valid W family before stability optimization."""
+
+    dtype = jnp.float64
+    current_dt = jnp.asarray(0.07, dtype=dtype)
+    previous_dts = jnp.asarray([0.05, 0.09, 0.06, 0.08], dtype=dtype)
+    beta, mu_past, gamma = transport_solvers._limm_w_baseline_coefficients(
+        current_dt, previous_dts, order=order, dtype=dtype
+    )
+    c = jnp.concatenate(
+        (
+            jnp.zeros((1,), dtype=dtype),
+            jnp.cumsum(previous_dts[: order - 1]) / current_dt,
+        )
+    )
+    powers = jnp.arange(order, dtype=dtype)
+
+    # Explicit Adams--Bashforth consistency conditions.
+    assert jnp.allclose(
+        ((-c)[None, :] ** powers[:, None]) @ beta,
+        1.0 / (powers + 1.0),
+        rtol=1.0e-12,
+        atol=1.0e-12,
+    )
+    # W correction: sum_i mu_i c_i^m + gamma (-1)^m = 0.
+    assert jnp.allclose(
+        (c[None, :] ** powers[:, None]) @ mu_past
+        + gamma * ((-jnp.ones_like(powers)) ** powers),
+        jnp.zeros_like(powers),
+        rtol=1.0e-12,
+        atol=1.0e-12,
+    )
+
+
+@pytest.mark.parametrize("order", [1, 2, 3, 4, 5])
+def test_limm_w_baseline_trial_step_preserves_constant_rhs(order):
+    """A response-only trial is exact for a constant nonlinear RHS sample."""
+
+    dtype = jnp.float64
+    h = jnp.asarray(0.1, dtype=dtype)
+    y = jnp.asarray([1.5, -2.0], dtype=dtype)
+    f = jnp.asarray([3.0, -4.0], dtype=dtype)
+    state_history = jnp.broadcast_to(y, (order, y.size))
+    rhs_history = jnp.broadcast_to(f, (order, y.size))
+    y_new = transport_solvers._limm_w_baseline_trial_step(
+        y,
+        rhs_history,
+        state_history,
+        jnp.zeros((y.size, y.size), dtype=dtype),
+        h,
+        jnp.full((max(order - 1, 0),), h, dtype=dtype),
+        order=order,
+    )
+    assert jnp.allclose(y_new, y + h * f, rtol=1.0e-12, atol=1.0e-12)
+
+
+def test_limm_w_baseline_trial_step_uses_one_response_matrix_solve():
+    """The kernel is an explicit RHS/history combination plus one LHS solve."""
+
+    dtype = jnp.float64
+    h = jnp.asarray(0.1, dtype=dtype)
+    y = jnp.asarray([1.0], dtype=dtype)
+    jacobian = jnp.asarray([[-5.0]], dtype=dtype)
+    rhs_history = jnp.asarray([[-5.0], [-6.0]], dtype=dtype)
+    state_history = jnp.asarray([[1.0], [1.2]], dtype=dtype)
+    beta, mu, gamma = transport_solvers._limm_w_baseline_coefficients(
+        h, jnp.asarray([h], dtype=dtype), order=2, dtype=dtype
+    )
+    expected = jnp.linalg.solve(
+        jnp.eye(1, dtype=dtype) - h * gamma * jacobian,
+        y
+        + h * jnp.einsum("i,ij->j", beta, rhs_history)
+        + h * (jacobian @ jnp.einsum("i,ij->j", mu, state_history)),
+    )
+    actual = transport_solvers._limm_w_baseline_trial_step(
+        y,
+        rhs_history,
+        state_history,
+        jacobian,
+        h,
+        jnp.asarray([h], dtype=dtype),
+        order=2,
+    )
+    assert jnp.allclose(actual, expected, rtol=1.0e-12, atol=1.0e-12)
+
+
+def test_limm_w_general_multistep_kernel_matches_provisional_coefficient_adapter():
+    """The published alpha/beta/gamma form must preserve the old baseline."""
+
+    dtype = jnp.float64
+    order = 3
+    h = jnp.asarray(0.08, dtype=dtype)
+    previous_dts = jnp.asarray([0.07, 0.09], dtype=dtype)
+    states = jnp.asarray([[1.0, -0.5], [0.9, -0.45], [0.8, -0.4]], dtype=dtype)
+    rhs = jnp.asarray([[0.2, 0.3], [0.1, 0.25], [0.05, 0.2]], dtype=dtype)
+    jacobian = jnp.asarray([[2.0, 0.1], [0.0, -1.5]], dtype=dtype)
+    beta, gamma_past, gamma_new = transport_solvers._limm_w_baseline_coefficients(
+        h, previous_dts, order=order, dtype=dtype
+    )
+    alpha = jnp.asarray([-1.0, 0.0, 0.0], dtype=dtype)
+    generic = transport_solvers._limm_w_linear_multistep_trial_step(
+        rhs_history=rhs,
+        state_history=states,
+        current_jacobian=jacobian,
+        current_dt=h,
+        alpha_past=alpha,
+        beta_past=beta,
+        gamma_past=gamma_past,
+        gamma_new=gamma_new,
+    )
+    baseline = transport_solvers._limm_w_baseline_trial_step(
+        states[0], rhs, states, jacobian, h, previous_dts, order=order
+    )
+    assert jnp.allclose(generic, baseline, rtol=1.0e-12, atol=1.0e-12)
+
+
+@pytest.mark.parametrize("order", [1, 2, 3])
+def test_limm_w_published_o16_coefficients_preserve_constant_rhs(order):
+    """The vendored public variable-step tables satisfy the basic consistency law."""
+
+    dtype = jnp.float64
+    h = jnp.asarray(0.08, dtype=dtype)
+    previous_dts = jnp.asarray([0.11, 0.05], dtype=dtype)
+    alpha, beta, gamma_past, gamma_new = transport_solvers._limm_w_o16_coefficients(
+        h, previous_dts, order=order, dtype=dtype
+    )
+    y = jnp.asarray([1.5, -2.0], dtype=dtype)
+    f = jnp.asarray([3.0, -4.0], dtype=dtype)
+    past_offsets = jnp.concatenate((jnp.zeros((1,), dtype=dtype), jnp.cumsum(previous_dts[: order - 1])))
+    state_history = y[None, :] - past_offsets[:, None] * f[None, :]
+    trial = transport_solvers._limm_w_linear_multistep_trial_step(
+        rhs_history=jnp.broadcast_to(f, (order, f.size)),
+        state_history=state_history,
+        current_jacobian=jnp.zeros((y.size, y.size), dtype=dtype),
+        current_dt=h,
+        alpha_past=alpha,
+        beta_past=beta,
+        gamma_past=gamma_past,
+        gamma_new=gamma_new,
+    )
+    assert alpha.shape == beta.shape == gamma_past.shape == (order,)
+    assert jnp.isfinite(gamma_new)
+    assert jnp.allclose(trial, y + h * f, rtol=1.0e-11, atol=1.0e-11)
+
+
+def test_limm_w_history_advances_only_from_accepted_values():
+    dtype = jnp.float64
+    history = transport_solvers._limm_w_initial_history(
+        jnp.asarray([1.0, 2.0], dtype=dtype),
+        jnp.asarray([3.0, 4.0], dtype=dtype),
+        max_order=3,
+    )
+    advanced = transport_solvers._limm_w_advance_history_on_accept(
+        history,
+        jnp.asarray([5.0, 6.0], dtype=dtype),
+        jnp.asarray([7.0, 8.0], dtype=dtype),
+        jnp.asarray(0.1, dtype=dtype),
+    )
+
+    assert jnp.array_equal(history.states[0], jnp.asarray([1.0, 2.0], dtype=dtype))
+    assert jnp.array_equal(advanced.states[:2], jnp.asarray([[5.0, 6.0], [1.0, 2.0]], dtype=dtype))
+    assert jnp.array_equal(advanced.rhs_values[:2], jnp.asarray([[7.0, 8.0], [3.0, 4.0]], dtype=dtype))
+    assert float(advanced.accepted_dts[0]) == pytest.approx(0.1)
+    assert int(advanced.valid_count) == 2
+
+
+def test_limm_w_step_state_ramps_order_with_accepted_history():
+    dtype = jnp.float64
+    state = transport_solvers._limm_w_initial_step_state(
+        0.0,
+        jnp.asarray([1.0], dtype=dtype),
+        jnp.asarray([-2.0], dtype=dtype),
+        0.1,
+        max_order=5,
+    )
+    assert int(transport_solvers._limm_w_available_order(state, 5)) == 1
+    state = dataclasses.replace(
+        state,
+        history=transport_solvers._limm_w_advance_history_on_accept(
+            state.history,
+            jnp.asarray([0.8], dtype=dtype),
+            jnp.asarray([-1.6], dtype=dtype),
+            jnp.asarray(0.1, dtype=dtype),
+        ),
+    )
+    assert int(transport_solvers._limm_w_available_order(state, 5)) == 2
+    assert int(transport_solvers._limm_w_available_order(state, 1)) == 1
+
+
+def test_limm_w_embedded_error_uses_only_current_response_and_history():
+    dtype = jnp.float64
+    h = jnp.asarray(0.1, dtype=dtype)
+    y = jnp.asarray([1.0], dtype=dtype)
+    jacobian = jnp.asarray([[-2.0]], dtype=dtype)
+    states = jnp.asarray([[1.0], [1.1]], dtype=dtype)
+    rhs = jnp.asarray([[-2.0], [-2.2]], dtype=dtype)
+    trial = transport_solvers._limm_w_baseline_trial_step(
+        y, rhs, states, jacobian, h, jnp.asarray([h], dtype=dtype), order=2
+    )
+    error = transport_solvers._limm_w_embedded_trial_error(
+        trial_y=trial,
+        current_y=y,
+        rhs_history=rhs,
+        state_history=states,
+        current_jacobian=jacobian,
+        current_dt=h,
+        previous_dts=jnp.asarray([h], dtype=dtype),
+        order=2,
+    )
+    lower = transport_solvers._limm_w_baseline_trial_step(
+        y, rhs, states, jacobian, h, jnp.asarray([h], dtype=dtype), order=1
+    )
+    assert jnp.allclose(error, trial - lower, rtol=1.0e-12, atol=1.0e-12)
+
+
+def test_limm_w_controller_shrinks_and_grows_dt_from_scaled_error():
+    dtype = jnp.float64
+    y = jnp.asarray([1.0, 2.0], dtype=dtype)
+    err_norm = transport_solvers._limm_w_scaled_error_norm(
+        jnp.asarray([0.1, 0.2], dtype=dtype), y, y, rtol=0.1, atol=0.0
+    )
+    assert float(err_norm) == pytest.approx(1.0)
+    shrink = transport_solvers._limm_w_next_dt(
+        0.1, 100.0, order=3, safety_factor=0.9, min_step_factor=0.2, max_step_factor=2.0
+    )
+    grow = transport_solvers._limm_w_next_dt(
+        0.1, 1.0e-8, order=3, safety_factor=0.9, min_step_factor=0.2, max_step_factor=2.0
+    )
+    assert float(shrink) < 0.1
+    assert float(grow) > 0.1
+
+
+def test_limm_w_attempt_commit_preserves_history_on_rejection_and_shifts_on_accept():
+    dtype = jnp.float64
+    state = transport_solvers._limm_w_initial_step_state(
+        0.0,
+        jnp.asarray([1.0], dtype=dtype),
+        jnp.asarray([-10.0], dtype=dtype),
+        0.1,
+        max_order=2,
+    )
+    reject_solver = transport_solvers._LIMMWSolverConfig(
+        t0=0.0, t1=1.0, dt=0.1, order=1, rtol=1.0e-12, atol=1.0e-12
+    )
+    rejected_attempt = transport_solvers._limm_w_attempt_at_order(
+        state,
+        jnp.asarray([-10.0], dtype=dtype),
+        jnp.asarray([[-10.0]], dtype=dtype),
+        t_final=1.0,
+        solver=reject_solver,
+        order=1,
+    )
+    assert not bool(rejected_attempt.accepted)
+    rejected = transport_solvers._limm_w_commit_attempt(
+        state, rejected_attempt, jnp.asarray([-5.0], dtype=dtype)
+    )
+    assert float(rejected.t) == pytest.approx(0.0)
+    assert jnp.array_equal(rejected.history.states, state.history.states)
+    assert jnp.array_equal(rejected.history.rhs_values, state.history.rhs_values)
+
+    accept_solver = transport_solvers._LIMMWSolverConfig(
+        t0=0.0, t1=1.0, dt=0.1, order=1, rtol=1.0e3, atol=1.0e3
+    )
+    accepted_attempt = transport_solvers._limm_w_attempt_at_order(
+        state,
+        jnp.asarray([-10.0], dtype=dtype),
+        jnp.asarray([[-10.0]], dtype=dtype),
+        t_final=1.0,
+        solver=accept_solver,
+        order=1,
+    )
+    assert bool(accepted_attempt.accepted)
+    accepted = transport_solvers._limm_w_commit_attempt(
+        state, accepted_attempt, jnp.asarray([-5.0], dtype=dtype)
+    )
+    assert float(accepted.t) == pytest.approx(0.1)
+    assert jnp.array_equal(accepted.history.states[0], accepted.y)
+    assert jnp.array_equal(accepted.history.rhs_values[0], jnp.asarray([-5.0], dtype=dtype))
+    assert int(accepted.status[2]) == 1
+
+
+def test_limm_w_full_rhs_adapter_keeps_sources_direct_and_response_only_in_jacobian():
+    """The response accelerates dF/dy; F itself remains the full direct RHS."""
+
+    dtype = jnp.float64
+    state = transport_solvers._limm_w_initial_step_state(
+        0.0,
+        jnp.asarray([2.0], dtype=dtype),
+        jnp.asarray([10.0], dtype=dtype),
+        0.1,
+        max_order=2,
+    )
+    # A structurally compatible cache is required for the compiled cond path.
+    state = dataclasses.replace(
+        state,
+        reuse_state=dataclasses.replace(
+            state.reuse_state,
+            response_cache=jnp.asarray([2.0], dtype=dtype),
+            response_available=jnp.asarray(True),
+        ),
+    )
+
+    def full_rhs(_t, y):
+        return y * y + 3.0 * y  # nonlinear flux-like term + a separate source
+
+    def build_response(y):
+        return y
+
+    def response_rhs(_t, y, response):
+        return response * response + 2.0 * response * (y - response) + 3.0 * y
+
+    current_rhs, jacobian, reuse = transport_solvers._limm_w_prepare_full_rhs_and_jacobian(
+        state,
+        flat_rhs=full_rhs,
+        build_lagged_response=build_response,
+        flat_rhs_with_lagged_response=response_rhs,
+        jacobian_reuse_mode="fresh",
+    )
+    assert jnp.allclose(current_rhs, jnp.asarray([10.0], dtype=dtype))
+    assert jnp.allclose(jacobian, jnp.asarray([[7.0]], dtype=dtype))
+    assert not bool(reuse.last_jacobian_reused)
+
+
+def test_limm_w_anchor_build_uses_one_response_for_exact_full_rhs_and_jacobian():
+    """A rebuilt accepted anchor must not duplicate its direct NTX call."""
+
+    y0 = jnp.asarray([2.0])
+    t0 = jnp.asarray(0.0)
+    calls = {"build": 0, "direct": 0}
+
+    def flat_rhs(_t, y):
+        calls["direct"] += 1
+        return y**2 + 3.0 * y
+
+    def build_response(y):
+        calls["build"] += 1
+        return y**2
+
+    def response_rhs(_t, y, response):
+        # Linearized NTX flux plus the direct non-NTX source.
+        return response + 2.0 * jnp.sqrt(response) * (y - jnp.sqrt(response)) + 3.0 * y
+
+    rhs0, reuse0 = transport_solvers._limm_w_initial_anchor_full_rhs_and_jacobian(
+        y0,
+        t0=t0,
+        flat_rhs=flat_rhs,
+        build_lagged_response=build_response,
+        flat_rhs_with_lagged_response=response_rhs,
+    )
+
+    assert calls == {"build": 1, "direct": 0}
+    assert jnp.allclose(rhs0, y0**2 + 3.0 * y0)
+    assert jnp.allclose(reuse0.jacobian, jnp.asarray([[7.0]]))
+
+    y1 = jnp.asarray([3.0])
+    rhs1, reuse1 = transport_solvers._limm_w_prepare_next_accepted_anchor(
+        y1,
+        accepted_t=jnp.asarray(0.1),
+        reuse_state=reuse0,
+        flat_rhs=flat_rhs,
+        build_lagged_response=build_response,
+        flat_rhs_with_lagged_response=response_rhs,
+        jacobian_reuse_mode="fresh",
+    )
+    # ``lax.cond`` traces both branches in eager mode, so Python counters are
+    # not an execution-count instrument.  The solver invariant is instead
+    # that the selected rebuilt branch returns the exact anchor F and J.
+    assert calls["build"] >= 2
+    assert jnp.allclose(rhs1, y1**2 + 3.0 * y1)
+    assert jnp.allclose(reuse1.jacobian, jnp.asarray([[9.0]]))
+
+
+def test_limm_w_anchor_global_jacobian_reuse_keeps_rhs_direct():
+    """Reusing J across anchors must never reuse the old response value F."""
+
+    y0 = jnp.asarray([2.0])
+    calls = {"build": 0, "direct": 0}
+
+    def flat_rhs(_t, y):
+        calls["direct"] += 1
+        return y**2 + 3.0 * y
+
+    def build_response(y):
+        calls["build"] += 1
+        return y**2
+
+    def response_rhs(_t, y, response):
+        return response + 2.0 * jnp.sqrt(response) * (y - jnp.sqrt(response)) + 3.0 * y
+
+    _, reuse0 = transport_solvers._limm_w_initial_anchor_full_rhs_and_jacobian(
+        y0,
+        t0=jnp.asarray(0.0),
+        flat_rhs=flat_rhs,
+        build_lagged_response=build_response,
+        flat_rhs_with_lagged_response=response_rhs,
+    )
+    y1 = jnp.asarray([2.001])
+    rhs1, reuse1 = transport_solvers._limm_w_prepare_next_accepted_anchor(
+        y1,
+        accepted_t=jnp.asarray(0.1),
+        reuse_state=reuse0,
+        flat_rhs=flat_rhs,
+        build_lagged_response=build_response,
+        flat_rhs_with_lagged_response=response_rhs,
+        jacobian_reuse_mode="global_state_drift_max",
+        jacobian_reuse_rtol=1.0e-2,
+        jacobian_reuse_atol=1.0e-12,
+    )
+    assert calls["direct"] >= 1
+    assert bool(reuse1.last_jacobian_reused)
+    assert jnp.allclose(rhs1, y1**2 + 3.0 * y1)
+
+
+def test_limm_w_baseline_forward_harness_advances_complete_rhs_without_response_hook():
+    """The private forward lane is usable before backend/TOML exposure."""
+
+    solver = LIMMWBaselineSolver(
+        t0=0.0,
+        t1=0.2,
+        dt=0.05,
+        order=3,
+        rtol=1.0e-8,
+        atol=1.0e-10,
+        max_steps=20,
+        save_n=3,
+    )
+    out = solver.solve(jnp.asarray([1.0]), lambda _t, y: jnp.ones_like(y))
+
+    assert not bool(out["failed"])
+    assert float(out["final_time"]) == pytest.approx(0.2)
+    assert jnp.allclose(out["final_state"], jnp.asarray([1.2]), rtol=1.0e-12, atol=1.0e-12)
+    assert int(out["n_steps"]) >= 1
+
+
+def test_limm_w_published_o16_forward_harness_advances_complete_rhs_without_response_hook():
+    """The production candidate uses the same accepted-anchor physics path."""
+
+    solver = LIMMWBaselineSolver(
+        t0=0.0,
+        t1=0.2,
+        dt=0.05,
+        order=3,
+        coefficient_family="o16_published",
+        rtol=1.0e-8,
+        atol=1.0e-10,
+        max_steps=20,
+        save_n=3,
+    )
+    out = solver.solve(jnp.asarray([1.0]), lambda _t, y: jnp.ones_like(y))
+
+    assert not bool(out["failed"])
+    assert float(out["final_time"]) == pytest.approx(0.2)
+    assert jnp.allclose(out["final_state"], jnp.asarray([1.2]), rtol=1.0e-12, atol=1.0e-12)
+
+
+def test_limm_w_published_o16_compiled_loop_controls_stiff_linear_rhs():
+    """Regression for the compiled adaptive path on y' = -100 y."""
+
+    solver = LIMMWBaselineSolver(
+        t0=0.0,
+        t1=0.1,
+        dt=1.0e-3,
+        max_step=2.0e-2,
+        order=3,
+        coefficient_family="o16_published",
+        rtol=1.0e-6,
+        atol=1.0e-10,
+        max_steps=2000,
+    )
+    out = solver.solve(jnp.asarray([1.0]), lambda _t, y: -100.0 * y)
+
+    assert not bool(out["failed"])
+    assert float(out["final_time"]) == pytest.approx(0.1)
+    assert jnp.allclose(out["final_state"], jnp.asarray([jnp.exp(-10.0)]), rtol=2.0e-3, atol=2.0e-7)
+
 
 
 def test_lagged_response_global_state_drift_max_uses_componentwise_max_norm():
@@ -197,6 +701,20 @@ def test_build_time_solver_t3d_outer_theta_backend():
     )
     assert isinstance(solver, T3DOuterThetaMethodSolver)
     assert solver.rhs_mode == "lagged_transport_response"
+
+
+def test_build_time_solver_limm_w_forward_backend_is_explicitly_forward_only():
+    solver = build_time_solver(
+        _base_solver_parameters(
+            transport_solver_backend="limm_w_forward",
+            limm_w_order=3,
+            limm_w_coefficient_family="o16_published",
+            limm_w_jacobian_reuse_mode="retry_only",
+        )
+    )
+    assert isinstance(solver, LIMMWBaselineSolver)
+    assert solver.coefficient_family == "o16_published"
+    assert solver.jacobian_reuse_mode == "retry_only"
 
 
 def test_t3d_outer_theta_solver_rebuilds_lagged_response_before_accepting_time():

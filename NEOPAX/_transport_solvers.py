@@ -7,12 +7,15 @@ Inspired by torax (https://github.com/google-deepmind/torax).
 """
 
 from typing import Callable, Any
+import base64
 import contextlib
 import dataclasses
 from functools import partial
 import inspect
+import json
 import math
 import time
+import zlib
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -26,6 +29,7 @@ ODE_SOLVER_BACKENDS = {
     "diffrax_tsit5",
     "diffrax_dopri5",
     "radau",
+    "limm_w_forward",
     "theta",
     "theta_newton",
     "theta_t3d_outer",
@@ -19874,6 +19878,1153 @@ class _ThetaSolverConfig(TransportSolver):
 
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True, eq=False)
+class _LIMMWSolverConfig(TransportSolver):
+    """Configuration shared by the response-aware LIMM-W forward/reverse paths.
+
+    A LIMM-W step always uses the direct RHS value at the *current accepted*
+    state.  ``jacobian_reuse_mode`` controls only the linear response matrix;
+    it must never turn an old affine response into the current physical RHS.
+    """
+
+    t0: float
+    t1: float
+    dt: float
+    rtol: float = 1.0e-6
+    atol: float = 1.0e-8
+    min_step: float = 1.0e-14
+    max_step: float = 1.0
+    order: int = 5
+    max_steps: int = 20000
+    safety_factor: float = 0.9
+    min_step_factor: float = 0.2
+    max_step_factor: float = 2.0
+    coefficient_family: str = "baseline"
+    jacobian_reuse_mode: str = "fresh"
+    jacobian_reuse_rtol: float = 5.0e-2
+    jacobian_reuse_atol: float = 1.0e-8
+    stop_after_accepted_steps: int | None = None
+    debug_walltime_attempts: bool = False
+    debug_stage_markers: bool = False
+    save_n: Any = None
+
+    def __init__(
+        self,
+        t0: float = 0.0,
+        t1: float = 1.0,
+        dt: float = 1.0e-2,
+        rtol: float = 1.0e-6,
+        atol: float = 1.0e-8,
+        min_step: float = 1.0e-14,
+        max_step: float | None = None,
+        order: int = 5,
+        max_steps: int = 20000,
+        safety_factor: float = 0.9,
+        min_step_factor: float = 0.2,
+        max_step_factor: float = 2.0,
+        coefficient_family: str = "baseline",
+        jacobian_reuse_mode: str = "fresh",
+        jacobian_reuse_rtol: float = 5.0e-2,
+        jacobian_reuse_atol: float = 1.0e-8,
+        stop_after_accepted_steps: int | None = None,
+        debug_walltime_attempts: bool = False,
+        debug_stage_markers: bool = False,
+        save_n=None,
+    ):
+        if not 1 <= int(order) <= 5:
+            raise ValueError("limm_w_order must be an integer in [1, 5].")
+        if float(dt) <= 0.0:
+            raise ValueError("limm_w_dt must be positive.")
+        if float(min_step) <= 0.0:
+            raise ValueError("limm_w_min_step must be positive.")
+        if max_step is None:
+            max_step = max(float(t1) - float(t0), float(dt))
+        if float(max_step) < float(min_step):
+            raise ValueError("limm_w_max_step must be no smaller than limm_w_min_step.")
+        coefficient_family = str(coefficient_family).strip().lower()
+        if coefficient_family not in {"baseline", "o16_published"}:
+            raise ValueError("limm_w_coefficient_family must be 'baseline' or 'o16_published'.")
+        if coefficient_family == "o16_published" and int(order) > 3:
+            raise ValueError(
+                "The vendored published LIMM o16 tables currently support startup/orders through 3."
+            )
+        reuse_aliases = {
+            "none": "fresh",
+            "refresh": "fresh",
+            "retry": "retry_only",
+            "drift": "global_state_drift_max",
+        }
+        reuse_mode = reuse_aliases.get(str(jacobian_reuse_mode).strip().lower(), str(jacobian_reuse_mode).strip().lower())
+        if reuse_mode not in {"fresh", "retry_only", "global_state_drift", "global_state_drift_max"}:
+            raise ValueError(
+                "limm_w_jacobian_reuse_mode must be one of: fresh, retry_only, "
+                "global_state_drift, global_state_drift_max."
+            )
+        if stop_after_accepted_steps is not None:
+            stop_after_accepted_steps = int(max(1, stop_after_accepted_steps))
+        object.__setattr__(self, "t0", float(t0))
+        object.__setattr__(self, "t1", float(t1))
+        object.__setattr__(self, "dt", float(dt))
+        object.__setattr__(self, "rtol", float(rtol))
+        object.__setattr__(self, "atol", float(atol))
+        object.__setattr__(self, "min_step", float(min_step))
+        object.__setattr__(self, "max_step", float(max_step))
+        object.__setattr__(self, "order", int(order))
+        object.__setattr__(self, "max_steps", int(max(1, max_steps)))
+        object.__setattr__(self, "safety_factor", float(safety_factor))
+        object.__setattr__(self, "min_step_factor", float(min_step_factor))
+        object.__setattr__(self, "max_step_factor", float(max_step_factor))
+        object.__setattr__(self, "coefficient_family", coefficient_family)
+        object.__setattr__(self, "jacobian_reuse_mode", reuse_mode)
+        object.__setattr__(self, "jacobian_reuse_rtol", float(jacobian_reuse_rtol))
+        object.__setattr__(self, "jacobian_reuse_atol", float(jacobian_reuse_atol))
+        object.__setattr__(self, "stop_after_accepted_steps", stop_after_accepted_steps)
+        object.__setattr__(self, "debug_walltime_attempts", bool(debug_walltime_attempts))
+        object.__setattr__(self, "debug_stage_markers", bool(debug_stage_markers))
+        object.__setattr__(self, "save_n", save_n)
+
+
+def _limm_w_baseline_coefficients(current_dt, previous_dts, *, order: int, dtype):
+    """Return a variable-step order-consistent LIMM-W baseline coefficient set.
+
+    This is intentionally a small, algebraic coefficient family used to build
+    and test the NEOPAX LIMM-W carry/kernel.  It is *not* the stability-
+    optimized coefficient family selected in Glandon--Narayanamurthi--Sandu.
+    The explicit multistep part is Adams--Bashforth on the nonuniform history;
+    the W correction annihilates polynomials through degree ``order - 1``.
+    Consequently the LIMM-W consistency conditions hold for any nonzero,
+    bounded local step-ratio sequence.  The production backend will replace
+    this baseline with the optimized coefficient family before exposure.
+    """
+
+    if not 1 <= int(order) <= 5:
+        raise ValueError("LIMM-W baseline order must be in [1, 5].")
+    current_dt = jnp.asarray(current_dt, dtype=dtype)
+    previous_dts = jnp.asarray(previous_dts, dtype=dtype)
+    if int(order) > 1 and previous_dts.shape[0] < int(order) - 1:
+        raise ValueError("LIMM-W baseline needs order - 1 previous step sizes.")
+
+    # c_i = (t_n - t_{n-i}) / h_n, with past interpolation nodes -c_i.
+    c = jnp.concatenate(
+        (
+            jnp.zeros((1,), dtype=dtype),
+            jnp.cumsum(previous_dts[: int(order) - 1]) / current_dt,
+        )
+    )
+    powers = jnp.arange(int(order), dtype=dtype)
+    vandermonde_past = (-c)[None, :] ** powers[:, None]
+    ab_rhs = jnp.reciprocal(powers + jnp.asarray(1.0, dtype=dtype))
+    beta = jnp.linalg.solve(vandermonde_past, ab_rhs)
+
+    # The BDF leading derivative scale gives a useful W-matrix scale.  The
+    # remaining mu coefficients are the unique polynomial-annihilating values
+    # at the current history nodes, leaving (I - h gamma J_n) on the left.
+    bdf_gamma = jnp.asarray((1.0, 2.0 / 3.0, 6.0 / 11.0, 12.0 / 25.0, 60.0 / 137.0), dtype=dtype)[
+        int(order) - 1
+    ]
+    vandermonde_w = c[None, :] ** powers[:, None]
+    mu_rhs = -bdf_gamma * ((-jnp.ones_like(powers)) ** powers)
+    mu_past = jnp.linalg.solve(vandermonde_w, mu_rhs)
+    return beta, mu_past, bdf_gamma
+
+
+# Compact sparse-polynomial tables for the order-1--3 LIMM-o16 family from
+# the public MATLODE ``limm_dev`` implementation (commit 41bdbdc).  The table
+# is source data, not a runtime dependency on MATLAB/scipy or a local checkout.
+# It is intentionally limited to order 3 while the forward benchmark lane is
+# established; the method still starts at order 1 then 2 from accepted history.
+_LIMM_W_O16_TABLES_B85 = (
+    "c-pmBO^@6*4E-;2t!?mIQqDOSJ@pdgFa;KEfJ`<>(^Ihjy_9TcJ+|m<itWWP^dySpBOmQ=7rearcDa81{MYsE!>7mFhfmk9k6(Vje!RSS_YU8`9}d`WkAH{Q+Yh&U?AL#84__9GSfLRoIHGP7gM)7J8T#YlYvkq*+IqQzwoX>);Nuaw^Y0G1bMMdV?H2jB$F>gcv8{&<3)6T&DL8l+!2ya+9i!Vq>#3*VLMK(kuU|!dsQEL>PZro+_$Re@fanKh$**0O6AUZw`wh((I;q>CkJ5QnQxAE*E2ww-AL^Yvcsi^3v89JLIXdj)#>#No9m6KFPNFJ2%*-CP@VbTLM&h`U`VcRW_ZXk_m;i`~N>+eWgf>0!deY6AS(OuJAeOF>uWT@au_Xof$4Zi5Z;NiUL`gImW<t`Wuh+oOto-NRK0y4VX*4mRSONr4GJ^c@3nnjK6Dlk~4k!s)T|SYBforu56iWpU9EycZ0+I`WQwBM4z0C$8v;qZk$u-fnWpE->a0bYVq(n+>=V+5NXO@Y49~R`ctWzmqWLDUz#nM(oK^psB^i5}B&X_S3Q&gbYH$Y}KQD5LpEoZ}+rsQe0#OV1=YJ6hW)gTow*<2gL?dnX&_~J+!-^o333+OQbI*)T8IEnM<(IqjUtcA9m9&2}~>VShZVk^DeR%F0fo0l`ZIZ3<o+*SfB+%2X<8;IMEv_8Oig9VeIU-Vu@o~&#c96&D+KIxGD=93AtW~K>sdzXPurp`8kqvqu)LrG43ZRjLv>5fjZMq6ppS~Dujx%d+#G!fN%V1m6S87vo9V}U%6J}lWq)J>b~k3a9S_0kRvM4{tyl%M``5Fk&SSp7EdQv(B>#cJBA)$Bu*WiJo&Nm4v)Nv3n=q`31?41I37V)$sO5(ZpHPPJ*Un2lVkI;fHgd8TtokVMwjcah<eGnY~{bDFmwIiZP*xfAAjBp0E1<4+L9v7V2SdcT+{_ON}Z8&`oe*41!SwS7{0_nCW~5Gf@mlst2*$5lniBk*q($C@8akDYj`mQ$)vT>U7Dnf+sevO7=u-M^~3&J24rPHv+mMGX+g(`Tn%Ta>*X#IzOAvOSy{2iByr*3Wsj^ZoOucsZi$A4^%n3BM(}NeKir2t5e#g%PeZjoJjFHksCGH0!S{GpRo7inezf&i+7`F{kZm%`omp9xX#qcjK>jE$uGXwi3C(kqiCHsiDWqxuM(3rLE7GYg@6Q|Cb@p1FUC$Ygo>Wt#jQ!i{f972;?(RzJpIs{{l1^FdF"
+)
+_LIMM_W_O16_TABLES = json.loads(
+    zlib.decompress(base64.b85decode(_LIMM_W_O16_TABLES_B85.encode("ascii"))).decode("utf-8")
+)
+
+
+def _limm_w_evaluate_sparse_polynomial(values, positions, dimensions, ratios, *, dtype):
+    """Evaluate one MATLODE sparse tensor polynomial with JAX operations."""
+
+    values = jnp.asarray(np.asarray(values, dtype=np.float64).reshape(-1), dtype=dtype)
+    positions = np.asarray(positions, dtype=np.int32)
+    dimensions = np.asarray(dimensions, dtype=np.int32).reshape(-1)
+    if positions.size == 0:
+        return jnp.asarray(0.0, dtype=dtype)
+    if positions.ndim == 1:
+        positions = positions[:, None]
+    if ratios.size == 0:
+        # Order one has no step-ratio arguments; MATLODE stores its scalar
+        # tensor in the same sparse format.
+        return jnp.sum(values)
+    if positions.shape[1] != dimensions.size:
+        raise ValueError("Malformed sparse LIMM coefficient tensor.")
+    term = jnp.ones((values.size,), dtype=dtype)
+    # MATLAB's tensor evaluator contracts dimension 1 with the newest ratio,
+    # dimension 2 with the next-oldest ratio, and so on.
+    for axis in range(dimensions.size):
+        term = term * ratios[-(axis + 1)] ** jnp.asarray(positions[:, axis] - 1, dtype=dtype)
+    return jnp.sum(values * term)
+
+
+def _limm_w_o16_coefficients(current_dt, previous_dts, *, order: int, dtype):
+    """Evaluate published variable-step LIMM-o16 coefficients (orders 1--3)."""
+
+    if not 1 <= int(order) <= 3:
+        raise ValueError("Published LIMM-o16 tables are currently vendored for orders 1--3.")
+    data = _LIMM_W_O16_TABLES[str(int(order))]
+    required_ratios = int(order) - 1
+    previous_dts = jnp.asarray(previous_dts, dtype=dtype)
+    if previous_dts.size < required_ratios:
+        raise ValueError("LIMM-o16 needs order - 1 accepted prior step sizes.")
+    ratios = jnp.flip(previous_dts[:required_ratios]) / jnp.asarray(current_dt, dtype=dtype)
+
+    def _coefficient_set(prefix, count):
+        denominator = _limm_w_evaluate_sparse_polynomial(
+            data[f"{prefix}DenominatorVal"],
+            data[f"{prefix}DenominatorPos"],
+            data[f"{prefix}DenominatorDim"],
+            ratios,
+            dtype=dtype,
+        )
+        return jnp.stack(
+            [
+                _limm_w_evaluate_sparse_polynomial(
+                    data[f"{prefix}NumeratorVal{i}"],
+                    data[f"{prefix}NumeratorPos{i}"],
+                    data[f"{prefix}NumeratorDim{i}"],
+                    ratios,
+                    dtype=dtype,
+                )
+                / denominator
+                for i in range(1, count + 1)
+            ]
+        )
+
+    # MATLODE aligns coefficient vectors oldest-to-newest in a circular
+    # history buffer.  NEOPAX stores accepted rows newest-first.
+    alpha = jnp.flip(_coefficient_set("alpha", int(order)))
+    beta = jnp.flip(_coefficient_set("beta", int(order)))
+    gamma = _coefficient_set("gamma", int(order) + 1)
+    return alpha, beta, jnp.flip(gamma[:-1]), gamma[-1]
+
+
+def _limm_w_baseline_trial_step(
+    current_y,
+    rhs_history,
+    state_history,
+    current_jacobian,
+    current_dt,
+    previous_dts,
+    *,
+    order: int,
+):
+    """Advance one response-only LIMM-W baseline trial with one linear solve.
+
+    ``*_history[0]`` is the current accepted anchor, followed by older
+    accepted values.  The caller owns history advancement: this pure trial
+    routine deliberately cannot mutate it, which makes rejected-step
+    semantics unambiguous.
+    """
+
+    current_y = jnp.asarray(current_y)
+    dtype = current_y.dtype
+    required = int(order)
+    if rhs_history.shape[0] < required or state_history.shape[0] < required:
+        raise ValueError("LIMM-W trial needs `order` current/past state and RHS values.")
+    beta, mu_past, gamma = _limm_w_baseline_coefficients(
+        current_dt,
+        previous_dts,
+        order=order,
+        dtype=dtype,
+    )
+    alpha_past = jnp.concatenate(
+        (-jnp.ones((1,), dtype=dtype), jnp.zeros((int(order) - 1,), dtype=dtype))
+    )
+    return _limm_w_linear_multistep_trial_step(
+        rhs_history=rhs_history,
+        state_history=state_history,
+        current_jacobian=current_jacobian,
+        current_dt=current_dt,
+        alpha_past=alpha_past,
+        beta_past=beta,
+        gamma_past=mu_past,
+        gamma_new=gamma,
+    )
+
+
+def _limm_w_linear_multistep_trial_step(
+    *,
+    rhs_history,
+    state_history,
+    current_jacobian,
+    current_dt,
+    alpha_past,
+    beta_past,
+    gamma_past,
+    gamma_new,
+):
+    """Solve the general one-Jacobian LIMM-W linear multistep equation.
+
+    The coefficient convention matches the published LIMM implementation:
+
+    ``(I - h gamma_new J_n)y_(n+1) = -sum(alpha_i y_(n-i))
+       + h sum(beta_i F_(n-i)) + h J_n sum(gamma_i y_(n-i))``.
+
+    All history rows are accepted anchors, newest first.  This primitive is
+    deliberately independent of coefficient construction: the provisional
+    order-consistent family and the published optimized variable-step family
+    therefore share exactly the same physics/NTX execution path.
+    """
+
+    state_history = jnp.asarray(state_history)
+    rhs_history = jnp.asarray(rhs_history, dtype=state_history.dtype)
+    current_jacobian = jnp.asarray(current_jacobian, dtype=state_history.dtype)
+    alpha_past = jnp.asarray(alpha_past, dtype=state_history.dtype)
+    beta_past = jnp.asarray(beta_past, dtype=state_history.dtype)
+    gamma_past = jnp.asarray(gamma_past, dtype=state_history.dtype)
+    if not (alpha_past.size == beta_past.size == gamma_past.size):
+        raise ValueError("LIMM-W alpha, beta, and past-gamma coefficient lengths must match.")
+    if state_history.shape[0] < alpha_past.size or rhs_history.shape[0] < beta_past.size:
+        raise ValueError("LIMM-W multistep trial needs one accepted history row per coefficient.")
+    h = jnp.asarray(current_dt, dtype=state_history.dtype)
+    state_term = -jnp.einsum("i,i...->...", alpha_past, state_history[: alpha_past.size])
+    rhs_term = jnp.einsum("i,i...->...", beta_past, rhs_history[: beta_past.size])
+    w_term = jnp.einsum("i,i...->...", gamma_past, state_history[: gamma_past.size])
+    identity = jnp.eye(state_history.shape[-1], dtype=state_history.dtype)
+    lhs = identity - h * jnp.asarray(gamma_new, dtype=state_history.dtype) * current_jacobian
+    rhs = state_term + h * rhs_term + h * (current_jacobian @ w_term)
+    return jnp.linalg.solve(lhs, rhs)
+
+
+def _limm_w_trial_step_for_family(
+    current_y,
+    rhs_history,
+    state_history,
+    current_jacobian,
+    current_dt,
+    previous_dts,
+    *,
+    order: int,
+    coefficient_family: str,
+):
+    """Dispatch the common LIMM-W equation to a coefficient family."""
+
+    family = str(coefficient_family).strip().lower()
+    if family == "baseline":
+        return _limm_w_baseline_trial_step(
+            current_y,
+            rhs_history,
+            state_history,
+            current_jacobian,
+            current_dt,
+            previous_dts,
+            order=order,
+        )
+    if family == "o16_published":
+        alpha, beta, gamma_past, gamma_new = _limm_w_o16_coefficients(
+            current_dt,
+            previous_dts,
+            order=order,
+            dtype=jnp.asarray(current_y).dtype,
+        )
+        return _limm_w_linear_multistep_trial_step(
+            rhs_history=rhs_history,
+            state_history=state_history,
+            current_jacobian=current_jacobian,
+            current_dt=current_dt,
+            alpha_past=alpha,
+            beta_past=beta,
+            gamma_past=gamma_past,
+            gamma_new=gamma_new,
+        )
+    raise ValueError(f"Unsupported LIMM-W coefficient family '{coefficient_family}'.")
+
+
+@jax.tree_util.register_dataclass
+@dataclasses.dataclass(frozen=True, eq=False)
+class _LIMMWHistory:
+    """Bounded accepted-step history for the LIMM-W multistep formula."""
+
+    states: Any
+    rhs_values: Any
+    accepted_dts: Any
+    valid_count: Any
+
+
+def _limm_w_initial_history(initial_y, initial_rhs, *, max_order: int):
+    if not 1 <= int(max_order) <= 5:
+        raise ValueError("LIMM-W maximum order must be in [1, 5].")
+    initial_y = jnp.asarray(initial_y)
+    initial_rhs = jnp.asarray(initial_rhs)
+    if initial_y.shape != initial_rhs.shape:
+        raise ValueError("LIMM-W initial state and RHS must have matching flattened shapes.")
+    return _LIMMWHistory(
+        states=jnp.concatenate(
+            (initial_y[None, :], jnp.zeros((int(max_order) - 1, initial_y.size), dtype=initial_y.dtype)),
+            axis=0,
+        ),
+        rhs_values=jnp.concatenate(
+            (initial_rhs[None, :], jnp.zeros((int(max_order) - 1, initial_y.size), dtype=initial_y.dtype)),
+            axis=0,
+        ),
+        accepted_dts=jnp.zeros((int(max_order) - 1,), dtype=initial_y.dtype),
+        valid_count=jnp.asarray(1, dtype=jnp.int32),
+    )
+
+
+def _limm_w_advance_history_on_accept(history, accepted_y, accepted_rhs, accepted_dt):
+    """Return a new history after an accepted step; never use this on rejection."""
+
+    accepted_y = jnp.asarray(accepted_y, dtype=history.states.dtype)
+    accepted_rhs = jnp.asarray(accepted_rhs, dtype=history.rhs_values.dtype)
+    if accepted_y.shape != history.states.shape[1:] or accepted_rhs.shape != history.rhs_values.shape[1:]:
+        raise ValueError("Accepted LIMM-W state/RHS shape does not match history.")
+    states = jnp.concatenate((accepted_y[None, :], history.states[:-1]), axis=0)
+    rhs_values = jnp.concatenate((accepted_rhs[None, :], history.rhs_values[:-1]), axis=0)
+    if history.accepted_dts.size:
+        accepted_dts = jnp.concatenate(
+            (
+                jnp.asarray(accepted_dt, dtype=history.accepted_dts.dtype)[None],
+                history.accepted_dts[:-1],
+            ),
+            axis=0,
+        )
+    else:
+        accepted_dts = history.accepted_dts
+    return _LIMMWHistory(
+        states=states,
+        rhs_values=rhs_values,
+        accepted_dts=accepted_dts,
+        valid_count=jnp.minimum(history.valid_count + 1, jnp.asarray(history.states.shape[0], dtype=jnp.int32)),
+    )
+
+
+@jax.tree_util.register_dataclass
+@dataclasses.dataclass(frozen=True, eq=False)
+class _LIMMWReuseState:
+    """Cache only the matrix-side response data; never the current RHS value."""
+
+    response_cache: Any
+    response_available: Any
+    jacobian: Any
+    jacobian_valid: Any
+    jacobian_reference_y: Any
+    last_jacobian_reused: Any
+
+
+@jax.tree_util.register_dataclass
+@dataclasses.dataclass(frozen=True, eq=False)
+class _LIMMWStepState:
+    """Adaptive LIMM-W carry with immutable accepted-step history."""
+
+    t: Any
+    y: Any
+    dt: Any
+    status: Any
+    history: _LIMMWHistory
+    reuse_state: _LIMMWReuseState
+    prev_error: Any
+    recent_reject_count: Any
+    easy_growth_streak: Any
+
+
+def _limm_w_initial_step_state(t0, initial_y, initial_rhs, base_dt, *, max_order: int):
+    """Create the startup carry; subsequent accepted steps ramp usable order."""
+
+    initial_y = jnp.asarray(initial_y)
+    dtype = initial_y.dtype
+    state_dim = initial_y.size
+    history = _limm_w_initial_history(initial_y, initial_rhs, max_order=max_order)
+    return _LIMMWStepState(
+        t=jnp.asarray(t0, dtype=dtype),
+        y=initial_y,
+        dt=jnp.asarray(base_dt, dtype=dtype),
+        status=jnp.asarray([0, 0, 0], dtype=jnp.int32),
+        history=history,
+        reuse_state=_LIMMWReuseState(
+            response_cache=None,
+            response_available=jnp.asarray(False),
+            jacobian=jnp.zeros((state_dim, state_dim), dtype=dtype),
+            jacobian_valid=jnp.asarray(False),
+            jacobian_reference_y=initial_y,
+            last_jacobian_reused=jnp.asarray(False),
+        ),
+        prev_error=jnp.asarray(1.0, dtype=dtype),
+        recent_reject_count=jnp.asarray(0, dtype=jnp.int32),
+        easy_growth_streak=jnp.asarray(0, dtype=jnp.int32),
+    )
+
+
+def _limm_w_available_order(step_state: _LIMMWStepState, configured_order: int):
+    """Use orders 1..configured_order while startup history is populated."""
+
+    return jnp.minimum(
+        step_state.history.valid_count,
+        jnp.asarray(int(configured_order), dtype=step_state.history.valid_count.dtype),
+    )
+
+
+def _limm_w_embedded_trial_error(
+    trial_y,
+    *,
+    current_y,
+    rhs_history,
+    state_history,
+    current_jacobian,
+    current_dt,
+    previous_dts,
+    order: int,
+    coefficient_family: str = "baseline",
+):
+    """Estimate local error without evaluating NTX at an in-step/end-point state.
+
+    For order >= 2 this is the difference to the adjacent lower-order
+    LIMM-W formula, built from the same accepted history and current response.
+    At startup, explicit Euler is the order-zero companion.  This costs an
+    additional *linear* solve for order >= 2 but no additional RHS/NTX call.
+    """
+
+    current_y = jnp.asarray(current_y)
+    if int(order) <= 1:
+        lower_y = current_y + jnp.asarray(current_dt, dtype=current_y.dtype) * rhs_history[0]
+    else:
+        lower_y = _limm_w_trial_step_for_family(
+            current_y,
+            rhs_history,
+            state_history,
+            current_jacobian,
+            current_dt,
+            previous_dts,
+            order=int(order) - 1,
+            coefficient_family=coefficient_family,
+        )
+    return trial_y - lower_y
+
+
+def _limm_w_scaled_error_norm(error, current_y, trial_y, *, rtol, atol):
+    error = jnp.asarray(error)
+    scale = jnp.asarray(atol, dtype=error.dtype) + jnp.asarray(rtol, dtype=error.dtype) * jnp.maximum(
+        jnp.abs(current_y), jnp.abs(trial_y)
+    )
+    return jnp.sqrt(jnp.mean((error / scale) ** 2))
+
+
+def _limm_w_next_dt(
+    current_dt,
+    error_norm,
+    *,
+    order: int,
+    safety_factor,
+    min_step_factor,
+    max_step_factor,
+):
+    """Return a bounded adaptive proposal for an order-``order`` LIMM step."""
+
+    dtype = jnp.asarray(current_dt).dtype
+    safe_error = jnp.maximum(jnp.asarray(error_norm, dtype=dtype), jnp.asarray(1.0e-14, dtype=dtype))
+    factor = jnp.asarray(safety_factor, dtype=dtype) * safe_error ** (-jnp.asarray(1.0 / (int(order) + 1), dtype=dtype))
+    factor = jnp.clip(
+        factor,
+        jnp.asarray(min_step_factor, dtype=dtype),
+        jnp.asarray(max_step_factor, dtype=dtype),
+    )
+    return jnp.asarray(current_dt, dtype=dtype) * factor
+
+
+@jax.tree_util.register_dataclass
+@dataclasses.dataclass(frozen=True, eq=False)
+class _LIMMWAttemptResult:
+    trial_y: Any
+    trial_dt: Any
+    next_dt: Any
+    error_norm: Any
+    accepted: Any
+    order: Any
+
+
+def _limm_w_attempt_at_order(
+    step_state: _LIMMWStepState,
+    current_rhs,
+    current_jacobian,
+    *,
+    t_final,
+    solver: _LIMMWSolverConfig,
+    order: int,
+):
+    """Form one adaptive trial using the supplied current direct RHS/Jacobian."""
+
+    if not 1 <= int(order) <= int(solver.order):
+        raise ValueError("Requested LIMM-W attempt order is outside the configured range.")
+    if int(order) > int(step_state.history.states.shape[0]):
+        raise ValueError("LIMM-W attempt order exceeds the allocated history size.")
+    trial_dt = jnp.minimum(step_state.dt, jnp.asarray(t_final, dtype=step_state.y.dtype) - step_state.t)
+    history_states = step_state.history.states.at[0].set(step_state.y)
+    history_rhs = step_state.history.rhs_values.at[0].set(jnp.asarray(current_rhs, dtype=step_state.y.dtype))
+    trial_y = _limm_w_trial_step_for_family(
+        step_state.y,
+        history_rhs,
+        history_states,
+        current_jacobian,
+        trial_dt,
+        step_state.history.accepted_dts,
+        order=int(order),
+        coefficient_family=solver.coefficient_family,
+    )
+    error = _limm_w_embedded_trial_error(
+        trial_y,
+        current_y=step_state.y,
+        rhs_history=history_rhs,
+        state_history=history_states,
+        current_jacobian=current_jacobian,
+        current_dt=trial_dt,
+        previous_dts=step_state.history.accepted_dts,
+        order=int(order),
+        coefficient_family=solver.coefficient_family,
+    )
+    error_norm = _limm_w_scaled_error_norm(
+        error,
+        step_state.y,
+        trial_y,
+        rtol=solver.rtol,
+        atol=solver.atol,
+    )
+    finite = jnp.logical_and(jnp.all(jnp.isfinite(trial_y)), jnp.isfinite(error_norm))
+    accepted = jnp.logical_and(finite, error_norm <= jnp.asarray(1.0, dtype=step_state.y.dtype))
+    next_dt = _limm_w_next_dt(
+        trial_dt,
+        error_norm,
+        order=int(order),
+        safety_factor=solver.safety_factor,
+        min_step_factor=solver.min_step_factor,
+        max_step_factor=solver.max_step_factor,
+    )
+    next_dt = jnp.clip(
+        next_dt,
+        jnp.asarray(solver.min_step, dtype=step_state.y.dtype),
+        jnp.asarray(solver.max_step, dtype=step_state.y.dtype),
+    )
+    return _LIMMWAttemptResult(
+        trial_y=trial_y,
+        trial_dt=trial_dt,
+        next_dt=next_dt,
+        error_norm=error_norm,
+        accepted=accepted,
+        order=jnp.asarray(int(order), dtype=jnp.int32),
+    )
+
+
+def _limm_w_commit_attempt(step_state: _LIMMWStepState, attempt: _LIMMWAttemptResult, accepted_rhs):
+    """Commit an accepted attempt or retain exact history on rejection."""
+
+    dtype = step_state.y.dtype
+
+    def _accept(_):
+        history = _limm_w_advance_history_on_accept(
+            step_state.history,
+            attempt.trial_y,
+            accepted_rhs,
+            attempt.trial_dt,
+        )
+        return dataclasses.replace(
+            step_state,
+            t=step_state.t + attempt.trial_dt,
+            y=attempt.trial_y,
+            dt=attempt.next_dt,
+            status=step_state.status.at[2].add(jnp.asarray(1, dtype=jnp.int32)),
+            history=history,
+            prev_error=attempt.error_norm,
+            recent_reject_count=jnp.asarray(0, dtype=jnp.int32),
+            easy_growth_streak=step_state.easy_growth_streak + jnp.asarray(1, dtype=jnp.int32),
+        )
+
+    def _reject(_):
+        return dataclasses.replace(
+            step_state,
+            dt=attempt.next_dt,
+            prev_error=attempt.error_norm,
+            recent_reject_count=step_state.recent_reject_count + jnp.asarray(1, dtype=jnp.int32),
+            easy_growth_streak=jnp.asarray(0, dtype=jnp.int32),
+        )
+
+    del dtype
+    return jax.lax.cond(attempt.accepted, _accept, _reject, operand=None)
+
+
+def _limm_w_prepare_full_rhs_and_jacobian(
+    step_state: _LIMMWStepState,
+    *,
+    flat_rhs,
+    build_lagged_response=None,
+    flat_rhs_with_lagged_response=None,
+    unpack_flat=None,
+    project_flat=None,
+    jacobian_reuse_mode: str = "fresh",
+    jacobian_reuse_rtol=5.0e-2,
+    jacobian_reuse_atol=1.0e-8,
+):
+    """Return the complete transport RHS and a reusable full-RHS Jacobian.
+
+    ``flat_rhs`` is always evaluated at the current accepted state and includes
+    every transport contribution: turbulence, other fluxes, sources, and
+    transport operators.  When a lagged response is available it is used only
+    to assemble the Jacobian-side linearization; it never replaces this RHS.
+
+    For the response branch the caller must seed ``response_cache`` with a
+    response of the same pytree structure (normally built at the initial
+    state).  This makes both branches JAX-compatible when the solver loop is
+    later compiled.
+    """
+
+    current_y = step_state.y
+    current_rhs = flat_rhs(step_state.t, current_y)
+    reuse_state = step_state.reuse_state
+    mode = str(jacobian_reuse_mode).strip().lower()
+    can_reuse = reuse_state.jacobian_valid
+    if mode == "fresh":
+        can_reuse = jnp.asarray(False)
+    elif mode == "retry_only":
+        can_reuse = jnp.logical_and(
+            can_reuse,
+            step_state.recent_reject_count > jnp.asarray(0, dtype=jnp.int32),
+        )
+    elif _lagged_response_reuse_uses_global_drift(mode):
+        metric = _lagged_response_global_reuse_metric(
+            current_y,
+            reuse_state.jacobian_reference_y,
+            atol=jacobian_reuse_atol,
+            rtol=jacobian_reuse_rtol,
+            norm=_lagged_response_drift_norm(mode),
+        )
+        can_reuse = jnp.logical_and(can_reuse, metric <= jnp.asarray(1.0, dtype=current_y.dtype))
+    else:
+        raise ValueError(f"Unsupported LIMM-W Jacobian reuse mode '{jacobian_reuse_mode}'.")
+
+    if build_lagged_response is None or flat_rhs_with_lagged_response is None:
+        jacobian = jax.lax.cond(
+            can_reuse,
+            lambda _: reuse_state.jacobian,
+            lambda _: jax.jacfwd(lambda y: flat_rhs(step_state.t, y))(current_y),
+            operand=None,
+        )
+        return (
+            current_rhs,
+            jacobian,
+            dataclasses.replace(
+                reuse_state,
+                jacobian=jacobian,
+                jacobian_valid=jnp.asarray(True),
+                jacobian_reference_y=jnp.where(can_reuse, reuse_state.jacobian_reference_y, current_y),
+                last_jacobian_reused=can_reuse,
+            ),
+        )
+
+    if unpack_flat is None:
+        unpack_flat = lambda y: y
+    if project_flat is None:
+        project_flat = lambda y: y
+
+    def _build_response(_):
+        return build_lagged_response(unpack_flat(project_flat(current_y)))
+
+    response = jax.lax.cond(
+        can_reuse,
+        lambda _: reuse_state.response_cache,
+        _build_response,
+        operand=None,
+    )
+
+    def _response_rhs(y_value):
+        return flat_rhs_with_lagged_response(step_state.t, project_flat(y_value), response)
+
+    jacobian = jax.lax.cond(
+        can_reuse,
+        lambda _: reuse_state.jacobian,
+        lambda _: jax.jacfwd(_response_rhs)(current_y),
+        operand=None,
+    )
+    next_reuse_state = dataclasses.replace(
+        reuse_state,
+        response_cache=response,
+        response_available=jnp.asarray(True),
+        jacobian=jacobian,
+        jacobian_valid=jnp.asarray(True),
+        jacobian_reference_y=jnp.where(can_reuse, reuse_state.jacobian_reference_y, current_y),
+        last_jacobian_reused=can_reuse,
+    )
+    return current_rhs, jacobian, next_reuse_state
+
+
+def _limm_w_initial_anchor_full_rhs_and_jacobian(
+    initial_y,
+    *,
+    t0,
+    flat_rhs,
+    build_lagged_response=None,
+    flat_rhs_with_lagged_response=None,
+    unpack_flat=None,
+    project_flat=None,
+):
+    """Prepare the first accepted LIMM-W anchor.
+
+    With a response-capable flux model, evaluating its affine response at its
+    own construction point is the exact full RHS: the flux part is its direct
+    anchor value and all non-response equation terms remain direct.  Thus one
+    response construction provides both ``F(y_0)`` and ``J(y_0)``.  The
+    no-response fallback is intentionally generic and differentiates the full
+    RHS directly.
+    """
+
+    initial_y = jnp.asarray(initial_y)
+    dtype = initial_y.dtype
+    state_dim = initial_y.size
+    if build_lagged_response is None or flat_rhs_with_lagged_response is None:
+        initial_rhs = flat_rhs(t0, initial_y)
+        initial_jacobian = jax.jacfwd(lambda y: flat_rhs(t0, y))(initial_y)
+        return initial_rhs, _LIMMWReuseState(
+            response_cache=(),
+            response_available=jnp.asarray(False),
+            jacobian=initial_jacobian,
+            jacobian_valid=jnp.asarray(True),
+            jacobian_reference_y=initial_y,
+            last_jacobian_reused=jnp.asarray(False),
+        )
+
+    if unpack_flat is None:
+        unpack_flat = lambda y: y
+    if project_flat is None:
+        project_flat = lambda y: y
+    response = build_lagged_response(unpack_flat(project_flat(initial_y)))
+
+    def response_rhs(y_value):
+        return flat_rhs_with_lagged_response(t0, project_flat(y_value), response)
+
+    initial_rhs = response_rhs(initial_y)
+    initial_jacobian = jax.jacfwd(response_rhs)(initial_y)
+    return initial_rhs, _LIMMWReuseState(
+        response_cache=response,
+        response_available=jnp.asarray(True),
+        jacobian=initial_jacobian,
+        jacobian_valid=jnp.asarray(True),
+        jacobian_reference_y=initial_y,
+        last_jacobian_reused=jnp.asarray(False),
+    )
+
+
+def _limm_w_prepare_next_accepted_anchor(
+    accepted_y,
+    *,
+    accepted_t,
+    reuse_state: _LIMMWReuseState,
+    flat_rhs,
+    build_lagged_response=None,
+    flat_rhs_with_lagged_response=None,
+    unpack_flat=None,
+    project_flat=None,
+    jacobian_reuse_mode: str = "fresh",
+    jacobian_reuse_rtol=5.0e-2,
+    jacobian_reuse_atol=1.0e-8,
+):
+    """Prepare ``F,J`` for a newly *accepted* anchor, never for a trial.
+
+    The response construction is delayed until acceptance.  Therefore a
+    rejected adaptive attempt simply retries the same frozen LIMM-W equation;
+    it cannot rebuild NTX or alter the accepted multistep history.  If the
+    Jacobian is deliberately reused across accepted anchors, only ``J`` is
+    reused: ``F(accepted_y)`` remains a fresh direct complete-RHS evaluation.
+    """
+
+    accepted_y = jnp.asarray(accepted_y)
+    mode = str(jacobian_reuse_mode).strip().lower()
+    can_reuse = reuse_state.jacobian_valid
+    if mode in {"fresh", "retry_only"}:
+        # retry_only is handled by retaining this complete anchor on a
+        # rejection; a new accepted state always gets a fresh response.
+        can_reuse = jnp.asarray(False)
+    elif _lagged_response_reuse_uses_global_drift(mode):
+        metric = _lagged_response_global_reuse_metric(
+            accepted_y,
+            reuse_state.jacobian_reference_y,
+            atol=jacobian_reuse_atol,
+            rtol=jacobian_reuse_rtol,
+            norm=_lagged_response_drift_norm(mode),
+        )
+        can_reuse = jnp.logical_and(can_reuse, metric <= jnp.asarray(1.0, dtype=accepted_y.dtype))
+    else:
+        raise ValueError(f"Unsupported LIMM-W Jacobian reuse mode '{jacobian_reuse_mode}'.")
+
+    if build_lagged_response is None or flat_rhs_with_lagged_response is None:
+        accepted_rhs = flat_rhs(accepted_t, accepted_y)
+        jacobian = jax.lax.cond(
+            can_reuse,
+            lambda _: reuse_state.jacobian,
+            lambda _: jax.jacfwd(lambda y: flat_rhs(accepted_t, y))(accepted_y),
+            operand=None,
+        )
+        return accepted_rhs, dataclasses.replace(
+            reuse_state,
+            jacobian=jacobian,
+            jacobian_valid=jnp.asarray(True),
+            jacobian_reference_y=jnp.where(can_reuse, reuse_state.jacobian_reference_y, accepted_y),
+            last_jacobian_reused=can_reuse,
+        )
+
+    if unpack_flat is None:
+        unpack_flat = lambda y: y
+    if project_flat is None:
+        project_flat = lambda y: y
+
+    def _build_response(_):
+        return build_lagged_response(unpack_flat(project_flat(accepted_y)))
+
+    response = jax.lax.cond(
+        can_reuse,
+        lambda _: reuse_state.response_cache,
+        _build_response,
+        operand=None,
+    )
+
+    def _response_rhs(y_value):
+        return flat_rhs_with_lagged_response(accepted_t, project_flat(y_value), response)
+
+    # At a rebuilt anchor, this is exactly the direct full RHS while avoiding
+    # a duplicate NTX call.  A reused response is not allowed to supply F at a
+    # different state, so use the direct full equation there.
+    accepted_rhs = jax.lax.cond(
+        can_reuse,
+        lambda _: flat_rhs(accepted_t, accepted_y),
+        lambda _: _response_rhs(accepted_y),
+        operand=None,
+    )
+    jacobian = jax.lax.cond(
+        can_reuse,
+        lambda _: reuse_state.jacobian,
+        lambda _: jax.jacfwd(_response_rhs)(accepted_y),
+        operand=None,
+    )
+    return accepted_rhs, dataclasses.replace(
+        reuse_state,
+        response_cache=response,
+        response_available=jnp.asarray(True),
+        jacobian=jacobian,
+        jacobian_valid=jnp.asarray(True),
+        jacobian_reference_y=jnp.where(can_reuse, reuse_state.jacobian_reference_y, accepted_y),
+        last_jacobian_reused=can_reuse,
+    )
+
+
+def _limm_w_step_fn(
+    step_state: _LIMMWStepState,
+    _unused,
+    *,
+    t_final,
+    solver: _LIMMWSolverConfig,
+    flat_rhs,
+    build_response=None,
+    response_rhs=None,
+    unpack_flat=None,
+    project_flat=None,
+):
+    """One compiled adaptive LIMM-W attempt, mirroring theta/Radau loops."""
+
+    available_order = _limm_w_available_order(step_state, solver.order)
+    current_rhs = step_state.history.rhs_values[0]
+    current_jacobian = step_state.reuse_state.jacobian
+    branches = tuple(
+        lambda _, order=order: _limm_w_attempt_at_order(
+            step_state,
+            current_rhs,
+            current_jacobian,
+            t_final=t_final,
+            solver=solver,
+            order=order,
+        )
+        for order in range(1, int(solver.order) + 1)
+    )
+    attempt = jax.lax.switch(available_order - jnp.asarray(1, dtype=available_order.dtype), branches, operand=None)
+
+    def _prepare_accepted_anchor(_):
+        return _limm_w_prepare_next_accepted_anchor(
+            attempt.trial_y,
+            accepted_t=step_state.t + attempt.trial_dt,
+            reuse_state=step_state.reuse_state,
+            flat_rhs=flat_rhs,
+            build_lagged_response=build_response,
+            flat_rhs_with_lagged_response=response_rhs,
+            unpack_flat=unpack_flat,
+            project_flat=project_flat,
+            jacobian_reuse_mode=solver.jacobian_reuse_mode,
+            jacobian_reuse_rtol=solver.jacobian_reuse_rtol,
+            jacobian_reuse_atol=solver.jacobian_reuse_atol,
+        )
+
+    def _retain_anchor_on_reject(_):
+        return step_state.history.rhs_values[0], step_state.reuse_state
+
+    accepted_rhs, next_reuse = jax.lax.cond(
+        attempt.accepted,
+        _prepare_accepted_anchor,
+        _retain_anchor_on_reject,
+        operand=None,
+    )
+    next_state = _limm_w_commit_attempt(step_state, attempt, accepted_rhs)
+    next_state = dataclasses.replace(next_state, reuse_state=next_reuse)
+    exhausted_min_step = jnp.logical_and(
+        jnp.logical_not(attempt.accepted),
+        next_state.dt <= jnp.asarray(solver.min_step, dtype=next_state.y.dtype) * jnp.asarray(1.0 + 1.0e-12, dtype=next_state.y.dtype),
+    )
+    next_status = next_state.status.at[0].set(jnp.where(exhausted_min_step, 1, next_state.status[0]))
+    next_status = next_status.at[1].set(jnp.where(exhausted_min_step, 1, next_state.status[1]))
+    next_state = dataclasses.replace(next_state, status=next_status)
+    return next_state, _RadauStepInfo(
+        y=next_state.y,
+        t=next_state.t,
+        dt=attempt.trial_dt,
+        next_dt=next_state.dt,
+        lagged_reused=next_reuse.last_jacobian_reused,
+        jacobian_reused=next_reuse.last_jacobian_reused,
+        accepted=attempt.accepted,
+        failed=next_state.status[0] != 0,
+        fail_code=next_state.status[1],
+        converged=jnp.asarray(True),
+        err_norm=attempt.error_norm,
+    )
+
+
+class LIMMWBaselineSolver(_LIMMWSolverConfig):
+    """Private forward-only LIMM-W baseline integration lane.
+
+    This intentionally is not registered as a TOML/backend option yet.  It
+    wires the accepted-anchor semantics into the real complete transport RHS
+    so that forward behaviour can be validated before stability-optimized
+    LIMM coefficients and a realized-schedule reverse rule are introduced.
+    """
+
+    def solve(self, state, vector_field: Callable, *args, **kwargs):
+        species = _extract_species_from_args(args)
+        temperature_active_mask, fixed_temperature_profile = _extract_fixed_temperature_projection(vector_field)
+        density_floor, temperature_floor = _extract_state_regularization(vector_field)
+        state = _project_state_to_quasi_neutrality(
+            state,
+            species,
+            temperature_active_mask=temperature_active_mask,
+            fixed_temperature_profile=fixed_temperature_profile,
+            density_floor=density_floor,
+            temperature_floor=temperature_floor,
+        )
+        flat_y0, unpack_flat, _unpack_packed, _pack_state, project_flat = _make_solver_state_transform(
+            state,
+            species,
+            temperature_active_mask=temperature_active_mask,
+            fixed_temperature_profile=fixed_temperature_profile,
+            density_floor=density_floor,
+            temperature_floor=temperature_floor,
+        )
+        dtype = flat_y0.dtype
+        t0 = jnp.asarray(self.t0, dtype=dtype)
+        t_final = jnp.asarray(self.t1, dtype=dtype)
+        flat_rhs = _flat_rhs_factory(unpack_flat, vector_field, args, kwargs, project_flat=project_flat)
+        build_response, _ = _lagged_response_hooks(vector_field)
+        response_rhs = _flat_rhs_with_lagged_response_factory(
+            unravel=unpack_flat,
+            vector_field=vector_field,
+            args=args,
+            kwargs=kwargs,
+            project_flat=project_flat,
+        )
+        if build_response is None:
+            response_rhs = None
+
+        initial_rhs, initial_reuse = _limm_w_initial_anchor_full_rhs_and_jacobian(
+            flat_y0,
+            t0=t0,
+            flat_rhs=flat_rhs,
+            build_lagged_response=build_response,
+            flat_rhs_with_lagged_response=response_rhs,
+            unpack_flat=unpack_flat,
+            project_flat=project_flat,
+        )
+        dt0 = jnp.clip(
+            jnp.asarray(self.dt, dtype=dtype),
+            jnp.asarray(self.min_step, dtype=dtype),
+            jnp.asarray(self.max_step, dtype=dtype),
+        )
+        step_state = _limm_w_initial_step_state(t0, flat_y0, initial_rhs, dt0, max_order=self.order)
+        step_state = dataclasses.replace(step_state, reuse_state=initial_reuse)
+
+        save_n = max(1, int(self.save_n)) if self.save_n is not None else 1
+        step_fn = partial(
+            _limm_w_step_fn,
+            t_final=t_final,
+            solver=self,
+            flat_rhs=flat_rhs,
+            build_response=build_response,
+            response_rhs=response_rhs,
+            unpack_flat=unpack_flat,
+            project_flat=project_flat,
+        )
+        loop_result = _run_saved_loop(
+            step_state0=step_state,
+            step_fn=step_fn,
+            save_n=save_n,
+            t0=t0,
+            t_final=t_final,
+            state_dim=flat_y0.size,
+            dtype=dtype,
+            max_total_steps=int(self.max_steps),
+            stop_after_accepted_steps=self.stop_after_accepted_steps,
+        )
+        (
+            step_state,
+            _,
+            _,
+            ys_saved,
+            ts_saved,
+            dts_saved,
+            accepted_mask,
+            failed_mask,
+            fail_codes,
+            last_attempt_accepted,
+            last_attempt_converged,
+            last_attempt_error,
+            last_attempt_fail_code,
+            last_attempt_diverged,
+            last_attempt_nonfinite_stage_state,
+            last_attempt_nonfinite_stage_residual,
+            last_attempt_finite_f0,
+            last_attempt_finite_z0,
+            last_attempt_finite_initial_residual,
+            last_attempt_newton_iter_count,
+            last_attempt_final_residual_norm,
+            last_attempt_final_delta_norm,
+            last_attempt_theta_final,
+            last_attempt_slow_contraction,
+            last_attempt_residual_blowup,
+            last_attempt_newton_nonfinite,
+            last_attempt_lagged_reused,
+            last_attempt_jacobian_reused,
+        ) = loop_result
+        failed = step_state.status[0] != 0
+        accepted_limit_hit = _accepted_step_limit_reached(step_state, self.stop_after_accepted_steps)
+        return _finalize_custom_solver_output(
+            ys_saved, ts_saved, dts_saved, accepted_mask, failed_mask, fail_codes,
+            step_state.y, step_state.t,
+            jnp.logical_or(step_state.t >= (t_final - 1.0e-15), accepted_limit_hit),
+            failed, step_state.status[1], step_state.status[2], step_state.dt,
+            last_attempt_accepted, last_attempt_converged, last_attempt_error,
+            last_attempt_fail_code, last_attempt_diverged, last_attempt_nonfinite_stage_state,
+            last_attempt_nonfinite_stage_residual, last_attempt_finite_f0, last_attempt_finite_z0,
+            last_attempt_finite_initial_residual, last_attempt_newton_iter_count,
+            last_attempt_final_residual_norm, last_attempt_final_delta_norm, last_attempt_theta_final,
+            last_attempt_slow_contraction, last_attempt_residual_blowup, last_attempt_newton_nonfinite,
+            last_attempt_lagged_reused, last_attempt_jacobian_reused,
+            step_state.reuse_state, unpack_flat, state, species,
+            temperature_active_mask=temperature_active_mask,
+            fixed_temperature_profile=fixed_temperature_profile,
+            density_floor=density_floor,
+            temperature_floor=temperature_floor,
+        )
+
+
+@jax.tree_util.register_dataclass
+@dataclasses.dataclass(frozen=True, eq=False)
 class _ThetaNewtonSolverConfig(_ThetaSolverConfig):
     maxiter: int = 20
     max_step: float = 1.0
@@ -23044,6 +24195,29 @@ def build_time_solver(solver_parameters: Any, solver_override: Any = None) -> Tr
             debug_stage_markers=bool(_cfg_get("debug_stage_markers", False)),
             save_n=save_n,
         )
+    if backend == "limm_w_forward":
+        return LIMMWBaselineSolver(
+            t0=t0,
+            t1=t1,
+            dt=dt,
+            rtol=float(_cfg_get("rtol", 1.0e-6)),
+            atol=float(_cfg_get("atol", 1.0e-8)),
+            min_step=float(_cfg_get("min_step", 1.0e-14)),
+            max_step=float(_cfg_get("max_step", max(t1 - t0, dt))),
+            order=int(_cfg_get("limm_w_order", 3)),
+            coefficient_family=str(_cfg_get("limm_w_coefficient_family", "o16_published")),
+            max_steps=int(_cfg_get("max_steps", 20000)),
+            safety_factor=float(_cfg_get("safety_factor", 0.9)),
+            min_step_factor=float(_cfg_get("min_step_factor", 0.2)),
+            max_step_factor=float(_cfg_get("max_step_factor", 2.0)),
+            jacobian_reuse_mode=str(_cfg_get("limm_w_jacobian_reuse_mode", "retry_only")),
+            jacobian_reuse_rtol=float(_cfg_get("limm_w_jacobian_reuse_rtol", 5.0e-2)),
+            jacobian_reuse_atol=float(_cfg_get("limm_w_jacobian_reuse_atol", 1.0e-8)),
+            stop_after_accepted_steps=stop_after_accepted_steps,
+            debug_walltime_attempts=bool(_cfg_get("debug_walltime_attempts", False)),
+            debug_stage_markers=bool(_cfg_get("debug_stage_markers", False)),
+            save_n=save_n,
+        )
     if backend == "radau":
         return RADAUSolver(
             t0=t0,
@@ -23111,6 +24285,7 @@ register_time_solver("diffrax_kvaerno5", lambda **kw: DiffraxSolver(_get_diffrax
 register_time_solver("diffrax_tsit5", lambda **kw: DiffraxSolver(_get_diffrax_integrator("diffrax_tsit5"), **kw))
 register_time_solver("diffrax_dopri5", lambda **kw: DiffraxSolver(_get_diffrax_integrator("diffrax_dopri5"), **kw))
 register_time_solver("radau", lambda **kw: RADAUSolver(**kw))
+register_time_solver("limm_w_forward", lambda **kw: LIMMWBaselineSolver(**kw))
 register_time_solver("theta", lambda **kw: ThetaMethodSolver(**kw))
 register_time_solver("theta_newton", lambda **kw: NewtonThetaMethodSolver(**kw))
 register_time_solver("theta_t3d_outer", lambda **kw: T3DOuterThetaMethodSolver(**kw))

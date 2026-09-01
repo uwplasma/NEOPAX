@@ -153,3 +153,120 @@ Baseline objective values:
 | `total_pressure_volume_average` | 8.059606e+00 | 1.864677e+00 | 2.442594e-01 |
 | `alpha_power_volume_average_mw_m3` | 2.790502e-01 | 8.360589e-02 | 2.354167e-03 |
 | `bootstrap_current_softmax_abs_scaled` | -9.391406e-04 | 2.307464e-01 | -1.320395e-02 |
+
+### wHe reverse AD versus frozen-linearized FD
+
+The reverse run used the selected-root compact pullback after aligning its
+state preparation with the forward local particle-flux evaluator (configured
+species floors, fixed-species projection, and center-gradient construction).
+The FD values above are printed to six decimal places, so the reported errors
+are conservative with respect to the unprinted FD precision.
+
+#### Reverse-AD transport derivatives
+
+| objective | d/n0 | d/T0 | d/density-shape-power | d/temperature-shape-power | d/density-shape-alpha | d/temperature-shape-alpha | d/RBC:1:0 | d/ZBS:1:0 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `softmax_Er` | -4.405970182e+00 | 3.693005393e+00 | -9.764981822e-02 | 2.326826072e+00 | 1.781345735e-01 | 1.381981115e+01 | -5.161877072e+01 | 1.544093574e+01 |
+| `net_total_power_volume_average_mw_m3` | 2.408879193e-01 | 8.140384894e-02 | 9.949818099e-04 | 2.756007771e-01 | -2.352270801e-04 | -3.942156986e-01 | -6.528865665e-03 | -2.280228812e-03 |
+| `Er_transition_left` | -1.447091223e+00 | 1.837078552e+00 | -1.280427940e-02 | -7.180969420e+00 | 1.581278314e-02 | 1.610114938e+01 | -2.029714231e+01 | 1.538368183e-01 |
+| `Er_transition_right` | -1.670881677e+00 | 2.001436550e+00 | -1.820510244e-02 | -6.263604560e+00 | 2.384770614e-02 | 1.629422742e+01 | -2.248753599e+01 | 1.020231456e+00 |
+| `Er2_volume_average` | -1.137440200e-01 | 2.953282497e+01 | 2.908458025e+00 | -3.304416001e+01 | -7.914954885e+00 | 1.501751046e+02 | -1.370294385e+02 | -1.710580936e+02 |
+| `Er_volume_average` | -4.691408779e+00 | 2.484760954e+00 | -1.133619545e-01 | 3.080282794e+00 | 8.113053755e-02 | 2.623662925e+00 | -4.236791466e+01 | 3.015190408e+01 |
+| `electron_temperature_volume_average_keV` | 2.627427320e-04 | 3.553105415e-01 | -1.731549853e-05 | 1.522883654e+00 | 3.187910548e-04 | -3.043178743e+00 | -1.297160075e-02 | -3.997608597e-02 |
+| `total_pressure_volume_average` | 8.059606042e+00 | 1.864676793e+00 | 2.442593657e-01 | 7.750766053e+00 | -1.326611062e+00 | -1.452040307e+01 | -7.360244916e-02 | -2.373430136e-01 |
+| `alpha_power_volume_average_mw_m3` | 2.790502063e-01 | 8.360589676e-02 | 2.354163306e-03 | 2.852953771e-01 | -7.627225877e-03 | -4.132077181e-01 | -6.686679722e-03 | -2.750729344e-03 |
+| `bootstrap_current_softmax_abs_scaled` | -9.388484465e-04 | 2.307460298e-01 | -1.320397873e-02 | 1.523316057e+00 | 1.139955494e-01 | -3.521755735e+00 | -1.760376607e+00 | -6.237748905e+00 |
+
+| objective | n0 reverse | n0 FD | n0 abs. error | n0 rel. error | T0 reverse | T0 FD | T0 abs. error | T0 rel. error | density-power reverse | density-power FD | density-power abs. error | density-power rel. error |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `softmax_Er` | -4.405970182e+00 | -4.405941e+00 | 2.918e-05 | 6.623e-06 | 3.693005393e+00 | 3.693007e+00 | 1.607e-06 | 4.351e-07 | -9.764981822e-02 | -9.766809e-02 | 1.827e-05 | 1.871e-04 |
+| `net_total_power_volume_average_mw_m3` | 2.408879193e-01 | 2.408879e-01 | 1.931e-08 | 8.018e-08 | 8.140384894e-02 | 8.140385e-02 | 1.063e-09 | 1.306e-08 | 9.949818099e-04 | 9.949851e-04 | 3.290e-09 | 3.307e-06 |
+| `Er_transition_left` | -1.447091223e+00 | -1.447162e+00 | 7.078e-05 | 4.891e-05 | 1.837078552e+00 | 1.837081e+00 | 2.448e-06 | 1.333e-06 | -1.280427940e-02 | -1.280441e-02 | 1.306e-07 | 1.020e-05 |
+| `Er_transition_right` | -1.670881677e+00 | -1.670833e+00 | 4.868e-05 | 2.913e-05 | 2.001436550e+00 | 2.001425e+00 | 1.155e-05 | 5.771e-06 | -1.820510244e-02 | -1.821576e-02 | 1.066e-05 | 5.851e-04 |
+| `Er2_volume_average` | -1.137440200e-01 | -1.136820e-01 | 6.202e-05 | 5.456e-04 | 2.953282497e+01 | 2.953277e+01 | 5.497e-05 | 1.861e-06 | 2.908458025e+00 | 2.908472e+00 | 1.398e-05 | 4.805e-06 |
+| `Er_volume_average` | -4.691408779e+00 | -4.691384e+00 | 2.478e-05 | 5.282e-06 | 2.484760954e+00 | 2.484746e+00 | 1.495e-05 | 6.018e-06 | -1.133619545e-01 | -1.133473e-01 | 1.465e-05 | 1.293e-04 |
+| `electron_temperature_volume_average_keV` | 2.627427320e-04 | 2.627422e-04 | 5.320e-10 | 2.025e-06 | 3.553105415e-01 | 3.553105e-01 | 4.149e-08 | 1.168e-07 | -1.731549853e-05 | -1.731593e-05 | 4.315e-10 | 2.492e-05 |
+| `total_pressure_volume_average` | 8.059606042e+00 | 8.059606e+00 | 4.173e-08 | 5.178e-09 | 1.864676793e+00 | 1.864677e+00 | 2.069e-07 | 1.109e-07 | 2.442593657e-01 | 2.442594e-01 | 3.428e-08 | 1.403e-07 |
+| `alpha_power_volume_average_mw_m3` | 2.790502063e-01 | 2.790502e-01 | 6.276e-09 | 2.249e-08 | 8.360589676e-02 | 8.360589e-02 | 6.758e-09 | 8.083e-08 | 2.354163306e-03 | 2.354167e-03 | 3.694e-09 | 1.569e-06 |
+| `bootstrap_current_softmax_abs_scaled` | -9.388484465e-04 | -9.391406e-04 | 2.922e-07 | 3.111e-04 | 2.307460298e-01 | 2.307464e-01 | 3.702e-07 | 1.604e-06 | -1.320397873e-02 | -1.320395e-02 | 2.873e-08 | 2.176e-06 |
+
+#### Remaining profile and geometry parameter comparisons
+
+The following FD results were produced by the same wHe accepted-schedule,
+frozen-linearized geometry/root lane as the preceding table.  `rel. error` is
+`|reverse - FD| / |FD|`; it is quoted from the printed six-decimal FD values.
+
+##### `temperature_shape_power`
+
+| objective | reverse AD | FD | abs. error | rel. error |
+| --- | ---: | ---: | ---: | ---: |
+| `softmax_Er` | 2.326826072e+00 | 2.326775e+00 | 5.107e-05 | 2.195e-05 |
+| `net_total_power_volume_average_mw_m3` | 2.756007771e-01 | 2.756008e-01 | 2.286e-08 | 8.294e-08 |
+| `Er_transition_left` | -7.180969420e+00 | -7.180946e+00 | 2.342e-05 | 3.261e-06 |
+| `Er_transition_right` | -6.263604560e+00 | -6.263527e+00 | 7.756e-05 | 1.238e-05 |
+| `Er2_volume_average` | -3.304416001e+01 | -3.304452e+01 | 3.600e-04 | 1.089e-05 |
+| `Er_volume_average` | 3.080282794e+00 | 3.080242e+00 | 4.079e-05 | 1.324e-05 |
+| `electron_temperature_volume_average_keV` | 1.522883654e+00 | 1.522884e+00 | 3.465e-07 | 2.275e-07 |
+| `total_pressure_volume_average` | 7.750766053e+00 | 7.750766e+00 | 5.367e-08 | 6.924e-09 |
+| `alpha_power_volume_average_mw_m3` | 2.852953771e-01 | 2.852954e-01 | 2.294e-08 | 8.041e-08 |
+| `bootstrap_current_softmax_abs_scaled` | 1.523316057e+00 | 1.523310e+00 | 6.057e-06 | 3.976e-06 |
+
+##### `density_shape_alpha`
+
+| objective | reverse AD | FD | abs. error | rel. error |
+| --- | ---: | ---: | ---: | ---: |
+| `softmax_Er` | 1.781345735e-01 | 1.780592e-01 | 7.537e-05 | 4.233e-04 |
+| `net_total_power_volume_average_mw_m3` | -2.352270801e-04 | -2.352239e-04 | 3.180e-09 | 1.352e-05 |
+| `Er_transition_left` | 1.581278314e-02 | 1.578012e-02 | 3.266e-05 | 2.070e-03 |
+| `Er_transition_right` | 2.384770614e-02 | 2.393388e-02 | 8.617e-05 | 3.600e-03 |
+| `Er2_volume_average` | -7.914954885e+00 | -7.915027e+00 | 7.211e-05 | 9.111e-06 |
+| `Er_volume_average` | 8.113053755e-02 | 8.114724e-02 | 1.670e-05 | 2.058e-04 |
+| `electron_temperature_volume_average_keV` | 3.187910548e-04 | 3.187894e-04 | 1.655e-09 | 5.191e-06 |
+| `total_pressure_volume_average` | -1.326611062e+00 | -1.326611e+00 | 6.244e-08 | 4.706e-08 |
+| `alpha_power_volume_average_mw_m3` | -7.627225877e-03 | -7.627223e-03 | 2.877e-09 | 3.772e-07 |
+| `bootstrap_current_softmax_abs_scaled` | -1.139955494e-01 | 1.139911e-01 | 2.280e-01 | 2.000e+00 |
+
+##### `temperature_shape_alpha`
+
+| objective | reverse AD | FD | abs. error | rel. error |
+| --- | ---: | ---: | ---: | ---: |
+| `softmax_Er` | 1.381981115e+01 | 1.381965e+01 | 1.611e-04 | 1.166e-05 |
+| `net_total_power_volume_average_mw_m3` | -3.942156986e-01 | -3.942157e-01 | 1.358e-09 | 3.446e-09 |
+| `Er_transition_left` | 1.610114938e+01 | 1.610097e+01 | 1.794e-04 | 1.114e-05 |
+| `Er_transition_right` | 1.629422742e+01 | 1.629420e+01 | 2.742e-05 | 1.683e-06 |
+| `Er2_volume_average` | 1.501751046e+02 | 1.501754e+02 | 2.954e-04 | 1.967e-06 |
+| `Er_volume_average` | 2.623662925e+00 | 2.623741e+00 | 7.807e-05 | 2.976e-05 |
+| `electron_temperature_volume_average_keV` | -3.043178743e+00 | -3.043179e+00 | 2.569e-07 | 8.441e-08 |
+| `total_pressure_volume_average` | -1.452040307e+01 | -1.452040e+01 | 3.066e-06 | 2.111e-07 |
+| `alpha_power_volume_average_mw_m3` | -4.132077181e-01 | -4.132077e-01 | 1.809e-08 | 4.377e-08 |
+| `bootstrap_current_softmax_abs_scaled` | -3.521755735e+00 | -3.521756e+00 | 2.645e-07 | 7.511e-08 |
+
+##### `RBC:1:0`
+
+| objective | reverse AD | FD | abs. error | rel. error |
+| --- | ---: | ---: | ---: | ---: |
+| `softmax_Er` | -5.161877072e+01 | -5.161912e+01 | 3.493e-04 | 6.767e-06 |
+| `net_total_power_volume_average_mw_m3` | -6.528865665e-03 | -5.767493e-03 | 7.614e-04 | 1.320e-01 |
+| `Er_transition_left` | -2.029714231e+01 | -2.029573e+01 | 1.412e-03 | 6.959e-05 |
+| `Er_transition_right` | -2.248753599e+01 | -2.248608e+01 | 1.456e-03 | 6.475e-05 |
+| `Er2_volume_average` | -1.370294385e+02 | -9.018049e+01 | 4.685e+01 | 5.195e-01 |
+| `Er_volume_average` | -4.236791466e+01 | -4.252461e+01 | 1.567e-01 | 3.685e-03 |
+| `electron_temperature_volume_average_keV` | -1.297160075e-02 | -1.312590e-02 | 1.543e-04 | 1.176e-02 |
+| `total_pressure_volume_average` | -7.360244916e-02 | -7.383215e-02 | 2.297e-04 | 3.111e-03 |
+| `alpha_power_volume_average_mw_m3` | -6.686679722e-03 | -5.925965e-03 | 7.607e-04 | 1.284e-01 |
+| `bootstrap_current_softmax_abs_scaled` | -1.760376607e+00 | -1.759171e+00 | 1.206e-03 | 6.853e-04 |
+
+##### `ZBS:1:0`
+
+| objective | reverse AD | FD | abs. error | rel. error |
+| --- | ---: | ---: | ---: | ---: |
+| `softmax_Er` | 1.544093574e+01 | 1.547149e+01 | 3.055e-02 | 1.975e-03 |
+| `net_total_power_volume_average_mw_m3` | -2.280228812e-03 | -2.903250e-03 | 6.230e-04 | 2.146e-01 |
+| `Er_transition_left` | 1.538368183e-01 | 1.537210e-01 | 1.158e-04 | 7.534e-04 |
+| `Er_transition_right` | 1.020231456e+00 | 1.020293e+00 | 6.154e-05 | 6.032e-05 |
+| `Er2_volume_average` | -1.710580936e+02 | -2.092590e+02 | 3.820e+01 | 1.826e-01 |
+| `Er_volume_average` | 3.015190408e+01 | 3.030914e+01 | 1.572e-01 | 5.188e-03 |
+| `electron_temperature_volume_average_keV` | -3.997608597e-02 | -4.003870e-02 | 6.261e-05 | 1.564e-03 |
+| `total_pressure_volume_average` | -2.373430136e-01 | -2.374806e-01 | 1.376e-04 | 5.794e-04 |
+| `alpha_power_volume_average_mw_m3` | -2.750729344e-03 | -3.373287e-03 | 6.226e-04 | 1.846e-01 |
+| `bootstrap_current_softmax_abs_scaled` | -6.237748905e+00 | -6.237500e+00 | 2.489e-04 | 3.990e-05 |

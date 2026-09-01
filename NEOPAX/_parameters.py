@@ -44,6 +44,11 @@ class Solver_Parameters:
     theta_trust_radius: float
     theta_homotopy_steps: int
     theta_differentiable_mode: bool
+    limm_w_order: int
+    limm_w_coefficient_family: str
+    limm_w_jacobian_reuse_mode: str
+    limm_w_jacobian_reuse_rtol: float
+    limm_w_jacobian_reuse_atol: float
     er_ambipolar_scan_min: float
     er_ambipolar_scan_max: float
     er_ambipolar_n_scan: int
@@ -101,6 +106,9 @@ class Solver_Parameters:
                         theta_trust_region_enabled=None,theta_trust_radius=None,
                         theta_homotopy_steps=None,
                         theta_differentiable_mode=None,
+                        limm_w_order=None,limm_w_coefficient_family=None,
+                        limm_w_jacobian_reuse_mode=None,limm_w_jacobian_reuse_rtol=None,
+                        limm_w_jacobian_reuse_atol=None,
                         er_ambipolar_scan_min=None,er_ambipolar_scan_max=None,er_ambipolar_n_scan=None,
                         er_ambipolar_tol=None,er_ambipolar_maxiter=None,
                         er_ambipolar_n_coarse=None,er_ambipolar_n_fine=None,
@@ -314,6 +322,31 @@ class Solver_Parameters:
             self.theta_differentiable_mode = False
         else:
             self.theta_differentiable_mode = bool(theta_differentiable_mode)
+
+        if limm_w_order is None:
+            self.limm_w_order = 3
+        else:
+            self.limm_w_order = int(limm_w_order)
+
+        if limm_w_coefficient_family is None:
+            self.limm_w_coefficient_family = "o16_published"
+        else:
+            self.limm_w_coefficient_family = str(limm_w_coefficient_family)
+
+        if limm_w_jacobian_reuse_mode is None:
+            self.limm_w_jacobian_reuse_mode = "retry_only"
+        else:
+            self.limm_w_jacobian_reuse_mode = str(limm_w_jacobian_reuse_mode)
+
+        if limm_w_jacobian_reuse_rtol is None:
+            self.limm_w_jacobian_reuse_rtol = 5.0e-2
+        else:
+            self.limm_w_jacobian_reuse_rtol = float(limm_w_jacobian_reuse_rtol)
+
+        if limm_w_jacobian_reuse_atol is None:
+            self.limm_w_jacobian_reuse_atol = 1.0e-8
+        else:
+            self.limm_w_jacobian_reuse_atol = float(limm_w_jacobian_reuse_atol)
 
         if er_ambipolar_scan_min is None:
             self.er_ambipolar_scan_min = -20.0
