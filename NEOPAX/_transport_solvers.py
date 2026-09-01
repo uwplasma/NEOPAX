@@ -19943,9 +19943,12 @@ class _LIMMWSolverConfig(TransportSolver):
         coefficient_family = str(coefficient_family).strip().lower()
         if coefficient_family not in {"baseline", "o16_published"}:
             raise ValueError("limm_w_coefficient_family must be 'baseline' or 'o16_published'.")
-        if coefficient_family == "o16_published" and int(order) > 5:
+        # The forward lane currently implements and validates the complete
+        # p=3/p+1 controller only.  Tables above p4 are not an authorization
+        # to expose an incomplete higher-order controller.
+        if coefficient_family == "o16_published" and int(order) > 3:
             raise ValueError(
-                "The vendored published LIMM o16 tables currently support startup/orders through 5."
+                "The published LIMM-o16 forward controller currently supports max accepted order 3."
             )
         reuse_aliases = {
             "none": "fresh",
@@ -20331,6 +20334,10 @@ class _LIMMWStepState:
     prev_error: Any
     recent_reject_count: Any
     easy_growth_streak: Any
+    selected_order: Any
+    consecutive_accepts: Any
+    reject_last: Any
+    reject_more: Any
 
 
 def _limm_w_initial_step_state(t0, initial_y, initial_rhs, base_dt, *, max_order: int):
@@ -20357,6 +20364,10 @@ def _limm_w_initial_step_state(t0, initial_y, initial_rhs, base_dt, *, max_order
         prev_error=jnp.asarray(1.0, dtype=dtype),
         recent_reject_count=jnp.asarray(0, dtype=jnp.int32),
         easy_growth_streak=jnp.asarray(0, dtype=jnp.int32),
+        selected_order=jnp.asarray(1, dtype=jnp.int32),
+        consecutive_accepts=jnp.asarray(0, dtype=jnp.int32),
+        reject_last=jnp.asarray(False),
+        reject_more=jnp.asarray(False),
     )
 
 
@@ -20443,11 +20454,111 @@ def _limm_w_next_dt(
 
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True, eq=False)
+class _LIMMWControllerDecision:
+    """Pure MATLODE-style order/timestep decision for one LIMM attempt."""
+
+    next_dt: Any
+    next_order: Any
+    next_consecutive_accepts: Any
+    reject_last: Any
+    reject_more: Any
+
+
+def _limm_w_controller_decision(
+    *,
+    trial_dt,
+    errors,
+    order,
+    consecutive_accepts,
+    reject_last,
+    reject_more,
+    max_order: int,
+    min_step,
+    max_step,
+):
+    """Port MATLODE LIMM's order/timestep selection without host control flow.
+
+    ``errors`` is ``(E_{p-1}, E_p, E_{p+1})``.  The accepted step uses
+    ``E_p``; neighbouring estimates are used only to choose the next order
+    and step size.  This function does not mutate solution/history state.
+    """
+
+    trial_dt = jnp.asarray(trial_dt)
+    dtype = trial_dt.dtype
+    order = jnp.asarray(order, dtype=jnp.int32)
+    errors = jnp.maximum(jnp.asarray(errors, dtype=dtype), jnp.asarray(1.0e-10, dtype=dtype))
+    fac_min = jnp.asarray(0.2, dtype=dtype)
+    fac_max = jnp.asarray(6.0, dtype=dtype)
+    fac_rej = jnp.asarray(0.1, dtype=dtype)
+    safe_low = jnp.asarray(0.7, dtype=dtype)
+    safe = jnp.asarray(0.9, dtype=dtype)
+    safe_high = jnp.asarray(0.8, dtype=dtype)
+
+    # MATLODE ELO = [max(1,p-1), p, p+1].
+    elo_m1 = jnp.maximum(jnp.asarray(1, dtype=jnp.int32), order - jnp.asarray(1, dtype=jnp.int32))
+    elo_p = order
+    elo_p1 = order + jnp.asarray(1, dtype=jnp.int32)
+    unscaled = jnp.stack(
+        (
+            errors[0] ** (-jnp.asarray(1.0, dtype=dtype) / elo_m1.astype(dtype)),
+            errors[1] ** (-jnp.asarray(1.0, dtype=dtype) / elo_p.astype(dtype)),
+            errors[2] ** (-jnp.asarray(1.0, dtype=dtype) / elo_p1.astype(dtype)),
+        )
+    )
+    factors = jnp.clip(unscaled * jnp.asarray([safe_low, safe, safe_high], dtype=dtype), fac_min, fac_max)
+    candidates = trial_dt * factors
+    can_change = consecutive_accepts >= order + jnp.asarray(2, dtype=jnp.int32)
+    choose_m1 = jnp.logical_and(candidates[0] > candidates[1], order > 1)
+    best_dt = jnp.where(choose_m1, candidates[0], candidates[1])
+    best_order = jnp.where(choose_m1, order - 1, order)
+    choose_p1 = jnp.logical_and(
+        candidates[2] > best_dt,
+        jnp.logical_and(order < jnp.asarray(int(max_order), dtype=jnp.int32), order + 1 < consecutive_accepts),
+    )
+    best_dt = jnp.where(choose_p1, candidates[2], best_dt)
+    best_order = jnp.where(choose_p1, order + 1, best_order)
+    next_dt_accept = jnp.where(can_change, best_dt, trial_dt)
+    next_order_accept = jnp.where(can_change, best_order, order)
+    next_dt_accept = jnp.where(reject_last, jnp.minimum(next_dt_accept, trial_dt), next_dt_accept)
+    next_order_accept = jnp.where(reject_last, jnp.minimum(next_order_accept, order), next_order_accept)
+
+    reject_use_forced = jnp.asarray(reject_more)
+    reject_dt_from_errors = jnp.minimum(trial_dt, jnp.maximum(candidates[1], candidates[0]))
+    reject_choose_m1 = jnp.logical_and(order > 1, candidates[0] >= candidates[1])
+    next_dt_reject = jnp.where(reject_use_forced, trial_dt * fac_rej, reject_dt_from_errors)
+    next_order_reject = jnp.where(
+        reject_use_forced,
+        jnp.maximum(order - 1, jnp.asarray(1, dtype=jnp.int32)),
+        jnp.where(reject_choose_m1, order - 1, order),
+    )
+    accepted = errors[1] <= jnp.asarray(1.0, dtype=dtype)
+    next_dt = jnp.where(accepted, next_dt_accept, next_dt_reject)
+    next_dt = jnp.clip(next_dt, jnp.asarray(min_step, dtype=dtype), jnp.asarray(max_step, dtype=dtype))
+    next_order = jnp.where(accepted, next_order_accept, next_order_reject)
+    return _LIMMWControllerDecision(
+        next_dt=next_dt,
+        next_order=next_order,
+        next_consecutive_accepts=jnp.where(
+            accepted,
+            jnp.minimum(consecutive_accepts + 1, jnp.asarray(int(max_order) + 2, dtype=jnp.int32)),
+            jnp.asarray(0, dtype=jnp.int32),
+        ),
+        reject_last=jnp.logical_not(accepted),
+        reject_more=jnp.where(accepted, jnp.asarray(False), jnp.asarray(reject_last)),
+    )
+
+
+@jax.tree_util.register_dataclass
+@dataclasses.dataclass(frozen=True, eq=False)
 class _LIMMWAttemptResult:
     trial_y: Any
+    lower_trial_y: Any
+    higher_trial_y: Any
     trial_dt: Any
     next_dt: Any
     error_norm: Any
+    candidate_error_norms: Any
+    controller: _LIMMWControllerDecision
     accepted: Any
     order: Any
 
@@ -20498,26 +20609,48 @@ def _limm_w_attempt_at_order(
         rtol=solver.rtol,
         atol=solver.atol,
     )
+    # The adjacent candidates are purely linear solves under the same frozen
+    # response/J.  They are controller data only; ``trial_y`` remains Y_p.
+    if int(order) > 1:
+        lower_trial_y = _limm_w_trial_step_for_family(
+            step_state.y, history_rhs, history_states, current_jacobian, trial_dt,
+            step_state.history.accepted_dts, order=int(order) - 1,
+            coefficient_family=solver.coefficient_family,
+        )
+        higher_trial_y = _limm_w_trial_step_for_family(
+            step_state.y, history_rhs, history_states, current_jacobian, trial_dt,
+            step_state.history.accepted_dts, order=int(order) + 1,
+            coefficient_family=solver.coefficient_family,
+        )
+        error_m1 = _limm_w_scaled_error_norm(trial_y - lower_trial_y, step_state.y, trial_y, rtol=solver.rtol, atol=solver.atol)
+        error_p = _limm_w_scaled_error_norm(higher_trial_y - trial_y, step_state.y, trial_y, rtol=solver.rtol, atol=solver.atol)
+        candidate_error_norms = jnp.stack((error_m1, error_p, error_p))
+    else:
+        lower_trial_y = trial_y
+        higher_trial_y = trial_y
+        candidate_error_norms = jnp.broadcast_to(error_norm, (3,))
+    controller = _limm_w_controller_decision(
+        trial_dt=trial_dt, errors=candidate_error_norms, order=jnp.asarray(order, dtype=jnp.int32),
+        consecutive_accepts=step_state.consecutive_accepts, reject_last=step_state.reject_last,
+        reject_more=step_state.reject_more, max_order=solver.order,
+        min_step=solver.min_step, max_step=solver.max_step,
+    )
+    error_norm = candidate_error_norms[1]
     finite = jnp.logical_and(jnp.all(jnp.isfinite(trial_y)), jnp.isfinite(error_norm))
     accepted = jnp.logical_and(finite, error_norm <= jnp.asarray(1.0, dtype=step_state.y.dtype))
-    next_dt = _limm_w_next_dt(
-        trial_dt,
-        error_norm,
-        order=int(order),
-        safety_factor=solver.safety_factor,
-        min_step_factor=solver.min_step_factor,
-        max_step_factor=solver.max_step_factor,
-    )
-    next_dt = jnp.clip(
-        next_dt,
-        jnp.asarray(solver.min_step, dtype=step_state.y.dtype),
-        jnp.asarray(solver.max_step, dtype=step_state.y.dtype),
-    )
+    next_dt = controller.next_dt
     return _LIMMWAttemptResult(
         trial_y=trial_y,
+        # Populated with distinct p-1/p/p+1 candidates when the live
+        # MATLODE controller wiring is enabled; retain shape-stable fields
+        # during this interface transition.
+        lower_trial_y=lower_trial_y,
+        higher_trial_y=higher_trial_y,
         trial_dt=trial_dt,
         next_dt=next_dt,
         error_norm=error_norm,
+        candidate_error_norms=candidate_error_norms,
+        controller=controller,
         accepted=accepted,
         order=jnp.asarray(int(order), dtype=jnp.int32),
     )
@@ -20545,6 +20678,10 @@ def _limm_w_commit_attempt(step_state: _LIMMWStepState, attempt: _LIMMWAttemptRe
             prev_error=attempt.error_norm,
             recent_reject_count=jnp.asarray(0, dtype=jnp.int32),
             easy_growth_streak=step_state.easy_growth_streak + jnp.asarray(1, dtype=jnp.int32),
+            selected_order=attempt.controller.next_order,
+            consecutive_accepts=attempt.controller.next_consecutive_accepts,
+            reject_last=attempt.controller.reject_last,
+            reject_more=attempt.controller.reject_more,
         )
 
     def _reject(_):
@@ -20554,6 +20691,10 @@ def _limm_w_commit_attempt(step_state: _LIMMWStepState, attempt: _LIMMWAttemptRe
             prev_error=attempt.error_norm,
             recent_reject_count=step_state.recent_reject_count + jnp.asarray(1, dtype=jnp.int32),
             easy_growth_streak=jnp.asarray(0, dtype=jnp.int32),
+            selected_order=attempt.controller.next_order,
+            consecutive_accepts=attempt.controller.next_consecutive_accepts,
+            reject_last=attempt.controller.reject_last,
+            reject_more=attempt.controller.reject_more,
         )
 
     del dtype
@@ -20836,7 +20977,16 @@ def _limm_w_step_fn(
 ):
     """One compiled adaptive LIMM-W attempt, mirroring theta/Radau loops."""
 
-    available_order = _limm_w_available_order(step_state, solver.order)
+    history_order = _limm_w_available_order(step_state, solver.order)
+    # The p=1 Euler fallback is only a startup estimator, not a three-order
+    # LIMM controller stencil.  Ramp deterministically until p=2 has been
+    # accepted with a valid p=3 companion; thereafter honour controller order.
+    startup = step_state.history.valid_count <= jnp.asarray(3, dtype=jnp.int32)
+    available_order = jnp.where(
+        startup,
+        history_order,
+        jnp.minimum(history_order, step_state.selected_order),
+    )
     current_rhs = step_state.history.rhs_values[0]
     current_jacobian = step_state.reuse_state.jacobian
     branches = tuple(
@@ -20961,7 +21111,13 @@ class LIMMWBaselineSolver(_LIMMWSolverConfig):
         # Keep one extra accepted row so the order-(p+1) companion can be
         # formed while the accepted method remains capped at p.
         step_state = _limm_w_initial_step_state(t0, flat_y0, initial_rhs, dt0, max_order=self.order + 1)
-        step_state = dataclasses.replace(step_state, reuse_state=initial_reuse)
+        # Start with the configured cap; ``_limm_w_available_order`` still
+        # limits the live method to orders whose accepted history exists.
+        step_state = dataclasses.replace(
+            step_state,
+            reuse_state=initial_reuse,
+            selected_order=jnp.asarray(self.order, dtype=jnp.int32),
+        )
 
         save_n = max(1, int(self.save_n)) if self.save_n is not None else 1
         step_fn = partial(

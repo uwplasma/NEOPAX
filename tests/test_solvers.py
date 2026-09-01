@@ -60,9 +60,9 @@ def test_limm_w_config_rejects_unsupported_order(order):
 
 
 def test_limm_w_published_o16_configuration_is_limited_to_vendored_orders():
-    assert transport_solvers._LIMMWSolverConfig(order=5, coefficient_family="o16_published").coefficient_family == "o16_published"
-    with pytest.raises(ValueError, match="limm_w_order"):
-        transport_solvers._LIMMWSolverConfig(order=6, coefficient_family="o16_published")
+    assert transport_solvers._LIMMWSolverConfig(order=3, coefficient_family="o16_published").coefficient_family == "o16_published"
+    with pytest.raises(ValueError, match="currently supports"):
+        transport_solvers._LIMMWSolverConfig(order=4, coefficient_family="o16_published")
 
 
 @pytest.mark.parametrize("order", [1, 2, 3, 4, 5])
@@ -306,6 +306,39 @@ def test_limm_w_controller_shrinks_and_grows_dt_from_scaled_error():
     )
     assert float(shrink) < 0.1
     assert float(grow) > 0.1
+
+
+def test_limm_w_matlode_controller_selects_order_and_recovers_after_rejection():
+    accepted = transport_solvers._limm_w_controller_decision(
+        trial_dt=jnp.asarray(0.1),
+        errors=jnp.asarray([0.5, 0.4, 0.01]),
+        order=jnp.asarray(2, dtype=jnp.int32),
+        consecutive_accepts=jnp.asarray(4, dtype=jnp.int32),
+        reject_last=jnp.asarray(False),
+        reject_more=jnp.asarray(False),
+        max_order=3,
+        min_step=1.0e-8,
+        max_step=1.0,
+    )
+    assert int(accepted.next_order) == 3
+    assert float(accepted.next_dt) > 0.1
+    assert not bool(accepted.reject_last)
+
+    rejected = transport_solvers._limm_w_controller_decision(
+        trial_dt=jnp.asarray(0.1),
+        errors=jnp.asarray([2.0, 4.0, 8.0]),
+        order=jnp.asarray(3, dtype=jnp.int32),
+        consecutive_accepts=jnp.asarray(2, dtype=jnp.int32),
+        reject_last=jnp.asarray(True),
+        reject_more=jnp.asarray(True),
+        max_order=3,
+        min_step=1.0e-8,
+        max_step=1.0,
+    )
+    assert int(rejected.next_order) == 2
+    assert float(rejected.next_dt) == pytest.approx(0.01)
+    assert int(rejected.next_consecutive_accepts) == 0
+    assert bool(rejected.reject_last)
 
 
 def test_limm_w_attempt_commit_preserves_history_on_rejection_and_shifts_on_accept():
