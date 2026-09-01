@@ -19943,9 +19943,9 @@ class _LIMMWSolverConfig(TransportSolver):
         coefficient_family = str(coefficient_family).strip().lower()
         if coefficient_family not in {"baseline", "o16_published"}:
             raise ValueError("limm_w_coefficient_family must be 'baseline' or 'o16_published'.")
-        if coefficient_family == "o16_published" and int(order) > 3:
+        if coefficient_family == "o16_published" and int(order) > 5:
             raise ValueError(
-                "The vendored published LIMM o16 tables currently support startup/orders through 3."
+                "The vendored published LIMM o16 tables currently support startup/orders through 5."
             )
         reuse_aliases = {
             "none": "fresh",
@@ -20027,16 +20027,23 @@ def _limm_w_baseline_coefficients(current_dt, previous_dts, *, order: int, dtype
     return beta, mu_past, bdf_gamma
 
 
-# Compact sparse-polynomial tables for the order-1--3 LIMM-o16 family from
+# Compact sparse-polynomial tables for the order-1--5 LIMM-o16 family from
 # the public MATLODE ``limm_dev`` implementation (commit 41bdbdc).  The table
 # is source data, not a runtime dependency on MATLAB/scipy or a local checkout.
-# It is intentionally limited to order 3 while the forward benchmark lane is
-# established; the method still starts at order 1 then 2 from accepted history.
+# Orders 4--5 are kept in a companion module to keep this solver module
+# readable; the method starts at order 1 from accepted history.
 _LIMM_W_O16_TABLES_B85 = (
     "c-pmBO^@6*4E-;2t!?mIQqDOSJ@pdgFa;KEfJ`<>(^Ihjy_9TcJ+|m<itWWP^dySpBOmQ=7rearcDa81{MYsE!>7mFhfmk9k6(Vje!RSS_YU8`9}d`WkAH{Q+Yh&U?AL#84__9GSfLRoIHGP7gM)7J8T#YlYvkq*+IqQzwoX>);Nuaw^Y0G1bMMdV?H2jB$F>gcv8{&<3)6T&DL8l+!2ya+9i!Vq>#3*VLMK(kuU|!dsQEL>PZro+_$Re@fanKh$**0O6AUZw`wh((I;q>CkJ5QnQxAE*E2ww-AL^Yvcsi^3v89JLIXdj)#>#No9m6KFPNFJ2%*-CP@VbTLM&h`U`VcRW_ZXk_m;i`~N>+eWgf>0!deY6AS(OuJAeOF>uWT@au_Xof$4Zi5Z;NiUL`gImW<t`Wuh+oOto-NRK0y4VX*4mRSONr4GJ^c@3nnjK6Dlk~4k!s)T|SYBforu56iWpU9EycZ0+I`WQwBM4z0C$8v;qZk$u-fnWpE->a0bYVq(n+>=V+5NXO@Y49~R`ctWzmqWLDUz#nM(oK^psB^i5}B&X_S3Q&gbYH$Y}KQD5LpEoZ}+rsQe0#OV1=YJ6hW)gTow*<2gL?dnX&_~J+!-^o333+OQbI*)T8IEnM<(IqjUtcA9m9&2}~>VShZVk^DeR%F0fo0l`ZIZ3<o+*SfB+%2X<8;IMEv_8Oig9VeIU-Vu@o~&#c96&D+KIxGD=93AtW~K>sdzXPurp`8kqvqu)LrG43ZRjLv>5fjZMq6ppS~Dujx%d+#G!fN%V1m6S87vo9V}U%6J}lWq)J>b~k3a9S_0kRvM4{tyl%M``5Fk&SSp7EdQv(B>#cJBA)$Bu*WiJo&Nm4v)Nv3n=q`31?41I37V)$sO5(ZpHPPJ*Un2lVkI;fHgd8TtokVMwjcah<eGnY~{bDFmwIiZP*xfAAjBp0E1<4+L9v7V2SdcT+{_ON}Z8&`oe*41!SwS7{0_nCW~5Gf@mlst2*$5lniBk*q($C@8akDYj`mQ$)vT>U7Dnf+sevO7=u-M^~3&J24rPHv+mMGX+g(`Tn%Ta>*X#IzOAvOSy{2iByr*3Wsj^ZoOucsZi$A4^%n3BM(}NeKir2t5e#g%PeZjoJjFHksCGH0!S{GpRo7inezf&i+7`F{kZm%`omp9xX#qcjK>jE$uGXwi3C(kqiCHsiDWqxuM(3rLE7GYg@6Q|Cb@p1FUC$Ygo>Wt#jQ!i{f972;?(RzJpIs{{l1^FdF"
 )
 _LIMM_W_O16_TABLES = json.loads(
     zlib.decompress(base64.b85decode(_LIMM_W_O16_TABLES_B85.encode("ascii"))).decode("utf-8")
+)
+from ._limm_w_o16_tables import O16_EXTRA_TABLES_B85
+
+_LIMM_W_O16_TABLES.update(
+    json.loads(
+        zlib.decompress(base64.b85decode(O16_EXTRA_TABLES_B85.encode("ascii"))).decode("utf-8")
+    )
 )
 
 
@@ -20065,10 +20072,10 @@ def _limm_w_evaluate_sparse_polynomial(values, positions, dimensions, ratios, *,
 
 
 def _limm_w_o16_coefficients(current_dt, previous_dts, *, order: int, dtype):
-    """Evaluate published variable-step LIMM-o16 coefficients (orders 1--3)."""
+    """Evaluate published variable-step LIMM-o16 coefficients (orders 1--5)."""
 
-    if not 1 <= int(order) <= 3:
-        raise ValueError("Published LIMM-o16 tables are currently vendored for orders 1--3.")
+    if not 1 <= int(order) <= 5:
+        raise ValueError("Published LIMM-o16 tables are currently vendored for orders 1--5.")
     data = _LIMM_W_O16_TABLES[str(int(order))]
     required_ratios = int(order) - 1
     previous_dts = jnp.asarray(previous_dts, dtype=dtype)
@@ -20420,7 +20427,10 @@ def _limm_w_next_dt(
 
     dtype = jnp.asarray(current_dt).dtype
     safe_error = jnp.maximum(jnp.asarray(error_norm, dtype=dtype), jnp.asarray(1.0e-14, dtype=dtype))
-    factor = jnp.asarray(safety_factor, dtype=dtype) * safe_error ** (-jnp.asarray(1.0 / (int(order) + 1), dtype=dtype))
+    # The embedded estimate is the difference to the adjacent lower-order
+    # formula, so it is O(h**order), rather than the O(h**(order + 1)) local
+    # defect of the accepted formula itself.
+    factor = jnp.asarray(safety_factor, dtype=dtype) * safe_error ** (-jnp.asarray(1.0 / int(order), dtype=dtype))
     factor = jnp.clip(
         factor,
         jnp.asarray(min_step_factor, dtype=dtype),

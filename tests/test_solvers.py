@@ -60,9 +60,9 @@ def test_limm_w_config_rejects_unsupported_order(order):
 
 
 def test_limm_w_published_o16_configuration_is_limited_to_vendored_orders():
-    assert transport_solvers._LIMMWSolverConfig(order=3, coefficient_family="o16_published").coefficient_family == "o16_published"
-    with pytest.raises(ValueError, match="currently support"):
-        transport_solvers._LIMMWSolverConfig(order=4, coefficient_family="o16_published")
+    assert transport_solvers._LIMMWSolverConfig(order=5, coefficient_family="o16_published").coefficient_family == "o16_published"
+    with pytest.raises(ValueError, match="limm_w_order"):
+        transport_solvers._LIMMWSolverConfig(order=6, coefficient_family="o16_published")
 
 
 @pytest.mark.parametrize("order", [1, 2, 3, 4, 5])
@@ -182,13 +182,13 @@ def test_limm_w_general_multistep_kernel_matches_provisional_coefficient_adapter
     assert jnp.allclose(generic, baseline, rtol=1.0e-12, atol=1.0e-12)
 
 
-@pytest.mark.parametrize("order", [1, 2, 3])
+@pytest.mark.parametrize("order", [1, 2, 3, 4, 5])
 def test_limm_w_published_o16_coefficients_preserve_constant_rhs(order):
     """The vendored public variable-step tables satisfy the basic consistency law."""
 
     dtype = jnp.float64
     h = jnp.asarray(0.08, dtype=dtype)
-    previous_dts = jnp.asarray([0.11, 0.05], dtype=dtype)
+    previous_dts = jnp.asarray([0.11, 0.05, 0.09, 0.06], dtype=dtype)
     alpha, beta, gamma_past, gamma_new = transport_solvers._limm_w_o16_coefficients(
         h, previous_dts, order=order, dtype=dtype
     )
