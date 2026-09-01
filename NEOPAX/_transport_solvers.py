@@ -20741,13 +20741,16 @@ def _limm_w_commit_attempt(step_state: _LIMMWStepState, attempt: _LIMMWAttemptRe
                 history=history,
                 selected_order=jnp.asarray(1, dtype=jnp.int32),
                 consecutive_accepts=jnp.asarray(0, dtype=jnp.int32),
-                recent_reject_count=jnp.asarray(0, dtype=jnp.int32),
-                reject_last=jnp.asarray(False),
-                reject_more=jnp.asarray(False),
+                # Preserve the repeated-rejection controller state. MATLODE
+                # keeps this state until an accepted step; clearing it here
+                # created a new two-rejection/restart cycle each time.
                 restart_count=rejected.restart_count + jnp.asarray(1, dtype=jnp.int32),
             )
         return jax.lax.cond(
-            jnp.logical_and(attempt.controller.reject_more, attempt.controller.next_order == 1),
+            jnp.logical_and(
+                jnp.logical_and(attempt.controller.reject_more, jnp.logical_not(step_state.reject_more)),
+                attempt.controller.next_order == 1,
+            ),
             _restart,
             lambda _: rejected,
             operand=None,
