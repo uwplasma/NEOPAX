@@ -2219,6 +2219,16 @@ def _run_saved_loop(
         last_attempt_lagged_reused,
         last_attempt_jacobian_reused,
     ) = loop_result
+    exhausted_budget = jnp.logical_and(
+        step_idx >= jnp.asarray(max_total_steps, dtype=step_idx.dtype),
+        jnp.logical_and(final_step_state.t < (t_final - 1.0e-15), final_step_state.status[0] == 0),
+    )
+    final_step_state = dataclasses.replace(
+        final_step_state,
+        status=final_step_state.status.at[0].set(jnp.where(exhausted_budget, 1, final_step_state.status[0])).at[1].set(
+            jnp.where(exhausted_budget, 2, final_step_state.status[1])
+        ),
+    )
     save_idx, ys_saved, ts_saved, dts_saved, accepted_mask_saved, failed_mask_saved, fail_codes_saved = _fill_realized_final_slot(
         save_idx,
         t0,
@@ -20627,8 +20637,17 @@ def _limm_w_attempt_at_order(
         candidate_error_norms = jnp.stack((error_m1, error_p, error_p))
     else:
         lower_trial_y = trial_y
-        higher_trial_y = trial_y
-        candidate_error_norms = jnp.broadcast_to(error_norm, (3,))
+        # Once one accepted step exists, p=1 has a real p=2 companion.  Using
+        # Euler forever here prevented recovery from a p=1 demotion.
+        has_p2_history = step_state.history.valid_count >= jnp.asarray(2, dtype=jnp.int32)
+        def _p2(_):
+            return _limm_w_trial_step_for_family(
+                step_state.y, history_rhs, history_states, current_jacobian, trial_dt,
+                step_state.history.accepted_dts, order=2, coefficient_family=solver.coefficient_family,
+            )
+        higher_trial_y = jax.lax.cond(has_p2_history, _p2, lambda _: trial_y, operand=None)
+        p1_error = _limm_w_scaled_error_norm(higher_trial_y - trial_y, step_state.y, trial_y, rtol=solver.rtol, atol=solver.atol)
+        candidate_error_norms = jnp.broadcast_to(p1_error, (3,))
     controller = _limm_w_controller_decision(
         trial_dt=trial_dt, errors=candidate_error_norms, order=jnp.asarray(order, dtype=jnp.int32),
         consecutive_accepts=step_state.consecutive_accepts, reject_last=step_state.reject_last,
@@ -21173,6 +21192,28 @@ class LIMMWBaselineSolver(_LIMMWSolverConfig):
         ) = loop_result
         failed = step_state.status[0] != 0
         accepted_limit_hit = _accepted_step_limit_reached(step_state, self.stop_after_accepted_steps)
+        if bool(self.debug_stage_markers):
+            limm_diag = jax.device_get(
+                (
+                    step_state.t,
+                    step_state.dt,
+                    step_state.selected_order,
+                    step_state.consecutive_accepts,
+                    step_state.recent_reject_count,
+                    step_state.reject_last,
+                    step_state.reject_more,
+                    last_attempt_error,
+                    step_state.status,
+                )
+            )
+            print(
+                "[NEOPAX] LIMM controller summary:"
+                f" t={float(limm_diag[0]):.8e} dt_next={float(limm_diag[1]):.8e}"
+                f" order={int(limm_diag[2])} consecutive={int(limm_diag[3])}"
+                f" recent_rejects={int(limm_diag[4])} reject_last={bool(limm_diag[5])}"
+                f" reject_more={bool(limm_diag[6])} last_error={float(limm_diag[7]):.8e}"
+                f" status={np.asarray(limm_diag[8]).tolist()}"
+            )
         return _finalize_custom_solver_output(
             ys_saved, ts_saved, dts_saved, accepted_mask, failed_mask, fail_codes,
             step_state.y, step_state.t,
