@@ -3430,6 +3430,18 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
     density_floor: Any = DEFAULT_TRANSPORT_DENSITY_FLOOR
     temperature_floor: Any = DEFAULT_TRANSPORT_TEMPERATURE_FLOOR
     support: NTXExactLijRuntimeSupport | None = None
+    # Shared with the database/scan response models.  Order two is wired as
+    # an explicit forward-only feature gate while the dedicated factorized NTX
+    # Hessian primitive is implemented below; order one remains the exact
+    # established realtime response path.
+    lagged_response_taylor_order: int = 1
+
+    def __post_init__(self):
+        order = int(self.lagged_response_taylor_order)
+        if order not in {1, 2}:
+            raise ValueError(
+                "ntx_exact_lij_runtime lagged_response_taylor_order must be 1 or 2."
+            )
 
     def _rho_center_face(self):
         a_b = jnp.asarray(self.geometry.a_b, dtype=jnp.float64)
@@ -3512,6 +3524,12 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
     def with_response_anchor_count(self, response_anchor_count: int | None) -> "NTXExactLijRuntimeTransportModel":
         normalized = None if response_anchor_count in (None, 0) else int(response_anchor_count)
         return dataclasses.replace(self, response_anchor_count=normalized)
+
+    def with_lagged_response_taylor_order(self, lagged_response_taylor_order: int) -> "NTXExactLijRuntimeTransportModel":
+        return dataclasses.replace(
+            self,
+            lagged_response_taylor_order=int(lagged_response_taylor_order),
+        )
 
     def with_use_remat(self, use_remat: bool) -> "NTXExactLijRuntimeTransportModel":
         return dataclasses.replace(self, use_remat=bool(use_remat))
@@ -10263,6 +10281,12 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
 
     def build_lagged_response(self, state, **kwargs):
         del kwargs
+        if int(self.lagged_response_taylor_order) == 2:
+            raise NotImplementedError(
+                "Quadratic realtime NTX Lij responses require the dedicated "
+                "factorized Hessian primitive, which is not available yet. "
+                "Use lagged_response_taylor_order=1 until that implementation lands."
+            )
         if lagged_timing_enabled():
             jax.debug.callback(lambda: lagged_timing_start("ntx.build_lagged_response"), ordered=True)
         density = safe_density(state.density, self.density_floor)
@@ -15373,6 +15397,7 @@ def build_ntx_exact_lij_runtime_transport_model(
     ntx_exact_derivative_pullback_boundary="inline",
     ntx_exact_derivative_pullback_algebra="ntx_helper",
     ntx_exact_er_v_floor=None,
+    lagged_response_taylor_order=1,
     ntx_exact_lij_support=None,
     preload_support=False,
     collisionality_model="default",
@@ -15446,6 +15471,7 @@ def build_ntx_exact_lij_runtime_transport_model(
         density_floor=density_floor,
         temperature_floor=temperature_floor,
         support=ntx_exact_lij_support,
+        lagged_response_taylor_order=int(lagged_response_taylor_order),
     )
     if preload_support:
         return model.with_static_support()

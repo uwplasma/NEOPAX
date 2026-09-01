@@ -6,6 +6,7 @@ transport, and direct flux evaluation.
 from __future__ import annotations
 
 import contextlib
+import copy
 import dataclasses
 import importlib
 import importlib.util
@@ -1439,13 +1440,16 @@ def run_transport(config: dict, runtime: RuntimeContext, state: TransportState):
         # Avoid duplicating per-attempt/Newton diagnostics in the warm timing
         # output.  The warm solve has exactly the same numerical settings and
         # starts from the same original state; it is discarded after timing.
+        # Several solver dataclasses compute derived fields in their custom
+        # ``__init__`` (Radau's ``n_steps`` is one example).  ``replace``
+        # forwards those fields as constructor arguments and therefore fails.
+        # A shallow copy is sufficient: solver configuration is immutable and
+        # the warm pass only needs to silence diagnostic output.
+        warm_solver = copy.copy(solver)
         solver_field_names = {field.name for field in dataclasses.fields(solver)}
-        warm_debug_overrides = {
-            name: False
-            for name in ("debug_stage_markers", "debug_walltime_attempts")
-            if name in solver_field_names
-        }
-        warm_solver = dataclasses.replace(solver, **warm_debug_overrides)
+        for name in ("debug_stage_markers", "debug_walltime_attempts"):
+            if name in solver_field_names:
+                object.__setattr__(warm_solver, name, False)
         warm_times = []
         for _ in range(forward_warm_timing_repeats):
             warm_start = time.perf_counter()

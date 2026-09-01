@@ -1740,6 +1740,23 @@ def test_build_ntx_exact_lij_runtime_transport_model_can_skip_preload():
     assert model.support is None
     assert model.vmec_file == "wout.nc"
     assert model.boozer_file == "boozmn.nc"
+    assert model.lagged_response_taylor_order == 1
+
+
+def test_build_ntx_exact_lij_runtime_transport_model_accepts_quadratic_feature_gate():
+    model = build_ntx_exact_lij_runtime_transport_model(
+        species="species",
+        energy_grid="grid",
+        geometry="geometry",
+        vmec_file="wout.nc",
+        boozer_file="boozmn.nc",
+        lagged_response_taylor_order=2,
+        preload_support=False,
+    )
+
+    assert model.lagged_response_taylor_order == 2
+    with pytest.raises(ValueError, match="must be 1 or 2"):
+        model.with_lagged_response_taylor_order(3)
 
 
 def test_build_ntx_runtime_scan_channels_uses_loader(monkeypatch):
