@@ -20348,6 +20348,10 @@ class _LIMMWStepState:
     consecutive_accepts: Any
     reject_last: Any
     reject_more: Any
+    accepted_by_order: Any
+    rejected_by_order: Any
+    restart_count: Any
+    min_accepted_dt: Any
 
 
 def _limm_w_initial_step_state(t0, initial_y, initial_rhs, base_dt, *, max_order: int):
@@ -20378,6 +20382,10 @@ def _limm_w_initial_step_state(t0, initial_y, initial_rhs, base_dt, *, max_order
         consecutive_accepts=jnp.asarray(0, dtype=jnp.int32),
         reject_last=jnp.asarray(False),
         reject_more=jnp.asarray(False),
+        accepted_by_order=jnp.zeros((3,), dtype=jnp.int32),
+        rejected_by_order=jnp.zeros((3,), dtype=jnp.int32),
+        restart_count=jnp.asarray(0, dtype=jnp.int32),
+        min_accepted_dt=jnp.asarray(jnp.inf, dtype=dtype),
     )
 
 
@@ -20701,6 +20709,8 @@ def _limm_w_commit_attempt(step_state: _LIMMWStepState, attempt: _LIMMWAttemptRe
             consecutive_accepts=attempt.controller.next_consecutive_accepts,
             reject_last=attempt.controller.reject_last,
             reject_more=attempt.controller.reject_more,
+            accepted_by_order=step_state.accepted_by_order.at[attempt.order - 1].add(1),
+            min_accepted_dt=jnp.minimum(step_state.min_accepted_dt, attempt.trial_dt),
         )
 
     def _reject(_):
@@ -20714,6 +20724,7 @@ def _limm_w_commit_attempt(step_state: _LIMMWStepState, attempt: _LIMMWAttemptRe
             consecutive_accepts=attempt.controller.next_consecutive_accepts,
             reject_last=attempt.controller.reject_last,
             reject_more=attempt.controller.reject_more,
+            rejected_by_order=step_state.rejected_by_order.at[attempt.order - 1].add(1),
         )
         # A repeated-rejection demotion invalidates the old variable-step
         # multistep stencil. Restart numerically at the same physical anchor:
@@ -20733,6 +20744,7 @@ def _limm_w_commit_attempt(step_state: _LIMMWStepState, attempt: _LIMMWAttemptRe
                 recent_reject_count=jnp.asarray(0, dtype=jnp.int32),
                 reject_last=jnp.asarray(False),
                 reject_more=jnp.asarray(False),
+                restart_count=rejected.restart_count + jnp.asarray(1, dtype=jnp.int32),
             )
         return jax.lax.cond(
             jnp.logical_and(attempt.controller.reject_more, attempt.controller.next_order == 1),
@@ -21229,6 +21241,10 @@ class LIMMWBaselineSolver(_LIMMWSolverConfig):
                     step_state.reject_more,
                     last_attempt_error,
                     step_state.status,
+                    step_state.accepted_by_order,
+                    step_state.rejected_by_order,
+                    step_state.restart_count,
+                    step_state.min_accepted_dt,
                 )
             )
             print(
@@ -21238,6 +21254,9 @@ class LIMMWBaselineSolver(_LIMMWSolverConfig):
                 f" recent_rejects={int(limm_diag[4])} reject_last={bool(limm_diag[5])}"
                 f" reject_more={bool(limm_diag[6])} last_error={float(limm_diag[7]):.8e}"
                 f" status={np.asarray(limm_diag[8]).tolist()}"
+                f" accepted_by_order={np.asarray(limm_diag[9]).tolist()}"
+                f" rejected_by_order={np.asarray(limm_diag[10]).tolist()}"
+                f" restarts={int(limm_diag[11])} min_accepted_dt={float(limm_diag[12]):.8e}"
             )
         return _finalize_custom_solver_output(
             ys_saved, ts_saved, dts_saved, accepted_mask, failed_mask, fail_codes,

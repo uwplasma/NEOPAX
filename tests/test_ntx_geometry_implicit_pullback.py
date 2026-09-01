@@ -2301,6 +2301,60 @@ def test_native_vmec_face_rebuild_accumulation_matches_generic_prepared_vjp():
         rtol=1e-10,
         atol=1e-12,
     )
+    def _jvp_zero_like(value):
+        array = jnp.asarray(value)
+        if jnp.issubdtype(array.dtype, jnp.inexact):
+            return jnp.zeros_like(array)
+        return jnp.zeros(array.shape, dtype=jax.dtypes.float0)
+
+    def _prepared_support_direction(value):
+        array = jnp.asarray(value)
+        if jnp.issubdtype(array.dtype, jnp.inexact):
+            return 0.013 * jnp.ones_like(array)
+        return jnp.zeros(array.shape, dtype=jax.dtypes.float0)
+
+    support_zero_direction = jax.tree_util.tree_map(_jvp_zero_like, support)
+    support_direction = dataclasses.replace(
+        support_zero_direction,
+        center_channels=dataclasses.replace(
+            support_zero_direction.center_channels,
+            drds=jnp.asarray([0.07, -0.04]),
+        ),
+        center_prepared=jax.tree_util.tree_map(
+            _prepared_support_direction,
+            support.center_prepared,
+        ),
+    )
+    upar_support_tangent = jax.jvp(
+        lambda support_value: model.with_support_payload(
+            support_value
+        ).evaluate_momentum_corrected_upar_only(state),
+        (support,),
+        (support_direction,),
+    )[1]
+    compact_support_leaves = model.pullback_momentum_corrected_upar_support_by_radius(
+        state,
+        upar_bar,
+        support,
+    )
+    compact_support_contraction = sum(
+        jnp.vdot(jnp.asarray(bar), jnp.asarray(direction))
+        for bar, direction in zip(
+            compact_support_leaves,
+            jax.tree_util.tree_leaves(support_direction),
+            strict=True,
+        )
+        if (
+            jnp.issubdtype(jnp.asarray(bar).dtype, jnp.inexact)
+            and jnp.issubdtype(jnp.asarray(direction).dtype, jnp.inexact)
+        )
+    )
+    assert jnp.allclose(
+        compact_support_contraction,
+        jnp.vdot(upar_bar, upar_support_tangent),
+        rtol=1e-10,
+        atol=1e-12,
+    )
     response_bars = jax.tree_util.tree_map(
         lambda value: jnp.stack(
             (jnp.full_like(jnp.asarray(value), 0.17),
