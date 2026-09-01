@@ -59,9 +59,10 @@ def test_limm_w_config_rejects_unsupported_order(order):
         transport_solvers._LIMMWSolverConfig(order=order)
 
 
-def test_limm_w_published_o16_configuration_is_limited_to_vendored_orders():
+def test_limm_w_published_o16_configuration_exposes_fixed_w3_and_w5_lanes():
     assert transport_solvers._LIMMWSolverConfig(order=3, coefficient_family="o16_published").coefficient_family == "o16_published"
-    with pytest.raises(ValueError, match="currently supports"):
+    assert transport_solvers._LIMMWSolverConfig(order=5, coefficient_family="o16_published").coefficient_family == "o16_published"
+    with pytest.raises(ValueError, match="order 3 or 5"):
         transport_solvers._LIMMWSolverConfig(order=4, coefficient_family="o16_published")
 
 
@@ -291,86 +292,51 @@ def test_limm_w_embedded_error_uses_only_current_response_and_history():
     assert jnp.allclose(error, trial - higher, rtol=1.0e-12, atol=1.0e-12)
 
 
-def test_limm_w_controller_shrinks_and_grows_dt_from_scaled_error():
+def test_limm_w_fixed_pi_controller_shrinks_and_grows_dt_from_scaled_error():
     dtype = jnp.float64
     y = jnp.asarray([1.0, 2.0], dtype=dtype)
     err_norm = transport_solvers._limm_w_scaled_error_norm(
         jnp.asarray([0.1, 0.2], dtype=dtype), y, y, rtol=0.1, atol=0.0
     )
     assert float(err_norm) == pytest.approx(1.0)
-    shrink = transport_solvers._limm_w_next_dt(
-        0.1, 100.0, order=3, safety_factor=0.9, min_step_factor=0.2, max_step_factor=2.0
+    shrink = transport_solvers._limm_w_fixed_pi_controller(
+        trial_dt=0.1, error_norm=100.0, previous_accepted_error=1.0,
+        error_order=4, reject_last=False, min_step=1.0e-14, max_step=1.0,
+        safety_factor=0.9, min_step_factor=0.2, max_step_factor=2.0,
     )
-    grow = transport_solvers._limm_w_next_dt(
-        0.1, 1.0e-8, order=3, safety_factor=0.9, min_step_factor=0.2, max_step_factor=2.0
+    grow = transport_solvers._limm_w_fixed_pi_controller(
+        trial_dt=0.1, error_norm=1.0e-8, previous_accepted_error=1.0,
+        error_order=4, reject_last=False, min_step=1.0e-14, max_step=1.0,
+        safety_factor=0.9, min_step_factor=0.2, max_step_factor=2.0,
     )
-    assert float(shrink) < 0.1
-    assert float(grow) > 0.1
+    assert float(shrink.next_dt) < 0.1
+    assert float(grow.next_dt) > 0.1
 
 
-def test_limm_w_matlode_controller_selects_order_and_recovers_after_rejection():
-    accepted = transport_solvers._limm_w_controller_decision(
-        trial_dt=jnp.asarray(0.1),
-        errors=jnp.asarray([0.5, 0.4, 0.01]),
-        order=jnp.asarray(2, dtype=jnp.int32),
-        consecutive_accepts=jnp.asarray(4, dtype=jnp.int32),
-        reject_last=jnp.asarray(False),
-        reject_more=jnp.asarray(False),
-        max_order=3,
-        min_step=1.0e-8,
-        max_step=1.0,
+def test_limm_w_fixed_pi_retry_never_increases_step():
+    retry = transport_solvers._limm_w_fixed_pi_controller(
+        trial_dt=jnp.asarray(0.1), error_norm=jnp.asarray(4.0),
+        previous_accepted_error=jnp.asarray(0.1), error_order=4,
+        reject_last=jnp.asarray(True), min_step=1.0e-8, max_step=1.0,
+        safety_factor=0.9, min_step_factor=0.2, max_step_factor=2.0,
     )
-    assert int(accepted.next_order) == 3
-    assert float(accepted.next_dt) > 0.1
-    assert not bool(accepted.reject_last)
-
-    rejected = transport_solvers._limm_w_controller_decision(
-        trial_dt=jnp.asarray(0.1),
-        errors=jnp.asarray([2.0, 4.0, 8.0]),
-        order=jnp.asarray(3, dtype=jnp.int32),
-        consecutive_accepts=jnp.asarray(2, dtype=jnp.int32),
-        reject_last=jnp.asarray(True),
-        reject_more=jnp.asarray(True),
-        max_order=3,
-        min_step=1.0e-8,
-        max_step=1.0,
-    )
-    assert int(rejected.next_order) == 2
-    assert float(rejected.next_dt) == pytest.approx(0.01)
-    assert int(rejected.next_consecutive_accepts) == 0
-    assert bool(rejected.reject_last)
+    assert not bool(retry.accepted)
+    assert float(retry.next_dt) < 0.1
+    assert bool(retry.reject_last)
 
 
-def test_limm_w_attempt_commit_preserves_history_on_rejection_and_shifts_on_accept():
+def test_limm_w_attempt_commit_shifts_history_on_fixed_order_startup_accept():
     dtype = jnp.float64
     state = transport_solvers._limm_w_initial_step_state(
         0.0,
         jnp.asarray([1.0], dtype=dtype),
         jnp.asarray([-10.0], dtype=dtype),
         0.1,
-        max_order=2,
+        max_order=4,
     )
-    reject_solver = transport_solvers._LIMMWSolverConfig(
-        t0=0.0, t1=1.0, dt=0.1, order=1, rtol=1.0e-12, atol=1.0e-12
-    )
-    rejected_attempt = transport_solvers._limm_w_attempt_at_order(
-        state,
-        jnp.asarray([-10.0], dtype=dtype),
-        jnp.asarray([[-10.0]], dtype=dtype),
-        t_final=1.0,
-        solver=reject_solver,
-        order=1,
-    )
-    assert not bool(rejected_attempt.accepted)
-    rejected = transport_solvers._limm_w_commit_attempt(
-        state, rejected_attempt, jnp.asarray([-5.0], dtype=dtype)
-    )
-    assert float(rejected.t) == pytest.approx(0.0)
-    assert jnp.array_equal(rejected.history.states, state.history.states)
-    assert jnp.array_equal(rejected.history.rhs_values, state.history.rhs_values)
 
     accept_solver = transport_solvers._LIMMWSolverConfig(
-        t0=0.0, t1=1.0, dt=0.1, order=1, rtol=1.0e3, atol=1.0e3
+        t0=0.0, t1=1.0, dt=0.1, order=3, rtol=1.0e3, atol=1.0e3
     )
     accepted_attempt = transport_solvers._limm_w_attempt_at_order(
         state,
@@ -388,6 +354,35 @@ def test_limm_w_attempt_commit_preserves_history_on_rejection_and_shifts_on_acce
     assert jnp.array_equal(accepted.history.states[0], accepted.y)
     assert jnp.array_equal(accepted.history.rhs_values[0], jnp.asarray([-5.0], dtype=dtype))
     assert int(accepted.status[2]) == 1
+
+
+def test_limm_w_fixed_order_rejection_retains_every_accepted_history_row():
+    """A rejected W3 retry may change h, but must never restart history."""
+
+    dtype = jnp.float64
+    state = transport_solvers._limm_w_initial_step_state(
+        0.0, jnp.asarray([1.0], dtype=dtype), jnp.asarray([-1.0], dtype=dtype), 0.1, max_order=4
+    )
+    history = transport_solvers._LIMMWHistory(
+        states=jnp.asarray([[1.0], [0.9], [0.8], [0.7]], dtype=dtype),
+        rhs_values=jnp.asarray([[-1.0], [-0.8], [-0.6], [-0.4]], dtype=dtype),
+        accepted_dts=jnp.asarray([0.1, 0.1, 0.1], dtype=dtype),
+        valid_count=jnp.asarray(4, dtype=jnp.int32),
+    )
+    state = dataclasses.replace(state, history=history)
+    solver = transport_solvers._LIMMWSolverConfig(
+        t0=0.0, t1=1.0, dt=0.1, order=3, coefficient_family="o16_published", rtol=1.0e-14, atol=1.0e-14
+    )
+    attempt = transport_solvers._limm_w_attempt_at_order(
+        state, history.rhs_values[0], jnp.zeros((1, 1), dtype=dtype), t_final=1.0, solver=solver, order=3
+    )
+    assert not bool(attempt.accepted)
+    retried = transport_solvers._limm_w_commit_attempt(state, attempt, history.rhs_values[0])
+    assert float(retried.t) == pytest.approx(float(state.t))
+    assert jnp.array_equal(retried.history.states, state.history.states)
+    assert jnp.array_equal(retried.history.rhs_values, state.history.rhs_values)
+    assert jnp.array_equal(retried.history.accepted_dts, state.history.accepted_dts)
+    assert int(retried.restart_count) == 0
 
 
 def test_limm_w_full_rhs_adapter_keeps_sources_direct_and_response_only_in_jacobian():
@@ -583,6 +578,37 @@ def test_limm_w_published_o16_compiled_loop_controls_stiff_linear_rhs():
     assert not bool(out["failed"])
     assert float(out["final_time"]) == pytest.approx(0.1)
     assert jnp.allclose(out["final_state"], jnp.asarray([jnp.exp(-10.0)]), rtol=2.0e-3, atol=2.0e-7)
+
+
+def test_limm_w5_uses_fixed_order_history_and_lower_embedded_companion():
+    """W5 must reach its fixed production pair without a p=6 table/NTX call."""
+
+    solver = LIMMWBaselineSolver(
+        t0=0.0,
+        t1=0.3,
+        dt=0.02,
+        order=5,
+        coefficient_family="o16_published",
+        rtol=1.0e-6,
+        atol=1.0e-10,
+        max_steps=200,
+    )
+    out = solver.solve(jnp.asarray([1.0]), lambda _t, y: jnp.ones_like(y))
+
+    assert not bool(out["failed"])
+    assert float(out["final_time"]) == pytest.approx(0.3)
+    assert jnp.allclose(out["final_state"], jnp.asarray([1.3]), rtol=1.0e-11, atol=1.0e-11)
+
+
+def test_limm_w_history_predictor_reproduces_linear_trajectory():
+    dtype = jnp.float64
+    # y(t) = 3 - 2 t; current state is at t=0 and older accepted states are
+    # at -0.1 and -0.3, exactly matching the variable-step history convention.
+    history = jnp.asarray([[3.0], [3.2], [3.6]], dtype=dtype)
+    predicted = transport_solvers._limm_w_history_predictor(
+        history, jnp.asarray([0.1, 0.2], dtype=dtype), jnp.asarray(0.05, dtype=dtype), order=3
+    )
+    assert jnp.allclose(predicted, jnp.asarray([2.9], dtype=dtype), rtol=1.0e-12, atol=1.0e-12)
 
 
 

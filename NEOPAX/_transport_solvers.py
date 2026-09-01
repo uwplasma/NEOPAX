@@ -19889,7 +19889,7 @@ class _ThetaSolverConfig(TransportSolver):
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True, eq=False)
 class _LIMMWSolverConfig(TransportSolver):
-    """Configuration shared by the response-aware LIMM-W forward/reverse paths.
+    """Configuration for a fixed-order response-aware LIMM-W forward path.
 
     A LIMM-W step always uses the direct RHS value at the *current accepted*
     state.  ``jacobian_reuse_mode`` controls only the linear response matrix;
@@ -19903,7 +19903,7 @@ class _LIMMWSolverConfig(TransportSolver):
     atol: float = 1.0e-8
     min_step: float = 1.0e-14
     max_step: float = 1.0
-    order: int = 5
+    order: int = 3
     max_steps: int = 20000
     safety_factor: float = 0.9
     min_step_factor: float = 0.2
@@ -19953,12 +19953,13 @@ class _LIMMWSolverConfig(TransportSolver):
         coefficient_family = str(coefficient_family).strip().lower()
         if coefficient_family not in {"baseline", "o16_published"}:
             raise ValueError("limm_w_coefficient_family must be 'baseline' or 'o16_published'.")
-        # The forward lane currently implements and validates the complete
-        # p=3/p+1 controller only.  Tables above p4 are not an authorization
-        # to expose an incomplete higher-order controller.
-        if coefficient_family == "o16_published" and int(order) > 3:
+        # The production candidates are deliberately *fixed* order.  A full
+        # variable-order controller is a different method and is not hidden
+        # behind this backend.  p=3 uses its p=4 companion; p=5 uses its p=4
+        # embedded companion, avoiding an unvendored, very large p=6 table.
+        if coefficient_family == "o16_published" and int(order) not in {3, 5}:
             raise ValueError(
-                "The published LIMM-o16 forward controller currently supports max accepted order 3."
+                "The published fixed-order LIMM-W forward backend supports order 3 or 5."
             )
         reuse_aliases = {
             "none": "fresh",
@@ -20382,8 +20383,8 @@ def _limm_w_initial_step_state(t0, initial_y, initial_rhs, base_dt, *, max_order
         consecutive_accepts=jnp.asarray(0, dtype=jnp.int32),
         reject_last=jnp.asarray(False),
         reject_more=jnp.asarray(False),
-        accepted_by_order=jnp.zeros((3,), dtype=jnp.int32),
-        rejected_by_order=jnp.zeros((3,), dtype=jnp.int32),
+        accepted_by_order=jnp.zeros((5,), dtype=jnp.int32),
+        rejected_by_order=jnp.zeros((5,), dtype=jnp.int32),
         restart_count=jnp.asarray(0, dtype=jnp.int32),
         min_accepted_dt=jnp.asarray(jnp.inf, dtype=dtype),
     )
@@ -20472,113 +20473,105 @@ def _limm_w_next_dt(
 
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True, eq=False)
-class _LIMMWControllerDecision:
-    """Pure MATLODE-style order/timestep decision for one LIMM attempt."""
-
-    next_dt: Any
-    next_order: Any
-    next_consecutive_accepts: Any
-    reject_last: Any
-    reject_more: Any
-
-
-def _limm_w_controller_decision(
-    *,
-    trial_dt,
-    errors,
-    order,
-    consecutive_accepts,
-    reject_last,
-    reject_more,
-    max_order: int,
-    min_step,
-    max_step,
-):
-    """Port MATLODE LIMM's order/timestep selection without host control flow.
-
-    ``errors`` is ``(E_{p-1}, E_p, E_{p+1})``.  The accepted step uses
-    ``E_p``; neighbouring estimates are used only to choose the next order
-    and step size.  This function does not mutate solution/history state.
-    """
-
-    trial_dt = jnp.asarray(trial_dt)
-    dtype = trial_dt.dtype
-    order = jnp.asarray(order, dtype=jnp.int32)
-    errors = jnp.maximum(jnp.asarray(errors, dtype=dtype), jnp.asarray(1.0e-10, dtype=dtype))
-    fac_min = jnp.asarray(0.2, dtype=dtype)
-    fac_max = jnp.asarray(6.0, dtype=dtype)
-    fac_rej = jnp.asarray(0.1, dtype=dtype)
-    safe_low = jnp.asarray(0.7, dtype=dtype)
-    safe = jnp.asarray(0.9, dtype=dtype)
-    safe_high = jnp.asarray(0.8, dtype=dtype)
-
-    # MATLODE ELO = [max(1,p-1), p, p+1].
-    elo_m1 = jnp.maximum(jnp.asarray(1, dtype=jnp.int32), order - jnp.asarray(1, dtype=jnp.int32))
-    elo_p = order
-    elo_p1 = order + jnp.asarray(1, dtype=jnp.int32)
-    unscaled = jnp.stack(
-        (
-            errors[0] ** (-jnp.asarray(1.0, dtype=dtype) / elo_m1.astype(dtype)),
-            errors[1] ** (-jnp.asarray(1.0, dtype=dtype) / elo_p.astype(dtype)),
-            errors[2] ** (-jnp.asarray(1.0, dtype=dtype) / elo_p1.astype(dtype)),
-        )
-    )
-    factors = jnp.clip(unscaled * jnp.asarray([safe_low, safe, safe_high], dtype=dtype), fac_min, fac_max)
-    candidates = trial_dt * factors
-    can_change = consecutive_accepts >= order + jnp.asarray(2, dtype=jnp.int32)
-    choose_m1 = jnp.logical_and(candidates[0] > candidates[1], order > 1)
-    best_dt = jnp.where(choose_m1, candidates[0], candidates[1])
-    best_order = jnp.where(choose_m1, order - 1, order)
-    choose_p1 = jnp.logical_and(
-        candidates[2] > best_dt,
-        jnp.logical_and(order < jnp.asarray(int(max_order), dtype=jnp.int32), order + 1 < consecutive_accepts),
-    )
-    best_dt = jnp.where(choose_p1, candidates[2], best_dt)
-    best_order = jnp.where(choose_p1, order + 1, best_order)
-    next_dt_accept = jnp.where(can_change, best_dt, trial_dt)
-    next_order_accept = jnp.where(can_change, best_order, order)
-    next_dt_accept = jnp.where(reject_last, jnp.minimum(next_dt_accept, trial_dt), next_dt_accept)
-    next_order_accept = jnp.where(reject_last, jnp.minimum(next_order_accept, order), next_order_accept)
-
-    reject_use_forced = jnp.asarray(reject_more)
-    reject_dt_from_errors = jnp.minimum(trial_dt, jnp.maximum(candidates[1], candidates[0]))
-    reject_choose_m1 = jnp.logical_and(order > 1, candidates[0] >= candidates[1])
-    next_dt_reject = jnp.where(reject_use_forced, trial_dt * fac_rej, reject_dt_from_errors)
-    next_order_reject = jnp.where(
-        reject_use_forced,
-        jnp.maximum(order - 1, jnp.asarray(1, dtype=jnp.int32)),
-        jnp.where(reject_choose_m1, order - 1, order),
-    )
-    accepted = errors[1] <= jnp.asarray(1.0, dtype=dtype)
-    next_dt = jnp.where(accepted, next_dt_accept, next_dt_reject)
-    next_dt = jnp.clip(next_dt, jnp.asarray(min_step, dtype=dtype), jnp.asarray(max_step, dtype=dtype))
-    next_order = jnp.where(accepted, next_order_accept, next_order_reject)
-    return _LIMMWControllerDecision(
-        next_dt=next_dt,
-        next_order=next_order,
-        next_consecutive_accepts=jnp.where(
-            accepted,
-            jnp.minimum(consecutive_accepts + 1, jnp.asarray(int(max_order) + 2, dtype=jnp.int32)),
-            jnp.asarray(0, dtype=jnp.int32),
-        ),
-        reject_last=jnp.logical_not(accepted),
-        reject_more=jnp.where(accepted, jnp.asarray(False), jnp.asarray(reject_last)),
-    )
-
-
-@jax.tree_util.register_dataclass
-@dataclasses.dataclass(frozen=True, eq=False)
 class _LIMMWAttemptResult:
     trial_y: Any
     lower_trial_y: Any
     higher_trial_y: Any
+    predictor_y: Any
     trial_dt: Any
     next_dt: Any
     error_norm: Any
     candidate_error_norms: Any
-    controller: _LIMMWControllerDecision
+    controller: Any
     accepted: Any
     order: Any
+
+
+def _limm_w_history_predictor(state_history, previous_dts, trial_dt, *, order: int):
+    """Variable-step polynomial extrapolation from accepted LIMM history.
+
+    This is deliberately not an additional RHS evaluation and does not alter
+    the LIMM-W linear equation.  It provides a shape-stable predictor for
+    startup/diagnostics and makes the accepted-history time convention
+    explicit: row zero is ``y_n`` and later rows are older accepted states.
+    """
+
+    dtype = state_history.dtype
+    nodes = jnp.concatenate(
+        (
+            jnp.zeros((1,), dtype=dtype),
+            -jnp.cumsum(jnp.asarray(previous_dts[: int(order) - 1], dtype=dtype)),
+        )
+    )
+    target = jnp.asarray(trial_dt, dtype=dtype)
+    weights = []
+    for i in range(int(order)):
+        weight = jnp.asarray(1.0, dtype=dtype)
+        for j in range(int(order)):
+            if i != j:
+                weight = weight * (target - nodes[j]) / (nodes[i] - nodes[j])
+        weights.append(weight)
+    return jnp.einsum("i,i...->...", jnp.stack(weights), state_history[: int(order)])
+
+
+@jax.tree_util.register_dataclass
+@dataclasses.dataclass(frozen=True, eq=False)
+class _LIMMFixedPIControllerDecision:
+    next_dt: Any
+    accepted: Any
+    reject_last: Any
+
+
+def _limm_w_fixed_pi_controller(
+    *,
+    trial_dt,
+    error_norm,
+    previous_accepted_error,
+    error_order: int,
+    reject_last,
+    min_step,
+    max_step,
+    safety_factor,
+    min_step_factor,
+    max_step_factor,
+):
+    """Bounded PI controller for a fixed embedded LIMM-W pair.
+
+    ``error_order`` is the power of the companion defect: 4 for W3/W4 and
+    5 for the W5/W4 pair.  Rejected retries use a conservative proportional
+    reduction and never change the accepted multistep history.
+    """
+
+    trial_dt = jnp.asarray(trial_dt)
+    dtype = trial_dt.dtype
+    error = jnp.maximum(jnp.asarray(error_norm, dtype=dtype), jnp.asarray(1.0e-14, dtype=dtype))
+    previous = jnp.maximum(jnp.asarray(previous_accepted_error, dtype=dtype), jnp.asarray(1.0e-14, dtype=dtype))
+    q = jnp.asarray(float(error_order), dtype=dtype)
+    safety = jnp.asarray(safety_factor, dtype=dtype)
+    min_factor = jnp.asarray(min_step_factor, dtype=dtype)
+    max_factor = jnp.asarray(max_step_factor, dtype=dtype)
+    # Gustafsson-style PI damping: P-only on a rejected attempt, PI on an
+    # accepted one.  This prevents alternating growth/shrink cycles without
+    # introducing another flux/NTX calculation.
+    accepted_factor = safety * error ** (-jnp.asarray(0.7, dtype=dtype) / q) * previous ** (
+        jnp.asarray(0.4, dtype=dtype) / q
+    )
+    rejected_factor = safety * error ** (-jnp.asarray(1.0, dtype=dtype) / q)
+    accepted_factor = jnp.clip(accepted_factor, min_factor, max_factor)
+    accepted_factor = jnp.where(reject_last, jnp.minimum(accepted_factor, jnp.asarray(1.0, dtype=dtype)), accepted_factor)
+    rejected_factor = jnp.clip(rejected_factor, min_factor, jnp.asarray(0.9, dtype=dtype))
+    accepted = error <= jnp.asarray(1.0, dtype=dtype)
+    factor = jnp.where(accepted, accepted_factor, rejected_factor)
+    next_dt = jnp.clip(
+        trial_dt * factor,
+        jnp.asarray(min_step, dtype=dtype),
+        jnp.asarray(max_step, dtype=dtype),
+    )
+    return _LIMMFixedPIControllerDecision(
+        next_dt=next_dt,
+        accepted=accepted,
+        reject_last=jnp.logical_not(accepted),
+    )
 
 
 def _limm_w_attempt_at_order(
@@ -20590,7 +20583,7 @@ def _limm_w_attempt_at_order(
     solver: _LIMMWSolverConfig,
     order: int,
 ):
-    """Form one adaptive trial using the supplied current direct RHS/Jacobian."""
+    """Form one fixed-order LIMM-W trial using the current anchor RHS/J."""
 
     if not 1 <= int(order) <= int(solver.order):
         raise ValueError("Requested LIMM-W attempt order is outside the configured range.")
@@ -20609,74 +20602,71 @@ def _limm_w_attempt_at_order(
         order=int(order),
         coefficient_family=solver.coefficient_family,
     )
-    error = _limm_w_embedded_trial_error(
-        trial_y,
-        current_y=step_state.y,
-        rhs_history=history_rhs,
-        state_history=history_states,
-        current_jacobian=current_jacobian,
-        current_dt=trial_dt,
-        previous_dts=step_state.history.accepted_dts,
-        order=int(order),
-        coefficient_family=solver.coefficient_family,
+    predictor_y = _limm_w_history_predictor(
+        history_states, step_state.history.accepted_dts, trial_dt, order=int(order)
     )
-    error_norm = _limm_w_scaled_error_norm(
-        error,
-        step_state.y,
-        trial_y,
-        rtol=solver.rtol,
-        atol=solver.atol,
-    )
-    # The adjacent candidates are purely linear solves under the same frozen
-    # response/J.  They are controller data only; ``trial_y`` remains Y_p.
-    if int(order) > 1:
-        lower_trial_y = _limm_w_trial_step_for_family(
-            step_state.y, history_rhs, history_states, current_jacobian, trial_dt,
-            step_state.history.accepted_dts, order=int(order) - 1,
-            coefficient_family=solver.coefficient_family,
+
+    # Seed p=1,...,p steps establish accepted history at the requested tiny
+    # initial dt.  They are intentionally not fed to an invented adaptive
+    # estimator.  Once sufficient history exists, W3 uses the p=4 companion;
+    # W5 uses its p=4 embedded partner (a valid lower-order pair that avoids
+    # a 3.5 MB order-6 variable-step table).
+    if int(solver.order) == 3:
+        production = jnp.logical_and(
+            jnp.asarray(int(order) == 3),
+            step_state.history.valid_count >= jnp.asarray(4, dtype=jnp.int32),
         )
-        higher_trial_y = _limm_w_trial_step_for_family(
-            step_state.y, history_rhs, history_states, current_jacobian, trial_dt,
-            step_state.history.accepted_dts, order=int(order) + 1,
-            coefficient_family=solver.coefficient_family,
-        )
-        error_m1 = _limm_w_scaled_error_norm(trial_y - lower_trial_y, step_state.y, trial_y, rtol=solver.rtol, atol=solver.atol)
-        error_p = _limm_w_scaled_error_norm(higher_trial_y - trial_y, step_state.y, trial_y, rtol=solver.rtol, atol=solver.atol)
-        candidate_error_norms = jnp.stack((error_m1, error_p, error_p))
     else:
-        lower_trial_y = trial_y
-        # Once one accepted step exists, p=1 has a real p=2 companion.  Using
-        # Euler forever here prevented recovery from a p=1 demotion.
-        has_p2_history = step_state.history.valid_count >= jnp.asarray(2, dtype=jnp.int32)
-        def _p2(_):
-            return _limm_w_trial_step_for_family(
-                step_state.y, history_rhs, history_states, current_jacobian, trial_dt,
-                step_state.history.accepted_dts, order=2, coefficient_family=solver.coefficient_family,
-            )
-        higher_trial_y = jax.lax.cond(has_p2_history, _p2, lambda _: trial_y, operand=None)
-        p1_error = _limm_w_scaled_error_norm(higher_trial_y - trial_y, step_state.y, trial_y, rtol=solver.rtol, atol=solver.atol)
-        candidate_error_norms = jnp.broadcast_to(p1_error, (3,))
-    controller = _limm_w_controller_decision(
-        trial_dt=trial_dt, errors=candidate_error_norms, order=jnp.asarray(order, dtype=jnp.int32),
-        consecutive_accepts=step_state.consecutive_accepts, reject_last=step_state.reject_last,
-        reject_more=step_state.reject_more, max_order=solver.order,
-        min_step=solver.min_step, max_step=solver.max_step,
+        production = jnp.logical_and(
+            jnp.asarray(int(order) == 5),
+            step_state.history.valid_count >= jnp.asarray(5, dtype=jnp.int32),
+        )
+    companion_order = 4 if int(solver.order) in {3, 5} else int(order)
+
+    def _companion(_):
+        return _limm_w_trial_step_for_family(
+            step_state.y, history_rhs, history_states, current_jacobian, trial_dt,
+            step_state.history.accepted_dts, order=companion_order,
+            coefficient_family=solver.coefficient_family,
+        )
+
+    companion_y = jax.lax.cond(production, _companion, lambda _: trial_y, operand=None)
+    if int(solver.order) == 3:
+        lower_trial_y, higher_trial_y = trial_y, companion_y
+        defect = companion_y - trial_y
+        error_order = 4
+    else:
+        lower_trial_y, higher_trial_y = companion_y, trial_y
+        defect = trial_y - companion_y
+        error_order = 5
+    measured_error = _limm_w_scaled_error_norm(
+        defect, step_state.y, trial_y, rtol=solver.rtol, atol=solver.atol
     )
-    error_norm = candidate_error_norms[1]
+    error_norm = jnp.where(production, measured_error, jnp.asarray(0.0, dtype=trial_y.dtype))
+    controller = _limm_w_fixed_pi_controller(
+        trial_dt=trial_dt,
+        error_norm=error_norm,
+        previous_accepted_error=step_state.prev_error,
+        error_order=error_order,
+        reject_last=step_state.reject_last,
+        min_step=solver.min_step,
+        max_step=solver.max_step,
+        safety_factor=solver.safety_factor,
+        min_step_factor=solver.min_step_factor,
+        max_step_factor=solver.max_step_factor,
+    )
     finite = jnp.logical_and(jnp.all(jnp.isfinite(trial_y)), jnp.isfinite(error_norm))
-    accepted = jnp.logical_and(finite, error_norm <= jnp.asarray(1.0, dtype=step_state.y.dtype))
+    accepted = jnp.logical_and(finite, controller.accepted)
     next_dt = controller.next_dt
     return _LIMMWAttemptResult(
         trial_y=trial_y,
-        # Populated with distinct p-1/p/p+1 candidates when the live
-        # MATLODE controller wiring is enabled; retain shape-stable fields
-        # during this interface transition.
         lower_trial_y=lower_trial_y,
         higher_trial_y=higher_trial_y,
+        predictor_y=predictor_y,
         trial_dt=trial_dt,
         next_dt=next_dt,
         error_norm=error_norm,
-        candidate_error_norms=candidate_error_norms,
+        candidate_error_norms=jnp.stack((measured_error, measured_error, measured_error)),
         controller=controller,
         accepted=accepted,
         order=jnp.asarray(int(order), dtype=jnp.int32),
@@ -20685,8 +20675,6 @@ def _limm_w_attempt_at_order(
 
 def _limm_w_commit_attempt(step_state: _LIMMWStepState, attempt: _LIMMWAttemptResult, accepted_rhs):
     """Commit an accepted attempt or retain exact history on rejection."""
-
-    dtype = step_state.y.dtype
 
     def _accept(_):
         history = _limm_w_advance_history_on_accept(
@@ -20702,61 +20690,40 @@ def _limm_w_commit_attempt(step_state: _LIMMWStepState, attempt: _LIMMWAttemptRe
             dt=attempt.next_dt,
             status=step_state.status.at[2].add(jnp.asarray(1, dtype=jnp.int32)),
             history=history,
-            prev_error=attempt.error_norm,
+            # Startup history steps intentionally have no invented embedded
+            # defect.  Keep the neutral previous error for the first real PI
+            # update instead of treating that artificial zero as a perfect
+            # accepted error.
+            prev_error=jnp.where(
+                attempt.error_norm > jnp.asarray(0.0, dtype=step_state.y.dtype),
+                attempt.error_norm,
+                step_state.prev_error,
+            ),
             recent_reject_count=jnp.asarray(0, dtype=jnp.int32),
             easy_growth_streak=step_state.easy_growth_streak + jnp.asarray(1, dtype=jnp.int32),
-            selected_order=attempt.controller.next_order,
-            consecutive_accepts=attempt.controller.next_consecutive_accepts,
+            selected_order=jnp.asarray(attempt.order, dtype=jnp.int32),
+            consecutive_accepts=step_state.consecutive_accepts + jnp.asarray(1, dtype=jnp.int32),
             reject_last=attempt.controller.reject_last,
-            reject_more=attempt.controller.reject_more,
+            reject_more=jnp.asarray(False),
             accepted_by_order=step_state.accepted_by_order.at[attempt.order - 1].add(1),
             min_accepted_dt=jnp.minimum(step_state.min_accepted_dt, attempt.trial_dt),
         )
 
     def _reject(_):
-        rejected = dataclasses.replace(
+        # A retry changes only the pending step size.  Accepted multistep
+        # history, F(y_n), and the NTX response/J all remain untouched.
+        return dataclasses.replace(
             step_state,
             dt=attempt.next_dt,
             prev_error=attempt.error_norm,
             recent_reject_count=step_state.recent_reject_count + jnp.asarray(1, dtype=jnp.int32),
             easy_growth_streak=jnp.asarray(0, dtype=jnp.int32),
-            selected_order=attempt.controller.next_order,
-            consecutive_accepts=attempt.controller.next_consecutive_accepts,
+            selected_order=step_state.selected_order,
+            consecutive_accepts=step_state.consecutive_accepts,
             reject_last=attempt.controller.reject_last,
-            reject_more=attempt.controller.reject_more,
+            reject_more=step_state.reject_last,
             rejected_by_order=step_state.rejected_by_order.at[attempt.order - 1].add(1),
         )
-        # A repeated-rejection demotion invalidates the old variable-step
-        # multistep stencil. Restart numerically at the same physical anchor:
-        # y, F(y), and the cached NTX response/J are retained; only accepted
-        # extrapolation history and controller startup metadata are reset.
-        def _restart(_):
-            history = _limm_w_initial_history(
-                step_state.y,
-                accepted_rhs,
-                max_order=step_state.history.states.shape[0],
-            )
-            return dataclasses.replace(
-                rejected,
-                history=history,
-                selected_order=jnp.asarray(1, dtype=jnp.int32),
-                consecutive_accepts=jnp.asarray(0, dtype=jnp.int32),
-                # Preserve the repeated-rejection controller state. MATLODE
-                # keeps this state until an accepted step; clearing it here
-                # created a new two-rejection/restart cycle each time.
-                restart_count=rejected.restart_count + jnp.asarray(1, dtype=jnp.int32),
-            )
-        return jax.lax.cond(
-            jnp.logical_and(
-                jnp.logical_and(attempt.controller.reject_more, jnp.logical_not(step_state.reject_more)),
-                attempt.controller.next_order == 1,
-            ),
-            _restart,
-            lambda _: rejected,
-            operand=None,
-        )
-
-    del dtype
     return jax.lax.cond(attempt.accepted, _accept, _reject, operand=None)
 
 
@@ -21036,15 +21003,12 @@ def _limm_w_step_fn(
 ):
     """One compiled adaptive LIMM-W attempt, mirroring theta/Radau loops."""
 
-    history_order = _limm_w_available_order(step_state, solver.order)
-    # The p=1 Euler fallback is only a startup estimator, not a three-order
-    # LIMM controller stencil.  Ramp deterministically until p=2 has been
-    # accepted with a valid p=3 companion; thereafter honour controller order.
-    startup = step_state.history.valid_count <= jnp.asarray(3, dtype=jnp.int32)
-    available_order = jnp.where(
-        startup,
-        history_order,
-        jnp.minimum(history_order, step_state.selected_order),
+    # Fixed p=3/p=5 production lanes.  The first p accepted steps establish
+    # only the multistep history; thereafter the chosen order never changes.
+    # This is intentionally not a hidden variable-order controller.
+    available_order = jnp.minimum(
+        step_state.history.valid_count,
+        jnp.asarray(int(solver.order), dtype=step_state.history.valid_count.dtype),
     )
     current_rhs = step_state.history.rhs_values[0]
     current_jacobian = step_state.reuse_state.jacobian

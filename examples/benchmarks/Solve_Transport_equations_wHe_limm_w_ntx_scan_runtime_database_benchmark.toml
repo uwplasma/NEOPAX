@@ -1,5 +1,5 @@
 # Full w-He transport run using the runtime-built NTX scan database and the
-# forward-only published LIMM-W (orders 1--3) transport integrator.
+# forward-only fixed-order published LIMM-W transport integrator.
 
 [general]
 mode = "transport"
@@ -125,8 +125,10 @@ transport_solver_backend = "limm_w_forward"
 integrator = "limm_w_forward"
 center_flux_mode = "interpolate_from_faces"
 
-# Published LIMM-o16 coefficients, vendored through order 5. The response/J is
-# rebuilt after every accepted state; a rejected retry retains it.
+# Fixed W3: p=3 solution with a p=4 embedded companion.  Set
+# ``limm_w_order = 5`` to select fixed W5 with its validated p=4 lower-order
+# companion.  The response/J is rebuilt only after an accepted state; retries
+# retain the same anchor response/J and accepted multistep history.
 limm_w_order = 3
 limm_w_coefficient_family = "o16_published"
 limm_w_jacobian_reuse_mode = "retry_only"
