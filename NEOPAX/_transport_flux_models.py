@@ -2229,6 +2229,24 @@ class NTXDatabaseTransportModel(TransportFluxModelBase):
     bc_density: Any = None
     bc_temperature: Any = None
     density_floor: Any = DEFAULT_TRANSPORT_DENSITY_FLOOR
+    # This is intentionally an opt-in forward experiment.  The linear
+    # response remains the production default and the quadratic response does
+    # not yet have an exact reverse-AD rule.
+    lagged_response_taylor_order: int = 1
+
+    def __post_init__(self):
+        order = int(self.lagged_response_taylor_order)
+        if order not in {1, 2}:
+            raise ValueError(
+                "NTX database lagged_response_taylor_order must be 1 or 2."
+            )
+
+    def _require_supported_reverse_lagged_response(self):
+        if int(self.lagged_response_taylor_order) == 2:
+            raise NotImplementedError(
+                "The quadratic NTX database lagged response is forward-only. "
+                "Its exact reverse rule requires the response-Hessian pullback."
+            )
 
     def __call__(self, state) -> dict:
         density = safe_density(state.density, self.density_floor)
@@ -2360,6 +2378,10 @@ class NTXDatabaseTransportModel(TransportFluxModelBase):
             reference_flux=self(state),
         )
 
+    def pullback_build_lagged_response(self, state, lagged_response_bar, **kwargs):
+        self._require_supported_reverse_lagged_response()
+        return super().pullback_build_lagged_response(state, lagged_response_bar, **kwargs)
+
     def evaluate_with_lagged_response(self, state, lagged_response, **kwargs):
         del kwargs
         delta_state = jax.tree_util.tree_map(
@@ -2382,28 +2404,63 @@ class NTXDatabaseTransportModel(TransportFluxModelBase):
                 bc_temperature=self.bc_temperature,
             )
 
-        tangent_face_flux = jax.jvp(
+        _, tangent_face_flux = jax.jvp(
             _face_fluxes_from_state,
             (lagged_response.reference_state,),
             (delta_state,),
-        )[1]
+        )
+        curvature_face_flux = None
+        if int(self.lagged_response_taylor_order) == 2:
+            # Keep delta_state fixed while differentiating the anchored JVP.
+            # This is exactly H(y_ref)[delta_state, delta_state], rather than
+            # a derivative of the path-dependent delta itself.
+            _, curvature_face_flux = jax.jvp(
+                lambda anchor_state: jax.jvp(
+                    _face_fluxes_from_state,
+                    (anchor_state,),
+                    (delta_state,),
+                )[1],
+                (lagged_response.reference_state,),
+                (delta_state,),
+            )
         face_fluxes = jax.tree_util.tree_map(
-            lambda reference, tangent: reference + tangent,
+            (
+                (lambda reference, tangent, curvature: reference + tangent + 0.5 * curvature)
+                if curvature_face_flux is not None
+                else (lambda reference, tangent: reference + tangent)
+            ),
             lagged_response.reference_face_flux,
             tangent_face_flux,
+            *(() if curvature_face_flux is None else (curvature_face_flux,)),
         )
         out = self._fluxes_from_face_fluxes(face_fluxes)
         if lagged_response.reference_flux is not None:
-            tangent_flux = jax.jvp(
+            _, tangent_flux = jax.jvp(
                 self.__call__,
                 (lagged_response.reference_state,),
                 (delta_state,),
-            )[1]
+            )
+            curvature_flux = None
+            if int(self.lagged_response_taylor_order) == 2:
+                _, curvature_flux = jax.jvp(
+                    lambda anchor_state: jax.jvp(
+                        self.__call__,
+                        (anchor_state,),
+                        (delta_state,),
+                    )[1],
+                    (lagged_response.reference_state,),
+                    (delta_state,),
+                )
             out.update(
                 jax.tree_util.tree_map(
-                    lambda reference, tangent: reference + tangent,
+                    (
+                        (lambda reference, tangent, curvature: reference + tangent + 0.5 * curvature)
+                        if curvature_flux is not None
+                        else (lambda reference, tangent: reference + tangent)
+                    ),
                     lagged_response.reference_flux,
                     tangent_flux,
+                    *(() if curvature_flux is None else (curvature_flux,)),
                 )
             )
         return out
@@ -3010,6 +3067,14 @@ class NTXRuntimeScanTransportModel(TransportFluxModelBase):
     channels: NTXRuntimeScanChannels | None = None
     scan_surfaces: tuple[Any, ...] | None = None
     database: Any = None
+    lagged_response_taylor_order: int = 1
+
+    def __post_init__(self):
+        order = int(self.lagged_response_taylor_order)
+        if order not in {1, 2}:
+            raise ValueError(
+                "ntx_scan_runtime lagged_response_taylor_order must be 1 or 2."
+            )
 
     def with_runtime_scan_payload(
         self,
@@ -3238,6 +3303,7 @@ class NTXRuntimeScanTransportModel(TransportFluxModelBase):
             collisionality_model=self.collisionality_model,
             bc_density=self.bc_density,
             bc_temperature=self.bc_temperature,
+            lagged_response_taylor_order=self.lagged_response_taylor_order,
         )
 
     def __call__(self, state) -> dict:
@@ -3256,6 +3322,11 @@ class NTXRuntimeScanTransportModel(TransportFluxModelBase):
         return self._database_model().evaluate_with_lagged_response(state, lagged_response, **kwargs)
 
     def pullback_build_lagged_response(self, state, lagged_response_bar, **kwargs):
+        if int(self.lagged_response_taylor_order) == 2:
+            raise NotImplementedError(
+                "The quadratic ntx_scan_runtime lagged response is forward-only. "
+                "Its exact reverse rule requires the response-Hessian pullback."
+            )
         return self._database_model().pullback_build_lagged_response(
             state,
             lagged_response_bar,
@@ -15389,6 +15460,7 @@ def build_ntx_runtime_scan_transport_model(
     ntx_scan_surfaces=None,
     preload_channels=False,
     prebuild_database=True,
+    lagged_response_taylor_order=1,
     **kwargs,
 ):
     del kwargs
@@ -15412,6 +15484,7 @@ def build_ntx_runtime_scan_transport_model(
         channels=ntx_scan_channels,
         scan_surfaces=None if ntx_scan_surfaces is None else tuple(ntx_scan_surfaces),
         database=None,
+        lagged_response_taylor_order=int(lagged_response_taylor_order),
     )
     if preload_channels:
         model = model.with_static_channels()

@@ -428,6 +428,75 @@ def test_ntx_database_lagged_face_response_matches_reference_and_finite_differen
             atol=3.0e-4,
         )
 
+    # The quadratic experimental lane is a Taylor response of the same
+    # database primitives.  Its remaining local error must be cubic in a
+    # smooth profile perturbation, whereas the established lagged response
+    # leaves a quadratic remainder.
+    quadratic_model = flux_models_module.NTXDatabaseTransportModel(
+        species=species,
+        energy_grid="grid",
+        geometry=geometry,
+        database="database",
+        lagged_response_taylor_order=2,
+    )
+    quadratic_response = quadratic_model.build_lagged_response(state0)
+
+    def _state_at_scale(scale):
+        return jax.tree_util.tree_map(
+            lambda value, delta: value + scale * delta,
+            state0,
+            direction,
+        )
+
+    def _response_error(response_model, response_value, scale):
+        state_value = _state_at_scale(scale)
+        approximate = response_model.evaluate_with_lagged_response(state_value, response_value)
+        direct_faces = face_fluxes_from_state(state_value)
+        direct_centres = response_model(state_value)
+        squared_error = jnp.asarray(0.0)
+        for name in ("Gamma", "Q", "Upar"):
+            squared_error = squared_error + jnp.sum(
+                (approximate[name] - direct_centres[name]) ** 2
+            )
+            squared_error = squared_error + jnp.sum(
+                (approximate[f"{name}_faces"] - direct_faces[name]) ** 2
+            )
+        return jnp.sqrt(squared_error)
+
+    quadratic_at_reference = quadratic_model.evaluate_with_lagged_response(
+        state0,
+        quadratic_response,
+    )
+    for name in ("Gamma", "Q", "Upar"):
+        assert jnp.allclose(quadratic_at_reference[name], quadratic_model(state0)[name])
+        assert jnp.allclose(quadratic_at_reference[f"{name}_faces"], direct_at_reference[name])
+
+    scales = (jnp.asarray(0.10), jnp.asarray(0.05), jnp.asarray(0.025))
+    linear_errors = jnp.asarray([_response_error(model, response, scale) for scale in scales])
+    quadratic_errors = jnp.asarray(
+        [_response_error(quadratic_model, quadratic_response, scale) for scale in scales]
+    )
+    assert float(linear_errors[1] / linear_errors[0]) < 0.35
+    assert float(linear_errors[2] / linear_errors[1]) < 0.35
+    assert float(quadratic_errors[1] / quadratic_errors[0]) < 0.18
+    assert float(quadratic_errors[2] / quadratic_errors[1]) < 0.18
+
+
+def test_ntx_database_quadratic_lagged_response_rejects_reverse_build():
+    model = flux_models_module.NTXDatabaseTransportModel(
+        species="species",
+        energy_grid="grid",
+        geometry="geometry",
+        database="database",
+        lagged_response_taylor_order=2,
+    )
+    try:
+        model.pullback_build_lagged_response(None, None)
+    except NotImplementedError as exc:
+        assert "forward-only" in str(exc)
+    else:
+        raise AssertionError("quadratic database response unexpectedly entered reverse AD")
+
 
 def test_pack_and_unpack_transport_state_arrays_restore_electron_row():
     species = _dummy_species()
