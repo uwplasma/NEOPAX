@@ -160,6 +160,9 @@ max_steps = 20000
 throw = false
 debug_stage_markers = true
 debug_walltime_attempts = true
+# Run one identical, discarded solve after the first solve has compiled.  This
+# prints the steady-state full-forward time separately from first-call time.
+forward_warm_timing_repeats = 1
 debug_nonfinite_rhs_components = false
 debug_disable_jit = false
 save_n = 10

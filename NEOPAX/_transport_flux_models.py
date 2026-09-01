@@ -2230,23 +2230,67 @@ class NTXDatabaseTransportModel(TransportFluxModelBase):
     bc_temperature: Any = None
     density_floor: Any = DEFAULT_TRANSPORT_DENSITY_FLOOR
     # This is intentionally an opt-in forward experiment.  The linear
-    # response remains the production default and the quadratic response does
-    # not yet have an exact reverse-AD rule.
+    # response remains the production default and higher-order responses do
+    # not yet have exact reverse-AD rules.
     lagged_response_taylor_order: int = 1
 
     def __post_init__(self):
         order = int(self.lagged_response_taylor_order)
-        if order not in {1, 2}:
+        if order not in {1, 2, 3}:
             raise ValueError(
-                "NTX database lagged_response_taylor_order must be 1 or 2."
+                "NTX database lagged_response_taylor_order must be 1, 2, or 3."
             )
 
     def _require_supported_reverse_lagged_response(self):
-        if int(self.lagged_response_taylor_order) == 2:
+        if int(self.lagged_response_taylor_order) > 1:
             raise NotImplementedError(
-                "The quadratic NTX database lagged response is forward-only. "
-                "Its exact reverse rule requires the response-Hessian pullback."
+                "Higher-order NTX database lagged responses are forward-only. "
+                "Their exact reverse rules require higher-response pullbacks."
             )
+
+    @staticmethod
+    def _anchored_taylor_terms(function, anchor_state, delta_state, order):
+        """Return first through third directional Taylor terms at one anchor.
+
+        ``delta_state`` is intentionally held fixed in every nested JVP, so
+        the outputs are J[delta], H[delta, delta], and D3[delta, delta,
+        delta] of ``function`` at ``anchor_state``.
+        """
+        _, first = jax.jvp(function, (anchor_state,), (delta_state,))
+        if order == 1:
+            return first, None, None
+
+        def _first_direction(anchor_value):
+            return jax.jvp(function, (anchor_value,), (delta_state,))[1]
+
+        _, second = jax.jvp(_first_direction, (anchor_state,), (delta_state,))
+        if order == 2:
+            return first, second, None
+
+        def _second_direction(anchor_value):
+            return jax.jvp(_first_direction, (anchor_value,), (delta_state,))[1]
+
+        _, third = jax.jvp(_second_direction, (anchor_state,), (delta_state,))
+        return first, second, third
+
+    @staticmethod
+    def _add_taylor_terms(reference, first, second=None, third=None):
+        if third is not None:
+            return jax.tree_util.tree_map(
+                lambda ref, one, two, three: ref + one + 0.5 * two + three / 6.0,
+                reference,
+                first,
+                second,
+                third,
+            )
+        if second is not None:
+            return jax.tree_util.tree_map(
+                lambda ref, one, two: ref + one + 0.5 * two,
+                reference,
+                first,
+                second,
+            )
+        return jax.tree_util.tree_map(lambda ref, one: ref + one, reference, first)
 
     def __call__(self, state) -> dict:
         density = safe_density(state.density, self.density_floor)
@@ -2404,63 +2448,33 @@ class NTXDatabaseTransportModel(TransportFluxModelBase):
                 bc_temperature=self.bc_temperature,
             )
 
-        _, tangent_face_flux = jax.jvp(
+        order = int(self.lagged_response_taylor_order)
+        tangent_face_flux, curvature_face_flux, cubic_face_flux = self._anchored_taylor_terms(
             _face_fluxes_from_state,
-            (lagged_response.reference_state,),
-            (delta_state,),
+            lagged_response.reference_state,
+            delta_state,
+            order,
         )
-        curvature_face_flux = None
-        if int(self.lagged_response_taylor_order) == 2:
-            # Keep delta_state fixed while differentiating the anchored JVP.
-            # This is exactly H(y_ref)[delta_state, delta_state], rather than
-            # a derivative of the path-dependent delta itself.
-            _, curvature_face_flux = jax.jvp(
-                lambda anchor_state: jax.jvp(
-                    _face_fluxes_from_state,
-                    (anchor_state,),
-                    (delta_state,),
-                )[1],
-                (lagged_response.reference_state,),
-                (delta_state,),
-            )
-        face_fluxes = jax.tree_util.tree_map(
-            (
-                (lambda reference, tangent, curvature: reference + tangent + 0.5 * curvature)
-                if curvature_face_flux is not None
-                else (lambda reference, tangent: reference + tangent)
-            ),
+        face_fluxes = self._add_taylor_terms(
             lagged_response.reference_face_flux,
             tangent_face_flux,
-            *(() if curvature_face_flux is None else (curvature_face_flux,)),
+            curvature_face_flux,
+            cubic_face_flux,
         )
         out = self._fluxes_from_face_fluxes(face_fluxes)
         if lagged_response.reference_flux is not None:
-            _, tangent_flux = jax.jvp(
+            tangent_flux, curvature_flux, cubic_flux = self._anchored_taylor_terms(
                 self.__call__,
-                (lagged_response.reference_state,),
-                (delta_state,),
+                lagged_response.reference_state,
+                delta_state,
+                order,
             )
-            curvature_flux = None
-            if int(self.lagged_response_taylor_order) == 2:
-                _, curvature_flux = jax.jvp(
-                    lambda anchor_state: jax.jvp(
-                        self.__call__,
-                        (anchor_state,),
-                        (delta_state,),
-                    )[1],
-                    (lagged_response.reference_state,),
-                    (delta_state,),
-                )
             out.update(
-                jax.tree_util.tree_map(
-                    (
-                        (lambda reference, tangent, curvature: reference + tangent + 0.5 * curvature)
-                        if curvature_flux is not None
-                        else (lambda reference, tangent: reference + tangent)
-                    ),
+                self._add_taylor_terms(
                     lagged_response.reference_flux,
                     tangent_flux,
-                    *(() if curvature_flux is None else (curvature_flux,)),
+                    curvature_flux,
+                    cubic_flux,
                 )
             )
         return out
@@ -3071,9 +3085,9 @@ class NTXRuntimeScanTransportModel(TransportFluxModelBase):
 
     def __post_init__(self):
         order = int(self.lagged_response_taylor_order)
-        if order not in {1, 2}:
+        if order not in {1, 2, 3}:
             raise ValueError(
-                "ntx_scan_runtime lagged_response_taylor_order must be 1 or 2."
+                "ntx_scan_runtime lagged_response_taylor_order must be 1, 2, or 3."
             )
 
     def with_runtime_scan_payload(
@@ -3322,10 +3336,10 @@ class NTXRuntimeScanTransportModel(TransportFluxModelBase):
         return self._database_model().evaluate_with_lagged_response(state, lagged_response, **kwargs)
 
     def pullback_build_lagged_response(self, state, lagged_response_bar, **kwargs):
-        if int(self.lagged_response_taylor_order) == 2:
+        if int(self.lagged_response_taylor_order) > 1:
             raise NotImplementedError(
-                "The quadratic ntx_scan_runtime lagged response is forward-only. "
-                "Its exact reverse rule requires the response-Hessian pullback."
+                "Higher-order ntx_scan_runtime lagged responses are forward-only. "
+                "Their exact reverse rules require higher-response pullbacks."
             )
         return self._database_model().pullback_build_lagged_response(
             state,

@@ -481,6 +481,20 @@ def test_ntx_database_lagged_face_response_matches_reference_and_finite_differen
     assert float(quadratic_errors[1] / quadratic_errors[0]) < 0.18
     assert float(quadratic_errors[2] / quadratic_errors[1]) < 0.18
 
+    cubic_model = flux_models_module.NTXDatabaseTransportModel(
+        species=species,
+        energy_grid="grid",
+        geometry=geometry,
+        database="database",
+        lagged_response_taylor_order=3,
+    )
+    cubic_response = cubic_model.build_lagged_response(state0)
+    cubic_errors = jnp.asarray(
+        [_response_error(cubic_model, cubic_response, scale) for scale in scales]
+    )
+    assert float(cubic_errors[1] / cubic_errors[0]) < 0.10
+    assert float(cubic_errors[2] / cubic_errors[1]) < 0.10
+
 
 def test_ntx_database_quadratic_lagged_response_rejects_reverse_build():
     model = flux_models_module.NTXDatabaseTransportModel(

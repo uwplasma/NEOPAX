@@ -997,6 +997,13 @@ def run_transport(config: dict, runtime: RuntimeContext, state: TransportState):
     backend_name = str(solver_cfg.get("transport_solver_backend", solver_cfg.get("integrator", ""))).strip().lower()
     debug_markers = bool(solver_cfg.get("debug_stage_markers", False))
     debug_disable_jit = bool(solver_cfg.get("debug_disable_jit", False))
+    # This is deliberately a benchmark-only setting.  The first full solve
+    # includes JAX tracing/compilation; subsequent identical solves expose the
+    # steady-state wall time.  The result and output of the first solve remain
+    # authoritative.
+    forward_warm_timing_repeats = int(solver_cfg.get("forward_warm_timing_repeats", 0))
+    if forward_warm_timing_repeats < 0:
+        raise ValueError("forward_warm_timing_repeats must be non-negative.")
     if debug_markers and _resolve_er_right_boundary_mode(config, runtime.solver_parameters) == "ambipolar_edge_root" and "Er" in bc:
         print(f"[NEOPAX] using ambipolar edge Er BC: Er_edge={float(jnp.asarray(getattr(bc['Er'], 'right_value', 0.0))):.6e}")
     if debug_markers:
@@ -1406,29 +1413,51 @@ def run_transport(config: dict, runtime: RuntimeContext, state: TransportState):
         except Exception:
             return result_obj
 
-    solve_wall_start = None
-    if debug_markers:
-        solve_wall_start = time.perf_counter()
+    def _solve_once(active_solver):
+        if debug_disable_jit:
+            with jax.disable_jit(True):
+                return active_solver.solve(solve_state, solve_vector_field, runtime.species)
+        return active_solver.solve(solve_state, solve_vector_field, runtime.species)
 
-    if debug_disable_jit:
-        import jax
-
-        if debug_markers:
-            print("[NEOPAX] debug_disable_jit=true, forcing eager execution for diagnosis")
-        with jax.disable_jit(True):
-            result = solver.solve(solve_state, solve_vector_field, runtime.species)
-    else:
-        result = solver.solve(solve_state, solve_vector_field, runtime.species)
-
-    solve_wall_mid = time.perf_counter() if debug_markers else None
-    if debug_markers:
+    record_solver_timing = debug_markers or bool(forward_warm_timing_repeats)
+    solve_wall_start = time.perf_counter() if record_solver_timing else None
+    if debug_disable_jit and debug_markers:
+        print("[NEOPAX] debug_disable_jit=true, forcing eager execution for diagnosis")
+    result = _solve_once(solver)
+    solve_wall_mid = time.perf_counter() if record_solver_timing else None
+    if record_solver_timing:
         _block_until_ready_result(result)
         solve_wall_end = time.perf_counter()
         print(
-            "[NEOPAX] solver timing:",
+            "[NEOPAX] solver timing:" if debug_markers else "[NEOPAX] forward first-call timing:",
             f"host_return_elapsed_s={solve_wall_mid - solve_wall_start:.3f}",
             f"synchronized_elapsed_s={solve_wall_end - solve_wall_start:.3f}",
             f"device_tail_s={solve_wall_end - solve_wall_mid:.3f}",
+        )
+
+    if forward_warm_timing_repeats:
+        # Avoid duplicating per-attempt/Newton diagnostics in the warm timing
+        # output.  The warm solve has exactly the same numerical settings and
+        # starts from the same original state; it is discarded after timing.
+        solver_field_names = {field.name for field in dataclasses.fields(solver)}
+        warm_debug_overrides = {
+            name: False
+            for name in ("debug_stage_markers", "debug_walltime_attempts")
+            if name in solver_field_names
+        }
+        warm_solver = dataclasses.replace(solver, **warm_debug_overrides)
+        warm_times = []
+        for _ in range(forward_warm_timing_repeats):
+            warm_start = time.perf_counter()
+            warm_result = _solve_once(warm_solver)
+            _block_until_ready_result(warm_result)
+            warm_times.append(time.perf_counter() - warm_start)
+        print(
+            "[NEOPAX] forward warm timing:",
+            f"repeats={forward_warm_timing_repeats}",
+            "execute_times_s=[" + ", ".join(f"{elapsed:.3f}" for elapsed in warm_times) + "]",
+            f"mean_execute_s={sum(warm_times) / len(warm_times):.3f}",
+            f"min_execute_s={min(warm_times):.3f}",
         )
     if debug_markers:
         ys = getattr(result, "ys", None)
