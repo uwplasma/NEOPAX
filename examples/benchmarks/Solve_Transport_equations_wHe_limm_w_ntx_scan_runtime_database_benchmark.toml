@@ -127,7 +127,7 @@ center_flux_mode = "interpolate_from_faces"
 
 # Published LIMM-o16 coefficients, vendored through order 5. The response/J is
 # rebuilt after every accepted state; a rejected retry retains it.
-limm_w_order = 5
+limm_w_order = 3
 limm_w_coefficient_family = "o16_published"
 limm_w_jacobian_reuse_mode = "retry_only"
 limm_w_jacobian_reuse_rtol = 5.0e-2

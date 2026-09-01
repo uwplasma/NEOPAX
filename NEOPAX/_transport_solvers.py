@@ -20257,8 +20257,8 @@ class _LIMMWHistory:
 
 
 def _limm_w_initial_history(initial_y, initial_rhs, *, max_order: int):
-    if not 1 <= int(max_order) <= 5:
-        raise ValueError("LIMM-W maximum order must be in [1, 5].")
+    if not 1 <= int(max_order) <= 6:
+        raise ValueError("LIMM-W history capacity must be in [1, 6].")
     initial_y = jnp.asarray(initial_y)
     initial_rhs = jnp.asarray(initial_rhs)
     if initial_y.shape != initial_rhs.shape:
@@ -20361,11 +20361,14 @@ def _limm_w_initial_step_state(t0, initial_y, initial_rhs, base_dt, *, max_order
 
 
 def _limm_w_available_order(step_state: _LIMMWStepState, configured_order: int):
-    """Use orders 1..configured_order while startup history is populated."""
+    """Use an order only when its one-order-higher estimator has history."""
 
-    return jnp.minimum(
-        step_state.history.valid_count,
+    return jnp.maximum(
+        jnp.asarray(1, dtype=step_state.history.valid_count.dtype),
+        jnp.minimum(
+        step_state.history.valid_count - jnp.asarray(1, dtype=step_state.history.valid_count.dtype),
         jnp.asarray(int(configured_order), dtype=step_state.history.valid_count.dtype),
+        ),
     )
 
 
@@ -20383,10 +20386,11 @@ def _limm_w_embedded_trial_error(
 ):
     """Estimate local error without evaluating NTX at an in-step/end-point state.
 
-    For order >= 2 this is the difference to the adjacent lower-order
-    LIMM-W formula, built from the same accepted history and current response.
-    At startup, explicit Euler is the order-zero companion.  This costs an
-    additional *linear* solve for order >= 2 but no additional RHS/NTX call.
+    The published LIMM controller compares the accepted order-``p`` formula
+    to its order-``p + 1`` companion, built from the same accepted history and
+    frozen response. This costs one additional *linear* solve but no NTX call.
+    Only the very first p=1 startup attempt falls back to Euler because no
+    multistep p=2 companion exists yet.
     """
 
     current_y = jnp.asarray(current_y)
@@ -20400,7 +20404,7 @@ def _limm_w_embedded_trial_error(
             current_jacobian,
             current_dt,
             previous_dts,
-            order=int(order) - 1,
+            order=int(order) + 1,
             coefficient_family=coefficient_family,
         )
     return trial_y - lower_y
@@ -20427,10 +20431,8 @@ def _limm_w_next_dt(
 
     dtype = jnp.asarray(current_dt).dtype
     safe_error = jnp.maximum(jnp.asarray(error_norm, dtype=dtype), jnp.asarray(1.0e-14, dtype=dtype))
-    # The embedded estimate is the difference to the adjacent lower-order
-    # formula, so it is O(h**order), rather than the O(h**(order + 1)) local
-    # defect of the accepted formula itself.
-    factor = jnp.asarray(safety_factor, dtype=dtype) * safe_error ** (-jnp.asarray(1.0 / int(order), dtype=dtype))
+    # This is the p+1 minus p embedded defect, hence O(h**(p+1)).
+    factor = jnp.asarray(safety_factor, dtype=dtype) * safe_error ** (-jnp.asarray(1.0 / (int(order) + 1), dtype=dtype))
     factor = jnp.clip(
         factor,
         jnp.asarray(min_step_factor, dtype=dtype),
@@ -20956,7 +20958,9 @@ class LIMMWBaselineSolver(_LIMMWSolverConfig):
             jnp.asarray(self.min_step, dtype=dtype),
             jnp.asarray(self.max_step, dtype=dtype),
         )
-        step_state = _limm_w_initial_step_state(t0, flat_y0, initial_rhs, dt0, max_order=self.order)
+        # Keep one extra accepted row so the order-(p+1) companion can be
+        # formed while the accepted method remains capped at p.
+        step_state = _limm_w_initial_step_state(t0, flat_y0, initial_rhs, dt0, max_order=self.order + 1)
         step_state = dataclasses.replace(step_state, reuse_state=initial_reuse)
 
         save_n = max(1, int(self.save_n)) if self.save_n is not None else 1

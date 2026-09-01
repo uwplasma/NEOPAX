@@ -251,6 +251,16 @@ def test_limm_w_step_state_ramps_order_with_accepted_history():
             jnp.asarray(0.1, dtype=dtype),
         ),
     )
+    assert int(transport_solvers._limm_w_available_order(state, 5)) == 1
+    state = dataclasses.replace(
+        state,
+        history=transport_solvers._limm_w_advance_history_on_accept(
+            state.history,
+            jnp.asarray([0.7], dtype=dtype),
+            jnp.asarray([-1.4], dtype=dtype),
+            jnp.asarray(0.1, dtype=dtype),
+        ),
+    )
     assert int(transport_solvers._limm_w_available_order(state, 5)) == 2
     assert int(transport_solvers._limm_w_available_order(state, 1)) == 1
 
@@ -260,10 +270,10 @@ def test_limm_w_embedded_error_uses_only_current_response_and_history():
     h = jnp.asarray(0.1, dtype=dtype)
     y = jnp.asarray([1.0], dtype=dtype)
     jacobian = jnp.asarray([[-2.0]], dtype=dtype)
-    states = jnp.asarray([[1.0], [1.1]], dtype=dtype)
-    rhs = jnp.asarray([[-2.0], [-2.2]], dtype=dtype)
+    states = jnp.asarray([[1.0], [1.1], [1.3]], dtype=dtype)
+    rhs = jnp.asarray([[-2.0], [-2.2], [-2.6]], dtype=dtype)
     trial = transport_solvers._limm_w_baseline_trial_step(
-        y, rhs, states, jacobian, h, jnp.asarray([h], dtype=dtype), order=2
+        y, rhs, states, jacobian, h, jnp.asarray([h, h], dtype=dtype), order=2
     )
     error = transport_solvers._limm_w_embedded_trial_error(
         trial_y=trial,
@@ -272,13 +282,13 @@ def test_limm_w_embedded_error_uses_only_current_response_and_history():
         state_history=states,
         current_jacobian=jacobian,
         current_dt=h,
-        previous_dts=jnp.asarray([h], dtype=dtype),
+        previous_dts=jnp.asarray([h, h], dtype=dtype),
         order=2,
     )
-    lower = transport_solvers._limm_w_baseline_trial_step(
-        y, rhs, states, jacobian, h, jnp.asarray([h], dtype=dtype), order=1
+    higher = transport_solvers._limm_w_baseline_trial_step(
+        y, rhs, states, jacobian, h, jnp.asarray([h, h], dtype=dtype), order=3
     )
-    assert jnp.allclose(error, trial - lower, rtol=1.0e-12, atol=1.0e-12)
+    assert jnp.allclose(error, trial - higher, rtol=1.0e-12, atol=1.0e-12)
 
 
 def test_limm_w_controller_shrinks_and_grows_dt_from_scaled_error():
