@@ -20574,6 +20574,59 @@ def _limm_w_fixed_pi_controller(
     )
 
 
+def _limm_w_ros2_startup_attempt(step_state, current_rhs, current_jacobian, *, t_final, solver):
+    """Error-controlled response-only ROS2 starter/re-starter.
+
+    The second RHS is evaluated from the already available affine response,
+    ``F_n + J_n (y-y_n)``.  Thus this is a legitimate local embedded pair for
+    the frozen response model and costs linear solves only; it never performs
+    a new NTX calculation at an in-step point.
+    """
+
+    y = step_state.y
+    dtype = y.dtype
+    h = jnp.minimum(step_state.dt, jnp.asarray(t_final, dtype=dtype) - step_state.t)
+    jacobian = jnp.asarray(current_jacobian, dtype=dtype)
+    identity = jnp.eye(y.size, dtype=dtype)
+    gamma = jnp.asarray(0.282893218813449984772, dtype=dtype)
+    gamma21 = jnp.asarray(-0.585786437626899969544, dtype=dtype)
+    lhs = identity - h * gamma * jacobian
+    k1 = jnp.linalg.solve(lhs, h * current_rhs)
+    affine_f2 = current_rhs + jacobian @ k1
+    k2 = jnp.linalg.solve(lhs, h * affine_f2 + h * gamma21 * (jacobian @ k1))
+    trial_y = y + jnp.asarray(0.5, dtype=dtype) * (k1 + k2)
+    euler_y = y + k1
+    error_norm = _limm_w_scaled_error_norm(
+        trial_y - euler_y, y, trial_y, rtol=solver.rtol, atol=solver.atol
+    )
+    controller = _limm_w_fixed_pi_controller(
+        trial_dt=h,
+        error_norm=error_norm,
+        previous_accepted_error=step_state.prev_error,
+        error_order=2,
+        reject_last=step_state.reject_last,
+        min_step=solver.min_step,
+        max_step=solver.max_step,
+        safety_factor=solver.safety_factor,
+        min_step_factor=solver.min_step_factor,
+        max_step_factor=solver.max_step_factor,
+    )
+    finite = jnp.logical_and(jnp.all(jnp.isfinite(trial_y)), jnp.isfinite(error_norm))
+    return _LIMMWAttemptResult(
+        trial_y=trial_y,
+        lower_trial_y=euler_y,
+        higher_trial_y=trial_y,
+        predictor_y=euler_y,
+        trial_dt=h,
+        next_dt=controller.next_dt,
+        error_norm=error_norm,
+        candidate_error_norms=jnp.broadcast_to(error_norm, (3,)),
+        controller=controller,
+        accepted=jnp.logical_and(finite, controller.accepted),
+        order=jnp.asarray(1, dtype=jnp.int32),
+    )
+
+
 def _limm_w_attempt_at_order(
     step_state: _LIMMWStepState,
     current_rhs,
@@ -20673,7 +20726,13 @@ def _limm_w_attempt_at_order(
     )
 
 
-def _limm_w_commit_attempt(step_state: _LIMMWStepState, attempt: _LIMMWAttemptResult, accepted_rhs):
+def _limm_w_commit_attempt(
+    step_state: _LIMMWStepState,
+    attempt: _LIMMWAttemptResult,
+    accepted_rhs,
+    *,
+    restart_history_on_reject=False,
+):
     """Commit an accepted attempt or retain exact history on rejection."""
 
     def _accept(_):
@@ -20712,7 +20771,7 @@ def _limm_w_commit_attempt(step_state: _LIMMWStepState, attempt: _LIMMWAttemptRe
     def _reject(_):
         # A retry changes only the pending step size.  Accepted multistep
         # history, F(y_n), and the NTX response/J all remain untouched.
-        return dataclasses.replace(
+        rejected = dataclasses.replace(
             step_state,
             dt=attempt.next_dt,
             prev_error=attempt.error_norm,
@@ -20724,6 +20783,21 @@ def _limm_w_commit_attempt(step_state: _LIMMWStepState, attempt: _LIMMWAttemptRe
             reject_more=step_state.reject_last,
             rejected_by_order=step_state.rejected_by_order.at[attempt.order - 1].add(1),
         )
+        # A history reset is permitted only when a rejection would make the
+        # proposed step ratio leave the configured multistep stability domain.
+        # It preserves the physical anchor, F(y_n), and response/J; subsequent
+        # steps use the controlled ROS2 starter above to rebuild history.
+        def _restart(_):
+            return dataclasses.replace(
+                rejected,
+                history=_limm_w_initial_history(
+                    step_state.y,
+                    accepted_rhs,
+                    max_order=step_state.history.states.shape[0],
+                ),
+                restart_count=step_state.restart_count + jnp.asarray(1, dtype=jnp.int32),
+            )
+        return jax.lax.cond(restart_history_on_reject, _restart, lambda _: rejected, operand=None)
     return jax.lax.cond(attempt.accepted, _accept, _reject, operand=None)
 
 
@@ -21003,27 +21077,31 @@ def _limm_w_step_fn(
 ):
     """One compiled adaptive LIMM-W attempt, mirroring theta/Radau loops."""
 
-    # Fixed p=3/p=5 production lanes.  The first p accepted steps establish
-    # only the multistep history; thereafter the chosen order never changes.
+    # Fixed p=3/p=5 production lanes.  A controlled ROS2 starter supplies
+    # the initial accepted history and is reused after a step-ratio restart.
     # This is intentionally not a hidden variable-order controller.
-    available_order = jnp.minimum(
-        step_state.history.valid_count,
-        jnp.asarray(int(solver.order), dtype=step_state.history.valid_count.dtype),
-    )
+    required_history = 4 if int(solver.order) == 3 else 5
+    needs_startup = step_state.history.valid_count < jnp.asarray(required_history, dtype=jnp.int32)
     current_rhs = step_state.history.rhs_values[0]
     current_jacobian = step_state.reuse_state.jacobian
-    branches = tuple(
-        lambda _, order=order: _limm_w_attempt_at_order(
+    def _production_attempt(_):
+        return _limm_w_attempt_at_order(
             step_state,
             current_rhs,
             current_jacobian,
             t_final=t_final,
             solver=solver,
-            order=order,
+            order=int(solver.order),
         )
-        for order in range(1, int(solver.order) + 1)
+
+    attempt = jax.lax.cond(
+        needs_startup,
+        lambda _: _limm_w_ros2_startup_attempt(
+            step_state, current_rhs, current_jacobian, t_final=t_final, solver=solver
+        ),
+        _production_attempt,
+        operand=None,
     )
-    attempt = jax.lax.switch(available_order - jnp.asarray(1, dtype=available_order.dtype), branches, operand=None)
 
     def _prepare_accepted_anchor(_):
         return _limm_w_prepare_next_accepted_anchor(
@@ -21049,7 +21127,20 @@ def _limm_w_step_fn(
         _retain_anchor_on_reject,
         operand=None,
     )
-    next_state = _limm_w_commit_attempt(step_state, attempt, accepted_rhs)
+    newest_accepted_dt = step_state.history.accepted_dts[0]
+    restart_history_on_reject = jnp.logical_and(
+        jnp.logical_not(needs_startup),
+        jnp.logical_and(
+            jnp.logical_not(attempt.accepted),
+            attempt.next_dt < jnp.asarray(solver.min_step_factor, dtype=attempt.next_dt.dtype) * newest_accepted_dt,
+        ),
+    )
+    next_state = _limm_w_commit_attempt(
+        step_state,
+        attempt,
+        accepted_rhs,
+        restart_history_on_reject=restart_history_on_reject,
+    )
     next_state = dataclasses.replace(next_state, reuse_state=next_reuse)
     exhausted_min_step = jnp.logical_and(
         jnp.logical_not(attempt.accepted),
