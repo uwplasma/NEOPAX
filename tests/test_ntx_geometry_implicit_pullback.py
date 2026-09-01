@@ -2194,13 +2194,15 @@ def test_native_vmec_face_rebuild_accumulation_matches_generic_prepared_vjp():
         grid=grid,
     )
     species = Species(
-        # The hard-coded three-Sonine momentum correction is square only
-        # for three kinetic species; this mirrors the production contract.
-        number_species=3,
-        species_indices=jnp.asarray([0, 1, 2]),
-        mass_mp=jnp.asarray([5.446e-4, 2.0, 3.0]),
-        charge_qp=jnp.asarray([-1.0, 1.0, 2.0]),
-        names=("e", "D", "He"),
+        # Keep this fixture at the active-wHe dimensionality.  The compact
+        # bootstrap VJP has a separate local implementation from the fast
+        # Upar-only primal, so a three-species parity check cannot validate
+        # the four-species correction matrix introduced for wHe.
+        number_species=4,
+        species_indices=jnp.asarray([0, 1, 2, 3]),
+        mass_mp=jnp.asarray([5.446e-4, 2.0, 3.0, 4.0]),
+        charge_qp=jnp.asarray([-1.0, 1.0, 1.0, 2.0]),
+        names=("e", "D", "T", "He"),
     )
     # ``get_Matrix`` is JIT compiled, so this needs the same JAX-pytree
     # energy-grid object used by production rather than a SimpleNamespace.
@@ -2211,8 +2213,12 @@ def test_native_vmec_face_rebuild_accumulation_matches_generic_prepared_vjp():
         center_response_mode="interpolate_from_faces", response_anchor_count=2,
     )
     state = TransportState(
-        density=jnp.asarray([[1.0, 1.15], [1.0, 1.15], [0.8, 0.9]]),
-        pressure=jnp.asarray([[1.3, 1.61], [1.1, 1.38], [0.7, 0.87]]),
+        density=jnp.asarray(
+            [[1.0, 1.15], [1.0, 1.15], [0.8, 0.9], [0.3, 0.34]]
+        ),
+        pressure=jnp.asarray(
+            [[1.3, 1.61], [1.1, 1.38], [0.7, 0.87], [0.24, 0.29]]
+        ),
         Er=jnp.asarray([2.0e-4, 2.5e-4]),
     )
     # The bootstrap-only primal may omit Gamma/Q/qpar/Upar2, but must retain
@@ -2220,6 +2226,78 @@ def test_native_vmec_face_rebuild_accumulation_matches_generic_prepared_vjp():
     _assert_float_tree_allclose(
         model.evaluate_momentum_corrected_upar_only(state),
         model.evaluate_momentum_corrected_fluxes(state)["Upar"],
+        rtol=1e-10,
+        atol=1e-12,
+    )
+    # The production ``joint_local_vjp_upar_only`` mode evaluates the fast
+    # Upar-only primal but obtains its derivative from the local corrected-
+    # flux VJP.  Check that exact duality at wHe dimensionality, including a
+    # density/pressure/Er direction; this is the direct oracle for a claimed
+    # bootstrap sign error before involving any transport rollout.
+    upar_bar = jnp.asarray(
+        [[0.3, -0.2], [-0.4, 0.5], [0.2, 0.1], [-0.15, 0.25]]
+    )
+    state_direction = dataclasses.replace(
+        state,
+        density=jnp.asarray(
+            [[0.12, -0.07], [-0.08, 0.03], [0.05, 0.09], [-0.02, 0.04]]
+        ),
+        pressure=jnp.asarray(
+            [[0.17, -0.06], [-0.04, 0.11], [0.08, -0.03], [0.02, 0.05]]
+        ),
+        Er=jnp.asarray([3.0e-5, -2.0e-5]),
+    )
+    upar_tangent = jax.jvp(
+        model.evaluate_momentum_corrected_upar_only,
+        (state,),
+        (state_direction,),
+    )[1]
+    compact_state_bar = model.pullback_momentum_corrected_upar_state_by_radius(
+        state,
+        upar_bar,
+    )
+    def _float_tree_vdot(bar_tree, direction_tree):
+        return sum(
+            jnp.vdot(jnp.asarray(bar), jnp.asarray(direction))
+            for bar, direction in zip(
+                jax.tree_util.tree_leaves(bar_tree),
+                jax.tree_util.tree_leaves(direction_tree),
+                strict=True,
+            )
+            if jnp.issubdtype(jnp.asarray(bar).dtype, jnp.inexact)
+        )
+
+    compact_contraction = _float_tree_vdot(compact_state_bar, state_direction)
+    assert jnp.allclose(
+        compact_contraction,
+        jnp.vdot(upar_bar, upar_tangent),
+        rtol=1e-10,
+        atol=1e-12,
+    )
+    geometry_direction = _TestMomentumGeometry(
+        a_b=jnp.asarray(0.03),
+        r_grid=jnp.asarray([0.01, -0.02]),
+        r_grid_half=jnp.asarray([0.01, -0.02, 0.03]),
+        Bsqav=jnp.asarray([0.04, -0.03]),
+        G_PS=jnp.asarray([0.02, -0.01]),
+        B0=jnp.asarray([-0.02, 0.01]),
+    )
+    upar_geometry_tangent = jax.jvp(
+        lambda geometry_value: dataclasses.replace(
+            model, geometry=geometry_value
+        ).evaluate_momentum_corrected_upar_only(state),
+        (geometry,),
+        (geometry_direction,),
+    )[1]
+    compact_geometry_bar = model.pullback_momentum_corrected_upar_geometry_by_radius(
+        state,
+        upar_bar,
+        geometry,
+        support,
+    )
+    assert jnp.allclose(
+        _float_tree_vdot(compact_geometry_bar, geometry_direction),
+        jnp.vdot(upar_bar, upar_geometry_tangent),
         rtol=1e-10,
         atol=1e-12,
     )

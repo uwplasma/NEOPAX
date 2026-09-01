@@ -20704,7 +20704,7 @@ def _limm_w_commit_attempt(step_state: _LIMMWStepState, attempt: _LIMMWAttemptRe
         )
 
     def _reject(_):
-        return dataclasses.replace(
+        rejected = dataclasses.replace(
             step_state,
             dt=attempt.next_dt,
             prev_error=attempt.error_norm,
@@ -20714,6 +20714,31 @@ def _limm_w_commit_attempt(step_state: _LIMMWStepState, attempt: _LIMMWAttemptRe
             consecutive_accepts=attempt.controller.next_consecutive_accepts,
             reject_last=attempt.controller.reject_last,
             reject_more=attempt.controller.reject_more,
+        )
+        # A repeated-rejection demotion invalidates the old variable-step
+        # multistep stencil. Restart numerically at the same physical anchor:
+        # y, F(y), and the cached NTX response/J are retained; only accepted
+        # extrapolation history and controller startup metadata are reset.
+        def _restart(_):
+            history = _limm_w_initial_history(
+                step_state.y,
+                accepted_rhs,
+                max_order=step_state.history.states.shape[0],
+            )
+            return dataclasses.replace(
+                rejected,
+                history=history,
+                selected_order=jnp.asarray(1, dtype=jnp.int32),
+                consecutive_accepts=jnp.asarray(0, dtype=jnp.int32),
+                recent_reject_count=jnp.asarray(0, dtype=jnp.int32),
+                reject_last=jnp.asarray(False),
+                reject_more=jnp.asarray(False),
+            )
+        return jax.lax.cond(
+            jnp.logical_and(attempt.controller.reject_more, attempt.controller.next_order == 1),
+            _restart,
+            lambda _: rejected,
+            operand=None,
         )
 
     del dtype
