@@ -4576,11 +4576,22 @@ def _run_local_stage_matvec_diagnostic_report(
     *,
     args,
     reverse_setup: _ReverseStaticSetup,
-    accepted_step_index: int,
+    accepted_step_index: int | None,
+    select_first_rebuild: bool = False,
     mode_label: str = "transport_reverse_ad_only_local_stage_matvec_diagnostic",
 ):
-    if accepted_step_index < 0:
+    if accepted_step_index is not None and accepted_step_index < 0:
         raise SystemExit("[autodiff-gate] --local-transpose-diagnostic-accepted-step must be >= 0.")
+    if select_first_rebuild and accepted_step_index is not None:
+        raise SystemExit(
+            "[autodiff-gate] choose either --local-transpose-diagnostic-accepted-step "
+            "or --local-transpose-diagnostic-first-rebuild, not both."
+        )
+    if accepted_step_index is None and not select_first_rebuild:
+        raise SystemExit(
+            "[autodiff-gate] local stage matvec diagnostic requires an accepted-step "
+            "index or --local-transpose-diagnostic-first-rebuild."
+        )
     print("[autodiff-gate] progress: running local stage transpose matvec diagnostic", flush=True)
     baseline_rollout = _radau_adaptive_schedule_rollout(
         reverse_setup.execution_context,
@@ -4588,6 +4599,40 @@ def _run_local_stage_matvec_diagnostic_report(
         max_total_steps=reverse_setup.max_total_steps,
         stop_after_accepted_steps=reverse_setup.stop_after_accepted_steps,
     )
+    selected_from_realized_schedule = False
+    if select_first_rebuild:
+        active_mask = np.asarray(jax.device_get(baseline_rollout.trace.active_mask), dtype=bool)
+        accepted_mask = np.asarray(jax.device_get(baseline_rollout.trace.accepted_mask), dtype=bool)
+        next_lagged_valid = np.asarray(
+            jax.device_get(baseline_rollout.trace.next_lagged_response_valid), dtype=bool
+        )
+        accepted_positions = np.nonzero(np.logical_and(active_mask, accepted_mask))[0]
+        incoming_valid = bool(
+            np.asarray(
+                jax.device_get(
+                    reverse_setup.prepared_rollout.initial_carry.lagged_response_valid
+                )
+            )
+        )
+        selected_step = None
+        for logical_step, attempt_position in enumerate(accepted_positions):
+            if not incoming_valid:
+                selected_step = logical_step
+                break
+            incoming_valid = bool(next_lagged_valid[int(attempt_position)])
+        if selected_step is None:
+            raise RuntimeError(
+                "[autodiff-gate] no realized accepted rebuild step was found in the "
+                f"schedule ({len(accepted_positions)} accepted steps)."
+            )
+        accepted_step_index = int(selected_step)
+        selected_from_realized_schedule = True
+        print(
+            "[autodiff-gate] local stage matvec diagnostic selected first realized "
+            f"rebuild accepted_step_index={accepted_step_index}",
+            flush=True,
+        )
+    assert accepted_step_index is not None
     diagnostic = _radau_debug_local_stage_transpose_matvec(
         reverse_setup.execution_context,
         reverse_setup.prepared_rollout.initial_carry,
@@ -4601,6 +4646,7 @@ def _run_local_stage_matvec_diagnostic_report(
         "objective_name": args.objective,
         "accepted_step_limit": None if args.accepted_step_limit is None else int(args.accepted_step_limit),
         "diagnostic_accepted_step_index": accepted_step_index,
+        "selected_first_realized_rebuild": selected_from_realized_schedule,
         "target_attempt_index": int(diagnostic["target_attempt_index"]),
         "found_target": bool(diagnostic["found_target"]),
         "lagged_response_valid_in": bool(diagnostic["lagged_response_valid_in"]),
@@ -4952,7 +4998,21 @@ def _run_realtime_geometry_reverse_mode(
             "--timing-mode split-vjp-warm. Use jit-warm, jit-compile-only, or eager."
         )
     local_transpose_diagnostic_accepted_step = args.local_transpose_diagnostic_accepted_step
-    if local_transpose_diagnostic_accepted_step is not None and not bool(args.stage_matvec_diagnostic):
+    local_transpose_diagnostic_first_rebuild = bool(
+        args.local_transpose_diagnostic_first_rebuild
+    )
+    if (
+        local_transpose_diagnostic_accepted_step is not None
+        and local_transpose_diagnostic_first_rebuild
+    ):
+        raise SystemExit(
+            "[autodiff-gate] choose either --local-transpose-diagnostic-accepted-step "
+            "or --local-transpose-diagnostic-first-rebuild, not both."
+        )
+    if (
+        local_transpose_diagnostic_accepted_step is not None
+        or local_transpose_diagnostic_first_rebuild
+    ) and not bool(args.stage_matvec_diagnostic):
         raise SystemExit(
             "[autodiff-gate] realtime-geometry local transpose diagnostics currently "
             "support only --stage-matvec-diagnostic."
@@ -5039,7 +5099,10 @@ def _run_realtime_geometry_reverse_mode(
                 "--realtime-geometry-gradient-path reverse_payload so it exercises "
                 "the validated full realtime geometry table."
             )
-        if local_transpose_diagnostic_accepted_step is not None:
+        if (
+            local_transpose_diagnostic_accepted_step is not None
+            or local_transpose_diagnostic_first_rebuild
+        ):
             core_setup = prepare_realtime_geometry_support_segment_core_setup(
                 args=args,
                 config=config,
@@ -5056,7 +5119,12 @@ def _run_realtime_geometry_reverse_mode(
             _run_local_stage_matvec_diagnostic_report(
                 args=args,
                 reverse_setup=core_setup.reverse_setup,
-                accepted_step_index=int(local_transpose_diagnostic_accepted_step),
+                accepted_step_index=(
+                    None
+                    if local_transpose_diagnostic_first_rebuild
+                    else int(local_transpose_diagnostic_accepted_step)
+                ),
+                select_first_rebuild=local_transpose_diagnostic_first_rebuild,
                 mode_label="transport_reverse_ad_only_realtime_geometry_local_stage_matvec_diagnostic",
             )
             return
@@ -6140,6 +6208,15 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--local-transpose-diagnostic-first-rebuild",
+        action="store_true",
+        help=(
+            "Diagnostic-only mode: with --stage-matvec-diagnostic, find the first "
+            "active accepted step whose incoming lagged-response cache is invalid, "
+            "run the local transpose check there, then exit."
+        ),
+    )
+    parser.add_argument(
         "--local-transpose-diagnostic-seed-mode",
         type=str,
         default="y",
@@ -6191,9 +6268,10 @@ def main() -> None:
         "--stage-matvec-diagnostic",
         action="store_true",
         help=(
-            "With --local-transpose-diagnostic-accepted-step, compare the compact "
-            "exact Radau stage transpose matvec against the dense block matrix, "
-            "then exit. Diagnostic only; does not compute parameter gradients."
+            "With --local-transpose-diagnostic-accepted-step or "
+            "--local-transpose-diagnostic-first-rebuild, compare the compact exact "
+            "Radau stage transpose matvec against the dense block matrix, then exit. "
+            "Diagnostic only; does not compute parameter gradients."
         ),
     )
     parser.add_argument(
@@ -6307,17 +6385,41 @@ def main() -> None:
         reverse_stage_adjoint_woodbury_rank=int(args.reverse_stage_adjoint_woodbury_rank),
     )
 
-    if args.local_transpose_diagnostic_accepted_step is not None:
-        accepted_step_index = int(args.local_transpose_diagnostic_accepted_step)
-        if accepted_step_index < 0:
+    if (
+        args.local_transpose_diagnostic_accepted_step is not None
+        and bool(args.local_transpose_diagnostic_first_rebuild)
+    ):
+        raise SystemExit(
+            "[autodiff-gate] choose either --local-transpose-diagnostic-accepted-step "
+            "or --local-transpose-diagnostic-first-rebuild, not both."
+        )
+    if (
+        args.local_transpose_diagnostic_accepted_step is not None
+        or bool(args.local_transpose_diagnostic_first_rebuild)
+    ):
+        if bool(args.local_transpose_diagnostic_first_rebuild) and not bool(
+            args.stage_matvec_diagnostic
+        ):
+            raise SystemExit(
+                "[autodiff-gate] --local-transpose-diagnostic-first-rebuild requires "
+                "--stage-matvec-diagnostic."
+            )
+        accepted_step_index = (
+            None
+            if bool(args.local_transpose_diagnostic_first_rebuild)
+            else int(args.local_transpose_diagnostic_accepted_step)
+        )
+        if accepted_step_index is not None and accepted_step_index < 0:
             raise SystemExit("[autodiff-gate] --local-transpose-diagnostic-accepted-step must be >= 0.")
         if bool(args.stage_matvec_diagnostic):
             _run_local_stage_matvec_diagnostic_report(
                 args=args,
                 reverse_setup=reverse_setup,
                 accepted_step_index=accepted_step_index,
+                select_first_rebuild=bool(args.local_transpose_diagnostic_first_rebuild),
             )
             return
+        assert accepted_step_index is not None
         print("[autodiff-gate] progress: running local accepted-step transpose diagnostic", flush=True)
         baseline_rollout = _radau_adaptive_schedule_rollout(
             reverse_setup.execution_context,
