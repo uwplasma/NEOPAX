@@ -2836,7 +2836,11 @@ def _run_realtime_geometry_support_pullback_probe(
     support_build_directional_duality = bool(
         getattr(args, "support_pullback_probe_build_directional_duality", False)
     )
-    if bool(args.support_pullback_probe_include_build) or support_build_directional_duality:
+    if (
+        bool(args.support_pullback_probe_include_build)
+        or support_build_directional_duality
+        or direct_rhs_geometry_duality_requested
+    ):
         lagged_response_bar = jax.tree_util.tree_map(
             lambda leaf: (
                 jnp.ones_like(leaf)
@@ -3110,6 +3114,112 @@ def _run_realtime_geometry_support_pullback_probe(
                 "full_rhs_geometry_jvp_l2": float(jax.block_until_ready(full_l2)),
                 "fixed_flux_direct_geometry_jvp_l2": float(jax.block_until_ready(direct_l2)),
             }
+
+        # The preceding rows validate the direct geometry dependence of one
+        # fixed lagged RHS.  Rebuild steps additionally differentiate the
+        # construction of the lagged response itself.  Check both the ordinary
+        # combined-payload VJP and the exact native hook selected by this run;
+        # this is the only local geometry boundary used by the native rebuild
+        # route that was not covered by the fixed-RHS rows above.
+        def _response_from_geometry(geometry_value):
+            return equation_system.with_geometry_payload(geometry_value).build_lagged_response(
+                baseline_profile_state
+            )
+
+        response_primal, response_tangent = jax.jvp(
+            _response_from_geometry, (geometry,), (geometry_direction,)
+        )
+        response_primal_l2_error = _tree_vdot(
+            jax.tree_util.tree_map(
+                lambda lhs, rhs: lhs - rhs, response_primal, lagged_response
+            ),
+            jax.tree_util.tree_map(
+                lambda lhs, rhs: lhs - rhs, response_primal, lagged_response
+            ),
+        )
+        generic_build_payload_bar = (
+            equation_system.pullback_build_lagged_response_support_payload(
+                baseline_profile_state,
+                lagged_response_bar,
+                rhs_support_payload,
+            )
+        )
+        generic_geometry_bar = generic_build_payload_bar["geometry"]
+        generic_lhs = _tree_vdot(lagged_response_bar, response_tangent)
+        generic_rhs = _tree_vdot(generic_geometry_bar, geometry_direction)
+        generic_lhs, generic_rhs, response_primal_l2_error = jax.block_until_ready(
+            (generic_lhs, generic_rhs, response_primal_l2_error)
+        )
+
+        native_hook_names = {
+            "ntx_batched_interpolated_faces_native_multi_rhs_reuse_moment_drds_jvp_shared_primal_with_vmec_coefficients": (
+                "pullback_build_lagged_response_support_payload_batched_interpolated_faces_"
+                "native_multi_rhs_reuse_moment_drds_jvp_shared_primal_with_vmec_coefficients"
+            ),
+            "ntx_batched_interpolated_faces_native_multi_rhs_reuse_moment_drds_jvp_shared_primal_with_vmec_coefficients_direct_directional_product_rule": (
+                "pullback_build_lagged_response_support_payload_batched_interpolated_faces_"
+                "native_multi_rhs_reuse_moment_drds_jvp_shared_primal_with_vmec_coefficients_"
+                "direct_directional_product_rule"
+            ),
+            "ntx_batched_interpolated_faces_native_multi_rhs_reuse_moment_drds_jvp_shared_primal_with_vmec_coefficients_direct_coefficient_pullback": (
+                "pullback_build_lagged_response_support_payload_batched_interpolated_faces_"
+                "native_multi_rhs_reuse_moment_drds_jvp_shared_primal_with_vmec_coefficients_"
+                "direct_coefficient_pullback"
+            ),
+            "ntx_batched_interpolated_faces_native_multi_rhs_reuse_moment_drds_jvp_shared_primal_with_vmec_coefficients_direct_directional_product_rule_per_energy_call_boundary": (
+                "pullback_build_lagged_response_support_payload_batched_interpolated_faces_"
+                "native_multi_rhs_reuse_moment_drds_jvp_shared_primal_with_vmec_coefficients_"
+                "direct_directional_product_rule_per_energy_call_boundary"
+            ),
+        }
+        active_rebuild_mode = str(
+            getattr(args, "reverse_rebuild_support_pullback_mode", "")
+        ).strip().lower()
+        native_hook_name = native_hook_names.get(active_rebuild_mode)
+        native_build_row = None
+        if native_hook_name is None:
+            native_build_row = {
+                "status": "not_requested_native_vmec_rebuild_mode",
+                "active_rebuild_mode": active_rebuild_mode,
+            }
+        else:
+            native_hook = getattr(equation_system, native_hook_name, None)
+            if not callable(native_hook):
+                raise RuntimeError(
+                    "direct-RHS geometry duality could not find the active native "
+                    f"rebuild hook {native_hook_name!r}."
+                )
+            batched_response_bar = jax.tree_util.tree_map(
+                lambda leaf: jnp.asarray(leaf)[None, ...], lagged_response_bar
+            )
+            native_payload_bars, _native_vmec_coefficients = native_hook(
+                baseline_profile_state,
+                batched_response_bar,
+                rhs_support_payload,
+            )
+            native_geometry_bar = jax.tree_util.tree_map(
+                lambda leaf: jnp.asarray(leaf)[0], native_payload_bars["geometry"]
+            )
+            native_rhs = _tree_vdot(native_geometry_bar, geometry_direction)
+            native_rhs = jax.block_until_ready(native_rhs)
+            native_abs_err = jnp.abs(generic_lhs - native_rhs)
+            native_rel_err = native_abs_err / jnp.maximum(
+                jnp.asarray(1.0e-30, dtype=native_abs_err.dtype),
+                jnp.maximum(jnp.abs(generic_lhs), jnp.abs(native_rhs)),
+            )
+            native_build_row = {
+                "status": "checked",
+                "active_rebuild_mode": active_rebuild_mode,
+                "native_geometry_vjp_dot_direction": float(native_rhs),
+                "native_abs_err_vs_jvp": float(native_abs_err),
+                "native_rel_err_vs_jvp": float(native_rel_err),
+            }
+
+        generic_abs_err = jnp.abs(generic_lhs - generic_rhs)
+        generic_rel_err = generic_abs_err / jnp.maximum(
+            jnp.asarray(1.0e-30, dtype=generic_abs_err.dtype),
+            jnp.maximum(jnp.abs(generic_lhs), jnp.abs(generic_rhs)),
+        )
         primal_abs_err = _tree_vdot(
             jax.tree_util.tree_map(lambda lhs, rhs: lhs - rhs, full_rhs, rhs),
             jax.tree_util.tree_map(lambda lhs, rhs: lhs - rhs, full_rhs, rhs),
@@ -3117,6 +3227,14 @@ def _run_realtime_geometry_support_pullback_probe(
         direct_rhs_geometry_duality = {
             "full_rhs_primal_l2_error_squared": float(jax.block_until_ready(primal_abs_err)),
             "directions": rows,
+            "lagged_response_build_geometry": {
+                "primal_l2_error_squared": float(response_primal_l2_error),
+                "jvp_dot_response_bar": float(generic_lhs),
+                "generic_geometry_vjp_dot_direction": float(generic_rhs),
+                "generic_abs_err": float(generic_abs_err),
+                "generic_rel_err": float(generic_rel_err),
+                "native": native_build_row,
+            },
         }
     support_summary = _payload_leaf_summary(support_payload)
     support_bar_summaries = {
@@ -3194,6 +3312,31 @@ def _run_realtime_geometry_support_pullback_probe(
                 f"rel_err={row['rel_err']:.6e} "
                 f"full_jvp_l2={row['full_rhs_geometry_jvp_l2']:.6e} "
                 f"fixed_flux_direct_jvp_l2={row['fixed_flux_direct_geometry_jvp_l2']:.6e}",
+                flush=True,
+            )
+        build_row = direct_rhs_geometry_duality["lagged_response_build_geometry"]
+        print(
+            "[autodiff-gate] support rebuild geometry duality: "
+            f"generic_lhs={build_row['jvp_dot_response_bar']:.6e} "
+            f"generic_rhs={build_row['generic_geometry_vjp_dot_direction']:.6e} "
+            f"generic_abs_err={build_row['generic_abs_err']:.6e} "
+            f"generic_rel_err={build_row['generic_rel_err']:.6e}",
+            flush=True,
+        )
+        native_row = build_row["native"]
+        if native_row["status"] == "checked":
+            print(
+                "[autodiff-gate] support native rebuild geometry duality: "
+                f"mode={native_row['active_rebuild_mode']} "
+                f"rhs={native_row['native_geometry_vjp_dot_direction']:.6e} "
+                f"abs_err={native_row['native_abs_err_vs_jvp']:.6e} "
+                f"rel_err={native_row['native_rel_err_vs_jvp']:.6e}",
+                flush=True,
+            )
+        else:
+            print(
+                "[autodiff-gate] support native rebuild geometry duality: "
+                f"{native_row['status']} mode={native_row['active_rebuild_mode']}",
                 flush=True,
             )
     outpath = _report_path("realtime_geometry_support_pullback")
