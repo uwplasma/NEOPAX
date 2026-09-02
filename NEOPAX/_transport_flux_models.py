@@ -1481,7 +1481,48 @@ class CombinedTransportFluxModel(TransportFluxModelBase):
         }
         if self.center_flux_mode == "direct":
             return out
-        return self._apply_center_flux_mode(out, self._canonical_face_fluxes(state))
+
+        # Keep the component face fluxes as well as the total face fluxes.
+        # The temperature equation uses (for example) ``Gamma_neo_faces`` to
+        # construct the convective heat flux.  Retaining only total
+        # ``Gamma_faces`` here made that equation fall back to the 51-point
+        # centre ``Gamma_neo`` while its temperature states were on 52 faces.
+        # The lagged path already preserves these keys; direct/black-box mode
+        # must expose the same representation.
+        face_state = build_face_transport_state(
+            state,
+            self.geometry,
+            bc_density=getattr(self.neoclassical_model, "bc_density", None),
+            bc_temperature=getattr(self.neoclassical_model, "bc_temperature", None),
+        )
+        raw_face_fluxes = self.evaluate_face_fluxes(state, face_state)
+        if raw_face_fluxes is None:
+            raise ValueError(
+                "center_flux_mode='interpolate_from_faces' requires all active "
+                "transport flux models to provide face fluxes."
+            )
+        face_fluxes = {
+            name: raw_face_fluxes[name]
+            for name in ("Gamma", "Q", "Upar")
+        }
+        out = self._apply_center_flux_mode(out, face_fluxes)
+        out.update({
+            name: value
+            for name, value in raw_face_fluxes.items()
+            if name.endswith("_faces")
+        })
+        # ``evaluate_face_fluxes`` historically returns direct model faces
+        # under the unsuffixed component names.  Give those component values
+        # an unambiguous face key in the public composite output.
+        for name in (
+            "Gamma_neo", "Q_neo", "Upar_neo",
+            "Gamma_turb", "Q_turb", "Upar_turb",
+            "Gamma_classical", "Q_classical", "Upar_classical",
+        ):
+            face_value = raw_face_fluxes.get(f"{name}_faces", raw_face_fluxes.get(name))
+            if face_value is not None:
+                out[f"{name}_faces"] = face_value
+        return out
 
     def pullback_direct_rhs_support_payload(self, state, flux_bar, support):
         """Return the neoclassical direct-support bar for a black-box RHS.

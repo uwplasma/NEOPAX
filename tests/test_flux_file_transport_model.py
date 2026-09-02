@@ -116,6 +116,10 @@ def test_combined_flux_model_applies_interpolate_from_faces_to_black_box_centres
 
     assert jnp.allclose(out["Gamma_faces"], expected_faces)
     assert jnp.allclose(out["Gamma"], expected_centres)
+    # Direct/black-box mode must retain component face keys too: pressure
+    # convection consumes Gamma_neo on the face grid when face fluxes are
+    # selected globally.
+    assert jnp.allclose(out["Gamma_neo_faces"], jnp.asarray([[1.0, 3.0, 5.0], [2.0, 4.0, 6.0]]))
 
 
 def test_combined_lagged_flux_model_applies_interpolate_from_faces_to_centres():

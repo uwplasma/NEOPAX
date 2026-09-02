@@ -49,6 +49,7 @@ from NEOPAX._reverse_ad_optimization import (  # noqa: E402
 from NEOPAX._reverse_ad_initial_er import (  # noqa: E402
     initial_er_charge_flux_residual_er_derivative,
     initial_er_charge_flux_residuals,
+    initial_er_selected_root_profile,
 )
 from NEOPAX._geometry_autodiff import (  # noqa: E402
     _implicit_params_with_boundary_deltas,
@@ -171,12 +172,18 @@ def _objectives_on_realtime_geometry_frozen_trace(
     initial_er_root_ad: str = "off",
     initial_er_root_fd_root_lane: str = "selected",
     baseline_er_profile=None,
+    baseline_finite_mask=None,
     baseline_residual=None,
     baseline_dres_der=None,
 ):
     root_lane = str(initial_er_root_fd_root_lane).strip().lower()
     if root_lane == "frozen_linearized":
-        if baseline_er_profile is None or baseline_residual is None or baseline_dres_der is None:
+        if (
+            baseline_er_profile is None
+            or baseline_finite_mask is None
+            or baseline_residual is None
+            or baseline_dres_der is None
+        ):
             raise ValueError("frozen-linearized full-transport initial-Er FD requires baseline root data.")
         state0 = _state_with_frozen_linearized_initial_er_root(
             runtime=runtime,
@@ -184,6 +191,7 @@ def _objectives_on_realtime_geometry_frozen_trace(
             profile_cfg=profile_cfg,
             profile_values=profile_values,
             baseline_er_profile=baseline_er_profile,
+            baseline_finite_mask=baseline_finite_mask,
             baseline_residual=baseline_residual,
             baseline_dres_der=baseline_dres_der,
         )
@@ -421,6 +429,7 @@ def _geometry_fd_objectives(
     initial_er_root_ad: str = "off",
     initial_er_root_fd_root_lane: str = "selected",
     baseline_er_profile=None,
+    baseline_finite_mask=None,
     baseline_residual=None,
     baseline_dres_der=None,
 ):
@@ -447,6 +456,7 @@ def _geometry_fd_objectives(
         initial_er_root_ad=initial_er_root_ad,
         initial_er_root_fd_root_lane=initial_er_root_fd_root_lane,
         baseline_er_profile=baseline_er_profile,
+        baseline_finite_mask=baseline_finite_mask,
         baseline_residual=baseline_residual,
         baseline_dres_der=baseline_dres_der,
     )
@@ -488,6 +498,7 @@ def _initial_er_root_only_frozen_linearized_objectives(
     profile_values,
     objective_names: tuple[str, ...],
     baseline_er_profile,
+    baseline_finite_mask,
     baseline_residual,
     baseline_dres_der,
 ):
@@ -510,7 +521,17 @@ def _initial_er_root_only_frozen_linearized_objectives(
         jnp.asarray(baseline_dres_der, dtype=residual_delta.dtype),
         jnp.inf,
     )
-    er_profile = jnp.asarray(baseline_er_profile, dtype=pre_root_state.Er.dtype) - residual_delta / safe_dres_der
+    # Match the selected-root custom VJP exactly.  At a radius without a
+    # finite selected root, the primal falls back to the incoming Er and its
+    # custom derivative is deliberately zero.  Applying the implicit update
+    # there was an FD-only continuation through a non-root, which becomes
+    # material for the mixed evolved/fixed-species wHe case.
+    baseline_er = jnp.asarray(baseline_er_profile, dtype=pre_root_state.Er.dtype)
+    er_profile = jnp.where(
+        jnp.asarray(baseline_finite_mask, dtype=bool),
+        baseline_er - residual_delta / safe_dres_der,
+        baseline_er,
+    )
     rooted_state = dataclasses.replace(pre_root_state, Er=er_profile)
     return _initial_er_root_only_objective_values(rooted_state, runtime, objective_names), rooted_state
 
@@ -522,6 +543,7 @@ def _state_with_frozen_linearized_initial_er_root(
     profile_cfg: dict[str, Any],
     profile_values,
     baseline_er_profile,
+    baseline_finite_mask,
     baseline_residual,
     baseline_dres_der,
 ):
@@ -543,7 +565,15 @@ def _state_with_frozen_linearized_initial_er_root(
         jnp.asarray(baseline_dres_der, dtype=residual_delta.dtype),
         jnp.inf,
     )
-    er_profile = jnp.asarray(baseline_er_profile, dtype=pre_root_state.Er.dtype) - residual_delta / safe_dres_der
+    # See the corresponding root-only helper: this must retain the selected
+    # root's fallback values at non-finite-root radii, just as the reverse
+    # custom VJP does.
+    baseline_er = jnp.asarray(baseline_er_profile, dtype=pre_root_state.Er.dtype)
+    er_profile = jnp.where(
+        jnp.asarray(baseline_finite_mask, dtype=bool),
+        baseline_er - residual_delta / safe_dres_der,
+        baseline_er,
+    )
     return dataclasses.replace(pre_root_state, Er=er_profile)
 
 
@@ -866,6 +896,11 @@ def main() -> None:
                 profile_cfg=profile_cfg,
             )
             baseline_er_profile = jnp.asarray(baseline_rooted_state.Er, dtype=baseline_pre_root_state.Er.dtype)
+            _selected_er_profile, baseline_finite_mask = initial_er_selected_root_profile(
+                baseline_pre_root_state,
+                config=config,
+                runtime=baseline_runtime,
+            )
             baseline_residual = initial_er_charge_flux_residuals(
                 baseline_pre_root_state,
                 baseline_er_profile,
@@ -889,6 +924,7 @@ def main() -> None:
                 profile_values=minus_profile_values,
                 objective_names=objective_names,
                 baseline_er_profile=baseline_er_profile,
+                baseline_finite_mask=baseline_finite_mask,
                 baseline_residual=baseline_residual,
                 baseline_dres_der=baseline_dres_der,
             )
@@ -913,6 +949,7 @@ def main() -> None:
                 profile_values=plus_profile_values,
                 objective_names=objective_names,
                 baseline_er_profile=baseline_er_profile,
+                baseline_finite_mask=baseline_finite_mask,
                 baseline_residual=baseline_residual,
                 baseline_dres_der=baseline_dres_der,
             )
@@ -1020,6 +1057,7 @@ def main() -> None:
             "requires --initial-Er-root-ad jax_selected_root."
         )
     baseline_er_profile = None
+    baseline_finite_mask = None
     baseline_residual = None
     baseline_dres_der = None
     if full_root_fd_lane == "frozen_linearized":
@@ -1036,6 +1074,11 @@ def main() -> None:
             profile_cfg=profile_cfg,
         )
         baseline_er_profile = jnp.asarray(baseline_profile_state.Er, dtype=baseline_pre_root_state.Er.dtype)
+        _selected_er_profile, baseline_finite_mask = initial_er_selected_root_profile(
+            baseline_pre_root_state,
+            config=config,
+            runtime=baseline_runtime,
+        )
         baseline_residual = initial_er_charge_flux_residuals(
             baseline_pre_root_state,
             baseline_er_profile,
@@ -1083,6 +1126,7 @@ def main() -> None:
             initial_er_root_ad=initial_er_root_ad,
             initial_er_root_fd_root_lane=full_root_fd_lane,
             baseline_er_profile=baseline_er_profile,
+            baseline_finite_mask=baseline_finite_mask,
             baseline_residual=baseline_residual,
             baseline_dres_der=baseline_dres_der,
         )
@@ -1101,6 +1145,7 @@ def main() -> None:
             initial_er_root_ad=initial_er_root_ad,
             initial_er_root_fd_root_lane=full_root_fd_lane,
             baseline_er_profile=baseline_er_profile,
+            baseline_finite_mask=baseline_finite_mask,
             baseline_residual=baseline_residual,
             baseline_dres_der=baseline_dres_der,
         )
@@ -1134,6 +1179,7 @@ def main() -> None:
             initial_er_root_ad=initial_er_root_ad,
             initial_er_root_fd_root_lane=full_root_fd_lane,
             baseline_er_profile=baseline_er_profile,
+            baseline_finite_mask=baseline_finite_mask,
             baseline_residual=baseline_residual,
             baseline_dres_der=baseline_dres_der,
         )
@@ -1176,6 +1222,7 @@ def main() -> None:
             initial_er_root_ad=initial_er_root_ad,
             initial_er_root_fd_root_lane=full_root_fd_lane,
             baseline_er_profile=baseline_er_profile,
+            baseline_finite_mask=baseline_finite_mask,
             baseline_residual=baseline_residual,
             baseline_dres_der=baseline_dres_der,
         )
@@ -1222,6 +1269,7 @@ def main() -> None:
                 initial_er_root_ad=initial_er_root_ad,
                 initial_er_root_fd_root_lane=full_root_fd_lane,
                 baseline_er_profile=baseline_er_profile,
+                baseline_finite_mask=baseline_finite_mask,
                 baseline_residual=baseline_residual,
                 baseline_dres_der=baseline_dres_der,
             )
@@ -1236,6 +1284,7 @@ def main() -> None:
                 initial_er_root_ad=initial_er_root_ad,
                 initial_er_root_fd_root_lane=full_root_fd_lane,
                 baseline_er_profile=baseline_er_profile,
+                baseline_finite_mask=baseline_finite_mask,
                 baseline_residual=baseline_residual,
                 baseline_dres_der=baseline_dres_der,
             )
@@ -1250,6 +1299,7 @@ def main() -> None:
                 initial_er_root_ad=initial_er_root_ad,
                 initial_er_root_fd_root_lane=full_root_fd_lane,
                 baseline_er_profile=baseline_er_profile,
+                baseline_finite_mask=baseline_finite_mask,
                 baseline_residual=baseline_residual,
                 baseline_dres_der=baseline_dres_der,
             )
@@ -1264,6 +1314,7 @@ def main() -> None:
                 initial_er_root_ad=initial_er_root_ad,
                 initial_er_root_fd_root_lane=full_root_fd_lane,
                 baseline_er_profile=baseline_er_profile,
+                baseline_finite_mask=baseline_finite_mask,
                 baseline_residual=baseline_residual,
                 baseline_dres_der=baseline_dres_der,
             )
