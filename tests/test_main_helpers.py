@@ -52,6 +52,7 @@ from NEOPAX._transport_flux_models import (
     NTXDatabaseTransportModel,
     NTXExactLijRuntimeTransportModel,
     NTXExactLijRuntimeSupport,
+    NTXQuadraticPreparedCoefficientResponse,
     NTXRuntimeScanChannels,
     NTXRuntimeScanTransportModel,
     _sanitize_float_delta_bar_tree,
@@ -206,6 +207,70 @@ def test_ntx_exact_runtime_lagged_face_response_matches_reference_and_finite_dif
             finite_difference[name],
             rtol=2.0e-2,
             atol=1.0e-8,
+        )
+
+
+@pytest.mark.parametrize("response_anchor_count", (2, 3))
+def test_ntx_exact_runtime_quadratic_lagged_response_matches_live_reference(response_anchor_count):
+    """Quadratic realtime payloads work for reduced and full radial layouts."""
+    geometry = types.SimpleNamespace(
+        a_b=1.0,
+        r_grid=jnp.asarray([0.3, 0.7]),
+        r_grid_half=jnp.asarray([0.1, 0.5, 0.9]),
+    )
+    species = Species(
+        number_species=2,
+        species_indices=jnp.asarray([0, 1]),
+        mass_mp=jnp.asarray([5.446e-4, 2.0]),
+        charge_qp=jnp.asarray([-1.0, 1.0]),
+        names=("e", "D"),
+    )
+    energy_grid = types.SimpleNamespace(
+        xWeights=jnp.asarray([0.2, 0.3, 0.5]),
+        L11_weight=jnp.asarray([1.0, 0.8, 1.2]),
+        L12_weight=jnp.asarray([0.1, -0.2, 0.3]),
+        L22_weight=jnp.asarray([0.9, 1.1, 0.7]),
+        L13_weight=jnp.asarray([0.4, 0.5, 0.6]),
+        L23_weight=jnp.asarray([-0.3, 0.2, 0.1]),
+        L33_weight=jnp.asarray([1.3, 0.6, 0.9]),
+        v_norm=jnp.asarray([1.7, 1.8, 1.9]),
+    )
+    prepared = prepare_monoenergetic_system(example_surface(), GridSpec(3, 3, 2))
+    support = NTXExactLijRuntimeSupport(
+        center_channels=_tiny_ntx_runtime_channels(geometry.r_grid),
+        face_channels=_tiny_ntx_runtime_channels(geometry.r_grid_half),
+        center_prepared=_repeat_ntx_prepared(prepared, 2),
+        face_prepared=_repeat_ntx_prepared(prepared, 3),
+        grid=GridSpec(3, 3, 2),
+    )
+    model = NTXExactLijRuntimeTransportModel(
+        species=species,
+        energy_grid=energy_grid,
+        geometry=geometry,
+        vmec_file=None,
+        boozer_file=None,
+        support=support,
+        center_response_mode="interpolate_from_faces",
+        response_anchor_count=response_anchor_count,
+        lagged_response_taylor_order=2,
+    )
+    state = TransportState(
+        density=jnp.asarray([[1.0, 1.15], [1.0, 1.15]]),
+        pressure=jnp.asarray([[1.3, 1.61], [1.1, 1.38]]),
+        Er=jnp.asarray([2.0e-4, 2.5e-4]),
+    )
+    response = model.build_lagged_response(state)
+    assert isinstance(response.face_response, NTXQuadraticPreparedCoefficientResponse)
+    assert response.center_response is None
+    with pytest.raises(NotImplementedError, match="linear-response reverse-replay"):
+        model.build_lagged_response_with_compact_coefficient_record(state)
+
+    faces = build_face_transport_state(state, geometry)
+    direct = model.evaluate_face_fluxes(state, faces)
+    lagged = model.evaluate_with_lagged_response(state, response)
+    for name in ("Gamma", "Q", "Upar"):
+        assert jnp.allclose(
+            lagged[f"{name}_faces"], direct[name], rtol=3.0e-6, atol=1.0e-12
         )
 
 

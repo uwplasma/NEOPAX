@@ -2815,7 +2815,10 @@ def _run_realtime_geometry_support_pullback_probe(
         )
         support_bars[f"rhs_{component_name}"] = jax.block_until_ready(support_bar_value)
 
-    if bool(args.support_pullback_probe_include_build):
+    support_build_directional_duality = bool(
+        getattr(args, "support_pullback_probe_build_directional_duality", False)
+    )
+    if bool(args.support_pullback_probe_include_build) or support_build_directional_duality:
         lagged_response_bar = jax.tree_util.tree_map(
             lambda leaf: (
                 jnp.ones_like(leaf)
@@ -2831,6 +2834,148 @@ def _run_realtime_geometry_support_pullback_probe(
                 support_payload,
             )
         )
+
+    build_directional_duality = None
+    if support_build_directional_duality:
+        # This is deliberately a support-space check.  In particular, it does
+        # not trace VMEC -> Boozer -> support, so it exercises the live
+        # four-species lagged-response rule without creating the large
+        # payload-to-VMEC raw-block VJP used by geometry diagnostics.
+        working_state, _electron_index = equation_system._prepare_working_state(
+            baseline_profile_state
+        )
+        shared_flux_model = equation_system.shared_flux_model
+        if shared_flux_model is None or not callable(
+            getattr(shared_flux_model, "with_support_payload", None)
+        ):
+            raise RuntimeError(
+                "support build directional duality requires a shared flux model "
+                "with an explicit NTX support payload."
+            )
+        flux_response_bar = lagged_response_bar.flux_response
+        if flux_response_bar is None:
+            raise RuntimeError(
+                "support build directional duality requires a lagged flux-response bar."
+            )
+
+        def _response_from_support(support_value):
+            return shared_flux_model.with_support_payload(support_value).build_lagged_response(
+                working_state,
+                **equation_system._shared_flux_bc_kwargs(),
+            )
+
+        def _floating_tree_vdot(left, right):
+            terms = []
+            for left_leaf, right_leaf in zip(
+                jax.tree_util.tree_leaves(left),
+                jax.tree_util.tree_leaves(right),
+                strict=True,
+            ):
+                left_value = jnp.asarray(left_leaf)
+                right_value = jnp.asarray(right_leaf)
+                if (
+                    jnp.issubdtype(left_value.dtype, jnp.inexact)
+                    and jnp.issubdtype(right_value.dtype, jnp.inexact)
+                ):
+                    terms.append(jnp.vdot(left_value, right_value))
+            return (
+                jnp.asarray(0.0, dtype=jnp.float64)
+                if not terms
+                else sum(terms)
+            )
+
+        def _floating_tree_l2_difference(left, right):
+            terms = []
+            for left_leaf, right_leaf in zip(
+                jax.tree_util.tree_leaves(left),
+                jax.tree_util.tree_leaves(right),
+                strict=True,
+            ):
+                left_value = jnp.asarray(left_leaf)
+                right_value = jnp.asarray(right_leaf)
+                if (
+                    jnp.issubdtype(left_value.dtype, jnp.inexact)
+                    and jnp.issubdtype(right_value.dtype, jnp.inexact)
+                ):
+                    difference = left_value - right_value
+                    terms.append(jnp.vdot(difference, difference))
+            return jnp.sqrt(
+                jnp.asarray(0.0, dtype=jnp.float64)
+                if not terms
+                else sum(terms)
+            )
+
+        payload_paths, payload_treedef = jax.tree_util.tree_flatten_with_path(
+            support_payload
+        )
+
+        def _direction_for_path(path, leaf, *, drds_only: bool):
+            value = jnp.asarray(leaf)
+            path_text = "/".join(str(entry) for entry in path).lower()
+            active = not drds_only or "drds" in path_text
+            if active and jnp.issubdtype(value.dtype, jnp.inexact):
+                # Unit-norm per active leaf makes the reported scalar stable
+                # while avoiding a preference for one support-array size.
+                size = max(int(value.size), 1)
+                return jnp.ones_like(value) / jnp.sqrt(
+                    jnp.asarray(size, dtype=value.real.dtype)
+                )
+            return jnp.zeros_like(value, dtype=jax.dtypes.float0)
+
+        directions = {
+            "all_floating_support": payload_treedef.unflatten(
+                tuple(
+                    _direction_for_path(path, leaf, drds_only=False)
+                    for path, leaf in payload_paths
+                )
+            ),
+            "drds_only": payload_treedef.unflatten(
+                tuple(
+                    _direction_for_path(path, leaf, drds_only=True)
+                    for path, leaf in payload_paths
+                )
+            ),
+        }
+        active_drds_leaves = sum(
+            int("drds" in "/".join(str(entry) for entry in path).lower())
+            for path, _leaf in payload_paths
+        )
+        directional_rows = {}
+        primal_abs_err = None
+        for direction_name, support_direction in directions.items():
+            response_primal, response_tangent = jax.jvp(
+                _response_from_support,
+                (support_payload,),
+                (support_direction,),
+            )
+            if primal_abs_err is None:
+                primal_abs_err = _floating_tree_l2_difference(
+                    response_primal,
+                    lagged_response.flux_response,
+                )
+            lhs = _floating_tree_vdot(flux_response_bar, response_tangent)
+            rhs = _floating_tree_vdot(
+                support_bars["build_lagged_response"],
+                support_direction,
+            )
+            lhs, rhs = jax.block_until_ready((lhs, rhs))
+            abs_err = jnp.abs(lhs - rhs)
+            rel_err = abs_err / jnp.maximum(
+                jnp.asarray(1.0e-30, dtype=abs_err.dtype),
+                jnp.maximum(jnp.abs(lhs), jnp.abs(rhs)),
+            )
+            directional_rows[direction_name] = {
+                "lhs_response_bar_dot_support_jvp": float(lhs),
+                "rhs_support_bar_dot_direction": float(rhs),
+                "abs_err": float(abs_err),
+                "rel_err": float(rel_err),
+            }
+        primal_abs_err = jax.block_until_ready(primal_abs_err)
+        build_directional_duality = {
+            "primal_response_abs_err": float(primal_abs_err),
+            "active_drds_leaves": int(active_drds_leaves),
+            "directions": directional_rows,
+        }
     support_summary = _payload_leaf_summary(support_payload)
     support_bar_summaries = {
         name: _payload_leaf_summary(support_bar)
@@ -2856,6 +3001,7 @@ def _run_realtime_geometry_support_pullback_probe(
         "support_bar_summary": support_bar_summaries,
         "support_bar_l2": support_bar_l2,
         "support_pullback_probe_include_build": bool(args.support_pullback_probe_include_build),
+        "support_pullback_probe_build_directional_duality": build_directional_duality,
     }
     print(
         "[autodiff-gate] mode=transport_reverse_ad_only "
@@ -2872,6 +3018,23 @@ def _run_realtime_geometry_support_pullback_probe(
             f"all_finite={summary['all_floating_leaves_finite']}",
             flush=True,
         )
+    if build_directional_duality is not None:
+        print(
+            "[autodiff-gate] support build directional primal consistency: "
+            f"response_abs_err={build_directional_duality['primal_response_abs_err']:.6e} "
+            f"active_drds_leaves={build_directional_duality['active_drds_leaves']}",
+            flush=True,
+        )
+        for direction_name, row in build_directional_duality["directions"].items():
+            print(
+                "[autodiff-gate] support build directional duality: "
+                f"direction={direction_name} "
+                f"lhs={row['lhs_response_bar_dot_support_jvp']:.6e} "
+                f"rhs={row['rhs_support_bar_dot_direction']:.6e} "
+                f"abs_err={row['abs_err']:.6e} "
+                f"rel_err={row['rel_err']:.6e}",
+                flush=True,
+            )
     outpath = _report_path("realtime_geometry_support_pullback")
     outpath.write_text(json.dumps(report, indent=2))
     print(f"Wrote {outpath.relative_to(ROOT)}")
@@ -5284,6 +5447,16 @@ def main() -> None:
             "least-squares API through the direct JAX table-result builder and then "
             "exit. This uses the same validated grouped reverse runner but does not "
             "write the normal benchmark report."
+        ),
+    )
+    parser.add_argument(
+        "--support-pullback-probe-build-directional-duality",
+        action="store_true",
+        help=(
+            "Only for --realtime-geometry-gradient-path support_pullback_probe. "
+            "Compare the compact lagged-response support pullback against one "
+            "live support-space JVP by VJP/JVP duality. This does not invoke "
+            "the VMEC/Boozer payload-to-parameter pullback."
         ),
     )
     parser.add_argument(

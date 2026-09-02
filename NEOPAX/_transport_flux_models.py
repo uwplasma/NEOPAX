@@ -172,6 +172,21 @@ def _debug_lagged_response_if_nonfinite(prefix, response):
                 ("reference_epsi_hat", response.reference_epsi_hat),
             ),
         )
+        return
+    if isinstance(response, NTXQuadraticPreparedCoefficientResponse):
+        _debug_arrays_if_any_nonfinite(
+            prefix,
+            (
+                ("reference_transport_moments", response.reference_transport_moments),
+                ("reference_nu_hat", response.reference_nu_hat),
+                ("reference_epsi_hat", response.reference_epsi_hat),
+                ("dtransport_moments_d_nu_hat", response.dtransport_moments_d_nu_hat),
+                ("dtransport_moments_d_epsi_hat", response.dtransport_moments_d_epsi_hat),
+                ("d2transport_moments_d_nu_hat2", response.d2transport_moments_d_nu_hat2),
+                ("d2transport_moments_d_nu_hat_d_epsi_hat", response.d2transport_moments_d_nu_hat_d_epsi_hat),
+                ("d2transport_moments_d_epsi_hat2", response.d2transport_moments_d_epsi_hat2),
+            ),
+        )
 
 
 def compute_total_power_mw(state, species, pressure_source_model, geometry, fallback_mw=3.0):
@@ -414,6 +429,21 @@ class NTXPreparedCoefficientResponse:
     reference_transport_moments: jax.Array
     reference_nu_hat: jax.Array
     reference_epsi_hat: jax.Array
+
+
+@jax.tree_util.register_dataclass
+@dataclasses.dataclass(frozen=True, eq=False)
+class NTXQuadraticPreparedCoefficientResponse:
+    """Full-radius realtime NTX moment Taylor data in native NTX coordinates."""
+
+    reference_transport_moments: jax.Array
+    reference_nu_hat: jax.Array
+    reference_epsi_hat: jax.Array
+    dtransport_moments_d_nu_hat: jax.Array
+    dtransport_moments_d_epsi_hat: jax.Array
+    d2transport_moments_d_nu_hat2: jax.Array
+    d2transport_moments_d_nu_hat_d_epsi_hat: jax.Array
+    d2transport_moments_d_epsi_hat2: jax.Array
 
 
 @jax.tree_util.register_dataclass
@@ -4517,6 +4547,121 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             reference_transport_moments=reference_transport_moments,
             reference_nu_hat=ref_nu_hat,
             reference_epsi_hat=ref_epsi_hat,
+        )
+
+    def _build_quadratic_coefficient_response_local(
+        self,
+        prepared,
+        *,
+        drds_value,
+        species_index: int,
+        er_value,
+        temperature_local,
+        density_local,
+        vthermal_local,
+        collisionality_kind,
+    ):
+        """Build a full-radius local quadratic moment response.
+
+        The NTX coefficient value/gradient/Hessian is supplied by the
+        dedicated factorized primitive.  The small JVPs below differentiate
+        only the inexpensive coefficient-to-moment reduction (including its
+        D11 floor), never an NTX solve or a custom-VJP rule.
+        """
+        ref_nu_hat, ref_epsi_hat, _ = self._local_scan_inputs(
+            drds_value=drds_value,
+            species_index=species_index,
+            er_value=er_value,
+            temperature_local=temperature_local,
+            density_local=density_local,
+            vthermal_local=vthermal_local,
+            collisionality_kind=collisionality_kind,
+        )
+        ntx = _import_ntx()
+
+        def _one_energy(nu_hat_value, epsi_hat_value):
+            return ntx.solve_prepared_coefficient_vector_hessian_factorized(
+                prepared,
+                ntx.MonoenergeticCase(
+                    nu_hat=nu_hat_value,
+                    epsi_hat=epsi_hat_value,
+                ),
+            )
+
+        (
+            coefficient_base,
+            coefficient_nu,
+            coefficient_epsi,
+            coefficient_nunu,
+            coefficient_nuepsi,
+            coefficient_epsiepsi,
+        ) = jax.vmap(_one_energy)(ref_nu_hat, ref_epsi_hat)
+
+        def _moments(nu_delta, epsi_delta):
+            coefficients = (
+                coefficient_base
+                + coefficient_nu * nu_delta
+                + coefficient_epsi * epsi_delta
+                + 0.5
+                * (
+                    coefficient_nunu * nu_delta**2
+                    + 2.0 * coefficient_nuepsi * nu_delta * epsi_delta
+                    + coefficient_epsiepsi * epsi_delta**2
+                )
+            )
+            return self._transport_moments_from_coefficient_scan(
+                coefficients,
+                drds_value=drds_value,
+            )
+
+        zero = jnp.asarray(0.0, dtype=ref_nu_hat.dtype)
+        one = jnp.asarray(1.0, dtype=ref_nu_hat.dtype)
+        reference_transport_moments, dtransport_moments_d_nu_hat = jax.jvp(
+            lambda delta: _moments(delta, zero),
+            (zero,),
+            (one,),
+        )
+        _, dtransport_moments_d_epsi_hat = jax.jvp(
+            lambda delta: _moments(zero, delta),
+            (zero,),
+            (one,),
+        )
+        _, d2transport_moments_d_nu_hat2 = jax.jvp(
+            lambda delta: jax.jvp(
+                lambda inner: _moments(inner, zero),
+                (delta,),
+                (one,),
+            )[1],
+            (zero,),
+            (one,),
+        )
+        _, d2transport_moments_d_nu_hat_d_epsi_hat = jax.jvp(
+            lambda delta: jax.jvp(
+                lambda inner: _moments(inner, delta),
+                (zero,),
+                (one,),
+            )[1],
+            (zero,),
+            (one,),
+        )
+        _, d2transport_moments_d_epsi_hat2 = jax.jvp(
+            lambda delta: jax.jvp(
+                lambda inner: _moments(zero, inner),
+                (delta,),
+                (one,),
+            )[1],
+            (zero,),
+            (one,),
+        )
+        return NTXQuadraticPreparedCoefficientResponse(
+            reference_transport_moments=reference_transport_moments,
+            reference_nu_hat=ref_nu_hat,
+            reference_epsi_hat=ref_epsi_hat,
+            dtransport_moments_d_nu_hat=dtransport_moments_d_nu_hat,
+            dtransport_moments_d_epsi_hat=dtransport_moments_d_epsi_hat,
+            d2transport_moments_d_nu_hat2=d2transport_moments_d_nu_hat2,
+            d2transport_moments_d_nu_hat_d_epsi_hat=d2transport_moments_d_nu_hat_d_epsi_hat,
+            d2transport_moments_d_epsi_hat2=d2transport_moments_d_epsi_hat2,
         )
 
     def _interpolated_moment_local_scan_primitives(
@@ -10034,6 +10179,62 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         if int(anchor_indices.shape[0]) < n_radius:
             target_rho = jnp.asarray(channels.rho, dtype=jnp.float64)
 
+            if int(self.lagged_response_taylor_order) == 2:
+                def _per_quadratic_anchor(radius_index):
+                    prepared = jax.tree_util.tree_map(
+                        lambda arr: jax.lax.dynamic_index_in_dim(arr, radius_index, axis=0, keepdims=False),
+                        prepared_all,
+                    )
+                    drds_value = jax.lax.dynamic_index_in_dim(channels.drds, radius_index, axis=0, keepdims=False)
+                    er_value = jax.lax.dynamic_index_in_dim(Er, radius_index, axis=0, keepdims=False)
+                    temperature_local = jax.lax.dynamic_index_in_dim(temperature, radius_index, axis=1, keepdims=False)
+                    density_local = jax.lax.dynamic_index_in_dim(density, radius_index, axis=1, keepdims=False)
+                    vthermal_local = jax.lax.dynamic_index_in_dim(v_thermal, radius_index, axis=1, keepdims=False)
+                    return jax.vmap(
+                        lambda species_index: self._build_quadratic_coefficient_response_local(
+                            prepared,
+                            drds_value=drds_value,
+                            species_index=species_index,
+                            er_value=er_value,
+                            temperature_local=temperature_local,
+                            density_local=density_local,
+                            vthermal_local=vthermal_local,
+                            collisionality_kind=collisionality_kind,
+                        )
+                    )(species_indices)
+
+                anchor_response = self._map_radius_axis_regularized_at_axis0(
+                    _per_quadratic_anchor,
+                    anchor_indices,
+                    jnp.asarray(radius_coordinates, dtype=jnp.float64)[anchor_indices],
+                )
+                return NTXQuadraticPreparedCoefficientResponse(
+                    reference_transport_moments=self._interpolate_anchor_values(
+                        anchor_indices, anchor_response.reference_transport_moments, target_rho
+                    ),
+                    reference_nu_hat=self._interpolate_anchor_values(
+                        anchor_indices, anchor_response.reference_nu_hat, target_rho
+                    ),
+                    reference_epsi_hat=self._interpolate_anchor_values(
+                        anchor_indices, anchor_response.reference_epsi_hat, target_rho
+                    ),
+                    dtransport_moments_d_nu_hat=self._interpolate_anchor_values(
+                        anchor_indices, anchor_response.dtransport_moments_d_nu_hat, target_rho
+                    ),
+                    dtransport_moments_d_epsi_hat=self._interpolate_anchor_values(
+                        anchor_indices, anchor_response.dtransport_moments_d_epsi_hat, target_rho
+                    ),
+                    d2transport_moments_d_nu_hat2=self._interpolate_anchor_values(
+                        anchor_indices, anchor_response.d2transport_moments_d_nu_hat2, target_rho
+                    ),
+                    d2transport_moments_d_nu_hat_d_epsi_hat=self._interpolate_anchor_values(
+                        anchor_indices, anchor_response.d2transport_moments_d_nu_hat_d_epsi_hat, target_rho
+                    ),
+                    d2transport_moments_d_epsi_hat2=self._interpolate_anchor_values(
+                        anchor_indices, anchor_response.d2transport_moments_d_epsi_hat2, target_rho
+                    ),
+                )
+
             def _per_anchor(radius_index):
                 prepared = jax.tree_util.tree_map(
                     lambda arr: jax.lax.dynamic_index_in_dim(arr, radius_index, axis=0, keepdims=False),
@@ -10084,8 +10285,13 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             temperature_local = jax.lax.dynamic_index_in_dim(temperature, radius_index, axis=1, keepdims=False)
             density_local = jax.lax.dynamic_index_in_dim(density, radius_index, axis=1, keepdims=False)
             vthermal_local = jax.lax.dynamic_index_in_dim(v_thermal, radius_index, axis=1, keepdims=False)
+            build_local_response = (
+                self._build_quadratic_coefficient_response_local
+                if int(self.lagged_response_taylor_order) == 2
+                else self._build_coefficient_response_local
+            )
             return jax.vmap(
-                lambda species_index: self._build_coefficient_response_local(
+                lambda species_index: build_local_response(
                     prepared,
                     drds_value=drds_value,
                     species_index=species_index,
@@ -10213,6 +10419,11 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         normal rollout or established reverse benchmark gains a new carry leaf.
         """
 
+        if int(self.lagged_response_taylor_order) == 2:
+            raise NotImplementedError(
+                "Compact coefficient records are a linear-response reverse-replay "
+                "optimization and do not support quadratic realtime NTX responses."
+            )
         if self._resolved_center_response_mode() != "interpolate_from_faces":
             raise NotImplementedError(
                 "compact coefficient records currently require center_response_mode="
@@ -10259,6 +10470,11 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         keeping the record out of the regular carry.
         """
 
+        if int(self.lagged_response_taylor_order) == 2:
+            raise NotImplementedError(
+                "Compact coefficient records are a linear-response reverse-replay "
+                "optimization and do not support quadratic realtime NTX responses."
+            )
         if self._resolved_center_response_mode() != "interpolate_from_faces":
             raise NotImplementedError(
                 "compact coefficient records currently require center_response_mode="
@@ -10281,12 +10497,6 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
 
     def build_lagged_response(self, state, **kwargs):
         del kwargs
-        if int(self.lagged_response_taylor_order) == 2:
-            raise NotImplementedError(
-                "Quadratic realtime NTX Lij responses require the dedicated "
-                "factorized Hessian primitive, which is not available yet. "
-                "Use lagged_response_taylor_order=1 until that implementation lands."
-            )
         if lagged_timing_enabled():
             jax.debug.callback(lambda: lagged_timing_start("ntx.build_lagged_response"), ordered=True)
         density = safe_density(state.density, self.density_floor)
@@ -10346,6 +10556,11 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         )
 
     def pullback_build_lagged_response(self, state, lagged_response_bar, **kwargs):
+        if int(self.lagged_response_taylor_order) == 2:
+            raise NotImplementedError(
+                "Reverse AD for quadratic realtime NTX Lij responses requires "
+                "third local NTX derivatives and is not implemented."
+            )
         reverse_stage_cotangent_mode = str(kwargs.pop("reverse_stage_cotangent_mode", "full")).strip().lower()
         reverse_segment_profile_annotations = bool(
             kwargs.pop("reverse_segment_profile_annotations", False)
@@ -13708,6 +13923,86 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                     ),
                 )
                 return lij_axis
+
+            if isinstance(response, NTXQuadraticPreparedCoefficientResponse):
+                radius_indices_axis = jnp.arange(Er_axis.shape[0], dtype=jnp.int32)
+
+                def _quadratic_transport_moments_per_radius(radius_index):
+                    drds_value = jax.lax.dynamic_index_in_dim(
+                        channels.drds, radius_index, axis=0, keepdims=False
+                    )
+                    er_value = jax.lax.dynamic_index_in_dim(
+                        Er_axis, radius_index, axis=0, keepdims=False
+                    )
+                    temperature_local = jax.lax.dynamic_index_in_dim(
+                        temperature_axis, radius_index, axis=1, keepdims=False
+                    )
+                    density_local = jax.lax.dynamic_index_in_dim(
+                        density_axis, radius_index, axis=1, keepdims=False
+                    )
+                    vthermal_local = jax.lax.dynamic_index_in_dim(
+                        v_thermal_axis, radius_index, axis=1, keepdims=False
+                    )
+                    current_nu_hat, current_epsi_hat = jax.vmap(
+                        lambda species_index: self._local_scan_inputs(
+                            drds_value=drds_value,
+                            species_index=species_index,
+                            er_value=er_value,
+                            temperature_local=temperature_local,
+                            density_local=density_local,
+                            vthermal_local=vthermal_local,
+                            collisionality_kind=collisionality_kind,
+                        )[:2]
+                    )(species_indices)
+                    reference_nu_hat = jax.lax.dynamic_index_in_dim(
+                        response.reference_nu_hat, radius_index, axis=0, keepdims=False
+                    )
+                    reference_epsi_hat = jax.lax.dynamic_index_in_dim(
+                        response.reference_epsi_hat, radius_index, axis=0, keepdims=False
+                    )
+                    delta_nu_hat = current_nu_hat - reference_nu_hat
+                    delta_epsi_hat = current_epsi_hat - reference_epsi_hat
+                    reference_moments = jax.lax.dynamic_index_in_dim(
+                        response.reference_transport_moments, radius_index, axis=0, keepdims=False
+                    )
+                    return (
+                        reference_moments
+                        + jax.lax.dynamic_index_in_dim(
+                            response.dtransport_moments_d_nu_hat, radius_index, axis=0, keepdims=False
+                        ) * delta_nu_hat[:, None]
+                        + jax.lax.dynamic_index_in_dim(
+                            response.dtransport_moments_d_epsi_hat, radius_index, axis=0, keepdims=False
+                        ) * delta_epsi_hat[:, None]
+                        + 0.5
+                        * (
+                            jax.lax.dynamic_index_in_dim(
+                                response.d2transport_moments_d_nu_hat2, radius_index, axis=0, keepdims=False
+                            ) * delta_nu_hat[:, None] ** 2
+                            + 2.0
+                            * jax.lax.dynamic_index_in_dim(
+                                response.d2transport_moments_d_nu_hat_d_epsi_hat, radius_index, axis=0, keepdims=False
+                            )
+                            * delta_nu_hat[:, None]
+                            * delta_epsi_hat[:, None]
+                            + jax.lax.dynamic_index_in_dim(
+                                response.d2transport_moments_d_epsi_hat2, radius_index, axis=0, keepdims=False
+                            ) * delta_epsi_hat[:, None] ** 2
+                        )
+                    )
+
+                transport_moments = jnp.swapaxes(
+                    self._map_radius_axis_regularized_at_axis0(
+                        _quadratic_transport_moments_per_radius,
+                        radius_indices_axis,
+                        radius_coordinates,
+                    ),
+                    0,
+                    1,
+                )
+                return self._batched_lij_from_transport_moments(
+                    transport_moments,
+                    v_thermal_axis,
+                )
 
             radius_indices_axis = jnp.arange(Er_axis.shape[0], dtype=jnp.int32)
 
