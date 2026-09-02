@@ -1165,6 +1165,80 @@ def test_radau_controller_holds_dt_after_a_very_difficult_accepted_step():
     assert float(info.growth) == pytest.approx(1.0)
 
 
+def test_radau_discounted_newton_bracket_avoids_immediate_regrowth_to_failed_dt():
+    """A successful small retry must probe below, not jump past, a Newton failure."""
+
+    args = _radau_controller_arguments(
+        newton_iter_count=3,
+        controller_mode="hairer_lean_transport_discounted_newton_bracket",
+    )
+    failed_dt = jnp.asarray(5.0e-6, dtype=jnp.float64)
+    retry_dt = jnp.asarray(1.0e-6, dtype=jnp.float64)
+    args["step_state"] = dataclasses.replace(
+        args["step_state"],
+        newton_reject_dt_upper=failed_dt,
+    )
+    args["trial_dt"] = retry_dt
+
+    next_state, info = _apply_radau_lean_timestep_controller(**args)
+
+    assert bool(info.accepted)
+    # The uncorrected Hairer-lean controller would choose the 5x proposal.
+    assert float(info.next_dt) == pytest.approx(0.9 * float(failed_dt))
+    assert float(info.growth) == pytest.approx(0.9 * float(failed_dt) / float(retry_dt))
+    assert float(info.next_dt) < float(failed_dt)
+    assert float(next_state.newton_reject_dt_upper) == pytest.approx(float(failed_dt))
+
+
+def test_radau_discounted_newton_bracket_records_only_newton_rejections():
+    """An LTE rejection must not be mistaken for a stage-convergence bound."""
+
+    args = _radau_controller_arguments(
+        newton_iter_count=3,
+        controller_mode="hairer_lean_transport_discounted_newton_bracket",
+    )
+    args["converged"] = jnp.asarray(False)
+    args["err_norm"] = jnp.asarray(2.0, dtype=jnp.float64)
+    failed_state, _ = _apply_radau_lean_timestep_controller(**args)
+    assert float(failed_state.newton_reject_dt_upper) == pytest.approx(1.0e-6)
+
+    args = _radau_controller_arguments(
+        newton_iter_count=3,
+        controller_mode="hairer_lean_transport_discounted_newton_bracket",
+    )
+    args["converged"] = jnp.asarray(True)
+    args["err_norm"] = jnp.asarray(2.0, dtype=jnp.float64)
+    lte_failed_state, _ = _apply_radau_lean_timestep_controller(**args)
+    assert float(lte_failed_state.newton_reject_dt_upper) == pytest.approx(0.0)
+
+
+def test_radau_discounted_newton_bracket_mode_is_an_explicit_opt_in():
+    solver = RADAUSolver(
+        t0=0.0,
+        t1=1.0,
+        dt=1.0e-3,
+        controller_mode="discounted_newton_bracket",
+    )
+    assert solver.controller_mode == "hairer_lean_transport_discounted_newton_bracket"
+
+
+def test_radau_discounted_newton_bracket_runs_through_jitted_adaptive_loop():
+    """Exercise the new carry leaf in the compiled adaptive solver loop."""
+
+    solver = RADAUSolver(
+        t0=0.0,
+        t1=1.0e-2,
+        dt=1.0e-3,
+        rtol=1.0e-6,
+        atol=1.0e-8,
+        max_steps=64,
+        controller_mode="hairer_lean_transport_discounted_newton_bracket",
+    )
+    out = solver.solve(jnp.asarray([1.0]), lambda _t, y: -y)
+    assert int(out["n_steps"]) > 0
+    assert jnp.all(jnp.isfinite(out["final_state"]))
+
+
 def test_flat_support_pullback_forwards_local_vjp_primal_reuse_flag():
     """The isolated rebuild mode must reach the NTX support hook unchanged."""
 

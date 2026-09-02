@@ -2035,6 +2035,7 @@ def _make_radau_initial_step_state(
         complex_piv=complex_piv0,
         prev_theta_final=jnp.asarray(0.0, dtype=dtype),
         prev_newton_iter_count=jnp.asarray(0, dtype=jnp.int32),
+        newton_reject_dt_upper=jnp.asarray(0.0, dtype=dtype),
     )
     return _radau_step_state_from_carry(
         carry0,
@@ -2771,6 +2772,13 @@ def _apply_radau_lean_timestep_controller(
     use_hairer_lean_transport_controller = controller_mode == "hairer_lean_transport"
     use_hairer_lean_transport_weighted_controller = controller_mode == "hairer_lean_transport_weighted"
     use_hairer_lean_transport_discounted_controller = controller_mode == "hairer_lean_transport_discounted"
+    use_hairer_lean_transport_discounted_newton_bracket_controller = (
+        controller_mode == "hairer_lean_transport_discounted_newton_bracket"
+    )
+    use_hairer_lean_transport_discounted_family_controller = jnp.logical_or(
+        use_hairer_lean_transport_discounted_controller,
+        use_hairer_lean_transport_discounted_newton_bracket_controller,
+    )
     use_hairer_ntss_controller = controller_mode == "hairer_ntss"
     use_hairer_lean_family_controller = jnp.logical_or(
         jnp.logical_or(
@@ -2780,7 +2788,7 @@ def _apply_radau_lean_timestep_controller(
             ),
             use_hairer_lean_transport_weighted_controller,
         ),
-        use_hairer_lean_transport_discounted_controller,
+        use_hairer_lean_transport_discounted_family_controller,
     )
     growth_lean = safety_factor * safe_error ** (-controller_alpha)
     growth_lean = jnp.clip(growth_lean, min_step_factor, max_step_factor)
@@ -2999,6 +3007,33 @@ def _apply_radau_lean_timestep_controller(
         t_new = step_state.t + trial_dt
         accepted_y = _project_flat_state_if_needed(trial_y, project_flat)
         next_dt_accept = jnp.clip(trial_dt * growth, dt_min, dt_max)
+        # Keep the last Newton-failed radius as a local bracket.  The corrected
+        # mode probes just below it after a successful retry instead of letting
+        # a tiny LTE estimate immediately regrow to the known failed step.
+        bracket_active = jnp.logical_and(
+            use_hairer_lean_transport_discounted_newton_bracket_controller,
+            step_state.newton_reject_dt_upper > dt_min,
+        )
+        bracket_upper = jnp.maximum(step_state.newton_reject_dt_upper, dt_min)
+        bracket_near = trial_dt >= jnp.asarray(0.85, dtype=dtype) * bracket_upper
+        bracket_upper_next = jnp.where(
+            bracket_active,
+            jnp.where(
+                bracket_near,
+                jnp.minimum(
+                    bracket_upper * jnp.asarray(1.25, dtype=dtype),
+                    dt_max,
+                ),
+                bracket_upper,
+            ),
+            jnp.asarray(0.0, dtype=dtype),
+        )
+        bracket_probe_dt = jnp.asarray(0.9, dtype=dtype) * bracket_upper_next
+        next_dt_accept = jnp.where(
+            bracket_active,
+            jnp.minimum(next_dt_accept, bracket_probe_dt),
+            next_dt_accept,
+        )
         lagged_reuse_global = _lagged_response_reuse_uses_global_drift(lagged_response_reuse_mode)
         lagged_reuse_metric = _lagged_response_global_reuse_metric(
             accepted_y,
@@ -3064,12 +3099,17 @@ def _apply_radau_lean_timestep_controller(
             complex_piv=complex_piv_out,
             prev_theta_final=theta_final,
             prev_newton_iter_count=newton_iter_count,
+            newton_reject_dt_upper=bracket_upper_next,
         ), _RadauStepInfo(
             y=accepted_y,
             t=t_new,
             dt=trial_dt,
             next_dt=next_dt_accept,
-            growth=growth,
+            growth=jnp.where(
+                trial_dt > 0,
+                next_dt_accept / trial_dt,
+                jnp.asarray(1.0, dtype=dtype),
+            ),
             lagged_reused=lagged_reused,
             jacobian_reused=jacobian_reused,
             accepted=jnp.asarray(True),
@@ -3113,12 +3153,12 @@ def _apply_radau_lean_timestep_controller(
             jnp.asarray(0.85, dtype=dtype) + jnp.asarray(0.1, dtype=dtype) * localized_gate,
         )
         retry_shrink = jnp.where(
-            jnp.logical_and(use_hairer_lean_transport_discounted_controller, weighted_localized_discount_ready),
+            jnp.logical_and(use_hairer_lean_transport_discounted_family_controller, weighted_localized_discount_ready),
             localized_retry_shrink,
             retry_shrink,
         )
         reject_cap = jnp.where(
-            jnp.logical_and(use_hairer_lean_transport_discounted_controller, weighted_localized_discount_ready),
+            jnp.logical_and(use_hairer_lean_transport_discounted_family_controller, weighted_localized_discount_ready),
             trial_dt * (jnp.asarray(0.6, dtype=dtype) + jnp.asarray(0.2, dtype=dtype) * localized_gate),
             trial_dt * jnp.asarray(0.5, dtype=dtype),
         )
@@ -3172,6 +3212,14 @@ def _apply_radau_lean_timestep_controller(
             complex_piv=complex_piv_out,
             prev_theta_final=theta_final,
             prev_newton_iter_count=newton_iter_count,
+            newton_reject_dt_upper=jnp.where(
+                jnp.logical_and(
+                    use_hairer_lean_transport_discounted_newton_bracket_controller,
+                    jnp.logical_not(converged),
+                ),
+                trial_dt,
+                step_state.newton_reject_dt_upper,
+            ),
         ), _RadauStepInfo(
             y=step_state.y,
             t=step_state.t,
@@ -3382,6 +3430,9 @@ class _RadauSolverConfig(TransportSolver):
             "discounted": "hairer_lean_transport_discounted",
             "transport_discounted": "hairer_lean_transport_discounted",
             "lean_transport_discounted": "hairer_lean_transport_discounted",
+            "discounted_newton_bracket": "hairer_lean_transport_discounted_newton_bracket",
+            "transport_discounted_newton_bracket": "hairer_lean_transport_discounted_newton_bracket",
+            "lean_transport_discounted_newton_bracket": "hairer_lean_transport_discounted_newton_bracket",
             "ntss": "hairer_ntss",
             "hairer": "hairer_ntss",
             "hairer_default": "hairer_ntss",
@@ -3391,9 +3442,9 @@ class _RadauSolverConfig(TransportSolver):
             "standard": "gustafsson",
         }
         controller_mode_norm = controller_aliases.get(controller_mode_norm, controller_mode_norm)
-        if controller_mode_norm not in {"current", "current_legacy", "gustafsson", "hairer_lean", "hairer_lean_aggressive", "hairer_lean_transport", "hairer_lean_transport_weighted", "hairer_lean_transport_discounted", "hairer_ntss"}:
+        if controller_mode_norm not in {"current", "current_legacy", "gustafsson", "hairer_lean", "hairer_lean_aggressive", "hairer_lean_transport", "hairer_lean_transport_weighted", "hairer_lean_transport_discounted", "hairer_lean_transport_discounted_newton_bracket", "hairer_ntss"}:
             raise ValueError(
-                "radau_controller_mode must be one of: current, current_legacy, gustafsson, hairer_lean, hairer_lean_aggressive, hairer_lean_transport, hairer_lean_transport_weighted, hairer_lean_transport_discounted, hairer_ntss"
+                "radau_controller_mode must be one of: current, current_legacy, gustafsson, hairer_lean, hairer_lean_aggressive, hairer_lean_transport, hairer_lean_transport_weighted, hairer_lean_transport_discounted, hairer_lean_transport_discounted_newton_bracket, hairer_ntss"
             )
         object.__setattr__(self, "controller_mode", controller_mode_norm)
         predictor_mode_norm = str(predictor_mode).strip().lower()
@@ -3518,6 +3569,9 @@ class _RadauAcceptedStepCarry:
     complex_piv: Any
     prev_theta_final: Any
     prev_newton_iter_count: Any
+    # Schedule/controller metadata only.  It is not a physics state and is
+    # held fixed by realized-schedule reverse replay.
+    newton_reject_dt_upper: Any = 0.0
 
 
 @jax.tree_util.register_dataclass
@@ -4159,6 +4213,7 @@ class _RadauStepState:
     complex_piv: Any
     prev_theta_final: Any
     prev_newton_iter_count: Any
+    newton_reject_dt_upper: Any = 0.0
 
 
 def _radau_carry_from_step_state(step_state: "_RadauStepState") -> _RadauAcceptedStepCarry:
@@ -4186,6 +4241,7 @@ def _radau_carry_from_step_state(step_state: "_RadauStepState") -> _RadauAccepte
         complex_piv=step_state.complex_piv,
         prev_theta_final=step_state.prev_theta_final,
         prev_newton_iter_count=step_state.prev_newton_iter_count,
+        newton_reject_dt_upper=step_state.newton_reject_dt_upper,
     )
 
 
@@ -4215,6 +4271,7 @@ def _radau_step_state_from_carry(carry: _RadauAcceptedStepCarry, *, status) -> _
         complex_piv=carry.complex_piv,
         prev_theta_final=carry.prev_theta_final,
         prev_newton_iter_count=carry.prev_newton_iter_count,
+        newton_reject_dt_upper=carry.newton_reject_dt_upper,
     )
 
 
@@ -12791,6 +12848,7 @@ def _radau_carry_with_forward_only_jvp_fields(
         recent_reject_count=jax.lax.stop_gradient(carry.recent_reject_count),
         regrowth_cooldown=jax.lax.stop_gradient(carry.regrowth_cooldown),
         easy_growth_streak=jax.lax.stop_gradient(carry.easy_growth_streak),
+        newton_reject_dt_upper=jax.lax.stop_gradient(carry.newton_reject_dt_upper),
         jacobian=jax.lax.stop_gradient(carry.jacobian),
         cache_valid=jax.lax.stop_gradient(carry.cache_valid),
         cache_dt=jax.lax.stop_gradient(carry.cache_dt),
@@ -12815,6 +12873,7 @@ def _radau_step_state_with_forward_only_controller_fields(
         recent_reject_count=jax.lax.stop_gradient(step_state.recent_reject_count),
         regrowth_cooldown=jax.lax.stop_gradient(step_state.regrowth_cooldown),
         easy_growth_streak=jax.lax.stop_gradient(step_state.easy_growth_streak),
+        newton_reject_dt_upper=jax.lax.stop_gradient(step_state.newton_reject_dt_upper),
         jacobian=jax.lax.stop_gradient(step_state.jacobian),
         cache_valid=jax.lax.stop_gradient(step_state.cache_valid),
         cache_dt=jax.lax.stop_gradient(step_state.cache_dt),
