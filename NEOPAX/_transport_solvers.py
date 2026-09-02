@@ -2291,6 +2291,7 @@ def _run_saved_loop_debug_walltime(
     max_total_steps,
     stop_after_accepted_steps=None,
     stop_after_first_nonconverged_attempt=False,
+    on_first_nonconverged_attempt=None,
     walltime_label="solver.attempt",
 ):
     compiled_step_fn = jax.jit(lambda step_state: step_fn(step_state, None))
@@ -2339,6 +2340,7 @@ def _run_saved_loop_debug_walltime(
 
         attempt_idx = step_idx + 1
         start = time.perf_counter()
+        step_state_before_attempt = step_state
         step_state, step_info = compiled_step_fn(step_state)
         step_state = jax.block_until_ready(step_state)
         step_info = jax.block_until_ready(step_info)
@@ -2384,6 +2386,8 @@ def _run_saved_loop_debug_walltime(
 
         step_idx += 1
         if stop_after_first_nonconverged_attempt and not bool(jax.device_get(last_attempt_converged)):
+            if on_first_nonconverged_attempt is not None:
+                on_first_nonconverged_attempt(step_state_before_attempt, step_info)
             print(
                 "[radau-stage-repeat-probe] diagnostic stop after first "
                 "nonconverged attempt",
@@ -8737,7 +8741,7 @@ def _radau_attempt_step_forward_solver(
         lagged_reference_y=lagged_reference_y_out,
     )
     step_state_attempt = _radau_step_state_from_carry(carry_after_attempt, status=status)
-    return _apply_radau_lean_timestep_controller(
+    next_step_state, step_info = _apply_radau_lean_timestep_controller(
         step_state=step_state_attempt,
         trial_dt=trial_dt,
         trial_y=trial_y,
@@ -8787,6 +8791,7 @@ def _radau_attempt_step_forward_solver(
         lagged_response_reuse_atol=execution_context.lagged_response_reuse_atol,
         project_flat=execution_context.project_flat,
     )
+    return next_step_state, dataclasses.replace(step_info, stage_history=stage_history)
 def _radau_attempt_step_with_payload(
     execution_context: _RadauSolveExecutionContext,
     step_state: _RadauStepState,
@@ -8949,6 +8954,7 @@ def _radau_step_fn_forward_solver(
             slow_contraction=jnp.asarray(False),
             residual_blowup=jnp.asarray(False),
             newton_nonfinite=jnp.asarray(False),
+            stage_history=step_state.prev_stages,
         )
 
     def _run(_):
@@ -13466,45 +13472,6 @@ def _radau_run_stage_subsolve(
         ),
         jnp.logical_not(diverged_final),
     )
-    if kernel_context.debug_first_failed_stage_probe:
-        # This is deliberately an opt-in, one-attempt probe.  The host debug
-        # loop stops after this failed attempt; its only purpose is to tell
-        # whether the live stage residual is repeatable at an identical frozen
-        # stage vector.  The optimization barrier prevents XLA from folding
-        # the second residual evaluation into ``final_residual``.
-        def _print_repeat_probe(_):
-            repeated_residual = _radau_stage_subsolve_residual(
-                kernel_context,
-                physics_context,
-                inputs,
-                jax.lax.optimization_barrier(z_final),
-            )
-            repeat_delta = repeated_residual - final_residual
-            repeat_abs = jnp.max(jnp.abs(repeat_delta))
-            residual_abs = jnp.max(jnp.abs(final_residual))
-            repeat_rel = repeat_abs / jnp.maximum(
-                residual_abs,
-                jnp.asarray(1.0e-30, dtype=kernel_context.dtype),
-            )
-            jax.debug.print(
-                "[radau-stage-repeat-probe] t={t:.8e} dt={dt:.8e} "
-                "final_residual_max_abs={residual:.8e} "
-                "repeat_delta_max_abs={repeat_abs:.8e} "
-                "repeat_delta_rel={repeat_rel:.8e}",
-                t=inputs.t_value,
-                dt=inputs.h_value,
-                residual=residual_abs,
-                repeat_abs=repeat_abs,
-                repeat_rel=repeat_rel,
-            )
-            return jnp.asarray(0, dtype=jnp.int32)
-
-        jax.lax.cond(
-            jnp.logical_not(converged),
-            _print_repeat_probe,
-            lambda _: jnp.asarray(0, dtype=jnp.int32),
-            operand=None,
-        )
     return _RadauStageSubsolveResult(
         iter_final=iter_final,
         z_final=z_final,
@@ -19136,6 +19103,10 @@ class _RadauStepInfo:
     slow_contraction: Any = None
     residual_blowup: Any = None
     newton_nonfinite: Any = None
+    # Present only in the opt-in forward diagnostic path.  Keeping it on the
+    # attempt result lets the host repeat the physical RHS after the compiled
+    # step, instead of duplicating the full realtime NTX graph inside XLA.
+    stage_history: Any = None
 
 
 class RADAUSolver(_RadauSolverConfig):
@@ -19677,9 +19648,9 @@ class RADAUSolver(_RadauSolverConfig):
             tiny_scalar=tiny_scalar,
             zero_scalar=zero_scalar,
             debug_newton_trace=bool(debug_newton_trace),
-            debug_first_failed_stage_probe=bool(
-                getattr(self, "debug_stop_after_first_failed_stage_probe", False)
-            ),
+            # The repeat probe is deliberately host-side: putting the second
+            # realtime RHS inside this executable doubles its XLA memory peak.
+            debug_first_failed_stage_probe=False,
             use_transport_lagged_response=bool(use_transport_lagged_response),
             lagged_response_correction_mode=str(
                 getattr(self, "lagged_response_correction_mode", "none")
@@ -19848,6 +19819,54 @@ class RADAUSolver(_RadauSolverConfig):
                 "debug_stop_after_first_failed_stage_probe requires "
                 "debug_walltime_attempts=true so the host loop can stop after the probe."
             )
+        if debug_stage_probe and rhs_mode != "black_box":
+            raise ValueError(
+                "debug_stop_after_first_failed_stage_probe currently validates the "
+                "direct black-box stage residual and therefore requires radau_rhs_mode='black_box'."
+            )
+
+        def _repeat_failed_black_box_stage_residual(step_state_before_attempt, step_info):
+            """Repeat a failed direct-stage residual without enlarging the step executable."""
+            stage_history = step_info.stage_history
+            if stage_history is None:
+                raise RuntimeError("Radau stage-repeat probe did not receive the final stage vector.")
+            trial_dt = jnp.asarray(step_info.dt, dtype=dtype)
+            stages = jnp.asarray(stage_history, dtype=dtype).reshape((num_stages, state_dim))
+            stage_times = step_state_before_attempt.t + c * trial_dt
+            stage_states = step_state_before_attempt.y[None, :] + trial_dt * (a @ stages)
+
+            def _evaluate_once():
+                # Execute each direct stage separately.  This is intentionally
+                # not vmapped/jitted as one giant expression: the purpose is to
+                # measure repeatability without duplicating the full realtime
+                # NTX graph and its temporary buffers.
+                rhs_rows = []
+                for stage_idx in range(num_stages):
+                    rhs_rows.append(
+                        jax.block_until_ready(
+                            physics_context.flat_rhs(
+                                stage_times[stage_idx],
+                                stage_states[stage_idx],
+                            )
+                        )
+                    )
+                return jax.block_until_ready((stages - jnp.stack(rhs_rows, axis=0)).reshape((-1,)))
+
+            first_residual = _evaluate_once()
+            repeated_residual = _evaluate_once()
+            repeat_delta = repeated_residual - first_residual
+            residual_abs = float(jax.device_get(jnp.max(jnp.abs(first_residual))))
+            repeat_abs = float(jax.device_get(jnp.max(jnp.abs(repeat_delta))))
+            repeat_rel = repeat_abs / max(residual_abs, 1.0e-30)
+            print(
+                "[radau-stage-repeat-probe] "
+                f"t={float(jax.device_get(step_state_before_attempt.t)):.8e} "
+                f"dt={float(jax.device_get(trial_dt)):.8e} "
+                f"first_residual_max_abs={residual_abs:.8e} "
+                f"repeat_delta_max_abs={repeat_abs:.8e} "
+                f"repeat_delta_rel={repeat_rel:.8e}",
+                flush=True,
+            )
         if bool(getattr(self, "debug_walltime_attempts", False)):
             loop_result = _run_saved_loop_debug_walltime(
                 step_state0=step_state0,
@@ -19860,6 +19879,9 @@ class RADAUSolver(_RadauSolverConfig):
                 max_total_steps=max_total_steps,
                 stop_after_accepted_steps=stop_after_accepted_steps,
                 stop_after_first_nonconverged_attempt=debug_stage_probe,
+                on_first_nonconverged_attempt=(
+                    _repeat_failed_black_box_stage_residual if debug_stage_probe else None
+                ),
                 walltime_label="radau.attempt",
             )
         else:
