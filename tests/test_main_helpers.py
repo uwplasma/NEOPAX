@@ -266,6 +266,14 @@ def test_ntx_exact_runtime_quadratic_lagged_response_matches_live_reference(resp
     with pytest.raises(NotImplementedError, match="linear-response reverse-replay"):
         model.build_lagged_response_with_compact_coefficient_record(state)
 
+    # A reduced radial payload interpolates coefficient data onto the omitted
+    # face.  It is therefore valid, but cannot be an anchor-identity test.
+    if response_anchor_count != 3:
+        lagged = model.evaluate_with_lagged_response(state, response)
+        for value in lagged.values():
+            assert bool(jnp.all(jnp.isfinite(value)))
+        return
+
     faces = build_face_transport_state(state, geometry)
     direct = model.evaluate_face_fluxes(state, faces)
     lagged = model.evaluate_with_lagged_response(state, response)
@@ -288,6 +296,42 @@ def test_ntx_exact_runtime_quadratic_lagged_response_matches_live_reference(resp
         assert jnp.allclose(
             full_state[f"{name}_faces"], direct[name], rtol=3.0e-6, atol=1.0e-12
         )
+
+    direction = TransportState(
+        density=jnp.asarray([[0.04, -0.03], [-0.02, 0.01]]),
+        pressure=jnp.asarray([[0.06, -0.04], [-0.03, 0.02]]),
+        Er=jnp.asarray([2.0e-5, -1.5e-5]),
+    )
+
+    def _state_at(scale):
+        return TransportState(
+            density=state.density + scale * direction.density,
+            pressure=state.pressure + scale * direction.pressure,
+            Er=state.Er + scale * direction.Er,
+        )
+
+    def _relative_flux_error(scale):
+        perturbed = _state_at(scale)
+        direct_perturbed = model.evaluate_face_fluxes(
+            perturbed, build_face_transport_state(perturbed, geometry)
+        )
+        full_perturbed = full_state_model.evaluate_with_lagged_response(
+            perturbed, full_state_response
+        )
+        errors = tuple(
+            jnp.max(jnp.abs(full_perturbed[f"{name}_faces"] - direct_perturbed[name]))
+            / (1.0 + jnp.max(jnp.abs(direct_perturbed[name])))
+            for name in ("Gamma", "Q", "Upar")
+        )
+        return jnp.max(jnp.asarray(errors))
+
+    # The full-state payload is a quadratic Taylor model.  Away from its
+    # anchor its direct-flux defect must decrease cubically as the same state
+    # displacement is halved.
+    error_full = _relative_flux_error(1.0)
+    error_half = _relative_flux_error(0.5)
+    assert float(error_full) < 2.0e-2
+    assert float(error_half / error_full) < 0.3
 
 
 def test_ntx_exact_fused_lowdot_local_pullback_matches_ntx_helper():

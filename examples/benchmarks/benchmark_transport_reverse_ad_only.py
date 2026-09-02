@@ -4089,6 +4089,9 @@ def _run_realtime_geometry_optimization_api_smoke(
                 if args.max_reverse_accepted_steps is None
                 else int(args.max_reverse_accepted_steps)
             ),
+            realtime_geometry_component_pullbacks=bool(
+                args.realtime_geometry_component_pullbacks
+            ),
             progress_label="[autodiff-gate] full-transport shared payload:",
         )
         request = realtime_geometry_transport_reverse_table_request(

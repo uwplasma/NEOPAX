@@ -6900,6 +6900,7 @@ def internal_realtime_geometry_transport_reverse_table_result_builder(
     reverse_stage_adjoint_woodbury_rank: int = 24,
     reverse_schedule_artifact_mode: str = "legacy",
     max_reverse_accepted_steps: int | None = None,
+    realtime_geometry_component_pullbacks: bool = False,
     progress_label: str | None = None,
     raw_block_solve: GeometryRawBlockSolve | None = None,
 ) -> TransportReverseTableResultBuilder:
@@ -6955,6 +6956,12 @@ def internal_realtime_geometry_transport_reverse_table_result_builder(
         )
         active_initial_er_root_ad = str(opts.get("initial_er_root_ad", initial_er_root_ad))
         active_raw_block_solve = opts.get("raw_block_solve", raw_block_solve)
+        active_component_pullbacks = bool(
+            opts.get(
+                "realtime_geometry_component_pullbacks",
+                realtime_geometry_component_pullbacks,
+            )
+        )
         active_profile_values = jnp.asarray(
             opts.get("profile_values", baseline_profile_values),
             dtype=baseline_profile_values.dtype,
@@ -7171,7 +7178,7 @@ def internal_realtime_geometry_transport_reverse_table_result_builder(
             support_bars=support_bars,
             support_component_bars_by_name=component_bars,
             native_vmec_face_coefficient_bars=native_vmec_face_coefficient_bars,
-            include_component_pullbacks=False,
+            include_component_pullbacks=active_component_pullbacks,
             combined_geometry_payload=combined_geometry_payload,
             n_r=int(opts.get("n_r", n_r)),
             n_theta=int(opts.get("n_theta", n_theta)),
@@ -7185,6 +7192,36 @@ def internal_realtime_geometry_transport_reverse_table_result_builder(
             raw_block_solve=active_raw_block_solve,
         )
         _report_table_builder_phase("transport_payload_to_geometry_table")
+        if active_component_pullbacks:
+            component_matrices = assembly.payload_pullback_result.component_gradient_matrices
+            geometry_labels = tuple(spec.vmec_label for spec in parameter_set.vmec_boundary_specs)
+            prefix = progress_label or "[autodiff-gate]"
+            print(
+                f"{prefix} diagnostic: reverse geometry component pullbacks "
+                "(compare objective_explicit to FD fd_explicit_geometry and "
+                "final_state_components_sum to FD fd_final_state_geometry)",
+                flush=True,
+            )
+            for objective_i, objective_name in enumerate(objective_names):
+                for geometry_i, geometry_label in enumerate(geometry_labels):
+                    components = {
+                        name: float(jax.device_get(matrix[objective_i, geometry_i]))
+                        for name, matrix in component_matrices.items()
+                    }
+                    dynamic_sum = sum(
+                        value for name, value in components.items()
+                        if name != "objective_explicit"
+                    )
+                    component_text = " ".join(
+                        f"{name}={value:.6e}"
+                        for name, value in components.items()
+                    )
+                    print(
+                        f"{prefix} diagnostic: objective={objective_name} "
+                        f"parameter={geometry_label} {component_text} "
+                        f"final_state_components_sum={dynamic_sum:.6e}",
+                        flush=True,
+                    )
         return assembly.table_result
 
     return _builder
