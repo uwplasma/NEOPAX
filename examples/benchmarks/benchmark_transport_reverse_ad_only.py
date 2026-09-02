@@ -2803,6 +2803,24 @@ def _run_realtime_geometry_support_pullback_probe(
             },
         )
 
+    # The ordinary support probe intentionally carries the bare NTX support
+    # tree.  The direct-RHS geometry check, however, needs the same combined
+    # geometry/NTX payload contract as the production reverse path so that it
+    # can exercise the equation-system geometry branch as well as the compact
+    # NTX support branch.  Keep this opt-in: the existing lightweight probe
+    # and its build-response diagnostic continue to see the bare NTX tree.
+    direct_rhs_geometry_duality_requested = bool(
+        getattr(args, "support_pullback_probe_direct_rhs_geometry_duality", False)
+    )
+    rhs_support_payload = (
+        {
+            "geometry": baseline_runtime.geometry,
+            "ntx_support": support_payload,
+        }
+        if direct_rhs_geometry_duality_requested
+        else support_payload
+    )
+
     support_bars = {}
     for component_name in ("density", "pressure", "Er"):
         support_bar_value = equation_system.pullback_evaluate_with_lagged_response_support_payload(
@@ -2811,7 +2829,7 @@ def _run_realtime_geometry_support_pullback_probe(
             baseline_runtime.species,
             lagged_response,
             _rhs_bar_for(component_name),
-            support_payload,
+            rhs_support_payload,
         )
         support_bars[f"rhs_{component_name}"] = jax.block_until_ready(support_bar_value)
 
@@ -2968,19 +2986,19 @@ def _run_realtime_geometry_support_pullback_probe(
                     lagged_response.flux_response,
                 )
             lhs = _floating_tree_vdot(flux_response_bar, response_tangent)
-            rhs = _floating_tree_vdot(
+            rhs_dot = _floating_tree_vdot(
                 support_bars["build_lagged_response"],
                 support_direction,
             )
-            lhs, rhs = jax.block_until_ready((lhs, rhs))
-            abs_err = jnp.abs(lhs - rhs)
+            lhs, rhs_dot = jax.block_until_ready((lhs, rhs_dot))
+            abs_err = jnp.abs(lhs - rhs_dot)
             rel_err = abs_err / jnp.maximum(
                 jnp.asarray(1.0e-30, dtype=abs_err.dtype),
-                jnp.maximum(jnp.abs(lhs), jnp.abs(rhs)),
+                jnp.maximum(jnp.abs(lhs), jnp.abs(rhs_dot)),
             )
             directional_rows[direction_name] = {
                 "lhs_response_bar_dot_support_jvp": float(lhs),
-                "rhs_support_bar_dot_direction": float(rhs),
+                "rhs_support_bar_dot_direction": float(rhs_dot),
                 "abs_err": float(abs_err),
                 "rel_err": float(rel_err),
             }
@@ -2992,12 +3010,12 @@ def _run_realtime_geometry_support_pullback_probe(
         }
 
     direct_rhs_geometry_duality = None
-    if bool(getattr(args, "support_pullback_probe_direct_rhs_geometry_duality", False)):
-        if not isinstance(support_payload, dict) or "geometry" not in support_payload:
+    if direct_rhs_geometry_duality_requested:
+        if not isinstance(rhs_support_payload, dict) or "geometry" not in rhs_support_payload:
             raise RuntimeError(
                 "direct-RHS geometry duality requires a combined realtime geometry support payload."
             )
-        geometry = support_payload["geometry"]
+        geometry = rhs_support_payload["geometry"]
         geometry_paths, geometry_treedef = jax.tree_util.tree_flatten_with_path(geometry)
 
         def _geometry_direction(_path, leaf):
