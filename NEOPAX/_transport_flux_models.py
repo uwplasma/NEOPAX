@@ -14206,7 +14206,19 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             def per_species(a):
                 nu, ep, vth = _local_scan_inputs_directional_default(self.energy_grid, self.species, drds_value=drds, species_index=a, er_value=er, temperature_local=t, density_local=n, reference_vthermal_local=v0, er_v_floor=self.er_v_floor)
                 fields = jax.tree_util.tree_map(lambda x: jax.lax.dynamic_index_in_dim(jax.lax.dynamic_index_in_dim(x, radius, axis=0, keepdims=False), a, axis=0, keepdims=False), coefficients)
-                c = compose_ntx_coefficient_quadratic(*dataclasses.astuple(fields), nu, ep); m = _transport_moments_from_coefficient_scan_directional(self.energy_grid, c, drds_value=drds)
+                c = compose_ntx_coefficient_quadratic(
+                    fields.reference_coefficients,
+                    fields.dcoefficients_d_nu_hat,
+                    fields.dcoefficients_d_epsi_hat,
+                    fields.d2coefficients_d_nu_hat2,
+                    fields.d2coefficients_d_nu_hat_d_epsi_hat,
+                    fields.d2coefficients_d_epsi_hat2,
+                    nu,
+                    ep,
+                )
+                m = _transport_moments_from_coefficient_scan_directional(
+                    self.energy_grid, c, drds_value=drds
+                )
                 lij = _lij_from_transport_moments_directional(self.species, m, species_index=a, vth_a=vth)
                 return _assemble_face_fluxes_from_lij_directional_local(charge=self.species.charge[a], density=_jet_select_axis(n,a), temperature=_jet_select_axis(t,a), density_gradient=_jet_select_axis(dn,a), temperature_gradient=_jet_select_axis(dt,a), er=er, lij=lij)
             return jax.vmap(per_species)(species_indices)
