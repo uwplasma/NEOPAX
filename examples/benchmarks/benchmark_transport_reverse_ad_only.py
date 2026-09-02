@@ -2845,12 +2845,18 @@ def _run_realtime_geometry_support_pullback_probe(
             baseline_profile_state
         )
         shared_flux_model = equation_system.shared_flux_model
-        if shared_flux_model is None or not callable(
-            getattr(shared_flux_model, "with_support_payload", None)
-        ):
+        if shared_flux_model is None:
             raise RuntimeError(
-                "support build directional duality requires a shared flux model "
-                "with an explicit NTX support payload."
+                "support build directional duality requires a shared flux model."
+            )
+        _replaced_model, support_payload_found = _replace_ntx_support_payload_in_model(
+            shared_flux_model,
+            support_payload,
+        )
+        if not support_payload_found:
+            raise RuntimeError(
+                "support build directional duality could not find an NTX model "
+                "with an explicit support payload inside the shared flux model."
             )
         flux_response_bar = lagged_response_bar.flux_response
         if flux_response_bar is None:
@@ -2859,7 +2865,13 @@ def _run_realtime_geometry_support_pullback_probe(
             )
 
         def _response_from_support(support_value):
-            return shared_flux_model.with_support_payload(support_value).build_lagged_response(
+            model_with_support, replaced = _replace_ntx_support_payload_in_model(
+                shared_flux_model,
+                support_value,
+            )
+            if not replaced:
+                raise RuntimeError("live NTX support replacement unexpectedly failed.")
+            return model_with_support.build_lagged_response(
                 working_state,
                 **equation_system._shared_flux_bc_kwargs(),
             )

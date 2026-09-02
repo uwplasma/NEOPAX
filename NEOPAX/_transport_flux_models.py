@@ -177,14 +177,14 @@ def _debug_lagged_response_if_nonfinite(prefix, response):
         _debug_arrays_if_any_nonfinite(
             prefix,
             (
-                ("reference_transport_moments", response.reference_transport_moments),
                 ("reference_nu_hat", response.reference_nu_hat),
                 ("reference_epsi_hat", response.reference_epsi_hat),
-                ("dtransport_moments_d_nu_hat", response.dtransport_moments_d_nu_hat),
-                ("dtransport_moments_d_epsi_hat", response.dtransport_moments_d_epsi_hat),
-                ("d2transport_moments_d_nu_hat2", response.d2transport_moments_d_nu_hat2),
-                ("d2transport_moments_d_nu_hat_d_epsi_hat", response.d2transport_moments_d_nu_hat_d_epsi_hat),
-                ("d2transport_moments_d_epsi_hat2", response.d2transport_moments_d_epsi_hat2),
+                ("reference_coefficients", response.reference_coefficients),
+                ("dcoefficients_d_nu_hat", response.dcoefficients_d_nu_hat),
+                ("dcoefficients_d_epsi_hat", response.dcoefficients_d_epsi_hat),
+                ("d2coefficients_d_nu_hat2", response.d2coefficients_d_nu_hat2),
+                ("d2coefficients_d_nu_hat_d_epsi_hat", response.d2coefficients_d_nu_hat_d_epsi_hat),
+                ("d2coefficients_d_epsi_hat2", response.d2coefficients_d_epsi_hat2),
             ),
         )
 
@@ -434,16 +434,22 @@ class NTXPreparedCoefficientResponse:
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True, eq=False)
 class NTXQuadraticPreparedCoefficientResponse:
-    """Full-radius realtime NTX moment Taylor data in native NTX coordinates."""
+    """Energy-resolved realtime NTX coefficient Taylor data.
 
-    reference_transport_moments: jax.Array
+    ``nu_hat`` and ``epsi_hat`` vary over the energy grid, so their Taylor
+    fields must remain energy resolved until the current displacement has
+    been applied.  Reducing to transport moments before that contraction
+    would incorrectly treat all energy-point displacements as one scalar.
+    """
+
     reference_nu_hat: jax.Array
     reference_epsi_hat: jax.Array
-    dtransport_moments_d_nu_hat: jax.Array
-    dtransport_moments_d_epsi_hat: jax.Array
-    d2transport_moments_d_nu_hat2: jax.Array
-    d2transport_moments_d_nu_hat_d_epsi_hat: jax.Array
-    d2transport_moments_d_epsi_hat2: jax.Array
+    reference_coefficients: jax.Array
+    dcoefficients_d_nu_hat: jax.Array
+    dcoefficients_d_epsi_hat: jax.Array
+    d2coefficients_d_nu_hat2: jax.Array
+    d2coefficients_d_nu_hat_d_epsi_hat: jax.Array
+    d2coefficients_d_epsi_hat2: jax.Array
 
 
 @jax.tree_util.register_dataclass
