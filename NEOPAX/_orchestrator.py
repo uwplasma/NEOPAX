@@ -1436,7 +1436,18 @@ def run_transport(config: dict, runtime: RuntimeContext, state: TransportState):
             f"device_tail_s={solve_wall_end - solve_wall_mid:.3f}",
         )
 
-    if forward_warm_timing_repeats:
+    diagnostic_stopped = bool(
+        isinstance(result, dict)
+        and jax.device_get(result.get("diagnostic_stopped", False))
+    )
+    if diagnostic_stopped:
+        print(
+            "[NEOPAX] Radau stage-repeat diagnostic stopped after the first "
+            "nonconverged attempt; skipping warm timing and transport output.",
+            flush=True,
+        )
+
+    if forward_warm_timing_repeats and not diagnostic_stopped:
         # Avoid duplicating per-attempt/Newton diagnostics in the warm timing
         # output.  The warm solve has exactly the same numerical settings and
         # starts from the same original state; it is discarded after timing.
@@ -1507,6 +1518,8 @@ def run_transport(config: dict, runtime: RuntimeContext, state: TransportState):
                     f"final_time={float(final_time):.6e}" if final_time is not None else "final_time=na",
                 )
         print("[NEOPAX] solver.solve(...) returned")
+    if diagnostic_stopped:
+        return result
     transport_cfg = config.get("transport_output", {})
     do_plot = transport_cfg.get("transport_plot", False)
     do_hdf5 = transport_cfg.get("transport_write_hdf5", False)

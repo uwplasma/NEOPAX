@@ -737,6 +737,7 @@ def _finalize_custom_solver_output(
     fixed_temperature_profile=None,
     density_floor=None,
     temperature_floor=None,
+    diagnostic_stopped=False,
 ):
     from ._transport_equations import enforce_quasi_neutrality
 
@@ -780,6 +781,7 @@ def _finalize_custom_solver_output(
         "fail_codes": fail_codes_saved,
         "n_steps": n_steps_f,
         "done": done_f,
+        "diagnostic_stopped": diagnostic_stopped,
         "failed": failed_f,
         "fail_code": fail_code_f,
         "last_attempt_accepted": last_attempt_accepted,
@@ -2288,6 +2290,7 @@ def _run_saved_loop_debug_walltime(
     dtype,
     max_total_steps,
     stop_after_accepted_steps=None,
+    stop_after_first_nonconverged_attempt=False,
     walltime_label="solver.attempt",
 ):
     compiled_step_fn = jax.jit(lambda step_state: step_fn(step_state, None))
@@ -2380,6 +2383,13 @@ def _run_saved_loop_debug_walltime(
         last_attempt_jacobian_reused = jnp.asarray(False if getattr(step_info, "jacobian_reused", None) is None else getattr(step_info, "jacobian_reused"))
 
         step_idx += 1
+        if stop_after_first_nonconverged_attempt and not bool(jax.device_get(last_attempt_converged)):
+            print(
+                "[radau-stage-repeat-probe] diagnostic stop after first "
+                "nonconverged attempt",
+                flush=True,
+            )
+            break
 
     save_idx, ys_saved, ts_saved, dts_saved, accepted_mask_saved, failed_mask_saved, fail_codes_saved = _fill_realized_final_slot(
         save_idx,
@@ -3267,6 +3277,7 @@ class _RadauSolverConfig(TransportSolver):
     n_steps: int = 0
     debug_stage_markers: bool = False
     debug_walltime_attempts: bool = False
+    debug_stop_after_first_failed_stage_probe: bool = False
 
     def __init__(
         self,
@@ -3307,6 +3318,7 @@ class _RadauSolverConfig(TransportSolver):
         stop_after_accepted_steps: int | None = None,
         debug_stage_markers: bool = False,
         debug_walltime_attempts: bool = False,
+        debug_stop_after_first_failed_stage_probe: bool = False,
         save_n=None,
     ):
         n_steps = max(1, int(jnp.ceil((float(t1) - float(t0)) / float(dt))))
@@ -3518,6 +3530,11 @@ class _RadauSolverConfig(TransportSolver):
         object.__setattr__(self, "n_steps", n_steps)
         object.__setattr__(self, "debug_stage_markers", bool(debug_stage_markers))
         object.__setattr__(self, "debug_walltime_attempts", bool(debug_walltime_attempts))
+        object.__setattr__(
+            self,
+            "debug_stop_after_first_failed_stage_probe",
+            bool(debug_stop_after_first_failed_stage_probe),
+        )
         object.__setattr__(self, "save_n", save_n)
 
 @jax.tree_util.register_dataclass
@@ -4068,6 +4085,7 @@ class _RadauAcceptedStepKernelContext:
     tiny_scalar: Any
     zero_scalar: Any
     debug_newton_trace: Any
+    debug_first_failed_stage_probe: Any
     use_transport_lagged_response: Any
     lagged_response_correction_mode: str
 
@@ -13448,6 +13466,45 @@ def _radau_run_stage_subsolve(
         ),
         jnp.logical_not(diverged_final),
     )
+    if kernel_context.debug_first_failed_stage_probe:
+        # This is deliberately an opt-in, one-attempt probe.  The host debug
+        # loop stops after this failed attempt; its only purpose is to tell
+        # whether the live stage residual is repeatable at an identical frozen
+        # stage vector.  The optimization barrier prevents XLA from folding
+        # the second residual evaluation into ``final_residual``.
+        def _print_repeat_probe(_):
+            repeated_residual = _radau_stage_subsolve_residual(
+                kernel_context,
+                physics_context,
+                inputs,
+                jax.lax.optimization_barrier(z_final),
+            )
+            repeat_delta = repeated_residual - final_residual
+            repeat_abs = jnp.max(jnp.abs(repeat_delta))
+            residual_abs = jnp.max(jnp.abs(final_residual))
+            repeat_rel = repeat_abs / jnp.maximum(
+                residual_abs,
+                jnp.asarray(1.0e-30, dtype=kernel_context.dtype),
+            )
+            jax.debug.print(
+                "[radau-stage-repeat-probe] t={t:.8e} dt={dt:.8e} "
+                "final_residual_max_abs={residual:.8e} "
+                "repeat_delta_max_abs={repeat_abs:.8e} "
+                "repeat_delta_rel={repeat_rel:.8e}",
+                t=inputs.t_value,
+                dt=inputs.h_value,
+                residual=residual_abs,
+                repeat_abs=repeat_abs,
+                repeat_rel=repeat_rel,
+            )
+            return jnp.asarray(0, dtype=jnp.int32)
+
+        jax.lax.cond(
+            jnp.logical_not(converged),
+            _print_repeat_probe,
+            lambda _: jnp.asarray(0, dtype=jnp.int32),
+            operand=None,
+        )
     return _RadauStageSubsolveResult(
         iter_final=iter_final,
         z_final=z_final,
@@ -18910,6 +18967,9 @@ def _build_prepared_radau_accepted_rollout(
         tiny_scalar=tiny_scalar,
         zero_scalar=zero_scalar,
         debug_newton_trace=bool(debug_newton_trace),
+        debug_first_failed_stage_probe=bool(
+            getattr(solver, "debug_stop_after_first_failed_stage_probe", False)
+        ),
         use_transport_lagged_response=bool(use_transport_lagged_response),
         lagged_response_correction_mode=str(
             getattr(solver, "lagged_response_correction_mode", "none")
@@ -19617,6 +19677,9 @@ class RADAUSolver(_RadauSolverConfig):
             tiny_scalar=tiny_scalar,
             zero_scalar=zero_scalar,
             debug_newton_trace=bool(debug_newton_trace),
+            debug_first_failed_stage_probe=bool(
+                getattr(self, "debug_stop_after_first_failed_stage_probe", False)
+            ),
             use_transport_lagged_response=bool(use_transport_lagged_response),
             lagged_response_correction_mode=str(
                 getattr(self, "lagged_response_correction_mode", "none")
@@ -19777,6 +19840,14 @@ class RADAUSolver(_RadauSolverConfig):
         save_n = getattr(self, "save_n", None)
         save_n = max(1, int(save_n)) if save_n is not None else 1
         stop_after_accepted_steps = getattr(self, "stop_after_accepted_steps", None)
+        debug_stage_probe = bool(
+            getattr(self, "debug_stop_after_first_failed_stage_probe", False)
+        )
+        if debug_stage_probe and not bool(getattr(self, "debug_walltime_attempts", False)):
+            raise ValueError(
+                "debug_stop_after_first_failed_stage_probe requires "
+                "debug_walltime_attempts=true so the host loop can stop after the probe."
+            )
         if bool(getattr(self, "debug_walltime_attempts", False)):
             loop_result = _run_saved_loop_debug_walltime(
                 step_state0=step_state0,
@@ -19788,6 +19859,7 @@ class RADAUSolver(_RadauSolverConfig):
                 dtype=dtype,
                 max_total_steps=max_total_steps,
                 stop_after_accepted_steps=stop_after_accepted_steps,
+                stop_after_first_nonconverged_attempt=debug_stage_probe,
                 walltime_label="radau.attempt",
             )
         else:
@@ -19836,6 +19908,9 @@ class RADAUSolver(_RadauSolverConfig):
         fail_code_f = step_state_f.status[STATUS_FAIL_CODE]
         n_acc_f = step_state_f.status[STATUS_N_ACCEPTED]
         accepted_limit_hit = _accepted_step_limit_reached(step_state_f, stop_after_accepted_steps)
+        diagnostic_stopped = jnp.asarray(
+            debug_stage_probe and not bool(jax.device_get(last_attempt_converged)),
+        )
         return _finalize_custom_solver_output(
             ys_saved, ts_saved, dts_saved, accepted_mask_saved, failed_mask_saved, fail_codes_saved,
             step_state_f.y,
@@ -19872,6 +19947,7 @@ class RADAUSolver(_RadauSolverConfig):
             fixed_temperature_profile=fixed_temperature_profile,
             density_floor=density_floor,
             temperature_floor=temperature_floor,
+            diagnostic_stopped=diagnostic_stopped,
         )
 
 
@@ -24630,6 +24706,9 @@ def build_time_solver(solver_parameters: Any, solver_override: Any = None) -> Tr
             stop_after_accepted_steps=stop_after_accepted_steps,
             debug_stage_markers=bool(_cfg_get("debug_stage_markers", False)),
             debug_walltime_attempts=bool(_cfg_get("debug_walltime_attempts", False)),
+            debug_stop_after_first_failed_stage_probe=bool(
+                _cfg_get("radau_debug_stop_after_first_failed_stage_probe", False)
+            ),
             save_n=save_n,
         )
     integrator_ctor = _get_diffrax_integrator(backend)

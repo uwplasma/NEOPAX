@@ -942,6 +942,20 @@ def test_build_time_solver_radau_backend():
     assert solver.rhs_mode == "black_box"
 
 
+def test_build_time_solver_radau_enables_first_failed_stage_repeat_probe():
+    pytest.importorskip("diffrax")
+    solver = build_time_solver(
+        _base_solver_parameters(
+            transport_solver_backend="radau",
+            debug_walltime_attempts=True,
+            radau_debug_stop_after_first_failed_stage_probe=True,
+        )
+    )
+    assert isinstance(solver, RADAUSolver)
+    assert solver.debug_walltime_attempts
+    assert solver.debug_stop_after_first_failed_stage_probe
+
+
 @pytest.mark.parametrize("backend", ["radau", "theta_newton"])
 def test_build_time_solver_accepts_global_state_drift_max(backend):
     pytest.importorskip("diffrax")
