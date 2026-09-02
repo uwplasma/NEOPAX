@@ -14222,7 +14222,15 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                 lij = _lij_from_transport_moments_directional(self.species, m, species_index=a, vth_a=vth)
                 return _assemble_face_fluxes_from_lij_directional_local(charge=self.species.charge[a], density=_jet_select_axis(n,a), temperature=_jet_select_axis(t,a), density_gradient=_jet_select_axis(dn,a), temperature_gradient=_jet_select_axis(dt,a), er=er, lij=lij)
             return jax.vmap(per_species)(species_indices)
-        gamma, q, upar = self._map_radius_axis_regularized_at_axis0(per_radius, radii, self.geometry.r_grid_half)
+        gamma, q, upar = self._map_radius_axis_regularized_at_axis0(
+            per_radius, radii, self.geometry.r_grid_half
+        )
+        # ``per_radius`` maps radius first.  The transport interface, like the
+        # ordinary Lij evaluator, is species-first: (species, face).
+        gamma, q, upar = (
+            jax.tree_util.tree_map(lambda array: jnp.swapaxes(array, 0, 1), value)
+            for value in (gamma, q, upar)
+        )
         return {"Gamma_faces": _jet_evaluate(gamma), "Q_faces": _jet_evaluate(q), "Upar_faces": _jet_evaluate(upar)}
 
     def evaluate_with_lagged_response(self, state, lagged_response, **kwargs):
