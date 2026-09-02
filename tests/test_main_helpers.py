@@ -52,6 +52,7 @@ from NEOPAX._transport_flux_models import (
     NTXDatabaseTransportModel,
     NTXExactLijRuntimeTransportModel,
     NTXExactLijRuntimeSupport,
+    NTXFullStateQuadraticPreparedCoefficientResponse,
     NTXQuadraticPreparedCoefficientResponse,
     NTXRuntimeScanChannels,
     NTXRuntimeScanTransportModel,
@@ -271,6 +272,21 @@ def test_ntx_exact_runtime_quadratic_lagged_response_matches_live_reference(resp
     for name in ("Gamma", "Q", "Upar"):
         assert jnp.allclose(
             lagged[f"{name}_faces"], direct[name], rtol=3.0e-6, atol=1.0e-12
+        )
+
+    full_state_model = dataclasses.replace(model, full_state_quadratic_response=True)
+    full_state_response = dataclasses.replace(
+        response,
+        face_response=NTXFullStateQuadraticPreparedCoefficientResponse(
+            reference_state=state,
+            coefficient_response=response.face_response,
+        ),
+    )
+    assert isinstance(full_state_response.face_response, NTXFullStateQuadraticPreparedCoefficientResponse)
+    full_state = full_state_model.evaluate_with_lagged_response(state, full_state_response)
+    for name in ("Gamma", "Q", "Upar"):
+        assert jnp.allclose(
+            full_state[f"{name}_faces"], direct[name], rtol=3.0e-6, atol=1.0e-12
         )
 
 

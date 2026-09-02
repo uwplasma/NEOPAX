@@ -51,6 +51,28 @@ from ._state import (
     safe_density,
     safe_temperature,
 )
+from ._second_order_response import (
+    DirectionalSecondOrderJet,
+    add as _jet_add,
+    absolute_with_fixed_anchor_sign as _jet_abs,
+    divide as _jet_divide,
+    compose_ntx_coefficient_quadratic,
+    dynamic_index as _jet_dynamic_index,
+    erf as _jet_erf,
+    evaluate as _jet_evaluate,
+    exp as _jet_exp,
+    log10 as _jet_log10,
+    maximum_with_constant_floor,
+    multiply as _jet_multiply,
+    negate as _jet_negate,
+    select_axis as _jet_select_axis,
+    seed as _jet_seed,
+    stack as _jet_stack,
+    subtract as _jet_subtract,
+    sum_axis as _jet_sum_axis,
+    take as _jet_take,
+    unary_power as _jet_power,
+)
 from ._database import D11_POSITIVE_FLOOR, Monoenergetic
 from ._source_models import assemble_pressure_source_components, sum_source_components
 from ._model_api import (
@@ -60,7 +82,7 @@ from ._model_api import (
     validate_transport_flux_builder,
 )
 from ._transport_debug import lagged_timing_enabled, lagged_timing_start, lagged_timing_end
-from ._constants import elementary_charge, proton_mass
+from ._constants import elementary_charge, epsilon_0, proton_mass
 from ._spectrax_quasilinear_runtime import (
     SpectraXQuasilinearRuntimeDiagnostics,
     evaluate_spectrax_quasilinear_proxy,
@@ -454,6 +476,22 @@ class NTXQuadraticPreparedCoefficientResponse:
 
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True, eq=False)
+class NTXFullStateQuadraticPreparedCoefficientResponse:
+    """Forward-only full transport-state wrapper around NTX coefficient data.
+
+    The nested coefficient response remains exactly the factorized NTX
+    Hessian payload.  ``reference_state`` supplies the missing state anchor
+    needed to evaluate its explicit full-state Taylor composition at a Radau
+    stage.  This separate type prevents the established coefficient-only
+    quadratic response from silently changing meaning.
+    """
+
+    reference_state: TransportState
+    coefficient_response: NTXQuadraticPreparedCoefficientResponse
+
+
+@jax.tree_util.register_dataclass
+@dataclasses.dataclass(frozen=True, eq=False)
 class NTXInterpolatedMomentResponse:
     reference_er: jax.Array
     reference_log_nu_star: jax.Array
@@ -554,6 +592,35 @@ class EvaluatedTransportState:
     density_grad_face: jax.Array
     temperature_grad_face: jax.Array
     Er_grad_face: jax.Array
+
+
+@jax.tree_util.register_dataclass
+@dataclasses.dataclass(frozen=True, eq=False)
+class _DirectionalTransportState:
+    """Fixed-anchor second-order transport-state response along one stage direction."""
+
+    density: DirectionalSecondOrderJet
+    pressure: DirectionalSecondOrderJet
+    Er: DirectionalSecondOrderJet
+
+    @property
+    def temperature(self):
+        return _jet_divide(self.pressure, self.density)
+
+
+@jax.tree_util.register_dataclass
+@dataclasses.dataclass(frozen=True, eq=False)
+class _DirectionalEvaluatedTransportState:
+    """Directional counterpart to :class:`EvaluatedTransportState`."""
+
+    center: _DirectionalTransportState
+    face: _DirectionalTransportState
+    density_grad_center: DirectionalSecondOrderJet
+    temperature_grad_center: DirectionalSecondOrderJet
+    Er_grad_center: DirectionalSecondOrderJet
+    density_grad_face: DirectionalSecondOrderJet
+    temperature_grad_face: DirectionalSecondOrderJet
+    Er_grad_face: DirectionalSecondOrderJet
 
 
 def _flatten_flux_dict(fluxes: dict) -> tuple[jax.Array, tuple[str, ...]]:
@@ -718,6 +785,69 @@ def _face_profile_gradient(profile, face_centers, bc_model=None):
     return grads
 
 
+def _homogeneous_directional_bc_model(bc_model):
+    """Return the tangent BC model for a fixed-anchor face response.
+
+    Explicit Dirichlet values and Neumann gradients are external constants and
+    hence have zero directional response.  A missing Dirichlet value
+    deliberately remains ``None``: in that case the ordinary FV rule uses the
+    endpoint profile, so it is state dependent. Robin has no additive external
+    datum in the implemented FV constraint and remains homogeneous.
+    """
+    if bc_model is None:
+        return None
+    changes = {}
+    for side in ("left", "right"):
+        value_name = f"{side}_value"
+        gradient_name = f"{side}_gradient"
+        boundary_type = str(getattr(bc_model, f"{side}_type", "dirichlet")).strip().lower()
+        if boundary_type == "dirichlet":
+            boundary_value = getattr(bc_model, value_name, None)
+            if boundary_value is not None:
+                changes[value_name] = jnp.zeros_like(jnp.asarray(boundary_value))
+        elif boundary_type == "neumann":
+            boundary_gradient = getattr(bc_model, gradient_name, None)
+            if boundary_gradient is not None:
+                changes[gradient_name] = jnp.zeros_like(jnp.asarray(boundary_gradient))
+    return dataclasses.replace(bc_model, **changes) if changes else bc_model
+
+
+def _face_profile_directional(
+    profile: DirectionalSecondOrderJet,
+    face_centers,
+    *,
+    bc_model=None,
+    reconstruction: str = "linear",
+) -> DirectionalSecondOrderJet:
+    """Propagate a profile jet through the fixed-branch linear FV face map."""
+    if reconstruction != "linear":
+        raise NotImplementedError(
+            "Full-state quadratic realtime NTX responses currently require "
+            "linear face reconstruction; WENO has a state-dependent stencil."
+        )
+    tangent_bc = _homogeneous_directional_bc_model(bc_model)
+    return DirectionalSecondOrderJet(
+        _face_profile(profile.value, face_centers, bc_model=bc_model, reconstruction=reconstruction),
+        _face_profile(profile.first, face_centers, bc_model=tangent_bc, reconstruction=reconstruction),
+        _face_profile(profile.second, face_centers, bc_model=tangent_bc, reconstruction=reconstruction),
+    )
+
+
+def _face_profile_gradient_directional(
+    profile: DirectionalSecondOrderJet,
+    face_centers,
+    *,
+    bc_model=None,
+) -> DirectionalSecondOrderJet:
+    """Propagate a profile jet through the fixed-branch FV face-gradient map."""
+    tangent_bc = _homogeneous_directional_bc_model(bc_model)
+    return DirectionalSecondOrderJet(
+        _face_profile_gradient(profile.value, face_centers, bc_model=bc_model),
+        _face_profile_gradient(profile.first, face_centers, bc_model=tangent_bc),
+        _face_profile_gradient(profile.second, face_centers, bc_model=tangent_bc),
+    )
+
+
 def _center_profile_gradient(profile, face_centers, bc_model=None):
     if profile.ndim == 1:
         profile_2d = profile[None, :]
@@ -849,6 +979,265 @@ def build_evaluated_transport_state(
             geometry.r_grid_half,
             bc_model=bc_er,
         ),
+    )
+
+
+def _center_profile_gradient_directional(
+    profile: DirectionalSecondOrderJet,
+    face_centers,
+    *,
+    bc_model=None,
+) -> DirectionalSecondOrderJet:
+    tangent_bc = _homogeneous_directional_bc_model(bc_model)
+    return DirectionalSecondOrderJet(
+        _center_profile_gradient(profile.value, face_centers, bc_model=bc_model),
+        _center_profile_gradient(profile.first, face_centers, bc_model=tangent_bc),
+        _center_profile_gradient(profile.second, face_centers, bc_model=tangent_bc),
+    )
+
+
+def _jet_vthermal_from_temperature(
+    reference_vthermal: jax.Array,
+    temperature: DirectionalSecondOrderJet,
+) -> DirectionalSecondOrderJet:
+    """Explicit thermal-speed response, retaining the normal-model anchor."""
+    normalized_temperature = _jet_divide(temperature, temperature.value)
+    return _jet_multiply(jnp.asarray(reference_vthermal), _jet_power(normalized_temperature, 0.5))
+
+
+def _nu_over_vnew_local_directional_default(
+    species,
+    species_index: int,
+    v_new: DirectionalSecondOrderJet,
+    density_local: DirectionalSecondOrderJet,
+    temperature_local: DirectionalSecondOrderJet,
+    vthermal_local: DirectionalSecondOrderJet,
+) -> DirectionalSecondOrderJet:
+    """Default local collision response written through second directional order.
+
+    This mirrors ``collisionality_local(..., COULOMB_LOG_MODEL_DEFAULT) /
+    v_new``.  It is deliberately explicit: no generic JVP/VJP traces through
+    the collision or NTX code are created.
+    """
+    electron_temperature = _jet_select_axis(temperature_local, 0)
+    electron_density = _jet_select_axis(density_local, 0)
+    coulomb_log = _jet_add(
+        32.2,
+        _jet_multiply(
+            1.15,
+            _jet_log10(
+                _jet_divide(
+                    _jet_multiply(1.0e6, _jet_multiply(electron_temperature, electron_temperature)),
+                    _jet_multiply(1.0e20, electron_density),
+                )
+            ),
+        ),
+    )
+    test_charge = species.charge[species_index]
+    test_mass = species.mass[species_index]
+    collision_sum = None
+    for background_index in range(int(species.number_species)):
+        background_density = _jet_select_axis(density_local, background_index)
+        background_vthermal = _jet_select_axis(vthermal_local, background_index)
+        gamma_prefactor = (
+            test_charge**2
+            * species.charge[background_index] ** 2
+            / (4.0 * jnp.pi * epsilon_0**2 * test_mass**2)
+        )
+        x = _jet_divide(v_new, background_vthermal)
+        chandrasekhar = _jet_divide(
+            _jet_subtract(
+                _jet_erf(x),
+                _jet_multiply(
+                    2.0 / jnp.sqrt(jnp.pi),
+                    _jet_multiply(x, _jet_exp(_jet_multiply(-1.0, _jet_multiply(x, x)))),
+                ),
+            ),
+            _jet_multiply(2.0, _jet_multiply(x, x)),
+        )
+        pair = _jet_multiply(
+            _jet_multiply(gamma_prefactor, coulomb_log),
+            _jet_multiply(
+                _jet_divide(_jet_multiply(1.0e20, background_density), _jet_power(v_new, 3.0)),
+                _jet_subtract(_jet_erf(x), chandrasekhar),
+            ),
+        )
+        collision_sum = pair if collision_sum is None else _jet_add(collision_sum, pair)
+    return _jet_divide(collision_sum, v_new)
+
+
+def _local_scan_inputs_directional_default(
+    energy_grid,
+    species,
+    *,
+    drds_value,
+    species_index: int,
+    er_value: DirectionalSecondOrderJet,
+    temperature_local: DirectionalSecondOrderJet,
+    density_local: DirectionalSecondOrderJet,
+    reference_vthermal_local: jax.Array,
+    er_v_floor: float | None,
+) -> tuple[DirectionalSecondOrderJet, DirectionalSecondOrderJet, DirectionalSecondOrderJet]:
+    """Custom full-state response of the realtime NTX local coordinates."""
+    vthermal_local = _jet_vthermal_from_temperature(reference_vthermal_local, temperature_local)
+    vth_a = _jet_select_axis(vthermal_local, species_index)
+    v_new_a = _jet_multiply(jnp.asarray(energy_grid.v_norm), vth_a)
+    finite_drds = jnp.isfinite(drds_value)
+    safe_drds = jnp.where(finite_drds, drds_value, jnp.asarray(0.0, dtype=vth_a.value.dtype))
+    epsi_hat = _jet_divide(_jet_multiply(1.0e3 * safe_drds, er_value), v_new_a)
+    if er_v_floor is not None:
+        sign = jnp.where(epsi_hat.value < 0.0, -1.0, 1.0)
+        epsi_abs = maximum_with_constant_floor(_jet_abs(epsi_hat), er_v_floor)
+        epsi_hat = _jet_multiply(sign, epsi_abs)
+    nu_hat = _nu_over_vnew_local_directional_default(
+        species, species_index, v_new_a, density_local, temperature_local, vthermal_local
+    )
+    return nu_hat, epsi_hat, vth_a
+
+
+def _transport_moments_from_coefficient_scan_directional(
+    energy_grid,
+    coefficient_scan: DirectionalSecondOrderJet,
+    *,
+    drds_value,
+) -> DirectionalSecondOrderJet:
+    """Explicit coefficient-to-moment reduction on the frozen D11 branch."""
+    d11 = maximum_with_constant_floor(
+        _jet_multiply(_jet_take(coefficient_scan, 0, axis=1), drds_value**2),
+        D11_POSITIVE_FLOOR,
+    )
+    d11 = _jet_multiply(-1.0, d11)
+    d13 = _jet_multiply(-drds_value, _jet_take(coefficient_scan, 2, axis=1))
+    d33 = _jet_multiply(-1.0, _jet_take(coefficient_scan, 3, axis=1))
+    weights = energy_grid.xWeights
+    return _jet_stack(
+        (
+            _jet_sum_axis(_jet_multiply(energy_grid.L11_weight * weights, d11)),
+            _jet_sum_axis(_jet_multiply(energy_grid.L12_weight * weights, d11)),
+            _jet_sum_axis(_jet_multiply(energy_grid.L22_weight * weights, d11)),
+            _jet_sum_axis(_jet_multiply(energy_grid.L13_weight * weights, d13)),
+            _jet_sum_axis(_jet_multiply(energy_grid.L23_weight * weights, d13)),
+            _jet_sum_axis(_jet_multiply(energy_grid.L33_weight * weights, d33)),
+        ),
+        axis=0,
+    )
+
+
+def _lij_from_transport_moments_directional(
+    species,
+    transport_moments: DirectionalSecondOrderJet,
+    *,
+    species_index: int,
+    vth_a: DirectionalSecondOrderJet,
+) -> DirectionalSecondOrderJet:
+    """Written second-order counterpart of ``_lij_from_transport_moments``."""
+    charge, mass = species.charge[species_index], species.mass[species_index]
+    inv_sqrt_pi = 1.0 / jnp.sqrt(jnp.pi)
+    l11_factor = _jet_multiply(-inv_sqrt_pi * (mass / charge) ** 2, _jet_power(vth_a, 3.0))
+    l13_factor = _jet_multiply(-inv_sqrt_pi * (mass / charge), _jet_power(vth_a, 2.0))
+    l33_factor = _jet_multiply(-inv_sqrt_pi, vth_a)
+    l00, l01, l11 = (_jet_multiply(l11_factor, _jet_take(transport_moments, index)) for index in (0, 1, 2))
+    l02, l12 = (_jet_multiply(l13_factor, _jet_take(transport_moments, index)) for index in (3, 4))
+    l22 = _jet_multiply(l33_factor, _jet_take(transport_moments, 5))
+    return _jet_stack((_jet_stack((l00, l01, l02), axis=-1), _jet_stack((l01, l11, l12), axis=-1), _jet_stack((_jet_negate(l02), _jet_negate(l12), l22), axis=-1)), axis=-2)
+
+
+def _directional_lij_entry(lij: DirectionalSecondOrderJet, row: int, column: int) -> DirectionalSecondOrderJet:
+    return _jet_take(_jet_take(lij, row, axis=0), column, axis=0)
+
+
+def _assemble_face_fluxes_from_lij_directional_local(
+    *,
+    charge,
+    density: DirectionalSecondOrderJet,
+    temperature: DirectionalSecondOrderJet,
+    density_gradient: DirectionalSecondOrderJet,
+    temperature_gradient: DirectionalSecondOrderJet,
+    er: DirectionalSecondOrderJet,
+    lij: DirectionalSecondOrderJet,
+) -> tuple[DirectionalSecondOrderJet, DirectionalSecondOrderJet, DirectionalSecondOrderJet]:
+    """Second-order directional counterpart of one-species face flux assembly."""
+    a1 = _jet_subtract(
+        _jet_subtract(
+            _jet_divide(density_gradient, density),
+            _jet_multiply(1.5, _jet_divide(temperature_gradient, temperature)),
+        ),
+        _jet_divide(_jet_multiply(charge, er), _jet_multiply(elementary_charge, temperature)),
+    )
+    a2 = _jet_divide(temperature_gradient, temperature)
+    gamma = _jet_multiply(
+        _jet_multiply(-DENSITY_STATE_TO_PHYSICAL, density),
+        _jet_add(
+            _jet_multiply(_directional_lij_entry(lij, 0, 0), a1),
+            _jet_multiply(_directional_lij_entry(lij, 0, 1), a2),
+        ),
+    )
+    q = _jet_multiply(
+        _jet_multiply(-DENSITY_STATE_TO_PHYSICAL * TEMPERATURE_STATE_TO_PHYSICAL, _jet_multiply(temperature, density)),
+        _jet_add(
+            _jet_multiply(_directional_lij_entry(lij, 1, 0), a1),
+            _jet_multiply(_directional_lij_entry(lij, 1, 1), a2),
+        ),
+    )
+    upar = _jet_multiply(
+        _jet_multiply(-DENSITY_STATE_TO_PHYSICAL, density),
+        _jet_add(
+            _jet_multiply(_directional_lij_entry(lij, 2, 0), a1),
+            _jet_multiply(_directional_lij_entry(lij, 2, 1), a2),
+        ),
+    )
+    return gamma, q, upar
+
+
+def _build_evaluated_transport_state_directional(
+    state: TransportState,
+    state_direction: TransportState,
+    geometry: Any,
+    *,
+    bc_density: Any = None,
+    bc_temperature: Any = None,
+    bc_er: Any = None,
+    reconstruction: str = "linear",
+    density_floor: Any = DEFAULT_TRANSPORT_DENSITY_FLOOR,
+    temperature_floor: Any = DEFAULT_TRANSPORT_TEMPERATURE_FLOOR,
+) -> _DirectionalEvaluatedTransportState:
+    """Explicit fixed-anchor state response through the FV evaluation layer."""
+    center = _DirectionalTransportState(
+        density=maximum_with_constant_floor(_jet_seed(state.density, state_direction.density), density_floor),
+        pressure=_jet_seed(state.pressure, state_direction.pressure),
+        Er=_jet_seed(state.Er, state_direction.Er),
+    )
+    if temperature_floor is not None:
+        center = dataclasses.replace(
+            center,
+            pressure=_jet_multiply(
+                center.density,
+                maximum_with_constant_floor(center.temperature, temperature_floor),
+            ),
+        )
+    density_face = maximum_with_constant_floor(
+        _face_profile_directional(center.density, geometry.r_grid_half, bc_model=bc_density, reconstruction=reconstruction),
+        density_floor,
+    )
+    temperature_face = _face_profile_directional(
+        center.temperature, geometry.r_grid_half, bc_model=bc_temperature, reconstruction=reconstruction
+    )
+    if temperature_floor is not None:
+        temperature_face = maximum_with_constant_floor(temperature_face, temperature_floor)
+    face = _DirectionalTransportState(
+        density=density_face,
+        pressure=_jet_multiply(density_face, temperature_face),
+        Er=_face_profile_directional(center.Er, geometry.r_grid_half, bc_model=bc_er, reconstruction=reconstruction),
+    )
+    return _DirectionalEvaluatedTransportState(
+        center=center,
+        face=face,
+        density_grad_center=_center_profile_gradient_directional(center.density, geometry.r_grid_half, bc_model=bc_density),
+        temperature_grad_center=_center_profile_gradient_directional(center.temperature, geometry.r_grid_half, bc_model=bc_temperature),
+        Er_grad_center=_center_profile_gradient_directional(center.Er, geometry.r_grid_half, bc_model=bc_er),
+        density_grad_face=_face_profile_gradient_directional(center.density, geometry.r_grid_half, bc_model=bc_density),
+        temperature_grad_face=_face_profile_gradient_directional(center.temperature, geometry.r_grid_half, bc_model=bc_temperature),
+        Er_grad_face=_face_profile_gradient_directional(center.Er, geometry.r_grid_half, bc_model=bc_er),
     )
 
 
@@ -3471,6 +3860,10 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
     # Hessian primitive is implemented below; order one remains the exact
     # established realtime response path.
     lagged_response_taylor_order: int = 1
+    # Opt-in full transport-state composition of the existing coefficient
+    # Hessian.  Kept separate from the established coefficient-only order-two
+    # mode until its dedicated face evaluator is selected below.
+    full_state_quadratic_response: bool = False
 
     def __post_init__(self):
         order = int(self.lagged_response_taylor_order)
@@ -3478,6 +3871,10 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             raise ValueError(
                 "ntx_exact_lij_runtime lagged_response_taylor_order must be 1 or 2."
             )
+        if self.full_state_quadratic_response and order != 2:
+            raise ValueError("full_state_quadratic_response requires lagged_response_taylor_order = 2.")
+        if self.full_state_quadratic_response and str(self.collisionality_model).strip().lower() not in {"", "default"}:
+            raise NotImplementedError("full_state_quadratic_response currently supports collisionality_model = 'default' only.")
 
     def _rho_center_face(self):
         a_b = jnp.asarray(self.geometry.a_b, dtype=jnp.float64)
@@ -10473,6 +10870,18 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             density=face_density,
             v_thermal=face_v_thermal,
         )
+        if self.full_state_quadratic_response:
+            if self._resolved_center_response_mode() != "interpolate_from_faces":
+                raise NotImplementedError(
+                    "full_state_quadratic_response currently requires "
+                    "center_response_mode = 'interpolate_from_faces'."
+                )
+            if not isinstance(face_response, NTXQuadraticPreparedCoefficientResponse):
+                raise AssertionError("full-state quadratic response requires quadratic coefficient payload.")
+            face_response = NTXFullStateQuadraticPreparedCoefficientResponse(
+                reference_state=state,
+                coefficient_response=face_response,
+            )
         _debug_arrays_if_any_nonfinite(
             "ntx.build_lagged_response.face_state",
             (
@@ -13784,8 +14193,32 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             **kwargs,
         )
 
+    def _evaluate_full_state_quadratic_face_response(self, state, response):
+        delta = dataclasses.replace(state, density=state.density-response.reference_state.density, pressure=state.pressure-response.reference_state.pressure, Er=state.Er-response.reference_state.Er)
+        evaluated = _build_evaluated_transport_state_directional(response.reference_state, delta, self.geometry, bc_density=self.bc_density, bc_temperature=self.bc_temperature, density_floor=self.density_floor, temperature_floor=self.temperature_floor)
+        support, coefficients = self._static_support(), response.coefficient_response
+        vthermal0 = get_v_thermal(self.species.mass, evaluated.face.temperature.value)
+        radii = jnp.arange(evaluated.face.Er.value.shape[0], dtype=jnp.int32); species_indices = jnp.arange(int(self.species.number_species), dtype=jnp.int32)
+        def per_radius(radius):
+            n = _jet_dynamic_index(evaluated.face.density, radius, axis=1); t = _jet_dynamic_index(evaluated.face.temperature, radius, axis=1); er = _jet_dynamic_index(evaluated.face.Er, radius)
+            dn = _jet_dynamic_index(evaluated.density_grad_face, radius, axis=1); dt = _jet_dynamic_index(evaluated.temperature_grad_face, radius, axis=1)
+            v0 = jax.lax.dynamic_index_in_dim(vthermal0, radius, axis=1, keepdims=False); drds = jax.lax.dynamic_index_in_dim(support.face_channels.drds, radius, axis=0, keepdims=False)
+            def per_species(a):
+                nu, ep, vth = _local_scan_inputs_directional_default(self.energy_grid, self.species, drds_value=drds, species_index=a, er_value=er, temperature_local=t, density_local=n, reference_vthermal_local=v0, er_v_floor=self.er_v_floor)
+                fields = jax.tree_util.tree_map(lambda x: jax.lax.dynamic_index_in_dim(jax.lax.dynamic_index_in_dim(x, radius, axis=0, keepdims=False), a, axis=0, keepdims=False), coefficients)
+                c = compose_ntx_coefficient_quadratic(*dataclasses.astuple(fields), nu, ep); m = _transport_moments_from_coefficient_scan_directional(self.energy_grid, c, drds_value=drds)
+                lij = _lij_from_transport_moments_directional(self.species, m, species_index=a, vth_a=vth)
+                return _assemble_face_fluxes_from_lij_directional_local(charge=self.species.charge[a], density=_jet_select_axis(n,a), temperature=_jet_select_axis(t,a), density_gradient=_jet_select_axis(dn,a), temperature_gradient=_jet_select_axis(dt,a), er=er, lij=lij)
+            return jax.vmap(per_species)(species_indices)
+        gamma, q, upar = self._map_radius_axis_regularized_at_axis0(per_radius, radii, self.geometry.r_grid_half)
+        return {"Gamma_faces": _jet_evaluate(gamma), "Q_faces": _jet_evaluate(q), "Upar_faces": _jet_evaluate(upar)}
+
     def evaluate_with_lagged_response(self, state, lagged_response, **kwargs):
         del kwargs
+        if isinstance(lagged_response.face_response, NTXFullStateQuadraticPreparedCoefficientResponse):
+            if lagged_response.center_response is not None:
+                raise NotImplementedError("full-state quadratic response is face-only.")
+            return self._evaluate_full_state_quadratic_face_response(state, lagged_response.face_response)
         evaluated = build_evaluated_transport_state(
             state,
             self.geometry,
@@ -15653,6 +16086,7 @@ def build_ntx_exact_lij_runtime_transport_model(
     ntx_exact_derivative_pullback_boundary="inline",
     ntx_exact_derivative_pullback_algebra="ntx_helper",
     ntx_exact_er_v_floor=None,
+    ntx_exact_full_state_quadratic_response=False,
     lagged_response_taylor_order=1,
     ntx_exact_lij_support=None,
     preload_support=False,
@@ -15721,6 +16155,7 @@ def build_ntx_exact_lij_runtime_transport_model(
             if ntx_exact_er_v_floor in (None, "", 0, "0")
             else float(ntx_exact_er_v_floor)
         ),
+        full_state_quadratic_response=bool(ntx_exact_full_state_quadratic_response),
         collisionality_model=str(collisionality_model),
         bc_density=bc_density,
         bc_temperature=bc_temperature,
