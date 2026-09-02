@@ -2990,6 +2990,116 @@ def _run_realtime_geometry_support_pullback_probe(
             "active_drds_leaves": int(active_drds_leaves),
             "directions": directional_rows,
         }
+
+    direct_rhs_geometry_duality = None
+    if bool(getattr(args, "support_pullback_probe_direct_rhs_geometry_duality", False)):
+        if not isinstance(support_payload, dict) or "geometry" not in support_payload:
+            raise RuntimeError(
+                "direct-RHS geometry duality requires a combined realtime geometry support payload."
+            )
+        geometry = support_payload["geometry"]
+        geometry_paths, geometry_treedef = jax.tree_util.tree_flatten_with_path(geometry)
+
+        def _geometry_direction(_path, leaf):
+            value = jnp.asarray(leaf)
+            if jnp.issubdtype(value.dtype, jnp.inexact):
+                size = max(int(value.size), 1)
+                return jnp.ones_like(value) / jnp.sqrt(
+                    jnp.asarray(size, dtype=value.real.dtype)
+                )
+            return jnp.zeros_like(value, dtype=jax.dtypes.float0)
+
+        geometry_direction = geometry_treedef.unflatten(
+            tuple(_geometry_direction(path, leaf) for path, leaf in geometry_paths)
+        )
+
+        def _tree_vdot(left, right):
+            terms = []
+            for left_leaf, right_leaf in zip(
+                jax.tree_util.tree_leaves(left),
+                jax.tree_util.tree_leaves(right),
+                strict=True,
+            ):
+                left_value = jnp.asarray(left_leaf)
+                right_value = jnp.asarray(right_leaf)
+                if (
+                    jnp.issubdtype(left_value.dtype, jnp.inexact)
+                    and jnp.issubdtype(right_value.dtype, jnp.inexact)
+                ):
+                    terms.append(jnp.vdot(left_value, right_value))
+            return jnp.asarray(0.0, dtype=jnp.float64) if not terms else sum(terms)
+
+        def _rhs_from_geometry(geometry_value):
+            return equation_system.with_geometry_payload(geometry_value).evaluate_with_lagged_response(
+                t0,
+                baseline_profile_state,
+                baseline_runtime.species,
+                lagged_response,
+            )
+
+        # This fixed-flux map isolates transport-equation assembly.  In the wHe
+        # density row it is exactly the direct Vprime/Vprime_half divergence
+        # route, with NTX response and its geometry dependence held fixed.
+        working_state, _electron_index = equation_system._prepare_working_state(
+            baseline_profile_state
+        )
+        shared_fluxes = equation_system.shared_flux_model.evaluate_with_lagged_response(
+            working_state,
+            lagged_response.flux_response,
+            **equation_system._shared_flux_bc_kwargs(),
+        )
+
+        def _rhs_from_geometry_fixed_flux(geometry_value):
+            return equation_system.with_geometry_payload(geometry_value).evaluate_with_shared_fluxes(
+                t0,
+                baseline_profile_state,
+                baseline_runtime.species,
+                shared_fluxes,
+            )
+
+        full_rhs, full_rhs_tangent = jax.jvp(
+            _rhs_from_geometry, (geometry,), (geometry_direction,)
+        )
+        fixed_flux_rhs, fixed_flux_rhs_tangent = jax.jvp(
+            _rhs_from_geometry_fixed_flux, (geometry,), (geometry_direction,)
+        )
+        rows = {}
+        for component_name in ("density", "pressure", "Er"):
+            rhs_bar = _rhs_bar_for(component_name)
+            lhs = jnp.vdot(
+                jnp.asarray(getattr(rhs_bar, component_name)),
+                jnp.asarray(getattr(full_rhs_tangent, component_name)),
+            )
+            geometry_bar = support_bars[f"rhs_{component_name}"]["geometry"]
+            rhs_value = _tree_vdot(geometry_bar, geometry_direction)
+            lhs, rhs_value = jax.block_until_ready((lhs, rhs_value))
+            abs_err = jnp.abs(lhs - rhs_value)
+            rel_err = abs_err / jnp.maximum(
+                jnp.asarray(1.0e-30, dtype=abs_err.dtype),
+                jnp.maximum(jnp.abs(lhs), jnp.abs(rhs_value)),
+            )
+            direct_l2 = jnp.linalg.norm(
+                jnp.asarray(getattr(fixed_flux_rhs_tangent, component_name)).reshape(-1)
+            )
+            full_l2 = jnp.linalg.norm(
+                jnp.asarray(getattr(full_rhs_tangent, component_name)).reshape(-1)
+            )
+            rows[component_name] = {
+                "full_rhs_jvp_dot_component_bar": float(lhs),
+                "geometry_vjp_dot_direction": float(rhs_value),
+                "abs_err": float(abs_err),
+                "rel_err": float(rel_err),
+                "full_rhs_geometry_jvp_l2": float(jax.block_until_ready(full_l2)),
+                "fixed_flux_direct_geometry_jvp_l2": float(jax.block_until_ready(direct_l2)),
+            }
+        primal_abs_err = _tree_vdot(
+            jax.tree_util.tree_map(lambda lhs, rhs: lhs - rhs, full_rhs, rhs),
+            jax.tree_util.tree_map(lambda lhs, rhs: lhs - rhs, full_rhs, rhs),
+        )
+        direct_rhs_geometry_duality = {
+            "full_rhs_primal_l2_error_squared": float(jax.block_until_ready(primal_abs_err)),
+            "directions": rows,
+        }
     support_summary = _payload_leaf_summary(support_payload)
     support_bar_summaries = {
         name: _payload_leaf_summary(support_bar)
@@ -3016,6 +3126,7 @@ def _run_realtime_geometry_support_pullback_probe(
         "support_bar_l2": support_bar_l2,
         "support_pullback_probe_include_build": bool(args.support_pullback_probe_include_build),
         "support_pullback_probe_build_directional_duality": build_directional_duality,
+        "support_pullback_probe_direct_rhs_geometry_duality": direct_rhs_geometry_duality,
     }
     print(
         "[autodiff-gate] mode=transport_reverse_ad_only "
@@ -3047,6 +3158,24 @@ def _run_realtime_geometry_support_pullback_probe(
                 f"rhs={row['rhs_support_bar_dot_direction']:.6e} "
                 f"abs_err={row['abs_err']:.6e} "
                 f"rel_err={row['rel_err']:.6e}",
+                flush=True,
+            )
+    if direct_rhs_geometry_duality is not None:
+        print(
+            "[autodiff-gate] support direct-RHS geometry primal consistency: "
+            f"l2_error_squared={direct_rhs_geometry_duality['full_rhs_primal_l2_error_squared']:.6e}",
+            flush=True,
+        )
+        for component_name, row in direct_rhs_geometry_duality["directions"].items():
+            print(
+                "[autodiff-gate] support direct-RHS geometry duality: "
+                f"component={component_name} "
+                f"lhs={row['full_rhs_jvp_dot_component_bar']:.6e} "
+                f"rhs={row['geometry_vjp_dot_direction']:.6e} "
+                f"abs_err={row['abs_err']:.6e} "
+                f"rel_err={row['rel_err']:.6e} "
+                f"full_jvp_l2={row['full_rhs_geometry_jvp_l2']:.6e} "
+                f"fixed_flux_direct_jvp_l2={row['fixed_flux_direct_geometry_jvp_l2']:.6e}",
                 flush=True,
             )
     outpath = _report_path("realtime_geometry_support_pullback")
@@ -5564,6 +5693,17 @@ def main() -> None:
             "Compare the compact lagged-response support pullback against one "
             "live support-space JVP by VJP/JVP duality. This does not invoke "
             "the VMEC/Boozer payload-to-parameter pullback."
+        ),
+    )
+    parser.add_argument(
+        "--support-pullback-probe-direct-rhs-geometry-duality",
+        action="store_true",
+        help=(
+            "Only for --realtime-geometry-gradient-path support_pullback_probe. "
+            "Check the full fixed-lagged-RHS geometry VJP against a geometry JVP, "
+            "and report the fixed-flux direct-assembly JVP separately. In wHe this "
+            "isolates the He density Vprime/Vprime_half divergence contribution "
+            "without a VMEC payload-to-parameter pullback or a reverse sweep."
         ),
     )
     parser.add_argument(
