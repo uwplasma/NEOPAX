@@ -8,6 +8,7 @@ import jax.numpy as jnp
 import pytest
 from ntx import GridSpec, example_surface, prepare_monoenergetic_system
 
+import NEOPAX._reverse_ad_transport as reverse_transport_module
 from NEOPAX._orchestrator import (
     _build_database,
     _build_flux_model,
@@ -93,6 +94,45 @@ def _tiny_ntx_runtime_channels(rho):
             "fac_dkes_to_d33star": ones,
         },
     )
+
+
+def test_reverse_initial_state_preserves_fixed_temperature_at_density_floor(monkeypatch):
+    """The reverse initial root must see the same floor regularization as forward."""
+
+    baseline_state = TransportState(
+        density=jnp.ones((4, 2)),
+        pressure=jnp.ones((4, 2)),
+        Er=jnp.zeros((2,)),
+    )
+    profile_set = types.SimpleNamespace(
+        density=jnp.asarray(
+            [[2.0e20, 2.0e20], [1.0e20, 1.0e20], [1.0e20, 1.0e20], [0.0, 0.0]]
+        ),
+        temperature=jnp.asarray(
+            [[8.0e3, 8.0e3], [7.0e3, 7.0e3], [7.0e3, 7.0e3], [0.7e3, 0.7e3]]
+        ),
+    )
+    runtime = types.SimpleNamespace(
+        geometry=object(),
+        species=types.SimpleNamespace(number_species=4),
+    )
+    monkeypatch.setattr(
+        reverse_transport_module,
+        "parameterized_profile_set",
+        lambda *args, **kwargs: profile_set,
+    )
+
+    state = reverse_transport_module.initial_state_for_parameter_vector(
+        jnp.asarray([4.21, 17.8, 2.0, 2.0]),
+        baseline_state=baseline_state,
+        profile_cfg={},
+        runtime=runtime,
+        config={"transport_solver": {"density_floor": 1.0e-6, "temperature_floor": 1.0e-6}},
+    )
+
+    assert jnp.allclose(state.density[3], 0.0)
+    assert jnp.allclose(state.pressure[3], 0.7e-6)
+    assert jnp.allclose(state.temperature[3], 0.7)
 
 
 def _repeat_ntx_prepared(prepared, count):

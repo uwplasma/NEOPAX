@@ -194,6 +194,7 @@ from NEOPAX._transport_flux_models import (  # noqa: E402
     _float_delta_tree_like,
     _sanitize_float_delta_bar_tree,
 )
+from NEOPAX._state import safe_density, safe_temperature  # noqa: E402
 from NEOPAX._transport_solvers import (  # noqa: E402
     _RadauAcceptedStepReducedCotangent,
     _build_prepared_radau_accepted_rollout,
@@ -740,7 +741,15 @@ def _initial_state_for_parameter_vector(
     )
     density_state = jnp.asarray(profile_set.density, dtype=baseline_state.density.dtype) / 1.0e20
     temperature_state = jnp.asarray(profile_set.temperature, dtype=baseline_state.pressure.dtype) / 1.0e3
-    pressure_state = density_state * temperature_state
+    solver_cfg = {} if config is None else dict(config.get("transport_solver", {}))
+    fallback_solver_cfg = {} if config is None else dict(config.get("solver", {}))
+    density_floor = solver_cfg.get("density_floor", fallback_solver_cfg.get("density_floor", 1.0e-6))
+    temperature_floor = solver_cfg.get("temperature_floor", fallback_solver_cfg.get("temperature_floor"))
+    # Keep this benchmark seam identical to _orchestrator._build_state.  This
+    # matters for a zero-concentration, fixed-temperature species such as He:
+    # its pressure must retain the density-floor times configured temperature.
+    temperature_state = safe_temperature(temperature_state, temperature_floor)
+    pressure_state = temperature_state * safe_density(density_state, density_floor)
     state = dataclasses.replace(
         baseline_state,
         density=density_state,

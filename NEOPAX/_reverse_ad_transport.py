@@ -61,6 +61,7 @@ from ._transport_flux_models import (
     _float_delta_tree_like,
     _sanitize_float_delta_bar_tree,
 )
+from ._state import safe_density, safe_temperature
 from ._transport_solvers import (
     RADAUSolver,
     NewtonThetaMethodSolver,
@@ -850,7 +851,15 @@ def initial_state_for_parameter_vector(
     )
     density_state = jnp.asarray(profile_set.density, dtype=baseline_state.density.dtype) / 1.0e20
     temperature_state = jnp.asarray(profile_set.temperature, dtype=baseline_state.pressure.dtype) / 1.0e3
-    pressure_state = density_state * temperature_state
+    solver_cfg = {} if config is None else dict(config.get("transport_solver", {}))
+    fallback_solver_cfg = {} if config is None else dict(config.get("solver", {}))
+    density_floor = solver_cfg.get("density_floor", fallback_solver_cfg.get("density_floor", 1.0e-6))
+    temperature_floor = solver_cfg.get("temperature_floor", fallback_solver_cfg.get("temperature_floor"))
+    # Match _orchestrator._build_state exactly.  In particular, a species at
+    # zero configured concentration can still have a fixed, finite configured
+    # temperature when it participates in the initial ambipolar root.
+    temperature_state = safe_temperature(temperature_state, temperature_floor)
+    pressure_state = temperature_state * safe_density(density_state, density_floor)
     state = dataclasses.replace(
         baseline_state,
         density=density_state,
