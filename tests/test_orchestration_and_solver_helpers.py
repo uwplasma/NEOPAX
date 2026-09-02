@@ -11,6 +11,8 @@ from NEOPAX._boundary_conditions import BoundaryConditionModel
 from NEOPAX._state import TransportState
 from NEOPAX._transport_equations import ComposedEquationSystem
 from NEOPAX._transport_solvers import (
+    _full_state_bar_to_flat_input_bar,
+    _make_solver_state_transform,
     _pack_transport_state_arrays,
     _project_state_to_quasi_neutrality,
     _unpack_transport_state_arrays,
@@ -51,6 +53,16 @@ def _dummy_species():
         charge_qp=jnp.array([-1.0, 1.0, 1.0]),
         ion_indices=(1, 2),
         species_idx={"e": 0, "D": 1, "T": 2},
+    )
+
+
+def _dummy_whe_species():
+    return DummySpecies(
+        number_species=4,
+        names=("e", "D", "T", "He"),
+        charge_qp=jnp.array([-1.0, 1.0, 1.0, 2.0]),
+        ion_indices=(1, 2, 3),
+        species_idx={"e": 0, "D": 1, "T": 2, "He": 3},
     )
 
 
@@ -531,6 +543,48 @@ def test_pack_and_unpack_transport_state_arrays_restore_electron_row():
     assert unpacked.density.shape == state.density.shape
     assert jnp.allclose(unpacked.density[1:], state.density[1:])
     assert jnp.allclose(unpacked.density[0], state.density[1] + state.density[2])
+
+
+def test_whe_state_bar_uses_unpack_projection_transpose_not_row_drop():
+    """He closure bars must reach its independent density through n_e and p_He."""
+    species = _dummy_whe_species()
+    fixed_temperature = jnp.array(
+        [[5.0, 5.0], [4.0, 4.0], [3.0, 3.0], [2.0, 2.0]]
+    )
+    density = jnp.array(
+        [[12.0, 14.0], [2.0, 3.0], [4.0, 5.0], [3.0, 3.0]]
+    )
+    pressure = density * fixed_temperature
+    state = TransportState(density=density, pressure=pressure, Er=jnp.array([1.0, 2.0]))
+    flat_state, unpack_flat, _unpack_packed, pack_flat, project_flat = _make_solver_state_transform(
+        state,
+        species,
+        temperature_active_mask=jnp.array([True, True, True, False]),
+        fixed_temperature_profile=fixed_temperature,
+        density_floor=1.0e-6,
+        temperature_floor=None,
+    )
+    state_bar = dataclasses.replace(
+        state,
+        density=jnp.array([[7.0, 11.0], [0.0, 0.0], [0.0, 0.0], [0.0, 0.0]]),
+        pressure=jnp.array([[0.0, 0.0], [0.0, 0.0], [0.0, 0.0], [13.0, 17.0]]),
+        Er=jnp.zeros_like(state.Er),
+    )
+
+    actual = _full_state_bar_to_flat_input_bar(
+        state_bar, flat_state, unpack_flat, project_flat
+    )
+    projected = project_flat(flat_state)
+    _, unpack_pullback = jax.vjp(unpack_flat, projected)
+    (expected_projected,) = unpack_pullback(state_bar)
+    _, project_pullback = jax.vjp(project_flat, flat_state)
+    expected = project_pullback(expected_projected)[0]
+
+    legacy_row_drop = pack_flat(state_bar)
+    _, project_pullback = jax.vjp(project_flat, flat_state)
+    legacy_row_drop = project_pullback(legacy_row_drop)[0]
+    assert jnp.allclose(actual, expected, rtol=1.0e-12, atol=1.0e-12)
+    assert not jnp.allclose(legacy_row_drop, expected, rtol=1.0e-12, atol=1.0e-12)
 
 
 LAGGED_HEAT_FLUX = 7.0

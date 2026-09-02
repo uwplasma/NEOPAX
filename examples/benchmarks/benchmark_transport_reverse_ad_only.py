@@ -3216,6 +3216,14 @@ def _run_realtime_geometry_support_segment_probe(
                     "produced nonfinite support/geometry payload cotangents. See the "
                     "precheck branch output above for the first bad payload leaf."
                 )
+        if bool(getattr(args, "support_segment_probe_stop_after_precheck", False)):
+            print(
+                "[autodiff-gate] support-segment probe stopping after transport "
+                "support precheck (--support-segment-probe-stop-after-precheck); "
+                "VMEC/Boozer payload-to-parameter pullback was not launched.",
+                flush=True,
+            )
+            return
 
         geom_cfg = config.get("geometry", {})
         geometry_parameter_name = str(args.reverse_geometry_parameter)
@@ -4289,8 +4297,8 @@ def _run_initial_er_root_only_optimization_api_smoke(
         "config_path": str(Path(args.config)),
         "objective_name": str(args.objective),
         "objective_order": list(objective_names),
-        "residual_labels": list(result.residual_labels),
-        "parameter_order": list(result.parameter_labels),
+        "residual_labels": list(residual_labels),
+        "parameter_order": list(parameter_labels),
         "optimization_api_profile_dofs": str(getattr(args, "optimization_api_profile_dofs", "include")),
         "geometry_parameter_specs": [_format_geometry_param_spec(spec) for spec in geometry_param_specs],
         "objective_values": objective_values_np,
@@ -5001,6 +5009,13 @@ def _run_realtime_geometry_reverse_mode(
     local_transpose_diagnostic_first_rebuild = bool(
         args.local_transpose_diagnostic_first_rebuild
     )
+    if bool(getattr(args, "support_segment_probe_stop_after_precheck", False)) and (
+        str(args.realtime_geometry_gradient_path) != "support_segment_probe"
+    ):
+        raise SystemExit(
+            "[autodiff-gate] --support-segment-probe-stop-after-precheck requires "
+            "--realtime-geometry-gradient-path support_segment_probe."
+        )
     if (
         local_transpose_diagnostic_accepted_step is not None
         and local_transpose_diagnostic_first_rebuild
@@ -5529,6 +5544,16 @@ def main() -> None:
             "least-squares API through the direct JAX table-result builder and then "
             "exit. This uses the same validated grouped reverse runner but does not "
             "write the normal benchmark report."
+        ),
+    )
+    parser.add_argument(
+        "--support-segment-probe-stop-after-precheck",
+        action="store_true",
+        help=(
+            "Only for --realtime-geometry-gradient-path support_segment_probe: "
+            "exit after the real segmented transport support-cotangent finiteness "
+            "precheck. This prevents the diagnostic from launching the generic "
+            "VMEC/Boozer payload-to-parameter pullback."
         ),
     )
     parser.add_argument(
