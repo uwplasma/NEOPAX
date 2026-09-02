@@ -2925,13 +2925,15 @@ def _run_realtime_geometry_support_pullback_probe(
             value = jnp.asarray(leaf)
             path_text = "/".join(str(entry) for entry in path).lower()
             active = not drds_only or "drds" in path_text
-            if active and jnp.issubdtype(value.dtype, jnp.inexact):
-                # Unit-norm per active leaf makes the reported scalar stable
-                # while avoiding a preference for one support-array size.
-                size = max(int(value.size), 1)
-                return jnp.ones_like(value) / jnp.sqrt(
-                    jnp.asarray(size, dtype=value.real.dtype)
-                )
+            if jnp.issubdtype(value.dtype, jnp.inexact):
+                if active:
+                    # Unit-norm per active leaf makes the reported scalar stable
+                    # while avoiding a preference for one support-array size.
+                    size = max(int(value.size), 1)
+                    return jnp.ones_like(value) / jnp.sqrt(
+                        jnp.asarray(size, dtype=value.real.dtype)
+                    )
+                return jnp.zeros_like(value)
             return jnp.zeros_like(value, dtype=jax.dtypes.float0)
 
         directions = {
