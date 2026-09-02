@@ -4603,71 +4603,15 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             coefficient_epsiepsi,
         ) = jax.vmap(_one_energy)(ref_nu_hat, ref_epsi_hat)
 
-        def _moments(nu_delta, epsi_delta):
-            coefficients = (
-                coefficient_base
-                + coefficient_nu * nu_delta
-                + coefficient_epsi * epsi_delta
-                + 0.5
-                * (
-                    coefficient_nunu * nu_delta**2
-                    + 2.0 * coefficient_nuepsi * nu_delta * epsi_delta
-                    + coefficient_epsiepsi * epsi_delta**2
-                )
-            )
-            return self._transport_moments_from_coefficient_scan(
-                coefficients,
-                drds_value=drds_value,
-            )
-
-        zero = jnp.asarray(0.0, dtype=ref_nu_hat.dtype)
-        one = jnp.asarray(1.0, dtype=ref_nu_hat.dtype)
-        reference_transport_moments, dtransport_moments_d_nu_hat = jax.jvp(
-            lambda delta: _moments(delta, zero),
-            (zero,),
-            (one,),
-        )
-        _, dtransport_moments_d_epsi_hat = jax.jvp(
-            lambda delta: _moments(zero, delta),
-            (zero,),
-            (one,),
-        )
-        _, d2transport_moments_d_nu_hat2 = jax.jvp(
-            lambda delta: jax.jvp(
-                lambda inner: _moments(inner, zero),
-                (delta,),
-                (one,),
-            )[1],
-            (zero,),
-            (one,),
-        )
-        _, d2transport_moments_d_nu_hat_d_epsi_hat = jax.jvp(
-            lambda delta: jax.jvp(
-                lambda inner: _moments(inner, delta),
-                (zero,),
-                (one,),
-            )[1],
-            (zero,),
-            (one,),
-        )
-        _, d2transport_moments_d_epsi_hat2 = jax.jvp(
-            lambda delta: jax.jvp(
-                lambda inner: _moments(zero, inner),
-                (delta,),
-                (one,),
-            )[1],
-            (zero,),
-            (one,),
-        )
         return NTXQuadraticPreparedCoefficientResponse(
-            reference_transport_moments=reference_transport_moments,
             reference_nu_hat=ref_nu_hat,
             reference_epsi_hat=ref_epsi_hat,
-            dtransport_moments_d_nu_hat=dtransport_moments_d_nu_hat,
-            dtransport_moments_d_epsi_hat=dtransport_moments_d_epsi_hat,
-            d2transport_moments_d_nu_hat2=d2transport_moments_d_nu_hat2,
-            d2transport_moments_d_nu_hat_d_epsi_hat=d2transport_moments_d_nu_hat_d_epsi_hat,
-            d2transport_moments_d_epsi_hat2=d2transport_moments_d_epsi_hat2,
+            reference_coefficients=coefficient_base,
+            dcoefficients_d_nu_hat=coefficient_nu,
+            dcoefficients_d_epsi_hat=coefficient_epsi,
+            d2coefficients_d_nu_hat2=coefficient_nunu,
+            d2coefficients_d_nu_hat_d_epsi_hat=coefficient_nuepsi,
+            d2coefficients_d_epsi_hat2=coefficient_epsiepsi,
         )
 
     def _interpolated_moment_local_scan_primitives(
@@ -10215,29 +10159,29 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                     jnp.asarray(radius_coordinates, dtype=jnp.float64)[anchor_indices],
                 )
                 return NTXQuadraticPreparedCoefficientResponse(
-                    reference_transport_moments=self._interpolate_anchor_values(
-                        anchor_indices, anchor_response.reference_transport_moments, target_rho
-                    ),
                     reference_nu_hat=self._interpolate_anchor_values(
                         anchor_indices, anchor_response.reference_nu_hat, target_rho
                     ),
                     reference_epsi_hat=self._interpolate_anchor_values(
                         anchor_indices, anchor_response.reference_epsi_hat, target_rho
                     ),
-                    dtransport_moments_d_nu_hat=self._interpolate_anchor_values(
-                        anchor_indices, anchor_response.dtransport_moments_d_nu_hat, target_rho
+                    reference_coefficients=self._interpolate_anchor_values(
+                        anchor_indices, anchor_response.reference_coefficients, target_rho
                     ),
-                    dtransport_moments_d_epsi_hat=self._interpolate_anchor_values(
-                        anchor_indices, anchor_response.dtransport_moments_d_epsi_hat, target_rho
+                    dcoefficients_d_nu_hat=self._interpolate_anchor_values(
+                        anchor_indices, anchor_response.dcoefficients_d_nu_hat, target_rho
                     ),
-                    d2transport_moments_d_nu_hat2=self._interpolate_anchor_values(
-                        anchor_indices, anchor_response.d2transport_moments_d_nu_hat2, target_rho
+                    dcoefficients_d_epsi_hat=self._interpolate_anchor_values(
+                        anchor_indices, anchor_response.dcoefficients_d_epsi_hat, target_rho
                     ),
-                    d2transport_moments_d_nu_hat_d_epsi_hat=self._interpolate_anchor_values(
-                        anchor_indices, anchor_response.d2transport_moments_d_nu_hat_d_epsi_hat, target_rho
+                    d2coefficients_d_nu_hat2=self._interpolate_anchor_values(
+                        anchor_indices, anchor_response.d2coefficients_d_nu_hat2, target_rho
                     ),
-                    d2transport_moments_d_epsi_hat2=self._interpolate_anchor_values(
-                        anchor_indices, anchor_response.d2transport_moments_d_epsi_hat2, target_rho
+                    d2coefficients_d_nu_hat_d_epsi_hat=self._interpolate_anchor_values(
+                        anchor_indices, anchor_response.d2coefficients_d_nu_hat_d_epsi_hat, target_rho
+                    ),
+                    d2coefficients_d_epsi_hat2=self._interpolate_anchor_values(
+                        anchor_indices, anchor_response.d2coefficients_d_epsi_hat2, target_rho
                     ),
                 )
 
@@ -13968,33 +13912,44 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                     )
                     delta_nu_hat = current_nu_hat - reference_nu_hat
                     delta_epsi_hat = current_epsi_hat - reference_epsi_hat
-                    reference_moments = jax.lax.dynamic_index_in_dim(
-                        response.reference_transport_moments, radius_index, axis=0, keepdims=False
-                    )
-                    return (
-                        reference_moments
+                    coefficients = (
+                        jax.lax.dynamic_index_in_dim(
+                            response.reference_coefficients, radius_index, axis=0, keepdims=False
+                        )
                         + jax.lax.dynamic_index_in_dim(
-                            response.dtransport_moments_d_nu_hat, radius_index, axis=0, keepdims=False
-                        ) * delta_nu_hat[:, None]
+                            response.dcoefficients_d_nu_hat, radius_index, axis=0, keepdims=False
+                        ) * delta_nu_hat[..., None]
                         + jax.lax.dynamic_index_in_dim(
-                            response.dtransport_moments_d_epsi_hat, radius_index, axis=0, keepdims=False
-                        ) * delta_epsi_hat[:, None]
+                            response.dcoefficients_d_epsi_hat, radius_index, axis=0, keepdims=False
+                        ) * delta_epsi_hat[..., None]
                         + 0.5
                         * (
                             jax.lax.dynamic_index_in_dim(
-                                response.d2transport_moments_d_nu_hat2, radius_index, axis=0, keepdims=False
-                            ) * delta_nu_hat[:, None] ** 2
+                                response.d2coefficients_d_nu_hat2, radius_index, axis=0, keepdims=False
+                            ) * delta_nu_hat[..., None] ** 2
                             + 2.0
                             * jax.lax.dynamic_index_in_dim(
-                                response.d2transport_moments_d_nu_hat_d_epsi_hat, radius_index, axis=0, keepdims=False
+                                response.d2coefficients_d_nu_hat_d_epsi_hat,
+                                radius_index,
+                                axis=0,
+                                keepdims=False,
                             )
-                            * delta_nu_hat[:, None]
-                            * delta_epsi_hat[:, None]
+                            * delta_nu_hat[..., None]
+                            * delta_epsi_hat[..., None]
                             + jax.lax.dynamic_index_in_dim(
-                                response.d2transport_moments_d_epsi_hat2, radius_index, axis=0, keepdims=False
-                            ) * delta_epsi_hat[:, None] ** 2
+                                response.d2coefficients_d_epsi_hat2,
+                                radius_index,
+                                axis=0,
+                                keepdims=False,
+                            ) * delta_epsi_hat[..., None] ** 2
                         )
                     )
+                    return jax.vmap(
+                        lambda coefficient_scan: self._transport_moments_from_coefficient_scan(
+                            coefficient_scan,
+                            drds_value=drds_value,
+                        )
+                    )(coefficients)
 
                 transport_moments = jnp.swapaxes(
                     self._map_radius_axis_regularized_at_axis0(
