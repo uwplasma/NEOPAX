@@ -77,7 +77,6 @@ from ._transport_solvers import (
     _flat_rhs_lagged_response_support_pullback_factory,
     _flat_rhs_state_pullback_factory,
     _flat_rhs_with_lagged_response_factory,
-    _full_state_bar_to_flat_input_bar,
     _lagged_response_hooks,
     _make_radau_initial_step_state,
     _make_solver_state_transform,
@@ -2074,14 +2073,10 @@ def _theta_segment_reduced_cotangent_bwd_batched_with_support_call(
                                     lagged_bar,
                                 )
                             )(total_lagged_bars)
-                            rebuild_flat_bars = jax.vmap(
-                                lambda state_bar: _full_state_bar_to_flat_input_bar(
-                                    state_bar,
-                                    y_old,
-                                    physics_context.unpack_flat,
-                                    project_flat,
-                                )
-                            )(rebuild_state_bars)
+                            rebuild_flat_bars = jax.vmap(physics_context.pack_flat)(rebuild_state_bars)
+                            if project_flat is not None:
+                                _, project_pullback = jax.vjp(project_flat, y_old)
+                                rebuild_flat_bars = jax.vmap(lambda bar: project_pullback(bar)[0])(rebuild_flat_bars)
                         else:
                             def _build_from_flat(flat_inner):
                                 projected_inner = _project_flat_state_if_needed(flat_inner, project_flat)
@@ -2242,12 +2237,10 @@ def _theta_segment_reduced_cotangent_bwd_batched_with_support_call(
                     state_value,
                     lagged_bar,
                 )
-                flat_y_bar = _full_state_bar_to_flat_input_bar(
-                    state_bar,
-                    flat_y_value,
-                    physics_context.unpack_flat,
-                    project_flat,
-                )
+                flat_y_bar = physics_context.pack_flat(state_bar)
+                if project_flat is not None:
+                    _, project_pullback = jax.vjp(project_flat, flat_y_value)
+                    (flat_y_bar,) = project_pullback(flat_y_bar)
             else:
                 def _build_from_flat(flat_inner):
                     projected_inner = _project_flat_state_if_needed(flat_inner, project_flat)

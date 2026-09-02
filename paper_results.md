@@ -224,7 +224,7 @@ frozen-linearized geometry/root lane as the preceding table.  `rel. error` is
 | `electron_temperature_volume_average_keV` | 3.187910548e-04 | 3.187894e-04 | 1.655e-09 | 5.191e-06 |
 | `total_pressure_volume_average` | -1.326611062e+00 | -1.326611e+00 | 6.244e-08 | 4.706e-08 |
 | `alpha_power_volume_average_mw_m3` | -7.627225877e-03 | -7.627223e-03 | 2.877e-09 | 3.772e-07 |
-| `bootstrap_current_softmax_abs_scaled` | -1.139955494e-01 | 1.139911e-01 | 2.280e-01 | 2.000e+00 |
+| `bootstrap_current_softmax_abs_scaled` | 1.139955494e-01 | 1.139911e-01 | 4.449e-06 | 3.903e-05 |
 
 ##### `temperature_shape_alpha`
 

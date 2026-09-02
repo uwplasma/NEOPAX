@@ -490,30 +490,6 @@ def _project_flat_state_if_needed(
     return project_flat(flat_y)
 
 
-def _full_state_bar_to_flat_input_bar(
-    state_bar: Any,
-    flat_y: jax.Array,
-    unpack_flat: Callable[[jax.Array], Any],
-    project_flat: Callable[[jax.Array], jax.Array] | None = None,
-) -> jax.Array:
-    """Pull a full physical-state cotangent back to the packed solver state.
-
-    ``unpack_flat`` is not a reshape: for a charged species set it reconstructs
-    electron density from quasi-neutrality, and it can also replace pressure
-    rows for fixed-temperature species.  Therefore ``pack_flat(state_bar)`` is
-    *not* its transpose.  In particular, dropping the electron row loses its
-    contribution to every independent ion density.  That was dormant for the
-    no-He layout but wrong for the active-He / fixed-He-temperature layout.
-    """
-    projected_flat_y = _project_flat_state_if_needed(flat_y, project_flat)
-    _, unpack_pullback = jax.vjp(unpack_flat, projected_flat_y)
-    (projected_flat_bar,) = unpack_pullback(state_bar)
-    if project_flat is None:
-        return projected_flat_bar
-    _, project_pullback = jax.vjp(project_flat, flat_y)
-    return project_pullback(projected_flat_bar)[0]
-
-
 def _make_solver_state_transform(
     template_state: Any,
     species: Any,
@@ -1694,19 +1670,9 @@ def _flat_rhs_build_state_and_support_pullback_batched_interpolated_faces_factor
             or native_multi_rhs_reuse_moment_drds_jvp_shared_primal_with_vmec_coefficients_no_prepared_carry
         ):
             state_bars, support_bars, coefficient_bars = pullback_result
-            flat_state_bars = jax.vmap(
-                lambda state_bar: _full_state_bar_to_flat_input_bar(
-                    state_bar, flat_y, unravel, project_flat
-                )
-            )(state_bars)
-            return flat_state_bars, support_bars, coefficient_bars
+            return jax.vmap(pack_flat)(state_bars), support_bars, coefficient_bars
         state_bars, support_bars = pullback_result
-        flat_state_bars = jax.vmap(
-            lambda state_bar: _full_state_bar_to_flat_input_bar(
-                state_bar, flat_y, unravel, project_flat
-            )
-        )(state_bars)
-        return flat_state_bars, support_bars
+        return jax.vmap(pack_flat)(state_bars), support_bars
 
     return _pullback
 
@@ -1786,9 +1752,12 @@ def _flat_rhs_lagged_response_all_pullback_factory(
             support=support,
             **kwargs,
         )
-        flat_state_bar = _full_state_bar_to_flat_input_bar(
-            state_bar, flat_y, unravel, project_flat
-        )
+        projected_state_bar = pack_flat(state_bar)
+        if project_flat is None:
+            flat_state_bar = projected_state_bar
+        else:
+            _, project_pullback = jax.vjp(project_flat, flat_y)
+            (flat_state_bar,) = project_pullback(projected_state_bar)
         return flat_state_bar, lagged_response_bar, support_bar
 
     return _pullback
@@ -1815,9 +1784,12 @@ def _flat_rhs_state_pullback_factory(unravel, pack_flat, vector_field, args, kwa
             rhs_bar=rhs_bar_state,
             **kwargs,
         )
-        return _full_state_bar_to_flat_input_bar(
-            state_bar, flat_y, unravel, project_flat
-        )
+        projected_bar = pack_flat(state_bar)
+        if project_flat is None:
+            return projected_bar
+        _, project_pullback = jax.vjp(project_flat, flat_y)
+        (flat_bar,) = project_pullback(projected_bar)
+        return flat_bar
 
     return _pullback
 
@@ -1848,10 +1820,11 @@ def _flat_rhs_state_and_lagged_response_pullback_factory(
             rhs_bar=rhs_bar_state,
             **kwargs,
         )
-        flat_state_bar = _full_state_bar_to_flat_input_bar(
-            state_bar, flat_y, unravel, project_flat
-        )
-        return flat_state_bar, lagged_bar
+        projected_state_bar = pack_flat(state_bar)
+        if project_flat is None:
+            return projected_state_bar, lagged_bar
+        _, project_pullback = jax.vjp(project_flat, flat_y)
+        return project_pullback(projected_state_bar)[0], lagged_bar
 
     return _pullback
 
@@ -1911,9 +1884,12 @@ def _flat_rhs_split_state_pullback_factory(
             rhs_bar=rhs_bar_state,
             **kwargs,
         )
-        return _full_state_bar_to_flat_input_bar(
-            state_bar, flat_y, unravel, project_flat
-        )
+        projected_bar = pack_flat(state_bar)
+        if project_flat is None:
+            return projected_bar
+        _, project_pullback = jax.vjp(project_flat, flat_y)
+        (flat_bar,) = project_pullback(projected_bar)
+        return flat_bar
 
     return _pullback
 
@@ -5078,12 +5054,10 @@ def _execute_radau_accepted_step_trial_y_vjp_lagged_branch_bwd(
             rebuild_state,
             dlagged_response_cache_bar,
         )
-        rebuild_flat_bar = _full_state_bar_to_flat_input_bar(
-            rebuild_state_bar,
-            carry_in.y,
-            physics_context.unpack_flat,
-            physics_context.project_flat,
-        )
+        rebuild_flat_bar = physics_context.pack_flat(rebuild_state_bar)
+        if physics_context.project_flat is not None:
+            _, project_pullback = jax.vjp(physics_context.project_flat, carry_in.y)
+            (rebuild_flat_bar,) = project_pullback(rebuild_flat_bar)
         dy_bar = dy_bar + rebuild_flat_bar
         dlagged_response_cache_bar = _radau_align_tangent_tree_to_primal(None, carry_in.lagged_response_cache)
         dlagged_reference_y_bar = jnp.zeros_like(carry_in.lagged_reference_y)
@@ -5454,12 +5428,10 @@ def _execute_radau_accepted_step_next_carry_vjp_lagged_branch_bwd(
                 carry_bar.lagged_response_cache,
                 reverse_stage_cotangent_mode=cotangent_mode,
             )
-            rebuild_flat_bar = _full_state_bar_to_flat_input_bar(
-                rebuild_state_bar,
-                carry_in.y,
-                physics_context.unpack_flat,
-                physics_context.project_flat,
-            )
+            rebuild_flat_bar = physics_context.pack_flat(rebuild_state_bar)
+            if physics_context.project_flat is not None:
+                _, project_pullback = jax.vjp(physics_context.project_flat, carry_in.y)
+                (rebuild_flat_bar,) = project_pullback(rebuild_flat_bar)
         carry_bar = dataclasses.replace(
             carry_bar,
             y=carry_bar.y + rebuild_flat_bar + carry_bar.lagged_reference_y,
@@ -5665,12 +5637,10 @@ def _execute_radau_accepted_step_next_reduced_cotangent_bwd(
                 lagged_cache_bar,
                 reverse_stage_cotangent_mode=cotangent_mode,
             )
-            rebuild_flat_bar = _full_state_bar_to_flat_input_bar(
-                rebuild_state_bar,
-                carry_in.y,
-                physics_context.unpack_flat,
-                physics_context.project_flat,
-            )
+            rebuild_flat_bar = physics_context.pack_flat(rebuild_state_bar)
+            if physics_context.project_flat is not None:
+                _, project_pullback = jax.vjp(physics_context.project_flat, carry_in.y)
+                (rebuild_flat_bar,) = project_pullback(rebuild_flat_bar)
         y_bar = y_bar + rebuild_flat_bar + lagged_reference_y_bar
         lagged_cache_bar = _radau_align_tangent_tree_to_primal(None, carry_in.lagged_response_cache)
         lagged_reference_y_bar = jnp.zeros_like(carry_in.lagged_reference_y)
@@ -6077,14 +6047,10 @@ def _execute_radau_accepted_step_next_reduced_cotangent_batched_bwd(
             rebuild_state_bars = jax.vmap(
                 _rebuild_state_pullback
             )(lagged_cache_bars)
-            rebuild_flat_bars = jax.vmap(
-                lambda state_bar: _full_state_bar_to_flat_input_bar(
-                    state_bar,
-                    carry_in.y,
-                    physics_context.unpack_flat,
-                    physics_context.project_flat,
-                )
-            )(rebuild_state_bars)
+            rebuild_flat_bars = jax.vmap(physics_context.pack_flat)(rebuild_state_bars)
+            if physics_context.project_flat is not None:
+                _, project_pullback = jax.vjp(physics_context.project_flat, carry_in.y)
+                rebuild_flat_bars = jax.vmap(lambda bar: project_pullback(bar)[0])(rebuild_flat_bars)
         y_bars = y_bars + rebuild_flat_bars + lagged_reference_y_bars
         lagged_cache_bars = _batched_zero_tangent_tree_like(
             carry_in.lagged_response_cache,
@@ -6326,15 +6292,12 @@ def _radau_finish_native_vmec_rebuild_from_common(
         with _radau_reverse_profile_scope(
             physics_context, "reverse_segment/rebuild_lagged_response_transpose"
         ):
-            rebuild_state_bars = jax.vmap(_state_pullback)(lagged_cache_bars)
-            rebuild_flat_bars = jax.vmap(
-                lambda state_bar: _full_state_bar_to_flat_input_bar(
-                    state_bar,
-                    carry_in.y,
-                    physics_context.unpack_flat,
-                    physics_context.project_flat,
-                )
-            )(rebuild_state_bars)
+            rebuild_flat_bars = jax.vmap(physics_context.pack_flat)(
+                jax.vmap(_state_pullback)(lagged_cache_bars)
+            )
+        if physics_context.project_flat is not None:
+            _, project_pullback = jax.vjp(physics_context.project_flat, carry_in.y)
+            rebuild_flat_bars = jax.vmap(lambda bar: project_pullback(bar)[0])(rebuild_flat_bars)
         rebuild_support_mode = str(
             getattr(physics_context, "reverse_rebuild_support_pullback_mode", "separate")
         ).strip().lower()
@@ -6730,14 +6693,10 @@ def _execute_radau_accepted_step_next_reduced_cotangent_batched_bwd_with_support
             rebuild_state_bars = jax.vmap(
                 _rebuild_state_pullback_batched
             )(lagged_cache_bars)
-            rebuild_flat_bars = jax.vmap(
-                lambda state_bar: _full_state_bar_to_flat_input_bar(
-                    state_bar,
-                    carry_in.y,
-                    physics_context.unpack_flat,
-                    physics_context.project_flat,
-                )
-            )(rebuild_state_bars)
+            rebuild_flat_bars = jax.vmap(physics_context.pack_flat)(rebuild_state_bars)
+            if physics_context.project_flat is not None:
+                _, project_pullback = jax.vjp(physics_context.project_flat, carry_in.y)
+                rebuild_flat_bars = jax.vmap(lambda bar: project_pullback(bar)[0])(rebuild_flat_bars)
         y_bars = y_bars + rebuild_flat_bars + lagged_reference_y_bars
 
         if (
