@@ -4906,10 +4906,51 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
         flush=True,
     )
 
+    def _batched_reduced_first_nonfinite_rows(value):
+        """Return one nonfinite reduced-cotangent leaf label per objective row.
+
+        This is host-only diagnostic metadata.  Leaves without the leading
+        objective axis are structural carry fields and are intentionally
+        ignored.
+        """
+        path_leaves, _ = jax.tree_util.tree_flatten_with_path(value)
+        row_finite = []
+        labels = []
+        for path, leaf in path_leaves:
+            array = jnp.asarray(leaf)
+            if (
+                array.dtype == jax.dtypes.float0
+                or not jnp.issubdtype(array.dtype, jnp.inexact)
+                or array.ndim < 1
+                or int(array.shape[0]) != int(objective_count)
+            ):
+                continue
+            axes = tuple(range(1, array.ndim))
+            row_finite.append(
+                jnp.isfinite(array)
+                if not axes
+                else jnp.all(jnp.isfinite(array), axis=axes)
+            )
+            labels.append(_pytree_path_label(path))
+        if not row_finite:
+            return tuple(None for _ in range(objective_count))
+        finite_rows = tuple(
+            np.asarray(row, dtype=bool) for row in jax.device_get(tuple(row_finite))
+        )
+        return tuple(
+            next(
+                (label for label, finite in zip(labels, finite_rows, strict=True) if not finite[row_i]),
+                None,
+            )
+            for row_i in range(objective_count)
+        )
+
     def _run_host_static_branch_segment(
         segment_carry,
         segment_arrays,
         segment_next_reduced_bars,
+        *,
+        capture_actual_cotangent_diagnostics: bool = False,
     ):
         """Run one realized segment through two static device executables.
 
@@ -4956,23 +4997,73 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
                     support_payload,
                 )
             )
-        return jax.block_until_ready(
-            _run_realized_reverse_slot_dispatch(
-                slot_active=slot_active,
-                slot_next_lagged_valid=slot_next_lagged_valid,
-                segment_start_lagged_valid=bool(
-                    np.asarray(jax.device_get(segment_carry.lagged_response_valid))
-                ),
-                step_start_carries=step_start_carries,
-                step_primal_records=step_primal_records,
-                next_reduced_bars=segment_next_reduced_bars,
-                initial_support_bars=segment_support_bars,
-                take_axis0=_take_tree_axis0,
-                step_fn=_run_static_step,
+        if not capture_actual_cotangent_diagnostics:
+            return jax.block_until_ready(
+                _run_realized_reverse_slot_dispatch(
+                    slot_active=slot_active,
+                    slot_next_lagged_valid=slot_next_lagged_valid,
+                    segment_start_lagged_valid=bool(
+                        np.asarray(jax.device_get(segment_carry.lagged_response_valid))
+                    ),
+                    step_start_carries=step_start_carries,
+                    step_primal_records=step_primal_records,
+                    next_reduced_bars=segment_next_reduced_bars,
+                    initial_support_bars=segment_support_bars,
+                    take_axis0=_take_tree_axis0,
+                    step_fn=_run_static_step,
+                )
             )
-        )
+
+        # A nonfinite segment is replayed only in this opt-in host diagnostic.
+        # It uses the production step executable and the exact realized branch
+        # order, but transfers only finite/nonfinite metadata after each step.
+        reduced_value = segment_next_reduced_bars
+        support_value = segment_support_bars
+        rows = []
+        for slot_index, branch in _realized_reverse_slot_branches(
+            slot_active,
+            slot_next_lagged_valid,
+            bool(np.asarray(jax.device_get(segment_carry.lagged_response_valid))),
+        ):
+            reduced_input_bad = _batched_reduced_first_nonfinite_rows(reduced_value)
+            reduced_value, step_support_value = _run_static_step(
+                slot_index,
+                branch,
+                _take_tree_axis0(step_start_carries, slot_index),
+                _take_tree_axis0(step_primal_records, slot_index),
+                reduced_value,
+            )
+            reduced_value, step_support_value = jax.block_until_ready(
+                (reduced_value, step_support_value)
+            )
+            support_value = tuple(
+                accumulated + increment
+                for accumulated, increment in zip(
+                    support_value, step_support_value, strict=True
+                )
+            )
+            rows.append(
+                {
+                    "slot_index": int(slot_index),
+                    "branch": str(branch),
+                    "input_reduced_bad": reduced_input_bad,
+                    "output_reduced_bad": _batched_reduced_first_nonfinite_rows(reduced_value),
+                    "step_support_bad": _batched_support_first_nonfinite_leaves(
+                        step_support_value[: len(_zero_support_leaves)],
+                        support_leaf_labels,
+                        objective_count,
+                    ),
+                    "cumulative_support_bad": _batched_support_first_nonfinite_leaves(
+                        support_value[: len(_zero_support_leaves)],
+                        support_leaf_labels,
+                        objective_count,
+                    ),
+                }
+            )
+        return reduced_value, support_value, tuple(rows)
 
     phase_start = time.perf_counter()
+    actual_cotangent_nonfinite_segment_diagnosed = False
     for segment_index in range(segment_count - 1, -1, -1):
         segment_phase_start = time.perf_counter()
         if segment_jit_diagnostics:
@@ -5005,6 +5096,7 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
             reduced_bars, segment_support_bar_leaves = jax.block_until_ready(
                 (reduced_bars, segment_support_bar_leaves)
             )
+        segment_bad_rows = None
         if segment_input_diagnostics:
             segment_bad_rows = _batched_support_first_nonfinite_leaves(
                 segment_support_bar_leaves[: len(_zero_support_leaves)],
@@ -5022,6 +5114,60 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
                     f"leaf={leaf_i}:{leaf_label}",
                     flush=True,
                 )
+            if (
+                not actual_cotangent_nonfinite_segment_diagnosed
+                and any(row is not None for row in segment_bad_rows)
+            ):
+                actual_cotangent_nonfinite_segment_diagnosed = True
+                (
+                    diagnostic_reduced_bars,
+                    diagnostic_support_bar_leaves,
+                    diagnostic_step_rows,
+                ) = _run_host_static_branch_segment(
+                    segment_start_carry,
+                    segment_arrays,
+                    segment_reduced_bars_input,
+                    capture_actual_cotangent_diagnostics=True,
+                )
+                diagnostic_reduced_bars, diagnostic_support_bar_leaves = (
+                    jax.block_until_ready(
+                        (diagnostic_reduced_bars, diagnostic_support_bar_leaves)
+                    )
+                )
+                for row in diagnostic_step_rows:
+                    for objective_i, objective_name in enumerate(objective_labels):
+                        input_bad = row["input_reduced_bad"][objective_i]
+                        output_bad = row["output_reduced_bad"][objective_i]
+                        step_bad = row["step_support_bad"][objective_i]
+                        cumulative_bad = row["cumulative_support_bad"][objective_i]
+                        if (
+                            input_bad is None
+                            and output_bad is None
+                            and step_bad is None
+                            and cumulative_bad is None
+                        ):
+                            continue
+                        step_label = (
+                            None
+                            if step_bad is None
+                            else f"{step_bad[0]}:{step_bad[1]}"
+                        )
+                        cumulative_label = (
+                            None
+                            if cumulative_bad is None
+                            else f"{cumulative_bad[0]}:{cumulative_bad[1]}"
+                        )
+                        print(
+                            f"{progress_prefix} diagnostic: support reverse segment "
+                            f"{segment_index + 1}/{segment_count} actual-cotangent "
+                            f"slot={row['slot_index']} branch={row['branch']} "
+                            f"objective={objective_name} "
+                            f"input_reduced_bad={input_bad} "
+                            f"output_reduced_bad={output_bad} "
+                            f"step_support_bad={step_label} "
+                            f"cumulative_support_bad={cumulative_label}",
+                            flush=True,
+                        )
         if phase_timing_segment_warm_pending and not host_static_branch_dispatch:
             first_call_elapsed = time.perf_counter() - segment_phase_start
             warm_start = time.perf_counter()
