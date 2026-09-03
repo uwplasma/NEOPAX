@@ -25,6 +25,7 @@ from NEOPAX._reverse_ad_initial_er import (
     fold_recorded_ntx_scan_database_bars_into_support,
     realtime_geometry_payload_for_runtime,
     realtime_geometry_reverse_support_payload_for_runtime,
+    runtime_without_recorded_ntx_scan_primal,
     runtime_with_geometry_payload,
     runtime_with_realtime_geometry_payload,
     runtime_with_realtime_geometry_reverse_support_payload,
@@ -2031,6 +2032,43 @@ def test_recorded_live_ntx_scan_support_exposes_only_the_existing_database():
     assert support["database"] is database
     assert support["channels"] is channels
     assert support["surfaces"] is surfaces
+
+
+def test_recorded_live_ntx_scan_primal_is_not_captured_by_reverse_runtime():
+    """The heavy prepared record is retained only for the post-sweep fold."""
+
+    channels = _tiny_ntx_runtime_channels([0.25, 0.5])
+    database = object()
+    model = build_ntx_runtime_scan_transport_model(
+        species="species", energy_grid="grid", geometry="geometry",
+        vmec_file=None, boozer_file=None,
+        ntx_scan_rho=[0.25, 0.5], ntx_scan_nu_v=[1.0e-4, 1.0e-3],
+        ntx_scan_er_tilde=[0.0, 1.0e-4], ntx_scan_channels=channels,
+        ntx_scan_surfaces=(object(), object()),
+        ntx_scan_coefficient_reverse_mode="structured",
+        ntx_scan_record_primal=True,
+        prebuild_database=False,
+    )
+    record = object()
+    raw_scan = object()
+    runtime = RuntimeContext(
+        species="species", energy_grid="grid", geometry="geometry",
+        database=database, solver_parameters={},
+        models=Models(flux=dataclasses.replace(
+            model, database=database, scan_primal_record=record, scan_primal=raw_scan
+        )),
+    )
+
+    stripped = runtime_without_recorded_ntx_scan_primal(runtime)
+    stripped_model = stripped.models.flux
+    assert stripped_model.database is database
+    assert stripped_model.channels is channels
+    assert stripped_model.scan_surfaces == runtime.models.flux.scan_surfaces
+    assert stripped_model.scan_primal_record is None
+    assert stripped_model.scan_primal is None
+    # The original remains available to execute the single final transpose.
+    assert runtime.models.flux.scan_primal_record is record
+    assert runtime.models.flux.scan_primal is raw_scan
 
 
 def test_live_ntx_scan_payload_can_select_structured_coefficient_reverse_mode():

@@ -204,6 +204,40 @@ def find_ntx_runtime_scan_model_in_model(model):
     return None
 
 
+def runtime_without_recorded_ntx_scan_primal(runtime):
+    """Drop the retained scan record from runtime objects used inside segment VJPs.
+
+    The record contains full prepared NTX systems and is needed only after the
+    transport sweep, when the accumulated database cotangent is transposed.
+    Leaving it captured by every generic black-box stage VJP unnecessarily
+    retains those systems in each compiled reverse closure.  The returned
+    runtime keeps the already-built database, channels and surfaces unchanged.
+    """
+
+    def _strip(model):
+        if model is None or not dataclasses.is_dataclass(model) or isinstance(model, type):
+            return model, False
+        if isinstance(model, NTXRuntimeScanTransportModel):
+            if model.scan_primal_record is None and model.scan_primal is None:
+                return model, False
+            return dataclasses.replace(
+                model, scan_primal_record=None, scan_primal=None
+            ), True
+        updates = {}
+        changed = False
+        for field in dataclasses.fields(model):
+            replacement, child_changed = _strip(getattr(model, field.name))
+            if child_changed:
+                updates[field.name] = replacement
+                changed = True
+        return (dataclasses.replace(model, **updates), True) if changed else (model, False)
+
+    flux_model, changed = _strip(runtime.models.flux)
+    if not changed:
+        return runtime
+    return dataclasses.replace(runtime, models=dataclasses.replace(runtime.models, flux=flux_model))
+
+
 def realtime_geometry_payload_for_runtime(runtime):
     """Return the additive tagged geometry payload for a supported runtime.
 
