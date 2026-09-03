@@ -956,7 +956,7 @@ def test_build_time_solver_radau_enables_first_failed_stage_repeat_probe():
     assert solver.debug_stop_after_first_failed_stage_probe
 
 
-def test_radau_first_failed_stage_repeat_probe_stops_cleanly():
+def test_radau_first_failed_attempt_probe_stops_cleanly():
     solver = RADAUSolver(
         t0=0.0,
         t1=1.0e-1,

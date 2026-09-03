@@ -1,5 +1,6 @@
-# One-shot direct-runtime diagnostic: stop after the first Newton failure and
-# compare two independently materialized evaluations of its frozen stage residual.
+# One-shot direct-runtime Newton-defect diagnostic: preserve the production
+# compiled attempt, trace existing residual/correction localization scalars,
+# then stop after the first Newton failure.
 
 [general]
 mode = "transport"
