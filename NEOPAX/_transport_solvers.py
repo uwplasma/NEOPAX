@@ -15097,6 +15097,11 @@ def _radau_fixed_dt_schedule_rollout_scan_step(
             slow_contraction=jnp.asarray(False),
             residual_blowup=jnp.asarray(False),
             newton_nonfinite=jnp.asarray(False),
+            # Keep the inactive scan branch structurally identical to a real
+            # step attempt.  These diagnostics were added to the active
+            # Radau result after this schedule-only placeholder was written.
+            stagnation_accepted=jnp.asarray(False),
+            stagnation_defect_norm=jnp.asarray(0.0, dtype=dtype),
         )
 
     def _scan_output(step_info: _RadauStepInfo, next_state: _RadauStepState):
