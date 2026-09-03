@@ -4043,6 +4043,36 @@ class NTXRuntimeScanTransportModel(TransportFluxModelBase):
             **kwargs,
         )
 
+    def pullback_direct_rhs_support_payload(self, state, flux_bar, support):
+        """Transpose a recorded database leaf without tracing scan setup.
+
+        The generic equation fallback differentiates the whole realtime
+        payload reconstruction at every Radau stage.  In the recorded route
+        channels and surfaces deliberately do not feed the fixed database
+        during that sweep, so their direct bar is zero.  Transpose only the
+        database through the same lagged-response construction used by the
+        primal; the retained scan record is consumed later, once.
+        """
+
+        if not isinstance(support, dict) or "database" not in support:
+            return None
+        model = self.with_support_payload(support)
+        database_model = model._database_model()
+        database = support["database"]
+        _, database_pullback = jax.vjp(
+            lambda database_value: dataclasses.replace(
+                database_model, database=database_value
+            ).build_lagged_response(state),
+            database,
+        )
+        (database_bar,) = database_pullback(flux_bar)
+        support_bar = _float_delta_tree_like(support)
+        support_bar = dict(support_bar)
+        support_bar["database"] = _sanitize_float_delta_bar_tree(
+            database, database_bar
+        )
+        return support_bar
+
     def with_runtime_database(self) -> "NTXRuntimeScanTransportModel":
         if self.database is not None:
             return self

@@ -1092,6 +1092,45 @@ def test_black_box_exact_direct_support_split_matches_generic_payload_vjp():
     )
 
 
+def test_black_box_recorded_database_direct_support_split_matches_generic_payload_vjp():
+    """Recorded scan databases take the same split geometry/direct path."""
+
+    class _RecordedDatabaseOwner:
+        def __call__(self, _state):
+            return jnp.asarray(3.0)
+
+        def pullback_direct_rhs_support_payload(self, _state, flux_bar, support):
+            return {
+                "geometry": jnp.asarray(0.0),
+                "channels": jnp.asarray(0.0),
+                "surfaces": jnp.asarray(0.0),
+                "database": 2.0 * flux_bar,
+            }
+
+    equations = object.__new__(ComposedEquationSystem)
+    object.__setattr__(equations, "shared_flux_model", _RecordedDatabaseOwner())
+    object.__setattr__(equations, "_prepare_working_state", lambda state: (state, None))
+    object.__setattr__(equations, "pullback_shared_fluxes", lambda _state, _fluxes, rhs_bar: rhs_bar)
+    object.__setattr__(
+        equations,
+        "with_realtime_geometry_support_payload",
+        lambda payload: lambda _t, _state, _runtime: payload["geometry"] + 2.0 * payload["database"],
+    )
+    support = {
+        "geometry": jnp.asarray(5.0),
+        "channels": jnp.asarray(7.0),
+        "surfaces": jnp.asarray(11.0),
+        "database": jnp.asarray(13.0),
+    }
+    actual = equations.pullback_direct_rhs_support_payload(
+        jnp.asarray(0.0), None, None, jnp.asarray(17.0), support
+    )
+    assert jnp.allclose(actual["geometry"], 17.0)
+    assert jnp.allclose(actual["database"], 34.0)
+    assert jnp.allclose(actual["channels"], 0.0)
+    assert jnp.allclose(actual["surfaces"], 0.0)
+
+
 def test_native_multi_rhs_equation_system_forwarding_hook_is_exposed_to_radau():
     """The real Radau vector-field owner forwards the native hook once."""
 

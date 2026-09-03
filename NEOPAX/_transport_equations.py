@@ -1628,32 +1628,54 @@ class ComposedEquationSystem:
         exact_pullback = getattr(
             self.shared_flux_model, "pullback_direct_rhs_support_payload", None
         )
+        is_exact_ntx_support = isinstance(support, dict) and "ntx_support" in support
+        is_recorded_database_support = isinstance(support, dict) and "database" in support
         if (
             callable(exact_pullback)
             and isinstance(support, dict)
             and "geometry" in support
-            and "ntx_support" in support
+            and (is_exact_ntx_support or is_recorded_database_support)
         ):
             working_state, _ = self._prepare_working_state(state)
             shared_fluxes = self.shared_flux_model(working_state)
             flux_bar = self.pullback_shared_fluxes(state, shared_fluxes, rhs_bar)
-            ntx_support_bar = exact_pullback(
-                working_state, flux_bar, support["ntx_support"]
+            owner_support = (
+                support["ntx_support"] if is_exact_ntx_support else support
+            )
+            owner_support_bar = exact_pullback(
+                working_state, flux_bar, owner_support
             )
             geometry = support["geometry"]
             geometry_delta0 = _float_delta_tree_like(geometry)
-            _, geometry_pullback = jax.vjp(
-                lambda geometry_delta: self.with_realtime_geometry_support_payload(
+            def _rhs_from_geometry_delta(geometry_delta):
+                geometry_payload = (
                     {"geometry": _add_float_delta_tree(geometry, geometry_delta),
                      "ntx_support": support["ntx_support"]}
-                )(t, state, runtime),
+                    if is_exact_ntx_support
+                    else {**support, "geometry": _add_float_delta_tree(geometry, geometry_delta)}
+                )
+                return self.with_realtime_geometry_support_payload(
+                    geometry_payload
+                )(t, state, runtime)
+
+            _, geometry_pullback = jax.vjp(
+                _rhs_from_geometry_delta,
                 geometry_delta0,
             )
             (geometry_bar,) = geometry_pullback(rhs_bar)
+            if is_recorded_database_support:
+                support_bar = _sanitize_float_delta_bar_tree(
+                    support, owner_support_bar
+                )
+                support_bar = dict(support_bar)
+                support_bar["geometry"] = _sanitize_float_delta_bar_tree(
+                    geometry, geometry_bar
+                )
+                return support_bar
             return {
                 "geometry": _sanitize_float_delta_bar_tree(geometry, geometry_bar),
                 "ntx_support": _sanitize_float_delta_bar_tree(
-                    support["ntx_support"], ntx_support_bar
+                    support["ntx_support"], owner_support_bar
                 ),
             }
 
