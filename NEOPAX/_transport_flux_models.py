@@ -3211,6 +3211,43 @@ def _ntx_runtime_scan_to_neopax_monoenergetic(scan, *, a_b):
     )
 
 
+def _ntx_runtime_scan_with_live_channels(scan, *, channels, er_tilde):
+    """Attach live geometry channels to an NTX coefficient scan.
+
+    This deliberately contains no NTX solve.  Keeping it as a pure array
+    mapping lets the recorded database transpose recover every channel bar
+    after the one retained coefficient pullback.
+    """
+    rho = jnp.asarray(scan.rho, dtype=jnp.float64)
+    _, _, er_to_ertilde = _build_ntx_field_channels(rho, er_tilde, channels)
+    return dataclasses.replace(
+        scan,
+        Er_tilde=er_tilde,
+        Er_to_Ertilde=er_to_ertilde,
+        dr_tildedr=jnp.asarray(channels["dr_tildedr"], dtype=jnp.float64),
+        dr_tildeds=jnp.asarray(channels["dr_tildeds"], dtype=jnp.float64),
+        a_b=jnp.asarray(channels["a_b"], dtype=jnp.float64),
+        psia=jnp.asarray(channels["psia"], dtype=jnp.float64),
+        b00=jnp.asarray(channels["b00"], dtype=jnp.float64),
+        r00=jnp.asarray(channels["r00"], dtype=jnp.float64),
+        boozer_i=jnp.asarray(channels["boozer_i"], dtype=jnp.float64),
+        boozer_g=jnp.asarray(channels["boozer_g"], dtype=jnp.float64),
+        iota=jnp.asarray(channels["iota"], dtype=jnp.float64),
+        fac_reference_to_sfincs_11=jnp.asarray(channels["fac_reference_to_sfincs_11"], dtype=jnp.float64),
+        fac_reference_to_sfincs_31=jnp.asarray(channels["fac_reference_to_sfincs_31"], dtype=jnp.float64),
+        fac_reference_to_sfincs_33=jnp.asarray(channels["fac_reference_to_sfincs_33"], dtype=jnp.float64),
+        fac_monkes_to_sfincs_11=jnp.asarray(channels["fac_reference_to_sfincs_11"], dtype=jnp.float64),
+        fac_monkes_to_sfincs_31=jnp.asarray(channels["fac_reference_to_sfincs_31"], dtype=jnp.float64),
+        fac_monkes_to_sfincs_33=jnp.asarray(channels["fac_reference_to_sfincs_33"], dtype=jnp.float64),
+        fac_sfincs_to_dkes_11=jnp.asarray(channels["fac_sfincs_to_dkes_11"], dtype=jnp.float64),
+        fac_sfincs_to_dkes_31=jnp.asarray(channels["fac_sfincs_to_dkes_31"], dtype=jnp.float64),
+        fac_sfincs_to_dkes_33=jnp.asarray(channels["fac_sfincs_to_dkes_33"], dtype=jnp.float64),
+        fac_dkes_to_d11star=jnp.asarray(channels["fac_dkes_to_d11star"], dtype=jnp.float64),
+        fac_dkes_to_d31star=jnp.asarray(channels["fac_dkes_to_d31star"], dtype=jnp.float64),
+        fac_dkes_to_d33star=jnp.asarray(channels["fac_dkes_to_d33star"], dtype=jnp.float64),
+    )
+
+
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True, eq=False)
 class NTXRuntimeScanChannels:
@@ -3751,7 +3788,7 @@ class NTXRuntimeScanTransportModel(TransportFluxModelBase):
         rho, nu_v, er_tilde = self._scan_axes()
         static_channels = self._static_channels()
         channels = static_channels.as_mapping()
-        er, es, er_to_ertilde = _build_ntx_field_channels(rho, er_tilde, channels)
+        er, es, _ = _build_ntx_field_channels(rho, er_tilde, channels)
         grid = ntx.GridSpec(
             n_theta=int(self.n_theta),
             n_zeta=int(self.n_zeta),
@@ -3770,38 +3807,12 @@ class NTXRuntimeScanTransportModel(TransportFluxModelBase):
             return_primal_record=bool(self.record_scan_primal),
         )
         if self.record_scan_primal:
-            scan, scan_primal_record = scan_result
+            raw_scan, scan_primal_record = scan_result
         else:
-            scan = scan_result
+            raw_scan = scan_result
             scan_primal_record = None
-        scan = dataclasses.replace(
-            scan,
-            Er_tilde=er_tilde,
-            Er_to_Ertilde=er_to_ertilde,
-            dr_tildedr=jnp.asarray(channels["dr_tildedr"], dtype=jnp.float64),
-            dr_tildeds=jnp.asarray(channels["dr_tildeds"], dtype=jnp.float64),
-            # Keep these as arrays.  The runtime scan is also the realtime
-            # geometry reverse payload, where converting a channel tracer to
-            # Python ``float`` would cut (or reject) its derivative.
-            a_b=jnp.asarray(channels["a_b"], dtype=jnp.float64),
-            psia=jnp.asarray(channels["psia"], dtype=jnp.float64),
-            b00=jnp.asarray(channels["b00"], dtype=jnp.float64),
-            r00=jnp.asarray(channels["r00"], dtype=jnp.float64),
-            boozer_i=jnp.asarray(channels["boozer_i"], dtype=jnp.float64),
-            boozer_g=jnp.asarray(channels["boozer_g"], dtype=jnp.float64),
-            iota=jnp.asarray(channels["iota"], dtype=jnp.float64),
-            fac_reference_to_sfincs_11=jnp.asarray(channels["fac_reference_to_sfincs_11"], dtype=jnp.float64),
-            fac_reference_to_sfincs_31=jnp.asarray(channels["fac_reference_to_sfincs_31"], dtype=jnp.float64),
-            fac_reference_to_sfincs_33=jnp.asarray(channels["fac_reference_to_sfincs_33"], dtype=jnp.float64),
-            fac_monkes_to_sfincs_11=jnp.asarray(channels["fac_reference_to_sfincs_11"], dtype=jnp.float64),
-            fac_monkes_to_sfincs_31=jnp.asarray(channels["fac_reference_to_sfincs_31"], dtype=jnp.float64),
-            fac_monkes_to_sfincs_33=jnp.asarray(channels["fac_reference_to_sfincs_33"], dtype=jnp.float64),
-            fac_sfincs_to_dkes_11=jnp.asarray(channels["fac_sfincs_to_dkes_11"], dtype=jnp.float64),
-            fac_sfincs_to_dkes_31=jnp.asarray(channels["fac_sfincs_to_dkes_31"], dtype=jnp.float64),
-            fac_sfincs_to_dkes_33=jnp.asarray(channels["fac_sfincs_to_dkes_33"], dtype=jnp.float64),
-            fac_dkes_to_d11star=jnp.asarray(channels["fac_dkes_to_d11star"], dtype=jnp.float64),
-            fac_dkes_to_d31star=jnp.asarray(channels["fac_dkes_to_d31star"], dtype=jnp.float64),
-            fac_dkes_to_d33star=jnp.asarray(channels["fac_dkes_to_d33star"], dtype=jnp.float64),
+        scan = _ntx_runtime_scan_with_live_channels(
+            raw_scan, channels=channels, er_tilde=er_tilde,
         )
         print(
             "[NEOPAX] built runtime NTX scan database: "
@@ -3815,7 +3826,7 @@ class NTXRuntimeScanTransportModel(TransportFluxModelBase):
                 a_b=jnp.asarray(channels["a_b"], dtype=jnp.float64),
             ),
             scan_primal_record,
-            scan if self.record_scan_primal else None,
+            raw_scan if self.record_scan_primal else None,
         )
 
     def _build_runtime_database(self):
@@ -3836,17 +3847,22 @@ class NTXRuntimeScanTransportModel(TransportFluxModelBase):
                 "record_scan_primal=True and coefficient_reverse_mode='structured'."
             )
         ntx = _import_ntx()
-        channels = self._static_channels().as_mapping()
-        a_b = jnp.asarray(channels["a_b"], dtype=jnp.float64)
+        channels = self._static_channels()
+        rho, _, er_tilde = self._scan_axes()
+        del rho
         _, conversion_pullback = jax.vjp(
-            lambda scan_value, a_b_value: _ntx_runtime_scan_to_neopax_monoenergetic(
-                scan_value,
-                a_b=a_b_value,
+            lambda raw_scan_value, channel_value: _ntx_runtime_scan_to_neopax_monoenergetic(
+                _ntx_runtime_scan_with_live_channels(
+                    raw_scan_value,
+                    channels=channel_value.as_mapping(),
+                    er_tilde=er_tilde,
+                ),
+                a_b=channel_value.a_b,
             ),
             self.scan_primal,
-            a_b,
+            channels,
         )
-        scan_bar, a_b_bar = conversion_pullback(database_bar)
+        scan_bar, channels_bar = conversion_pullback(database_bar)
         blocks_bar = ntx.NeopaxScanCoefficientBlocks(
             D11=scan_bar.D11,
             D13=scan_bar.D13,
@@ -3869,7 +3885,37 @@ class NTXRuntimeScanTransportModel(TransportFluxModelBase):
                 coefficient_blocks_bar=blocks_bar,
             )
         )
-        return scan_bar, surface_bars, es_bar, a_b_bar
+        # ``Er``, ``Es`` and ``drds`` are direct scan inputs, not coefficient
+        # outputs.  Their bars from the conversion must still be returned to
+        # the live channels, without replaying the coefficient scan.
+        def _raw_scan_inputs_from_channels(channel_value):
+            channel_mapping = channel_value.as_mapping()
+            er_value, es_value, _ = _build_ntx_field_channels(
+                jnp.asarray(self.scan_primal.rho, dtype=jnp.float64),
+                er_tilde,
+                channel_mapping,
+            )
+            return dataclasses.replace(
+                self.scan_primal,
+                Er=er_value,
+                Es=es_value,
+                drds=jnp.asarray(channel_mapping["drds"], dtype=jnp.float64),
+            )
+
+        scan_input_bar = dataclasses.replace(
+            scan_bar,
+            Es=jnp.asarray(scan_bar.Es) + jnp.asarray(es_bar),
+        )
+        _, input_channel_pullback = jax.vjp(
+            _raw_scan_inputs_from_channels, channels,
+        )
+        (input_channels_bar,) = input_channel_pullback(scan_input_bar)
+        channels_bar = jax.tree_util.tree_map(
+            lambda lhs, rhs: jnp.asarray(lhs) + jnp.asarray(rhs),
+            channels_bar,
+            input_channels_bar,
+        )
+        return scan_bar, surface_bars, es_bar, channels_bar
 
     def with_static_channels(self) -> "NTXRuntimeScanTransportModel":
         if self.channels is not None:
