@@ -14001,6 +14001,8 @@ def _radau_single_step_primal(
 
     stagnation_accepted = jnp.asarray(False)
     stagnation_defect_norm = kernel_context.zero_scalar
+    stagnation_shared_error = err_norm
+    stagnation_eligible = jnp.asarray(False)
     converged_effective = subsolve_result.converged
     err_norm_effective = err_norm
     if kernel_context.newton_stagnation_mode == "endpoint_correction":
@@ -14048,7 +14050,7 @@ def _radau_single_step_primal(
             )
         else:
             stagnation_defect_norm = correction_norms.global_norm
-        shared_error = jnp.sqrt(
+        stagnation_shared_error = jnp.sqrt(
             err_norm * err_norm
             + (
                 stagnation_defect_norm
@@ -14084,9 +14086,22 @@ def _radau_single_step_primal(
                 ),
             ),
         )
-        stagnation_accepted = jnp.logical_and(stagnation_eligible, shared_error <= 1.0)
+        stagnation_accepted = jnp.logical_and(
+            stagnation_eligible, stagnation_shared_error <= 1.0
+        )
         converged_effective = jnp.logical_or(subsolve_result.converged, stagnation_accepted)
-        err_norm_effective = jnp.where(stagnation_accepted, shared_error, err_norm)
+        err_norm_effective = jnp.where(
+            stagnation_accepted, stagnation_shared_error, err_norm
+        )
+        if kernel_context.debug_newton_trace:
+            jax.debug.print(
+                "[radau-solver] stagnation_check raw_lte={raw_lte:.6e} endpoint_correction={endpoint_correction:.6e} shared_error={shared_error:.6e} eligible={eligible} accepted={accepted}",
+                raw_lte=err_norm,
+                endpoint_correction=stagnation_defect_norm,
+                shared_error=stagnation_shared_error,
+                eligible=stagnation_eligible,
+                accepted=stagnation_accepted,
+            )
     theta_safe = jnp.clip(subsolve_result.theta_final, kernel_context.theta_clip_min, kernel_context.theta_clip_max)
     fallback_newton_shrink = jnp.clip(
         kernel_context.newton_shrink_num / theta_safe,
