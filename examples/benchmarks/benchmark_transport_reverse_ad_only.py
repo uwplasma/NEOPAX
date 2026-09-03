@@ -5995,6 +5995,15 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--ntx-scan-record-primal",
+        action="store_true",
+        help=(
+            "Opt in to the recorded structured NTX scan reverse path for a live "
+            "database. It retains the initial scan primal and folds one accumulated "
+            "database cotangent after the segmented reverse sweep."
+        ),
+    )
+    parser.add_argument(
         "--reverse-rhs-pullback-mode",
         choices=("separate", "fused_ntx"),
         default="separate",
@@ -6549,6 +6558,13 @@ def main() -> None:
         neoclassical_cfg["ntx_scan_coefficient_reverse_mode"] = str(
             args.ntx_scan_coefficient_reverse_mode
         )
+    if args.ntx_scan_record_primal:
+        if args.ntx_scan_coefficient_reverse_mode == "generic":
+            parser.error(
+                "--ntx-scan-record-primal requires "
+                "--ntx-scan-coefficient-reverse-mode structured (or a TOML structured mode)."
+            )
+        neoclassical_cfg["ntx_scan_record_primal"] = True
     if args.ntx_exact_preload_support != "config":
         neoclassical_cfg["preload_support"] = args.ntx_exact_preload_support == "true"
     profile_cfg = _baseline_profile_cfg(config)

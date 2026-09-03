@@ -3715,12 +3715,17 @@ class NTXRuntimeScanTransportModel(TransportFluxModelBase):
         missing = tuple(name for name in required if name not in support_payload)
         if missing:
             raise ValueError(f"Live NTX scan support payload is missing {missing!r}.")
-        return self.with_runtime_scan_payload(
+        model = self.with_runtime_scan_payload(
             geometry=support_payload["geometry"],
             channels=support_payload["channels"],
             scan_surfaces=support_payload["surfaces"],
-            database=None,
-        ).with_runtime_database()
+            database=support_payload.get("database"),
+        )
+        # Recorded reverse passes an explicit database leaf.  Its derivative
+        # is accumulated by the caller and transposed once through the saved
+        # scan primal after the segment sweep.  The established payload has no
+        # such leaf and therefore retains its rebuild behaviour unchanged.
+        return model if "database" in support_payload else model.with_runtime_database()
 
     def pullback_build_lagged_response_support_payload(
         self,
@@ -3916,6 +3921,21 @@ class NTXRuntimeScanTransportModel(TransportFluxModelBase):
             input_channels_bar,
         )
         return scan_bar, surface_bars, es_bar, channels_bar
+
+    def recorded_runtime_database_support_bar(self, database_bar):
+        """Map one accumulated database cotangent to live scan support bars.
+
+        The returned tree intentionally matches the existing realtime scan
+        payload.  The caller adds it to the direct per-step channel/surface
+        bars before invoking the unchanged VMEC payload transpose.
+        """
+        _, surface_bars, _, channels_bar = self.pullback_recorded_runtime_database(
+            database_bar
+        )
+        return {
+            "channels": channels_bar,
+            "surfaces": surface_bars,
+        }
 
     def with_static_channels(self) -> "NTXRuntimeScanTransportModel":
         if self.channels is not None:

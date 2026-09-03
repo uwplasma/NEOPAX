@@ -238,19 +238,32 @@ def realtime_geometry_payload_for_runtime(runtime):
 def realtime_geometry_reverse_support_payload_for_runtime(runtime):
     """Return only the differentiable support leaves for a runtime payload.
 
-    A live runtime scan deliberately excludes its cached database: it is
-    regenerated from geometry/channels/surfaces by the NTX scan model during
-    the support VJP.  Keeping the cache out prevents it becoming an unrelated
-    independent cotangent leaf.
+    A normal live runtime scan deliberately excludes its cached database: it
+    is regenerated from geometry/channels/surfaces by the NTX scan model during
+    the support VJP.  The opt-in recorded route instead exposes that database
+    as a fixed explicit leaf, then folds its accumulated cotangent through the
+    retained NTX scan primal after the segmented sweep.
     """
 
     payload = realtime_geometry_payload_for_runtime(runtime)
     if payload["kind"] == "ntx_scan_runtime":
-        return {
+        support = {
             "geometry": payload["geometry"],
             "channels": payload["channels"],
             "surfaces": payload["surfaces"],
         }
+        runtime_scan = find_ntx_runtime_scan_model_in_model(runtime.models.flux)
+        if (
+            runtime_scan is not None
+            and bool(getattr(runtime_scan, "record_scan_primal", False))
+            and runtime_scan.scan_primal_record is not None
+            and runtime_scan.database is not None
+        ):
+            # This is an explicit differentiable leaf only for the recorded
+            # route.  Its accumulated bar is folded back into channels and
+            # surfaces exactly once after the segmented sweep.
+            support["database"] = runtime_scan.database
+        return support
     if payload["kind"] == "ntx_exact":
         return {
             "geometry": payload["geometry"],
@@ -262,6 +275,75 @@ def realtime_geometry_reverse_support_payload_for_runtime(runtime):
             "database": payload["database"],
         }
     raise ValueError(f"Unknown realtime geometry payload kind {payload['kind']!r}.")
+
+
+def fold_recorded_ntx_scan_database_bar_into_support(runtime, support_bar):
+    """Consume a recorded scan database bar after a segmented reverse sweep.
+
+    Per-step reverse treats ``database`` as a fixed explicit leaf.  This
+    helper performs the single retained NTX coefficient transpose afterwards
+    and returns the ordinary VMEC scan-support shape, with no database leaf.
+    """
+    if not isinstance(support_bar, dict) or "database" not in support_bar:
+        return support_bar
+    runtime_scan = find_ntx_runtime_scan_model_in_model(runtime.models.flux)
+    if runtime_scan is None:
+        raise ValueError("Recorded database support bar requires an NTX runtime scan model.")
+    database_support_bar = runtime_scan.recorded_runtime_database_support_bar(
+        support_bar["database"]
+    )
+    merged = dict(support_bar)
+    merged.pop("database")
+    for key in ("channels", "surfaces"):
+        if key not in merged:
+            raise ValueError(f"Recorded database support bar is missing direct {key!r} support.")
+        merged[key] = _add_float_delta_tree(merged[key], database_support_bar[key])
+    return merged
+
+
+def fold_recorded_ntx_scan_database_bars_into_support(runtime, support_bars):
+    """Fold a table of recorded database bars through one batched scan transpose.
+
+    The outer transport reverse carries one support bar per objective.  Doing
+    the retained NTX coefficient transpose separately for every row would
+    avoid the database rebuild but would still repeat its prepared adjoint.
+    Stack those independent database bars and let ``vmap`` form one batched
+    retained-scan pullback instead.  The returned tuple has exactly the same
+    row order and support-tree contract as the input.
+    """
+    support_bars = tuple(support_bars)
+    if not support_bars or not isinstance(support_bars[0], dict):
+        return support_bars
+    if "database" not in support_bars[0]:
+        return support_bars
+    if any("database" not in bar for bar in support_bars):
+        raise ValueError("Recorded database support bars must use one consistent tree.")
+    runtime_scan = find_ntx_runtime_scan_model_in_model(runtime.models.flux)
+    if runtime_scan is None:
+        raise ValueError("Recorded database support bars require an NTX runtime scan model.")
+
+    database_bars = jax.tree_util.tree_map(
+        lambda *values: jnp.stack(values),
+        *(bar["database"] for bar in support_bars),
+    )
+    database_support_bars = jax.vmap(
+        runtime_scan.recorded_runtime_database_support_bar,
+    )(database_bars)
+
+    def _row(tree, index):
+        return jax.tree_util.tree_map(lambda value: value[index], tree)
+
+    folded = []
+    for index, support_bar in enumerate(support_bars):
+        merged = dict(support_bar)
+        merged.pop("database")
+        database_support_bar = _row(database_support_bars, index)
+        for key in ("channels", "surfaces"):
+            if key not in merged:
+                raise ValueError(f"Recorded database support bar is missing direct {key!r} support.")
+            merged[key] = _add_float_delta_tree(merged[key], database_support_bar[key])
+        folded.append(merged)
+    return tuple(folded)
 
 
 def _replace_database_payload_in_model(model, database):
@@ -380,9 +462,10 @@ def runtime_with_realtime_geometry_reverse_support_payload(runtime, support_payl
                 "geometry": support_payload["geometry"],
                 "channels": support_payload["channels"],
                 "surfaces": support_payload["surfaces"],
-                # Deliberately clear the old cache. ``with_runtime_scan_payload``
-                # rebuilds it through the live NTX scan when the model is used.
-                "database": None,
+                # Legacy payloads clear the cache and rebuild it.  The
+                # recorded path supplies an explicit database leaf instead,
+                # so the inner VJP differentiates interpolation only.
+                "database": support_payload.get("database"),
             },
         )
     if kind == "ntx_exact":

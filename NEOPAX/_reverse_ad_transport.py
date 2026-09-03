@@ -33,6 +33,7 @@ from ._geometry_autodiff import (
 from ._orchestrator import prepare_transport_solver_components
 from ._profiles import AnalyticalProfileModel
 from ._reverse_ad_initial_er import (
+    fold_recorded_ntx_scan_database_bars_into_support,
     compact_initial_er_ntx_support_pullback_leaves,
     compact_initial_er_state_pullback,
     find_ntx_support_payload,
@@ -7166,6 +7167,19 @@ def internal_realtime_geometry_transport_reverse_table_result_builder(
         component_bars = {
             name: tuple(values[i] for i in rows)
             for name, values in support_result.support_component_bars_by_name.items()
+        }
+        # The recorded scan route accumulates a database bar during all
+        # objective/segment VJPs.  Fold it once here, before the ordinary
+        # VMEC payload transpose.  Legacy payloads have no database leaf and
+        # are returned unchanged by the helper.
+        support_bars = fold_recorded_ntx_scan_database_bars_into_support(
+            active_runtime, support_bars
+        )
+        component_bars = {
+            name: fold_recorded_ntx_scan_database_bars_into_support(
+                active_runtime, values
+            )
+            for name, values in component_bars.items()
         }
         all_objective_values = jnp.asarray(support_result.objective_values)
         all_profile_gradient_matrix = jnp.asarray(support_result.profile_gradient_matrix)

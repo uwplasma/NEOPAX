@@ -9,6 +9,7 @@ import pytest
 from ntx import GridSpec, example_surface, prepare_monoenergetic_system
 
 import NEOPAX._reverse_ad_transport as reverse_transport_module
+import NEOPAX._reverse_ad_initial_er as initial_er_module
 from NEOPAX._orchestrator import (
     _build_database,
     _build_flux_model,
@@ -20,6 +21,8 @@ from NEOPAX._orchestrator import (
     RuntimeContext,
 )
 from NEOPAX._reverse_ad_initial_er import (
+    fold_recorded_ntx_scan_database_bar_into_support,
+    fold_recorded_ntx_scan_database_bars_into_support,
     realtime_geometry_payload_for_runtime,
     realtime_geometry_reverse_support_payload_for_runtime,
     runtime_with_geometry_payload,
@@ -1867,6 +1870,140 @@ def test_live_ntx_scan_payload_rebuild_keeps_channel_jvp(monkeypatch):
     )
     assert jnp.allclose(tangent, expected_tangent)
     assert captured_builder_kwargs["coefficient_reverse_mode"] == "generic"
+
+
+def test_live_ntx_scan_explicit_database_support_does_not_rebuild(monkeypatch):
+    """The recorded reverse support leaf must bypass the NTX scan builder."""
+    calls = {"count": 0}
+
+    class _FakeNTX:
+        class GridSpec:
+            def __init__(self, **kwargs):
+                self.__dict__.update(kwargs)
+
+        @staticmethod
+        def build_ntx_neopax_scan_from_surfaces(*_args, **_kwargs):
+            calls["count"] += 1
+            raise AssertionError("explicit recorded database support must not rebuild the scan")
+
+    monkeypatch.setattr("NEOPAX._transport_flux_models._import_ntx", lambda: _FakeNTX)
+    surfaces = (object(), object())
+    channels = _tiny_ntx_runtime_channels([0.25, 0.5])
+    database = object()
+    model = build_ntx_runtime_scan_transport_model(
+        species="species", energy_grid="grid", geometry="geometry",
+        vmec_file=None, boozer_file=None,
+        ntx_scan_rho=[0.25, 0.5], ntx_scan_nu_v=[1.0e-4, 1.0e-3],
+        ntx_scan_er_tilde=[0.0, 1.0e-4], ntx_scan_channels=channels,
+        ntx_scan_surfaces=surfaces, prebuild_database=False,
+    )
+
+    result = model.with_support_payload(
+        {"geometry": "geometry", "channels": channels, "surfaces": surfaces, "database": database}
+    )
+    assert result.database is database
+    assert calls == {"count": 0}
+
+
+def test_recorded_ntx_database_bar_is_folded_once_into_scan_support(monkeypatch):
+    calls = {"count": 0}
+
+    class _RecordedScan:
+        def recorded_runtime_database_support_bar(self, database_bar):
+            calls["count"] += 1
+            assert database_bar == jnp.asarray(5.0)
+            return {
+                "channels": jnp.asarray(2.0),
+                "surfaces": jnp.asarray(3.0),
+            }
+
+    monkeypatch.setattr(
+        initial_er_module,
+        "find_ntx_runtime_scan_model_in_model",
+        lambda _flux: _RecordedScan(),
+    )
+    runtime = types.SimpleNamespace(models=types.SimpleNamespace(flux=object()))
+    actual = fold_recorded_ntx_scan_database_bar_into_support(
+        runtime,
+        {
+            "geometry": jnp.asarray(7.0),
+            "channels": jnp.asarray(11.0),
+            "surfaces": jnp.asarray(13.0),
+            "database": jnp.asarray(5.0),
+        },
+    )
+    assert set(actual) == {"geometry", "channels", "surfaces"}
+    assert jnp.allclose(actual["channels"], 13.0)
+    assert jnp.allclose(actual["surfaces"], 16.0)
+    assert calls == {"count": 1}
+
+
+def test_recorded_ntx_database_bars_use_one_batched_scan_pullback(monkeypatch):
+    calls = {"count": 0}
+
+    class _RecordedScan:
+        def recorded_runtime_database_support_bar(self, database_bar):
+            calls["count"] += 1
+            return {
+                "channels": 2.0 * database_bar,
+                "surfaces": 3.0 * database_bar,
+            }
+
+    monkeypatch.setattr(
+        initial_er_module,
+        "find_ntx_runtime_scan_model_in_model",
+        lambda _flux: _RecordedScan(),
+    )
+    runtime = types.SimpleNamespace(models=types.SimpleNamespace(flux=object()))
+    actual = fold_recorded_ntx_scan_database_bars_into_support(
+        runtime,
+        (
+            {"geometry": jnp.asarray(7.0), "channels": jnp.asarray(11.0), "surfaces": jnp.asarray(13.0), "database": jnp.asarray(5.0)},
+            {"geometry": jnp.asarray(17.0), "channels": jnp.asarray(19.0), "surfaces": jnp.asarray(23.0), "database": jnp.asarray(29.0)},
+        ),
+    )
+    assert len(actual) == 2
+    assert jnp.allclose(actual[0]["channels"], 21.0)
+    assert jnp.allclose(actual[0]["surfaces"], 28.0)
+    assert jnp.allclose(actual[1]["channels"], 77.0)
+    assert jnp.allclose(actual[1]["surfaces"], 110.0)
+    # ``vmap`` traces the retained transpose once instead of Python-looping
+    # through the two objective rows.
+    assert calls == {"count": 1}
+
+
+def test_recorded_live_ntx_scan_support_exposes_only_the_existing_database():
+    """The recorded route is opt-in and never asks the support VJP to rebuild."""
+
+    surfaces = (object(), object())
+    channels = _tiny_ntx_runtime_channels([0.25, 0.5])
+    database = object()
+    model = build_ntx_runtime_scan_transport_model(
+        species="species", energy_grid="grid", geometry="geometry",
+        vmec_file=None, boozer_file=None,
+        ntx_scan_rho=[0.25, 0.5], ntx_scan_nu_v=[1.0e-4, 1.0e-3],
+        ntx_scan_er_tilde=[0.0, 1.0e-4], ntx_scan_channels=channels,
+        ntx_scan_surfaces=surfaces,
+        ntx_scan_coefficient_reverse_mode="structured",
+        ntx_scan_record_primal=True,
+        prebuild_database=False,
+    )
+    # The actual record is opaque to this payload-seam test; it simply marks
+    # that the forward scan recorded the retained prepared primal.
+    model = dataclasses.replace(
+        model, database=database, scan_primal_record=object(), scan_primal=object()
+    )
+    runtime = RuntimeContext(
+        species="species", energy_grid="grid", geometry="geometry",
+        database=database, solver_parameters={}, models=Models(flux=model),
+    )
+
+    support = realtime_geometry_reverse_support_payload_for_runtime(runtime)
+
+    assert set(support) == {"geometry", "channels", "surfaces", "database"}
+    assert support["database"] is database
+    assert support["channels"] is channels
+    assert support["surfaces"] is surfaces
 
 
 def test_live_ntx_scan_payload_can_select_structured_coefficient_reverse_mode():
