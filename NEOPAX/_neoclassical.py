@@ -31,6 +31,11 @@ from ._monoenergetic import (
     monoenergetic_database_kind,
 )
 from ._monoenergetic_interpolators import monoenergetic_interpolation_kernel
+from ._interpolators_preprocessed import (
+    get_Dij_preprocessed_3d_ntss_radius,
+    radial_preprocessed_interpolation_stencil,
+    radial_preprocessed_interpolation_table_bar,
+)
 from ._species import get_Thermodynamical_Forces_A1, get_Thermodynamical_Forces_A2, get_Thermodynamical_Forces_A3
 from ._cell_variable import get_gradient_density, get_gradient_temperature
 from ._state import JOULE_PER_KEV, get_v_thermal
@@ -363,6 +368,138 @@ def _get_Neoclassical_Fluxes_generic(
     )
     Gamma, Q, Upar = results
     return Lij, Gamma, Q, Upar
+
+
+@jit
+def pullback_preprocessed_radial_database_fluxes(
+    species,
+    energy_grid,
+    geometry,
+    database,
+    Er,
+    temperature,
+    density,
+    gamma_bar,
+    q_bar,
+    upar_bar,
+    collisionality_kind=COLLISIONALITY_MODEL_DEFAULT,
+):
+    """Explicit table transpose for centre black-box database fluxes.
+
+    This is deliberately a transpose with respect to the three NTX scan
+    tables only.  State/geometry derivatives remain on their established
+    paths.  Each local flux bar is reduced analytically through ``Lij`` and
+    the energy quadrature, then scattered through the compact 4x2x2 radial
+    interpolation stencil.  It therefore avoids constructing a JAX VJP of
+    the full database interpolation graph for every Radau stage.
+    """
+
+    v_thermal = get_v_thermal(species.mass, temperature)
+    density_phys = DENSITY_STATE_TO_PHYSICAL * density
+    temperature_phys = TEMPERATURE_STATE_TO_PHYSICAL * temperature
+    dndr = get_gradient_density(density, geometry.r_grid, geometry.r_grid_half, geometry.dr)
+    dTdr = get_gradient_temperature(temperature, geometry.r_grid, geometry.r_grid_half, geometry.dr)
+    a1 = jax.vmap(
+        lambda charge, density_a, temperature_a: get_Thermodynamical_Forces_A1(
+            charge, density_a, temperature_a, dndr, dTdr, Er
+        ),
+        in_axes=(0, 0, 0),
+    )(species.charge, density, temperature)
+    a2 = jax.vmap(get_Thermodynamical_Forces_A2, in_axes=(0, 0))(temperature, dTdr)
+    a3 = get_Thermodynamical_Forces_A3(Er)
+
+    def _one_species_radius(species_index, radius_index, gamma_bar_local, q_bar_local, upar_bar_local):
+        vth = v_thermal[species_index, radius_index]
+        v_new = energy_grid.v_norm * vth
+        nu_over_vnew = _nu_over_vnew(
+            species,
+            species_index,
+            v_new,
+            radius_index,
+            density,
+            temperature,
+            v_thermal,
+            collisionality_kind,
+        )
+        forces = jnp.asarray((
+            a1[species_index, radius_index],
+            a2[species_index, radius_index],
+            a3[radius_index],
+        ))
+        lbar = jnp.zeros((3, 3), dtype=temperature.dtype)
+        lbar = lbar.at[0, :].add(-density_phys[species_index, radius_index] * gamma_bar_local * forces)
+        lbar = lbar.at[1, :].add(
+            -temperature_phys[species_index, radius_index]
+            * density_phys[species_index, radius_index]
+            * q_bar_local
+            * forces
+        )
+        lbar = lbar.at[2, :].add(-density_phys[species_index, radius_index] * upar_bar_local * forces)
+
+        l11_factor = -1.0 / jnp.sqrt(jnp.pi) * (
+            species.mass[species_index] / species.charge[species_index]
+        ) ** 2 * vth**3
+        l13_factor = -1.0 / jnp.sqrt(jnp.pi) * (
+            species.mass[species_index] / species.charge[species_index]
+        ) * vth**2
+        l33_factor = -1.0 / jnp.sqrt(jnp.pi) * vth
+        x_weights = energy_grid.xWeights
+        d11_log_bar = (
+            -jnp.log(10.0)
+            * 10.0 ** jax.vmap(
+                lambda nu_value, er_value: get_Dij_preprocessed_3d_ntss_radius(
+                    geometry.r_grid[radius_index], nu_value, er_value, database
+                )[0]
+            )(nu_over_vnew, Er[radius_index] * 1.0e3 / (energy_grid.v_norm * vth))
+            * l11_factor
+            * x_weights
+            * (
+                lbar[0, 0] * energy_grid.L11_weight
+                + (lbar[0, 1] + lbar[1, 0]) * energy_grid.L12_weight
+                + lbar[1, 1] * energy_grid.L22_weight
+            )
+        )
+        d13_bar = (
+            -l13_factor
+            * x_weights
+            * (
+                (lbar[0, 2] - lbar[2, 0]) * energy_grid.L13_weight
+                + (lbar[1, 2] - lbar[2, 1]) * energy_grid.L23_weight
+            )
+        )
+        d33_bar = (
+            -l33_factor
+            * x_weights
+            * lbar[2, 2]
+            * energy_grid.L33_weight
+            / nu_over_vnew
+        )
+
+        def _scatter_one(nu_value, d11_value, d13_value, d33_value):
+            er_value = Er[radius_index] * 1.0e3 / (energy_grid.v_norm * vth)
+            stencil = radial_preprocessed_interpolation_stencil(
+                geometry.r_grid[radius_index], nu_value, er_value, database
+            )
+            return (
+                radial_preprocessed_interpolation_table_bar(stencil, d11_value, database.D11_log),
+                radial_preprocessed_interpolation_table_bar(stencil, d13_value, database.D13),
+                radial_preprocessed_interpolation_table_bar(stencil, d33_value, database.D33),
+            )
+
+        tables = jax.vmap(_scatter_one)(nu_over_vnew, d11_log_bar, d13_bar, d33_bar)
+        return tuple(jnp.sum(value, axis=0) for value in tables)
+
+    species_indices = species.species_indices
+    radius_indices = geometry.full_grid_indices
+    table_bars = jax.vmap(
+        lambda species_index, gamma_species, q_species, upar_species: jax.vmap(
+            lambda radius_index, gamma_local, q_local, upar_local: _one_species_radius(
+                species_index, radius_index, gamma_local, q_local, upar_local
+            )
+        )(radius_indices, gamma_species, q_species, upar_species),
+        in_axes=(0, 0, 0, 0),
+    )(species_indices, gamma_bar, q_bar, upar_bar)
+    return tuple(jnp.sum(value, axis=(0, 1)) for value in table_bars)
 
 
 @jit

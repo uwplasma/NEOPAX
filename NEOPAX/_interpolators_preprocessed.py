@@ -1,5 +1,6 @@
 import jax
 import jax.numpy as jnp
+import dataclasses
 from jax import config
 from ._interpolators_ntss_preprocessed import _inpold_fixed
 
@@ -82,6 +83,150 @@ def _surface_bilinear(table, er_grid, ir, inu, ty, grid_er_internal):
         ty,
         tz,
     )
+
+
+@jax.tree_util.register_dataclass
+@dataclasses.dataclass(frozen=True)
+class RadialPreprocessedInterpolationStencil:
+    """Numeric table stencil for one radial-preprocessed database query.
+
+    The forward interpolation is linear in the selected table values.  This
+    compact record is therefore sufficient for its explicit transpose; no
+    database object, generic VJP tape, or static scan-surface metadata is
+    needed after the primal query.
+    """
+
+    radial_indices: jax.Array
+    radial_weights: jax.Array
+    nu_index: jax.Array
+    nu_fraction: jax.Array
+    er_indices: jax.Array
+    er_fractions: jax.Array
+
+
+def _lagrange3_weights(x, x0, x1, x2):
+    return jnp.asarray((
+        (x - x1) * (x - x2) / ((x0 - x1) * (x0 - x2)),
+        (x - x0) * (x - x2) / ((x1 - x0) * (x1 - x2)),
+        (x - x0) * (x - x1) / ((x2 - x0) * (x2 - x1)),
+        0.0,
+    ))
+
+
+def _lagrange4_weights(x, x0, x1, x2, x3):
+    return jnp.asarray((
+        (x - x1) * (x - x2) * (x - x3) / ((x0 - x1) * (x0 - x2) * (x0 - x3)),
+        (x - x0) * (x - x2) * (x - x3) / ((x1 - x0) * (x1 - x2) * (x1 - x3)),
+        (x - x0) * (x - x1) * (x - x3) / ((x2 - x0) * (x2 - x1) * (x2 - x3)),
+        (x - x0) * (x - x1) * (x - x2) / ((x3 - x0) * (x3 - x1) * (x3 - x2)),
+    ))
+
+
+@jax.jit
+def radial_preprocessed_interpolation_stencil(grid_x, grid_nu, grid_Er, database):
+    """Return the exact stencil used by ``get_Dij_preprocessed_3d_ntss_radius``."""
+
+    arr = database.r_grid
+    nr = arr.shape[0]
+    xri = jax.lax.cond(nr == 1, lambda: arr[0], lambda: jnp.maximum(1.0e-2 * arr[0], grid_x))
+    grid_nu_internal = jnp.log10(jnp.maximum(1.0e-12, grid_nu))
+    er_ratio = jnp.where(
+        xri <= database.low_limit_r,
+        database.Er_lower_limit,
+        jnp.maximum(database.Er_lower_limit, jnp.abs(grid_Er / xri)),
+    )
+    grid_er_internal = jnp.log10(er_ratio)
+    inu = _clamped_interval_index(database.nu_log, grid_nu_internal)
+    ty = _fraction(database.nu_log, inu, grid_nu_internal)
+    exact_mask = jnp.abs(xri - arr) <= database.del_r
+    exact_idx = jnp.argmax(exact_mask.astype(jnp.int32))
+    is_exact = jnp.any(exact_mask)
+    nil = jnp.where(
+        xri < arr[1], 0,
+        jnp.where(xri >= arr[nr - 2], nr - 3, jnp.searchsorted(arr[2:nr - 1], xri, side="left")),
+    )
+    nil = jnp.where(is_exact, exact_idx, nil)
+    radial_indices = jnp.minimum(nil + jnp.arange(4, dtype=jnp.int32), nr - 1)
+
+    def _exact_weights():
+        return jnp.asarray((1.0, 0.0, 0.0, 0.0))
+
+    def _small_radius_weights():
+        xr2, xr3 = xri * xri, xri * xri * xri
+        r1, r2, r3 = arr[0], arr[1], arr[2]
+        r12, r22, r32 = r1 * r1, r2 * r2, r3 * r3
+        r13, r23, r33 = r1 * r12, r2 * r22, r3 * r32
+        denom_a = (r32 - r22) / (r33 - r23) - (r32 - r12) / (r33 - r13)
+        denom_b = (r33 - r23) / (r32 - r22) - (r33 - r13) / (r32 - r12)
+        a = jnp.asarray((
+            1.0 / (r33 - r13) / denom_a,
+            -1.0 / (r33 - r23) / denom_a,
+            (1.0 / (r33 - r23) - 1.0 / (r33 - r13)) / denom_a,
+        ))
+        b = jnp.asarray((
+            1.0 / (r32 - r12) / denom_b,
+            -1.0 / (r32 - r22) / denom_b,
+            (1.0 / (r32 - r22) - 1.0 / (r32 - r12)) / denom_b,
+        ))
+        return jnp.concatenate((
+            jnp.asarray((1.0, 0.0, 0.0)) + (xr2 - r12) * a + (xr3 - r13) * b,
+            jnp.zeros((1,), dtype=xri.dtype),
+        ))
+
+    def _edge_weights():
+        return _lagrange3_weights(xri, arr[nil], arr[nil + 1], arr[nil + 2])
+
+    def _interior_weights():
+        return _lagrange4_weights(xri, arr[nil], arr[nil + 1], arr[nil + 2], arr[nil + 3])
+
+    radial_weights = jax.lax.cond(
+        is_exact, _exact_weights,
+        lambda: jax.lax.cond(
+            xri < arr[1], _small_radius_weights,
+            lambda: jax.lax.cond(xri >= arr[nr - 2], _edge_weights, _interior_weights),
+        ),
+    )
+    er_indices = jax.vmap(
+        lambda ir: _clamped_interval_index(database.Er_grid[ir], grid_er_internal)
+    )(radial_indices)
+    er_fractions = jax.vmap(
+        lambda ir, ier: _fraction(database.Er_grid[ir], ier, grid_er_internal)
+    )(radial_indices, er_indices)
+    return RadialPreprocessedInterpolationStencil(
+        radial_indices, radial_weights, inu, ty, er_indices, er_fractions
+    )
+
+
+@jax.jit
+def radial_preprocessed_interpolation_table_bar(stencil, local_bar, table):
+    """Explicit transpose of one radial-preprocessed table interpolation.
+
+    ``local_bar`` is the cotangent of one scalar interpolated value (D11-log,
+    D13, or D33).  Only the 16 possible radial/nu/Er table entries are
+    updated.  This is the primitive that replaces a generic database-table
+    VJP in the forthcoming transport reverse kernel.
+    """
+
+    result = jnp.zeros_like(table)
+    nu_weights = jnp.asarray((1.0 - stencil.nu_fraction, stencil.nu_fraction))
+    for radial_slot in range(4):
+        er_weights = jnp.asarray((
+            1.0 - stencil.er_fractions[radial_slot],
+            stencil.er_fractions[radial_slot],
+        ))
+        for nu_offset in range(2):
+            for er_offset in range(2):
+                result = result.at[
+                    stencil.radial_indices[radial_slot],
+                    stencil.nu_index + nu_offset,
+                    stencil.er_indices[radial_slot] + er_offset,
+                ].add(
+                    local_bar
+                    * stencil.radial_weights[radial_slot]
+                    * nu_weights[nu_offset]
+                    * er_weights[er_offset]
+                )
+    return result
 
 
 def _inpold_fixed12_er(x, xs, ys, gmix):

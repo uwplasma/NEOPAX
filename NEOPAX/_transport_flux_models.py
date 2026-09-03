@@ -38,6 +38,7 @@ from ._neoclassical import (
     get_Neoclassical_Fluxes,
     get_Neoclassical_Fluxes_Faces,
     get_Neoclassical_Fluxes_With_Momentum_Correction,
+    pullback_preprocessed_radial_database_fluxes,
 )
 from ._species import get_Thermodynamical_Forces_A1, get_Thermodynamical_Forces_A2, get_Thermodynamical_Forces_A3
 from ._state import (
@@ -1546,24 +1547,39 @@ class CombinedTransportFluxModel(TransportFluxModelBase):
         composite = dataclasses.replace(self, neoclassical_model=payload_model)
 
         if isinstance(support, dict) and "database" in support:
+            # The compact database rule currently covers the direct centre
+            # representation.  Face-interpolated composites have an
+            # additional face interpolation transpose and retain the generic
+            # compatibility route until their equivalent compact rule lands.
+            if self.center_flux_mode == "direct":
+                zero = jnp.zeros_like(jnp.asarray(state.density))
+
+                def _bar(name):
+                    value = flux_bar.get(name, None)
+                    if value is None:
+                        return zero
+                    value = jnp.asarray(value)
+                    return zero if value.ndim == 0 or value.dtype == jax.dtypes.float0 else value
+
+                neo_flux_bar = {
+                    "Gamma": _bar("Gamma") + _bar("Gamma_neo"),
+                    "Q": _bar("Q") + _bar("Q_neo"),
+                    "Upar": _bar("Upar") + _bar("Upar_neo"),
+                }
+                direct_support_bar = pullback_fn(state, neo_flux_bar, support)
+                if direct_support_bar is not None:
+                    return direct_support_bar
+
             database = support["database"]
-
+            # Compatibility fallback for non-direct centre representations.
             def _direct_fluxes_from_database(database_value):
-                direct_model = dataclasses.replace(
-                    payload_model, database=database_value
-                )
-                return dataclasses.replace(
-                    self, neoclassical_model=direct_model
-                )(state)
+                direct_model = dataclasses.replace(payload_model, database=database_value)
+                return dataclasses.replace(self, neoclassical_model=direct_model)(state)
 
-            _, database_pullback = jax.vjp(
-                _direct_fluxes_from_database, database
-            )
+            _, database_pullback = jax.vjp(_direct_fluxes_from_database, database)
             (database_bar,) = database_pullback(flux_bar)
             support_bar = dict(_float_delta_tree_like(support))
-            support_bar["database"] = _sanitize_float_delta_bar_tree(
-                database, database_bar
-            )
+            support_bar["database"] = _sanitize_float_delta_bar_tree(database, database_bar)
             return support_bar
 
         response = composite.build_lagged_response(state)
@@ -2801,6 +2817,52 @@ class NTXDatabaseTransportModel(TransportFluxModelBase):
             "Q": q_neo,
             "Upar": upar_neo,
         }
+
+    def pullback_direct_rhs_support_payload(self, state, flux_bar, support):
+        """Compact black-box transpose of the radial NTX database tables.
+
+        This is table-only by design: accumulated table bars are later folded
+        exactly once through the retained NTX scan record.  It is the database
+        analogue of the low-dot Lij support rule, not a lagged-response VJP.
+        """
+        if not isinstance(support, dict) or "database" not in support:
+            return None
+        database = support["database"]
+        if not all(hasattr(database, name) for name in ("r_grid", "Er_grid", "D11_log", "D13", "D33")):
+            return None
+        density = safe_density(state.density, self.density_floor)
+        zero = jnp.zeros_like(jnp.asarray(density))
+
+        def _bar(name):
+            value = flux_bar.get(name, None)
+            if value is None:
+                return zero
+            value = jnp.asarray(value)
+            return zero if value.ndim == 0 or value.dtype == jax.dtypes.float0 else value
+
+        d11_bar, d13_bar, d33_bar = pullback_preprocessed_radial_database_fluxes(
+            self.species,
+            self.energy_grid,
+            self.geometry,
+            database,
+            state.Er,
+            state.temperature,
+            density,
+            _bar("Gamma"),
+            _bar("Q"),
+            _bar("Upar"),
+            _collisionality_kind(self.collisionality_model),
+        )
+        database_bar = _float_delta_tree_like(database)
+        database_bar = dataclasses.replace(
+            database_bar,
+            D11_log=d11_bar,
+            D13=d13_bar,
+            D33=d33_bar,
+        )
+        support_bar = dict(_float_delta_tree_like(support))
+        support_bar["database"] = _sanitize_float_delta_bar_tree(database, database_bar)
+        return support_bar
 
     def evaluate_momentum_corrected_fluxes(self, state, *, diagnostics: bool = False) -> dict:
         """Evaluate database-interpolated neoclassical fluxes with momentum correction.
@@ -4083,20 +4145,9 @@ class NTXRuntimeScanTransportModel(TransportFluxModelBase):
             return None
         model = self.with_support_payload(support)
         database_model = model._database_model()
-        database = support["database"]
-        _, database_pullback = jax.vjp(
-            lambda database_value: dataclasses.replace(
-                database_model, database=database_value
-            )(state),
-            database,
+        return database_model.pullback_direct_rhs_support_payload(
+            state, flux_bar, {"database": support["database"]}
         )
-        (database_bar,) = database_pullback(flux_bar)
-        support_bar = _float_delta_tree_like(support)
-        support_bar = dict(support_bar)
-        support_bar["database"] = _sanitize_float_delta_bar_tree(
-            database, database_bar
-        )
-        return support_bar
 
     def with_runtime_database(self) -> "NTXRuntimeScanTransportModel":
         if self.database is not None:

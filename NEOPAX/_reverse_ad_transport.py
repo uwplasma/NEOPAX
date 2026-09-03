@@ -717,11 +717,23 @@ def _initial_direct_rhs_support_pullback_batched(
         ),
         axis=1,
     )
-    return jax.vmap(
-        lambda rhs_bar: flat_rhs_direct_support_pullback(
-            carry0.t, carry0.y, rhs_bar, support_payload
+    # Do not ``vmap`` this owner-level callback.  A realtime NTX database
+    # payload contains scan-surface metadata with static Boozer mode arrays;
+    # JAX's batched pytree reconstruction replaces those fields with internal
+    # placeholders and fails in ``BoozerSurface.__post_init__``.  The final
+    # database specialization will replace these scalar calls with one
+    # numerical multi-RHS interpolation transpose.  Until then, a Python
+    # tuple preserves the support tree exactly and stacks only real bars.
+    support_bars = tuple(
+        flat_rhs_direct_support_pullback(
+            carry0.t, carry0.y, rhs_bars[index], support_payload
         )
-    )(rhs_bars)
+        for index in range(objective_count)
+    )
+    return jax.tree_util.tree_map(
+        lambda *values: jnp.stack(tuple(jnp.asarray(value) for value in values)),
+        *support_bars,
+    )
     next_recent_reject_count: Any
     next_regrowth_cooldown: Any
     next_easy_growth_streak: Any

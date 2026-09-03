@@ -45,8 +45,19 @@ from NEOPAX._monoenergetic import (
 from NEOPAX._database import Monoenergetic
 from NEOPAX._database_preprocessed import (
     PreprocessedMonoenergetic3D,
+    PreprocessedMonoenergetic3DNTSSRadius,
     PreprocessedMonoenergetic3DNTSSRadiusNTSS1D,
     PreprocessedMonoenergetic3DNTSSRadiusNTSS1DFixedNU,
+)
+from NEOPAX._interpolators_preprocessed import (
+    _bilinear,
+    get_Dij_preprocessed_3d_ntss_radius,
+    radial_preprocessed_interpolation_stencil,
+    radial_preprocessed_interpolation_table_bar,
+)
+from NEOPAX._neoclassical import (
+    get_Neoclassical_Fluxes,
+    pullback_preprocessed_radial_database_fluxes,
 )
 from NEOPAX._monoenergetic_interpolators import monoenergetic_interpolation_kernel
 from NEOPAX._interpolators import get_Dij
@@ -2410,3 +2421,153 @@ def test_build_ntx_exact_lij_runtime_transport_model_can_preload_support(monkeyp
     )
 
     assert model.support == "sentinel_support"
+
+
+@pytest.mark.parametrize("radius", (0.01, 0.2, 0.55, 0.95))
+def test_radial_preprocessed_stencil_reconstructs_established_interpolation(radius):
+    """The compact stencil is exactly the production radial interpolation."""
+
+    rho = jnp.asarray([0.1, 0.3, 0.5, 0.7, 0.9])
+    nu_v = jnp.asarray([1.0e-3, 1.0e-2, 1.0e-1])
+    er = jnp.asarray([[1.0e-4, 1.0e-3, 1.0e-2, 1.0e-1]])
+    shape = (rho.size, nu_v.size, er.shape[1])
+    base = jnp.reshape(jnp.arange(int(jnp.prod(jnp.asarray(shape))), dtype=jnp.float64), shape)
+    database = PreprocessedMonoenergetic3DNTSSRadius.read_data(
+        a_b=1.0,
+        rho=rho,
+        nu_v=nu_v,
+        Er=er,
+        drds=jnp.ones_like(rho),
+        D11=1.0 + base,
+        D13=2.0 + base,
+        D33=3.0 + base,
+    )
+    grid_nu = jnp.asarray(2.0e-2)
+    grid_er = jnp.asarray(3.0e-3)
+    stencil = radial_preprocessed_interpolation_stencil(
+        jnp.asarray(radius), grid_nu, grid_er, database
+    )
+
+    def _reconstruct(table):
+        def _one_surface(ir, ier, tz):
+            return _bilinear(
+                table[ir, stencil.nu_index, ier],
+                table[ir, stencil.nu_index, ier + 1],
+                table[ir, stencil.nu_index + 1, ier],
+                table[ir, stencil.nu_index + 1, ier + 1],
+                stencil.nu_fraction,
+                tz,
+            )
+
+        values = jax.vmap(_one_surface)(
+            stencil.radial_indices, stencil.er_indices, stencil.er_fractions
+        )
+        return jnp.sum(stencil.radial_weights * values)
+
+    expected = get_Dij_preprocessed_3d_ntss_radius(
+        jnp.asarray(radius), grid_nu, grid_er, database
+    )
+    actual = jnp.asarray(
+        (
+            _reconstruct(database.D11_log),
+            _reconstruct(database.D13),
+            _reconstruct(database.D33),
+        )
+    )
+    assert jnp.allclose(actual, expected, rtol=1.0e-12, atol=1.0e-12)
+
+
+@pytest.mark.parametrize("radius", (0.01, 0.55, 0.95))
+def test_radial_preprocessed_stencil_table_transpose_matches_generic_vjp(radius):
+    """The explicit 16-entry scatter is the established table VJP exactly."""
+
+    rho = jnp.asarray([0.1, 0.3, 0.5, 0.7, 0.9])
+    nu_v = jnp.asarray([1.0e-3, 1.0e-2, 1.0e-1])
+    er = jnp.asarray([[1.0e-4, 1.0e-3, 1.0e-2, 1.0e-1]])
+    shape = (rho.size, nu_v.size, er.shape[1])
+    base = jnp.reshape(jnp.arange(int(jnp.prod(jnp.asarray(shape))), dtype=jnp.float64), shape)
+    database = PreprocessedMonoenergetic3DNTSSRadius.read_data(
+        a_b=1.0, rho=rho, nu_v=nu_v, Er=er, drds=jnp.ones_like(rho),
+        D11=1.0 + base, D13=2.0 + base, D33=3.0 + base,
+    )
+    grid_nu = jnp.asarray(2.0e-2)
+    grid_er = jnp.asarray(3.0e-3)
+    local_bar = jnp.asarray(-0.37)
+    stencil = radial_preprocessed_interpolation_stencil(
+        jnp.asarray(radius), grid_nu, grid_er, database
+    )
+
+    def _interpolate(table):
+        return get_Dij_preprocessed_3d_ntss_radius(
+            jnp.asarray(radius), grid_nu, grid_er,
+            dataclasses.replace(database, D13=table),
+        )[1]
+
+    _, generic_pullback = jax.vjp(_interpolate, database.D13)
+    expected = generic_pullback(local_bar)[0]
+    actual = radial_preprocessed_interpolation_table_bar(
+        stencil, local_bar, database.D13
+    )
+    assert jnp.allclose(actual, expected, rtol=1.0e-12, atol=1.0e-12)
+
+
+def test_radial_database_flux_table_transpose_matches_generic_vjp():
+    """The compact black-box centre rule is the established database VJP."""
+
+    rho = jnp.asarray([0.1, 0.3, 0.5, 0.7, 0.9])
+    nu_v = jnp.asarray([1.0e-3, 1.0e-2, 1.0e-1])
+    er = jnp.asarray([[1.0e-4, 1.0e-3, 1.0e-2, 1.0e-1]])
+    shape = (rho.size, nu_v.size, er.shape[1])
+    base = jnp.reshape(jnp.arange(int(jnp.prod(jnp.asarray(shape))), dtype=jnp.float64), shape)
+    database = PreprocessedMonoenergetic3DNTSSRadius.read_data(
+        a_b=1.0, rho=rho, nu_v=nu_v, Er=er, drds=jnp.ones_like(rho),
+        D11=1.0 + 0.01 * base, D13=0.2 + 0.001 * base, D33=0.3 + 0.002 * base,
+    )
+    geometry = types.SimpleNamespace(
+        r_grid=jnp.asarray([0.2, 0.4, 0.6, 0.8]),
+        r_grid_half=jnp.asarray([0.1, 0.3, 0.5, 0.7, 0.9]),
+        dr=jnp.asarray(0.2),
+        full_grid_indices=jnp.arange(4, dtype=jnp.int32),
+    )
+    species = Species(
+        number_species=2,
+        species_indices=jnp.asarray([0, 1]),
+        mass_mp=jnp.asarray([5.446e-4, 2.0]),
+        charge_qp=jnp.asarray([-1.0, 1.0]),
+        names=("e", "D"),
+    )
+    energy_grid = types.SimpleNamespace(
+        xWeights=jnp.asarray([0.25, 0.75]),
+        L11_weight=jnp.asarray([1.0, 0.7]),
+        L12_weight=jnp.asarray([0.1, -0.2]),
+        L22_weight=jnp.asarray([0.8, 1.2]),
+        L13_weight=jnp.asarray([0.4, 0.5]),
+        L23_weight=jnp.asarray([-0.3, 0.2]),
+        L33_weight=jnp.asarray([1.1, 0.6]),
+        v_norm=jnp.asarray([1.2, 1.8]),
+    )
+    density = jnp.asarray([[1.0, 1.05, 1.1, 1.15], [0.9, 0.95, 1.0, 1.05]])
+    temperature = jnp.asarray([[2.0, 2.1, 2.2, 2.3], [1.6, 1.7, 1.8, 1.9]])
+    er_center = jnp.asarray([1.0e-4, -1.2e-4, 1.5e-4, -1.8e-4])
+    gamma_bar = jnp.asarray([[0.2, -0.1, 0.3, -0.4], [-0.3, 0.5, -0.2, 0.1]])
+    q_bar = -0.7 * gamma_bar
+    upar_bar = 0.4 * gamma_bar
+
+    def _fluxes(d11_log, d13, d33):
+        _, gamma, q, upar = get_Neoclassical_Fluxes(
+            species, energy_grid, geometry,
+            dataclasses.replace(database, D11_log=d11_log, D13=d13, D33=d33),
+            er_center, temperature, density,
+        )
+        return gamma, q, upar
+
+    _, generic_pullback = jax.vjp(
+        _fluxes, database.D11_log, database.D13, database.D33
+    )
+    expected = generic_pullback((gamma_bar, q_bar, upar_bar))
+    actual = pullback_preprocessed_radial_database_fluxes(
+        species, energy_grid, geometry, database, er_center, temperature, density,
+        gamma_bar, q_bar, upar_bar,
+    )
+    for actual_table_bar, expected_table_bar in zip(actual, expected, strict=True):
+        assert jnp.allclose(actual_table_bar, expected_table_bar, rtol=2.0e-10, atol=2.0e-10)

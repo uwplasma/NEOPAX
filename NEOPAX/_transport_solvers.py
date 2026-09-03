@@ -2757,6 +2757,7 @@ def _apply_radau_lean_timestep_controller(
     lagged_response_reuse_atol,
     project_flat,
     debug_lagged_response_reuse_drift=False,
+    debug_newton_bracket=False,
 ):
     accepted = jnp.logical_and(converged, err_norm <= 1.0)
     safe_error = jnp.maximum(err_norm, 1.0e-12)
@@ -3092,6 +3093,29 @@ def _apply_radau_lean_timestep_controller(
             jnp.minimum(next_dt_accept, bracket_probe_dt),
             next_dt_accept,
         )
+        if debug_newton_bracket:
+            def _print_bracket_accept(_):
+                jax.debug.print(
+                    "[radau-newton-bracket] accept t={t:.6e} h={h:.6e} "
+                    "upper_in={upper_in:.6e} upper_out={upper_out:.6e} "
+                    "unbracketed_next={unbracketed_next:.6e} "
+                    "bracketed_next={bracketed_next:.6e}",
+                    t=step_state.t,
+                    h=trial_dt,
+                    upper_in=step_state.newton_reject_dt_upper,
+                    upper_out=bracket_upper_next,
+                    unbracketed_next=jnp.clip(trial_dt * growth, dt_min, dt_max),
+                    bracketed_next=next_dt_accept,
+                    ordered=True,
+                )
+                return jnp.asarray(0, dtype=jnp.int32)
+
+            jax.lax.cond(
+                bracket_active,
+                _print_bracket_accept,
+                lambda _: jnp.asarray(0, dtype=jnp.int32),
+                operand=None,
+            )
         lagged_reuse_global = _lagged_response_reuse_uses_global_drift(lagged_response_reuse_mode)
         lagged_reuse_metric = _lagged_response_global_reuse_metric(
             accepted_y,
@@ -3289,6 +3313,35 @@ def _apply_radau_lean_timestep_controller(
             cache_valid_out,
             jnp.logical_not(reject_nonfinite),
         )
+        if debug_newton_bracket:
+            is_newton_reject = jnp.logical_not(converged)
+
+            def _print_bracket_reject(_):
+                jax.debug.print(
+                    "[radau-newton-bracket] reject t={t:.6e} h={h:.6e} "
+                    "kind={kind} next_h={next_h:.6e} upper_out={upper_out:.6e}",
+                    t=step_state.t,
+                    h=trial_dt,
+                    kind=jnp.where(is_newton_reject, jnp.asarray(1, dtype=jnp.int32), jnp.asarray(2, dtype=jnp.int32)),
+                    next_h=reduced_dt,
+                    upper_out=jnp.where(
+                        jnp.logical_and(
+                            use_hairer_lean_transport_discounted_newton_bracket_controller,
+                            is_newton_reject,
+                        ),
+                        trial_dt,
+                        step_state.newton_reject_dt_upper,
+                    ),
+                    ordered=True,
+                )
+                return jnp.asarray(0, dtype=jnp.int32)
+
+            jax.lax.cond(
+                use_hairer_lean_transport_discounted_newton_bracket_controller,
+                _print_bracket_reject,
+                lambda _: jnp.asarray(0, dtype=jnp.int32),
+                operand=None,
+            )
         return _RadauStepState(
             t=step_state.t,
             y=step_state.y,
@@ -3405,6 +3458,7 @@ class _RadauSolverConfig(TransportSolver):
     debug_walltime_attempts: bool = False
     debug_stop_after_first_failed_stage_probe: bool = False
     debug_lagged_response_reuse_drift: bool = False
+    debug_newton_bracket: bool = False
 
     def __init__(
         self,
@@ -3452,6 +3506,7 @@ class _RadauSolverConfig(TransportSolver):
         debug_walltime_attempts: bool = False,
         debug_stop_after_first_failed_stage_probe: bool = False,
         debug_lagged_response_reuse_drift: bool = False,
+        debug_newton_bracket: bool = False,
         save_n=None,
     ):
         n_steps = max(1, int(jnp.ceil((float(t1) - float(t0)) / float(dt))))
@@ -3728,6 +3783,7 @@ class _RadauSolverConfig(TransportSolver):
         object.__setattr__(self, "debug_walltime_attempts", bool(debug_walltime_attempts))
         object.__setattr__(self, "debug_stop_after_first_failed_stage_probe", bool(debug_stop_after_first_failed_stage_probe))
         object.__setattr__(self, "debug_lagged_response_reuse_drift", bool(debug_lagged_response_reuse_drift))
+        object.__setattr__(self, "debug_newton_bracket", bool(debug_newton_bracket))
         object.__setattr__(self, "save_n", save_n)
 
 @jax.tree_util.register_dataclass
@@ -4108,6 +4164,7 @@ class _RadauSolveExecutionContext:
     project_flat: Any
     debug_newton_trace: Any
     debug_lagged_response_reuse_drift: Any
+    debug_newton_bracket: Any
 
 
 def _build_prepared_radau_execution_context(
@@ -4148,6 +4205,7 @@ def _build_prepared_radau_execution_context(
         debug_lagged_response_reuse_drift=bool(
             getattr(solver, "debug_lagged_response_reuse_drift", False)
         ),
+        debug_newton_bracket=bool(getattr(solver, "debug_newton_bracket", False)),
     )
 
 
@@ -8937,6 +8995,7 @@ def _radau_attempt_step_lean(
         lagged_response_reuse_atol=execution_context.lagged_response_reuse_atol,
         project_flat=execution_context.project_flat,
         debug_lagged_response_reuse_drift=execution_context.debug_lagged_response_reuse_drift,
+        debug_newton_bracket=execution_context.debug_newton_bracket,
     )
 
 
@@ -9032,6 +9091,7 @@ def _radau_attempt_step_forward_solver(
         lagged_response_reuse_atol=execution_context.lagged_response_reuse_atol,
         project_flat=execution_context.project_flat,
         debug_lagged_response_reuse_drift=execution_context.debug_lagged_response_reuse_drift,
+        debug_newton_bracket=execution_context.debug_newton_bracket,
     )
     return next_step_state, dataclasses.replace(step_info, stage_history=stage_history)
 
@@ -9101,6 +9161,7 @@ def _radau_attempt_step_with_payload(
         lagged_response_reuse_atol=execution_context.lagged_response_reuse_atol,
         project_flat=execution_context.project_flat,
         debug_lagged_response_reuse_drift=execution_context.debug_lagged_response_reuse_drift,
+        debug_newton_bracket=execution_context.debug_newton_bracket,
     )
     payload = _radau_backward_payload_candidate(carry_in, attempt_result)
     return next_step_state, step_info, payload
@@ -16974,6 +17035,7 @@ def _radau_adaptive_final_y_realized_schedule_fused_jvp(
                 lagged_response_reuse_atol=execution_context.lagged_response_reuse_atol,
                 project_flat=execution_context.project_flat,
                 debug_lagged_response_reuse_drift=execution_context.debug_lagged_response_reuse_drift,
+                debug_newton_bracket=execution_context.debug_newton_bracket,
             )
             return next_state, info, attempt_result
 
@@ -20405,6 +20467,7 @@ class RADAUSolver(_RadauSolverConfig):
             debug_lagged_response_reuse_drift=bool(
                 getattr(self, "debug_lagged_response_reuse_drift", False)
             ),
+            debug_newton_bracket=bool(getattr(self, "debug_newton_bracket", False)),
         )
 
         step_fn = partial(_radau_step_fn_forward_solver, execution_context)
@@ -25824,6 +25887,7 @@ def build_time_solver(solver_parameters: Any, solver_override: Any = None) -> Tr
             debug_lagged_response_reuse_drift=bool(
                 _cfg_get("radau_debug_lagged_response_reuse_drift", False)
             ),
+            debug_newton_bracket=bool(_cfg_get("radau_debug_newton_bracket", False)),
             save_n=save_n,
         )
     integrator_ctor = _get_diffrax_integrator(backend)

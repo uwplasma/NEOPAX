@@ -1269,6 +1269,18 @@ def test_radau_discounted_newton_bracket_mode_is_an_explicit_opt_in():
     assert solver.controller_mode == "hairer_lean_transport_discounted_newton_bracket"
 
 
+def test_radau_newton_bracket_trace_is_an_independent_opt_in():
+    solver = RADAUSolver(
+        t0=0.0,
+        t1=1.0,
+        dt=1.0e-3,
+        controller_mode="discounted_newton_bracket",
+        debug_newton_bracket=True,
+    )
+    assert solver.controller_mode == "hairer_lean_transport_discounted_newton_bracket"
+    assert solver.debug_newton_bracket
+
+
 def test_radau_discounted_newton_bracket_runs_through_jitted_adaptive_loop():
     """Exercise the new carry leaf in the compiled adaptive solver loop."""
 
