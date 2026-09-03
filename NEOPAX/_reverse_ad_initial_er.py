@@ -153,7 +153,14 @@ def compact_initial_er_database_support_bars(
 
     def _one_objective(residual_bar):
         gamma_bar = charge_qp[:, None] * residual_bar[None, :]
-        support_bar = runtime_scan.pullback_direct_rhs_support_payload(
+        pullback = getattr(
+            runtime_scan, "pullback_local_particle_flux_support_payload", None
+        )
+        if not callable(pullback):
+            raise ValueError(
+                "Runtime database model did not expose its local particle-flux transpose."
+            )
+        support_bar = pullback(
             state_with_er,
             {"Gamma": gamma_bar},
             support,

@@ -2873,6 +2873,54 @@ class NTXDatabaseTransportModel(TransportFluxModelBase):
         support_bar["database"] = _sanitize_float_delta_bar_tree(database, database_bar)
         return support_bar
 
+    def pullback_local_particle_flux_support_payload(self, state, flux_bar, support):
+        """Compact table transpose of the constrained local root flux.
+
+        Unlike :meth:`__call__`, the ambipolar-root evaluator supplies the
+        model's right-boundary constraints to the centre flux construction.
+        Keep that distinction explicit: using the ordinary RHS transpose here
+        silently differentiates a different density/temperature gradient at
+        the outer cell.
+        """
+        if not isinstance(support, dict) or "database" not in support:
+            return None
+        database = support["database"]
+        if not all(hasattr(database, name) for name in ("r_grid", "Er_grid", "D11_log", "D13", "D33")):
+            return None
+        density = safe_density(state.density, self.density_floor)
+        density_right_constraint, density_right_grad_constraint = _extract_right_constraints(
+            self.bc_density, density, self.geometry.r_grid_half
+        )
+        temperature_right_constraint, temperature_right_grad_constraint = _extract_right_constraints(
+            self.bc_temperature, state.temperature, self.geometry.r_grid_half
+        )
+        zero = jnp.zeros_like(jnp.asarray(density))
+
+        def _bar(name):
+            value = flux_bar.get(name, None)
+            if value is None:
+                return zero
+            value = jnp.asarray(value)
+            return zero if value.ndim == 0 or value.dtype == jax.dtypes.float0 else value
+
+        d11_bar, d13_bar, d33_bar = pullback_preprocessed_radial_database_fluxes(
+            self.species, self.energy_grid, self.geometry, database,
+            state.Er, state.temperature, density,
+            _bar("Gamma"), _bar("Q"), _bar("Upar"),
+            _collisionality_kind(self.collisionality_model),
+            density_right_constraint,
+            density_right_grad_constraint,
+            temperature_right_constraint,
+            temperature_right_grad_constraint,
+        )
+        database_bar = dataclasses.replace(
+            _float_delta_tree_like(database),
+            D11_log=d11_bar, D13=d13_bar, D33=d33_bar,
+        )
+        support_bar = dict(_float_delta_tree_like(support))
+        support_bar["database"] = _sanitize_float_delta_bar_tree(database, database_bar)
+        return support_bar
+
     def evaluate_momentum_corrected_fluxes(self, state, *, diagnostics: bool = False) -> dict:
         """Evaluate database-interpolated neoclassical fluxes with momentum correction.
 
@@ -4467,6 +4515,15 @@ class NTXRuntimeScanTransportModel(TransportFluxModelBase):
         model = self.with_support_payload(support)
         database_model = model._database_model()
         return database_model.pullback_direct_rhs_support_payload(
+            state, flux_bar, {"database": support["database"]}
+        )
+
+    def pullback_local_particle_flux_support_payload(self, state, flux_bar, support):
+        """Delegate the selected-root constrained local-flux transpose."""
+        if not isinstance(support, dict) or "database" not in support:
+            return None
+        model = self.with_support_payload(support)
+        return model._database_model().pullback_local_particle_flux_support_payload(
             state, flux_bar, {"database": support["database"]}
         )
 

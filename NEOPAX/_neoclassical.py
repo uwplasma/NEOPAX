@@ -453,6 +453,10 @@ def pullback_preprocessed_radial_database_fluxes(
     q_bar,
     upar_bar,
     collisionality_kind=COLLISIONALITY_MODEL_DEFAULT,
+    density_right_constraint=None,
+    density_right_grad_constraint=None,
+    temperature_right_constraint=None,
+    temperature_right_grad_constraint=None,
 ):
     """Explicit table transpose for centre black-box database fluxes.
 
@@ -467,32 +471,52 @@ def pullback_preprocessed_radial_database_fluxes(
     v_thermal = get_v_thermal(species.mass, temperature)
     density_phys = DENSITY_STATE_TO_PHYSICAL * density
     temperature_phys = TEMPERATURE_STATE_TO_PHYSICAL * temperature
-    # Match ``_get_Neoclassical_Fluxes_generic`` exactly.  Its centre path
-    # holds the final cell as the right-face value with zero right-face
-    # gradient when no explicit boundary constraint is supplied.
+    # Match ``_get_Neoclassical_Fluxes_generic`` exactly.  The ordinary
+    # black-box RHS has no explicit constraints; the selected-root local
+    # evaluator does, so both are accepted by this table-only transpose.
     # Keep this species-local, not merely species-batched.  The primal
     # centre routine invokes the gradient helper once per species, and that
     # helper interprets a rank-one profile differently from a rank-two batch.
+    n_right = (
+        density[:, -1]
+        if density_right_constraint is None
+        else jnp.asarray(density_right_constraint, dtype=density.dtype)
+    )
+    n_right_grad = (
+        jnp.zeros_like(n_right)
+        if density_right_grad_constraint is None
+        else jnp.asarray(density_right_grad_constraint, dtype=density.dtype)
+    )
+    t_right = (
+        temperature[:, -1]
+        if temperature_right_constraint is None
+        else jnp.asarray(temperature_right_constraint, dtype=temperature.dtype)
+    )
+    t_right_grad = (
+        jnp.zeros_like(t_right)
+        if temperature_right_grad_constraint is None
+        else jnp.asarray(temperature_right_grad_constraint, dtype=temperature.dtype)
+    )
     dndr = jax.vmap(
-        lambda density_a: get_gradient_density(
+        lambda density_a, n_rc, n_rg: get_gradient_density(
             density_a,
             geometry.r_grid,
             geometry.r_grid_half,
             geometry.dr,
-            right_face_constraint=density_a[-1],
-            right_face_grad_constraint=jnp.asarray(0.0, dtype=density_a.dtype),
+            right_face_constraint=n_rc,
+            right_face_grad_constraint=n_rg,
         )
-    )(density)
+    )(density, n_right, n_right_grad)
     dTdr = jax.vmap(
-        lambda temperature_a: get_gradient_temperature(
+        lambda temperature_a, t_rc, t_rg: get_gradient_temperature(
             temperature_a,
             geometry.r_grid,
             geometry.r_grid_half,
             geometry.dr,
-            right_face_constraint=temperature_a[-1],
-            right_face_grad_constraint=jnp.asarray(0.0, dtype=temperature_a.dtype),
+            right_face_constraint=t_rc,
+            right_face_grad_constraint=t_rg,
         )
-    )(temperature)
+    )(temperature, t_right, t_right_grad)
     a1 = jax.vmap(
         get_Thermodynamical_Forces_A1,
         in_axes=(0, 0, 0, 0, 0, None),

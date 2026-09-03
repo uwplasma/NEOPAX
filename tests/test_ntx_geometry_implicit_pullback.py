@@ -137,6 +137,10 @@ def test_database_initial_root_support_batches_charge_weighted_particle_bars(mon
             del state, support
             return {"database": {"gamma": 2.0 * flux_bar["Gamma"]}}
 
+        pullback_local_particle_flux_support_payload = (
+            pullback_direct_rhs_support_payload
+        )
+
     scan_model = _ScanModel()
     monkeypatch.setattr(
         initial_er_module,
@@ -421,7 +425,7 @@ def test_momentum_corrected_fluxes_accept_four_collision_species():
     assert all(bool(jnp.all(jnp.isfinite(value))) for value in outputs)
 
 
-def test_database_local_bootstrap_state_pullback_matches_full_upar_jvp():
+def test_database_local_bootstrap_state_pullback_matches_full_upar_jvp(monkeypatch):
     """The compact database bootstrap state rule is the full wHe JVP.
 
     This guards the new per-radius boundary directly.  In particular it
@@ -528,6 +532,61 @@ def test_database_local_bootstrap_state_pullback_matches_full_upar_jvp():
         state, upar_bar
     )
     for actual, expected in zip(actual_table_bars, expected_table_bars, strict=True):
+        assert jnp.allclose(actual, expected, rtol=2.0e-10, atol=2.0e-10)
+
+    # The selected-root helper reduces exactly the local charge-flux residual,
+    # rather than the transport RHS.  Test that complete database boundary
+    # against its generic table VJP before the recorded scan fold.
+    root_runtime = SimpleNamespace(
+        species=species,
+        models=SimpleNamespace(flux=model),
+    )
+    root_residual_bars = jnp.asarray(
+        [[0.35, -0.2], [-0.15, 0.45]], dtype=jnp.float64
+    )
+
+    def _root_residuals_from_tables(d11_log, d13, d33):
+        table_model = dataclasses.replace(
+            model,
+            database=dataclasses.replace(
+                database, D11_log=d11_log, D13=d13, D33=d33
+            ),
+        )
+        runtime = SimpleNamespace(
+            species=species, models=SimpleNamespace(flux=table_model)
+        )
+        return initial_er_module.initial_er_charge_flux_residuals(
+            state, state.Er, runtime=runtime
+        )
+
+    _, generic_root_pullback = jax.vjp(
+        _root_residuals_from_tables,
+        database.D11_log,
+        database.D13,
+        database.D33,
+    )
+    expected_root_table_bars = jax.vmap(generic_root_pullback)(root_residual_bars)
+    monkeypatch.setattr(
+        initial_er_module,
+        "find_ntx_runtime_scan_model_in_model",
+        lambda _model: model,
+    )
+    actual_root_database_bars = initial_er_module.compact_initial_er_database_support_bars(
+        runtime=root_runtime,
+        state=state,
+        er_profile=state.Er,
+        residual_bars=root_residual_bars,
+        support={"database": database},
+    )
+    for actual, expected in zip(
+        (
+            actual_root_database_bars.D11_log,
+            actual_root_database_bars.D13,
+            actual_root_database_bars.D33,
+        ),
+        expected_root_table_bars,
+        strict=True,
+    ):
         assert jnp.allclose(actual, expected, rtol=2.0e-10, atol=2.0e-10)
 
 
