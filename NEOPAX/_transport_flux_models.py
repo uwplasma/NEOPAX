@@ -3609,6 +3609,7 @@ class NTXRuntimeScanTransportModel(TransportFluxModelBase):
     coefficient_reverse_mode: str = "generic"
     record_scan_primal: bool = False
     scan_primal_record: Any = None
+    scan_primal: Any = None
 
     def __post_init__(self):
         order = int(self.lagged_response_taylor_order)
@@ -3656,6 +3657,7 @@ class NTXRuntimeScanTransportModel(TransportFluxModelBase):
             scan_surfaces=tuple(scan_surfaces),
             database=database,
             scan_primal_record=None,
+            scan_primal=None,
             vmec_file=None,
             boozer_file=None,
         )
@@ -3743,7 +3745,7 @@ class NTXRuntimeScanTransportModel(TransportFluxModelBase):
 
     def _build_runtime_database_and_record(self):
         if self.database is not None:
-            return self.database, self.scan_primal_record
+            return self.database, self.scan_primal_record, self.scan_primal
 
         ntx = _import_ntx()
         rho, nu_v, er_tilde = self._scan_axes()
@@ -3813,10 +3815,61 @@ class NTXRuntimeScanTransportModel(TransportFluxModelBase):
                 a_b=jnp.asarray(channels["a_b"], dtype=jnp.float64),
             ),
             scan_primal_record,
+            scan if self.record_scan_primal else None,
         )
 
     def _build_runtime_database(self):
         return self._build_runtime_database_and_record()[0]
+
+    def pullback_recorded_runtime_database(self, database_bar):
+        """Transpose a database cotangent through a retained structured scan primal.
+
+        This deliberately stops at the live scan inputs.  The caller still
+        owns the direct transport-geometry/channel bars and combines them
+        with the returned scan/surface bars.  Crucially, no scan database is
+        rebuilt here.
+        """
+
+        if self.scan_primal_record is None or self.scan_primal is None:
+            raise ValueError(
+                "Recorded runtime scan primal is unavailable; rebuild with "
+                "record_scan_primal=True and coefficient_reverse_mode='structured'."
+            )
+        ntx = _import_ntx()
+        channels = self._static_channels().as_mapping()
+        a_b = jnp.asarray(channels["a_b"], dtype=jnp.float64)
+        _, conversion_pullback = jax.vjp(
+            lambda scan_value, a_b_value: _ntx_runtime_scan_to_neopax_monoenergetic(
+                scan_value,
+                a_b=a_b_value,
+            ),
+            self.scan_primal,
+            a_b,
+        )
+        scan_bar, a_b_bar = conversion_pullback(database_bar)
+        blocks_bar = ntx.NeopaxScanCoefficientBlocks(
+            D11=scan_bar.D11,
+            D13=scan_bar.D13,
+            D33=scan_bar.D33,
+            D33_spitzer=scan_bar.D33_spitzer,
+            b00=scan_bar.b00,
+            boozer_i=scan_bar.boozer_i,
+            boozer_g=scan_bar.boozer_g,
+            iota=scan_bar.iota,
+            fac_reference_to_sfincs_11=scan_bar.fac_reference_to_sfincs_11,
+            fac_reference_to_sfincs_31=scan_bar.fac_reference_to_sfincs_31,
+            fac_reference_to_sfincs_33=scan_bar.fac_reference_to_sfincs_33,
+            fac_sfincs_to_dkes_11=scan_bar.fac_sfincs_to_dkes_11,
+            fac_sfincs_to_dkes_31=scan_bar.fac_sfincs_to_dkes_31,
+            fac_sfincs_to_dkes_33=scan_bar.fac_sfincs_to_dkes_33,
+        )
+        surface_bars, es_bar = (
+            ntx.pullback_neopax_scan_coefficient_blocks_from_primal_record(
+                self.scan_primal_record,
+                coefficient_blocks_bar=blocks_bar,
+            )
+        )
+        return scan_bar, surface_bars, es_bar, a_b_bar
 
     def with_static_channels(self) -> "NTXRuntimeScanTransportModel":
         if self.channels is not None:
@@ -3857,6 +3910,7 @@ class NTXRuntimeScanTransportModel(TransportFluxModelBase):
             scan_surfaces=new_scan_surfaces,
             database=None if clear_database else self.database,
             scan_primal_record=None if clear_database else self.scan_primal_record,
+            scan_primal=None if clear_database else self.scan_primal,
         )
 
     def _database_model(self) -> NTXDatabaseTransportModel:
@@ -3914,11 +3968,12 @@ class NTXRuntimeScanTransportModel(TransportFluxModelBase):
         if self.database is not None:
             return self
         model = self.with_static_channels()
-        database, scan_primal_record = model._build_runtime_database_and_record()
+        database, scan_primal_record, scan_primal = model._build_runtime_database_and_record()
         return dataclasses.replace(
             model,
             database=database,
             scan_primal_record=scan_primal_record,
+            scan_primal=scan_primal,
         )
 
 

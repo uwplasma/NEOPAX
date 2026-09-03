@@ -4442,7 +4442,7 @@ def _radau_build_approximate_tangent_result(
     tangent_inputs: _RadauAcceptedStepTangentInputs,
     tangent_result: _RadauAcceptedStepApproximateTangentResult,
     *,
-    attempt_result: _RadauAcceptedStepAttemptResult,
+    attempt_result: _RadauAcceptedStepAttemptResult | _RadauAcceptedStepReverseMinimalAttemptResult,
     dlagged_response_cache_out,
     dlagged_reference_y_out,
 ) -> _RadauAcceptedStepAttemptResult:
@@ -4465,12 +4465,16 @@ def _radau_build_approximate_tangent_result(
         lagged_response_cache=dlagged_response_cache_out,
         lagged_reference_y=dlagged_reference_y_out,
     )
-    return _RadauAcceptedStepAttemptResult(
+    # Segment-record reverse intentionally retains only the fields consumed by
+    # the direct accepted-step adjoint.  Do not manufacture the controller
+    # diagnostics here: apart from growing the record contract, doing so made
+    # the generic-RHS fallback incorrectly assume it had a full attempt
+    # result.  The common fields below are exactly those used by the tangent
+    # map in either representation.
+    common = dict(
         carry_after_attempt=carry_after_attempt_tangent,
         trial_dt=tangent_result.dtrial_dt,
         trial_y=tangent_result.dtrial_y,
-        err_norm=_zero_tangent_like(attempt_result.err_norm),
-        converged=_zero_tangent_like(attempt_result.converged),
         stage_history=tangent_result.dstage_history,
         jacobian_out=_zero_tangent_like(attempt_result.jacobian_out),
         cache_valid_out=_zero_tangent_like(attempt_result.cache_valid_out),
@@ -4480,6 +4484,16 @@ def _radau_build_approximate_tangent_result(
         real_piv_out=_zero_tangent_like(attempt_result.real_piv_out),
         complex_lu_out=_zero_tangent_like(attempt_result.complex_lu_out),
         complex_piv_out=_zero_tangent_like(attempt_result.complex_piv_out),
+        theta_final=_zero_tangent_like(attempt_result.theta_final),
+        newton_iter_count=_zero_tangent_like(attempt_result.newton_iter_count),
+    )
+    if isinstance(attempt_result, _RadauAcceptedStepReverseMinimalAttemptResult):
+        return _RadauAcceptedStepReverseMinimalAttemptResult(**common)
+
+    return _RadauAcceptedStepAttemptResult(
+        **common,
+        err_norm=_zero_tangent_like(attempt_result.err_norm),
+        converged=_zero_tangent_like(attempt_result.converged),
         newton_shrink=_zero_tangent_like(attempt_result.newton_shrink),
         diverged_final=_zero_tangent_like(attempt_result.diverged_final),
         nonfinite_stage_state=_zero_tangent_like(attempt_result.nonfinite_stage_state),
@@ -4487,10 +4501,8 @@ def _radau_build_approximate_tangent_result(
         finite_f0=_zero_tangent_like(attempt_result.finite_f0),
         finite_z0=_zero_tangent_like(attempt_result.finite_z0),
         finite_initial_residual=_zero_tangent_like(attempt_result.finite_initial_residual),
-        newton_iter_count=_zero_tangent_like(attempt_result.newton_iter_count),
         final_residual_norm=_zero_tangent_like(attempt_result.final_residual_norm),
         final_delta_norm=_zero_tangent_like(attempt_result.final_delta_norm),
-        theta_final=_zero_tangent_like(attempt_result.theta_final),
         slow_contraction_final=_zero_tangent_like(attempt_result.slow_contraction_final),
         residual_blowup_final=_zero_tangent_like(attempt_result.residual_blowup_final),
         newton_nonfinite_final=_zero_tangent_like(attempt_result.newton_nonfinite_final),
@@ -13653,10 +13665,10 @@ def _radau_run_stage_subsolve(
             ),
         )
         convergence_metric = jnp.where(theta_valid, faccon * current_newton_norm, current_newton_norm)
-        # Unlike the legacy stage-space Hairer threshold, the endpoint budget
-        # is intentionally O(1).  Require an observed contraction ratio before
-        # it may terminate Newton, so a fortuitously small first endpoint
-        # update cannot hide an unresolved stage system.
+        # The endpoint metric is deliberately O(1), unlike the legacy
+        # stage-space fnewt.  Observe one contraction ratio before it may
+        # terminate Newton, otherwise a small first endpoint projection could
+        # conceal a nonlinear stage residual.
         endpoint_contraction_observed = jnp.logical_or(
             jnp.logical_not(kernel_context.use_transport_endpoint_newton_tol),
             theta_valid,

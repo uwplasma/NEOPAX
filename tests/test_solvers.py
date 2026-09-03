@@ -1428,6 +1428,47 @@ def test_segment_primal_record_bwd_avoids_second_minimal_attempt_reconstruction(
     assert observed == {"minimal_attempt_calls": 1, "record_adapter_calls": 1}
 
 
+def test_approximate_tangent_lift_preserves_minimal_segment_record_contract():
+    """Generic-RHS fallback must not demand controller fields from a compact record."""
+    value = jnp.asarray(1.0)
+    carry = transport_solvers._RadauAcceptedStepCarry(
+        t=value, y=jnp.asarray([value]), dt=value, prev_error=value,
+        prev_stages=jnp.asarray([value]), prev_dt=value,
+        recent_reject_count=value, regrowth_cooldown=value, easy_growth_streak=value,
+        lagged_response_cache=value, lagged_response_valid=value,
+        lagged_reference_y=jnp.asarray([value]), jacobian=jnp.asarray([[value]]),
+        cache_valid=value, cache_dt=value, cache_age=value, real_lu=jnp.asarray([[value]]),
+        real_piv=jnp.asarray([value]), complex_lu=jnp.asarray([[value]]),
+        complex_piv=jnp.asarray([value]), prev_theta_final=value,
+        prev_newton_iter_count=value,
+    )
+    minimal = transport_solvers._RadauAcceptedStepReverseMinimalAttemptResult(
+        carry_after_attempt=carry, trial_dt=value, trial_y=jnp.asarray([value]),
+        stage_history=jnp.asarray([value]), jacobian_out=jnp.asarray([[value]]),
+        cache_valid_out=value, cache_dt_out=value, cache_age_out=value,
+        real_lu_out=jnp.asarray([[value]]), real_piv_out=jnp.asarray([value]),
+        complex_lu_out=jnp.asarray([[value]]), complex_piv_out=jnp.asarray([value]),
+        theta_final=value, newton_iter_count=value,
+    )
+    tangent = transport_solvers._radau_build_approximate_tangent_result(
+        transport_solvers._RadauAcceptedStepTangentInputs(
+            dy=jnp.asarray([2.0]), dh=jnp.asarray(3.0), dlagged_response_cache=value,
+        ),
+        transport_solvers._RadauAcceptedStepApproximateTangentResult(
+            dy_next=jnp.asarray([4.0]), dz_stages=jnp.asarray([5.0]),
+            dtrial_dt=jnp.asarray(6.0), dtrial_y=jnp.asarray([7.0]),
+            dstage_history=jnp.asarray([8.0]),
+        ),
+        attempt_result=minimal,
+        dlagged_response_cache_out=value,
+        dlagged_reference_y_out=jnp.asarray([value]),
+    )
+
+    assert isinstance(tangent, transport_solvers._RadauAcceptedStepReverseMinimalAttemptResult)
+    assert tangent.trial_dt == jnp.asarray(6.0)
+    assert not hasattr(tangent, "err_norm")
+
+
 def test_radau_controller_keeps_the_moderate_cap_on_an_easy_accepted_step():
     _, info = _apply_radau_lean_timestep_controller(**_radau_controller_arguments(newton_iter_count=3))
     assert float(info.growth) == pytest.approx(1.5)
