@@ -5985,6 +5985,16 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--ntx-scan-coefficient-reverse-mode",
+        choices=("config", "generic", "structured"),
+        default="config",
+        help=(
+            "Live NTX-scan database coefficient reverse rule. 'generic' keeps "
+            "the taped scan JAX VJP; 'structured' uses the opt-in compact "
+            "prepared coefficient adjoint. This applies only to ntx_scan_runtime."
+        ),
+    )
+    parser.add_argument(
         "--reverse-rhs-pullback-mode",
         choices=("separate", "fused_ntx"),
         default="separate",
@@ -6535,6 +6545,10 @@ def main() -> None:
         neoclassical_cfg["ntx_exact_radial_batch_mode"] = str(args.ntx_radial_batch_mode)
     if args.ntx_scan_batch_size not in (None, 0):
         neoclassical_cfg["ntx_exact_scan_batch_size"] = int(args.ntx_scan_batch_size)
+    if args.ntx_scan_coefficient_reverse_mode != "config":
+        neoclassical_cfg["ntx_scan_coefficient_reverse_mode"] = str(
+            args.ntx_scan_coefficient_reverse_mode
+        )
     if args.ntx_exact_preload_support != "config":
         neoclassical_cfg["preload_support"] = args.ntx_exact_preload_support == "true"
     profile_cfg = _baseline_profile_cfg(config)

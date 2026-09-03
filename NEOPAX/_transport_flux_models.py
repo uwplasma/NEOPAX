@@ -3606,12 +3606,18 @@ class NTXRuntimeScanTransportModel(TransportFluxModelBase):
     scan_surfaces: tuple[Any, ...] | None = None
     database: Any = None
     lagged_response_taylor_order: int = 1
+    coefficient_reverse_mode: str = "generic"
 
     def __post_init__(self):
         order = int(self.lagged_response_taylor_order)
         if order not in {1, 2, 3}:
             raise ValueError(
                 "ntx_scan_runtime lagged_response_taylor_order must be 1, 2, or 3."
+            )
+        if self.coefficient_reverse_mode not in {"generic", "structured"}:
+            raise ValueError(
+                "ntx_scan_runtime coefficient_reverse_mode must be 'generic' or "
+                "'structured'."
             )
 
     def with_runtime_scan_payload(
@@ -3751,6 +3757,7 @@ class NTXRuntimeScanTransportModel(TransportFluxModelBase):
             drds=jnp.asarray(channels["drds"], dtype=jnp.float64),
             grid=grid,
             source_name=self.source_name,
+            coefficient_reverse_mode=self.coefficient_reverse_mode,
         )
         scan = dataclasses.replace(
             scan,
@@ -16323,6 +16330,7 @@ def build_ntx_runtime_scan_transport_model(
     preload_channels=False,
     prebuild_database=True,
     lagged_response_taylor_order=1,
+    ntx_scan_coefficient_reverse_mode="generic",
     **kwargs,
 ):
     del kwargs
@@ -16347,6 +16355,7 @@ def build_ntx_runtime_scan_transport_model(
         scan_surfaces=None if ntx_scan_surfaces is None else tuple(ntx_scan_surfaces),
         database=None,
         lagged_response_taylor_order=int(lagged_response_taylor_order),
+        coefficient_reverse_mode=str(ntx_scan_coefficient_reverse_mode),
     )
     if preload_channels:
         model = model.with_static_channels()
