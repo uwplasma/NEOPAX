@@ -3607,6 +3607,8 @@ class NTXRuntimeScanTransportModel(TransportFluxModelBase):
     database: Any = None
     lagged_response_taylor_order: int = 1
     coefficient_reverse_mode: str = "generic"
+    record_scan_primal: bool = False
+    scan_primal_record: Any = None
 
     def __post_init__(self):
         order = int(self.lagged_response_taylor_order)
@@ -3618,6 +3620,10 @@ class NTXRuntimeScanTransportModel(TransportFluxModelBase):
             raise ValueError(
                 "ntx_scan_runtime coefficient_reverse_mode must be 'generic' or "
                 "'structured'."
+            )
+        if self.record_scan_primal and self.coefficient_reverse_mode != "structured":
+            raise ValueError(
+                "ntx_scan_runtime record_scan_primal requires coefficient_reverse_mode='structured'."
             )
 
     def with_runtime_scan_payload(
@@ -3649,6 +3655,7 @@ class NTXRuntimeScanTransportModel(TransportFluxModelBase):
             channels=channels,
             scan_surfaces=tuple(scan_surfaces),
             database=database,
+            scan_primal_record=None,
             vmec_file=None,
             boozer_file=None,
         )
@@ -3734,9 +3741,9 @@ class NTXRuntimeScanTransportModel(TransportFluxModelBase):
         loader = self._surface_loader(ntx)
         return tuple(loader(float(rho_value)) for rho_value in rho)
 
-    def _build_runtime_database(self):
+    def _build_runtime_database_and_record(self):
         if self.database is not None:
-            return self.database
+            return self.database, self.scan_primal_record
 
         ntx = _import_ntx()
         rho, nu_v, er_tilde = self._scan_axes()
@@ -3748,7 +3755,7 @@ class NTXRuntimeScanTransportModel(TransportFluxModelBase):
             n_zeta=int(self.n_zeta),
             n_xi=int(self.n_xi),
         )
-        scan = ntx.build_ntx_neopax_scan_from_surfaces(
+        scan_result = ntx.build_ntx_neopax_scan_from_surfaces(
             self._scan_surfaces(ntx, rho),
             rho=rho,
             nu_v=nu_v,
@@ -3758,7 +3765,13 @@ class NTXRuntimeScanTransportModel(TransportFluxModelBase):
             grid=grid,
             source_name=self.source_name,
             coefficient_reverse_mode=self.coefficient_reverse_mode,
+            return_primal_record=bool(self.record_scan_primal),
         )
+        if self.record_scan_primal:
+            scan, scan_primal_record = scan_result
+        else:
+            scan = scan_result
+            scan_primal_record = None
         scan = dataclasses.replace(
             scan,
             Er_tilde=er_tilde,
@@ -3794,10 +3807,16 @@ class NTXRuntimeScanTransportModel(TransportFluxModelBase):
             f"Er_tilde={int(er_tilde.shape[0])} "
             f"grid=({grid.n_theta},{grid.n_zeta},{grid.n_xi}) backend={str(self.surface_backend).strip().lower()}"
         )
-        return _ntx_runtime_scan_to_neopax_monoenergetic(
-            scan,
-            a_b=jnp.asarray(channels["a_b"], dtype=jnp.float64),
+        return (
+            _ntx_runtime_scan_to_neopax_monoenergetic(
+                scan,
+                a_b=jnp.asarray(channels["a_b"], dtype=jnp.float64),
+            ),
+            scan_primal_record,
         )
+
+    def _build_runtime_database(self):
+        return self._build_runtime_database_and_record()[0]
 
     def with_static_channels(self) -> "NTXRuntimeScanTransportModel":
         if self.channels is not None:
@@ -3837,6 +3856,7 @@ class NTXRuntimeScanTransportModel(TransportFluxModelBase):
             channels=new_channels,
             scan_surfaces=new_scan_surfaces,
             database=None if clear_database else self.database,
+            scan_primal_record=None if clear_database else self.scan_primal_record,
         )
 
     def _database_model(self) -> NTXDatabaseTransportModel:
@@ -3894,7 +3914,12 @@ class NTXRuntimeScanTransportModel(TransportFluxModelBase):
         if self.database is not None:
             return self
         model = self.with_static_channels()
-        return dataclasses.replace(model, database=model._build_runtime_database())
+        database, scan_primal_record = model._build_runtime_database_and_record()
+        return dataclasses.replace(
+            model,
+            database=database,
+            scan_primal_record=scan_primal_record,
+        )
 
 
 def build_ntx_exact_lij_runtime_support(
@@ -16331,6 +16356,7 @@ def build_ntx_runtime_scan_transport_model(
     prebuild_database=True,
     lagged_response_taylor_order=1,
     ntx_scan_coefficient_reverse_mode="generic",
+    ntx_scan_record_primal=False,
     **kwargs,
 ):
     del kwargs
@@ -16356,6 +16382,7 @@ def build_ntx_runtime_scan_transport_model(
         database=None,
         lagged_response_taylor_order=int(lagged_response_taylor_order),
         coefficient_reverse_mode=str(ntx_scan_coefficient_reverse_mode),
+        record_scan_primal=bool(ntx_scan_record_primal),
     )
     if preload_channels:
         model = model.with_static_channels()

@@ -13706,9 +13706,16 @@ def _radau_run_stage_subsolve(
 
     def cond_fn(newton_state):
         iter_idx, _, _, delta_norm, residual_norm, _, newton_metric, _, _, diverged, _, _, _, _ = newton_state
+        endpoint_contraction_not_observed = jnp.logical_and(
+            kernel_context.use_transport_endpoint_newton_tol,
+            iter_idx < jnp.asarray(2, dtype=jnp.int32),
+        )
         active = jnp.where(
             kernel_context.use_hairer_newton_tol,
-            newton_metric > kernel_context.newton_convergence_tol,
+            jnp.logical_or(
+                newton_metric > kernel_context.newton_convergence_tol,
+                endpoint_contraction_not_observed,
+            ),
             jnp.logical_or(residual_norm > kernel_context.tol, delta_norm > kernel_context.tol),
         )
         return jnp.logical_and(jnp.logical_and(iter_idx < kernel_context.maxiter, active), jnp.logical_not(diverged))
