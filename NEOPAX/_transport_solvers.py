@@ -2513,7 +2513,11 @@ def _make_radau_stage_predictor(
     prev_newton_iter_count=None,
     predictor_mode="current",
 ):
-    base_guess = c[:, None] * f0[None, :]
+    # Radau solves for stage derivatives K_i, so the constant-RHS predictor is
+    # K_i = F(y_n) at every stage.  ``c_i * f0`` would be a state increment
+    # shape, not a derivative, and is therefore inconsistent even before any
+    # stage history is available.
+    base_guess = jnp.broadcast_to(f0[None, :], (c.shape[0], f0.shape[0]))
     use_predictor = jnp.logical_and(
         prev_dt > 0.0,
         jnp.all(jnp.isfinite(prev_stages)),

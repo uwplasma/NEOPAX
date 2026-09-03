@@ -4155,6 +4155,20 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
             )
             flux_model = getattr(getattr(runtime, "models", None), "flux", None)
             neoclassical_model = getattr(flux_model, "neoclassical_model", flux_model)
+            database_payload = "database" in support_payload
+            # A recorded runtime-scan payload owns the already-built radial
+            # database.  The static scan model still carries its source
+            # ``Monoenergetic`` configuration, which is not a centre-flux
+            # interpolation table.  Bind the recorded table before obtaining
+            # either bootstrap primal or compact pullback methods.
+            if database_payload:
+                with_payload = getattr(neoclassical_model, "with_support_payload", None)
+                if not callable(with_payload):
+                    raise NotImplementedError(
+                        "Recorded database bootstrap AD requires a realtime NTX "
+                        "model with support-payload binding."
+                    )
+                neoclassical_model = with_payload(support_payload)
             corrected_fluxes_fn = getattr(neoclassical_model, "evaluate_momentum_corrected_fluxes", None)
             upar_only_fn = getattr(
                 neoclassical_model,
@@ -4182,7 +4196,6 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
                 "pullback_momentum_corrected_upar_state_support_geometry_by_radius",
                 None,
             )
-            database_payload = "database" in support_payload
             use_upar_only_primal = (
                 bootstrap_cotangent_mode == "joint_local_vjp_upar_only"
             )

@@ -71,8 +71,24 @@ def test_radau_stage_predictor_does_not_rescale_derivative_history_after_retry()
         predictor_mode="current",
     ).reshape((3, 2))
 
-    expected = 0.85 * jnp.asarray([5.0, -7.0]) + 0.15 * c[:, None] * f0[None, :]
+    expected = 0.85 * jnp.asarray([5.0, -7.0]) + 0.15 * f0[None, :]
     assert jnp.allclose(predictor, expected, rtol=1.0e-12, atol=1.0e-12)
+
+    first_step_predictor = transport_solvers._make_radau_stage_predictor(
+        f0,
+        previous_stages,
+        jnp.asarray(0.0, dtype=dtype),
+        jnp.asarray(0.01, dtype=dtype),
+        c,
+        dtype,
+        predictor_mode="current",
+    ).reshape((3, 2))
+    assert jnp.allclose(
+        first_step_predictor,
+        jnp.broadcast_to(f0, (3, 2)),
+        rtol=1.0e-12,
+        atol=1.0e-12,
+    )
 
 
 def test_radau_stage_residual_defect_is_not_hidden_by_endpoint_cancellation():
