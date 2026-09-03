@@ -9624,6 +9624,28 @@ def _radau_endpoint_correction_norm(
     )
 
 
+def _radau_stage_residual_defect_norm(
+    kernel_context: _RadauAcceptedStepKernelContext,
+    *,
+    h_value,
+    stage_residual,
+    endpoint_scale,
+):
+    """Return a non-cancelling, state-scaled Radau stage-residual defect.
+
+    The stage residual has derivative units, ``K_i - F(Y_i)``.  Multiplication
+    by ``h`` converts it to the state defect relevant to the transport
+    tolerances.  Unlike the endpoint correction ``h b.T delta_K``, this norm
+    retains every stage and therefore cannot be made small by cancellation
+    between Radau stages.
+    """
+    residual_matrix = jnp.asarray(stage_residual, dtype=kernel_context.dtype).reshape(
+        (kernel_context.num_stages, kernel_context.state_dim)
+    )
+    normalized = h_value * residual_matrix / endpoint_scale[None, :]
+    return jnp.sqrt(jnp.mean(normalized * normalized) + kernel_context.tiny_scalar)
+
+
 def _radau_transform_stage_stack(
     kernel_context: _RadauAcceptedStepKernelContext,
     stage_stack,
@@ -13747,6 +13769,7 @@ def _radau_run_stage_subsolve(
             _delta_prev,
             delta_norm,
             residual_norm,
+            stage_residual_defect_norm,
             prev_newton_norm,
             newton_metric,
             prev_theta_ratio,
@@ -13771,6 +13794,12 @@ def _radau_run_stage_subsolve(
         delta = jnp.where(jnp.all(jnp.isfinite(delta)), delta, jnp.zeros_like(delta))
         z_next = z_cur + delta
         current_residual_norm = _radau_residual_norm(kernel_context, residual_cur)
+        current_stage_residual_defect_norm = _radau_stage_residual_defect_norm(
+            kernel_context,
+            h_value=inputs.h_value,
+            stage_residual=residual_cur,
+            endpoint_scale=endpoint_newton_scale,
+        )
         current_delta_norm = jnp.linalg.norm(delta)
         stage_newton_norm = _radau_correction_norm(kernel_context, delta)
         endpoint_correction_norms = _radau_endpoint_correction_defect_norms(
@@ -13844,7 +13873,13 @@ def _radau_run_stage_subsolve(
         )
         meets_newton_tol = jnp.logical_and(
             convergence_metric <= kernel_context.newton_convergence_tol,
-            endpoint_contraction_observed,
+            jnp.logical_and(
+                endpoint_contraction_observed,
+                jnp.logical_or(
+                    jnp.logical_not(kernel_context.use_transport_endpoint_newton_tol),
+                    current_stage_residual_defect_norm <= kernel_context.newton_convergence_tol,
+                ),
+            ),
         )
         predictor_shrink = jnp.where(
             theta_candidate < kernel_context.theta_diverge_threshold,
@@ -13856,10 +13891,11 @@ def _radau_run_stage_subsolve(
         diverged_next = jnp.logical_or(diverged, jnp.logical_or(slow_reject, jnp.logical_or(residual_blowup, nonfinite_state)))
         if kernel_context.debug_newton_trace:
             jax.debug.print(
-                "[radau-solver] iter={iter} delta_norm={delta_norm:.6e} residual_norm={residual_norm:.6e} newton_metric={newton_metric:.6e} newton_tol={newton_tol:.6e} theta={theta:.6e} slow={slow} blowup={blowup} nonfinite={nonfinite} diverged={diverged}",
+                "[radau-solver] iter={iter} delta_norm={delta_norm:.6e} residual_norm={residual_norm:.6e} stage_residual_defect={stage_residual_defect:.6e} newton_metric={newton_metric:.6e} newton_tol={newton_tol:.6e} theta={theta:.6e} slow={slow} blowup={blowup} nonfinite={nonfinite} diverged={diverged}",
                 iter=iter_idx + 1,
                 delta_norm=current_delta_norm,
                 residual_norm=current_residual_norm,
+                stage_residual_defect=current_stage_residual_defect_norm,
                 newton_metric=convergence_metric,
                 newton_tol=kernel_context.newton_convergence_tol,
                 theta=theta_next,
@@ -13874,6 +13910,7 @@ def _radau_run_stage_subsolve(
             delta,
             current_delta_norm,
             current_residual_norm,
+            current_stage_residual_defect_norm,
             current_newton_norm,
             convergence_metric,
             theta_ratio_next,
@@ -13886,7 +13923,7 @@ def _radau_run_stage_subsolve(
         )
 
     def cond_fn(newton_state):
-        iter_idx, _, _, delta_norm, residual_norm, _, newton_metric, _, _, diverged, _, _, _, _ = newton_state
+        iter_idx, _, _, delta_norm, residual_norm, stage_residual_defect_norm, _, newton_metric, _, _, diverged, _, _, _, _ = newton_state
         endpoint_contraction_not_observed = jnp.logical_and(
             kernel_context.use_transport_endpoint_newton_tol,
             iter_idx < jnp.asarray(2, dtype=jnp.int32),
@@ -13895,7 +13932,14 @@ def _radau_run_stage_subsolve(
             kernel_context.use_hairer_newton_tol,
             jnp.logical_or(
                 newton_metric > kernel_context.newton_convergence_tol,
-                endpoint_contraction_not_observed,
+                jnp.logical_or(
+                    endpoint_contraction_not_observed,
+                    jnp.logical_and(
+                        kernel_context.use_transport_endpoint_newton_tol,
+                        stage_residual_defect_norm
+                        > kernel_context.newton_convergence_tol,
+                    ),
+                ),
             ),
             jnp.logical_or(residual_norm > kernel_context.tol, delta_norm > kernel_context.tol),
         )
@@ -13905,6 +13949,7 @@ def _radau_run_stage_subsolve(
         jnp.asarray(0, dtype=jnp.int32),
         inputs.z0,
         jnp.zeros_like(inputs.z0),
+        jnp.asarray(jnp.inf, dtype=kernel_context.dtype),
         jnp.asarray(jnp.inf, dtype=kernel_context.dtype),
         jnp.asarray(jnp.inf, dtype=kernel_context.dtype),
         jnp.asarray(jnp.inf, dtype=kernel_context.dtype),
@@ -13930,6 +13975,7 @@ def _radau_run_stage_subsolve(
         delta_final,
         delta_norm_final,
         _residual_norm_loop_final,
+        _stage_residual_defect_norm_loop_final,
         _prev_newton_norm_final,
         newton_metric_final,
         _prev_theta_ratio_final,
@@ -13949,6 +13995,12 @@ def _radau_run_stage_subsolve(
     nonfinite_stage_state = jnp.logical_not(jnp.all(jnp.isfinite(z_final)))
     nonfinite_stage_residual = jnp.logical_not(jnp.all(jnp.isfinite(final_residual)))
     final_residual_norm = _radau_residual_norm(kernel_context, final_residual)
+    final_stage_residual_defect_norm = _radau_stage_residual_defect_norm(
+        kernel_context,
+        h_value=inputs.h_value,
+        stage_residual=final_residual,
+        endpoint_scale=endpoint_newton_scale,
+    )
     if kernel_context.debug_newton_trace:
         debug_trigger = jnp.logical_or(
             jnp.logical_not(finite_initial_residual),
@@ -13981,7 +14033,11 @@ def _radau_run_stage_subsolve(
                     newton_metric_final <= kernel_context.newton_convergence_tol,
                     jnp.logical_or(
                         jnp.logical_not(kernel_context.use_transport_endpoint_newton_tol),
-                        iter_final >= jnp.asarray(2, dtype=jnp.int32),
+                        jnp.logical_and(
+                            iter_final >= jnp.asarray(2, dtype=jnp.int32),
+                            final_stage_residual_defect_norm
+                            <= kernel_context.newton_convergence_tol,
+                        ),
                     ),
                 ),
                 final_residual_norm <= kernel_context.tol,
@@ -13989,6 +14045,11 @@ def _radau_run_stage_subsolve(
         ),
         jnp.logical_not(diverged_final),
     )
+    if kernel_context.debug_newton_trace:
+        jax.debug.print(
+            "[radau-solver] final_stage_residual_defect={stage_residual_defect:.6e}",
+            stage_residual_defect=final_stage_residual_defect_norm,
+        )
     return _RadauStageSubsolveResult(
         iter_final=iter_final,
         z_final=z_final,

@@ -119,6 +119,54 @@ def initial_er_charge_flux_residual_er_derivative(state, er_profile, *, runtime)
     )
 
 
+def compact_initial_er_database_support_bars(
+    *, runtime, state, er_profile, residual_bars, support
+):
+    """Map selected-root charge-residual bars to recorded database tables.
+
+    The selected-root residual uses the local particle flux.  Its only
+    database-dependent contribution is therefore the neoclassical ``Gamma``
+    channel, with cotangent ``Z_a * residual_bar``.  This companion to the
+    black-box direct-RHS rule intentionally stops at the explicit database
+    leaf; the caller folds the accumulated table bars through the retained
+    runtime scan exactly once.
+    """
+    if not isinstance(support, dict) or "database" not in support:
+        raise ValueError(
+            "Compact database initial-Er support pullback requires an explicit "
+            "recorded database support leaf."
+        )
+    runtime_scan = find_ntx_runtime_scan_model_in_model(runtime.models.flux)
+    if runtime_scan is None:
+        raise ValueError(
+            "Compact database initial-Er support pullback requires an NTX runtime scan model."
+        )
+    er_profile = jnp.asarray(er_profile, dtype=state.Er.dtype)
+    residual_bars = jnp.asarray(residual_bars, dtype=state.Er.dtype)
+    if residual_bars.ndim != 2 or residual_bars.shape[1] != er_profile.shape[0]:
+        raise ValueError(
+            "Compact database initial-Er support pullback expects residual_bars "
+            "with shape (objective_count, radial_count)."
+        )
+    state_with_er = dataclasses.replace(state, Er=er_profile)
+    charge_qp = jnp.asarray(runtime.species.charge_qp, dtype=state.Er.dtype)
+
+    def _one_objective(residual_bar):
+        gamma_bar = charge_qp[:, None] * residual_bar[None, :]
+        support_bar = runtime_scan.pullback_direct_rhs_support_payload(
+            state_with_er,
+            {"Gamma": gamma_bar},
+            support,
+        )
+        if support_bar is None or "database" not in support_bar:
+            raise ValueError(
+                "Runtime database model did not expose its direct particle-flux transpose."
+            )
+        return support_bar["database"]
+
+    return jax.vmap(_one_objective)(residual_bars)
+
+
 def _replace_ntx_support_payload_in_model(model, support):
     if model is None or not dataclasses.is_dataclass(model) or isinstance(model, type):
         return model, False

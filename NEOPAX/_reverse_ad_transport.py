@@ -33,6 +33,7 @@ from ._geometry_autodiff import (
 from ._orchestrator import prepare_transport_solver_components
 from ._profiles import AnalyticalProfileModel
 from ._reverse_ad_initial_er import (
+    compact_initial_er_database_support_bars,
     fold_recorded_ntx_scan_database_bars_into_support,
     compact_initial_er_ntx_support_pullback_leaves,
     compact_initial_er_state_pullback,
@@ -4161,6 +4162,11 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
                 None,
             )
             state_pullback_fn = getattr(neoclassical_model, "pullback_momentum_corrected_upar_state_by_radius", None)
+            database_pullback_fn = getattr(
+                neoclassical_model,
+                "pullback_momentum_corrected_upar_database_by_radius",
+                None,
+            )
             support_pullback_fn = getattr(
                 neoclassical_model,
                 "pullback_momentum_corrected_upar_support_by_radius",
@@ -4194,6 +4200,10 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
                 bootstrap_cotangent_mode == "separate"
                 and (
                     not callable(state_pullback_fn)
+                    or (
+                        database_payload
+                        and not callable(database_pullback_fn)
+                    )
                     or (not database_payload and not callable(support_pullback_fn))
                 )
             ):
@@ -4254,46 +4264,61 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
             objective_values_rows.append(objective_value)
             if combined_geometry_payload:
                 if database_payload:
-                    # The database model now has a compact per-radius state
-                    # transpose.  Keep its table/geometry transpose on the
-                    # established support-payload VJP until the companion
-                    # interpolation-stencil momentum rule is installed.
-                    # This intentionally preserves correctness while removing
-                    # the all-radii database tape from the final-state VJP.
-                    support_delta0 = _float_delta_tree_like(support_payload)
+                    d11_bar, d13_bar, d33_bar = database_pullback_fn(
+                        final_state_for_bootstrap, upar_bar
+                    )
+                    database = support_payload["database"]
+                    database_bar = dataclasses.replace(
+                        _float_delta_tree_like(database),
+                        D11_log=d11_bar,
+                        D13=d13_bar,
+                        D33=d33_bar,
+                    )
+                    geometry = support_payload["geometry"]
+                    geometry_delta0 = _float_delta_tree_like(geometry)
 
-                    def _bootstrap_from_support_delta(support_delta):
-                        runtime_with_support = (
+                    def _bootstrap_from_geometry_delta(geometry_delta):
+                        payload = dict(support_payload)
+                        payload["geometry"] = _add_float_delta_tree(
+                            geometry, geometry_delta
+                        )
+                        runtime_with_geometry = (
                             dependencies.runtime_with_realtime_geometry_reverse_support_payload(
-                                runtime,
-                                _add_float_delta_tree(support_payload, support_delta),
+                                runtime, payload
                             )
                         )
-                        support_flux_model = getattr(
-                            getattr(runtime_with_support, "models", None), "flux", None
+                        geometry_flux_model = getattr(
+                            getattr(runtime_with_geometry, "models", None), "flux", None
                         )
-                        support_neoclassical_model = getattr(
-                            support_flux_model, "neoclassical_model", support_flux_model
+                        geometry_neoclassical_model = getattr(
+                            geometry_flux_model,
+                            "neoclassical_model",
+                            geometry_flux_model,
                         )
-                        support_fluxes = support_neoclassical_model.evaluate_momentum_corrected_fluxes(
+                        geometry_fluxes = geometry_neoclassical_model.evaluate_momentum_corrected_fluxes(
                             final_state_for_bootstrap
                         )
                         return bootstrap_current_softmax_abs_value_and_upar_bar(
                             final_state_for_bootstrap,
-                            runtime_with_support,
-                            support_fluxes,
+                            runtime_with_geometry,
+                            geometry_fluxes,
                         )[0]
 
-                    _, database_support_pullback = jax.vjp(
-                        _bootstrap_from_support_delta, support_delta0
+                    _, geometry_pullback = jax.vjp(
+                        _bootstrap_from_geometry_delta, geometry_delta0
                     )
-                    (database_support_bar,) = database_support_pullback(
+                    (geometry_objective_bar,) = geometry_pullback(
                         jnp.ones_like(objective_value)
                     )
                     objective_payload_bar_rows.append(
-                        _sanitize_float_delta_bar_tree(
-                            support_payload, database_support_bar
-                        )
+                        {
+                            "geometry": _sanitize_float_delta_bar_tree(
+                                geometry, geometry_objective_bar
+                            ),
+                            "database": _sanitize_float_delta_bar_tree(
+                                database, database_bar
+                            ),
+                        }
                     )
                     if phase_timing_diagnostics:
                         objective_payload_bar_rows[-1] = jax.block_until_ready(
@@ -5895,11 +5920,75 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
             initial_er_root_support_bars = (
                 tuple(jax.tree_util.tree_leaves(geometry_bars)) + tuple(ntx_bar_leaves)
             )
+        elif combined_geometry_payload and "database" in support_payload:
+            # Recorded scan database: transpose charge-weighted particle flux
+            # directly to the three tables, then preserve only the explicit
+            # geometry derivative in a database-fixed VJP.  The resulting
+            # table bars are folded through the retained scan once with the
+            # rest of the transport reverse support bars.
+            root_ntx_support_pullback_start = time.perf_counter()
+            database_bars = compact_initial_er_database_support_bars(
+                runtime=runtime,
+                state=pre_root_initial_state,
+                er_profile=er_profile,
+                residual_bars=residual_bars,
+                support=support_payload,
+            )
+            if phase_timing_diagnostics:
+                database_bars = jax.block_until_ready(database_bars)
+            root_ntx_support_pullback_elapsed = (
+                time.perf_counter() - root_ntx_support_pullback_start
+            )
+            geometry = support_payload["geometry"]
+            geometry_delta0 = _float_delta_tree_like(geometry)
+
+            def _residuals_from_geometry_delta(geometry_delta):
+                payload = dict(support_payload)
+                payload["geometry"] = _add_float_delta_tree(geometry, geometry_delta)
+                runtime_with_geometry = (
+                    dependencies.runtime_with_realtime_geometry_reverse_support_payload(
+                        runtime, payload
+                    )
+                )
+                return dependencies.initial_er_charge_flux_residuals(
+                    pre_root_initial_state, er_profile, runtime=runtime_with_geometry
+                )
+
+            root_geometry_pullback_start = time.perf_counter()
+            _, geometry_pullback = jax.vjp(
+                _residuals_from_geometry_delta, geometry_delta0
+            )
+            geometry_bars = jax.vmap(
+                lambda residual_bar: geometry_pullback(residual_bar)[0]
+            )(residual_bars)
+            if phase_timing_diagnostics:
+                geometry_bars = jax.block_until_ready(geometry_bars)
+            root_geometry_pullback_elapsed = time.perf_counter() - root_geometry_pullback_start
+
+            def _batched_zero(tree):
+                return jax.tree_util.tree_map(
+                    lambda leaf: jnp.zeros(
+                        (residual_bars.shape[0],) + jnp.asarray(leaf).shape,
+                        dtype=(
+                            jnp.asarray(leaf).dtype
+                            if jnp.issubdtype(jnp.asarray(leaf).dtype, jnp.inexact)
+                            else jnp.float64
+                        ),
+                    ),
+                    tree,
+                )
+
+            batched_support_bars = {
+                "geometry": geometry_bars,
+                "channels": _batched_zero(support_payload["channels"]),
+                "surfaces": _batched_zero(support_payload["surfaces"]),
+                "database": database_bars,
+            }
+            initial_er_root_support_bars = tuple(
+                jax.tree_util.tree_leaves(batched_support_bars)
+            )
         elif combined_geometry_payload:
-            # A live NTX scan has no prepared exact-support compact rule.  Its
-            # complete differentiable support tree is small and explicit:
-            # geometry, scan channels, and scan surfaces.  Rebuild the scan
-            # runtime from that tree so the database cache remains internal.
+            # Compatibility path for unrecorded scan payloads.
             support_delta0 = _float_delta_tree_like(support_payload)
 
             def _residuals_from_support_delta(support_delta):
@@ -5912,8 +6001,8 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
                 return dependencies.initial_er_charge_flux_residuals(
                     pre_root_initial_state,
                     er_profile,
-                runtime=runtime_with_support,
-            )
+                    runtime=runtime_with_support,
+                )
 
             root_geometry_pullback_start = time.perf_counter()
             _, support_pullback = jax.vjp(

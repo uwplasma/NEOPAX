@@ -75,6 +75,27 @@ def test_radau_stage_predictor_does_not_rescale_derivative_history_after_retry()
     assert jnp.allclose(predictor, expected, rtol=1.0e-12, atol=1.0e-12)
 
 
+def test_radau_stage_residual_defect_is_not_hidden_by_endpoint_cancellation():
+    """Opposing stage residuals must not pass an endpoint-only Newton test."""
+
+    context = types.SimpleNamespace(
+        num_stages=2,
+        state_dim=1,
+        dtype=jnp.float64,
+        tiny_scalar=jnp.asarray(1.0e-30, dtype=jnp.float64),
+    )
+    # With equal endpoint weights these two residuals would cancel, while the
+    # full collocation defect remains one half of the state scale.
+    defect = transport_solvers._radau_stage_residual_defect_norm(
+        context,
+        h_value=jnp.asarray(0.5, dtype=jnp.float64),
+        stage_residual=jnp.asarray([1.0, -1.0], dtype=jnp.float64),
+        endpoint_scale=jnp.asarray([1.0], dtype=jnp.float64),
+    )
+
+    assert jnp.allclose(defect, 0.5, rtol=1.0e-12, atol=1.0e-12)
+
+
 @pytest.mark.parametrize("order", [0, 6])
 def test_limm_w_config_rejects_unsupported_order(order):
     with pytest.raises(ValueError, match="limm_w_order"):

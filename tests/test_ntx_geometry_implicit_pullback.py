@@ -11,6 +11,7 @@ import ntx
 import pytest
 
 import NEOPAX._neoclassical as neoclassical_module
+import NEOPAX._reverse_ad_initial_er as initial_er_module
 
 from NEOPAX._transport_flux_models import (
     CombinedTransportFluxModel,
@@ -126,6 +127,41 @@ class _ToyBootstrapModel:
             + state.density[:, radius_index] * drds
             + self.geometry.scale * (prepared + 0.5 * drds)
         )
+
+
+def test_database_initial_root_support_batches_charge_weighted_particle_bars(monkeypatch):
+    """Selected-root database bars use exactly ``Z_a * residual_bar``."""
+
+    class _ScanModel:
+        def pullback_direct_rhs_support_payload(self, state, flux_bar, support):
+            del state, support
+            return {"database": {"gamma": 2.0 * flux_bar["Gamma"]}}
+
+    scan_model = _ScanModel()
+    monkeypatch.setattr(
+        initial_er_module,
+        "find_ntx_runtime_scan_model_in_model",
+        lambda _model: scan_model,
+    )
+    runtime = SimpleNamespace(
+        species=SimpleNamespace(charge_qp=jnp.asarray([-1.0, 2.0])),
+        models=SimpleNamespace(flux=object()),
+    )
+    state = TransportState(
+        density=jnp.ones((2, 3)),
+        pressure=2.0 * jnp.ones((2, 3)),
+        Er=jnp.asarray([0.1, 0.2, 0.3]),
+    )
+    residual_bars = jnp.asarray([[0.4, -0.2, 0.1], [-0.3, 0.5, 0.2]])
+    actual = initial_er_module.compact_initial_er_database_support_bars(
+        runtime=runtime,
+        state=state,
+        er_profile=state.Er,
+        residual_bars=residual_bars,
+        support={"database": object()},
+    )
+    expected = 2.0 * runtime.species.charge_qp[None, :, None] * residual_bars[:, None, :]
+    assert jnp.allclose(actual["gamma"], expected, rtol=0.0, atol=0.0)
 
 
 def test_momentum_correction_matrix_is_square_for_four_species():
@@ -474,6 +510,25 @@ def test_database_local_bootstrap_state_pullback_matches_full_upar_jvp():
         if jnp.issubdtype(jnp.asarray(bar).dtype, jnp.inexact)
     )
     assert jnp.allclose(lhs, jnp.vdot(upar_bar, upar_tangent), rtol=2.0e-10, atol=2.0e-10)
+
+    def _upar_from_tables(d11_log, d13, d33):
+        table_model = dataclasses.replace(
+            model,
+            database=dataclasses.replace(
+                database, D11_log=d11_log, D13=d13, D33=d33
+            ),
+        )
+        return table_model.evaluate_momentum_corrected_upar_only(state)
+
+    _, generic_table_pullback = jax.vjp(
+        _upar_from_tables, database.D11_log, database.D13, database.D33
+    )
+    expected_table_bars = generic_table_pullback(upar_bar)
+    actual_table_bars = model.pullback_momentum_corrected_upar_database_by_radius(
+        state, upar_bar
+    )
+    for actual, expected in zip(actual_table_bars, expected_table_bars, strict=True):
+        assert jnp.allclose(actual, expected, rtol=2.0e-10, atol=2.0e-10)
 
 
 def test_ntss_radial_flux_correction_terms_match_taguchi_formula():

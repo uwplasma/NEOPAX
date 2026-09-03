@@ -220,6 +220,76 @@ def _assemble_lij_matrix(species, energy_grid, index_species, vth_a, nu_vnew_a, 
     return Lij
 
 
+def assemble_momentum_lij_matrices(
+    species, energy_grid, index_species, vth_a, nu_a, nu_vnew_a, Dij
+):
+    """Assemble the extended Sonine moments from local monoenergetic values.
+
+    Kept separate from database interpolation so a database transpose can
+    first reduce a corrected-flow bar to this compact ``Dij`` tensor and only
+    then scatter it through the radial interpolation stencil.
+    """
+    lij = jnp.zeros((5, 5), dtype=Dij.dtype)
+    eij = jnp.zeros((5, 5), dtype=Dij.dtype)
+    l11 = -1.0 / jnp.sqrt(jnp.pi) * (species.mass[index_species] / species.charge[index_species]) ** 2 * vth_a**3
+    l13 = -1.0 / jnp.sqrt(jnp.pi) * (species.mass[index_species] / species.charge[index_species]) * vth_a**2
+    l33 = -1.0 / jnp.sqrt(jnp.pi) * vth_a
+    d11, d13, d33 = -(10.0**Dij[:, 0]), -Dij[:, 1], -Dij[:, 2] / nu_vnew_a
+    weighted = energy_grid.xWeights
+    lij = lij.at[0, 0].set(l11 * jnp.sum(energy_grid.L11_weight * weighted * d11))
+    lij = lij.at[0, 1].set(l11 * jnp.sum(energy_grid.L12_weight * weighted * d11))
+    lij = lij.at[1, 0].set(lij[0, 1])
+    lij = lij.at[1, 1].set(l11 * jnp.sum(energy_grid.L22_weight * weighted * d11))
+    lij = lij.at[0, 2].set(l13 * jnp.sum(energy_grid.L13_weight * weighted * d13))
+    lij = lij.at[1, 2].set(l13 * jnp.sum(energy_grid.L23_weight * weighted * d13))
+    lij = lij.at[2, 0].set(-lij[0, 2])
+    lij = lij.at[2, 1].set(-lij[1, 2])
+    lij = lij.at[2, 2].set(l33 * jnp.sum(energy_grid.L33_weight * weighted * d33))
+    lij = lij.at[0, 3].set(lij[1, 2])
+    lij = lij.at[1, 3].set(l13 * jnp.sum(energy_grid.L24_weight * weighted * d13))
+    lij = lij.at[0, 4].set(lij[1, 3])
+    lij = lij.at[1, 4].set(l13 * jnp.sum(energy_grid.L25_weight * weighted * d13))
+    lij = lij.at[3, 0].set(-lij[0, 3])
+    lij = lij.at[4, 0].set(-lij[0, 4])
+    lij = lij.at[3, 1].set(-lij[1, 3])
+    lij = lij.at[4, 1].set(-lij[1, 4])
+    lij = lij.at[3, 2].set(l33 * jnp.sum(energy_grid.L43_weight * weighted * d33))
+    lij = lij.at[2, 3].set(lij[3, 2])
+    lij = lij.at[3, 3].set(l33 * jnp.sum(energy_grid.L44_weight * weighted * d33))
+    lij = lij.at[2, 4].set(lij[3, 3])
+    lij = lij.at[4, 2].set(lij[3, 3])
+    lij = lij.at[3, 4].set(l33 * jnp.sum(energy_grid.L45_weight * weighted * d33))
+    lij = lij.at[4, 3].set(lij[3, 4])
+    lij = lij.at[4, 4].set(l33 * jnp.sum(energy_grid.L55_weight * weighted * d33))
+    eij = eij.at[0, 2].set(l13 * jnp.sum(energy_grid.L13_weight * nu_a * weighted * d13))
+    eij = eij.at[1, 2].set(l13 * jnp.sum(energy_grid.L23_weight * nu_a * weighted * d13))
+    eij = eij.at[2, 0].set(-eij[0, 2])
+    eij = eij.at[2, 1].set(-eij[1, 2])
+    eij = eij.at[2, 2].set(l33 * jnp.sum(energy_grid.L33_weight * nu_a * weighted * d33))
+    eij = eij.at[0, 3].set(eij[1, 2])
+    eij = eij.at[1, 3].set(l13 * jnp.sum(energy_grid.L24_weight * nu_a * weighted * d13))
+    eij = eij.at[0, 4].set(eij[1, 3])
+    eij = eij.at[1, 4].set(l13 * jnp.sum(energy_grid.L25_weight * nu_a * weighted * d13))
+    eij = eij.at[3, 0].set(-eij[0, 3])
+    eij = eij.at[4, 0].set(-eij[0, 4])
+    eij = eij.at[3, 1].set(-eij[1, 3])
+    eij = eij.at[4, 1].set(-eij[1, 4])
+    eij = eij.at[3, 2].set(l33 * jnp.sum(energy_grid.L43_weight * nu_a * weighted * d33))
+    eij = eij.at[2, 3].set(eij[3, 2])
+    eij = eij.at[3, 3].set(l33 * jnp.sum(energy_grid.L44_weight * nu_a * weighted * d33))
+    eij = eij.at[2, 4].set(eij[3, 3])
+    eij = eij.at[4, 2].set(eij[3, 3])
+    eij = eij.at[3, 4].set(l33 * jnp.sum(energy_grid.L45_weight * nu_a * weighted * d33))
+    eij = eij.at[4, 3].set(eij[3, 4])
+    eij = eij.at[4, 4].set(l33 * jnp.sum(energy_grid.L55_weight * nu_a * weighted * d33))
+    nu_av = jnp.stack((
+        jnp.sum(nu_a * energy_grid.L13_weight * weighted),
+        jnp.sum(nu_a * energy_grid.L23_weight * weighted),
+        jnp.sum(nu_a * energy_grid.L24_weight * weighted),
+    ))
+    return lij, eij, nu_av
+
+
 def _interpolated_lij_matrix(
     species,
     energy_grid,

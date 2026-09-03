@@ -30,6 +30,8 @@ from ._boundary_conditions import (
 from ._neoclassical import (
     _as_species_constraint,
     _collisionality_kind,
+    _nu_over_vnew,
+    assemble_momentum_lij_matrices,
     _nu_over_vnew_local,
     get_Collision_Operator_terms,
     get_Lij_matrix_with_momentum_correction,
@@ -77,6 +79,11 @@ from ._second_order_response import (
     unary_power as _jet_power,
 )
 from ._database import D11_POSITIVE_FLOOR, Monoenergetic
+from ._interpolators_preprocessed import (
+    get_Dij_preprocessed_3d_ntss_radius,
+    radial_preprocessed_interpolation_stencil,
+    radial_preprocessed_interpolation_table_bar,
+)
 from ._source_models import assemble_pressure_source_components, sum_source_components
 from ._model_api import (
     ModelCapabilities,
@@ -3049,6 +3056,179 @@ class NTXDatabaseTransportModel(TransportFluxModelBase):
         state_bar, _ = jax.lax.scan(_accumulate, state_bar0, radius_indices)
         return state_bar
 
+    def pullback_momentum_corrected_upar_database_by_radius(self, state, upar_bar):
+        """Return compact corrected-Upar bars for the three database tables.
+
+        The only differentiated functions in this rule are the fixed-size
+        local momentum solve and the local 5x5 moment assembly.  In
+        particular, neither the radial database tables nor the NTX scan are
+        differentiated by JAX here: each resulting ``Dij`` bar is scattered
+        explicitly through the established interpolation stencil.
+        """
+        density = safe_density(state.density, self.density_floor)
+        temperature = state.temperature
+        density_right, density_right_grad = _extract_right_constraints(
+            self.bc_density, density, self.geometry.r_grid_half
+        )
+        temperature_right, temperature_right_grad = _extract_right_constraints(
+            self.bc_temperature, temperature, self.geometry.r_grid_half
+        )
+        density_right = density[:, -1] if density_right is None else density_right
+        density_right_grad = (
+            jnp.zeros_like(density_right)
+            if density_right_grad is None
+            else density_right_grad
+        )
+        temperature_right = (
+            temperature[:, -1] if temperature_right is None else temperature_right
+        )
+        temperature_right_grad = (
+            jnp.zeros_like(temperature_right)
+            if temperature_right_grad is None
+            else temperature_right_grad
+        )
+        dndr = jax.vmap(
+            lambda values, right, right_grad: get_gradient_density(
+                values, self.geometry.r_grid, self.geometry.r_grid_half, self.geometry.dr,
+                right_face_constraint=right, right_face_grad_constraint=right_grad,
+            )
+        )(density, density_right, density_right_grad)
+        dTdr = jax.vmap(
+            lambda values, right, right_grad: get_gradient_temperature(
+                values, self.geometry.r_grid, self.geometry.r_grid_half, self.geometry.dr,
+                right_face_constraint=right, right_face_grad_constraint=right_grad,
+            )
+        )(temperature, temperature_right, temperature_right_grad)
+        A1 = jax.vmap(
+            lambda charge, density_a, temperature_a, dndr_a, dTdr_a: get_Thermodynamical_Forces_A1(
+                charge, density_a, temperature_a, dndr_a, dTdr_a, state.Er
+            )
+        )(self.species.charge, density, temperature, dndr, dTdr)
+        A2 = jax.vmap(get_Thermodynamical_Forces_A2)(temperature, dTdr)
+        A3 = get_Thermodynamical_Forces_A3(state.Er)
+        v_thermal = get_v_thermal(self.species.mass, temperature)
+        species_indices = jnp.arange(int(self.species.number_species), dtype=jnp.int32)
+        upar_bar = jnp.asarray(upar_bar, dtype=state.pressure.dtype)
+        radius_indices = jnp.arange(upar_bar.shape[-1], dtype=jnp.int32)
+        database = self.database
+        # The established momentum-correction routine always uses its
+        # default collisionality construction.  Preserve that convention here
+        # rather than silently changing the bootstrap objective's physics.
+        default_collisionality_kind = _collisionality_kind("default")
+
+        def _zero_tables():
+            return (
+                jnp.zeros_like(database.D11_log),
+                jnp.zeros_like(database.D13),
+                jnp.zeros_like(database.D33),
+            )
+
+        def _local_dij_and_moments(radius_index):
+            coefficient_radius = jnp.maximum(
+                radius_index, jnp.asarray(1, dtype=radius_index.dtype)
+            )
+
+            def _one_species(species_index):
+                vth = v_thermal[species_index, coefficient_radius]
+                v_new = self.energy_grid.v_norm * vth
+                nu_over_vnew = _nu_over_vnew(
+                    self.species,
+                    species_index,
+                    v_new,
+                    coefficient_radius,
+                    density,
+                    temperature,
+                    v_thermal,
+                    default_collisionality_kind,
+                )
+                er_over_vnew = state.Er[coefficient_radius] * 1.0e3 / v_new
+                dij = jax.vmap(
+                    lambda nu_value, er_value: get_Dij_preprocessed_3d_ntss_radius(
+                        self.geometry.r_grid[coefficient_radius],
+                        nu_value,
+                        er_value,
+                        database,
+                    )
+                )(nu_over_vnew, er_over_vnew)
+                return dij, vth, nu_over_vnew * v_new, nu_over_vnew, er_over_vnew
+
+            dij, vth, nu, nu_over_vnew, er_over_vnew = jax.vmap(_one_species)(
+                species_indices
+            )
+            moments = jax.vmap(
+                lambda species_index, vth_value, nu_value, nu_ratio, dij_value: assemble_momentum_lij_matrices(
+                    self.species,
+                    self.energy_grid,
+                    species_index,
+                    vth_value,
+                    nu_value,
+                    nu_ratio,
+                    dij_value,
+                )
+            )(species_indices, vth, nu, nu_over_vnew, dij)
+            return dij, vth, nu, nu_over_vnew, er_over_vnew, moments
+
+        def _accumulate(carry, radius_index):
+            dij, vth, nu, nu_over_vnew, er_over_vnew, moments = _local_dij_and_moments(
+                radius_index
+            )
+            lij, eij, nu_av = moments
+
+            def _upar_from_moments(lij_value, eij_value, nu_av_value):
+                return get_momentum_Correction(
+                    self.species, self.energy_grid, self.geometry, radius_index,
+                    lij_value, eij_value, nu_av_value, v_thermal, density,
+                    temperature, A1, A2, A3, self.species.mass,
+                    self.species.charge, dndr, dTdr,
+                )[2]
+
+            _, momentum_pullback = jax.vjp(
+                _upar_from_moments, lij, eij, nu_av
+            )
+            local_upar_bar = jax.lax.dynamic_index_in_dim(
+                upar_bar, radius_index, axis=1, keepdims=False
+            )
+            lij_bar, eij_bar, nu_av_bar = momentum_pullback(local_upar_bar)
+
+            def _moments_from_dij(dij_value):
+                return jax.vmap(
+                    lambda species_index, vth_value, nu_value, nu_ratio, local_dij: assemble_momentum_lij_matrices(
+                        self.species, self.energy_grid, species_index, vth_value,
+                        nu_value, nu_ratio, local_dij,
+                    )
+                )(species_indices, vth, nu, nu_over_vnew, dij_value)
+
+            _, dij_pullback = jax.vjp(_moments_from_dij, dij)
+            (dij_bar,) = dij_pullback((lij_bar, eij_bar, nu_av_bar))
+
+            def _scatter_table(table_index, table):
+                def _one_species(species_index, nu_ratio, er_ratio, local_bar):
+                    def _one_energy(nu_value, er_value, bar_value):
+                        stencil = radial_preprocessed_interpolation_stencil(
+                            self.geometry.r_grid[jnp.maximum(radius_index, 1)],
+                            nu_value,
+                            er_value,
+                            database,
+                        )
+                        return radial_preprocessed_interpolation_table_bar(
+                            stencil, bar_value, table
+                        )
+                    return jnp.sum(
+                        jax.vmap(_one_energy)(nu_ratio, er_ratio, local_bar), axis=0
+                    )
+                return jnp.sum(
+                    jax.vmap(_one_species)(species_indices, nu_over_vnew, er_over_vnew, dij_bar[:, :, table_index]),
+                    axis=0,
+                )
+
+            d11_bar = _scatter_table(0, database.D11_log)
+            d13_bar = _scatter_table(1, database.D13)
+            d33_bar = _scatter_table(2, database.D33)
+            return tuple(left + right for left, right in zip(carry, (d11_bar, d13_bar, d33_bar), strict=True)), None
+
+        table_bars, _ = jax.lax.scan(_accumulate, _zero_tables(), radius_indices)
+        return table_bars
+
     def build_local_particle_flux_evaluator(self, state):
         species = self.species
         energy_grid = self.energy_grid
@@ -4238,6 +4418,13 @@ class NTXRuntimeScanTransportModel(TransportFluxModelBase):
         """Delegate the compact database bootstrap state transpose."""
 
         return self._database_model().pullback_momentum_corrected_upar_state_by_radius(
+            state, upar_bar
+        )
+
+    def pullback_momentum_corrected_upar_database_by_radius(self, state, upar_bar):
+        """Delegate compact corrected-bootstrap database table bars."""
+
+        return self._database_model().pullback_momentum_corrected_upar_database_by_radius(
             state, upar_bar
         )
 
