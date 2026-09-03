@@ -7106,23 +7106,40 @@ def internal_realtime_geometry_transport_reverse_table_result_builder(
             raise RuntimeError(
                 "reuse_static_probe was requested, but the internal table builder returned no schedule artifact."
             )
-        ntx_support_payload = (
-            active_support_payload["ntx_support"]
-            if active_support_payload is not None
-            else find_ntx_support_payload(active_runtime)
-        )
-        support_payload = (
-            {
-                "geometry": (
-                    active_support_payload["geometry"]
-                    if active_support_payload is not None
-                    else active_runtime.geometry
-                ),
-                "ntx_support": ntx_support_payload,
-            }
-            if combined_geometry_payload
-            else ntx_support_payload
-        )
+        if active_support_payload is not None:
+            # A raw-block state supplies the established exact-Lij payload.
+            ntx_support_payload = active_support_payload["ntx_support"]
+            support_payload = (
+                {
+                    "geometry": active_support_payload["geometry"],
+                    "ntx_support": ntx_support_payload,
+                }
+                if combined_geometry_payload
+                else ntx_support_payload
+            )
+        elif str(realtime_geometry_payload_for_runtime(active_runtime)["kind"]) == "ntx_scan_runtime":
+            # A live scan model owns no prepared exact-NTX support tree.  Its
+            # differentiable inputs are geometry, channels and scan surfaces;
+            # the interpolated database is rebuilt by the model itself.
+            if not combined_geometry_payload:
+                raise ValueError(
+                    "ntx_scan_runtime reverse requires the combined realtime "
+                    "geometry payload."
+                )
+            ntx_support_payload = None
+            support_payload = realtime_geometry_reverse_support_payload_for_runtime(
+                active_runtime
+            )
+        else:
+            ntx_support_payload = find_ntx_support_payload(active_runtime)
+            support_payload = (
+                {
+                    "geometry": active_runtime.geometry,
+                    "ntx_support": ntx_support_payload,
+                }
+                if combined_geometry_payload
+                else ntx_support_payload
+            )
         _report_table_builder_phase("prepare_support_payload")
         support_result = realtime_geometry_support_cotangents_from_parameter_vector(
             profile_values=active_profile_values,
