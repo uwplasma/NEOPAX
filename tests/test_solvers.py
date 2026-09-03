@@ -817,6 +817,8 @@ def test_t3d_outer_theta_solver_rebuilds_lagged_response_before_accepting_time()
     assert field.anchors == pytest.approx([1.0, 1.125])
     assert int(out["n_steps"]) == 1
     assert float(out["final_time"]) == pytest.approx(0.1)
+    assert jnp.asarray(out["ts"]).tolist() == pytest.approx([0.0, 0.1])
+    assert jnp.asarray(out["accepted_mask"]).tolist() == [True, True]
     assert int(out["t3d_outer_iterations"]) == 2
 
 

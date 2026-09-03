@@ -24714,7 +24714,11 @@ class T3DOuterThetaMethodSolver(_T3DOuterThetaSolverConfig):
         ys = [flat_state]
         ts = [t_value]
         dts = [jnp.asarray(0.0, dtype=dtype)]
-        accepted = [jnp.asarray(False)]
+        # ``accepted_mask`` is also the output-validity mask.  The initial
+        # state is a valid saved time, even though it is not the result of an
+        # attempted step; marking it false causes plotting/HDF5 selection to
+        # discard t0 when a one-step T3D-like run stops before t_final.
+        accepted = [jnp.asarray(True)]
         failed = [jnp.asarray(False)]
         fail_codes = [jnp.asarray(0, dtype=jnp.int32)]
         accepted_steps = 0
