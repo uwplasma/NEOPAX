@@ -2690,6 +2690,9 @@ def _apply_radau_lean_timestep_controller(
     slow_contraction,
     residual_blowup,
     newton_nonfinite,
+    stagnation_accepted,
+    stagnation_defect_norm,
+    stagnation_growth_cap,
     lagged_reused,
     jacobian_reused,
     fail_code,
@@ -3001,6 +3004,14 @@ def _apply_radau_lean_timestep_controller(
         jnp.asarray(1.0, dtype=dtype),
         growth,
     )
+    # A plateau acceptance is admissible only because its endpoint correction
+    # shares the time-error budget. Do not let a tiny embedded LTE immediately
+    # undo that safeguard by jumping back to the rejected step size.
+    growth = jnp.where(
+        stagnation_accepted,
+        jnp.minimum(growth, stagnation_growth_cap),
+        growth,
+    )
     next_dt = jnp.clip(trial_dt * growth, dt_min, dt_max)
 
     def _accept(_):
@@ -3130,6 +3141,8 @@ def _apply_radau_lean_timestep_controller(
             slow_contraction=slow_contraction,
             residual_blowup=residual_blowup,
             newton_nonfinite=newton_nonfinite,
+            stagnation_accepted=stagnation_accepted,
+            stagnation_defect_norm=stagnation_defect_norm,
         )
 
     def _reject(_):
@@ -3246,6 +3259,8 @@ def _apply_radau_lean_timestep_controller(
             slow_contraction=slow_contraction,
             residual_blowup=residual_blowup,
             newton_nonfinite=newton_nonfinite,
+            stagnation_accepted=stagnation_accepted,
+            stagnation_defect_norm=stagnation_defect_norm,
         )
 
     return jax.lax.cond(accepted, _accept, _reject, operand=None)
@@ -3276,6 +3291,9 @@ class _RadauSolverConfig(TransportSolver):
     newton_tol_mode: str = "residual"
     newton_fnewt_mode: str = "tol"
     newton_fnewt_override: float | None = None
+    newton_stagnation_mode: str = "off"
+    newton_stagnation_defect_budget: float = 1.0
+    newton_stagnation_growth_cap: float = 1.25
     controller_mode: str = "current"
     predictor_mode: str = "current"
     lagged_response_reuse_mode: str = "retry_only"
@@ -3319,6 +3337,9 @@ class _RadauSolverConfig(TransportSolver):
         newton_tol_mode: str = "residual",
         newton_fnewt_mode: str = "tol",
         newton_fnewt_override: float | None = None,
+        newton_stagnation_mode: str = "off",
+        newton_stagnation_defect_budget: float = 1.0,
+        newton_stagnation_growth_cap: float = 1.25,
         controller_mode: str = "current",
         predictor_mode: str = "current",
         lagged_response_reuse_mode: str = "retry_only",
@@ -3417,6 +3438,36 @@ class _RadauSolverConfig(TransportSolver):
             self,
             "newton_fnewt_override",
             None if newton_fnewt_override is None else float(newton_fnewt_override),
+        )
+        stagnation_mode_norm = str(newton_stagnation_mode).strip().lower()
+        stagnation_mode_aliases = {
+            "none": "off",
+            "disabled": "off",
+            "endpoint": "endpoint_correction",
+            "defect": "endpoint_correction",
+        }
+        stagnation_mode_norm = stagnation_mode_aliases.get(
+            stagnation_mode_norm, stagnation_mode_norm
+        )
+        if stagnation_mode_norm not in {"off", "endpoint_correction"}:
+            raise ValueError(
+                "radau_newton_stagnation_mode must be one of: off, endpoint_correction"
+            )
+        if float(newton_stagnation_defect_budget) <= 0.0:
+            raise ValueError("radau_newton_stagnation_defect_budget must be positive")
+        if (
+            stagnation_mode_norm != "off"
+            and not 1.0 <= float(newton_stagnation_growth_cap) <= float(max_step_factor)
+        ):
+            raise ValueError(
+                "radau_newton_stagnation_growth_cap must lie in [1, max_step_factor]"
+            )
+        object.__setattr__(self, "newton_stagnation_mode", stagnation_mode_norm)
+        object.__setattr__(
+            self, "newton_stagnation_defect_budget", float(newton_stagnation_defect_budget)
+        )
+        object.__setattr__(
+            self, "newton_stagnation_growth_cap", float(newton_stagnation_growth_cap)
         )
         controller_mode_norm = str(controller_mode).strip().lower()
         controller_aliases = {
@@ -3637,6 +3688,8 @@ class _RadauAcceptedStepAttemptResult:
     density_err_norm: Any
     pressure_err_norm: Any
     er_err_norm: Any
+    stagnation_accepted: Any
+    stagnation_defect_norm: Any
     lagged_response_reused: Any
     jacobian_reused: Any
 
@@ -3994,6 +4047,7 @@ class _RadauAcceptedStepApproximateTangentResult:
 class _RadauStageSubsolveResult:
     iter_final: Any
     z_final: Any
+    delta_final: Any
     delta_norm_final: Any
     newton_metric_final: Any
     theta_final: Any
@@ -4056,6 +4110,22 @@ class _RadauStageSubsolveApproximateTangentResult:
 
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True, eq=False)
+class _RadauEndpointCorrectionDefectNorms:
+    """Tolerance-scaled endpoint size of the final Newton stage correction.
+
+    This is a linearized endpoint *correction*, not a direct-RHS endpoint
+    defect: it uses only the final stage update already produced by Newton.
+    """
+
+    endpoint_delta: Any
+    global_norm: Any
+    density_norm: Any
+    pressure_norm: Any
+    er_norm: Any
+
+
+@jax.tree_util.register_dataclass
+@dataclasses.dataclass(frozen=True, eq=False)
 class _RadauAcceptedStepKernelContext:
     radau_transform: Any
     radau_inv_transform: Any
@@ -4106,6 +4176,9 @@ class _RadauAcceptedStepKernelContext:
     debug_newton_trace: Any
     use_transport_lagged_response: Any
     lagged_response_correction_mode: str
+    newton_stagnation_mode: str
+    newton_stagnation_defect_budget: Any
+    newton_stagnation_growth_cap: Any
 
 
 @dataclasses.dataclass(frozen=True, eq=False)
@@ -4394,6 +4467,8 @@ def _radau_build_approximate_tangent_result(
         density_err_norm=_zero_tangent_like(attempt_result.density_err_norm),
         pressure_err_norm=_zero_tangent_like(attempt_result.pressure_err_norm),
         er_err_norm=_zero_tangent_like(attempt_result.er_err_norm),
+        stagnation_accepted=_zero_tangent_like(attempt_result.stagnation_accepted),
+        stagnation_defect_norm=_zero_tangent_like(attempt_result.stagnation_defect_norm),
         lagged_response_reused=_zero_tangent_like(attempt_result.lagged_response_reused),
         jacobian_reused=_zero_tangent_like(attempt_result.jacobian_reused),
     )
@@ -8292,6 +8367,7 @@ def _execute_radau_accepted_step_attempt(
         real_lu_out, real_piv_out, complex_lu_out, complex_piv_out,
         newton_shrink, diverged_final, nonfinite_stage_state, nonfinite_stage_residual,
         finite_f0, finite_z0, finite_initial_residual, density_err_norm, pressure_err_norm, er_err_norm,
+        stagnation_accepted, stagnation_defect_norm,
         lagged_response_out, lagged_reference_y_out, lagged_response_reused,
         jacobian_reused,
     ) = _radau_single_step_primal(kernel_context, physics_context, carry_in, trial_dt)
@@ -8333,6 +8409,8 @@ def _execute_radau_accepted_step_attempt(
         density_err_norm=density_err_norm,
         pressure_err_norm=pressure_err_norm,
         er_err_norm=er_err_norm,
+        stagnation_accepted=stagnation_accepted,
+        stagnation_defect_norm=stagnation_defect_norm,
         lagged_response_reused=lagged_response_reused,
         jacobian_reused=jacobian_reused,
     )
@@ -8697,6 +8775,9 @@ def _radau_attempt_step_lean(
         slow_contraction=attempt_result.slow_contraction_final,
         residual_blowup=attempt_result.residual_blowup_final,
         newton_nonfinite=attempt_result.newton_nonfinite_final,
+        stagnation_accepted=attempt_result.stagnation_accepted,
+        stagnation_defect_norm=attempt_result.stagnation_defect_norm,
+        stagnation_growth_cap=execution_context.kernel_context.newton_stagnation_growth_cap,
         lagged_reused=attempt_result.lagged_response_reused,
         jacobian_reused=attempt_result.jacobian_reused,
         fail_code=fail_code,
@@ -8740,6 +8821,7 @@ def _radau_attempt_step_forward_solver(
         real_lu_out, real_piv_out, complex_lu_out, complex_piv_out,
         newton_shrink, diverged_final, nonfinite_stage_state, nonfinite_stage_residual,
         finite_f0, finite_z0, finite_initial_residual, density_err_norm, pressure_err_norm, er_err_norm,
+        stagnation_accepted, stagnation_defect_norm,
         lagged_response_out, lagged_reference_y_out, lagged_response_reused,
         jacobian_reused,
     ) = _radau_single_step_primal(
@@ -8787,6 +8869,9 @@ def _radau_attempt_step_forward_solver(
         slow_contraction=slow_contraction_final,
         residual_blowup=residual_blowup_final,
         newton_nonfinite=newton_nonfinite_final,
+        stagnation_accepted=stagnation_accepted,
+        stagnation_defect_norm=stagnation_defect_norm,
+        stagnation_growth_cap=execution_context.kernel_context.newton_stagnation_growth_cap,
         lagged_reused=lagged_response_reused,
         jacobian_reused=jacobian_reused,
         fail_code=fail_code,
@@ -8852,6 +8937,9 @@ def _radau_attempt_step_with_payload(
         slow_contraction=attempt_result.slow_contraction_final,
         residual_blowup=attempt_result.residual_blowup_final,
         newton_nonfinite=attempt_result.newton_nonfinite_final,
+        stagnation_accepted=attempt_result.stagnation_accepted,
+        stagnation_defect_norm=attempt_result.stagnation_defect_norm,
+        stagnation_growth_cap=execution_context.kernel_context.newton_stagnation_growth_cap,
         lagged_reused=attempt_result.lagged_response_reused,
         jacobian_reused=attempt_result.jacobian_reused,
         fail_code=step_state.status[1],
@@ -8909,6 +8997,8 @@ def _radau_step_fn(
             slow_contraction=jnp.asarray(False),
             residual_blowup=jnp.asarray(False),
             newton_nonfinite=jnp.asarray(False),
+            stagnation_accepted=jnp.asarray(False),
+            stagnation_defect_norm=jnp.asarray(0.0, dtype=execution_context.dtype),
         )
 
     def _run(_):
@@ -8917,7 +9007,7 @@ def _radau_step_fn(
     step_state_out, step_info = jax.lax.cond(failed, _skip, _run, operand=None)
     if execution_context.debug_newton_trace:
         jax.debug.print(
-            "[radau-solver] attempt t_start={t_start:.6e} dt_try={dt_try:.6e} accepted={accepted} failed={failed} fail_code={fail_code} converged={converged} err_norm={err_norm:.6e} growth={growth:.6e} next_dt={next_dt:.6e} lagged_reused={lagged_reused} jacobian_reused={jacobian_reused}",
+            "[radau-solver] attempt t_start={t_start:.6e} dt_try={dt_try:.6e} accepted={accepted} failed={failed} fail_code={fail_code} converged={converged} err_norm={err_norm:.6e} growth={growth:.6e} next_dt={next_dt:.6e} stagnation_accepted={stagnation_accepted} stagnation_defect_norm={stagnation_defect_norm:.6e} lagged_reused={lagged_reused} jacobian_reused={jacobian_reused}",
             t_start=step_state.t,
             dt_try=step_state.dt,
             accepted=step_info.accepted,
@@ -8927,6 +9017,8 @@ def _radau_step_fn(
             err_norm=jnp.asarray(jnp.inf, dtype=execution_context.dtype) if getattr(step_info, "err_norm", None) is None else jnp.asarray(getattr(step_info, "err_norm"), dtype=execution_context.dtype),
             growth=jnp.asarray(1.0, dtype=execution_context.dtype) if getattr(step_info, "growth", None) is None else jnp.asarray(getattr(step_info, "growth"), dtype=execution_context.dtype),
             next_dt=step_state.dt if getattr(step_info, "next_dt", None) is None else jnp.asarray(getattr(step_info, "next_dt"), dtype=execution_context.dtype),
+            stagnation_accepted=jnp.asarray(False) if getattr(step_info, "stagnation_accepted", None) is None else jnp.asarray(getattr(step_info, "stagnation_accepted")),
+            stagnation_defect_norm=jnp.asarray(0.0, dtype=execution_context.dtype) if getattr(step_info, "stagnation_defect_norm", None) is None else jnp.asarray(getattr(step_info, "stagnation_defect_norm"), dtype=execution_context.dtype),
             lagged_reused=jnp.asarray(False) if getattr(step_info, "lagged_reused", None) is None else jnp.asarray(getattr(step_info, "lagged_reused")),
             jacobian_reused=jnp.asarray(False) if getattr(step_info, "jacobian_reused", None) is None else jnp.asarray(getattr(step_info, "jacobian_reused")),
             ordered=True,
@@ -8970,6 +9062,8 @@ def _radau_step_fn_forward_solver(
             slow_contraction=jnp.asarray(False),
             residual_blowup=jnp.asarray(False),
             newton_nonfinite=jnp.asarray(False),
+            stagnation_accepted=jnp.asarray(False),
+            stagnation_defect_norm=jnp.asarray(0.0, dtype=execution_context.dtype),
             stage_history=step_state.prev_stages,
         )
 
@@ -8979,7 +9073,7 @@ def _radau_step_fn_forward_solver(
     step_state_out, step_info = jax.lax.cond(failed, _skip, _run, operand=None)
     if execution_context.debug_newton_trace:
         jax.debug.print(
-            "[radau-solver] attempt t_start={t_start:.6e} dt_try={dt_try:.6e} accepted={accepted} failed={failed} fail_code={fail_code} converged={converged} err_norm={err_norm:.6e} growth={growth:.6e} next_dt={next_dt:.6e} lagged_reused={lagged_reused} jacobian_reused={jacobian_reused}",
+            "[radau-solver] attempt t_start={t_start:.6e} dt_try={dt_try:.6e} accepted={accepted} failed={failed} fail_code={fail_code} converged={converged} err_norm={err_norm:.6e} growth={growth:.6e} next_dt={next_dt:.6e} stagnation_accepted={stagnation_accepted} stagnation_defect_norm={stagnation_defect_norm:.6e} lagged_reused={lagged_reused} jacobian_reused={jacobian_reused}",
             t_start=step_state.t,
             dt_try=step_state.dt,
             accepted=step_info.accepted,
@@ -8989,6 +9083,8 @@ def _radau_step_fn_forward_solver(
             err_norm=jnp.asarray(jnp.inf, dtype=execution_context.dtype) if getattr(step_info, "err_norm", None) is None else jnp.asarray(getattr(step_info, "err_norm"), dtype=execution_context.dtype),
             growth=jnp.asarray(1.0, dtype=execution_context.dtype) if getattr(step_info, "growth", None) is None else jnp.asarray(getattr(step_info, "growth"), dtype=execution_context.dtype),
             next_dt=step_state.dt if getattr(step_info, "next_dt", None) is None else jnp.asarray(getattr(step_info, "next_dt"), dtype=execution_context.dtype),
+            stagnation_accepted=jnp.asarray(False) if getattr(step_info, "stagnation_accepted", None) is None else jnp.asarray(getattr(step_info, "stagnation_accepted")),
+            stagnation_defect_norm=jnp.asarray(0.0, dtype=execution_context.dtype) if getattr(step_info, "stagnation_defect_norm", None) is None else jnp.asarray(getattr(step_info, "stagnation_defect_norm"), dtype=execution_context.dtype),
             lagged_reused=jnp.asarray(False) if getattr(step_info, "lagged_reused", None) is None else jnp.asarray(getattr(step_info, "lagged_reused")),
             jacobian_reused=jnp.asarray(False) if getattr(step_info, "jacobian_reused", None) is None else jnp.asarray(getattr(step_info, "jacobian_reused")),
             ordered=True,
@@ -9167,6 +9263,55 @@ def _radau_correction_norm(
         + kernel_context.tiny_scalar
     )
     return jnp.where(kernel_context.use_hairer_scaled_correction, scaled_norm, raw_norm)
+
+
+def _radau_endpoint_correction_defect_norms(
+    kernel_context: _RadauAcceptedStepKernelContext,
+    *,
+    h_value,
+    stage_delta,
+    endpoint_scale,
+):
+    """Measure ``h b^T delta_K`` in the solver's endpoint state scale.
+
+    ``stage_delta`` is the final Newton correction in physical Radau-stage
+    coordinates, with shape ``(num_stages, state_dim)``. No RHS evaluation,
+    lagged-response rebuild, or Jacobian action is performed here.
+    """
+    endpoint_delta = h_value * (kernel_context.b @ stage_delta)
+    normalized = endpoint_delta / endpoint_scale
+    tiny = kernel_context.tiny_scalar
+
+    def _block_norm(block):
+        return jnp.sqrt(jnp.mean(block * block) + tiny)
+
+    # These block sizes are static properties of the compiled transport solve;
+    # use ordinary slices, as the embedded transport estimator does below.
+    density_end = kernel_context.density_size
+    pressure_end = density_end + kernel_context.pressure_size
+    density_norm = (
+        _block_norm(normalized[:density_end])
+        if kernel_context.density_size > 0
+        else kernel_context.zero_scalar
+    )
+    pressure_norm = (
+        _block_norm(normalized[density_end:pressure_end])
+        if kernel_context.pressure_size > 0
+        else kernel_context.zero_scalar
+    )
+    er_norm = (
+        _block_norm(normalized[pressure_end:pressure_end + kernel_context.er_size])
+        if kernel_context.er_size > 0
+        else kernel_context.zero_scalar
+    )
+    global_norm = jnp.sqrt(jnp.mean(normalized * normalized) + tiny)
+    return _RadauEndpointCorrectionDefectNorms(
+        endpoint_delta=endpoint_delta,
+        global_norm=global_norm,
+        density_norm=density_norm,
+        pressure_norm=pressure_norm,
+        er_norm=er_norm,
+    )
 
 
 def _radau_transform_stage_stack(
@@ -13171,6 +13316,7 @@ def _radau_build_stage_subsolve_tangent_result(
     return _RadauStageSubsolveResult(
         iter_final=_zero_tangent_like(primal_result.iter_final),
         z_final=tangent_result.dz_flat,
+        delta_final=_zero_tangent_like(primal_result.delta_final),
         delta_norm_final=_zero_tangent_like(primal_result.delta_norm_final),
         newton_metric_final=_zero_tangent_like(primal_result.newton_metric_final),
         theta_final=_zero_tangent_like(primal_result.theta_final),
@@ -13285,6 +13431,7 @@ def _radau_run_stage_subsolve(
         (
             iter_idx,
             z_cur,
+            _delta_prev,
             delta_norm,
             residual_norm,
             prev_newton_norm,
@@ -13386,6 +13533,7 @@ def _radau_run_stage_subsolve(
         return (
             iter_idx + 1,
             z_next,
+            delta,
             current_delta_norm,
             current_residual_norm,
             current_newton_norm,
@@ -13400,7 +13548,7 @@ def _radau_run_stage_subsolve(
         )
 
     def cond_fn(newton_state):
-        iter_idx, _, delta_norm, residual_norm, _, newton_metric, _, _, diverged, _, _, _, _ = newton_state
+        iter_idx, _, _, delta_norm, residual_norm, _, newton_metric, _, _, diverged, _, _, _, _ = newton_state
         active = jnp.where(
             kernel_context.use_hairer_newton_tol,
             newton_metric > kernel_context.predictor_fnewt,
@@ -13411,6 +13559,7 @@ def _radau_run_stage_subsolve(
     init_newton = (
         jnp.asarray(0, dtype=jnp.int32),
         inputs.z0,
+        jnp.zeros_like(inputs.z0),
         jnp.asarray(jnp.inf, dtype=kernel_context.dtype),
         jnp.asarray(jnp.inf, dtype=kernel_context.dtype),
         jnp.asarray(jnp.inf, dtype=kernel_context.dtype),
@@ -13433,6 +13582,7 @@ def _radau_run_stage_subsolve(
     (
         iter_final,
         z_final,
+        delta_final,
         delta_norm_final,
         _residual_norm_loop_final,
         _prev_newton_norm_final,
@@ -13491,6 +13641,7 @@ def _radau_run_stage_subsolve(
     return _RadauStageSubsolveResult(
         iter_final=iter_final,
         z_final=z_final,
+        delta_final=delta_final,
         delta_norm_final=delta_norm_final,
         newton_metric_final=newton_metric_final,
         theta_final=theta_final,
@@ -13847,6 +13998,95 @@ def _radau_single_step_primal(
         )
     else:
         pressure_err_norm = err_norm
+
+    stagnation_accepted = jnp.asarray(False)
+    stagnation_defect_norm = kernel_context.zero_scalar
+    converged_effective = subsolve_result.converged
+    err_norm_effective = err_norm
+    if kernel_context.newton_stagnation_mode == "endpoint_correction":
+        correction_norms = _radau_endpoint_correction_defect_norms(
+            kernel_context,
+            h_value=h_value,
+            stage_delta=subsolve_result.delta_final.reshape(
+                (kernel_context.num_stages, kernel_context.state_dim)
+            ),
+            endpoint_scale=local_scale,
+        )
+        if kernel_context.error_scale_mode == "ntss_block_rms" and (
+            kernel_context.density_size + kernel_context.pressure_size + kernel_context.er_size
+            == kernel_context.state_dim
+        ):
+            defect_block_squares = jnp.stack(
+                [
+                    jnp.where(
+                        kernel_context.density_size > 0,
+                        correction_norms.density_norm * correction_norms.density_norm,
+                        kernel_context.zero_scalar,
+                    ),
+                    jnp.where(
+                        kernel_context.pressure_size > 0,
+                        correction_norms.pressure_norm * correction_norms.pressure_norm,
+                        kernel_context.zero_scalar,
+                    ),
+                    jnp.where(
+                        kernel_context.er_size > 0,
+                        correction_norms.er_norm * correction_norms.er_norm,
+                        kernel_context.zero_scalar,
+                    ),
+                ],
+                axis=0,
+            )
+            defect_block_count = (
+                jnp.where(kernel_context.density_size > 0, 1.0, 0.0)
+                + jnp.where(kernel_context.pressure_size > 0, 1.0, 0.0)
+                + jnp.where(kernel_context.er_size > 0, 1.0, 0.0)
+            )
+            stagnation_defect_norm = jnp.sqrt(
+                jnp.sum(defect_block_squares)
+                / jnp.maximum(defect_block_count, jnp.asarray(1.0, dtype=kernel_context.dtype))
+                + kernel_context.tiny_scalar
+            )
+        else:
+            stagnation_defect_norm = correction_norms.global_norm
+        shared_error = jnp.sqrt(
+            err_norm * err_norm
+            + (
+                stagnation_defect_norm
+                / jnp.maximum(
+                    kernel_context.newton_stagnation_defect_budget,
+                    kernel_context.tiny_scalar,
+                )
+            ) ** 2
+        )
+        stagnation_eligible = jnp.logical_and(
+            jnp.logical_not(subsolve_result.converged),
+            jnp.logical_and(
+                subsolve_result.slow_contraction_final,
+                jnp.logical_and(
+                    jnp.logical_not(subsolve_result.residual_blowup_final),
+                    jnp.logical_and(
+                        jnp.logical_not(subsolve_result.newton_nonfinite_final),
+                        jnp.logical_and(
+                            subsolve_result.finite_initial_residual,
+                            jnp.logical_and(
+                                subsolve_result.theta_final
+                                < kernel_context.theta_diverge_threshold,
+                                jnp.logical_and(
+                                    jnp.logical_not(subsolve_result.nonfinite_stage_state),
+                                    jnp.logical_and(
+                                        jnp.logical_not(subsolve_result.nonfinite_stage_residual),
+                                        jnp.isfinite(subsolve_result.final_residual_norm),
+                                    ),
+                                ),
+                            ),
+                        ),
+                    ),
+                ),
+            ),
+        )
+        stagnation_accepted = jnp.logical_and(stagnation_eligible, shared_error <= 1.0)
+        converged_effective = jnp.logical_or(subsolve_result.converged, stagnation_accepted)
+        err_norm_effective = jnp.where(stagnation_accepted, shared_error, err_norm)
     theta_safe = jnp.clip(subsolve_result.theta_final, kernel_context.theta_clip_min, kernel_context.theta_clip_max)
     fallback_newton_shrink = jnp.clip(
         kernel_context.newton_shrink_num / theta_safe,
@@ -13854,7 +14094,7 @@ def _radau_single_step_primal(
         kernel_context.newton_shrink_max,
     )
     newton_shrink = jnp.where(
-        subsolve_result.converged,
+        converged_effective,
         jnp.asarray(1.0, dtype=kernel_context.dtype),
         jnp.where(subsolve_result.slow_contraction_final, subsolve_result.shrink_suggest_final, fallback_newton_shrink),
     )
@@ -13864,8 +14104,8 @@ def _radau_single_step_primal(
     cache_age_out = jnp.where(reuse_jacobian, cache_age + 1, jnp.asarray(0, dtype=jnp.int32))
     return (
         flat_next,
-        err_norm,
-        subsolve_result.converged,
+        err_norm_effective,
+        converged_effective,
         subsolve_result.z_final,
         subsolve_result.theta_final,
         subsolve_result.iter_final,
@@ -13892,6 +14132,8 @@ def _radau_single_step_primal(
         density_err_norm,
         pressure_err_norm,
         er_err_norm,
+        stagnation_accepted,
+        stagnation_defect_norm,
         lagged_response,
         lagged_reference_y,
         lagged_response_reused,
@@ -14499,6 +14741,8 @@ def _radau_adaptive_payload_trace_rollout(
             slow_contraction=jnp.asarray(False),
             residual_blowup=jnp.asarray(False),
             newton_nonfinite=jnp.asarray(False),
+            stagnation_accepted=jnp.asarray(False),
+            stagnation_defect_norm=jnp.asarray(0.0, dtype=dtype),
         )
 
     xs = jnp.arange(int(max_total_steps), dtype=jnp.int32)
@@ -16347,6 +16591,8 @@ def _radau_adaptive_final_y_realized_schedule_fused_jvp(
                 density_err_norm=jnp.asarray(jnp.inf, dtype=dtype),
                 pressure_err_norm=jnp.asarray(jnp.inf, dtype=dtype),
                 er_err_norm=jnp.asarray(jnp.inf, dtype=dtype),
+                stagnation_accepted=jnp.asarray(False),
+                stagnation_defect_norm=jnp.asarray(jnp.inf, dtype=dtype),
                 lagged_response_reused=jnp.asarray(False),
                 jacobian_reused=jnp.asarray(False),
             )
@@ -16399,6 +16645,9 @@ def _radau_adaptive_final_y_realized_schedule_fused_jvp(
                 slow_contraction=attempt_result.slow_contraction_final,
                 residual_blowup=attempt_result.residual_blowup_final,
                 newton_nonfinite=attempt_result.newton_nonfinite_final,
+                stagnation_accepted=attempt_result.stagnation_accepted,
+                stagnation_defect_norm=attempt_result.stagnation_defect_norm,
+                stagnation_growth_cap=execution_context.kernel_context.newton_stagnation_growth_cap,
                 lagged_reused=attempt_result.lagged_response_reused,
                 jacobian_reused=attempt_result.jacobian_reused,
                 fail_code=fail_code,
@@ -18957,6 +19206,15 @@ def _build_prepared_radau_accepted_rollout(
         lagged_response_correction_mode=str(
             getattr(solver, "lagged_response_correction_mode", "none")
         ).strip().lower(),
+        newton_stagnation_mode=str(
+            getattr(solver, "newton_stagnation_mode", "off")
+        ).strip().lower(),
+        newton_stagnation_defect_budget=jnp.asarray(
+            getattr(solver, "newton_stagnation_defect_budget", 1.0), dtype=dtype
+        ),
+        newton_stagnation_growth_cap=jnp.asarray(
+            getattr(solver, "newton_stagnation_growth_cap", 1.25), dtype=dtype
+        ),
     )
     physics_context = _RadauAcceptedStepPhysicsContext(
         unpack_flat=unpack_flat,
@@ -19119,6 +19377,8 @@ class _RadauStepInfo:
     slow_contraction: Any = None
     residual_blowup: Any = None
     newton_nonfinite: Any = None
+    stagnation_accepted: Any = None
+    stagnation_defect_norm: Any = None
     stage_history: Any = None
 
 
@@ -19671,6 +19931,15 @@ class RADAUSolver(_RadauSolverConfig):
             lagged_response_correction_mode=str(
                 getattr(self, "lagged_response_correction_mode", "none")
             ).strip().lower(),
+            newton_stagnation_mode=str(
+                getattr(self, "newton_stagnation_mode", "off")
+            ).strip().lower(),
+            newton_stagnation_defect_budget=jnp.asarray(
+                getattr(self, "newton_stagnation_defect_budget", 1.0), dtype=dtype
+            ),
+            newton_stagnation_growth_cap=jnp.asarray(
+                getattr(self, "newton_stagnation_growth_cap", 1.25), dtype=dtype
+            ),
         )
         physics_context = _RadauAcceptedStepPhysicsContext(
             unpack_flat=unpack_flat,
@@ -25191,6 +25460,13 @@ def build_time_solver(solver_parameters: Any, solver_override: Any = None) -> Tr
             newton_tol_mode=str(_cfg_get("radau_newton_tol_mode", "residual")),
             newton_fnewt_mode=str(_cfg_get("radau_newton_fnewt_mode", "tol")),
             newton_fnewt_override=_cfg_get("radau_newton_fnewt_override"),
+            newton_stagnation_mode=str(_cfg_get("radau_newton_stagnation_mode", "off")),
+            newton_stagnation_defect_budget=float(
+                _cfg_get("radau_newton_stagnation_defect_budget", 1.0)
+            ),
+            newton_stagnation_growth_cap=float(
+                _cfg_get("radau_newton_stagnation_growth_cap", 1.25)
+            ),
             controller_mode=str(_cfg_get("radau_controller_mode", "current")),
             predictor_mode=str(_cfg_get("radau_predictor_mode", "current")),
             lagged_response_reuse_mode=str(_cfg_get("lagged_response_reuse_mode", "retry_only")),

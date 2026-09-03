@@ -1131,6 +1131,9 @@ def _radau_controller_arguments(*, newton_iter_count, theta_final=0.0, controlle
         "slow_contraction": jnp.asarray(False),
         "residual_blowup": jnp.asarray(False),
         "newton_nonfinite": jnp.asarray(False),
+        "stagnation_accepted": jnp.asarray(False),
+        "stagnation_defect_norm": jnp.asarray(0.0, dtype=dtype),
+        "stagnation_growth_cap": jnp.asarray(1.25, dtype=dtype),
         "lagged_reused": jnp.asarray(False),
         "jacobian_reused": jnp.asarray(False),
         "fail_code": zero_int,
@@ -1165,6 +1168,21 @@ def test_radau_controller_regrows_dt_after_a_difficult_accepted_step(controller_
 def test_radau_controller_holds_dt_after_a_very_difficult_accepted_step():
     _, info = _apply_radau_lean_timestep_controller(**_radau_controller_arguments(newton_iter_count=8))
     assert float(info.growth) == pytest.approx(1.0)
+
+
+def test_radau_controller_caps_only_an_endpoint_correction_plateau_acceptance():
+    args = _radau_controller_arguments(
+        newton_iter_count=3,
+        controller_mode="hairer_lean_transport_discounted",
+    )
+    args["stagnation_accepted"] = jnp.asarray(True)
+    args["stagnation_defect_norm"] = jnp.asarray(0.4, dtype=jnp.float64)
+    args["stagnation_growth_cap"] = jnp.asarray(1.1, dtype=jnp.float64)
+    _, info = _apply_radau_lean_timestep_controller(**args)
+    assert bool(info.accepted)
+    assert bool(info.stagnation_accepted)
+    assert float(info.stagnation_defect_norm) == pytest.approx(0.4)
+    assert float(info.growth) == pytest.approx(1.1)
 
 
 def test_radau_discounted_newton_bracket_avoids_immediate_regrowth_to_failed_dt():
