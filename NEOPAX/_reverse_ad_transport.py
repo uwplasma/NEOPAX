@@ -717,13 +717,21 @@ def _initial_direct_rhs_support_pullback_batched(
         ),
         axis=1,
     )
-    # Do not ``vmap`` this owner-level callback.  A realtime NTX database
-    # payload contains scan-surface metadata with static Boozer mode arrays;
-    # JAX's batched pytree reconstruction replaces those fields with internal
-    # placeholders and fails in ``BoozerSurface.__post_init__``.  The final
-    # database specialization will replace these scalar calls with one
-    # numerical multi-RHS interpolation transpose.  Until then, a Python
-    # tuple preserves the support tree exactly and stacks only real bars.
+    # The retained scan-database support is numerical (geometry plus compact
+    # tables) after the scan record has been stripped from the rollout
+    # runtime.  It can therefore take the objective axis natively.  Keep the
+    # conservative scalar path for live Lij payloads, whose scan-surface
+    # metadata has static Boozer arrays that cannot be reconstructed by a
+    # generic ``vmap``.
+    if isinstance(support_payload, dict) and "database" in support_payload:
+        return jax.vmap(
+            lambda rhs_bar: flat_rhs_direct_support_pullback(
+                carry0.t, carry0.y, rhs_bar, support_payload
+            )
+        )(rhs_bars)
+
+    # Live support compatibility route: stack only numerical bars after each
+    # scalar owner call, preserving static surface metadata exactly.
     support_bars = tuple(
         flat_rhs_direct_support_pullback(
             carry0.t, carry0.y, rhs_bars[index], support_payload
@@ -4135,7 +4143,10 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
         objective_name = objective_labels[objective_i]
         if (
             objective_name == bootstrap_objective_name
-            and "ntx_support" in support_payload
+            and (
+                "ntx_support" in support_payload
+                or "database" in support_payload
+            )
         ):
             component_start = time.perf_counter()
             final_state_for_bootstrap = reverse_setup.prepared_rollout.physics_context.unpack_flat(
@@ -4165,6 +4176,7 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
                 "pullback_momentum_corrected_upar_state_support_geometry_by_radius",
                 None,
             )
+            database_payload = "database" in support_payload
             use_upar_only_primal = (
                 bootstrap_cotangent_mode == "joint_local_vjp_upar_only"
             )
@@ -4180,7 +4192,10 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
                 )
             if (
                 bootstrap_cotangent_mode == "separate"
-                and (not callable(state_pullback_fn) or not callable(support_pullback_fn))
+                and (
+                    not callable(state_pullback_fn)
+                    or (not database_payload and not callable(support_pullback_fn))
+                )
             ):
                 raise NotImplementedError(
                     "bootstrap_current_softmax_abs_scaled requires compact corrected-Upar "
@@ -4200,6 +4215,7 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
                 bootstrap_cotangent_mode
                 in {"joint_local_vjp", "joint_local_vjp_upar_only"}
                 and combined_geometry_payload
+                and not database_payload
             )
             if (
                 bootstrap_cotangent_mode
@@ -4237,6 +4253,53 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
             final_y_bar_rows.append(unpack_pullback(final_state_bar)[0])
             objective_values_rows.append(objective_value)
             if combined_geometry_payload:
+                if database_payload:
+                    # The database model now has a compact per-radius state
+                    # transpose.  Keep its table/geometry transpose on the
+                    # established support-payload VJP until the companion
+                    # interpolation-stencil momentum rule is installed.
+                    # This intentionally preserves correctness while removing
+                    # the all-radii database tape from the final-state VJP.
+                    support_delta0 = _float_delta_tree_like(support_payload)
+
+                    def _bootstrap_from_support_delta(support_delta):
+                        runtime_with_support = (
+                            dependencies.runtime_with_realtime_geometry_reverse_support_payload(
+                                runtime,
+                                _add_float_delta_tree(support_payload, support_delta),
+                            )
+                        )
+                        support_flux_model = getattr(
+                            getattr(runtime_with_support, "models", None), "flux", None
+                        )
+                        support_neoclassical_model = getattr(
+                            support_flux_model, "neoclassical_model", support_flux_model
+                        )
+                        support_fluxes = support_neoclassical_model.evaluate_momentum_corrected_fluxes(
+                            final_state_for_bootstrap
+                        )
+                        return bootstrap_current_softmax_abs_value_and_upar_bar(
+                            final_state_for_bootstrap,
+                            runtime_with_support,
+                            support_fluxes,
+                        )[0]
+
+                    _, database_support_pullback = jax.vjp(
+                        _bootstrap_from_support_delta, support_delta0
+                    )
+                    (database_support_bar,) = database_support_pullback(
+                        jnp.ones_like(objective_value)
+                    )
+                    objective_payload_bar_rows.append(
+                        _sanitize_float_delta_bar_tree(
+                            support_payload, database_support_bar
+                        )
+                    )
+                    if phase_timing_diagnostics:
+                        objective_payload_bar_rows[-1] = jax.block_until_ready(
+                            objective_payload_bar_rows[-1]
+                        )
+                    continue
                 if not use_joint_bootstrap_pullback and not callable(geometry_pullback_fn):
                     raise NotImplementedError(
                         "bootstrap_current_softmax_abs_scaled requires compact corrected-Upar "

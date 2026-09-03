@@ -14,11 +14,13 @@ import NEOPAX._neoclassical as neoclassical_module
 
 from NEOPAX._transport_flux_models import (
     CombinedTransportFluxModel,
+    NTXDatabaseTransportModel,
     NTXExactLijRuntimeSupport,
     NTXExactLijRuntimeTransportModel,
     NTXRuntimeScanChannels,
     _sanitize_float_delta_bar_tree,
 )
+from NEOPAX._database_preprocessed import PreprocessedMonoenergetic3DNTSSRadius
 from NEOPAX._neoclassical import (
     _collisionality_kind,
     _ntss_radial_flux_correction_terms,
@@ -381,6 +383,97 @@ def test_momentum_corrected_fluxes_accept_four_collision_species():
     )
 
     assert all(bool(jnp.all(jnp.isfinite(value))) for value in outputs)
+
+
+def test_database_local_bootstrap_state_pullback_matches_full_upar_jvp():
+    """The compact database bootstrap state rule is the full wHe JVP.
+
+    This guards the new per-radius boundary directly.  In particular it
+    covers the production axis convention (coefficient matrices at the axis
+    borrow index one) and keeps the database tables out of the differentiated
+    input tree.
+    """
+    species = Species(
+        number_species=4,
+        species_indices=jnp.asarray([0, 1, 2, 3]),
+        mass_mp=jnp.asarray([5.446e-4, 2.0, 3.0, 4.0]),
+        charge_qp=jnp.asarray([-1.0, 1.0, 1.0, 2.0]),
+        names=("e", "D", "T", "He"),
+    )
+    geometry = _TestMomentumGeometry(
+        a_b=jnp.asarray(1.0),
+        r_grid=jnp.asarray([0.25, 0.75]),
+        r_grid_half=jnp.asarray([0.0, 0.5, 1.0]),
+        Bsqav=jnp.asarray([1.2, 1.3]),
+        G_PS=jnp.asarray([1.0, 1.1]),
+        B0=jnp.asarray([1.0, 1.0]),
+        full_grid_indices=jnp.arange(2, dtype=jnp.int32),
+        dr=jnp.asarray(0.5),
+    )
+    rho = jnp.asarray([0.0, 0.25, 0.5, 0.75, 1.0])
+    nu_v = jnp.asarray([1.0e-4, 1.0e-2, 1.0])
+    er_grid = jnp.asarray([[0.0, 1.0e-4, 1.0e-3, 1.0e-2]])
+    table_shape = (rho.size, nu_v.size, er_grid.shape[1])
+    table_seed = jnp.reshape(
+        jnp.arange(int(jnp.prod(jnp.asarray(table_shape))), dtype=jnp.float64),
+        table_shape,
+    )
+    database = PreprocessedMonoenergetic3DNTSSRadius.read_data(
+        a_b=1.0,
+        rho=rho,
+        nu_v=nu_v,
+        Er=er_grid,
+        drds=jnp.ones_like(rho),
+        D11=1.0 + 1.0e-3 * table_seed,
+        D13=0.2 + 1.0e-4 * table_seed,
+        D33=0.3 + 2.0e-4 * table_seed,
+    )
+    model = NTXDatabaseTransportModel(
+        species=species,
+        energy_grid=StandardLaguerreEnergyGrid(n_x=2),
+        geometry=geometry,
+        database=database,
+    )
+    state = TransportState(
+        density=jnp.asarray(
+            [[1.0, 1.1], [0.9, 1.0], [0.8, 0.9], [1.0e-4, 1.1e-4]]
+        ),
+        pressure=jnp.asarray(
+            [[1.5, 1.76], [1.2, 1.5], [0.9, 1.17], [1.5e-4, 1.76e-4]]
+        ),
+        Er=jnp.asarray([2.0e-4, 2.5e-4]),
+    )
+    state_direction = dataclasses.replace(
+        state,
+        density=jnp.asarray(
+            [[0.03, -0.02], [-0.01, 0.04], [0.02, -0.03], [1.0e-6, -2.0e-6]]
+        ),
+        pressure=jnp.asarray(
+            [[0.04, -0.01], [0.02, 0.03], [-0.03, 0.01], [2.0e-6, -1.0e-6]]
+        ),
+        Er=jnp.asarray([2.0e-5, -1.0e-5]),
+    )
+    upar_bar = jnp.asarray(
+        [[0.2, -0.3], [-0.4, 0.1], [0.3, 0.2], [-0.1, 0.25]]
+    )
+    upar_tangent = jax.jvp(
+        model.evaluate_momentum_corrected_upar_only,
+        (state,),
+        (state_direction,),
+    )[1]
+    state_bar = model.pullback_momentum_corrected_upar_state_by_radius(
+        state, upar_bar
+    )
+    lhs = sum(
+        jnp.vdot(jnp.asarray(bar), jnp.asarray(direction))
+        for bar, direction in zip(
+            jax.tree_util.tree_leaves(state_bar),
+            jax.tree_util.tree_leaves(state_direction),
+            strict=True,
+        )
+        if jnp.issubdtype(jnp.asarray(bar).dtype, jnp.inexact)
+    )
+    assert jnp.allclose(lhs, jnp.vdot(upar_bar, upar_tangent), rtol=2.0e-10, atol=2.0e-10)
 
 
 def test_ntss_radial_flux_correction_terms_match_taguchi_formula():
@@ -1043,6 +1136,35 @@ def test_black_box_initial_direct_rhs_support_contracts_each_objective():
         support_payload=jnp.asarray(0.5),
     )
     assert jnp.allclose(result, jnp.asarray([5.0, 0.5]))
+
+
+def test_black_box_database_initial_direct_rhs_support_uses_objective_batch():
+    """Recorded database payloads keep the initial direct bar numerical."""
+
+    carry0 = SimpleNamespace(t=jnp.asarray(1.5), y=jnp.asarray([2.0, 3.0]))
+    carry0_bars = SimpleNamespace(
+        prev_stages=jnp.asarray(
+            [
+                [[1.0, 2.0], [3.0, 4.0]],
+                [[-2.0, 1.0], [5.0, -3.0]],
+            ]
+        )
+    )
+    calls = []
+
+    def _direct_hook(_t, _y, rhs_bar, support):
+        calls.append(jnp.asarray(rhs_bar).shape)
+        return {"database": support["database"] * jnp.sum(rhs_bar)}
+
+    result = _initial_direct_rhs_support_pullback_batched(
+        carry0=carry0,
+        carry0_bars=carry0_bars,
+        kernel_context=SimpleNamespace(num_stages=2),
+        flat_rhs_direct_support_pullback=_direct_hook,
+        support_payload={"database": jnp.asarray(0.5)},
+    )
+    assert calls == [(2,)]
+    assert jnp.allclose(result["database"], jnp.asarray([5.0, 0.5]))
 
 
 def test_black_box_exact_direct_support_split_matches_generic_payload_vjp():

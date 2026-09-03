@@ -2521,7 +2521,13 @@ def _make_radau_stage_predictor(
     step_ratio = h_value / jnp.maximum(prev_dt, jnp.asarray(1.0e-14, dtype=dtype))
     bounded_step_ratio = jnp.clip(step_ratio, jnp.asarray(0.25, dtype=dtype), jnp.asarray(4.0, dtype=dtype))
     prev_stage_stack = prev_stages.reshape(base_guess.shape)
-    prev_stage_guess = prev_stage_stack * step_ratio
+    # ``prev_stages`` stores the Radau stage *derivatives* K_i, not the
+    # increments h K_i.  They therefore must not be rescaled by the ratio of
+    # two time steps.  Doing so made a rejected step with a much smaller h
+    # start Newton from an artificially near-zero derivative, even for an
+    # essentially unchanged RHS.  The ratio is still used below where it
+    # genuinely represents a change of collocation time coordinate.
+    prev_stage_guess = prev_stage_stack
     predictor_mode_norm = str(predictor_mode).strip().lower()
     if predictor_mode_norm in {"default", "legacy"}:
         predictor_mode_norm = "current"

@@ -53,6 +53,28 @@ def test_limm_w_config_keeps_current_flux_and_jacobian_reuse_separate():
     assert not hasattr(config, "rhs_mode")
 
 
+def test_radau_stage_predictor_does_not_rescale_derivative_history_after_retry():
+    """K-history is a derivative history, not a history of h*K increments."""
+
+    dtype = jnp.float64
+    f0 = jnp.asarray([2.0, -3.0], dtype=dtype)
+    previous_stages = jnp.tile(jnp.asarray([5.0, -7.0], dtype=dtype), 3)
+    c = jnp.asarray([0.1, 0.5, 1.0], dtype=dtype)
+
+    predictor = transport_solvers._make_radau_stage_predictor(
+        f0,
+        previous_stages,
+        jnp.asarray(1.0, dtype=dtype),
+        jnp.asarray(0.01, dtype=dtype),
+        c,
+        dtype,
+        predictor_mode="current",
+    ).reshape((3, 2))
+
+    expected = 0.85 * jnp.asarray([5.0, -7.0]) + 0.15 * c[:, None] * f0[None, :]
+    assert jnp.allclose(predictor, expected, rtol=1.0e-12, atol=1.0e-12)
+
+
 @pytest.mark.parametrize("order", [0, 6])
 def test_limm_w_config_rejects_unsupported_order(order):
     with pytest.raises(ValueError, match="limm_w_order"):

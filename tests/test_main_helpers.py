@@ -2566,10 +2566,24 @@ def test_radial_database_flux_table_transpose_matches_generic_vjp():
     _, generic_pullback = jax.vjp(
         _fluxes, database.D11_log, database.D13, database.D33
     )
-    expected = generic_pullback((gamma_bar, q_bar, upar_bar))
-    actual = pullback_preprocessed_radial_database_fluxes(
-        species, energy_grid, geometry, database, er_center, temperature, density,
-        gamma_bar, q_bar, upar_bar,
-    )
-    for actual_table_bar, expected_table_bar in zip(actual, expected, strict=True):
-        assert jnp.allclose(actual_table_bar, expected_table_bar, rtol=2.0e-10, atol=2.0e-10)
+    zero_bar = jnp.zeros_like(gamma_bar)
+    for channel, output_bars in (
+        ("Gamma", (gamma_bar, zero_bar, zero_bar)),
+        ("Q", (zero_bar, q_bar, zero_bar)),
+        ("Upar", (zero_bar, zero_bar, upar_bar)),
+        ("joint", (gamma_bar, q_bar, upar_bar)),
+    ):
+        expected = generic_pullback(output_bars)
+        actual = pullback_preprocessed_radial_database_fluxes(
+            species, energy_grid, geometry, database, er_center, temperature, density,
+            *output_bars,
+        )
+        for table_name, actual_table_bar, expected_table_bar in zip(
+            ("D11_log", "D13", "D33"), actual, expected, strict=True
+        ):
+            assert jnp.allclose(actual_table_bar, expected_table_bar, rtol=2.0e-10, atol=2.0e-10), (
+                channel,
+                table_name,
+                float(jnp.max(jnp.abs(actual_table_bar - expected_table_bar))),
+                float(jnp.max(jnp.abs(expected_table_bar))),
+            )

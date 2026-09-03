@@ -32,7 +32,9 @@ from ._neoclassical import (
     _collisionality_kind,
     _nu_over_vnew_local,
     get_Collision_Operator_terms,
+    get_Lij_matrix_with_momentum_correction,
     get_Matrix,
+    get_momentum_Correction,
     get_corrected_fluxes,
     get_Lij_matrix_local,
     get_Neoclassical_Fluxes,
@@ -2922,6 +2924,131 @@ class NTXDatabaseTransportModel(TransportFluxModelBase):
 
         return self.evaluate_momentum_corrected_fluxes(state)["Upar"]
 
+    def _momentum_corrected_upar_one_radius(self, state, radius_index):
+        """Evaluate the corrected database ``U_parallel`` at one radius.
+
+        This is the database analogue of the realtime-Lij local bootstrap
+        primitive.  It deliberately exposes a *single* radial momentum solve:
+        a state transpose can consequently keep the (large) database tables
+        fixed instead of asking JAX to retain the all-radii database graph.
+        The axis follows the established full evaluator, whose coefficient
+        matrices at index zero are copied from index one before the correction
+        solve.
+        """
+        density = safe_density(state.density, self.density_floor)
+        temperature = state.temperature
+        density_right, density_right_grad = _extract_right_constraints(
+            self.bc_density, density, self.geometry.r_grid_half
+        )
+        temperature_right, temperature_right_grad = _extract_right_constraints(
+            self.bc_temperature, temperature, self.geometry.r_grid_half
+        )
+        density_right = density[:, -1] if density_right is None else density_right
+        density_right_grad = (
+            jnp.zeros_like(density_right)
+            if density_right_grad is None
+            else density_right_grad
+        )
+        temperature_right = (
+            temperature[:, -1] if temperature_right is None else temperature_right
+        )
+        temperature_right_grad = (
+            jnp.zeros_like(temperature_right)
+            if temperature_right_grad is None
+            else temperature_right_grad
+        )
+        dndr = jax.vmap(
+            lambda values, right, right_grad: get_gradient_density(
+                values,
+                self.geometry.r_grid,
+                self.geometry.r_grid_half,
+                self.geometry.dr,
+                right_face_constraint=right,
+                right_face_grad_constraint=right_grad,
+            )
+        )(density, density_right, density_right_grad)
+        dTdr = jax.vmap(
+            lambda values, right, right_grad: get_gradient_temperature(
+                values,
+                self.geometry.r_grid,
+                self.geometry.r_grid_half,
+                self.geometry.dr,
+                right_face_constraint=right,
+                right_face_grad_constraint=right_grad,
+            )
+        )(temperature, temperature_right, temperature_right_grad)
+        A1 = jax.vmap(
+            lambda charge, density_a, temperature_a, dndr_a, dTdr_a: get_Thermodynamical_Forces_A1(
+                charge, density_a, temperature_a, dndr_a, dTdr_a, state.Er
+            )
+        )(self.species.charge, density, temperature, dndr, dTdr)
+        A2 = jax.vmap(get_Thermodynamical_Forces_A2)(temperature, dTdr)
+        A3 = get_Thermodynamical_Forces_A3(state.Er)
+        v_thermal = get_v_thermal(self.species.mass, temperature)
+        species_indices = jnp.arange(int(self.species.number_species), dtype=jnp.int32)
+        coefficient_radius = jnp.maximum(radius_index, jnp.asarray(1, dtype=radius_index.dtype))
+        lij, eij, nu_av = jax.vmap(
+            lambda species_index: get_Lij_matrix_with_momentum_correction(
+                self.species,
+                self.energy_grid,
+                self.geometry,
+                self.database,
+                species_index,
+                coefficient_radius,
+                state.Er,
+                temperature,
+                density,
+                v_thermal,
+            )
+        )(species_indices)
+        _gamma, _q, upar, _qpar, _upar2 = get_momentum_Correction(
+            self.species,
+            self.energy_grid,
+            self.geometry,
+            radius_index,
+            lij,
+            eij,
+            nu_av,
+            v_thermal,
+            density,
+            temperature,
+            A1,
+            A2,
+            A3,
+            self.species.mass,
+            self.species.charge,
+            dndr,
+            dTdr,
+        )
+        return upar
+
+    def pullback_momentum_corrected_upar_state_by_radius(self, state, upar_bar):
+        """Transpose corrected-Upar to state with database tables held fixed."""
+        upar_bar = jnp.asarray(upar_bar, dtype=state.pressure.dtype)
+        radius_indices = jnp.arange(upar_bar.shape[-1], dtype=jnp.int32)
+
+        def _zero(leaf):
+            array = jnp.asarray(leaf)
+            return jnp.zeros_like(array) if jnp.issubdtype(array.dtype, jnp.inexact) else jnp.zeros(array.shape, dtype=jnp.float64)
+
+        state_bar0 = jax.tree_util.tree_map(_zero, state)
+
+        def _accumulate(carry, radius_index):
+            _, pullback = jax.vjp(
+                lambda state_value: self._momentum_corrected_upar_one_radius(
+                    state_value, radius_index
+                ),
+                state,
+            )
+            local_bar = jax.lax.dynamic_index_in_dim(
+                upar_bar, radius_index, axis=1, keepdims=False
+            )
+            (state_bar,) = pullback(local_bar)
+            return jax.tree_util.tree_map(lambda left, right: left + right, carry, state_bar), None
+
+        state_bar, _ = jax.lax.scan(_accumulate, state_bar0, radius_indices)
+        return state_bar
+
     def build_local_particle_flux_evaluator(self, state):
         species = self.species
         energy_grid = self.energy_grid
@@ -4106,6 +4233,13 @@ class NTXRuntimeScanTransportModel(TransportFluxModelBase):
         """Return corrected ``U_parallel`` from the rebuilt scan database."""
 
         return self._database_model().evaluate_momentum_corrected_upar_only(state)
+
+    def pullback_momentum_corrected_upar_state_by_radius(self, state, upar_bar):
+        """Delegate the compact database bootstrap state transpose."""
+
+        return self._database_model().pullback_momentum_corrected_upar_state_by_radius(
+            state, upar_bar
+        )
 
     def build_local_particle_flux_evaluator(self, state):
         return self._database_model().build_local_particle_flux_evaluator(state)
