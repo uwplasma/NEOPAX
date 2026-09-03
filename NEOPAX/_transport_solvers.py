@@ -20197,9 +20197,33 @@ class RADAUSolver(_RadauSolverConfig):
                         project_flat,
                     )
                 )
-                base_components = er_equation.debug_components(component_base_state)
-                perturbed_components = er_equation.debug_components(
+                # Keep the two direct flux evaluations and expose their
+                # species-resolved Gamma values below.  Passing them into
+                # debug_components avoids accidentally paying for two further
+                # realtime-NTX evaluations.
+                base_fluxes = er_equation.flux_model(component_base_state)
+                perturbed_fluxes = er_equation.flux_model(
                     component_perturbed_state
+                )
+                # A single symmetric sample is enough to distinguish a steep
+                # but smooth Er transition from a one-sided jump (or a
+                # factorization/pivot-level numerical discontinuity).  Keep
+                # it only in this explicit diagnostic callback.
+                component_negative_stages = stages - component_epsilon * delta_stages
+                component_negative_state = unpack_flat(
+                    _project_flat_state_if_needed(
+                        step_state_before_attempt.y
+                        + trial_dt
+                        * (a @ component_negative_stages)[component_stage],
+                        project_flat,
+                    )
+                )
+                negative_fluxes = er_equation.flux_model(component_negative_state)
+                base_components = er_equation.debug_components(
+                    component_base_state, fluxes=base_fluxes
+                )
+                perturbed_components = er_equation.debug_components(
+                    component_perturbed_state, fluxes=perturbed_fluxes
                 )
                 component_lines = {}
                 for component_name in (
@@ -20240,10 +20264,59 @@ class RADAUSolver(_RadauSolverConfig):
                         * float(er_equation.DEr)
                         * component_lines["er_diffusion"]["delta"],
                     }
+                base_gamma = jnp.asarray(base_fluxes["Gamma"])
+                perturbed_gamma = jnp.asarray(perturbed_fluxes["Gamma"])
+                negative_gamma = jnp.asarray(negative_fluxes["Gamma"])
+                gamma_index = min(defect_radial_index, int(base_gamma.shape[-1]) - 1)
+                gamma_base_at_radius = jax.device_get(base_gamma[:, gamma_index])
+                gamma_delta_at_radius = jax.device_get(
+                    perturbed_gamma[:, gamma_index] - base_gamma[:, gamma_index]
+                )
+                gamma_negative_delta_at_radius = jax.device_get(
+                    negative_gamma[:, gamma_index] - base_gamma[:, gamma_index]
+                )
+                negative_charge_flux = jnp.sum(
+                    jnp.asarray(er_equation.charge_qp, dtype=negative_gamma.dtype)
+                    * negative_gamma[:, gamma_index]
+                )
+                base_charge_flux = jnp.sum(
+                    jnp.asarray(er_equation.charge_qp, dtype=base_gamma.dtype)
+                    * base_gamma[:, gamma_index]
+                )
+                state_lines = {
+                    "Er": {
+                        "base": float(jax.device_get(component_base_state.Er[gamma_index])),
+                        "delta": float(
+                            jax.device_get(
+                                component_perturbed_state.Er[gamma_index]
+                                - component_base_state.Er[gamma_index]
+                            )
+                        ),
+                    },
+                    "density_delta_by_species": [
+                        float(value)
+                        for value in jax.device_get(
+                            component_perturbed_state.density[:, gamma_index]
+                            - component_base_state.density[:, gamma_index]
+                        )
+                    ],
+                    "temperature_delta_by_species": [
+                        float(value)
+                        for value in jax.device_get(
+                            component_perturbed_state.temperature[:, gamma_index]
+                            - component_base_state.temperature[:, gamma_index]
+                        )
+                    ],
+                }
                 print(
                     "[radau-stage-er-component-probe] "
                     f"stage={component_stage} radial_index={defect_radial_index} "
-                    f"epsilon={float(component_epsilon):.6e} components={component_lines}",
+                    f"epsilon={float(component_epsilon):.6e} components={component_lines} "
+                    f"Gamma_base_by_species={gamma_base_at_radius.tolist()} "
+                    f"Gamma_delta_by_species={gamma_delta_at_radius.tolist()} "
+                    f"Gamma_negative_delta_by_species={gamma_negative_delta_at_radius.tolist()} "
+                    f"charge_flux_negative_delta={float(jax.device_get(negative_charge_flux - base_charge_flux)):.6e} "
+                    f"state={state_lines}",
                     flush=True,
                 )
         if bool(getattr(self, "debug_walltime_attempts", False)):
