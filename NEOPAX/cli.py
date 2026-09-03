@@ -170,6 +170,10 @@ def _failed_solve_reason(result) -> str | None:
     """
     if not isinstance(result, dict):
         return _failed_diffrax_reason(result)
+    if result.get("diagnostic_stopped", False):
+        # A stage-repeat probe deliberately stops at the selected rejected
+        # attempt; that is a completed diagnostic, not a failed solve.
+        return None
     failed = result.get("failed")
     done = result.get("done")
     n_steps = result.get("n_steps")

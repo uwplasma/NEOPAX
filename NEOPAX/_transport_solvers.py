@@ -2330,6 +2330,7 @@ def _run_saved_loop_debug_walltime(
     last_attempt_lagged_reused = jnp.asarray(False)
     last_attempt_jacobian_reused = jnp.asarray(False)
     diagnostic_stopped = False
+    previous_accepted_attempt = None
 
     while True:
         active = bool(jax.device_get(_custom_loop_active(step_state, t_final, jnp.asarray(step_idx, dtype=jnp.int32), max_total_steps)))
@@ -2389,9 +2390,20 @@ def _run_saved_loop_debug_walltime(
         if stop_after_first_nonconverged_attempt and not bool(jax.device_get(step_info.converged)):
             diagnostic_stopped = True
             if on_first_nonconverged_attempt is not None:
-                on_first_nonconverged_attempt(step_state_before_attempt, step_info)
+                on_first_nonconverged_attempt(
+                    step_state_before_attempt,
+                    step_state,
+                    step_info,
+                    previous_accepted_attempt,
+                )
             print("[radau-stage-repeat-probe] diagnostic stop after first nonconverged attempt", flush=True)
             break
+        if bool(jax.device_get(step_info.accepted)):
+            previous_accepted_attempt = (
+                step_state_before_attempt,
+                step_state,
+                step_info,
+            )
 
     save_idx, ys_saved, ts_saved, dts_saved, accepted_mask_saved, failed_mask_saved, fail_codes_saved = _fill_realized_final_slot(
         save_idx,
@@ -19806,8 +19818,13 @@ class RADAUSolver(_RadauSolverConfig):
                 "radau_rhs_mode='black_box'."
             )
 
-        def _repeat_failed_black_box_stage_residual(step_state_before_attempt, step_info):
-            """Host-only repeatability check for the rejected Newton stages.
+        def _repeat_failed_black_box_stage_residual(
+            step_state_before_attempt,
+            step_state_after_attempt,
+            step_info,
+            previous_accepted_attempt,
+        ):
+            """Host-only repeatability and frozen-Jacobian check.
 
             This deliberately runs after the compiled attempt has returned.
             It therefore cannot enlarge the production Radau/XLA executable.
@@ -19836,6 +19853,27 @@ class RADAUSolver(_RadauSolverConfig):
                 jax.device_get(jnp.max(jnp.abs(residual_repeat - residual_first)))
             )
             repeat_delta_rel = repeat_delta_max / max(residual_max, 1.0e-30)
+            stage_maxima = jax.device_get(jnp.max(jnp.abs(residual_first), axis=1))
+            residual_flat = jnp.abs(residual_first).reshape((num_stages, state_dim))
+            block_maxima = {
+                "density": float(jax.device_get(jnp.max(residual_flat[:, :density_size])))
+                if density_size
+                else 0.0,
+                "pressure": float(
+                    jax.device_get(
+                        jnp.max(
+                            residual_flat[
+                                :, density_size:density_size + pressure_size
+                            ]
+                        )
+                    )
+                )
+                if pressure_size
+                else 0.0,
+                "Er": float(jax.device_get(jnp.max(residual_flat[:, -er_size:])))
+                if er_size
+                else 0.0,
+            }
             print(
                 "[radau-stage-repeat-probe] "
                 f"t={float(jax.device_get(step_state_before_attempt.t)):.6e} "
@@ -19843,6 +19881,195 @@ class RADAUSolver(_RadauSolverConfig):
                 f"stage_residual_max_abs={residual_max:.6e} "
                 f"repeat_delta_max_abs={repeat_delta_max:.6e} "
                 f"repeat_delta_rel={repeat_delta_rel:.6e}",
+                flush=True,
+            )
+
+            # Recover the next Newton correction from exactly the frozen stage
+            # matrix used in the rejected compiled attempt.  This lets the
+            # probe distinguish a bad contraction policy from actual local
+            # curvature of the black-box RHS.
+            residual_flattened = residual_first.reshape((-1,))
+            delta_flattened = _radau_apply_stage_linear_solve(
+                kernel_context,
+                rhs=-residual_flattened,
+                real_lu_out=step_state_after_attempt.real_lu,
+                real_piv_out=step_state_after_attempt.real_piv,
+                complex_lu_out=step_state_after_attempt.complex_lu,
+                complex_piv_out=step_state_after_attempt.complex_piv,
+            )
+            delta_stages = delta_flattened.reshape((num_stages, state_dim))
+            frozen_stage_jvp = delta_stages @ step_state_after_attempt.jacobian.T
+            frozen_linear_product = (
+                delta_stages - trial_dt * (a @ frozen_stage_jvp)
+            )
+            linear_solve_relative_residual = float(
+                jax.device_get(
+                    jnp.linalg.norm(frozen_linear_product.reshape((-1,)) + residual_flattened)
+                    / jnp.maximum(jnp.linalg.norm(residual_flattened), 1.0e-30)
+                )
+            )
+            delta_scaled_norm = float(
+                jax.device_get(
+                    _radau_correction_norm(kernel_context, delta_flattened)
+                )
+            )
+            print(
+                "[radau-stage-taylor-probe] "
+                f"next_delta_raw_l2={float(jax.device_get(jnp.linalg.norm(delta_flattened))):.6e} "
+                f"next_delta_scaled_rms={delta_scaled_norm:.6e} "
+                f"frozen_linear_solve_relative_residual={linear_solve_relative_residual:.6e}",
+                flush=True,
+            )
+
+            print(
+                "[radau-stage-taylor-probe] "
+                f"dtype={dtype} x64_enabled={jax.config.x64_enabled}",
+                flush=True,
+            )
+            delta_stage_states = trial_dt * (a @ delta_stages)
+            local_jvp_rows = []
+            frozen_jvp_rows = []
+            for stage_idx in range(num_stages):
+                _, local_jvp = jax.jvp(
+                    lambda y_value: flat_rhs(stage_times[stage_idx], y_value),
+                    (stage_states[stage_idx],),
+                    (delta_stage_states[stage_idx],),
+                )
+                local_jvp_rows.append(jax.block_until_ready(local_jvp))
+                frozen_jvp_rows.append(
+                    delta_stage_states[stage_idx] @ step_state_after_attempt.jacobian.T
+                )
+            local_jvp_stack = jnp.stack(local_jvp_rows, axis=0)
+            frozen_jvp_stack = jnp.stack(frozen_jvp_rows, axis=0)
+            jvp_difference = local_jvp_stack - frozen_jvp_stack
+            jvp_difference_ratio = float(
+                jax.device_get(
+                    jnp.linalg.norm(jvp_difference.reshape((-1,)))
+                    / jnp.maximum(jnp.linalg.norm(local_jvp_stack.reshape((-1,))), 1.0e-30)
+                )
+            )
+            local_jvp_stage_ratio = jax.device_get(
+                jnp.linalg.norm(jvp_difference, axis=1)
+                / jnp.maximum(jnp.linalg.norm(local_jvp_stack, axis=1), 1.0e-30)
+            )
+            print(
+                "[radau-stage-jvp-probe] "
+                f"frozen_vs_local_relative_l2={jvp_difference_ratio:.6e} "
+                "per_stage_relative_l2="
+                + repr([float(value) for value in local_jvp_stage_ratio]),
+                flush=True,
+            )
+
+            if previous_accepted_attempt is not None:
+                previous_before, previous_after, previous_info = previous_accepted_attempt
+                previous_dt = jnp.asarray(previous_info.dt, dtype=dtype)
+                previous_stages = jnp.asarray(
+                    previous_info.stage_history, dtype=dtype
+                ).reshape((num_stages, state_dim))
+                previous_times = previous_before.t + c * previous_dt
+                previous_states = (
+                    previous_before.y[None, :]
+                    + previous_dt * (a @ previous_stages)
+                )
+                previous_rhs_rows = [
+                    jax.block_until_ready(
+                        flat_rhs(previous_times[stage_idx], previous_states[stage_idx])
+                    )
+                    for stage_idx in range(num_stages)
+                ]
+                previous_residual = jax.block_until_ready(
+                    previous_stages - jnp.stack(previous_rhs_rows, axis=0)
+                )
+                previous_delta = _radau_apply_stage_linear_solve(
+                    kernel_context,
+                    rhs=-previous_residual.reshape((-1,)),
+                    real_lu_out=previous_after.real_lu,
+                    real_piv_out=previous_after.real_piv,
+                    complex_lu_out=previous_after.complex_lu,
+                    complex_piv_out=previous_after.complex_piv,
+                ).reshape((num_stages, state_dim))
+                previous_perturbed_stages = previous_stages + previous_delta
+                previous_perturbed_states = (
+                    previous_before.y[None, :]
+                    + previous_dt * (a @ previous_perturbed_stages)
+                )
+                previous_perturbed_rhs_rows = [
+                    jax.block_until_ready(
+                        flat_rhs(previous_times[stage_idx], previous_perturbed_states[stage_idx])
+                    )
+                    for stage_idx in range(num_stages)
+                ]
+                previous_perturbed_residual = jax.block_until_ready(
+                    previous_perturbed_stages
+                    - jnp.stack(previous_perturbed_rhs_rows, axis=0)
+                )
+                previous_stage_jvp = previous_delta @ previous_after.jacobian.T
+                previous_linear_product = previous_delta - previous_dt * (
+                    a @ previous_stage_jvp
+                )
+                previous_exact_change = previous_perturbed_residual - previous_residual
+                previous_taylor_defect = previous_perturbed_residual - (
+                    previous_residual + previous_linear_product
+                )
+                previous_taylor_ratio = float(
+                    jax.device_get(
+                        jnp.linalg.norm(previous_taylor_defect.reshape((-1,)))
+                        / jnp.maximum(
+                            jnp.linalg.norm(previous_exact_change.reshape((-1,))),
+                            1.0e-30,
+                        )
+                    )
+                )
+                print(
+                    "[radau-stage-control-probe] "
+                    f"t={float(jax.device_get(previous_before.t)):.6e} "
+                    f"dt={float(jax.device_get(previous_dt)):.6e} "
+                    f"taylor_defect_ratio_epsilon_1={previous_taylor_ratio:.6e}",
+                    flush=True,
+                )
+
+            for epsilon in (1.0, 0.25):
+                perturbed_stages = stages + jnp.asarray(epsilon, dtype=dtype) * delta_stages
+                perturbed_states = (
+                    step_state_before_attempt.y[None, :]
+                    + trial_dt * (a @ perturbed_stages)
+                )
+                perturbed_rhs_rows = []
+                for stage_idx in range(num_stages):
+                    perturbed_rhs_rows.append(
+                        jax.block_until_ready(
+                            flat_rhs(stage_times[stage_idx], perturbed_states[stage_idx])
+                        )
+                    )
+                perturbed_residual = jax.block_until_ready(
+                    perturbed_stages - jnp.stack(perturbed_rhs_rows, axis=0)
+                )
+                exact_change = perturbed_residual - residual_first
+                linear_change = jnp.asarray(epsilon, dtype=dtype) * frozen_linear_product
+                taylor_defect = perturbed_residual - (
+                    residual_first + linear_change
+                )
+                taylor_ratio = float(
+                    jax.device_get(
+                        jnp.linalg.norm(taylor_defect.reshape((-1,)))
+                        / jnp.maximum(jnp.linalg.norm(exact_change.reshape((-1,))), 1.0e-30)
+                    )
+                )
+                print(
+                    "[radau-stage-taylor-probe] "
+                    f"epsilon={epsilon:.2f} "
+                    f"exact_change_l2={float(jax.device_get(jnp.linalg.norm(exact_change))):.6e} "
+                    f"linear_change_l2={float(jax.device_get(jnp.linalg.norm(linear_change))):.6e} "
+                    f"taylor_defect_l2={float(jax.device_get(jnp.linalg.norm(taylor_defect))):.6e} "
+                    f"taylor_defect_ratio={taylor_ratio:.6e}",
+                    flush=True,
+                )
+            print(
+                "[radau-stage-repeat-probe] "
+                "stage_residual_max_abs="
+                + repr([float(value) for value in stage_maxima])
+                + " block_residual_max_abs="
+                + repr(block_maxima),
                 flush=True,
             )
         if bool(getattr(self, "debug_walltime_attempts", False)):
