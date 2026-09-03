@@ -527,7 +527,15 @@ def get_Lij_matrix_with_momentum_correction(species, energy_grid, geometry, data
     T = temperature[index_species, r_index]
     #same species collisionalities
     ##nu_vnew_T=collisionality(species_a_loc, v_new_a, *global_species_loc)/v_new_a 
-    nu_a=collisionality(index_species, species,v_new_a, r_index)#/v_new_a   
+    nu_a = collisionality(
+        index_species,
+        species,
+        v_new_a,
+        r_index,
+        density,
+        temperature,
+        v_thermal,
+    )
     nu_vnew_a=nu_a/v_new_a
     #L11_fac_T=nT*2./jnp.sqrt(jnp.pi)*(tritium_loc.species.mass/tritium_loc.species.charge)**2*vth_T**3
     #L11_fac_a=n/jnp.sqrt(jnp.pi)*(species.mass[index_species]/species.charge[index_species])**2*vth_a**3
@@ -890,32 +898,76 @@ def get_corrected_fluxes(grid, field, a, r_index, Lij, Eij, nu_av, CM_ab, CN_ab,
 
 @jit
 #Get momentum correction at one radial position
-def get_momentum_Correction(grid, field, r_index, Lij, Eij, nu_av,
+def get_momentum_Correction(species, energy_grid, geometry, r_index, Lij, Eij, nu_av,
                             v_thermal, density, temperature, A1, A2, A3, mass, charge, dndr, dTdr):
     #Get collisional operator expansion matrix for a radial position
     n_species = density.shape[0]
     species_indices = jnp.arange(n_species)
     CM_ab, CN_ab, tau = jax.vmap(
-        jax.vmap(get_Collision_Operator_terms, in_axes=(None, None, 0, None)),
-        in_axes=(None, 0, None, None)
-    )(grid, species_indices, species_indices, r_index)
+        lambda species_a: jax.vmap(
+            lambda species_b: get_Collision_Operator_terms(
+                species,
+                species_a,
+                species_b,
+                r_index,
+                temperature,
+                density,
+                v_thermal,
+            )
+        )(species_indices)
+    )(species_indices)
     #construct the linear system M*solution = rhs to be solved
     #Construct rhs vector
-    rhs = jax.vmap(get_rhs, in_axes=(None, 0, None, 0))(
-        grid, species_indices, r_index, Lij)
+    rhs = jax.vmap(
+        lambda species_a, lij_a: get_rhs(species_a, r_index, lij_a, A1, A2, A3)
+    )(species_indices, Lij)
     rhs = jnp.reshape(rhs, rhs.shape[0] * rhs.shape[1])
     #Construct matrix M=
-    M = jax.vmap(get_Matrix, in_axes=(None, None, None, 0, None, 0, 0, None, None, None, None))(
-        grid, field, species_indices, r_index, Lij, Eij, CM_ab, CN_ab, tau, v_thermal)
+    M = jax.vmap(
+        lambda species_a, lij_a, eij_a, cm_a, cn_a, tau_a: get_Matrix(
+            energy_grid,
+            geometry,
+            species_a,
+            r_index,
+            lij_a,
+            eij_a,
+            cm_a,
+            cn_a,
+            tau_a,
+            v_thermal,
+        )
+    )(species_indices, Lij, Eij, CM_ab, CN_ab, tau)
     S = lineax.MatrixLinearOperator(jnp.reshape(M, (M.shape[0] * M.shape[1], M.shape[2])))
     #Solve linear system using lineax to get the correction 
     solution = lineax.linear_solve(S, rhs)
     corr = jnp.reshape(solution.value, (CM_ab.shape[0], CM_ab.shape[-1]))
     #Now we need to get corrected fluxes
     #Then we apply correction to fluxes for each species in a function similar to the one for getting matrix M 
-    Gamma, Q, Upar, qpar, Upar2 = jax.vmap(get_corrected_fluxes, in_axes=(None, None, None, 0, None, 0, 0, 0, None, None, None, None, None, None, None, None, None, None, None, None, None))(
-        grid, field, species_indices, r_index, Lij, Eij, nu_av, CM_ab, CN_ab, tau, corr,
-        v_thermal, density, temperature, A1, A2, A3, mass, charge, dndr, dTdr)
+    Gamma, Q, Upar, qpar, Upar2 = jax.vmap(
+        lambda species_a, lij_a, eij_a, nu_a: get_corrected_fluxes(
+            energy_grid,
+            geometry,
+            species_a,
+            r_index,
+            lij_a,
+            eij_a,
+            nu_a,
+            CM_ab,
+            CN_ab,
+            tau,
+            corr,
+            v_thermal,
+            density,
+            temperature,
+            A1,
+            A2,
+            A3,
+            mass,
+            charge,
+            dndr,
+            dTdr,
+        )
+    )(species_indices, Lij, Eij, nu_av)
     return Gamma, Q, Upar, qpar, Upar2
 
 
@@ -1028,14 +1080,36 @@ def get_Neoclassical_Fluxes_With_Momentum_Correction(
     Eij = Eij.at[:, 0, :, :].set(Eij.at[:, 1, :, :].get())
     # Compute momentum correction for all radial points
     correction = jax.vmap(
-        get_momentum_Correction,
-        in_axes=(None, None, 0, 1, 1, 1, None, None, None, None, None, None, None, None, None, None)
+        lambda radial_index, lij_at_radius, eij_at_radius, nu_at_radius: (
+            get_momentum_Correction(
+                species,
+                energy_grid,
+                geometry,
+                radial_index,
+                lij_at_radius,
+                eij_at_radius,
+                nu_at_radius,
+                v_thermal,
+                density,
+                temperature,
+                A1,
+                A2,
+                A3,
+                species.mass,
+                species.charge,
+                dndr,
+                dTdr,
+            )
+        )
     )(
-        energy_grid, geometry, radial_indices, Lij, Eij, nu_weighted_average,
-        v_thermal, density, temperature, A1, A2, A3, species.mass, species.charge, dndr, dTdr
+        radial_indices,
+        jnp.moveaxis(Lij, 1, 0),
+        jnp.moveaxis(Eij, 1, 0),
+        jnp.moveaxis(nu_weighted_average, 1, 0),
     )
-    # correction is (Gamma, Q, Upar, qpar, Upar2)
-    return correction  #, Lij, Eij, nu_weighted_average
+    # The radial map returns (radius, species); NEOPAX flux-model consumers
+    # uniformly use (species, radius).
+    return tuple(jnp.swapaxes(component, 0, 1) for component in correction)
 
 
 

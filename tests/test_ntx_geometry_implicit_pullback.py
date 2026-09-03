@@ -10,6 +10,8 @@ import jax.numpy as jnp
 import ntx
 import pytest
 
+import NEOPAX._neoclassical as neoclassical_module
+
 from NEOPAX._transport_flux_models import (
     CombinedTransportFluxModel,
     NTXExactLijRuntimeSupport,
@@ -80,6 +82,8 @@ class _TestMomentumGeometry:
     Bsqav: object
     G_PS: object
     B0: object
+    full_grid_indices: object = None
+    dr: object = None
 
 
 @jax.tree_util.register_dataclass
@@ -130,6 +134,7 @@ def test_momentum_correction_matrix_is_square_for_four_species():
         a_b=jnp.asarray(1.0),
         r_grid=jnp.asarray([0.5]),
         r_grid_half=jnp.asarray([0.25, 0.75]),
+        full_grid_indices=jnp.asarray([0]),
         Bsqav=jnp.asarray([1.2]),
         G_PS=jnp.asarray([1.0]),
         B0=jnp.asarray([1.0]),
@@ -161,6 +166,58 @@ def test_momentum_correction_matrix_is_square_for_four_species():
 
     assert rows.shape == (n_species, 3, n_species * 3)
     assert matrix.shape == (n_species * 3, n_species * 3)
+
+
+def test_momentum_flux_wrapper_preserves_species_radius_contract(monkeypatch):
+    """The corrected-flux wrapper maps species and radius independently."""
+
+    n_species = 4
+    geometry = _TestMomentumGeometry(
+        a_b=jnp.asarray(1.0),
+        r_grid=jnp.asarray([0.25, 0.75]),
+        r_grid_half=jnp.asarray([0.0, 0.5, 1.0]),
+        Bsqav=jnp.ones(2),
+        G_PS=jnp.ones(2),
+        B0=jnp.ones(2),
+        full_grid_indices=jnp.asarray([0, 1]),
+        dr=jnp.asarray(0.5),
+    )
+    species = Species(
+        number_species=n_species,
+        species_indices=jnp.arange(n_species),
+        mass_mp=jnp.asarray([5.446e-4, 2.0, 3.0, 4.0]),
+        charge_qp=jnp.asarray([-1.0, 1.0, 1.0, 2.0]),
+        names=("e", "D", "T", "He"),
+    )
+    energy_grid = StandardLaguerreEnergyGrid(n_x=2)
+    density = jnp.ones((n_species, 2))
+    temperature = 2.0 * jnp.ones((n_species, 2))
+    er = jnp.zeros(2)
+
+    def _fake_lij(*_args):
+        return jnp.zeros((5, 5)), jnp.zeros((5, 5)), jnp.zeros(3)
+
+    def _fake_momentum(
+        species_arg, energy_grid_arg, geometry_arg, _radius_index,
+        lij, eij, nu_average, *_args,
+    ):
+        assert species_arg is species
+        assert energy_grid_arg is energy_grid
+        assert geometry_arg is geometry
+        assert lij.shape == (n_species, 5, 5)
+        assert eij.shape == (n_species, 5, 5)
+        assert nu_average.shape == (n_species, 3)
+        value = jnp.arange(n_species, dtype=jnp.float64)
+        return value, value + 1.0, value + 2.0, value + 3.0, value + 4.0
+
+    monkeypatch.setattr(neoclassical_module, "get_Lij_matrix_with_momentum_correction", _fake_lij)
+    monkeypatch.setattr(neoclassical_module, "get_momentum_Correction", _fake_momentum)
+    corrected = neoclassical_module.get_Neoclassical_Fluxes_With_Momentum_Correction.__wrapped__(
+        species, energy_grid, geometry, None, er, temperature, density
+    )
+    for component in corrected:
+        assert component.shape == (n_species, 2)
+    assert jnp.allclose(corrected[2][:, 0], jnp.arange(n_species) + 2.0)
 
 
 def test_four_species_momentum_blocks_use_species_equality_not_sonine_indices():
