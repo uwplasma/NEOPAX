@@ -997,7 +997,10 @@ def get_Neoclassical_Fluxes_With_Momentum_Correction(
     dndr, dTdr, A1, A2, A3 = grads_forces
 
     species_indices = jnp.arange(n_species)
-    radial_indices = grid.full_grid_indices
+    # ``grid`` is the velocity/Sonine energy grid while ``field`` is the
+    # transport geometry.  The radial loop must therefore come from the
+    # latter; StandardLaguerreEnergyGrid deliberately has no radial indices.
+    radial_indices = field.full_grid_indices
     # Compute Lij, Eij, nu_weighted_average for all species and radial points
     Lij, Eij, nu_weighted_average = jax.vmap(
         jax.vmap(
