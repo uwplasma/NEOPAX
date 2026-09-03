@@ -1,6 +1,4 @@
-# One-shot direct-runtime Newton-defect diagnostic: preserve the production
-# compiled attempt, trace existing residual/correction localization scalars,
-# then stop after the first Newton failure.
+# Direct-runtime black-box Radau configuration.
 
 [general]
 mode = "transport"
@@ -145,7 +143,6 @@ max_steps = 20000
 throw = false
 debug_stage_markers = true
 debug_walltime_attempts = true
-radau_debug_stop_after_first_failed_stage_probe = true
 forward_warm_timing_repeats = 0
 debug_nonfinite_rhs_components = false
 debug_disable_jit = false
