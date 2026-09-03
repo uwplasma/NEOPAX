@@ -927,8 +927,8 @@ def get_momentum_Correction(grid, field, r_index, Lij, Eij, nu_av,
 #Get_fluxes with momentum correction, unified interface
 def get_Neoclassical_Fluxes_With_Momentum_Correction(
     species,
-    grid,
-    field,
+    energy_grid,
+    geometry,
     database,
     Er,
     temperature,
@@ -942,9 +942,9 @@ def get_Neoclassical_Fluxes_With_Momentum_Correction(
     # temperature in keV). The low-level species/collision helpers convert
     # those to physical units internally where needed, so do not rescale here.
     v_thermal = get_v_thermal(species.mass, temperature)
-    r_grid = field.r_grid
-    r_grid_half = field.r_grid_half
-    dr = field.dr
+    r_grid = geometry.r_grid
+    r_grid_half = geometry.r_grid_half
+    dr = geometry.dr
 
     n_species = int(temperature.shape[0])
     n_right = _as_species_constraint(density_right_constraint, n_species)
@@ -997,10 +997,10 @@ def get_Neoclassical_Fluxes_With_Momentum_Correction(
     dndr, dTdr, A1, A2, A3 = grads_forces
 
     species_indices = jnp.arange(n_species)
-    # ``grid`` is the velocity/Sonine energy grid while ``field`` is the
+    # ``energy_grid`` is the velocity/Sonine grid while ``geometry`` is the
     # transport geometry.  The radial loop must therefore come from the
     # latter; StandardLaguerreEnergyGrid deliberately has no radial indices.
-    radial_indices = field.full_grid_indices
+    radial_indices = geometry.full_grid_indices
     # Compute Lij, Eij, nu_weighted_average for all species and radial points
     Lij, Eij, nu_weighted_average = jax.vmap(
         jax.vmap(
@@ -1009,7 +1009,7 @@ def get_Neoclassical_Fluxes_With_Momentum_Correction(
         ),
         in_axes=(None, None, None, None, 0, None, None, None, None, None)
     )(
-        species, grid, field, database, species_indices, radial_indices, Er, temperature, density, v_thermal
+        species, energy_grid, geometry, database, species_indices, radial_indices, Er, temperature, density, v_thermal
     )
     # Adjust Lij and Eij as before
     Lij = Lij.at[:, 0, :, :].set(Lij.at[:, 1, :, :].get())
@@ -1019,7 +1019,7 @@ def get_Neoclassical_Fluxes_With_Momentum_Correction(
         get_momentum_Correction,
         in_axes=(None, None, 0, 1, 1, 1, None, None, None, None, None, None, None, None, None, None)
     )(
-        grid, field, radial_indices, Lij, Eij, nu_weighted_average,
+        energy_grid, geometry, radial_indices, Lij, Eij, nu_weighted_average,
         v_thermal, density, temperature, A1, A2, A3, species.mass, species.charge, dndr, dTdr
     )
     # correction is (Gamma, Q, Upar, qpar, Upar2)

@@ -1779,6 +1779,8 @@ def test_payload_transpose_forwards_live_scan_contract(monkeypatch):
 def test_live_ntx_scan_payload_rebuild_keeps_channel_jvp(monkeypatch):
     """A support payload regenerates the database through the live NTX seam."""
 
+    captured_builder_kwargs = {}
+
     @dataclasses.dataclass(frozen=True)
     class _FakeScan:
         rho: object
@@ -1819,6 +1821,7 @@ def test_live_ntx_scan_payload_rebuild_keeps_channel_jvp(monkeypatch):
 
         @staticmethod
         def build_ntx_neopax_scan_from_surfaces(surfaces, *, rho, nu_v, Er, drds, **kwargs):
+            captured_builder_kwargs.update(kwargs)
             assert len(surfaces) == int(rho.shape[0])
             shape = (rho.shape[0], nu_v.shape[0], Er.shape[1])
             return _FakeScan(
@@ -1863,6 +1866,25 @@ def test_live_ntx_scan_payload_rebuild_keeps_channel_jvp(monkeypatch):
         0.0,
     )
     assert jnp.allclose(tangent, expected_tangent)
+    assert captured_builder_kwargs["coefficient_reverse_mode"] == "generic"
+
+
+def test_live_ntx_scan_payload_can_select_structured_coefficient_reverse_mode():
+    """The scan builder mode is a narrow opt-in, with generic kept as default."""
+
+    model = build_ntx_runtime_scan_transport_model(
+        species="species",
+        energy_grid="grid",
+        geometry="geometry",
+        vmec_file=None,
+        boozer_file=None,
+        ntx_scan_rho=[0.25, 0.5],
+        ntx_scan_nu_v=[1.0e-4, 1.0e-3],
+        ntx_scan_er_tilde=[0.0, 1.0e-4],
+        ntx_scan_coefficient_reverse_mode="structured",
+        prebuild_database=False,
+    )
+    assert model.coefficient_reverse_mode == "structured"
 
 
 def test_ntx_runtime_scan_database_keeps_radius_local_er_axis():

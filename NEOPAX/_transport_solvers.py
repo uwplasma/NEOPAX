@@ -20028,7 +20028,7 @@ class RADAUSolver(_RadauSolverConfig):
                     flush=True,
                 )
 
-            for epsilon in (1.0, 0.25):
+            for epsilon in (1.0, 0.25, 0.0625):
                 perturbed_stages = stages + jnp.asarray(epsilon, dtype=dtype) * delta_stages
                 perturbed_states = (
                     step_state_before_attempt.y[None, :]
@@ -20055,13 +20055,96 @@ class RADAUSolver(_RadauSolverConfig):
                         / jnp.maximum(jnp.linalg.norm(exact_change.reshape((-1,))), 1.0e-30)
                     )
                 )
+                # The residual identities R = K - F recover the primal RHS
+                # finite difference without another evaluation.  Comparing it
+                # with the fresh local JVP distinguishes ordinary curvature
+                # from a custom-JVP/primal inconsistency.
+                primal_rhs_change = (
+                    jnp.asarray(epsilon, dtype=dtype) * delta_stages
+                    - exact_change
+                )
+                fresh_jvp_change = (
+                    jnp.asarray(epsilon, dtype=dtype) * local_jvp_stack
+                )
+                fresh_jvp_fd_defect = primal_rhs_change - fresh_jvp_change
+                fresh_jvp_fd_ratio = float(
+                    jax.device_get(
+                        jnp.linalg.norm(fresh_jvp_fd_defect.reshape((-1,)))
+                        / jnp.maximum(
+                            jnp.linalg.norm(primal_rhs_change.reshape((-1,))),
+                            1.0e-30,
+                        )
+                    )
+                )
+                fresh_jvp_fd_stage_ratios = jax.device_get(
+                    jnp.linalg.norm(fresh_jvp_fd_defect, axis=1)
+                    / jnp.maximum(
+                        jnp.linalg.norm(primal_rhs_change, axis=1),
+                        1.0e-30,
+                    )
+                )
+
+                def _block_ratio(start, stop):
+                    if stop <= start:
+                        return 0.0
+                    defect_block = fresh_jvp_fd_defect[:, start:stop]
+                    primal_block = primal_rhs_change[:, start:stop]
+                    return float(
+                        jax.device_get(
+                            jnp.linalg.norm(defect_block.reshape((-1,)))
+                            / jnp.maximum(
+                                jnp.linalg.norm(primal_block.reshape((-1,))),
+                                1.0e-30,
+                            )
+                        )
+                    )
+
+                density_end = density_size
+                pressure_end = density_size + pressure_size
+                defect_abs = jnp.abs(fresh_jvp_fd_defect)
+                defect_flat_index = int(jax.device_get(jnp.argmax(defect_abs)))
+                defect_stage_index = defect_flat_index // state_dim
+                defect_state_index = defect_flat_index % state_dim
+                if defect_state_index < density_end:
+                    defect_block_name = "density"
+                    defect_block_index = defect_state_index
+                elif defect_state_index < pressure_end:
+                    defect_block_name = "pressure"
+                    defect_block_index = defect_state_index - density_end
+                else:
+                    defect_block_name = "Er"
+                    defect_block_index = defect_state_index - pressure_end
+                defect_radial_index = (
+                    defect_block_index % er_size if er_size else defect_block_index
+                )
                 print(
                     "[radau-stage-taylor-probe] "
                     f"epsilon={epsilon:.2f} "
                     f"exact_change_l2={float(jax.device_get(jnp.linalg.norm(exact_change))):.6e} "
                     f"linear_change_l2={float(jax.device_get(jnp.linalg.norm(linear_change))):.6e} "
                     f"taylor_defect_l2={float(jax.device_get(jnp.linalg.norm(taylor_defect))):.6e} "
-                    f"taylor_defect_ratio={taylor_ratio:.6e}",
+                    f"taylor_defect_ratio={taylor_ratio:.6e} "
+                    f"fresh_jvp_vs_primal_fd_ratio={fresh_jvp_fd_ratio:.6e} "
+                    "fresh_jvp_fd_per_stage="
+                    + repr([float(value) for value in fresh_jvp_fd_stage_ratios])
+                    + " fresh_jvp_fd_by_block="
+                    + repr(
+                        {
+                            "density": _block_ratio(0, density_end),
+                            "pressure": _block_ratio(density_end, pressure_end),
+                            "Er": _block_ratio(pressure_end, pressure_end + er_size),
+                        }
+                    )
+                    + " fresh_jvp_fd_max="
+                    + repr(
+                        {
+                            "stage": defect_stage_index,
+                            "block": defect_block_name,
+                            "block_index": defect_block_index,
+                            "radial_index": defect_radial_index,
+                            "abs": float(jax.device_get(jnp.max(defect_abs))),
+                        }
+                    ),
                     flush=True,
                 )
             print(
