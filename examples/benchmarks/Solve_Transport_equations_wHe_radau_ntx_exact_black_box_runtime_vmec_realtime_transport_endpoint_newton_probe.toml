@@ -124,12 +124,12 @@ radau_rhs_mode = "black_box"
 radau_num_stages = 7
 nonlinear_solver_tol = 1.0e-7
 nonlinear_solver_maxiter = 20
-radau_newton_tol_mode = "hairer"
+radau_newton_tol_mode = "hairer_transport_endpoint"
 radau_newton_fnewt_mode = "hairer"
-# Normal Hairer fnewt: no override is set in this probe.
-radau_newton_stagnation_mode = "endpoint_correction"
-radau_newton_stagnation_defect_budget = 1.0
-radau_newton_stagnation_growth_cap = 1.25
+# The in-loop endpoint Newton budget is 10% of the frozen transport LTE scale.
+radau_newton_transport_endpoint_tol = 1.0e-1
+# Do not use the older post-failure endpoint fallback in this probe.
+radau_newton_stagnation_mode = "off"
 radau_error_estimator = "embedded2_ntss_transport_scale"
 radau_controller_mode = "hairer_lean_transport_discounted"
 radau_predictor_mode = "collocation_transport_weighted"
@@ -144,8 +144,8 @@ atol = 1.0e-8
 max_step = 1.0
 min_step = 1.0e-14
 max_steps = 20000
-# Continue through the plateau acceptance and two following accepted-step
-# opportunities, so this can expose an immediate reject/regrow sawtooth.
+# Eight accepted steps is enough to compare the first plateau against the
+# baseline Hairer solve without launching a full transport run.
 stop_after_accepted_steps = 8
 throw = false
 debug_stage_markers = true
@@ -170,5 +170,5 @@ transport_write_hdf5 = false
 transport_compare_ambipolarity_residual = false
 transport_scan_ambipolarity_residual = false
 transport_overlay_reference_er = false
-transport_output_dir = "./outputs/transport_solver_radau_wHe_ntx_exact_black_box_vmec_realtime_endpoint_correction_probe"
+transport_output_dir = "./outputs/transport_solver_radau_wHe_ntx_exact_black_box_vmec_realtime_transport_endpoint_newton_probe"
 transport_plot_n_times = -1

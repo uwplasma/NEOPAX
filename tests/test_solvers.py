@@ -1067,6 +1067,33 @@ def test_theta_newton_solver_runs_scalar_decay_problem():
     assert float(final_state[0]) < 1.0
 
 
+def test_radau_transport_endpoint_newton_tolerance_runs_scalar_decay_problem():
+    """The endpoint metric is an in-loop Newton criterion, not a fallback."""
+    solver = RADAUSolver(
+        t0=0.0,
+        t1=0.1,
+        dt=0.01,
+        rtol=1.0e-6,
+        atol=1.0e-8,
+        tol=1.0e-7,
+        maxiter=12,
+        num_stages=3,
+        newton_tol_mode="transport_endpoint",
+        newton_fnewt_mode="hairer",
+        newton_transport_endpoint_tol=0.1,
+        max_steps=100,
+        save_n=3,
+    )
+
+    def vector_field(t, y):
+        del t
+        return -2.0 * y
+
+    out = solver.solve(jnp.array([1.0]), vector_field)
+    assert not bool(out["failed"])
+    assert float(out["final_state"][0]) == pytest.approx(float(jnp.exp(-0.2)), rel=2.0e-5)
+
+
 def _radau_controller_arguments(*, newton_iter_count, theta_final=0.0, controller_mode="current"):
     dtype = jnp.float64
     y = jnp.zeros((2,), dtype=dtype)

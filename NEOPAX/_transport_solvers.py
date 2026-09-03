@@ -3291,6 +3291,7 @@ class _RadauSolverConfig(TransportSolver):
     newton_tol_mode: str = "residual"
     newton_fnewt_mode: str = "tol"
     newton_fnewt_override: float | None = None
+    newton_transport_endpoint_tol: float = 1.0e-1
     newton_stagnation_mode: str = "off"
     newton_stagnation_defect_budget: float = 1.0
     newton_stagnation_growth_cap: float = 1.25
@@ -3337,6 +3338,7 @@ class _RadauSolverConfig(TransportSolver):
         newton_tol_mode: str = "residual",
         newton_fnewt_mode: str = "tol",
         newton_fnewt_override: float | None = None,
+        newton_transport_endpoint_tol: float = 1.0e-1,
         newton_stagnation_mode: str = "off",
         newton_stagnation_defect_budget: float = 1.0,
         newton_stagnation_growth_cap: float = 1.25,
@@ -3430,7 +3432,26 @@ class _RadauSolverConfig(TransportSolver):
         object.__setattr__(self, "rhs_mode", str(rhs_mode).strip().lower())
         object.__setattr__(self, "newton_divergence_mode", str(newton_divergence_mode).strip().lower())
         object.__setattr__(self, "newton_residual_norm", str(newton_residual_norm).strip().lower())
-        object.__setattr__(self, "newton_tol_mode", str(newton_tol_mode).strip().lower())
+        newton_tol_mode_norm = str(newton_tol_mode).strip().lower()
+        newton_tol_mode_aliases = {
+            "transport_endpoint": "hairer_transport_endpoint",
+            "endpoint_transport": "hairer_transport_endpoint",
+            "transport": "hairer_transport_endpoint",
+        }
+        newton_tol_mode_norm = newton_tol_mode_aliases.get(
+            newton_tol_mode_norm, newton_tol_mode_norm
+        )
+        if newton_tol_mode_norm not in {
+            "residual",
+            "hairer",
+            "hairer_like",
+            "ntss",
+            "hairer_transport_endpoint",
+        }:
+            raise ValueError(
+                "radau_newton_tol_mode must be one of: residual, hairer, hairer_like, ntss, hairer_transport_endpoint"
+            )
+        object.__setattr__(self, "newton_tol_mode", newton_tol_mode_norm)
         object.__setattr__(self, "newton_fnewt_mode", str(newton_fnewt_mode).strip().lower())
         if newton_fnewt_override is not None and float(newton_fnewt_override) <= 0.0:
             raise ValueError("radau_newton_fnewt_override must be positive when set")
@@ -3438,6 +3459,13 @@ class _RadauSolverConfig(TransportSolver):
             self,
             "newton_fnewt_override",
             None if newton_fnewt_override is None else float(newton_fnewt_override),
+        )
+        if float(newton_transport_endpoint_tol) <= 0.0:
+            raise ValueError("radau_newton_transport_endpoint_tol must be positive")
+        object.__setattr__(
+            self,
+            "newton_transport_endpoint_tol",
+            float(newton_transport_endpoint_tol),
         )
         stagnation_mode_norm = str(newton_stagnation_mode).strip().lower()
         stagnation_mode_aliases = {
@@ -4154,6 +4182,7 @@ class _RadauAcceptedStepKernelContext:
     radau_real_eig: Any
     radau_complex_blocks: Any
     predictor_fnewt: Any
+    newton_convergence_tol: Any
     maxiter: Any
     tol: Any
     error_scale_mode: Any
@@ -4162,6 +4191,7 @@ class _RadauAcceptedStepKernelContext:
     estimator_rtol_eff: Any
     use_hairer_newton_tol: Any
     use_hairer_scaled_correction: Any
+    use_transport_endpoint_newton_tol: Any
     theta_diverge_threshold: Any
     predictor_defect_floor: Any
     predictor_defect_cap: Any
@@ -9265,6 +9295,75 @@ def _radau_correction_norm(
     return jnp.where(kernel_context.use_hairer_scaled_correction, scaled_norm, raw_norm)
 
 
+def _radau_frozen_endpoint_error_scale(
+    kernel_context: _RadauAcceptedStepKernelContext,
+    flat_y,
+):
+    """Return the per-attempt state scale used by endpoint Newton stopping.
+
+    The scale is deliberately evaluated at the accepted step anchor ``y_n``.
+    It therefore has the same transport-block semantics as the embedded error
+    estimator without changing as the Newton stages move.
+    """
+    has_transport_blocks = (
+        kernel_context.density_size + kernel_context.pressure_size + kernel_context.er_size
+        == kernel_context.state_dim
+    )
+    if kernel_context.error_scale_mode == "ntss_transport" and has_transport_blocks:
+        density_end = kernel_context.density_size
+        pressure_end = density_end + kernel_context.pressure_size
+        density_y = flat_y[:density_end]
+        pressure_y = flat_y[density_end:pressure_end]
+        er_y = flat_y[pressure_end:pressure_end + kernel_context.er_size]
+        er_rms = jnp.sqrt(jnp.mean(er_y * er_y) + kernel_context.tiny_scalar)
+        er_floor = jnp.maximum(
+            jnp.asarray(0.1, dtype=kernel_context.dtype) * er_rms,
+            jnp.asarray(1.0e-3, dtype=kernel_context.dtype),
+        )
+        return jnp.concatenate(
+            [
+                kernel_context.atol + kernel_context.estimator_rtol_eff * jnp.abs(density_y),
+                kernel_context.atol + kernel_context.estimator_rtol_eff * jnp.abs(pressure_y),
+                kernel_context.atol
+                + kernel_context.estimator_rtol_eff * jnp.maximum(jnp.abs(er_y), er_floor),
+            ],
+            axis=0,
+        )
+    if kernel_context.error_scale_mode in {"ntss_block_floor", "ntss_block_rms"} and has_transport_blocks:
+        density_end = kernel_context.density_size
+        pressure_end = density_end + kernel_context.pressure_size
+        density_y = flat_y[:density_end]
+        pressure_y = flat_y[density_end:pressure_end]
+        er_y = flat_y[pressure_end:pressure_end + kernel_context.er_size]
+        density_floor = jnp.maximum(
+            jnp.asarray(0.05, dtype=kernel_context.dtype)
+            * jnp.sqrt(jnp.mean(density_y * density_y) + kernel_context.tiny_scalar),
+            jnp.asarray(1.0e-4, dtype=kernel_context.dtype),
+        )
+        pressure_floor = jnp.maximum(
+            jnp.asarray(0.05, dtype=kernel_context.dtype)
+            * jnp.sqrt(jnp.mean(pressure_y * pressure_y) + kernel_context.tiny_scalar),
+            jnp.asarray(1.0e-4, dtype=kernel_context.dtype),
+        )
+        er_floor = jnp.maximum(
+            jnp.asarray(0.1, dtype=kernel_context.dtype)
+            * jnp.sqrt(jnp.mean(er_y * er_y) + kernel_context.tiny_scalar),
+            jnp.asarray(1.0e-3, dtype=kernel_context.dtype),
+        )
+        return jnp.concatenate(
+            [
+                kernel_context.atol
+                + kernel_context.estimator_rtol_eff * jnp.maximum(jnp.abs(density_y), density_floor),
+                kernel_context.atol
+                + kernel_context.estimator_rtol_eff * jnp.maximum(jnp.abs(pressure_y), pressure_floor),
+                kernel_context.atol
+                + kernel_context.estimator_rtol_eff * jnp.maximum(jnp.abs(er_y), er_floor),
+            ],
+            axis=0,
+        )
+    return kernel_context.atol + kernel_context.estimator_rtol_eff * jnp.abs(flat_y)
+
+
 def _radau_endpoint_correction_defect_norms(
     kernel_context: _RadauAcceptedStepKernelContext,
     *,
@@ -9311,6 +9410,36 @@ def _radau_endpoint_correction_defect_norms(
         density_norm=density_norm,
         pressure_norm=pressure_norm,
         er_norm=er_norm,
+    )
+
+
+def _radau_endpoint_correction_norm(
+    kernel_context: _RadauAcceptedStepKernelContext,
+    correction_norms: _RadauEndpointCorrectionDefectNorms,
+):
+    """Select global or equal-block endpoint norm, matching the LTE mode."""
+    has_transport_blocks = (
+        kernel_context.density_size + kernel_context.pressure_size + kernel_context.er_size
+        == kernel_context.state_dim
+    )
+    if kernel_context.error_scale_mode != "ntss_block_rms" or not has_transport_blocks:
+        return correction_norms.global_norm
+    block_squares = jnp.stack(
+        [
+            jnp.where(kernel_context.density_size > 0, correction_norms.density_norm ** 2, kernel_context.zero_scalar),
+            jnp.where(kernel_context.pressure_size > 0, correction_norms.pressure_norm ** 2, kernel_context.zero_scalar),
+            jnp.where(kernel_context.er_size > 0, correction_norms.er_norm ** 2, kernel_context.zero_scalar),
+        ]
+    )
+    active_count = (
+        jnp.where(kernel_context.density_size > 0, 1.0, 0.0)
+        + jnp.where(kernel_context.pressure_size > 0, 1.0, 0.0)
+        + jnp.where(kernel_context.er_size > 0, 1.0, 0.0)
+    )
+    return jnp.sqrt(
+        jnp.sum(block_squares)
+        / jnp.maximum(jnp.asarray(active_count, dtype=kernel_context.dtype), jnp.asarray(1.0, dtype=kernel_context.dtype))
+        + kernel_context.tiny_scalar
     )
 
 
@@ -13426,6 +13555,9 @@ def _radau_run_stage_subsolve(
     wrapper and adaptive controller logic. It is the closest NEOPAX analogue to
     SPECTRAX-GK's "customize AD at a meaningful subsolve" pattern.
     """
+    # This reference scale is intentionally outside the Newton loop: it is
+    # frozen at y_n for the entire attempted step.
+    endpoint_newton_scale = _radau_frozen_endpoint_error_scale(kernel_context, inputs.flat_y)
 
     def body_fn(newton_state):
         (
@@ -13459,7 +13591,21 @@ def _radau_run_stage_subsolve(
         z_next = z_cur + delta
         current_residual_norm = _radau_residual_norm(kernel_context, residual_cur)
         current_delta_norm = jnp.linalg.norm(delta)
-        current_newton_norm = _radau_correction_norm(kernel_context, delta)
+        stage_newton_norm = _radau_correction_norm(kernel_context, delta)
+        endpoint_correction_norms = _radau_endpoint_correction_defect_norms(
+            kernel_context,
+            h_value=inputs.h_value,
+            stage_delta=delta.reshape((kernel_context.num_stages, kernel_context.state_dim)),
+            endpoint_scale=endpoint_newton_scale,
+        )
+        endpoint_newton_norm = _radau_endpoint_correction_norm(
+            kernel_context, endpoint_correction_norms
+        )
+        current_newton_norm = jnp.where(
+            kernel_context.use_transport_endpoint_newton_tol,
+            endpoint_newton_norm,
+            stage_newton_norm,
+        )
         safe_prev_delta = jnp.maximum(prev_newton_norm, kernel_context.tiny_scalar)
         theta_raw = current_newton_norm / safe_prev_delta
         newton_iter_num = iter_idx + jnp.asarray(1, dtype=jnp.int32)
@@ -13488,7 +13634,7 @@ def _radau_run_stage_subsolve(
             jnp.asarray(1.0, dtype=kernel_context.dtype) - theta_candidate,
             kernel_context.tiny_scalar,
         )
-        predicted_defect = faccon * current_newton_norm * (theta_candidate ** remaining_iters) / kernel_context.predictor_fnewt
+        predicted_defect = faccon * current_newton_norm * (theta_candidate ** remaining_iters) / kernel_context.newton_convergence_tol
         qnewt = jnp.clip(predicted_defect, kernel_context.predictor_defect_floor, kernel_context.predictor_defect_cap)
         predictor_exponent = -jnp.asarray(1.0, dtype=kernel_context.dtype) / (
             jnp.asarray(kernel_context.maxiter + 3, dtype=kernel_context.dtype) - newton_iter_num.astype(kernel_context.dtype)
@@ -13507,7 +13653,18 @@ def _radau_run_stage_subsolve(
             ),
         )
         convergence_metric = jnp.where(theta_valid, faccon * current_newton_norm, current_newton_norm)
-        meets_newton_tol = convergence_metric <= kernel_context.predictor_fnewt
+        # Unlike the legacy stage-space Hairer threshold, the endpoint budget
+        # is intentionally O(1).  Require an observed contraction ratio before
+        # it may terminate Newton, so a fortuitously small first endpoint
+        # update cannot hide an unresolved stage system.
+        endpoint_contraction_observed = jnp.logical_or(
+            jnp.logical_not(kernel_context.use_transport_endpoint_newton_tol),
+            theta_valid,
+        )
+        meets_newton_tol = jnp.logical_and(
+            convergence_metric <= kernel_context.newton_convergence_tol,
+            endpoint_contraction_observed,
+        )
         predictor_shrink = jnp.where(
             theta_candidate < kernel_context.theta_diverge_threshold,
             predictor_shrink,
@@ -13518,12 +13675,12 @@ def _radau_run_stage_subsolve(
         diverged_next = jnp.logical_or(diverged, jnp.logical_or(slow_reject, jnp.logical_or(residual_blowup, nonfinite_state)))
         if kernel_context.debug_newton_trace:
             jax.debug.print(
-                "[radau-solver] iter={iter} delta_norm={delta_norm:.6e} residual_norm={residual_norm:.6e} newton_metric={newton_metric:.6e} fnewt={fnewt:.6e} theta={theta:.6e} slow={slow} blowup={blowup} nonfinite={nonfinite} diverged={diverged}",
+                "[radau-solver] iter={iter} delta_norm={delta_norm:.6e} residual_norm={residual_norm:.6e} newton_metric={newton_metric:.6e} newton_tol={newton_tol:.6e} theta={theta:.6e} slow={slow} blowup={blowup} nonfinite={nonfinite} diverged={diverged}",
                 iter=iter_idx + 1,
                 delta_norm=current_delta_norm,
                 residual_norm=current_residual_norm,
                 newton_metric=convergence_metric,
-                fnewt=kernel_context.predictor_fnewt,
+                newton_tol=kernel_context.newton_convergence_tol,
                 theta=theta_next,
                 slow=slow_contraction,
                 blowup=residual_blowup,
@@ -13551,7 +13708,7 @@ def _radau_run_stage_subsolve(
         iter_idx, _, _, delta_norm, residual_norm, _, newton_metric, _, _, diverged, _, _, _, _ = newton_state
         active = jnp.where(
             kernel_context.use_hairer_newton_tol,
-            newton_metric > kernel_context.predictor_fnewt,
+            newton_metric > kernel_context.newton_convergence_tol,
             jnp.logical_or(residual_norm > kernel_context.tol, delta_norm > kernel_context.tol),
         )
         return jnp.logical_and(jnp.logical_and(iter_idx < kernel_context.maxiter, active), jnp.logical_not(diverged))
@@ -13632,7 +13789,13 @@ def _radau_run_stage_subsolve(
             jnp.all(jnp.isfinite(z_final)),
             jnp.where(
                 kernel_context.use_hairer_newton_tol,
-                newton_metric_final <= kernel_context.predictor_fnewt,
+                jnp.logical_and(
+                    newton_metric_final <= kernel_context.newton_convergence_tol,
+                    jnp.logical_or(
+                        jnp.logical_not(kernel_context.use_transport_endpoint_newton_tol),
+                        iter_final >= jnp.asarray(2, dtype=jnp.int32),
+                    ),
+                ),
                 final_residual_norm <= kernel_context.tol,
             ),
         ),
@@ -13843,7 +14006,7 @@ def _radau_single_step_primal(
     stages_final = subsolve_result.z_final.reshape((kernel_context.num_stages, kernel_context.state_dim))
     if kernel_context.debug_newton_trace:
         jax.debug.print(
-            "[radau-solver] final iter={iter} converged={converged} diverged={diverged} finite_initial_residual={finite_initial_residual} nonfinite_stage_state={nonfinite_stage_state} nonfinite_stage_residual={nonfinite_stage_residual} residual_norm={residual_norm:.6e} delta_norm={delta_norm:.6e} newton_metric={newton_metric:.6e} fnewt={fnewt:.6e} theta={theta:.6e} slow={slow} blowup={blowup} newton_nonfinite={newton_nonfinite}",
+            "[radau-solver] final iter={iter} converged={converged} diverged={diverged} finite_initial_residual={finite_initial_residual} nonfinite_stage_state={nonfinite_stage_state} nonfinite_stage_residual={nonfinite_stage_residual} residual_norm={residual_norm:.6e} delta_norm={delta_norm:.6e} newton_metric={newton_metric:.6e} newton_tol={newton_tol:.6e} theta={theta:.6e} slow={slow} blowup={blowup} newton_nonfinite={newton_nonfinite}",
             iter=subsolve_result.iter_final,
             converged=subsolve_result.converged,
             diverged=subsolve_result.diverged_final,
@@ -13853,7 +14016,7 @@ def _radau_single_step_primal(
             residual_norm=subsolve_result.final_residual_norm,
             delta_norm=subsolve_result.delta_norm_final,
             newton_metric=subsolve_result.newton_metric_final,
-            fnewt=kernel_context.predictor_fnewt,
+            newton_tol=kernel_context.newton_convergence_tol,
             theta=subsolve_result.theta_final,
             slow=subsolve_result.slow_contraction_final,
             blowup=subsolve_result.residual_blowup_final,
@@ -19110,7 +19273,8 @@ def _build_prepared_radau_accepted_rollout(
     conservative_divergence = divergence_mode in {"ntss", "hairer", "conservative"}
     newton_tol_mode = str(getattr(solver, "newton_tol_mode", "residual")).strip().lower()
     fnewt_mode = str(getattr(solver, "newton_fnewt_mode", "tol")).strip().lower()
-    use_hairer_newton_tol = newton_tol_mode in {"hairer", "hairer_like", "ntss"}
+    use_transport_endpoint_newton_tol = newton_tol_mode == "hairer_transport_endpoint"
+    use_hairer_newton_tol = newton_tol_mode in {"hairer", "hairer_like", "ntss", "hairer_transport_endpoint"}
     use_hairer_scaled_correction = use_hairer_newton_tol or fnewt_mode in {"hairer", "hairer_like", "ntss"}
     tiny_scalar = jnp.asarray(1.0e-30, dtype=dtype)
     zero_scalar = jnp.asarray(0.0, dtype=dtype)
@@ -19141,6 +19305,11 @@ def _build_prepared_radau_accepted_rollout(
     fnewt_override = getattr(solver, "newton_fnewt_override", None)
     if fnewt_override is not None:
         predictor_fnewt = jnp.asarray(fnewt_override, dtype=dtype)
+    newton_convergence_tol = jnp.where(
+        use_transport_endpoint_newton_tol,
+        jnp.asarray(getattr(solver, "newton_transport_endpoint_tol", 1.0e-1), dtype=dtype),
+        predictor_fnewt,
+    )
     estimator_rtol_eff = jnp.asarray(solver.rtol, dtype=dtype)
     if error_scale_mode == "ntss":
         uround_est = jnp.asarray(jnp.finfo(dtype).eps, dtype=dtype)
@@ -19197,6 +19366,7 @@ def _build_prepared_radau_accepted_rollout(
         radau_real_eig=radau_real_eig,
         radau_complex_blocks=radau_complex_blocks,
         predictor_fnewt=predictor_fnewt,
+        newton_convergence_tol=newton_convergence_tol,
         maxiter=int(solver.maxiter),
         tol=jnp.asarray(solver.tol, dtype=dtype),
         error_scale_mode=error_scale_mode,
@@ -19205,6 +19375,7 @@ def _build_prepared_radau_accepted_rollout(
         estimator_rtol_eff=estimator_rtol_eff,
         use_hairer_newton_tol=bool(use_hairer_newton_tol),
         use_hairer_scaled_correction=bool(use_hairer_scaled_correction),
+        use_transport_endpoint_newton_tol=bool(use_transport_endpoint_newton_tol),
         theta_diverge_threshold=theta_diverge_threshold,
         predictor_defect_floor=predictor_defect_floor,
         predictor_defect_cap=predictor_defect_cap,
@@ -19821,7 +19992,8 @@ class RADAUSolver(_RadauSolverConfig):
         use_rms_residual_norm = residual_norm_mode in {"rms", "scaled", "normalized"}
         newton_tol_mode = str(getattr(self, "newton_tol_mode", "residual")).strip().lower()
         fnewt_mode = str(getattr(self, "newton_fnewt_mode", "tol")).strip().lower()
-        use_hairer_newton_tol = newton_tol_mode in {"hairer", "hairer_like", "ntss"}
+        use_transport_endpoint_newton_tol = newton_tol_mode == "hairer_transport_endpoint"
+        use_hairer_newton_tol = newton_tol_mode in {"hairer", "hairer_like", "ntss", "hairer_transport_endpoint"}
         use_hairer_scaled_correction = use_hairer_newton_tol or fnewt_mode in {"hairer", "hairer_like", "ntss"}
         # Follow the Hairer/NTSS pattern more closely: use the Newton-correction
         # contraction estimate to predict the remaining defect, and turn that
@@ -19854,6 +20026,11 @@ class RADAUSolver(_RadauSolverConfig):
         fnewt_override = getattr(self, "newton_fnewt_override", None)
         if fnewt_override is not None:
             predictor_fnewt = jnp.asarray(fnewt_override, dtype=dtype)
+        newton_convergence_tol = jnp.where(
+            use_transport_endpoint_newton_tol,
+            jnp.asarray(getattr(self, "newton_transport_endpoint_tol", 1.0e-1), dtype=dtype),
+            predictor_fnewt,
+        )
         estimator_rtol_eff = jnp.asarray(self.rtol, dtype=dtype)
         if error_estimator_mode == "embedded2_ntss_scale":
             uround_est = jnp.asarray(jnp.finfo(dtype).eps, dtype=dtype)
@@ -19881,11 +20058,12 @@ class RADAUSolver(_RadauSolverConfig):
 
         if debug_newton_trace:
             jax.debug.print(
-                "[radau-solver] newton_tol_mode={tol_mode} newton_fnewt_mode={fnewt_mode} predictor_fnewt={fnewt:.6e} residual_tol={tol:.6e} fnewt_override={fnewt_override:.6e}",
+                "[radau-solver] newton_tol_mode={tol_mode} newton_fnewt_mode={fnewt_mode} predictor_fnewt={fnewt:.6e} newton_convergence_tol={newton_tol:.6e} residual_tol={tol:.6e} fnewt_override={fnewt_override:.6e}",
                 tol_mode=newton_tol_mode,
                 fnewt_mode=fnewt_mode,
                 tol=jnp.asarray(self.tol, dtype=dtype),
                 fnewt=predictor_fnewt,
+                newton_tol=newton_convergence_tol,
                 fnewt_override=jnp.asarray(
                     -1.0 if fnewt_override is None else fnewt_override, dtype=dtype
                 ),
@@ -19922,6 +20100,7 @@ class RADAUSolver(_RadauSolverConfig):
             radau_real_eig=radau_real_eig,
             radau_complex_blocks=radau_complex_blocks,
             predictor_fnewt=predictor_fnewt,
+            newton_convergence_tol=newton_convergence_tol,
             maxiter=int(self.maxiter),
             tol=jnp.asarray(self.tol, dtype=dtype),
             error_scale_mode=error_scale_mode,
@@ -19930,6 +20109,7 @@ class RADAUSolver(_RadauSolverConfig):
             estimator_rtol_eff=estimator_rtol_eff,
             use_hairer_newton_tol=bool(use_hairer_newton_tol),
             use_hairer_scaled_correction=bool(use_hairer_scaled_correction),
+            use_transport_endpoint_newton_tol=bool(use_transport_endpoint_newton_tol),
             theta_diverge_threshold=theta_diverge_threshold,
             predictor_defect_floor=predictor_defect_floor,
             predictor_defect_cap=predictor_defect_cap,
@@ -25475,6 +25655,9 @@ def build_time_solver(solver_parameters: Any, solver_override: Any = None) -> Tr
             newton_tol_mode=str(_cfg_get("radau_newton_tol_mode", "residual")),
             newton_fnewt_mode=str(_cfg_get("radau_newton_fnewt_mode", "tol")),
             newton_fnewt_override=_cfg_get("radau_newton_fnewt_override"),
+            newton_transport_endpoint_tol=float(
+                _cfg_get("radau_newton_transport_endpoint_tol", 1.0e-1)
+            ),
             newton_stagnation_mode=str(_cfg_get("radau_newton_stagnation_mode", "off")),
             newton_stagnation_defect_budget=float(
                 _cfg_get("radau_newton_stagnation_defect_budget", 1.0)
