@@ -144,8 +144,9 @@ atol = 1.0e-8
 max_step = 1.0
 min_step = 1.0e-14
 max_steps = 20000
-# Five startup accepts reach the prior failure; the sixth tests the fallback.
-stop_after_accepted_steps = 6
+# Continue through the plateau acceptance and two following accepted-step
+# opportunities, so this can expose an immediate reject/regrow sawtooth.
+stop_after_accepted_steps = 8
 throw = false
 debug_stage_markers = true
 debug_walltime_attempts = true
