@@ -19883,6 +19883,23 @@ class RADAUSolver(_RadauSolverConfig):
                 f"repeat_delta_rel={repeat_delta_rel:.6e}",
                 flush=True,
             )
+            print(
+                "[radau-stage-controller-probe] "
+                f"accepted={bool(jax.device_get(step_info.accepted))} "
+                f"converged={bool(jax.device_get(step_info.converged))} "
+                f"err_norm={float(jax.device_get(step_info.err_norm)):.6e} "
+                f"growth={float(jax.device_get(step_info.growth)):.6e} "
+                f"next_dt={float(jax.device_get(step_info.next_dt)):.6e} "
+                f"newton_iters={int(jax.device_get(step_info.newton_iter_count))} "
+                f"final_residual_norm={float(jax.device_get(step_info.final_residual_norm)):.6e} "
+                f"final_delta_norm={float(jax.device_get(step_info.final_delta_norm)):.6e} "
+                f"theta_final={float(jax.device_get(step_info.theta_final)):.6e} "
+                f"slow={bool(jax.device_get(step_info.slow_contraction))} "
+                f"residual_blowup={bool(jax.device_get(step_info.residual_blowup))} "
+                f"nonfinite={bool(jax.device_get(step_info.newton_nonfinite))} "
+                f"fail_code={int(jax.device_get(step_info.fail_code))}",
+                flush=True,
+            )
 
             # Recover the next Newton correction from exactly the frozen stage
             # matrix used in the rejected compiled attempt.  This lets the
@@ -20185,7 +20202,12 @@ class RADAUSolver(_RadauSolverConfig):
                     component_perturbed_state
                 )
                 component_lines = {}
-                for component_name in ("charge_flux", "ambi_term", "er_diffusion"):
+                for component_name in (
+                    "charge_flux",
+                    "plasma_permitivity",
+                    "ambi_term",
+                    "er_diffusion",
+                ):
                     if component_name not in base_components:
                         continue
                     base_component = jnp.asarray(base_components[component_name])
@@ -20206,6 +20228,17 @@ class RADAUSolver(_RadauSolverConfig):
                                 - base_component[component_index]
                             )
                         ),
+                    }
+                if "ambi_term" in component_lines:
+                    component_lines["rhs_ambi_term"] = {
+                        "delta": -float(er_equation.Er_relax)
+                        * component_lines["ambi_term"]["delta"],
+                    }
+                if "er_diffusion" in component_lines:
+                    component_lines["rhs_er_diffusion"] = {
+                        "delta": float(er_equation.Er_relax)
+                        * float(er_equation.DEr)
+                        * component_lines["er_diffusion"]["delta"],
                     }
                 print(
                     "[radau-stage-er-component-probe] "
