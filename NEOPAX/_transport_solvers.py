@@ -20124,6 +20124,8 @@ class RADAUSolver(_RadauSolverConfig):
                     f"linear_change_l2={float(jax.device_get(jnp.linalg.norm(linear_change))):.6e} "
                     f"taylor_defect_l2={float(jax.device_get(jnp.linalg.norm(taylor_defect))):.6e} "
                     f"taylor_defect_ratio={taylor_ratio:.6e} "
+                    f"primal_rhs_change_l2={float(jax.device_get(jnp.linalg.norm(primal_rhs_change))):.6e} "
+                    f"fresh_jvp_change_l2={float(jax.device_get(jnp.linalg.norm(fresh_jvp_change))):.6e} "
                     f"fresh_jvp_vs_primal_fd_ratio={fresh_jvp_fd_ratio:.6e} "
                     "fresh_jvp_fd_per_stage="
                     + repr([float(value) for value in fresh_jvp_fd_stage_ratios])
@@ -20155,6 +20157,62 @@ class RADAUSolver(_RadauSolverConfig):
                 + repr(block_maxima),
                 flush=True,
             )
+            # Finally decompose the dominant Er finite-difference location.
+            # This costs two direct flux evaluations only in the explicit
+            # diagnostic path and identifies whether ambipolarity or the Er
+            # diffusion term owns the primal jump.
+            owner = getattr(vector_field, "__self__", None)
+            er_equation = getattr(owner, "er_equation", None)
+            if er_equation is not None:
+                component_stage = defect_stage_index
+                component_epsilon = jnp.asarray(0.0625, dtype=dtype)
+                component_perturbed_stages = stages + component_epsilon * delta_stages
+                component_base_state = unpack_flat(
+                    _project_flat_state_if_needed(
+                        stage_states[component_stage], project_flat
+                    )
+                )
+                component_perturbed_state = unpack_flat(
+                    _project_flat_state_if_needed(
+                        step_state_before_attempt.y
+                        + trial_dt
+                        * (a @ component_perturbed_stages)[component_stage],
+                        project_flat,
+                    )
+                )
+                base_components = er_equation.debug_components(component_base_state)
+                perturbed_components = er_equation.debug_components(
+                    component_perturbed_state
+                )
+                component_lines = {}
+                for component_name in ("charge_flux", "ambi_term", "er_diffusion"):
+                    if component_name not in base_components:
+                        continue
+                    base_component = jnp.asarray(base_components[component_name])
+                    perturbed_component = jnp.asarray(
+                        perturbed_components[component_name]
+                    )
+                    component_index = min(
+                        defect_radial_index, int(base_component.size) - 1
+                    )
+                    component_lines[component_name] = {
+                        "base": float(jax.device_get(base_component[component_index])),
+                        "perturbed": float(
+                            jax.device_get(perturbed_component[component_index])
+                        ),
+                        "delta": float(
+                            jax.device_get(
+                                perturbed_component[component_index]
+                                - base_component[component_index]
+                            )
+                        ),
+                    }
+                print(
+                    "[radau-stage-er-component-probe] "
+                    f"stage={component_stage} radial_index={defect_radial_index} "
+                    f"epsilon={float(component_epsilon):.6e} components={component_lines}",
+                    flush=True,
+                )
         if bool(getattr(self, "debug_walltime_attempts", False)):
             loop_result, diagnostic_stopped = _run_saved_loop_debug_walltime(
                 step_state0=step_state0,

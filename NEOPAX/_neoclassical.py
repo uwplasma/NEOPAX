@@ -1002,15 +1002,27 @@ def get_Neoclassical_Fluxes_With_Momentum_Correction(
     # latter; StandardLaguerreEnergyGrid deliberately has no radial indices.
     radial_indices = geometry.full_grid_indices
     # Compute Lij, Eij, nu_weighted_average for all species and radial points
-    Lij, Eij, nu_weighted_average = jax.vmap(
-        jax.vmap(
-            get_Lij_matrix_with_momentum_correction,
-            in_axes=(None, None, None, None, 0, 0, None, 0, 0, 0)
-        ),
-        in_axes=(None, None, None, None, 0, None, None, None, None, None)
-    )(
-        species, energy_grid, geometry, database, species_indices, radial_indices, Er, temperature, density, v_thermal
-    )
+    # The coefficient kernel consumes full profile arrays and extracts both
+    # the species and radius internally.  Map only those scalar indices: the
+    # former nested ``in_axes`` also mapped temperature/density over axis zero
+    # during the radial loop, which is invalid when n_radius != n_species.
+    def _one_species(species_index):
+        return jax.vmap(
+            lambda radial_index: get_Lij_matrix_with_momentum_correction(
+                species,
+                energy_grid,
+                geometry,
+                database,
+                species_index,
+                radial_index,
+                Er,
+                temperature,
+                density,
+                v_thermal,
+            )
+        )(radial_indices)
+
+    Lij, Eij, nu_weighted_average = jax.vmap(_one_species)(species_indices)
     # Adjust Lij and Eij as before
     Lij = Lij.at[:, 0, :, :].set(Lij.at[:, 1, :, :].get())
     Eij = Eij.at[:, 0, :, :].set(Eij.at[:, 1, :, :].get())
