@@ -924,19 +924,25 @@ def get_momentum_Correction(species, energy_grid, geometry, r_index, Lij, Eij, n
     rhs = jnp.reshape(rhs, rhs.shape[0] * rhs.shape[1])
     #Construct matrix M=
     M = jax.vmap(
-        lambda species_a, lij_a, eij_a, cm_a, cn_a, tau_a: get_Matrix(
+        # ``get_Matrix`` constructs the block row for ``species_a`` and
+        # indexes every collision partner internally.  Therefore CM/CN/tau
+        # must stay as the full (a, b, sonine, sonine) / (a, b) tensors;
+        # mapping them here stripped their leading ``a`` axis and led to the
+        # four-index-on-three-dimensional-tensor failure in the wHe database
+        # bootstrap objective.
+        lambda species_a, lij_a, eij_a: get_Matrix(
             energy_grid,
             geometry,
             species_a,
             r_index,
             lij_a,
             eij_a,
-            cm_a,
-            cn_a,
-            tau_a,
+            CM_ab,
+            CN_ab,
+            tau,
             v_thermal,
         )
-    )(species_indices, Lij, Eij, CM_ab, CN_ab, tau)
+    )(species_indices, Lij, Eij)
     S = lineax.MatrixLinearOperator(jnp.reshape(M, (M.shape[0] * M.shape[1], M.shape[2])))
     #Solve linear system using lineax to get the correction 
     solution = lineax.linear_solve(S, rhs)

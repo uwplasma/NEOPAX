@@ -224,6 +224,57 @@ def test_momentum_flux_wrapper_preserves_species_radius_contract(monkeypatch):
     assert jnp.allclose(corrected[2][:, 0], jnp.arange(n_species) + 2.0)
 
 
+def test_four_species_momentum_assembly_keeps_full_collision_partner_axes(monkeypatch):
+    """Each species block must retain all collision partners while assembling M."""
+
+    n_species = 4
+    n_sonine = 3
+    species = Species(
+        number_species=n_species,
+        species_indices=jnp.arange(n_species),
+        mass_mp=jnp.asarray([5.446e-4, 2.0, 3.0, 4.0]),
+        charge_qp=jnp.asarray([-1.0, 1.0, 1.0, 2.0]),
+        names=("e", "D", "T", "He"),
+    )
+    grid = StandardLaguerreEnergyGrid(n_x=2)
+    geometry = _TestMomentumGeometry(
+        a_b=jnp.asarray(1.0), r_grid=jnp.asarray([0.5]),
+        r_grid_half=jnp.asarray([0.25, 0.75]), Bsqav=jnp.ones(1),
+        G_PS=jnp.ones(1), B0=jnp.ones(1), full_grid_indices=jnp.asarray([0]),
+        dr=jnp.asarray(0.5),
+    )
+    density = jnp.ones((n_species, 1))
+    temperature = 2.0 * jnp.ones((n_species, 1))
+    v_thermal = jnp.ones((n_species, 1))
+    lij = jnp.broadcast_to(jnp.eye(5), (n_species, 5, 5))
+    eij = 0.1 * lij
+    nu_average = jnp.ones((n_species, 3))
+    gradients = jnp.ones((n_species, 1))
+
+    def _fake_collision(*_args):
+        return jnp.zeros((n_sonine, n_sonine)), jnp.zeros((n_sonine, n_sonine)), jnp.asarray(1.0)
+
+    def _fake_matrix(_grid, _geometry, species_index, _radius_index, _lij, _eij, cm, cn, tau, _vthermal):
+        assert cm.shape == (n_species, n_species, n_sonine, n_sonine)
+        assert cn.shape == (n_species, n_species, n_sonine, n_sonine)
+        assert tau.shape == (n_species, n_species)
+        return jax.lax.dynamic_slice(jnp.eye(n_species * n_sonine), (n_sonine * species_index, 0), (n_sonine, n_species * n_sonine))
+
+    def _fake_fluxes(_grid, _geometry, species_index, *_args):
+        value = species_index.astype(jnp.float64)
+        return value, value, value, value, value
+
+    monkeypatch.setattr(neoclassical_module, "get_Collision_Operator_terms", _fake_collision)
+    monkeypatch.setattr(neoclassical_module, "get_Matrix", _fake_matrix)
+    monkeypatch.setattr(neoclassical_module, "get_corrected_fluxes", _fake_fluxes)
+    result = neoclassical_module.get_momentum_Correction.__wrapped__(
+        species, grid, geometry, 0, lij, eij, nu_average, v_thermal,
+        density, temperature, gradients, gradients, jnp.zeros(1),
+        species.mass, species.charge, gradients, gradients,
+    )
+    assert all(component.shape == (n_species,) for component in result)
+
+
 def test_four_species_momentum_blocks_use_species_equality_not_sonine_indices():
     """The fourth species must not alias the final Sonine index.
 
