@@ -59,6 +59,7 @@ from NEOPAX._transport_flux_models import (
     NTXFullStateQuadraticPreparedCoefficientResponse,
     NTXQuadraticPreparedCoefficientResponse,
     NTXRuntimeScanChannels,
+    _as_float_array,
     NTXRuntimeScanTransportModel,
     _sanitize_float_delta_bar_tree,
     _ntx_runtime_scan_to_neopax_monoenergetic,
@@ -97,6 +98,32 @@ def _tiny_ntx_runtime_channels(rho):
             "fac_dkes_to_d33star": ones,
         },
     )
+
+
+def test_runtime_scan_axis_validation_is_trace_safe():
+    """Recorded database support VJPs may carry the scan axes as tracers."""
+
+    actual = jax.jit(lambda values: _as_float_array(values, name="rho_scan"))(
+        jnp.asarray([0.25, 0.5])
+    )
+    assert jnp.allclose(actual, jnp.asarray([0.25, 0.5]))
+    with pytest.raises(ValueError, match="rho_scan contains non-finite"):
+        _as_float_array(jnp.asarray([0.25, jnp.nan]), name="rho_scan")
+
+
+def test_runtime_scan_axis_range_validation_is_trace_safe():
+    model = build_ntx_runtime_scan_transport_model(
+        species="species", energy_grid="grid", geometry="geometry",
+        vmec_file=None, boozer_file=None,
+        ntx_scan_rho=[0.25, 0.5], ntx_scan_nu_v=[1.0e-4, 1.0e-3],
+        ntx_scan_er_tilde=[0.0, 1.0e-4], prebuild_database=False,
+    )
+    actual = jax.jit(
+        lambda rho: dataclasses.replace(model, rho_scan=rho)._scan_axes()[0]
+    )(jnp.asarray([0.25, 0.5]))
+    assert jnp.allclose(actual, jnp.asarray([0.25, 0.5]))
+    with pytest.raises(ValueError, match="rho_scan values must satisfy"):
+        dataclasses.replace(model, rho_scan=jnp.asarray([0.0, 0.5]))._scan_axes()
 
 
 def test_reverse_initial_state_preserves_fixed_temperature_at_density_floor(monkeypatch):

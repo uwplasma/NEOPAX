@@ -3010,10 +3010,16 @@ def _as_float_array(value, *, name: str, positive: bool = False) -> jax.Array:
         raise ValueError(f"{name} must be a one-dimensional list/array.")
     if arr.shape[0] == 0:
         raise ValueError(f"{name} must contain at least one value.")
-    if not bool(jnp.all(jnp.isfinite(arr))):
-        raise ValueError(f"{name} contains non-finite values.")
-    if positive and not bool(jnp.all(arr > 0.0)):
-        raise ValueError(f"{name} values must be positive.")
+    # Axis configuration is validated eagerly at construction time.  The same
+    # arrays become tracers when the recorded database is an explicit support
+    # leaf inside a JAX VJP, where Python ``bool`` conversion is invalid.
+    # Shapes remain statically checked above; defer value validation in traced
+    # execution rather than changing the numerical axis conversion.
+    if not isinstance(arr, jax.core.Tracer):
+        if not bool(jnp.all(jnp.isfinite(arr))):
+            raise ValueError(f"{name} contains non-finite values.")
+        if positive and not bool(jnp.all(arr > 0.0)):
+            raise ValueError(f"{name} values must be positive.")
     return arr
 
 
@@ -3750,14 +3756,21 @@ class NTXRuntimeScanTransportModel(TransportFluxModelBase):
         rho = _as_float_array(self.rho_scan, name="rho_scan")
         nu_v = _as_float_array(self.nu_v_scan, name="nu_v_scan", positive=True)
         er_tilde = _as_float_array(self.er_tilde_scan, name="er_tilde_scan")
-        if not bool(jnp.all((rho > 0.0) & (rho <= 1.0))):
-            raise ValueError("rho_scan values must satisfy 0 < rho <= 1.")
+        if not isinstance(rho, jax.core.Tracer):
+            if not bool(jnp.all((rho > 0.0) & (rho <= 1.0))):
+                raise ValueError("rho_scan values must satisfy 0 < rho <= 1.")
         return rho, nu_v, er_tilde
 
     def _static_channels(self) -> NTXRuntimeScanChannels:
         rho, _, _ = self._scan_axes()
         if self.channels is not None:
-            if self.channels.rho.shape != rho.shape or not bool(jnp.allclose(self.channels.rho, rho)):
+            if self.channels.rho.shape != rho.shape:
+                raise ValueError("Provided ntx_scan_channels rho grid does not match rho_scan.")
+            if (
+                not isinstance(rho, jax.core.Tracer)
+                and not isinstance(self.channels.rho, jax.core.Tracer)
+                and not bool(jnp.allclose(self.channels.rho, rho))
+            ):
                 raise ValueError("Provided ntx_scan_channels rho grid does not match rho_scan.")
             return self.channels
         if self.vmec_file is None or self.boozer_file is None:
