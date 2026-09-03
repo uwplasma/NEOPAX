@@ -11,12 +11,12 @@ n_radial = 51
 [neoclassical]
 flux_model = "ntx_exact_lij_runtime"
 entropy_model = "ntx_exact_lij_runtime"
-ntx_exact_n_theta = 25
+ntx_exact_n_theta = 5
 ntx_exact_n_zeta = 25
-ntx_exact_n_xi = 64
+ntx_exact_n_xi = 31
 ntx_exact_surface_backend = "vmec"
 ntx_exact_center_response_mode = "interpolate_from_faces"
-ntx_exact_response_anchor_count = 8
+ntx_exact_response_anchor_count = 52
 lagged_response_taylor_order = 2
 
 [ambipolarity]
@@ -31,7 +31,7 @@ er_ambipolar_tol = 1.0e-6
 er_ambipolar_x_tol = 1.0e-6
 er_ambipolar_maxiter = 12
 er_ambipolar_blocksize = 1
-er_ambipolar_scan_batch_mode = "hybrid"
+er_ambipolar_scan_batch_mode = "vmap"
 er_ambipolar_scan_batch_size = 10
 er_ambipolar_overlay_reference_er = true
 er_ambipolar_reference_er_file = "./examples/inputs/NTSS_Test_Initial_scaled_flux.h5"
