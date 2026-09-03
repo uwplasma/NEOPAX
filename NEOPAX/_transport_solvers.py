@@ -4085,7 +4085,6 @@ class _RadauAcceptedStepKernelContext:
     tiny_scalar: Any
     zero_scalar: Any
     debug_newton_trace: Any
-    debug_first_failed_stage_probe: Any
     use_transport_lagged_response: Any
     lagged_response_correction_mode: str
 
@@ -13348,41 +13347,6 @@ def _radau_run_stage_subsolve(
         slow_reject = jnp.logical_and(slow_contraction, jnp.logical_not(meets_newton_tol))
         diverged_next = jnp.logical_or(diverged, jnp.logical_or(slow_reject, jnp.logical_or(residual_blowup, nonfinite_state)))
         if kernel_context.debug_newton_trace:
-            # All quantities below are derived from residual_cur and delta,
-            # which the Newton iteration has already computed.  They add no
-            # RHS/NTX evaluations and identify which normalized state block
-            # prevents the frozen-Jacobian solve from contracting.
-            scaled_delta = (delta / kernel_context.stage_scale).reshape(
-                (kernel_context.num_stages, kernel_context.state_dim)
-            )
-            density_end = kernel_context.density_size
-            pressure_end = density_end + kernel_context.pressure_size
-
-            def _block_update_inf(start, end):
-                if end <= start:
-                    return kernel_context.zero_scalar
-                return jnp.max(jnp.abs(scaled_delta[:, start:end]))
-
-            density_update = _block_update_inf(0, density_end)
-            pressure_update = _block_update_inf(density_end, pressure_end)
-            er_update = _block_update_inf(pressure_end, kernel_context.state_dim)
-            block_updates = jnp.asarray(
-                [density_update, pressure_update, er_update],
-                dtype=kernel_context.dtype,
-            )
-            dominant_block = jnp.argmax(block_updates)
-            flat_dominant = jnp.argmax(jnp.abs(scaled_delta))
-            dominant_stage = flat_dominant // kernel_context.state_dim
-            dominant_state = flat_dominant % kernel_context.state_dim
-            dominant_radius = dominant_state % jnp.maximum(
-                jnp.asarray(kernel_context.er_size, dtype=jnp.int32),
-                jnp.asarray(1, dtype=jnp.int32),
-            )
-            residual_ratio = jnp.where(
-                iter_idx > 0,
-                current_residual_norm / jnp.maximum(residual_norm, kernel_context.tiny_scalar),
-                jnp.asarray(0.0, dtype=kernel_context.dtype),
-            )
             jax.debug.print(
                 "[radau-solver] iter={iter} delta_norm={delta_norm:.6e} residual_norm={residual_norm:.6e} newton_metric={newton_metric:.6e} fnewt={fnewt:.6e} theta={theta:.6e} slow={slow} blowup={blowup} nonfinite={nonfinite} diverged={diverged}",
                 iter=iter_idx + 1,
@@ -13395,19 +13359,6 @@ def _radau_run_stage_subsolve(
                 blowup=residual_blowup,
                 nonfinite=nonfinite_state,
                 diverged=diverged_next,
-            )
-            jax.debug.print(
-                "[radau-newton-defect] iter={iter} residual_ratio={residual_ratio:.6e} "
-                "scaled_update_inf=(density={density:.6e},pressure={pressure:.6e},Er={er:.6e}) "
-                "dominant_block={block} dominant_stage={stage} dominant_radial_index={radius}",
-                iter=iter_idx + 1,
-                residual_ratio=residual_ratio,
-                density=density_update,
-                pressure=pressure_update,
-                er=er_update,
-                block=dominant_block,
-                stage=dominant_stage,
-                radius=dominant_radius,
             )
         return (
             iter_idx + 1,
@@ -18976,9 +18927,6 @@ def _build_prepared_radau_accepted_rollout(
         tiny_scalar=tiny_scalar,
         zero_scalar=zero_scalar,
         debug_newton_trace=bool(debug_newton_trace),
-        debug_first_failed_stage_probe=bool(
-            getattr(solver, "debug_stop_after_first_failed_stage_probe", False)
-        ),
         use_transport_lagged_response=bool(use_transport_lagged_response),
         lagged_response_correction_mode=str(
             getattr(solver, "lagged_response_correction_mode", "none")
@@ -19686,9 +19634,6 @@ class RADAUSolver(_RadauSolverConfig):
             tiny_scalar=tiny_scalar,
             zero_scalar=zero_scalar,
             debug_newton_trace=bool(debug_newton_trace),
-            # The repeat probe is deliberately host-side: putting the second
-            # realtime RHS inside this executable doubles its XLA memory peak.
-            debug_first_failed_stage_probe=False,
             use_transport_lagged_response=bool(use_transport_lagged_response),
             lagged_response_correction_mode=str(
                 getattr(self, "lagged_response_correction_mode", "none")
@@ -19920,6 +19865,24 @@ class RADAUSolver(_RadauSolverConfig):
         diagnostic_stopped = jnp.asarray(
             debug_stage_probe and not bool(jax.device_get(last_attempt_converged)),
         )
+        if bool(diagnostic_stopped):
+            # Every value here is already returned by the unmodified compiled
+            # attempt.  Keep this report on the host so the diagnostic does
+            # not introduce another RHS, Jacobian, or stage-vector output.
+            print(
+                "[radau-first-failure-diagnostic] "
+                f"t_start={float(jax.device_get(step_state_f.t)):.8e} "
+                f"dt_next={float(jax.device_get(step_state_f.dt)):.8e} "
+                f"accepted={bool(jax.device_get(last_attempt_accepted))} "
+                f"converged={bool(jax.device_get(last_attempt_converged))} "
+                f"newton_iterations={int(jax.device_get(last_attempt_newton_iter_count))} "
+                f"final_residual_norm={float(jax.device_get(last_attempt_final_residual_norm)):.8e} "
+                f"final_delta_norm={float(jax.device_get(last_attempt_final_delta_norm)):.8e} "
+                f"theta={float(jax.device_get(last_attempt_theta_final)):.8e} "
+                f"error_norm={float(jax.device_get(last_attempt_err_norm)):.8e} "
+                f"diverged={bool(jax.device_get(last_attempt_diverged))}",
+                flush=True,
+            )
         return _finalize_custom_solver_output(
             ys_saved, ts_saved, dts_saved, accepted_mask_saved, failed_mask_saved, fail_codes_saved,
             step_state_f.y,

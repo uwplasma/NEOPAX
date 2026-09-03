@@ -270,3 +270,30 @@ frozen-linearized geometry/root lane as the preceding table.  `rel. error` is
 | `total_pressure_volume_average` | -2.373430136e-01 | -2.374806e-01 | 1.376e-04 | 5.794e-04 |
 | `alpha_power_volume_average_mw_m3` | -2.750729344e-03 | -3.373287e-03 | 6.226e-04 | 1.846e-01 |
 | `bootstrap_current_softmax_abs_scaled` | -6.237748905e+00 | -6.237500e+00 | 2.489e-04 | 3.990e-05 |
+
+### Superseding wHe geometry comparison after initial-root He-floor correction
+
+The preceding wHe `RBC:1:0` and `ZBS:1:0` geometry tables were obtained
+before the initial ambipolar-root reconstruction preserved the configured He
+temperature at the density floor.  They are superseded by this comparison.
+The normal forward state has always used
+`pressure = configured_temperature * max(density, density_floor)`; the
+reverse and frozen-root FD reconstruction now use that same state.
+
+The values below are from the corrected reverse shared-payload run and the
+corrected accepted-schedule frozen-linearized FD runs.  FD is printed to six
+decimal digits by the benchmark, so the small reported errors are conservative
+at that output precision.
+
+| objective | RBC reverse AD | RBC FD | RBC rel. error | ZBS reverse AD | ZBS FD | ZBS rel. error |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `softmax_Er` | -5.161877696e+01 | -5.161888e+01 | 1.996e-06 | 1.544093365e+01 | 1.544048e+01 | 2.938e-05 |
+| `net_total_power_volume_average_mw_m3` | -6.527003888e-03 | -6.527018e-03 | 2.162e-06 | -2.281685584e-03 | -2.281675e-03 | 4.639e-06 |
+| `Er_transition_left` | -2.029715886e+01 | -2.029704e+01 | 5.856e-06 | 1.538496870e-01 | 1.539699e-01 | 7.808e-04 |
+| `Er_transition_right` | -2.248755529e+01 | -2.248736e+01 | 8.685e-06 | 1.020246312e+00 | 1.019976e+00 | 2.650e-04 |
+| `Er2_volume_average` | -1.370697603e+02 | -1.370601e+02 | 7.048e-05 | -1.710248368e+02 | -1.710214e+02 | 2.010e-05 |
+| `Er_volume_average` | -4.236329294e+01 | -4.236430e+01 | 2.377e-05 | 3.014820897e+01 | 3.014751e+01 | 2.318e-05 |
+| `electron_temperature_volume_average_keV` | -1.297161609e-02 | -1.311549e-02 | 1.097e-02 | -3.997609997e-02 | -4.010611e-02 | 3.242e-03 |
+| `total_pressure_volume_average` | -7.360239022e-02 | -7.378432e-02 | 2.466e-03 | -2.373430410e-01 | -2.375081e-01 | 6.950e-04 |
+| `alpha_power_volume_average_mw_m3` | -6.684817932e-03 | -6.684999e-03 | 2.709e-05 | -2.752186254e-03 | -2.752328e-03 | 5.150e-05 |
+| `bootstrap_current_softmax_abs_scaled` | -1.760377166e+00 | -1.760067e+00 | 1.762e-04 | -6.237749176e+00 | -6.237928e+00 | 2.867e-05 |
