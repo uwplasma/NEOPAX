@@ -1527,10 +1527,14 @@ class CombinedTransportFluxModel(TransportFluxModelBase):
     def pullback_direct_rhs_support_payload(self, state, flux_bar, support):
         """Return the neoclassical direct-support bar for a black-box RHS.
 
-        ``support`` is a live payload, so its response must be built by the
-        payload-owning neoclassical model too.  Building it through ``self``
-        would accidentally use the composite's original (static) support for
-        the interpolation primal while differentiating the supplied payload.
+        The recorded scan-database payload is a true black-box path: the
+        forward RHS evaluates ``composite(state)`` directly from the database,
+        so its transpose must do the same.  In particular, do *not* convert
+        the flux bar through a lagged-response object here.  The latter is a
+        separate, retained route used only by ``radau_rhs_mode=lagged_*``.
+
+        Older live NTX payloads have no explicit ``database`` leaf.  Preserve
+        their established lagged-response bridge below.
         """
         pullback_fn = getattr(self.neoclassical_model, "pullback_direct_rhs_support_payload", None)
         if not callable(pullback_fn):
@@ -1540,6 +1544,28 @@ class CombinedTransportFluxModel(TransportFluxModelBase):
             return None
         payload_model = replace_payload(support)
         composite = dataclasses.replace(self, neoclassical_model=payload_model)
+
+        if isinstance(support, dict) and "database" in support:
+            database = support["database"]
+
+            def _direct_fluxes_from_database(database_value):
+                direct_model = dataclasses.replace(
+                    payload_model, database=database_value
+                )
+                return dataclasses.replace(
+                    self, neoclassical_model=direct_model
+                )(state)
+
+            _, database_pullback = jax.vjp(
+                _direct_fluxes_from_database, database
+            )
+            (database_bar,) = database_pullback(flux_bar)
+            support_bar = dict(_float_delta_tree_like(support))
+            support_bar["database"] = _sanitize_float_delta_bar_tree(
+                database, database_bar
+            )
+            return support_bar
+
         response = composite.build_lagged_response(state)
         response_bar = composite.pullback_evaluate_with_lagged_response(
             state, response, flux_bar
@@ -4044,14 +4070,13 @@ class NTXRuntimeScanTransportModel(TransportFluxModelBase):
         )
 
     def pullback_direct_rhs_support_payload(self, state, flux_bar, support):
-        """Transpose a recorded database leaf without tracing scan setup.
+        """Transpose direct black-box database interpolation only.
 
-        The generic equation fallback differentiates the whole realtime
-        payload reconstruction at every Radau stage.  In the recorded route
-        channels and surfaces deliberately do not feed the fixed database
-        during that sweep, so their direct bar is zero.  Transpose only the
-        database through the same lagged-response construction used by the
-        primal; the retained scan record is consumed later, once.
+        This is intentionally distinct from ``pullback_build_lagged_response``:
+        the black-box Radau RHS called ``self(state)`` in its primal, so the
+        local transpose is of that same direct database evaluation.  The
+        retained scan primal is consumed later, once, after segment bars have
+        been accumulated.
         """
 
         if not isinstance(support, dict) or "database" not in support:
@@ -4062,7 +4087,7 @@ class NTXRuntimeScanTransportModel(TransportFluxModelBase):
         _, database_pullback = jax.vjp(
             lambda database_value: dataclasses.replace(
                 database_model, database=database_value
-            ).build_lagged_response(state),
+            )(state),
             database,
         )
         (database_bar,) = database_pullback(flux_bar)
