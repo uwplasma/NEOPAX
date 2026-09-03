@@ -2776,6 +2776,64 @@ class NTXDatabaseTransportModel(TransportFluxModelBase):
             "Upar": upar_neo,
         }
 
+    def evaluate_momentum_corrected_fluxes(self, state, *, diagnostics: bool = False) -> dict:
+        """Evaluate database-interpolated neoclassical fluxes with momentum correction.
+
+        The runtime database retains the monoenergetic ``D11``, ``D13`` and
+        ``D33`` surfaces needed by the established database momentum
+        correction.  This is deliberately separate from :meth:`__call__`:
+        transport evolution continues to use its configured black-box flux
+        path, while the bootstrap objective requests the corrected parallel
+        flow explicitly.
+        """
+
+        if diagnostics:
+            raise NotImplementedError(
+                "Momentum-correction diagnostics are not yet exposed for the "
+                "interpolated NTX database model."
+            )
+        density = safe_density(state.density, self.density_floor)
+        density_right_constraint, density_right_grad_constraint = _extract_right_constraints(
+            self.bc_density,
+            density,
+            self.geometry.r_grid_half,
+        )
+        temperature_right_constraint, temperature_right_grad_constraint = _extract_right_constraints(
+            self.bc_temperature,
+            state.temperature,
+            self.geometry.r_grid_half,
+        )
+        gamma_neo, q_neo, upar_neo, qpar_neo, upar2_neo = (
+            get_Neoclassical_Fluxes_With_Momentum_Correction(
+                self.species,
+                self.energy_grid,
+                self.geometry,
+                self.database,
+                state.Er,
+                state.temperature,
+                density,
+                density_right_constraint=density_right_constraint,
+                density_right_grad_constraint=density_right_grad_constraint,
+                temperature_right_constraint=temperature_right_constraint,
+                temperature_right_grad_constraint=temperature_right_grad_constraint,
+            )
+        )
+        return {
+            "Gamma": gamma_neo,
+            "Q": q_neo,
+            "Upar": upar_neo,
+            "Gamma_neo": gamma_neo,
+            "Q_neo": q_neo,
+            "Upar_neo": upar_neo,
+            "qpar_neo": qpar_neo,
+            "Upar2_neo": upar2_neo,
+        }
+
+    def evaluate_momentum_corrected_upar_only(self, state):
+        """Return the database-interpolated momentum-corrected parallel flow."""
+
+        return self.evaluate_momentum_corrected_fluxes(state)["Upar"]
+
     def build_local_particle_flux_evaluator(self, state):
         species = self.species
         energy_grid = self.energy_grid
@@ -3788,6 +3846,18 @@ class NTXRuntimeScanTransportModel(TransportFluxModelBase):
 
     def __call__(self, state) -> dict:
         return self._database_model()(state)
+
+    def evaluate_momentum_corrected_fluxes(self, state, *, diagnostics: bool = False) -> dict:
+        """Delegate corrected parallel-flow evaluation to the rebuilt scan database."""
+
+        return self._database_model().evaluate_momentum_corrected_fluxes(
+            state, diagnostics=diagnostics
+        )
+
+    def evaluate_momentum_corrected_upar_only(self, state):
+        """Return corrected ``U_parallel`` from the rebuilt scan database."""
+
+        return self._database_model().evaluate_momentum_corrected_upar_only(state)
 
     def build_local_particle_flux_evaluator(self, state):
         return self._database_model().build_local_particle_flux_evaluator(state)

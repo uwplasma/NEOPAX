@@ -143,6 +143,10 @@ max_steps = 20000
 throw = false
 debug_stage_markers = true
 debug_walltime_attempts = true
+# Stop on the first nonconverged Newton attempt and repeat its direct stage
+# residual on the host.  Do not launch this benchmark with
+# XLA_PYTHON_CLIENT_PREALLOCATE=false on a 10 GiB GPU.
+radau_debug_stop_after_first_failed_stage_probe = true
 forward_warm_timing_repeats = 0
 debug_nonfinite_rhs_components = false
 debug_disable_jit = false

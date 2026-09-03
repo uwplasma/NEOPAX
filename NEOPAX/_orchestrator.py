@@ -1436,6 +1436,13 @@ def run_transport(config: dict, runtime: RuntimeContext, state: TransportState):
             f"device_tail_s={solve_wall_end - solve_wall_mid:.3f}",
         )
 
+    # The stage-repeat probe intentionally stops after its first rejected
+    # Newton attempt.  Do not run a warm repeat or try to make transport
+    # products from this deliberately incomplete trajectory.
+    if isinstance(result, dict) and result.get("diagnostic_stopped", False):
+        print("[NEOPAX] diagnostic probe completed; skipping warm runs and transport output")
+        return result
+
     if forward_warm_timing_repeats:
         # Avoid duplicating per-attempt/Newton diagnostics in the warm timing
         # output.  The warm solve has exactly the same numerical settings and

@@ -247,6 +247,46 @@ def test_ntx_local_particle_flux_evaluator_passes_bc_constraints(monkeypatch):
     assert float(captured["er_profile"][1]) == 9.0
 
 
+def test_ntx_database_exposes_momentum_corrected_parallel_flow(monkeypatch):
+    """The black-box database keeps bootstrap on the corrected-Upar physics path."""
+
+    species = _dummy_species()
+    geometry = SimpleNamespace(r_grid_half=jnp.asarray([0.0, 0.5, 1.0]))
+    state = _dummy_state()
+    captured = {}
+
+    def fake_corrected_fluxes(*args, **kwargs):
+        captured["args"] = args
+        captured["kwargs"] = kwargs
+        shape = state.density.shape
+        gamma = jnp.full(shape, 1.0)
+        q = jnp.full(shape, 2.0)
+        upar = jnp.full(shape, 3.0)
+        qpar = jnp.full(shape, 4.0)
+        upar2 = jnp.full(shape, 5.0)
+        return gamma, q, upar, qpar, upar2
+
+    monkeypatch.setattr(
+        flux_models_module,
+        "get_Neoclassical_Fluxes_With_Momentum_Correction",
+        fake_corrected_fluxes,
+    )
+    model = flux_models_module.NTXDatabaseTransportModel(
+        species=species,
+        energy_grid="grid",
+        geometry=geometry,
+        database="db",
+    )
+
+    corrected = model.evaluate_momentum_corrected_fluxes(state)
+
+    assert jnp.allclose(corrected["Upar"], 3.0)
+    assert jnp.allclose(corrected["Upar_neo"], 3.0)
+    assert jnp.allclose(model.evaluate_momentum_corrected_upar_only(state), 3.0)
+    assert "density_right_constraint" in captured["kwargs"]
+    assert "temperature_right_constraint" in captured["kwargs"]
+
+
 def test_ntx_database_lagged_face_response_matches_reference_and_finite_difference(monkeypatch):
     """The database lagged response preserves direct centres and face JVPs.
 
