@@ -1964,6 +1964,52 @@ def _lagged_response_global_reuse_metric(
     raise ValueError(f"Unsupported lagged-response drift norm '{norm}'.")
 
 
+def _lagged_response_reuse_drift_details(
+    current_flat,
+    reference_flat,
+    atol: float,
+    rtol: float,
+    *,
+    norm: str = "rms",
+):
+    """Return the reuse metric and its worst component without model work.
+
+    The per-component scaling intentionally matches
+    :func:`_lagged_response_global_reuse_metric`.  This helper exists only for
+    the opt-in Radau trace, so it can identify which evolved state entry
+    invalidated a global-drift response cache without evaluating NTX again.
+    """
+    delta_flat = current_flat - reference_flat
+    scale = atol + rtol * jnp.maximum(jnp.abs(reference_flat), jnp.abs(current_flat))
+    safe_scale = jnp.where(scale > 0, scale, jnp.ones_like(scale))
+    component_metric = jnp.abs(delta_flat) / safe_scale
+    component_metric = jnp.where(
+        scale > 0,
+        component_metric,
+        jnp.where(
+            jnp.abs(delta_flat) == 0,
+            jnp.zeros_like(component_metric),
+            jnp.full_like(component_metric, jnp.inf),
+        ),
+    )
+    worst_index = jnp.argmax(component_metric)
+    if norm == "max":
+        metric = component_metric[worst_index]
+    elif norm == "rms":
+        metric = jnp.sqrt(jnp.mean(component_metric * component_metric) + 1.0e-30)
+    else:
+        raise ValueError(f"Unsupported lagged-response drift norm '{norm}'.")
+    return (
+        metric,
+        worst_index,
+        reference_flat[worst_index],
+        current_flat[worst_index],
+        delta_flat[worst_index],
+        scale[worst_index],
+        component_metric[worst_index],
+    )
+
+
 def _lagged_response_reuse_uses_global_drift(mode: str) -> bool:
     return mode in {"global_state_drift", "global_state_drift_max"}
 
@@ -2710,6 +2756,7 @@ def _apply_radau_lean_timestep_controller(
     lagged_response_reuse_rtol,
     lagged_response_reuse_atol,
     project_flat,
+    debug_lagged_response_reuse_drift=False,
 ):
     accepted = jnp.logical_and(converged, err_norm <= 1.0)
     safe_error = jnp.maximum(err_norm, 1.0e-12)
@@ -3060,6 +3107,51 @@ def _apply_radau_lean_timestep_controller(
                 lagged_reuse_metric <= jnp.asarray(1.0, dtype=dtype),
             ),
         )
+        if debug_lagged_response_reuse_drift:
+            (
+                drift_metric_debug,
+                drift_index_debug,
+                drift_anchor_debug,
+                drift_current_debug,
+                drift_delta_debug,
+                drift_scale_debug,
+                drift_component_debug,
+            ) = _lagged_response_reuse_drift_details(
+                accepted_y,
+                step_state.lagged_reference_y,
+                atol=lagged_response_reuse_atol,
+                rtol=lagged_response_reuse_rtol,
+                norm=_lagged_response_drift_norm(lagged_response_reuse_mode),
+            )
+            def _print_invalidation(_):
+                jax.debug.print(
+                    "[radau-reuse-drift] invalidate t={t:.6e} dt={dt:.6e} "
+                    "metric={metric:.6e} index={index} anchor={anchor:.6e} "
+                    "current={current:.6e} delta={delta:.6e} scale={scale:.6e} "
+                    "component={component:.6e} rebuilt_this_attempt={rebuilt}",
+                    t=step_state.t,
+                    dt=trial_dt,
+                    metric=drift_metric_debug,
+                    index=drift_index_debug,
+                    anchor=drift_anchor_debug,
+                    current=drift_current_debug,
+                    delta=drift_delta_debug,
+                    scale=drift_scale_debug,
+                    component=drift_component_debug,
+                    rebuilt=jnp.logical_not(lagged_reused),
+                    ordered=True,
+                )
+                return jnp.asarray(0, dtype=jnp.int32)
+
+            jax.lax.cond(
+                jnp.logical_and(
+                    jnp.asarray(use_transport_lagged_response),
+                    jnp.logical_not(keep_lagged_response),
+                ),
+                _print_invalidation,
+                lambda _: jnp.asarray(0, dtype=jnp.int32),
+                operand=None,
+            )
         status_next = jnp.asarray([0, fail_code, n_accepted + 1], dtype=jnp.int32)
         regrowth_cooldown_next = jnp.where(
             jnp.logical_or(use_hairer_lean_family_controller, use_hairer_ntss_controller),
@@ -3312,6 +3404,7 @@ class _RadauSolverConfig(TransportSolver):
     debug_stage_markers: bool = False
     debug_walltime_attempts: bool = False
     debug_stop_after_first_failed_stage_probe: bool = False
+    debug_lagged_response_reuse_drift: bool = False
 
     def __init__(
         self,
@@ -3358,6 +3451,7 @@ class _RadauSolverConfig(TransportSolver):
         debug_stage_markers: bool = False,
         debug_walltime_attempts: bool = False,
         debug_stop_after_first_failed_stage_probe: bool = False,
+        debug_lagged_response_reuse_drift: bool = False,
         save_n=None,
     ):
         n_steps = max(1, int(jnp.ceil((float(t1) - float(t0)) / float(dt))))
@@ -3633,6 +3727,7 @@ class _RadauSolverConfig(TransportSolver):
         object.__setattr__(self, "debug_stage_markers", bool(debug_stage_markers))
         object.__setattr__(self, "debug_walltime_attempts", bool(debug_walltime_attempts))
         object.__setattr__(self, "debug_stop_after_first_failed_stage_probe", bool(debug_stop_after_first_failed_stage_probe))
+        object.__setattr__(self, "debug_lagged_response_reuse_drift", bool(debug_lagged_response_reuse_drift))
         object.__setattr__(self, "save_n", save_n)
 
 @jax.tree_util.register_dataclass
@@ -4012,6 +4107,7 @@ class _RadauSolveExecutionContext:
     lagged_response_reuse_atol: Any
     project_flat: Any
     debug_newton_trace: Any
+    debug_lagged_response_reuse_drift: Any
 
 
 def _build_prepared_radau_execution_context(
@@ -4049,6 +4145,9 @@ def _build_prepared_radau_execution_context(
         lagged_response_reuse_atol=jnp.asarray(getattr(solver, "lagged_response_reuse_atol", 1.0e-8), dtype=dtype),
         project_flat=prepared_rollout.physics_context.project_flat,
         debug_newton_trace=bool(getattr(solver, "debug_stage_markers", False)),
+        debug_lagged_response_reuse_drift=bool(
+            getattr(solver, "debug_lagged_response_reuse_drift", False)
+        ),
     )
 
 
@@ -8837,6 +8936,7 @@ def _radau_attempt_step_lean(
         lagged_response_reuse_rtol=execution_context.lagged_response_reuse_rtol,
         lagged_response_reuse_atol=execution_context.lagged_response_reuse_atol,
         project_flat=execution_context.project_flat,
+        debug_lagged_response_reuse_drift=execution_context.debug_lagged_response_reuse_drift,
     )
 
 
@@ -8931,6 +9031,7 @@ def _radau_attempt_step_forward_solver(
         lagged_response_reuse_rtol=execution_context.lagged_response_reuse_rtol,
         lagged_response_reuse_atol=execution_context.lagged_response_reuse_atol,
         project_flat=execution_context.project_flat,
+        debug_lagged_response_reuse_drift=execution_context.debug_lagged_response_reuse_drift,
     )
     return next_step_state, dataclasses.replace(step_info, stage_history=stage_history)
 
@@ -8999,6 +9100,7 @@ def _radau_attempt_step_with_payload(
         lagged_response_reuse_rtol=execution_context.lagged_response_reuse_rtol,
         lagged_response_reuse_atol=execution_context.lagged_response_reuse_atol,
         project_flat=execution_context.project_flat,
+        debug_lagged_response_reuse_drift=execution_context.debug_lagged_response_reuse_drift,
     )
     payload = _radau_backward_payload_candidate(carry_in, attempt_result)
     return next_step_state, step_info, payload
@@ -16871,6 +16973,7 @@ def _radau_adaptive_final_y_realized_schedule_fused_jvp(
                 lagged_response_reuse_rtol=execution_context.lagged_response_reuse_rtol,
                 lagged_response_reuse_atol=execution_context.lagged_response_reuse_atol,
                 project_flat=execution_context.project_flat,
+                debug_lagged_response_reuse_drift=execution_context.debug_lagged_response_reuse_drift,
             )
             return next_state, info, attempt_result
 
@@ -20299,6 +20402,9 @@ class RADAUSolver(_RadauSolverConfig):
             lagged_response_reuse_atol=jnp.asarray(getattr(self, "lagged_response_reuse_atol", 1.0e-8), dtype=dtype),
             project_flat=project_flat,
             debug_newton_trace=bool(debug_newton_trace),
+            debug_lagged_response_reuse_drift=bool(
+                getattr(self, "debug_lagged_response_reuse_drift", False)
+            ),
         )
 
         step_fn = partial(_radau_step_fn_forward_solver, execution_context)
@@ -25714,6 +25820,9 @@ def build_time_solver(solver_parameters: Any, solver_override: Any = None) -> Tr
             debug_walltime_attempts=bool(_cfg_get("debug_walltime_attempts", False)),
             debug_stop_after_first_failed_stage_probe=bool(
                 _cfg_get("radau_debug_stop_after_first_failed_stage_probe", False)
+            ),
+            debug_lagged_response_reuse_drift=bool(
+                _cfg_get("radau_debug_lagged_response_reuse_drift", False)
             ),
             save_n=save_n,
         )

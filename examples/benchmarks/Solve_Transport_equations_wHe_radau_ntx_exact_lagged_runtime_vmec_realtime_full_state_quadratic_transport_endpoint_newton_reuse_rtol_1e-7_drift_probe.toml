@@ -1,6 +1,5 @@
-# Full w-He Radau transport run using the frozen full transport-state
-# quadratic realtime-NTX response and the transport-scaled endpoint Newton
-# criterion. All 52 face anchors are retained.
+# Short reuse-drift diagnostic: full-state quadratic realtime-NTX response,
+# transport-scaled endpoint Newton criterion, and strict 1e-7 max drift.
 
 [general]
 mode = "transport"
@@ -40,7 +39,7 @@ er_ambipolar_overlay_reference_er = true
 er_ambipolar_reference_er_file = "./examples/inputs/NTSS_Test_Initial_scaled_flux.h5"
 er_ambipolar_reference_er_label = "reference Er"
 er_ambipolar_plot = true
-er_ambipolar_output_dir = "./outputs/my_ambipolarity_run_scaled_flux_ntx_exact_lagged_vmec_realtime_full_state_quadratic_transport_endpoint_newton_wHe"
+er_ambipolar_output_dir = "./outputs/my_ambipolarity_reuse_rtol_1e-7_drift_probe"
 er_initialization_preprocess_boundary_state = false
 
 [turbulence]
@@ -137,7 +136,7 @@ radau_error_estimator = "embedded2_ntss_transport_scale"
 radau_controller_mode = "hairer_lean_transport_discounted"
 radau_predictor_mode = "collocation_transport_weighted"
 lagged_response_reuse_mode = "global_state_drift_max"
-lagged_response_reuse_rtol = 1.0e-2
+lagged_response_reuse_rtol = 1.0e-7
 lagged_response_reuse_atol = 1.0e-8
 t0 = 0.0
 t_final = 0.1
@@ -147,9 +146,11 @@ atol = 1.0e-8
 max_step = 1.0
 min_step = 1.0e-14
 max_steps = 20000
+stop_after_accepted_steps = 20
 throw = false
-debug_stage_markers = true
-debug_walltime_attempts = true
+debug_stage_markers = false
+debug_walltime_attempts = false
+radau_debug_lagged_response_reuse_drift = true
 debug_nonfinite_rhs_components = false
 debug_disable_jit = false
 forward_warm_timing_repeats = 0
@@ -164,8 +165,8 @@ DEr = 2.0
 Er_permittivity_mode = "ntss_like_midpoint"
 
 [transport_output]
-transport_plot = true
-transport_write_hdf5 = true
+transport_plot = false
+transport_write_hdf5 = false
 transport_compare_ambipolarity_residual = false
 transport_scan_ambipolarity_residual = false
 transport_overlay_reference_er = true
@@ -173,5 +174,5 @@ transport_initial_reference_file = "./examples/inputs/NTSS_Test_Initial_scaled_f
 transport_initial_reference_label = "Initial NTSS"
 transport_final_reference_file = "./examples/inputs/NTSS_Test_Final_flux_scaled_wHe.h5"
 transport_final_reference_label = "Final NTSS"
-transport_output_dir = "./outputs/transport_solver_radau_wHe_ntx_exact_lagged_vmec_realtime_full_state_quadratic_transport_endpoint_newton"
+transport_output_dir = "./outputs/transport_solver_radau_wHe_ntx_exact_lagged_vmec_realtime_full_state_quadratic_transport_endpoint_newton_reuse_rtol_1e-7_drift_probe"
 transport_plot_n_times = -1
