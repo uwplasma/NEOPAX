@@ -15349,6 +15349,8 @@ def _radau_adaptive_schedule_rollout(
             slow_contraction=jnp.asarray(False),
             residual_blowup=jnp.asarray(False),
             newton_nonfinite=jnp.asarray(False),
+            stagnation_accepted=jnp.asarray(False),
+            stagnation_defect_norm=jnp.asarray(0.0, dtype=dtype),
         )
 
     def _scan_body_with_idx(step_state, step_idx):
@@ -16745,6 +16747,8 @@ def _radau_adaptive_final_y_realized_schedule_fused_jvp(
             slow_contraction=jnp.asarray(False),
             residual_blowup=jnp.asarray(False),
             newton_nonfinite=jnp.asarray(False),
+            stagnation_accepted=jnp.asarray(False),
+            stagnation_defect_norm=jnp.asarray(0.0, dtype=dtype),
         )
 
     def _scan_body(carry_tuple, step_idx):
@@ -17488,6 +17492,8 @@ def _radau_adaptive_final_state_rollout(
             slow_contraction=jnp.asarray(False),
             residual_blowup=jnp.asarray(False),
             newton_nonfinite=jnp.asarray(False),
+            stagnation_accepted=jnp.asarray(False),
+            stagnation_defect_norm=jnp.asarray(0.0, dtype=dtype),
         )
 
     xs = jnp.arange(int(max_total_steps), dtype=jnp.int32)
