@@ -1,4 +1,5 @@
 import dataclasses
+import collections
 import types
 from pathlib import Path
 
@@ -2523,11 +2524,13 @@ def test_radial_database_flux_table_transpose_matches_generic_vjp():
         a_b=1.0, rho=rho, nu_v=nu_v, Er=er, drds=jnp.ones_like(rho),
         D11=1.0 + 0.01 * base, D13=0.2 + 0.001 * base, D33=0.3 + 0.002 * base,
     )
-    geometry = types.SimpleNamespace(
-        r_grid=jnp.asarray([0.2, 0.4, 0.6, 0.8]),
-        r_grid_half=jnp.asarray([0.1, 0.3, 0.5, 0.7, 0.9]),
-        dr=jnp.asarray(0.2),
-        full_grid_indices=jnp.arange(4, dtype=jnp.int32),
+    geometry = collections.namedtuple(
+        "CompactTransposeGeometry", "r_grid r_grid_half dr full_grid_indices"
+    )(
+        jnp.asarray([0.2, 0.4, 0.6, 0.8]),
+        jnp.asarray([0.1, 0.3, 0.5, 0.7, 0.9]),
+        jnp.asarray(0.2),
+        jnp.arange(4, dtype=jnp.int32),
     )
     species = Species(
         number_species=2,
@@ -2536,15 +2539,14 @@ def test_radial_database_flux_table_transpose_matches_generic_vjp():
         charge_qp=jnp.asarray([-1.0, 1.0]),
         names=("e", "D"),
     )
-    energy_grid = types.SimpleNamespace(
-        xWeights=jnp.asarray([0.25, 0.75]),
-        L11_weight=jnp.asarray([1.0, 0.7]),
-        L12_weight=jnp.asarray([0.1, -0.2]),
-        L22_weight=jnp.asarray([0.8, 1.2]),
-        L13_weight=jnp.asarray([0.4, 0.5]),
-        L23_weight=jnp.asarray([-0.3, 0.2]),
-        L33_weight=jnp.asarray([1.1, 0.6]),
-        v_norm=jnp.asarray([1.2, 1.8]),
+    energy_grid = collections.namedtuple(
+        "CompactTransposeEnergyGrid",
+        "xWeights L11_weight L12_weight L22_weight L13_weight L23_weight L33_weight v_norm",
+    )(
+        jnp.asarray([0.25, 0.75]), jnp.asarray([1.0, 0.7]),
+        jnp.asarray([0.1, -0.2]), jnp.asarray([0.8, 1.2]),
+        jnp.asarray([0.4, 0.5]), jnp.asarray([-0.3, 0.2]),
+        jnp.asarray([1.1, 0.6]), jnp.asarray([1.2, 1.8]),
     )
     density = jnp.asarray([[1.0, 1.05, 1.1, 1.15], [0.9, 0.95, 1.0, 1.05]])
     temperature = jnp.asarray([[2.0, 2.1, 2.2, 2.3], [1.6, 1.7, 1.8, 1.9]])
