@@ -3275,6 +3275,7 @@ class _RadauSolverConfig(TransportSolver):
     newton_residual_norm: str = "raw"
     newton_tol_mode: str = "residual"
     newton_fnewt_mode: str = "tol"
+    newton_fnewt_override: float | None = None
     controller_mode: str = "current"
     predictor_mode: str = "current"
     lagged_response_reuse_mode: str = "retry_only"
@@ -3317,6 +3318,7 @@ class _RadauSolverConfig(TransportSolver):
         newton_residual_norm: str = "raw",
         newton_tol_mode: str = "residual",
         newton_fnewt_mode: str = "tol",
+        newton_fnewt_override: float | None = None,
         controller_mode: str = "current",
         predictor_mode: str = "current",
         lagged_response_reuse_mode: str = "retry_only",
@@ -3409,6 +3411,13 @@ class _RadauSolverConfig(TransportSolver):
         object.__setattr__(self, "newton_residual_norm", str(newton_residual_norm).strip().lower())
         object.__setattr__(self, "newton_tol_mode", str(newton_tol_mode).strip().lower())
         object.__setattr__(self, "newton_fnewt_mode", str(newton_fnewt_mode).strip().lower())
+        if newton_fnewt_override is not None and float(newton_fnewt_override) <= 0.0:
+            raise ValueError("radau_newton_fnewt_override must be positive when set")
+        object.__setattr__(
+            self,
+            "newton_fnewt_override",
+            None if newton_fnewt_override is None else float(newton_fnewt_override),
+        )
         controller_mode_norm = str(controller_mode).strip().lower()
         controller_aliases = {
             "default": "current",
@@ -18865,6 +18874,9 @@ def _build_prepared_radau_accepted_rollout(
         )
     else:
         predictor_fnewt = jnp.maximum(jnp.asarray(solver.tol, dtype=dtype), tiny_scalar)
+    fnewt_override = getattr(solver, "newton_fnewt_override", None)
+    if fnewt_override is not None:
+        predictor_fnewt = jnp.asarray(fnewt_override, dtype=dtype)
     estimator_rtol_eff = jnp.asarray(solver.rtol, dtype=dtype)
     if error_scale_mode == "ntss":
         uround_est = jnp.asarray(jnp.finfo(dtype).eps, dtype=dtype)
@@ -19564,6 +19576,9 @@ class RADAUSolver(_RadauSolverConfig):
             )
         else:
             predictor_fnewt = jnp.maximum(jnp.asarray(self.tol, dtype=dtype), tiny_scalar)
+        fnewt_override = getattr(self, "newton_fnewt_override", None)
+        if fnewt_override is not None:
+            predictor_fnewt = jnp.asarray(fnewt_override, dtype=dtype)
         estimator_rtol_eff = jnp.asarray(self.rtol, dtype=dtype)
         if error_estimator_mode == "embedded2_ntss_scale":
             uround_est = jnp.asarray(jnp.finfo(dtype).eps, dtype=dtype)
@@ -19591,11 +19606,14 @@ class RADAUSolver(_RadauSolverConfig):
 
         if debug_newton_trace:
             jax.debug.print(
-                "[radau-solver] newton_tol_mode={tol_mode} newton_fnewt_mode={fnewt_mode} predictor_fnewt={fnewt:.6e} residual_tol={tol:.6e}",
+                "[radau-solver] newton_tol_mode={tol_mode} newton_fnewt_mode={fnewt_mode} predictor_fnewt={fnewt:.6e} residual_tol={tol:.6e} fnewt_override={fnewt_override:.6e}",
                 tol_mode=newton_tol_mode,
                 fnewt_mode=fnewt_mode,
                 tol=jnp.asarray(self.tol, dtype=dtype),
                 fnewt=predictor_fnewt,
+                fnewt_override=jnp.asarray(
+                    -1.0 if fnewt_override is None else fnewt_override, dtype=dtype
+                ),
             )
 
         state_scale_base = jnp.asarray(self.atol, dtype=dtype) + jnp.asarray(self.rtol, dtype=dtype) * jnp.abs(flat_state0)
@@ -24752,6 +24770,11 @@ class T3DOuterThetaMethodSolver(_T3DOuterThetaSolverConfig):
                     break
             if failed_step:
                 break
+            if (
+                self.stop_after_accepted_steps is not None
+                and accepted_steps >= int(self.stop_after_accepted_steps)
+            ):
+                break
 
         ys_saved = jnp.stack(ys)
         ts_saved = jnp.stack(ts)
@@ -25163,6 +25186,7 @@ def build_time_solver(solver_parameters: Any, solver_override: Any = None) -> Tr
             newton_residual_norm=str(_cfg_get("radau_newton_residual_norm", "raw")),
             newton_tol_mode=str(_cfg_get("radau_newton_tol_mode", "residual")),
             newton_fnewt_mode=str(_cfg_get("radau_newton_fnewt_mode", "tol")),
+            newton_fnewt_override=_cfg_get("radau_newton_fnewt_override"),
             controller_mode=str(_cfg_get("radau_controller_mode", "current")),
             predictor_mode=str(_cfg_get("radau_predictor_mode", "current")),
             lagged_response_reuse_mode=str(_cfg_get("lagged_response_reuse_mode", "retry_only")),

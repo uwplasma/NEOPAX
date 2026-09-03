@@ -199,7 +199,8 @@ def test_momentum_flux_wrapper_preserves_species_radius_contract(monkeypatch):
 
     def _fake_momentum(
         species_arg, energy_grid_arg, geometry_arg, _radius_index,
-        lij, eij, nu_average, *_args,
+        lij, eij, nu_average, _v_thermal, _density, _temperature,
+        a1, a2, a3, *_args,
     ):
         assert species_arg is species
         assert energy_grid_arg is energy_grid
@@ -207,6 +208,9 @@ def test_momentum_flux_wrapper_preserves_species_radius_contract(monkeypatch):
         assert lij.shape == (n_species, 5, 5)
         assert eij.shape == (n_species, 5, 5)
         assert nu_average.shape == (n_species, 3)
+        assert a1.shape == (n_species, 2)
+        assert a2.shape == (n_species, 2)
+        assert a3.shape == (2,)
         value = jnp.arange(n_species, dtype=jnp.float64)
         return value, value + 1.0, value + 2.0, value + 3.0, value + 4.0
 

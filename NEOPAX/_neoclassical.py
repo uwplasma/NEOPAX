@@ -1032,8 +1032,11 @@ def get_Neoclassical_Fluxes_With_Momentum_Correction(
         )
         A1 = get_Thermodynamical_Forces_A1(species.charge[a], density, temperature, dndr, dTdr, Er)
         A2 = get_Thermodynamical_Forces_A2(temperature, dTdr)
-        A3 = get_Thermodynamical_Forces_A3(Er)
-        return dndr, dTdr, A1, A2, A3
+        # ``A3`` is common to all species.  Do not construct it inside this
+        # species-vmapped helper: that used to give it shape
+        # ``(n_species, n_radius)``, while ``get_rhs`` correctly expects the
+        # single radial vector and indexes it as ``A3[r_index]``.
+        return dndr, dTdr, A1, A2
 
     # Vectorize over species
     grads_forces = jax.vmap(get_gradients_and_forces, in_axes=(0,0,0,0,0,0,None,0))(
@@ -1046,7 +1049,8 @@ def get_Neoclassical_Fluxes_With_Momentum_Correction(
         Er,
         jnp.arange(n_species),
     )
-    dndr, dTdr, A1, A2, A3 = grads_forces
+    dndr, dTdr, A1, A2 = grads_forces
+    A3 = get_Thermodynamical_Forces_A3(Er)
 
     species_indices = jnp.arange(n_species)
     # ``energy_grid`` is the velocity/Sonine grid while ``geometry`` is the
