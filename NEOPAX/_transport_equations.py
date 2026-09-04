@@ -1664,10 +1664,21 @@ class ComposedEquationSystem:
             )
             (geometry_bar,) = geometry_pullback(rhs_bar)
             if is_recorded_database_support:
-                support_bar = _sanitize_float_delta_bar_tree(
-                    support, owner_support_bar
+                # The black-box database model intentionally returns only
+                # its three interpolation-table cotangents.  It cannot (and
+                # must not) manufacture zero bars for the recorded scan's
+                # channels/surfaces branches.  Reinsert that local result in
+                # the complete payload contract here, before Radau stacks
+                # stage/objective support bars.
+                if not isinstance(owner_support_bar, dict) or "database" not in owner_support_bar:
+                    raise ValueError(
+                        "Recorded database direct-RHS pullback must return "
+                        "a mapping containing the database table bar."
+                    )
+                support_bar = dict(_float_delta_tree_like(support))
+                support_bar["database"] = _sanitize_float_delta_bar_tree(
+                    support["database"], owner_support_bar["database"]
                 )
-                support_bar = dict(support_bar)
                 support_bar["geometry"] = _sanitize_float_delta_bar_tree(
                     geometry, geometry_bar
                 )

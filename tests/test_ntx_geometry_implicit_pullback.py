@@ -1353,10 +1353,8 @@ def test_black_box_recorded_database_direct_support_split_matches_generic_payloa
             return jnp.asarray(3.0)
 
         def pullback_direct_rhs_support_payload(self, _state, flux_bar, support):
+            del support
             return {
-                "geometry": jnp.asarray(0.0),
-                "channels": jnp.asarray(0.0),
-                "surfaces": jnp.asarray(0.0),
                 "database": 2.0 * flux_bar,
             }
 
