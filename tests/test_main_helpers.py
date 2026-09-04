@@ -445,6 +445,23 @@ def test_ntx_exact_runtime_quadratic_lagged_response_matches_live_reference(resp
             face_coefficient_flux[f"{name}_faces"], direct[name], rtol=3.0e-6, atol=1.0e-12
         )
 
+    native_distance_model = dataclasses.replace(
+        model,
+        center_response_mode="interpolate_face_coefficients_native_distance",
+        full_state_quadratic_response=True,
+    )
+    native_distance_response = native_distance_model.build_lagged_response(state)
+    native_distance_flux = native_distance_model.evaluate_with_lagged_response(
+        state, native_distance_response
+    )
+    for name in ("Gamma", "Q", "Upar"):
+        assert bool(jnp.all(jnp.isfinite(native_distance_flux[name])))
+        # The candidate changes centre-local terms only; faces remain the
+        # original face-local response used by conservative divergence.
+        assert jnp.allclose(
+            native_distance_flux[f"{name}_faces"], direct[name], rtol=3.0e-6, atol=1.0e-12
+        )
+
     direction = TransportState(
         density=jnp.asarray([[0.04, -0.03], [-0.02, 0.01]]),
         pressure=jnp.asarray([[0.06, -0.04], [-0.03, 0.02]]),

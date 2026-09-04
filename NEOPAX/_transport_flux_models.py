@@ -5239,17 +5239,21 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             "interpolate_coefficients": "interpolate_face_coefficients",
             "interpolate_face_coefficients": "interpolate_face_coefficients",
             "face_coefficient_interpolation": "interpolate_face_coefficients",
+            "interpolate_face_coefficients_native_distance": "interpolate_face_coefficients_native_distance",
+            "face_coefficient_native_distance": "interpolate_face_coefficients_native_distance",
         }
         mode = aliases.get(mode, mode)
         if mode not in {
             "interpolate_from_faces",
             "center_local_response",
             "interpolate_face_coefficients",
+            "interpolate_face_coefficients_native_distance",
         }:
             raise ValueError(
                 "ntx_exact_center_response_mode must be one of: "
                 "interpolate_from_faces, center_local_response, "
-                "interpolate_face_coefficients"
+                "interpolate_face_coefficients, "
+                "interpolate_face_coefficients_native_distance"
             )
         return mode
 
@@ -5301,17 +5305,19 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         *,
         center_reference_nu_hat,
         center_reference_epsi_hat,
+        weight_mode: str = "radial",
         weight_hi_override=None,
     ) -> NTXQuadraticPreparedCoefficientResponse:
-        """Radially interpolate face NTX Taylor polynomials to cell centres.
+        """Interpolate face NTX Taylor polynomials to cell centres.
 
         Each face response is anchored at different ``(nu_hat, epsi_hat)``.
         For each centre, first translate its two adjacent face polynomials to
-        that centre's reference coordinates and then linearly blend their
-        translated coefficients.  This is algebraically equivalent to
-        rebasing everything into global coordinates before interpolation, but
-        avoids catastrophic cancellation in the global constant term when
-        ``nu_hat`` or ``epsi_hat`` varies strongly in radius.
+        that centre's reference coordinates. ``weight_mode='radial'`` then
+        uses the geometric radial stencil. ``weight_mode='native_distance'``
+        instead weights each species/energy response by its distance to the
+        centre in native ``(nu_hat, epsi_hat)`` space.  The latter is needed
+        when an ambipolar branch transition makes the two faces represent
+        different local NTX states.
         """
 
         face_rho = jnp.asarray(self.geometry.r_grid_half, dtype=jnp.float64) / jnp.asarray(
@@ -5323,12 +5329,38 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         hi = jnp.searchsorted(face_rho, center_rho, side="right")
         hi = jnp.clip(hi, 1, face_rho.shape[0] - 1)
         lo = hi - 1
+        if weight_mode not in {"radial", "native_distance"}:
+            raise ValueError("weight_mode must be 'radial' or 'native_distance'.")
         denominator = face_rho[hi] - face_rho[lo]
+        u_center_native = jnp.asarray(center_reference_nu_hat)
+        e_center_native = jnp.asarray(center_reference_epsi_hat)
+        u_lo_native = face_response.reference_nu_hat[lo]
+        u_hi_native = face_response.reference_nu_hat[hi]
+        e_lo_native = face_response.reference_epsi_hat[lo]
+        e_hi_native = face_response.reference_epsi_hat[hi]
         if weight_hi_override is None:
-            weight_hi = (center_rho - face_rho[lo]) / jnp.where(
-                jnp.abs(denominator) > 0.0, denominator, 1.0
-            )
-            weight_hi = jnp.clip(weight_hi, 0.0, 1.0)
+            if weight_mode == "radial":
+                weight_hi = (center_rho - face_rho[lo]) / jnp.where(
+                    jnp.abs(denominator) > 0.0, denominator, 1.0
+                )
+                weight_hi = jnp.clip(weight_hi, 0.0, 1.0)
+            else:
+                # The local left/right span non-dimensionalizes the two
+                # native coordinates without assuming that nu_hat and
+                # epsi_hat have comparable numerical magnitudes.
+                nu_scale = jnp.maximum(jnp.abs(u_hi_native - u_lo_native), 1.0e-30)
+                epsi_scale = jnp.maximum(jnp.abs(e_hi_native - e_lo_native), 1.0e-30)
+                distance_lo2 = (
+                    ((u_center_native - u_lo_native) / nu_scale) ** 2
+                    + ((e_center_native - e_lo_native) / epsi_scale) ** 2
+                )
+                distance_hi2 = (
+                    ((u_center_native - u_hi_native) / nu_scale) ** 2
+                    + ((e_center_native - e_hi_native) / epsi_scale) ** 2
+                )
+                inverse_lo = 1.0 / jnp.maximum(distance_lo2, 1.0e-24)
+                inverse_hi = 1.0 / jnp.maximum(distance_hi2, 1.0e-24)
+                weight_hi = inverse_hi / (inverse_lo + inverse_hi)
         else:
             weight_hi = jnp.asarray(weight_hi_override, dtype=center_rho.dtype)
             if weight_hi.shape != center_rho.shape:
@@ -5338,8 +5370,8 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         def _at_adjacent_faces(field):
             return field[lo], field[hi]
 
-        u_center = jnp.asarray(center_reference_nu_hat)[..., None]
-        e_center = jnp.asarray(center_reference_epsi_hat)[..., None]
+        u_center = u_center_native[..., None]
+        e_center = e_center_native[..., None]
         u_lo, u_hi = _at_adjacent_faces(face_response.reference_nu_hat[..., None])
         e_lo, e_hi = _at_adjacent_faces(face_response.reference_epsi_hat[..., None])
 
@@ -5370,8 +5402,12 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         translated_hi = _translate(
             *(_at_adjacent_faces(field)[1] for field in face_fields), u_hi, e_hi
         )
-        weight_lo = weight_lo.reshape((-1,) + (1,) * (translated_lo[0].ndim - 1))
-        weight_hi = weight_hi.reshape((-1,) + (1,) * (translated_hi[0].ndim - 1))
+        weight_lo = weight_lo.reshape(
+            weight_lo.shape + (1,) * (translated_lo[0].ndim - weight_lo.ndim)
+        )
+        weight_hi = weight_hi.reshape(
+            weight_hi.shape + (1,) * (translated_hi[0].ndim - weight_hi.ndim)
+        )
         center_c0, center_cu, center_ce, center_cuu, center_cue, center_cee = tuple(
             weight_lo * left + weight_hi * right
             for left, right in zip(translated_lo, translated_hi, strict=True)
@@ -12233,7 +12269,15 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         face_v_thermal = get_v_thermal(self.species.mass, face_temperature)
         center_response_mode = self._resolved_center_response_mode()
         center_local_response = center_response_mode == "center_local_response"
-        interpolate_face_coefficients = center_response_mode == "interpolate_face_coefficients"
+        interpolate_face_coefficients = center_response_mode in {
+            "interpolate_face_coefficients",
+            "interpolate_face_coefficients_native_distance",
+        }
+        coefficient_weight_mode = (
+            "native_distance"
+            if center_response_mode == "interpolate_face_coefficients_native_distance"
+            else "radial"
+        )
         if interpolate_face_coefficients and not self.full_state_quadratic_response:
             raise NotImplementedError(
                 "interpolate_face_coefficients currently requires the full-state "
@@ -12294,6 +12338,7 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                     face_response.coefficient_response,
                     center_reference_nu_hat=center_reference_nu_hat,
                     center_reference_epsi_hat=center_reference_epsi_hat,
+                    weight_mode=coefficient_weight_mode,
                 ),
             )
             if self.debug_center_lij_comparison:
@@ -12366,6 +12411,58 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                 nu_hi = face_response.coefficient_response.reference_nu_hat[face_hi, species]
                 epsi_lo = face_response.coefficient_response.reference_epsi_hat[face_lo, species]
                 epsi_hi = face_response.coefficient_response.reference_epsi_hat[face_hi, species]
+
+                # Inspect the raw NTX coefficient vector as well.  This is
+                # only four (n_x) direct solves for the already selected
+                # worst cell/species, compared with the full direct-Lij
+                # diagnostic above; it separates coefficient error from the
+                # later energy-moment/Lij reduction.
+                prepared_center = jax.tree_util.tree_map(
+                    lambda arr: jax.lax.dynamic_index_in_dim(
+                        arr, radius, axis=0, keepdims=False
+                    ),
+                    support.center_prepared,
+                )
+                direct_coefficient_scan = self._solve_coefficient_scan_prepared(
+                    prepared_center, nu_center, epsi_center
+                )
+
+                def _translated_coefficient_scan(face_index):
+                    c0 = face_response.coefficient_response.reference_coefficients[
+                        face_index, species
+                    ]
+                    cu = face_response.coefficient_response.dcoefficients_d_nu_hat[
+                        face_index, species
+                    ]
+                    ce = face_response.coefficient_response.dcoefficients_d_epsi_hat[
+                        face_index, species
+                    ]
+                    cuu = face_response.coefficient_response.d2coefficients_d_nu_hat2[
+                        face_index, species
+                    ]
+                    cue = face_response.coefficient_response.d2coefficients_d_nu_hat_d_epsi_hat[
+                        face_index, species
+                    ]
+                    cee = face_response.coefficient_response.d2coefficients_d_epsi_hat2[
+                        face_index, species
+                    ]
+                    du = (nu_center - face_response.coefficient_response.reference_nu_hat[
+                        face_index, species
+                    ])[:, None]
+                    de = (epsi_center - face_response.coefficient_response.reference_epsi_hat[
+                        face_index, species
+                    ])[:, None]
+                    return c0 + cu * du + ce * de + 0.5 * cuu * du * du + cue * du * de + 0.5 * cee * de * de
+
+                coefficient_from_lo = _translated_coefficient_scan(face_lo)
+                coefficient_from_hi = _translated_coefficient_scan(face_hi)
+                coefficient_abs_error = jnp.abs(
+                    coefficient_from_hi - direct_coefficient_scan
+                )
+                coefficient_worst = jnp.argmax(coefficient_abs_error)
+                coefficient_count = direct_coefficient_scan.shape[1]
+                coefficient_energy = coefficient_worst // coefficient_count
+                coefficient_component = coefficient_worst % coefficient_count
                 jax.debug.print(
                     "[NEOPAX] centre-Lij face-coefficient diagnostic: "
                     "max_rel={max_rel:.6e} "
@@ -12410,6 +12507,18 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                     direct=direct_lij[species, radius, row, col],
                 )
                 jax.debug.print(
+                    "[NEOPAX] centre-coefficient high-face check: "
+                    "energy={energy} component={component} direct={direct:.6e} "
+                    "from_lo={from_lo:.6e} from_hi={from_hi:.6e} "
+                    "max_abs_error_hi={max_abs:.6e}",
+                    energy=coefficient_energy,
+                    component=coefficient_component,
+                    direct=direct_coefficient_scan.reshape(-1)[coefficient_worst],
+                    from_lo=coefficient_from_lo.reshape(-1)[coefficient_worst],
+                    from_hi=coefficient_from_hi.reshape(-1)[coefficient_worst],
+                    max_abs=jnp.max(coefficient_abs_error),
+                )
+                jax.debug.print(
                     "[NEOPAX] centre-Lij face-coefficient max-abs: "
                     "max_abs={max_abs:.6e} rel_at_max_abs={rel_at_max_abs:.6e} "
                     "species={species} radius={radius} row={row} col={col} "
@@ -12422,6 +12531,15 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                     col=abs_col,
                     interpolated=interpolated_lij.reshape(-1)[worst_abs],
                     direct=direct_lij.reshape(-1)[worst_abs],
+                )
+                # Rows/columns are the assembled transport Lij indices.  The
+                # reduction is over species and radius only, so this shows
+                # whether the error is confined to L02/L20 or affects other
+                # coefficients as well.
+                jax.debug.print(
+                    "[NEOPAX] centre-Lij per-entry max-relative error "
+                    "(max over species,radius): {matrix}",
+                    matrix=jnp.max(rel_error, axis=(0, 1)),
                 )
         elif center_local_response:
             center_response = self._build_axis_lagged_response(
@@ -15863,6 +15981,7 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         if self._resolved_center_response_mode() in {
             "center_local_response",
             "interpolate_face_coefficients",
+            "interpolate_face_coefficients_native_distance",
         }:
             # Direct-centre mode owns two cached models: centres for local
             # terms and faces for conservative divergence.  Its tangent must
@@ -15916,6 +16035,7 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             if self._resolved_center_response_mode() in {
                 "center_local_response",
                 "interpolate_face_coefficients",
+                "interpolate_face_coefficients_native_distance",
             }:
                 centre_fluxes = self._evaluate_full_state_quadratic_center_response(
                     state, lagged_response.center_response
