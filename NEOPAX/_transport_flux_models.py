@@ -12278,25 +12278,71 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                 direct_lij = self._lij_center(state.Er, temperature, density)
                 abs_error = jnp.abs(interpolated_lij - direct_lij)
                 rel_error = abs_error / jnp.maximum(jnp.abs(direct_lij), 1.0e-30)
-                worst = jnp.argmax(rel_error)
+                worst_rel = jnp.argmax(rel_error)
+                worst_abs = jnp.argmax(abs_error)
                 n_radius = direct_lij.shape[1]
-                col = worst % 3
-                row = (worst // 3) % 3
-                radius = (worst // 9) % n_radius
-                species = worst // (9 * n_radius)
+                col = worst_rel % 3
+                row = (worst_rel // 3) % 3
+                radius = (worst_rel // 9) % n_radius
+                species = worst_rel // (9 * n_radius)
+                abs_col = worst_abs % 3
+                abs_row = (worst_abs // 3) % 3
+                abs_radius = (worst_abs // 9) % n_radius
+                abs_species = worst_abs // (9 * n_radius)
+                face_lij = self._lij_from_quadratic_response_at_reference(
+                    face_response, axis="face"
+                )
+                face_rho = self.geometry.r_grid_half / self.geometry.a_b
+                center_rho = self.geometry.r_grid / self.geometry.a_b
+                face_hi = jnp.clip(
+                    jnp.searchsorted(face_rho, center_rho[radius], side="right"),
+                    1,
+                    face_rho.shape[0] - 1,
+                )
+                face_lo = face_hi - 1
+                face_weight_hi = (center_rho[radius] - face_rho[face_lo]) / (
+                    face_rho[face_hi] - face_rho[face_lo]
+                )
                 jax.debug.print(
                     "[NEOPAX] centre-Lij face-coefficient diagnostic: "
-                    "max_rel={max_rel:.6e} max_abs={max_abs:.6e} "
+                    "max_rel={max_rel:.6e} "
                     "species={species} radius={radius} row={row} col={col} "
                     "interpolated={interpolated:.6e} direct={direct:.6e}",
                     max_rel=jnp.max(rel_error),
-                    max_abs=jnp.max(abs_error),
                     species=species,
                     radius=radius,
                     row=row,
                     col=col,
-                    interpolated=interpolated_lij.reshape(-1)[worst],
-                    direct=direct_lij.reshape(-1)[worst],
+                    interpolated=interpolated_lij.reshape(-1)[worst_rel],
+                    direct=direct_lij.reshape(-1)[worst_rel],
+                )
+                jax.debug.print(
+                    "[NEOPAX] centre-Lij face-coefficient bracket: "
+                    "rho_center={rho_center:.6e} lo={lo} rho_lo={rho_lo:.6e} "
+                    "hi={hi} rho_hi={rho_hi:.6e} weight_hi={weight_hi:.6e} "
+                    "Lij_lo={lij_lo:.6e} Lij_hi={lij_hi:.6e}",
+                    rho_center=center_rho[radius],
+                    lo=face_lo,
+                    rho_lo=face_rho[face_lo],
+                    hi=face_hi,
+                    rho_hi=face_rho[face_hi],
+                    weight_hi=face_weight_hi,
+                    lij_lo=face_lij[species, face_lo, row, col],
+                    lij_hi=face_lij[species, face_hi, row, col],
+                )
+                jax.debug.print(
+                    "[NEOPAX] centre-Lij face-coefficient max-abs: "
+                    "max_abs={max_abs:.6e} rel_at_max_abs={rel_at_max_abs:.6e} "
+                    "species={species} radius={radius} row={row} col={col} "
+                    "interpolated={interpolated:.6e} direct={direct:.6e}",
+                    max_abs=jnp.max(abs_error),
+                    rel_at_max_abs=rel_error.reshape(-1)[worst_abs],
+                    species=abs_species,
+                    radius=abs_radius,
+                    row=abs_row,
+                    col=abs_col,
+                    interpolated=interpolated_lij.reshape(-1)[worst_abs],
+                    direct=direct_lij.reshape(-1)[worst_abs],
                 )
         elif center_local_response:
             center_response = self._build_axis_lagged_response(
