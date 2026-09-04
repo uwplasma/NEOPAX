@@ -3624,6 +3624,9 @@ class _RadauSolverConfig(TransportSolver):
     debug_lagged_response_reuse_drift: bool = False
     debug_newton_bracket: bool = False
     debug_newton_dt_stall: bool = False
+    debug_first_newton_failure_snapshot: bool = False
+    debug_first_newton_failure_time_min: float = 0.0
+    debug_first_newton_failure_dt_min: float = 0.0
 
     def __init__(
         self,
@@ -3675,6 +3678,9 @@ class _RadauSolverConfig(TransportSolver):
         debug_lagged_response_reuse_drift: bool = False,
         debug_newton_bracket: bool = False,
         debug_newton_dt_stall: bool = False,
+        debug_first_newton_failure_snapshot: bool = False,
+        debug_first_newton_failure_time_min: float = 0.0,
+        debug_first_newton_failure_dt_min: float = 0.0,
         save_n=None,
     ):
         n_steps = max(1, int(jnp.ceil((float(t1) - float(t0)) / float(dt))))
@@ -3994,6 +4000,9 @@ class _RadauSolverConfig(TransportSolver):
         object.__setattr__(self, "debug_lagged_response_reuse_drift", bool(debug_lagged_response_reuse_drift))
         object.__setattr__(self, "debug_newton_bracket", bool(debug_newton_bracket))
         object.__setattr__(self, "debug_newton_dt_stall", bool(debug_newton_dt_stall))
+        object.__setattr__(self, "debug_first_newton_failure_snapshot", bool(debug_first_newton_failure_snapshot))
+        object.__setattr__(self, "debug_first_newton_failure_time_min", float(debug_first_newton_failure_time_min))
+        object.__setattr__(self, "debug_first_newton_failure_dt_min", float(debug_first_newton_failure_dt_min))
         object.__setattr__(self, "save_n", save_n)
 
 @jax.tree_util.register_dataclass
@@ -4377,6 +4386,9 @@ class _RadauSolveExecutionContext:
     debug_lagged_response_reuse_drift: Any
     debug_newton_bracket: Any
     debug_newton_dt_stall: Any
+    debug_first_newton_failure_snapshot: Any
+    debug_first_newton_failure_time_min: Any
+    debug_first_newton_failure_dt_min: Any
 
 
 def _build_prepared_radau_execution_context(
@@ -4419,6 +4431,15 @@ def _build_prepared_radau_execution_context(
         ),
         debug_newton_bracket=bool(getattr(solver, "debug_newton_bracket", False)),
         debug_newton_dt_stall=bool(getattr(solver, "debug_newton_dt_stall", False)),
+        debug_first_newton_failure_snapshot=bool(
+            getattr(solver, "debug_first_newton_failure_snapshot", False)
+        ),
+        debug_first_newton_failure_time_min=jnp.asarray(
+            getattr(solver, "debug_first_newton_failure_time_min", 0.0), dtype=dtype
+        ),
+        debug_first_newton_failure_dt_min=jnp.asarray(
+            getattr(solver, "debug_first_newton_failure_dt_min", 0.0), dtype=dtype
+        ),
     )
 
 
@@ -9250,6 +9271,42 @@ def _radau_attempt_step_forward_solver(
         carry_in,
         trial_dt,
     )
+    # Capture only the first rejection *following an accepted step* in the
+    # user-selected late-time / large-step regime.  Early startup rejections
+    # are intentionally excluded: they are not evidence about the narrow
+    # basin observed later in the run.
+    if execution_context.debug_first_newton_failure_snapshot:
+        snapshot_trigger = jnp.logical_and(
+            jnp.logical_and(
+                jnp.logical_not(converged),
+                step_state.recent_reject_count == 0,
+            ),
+            jnp.logical_and(
+                carry_in.t >= execution_context.debug_first_newton_failure_time_min,
+                trial_dt >= execution_context.debug_first_newton_failure_dt_min,
+            ),
+        )
+
+        def _print_failure_snapshot(_):
+            _radau_debug_first_newton_failure_snapshot(
+                execution_context.kernel_context,
+                execution_context.physics_context,
+                flat_y=carry_in.y,
+                t_value=carry_in.t,
+                h_value=trial_dt,
+                stage_history=stage_history,
+                newton_iter_count=newton_iter_count,
+                theta_final=theta_final,
+                final_residual_norm=final_residual_norm,
+            )
+            return jnp.asarray(0, dtype=jnp.int32)
+
+        jax.lax.cond(
+            snapshot_trigger,
+            _print_failure_snapshot,
+            lambda _: jnp.asarray(0, dtype=jnp.int32),
+            operand=None,
+        )
     carry_after_attempt = dataclasses.replace(
         carry_in,
         lagged_response_cache=lagged_response_out,
@@ -10034,6 +10091,93 @@ def _radau_debug_nonfinite_stage_residual(
     _radau_debug_array_stats("residual_matrix", residual_matrix)
     _radau_debug_flat_state_parts("residual_matrix", kernel_context, residual_matrix)
     jax.debug.print("[radau-nonfinite-detail] end")
+
+
+def _radau_debug_first_newton_failure_snapshot(
+    kernel_context: _RadauAcceptedStepKernelContext,
+    physics_context: _RadauAcceptedStepPhysicsContext,
+    *,
+    flat_y,
+    t_value,
+    h_value,
+    stage_history,
+    newton_iter_count,
+    theta_final,
+    final_residual_norm,
+):
+    """Print the accepted base state versus the most displaced failed stage.
+
+    This is deliberately a failure-only diagnostic.  It does not evaluate the
+    RHS, rebuild NTX, or change the Newton/controller decision.
+    """
+    stages = stage_history.reshape((kernel_context.num_stages, kernel_context.state_dim))
+    stage_states = flat_y[None, :] + h_value * (kernel_context.a @ stages)
+    endpoint_scale = _radau_frozen_endpoint_error_scale(kernel_context, flat_y)
+    normalized_displacement = (stage_states - flat_y[None, :]) / endpoint_scale[None, :]
+    stage_rms = jnp.sqrt(jnp.mean(normalized_displacement * normalized_displacement, axis=1))
+    stage_index = jnp.argmax(stage_rms)
+    selected_flat = stage_states[stage_index]
+    base_state = physics_context.unpack_flat(flat_y)
+    selected_state = physics_context.unpack_flat(selected_flat)
+
+    def _field_detail(base, stage):
+        base_flat = jnp.ravel(base)
+        stage_flat = jnp.ravel(stage)
+        index = jnp.argmax(jnp.abs(stage_flat - base_flat))
+        return index, base_flat[index], stage_flat[index], stage_flat[index] - base_flat[index]
+
+    density_index, density_base, density_stage, density_delta = _field_detail(
+        base_state.density, selected_state.density
+    )
+    temperature_index, temperature_base, temperature_stage, temperature_delta = _field_detail(
+        base_state.temperature, selected_state.temperature
+    )
+    er_index, er_base, er_stage, er_delta = _field_detail(base_state.Er, selected_state.Er)
+    n_radius = base_state.Er.shape[0]
+    density_species, density_radius = density_index // n_radius, density_index % n_radius
+    temperature_species, temperature_radius = temperature_index // n_radius, temperature_index % n_radius
+    jax.debug.print(
+        "[radau-first-failed-stage] t={t:.6e} h={h:.6e} stage={stage} c={c:.6e} "
+        "stage_rms={stage_rms:.6e} iter={iters} theta={theta:.6e} residual={residual:.6e}",
+        t=t_value,
+        h=h_value,
+        stage=stage_index,
+        c=kernel_context.c[stage_index],
+        stage_rms=stage_rms[stage_index],
+        iters=newton_iter_count,
+        theta=theta_final,
+        residual=final_residual_norm,
+        ordered=True,
+    )
+    jax.debug.print(
+        "[radau-first-failed-stage] density max-delta: species={species} radius={radius} "
+        "accepted={base:.6e} stage={stage:.6e} delta={delta:.6e}",
+        species=density_species,
+        radius=density_radius,
+        base=density_base,
+        stage=density_stage,
+        delta=density_delta,
+        ordered=True,
+    )
+    jax.debug.print(
+        "[radau-first-failed-stage] temperature max-delta: species={species} radius={radius} "
+        "accepted={base:.6e} stage={stage:.6e} delta={delta:.6e}",
+        species=temperature_species,
+        radius=temperature_radius,
+        base=temperature_base,
+        stage=temperature_stage,
+        delta=temperature_delta,
+        ordered=True,
+    )
+    jax.debug.print(
+        "[radau-first-failed-stage] Er max-delta: radius={radius} "
+        "accepted={base:.6e} stage={stage:.6e} delta={delta:.6e}",
+        radius=er_index,
+        base=er_base,
+        stage=er_stage,
+        delta=er_delta,
+        ordered=True,
+    )
 
 
 def _radau_apply_stage_linear_solve(
@@ -21494,6 +21638,15 @@ class RADAUSolver(_RadauSolverConfig):
             ),
             debug_newton_bracket=bool(getattr(self, "debug_newton_bracket", False)),
             debug_newton_dt_stall=bool(getattr(self, "debug_newton_dt_stall", False)),
+            debug_first_newton_failure_snapshot=bool(
+                getattr(self, "debug_first_newton_failure_snapshot", False)
+            ),
+            debug_first_newton_failure_time_min=jnp.asarray(
+                getattr(self, "debug_first_newton_failure_time_min", 0.0), dtype=dtype
+            ),
+            debug_first_newton_failure_dt_min=jnp.asarray(
+                getattr(self, "debug_first_newton_failure_dt_min", 0.0), dtype=dtype
+            ),
         )
 
         step_fn = partial(_radau_step_fn_forward_solver, execution_context)
@@ -26921,6 +27074,15 @@ def build_time_solver(solver_parameters: Any, solver_override: Any = None) -> Tr
             ),
             debug_newton_bracket=bool(_cfg_get("radau_debug_newton_bracket", False)),
             debug_newton_dt_stall=bool(_cfg_get("radau_debug_newton_dt_stall", False)),
+            debug_first_newton_failure_snapshot=bool(
+                _cfg_get("radau_debug_first_newton_failure_snapshot", False)
+            ),
+            debug_first_newton_failure_time_min=float(
+                _cfg_get("radau_debug_first_newton_failure_time_min", 0.0)
+            ),
+            debug_first_newton_failure_dt_min=float(
+                _cfg_get("radau_debug_first_newton_failure_dt_min", 0.0)
+            ),
             save_n=save_n,
         )
     integrator_ctor = _get_diffrax_integrator(backend)
