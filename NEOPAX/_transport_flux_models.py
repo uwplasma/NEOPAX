@@ -11755,27 +11755,31 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         face_density = safe_density(face_state.density, self.density_floor)
         face_temperature = face_state.temperature
         face_v_thermal = get_v_thermal(self.species.mass, face_temperature)
-        face_response = self._build_axis_lagged_response(
-            channels=support.face_channels,
-            prepared_all=support.face_prepared,
-            radius_coordinates=self.geometry.r_grid_half,
-            Er=face_state.Er,
-            temperature=face_temperature,
-            density=face_density,
-            v_thermal=face_v_thermal,
+        center_local_response = (
+            self._resolved_center_response_mode() == "center_local_response"
         )
-        if self.full_state_quadratic_response:
-            if self._resolved_center_response_mode() != "interpolate_from_faces":
-                raise NotImplementedError(
-                    "full_state_quadratic_response currently requires "
-                    "center_response_mode = 'interpolate_from_faces'."
-                )
-            if not isinstance(face_response, NTXQuadraticPreparedCoefficientResponse):
-                raise AssertionError("full-state quadratic response requires quadratic coefficient payload.")
-            face_response = NTXFullStateQuadraticPreparedCoefficientResponse(
-                reference_state=state,
-                coefficient_response=face_response,
+        # A direct-centre quadratic response never consumes face coefficients.
+        # Do not build a second NTX Hessian payload merely to keep the old
+        # face-first response shape; this is the key memory/cost distinction
+        # between direct centres and face interpolation.
+        face_response = None
+        if not (self.full_state_quadratic_response and center_local_response):
+            face_response = self._build_axis_lagged_response(
+                channels=support.face_channels,
+                prepared_all=support.face_prepared,
+                radius_coordinates=self.geometry.r_grid_half,
+                Er=face_state.Er,
+                temperature=face_temperature,
+                density=face_density,
+                v_thermal=face_v_thermal,
             )
+            if self.full_state_quadratic_response:
+                if not isinstance(face_response, NTXQuadraticPreparedCoefficientResponse):
+                    raise AssertionError("full-state quadratic response requires quadratic coefficient payload.")
+                face_response = NTXFullStateQuadraticPreparedCoefficientResponse(
+                    reference_state=state,
+                    coefficient_response=face_response,
+                )
         _debug_arrays_if_any_nonfinite(
             "ntx.build_lagged_response.face_state",
             (
@@ -11790,7 +11794,7 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         )
         _debug_lagged_response_if_nonfinite("ntx.build_lagged_response.face_response", face_response)
         center_response = None
-        if self._resolved_center_response_mode() == "center_local_response":
+        if center_local_response:
             center_response = self._build_axis_lagged_response(
                 channels=support.center_channels,
                 prepared_all=support.center_prepared,
@@ -11800,6 +11804,15 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                 density=density,
                 v_thermal=v_thermal,
             )
+            if self.full_state_quadratic_response:
+                if not isinstance(center_response, NTXQuadraticPreparedCoefficientResponse):
+                    raise AssertionError(
+                        "full-state quadratic response requires quadratic coefficient payload."
+                    )
+                center_response = NTXFullStateQuadraticPreparedCoefficientResponse(
+                    reference_state=state,
+                    coefficient_response=center_response,
+                )
             _debug_lagged_response_if_nonfinite("ntx.build_lagged_response.center_response", center_response)
         if lagged_timing_enabled():
             jax.debug.callback(lambda: lagged_timing_end("ntx.build_lagged_response"), ordered=True)
@@ -15087,16 +15100,46 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             **kwargs,
         )
 
-    def _evaluate_full_state_quadratic_face_response(self, state, response):
-        delta = dataclasses.replace(state, density=state.density-response.reference_state.density, pressure=state.pressure-response.reference_state.pressure, Er=state.Er-response.reference_state.Er)
-        evaluated = _build_evaluated_transport_state_directional(response.reference_state, delta, self.geometry, bc_density=self.bc_density, bc_temperature=self.bc_temperature, density_floor=self.density_floor, temperature_floor=self.temperature_floor)
+    def _evaluate_full_state_quadratic_axis_response(self, state, response, *, axis):
+        """Evaluate the cached full-state quadratic model on centres or faces."""
+        if axis not in {"center", "face"}:
+            raise ValueError("axis must be 'center' or 'face'.")
+        delta = dataclasses.replace(
+            state,
+            density=state.density - response.reference_state.density,
+            pressure=state.pressure - response.reference_state.pressure,
+            Er=state.Er - response.reference_state.Er,
+        )
+        evaluated = _build_evaluated_transport_state_directional(
+            response.reference_state,
+            delta,
+            self.geometry,
+            bc_density=self.bc_density,
+            bc_temperature=self.bc_temperature,
+            density_floor=self.density_floor,
+            temperature_floor=self.temperature_floor,
+        )
+        axis_state = getattr(evaluated, axis)
+        density_gradient = getattr(evaluated, f"density_grad_{axis}")
+        temperature_gradient = getattr(evaluated, f"temperature_grad_{axis}")
         support, coefficients = self._static_support(), response.coefficient_response
-        vthermal0 = get_v_thermal(self.species.mass, evaluated.face.temperature.value)
-        radii = jnp.arange(evaluated.face.Er.value.shape[0], dtype=jnp.int32); species_indices = jnp.arange(int(self.species.number_species), dtype=jnp.int32)
+        channels = getattr(support, f"{axis}_channels")
+        radius_coordinates = (
+            self.geometry.r_grid if axis == "center" else self.geometry.r_grid_half
+        )
+        vthermal0 = get_v_thermal(self.species.mass, axis_state.temperature.value)
+        radii = jnp.arange(axis_state.Er.value.shape[0], dtype=jnp.int32)
+        species_indices = jnp.arange(int(self.species.number_species), dtype=jnp.int32)
+
         def per_radius(radius):
-            n = _jet_dynamic_index(evaluated.face.density, radius, axis=1); t = _jet_dynamic_index(evaluated.face.temperature, radius, axis=1); er = _jet_dynamic_index(evaluated.face.Er, radius)
-            dn = _jet_dynamic_index(evaluated.density_grad_face, radius, axis=1); dt = _jet_dynamic_index(evaluated.temperature_grad_face, radius, axis=1)
-            v0 = jax.lax.dynamic_index_in_dim(vthermal0, radius, axis=1, keepdims=False); drds = jax.lax.dynamic_index_in_dim(support.face_channels.drds, radius, axis=0, keepdims=False)
+            n = _jet_dynamic_index(axis_state.density, radius, axis=1)
+            t = _jet_dynamic_index(axis_state.temperature, radius, axis=1)
+            er = _jet_dynamic_index(axis_state.Er, radius)
+            dn = _jet_dynamic_index(density_gradient, radius, axis=1)
+            dt = _jet_dynamic_index(temperature_gradient, radius, axis=1)
+            v0 = jax.lax.dynamic_index_in_dim(vthermal0, radius, axis=1, keepdims=False)
+            drds = jax.lax.dynamic_index_in_dim(channels.drds, radius, axis=0, keepdims=False)
+
             def per_species(a):
                 nu, ep, vth = _local_scan_inputs_directional_default(self.energy_grid, self.species, drds_value=drds, species_index=a, er_value=er, temperature_local=t, density_local=n, reference_vthermal_local=v0, er_v_floor=self.er_v_floor)
                 fields = jax.tree_util.tree_map(lambda x: jax.lax.dynamic_index_in_dim(jax.lax.dynamic_index_in_dim(x, radius, axis=0, keepdims=False), a, axis=0, keepdims=False), coefficients)
@@ -15117,7 +15160,7 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                 return _assemble_face_fluxes_from_lij_directional_local(charge=self.species.charge[a], density=_jet_select_axis(n,a), temperature=_jet_select_axis(t,a), density_gradient=_jet_select_axis(dn,a), temperature_gradient=_jet_select_axis(dt,a), er=er, lij=lij)
             return jax.vmap(per_species)(species_indices)
         gamma, q, upar = self._map_radius_axis_regularized_at_axis0(
-            per_radius, radii, self.geometry.r_grid_half
+            per_radius, radii, radius_coordinates
         )
         # ``per_radius`` maps radius first.  The transport interface, like the
         # ordinary Lij evaluator, is species-first: (species, face).
@@ -15125,7 +15168,22 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             jax.tree_util.tree_map(lambda array: jnp.swapaxes(array, 0, 1), value)
             for value in (gamma, q, upar)
         )
-        return {"Gamma_faces": _jet_evaluate(gamma), "Q_faces": _jet_evaluate(q), "Upar_faces": _jet_evaluate(upar)}
+        suffix = "" if axis == "center" else "_faces"
+        return {
+            f"Gamma{suffix}": _jet_evaluate(gamma),
+            f"Q{suffix}": _jet_evaluate(q),
+            f"Upar{suffix}": _jet_evaluate(upar),
+        }
+
+    def _evaluate_full_state_quadratic_face_response(self, state, response):
+        return self._evaluate_full_state_quadratic_axis_response(
+            state, response, axis="face"
+        )
+
+    def _evaluate_full_state_quadratic_center_response(self, state, response):
+        return self._evaluate_full_state_quadratic_axis_response(
+            state, response, axis="center"
+        )
 
     def evaluate_full_state_quadratic_face_tangent_with_lagged_response(
         self,
@@ -15146,10 +15204,14 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         involved.  The equation-level mixed tangent will consume this flux
         primitive when constructing the opt-in stage Newton operator.
         """
-        response = lagged_response.face_response
+        response = (
+            lagged_response.center_response
+            if self._resolved_center_response_mode() == "center_local_response"
+            else lagged_response.face_response
+        )
         if not isinstance(response, NTXFullStateQuadraticPreparedCoefficientResponse):
             raise NotImplementedError(
-                "Quadratic face tangents require the full_state_quadratic_response payload."
+                "Quadratic tangents require the full_state_quadratic_response payload."
             )
         plus_state = dataclasses.replace(
             state,
@@ -15163,8 +15225,13 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             pressure=state.pressure - state_direction.pressure,
             Er=state.Er - state_direction.Er,
         )
-        plus = self._evaluate_full_state_quadratic_face_response(plus_state, response)
-        minus = self._evaluate_full_state_quadratic_face_response(minus_state, response)
+        evaluate = (
+            self._evaluate_full_state_quadratic_center_response
+            if self._resolved_center_response_mode() == "center_local_response"
+            else self._evaluate_full_state_quadratic_face_response
+        )
+        plus = evaluate(plus_state, response)
+        minus = evaluate(minus_state, response)
         return jax.tree_util.tree_map(lambda left, right: 0.5 * (left - right), plus, minus)
 
     def evaluate_with_lagged_response_tangent(
@@ -15176,9 +15243,13 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
     ) -> dict[str, jax.Array]:
         """Custom tangent hook used only by the opt-in quadratic Newton path."""
         del kwargs
-        if isinstance(lagged_response.face_response, NTXFullStateQuadraticPreparedCoefficientResponse):
-            if lagged_response.center_response is not None:
-                raise NotImplementedError("full-state quadratic response is face-only.")
+        if isinstance(
+            lagged_response.face_response,
+            NTXFullStateQuadraticPreparedCoefficientResponse,
+        ) or isinstance(
+            lagged_response.center_response,
+            NTXFullStateQuadraticPreparedCoefficientResponse,
+        ):
             return self.evaluate_full_state_quadratic_face_tangent_with_lagged_response(
                 state, state_direction, lagged_response
             )
@@ -15188,10 +15259,20 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
 
     def evaluate_with_lagged_response(self, state, lagged_response, **kwargs):
         del kwargs
-        if isinstance(lagged_response.face_response, NTXFullStateQuadraticPreparedCoefficientResponse):
-            if lagged_response.center_response is not None:
-                raise NotImplementedError("full-state quadratic response is face-only.")
-            return self._evaluate_full_state_quadratic_face_response(state, lagged_response.face_response)
+        if isinstance(
+            lagged_response.face_response,
+            NTXFullStateQuadraticPreparedCoefficientResponse,
+        ) or isinstance(
+            lagged_response.center_response,
+            NTXFullStateQuadraticPreparedCoefficientResponse,
+        ):
+            if self._resolved_center_response_mode() == "center_local_response":
+                return self._evaluate_full_state_quadratic_center_response(
+                    state, lagged_response.center_response
+                )
+            return self._evaluate_full_state_quadratic_face_response(
+                state, lagged_response.face_response
+            )
         evaluated = build_evaluated_transport_state(
             state,
             self.geometry,

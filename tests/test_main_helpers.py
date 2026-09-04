@@ -380,6 +380,25 @@ def test_ntx_exact_runtime_quadratic_lagged_response_matches_live_reference(resp
             full_state[f"{name}_faces"], direct[name], rtol=3.0e-6, atol=1.0e-12
         )
 
+    direct_full_state_model = dataclasses.replace(
+        model,
+        center_response_mode="center_local_response",
+        full_state_quadratic_response=True,
+    )
+    direct_full_state_response = direct_full_state_model.build_lagged_response(state)
+    assert isinstance(
+        direct_full_state_response.center_response,
+        NTXFullStateQuadraticPreparedCoefficientResponse,
+    )
+    direct_full_state = direct_full_state_model.evaluate_with_lagged_response(
+        state, direct_full_state_response
+    )
+    direct_center = direct_full_state_model(state)
+    for name in ("Gamma", "Q", "Upar"):
+        assert jnp.allclose(
+            direct_full_state[name], direct_center[name], rtol=3.0e-6, atol=1.0e-12
+        )
+
     direction = TransportState(
         density=jnp.asarray([[0.04, -0.03], [-0.02, 0.01]]),
         pressure=jnp.asarray([[0.06, -0.04], [-0.03, 0.02]]),
