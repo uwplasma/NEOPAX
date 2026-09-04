@@ -3618,10 +3618,10 @@ def prepare_realtime_geometry_support_segment_core_setup(
         final_cotangent_mode = str(
             getattr(args, "reverse_final_objective_cotangent_mode", "scalar")
         ).strip().lower()
-        if final_cotangent_mode != "scalar":
+        if final_cotangent_mode not in {"scalar", "grouped_vjp"}:
             raise ValueError(
-                "ntx_scan_runtime currently requires "
-                "--reverse-final-objective-cotangent-mode scalar."
+                "ntx_scan_runtime requires "
+                "--reverse-final-objective-cotangent-mode scalar or grouped_vjp."
             )
         ntx_support_payload = None
         support_payload = realtime_geometry_reverse_support_payload_for_runtime(
