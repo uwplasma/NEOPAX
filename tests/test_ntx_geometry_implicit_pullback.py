@@ -19,6 +19,7 @@ from NEOPAX._transport_flux_models import (
     NTXExactLijRuntimeSupport,
     NTXExactLijRuntimeTransportModel,
     NTXRuntimeScanChannels,
+    _extract_right_constraints,
     _sanitize_float_delta_bar_tree,
 )
 from NEOPAX._database_preprocessed import PreprocessedMonoenergetic3DNTSSRadius
@@ -33,7 +34,7 @@ from NEOPAX._neoclassical import (
 )
 from NEOPAX._energy_grid_models import StandardLaguerreEnergyGrid
 from NEOPAX._species import Species
-from NEOPAX._state import TransportState, get_v_thermal
+from NEOPAX._state import TransportState, get_v_thermal, safe_density
 from NEOPAX._transport_equations import ComposedEquationSystem
 from NEOPAX._transport_solvers import (
     _flat_rhs_build_support_pullback_batched_interpolated_faces_factory,
@@ -691,6 +692,13 @@ def test_database_local_bootstrap_state_pullback_matches_full_upar_jvp(
     # pointwise database primitive, not build all radial flux columns and
     # select one afterwards.  Check both its primal value and its geometry
     # transpose against the established complete centre-flux calculation.
+    root_density = safe_density(state.density, model.density_floor)
+    density_right, density_right_grad = _extract_right_constraints(
+        model.bc_density, root_density, geometry.r_grid_half
+    )
+    temperature_right, temperature_right_grad = _extract_right_constraints(
+        model.bc_temperature, state.temperature, geometry.r_grid_half
+    )
     _, generic_gamma, _, _ = neoclassical_module.get_Neoclassical_Fluxes(
         species,
         model.energy_grid,
@@ -698,7 +706,11 @@ def test_database_local_bootstrap_state_pullback_matches_full_upar_jvp(
         database,
         state.Er,
         state.temperature,
-        state.density,
+        root_density,
+        density_right_constraint=density_right,
+        density_right_grad_constraint=density_right_grad,
+        temperature_right_constraint=temperature_right,
+        temperature_right_grad_constraint=temperature_right_grad,
     )
     local_gamma = model.build_local_particle_flux_evaluator(state)
     for radius_index in range(state.Er.shape[0]):
@@ -719,7 +731,11 @@ def test_database_local_bootstrap_state_pullback_matches_full_upar_jvp(
                 database,
                 state.Er,
                 state.temperature,
-                state.density,
+                root_density,
+                density_right_constraint=density_right,
+                density_right_grad_constraint=density_right_grad,
+                temperature_right_constraint=temperature_right,
+                temperature_right_grad_constraint=temperature_right_grad,
             )[1],
             axis=0,
         ),
