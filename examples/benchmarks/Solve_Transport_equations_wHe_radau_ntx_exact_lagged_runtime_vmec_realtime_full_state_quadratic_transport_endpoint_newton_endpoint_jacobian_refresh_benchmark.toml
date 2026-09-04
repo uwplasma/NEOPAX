@@ -1,5 +1,5 @@
-# Forward benchmark: one shared Jacobian refresh at the first corrected Radau
-# endpoint when the initial chord correction exceeds the transport-scale gate.
+# Forward benchmark: one shared Jacobian refresh at the most displaced first
+# Radau stage when its non-cancelling state defect crosses the gate.
 # The NTX lagged response itself is not rebuilt by this option.
 
 [general]
@@ -137,9 +137,9 @@ radau_predictor_mode = "collocation_transport_weighted"
 lagged_response_reuse_mode = "global_state_drift_max"
 lagged_response_reuse_rtol = 1.0e-2
 lagged_response_reuse_atol = 1.0e-8
-radau_lagged_jacobian_refresh_mode = "endpoint_after_first"
-# Refresh only if the first transport-scaled endpoint correction exceeds one.
-radau_lagged_jacobian_refresh_threshold = 1.0
+radau_lagged_jacobian_refresh_mode = "stage_drift_after_first"
+# First-stage non-cancelling transport defect gate.
+radau_lagged_jacobian_refresh_threshold = 5.0e-2
 t0 = 0.0
 t_final = 2.0
 dt = 1.0e-8
@@ -174,5 +174,5 @@ transport_initial_reference_file = "./examples/inputs/NTSS_Test_Initial_scaled_f
 transport_initial_reference_label = "Initial NTSS"
 transport_final_reference_file = "./examples/inputs/NTSS_Test_Final_flux_scaled_wHe.h5"
 transport_final_reference_label = "Final NTSS"
-transport_output_dir = "./outputs/transport_solver_radau_wHe_ntx_exact_lagged_vmec_realtime_full_state_quadratic_transport_endpoint_newton_endpoint_jacobian_refresh"
+transport_output_dir = "./outputs/transport_solver_radau_wHe_ntx_exact_lagged_vmec_realtime_full_state_quadratic_transport_endpoint_newton_stage_drift_jacobian_refresh"
 transport_plot_n_times = -1

@@ -61,7 +61,7 @@ from NEOPAX._neoclassical import (
     pullback_preprocessed_radial_database_fluxes,
 )
 from NEOPAX._monoenergetic_interpolators import monoenergetic_interpolation_kernel
-from NEOPAX._interpolators import get_Dij
+from NEOPAX._interpolators import get_Dij, monoenergetic_interpolation_table_bar
 from NEOPAX._source_models import get_source_model
 from NEOPAX._species import Species
 from NEOPAX._state import TransportState
@@ -2512,6 +2512,42 @@ def test_radial_preprocessed_stencil_table_transpose_matches_generic_vjp(radius)
     assert jnp.allclose(actual, expected, rtol=1.0e-12, atol=1.0e-12)
 
 
+@pytest.mark.parametrize("radius", (0.12, 0.52, 0.88))
+def test_legacy_monoenergetic_table_transpose_matches_generic_vjp(radius):
+    """The explicit C1 bicubic/radial Monoenergetic transpose is exact."""
+
+    rho = jnp.asarray([0.1, 0.3, 0.5, 0.7, 0.9])
+    nu_log = jnp.asarray([-3.0, -2.0, -1.0, 0.0])
+    er_row = jnp.asarray([-5.0, -4.0, -3.0, -2.0])
+    er_list = jnp.broadcast_to(er_row, (rho.size, er_row.size))
+    shape = (rho.size, nu_log.size, er_row.size)
+    base = jnp.reshape(jnp.arange(int(jnp.prod(jnp.asarray(shape))), dtype=jnp.float64), shape)
+    database = Monoenergetic(
+        a_b=1.0, rho=rho, nu_log=nu_log, Er_list=er_list,
+        D11_log=-3.0 + 0.001 * base, D13=0.2 + 0.002 * base,
+        D33=0.4 + 0.003 * base,
+    )
+    grid_nu = jnp.asarray(2.4e-2)
+    grid_er = jnp.asarray(2.0e-4)
+    local_bar = jnp.asarray(-0.37)
+
+    def _interpolate(table):
+        return get_Dij(
+            jnp.asarray(radius), grid_nu, grid_er,
+            dataclasses.replace(database, D13=table),
+        )[1]
+
+    _, generic_pullback = jax.vjp(_interpolate, database.D13)
+    expected = generic_pullback(local_bar)[0]
+    actual = monoenergetic_interpolation_table_bar(
+        jnp.asarray(radius), grid_nu, grid_er, local_bar, database.D13, database
+    )
+    assert jnp.allclose(actual, expected, rtol=2.0e-11, atol=2.0e-12), (
+        float(jnp.max(jnp.abs(actual - expected))),
+        float(jnp.max(jnp.abs(expected))),
+    )
+
+
 def test_radial_database_flux_table_transpose_matches_generic_vjp():
     """The compact black-box centre rule is the established database VJP."""
 
@@ -2587,3 +2623,63 @@ def test_radial_database_flux_table_transpose_matches_generic_vjp():
                 float(jnp.max(jnp.abs(actual_table_bar - expected_table_bar))),
                 float(jnp.max(jnp.abs(expected_table_bar))),
             )
+
+
+def test_legacy_monoenergetic_flux_table_transpose_matches_generic_vjp():
+    """The black-box centre rule remains exact for scan-generated tables."""
+
+    rho = jnp.asarray([0.1, 0.3, 0.5, 0.7, 0.9])
+    nu_log = jnp.asarray([-5.0, -3.0, -1.0, 1.0])
+    er_list = jnp.broadcast_to(jnp.asarray([-8.0, -5.0, -2.0, 1.0]), (rho.size, 4))
+    base = jnp.reshape(jnp.arange(80, dtype=jnp.float64), (5, 4, 4))
+    database = Monoenergetic(
+        a_b=1.0, rho=rho, nu_log=nu_log, Er_list=er_list,
+        D11_log=-3.0 + 0.001 * base, D13=0.2 + 0.001 * base,
+        D33=0.3 + 0.002 * base,
+    )
+    geometry = collections.namedtuple(
+        "LegacyMonoTransposeGeometry", "r_grid r_grid_half dr full_grid_indices"
+    )(
+        jnp.asarray([0.2, 0.4, 0.6, 0.8]),
+        jnp.asarray([0.1, 0.3, 0.5, 0.7, 0.9]),
+        jnp.asarray(0.2), jnp.arange(4, dtype=jnp.int32),
+    )
+    species = Species(
+        number_species=2, species_indices=jnp.asarray([0, 1]),
+        mass_mp=jnp.asarray([5.446e-4, 2.0]), charge_qp=jnp.asarray([-1.0, 1.0]),
+        names=("e", "D"),
+    )
+    energy_grid = collections.namedtuple(
+        "LegacyMonoTransposeEnergyGrid",
+        "xWeights L11_weight L12_weight L22_weight L13_weight L23_weight L33_weight v_norm",
+    )(
+        jnp.asarray([0.25, 0.75]), jnp.asarray([1.0, 0.7]),
+        jnp.asarray([0.1, -0.2]), jnp.asarray([0.8, 1.2]),
+        jnp.asarray([0.4, 0.5]), jnp.asarray([-0.3, 0.2]),
+        jnp.asarray([1.1, 0.6]), jnp.asarray([1.2, 1.8]),
+    )
+    density = jnp.asarray([[1.0, 1.05, 1.1, 1.15], [0.9, 0.95, 1.0, 1.05]])
+    temperature = jnp.asarray([[2.0, 2.1, 2.2, 2.3], [1.6, 1.7, 1.8, 1.9]])
+    er_center = jnp.asarray([1.0e-4, -1.2e-4, 1.5e-4, -1.8e-4])
+    gamma_bar = jnp.asarray([[0.2, -0.1, 0.3, -0.4], [-0.3, 0.5, -0.2, 0.1]])
+    q_bar, upar_bar = -0.7 * gamma_bar, 0.4 * gamma_bar
+
+    def _fluxes(d11_log, d13, d33):
+        _, gamma, q, upar = get_Neoclassical_Fluxes(
+            species, energy_grid, geometry,
+            dataclasses.replace(database, D11_log=d11_log, D13=d13, D33=d33),
+            er_center, temperature, density,
+        )
+        return gamma, q, upar
+
+    _, generic_pullback = jax.vjp(_fluxes, database.D11_log, database.D13, database.D33)
+    expected = generic_pullback((gamma_bar, q_bar, upar_bar))
+    actual = pullback_preprocessed_radial_database_fluxes(
+        species, energy_grid, geometry, database, er_center, temperature, density,
+        gamma_bar, q_bar, upar_bar,
+    )
+    for actual_table_bar, expected_table_bar in zip(actual, expected, strict=True):
+        assert jnp.allclose(actual_table_bar, expected_table_bar, rtol=3.0e-10, atol=3.0e-10), (
+            float(jnp.max(jnp.abs(actual_table_bar - expected_table_bar))),
+            float(jnp.max(jnp.abs(expected_table_bar))),
+        )

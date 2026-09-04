@@ -84,6 +84,9 @@ from ._interpolators_preprocessed import (
     radial_preprocessed_interpolation_stencil,
     radial_preprocessed_interpolation_table_bar,
 )
+from ._interpolators import monoenergetic_interpolation_table_bar
+from ._monoenergetic import MONOENERGETIC_KIND_GENERIC, monoenergetic_database_kind
+from ._monoenergetic_interpolators import monoenergetic_interpolation_kernel
 from ._source_models import assemble_pressure_source_components, sum_source_components
 from ._model_api import (
     ModelCapabilities,
@@ -2837,10 +2840,6 @@ class NTXDatabaseTransportModel(TransportFluxModelBase):
         if not isinstance(support, dict) or "database" not in support:
             return None
         database = support["database"]
-        if not all(hasattr(database, name) for name in ("r_grid", "Er_grid", "D11_log", "D13", "D33")):
-            return self._pullback_generic_monoenergetic_flux_tables(
-                state, flux_bar, support
-            )
         density = safe_density(state.density, self.density_floor)
         zero = jnp.zeros_like(jnp.asarray(density))
 
@@ -2875,62 +2874,6 @@ class NTXDatabaseTransportModel(TransportFluxModelBase):
         support_bar["database"] = _sanitize_float_delta_bar_tree(database, database_bar)
         return support_bar
 
-    def _pullback_generic_monoenergetic_flux_tables(
-        self, state, flux_bar, support, *, local_root_constraints=False
-    ):
-        """Table-only fallback for the scan-generated ``Monoenergetic`` form.
-
-        The scan runtime serializes its generated coefficients into the legacy
-        radius-dependent ``Monoenergetic`` interpolator, not the sparse radial
-        preprocessed table used by the explicit stencil rule above.  Keep this
-        VJP strictly at that interpolation boundary: it never captures the
-        NTX scan record, which is still folded once by the caller.
-        """
-        database = support["database"]
-        density = safe_density(state.density, self.density_floor)
-        zero = jnp.zeros_like(density)
-
-        def _bar(name):
-            value = flux_bar.get(name, None)
-            if value is None:
-                return zero
-            return jnp.asarray(value)
-
-        kwargs = {"collisionality_model": self.collisionality_model}
-        if local_root_constraints:
-            (
-                kwargs["density_right_constraint"],
-                kwargs["density_right_grad_constraint"],
-            ) = _extract_right_constraints(self.bc_density, density, self.geometry.r_grid_half)
-            (
-                kwargs["temperature_right_constraint"],
-                kwargs["temperature_right_grad_constraint"],
-            ) = _extract_right_constraints(
-                self.bc_temperature, state.temperature, self.geometry.r_grid_half
-            )
-
-        def _fluxes(d11_log, d13, d33):
-            table_database = dataclasses.replace(
-                database, D11_log=d11_log, D13=d13, D33=d33
-            )
-            _, gamma, q, upar = get_Neoclassical_Fluxes(
-                self.species, self.energy_grid, self.geometry, table_database,
-                state.Er, state.temperature, density, **kwargs,
-            )
-            return gamma, q, upar
-
-        _, pullback = jax.vjp(
-            _fluxes, database.D11_log, database.D13, database.D33
-        )
-        d11_bar, d13_bar, d33_bar = pullback((_bar("Gamma"), _bar("Q"), _bar("Upar")))
-        database_bar = dataclasses.replace(
-            _float_delta_tree_like(database),
-            D11_log=d11_bar, D13=d13_bar, D33=d33_bar,
-        )
-        support_bar = dict(_float_delta_tree_like(support))
-        support_bar["database"] = _sanitize_float_delta_bar_tree(database, database_bar)
-        return support_bar
-
     def pullback_local_particle_flux_support_payload(self, state, flux_bar, support):
         """Compact table transpose of the constrained local root flux.
 
@@ -2943,10 +2886,6 @@ class NTXDatabaseTransportModel(TransportFluxModelBase):
         if not isinstance(support, dict) or "database" not in support:
             return None
         database = support["database"]
-        if not all(hasattr(database, name) for name in ("r_grid", "Er_grid", "D11_log", "D13", "D33")):
-            return self._pullback_generic_monoenergetic_flux_tables(
-                state, flux_bar, support, local_root_constraints=True
-            )
         density = safe_density(state.density, self.density_floor)
         density_right_constraint, density_right_grad_constraint = _extract_right_constraints(
             self.bc_density, density, self.geometry.r_grid_half
@@ -3173,23 +3112,6 @@ class NTXDatabaseTransportModel(TransportFluxModelBase):
         differentiated by JAX here: each resulting ``Dij`` bar is scattered
         explicitly through the established interpolation stencil.
         """
-        if not hasattr(self.database, "r_grid"):
-            database = self.database
-
-            def _upar(d11_log, d13, d33):
-                table_model = dataclasses.replace(
-                    self,
-                    database=dataclasses.replace(
-                        database, D11_log=d11_log, D13=d13, D33=d33
-                    ),
-                )
-                return table_model.evaluate_momentum_corrected_upar_only(state)
-
-            _, pullback = jax.vjp(
-                _upar, database.D11_log, database.D13, database.D33
-            )
-            return pullback(jnp.asarray(upar_bar, dtype=state.pressure.dtype))
-
         density = safe_density(state.density, self.density_floor)
         temperature = state.temperature
         density_right, density_right_grad = _extract_right_constraints(
@@ -3267,12 +3189,11 @@ class NTXDatabaseTransportModel(TransportFluxModelBase):
                     default_collisionality_kind,
                 )
                 er_over_vnew = state.Er[coefficient_radius] * 1.0e3 / v_new
+                interpolation_kernel = monoenergetic_interpolation_kernel(database)
                 dij = jax.vmap(
-                    lambda nu_value, er_value: get_Dij_preprocessed_3d_ntss_radius(
+                    lambda nu_value, er_value: interpolation_kernel(
                         self.geometry.r_grid[coefficient_radius],
-                        nu_value,
-                        er_value,
-                        database,
+                        nu_value, er_value, database,
                     )
                 )(nu_over_vnew, er_over_vnew)
                 return dij, vth, nu_over_vnew * v_new, nu_over_vnew, er_over_vnew
@@ -3329,6 +3250,11 @@ class NTXDatabaseTransportModel(TransportFluxModelBase):
             def _scatter_table(table_index, table):
                 def _one_species(species_index, nu_ratio, er_ratio, local_bar):
                     def _one_energy(nu_value, er_value, bar_value):
+                        if monoenergetic_database_kind(database) == MONOENERGETIC_KIND_GENERIC:
+                            return monoenergetic_interpolation_table_bar(
+                                self.geometry.r_grid[jnp.maximum(radius_index, 1)],
+                                nu_value, er_value, bar_value, table, database,
+                            )
                         stencil = radial_preprocessed_interpolation_stencil(
                             self.geometry.r_grid[jnp.maximum(radius_index, 1)],
                             nu_value,

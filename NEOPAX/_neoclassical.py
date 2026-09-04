@@ -31,6 +31,7 @@ from ._monoenergetic import (
     monoenergetic_database_kind,
 )
 from ._monoenergetic_interpolators import monoenergetic_interpolation_kernel
+from ._interpolators import monoenergetic_interpolation_table_bar
 from ._interpolators_preprocessed import (
     get_Dij_preprocessed_3d_ntss_radius,
     radial_preprocessed_interpolation_stencil,
@@ -564,8 +565,9 @@ def pullback_preprocessed_radial_database_fluxes(
         lbar = lbar.at[2, :].add(-density_phys_species[radius_index] * upar_bar_local * forces)
 
         er_over_vnew = Er[radius_index] * 1.0e3 / (energy_grid.v_norm * vth)
+        interpolation_kernel = monoenergetic_interpolation_kernel(database)
         dij = jax.vmap(
-            lambda nu_value, er_value: get_Dij_preprocessed_3d_ntss_radius(
+            lambda nu_value, er_value: interpolation_kernel(
                 geometry.r_grid[radius_index], nu_value, er_value, database
             )
         )(nu_over_vnew, er_over_vnew)
@@ -587,7 +589,24 @@ def pullback_preprocessed_radial_database_fluxes(
         d13_bar = dij_bar[:, 1]
         d33_bar = dij_bar[:, 2]
 
+        is_legacy_monoenergetic = monoenergetic_database_kind(database) == MONOENERGETIC_KIND_GENERIC
+
         def _scatter_one(nu_value, er_value, d11_value, d13_value, d33_value):
+            if is_legacy_monoenergetic:
+                return (
+                    monoenergetic_interpolation_table_bar(
+                        geometry.r_grid[radius_index], nu_value, er_value,
+                        d11_value, database.D11_log, database,
+                    ),
+                    monoenergetic_interpolation_table_bar(
+                        geometry.r_grid[radius_index], nu_value, er_value,
+                        d13_value, database.D13, database,
+                    ),
+                    monoenergetic_interpolation_table_bar(
+                        geometry.r_grid[radius_index], nu_value, er_value,
+                        d33_value, database.D33, database,
+                    ),
+                )
             stencil = radial_preprocessed_interpolation_stencil(
                 geometry.r_grid[radius_index], nu_value, er_value, database
             )

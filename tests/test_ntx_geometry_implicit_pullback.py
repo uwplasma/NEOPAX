@@ -22,6 +22,7 @@ from NEOPAX._transport_flux_models import (
     _sanitize_float_delta_bar_tree,
 )
 from NEOPAX._database_preprocessed import PreprocessedMonoenergetic3DNTSSRadius
+from NEOPAX._database import Monoenergetic
 from NEOPAX._neoclassical import (
     _collisionality_kind,
     _ntss_radial_flux_correction_terms,
@@ -425,7 +426,10 @@ def test_momentum_corrected_fluxes_accept_four_collision_species():
     assert all(bool(jnp.all(jnp.isfinite(value))) for value in outputs)
 
 
-def test_database_local_bootstrap_state_pullback_matches_full_upar_jvp(monkeypatch):
+@pytest.mark.parametrize("scan_generated_monoenergetic", (False, True))
+def test_database_local_bootstrap_state_pullback_matches_full_upar_jvp(
+    monkeypatch, scan_generated_monoenergetic
+):
     """The compact database bootstrap state rule is the full wHe JVP.
 
     This guards the new per-radius boundary directly.  In particular it
@@ -458,16 +462,29 @@ def test_database_local_bootstrap_state_pullback_matches_full_upar_jvp(monkeypat
         jnp.arange(int(jnp.prod(jnp.asarray(table_shape))), dtype=jnp.float64),
         table_shape,
     )
-    database = PreprocessedMonoenergetic3DNTSSRadius.read_data(
-        a_b=1.0,
-        rho=rho,
-        nu_v=nu_v,
-        Er=er_grid,
-        drds=jnp.ones_like(rho),
-        D11=1.0 + 1.0e-3 * table_seed,
-        D13=0.2 + 1.0e-4 * table_seed,
-        D33=0.3 + 2.0e-4 * table_seed,
-    )
+    if scan_generated_monoenergetic:
+        database = Monoenergetic(
+            a_b=1.0,
+            rho=rho,
+            nu_log=jnp.log10(nu_v),
+            Er_list=jnp.broadcast_to(
+                jnp.asarray([-8.0, -5.0, -2.0, 1.0]), table_shape[:1] + (4,)
+            ),
+            D11_log=-3.0 + 1.0e-3 * table_seed,
+            D13=0.2 + 1.0e-4 * table_seed,
+            D33=0.3 + 2.0e-4 * table_seed,
+        )
+    else:
+        database = PreprocessedMonoenergetic3DNTSSRadius.read_data(
+            a_b=1.0,
+            rho=rho,
+            nu_v=nu_v,
+            Er=er_grid,
+            drds=jnp.ones_like(rho),
+            D11=1.0 + 1.0e-3 * table_seed,
+            D13=0.2 + 1.0e-4 * table_seed,
+            D33=0.3 + 2.0e-4 * table_seed,
+        )
     model = NTXDatabaseTransportModel(
         species=species,
         energy_grid=StandardLaguerreEnergyGrid(n_x=2),

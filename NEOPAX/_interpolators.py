@@ -5,6 +5,7 @@ from jax import config
 config.update("jax_enable_x64", True)
 from jax import jit
 import interpax
+from interpax._coefs import A_BICUBIC
 
 
 
@@ -343,6 +344,143 @@ def get_Dij(grid_x, grid_nu, grid_Er,database):
     #xg=xg.at[1].set(monodata2(grid_x,grid_nu_internal,grid_Er_internal))
     #xg=xg.at[2].set(monodata3(grid_x,grid_nu_internal,grid_Er_internal))
     return xg
+
+
+def _cubic1_transpose(table_bar, knots, axis):
+    """Transpose interpax's local C1 ``approx_df(..., "cubic")`` rule.
+
+    The legacy ``Monoenergetic`` interpolation uses this exact derivative
+    construction before its bicubic Hermite evaluation.  Keeping its
+    transpose here makes the database-table reverse explicit: no VJP of an
+    ``Interpolator2D`` (and consequently no interpolation tape) is built in
+    the transport reverse sweep.
+    """
+
+    moved = jnp.moveaxis(table_bar, axis, 0)
+    slope_bar = jnp.zeros_like(moved[:-1])
+    slope_bar = slope_bar.at[0].add(moved[0])
+    slope_bar = slope_bar.at[-1].add(moved[-1])
+    interior = moved[1:-1]
+    slope_bar = slope_bar.at[:-1].add(0.5 * interior)
+    slope_bar = slope_bar.at[1:].add(0.5 * interior)
+    inv_dx = jnp.where(jnp.diff(knots) == 0.0, 0.0, 1.0 / jnp.diff(knots))
+    inv_dx = inv_dx.reshape((inv_dx.shape[0],) + (1,) * (slope_bar.ndim - 1))
+    result = jnp.zeros_like(moved)
+    result = result.at[:-1].add(-inv_dx * slope_bar)
+    result = result.at[1:].add(inv_dx * slope_bar)
+    return jnp.moveaxis(result, 0, axis)
+
+
+def _monoenergetic_slice_table_bar(nu_grid, er_grid, grid_nu, grid_er, local_bar, table):
+    """Exact table transpose of one legacy interpax bicubic surface query."""
+
+    i = jnp.clip(jnp.searchsorted(nu_grid, grid_nu, side="right"), 1, nu_grid.shape[0] - 1)
+    j = jnp.clip(jnp.searchsorted(er_grid, grid_er, side="right"), 1, er_grid.shape[0] - 1)
+    dx = nu_grid[i] - nu_grid[i - 1]
+    dy = er_grid[j] - er_grid[j - 1]
+    tx = (grid_nu - nu_grid[i - 1]) * jnp.where(dx == 0.0, 0.0, 1.0 / dx)
+    ty = (grid_er - er_grid[j - 1]) * jnp.where(dy == 0.0, 0.0, 1.0 / dy)
+
+    # ``interpax.interp2d`` forms ``coef = A_BICUBIC @ F`` and then evaluates
+    # ``sum_ij coef_ij [1,t,t^2,t^3]_i [1,u,u^2,u^3]_j``.  Materialize only
+    # this 16-entry local linear map and scatter its transpose below.
+    powers_x = jnp.asarray((1.0, tx, tx * tx, tx * tx * tx), dtype=table.dtype)
+    powers_y = jnp.asarray((1.0, ty, ty * ty, ty * ty * ty), dtype=table.dtype)
+    bicubic = jnp.asarray(A_BICUBIC, dtype=table.dtype)
+    coefficient_basis = bicubic @ jnp.eye(16, dtype=table.dtype)
+    coefficient_basis = jnp.reshape(coefficient_basis, (4, 4, 16), order="F")
+    f_weights = local_bar * jnp.einsum(
+        "ij,ijm->m", jnp.outer(powers_x, powers_y), coefficient_basis
+    )
+
+    def _scatter_corners(result, corner_bar):
+        result = result.at[i - 1, j - 1].add(corner_bar[0])
+        result = result.at[i, j - 1].add(corner_bar[1])
+        result = result.at[i - 1, j].add(corner_bar[2])
+        return result.at[i, j].add(corner_bar[3])
+
+    direct_bar = _scatter_corners(jnp.zeros_like(table), f_weights[:4])
+    fx_bar = _scatter_corners(jnp.zeros_like(table), dx * f_weights[4:8])
+    fy_bar = _scatter_corners(jnp.zeros_like(table), dy * f_weights[8:12])
+    fxy_bar = _scatter_corners(jnp.zeros_like(table), dx * dy * f_weights[12:])
+    return (
+        direct_bar
+        + _cubic1_transpose(fx_bar, nu_grid, axis=0)
+        + _cubic1_transpose(fy_bar, er_grid, axis=1)
+        + _cubic1_transpose(
+            _cubic1_transpose(fxy_bar, er_grid, axis=1), nu_grid, axis=0
+        )
+    )
+
+
+def monoenergetic_interpolation_table_bar(grid_x, grid_nu, grid_Er, local_bar, table, database):
+    """Explicit transpose of legacy ``get_Dij`` for one coefficient table.
+
+    This mirrors the primal's C1 bicubic slice interpolation and its legacy
+    small/mid/large radial polynomials.  It is table-only by construction:
+    the dynamic state query coordinates are treated as primal values.
+    """
+
+    grid_nu_internal = jnp.log10(jnp.maximum(1.0e-12, grid_nu))
+    grid_er_internal = jnp.where(
+        grid_x <= database.low_limit_r,
+        jnp.log10(database.Er_lower_limit),
+        jnp.log10(jnp.maximum(database.Er_lower_limit, jnp.abs(grid_Er / grid_x))),
+    )
+
+    def _surface_bar(surface_index, weight):
+        er_values = jax.lax.dynamic_index_in_dim(database.Er_list, surface_index, axis=0, keepdims=False)
+        surface_table = jax.lax.dynamic_index_in_dim(table, surface_index, axis=0, keepdims=False)
+        local = _monoenergetic_slice_table_bar(
+            database.nu_log, er_values, grid_nu_internal, grid_er_internal, weight * local_bar, surface_table
+        )
+        return jnp.zeros_like(table).at[surface_index].add(local)
+
+    # Reproduce ``interpolation_small_r`` algebra exactly by evaluating its
+    # three linear basis vectors.  This avoids a numerically different matrix
+    # inverse in a transpose that is compared against the established VJP.
+    r12, r22, r32 = database.r1**2, database.r2**2, database.r3**2
+    r13, r23, r33 = database.r1**3, database.r2**3, database.r3**3
+    xr2, xr3 = grid_x**2, grid_x**3
+    denom_a = (r32-r22)/(r33-r23) - (r32-r12)/(r33-r13)
+    denom_b = (r33-r23)/(r32-r22) - (r33-r13)/(r32-r12)
+    small_a = jnp.asarray((
+        1.0/(r33-r13)/denom_a,
+        -1.0/(r33-r23)/denom_a,
+        (1.0/(r33-r23)-1.0/(r33-r13))/denom_a,
+    ))
+    small_b = jnp.asarray((
+        1.0/(r32-r12)/denom_b,
+        -1.0/(r32-r22)/denom_b,
+        (1.0/(r32-r22)-1.0/(r32-r12))/denom_b,
+    ))
+    small_weights = jnp.asarray((1.0, 0.0, 0.0)) + (xr2-r12)*small_a + (xr3-r13)*small_b
+
+    index = jnp.argmax(jnp.where(grid_x - database.rho[1:-1] * database.a_b <= 0.0, grid_x - database.rho[1:-1] * database.a_b, -jnp.inf)) + 1
+    mid_indices = index + jnp.asarray((-2, -1, 0, 1), dtype=jnp.int32)
+    mid_radii = database.a_b * database.rho[mid_indices]
+    mid_weights = jnp.asarray((
+        (grid_x-mid_radii[1])*(grid_x-mid_radii[2])*(grid_x-mid_radii[3]) / ((mid_radii[0]-mid_radii[1])*(mid_radii[0]-mid_radii[2])*(mid_radii[0]-mid_radii[3])),
+        (grid_x-mid_radii[0])*(grid_x-mid_radii[2])*(grid_x-mid_radii[3]) / ((mid_radii[1]-mid_radii[0])*(mid_radii[1]-mid_radii[2])*(mid_radii[1]-mid_radii[3])),
+        (grid_x-mid_radii[0])*(grid_x-mid_radii[1])*(grid_x-mid_radii[3]) / ((mid_radii[2]-mid_radii[0])*(mid_radii[2]-mid_radii[1])*(mid_radii[2]-mid_radii[3])),
+        (grid_x-mid_radii[0])*(grid_x-mid_radii[1])*(grid_x-mid_radii[2]) / ((mid_radii[3]-mid_radii[0])*(mid_radii[3]-mid_radii[1])*(mid_radii[3]-mid_radii[2])),
+    ))
+    large_radii = jnp.asarray((database.rnm3, database.rnm2, database.rnm1))
+    large_weights = jnp.asarray((
+        (grid_x-large_radii[1])*(grid_x-large_radii[2]) / ((large_radii[0]-large_radii[1])*(large_radii[0]-large_radii[2])),
+        (grid_x-large_radii[0])*(grid_x-large_radii[2]) / ((large_radii[1]-large_radii[0])*(large_radii[1]-large_radii[2])),
+        (grid_x-large_radii[0])*(grid_x-large_radii[1]) / ((large_radii[2]-large_radii[0])*(large_radii[2]-large_radii[1])),
+    ))
+
+    small = sum((_surface_bar(i, w) for i, w in zip((0, 1, 2), small_weights, strict=True)), jnp.zeros_like(table))
+    mid = sum((_surface_bar(i, w) for i, w in zip(mid_indices, mid_weights, strict=True)), jnp.zeros_like(table))
+    n_radius = table.shape[0]
+    large = sum((_surface_bar(i, w) for i, w in zip((n_radius - 3, n_radius - 2, n_radius - 1), large_weights, strict=True)), jnp.zeros_like(table))
+    return jnp.where(
+        grid_x < database.r1_lim,
+        small,
+        jnp.where(grid_x < database.rmn2_lim, mid, large),
+    )
 
 
 @jit

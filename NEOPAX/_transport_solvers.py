@@ -3780,13 +3780,19 @@ class _RadauSolverConfig(TransportSolver):
             "disabled": "none",
             "endpoint": "endpoint_after_first",
             "endpoint_once": "endpoint_after_first",
+            "stage": "stage_drift_after_first",
+            "stage_drift": "stage_drift_after_first",
         }
         jacobian_refresh_mode_norm = jacobian_refresh_mode_aliases.get(
             jacobian_refresh_mode_norm, jacobian_refresh_mode_norm
         )
-        if jacobian_refresh_mode_norm not in {"none", "endpoint_after_first"}:
+        if jacobian_refresh_mode_norm not in {
+            "none",
+            "endpoint_after_first",
+            "stage_drift_after_first",
+        }:
             raise ValueError(
-                "radau_lagged_jacobian_refresh_mode must be one of: none, endpoint_after_first"
+                "radau_lagged_jacobian_refresh_mode must be one of: none, endpoint_after_first, stage_drift_after_first"
             )
         if float(lagged_jacobian_refresh_threshold) <= 0.0:
             raise ValueError("radau_lagged_jacobian_refresh_threshold must be positive")
@@ -3795,7 +3801,7 @@ class _RadauSolverConfig(TransportSolver):
             "lagged_response",
         }:
             raise ValueError(
-                "radau_lagged_jacobian_refresh_mode='endpoint_after_first' requires "
+                "radau_lagged_jacobian_refresh_mode requires "
                 "a lagged transport response RHS mode."
             )
         if jacobian_refresh_mode_norm != "none" and correction_mode_norm != "none":
@@ -4294,6 +4300,7 @@ class _RadauStageSubsolveResult:
     final_residual: Any
     final_residual_norm: Any
     converged: Any
+    newton_state_final: Any
 
 
 @jax.tree_util.register_dataclass
@@ -13706,6 +13713,9 @@ def _radau_build_stage_subsolve_tangent_result(
         final_residual=_zero_tangent_like(primal_result.final_residual),
         final_residual_norm=_zero_tangent_like(primal_result.final_residual_norm),
         converged=_zero_tangent_like(primal_result.converged),
+        newton_state_final=jax.tree.map(
+            _zero_tangent_like, primal_result.newton_state_final
+        ),
     )
 
 
@@ -13794,6 +13804,9 @@ def _radau_run_stage_subsolve(
     kernel_context: _RadauAcceptedStepKernelContext,
     physics_context: _RadauAcceptedStepPhysicsContext,
     inputs: _RadauStageSubsolveInputs,
+    *,
+    initial_newton_state=None,
+    finite_initial_residual_override=None,
 ) -> _RadauStageSubsolveResult:
     """Run the implicit Radau stage Newton solve as a standalone subsolve.
 
@@ -14012,6 +14025,9 @@ def _radau_run_stage_subsolve(
         inputs.z0,
     )
     finite_initial_residual = jnp.all(jnp.isfinite(initial_residual))
+    if initial_newton_state is not None:
+        init_newton = initial_newton_state
+        finite_initial_residual = finite_initial_residual_override
     (
         iter_final,
         z_final,
@@ -14111,6 +14127,23 @@ def _radau_run_stage_subsolve(
         final_residual=final_residual,
         final_residual_norm=final_residual_norm,
         converged=converged,
+        newton_state_final=(
+            iter_final,
+            z_final,
+            delta_final,
+            delta_norm_final,
+            _residual_norm_loop_final,
+            _stage_residual_defect_norm_loop_final,
+            _prev_newton_norm_final,
+            newton_metric_final,
+            _prev_theta_ratio_final,
+            theta_final,
+            diverged_final,
+            shrink_suggest_final,
+            slow_contraction_final,
+            residual_blowup_final,
+            newton_nonfinite_final,
+        ),
     )
 
 
@@ -14266,12 +14299,14 @@ def _radau_single_step_primal(
         complex_lu_out=complex_lu_out,
         complex_piv_out=complex_piv_out,
     )
-    if kernel_context.lagged_jacobian_refresh_mode == "endpoint_after_first":
-        # The lagged response is already quadratic, so its Jacobian at the
-        # first corrected endpoint is J_n + H_n[delta_endpoint, .].  Refresh
-        # one *shared* matrix there only when the first chord correction is
-        # large.  This preserves the transformed Radau factorization and does
-        # not call the NTX builder again.
+    if kernel_context.lagged_jacobian_refresh_mode in {
+        "endpoint_after_first", "stage_drift_after_first"
+    }:
+        # The lagged response is already quadratic.  Refresh one *shared*
+        # matrix at the most displaced first-corrected Radau stage, using
+        # J_n + H_n[delta_stage, .].  The non-cancelling stage defect avoids
+        # an endpoint-projection cancellation blind spot and does not call
+        # the NTX builder again.
         first_iteration_context = dataclasses.replace(
             kernel_context, maxiter=1, debug_newton_trace=False
         )
@@ -14280,11 +14315,24 @@ def _radau_single_step_primal(
             physics_context,
             subsolve_inputs,
         )
-        first_endpoint = flat_y + h_value * (
-            kernel_context.b
-            @ first_iteration.z_final.reshape(
-                (kernel_context.num_stages, kernel_context.state_dim)
+        first_stages = first_iteration.z_final.reshape(
+            (kernel_context.num_stages, kernel_context.state_dim)
+        )
+        first_stage_states = flat_y[None, :] + h_value * (kernel_context.a @ first_stages)
+        first_stage_scale = _radau_frozen_endpoint_error_scale(kernel_context, flat_y)
+        first_stage_drift = jnp.sqrt(
+            jnp.mean(
+                ((first_stage_states - flat_y[None, :]) / first_stage_scale[None, :]) ** 2,
+                axis=1,
             )
+        )
+        refresh_stage_index = jnp.argmax(first_stage_drift)
+        refresh_state = first_stage_states[refresh_stage_index]
+        first_stage_defect = _radau_stage_residual_defect_norm(
+            kernel_context,
+            h_value=h_value,
+            stage_residual=first_iteration.final_residual,
+            endpoint_scale=first_stage_scale,
         )
         refresh_jacobian = jnp.logical_and(
             jnp.logical_and(
@@ -14294,13 +14342,17 @@ def _radau_single_step_primal(
                     jnp.logical_not(first_iteration.nonfinite_stage_residual),
                 ),
             ),
-            first_iteration.newton_metric_final
+            first_stage_defect
             > kernel_context.lagged_jacobian_refresh_threshold,
         )
 
         def _run_with_anchor_jacobian(_):
-            anchor_result = _radau_run_stage_subsolve_from_inputs(
-                kernel_context, physics_context, subsolve_inputs
+            anchor_result = _radau_run_stage_subsolve(
+                kernel_context,
+                physics_context,
+                subsolve_inputs,
+                initial_newton_state=first_iteration.newton_state_final,
+                finite_initial_residual_override=first_iteration.finite_initial_residual,
             )
             return (
                 anchor_result,
@@ -14312,7 +14364,7 @@ def _radau_single_step_primal(
             )
 
         def _run_with_endpoint_jacobian(_):
-            endpoint_jacobian = jax.jacfwd(_rhs_eval_at_current_time)(first_endpoint)
+            endpoint_jacobian = jax.jacfwd(_rhs_eval_at_current_time)(refresh_state)
 
             def _factor_and_run(_):
                 endpoint_real_lu, endpoint_real_piv, endpoint_complex_lu, endpoint_complex_piv = (
@@ -14327,8 +14379,28 @@ def _radau_single_step_primal(
                     complex_lu_out=endpoint_complex_lu,
                     complex_piv_out=endpoint_complex_piv,
                 )
-                endpoint_result = _radau_run_stage_subsolve_from_inputs(
-                    kernel_context, physics_context, endpoint_inputs
+                # The state after the first correction is retained.  The
+                # contraction estimates are reset because they belonged to
+                # the old chord matrix and are not comparable after refresh.
+                first_state = first_iteration.newton_state_final
+                refreshed_state = (
+                    jnp.asarray(0, dtype=jnp.int32), first_state[1],
+                    jnp.zeros_like(first_state[2]),
+                    jnp.asarray(jnp.inf, dtype=kernel_context.dtype),
+                    jnp.asarray(jnp.inf, dtype=kernel_context.dtype),
+                    jnp.asarray(jnp.inf, dtype=kernel_context.dtype),
+                    jnp.asarray(jnp.inf, dtype=kernel_context.dtype),
+                    jnp.asarray(jnp.inf, dtype=kernel_context.dtype),
+                    kernel_context.zero_scalar, kernel_context.zero_scalar,
+                    jnp.asarray(False), jnp.asarray(1.0, dtype=kernel_context.dtype),
+                    jnp.asarray(False), jnp.asarray(False), jnp.asarray(False),
+                )
+                endpoint_result = _radau_run_stage_subsolve(
+                    kernel_context,
+                    physics_context,
+                    endpoint_inputs,
+                    initial_newton_state=refreshed_state,
+                    finite_initial_residual_override=first_iteration.finite_initial_residual,
                 )
                 return (
                     endpoint_result,
@@ -14361,9 +14433,10 @@ def _radau_single_step_primal(
         )
         if kernel_context.debug_newton_trace:
             jax.debug.print(
-                "[radau-solver] endpoint_jacobian_refresh={refresh} first_newton_metric={metric:.6e} threshold={threshold:.6e}",
+                "[radau-solver] stage_jacobian_refresh={refresh} stage={stage} first_stage_defect={defect:.6e} threshold={threshold:.6e}",
                 refresh=refresh_jacobian,
-                metric=first_iteration.newton_metric_final,
+                stage=refresh_stage_index,
+                defect=first_stage_defect,
                 threshold=kernel_context.lagged_jacobian_refresh_threshold,
             )
     else:
@@ -14892,7 +14965,9 @@ def _radau_single_step_primal_reverse_minimal(
         complex_lu_out=complex_lu_out,
         complex_piv_out=complex_piv_out,
     )
-    if kernel_context.lagged_jacobian_refresh_mode == "endpoint_after_first":
+    if kernel_context.lagged_jacobian_refresh_mode in {
+        "endpoint_after_first", "stage_drift_after_first"
+    }:
         # Keep reverse-only realized-schedule replay on precisely the same
         # primal linearization path as the forward accepted step.
         first_iteration_context = dataclasses.replace(
@@ -14903,11 +14978,24 @@ def _radau_single_step_primal_reverse_minimal(
             physics_context,
             subsolve_inputs,
         )
-        first_endpoint = flat_y + h_value * (
-            kernel_context.b
-            @ first_iteration.z_final.reshape(
-                (kernel_context.num_stages, kernel_context.state_dim)
+        first_stages = first_iteration.z_final.reshape(
+            (kernel_context.num_stages, kernel_context.state_dim)
+        )
+        first_stage_states = flat_y[None, :] + h_value * (kernel_context.a @ first_stages)
+        first_stage_scale = _radau_frozen_endpoint_error_scale(kernel_context, flat_y)
+        first_stage_drift = jnp.sqrt(
+            jnp.mean(
+                ((first_stage_states - flat_y[None, :]) / first_stage_scale[None, :]) ** 2,
+                axis=1,
             )
+        )
+        refresh_stage_index = jnp.argmax(first_stage_drift)
+        refresh_state = first_stage_states[refresh_stage_index]
+        first_stage_defect = _radau_stage_residual_defect_norm(
+            kernel_context,
+            h_value=h_value,
+            stage_residual=first_iteration.final_residual,
+            endpoint_scale=first_stage_scale,
         )
         refresh_jacobian = jnp.logical_and(
             jnp.logical_and(
@@ -14917,13 +15005,17 @@ def _radau_single_step_primal_reverse_minimal(
                     jnp.logical_not(first_iteration.nonfinite_stage_residual),
                 ),
             ),
-            first_iteration.newton_metric_final
+            first_stage_defect
             > kernel_context.lagged_jacobian_refresh_threshold,
         )
 
         def _run_with_anchor_jacobian(_):
-            anchor_result = _radau_run_stage_subsolve_from_inputs(
-                kernel_context, physics_context, subsolve_inputs
+            anchor_result = _radau_run_stage_subsolve(
+                kernel_context,
+                physics_context,
+                subsolve_inputs,
+                initial_newton_state=first_iteration.newton_state_final,
+                finite_initial_residual_override=first_iteration.finite_initial_residual,
             )
             return (
                 anchor_result,
@@ -14935,7 +15027,7 @@ def _radau_single_step_primal_reverse_minimal(
             )
 
         def _run_with_endpoint_jacobian(_):
-            endpoint_jacobian = jax.jacfwd(_rhs_eval_at_current_time)(first_endpoint)
+            endpoint_jacobian = jax.jacfwd(_rhs_eval_at_current_time)(refresh_state)
 
             def _factor_and_run(_):
                 endpoint_real_lu, endpoint_real_piv, endpoint_complex_lu, endpoint_complex_piv = (
@@ -14950,8 +15042,25 @@ def _radau_single_step_primal_reverse_minimal(
                     complex_lu_out=endpoint_complex_lu,
                     complex_piv_out=endpoint_complex_piv,
                 )
-                endpoint_result = _radau_run_stage_subsolve_from_inputs(
-                    kernel_context, physics_context, endpoint_inputs
+                first_state = first_iteration.newton_state_final
+                refreshed_state = (
+                    jnp.asarray(0, dtype=jnp.int32), first_state[1],
+                    jnp.zeros_like(first_state[2]),
+                    jnp.asarray(jnp.inf, dtype=kernel_context.dtype),
+                    jnp.asarray(jnp.inf, dtype=kernel_context.dtype),
+                    jnp.asarray(jnp.inf, dtype=kernel_context.dtype),
+                    jnp.asarray(jnp.inf, dtype=kernel_context.dtype),
+                    jnp.asarray(jnp.inf, dtype=kernel_context.dtype),
+                    kernel_context.zero_scalar, kernel_context.zero_scalar,
+                    jnp.asarray(False), jnp.asarray(1.0, dtype=kernel_context.dtype),
+                    jnp.asarray(False), jnp.asarray(False), jnp.asarray(False),
+                )
+                endpoint_result = _radau_run_stage_subsolve(
+                    kernel_context,
+                    physics_context,
+                    endpoint_inputs,
+                    initial_newton_state=refreshed_state,
+                    finite_initial_residual_override=first_iteration.finite_initial_residual,
                 )
                 return (
                     endpoint_result,

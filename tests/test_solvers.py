@@ -1045,23 +1045,23 @@ def test_radau_endpoint_defect_correction_requires_transport_lagged_response():
         RADAUSolver(lagged_response_correction_mode="endpoint_defect")
 
 
-def test_build_time_solver_radau_accepts_endpoint_jacobian_refresh():
+def test_build_time_solver_radau_accepts_stage_drift_jacobian_refresh():
     solver = build_time_solver(
         _base_solver_parameters(
             transport_solver_backend="radau",
             radau_rhs_mode="lagged_transport_response",
-            radau_lagged_jacobian_refresh_mode="endpoint_after_first",
+            radau_lagged_jacobian_refresh_mode="stage_drift_after_first",
             radau_lagged_jacobian_refresh_threshold=0.75,
         )
     )
     assert isinstance(solver, RADAUSolver)
-    assert solver.lagged_jacobian_refresh_mode == "endpoint_after_first"
+    assert solver.lagged_jacobian_refresh_mode == "stage_drift_after_first"
     assert solver.lagged_jacobian_refresh_threshold == pytest.approx(0.75)
 
 
-def test_radau_endpoint_jacobian_refresh_requires_transport_lagged_response():
+def test_radau_stage_drift_jacobian_refresh_requires_transport_lagged_response():
     with pytest.raises(ValueError, match="requires a lagged transport response RHS mode"):
-        RADAUSolver(lagged_jacobian_refresh_mode="endpoint_after_first")
+        RADAUSolver(lagged_jacobian_refresh_mode="stage_drift_after_first")
 
 
 def test_radau_endpoint_defect_correction_runs_on_nonlinear_lagged_rhs():
@@ -1091,7 +1091,7 @@ def test_radau_endpoint_defect_correction_runs_on_nonlinear_lagged_rhs():
     assert jnp.all(jnp.isfinite(out["final_state"]))
 
 
-def test_radau_endpoint_jacobian_refresh_runs_on_nonlinear_lagged_rhs():
+def test_radau_stage_drift_jacobian_refresh_runs_on_nonlinear_lagged_rhs():
     class QuadraticLaggedField:
         def __call__(self, _t, y):
             return y * y
@@ -1109,7 +1109,7 @@ def test_radau_endpoint_jacobian_refresh_runs_on_nonlinear_lagged_rhs():
         rtol=1.0e-5,
         atol=1.0e-8,
         rhs_mode="lagged_transport_response",
-        lagged_jacobian_refresh_mode="endpoint_after_first",
+        lagged_jacobian_refresh_mode="stage_drift_after_first",
         # Force the refresh path in this small regression test.
         lagged_jacobian_refresh_threshold=1.0e-16,
         maxiter=8,
