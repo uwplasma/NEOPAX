@@ -5301,6 +5301,7 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         *,
         center_reference_nu_hat,
         center_reference_epsi_hat,
+        weight_hi_override=None,
     ) -> NTXQuadraticPreparedCoefficientResponse:
         """Radially interpolate face NTX Taylor polynomials to cell centres.
 
@@ -5323,10 +5324,15 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         hi = jnp.clip(hi, 1, face_rho.shape[0] - 1)
         lo = hi - 1
         denominator = face_rho[hi] - face_rho[lo]
-        weight_hi = (center_rho - face_rho[lo]) / jnp.where(
-            jnp.abs(denominator) > 0.0, denominator, 1.0
-        )
-        weight_hi = jnp.clip(weight_hi, 0.0, 1.0)
+        if weight_hi_override is None:
+            weight_hi = (center_rho - face_rho[lo]) / jnp.where(
+                jnp.abs(denominator) > 0.0, denominator, 1.0
+            )
+            weight_hi = jnp.clip(weight_hi, 0.0, 1.0)
+        else:
+            weight_hi = jnp.asarray(weight_hi_override, dtype=center_rho.dtype)
+            if weight_hi.shape != center_rho.shape:
+                raise ValueError("weight_hi_override must have one value per cell centre.")
         weight_lo = 1.0 - weight_hi
 
         def _at_adjacent_faces(field):
@@ -12316,6 +12322,33 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                 face_lij = self._lij_from_quadratic_response_at_reference(
                     face_response, axis="face"
                 )
+                # These two are diagnostic probes only. They expose whether
+                # either adjacent face polynomial is locally valid at the
+                # centre before the fixed radial 50/50 blend is applied.
+                center_lo_response = NTXFullStateQuadraticPreparedCoefficientResponse(
+                    reference_state=state,
+                    coefficient_response=self._interpolate_face_quadratic_coefficients_to_centres(
+                        face_response.coefficient_response,
+                        center_reference_nu_hat=center_reference_nu_hat,
+                        center_reference_epsi_hat=center_reference_epsi_hat,
+                        weight_hi_override=jnp.zeros_like(center_reference_nu_hat[:, 0, 0]),
+                    ),
+                )
+                center_hi_response = NTXFullStateQuadraticPreparedCoefficientResponse(
+                    reference_state=state,
+                    coefficient_response=self._interpolate_face_quadratic_coefficients_to_centres(
+                        face_response.coefficient_response,
+                        center_reference_nu_hat=center_reference_nu_hat,
+                        center_reference_epsi_hat=center_reference_epsi_hat,
+                        weight_hi_override=jnp.ones_like(center_reference_nu_hat[:, 0, 0]),
+                    ),
+                )
+                lij_from_lo = self._lij_from_quadratic_response_at_reference(
+                    center_lo_response, axis="center"
+                )
+                lij_from_hi = self._lij_from_quadratic_response_at_reference(
+                    center_hi_response, axis="center"
+                )
                 face_rho = self.geometry.r_grid_half / self.geometry.a_b
                 center_rho = self.geometry.r_grid / self.geometry.a_b
                 face_hi = jnp.clip(
@@ -12368,6 +12401,13 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                     dnu_hi=jnp.max(jnp.abs(nu_center - nu_hi)),
                     depsi_lo=jnp.max(jnp.abs(epsi_center - epsi_lo)),
                     depsi_hi=jnp.max(jnp.abs(epsi_center - epsi_hi)),
+                )
+                jax.debug.print(
+                    "[NEOPAX] centre-Lij translated one-sided values: "
+                    "from_lo={from_lo:.6e} from_hi={from_hi:.6e} direct={direct:.6e}",
+                    from_lo=lij_from_lo[species, radius, row, col],
+                    from_hi=lij_from_hi[species, radius, row, col],
+                    direct=direct_lij[species, radius, row, col],
                 )
                 jax.debug.print(
                     "[NEOPAX] centre-Lij face-coefficient max-abs: "
