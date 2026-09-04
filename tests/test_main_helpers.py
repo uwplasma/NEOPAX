@@ -76,6 +76,7 @@ from NEOPAX._transport_flux_models import (
     NTXRuntimeScanTransportModel,
     _sanitize_float_delta_bar_tree,
     _ntx_runtime_scan_to_neopax_monoenergetic,
+    build_evaluated_transport_state,
     build_face_transport_state,
     build_ntx_exact_lij_runtime_transport_model,
     build_ntx_runtime_scan_channels,
@@ -405,6 +406,17 @@ def test_ntx_exact_runtime_quadratic_lagged_response_matches_live_reference(resp
         assert jnp.allclose(
             direct_full_state[f"{name}_faces"], direct[name], rtol=3.0e-6, atol=1.0e-12
         )
+
+    # The diagnostic Lij recovery used by face-coefficient interpolation must
+    # reproduce a directly prepared centre response at its own anchor.
+    recovered_direct_lij = direct_full_state_model._lij_from_quadratic_response_at_reference(
+        direct_full_state_response.center_response, axis="center"
+    )
+    evaluated_state = build_evaluated_transport_state(state, geometry)
+    live_direct_lij = direct_full_state_model._lij_center(
+        state.Er, evaluated_state.center.temperature, evaluated_state.center.density
+    )
+    assert jnp.allclose(recovered_direct_lij, live_direct_lij, rtol=3.0e-6, atol=1.0e-12)
 
     face_coefficient_model = dataclasses.replace(
         model,

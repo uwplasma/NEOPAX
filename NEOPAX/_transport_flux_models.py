@@ -5022,6 +5022,9 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
     # Hessian.  Kept separate from the established coefficient-only order-two
     # mode until its dedicated face evaluator is selected below.
     full_state_quadratic_response: bool = False
+    # Explicit diagnostic only: compares the interpolated centre Lij against
+    # a live direct-centre NTX evaluation at each response rebuild.
+    debug_center_lij_comparison: bool = False
 
     def __post_init__(self):
         order = int(self.lagged_response_taylor_order)
@@ -10733,6 +10736,52 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         )
         return jnp.swapaxes(lij_by_radius, 0, 1)
 
+    def _lij_from_quadratic_response_at_reference(
+        self,
+        response: NTXFullStateQuadraticPreparedCoefficientResponse,
+        *,
+        axis: str,
+    ):
+        """Return Lij at a quadratic response anchor without another NTX solve."""
+
+        if axis not in {"center", "face"}:
+            raise ValueError("axis must be 'center' or 'face'.")
+        state = response.reference_state
+        evaluated = build_evaluated_transport_state(
+            state,
+            self.geometry,
+            bc_density=self.bc_density,
+            bc_temperature=self.bc_temperature,
+            density_floor=self.density_floor,
+            temperature_floor=self.temperature_floor,
+        )
+        axis_state = getattr(evaluated, axis)
+        support = self._static_support()
+        channels = getattr(support, f"{axis}_channels")
+        radius_coordinates = self.geometry.r_grid if axis == "center" else self.geometry.r_grid_half
+        coefficients = response.coefficient_response.reference_coefficients
+        radius_indices = jnp.arange(axis_state.Er.shape[0], dtype=jnp.int32)
+
+        def _per_radius(radius_index):
+            drds_value = jax.lax.dynamic_index_in_dim(
+                channels.drds, radius_index, axis=0, keepdims=False
+            )
+            coefficient_scan = jax.lax.dynamic_index_in_dim(
+                coefficients, radius_index, axis=0, keepdims=False
+            )
+            return jax.vmap(
+                lambda one_species_scan: self._transport_moments_from_coefficient_scan(
+                    one_species_scan, drds_value=drds_value
+                )
+            )(coefficient_scan)
+
+        moments_by_radius = self._map_radius_axis_regularized_at_axis0(
+            _per_radius, radius_indices, radius_coordinates
+        )
+        moments = jnp.swapaxes(moments_by_radius, 0, 1)
+        v_thermal = get_v_thermal(self.species.mass, axis_state.temperature)
+        return self._batched_lij_from_transport_moments(moments, v_thermal)
+
     def _lij_faces(self, Er_faces, temperature_faces, density_faces):
         support = self._static_support()
         collisionality_kind = _collisionality_kind(self.collisionality_model)
@@ -12217,6 +12266,38 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                     center_reference_epsi_hat=center_reference_epsi_hat,
                 ),
             )
+            if self.debug_center_lij_comparison:
+                # Diagnostic only.  The first operand is recovered from the
+                # cached, interpolated coefficient response; the second is a
+                # fresh centre NTX solve at exactly the same reference state.
+                # It is deliberately outside normal runs because it adds one
+                # full direct-centre NTX evaluation at every rebuild.
+                interpolated_lij = self._lij_from_quadratic_response_at_reference(
+                    center_response, axis="center"
+                )
+                direct_lij = self._lij_center(state.Er, temperature, density)
+                abs_error = jnp.abs(interpolated_lij - direct_lij)
+                rel_error = abs_error / jnp.maximum(jnp.abs(direct_lij), 1.0e-30)
+                worst = jnp.argmax(rel_error)
+                n_radius = direct_lij.shape[1]
+                col = worst % 3
+                row = (worst // 3) % 3
+                radius = (worst // 9) % n_radius
+                species = worst // (9 * n_radius)
+                jax.debug.print(
+                    "[NEOPAX] centre-Lij face-coefficient diagnostic: "
+                    "max_rel={max_rel:.6e} max_abs={max_abs:.6e} "
+                    "species={species} radius={radius} row={row} col={col} "
+                    "interpolated={interpolated:.6e} direct={direct:.6e}",
+                    max_rel=jnp.max(rel_error),
+                    max_abs=jnp.max(abs_error),
+                    species=species,
+                    radius=radius,
+                    row=row,
+                    col=col,
+                    interpolated=interpolated_lij.reshape(-1)[worst],
+                    direct=direct_lij.reshape(-1)[worst],
+                )
         elif center_local_response:
             center_response = self._build_axis_lagged_response(
                 channels=support.center_channels,
@@ -17589,6 +17670,7 @@ def build_ntx_exact_lij_runtime_transport_model(
     ntx_exact_derivative_pullback_algebra="ntx_helper",
     ntx_exact_er_v_floor=None,
     ntx_exact_full_state_quadratic_response=False,
+    ntx_exact_debug_center_lij_comparison=False,
     lagged_response_taylor_order=1,
     ntx_exact_lij_support=None,
     preload_support=False,
@@ -17658,6 +17740,7 @@ def build_ntx_exact_lij_runtime_transport_model(
             else float(ntx_exact_er_v_floor)
         ),
         full_state_quadratic_response=bool(ntx_exact_full_state_quadratic_response),
+        debug_center_lij_comparison=bool(ntx_exact_debug_center_lij_comparison),
         collisionality_model=str(collisionality_model),
         bc_density=bc_density,
         bc_temperature=bc_temperature,
