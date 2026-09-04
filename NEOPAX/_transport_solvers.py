@@ -1724,7 +1724,12 @@ def _flat_rhs_direct_support_pullback_factory(
             t_value, state_y, *args, rhs_bar=rhs_bar_state, support=support, **kwargs
         )
 
-    return _pullback
+    # The direct hook is used solely by the black-box transport route.  Keep
+    # its database-table/geometry transpose behind its own non-inlined XLA
+    # call so Radau's per-stage reverse does not clone that local graph into
+    # every accepted-step segment.  Fixed-lagged Lij transport never calls
+    # this hook and is therefore unaffected.
+    return jax.jit(_pullback, inline=False)
 
 
 def _flat_rhs_lagged_response_all_pullback_factory(
@@ -3447,8 +3452,6 @@ class _RadauSolverConfig(TransportSolver):
     newton_fnewt_mode: str = "tol"
     newton_fnewt_override: float | None = None
     newton_transport_endpoint_tol: float = 1.0e-1
-    newton_damping_mode: str = "off"
-    newton_damping_max_backtracks: int = 3
     newton_stagnation_mode: str = "off"
     newton_stagnation_defect_budget: float = 1.0
     newton_stagnation_growth_cap: float = 1.25
@@ -3500,8 +3503,6 @@ class _RadauSolverConfig(TransportSolver):
         newton_fnewt_mode: str = "tol",
         newton_fnewt_override: float | None = None,
         newton_transport_endpoint_tol: float = 1.0e-1,
-        newton_damping_mode: str = "off",
-        newton_damping_max_backtracks: int = 3,
         newton_stagnation_mode: str = "off",
         newton_stagnation_defect_budget: float = 1.0,
         newton_stagnation_growth_cap: float = 1.25,
@@ -3633,24 +3634,6 @@ class _RadauSolverConfig(TransportSolver):
             self,
             "newton_transport_endpoint_tol",
             float(newton_transport_endpoint_tol),
-        )
-        damping_mode_norm = str(newton_damping_mode).strip().lower()
-        damping_mode_aliases = {
-            "none": "off",
-            "disabled": "off",
-            "backtrack": "stage_residual_backtrack",
-            "stage": "stage_residual_backtrack",
-        }
-        damping_mode_norm = damping_mode_aliases.get(damping_mode_norm, damping_mode_norm)
-        if damping_mode_norm not in {"off", "stage_residual_backtrack"}:
-            raise ValueError(
-                "radau_newton_damping_mode must be one of: off, stage_residual_backtrack"
-            )
-        if int(newton_damping_max_backtracks) < 0:
-            raise ValueError("radau_newton_damping_max_backtracks must be nonnegative")
-        object.__setattr__(self, "newton_damping_mode", damping_mode_norm)
-        object.__setattr__(
-            self, "newton_damping_max_backtracks", int(newton_damping_max_backtracks)
         )
         stagnation_mode_norm = str(newton_stagnation_mode).strip().lower()
         stagnation_mode_aliases = {
@@ -4416,8 +4399,6 @@ class _RadauAcceptedStepKernelContext:
     radau_complex_blocks: Any
     predictor_fnewt: Any
     newton_convergence_tol: Any
-    newton_damping_mode: str
-    newton_damping_max_backtracks: Any
     maxiter: Any
     tol: Any
     error_scale_mode: Any
@@ -13866,14 +13847,12 @@ def _radau_run_stage_subsolve(
             inputs,
             z_cur,
         )
-        raw_delta = _radau_stage_subsolve_linear_solve(
+        delta = _radau_stage_subsolve_linear_solve(
             kernel_context,
             inputs,
             -residual_cur,
         )
-        raw_delta = jnp.where(
-            jnp.all(jnp.isfinite(raw_delta)), raw_delta, jnp.zeros_like(raw_delta)
-        )
+        delta = jnp.where(jnp.all(jnp.isfinite(delta)), delta, jnp.zeros_like(delta))
         current_residual_norm = _radau_residual_norm(kernel_context, residual_cur)
         current_stage_residual_defect_norm = _radau_stage_residual_defect_norm(
             kernel_context,
@@ -13881,72 +13860,6 @@ def _radau_run_stage_subsolve(
             stage_residual=residual_cur,
             endpoint_scale=endpoint_newton_scale,
         )
-        line_search_lambda = jnp.asarray(1.0, dtype=kernel_context.dtype)
-        line_search_trials = jnp.asarray(1, dtype=jnp.int32)
-        line_search_accepted = jnp.asarray(True)
-        if kernel_context.newton_damping_mode == "stage_residual_backtrack":
-            # The factorization remains the same frozen chord factorization.
-            # Only the length of its correction is safeguarded, using the
-            # full non-cancelling stage residual as the merit function.
-            def _line_search_cond(search_state):
-                trial_index, _delta, _lambda, _accepted, _trials = search_state
-                return jnp.logical_and(
-                    jnp.logical_not(_accepted),
-                    trial_index
-                    <= jnp.asarray(kernel_context.newton_damping_max_backtracks, dtype=jnp.int32),
-                )
-
-            def _line_search_body(search_state):
-                trial_index, best_delta, best_lambda, accepted, _trials = search_state
-                trial_lambda = jnp.asarray(0.5, dtype=kernel_context.dtype) ** trial_index.astype(
-                    kernel_context.dtype
-                )
-                trial_delta = trial_lambda * raw_delta
-                trial_residual = _radau_stage_subsolve_residual(
-                    kernel_context, physics_context, inputs, z_cur + trial_delta
-                )
-                trial_defect = _radau_stage_residual_defect_norm(
-                    kernel_context,
-                    h_value=inputs.h_value,
-                    stage_residual=trial_residual,
-                    endpoint_scale=endpoint_newton_scale,
-                )
-                decreases = jnp.logical_and(
-                    jnp.all(jnp.isfinite(trial_residual)),
-                    # Equality matters for an already-converged predictor:
-                    # its Newton correction is exactly zero, so the residual
-                    # cannot decrease further.  Treat that as a valid full
-                    # step rather than manufacturing a line-search failure.
-                    trial_defect <= current_stage_residual_defect_norm,
-                )
-                take_trial = jnp.logical_and(jnp.logical_not(accepted), decreases)
-                return (
-                    trial_index + jnp.asarray(1, dtype=jnp.int32),
-                    jnp.where(take_trial, trial_delta, best_delta),
-                    jnp.where(take_trial, trial_lambda, best_lambda),
-                    jnp.logical_or(accepted, decreases),
-                    trial_index + jnp.asarray(1, dtype=jnp.int32),
-                )
-
-            (
-                _line_search_index,
-                delta,
-                line_search_lambda,
-                line_search_accepted,
-                line_search_trials,
-            ) = jax.lax.while_loop(
-                _line_search_cond,
-                _line_search_body,
-                (
-                    jnp.asarray(0, dtype=jnp.int32),
-                    jnp.zeros_like(raw_delta),
-                    jnp.asarray(0.0, dtype=kernel_context.dtype),
-                    jnp.asarray(False),
-                    jnp.asarray(0, dtype=jnp.int32),
-                ),
-            )
-        else:
-            delta = raw_delta
         z_next = z_cur + delta
         current_delta_norm = jnp.linalg.norm(delta)
         stage_newton_norm = _radau_correction_norm(kernel_context, delta)
@@ -13980,7 +13893,6 @@ def _radau_run_stage_subsolve(
             iter_idx >= 1,
             current_residual_norm > residual_norm * kernel_context.residual_blowup_factor,
         )
-        line_search_failed = jnp.logical_not(line_search_accepted)
         nonfinite_state = jnp.logical_not(
             jnp.logical_and(
                 jnp.logical_and(jnp.all(jnp.isfinite(delta)), jnp.isfinite(current_residual_norm)),
@@ -14041,21 +13953,10 @@ def _radau_run_stage_subsolve(
             diverged,
             jnp.logical_or(
                 slow_reject,
-                jnp.logical_or(
-                    residual_blowup,
-                    jnp.logical_or(nonfinite_state, line_search_failed),
-                ),
+                jnp.logical_or(residual_blowup, nonfinite_state),
             ),
         )
         if kernel_context.debug_newton_trace:
-            if kernel_context.newton_damping_mode == "stage_residual_backtrack":
-                jax.debug.print(
-                    "[radau-solver] line_search lambda={line_lambda:.6e} trials={trials} accepted={accepted} base_stage_defect={base_defect:.6e}",
-                    line_lambda=line_search_lambda,
-                    trials=line_search_trials,
-                    accepted=line_search_accepted,
-                    base_defect=current_stage_residual_defect_norm,
-                )
             jax.debug.print(
                 "[radau-solver] iter={iter} delta_norm={delta_norm:.6e} residual_norm={residual_norm:.6e} stage_residual_defect={stage_residual_defect:.6e} newton_metric={newton_metric:.6e} newton_tol={newton_tol:.6e} theta={theta:.6e} slow={slow} blowup={blowup} nonfinite={nonfinite} diverged={diverged}",
                 iter=iter_idx + 1,
@@ -20083,10 +19984,6 @@ def _build_prepared_radau_accepted_rollout(
         radau_complex_blocks=radau_complex_blocks,
         predictor_fnewt=predictor_fnewt,
         newton_convergence_tol=newton_convergence_tol,
-        newton_damping_mode=str(getattr(solver, "newton_damping_mode", "off")).strip().lower(),
-        newton_damping_max_backtracks=int(
-            getattr(solver, "newton_damping_max_backtracks", 3)
-        ),
         maxiter=int(solver.maxiter),
         tol=jnp.asarray(solver.tol, dtype=dtype),
         error_scale_mode=error_scale_mode,
@@ -20827,12 +20724,6 @@ class RADAUSolver(_RadauSolverConfig):
             radau_complex_blocks=radau_complex_blocks,
             predictor_fnewt=predictor_fnewt,
             newton_convergence_tol=newton_convergence_tol,
-            newton_damping_mode=str(
-                getattr(self, "newton_damping_mode", "off")
-            ).strip().lower(),
-            newton_damping_max_backtracks=int(
-                getattr(self, "newton_damping_max_backtracks", 3)
-            ),
             maxiter=int(self.maxiter),
             tol=jnp.asarray(self.tol, dtype=dtype),
             error_scale_mode=error_scale_mode,
@@ -26399,10 +26290,6 @@ def build_time_solver(solver_parameters: Any, solver_override: Any = None) -> Tr
             newton_fnewt_override=_cfg_get("radau_newton_fnewt_override"),
             newton_transport_endpoint_tol=float(
                 _cfg_get("radau_newton_transport_endpoint_tol", 1.0e-1)
-            ),
-            newton_damping_mode=str(_cfg_get("radau_newton_damping_mode", "off")),
-            newton_damping_max_backtracks=int(
-                _cfg_get("radau_newton_damping_max_backtracks", 3)
             ),
             newton_stagnation_mode=str(_cfg_get("radau_newton_stagnation_mode", "off")),
             newton_stagnation_defect_budget=float(

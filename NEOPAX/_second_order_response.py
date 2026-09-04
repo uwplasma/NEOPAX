@@ -32,6 +32,196 @@ class DirectionalSecondOrderJet:
     second: jax.Array
 
 
+@jax.tree_util.register_dataclass
+@dataclasses.dataclass(frozen=True, eq=False)
+class MixedDirectionalSecondOrderJet:
+    """Two first directions and their explicit mixed second derivative.
+
+    ``anchor`` is ``Df(y0)[delta]``, ``direction`` is ``Df(y0)[v]``, and
+    ``mixed`` is ``D2f(y0)[delta, v]``.  This is the compact quantity needed
+    for the tangent of a quadratic response at a displaced Radau stage:
+    ``Df(y0)[v] + D2f(y0)[delta, v]``.  It deliberately carries no dense
+    transport-state Hessian and never invokes generic JAX differentiation.
+    """
+
+    value: jax.Array
+    anchor: jax.Array
+    direction: jax.Array
+    mixed: jax.Array
+
+
+def mixed_constant(value) -> MixedDirectionalSecondOrderJet:
+    value = jnp.asarray(value)
+    zeros = jnp.zeros_like(value)
+    return MixedDirectionalSecondOrderJet(value, zeros, zeros, zeros)
+
+
+def mixed_seed(value, anchor, direction, mixed=None) -> MixedDirectionalSecondOrderJet:
+    value = jnp.asarray(value)
+    anchor = jnp.asarray(anchor, dtype=value.dtype)
+    direction = jnp.asarray(direction, dtype=value.dtype)
+    mixed = jnp.zeros_like(value) if mixed is None else jnp.asarray(mixed, dtype=value.dtype)
+    return MixedDirectionalSecondOrderJet(value, anchor, direction, mixed)
+
+
+def _as_mixed(value) -> MixedDirectionalSecondOrderJet:
+    return value if isinstance(value, MixedDirectionalSecondOrderJet) else mixed_constant(value)
+
+
+def mixed_add(left, right) -> MixedDirectionalSecondOrderJet:
+    left, right = _as_mixed(left), _as_mixed(right)
+    return MixedDirectionalSecondOrderJet(
+        left.value + right.value,
+        left.anchor + right.anchor,
+        left.direction + right.direction,
+        left.mixed + right.mixed,
+    )
+
+
+def mixed_negate(value) -> MixedDirectionalSecondOrderJet:
+    value = _as_mixed(value)
+    return MixedDirectionalSecondOrderJet(-value.value, -value.anchor, -value.direction, -value.mixed)
+
+
+def mixed_subtract(left, right) -> MixedDirectionalSecondOrderJet:
+    return mixed_add(left, mixed_negate(right))
+
+
+def mixed_multiply(left, right) -> MixedDirectionalSecondOrderJet:
+    left, right = _as_mixed(left), _as_mixed(right)
+    return MixedDirectionalSecondOrderJet(
+        left.value * right.value,
+        left.anchor * right.value + left.value * right.anchor,
+        left.direction * right.value + left.value * right.direction,
+        left.mixed * right.value
+        + left.anchor * right.direction
+        + left.direction * right.anchor
+        + left.value * right.mixed,
+    )
+
+
+def mixed_unary_power(value, exponent: float) -> MixedDirectionalSecondOrderJet:
+    value = _as_mixed(value)
+    exponent_value = jnp.asarray(exponent, dtype=value.value.dtype)
+    result = value.value**exponent_value
+    slope = exponent_value * value.value ** (exponent_value - 1.0)
+    curvature = exponent_value * (exponent_value - 1.0) * value.value ** (exponent_value - 2.0)
+    return MixedDirectionalSecondOrderJet(
+        result,
+        slope * value.anchor,
+        slope * value.direction,
+        slope * value.mixed + curvature * value.anchor * value.direction,
+    )
+
+
+def mixed_reciprocal(value) -> MixedDirectionalSecondOrderJet:
+    return mixed_unary_power(value, -1.0)
+
+
+def mixed_divide(left, right) -> MixedDirectionalSecondOrderJet:
+    return mixed_multiply(left, mixed_reciprocal(right))
+
+
+def mixed_exp(value) -> MixedDirectionalSecondOrderJet:
+    value = _as_mixed(value)
+    result = jnp.exp(value.value)
+    return MixedDirectionalSecondOrderJet(
+        result,
+        result * value.anchor,
+        result * value.direction,
+        result * (value.mixed + value.anchor * value.direction),
+    )
+
+
+def mixed_log(value) -> MixedDirectionalSecondOrderJet:
+    value = _as_mixed(value)
+    reciprocal_value = 1.0 / value.value
+    return MixedDirectionalSecondOrderJet(
+        jnp.log(value.value),
+        reciprocal_value * value.anchor,
+        reciprocal_value * value.direction,
+        reciprocal_value * value.mixed - reciprocal_value**2 * value.anchor * value.direction,
+    )
+
+
+def mixed_erf(value) -> MixedDirectionalSecondOrderJet:
+    value = _as_mixed(value)
+    slope = 2.0 / jnp.sqrt(jnp.pi) * jnp.exp(-value.value**2)
+    curvature = -2.0 * value.value * slope
+    return MixedDirectionalSecondOrderJet(
+        jsp.special.erf(value.value),
+        slope * value.anchor,
+        slope * value.direction,
+        slope * value.mixed + curvature * value.anchor * value.direction,
+    )
+
+
+def mixed_select_axis(value, index: int, axis: int = 0) -> MixedDirectionalSecondOrderJet:
+    value = _as_mixed(value)
+    return MixedDirectionalSecondOrderJet(
+        jnp.take(value.value, index, axis=axis),
+        jnp.take(value.anchor, index, axis=axis),
+        jnp.take(value.direction, index, axis=axis),
+        jnp.take(value.mixed, index, axis=axis),
+    )
+
+
+def mixed_take(value, indices, axis: int = 0) -> MixedDirectionalSecondOrderJet:
+    value = _as_mixed(value)
+    return MixedDirectionalSecondOrderJet(
+        jnp.take(value.value, indices, axis=axis),
+        jnp.take(value.anchor, indices, axis=axis),
+        jnp.take(value.direction, indices, axis=axis),
+        jnp.take(value.mixed, indices, axis=axis),
+    )
+
+
+def mixed_sum_axis(value, axis=None, *, keepdims: bool = False) -> MixedDirectionalSecondOrderJet:
+    value = _as_mixed(value)
+    return MixedDirectionalSecondOrderJet(
+        jnp.sum(value.value, axis=axis, keepdims=keepdims),
+        jnp.sum(value.anchor, axis=axis, keepdims=keepdims),
+        jnp.sum(value.direction, axis=axis, keepdims=keepdims),
+        jnp.sum(value.mixed, axis=axis, keepdims=keepdims),
+    )
+
+
+def mixed_stack(values, axis: int = 0) -> MixedDirectionalSecondOrderJet:
+    values = tuple(_as_mixed(value) for value in values)
+    return MixedDirectionalSecondOrderJet(
+        jnp.stack(tuple(value.value for value in values), axis=axis),
+        jnp.stack(tuple(value.anchor for value in values), axis=axis),
+        jnp.stack(tuple(value.direction for value in values), axis=axis),
+        jnp.stack(tuple(value.mixed for value in values), axis=axis),
+    )
+
+
+def mixed_maximum_with_constant_floor(value, floor) -> MixedDirectionalSecondOrderJet:
+    value = _as_mixed(value)
+    floor_value = jnp.asarray(floor, dtype=value.value.dtype)
+    active = value.value > floor_value
+    return MixedDirectionalSecondOrderJet(
+        jnp.maximum(value.value, floor_value),
+        jnp.where(active, value.anchor, jnp.zeros_like(value.anchor)),
+        jnp.where(active, value.direction, jnp.zeros_like(value.direction)),
+        jnp.where(active, value.mixed, jnp.zeros_like(value.mixed)),
+    )
+
+
+def mixed_absolute_with_fixed_anchor_sign(value) -> MixedDirectionalSecondOrderJet:
+    value = _as_mixed(value)
+    sign = jnp.where(value.value < 0.0, -1.0, 1.0)
+    return MixedDirectionalSecondOrderJet(
+        jnp.abs(value.value), sign * value.anchor, sign * value.direction, sign * value.mixed
+    )
+
+
+def mixed_tangent(value) -> jax.Array:
+    """Return the quadratic-model tangent at the displaced stage."""
+    value = _as_mixed(value)
+    return value.direction + value.mixed
+
+
 def constant(value) -> DirectionalSecondOrderJet:
     """Return a response-independent value."""
     value = jnp.asarray(value)
@@ -259,6 +449,54 @@ def compose_ntx_coefficient_quadratic(
             + coefficient_nunu * nu_hat.first[..., None] ** 2
             + 2.0 * coefficient_nuepsi * nu_hat.first[..., None] * epsi_hat.first[..., None]
             + coefficient_epsiepsi * epsi_hat.first[..., None] ** 2
+        ),
+    )
+
+
+def compose_ntx_coefficient_quadratic_mixed(
+    reference_coefficients,
+    dcoefficients_d_nu_hat,
+    dcoefficients_d_epsi_hat,
+    d2coefficients_d_nu_hat2,
+    d2coefficients_d_nu_hat_d_epsi_hat,
+    d2coefficients_d_epsi_hat2,
+    nu_hat,
+    epsi_hat,
+) -> MixedDirectionalSecondOrderJet:
+    """Mixed tangent of the factorized NTX quadratic coefficient response.
+
+    The returned ``direction + mixed`` is exactly the derivative with respect
+    to the second direction of the anchored quadratic polynomial evaluated at
+    the first-direction displacement.  It is not a nested JVP through NTX.
+    """
+    nu_hat = _as_mixed(nu_hat)
+    epsi_hat = _as_mixed(epsi_hat)
+    coefficient0 = jnp.asarray(reference_coefficients)
+    coefficient_nu = jnp.asarray(dcoefficients_d_nu_hat, dtype=coefficient0.dtype)
+    coefficient_epsi = jnp.asarray(dcoefficients_d_epsi_hat, dtype=coefficient0.dtype)
+    coefficient_nunu = jnp.asarray(d2coefficients_d_nu_hat2, dtype=coefficient0.dtype)
+    coefficient_nuepsi = jnp.asarray(d2coefficients_d_nu_hat_d_epsi_hat, dtype=coefficient0.dtype)
+    coefficient_epsiepsi = jnp.asarray(d2coefficients_d_epsi_hat2, dtype=coefficient0.dtype)
+    return MixedDirectionalSecondOrderJet(
+        value=coefficient0,
+        anchor=(
+            coefficient_nu * nu_hat.anchor[..., None]
+            + coefficient_epsi * epsi_hat.anchor[..., None]
+        ),
+        direction=(
+            coefficient_nu * nu_hat.direction[..., None]
+            + coefficient_epsi * epsi_hat.direction[..., None]
+        ),
+        mixed=(
+            coefficient_nu * nu_hat.mixed[..., None]
+            + coefficient_epsi * epsi_hat.mixed[..., None]
+            + coefficient_nunu * nu_hat.anchor[..., None] * nu_hat.direction[..., None]
+            + coefficient_nuepsi
+            * (
+                nu_hat.anchor[..., None] * epsi_hat.direction[..., None]
+                + epsi_hat.anchor[..., None] * nu_hat.direction[..., None]
+            )
+            + coefficient_epsiepsi * epsi_hat.anchor[..., None] * epsi_hat.direction[..., None]
         ),
     )
 

@@ -431,6 +431,24 @@ class TransportFluxModelBase(abc.ABC):
                         tangent_flux,
                 )
 
+        def evaluate_with_lagged_response_tangent(
+                self, state, state_direction, lagged_response, **kwargs
+        ):
+                """Optional forward tangent of a cached response.
+
+                Ordinary linear-response models use their established JAX
+                forward rule here.  Realtime quadratic NTX overrides this
+                method with its explicit factorized-Hessian implementation;
+                the normal value-only solver never calls this API.
+                """
+                return jax.jvp(
+                        lambda state_value: self.evaluate_with_lagged_response(
+                                state_value, lagged_response, **kwargs
+                        ),
+                        (state,),
+                        (state_direction,),
+                )[1]
+
         def pullback_build_lagged_response(self, state, lagged_response_bar, **kwargs):
                 _, pullback = jax.vjp(
                         lambda state_value: self.build_lagged_response(state_value, **kwargs),
@@ -2343,6 +2361,31 @@ class CombinedTransportFluxModel(TransportFluxModelBase):
                 name: out[f"{name}_faces"] for name in ("Gamma", "Q", "Upar")
             }
         return self._apply_center_flux_mode(out, lagged_face_fluxes)
+
+    def evaluate_with_lagged_response_tangent(self, state, state_direction, lagged_response, **kwargs):
+        """Directional tangent of the combined cached flux response.
+
+        For the intended quadratic-realtime-NTX route, the neoclassical
+        contribution is quadratic and the analytical turbulent/classical
+        cached contributions are linear (or absent).  Centered polarization
+        is consequently exact for that combined cached response and keeps the
+        normal value combiner as the single source of truth.
+        """
+        plus_state = dataclasses.replace(
+            state,
+            density=state.density + state_direction.density,
+            pressure=state.pressure + state_direction.pressure,
+            Er=state.Er + state_direction.Er,
+        )
+        minus_state = dataclasses.replace(
+            state,
+            density=state.density - state_direction.density,
+            pressure=state.pressure - state_direction.pressure,
+            Er=state.Er - state_direction.Er,
+        )
+        plus = self.evaluate_with_lagged_response(plus_state, lagged_response, **kwargs)
+        minus = self.evaluate_with_lagged_response(minus_state, lagged_response, **kwargs)
+        return jax.tree_util.tree_map(lambda left, right: 0.5 * (left - right), plus, minus)
 
     def pullback_evaluate_with_lagged_response(self, state, lagged_response, flux_bar, **kwargs):
         flux_bar = self._apply_center_flux_mode_pullback(flux_bar)
@@ -15003,6 +15046,65 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             for value in (gamma, q, upar)
         )
         return {"Gamma_faces": _jet_evaluate(gamma), "Q_faces": _jet_evaluate(q), "Upar_faces": _jet_evaluate(upar)}
+
+    def evaluate_full_state_quadratic_face_tangent_with_lagged_response(
+        self,
+        state: TransportState,
+        state_direction: TransportState,
+        lagged_response: NTXExactLijLaggedResponse,
+    ) -> dict[str, jax.Array]:
+        """Exact directional tangent of the cached quadratic NTX face model.
+
+        The full-state response is an explicit quadratic polynomial in the
+        transport-state displacement.  Its centred polarization is therefore
+        *exact*, not a finite-difference approximation:
+
+        ``(F_Q(y + v) - F_Q(y - v)) / 2 = J_Q(y) v``.
+
+        Each side uses the existing written second-order jet composition and
+        cached NTX coefficient Hessian; no generic JVP and no NTX rebuild are
+        involved.  The equation-level mixed tangent will consume this flux
+        primitive when constructing the opt-in stage Newton operator.
+        """
+        response = lagged_response.face_response
+        if not isinstance(response, NTXFullStateQuadraticPreparedCoefficientResponse):
+            raise NotImplementedError(
+                "Quadratic face tangents require the full_state_quadratic_response payload."
+            )
+        plus_state = dataclasses.replace(
+            state,
+            density=state.density + state_direction.density,
+            pressure=state.pressure + state_direction.pressure,
+            Er=state.Er + state_direction.Er,
+        )
+        minus_state = dataclasses.replace(
+            state,
+            density=state.density - state_direction.density,
+            pressure=state.pressure - state_direction.pressure,
+            Er=state.Er - state_direction.Er,
+        )
+        plus = self._evaluate_full_state_quadratic_face_response(plus_state, response)
+        minus = self._evaluate_full_state_quadratic_face_response(minus_state, response)
+        return jax.tree_util.tree_map(lambda left, right: 0.5 * (left - right), plus, minus)
+
+    def evaluate_with_lagged_response_tangent(
+        self,
+        state: TransportState,
+        state_direction: TransportState,
+        lagged_response: NTXExactLijLaggedResponse,
+        **kwargs,
+    ) -> dict[str, jax.Array]:
+        """Custom tangent hook used only by the opt-in quadratic Newton path."""
+        del kwargs
+        if isinstance(lagged_response.face_response, NTXFullStateQuadraticPreparedCoefficientResponse):
+            if lagged_response.center_response is not None:
+                raise NotImplementedError("full-state quadratic response is face-only.")
+            return self.evaluate_full_state_quadratic_face_tangent_with_lagged_response(
+                state, state_direction, lagged_response
+            )
+        return super().evaluate_with_lagged_response_tangent(
+            state, state_direction, lagged_response
+        )
 
     def evaluate_with_lagged_response(self, state, lagged_response, **kwargs):
         del kwargs

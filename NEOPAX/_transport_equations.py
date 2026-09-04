@@ -2858,6 +2858,56 @@ class ComposedEquationSystem:
         del t, runtime
         return self._evaluate_state(state, lagged_response=lagged_response)
 
+    def evaluate_with_lagged_response_tangent(
+        self, t, state, state_direction, runtime, lagged_response
+    ):
+        """RHS tangent for the opt-in quadratic cached-response Newton path.
+
+        The expensive neoclassical part is supplied by the shared flux model's
+        explicit quadratic-response tangent.  JAX forward mode below is used
+        only for local projection and transport-equation assembly with those
+        flux values as explicit inputs; it never differentiates through an
+        NTX solve or response builder.
+        """
+        del t, runtime
+
+        def _working_state_only(state_value):
+            return self._prepare_working_state(state_value)[0]
+
+        working_state, working_direction = jax.jvp(
+            _working_state_only, (state,), (state_direction,)
+        )
+        _working_reference, eidx = self._prepare_working_state(state)
+        shared_fluxes = self.shared_flux_model.evaluate_with_lagged_response(
+            working_state,
+            lagged_response.flux_response,
+            **self._shared_flux_bc_kwargs(),
+        )
+        tangent_fn = getattr(
+            self.shared_flux_model, "evaluate_with_lagged_response_tangent", None
+        )
+        if not callable(tangent_fn):
+            raise NotImplementedError(
+                "The active shared flux model does not expose a cached-response tangent."
+            )
+        shared_flux_direction = tangent_fn(
+            working_state,
+            working_direction,
+            lagged_response.flux_response,
+            **self._shared_flux_bc_kwargs(),
+        )
+
+        def _assemble(working_state_value, flux_value):
+            return self._evaluate_with_shared_fluxes_from_working_state(
+                working_state_value, eidx, state, flux_value
+            )
+
+        return jax.jvp(
+            _assemble,
+            (working_state, shared_fluxes),
+            (working_direction, shared_flux_direction),
+        )[1]
+
     def _evaluate_with_shared_fluxes_from_working_state(self, working_state, eidx, state_reference, shared_fluxes):
         from ._state import TransportState
         density_eq, temperature_eq, er_eq = self._resolve_equations()

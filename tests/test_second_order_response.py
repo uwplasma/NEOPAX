@@ -3,11 +3,15 @@ from types import SimpleNamespace
 
 from NEOPAX._second_order_response import (
     DirectionalSecondOrderJet,
+    compose_ntx_coefficient_quadratic_mixed,
     compose_ntx_coefficient_quadratic,
     divide,
     evaluate,
     maximum_with_constant_floor,
     multiply,
+    mixed_multiply,
+    mixed_seed,
+    mixed_tangent,
     seed,
 )
 from NEOPAX._boundary_conditions import BoundaryConditionModel
@@ -31,6 +35,16 @@ def test_directional_second_order_jet_product_and_reciprocal_are_exact_to_second
     basis = seed(value, delta)
     response = divide(multiply(basis, basis), basis)
     assert jnp.allclose(evaluate(response), value + delta, rtol=1.0e-12, atol=1.0e-12)
+
+
+def test_mixed_jet_is_the_exact_tangent_of_a_quadratic_product_at_a_displacement():
+    # f(x) = x^2; Df(x0 + delta)[v] = 2 (x0 + delta) v.
+    value = jnp.asarray([2.0])
+    delta = jnp.asarray([0.3])
+    direction = jnp.asarray([-0.4])
+    jet = mixed_seed(value, delta, direction)
+    response = mixed_multiply(jet, jet)
+    assert jnp.allclose(mixed_tangent(response), 2.0 * (value + delta) * direction)
 
 
 def test_directional_second_order_jet_reciprocal_has_cubic_remainder():
@@ -62,6 +76,24 @@ def test_ntx_coefficient_composition_includes_coordinate_chain_terms():
     expected_second = 11.0 * 0.3 + 13.0 * 0.5 + 17.0 * 0.2**2 + 2.0 * 19.0 * 0.2 * -0.4 + 23.0 * (-0.4)**2
     assert jnp.allclose(response.first, jnp.asarray([[expected_first]]))
     assert jnp.allclose(response.second, jnp.asarray([[expected_second]]))
+
+
+def test_mixed_ntx_quadratic_composition_has_the_expected_stage_tangent():
+    nu = mixed_seed(jnp.asarray([1.0]), jnp.asarray([0.2]), jnp.asarray([0.3]))
+    epsi = mixed_seed(jnp.asarray([2.0]), jnp.asarray([-0.4]), jnp.asarray([0.5]))
+    response = compose_ntx_coefficient_quadratic_mixed(
+        reference_coefficients=jnp.asarray([[7.0]]),
+        dcoefficients_d_nu_hat=jnp.asarray([[11.0]]),
+        dcoefficients_d_epsi_hat=jnp.asarray([[13.0]]),
+        d2coefficients_d_nu_hat2=jnp.asarray([[17.0]]),
+        d2coefficients_d_nu_hat_d_epsi_hat=jnp.asarray([[19.0]]),
+        d2coefficients_d_epsi_hat2=jnp.asarray([[23.0]]),
+        nu_hat=nu,
+        epsi_hat=epsi,
+    )
+    # D C[v] + D2 C[delta, v], with zero coordinate mixed curvature.
+    expected = 11.0 * 0.3 + 13.0 * 0.5 + 17.0 * 0.2 * 0.3 + 19.0 * (0.2 * 0.5 + -0.4 * 0.3) + 23.0 * -0.4 * 0.5
+    assert jnp.allclose(mixed_tangent(response), jnp.asarray([[expected]]))
 
 
 def test_floor_jet_freezes_clamped_anchor_branch():

@@ -1064,52 +1064,6 @@ def test_radau_stage_drift_jacobian_refresh_requires_transport_lagged_response()
         RADAUSolver(lagged_jacobian_refresh_mode="stage_drift_after_first")
 
 
-def test_build_time_solver_radau_accepts_stage_residual_backtracking():
-    solver = build_time_solver(
-        _base_solver_parameters(
-            transport_solver_backend="radau",
-            radau_newton_damping_mode="stage_residual_backtrack",
-            radau_newton_damping_max_backtracks=4,
-        )
-    )
-    assert isinstance(solver, RADAUSolver)
-    assert solver.newton_damping_mode == "stage_residual_backtrack"
-    assert solver.newton_damping_max_backtracks == 4
-
-
-def test_radau_stage_residual_backtracking_rejects_invalid_limit():
-    with pytest.raises(ValueError, match="radau_newton_damping_max_backtracks"):
-        RADAUSolver(newton_damping_max_backtracks=-1)
-
-
-def test_radau_stage_residual_backtracking_runs_on_nonlinear_lagged_rhs():
-    class QuadraticLaggedField:
-        def __call__(self, _t, y):
-            return y * y
-
-        def build_lagged_response(self, y):
-            return y
-
-        def evaluate_with_lagged_response(self, _t, y, *, lagged_response):
-            return lagged_response * lagged_response + 2.0 * lagged_response * (y - lagged_response)
-
-    solver = RADAUSolver(
-        t0=0.0,
-        t1=0.05,
-        dt=0.01,
-        rtol=1.0e-5,
-        atol=1.0e-8,
-        rhs_mode="lagged_transport_response",
-        newton_damping_mode="stage_residual_backtrack",
-        newton_damping_max_backtracks=3,
-        maxiter=8,
-        max_steps=32,
-    )
-    out = solver.solve(jnp.asarray([0.1]), QuadraticLaggedField().__call__)
-    assert int(out["n_steps"]) > 0
-    assert jnp.all(jnp.isfinite(out["final_state"]))
-
-
 def test_radau_endpoint_defect_correction_runs_on_nonlinear_lagged_rhs():
     class QuadraticLaggedField:
         def __call__(self, _t, y):

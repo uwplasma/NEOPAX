@@ -4414,7 +4414,9 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
                 final_objective_state_elapsed += time.perf_counter() - component_start
         objective_values_rows.append(objective_value)
         final_y_bar_rows.append(final_y_bar)
-        if combined_geometry_payload and "ntx_support" in support_payload:
+        if combined_geometry_payload and (
+            "ntx_support" in support_payload or "database" in support_payload
+        ):
             if final_objective_cotangent_mode == "grouped_vjp":
                 geometry_objective_bar = grouped_geometry_bars[objective_i]
             else:
@@ -4445,12 +4447,18 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
                 if phase_timing_diagnostics:
                     geometry_objective_bar = jax.block_until_ready(geometry_objective_bar)
                     final_objective_geometry_elapsed += time.perf_counter() - component_start
-            objective_payload_bar_rows.append(
-                {
-                    "geometry": _sanitize_float_delta_bar_tree(geometry, geometry_objective_bar),
-                    "ntx_support": zero_payload_bar["ntx_support"],
-                }
+            # Ordinary terminal objectives read only the final transport
+            # state and runtime geometry.  In particular they do not depend
+            # directly on the recorded database, scan channels, or scan
+            # surfaces.  Keeping this as a geometry-only VJP is the database
+            # analogue of the established exact-NTX boundary: differentiating
+            # the whole recorded payload here would trace the large table
+            # leaves once per objective and defeat the one-time scan fold.
+            objective_payload_bar = dict(zero_payload_bar)
+            objective_payload_bar["geometry"] = _sanitize_float_delta_bar_tree(
+                geometry, geometry_objective_bar
             )
+            objective_payload_bar_rows.append(objective_payload_bar)
         elif combined_geometry_payload:
             if final_objective_cotangent_mode == "grouped_vjp":
                 raise NotImplementedError(
