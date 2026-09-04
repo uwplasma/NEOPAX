@@ -3627,6 +3627,31 @@ def prepare_realtime_geometry_support_segment_core_setup(
         support_payload = realtime_geometry_reverse_support_payload_for_runtime(
             baseline_runtime
         )
+        rhs_transpose_mode = str(
+            getattr(args, "reverse_rhs_transpose_mode", "generic")
+        ).strip().lower()
+        if rhs_transpose_mode in {
+            "explicit_database",
+            "database",
+            "explicit_black_box_database",
+        }:
+            centre_mode = str(
+                getattr(baseline_runtime.models.flux, "center_flux_mode", "")
+            ).strip().lower()
+            if centre_mode != "direct":
+                raise ValueError(
+                    "reverse_rhs_transpose_mode='explicit_database' requires "
+                    "the black-box database forward contract "
+                    "center_flux_mode='direct'; got "
+                    f"{centre_mode!r}."
+                )
+            if "database" not in support_payload:
+                raise ValueError(
+                    "reverse_rhs_transpose_mode='explicit_database' requires "
+                    "a recorded runtime database support payload. Enable "
+                    "--ntx-scan-coefficient-reverse-mode structured and "
+                    "--ntx-scan-record-primal."
+                )
     else:
         raise NotImplementedError(
             "Realtime geometry segmented reverse currently supports "
