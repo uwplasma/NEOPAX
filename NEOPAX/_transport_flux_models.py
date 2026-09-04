@@ -12411,6 +12411,19 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                 nu_hi = face_response.coefficient_response.reference_nu_hat[face_hi, species]
                 epsi_lo = face_response.coefficient_response.reference_epsi_hat[face_lo, species]
                 epsi_hi = face_response.coefficient_response.reference_epsi_hat[face_hi, species]
+                native_nu_scale = jnp.maximum(jnp.abs(nu_hi - nu_lo), 1.0e-30)
+                native_epsi_scale = jnp.maximum(jnp.abs(epsi_hi - epsi_lo), 1.0e-30)
+                native_distance_lo2 = (
+                    ((nu_center - nu_lo) / native_nu_scale) ** 2
+                    + ((epsi_center - epsi_lo) / native_epsi_scale) ** 2
+                )
+                native_distance_hi2 = (
+                    ((nu_center - nu_hi) / native_nu_scale) ** 2
+                    + ((epsi_center - epsi_hi) / native_epsi_scale) ** 2
+                )
+                native_inverse_lo = 1.0 / jnp.maximum(native_distance_lo2, 1.0e-24)
+                native_inverse_hi = 1.0 / jnp.maximum(native_distance_hi2, 1.0e-24)
+                native_weight_hi = native_inverse_hi / (native_inverse_lo + native_inverse_hi)
 
                 # Inspect the raw NTX coefficient vector as well.  This is
                 # only four (n_x) direct solves for the already selected
@@ -12479,7 +12492,7 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                 jax.debug.print(
                     "[NEOPAX] centre-Lij face-coefficient bracket: "
                     "rho_center={rho_center:.6e} lo={lo} rho_lo={rho_lo:.6e} "
-                    "hi={hi} rho_hi={rho_hi:.6e} weight_hi={weight_hi:.6e} "
+                    "hi={hi} rho_hi={rho_hi:.6e} geometric_weight_hi={weight_hi:.6e} "
                     "Lij_lo={lij_lo:.6e} Lij_hi={lij_hi:.6e}",
                     rho_center=center_rho[radius],
                     lo=face_lo,
@@ -12489,6 +12502,14 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                     weight_hi=face_weight_hi,
                     lij_lo=face_lij[species, face_lo, row, col],
                     lij_hi=face_lij[species, face_hi, row, col],
+                )
+                jax.debug.print(
+                    "[NEOPAX] centre-Lij native-distance weight for selected "
+                    "species/radius: min_hi={min_hi:.6e} mean_hi={mean_hi:.6e} "
+                    "max_hi={max_hi:.6e}",
+                    min_hi=jnp.min(native_weight_hi),
+                    mean_hi=jnp.mean(native_weight_hi),
+                    max_hi=jnp.max(native_weight_hi),
                 )
                 jax.debug.print(
                     "[NEOPAX] centre-Lij face-coefficient native displacement: "
