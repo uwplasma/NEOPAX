@@ -43,6 +43,7 @@ from ._neoclassical import (
     get_Neoclassical_Fluxes,
     get_Neoclassical_Fluxes_Faces,
     get_Neoclassical_Fluxes_With_Momentum_Correction,
+    get_Neoclassical_Upar_With_Momentum_Correction,
     pullback_preprocessed_radial_database_fluxes,
 )
 from ._species import get_Thermodynamical_Forces_A1, get_Thermodynamical_Forces_A2, get_Thermodynamical_Forces_A3
@@ -3211,9 +3212,32 @@ class NTXDatabaseTransportModel(TransportFluxModelBase):
         }
 
     def evaluate_momentum_corrected_upar_only(self, state):
-        """Return the database-interpolated momentum-corrected parallel flow."""
+        """Return only the database momentum-corrected parallel flow.
 
-        return self.evaluate_momentum_corrected_fluxes(state)["Upar"]
+        Keep this separate from the general flux-table evaluator: bootstrap
+        objectives require ``Upar`` only, and must not stage the unused
+        Gamma/Q/qpar/Upar2 output algebra in their local VJPs.
+        """
+        density = safe_density(state.density, self.density_floor)
+        density_right_constraint, density_right_grad_constraint = _extract_right_constraints(
+            self.bc_density, density, self.geometry.r_grid_half
+        )
+        temperature_right_constraint, temperature_right_grad_constraint = _extract_right_constraints(
+            self.bc_temperature, state.temperature, self.geometry.r_grid_half
+        )
+        return get_Neoclassical_Upar_With_Momentum_Correction(
+            self.species,
+            self.energy_grid,
+            self.geometry,
+            self.database,
+            state.Er,
+            state.temperature,
+            density,
+            density_right_constraint=density_right_constraint,
+            density_right_grad_constraint=density_right_grad_constraint,
+            temperature_right_constraint=temperature_right_constraint,
+            temperature_right_grad_constraint=temperature_right_grad_constraint,
+        )
 
     def _momentum_corrected_upar_one_radius(self, state, radius_index):
         """Evaluate the corrected database ``U_parallel`` at one radius.

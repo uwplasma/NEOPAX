@@ -859,6 +859,43 @@ def initial_state_for_parameter_vector(
     config: Mapping[str, Any] | None = None,
     initial_er_root_ad: str = "off",
 ):
+    """Build the initial profile state from a complete runtime object.
+
+    This public compatibility wrapper retains the existing call signature.
+    Reverse profile pullbacks should call the compact helper below directly so
+    a large database/support payload is not captured by their JAX trace.
+    """
+    return initial_state_for_parameter_vector_compact(
+        parameter_values,
+        baseline_state=baseline_state,
+        profile_cfg=profile_cfg,
+        geometry=runtime.geometry,
+        number_species=runtime.species.number_species,
+        config=config,
+        initial_er_root_ad=initial_er_root_ad,
+        root_runtime=runtime,
+    )
+
+
+def initial_state_for_parameter_vector_compact(
+    parameter_values,
+    *,
+    baseline_state,
+    profile_cfg: Mapping[str, Any],
+    geometry,
+    number_species: int,
+    config: Mapping[str, Any] | None = None,
+    initial_er_root_ad: str = "off",
+    root_runtime=None,
+):
+    """Build an initial profile state without capturing unrelated runtime data.
+
+    Profile construction depends solely on transport geometry and the species
+    count.  In particular it does not use an NTX database, its recorded scan
+    primal, or flux-model support payload.  Keeping those out of this function
+    is important because this map is itself differentiated at the beginning
+    of every segmented reverse sweep.
+    """
     cfg = dict(profile_cfg)
     values_arr = jnp.asarray(parameter_values)
     if int(values_arr.shape[0]) == len(PROFILE_PARAMETER_ORDER):
@@ -869,8 +906,8 @@ def initial_state_for_parameter_vector(
         cfg[name] = value
     profile_set = parameterized_profile_set(
         cfg,
-        runtime.geometry,
-        runtime.species.number_species,
+        geometry,
+        number_species,
         parameter_name=TRANSPORT_REVERSE_PROFILE_PARAMETER_ORDER[0],
         parameter_value=cfg[TRANSPORT_REVERSE_PROFILE_PARAMETER_ORDER[0]],
     )
@@ -894,7 +931,11 @@ def initial_state_for_parameter_vector(
     if mode != "off":
         if config is None:
             raise ValueError("config is required when initial_er_root_ad is enabled.")
-        state = state_with_initial_er_root_ad(state, config=config, runtime=runtime, mode=mode)
+        if root_runtime is None:
+            raise ValueError("root_runtime is required when initial_er_root_ad is enabled.")
+        state = state_with_initial_er_root_ad(
+            state, config=config, runtime=root_runtime, mode=mode
+        )
     return state
 
 
@@ -3864,14 +3905,21 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
 
     initial_er_root_enabled = dependencies.initial_er_root_enabled(config, initial_er_root_ad)
 
+    # Do not close this small profile map over the complete runtime: a scan
+    # database runtime contains the large coefficient tables and optional
+    # recorded scan primal, neither of which is an input to profile creation.
+    profile_geometry = runtime.geometry
+    profile_number_species = runtime.species.number_species
+
     def _state_from_profiles(p):
-        return dependencies.initial_state_for_parameter_vector(
+        return initial_state_for_parameter_vector_compact(
             p,
             config=config,
             initial_er_root_ad="off",
-            runtime=runtime,
             baseline_state=baseline_state,
             profile_cfg=profile_cfg,
+            geometry=profile_geometry,
+            number_species=profile_number_species,
         )
 
     phase_timing_diagnostics = bool(

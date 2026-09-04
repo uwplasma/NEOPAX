@@ -513,6 +513,15 @@ def test_database_local_bootstrap_state_pullback_matches_full_upar_jvp(
     upar_bar = jnp.asarray(
         [[0.2, -0.3], [-0.4, 0.1], [0.3, 0.2], [-0.1, 0.25]]
     )
+    # The bootstrap-only path must be numerically identical to the Upar
+    # component of the established full corrected-flux evaluator.  It merely
+    # omits unused output-channel construction from the reverse graph.
+    assert jnp.allclose(
+        model.evaluate_momentum_corrected_upar_only(state),
+        model.evaluate_momentum_corrected_fluxes(state)["Upar"],
+        rtol=2.0e-10,
+        atol=2.0e-10,
+    )
     upar_tangent = jax.jvp(
         model.evaluate_momentum_corrected_upar_only,
         (state,),
