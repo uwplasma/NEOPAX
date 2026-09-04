@@ -1075,7 +1075,7 @@ def test_normalize_solver_config_t3d_outer_rejects_non_transport_lagged_rhs(rhs_
 )
 def test_normalize_solver_config_resolves_universal_center_flux_mode(configured, expected):
     config = {
-        "transport_flux": {"center_flux_mode": configured},
+        "transport_solver": {"center_flux_mode": configured},
         "neoclassical": {"flux_model": "ntx_scan_runtime"},
     }
 
@@ -1098,7 +1098,7 @@ def test_normalize_solver_config_maps_exact_ntx_center_response_mode_as_compatib
 
 def test_normalize_solver_config_rejects_conflicting_universal_and_exact_ntx_center_modes():
     config = {
-        "transport_flux": {"center_flux_mode": "direct"},
+        "transport_solver": {"center_flux_mode": "direct"},
         "neoclassical": {
             "flux_model": "ntx_exact_lij_runtime",
             "ntx_exact_center_response_mode": "interpolate_from_faces",
@@ -1107,6 +1107,13 @@ def test_normalize_solver_config_rejects_conflicting_universal_and_exact_ntx_cen
 
     with pytest.raises(ValueError, match="conflicts"):
         _normalize_solver_config(config)
+
+
+def test_normalize_solver_config_rejects_center_flux_mode_in_old_transport_flux_table():
+    with pytest.raises(ValueError, match="has moved"):
+        _normalize_solver_config(
+            {"transport_flux": {"center_flux_mode": "interpolate_from_faces"}}
+        )
 
 
 def test_resolve_reference_path_handles_relative_paths(tmp_path, monkeypatch):
@@ -1551,8 +1558,8 @@ def test_build_flux_model_passes_runtime_ntx_exact_lij_inputs(
             "transport_solver": {
                 "density_floor": 2.5e-6,
                 "temperature_floor": 7.5e-6,
+                "center_flux_mode": center_flux_mode,
             },
-            "transport_flux": {"center_flux_mode": center_flux_mode},
             "turbulence": {"flux_model": "none"},
             "classical": {"flux_model": "none"},
         },

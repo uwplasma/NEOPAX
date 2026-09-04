@@ -98,7 +98,7 @@ def _normalize_transport_center_flux_mode(mode: object) -> str:
     normalized = aliases.get(normalized, normalized)
     if normalized not in {"direct", "interpolate_from_faces"}:
         raise ValueError(
-            "transport_flux.center_flux_mode must be one of: "
+            "transport_solver.center_flux_mode must be one of: "
             "direct, interpolate_from_faces"
         )
     return normalized
@@ -112,14 +112,30 @@ def _resolve_transport_center_flux_mode(config: dict) -> str:
     with an explicitly supplied legacy setting.
     """
 
-    flux_cfg = config.get("transport_flux", {})
-    if flux_cfg is None:
-        flux_cfg = {}
-    if not isinstance(flux_cfg, dict):
+    solver_cfg = config.get("transport_solver", {})
+    if not solver_cfg:
+        solver_cfg = config.get("solver", config.get("transport", {}))
+    if solver_cfg is None:
+        solver_cfg = {}
+    if not isinstance(solver_cfg, dict):
+        raise ValueError("transport_solver must be a TOML table.")
+
+    # ``center_flux_mode`` is a transport-solver representation policy: it
+    # governs how the combined RHS consumes every flux model, rather than a
+    # property of one flux model.  Reject the old table rather than silently
+    # ignoring it and falling back to direct centres.
+    old_flux_cfg = config.get("transport_flux", {})
+    if old_flux_cfg is not None and not isinstance(old_flux_cfg, dict):
         raise ValueError("transport_flux must be a TOML table.")
-    has_universal_mode = "center_flux_mode" in flux_cfg
+    if isinstance(old_flux_cfg, dict) and "center_flux_mode" in old_flux_cfg:
+        raise ValueError(
+            "transport_flux.center_flux_mode has moved to "
+            "transport_solver.center_flux_mode."
+        )
+
+    has_universal_mode = "center_flux_mode" in solver_cfg
     universal_mode = _normalize_transport_center_flux_mode(
-        flux_cfg.get("center_flux_mode")
+        solver_cfg.get("center_flux_mode")
     )
 
     neo_cfg = config.get("neoclassical", {})
@@ -133,7 +149,7 @@ def _resolve_transport_center_flux_mode(config: dict) -> str:
     legacy_as_universal = _normalize_transport_center_flux_mode(legacy_mode)
     if has_universal_mode and universal_mode != legacy_as_universal:
         raise ValueError(
-            "transport_flux.center_flux_mode conflicts with "
+            "transport_solver.center_flux_mode conflicts with "
             "neoclassical.ntx_exact_center_response_mode."
         )
     return universal_mode if has_universal_mode else legacy_as_universal
