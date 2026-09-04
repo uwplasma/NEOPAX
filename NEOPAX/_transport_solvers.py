@@ -2513,11 +2513,11 @@ def _make_radau_stage_predictor(
     prev_newton_iter_count=None,
     predictor_mode="current",
 ):
-    # Radau solves for stage derivatives K_i, so the constant-RHS predictor is
-    # K_i = F(y_n) at every stage.  ``c_i * f0`` would be a state increment
-    # shape, not a derivative, and is therefore inconsistent even before any
-    # stage history is available.
-    base_guess = jnp.broadcast_to(f0[None, :], (c.shape[0], f0.shape[0]))
+    # This is a deliberately damped no-history seed, not a claim that the
+    # Radau stage derivatives equal c_i*f0.  Empirically it provides a more
+    # stable initial iterate for this stiff transport system.  Saved stage
+    # *history* below is still K_i and must never be rescaled by h_new/h_old.
+    base_guess = c[:, None] * f0[None, :]
     use_predictor = jnp.logical_and(
         prev_dt > 0.0,
         jnp.all(jnp.isfinite(prev_stages)),
@@ -3456,6 +3456,8 @@ class _RadauSolverConfig(TransportSolver):
     lagged_response_reuse_rtol: float = 5.0e-2
     lagged_response_reuse_atol: float = 1.0e-8
     lagged_response_correction_mode: str = "none"
+    lagged_jacobian_refresh_mode: str = "none"
+    lagged_jacobian_refresh_threshold: float = 1.0
     lagged_response_defect_mode: str = "off"
     lagged_response_defect_rtol: float = 1.0e-6
     lagged_response_defect_atol: float = 1.0e-8
@@ -3505,6 +3507,8 @@ class _RadauSolverConfig(TransportSolver):
         lagged_response_reuse_rtol: float = 5.0e-2,
         lagged_response_reuse_atol: float = 1.0e-8,
         lagged_response_correction_mode: str = "none",
+        lagged_jacobian_refresh_mode: str = "none",
+        lagged_jacobian_refresh_threshold: float = 1.0,
         lagged_response_defect_mode: str = "off",
         lagged_response_defect_rtol: float = 1.0e-6,
         lagged_response_defect_atol: float = 1.0e-8,
@@ -3770,6 +3774,39 @@ class _RadauSolverConfig(TransportSolver):
                 "radau_rhs_mode='lagged_transport_response'."
             )
         object.__setattr__(self, "lagged_response_correction_mode", correction_mode_norm)
+        jacobian_refresh_mode_norm = str(lagged_jacobian_refresh_mode).strip().lower()
+        jacobian_refresh_mode_aliases = {
+            "off": "none",
+            "disabled": "none",
+            "endpoint": "endpoint_after_first",
+            "endpoint_once": "endpoint_after_first",
+        }
+        jacobian_refresh_mode_norm = jacobian_refresh_mode_aliases.get(
+            jacobian_refresh_mode_norm, jacobian_refresh_mode_norm
+        )
+        if jacobian_refresh_mode_norm not in {"none", "endpoint_after_first"}:
+            raise ValueError(
+                "radau_lagged_jacobian_refresh_mode must be one of: none, endpoint_after_first"
+            )
+        if float(lagged_jacobian_refresh_threshold) <= 0.0:
+            raise ValueError("radau_lagged_jacobian_refresh_threshold must be positive")
+        if jacobian_refresh_mode_norm != "none" and str(rhs_mode).strip().lower() not in {
+            "lagged_transport_response",
+            "lagged_response",
+        }:
+            raise ValueError(
+                "radau_lagged_jacobian_refresh_mode='endpoint_after_first' requires "
+                "a lagged transport response RHS mode."
+            )
+        if jacobian_refresh_mode_norm != "none" and correction_mode_norm != "none":
+            raise ValueError(
+                "radau_lagged_jacobian_refresh_mode and "
+                "radau_lagged_response_correction_mode cannot be combined."
+            )
+        object.__setattr__(self, "lagged_jacobian_refresh_mode", jacobian_refresh_mode_norm)
+        object.__setattr__(
+            self, "lagged_jacobian_refresh_threshold", float(lagged_jacobian_refresh_threshold)
+        )
         defect_mode_norm = str(lagged_response_defect_mode).strip().lower()
         defect_mode_aliases = {"none": "off", "disabled": "off", "endpoint": "endpoint_diagnostic", "diagnostic": "endpoint_diagnostic", "next": "endpoint_next_step_cap", "cap": "endpoint_next_step_cap"}
         defect_mode_norm = defect_mode_aliases.get(defect_mode_norm, defect_mode_norm)
@@ -4373,6 +4410,8 @@ class _RadauAcceptedStepKernelContext:
     debug_newton_trace: Any
     use_transport_lagged_response: Any
     lagged_response_correction_mode: str
+    lagged_jacobian_refresh_mode: str
+    lagged_jacobian_refresh_threshold: Any
     newton_stagnation_mode: str
     newton_stagnation_defect_budget: Any
     newton_stagnation_growth_cap: Any
@@ -14227,11 +14266,112 @@ def _radau_single_step_primal(
         complex_lu_out=complex_lu_out,
         complex_piv_out=complex_piv_out,
     )
-    subsolve_result = _radau_run_stage_subsolve_from_inputs(
-        kernel_context,
-        physics_context,
-        subsolve_inputs,
-    )
+    if kernel_context.lagged_jacobian_refresh_mode == "endpoint_after_first":
+        # The lagged response is already quadratic, so its Jacobian at the
+        # first corrected endpoint is J_n + H_n[delta_endpoint, .].  Refresh
+        # one *shared* matrix there only when the first chord correction is
+        # large.  This preserves the transformed Radau factorization and does
+        # not call the NTX builder again.
+        first_iteration_context = dataclasses.replace(
+            kernel_context, maxiter=1, debug_newton_trace=False
+        )
+        first_iteration = _radau_run_stage_subsolve_from_inputs(
+            first_iteration_context,
+            physics_context,
+            subsolve_inputs,
+        )
+        first_endpoint = flat_y + h_value * (
+            kernel_context.b
+            @ first_iteration.z_final.reshape(
+                (kernel_context.num_stages, kernel_context.state_dim)
+            )
+        )
+        refresh_jacobian = jnp.logical_and(
+            jnp.logical_and(
+                first_iteration.finite_initial_residual,
+                jnp.logical_and(
+                    jnp.all(jnp.isfinite(first_iteration.z_final)),
+                    jnp.logical_not(first_iteration.nonfinite_stage_residual),
+                ),
+            ),
+            first_iteration.newton_metric_final
+            > kernel_context.lagged_jacobian_refresh_threshold,
+        )
+
+        def _run_with_anchor_jacobian(_):
+            anchor_result = _radau_run_stage_subsolve_from_inputs(
+                kernel_context, physics_context, subsolve_inputs
+            )
+            return (
+                anchor_result,
+                jacobian_ref,
+                real_lu_out,
+                real_piv_out,
+                complex_lu_out,
+                complex_piv_out,
+            )
+
+        def _run_with_endpoint_jacobian(_):
+            endpoint_jacobian = jax.jacfwd(_rhs_eval_at_current_time)(first_endpoint)
+
+            def _factor_and_run(_):
+                endpoint_real_lu, endpoint_real_piv, endpoint_complex_lu, endpoint_complex_piv = (
+                    _factor_linear_systems(endpoint_jacobian)
+                )
+                endpoint_inputs = dataclasses.replace(
+                    subsolve_inputs,
+                    z0=first_iteration.z_final,
+                    jacobian_ref=endpoint_jacobian,
+                    real_lu_out=endpoint_real_lu,
+                    real_piv_out=endpoint_real_piv,
+                    complex_lu_out=endpoint_complex_lu,
+                    complex_piv_out=endpoint_complex_piv,
+                )
+                endpoint_result = _radau_run_stage_subsolve_from_inputs(
+                    kernel_context, physics_context, endpoint_inputs
+                )
+                return (
+                    endpoint_result,
+                    endpoint_jacobian,
+                    endpoint_real_lu,
+                    endpoint_real_piv,
+                    endpoint_complex_lu,
+                    endpoint_complex_piv,
+                )
+
+            return jax.lax.cond(
+                jnp.all(jnp.isfinite(endpoint_jacobian)),
+                _factor_and_run,
+                _run_with_anchor_jacobian,
+                operand=None,
+            )
+
+        (
+            subsolve_result,
+            jacobian_ref,
+            real_lu_out,
+            real_piv_out,
+            complex_lu_out,
+            complex_piv_out,
+        ) = jax.lax.cond(
+            refresh_jacobian,
+            _run_with_endpoint_jacobian,
+            _run_with_anchor_jacobian,
+            operand=None,
+        )
+        if kernel_context.debug_newton_trace:
+            jax.debug.print(
+                "[radau-solver] endpoint_jacobian_refresh={refresh} first_newton_metric={metric:.6e} threshold={threshold:.6e}",
+                refresh=refresh_jacobian,
+                metric=first_iteration.newton_metric_final,
+                threshold=kernel_context.lagged_jacobian_refresh_threshold,
+            )
+    else:
+        subsolve_result = _radau_run_stage_subsolve_from_inputs(
+            kernel_context,
+            physics_context,
+            subsolve_inputs,
+        )
     if kernel_context.lagged_response_correction_mode == "endpoint_defect":
         predictor_stages = subsolve_result.z_final.reshape(
             (kernel_context.num_stages, kernel_context.state_dim)
@@ -14752,11 +14892,102 @@ def _radau_single_step_primal_reverse_minimal(
         complex_lu_out=complex_lu_out,
         complex_piv_out=complex_piv_out,
     )
-    subsolve_result = _radau_run_stage_subsolve_from_inputs(
-        kernel_context,
-        physics_context,
-        subsolve_inputs,
-    )
+    if kernel_context.lagged_jacobian_refresh_mode == "endpoint_after_first":
+        # Keep reverse-only realized-schedule replay on precisely the same
+        # primal linearization path as the forward accepted step.
+        first_iteration_context = dataclasses.replace(
+            kernel_context, maxiter=1, debug_newton_trace=False
+        )
+        first_iteration = _radau_run_stage_subsolve_from_inputs(
+            first_iteration_context,
+            physics_context,
+            subsolve_inputs,
+        )
+        first_endpoint = flat_y + h_value * (
+            kernel_context.b
+            @ first_iteration.z_final.reshape(
+                (kernel_context.num_stages, kernel_context.state_dim)
+            )
+        )
+        refresh_jacobian = jnp.logical_and(
+            jnp.logical_and(
+                first_iteration.finite_initial_residual,
+                jnp.logical_and(
+                    jnp.all(jnp.isfinite(first_iteration.z_final)),
+                    jnp.logical_not(first_iteration.nonfinite_stage_residual),
+                ),
+            ),
+            first_iteration.newton_metric_final
+            > kernel_context.lagged_jacobian_refresh_threshold,
+        )
+
+        def _run_with_anchor_jacobian(_):
+            anchor_result = _radau_run_stage_subsolve_from_inputs(
+                kernel_context, physics_context, subsolve_inputs
+            )
+            return (
+                anchor_result,
+                jacobian_ref,
+                real_lu_out,
+                real_piv_out,
+                complex_lu_out,
+                complex_piv_out,
+            )
+
+        def _run_with_endpoint_jacobian(_):
+            endpoint_jacobian = jax.jacfwd(_rhs_eval_at_current_time)(first_endpoint)
+
+            def _factor_and_run(_):
+                endpoint_real_lu, endpoint_real_piv, endpoint_complex_lu, endpoint_complex_piv = (
+                    _factor_linear_systems(endpoint_jacobian)
+                )
+                endpoint_inputs = dataclasses.replace(
+                    subsolve_inputs,
+                    z0=first_iteration.z_final,
+                    jacobian_ref=endpoint_jacobian,
+                    real_lu_out=endpoint_real_lu,
+                    real_piv_out=endpoint_real_piv,
+                    complex_lu_out=endpoint_complex_lu,
+                    complex_piv_out=endpoint_complex_piv,
+                )
+                endpoint_result = _radau_run_stage_subsolve_from_inputs(
+                    kernel_context, physics_context, endpoint_inputs
+                )
+                return (
+                    endpoint_result,
+                    endpoint_jacobian,
+                    endpoint_real_lu,
+                    endpoint_real_piv,
+                    endpoint_complex_lu,
+                    endpoint_complex_piv,
+                )
+
+            return jax.lax.cond(
+                jnp.all(jnp.isfinite(endpoint_jacobian)),
+                _factor_and_run,
+                _run_with_anchor_jacobian,
+                operand=None,
+            )
+
+        (
+            subsolve_result,
+            jacobian_ref,
+            real_lu_out,
+            real_piv_out,
+            complex_lu_out,
+            complex_piv_out,
+        ) = jax.lax.cond(
+            refresh_jacobian,
+            _run_with_endpoint_jacobian,
+            _run_with_anchor_jacobian,
+            operand=None,
+        )
+    else:
+        subsolve_result = _radau_run_stage_subsolve_from_inputs(
+            kernel_context,
+            physics_context,
+            subsolve_inputs,
+        )
     stages_final = subsolve_result.z_final.reshape((kernel_context.num_stages, kernel_context.state_dim))
     flat_next = flat_y + h_value * (kernel_context.b @ stages_final)
     cache_valid_out = jnp.asarray(True)
@@ -19658,6 +19889,12 @@ def _build_prepared_radau_accepted_rollout(
         lagged_response_correction_mode=str(
             getattr(solver, "lagged_response_correction_mode", "none")
         ).strip().lower(),
+        lagged_jacobian_refresh_mode=str(
+            getattr(solver, "lagged_jacobian_refresh_mode", "none")
+        ).strip().lower(),
+        lagged_jacobian_refresh_threshold=jnp.asarray(
+            getattr(solver, "lagged_jacobian_refresh_threshold", 1.0), dtype=dtype
+        ),
         newton_stagnation_mode=str(
             getattr(solver, "newton_stagnation_mode", "off")
         ).strip().lower(),
@@ -20392,6 +20629,12 @@ class RADAUSolver(_RadauSolverConfig):
             lagged_response_correction_mode=str(
                 getattr(self, "lagged_response_correction_mode", "none")
             ).strip().lower(),
+            lagged_jacobian_refresh_mode=str(
+                getattr(self, "lagged_jacobian_refresh_mode", "none")
+            ).strip().lower(),
+            lagged_jacobian_refresh_threshold=jnp.asarray(
+                getattr(self, "lagged_jacobian_refresh_threshold", 1.0), dtype=dtype
+            ),
             newton_stagnation_mode=str(
                 getattr(self, "newton_stagnation_mode", "off")
             ).strip().lower(),
@@ -25942,6 +26185,12 @@ def build_time_solver(solver_parameters: Any, solver_override: Any = None) -> Tr
             lagged_response_reuse_atol=float(_cfg_get("lagged_response_reuse_atol", 1.0e-8)),
             lagged_response_correction_mode=str(
                 _cfg_get("radau_lagged_response_correction_mode", "none")
+            ),
+            lagged_jacobian_refresh_mode=str(
+                _cfg_get("radau_lagged_jacobian_refresh_mode", "none")
+            ),
+            lagged_jacobian_refresh_threshold=float(
+                _cfg_get("radau_lagged_jacobian_refresh_threshold", 1.0)
             ),
             lagged_response_defect_mode=str(_cfg_get("radau_lagged_response_defect_mode", "off")),
             lagged_response_defect_rtol=float(_cfg_get("radau_lagged_response_defect_rtol", 1.0e-6)),

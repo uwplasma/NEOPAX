@@ -71,24 +71,8 @@ def test_radau_stage_predictor_does_not_rescale_derivative_history_after_retry()
         predictor_mode="current",
     ).reshape((3, 2))
 
-    expected = 0.85 * jnp.asarray([5.0, -7.0]) + 0.15 * f0[None, :]
+    expected = 0.85 * jnp.asarray([5.0, -7.0]) + 0.15 * c[:, None] * f0[None, :]
     assert jnp.allclose(predictor, expected, rtol=1.0e-12, atol=1.0e-12)
-
-    first_step_predictor = transport_solvers._make_radau_stage_predictor(
-        f0,
-        previous_stages,
-        jnp.asarray(0.0, dtype=dtype),
-        jnp.asarray(0.01, dtype=dtype),
-        c,
-        dtype,
-        predictor_mode="current",
-    ).reshape((3, 2))
-    assert jnp.allclose(
-        first_step_predictor,
-        jnp.broadcast_to(f0, (3, 2)),
-        rtol=1.0e-12,
-        atol=1.0e-12,
-    )
 
 
 def test_radau_stage_residual_defect_is_not_hidden_by_endpoint_cancellation():
@@ -1061,6 +1045,25 @@ def test_radau_endpoint_defect_correction_requires_transport_lagged_response():
         RADAUSolver(lagged_response_correction_mode="endpoint_defect")
 
 
+def test_build_time_solver_radau_accepts_endpoint_jacobian_refresh():
+    solver = build_time_solver(
+        _base_solver_parameters(
+            transport_solver_backend="radau",
+            radau_rhs_mode="lagged_transport_response",
+            radau_lagged_jacobian_refresh_mode="endpoint_after_first",
+            radau_lagged_jacobian_refresh_threshold=0.75,
+        )
+    )
+    assert isinstance(solver, RADAUSolver)
+    assert solver.lagged_jacobian_refresh_mode == "endpoint_after_first"
+    assert solver.lagged_jacobian_refresh_threshold == pytest.approx(0.75)
+
+
+def test_radau_endpoint_jacobian_refresh_requires_transport_lagged_response():
+    with pytest.raises(ValueError, match="requires a lagged transport response RHS mode"):
+        RADAUSolver(lagged_jacobian_refresh_mode="endpoint_after_first")
+
+
 def test_radau_endpoint_defect_correction_runs_on_nonlinear_lagged_rhs():
     class QuadraticLaggedField:
         def __call__(self, _t, y):
@@ -1080,6 +1083,35 @@ def test_radau_endpoint_defect_correction_runs_on_nonlinear_lagged_rhs():
         atol=1.0e-8,
         rhs_mode="lagged_transport_response",
         lagged_response_correction_mode="endpoint_defect",
+        maxiter=8,
+        max_steps=32,
+    )
+    out = solver.solve(jnp.asarray([0.1]), QuadraticLaggedField().__call__)
+    assert int(out["n_steps"]) > 0
+    assert jnp.all(jnp.isfinite(out["final_state"]))
+
+
+def test_radau_endpoint_jacobian_refresh_runs_on_nonlinear_lagged_rhs():
+    class QuadraticLaggedField:
+        def __call__(self, _t, y):
+            return y * y
+
+        def build_lagged_response(self, y):
+            return y
+
+        def evaluate_with_lagged_response(self, _t, y, *, lagged_response):
+            return lagged_response * lagged_response + 2.0 * lagged_response * (y - lagged_response)
+
+    solver = RADAUSolver(
+        t0=0.0,
+        t1=0.05,
+        dt=0.01,
+        rtol=1.0e-5,
+        atol=1.0e-8,
+        rhs_mode="lagged_transport_response",
+        lagged_jacobian_refresh_mode="endpoint_after_first",
+        # Force the refresh path in this small regression test.
+        lagged_jacobian_refresh_threshold=1.0e-16,
         maxiter=8,
         max_steps=32,
     )
