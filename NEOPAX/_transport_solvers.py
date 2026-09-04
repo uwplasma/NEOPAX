@@ -12504,7 +12504,32 @@ def _radau_quadratic_colored_jacobian_update(
     correction_flat = jnp.zeros_like(jacobian_anchor).at[
         radial_flat_indices[:, None], radial_flat_indices[None, :]
     ].set(correction_radial)
-    return jacobian_anchor + correction_flat
+    updated_jacobian = jacobian_anchor + correction_flat
+
+    if getattr(kernel_context, "debug_newton_trace", False):
+        # This is an exact consistency check for the same colored probes
+        # already needed by recovery: it performs no additional tangent or
+        # NTX evaluation.  A zero residual means the change in the cached
+        # quadratic Jacobian is genuinely captured by the assumed local
+        # block-tridiagonal stencil.  Any remainder is the omitted nonlocal
+        # part of that *Jacobian change*, rather than a Newton residual.
+        recovered_tangent_values = directions @ updated_jacobian.T
+        omitted_values = tangent_values - recovered_tangent_values
+        exact_norms = jnp.linalg.norm(tangent_values, axis=1)
+        omitted_norms = jnp.linalg.norm(omitted_values, axis=1)
+        relative_norms = omitted_norms / jnp.maximum(
+            exact_norms, kernel_context.tiny_scalar
+        )
+        jax.debug.print(
+            "[radau-colored-jacobian-audit] jvp_relative_rms={relative_rms:.6e} "
+            "jvp_relative_max={relative_max:.6e} jvp_omitted_abs_max={omitted_abs_max:.6e}",
+            relative_rms=jnp.linalg.norm(omitted_values) / jnp.maximum(
+                jnp.linalg.norm(tangent_values), kernel_context.tiny_scalar
+            ),
+            relative_max=jnp.max(relative_norms),
+            omitted_abs_max=jnp.max(omitted_norms),
+        )
+    return updated_jacobian
 
 
 def _radau_stage_matrix_to_radial_blocks(
