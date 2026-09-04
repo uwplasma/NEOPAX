@@ -12768,15 +12768,22 @@ def _radau_exact_stage_transpose_radial_bands_from_colored_matvec(
     stage_vectors = jnp.zeros_like(radial_vectors).at[:, radial_permutation].set(
         radial_vectors
     )
-    # ``block`` defines its stage matrix through generic ``jax.jacfwd``.  Use
-    # the corresponding generic JAX VJP here, irrespective of the separately
-    # selected RHS pullback mode used elsewhere in the reverse step.  This is
-    # necessary for this candidate to reconstruct the same stage system as
-    # ``block`` rather than a nearby explicit-NTX derivative implementation.
-    matrix_physics_context = dataclasses.replace(
-        physics_context,
-        reverse_rhs_transpose_mode="generic",
-    )
+    # The historical NTSS-midpoint candidate reconstructs ``block``'s generic
+    # JAX derivative, so keep that behaviour for its callers.  The direct
+    # database candidate, in contrast, must retain ``explicit_database``:
+    # its state transpose is an exact custom boundary and is substantially
+    # smaller than tracing a generic VJP through the database interpolation.
+    rhs_transpose_mode = str(
+        getattr(physics_context, "reverse_rhs_transpose_mode", "generic")
+    ).strip().lower()
+    matrix_physics_context = physics_context
+    if rhs_transpose_mode not in {
+        "explicit_database", "database", "explicit_black_box_database"
+    }:
+        matrix_physics_context = dataclasses.replace(
+            physics_context,
+            reverse_rhs_transpose_mode="generic",
+        )
     stage_outputs = _radau_exact_stage_residual_transpose_matvec_batched(
         kernel_context,
         matrix_physics_context,
@@ -12915,6 +12922,53 @@ def _radau_exact_stage_residual_transpose_matrix_colored_ntss_midpoint(
         (system_size, system_size),
         dtype=kernel_context.dtype,
     ).at[radial_permutation[:, None], radial_permutation[None, :]].set(radial_matrix)
+
+
+def _radau_exact_stage_residual_transpose_matrix_colored_database(
+    kernel_context: _RadauAcceptedStepKernelContext,
+    physics_context: _RadauAcceptedStepPhysicsContext,
+    carry_in: _RadauAcceptedStepCarry,
+    primal_result: _RadauAcceptedStepAttemptResult,
+    lagged_response,
+):
+    """Exact direct-database stage transpose from colored local actions.
+
+    Direct centre database fluxes depend only on a cell and its two radial
+    neighbours.  Consequently the complete accepted-step transpose is block
+    tridiagonal in radial ordering.  Three colors recover that operator from
+    exact direct-RHS transpose actions, avoiding the old one-action-per-state
+    basis materialization used by ``block``.
+
+    This intentionally retains the dense final solve for now.  It changes
+    only construction of the *same* exact stage matrix and is database-only.
+    """
+    rhs_transpose_mode = str(
+        getattr(physics_context, "reverse_rhs_transpose_mode", "generic")
+    ).strip().lower()
+    if rhs_transpose_mode not in {
+        "explicit_database", "database", "explicit_black_box_database"
+    }:
+        raise ValueError(
+            "block_colored_database requires reverse_rhs_transpose_mode='explicit_database'."
+        )
+    radial_permutation, _radial_block_dim, block_lower, block_diagonal, block_upper = (
+        _radau_exact_stage_transpose_radial_bands_from_colored_matvec(
+            kernel_context,
+            physics_context,
+            carry_in,
+            primal_result,
+            lagged_response,
+        )
+    )
+    radial_matrix = _radau_radial_block_tridiagonal_matrix(
+        block_lower,
+        block_diagonal,
+        block_upper,
+    )
+    system_size = int(kernel_context.num_stages) * int(kernel_context.state_dim)
+    return jnp.zeros((system_size, system_size), dtype=kernel_context.dtype).at[
+        radial_permutation[:, None], radial_permutation[None, :]
+    ].set(radial_matrix)
 
 
 def _radau_exact_stage_residual_colored_ntss_midpoint_matrix_error(
@@ -13129,6 +13183,31 @@ def _radau_solve_exact_stage_residual_transpose_block_colored_ntss_midpoint(
     )
     # Passing all objectives as columns makes one dense multi-RHS solve.  This
     # preserves the existing all-objective batching rather than scanning them.
+    solution_rows = jnp.linalg.solve(transpose_matrix, -rhs_rows.T).T
+    return solution_rows if batched else solution_rows[0]
+
+
+def _radau_solve_exact_stage_residual_transpose_block_colored_database(
+    kernel_context: _RadauAcceptedStepKernelContext,
+    physics_context: _RadauAcceptedStepPhysicsContext,
+    carry_in: _RadauAcceptedStepCarry,
+    primal_result: _RadauAcceptedStepAttemptResult,
+    lagged_response,
+    *,
+    rhs,
+    batched: bool = False,
+):
+    """Solve the exact direct-database stage system reconstructed by coloring."""
+    system_size = int(kernel_context.num_stages) * int(kernel_context.state_dim)
+    rhs_arr = jnp.asarray(rhs, dtype=kernel_context.dtype)
+    rhs_rows = rhs_arr.reshape((-1, system_size)) if batched else rhs_arr.reshape((1, system_size))
+    transpose_matrix = _radau_exact_stage_residual_transpose_matrix_colored_database(
+        kernel_context,
+        physics_context,
+        carry_in,
+        primal_result,
+        lagged_response,
+    )
     solution_rows = jnp.linalg.solve(transpose_matrix, -rhs_rows.T).T
     return solution_rows if batched else solution_rows[0]
 
@@ -13437,6 +13516,15 @@ def _radau_solve_exact_stage_residual_transpose(
             lagged_response,
             rhs=rhs,
         )
+    if mode == "block_colored_database":
+        return _radau_solve_exact_stage_residual_transpose_block_colored_database(
+            kernel_context,
+            physics_context,
+            carry_in,
+            primal_result,
+            lagged_response,
+            rhs=rhs,
+        )
     if mode not in {"block", "block_explicit_ntx_jacobian", "block_frozen_forward_jacobian"}:
         raise ValueError(f"Unknown reverse_stage_adjoint_solve_mode '{mode}'.")
     return _radau_solve_exact_stage_residual_transpose_block(
@@ -13530,6 +13618,16 @@ def _radau_solve_exact_stage_residual_transpose_batched(
         )
     if mode == "block_colored_ntss_midpoint":
         return _radau_solve_exact_stage_residual_transpose_block_colored_ntss_midpoint(
+            kernel_context,
+            physics_context,
+            carry_in,
+            primal_result,
+            lagged_response,
+            rhs=rhs_arr,
+            batched=True,
+        )
+    if mode == "block_colored_database":
+        return _radau_solve_exact_stage_residual_transpose_block_colored_database(
             kernel_context,
             physics_context,
             carry_in,

@@ -5955,6 +5955,7 @@ def main() -> None:
             "bicgstab",
             "block",
             "block_colored_ntss_midpoint",
+            "block_colored_database",
             "block_explicit_ntx_jacobian",
             "block_frozen_forward_jacobian",
             "gmres",
@@ -5973,6 +5974,9 @@ def main() -> None:
             "NTSS-midpoint model: it reconstructs the dense block transpose from "
             "colored local actions plus the analytic rank-three correction, then "
             "uses the same dense multi-RHS solve as 'block'; "
+            "'block_colored_database' reconstructs the exact direct-database "
+            "block-tridiagonal transpose from colored custom state-transpose "
+            "actions, then uses the same dense multi-RHS solve as 'block'; "
             "'block_explicit_ntx_jacobian' keeps the exact block system but materializes "
             "each fixed-lagged NTX stage Jacobian from the explicit state pullback; "
             "'block_frozen_forward_jacobian' uses each replayed primal step's frozen "

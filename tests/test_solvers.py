@@ -1569,6 +1569,47 @@ def test_segment_primal_record_bwd_avoids_second_minimal_attempt_reconstruction(
     assert observed == {"minimal_attempt_calls": 1, "record_adapter_calls": 1}
 
 
+def test_colored_database_stage_matrix_recovers_exact_tridiagonal_transpose(monkeypatch):
+    """The database colored path is algebraically identical to its full matrix."""
+    dtype = jnp.float64
+    transpose_matrix = jnp.asarray(
+        [[2.0, -0.1, 0.0, 0.0], [0.3, 1.7, 0.2, 0.0],
+         [0.0, -0.4, 1.5, 0.6], [0.0, 0.0, 0.1, 1.2]],
+        dtype=dtype,
+    )
+    kernel_context = types.SimpleNamespace(num_stages=1, state_dim=4, dtype=dtype)
+    layout = types.SimpleNamespace(n_radial=4)
+    physics_context = types.SimpleNamespace(
+        reverse_rhs_transpose_mode="explicit_database",
+    )
+
+    monkeypatch.setattr(
+        transport_solvers,
+        "_radau_stage_to_radial_permutation_and_block_dim",
+        lambda _kernel: (layout, jnp.arange(4, dtype=jnp.int32), 1),
+    )
+    monkeypatch.setattr(
+        transport_solvers,
+        "_radau_exact_stage_times_states",
+        lambda *_args: (jnp.asarray([0.0], dtype=dtype), jnp.zeros((1, 4), dtype=dtype)),
+    )
+
+    def _matvec(_kernel, seen_physics, *_args, **_kwargs):
+        assert seen_physics is physics_context
+        # Each row is a direction; the helper returns the transpose action.
+        return _args[-1] @ transpose_matrix.T
+
+    monkeypatch.setattr(
+        transport_solvers,
+        "_radau_exact_stage_residual_transpose_matvec_batched",
+        _matvec,
+    )
+    actual = transport_solvers._radau_exact_stage_residual_transpose_matrix_colored_database(
+        kernel_context, physics_context, object(), object(), None,
+    )
+    assert jnp.allclose(actual, transpose_matrix, rtol=1.0e-12, atol=1.0e-12)
+
+
 def test_approximate_tangent_lift_preserves_minimal_segment_record_contract():
     """Generic-RHS fallback must not demand controller fields from a compact record."""
     value = jnp.asarray(1.0)
