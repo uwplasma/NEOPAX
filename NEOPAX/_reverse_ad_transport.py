@@ -7305,7 +7305,8 @@ def internal_realtime_geometry_transport_reverse_table_result_builder(
         elif str(realtime_geometry_payload_for_runtime(recorded_scan_runtime)["kind"]) == "ntx_scan_runtime":
             # A live scan model owns no prepared exact-NTX support tree.  Its
             # differentiable inputs are geometry, channels and scan surfaces;
-            # the interpolated database is rebuilt by the model itself.
+            # the recorded route additionally exposes its already-built
+            # interpolation database as a table-only support leaf.
             if not combined_geometry_payload:
                 raise ValueError(
                     "ntx_scan_runtime reverse requires the combined realtime "

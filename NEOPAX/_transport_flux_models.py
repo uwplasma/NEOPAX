@@ -4439,11 +4439,18 @@ class NTXRuntimeScanTransportModel(TransportFluxModelBase):
         )
 
     def _database_model(self) -> NTXDatabaseTransportModel:
+        # A recorded/prebuilt runtime owns a concrete interpolation database.
+        # Reusing it is essential for black-box Radau: rebuilding here would
+        # rerun the complete NTX scan every time a direct database model is
+        # requested, including from the compact reverse hooks.
+        database = self.database
+        if database is None:
+            database = self._build_runtime_database()
         return NTXDatabaseTransportModel(
             species=self.species,
             energy_grid=self.energy_grid,
             geometry=self.geometry,
-            database=self._build_runtime_database(),
+            database=database,
             collisionality_model=self.collisionality_model,
             bc_density=self.bc_density,
             bc_temperature=self.bc_temperature,

@@ -1942,6 +1942,10 @@ def test_live_ntx_scan_explicit_database_support_does_not_rebuild(monkeypatch):
         {"geometry": "geometry", "channels": channels, "surfaces": surfaces, "database": database}
     )
     assert result.database is database
+    # This is the path used by the direct black-box RHS and its compact
+    # pullbacks.  It must preserve the explicit database rather than invoking
+    # the runtime NTX scan builder a second time.
+    assert result._database_model().database is database
     assert calls == {"count": 0}
 
 
