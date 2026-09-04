@@ -4323,7 +4323,14 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
                     (geometry_objective_bar,) = geometry_pullback(
                         jnp.ones_like(objective_value)
                     )
-                    objective_payload_bar_rows.append(
+                    # The recorded scan payload also contains the direct
+                    # ``channels`` and ``surfaces`` branches.  Bootstrap has
+                    # no direct contribution to either one at this stage,
+                    # but every objective row must retain the identical
+                    # support pytree so the subsequent batched segment sweep
+                    # and one-time database fold can stack it safely.
+                    bootstrap_payload_bar = dict(zero_payload_bar)
+                    bootstrap_payload_bar.update(
                         {
                             "geometry": _sanitize_float_delta_bar_tree(
                                 geometry, geometry_objective_bar
@@ -4333,6 +4340,7 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
                             ),
                         }
                     )
+                    objective_payload_bar_rows.append(bootstrap_payload_bar)
                     if phase_timing_diagnostics:
                         objective_payload_bar_rows[-1] = jax.block_until_ready(
                             objective_payload_bar_rows[-1]
