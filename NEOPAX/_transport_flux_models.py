@@ -3488,7 +3488,98 @@ class NTXDatabaseTransportModel(TransportFluxModelBase):
         )
         return _split_flat_geometry(geometry_flat_bar)
 
+    def pullback_local_particle_flux_geometry_by_radius(
+        self, state, er_profile, residual_bars, geometry
+    ):
+        """Transpose selected-root charge residuals to fixed-database geometry.
+
+        The selected-root lane needs only the local charge-weighted particle
+        flux at each radius.  Keep the interpolation tables fixed and perform
+        one local geometry VJP per radius; the NTX scan is deliberately not
+        part of this boundary.
+        """
+
+        er_profile = jnp.asarray(er_profile, dtype=state.Er.dtype)
+        residual_bars = jnp.asarray(residual_bars, dtype=state.Er.dtype)
+        if residual_bars.ndim != 2 or residual_bars.shape[1] != er_profile.shape[0]:
+            raise ValueError(
+                "Local particle-flux geometry pullback expects residual_bars "
+                "with shape (objective_count, radial_count)."
+            )
+        state_with_er = dataclasses.replace(state, Er=er_profile)
+        charge = jnp.asarray(self.species.charge, dtype=state.Er.dtype)
+        radius_indices = jnp.arange(er_profile.shape[0], dtype=jnp.int32)
+        geometry_delta0 = _float_delta_tree_like(geometry)
+        delta_leaves, delta_treedef = jax.tree_util.tree_flatten(geometry_delta0)
+        delta_shapes = tuple(jnp.asarray(leaf).shape for leaf in delta_leaves)
+        delta_sizes = tuple(int(jnp.asarray(leaf).size) for leaf in delta_leaves)
+        flat_delta0 = jnp.concatenate(
+            tuple(jnp.ravel(jnp.asarray(leaf)) for leaf in delta_leaves)
+        )
+
+        def _split(flat_delta):
+            leaves = []
+            offset = 0
+            for size, shape in zip(delta_sizes, delta_shapes, strict=True):
+                leaves.append(jnp.reshape(flat_delta[offset : offset + size], shape))
+                offset += size
+            return delta_treedef.unflatten(leaves)
+
+        def _accumulate(flat_carry, radius_index):
+            def _local_residual(flat_delta):
+                model = dataclasses.replace(
+                    self,
+                    geometry=_add_float_delta_tree(geometry, _split(flat_delta)),
+                )
+                gamma = model.build_local_particle_flux_evaluator(state_with_er)(
+                    radius_index,
+                    er_profile[radius_index],
+                )
+                return jnp.sum(charge * gamma)
+
+            _, pullback = jax.vjp(_local_residual, flat_delta0)
+            local_bars = jax.vmap(lambda bar: pullback(bar)[0])(
+                residual_bars[:, radius_index]
+            )
+            return flat_carry + local_bars, None
+
+        flat_bars, _ = jax.lax.scan(
+            _accumulate,
+            jnp.zeros((residual_bars.shape[0], flat_delta0.size), dtype=flat_delta0.dtype),
+            radius_indices,
+        )
+        return delta_treedef.unflatten(
+            tuple(
+                jnp.reshape(
+                    flat_bars[:, sum(delta_sizes[:index]) : sum(delta_sizes[: index + 1])],
+                    (flat_bars.shape[0],) + shape,
+                )
+                for index, shape in enumerate(delta_shapes)
+            )
+        )
+
     def build_local_particle_flux_evaluator(self, state):
+        """Return the constrained particle flux at exactly one radial point.
+
+        The selected initial-:math:`E_r` root is pointwise.  Do not construct
+        the all-radii centre-flux table here merely to take one column: that
+        retained graph is especially costly when this evaluator is used inside
+        a geometry VJP.
+        """
+        def evaluator(radius_index, er_value):
+            return self._local_particle_flux_one_radius(state, radius_index, er_value)
+
+        return evaluator
+
+    def _local_particle_flux_one_radius(self, state, radius_index, er_value):
+        """Evaluate the constrained database particle flux at one radius.
+
+        This is algebraically the selected column of
+        :func:`get_Neoclassical_Fluxes`, while retaining only one interpolated
+        ``Lij`` matrix per species.  Gradients remain full-profile because the
+        finite-volume stencil at ``radius_index`` depends on neighbouring
+        cells, but the expensive radial database interpolation is local.
+        """
         species = self.species
         energy_grid = self.energy_grid
         geometry = self.geometry
@@ -3506,26 +3597,59 @@ class NTXDatabaseTransportModel(TransportFluxModelBase):
             self.geometry.r_grid_half,
         )
 
-        def evaluator(radius_index, er_value):
-            er_scalar = jnp.asarray(er_value, dtype=state.Er.dtype)
-            er_profile = state.Er.at[radius_index].set(er_scalar)
-            _, gamma_neo, _, _ = get_Neoclassical_Fluxes(
-                species,
-                energy_grid,
-                geometry,
-                database,
-                er_profile,
-                temperature,
-                density,
-                density_right_constraint=density_right_constraint,
-                density_right_grad_constraint=density_right_grad_constraint,
-                temperature_right_constraint=temperature_right_constraint,
-                temperature_right_grad_constraint=temperature_right_grad_constraint,
-                collisionality_model=self.collisionality_model,
+        density_right = density[:, -1] if density_right_constraint is None else density_right_constraint
+        density_right_grad = (
+            jnp.zeros_like(density_right)
+            if density_right_grad_constraint is None
+            else density_right_grad_constraint
+        )
+        temperature_right = (
+            temperature[:, -1]
+            if temperature_right_constraint is None
+            else temperature_right_constraint
+        )
+        temperature_right_grad = (
+            jnp.zeros_like(temperature_right)
+            if temperature_right_grad_constraint is None
+            else temperature_right_grad_constraint
+        )
+        dndr = jax.vmap(
+            lambda values, right, right_grad: get_gradient_density(
+                values, geometry.r_grid, geometry.r_grid_half, geometry.dr,
+                right_face_constraint=right, right_face_grad_constraint=right_grad,
             )
-            return gamma_neo[:, radius_index]
-
-        return evaluator
+        )(density, density_right, density_right_grad)
+        dtdr = jax.vmap(
+            lambda values, right, right_grad: get_gradient_temperature(
+                values, geometry.r_grid, geometry.r_grid_half, geometry.dr,
+                right_face_constraint=right, right_face_grad_constraint=right_grad,
+            )
+        )(temperature, temperature_right, temperature_right_grad)
+        er_scalar = jnp.asarray(er_value, dtype=state.Er.dtype)
+        er_profile = state.Er.at[radius_index].set(er_scalar)
+        v_thermal = get_v_thermal(species.mass, temperature)
+        species_indices = jnp.arange(int(species.number_species), dtype=jnp.int32)
+        lij = jax.vmap(
+            lambda species_index: get_Lij_matrix_local(
+                species, energy_grid, geometry, database, species_index, radius_index,
+                er_scalar, temperature, density, v_thermal,
+                _collisionality_kind(self.collisionality_model),
+            )
+        )(species_indices)
+        a1 = jax.vmap(
+            lambda charge, density_a, temperature_a, dndr_a, dtdr_a:
+            get_Thermodynamical_Forces_A1(
+                charge, density_a, temperature_a, dndr_a, dtdr_a, er_profile
+            )
+        )(species.charge, density, temperature, dndr, dtdr)
+        a2 = jax.vmap(get_Thermodynamical_Forces_A2)(temperature, dtdr)
+        a3 = get_Thermodynamical_Forces_A3(er_profile)
+        density_phys = 1.0e20 * density[:, radius_index]
+        return -density_phys * (
+            lij[:, 0, 0] * a1[:, radius_index]
+            + lij[:, 0, 1] * a2[:, radius_index]
+            + lij[:, 0, 2] * a3[radius_index]
+        )
 
     def evaluate_face_fluxes(self, state, face_state, **kwargs):
         evaluated = kwargs.get("evaluated_state")
@@ -4703,6 +4827,15 @@ class NTXRuntimeScanTransportModel(TransportFluxModelBase):
             state, upar_bar, geometry
         )
 
+    def pullback_local_particle_flux_geometry_by_radius(
+        self, state, er_profile, residual_bars, geometry
+    ):
+        """Delegate the compact selected-root geometry transpose."""
+
+        return self._database_model().pullback_local_particle_flux_geometry_by_radius(
+            state, er_profile, residual_bars, geometry
+        )
+
     def build_local_particle_flux_evaluator(self, state):
         return self._database_model().build_local_particle_flux_evaluator(state)
 
@@ -5043,17 +5176,142 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             "local_center_response": "center_local_response",
             "center_response": "center_local_response",
             "center_local": "center_local_response",
+            "interpolate_coefficients": "interpolate_face_coefficients",
+            "interpolate_face_coefficients": "interpolate_face_coefficients",
+            "face_coefficient_interpolation": "interpolate_face_coefficients",
         }
         mode = aliases.get(mode, mode)
-        if mode not in {"interpolate_from_faces", "center_local_response"}:
+        if mode not in {
+            "interpolate_from_faces",
+            "center_local_response",
+            "interpolate_face_coefficients",
+        }:
             raise ValueError(
                 "ntx_exact_center_response_mode must be one of: "
-                "interpolate_from_faces, center_local_response"
+                "interpolate_from_faces, center_local_response, "
+                "interpolate_face_coefficients"
             )
         return mode
 
     def _resolved_center_response_mode(self) -> str:
         return self._normalize_center_response_mode(self.center_response_mode)
+
+    def _interpolate_radial_response_values(self, source_rho, source_values, target_rho):
+        """Linearly interpolate a radius-leading response field.
+
+        This deliberately operates on a response *field*, never on an
+        assembled particle/heat flux.  The latter contains the face state and
+        thermodynamic forces and cannot be used as a centre-local model.
+        """
+
+        source_values = jnp.asarray(source_values)
+        source_rho = jnp.asarray(source_rho, dtype=source_values.dtype)
+        target_rho = jnp.asarray(target_rho, dtype=source_values.dtype)
+        flat_source = source_values.reshape((source_values.shape[0], -1)).T
+        flat_target = jax.vmap(
+            lambda values: jnp.interp(target_rho, source_rho, values)
+        )(flat_source)
+        return flat_target.T.reshape((target_rho.shape[0],) + source_values.shape[1:])
+
+    def _center_reference_scan_inputs(
+        self,
+        *,
+        channels,
+        Er,
+        temperature,
+        density,
+        v_thermal,
+        radius_coordinates,
+    ):
+        """Obtain centre reference NTX coordinates without an NTX solve."""
+
+        collisionality_kind = _collisionality_kind(self.collisionality_model)
+        species_indices = jnp.arange(int(self.species.number_species), dtype=jnp.int32)
+        radius_indices = jnp.arange(Er.shape[0], dtype=jnp.int32)
+
+        def _per_radius(radius_index):
+            drds_value = jax.lax.dynamic_index_in_dim(channels.drds, radius_index, axis=0, keepdims=False)
+            er_value = jax.lax.dynamic_index_in_dim(Er, radius_index, axis=0, keepdims=False)
+            temperature_local = jax.lax.dynamic_index_in_dim(temperature, radius_index, axis=1, keepdims=False)
+            density_local = jax.lax.dynamic_index_in_dim(density, radius_index, axis=1, keepdims=False)
+            vthermal_local = jax.lax.dynamic_index_in_dim(v_thermal, radius_index, axis=1, keepdims=False)
+            return jax.vmap(
+                lambda species_index: self._local_scan_inputs(
+                    drds_value=drds_value,
+                    species_index=species_index,
+                    er_value=er_value,
+                    temperature_local=temperature_local,
+                    density_local=density_local,
+                    vthermal_local=vthermal_local,
+                    collisionality_kind=collisionality_kind,
+                )[:2]
+            )(species_indices)
+
+        nu_hat, epsi_hat = self._map_radius_axis_regularized_at_axis0(
+            _per_radius, radius_indices, radius_coordinates
+        )
+        return nu_hat, epsi_hat
+
+    def _interpolate_face_quadratic_coefficients_to_centres(
+        self,
+        face_response: NTXQuadraticPreparedCoefficientResponse,
+        *,
+        center_reference_nu_hat,
+        center_reference_epsi_hat,
+    ) -> NTXQuadraticPreparedCoefficientResponse:
+        """Radially interpolate face NTX Taylor polynomials to cell centres.
+
+        Each face response is anchored at different ``(nu_hat, epsi_hat)``.
+        We first rebase every local quadratic polynomial into common absolute
+        coordinates, interpolate those coefficient fields in radius, and then
+        re-anchor at the actual centre state.  This is the coefficient-level
+        analogue of the database's radial Dij interpolation.
+        """
+
+        face_rho = jnp.asarray(self.geometry.r_grid_half, dtype=jnp.float64) / jnp.asarray(
+            self.geometry.a_b, dtype=jnp.float64
+        )
+        center_rho = jnp.asarray(self.geometry.r_grid, dtype=jnp.float64) / jnp.asarray(
+            self.geometry.a_b, dtype=jnp.float64
+        )
+        u = face_response.reference_nu_hat[..., None]
+        e = face_response.reference_epsi_hat[..., None]
+        c0 = face_response.reference_coefficients
+        cu = face_response.dcoefficients_d_nu_hat
+        ce = face_response.dcoefficients_d_epsi_hat
+        cuu = face_response.d2coefficients_d_nu_hat2
+        cue = face_response.d2coefficients_d_nu_hat_d_epsi_hat
+        cee = face_response.d2coefficients_d_epsi_hat2
+
+        # C(u,e) = a0 + au*u + ae*e + 1/2 auu*u^2 + aue*u*e + 1/2 aee*e^2.
+        a0 = c0 - cu * u - ce * e + 0.5 * cuu * u * u + cue * u * e + 0.5 * cee * e * e
+        au = cu - cuu * u - cue * e
+        ae = ce - cue * u - cee * e
+        interpolate = lambda field: self._interpolate_radial_response_values(face_rho, field, center_rho)
+        a0, au, ae, auu, aue, aee = tuple(
+            interpolate(field) for field in (a0, au, ae, cuu, cue, cee)
+        )
+
+        u_center = jnp.asarray(center_reference_nu_hat)[..., None]
+        e_center = jnp.asarray(center_reference_epsi_hat)[..., None]
+        center_c0 = (
+            a0 + au * u_center + ae * e_center
+            + 0.5 * auu * u_center * u_center
+            + aue * u_center * e_center
+            + 0.5 * aee * e_center * e_center
+        )
+        center_cu = au + auu * u_center + aue * e_center
+        center_ce = ae + aue * u_center + aee * e_center
+        return NTXQuadraticPreparedCoefficientResponse(
+            reference_nu_hat=center_reference_nu_hat,
+            reference_epsi_hat=center_reference_epsi_hat,
+            reference_coefficients=center_c0,
+            dcoefficients_d_nu_hat=center_cu,
+            dcoefficients_d_epsi_hat=center_ce,
+            d2coefficients_d_nu_hat2=auu,
+            d2coefficients_d_nu_hat_d_epsi_hat=aue,
+            d2coefficients_d_epsi_hat2=aee,
+        )
 
     @staticmethod
     def _normalize_derivative_field_pullback_mode(mode: str | None) -> str:
@@ -11853,9 +12111,15 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         face_density = safe_density(face_state.density, self.density_floor)
         face_temperature = face_state.temperature
         face_v_thermal = get_v_thermal(self.species.mass, face_temperature)
-        center_local_response = (
-            self._resolved_center_response_mode() == "center_local_response"
-        )
+        center_response_mode = self._resolved_center_response_mode()
+        center_local_response = center_response_mode == "center_local_response"
+        interpolate_face_coefficients = center_response_mode == "interpolate_face_coefficients"
+        if interpolate_face_coefficients and not self.full_state_quadratic_response:
+            raise NotImplementedError(
+                "interpolate_face_coefficients currently requires the full-state "
+                "quadratic NTX response; the linear reverse-capable lane will be "
+                "added after this forward representation is validated."
+            )
         # Conservative transport divergence always lives on faces.  Therefore
         # a direct-centre response is an *additional* cached axis response for
         # the local Er source, never a replacement for the face response.
@@ -11891,7 +12155,28 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         )
         _debug_lagged_response_if_nonfinite("ntx.build_lagged_response.face_response", face_response)
         center_response = None
-        if center_local_response:
+        if interpolate_face_coefficients:
+            if not isinstance(face_response, NTXFullStateQuadraticPreparedCoefficientResponse):
+                raise AssertionError(
+                    "interpolate_face_coefficients requires a full-state quadratic face response."
+                )
+            center_reference_nu_hat, center_reference_epsi_hat = self._center_reference_scan_inputs(
+                channels=support.center_channels,
+                Er=state.Er,
+                temperature=temperature,
+                density=density,
+                v_thermal=v_thermal,
+                radius_coordinates=self.geometry.r_grid,
+            )
+            center_response = NTXFullStateQuadraticPreparedCoefficientResponse(
+                reference_state=state,
+                coefficient_response=self._interpolate_face_quadratic_coefficients_to_centres(
+                    face_response.coefficient_response,
+                    center_reference_nu_hat=center_reference_nu_hat,
+                    center_reference_epsi_hat=center_reference_epsi_hat,
+                ),
+            )
+        elif center_local_response:
             center_response = self._build_axis_lagged_response(
                 channels=support.center_channels,
                 prepared_all=support.center_prepared,
@@ -11910,7 +12195,9 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                     reference_state=state,
                     coefficient_response=center_response,
                 )
-            _debug_lagged_response_if_nonfinite("ntx.build_lagged_response.center_response", center_response)
+        _debug_lagged_response_if_nonfinite(
+            "ntx.build_lagged_response.center_response", center_response
+        )
         if lagged_timing_enabled():
             jax.debug.callback(lambda: lagged_timing_end("ntx.build_lagged_response"), ordered=True)
         return NTXExactLijLaggedResponse(
@@ -15326,7 +15613,10 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                 lambda left, right: 0.5 * (left - right), plus, minus
             )
 
-        if self._resolved_center_response_mode() == "center_local_response":
+        if self._resolved_center_response_mode() in {
+            "center_local_response",
+            "interpolate_face_coefficients",
+        }:
             # Direct-centre mode owns two cached models: centres for local
             # terms and faces for conservative divergence.  Its tangent must
             # preserve the same complete representation as its value path.
@@ -15376,7 +15666,10 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             lagged_response.center_response,
             NTXFullStateQuadraticPreparedCoefficientResponse,
         ):
-            if self._resolved_center_response_mode() == "center_local_response":
+            if self._resolved_center_response_mode() in {
+                "center_local_response",
+                "interpolate_face_coefficients",
+            }:
                 centre_fluxes = self._evaluate_full_state_quadratic_center_response(
                     state, lagged_response.center_response
                 )

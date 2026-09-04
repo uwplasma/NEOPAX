@@ -33,6 +33,7 @@ from ._geometry_autodiff import (
 from ._orchestrator import prepare_transport_solver_components
 from ._profiles import AnalyticalProfileModel
 from ._reverse_ad_initial_er import (
+    compact_initial_er_database_geometry_bars,
     compact_initial_er_database_support_bars,
     fold_recorded_ntx_scan_database_bars_into_support,
     compact_initial_er_ntx_support_pullback_leaves,
@@ -6028,28 +6029,14 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
             root_ntx_support_pullback_elapsed = (
                 time.perf_counter() - root_ntx_support_pullback_start
             )
-            geometry = support_payload["geometry"]
-            geometry_delta0 = _float_delta_tree_like(geometry)
-
-            def _residuals_from_geometry_delta(geometry_delta):
-                payload = dict(support_payload)
-                payload["geometry"] = _add_float_delta_tree(geometry, geometry_delta)
-                runtime_with_geometry = (
-                    dependencies.runtime_with_realtime_geometry_reverse_support_payload(
-                        runtime, payload
-                    )
-                )
-                return dependencies.initial_er_charge_flux_residuals(
-                    pre_root_initial_state, er_profile, runtime=runtime_with_geometry
-                )
-
             root_geometry_pullback_start = time.perf_counter()
-            _, geometry_pullback = jax.vjp(
-                _residuals_from_geometry_delta, geometry_delta0
+            geometry_bars = compact_initial_er_database_geometry_bars(
+                runtime=runtime,
+                state=pre_root_initial_state,
+                er_profile=er_profile,
+                residual_bars=residual_bars,
+                support=support_payload,
             )
-            geometry_bars = jax.vmap(
-                lambda residual_bar: geometry_pullback(residual_bar)[0]
-            )(residual_bars)
             if phase_timing_diagnostics:
                 geometry_bars = jax.block_until_ready(geometry_bars)
             root_geometry_pullback_elapsed = time.perf_counter() - root_geometry_pullback_start

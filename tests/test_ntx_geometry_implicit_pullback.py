@@ -169,6 +169,48 @@ def test_database_initial_root_support_batches_charge_weighted_particle_bars(mon
     assert jnp.allclose(actual["gamma"], expected, rtol=0.0, atol=0.0)
 
 
+def test_database_initial_root_geometry_uses_recorded_database_payload(monkeypatch):
+    """The compact root geometry hook must not request a new NTX scan."""
+
+    seen = {}
+
+    class _ScanModel:
+        def with_support_payload(self, support):
+            seen["support"] = support
+            return self
+
+        def pullback_local_particle_flux_geometry_by_radius(
+            self, state, er_profile, residual_bars, geometry
+        ):
+            assert seen["support"]["database"] is database
+            assert geometry is support_geometry
+            assert state is root_state
+            assert er_profile is root_state.Er
+            return {"scale": 3.0 * residual_bars}
+
+    database = object()
+    support_geometry = object()
+    root_state = TransportState(
+        density=jnp.ones((1, 2)), pressure=jnp.ones((1, 2)), Er=jnp.asarray([0.1, 0.2])
+    )
+    residual_bars = jnp.asarray([[0.3, -0.2], [-0.4, 0.5]])
+    scan_model = _ScanModel()
+    monkeypatch.setattr(
+        initial_er_module,
+        "find_ntx_runtime_scan_model_in_model",
+        lambda _model: scan_model,
+    )
+    actual = initial_er_module.compact_initial_er_database_geometry_bars(
+        runtime=SimpleNamespace(models=SimpleNamespace(flux=object())),
+        state=root_state,
+        er_profile=root_state.Er,
+        residual_bars=residual_bars,
+        support={"geometry": support_geometry, "database": database},
+    )
+    assert seen["support"]["database"] is database
+    assert jnp.allclose(actual["scale"], 3.0 * residual_bars, rtol=0.0, atol=0.0)
+
+
 def test_momentum_correction_matrix_is_square_for_four_species():
     """The wHe bootstrap system has three Sonine unknowns per species."""
 
@@ -638,6 +680,64 @@ def test_database_local_bootstrap_state_pullback_matches_full_upar_jvp(
         strict=True,
     ):
         assert jnp.allclose(actual, expected, rtol=2.0e-10, atol=2.0e-10)
+
+    # The geometry half of the same selected-root boundary must use the
+    # pointwise database primitive, not build all radial flux columns and
+    # select one afterwards.  Check both its primal value and its geometry
+    # transpose against the established complete centre-flux calculation.
+    _, generic_gamma, _, _ = neoclassical_module.get_Neoclassical_Fluxes(
+        species,
+        model.energy_grid,
+        geometry,
+        database,
+        state.Er,
+        state.temperature,
+        state.density,
+    )
+    local_gamma = model.build_local_particle_flux_evaluator(state)
+    for radius_index in range(state.Er.shape[0]):
+        assert jnp.allclose(
+            local_gamma(jnp.asarray(radius_index), state.Er[radius_index]),
+            generic_gamma[:, radius_index],
+            rtol=2.0e-10,
+            atol=2.0e-10,
+        )
+
+    geometry_root_tangent = jax.jvp(
+        lambda geometry_value: jnp.sum(
+            species.charge_qp[:, None]
+            * neoclassical_module.get_Neoclassical_Fluxes(
+                species,
+                model.energy_grid,
+                geometry_value,
+                database,
+                state.Er,
+                state.temperature,
+                state.density,
+            )[1],
+            axis=0,
+        ),
+        (geometry,),
+        (geometry_direction,),
+    )[1]
+    geometry_root_bar = model.pullback_local_particle_flux_geometry_by_radius(
+        state, state.Er, root_residual_bars, geometry
+    )
+    geometry_root_lhs = sum(
+        jnp.vdot(jnp.asarray(bar), jnp.asarray(direction))
+        for bar, direction in zip(
+            jax.tree_util.tree_leaves(geometry_root_bar),
+            jax.tree_util.tree_leaves(geometry_direction),
+            strict=True,
+        )
+        if jnp.issubdtype(jnp.asarray(bar).dtype, jnp.inexact)
+    )
+    assert jnp.allclose(
+        geometry_root_lhs,
+        jnp.vdot(root_residual_bars, geometry_root_tangent),
+        rtol=2.0e-10,
+        atol=2.0e-10,
+    )
 
 
 def test_ntss_radial_flux_correction_terms_match_taguchi_formula():

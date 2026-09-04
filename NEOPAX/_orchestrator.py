@@ -146,6 +146,23 @@ def _resolve_transport_center_flux_mode(config: dict) -> str:
     if neo_name != "ntx_exact_lij_runtime" or legacy_mode is None:
         return universal_mode
 
+    # This is an exact-NTX implementation detail under the universal direct
+    # centre representation: faces still supply the conservative divergence,
+    # while a face-built coefficient model is interpolated and evaluated at
+    # centres for local terms.  It is not the old flux-averaging policy.
+    if str(legacy_mode).strip().lower() in {
+        "interpolate_face_coefficients",
+        "interpolate_coefficients",
+        "face_coefficient_interpolation",
+    }:
+        if has_universal_mode and universal_mode != "direct":
+            raise ValueError(
+                "neoclassical.ntx_exact_center_response_mode="
+                "'interpolate_face_coefficients' requires "
+                "transport_solver.center_flux_mode='direct'."
+            )
+        return "direct"
+
     legacy_as_universal = _normalize_transport_center_flux_mode(legacy_mode)
     if has_universal_mode and universal_mode != legacy_as_universal:
         raise ValueError(
@@ -624,11 +641,28 @@ def _build_flux_model(config: dict, species, energy_grid, geometry, database, so
             runtime_kwargs.setdefault("preload_support", True)
             # The exact model retains two internal response primitives, but
             # their selection is now owned by the universal transport policy.
-            runtime_kwargs["ntx_exact_center_response_mode"] = (
-                "center_local_response"
-                if solver_cfg["transport_center_flux_mode"] == "direct"
-                else "interpolate_from_faces"
+            requested_center_response_mode = runtime_kwargs.get(
+                "ntx_exact_center_response_mode"
             )
+            if str(requested_center_response_mode).strip().lower() in {
+                "interpolate_face_coefficients",
+                "interpolate_coefficients",
+                "face_coefficient_interpolation",
+            }:
+                if solver_cfg["transport_center_flux_mode"] != "direct":
+                    raise ValueError(
+                        "interpolate_face_coefficients requires "
+                        "transport_solver.center_flux_mode='direct'."
+                    )
+                runtime_kwargs["ntx_exact_center_response_mode"] = (
+                    "interpolate_face_coefficients"
+                )
+            else:
+                runtime_kwargs["ntx_exact_center_response_mode"] = (
+                    "center_local_response"
+                    if solver_cfg["transport_center_flux_mode"] == "direct"
+                    else "interpolate_from_faces"
+                )
         neoclassical_model = neoclassical_factory(
             species,
             energy_grid,
