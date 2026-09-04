@@ -532,6 +532,39 @@ def test_database_local_bootstrap_state_pullback_matches_full_upar_jvp(
     )
     assert jnp.allclose(lhs, jnp.vdot(upar_bar, upar_tangent), rtol=2.0e-10, atol=2.0e-10)
 
+    def _geometry_direction_leaf(value):
+        array = jnp.asarray(value)
+        if jnp.issubdtype(array.dtype, jnp.inexact):
+            return jnp.full_like(array, 0.013)
+        return jnp.zeros(array.shape, dtype=jax.dtypes.float0)
+
+    geometry_direction = jax.tree_util.tree_map(_geometry_direction_leaf, geometry)
+    geometry_upar_tangent = jax.jvp(
+        lambda geometry_value: dataclasses.replace(
+            model, geometry=geometry_value
+        ).evaluate_momentum_corrected_upar_only(state),
+        (geometry,),
+        (geometry_direction,),
+    )[1]
+    geometry_bar = model.pullback_momentum_corrected_upar_geometry_by_radius(
+        state, upar_bar, geometry
+    )
+    geometry_lhs = sum(
+        jnp.vdot(jnp.asarray(bar), jnp.asarray(direction))
+        for bar, direction in zip(
+            jax.tree_util.tree_leaves(geometry_bar),
+            jax.tree_util.tree_leaves(geometry_direction),
+            strict=True,
+        )
+        if jnp.issubdtype(jnp.asarray(bar).dtype, jnp.inexact)
+    )
+    assert jnp.allclose(
+        geometry_lhs,
+        jnp.vdot(upar_bar, geometry_upar_tangent),
+        rtol=2.0e-10,
+        atol=2.0e-10,
+    )
+
     def _upar_from_tables(d11_log, d13, d33):
         table_model = dataclasses.replace(
             model,

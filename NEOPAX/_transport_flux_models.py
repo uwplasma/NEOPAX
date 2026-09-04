@@ -3430,6 +3430,64 @@ class NTXDatabaseTransportModel(TransportFluxModelBase):
         table_bars, _ = jax.lax.scan(_accumulate, _zero_tables(), radius_indices)
         return table_bars
 
+    def pullback_momentum_corrected_upar_geometry_by_radius(
+        self, state, upar_bar, geometry
+    ):
+        """Transpose corrected-Upar to geometry with the database held fixed.
+
+        This is the black-box-database counterpart of the compact realtime-Lij
+        bootstrap geometry boundary.  It differentiates one local momentum
+        solve per radius, never rebuilds a runtime, regenerates an NTX scan,
+        or traces the complete all-radii corrected-flux evaluation.
+        """
+
+        upar_bar = jnp.asarray(upar_bar, dtype=state.pressure.dtype)
+        radius_indices = jnp.arange(upar_bar.shape[-1], dtype=jnp.int32)
+        geometry_delta0 = _float_delta_tree_like(geometry)
+        geometry_delta_leaves0, geometry_delta_treedef = jax.tree_util.tree_flatten(
+            geometry_delta0
+        )
+        geometry_delta_shapes = tuple(
+            jnp.asarray(leaf).shape for leaf in geometry_delta_leaves0
+        )
+        geometry_delta_sizes = tuple(
+            int(jnp.asarray(leaf).size) for leaf in geometry_delta_leaves0
+        )
+        flat_delta0 = jnp.concatenate(
+            tuple(jnp.ravel(jnp.asarray(leaf)) for leaf in geometry_delta_leaves0)
+        )
+
+        def _split_flat_geometry(flat_delta):
+            leaves = []
+            offset = 0
+            for size, shape in zip(
+                geometry_delta_sizes, geometry_delta_shapes, strict=True
+            ):
+                leaves.append(jnp.reshape(flat_delta[offset : offset + size], shape))
+                offset += size
+            return geometry_delta_treedef.unflatten(leaves)
+
+        def _accumulate(flat_carry, radius_index):
+            def _upar_from_geometry_delta(flat_delta):
+                geometry_delta = _split_flat_geometry(flat_delta)
+                model = dataclasses.replace(
+                    self,
+                    geometry=_add_float_delta_tree(geometry, geometry_delta),
+                )
+                return model._momentum_corrected_upar_one_radius(state, radius_index)
+
+            _, pullback = jax.vjp(_upar_from_geometry_delta, flat_delta0)
+            local_bar = jax.lax.dynamic_index_in_dim(
+                upar_bar, radius_index, axis=1, keepdims=False
+            )
+            (flat_bar,) = pullback(local_bar)
+            return flat_carry + flat_bar, None
+
+        geometry_flat_bar, _ = jax.lax.scan(
+            _accumulate, jnp.zeros_like(flat_delta0), radius_indices
+        )
+        return _split_flat_geometry(geometry_flat_bar)
+
     def build_local_particle_flux_evaluator(self, state):
         species = self.species
         energy_grid = self.energy_grid
@@ -4634,6 +4692,15 @@ class NTXRuntimeScanTransportModel(TransportFluxModelBase):
 
         return self._database_model().pullback_momentum_corrected_upar_database_by_radius(
             state, upar_bar
+        )
+
+    def pullback_momentum_corrected_upar_geometry_by_radius(
+        self, state, upar_bar, geometry
+    ):
+        """Delegate the fixed-database compact bootstrap geometry transpose."""
+
+        return self._database_model().pullback_momentum_corrected_upar_geometry_by_radius(
+            state, upar_bar, geometry
         )
 
     def build_local_particle_flux_evaluator(self, state):

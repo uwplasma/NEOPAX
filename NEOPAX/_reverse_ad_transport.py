@@ -4348,40 +4348,15 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
                         D33=d33_bar,
                     )
                     geometry = support_payload["geometry"]
-                    geometry_delta0 = _float_delta_tree_like(geometry)
-
-                    def _bootstrap_from_geometry_delta(geometry_delta):
-                        payload = dict(support_payload)
-                        payload["geometry"] = _add_float_delta_tree(
-                            geometry, geometry_delta
+                    if not callable(geometry_pullback_fn):
+                        raise NotImplementedError(
+                            "Recorded database bootstrap AD requires the compact "
+                            "fixed-database corrected-Upar geometry pullback."
                         )
-                        runtime_with_geometry = (
-                            dependencies.runtime_with_realtime_geometry_reverse_support_payload(
-                                runtime, payload
-                            )
-                        )
-                        geometry_flux_model = getattr(
-                            getattr(runtime_with_geometry, "models", None), "flux", None
-                        )
-                        geometry_neoclassical_model = getattr(
-                            geometry_flux_model,
-                            "neoclassical_model",
-                            geometry_flux_model,
-                        )
-                        geometry_fluxes = geometry_neoclassical_model.evaluate_momentum_corrected_fluxes(
-                            final_state_for_bootstrap
-                        )
-                        return bootstrap_current_softmax_abs_value_and_upar_bar(
-                            final_state_for_bootstrap,
-                            runtime_with_geometry,
-                            geometry_fluxes,
-                        )[0]
-
-                    _, geometry_pullback = jax.vjp(
-                        _bootstrap_from_geometry_delta, geometry_delta0
-                    )
-                    (geometry_objective_bar,) = geometry_pullback(
-                        jnp.ones_like(objective_value)
+                    geometry_objective_bar = geometry_pullback_fn(
+                        final_state_for_bootstrap,
+                        upar_bar,
+                        geometry,
                     )
                     # The recorded scan payload also contains the direct
                     # ``channels`` and ``surfaces`` branches.  Bootstrap has
