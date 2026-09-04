@@ -1608,6 +1608,14 @@ def test_colored_database_stage_matrix_recovers_exact_tridiagonal_transpose(monk
         kernel_context, physics_context, object(), object(), None,
     )
     assert jnp.allclose(actual, transpose_matrix, rtol=1.0e-12, atol=1.0e-12)
+    rhs_rows = jnp.asarray([[0.3, -0.2, 0.7, 0.1], [-0.1, 0.5, 0.2, -0.4]], dtype=dtype)
+    compact = transport_solvers._radau_solve_exact_stage_residual_transpose_block_colored_database(
+        kernel_context, physics_context, object(), object(), None, rhs=rhs_rows, batched=True,
+    )
+    dense = transport_solvers._radau_solve_exact_stage_residual_transpose_block_colored_database_dense_reference(
+        kernel_context, physics_context, object(), object(), None, rhs=rhs_rows, batched=True,
+    )
+    assert jnp.allclose(compact, dense, rtol=1.0e-12, atol=1.0e-12)
 
 
 def test_approximate_tangent_lift_preserves_minimal_segment_record_contract():

@@ -13197,7 +13197,56 @@ def _radau_solve_exact_stage_residual_transpose_block_colored_database(
     rhs,
     batched: bool = False,
 ):
-    """Solve the exact direct-database stage system reconstructed by coloring."""
+    """Solve the exact colored direct-database stage system compactly.
+
+    Unlike the NTSS-midpoint colored candidate, direct centre database fluxes
+    have no nonlocal low-rank correction.  The reconstructed radial bands are
+    therefore the complete operator and can be solved directly with the
+    block-tridiagonal multi-RHS solver.  Do not materialize a dense Radau
+    matrix here: that would defeat the purpose of the colored database path.
+    """
+    system_size = int(kernel_context.num_stages) * int(kernel_context.state_dim)
+    rhs_arr = jnp.asarray(rhs, dtype=kernel_context.dtype)
+    rhs_rows = rhs_arr.reshape((-1, system_size)) if batched else rhs_arr.reshape((1, system_size))
+    radial_permutation, radial_block_dim, block_lower, block_diagonal, block_upper = (
+        _radau_exact_stage_transpose_radial_bands_from_colored_matvec(
+            kernel_context,
+            physics_context,
+            carry_in,
+            primal_result,
+            lagged_response,
+        )
+    )
+    radial_rhs_columns = (-rhs_rows[:, radial_permutation]).T
+    radial_rhs_blocks = radial_rhs_columns.reshape(
+        (-1, radial_block_dim, radial_rhs_columns.shape[-1])
+    )
+    radial_solution_blocks = _radau_block_tridiagonal_solve(
+        block_lower,
+        block_diagonal,
+        block_upper,
+        radial_rhs_blocks,
+    )
+    radial_solution_rows = radial_solution_blocks.reshape(
+        (system_size, rhs_rows.shape[0])
+    ).T
+    solution_rows = jnp.zeros_like(rhs_rows).at[:, radial_permutation].set(
+        radial_solution_rows
+    )
+    return solution_rows if batched else solution_rows[0]
+
+
+def _radau_solve_exact_stage_residual_transpose_block_colored_database_dense_reference(
+    kernel_context: _RadauAcceptedStepKernelContext,
+    physics_context: _RadauAcceptedStepPhysicsContext,
+    carry_in: _RadauAcceptedStepCarry,
+    primal_result: _RadauAcceptedStepAttemptResult,
+    lagged_response,
+    *,
+    rhs,
+    batched: bool = False,
+):
+    """Dense reference retained only for tests of the compact database solve."""
     system_size = int(kernel_context.num_stages) * int(kernel_context.state_dim)
     rhs_arr = jnp.asarray(rhs, dtype=kernel_context.dtype)
     rhs_rows = rhs_arr.reshape((-1, system_size)) if batched else rhs_arr.reshape((1, system_size))
