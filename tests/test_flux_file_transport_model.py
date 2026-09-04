@@ -17,6 +17,7 @@ from NEOPAX._transport_flux_models import (
     PowerAnalyticalTurbulentTransportModel,
     SpectraXTurbulenceFDLaggedResponse,
     ReLUAnalyticalTurbulentTransportModel,
+    ZeroTransportModel,
     _sum_float_delta_bar_trees,
     build_fluxes_r_file_transport_model,
     read_flux_profile_file,
@@ -161,6 +162,60 @@ def test_combined_lagged_flux_model_applies_interpolate_from_faces_to_centres():
 
     assert jnp.allclose(out["Gamma_faces"], expected_faces)
     assert jnp.allclose(out["Gamma"], jax.vmap(cell_centered_from_faces)(expected_faces))
+
+
+def test_combined_lagged_flux_does_not_zero_missing_neoclassical_faces():
+    """A centre-only model may not be silently erased from face divergence.
+
+    This is the direct-centre quadratic-NTX shape: the neoclassical cached
+    response supplies centres, while a face-based turbulent response supplies
+    faces.  The composite must leave the face keys absent so the equation
+    layer takes its explicit face fallback; manufacturing face keys with zero
+    neoclassical contribution loses the neoclassical divergence.
+    """
+
+    class _CentreOnlyModel:
+        def __call__(self, state):
+            del state
+            centre = jnp.asarray([[10.0, 20.0], [30.0, 40.0]])
+            return {"Gamma": centre, "Q": 2.0 * centre, "Upar": 3.0 * centre}
+
+        def build_lagged_response(self, state, **kwargs):
+            del state, kwargs
+            return object()
+
+        def evaluate_with_lagged_response(self, state, response, **kwargs):
+            del response, kwargs
+            return self(state)
+
+    class _FaceModel(_CentreOnlyModel):
+        def evaluate_with_lagged_response(self, state, response, **kwargs):
+            out = super().evaluate_with_lagged_response(state, response, **kwargs)
+            face = jnp.asarray([[1.0, 3.0, 5.0], [2.0, 4.0, 6.0]])
+            out.update({"Gamma_faces": face, "Q_faces": 2.0 * face, "Upar_faces": 3.0 * face})
+            return out
+
+    state = TransportState(
+        density=jnp.ones((2, 2)), pressure=jnp.ones((2, 2)), Er=jnp.zeros(2)
+    )
+    neo = _CentreOnlyModel()
+    turb = _FaceModel()
+    combined = CombinedTransportFluxModel(
+        neo,
+        turb,
+        ZeroTransportModel(shape=(2, 2)),
+        geometry=DummyGeometry(),
+        center_flux_mode="direct",
+    )
+
+    output = combined.evaluate_with_lagged_response(
+        state, combined.build_lagged_response(state)
+    )
+
+    assert "Gamma_faces" not in output
+    assert "Q_faces" not in output
+    assert "Upar_faces" not in output
+    assert jnp.allclose(output["Gamma"], 2.0 * neo(state)["Gamma"])
 
 
 def test_combined_lagged_pullback_transposes_interpolated_centres_to_faces():

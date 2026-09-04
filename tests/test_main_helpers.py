@@ -390,6 +390,10 @@ def test_ntx_exact_runtime_quadratic_lagged_response_matches_live_reference(resp
         direct_full_state_response.center_response,
         NTXFullStateQuadraticPreparedCoefficientResponse,
     )
+    assert isinstance(
+        direct_full_state_response.face_response,
+        NTXFullStateQuadraticPreparedCoefficientResponse,
+    )
     direct_full_state = direct_full_state_model.evaluate_with_lagged_response(
         state, direct_full_state_response
     )
@@ -398,12 +402,24 @@ def test_ntx_exact_runtime_quadratic_lagged_response_matches_live_reference(resp
         assert jnp.allclose(
             direct_full_state[name], direct_center[name], rtol=3.0e-6, atol=1.0e-12
         )
+        assert jnp.allclose(
+            direct_full_state[f"{name}_faces"], direct[name], rtol=3.0e-6, atol=1.0e-12
+        )
 
     direction = TransportState(
         density=jnp.asarray([[0.04, -0.03], [-0.02, 0.01]]),
         pressure=jnp.asarray([[0.06, -0.04], [-0.03, 0.02]]),
         Er=jnp.asarray([2.0e-5, -1.5e-5]),
     )
+
+    direct_full_state_tangent = (
+        direct_full_state_model.evaluate_with_lagged_response_tangent(
+            state, direction, direct_full_state_response
+        )
+    )
+    for name in ("Gamma", "Q", "Upar"):
+        assert name in direct_full_state_tangent
+        assert f"{name}_faces" in direct_full_state_tangent
 
     def _state_at(scale):
         return TransportState(

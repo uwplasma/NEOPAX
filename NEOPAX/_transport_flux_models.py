@@ -1390,6 +1390,29 @@ class CombinedTransportFluxModel(TransportFluxModelBase):
             return jnp.zeros_like(jnp.asarray(reference))
         return fallback
 
+    @staticmethod
+    def _has_complete_face_fluxes(fluxes):
+        """Whether one model supplied the complete face representation."""
+
+        return all(
+            f"{name}_faces" in fluxes and fluxes[f"{name}_faces"] is not None
+            for name in ("Gamma", "Q", "Upar")
+        )
+
+    @classmethod
+    def _can_contribute_face_fluxes(cls, model, fluxes):
+        """A zero model is the sole valid exception to a complete face payload.
+
+        A partial payload must never be interpreted as zero contribution from
+        the missing model.  In particular, a centre-only cached neoclassical
+        response combined with face-based turbulence used to manufacture
+        ``*_faces`` fields with the neoclassical part silently set to zero.
+        That bypassed the equation-level face fallback and dropped the
+        neoclassical conservative divergence.
+        """
+
+        return isinstance(model, ZeroTransportModel) or cls._has_complete_face_fluxes(fluxes)
+
     def _canonical_face_fluxes(self, state):
         """Evaluate total face fluxes under one stable public key convention."""
 
@@ -1686,9 +1709,13 @@ class CombinedTransportFluxModel(TransportFluxModelBase):
         classical = self.classical_model.evaluate_face_fluxes(state, face_state, **kwargs)
         if neo is None or turb is None or classical is None:
             return None
-        has_face_fluxes = any(
-            "Gamma_faces" in fluxes and "Q_faces" in fluxes and "Upar_faces" in fluxes
-            for fluxes in (neo, turb, classical)
+        has_face_fluxes = all(
+            self._can_contribute_face_fluxes(model, fluxes)
+            for model, fluxes in (
+                (self.neoclassical_model, neo),
+                (self.turbulent_model, turb),
+                (self.classical_model, classical),
+            )
         )
         has_center_fluxes = all(
             "Gamma" in fluxes and "Q" in fluxes and "Upar" in fluxes
@@ -2338,9 +2365,13 @@ class CombinedTransportFluxModel(TransportFluxModelBase):
                 **kwargs,
             )
         )
-        has_face_fluxes = any(
-            "Gamma_faces" in fluxes and "Q_faces" in fluxes and "Upar_faces" in fluxes
-            for fluxes in (neo, turb, classical)
+        has_face_fluxes = all(
+            self._can_contribute_face_fluxes(model, fluxes)
+            for model, fluxes in (
+                (self.neoclassical_model, neo),
+                (self.turbulent_model, turb),
+                (self.classical_model, classical),
+            )
         )
         has_center_fluxes = all(
             "Gamma" in fluxes and "Q" in fluxes and "Upar" in fluxes
@@ -11758,28 +11789,27 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         center_local_response = (
             self._resolved_center_response_mode() == "center_local_response"
         )
-        # A direct-centre quadratic response never consumes face coefficients.
-        # Do not build a second NTX Hessian payload merely to keep the old
-        # face-first response shape; this is the key memory/cost distinction
-        # between direct centres and face interpolation.
-        face_response = None
-        if not (self.full_state_quadratic_response and center_local_response):
-            face_response = self._build_axis_lagged_response(
-                channels=support.face_channels,
-                prepared_all=support.face_prepared,
-                radius_coordinates=self.geometry.r_grid_half,
-                Er=face_state.Er,
-                temperature=face_temperature,
-                density=face_density,
-                v_thermal=face_v_thermal,
+        # Conservative transport divergence always lives on faces.  Therefore
+        # a direct-centre response is an *additional* cached axis response for
+        # the local Er source, never a replacement for the face response.
+        # Both payloads are built at a rebuild and both are evaluated cheaply
+        # at stages; no stage may fall back to a live NTX solve.
+        face_response = self._build_axis_lagged_response(
+            channels=support.face_channels,
+            prepared_all=support.face_prepared,
+            radius_coordinates=self.geometry.r_grid_half,
+            Er=face_state.Er,
+            temperature=face_temperature,
+            density=face_density,
+            v_thermal=face_v_thermal,
+        )
+        if self.full_state_quadratic_response:
+            if not isinstance(face_response, NTXQuadraticPreparedCoefficientResponse):
+                raise AssertionError("full-state quadratic response requires quadratic coefficient payload.")
+            face_response = NTXFullStateQuadraticPreparedCoefficientResponse(
+                reference_state=state,
+                coefficient_response=face_response,
             )
-            if self.full_state_quadratic_response:
-                if not isinstance(face_response, NTXQuadraticPreparedCoefficientResponse):
-                    raise AssertionError("full-state quadratic response requires quadratic coefficient payload.")
-                face_response = NTXFullStateQuadraticPreparedCoefficientResponse(
-                    reference_state=state,
-                    coefficient_response=face_response,
-                )
         _debug_arrays_if_any_nonfinite(
             "ntx.build_lagged_response.face_state",
             (
@@ -15191,7 +15221,7 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         state_direction: TransportState,
         lagged_response: NTXExactLijLaggedResponse,
     ) -> dict[str, jax.Array]:
-        """Exact directional tangent of the cached quadratic NTX face model.
+        """Exact directional tangent of the cached quadratic NTX response.
 
         The full-state response is an explicit quadratic polynomial in the
         transport-state displacement.  Its centred polarization is therefore
@@ -15201,18 +15231,11 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
 
         Each side uses the existing written second-order jet composition and
         cached NTX coefficient Hessian; no generic JVP and no NTX rebuild are
-        involved.  The equation-level mixed tangent will consume this flux
-        primitive when constructing the opt-in stage Newton operator.
+        involved.  Face-interpolated mode returns faces; direct-centre mode
+        returns its complete cached centre-and-face representation. The
+        equation-level mixed tangent consumes this primitive when constructing
+        the opt-in stage Newton operator.
         """
-        response = (
-            lagged_response.center_response
-            if self._resolved_center_response_mode() == "center_local_response"
-            else lagged_response.face_response
-        )
-        if not isinstance(response, NTXFullStateQuadraticPreparedCoefficientResponse):
-            raise NotImplementedError(
-                "Quadratic tangents require the full_state_quadratic_response payload."
-            )
         plus_state = dataclasses.replace(
             state,
             density=state.density + state_direction.density,
@@ -15225,14 +15248,34 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             pressure=state.pressure - state_direction.pressure,
             Er=state.Er - state_direction.Er,
         )
-        evaluate = (
-            self._evaluate_full_state_quadratic_center_response
-            if self._resolved_center_response_mode() == "center_local_response"
-            else self._evaluate_full_state_quadratic_face_response
+        def _polarized(evaluate, response):
+            if not isinstance(response, NTXFullStateQuadraticPreparedCoefficientResponse):
+                raise NotImplementedError(
+                    "Quadratic tangents require the full_state_quadratic_response payload."
+                )
+            plus = evaluate(plus_state, response)
+            minus = evaluate(minus_state, response)
+            return jax.tree_util.tree_map(
+                lambda left, right: 0.5 * (left - right), plus, minus
+            )
+
+        if self._resolved_center_response_mode() == "center_local_response":
+            # Direct-centre mode owns two cached models: centres for local
+            # terms and faces for conservative divergence.  Its tangent must
+            # preserve the same complete representation as its value path.
+            centre = _polarized(
+                self._evaluate_full_state_quadratic_center_response,
+                lagged_response.center_response,
+            )
+            faces = _polarized(
+                self._evaluate_full_state_quadratic_face_response,
+                lagged_response.face_response,
+            )
+            return {**centre, **faces}
+        return _polarized(
+            self._evaluate_full_state_quadratic_face_response,
+            lagged_response.face_response,
         )
-        plus = evaluate(plus_state, response)
-        minus = evaluate(minus_state, response)
-        return jax.tree_util.tree_map(lambda left, right: 0.5 * (left - right), plus, minus)
 
     def evaluate_with_lagged_response_tangent(
         self,
@@ -15267,9 +15310,13 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             NTXFullStateQuadraticPreparedCoefficientResponse,
         ):
             if self._resolved_center_response_mode() == "center_local_response":
-                return self._evaluate_full_state_quadratic_center_response(
+                centre_fluxes = self._evaluate_full_state_quadratic_center_response(
                     state, lagged_response.center_response
                 )
+                face_fluxes = self._evaluate_full_state_quadratic_face_response(
+                    state, lagged_response.face_response
+                )
+                return {**centre_fluxes, **face_fluxes}
             return self._evaluate_full_state_quadratic_face_response(
                 state, lagged_response.face_response
             )
