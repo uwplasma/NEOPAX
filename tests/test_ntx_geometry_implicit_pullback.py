@@ -746,7 +746,10 @@ def test_database_local_bootstrap_state_pullback_matches_full_upar_jvp(
         state, state.Er, root_residual_bars, geometry
     )
     geometry_root_lhs = sum(
-        jnp.vdot(jnp.asarray(bar), jnp.asarray(direction))
+        jnp.sum(
+            jnp.asarray(bar) * jnp.asarray(direction),
+            axis=tuple(range(1, jnp.asarray(bar).ndim)),
+        )
         for bar, direction in zip(
             jax.tree_util.tree_leaves(geometry_root_bar),
             jax.tree_util.tree_leaves(geometry_direction),
@@ -759,7 +762,7 @@ def test_database_local_bootstrap_state_pullback_matches_full_upar_jvp(
     )
     assert jnp.allclose(
         geometry_root_lhs,
-        jnp.vdot(root_residual_bars, geometry_root_tangent),
+        jnp.sum(root_residual_bars * geometry_root_tangent[None, :], axis=1),
         rtol=2.0e-10,
         atol=2.0e-10,
     )
