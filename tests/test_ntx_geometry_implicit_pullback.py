@@ -645,6 +645,24 @@ def test_database_local_bootstrap_state_pullback_matches_full_upar_jvp(
     ):
         assert jnp.allclose(actual, expected, rtol=2.0e-10, atol=2.0e-10)
 
+    # The direct black-box database RHS must retain its generic derivative
+    # exactly while using the split state-transpose implementation.
+    direct_flux_bar = {
+        "Gamma": jnp.asarray([[0.2, -0.1], [-0.3, 0.4], [0.1, 0.25], [-0.2, 0.05]]),
+        "Q": jnp.asarray([[-0.15, 0.2], [0.1, -0.25], [0.3, -0.05], [0.2, 0.1]]),
+        "Upar": jnp.asarray([[0.05, 0.15], [-0.2, 0.1], [0.12, -0.18], [0.08, 0.06]]),
+    }
+    _, generic_direct_pullback = jax.vjp(lambda state_value: model(state_value), state)
+    (expected_direct_state_bar,) = generic_direct_pullback(direct_flux_bar)
+    actual_direct_state_bar = model.pullback_direct_rhs_state(state, direct_flux_bar)
+    for actual, expected in zip(
+        jax.tree_util.tree_leaves(actual_direct_state_bar),
+        jax.tree_util.tree_leaves(expected_direct_state_bar),
+        strict=True,
+    ):
+        if jnp.issubdtype(jnp.asarray(expected).dtype, jnp.inexact):
+            assert jnp.allclose(actual, expected, rtol=2.0e-10, atol=2.0e-10)
+
 def test_ntss_radial_flux_correction_terms_match_taguchi_formula():
     """Port the four additive Taguchi terms without changing Upar."""
 

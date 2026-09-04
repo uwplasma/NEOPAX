@@ -38,6 +38,7 @@ from ._neoclassical import (
     get_Matrix,
     get_momentum_Correction,
     get_corrected_fluxes,
+    get_Lij_matrix,
     get_Lij_matrix_local,
     get_Neoclassical_Fluxes,
     get_Neoclassical_Fluxes_Faces,
@@ -2969,15 +2970,101 @@ class NTXDatabaseTransportModel(TransportFluxModelBase):
             value = jnp.asarray(value)
             return zero if value.ndim == 0 or value.dtype == jax.dtypes.float0 else value
 
-        _, pullback = jax.vjp(
-            lambda state_value: self(state_value),
-            state,
+        # Split the centre-flux transpose at the same boundaries as the
+        # exact-Lij implementation: flux algebra, local Lij construction,
+        # finite-volume gradients, then TransportState unpacking.  In
+        # particular, do not ask JAX for one VJP through the complete flux
+        # model for every Radau state-basis cotangent.
+        def _primitive_inputs(state_value):
+            density_value = safe_density(state_value.density, self.density_floor)
+            return density_value, state_value.temperature, state_value.Er
+
+        density, temperature, er_profile = _primitive_inputs(state)
+
+        def _gradients(density_value, temperature_value):
+            # ``__call__`` deliberately uses the ordinary direct-centre RHS
+            # contract: no root-specific boundary constraints. Match its
+            # ``get_Neoclassical_Fluxes`` default exactly.
+            density_right_value = density_value[:, -1]
+            density_right_grad_value = jnp.zeros_like(density_right_value)
+            temperature_right_value = temperature_value[:, -1]
+            temperature_right_grad_value = jnp.zeros_like(temperature_right_value)
+            dndr_value = jax.vmap(
+                lambda values, right, right_grad: get_gradient_density(
+                    values, self.geometry.r_grid, self.geometry.r_grid_half, self.geometry.dr,
+                    right_face_constraint=right, right_face_grad_constraint=right_grad,
+                )
+            )(density_value, density_right_value, density_right_grad_value)
+            dtdr_value = jax.vmap(
+                lambda values, right, right_grad: get_gradient_temperature(
+                    values, self.geometry.r_grid, self.geometry.r_grid_half, self.geometry.dr,
+                    right_face_constraint=right, right_face_grad_constraint=right_grad,
+                )
+            )(temperature_value, temperature_right_value, temperature_right_grad_value)
+            return dndr_value, dtdr_value
+
+        dndr, dtdr = _gradients(density, temperature)
+
+        def _lij(density_value, temperature_value, er_value):
+            vthermal_value = get_v_thermal(self.species.mass, temperature_value)
+            return jax.vmap(
+                lambda species_index: jax.vmap(
+                    lambda radius_index: get_Lij_matrix(
+                        self.species, self.energy_grid, self.geometry, self.database,
+                        species_index, radius_index, er_value, temperature_value,
+                        density_value, vthermal_value,
+                        _collisionality_kind(self.collisionality_model),
+                    )
+                )(self.geometry.full_grid_indices)
+            )(self.species.species_indices)
+
+        lij = _lij(density, temperature, er_profile)
+
+        def _flux_algebra(lij_value, density_value, temperature_value, dndr_value, dtdr_value, er_value):
+            a1 = jax.vmap(
+                lambda charge, density_a, temperature_a, dndr_a, dtdr_a:
+                get_Thermodynamical_Forces_A1(
+                    charge, density_a, temperature_a, dndr_a, dtdr_a, er_value
+                )
+            )(self.species.charge, density_value, temperature_value, dndr_value, dtdr_value)
+            a2 = jax.vmap(get_Thermodynamical_Forces_A2)(temperature_value, dtdr_value)
+            a3 = get_Thermodynamical_Forces_A3(er_value)
+            density_phys = DENSITY_STATE_TO_PHYSICAL * density_value
+            temperature_phys = TEMPERATURE_STATE_TO_PHYSICAL * temperature_value
+            return {
+                "Gamma": -density_phys * (
+                    lij_value[:, :, 0, 0] * a1
+                    + lij_value[:, :, 0, 1] * a2
+                    + lij_value[:, :, 0, 2] * a3[None, :]
+                ),
+                "Q": -temperature_phys * density_phys * (
+                    lij_value[:, :, 1, 0] * a1
+                    + lij_value[:, :, 1, 1] * a2
+                    + lij_value[:, :, 1, 2] * a3[None, :]
+                ),
+                "Upar": -density_phys * (
+                    lij_value[:, :, 2, 0] * a1
+                    + lij_value[:, :, 2, 1] * a2
+                    + lij_value[:, :, 2, 2] * a3[None, :]
+                ),
+            }
+
+        _, algebra_pullback = jax.vjp(
+            _flux_algebra, lij, density, temperature, dndr, dtdr, er_profile
         )
-        (state_bar,) = pullback({
-            "Gamma": _bar("Gamma"),
-            "Q": _bar("Q"),
-            "Upar": _bar("Upar"),
-        })
+        lij_bar, density_bar, temperature_bar, dndr_bar, dtdr_bar, er_bar = algebra_pullback(
+            {"Gamma": _bar("Gamma"), "Q": _bar("Q"), "Upar": _bar("Upar")}
+        )
+        _, lij_pullback = jax.vjp(_lij, density, temperature, er_profile)
+        lij_density_bar, lij_temperature_bar, lij_er_bar = lij_pullback(lij_bar)
+        _, gradients_pullback = jax.vjp(_gradients, density, temperature)
+        gradient_density_bar, gradient_temperature_bar = gradients_pullback((dndr_bar, dtdr_bar))
+        _, state_inputs_pullback = jax.vjp(_primitive_inputs, state)
+        (state_bar,) = state_inputs_pullback((
+            density_bar + lij_density_bar + gradient_density_bar,
+            temperature_bar + lij_temperature_bar + gradient_temperature_bar,
+            er_bar + lij_er_bar,
+        ))
         return state_bar
 
     def pullback_direct_rhs_support_payload(self, state, flux_bar, support):
