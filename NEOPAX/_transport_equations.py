@@ -2897,6 +2897,25 @@ class ComposedEquationSystem:
             **self._shared_flux_bc_kwargs(),
         )
 
+        # The flux dictionary also carries structural leaves for some
+        # reconstruction modes (for example integer face/index metadata).
+        # They are held fixed by the assembly, but JAX still requires their
+        # tangent leaves to be ``float0`` rather than ordinary floating
+        # zeros.  The custom NTX tangent intentionally returns numerical
+        # zeros for every dictionary leaf, so normalise those structural
+        # tangents here at the equation/assembly boundary.
+        def _jvp_tangent_like(primal, tangent):
+            primal_array = jnp.asarray(primal)
+            if jnp.issubdtype(primal_array.dtype, jnp.inexact):
+                return tangent
+            return jnp.zeros_like(primal_array, dtype=jax.dtypes.float0)
+
+        shared_flux_direction = jax.tree_util.tree_map(
+            _jvp_tangent_like,
+            shared_fluxes,
+            shared_flux_direction,
+        )
+
         def _assemble(working_state_value, flux_value):
             return self._evaluate_with_shared_fluxes_from_working_state(
                 working_state_value, eidx, state, flux_value
