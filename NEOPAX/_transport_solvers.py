@@ -1150,6 +1150,15 @@ def _direct_rhs_support_pullback_hook(vector_field: Callable):
     return pullback_fn if callable(pullback_fn) else None
 
 
+def _direct_rhs_state_pullback_hook(vector_field: Callable):
+    """Optional state transpose for a true direct/black-box RHS."""
+    owner = getattr(vector_field, "__self__", None)
+    if owner is None:
+        return None
+    pullback_fn = getattr(owner, "pullback_direct_rhs_state", None)
+    return pullback_fn if callable(pullback_fn) else None
+
+
 def _lagged_response_eval_all_pullback_hook(vector_field: Callable):
     owner = getattr(vector_field, "__self__", None)
     if owner is None:
@@ -1947,6 +1956,36 @@ def _flat_rhs_split_state_pullback_factory(
         return flat_bar
 
     return _pullback
+
+
+def _flat_rhs_direct_black_box_state_pullback_factory(
+    unravel, pack_flat, vector_field, args, kwargs, *, project_flat=None
+):
+    """Flatten a direct-RHS state transpose without a lagged-response input."""
+    pullback_fn = _direct_rhs_state_pullback_hook(vector_field)
+    if pullback_fn is None:
+        return None
+    unravel_bar = getattr(unravel, "cotangent", unravel)
+
+    def _pullback(t_value, flat_y, _lagged_response, rhs_bar_flat):
+        projected_flat_y = _project_flat_state_if_needed(flat_y, project_flat)
+        state_y = unravel(projected_flat_y)
+        rhs_bar_state = unravel_bar(
+            jnp.asarray(rhs_bar_flat, dtype=jnp.asarray(flat_y).dtype)
+        )
+        state_bar = pullback_fn(t_value, state_y, *args, rhs_bar_state, **kwargs)
+        if state_bar is None:
+            # A capability may reject an unsupported representation.  This
+            # factory is not installed in that case at setup time, but retain
+            # an explicit failure if a dynamic model violates its contract.
+            raise ValueError("Direct black-box RHS state pullback returned None.")
+        projected_bar = pack_flat(state_bar)
+        if project_flat is None:
+            return projected_bar
+        _, project_pullback = jax.vjp(project_flat, flat_y)
+        return project_pullback(projected_bar)[0]
+
+    return jax.jit(_pullback, inline=False)
 
 
 def _solver_error_norm(err_vec, flat_ref, flat_candidate, atol: float, rtol: float, scale_mode: str = "max", rtol_eff=None, scale_override=None):
@@ -4160,6 +4199,7 @@ class _RadauAdaptiveScheduleRolloutResult:
     completed: Any
     failed: Any
     fail_code: Any
+    segment_start_carries: Any = None
 
 
 @jax.tree_util.register_dataclass
@@ -4513,6 +4553,7 @@ class _RadauAcceptedStepPhysicsContext:
     flat_rhs_lagged_response_all_pullback: Callable[[Any, Any, Any, Any, Any], tuple[Any, Any, Any]] | None = None
     flat_rhs_state_and_lagged_response_pullback: Callable[[Any, Any, Any, Any], tuple[Any, Any]] | None = None
     flat_rhs_state_pullback: Callable[[Any, Any, Any, Any], Any] | None = None
+    flat_rhs_direct_black_box_state_pullback: Callable[[Any, Any, Any, Any], Any] | None = None
     flat_rhs_direct_state_pullback: Callable[[Any, Any, Any, Any], Any] | None = None
     flat_rhs_direct_state_pullback_generic: Callable[[Any, Any, Any, Any], Any] | None = None
     flat_rhs_direct_density_state_pullback: Callable[[Any, Any, Any, Any], Any] | None = None
@@ -10095,6 +10136,16 @@ def _radau_exact_stage_residual_input_pullback(
                 cotangent,
             )
         if (
+            rhs_transpose_mode in {"explicit_database", "database", "explicit_black_box_database"}
+            and physics_context.flat_rhs_direct_black_box_state_pullback is not None
+        ):
+            return physics_context.flat_rhs_direct_black_box_state_pullback(
+                t_eval,
+                y_eval,
+                lagged_response,
+                cotangent,
+            )
+        if (
             rhs_transpose_mode in {"explicit", "explicit_ntx_interpolated"}
             and physics_context.flat_rhs_state_pullback is not None
         ):
@@ -10414,6 +10465,13 @@ def _radau_exact_stage_residual_transpose_matvec(
         if zero_rhs_state_cotangent:
             return jnp.zeros_like(y_eval)
         if (
+            rhs_transpose_mode in {"explicit_database", "database", "explicit_black_box_database"}
+            and physics_context.flat_rhs_direct_black_box_state_pullback is not None
+        ):
+            return physics_context.flat_rhs_direct_black_box_state_pullback(
+                t_eval, y_eval, lagged_response, lambda_eval
+            )
+        if (
             zero_rhs_direct_cotangent
             and rhs_transpose_mode in {"explicit", "explicit_ntx_interpolated"}
             and physics_context.flat_rhs_flux_state_pullback is not None
@@ -10533,6 +10591,13 @@ def _radau_exact_stage_residual_transpose_matvec_batched(
     def _stage_rhs_vjp(t_eval, y_eval, lambda_eval):
         if zero_rhs_state_cotangent:
             return jnp.zeros_like(y_eval)
+        if (
+            rhs_transpose_mode in {"explicit_database", "database", "explicit_black_box_database"}
+            and physics_context.flat_rhs_direct_black_box_state_pullback is not None
+        ):
+            return physics_context.flat_rhs_direct_black_box_state_pullback(
+                t_eval, y_eval, lagged_response, lambda_eval
+            )
         if (
             zero_rhs_direct_cotangent
             and rhs_transpose_mode in {"explicit", "explicit_ntx_interpolated"}
@@ -10963,6 +11028,9 @@ def _radau_exact_stage_residual_matrix(
     matrix_mode = str(
         getattr(physics_context, "reverse_stage_adjoint_solve_mode", "structured")
     ).strip().lower()
+    rhs_transpose_mode = str(
+        getattr(physics_context, "reverse_rhs_transpose_mode", "generic")
+    ).strip().lower()
 
     def _stage_jacobian_generic(t_eval, y_eval):
         def _rhs_at_stage(y_value):
@@ -11011,6 +11079,30 @@ def _radau_exact_stage_residual_matrix(
             )(output_basis)
 
         stage_jacobians = jax.vmap(_stage_jacobian_explicit, in_axes=(0, 0))(
+            stage_times,
+            stage_states,
+        )
+    elif (
+        matrix_mode == "block"
+        and rhs_transpose_mode in {"explicit_database", "database", "explicit_black_box_database"}
+    ):
+        if physics_context.flat_rhs_direct_black_box_state_pullback is None:
+            raise ValueError(
+                "reverse_rhs_transpose_mode='explicit_database' requires the "
+                "direct black-box database state pullback."
+            )
+        output_basis = jnp.eye(kernel_context.state_dim, dtype=kernel_context.dtype)
+
+        def _stage_jacobian_database(t_eval, y_eval):
+            # The direct boundary returns J.T @ e_i.  Vmap materializes rows
+            # of J without tracing jacfwd through the full composed RHS.
+            return jax.vmap(
+                lambda rhs_bar: physics_context.flat_rhs_direct_black_box_state_pullback(
+                    t_eval, y_eval, lagged_response, rhs_bar
+                )
+            )(output_basis)
+
+        stage_jacobians = jax.vmap(_stage_jacobian_database, in_axes=(0, 0))(
             stage_times,
             stage_states,
         )
@@ -16068,6 +16160,7 @@ def _radau_adaptive_schedule_rollout(
     *,
     max_total_steps: int,
     stop_after_accepted_steps: int | None = None,
+    capture_segment_length: int | None = None,
 ) -> _RadauAdaptiveScheduleRolloutResult:
     """Run the real adaptive rollout while saving only schedule/controller metadata."""
 
@@ -16111,7 +16204,19 @@ def _radau_adaptive_schedule_rollout(
             stagnation_defect_norm=jnp.asarray(0.0, dtype=dtype),
         )
 
-    def _scan_body_with_idx(step_state, step_idx):
+    capture_count = (
+        0 if capture_segment_length is None or int(capture_segment_length) <= 0
+        else (int(stop_after_accepted_steps or max_total_steps) + int(capture_segment_length) - 1) // int(capture_segment_length)
+    )
+    segment_starts0 = (
+        None if capture_count == 0 else jax.tree_util.tree_map(
+            lambda value: jnp.broadcast_to(value, (capture_count,) + jnp.asarray(value).shape),
+            carry0,
+        )
+    )
+
+    def _scan_body_with_idx(scan_carry, step_idx):
+        step_state, accepted_so_far, segment_starts = scan_carry
         active = jnp.logical_and(
             _custom_loop_active(
                 step_state,
@@ -16129,6 +16234,24 @@ def _radau_adaptive_schedule_rollout(
             return step_state, _inactive_step_info(step_state)
 
         next_step_state, step_info = jax.lax.cond(active, _run, _skip, operand=None)
+        if capture_count:
+            capture_here = jnp.logical_and(
+                jnp.logical_and(active, step_info.accepted),
+                (accepted_so_far % int(capture_segment_length)) == 0,
+            )
+            segment_index = accepted_so_far // int(capture_segment_length)
+            start_carry = _radau_carry_from_step_state(step_state)
+            segment_starts = jax.lax.cond(
+                capture_here,
+                lambda stored: jax.tree_util.tree_map(
+                    lambda values, value: jax.lax.dynamic_update_index_in_dim(
+                        values, jnp.expand_dims(value, axis=0), segment_index, axis=0
+                    ), stored, start_carry,
+                ),
+                lambda stored: stored,
+                segment_starts,
+            )
+        accepted_next = accepted_so_far + jnp.asarray(step_info.accepted, dtype=jnp.int32)
         scan_out = (
             active,
             jnp.asarray(step_info.accepted),
@@ -16141,9 +16264,11 @@ def _radau_adaptive_schedule_rollout(
             next_step_state.easy_growth_streak,
             next_step_state.lagged_response_valid,
         )
-        return next_step_state, scan_out
+        return (next_step_state, accepted_next, segment_starts), scan_out
 
-    final_step_state, scan_outputs = jax.lax.scan(_scan_body_with_idx, step_state0, xs)
+    (final_step_state, _, segment_start_carries), scan_outputs = jax.lax.scan(
+        _scan_body_with_idx, (step_state0, jnp.asarray(0, dtype=jnp.int32), segment_starts0), xs
+    )
     (
         active_mask,
         accepted_mask,
@@ -16184,6 +16309,7 @@ def _radau_adaptive_schedule_rollout(
         completed=completed,
         failed=failed,
         fail_code=fail_code,
+        segment_start_carries=segment_start_carries,
     )
 
 
@@ -18520,6 +18646,7 @@ def _radau_adaptive_final_y_realized_schedule_vjp_fwd_from_schedule_artifact(
     schedule_artifact: _RadauAdaptiveScheduleTrace,
     *,
     final_carry: _RadauAcceptedStepCarry | None = None,
+    segment_start_carries_artifact: Any = None,
 ):
     """Build reverse residuals from a previously computed adaptive schedule.
 
@@ -18614,7 +18741,12 @@ def _radau_adaptive_final_y_realized_schedule_vjp_fwd_from_schedule_artifact(
         # schedule solely to construct the same two segment-level values.
         # Per-step carries are still reconstructed by the reverse segment
         # kernel; this does not retain a full accepted-step carry tape.
-        if single_segment_mode == "reuse_adaptive_rollout" and segment_count == 1:
+        if segment_start_carries_artifact is not None:
+            if final_carry is None:
+                raise ValueError("Segment-start carry artifact requires the probe final carry.")
+            segment_start_carries = segment_start_carries_artifact
+            segmented_final_carry = final_carry
+        elif single_segment_mode == "reuse_adaptive_rollout" and segment_count == 1:
             if final_carry is None:
                 raise ValueError(
                     "reuse_adaptive_rollout is incompatible with a trace-only "
@@ -19905,6 +20037,14 @@ def _build_prepared_radau_accepted_rollout(
         kwargs=kwargs,
         project_flat=project_flat,
     )
+    flat_rhs_direct_black_box_state_pullback = _flat_rhs_direct_black_box_state_pullback_factory(
+        unravel=unpack_flat,
+        pack_flat=pack_state,
+        vector_field=vector_field,
+        args=args,
+        kwargs=kwargs,
+        project_flat=project_flat,
+    )
     flat_rhs_direct_state_pullback = _flat_rhs_split_state_pullback_factory(
         unravel=unpack_flat,
         pack_flat=pack_state,
@@ -20286,6 +20426,7 @@ def _build_prepared_radau_accepted_rollout(
         flat_rhs_lagged_response_all_pullback=flat_rhs_lagged_response_all_pullback,
         flat_rhs_state_and_lagged_response_pullback=flat_rhs_state_and_lagged_response_pullback,
         flat_rhs_state_pullback=flat_rhs_state_pullback,
+        flat_rhs_direct_black_box_state_pullback=flat_rhs_direct_black_box_state_pullback,
         flat_rhs_direct_state_pullback=flat_rhs_direct_state_pullback,
         flat_rhs_direct_state_pullback_generic=flat_rhs_direct_state_pullback_generic,
         flat_rhs_direct_density_state_pullback=flat_rhs_direct_density_state_pullback,

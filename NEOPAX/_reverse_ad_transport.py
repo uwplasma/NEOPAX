@@ -635,6 +635,8 @@ class RealtimeGeometryReverseStaticSetup:
     # Optional compact scalar trace from the static schedule probe. This is
     # intentionally not a per-step primal tape or an additional carry.
     schedule_artifact: object | None = None
+    schedule_segment_start_carries: object | None = None
+    schedule_final_carry: object | None = None
 
 
 @jax.tree_util.register_dataclass
@@ -1478,6 +1480,7 @@ def _reverse_adaptive_schedule_rollout(
     *,
     max_total_steps,
     stop_after_accepted_steps,
+    capture_segment_length=None,
 ):
     if isinstance(execution_context, _ThetaReverseExecutionContext):
         return _theta_reverse_adaptive_schedule_rollout(
@@ -1492,6 +1495,7 @@ def _reverse_adaptive_schedule_rollout(
         initial_carry,
         max_total_steps=max_total_steps,
         stop_after_accepted_steps=stop_after_accepted_steps,
+        capture_segment_length=capture_segment_length,
     )
 
 
@@ -3414,6 +3418,7 @@ def prepare_reverse_static_setup(
             prepared_rollout_static.initial_carry,
             max_total_steps=probe_max_total_steps,
             stop_after_accepted_steps=probe_stop_after_accepted_steps,
+            capture_segment_length=reverse_segment_length_eff,
         )
         actual_attempt_count = int(np.asarray(jax.device_get(schedule_probe.attempt_count)))
         active_mask_np = np.asarray(jax.device_get(schedule_probe.trace.active_mask), dtype=bool)
@@ -3486,6 +3491,13 @@ def prepare_reverse_static_setup(
         reverse_segment_length=reverse_segment_length_eff,
         require_final_time=bool(requested_full_final_time and reverse_segment_length_eff is not None),
         schedule_artifact=schedule_artifact,
+        schedule_segment_start_carries=(
+            schedule_probe.segment_start_carries
+            if schedule_artifact is not None else None
+        ),
+        schedule_final_carry=(
+            schedule_probe.final_carry if schedule_artifact is not None else None
+        ),
     )
 
 
@@ -3837,14 +3849,30 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
             profile_cfg=profile_cfg,
         )
 
+    phase_timing_diagnostics = bool(
+        getattr(
+            reverse_setup.execution_context.physics_context,
+            "reverse_phase_timing_diagnostics",
+            False,
+        )
+    )
     phase_start = time.perf_counter()
     pre_root_initial_state, profile_state_pullback = jax.vjp(_state_from_profiles, parameter_values)
+    profile_state_vjp_elapsed = None
+    if phase_timing_diagnostics:
+        # Do not conflate the profile pytree VJP with the separately executed
+        # selected-root primal below.  This synchronization is diagnostic-only
+        # and mirrors the component timings printed later in the Lij path.
+        pre_root_initial_state = jax.block_until_ready(pre_root_initial_state)
+        profile_state_vjp_elapsed = time.perf_counter() - phase_start
     # The reverse boundary below implements the selected-root implicit
     # pullback explicitly.  Keep the forward root result here so that
     # boundary does not repeat the same radial root solve just to recover its
     # primal value and finite-root mask.
     initial_er_root_primal = None
+    selected_root_primal_elapsed = None
     if initial_er_root_enabled:
+        selected_root_start = time.perf_counter()
         initial_er_root_primal = dependencies.initial_er_selected_root_profile(
             pre_root_initial_state,
             config=config,
@@ -3856,6 +3884,9 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
                 initial_er_root_primal[0], dtype=pre_root_initial_state.Er.dtype
             ),
         )
+        if phase_timing_diagnostics:
+            initial_state = jax.block_until_ready(initial_state)
+            selected_root_primal_elapsed = time.perf_counter() - selected_root_start
     else:
         initial_state = pre_root_initial_state
     initial_state = jax.block_until_ready(initial_state)
@@ -3864,6 +3895,24 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
         f"elapsed_s={time.perf_counter() - phase_start:.3f}",
         flush=True,
     )
+    if phase_timing_diagnostics:
+        root_time_text = (
+            "off"
+            if selected_root_primal_elapsed is None
+            else f"{selected_root_primal_elapsed:.3f}"
+        )
+        profile_time_text = (
+            "n/a"
+            if profile_state_vjp_elapsed is None
+            else f"{profile_state_vjp_elapsed:.3f}"
+        )
+        print(
+            f"{progress_prefix} diagnostic: initial-state construction "
+            f"profile_state_vjp_compile_plus_execute_s={profile_time_text} "
+            f"selected_root_primal_compile_plus_execute_s={root_time_text} "
+            f"assembly_and_sync_s={time.perf_counter() - phase_start - (profile_state_vjp_elapsed or 0.0) - (selected_root_primal_elapsed or 0.0):.3f}",
+            flush=True,
+        )
 
     def _carry_from_state(state_value):
         return dependencies.reverse_initial_carry_from_state_with_static_setup(
@@ -3967,6 +4016,10 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
             reverse_setup.reverse_segment_length,
             initial_carry,
             schedule_artifact,
+            final_carry=getattr(reverse_setup, "schedule_final_carry", None),
+            segment_start_carries_artifact=getattr(
+                reverse_setup, "schedule_segment_start_carries", None
+            ),
         )
     final_y, residuals = jax.block_until_ready((final_y, residuals))
     print(
@@ -3974,6 +4027,13 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
         f"elapsed_s={time.perf_counter() - phase_start:.3f}",
         flush=True,
     )
+    if phase_timing_diagnostics:
+        print(
+            f"{progress_prefix} diagnostic: realized-schedule residual construction "
+            f"compile_plus_replay_execute_s={time.perf_counter() - phase_start:.3f} "
+            "(fixed accepted schedule; this is not an adaptive rerun)",
+            flush=True,
+        )
 
     (
         carry0,

@@ -6258,12 +6258,13 @@ def main() -> None:
     )
     parser.add_argument(
         "--reverse-rhs-transpose-mode",
-        choices=("generic", "explicit_ntx_interpolated"),
+        choices=("generic", "explicit_ntx_interpolated", "explicit_database"),
         default="explicit_ntx_interpolated",
         help=(
             "RHS-state transpose used inside exact reverse stage-adjoint matvecs. "
             "'generic' is the known-good JAX VJP reference; "
-            "'explicit_ntx_interpolated' opts into the experimental explicit NTX state pullback."
+            "'explicit_ntx_interpolated' opts into the experimental explicit NTX state pullback; "
+            "'explicit_database' uses the direct black-box database state boundary."
         ),
     )
     parser.add_argument(

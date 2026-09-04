@@ -1555,6 +1555,51 @@ class CombinedTransportFluxModel(TransportFluxModelBase):
                 out[f"{name}_faces"] = face_value
         return out
 
+    def pullback_direct_rhs_state(self, state, flux_bar):
+        """Split direct black-box flux transpose by model ownership.
+
+        Database-backed neoclassical fluxes use their dedicated local state
+        transpose. Optional turbulent/classical contributions retain separate
+        small flux-model VJPs, never a VJP of the composed transport RHS.
+        """
+        if self.center_flux_mode != "direct":
+            return None
+        neo_pullback = getattr(self.neoclassical_model, "pullback_direct_rhs_state", None)
+        if not callable(neo_pullback):
+            return None
+        zero = jnp.zeros_like(jnp.asarray(state.density))
+
+        def _bar(name):
+            value = flux_bar.get(name, None)
+            if value is None:
+                return zero
+            value = jnp.asarray(value)
+            return zero if value.ndim == 0 or value.dtype == jax.dtypes.float0 else value
+
+        state_bar = neo_pullback(state, {
+            "Gamma": _bar("Gamma") + _bar("Gamma_neo"),
+            "Q": _bar("Q") + _bar("Q_neo"),
+            "Upar": _bar("Upar") + _bar("Upar_neo"),
+        })
+
+        def _add(lhs, rhs):
+            return jax.tree_util.tree_map(lambda a, b: a + b, lhs, rhs)
+
+        for model, suffix in (
+            (self.turbulent_model, "turb"),
+            (self.classical_model, "classical"),
+        ):
+            if isinstance(model, ZeroTransportModel):
+                continue
+            _, pullback = jax.vjp(lambda state_value: model(state_value), state)
+            (model_state_bar,) = pullback({
+                "Gamma": _bar("Gamma") + _bar(f"Gamma_{suffix}"),
+                "Q": _bar("Q") + _bar(f"Q_{suffix}"),
+                "Upar": _bar("Upar") + _bar(f"Upar_{suffix}"),
+            })
+            state_bar = _add(state_bar, model_state_bar)
+        return state_bar
+
     def pullback_direct_rhs_support_payload(self, state, flux_bar, support):
         """Return the neoclassical direct-support bar for a black-box RHS.
 
@@ -2872,6 +2917,37 @@ class NTXDatabaseTransportModel(TransportFluxModelBase):
             "Q": q_neo,
             "Upar": upar_neo,
         }
+
+    def pullback_direct_rhs_state(self, state, flux_bar):
+        """Transpose the direct database flux map with respect to its state.
+
+        This is intentionally a *flux-model* boundary.  The Radau reverse no
+        longer needs to trace the composed transport RHS (equations, sources,
+        quasineutral projection, and the database interpolation) as one VJP.
+        The interpolation-coordinate derivative remains the established
+        database primitive derivative; table values themselves are handled by
+        :meth:`pullback_direct_rhs_support_payload` and folded through the
+        recorded scan once after the sweep.
+        """
+        zero = jnp.zeros_like(jnp.asarray(state.density))
+
+        def _bar(name):
+            value = flux_bar.get(name, None)
+            if value is None:
+                return zero
+            value = jnp.asarray(value)
+            return zero if value.ndim == 0 or value.dtype == jax.dtypes.float0 else value
+
+        _, pullback = jax.vjp(
+            lambda state_value: self(state_value),
+            state,
+        )
+        (state_bar,) = pullback({
+            "Gamma": _bar("Gamma"),
+            "Q": _bar("Q"),
+            "Upar": _bar("Upar"),
+        })
+        return state_bar
 
     def pullback_direct_rhs_support_payload(self, state, flux_bar, support):
         """Compact black-box transpose of the radial NTX database tables.
@@ -4570,6 +4646,10 @@ class NTXRuntimeScanTransportModel(TransportFluxModelBase):
         return database_model.pullback_direct_rhs_support_payload(
             state, flux_bar, {"database": support["database"]}
         )
+
+    def pullback_direct_rhs_state(self, state, flux_bar):
+        """Delegate the direct database state transpose without rebuilding."""
+        return self._database_model().pullback_direct_rhs_state(state, flux_bar)
 
     def pullback_local_particle_flux_support_payload(self, state, flux_bar, support):
         """Delegate the selected-root constrained local-flux transpose."""

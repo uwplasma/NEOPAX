@@ -1617,6 +1617,39 @@ class ComposedEquationSystem:
             shared_flux_model=flux_model,
         )
 
+    def pullback_direct_rhs_state(self, t, state, runtime, rhs_bar):
+        """Split transpose of a direct black-box RHS with respect to state.
+
+        This is the database counterpart of the Lij fixed-lagged state
+        boundary: equation assembly is transposed separately from the flux
+        model, and the database model owns only its local interpolation/state
+        derivative.  No lagged response is constructed or substituted.
+        """
+        del t, runtime
+        if self.shared_flux_model is None:
+            return None
+        flux_state_pullback = getattr(
+            self.shared_flux_model, "pullback_direct_rhs_state", None
+        )
+        if not callable(flux_state_pullback):
+            return None
+        working_state, eidx = self._prepare_working_state(state)
+        shared_fluxes = self.shared_flux_model(working_state)
+        direct_working_state_bar, flux_bar = (
+            self._pullback_shared_flux_rhs_state_and_fluxes(
+                state, working_state, eidx, shared_fluxes, rhs_bar
+            )
+        )
+        flux_working_state_bar = flux_state_pullback(working_state, flux_bar)
+        if flux_working_state_bar is None:
+            return None
+        total_working_state_bar = jax.tree_util.tree_map(
+            lambda direct, flux: direct + flux,
+            direct_working_state_bar,
+            flux_working_state_bar,
+        )
+        return self._prepare_working_state_pullback(state, total_working_state_bar)
+
     def pullback_direct_rhs_support_payload(self, t, state, runtime, rhs_bar, support):
         """Generic black-box RHS transpose with respect to realtime support.
 

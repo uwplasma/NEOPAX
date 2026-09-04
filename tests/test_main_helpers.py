@@ -2628,6 +2628,33 @@ def test_radial_database_flux_table_transpose_matches_generic_vjp():
                 float(jnp.max(jnp.abs(expected_table_bar))),
             )
 
+    # The separate direct-state boundary must be exactly the established
+    # local database flux VJP.  It is intentionally tested independently of
+    # the table transpose above: Radau uses this path at every stage whereas
+    # table bars are accumulated and folded only once after the sweep.
+    model = NTXDatabaseTransportModel(
+        species=species,
+        energy_grid=energy_grid,
+        geometry=geometry,
+        database=database,
+    )
+    state = TransportState(
+        density=density,
+        pressure=density * temperature,
+        Er=er_center,
+    )
+    model_flux_bar = {"Gamma": gamma_bar, "Q": q_bar, "Upar": upar_bar}
+    _, state_pullback = jax.vjp(lambda state_value: model(state_value), state)
+    (expected_state_bar,) = state_pullback(model_flux_bar)
+    actual_state_bar = model.pullback_direct_rhs_state(state, model_flux_bar)
+    for actual_leaf, expected_leaf in zip(
+        jax.tree_util.tree_leaves(actual_state_bar),
+        jax.tree_util.tree_leaves(expected_state_bar),
+        strict=True,
+    ):
+        if jnp.issubdtype(jnp.asarray(expected_leaf).dtype, jnp.inexact):
+            assert jnp.allclose(actual_leaf, expected_leaf, rtol=2.0e-10, atol=2.0e-10)
+
 
 def test_legacy_monoenergetic_flux_table_transpose_matches_generic_vjp():
     """The black-box centre rule remains exact for scan-generated tables."""
