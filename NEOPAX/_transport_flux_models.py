@@ -12303,6 +12303,12 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                 face_weight_hi = (center_rho[radius] - face_rho[face_lo]) / (
                     face_rho[face_hi] - face_rho[face_lo]
                 )
+                nu_center = center_reference_nu_hat[radius, species]
+                epsi_center = center_reference_epsi_hat[radius, species]
+                nu_lo = face_response.coefficient_response.reference_nu_hat[face_lo, species]
+                nu_hi = face_response.coefficient_response.reference_nu_hat[face_hi, species]
+                epsi_lo = face_response.coefficient_response.reference_epsi_hat[face_lo, species]
+                epsi_hi = face_response.coefficient_response.reference_epsi_hat[face_hi, species]
                 jax.debug.print(
                     "[NEOPAX] centre-Lij face-coefficient diagnostic: "
                     "max_rel={max_rel:.6e} "
@@ -12329,6 +12335,15 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                     weight_hi=face_weight_hi,
                     lij_lo=face_lij[species, face_lo, row, col],
                     lij_hi=face_lij[species, face_hi, row, col],
+                )
+                jax.debug.print(
+                    "[NEOPAX] centre-Lij face-coefficient native displacement: "
+                    "max_abs_dnu_lo={dnu_lo:.6e} max_abs_dnu_hi={dnu_hi:.6e} "
+                    "max_abs_depsi_lo={depsi_lo:.6e} max_abs_depsi_hi={depsi_hi:.6e}",
+                    dnu_lo=jnp.max(jnp.abs(nu_center - nu_lo)),
+                    dnu_hi=jnp.max(jnp.abs(nu_center - nu_hi)),
+                    depsi_lo=jnp.max(jnp.abs(epsi_center - epsi_lo)),
+                    depsi_hi=jnp.max(jnp.abs(epsi_center - epsi_hi)),
                 )
                 jax.debug.print(
                     "[NEOPAX] centre-Lij face-coefficient max-abs: "

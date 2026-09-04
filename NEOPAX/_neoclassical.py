@@ -1265,6 +1265,48 @@ def get_momentum_Correction(species, energy_grid, geometry, r_index, Lij, Eij, n
     return Gamma, Q, Upar, qpar, Upar2
 
 
+@jit
+def get_momentum_Correction_Upar_Only(
+    species, energy_grid, geometry, r_index, Lij, Eij, nu_av,
+    v_thermal, density, temperature, A1, A2, A3, mass, charge, dndr, dTdr,
+):
+    """Return only corrected Upar after the shared momentum solve.
+
+    The bootstrap objective never consumes Gamma, Q, qpar, or Upar2.  Keep
+    the collision matrix and correction solve identical to
+    :func:`get_momentum_Correction`, but avoid the per-species corrected-flux
+    construction used exclusively by the general output table.
+    """
+    del nu_av, mass, charge, dndr, dTdr
+    n_species = density.shape[0]
+    species_indices = jnp.arange(n_species)
+    CM_ab, CN_ab, tau = jax.vmap(
+        lambda species_a: jax.vmap(
+            lambda species_b: get_Collision_Operator_terms(
+                species, species_a, species_b, r_index,
+                temperature, density, v_thermal,
+            )
+        )(species_indices)
+    )(species_indices)
+    rhs = jax.vmap(
+        lambda species_a, lij_a: get_rhs(species_a, r_index, lij_a, A1, A2, A3)
+    )(species_indices, Lij)
+    matrix = jax.vmap(
+        lambda species_a, lij_a, eij_a: get_Matrix(
+            energy_grid, geometry, species_a, r_index, lij_a, eij_a,
+            CM_ab, CN_ab, tau, v_thermal,
+        )
+    )(species_indices, Lij, Eij)
+    operator = lineax.MatrixLinearOperator(
+        jnp.reshape(matrix, (matrix.shape[0] * matrix.shape[1], matrix.shape[2]))
+    )
+    solution = lineax.linear_solve(
+        operator, jnp.reshape(rhs, rhs.shape[0] * rhs.shape[1])
+    )
+    correction = jnp.reshape(solution.value, (n_species, 3))
+    return correction[:, 0] * density[:, r_index]
+
+
 
 
 
@@ -1408,6 +1450,92 @@ def get_Neoclassical_Fluxes_With_Momentum_Correction(
     # The radial map returns (radius, species); NEOPAX flux-model consumers
     # uniformly use (species, radius).
     return tuple(jnp.swapaxes(component, 0, 1) for component in correction)
+
+
+@jit
+def get_Neoclassical_Upar_With_Momentum_Correction(
+    species,
+    energy_grid,
+    geometry,
+    database,
+    Er,
+    temperature,
+    density,
+    density_right_constraint=None,
+    density_right_grad_constraint=None,
+    temperature_right_constraint=None,
+    temperature_right_grad_constraint=None,
+):
+    """Bootstrap-only corrected parallel flow for an interpolated database.
+
+    This shares the exact gradients, Lij/Eij construction, axis convention,
+    collision matrices, and momentum solve of the full corrected-flux path.
+    It omits only output channels which the bootstrap scalar never reads.
+    """
+    v_thermal = get_v_thermal(species.mass, temperature)
+    n_species = int(temperature.shape[0])
+    n_right = _as_species_constraint(density_right_constraint, n_species)
+    n_right = density[:, -1] if n_right is None else n_right
+    n_right_grad = _as_species_constraint(density_right_grad_constraint, n_species)
+    n_right_grad = jnp.zeros_like(n_right) if n_right_grad is None else n_right_grad
+    t_right = _as_species_constraint(temperature_right_constraint, n_species)
+    t_right = temperature[:, -1] if t_right is None else t_right
+    t_right_grad = _as_species_constraint(temperature_right_grad_constraint, n_species)
+    t_right_grad = jnp.zeros_like(t_right) if t_right_grad is None else t_right_grad
+
+    def _gradients_and_forces(density_a, temperature_a, n_rc, n_rg, t_rc, t_rg, species_index):
+        dndr = get_gradient_density(
+            density_a, geometry.r_grid, geometry.r_grid_half, geometry.dr,
+            right_face_constraint=n_rc, right_face_grad_constraint=n_rg,
+        )
+        dtdr = get_gradient_temperature(
+            temperature_a, geometry.r_grid, geometry.r_grid_half, geometry.dr,
+            right_face_constraint=t_rc, right_face_grad_constraint=t_rg,
+        )
+        return (
+            dndr,
+            dtdr,
+            get_Thermodynamical_Forces_A1(
+                species.charge[species_index], density_a, temperature_a, dndr, dtdr, Er
+            ),
+            get_Thermodynamical_Forces_A2(temperature_a, dtdr),
+        )
+
+    dndr, dtdr, a1, a2 = jax.vmap(
+        _gradients_and_forces, in_axes=(0, 0, 0, 0, 0, 0, 0)
+    )(
+        density, temperature, n_right, n_right_grad, t_right, t_right_grad,
+        jnp.arange(n_species),
+    )
+    a3 = get_Thermodynamical_Forces_A3(Er)
+    species_indices = jnp.arange(n_species)
+    radial_indices = geometry.full_grid_indices
+
+    def _one_species(species_index):
+        return jax.vmap(
+            lambda radial_index: get_Lij_matrix_with_momentum_correction(
+                species, energy_grid, geometry, database, species_index,
+                radial_index, Er, temperature, density, v_thermal,
+            )
+        )(radial_indices)
+
+    lij, eij, nu_weighted_average = jax.vmap(_one_species)(species_indices)
+    lij = lij.at[:, 0, :, :].set(lij[:, 1, :, :])
+    eij = eij.at[:, 0, :, :].set(eij[:, 1, :, :])
+    upar_by_radius = jax.vmap(
+        lambda radial_index, lij_at_radius, eij_at_radius, nu_at_radius:
+        get_momentum_Correction_Upar_Only(
+            species, energy_grid, geometry, radial_index, lij_at_radius,
+            eij_at_radius, nu_at_radius, v_thermal, density, temperature,
+            a1, a2, a3, species.mass, species.charge, dndr, dtdr,
+        )
+    )(
+        radial_indices,
+        jnp.moveaxis(lij, 1, 0),
+        jnp.moveaxis(eij, 1, 0),
+        jnp.moveaxis(nu_weighted_average, 1, 0),
+    )
+    return jnp.swapaxes(upar_by_radius, 0, 1)
 
 
 
