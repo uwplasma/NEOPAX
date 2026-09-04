@@ -5229,23 +5229,6 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
     def _resolved_center_response_mode(self) -> str:
         return self._normalize_center_response_mode(self.center_response_mode)
 
-    def _interpolate_radial_response_values(self, source_rho, source_values, target_rho):
-        """Linearly interpolate a radius-leading response field.
-
-        This deliberately operates on a response *field*, never on an
-        assembled particle/heat flux.  The latter contains the face state and
-        thermodynamic forces and cannot be used as a centre-local model.
-        """
-
-        source_values = jnp.asarray(source_values)
-        source_rho = jnp.asarray(source_rho, dtype=source_values.dtype)
-        target_rho = jnp.asarray(target_rho, dtype=source_values.dtype)
-        flat_source = source_values.reshape((source_values.shape[0], -1)).T
-        flat_target = jax.vmap(
-            lambda values: jnp.interp(target_rho, source_rho, values)
-        )(flat_source)
-        return flat_target.T.reshape((target_rho.shape[0],) + source_values.shape[1:])
-
     def _center_reference_scan_inputs(
         self,
         *,
@@ -5295,10 +5278,12 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         """Radially interpolate face NTX Taylor polynomials to cell centres.
 
         Each face response is anchored at different ``(nu_hat, epsi_hat)``.
-        We first rebase every local quadratic polynomial into common absolute
-        coordinates, interpolate those coefficient fields in radius, and then
-        re-anchor at the actual centre state.  This is the coefficient-level
-        analogue of the database's radial Dij interpolation.
+        For each centre, first translate its two adjacent face polynomials to
+        that centre's reference coordinates and then linearly blend their
+        translated coefficients.  This is algebraically equivalent to
+        rebasing everything into global coordinates before interpolation, but
+        avoids catastrophic cancellation in the global constant term when
+        ``nu_hat`` or ``epsi_hat`` varies strongly in radius.
         """
 
         face_rho = jnp.asarray(self.geometry.r_grid_half, dtype=jnp.float64) / jnp.asarray(
@@ -5307,43 +5292,66 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         center_rho = jnp.asarray(self.geometry.r_grid, dtype=jnp.float64) / jnp.asarray(
             self.geometry.a_b, dtype=jnp.float64
         )
-        u = face_response.reference_nu_hat[..., None]
-        e = face_response.reference_epsi_hat[..., None]
-        c0 = face_response.reference_coefficients
-        cu = face_response.dcoefficients_d_nu_hat
-        ce = face_response.dcoefficients_d_epsi_hat
-        cuu = face_response.d2coefficients_d_nu_hat2
-        cue = face_response.d2coefficients_d_nu_hat_d_epsi_hat
-        cee = face_response.d2coefficients_d_epsi_hat2
-
-        # C(u,e) = a0 + au*u + ae*e + 1/2 auu*u^2 + aue*u*e + 1/2 aee*e^2.
-        a0 = c0 - cu * u - ce * e + 0.5 * cuu * u * u + cue * u * e + 0.5 * cee * e * e
-        au = cu - cuu * u - cue * e
-        ae = ce - cue * u - cee * e
-        interpolate = lambda field: self._interpolate_radial_response_values(face_rho, field, center_rho)
-        a0, au, ae, auu, aue, aee = tuple(
-            interpolate(field) for field in (a0, au, ae, cuu, cue, cee)
+        hi = jnp.searchsorted(face_rho, center_rho, side="right")
+        hi = jnp.clip(hi, 1, face_rho.shape[0] - 1)
+        lo = hi - 1
+        denominator = face_rho[hi] - face_rho[lo]
+        weight_hi = (center_rho - face_rho[lo]) / jnp.where(
+            jnp.abs(denominator) > 0.0, denominator, 1.0
         )
+        weight_hi = jnp.clip(weight_hi, 0.0, 1.0)
+        weight_lo = 1.0 - weight_hi
+
+        def _at_adjacent_faces(field):
+            return field[lo], field[hi]
 
         u_center = jnp.asarray(center_reference_nu_hat)[..., None]
         e_center = jnp.asarray(center_reference_epsi_hat)[..., None]
-        center_c0 = (
-            a0 + au * u_center + ae * e_center
-            + 0.5 * auu * u_center * u_center
-            + aue * u_center * e_center
-            + 0.5 * aee * e_center * e_center
+        u_lo, u_hi = _at_adjacent_faces(face_response.reference_nu_hat[..., None])
+        e_lo, e_hi = _at_adjacent_faces(face_response.reference_epsi_hat[..., None])
+
+        def _translate(c0, cu, ce, cuu, cue, cee, u_face, e_face):
+            du = u_center - u_face
+            de = e_center - e_face
+            return (
+                c0 + cu * du + ce * de
+                + 0.5 * cuu * du * du + cue * du * de + 0.5 * cee * de * de,
+                cu + cuu * du + cue * de,
+                ce + cue * du + cee * de,
+                cuu,
+                cue,
+                cee,
+            )
+
+        face_fields = (
+            face_response.reference_coefficients,
+            face_response.dcoefficients_d_nu_hat,
+            face_response.dcoefficients_d_epsi_hat,
+            face_response.d2coefficients_d_nu_hat2,
+            face_response.d2coefficients_d_nu_hat_d_epsi_hat,
+            face_response.d2coefficients_d_epsi_hat2,
         )
-        center_cu = au + auu * u_center + aue * e_center
-        center_ce = ae + aue * u_center + aee * e_center
+        translated_lo = _translate(
+            *(_at_adjacent_faces(field)[0] for field in face_fields), u_lo, e_lo
+        )
+        translated_hi = _translate(
+            *(_at_adjacent_faces(field)[1] for field in face_fields), u_hi, e_hi
+        )
+        weight_lo = weight_lo.reshape((-1,) + (1,) * (translated_lo[0].ndim - 1))
+        weight_hi = weight_hi.reshape((-1,) + (1,) * (translated_hi[0].ndim - 1))
+        center_c0, center_cu, center_ce, center_cuu, center_cue, center_cee = tuple(
+            weight_lo * left + weight_hi * right
+            for left, right in zip(translated_lo, translated_hi, strict=True)
+        )
         return NTXQuadraticPreparedCoefficientResponse(
             reference_nu_hat=center_reference_nu_hat,
             reference_epsi_hat=center_reference_epsi_hat,
             reference_coefficients=center_c0,
             dcoefficients_d_nu_hat=center_cu,
             dcoefficients_d_epsi_hat=center_ce,
-            d2coefficients_d_nu_hat2=auu,
-            d2coefficients_d_nu_hat_d_epsi_hat=aue,
-            d2coefficients_d_epsi_hat2=aee,
+            d2coefficients_d_nu_hat2=center_cuu,
+            d2coefficients_d_nu_hat_d_epsi_hat=center_cue,
+            d2coefficients_d_epsi_hat2=center_cee,
         )
 
     @staticmethod
