@@ -570,7 +570,10 @@ def test_database_local_bootstrap_state_pullback_matches_full_upar_jvp(
             jax.tree_util.tree_leaves(state_direction),
             strict=True,
         )
-        if jnp.issubdtype(jnp.asarray(bar).dtype, jnp.inexact)
+        if (
+            jnp.issubdtype(jnp.asarray(bar).dtype, jnp.inexact)
+            and jnp.issubdtype(jnp.asarray(direction).dtype, jnp.inexact)
+        )
     )
     assert jnp.allclose(lhs, jnp.vdot(upar_bar, upar_tangent), rtol=2.0e-10, atol=2.0e-10)
 
@@ -598,7 +601,10 @@ def test_database_local_bootstrap_state_pullback_matches_full_upar_jvp(
             jax.tree_util.tree_leaves(geometry_direction),
             strict=True,
         )
-        if jnp.issubdtype(jnp.asarray(bar).dtype, jnp.inexact)
+        if (
+            jnp.issubdtype(jnp.asarray(bar).dtype, jnp.inexact)
+            and jnp.issubdtype(jnp.asarray(direction).dtype, jnp.inexact)
+        )
     )
     assert jnp.allclose(
         geometry_lhs,
@@ -730,7 +736,10 @@ def test_database_local_bootstrap_state_pullback_matches_full_upar_jvp(
             jax.tree_util.tree_leaves(geometry_direction),
             strict=True,
         )
-        if jnp.issubdtype(jnp.asarray(bar).dtype, jnp.inexact)
+        if (
+            jnp.issubdtype(jnp.asarray(bar).dtype, jnp.inexact)
+            and jnp.issubdtype(jnp.asarray(direction).dtype, jnp.inexact)
+        )
     )
     assert jnp.allclose(
         geometry_root_lhs,
