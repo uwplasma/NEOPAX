@@ -174,35 +174,6 @@ def compact_initial_er_database_support_bars(
     return jax.vmap(_one_objective)(residual_bars)
 
 
-def compact_initial_er_database_geometry_bars(
-    *, runtime, state, er_profile, residual_bars, support
-):
-    """Return fixed-database geometry bars for the selected-root residual.
-
-    This is intentionally parallel to :func:`compact_initial_er_database_support_bars`:
-    the recorded table remains a fixed explicit leaf and the runtime scan is
-    not rebuilt or differentiated here.
-    """
-
-    if not isinstance(support, dict) or "database" not in support or "geometry" not in support:
-        raise ValueError(
-            "Compact database initial-Er geometry pullback requires recorded "
-            "database and geometry support leaves."
-        )
-    runtime_scan = find_ntx_runtime_scan_model_in_model(runtime.models.flux)
-    if runtime_scan is None:
-        raise ValueError(
-            "Compact database initial-Er geometry pullback requires an NTX runtime scan model."
-        )
-    model = runtime_scan.with_support_payload(support)
-    pullback = getattr(model, "pullback_local_particle_flux_geometry_by_radius", None)
-    if not callable(pullback):
-        raise ValueError(
-            "Runtime database model did not expose its compact local particle-flux geometry transpose."
-        )
-    return pullback(state, er_profile, residual_bars, support["geometry"])
-
-
 def _replace_ntx_support_payload_in_model(model, support):
     if model is None or not dataclasses.is_dataclass(model) or isinstance(model, type):
         return model, False

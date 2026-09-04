@@ -3559,27 +3559,6 @@ class NTXDatabaseTransportModel(TransportFluxModelBase):
         )
 
     def build_local_particle_flux_evaluator(self, state):
-        """Return the constrained particle flux at exactly one radial point.
-
-        The selected initial-:math:`E_r` root is pointwise.  Do not construct
-        the all-radii centre-flux table here merely to take one column: that
-        retained graph is especially costly when this evaluator is used inside
-        a geometry VJP.
-        """
-        def evaluator(radius_index, er_value):
-            return self._local_particle_flux_one_radius(state, radius_index, er_value)
-
-        return evaluator
-
-    def _local_particle_flux_one_radius(self, state, radius_index, er_value):
-        """Evaluate the constrained database particle flux at one radius.
-
-        This is algebraically the selected column of
-        :func:`get_Neoclassical_Fluxes`, while retaining only one interpolated
-        ``Lij`` matrix per species.  Gradients remain full-profile because the
-        finite-volume stencil at ``radius_index`` depends on neighbouring
-        cells, but the expensive radial database interpolation is local.
-        """
         species = self.species
         energy_grid = self.energy_grid
         geometry = self.geometry
@@ -3597,59 +3576,26 @@ class NTXDatabaseTransportModel(TransportFluxModelBase):
             self.geometry.r_grid_half,
         )
 
-        density_right = density[:, -1] if density_right_constraint is None else density_right_constraint
-        density_right_grad = (
-            jnp.zeros_like(density_right)
-            if density_right_grad_constraint is None
-            else density_right_grad_constraint
-        )
-        temperature_right = (
-            temperature[:, -1]
-            if temperature_right_constraint is None
-            else temperature_right_constraint
-        )
-        temperature_right_grad = (
-            jnp.zeros_like(temperature_right)
-            if temperature_right_grad_constraint is None
-            else temperature_right_grad_constraint
-        )
-        dndr = jax.vmap(
-            lambda values, right, right_grad: get_gradient_density(
-                values, geometry.r_grid, geometry.r_grid_half, geometry.dr,
-                right_face_constraint=right, right_face_grad_constraint=right_grad,
+        def evaluator(radius_index, er_value):
+            er_scalar = jnp.asarray(er_value, dtype=state.Er.dtype)
+            er_profile = state.Er.at[radius_index].set(er_scalar)
+            _, gamma_neo, _, _ = get_Neoclassical_Fluxes(
+                species,
+                energy_grid,
+                geometry,
+                database,
+                er_profile,
+                temperature,
+                density,
+                density_right_constraint=density_right_constraint,
+                density_right_grad_constraint=density_right_grad_constraint,
+                temperature_right_constraint=temperature_right_constraint,
+                temperature_right_grad_constraint=temperature_right_grad_constraint,
+                collisionality_model=self.collisionality_model,
             )
-        )(density, density_right, density_right_grad)
-        dtdr = jax.vmap(
-            lambda values, right, right_grad: get_gradient_temperature(
-                values, geometry.r_grid, geometry.r_grid_half, geometry.dr,
-                right_face_constraint=right, right_face_grad_constraint=right_grad,
-            )
-        )(temperature, temperature_right, temperature_right_grad)
-        er_scalar = jnp.asarray(er_value, dtype=state.Er.dtype)
-        er_profile = state.Er.at[radius_index].set(er_scalar)
-        v_thermal = get_v_thermal(species.mass, temperature)
-        species_indices = jnp.arange(int(species.number_species), dtype=jnp.int32)
-        lij = jax.vmap(
-            lambda species_index: get_Lij_matrix_local(
-                species, energy_grid, geometry, database, species_index, radius_index,
-                er_scalar, temperature, density, v_thermal,
-                _collisionality_kind(self.collisionality_model),
-            )
-        )(species_indices)
-        a1 = jax.vmap(
-            lambda charge, density_a, temperature_a, dndr_a, dtdr_a:
-            get_Thermodynamical_Forces_A1(
-                charge, density_a, temperature_a, dndr_a, dtdr_a, er_profile
-            )
-        )(species.charge, density, temperature, dndr, dtdr)
-        a2 = jax.vmap(get_Thermodynamical_Forces_A2)(temperature, dtdr)
-        a3 = get_Thermodynamical_Forces_A3(er_profile)
-        density_phys = 1.0e20 * density[:, radius_index]
-        return -density_phys * (
-            lij[:, 0, 0] * a1[:, radius_index]
-            + lij[:, 0, 1] * a2[:, radius_index]
-            + lij[:, 0, 2] * a3[radius_index]
-        )
+            return gamma_neo[:, radius_index]
+
+        return evaluator
 
     def evaluate_face_fluxes(self, state, face_state, **kwargs):
         evaluated = kwargs.get("evaluated_state")
