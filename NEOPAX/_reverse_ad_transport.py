@@ -47,6 +47,7 @@ from ._reverse_ad_initial_er import (
     runtime_with_geometry_payload,
     runtime_with_ntx_support_payload,
     runtime_with_realtime_geometry_reverse_support_payload,
+    runtime_with_prebuilt_ntx_scan_database,
     runtime_without_recorded_ntx_scan_primal,
 )
 from ._reverse_ad_parameters import (
@@ -7180,6 +7181,10 @@ def internal_realtime_geometry_transport_reverse_table_result_builder(
         # VJPs.  The database itself remains in the support payload, while
         # the original runtime below is retained solely for the final one-time
         # database-to-scan transpose.
+        # The scan database may still be the source ``Monoenergetic`` object
+        # in config-derived black-box runtimes.  Convert it once to the radial
+        # table before exposing a recorded database support leaf.
+        active_runtime = runtime_with_prebuilt_ntx_scan_database(active_runtime)
         recorded_scan_runtime = active_runtime
         active_runtime = runtime_without_recorded_ntx_scan_primal(active_runtime)
         _report_table_builder_phase("prepare_runtime_payload")

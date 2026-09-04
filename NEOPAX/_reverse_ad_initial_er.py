@@ -293,6 +293,40 @@ def runtime_without_recorded_ntx_scan_primal(runtime):
     return dataclasses.replace(runtime, models=dataclasses.replace(runtime.models, flux=flux_model))
 
 
+def runtime_with_prebuilt_ntx_scan_database(runtime):
+    """Ensure a live scan runtime owns its generated radial database.
+
+    Some config-level database cases retain their source ``Monoenergetic``
+    input on the runtime model.  That object is a scan *source*, not the
+    radial interpolation table consumed by the black-box transport and
+    bootstrap rules.  Materialize the latter once, before recorded reverse
+    support is formed, so every later path sees one consistent database.
+    """
+    def _materialize(model):
+        if model is None or not dataclasses.is_dataclass(model) or isinstance(model, type):
+            return model, False
+        if isinstance(model, NTXRuntimeScanTransportModel):
+            database = model.database
+            if database is not None and hasattr(database, "r_grid"):
+                return model, False
+            # ``with_runtime_database`` considers any non-None database
+            # prebuilt.  Clear a source Monoenergetic explicitly first.
+            return dataclasses.replace(model, database=None).with_runtime_database(), True
+        updates = {}
+        changed = False
+        for field in dataclasses.fields(model):
+            replacement, child_changed = _materialize(getattr(model, field.name))
+            if child_changed:
+                updates[field.name] = replacement
+                changed = True
+        return (dataclasses.replace(model, **updates), True) if changed else (model, False)
+
+    flux_model, changed = _materialize(runtime.models.flux)
+    if not changed:
+        return runtime
+    return dataclasses.replace(runtime, models=dataclasses.replace(runtime.models, flux=flux_model))
+
+
 def realtime_geometry_payload_for_runtime(runtime):
     """Return the additive tagged geometry payload for a supported runtime.
 
