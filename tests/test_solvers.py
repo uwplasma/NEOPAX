@@ -1,6 +1,7 @@
 import dataclasses
 import types
 
+import jax
 import jax.numpy as jnp
 import pytest
 
@@ -1062,6 +1063,43 @@ def test_build_time_solver_radau_accepts_stage_drift_jacobian_refresh():
 def test_radau_stage_drift_jacobian_refresh_requires_transport_lagged_response():
     with pytest.raises(ValueError, match="requires a lagged transport response RHS mode"):
         RADAUSolver(lagged_jacobian_refresh_mode="stage_drift_after_first")
+
+
+def test_radau_quadratic_colored_refresh_recovers_block_tridiagonal_jacobian():
+    """Colored cached-response tangents recover the exact local Jacobian."""
+    dtype = jnp.float64
+    context = types.SimpleNamespace(
+        density_size=4,
+        pressure_size=4,
+        er_size=0,
+        state_dim=8,
+        num_stages=1,
+        dtype=dtype,
+        zero_scalar=jnp.asarray(0.0, dtype=dtype),
+    )
+
+    def rhs(y):
+        density, pressure = y[:4], y[4:]
+        density_left = jnp.concatenate([jnp.zeros((1,), dtype=dtype), density[:-1]])
+        pressure_right = jnp.concatenate([pressure[1:], jnp.zeros((1,), dtype=dtype)])
+        density_rhs = 0.2 * density * density + 0.3 * density * pressure + 0.1 * density_left * density
+        pressure_rhs = 0.4 * pressure * pressure + 0.2 * density * pressure_right + 0.1 * density_left * pressure
+        return jnp.concatenate([density_rhs, pressure_rhs])
+
+    anchor = jnp.asarray([0.2, 0.4, -0.3, 0.7, 0.1, -0.2, 0.5, 0.3], dtype=dtype)
+    current = jnp.asarray([0.5, -0.1, 0.8, 0.3, -0.4, 0.2, 0.6, -0.5], dtype=dtype)
+    jacobian_anchor = jax.jacfwd(rhs)(anchor)
+    updated = transport_solvers._radau_quadratic_colored_jacobian_update(
+        context,
+        t_value=jnp.asarray(0.0, dtype=dtype),
+        flat_y=current,
+        jacobian_anchor=jacobian_anchor,
+        lagged_response=None,
+        flat_rhs_lagged_response_tangent=lambda _t, y, direction, _response: jax.jvp(
+            rhs, (y,), (direction,)
+        )[1],
+    )
+    assert jnp.allclose(updated, jax.jacfwd(rhs)(current), rtol=1.0e-12, atol=1.0e-12)
 
 
 def test_radau_endpoint_defect_correction_runs_on_nonlinear_lagged_rhs():

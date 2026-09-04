@@ -930,6 +930,15 @@ def _lagged_response_hooks(vector_field: Callable):
     return None, None
 
 
+def _lagged_response_tangent_hook(vector_field: Callable):
+    """Return the optional split cached-response tangent supplied by the RHS owner."""
+    owner = getattr(vector_field, "__self__", None)
+    if owner is None:
+        return None
+    tangent_fn = getattr(owner, "evaluate_with_lagged_response_tangent", None)
+    return tangent_fn if callable(tangent_fn) else None
+
+
 def _lagged_response_compact_coefficient_record_hooks(vector_field: Callable):
     """Return the optional one-build compact-record hooks from the model."""
 
@@ -1444,6 +1453,45 @@ def _flat_rhs_with_lagged_response_factory(unravel, vector_field, args, kwargs, 
         return rhs_flat
 
     return _flat_rhs
+
+
+def _flat_rhs_with_lagged_response_tangent_factory(
+    unravel, vector_field, args, kwargs, project_flat=None
+):
+    """Flatten the opt-in split cached-response tangent.
+
+    The model-owned tangent is required to avoid tracing a JVP through the
+    realtime NTX builder.  The projection tangent is retained because the
+    solver coordinates may include constrained boundary entries.
+    """
+    species = _extract_species_from_args(args)
+    tangent_fn = _lagged_response_tangent_hook(vector_field)
+    if tangent_fn is None:
+        return None
+
+    def _flat_rhs_tangent(t_value, flat_y, flat_direction, lagged_response):
+        def _project(value):
+            return _project_flat_state_if_needed(value, project_flat)
+
+        projected_flat_y, projected_direction = jax.jvp(
+            _project,
+            (flat_y,),
+            (flat_direction,),
+        )
+        rhs_tree = tangent_fn(
+            t_value,
+            unravel(projected_flat_y),
+            unravel(projected_direction),
+            *args,
+            lagged_response=lagged_response,
+            **kwargs,
+        )
+        rhs_flat, _ = jax.flatten_util.ravel_pytree(
+            _pack_transport_state_arrays(rhs_tree, species)
+        )
+        return rhs_flat
+
+    return _flat_rhs_tangent
 
 
 def _flat_rhs_lagged_response_pullback_factory(unravel, vector_field, args, kwargs, project_flat=None):
@@ -3795,9 +3843,11 @@ class _RadauSolverConfig(TransportSolver):
             "none",
             "endpoint_after_first",
             "stage_drift_after_first",
+            "quadratic_colored_after_first",
         }:
             raise ValueError(
-                "radau_lagged_jacobian_refresh_mode must be one of: none, endpoint_after_first, stage_drift_after_first"
+                "radau_lagged_jacobian_refresh_mode must be one of: none, endpoint_after_first, "
+                "stage_drift_after_first, quadratic_colored_after_first"
             )
         if float(lagged_jacobian_refresh_threshold) <= 0.0:
             raise ValueError("radau_lagged_jacobian_refresh_threshold must be positive")
@@ -4438,6 +4488,7 @@ class _RadauAcceptedStepPhysicsContext:
     pullback_build_lagged_response: Callable[[Any, Any], Any] | None
     flat_rhs: Callable[[Any, Any], Any]
     flat_rhs_with_lagged_response: Callable[[Any, Any, Any], Any]
+    flat_rhs_with_lagged_response_tangent: Callable[[Any, Any, Any, Any], Any] | None = None
     flat_rhs_lagged_response_pullback: Callable[[Any, Any, Any, Any], Any] | None = None
     flat_rhs_build_support_pullback: Callable[[Any, Any, Any], Any] | None = None
     flat_rhs_build_support_pullback_batched_interpolated_faces: Callable[[Any, Any, Any], Any] | None = None
@@ -12266,6 +12317,104 @@ def _radau_stage_to_radial_permutation_and_block_dim(
     return layout, radial_permutation, radial_block_dim
 
 
+def _radau_radial_state_index_map(kernel_context: _RadauAcceptedStepKernelContext):
+    """Map ``(radius, local-variable)`` to packed-state indices.
+
+    The solver stores components by field, while the colored response recovery
+    is naturally radial-block ordered.  Reusing the established stage/radial
+    conversion keeps this mapping identical to the reverse structured-solve
+    layout.
+    """
+    layout = _radau_infer_radial_block_layout(kernel_context)
+    stage_indices = jnp.broadcast_to(
+        jnp.arange(kernel_context.state_dim, dtype=jnp.int32)[None, :],
+        (kernel_context.num_stages, kernel_context.state_dim),
+    )
+    radial_indices = _radau_stage_stack_to_radial_blocks(
+        kernel_context, stage_indices
+    ).reshape(
+        (layout.n_radial, kernel_context.num_stages, layout.variables_per_cell)
+    )
+    return layout, radial_indices[:, 0, :].astype(jnp.int32)
+
+
+def _radau_quadratic_colored_jacobian_update(
+    kernel_context: _RadauAcceptedStepKernelContext,
+    *,
+    t_value,
+    flat_y,
+    jacobian_anchor,
+    lagged_response,
+    flat_rhs_lagged_response_tangent,
+):
+    """Recover the local quadratic Jacobian correction with three radial colors.
+
+    For the face-based finite-volume transport RHS, the difference between the
+    quadratic-response Jacobian at ``flat_y`` and the cached anchor Jacobian
+    has a radial block-tridiagonal stencil.  Three colors isolate its three
+    block columns.  We probe each local state component once per color, so the
+    cost is ``3 * variables_per_cell`` cached-response tangents, never a
+    dense 459-direction AD Jacobian and never a live NTX rebuild.
+    """
+    if flat_rhs_lagged_response_tangent is None:
+        raise ValueError(
+            "quadratic_colored_after_first requires an explicit cached-response tangent; "
+            "the active transport RHS does not provide one."
+        )
+    layout, state_indices = _radau_radial_state_index_map(kernel_context)
+    n_radial = int(layout.n_radial)
+    variables_per_cell = int(layout.variables_per_cell)
+    state_dim = int(kernel_context.state_dim)
+    colors = jnp.mod(jnp.arange(n_radial, dtype=jnp.int32), 3)
+    directions = jnp.zeros((3 * variables_per_cell, state_dim), dtype=kernel_context.dtype)
+    for color in range(3):
+        color_mask = (colors == color).astype(kernel_context.dtype)
+        for component in range(variables_per_cell):
+            directions = directions.at[
+                color * variables_per_cell + component,
+                state_indices[:, component],
+            ].set(color_mask)
+
+    tangent_values = jax.lax.map(
+        lambda direction: flat_rhs_lagged_response_tangent(
+            t_value, flat_y, direction, lagged_response
+        ),
+        directions,
+    )
+    anchor_values = directions @ jacobian_anchor.T
+    # RHS storage is component-major, whereas the coloring is radial-block
+    # major.  Convert each probe output through the same packed-state index
+    # map before splitting its color/component axes.
+    correction_values = (tangent_values - anchor_values)[:, state_indices].reshape(
+        (3, variables_per_cell, n_radial, variables_per_cell)
+    )
+
+    row_blocks = jnp.arange(n_radial, dtype=jnp.int32)
+    correction_blocks = jnp.zeros(
+        (n_radial, n_radial, variables_per_cell, variables_per_cell),
+        dtype=kernel_context.dtype,
+    )
+    for component in range(variables_per_cell):
+        for offset in (-1, 0, 1):
+            column_blocks = row_blocks + jnp.asarray(offset, dtype=jnp.int32)
+            valid = jnp.logical_and(column_blocks >= 0, column_blocks < n_radial)
+            safe_columns = jnp.clip(column_blocks, 0, n_radial - 1)
+            source_colors = jnp.mod(safe_columns, 3)
+            values = correction_values[source_colors, component, row_blocks, :]
+            correction_blocks = correction_blocks.at[
+                row_blocks, safe_columns, :, component
+            ].add(values * valid[:, None].astype(kernel_context.dtype))
+
+    correction_radial = jnp.transpose(correction_blocks, (0, 2, 1, 3)).reshape(
+        (state_dim, state_dim)
+    )
+    radial_flat_indices = state_indices.reshape((-1,))
+    correction_flat = jnp.zeros_like(jacobian_anchor).at[
+        radial_flat_indices[:, None], radial_flat_indices[None, :]
+    ].set(correction_radial)
+    return jacobian_anchor + correction_flat
+
+
 def _radau_stage_matrix_to_radial_blocks(
     kernel_context: _RadauAcceptedStepKernelContext,
     matrix,
@@ -14311,7 +14460,7 @@ def _radau_single_step_primal(
         complex_piv_out=complex_piv_out,
     )
     if kernel_context.lagged_jacobian_refresh_mode in {
-        "endpoint_after_first", "stage_drift_after_first"
+        "endpoint_after_first", "stage_drift_after_first", "quadratic_colored_after_first"
     }:
         # The lagged response is already quadratic.  Refresh one *shared*
         # matrix at the most displaced first-corrected Radau stage, using
@@ -14375,7 +14524,19 @@ def _radau_single_step_primal(
             )
 
         def _run_with_endpoint_jacobian(_):
-            endpoint_jacobian = jax.jacfwd(_rhs_eval_at_current_time)(refresh_state)
+            if kernel_context.lagged_jacobian_refresh_mode == "quadratic_colored_after_first":
+                endpoint_jacobian = _radau_quadratic_colored_jacobian_update(
+                    kernel_context,
+                    t_value=t_value,
+                    flat_y=refresh_state,
+                    jacobian_anchor=jacobian_ref,
+                    lagged_response=lagged_response,
+                    flat_rhs_lagged_response_tangent=(
+                        physics_context.flat_rhs_with_lagged_response_tangent
+                    ),
+                )
+            else:
+                endpoint_jacobian = jax.jacfwd(_rhs_eval_at_current_time)(refresh_state)
 
             def _factor_and_run(_):
                 endpoint_real_lu, endpoint_real_piv, endpoint_complex_lu, endpoint_complex_piv = (
@@ -14444,7 +14605,7 @@ def _radau_single_step_primal(
         )
         if kernel_context.debug_newton_trace:
             jax.debug.print(
-                "[radau-solver] stage_jacobian_refresh={refresh} stage={stage} first_stage_defect={defect:.6e} threshold={threshold:.6e}",
+                f"[radau-solver] stage_jacobian_refresh={{refresh}} mode={kernel_context.lagged_jacobian_refresh_mode} stage={{stage}} first_stage_defect={{defect:.6e}} threshold={{threshold:.6e}}",
                 refresh=refresh_jacobian,
                 stage=refresh_stage_index,
                 defect=first_stage_defect,
@@ -14977,7 +15138,7 @@ def _radau_single_step_primal_reverse_minimal(
         complex_piv_out=complex_piv_out,
     )
     if kernel_context.lagged_jacobian_refresh_mode in {
-        "endpoint_after_first", "stage_drift_after_first"
+        "endpoint_after_first", "stage_drift_after_first", "quadratic_colored_after_first"
     }:
         # Keep reverse-only realized-schedule replay on precisely the same
         # primal linearization path as the forward accepted step.
@@ -15038,7 +15199,19 @@ def _radau_single_step_primal_reverse_minimal(
             )
 
         def _run_with_endpoint_jacobian(_):
-            endpoint_jacobian = jax.jacfwd(_rhs_eval_at_current_time)(refresh_state)
+            if kernel_context.lagged_jacobian_refresh_mode == "quadratic_colored_after_first":
+                endpoint_jacobian = _radau_quadratic_colored_jacobian_update(
+                    kernel_context,
+                    t_value=t_value,
+                    flat_y=refresh_state,
+                    jacobian_anchor=jacobian_ref,
+                    lagged_response=lagged_response,
+                    flat_rhs_lagged_response_tangent=(
+                        physics_context.flat_rhs_with_lagged_response_tangent
+                    ),
+                )
+            else:
+                endpoint_jacobian = jax.jacfwd(_rhs_eval_at_current_time)(refresh_state)
 
             def _factor_and_run(_):
                 endpoint_real_lu, endpoint_real_piv, endpoint_complex_lu, endpoint_complex_piv = (
@@ -19522,6 +19695,13 @@ def _build_prepared_radau_accepted_rollout(
         kwargs=kwargs,
         project_flat=project_flat,
     )
+    flat_rhs_with_lagged_response_tangent_raw = _flat_rhs_with_lagged_response_tangent_factory(
+        unravel=unpack_flat,
+        vector_field=vector_field,
+        args=args,
+        kwargs=kwargs,
+        project_flat=project_flat,
+    )
     flat_rhs_lagged_response_pullback = _flat_rhs_lagged_response_pullback_factory(
         unravel=unpack_flat,
         vector_field=vector_field,
@@ -19871,6 +20051,16 @@ def _build_prepared_radau_accepted_rollout(
         )
     build_lagged_response = build_lagged_response_raw
     flat_rhs_with_lagged_response = flat_rhs_with_lagged_response_raw
+    flat_rhs_with_lagged_response_tangent = flat_rhs_with_lagged_response_tangent_raw
+    if (
+        str(getattr(solver, "lagged_jacobian_refresh_mode", "none")).strip().lower()
+        == "quadratic_colored_after_first"
+        and flat_rhs_with_lagged_response_tangent is None
+    ):
+        raise ValueError(
+            "radau_lagged_jacobian_refresh_mode='quadratic_colored_after_first' requires "
+            "the vector field to provide evaluate_with_lagged_response_tangent(...)."
+        )
     initial_lagged_response = (
         build_lagged_response(unpack_flat(_project_flat_state_if_needed(flat_state0, project_flat)))
         if (use_transport_lagged_response and build_lagged_response is not None)
@@ -20037,6 +20227,7 @@ def _build_prepared_radau_accepted_rollout(
         compact_coefficient_record_zero=compact_coefficient_record_zero,
         flat_rhs=flat_rhs,
         flat_rhs_with_lagged_response=flat_rhs_with_lagged_response,
+        flat_rhs_with_lagged_response_tangent=flat_rhs_with_lagged_response_tangent,
         flat_rhs_lagged_response_pullback=flat_rhs_lagged_response_pullback,
         flat_rhs_build_support_pullback=flat_rhs_build_support_pullback,
         flat_rhs_build_support_pullback_batched_interpolated_faces=(
@@ -20265,6 +20456,13 @@ class RADAUSolver(_RadauSolverConfig):
         ) = _lagged_response_compact_coefficient_record_hooks(vector_field)
         pullback_build_lagged_response = _lagged_response_pullback_hook(vector_field)
         flat_rhs_with_lagged_response_raw = _flat_rhs_with_lagged_response_factory(
+            unravel=unpack_flat,
+            vector_field=vector_field,
+            args=args,
+            kwargs=kwargs,
+            project_flat=project_flat,
+        )
+        flat_rhs_with_lagged_response_tangent_raw = _flat_rhs_with_lagged_response_tangent_factory(
             unravel=unpack_flat,
             vector_field=vector_field,
             args=args,
@@ -20593,6 +20791,16 @@ class RADAUSolver(_RadauSolverConfig):
             )
         build_lagged_response = build_lagged_response_raw
         flat_rhs_with_lagged_response = flat_rhs_with_lagged_response_raw
+        flat_rhs_with_lagged_response_tangent = flat_rhs_with_lagged_response_tangent_raw
+        if (
+            str(getattr(self, "lagged_jacobian_refresh_mode", "none")).strip().lower()
+            == "quadratic_colored_after_first"
+            and flat_rhs_with_lagged_response_tangent is None
+        ):
+            raise ValueError(
+                "radau_lagged_jacobian_refresh_mode='quadratic_colored_after_first' requires "
+                "the vector field to provide evaluate_with_lagged_response_tangent(...)."
+            )
         initial_lagged_response = (
             build_lagged_response(unpack_flat(_project_flat_state_if_needed(flat_state0, project_flat)))
             if (use_transport_lagged_response and build_lagged_response is not None)
@@ -20777,6 +20985,7 @@ class RADAUSolver(_RadauSolverConfig):
             compact_coefficient_record_zero=compact_coefficient_record_zero,
             flat_rhs=flat_rhs,
             flat_rhs_with_lagged_response=flat_rhs_with_lagged_response,
+            flat_rhs_with_lagged_response_tangent=flat_rhs_with_lagged_response_tangent,
             flat_rhs_lagged_response_pullback=flat_rhs_lagged_response_pullback,
             flat_rhs_build_support_pullback=flat_rhs_build_support_pullback,
             flat_rhs_build_support_pullback_batched_interpolated_faces=(

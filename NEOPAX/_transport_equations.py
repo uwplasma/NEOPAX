@@ -2861,13 +2861,13 @@ class ComposedEquationSystem:
     def evaluate_with_lagged_response_tangent(
         self, t, state, state_direction, runtime, lagged_response
     ):
-        """RHS tangent for the opt-in quadratic cached-response Newton path.
+        """Directional RHS derivative of a cached transport response.
 
-        The expensive neoclassical part is supplied by the shared flux model's
-        explicit quadratic-response tangent.  JAX forward mode below is used
-        only for local projection and transport-equation assembly with those
-        flux values as explicit inputs; it never differentiates through an
-        NTX solve or response builder.
+        This is deliberately a split rule.  The expensive neoclassical flux
+        derivative comes from the model's explicit cached-response tangent;
+        JAX differentiates only the inexpensive local transport assembly and
+        boundary/projection maps.  In particular, this does not trace through
+        a live NTX solve or a lagged-response rebuild.
         """
         del t, runtime
 
@@ -2897,15 +2897,15 @@ class ComposedEquationSystem:
             **self._shared_flux_bc_kwargs(),
         )
 
-        def _assemble(working_state_value, flux_value):
+        def _assemble(working_state_value, state_reference_value, flux_value):
             return self._evaluate_with_shared_fluxes_from_working_state(
-                working_state_value, eidx, state, flux_value
+                working_state_value, eidx, state_reference_value, flux_value
             )
 
         return jax.jvp(
             _assemble,
-            (working_state, shared_fluxes),
-            (working_direction, shared_flux_direction),
+            (working_state, state, shared_fluxes),
+            (working_direction, state_direction, shared_flux_direction),
         )[1]
 
     def _evaluate_with_shared_fluxes_from_working_state(self, working_state, eidx, state_reference, shared_fluxes):
