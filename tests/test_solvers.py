@@ -1,11 +1,13 @@
 import dataclasses
 import types
+from types import SimpleNamespace
 
 import jax
 import jax.numpy as jnp
 import pytest
 
 import NEOPAX._transport_solvers as transport_solvers
+from NEOPAX._state import TransportState
 
 from NEOPAX._transport_solvers import (
     DiffraxSolver,
@@ -1100,6 +1102,70 @@ def test_radau_quadratic_colored_refresh_recovers_block_tridiagonal_jacobian():
         )[1],
     )
     assert jnp.allclose(updated, jax.jacfwd(rhs)(current), rtol=1.0e-12, atol=1.0e-12)
+
+
+def test_radau_floating_edge_node_uses_private_augmented_coordinate():
+    """The node mode must integrate an edge scalar without changing output state."""
+
+    class _NodeOwner:
+        er_equation = SimpleNamespace(boundary_mode="floating_ambipolar_edge_node")
+
+        def __call__(self, _t, state, *_args):
+            return TransportState(
+                density=-0.1 * state.density,
+                pressure=-0.1 * state.pressure,
+                Er=-state.Er,
+            )
+
+        def build_lagged_response(self, state):
+            return state
+
+        def evaluate_with_lagged_response(self, _t, state, *_args, lagged_response):
+            del lagged_response
+            return self(0.0, state)
+
+        def build_node_boundary_lagged_response(self, state, er_edge):
+            # The cache is intentionally an ordinary model payload; Radau
+            # owns the separate edge anchor.
+            del state
+            return er_edge
+
+        def evaluate_node_boundary_with_lagged_response(
+            self, state, er_edge, transport_response, *, er_edge_anchor
+        ):
+            # Exercise both coupling directions: the final centre sees the
+            # node, and the node evolves independently from its anchor.
+            del transport_response, er_edge_anchor
+            er_rhs = -state.Er
+            er_rhs = er_rhs.at[-1].add(-0.25 * er_edge)
+            core = TransportState(
+                density=-0.1 * state.density,
+                pressure=-0.1 * state.pressure,
+                Er=er_rhs,
+            )
+            return core, -0.5 * er_edge
+
+    state0 = TransportState(
+        density=jnp.ones((1, 2)),
+        pressure=jnp.ones((1, 2)),
+        Er=jnp.asarray([1.0, 2.0]),
+    )
+    solver = RADAUSolver(
+        t0=0.0,
+        t1=1.0e-2,
+        dt=1.0e-3,
+        rtol=1.0e-6,
+        atol=1.0e-8,
+        rhs_mode="lagged_transport_response",
+        maxiter=8,
+        max_steps=32,
+    )
+    out = solver.solve(state0, _NodeOwner().__call__)
+
+    assert int(out["n_steps"]) > 0
+    assert isinstance(out["final_state"], TransportState)
+    assert len(jax.tree_util.tree_leaves(out["final_state"])) == 3
+    assert jnp.all(jnp.isfinite(out["final_state"].Er))
 
 
 def test_radau_endpoint_defect_correction_runs_on_nonlinear_lagged_rhs():

@@ -7536,6 +7536,8 @@ def internal_realtime_geometry_transport_reverse_table_result_builder(
                 "geometry": active_runtime.geometry,
                 "database": recorded_scan_owner.runtime_scan.database,
             }
+            if set(support_payload) != {"geometry", "database"}:
+                raise RuntimeError("Database segment support must contain only geometry and database.")
         else:
             ntx_support_payload = find_ntx_support_payload(active_runtime)
             support_payload = (

@@ -299,10 +299,13 @@ def split_recorded_ntx_database_runtime(runtime):
         )
     if runtime_scan.database is None:
         raise ValueError("Database reverse ownership requires a built runtime database.")
-    return (
-        DatabaseSegmentRuntime(runtime_without_recorded_ntx_scan_primal(runtime)),
-        RecordedNTXDatabaseScanOwner(runtime_scan),
-    )
+    segment_runtime = runtime_without_recorded_ntx_scan_primal(runtime)
+    segment_scan = find_ntx_runtime_scan_model_in_model(segment_runtime.models.flux)
+    if segment_scan is None or segment_scan.database is not runtime_scan.database:
+        raise RuntimeError("Database segment runtime failed to retain the fixed scan database.")
+    if segment_scan.scan_primal_record is not None or segment_scan.scan_primal is not None:
+        raise RuntimeError("Database segment runtime must not retain a scan primal or record.")
+    return DatabaseSegmentRuntime(segment_runtime), RecordedNTXDatabaseScanOwner(runtime_scan)
 
 
 def runtime_without_recorded_ntx_scan_primal(runtime):
@@ -431,7 +434,9 @@ def fold_recorded_ntx_scan_database_bar_into_support(runtime, support_bar):
     merged.pop("database")
     for key in ("channels", "surfaces"):
         if key not in merged:
-            raise ValueError(f"Recorded database support bar is missing direct {key!r} support.")
+            merged[key] = jax.tree_util.tree_map(
+                jnp.zeros_like, database_support_bar[key]
+            )
         merged[key] = _add_float_delta_tree(merged[key], database_support_bar[key])
     return merged
 
@@ -475,7 +480,9 @@ def fold_recorded_ntx_scan_database_bars_into_support(runtime, support_bars):
         database_support_bar = _row(database_support_bars, index)
         for key in ("channels", "surfaces"):
             if key not in merged:
-                raise ValueError(f"Recorded database support bar is missing direct {key!r} support.")
+                merged[key] = jax.tree_util.tree_map(
+                    jnp.zeros_like, database_support_bar[key]
+                )
             merged[key] = _add_float_delta_tree(merged[key], database_support_bar[key])
         folded.append(merged)
     return tuple(folded)

@@ -228,6 +228,7 @@ def test_floating_er_edge_node_keeps_last_cell_diffusion_and_evolves_face_node()
     # Radau-local scalar so ordinary forward/reverse state pytrees remain the
     # same three leaves.
     assert not hasattr(state, "Er_edge")
+    assert len(jax.tree_util.tree_leaves(state)) == 3
     assert jnp.allclose(rhs, jnp.asarray([0.0, -3.0]))
     assert jnp.allclose(
         equation.edge_rhs(state, fluxes=fluxes, er_edge_override=jnp.asarray(5.0)),
