@@ -23,6 +23,7 @@ from NEOPAX._orchestrator import (
 )
 from NEOPAX._reverse_ad_initial_er import (
     fold_recorded_ntx_scan_database_bar_into_support,
+    fold_recorded_ntx_scan_database_bar_groups_into_support,
     fold_recorded_ntx_scan_database_bars_into_support,
     realtime_geometry_payload_for_runtime,
     realtime_geometry_reverse_support_payload_for_runtime,
@@ -2288,6 +2289,38 @@ def test_recorded_ntx_database_bars_use_one_batched_scan_pullback(monkeypatch):
     assert jnp.allclose(actual[1]["surfaces"], 110.0)
     # ``vmap`` traces the retained transpose once instead of Python-looping
     # through the two objective rows.
+    assert calls == {"count": 1}
+
+
+def test_recorded_ntx_database_bar_groups_share_one_batched_scan_pullback(monkeypatch):
+    """Report components must not each replay the retained database transpose."""
+    calls = {"count": 0}
+
+    class _RecordedScan:
+        def recorded_runtime_database_support_bar(self, database_bar):
+            calls["count"] += 1
+            return {"channels": 2.0 * database_bar, "surfaces": 3.0 * database_bar}
+
+    monkeypatch.setattr(
+        initial_er_module,
+        "find_ntx_runtime_scan_model_in_model",
+        lambda _flux: _RecordedScan(),
+    )
+    runtime = types.SimpleNamespace(models=types.SimpleNamespace(flux=object()))
+    groups = (
+        (
+            {"geometry": jnp.asarray(0.0), "channels": jnp.asarray(1.0), "surfaces": jnp.asarray(2.0), "database": jnp.asarray(3.0)},
+            {"geometry": jnp.asarray(0.0), "channels": jnp.asarray(4.0), "surfaces": jnp.asarray(5.0), "database": jnp.asarray(6.0)},
+        ),
+        (
+            {"geometry": jnp.asarray(0.0), "channels": jnp.asarray(7.0), "surfaces": jnp.asarray(8.0), "database": jnp.asarray(9.0)},
+        ),
+    )
+    actual = fold_recorded_ntx_scan_database_bar_groups_into_support(runtime, groups)
+    assert jnp.allclose(actual[0][0]["channels"], 7.0)
+    assert jnp.allclose(actual[0][1]["surfaces"], 23.0)
+    assert jnp.allclose(actual[1][0]["channels"], 25.0)
+    # All three rows were stacked into one retained scan transpose.
     assert calls == {"count": 1}
 
 
