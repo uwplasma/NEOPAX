@@ -2182,13 +2182,6 @@ class ComposedEquationSystem:
         return state_bar
 
     def build_lagged_response(self, state):
-        if getattr(state, "Er_edge", None) is not None:
-            raise NotImplementedError(
-                "floating_ambipolar_edge_node is currently a direct/black-box "
-                "forward mode. Its custom lagged-response tangent must include "
-                "the separate outer-face Er_edge scalar before it can be used "
-                "with lagged_response or reverse AD."
-            )
         working_state, eidx = self._prepare_working_state(state)
         if lagged_timing_enabled():
             jax.debug.callback(lambda: lagged_timing_start("equations.build_lagged_response"), ordered=True)

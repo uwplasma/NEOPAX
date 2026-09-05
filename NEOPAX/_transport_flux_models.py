@@ -1262,10 +1262,26 @@ def _build_evaluated_transport_state_directional(
     )
     if temperature_floor is not None:
         temperature_face = maximum_with_constant_floor(temperature_face, temperature_floor)
+    er_face = _face_profile_directional(
+        center.Er, geometry.r_grid_half, bc_model=bc_er, reconstruction=reconstruction
+    )
+    # A floating edge node is an independent scalar direction.  Replace only
+    # the outer face jet, preserving the usual directional FV reconstruction
+    # on all interior faces.
+    if getattr(state, "Er_edge", None) is not None:
+        edge_direction = getattr(state_direction, "Er_edge", None)
+        if edge_direction is None:
+            edge_direction = jnp.zeros_like(state.Er_edge)
+        er_face = dataclasses.replace(
+            er_face,
+            value=er_face.value.at[-1].set(state.Er_edge),
+            first=er_face.first.at[-1].set(edge_direction),
+            second=er_face.second.at[-1].set(jnp.zeros_like(state.Er_edge)),
+        )
     face = _DirectionalTransportState(
         density=density_face,
         pressure=_jet_multiply(density_face, temperature_face),
-        Er=_face_profile_directional(center.Er, geometry.r_grid_half, bc_model=bc_er, reconstruction=reconstruction),
+        Er=er_face,
     )
     return _DirectionalEvaluatedTransportState(
         center=center,
@@ -16363,6 +16379,11 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             density=state.density - response.reference_state.density,
             pressure=state.pressure - response.reference_state.pressure,
             Er=state.Er - response.reference_state.Er,
+            Er_edge=(
+                state.Er_edge - response.reference_state.Er_edge
+                if getattr(state, "Er_edge", None) is not None
+                else None
+            ),
         )
         evaluated = _build_evaluated_transport_state_directional(
             response.reference_state,
@@ -16465,12 +16486,22 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             density=state.density + state_direction.density,
             pressure=state.pressure + state_direction.pressure,
             Er=state.Er + state_direction.Er,
+            Er_edge=(
+                state.Er_edge + state_direction.Er_edge
+                if getattr(state, "Er_edge", None) is not None
+                else None
+            ),
         )
         minus_state = dataclasses.replace(
             state,
             density=state.density - state_direction.density,
             pressure=state.pressure - state_direction.pressure,
             Er=state.Er - state_direction.Er,
+            Er_edge=(
+                state.Er_edge - state_direction.Er_edge
+                if getattr(state, "Er_edge", None) is not None
+                else None
+            ),
         )
         def _polarized(evaluate, response):
             if not isinstance(response, NTXFullStateQuadraticPreparedCoefficientResponse):
