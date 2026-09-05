@@ -1786,11 +1786,19 @@ class ComposedEquationSystem:
         composite fluxes and includes the direct geometry terms from transport
         equation assembly.
         """
-        exact_pullback = getattr(
-            self.shared_flux_model, "pullback_direct_rhs_support_payload", None
-        )
         is_exact_ntx_support = isinstance(support, dict) and "ntx_support" in support
         is_recorded_database_support = isinstance(support, dict) and "database" in support
+        # Bind the live payload once before taking any black-box boundary.
+        # The runtime-scan model otherwise still owns its construction-time
+        # database, while the support tree owns the recorded primal that must
+        # be used consistently by the table, flux-geometry, and outer-RHS
+        # transposes below.
+        active_shared_flux_model = self._flux_model_with_realtime_support_payload(
+            self.shared_flux_model, support
+        )
+        exact_pullback = getattr(
+            active_shared_flux_model, "pullback_direct_rhs_support_payload", None
+        )
         if (
             callable(exact_pullback)
             and isinstance(support, dict)
@@ -1798,7 +1806,7 @@ class ComposedEquationSystem:
             and (is_exact_ntx_support or is_recorded_database_support)
         ):
             working_state, _ = self._prepare_working_state(state)
-            shared_fluxes = self.shared_flux_model(working_state)
+            shared_fluxes = active_shared_flux_model(working_state)
             flux_bar = self.pullback_shared_fluxes(state, shared_fluxes, rhs_bar)
             owner_support = (
                 support["ntx_support"] if is_exact_ntx_support else support
@@ -1809,7 +1817,7 @@ class ComposedEquationSystem:
             geometry = support["geometry"]
             geometry_delta0 = _float_delta_tree_like(geometry)
             flux_geometry_pullback = getattr(
-                self.shared_flux_model,
+                active_shared_flux_model,
                 "pullback_direct_rhs_geometry_by_radius",
                 None,
             )
