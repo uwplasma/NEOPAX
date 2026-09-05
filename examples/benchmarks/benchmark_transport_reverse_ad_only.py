@@ -6570,6 +6570,11 @@ def main() -> None:
             else "explicit_ntx_interpolated"
         )
     if (
+        is_database_geometry_reverse
+        and str(args.reverse_stage_adjoint_solve_mode).strip().lower() == "block"
+    ):
+        args.reverse_stage_adjoint_solve_mode = "block_colored_database"
+    if (
         str(args.reverse_rhs_transpose_mode) == "explicit_ntx_interpolated"
         and str(args.reverse_stage_adjoint_solve_mode) == "gmres"
     ):

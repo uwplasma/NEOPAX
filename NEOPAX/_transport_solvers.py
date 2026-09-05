@@ -449,7 +449,16 @@ def _project_packed_transport_state_arrays(
         return state_like
 
     density, pressure, er = state_like
-    packed_density = safe_density(density, density_floor)
+    # ``None`` means “use the transport default”, not a numerical floor of
+    # ``None``.  Passing it directly to ``jnp.asarray`` produces NaNs; that
+    # was normally hidden because the production equation system always owns
+    # an explicit density floor, but it breaks valid lightweight/vector-field
+    # owners (including the private floating-edge-node solver path).
+    packed_density = (
+        safe_density(density)
+        if density_floor is None
+        else safe_density(density, density_floor)
+    )
     eidx = _electron_density_index(species)
     if eidx is not None and packed_density.shape[-2] == template_state.density.shape[0] - 1:
         full_shape = pressure.shape[:-2] + (template_state.density.shape[0], pressure.shape[-1])
