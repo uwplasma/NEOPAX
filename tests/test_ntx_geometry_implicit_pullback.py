@@ -600,6 +600,25 @@ def test_database_local_bootstrap_state_pullback_matches_full_upar_jvp(
         rtol=2.0e-10,
         atol=2.0e-10,
     )
+    joint_state_bar, joint_geometry_bar = (
+        model.pullback_momentum_corrected_upar_state_geometry_by_radius(
+            state, upar_bar, geometry
+        )
+    )
+    for actual, expected in zip(
+        jax.tree_util.tree_leaves(joint_state_bar),
+        jax.tree_util.tree_leaves(state_bar),
+        strict=True,
+    ):
+        if jnp.issubdtype(jnp.asarray(expected).dtype, jnp.inexact):
+            assert jnp.allclose(actual, expected, rtol=2.0e-10, atol=2.0e-10)
+    for actual, expected in zip(
+        jax.tree_util.tree_leaves(joint_geometry_bar),
+        jax.tree_util.tree_leaves(geometry_bar),
+        strict=True,
+    ):
+        if jnp.issubdtype(jnp.asarray(expected).dtype, jnp.inexact):
+            assert jnp.allclose(actual, expected, rtol=2.0e-10, atol=2.0e-10)
 
     def _upar_from_tables(d11_log, d13, d33):
         table_model = dataclasses.replace(

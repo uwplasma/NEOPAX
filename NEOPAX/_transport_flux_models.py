@@ -3362,6 +3362,88 @@ class NTXDatabaseTransportModel(TransportFluxModelBase):
         state_bar, _ = jax.lax.scan(_accumulate, state_bar0, radius_indices)
         return state_bar
 
+    def pullback_momentum_corrected_upar_state_geometry_by_radius(
+        self, state, upar_bar, geometry
+    ):
+        """Joint compact corrected-Upar transpose to state and geometry.
+
+        The recorded-database bootstrap boundary holds its three interpolation
+        tables fixed while differentiating state and geometry.  Keeping those
+        two cotangents in separate helpers made two otherwise identical local
+        VJP scans.  This is the database counterpart of the exact-Lij joint
+        local rule: one single-radius momentum VJP contributes both bars.
+        Database-table bars remain the explicit interpolation transpose in
+        :meth:`pullback_momentum_corrected_upar_database_by_radius`.
+        """
+        upar_bar = jnp.asarray(upar_bar, dtype=state.pressure.dtype)
+        radius_indices = jnp.arange(upar_bar.shape[-1], dtype=jnp.int32)
+
+        def _zero_state_leaf(leaf):
+            array = jnp.asarray(leaf)
+            return (
+                jnp.zeros_like(array)
+                if jnp.issubdtype(array.dtype, jnp.inexact)
+                else jnp.zeros(array.shape, dtype=jnp.float64)
+            )
+
+        state_bar0 = jax.tree_util.tree_map(_zero_state_leaf, state)
+        geometry_delta0 = _float_delta_tree_like(geometry)
+        geometry_leaves0, geometry_treedef = jax.tree_util.tree_flatten(
+            geometry_delta0
+        )
+        geometry_shapes = tuple(jnp.asarray(leaf).shape for leaf in geometry_leaves0)
+        geometry_sizes = tuple(int(jnp.asarray(leaf).size) for leaf in geometry_leaves0)
+        geometry_flat_delta0 = jnp.concatenate(
+            tuple(jnp.ravel(jnp.asarray(leaf)) for leaf in geometry_leaves0)
+        )
+
+        def _split_geometry(flat_delta):
+            leaves = []
+            offset = 0
+            for size, shape in zip(geometry_sizes, geometry_shapes, strict=True):
+                leaves.append(jnp.reshape(flat_delta[offset : offset + size], shape))
+                offset += size
+            return geometry_treedef.unflatten(leaves)
+
+        def _accumulate(carry, radius_index):
+            state_carry, geometry_flat_carry = carry
+
+            def _upar_from_state_and_geometry(state_value, geometry_flat_delta):
+                model = dataclasses.replace(
+                    self,
+                    geometry=_add_float_delta_tree(
+                        geometry, _split_geometry(geometry_flat_delta)
+                    ),
+                )
+                return model._momentum_corrected_upar_one_radius(
+                    state_value, radius_index
+                )
+
+            _, pullback = jax.vjp(
+                _upar_from_state_and_geometry, state, geometry_flat_delta0
+            )
+            local_bar = jax.lax.dynamic_index_in_dim(
+                upar_bar, radius_index, axis=1, keepdims=False
+            )
+            state_bar, geometry_flat_bar = pullback(local_bar)
+            return (
+                (
+                    jax.tree_util.tree_map(
+                        lambda left, right: left + right, state_carry, state_bar
+                    ),
+                    geometry_flat_carry + geometry_flat_bar,
+                ),
+                None,
+            )
+
+        (state_bar, geometry_flat_bar), _ = jax.lax.scan(
+            _accumulate,
+            (state_bar0, jnp.zeros_like(geometry_flat_delta0)),
+            radius_indices,
+        )
+        geometry_bar = _split_geometry(geometry_flat_bar)
+        return state_bar, geometry_bar
+
     def pullback_momentum_corrected_upar_database_by_radius(self, state, upar_bar):
         """Return compact corrected-Upar bars for the three database tables.
 
@@ -4938,6 +5020,15 @@ class NTXRuntimeScanTransportModel(TransportFluxModelBase):
 
         return self._database_model().pullback_momentum_corrected_upar_state_by_radius(
             state, upar_bar
+        )
+
+    def pullback_momentum_corrected_upar_state_geometry_by_radius(
+        self, state, upar_bar, geometry
+    ):
+        """Delegate the joint compact database state/geometry transpose."""
+
+        return self._database_model().pullback_momentum_corrected_upar_state_geometry_by_radius(
+            state, upar_bar, geometry
         )
 
     def pullback_momentum_corrected_upar_database_by_radius(self, state, upar_bar):

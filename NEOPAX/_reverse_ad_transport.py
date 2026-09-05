@@ -4325,6 +4325,11 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
                 "pullback_momentum_corrected_upar_geometry_by_radius",
                 None,
             )
+            database_state_geometry_pullback_fn = getattr(
+                neoclassical_model,
+                "pullback_momentum_corrected_upar_state_geometry_by_radius",
+                None,
+            )
             joint_pullback_fn = getattr(
                 neoclassical_model,
                 "pullback_momentum_corrected_upar_state_support_geometry_by_radius",
@@ -4374,6 +4379,12 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
                 and combined_geometry_payload
                 and not database_payload
             )
+            use_joint_database_bootstrap_pullback = (
+                bootstrap_cotangent_mode
+                in {"joint_local_vjp", "joint_local_vjp_upar_only"}
+                and combined_geometry_payload
+                and database_payload
+            )
             if (
                 bootstrap_cotangent_mode
                 in {"joint_local_vjp", "joint_local_vjp_upar_only"}
@@ -4401,6 +4412,19 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
                     geometry,
                     ntx_support,
                 )
+            elif use_joint_database_bootstrap_pullback:
+                if not callable(database_state_geometry_pullback_fn):
+                    raise NotImplementedError(
+                        "joint local database bootstrap modes require the compact "
+                        "state/geometry corrected-Upar pullback."
+                    )
+                final_state_bar, geometry_objective_bar = (
+                    database_state_geometry_pullback_fn(
+                        final_state_for_bootstrap,
+                        upar_bar,
+                        support_payload["geometry"],
+                    )
+                )
             else:
                 final_state_bar = state_pullback_fn(final_state_for_bootstrap, upar_bar)
             _, unpack_pullback = jax.vjp(
@@ -4422,16 +4446,20 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
                         D33=d33_bar,
                     )
                     geometry = support_payload["geometry"]
-                    if not callable(geometry_pullback_fn):
+                    if (
+                        not use_joint_database_bootstrap_pullback
+                        and not callable(geometry_pullback_fn)
+                    ):
                         raise NotImplementedError(
                             "Recorded database bootstrap AD requires the compact "
                             "fixed-database corrected-Upar geometry pullback."
                         )
-                    geometry_objective_bar = geometry_pullback_fn(
-                        final_state_for_bootstrap,
-                        upar_bar,
-                        geometry,
-                    )
+                    if not use_joint_database_bootstrap_pullback:
+                        geometry_objective_bar = geometry_pullback_fn(
+                            final_state_for_bootstrap,
+                            upar_bar,
+                            geometry,
+                        )
                     # The recorded scan payload also contains the direct
                     # ``channels`` and ``surfaces`` branches.  Bootstrap has
                     # no direct contribution to either one at this stage,
