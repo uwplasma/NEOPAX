@@ -9996,6 +9996,16 @@ def _radau_stage_residual(
 
 def _radau_debug_array_stats(label, value):
     value = jnp.asarray(value)
+    # Some equation selections intentionally leave a packed block empty
+    # (for example frozen density).  Diagnostics must report that fact rather
+    # than masking the original nonfinite-stage failure with argmax(empty).
+    if value.size == 0:
+        jax.debug.print(
+            "[radau-nonfinite-detail] {label}: empty shape={shape}",
+            label=label,
+            shape=value.shape,
+        )
+        return
     finite = jnp.all(jnp.isfinite(value))
     bad = jnp.ravel(jnp.logical_not(jnp.isfinite(value)))
     first_bad = jnp.argmax(bad)

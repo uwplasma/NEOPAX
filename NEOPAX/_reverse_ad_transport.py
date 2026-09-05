@@ -48,7 +48,7 @@ from ._reverse_ad_initial_er import (
     runtime_with_geometry_payload,
     runtime_with_ntx_support_payload,
     runtime_with_realtime_geometry_reverse_support_payload,
-    runtime_without_recorded_ntx_scan_primal,
+    split_recorded_ntx_database_runtime,
 )
 from ._reverse_ad_parameters import (
     PROFILE_PARAMETER_ORDER,
@@ -7410,7 +7410,12 @@ def internal_realtime_geometry_transport_reverse_table_result_builder(
         # the original runtime below is retained solely for the final one-time
         # database-to-scan transpose.
         recorded_scan_runtime = active_runtime
-        active_runtime = runtime_without_recorded_ntx_scan_primal(active_runtime)
+        recorded_scan_owner = None
+        if str(realtime_geometry_payload_for_runtime(active_runtime)["kind"]) == "ntx_scan_runtime":
+            database_segment_runtime, recorded_scan_owner = split_recorded_ntx_database_runtime(
+                active_runtime
+            )
+            active_runtime = database_segment_runtime.runtime
         _report_table_builder_phase("prepare_runtime_payload")
         active_reverse_setup = prepare_reverse_static_setup(
             active_profile_values,
@@ -7588,7 +7593,7 @@ def internal_realtime_geometry_transport_reverse_table_result_builder(
         # are returned unchanged by the helper.
         component_names = tuple(component_bars)
         folded_groups = fold_recorded_ntx_scan_database_bar_groups_into_support(
-            recorded_scan_runtime,
+            recorded_scan_owner if recorded_scan_owner is not None else recorded_scan_runtime,
             (support_bars, *(component_bars[name] for name in component_names)),
         )
         support_bars = folded_groups[0]

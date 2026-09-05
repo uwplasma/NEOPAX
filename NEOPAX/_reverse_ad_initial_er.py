@@ -259,6 +259,52 @@ def find_ntx_runtime_scan_model_in_model(model):
     return None
 
 
+@dataclasses.dataclass(frozen=True)
+class RecordedNTXDatabaseScanOwner:
+    """The sole owner of a recorded NTX scan and its final table transpose.
+
+    This object is intentionally host-side reverse orchestration state.  It
+    is not part of a Radau segment runtime and must only be used after the
+    transport sweep has accumulated database-table cotangents.
+    """
+
+    runtime_scan: NTXRuntimeScanTransportModel
+
+    def database_support_bar(self, database_bar):
+        return self.runtime_scan.recorded_runtime_database_support_bar(database_bar)
+
+
+@dataclasses.dataclass(frozen=True)
+class DatabaseSegmentRuntime:
+    """Fixed-table runtime safe to capture by forward and segment reverse work."""
+
+    runtime: Any
+
+
+def split_recorded_ntx_database_runtime(runtime):
+    """Split fixed-table segment state from the retained scan-transpose owner.
+
+    The segment runtime keeps the concrete database and all normal transport
+    inputs, but removes the prepared scan primal.  The returned owner is the
+    only object permitted to retain that primal for the one post-sweep scan
+    VJP.
+    """
+
+    runtime_scan = find_ntx_runtime_scan_model_in_model(runtime.models.flux)
+    if runtime_scan is None:
+        raise ValueError("Database reverse ownership requires an NTX runtime scan model.")
+    if runtime_scan.scan_primal_record is None or runtime_scan.scan_primal is None:
+        raise ValueError(
+            "Database reverse ownership requires a recorded NTX scan primal."
+        )
+    if runtime_scan.database is None:
+        raise ValueError("Database reverse ownership requires a built runtime database.")
+    return (
+        DatabaseSegmentRuntime(runtime_without_recorded_ntx_scan_primal(runtime)),
+        RecordedNTXDatabaseScanOwner(runtime_scan),
+    )
+
+
 def runtime_without_recorded_ntx_scan_primal(runtime):
     """Drop the retained scan record from runtime objects used inside segment VJPs.
 
@@ -435,7 +481,7 @@ def fold_recorded_ntx_scan_database_bars_into_support(runtime, support_bars):
     return tuple(folded)
 
 
-def fold_recorded_ntx_scan_database_bar_groups_into_support(runtime, bar_groups):
+def fold_recorded_ntx_scan_database_bar_groups_into_support(runtime_or_owner, bar_groups):
     """Fold every report-row database bar through one retained scan transpose.
 
     ``support_bars`` and the named component bars describe the same transport
@@ -462,8 +508,15 @@ def fold_recorded_ntx_scan_database_bar_groups_into_support(runtime, bar_groups)
         raise ValueError(
             "Recorded database support-bar groups must consistently carry a database leaf."
         )
-    runtime_scan = find_ntx_runtime_scan_model_in_model(runtime.models.flux)
-    if runtime_scan is None:
+    owner = (
+        runtime_or_owner
+        if isinstance(runtime_or_owner, RecordedNTXDatabaseScanOwner)
+        else None
+    )
+    runtime_scan = None if owner is not None else find_ntx_runtime_scan_model_in_model(
+        runtime_or_owner.models.flux
+    )
+    if owner is None and runtime_scan is None:
         raise ValueError("Recorded database support bars require an NTX runtime scan model.")
 
     database_bars = jax.tree_util.tree_map(
@@ -471,7 +524,7 @@ def fold_recorded_ntx_scan_database_bar_groups_into_support(runtime, bar_groups)
         *(bar["database"] for _group_index, _row_index, bar in indexed_bars),
     )
     database_support_bars = jax.vmap(
-        runtime_scan.recorded_runtime_database_support_bar,
+        owner.database_support_bar if owner is not None else runtime_scan.recorded_runtime_database_support_bar,
     )(database_bars)
 
     rebuilt = [list(group) for group in groups]
