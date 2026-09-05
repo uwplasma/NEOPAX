@@ -1,6 +1,6 @@
-# One-build diagnostic for face-coefficient centre interpolation evaluated in
-# common physical (nu / v, Er / v) coordinates. It prints the largest
-# difference against direct-centre Lij.
+# Full w-He Radau transport run using the frozen full transport-state
+# quadratic realtime-NTX response and the transport-scaled endpoint Newton
+# criterion. All 52 face anchors are retained.
 
 [general]
 mode = "transport"
@@ -17,11 +17,10 @@ ntx_exact_n_theta = 5
 ntx_exact_n_zeta = 25
 ntx_exact_n_xi = 31
 ntx_exact_surface_backend = "vmec"
-ntx_exact_center_response_mode = "center_local_response"
+ntx_exact_center_response_mode = "interpolate_from_faces"
 ntx_exact_response_anchor_count = 52
 lagged_response_taylor_order = 2
 ntx_exact_full_state_quadratic_response = true
-ntx_exact_debug_center_lij_comparison = false
 
 [ambipolarity]
 er_ambipolar_method = "two_stage"
@@ -41,7 +40,7 @@ er_ambipolar_overlay_reference_er = true
 er_ambipolar_reference_er_file = "./examples/inputs/NTSS_Test_Initial_scaled_flux.h5"
 er_ambipolar_reference_er_label = "reference Er"
 er_ambipolar_plot = true
-er_ambipolar_output_dir = "./outputs/my_ambipolarity_run_scaled_flux_ntx_exact_direct_completed_face_terms"
+er_ambipolar_output_dir = "./outputs/my_ambipolarity_run_scaled_flux_ntx_exact_lagged_vmec_realtime_full_state_quadratic_transport_endpoint_newton_completed_face_local_terms_wHe"
 er_initialization_preprocess_boundary_state = false
 
 [turbulence]
@@ -127,20 +126,21 @@ temperature_floor = 1.0e-6
 transport_solver_backend = "radau"
 integrator = "radau"
 radau_rhs_mode = "lagged_response"
-center_flux_mode = "direct"
 radau_num_stages = 7
 nonlinear_solver_tol = 1.0e-7
 nonlinear_solver_maxiter = 20
-radau_newton_tol_mode = "hairer"
+radau_newton_tol_mode = "hairer_transport_endpoint"
 radau_newton_fnewt_mode = "hairer"
+radau_newton_transport_endpoint_tol = 1.0e-1
 radau_newton_stagnation_mode = "off"
 radau_error_estimator = "embedded2_ntss_transport_scale"
 radau_controller_mode = "hairer_lean_transport_discounted"
 radau_predictor_mode = "collocation_transport_weighted"
-lagged_response_reuse_mode = "retry_only"
-radau_jacobian_reuse_mode = "retry_only"
+lagged_response_reuse_mode = "global_state_drift_max"
+lagged_response_reuse_rtol = 1.0e-2
+lagged_response_reuse_atol = 1.0e-8
 t0 = 0.0
-t_final = 2.0
+t_final = 0.001
 dt = 1.0e-8
 rtol = 1.0e-6
 atol = 1.0e-8
@@ -153,7 +153,7 @@ debug_walltime_attempts = true
 debug_nonfinite_rhs_components = false
 debug_disable_jit = false
 forward_warm_timing_repeats = 0
-save_n = 2
+save_n = 10
 temperature_include_work_term = true
 temperature_include_neo_convection = true
 temperature_include_turbulent_convection = false
@@ -175,6 +175,6 @@ transport_initial_reference_file = "./examples/inputs/NTSS_Test_Initial_scaled_f
 transport_initial_reference_label = "Initial NTSS"
 transport_final_reference_file = "./examples/inputs/NTSS_Test_Final_flux_scaled_wHe.h5"
 transport_final_reference_label = "Final NTSS"
-transport_output_dir = "./outputs/transport_solver_radau_wHe_ntx_exact_direct_completed_face_terms"
+transport_output_dir = "./outputs/transport_solver_radau_wHe_ntx_exact_lagged_vmec_realtime_full_state_quadratic_transport_endpoint_newton_completed_face_local_terms"
 transport_plot_n_times = -1
 
