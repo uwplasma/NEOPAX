@@ -2064,7 +2064,8 @@ def test_reverse_setup_selects_live_scan_payload_without_exact_support_lookup():
 
     setup = prepare_realtime_geometry_support_segment_core_setup(
         args=args, config={}, baseline_values=jnp.asarray([]), baseline_runtime=runtime,
-        baseline_state="state", profile_cfg={}, neoclassical_cfg={}, parameter_order=(),
+        baseline_state="state", profile_cfg={},
+        neoclassical_cfg={"flux_model": "ntx_scan_runtime"}, parameter_order=(),
         find_ntx_support_payload=_unexpected_exact_lookup,
         prepare_reverse_static_setup=_prepare,
     )

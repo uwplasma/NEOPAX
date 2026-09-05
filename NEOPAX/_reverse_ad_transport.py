@@ -3416,6 +3416,18 @@ def prepare_reverse_static_setup(
         or (requested_full_final_time and max_reverse_accepted_steps is not None)
     )
     schedule_artifact = None
+    # A captured carry is a database-only experimental checkpoint.  The
+    # established Lij lane must retain the trace-only artifact contract: its
+    # realized-schedule VJP forward replays the fixed accepted schedule.
+    # Keeping this condition here (at static-setup ownership) prevents a
+    # database checkpoint from silently changing Lij benchmark timing or
+    # reverse semantics.
+    database_checkpoint_artifact = (
+        str(config.get("neoclassical", {}).get("flux_model", ""))
+        .strip()
+        .lower()
+        == "ntx_scan_runtime"
+    )
     schedule_artifact_mode = str(reverse_schedule_artifact_mode).strip().lower()
     if schedule_artifact_mode not in {"legacy", "reuse_static_probe"}:
         raise ValueError(
@@ -3535,10 +3547,12 @@ def prepare_reverse_static_setup(
         schedule_artifact=schedule_artifact,
         schedule_segment_start_carries=(
             schedule_probe.segment_start_carries
-            if schedule_artifact is not None else None
+            if database_checkpoint_artifact and schedule_artifact is not None else None
         ),
         schedule_final_carry=(
-            schedule_probe.final_carry if schedule_artifact is not None else None
+            schedule_probe.final_carry
+            if database_checkpoint_artifact and schedule_artifact is not None
+            else None
         ),
     )
 
@@ -3588,6 +3602,31 @@ def realtime_geometry_transport_reverse_table_context(
     )
 
 
+def realtime_geometry_reverse_model_kind(neoclassical_cfg: Mapping[str, Any]) -> str:
+    """Return the reverse lane selected exclusively by the TOML flux model.
+
+    The exact-Lij and live-scan database implementations deliberately share
+    the Radau reverse machinery, but they do *not* share a support leaf.  Make
+    that ownership boundary explicit at the public reverse setup seam: CLI
+    selectors may tune a lane, but cannot cause one model to enter the other
+    model's reverse implementation.
+    """
+
+    flux_model = str(neoclassical_cfg.get("flux_model", "")).strip().lower()
+    lanes = {
+        "ntx_exact_lij_runtime": "ntx_exact",
+        "ntx_scan_runtime": "ntx_scan_runtime",
+    }
+    try:
+        return lanes[flux_model]
+    except KeyError as exc:
+        raise NotImplementedError(
+            "Realtime geometry segmented reverse supports only "
+            "neoclassical.flux_model='ntx_exact_lij_runtime' or "
+            f"'ntx_scan_runtime'; got {flux_model!r}."
+        ) from exc
+
+
 def prepare_realtime_geometry_support_segment_core_setup(
     *,
     args,
@@ -3627,8 +3666,20 @@ def prepare_realtime_geometry_support_segment_core_setup(
         "support_segment_probe",
     }
     ntx_surface_backend = str(neoclassical_cfg.get("ntx_exact_surface_backend", "booz"))
+    # The TOML owns lane selection.  The runtime payload is only a checked
+    # implementation detail; accepting it as the selector would permit a
+    # database payload to enter the established exact-Lij branch (or vice
+    # versa) after a caller/CLI mutation.
+    payload_kind = realtime_geometry_reverse_model_kind(neoclassical_cfg)
     runtime_payload = realtime_geometry_payload_for_runtime(baseline_runtime)
-    payload_kind = str(runtime_payload["kind"])
+    runtime_payload_kind = str(runtime_payload["kind"])
+    if runtime_payload_kind != payload_kind:
+        raise ValueError(
+            "Realtime geometry reverse runtime payload does not match "
+            "neoclassical.flux_model: "
+            f"TOML selects {payload_kind!r}, runtime exposes "
+            f"{runtime_payload_kind!r}."
+        )
     if payload_kind == "ntx_exact":
         # Preserve the established exact tree and call boundary unchanged.
         ntx_support_payload = find_ntx_support_payload(baseline_runtime)
