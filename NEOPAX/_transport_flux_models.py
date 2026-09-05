@@ -3112,6 +3112,72 @@ class NTXDatabaseTransportModel(TransportFluxModelBase):
         support_bar["database"] = _sanitize_float_delta_bar_tree(database, database_bar)
         return support_bar
 
+    def pullback_direct_rhs_geometry_by_radius(self, state, flux_bar, geometry):
+        """Transpose direct centre fluxes to fixed-database geometry locally.
+
+        The database table is fixed here: its accumulated cotangent is owned
+        by :meth:`pullback_direct_rhs_support_payload` and folded through the
+        retained scan once after the reverse sweep.  Avoiding a VJP of the
+        complete radial flux table keeps that scan record and all unrelated
+        equation/source work outside this boundary.
+        """
+        zero = jnp.zeros_like(jnp.asarray(state.density))
+
+        def _bar(name):
+            value = flux_bar.get(name, None)
+            if value is None:
+                return zero
+            value = jnp.asarray(value)
+            return zero if value.ndim == 0 or value.dtype == jax.dtypes.float0 else value
+
+        gamma_bar, q_bar, upar_bar = _bar("Gamma"), _bar("Q"), _bar("Upar")
+        radius_indices = jnp.arange(gamma_bar.shape[-1], dtype=jnp.int32)
+        geometry_delta0 = _float_delta_tree_like(geometry)
+        leaves0, treedef = jax.tree_util.tree_flatten(geometry_delta0)
+        shapes = tuple(jnp.asarray(leaf).shape for leaf in leaves0)
+        sizes = tuple(int(jnp.asarray(leaf).size) for leaf in leaves0)
+        flat_delta0 = jnp.concatenate(
+            tuple(jnp.ravel(jnp.asarray(leaf)) for leaf in leaves0)
+        )
+
+        def _split(flat_delta):
+            leaves = []
+            offset = 0
+            for size, shape in zip(sizes, shapes, strict=True):
+                leaves.append(jnp.reshape(flat_delta[offset : offset + size], shape))
+                offset += size
+            return treedef.unflatten(leaves)
+
+        def _accumulate(carry, radius_index):
+            def _local_fluxes(flat_delta):
+                model = dataclasses.replace(
+                    self,
+                    geometry=_add_float_delta_tree(geometry, _split(flat_delta)),
+                )
+                return model.build_local_direct_flux_evaluator(state)(
+                    radius_index, state.Er[radius_index]
+                )
+
+            _, pullback = jax.vjp(_local_fluxes, flat_delta0)
+            local_bar = {
+                "Gamma": jax.lax.dynamic_index_in_dim(
+                    gamma_bar, radius_index, axis=1, keepdims=False
+                ),
+                "Q": jax.lax.dynamic_index_in_dim(
+                    q_bar, radius_index, axis=1, keepdims=False
+                ),
+                "Upar": jax.lax.dynamic_index_in_dim(
+                    upar_bar, radius_index, axis=1, keepdims=False
+                ),
+            }
+            (flat_bar,) = pullback(local_bar)
+            return carry + flat_bar, None
+
+        flat_bar, _ = jax.lax.scan(
+            _accumulate, jnp.zeros_like(flat_delta0), radius_indices
+        )
+        return _split(flat_bar)
+
     def pullback_local_particle_flux_support_payload(self, state, flux_bar, support):
         """Compact table transpose of the local direct-centre root flux.
 
@@ -3753,15 +3819,14 @@ class NTXDatabaseTransportModel(TransportFluxModelBase):
             )
         )
 
-    def build_local_particle_flux_evaluator(self, state):
-        """Return a true single-radius database particle-flux primitive.
+    def build_local_direct_flux_evaluator(self, state):
+        """Return the direct database flux triplet at one centre radius.
 
-        Ambipolar root scans call this once for each trial ``Er`` at one
-        radius.  Calling the full centre-flux evaluator here used to rebuild
-        all radial ``Lij`` blocks for every scalar trial and then discard all
-        but one column.  This mirrors the exact-Lij local-root primitive: the
-        profile gradients are shared, while interpolation and Lij assembly are
-        performed only for the requested radius.
+        This is the compact primal shared by selected-root and direct-RHS
+        geometry transposes.  It is the local restriction of the direct
+        centre database flux evaluation: gradients are shared over the state,
+        while interpolation and Lij assembly are only performed at the
+        requested radius.
         """
         species = self.species
         energy_grid = self.energy_grid
@@ -3856,11 +3921,27 @@ class NTXDatabaseTransportModel(TransportFluxModelBase):
             a3 = get_Thermodynamical_Forces_A3(
                 jnp.reshape(er_scalar, (1,))
             )[0]
-            return -(DENSITY_STATE_TO_PHYSICAL * density_local) * (
-                lij[:, 0, 0] * a1 + lij[:, 0, 1] * a2 + lij[:, 0, 2] * a3
-            )
+            density_phys = DENSITY_STATE_TO_PHYSICAL * density_local
+            temperature_phys = TEMPERATURE_STATE_TO_PHYSICAL * temperature_local
+            return {
+                "Gamma": -density_phys * (
+                    lij[:, 0, 0] * a1 + lij[:, 0, 1] * a2 + lij[:, 0, 2] * a3
+                ),
+                "Q": -temperature_phys * density_phys * (
+                    lij[:, 1, 0] * a1 + lij[:, 1, 1] * a2 + lij[:, 1, 2] * a3
+                ),
+                "Upar": -density_phys * (
+                    lij[:, 2, 0] * a1 + lij[:, 2, 1] * a2 + lij[:, 2, 2] * a3
+                ),
+            }
 
         return evaluator
+
+    def build_local_particle_flux_evaluator(self, state):
+        """Return the particle component of the direct local flux primitive."""
+
+        local_fluxes = self.build_local_direct_flux_evaluator(state)
+        return lambda radius_index, er_value: local_fluxes(radius_index, er_value)["Gamma"]
 
     def evaluate_face_fluxes(self, state, face_state, **kwargs):
         evaluated = kwargs.get("evaluated_state")
@@ -5101,6 +5182,13 @@ class NTXRuntimeScanTransportModel(TransportFluxModelBase):
     def pullback_direct_rhs_state(self, state, flux_bar):
         """Delegate the direct database state transpose without rebuilding."""
         return self._database_model().pullback_direct_rhs_state(state, flux_bar)
+
+    def pullback_direct_rhs_geometry_by_radius(self, state, flux_bar, geometry):
+        """Delegate the compact fixed-database direct-flux geometry transpose."""
+
+        return self._database_model().pullback_direct_rhs_geometry_by_radius(
+            state, flux_bar, geometry
+        )
 
     def pullback_local_particle_flux_support_payload(self, state, flux_bar, support):
         """Delegate the selected-root constrained local-flux transpose."""

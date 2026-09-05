@@ -536,6 +536,8 @@ def test_database_local_bootstrap_state_pullback_matches_full_upar_jvp(
         state.density,
     )
     local_gamma = model.build_local_particle_flux_evaluator(state)
+    local_fluxes = model.build_local_direct_flux_evaluator(state)
+    direct_fluxes = model(state)
     for radius_index in range(state.Er.shape[0]):
         assert jnp.allclose(
             local_gamma(radius_index, state.Er[radius_index]),
@@ -543,6 +545,13 @@ def test_database_local_bootstrap_state_pullback_matches_full_upar_jvp(
             rtol=2.0e-10,
             atol=2.0e-10,
         )
+        for name in ("Gamma", "Q", "Upar"):
+            assert jnp.allclose(
+                local_fluxes(radius_index, state.Er[radius_index])[name],
+                direct_fluxes[name][:, radius_index],
+                rtol=2.0e-10,
+                atol=2.0e-10,
+            )
     upar_tangent = jax.jvp(
         model.evaluate_momentum_corrected_upar_only,
         (state,),
@@ -597,6 +606,41 @@ def test_database_local_bootstrap_state_pullback_matches_full_upar_jvp(
     assert jnp.allclose(
         geometry_lhs,
         jnp.vdot(upar_bar, geometry_upar_tangent),
+        rtol=2.0e-10,
+        atol=2.0e-10,
+    )
+    direct_flux_bar = {
+        "Gamma": jnp.asarray([[0.13, -0.21], [-0.08, 0.17], [0.05, -0.09], [0.03, 0.06]]),
+        "Q": jnp.asarray([[-0.11, 0.04], [0.07, -0.16], [0.09, 0.02], [-0.05, 0.12]]),
+        "Upar": jnp.asarray([[0.06, 0.14], [-0.19, 0.08], [0.04, -0.07], [0.11, -0.03]]),
+    }
+    direct_flux_geometry_tangent = jax.jvp(
+        lambda geometry_value: dataclasses.replace(model, geometry=geometry_value)(state),
+        (geometry,),
+        (geometry_direction,),
+    )[1]
+    direct_flux_geometry_bar = model.pullback_direct_rhs_geometry_by_radius(
+        state, direct_flux_bar, geometry
+    )
+    direct_flux_geometry_lhs = sum(
+        jnp.vdot(jnp.asarray(bar), jnp.asarray(direction))
+        for bar, direction in zip(
+            jax.tree_util.tree_leaves(direct_flux_geometry_bar),
+            jax.tree_util.tree_leaves(geometry_direction),
+            strict=True,
+        )
+        if (
+            jnp.issubdtype(jnp.asarray(bar).dtype, jnp.inexact)
+            and jnp.issubdtype(jnp.asarray(direction).dtype, jnp.inexact)
+        )
+    )
+    direct_flux_tangent_contraction = sum(
+        jnp.vdot(direct_flux_bar[name], direct_flux_geometry_tangent[name])
+        for name in ("Gamma", "Q", "Upar")
+    )
+    assert jnp.allclose(
+        direct_flux_geometry_lhs,
+        direct_flux_tangent_contraction,
         rtol=2.0e-10,
         atol=2.0e-10,
     )
