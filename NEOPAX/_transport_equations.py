@@ -3279,12 +3279,15 @@ class ComposedEquationSystem:
             if er_eq is not None and getattr(state_reference, "Er_edge", None) is not None
             else None
         )
-        return TransportState(
-            density=density_rhs,
-            pressure=pressure_rhs,
-            Er=Er_rhs,
-            Er_edge=Er_edge_rhs,
-        )
+        if Er_edge_rhs is not None:
+            return dataclasses.replace(
+                state_reference,
+                density=density_rhs,
+                pressure=pressure_rhs,
+                Er=Er_rhs,
+                Er_edge=Er_edge_rhs,
+            )
+        return TransportState(density=density_rhs, pressure=pressure_rhs, Er=Er_rhs)
 
     def evaluate_with_shared_fluxes(self, t, state, runtime, shared_fluxes):
         del t, runtime
@@ -4313,12 +4316,15 @@ class ComposedEquationSystem:
             if er_eq is not None and getattr(state, "Er_edge", None) is not None
             else None
         )
-        return TransportState(
-            density=density_rhs,
-            pressure=pressure_rhs,
-            Er=Er_rhs,
-            Er_edge=Er_edge_rhs,
-        )
+        if Er_edge_rhs is not None:
+            return dataclasses.replace(
+                state,
+                density=density_rhs,
+                pressure=pressure_rhs,
+                Er=Er_rhs,
+                Er_edge=Er_edge_rhs,
+            )
+        return TransportState(density=density_rhs, pressure=pressure_rhs, Er=Er_rhs)
 
     def __call__(self, t, state, runtime):
         """
