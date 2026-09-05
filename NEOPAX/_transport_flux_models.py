@@ -16374,17 +16374,14 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         """Evaluate the cached full-state quadratic model on centres or faces."""
         if axis not in {"center", "face"}:
             raise ValueError("axis must be 'center' or 'face'.")
-        delta = dataclasses.replace(
-            state,
+        delta_kwargs = dict(
             density=state.density - response.reference_state.density,
             pressure=state.pressure - response.reference_state.pressure,
             Er=state.Er - response.reference_state.Er,
-            Er_edge=(
-                state.Er_edge - response.reference_state.Er_edge
-                if getattr(state, "Er_edge", None) is not None
-                else None
-            ),
         )
+        if getattr(state, "Er_edge", None) is not None:
+            delta_kwargs["Er_edge"] = state.Er_edge - response.reference_state.Er_edge
+        delta = dataclasses.replace(state, **delta_kwargs)
         evaluated = _build_evaluated_transport_state_directional(
             response.reference_state,
             delta,
@@ -16481,28 +16478,21 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         equation-level mixed tangent consumes this primitive when constructing
         the opt-in stage Newton operator.
         """
-        plus_state = dataclasses.replace(
-            state,
+        plus_kwargs = dict(
             density=state.density + state_direction.density,
             pressure=state.pressure + state_direction.pressure,
             Er=state.Er + state_direction.Er,
-            Er_edge=(
-                state.Er_edge + state_direction.Er_edge
-                if getattr(state, "Er_edge", None) is not None
-                else None
-            ),
         )
-        minus_state = dataclasses.replace(
-            state,
+        minus_kwargs = dict(
             density=state.density - state_direction.density,
             pressure=state.pressure - state_direction.pressure,
             Er=state.Er - state_direction.Er,
-            Er_edge=(
-                state.Er_edge - state_direction.Er_edge
-                if getattr(state, "Er_edge", None) is not None
-                else None
-            ),
         )
+        if getattr(state, "Er_edge", None) is not None:
+            plus_kwargs["Er_edge"] = state.Er_edge + state_direction.Er_edge
+            minus_kwargs["Er_edge"] = state.Er_edge - state_direction.Er_edge
+        plus_state = dataclasses.replace(state, **plus_kwargs)
+        minus_state = dataclasses.replace(state, **minus_kwargs)
         def _polarized(evaluate, response):
             if not isinstance(response, NTXFullStateQuadraticPreparedCoefficientResponse):
                 raise NotImplementedError(

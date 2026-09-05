@@ -280,7 +280,10 @@ def _unpack_transport_state_arrays(
             full_density = jnp.zeros(full_shape, dtype=density.dtype)
             full_density = full_density.at[..., :eidx, :].set(density[..., :eidx, :])
             full_density = full_density.at[..., eidx + 1 :, :].set(density[..., eidx:, :])
-            rebuilt = dataclasses.replace(template_state, density=full_density, pressure=pressure, Er=er, Er_edge=er_edge)
+            rebuilt_kwargs = dict(density=full_density, pressure=pressure, Er=er)
+            if er_edge is not None:
+                rebuilt_kwargs["Er_edge"] = er_edge
+            rebuilt = dataclasses.replace(template_state, **rebuilt_kwargs)
             return _apply_quasi_neutrality_output(
                 rebuilt,
                 species,
@@ -290,7 +293,10 @@ def _unpack_transport_state_arrays(
                 density_floor=density_floor,
                 temperature_floor=temperature_floor,
             )
-        rebuilt = dataclasses.replace(template_state, density=density, pressure=pressure, Er=er, Er_edge=er_edge)
+        rebuilt_kwargs = dict(density=density, pressure=pressure, Er=er)
+        if er_edge is not None:
+            rebuilt_kwargs["Er_edge"] = er_edge
+        rebuilt = dataclasses.replace(template_state, **rebuilt_kwargs)
         return _project_fixed_temperature_output(
             rebuilt,
             template_state,
@@ -325,7 +331,10 @@ def _unpack_transport_state_cotangent_arrays(
             full_density_bar = full_density_bar.at[..., :eidx, :].set(density_bar[..., :eidx, :])
             full_density_bar = full_density_bar.at[..., eidx + 1 :, :].set(density_bar[..., eidx:, :])
             density_bar = full_density_bar
-        return dataclasses.replace(template_state, density=density_bar, pressure=pressure_bar, Er=er_bar, Er_edge=er_edge_bar)
+        rebuilt_kwargs = dict(density=density_bar, pressure=pressure_bar, Er=er_bar)
+        if er_edge_bar is not None:
+            rebuilt_kwargs["Er_edge"] = er_edge_bar
+        return dataclasses.replace(template_state, **rebuilt_kwargs)
     return state_like
 
 
@@ -9996,16 +10005,6 @@ def _radau_stage_residual(
 
 def _radau_debug_array_stats(label, value):
     value = jnp.asarray(value)
-    # Some equation selections intentionally leave a packed block empty
-    # (for example frozen density).  Diagnostics must report that fact rather
-    # than masking the original nonfinite-stage failure with argmax(empty).
-    if value.size == 0:
-        jax.debug.print(
-            "[radau-nonfinite-detail] {label}: empty shape={shape}",
-            label=label,
-            shape=value.shape,
-        )
-        return
     finite = jnp.all(jnp.isfinite(value))
     bad = jnp.ravel(jnp.logical_not(jnp.isfinite(value)))
     first_bad = jnp.argmax(bad)

@@ -35,7 +35,7 @@ from ._source_models import (
     sum_source_components,
 )
 from ._species import Species
-from ._state import FloatingEdgeTransportState, TransportState, safe_density, safe_temperature
+from ._state import TransportState, safe_density, safe_temperature
 from ._transport_flux_models import (
     ZeroTransportModel,
     build_transport_flux_model,
@@ -396,18 +396,15 @@ def _build_state(config: dict, geometry, species: Species):
             1.5 * er_profile[-1] - 0.5 * er_profile[-2]
             if er_profile.shape[0] >= 2 else er_profile[-1]
         )
-    state_type = FloatingEdgeTransportState if er_edge is not None else TransportState
-    state_kwargs = dict(
+    return TransportState(
         density=density_state,
         # Keep configured temperatures well-defined even when a species starts at
         # zero concentration, so downstream Er initialization does not collapse
         # that species to T=0 through the pressure/density representation.
         pressure=temperature_state * safe_density(density_state, density_floor),
         Er=profile_set.Er,
+        Er_edge=er_edge,
     )
-    if er_edge is not None:
-        state_kwargs["Er_edge"] = er_edge
-    return state_type(**state_kwargs)
 
 
 def _apply_configured_er_dirichlet_boundaries(config: dict, state: TransportState | None):
