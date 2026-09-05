@@ -198,7 +198,6 @@ def test_floating_er_edge_node_keeps_last_cell_diffusion_and_evolves_face_node()
         density=jnp.ones((1, 2)),
         pressure=jnp.ones((1, 2)),
         Er=jnp.asarray([1.0, 2.0]),
-        Er_edge=jnp.asarray(5.0),
     )
     equation = ElectricFieldEquation(
         dr_cells=jnp.ones(2),
@@ -223,10 +222,17 @@ def test_floating_er_edge_node_keeps_last_cell_diffusion_and_evolves_face_node()
         "Gamma": jnp.zeros((1, 2)),
         "Gamma_faces": jnp.asarray([[0.0, 0.0, 8.0]]),
     }
-    rhs = equation(state, fluxes=fluxes)
+    rhs = equation(state, fluxes=fluxes, er_edge_override=jnp.asarray(5.0))
 
+    # The node is deliberately not a public TransportState field.  It is a
+    # Radau-local scalar so ordinary forward/reverse state pytrees remain the
+    # same three leaves.
+    assert not hasattr(state, "Er_edge")
     assert jnp.allclose(rhs, jnp.asarray([0.0, -3.0]))
-    assert jnp.allclose(equation.edge_rhs(state, fluxes=fluxes), -95780.0 * 8.0e-20)
+    assert jnp.allclose(
+        equation.edge_rhs(state, fluxes=fluxes, er_edge_override=jnp.asarray(5.0)),
+        -95780.0 * 8.0e-20,
+    )
 
 
 def test_face_completed_work_term_cell_centres_completed_face_product():

@@ -1090,7 +1090,7 @@ class ElectricFieldEquation(EquationBase):
         )
         return charge_flux_edge * elementary_charge * 1.0e-3 / plasma_permitivity_edge
 
-    def debug_components(self, state, fluxes=None):
+    def debug_components(self, state, fluxes=None, *, er_edge_override=None):
         if fluxes is None:
             fluxes = self.flux_model(state)
         Er = state.Er
@@ -1115,7 +1115,7 @@ class ElectricFieldEquation(EquationBase):
         ambi_term_edge = self._outer_face_ambi_term(
             state, Gamma, plasma_permitivity, Gamma_faces
         )
-        er_diffusive_flux, er_diffusion = self._er_diffusion(Er, getattr(state, "Er_edge", None))
+        er_diffusive_flux, er_diffusion = self._er_diffusion(Er, er_edge_override)
         ambipolar_rhs = -self.Er_relax * ambi_term
         diffusion_rhs = self.Er_relax * self.DEr * er_diffusion
         return {
@@ -1130,7 +1130,7 @@ class ElectricFieldEquation(EquationBase):
             "unconstrained_rhs": diffusion_rhs + ambipolar_rhs,
         }
 
-    def __call__(self, state, fluxes=None):
+    def __call__(self, state, fluxes=None, *, er_edge_override=None):
         if fluxes is None:
             fluxes = self.flux_model(state)
         Er = state.Er
@@ -1150,7 +1150,7 @@ class ElectricFieldEquation(EquationBase):
         _, ambi_term = self._charge_flux_and_ambi_term(
             state, Gamma, plasma_permitivity, Gamma_faces
         )
-        _, Er_diffusion = self._er_diffusion(Er, getattr(state, "Er_edge", None))
+        _, Er_diffusion = self._er_diffusion(Er, er_edge_override)
         SourceEr = self.Er_relax * (self.DEr * Er_diffusion - ambi_term)
         if self.boundary_mode == "floating_ambipolar_edge":
             SourceEr = SourceEr.at[-1].set(
@@ -1161,7 +1161,7 @@ class ElectricFieldEquation(EquationBase):
         SourceEr = self.enforce_dirichlet_boundary_rhs(state, SourceEr)
         return SourceEr
 
-    def edge_rhs(self, state, fluxes=None):
+    def edge_rhs(self, state, fluxes=None, *, er_edge_override=None):
         """Ambipolar relaxation for the separate physical outer-face node."""
         if self.boundary_mode != "floating_ambipolar_edge_node":
             return None
@@ -3232,7 +3232,9 @@ class ComposedEquationSystem:
             (working_direction, shared_flux_direction),
         )[1]
 
-    def _evaluate_with_shared_fluxes_from_working_state(self, working_state, eidx, state_reference, shared_fluxes):
+    def _evaluate_with_shared_fluxes_from_working_state(
+        self, working_state, eidx, state_reference, shared_fluxes, *, er_edge_override=None
+    ):
         from ._state import TransportState
         density_eq, temperature_eq, er_eq = self._resolve_equations()
 
@@ -3247,7 +3249,7 @@ class ComposedEquationSystem:
             else jnp.zeros_like(state_reference.pressure)
         )
         Er_rhs = (
-            er_eq(working_state, fluxes=shared_fluxes)
+            er_eq(working_state, fluxes=shared_fluxes, er_edge_override=er_edge_override)
             if er_eq is not None
             else jnp.zeros_like(state_reference.Er)
         )
@@ -3274,19 +3276,6 @@ class ComposedEquationSystem:
             Er_rhs,
         )
 
-        Er_edge_rhs = (
-            er_eq.edge_rhs(working_state, fluxes=shared_fluxes)
-            if er_eq is not None and getattr(state_reference, "Er_edge", None) is not None
-            else None
-        )
-        if Er_edge_rhs is not None:
-            return dataclasses.replace(
-                state_reference,
-                density=density_rhs,
-                pressure=pressure_rhs,
-                Er=Er_rhs,
-                Er_edge=Er_edge_rhs,
-            )
         return TransportState(density=density_rhs, pressure=pressure_rhs, Er=Er_rhs)
 
     def evaluate_with_shared_fluxes(self, t, state, runtime, shared_fluxes):
@@ -3298,6 +3287,42 @@ class ComposedEquationSystem:
             state,
             shared_fluxes,
         )
+
+    def build_node_boundary_lagged_response(self, state, er_edge):
+        """Build the ordinary cached response with one explicit outer-face anchor.
+
+        The returned transport response keeps its established tree structure;
+        the owning Radau adapter stores ``er_edge`` separately.
+        """
+        working_state, _ = self._prepare_working_state(state)
+        if self.shared_flux_model is None:
+            raise ValueError("floating_ambipolar_edge_node requires a shared flux model.")
+        return self.shared_flux_model.build_lagged_response(
+            working_state,
+            **self._shared_flux_call_kwargs({"er_edge_override": er_edge}),
+        )
+
+    def evaluate_node_boundary_with_lagged_response(
+        self, state, er_edge, transport_response, *, er_edge_anchor
+    ):
+        """Return core RHS and outer-node RHS for the Radau-only node adapter."""
+        working_state, eidx = self._prepare_working_state(state)
+        _density_eq, _temperature_eq, er_eq = self._resolve_equations()
+        if er_eq is None or er_eq.boundary_mode != "floating_ambipolar_edge_node":
+            raise ValueError("Node boundary evaluation requested without floating_ambipolar_edge_node.")
+        shared_fluxes = self.shared_flux_model.evaluate_with_lagged_response(
+            working_state,
+            transport_response,
+            **self._shared_flux_call_kwargs({
+                "er_edge_override": er_edge,
+                "er_edge_anchor": er_edge_anchor,
+            }),
+        )
+        core_rhs = self._evaluate_with_shared_fluxes_from_working_state(
+            working_state, eidx, state, shared_fluxes, er_edge_override=er_edge
+        )
+        edge_rhs = er_eq.edge_rhs(working_state, fluxes=shared_fluxes, er_edge_override=er_edge)
+        return core_rhs, edge_rhs
 
     def pullback_shared_fluxes(self, state, shared_fluxes, rhs_bar):
         """Reverse-only pullback for the shared-flux -> RHS assembly.
@@ -4311,19 +4336,6 @@ class ComposedEquationSystem:
         if er_eq is not None and hasattr(er_eq, "enforce_dirichlet_boundary_rhs"):
             Er_rhs = er_eq.enforce_dirichlet_boundary_rhs(working_state, Er_rhs)
 
-        Er_edge_rhs = (
-            er_eq.edge_rhs(working_state, fluxes=shared_fluxes)
-            if er_eq is not None and getattr(state, "Er_edge", None) is not None
-            else None
-        )
-        if Er_edge_rhs is not None:
-            return dataclasses.replace(
-                state,
-                density=density_rhs,
-                pressure=pressure_rhs,
-                Er=Er_rhs,
-                Er_edge=Er_edge_rhs,
-            )
         return TransportState(density=density_rhs, pressure=pressure_rhs, Er=Er_rhs)
 
     def __call__(self, t, state, runtime):

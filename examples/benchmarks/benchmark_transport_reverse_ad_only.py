@@ -6533,15 +6533,6 @@ def main() -> None:
         raise SystemExit("[autodiff-gate] --reverse-stage-adjoint-iter-tol must be positive.")
     if int(args.reverse_stage_adjoint_woodbury_rank) <= 0:
         raise SystemExit("[autodiff-gate] --reverse-stage-adjoint-woodbury-rank must be positive.")
-    if (
-        str(args.reverse_rhs_transpose_mode) == "explicit_ntx_interpolated"
-        and str(args.reverse_stage_adjoint_solve_mode) == "gmres"
-    ):
-        raise SystemExit(
-            "[autodiff-gate] --reverse-rhs-transpose-mode explicit_ntx_interpolated is not ready for "
-            "JAX scipy GMRES. Use bicgstab for this experimental mode while the NTX RHS-state "
-            "transpose is being specialized."
-        )
     reverse_segment_length = None
     if args.reverse_segment_length is not None:
         reverse_segment_length = int(args.reverse_segment_length)

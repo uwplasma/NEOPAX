@@ -79,7 +79,6 @@ class TransportState:
     density: Float[Array, "..."]
     pressure: Float[Array, "..."]
     Er: Float[Array, "..."]
-    Er_edge: Float[Array, "..."] | None = None
 
     @property
     def temperature(self):

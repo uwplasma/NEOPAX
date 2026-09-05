@@ -387,15 +387,6 @@ def _build_state(config: dict, geometry, species: Species):
         config.get("solver", {}).get("temperature_floor"),
     )
     temperature_state = safe_temperature(temperature_state, temperature_floor)
-    solver_cfg = config.get("transport_solver", config.get("solver", config.get("transport", {})))
-    edge_mode = _resolve_er_right_boundary_mode(config, solver_cfg)
-    er_edge = None
-    if edge_mode == "floating_ambipolar_edge_node":
-        er_profile = jnp.asarray(profile_set.Er)
-        er_edge = (
-            1.5 * er_profile[-1] - 0.5 * er_profile[-2]
-            if er_profile.shape[0] >= 2 else er_profile[-1]
-        )
     return TransportState(
         density=density_state,
         # Keep configured temperatures well-defined even when a species starts at
@@ -403,7 +394,6 @@ def _build_state(config: dict, geometry, species: Species):
         # that species to T=0 through the pressure/density representation.
         pressure=temperature_state * safe_density(density_state, density_floor),
         Er=profile_set.Er,
-        Er_edge=er_edge,
     )
 
 

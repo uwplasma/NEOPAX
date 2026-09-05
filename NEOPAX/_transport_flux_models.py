@@ -1869,8 +1869,12 @@ class CombinedTransportFluxModel(TransportFluxModelBase):
         return out
 
     def build_lagged_response(self, state, **kwargs):
+        er_edge_override = kwargs.pop("er_edge_override", None)
+        neo_kwargs = dict(kwargs)
+        if er_edge_override is not None:
+            neo_kwargs["er_edge_override"] = er_edge_override
         return CombinedTransportLaggedResponse(
-            neoclassical_response=self.neoclassical_model.build_lagged_response(state, **kwargs),
+            neoclassical_response=self.neoclassical_model.build_lagged_response(state, **neo_kwargs),
             turbulent_response=self.turbulent_model.build_lagged_response(state, **kwargs),
             classical_response=self.classical_model.build_lagged_response(state, **kwargs),
         )
@@ -2429,13 +2433,22 @@ class CombinedTransportFluxModel(TransportFluxModelBase):
         )
 
     def evaluate_with_lagged_response(self, state, lagged_response, **kwargs):
+        # The outer-node scalar belongs to the realtime NTX face evaluator.
+        # Do not pass it to turbulence/classical models, whose public state
+        # contract intentionally remains the ordinary centre state.
+        er_edge_override = kwargs.pop("er_edge_override", None)
+        er_edge_anchor = kwargs.pop("er_edge_anchor", None)
+        neo_kwargs = dict(kwargs)
+        if er_edge_override is not None:
+            neo_kwargs["er_edge_override"] = er_edge_override
+            neo_kwargs["er_edge_anchor"] = er_edge_anchor
         neo = (
             self.neoclassical_model(state)
             if lagged_response.neoclassical_response is None
             else self.neoclassical_model.evaluate_with_lagged_response(
                 state,
                 lagged_response.neoclassical_response,
-                **kwargs,
+                **neo_kwargs,
             )
         )
         turb = (
@@ -12708,6 +12721,7 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         )
 
     def build_lagged_response(self, state, **kwargs):
+        er_edge_override = kwargs.pop("er_edge_override", None)
         del kwargs
         if lagged_timing_enabled():
             jax.debug.callback(lambda: lagged_timing_start("ntx.build_lagged_response"), ordered=True)
@@ -12722,6 +12736,7 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             bc_temperature=self.bc_temperature,
             density_floor=self.density_floor,
             temperature_floor=self.temperature_floor,
+            er_edge_override=er_edge_override,
         )
         face_density = safe_density(face_state.density, self.density_floor)
         face_temperature = face_state.temperature
@@ -16372,7 +16387,9 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             **kwargs,
         )
 
-    def _evaluate_full_state_quadratic_axis_response(self, state, response, *, axis):
+    def _evaluate_full_state_quadratic_axis_response(
+        self, state, response, *, axis, er_edge_override=None, er_edge_anchor=None
+    ):
         """Evaluate the cached full-state quadratic model on centres or faces."""
         if axis not in {"center", "face"}:
             raise ValueError("axis must be 'center' or 'face'.")
@@ -16381,9 +16398,12 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             pressure=state.pressure - response.reference_state.pressure,
             Er=state.Er - response.reference_state.Er,
         )
-        if getattr(state, "Er_edge", None) is not None:
-            delta_kwargs["Er_edge"] = state.Er_edge - response.reference_state.Er_edge
         delta = dataclasses.replace(state, **delta_kwargs)
+        # This scalar belongs only to the Radau boundary adapter, never to
+        # TransportState or the universal lagged-response payload.
+        edge_direction = (
+            None if er_edge_override is None else er_edge_override - er_edge_anchor
+        )
         evaluated = _build_evaluated_transport_state_directional(
             response.reference_state,
             delta,
@@ -16392,6 +16412,8 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             bc_temperature=self.bc_temperature,
             density_floor=self.density_floor,
             temperature_floor=self.temperature_floor,
+            er_edge_override=er_edge_override,
+            er_edge_direction=edge_direction,
         )
         axis_state = getattr(evaluated, axis)
         density_gradient = getattr(evaluated, f"density_grad_{axis}")
@@ -16449,9 +16471,12 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             f"Upar{suffix}": _jet_evaluate(upar),
         }
 
-    def _evaluate_full_state_quadratic_face_response(self, state, response):
+    def _evaluate_full_state_quadratic_face_response(
+        self, state, response, *, er_edge_override=None, er_edge_anchor=None
+    ):
         return self._evaluate_full_state_quadratic_axis_response(
-            state, response, axis="face"
+            state, response, axis="face", er_edge_override=er_edge_override,
+            er_edge_anchor=er_edge_anchor,
         )
 
     def _evaluate_full_state_quadratic_center_response(self, state, response):
@@ -16490,9 +16515,6 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             pressure=state.pressure - state_direction.pressure,
             Er=state.Er - state_direction.Er,
         )
-        if getattr(state, "Er_edge", None) is not None:
-            plus_kwargs["Er_edge"] = state.Er_edge + state_direction.Er_edge
-            minus_kwargs["Er_edge"] = state.Er_edge - state_direction.Er_edge
         plus_state = dataclasses.replace(state, **plus_kwargs)
         minus_state = dataclasses.replace(state, **minus_kwargs)
         def _polarized(evaluate, response):
@@ -16555,6 +16577,8 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         )
 
     def evaluate_with_lagged_response(self, state, lagged_response, **kwargs):
+        er_edge_override = kwargs.pop("er_edge_override", None)
+        er_edge_anchor = kwargs.pop("er_edge_anchor", None)
         del kwargs
         if isinstance(
             lagged_response.face_response,
@@ -16575,11 +16599,17 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                     state, lagged_response.center_response
                 )
                 face_fluxes = self._evaluate_full_state_quadratic_face_response(
-                    state, lagged_response.face_response
+                    state,
+                    lagged_response.face_response,
+                    er_edge_override=er_edge_override,
+                    er_edge_anchor=er_edge_anchor,
                 )
                 return {**centre_fluxes, **face_fluxes}
             return self._evaluate_full_state_quadratic_face_response(
-                state, lagged_response.face_response
+                state,
+                lagged_response.face_response,
+                er_edge_override=er_edge_override,
+                er_edge_anchor=er_edge_anchor,
             )
         evaluated = build_evaluated_transport_state(
             state,

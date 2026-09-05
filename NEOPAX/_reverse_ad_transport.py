@@ -6207,23 +6207,8 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
                 geometry_bars = jax.block_until_ready(geometry_bars)
             root_geometry_pullback_elapsed = time.perf_counter() - root_geometry_pullback_start
 
-            def _batched_zero(tree):
-                return jax.tree_util.tree_map(
-                    lambda leaf: jnp.zeros(
-                        (residual_bars.shape[0],) + jnp.asarray(leaf).shape,
-                        dtype=(
-                            jnp.asarray(leaf).dtype
-                            if jnp.issubdtype(jnp.asarray(leaf).dtype, jnp.inexact)
-                            else jnp.float64
-                        ),
-                    ),
-                    tree,
-                )
-
             batched_support_bars = {
                 "geometry": geometry_bars,
-                "channels": _batched_zero(support_payload["channels"]),
-                "surfaces": _batched_zero(support_payload["surfaces"]),
                 "database": database_bars,
             }
             initial_er_root_support_bars = tuple(
@@ -7545,11 +7530,12 @@ def internal_realtime_geometry_transport_reverse_table_result_builder(
                 raise ValueError(
                     "ntx_scan_runtime reverse requires the combined realtime "
                     "geometry payload."
-                )
-            ntx_support_payload = None
-            support_payload = realtime_geometry_reverse_support_payload_for_runtime(
-                recorded_scan_runtime
             )
+            ntx_support_payload = None
+            support_payload = {
+                "geometry": active_runtime.geometry,
+                "database": recorded_scan_owner.runtime_scan.database,
+            }
         else:
             ntx_support_payload = find_ntx_support_payload(active_runtime)
             support_payload = (

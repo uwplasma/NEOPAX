@@ -248,8 +248,6 @@ def _pack_transport_state_arrays(state: Any, species: Any = None) -> Any:
         eidx = _electron_density_index(species)
         if eidx is not None:
             density = jnp.concatenate([density[:eidx], density[eidx + 1 :]], axis=0)
-        if getattr(state, "Er_edge", None) is not None:
-            return (density, state.pressure, state.Er, state.Er_edge)
         return (density, state.pressure, state.Er)
     return state
 
@@ -270,20 +268,16 @@ def _unpack_transport_state_arrays(
         and hasattr(template_state, "pressure")
         and hasattr(template_state, "Er")
         and isinstance(state_like, tuple)
-        and len(state_like) in {3, 4}
+        and len(state_like) == 3
     ):
-        density, pressure, er = state_like[:3]
-        er_edge = state_like[3] if len(state_like) == 4 else None
+        density, pressure, er = state_like
         eidx = _electron_density_index(species)
         if eidx is not None and density.shape[-2] == template_state.density.shape[0] - 1:
             full_shape = pressure.shape[:-2] + (template_state.density.shape[0], pressure.shape[-1])
             full_density = jnp.zeros(full_shape, dtype=density.dtype)
             full_density = full_density.at[..., :eidx, :].set(density[..., :eidx, :])
             full_density = full_density.at[..., eidx + 1 :, :].set(density[..., eidx:, :])
-            rebuilt_kwargs = dict(density=full_density, pressure=pressure, Er=er)
-            if er_edge is not None:
-                rebuilt_kwargs["Er_edge"] = er_edge
-            rebuilt = dataclasses.replace(template_state, **rebuilt_kwargs)
+            rebuilt = dataclasses.replace(template_state, density=full_density, pressure=pressure, Er=er)
             return _apply_quasi_neutrality_output(
                 rebuilt,
                 species,
@@ -293,10 +287,7 @@ def _unpack_transport_state_arrays(
                 density_floor=density_floor,
                 temperature_floor=temperature_floor,
             )
-        rebuilt_kwargs = dict(density=density, pressure=pressure, Er=er)
-        if er_edge is not None:
-            rebuilt_kwargs["Er_edge"] = er_edge
-        rebuilt = dataclasses.replace(template_state, **rebuilt_kwargs)
+        rebuilt = dataclasses.replace(template_state, density=density, pressure=pressure, Er=er)
         return _project_fixed_temperature_output(
             rebuilt,
             template_state,
@@ -320,10 +311,9 @@ def _unpack_transport_state_cotangent_arrays(
         and hasattr(template_state, "pressure")
         and hasattr(template_state, "Er")
         and isinstance(state_like, tuple)
-        and len(state_like) in {3, 4}
+        and len(state_like) == 3
     ):
-        density_bar, pressure_bar, er_bar = state_like[:3]
-        er_edge_bar = state_like[3] if len(state_like) == 4 else None
+        density_bar, pressure_bar, er_bar = state_like
         eidx = _electron_density_index(species)
         if eidx is not None and density_bar.shape[-2] == template_state.density.shape[0] - 1:
             full_shape = pressure_bar.shape[:-2] + (template_state.density.shape[0], pressure_bar.shape[-1])
@@ -331,10 +321,7 @@ def _unpack_transport_state_cotangent_arrays(
             full_density_bar = full_density_bar.at[..., :eidx, :].set(density_bar[..., :eidx, :])
             full_density_bar = full_density_bar.at[..., eidx + 1 :, :].set(density_bar[..., eidx:, :])
             density_bar = full_density_bar
-        rebuilt_kwargs = dict(density=density_bar, pressure=pressure_bar, Er=er_bar)
-        if er_edge_bar is not None:
-            rebuilt_kwargs["Er_edge"] = er_edge_bar
-        return dataclasses.replace(template_state, **rebuilt_kwargs)
+        return dataclasses.replace(template_state, density=density_bar, pressure=pressure_bar, Er=er_bar)
     return state_like
 
 
@@ -458,11 +445,10 @@ def _project_packed_transport_state_arrays(
     """Project packed solver arrays without rebuilding a full TransportState."""
     from ._state import safe_density, safe_temperature
 
-    if not (isinstance(state_like, tuple) and len(state_like) in {3, 4}):
+    if not (isinstance(state_like, tuple) and len(state_like) == 3):
         return state_like
 
-    density, pressure, er = state_like[:3]
-    er_edge = state_like[3] if len(state_like) == 4 else None
+    density, pressure, er = state_like
     packed_density = safe_density(density, density_floor)
     eidx = _electron_density_index(species)
     if eidx is not None and packed_density.shape[-2] == template_state.density.shape[0] - 1:
@@ -492,8 +478,6 @@ def _project_packed_transport_state_arrays(
     if temperature_floor is not None:
         projected_temperature = safe_temperature(projected_pressure / floored_density, temperature_floor)
         projected_pressure = floored_density * projected_temperature
-    if er_edge is not None:
-        return (packed_density, projected_pressure, er, er_edge)
     return (packed_density, projected_pressure, er)
 
 
@@ -590,6 +574,21 @@ class TransportSolver:
     """
     def solve(self, state, vector_field: Callable, *args, **kwargs) -> Any:
         raise NotImplementedError
+
+
+@jax.tree_util.register_dataclass
+@dataclasses.dataclass(frozen=True, eq=False)
+class _RadauNodeBoundaryLaggedCache:
+    """Node-boundary-only Radau cache.
+
+    This deliberately sits outside both ``TransportState`` and the universal
+    transport lagged-response payload.  It is constructed only for the
+    NTSS-like floating outer-node mode and carries the separate outer-face
+    Taylor anchor required when a response is reused.
+    """
+
+    transport_response: Any
+    er_edge_anchor: jax.Array
 
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True, eq=False)
@@ -4691,6 +4690,9 @@ class _RadauAcceptedStepPhysicsContext:
     reverse_stage_adjoint_woodbury_rank: int = 24
     reverse_single_segment_vjp_forward_mode: str = "legacy"
     reverse_lagged_branch_schedule: tuple[bool, ...] | None = None
+    # Optional Radau-private builder which receives the full internal vector.
+    # Ordinary transport/reverse paths leave this None.
+    build_lagged_response_from_flat: Callable[[Any], Any] | None = None
 
 
 @contextlib.contextmanager
@@ -9572,11 +9574,16 @@ def _radau_prepare_lagged_response(
     unpack_flat: Callable[[Any], Any],
     project_flat: Callable[[Any], Any] | None,
     build_lagged_response: Callable[[Any], Any] | None,
+    build_lagged_response_from_flat: Callable[[Any], Any] | None = None,
 ) -> tuple[Any, Any, Any]:
     """Prepare optional lagged-response data for one accepted-step attempt."""
     lagged_response_reused = jnp.asarray(False)
     if kernel_context.use_transport_lagged_response:
         flat_y = carry_in.y
+        if build_lagged_response_from_flat is None:
+            build_lagged_response_from_flat = getattr(
+                unpack_flat, "radau_node_build_lagged_response_from_flat", None
+            )
         lagged_response_reused = jnp.asarray(carry_in.lagged_response_valid)
 
         def _reuse_cached(_):
@@ -9585,7 +9592,10 @@ def _radau_prepare_lagged_response(
         def _rebuild_cached(_):
             if build_lagged_response is None:
                 return None
-            candidate_state = unpack_flat(_project_flat_state_if_needed(flat_y, project_flat))
+            candidate_flat = _project_flat_state_if_needed(flat_y, project_flat)
+            if build_lagged_response_from_flat is not None:
+                return build_lagged_response_from_flat(candidate_flat)
+            candidate_state = unpack_flat(candidate_flat)
             return build_lagged_response(candidate_state)
 
         lagged_response = jax.lax.cond(
@@ -14923,6 +14933,7 @@ def _radau_single_step_primal(
         physics_context.unpack_flat,
         physics_context.project_flat,
         physics_context.build_lagged_response,
+        physics_context.build_lagged_response_from_flat,
     )
 
     def _rhs_eval(t_eval, y_eval):
@@ -21438,6 +21449,93 @@ class RADAUSolver(_RadauSolverConfig):
         build_lagged_response = build_lagged_response_raw
         flat_rhs_with_lagged_response = flat_rhs_with_lagged_response_raw
         flat_rhs_with_lagged_response_tangent = flat_rhs_with_lagged_response_tangent_raw
+        # The NTSS-like outer Er node is a Radau-private augmentation.  In
+        # particular it must never change the public TransportState pytree,
+        # generic lagged payload, or ordinary reverse/forward layout.
+        owner = getattr(vector_field, "__self__", None)
+        _node_er_equation = getattr(owner, "er_equation", None)
+        use_node_boundary = (
+            _node_er_equation is not None
+            and str(getattr(_node_er_equation, "boundary_mode", "")).strip().lower()
+            == "floating_ambipolar_edge_node"
+        )
+        build_lagged_response_from_flat = None
+        if use_node_boundary:
+            if not use_transport_lagged_response:
+                raise ValueError(
+                    "floating_ambipolar_edge_node currently requires "
+                    "radau_rhs_mode='lagged_transport_response'."
+                )
+            if owner is None or not callable(
+                getattr(owner, "build_node_boundary_lagged_response", None)
+            ):
+                raise ValueError(
+                    "floating_ambipolar_edge_node requires the composed transport "
+                    "equation-system boundary adapter."
+                )
+            _core_flat_state0 = flat_state0
+            _core_unpack_flat = unpack_flat
+            _core_pack_state = pack_state
+            _core_project_flat = project_flat
+            _edge0 = (
+                jnp.asarray(1.5, dtype=dtype) * state.Er[-1]
+                - jnp.asarray(0.5, dtype=dtype) * state.Er[-2]
+                if state.Er.shape[0] >= 2 else state.Er[-1]
+            )
+
+            def _node_unpack_flat(flat_y):
+                return _core_unpack_flat(flat_y[:-1])
+
+            def _node_project_flat(flat_y):
+                return jnp.concatenate((_core_project_flat(flat_y[:-1]), flat_y[-1:]))
+
+            def _node_build_from_flat(flat_y):
+                projected = _node_project_flat(flat_y)
+                edge = projected[-1]
+                return _RadauNodeBoundaryLaggedCache(
+                    transport_response=owner.build_node_boundary_lagged_response(
+                        _node_unpack_flat(projected), edge
+                    ),
+                    er_edge_anchor=edge,
+                )
+
+            def _node_lagged_rhs(t_value, flat_y, cache):
+                del t_value
+                projected = _node_project_flat(flat_y)
+                core_rhs, edge_rhs = owner.evaluate_node_boundary_with_lagged_response(
+                    _node_unpack_flat(projected),
+                    projected[-1],
+                    cache.transport_response,
+                    er_edge_anchor=cache.er_edge_anchor,
+                )
+                return jnp.concatenate((_core_pack_state(core_rhs), jnp.reshape(edge_rhs, (1,))))
+
+            setattr(
+                _node_unpack_flat,
+                "radau_node_build_lagged_response_from_flat",
+                _node_build_from_flat,
+            )
+
+            flat_state0 = jnp.concatenate((_core_flat_state0, jnp.reshape(_edge0, (1,))))
+            unpack_flat = _node_unpack_flat
+            project_flat = _node_project_flat
+            state_dim = flat_state0.shape[0]
+            # This is a correctness fallback for diagnostics/rare direct-RHS
+            # paths.  Production lagged stages use the cached branch below;
+            # they do not rebuild here.
+            flat_rhs = lambda t_value, flat_y: _node_lagged_rhs(
+                t_value, flat_y, _node_build_from_flat(flat_y)
+            )
+            flat_rhs_with_lagged_response = _node_lagged_rhs
+            # The coloured stage refresh needs the full analytic node tangent;
+            # until that dedicated custom rule is added, reject that opt-in
+            # mode rather than silently taking a finite difference.
+            if str(getattr(self, "lagged_jacobian_refresh_mode", "none")).strip().lower() != "none":
+                raise ValueError(
+                    "floating_ambipolar_edge_node does not yet support "
+                    "radau_lagged_jacobian_refresh_mode; use 'none'."
+                )
+            build_lagged_response_from_flat = _node_build_from_flat
         if (
             str(getattr(self, "lagged_jacobian_refresh_mode", "none")).strip().lower()
             == "quadratic_colored_after_first"
@@ -21448,7 +21546,15 @@ class RADAUSolver(_RadauSolverConfig):
                 "the vector field to provide evaluate_with_lagged_response_tangent(...)."
             )
         initial_lagged_response = (
-            build_lagged_response(unpack_flat(_project_flat_state_if_needed(flat_state0, project_flat)))
+            (
+                build_lagged_response_from_flat(
+                    _project_flat_state_if_needed(flat_state0, project_flat)
+                )
+                if build_lagged_response_from_flat is not None
+                else build_lagged_response(
+                    unpack_flat(_project_flat_state_if_needed(flat_state0, project_flat))
+                )
+            )
             if (use_transport_lagged_response and build_lagged_response is not None)
             else None
         )
@@ -21624,6 +21730,7 @@ class RADAUSolver(_RadauSolverConfig):
             pack_flat=pack_state,
             project_flat=project_flat,
             build_lagged_response=build_lagged_response,
+            build_lagged_response_from_flat=build_lagged_response_from_flat,
             pullback_build_lagged_response=pullback_build_lagged_response,
             build_lagged_response_with_compact_coefficient_record=(
                 build_lagged_response_with_compact_coefficient_record

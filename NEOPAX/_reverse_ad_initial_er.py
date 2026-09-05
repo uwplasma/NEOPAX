@@ -536,8 +536,8 @@ def fold_recorded_ntx_scan_database_bar_groups_into_support(runtime_or_owner, ba
         merged.pop("database")
         for key in ("channels", "surfaces"):
             if key not in merged:
-                raise ValueError(
-                    f"Recorded database support bar is missing direct {key!r} support."
+                merged[key] = jax.tree_util.tree_map(
+                    jnp.zeros_like, database_support_bar[key]
                 )
             merged[key] = _add_float_delta_tree(merged[key], database_support_bar[key])
         rebuilt[group_index][row_index] = merged
@@ -567,8 +567,8 @@ def _replace_ntx_runtime_scan_payload_in_model(model, payload):
     if isinstance(model, NTXRuntimeScanTransportModel):
         return model.with_runtime_scan_payload(
             geometry=payload["geometry"],
-            channels=payload["channels"],
-            scan_surfaces=payload["surfaces"],
+            channels=payload.get("channels", model.channels),
+            scan_surfaces=payload.get("surfaces", model.scan_surfaces),
             database=payload.get("database"),
         ), True
     updates = {}
@@ -646,26 +646,18 @@ def runtime_with_realtime_geometry_reverse_support_payload(runtime, support_payl
     payload = realtime_geometry_payload_for_runtime(runtime)
     kind = str(payload["kind"])
     if kind == "ntx_scan_runtime":
-        required = {"geometry", "channels", "surfaces"}
+        recorded_database_leaf = "database" in support_payload
+        required = {"geometry", "database"} if recorded_database_leaf else {"geometry", "channels", "surfaces"}
         missing = required.difference(support_payload)
         if missing:
             raise ValueError(
                 "Live NTX scan reverse support payload is missing "
                 f"{sorted(missing)!r}."
             )
-        return runtime_with_realtime_geometry_payload(
-            runtime,
-            {
-                "kind": kind,
-                "geometry": support_payload["geometry"],
-                "channels": support_payload["channels"],
-                "surfaces": support_payload["surfaces"],
-                # Legacy payloads clear the cache and rebuild it.  The
-                # recorded path supplies an explicit database leaf instead,
-                # so the inner VJP differentiates interpolation only.
-                "database": support_payload.get("database"),
-            },
-        )
+        replacement = {"kind": kind, "geometry": support_payload["geometry"], "database": support_payload.get("database")}
+        if not recorded_database_leaf:
+            replacement.update(channels=support_payload["channels"], surfaces=support_payload["surfaces"])
+        return runtime_with_realtime_geometry_payload(runtime, replacement)
     if kind == "ntx_exact":
         required = {"geometry", "ntx_support"}
         missing = required.difference(support_payload)
