@@ -3113,24 +3113,22 @@ class NTXDatabaseTransportModel(TransportFluxModelBase):
         return support_bar
 
     def pullback_local_particle_flux_support_payload(self, state, flux_bar, support):
-        """Compact table transpose of the constrained local root flux.
+        """Compact table transpose of the local direct-centre root flux.
 
-        Unlike :meth:`__call__`, the ambipolar-root evaluator supplies the
-        model's right-boundary constraints to the centre flux construction.
-        Keep that distinction explicit: using the ordinary RHS transpose here
-        silently differentiates a different density/temperature gradient at
-        the outer cell.
+        The selected-root primitive is the local restriction of
+        :meth:`__call__`; therefore this uses the identical direct-centre
+        last-cell, zero-gradient closure.  It must not use transport face
+        boundary constraints, which would transpose a different outer-cell
+        flux than the root solver evaluated.
         """
         if not isinstance(support, dict) or "database" not in support:
             return None
         database = support["database"]
         density = safe_density(state.density, self.density_floor)
-        density_right_constraint, density_right_grad_constraint = _extract_right_constraints(
-            self.bc_density, density, self.geometry.r_grid_half
-        )
-        temperature_right_constraint, temperature_right_grad_constraint = _extract_right_constraints(
-            self.bc_temperature, state.temperature, self.geometry.r_grid_half
-        )
+        density_right_constraint = density[:, -1]
+        density_right_grad_constraint = jnp.zeros_like(density_right_constraint)
+        temperature_right_constraint = state.temperature[:, -1]
+        temperature_right_grad_constraint = jnp.zeros_like(temperature_right_constraint)
         zero = jnp.zeros_like(jnp.asarray(density))
 
         def _bar(name):
