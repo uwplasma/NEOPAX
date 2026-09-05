@@ -162,6 +162,8 @@ def _resolve_transport_center_flux_mode(config: dict) -> str:
         "face_coefficient_physical_coordinates",
         "interpolate_face_coefficients_native_distance",
         "face_coefficient_native_distance",
+        "interpolate_face_coefficients_taylor_reliability",
+        "face_coefficient_taylor_reliability",
     }:
         if has_universal_mode and universal_mode != "direct":
             raise ValueError(
@@ -664,6 +666,8 @@ def _build_flux_model(config: dict, species, energy_grid, geometry, database, so
                 "face_coefficient_physical_coordinates",
                 "interpolate_face_coefficients_native_distance",
                 "face_coefficient_native_distance",
+                "interpolate_face_coefficients_taylor_reliability",
+                "face_coefficient_taylor_reliability",
             }:
                 if solver_cfg["transport_center_flux_mode"] != "direct":
                     raise ValueError(

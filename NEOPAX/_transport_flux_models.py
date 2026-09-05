@@ -5319,6 +5319,8 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             "face_coefficient_physical_coordinates": "interpolate_face_coefficients_physical_coordinates",
             "interpolate_face_coefficients_native_distance": "interpolate_face_coefficients_native_distance",
             "face_coefficient_native_distance": "interpolate_face_coefficients_native_distance",
+            "interpolate_face_coefficients_taylor_reliability": "interpolate_face_coefficients_taylor_reliability",
+            "face_coefficient_taylor_reliability": "interpolate_face_coefficients_taylor_reliability",
         }
         mode = aliases.get(mode, mode)
         if mode not in {
@@ -5328,6 +5330,7 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             "interpolate_face_coefficients_cubic",
             "interpolate_face_coefficients_physical_coordinates",
             "interpolate_face_coefficients_native_distance",
+            "interpolate_face_coefficients_taylor_reliability",
         }:
             raise ValueError(
                 "ntx_exact_center_response_mode must be one of: "
@@ -5335,7 +5338,8 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                 "interpolate_face_coefficients, "
                 "interpolate_face_coefficients_cubic, "
                 "interpolate_face_coefficients_physical_coordinates, "
-                "interpolate_face_coefficients_native_distance"
+                "interpolate_face_coefficients_native_distance, "
+                "interpolate_face_coefficients_taylor_reliability"
             )
         return mode
 
@@ -5404,6 +5408,11 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         reconstruction improves a root layer without additional NTX solves.
         ``weight_mode='native_distance'`` instead weights the two adjacent
         responses by their native ``(nu_hat, epsi_hat)`` distance.
+        ``weight_mode='taylor_reliability'`` retains the geometric radial
+        weights as a prior, but downweights a side whose quadratic Taylor
+        correction is large relative to its local constant-plus-linear
+        coefficient scale.  This is a fixed-shape, rebuild-time reliability
+        estimate; it does not perform an extra NTX solve.
 
         ``coordinate_mode='physical_er_over_v'`` keeps the radial
         interpolation query fixed in physical ``(nu/v, Er/v)`` coordinates.
@@ -5424,9 +5433,15 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         hi = jnp.searchsorted(face_rho, center_rho, side="right")
         hi = jnp.clip(hi, 1, face_rho.shape[0] - 1)
         lo = hi - 1
-        if weight_mode not in {"radial", "radial_cubic", "native_distance"}:
+        if weight_mode not in {
+            "radial",
+            "radial_cubic",
+            "native_distance",
+            "taylor_reliability",
+        }:
             raise ValueError(
-                "weight_mode must be 'radial', 'radial_cubic', or 'native_distance'."
+                "weight_mode must be 'radial', 'radial_cubic', 'native_distance', "
+                "or 'taylor_reliability'."
             )
         if coordinate_mode not in {"native", "physical_er_over_v"}:
             raise ValueError(
@@ -5462,11 +5477,15 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             u_hi_native = face_response.reference_nu_hat[hi]
             e_lo_native = face_response.reference_epsi_hat[lo]
             e_hi_native = face_response.reference_epsi_hat[hi]
-            if weight_hi_override is None and weight_mode == "radial":
-                weight_hi = (center_rho - face_rho[lo]) / jnp.where(
-                    jnp.abs(denominator) > 0.0, denominator, 1.0
-                )
-                weight_hi = jnp.clip(weight_hi, 0.0, 1.0)
+            radial_weight_hi = (center_rho - face_rho[lo]) / jnp.where(
+                jnp.abs(denominator) > 0.0, denominator, 1.0
+            )
+            radial_weight_hi = jnp.clip(radial_weight_hi, 0.0, 1.0)
+            if weight_hi_override is None and weight_mode in {
+                "radial",
+                "taylor_reliability",
+            }:
+                weight_hi = radial_weight_hi
             elif weight_hi_override is None:
                 # The local left/right span non-dimensionalizes the two
                 # native coordinates without assuming that nu_hat and
@@ -5546,9 +5565,40 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             face_response.d2coefficients_d_epsi_hat2,
         )
         translated = _translate(*(field[face_indices] for field in face_fields))
-        weights = weights.reshape(
-            weights.shape + (1,) * (translated[0].ndim - weights.ndim)
-        )
+        if weight_mode == "taylor_reliability" and weight_hi_override is None:
+            # ``u_center`` / ``e_center`` already carry the face-dependent
+            # physical Er/v rescaling when requested above.  Estimate each
+            # side's trustworthiness from the retained quadratic correction
+            # at this common centre state.  The radial weights remain the
+            # tie-breaking prior when both Taylor expansions have equal
+            # curvature.
+            c0, cu, ce, cuu, cue, cee = (
+                field[face_indices] for field in face_fields
+            )
+            du = u_center - u_face
+            de = e_center - e_face
+            linear = cu * du + ce * de
+            quadratic = (
+                0.5 * cuu * du * du
+                + cue * du * de
+                + 0.5 * cee * de * de
+            )
+            reduce_axes = tuple(range(3, quadratic.ndim))
+            quadratic_scale = jnp.sqrt(jnp.mean(quadratic * quadratic, axis=reduce_axes))
+            local_scale = jnp.sqrt(
+                jnp.mean(c0 * c0 + linear * linear, axis=reduce_axes)
+            )
+            curvature = quadratic_scale / jnp.maximum(local_scale, 1.0e-30)
+            radial_prior = jnp.stack((1.0 - radial_weight_hi, radial_weight_hi), axis=1)
+            score = radial_prior[:, :, None] / jnp.maximum(curvature, 1.0e-12)
+            weights = score / jnp.maximum(jnp.sum(score, axis=1, keepdims=True), 1.0e-30)
+            weights = weights.reshape(
+                weights.shape + (1,) * (translated[0].ndim - weights.ndim)
+            )
+        else:
+            weights = weights.reshape(
+                weights.shape + (1,) * (translated[0].ndim - weights.ndim)
+            )
         center_c0, center_cu, center_ce, center_cuu, center_cue, center_cee = tuple(
             jnp.sum(weights * value, axis=1)
             for value in translated
@@ -12415,14 +12465,19 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             "interpolate_face_coefficients_cubic",
             "interpolate_face_coefficients_physical_coordinates",
             "interpolate_face_coefficients_native_distance",
+            "interpolate_face_coefficients_taylor_reliability",
         }
         coefficient_weight_mode = (
             "native_distance"
             if center_response_mode == "interpolate_face_coefficients_native_distance"
             else (
+                "taylor_reliability"
+                if center_response_mode == "interpolate_face_coefficients_taylor_reliability"
+                else (
                 "radial_cubic"
                 if center_response_mode == "interpolate_face_coefficients_cubic"
                 else "radial"
+                )
             )
         )
         coefficient_coordinate_mode = (
@@ -16184,6 +16239,7 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             "interpolate_face_coefficients_cubic",
             "interpolate_face_coefficients_physical_coordinates",
             "interpolate_face_coefficients_native_distance",
+            "interpolate_face_coefficients_taylor_reliability",
         }:
             # Direct-centre mode owns two cached models: centres for local
             # terms and faces for conservative divergence.  Its tangent must
@@ -16240,6 +16296,7 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                 "interpolate_face_coefficients_cubic",
                 "interpolate_face_coefficients_physical_coordinates",
                 "interpolate_face_coefficients_native_distance",
+                "interpolate_face_coefficients_taylor_reliability",
             }:
                 centre_fluxes = self._evaluate_full_state_quadratic_center_response(
                     state, lagged_response.center_response

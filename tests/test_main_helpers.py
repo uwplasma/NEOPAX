@@ -566,6 +566,19 @@ def test_face_quadratic_coefficient_interpolation_rebases_before_radial_interpol
     assert jnp.allclose(interpolated.d2coefficients_d_nu_hat_d_epsi_hat, 11.0)
     assert jnp.allclose(interpolated.d2coefficients_d_epsi_hat2, 13.0)
 
+    # A globally consistent polynomial has identical translated left/right
+    # values, so the reliability weighting must preserve it exactly.
+    reliability_weighted = model._interpolate_face_quadratic_coefficients_to_centres(
+        response,
+        center_reference_nu_hat=u_center,
+        center_reference_epsi_hat=e_center,
+        weight_mode="taylor_reliability",
+    )
+    assert jnp.allclose(
+        reliability_weighted.reference_coefficients[..., 0],
+        coefficient(u_center, e_center),
+    )
+
 
 def test_face_quadratic_coefficient_cubic_interpolation_rebases_before_radial_interpolation():
     """The opt-in four-face reconstruction preserves a cubic radial field."""
