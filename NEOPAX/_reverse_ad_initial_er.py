@@ -119,61 +119,6 @@ def initial_er_charge_flux_residual_er_derivative(state, er_profile, *, runtime)
     )
 
 
-def compact_initial_er_database_support_bars(
-    *, runtime, state, er_profile, residual_bars, support
-):
-    """Map selected-root charge-residual bars to recorded database tables.
-
-    The selected-root residual uses the local particle flux.  Its only
-    database-dependent contribution is therefore the neoclassical ``Gamma``
-    channel, with cotangent ``Z_a * residual_bar``.  This companion to the
-    black-box direct-RHS rule intentionally stops at the explicit database
-    leaf; the caller folds the accumulated table bars through the retained
-    runtime scan exactly once.
-    """
-    if not isinstance(support, dict) or "database" not in support:
-        raise ValueError(
-            "Compact database initial-Er support pullback requires an explicit "
-            "recorded database support leaf."
-        )
-    runtime_scan = find_ntx_runtime_scan_model_in_model(runtime.models.flux)
-    if runtime_scan is None:
-        raise ValueError(
-            "Compact database initial-Er support pullback requires an NTX runtime scan model."
-        )
-    er_profile = jnp.asarray(er_profile, dtype=state.Er.dtype)
-    residual_bars = jnp.asarray(residual_bars, dtype=state.Er.dtype)
-    if residual_bars.ndim != 2 or residual_bars.shape[1] != er_profile.shape[0]:
-        raise ValueError(
-            "Compact database initial-Er support pullback expects residual_bars "
-            "with shape (objective_count, radial_count)."
-        )
-    state_with_er = dataclasses.replace(state, Er=er_profile)
-    charge_qp = jnp.asarray(runtime.species.charge_qp, dtype=state.Er.dtype)
-
-    def _one_objective(residual_bar):
-        gamma_bar = charge_qp[:, None] * residual_bar[None, :]
-        pullback = getattr(
-            runtime_scan, "pullback_local_particle_flux_support_payload", None
-        )
-        if not callable(pullback):
-            raise ValueError(
-                "Runtime database model did not expose its local particle-flux transpose."
-            )
-        support_bar = pullback(
-            state_with_er,
-            {"Gamma": gamma_bar},
-            support,
-        )
-        if support_bar is None or "database" not in support_bar:
-            raise ValueError(
-                "Runtime database model did not expose its direct particle-flux transpose."
-            )
-        return support_bar["database"]
-
-    return jax.vmap(_one_objective)(residual_bars)
-
-
 def _replace_ntx_support_payload_in_model(model, support):
     if model is None or not dataclasses.is_dataclass(model) or isinstance(model, type):
         return model, False
@@ -257,40 +202,6 @@ def find_ntx_runtime_scan_model_in_model(model):
             if found is not None:
                 return found
     return None
-
-
-def runtime_without_recorded_ntx_scan_primal(runtime):
-    """Drop the retained scan record from runtime objects used inside segment VJPs.
-
-    The record contains full prepared NTX systems and is needed only after the
-    transport sweep, when the accumulated database cotangent is transposed.
-    Leaving it captured by every generic black-box stage VJP unnecessarily
-    retains those systems in each compiled reverse closure.  The returned
-    runtime keeps the already-built database, channels and surfaces unchanged.
-    """
-
-    def _strip(model):
-        if model is None or not dataclasses.is_dataclass(model) or isinstance(model, type):
-            return model, False
-        if isinstance(model, NTXRuntimeScanTransportModel):
-            if model.scan_primal_record is None and model.scan_primal is None:
-                return model, False
-            return dataclasses.replace(
-                model, scan_primal_record=None, scan_primal=None
-            ), True
-        updates = {}
-        changed = False
-        for field in dataclasses.fields(model):
-            replacement, child_changed = _strip(getattr(model, field.name))
-            if child_changed:
-                updates[field.name] = replacement
-                changed = True
-        return (dataclasses.replace(model, **updates), True) if changed else (model, False)
-
-    flux_model, changed = _strip(runtime.models.flux)
-    if not changed:
-        return runtime
-    return dataclasses.replace(runtime, models=dataclasses.replace(runtime.models, flux=flux_model))
 
 
 def realtime_geometry_payload_for_runtime(runtime):
@@ -433,62 +344,6 @@ def fold_recorded_ntx_scan_database_bars_into_support(runtime, support_bars):
             merged[key] = _add_float_delta_tree(merged[key], database_support_bar[key])
         folded.append(merged)
     return tuple(folded)
-
-
-def fold_recorded_ntx_scan_database_bar_groups_into_support(runtime, bar_groups):
-    """Fold every report-row database bar through one retained scan transpose.
-
-    ``support_bars`` and the named component bars describe the same transport
-    reverse but used to call the retained scan VJP once per report group.  The
-    database is fixed throughout all of those groups, so concatenate their
-    objective rows and execute one batched scan transpose, then restore the
-    original grouping.  This is reporting-only bookkeeping: it changes no
-    cotangent, objective, or Lij path.
-    """
-    groups = tuple(tuple(group) for group in bar_groups)
-    indexed_bars = tuple(
-        (group_index, row_index, bar)
-        for group_index, group in enumerate(groups)
-        for row_index, bar in enumerate(group)
-        if isinstance(bar, dict) and "database" in bar
-    )
-    if not indexed_bars:
-        return groups
-    if any(
-        not isinstance(bar, dict) or "database" not in bar
-        for group in groups
-        for bar in group
-    ):
-        raise ValueError(
-            "Recorded database support-bar groups must consistently carry a database leaf."
-        )
-    runtime_scan = find_ntx_runtime_scan_model_in_model(runtime.models.flux)
-    if runtime_scan is None:
-        raise ValueError("Recorded database support bars require an NTX runtime scan model.")
-
-    database_bars = jax.tree_util.tree_map(
-        lambda *values: jnp.stack(values),
-        *(bar["database"] for _group_index, _row_index, bar in indexed_bars),
-    )
-    database_support_bars = jax.vmap(
-        runtime_scan.recorded_runtime_database_support_bar,
-    )(database_bars)
-
-    rebuilt = [list(group) for group in groups]
-    for batch_index, (group_index, row_index, support_bar) in enumerate(indexed_bars):
-        database_support_bar = jax.tree_util.tree_map(
-            lambda value: value[batch_index], database_support_bars
-        )
-        merged = dict(support_bar)
-        merged.pop("database")
-        for key in ("channels", "surfaces"):
-            if key not in merged:
-                raise ValueError(
-                    f"Recorded database support bar is missing direct {key!r} support."
-                )
-            merged[key] = _add_float_delta_tree(merged[key], database_support_bar[key])
-        rebuilt[group_index][row_index] = merged
-    return tuple(tuple(group) for group in rebuilt)
 
 
 def _replace_database_payload_in_model(model, database):

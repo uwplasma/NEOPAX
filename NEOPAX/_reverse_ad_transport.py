@@ -33,11 +33,9 @@ from ._geometry_autodiff import (
 from ._orchestrator import prepare_transport_solver_components
 from ._profiles import AnalyticalProfileModel
 from ._reverse_ad_initial_er import (
-    compact_initial_er_database_support_bars,
-    fold_recorded_ntx_scan_database_bar_groups_into_support,
+    fold_recorded_ntx_scan_database_bars_into_support,
     compact_initial_er_ntx_support_pullback_leaves,
     compact_initial_er_state_pullback,
-    find_ntx_runtime_scan_model_in_model,
     find_ntx_support_payload,
     initial_er_charge_flux_residual_er_derivative,
     initial_er_charge_flux_residual_scalar,
@@ -48,7 +46,6 @@ from ._reverse_ad_initial_er import (
     runtime_with_geometry_payload,
     runtime_with_ntx_support_payload,
     runtime_with_realtime_geometry_reverse_support_payload,
-    runtime_without_recorded_ntx_scan_primal,
 )
 from ._reverse_ad_parameters import (
     PROFILE_PARAMETER_ORDER,
@@ -636,8 +633,6 @@ class RealtimeGeometryReverseStaticSetup:
     # Optional compact scalar trace from the static schedule probe. This is
     # intentionally not a per-step primal tape or an additional carry.
     schedule_artifact: object | None = None
-    schedule_segment_start_carries: object | None = None
-    schedule_final_carry: object | None = None
 
 
 @jax.tree_util.register_dataclass
@@ -721,31 +716,11 @@ def _initial_direct_rhs_support_pullback_batched(
         ),
         axis=1,
     )
-    # The retained scan-database support is numerical (geometry plus compact
-    # tables) after the scan record has been stripped from the rollout
-    # runtime.  It can therefore take the objective axis natively.  Keep the
-    # conservative scalar path for live Lij payloads, whose scan-surface
-    # metadata has static Boozer arrays that cannot be reconstructed by a
-    # generic ``vmap``.
-    if isinstance(support_payload, dict) and "database" in support_payload:
-        return jax.vmap(
-            lambda rhs_bar: flat_rhs_direct_support_pullback(
-                carry0.t, carry0.y, rhs_bar, support_payload
-            )
-        )(rhs_bars)
-
-    # Live support compatibility route: stack only numerical bars after each
-    # scalar owner call, preserving static surface metadata exactly.
-    support_bars = tuple(
-        flat_rhs_direct_support_pullback(
-            carry0.t, carry0.y, rhs_bars[index], support_payload
+    return jax.vmap(
+        lambda rhs_bar: flat_rhs_direct_support_pullback(
+            carry0.t, carry0.y, rhs_bar, support_payload
         )
-        for index in range(objective_count)
-    )
-    return jax.tree_util.tree_map(
-        lambda *values: jnp.stack(tuple(jnp.asarray(value) for value in values)),
-        *support_bars,
-    )
+    )(rhs_bars)
     next_recent_reject_count: Any
     next_regrowth_cooldown: Any
     next_easy_growth_streak: Any
@@ -860,43 +835,6 @@ def initial_state_for_parameter_vector(
     config: Mapping[str, Any] | None = None,
     initial_er_root_ad: str = "off",
 ):
-    """Build the initial profile state from a complete runtime object.
-
-    This public compatibility wrapper retains the existing call signature.
-    Reverse profile pullbacks should call the compact helper below directly so
-    a large database/support payload is not captured by their JAX trace.
-    """
-    return initial_state_for_parameter_vector_compact(
-        parameter_values,
-        baseline_state=baseline_state,
-        profile_cfg=profile_cfg,
-        geometry=runtime.geometry,
-        number_species=runtime.species.number_species,
-        config=config,
-        initial_er_root_ad=initial_er_root_ad,
-        root_runtime=runtime,
-    )
-
-
-def initial_state_for_parameter_vector_compact(
-    parameter_values,
-    *,
-    baseline_state,
-    profile_cfg: Mapping[str, Any],
-    geometry,
-    number_species: int,
-    config: Mapping[str, Any] | None = None,
-    initial_er_root_ad: str = "off",
-    root_runtime=None,
-):
-    """Build an initial profile state without capturing unrelated runtime data.
-
-    Profile construction depends solely on transport geometry and the species
-    count.  In particular it does not use an NTX database, its recorded scan
-    primal, or flux-model support payload.  Keeping those out of this function
-    is important because this map is itself differentiated at the beginning
-    of every segmented reverse sweep.
-    """
     cfg = dict(profile_cfg)
     values_arr = jnp.asarray(parameter_values)
     if int(values_arr.shape[0]) == len(PROFILE_PARAMETER_ORDER):
@@ -907,8 +845,8 @@ def initial_state_for_parameter_vector_compact(
         cfg[name] = value
     profile_set = parameterized_profile_set(
         cfg,
-        geometry,
-        number_species,
+        runtime.geometry,
+        runtime.species.number_species,
         parameter_name=TRANSPORT_REVERSE_PROFILE_PARAMETER_ORDER[0],
         parameter_value=cfg[TRANSPORT_REVERSE_PROFILE_PARAMETER_ORDER[0]],
     )
@@ -932,11 +870,7 @@ def initial_state_for_parameter_vector_compact(
     if mode != "off":
         if config is None:
             raise ValueError("config is required when initial_er_root_ad is enabled.")
-        if root_runtime is None:
-            raise ValueError("root_runtime is required when initial_er_root_ad is enabled.")
-        state = state_with_initial_er_root_ad(
-            state, config=config, runtime=root_runtime, mode=mode
-        )
+        state = state_with_initial_er_root_ad(state, config=config, runtime=runtime, mode=mode)
     return state
 
 
@@ -1522,7 +1456,6 @@ def _reverse_adaptive_schedule_rollout(
     *,
     max_total_steps,
     stop_after_accepted_steps,
-    capture_segment_length=None,
 ):
     if isinstance(execution_context, _ThetaReverseExecutionContext):
         return _theta_reverse_adaptive_schedule_rollout(
@@ -1537,7 +1470,6 @@ def _reverse_adaptive_schedule_rollout(
         initial_carry,
         max_total_steps=max_total_steps,
         stop_after_accepted_steps=stop_after_accepted_steps,
-        capture_segment_length=capture_segment_length,
     )
 
 
@@ -3460,7 +3392,6 @@ def prepare_reverse_static_setup(
             prepared_rollout_static.initial_carry,
             max_total_steps=probe_max_total_steps,
             stop_after_accepted_steps=probe_stop_after_accepted_steps,
-            capture_segment_length=reverse_segment_length_eff,
         )
         actual_attempt_count = int(np.asarray(jax.device_get(schedule_probe.attempt_count)))
         active_mask_np = np.asarray(jax.device_get(schedule_probe.trace.active_mask), dtype=bool)
@@ -3533,13 +3464,6 @@ def prepare_reverse_static_setup(
         reverse_segment_length=reverse_segment_length_eff,
         require_final_time=bool(requested_full_final_time and reverse_segment_length_eff is not None),
         schedule_artifact=schedule_artifact,
-        schedule_segment_start_carries=(
-            schedule_probe.segment_start_carries
-            if schedule_artifact is not None else None
-        ),
-        schedule_final_carry=(
-            schedule_probe.final_carry if schedule_artifact is not None else None
-        ),
     )
 
 
@@ -3660,40 +3584,15 @@ def prepare_realtime_geometry_support_segment_core_setup(
         final_cotangent_mode = str(
             getattr(args, "reverse_final_objective_cotangent_mode", "scalar")
         ).strip().lower()
-        if final_cotangent_mode not in {"scalar", "grouped_vjp"}:
+        if final_cotangent_mode != "scalar":
             raise ValueError(
-                "ntx_scan_runtime requires "
-                "--reverse-final-objective-cotangent-mode scalar or grouped_vjp."
+                "ntx_scan_runtime currently requires "
+                "--reverse-final-objective-cotangent-mode scalar."
             )
         ntx_support_payload = None
         support_payload = realtime_geometry_reverse_support_payload_for_runtime(
             baseline_runtime
         )
-        rhs_transpose_mode = str(
-            getattr(args, "reverse_rhs_transpose_mode", "generic")
-        ).strip().lower()
-        if rhs_transpose_mode in {
-            "explicit_database",
-            "database",
-            "explicit_black_box_database",
-        }:
-            centre_mode = str(
-                getattr(baseline_runtime.models.flux, "center_flux_mode", "")
-            ).strip().lower()
-            if centre_mode != "direct":
-                raise ValueError(
-                    "reverse_rhs_transpose_mode='explicit_database' requires "
-                    "the black-box database forward contract "
-                    "center_flux_mode='direct'; got "
-                    f"{centre_mode!r}."
-                )
-            if "database" not in support_payload:
-                raise ValueError(
-                    "reverse_rhs_transpose_mode='explicit_database' requires "
-                    "a recorded runtime database support payload. Enable "
-                    "--ntx-scan-coefficient-reverse-mode structured and "
-                    "--ntx-scan-record-primal."
-                )
     else:
         raise NotImplementedError(
             "Realtime geometry segmented reverse currently supports "
@@ -3906,47 +3805,24 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
 
     initial_er_root_enabled = dependencies.initial_er_root_enabled(config, initial_er_root_ad)
 
-    # Do not close this small profile map over the complete runtime: a scan
-    # database runtime contains the large coefficient tables and optional
-    # recorded scan primal, neither of which is an input to profile creation.
-    profile_geometry = runtime.geometry
-    profile_number_species = runtime.species.number_species
-
     def _state_from_profiles(p):
-        return initial_state_for_parameter_vector_compact(
+        return dependencies.initial_state_for_parameter_vector(
             p,
             config=config,
             initial_er_root_ad="off",
+            runtime=runtime,
             baseline_state=baseline_state,
             profile_cfg=profile_cfg,
-            geometry=profile_geometry,
-            number_species=profile_number_species,
         )
 
-    phase_timing_diagnostics = bool(
-        getattr(
-            reverse_setup.execution_context.physics_context,
-            "reverse_phase_timing_diagnostics",
-            False,
-        )
-    )
     phase_start = time.perf_counter()
     pre_root_initial_state, profile_state_pullback = jax.vjp(_state_from_profiles, parameter_values)
-    profile_state_vjp_elapsed = None
-    if phase_timing_diagnostics:
-        # Do not conflate the profile pytree VJP with the separately executed
-        # selected-root primal below.  This synchronization is diagnostic-only
-        # and mirrors the component timings printed later in the Lij path.
-        pre_root_initial_state = jax.block_until_ready(pre_root_initial_state)
-        profile_state_vjp_elapsed = time.perf_counter() - phase_start
     # The reverse boundary below implements the selected-root implicit
     # pullback explicitly.  Keep the forward root result here so that
     # boundary does not repeat the same radial root solve just to recover its
     # primal value and finite-root mask.
     initial_er_root_primal = None
-    selected_root_primal_elapsed = None
     if initial_er_root_enabled:
-        selected_root_start = time.perf_counter()
         initial_er_root_primal = dependencies.initial_er_selected_root_profile(
             pre_root_initial_state,
             config=config,
@@ -3958,9 +3834,6 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
                 initial_er_root_primal[0], dtype=pre_root_initial_state.Er.dtype
             ),
         )
-        if phase_timing_diagnostics:
-            initial_state = jax.block_until_ready(initial_state)
-            selected_root_primal_elapsed = time.perf_counter() - selected_root_start
     else:
         initial_state = pre_root_initial_state
     initial_state = jax.block_until_ready(initial_state)
@@ -3969,24 +3842,6 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
         f"elapsed_s={time.perf_counter() - phase_start:.3f}",
         flush=True,
     )
-    if phase_timing_diagnostics:
-        root_time_text = (
-            "off"
-            if selected_root_primal_elapsed is None
-            else f"{selected_root_primal_elapsed:.3f}"
-        )
-        profile_time_text = (
-            "n/a"
-            if profile_state_vjp_elapsed is None
-            else f"{profile_state_vjp_elapsed:.3f}"
-        )
-        print(
-            f"{progress_prefix} diagnostic: initial-state construction "
-            f"profile_state_vjp_compile_plus_execute_s={profile_time_text} "
-            f"selected_root_primal_compile_plus_execute_s={root_time_text} "
-            f"assembly_and_sync_s={time.perf_counter() - phase_start - (profile_state_vjp_elapsed or 0.0) - (selected_root_primal_elapsed or 0.0):.3f}",
-            flush=True,
-        )
 
     def _carry_from_state(state_value):
         return dependencies.reverse_initial_carry_from_state_with_static_setup(
@@ -4090,10 +3945,6 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
             reverse_setup.reverse_segment_length,
             initial_carry,
             schedule_artifact,
-            final_carry=getattr(reverse_setup, "schedule_final_carry", None),
-            segment_start_carries_artifact=getattr(
-                reverse_setup, "schedule_segment_start_carries", None
-            ),
         )
     final_y, residuals = jax.block_until_ready((final_y, residuals))
     print(
@@ -4101,13 +3952,6 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
         f"elapsed_s={time.perf_counter() - phase_start:.3f}",
         flush=True,
     )
-    if phase_timing_diagnostics:
-        print(
-            f"{progress_prefix} diagnostic: realized-schedule residual construction "
-            f"compile_plus_replay_execute_s={time.perf_counter() - phase_start:.3f} "
-            "(fixed accepted schedule; this is not an adaptive rerun)",
-            flush=True,
-        )
 
     (
         carry0,
@@ -4278,10 +4122,7 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
         objective_name = objective_labels[objective_i]
         if (
             objective_name == bootstrap_objective_name
-            and (
-                "ntx_support" in support_payload
-                or "database" in support_payload
-            )
+            and "ntx_support" in support_payload
         ):
             component_start = time.perf_counter()
             final_state_for_bootstrap = reverse_setup.prepared_rollout.physics_context.unpack_flat(
@@ -4289,20 +4130,6 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
             )
             flux_model = getattr(getattr(runtime, "models", None), "flux", None)
             neoclassical_model = getattr(flux_model, "neoclassical_model", flux_model)
-            database_payload = "database" in support_payload
-            # A recorded runtime-scan payload owns the already-built radial
-            # database.  The static scan model still carries its source
-            # ``Monoenergetic`` configuration, which is not a centre-flux
-            # interpolation table.  Bind the recorded table before obtaining
-            # either bootstrap primal or compact pullback methods.
-            if database_payload:
-                with_payload = getattr(neoclassical_model, "with_support_payload", None)
-                if not callable(with_payload):
-                    raise NotImplementedError(
-                        "Recorded database bootstrap AD requires a realtime NTX "
-                        "model with support-payload binding."
-                    )
-                neoclassical_model = with_payload(support_payload)
             corrected_fluxes_fn = getattr(neoclassical_model, "evaluate_momentum_corrected_fluxes", None)
             upar_only_fn = getattr(
                 neoclassical_model,
@@ -4310,11 +4137,6 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
                 None,
             )
             state_pullback_fn = getattr(neoclassical_model, "pullback_momentum_corrected_upar_state_by_radius", None)
-            database_pullback_fn = getattr(
-                neoclassical_model,
-                "pullback_momentum_corrected_upar_database_by_radius",
-                None,
-            )
             support_pullback_fn = getattr(
                 neoclassical_model,
                 "pullback_momentum_corrected_upar_support_by_radius",
@@ -4323,11 +4145,6 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
             geometry_pullback_fn = getattr(
                 neoclassical_model,
                 "pullback_momentum_corrected_upar_geometry_by_radius",
-                None,
-            )
-            database_state_geometry_pullback_fn = getattr(
-                neoclassical_model,
-                "pullback_momentum_corrected_upar_state_geometry_by_radius",
                 None,
             )
             joint_pullback_fn = getattr(
@@ -4350,14 +4167,7 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
                 )
             if (
                 bootstrap_cotangent_mode == "separate"
-                and (
-                    not callable(state_pullback_fn)
-                    or (
-                        database_payload
-                        and not callable(database_pullback_fn)
-                    )
-                    or (not database_payload and not callable(support_pullback_fn))
-                )
+                and (not callable(state_pullback_fn) or not callable(support_pullback_fn))
             ):
                 raise NotImplementedError(
                     "bootstrap_current_softmax_abs_scaled requires compact corrected-Upar "
@@ -4377,13 +4187,6 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
                 bootstrap_cotangent_mode
                 in {"joint_local_vjp", "joint_local_vjp_upar_only"}
                 and combined_geometry_payload
-                and not database_payload
-            )
-            use_joint_database_bootstrap_pullback = (
-                bootstrap_cotangent_mode
-                in {"joint_local_vjp", "joint_local_vjp_upar_only"}
-                and combined_geometry_payload
-                and database_payload
             )
             if (
                 bootstrap_cotangent_mode
@@ -4412,19 +4215,6 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
                     geometry,
                     ntx_support,
                 )
-            elif use_joint_database_bootstrap_pullback:
-                if not callable(database_state_geometry_pullback_fn):
-                    raise NotImplementedError(
-                        "joint local database bootstrap modes require the compact "
-                        "state/geometry corrected-Upar pullback."
-                    )
-                final_state_bar, geometry_objective_bar = (
-                    database_state_geometry_pullback_fn(
-                        final_state_for_bootstrap,
-                        upar_bar,
-                        support_payload["geometry"],
-                    )
-                )
             else:
                 final_state_bar = state_pullback_fn(final_state_for_bootstrap, upar_bar)
             _, unpack_pullback = jax.vjp(
@@ -4434,55 +4224,6 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
             final_y_bar_rows.append(unpack_pullback(final_state_bar)[0])
             objective_values_rows.append(objective_value)
             if combined_geometry_payload:
-                if database_payload:
-                    d11_bar, d13_bar, d33_bar = database_pullback_fn(
-                        final_state_for_bootstrap, upar_bar
-                    )
-                    database = support_payload["database"]
-                    database_bar = dataclasses.replace(
-                        _float_delta_tree_like(database),
-                        D11_log=d11_bar,
-                        D13=d13_bar,
-                        D33=d33_bar,
-                    )
-                    geometry = support_payload["geometry"]
-                    if (
-                        not use_joint_database_bootstrap_pullback
-                        and not callable(geometry_pullback_fn)
-                    ):
-                        raise NotImplementedError(
-                            "Recorded database bootstrap AD requires the compact "
-                            "fixed-database corrected-Upar geometry pullback."
-                        )
-                    if not use_joint_database_bootstrap_pullback:
-                        geometry_objective_bar = geometry_pullback_fn(
-                            final_state_for_bootstrap,
-                            upar_bar,
-                            geometry,
-                        )
-                    # The recorded scan payload also contains the direct
-                    # ``channels`` and ``surfaces`` branches.  Bootstrap has
-                    # no direct contribution to either one at this stage,
-                    # but every objective row must retain the identical
-                    # support pytree so the subsequent batched segment sweep
-                    # and one-time database fold can stack it safely.
-                    bootstrap_payload_bar = dict(zero_payload_bar)
-                    bootstrap_payload_bar.update(
-                        {
-                            "geometry": _sanitize_float_delta_bar_tree(
-                                geometry, geometry_objective_bar
-                            ),
-                            "database": _sanitize_float_delta_bar_tree(
-                                database, database_bar
-                            ),
-                        }
-                    )
-                    objective_payload_bar_rows.append(bootstrap_payload_bar)
-                    if phase_timing_diagnostics:
-                        objective_payload_bar_rows[-1] = jax.block_until_ready(
-                            objective_payload_bar_rows[-1]
-                        )
-                    continue
                 if not use_joint_bootstrap_pullback and not callable(geometry_pullback_fn):
                     raise NotImplementedError(
                         "bootstrap_current_softmax_abs_scaled requires compact corrected-Upar "
@@ -4551,21 +4292,7 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
                 final_objective_state_elapsed += time.perf_counter() - component_start
         objective_values_rows.append(objective_value)
         final_y_bar_rows.append(final_y_bar)
-        # Ordinary terminal objectives depend directly on the final state and
-        # transport geometry, not on an NTX support/table leaf.  A live
-        # database scan without ``--ntx-scan-record-primal`` deliberately has
-        # ``geometry/channels/surfaces`` but no explicit ``database`` leaf;
-        # it still uses this geometry-only terminal boundary.  Grouping the
-        # ordinary objectives is therefore valid for both recorded and live
-        # database payloads and avoids the old scalar-only fallback.
-        is_live_database_support = (
-            "channels" in support_payload and "surfaces" in support_payload
-        )
-        if combined_geometry_payload and (
-            "ntx_support" in support_payload
-            or "database" in support_payload
-            or is_live_database_support
-        ):
+        if combined_geometry_payload and "ntx_support" in support_payload:
             if final_objective_cotangent_mode == "grouped_vjp":
                 geometry_objective_bar = grouped_geometry_bars[objective_i]
             else:
@@ -4596,18 +4323,12 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
                 if phase_timing_diagnostics:
                     geometry_objective_bar = jax.block_until_ready(geometry_objective_bar)
                     final_objective_geometry_elapsed += time.perf_counter() - component_start
-            # Ordinary terminal objectives read only the final transport
-            # state and runtime geometry.  In particular they do not depend
-            # directly on the recorded database, scan channels, or scan
-            # surfaces.  Keeping this as a geometry-only VJP is the database
-            # analogue of the established exact-NTX boundary: differentiating
-            # the whole recorded payload here would trace the large table
-            # leaves once per objective and defeat the one-time scan fold.
-            objective_payload_bar = dict(zero_payload_bar)
-            objective_payload_bar["geometry"] = _sanitize_float_delta_bar_tree(
-                geometry, geometry_objective_bar
+            objective_payload_bar_rows.append(
+                {
+                    "geometry": _sanitize_float_delta_bar_tree(geometry, geometry_objective_bar),
+                    "ntx_support": zero_payload_bar["ntx_support"],
+                }
             )
-            objective_payload_bar_rows.append(objective_payload_bar)
         elif combined_geometry_payload:
             if final_objective_cotangent_mode == "grouped_vjp":
                 raise NotImplementedError(
@@ -6098,88 +5819,11 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
             initial_er_root_support_bars = (
                 tuple(jax.tree_util.tree_leaves(geometry_bars)) + tuple(ntx_bar_leaves)
             )
-        elif combined_geometry_payload and "database" in support_payload:
-            # Recorded scan database: transpose charge-weighted particle flux
-            # directly to the three tables, then preserve only the explicit
-            # geometry derivative in a database-fixed VJP.  The resulting
-            # table bars are folded through the retained scan once with the
-            # rest of the transport reverse support bars.
-            root_ntx_support_pullback_start = time.perf_counter()
-            database_bars = compact_initial_er_database_support_bars(
-                runtime=runtime,
-                state=pre_root_initial_state,
-                er_profile=er_profile,
-                residual_bars=residual_bars,
-                support=support_payload,
-            )
-            if phase_timing_diagnostics:
-                database_bars = jax.block_until_ready(database_bars)
-            root_ntx_support_pullback_elapsed = (
-                time.perf_counter() - root_ntx_support_pullback_start
-            )
-            root_geometry_pullback_start = time.perf_counter()
-            # The recorded database is fixed at this boundary.  Use its
-            # existing local-radius root transpose rather than forming a VJP
-            # of the full radial residual vector with a geometry payload.  It
-            # is the same one-radius construction used by the Lij compact
-            # boundary and avoids tracing the all-radii database evaluator.
-            runtime_scan = find_ntx_runtime_scan_model_in_model(runtime.models.flux)
-            if runtime_scan is None:
-                raise ValueError(
-                    "Recorded database initial-Er geometry pullback requires "
-                    "an NTX runtime scan model."
-                )
-            with_payload = getattr(runtime_scan, "with_support_payload", None)
-            if not callable(with_payload):
-                raise NotImplementedError(
-                    "Recorded database initial-Er geometry pullback requires "
-                    "a support-payload binding method."
-                )
-            database_model = with_payload(support_payload)
-            geometry_pullback_fn = getattr(
-                database_model,
-                "pullback_local_particle_flux_geometry_by_radius",
-                None,
-            )
-            if not callable(geometry_pullback_fn):
-                raise NotImplementedError(
-                    "Recorded database initial-Er geometry pullback requires "
-                    "the compact local particle-flux geometry transpose."
-                )
-            geometry_bars = geometry_pullback_fn(
-                pre_root_initial_state,
-                er_profile,
-                residual_bars,
-                support_payload["geometry"],
-            )
-            if phase_timing_diagnostics:
-                geometry_bars = jax.block_until_ready(geometry_bars)
-            root_geometry_pullback_elapsed = time.perf_counter() - root_geometry_pullback_start
-
-            def _batched_zero(tree):
-                return jax.tree_util.tree_map(
-                    lambda leaf: jnp.zeros(
-                        (residual_bars.shape[0],) + jnp.asarray(leaf).shape,
-                        dtype=(
-                            jnp.asarray(leaf).dtype
-                            if jnp.issubdtype(jnp.asarray(leaf).dtype, jnp.inexact)
-                            else jnp.float64
-                        ),
-                    ),
-                    tree,
-                )
-
-            batched_support_bars = {
-                "geometry": geometry_bars,
-                "channels": _batched_zero(support_payload["channels"]),
-                "surfaces": _batched_zero(support_payload["surfaces"]),
-                "database": database_bars,
-            }
-            initial_er_root_support_bars = tuple(
-                jax.tree_util.tree_leaves(batched_support_bars)
-            )
         elif combined_geometry_payload:
-            # Compatibility path for unrecorded scan payloads.
+            # A live NTX scan has no prepared exact-support compact rule.  Its
+            # complete differentiable support tree is small and explicit:
+            # geometry, scan channels, and scan surfaces.  Rebuild the scan
+            # runtime from that tree so the database cache remains internal.
             support_delta0 = _float_delta_tree_like(support_payload)
 
             def _residuals_from_support_delta(support_delta):
@@ -6192,8 +5836,8 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
                 return dependencies.initial_er_charge_flux_residuals(
                     pre_root_initial_state,
                     er_profile,
-                    runtime=runtime_with_support,
-                )
+                runtime=runtime_with_support,
+            )
 
             root_geometry_pullback_start = time.perf_counter()
             _, support_pullback = jax.vjp(
@@ -7354,12 +6998,6 @@ def internal_realtime_geometry_transport_reverse_table_result_builder(
                 active_runtime,
                 active_support_payload["ntx_support"],
             )
-        # Keep the heavy retained scan record outside all generic segment
-        # VJPs.  The database itself remains in the support payload, while
-        # the original runtime below is retained solely for the final one-time
-        # database-to-scan transpose.
-        recorded_scan_runtime = active_runtime
-        active_runtime = runtime_without_recorded_ntx_scan_primal(active_runtime)
         _report_table_builder_phase("prepare_runtime_payload")
         active_reverse_setup = prepare_reverse_static_setup(
             active_profile_values,
@@ -7480,11 +7118,10 @@ def internal_realtime_geometry_transport_reverse_table_result_builder(
                 if combined_geometry_payload
                 else ntx_support_payload
             )
-        elif str(realtime_geometry_payload_for_runtime(recorded_scan_runtime)["kind"]) == "ntx_scan_runtime":
+        elif str(realtime_geometry_payload_for_runtime(active_runtime)["kind"]) == "ntx_scan_runtime":
             # A live scan model owns no prepared exact-NTX support tree.  Its
             # differentiable inputs are geometry, channels and scan surfaces;
-            # the recorded route additionally exposes its already-built
-            # interpolation database as a table-only support leaf.
+            # the interpolated database is rebuilt by the model itself.
             if not combined_geometry_payload:
                 raise ValueError(
                     "ntx_scan_runtime reverse requires the combined realtime "
@@ -7492,7 +7129,7 @@ def internal_realtime_geometry_transport_reverse_table_result_builder(
                 )
             ntx_support_payload = None
             support_payload = realtime_geometry_reverse_support_payload_for_runtime(
-                recorded_scan_runtime
+                active_runtime
             )
         else:
             ntx_support_payload = find_ntx_support_payload(active_runtime)
@@ -7535,15 +7172,14 @@ def internal_realtime_geometry_transport_reverse_table_result_builder(
         # objective/segment VJPs.  Fold it once here, before the ordinary
         # VMEC payload transpose.  Legacy payloads have no database leaf and
         # are returned unchanged by the helper.
-        component_names = tuple(component_bars)
-        folded_groups = fold_recorded_ntx_scan_database_bar_groups_into_support(
-            recorded_scan_runtime,
-            (support_bars, *(component_bars[name] for name in component_names)),
+        support_bars = fold_recorded_ntx_scan_database_bars_into_support(
+            active_runtime, support_bars
         )
-        support_bars = folded_groups[0]
         component_bars = {
-            name: folded_groups[index + 1]
-            for index, name in enumerate(component_names)
+            name: fold_recorded_ntx_scan_database_bars_into_support(
+                active_runtime, values
+            )
+            for name, values in component_bars.items()
         }
         all_objective_values = jnp.asarray(support_result.objective_values)
         all_profile_gradient_matrix = jnp.asarray(support_result.profile_gradient_matrix)
