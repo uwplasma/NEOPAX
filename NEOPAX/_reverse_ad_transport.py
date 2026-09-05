@@ -33,7 +33,6 @@ from ._geometry_autodiff import (
 from ._orchestrator import prepare_transport_solver_components
 from ._profiles import AnalyticalProfileModel
 from ._reverse_ad_initial_er import (
-    fold_recorded_ntx_scan_database_bars_into_support,
     compact_initial_er_ntx_support_pullback_leaves,
     compact_initial_er_state_pullback,
     find_ntx_support_payload,
@@ -62,7 +61,6 @@ from ._transport_flux_models import (
     _float_delta_tree_like,
     _sanitize_float_delta_bar_tree,
 )
-from ._state import safe_density, safe_temperature
 from ._transport_solvers import (
     RADAUSolver,
     NewtonThetaMethodSolver,
@@ -852,15 +850,7 @@ def initial_state_for_parameter_vector(
     )
     density_state = jnp.asarray(profile_set.density, dtype=baseline_state.density.dtype) / 1.0e20
     temperature_state = jnp.asarray(profile_set.temperature, dtype=baseline_state.pressure.dtype) / 1.0e3
-    solver_cfg = {} if config is None else dict(config.get("transport_solver", {}))
-    fallback_solver_cfg = {} if config is None else dict(config.get("solver", {}))
-    density_floor = solver_cfg.get("density_floor", fallback_solver_cfg.get("density_floor", 1.0e-6))
-    temperature_floor = solver_cfg.get("temperature_floor", fallback_solver_cfg.get("temperature_floor"))
-    # Match _orchestrator._build_state exactly.  In particular, a species at
-    # zero configured concentration can still have a fixed, finite configured
-    # temperature when it participates in the initial ambipolar root.
-    temperature_state = safe_temperature(temperature_state, temperature_floor)
-    pressure_state = temperature_state * safe_density(density_state, density_floor)
+    pressure_state = density_state * temperature_state
     state = dataclasses.replace(
         baseline_state,
         density=density_state,
@@ -7107,40 +7097,23 @@ def internal_realtime_geometry_transport_reverse_table_result_builder(
             raise RuntimeError(
                 "reuse_static_probe was requested, but the internal table builder returned no schedule artifact."
             )
-        if active_support_payload is not None:
-            # A raw-block state supplies the established exact-Lij payload.
-            ntx_support_payload = active_support_payload["ntx_support"]
-            support_payload = (
-                {
-                    "geometry": active_support_payload["geometry"],
-                    "ntx_support": ntx_support_payload,
-                }
-                if combined_geometry_payload
-                else ntx_support_payload
-            )
-        elif str(realtime_geometry_payload_for_runtime(active_runtime)["kind"]) == "ntx_scan_runtime":
-            # A live scan model owns no prepared exact-NTX support tree.  Its
-            # differentiable inputs are geometry, channels and scan surfaces;
-            # the interpolated database is rebuilt by the model itself.
-            if not combined_geometry_payload:
-                raise ValueError(
-                    "ntx_scan_runtime reverse requires the combined realtime "
-                    "geometry payload."
-                )
-            ntx_support_payload = None
-            support_payload = realtime_geometry_reverse_support_payload_for_runtime(
-                active_runtime
-            )
-        else:
-            ntx_support_payload = find_ntx_support_payload(active_runtime)
-            support_payload = (
-                {
-                    "geometry": active_runtime.geometry,
-                    "ntx_support": ntx_support_payload,
-                }
-                if combined_geometry_payload
-                else ntx_support_payload
-            )
+        ntx_support_payload = (
+            active_support_payload["ntx_support"]
+            if active_support_payload is not None
+            else find_ntx_support_payload(active_runtime)
+        )
+        support_payload = (
+            {
+                "geometry": (
+                    active_support_payload["geometry"]
+                    if active_support_payload is not None
+                    else active_runtime.geometry
+                ),
+                "ntx_support": ntx_support_payload,
+            }
+            if combined_geometry_payload
+            else ntx_support_payload
+        )
         _report_table_builder_phase("prepare_support_payload")
         support_result = realtime_geometry_support_cotangents_from_parameter_vector(
             profile_values=active_profile_values,
@@ -7167,19 +7140,6 @@ def internal_realtime_geometry_transport_reverse_table_result_builder(
         component_bars = {
             name: tuple(values[i] for i in rows)
             for name, values in support_result.support_component_bars_by_name.items()
-        }
-        # The recorded scan route accumulates a database bar during all
-        # objective/segment VJPs.  Fold it once here, before the ordinary
-        # VMEC payload transpose.  Legacy payloads have no database leaf and
-        # are returned unchanged by the helper.
-        support_bars = fold_recorded_ntx_scan_database_bars_into_support(
-            active_runtime, support_bars
-        )
-        component_bars = {
-            name: fold_recorded_ntx_scan_database_bars_into_support(
-                active_runtime, values
-            )
-            for name, values in component_bars.items()
         }
         all_objective_values = jnp.asarray(support_result.objective_values)
         all_profile_gradient_matrix = jnp.asarray(support_result.profile_gradient_matrix)
