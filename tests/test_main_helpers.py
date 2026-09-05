@@ -2238,6 +2238,16 @@ def test_live_ntx_scan_explicit_database_support_does_not_rebuild(monkeypatch):
     assert result._database_model().database is database
     assert calls == {"count": 0}
 
+    # Segment and terminal database VJPs deliberately receive only their two
+    # differentiable leaves.  Channels/surfaces remain fixed model metadata
+    # until the single recorded scan transpose after the sweep.
+    reduced_result = model.with_support_payload(
+        {"geometry": "geometry", "database": database}
+    )
+    assert reduced_result.database is database
+    assert reduced_result._database_model().database is database
+    assert calls == {"count": 0}
+
 
 def test_recorded_ntx_database_bar_is_folded_once_into_scan_support(monkeypatch):
     calls = {"count": 0}

@@ -4889,14 +4889,26 @@ class NTXRuntimeScanTransportModel(TransportFluxModelBase):
 
         if not isinstance(support_payload, dict):
             raise TypeError("Live NTX scan support payload must be a mapping.")
-        required = ("geometry", "channels", "surfaces")
+        # The recorded database reverse boundary intentionally exposes only
+        # geometry and the already-built tables to segment/terminal VJPs.
+        # Reuse this model's fixed scan inputs in that case; they are not
+        # differentiable leaves and the explicit database prevents a scan
+        # rebuild.  The ordinary live-scan payload remains unchanged.
+        recorded_database_payload = "database" in support_payload
+        required = ("geometry",) if recorded_database_payload else ("geometry", "channels", "surfaces")
         missing = tuple(name for name in required if name not in support_payload)
         if missing:
             raise ValueError(f"Live NTX scan support payload is missing {missing!r}.")
+        channels = support_payload.get("channels", self.channels)
+        scan_surfaces = support_payload.get("surfaces", self.scan_surfaces)
+        if channels is None or scan_surfaces is None:
+            raise ValueError(
+                "Recorded database support requires fixed runtime scan channels and surfaces."
+            )
         model = self.with_runtime_scan_payload(
             geometry=support_payload["geometry"],
-            channels=support_payload["channels"],
-            scan_surfaces=support_payload["surfaces"],
+            channels=channels,
+            scan_surfaces=scan_surfaces,
             database=support_payload.get("database"),
         )
         # Recorded reverse passes an explicit database leaf.  Its derivative
