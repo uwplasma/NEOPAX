@@ -675,6 +675,35 @@ def test_database_local_bootstrap_state_pullback_matches_full_upar_jvp(
     ):
         assert jnp.allclose(actual, expected, rtol=2.0e-10, atol=2.0e-10)
 
+    # The database selected-root geometry rule is likewise the local
+    # restriction of the complete residual VJP.  This is the production
+    # reverse boundary used instead of tracing that full radial VJP.
+    def _root_residuals_from_geometry(geometry_value):
+        geometry_model = dataclasses.replace(model, geometry=geometry_value)
+        runtime = SimpleNamespace(
+            species=species, models=SimpleNamespace(flux=geometry_model)
+        )
+        return initial_er_module.initial_er_charge_flux_residuals(
+            state, state.Er, runtime=runtime
+        )
+
+    _, generic_root_geometry_pullback = jax.vjp(
+        _root_residuals_from_geometry, geometry
+    )
+    expected_root_geometry_bars = jax.vmap(generic_root_geometry_pullback)(
+        root_residual_bars
+    )
+    actual_root_geometry_bars = model.pullback_local_particle_flux_geometry_by_radius(
+        state, state.Er, root_residual_bars, geometry
+    )
+    for actual, expected in zip(
+        jax.tree_util.tree_leaves(actual_root_geometry_bars),
+        jax.tree_util.tree_leaves(expected_root_geometry_bars),
+        strict=True,
+    ):
+        if jnp.issubdtype(jnp.asarray(expected).dtype, jnp.inexact):
+            assert jnp.allclose(actual, expected, rtol=2.0e-10, atol=2.0e-10)
+
     # The direct black-box database RHS must retain its generic derivative
     # exactly while using the split state-transpose implementation.
     direct_flux_bar = {
