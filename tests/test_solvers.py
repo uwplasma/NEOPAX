@@ -1157,6 +1157,7 @@ def test_radau_floating_edge_node_uses_private_augmented_coordinate():
         rtol=1.0e-6,
         atol=1.0e-8,
         rhs_mode="lagged_transport_response",
+        error_estimator="embedded2_ntss_transport_scale",
         maxiter=8,
         max_steps=32,
     )

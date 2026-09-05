@@ -475,7 +475,11 @@ def _project_packed_transport_state_arrays(
     else:
         full_density = packed_density
 
-    floored_density = safe_density(full_density, density_floor)
+    floored_density = (
+        safe_density(full_density)
+        if density_floor is None
+        else safe_density(full_density, density_floor)
+    )
     projected_pressure = pressure
     if temperature_active_mask is not None and fixed_temperature_profile is not None:
         active_mask = jnp.asarray(temperature_active_mask, dtype=bool)
@@ -21529,6 +21533,12 @@ class RADAUSolver(_RadauSolverConfig):
             unpack_flat = _node_unpack_flat
             project_flat = _node_project_flat
             state_dim = flat_state0.shape[0]
+            # The private node has the units and tolerance semantics of Er.
+            # Keep it in the solver's Er block so the transport-aware endpoint
+            # scale and stage predictor continue to cover all coordinates;
+            # this is solver-local bookkeeping only, not a fourth public
+            # TransportState field.
+            er_size += 1
             # This is a correctness fallback for diagnostics/rare direct-RHS
             # paths.  Production lagged stages use the cached branch below;
             # they do not rebuild here.
