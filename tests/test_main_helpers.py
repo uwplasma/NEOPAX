@@ -611,6 +611,80 @@ def test_face_quadratic_coefficient_cubic_interpolation_rebases_before_radial_in
     assert jnp.allclose(interpolated.dcoefficients_d_nu_hat[..., 0], 3.0 + 7.0 * u_center + 11.0 * e_center)
     assert jnp.allclose(interpolated.dcoefficients_d_epsi_hat[..., 0], -5.0 + 11.0 * u_center + 13.0 * e_center)
 
+
+def test_face_quadratic_coefficient_interpolation_uses_common_er_over_v_coordinate():
+    """Face Taylor models must be translated at one physical ``Er / v``.
+
+    The NTX electric coordinate is ``epsi_hat = drds * Er / v``.  A raw
+    centre-epsi query therefore represents different physical electric fields
+    at the two faces whenever ``drds`` varies radially.  This test uses a
+    polynomial in ``(nu / v, Er / v)`` and verifies both the reparameterized
+    value and all electric-coordinate chain-rule derivatives.
+    """
+
+    geometry = types.SimpleNamespace(
+        a_b=1.0,
+        r_grid=jnp.asarray([0.25, 0.75]),
+        r_grid_half=jnp.asarray([0.0, 0.5, 1.0]),
+    )
+    model = NTXExactLijRuntimeTransportModel(
+        species=types.SimpleNamespace(number_species=1),
+        energy_grid=object(),
+        geometry=geometry,
+        vmec_file=None,
+        boozer_file=None,
+    )
+    face_drds = jnp.asarray([2.0, 3.0, 4.0])
+    center_drds = jnp.asarray([2.5, 3.5])
+    u_face = jnp.asarray([[[1.0]], [[2.0]], [[3.0]]])
+    eta_face = jnp.asarray([[[0.5]], [[1.5]], [[2.5]]])
+    e_face = eta_face * face_drds[:, None, None]
+    # C = 2 + 3u - 5 eta + 7/2 u^2 + 11 u eta + 13/2 eta^2.
+    coefficient = lambda u, eta: 2.0 + 3.0 * u - 5.0 * eta + 3.5 * u**2 + 11.0 * u * eta + 6.5 * eta**2
+    d_u = 3.0 + 7.0 * u_face + 11.0 * eta_face
+    d_eta = -5.0 + 11.0 * u_face + 13.0 * eta_face
+    response = NTXQuadraticPreparedCoefficientResponse(
+        reference_nu_hat=u_face,
+        reference_epsi_hat=e_face,
+        reference_coefficients=coefficient(u_face, eta_face)[..., None],
+        dcoefficients_d_nu_hat=d_u[..., None],
+        dcoefficients_d_epsi_hat=(d_eta / face_drds[:, None, None])[..., None],
+        d2coefficients_d_nu_hat2=jnp.full((3, 1, 1, 1), 7.0),
+        d2coefficients_d_nu_hat_d_epsi_hat=(11.0 / face_drds[:, None, None])[..., None],
+        d2coefficients_d_epsi_hat2=(13.0 / face_drds[:, None, None] ** 2)[..., None],
+    )
+    u_center = jnp.asarray([[[1.5]], [[2.5]]])
+    eta_center = jnp.asarray([[[1.0]], [[2.0]]])
+    e_center = eta_center * center_drds[:, None, None]
+    interpolated = model._interpolate_face_quadratic_coefficients_to_centres(
+        response,
+        center_reference_nu_hat=u_center,
+        center_reference_epsi_hat=e_center,
+        coordinate_mode="physical_er_over_v",
+        center_drds=center_drds,
+        face_drds=face_drds,
+    )
+    assert jnp.allclose(
+        interpolated.reference_coefficients[..., 0], coefficient(u_center, eta_center)
+    )
+    assert jnp.allclose(
+        interpolated.dcoefficients_d_nu_hat[..., 0],
+        3.0 + 7.0 * u_center + 11.0 * eta_center,
+    )
+    assert jnp.allclose(
+        interpolated.dcoefficients_d_epsi_hat[..., 0],
+        (-5.0 + 11.0 * u_center + 13.0 * eta_center) / center_drds[:, None, None],
+    )
+    assert jnp.allclose(interpolated.d2coefficients_d_nu_hat2, 7.0)
+    assert jnp.allclose(
+        interpolated.d2coefficients_d_nu_hat_d_epsi_hat,
+        11.0 / center_drds[:, None, None, None],
+    )
+    assert jnp.allclose(
+        interpolated.d2coefficients_d_epsi_hat2,
+        13.0 / center_drds[:, None, None, None] ** 2,
+    )
+
 def test_ntx_exact_fused_lowdot_local_pullback_matches_ntx_helper():
     """The opt-in fused local NTX path must preserve the scalar local bars."""
     energy_grid = types.SimpleNamespace(

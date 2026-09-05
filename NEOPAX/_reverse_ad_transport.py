@@ -34,7 +34,7 @@ from ._orchestrator import prepare_transport_solver_components
 from ._profiles import AnalyticalProfileModel
 from ._reverse_ad_initial_er import (
     compact_initial_er_database_support_bars,
-    fold_recorded_ntx_scan_database_bars_into_support,
+    fold_recorded_ntx_scan_database_bar_groups_into_support,
     compact_initial_er_ntx_support_pullback_leaves,
     compact_initial_er_state_pullback,
     find_ntx_support_payload,
@@ -7481,14 +7481,15 @@ def internal_realtime_geometry_transport_reverse_table_result_builder(
         # objective/segment VJPs.  Fold it once here, before the ordinary
         # VMEC payload transpose.  Legacy payloads have no database leaf and
         # are returned unchanged by the helper.
-        support_bars = fold_recorded_ntx_scan_database_bars_into_support(
-            recorded_scan_runtime, support_bars
+        component_names = tuple(component_bars)
+        folded_groups = fold_recorded_ntx_scan_database_bar_groups_into_support(
+            recorded_scan_runtime,
+            (support_bars, *(component_bars[name] for name in component_names)),
         )
+        support_bars = folded_groups[0]
         component_bars = {
-            name: fold_recorded_ntx_scan_database_bars_into_support(
-                recorded_scan_runtime, values
-            )
-            for name, values in component_bars.items()
+            name: folded_groups[index + 1]
+            for index, name in enumerate(component_names)
         }
         all_objective_values = jnp.asarray(support_result.objective_values)
         all_profile_gradient_matrix = jnp.asarray(support_result.profile_gradient_matrix)

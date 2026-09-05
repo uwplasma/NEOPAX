@@ -5311,6 +5311,9 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             "interpolate_face_coefficients_cubic": "interpolate_face_coefficients_cubic",
             "interpolate_face_coefficients_four_point": "interpolate_face_coefficients_cubic",
             "face_coefficient_cubic": "interpolate_face_coefficients_cubic",
+            "interpolate_face_coefficients_physical_coordinates": "interpolate_face_coefficients_physical_coordinates",
+            "interpolate_face_coefficients_er_over_v": "interpolate_face_coefficients_physical_coordinates",
+            "face_coefficient_physical_coordinates": "interpolate_face_coefficients_physical_coordinates",
             "interpolate_face_coefficients_native_distance": "interpolate_face_coefficients_native_distance",
             "face_coefficient_native_distance": "interpolate_face_coefficients_native_distance",
         }
@@ -5320,6 +5323,7 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             "center_local_response",
             "interpolate_face_coefficients",
             "interpolate_face_coefficients_cubic",
+            "interpolate_face_coefficients_physical_coordinates",
             "interpolate_face_coefficients_native_distance",
         }:
             raise ValueError(
@@ -5327,6 +5331,7 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                 "interpolate_from_faces, center_local_response, "
                 "interpolate_face_coefficients, "
                 "interpolate_face_coefficients_cubic, "
+                "interpolate_face_coefficients_physical_coordinates, "
                 "interpolate_face_coefficients_native_distance"
             )
         return mode
@@ -5380,6 +5385,9 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         center_reference_nu_hat,
         center_reference_epsi_hat,
         weight_mode: str = "radial",
+        coordinate_mode: str = "native",
+        center_drds=None,
+        face_drds=None,
         weight_hi_override=None,
     ) -> NTXQuadraticPreparedCoefficientResponse:
         """Interpolate face NTX Taylor polynomials to cell centres.
@@ -5393,6 +5401,15 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         reconstruction improves a root layer without additional NTX solves.
         ``weight_mode='native_distance'`` instead weights the two adjacent
         responses by their native ``(nu_hat, epsi_hat)`` distance.
+
+        ``coordinate_mode='physical_er_over_v'`` keeps the radial
+        interpolation query fixed in physical ``(nu/v, Er/v)`` coordinates.
+        NTX stores the electric coordinate as ``epsi_hat=drds*Er/v``; hence a
+        centre ``epsi_hat`` must be rescaled separately for each face before
+        evaluating that face polynomial.  The returned Taylor derivatives are
+        transformed back to the centre ``epsi_hat`` by the matching chain
+        rule.  This is the realtime analogue of the database's common-query
+        coordinate interpolation.
         """
 
         face_rho = jnp.asarray(self.geometry.r_grid_half, dtype=jnp.float64) / jnp.asarray(
@@ -5407,6 +5424,10 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         if weight_mode not in {"radial", "radial_cubic", "native_distance"}:
             raise ValueError(
                 "weight_mode must be 'radial', 'radial_cubic', or 'native_distance'."
+            )
+        if coordinate_mode not in {"native", "physical_er_over_v"}:
+            raise ValueError(
+                "coordinate_mode must be 'native' or 'physical_er_over_v'."
             )
         u_center_native = jnp.asarray(center_reference_nu_hat)
         e_center_native = jnp.asarray(center_reference_epsi_hat)
@@ -5470,18 +5491,47 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         e_center = e_center_native[:, None, ..., None]
         u_face = face_response.reference_nu_hat[face_indices][..., None]
         e_face = face_response.reference_epsi_hat[face_indices][..., None]
+        if coordinate_mode == "physical_er_over_v":
+            if center_drds is None or face_drds is None:
+                raise ValueError(
+                    "physical_er_over_v interpolation requires centre and face drds."
+                )
+            center_drds = jnp.asarray(center_drds, dtype=center_rho.dtype)
+            face_drds = jnp.asarray(face_drds, dtype=face_rho.dtype)
+            centre_scale = center_drds[:, None]
+            face_scale = face_drds[face_indices]
+            finite_scale = (
+                jnp.isfinite(centre_scale)
+                & jnp.isfinite(face_scale)
+                & (jnp.abs(centre_scale) > 1.0e-30)
+            )
+            epsi_scale = jnp.where(finite_scale, face_scale / centre_scale, 1.0)
+            epsi_scale = epsi_scale[..., None, None, None]
+            e_center = e_center * epsi_scale
+        else:
+            epsi_scale = jnp.ones(
+                face_indices.shape + (1, 1, 1), dtype=center_rho.dtype
+            )
 
         def _translate(c0, cu, ce, cuu, cue, cee):
             du = u_center - u_face
             de = e_center - e_face
-            return (
+            translated_c0 = (
                 c0 + cu * du + ce * de
-                + 0.5 * cuu * du * du + cue * du * de + 0.5 * cee * de * de,
-                cu + cuu * du + cue * de,
-                ce + cue * du + cee * de,
+                + 0.5 * cuu * du * du + cue * du * de + 0.5 * cee * de * de
+            )
+            translated_cu = cu + cuu * du + cue * de
+            translated_ce_face = ce + cue * du + cee * de
+            # The face expansion is in epsi_face = scale * epsi_center.
+            # Convert all electric-coordinate derivatives back to the centre
+            # coordinate before the radial blend.
+            return (
+                translated_c0,
+                translated_cu,
+                translated_ce_face * epsi_scale,
                 cuu,
-                cue,
-                cee,
+                cue * epsi_scale,
+                cee * epsi_scale * epsi_scale,
             )
 
         face_fields = (
@@ -12360,6 +12410,7 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         interpolate_face_coefficients = center_response_mode in {
             "interpolate_face_coefficients",
             "interpolate_face_coefficients_cubic",
+            "interpolate_face_coefficients_physical_coordinates",
             "interpolate_face_coefficients_native_distance",
         }
         coefficient_weight_mode = (
@@ -12370,6 +12421,11 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                 if center_response_mode == "interpolate_face_coefficients_cubic"
                 else "radial"
             )
+        )
+        coefficient_coordinate_mode = (
+            "physical_er_over_v"
+            if center_response_mode == "interpolate_face_coefficients_physical_coordinates"
+            else "native"
         )
         if interpolate_face_coefficients and not self.full_state_quadratic_response:
             raise NotImplementedError(
@@ -12432,6 +12488,9 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                     center_reference_nu_hat=center_reference_nu_hat,
                     center_reference_epsi_hat=center_reference_epsi_hat,
                     weight_mode=coefficient_weight_mode,
+                    coordinate_mode=coefficient_coordinate_mode,
+                    center_drds=support.center_channels.drds,
+                    face_drds=support.face_channels.drds,
                 ),
             )
             if self.debug_center_lij_comparison:
@@ -12470,6 +12529,9 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                         center_reference_nu_hat=center_reference_nu_hat,
                         center_reference_epsi_hat=center_reference_epsi_hat,
                         weight_hi_override=jnp.zeros_like(center_reference_nu_hat[:, 0, 0]),
+                        coordinate_mode=coefficient_coordinate_mode,
+                        center_drds=support.center_channels.drds,
+                        face_drds=support.face_channels.drds,
                     ),
                 )
                 center_hi_response = NTXFullStateQuadraticPreparedCoefficientResponse(
@@ -12479,6 +12541,9 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                         center_reference_nu_hat=center_reference_nu_hat,
                         center_reference_epsi_hat=center_reference_epsi_hat,
                         weight_hi_override=jnp.ones_like(center_reference_nu_hat[:, 0, 0]),
+                        coordinate_mode=coefficient_coordinate_mode,
+                        center_drds=support.center_channels.drds,
+                        face_drds=support.face_channels.drds,
                     ),
                 )
                 lij_from_lo = self._lij_from_quadratic_response_at_reference(
@@ -12504,6 +12569,18 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                 nu_hi = face_response.coefficient_response.reference_nu_hat[face_hi, species]
                 epsi_lo = face_response.coefficient_response.reference_epsi_hat[face_lo, species]
                 epsi_hi = face_response.coefficient_response.reference_epsi_hat[face_hi, species]
+                if coefficient_coordinate_mode == "physical_er_over_v":
+                    epsi_query_lo = epsi_center * (
+                        support.face_channels.drds[face_lo]
+                        / support.center_channels.drds[radius]
+                    )
+                    epsi_query_hi = epsi_center * (
+                        support.face_channels.drds[face_hi]
+                        / support.center_channels.drds[radius]
+                    )
+                else:
+                    epsi_query_lo = epsi_center
+                    epsi_query_hi = epsi_center
                 native_nu_scale = jnp.maximum(jnp.abs(nu_hi - nu_lo), 1.0e-30)
                 native_epsi_scale = jnp.maximum(jnp.abs(epsi_hi - epsi_lo), 1.0e-30)
                 native_distance_lo2 = (
@@ -12555,7 +12632,13 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                     du = (nu_center - face_response.coefficient_response.reference_nu_hat[
                         face_index, species
                     ])[:, None]
-                    de = (epsi_center - face_response.coefficient_response.reference_epsi_hat[
+                    target_epsi = epsi_center
+                    if coefficient_coordinate_mode == "physical_er_over_v":
+                        target_epsi = target_epsi * (
+                            support.face_channels.drds[face_index]
+                            / support.center_channels.drds[radius]
+                        )
+                    de = (target_epsi - face_response.coefficient_response.reference_epsi_hat[
                         face_index, species
                     ])[:, None]
                     return c0 + cu * du + ce * de + 0.5 * cuu * du * du + cue * du * de + 0.5 * cee * de * de
@@ -12605,13 +12688,13 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                     max_hi=jnp.max(native_weight_hi),
                 )
                 jax.debug.print(
-                    "[NEOPAX] centre-Lij face-coefficient native displacement: "
+                    "[NEOPAX] centre-Lij face-coefficient Taylor displacement: "
                     "max_abs_dnu_lo={dnu_lo:.6e} max_abs_dnu_hi={dnu_hi:.6e} "
                     "max_abs_depsi_lo={depsi_lo:.6e} max_abs_depsi_hi={depsi_hi:.6e}",
                     dnu_lo=jnp.max(jnp.abs(nu_center - nu_lo)),
                     dnu_hi=jnp.max(jnp.abs(nu_center - nu_hi)),
-                    depsi_lo=jnp.max(jnp.abs(epsi_center - epsi_lo)),
-                    depsi_hi=jnp.max(jnp.abs(epsi_center - epsi_hi)),
+                    depsi_lo=jnp.max(jnp.abs(epsi_query_lo - epsi_lo)),
+                    depsi_hi=jnp.max(jnp.abs(epsi_query_hi - epsi_hi)),
                 )
                 jax.debug.print(
                     "[NEOPAX] centre-Lij translated one-sided values: "
@@ -16096,6 +16179,7 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             "center_local_response",
             "interpolate_face_coefficients",
             "interpolate_face_coefficients_cubic",
+            "interpolate_face_coefficients_physical_coordinates",
             "interpolate_face_coefficients_native_distance",
         }:
             # Direct-centre mode owns two cached models: centres for local
@@ -16151,6 +16235,7 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                 "center_local_response",
                 "interpolate_face_coefficients",
                 "interpolate_face_coefficients_cubic",
+                "interpolate_face_coefficients_physical_coordinates",
                 "interpolate_face_coefficients_native_distance",
             }:
                 centre_fluxes = self._evaluate_full_state_quadratic_center_response(

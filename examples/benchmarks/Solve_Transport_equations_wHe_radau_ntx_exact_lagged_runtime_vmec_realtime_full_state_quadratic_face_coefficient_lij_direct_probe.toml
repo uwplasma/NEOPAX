@@ -1,5 +1,6 @@
-# One-build diagnostic for native-state-weighted face-coefficient centre
-# interpolation. It prints the largest difference against direct-centre Lij.
+# One-build diagnostic for face-coefficient centre interpolation evaluated in
+# common physical (nu / v, Er / v) coordinates. It prints the largest
+# difference against direct-centre Lij.
 
 [general]
 mode = "transport"
@@ -16,7 +17,7 @@ ntx_exact_n_theta = 5
 ntx_exact_n_zeta = 25
 ntx_exact_n_xi = 31
 ntx_exact_surface_backend = "vmec"
-ntx_exact_center_response_mode = "interpolate_face_coefficients_cubic"
+ntx_exact_center_response_mode = "interpolate_face_coefficients_physical_coordinates"
 ntx_exact_response_anchor_count = 52
 lagged_response_taylor_order = 2
 ntx_exact_full_state_quadratic_response = true

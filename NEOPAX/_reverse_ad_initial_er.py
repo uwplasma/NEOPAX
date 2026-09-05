@@ -435,6 +435,62 @@ def fold_recorded_ntx_scan_database_bars_into_support(runtime, support_bars):
     return tuple(folded)
 
 
+def fold_recorded_ntx_scan_database_bar_groups_into_support(runtime, bar_groups):
+    """Fold every report-row database bar through one retained scan transpose.
+
+    ``support_bars`` and the named component bars describe the same transport
+    reverse but used to call the retained scan VJP once per report group.  The
+    database is fixed throughout all of those groups, so concatenate their
+    objective rows and execute one batched scan transpose, then restore the
+    original grouping.  This is reporting-only bookkeeping: it changes no
+    cotangent, objective, or Lij path.
+    """
+    groups = tuple(tuple(group) for group in bar_groups)
+    indexed_bars = tuple(
+        (group_index, row_index, bar)
+        for group_index, group in enumerate(groups)
+        for row_index, bar in enumerate(group)
+        if isinstance(bar, dict) and "database" in bar
+    )
+    if not indexed_bars:
+        return groups
+    if any(
+        not isinstance(bar, dict) or "database" not in bar
+        for group in groups
+        for bar in group
+    ):
+        raise ValueError(
+            "Recorded database support-bar groups must consistently carry a database leaf."
+        )
+    runtime_scan = find_ntx_runtime_scan_model_in_model(runtime.models.flux)
+    if runtime_scan is None:
+        raise ValueError("Recorded database support bars require an NTX runtime scan model.")
+
+    database_bars = jax.tree_util.tree_map(
+        lambda *values: jnp.stack(values),
+        *(bar["database"] for _group_index, _row_index, bar in indexed_bars),
+    )
+    database_support_bars = jax.vmap(
+        runtime_scan.recorded_runtime_database_support_bar,
+    )(database_bars)
+
+    rebuilt = [list(group) for group in groups]
+    for batch_index, (group_index, row_index, support_bar) in enumerate(indexed_bars):
+        database_support_bar = jax.tree_util.tree_map(
+            lambda value: value[batch_index], database_support_bars
+        )
+        merged = dict(support_bar)
+        merged.pop("database")
+        for key in ("channels", "surfaces"):
+            if key not in merged:
+                raise ValueError(
+                    f"Recorded database support bar is missing direct {key!r} support."
+                )
+            merged[key] = _add_float_delta_tree(merged[key], database_support_bar[key])
+        rebuilt[group_index][row_index] = merged
+    return tuple(tuple(group) for group in rebuilt)
+
+
 def _replace_database_payload_in_model(model, database):
     if model is None or not dataclasses.is_dataclass(model) or isinstance(model, type):
         return model, False
