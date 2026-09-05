@@ -3616,7 +3616,11 @@ class NTXDatabaseTransportModel(TransportFluxModelBase):
                 "with shape (objective_count, radial_count)."
             )
         state_with_er = dataclasses.replace(state, Er=er_profile)
-        charge = jnp.asarray(self.species.charge, dtype=state.Er.dtype)
+        # ``initial_er_charge_flux_residuals`` contracts Gamma with the
+        # dimensionless species charges (``charge_qp``), not the physical
+        # Coulomb-valued ``charge`` used inside thermodynamic forces.  The
+        # local geometry transpose must use that same residual weight.
+        charge = jnp.asarray(self.species.charge_qp, dtype=state.Er.dtype)
         radius_indices = jnp.arange(er_profile.shape[0], dtype=jnp.int32)
         geometry_delta0 = _float_delta_tree_like(geometry)
         delta_leaves, delta_treedef = jax.tree_util.tree_flatten(geometry_delta0)
