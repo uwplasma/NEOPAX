@@ -943,6 +943,11 @@ def build_face_transport_state(
         bc_model=bc_er,
         reconstruction=reconstruction,
     )
+    # The floating-edge-node mode owns a distinct physical outer-face value.
+    # It replaces no interior reconstructed face.
+    er_edge = getattr(state, "Er_edge", None)
+    if er_edge is not None:
+        er_faces = er_faces.at[-1].set(jnp.asarray(er_edge, dtype=er_faces.dtype))
     return FaceTransportState(
         density=density_faces,
         pressure=pressure_faces,

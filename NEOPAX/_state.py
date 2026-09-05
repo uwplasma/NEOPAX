@@ -79,6 +79,9 @@ class TransportState:
     density: Float[Array, "..."]
     pressure: Float[Array, "..."]
     Er: Float[Array, "..."]
+    # Present only for the NTSS-like floating-edge-node boundary mode.
+    # Ordinary cell-centred transport states retain the original three leaves.
+    Er_edge: Float[Array, "..."] | None = None
 
     @property
     def temperature(self):

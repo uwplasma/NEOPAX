@@ -192,6 +192,43 @@ def test_floating_er_edge_prefers_native_face_flux_over_center_reconstruction():
     assert jnp.allclose(rhs[-1], -95780.0 * 8.0e-20)
 
 
+def test_floating_er_edge_node_keeps_last_cell_diffusion_and_evolves_face_node():
+    """The NTSS-like mode must not replace the last FV-cell equation."""
+    state = TransportState(
+        density=jnp.ones((1, 2)),
+        pressure=jnp.ones((1, 2)),
+        Er=jnp.asarray([1.0, 2.0]),
+        Er_edge=jnp.asarray(5.0),
+    )
+    equation = ElectricFieldEquation(
+        dr_cells=jnp.ones(2),
+        Vprime=jnp.ones(2),
+        Vprime_half=jnp.ones(3),
+        flux_model=None,
+        species_mass=jnp.ones(1),
+        charge_qp=jnp.ones(1),
+        permitivity_prefactor=jnp.ones(2),
+        gamma_faces_builder=lambda gamma: jnp.zeros((1, gamma.shape[1] + 1)),
+        # A nonzero outer diffusive face makes a replacement of rhs[-1]
+        # immediately detectable: conservative_update gives [-0, -3].
+        er_diffusive_flux_builder=lambda er, er_edge: jnp.asarray([0.0, 0.0, 3.0]),
+        source_mode="ambipolar_local",
+        permitivity_mode="ntss_like_midpoint",
+        boundary_mode="floating_ambipolar_edge_node",
+        ntss_B0_mid=1.0,
+        ntss_psfactor_mid=1.0,
+        ntss_density_indices=jnp.asarray([0]),
+    )
+    fluxes = {
+        "Gamma": jnp.zeros((1, 2)),
+        "Gamma_faces": jnp.asarray([[0.0, 0.0, 8.0]]),
+    }
+    rhs = equation(state, fluxes=fluxes)
+
+    assert jnp.allclose(rhs, jnp.asarray([0.0, -3.0]))
+    assert jnp.allclose(equation.edge_rhs(state, fluxes=fluxes), -95780.0 * 8.0e-20)
+
+
 def test_face_completed_work_term_cell_centres_completed_face_product():
     """Work interpolation must average ``q Gamma_face Er_face`` as one scalar."""
 

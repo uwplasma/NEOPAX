@@ -965,13 +965,19 @@ class ElectricFieldEquation(EquationBase):
         Gamma_faces = self.gamma_faces_builder(Gamma)
         return jnp.sum(self.charge_qp[:, None] * Gamma_faces, axis=0)
 
-    def _er_diffusion(self, Er):
+    def _er_diffusion(self, Er, Er_edge=None):
         # When DEr == 0 we want a true pure-ambipolar RHS, not 0 * NaN.
         if float(self.DEr) == 0.0:
             er_diffusive_flux = jnp.zeros(Er.shape[0] + 1, dtype=Er.dtype)
             er_diffusion = jnp.zeros_like(Er)
         else:
-            er_diffusive_flux = self.er_diffusive_flux_builder(Er)
+            # Keep hand-written/test builders with the historical one-argument
+            # signature working for ordinary centre-only states.
+            er_diffusive_flux = (
+                self.er_diffusive_flux_builder(Er)
+                if Er_edge is None
+                else self.er_diffusive_flux_builder(Er, Er_edge)
+            )
             er_diffusion = conservative_update(
                 er_diffusive_flux, self.dr_cells, self.Vprime, self.Vprime_half
             )
@@ -1109,7 +1115,7 @@ class ElectricFieldEquation(EquationBase):
         ambi_term_edge = self._outer_face_ambi_term(
             state, Gamma, plasma_permitivity, Gamma_faces
         )
-        er_diffusive_flux, er_diffusion = self._er_diffusion(Er)
+        er_diffusive_flux, er_diffusion = self._er_diffusion(Er, getattr(state, "Er_edge", None))
         ambipolar_rhs = -self.Er_relax * ambi_term
         diffusion_rhs = self.Er_relax * self.DEr * er_diffusion
         return {
@@ -1144,7 +1150,7 @@ class ElectricFieldEquation(EquationBase):
         _, ambi_term = self._charge_flux_and_ambi_term(
             state, Gamma, plasma_permitivity, Gamma_faces
         )
-        _, Er_diffusion = self._er_diffusion(Er)
+        _, Er_diffusion = self._er_diffusion(Er, getattr(state, "Er_edge", None))
         SourceEr = self.Er_relax * (self.DEr * Er_diffusion - ambi_term)
         if self.boundary_mode == "floating_ambipolar_edge":
             SourceEr = SourceEr.at[-1].set(
@@ -1154,6 +1160,21 @@ class ElectricFieldEquation(EquationBase):
             )
         SourceEr = self.enforce_dirichlet_boundary_rhs(state, SourceEr)
         return SourceEr
+
+    def edge_rhs(self, state, fluxes=None):
+        """Ambipolar relaxation for the separate physical outer-face node."""
+        if self.boundary_mode != "floating_ambipolar_edge_node":
+            return None
+        if fluxes is None:
+            fluxes = self.flux_model(state)
+        plasma_permitivity = _plasma_permitivity_from_prefactor(
+            state, self.species_mass, self.permitivity_prefactor
+        )
+        Gamma = _get_center_flux(fluxes, "Gamma")
+        Gamma_faces = fluxes["Gamma_faces"] if _flux_has_key(fluxes, "Gamma_faces") else None
+        return -self.Er_relax * self._outer_face_ambi_term(
+            state, Gamma, plasma_permitivity, Gamma_faces
+        )
 
     def enforce_dirichlet_boundary_rhs(self, state, er_rhs):
         del state
@@ -1274,7 +1295,7 @@ def build_electric_field_equation(
             )(Gamma)
     # Pre-build the diffusive Er face-flux builder for BC handling.
     if bc_er is not None and hasattr(bc_er, "right_type"):
-        def er_diffusive_flux_builder(er_profile):
+        def er_diffusive_flux_builder(er_profile, er_edge=None):
             lv_er, lg_er = left_constraints_from_bc_model(
                 bc_er,
                 er_profile[0],
@@ -1287,7 +1308,15 @@ def build_electric_field_equation(
                 profile=er_profile,
                 face_centers=field.r_grid_half,
             )
-            if rv_er is not None:
+            if er_edge is not None:
+                er_cell_var = make_profile_cell_variable(
+                    er_profile,
+                    field.r_grid_half,
+                    left_face_constraint=None if lv_er is None else jnp.asarray(lv_er).reshape(-1)[0],
+                    left_face_grad_constraint=None if lg_er is None else jnp.asarray(lg_er).reshape(-1)[0],
+                    right_face_constraint=jnp.asarray(er_edge).reshape(-1)[0],
+                )
+            elif rv_er is not None:
                 er_cell_var = make_profile_cell_variable(
                     er_profile,
                     field.r_grid_half,
@@ -1305,20 +1334,25 @@ def build_electric_field_equation(
                 )
             return -er_cell_var.face_grad()
     elif bc_er is not None and hasattr(bc_er, "apply_ghost"):
-        def er_diffusive_flux_builder(er_profile):
+        def er_diffusive_flux_builder(er_profile, er_edge=None):
             er_ghost = bc_er.apply_ghost(er_profile)
-            return -jnp.diff(er_ghost) / jnp.diff(field.r_grid_half)
+            flux = -jnp.diff(er_ghost) / jnp.diff(field.r_grid_half)
+            if er_edge is None:
+                return flux
+            return flux.at[-1].set(
+                -(jnp.asarray(er_edge) - er_profile[-1])
+                / (field.r_grid_half[-1] - field.r_grid_half[-2])
+            )
     else:
-        def er_diffusive_flux_builder(er_profile):
+        def er_diffusive_flux_builder(er_profile, er_edge=None):
             er_cell_var = make_profile_cell_variable(
                 er_profile,
                 field.r_grid_half,
                 left_face_grad_constraint=jnp.asarray(0.0, dtype=er_profile.dtype),
-                right_face_constraint=(
+                right_face_constraint=(jnp.asarray(er_edge).reshape(-1)[0] if er_edge is not None else (
                     1.5 * er_profile[-1] - 0.5 * er_profile[-2]
-                    if er_profile.shape[0] >= 2
-                    else er_profile[-1]
-                ),
+                    if er_profile.shape[0] >= 2 else er_profile[-1]
+                )),
             )
             return -er_cell_var.face_grad()
     def face_state_builder(state):
@@ -1358,7 +1392,7 @@ def _resolve_er_boundary_mode(config, solver_cfg):
     er_right_cfg = config.get("boundary", {}).get("Er", {}).get("right", {})
     if isinstance(er_right_cfg, dict):
         right_type = er_right_cfg.get("type")
-        if str(right_type).strip().lower() in {"floating_ambipolar_edge", "ambipolar_edge_root"}:
+        if str(right_type).strip().lower() in {"floating_ambipolar_edge", "floating_ambipolar_edge_node", "ambipolar_edge_root"}:
             return str(right_type).strip().lower()
     return str(solver_cfg.get("Er_right_boundary_mode", solver_cfg.get("Er_boundary_mode", "standard"))).strip().lower()
 
@@ -1527,7 +1561,7 @@ def build_equation_system_from_config(config, species):
         if isinstance(right_cfg, dict):
             right_cfg = dict(right_cfg)
             right_type = str(right_cfg.get("type", "")).strip().lower()
-            if right_type in {"floating_ambipolar_edge", "ambipolar_edge_root"}:
+            if right_type in {"floating_ambipolar_edge", "floating_ambipolar_edge_node", "ambipolar_edge_root"}:
                 right_cfg["type"] = "neumann"
                 right_cfg.setdefault("gradient", 0.0)
             er_cfg["right"] = right_cfg
@@ -2148,6 +2182,13 @@ class ComposedEquationSystem:
         return state_bar
 
     def build_lagged_response(self, state):
+        if getattr(state, "Er_edge", None) is not None:
+            raise NotImplementedError(
+                "floating_ambipolar_edge_node is currently a direct/black-box "
+                "forward mode. Its custom lagged-response tangent must include "
+                "the separate outer-face Er_edge scalar before it can be used "
+                "with lagged_response or reverse AD."
+            )
         working_state, eidx = self._prepare_working_state(state)
         if lagged_timing_enabled():
             jax.debug.callback(lambda: lagged_timing_start("equations.build_lagged_response"), ordered=True)
@@ -3240,10 +3281,16 @@ class ComposedEquationSystem:
             Er_rhs,
         )
 
+        Er_edge_rhs = (
+            er_eq.edge_rhs(working_state, fluxes=shared_fluxes)
+            if er_eq is not None and getattr(state_reference, "Er_edge", None) is not None
+            else None
+        )
         return TransportState(
             density=density_rhs,
             pressure=pressure_rhs,
             Er=Er_rhs,
+            Er_edge=Er_edge_rhs,
         )
 
     def evaluate_with_shared_fluxes(self, t, state, runtime, shared_fluxes):
@@ -4268,10 +4315,16 @@ class ComposedEquationSystem:
         if er_eq is not None and hasattr(er_eq, "enforce_dirichlet_boundary_rhs"):
             Er_rhs = er_eq.enforce_dirichlet_boundary_rhs(working_state, Er_rhs)
 
+        Er_edge_rhs = (
+            er_eq.edge_rhs(working_state, fluxes=shared_fluxes)
+            if er_eq is not None and getattr(state, "Er_edge", None) is not None
+            else None
+        )
         return TransportState(
             density=density_rhs,
             pressure=pressure_rhs,
             Er=Er_rhs,
+            Er_edge=Er_edge_rhs,
         )
 
     def __call__(self, t, state, runtime):

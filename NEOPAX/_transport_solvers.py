@@ -248,6 +248,8 @@ def _pack_transport_state_arrays(state: Any, species: Any = None) -> Any:
         eidx = _electron_density_index(species)
         if eidx is not None:
             density = jnp.concatenate([density[:eidx], density[eidx + 1 :]], axis=0)
+        if getattr(state, "Er_edge", None) is not None:
+            return (density, state.pressure, state.Er, state.Er_edge)
         return (density, state.pressure, state.Er)
     return state
 
@@ -268,16 +270,17 @@ def _unpack_transport_state_arrays(
         and hasattr(template_state, "pressure")
         and hasattr(template_state, "Er")
         and isinstance(state_like, tuple)
-        and len(state_like) == 3
+        and len(state_like) in {3, 4}
     ):
-        density, pressure, er = state_like
+        density, pressure, er = state_like[:3]
+        er_edge = state_like[3] if len(state_like) == 4 else None
         eidx = _electron_density_index(species)
         if eidx is not None and density.shape[-2] == template_state.density.shape[0] - 1:
             full_shape = pressure.shape[:-2] + (template_state.density.shape[0], pressure.shape[-1])
             full_density = jnp.zeros(full_shape, dtype=density.dtype)
             full_density = full_density.at[..., :eidx, :].set(density[..., :eidx, :])
             full_density = full_density.at[..., eidx + 1 :, :].set(density[..., eidx:, :])
-            rebuilt = dataclasses.replace(template_state, density=full_density, pressure=pressure, Er=er)
+            rebuilt = dataclasses.replace(template_state, density=full_density, pressure=pressure, Er=er, Er_edge=er_edge)
             return _apply_quasi_neutrality_output(
                 rebuilt,
                 species,
@@ -287,7 +290,7 @@ def _unpack_transport_state_arrays(
                 density_floor=density_floor,
                 temperature_floor=temperature_floor,
             )
-        rebuilt = dataclasses.replace(template_state, density=density, pressure=pressure, Er=er)
+        rebuilt = dataclasses.replace(template_state, density=density, pressure=pressure, Er=er, Er_edge=er_edge)
         return _project_fixed_temperature_output(
             rebuilt,
             template_state,
@@ -311,9 +314,10 @@ def _unpack_transport_state_cotangent_arrays(
         and hasattr(template_state, "pressure")
         and hasattr(template_state, "Er")
         and isinstance(state_like, tuple)
-        and len(state_like) == 3
+        and len(state_like) in {3, 4}
     ):
-        density_bar, pressure_bar, er_bar = state_like
+        density_bar, pressure_bar, er_bar = state_like[:3]
+        er_edge_bar = state_like[3] if len(state_like) == 4 else None
         eidx = _electron_density_index(species)
         if eidx is not None and density_bar.shape[-2] == template_state.density.shape[0] - 1:
             full_shape = pressure_bar.shape[:-2] + (template_state.density.shape[0], pressure_bar.shape[-1])
@@ -321,7 +325,7 @@ def _unpack_transport_state_cotangent_arrays(
             full_density_bar = full_density_bar.at[..., :eidx, :].set(density_bar[..., :eidx, :])
             full_density_bar = full_density_bar.at[..., eidx + 1 :, :].set(density_bar[..., eidx:, :])
             density_bar = full_density_bar
-        return dataclasses.replace(template_state, density=density_bar, pressure=pressure_bar, Er=er_bar)
+        return dataclasses.replace(template_state, density=density_bar, pressure=pressure_bar, Er=er_bar, Er_edge=er_edge_bar)
     return state_like
 
 
@@ -445,10 +449,11 @@ def _project_packed_transport_state_arrays(
     """Project packed solver arrays without rebuilding a full TransportState."""
     from ._state import safe_density, safe_temperature
 
-    if not (isinstance(state_like, tuple) and len(state_like) == 3):
+    if not (isinstance(state_like, tuple) and len(state_like) in {3, 4}):
         return state_like
 
-    density, pressure, er = state_like
+    density, pressure, er = state_like[:3]
+    er_edge = state_like[3] if len(state_like) == 4 else None
     packed_density = safe_density(density, density_floor)
     eidx = _electron_density_index(species)
     if eidx is not None and packed_density.shape[-2] == template_state.density.shape[0] - 1:
@@ -478,6 +483,8 @@ def _project_packed_transport_state_arrays(
     if temperature_floor is not None:
         projected_temperature = safe_temperature(projected_pressure / floored_density, temperature_floor)
         projected_pressure = floored_density * projected_temperature
+    if er_edge is not None:
+        return (packed_density, projected_pressure, er, er_edge)
     return (packed_density, projected_pressure, er)
 
 
