@@ -565,6 +565,52 @@ def test_face_quadratic_coefficient_interpolation_rebases_before_radial_interpol
     assert jnp.allclose(interpolated.d2coefficients_d_nu_hat_d_epsi_hat, 11.0)
     assert jnp.allclose(interpolated.d2coefficients_d_epsi_hat2, 13.0)
 
+
+def test_face_quadratic_coefficient_cubic_interpolation_rebases_before_radial_interpolation():
+    """The opt-in four-face reconstruction preserves a cubic radial field."""
+
+    geometry = types.SimpleNamespace(
+        a_b=1.0,
+        r_grid=jnp.asarray([0.125, 0.375, 0.625, 0.875]),
+        r_grid_half=jnp.asarray([0.0, 0.25, 0.5, 0.75, 1.0]),
+    )
+    model = NTXExactLijRuntimeTransportModel(
+        species=types.SimpleNamespace(number_species=1),
+        energy_grid=object(),
+        geometry=geometry,
+        vmec_file=None,
+        boozer_file=None,
+    )
+    radius_face = geometry.r_grid_half[:, None, None]
+    u_face = jnp.asarray([[[1.0]], [[2.0]], [[3.0]], [[4.0]], [[5.0]]])
+    e_face = jnp.asarray([[[0.5]], [[1.5]], [[2.5]], [[3.5]], [[4.5]]])
+    radial = lambda r: 1.0 - 2.0 * r + 3.0 * r**2 - 4.0 * r**3
+    coefficient = lambda r, u, e: radial(r) + 3.0 * u - 5.0 * e + 3.5 * u**2 + 11.0 * u * e + 6.5 * e**2
+    du = 3.0 + 7.0 * u_face + 11.0 * e_face
+    de = -5.0 + 11.0 * u_face + 13.0 * e_face
+    response = NTXQuadraticPreparedCoefficientResponse(
+        reference_nu_hat=u_face,
+        reference_epsi_hat=e_face,
+        reference_coefficients=coefficient(radius_face, u_face, e_face)[..., None],
+        dcoefficients_d_nu_hat=du[..., None],
+        dcoefficients_d_epsi_hat=de[..., None],
+        d2coefficients_d_nu_hat2=jnp.full((5, 1, 1, 1), 7.0),
+        d2coefficients_d_nu_hat_d_epsi_hat=jnp.full((5, 1, 1, 1), 11.0),
+        d2coefficients_d_epsi_hat2=jnp.full((5, 1, 1, 1), 13.0),
+    )
+    u_center = jnp.asarray([[[1.5]], [[2.5]], [[3.5]], [[4.5]]])
+    e_center = jnp.asarray([[[1.0]], [[2.0]], [[3.0]], [[4.0]]])
+    interpolated = model._interpolate_face_quadratic_coefficients_to_centres(
+        response,
+        center_reference_nu_hat=u_center,
+        center_reference_epsi_hat=e_center,
+        weight_mode="radial_cubic",
+    )
+    expected = coefficient(geometry.r_grid[:, None, None], u_center, e_center)
+    assert jnp.allclose(interpolated.reference_coefficients[..., 0], expected)
+    assert jnp.allclose(interpolated.dcoefficients_d_nu_hat[..., 0], 3.0 + 7.0 * u_center + 11.0 * e_center)
+    assert jnp.allclose(interpolated.dcoefficients_d_epsi_hat[..., 0], -5.0 + 11.0 * u_center + 13.0 * e_center)
+
 def test_ntx_exact_fused_lowdot_local_pullback_matches_ntx_helper():
     """The opt-in fused local NTX path must preserve the scalar local bars."""
     energy_grid = types.SimpleNamespace(

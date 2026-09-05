@@ -5308,6 +5308,9 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             "interpolate_coefficients": "interpolate_face_coefficients",
             "interpolate_face_coefficients": "interpolate_face_coefficients",
             "face_coefficient_interpolation": "interpolate_face_coefficients",
+            "interpolate_face_coefficients_cubic": "interpolate_face_coefficients_cubic",
+            "interpolate_face_coefficients_four_point": "interpolate_face_coefficients_cubic",
+            "face_coefficient_cubic": "interpolate_face_coefficients_cubic",
             "interpolate_face_coefficients_native_distance": "interpolate_face_coefficients_native_distance",
             "face_coefficient_native_distance": "interpolate_face_coefficients_native_distance",
         }
@@ -5316,12 +5319,14 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             "interpolate_from_faces",
             "center_local_response",
             "interpolate_face_coefficients",
+            "interpolate_face_coefficients_cubic",
             "interpolate_face_coefficients_native_distance",
         }:
             raise ValueError(
                 "ntx_exact_center_response_mode must be one of: "
                 "interpolate_from_faces, center_local_response, "
                 "interpolate_face_coefficients, "
+                "interpolate_face_coefficients_cubic, "
                 "interpolate_face_coefficients_native_distance"
             )
         return mode
@@ -5380,13 +5385,14 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         """Interpolate face NTX Taylor polynomials to cell centres.
 
         Each face response is anchored at different ``(nu_hat, epsi_hat)``.
-        For each centre, first translate its two adjacent face polynomials to
-        that centre's reference coordinates. ``weight_mode='radial'`` then
-        uses the geometric radial stencil. ``weight_mode='native_distance'``
-        instead weights each species/energy response by its distance to the
-        centre in native ``(nu_hat, epsi_hat)`` space.  The latter is needed
-        when an ambipolar branch transition makes the two faces represent
-        different local NTX states.
+        For each centre, first translate face polynomials to that centre's
+        reference coordinates. ``weight_mode='radial'`` uses its adjacent
+        two-face linear stencil. ``weight_mode='radial_cubic'`` uses a fixed
+        four-face Lagrange stencil; this is an opt-in forward experiment,
+        intended to test whether a wider common-centre-state coefficient
+        reconstruction improves a root layer without additional NTX solves.
+        ``weight_mode='native_distance'`` instead weights the two adjacent
+        responses by their native ``(nu_hat, epsi_hat)`` distance.
         """
 
         face_rho = jnp.asarray(self.geometry.r_grid_half, dtype=jnp.float64) / jnp.asarray(
@@ -5398,22 +5404,46 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         hi = jnp.searchsorted(face_rho, center_rho, side="right")
         hi = jnp.clip(hi, 1, face_rho.shape[0] - 1)
         lo = hi - 1
-        if weight_mode not in {"radial", "native_distance"}:
-            raise ValueError("weight_mode must be 'radial' or 'native_distance'.")
-        denominator = face_rho[hi] - face_rho[lo]
+        if weight_mode not in {"radial", "radial_cubic", "native_distance"}:
+            raise ValueError(
+                "weight_mode must be 'radial', 'radial_cubic', or 'native_distance'."
+            )
         u_center_native = jnp.asarray(center_reference_nu_hat)
         e_center_native = jnp.asarray(center_reference_epsi_hat)
-        u_lo_native = face_response.reference_nu_hat[lo]
-        u_hi_native = face_response.reference_nu_hat[hi]
-        e_lo_native = face_response.reference_epsi_hat[lo]
-        e_hi_native = face_response.reference_epsi_hat[hi]
-        if weight_hi_override is None:
-            if weight_mode == "radial":
+        if weight_mode == "radial_cubic":
+            if weight_hi_override is not None:
+                raise ValueError("weight_hi_override is only valid for a two-face stencil.")
+            n_faces = int(face_rho.shape[0])
+            if n_faces < 4:
+                raise ValueError("radial_cubic requires at least four face radii.")
+            start = jnp.clip(lo - 1, 0, n_faces - 4)
+            face_indices = start[:, None] + jnp.arange(4, dtype=lo.dtype)[None, :]
+            nodes = face_rho[face_indices]
+            radial_weights = []
+            for stencil_index in range(4):
+                weight = jnp.ones_like(center_rho)
+                for other_index in range(4):
+                    if other_index == stencil_index:
+                        continue
+                    denominator = nodes[:, stencil_index] - nodes[:, other_index]
+                    weight = weight * (center_rho - nodes[:, other_index]) / jnp.where(
+                        jnp.abs(denominator) > 0.0, denominator, 1.0
+                    )
+                radial_weights.append(weight)
+            weights = jnp.stack(radial_weights, axis=1)
+        else:
+            face_indices = jnp.stack((lo, hi), axis=1)
+            denominator = face_rho[hi] - face_rho[lo]
+            u_lo_native = face_response.reference_nu_hat[lo]
+            u_hi_native = face_response.reference_nu_hat[hi]
+            e_lo_native = face_response.reference_epsi_hat[lo]
+            e_hi_native = face_response.reference_epsi_hat[hi]
+            if weight_hi_override is None and weight_mode == "radial":
                 weight_hi = (center_rho - face_rho[lo]) / jnp.where(
                     jnp.abs(denominator) > 0.0, denominator, 1.0
                 )
                 weight_hi = jnp.clip(weight_hi, 0.0, 1.0)
-            else:
+            elif weight_hi_override is None:
                 # The local left/right span non-dimensionalizes the two
                 # native coordinates without assuming that nu_hat and
                 # epsi_hat have comparable numerical magnitudes.
@@ -5430,21 +5460,18 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                 inverse_lo = 1.0 / jnp.maximum(distance_lo2, 1.0e-24)
                 inverse_hi = 1.0 / jnp.maximum(distance_hi2, 1.0e-24)
                 weight_hi = inverse_hi / (inverse_lo + inverse_hi)
-        else:
-            weight_hi = jnp.asarray(weight_hi_override, dtype=center_rho.dtype)
-            if weight_hi.shape != center_rho.shape:
-                raise ValueError("weight_hi_override must have one value per cell centre.")
-        weight_lo = 1.0 - weight_hi
+            else:
+                weight_hi = jnp.asarray(weight_hi_override, dtype=center_rho.dtype)
+                if weight_hi.shape != center_rho.shape:
+                    raise ValueError("weight_hi_override must have one value per cell centre.")
+            weights = jnp.stack((1.0 - weight_hi, weight_hi), axis=1)
 
-        def _at_adjacent_faces(field):
-            return field[lo], field[hi]
+        u_center = u_center_native[:, None, ..., None]
+        e_center = e_center_native[:, None, ..., None]
+        u_face = face_response.reference_nu_hat[face_indices][..., None]
+        e_face = face_response.reference_epsi_hat[face_indices][..., None]
 
-        u_center = u_center_native[..., None]
-        e_center = e_center_native[..., None]
-        u_lo, u_hi = _at_adjacent_faces(face_response.reference_nu_hat[..., None])
-        e_lo, e_hi = _at_adjacent_faces(face_response.reference_epsi_hat[..., None])
-
-        def _translate(c0, cu, ce, cuu, cue, cee, u_face, e_face):
+        def _translate(c0, cu, ce, cuu, cue, cee):
             du = u_center - u_face
             de = e_center - e_face
             return (
@@ -5465,21 +5492,13 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             face_response.d2coefficients_d_nu_hat_d_epsi_hat,
             face_response.d2coefficients_d_epsi_hat2,
         )
-        translated_lo = _translate(
-            *(_at_adjacent_faces(field)[0] for field in face_fields), u_lo, e_lo
-        )
-        translated_hi = _translate(
-            *(_at_adjacent_faces(field)[1] for field in face_fields), u_hi, e_hi
-        )
-        weight_lo = weight_lo.reshape(
-            weight_lo.shape + (1,) * (translated_lo[0].ndim - weight_lo.ndim)
-        )
-        weight_hi = weight_hi.reshape(
-            weight_hi.shape + (1,) * (translated_hi[0].ndim - weight_hi.ndim)
+        translated = _translate(*(field[face_indices] for field in face_fields))
+        weights = weights.reshape(
+            weights.shape + (1,) * (translated[0].ndim - weights.ndim)
         )
         center_c0, center_cu, center_ce, center_cuu, center_cue, center_cee = tuple(
-            weight_lo * left + weight_hi * right
-            for left, right in zip(translated_lo, translated_hi, strict=True)
+            jnp.sum(weights * value, axis=1)
+            for value in translated
         )
         return NTXQuadraticPreparedCoefficientResponse(
             reference_nu_hat=center_reference_nu_hat,
@@ -12340,12 +12359,17 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         center_local_response = center_response_mode == "center_local_response"
         interpolate_face_coefficients = center_response_mode in {
             "interpolate_face_coefficients",
+            "interpolate_face_coefficients_cubic",
             "interpolate_face_coefficients_native_distance",
         }
         coefficient_weight_mode = (
             "native_distance"
             if center_response_mode == "interpolate_face_coefficients_native_distance"
-            else "radial"
+            else (
+                "radial_cubic"
+                if center_response_mode == "interpolate_face_coefficients_cubic"
+                else "radial"
+            )
         )
         if interpolate_face_coefficients and not self.full_state_quadratic_response:
             raise NotImplementedError(
@@ -16071,6 +16095,7 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         if self._resolved_center_response_mode() in {
             "center_local_response",
             "interpolate_face_coefficients",
+            "interpolate_face_coefficients_cubic",
             "interpolate_face_coefficients_native_distance",
         }:
             # Direct-centre mode owns two cached models: centres for local
@@ -16125,6 +16150,7 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             if self._resolved_center_response_mode() in {
                 "center_local_response",
                 "interpolate_face_coefficients",
+                "interpolate_face_coefficients_cubic",
                 "interpolate_face_coefficients_native_distance",
             }:
                 centre_fluxes = self._evaluate_full_state_quadratic_center_response(

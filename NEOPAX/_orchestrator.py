@@ -154,6 +154,9 @@ def _resolve_transport_center_flux_mode(config: dict) -> str:
         "interpolate_face_coefficients",
         "interpolate_coefficients",
         "face_coefficient_interpolation",
+        "interpolate_face_coefficients_cubic",
+        "interpolate_face_coefficients_four_point",
+        "face_coefficient_cubic",
         "interpolate_face_coefficients_native_distance",
         "face_coefficient_native_distance",
     }:
@@ -650,6 +653,9 @@ def _build_flux_model(config: dict, species, energy_grid, geometry, database, so
                 "interpolate_face_coefficients",
                 "interpolate_coefficients",
                 "face_coefficient_interpolation",
+                "interpolate_face_coefficients_cubic",
+                "interpolate_face_coefficients_four_point",
+                "face_coefficient_cubic",
                 "interpolate_face_coefficients_native_distance",
                 "face_coefficient_native_distance",
             }:
