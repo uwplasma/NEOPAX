@@ -3670,6 +3670,15 @@ class NTXDatabaseTransportModel(TransportFluxModelBase):
         )
 
     def build_local_particle_flux_evaluator(self, state):
+        """Return a true single-radius database particle-flux primitive.
+
+        Ambipolar root scans call this once for each trial ``Er`` at one
+        radius.  Calling the full centre-flux evaluator here used to rebuild
+        all radial ``Lij`` blocks for every scalar trial and then discard all
+        but one column.  This mirrors the exact-Lij local-root primitive: the
+        profile gradients are shared, while interpolation and Lij assembly are
+        performed only for the requested radius.
+        """
         species = self.species
         energy_grid = self.energy_grid
         geometry = self.geometry
@@ -3686,25 +3695,85 @@ class NTXDatabaseTransportModel(TransportFluxModelBase):
             temperature,
             self.geometry.r_grid_half,
         )
+        v_thermal = get_v_thermal(species.mass, temperature)
+        collisionality_kind = _collisionality_kind(self.collisionality_model)
+        dndr = jax.vmap(
+            lambda density_a, n_rc, n_rg: get_gradient_density(
+                density_a,
+                geometry.r_grid,
+                geometry.r_grid_half,
+                geometry.dr,
+                right_face_constraint=n_rc,
+                right_face_grad_constraint=n_rg,
+            )
+        )(
+            density,
+            density_right_constraint,
+            density_right_grad_constraint,
+        )
+        dtdr = jax.vmap(
+            lambda temperature_a, t_rc, t_rg: get_gradient_temperature(
+                temperature_a,
+                geometry.r_grid,
+                geometry.r_grid_half,
+                geometry.dr,
+                right_face_constraint=t_rc,
+                right_face_grad_constraint=t_rg,
+            )
+        )(
+            temperature,
+            temperature_right_constraint,
+            temperature_right_grad_constraint,
+        )
+        species_indices = jnp.asarray(species.species_indices, dtype=jnp.int32)
 
         def evaluator(radius_index, er_value):
+            radius_index = jnp.asarray(radius_index, dtype=jnp.int32)
             er_scalar = jnp.asarray(er_value, dtype=state.Er.dtype)
-            er_profile = state.Er.at[radius_index].set(er_scalar)
-            _, gamma_neo, _, _ = get_Neoclassical_Fluxes(
-                species,
-                energy_grid,
-                geometry,
-                database,
-                er_profile,
-                temperature,
-                density,
-                density_right_constraint=density_right_constraint,
-                density_right_grad_constraint=density_right_grad_constraint,
-                temperature_right_constraint=temperature_right_constraint,
-                temperature_right_grad_constraint=temperature_right_grad_constraint,
-                collisionality_model=self.collisionality_model,
+            lij = jax.vmap(
+                lambda species_index: get_Lij_matrix_local(
+                    species,
+                    energy_grid,
+                    geometry,
+                    database,
+                    species_index,
+                    radius_index,
+                    er_scalar,
+                    temperature,
+                    density,
+                    v_thermal,
+                    collisionality_kind,
+                )
+            )(species_indices)
+            density_local = jax.lax.dynamic_index_in_dim(
+                density, radius_index, axis=1, keepdims=False
             )
-            return gamma_neo[:, radius_index]
+            temperature_local = jax.lax.dynamic_index_in_dim(
+                temperature, radius_index, axis=1, keepdims=False
+            )
+            dndr_local = jax.lax.dynamic_index_in_dim(
+                dndr, radius_index, axis=1, keepdims=False
+            )
+            dtdr_local = jax.lax.dynamic_index_in_dim(
+                dtdr, radius_index, axis=1, keepdims=False
+            )
+            a1 = jax.vmap(get_Thermodynamical_Forces_A1)(
+                species.charge,
+                density_local,
+                temperature_local,
+                dndr_local,
+                dtdr_local,
+                jnp.broadcast_to(er_scalar, density_local.shape),
+            )
+            a2 = jax.vmap(get_Thermodynamical_Forces_A2)(
+                temperature_local, dtdr_local
+            )
+            a3 = get_Thermodynamical_Forces_A3(
+                jnp.reshape(er_scalar, (1,))
+            )[0]
+            return -(DENSITY_STATE_TO_PHYSICAL * density_local) * (
+                lij[:, 0, 0] * a1 + lij[:, 0, 1] * a2 + lij[:, 0, 2] * a3
+            )
 
         return evaluator
 

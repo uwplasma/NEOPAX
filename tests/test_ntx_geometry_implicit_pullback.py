@@ -522,6 +522,27 @@ def test_database_local_bootstrap_state_pullback_matches_full_upar_jvp(
         rtol=2.0e-10,
         atol=2.0e-10,
     )
+    # Initial-Er root scans must use the same local-centre primitive as the
+    # full database flux calculation, without constructing all radii for a
+    # single trial Er.  This is the database counterpart of the exact-Lij
+    # local root evaluator.
+    _lij, full_gamma, _full_q, _full_upar = neoclassical_module.get_Neoclassical_Fluxes(
+        species,
+        model.energy_grid,
+        geometry,
+        database,
+        state.Er,
+        state.temperature,
+        state.density,
+    )
+    local_gamma = model.build_local_particle_flux_evaluator(state)
+    for radius_index in range(state.Er.shape[0]):
+        assert jnp.allclose(
+            local_gamma(radius_index, state.Er[radius_index]),
+            full_gamma[:, radius_index],
+            rtol=2.0e-10,
+            atol=2.0e-10,
+        )
     upar_tangent = jax.jvp(
         model.evaluate_momentum_corrected_upar_only,
         (state,),
