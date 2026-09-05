@@ -3685,16 +3685,17 @@ class NTXDatabaseTransportModel(TransportFluxModelBase):
         database = self.database
         density = safe_density(state.density, self.density_floor)
         temperature = state.temperature
-        density_right_constraint, density_right_grad_constraint = _extract_right_constraints(
-            self.bc_density,
-            density,
-            self.geometry.r_grid_half,
-        )
-        temperature_right_constraint, temperature_right_grad_constraint = _extract_right_constraints(
-            self.bc_temperature,
-            temperature,
-            self.geometry.r_grid_half,
-        )
+        # This primitive must be exactly the local restriction of ``self(state)``.
+        # The direct centre database evaluator deliberately uses its established
+        # zero-gradient, last-cell right closure; it does *not* use the transport
+        # face boundary conditions.  Feeding the face closure here made the last
+        # cell differ (by a factor of two in the two-cell regression) from the
+        # full direct database flux.  Keep these values in lockstep with
+        # ``_get_Neoclassical_Fluxes_generic``.
+        density_right_constraint = density[:, -1]
+        density_right_grad_constraint = jnp.zeros_like(density_right_constraint)
+        temperature_right_constraint = temperature[:, -1]
+        temperature_right_grad_constraint = jnp.zeros_like(temperature_right_constraint)
         v_thermal = get_v_thermal(species.mass, temperature)
         collisionality_kind = _collisionality_kind(self.collisionality_model)
         dndr = jax.vmap(
