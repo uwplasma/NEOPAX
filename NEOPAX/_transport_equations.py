@@ -3144,6 +3144,17 @@ class ComposedEquationSystem:
         This is deliberately diagnostic-only: it evaluates the inexpensive
         cached-response assembly but never builds a new NTX response.
         """
+        # A floating outer-node Radau solve keeps its physical edge scalar and
+        # response anchor in a solver-private wrapper.  This generic callback
+        # is deliberately passed only a public TransportState, so it cannot
+        # reconstruct the corresponding stage edge value without inventing
+        # one.  Do not unwrap the payload and print a misleading decomposition;
+        # the node-specific stage diagnostic owns that richer tuple.
+        if (
+            hasattr(lagged_response, "transport_response")
+            and hasattr(lagged_response, "er_edge_anchor")
+        ):
+            return None
         working_state, _ = self._prepare_working_state(state)
         density_eq, temperature_eq, er_eq = self._resolve_equations()
         del density_eq, temperature_eq

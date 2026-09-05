@@ -7,6 +7,7 @@ from NEOPAX._boundary_conditions import BoundaryConditionModel
 from NEOPAX._ambipolarity import _ambipolar_root_grid_has_axis_state_entry
 from NEOPAX._state import TransportState
 from NEOPAX._transport_equations import (
+    ComposedEquationSystem,
     ElectricFieldEquation,
     PARTICLE_FLUX_PHYSICAL_TO_STATE,
     TemperatureEquation,
@@ -22,6 +23,20 @@ class DummySpecies:
     charge_qp: jnp.ndarray
     names: tuple[str, ...]
     ion_indices: tuple[int, ...]
+
+
+def test_node_lagged_cache_is_skipped_by_public_er_component_debugger():
+    """The public-state diagnostic must not misread Radau's private cache."""
+    cache = SimpleNamespace(transport_response=object(), er_edge_anchor=jnp.asarray(1.0))
+    state = TransportState(
+        density=jnp.ones((1, 2)), pressure=jnp.ones((1, 2)), Er=jnp.ones(2)
+    )
+    assert (
+        ComposedEquationSystem.debug_er_components_with_lagged_response(
+            object(), state, cache
+        )
+        is None
+    )
 
 
 def test_enforce_quasi_neutrality_reconstructs_electron_density():
