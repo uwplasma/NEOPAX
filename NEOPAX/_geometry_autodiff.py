@@ -6424,6 +6424,11 @@ def build_runtime_context_for_geometry_param(
     database_runtime_timing = (
         str(config.get("neoclassical", {}).get("flux_model", "")).strip().lower()
         == "ntx_scan_runtime"
+        and bool(
+            config.get("diagnostics", {}).get(
+                "database_runtime_build_timing", False
+            )
+        )
     )
     phase_start = time.perf_counter()
     state_vmec = _solve_state_for_single_param(

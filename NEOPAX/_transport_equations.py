@@ -1094,7 +1094,15 @@ class ElectricFieldEquation(EquationBase):
             self.permitivity_prefactor,
         )
         Gamma = _get_center_flux(fluxes, "Gamma")
-        Gamma_faces = _get_face_flux(fluxes, "Gamma") if self._uses_face_completed_ambi_term() else None
+        # The floating edge condition is intrinsically a face condition.  Use
+        # native model faces whenever present, independently of the interior
+        # Er-source reconstruction mode; `_outer_face_ambi_term` reconstructs
+        # only when this remains ``None``.
+        Gamma_faces = (
+            fluxes["Gamma_faces"]
+            if _flux_has_key(fluxes, "Gamma_faces")
+            else None
+        )
         charge_flux, ambi_term = self._charge_flux_and_ambi_term(
             state, Gamma, plasma_permitivity, Gamma_faces
         )
@@ -1126,7 +1134,13 @@ class ElectricFieldEquation(EquationBase):
             self.permitivity_prefactor,
         )
         Gamma = _get_center_flux(fluxes, "Gamma")
-        Gamma_faces = _get_face_flux(fluxes, "Gamma") if self._uses_face_completed_ambi_term() else None
+        # Retain direct face data for the floating-edge residual even when
+        # the interior source is the centre-local `ambipolar_local` form.
+        Gamma_faces = (
+            fluxes["Gamma_faces"]
+            if _flux_has_key(fluxes, "Gamma_faces")
+            else None
+        )
         _, ambi_term = self._charge_flux_and_ambi_term(
             state, Gamma, plasma_permitivity, Gamma_faces
         )

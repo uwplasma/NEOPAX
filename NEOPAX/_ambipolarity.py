@@ -1271,6 +1271,22 @@ def register_ambipolarity_model(name: str, func):
     AMBIPOLARITY_MODEL_REGISTRY[str(name).strip().lower()] = func
 
 
+def _ambipolar_root_grid_has_axis_state_entry(geometry) -> bool:
+    """Whether radial-root index zero is itself an axis state entry.
+
+    Root indices address ``state.Er`` and must use the state/centre grid.
+    The first FV face is always the axis face, so it cannot decide whether the
+    first *centre* should be skipped.
+    """
+    state_grid = getattr(geometry, "r_grid", None)
+    if state_grid is None:
+        return False
+    try:
+        return bool(abs(float(np.asarray(state_grid)[0])) <= 1.0e-14)
+    except Exception:
+        return False
+
+
 def _ambipolarity_local_charge_flux_setup(state, params, flux_model, amb_cfg=None):
     """Return common local ambipolar residual closures for JAX radial root solves."""
     import dataclasses
@@ -1282,13 +1298,7 @@ def _ambipolarity_local_charge_flux_setup(state, params, flux_model, amb_cfg=Non
     charge_qp = jnp.asarray(params["species"].charge_qp)
 
     geometry = getattr(flux_model, "geometry", None)
-    r_grid = getattr(geometry, "r_grid_half", None)
-    skip_axis_root = False
-    if r_grid is not None:
-        try:
-            skip_axis_root = bool(abs(float(np.asarray(r_grid)[0])) <= 1.0e-14)
-        except Exception:
-            skip_axis_root = False
+    skip_axis_root = _ambipolar_root_grid_has_axis_state_entry(geometry)
 
     flux_mode = _normalize_ambipolar_flux_mode(amb_cfg, params)
     local_particle_flux = (
@@ -1484,13 +1494,7 @@ def solve_ambipolarity_roots_radial(state, config, params, model_name, flux_mode
 
     charge_qp = jnp.asarray(params["species"].charge_qp)
     geometry = getattr(flux_model, "geometry", None)
-    r_grid = getattr(geometry, "r_grid_half", None)
-    skip_axis_root = False
-    if r_grid is not None:
-        try:
-            skip_axis_root = bool(abs(float(np.asarray(r_grid)[0])) <= 1.0e-14)
-        except Exception:
-            skip_axis_root = False
+    skip_axis_root = _ambipolar_root_grid_has_axis_state_entry(geometry)
     t_flux_build = __import__("time").perf_counter() if debug_stage_markers else None
     flux_mode = _normalize_ambipolar_flux_mode(amb_cfg, params)
     local_particle_flux = (

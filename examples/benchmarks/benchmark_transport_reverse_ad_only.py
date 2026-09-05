@@ -6433,6 +6433,15 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--diagnose-database-runtime-build-timing",
+        action="store_true",
+        help=(
+            "Database-only diagnostic: synchronize and print VMEC, geometry, "
+            "scan-input, NTX-database, and initial-root setup timings. This "
+            "intentionally perturbs device scheduling and is off by default."
+        ),
+    )
+    parser.add_argument(
         "--local-transpose-diagnostic-first-rebuild",
         action="store_true",
         help=(
@@ -6551,6 +6560,8 @@ def main() -> None:
         radau_jacobian_reuse_mode=args.radau_jacobian_reuse_mode,
     )
     _apply_transport_solver_backend_override(config, args.transport_solver_backend_override)
+    if bool(args.diagnose_database_runtime_build_timing):
+        config.setdefault("diagnostics", {})["database_runtime_build_timing"] = True
     if bool(args.transport_solver_forward_smoke) and args.accepted_step_limit is not None:
         config.setdefault("transport_solver", {})["stop_after_accepted_steps"] = int(args.accepted_step_limit)
     neoclassical_cfg = config.setdefault("neoclassical", {})

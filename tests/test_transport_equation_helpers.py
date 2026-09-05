@@ -1,8 +1,10 @@
 import dataclasses
+from types import SimpleNamespace
 
 import jax.numpy as jnp
 
 from NEOPAX._boundary_conditions import BoundaryConditionModel
+from NEOPAX._ambipolarity import _ambipolar_root_grid_has_axis_state_entry
 from NEOPAX._state import TransportState
 from NEOPAX._transport_equations import (
     ElectricFieldEquation,
@@ -102,6 +104,17 @@ def test_expand_density_rhs_to_full_shape_returns_zero_template_on_mismatch():
     assert jnp.allclose(out, jnp.zeros_like(template))
 
 
+def test_ambipolar_axis_skip_uses_state_centres_not_axis_face():
+    cell_centred_geometry = SimpleNamespace(
+        r_grid=jnp.asarray([0.01, 0.03]),
+        r_grid_half=jnp.asarray([0.0, 0.02, 0.04]),
+    )
+    axis_node_geometry = SimpleNamespace(r_grid=jnp.asarray([0.0, 0.02]))
+
+    assert not _ambipolar_root_grid_has_axis_state_entry(cell_centred_geometry)
+    assert _ambipolar_root_grid_has_axis_state_entry(axis_node_geometry)
+
+
 def test_face_completed_ambipolar_term_cell_centres_completed_face_scalar():
     """The opt-in Er source uses supplied model faces, not reconstructed centres."""
 
@@ -139,6 +152,44 @@ def test_face_completed_ambipolar_term_cell_centres_completed_face_scalar():
     expected_coeff = 95780.0
     assert jnp.allclose(charge_flux, expected_charge_flux)
     assert jnp.allclose(ambi_term, expected_coeff * expected_charge_flux * 1.0e-20)
+
+
+def test_floating_er_edge_prefers_native_face_flux_over_center_reconstruction():
+    """The floating condition must use the model's outer face flux directly."""
+
+    state = TransportState(
+        density=jnp.ones((1, 2)),
+        pressure=jnp.ones((1, 2)),
+        Er=jnp.zeros(2),
+    )
+    equation = ElectricFieldEquation(
+        dr_cells=jnp.ones(2),
+        Vprime=jnp.ones(2),
+        Vprime_half=jnp.ones(3),
+        flux_model=None,
+        species_mass=jnp.ones(1),
+        charge_qp=jnp.ones(1),
+        permitivity_prefactor=jnp.ones(2),
+        # A deliberately incompatible fallback makes it clear that the
+        # native `Gamma_faces` payload, not reconstruction, is selected.
+        gamma_faces_builder=lambda gamma: jnp.zeros((1, gamma.shape[1] + 1)),
+        er_diffusive_flux_builder=lambda er: jnp.zeros(er.shape[0] + 1),
+        source_mode="ambipolar_local",
+        permitivity_mode="ntss_like_midpoint",
+        boundary_mode="floating_ambipolar_edge",
+        ntss_B0_mid=1.0,
+        ntss_psfactor_mid=1.0,
+        ntss_density_indices=jnp.asarray([0]),
+    )
+
+    rhs = equation(
+        state,
+        fluxes={
+            "Gamma": jnp.asarray([[100.0, 200.0]]),
+            "Gamma_faces": jnp.asarray([[2.0, 4.0, 8.0]]),
+        },
+    )
+    assert jnp.allclose(rhs[-1], -95780.0 * 8.0e-20)
 
 
 def test_face_completed_work_term_cell_centres_completed_face_product():
