@@ -5,6 +5,9 @@ import jax.numpy as jnp
 from NEOPAX._boundary_conditions import BoundaryConditionModel
 from NEOPAX._state import TransportState
 from NEOPAX._transport_equations import (
+    ElectricFieldEquation,
+    PARTICLE_FLUX_PHYSICAL_TO_STATE,
+    TemperatureEquation,
     _expand_density_rhs_to_full_shape,
     apply_er_dirichlet_boundary_state,
     enforce_quasi_neutrality,
@@ -97,3 +100,73 @@ def test_expand_density_rhs_to_full_shape_returns_zero_template_on_mismatch():
     bad_rhs = jnp.ones((4,))
     out = _expand_density_rhs_to_full_shape(bad_rhs, template, species=None)
     assert jnp.allclose(out, jnp.zeros_like(template))
+
+
+def test_face_completed_ambipolar_term_cell_centres_completed_face_scalar():
+    """The opt-in Er source uses supplied model faces, not reconstructed centres."""
+
+    state = TransportState(
+        density=jnp.ones((1, 2)),
+        pressure=jnp.ones((1, 2)),
+        Er=jnp.zeros(2),
+    )
+    gamma_faces = jnp.asarray([[2.0, 4.0, 8.0]])
+    equation = ElectricFieldEquation(
+        dr_cells=jnp.ones(2),
+        Vprime=jnp.ones(2),
+        Vprime_half=jnp.ones(3),
+        flux_model=None,
+        species_mass=jnp.ones(1),
+        charge_qp=jnp.ones(1),
+        permitivity_prefactor=jnp.ones(2),
+        gamma_faces_builder=lambda gamma: jnp.zeros((1, gamma.shape[1] + 1)),
+        er_diffusive_flux_builder=lambda er: jnp.zeros(er.shape[0] + 1),
+        source_mode="ambipolar_face_completed",
+        permitivity_mode="ntss_like_midpoint",
+        ntss_B0_mid=1.0,
+        ntss_psfactor_mid=1.0,
+        ntss_density_indices=jnp.asarray([0]),
+    )
+    # Deliberately inconsistent centre Gamma: if the implementation silently
+    # reconstructed faces from it, this assertion would fail.
+    charge_flux, ambi_term = equation._charge_flux_and_ambi_term(
+        state,
+        Gamma=jnp.asarray([[100.0, 200.0]]),
+        plasma_permitivity=jnp.ones(2),
+        Gamma_faces=gamma_faces,
+    )
+    expected_charge_flux = jnp.asarray([3.0, 6.0])
+    expected_coeff = 95780.0
+    assert jnp.allclose(charge_flux, expected_charge_flux)
+    assert jnp.allclose(ambi_term, expected_coeff * expected_charge_flux * 1.0e-20)
+
+
+def test_face_completed_work_term_cell_centres_completed_face_product():
+    """Work interpolation must average ``q Gamma_face Er_face`` as one scalar."""
+
+    state = TransportState(
+        density=jnp.ones((1, 2)),
+        pressure=jnp.ones((1, 2)),
+        Er=jnp.asarray([1.0, 2.0]),
+    )
+    equation = TemperatureEquation(
+        dr_cells=jnp.ones(2),
+        Vprime=jnp.ones(2),
+        Vprime_half=jnp.ones(3),
+        flux_model=None,
+        flux_faces_builder=lambda gamma: gamma,
+        temperature_ghost_builder=lambda temperature: temperature,
+        charge_qp=jnp.asarray([1.0]),
+        active_species_mask=jnp.asarray([True]),
+        er_faces_builder=lambda unused_state: jnp.asarray([10.0, 20.0, 30.0]),
+        include_work_term=True,
+        work_term_reconstruction="face_completed",
+    )
+    work_rhs = equation._work_rhs(
+        state,
+        fluxes={"Gamma": jnp.asarray([[100.0, 200.0]])},
+        face_fluxes={"Gamma_faces": jnp.asarray([[2.0, 4.0, 8.0]])},
+    )
+    # centre values are 0.5 * [2*10 + 4*20, 4*20 + 8*30].
+    expected = PARTICLE_FLUX_PHYSICAL_TO_STATE * jnp.asarray([[50.0, 160.0]])
+    assert jnp.allclose(work_rhs, expected)

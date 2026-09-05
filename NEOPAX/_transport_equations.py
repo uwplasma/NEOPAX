@@ -469,6 +469,7 @@ class TemperatureEquation(EquationBase):
     charge_qp: jax.Array = dataclasses.field(repr=False)
     active_species_mask: jax.Array = dataclasses.field(repr=False)
     face_flux_builder: callable = dataclasses.field(repr=False, default=None)
+    er_faces_builder: callable = dataclasses.field(repr=False, default=None)
     temperature_bc_model: object = dataclasses.field(repr=False, default=None)
     convection_reconstruction: str = "tvd_mc"
     heat_flux_reconstruction: str = "tvd_mc"
@@ -476,6 +477,7 @@ class TemperatureEquation(EquationBase):
     include_turbulent_convection: bool = True
     include_classical_convection: bool = True
     include_work_term: bool = True
+    work_term_reconstruction: str = "center"
     source_model: callable = dataclasses.field(repr=False, default=None)
     species: object = dataclasses.field(repr=False, default=None)
     name: str = "temperature"
@@ -490,6 +492,44 @@ class TemperatureEquation(EquationBase):
     def _use_model_face_particle_fluxes(self):
         return self._mode_requests_face_fluxes(self.convection_reconstruction)
 
+    def _use_face_completed_work_term(self):
+        return str(self.work_term_reconstruction).strip().lower() in {
+            "face_completed",
+            "interpolate_completed_faces",
+            "face_interpolated",
+        }
+
+    def _work_rhs(self, state, fluxes, face_fluxes):
+        """Return the local electric work term on cell centres.
+
+        ``face_completed`` is an opt-in comparison lane: it forms
+        ``q_a Gamma_a Er`` at the already evaluated finite-volume faces and
+        then cell-centres that completed scalar.  It deliberately does not
+        change any conservative flux divergence.
+        """
+        if not self.include_work_term:
+            return jnp.zeros_like(state.pressure)
+        if not self._use_face_completed_work_term():
+            return (
+                self.charge_qp[:, None]
+                * PARTICLE_FLUX_PHYSICAL_TO_STATE
+                * _get_center_flux(fluxes, "Gamma")
+                * state.Er[None, :]
+            )
+        gamma_faces = _get_face_flux(face_fluxes, "Gamma")
+        if gamma_faces is None:
+            gamma_faces = self.flux_faces_builder(_get_center_flux(fluxes, "Gamma"))
+        if self.er_faces_builder is None:
+            raise ValueError("face_completed work reconstruction requires er_faces_builder.")
+        er_faces = self.er_faces_builder(state)
+        work_faces = (
+            self.charge_qp[:, None]
+            * PARTICLE_FLUX_PHYSICAL_TO_STATE
+            * gamma_faces
+            * er_faces[None, :]
+        )
+        return jax.vmap(cell_centered_from_faces)(work_faces)
+
     def enforce_dirichlet_boundary_rhs(self, state, density_rhs, pressure_rhs):
         del state, density_rhs
         return pressure_rhs
@@ -499,7 +539,7 @@ class TemperatureEquation(EquationBase):
             fluxes = self.flux_model(state)
         use_face_q = self._use_model_face_heat_fluxes()
         use_face_gamma = self._use_model_face_particle_fluxes()
-        need_face_fluxes = use_face_q or use_face_gamma
+        need_face_fluxes = use_face_q or use_face_gamma or self._use_face_completed_work_term()
         face_fluxes = (
             fluxes
             if (
@@ -581,14 +621,7 @@ class TemperatureEquation(EquationBase):
             self.species,
         )
         source_rhs = sum_source_components(source_components, state.pressure)
-        work_rhs = (
-            self.charge_qp[:, None]
-            * PARTICLE_FLUX_PHYSICAL_TO_STATE
-            * _get_center_flux(fluxes, "Gamma")
-            * state.Er[None, :]
-            if self.include_work_term
-            else jnp.zeros_like(state.pressure)
-        )
+        work_rhs = self._work_rhs(state, fluxes, face_fluxes)
         total_rhs = (2.0 / 3.0) * (thermal_flux_rhs + source_rhs + work_rhs)
         return {
             "Q_faces": Q_faces,
@@ -614,7 +647,7 @@ class TemperatureEquation(EquationBase):
             fluxes = self.flux_model(state)
         use_face_q = self._use_model_face_heat_fluxes()
         use_face_gamma = self._use_model_face_particle_fluxes()
-        need_face_fluxes = use_face_q or use_face_gamma
+        need_face_fluxes = use_face_q or use_face_gamma or self._use_face_completed_work_term()
         face_fluxes = (
             fluxes
             if (
@@ -673,14 +706,7 @@ class TemperatureEquation(EquationBase):
             self.species,
         )
         source_rhs = sum_source_components(source_components, state.pressure)
-        work_rhs = (
-            self.charge_qp[:, None]
-            * PARTICLE_FLUX_PHYSICAL_TO_STATE
-            * _get_center_flux(fluxes, "Gamma")
-            * state.Er[None, :]
-            if self.include_work_term
-            else jnp.zeros_like(state.pressure)
-        )
+        work_rhs = self._work_rhs(state, fluxes, face_fluxes)
         return (2.0 / 3.0) * (thermal_flux_rhs + source_rhs + work_rhs) * self.active_species_mask[:, None]
 
 def _build_species_faces_builder(field, bc_model, reconstruction="linear"):
@@ -805,6 +831,7 @@ def build_temperature_equation(
     include_turbulent_convection=True,
     include_classical_convection=True,
     include_work_term=True,
+    work_term_reconstruction="center",
     convection_reconstruction="tvd_mc",
     heat_flux_reconstruction="tvd_mc",
     reconstruction="linear",
@@ -848,6 +875,17 @@ def build_temperature_equation(
             center_fluxes=center_fluxes,
             evaluated_state=evaluated_state,
         )
+    def er_faces_builder(state):
+        return build_face_transport_state(
+            state,
+            field,
+            bc_density=bc_density,
+            bc_temperature=bc_temperature,
+            bc_er=bc_er,
+            reconstruction=reconstruction,
+            density_floor=density_floor,
+            temperature_floor=temperature_floor,
+        ).Er
     temperature_ghost_builder = _build_species_ghost_builder(field, bc_temperature)
     if active_species_mask is None:
         active_species_mask = jnp.ones(species.number_species, dtype=bool)
@@ -860,6 +898,7 @@ def build_temperature_equation(
         species=species,
         flux_faces_builder=flux_faces_builder,
         face_flux_builder=face_flux_builder,
+        er_faces_builder=er_faces_builder,
         temperature_ghost_builder=temperature_ghost_builder,
         temperature_bc_model=bc_temperature,
         charge_qp=jnp.asarray(charge_qp),
@@ -868,6 +907,7 @@ def build_temperature_equation(
         include_turbulent_convection=bool(include_turbulent_convection),
         include_classical_convection=bool(include_classical_convection),
         include_work_term=bool(include_work_term),
+        work_term_reconstruction=str(work_term_reconstruction).strip().lower(),
         convection_reconstruction=str(convection_reconstruction),
         heat_flux_reconstruction=str(heat_flux_reconstruction),
     )
@@ -888,6 +928,7 @@ class ElectricFieldEquation(EquationBase):
     permitivity_prefactor: jax.Array = dataclasses.field(repr=False)
     gamma_faces_builder: callable = dataclasses.field(repr=False)
     er_diffusive_flux_builder: callable = dataclasses.field(repr=False)
+    face_state_builder: callable = dataclasses.field(repr=False, default=None)
     er_bc_model: object = dataclasses.field(repr=False, default=None)
     source_mode: str = "ambipolar_local"
     permitivity_mode: str = "neopax_local"
@@ -908,6 +949,13 @@ class ElectricFieldEquation(EquationBase):
         ambipolar_flux_center = 0.5 * (Gamma_faces[:, :-1] + Gamma_faces[:, 1:])
         return jnp.sum(self.charge_qp[:, None] * ambipolar_flux_center, axis=0)
 
+    def _uses_face_completed_ambi_term(self):
+        return str(self.source_mode).strip().lower() in {
+            "ambipolar_face_completed",
+            "face_completed",
+            "interpolate_completed_faces",
+        }
+
     def _charge_flux_faces_from_gamma(self, Gamma):
         Gamma_faces = self.gamma_faces_builder(Gamma)
         return jnp.sum(self.charge_qp[:, None] * Gamma_faces, axis=0)
@@ -924,8 +972,14 @@ class ElectricFieldEquation(EquationBase):
             )
         return er_diffusive_flux, er_diffusion
 
-    def _charge_flux_and_ambi_term(self, state, Gamma, plasma_permitivity):
-        charge_flux = self._charge_flux_from_gamma(Gamma)
+    def _charge_flux_and_ambi_term(self, state, Gamma, plasma_permitivity, Gamma_faces=None):
+        if self._uses_face_completed_ambi_term():
+            if Gamma_faces is None:
+                Gamma_faces = self.gamma_faces_builder(Gamma)
+            charge_flux_faces = jnp.sum(self.charge_qp[:, None] * Gamma_faces, axis=0)
+            charge_flux = cell_centered_from_faces(charge_flux_faces)
+        else:
+            charge_flux = self._charge_flux_from_gamma(Gamma)
         mode = str(self.permitivity_mode).strip().lower()
         if mode in {"ntss_like_midpoint", "ntss_like", "ntssfusion_midpoint"}:
             density_indices = self.ntss_density_indices
@@ -939,14 +993,45 @@ class ElectricFieldEquation(EquationBase):
                 * jnp.asarray(self.ntss_B0_mid, dtype=charge_flux.dtype) ** 2
                 / (ni_mid * jnp.asarray(self.ntss_psfactor_mid, dtype=charge_flux.dtype))
             )
-            ambi_term = coeffG * (charge_flux * jnp.asarray(1.0e-20, dtype=charge_flux.dtype))
+            if self._uses_face_completed_ambi_term():
+                ambi_faces = coeffG * (
+                    charge_flux_faces * jnp.asarray(1.0e-20, dtype=charge_flux.dtype)
+                )
+                ambi_term = cell_centered_from_faces(ambi_faces)
+            else:
+                ambi_term = coeffG * (charge_flux * jnp.asarray(1.0e-20, dtype=charge_flux.dtype))
             return charge_flux, ambi_term
+
+        if self._uses_face_completed_ambi_term():
+            if self.face_state_builder is None:
+                raise ValueError("face_completed ambipolar term requires face_state_builder.")
+            face_state = self.face_state_builder(state)
+            face_prefactor = jnp.concatenate(
+                (
+                    self.permitivity_prefactor[:1],
+                    0.5 * (self.permitivity_prefactor[:-1] + self.permitivity_prefactor[1:]),
+                    self.permitivity_prefactor[-1:],
+                )
+            )
+            face_mass_density = DENSITY_STATE_TO_PHYSICAL * jnp.sum(
+                self.species_mass[:, None] * face_state.density, axis=0
+            )
+            face_permitivity = jnp.maximum(
+                face_mass_density * face_prefactor,
+                jnp.asarray(1.0e-30, dtype=charge_flux_faces.dtype),
+            )
+            ambi_faces = charge_flux_faces * elementary_charge * 1.0e-3 / face_permitivity
+            return charge_flux, cell_centered_from_faces(ambi_faces)
 
         ambi_term = charge_flux * elementary_charge * 1.0e-3 / plasma_permitivity
         return charge_flux, ambi_term
 
-    def _outer_face_ambi_term(self, state, Gamma, plasma_permitivity):
-        charge_flux_faces = self._charge_flux_faces_from_gamma(Gamma)
+    def _outer_face_ambi_term(self, state, Gamma, plasma_permitivity, Gamma_faces=None):
+        charge_flux_faces = (
+            jnp.sum(self.charge_qp[:, None] * Gamma_faces, axis=0)
+            if Gamma_faces is not None
+            else self._charge_flux_faces_from_gamma(Gamma)
+        )
         charge_flux_edge = charge_flux_faces[-1]
         mode = str(self.permitivity_mode).strip().lower()
         if mode in {"ntss_like_midpoint", "ntss_like", "ntssfusion_midpoint"}:
@@ -962,6 +1047,19 @@ class ElectricFieldEquation(EquationBase):
                 / (ni_mid * jnp.asarray(self.ntss_psfactor_mid, dtype=charge_flux_edge.dtype))
             )
             return coeffG * (charge_flux_edge * jnp.asarray(1.0e-20, dtype=charge_flux_edge.dtype))
+
+        if self._uses_face_completed_ambi_term():
+            if self.face_state_builder is None:
+                raise ValueError("face_completed ambipolar term requires face_state_builder.")
+            face_state = self.face_state_builder(state)
+            edge_mass_density = DENSITY_STATE_TO_PHYSICAL * jnp.sum(
+                self.species_mass * face_state.density[:, -1]
+            )
+            edge_permitivity = jnp.maximum(
+                edge_mass_density * self.permitivity_prefactor[-1],
+                jnp.asarray(1.0e-30, dtype=charge_flux_edge.dtype),
+            )
+            return charge_flux_edge * elementary_charge * 1.0e-3 / edge_permitivity
 
         plasma_permitivity_edge = (
             1.5 * plasma_permitivity[-1] - 0.5 * plasma_permitivity[-2]
@@ -984,8 +1082,13 @@ class ElectricFieldEquation(EquationBase):
             self.permitivity_prefactor,
         )
         Gamma = _get_center_flux(fluxes, "Gamma")
-        charge_flux, ambi_term = self._charge_flux_and_ambi_term(state, Gamma, plasma_permitivity)
-        ambi_term_edge = self._outer_face_ambi_term(state, Gamma, plasma_permitivity)
+        Gamma_faces = _get_face_flux(fluxes, "Gamma") if self._uses_face_completed_ambi_term() else None
+        charge_flux, ambi_term = self._charge_flux_and_ambi_term(
+            state, Gamma, plasma_permitivity, Gamma_faces
+        )
+        ambi_term_edge = self._outer_face_ambi_term(
+            state, Gamma, plasma_permitivity, Gamma_faces
+        )
         er_diffusive_flux, er_diffusion = self._er_diffusion(Er)
         return {
             "charge_flux": charge_flux,
@@ -1006,11 +1109,18 @@ class ElectricFieldEquation(EquationBase):
             self.permitivity_prefactor,
         )
         Gamma = _get_center_flux(fluxes, "Gamma")
-        _, ambi_term = self._charge_flux_and_ambi_term(state, Gamma, plasma_permitivity)
+        Gamma_faces = _get_face_flux(fluxes, "Gamma") if self._uses_face_completed_ambi_term() else None
+        _, ambi_term = self._charge_flux_and_ambi_term(
+            state, Gamma, plasma_permitivity, Gamma_faces
+        )
         _, Er_diffusion = self._er_diffusion(Er)
         SourceEr = self.Er_relax * (self.DEr * Er_diffusion - ambi_term)
         if self.boundary_mode == "floating_ambipolar_edge":
-            SourceEr = SourceEr.at[-1].set(-self.Er_relax * self._outer_face_ambi_term(state, Gamma, plasma_permitivity))
+            SourceEr = SourceEr.at[-1].set(
+                -self.Er_relax * self._outer_face_ambi_term(
+                    state, Gamma, plasma_permitivity, Gamma_faces
+                )
+            )
         SourceEr = self.enforce_dirichlet_boundary_rhs(state, SourceEr)
         return SourceEr
 
@@ -1042,6 +1152,8 @@ def build_electric_field_equation(
     charge_qp,
     bc_gamma,
     bc_er,
+    bc_density=None,
+    bc_temperature=None,
     Er_relax=1.0,
     DEr=1.0,
     source_mode="ambipolar_local",
@@ -1173,6 +1285,15 @@ def build_electric_field_equation(
                 ),
             )
             return -er_cell_var.face_grad()
+    def face_state_builder(state):
+        return build_face_transport_state(
+            state,
+            field,
+            bc_density=bc_density,
+            bc_temperature=bc_temperature,
+            bc_er=bc_er,
+            reconstruction=reconstruction,
+        )
     return ElectricFieldEquation(
         dr_cells=dr_cells,
         Vprime=Vprime,
@@ -1183,6 +1304,7 @@ def build_electric_field_equation(
         permitivity_prefactor=permitivity_prefactor,
         gamma_faces_builder=gamma_faces_builder,
         er_diffusive_flux_builder=er_diffusive_flux_builder,
+        face_state_builder=face_state_builder,
         er_bc_model=bc_er,
         source_mode=str(source_mode).strip().lower(),
         permitivity_mode=str(permitivity_mode).strip().lower(),
@@ -1257,6 +1379,9 @@ def build_equation_system(
         "temperature_include_work_term",
         solver_cfg.get("temperature_include_work_source_term", True),
     )
+    work_term_reconstruction = solver_cfg.get(
+        "temperature_work_term_reconstruction", "center"
+    )
     convection_reconstruction = solver_cfg.get("temperature_convection_reconstruction", "closure_face_flux")
     heat_flux_reconstruction = solver_cfg.get("temperature_heat_flux_reconstruction", "closure_face_flux")
     density_floor = solver_cfg.get("density_floor", DEFAULT_TRANSPORT_DENSITY_FLOOR)
@@ -1293,6 +1418,7 @@ def build_equation_system(
             include_turbulent_convection=include_turbulent_convection,
             include_classical_convection=include_classical_convection,
             include_work_term=include_work_term,
+            work_term_reconstruction=work_term_reconstruction,
             convection_reconstruction=convection_reconstruction,
             heat_flux_reconstruction=heat_flux_reconstruction,
             density_floor=density_floor,
@@ -1307,6 +1433,8 @@ def build_equation_system(
             charge_qp,
             bc_gamma,
             bc_er,
+            bc_density=bc_density,
+            bc_temperature=bc_temperature,
             Er_relax=Er_relax,
             DEr=DEr,
             source_mode=Er_source_mode,
