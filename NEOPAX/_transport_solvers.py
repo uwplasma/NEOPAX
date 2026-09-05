@@ -10085,6 +10085,46 @@ def _radau_debug_stage_state_trace(
     normalized_displacement = (stage_states - flat_y[None, :]) / endpoint_scale[None, :]
     stage_rms = jnp.sqrt(jnp.mean(normalized_displacement * normalized_displacement, axis=1))
     stage_index = jnp.argmax(stage_rms)
+    # Keep this separate from the per-field raw extrema below.  The latter are
+    # useful physically, while this identifies the *scaled transport degree of
+    # freedom* which makes the trial stage large enough to shrink ``dt``.
+    # ``stage_history`` is the RHS evaluated at the final Newton stage, so no
+    # extra transport/NTX evaluation is introduced by this diagnostic.
+    scaled_flat_index = jnp.argmax(jnp.abs(normalized_displacement[stage_index]))
+    scaled_delta = stage_states[stage_index, scaled_flat_index] - flat_y[scaled_flat_index]
+    scaled_component = normalized_displacement[stage_index, scaled_flat_index]
+    scaled_rhs = stages[stage_index, scaled_flat_index]
+    density_end = kernel_context.density_size
+    pressure_end = density_end + kernel_context.pressure_size
+    scaled_block = jnp.where(
+        scaled_flat_index < density_end,
+        jnp.asarray(0, dtype=jnp.int32),
+        jnp.where(
+            scaled_flat_index < pressure_end,
+            jnp.asarray(1, dtype=jnp.int32),
+            jnp.asarray(2, dtype=jnp.int32),
+        ),
+    )
+    scaled_local_index = jnp.where(
+        scaled_flat_index < density_end,
+        scaled_flat_index,
+        jnp.where(
+            scaled_flat_index < pressure_end,
+            scaled_flat_index - density_end,
+            scaled_flat_index - pressure_end,
+        ),
+    )
+    n_radius = jnp.maximum(jnp.asarray(kernel_context.er_size, dtype=jnp.int32), 1)
+    scaled_species = jnp.where(
+        scaled_block < 2,
+        scaled_local_index // n_radius,
+        jnp.asarray(-1, dtype=jnp.int32),
+    )
+    scaled_radius = jnp.where(
+        scaled_block < 2,
+        scaled_local_index % n_radius,
+        scaled_local_index,
+    )
     selected_flat = stage_states[stage_index]
     base_state = physics_context.unpack_flat(flat_y)
     selected_state = physics_context.unpack_flat(selected_flat)
@@ -10120,6 +10160,19 @@ def _radau_debug_stage_state_trace(
         iters=newton_iter_count,
         theta=theta_final,
         residual=final_residual_norm,
+        ordered=True,
+    )
+    jax.debug.print(
+        "[radau-stage-state] dominant-scaled-stage: block={block} (0=density,1=pressure,2=Er) "
+        "species_slot={species} radius={radius} state={state:.6e} delta={delta:.6e} "
+        "delta_over_transport_scale={scaled:.6e} stage_rhs={rhs:.6e}",
+        block=scaled_block,
+        species=scaled_species,
+        radius=scaled_radius,
+        state=flat_y[scaled_flat_index],
+        delta=scaled_delta,
+        scaled=scaled_component,
+        rhs=scaled_rhs,
         ordered=True,
     )
     jax.debug.print(
