@@ -704,15 +704,23 @@ def test_database_local_bootstrap_state_pullback_matches_full_upar_jvp(
     actual_root_geometry_flat = jnp.concatenate(
         tuple(
             jnp.ravel(jnp.asarray(leaf))
-            for leaf in jax.tree_util.tree_leaves(actual_root_geometry_bars)
-            if jnp.issubdtype(jnp.asarray(leaf).dtype, jnp.inexact)
+            for leaf, primal_leaf in zip(
+                jax.tree_util.tree_leaves(actual_root_geometry_bars),
+                jax.tree_util.tree_leaves(geometry),
+                strict=True,
+            )
+            if jnp.issubdtype(jnp.asarray(primal_leaf).dtype, jnp.inexact)
         )
     )
     expected_root_geometry_flat = jnp.concatenate(
         tuple(
             jnp.ravel(jnp.asarray(leaf))
-            for leaf in jax.tree_util.tree_leaves(expected_root_geometry_bars)
-            if jnp.issubdtype(jnp.asarray(leaf).dtype, jnp.inexact)
+            for leaf, primal_leaf in zip(
+                jax.tree_util.tree_leaves(expected_root_geometry_bars),
+                jax.tree_util.tree_leaves(geometry),
+                strict=True,
+            )
+            if jnp.issubdtype(jnp.asarray(primal_leaf).dtype, jnp.inexact)
         )
     )
     assert jnp.linalg.norm(
