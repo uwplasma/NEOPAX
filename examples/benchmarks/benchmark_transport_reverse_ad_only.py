@@ -194,6 +194,7 @@ from NEOPAX._transport_flux_models import (  # noqa: E402
     _float_delta_tree_like,
     _sanitize_float_delta_bar_tree,
 )
+from NEOPAX._state import safe_density, safe_temperature  # noqa: E402
 from NEOPAX._transport_solvers import (  # noqa: E402
     _RadauAcceptedStepReducedCotangent,
     _build_prepared_radau_accepted_rollout,
@@ -740,7 +741,15 @@ def _initial_state_for_parameter_vector(
     )
     density_state = jnp.asarray(profile_set.density, dtype=baseline_state.density.dtype) / 1.0e20
     temperature_state = jnp.asarray(profile_set.temperature, dtype=baseline_state.pressure.dtype) / 1.0e3
-    pressure_state = density_state * temperature_state
+    solver_cfg = {} if config is None else dict(config.get("transport_solver", {}))
+    fallback_solver_cfg = {} if config is None else dict(config.get("solver", {}))
+    density_floor = solver_cfg.get("density_floor", fallback_solver_cfg.get("density_floor", 1.0e-6))
+    temperature_floor = solver_cfg.get("temperature_floor", fallback_solver_cfg.get("temperature_floor"))
+    # Keep this benchmark seam identical to _orchestrator._build_state.  This
+    # matters for a zero-concentration, fixed-temperature species such as He:
+    # its pressure must retain the density-floor times configured temperature.
+    temperature_state = safe_temperature(temperature_state, temperature_floor)
+    pressure_state = temperature_state * safe_density(density_state, density_floor)
     state = dataclasses.replace(
         baseline_state,
         density=density_state,
@@ -5946,6 +5955,7 @@ def main() -> None:
             "bicgstab",
             "block",
             "block_colored_ntss_midpoint",
+            "block_colored_database",
             "block_explicit_ntx_jacobian",
             "block_frozen_forward_jacobian",
             "gmres",
@@ -5964,6 +5974,10 @@ def main() -> None:
             "NTSS-midpoint model: it reconstructs the dense block transpose from "
             "colored local actions plus the analytic rank-three correction, then "
             "uses the same dense multi-RHS solve as 'block'; "
+            "'block_colored_database' reconstructs the exact direct-database "
+            "block-tridiagonal transpose from colored custom state-transpose "
+            "actions, then solves its exact radial block-tridiagonal multi-RHS "
+            "system without materializing a dense stage matrix; "
             "'block_explicit_ntx_jacobian' keeps the exact block system but materializes "
             "each fixed-lagged NTX stage Jacobian from the explicit state pullback; "
             "'block_frozen_forward_jacobian' uses each replayed primal step's frozen "
@@ -5973,6 +5987,25 @@ def main() -> None:
             "'woodbury_matvec_compact' builds the same Woodbury system from the compact "
             "transpose matvec instead of jacfwd; 'woodbury_er_coeff_compact' uses compact "
             "radial bands plus a skinny Er-coefficient Woodbury correction."
+        ),
+    )
+    parser.add_argument(
+        "--ntx-scan-coefficient-reverse-mode",
+        choices=("config", "generic", "structured"),
+        default="config",
+        help=(
+            "Live NTX-scan database coefficient reverse rule. 'generic' keeps "
+            "the taped scan JAX VJP; 'structured' uses the opt-in compact "
+            "prepared coefficient adjoint. This applies only to ntx_scan_runtime."
+        ),
+    )
+    parser.add_argument(
+        "--ntx-scan-record-primal",
+        action="store_true",
+        help=(
+            "Opt in to the recorded structured NTX scan reverse path for a live "
+            "database. It retains the initial scan primal and folds one accumulated "
+            "database cotangent after the segmented reverse sweep."
         ),
     )
     parser.add_argument(
@@ -6230,12 +6263,13 @@ def main() -> None:
     )
     parser.add_argument(
         "--reverse-rhs-transpose-mode",
-        choices=("generic", "explicit_ntx_interpolated"),
+        choices=("generic", "explicit_ntx_interpolated", "explicit_database"),
         default="explicit_ntx_interpolated",
         help=(
             "RHS-state transpose used inside exact reverse stage-adjoint matvecs. "
             "'generic' is the known-good JAX VJP reference; "
-            "'explicit_ntx_interpolated' opts into the experimental explicit NTX state pullback."
+            "'explicit_ntx_interpolated' opts into the experimental explicit NTX state pullback; "
+            "'explicit_database' uses the direct black-box database state boundary."
         ),
     )
     parser.add_argument(
@@ -6399,6 +6433,15 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--diagnose-database-runtime-build-timing",
+        action="store_true",
+        help=(
+            "Database-only diagnostic: synchronize and print VMEC, geometry, "
+            "scan-input, NTX-database, and initial-root setup timings. This "
+            "intentionally perturbs device scheduling and is off by default."
+        ),
+    )
+    parser.add_argument(
         "--local-transpose-diagnostic-first-rebuild",
         action="store_true",
         help=(
@@ -6517,6 +6560,8 @@ def main() -> None:
         radau_jacobian_reuse_mode=args.radau_jacobian_reuse_mode,
     )
     _apply_transport_solver_backend_override(config, args.transport_solver_backend_override)
+    if bool(args.diagnose_database_runtime_build_timing):
+        config.setdefault("diagnostics", {})["database_runtime_build_timing"] = True
     if bool(args.transport_solver_forward_smoke) and args.accepted_step_limit is not None:
         config.setdefault("transport_solver", {})["stop_after_accepted_steps"] = int(args.accepted_step_limit)
     neoclassical_cfg = config.setdefault("neoclassical", {})
@@ -6526,6 +6571,39 @@ def main() -> None:
         neoclassical_cfg["ntx_exact_radial_batch_mode"] = str(args.ntx_radial_batch_mode)
     if args.ntx_scan_batch_size not in (None, 0):
         neoclassical_cfg["ntx_exact_scan_batch_size"] = int(args.ntx_scan_batch_size)
+    if args.ntx_scan_coefficient_reverse_mode != "config":
+        neoclassical_cfg["ntx_scan_coefficient_reverse_mode"] = str(
+            args.ntx_scan_coefficient_reverse_mode
+        )
+    if args.ntx_scan_record_primal:
+        if args.ntx_scan_coefficient_reverse_mode == "generic":
+            parser.error(
+                "--ntx-scan-record-primal requires "
+                "--ntx-scan-coefficient-reverse-mode structured (or a TOML structured mode)."
+            )
+        neoclassical_cfg["ntx_scan_record_primal"] = True
+    is_database_reverse = (
+        str(neoclassical_cfg.get("flux_model", "")).strip().lower()
+        == "ntx_scan_runtime"
+        and str(args.reverse_parameter_mode) == "profiles_plus_realtime_geometry"
+        and str(args.reverse_rhs_transpose_mode).strip().lower()
+        in {"explicit_database", "database", "explicit_black_box_database"}
+    )
+    if is_database_reverse and not bool(
+        neoclassical_cfg.get("ntx_scan_record_primal", False)
+    ):
+        parser.error(
+            "--reverse-rhs-transpose-mode explicit_database requires a recorded "
+            "database. Add --ntx-scan-coefficient-reverse-mode structured "
+            "--ntx-scan-record-primal."
+        )
+    if is_database_reverse and str(
+        neoclassical_cfg.get("ntx_scan_coefficient_reverse_mode", "generic")
+    ).strip().lower() != "structured":
+        parser.error(
+            "--reverse-rhs-transpose-mode explicit_database requires "
+            "ntx_scan_coefficient_reverse_mode='structured'."
+        )
     if args.ntx_exact_preload_support != "config":
         neoclassical_cfg["preload_support"] = args.ntx_exact_preload_support == "true"
     profile_cfg = _baseline_profile_cfg(config)

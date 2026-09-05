@@ -6418,6 +6418,19 @@ def build_runtime_context_for_geometry_param(
     step_size: float | None = None,
     jacobian_penalty: float = 1.0e3,
 ):
+    # The runtime database benchmark is intentionally timed at the same
+    # boundaries as its reverse path.  Keep this database-only: exact-Lij
+    # construction retains its established quiet setup behaviour.
+    database_runtime_timing = (
+        str(config.get("neoclassical", {}).get("flux_model", "")).strip().lower()
+        == "ntx_scan_runtime"
+        and bool(
+            config.get("diagnostics", {}).get(
+                "database_runtime_build_timing", False
+            )
+        )
+    )
+    phase_start = time.perf_counter()
     state_vmec = _solve_state_for_single_param(
         context,
         param_delta,
@@ -6426,11 +6439,19 @@ def build_runtime_context_for_geometry_param(
         step_size=step_size,
         jacobian_penalty=jacobian_penalty,
     )
+    if database_runtime_timing:
+        jax.block_until_ready(jax.tree_util.tree_leaves(state_vmec))
+        print(
+            "[NEOPAX] database runtime build: VMEC solve ready "
+            f"elapsed_s={time.perf_counter() - phase_start:.3f}",
+            flush=True,
+        )
     return build_runtime_context_for_vmec_state(
         config,
         context,
         state_vmec,
         n_r=n_r,
+        database_runtime_timing=database_runtime_timing,
     )
 
 
@@ -6440,6 +6461,7 @@ def build_runtime_context_for_vmec_state(
     state_vmec,
     *,
     n_r: int,
+    database_runtime_timing: bool = False,
 ):
     from NEOPAX._orchestrator import (
         Models,
@@ -6455,7 +6477,15 @@ def build_runtime_context_for_vmec_state(
     )
     from NEOPAX._source_models import build_source_models_from_config
 
+    phase_start = time.perf_counter()
     geometry = _build_neopax_geometry_from_state(context, state_vmec, n_r=n_r)
+    if database_runtime_timing:
+        jax.block_until_ready(jax.tree_util.tree_leaves(geometry))
+        print(
+            "[NEOPAX] database runtime build: transport geometry ready "
+            f"elapsed_s={time.perf_counter() - phase_start:.3f}",
+            flush=True,
+        )
     species = _build_species(config)
     energy_grid = _build_energy_grid(config)
     database = _build_database(config, geometry)
@@ -6485,6 +6515,7 @@ def build_runtime_context_for_vmec_state(
             raise ValueError(
                 "ntx_scan_runtime with realtime geometry requires neoclassical.ntx_scan_rho."
             )
+        phase_start = time.perf_counter()
         scan_channels, scan_surfaces = build_ntx_runtime_scan_inputs_from_vmec_state(
             context,
             state_vmec,
@@ -6497,12 +6528,39 @@ def build_runtime_context_for_vmec_state(
         neoclassical_cfg["vmec_file"] = None
         neoclassical_cfg["boozer_file"] = None
         config_eff["neoclassical"] = neoclassical_cfg
+        if database_runtime_timing:
+            jax.block_until_ready(
+                jax.tree_util.tree_leaves((scan_channels, scan_surfaces))
+            )
+            print(
+                "[NEOPAX] database runtime build: scan inputs ready "
+                f"elapsed_s={time.perf_counter() - phase_start:.3f}",
+                flush=True,
+            )
     solver_cfg = _normalize_solver_config(config_eff)
     source_models = build_source_models_from_config(config, species)
+    phase_start = time.perf_counter()
     models = Models(
         flux=_build_flux_model(config_eff, species, energy_grid, geometry, database, source_models=source_models),
         source=source_models,
     )
+    if database_runtime_timing:
+        runtime_database = getattr(
+            getattr(models.flux, "neoclassical_model", None), "database", None
+        )
+        if runtime_database is not None:
+            jax.block_until_ready(
+                tuple(
+                    getattr(runtime_database, name)
+                    for name in ("D11_log", "D13", "D33")
+                    if hasattr(runtime_database, name)
+                )
+            )
+        print(
+            "[NEOPAX] database runtime build: NTX database ready "
+            f"elapsed_s={time.perf_counter() - phase_start:.3f}",
+            flush=True,
+        )
     runtime = RuntimeContext(
         species=species,
         energy_grid=energy_grid,
@@ -6513,7 +6571,15 @@ def build_runtime_context_for_vmec_state(
     )
     mode = str(config_eff.get("general", {}).get("mode", config_eff.get("mode", "transport"))).strip().lower()
     if mode != "ambipolarity":
+        phase_start = time.perf_counter()
         state = _maybe_initialize_er_from_ambipolarity(config_eff, runtime, state)
+        if database_runtime_timing:
+            jax.block_until_ready(jax.tree_util.tree_leaves(state))
+            print(
+                "[NEOPAX] database runtime build: initial ambipolar root ready "
+                f"elapsed_s={time.perf_counter() - phase_start:.3f}",
+                flush=True,
+            )
     state = _apply_configured_er_dirichlet_boundaries(config_eff, state)
     return runtime, state
 

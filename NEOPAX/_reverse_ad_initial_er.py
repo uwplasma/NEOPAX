@@ -119,6 +119,61 @@ def initial_er_charge_flux_residual_er_derivative(state, er_profile, *, runtime)
     )
 
 
+def compact_initial_er_database_support_bars(
+    *, runtime, state, er_profile, residual_bars, support
+):
+    """Map selected-root charge-residual bars to recorded database tables.
+
+    The selected-root residual uses the local particle flux.  Its only
+    database-dependent contribution is therefore the neoclassical ``Gamma``
+    channel, with cotangent ``Z_a * residual_bar``.  This companion to the
+    black-box direct-RHS rule intentionally stops at the explicit database
+    leaf; the caller folds the accumulated table bars through the retained
+    runtime scan exactly once.
+    """
+    if not isinstance(support, dict) or "database" not in support:
+        raise ValueError(
+            "Compact database initial-Er support pullback requires an explicit "
+            "recorded database support leaf."
+        )
+    runtime_scan = find_ntx_runtime_scan_model_in_model(runtime.models.flux)
+    if runtime_scan is None:
+        raise ValueError(
+            "Compact database initial-Er support pullback requires an NTX runtime scan model."
+        )
+    er_profile = jnp.asarray(er_profile, dtype=state.Er.dtype)
+    residual_bars = jnp.asarray(residual_bars, dtype=state.Er.dtype)
+    if residual_bars.ndim != 2 or residual_bars.shape[1] != er_profile.shape[0]:
+        raise ValueError(
+            "Compact database initial-Er support pullback expects residual_bars "
+            "with shape (objective_count, radial_count)."
+        )
+    state_with_er = dataclasses.replace(state, Er=er_profile)
+    charge_qp = jnp.asarray(runtime.species.charge_qp, dtype=state.Er.dtype)
+
+    def _one_objective(residual_bar):
+        gamma_bar = charge_qp[:, None] * residual_bar[None, :]
+        pullback = getattr(
+            runtime_scan, "pullback_local_particle_flux_support_payload", None
+        )
+        if not callable(pullback):
+            raise ValueError(
+                "Runtime database model did not expose its local particle-flux transpose."
+            )
+        support_bar = pullback(
+            state_with_er,
+            {"Gamma": gamma_bar},
+            support,
+        )
+        if support_bar is None or "database" not in support_bar:
+            raise ValueError(
+                "Runtime database model did not expose its direct particle-flux transpose."
+            )
+        return support_bar["database"]
+
+    return jax.vmap(_one_objective)(residual_bars)
+
+
 def _replace_ntx_support_payload_in_model(model, support):
     if model is None or not dataclasses.is_dataclass(model) or isinstance(model, type):
         return model, False
@@ -204,6 +259,40 @@ def find_ntx_runtime_scan_model_in_model(model):
     return None
 
 
+def runtime_without_recorded_ntx_scan_primal(runtime):
+    """Drop the retained scan record from runtime objects used inside segment VJPs.
+
+    The record contains full prepared NTX systems and is needed only after the
+    transport sweep, when the accumulated database cotangent is transposed.
+    Leaving it captured by every generic black-box stage VJP unnecessarily
+    retains those systems in each compiled reverse closure.  The returned
+    runtime keeps the already-built database, channels and surfaces unchanged.
+    """
+
+    def _strip(model):
+        if model is None or not dataclasses.is_dataclass(model) or isinstance(model, type):
+            return model, False
+        if isinstance(model, NTXRuntimeScanTransportModel):
+            if model.scan_primal_record is None and model.scan_primal is None:
+                return model, False
+            return dataclasses.replace(
+                model, scan_primal_record=None, scan_primal=None
+            ), True
+        updates = {}
+        changed = False
+        for field in dataclasses.fields(model):
+            replacement, child_changed = _strip(getattr(model, field.name))
+            if child_changed:
+                updates[field.name] = replacement
+                changed = True
+        return (dataclasses.replace(model, **updates), True) if changed else (model, False)
+
+    flux_model, changed = _strip(runtime.models.flux)
+    if not changed:
+        return runtime
+    return dataclasses.replace(runtime, models=dataclasses.replace(runtime.models, flux=flux_model))
+
+
 def realtime_geometry_payload_for_runtime(runtime):
     """Return the additive tagged geometry payload for a supported runtime.
 
@@ -238,19 +327,32 @@ def realtime_geometry_payload_for_runtime(runtime):
 def realtime_geometry_reverse_support_payload_for_runtime(runtime):
     """Return only the differentiable support leaves for a runtime payload.
 
-    A live runtime scan deliberately excludes its cached database: it is
-    regenerated from geometry/channels/surfaces by the NTX scan model during
-    the support VJP.  Keeping the cache out prevents it becoming an unrelated
-    independent cotangent leaf.
+    A normal live runtime scan deliberately excludes its cached database: it
+    is regenerated from geometry/channels/surfaces by the NTX scan model during
+    the support VJP.  The opt-in recorded route instead exposes that database
+    as a fixed explicit leaf, then folds its accumulated cotangent through the
+    retained NTX scan primal after the segmented sweep.
     """
 
     payload = realtime_geometry_payload_for_runtime(runtime)
     if payload["kind"] == "ntx_scan_runtime":
-        return {
+        support = {
             "geometry": payload["geometry"],
             "channels": payload["channels"],
             "surfaces": payload["surfaces"],
         }
+        runtime_scan = find_ntx_runtime_scan_model_in_model(runtime.models.flux)
+        if (
+            runtime_scan is not None
+            and bool(getattr(runtime_scan, "record_scan_primal", False))
+            and runtime_scan.scan_primal_record is not None
+            and runtime_scan.database is not None
+        ):
+            # This is an explicit differentiable leaf only for the recorded
+            # route.  Its accumulated bar is folded back into channels and
+            # surfaces exactly once after the segmented sweep.
+            support["database"] = runtime_scan.database
+        return support
     if payload["kind"] == "ntx_exact":
         return {
             "geometry": payload["geometry"],
@@ -262,6 +364,131 @@ def realtime_geometry_reverse_support_payload_for_runtime(runtime):
             "database": payload["database"],
         }
     raise ValueError(f"Unknown realtime geometry payload kind {payload['kind']!r}.")
+
+
+def fold_recorded_ntx_scan_database_bar_into_support(runtime, support_bar):
+    """Consume a recorded scan database bar after a segmented reverse sweep.
+
+    Per-step reverse treats ``database`` as a fixed explicit leaf.  This
+    helper performs the single retained NTX coefficient transpose afterwards
+    and returns the ordinary VMEC scan-support shape, with no database leaf.
+    """
+    if not isinstance(support_bar, dict) or "database" not in support_bar:
+        return support_bar
+    runtime_scan = find_ntx_runtime_scan_model_in_model(runtime.models.flux)
+    if runtime_scan is None:
+        raise ValueError("Recorded database support bar requires an NTX runtime scan model.")
+    database_support_bar = runtime_scan.recorded_runtime_database_support_bar(
+        support_bar["database"]
+    )
+    merged = dict(support_bar)
+    merged.pop("database")
+    for key in ("channels", "surfaces"):
+        if key not in merged:
+            raise ValueError(f"Recorded database support bar is missing direct {key!r} support.")
+        merged[key] = _add_float_delta_tree(merged[key], database_support_bar[key])
+    return merged
+
+
+def fold_recorded_ntx_scan_database_bars_into_support(runtime, support_bars):
+    """Fold a table of recorded database bars through one batched scan transpose.
+
+    The outer transport reverse carries one support bar per objective.  Doing
+    the retained NTX coefficient transpose separately for every row would
+    avoid the database rebuild but would still repeat its prepared adjoint.
+    Stack those independent database bars and let ``vmap`` form one batched
+    retained-scan pullback instead.  The returned tuple has exactly the same
+    row order and support-tree contract as the input.
+    """
+    support_bars = tuple(support_bars)
+    if not support_bars or not isinstance(support_bars[0], dict):
+        return support_bars
+    if "database" not in support_bars[0]:
+        return support_bars
+    if any("database" not in bar for bar in support_bars):
+        raise ValueError("Recorded database support bars must use one consistent tree.")
+    runtime_scan = find_ntx_runtime_scan_model_in_model(runtime.models.flux)
+    if runtime_scan is None:
+        raise ValueError("Recorded database support bars require an NTX runtime scan model.")
+
+    database_bars = jax.tree_util.tree_map(
+        lambda *values: jnp.stack(values),
+        *(bar["database"] for bar in support_bars),
+    )
+    database_support_bars = jax.vmap(
+        runtime_scan.recorded_runtime_database_support_bar,
+    )(database_bars)
+
+    def _row(tree, index):
+        return jax.tree_util.tree_map(lambda value: value[index], tree)
+
+    folded = []
+    for index, support_bar in enumerate(support_bars):
+        merged = dict(support_bar)
+        merged.pop("database")
+        database_support_bar = _row(database_support_bars, index)
+        for key in ("channels", "surfaces"):
+            if key not in merged:
+                raise ValueError(f"Recorded database support bar is missing direct {key!r} support.")
+            merged[key] = _add_float_delta_tree(merged[key], database_support_bar[key])
+        folded.append(merged)
+    return tuple(folded)
+
+
+def fold_recorded_ntx_scan_database_bar_groups_into_support(runtime, bar_groups):
+    """Fold every report-row database bar through one retained scan transpose.
+
+    ``support_bars`` and the named component bars describe the same transport
+    reverse but used to call the retained scan VJP once per report group.  The
+    database is fixed throughout all of those groups, so concatenate their
+    objective rows and execute one batched scan transpose, then restore the
+    original grouping.  This is reporting-only bookkeeping: it changes no
+    cotangent, objective, or Lij path.
+    """
+    groups = tuple(tuple(group) for group in bar_groups)
+    indexed_bars = tuple(
+        (group_index, row_index, bar)
+        for group_index, group in enumerate(groups)
+        for row_index, bar in enumerate(group)
+        if isinstance(bar, dict) and "database" in bar
+    )
+    if not indexed_bars:
+        return groups
+    if any(
+        not isinstance(bar, dict) or "database" not in bar
+        for group in groups
+        for bar in group
+    ):
+        raise ValueError(
+            "Recorded database support-bar groups must consistently carry a database leaf."
+        )
+    runtime_scan = find_ntx_runtime_scan_model_in_model(runtime.models.flux)
+    if runtime_scan is None:
+        raise ValueError("Recorded database support bars require an NTX runtime scan model.")
+
+    database_bars = jax.tree_util.tree_map(
+        lambda *values: jnp.stack(values),
+        *(bar["database"] for _group_index, _row_index, bar in indexed_bars),
+    )
+    database_support_bars = jax.vmap(
+        runtime_scan.recorded_runtime_database_support_bar,
+    )(database_bars)
+
+    rebuilt = [list(group) for group in groups]
+    for batch_index, (group_index, row_index, support_bar) in enumerate(indexed_bars):
+        database_support_bar = jax.tree_util.tree_map(
+            lambda value: value[batch_index], database_support_bars
+        )
+        merged = dict(support_bar)
+        merged.pop("database")
+        for key in ("channels", "surfaces"):
+            if key not in merged:
+                raise ValueError(
+                    f"Recorded database support bar is missing direct {key!r} support."
+                )
+            merged[key] = _add_float_delta_tree(merged[key], database_support_bar[key])
+        rebuilt[group_index][row_index] = merged
+    return tuple(tuple(group) for group in rebuilt)
 
 
 def _replace_database_payload_in_model(model, database):
@@ -380,9 +607,10 @@ def runtime_with_realtime_geometry_reverse_support_payload(runtime, support_payl
                 "geometry": support_payload["geometry"],
                 "channels": support_payload["channels"],
                 "surfaces": support_payload["surfaces"],
-                # Deliberately clear the old cache. ``with_runtime_scan_payload``
-                # rebuilds it through the live NTX scan when the model is used.
-                "database": None,
+                # Legacy payloads clear the cache and rebuild it.  The
+                # recorded path supplies an explicit database leaf instead,
+                # so the inner VJP differentiates interpolation only.
+                "database": support_payload.get("database"),
             },
         )
     if kind == "ntx_exact":
