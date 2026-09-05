@@ -930,6 +930,11 @@ class ElectricFieldEquation(EquationBase):
     er_diffusive_flux_builder: callable = dataclasses.field(repr=False)
     face_state_builder: callable = dataclasses.field(repr=False, default=None)
     er_bc_model: object = dataclasses.field(repr=False, default=None)
+    # The axis face is not a state/geometry centre.  This value is used only
+    # when a face-completed ambipolar source needs a left-face prefactor.
+    axis_face_permitivity_prefactor: jax.Array | None = dataclasses.field(
+        repr=False, default=None
+    )
     source_mode: str = "ambipolar_local"
     permitivity_mode: str = "neopax_local"
     Er_relax: float = 1.0
@@ -1013,6 +1018,13 @@ class ElectricFieldEquation(EquationBase):
                     self.permitivity_prefactor[-1:],
                 )
             )
+            # Do not regularize the first finite-radius centre.  The axis
+            # guard belongs only to the synthetic left face used by this
+            # face-completed reconstruction.
+            if self.axis_face_permitivity_prefactor is not None:
+                face_prefactor = face_prefactor.at[0].set(
+                    self.axis_face_permitivity_prefactor
+                )
             face_mass_density = DENSITY_STATE_TO_PHYSICAL * jnp.sum(
                 self.species_mass[:, None] * face_state.density, axis=0
             )
@@ -1090,6 +1102,8 @@ class ElectricFieldEquation(EquationBase):
             state, Gamma, plasma_permitivity, Gamma_faces
         )
         er_diffusive_flux, er_diffusion = self._er_diffusion(Er)
+        ambipolar_rhs = -self.Er_relax * ambi_term
+        diffusion_rhs = self.Er_relax * self.DEr * er_diffusion
         return {
             "charge_flux": charge_flux,
             "plasma_permitivity": plasma_permitivity,
@@ -1097,6 +1111,9 @@ class ElectricFieldEquation(EquationBase):
             "ambi_term_edge": ambi_term_edge,
             "er_diffusive_flux": er_diffusive_flux,
             "er_diffusion": er_diffusion,
+            "ambipolar_rhs": ambipolar_rhs,
+            "diffusion_rhs": diffusion_rhs,
+            "unconstrained_rhs": diffusion_rhs + ambipolar_rhs,
         }
 
     def __call__(self, state, fluxes=None):
@@ -1168,8 +1185,13 @@ def build_electric_field_equation(
     psi_den_active = jnp.abs(psi_den) > 0.0
     psi_den_safe = jnp.where(psi_den_active, psi_den, 1.0)
     psi_fac = 1.0 + jnp.where(psi_den_active, 1.0 / psi_den_safe, 0.0)
-    psi_fac = psi_fac.at[0].set(1.0)
+    # ``field`` quantities live at cell centres.  Index zero is therefore the
+    # first finite-radius centre, not the magnetic-axis boundary face; retain
+    # its evaluated geometry factor rather than applying an axis override.
     permitivity_prefactor = psi_fac / jnp.square(field.B0)
+    # Preserve the historical axis regularization only for reconstructions at
+    # the axis face. ``field.B0[0]`` is the nearest available centre value.
+    axis_face_permitivity_prefactor = 1.0 / jnp.square(field.B0[0])
     mid_idx = int(field.r_grid.shape[0] // 2)
     ntss_B0_mid = jnp.asarray(field.B0[mid_idx])
     ntss_psfactor_mid = jnp.asarray(psi_fac[mid_idx])
@@ -1306,6 +1328,7 @@ def build_electric_field_equation(
         er_diffusive_flux_builder=er_diffusive_flux_builder,
         face_state_builder=face_state_builder,
         er_bc_model=bc_er,
+        axis_face_permitivity_prefactor=axis_face_permitivity_prefactor,
         source_mode=str(source_mode).strip().lower(),
         permitivity_mode=str(permitivity_mode).strip().lower(),
         Er_relax=Er_relax,
@@ -3066,6 +3089,31 @@ class ComposedEquationSystem:
     def evaluate_with_lagged_response(self, t, state, runtime, lagged_response):
         del t, runtime
         return self._evaluate_state(state, lagged_response=lagged_response)
+
+    def debug_er_components_with_lagged_response(self, state, lagged_response):
+        """Return the assembled Er terms using an existing cached flux response.
+
+        This is deliberately diagnostic-only: it evaluates the inexpensive
+        cached-response assembly but never builds a new NTX response.
+        """
+        working_state, _ = self._prepare_working_state(state)
+        density_eq, temperature_eq, er_eq = self._resolve_equations()
+        del density_eq, temperature_eq
+        if (
+            er_eq is None
+            or self.shared_flux_model is None
+            or lagged_response is None
+            or lagged_response.flux_response is None
+        ):
+            return None
+        shared_fluxes = self.shared_flux_model.evaluate_with_lagged_response(
+            working_state,
+            lagged_response.flux_response,
+            **self._shared_flux_bc_kwargs(),
+        )
+        components = er_eq.debug_components(working_state, fluxes=shared_fluxes)
+        er_rhs = er_eq(working_state, fluxes=shared_fluxes)
+        return components, er_rhs
 
     def evaluate_with_lagged_response_tangent(
         self, t, state, state_direction, runtime, lagged_response

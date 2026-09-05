@@ -4551,8 +4551,20 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
                 final_objective_state_elapsed += time.perf_counter() - component_start
         objective_values_rows.append(objective_value)
         final_y_bar_rows.append(final_y_bar)
+        # Ordinary terminal objectives depend directly on the final state and
+        # transport geometry, not on an NTX support/table leaf.  A live
+        # database scan without ``--ntx-scan-record-primal`` deliberately has
+        # ``geometry/channels/surfaces`` but no explicit ``database`` leaf;
+        # it still uses this geometry-only terminal boundary.  Grouping the
+        # ordinary objectives is therefore valid for both recorded and live
+        # database payloads and avoids the old scalar-only fallback.
+        is_live_database_support = (
+            "channels" in support_payload and "surfaces" in support_payload
+        )
         if combined_geometry_payload and (
-            "ntx_support" in support_payload or "database" in support_payload
+            "ntx_support" in support_payload
+            or "database" in support_payload
+            or is_live_database_support
         ):
             if final_objective_cotangent_mode == "grouped_vjp":
                 geometry_objective_bar = grouped_geometry_bars[objective_i]

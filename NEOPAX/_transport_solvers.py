@@ -930,6 +930,13 @@ def _lagged_response_hooks(vector_field: Callable):
     return None, None
 
 
+def _lagged_response_er_component_debug_hook(vector_field: Callable):
+    """Return the cached-response Er decomposition supplied by an RHS owner."""
+    owner = getattr(vector_field, "__self__", None)
+    debug_fn = None if owner is None else getattr(owner, "debug_er_components_with_lagged_response", None)
+    return debug_fn if callable(debug_fn) else None
+
+
 def _lagged_response_tangent_hook(vector_field: Callable):
     """Return the optional split cached-response tangent supplied by the RHS owner."""
     owner = getattr(vector_field, "__self__", None)
@@ -4598,6 +4605,7 @@ class _RadauAcceptedStepPhysicsContext:
     pullback_build_lagged_response: Callable[[Any, Any], Any] | None
     flat_rhs: Callable[[Any, Any], Any]
     flat_rhs_with_lagged_response: Callable[[Any, Any, Any], Any]
+    debug_er_components_with_lagged_response: Callable[[Any, Any], Any] | None = None
     flat_rhs_with_lagged_response_tangent: Callable[[Any, Any, Any, Any], Any] | None = None
     flat_rhs_lagged_response_pullback: Callable[[Any, Any, Any, Any], Any] | None = None
     flat_rhs_build_support_pullback: Callable[[Any, Any, Any], Any] | None = None
@@ -9266,6 +9274,7 @@ def _radau_attempt_step_forward_solver(
             t_value=carry_in.t,
             h_value=trial_dt,
             stage_history=stage_history,
+            lagged_response=lagged_response_out,
             accepted=jnp.logical_and(converged, err_norm <= 1.0),
             converged=converged,
             err_norm=err_norm,
@@ -10067,6 +10076,7 @@ def _radau_debug_stage_state_trace(
     t_value,
     h_value,
     stage_history,
+    lagged_response,
     accepted,
     converged,
     err_norm,
@@ -10162,6 +10172,67 @@ def _radau_debug_stage_state_trace(
         residual=final_residual_norm,
         ordered=True,
     )
+    # The callback is supplied only by the transport equation system.  It
+    # evaluates the already cached lagged flux response, so it adds no NTX
+    # rebuild and is active only under this explicit trace flag.
+    er_component_debug = physics_context.debug_er_components_with_lagged_response
+    if er_component_debug is not None and lagged_response is not None:
+        er_debug_value = er_component_debug(base_state, lagged_response)
+        stage_er_debug_value = er_component_debug(
+            selected_state, lagged_response
+        )
+        if er_debug_value is not None and stage_er_debug_value is not None:
+            er_components, er_rhs = er_debug_value
+            stage_er_components, stage_er_rhs = stage_er_debug_value
+            er_radius = jnp.minimum(
+                scaled_radius,
+                jnp.asarray(er_rhs.shape[0] - 1, dtype=scaled_radius.dtype),
+            )
+            er_flat_index = pressure_end + er_radius
+            stage_er_k = stages[stage_index, er_flat_index]
+            stage_er_residual = stage_er_k - stage_er_rhs[er_radius]
+            jax.debug.print(
+            "[radau-Er-components] radius={radius} base: Er={base_er:.6e} "
+            "charge_flux={base_charge_flux:.6e} plasma_permitivity={base_permitivity:.6e} "
+            "ambi_term={base_ambi:.6e} diffusion={base_diffusion:.6e} "
+            "ambipolar_rhs={base_ambi_rhs:.6e} diffusion_rhs={base_diff_rhs:.6e} "
+            "unconstrained_rhs={base_unconstrained:.6e} final_rhs={base_rhs:.6e}",
+            radius=er_radius,
+            base_er=base_state.Er[er_radius],
+            base_charge_flux=er_components["charge_flux"][er_radius],
+            base_permitivity=er_components["plasma_permitivity"][er_radius],
+            base_ambi=er_components["ambi_term"][er_radius],
+            base_diffusion=er_components["er_diffusion"][er_radius],
+            base_ambi_rhs=er_components["ambipolar_rhs"][er_radius],
+            base_diff_rhs=er_components["diffusion_rhs"][er_radius],
+            base_unconstrained=er_components["unconstrained_rhs"][er_radius],
+            base_rhs=er_rhs[er_radius],
+                ordered=True,
+            )
+            jax.debug.print(
+            "[radau-Er-components] radius={radius} stage: Er={stage_er:.6e} "
+            "charge_flux={stage_charge_flux:.6e} plasma_permitivity={stage_permitivity:.6e} "
+            "ambi_term={stage_ambi:.6e} diffusion={stage_diffusion:.6e} "
+            "ambipolar_rhs={stage_ambi_rhs:.6e} diffusion_rhs={stage_diff_rhs:.6e} "
+            "unconstrained_rhs={stage_unconstrained:.6e} final_rhs={stage_rhs:.6e} "
+            "stage_K={stage_k:.6e} stage_residual_K_minus_F={stage_residual:.6e} "
+            "diffusive_face_left={face_left:.6e} diffusive_face_right={face_right:.6e}",
+            radius=er_radius,
+            stage_er=selected_state.Er[er_radius],
+            stage_charge_flux=stage_er_components["charge_flux"][er_radius],
+            stage_permitivity=stage_er_components["plasma_permitivity"][er_radius],
+            stage_ambi=stage_er_components["ambi_term"][er_radius],
+            stage_diffusion=stage_er_components["er_diffusion"][er_radius],
+            stage_ambi_rhs=stage_er_components["ambipolar_rhs"][er_radius],
+            stage_diff_rhs=stage_er_components["diffusion_rhs"][er_radius],
+            stage_unconstrained=stage_er_components["unconstrained_rhs"][er_radius],
+            stage_rhs=stage_er_rhs[er_radius],
+            stage_k=stage_er_k,
+            stage_residual=stage_er_residual,
+            face_left=stage_er_components["er_diffusive_flux"][er_radius],
+            face_right=stage_er_components["er_diffusive_flux"][er_radius + 1],
+                ordered=True,
+            )
     jax.debug.print(
         "[radau-stage-state] dominant-scaled-stage: block={block} (0=density,1=pressure,2=Er) "
         "species_slot={species} radius={radius} state={state:.6e} delta={delta:.6e} "
@@ -20226,6 +20297,9 @@ def _build_prepared_radau_accepted_rollout(
 
     flat_rhs = _flat_rhs_factory(unpack_flat, vector_field, args, kwargs, project_flat=project_flat)
     build_lagged_response_raw, _ = _lagged_response_hooks(vector_field)
+    debug_er_components_with_lagged_response = _lagged_response_er_component_debug_hook(
+        vector_field
+    )
     (
         build_lagged_response_with_compact_coefficient_record,
         compact_coefficient_record_zero,
@@ -20778,6 +20852,7 @@ def _build_prepared_radau_accepted_rollout(
         compact_coefficient_record_zero=compact_coefficient_record_zero,
         flat_rhs=flat_rhs,
         flat_rhs_with_lagged_response=flat_rhs_with_lagged_response,
+        debug_er_components_with_lagged_response=debug_er_components_with_lagged_response,
         flat_rhs_with_lagged_response_tangent=flat_rhs_with_lagged_response_tangent,
         flat_rhs_lagged_response_pullback=flat_rhs_lagged_response_pullback,
         flat_rhs_build_support_pullback=flat_rhs_build_support_pullback,
@@ -21002,6 +21077,9 @@ class RADAUSolver(_RadauSolverConfig):
         )
         flat_rhs = _flat_rhs_factory(unpack_flat, vector_field, args, kwargs, project_flat=project_flat)
         build_lagged_response_raw, _ = _lagged_response_hooks(vector_field)
+        debug_er_components_with_lagged_response = _lagged_response_er_component_debug_hook(
+            vector_field
+        )
         (
             build_lagged_response_with_compact_coefficient_record,
             compact_coefficient_record_zero,
@@ -21537,6 +21615,7 @@ class RADAUSolver(_RadauSolverConfig):
             compact_coefficient_record_zero=compact_coefficient_record_zero,
             flat_rhs=flat_rhs,
             flat_rhs_with_lagged_response=flat_rhs_with_lagged_response,
+            debug_er_components_with_lagged_response=debug_er_components_with_lagged_response,
             flat_rhs_with_lagged_response_tangent=flat_rhs_with_lagged_response_tangent,
             flat_rhs_lagged_response_pullback=flat_rhs_lagged_response_pullback,
             flat_rhs_build_support_pullback=flat_rhs_build_support_pullback,

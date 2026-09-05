@@ -59,11 +59,22 @@ def get_plasma_permitivity(state, species_mass, geometry, grid_x):
     psi_den_active = jnp.abs(psi_den) > 0.0
     psi_den_safe = jnp.where(psi_den_active, psi_den, 1.0)
     psi_fac = 1.0 + jnp.where(psi_den_active, 1.0 / psi_den_safe, 0.0)
-    psi_fac = psi_fac.at[0].set(1.0)
+    # Geometry is evaluated at cell centres, so index zero is not the axis
+    # face.  Keep the physically evaluated first-centre factor in sync with
+    # the transport Er equation.
     mass_density = DENSITY_STATE_TO_PHYSICAL * jnp.sum(species_mass[:, None] * state.density, axis=0)
     epsilon_r = mass_density * psi_fac / jnp.square(geometry.B0)
     plasma_permitivity = interpax.Interpolator1D(geometry.r_grid, epsilon_r, extrap=True)
-    return plasma_permitivity(grid_x)
+    evaluated = plasma_permitivity(grid_x)
+    # This helper may be queried at the axis face although its primitive
+    # geometry/state samples are cell-centred.  Apply the regularized factor
+    # only for that synthetic face; centre evaluations retain ``psi_fac``.
+    axis_face_value = mass_density[0] / jnp.square(geometry.B0[0])
+    return jnp.where(
+        jnp.asarray(grid_x) == jnp.asarray(geometry.r_grid_half[0]),
+        axis_face_value,
+        evaluated,
+    )
 
 
 def _as_species_constraint(arr, n_species):
