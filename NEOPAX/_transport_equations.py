@@ -1808,22 +1808,62 @@ class ComposedEquationSystem:
             )
             geometry = support["geometry"]
             geometry_delta0 = _float_delta_tree_like(geometry)
-            def _rhs_from_geometry_delta(geometry_delta):
-                geometry_payload = (
-                    {"geometry": _add_float_delta_tree(geometry, geometry_delta),
-                     "ntx_support": support["ntx_support"]}
-                    if is_exact_ntx_support
-                    else {**support, "geometry": _add_float_delta_tree(geometry, geometry_delta)}
-                )
-                return self.with_realtime_geometry_support_payload(
-                    geometry_payload
-                )(t, state, runtime)
-
-            _, geometry_pullback = jax.vjp(
-                _rhs_from_geometry_delta,
-                geometry_delta0,
+            flux_geometry_pullback = getattr(
+                self.shared_flux_model,
+                "pullback_direct_rhs_geometry_by_radius",
+                None,
             )
-            (geometry_bar,) = geometry_pullback(rhs_bar)
+            if is_recorded_database_support and callable(flux_geometry_pullback):
+                # Split the black-box geometry transpose at the same flux
+                # boundary used for its state and table transposes.  The
+                # compact database rule owns direct Gamma/Q/Upar geometry;
+                # retain a small generic VJP only for equation-owned metric
+                # terms, with those fluxes explicitly held fixed.
+                flux_geometry_bar = flux_geometry_pullback(
+                    working_state, flux_bar, geometry
+                )
+
+                def _equation_geometry_with_fixed_fluxes(geometry_delta):
+                    geometry_payload = {
+                        **support,
+                        "geometry": _add_float_delta_tree(geometry, geometry_delta),
+                    }
+                    system = self.with_realtime_geometry_support_payload(
+                        geometry_payload
+                    )
+                    fixed_working_state, fixed_eidx = system._prepare_working_state(state)
+                    return system._evaluate_with_shared_fluxes_from_working_state(
+                        fixed_working_state,
+                        fixed_eidx,
+                        state,
+                        shared_fluxes,
+                    )
+
+                _, equation_geometry_pullback = jax.vjp(
+                    _equation_geometry_with_fixed_fluxes,
+                    geometry_delta0,
+                )
+                (equation_geometry_bar,) = equation_geometry_pullback(rhs_bar)
+                geometry_bar = _add_float_delta_tree(
+                    flux_geometry_bar, equation_geometry_bar
+                )
+            else:
+                def _rhs_from_geometry_delta(geometry_delta):
+                    geometry_payload = (
+                        {"geometry": _add_float_delta_tree(geometry, geometry_delta),
+                         "ntx_support": support["ntx_support"]}
+                        if is_exact_ntx_support
+                        else {**support, "geometry": _add_float_delta_tree(geometry, geometry_delta)}
+                    )
+                    return self.with_realtime_geometry_support_payload(
+                        geometry_payload
+                    )(t, state, runtime)
+
+                _, geometry_pullback = jax.vjp(
+                    _rhs_from_geometry_delta,
+                    geometry_delta0,
+                )
+                (geometry_bar,) = geometry_pullback(rhs_bar)
             if is_recorded_database_support:
                 # The black-box database model intentionally returns only
                 # its three interpolation-table cotangents.  It cannot (and

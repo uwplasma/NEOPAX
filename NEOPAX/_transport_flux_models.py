@@ -1625,6 +1625,72 @@ class CombinedTransportFluxModel(TransportFluxModelBase):
             state_bar = _add(state_bar, model_state_bar)
         return state_bar
 
+    def pullback_direct_rhs_geometry_by_radius(self, state, flux_bar, geometry):
+        """Split direct-flux geometry bars without tracing the database table.
+
+        The neoclassical database branch uses its compact local rule.  Any
+        optional non-neoclassical model retains a small model-local VJP so the
+        composite contract remains exact when, for example, turbulence owns a
+        geometry-dependent coefficient.
+        """
+        if self.center_flux_mode != "direct":
+            return None
+        neo_pullback = getattr(
+            self.neoclassical_model,
+            "pullback_direct_rhs_geometry_by_radius",
+            None,
+        )
+        if not callable(neo_pullback):
+            return None
+        zero = jnp.zeros_like(jnp.asarray(state.density))
+
+        def _bar(name):
+            value = flux_bar.get(name, None)
+            if value is None:
+                return zero
+            value = jnp.asarray(value)
+            return zero if value.ndim == 0 or value.dtype == jax.dtypes.float0 else value
+
+        geometry_bar = neo_pullback(
+            state,
+            {
+                "Gamma": _bar("Gamma") + _bar("Gamma_neo"),
+                "Q": _bar("Q") + _bar("Q_neo"),
+                "Upar": _bar("Upar") + _bar("Upar_neo"),
+            },
+            geometry,
+        )
+        geometry_delta0 = _float_delta_tree_like(geometry)
+        for model, suffix in (
+            (self.turbulent_model, "turb"),
+            (self.classical_model, "classical"),
+        ):
+            if isinstance(model, ZeroTransportModel):
+                continue
+            field_name = (
+                "geometry" if hasattr(model, "geometry") else
+                "field" if hasattr(model, "field") else None
+            )
+            if field_name is None:
+                continue
+
+            def _model_fluxes(geometry_delta, model_value=model, name=field_name):
+                return dataclasses.replace(
+                    model_value,
+                    **{name: _add_float_delta_tree(geometry, geometry_delta)},
+                )(state)
+
+            _, pullback = jax.vjp(_model_fluxes, geometry_delta0)
+            (model_bar,) = pullback(
+                {
+                    "Gamma": _bar("Gamma") + _bar(f"Gamma_{suffix}"),
+                    "Q": _bar("Q") + _bar(f"Q_{suffix}"),
+                    "Upar": _bar("Upar") + _bar(f"Upar_{suffix}"),
+                }
+            )
+            geometry_bar = _add_float_delta_tree(geometry_bar, model_bar)
+        return geometry_bar
+
     def pullback_direct_rhs_support_payload(self, state, flux_bar, support):
         """Return the neoclassical direct-support bar for a black-box RHS.
 
