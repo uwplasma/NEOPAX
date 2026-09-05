@@ -6263,10 +6263,12 @@ def main() -> None:
     )
     parser.add_argument(
         "--reverse-rhs-transpose-mode",
-        choices=("generic", "explicit_ntx_interpolated", "explicit_database"),
-        default="explicit_ntx_interpolated",
+        choices=("config", "generic", "explicit_ntx_interpolated", "explicit_database"),
+        default="config",
         help=(
-            "RHS-state transpose used inside exact reverse stage-adjoint matvecs. "
+            "RHS-state transpose used inside reverse stage-adjoint matvecs. "
+            "'config' selects explicit_ntx_interpolated for exact-Lij and "
+            "explicit_database for ntx_scan_runtime. "
             "'generic' is the known-good JAX VJP reference; "
             "'explicit_ntx_interpolated' opts into the experimental explicit NTX state pullback; "
             "'explicit_database' uses the direct black-box database state boundary."
@@ -6565,6 +6567,26 @@ def main() -> None:
     if bool(args.transport_solver_forward_smoke) and args.accepted_step_limit is not None:
         config.setdefault("transport_solver", {})["stop_after_accepted_steps"] = int(args.accepted_step_limit)
     neoclassical_cfg = config.setdefault("neoclassical", {})
+    is_database_geometry_reverse = (
+        str(neoclassical_cfg.get("flux_model", "")).strip().lower()
+        == "ntx_scan_runtime"
+        and str(args.reverse_parameter_mode) == "profiles_plus_realtime_geometry"
+    )
+    if str(args.reverse_rhs_transpose_mode).strip().lower() == "config":
+        args.reverse_rhs_transpose_mode = (
+            "explicit_database"
+            if is_database_geometry_reverse
+            else "explicit_ntx_interpolated"
+        )
+    if (
+        str(args.reverse_rhs_transpose_mode) == "explicit_ntx_interpolated"
+        and str(args.reverse_stage_adjoint_solve_mode) == "gmres"
+    ):
+        raise SystemExit(
+            "[autodiff-gate] --reverse-rhs-transpose-mode explicit_ntx_interpolated is not ready for "
+            "JAX scipy GMRES. Use bicgstab for this experimental mode while the NTX RHS-state "
+            "transpose is being specialized."
+        )
     if args.ntx_radial_batch_size not in (None, 0):
         neoclassical_cfg["ntx_exact_radial_batch_size"] = int(args.ntx_radial_batch_size)
     if args.ntx_radial_batch_mode not in (None, ""):
@@ -6582,28 +6604,29 @@ def main() -> None:
                 "--ntx-scan-coefficient-reverse-mode structured (or a TOML structured mode)."
             )
         neoclassical_cfg["ntx_scan_record_primal"] = True
-    is_database_reverse = (
-        str(neoclassical_cfg.get("flux_model", "")).strip().lower()
-        == "ntx_scan_runtime"
-        and str(args.reverse_parameter_mode) == "profiles_plus_realtime_geometry"
-        and str(args.reverse_rhs_transpose_mode).strip().lower()
-        in {"explicit_database", "database", "explicit_black_box_database"}
-    )
-    if is_database_reverse and not bool(
-        neoclassical_cfg.get("ntx_scan_record_primal", False)
-    ):
-        parser.error(
-            "--reverse-rhs-transpose-mode explicit_database requires a recorded "
-            "database. Add --ntx-scan-coefficient-reverse-mode structured "
-            "--ntx-scan-record-primal."
-        )
-    if is_database_reverse and str(
-        neoclassical_cfg.get("ntx_scan_coefficient_reverse_mode", "generic")
-    ).strip().lower() != "structured":
-        parser.error(
-            "--reverse-rhs-transpose-mode explicit_database requires "
-            "ntx_scan_coefficient_reverse_mode='structured'."
-        )
+    if is_database_geometry_reverse:
+        # This is the normal database reverse architecture, not an optional
+        # benchmark tuning: one recorded scan build feeds fixed-table segment
+        # work and one post-sweep scan transpose.
+        requested_scan_mode = str(
+            neoclassical_cfg.get("ntx_scan_coefficient_reverse_mode", "generic")
+        ).strip().lower()
+        if args.ntx_scan_coefficient_reverse_mode == "generic":
+            parser.error(
+                "ntx_scan_runtime realtime reverse requires the structured recorded "
+                "database path; generic scan reverse is a legacy diagnostic only."
+            )
+        if requested_scan_mode not in {"generic", "structured"}:
+            parser.error(
+                "ntx_scan_runtime realtime reverse requires a structured scan coefficient mode."
+            )
+        if str(args.reverse_rhs_transpose_mode).strip().lower() != "explicit_database":
+            parser.error(
+                "ntx_scan_runtime realtime reverse requires "
+                "--reverse-rhs-transpose-mode explicit_database (or config)."
+            )
+        neoclassical_cfg["ntx_scan_coefficient_reverse_mode"] = "structured"
+        neoclassical_cfg["ntx_scan_record_primal"] = True
     if args.ntx_exact_preload_support != "config":
         neoclassical_cfg["preload_support"] = args.ntx_exact_preload_support == "true"
     profile_cfg = _baseline_profile_cfg(config)

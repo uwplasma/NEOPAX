@@ -919,6 +919,7 @@ def build_face_transport_state(
     reconstruction: str = "linear",
     density_floor: Any = DEFAULT_TRANSPORT_DENSITY_FLOOR,
     temperature_floor: Any = DEFAULT_TRANSPORT_TEMPERATURE_FLOOR,
+    er_edge_override: Any = None,
 ) -> FaceTransportState:
     state = apply_transport_density_floor(state, density_floor)
     state = apply_transport_temperature_floor(state, temperature_floor, density_floor)
@@ -943,11 +944,9 @@ def build_face_transport_state(
         bc_model=bc_er,
         reconstruction=reconstruction,
     )
-    # The floating-edge-node mode owns a distinct physical outer-face value.
-    # It replaces no interior reconstructed face.
-    er_edge = getattr(state, "Er_edge", None)
-    if er_edge is not None:
-        er_faces = er_faces.at[-1].set(jnp.asarray(er_edge, dtype=er_faces.dtype))
+    # The node-boundary solve owns this value outside TransportState.
+    if er_edge_override is not None:
+        er_faces = er_faces.at[-1].set(jnp.asarray(er_edge_override, dtype=er_faces.dtype))
     return FaceTransportState(
         density=density_faces,
         pressure=pressure_faces,
@@ -965,6 +964,7 @@ def build_evaluated_transport_state(
     reconstruction: str = "linear",
     density_floor: Any = DEFAULT_TRANSPORT_DENSITY_FLOOR,
     temperature_floor: Any = DEFAULT_TRANSPORT_TEMPERATURE_FLOOR,
+    er_edge_override: Any = None,
 ) -> EvaluatedTransportState:
     center_state = apply_transport_density_floor(state, density_floor)
     center_state = apply_transport_temperature_floor(center_state, temperature_floor, density_floor)
@@ -977,6 +977,7 @@ def build_evaluated_transport_state(
         reconstruction=reconstruction,
         density_floor=density_floor,
         temperature_floor=temperature_floor,
+        er_edge_override=er_edge_override,
     )
     density_center = safe_density(center_state.density, density_floor)
     temperature_center = safe_temperature(center_state.temperature, temperature_floor)
@@ -1238,6 +1239,8 @@ def _build_evaluated_transport_state_directional(
     reconstruction: str = "linear",
     density_floor: Any = DEFAULT_TRANSPORT_DENSITY_FLOOR,
     temperature_floor: Any = DEFAULT_TRANSPORT_TEMPERATURE_FLOOR,
+    er_edge_override: Any = None,
+    er_edge_direction: Any = None,
 ) -> _DirectionalEvaluatedTransportState:
     """Explicit fixed-anchor state response through the FV evaluation layer."""
     center = _DirectionalTransportState(
@@ -1268,15 +1271,14 @@ def _build_evaluated_transport_state_directional(
     # A floating edge node is an independent scalar direction.  Replace only
     # the outer face jet, preserving the usual directional FV reconstruction
     # on all interior faces.
-    if getattr(state, "Er_edge", None) is not None:
-        edge_direction = getattr(state_direction, "Er_edge", None)
-        if edge_direction is None:
-            edge_direction = jnp.zeros_like(state.Er_edge)
+    if er_edge_override is not None:
+        if er_edge_direction is None:
+            er_edge_direction = jnp.zeros_like(er_edge_override)
         er_face = dataclasses.replace(
             er_face,
-            value=er_face.value.at[-1].set(state.Er_edge),
-            first=er_face.first.at[-1].set(edge_direction),
-            second=er_face.second.at[-1].set(jnp.zeros_like(state.Er_edge)),
+            value=er_face.value.at[-1].set(er_edge_override),
+            first=er_face.first.at[-1].set(er_edge_direction),
+            second=er_face.second.at[-1].set(jnp.zeros_like(er_edge_override)),
         )
     face = _DirectionalTransportState(
         density=density_face,
