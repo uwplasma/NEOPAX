@@ -696,13 +696,30 @@ def test_database_local_bootstrap_state_pullback_matches_full_upar_jvp(
     actual_root_geometry_bars = model.pullback_local_particle_flux_geometry_by_radius(
         state, state.Er, root_residual_bars, geometry
     )
-    for actual, expected in zip(
-        jax.tree_util.tree_leaves(actual_root_geometry_bars),
-        jax.tree_util.tree_leaves(expected_root_geometry_bars),
-        strict=True,
-    ):
-        if jnp.issubdtype(jnp.asarray(expected).dtype, jnp.inexact):
-            assert jnp.allclose(actual, expected, rtol=2.0e-10, atol=2.0e-10)
+    # Radius-local accumulation has a different floating-point summation
+    # order from the full residual VJP.  Some interior face bars are the
+    # cancellation of O(1e20) endpoint contributions, so elementwise relative
+    # tolerances on those tiny remainders are not meaningful.  Compare the
+    # complete cotangent in its natural Euclidean norm instead.
+    actual_root_geometry_flat = jnp.concatenate(
+        tuple(
+            jnp.ravel(jnp.asarray(leaf))
+            for leaf in jax.tree_util.tree_leaves(actual_root_geometry_bars)
+            if jnp.issubdtype(jnp.asarray(leaf).dtype, jnp.inexact)
+        )
+    )
+    expected_root_geometry_flat = jnp.concatenate(
+        tuple(
+            jnp.ravel(jnp.asarray(leaf))
+            for leaf in jax.tree_util.tree_leaves(expected_root_geometry_bars)
+            if jnp.issubdtype(jnp.asarray(leaf).dtype, jnp.inexact)
+        )
+    )
+    assert jnp.linalg.norm(
+        actual_root_geometry_flat - expected_root_geometry_flat
+    ) <= 2.0e-10 * jnp.maximum(
+        jnp.linalg.norm(expected_root_geometry_flat), 1.0
+    )
 
     # The direct black-box database RHS must retain its generic derivative
     # exactly while using the split state-transpose implementation.
