@@ -6571,6 +6571,28 @@ def main() -> None:
                 "--ntx-scan-coefficient-reverse-mode structured (or a TOML structured mode)."
             )
         neoclassical_cfg["ntx_scan_record_primal"] = True
+    is_database_reverse = (
+        str(neoclassical_cfg.get("flux_model", "")).strip().lower()
+        == "ntx_scan_runtime"
+        and str(args.reverse_parameter_mode) == "profiles_plus_realtime_geometry"
+        and str(args.reverse_rhs_transpose_mode).strip().lower()
+        in {"explicit_database", "database", "explicit_black_box_database"}
+    )
+    if is_database_reverse and not bool(
+        neoclassical_cfg.get("ntx_scan_record_primal", False)
+    ):
+        parser.error(
+            "--reverse-rhs-transpose-mode explicit_database requires a recorded "
+            "database. Add --ntx-scan-coefficient-reverse-mode structured "
+            "--ntx-scan-record-primal."
+        )
+    if is_database_reverse and str(
+        neoclassical_cfg.get("ntx_scan_coefficient_reverse_mode", "generic")
+    ).strip().lower() != "structured":
+        parser.error(
+            "--reverse-rhs-transpose-mode explicit_database requires "
+            "ntx_scan_coefficient_reverse_mode='structured'."
+        )
     if args.ntx_exact_preload_support != "config":
         neoclassical_cfg["preload_support"] = args.ntx_exact_preload_support == "true"
     profile_cfg = _baseline_profile_cfg(config)
