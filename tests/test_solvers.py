@@ -1180,6 +1180,91 @@ def test_radau_floating_edge_node_uses_private_augmented_coordinate():
     assert int(prepared.initial_carry.y.shape[0]) == 7
 
 
+def test_radau_node_edge_live_probe_reaches_host_callback():
+    """The one-shot live probe must run after a fresh node-edge attempt.
+
+    This guards the host-loop wiring: a large edge Jacobian must not merely
+    appear in the compiled Newton trace while the requested direct comparison
+    is silently skipped.
+    """
+
+    class _NodeOwner:
+        er_equation = SimpleNamespace(boundary_mode="floating_ambipolar_edge_node")
+
+        def __init__(self):
+            self.probe_calls = 0
+
+        def __call__(self, _t, state, *_args):
+            return TransportState(
+                density=-0.1 * state.density,
+                pressure=-0.1 * state.pressure,
+                Er=-state.Er,
+            )
+
+        def build_lagged_response(self, state):
+            return state
+
+        def evaluate_with_lagged_response(self, _t, state, *_args, lagged_response):
+            del lagged_response
+            return self(0.0, state)
+
+        def build_node_boundary_lagged_response(self, state, er_edge):
+            del state
+            return er_edge
+
+        def evaluate_node_boundary_with_lagged_response(
+            self, state, er_edge, transport_response, *, er_edge_anchor
+        ):
+            del transport_response, er_edge_anchor
+            return self(0.0, state), -2.0e5 * er_edge
+
+        def debug_node_boundary_live_vs_lagged(
+            self, state, er_edge, transport_response, *, er_edge_anchor
+        ):
+            del state, transport_response, er_edge_anchor
+            self.probe_calls += 1
+            value = jnp.asarray(er_edge)
+            return {
+                "edge": value,
+                "edge_step": jnp.asarray(1.0e-6),
+                "cached_rhs": -2.0e5 * value,
+                "cached_drhs_dedge_fd": jnp.asarray(-2.0e5),
+                "live_rhs": -2.0e5 * value,
+                "live_drhs_dedge_fd": jnp.asarray(-2.0e5),
+                "state_last_center_Er": value,
+                "cached_gamma_by_species": jnp.asarray([0.0]),
+                "live_gamma_by_species": jnp.asarray([0.0]),
+                "face_density_by_species": jnp.asarray([1.0]),
+                "face_temperature_by_species": jnp.asarray([1.0]),
+            }
+
+    owner = _NodeOwner()
+    state0 = TransportState(
+        density=jnp.ones((1, 2)),
+        pressure=jnp.ones((1, 2)),
+        Er=jnp.asarray([1.0, 2.0]),
+    )
+    solver = RADAUSolver(
+        t0=0.0,
+        t1=1.0e-2,
+        dt=1.0e-3,
+        rtol=1.0e-6,
+        atol=1.0e-8,
+        rhs_mode="lagged_transport_response",
+        error_estimator="embedded2_ntss_transport_scale",
+        debug_walltime_attempts=True,
+        # The ordinary stage-state trace is the reliable arming path.  It is
+        # already active in the expensive diagnostic configuration, so a
+        # dropped optional TOML key cannot silently disable this probe.
+        debug_stage_state_trace=True,
+        maxiter=8,
+        max_steps=32,
+    )
+    solver.solve(state0, owner.__call__)
+
+    assert owner.probe_calls == 1
+
+
 def test_radau_floating_edge_node_allows_black_box_rhs():
     """The node is a discretization feature, not a lagged-response feature."""
 

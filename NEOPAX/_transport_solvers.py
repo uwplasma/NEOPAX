@@ -23036,6 +23036,19 @@ class RADAUSolver(_RadauSolverConfig):
         node_edge_live_probe_threshold = getattr(
             self, "debug_node_edge_live_probe_jacobian_threshold", None
         )
+        # ``radau_debug_stage_state_trace`` already means that the caller has
+        # explicitly opted into an expensive, host-visible stage diagnostic.
+        # Use it as the reliable arming path for the one decisive node-edge
+        # comparison.  The previous opt-in was silently absent when a config
+        # layer failed to propagate its new key, so the requested probe never
+        # ran.  A caller-provided threshold still takes precedence.
+        probe_armed_by_stage_trace = (
+            node_edge_live_probe_threshold is None
+            and use_node_boundary
+            and bool(getattr(self, "debug_stage_state_trace", False))
+        )
+        if probe_armed_by_stage_trace:
+            node_edge_live_probe_threshold = 1.0e5
         if node_edge_live_probe_threshold is not None:
             if not use_node_boundary:
                 raise ValueError(
@@ -23047,6 +23060,15 @@ class RADAUSolver(_RadauSolverConfig):
                     "radau_debug_node_edge_live_probe_jacobian_threshold requires "
                     "debug_walltime_attempts=true so the probe can run host-side."
                 )
+            # Print this before the attempt loop.  Thus a run can prove that
+            # the TOML value reached this particular solver instance even if
+            # no cache ever crosses the requested threshold.
+            print(
+                "[radau-node-edge-live-probe] armed "
+                f"jacobian_threshold={node_edge_live_probe_threshold:.6e} "
+                f"source={'stage_state_trace' if probe_armed_by_stage_trace else 'toml'}",
+                flush=True,
+            )
 
             def _node_edge_live_probe(
                 step_state_before_attempt, step_state_after_attempt, step_info, _attempt_idx
