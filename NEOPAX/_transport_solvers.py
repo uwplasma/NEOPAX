@@ -11040,8 +11040,19 @@ def _radau_exact_stage_residual_database_table_support_pullback_batched(
             "RHS pullback boundary."
         )
     residual_bars = jnp.asarray(residual_bars, dtype=kernel_context.dtype)
-    if residual_bars.ndim != 3:
-        raise ValueError("Batched Radau database table bars must have shape [objective, stage, state].")
+    if residual_bars.ndim == 2:
+        # The batched stage-adjoint transpose returns its Radau rows in the
+        # established flattened ``[objective, stage * state]`` layout.
+        # Scalar callers use the expanded layout below, so normalize both at
+        # this database-only boundary.
+        residual_bars = residual_bars.reshape(
+            (-1, kernel_context.num_stages, kernel_context.state_dim)
+        )
+    elif residual_bars.ndim != 3:
+        raise ValueError(
+            "Batched Radau database table bars must have shape "
+            "[objective, stage * state] or [objective, stage, state]."
+        )
     objective_count = residual_bars.shape[0]
     stages_final = primal_result.stage_history.reshape(
         (kernel_context.num_stages, kernel_context.state_dim)

@@ -2028,6 +2028,52 @@ def test_colored_database_stage_matrix_recovers_exact_tridiagonal_transpose(monk
     assert jnp.allclose(compact, dense, rtol=1.0e-12, atol=1.0e-12)
 
 
+def test_batched_database_stage_table_pullback_accepts_flattened_radau_rows():
+    """The compact stage-adjoint contract is [objective, stage * state]."""
+    dtype = jnp.float32
+    kernel_context = types.SimpleNamespace(
+        dtype=dtype,
+        num_stages=2,
+        state_dim=3,
+        c=jnp.asarray([0.0, 1.0], dtype=dtype),
+        a=jnp.eye(2, dtype=dtype),
+    )
+    carry = types.SimpleNamespace(
+        t=jnp.asarray(2.0, dtype=dtype),
+        y=jnp.asarray([1.0, 2.0, 3.0], dtype=dtype),
+    )
+    primal = types.SimpleNamespace(
+        trial_dt=jnp.asarray(0.5, dtype=dtype),
+        stage_history=jnp.arange(6, dtype=dtype),
+    )
+
+    def _database_table_pullback(_t, _y, rhs_bars, _support):
+        return {"table": rhs_bars}
+
+    physics_context = types.SimpleNamespace(
+        flat_rhs_direct_database_table_pullback_batched=_database_table_pullback,
+    )
+    flattened_rows = jnp.asarray(
+        [[1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+         [-2.0, 1.0, 0.5, 3.0, -1.0, 2.0]],
+        dtype=dtype,
+    )
+    actual_leaves = (
+        transport_solvers._radau_exact_stage_residual_database_table_support_pullback_batched(
+            kernel_context,
+            physics_context,
+            carry,
+            primal,
+            flattened_rows,
+            {"table": jnp.zeros((3,), dtype=dtype)},
+        )
+    )
+
+    expected = -flattened_rows.reshape(2, 2, 3).sum(axis=1)
+    assert len(actual_leaves) == 1
+    assert jnp.allclose(actual_leaves[0], expected)
+
+
 def test_approximate_tangent_lift_preserves_minimal_segment_record_contract():
     """Generic-RHS fallback must not demand controller fields from a compact record."""
     value = jnp.asarray(1.0)
