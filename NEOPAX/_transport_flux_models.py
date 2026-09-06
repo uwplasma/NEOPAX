@@ -2580,6 +2580,83 @@ class CombinedTransportFluxModel(TransportFluxModelBase):
         minus = self.evaluate_with_lagged_response(minus_state, lagged_response, **kwargs)
         return jax.tree_util.tree_map(lambda left, right: 0.5 * (left - right), plus, minus)
 
+    def evaluate_with_lagged_response_edge_tangent(
+        self,
+        state,
+        er_edge,
+        er_edge_direction,
+        lagged_response,
+        *,
+        er_edge_anchor,
+        **kwargs,
+    ):
+        """Exact quadratic directional tangent for the private outer Er node.
+
+        The full-state quadratic response is polarized along the explicit
+        outer-face coordinate, just as ``evaluate_with_lagged_response_tangent``
+        polarizes the public transport state.  The unit displacement is a
+        direction, not a finite-difference interval: for a quadratic response
+        ``(F(e + v) - F(e - v)) / 2 == F'(e) v`` exactly.
+        """
+        def _evaluate(edge_value):
+            return self.evaluate_with_lagged_response(
+                state,
+                lagged_response,
+                er_edge_override=edge_value,
+                er_edge_anchor=er_edge_anchor,
+                **kwargs,
+            )
+
+        plus = _evaluate(er_edge + er_edge_direction)
+        minus = _evaluate(er_edge - er_edge_direction)
+
+        def _polarize(left, right):
+            left_array = jnp.asarray(left)
+            if jnp.issubdtype(left_array.dtype, jnp.inexact):
+                return 0.5 * (left - right)
+            return jnp.zeros_like(left_array)
+
+        return jax.tree_util.tree_map(_polarize, plus, minus)
+
+    def pullback_evaluate_with_lagged_response_edge(
+        self,
+        state,
+        er_edge,
+        lagged_response,
+        flux_bar,
+        *,
+        er_edge_anchor,
+        **kwargs,
+    ):
+        """Analytic transpose from flux bars to the private edge scalar.
+
+        This is the exact transpose of the polarized quadratic edge tangent;
+        it deliberately does not invoke JAX VJP through ``er_edge_override``.
+        """
+        direction = jnp.ones_like(jnp.asarray(er_edge))
+        edge_flux_tangent = self.evaluate_with_lagged_response_edge_tangent(
+            state,
+            er_edge,
+            direction,
+            lagged_response,
+            er_edge_anchor=er_edge_anchor,
+            **kwargs,
+        )
+        complete_bar = _complete_flux_bar_like(
+            edge_flux_tangent,
+            flux_bar,
+            context="CombinedTransportFluxModel.response.private_edge",
+        )
+        contributions = [
+            jnp.sum(jnp.asarray(tangent) * jnp.asarray(bar))
+            for tangent, bar in zip(
+                jax.tree_util.tree_leaves(edge_flux_tangent),
+                jax.tree_util.tree_leaves(complete_bar),
+            )
+            if jnp.issubdtype(jnp.asarray(tangent).dtype, jnp.inexact)
+        ]
+        return sum(contributions, jnp.zeros_like(jnp.asarray(er_edge)))
+
     def pullback_evaluate_with_lagged_response(self, state, lagged_response, flux_bar, **kwargs):
         flux_bar = self._apply_center_flux_mode_pullback(flux_bar)
 

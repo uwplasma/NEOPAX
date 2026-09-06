@@ -3624,21 +3624,36 @@ class ComposedEquationSystem:
             state_flux_direction_raw,
         )
 
-        # The generic model tangent accepts a TransportState direction only.
-        # Obtain the one scalar edge contribution by JVP of the already-built
-        # response evaluation, never through build_lagged_response.
-        def _flux_from_edge(edge_value):
-            return self.shared_flux_model.evaluate_with_lagged_response(
-                working_state,
-                transport_response,
-                **self._shared_flux_call_kwargs({
-                    "er_edge_override": edge_value,
-                    "er_edge_anchor": er_edge_anchor,
-                }),
+        # The private edge direction has its own exact quadratic
+        # polarization rule.  Do not JVP through ``er_edge_override``: its
+        # generic AD path was inconsistent with both the cached polynomial
+        # and live NTX at the captured failure.
+        edge_tangent_fn = getattr(
+            self.shared_flux_model, "evaluate_with_lagged_response_edge_tangent", None
+        )
+        if not callable(edge_tangent_fn):
+            raise NotImplementedError(
+                "floating_ambipolar_edge_node quadratic refresh requires an "
+                "analytic cached edge tangent."
             )
 
-        _, edge_flux_direction = jax.jvp(
-            _flux_from_edge, (er_edge,), (er_edge_direction,)
+        def _edge_direction_tangent(_):
+            return edge_tangent_fn(
+                working_state,
+                er_edge,
+                er_edge_direction,
+                transport_response,
+                er_edge_anchor=er_edge_anchor,
+            )
+
+        def _zero_edge_tangent(_):
+            return jax.tree_util.tree_map(jnp.zeros_like, shared_fluxes)
+
+        edge_flux_direction = jax.lax.cond(
+            jnp.asarray(er_edge_direction) != 0,
+            _edge_direction_tangent,
+            _zero_edge_tangent,
+            operand=None,
         )
         # Flux payloads can contain integer/index metadata.  Their JVP leaves
         # must remain float0; only numerical leaves participate in the sum.
@@ -3674,6 +3689,68 @@ class ComposedEquationSystem:
             (working_direction, flux_direction, er_edge_direction),
         )
         return tangent
+
+    def pullback_node_boundary_with_lagged_response_edge(
+        self,
+        state,
+        er_edge,
+        transport_response,
+        rhs_bar,
+        *,
+        er_edge_anchor,
+    ):
+        """Exact cached transpose from node-RHS bars to ``Er_edge``.
+
+        The flux contribution uses the model's analytic edge-polarization
+        transpose.  The remaining finite-volume boundary assembly is a cheap
+        ordinary VJP at fixed cached fluxes.  No VJP crosses a live NTX solve
+        or the known-bad generic ``er_edge_override`` AD path.
+        """
+        _density_eq, _temperature_eq, er_eq = self._resolve_equations()
+        if er_eq is None or er_eq.boundary_mode != "floating_ambipolar_edge_node":
+            raise ValueError("Node edge pullback requested without floating_ambipolar_edge_node.")
+        if self.shared_flux_model is None:
+            raise ValueError("floating_ambipolar_edge_node requires a shared flux model.")
+        edge_pullback_fn = getattr(
+            self.shared_flux_model, "pullback_evaluate_with_lagged_response_edge", None
+        )
+        if not callable(edge_pullback_fn):
+            raise NotImplementedError(
+                "floating_ambipolar_edge_node reverse requires an analytic cached edge pullback."
+            )
+
+        working_state, eidx = self._prepare_working_state(state)
+        flux_kwargs = self._shared_flux_call_kwargs({
+            "er_edge_override": er_edge,
+            "er_edge_anchor": er_edge_anchor,
+        })
+        shared_fluxes = self.shared_flux_model.evaluate_with_lagged_response(
+            working_state, transport_response, **flux_kwargs
+        )
+
+        def _assemble(flux_value, edge_value):
+            core = self._evaluate_with_shared_fluxes_from_working_state(
+                working_state,
+                eidx,
+                state,
+                flux_value,
+                er_edge_override=edge_value,
+            )
+            edge = er_eq.edge_rhs(
+                working_state, fluxes=flux_value, er_edge_override=edge_value
+            )
+            return core, edge
+
+        _, assembly_pullback = jax.vjp(_assemble, shared_fluxes, er_edge)
+        flux_bar, direct_edge_bar = assembly_pullback(rhs_bar)
+        flux_edge_bar = edge_pullback_fn(
+            working_state,
+            er_edge,
+            transport_response,
+            flux_bar,
+            er_edge_anchor=er_edge_anchor,
+        )
+        return direct_edge_bar + flux_edge_bar
 
     def debug_node_boundary_live_vs_lagged(
         self,

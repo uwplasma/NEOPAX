@@ -21576,6 +21576,31 @@ def _build_prepared_radau_accepted_rollout(
                 (core_pack_state(core_tangent), jnp.reshape(edge_tangent, (1,)))
             )
 
+        def _node_lagged_rhs_state_pullback(t_value, flat_y, cache, rhs_bar_flat):
+            projected = _node_project_flat(flat_y)
+            cache = (
+                cache
+                if isinstance(cache, _RadauNodeBoundaryLaggedCache)
+                else _node_build_from_flat(projected)
+            )
+            # Retain the established public-state transpose, but replace the
+            # private scalar bar by the analytic edge-polarization transpose.
+            _, generic_pullback = jax.vjp(
+                lambda value: _node_lagged_rhs(t_value, value, cache), flat_y
+            )
+            (flat_bar,) = generic_pullback(rhs_bar_flat)
+            edge_bar = owner.pullback_node_boundary_with_lagged_response_edge(
+                _node_unpack_flat(projected),
+                projected[-1],
+                cache.transport_response,
+                # ``rhs_bar_flat[:-1]`` is already the public/core layout;
+                # do not pass it through the augmented-node unpacker, which
+                # would remove a second element.
+                (core_unpack_flat(rhs_bar_flat[:-1]), rhs_bar_flat[-1]),
+                er_edge_anchor=cache.er_edge_anchor,
+            )
+            return flat_bar.at[-1].set(edge_bar)
+
         setattr(
             _node_unpack_flat,
             "radau_node_build_lagged_response_from_flat",
@@ -21591,12 +21616,11 @@ def _build_prepared_radau_accepted_rollout(
         )
         flat_rhs_with_lagged_response = _node_lagged_rhs
         flat_rhs_with_lagged_response_tangent = _node_lagged_rhs_tangent
-        # Existing model hooks map the public three-field state only.  Let the
-        # generic VJP see the augmented edge coordinate until node-aware
-        # specialized hooks are supplied.
+        # Existing model hooks map the public three-field state only.  The
+        # node scalar receives the paired analytic transpose above.
         pullback_build_lagged_response = None
         flat_rhs_lagged_response_pullback = None
-        flat_rhs_state_pullback = None
+        flat_rhs_state_pullback = _node_lagged_rhs_state_pullback
         flat_rhs_state_and_lagged_response_pullback = None
         flat_rhs_lagged_response_all_pullback = None
         if str(getattr(solver, "lagged_jacobian_refresh_mode", "none")).strip().lower() not in {
@@ -22456,6 +22480,29 @@ class RADAUSolver(_RadauSolverConfig):
                     (_core_pack_state(core_tangent), jnp.reshape(edge_tangent, (1,)))
                 )
 
+            def _node_lagged_rhs_state_pullback(t_value, flat_y, cache, rhs_bar_flat):
+                projected = _node_project_flat(flat_y)
+                cache = (
+                    cache
+                    if isinstance(cache, _RadauNodeBoundaryLaggedCache)
+                    else _node_build_from_flat(projected)
+                )
+                _, generic_pullback = jax.vjp(
+                    lambda value: _node_lagged_rhs(t_value, value, cache), flat_y
+                )
+                (flat_bar,) = generic_pullback(rhs_bar_flat)
+                edge_bar = owner.pullback_node_boundary_with_lagged_response_edge(
+                    _node_unpack_flat(projected),
+                    projected[-1],
+                    cache.transport_response,
+                    # The bar excluding the private edge is already a core
+                    # flat state, so it must not be sliced by the node
+                    # unpacker a second time.
+                    (_core_unpack_flat(rhs_bar_flat[:-1]), rhs_bar_flat[-1]),
+                    er_edge_anchor=cache.er_edge_anchor,
+                )
+                return flat_bar.at[-1].set(edge_bar)
+
             setattr(
                 _node_unpack_flat,
                 "radau_node_build_lagged_response_from_flat",
@@ -22480,6 +22527,7 @@ class RADAUSolver(_RadauSolverConfig):
             )
             flat_rhs_with_lagged_response = _node_lagged_rhs
             flat_rhs_with_lagged_response_tangent = _node_lagged_rhs_tangent
+            flat_rhs_state_pullback = _node_lagged_rhs_state_pullback
             if str(getattr(self, "lagged_jacobian_refresh_mode", "none")).strip().lower() not in {
                 "none", "quadratic_colored_after_first"
             }:

@@ -9,6 +9,7 @@ import pytest
 import NEOPAX._transport_solvers as transport_solvers
 import NEOPAX._reverse_ad_transport as reverse_transport
 from NEOPAX._state import TransportState
+from NEOPAX._transport_flux_models import CombinedTransportFluxModel
 
 from NEOPAX._transport_solvers import (
     DiffraxSolver,
@@ -42,6 +43,41 @@ def _base_solver_parameters(**overrides):
     }
     params.update(overrides)
     return params
+
+
+def test_combined_private_edge_polarization_is_exact_quadratic_and_transposed():
+    """The private-node rule is an exact quadratic tangent, not an FD rule."""
+    model = object.__new__(CombinedTransportFluxModel)
+
+    def _quadratic_response(_self, _state, _response, *, er_edge_override, **_kwargs):
+        edge = jnp.asarray(er_edge_override)
+        return {"Gamma_faces": jnp.asarray([edge * edge, 3.0 * edge * edge])}
+
+    object.__setattr__(
+        model,
+        "evaluate_with_lagged_response",
+        types.MethodType(_quadratic_response, model),
+    )
+    edge = jnp.asarray(2.0)
+    direction = jnp.asarray(1.0)
+    tangent = model.evaluate_with_lagged_response_edge_tangent(
+        state=None,
+        er_edge=edge,
+        er_edge_direction=direction,
+        lagged_response=None,
+        er_edge_anchor=jnp.asarray(0.0),
+    )
+    # d/de [e^2, 3e^2] at e=2, applied to direction one.
+    assert jnp.allclose(tangent["Gamma_faces"], jnp.asarray([4.0, 12.0]))
+
+    edge_bar = model.pullback_evaluate_with_lagged_response_edge(
+        state=None,
+        er_edge=edge,
+        lagged_response=None,
+        flux_bar={"Gamma_faces": jnp.asarray([2.0, -0.5])},
+        er_edge_anchor=jnp.asarray(0.0),
+    )
+    assert jnp.allclose(edge_bar, jnp.asarray(2.0))
 
 
 def test_limm_w_config_keeps_current_flux_and_jacobian_reuse_separate():
@@ -1165,6 +1201,15 @@ def test_radau_floating_edge_node_uses_private_augmented_coordinate():
                 Er=er_rhs,
             ), -0.5 * er_edge_direction
 
+        def pullback_node_boundary_with_lagged_response_edge(
+            self, state, er_edge, transport_response, rhs_bar, *, er_edge_anchor
+        ):
+            del state, er_edge, transport_response, er_edge_anchor
+            core_bar, edge_bar = rhs_bar
+            # Core Er[-1] contains -0.25 * E_edge and the node RHS contains
+            # -0.5 * E_edge.
+            return -0.25 * core_bar.Er[-1] - 0.5 * edge_bar
+
     state0 = TransportState(
         density=jnp.ones((1, 2)),
         pressure=jnp.ones((1, 2)),
@@ -1184,11 +1229,12 @@ def test_radau_floating_edge_node_uses_private_augmented_coordinate():
         maxiter=8,
         max_steps=32,
     )
-    out = solver.solve(state0, _NodeOwner().__call__)
+    owner = _NodeOwner()
+    out = solver.solve(state0, owner.__call__)
     prepared = transport_solvers._build_prepared_radau_accepted_rollout(
         solver=solver,
         state=state0,
-        vector_field=_NodeOwner().__call__,
+        vector_field=owner.__call__,
         species=None,
     )
 
@@ -1199,6 +1245,14 @@ def test_radau_floating_edge_node_uses_private_augmented_coordinate():
     # The accepted-rollout builder is also the reverse replay entry point. It
     # must use the same private outer-Er coordinate as RADAUSolver.solve.
     assert int(prepared.initial_carry.y.shape[0]) == 7
+    rhs_bar = jnp.arange(7.0)
+    node_bar = prepared.physics_context.flat_rhs_state_pullback(
+        0.0,
+        prepared.initial_carry.y,
+        prepared.initial_carry.lagged_response_cache,
+        rhs_bar,
+    )
+    assert jnp.allclose(node_bar[-1], -0.25 * rhs_bar[-2] - 0.5 * rhs_bar[-1])
 
 
 def test_radau_node_edge_live_probe_reaches_host_callback():
