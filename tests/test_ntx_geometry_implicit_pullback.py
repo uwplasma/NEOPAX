@@ -19,6 +19,7 @@ from NEOPAX._transport_flux_models import (
     NTXExactLijRuntimeSupport,
     NTXExactLijRuntimeTransportModel,
     NTXRuntimeScanChannels,
+    _extract_right_constraints,
     _sanitize_float_delta_bar_tree,
 )
 from NEOPAX._database_preprocessed import PreprocessedMonoenergetic3DNTSSRadius
@@ -522,10 +523,15 @@ def test_database_local_bootstrap_state_pullback_matches_full_upar_jvp(
         rtol=2.0e-10,
         atol=2.0e-10,
     )
-    # Initial-Er root scans must use the same local-centre primitive as the
-    # full database flux calculation, without constructing all radii for a
-    # single trial Er.  This is the database counterpart of the exact-Lij
-    # local root evaluator.
+    # Initial-Er roots are physical local evaluations, so their final-centre
+    # gradient must use the configured boundary closure rather than the
+    # direct-centre RHS's separate zero-gradient discrete closure.
+    density_right, density_right_grad = _extract_right_constraints(
+        model.bc_density, state.density, geometry.r_grid_half
+    )
+    temperature_right, temperature_right_grad = _extract_right_constraints(
+        model.bc_temperature, state.temperature, geometry.r_grid_half
+    )
     _lij, full_gamma, _full_q, _full_upar = neoclassical_module.get_Neoclassical_Fluxes(
         species,
         model.energy_grid,
@@ -534,6 +540,10 @@ def test_database_local_bootstrap_state_pullback_matches_full_upar_jvp(
         state.Er,
         state.temperature,
         state.density,
+        density_right_constraint=density_right,
+        density_right_grad_constraint=density_right_grad,
+        temperature_right_constraint=temperature_right,
+        temperature_right_grad_constraint=temperature_right_grad,
     )
     local_gamma = model.build_local_particle_flux_evaluator(state)
     local_fluxes = model.build_local_direct_flux_evaluator(state)

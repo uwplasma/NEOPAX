@@ -1730,10 +1730,20 @@ class CombinedTransportFluxModel(TransportFluxModelBase):
         if not callable(pullback_fn):
             return None
         replace_payload = getattr(self.neoclassical_model, "with_support_payload", None)
-        if not callable(replace_payload):
-            return None
-        payload_model = replace_payload(support)
-        composite = dataclasses.replace(self, neoclassical_model=payload_model)
+        # A live runtime scan binds its recorded table through this method.
+        # A database segment runtime already owns NTXDatabaseTransportModel,
+        # whose explicit table bar is handled directly below and therefore
+        # must not require a scan-model payload binder.
+        payload_model = (
+            replace_payload(support)
+            if callable(replace_payload)
+            else self.neoclassical_model
+        )
+        composite = (
+            dataclasses.replace(self, neoclassical_model=payload_model)
+            if callable(replace_payload)
+            else self
+        )
 
         if isinstance(support, dict) and "database" in support:
             # The compact database rule currently covers the direct centre
@@ -1770,6 +1780,9 @@ class CombinedTransportFluxModel(TransportFluxModelBase):
             support_bar = dict(_float_delta_tree_like(support))
             support_bar["database"] = _sanitize_float_delta_bar_tree(database, database_bar)
             return support_bar
+
+        if not callable(replace_payload):
+            return None
 
         response = composite.build_lagged_response(state)
         response_bar = composite.pullback_evaluate_with_lagged_response(
@@ -3281,22 +3294,17 @@ class NTXDatabaseTransportModel(TransportFluxModelBase):
         return _split(flat_bar)
 
     def pullback_local_particle_flux_support_payload(self, state, flux_bar, support):
-        """Compact table transpose of the local direct-centre root flux.
-
-        The selected-root primitive is the local restriction of
-        :meth:`__call__`; therefore this uses the identical direct-centre
-        last-cell, zero-gradient closure.  It must not use transport face
-        boundary constraints, which would transpose a different outer-cell
-        flux than the root solver evaluated.
-        """
+        """Transpose the boundary-aware database flux used by local Er roots."""
         if not isinstance(support, dict) or "database" not in support:
             return None
         database = support["database"]
         density = safe_density(state.density, self.density_floor)
-        density_right_constraint = density[:, -1]
-        density_right_grad_constraint = jnp.zeros_like(density_right_constraint)
-        temperature_right_constraint = state.temperature[:, -1]
-        temperature_right_grad_constraint = jnp.zeros_like(temperature_right_constraint)
+        density_right_constraint, density_right_grad_constraint = _extract_right_constraints(
+            self.bc_density, density, self.geometry.r_grid_half
+        )
+        temperature_right_constraint, temperature_right_grad_constraint = _extract_right_constraints(
+            self.bc_temperature, state.temperature, self.geometry.r_grid_half
+        )
         zero = jnp.zeros_like(jnp.asarray(density))
 
         def _bar(name):
@@ -3921,14 +3929,17 @@ class NTXDatabaseTransportModel(TransportFluxModelBase):
             )
         )
 
-    def build_local_direct_flux_evaluator(self, state):
-        """Return the direct database flux triplet at one centre radius.
+    def _build_local_database_flux_evaluator(
+        self, state, *, use_transport_boundary_constraints: bool
+    ):
+        """Return one centre-radius database flux triplet.
 
-        This is the compact primal shared by selected-root and direct-RHS
-        geometry transposes.  It is the local restriction of the direct
-        centre database flux evaluation: gradients are shared over the state,
-        while interpolation and Lij assembly are only performed at the
-        requested radius.
+        The direct-centre transport RHS and the local ambipolar-root problem
+        intentionally have different outer closures.  The former preserves
+        its established zero-gradient last-cell discrete closure.  The latter
+        is a physical root calculation and must use the configured transport
+        density/temperature boundary conditions, exactly as the runtime Lij
+        evaluator does.
         """
         species = self.species
         energy_grid = self.energy_grid
@@ -3936,17 +3947,19 @@ class NTXDatabaseTransportModel(TransportFluxModelBase):
         database = self.database
         density = safe_density(state.density, self.density_floor)
         temperature = state.temperature
-        # This primitive must be exactly the local restriction of ``self(state)``.
-        # The direct centre database evaluator deliberately uses its established
-        # zero-gradient, last-cell right closure; it does *not* use the transport
-        # face boundary conditions.  Feeding the face closure here made the last
-        # cell differ (by a factor of two in the two-cell regression) from the
-        # full direct database flux.  Keep these values in lockstep with
-        # ``_get_Neoclassical_Fluxes_generic``.
-        density_right_constraint = density[:, -1]
-        density_right_grad_constraint = jnp.zeros_like(density_right_constraint)
-        temperature_right_constraint = temperature[:, -1]
-        temperature_right_grad_constraint = jnp.zeros_like(temperature_right_constraint)
+        if use_transport_boundary_constraints:
+            density_right_constraint, density_right_grad_constraint = _extract_right_constraints(
+                self.bc_density, density, geometry.r_grid_half
+            )
+            temperature_right_constraint, temperature_right_grad_constraint = _extract_right_constraints(
+                self.bc_temperature, temperature, geometry.r_grid_half
+            )
+        else:
+            # Keep this branch in exact lockstep with the direct-centre RHS.
+            density_right_constraint = density[:, -1]
+            density_right_grad_constraint = jnp.zeros_like(density_right_constraint)
+            temperature_right_constraint = temperature[:, -1]
+            temperature_right_grad_constraint = jnp.zeros_like(temperature_right_constraint)
         v_thermal = get_v_thermal(species.mass, temperature)
         collisionality_kind = _collisionality_kind(self.collisionality_model)
         dndr = jax.vmap(
@@ -4039,10 +4052,24 @@ class NTXDatabaseTransportModel(TransportFluxModelBase):
 
         return evaluator
 
-    def build_local_particle_flux_evaluator(self, state):
-        """Return the particle component of the direct local flux primitive."""
+    def build_local_direct_flux_evaluator(self, state):
+        """Return the local restriction of the direct-centre database RHS."""
 
-        local_fluxes = self.build_local_direct_flux_evaluator(state)
+        return self._build_local_database_flux_evaluator(
+            state, use_transport_boundary_constraints=False
+        )
+
+    def build_local_particle_flux_evaluator(self, state):
+        """Return the boundary-aware particle flux used by local Er roots.
+
+        This deliberately is *not* the direct-centre RHS primitive: roots at
+        the last state centre must see the configured outer Dirichlet/Robin
+        closure, rather than a synthetic zero-gradient closure.
+        """
+
+        local_fluxes = self._build_local_database_flux_evaluator(
+            state, use_transport_boundary_constraints=True
+        )
         return lambda radius_index, er_value: local_fluxes(radius_index, er_value)["Gamma"]
 
     def evaluate_face_fluxes(self, state, face_state, **kwargs):
