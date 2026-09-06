@@ -1185,6 +1185,22 @@ def _direct_rhs_support_pullback_hook(vector_field: Callable):
     return pullback_fn if callable(pullback_fn) else None
 
 
+def _direct_rhs_database_payload_pullback_hook(vector_field: Callable, name: str):
+    """Return one named database-only direct-RHS transpose hook, if present.
+
+    The database reverse needs two deliberately disjoint owner boundaries:
+    the table transpose can stay inside the compact Radau segment, while the
+    fixed-table geometry transpose is executed after that sweep.  Looking up
+    these optional methods separately keeps the established generic/Lij hook
+    unchanged.
+    """
+    owner = getattr(vector_field, "__self__", None)
+    if owner is None:
+        return None
+    pullback_fn = getattr(owner, name, None)
+    return pullback_fn if callable(pullback_fn) else None
+
+
 def _direct_rhs_state_pullback_hook(vector_field: Callable):
     """Optional state transpose for a true direct/black-box RHS."""
     owner = getattr(vector_field, "__self__", None)
@@ -1821,6 +1837,34 @@ def _flat_rhs_direct_support_pullback_factory(
     # call so Radau's per-stage reverse does not clone that local graph into
     # every accepted-step segment.  Fixed-lagged Lij transport never calls
     # this hook and is therefore unaffected.
+    return jax.jit(_pullback, inline=False)
+
+
+def _flat_rhs_direct_database_payload_pullback_factory(
+    unravel, vector_field, args, kwargs, hook_name: str, project_flat=None
+):
+    """Flatten a named, database-only black-box RHS support transpose.
+
+    This is intentionally not a fallback for the ordinary support hook.  It
+    is an opt-in boundary used only by the scan-database lane once its
+    table-only and geometry-only sweeps are both wired.  Therefore it cannot
+    alter the Lij lane's trace or numerical result.
+    """
+    pullback_fn = _direct_rhs_database_payload_pullback_hook(vector_field, hook_name)
+    if pullback_fn is None:
+        return None
+    unravel_bar = getattr(unravel, "cotangent", unravel)
+
+    def _pullback(t_value, flat_y, rhs_bar_flat, support):
+        projected_flat_y = _project_flat_state_if_needed(flat_y, project_flat)
+        state_y = unravel(projected_flat_y)
+        rhs_bar_state = unravel_bar(
+            jnp.asarray(rhs_bar_flat, dtype=jnp.asarray(flat_y).dtype)
+        )
+        return pullback_fn(
+            t_value, state_y, *args, rhs_bar=rhs_bar_state, support=support, **kwargs
+        )
+
     return jax.jit(_pullback, inline=False)
 
 
@@ -4171,6 +4215,22 @@ class _RadauAcceptedStepSegmentPrimalRecord:
 
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True, eq=False)
+class _RadauDatabaseGeometryStageRecord:
+    """Numerical direct-RHS inputs retained for the database geometry sweep.
+
+    These are deliberately *post stage-adjoint* values.  The expensive
+    geometry transpose therefore need not be traced through the Radau
+    segment's stage-adjoint and accepted-step scans.  There is no scan owner,
+    prepared NTX system, table primal, or callable in this record.
+    """
+
+    stage_times: Any
+    stage_states: Any
+    residual_bars: Any
+
+
+@jax.tree_util.register_dataclass
+@dataclasses.dataclass(frozen=True, eq=False)
 class _RadauAcceptedStepSegmentCompactCoefficientRecord:
     """Opt-in segment record holding the ordinary primal record plus NTX coefficients.
 
@@ -4656,6 +4716,11 @@ class _RadauAcceptedStepPhysicsContext:
     flat_rhs_build_state_and_ntx_support_pullback_batched_interpolated_faces_native_multi_rhs_reuse_moment_drds_jvp_shared_primal_with_vmec_coefficients_no_prepared_carry: Callable[[Any, Any, Any], Any] | None = None
     flat_rhs_lagged_response_support_pullback: Callable[[Any, Any, Any, Any, Any], Any] | None = None
     flat_rhs_direct_support_pullback: Callable[[Any, Any, Any, Any], Any] | None = None
+    # Database-only complements of ``flat_rhs_direct_support_pullback``.
+    # They are kept separate so the scan-database lane can put only the
+    # table transpose in a Radau segment and defer the geometry transpose.
+    flat_rhs_direct_database_table_pullback: Callable[[Any, Any, Any, Any], Any] | None = None
+    flat_rhs_direct_database_geometry_pullback: Callable[[Any, Any, Any, Any], Any] | None = None
     flat_rhs_lagged_response_all_pullback: Callable[[Any, Any, Any, Any, Any], tuple[Any, Any, Any]] | None = None
     flat_rhs_state_and_lagged_response_pullback: Callable[[Any, Any, Any, Any], tuple[Any, Any]] | None = None
     flat_rhs_state_pullback: Callable[[Any, Any, Any, Any], Any] | None = None
@@ -7035,41 +7100,6 @@ def _execute_radau_accepted_step_next_reduced_cotangent_batched_bwd_with_support
         physics_context.project_flat,
         physics_context.build_lagged_response,
     )
-    if lagged_response is None:
-        reduced_bars = _execute_radau_accepted_step_next_reduced_cotangent_batched_bwd(
-            kernel_context,
-            physics_context,
-            context,
-            lagged_response_branch,
-            carry_in,
-            next_reduced_bars,
-        )
-        if physics_context.flat_rhs_direct_support_pullback is None:
-            support_bar_leaves = tuple(
-                jnp.broadcast_to(
-                    jnp.asarray(leaf)[None, ...],
-                    (objective_count,) + jnp.asarray(leaf).shape,
-                )
-                for leaf in jax.tree_util.tree_leaves(zero_support_bar)
-            )
-        else:
-            support_bar_leaves = jax.vmap(
-                lambda next_reduced_bar: tuple(
-                    jax.tree_util.tree_leaves(
-                        _execute_radau_accepted_step_support_cotangent_bwd(
-                            kernel_context,
-                            physics_context,
-                            context,
-                            lagged_response_branch,
-                            carry_in,
-                            next_reduced_bar,
-                            support,
-                        )
-                    )
-                )
-            )(next_reduced_bars)
-        return reduced_bars, (*support_bar_leaves, *native_vmec_zero_leaves)
-
     trial_y_bars = jnp.asarray(next_reduced_bars.y, dtype=kernel_context.dtype)
     if physics_context.project_flat is not None:
         _, project_pullback = jax.vjp(physics_context.project_flat, primal_result.trial_y)
@@ -7190,7 +7220,11 @@ def _execute_radau_accepted_step_next_reduced_cotangent_batched_bwd_with_support
         dtype=kernel_context.dtype,
     )
 
-    if lagged_response_branch == "rebuild":
+    # A direct/database RHS has no lagged cache to rebuild.  It follows the
+    # same batched stage-adjoint path above, rather than the historical
+    # scalar-support fallback which replayed and solved the stage adjoint a
+    # second time for every objective.
+    if lagged_response is not None and lagged_response_branch == "rebuild":
         if physics_context.pullback_build_lagged_response is None:
             raise ValueError("Lagged-response rebuild reverse branch requires pullback_build_lagged_response.")
         cotangent_mode = str(getattr(physics_context, "reverse_stage_cotangent_mode", "full")).strip().lower()
@@ -10543,7 +10577,13 @@ def _radau_exact_stage_residual_input_pullback(
         residual_stages,
     )
 
-    if zero_lagged_cotangent:
+    if lagged_response is None:
+        # Direct black-box/database transport has no lagged-response input.
+        # Returning ``None`` preserves the existing reduced-carry alignment
+        # while allowing its state and support transposes to share the one
+        # objective-batched stage-adjoint solve.
+        residual_lagged_bar = None
+    elif zero_lagged_cotangent:
         residual_lagged_bar = _radau_align_tangent_tree_to_primal(None, lagged_response)
     elif physics_context.flat_rhs_lagged_response_pullback is not None:
         staged_lagged_bars = jax.vmap(
@@ -10747,6 +10787,73 @@ def _radau_exact_stage_residual_support_pullback(
         (stage_times, stage_states, residual_stages),
     )
     return support_bar
+
+
+def _radau_database_geometry_stage_record(
+    kernel_context: _RadauAcceptedStepKernelContext,
+    carry_in: _RadauAcceptedStepCarry,
+    primal_result: _RadauAcceptedStepReverseMinimalAttemptResult,
+    residual_bars,
+) -> _RadauDatabaseGeometryStageRecord:
+    """Make the bounded numeric record for a deferred database geometry VJP.
+
+    ``residual_bars`` already has the leading objective axis.  We retain only
+    the stage RHS inputs required by the direct geometry hook; the sign is
+    intentionally retained in its residual convention and applied by the
+    consumer, exactly as the in-segment support transpose does.
+    """
+    stages_final = jnp.asarray(primal_result.stage_history).reshape(
+        (kernel_context.num_stages, kernel_context.state_dim)
+    )
+    return _RadauDatabaseGeometryStageRecord(
+        stage_times=carry_in.t + kernel_context.c * primal_result.trial_dt,
+        stage_states=(
+            carry_in.y[None, :]
+            + primal_result.trial_dt * (kernel_context.a @ stages_final)
+        ),
+        residual_bars=jnp.asarray(residual_bars, dtype=kernel_context.dtype).reshape(
+            (-1, kernel_context.num_stages, kernel_context.state_dim)
+        ),
+    )
+
+
+def _radau_database_geometry_support_pullback_from_stage_record(
+    physics_context: _RadauAcceptedStepPhysicsContext,
+    support,
+    record: _RadauDatabaseGeometryStageRecord,
+):
+    """Evaluate a deferred fixed-table geometry transpose from numeric records.
+
+    This function is purposely outside the Radau segment kernel.  Its caller
+    will run it only after all compact table cotangents have been accumulated.
+    The returned tree has a leading objective axis and a zero database bar,
+    as guaranteed by the dedicated geometry hook.
+    """
+    pullback = physics_context.flat_rhs_direct_database_geometry_pullback
+    if pullback is None:
+        raise RuntimeError(
+            "Deferred database geometry sweep requires the direct geometry pullback hook."
+        )
+    if not isinstance(support, dict) or set(support) != {"geometry", "database"}:
+        raise ValueError(
+            "Deferred database geometry sweep requires exactly {'geometry', 'database'} support."
+        )
+
+    def _one_objective(residual_bar):
+        return jax.vmap(
+            lambda t_eval, y_eval, rhs_bar: pullback(
+                t_eval, y_eval, -rhs_bar, support
+            )
+        )(
+            record.stage_times,
+            record.stage_states,
+            residual_bar,
+        )
+
+    by_objective_and_stage = jax.vmap(_one_objective)(record.residual_bars)
+    return jax.tree_util.tree_map(
+        lambda values: jnp.sum(values, axis=1), by_objective_and_stage
+    )
 
 
 def _radau_exact_stage_residual_input_and_support_pullback_fused_ntx(
@@ -14789,14 +14896,35 @@ def _radau_run_stage_subsolve(
             edge_after = inputs.flat_y[-1] + inputs.h_value * (kernel_context.a @ z_next_stages[:, -1])
             edge_change = edge_after - edge_before
             edge_stage_index = jnp.argmax(jnp.abs(edge_change))
+            edge_flat_index = (
+                edge_stage_index * kernel_context.state_dim
+                + (kernel_context.state_dim - 1)
+            )
+            # ``residual = stage_derivative - evaluated_rhs``.  Recover the
+            # already-evaluated node RHS and its secant from the accepted base
+            # without a second cache evaluation.  This tells us whether the
+            # explosion originates in the cached nonlinear boundary response
+            # itself, rather than in the predictor or LU reuse policy.
+            edge_rhs_before = z_cur[edge_flat_index] - residual_cur[edge_flat_index]
+            edge_state_offset = edge_before[edge_stage_index] - inputs.flat_y[-1]
+            edge_secant = (edge_rhs_before - inputs.f0[-1]) / jnp.where(
+                jnp.abs(edge_state_offset) > kernel_context.tiny_scalar,
+                edge_state_offset,
+                jnp.asarray(jnp.inf, dtype=kernel_context.dtype),
+            )
+            edge_jacobian_diagonal = inputs.jacobian_ref[-1, -1]
             jax.debug.print(
                 "[radau-node-edge-newton] phase=update iter={iter} "
                 "edge_before={edge_before:.6e} edge_after={edge_after:.6e} "
-                "delta={edge_delta:.6e} stage={stage}",
+                "delta={edge_delta:.6e} rhs_before={rhs_before:.6e} "
+                "secant_from_base={secant:.6e} jac_edge_edge={jacobian:.6e} stage={stage}",
                 iter=iter_idx + 1,
                 edge_before=edge_before[edge_stage_index],
                 edge_after=edge_after[edge_stage_index],
                 edge_delta=edge_change[edge_stage_index],
+                rhs_before=edge_rhs_before,
+                secant=edge_secant,
+                jacobian=edge_jacobian_diagonal,
                 stage=edge_stage_index,
                 ordered=True,
             )
@@ -20604,6 +20732,26 @@ def _build_prepared_radau_accepted_rollout(
         kwargs=kwargs,
         project_flat=project_flat,
     )
+    flat_rhs_direct_database_table_pullback = (
+        _flat_rhs_direct_database_payload_pullback_factory(
+            unravel=unpack_flat,
+            vector_field=vector_field,
+            args=args,
+            kwargs=kwargs,
+            hook_name="pullback_direct_rhs_database_table_payload",
+            project_flat=project_flat,
+        )
+    )
+    flat_rhs_direct_database_geometry_pullback = (
+        _flat_rhs_direct_database_payload_pullback_factory(
+            unravel=unpack_flat,
+            vector_field=vector_field,
+            args=args,
+            kwargs=kwargs,
+            hook_name="pullback_direct_rhs_database_geometry_payload",
+            project_flat=project_flat,
+        )
+    )
     flat_rhs_lagged_response_all_pullback = _flat_rhs_lagged_response_all_pullback_factory(
         unravel=unpack_flat,
         pack_flat=pack_state,
@@ -21124,6 +21272,8 @@ def _build_prepared_radau_accepted_rollout(
         ),
         flat_rhs_lagged_response_support_pullback=flat_rhs_lagged_response_support_pullback,
         flat_rhs_direct_support_pullback=flat_rhs_direct_support_pullback,
+        flat_rhs_direct_database_table_pullback=flat_rhs_direct_database_table_pullback,
+        flat_rhs_direct_database_geometry_pullback=flat_rhs_direct_database_geometry_pullback,
         flat_rhs_lagged_response_all_pullback=flat_rhs_lagged_response_all_pullback,
         flat_rhs_state_and_lagged_response_pullback=flat_rhs_state_and_lagged_response_pullback,
         flat_rhs_state_pullback=flat_rhs_state_pullback,

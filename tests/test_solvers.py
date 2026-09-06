@@ -1267,6 +1267,91 @@ def test_fixed_branch_scalar_root_support_pullback_matches_implicit_derivative()
     )
 
 
+def test_radau_node_initial_carry_reverse_includes_selected_edge_root_state_bar():
+    """The private node's initial scalar reaches the public-state reverse bar."""
+
+    class _NodeOwner:
+        er_equation = SimpleNamespace(boundary_mode="floating_ambipolar_edge_node")
+        node_boundary_initial_er = jnp.asarray(3.0)
+
+        def __call__(self, _t, state, *_args):
+            return TransportState(
+                density=-0.1 * state.density,
+                pressure=-0.1 * state.pressure,
+                Er=-state.Er,
+            )
+
+        def build_lagged_response(self, state):
+            return state
+
+        def evaluate_with_lagged_response(self, _t, state, *_args, lagged_response):
+            del lagged_response
+            return self(0.0, state)
+
+        def build_node_boundary_lagged_response(self, state, er_edge):
+            del state
+            return er_edge
+
+        def evaluate_node_boundary_with_lagged_response(
+            self, state, er_edge, transport_response, *, er_edge_anchor
+        ):
+            del transport_response, er_edge_anchor
+            return self(0.0, state), -0.5 * er_edge
+
+        def node_boundary_charge_residual(self, state, er_edge):
+            # At the selected initial root, E_edge = 1.5 E_last.  The exact
+            # fixed-branch pullback is therefore dE_edge/dE_last = 1.5.
+            return er_edge - 1.5 * state.Er[-1]
+
+    state0 = TransportState(
+        density=jnp.ones((1, 2)),
+        pressure=jnp.ones((1, 2)),
+        Er=jnp.asarray([1.0, 2.0]),
+    )
+    owner = _NodeOwner()
+    solver = RADAUSolver(
+        t0=0.0,
+        t1=1.0e-3,
+        dt=1.0e-4,
+        rtol=1.0e-6,
+        atol=1.0e-8,
+        rhs_mode="lagged_transport_response",
+        maxiter=8,
+        max_steps=32,
+    )
+    prepared = transport_solvers._build_prepared_radau_accepted_rollout(
+        solver=solver,
+        state=state0,
+        vector_field=owner.__call__,
+        species=None,
+    )
+
+    def _initial_carry(state_value):
+        return reverse_transport.reverse_initial_carry_from_state_with_static_setup(
+            solver=solver,
+            state=state_value,
+            solve_vector_field=owner.__call__,
+            species=None,
+            prepared_rollout_static=prepared,
+        )
+
+    carry, carry_pullback = jax.vjp(_initial_carry, state0)
+    carry_bar = jax.tree_util.tree_map(
+        lambda leaf: None if leaf is None else jnp.zeros_like(leaf), carry
+    )
+    # Seed only the Radau-private edge coordinate.  Its bar must reach the
+    # final public centre through the selected scalar-root rule.
+    carry_bar = dataclasses.replace(
+        carry_bar,
+        y=carry_bar.y.at[-1].set(4.0),
+    )
+    (state_bar,) = carry_pullback(carry_bar)
+
+    assert jnp.allclose(state_bar.Er, jnp.asarray([0.0, 6.0]))
+    assert jnp.allclose(state_bar.density, jnp.zeros_like(state0.density))
+    assert jnp.allclose(state_bar.pressure, jnp.zeros_like(state0.pressure))
+
+
 def test_radau_endpoint_defect_correction_runs_on_nonlinear_lagged_rhs():
     class QuadraticLaggedField:
         def __call__(self, _t, y):
