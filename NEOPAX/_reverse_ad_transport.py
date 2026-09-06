@@ -5448,6 +5448,13 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
         f"objectives={objective_count} cotangent_mode={cotangent_mode}",
         flush=True,
     )
+    if use_database_table_geometry_split:
+        print(
+            f"{progress_prefix} progress: database segment reverse uses fixed-table "
+            "transpose plus deferred fixed-table geometry sweep "
+            "(no scan owner in segment payload)",
+            flush=True,
+        )
 
     def _batched_reduced_first_nonfinite_rows(value):
         """Return one nonfinite reduced-cotangent leaf label per objective row.
@@ -5674,7 +5681,7 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
                 (reduced_bars, segment_support_bar_leaves)
             )
         segment_bad_rows = None
-        if segment_input_diagnostics:
+        if segment_input_diagnostics and not use_database_table_geometry_split:
             segment_bad_rows = _batched_support_first_nonfinite_leaves(
                 segment_support_bar_leaves[: len(_zero_support_leaves)],
                 support_leaf_labels,
@@ -5880,6 +5887,14 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
                 accumulated + increment
                 for accumulated, increment in zip(
                     support_bar_leaves,
+                    geometry_support_bar_leaves,
+                    strict=True,
+                )
+            )
+            step_support_bar_leaves_accum = tuple(
+                accumulated + increment
+                for accumulated, increment in zip(
+                    step_support_bar_leaves_accum,
                     geometry_support_bar_leaves,
                     strict=True,
                 )
