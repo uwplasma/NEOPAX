@@ -5,6 +5,7 @@ import jax.numpy as jnp
 
 from NEOPAX._boundary_conditions import BoundaryConditionModel
 from NEOPAX._ambipolarity import _ambipolar_root_grid_has_axis_state_entry
+from NEOPAX._orchestrator import _initialize_floating_er_edge_node
 from NEOPAX._state import TransportState
 from NEOPAX._transport_equations import (
     ComposedEquationSystem,
@@ -23,6 +24,46 @@ class DummySpecies:
     charge_qp: jnp.ndarray
     names: tuple[str, ...]
     ion_indices: tuple[int, ...]
+
+
+def test_floating_er_edge_node_initialization_tracks_nearest_face_root():
+    """The private endpoint starts on the final-centre ambipolar branch."""
+
+    class _FaceFluxModel:
+        def evaluate_face_fluxes(self, _state, face_state, **_kwargs):
+            # The outer face has two roots, 1 and 3.  The selected final
+            # centre lies on the 3 branch, as in NTSS's forward continuation.
+            residual = (face_state.Er - 1.0) * (face_state.Er - 3.0)
+            return {
+                "Gamma": residual[None, :],
+                "Q": jnp.zeros((1, face_state.Er.shape[0])),
+                "Upar": jnp.zeros((1, face_state.Er.shape[0])),
+            }
+
+    state = TransportState(
+        density=jnp.ones((1, 2)),
+        pressure=jnp.ones((1, 2)),
+        Er=jnp.asarray([2.5, 2.8]),
+    )
+    runtime = SimpleNamespace(
+        species=SimpleNamespace(charge_qp=jnp.asarray([1.0])),
+        geometry=SimpleNamespace(r_grid_half=jnp.asarray([0.0, 0.5, 1.0])),
+        solver_parameters={"density_floor": 1.0e-6, "temperature_floor": 1.0e-6},
+        models=SimpleNamespace(flux=_FaceFluxModel()),
+    )
+    config = {
+        "ambipolarity": {
+            "er_ambipolar_method": "two_stage",
+            "er_ambipolar_scan_min": 0.0,
+            "er_ambipolar_scan_max": 4.0,
+            "er_ambipolar_n_coarse": 17,
+            "er_ambipolar_n_refine": 12,
+            "er_ambipolar_max_roots": 3,
+        }
+    }
+
+    edge = _initialize_floating_er_edge_node(state, runtime, config, {})
+    assert jnp.allclose(edge, 3.0, atol=1.0e-3)
 
 
 def test_node_lagged_cache_is_skipped_by_public_er_component_debugger():

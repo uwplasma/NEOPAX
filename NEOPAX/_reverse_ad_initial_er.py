@@ -136,10 +136,10 @@ def compact_initial_er_database_support_bars(
             "Compact database initial-Er support pullback requires an explicit "
             "recorded database support leaf."
         )
-    runtime_scan = find_ntx_runtime_scan_model_in_model(runtime.models.flux)
-    if runtime_scan is None:
+    database_model = find_ntx_database_transport_model_in_model(runtime.models.flux)
+    if database_model is None:
         raise ValueError(
-            "Compact database initial-Er support pullback requires an NTX runtime scan model."
+            "Compact database initial-Er support pullback requires a fixed database model."
         )
     er_profile = jnp.asarray(er_profile, dtype=state.Er.dtype)
     residual_bars = jnp.asarray(residual_bars, dtype=state.Er.dtype)
@@ -154,7 +154,7 @@ def compact_initial_er_database_support_bars(
     def _one_objective(residual_bar):
         gamma_bar = charge_qp[:, None] * residual_bar[None, :]
         pullback = getattr(
-            runtime_scan, "pullback_local_particle_flux_support_payload", None
+            database_model, "pullback_local_particle_flux_support_payload", None
         )
         if not callable(pullback):
             raise ValueError(
@@ -246,6 +246,19 @@ def find_database_payload_in_model(model):
     return None
 
 
+def find_ntx_database_transport_model_in_model(model):
+    """Return the nested fixed-table NTX model, if present."""
+
+    if isinstance(model, NTXDatabaseTransportModel):
+        return model
+    if dataclasses.is_dataclass(model) and not isinstance(model, type):
+        for field in dataclasses.fields(model):
+            found = find_ntx_database_transport_model_in_model(getattr(model, field.name))
+            if found is not None:
+                return found
+    return None
+
+
 def find_ntx_runtime_scan_model_in_model(model):
     """Return the nested live NTX scan model, if the runtime owns one."""
 
@@ -299,44 +312,41 @@ def split_recorded_ntx_database_runtime(runtime):
         )
     if runtime_scan.database is None:
         raise ValueError("Database reverse ownership requires a built runtime database.")
-    segment_runtime = runtime_without_recorded_ntx_scan_primal(runtime)
-    segment_scan = find_ntx_runtime_scan_model_in_model(segment_runtime.models.flux)
-    if segment_scan is None or segment_scan.database is not runtime_scan.database:
+    segment_runtime = runtime_with_fixed_ntx_database_model(runtime)
+    if find_ntx_runtime_scan_model_in_model(segment_runtime.models.flux) is not None:
+        raise RuntimeError("Database segment runtime must not retain an NTX scan model.")
+    if find_database_payload_in_model(segment_runtime.models.flux) is not runtime_scan.database:
         raise RuntimeError("Database segment runtime failed to retain the fixed scan database.")
-    if segment_scan.scan_primal_record is not None or segment_scan.scan_primal is not None:
-        raise RuntimeError("Database segment runtime must not retain a scan primal or record.")
     return DatabaseSegmentRuntime(segment_runtime), RecordedNTXDatabaseScanOwner(runtime_scan)
 
 
-def runtime_without_recorded_ntx_scan_primal(runtime):
-    """Drop the retained scan record from runtime objects used inside segment VJPs.
+def runtime_with_fixed_ntx_database_model(runtime):
+    """Replace live scan models by their fixed-table flux models.
 
-    The record contains full prepared NTX systems and is needed only after the
-    transport sweep, when the accumulated database cotangent is transposed.
-    Leaving it captured by every generic black-box stage VJP unnecessarily
-    retains those systems in each compiled reverse closure.  The returned
-    runtime keeps the already-built database, channels and surfaces unchanged.
+    This is the database segment boundary.  In particular it removes scan
+    surfaces, channels, scan primal, and scan record from all transport and
+    terminal VJP closures.  The caller retains the original scan model only
+    through :class:`RecordedNTXDatabaseScanOwner` for the final one-time
+    table-to-scan transpose.
     """
 
-    def _strip(model):
+    def _replace(model):
         if model is None or not dataclasses.is_dataclass(model) or isinstance(model, type):
             return model, False
         if isinstance(model, NTXRuntimeScanTransportModel):
-            if model.scan_primal_record is None and model.scan_primal is None:
-                return model, False
-            return dataclasses.replace(
-                model, scan_primal_record=None, scan_primal=None
-            ), True
+            if model.database is None:
+                raise ValueError("Fixed database segment runtime requires a built database.")
+            return model._database_model(), True
         updates = {}
         changed = False
         for field in dataclasses.fields(model):
-            replacement, child_changed = _strip(getattr(model, field.name))
+            replacement, child_changed = _replace(getattr(model, field.name))
             if child_changed:
                 updates[field.name] = replacement
                 changed = True
         return (dataclasses.replace(model, **updates), True) if changed else (model, False)
 
-    flux_model, changed = _strip(runtime.models.flux)
+    flux_model, changed = _replace(runtime.models.flux)
     if not changed:
         return runtime
     return dataclasses.replace(runtime, models=dataclasses.replace(runtime.models, flux=flux_model))

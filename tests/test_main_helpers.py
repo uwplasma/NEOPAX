@@ -27,7 +27,7 @@ from NEOPAX._reverse_ad_initial_er import (
     fold_recorded_ntx_scan_database_bars_into_support,
     realtime_geometry_payload_for_runtime,
     realtime_geometry_reverse_support_payload_for_runtime,
-    runtime_without_recorded_ntx_scan_primal,
+    runtime_with_fixed_ntx_database_model,
     runtime_with_geometry_payload,
     runtime_with_realtime_geometry_payload,
     runtime_with_realtime_geometry_reverse_support_payload,
@@ -2382,8 +2382,8 @@ def test_recorded_live_ntx_scan_support_exposes_only_the_existing_database():
     assert support["surfaces"] is surfaces
 
 
-def test_recorded_live_ntx_scan_primal_is_not_captured_by_reverse_runtime():
-    """The heavy prepared record is retained only for the post-sweep fold."""
+def test_recorded_live_ntx_scan_is_not_captured_by_database_segment_runtime():
+    """Database segments retain tables only; the owner retains the live scan."""
 
     channels = _tiny_ntx_runtime_channels([0.25, 0.5])
     database = object()
@@ -2407,13 +2407,14 @@ def test_recorded_live_ntx_scan_primal_is_not_captured_by_reverse_runtime():
         )),
     )
 
-    stripped = runtime_without_recorded_ntx_scan_primal(runtime)
-    stripped_model = stripped.models.flux
-    assert stripped_model.database is database
-    assert stripped_model.channels is channels
-    assert stripped_model.scan_surfaces == runtime.models.flux.scan_surfaces
-    assert stripped_model.scan_primal_record is None
-    assert stripped_model.scan_primal is None
+    segment_runtime = runtime_with_fixed_ntx_database_model(runtime)
+    segment_model = segment_runtime.models.flux
+    assert isinstance(segment_model, NTXDatabaseTransportModel)
+    assert segment_model.database is database
+    assert not hasattr(segment_model, "channels")
+    assert not hasattr(segment_model, "scan_surfaces")
+    assert not hasattr(segment_model, "scan_primal_record")
+    assert not hasattr(segment_model, "scan_primal")
     # The original remains available to execute the single final transpose.
     assert runtime.models.flux.scan_primal_record is record
     assert runtime.models.flux.scan_primal is raw_scan

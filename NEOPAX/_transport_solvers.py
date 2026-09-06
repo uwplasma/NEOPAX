@@ -21510,10 +21510,15 @@ class RADAUSolver(_RadauSolverConfig):
             _core_unpack_flat = unpack_flat
             _core_pack_state = pack_state
             _core_project_flat = project_flat
+            _configured_edge0 = getattr(owner, "node_boundary_initial_er", None)
             _edge0 = (
-                jnp.asarray(1.5, dtype=dtype) * state.Er[-1]
-                - jnp.asarray(0.5, dtype=dtype) * state.Er[-2]
-                if state.Er.shape[0] >= 2 else state.Er[-1]
+                jnp.asarray(_configured_edge0, dtype=dtype)
+                if _configured_edge0 is not None
+                else (
+                    jnp.asarray(1.5, dtype=dtype) * state.Er[-1]
+                    - jnp.asarray(0.5, dtype=dtype) * state.Er[-2]
+                    if state.Er.shape[0] >= 2 else state.Er[-1]
+                )
             )
 
             def _node_unpack_flat(flat_y):

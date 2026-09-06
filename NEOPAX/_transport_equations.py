@@ -1610,6 +1610,9 @@ class ComposedEquationSystem:
     source_models: object | None = None
     solver_cfg: object | None = None
     boundary_models: object | None = None
+    # Setup-only value for the private Radau outer-face Er coordinate.  It is
+    # deliberately not part of TransportState or a cached response payload.
+    node_boundary_initial_er: object | None = None
     debug_nonfinite_rhs_components: bool = False
 
     @staticmethod

@@ -18,6 +18,8 @@ import jax
 import jax.numpy as jnp
 
 from ._ambipolarity import (
+    find_ambipolar_Er_min_entropy_jit_adaptive,
+    find_ambipolar_Er_min_entropy_jit_multires,
     pad_and_sort_roots_for_plotting,
     plot_roots,
     solve_ambipolarity_roots_from_config,
@@ -38,6 +40,7 @@ from ._species import Species
 from ._state import TransportState, safe_density, safe_temperature
 from ._transport_flux_models import (
     ZeroTransportModel,
+    build_face_transport_state,
     build_transport_flux_model,
     compute_total_power_breakdown_mw,
     compute_total_power_mw,
@@ -430,6 +433,103 @@ def _normalized_boundary_cfg_for_transport(boundary_cfg: dict) -> dict:
         er_cfg["right"] = right_cfg
     out["Er"] = er_cfg
     return out
+
+
+def _initialize_floating_er_edge_node(state, runtime, config, boundary_models):
+    """Return the initial outer-face Er root for the private Radau node.
+
+    NTSS evolves an endpoint Er degree of freedom, but initializes that endpoint
+    by continuing the selected ambipolar root from the preceding radial point.
+    The FV counterpart must do the same at the outer *face*.  In particular, an
+    extrapolation of the last two cell-centre Er values is not an ambipolar
+    boundary condition and changes the first transport RHS.
+
+    This is setup-only work: it neither changes ``TransportState`` nor adds an
+    implicit root solve to Radau stages.
+    """
+    amb_cfg = dict(config.get("ambipolarity", {}))
+    method = str(amb_cfg.get("er_ambipolar_method", "two_stage")).strip().lower()
+    if method not in {"two_stage", "adaptive"}:
+        raise ValueError(
+            "floating_ambipolar_edge_node initialization currently requires "
+            "er_ambipolar_method='two_stage' or 'adaptive'."
+        )
+
+    solver_cfg = runtime.solver_parameters
+    face_state = build_face_transport_state(
+        state,
+        runtime.geometry,
+        bc_density=boundary_models.get("density"),
+        bc_temperature=boundary_models.get("temperature"),
+        bc_er=boundary_models.get("Er"),
+        density_floor=solver_cfg.get("density_floor", 1.0e-6),
+        temperature_floor=solver_cfg.get("temperature_floor"),
+    )
+    charge = jnp.asarray(runtime.species.charge_qp)
+    seed = jnp.asarray(state.Er[-1])
+
+    def _face_gamma(er_value):
+        candidate_face_state = dataclasses.replace(
+            face_state,
+            Er=face_state.Er.at[-1].set(jnp.asarray(er_value, dtype=face_state.Er.dtype)),
+        )
+        face_fluxes = runtime.models.flux.evaluate_face_fluxes(
+            state,
+            candidate_face_state,
+            bc_density=boundary_models.get("density"),
+            bc_temperature=boundary_models.get("temperature"),
+        )
+        if face_fluxes is None or "Gamma" not in face_fluxes:
+            raise ValueError(
+                "floating_ambipolar_edge_node requires native face particle fluxes."
+            )
+        return jnp.asarray(face_fluxes["Gamma"])[:, -1]
+
+    def gamma_func(er_value):
+        return jnp.sum(charge * _face_gamma(er_value))
+
+    def entropy_func(er_value):
+        return jnp.sum(jnp.abs(_face_gamma(er_value)))
+
+    root_args = {
+        "Gamma_func": gamma_func,
+        "entropy_func": entropy_func,
+        "Er_range": (
+            float(amb_cfg.get("er_ambipolar_scan_min", -20.0)),
+            float(amb_cfg.get("er_ambipolar_scan_max", 20.0)),
+        ),
+        "n_refine": int(amb_cfg.get("er_ambipolar_n_refine", 8)),
+        "max_roots": int(amb_cfg.get("er_ambipolar_max_roots", 3)),
+        "tol": float(amb_cfg.get("er_ambipolar_tol", 1.0e-6)),
+        "x_tol": float(amb_cfg.get("er_ambipolar_x_tol", 1.0e-6)),
+        "maxiter": int(amb_cfg.get("er_ambipolar_maxiter", 12)),
+        "er_scan_batch_mode": amb_cfg.get("er_ambipolar_scan_batch_mode", "vmap"),
+        "er_scan_batch_size": amb_cfg.get("er_ambipolar_scan_batch_size", None),
+    }
+    if method == "two_stage":
+        roots, _entropies, _best, n_roots = find_ambipolar_Er_min_entropy_jit_multires(
+            n_coarse=int(amb_cfg.get("er_ambipolar_n_coarse", 24)),
+            **root_args,
+        )
+    else:
+        roots, _entropies, _best, n_roots = find_ambipolar_Er_min_entropy_jit_adaptive(
+            n_init=int(amb_cfg.get("er_ambipolar_adaptive_n_init", 16)),
+            n_subdiv=int(amb_cfg.get("er_ambipolar_adaptive_n_subdiv", 2)),
+            n_rounds=int(amb_cfg.get("er_ambipolar_adaptive_n_rounds", 2)),
+            max_brackets=int(amb_cfg.get("er_ambipolar_adaptive_max_brackets", 24)),
+            **root_args,
+        )
+    del _entropies, _best
+    valid = jnp.arange(roots.shape[0]) < n_roots
+    nearest_index = jnp.argmin(jnp.where(valid, jnp.abs(roots - seed), jnp.inf))
+    edge_root = roots[nearest_index]
+    if not bool(jnp.asarray(jnp.isfinite(edge_root))):
+        raise RuntimeError(
+            "No finite ambipolar root was found at the outer face for "
+            "floating_ambipolar_edge_node. Refusing to initialize it from a "
+            "non-ambipolar extrapolation."
+        )
+    return edge_root
 
 
 def _apply_boundary_corrected_state_for_ambipolarity(config: dict, runtime: RuntimeContext, state: TransportState | None):
@@ -996,6 +1096,21 @@ def prepare_transport_solver_components(
                 right_gradient=None,
             )
 
+    # NTSS initializes its dynamic outer Er node from the ambipolar root at
+    # that endpoint.  Do this once, before the first lagged response is built;
+    # the result is private solver metadata rather than a TransportState leaf.
+    node_boundary_initial_er = None
+    if er_bc_mode == "floating_ambipolar_edge_node":
+        node_boundary_initial_er = _initialize_floating_er_edge_node(
+            state, runtime, config, bc
+        )
+        if bool(runtime.solver_parameters.get("debug_stage_markers", False)):
+            print(
+                "[NEOPAX] floating Er edge-node initialization: "
+                f"last_center={float(jnp.asarray(state.Er[-1])):.6e} "
+                f"face_root={float(jnp.asarray(node_boundary_initial_er)):.6e}"
+            )
+
     equations_to_evolve = build_equation_system(
         config=config,
         species=runtime.species,
@@ -1044,6 +1159,7 @@ def prepare_transport_solver_components(
         source_models=runtime.models.source,
         solver_cfg=solver_cfg,
         boundary_models=bc,
+        node_boundary_initial_er=node_boundary_initial_er,
         debug_nonfinite_rhs_components=bool(solver_cfg.get("debug_nonfinite_rhs_components", False)),
     )
     solver = build_time_solver(solver_cfg)
