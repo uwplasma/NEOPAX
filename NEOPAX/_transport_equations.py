@@ -3855,19 +3855,25 @@ class ComposedEquationSystem:
         # face is beyond the database's (nu/v, Es/v) domain: both coordinates
         # are energy-resolved.  Reuse the direct model's local-coordinate
         # calculation for this host-only probe; it performs no NTX solve.
-        local_scan_inputs = getattr(self.shared_flux_model, "_local_scan_inputs", None)
-        static_support = getattr(self.shared_flux_model, "_static_support", None)
+        # The shared model is normally a CombinedTransportFluxModel.  The
+        # runtime NTX coordinate routine lives on its neoclassical component,
+        # not on the composite wrapper.
+        diagnostic_model = getattr(
+            self.shared_flux_model, "neoclassical_model", self.shared_flux_model
+        )
+        local_scan_inputs = getattr(diagnostic_model, "_local_scan_inputs", None)
+        static_support = getattr(diagnostic_model, "_static_support", None)
         if callable(local_scan_inputs) and callable(static_support):
             support = static_support()
             face_drds = jnp.asarray(support.face_channels.drds[-1])
             face_density = safe_density(face_state_at_edge.density, self.density_floor)
             face_temperature = face_state_at_edge.temperature
-            face_vthermal = get_v_thermal(self.shared_flux_model.species.mass, face_temperature)
+            face_vthermal = get_v_thermal(diagnostic_model.species.mass, face_temperature)
             collisionality_kind = _collisionality_kind(
-                getattr(self.shared_flux_model, "collisionality_model", "default")
+                getattr(diagnostic_model, "collisionality_model", "default")
             )
             species_indices = jnp.arange(
-                int(self.shared_flux_model.species.number_species), dtype=jnp.int32
+                int(diagnostic_model.species.number_species), dtype=jnp.int32
             )
 
             def _outer_face_scan_inputs(species_index):

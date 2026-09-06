@@ -23759,12 +23759,17 @@ class RADAUSolver(_RadauSolverConfig):
             def _node_edge_live_probe(
                 step_state_before_attempt, step_state_after_attempt, step_info, _attempt_idx
             ):
-                """Stop on the first pathological *fresh* node-edge cache."""
-                lagged_reused = bool(jax.device_get(step_info.lagged_reused))
+                """Probe the first pathological node-edge linearization.
+
+                A coloured refresh can produce the large edge tangent from a
+                retry-reused response cache.  That cache is still anchored at
+                this accepted state, so excluding it hid precisely the case
+                this probe is meant to inspect.
+                """
                 edge_jacobian = float(
                     jax.device_get(step_state_after_attempt.jacobian[-1, -1])
                 )
-                if lagged_reused or abs(edge_jacobian) < node_edge_live_probe_threshold:
+                if abs(edge_jacobian) < node_edge_live_probe_threshold:
                     return False
                 cache = step_state_after_attempt.lagged_response_cache
                 if not isinstance(cache, _RadauNodeBoundaryLaggedCache):

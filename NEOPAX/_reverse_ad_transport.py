@@ -7865,10 +7865,26 @@ def internal_realtime_geometry_transport_reverse_table_result_builder(
         component_names = (
             tuple(component_bars) if active_component_pullbacks else tuple()
         )
+        database_scan_fold_start = time.perf_counter()
+        database_scan_fold_rows = len(support_bars) + sum(
+            len(component_bars[name]) for name in component_names
+        )
         folded_groups = fold_recorded_ntx_scan_database_bar_groups_into_support(
             recorded_scan_owner if recorded_scan_owner is not None else recorded_scan_runtime,
             (support_bars, *(component_bars[name] for name in component_names)),
         )
+        # This is deliberately outside the Lij branches.  Synchronize here so
+        # the benchmark can distinguish final recorded-scan compilation and
+        # execution from the preceding segmented solver reverse.
+        folded_groups = jax.block_until_ready(folded_groups)
+        if recorded_scan_owner is not None or recorded_scan_runtime is not None:
+            print(
+                f"[autodiff-gate] progress: database final recorded-scan fold ready "
+                f"elapsed_s={time.perf_counter() - database_scan_fold_start:.3f} "
+                f"objective_rows={database_scan_fold_rows} groups={len(folded_groups)} "
+                "contract=one_batched_scan_transpose",
+                flush=True,
+            )
         support_bars = folded_groups[0]
         if active_component_pullbacks:
             component_bars = {
