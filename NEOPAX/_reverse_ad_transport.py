@@ -822,6 +822,26 @@ def add_trees(lhs, rhs):
     return jax.tree_util.tree_map(lambda a, b: a + b, lhs, rhs)
 
 
+def implicit_scalar_root_state_pullback(residual_fn, state, root, root_bar):
+    """Transpose a fixed-branch scalar root ``residual_fn(state, root)=0``.
+
+    Root bracketing/selection remains primal-only.  Once its branch is known,
+    the local implicit function theorem gives the state cotangent without
+    differentiating through scan control flow.
+    """
+    root = jnp.asarray(root)
+    _, root_pullback = jax.vjp(lambda value: residual_fn(state, value), root)
+    (dres_droot,) = root_pullback(jnp.asarray(1.0, dtype=root.dtype))
+    safe_dres_droot = jnp.where(
+        jnp.abs(dres_droot) > jnp.asarray(1.0e-30, dtype=root.dtype),
+        dres_droot,
+        jnp.inf,
+    )
+    residual_bar = -jnp.asarray(root_bar, dtype=root.dtype) / safe_dres_droot
+    _, state_pullback = jax.vjp(lambda state_value: residual_fn(state_value, root), state)
+    return state_pullback(residual_bar)[0]
+
+
 def parameterized_profile_set(
     profile_cfg: Mapping[str, Any],
     geometry,
@@ -2714,6 +2734,38 @@ def reverse_initial_carry_from_state_with_static_setup(
         if node_response_from_flat is not None
         else None
     )
+    node_owner = getattr(solve_vector_field, "__self__", None)
+    node_residual = getattr(node_owner, "node_boundary_charge_residual", None)
+
+    def _node_edge_root_from_state(state_value):
+        """Return the selected outer root with a scalar implicit pullback.
+
+        Branch selection is a discrete primal policy: the forward preparation
+        has already selected ``node_edge0`` by continuation from the final
+        centre.  Within that branch, ``G(state, E_edge)=0`` gives the exact
+        local derivative ``dE_edge=-G_state/G_edge`` without differentiating
+        through the scan/refinement algorithm.
+        """
+        if node_edge0 is None or not callable(node_residual):
+            return node_edge0
+
+        @jax.custom_vjp
+        def _selected_root(state_inner):
+            return node_edge0[0]
+
+        def _selected_root_fwd(state_inner):
+            return node_edge0[0], state_inner
+
+        def _selected_root_bwd(state_inner, edge_bar):
+            edge_value = node_edge0[0]
+            return (
+                implicit_scalar_root_state_pullback(
+                    node_residual, state_inner, edge_value, edge_bar
+                ),
+            )
+
+        _selected_root.defvjp(_selected_root_fwd, _selected_root_bwd)
+        return _selected_root(state_value)[None]
 
     def _flat_state_from_state(state_value):
         flat_state, *_ = _make_solver_state_transform(
@@ -2725,7 +2777,7 @@ def reverse_initial_carry_from_state_with_static_setup(
             temperature_floor=temperature_floor,
         )
         return (
-            jnp.concatenate((flat_state, node_edge0))
+            jnp.concatenate((flat_state, _node_edge_root_from_state(state_value)))
             if node_edge0 is not None
             else flat_state
         )
@@ -4369,19 +4421,14 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
             flux_model = getattr(getattr(runtime, "models", None), "flux", None)
             neoclassical_model = getattr(flux_model, "neoclassical_model", flux_model)
             database_payload = "database" in support_payload
-            # A recorded runtime-scan payload owns the already-built radial
-            # database.  The static scan model still carries its source
-            # ``Monoenergetic`` configuration, which is not a centre-flux
-            # interpolation table.  Bind the recorded table before obtaining
-            # either bootstrap primal or compact pullback methods.
+            # The legacy recorded-scan runtime needs its explicit table bound
+            # before the local bootstrap hooks are selected.  A database
+            # segment runtime is already an NTXDatabaseTransportModel and
+            # deliberately has no live-scan payload binder.
             if database_payload:
                 with_payload = getattr(neoclassical_model, "with_support_payload", None)
-                if not callable(with_payload):
-                    raise NotImplementedError(
-                        "Recorded database bootstrap AD requires a realtime NTX "
-                        "model with support-payload binding."
-                    )
-                neoclassical_model = with_payload(support_payload)
+                if callable(with_payload):
+                    neoclassical_model = with_payload(support_payload)
             corrected_fluxes_fn = getattr(neoclassical_model, "evaluate_momentum_corrected_fluxes", None)
             upar_only_fn = getattr(
                 neoclassical_model,

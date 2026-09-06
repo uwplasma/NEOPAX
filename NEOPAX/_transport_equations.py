@@ -3316,6 +3316,36 @@ class ComposedEquationSystem:
             **self._shared_flux_call_kwargs({"er_edge_override": er_edge}),
         )
 
+    def node_boundary_charge_residual(self, state, er_edge):
+        """Outer-face ambipolar residual used by node initialization and AD.
+
+        It intentionally evaluates the same native face flux path as the
+        node RHS.  The scalar is zero at the selected floating-edge root;
+        keeping it here gives reverse AD a precise implicit-root residual
+        without introducing the edge node into ``TransportState``.
+        """
+        if self.shared_flux_model is None:
+            raise ValueError("floating_ambipolar_edge_node requires a shared flux model.")
+        working_state, _ = self._prepare_working_state(state)
+        response = self.build_node_boundary_lagged_response(working_state, er_edge)
+        fluxes = self.shared_flux_model.evaluate_with_lagged_response(
+            working_state,
+            response,
+            **self._shared_flux_call_kwargs({
+                "er_edge_override": er_edge,
+                "er_edge_anchor": er_edge,
+            }),
+        )
+        if not _flux_has_key(fluxes, "Gamma_faces"):
+            raise ValueError(
+                "floating_ambipolar_edge_node requires native face particle fluxes."
+            )
+        gamma_faces = fluxes["Gamma_faces"]
+        _density_eq, _temperature_eq, er_eq = self._resolve_equations()
+        if er_eq is None:
+            raise ValueError("floating_ambipolar_edge_node requires an Er equation.")
+        return jnp.sum(er_eq.charge_qp * jnp.asarray(gamma_faces)[:, -1])
+
     def evaluate_node_boundary_with_lagged_response(
         self, state, er_edge, transport_response, *, er_edge_anchor
     ):

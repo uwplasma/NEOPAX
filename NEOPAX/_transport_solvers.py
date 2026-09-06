@@ -20751,11 +20751,6 @@ def _build_prepared_radau_accepted_rollout(
     )
     build_lagged_response_from_flat = None
     if use_node_boundary:
-        if not use_transport_lagged_response:
-            raise ValueError(
-                "floating_ambipolar_edge_node currently requires "
-                "radau_rhs_mode='lagged_transport_response'."
-            )
         if owner is None or not callable(
             getattr(owner, "build_node_boundary_lagged_response", None)
         ):
@@ -21606,11 +21601,6 @@ class RADAUSolver(_RadauSolverConfig):
         )
         build_lagged_response_from_flat = None
         if use_node_boundary:
-            if not use_transport_lagged_response:
-                raise ValueError(
-                    "floating_ambipolar_edge_node currently requires "
-                    "radau_rhs_mode='lagged_transport_response'."
-                )
             if owner is None or not callable(
                 getattr(owner, "build_node_boundary_lagged_response", None)
             ):
