@@ -4127,12 +4127,17 @@ class NTXDatabaseTransportModel(TransportFluxModelBase):
         }
 
     def build_lagged_response(self, state, **kwargs):
+        # The Radau floating-edge node is not a public TransportState leaf,
+        # but its anchor is part of the face-response point.  Preserve it
+        # here so database and realtime NTX use the same outer-face state.
+        er_edge_override = kwargs.pop("er_edge_override", None)
         del kwargs
         face_state = build_face_transport_state(
             state,
             self.geometry,
             bc_density=self.bc_density,
             bc_temperature=self.bc_temperature,
+            er_edge_override=er_edge_override,
         )
         return FaceJVPTransportFluxResponse(
             reference_state=state,
@@ -4150,6 +4155,8 @@ class NTXDatabaseTransportModel(TransportFluxModelBase):
         return super().pullback_build_lagged_response(state, lagged_response_bar, **kwargs)
 
     def evaluate_with_lagged_response(self, state, lagged_response, **kwargs):
+        er_edge_override = kwargs.pop("er_edge_override", None)
+        er_edge_anchor = kwargs.pop("er_edge_anchor", None)
         del kwargs
         delta_state = jax.tree_util.tree_map(
             lambda current, reference: current - reference,
@@ -4171,11 +4178,56 @@ class NTXDatabaseTransportModel(TransportFluxModelBase):
                 bc_temperature=self.bc_temperature,
             )
 
+        # The edge scalar is an additional direction only in the private
+        # Radau node solve.  Treat (TransportState, E_edge) as one Taylor
+        # coordinate so the reference face flux, first derivative, and any
+        # enabled higher-order terms share precisely the realtime model's
+        # anchor/displacement convention.  Centre-local database fluxes stay
+        # functions of the public centre state, as before.
+        use_edge_node = er_edge_override is not None or er_edge_anchor is not None
+        if use_edge_node:
+            if er_edge_override is None or er_edge_anchor is None:
+                raise ValueError(
+                    "Database floating-edge lagged evaluation requires both "
+                    "er_edge_override and er_edge_anchor."
+                )
+
+            def _face_fluxes_from_state_and_edge(state_and_edge):
+                state_value, edge_value = state_and_edge
+                face_state_value = build_face_transport_state(
+                    state_value,
+                    self.geometry,
+                    bc_density=self.bc_density,
+                    bc_temperature=self.bc_temperature,
+                    er_edge_override=edge_value,
+                )
+                return self.evaluate_face_fluxes(
+                    state_value,
+                    face_state_value,
+                    bc_density=self.bc_density,
+                    bc_temperature=self.bc_temperature,
+                )
+
+            anchor_value = (
+                lagged_response.reference_state,
+                jnp.asarray(er_edge_anchor, dtype=state.Er.dtype),
+            )
+            delta_value = (
+                delta_state,
+                jnp.asarray(er_edge_override, dtype=state.Er.dtype)
+                - jnp.asarray(er_edge_anchor, dtype=state.Er.dtype),
+            )
+            face_taylor_function = _face_fluxes_from_state_and_edge
+        else:
+            anchor_value = lagged_response.reference_state
+            delta_value = delta_state
+            face_taylor_function = _face_fluxes_from_state
+
         order = int(self.lagged_response_taylor_order)
         tangent_face_flux, curvature_face_flux, cubic_face_flux = self._anchored_taylor_terms(
-            _face_fluxes_from_state,
-            lagged_response.reference_state,
-            delta_state,
+            face_taylor_function,
+            anchor_value,
+            delta_value,
             order,
         )
         face_fluxes = self._add_taylor_terms(

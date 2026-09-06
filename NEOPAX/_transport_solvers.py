@@ -4749,6 +4749,10 @@ class _RadauAcceptedStepPhysicsContext:
     reverse_stage_adjoint_solve_mode: str = "structured"
     reverse_rhs_transpose_mode: str = "generic"
     reverse_rhs_pullback_mode: str = "separate"
+    # Internal database-lane switch.  It is false until the caller also
+    # consumes the deferred geometry records, so it cannot silently omit
+    # geometry cotangents.
+    reverse_database_defer_geometry: bool = False
     reverse_initial_cache_support_pullback_mode: str = "scalar"
     reverse_rebuild_support_pullback_mode: str = "separate"
     reverse_segment_jit_diagnostics: bool = False
@@ -7008,7 +7012,7 @@ def _radau_finish_native_vmec_rebuild_from_common_call(
     )
 
 
-def _execute_radau_accepted_step_next_reduced_cotangent_batched_bwd_with_support_from_primal_result(
+def _execute_radau_accepted_step_next_reduced_cotangent_batched_bwd_with_support_from_primal_result_core(
     kernel_context: _RadauAcceptedStepKernelContext,
     physics_context: _RadauAcceptedStepPhysicsContext,
     context: _RadauAcceptedStepAttemptContext,
@@ -7017,7 +7021,13 @@ def _execute_radau_accepted_step_next_reduced_cotangent_batched_bwd_with_support
     primal_result: _RadauAcceptedStepReverseMinimalAttemptResult,
     next_reduced_bars: _RadauAcceptedStepReducedCotangent,
     support,
-) -> tuple[_RadauAcceptedStepReducedCotangent, tuple[Any, ...]]:
+    *,
+    collect_database_geometry_record: bool,
+) -> tuple[
+    _RadauAcceptedStepReducedCotangent,
+    tuple[Any, ...],
+    _RadauDatabaseGeometryStageRecord | None,
+]:
     """Batched reduced accepted-step bwd plus support cotangent leaves.
 
     This keeps the geometry/support payload pullback on the same batched stage
@@ -7034,7 +7044,7 @@ def _execute_radau_accepted_step_next_reduced_cotangent_batched_bwd_with_support
             carry_in,
             next_reduced_bars,
         )
-        return reduced_bars, tuple()
+        return reduced_bars, tuple(), None
     if not bool(getattr(physics_context, "reverse_direct_stage_adjoint", False)):
         raise ValueError("batched reduced_cotangent reverse step bwd requires reverse_direct_stage_adjoint=True.")
 
@@ -7499,13 +7509,73 @@ def _execute_radau_accepted_step_next_reduced_cotangent_batched_bwd_with_support
             dtype=jnp.asarray(carry_in.lagged_reference_y).dtype,
         )
 
-    return (
-        _RadauAcceptedStepReducedCotangent(
+    reduced_bars = _RadauAcceptedStepReducedCotangent(
             y=y_bars,
             lagged_response_cache=lagged_cache_bars,
             lagged_reference_y=lagged_reference_y_bars,
-        ),
-        support_bar_leaves,
+    )
+    geometry_record = (
+        _radau_database_geometry_stage_record(
+            kernel_context, carry_in, primal_result, residual_bars
+        )
+        if collect_database_geometry_record
+        else None
+    )
+    return reduced_bars, support_bar_leaves, geometry_record
+
+
+def _execute_radau_accepted_step_next_reduced_cotangent_batched_bwd_with_support_from_primal_result(
+    kernel_context: _RadauAcceptedStepKernelContext,
+    physics_context: _RadauAcceptedStepPhysicsContext,
+    context: _RadauAcceptedStepAttemptContext,
+    lagged_response_branch: str,
+    carry_in: _RadauAcceptedStepCarry,
+    primal_result: _RadauAcceptedStepReverseMinimalAttemptResult,
+    next_reduced_bars: _RadauAcceptedStepReducedCotangent,
+    support,
+) -> tuple[_RadauAcceptedStepReducedCotangent, tuple[Any, ...]]:
+    """Established support reverse contract, without exposing stage records."""
+    reduced_bars, support_bar_leaves, _ = (
+        _execute_radau_accepted_step_next_reduced_cotangent_batched_bwd_with_support_from_primal_result_core(
+            kernel_context,
+            physics_context,
+            context,
+            lagged_response_branch,
+            carry_in,
+            primal_result,
+            next_reduced_bars,
+            support,
+            collect_database_geometry_record=False,
+        )
+    )
+    return reduced_bars, support_bar_leaves
+
+
+def _execute_radau_accepted_step_next_reduced_cotangent_batched_bwd_with_database_geometry_record_from_primal_result(
+    kernel_context: _RadauAcceptedStepKernelContext,
+    physics_context: _RadauAcceptedStepPhysicsContext,
+    context: _RadauAcceptedStepAttemptContext,
+    lagged_response_branch: str,
+    carry_in: _RadauAcceptedStepCarry,
+    primal_result: _RadauAcceptedStepReverseMinimalAttemptResult,
+    next_reduced_bars: _RadauAcceptedStepReducedCotangent,
+    support,
+) -> tuple[
+    _RadauAcceptedStepReducedCotangent,
+    tuple[Any, ...],
+    _RadauDatabaseGeometryStageRecord,
+]:
+    """Database-only variant exposing the bounded deferred-geometry record."""
+    return _execute_radau_accepted_step_next_reduced_cotangent_batched_bwd_with_support_from_primal_result_core(
+        kernel_context,
+        physics_context,
+        context,
+        lagged_response_branch,
+        carry_in,
+        primal_result,
+        next_reduced_bars,
+        support,
+        collect_database_geometry_record=True,
     )
 
 
@@ -7605,6 +7675,38 @@ def _execute_radau_accepted_step_next_reduced_cotangent_batched_bwd_with_support
     )
 
 
+def _execute_radau_accepted_step_next_reduced_cotangent_batched_bwd_with_database_geometry_record_from_segment_primal_record(
+    kernel_context: _RadauAcceptedStepKernelContext,
+    physics_context: _RadauAcceptedStepPhysicsContext,
+    context: _RadauAcceptedStepAttemptContext,
+    lagged_response_branch: str,
+    carry_in: _RadauAcceptedStepCarry,
+    primal_record: _RadauAcceptedStepSegmentPrimalRecord,
+    next_reduced_bars: _RadauAcceptedStepReducedCotangent,
+    support,
+) -> tuple[
+    _RadauAcceptedStepReducedCotangent,
+    tuple[Any, ...],
+    _RadauDatabaseGeometryStageRecord,
+]:
+    """Record-consuming database reverse with deferred geometry inputs."""
+    primal_result = _radau_reverse_minimal_attempt_from_segment_primal_record(
+        carry_in,
+        context,
+        primal_record,
+    )
+    return _execute_radau_accepted_step_next_reduced_cotangent_batched_bwd_with_database_geometry_record_from_primal_result(
+        kernel_context,
+        physics_context,
+        context,
+        lagged_response_branch,
+        carry_in,
+        primal_result,
+        next_reduced_bars,
+        support,
+    )
+
+
 @partial(jax.jit, static_argnums=(0, 1, 2, 3), inline=False)
 def _execute_radau_accepted_step_next_reduced_cotangent_batched_bwd_with_support_call(
     kernel_context: _RadauAcceptedStepKernelContext,
@@ -7646,6 +7748,34 @@ def _execute_radau_accepted_step_next_reduced_cotangent_batched_bwd_with_support
 ) -> tuple[_RadauAcceptedStepReducedCotangent, tuple[Any, ...]]:
     """Exact record-consuming step adjoint behind the existing call boundary."""
     return _execute_radau_accepted_step_next_reduced_cotangent_batched_bwd_with_support_from_segment_primal_record(
+        kernel_context,
+        physics_context,
+        context,
+        lagged_response_branch,
+        carry_in,
+        primal_record,
+        next_reduced_bars,
+        support,
+    )
+
+
+@partial(jax.jit, static_argnums=(0, 1, 2, 3), inline=False)
+def _execute_radau_accepted_step_next_reduced_cotangent_batched_bwd_with_database_geometry_record_from_segment_primal_record_call(
+    kernel_context: _RadauAcceptedStepKernelContext,
+    physics_context: _RadauAcceptedStepPhysicsContext,
+    context: _RadauAcceptedStepAttemptContext,
+    lagged_response_branch: str,
+    carry_in: _RadauAcceptedStepCarry,
+    primal_record: _RadauAcceptedStepSegmentPrimalRecord,
+    next_reduced_bars: _RadauAcceptedStepReducedCotangent,
+    support,
+) -> tuple[
+    _RadauAcceptedStepReducedCotangent,
+    tuple[Any, ...],
+    _RadauDatabaseGeometryStageRecord,
+]:
+    """Database record producer behind the same non-inlined step boundary."""
+    return _execute_radau_accepted_step_next_reduced_cotangent_batched_bwd_with_database_geometry_record_from_segment_primal_record(
         kernel_context,
         physics_context,
         context,
@@ -8819,6 +8949,115 @@ def _radau_segment_reduced_cotangent_bwd_batched_with_support_from_primal_record
         reverse=True,
     )
     return segment_start_reduced_bars, segment_support_bar_leaves
+
+
+@partial(jax.jit, static_argnums=(0, 1), inline=False)
+def _radau_database_segment_reduced_cotangent_bwd_with_table_support_and_geometry_records_call(
+    execution_context: _RadauSolveExecutionContext,
+    cotangent_mode: str,
+    segment_reduced_bars: _RadauAcceptedStepReducedCotangent,
+    step_start_carries: _RadauAcceptedStepCarry,
+    step_primal_records: _RadauAcceptedStepSegmentPrimalRecord,
+    segment_arrays,
+    support,
+) -> tuple[
+    _RadauAcceptedStepReducedCotangent,
+    tuple[Any, ...],
+    _RadauDatabaseGeometryStageRecord,
+]:
+    """Database-only segment reverse with table bars and deferred geometry records.
+
+    The caller supplies the bounded primal records produced by the existing
+    minimal segment replay.  This kernel deliberately performs no scan VJP
+    and selects the table-only direct-RHS hook; geometry is returned as
+    numeric stage data for the post-segment sweep.
+    """
+    if str(cotangent_mode).strip().lower() in {
+        "zero_step_bwd", "step_bwd_zero", "zero_accepted_step_bwd"
+    }:
+        raise ValueError("The database record segment does not support a zero step reverse.")
+    if not isinstance(support, dict) or set(support) != {"geometry", "database"}:
+        raise ValueError(
+            "Database record segment requires exactly {'geometry', 'database'} support."
+        )
+
+    database_execution_context = dataclasses.replace(
+        execution_context,
+        physics_context=dataclasses.replace(
+            execution_context.physics_context,
+            reverse_database_defer_geometry=True,
+        ),
+    )
+    objective_count = jnp.asarray(segment_reduced_bars.y).shape[0]
+    zero_support_bar_leaves = tuple(
+        jnp.broadcast_to(
+            jnp.asarray(leaf)[None, ...],
+            (objective_count,) + jnp.asarray(leaf).shape,
+        )
+        for leaf in jax.tree_util.tree_leaves(_radau_zero_support_delta_tree_like(support))
+    )
+
+    def _zero_record():
+        return _RadauDatabaseGeometryStageRecord(
+            stage_times=jnp.zeros(
+                (database_execution_context.kernel_context.num_stages,),
+                dtype=database_execution_context.dtype,
+            ),
+            stage_states=jnp.zeros(
+                (
+                    database_execution_context.kernel_context.num_stages,
+                    database_execution_context.kernel_context.state_dim,
+                ),
+                dtype=database_execution_context.dtype,
+            ),
+            residual_bars=jnp.zeros(
+                (
+                    objective_count,
+                    database_execution_context.kernel_context.num_stages,
+                    database_execution_context.kernel_context.state_dim,
+                ),
+                dtype=database_execution_context.dtype,
+            ),
+        )
+
+    def _slot_bwd(carry, slot_xs):
+        slot_reduced_bars, support_bar_leaves = carry
+        step_start_carry, primal_record, slot_arrays = slot_xs
+        active, dt_value, *_ = slot_arrays
+        residual_carry = _radau_carry_with_forward_only_jvp_fields(
+            dataclasses.replace(step_start_carry, dt=dt_value)
+        )
+
+        def _do_step(_):
+            return _execute_radau_accepted_step_next_reduced_cotangent_batched_bwd_with_database_geometry_record_from_segment_primal_record_call(
+                database_execution_context.kernel_context,
+                database_execution_context.physics_context,
+                database_execution_context.attempt_context,
+                "rebuild",
+                residual_carry,
+                primal_record,
+                slot_reduced_bars,
+                support,
+            )
+
+        def _skip(_):
+            return slot_reduced_bars, zero_support_bar_leaves, _zero_record()
+
+        step_reduced_bars, step_support_bar_leaves, geometry_record = jax.lax.cond(
+            active, _do_step, _skip, operand=None
+        )
+        return (
+            step_reduced_bars,
+            tuple(a + b for a, b in zip(support_bar_leaves, step_support_bar_leaves)),
+        ), geometry_record
+
+    (segment_start_reduced_bars, segment_support_bar_leaves), geometry_records = jax.lax.scan(
+        _slot_bwd,
+        (segment_reduced_bars, zero_support_bar_leaves),
+        (step_start_carries, step_primal_records, segment_arrays),
+        reverse=True,
+    )
+    return segment_start_reduced_bars, segment_support_bar_leaves, geometry_records
 
 
 @partial(jax.jit, static_argnums=(0, 1, 2, 3), inline=False)
@@ -10740,14 +10979,22 @@ def _radau_exact_stage_residual_support_pullback(
     # dependence is instead in the direct RHS itself.  Keep this branch
     # isolated so the established fixed-lagged transpose remains unchanged.
     if lagged_response is None:
-        if physics_context.flat_rhs_direct_support_pullback is None:
+        use_database_table_only = bool(
+            getattr(physics_context, "reverse_database_defer_geometry", False)
+        )
+        direct_support_pullback = (
+            physics_context.flat_rhs_direct_database_table_pullback
+            if use_database_table_only
+            else physics_context.flat_rhs_direct_support_pullback
+        )
+        if direct_support_pullback is None:
             return _radau_zero_support_delta_tree_like(support)
 
         def _direct_stage_support_pullback(accumulated_bar, stage_inputs):
             t_eval, y_eval, rhs_bar_eval = stage_inputs
             stage_support_bar = _radau_sanitize_support_delta_bar_tree(
                 support,
-                physics_context.flat_rhs_direct_support_pullback(
+                direct_support_pullback(
                     t_eval, y_eval, -rhs_bar_eval, support
                 ),
             )
@@ -14730,11 +14977,14 @@ def _radau_run_stage_subsolve(
         jax.debug.print(
             "[radau-node-edge-newton] phase=predictor t={t:.6e} h={h:.6e} "
             "edge_base={edge_base:.6e} anchor={anchor:.6e} "
+            "rhs_base={rhs_base:.6e} jac_edge_edge={jacobian:.6e} "
             "edge_stage_max={edge_stage:.6e} delta_max={delta:.6e} stage={stage}",
             t=inputs.t_value,
             h=inputs.h_value,
             edge_base=inputs.flat_y[-1],
             anchor=inputs.lagged_response.er_edge_anchor,
+            rhs_base=inputs.f0[-1],
+            jacobian=inputs.jacobian_ref[-1, -1],
             edge_stage=predictor_edge[predictor_max_stage],
             delta=predictor_delta[predictor_max_stage],
             stage=predictor_max_stage,

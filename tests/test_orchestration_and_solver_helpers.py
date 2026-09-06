@@ -468,6 +468,87 @@ def test_ntx_database_lagged_face_response_matches_reference_and_finite_differen
             atol=3.0e-4,
         )
 
+    # The private floating-edge node must be an actual face-response Taylor
+    # coordinate.  Previously the database lagged path discarded these two
+    # keywords, so its edge ambipolar residual was insensitive to E_edge even
+    # though realtime NTX used it.
+    edge_anchor = jnp.asarray(0.47)
+    edge_step = jnp.asarray(1.0e-4)
+    edge_response = model.build_lagged_response(
+        state0, er_edge_override=edge_anchor
+    )
+
+    def _direct_face_fluxes_at_edge(edge_value):
+        face_state = flux_models_module.build_face_transport_state(
+            state0, geometry, er_edge_override=edge_value
+        )
+        return model.evaluate_face_fluxes(state0, face_state)
+
+    edge_reference = model.evaluate_with_lagged_response(
+        state0,
+        edge_response,
+        er_edge_override=edge_anchor,
+        er_edge_anchor=edge_anchor,
+    )
+    edge_plus = model.evaluate_with_lagged_response(
+        state0,
+        edge_response,
+        er_edge_override=edge_anchor + edge_step,
+        er_edge_anchor=edge_anchor,
+    )
+    edge_minus = model.evaluate_with_lagged_response(
+        state0,
+        edge_response,
+        er_edge_override=edge_anchor - edge_step,
+        er_edge_anchor=edge_anchor,
+    )
+    direct_edge_reference = _direct_face_fluxes_at_edge(edge_anchor)
+    direct_edge_plus = _direct_face_fluxes_at_edge(edge_anchor + edge_step)
+    direct_edge_minus = _direct_face_fluxes_at_edge(edge_anchor - edge_step)
+    for name in ("Gamma", "Q", "Upar"):
+        assert jnp.allclose(
+            edge_reference[f"{name}_faces"], direct_edge_reference[name],
+            rtol=1.0e-6, atol=1.0e-6,
+        )
+        assert jnp.allclose(
+            (edge_plus[f"{name}_faces"] - edge_minus[f"{name}_faces"])
+            / (2.0 * edge_step),
+            (direct_edge_plus[name] - direct_edge_minus[name]) / (2.0 * edge_step),
+            rtol=3.0e-3, atol=3.0e-4,
+        )
+
+    # Node-mode reverse uses a generic VJP over its private augmented edge
+    # coordinate.  Verify the database response payload exposes that exact
+    # dependency, rather than silently returning a zero edge cotangent.
+    edge_cache, edge_cache_pullback = jax.vjp(
+        lambda edge_value: model.build_lagged_response(
+            state0, er_edge_override=edge_value
+        ),
+        edge_anchor,
+    )
+    edge_cache_bar = jax.tree_util.tree_map(
+        lambda leaf: jnp.zeros_like(leaf), edge_cache
+    )
+    edge_cache_bar = dataclasses.replace(
+        edge_cache_bar,
+        reference_face_flux={
+            name: jnp.ones_like(value) if name == "Gamma" else jnp.zeros_like(value)
+            for name, value in edge_cache.reference_face_flux.items()
+        },
+    )
+    (edge_cache_bar_value,) = edge_cache_pullback(edge_cache_bar)
+    direct_edge_cache_derivative = jax.grad(
+        lambda edge_value: jnp.sum(
+            model.build_lagged_response(
+                state0, er_edge_override=edge_value
+            ).reference_face_flux["Gamma"]
+        )
+    )(edge_anchor)
+    assert jnp.allclose(
+        edge_cache_bar_value, direct_edge_cache_derivative,
+        rtol=1.0e-6, atol=1.0e-6,
+    )
+
     # The quadratic experimental lane is a Taylor response of the same
     # database primitives.  Its remaining local error must be cubic in a
     # smooth profile perturbation, whereas the established lagged response

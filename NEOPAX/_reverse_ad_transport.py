@@ -110,6 +110,8 @@ from ._transport_solvers import (
     _radau_eval_rhs,
     _execute_radau_accepted_step_next_reduced_cotangent_batched_bwd_with_support_call,
     _execute_radau_accepted_step_next_reduced_cotangent_batched_bwd_with_support_from_segment_primal_record_call,
+    _radau_database_geometry_support_pullback_from_stage_record,
+    _radau_database_segment_reduced_cotangent_bwd_with_table_support_and_geometry_records_call,
     _radau_segment_reduced_cotangent_bwd_batched_with_support_call,
     _radau_segment_replay_minimal_with_primal_records_call,
     _radau_segment_reduced_cotangent_bwd_batched_with_support_from_primal_records_call,
@@ -4903,6 +4905,11 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
         getattr(reverse_setup.execution_context.physics_context, "reverse_stage_cotangent_mode", "full")
     ).strip().lower()
     segment_count = int(jax.tree_util.tree_leaves(segmented_replay_arrays)[0].shape[0])
+    use_database_table_geometry_split = (
+        isinstance(support_payload, dict)
+        and set(support_payload) == {"geometry", "database"}
+    )
+    database_geometry_records_by_segment = []
 
     reduced_bars = _reverse_reduced_cotangent(
         reverse_setup.execution_context,
@@ -5612,7 +5619,41 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
         segment_start_carry = _take_tree_axis0(segment_start_carries, segment_index)
         segment_arrays = _take_tree_axis0(segmented_replay_arrays, segment_index)
         segment_reduced_bars_input = reduced_bars
-        if host_static_branch_dispatch:
+        if use_database_table_geometry_split:
+            # The database segment owns only the compact table transpose.
+            # Replay remains bounded by segment length; the returned numeric
+            # records are consumed after the complete table sweep below.
+            _, database_step_start_carries, database_step_primal_records = (
+                _radau_segment_replay_minimal_with_primal_records_call(
+                    reverse_setup.execution_context,
+                    segment_start_carry,
+                    segment_arrays,
+                )
+            )
+            (
+                reduced_bars,
+                segment_support_bar_leaves,
+                database_geometry_records,
+            ) = _radau_database_segment_reduced_cotangent_bwd_with_table_support_and_geometry_records_call(
+                reverse_setup.execution_context,
+                cotangent_mode,
+                reduced_bars,
+                database_step_start_carries,
+                database_step_primal_records,
+                segment_arrays,
+                support_payload,
+            )
+            reduced_bars, segment_support_bar_leaves, database_geometry_records = (
+                jax.block_until_ready(
+                    (
+                        reduced_bars,
+                        segment_support_bar_leaves,
+                        database_geometry_records,
+                    )
+                )
+            )
+            database_geometry_records_by_segment.append(database_geometry_records)
+        elif host_static_branch_dispatch:
             reduced_bars, segment_support_bar_leaves = _run_host_static_branch_segment(
                 segment_start_carry,
                 segment_arrays,
@@ -5704,7 +5745,11 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
                             f"cumulative_support_bad={cumulative_label}",
                             flush=True,
                         )
-        if phase_timing_segment_warm_pending and not host_static_branch_dispatch:
+        if (
+            phase_timing_segment_warm_pending
+            and not host_static_branch_dispatch
+            and not use_database_table_geometry_split
+        ):
             first_call_elapsed = time.perf_counter() - segment_phase_start
             warm_start = time.perf_counter()
             warm_reduced_bars, warm_support_bar_leaves = (
@@ -5818,6 +5863,34 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
                 "(host diagnostic; not an XLA persistent-cache metric)",
                 flush=True,
             )
+    if use_database_table_geometry_split:
+        geometry_sweep_start = time.perf_counter()
+        for database_geometry_records in database_geometry_records_by_segment:
+            geometry_support_bars = (
+                _radau_database_geometry_support_pullback_from_stage_record(
+                    reverse_setup.execution_context.physics_context,
+                    support_payload,
+                    database_geometry_records,
+                )
+            )
+            geometry_support_bar_leaves = tuple(
+                jax.tree_util.tree_leaves(geometry_support_bars)
+            )
+            support_bar_leaves = tuple(
+                accumulated + increment
+                for accumulated, increment in zip(
+                    support_bar_leaves,
+                    geometry_support_bar_leaves,
+                    strict=True,
+                )
+            )
+        support_bar_leaves = jax.block_until_ready(support_bar_leaves)
+        print(
+            f"{progress_prefix} progress: database post-segment geometry sweep ready "
+            f"elapsed_s={time.perf_counter() - geometry_sweep_start:.3f} "
+            f"segments={len(database_geometry_records_by_segment)}",
+            flush=True,
+        )
     reduced_bars, support_bar_leaves = jax.block_until_ready((reduced_bars, support_bar_leaves))
     print(
         f"{progress_prefix} progress: support reverse segmented cotangent sweep ready "
