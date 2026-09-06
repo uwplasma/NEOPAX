@@ -37,6 +37,7 @@ from ._reverse_ad_initial_er import (
     fold_recorded_ntx_scan_database_bar_groups_into_support,
     compact_initial_er_ntx_support_pullback_leaves,
     compact_initial_er_state_pullback,
+    find_ntx_database_transport_model_in_model,
     find_ntx_runtime_scan_model_in_model,
     find_ntx_support_payload,
     initial_er_charge_flux_residual_er_derivative,
@@ -2696,6 +2697,23 @@ def reverse_initial_carry_from_state_with_static_setup(
     physics_context = prepared_rollout_static.physics_context
     initial_carry_static = prepared_rollout_static.initial_carry
     lagged_pullback_fn = lagged_response_pullback_from_owner(solve_vector_field)
+    node_response_from_flat = (
+        physics_context.build_lagged_response_from_flat
+        or getattr(
+            physics_context.unpack_flat,
+            "radau_node_build_lagged_response_from_flat",
+            None,
+        )
+    )
+    # In node mode the public initial state remains three-field, while Radau
+    # carries one private outer-Er coordinate.  Its primal initial value is
+    # stored in the static forward preparation; appending it here makes every
+    # reverse replay use exactly the same internal layout as forward solve.
+    node_edge0 = (
+        jnp.asarray(initial_carry_static.y[-1:])
+        if node_response_from_flat is not None
+        else None
+    )
 
     def _flat_state_from_state(state_value):
         flat_state, *_ = _make_solver_state_transform(
@@ -2706,24 +2724,30 @@ def reverse_initial_carry_from_state_with_static_setup(
             density_floor=density_floor,
             temperature_floor=temperature_floor,
         )
-        return flat_state
+        return (
+            jnp.concatenate((flat_state, node_edge0))
+            if node_edge0 is not None
+            else flat_state
+        )
 
     def _build_state_from_flat(flat_value, unpack_flat, project_flat):
         return unpack_flat(_project_flat_state_if_needed(flat_value, project_flat))
 
+    def _build_lagged_response_from_flat(flat_value, unpack_flat, project_flat):
+        projected = _project_flat_state_if_needed(flat_value, project_flat)
+        if node_response_from_flat is not None:
+            return node_response_from_flat(projected)
+        if physics_context.build_lagged_response is None:
+            return None
+        return physics_context.build_lagged_response(unpack_flat(projected))
+
     @jax.custom_vjp
     def _build_initial_carry(state_value):
-        flat_state0, unpack_flat, _unpack_packed, _pack_state, project_flat = _make_solver_state_transform(
-            state_value,
-            species,
-            temperature_active_mask=temperature_active_mask,
-            fixed_temperature_profile=fixed_temperature_profile,
-            density_floor=density_floor,
-            temperature_floor=temperature_floor,
-        )
-        lagged_state0 = _build_state_from_flat(flat_state0, unpack_flat, project_flat)
+        flat_state0 = _flat_state_from_state(state_value)
+        unpack_flat = physics_context.unpack_flat
+        project_flat = physics_context.project_flat
         initial_lagged_response = (
-            physics_context.build_lagged_response(lagged_state0)
+            _build_lagged_response_from_flat(flat_state0, unpack_flat, project_flat)
             if (kernel_context.use_transport_lagged_response and physics_context.build_lagged_response is not None)
             else None
         )
@@ -2752,17 +2776,12 @@ def reverse_initial_carry_from_state_with_static_setup(
         return _radau_carry_from_step_state(step_state0)
 
     def _build_initial_carry_fwd(state_value):
-        flat_state0, unpack_flat, _unpack_packed, _pack_state, project_flat = _make_solver_state_transform(
-            state_value,
-            species,
-            temperature_active_mask=temperature_active_mask,
-            fixed_temperature_profile=fixed_temperature_profile,
-            density_floor=density_floor,
-            temperature_floor=temperature_floor,
-        )
+        flat_state0 = _flat_state_from_state(state_value)
+        unpack_flat = physics_context.unpack_flat
+        project_flat = physics_context.project_flat
         lagged_state0 = _build_state_from_flat(flat_state0, unpack_flat, project_flat)
         initial_lagged_response = (
-            physics_context.build_lagged_response(lagged_state0)
+            _build_lagged_response_from_flat(flat_state0, unpack_flat, project_flat)
             if (kernel_context.use_transport_lagged_response and physics_context.build_lagged_response is not None)
             else None
         )
@@ -2794,14 +2813,8 @@ def reverse_initial_carry_from_state_with_static_setup(
 
     def _build_initial_carry_bwd(residual, carry_bar):
         state_value, flat_state0, lagged_state0, initial_lagged_response = residual
-        _, unpack_flat, _unpack_packed, _pack_state, project_flat = _make_solver_state_transform(
-            state_value,
-            species,
-            temperature_active_mask=temperature_active_mask,
-            fixed_temperature_profile=fixed_temperature_profile,
-            density_floor=density_floor,
-            temperature_floor=temperature_floor,
-        )
+        unpack_flat = physics_context.unpack_flat
+        project_flat = physics_context.project_flat
         flat_bar = jnp.asarray(carry_bar.y)
         flat_bar = flat_bar + jnp.asarray(carry_bar.lagged_reference_y)
 
@@ -2893,10 +2906,19 @@ def reverse_initial_carry_from_state_with_static_setup(
             )
             lagged_bar = add_trees(lagged_bar, rhs_lagged_bar)
 
-            if lagged_pullback_fn is not None:
+            if lagged_pullback_fn is not None and node_response_from_flat is None:
                 lagged_state_bar = lagged_pullback_fn(lagged_state0, lagged_bar)
             else:
                 def _nonzero_lagged_state_pullback(_):
+                    if node_response_from_flat is not None:
+                        _, lagged_pullback = jax.vjp(
+                            lambda flat_value: _build_lagged_response_from_flat(
+                                flat_value, unpack_flat, project_flat
+                            ),
+                            flat_state0,
+                        )
+                        (flat_bar_value,) = lagged_pullback(lagged_bar)
+                        return flat_bar_value
                     def _build_lagged_from_state(lagged_state_value):
                         return physics_context.build_lagged_response(lagged_state_value)
 
@@ -2907,24 +2929,30 @@ def reverse_initial_carry_from_state_with_static_setup(
                 lagged_state_bar = jax.lax.cond(
                     _tree_max_abs(lagged_bar) > 0.0,
                     _nonzero_lagged_state_pullback,
-                    lambda _: jax.tree_util.tree_map(jnp.zeros_like, lagged_state0),
-                    operand=None,
-                )
-
-            def _lagged_state_from_flat(flat_value):
-                return _build_state_from_flat(flat_value, unpack_flat, project_flat)
-
-            def _nonzero_lagged_state_flat_pullback(_):
-                _, lagged_state_flat_pullback = jax.vjp(_lagged_state_from_flat, flat_state0)
-                (lagged_flat_bar_value,) = lagged_state_flat_pullback(lagged_state_bar)
-                return lagged_flat_bar_value
-
-            lagged_flat_bar = jax.lax.cond(
-                _tree_max_abs(lagged_state_bar) > 0.0,
-                _nonzero_lagged_state_flat_pullback,
-                lambda _: _zero_flat_bar(),
+                lambda _: (
+                    jnp.zeros_like(flat_state0)
+                    if node_response_from_flat is not None
+                    else jax.tree_util.tree_map(jnp.zeros_like, lagged_state0)
+                ),
                 operand=None,
             )
+            if node_response_from_flat is not None:
+                lagged_flat_bar = lagged_state_bar
+            else:
+                def _lagged_state_from_flat(flat_value):
+                    return _build_state_from_flat(flat_value, unpack_flat, project_flat)
+
+                def _nonzero_lagged_state_flat_pullback(_):
+                    _, lagged_state_flat_pullback = jax.vjp(_lagged_state_from_flat, flat_state0)
+                    (lagged_flat_bar_value,) = lagged_state_flat_pullback(lagged_state_bar)
+                    return lagged_flat_bar_value
+
+                lagged_flat_bar = jax.lax.cond(
+                    _tree_max_abs(lagged_state_bar) > 0.0,
+                    _nonzero_lagged_state_flat_pullback,
+                    lambda _: _zero_flat_bar(),
+                    operand=None,
+                )
             flat_bar = flat_bar + lagged_flat_bar
 
         _, state_pullback = jax.vjp(_flat_state_from_state, state_value)
@@ -6174,19 +6202,12 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
             # of the full radial residual vector with a geometry payload.  It
             # is the same one-radius construction used by the Lij compact
             # boundary and avoids tracing the all-radii database evaluator.
-            runtime_scan = find_ntx_runtime_scan_model_in_model(runtime.models.flux)
-            if runtime_scan is None:
+            database_model = find_ntx_database_transport_model_in_model(runtime.models.flux)
+            if database_model is None:
                 raise ValueError(
                     "Recorded database initial-Er geometry pullback requires "
-                    "an NTX runtime scan model."
+                    "a fixed NTX database model."
                 )
-            with_payload = getattr(runtime_scan, "with_support_payload", None)
-            if not callable(with_payload):
-                raise NotImplementedError(
-                    "Recorded database initial-Er geometry pullback requires "
-                    "a support-payload binding method."
-                )
-            database_model = with_payload(support_payload)
             geometry_pullback_fn = getattr(
                 database_model,
                 "pullback_local_particle_flux_geometry_by_radius",

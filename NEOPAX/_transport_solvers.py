@@ -20737,6 +20737,109 @@ def _build_prepared_radau_accepted_rollout(
     build_lagged_response = build_lagged_response_raw
     flat_rhs_with_lagged_response = flat_rhs_with_lagged_response_raw
     flat_rhs_with_lagged_response_tangent = flat_rhs_with_lagged_response_tangent_raw
+    # Keep the accepted-rollout/reverse preparation structurally identical to
+    # RADAUSolver.solve: the NTSS-like outer Er node is an internal 460th
+    # Radau coordinate, not a public TransportState entry.  Previously this
+    # helper silently rebuilt a 459-coordinate context, which made replay and
+    # therefore reverse AD inconsistent with the forward node solve.
+    owner = getattr(vector_field, "__self__", None)
+    node_er_equation = getattr(owner, "er_equation", None)
+    use_node_boundary = (
+        node_er_equation is not None
+        and str(getattr(node_er_equation, "boundary_mode", "")).strip().lower()
+        == "floating_ambipolar_edge_node"
+    )
+    build_lagged_response_from_flat = None
+    if use_node_boundary:
+        if not use_transport_lagged_response:
+            raise ValueError(
+                "floating_ambipolar_edge_node currently requires "
+                "radau_rhs_mode='lagged_transport_response'."
+            )
+        if owner is None or not callable(
+            getattr(owner, "build_node_boundary_lagged_response", None)
+        ):
+            raise ValueError(
+                "floating_ambipolar_edge_node requires the composed transport "
+                "equation-system boundary adapter."
+            )
+        core_flat_state0 = flat_state0
+        core_unpack_flat = unpack_flat
+        core_pack_state = pack_state
+        core_project_flat = project_flat
+        configured_edge0 = getattr(owner, "node_boundary_initial_er", None)
+        edge0 = (
+            jnp.asarray(configured_edge0, dtype=dtype)
+            if configured_edge0 is not None
+            else (
+                jnp.asarray(1.5, dtype=dtype) * state.Er[-1]
+                - jnp.asarray(0.5, dtype=dtype) * state.Er[-2]
+                if state.Er.shape[0] >= 2 else state.Er[-1]
+            )
+        )
+
+        def _node_unpack_flat(flat_y):
+            return core_unpack_flat(flat_y[:-1])
+
+        def _node_project_flat(flat_y):
+            return jnp.concatenate((core_project_flat(flat_y[:-1]), flat_y[-1:]))
+
+        def _node_build_from_flat(flat_y):
+            projected = _node_project_flat(flat_y)
+            edge = projected[-1]
+            return _RadauNodeBoundaryLaggedCache(
+                transport_response=owner.build_node_boundary_lagged_response(
+                    _node_unpack_flat(projected), edge
+                ),
+                er_edge_anchor=edge,
+            )
+
+        def _node_lagged_rhs(t_value, flat_y, cache):
+            del t_value
+            projected = _node_project_flat(flat_y)
+            # A regular transport cache can be present only when this helper
+            # is entered through an older replay artifact.  Rebuild the node
+            # wrapper rather than interpreting that public cache as one.
+            cache = (
+                cache
+                if isinstance(cache, _RadauNodeBoundaryLaggedCache)
+                else _node_build_from_flat(projected)
+            )
+            core_rhs, edge_rhs = owner.evaluate_node_boundary_with_lagged_response(
+                _node_unpack_flat(projected),
+                projected[-1],
+                cache.transport_response,
+                er_edge_anchor=cache.er_edge_anchor,
+            )
+            return jnp.concatenate((core_pack_state(core_rhs), jnp.reshape(edge_rhs, (1,))))
+
+        setattr(
+            _node_unpack_flat,
+            "radau_node_build_lagged_response_from_flat",
+            _node_build_from_flat,
+        )
+        flat_state0 = jnp.concatenate((core_flat_state0, jnp.reshape(edge0, (1,))))
+        unpack_flat = _node_unpack_flat
+        project_flat = _node_project_flat
+        state_dim = flat_state0.shape[0]
+        er_size += 1
+        flat_rhs = lambda t_value, flat_y: _node_lagged_rhs(
+            t_value, flat_y, _node_build_from_flat(flat_y)
+        )
+        flat_rhs_with_lagged_response = _node_lagged_rhs
+        # Existing model hooks map the public three-field state only.  Let the
+        # generic VJP see the augmented edge coordinate until node-aware
+        # specialized hooks are supplied.
+        pullback_build_lagged_response = None
+        flat_rhs_lagged_response_pullback = None
+        flat_rhs_state_pullback = None
+        flat_rhs_state_and_lagged_response_pullback = None
+        flat_rhs_lagged_response_all_pullback = None
+        if str(getattr(solver, "lagged_jacobian_refresh_mode", "none")).strip().lower() != "none":
+            raise ValueError(
+                "floating_ambipolar_edge_node does not yet support "
+                "radau_lagged_jacobian_refresh_mode; use 'none'."
+            )
     if (
         str(getattr(solver, "lagged_jacobian_refresh_mode", "none")).strip().lower()
         == "quadratic_colored_after_first"
@@ -20747,7 +20850,15 @@ def _build_prepared_radau_accepted_rollout(
             "the vector field to provide evaluate_with_lagged_response_tangent(...)."
         )
     initial_lagged_response = (
-        build_lagged_response(unpack_flat(_project_flat_state_if_needed(flat_state0, project_flat)))
+        (
+            build_lagged_response_from_flat(
+                _project_flat_state_if_needed(flat_state0, project_flat)
+            )
+            if build_lagged_response_from_flat is not None
+            else build_lagged_response(
+                unpack_flat(_project_flat_state_if_needed(flat_state0, project_flat))
+            )
+        )
         if (use_transport_lagged_response and build_lagged_response is not None)
         else None
     )
@@ -20905,6 +21016,7 @@ def _build_prepared_radau_accepted_rollout(
         pack_flat=pack_state,
         project_flat=project_flat,
         build_lagged_response=build_lagged_response,
+        build_lagged_response_from_flat=build_lagged_response_from_flat,
         pullback_build_lagged_response=pullback_build_lagged_response,
         build_lagged_response_with_compact_coefficient_record=(
             build_lagged_response_with_compact_coefficient_record

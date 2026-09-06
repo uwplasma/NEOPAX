@@ -1163,11 +1163,20 @@ def test_radau_floating_edge_node_uses_private_augmented_coordinate():
         max_steps=32,
     )
     out = solver.solve(state0, _NodeOwner().__call__)
+    prepared = transport_solvers._build_prepared_radau_accepted_rollout(
+        solver=solver,
+        state=state0,
+        vector_field=_NodeOwner().__call__,
+        species=None,
+    )
 
     assert int(out["n_steps"]) > 0
     assert isinstance(out["final_state"], TransportState)
     assert len(jax.tree_util.tree_leaves(out["final_state"])) == 3
     assert jnp.all(jnp.isfinite(out["final_state"].Er))
+    # The accepted-rollout builder is also the reverse replay entry point. It
+    # must use the same private outer-Er coordinate as RADAUSolver.solve.
+    assert int(prepared.initial_carry.y.shape[0]) == 7
 
 
 def test_radau_endpoint_defect_correction_runs_on_nonlinear_lagged_rhs():
