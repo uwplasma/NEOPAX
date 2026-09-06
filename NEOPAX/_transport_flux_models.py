@@ -5213,6 +5213,86 @@ class NTXRuntimeScanTransportModel(TransportFluxModelBase):
             "surfaces": surface_bars,
         }
 
+    def recorded_runtime_database_support_bar_batched(self, database_bars):
+        """Transpose a leading batch of fixed-table bars through one scan record.
+
+        Only numerical table bars are mapped.  In particular, this does not
+        ``vmap`` the public scalar scan transpose, because that maps VMEC
+        surface cotangent PyTrees and is invalid for their static metadata.
+        """
+
+        if self.scan_primal_record is None or self.scan_primal is None:
+            raise ValueError(
+                "Recorded runtime scan primal is unavailable; rebuild with "
+                "record_scan_primal=True and coefficient_reverse_mode='structured'."
+            )
+        ntx = _import_ntx()
+        channels = self._static_channels()
+        rho, _, er_tilde = self._scan_axes()
+        del rho
+        _, conversion_pullback = jax.vjp(
+            lambda raw_scan_value, channel_value: _ntx_runtime_scan_to_neopax_monoenergetic(
+                _ntx_runtime_scan_with_live_channels(
+                    raw_scan_value,
+                    channels=channel_value.as_mapping(),
+                    er_tilde=er_tilde,
+                ),
+                a_b=channel_value.a_b,
+            ),
+            self.scan_primal,
+            channels,
+        )
+        scan_bars, channels_bars = jax.vmap(conversion_pullback)(database_bars)
+        blocks_bars = ntx.NeopaxScanCoefficientBlocks(
+            D11=scan_bars.D11,
+            D13=scan_bars.D13,
+            D33=scan_bars.D33,
+            D33_spitzer=scan_bars.D33_spitzer,
+            b00=scan_bars.b00,
+            boozer_i=scan_bars.boozer_i,
+            boozer_g=scan_bars.boozer_g,
+            iota=scan_bars.iota,
+            fac_reference_to_sfincs_11=scan_bars.fac_reference_to_sfincs_11,
+            fac_reference_to_sfincs_31=scan_bars.fac_reference_to_sfincs_31,
+            fac_reference_to_sfincs_33=scan_bars.fac_reference_to_sfincs_33,
+            fac_sfincs_to_dkes_11=scan_bars.fac_sfincs_to_dkes_11,
+            fac_sfincs_to_dkes_31=scan_bars.fac_sfincs_to_dkes_31,
+            fac_sfincs_to_dkes_33=scan_bars.fac_sfincs_to_dkes_33,
+        )
+        surface_bars, es_bars = (
+            ntx.pullback_neopax_scan_coefficient_blocks_from_primal_record_batched(
+                self.scan_primal_record,
+                coefficient_blocks_bar=blocks_bars,
+            )
+        )
+
+        def _raw_scan_inputs_from_channels(channel_value):
+            channel_mapping = channel_value.as_mapping()
+            er_value, es_value, _ = _build_ntx_field_channels(
+                jnp.asarray(self.scan_primal.rho, dtype=jnp.float64),
+                er_tilde,
+                channel_mapping,
+            )
+            return dataclasses.replace(
+                self.scan_primal,
+                Er=er_value,
+                Es=es_value,
+                drds=jnp.asarray(channel_mapping["drds"], dtype=jnp.float64),
+            )
+
+        scan_input_bars = dataclasses.replace(
+            scan_bars,
+            Es=jnp.asarray(scan_bars.Es) + jnp.asarray(es_bars),
+        )
+        _, input_channel_pullback = jax.vjp(_raw_scan_inputs_from_channels, channels)
+        input_channels_bars = jax.vmap(input_channel_pullback)(scan_input_bars)[0]
+        channels_bars = jax.tree_util.tree_map(
+            lambda lhs, rhs: jnp.asarray(lhs) + jnp.asarray(rhs),
+            channels_bars,
+            input_channels_bars,
+        )
+        return {"channels": channels_bars, "surfaces": surface_bars}
+
     def with_static_channels(self) -> "NTXRuntimeScanTransportModel":
         if self.channels is not None:
             return self

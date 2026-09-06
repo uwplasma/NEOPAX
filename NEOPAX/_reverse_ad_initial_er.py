@@ -476,9 +476,14 @@ def fold_recorded_ntx_scan_database_bars_into_support(runtime, support_bars):
         lambda *values: jnp.stack(values),
         *(bar["database"] for bar in support_bars),
     )
-    database_support_bars = jax.vmap(
-        runtime_scan.recorded_runtime_database_support_bar,
-    )(database_bars)
+    batched_pullback = getattr(
+        runtime_scan, "recorded_runtime_database_support_bar_batched", None
+    )
+    database_support_bars = (
+        batched_pullback(database_bars)
+        if batched_pullback is not None
+        else jax.vmap(runtime_scan.recorded_runtime_database_support_bar)(database_bars)
+    )
 
     def _row(tree, index):
         return jax.tree_util.tree_map(lambda value: value[index], tree)
@@ -540,9 +545,17 @@ def fold_recorded_ntx_scan_database_bar_groups_into_support(runtime_or_owner, ba
         lambda *values: jnp.stack(values),
         *(bar["database"] for _group_index, _row_index, bar in indexed_bars),
     )
-    database_support_bars = jax.vmap(
-        owner.database_support_bar if owner is not None else runtime_scan.recorded_runtime_database_support_bar,
-    )(database_bars)
+    selected_scan = owner.runtime_scan if owner is not None else runtime_scan
+    batched_pullback = getattr(
+        selected_scan, "recorded_runtime_database_support_bar_batched", None
+    )
+    database_support_bars = (
+        batched_pullback(database_bars)
+        if batched_pullback is not None
+        else jax.vmap(
+            owner.database_support_bar if owner is not None else runtime_scan.recorded_runtime_database_support_bar,
+        )(database_bars)
+    )
 
     rebuilt = [list(group) for group in groups]
     for batch_index, (group_index, row_index, support_bar) in enumerate(indexed_bars):
