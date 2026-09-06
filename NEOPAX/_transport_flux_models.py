@@ -3324,7 +3324,22 @@ class NTXDatabaseTransportModel(TransportFluxModelBase):
             return None
         database = support["database"]
         density = safe_density(state.density, self.density_floor)
-        zero = jnp.zeros_like(jnp.asarray(density))
+        # The selected-root path normally supplies only ``Gamma``.  When it
+        # is objective-batched, its omitted Q/Upar cotangents must carry the
+        # same leading RHS axis; using a scalar-layout density zero here makes
+        # the fixed-table transpose reject otherwise valid root bars.
+        supplied_bars = tuple(
+            jnp.asarray(value)
+            for value in flux_bar.values()
+            if value is not None
+            and jnp.asarray(value).ndim > 0
+            and jnp.asarray(value).dtype != jax.dtypes.float0
+        )
+        zero = (
+            jnp.zeros_like(supplied_bars[0])
+            if supplied_bars
+            else jnp.zeros_like(jnp.asarray(density))
+        )
 
         def _bar(name):
             value = flux_bar.get(name, None)
@@ -16860,15 +16875,19 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
     ) -> dict[str, jax.Array]:
         """Exact cached tangent in the private floating-edge coordinate.
 
-        This evaluates the written first and second Taylor-jet fields, not a
-        subtraction of two flux values.  With public displacement ``d_y`` and
-        edge displacement ``d_e``, it forms
+        Differentiate exactly the *cached quadratic primal evaluator* with
+        respect to its private scalar edge argument.  This is forward AD
+        through already-built coefficient algebra only: it neither rebuilds
+        nor differentiates an NTX solve, and it contains no numerical
+        differencing interval.  It is the authoritative derivative because
+        the primal evaluator, including its anchor/displacement convention,
+        is the response that Radau actually advances.
 
-        ``F_e v + F_ye[d_y, v] + F_ee[d_e, v]``.
-
-        Therefore the result is the derivative of the same current quadratic
-        response used by the primal, without a finite-difference interval or
-        catastrophic cancellation between O(1e19) flux values.
+        The former hand reconstruction combined several one-direction jets
+        to recover ``F_e + F_ye[delta_y] + F_ee[delta_e]``.  Although that
+        algebra is attractive, its result demonstrably differed from this
+        cached-primal JVP at a displaced stage.  Do not maintain a separate
+        edge polynomial here: that risks a second response definition.
         """
         response = lagged_response.face_response
         if not isinstance(response, NTXFullStateQuadraticPreparedCoefficientResponse):
@@ -16878,66 +16897,18 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         edge = jnp.asarray(er_edge, dtype=state.Er.dtype)
         anchor = jnp.asarray(er_edge_anchor, dtype=state.Er.dtype)
         direction = jnp.asarray(er_edge_direction, dtype=state.Er.dtype)
-        displacement = edge - anchor
-
-        def _face_jets(state_value, edge_displacement):
-            return self._evaluate_full_state_quadratic_axis_response(
-                state_value,
+        def _cached_face_primal(edge_value):
+            return self._evaluate_full_state_quadratic_face_response(
+                state,
                 response,
-                axis="face",
-                er_edge_override=anchor + edge_displacement,
+                er_edge_override=edge_value,
                 er_edge_anchor=anchor,
-                er_edge_direction=edge_displacement,
-                return_directional=True,
             )
 
-        zero_edge = jnp.zeros_like(displacement)
-        state_only = _face_jets(state, zero_edge)
-        total = _face_jets(state, displacement)
-        edge_only = _face_jets(response.reference_state, displacement)
-
-        # At a nonzero stage displacement the directional first/second jet
-        # fields give the exact partial derivative algebraically.  No flux
-        # values are differenced.
-        def _at_displaced_edge(_):
-            def _tangent(total_jet, state_jet, edge_jet):
-                first_edge = (total_jet.first - state_jet.first) / displacement
-                mixed_edge = (
-                    total_jet.second - state_jet.second + edge_jet.second
-                ) / (2.0 * displacement)
-                return direction * (first_edge + mixed_edge)
-
-            return {
-                name: _tangent(total[name], state_only[name], edge_only[name])
-                for name in total
-            }
-
-        # The Jacobian refresh is normally evaluated at the rebase anchor.
-        # There d_e=0, so use the requested tangent direction itself as the
-        # symbolic second direction.  This is still exact jet algebra: it is
-        # not a numerical step or a flux difference.
-        def _at_anchor(_):
-            def _tangent_from_probe(total_jet, state_jet, edge_jet):
-                first_edge = edge_jet.first
-                mixed_edge = 0.5 * (
-                    total_jet.second - state_jet.second - edge_jet.second
-                )
-                return first_edge + mixed_edge
-
-            total_probe = _face_jets(state, direction)
-            edge_probe = _face_jets(response.reference_state, direction)
-            return {
-                name: _tangent_from_probe(
-                    total_probe[name], state_only[name], edge_probe[name]
-                )
-                for name in total_probe
-            }
-
-        face_tangent = jax.lax.cond(
-            jnp.abs(displacement) > jnp.asarray(0.0, dtype=displacement.dtype),
-            _at_displaced_edge,
-            _at_anchor,
-            operand=None,
+        _, face_tangent = jax.jvp(
+            _cached_face_primal,
+            (edge,),
+            (direction,),
         )
         if self._resolved_center_response_mode() in {
             "center_local_response",

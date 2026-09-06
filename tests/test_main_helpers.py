@@ -421,6 +421,111 @@ def test_ntx_exact_runtime_quadratic_lagged_response_matches_live_reference(resp
             atol=3.0e-4,
         )
 
+    # Exercise the actual Radau case: the cached response remains anchored
+    # at the accepted state while both the public stage state and the private
+    # edge coordinate have moved.  The former anchor-only check could not
+    # detect an erroneous pure-edge-curvature contribution in this branch.
+    displaced_state = TransportState(
+        density=state.density * jnp.asarray([[1.03, 0.98], [1.01, 1.02]]),
+        pressure=state.pressure * jnp.asarray([[0.97, 1.04], [1.02, 0.96]]),
+        Er=state.Er + jnp.asarray([1.0e-5, -1.5e-5]),
+    )
+    displaced_edge = edge_anchor + jnp.asarray(8.0e-5)
+    displaced_tangent = full_state_model.evaluate_with_lagged_response_edge_tangent(
+        displaced_state,
+        displaced_edge,
+        jnp.asarray(1.0),
+        edge_response,
+        er_edge_anchor=edge_anchor,
+    )
+    displaced_plus = full_state_model.evaluate_with_lagged_response(
+        displaced_state,
+        edge_response,
+        er_edge_override=displaced_edge + edge_epsilon,
+        er_edge_anchor=edge_anchor,
+    )
+    displaced_minus = full_state_model.evaluate_with_lagged_response(
+        displaced_state,
+        edge_response,
+        er_edge_override=displaced_edge - edge_epsilon,
+        er_edge_anchor=edge_anchor,
+    )
+    for name in ("Gamma", "Q", "Upar"):
+        assert jnp.allclose(
+            displaced_tangent[f"{name}_faces"],
+            (displaced_plus[f"{name}_faces"] - displaced_minus[f"{name}_faces"])
+            / (2.0 * edge_epsilon),
+            rtol=5.0e-3,
+            atol=5.0e-4,
+        )
+
+    def _cached_displaced_edge_primal(edge_value):
+        return full_state_model.evaluate_with_lagged_response(
+            displaced_state,
+            edge_response,
+            er_edge_override=edge_value,
+            er_edge_anchor=edge_anchor,
+        )
+
+    # This is the exact forward AD derivative of the *cached primal
+    # polynomial*.  It never sees a live NTX solve and has no differencing
+    # interval.  Keep it as a test oracle for the written edge tangent.
+    _, displaced_primal_jvp = jax.jvp(
+        _cached_displaced_edge_primal,
+        (displaced_edge,),
+        (jnp.asarray(1.0),),
+    )
+    for name in ("Gamma", "Q", "Upar"):
+        assert jnp.allclose(
+            displaced_tangent[f"{name}_faces"],
+            displaced_primal_jvp[f"{name}_faces"],
+            rtol=3.0e-6,
+            atol=1.0e-9,
+        )
+
+    # Jacobian refreshes evaluate the edge column at the cache anchor while
+    # the Radau centre state is already displaced.  This is the exact
+    # configuration that must be correct for the refreshed edge diagonal.
+    anchor_stage_tangent = full_state_model.evaluate_with_lagged_response_edge_tangent(
+        displaced_state,
+        edge_anchor,
+        jnp.asarray(1.0),
+        edge_response,
+        er_edge_anchor=edge_anchor,
+    )
+    anchor_stage_plus = full_state_model.evaluate_with_lagged_response(
+        displaced_state,
+        edge_response,
+        er_edge_override=edge_anchor + edge_epsilon,
+        er_edge_anchor=edge_anchor,
+    )
+    anchor_stage_minus = full_state_model.evaluate_with_lagged_response(
+        displaced_state,
+        edge_response,
+        er_edge_override=edge_anchor - edge_epsilon,
+        er_edge_anchor=edge_anchor,
+    )
+    for name in ("Gamma", "Q", "Upar"):
+        assert jnp.allclose(
+            anchor_stage_tangent[f"{name}_faces"],
+            (anchor_stage_plus[f"{name}_faces"] - anchor_stage_minus[f"{name}_faces"])
+            / (2.0 * edge_epsilon),
+            rtol=5.0e-3,
+            atol=5.0e-4,
+        )
+    _, anchor_stage_primal_jvp = jax.jvp(
+        _cached_displaced_edge_primal,
+        (edge_anchor,),
+        (jnp.asarray(1.0),),
+    )
+    for name in ("Gamma", "Q", "Upar"):
+        assert jnp.allclose(
+            anchor_stage_tangent[f"{name}_faces"],
+            anchor_stage_primal_jvp[f"{name}_faces"],
+            rtol=3.0e-6,
+            atol=1.0e-9,
+        )
+
     # The composite VJP is the transpose of the same written edge tangent,
     # not a generic VJP through ``er_edge_override``.
     edge_combined = CombinedTransportFluxModel(
@@ -3086,6 +3191,31 @@ def test_radial_database_flux_table_transpose_matches_generic_vjp():
         assert jnp.allclose(
             actual_table_bar, expected_table_bar, rtol=2.0e-10, atol=2.0e-10
         )
+
+    # Selected initial-Er roots contribute only particle-flux (Gamma) bars.
+    # Missing channels must inherit Gamma's leading objective axis rather
+    # than fall back to an unbatched density-shaped zero.
+    gamma_rows = jnp.stack((gamma_bar, -0.3 * gamma_bar))
+    root_only = model.pullback_local_particle_flux_support_payload(
+        state,
+        {"Gamma": gamma_rows},
+        {"database": database},
+    )["database"]
+    explicit_zero_channels = model.pullback_local_particle_flux_support_payload(
+        state,
+        {
+            "Gamma": gamma_rows,
+            "Q": jnp.zeros_like(gamma_rows),
+            "Upar": jnp.zeros_like(gamma_rows),
+        },
+        {"database": database},
+    )["database"]
+    for actual_leaf, expected_leaf in zip(
+        jax.tree_util.tree_leaves(root_only),
+        jax.tree_util.tree_leaves(explicit_zero_channels),
+        strict=True,
+    ):
+        assert jnp.allclose(actual_leaf, expected_leaf, rtol=2.0e-10, atol=2.0e-10)
 
 
 def test_legacy_monoenergetic_flux_table_transpose_matches_generic_vjp():
