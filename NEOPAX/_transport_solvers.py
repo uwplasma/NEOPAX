@@ -2510,6 +2510,7 @@ def _run_saved_loop_debug_walltime(
     walltime_label="solver.attempt",
     stop_after_first_nonconverged_attempt=False,
     on_first_nonconverged_attempt=None,
+    on_attempt=None,
 ):
     compiled_step_fn = jax.jit(lambda step_state: step_fn(step_state, None))
     save_times = jnp.linspace(t0, t_final, save_n)
@@ -2604,6 +2605,16 @@ def _run_saved_loop_debug_walltime(
         last_attempt_jacobian_reused = jnp.asarray(False if getattr(step_info, "jacobian_reused", None) is None else getattr(step_info, "jacobian_reused"))
 
         step_idx += 1
+        # Host-only escape hatch for an explicitly requested, one-shot
+        # diagnostic at an exact accepted-state cache anchor.  In particular,
+        # this keeps expensive live NTX comparisons out of the compiled
+        # attempt function and out of all ordinary runs.
+        if on_attempt is not None and on_attempt(
+            step_state_before_attempt, step_state, step_info, attempt_idx
+        ):
+            diagnostic_stopped = True
+            print("[radau-host-probe] diagnostic stop after requested attempt probe", flush=True)
+            break
         if stop_after_first_nonconverged_attempt and not bool(jax.device_get(step_info.converged)):
             diagnostic_stopped = True
             if on_first_nonconverged_attempt is not None:
@@ -3704,6 +3715,7 @@ class _RadauSolverConfig(TransportSolver):
     debug_newton_bracket: bool = False
     debug_newton_dt_stall: bool = False
     debug_stage_state_trace: bool = False
+    debug_node_edge_live_probe_jacobian_threshold: float | None = None
 
     def __init__(
         self,
@@ -3756,6 +3768,7 @@ class _RadauSolverConfig(TransportSolver):
         debug_newton_bracket: bool = False,
         debug_newton_dt_stall: bool = False,
         debug_stage_state_trace: bool = False,
+        debug_node_edge_live_probe_jacobian_threshold: float | None = None,
         save_n=None,
     ):
         n_steps = max(1, int(jnp.ceil((float(t1) - float(t0)) / float(dt))))
@@ -4076,6 +4089,14 @@ class _RadauSolverConfig(TransportSolver):
         object.__setattr__(self, "debug_newton_bracket", bool(debug_newton_bracket))
         object.__setattr__(self, "debug_newton_dt_stall", bool(debug_newton_dt_stall))
         object.__setattr__(self, "debug_stage_state_trace", bool(debug_stage_state_trace))
+        probe_threshold = (
+            None
+            if debug_node_edge_live_probe_jacobian_threshold is None
+            else float(debug_node_edge_live_probe_jacobian_threshold)
+        )
+        if probe_threshold is not None and probe_threshold <= 0.0:
+            raise ValueError("radau_debug_node_edge_live_probe_jacobian_threshold must be positive")
+        object.__setattr__(self, "debug_node_edge_live_probe_jacobian_threshold", probe_threshold)
         object.__setattr__(self, "save_n", save_n)
 
 @jax.tree_util.register_dataclass
@@ -11086,20 +11107,38 @@ def _radau_database_geometry_support_pullback_from_stage_record(
             "Deferred database geometry sweep requires exactly {'geometry', 'database'} support."
         )
 
-    def _one_objective(residual_bar):
-        return jax.vmap(
-            lambda t_eval, y_eval, rhs_bar: pullback(
-                t_eval, y_eval, -rhs_bar, support
+    def _one_slot(stage_times, stage_states, residual_bars):
+        def _one_objective(residual_bar):
+            return jax.vmap(
+                lambda t_eval, y_eval, rhs_bar: pullback(
+                    t_eval, y_eval, -rhs_bar, support
+                )
+            )(
+                stage_times,
+                stage_states,
+                residual_bar,
             )
-        )(
-            record.stage_times,
-            record.stage_states,
-            residual_bar,
+
+        by_objective_and_stage = jax.vmap(_one_objective)(residual_bars)
+        return jax.tree_util.tree_map(
+            lambda values: jnp.sum(values, axis=1), by_objective_and_stage
         )
 
-    by_objective_and_stage = jax.vmap(_one_objective)(record.residual_bars)
-    return jax.tree_util.tree_map(
-        lambda values: jnp.sum(values, axis=1), by_objective_and_stage
+    # A single-step caller supplies ``(objective, stage, state)`` bars;
+    # the database segment kernel supplies one such record per slot,
+    # ``(slot, objective, stage, state)``.  In the latter case first reduce
+    # Radau stages within each slot, then add the independent slot bars.
+    if jnp.asarray(record.residual_bars).ndim == 4:
+        by_slot = jax.vmap(_one_slot)(
+            record.stage_times,
+            record.stage_states,
+            record.residual_bars,
+        )
+        return jax.tree_util.tree_map(lambda values: jnp.sum(values, axis=0), by_slot)
+    return _one_slot(
+        record.stage_times,
+        record.stage_states,
+        record.residual_bars,
     )
 
 
@@ -22993,6 +23032,78 @@ class RADAUSolver(_RadauSolverConfig):
                     f"state={state_lines}",
                     flush=True,
                 )
+        node_edge_live_probe = None
+        node_edge_live_probe_threshold = getattr(
+            self, "debug_node_edge_live_probe_jacobian_threshold", None
+        )
+        if node_edge_live_probe_threshold is not None:
+            if not use_node_boundary:
+                raise ValueError(
+                    "radau_debug_node_edge_live_probe_jacobian_threshold requires "
+                    "boundary.Er.right.type='floating_ambipolar_edge_node'."
+                )
+            if not bool(getattr(self, "debug_walltime_attempts", False)):
+                raise ValueError(
+                    "radau_debug_node_edge_live_probe_jacobian_threshold requires "
+                    "debug_walltime_attempts=true so the probe can run host-side."
+                )
+
+            def _node_edge_live_probe(
+                step_state_before_attempt, step_state_after_attempt, step_info, _attempt_idx
+            ):
+                """Stop on the first pathological *fresh* node-edge cache."""
+                lagged_reused = bool(jax.device_get(step_info.lagged_reused))
+                edge_jacobian = float(
+                    jax.device_get(step_state_after_attempt.jacobian[-1, -1])
+                )
+                if lagged_reused or abs(edge_jacobian) < node_edge_live_probe_threshold:
+                    return False
+                cache = step_state_after_attempt.lagged_response_cache
+                if not isinstance(cache, _RadauNodeBoundaryLaggedCache):
+                    raise RuntimeError(
+                        "node-edge threshold probe found a non-node lagged cache."
+                    )
+                base_flat = step_state_before_attempt.y
+                base_state = unpack_flat(base_flat)
+                edge_value = base_flat[-1]
+                probe = owner.debug_node_boundary_live_vs_lagged(
+                    base_state,
+                    edge_value,
+                    cache.transport_response,
+                    er_edge_anchor=cache.er_edge_anchor,
+                )
+                scalar_keys = (
+                    "edge",
+                    "edge_step",
+                    "cached_rhs",
+                    "cached_drhs_dedge_fd",
+                    "live_rhs",
+                    "live_drhs_dedge_fd",
+                    "state_last_center_Er",
+                )
+                scalar_text = " ".join(
+                    f"{key}={float(jax.device_get(probe[key])):.6e}"
+                    for key in scalar_keys
+                )
+                print(
+                    "[radau-node-edge-live-probe] "
+                    f"t={float(jax.device_get(step_state_before_attempt.t)):.6e} "
+                    f"dt={float(jax.device_get(step_state_before_attempt.dt)):.6e} "
+                    f"jac_edge_edge={edge_jacobian:.6e} {scalar_text} "
+                    "cached_Gamma_edge_by_species="
+                    f"{jax.device_get(probe['cached_gamma_by_species']).tolist()} "
+                    "live_Gamma_edge_by_species="
+                    f"{jax.device_get(probe['live_gamma_by_species']).tolist()} "
+                    "face_density_by_species="
+                    f"{jax.device_get(probe['face_density_by_species']).tolist()} "
+                    "face_temperature_by_species="
+                    f"{jax.device_get(probe['face_temperature_by_species']).tolist()}",
+                    flush=True,
+                )
+                return True
+
+            node_edge_live_probe = _node_edge_live_probe
+
         if bool(getattr(self, "debug_walltime_attempts", False)):
             loop_result, diagnostic_stopped = _run_saved_loop_debug_walltime(
                 step_state0=step_state0,
@@ -23011,6 +23122,7 @@ class RADAUSolver(_RadauSolverConfig):
                     if stop_after_first_failed_stage_probe
                     else None
                 ),
+                on_attempt=node_edge_live_probe,
             )
         else:
             loop_result = _run_saved_loop(
@@ -27889,6 +28001,9 @@ def build_time_solver(solver_parameters: Any, solver_override: Any = None) -> Tr
             debug_newton_bracket=bool(_cfg_get("radau_debug_newton_bracket", False)),
             debug_newton_dt_stall=bool(_cfg_get("radau_debug_newton_dt_stall", False)),
             debug_stage_state_trace=bool(_cfg_get("radau_debug_stage_state_trace", False)),
+            debug_node_edge_live_probe_jacobian_threshold=_cfg_get(
+                "radau_debug_node_edge_live_probe_jacobian_threshold"
+            ),
             save_n=save_n,
         )
     integrator_ctor = _get_diffrax_integrator(backend)

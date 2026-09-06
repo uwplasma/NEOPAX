@@ -3466,6 +3466,107 @@ class ComposedEquationSystem:
         edge_rhs = er_eq.edge_rhs(working_state, fluxes=shared_fluxes, er_edge_override=er_edge)
         return core_rhs, edge_rhs
 
+    def debug_node_boundary_live_vs_lagged(
+        self,
+        state,
+        er_edge,
+        transport_response,
+        *,
+        er_edge_anchor,
+        relative_edge_step=1.0e-5,
+    ):
+        """One-shot host diagnostic of the private outer-face response.
+
+        This is intentionally not part of the traced transport RHS.  It is
+        invoked only by the Radau host-loop threshold probe, where comparing a
+        cached Taylor response to direct NTX at the *same accepted base state*
+        is worth the extra direct evaluations.
+        """
+        if self.shared_flux_model is None:
+            raise ValueError("node edge probe requires a shared flux model.")
+        working_state, _ = self._prepare_working_state(state)
+        _density_eq, _temperature_eq, er_eq = self._resolve_equations()
+        if er_eq is None:
+            raise ValueError("node edge probe requires an Er equation.")
+        geometry = getattr(self.shared_flux_model, "geometry", None)
+        if geometry is None:
+            raise ValueError("node edge probe requires shared flux-model geometry.")
+        bc_kwargs = self._shared_flux_bc_kwargs()
+        edge = jnp.asarray(er_edge, dtype=working_state.Er.dtype)
+        edge_step = jnp.asarray(relative_edge_step, dtype=edge.dtype) * jnp.maximum(
+            jnp.abs(edge), jnp.asarray(1.0, dtype=edge.dtype)
+        )
+        face_state_at_edge = build_face_transport_state(
+            working_state,
+            geometry,
+            bc_density=bc_kwargs["bc_density"],
+            bc_temperature=bc_kwargs["bc_temperature"],
+            er_edge_override=edge,
+            density_floor=self.density_floor,
+            temperature_floor=self.temperature_floor,
+        )
+
+        def edge_rhs_from_faces(face_fluxes):
+            gamma_faces = jnp.asarray(face_fluxes["Gamma_faces"])
+            plasma_permitivity = _plasma_permitivity_from_prefactor(
+                working_state, er_eq.species_mass, er_eq.permitivity_prefactor
+            )
+            ambi = er_eq._outer_face_ambi_term(
+                working_state, None, plasma_permitivity, gamma_faces
+            )
+            return -er_eq.Er_relax * ambi, gamma_faces[:, -1]
+
+        def cached_at(edge_value):
+            fluxes = self.shared_flux_model.evaluate_with_lagged_response(
+                working_state,
+                transport_response,
+                **self._shared_flux_call_kwargs({
+                    "er_edge_override": edge_value,
+                    "er_edge_anchor": er_edge_anchor,
+                }),
+            )
+            return edge_rhs_from_faces(fluxes)
+
+        def live_at(edge_value):
+            face_state = build_face_transport_state(
+                working_state,
+                geometry,
+                bc_density=bc_kwargs["bc_density"],
+                bc_temperature=bc_kwargs["bc_temperature"],
+                er_edge_override=edge_value,
+                density_floor=self.density_floor,
+                temperature_floor=self.temperature_floor,
+            )
+            raw_face_fluxes = self.shared_flux_model.evaluate_face_fluxes(
+                working_state, face_state, **bc_kwargs
+            )
+            if raw_face_fluxes is None:
+                raise ValueError("node edge probe requires complete native face fluxes.")
+            gamma_faces = raw_face_fluxes.get("Gamma_faces", raw_face_fluxes.get("Gamma"))
+            if gamma_faces is None:
+                raise ValueError("node edge probe requires native face particle fluxes.")
+            return edge_rhs_from_faces({"Gamma_faces": gamma_faces})
+
+        cached_0, cached_gamma = cached_at(edge)
+        cached_plus, _ = cached_at(edge + edge_step)
+        cached_minus, _ = cached_at(edge - edge_step)
+        live_0, live_gamma = live_at(edge)
+        live_plus, _ = live_at(edge + edge_step)
+        live_minus, _ = live_at(edge - edge_step)
+        return {
+            "edge": edge,
+            "edge_step": edge_step,
+            "cached_rhs": cached_0,
+            "cached_drhs_dedge_fd": (cached_plus - cached_minus) / (2.0 * edge_step),
+            "cached_gamma_by_species": cached_gamma,
+            "live_rhs": live_0,
+            "live_drhs_dedge_fd": (live_plus - live_minus) / (2.0 * edge_step),
+            "live_gamma_by_species": live_gamma,
+            "face_density_by_species": face_state_at_edge.density[:, -1],
+            "face_temperature_by_species": face_state_at_edge.temperature[:, -1],
+            "state_last_center_Er": working_state.Er[-1],
+        }
+
     def pullback_shared_fluxes(self, state, shared_fluxes, rhs_bar):
         """Reverse-only pullback for the shared-flux -> RHS assembly.
 
