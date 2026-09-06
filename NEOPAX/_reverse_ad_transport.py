@@ -7856,16 +7856,25 @@ def internal_realtime_geometry_transport_reverse_table_result_builder(
         # objective/segment VJPs.  Fold it once here, before the ordinary
         # VMEC payload transpose.  Legacy payloads have no database leaf and
         # are returned unchanged by the helper.
-        component_names = tuple(component_bars)
+        # Component pullbacks are diagnostic output.  When they are not
+        # requested they are discarded by the assembly below, so including
+        # their database bars in the recorded scan transpose merely widens
+        # its multi-RHS batch.  That width scales with accepted-step detail
+        # and can make the otherwise single scan transpose exceed GPU memory.
+        # Keep the normal benchmark to its selected objective rows only.
+        component_names = (
+            tuple(component_bars) if active_component_pullbacks else tuple()
+        )
         folded_groups = fold_recorded_ntx_scan_database_bar_groups_into_support(
             recorded_scan_owner if recorded_scan_owner is not None else recorded_scan_runtime,
             (support_bars, *(component_bars[name] for name in component_names)),
         )
         support_bars = folded_groups[0]
-        component_bars = {
-            name: folded_groups[index + 1]
-            for index, name in enumerate(component_names)
-        }
+        if active_component_pullbacks:
+            component_bars = {
+                name: folded_groups[index + 1]
+                for index, name in enumerate(component_names)
+            }
         all_objective_values = jnp.asarray(support_result.objective_values)
         all_profile_gradient_matrix = jnp.asarray(support_result.profile_gradient_matrix)
         if int(all_profile_gradient_matrix.shape[1]) == len(PROFILE_PARAMETER_ORDER):
