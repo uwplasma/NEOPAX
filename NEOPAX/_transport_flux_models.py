@@ -1274,9 +1274,15 @@ def _build_evaluated_transport_state_directional(
     if er_edge_override is not None:
         if er_edge_direction is None:
             er_edge_direction = jnp.zeros_like(er_edge_override)
+        # A directional jet stores its *anchor* in ``value`` and its
+        # displacement from that anchor in ``first``.  The floating node is
+        # supplied as ``override = anchor + direction`` by the cached Radau
+        # response.  Storing ``override`` in both fields would evaluate as
+        # ``anchor + 2 * direction`` and corrupt every edge derivative.
+        er_edge_anchor = er_edge_override - er_edge_direction
         er_face = dataclasses.replace(
             er_face,
-            value=er_face.value.at[-1].set(er_edge_override),
+            value=er_face.value.at[-1].set(er_edge_anchor),
             first=er_face.first.at[-1].set(er_edge_direction),
             second=er_face.second.at[-1].set(jnp.zeros_like(er_edge_override)),
         )
@@ -2598,6 +2604,53 @@ class CombinedTransportFluxModel(TransportFluxModelBase):
         direction, not a finite-difference interval: for a quadratic response
         ``(F(e + v) - F(e - v)) / 2 == F'(e) v`` exactly.
         """
+        # Realtime full-state NTX owns written first/mixed-second jet fields
+        # for the floating coordinate.  Prefer that algebraic derivative over
+        # value polarization: the latter can lose a small ambipolar slope by
+        # subtracting very large cancelling particle fluxes.
+        neo_edge_tangent = getattr(
+            getattr(self, "neoclassical_model", None),
+            "evaluate_with_lagged_response_edge_tangent",
+            None,
+        )
+        if callable(neo_edge_tangent):
+            neo_tangent = neo_edge_tangent(
+                state,
+                er_edge,
+                er_edge_direction,
+                lagged_response.neoclassical_response,
+                er_edge_anchor=er_edge_anchor,
+                **kwargs,
+            )
+            primal = self.evaluate_with_lagged_response(
+                state,
+                lagged_response,
+                er_edge_override=er_edge,
+                er_edge_anchor=er_edge_anchor,
+                **kwargs,
+            )
+            out = jax.tree_util.tree_map(jnp.zeros_like, primal)
+
+            def _set_if_present(key, value):
+                return out if key not in out else {**out, key: value}
+
+            for name in ("Gamma", "Q", "Upar"):
+                face_key = f"{name}_faces"
+                if face_key in neo_tangent:
+                    value = neo_tangent[face_key]
+                    out = _set_if_present(face_key, value)
+                    out = _set_if_present(f"{name}_neo_faces", value)
+                    if self.center_flux_mode != "direct":
+                        out = _set_if_present(
+                            name,
+                            jax.vmap(cell_centered_from_faces)(value),
+                        )
+                if name in neo_tangent:
+                    value = neo_tangent[name]
+                    out = _set_if_present(name, value)
+                    out = _set_if_present(f"{name}_neo", value)
+            return out
+
         def _evaluate(edge_value):
             return self.evaluate_with_lagged_response(
                 state,
@@ -16686,7 +16739,15 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         )
 
     def _evaluate_full_state_quadratic_axis_response(
-        self, state, response, *, axis, er_edge_override=None, er_edge_anchor=None
+        self,
+        state,
+        response,
+        *,
+        axis,
+        er_edge_override=None,
+        er_edge_anchor=None,
+        er_edge_direction=None,
+        return_directional=False,
     ):
         """Evaluate the cached full-state quadratic model on centres or faces."""
         if axis not in {"center", "face"}:
@@ -16699,9 +16760,9 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         delta = dataclasses.replace(state, **delta_kwargs)
         # This scalar belongs only to the Radau boundary adapter, never to
         # TransportState or the universal lagged-response payload.
-        edge_direction = (
-            None if er_edge_override is None else er_edge_override - er_edge_anchor
-        )
+        edge_direction = er_edge_direction
+        if edge_direction is None and er_edge_override is not None:
+            edge_direction = er_edge_override - er_edge_anchor
         evaluated = _build_evaluated_transport_state_directional(
             response.reference_state,
             delta,
@@ -16763,11 +16824,17 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             for value in (gamma, q, upar)
         )
         suffix = "" if axis == "center" else "_faces"
-        return {
-            f"Gamma{suffix}": _jet_evaluate(gamma),
-            f"Q{suffix}": _jet_evaluate(q),
-            f"Upar{suffix}": _jet_evaluate(upar),
+        directional = {
+            f"Gamma{suffix}": gamma,
+            f"Q{suffix}": q,
+            f"Upar{suffix}": upar,
         }
+        if return_directional:
+            return directional
+        # DirectionalSecondOrderJet is itself a registered pytree.  Evaluate
+        # each flux jet as one object; a generic tree_map would descend into
+        # its fields and reconstruct a jet of arrays instead of a flux array.
+        return {name: _jet_evaluate(value) for name, value in directional.items()}
 
     def _evaluate_full_state_quadratic_face_response(
         self, state, response, *, er_edge_override=None, er_edge_anchor=None
@@ -16780,6 +16847,138 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
     def _evaluate_full_state_quadratic_center_response(self, state, response):
         return self._evaluate_full_state_quadratic_axis_response(
             state, response, axis="center"
+        )
+
+    def evaluate_full_state_quadratic_edge_tangent_with_lagged_response(
+        self,
+        state: TransportState,
+        er_edge,
+        er_edge_direction,
+        lagged_response: NTXExactLijLaggedResponse,
+        *,
+        er_edge_anchor,
+    ) -> dict[str, jax.Array]:
+        """Exact cached tangent in the private floating-edge coordinate.
+
+        This evaluates the written first and second Taylor-jet fields, not a
+        subtraction of two flux values.  With public displacement ``d_y`` and
+        edge displacement ``d_e``, it forms
+
+        ``F_e v + F_ye[d_y, v] + F_ee[d_e, v]``.
+
+        Therefore the result is the derivative of the same current quadratic
+        response used by the primal, without a finite-difference interval or
+        catastrophic cancellation between O(1e19) flux values.
+        """
+        response = lagged_response.face_response
+        if not isinstance(response, NTXFullStateQuadraticPreparedCoefficientResponse):
+            raise NotImplementedError(
+                "Private-edge tangents require a full_state_quadratic face response."
+            )
+        edge = jnp.asarray(er_edge, dtype=state.Er.dtype)
+        anchor = jnp.asarray(er_edge_anchor, dtype=state.Er.dtype)
+        direction = jnp.asarray(er_edge_direction, dtype=state.Er.dtype)
+        displacement = edge - anchor
+
+        def _face_jets(state_value, edge_displacement):
+            return self._evaluate_full_state_quadratic_axis_response(
+                state_value,
+                response,
+                axis="face",
+                er_edge_override=anchor + edge_displacement,
+                er_edge_anchor=anchor,
+                er_edge_direction=edge_displacement,
+                return_directional=True,
+            )
+
+        zero_edge = jnp.zeros_like(displacement)
+        state_only = _face_jets(state, zero_edge)
+        total = _face_jets(state, displacement)
+        edge_only = _face_jets(response.reference_state, displacement)
+
+        # At a nonzero stage displacement the directional first/second jet
+        # fields give the exact partial derivative algebraically.  No flux
+        # values are differenced.
+        def _at_displaced_edge(_):
+            def _tangent(total_jet, state_jet, edge_jet):
+                first_edge = (total_jet.first - state_jet.first) / displacement
+                mixed_edge = (
+                    total_jet.second - state_jet.second + edge_jet.second
+                ) / (2.0 * displacement)
+                return direction * (first_edge + mixed_edge)
+
+            return {
+                name: _tangent(total[name], state_only[name], edge_only[name])
+                for name in total
+            }
+
+        # The Jacobian refresh is normally evaluated at the rebase anchor.
+        # There d_e=0, so use the requested tangent direction itself as the
+        # symbolic second direction.  This is still exact jet algebra: it is
+        # not a numerical step or a flux difference.
+        def _at_anchor(_):
+            def _tangent_from_probe(total_jet, state_jet, edge_jet):
+                first_edge = edge_jet.first
+                mixed_edge = 0.5 * (
+                    total_jet.second - state_jet.second - edge_jet.second
+                )
+                return first_edge + mixed_edge
+
+            total_probe = _face_jets(state, direction)
+            edge_probe = _face_jets(response.reference_state, direction)
+            return {
+                name: _tangent_from_probe(
+                    total_probe[name], state_only[name], edge_probe[name]
+                )
+                for name in total_probe
+            }
+
+        face_tangent = jax.lax.cond(
+            jnp.abs(displacement) > jnp.asarray(0.0, dtype=displacement.dtype),
+            _at_displaced_edge,
+            _at_anchor,
+            operand=None,
+        )
+        if self._resolved_center_response_mode() in {
+            "center_local_response",
+            "interpolate_face_coefficients",
+            "interpolate_face_coefficients_cubic",
+            "interpolate_face_coefficients_physical_coordinates",
+            "interpolate_face_coefficients_native_distance",
+            "interpolate_face_coefficients_taylor_reliability",
+        }:
+            centre_primal = self._evaluate_full_state_quadratic_center_response(
+                state, lagged_response.center_response
+            )
+            zero_centre = jax.tree_util.tree_map(jnp.zeros_like, centre_primal)
+            return {**zero_centre, **face_tangent}
+        return face_tangent
+
+    def evaluate_with_lagged_response_edge_tangent(
+        self,
+        state,
+        er_edge,
+        er_edge_direction,
+        lagged_response,
+        *,
+        er_edge_anchor,
+        **kwargs,
+    ):
+        """Model-owned exact edge tangent for the cached NTX quadratic path."""
+        del kwargs
+        if isinstance(
+            lagged_response.face_response,
+            NTXFullStateQuadraticPreparedCoefficientResponse,
+        ):
+            return self.evaluate_full_state_quadratic_edge_tangent_with_lagged_response(
+                state,
+                er_edge,
+                er_edge_direction,
+                lagged_response,
+                er_edge_anchor=er_edge_anchor,
+            )
+        raise NotImplementedError(
+            "Private-edge tangents require the full_state_quadratic NTX response."
         )
 
     def evaluate_full_state_quadratic_face_tangent_with_lagged_response(

@@ -2010,7 +2010,17 @@ class ComposedEquationSystem:
             )
         )(rhs_bar)
         geometry = support["geometry"]
-        flux_geometry_bar = flux_geometry_pullback(working_state, flux_bar, geometry)
+        # ``pullback_direct_rhs_geometry_by_radius`` is the scalar-flux
+        # contract used by the established Lij path.  Keep the objective
+        # dimension outside that VJP: feeding the full batched tree into it
+        # makes JAX reject a ``[objective, ...]`` cotangent for a scalar
+        # ``[...]`` primal flux output.  The database deferred sweep owns
+        # this batching boundary explicitly.
+        flux_geometry_bar = jax.vmap(
+            lambda one_flux_bar: flux_geometry_pullback(
+                working_state, one_flux_bar, geometry
+            )
+        )(flux_bar)
         geometry_delta0 = _float_delta_tree_like(geometry)
 
         def _equation_geometry_with_fixed_fluxes(geometry_delta):

@@ -1603,6 +1603,9 @@ def test_batched_database_geometry_payload_keeps_objective_axis_inside_hook():
             return jnp.asarray(3.0)
 
         def pullback_direct_rhs_geometry_by_radius(self, _state, flux_bar, _geometry):
+            # This is deliberately the scalar-flux contract.  The database
+            # adapter, not this leaf VJP, owns the objective axis.
+            assert jnp.asarray(flux_bar).ndim == 0
             return flux_bar
 
     class _FixedFluxEquation:

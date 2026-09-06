@@ -67,6 +67,7 @@ from NEOPAX._source_models import get_source_model
 from NEOPAX._species import Species
 from NEOPAX._state import TransportState
 from NEOPAX._transport_flux_models import (
+    CombinedTransportFluxModel,
     NTXDatabaseTransportModel,
     NTXExactLijRuntimeTransportModel,
     NTXExactLijRuntimeSupport,
@@ -75,6 +76,7 @@ from NEOPAX._transport_flux_models import (
     NTXRuntimeScanChannels,
     _as_float_array,
     NTXRuntimeScanTransportModel,
+    ZeroTransportModel,
     _sanitize_float_delta_bar_tree,
     _ntx_runtime_scan_to_neopax_monoenergetic,
     build_evaluated_transport_state,
@@ -381,6 +383,77 @@ def test_ntx_exact_runtime_quadratic_lagged_response_matches_live_reference(resp
         assert jnp.allclose(
             full_state[f"{name}_faces"], direct[name], rtol=3.0e-6, atol=1.0e-12
         )
+
+    # The private floating-edge direction is a Taylor coordinate of the same
+    # cached face response.  Its written jet tangent must agree with the
+    # local derivative of that response without obtaining the tangent by
+    # subtracting large flux values in production.
+    edge_anchor = jnp.asarray(3.0e-4)
+    edge_response = full_state_model.build_lagged_response(
+        state, er_edge_override=edge_anchor
+    )
+    edge_tangent = full_state_model.evaluate_with_lagged_response_edge_tangent(
+        state,
+        edge_anchor,
+        jnp.asarray(1.0),
+        edge_response,
+        er_edge_anchor=edge_anchor,
+    )
+    edge_epsilon = jnp.asarray(1.0e-7)
+    edge_plus = full_state_model.evaluate_with_lagged_response(
+        state,
+        edge_response,
+        er_edge_override=edge_anchor + edge_epsilon,
+        er_edge_anchor=edge_anchor,
+    )
+    edge_minus = full_state_model.evaluate_with_lagged_response(
+        state,
+        edge_response,
+        er_edge_override=edge_anchor - edge_epsilon,
+        er_edge_anchor=edge_anchor,
+    )
+    for name in ("Gamma", "Q", "Upar"):
+        assert jnp.allclose(
+            edge_tangent[f"{name}_faces"],
+            (edge_plus[f"{name}_faces"] - edge_minus[f"{name}_faces"])
+            / (2.0 * edge_epsilon),
+            rtol=3.0e-3,
+            atol=3.0e-4,
+        )
+
+    # The composite VJP is the transpose of the same written edge tangent,
+    # not a generic VJP through ``er_edge_override``.
+    edge_combined = CombinedTransportFluxModel(
+        neoclassical_model=full_state_model,
+        turbulent_model=ZeroTransportModel(),
+        classical_model=ZeroTransportModel(),
+        geometry=geometry,
+        center_flux_mode="interpolate_from_faces",
+    )
+    edge_combined_response = edge_combined.build_lagged_response(
+        state, er_edge_override=edge_anchor
+    )
+    edge_combined_tangent = edge_combined.evaluate_with_lagged_response_edge_tangent(
+        state,
+        edge_anchor,
+        jnp.asarray(1.0),
+        edge_combined_response,
+        er_edge_anchor=edge_anchor,
+    )
+    edge_flux_bar = jax.tree_util.tree_map(jnp.ones_like, edge_combined_tangent)
+    edge_bar = edge_combined.pullback_evaluate_with_lagged_response_edge(
+        state,
+        edge_anchor,
+        edge_combined_response,
+        edge_flux_bar,
+        er_edge_anchor=edge_anchor,
+    )
+    expected_edge_bar = sum(
+        jnp.sum(value)
+        for value in jax.tree_util.tree_leaves(edge_combined_tangent)
+        if jnp.issubdtype(jnp.asarray(value).dtype, jnp.inexact)
+    )
+    assert jnp.allclose(edge_bar, expected_edge_bar, rtol=1.0e-12, atol=1.0e-12)
 
     direct_full_state_model = dataclasses.replace(
         model,

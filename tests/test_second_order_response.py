@@ -164,6 +164,31 @@ def test_evaluated_state_jet_matches_second_directional_difference():
     assert jnp.allclose(response.face.temperature.second, central_second, rtol=2.0e-4, atol=2.0e-4)
 
 
+def test_floating_edge_jet_keeps_anchor_and_displacement_separate():
+    """An explicit edge node must not add its displacement twice."""
+    geometry = SimpleNamespace(r_grid_half=jnp.asarray([0.0, 0.5, 1.0]))
+    state = TransportState(
+        density=jnp.asarray([[2.0, 2.0]]),
+        pressure=jnp.asarray([[4.0, 4.0]]),
+        Er=jnp.asarray([1.0, 2.0]),
+    )
+    zero = TransportState(
+        density=jnp.zeros_like(state.density),
+        pressure=jnp.zeros_like(state.pressure),
+        Er=jnp.zeros_like(state.Er),
+    )
+    response = _build_evaluated_transport_state_directional(
+        state,
+        zero,
+        geometry,
+        er_edge_override=jnp.asarray(7.0),
+        er_edge_direction=jnp.asarray(3.0),
+    )
+    assert jnp.allclose(response.face.Er.value[-1], 4.0)
+    assert jnp.allclose(response.face.Er.first[-1], 3.0)
+    assert jnp.allclose(evaluate(response.face.Er)[-1], 7.0)
+
+
 def test_default_local_collision_jet_matches_second_directional_difference():
     species = Species(
         number_species=2,
