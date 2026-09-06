@@ -10211,6 +10211,26 @@ def _radau_debug_stage_state_trace(
         residual=final_residual_norm,
         ordered=True,
     )
+    # The node is intentionally absent from ``TransportState``.  Print its
+    # actual internal Radau coordinate explicitly when present, rather than
+    # silently folding it into the Er block or asking the public-state flux
+    # diagnostic to invent an outer-face value.
+    if (
+        hasattr(lagged_response, "transport_response")
+        and hasattr(lagged_response, "er_edge_anchor")
+    ):
+        jax.debug.print(
+            "[radau-stage-node-edge] accepted={accepted} edge_base={edge_base:.6e} "
+            "edge_stage={edge_stage:.6e} delta={edge_delta:.6e} "
+            "stage_rhs={edge_rhs:.6e} anchor={edge_anchor:.6e}",
+            accepted=accepted,
+            edge_base=flat_y[-1],
+            edge_stage=selected_flat[-1],
+            edge_delta=selected_flat[-1] - flat_y[-1],
+            edge_rhs=stages[stage_index, -1],
+            edge_anchor=lagged_response.er_edge_anchor,
+            ordered=True,
+        )
     # The callback is supplied only by the transport equation system.  It
     # evaluates the already cached lagged flux response, so it adds no NTX
     # rebuild and is active only under this explicit trace flag.

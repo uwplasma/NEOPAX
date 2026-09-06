@@ -3416,18 +3416,6 @@ def prepare_reverse_static_setup(
         or (requested_full_final_time and max_reverse_accepted_steps is not None)
     )
     schedule_artifact = None
-    # A captured carry is a database-only experimental checkpoint.  The
-    # established Lij lane must retain the trace-only artifact contract: its
-    # realized-schedule VJP forward replays the fixed accepted schedule.
-    # Keeping this condition here (at static-setup ownership) prevents a
-    # database checkpoint from silently changing Lij benchmark timing or
-    # reverse semantics.
-    database_checkpoint_artifact = (
-        str(config.get("neoclassical", {}).get("flux_model", ""))
-        .strip()
-        .lower()
-        == "ntx_scan_runtime"
-    )
     schedule_artifact_mode = str(reverse_schedule_artifact_mode).strip().lower()
     if schedule_artifact_mode not in {"legacy", "reuse_static_probe"}:
         raise ValueError(
@@ -3545,15 +3533,12 @@ def prepare_reverse_static_setup(
         reverse_segment_length=reverse_segment_length_eff,
         require_final_time=bool(requested_full_final_time and reverse_segment_length_eff is not None),
         schedule_artifact=schedule_artifact,
-        schedule_segment_start_carries=(
-            schedule_probe.segment_start_carries
-            if database_checkpoint_artifact and schedule_artifact is not None else None
-        ),
-        schedule_final_carry=(
-            schedule_probe.final_carry
-            if database_checkpoint_artifact and schedule_artifact is not None
-            else None
-        ),
+        # Both exact-NTX and fixed-table database lanes retain only the scalar
+        # accepted-schedule trace.  Storing these full carries turns the
+        # static schedule artifact into a transport-size checkpoint tape and
+        # retains it through terminal VJPs and every reverse segment.
+        schedule_segment_start_carries=None,
+        schedule_final_carry=None,
     )
 
 
