@@ -7865,25 +7865,29 @@ def internal_realtime_geometry_transport_reverse_table_result_builder(
         component_names = (
             tuple(component_bars) if active_component_pullbacks else tuple()
         )
-        database_scan_fold_start = time.perf_counter()
-        database_scan_fold_rows = len(support_bars) + sum(
-            len(component_bars[name]) for name in component_names
-        )
-        folded_groups = fold_recorded_ntx_scan_database_bar_groups_into_support(
-            recorded_scan_owner if recorded_scan_owner is not None else recorded_scan_runtime,
-            (support_bars, *(component_bars[name] for name in component_names)),
-        )
-        # This is deliberately outside the Lij branches.  Synchronize here so
-        # the benchmark can distinguish final recorded-scan compilation and
-        # execution from the preceding segmented solver reverse.
-        folded_groups = jax.block_until_ready(folded_groups)
-        if recorded_scan_owner is not None or recorded_scan_runtime is not None:
+        fold_input_groups = (support_bars, *(component_bars[name] for name in component_names))
+        if recorded_scan_owner is not None:
+            database_scan_fold_start = time.perf_counter()
+            database_scan_fold_rows = len(support_bars) + sum(
+                len(component_bars[name]) for name in component_names
+            )
+            folded_groups = fold_recorded_ntx_scan_database_bar_groups_into_support(
+                recorded_scan_owner, fold_input_groups
+            )
+            # Synchronize only the database-specific final boundary.  The
+            # established Lij branch retains its exact prior asynchronous
+            # behavior and output timing.
+            folded_groups = jax.block_until_ready(folded_groups)
             print(
                 f"[autodiff-gate] progress: database final recorded-scan fold ready "
                 f"elapsed_s={time.perf_counter() - database_scan_fold_start:.3f} "
                 f"objective_rows={database_scan_fold_rows} groups={len(folded_groups)} "
                 "contract=one_batched_scan_transpose",
                 flush=True,
+            )
+        else:
+            folded_groups = fold_recorded_ntx_scan_database_bar_groups_into_support(
+                recorded_scan_runtime, fold_input_groups
             )
         support_bars = folded_groups[0]
         if active_component_pullbacks:
@@ -7915,6 +7919,15 @@ def internal_realtime_geometry_transport_reverse_table_result_builder(
             active_baseline_geometry_deltas = jnp.zeros((len(vmec_specs),), dtype=jnp.float64)
         else:
             active_baseline_geometry_deltas = jnp.asarray(baseline_geometry_deltas, dtype=jnp.float64)
+        # The table builder historically defaulted this final geometry bridge
+        # to ``ntx_exact``.  Preserve that value for the Lij runtime, but
+        # explicitly forward the TOML-selected database scan kind so its
+        # folded ``{geometry, channels, surfaces}`` bars are consumed as one
+        # live-scan payload rather than looked up under ``ntx_support``.
+        active_payload_kind = str(
+            realtime_geometry_payload_for_runtime(recorded_scan_runtime)["kind"]
+        )
+        active_neoclassical_cfg = table_context.config.get("neoclassical", {})
         _report_table_builder_phase("prepare_transport_table_inputs")
         assembly = realtime_geometry_transport_reverse_table_from_payload_cotangents(
             objective_labels=objective_names,
@@ -7930,6 +7943,11 @@ def internal_realtime_geometry_transport_reverse_table_result_builder(
             native_vmec_face_coefficient_bars=native_vmec_face_coefficient_bars,
             include_component_pullbacks=active_component_pullbacks,
             combined_geometry_payload=combined_geometry_payload,
+            payload_kind=active_payload_kind,
+            scan_rho=active_neoclassical_cfg.get("ntx_scan_rho"),
+            scan_surface_backend=str(
+                active_neoclassical_cfg.get("ntx_scan_surface_backend", "vmec")
+            ),
             n_r=int(opts.get("n_r", n_r)),
             n_theta=int(opts.get("n_theta", n_theta)),
             n_zeta=int(opts.get("n_zeta", n_zeta)),

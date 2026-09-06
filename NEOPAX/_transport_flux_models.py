@@ -1116,6 +1116,9 @@ def _local_scan_inputs_directional_default(
     density_local: DirectionalSecondOrderJet,
     reference_vthermal_local: jax.Array,
     er_v_floor: float | None,
+    er_tilde_max: float | None,
+    er_tilde_to_er: jax.Array | float | None,
+    nu_v_min: float | None,
 ) -> tuple[DirectionalSecondOrderJet, DirectionalSecondOrderJet, DirectionalSecondOrderJet]:
     """Custom full-state response of the realtime NTX local coordinates."""
     vthermal_local = _jet_vthermal_from_temperature(reference_vthermal_local, temperature_local)
@@ -1123,7 +1126,24 @@ def _local_scan_inputs_directional_default(
     v_new_a = _jet_multiply(jnp.asarray(energy_grid.v_norm), vth_a)
     finite_drds = jnp.isfinite(drds_value)
     safe_drds = jnp.where(finite_drds, drds_value, jnp.asarray(0.0, dtype=vth_a.value.dtype))
-    epsi_hat = _jet_divide(_jet_multiply(1.0e3 * safe_drds, er_value), v_new_a)
+    # The configured maximum is the same normalized er_tilde coordinate as
+    # the runtime-scan database.  Convert it to Es at this radius before the
+    # energy-dependent division by v_new:
+    # Es_max = er_tilde_max * (2 * psia / a_b**2) * drds.
+    er_times_drds = _jet_multiply(safe_drds, er_value)
+    if er_tilde_max is not None:
+        if er_tilde_to_er is None:
+            raise ValueError("A normalized NTX Er cap requires the scan geometry scale.")
+        es_cap = jnp.abs(
+            jnp.asarray(er_tilde_max, dtype=jnp.float64)
+            * jnp.asarray(er_tilde_to_er, dtype=jnp.float64)
+            * safe_drds
+        )
+        sign = jnp.where(er_times_drds.value < 0.0, -1.0, 1.0)
+        es_abs = _jet_abs(er_times_drds)
+        es_abs = _jet_negate(maximum_with_constant_floor(_jet_negate(es_abs), -es_cap))
+        er_times_drds = _jet_multiply(sign, es_abs)
+    epsi_hat = _jet_divide(_jet_multiply(1.0e3, er_times_drds), v_new_a)
     if er_v_floor is not None:
         sign = jnp.where(epsi_hat.value < 0.0, -1.0, 1.0)
         epsi_abs = maximum_with_constant_floor(_jet_abs(epsi_hat), er_v_floor)
@@ -1131,6 +1151,8 @@ def _local_scan_inputs_directional_default(
     nu_hat = _nu_over_vnew_local_directional_default(
         species, species_index, v_new_a, density_local, temperature_local, vthermal_local
     )
+    if nu_v_min is not None:
+        nu_hat = maximum_with_constant_floor(nu_hat, nu_v_min)
     return nu_hat, epsi_hat, vth_a
 
 
@@ -5469,7 +5491,7 @@ class NTXRuntimeScanTransportModel(TransportFluxModelBase):
             fac_sfincs_to_dkes_33=scan_bars.fac_sfincs_to_dkes_33,
         )
         surface_bars, es_bars = (
-            ntx.pullback_neopax_scan_coefficient_blocks_from_primal_record_batched(
+            ntx.pullback_neopax_scan_coefficient_blocks_from_primal_record_batched_vmec_native(
                 self.scan_primal_record,
                 coefficient_blocks_bar=blocks_bars,
             )
@@ -5764,6 +5786,10 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
     derivative_pullback_boundary: str = "inline"
     derivative_pullback_algebra: str = "ntx_helper"
     er_v_floor: float | None = None
+    # Same normalized field coordinate used by ``ntx_scan_er_tilde`` in the
+    # runtime database construction.  It is deliberately not an Es/v cap.
+    er_tilde_max: float | None = None
+    nu_v_min: float | None = None
     collisionality_model: str = "default"
     bc_density: Any = None
     bc_temperature: Any = None
@@ -5793,12 +5819,39 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             raise ValueError("full_state_quadratic_response requires lagged_response_taylor_order = 2.")
         if self.full_state_quadratic_response and str(self.collisionality_model).strip().lower() not in {"", "default"}:
             raise NotImplementedError("full_state_quadratic_response currently supports collisionality_model = 'default' only.")
+        if self.er_tilde_max is not None and float(self.er_tilde_max) <= 0.0:
+            raise ValueError("ntx_exact_er_tilde_max must be positive when provided.")
+        if self.nu_v_min is not None and float(self.nu_v_min) <= 0.0:
+            raise ValueError("ntx_exact_nu_v_min must be positive when provided.")
 
     def _rho_center_face(self):
         a_b = jnp.asarray(self.geometry.a_b, dtype=jnp.float64)
         rho_center = jnp.asarray(self.geometry.r_grid, dtype=jnp.float64) / a_b
         rho_face = jnp.asarray(self.geometry.r_grid_half, dtype=jnp.float64) / a_b
         return rho_center, rho_face
+
+    def _er_tilde_to_er_scale(self):
+        """Return the database scan's ``Er_tilde -> Er`` geometry factor.
+
+        The field-channel definition is ``Er = Er_tilde * dr_tildedr * B00``.
+        Its product is ``2*psia/a_b**2`` and therefore does not depend on
+        radius; multiplying it by the local ``drds`` produces the per-radius
+        ``Es`` cap used by the realtime monoenergetic input.
+        """
+        # Geometry-backed runs carry the same unsigned toroidal-flux endpoint
+        # used to construct the NTX channels.  Prefer it so this inexpensive
+        # coordinate conversion never triggers support construction from a
+        # local scan evaluation.  The support fallback retains compatibility
+        # with minimal test geometries.
+        psia_value = getattr(self.geometry, "Psia_value", None)
+        if psia_value is None:
+            psia = self._static_support().center_channels.psia
+        else:
+            psia = jnp.abs(jnp.asarray(psia_value, dtype=jnp.float64)) / (2.0 * jnp.pi)
+        return (
+            2.0 * jnp.asarray(psia, dtype=jnp.float64)
+            / jnp.asarray(self.geometry.a_b, dtype=jnp.float64) ** 2
+        )
 
     def _static_support(self) -> NTXExactLijRuntimeSupport:
         if self.support is not None:
@@ -6546,6 +6599,18 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             jnp.asarray(er_value * drds_value, dtype=jnp.result_type(er_value, drds_value, jnp.float64)),
             jnp.asarray(0.0, dtype=jnp.result_type(er_value, drds_value, jnp.float64)),
         )
+        if self.er_tilde_max is not None:
+            es_cap = jnp.abs(
+                jnp.asarray(self.er_tilde_max, dtype=jnp.float64)
+                * self._er_tilde_to_er_scale()
+                * jnp.asarray(drds_value, dtype=jnp.float64)
+            )
+            sign = jnp.where(er_times_drds < 0.0, -1.0, 1.0)
+            er_times_drds = jnp.where(
+                drds_is_finite,
+                sign * jnp.minimum(jnp.abs(er_times_drds), es_cap),
+                jnp.asarray(0.0, dtype=jnp.float64),
+            )
         epsi_hat_a = er_times_drds * 1.0e3 / v_new_a
         if self.er_v_floor is not None:
             er_v_floor = jnp.asarray(self.er_v_floor, dtype=jnp.float64)
@@ -6604,6 +6669,11 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             vthermal_local,
             collisionality_kind,
         )
+        if self.nu_v_min is not None:
+            nu_hat_a = jnp.maximum(
+                jnp.asarray(nu_hat_a, dtype=jnp.float64),
+                jnp.asarray(self.nu_v_min, dtype=jnp.float64),
+            )
         return nu_hat_a, epsi_hat_a, vth_a
 
     def _lij_from_coefficient_scan(
@@ -16812,6 +16882,7 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             self.geometry.r_grid if axis == "center" else self.geometry.r_grid_half
         )
         vthermal0 = get_v_thermal(self.species.mass, axis_state.temperature.value)
+        er_tilde_to_er = self._er_tilde_to_er_scale()
         radii = jnp.arange(axis_state.Er.value.shape[0], dtype=jnp.int32)
         species_indices = jnp.arange(int(self.species.number_species), dtype=jnp.int32)
 
@@ -16825,7 +16896,7 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             drds = jax.lax.dynamic_index_in_dim(channels.drds, radius, axis=0, keepdims=False)
 
             def per_species(a):
-                nu, ep, vth = _local_scan_inputs_directional_default(self.energy_grid, self.species, drds_value=drds, species_index=a, er_value=er, temperature_local=t, density_local=n, reference_vthermal_local=v0, er_v_floor=self.er_v_floor)
+                nu, ep, vth = _local_scan_inputs_directional_default(self.energy_grid, self.species, drds_value=drds, species_index=a, er_value=er, temperature_local=t, density_local=n, reference_vthermal_local=v0, er_v_floor=self.er_v_floor, er_tilde_max=self.er_tilde_max, er_tilde_to_er=er_tilde_to_er, nu_v_min=self.nu_v_min)
                 fields = jax.tree_util.tree_map(lambda x: jax.lax.dynamic_index_in_dim(jax.lax.dynamic_index_in_dim(x, radius, axis=0, keepdims=False), a, axis=0, keepdims=False), coefficients)
                 c = compose_ntx_coefficient_quadratic(
                     fields.reference_coefficients,
@@ -18960,6 +19031,8 @@ def build_ntx_exact_lij_runtime_transport_model(
     ntx_exact_derivative_pullback_boundary="inline",
     ntx_exact_derivative_pullback_algebra="ntx_helper",
     ntx_exact_er_v_floor=None,
+    ntx_exact_er_tilde_max=None,
+    ntx_exact_nu_v_min=None,
     ntx_exact_full_state_quadratic_response=False,
     ntx_exact_debug_center_lij_comparison=False,
     lagged_response_taylor_order=1,
@@ -18972,6 +19045,11 @@ def build_ntx_exact_lij_runtime_transport_model(
     temperature_floor=DEFAULT_TRANSPORT_TEMPERATURE_FLOOR,
     **kwargs,
 ):
+    if "ntx_exact_er_v_max" in kwargs:
+        raise ValueError(
+            "ntx_exact_er_v_max is not a supported input: use "
+            "ntx_exact_er_tilde_max, the normalized database scan coordinate."
+        )
     del kwargs
     if ntx_exact_center_response_mode is None:
         ntx_exact_center_response_mode = (
@@ -19029,6 +19107,16 @@ def build_ntx_exact_lij_runtime_transport_model(
             None
             if ntx_exact_er_v_floor in (None, "", 0, "0")
             else float(ntx_exact_er_v_floor)
+        ),
+        er_tilde_max=(
+            None
+            if ntx_exact_er_tilde_max in (None, "", 0, "0")
+            else float(ntx_exact_er_tilde_max)
+        ),
+        nu_v_min=(
+            None
+            if ntx_exact_nu_v_min in (None, "", 0, "0")
+            else float(ntx_exact_nu_v_min)
         ),
         full_state_quadratic_response=bool(ntx_exact_full_state_quadratic_response),
         debug_center_lij_comparison=bool(ntx_exact_debug_center_lij_comparison),
