@@ -1868,6 +1868,30 @@ def _flat_rhs_direct_database_payload_pullback_factory(
     return jax.jit(_pullback, inline=False)
 
 
+def _flat_rhs_direct_database_payload_pullback_batched_factory(
+    unravel, vector_field, args, kwargs, hook_name: str, project_flat=None
+):
+    """Flatten one database-only RHS transpose with objective rows batched."""
+    pullback_fn = _direct_rhs_database_payload_pullback_hook(vector_field, hook_name)
+    if pullback_fn is None:
+        return None
+    unravel_bar = getattr(unravel, "cotangent", unravel)
+
+    def _pullback(t_value, flat_y, rhs_bars_flat, support):
+        projected_flat_y = _project_flat_state_if_needed(flat_y, project_flat)
+        state_y = unravel(projected_flat_y)
+        rhs_bars_state = jax.vmap(
+            lambda one_bar: unravel_bar(
+                jnp.asarray(one_bar, dtype=jnp.asarray(flat_y).dtype)
+            )
+        )(rhs_bars_flat)
+        return pullback_fn(
+            t_value, state_y, *args, rhs_bar=rhs_bars_state, support=support, **kwargs
+        )
+
+    return jax.jit(_pullback, inline=False)
+
+
 def _flat_rhs_lagged_response_all_pullback_factory(
     unravel,
     pack_flat,
@@ -4741,7 +4765,9 @@ class _RadauAcceptedStepPhysicsContext:
     # They are kept separate so the scan-database lane can put only the
     # table transpose in a Radau segment and defer the geometry transpose.
     flat_rhs_direct_database_table_pullback: Callable[[Any, Any, Any, Any], Any] | None = None
+    flat_rhs_direct_database_table_pullback_batched: Callable[[Any, Any, Any, Any], Any] | None = None
     flat_rhs_direct_database_geometry_pullback: Callable[[Any, Any, Any, Any], Any] | None = None
+    flat_rhs_direct_database_geometry_pullback_batched: Callable[[Any, Any, Any, Any], Any] | None = None
     flat_rhs_lagged_response_all_pullback: Callable[[Any, Any, Any, Any, Any], tuple[Any, Any, Any]] | None = None
     flat_rhs_state_and_lagged_response_pullback: Callable[[Any, Any, Any, Any], tuple[Any, Any]] | None = None
     flat_rhs_state_pullback: Callable[[Any, Any, Any, Any], Any] | None = None
@@ -7217,24 +7243,41 @@ def _execute_radau_accepted_step_next_reduced_cotangent_batched_bwd_with_support
         with _radau_reverse_profile_scope(
             physics_context, "reverse_segment/fixed_lagged_rhs_support_transpose"
         ):
-            support_bar_leaves = jax.vmap(
-                lambda residual_bar: tuple(
-                    jax.tree_util.tree_leaves(
-                        _radau_sanitize_support_delta_bar_tree(
-                            support,
-                            _radau_exact_stage_residual_support_pullback(
-                                kernel_context,
-                                physics_context,
-                                carry_in,
-                                primal_result,
-                                lagged_response,
-                                residual_bar,
-                                support,
-                            ),
-                        )
+            if (
+                lagged_response is None
+                and bool(
+                    getattr(physics_context, "reverse_database_defer_geometry", False)
+                )
+            ):
+                support_bar_leaves = (
+                    _radau_exact_stage_residual_database_table_support_pullback_batched(
+                        kernel_context,
+                        physics_context,
+                        carry_in,
+                        primal_result,
+                        residual_bars,
+                        support,
                     )
                 )
-            )(residual_bars)
+            else:
+                support_bar_leaves = jax.vmap(
+                    lambda residual_bar: tuple(
+                        jax.tree_util.tree_leaves(
+                            _radau_sanitize_support_delta_bar_tree(
+                                support,
+                                _radau_exact_stage_residual_support_pullback(
+                                    kernel_context,
+                                    physics_context,
+                                    carry_in,
+                                    primal_result,
+                                    lagged_response,
+                                    residual_bar,
+                                    support,
+                                ),
+                            )
+                        )
+                    )
+                )(residual_bars)
     else:
         raise ValueError(f"Unknown reverse_rhs_pullback_mode '{rhs_pullback_mode}'.")
     if collect_native_vmec_coefficients:
@@ -10975,6 +11018,68 @@ def _radau_sum_leading_axis_tree(tree):
     return jax.tree_util.tree_map(lambda value: jnp.sum(value, axis=0), tree)
 
 
+def _radau_exact_stage_residual_database_table_support_pullback_batched(
+    kernel_context: _RadauAcceptedStepKernelContext,
+    physics_context: _RadauAcceptedStepPhysicsContext,
+    carry_in: _RadauAcceptedStepCarry,
+    primal_result: _RadauAcceptedStepAttemptResult,
+    residual_bars,
+    support,
+):
+    """Pull fixed-table bars for all objectives without mapping a support tree.
+
+    This boundary is database-only and is entered only by the deferred-
+    geometry segmented reverse.  The objective axis stays inside the compact
+    database interpolation transpose; scan ownership and the Lij path are
+    deliberately outside it.
+    """
+    direct_pullback = physics_context.flat_rhs_direct_database_table_pullback_batched
+    if direct_pullback is None:
+        raise ValueError(
+            "Database deferred-geometry reverse requires the batched table "
+            "RHS pullback boundary."
+        )
+    residual_bars = jnp.asarray(residual_bars, dtype=kernel_context.dtype)
+    if residual_bars.ndim != 3:
+        raise ValueError("Batched Radau database table bars must have shape [objective, stage, state].")
+    objective_count = residual_bars.shape[0]
+    stages_final = primal_result.stage_history.reshape(
+        (kernel_context.num_stages, kernel_context.state_dim)
+    )
+    stage_times = carry_in.t + kernel_context.c * primal_result.trial_dt
+    stage_states = carry_in.y[None, :] + primal_result.trial_dt * (
+        kernel_context.a @ stages_final
+    )
+    support_zero = _radau_zero_support_delta_tree_like(support)
+    zero_leaves = tuple(
+        jnp.broadcast_to(
+            jnp.asarray(leaf)[None, ...],
+            (objective_count,) + jnp.asarray(leaf).shape,
+        )
+        for leaf in jax.tree_util.tree_leaves(support_zero)
+    )
+
+    def _stage_pullback(accumulated_leaves, stage_inputs):
+        t_eval, y_eval, rhs_bars_eval = stage_inputs
+        stage_support_bar = _radau_sanitize_support_delta_bar_tree(
+            support,
+            direct_pullback(t_eval, y_eval, -rhs_bars_eval, support),
+        )
+        stage_leaves = tuple(jax.tree_util.tree_leaves(stage_support_bar))
+        return tuple(
+            accumulated + stage for accumulated, stage in zip(
+                accumulated_leaves, stage_leaves
+            )
+        ), None
+
+    support_bar_leaves, _ = jax.lax.scan(
+        _stage_pullback,
+        zero_leaves,
+        (stage_times, stage_states, jnp.moveaxis(residual_bars, 1, 0)),
+    )
+    return support_bar_leaves
+
+
 def _radau_exact_stage_residual_support_pullback(
     kernel_context: _RadauAcceptedStepKernelContext,
     physics_context: _RadauAcceptedStepPhysicsContext,
@@ -11106,6 +11211,61 @@ def _radau_database_geometry_support_pullback_from_stage_record(
         raise ValueError(
             "Deferred database geometry sweep requires exactly {'geometry', 'database'} support."
         )
+
+    batched_pullback = (
+        physics_context.flat_rhs_direct_database_geometry_pullback_batched
+    )
+    if batched_pullback is not None:
+        support_treedef = jax.tree_util.tree_structure(support)
+
+        def _one_slot_leaves(stage_times, stage_states, residual_bars):
+            objective_count = jnp.asarray(residual_bars).shape[0]
+            zero_leaves = tuple(
+                jnp.broadcast_to(
+                    jnp.asarray(leaf)[None, ...],
+                    (objective_count,) + jnp.asarray(leaf).shape,
+                )
+                for leaf in jax.tree_util.tree_leaves(
+                    _radau_zero_support_delta_tree_like(support)
+                )
+            )
+
+            def _stage_pullback(accumulated_leaves, stage_inputs):
+                t_eval, y_eval, rhs_bars = stage_inputs
+                support_bar = _radau_sanitize_support_delta_bar_tree(
+                    support,
+                    batched_pullback(t_eval, y_eval, -rhs_bars, support),
+                )
+                return tuple(
+                    accumulated + stage
+                    for accumulated, stage in zip(
+                        accumulated_leaves,
+                        jax.tree_util.tree_leaves(support_bar),
+                    )
+                ), None
+
+            return jax.lax.scan(
+                _stage_pullback,
+                zero_leaves,
+                (stage_times, stage_states, jnp.moveaxis(residual_bars, 1, 0)),
+            )[0]
+
+        if jnp.asarray(record.residual_bars).ndim == 4:
+            by_slot_leaves = jax.vmap(_one_slot_leaves)(
+                record.stage_times,
+                record.stage_states,
+                record.residual_bars,
+            )
+            summed_leaves = tuple(
+                jnp.sum(values, axis=0) for values in by_slot_leaves
+            )
+        else:
+            summed_leaves = _one_slot_leaves(
+                record.stage_times,
+                record.stage_states,
+                record.residual_bars,
+            )
+        return support_treedef.unflatten(summed_leaves)
 
     def _one_slot(stage_times, stage_states, residual_bars):
         def _one_objective(residual_bar):
@@ -21108,6 +21268,16 @@ def _build_prepared_radau_accepted_rollout(
             project_flat=project_flat,
         )
     )
+    flat_rhs_direct_database_table_pullback_batched = (
+        _flat_rhs_direct_database_payload_pullback_batched_factory(
+            unravel=unpack_flat,
+            vector_field=vector_field,
+            args=args,
+            kwargs=kwargs,
+            hook_name="pullback_direct_rhs_database_table_payload_batched",
+            project_flat=project_flat,
+        )
+    )
     flat_rhs_direct_database_geometry_pullback = (
         _flat_rhs_direct_database_payload_pullback_factory(
             unravel=unpack_flat,
@@ -21115,6 +21285,16 @@ def _build_prepared_radau_accepted_rollout(
             args=args,
             kwargs=kwargs,
             hook_name="pullback_direct_rhs_database_geometry_payload",
+            project_flat=project_flat,
+        )
+    )
+    flat_rhs_direct_database_geometry_pullback_batched = (
+        _flat_rhs_direct_database_payload_pullback_batched_factory(
+            unravel=unpack_flat,
+            vector_field=vector_field,
+            args=args,
+            kwargs=kwargs,
+            hook_name="pullback_direct_rhs_database_geometry_payload_batched",
             project_flat=project_flat,
         )
     )
@@ -21669,7 +21849,13 @@ def _build_prepared_radau_accepted_rollout(
         flat_rhs_lagged_response_support_pullback=flat_rhs_lagged_response_support_pullback,
         flat_rhs_direct_support_pullback=flat_rhs_direct_support_pullback,
         flat_rhs_direct_database_table_pullback=flat_rhs_direct_database_table_pullback,
+        flat_rhs_direct_database_table_pullback_batched=(
+            flat_rhs_direct_database_table_pullback_batched
+        ),
         flat_rhs_direct_database_geometry_pullback=flat_rhs_direct_database_geometry_pullback,
+        flat_rhs_direct_database_geometry_pullback_batched=(
+            flat_rhs_direct_database_geometry_pullback_batched
+        ),
         flat_rhs_lagged_response_all_pullback=flat_rhs_lagged_response_all_pullback,
         flat_rhs_state_and_lagged_response_pullback=flat_rhs_state_and_lagged_response_pullback,
         flat_rhs_state_pullback=flat_rhs_state_pullback,

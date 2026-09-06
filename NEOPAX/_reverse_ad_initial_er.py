@@ -138,8 +138,13 @@ def compact_initial_er_database_support_bars(
         )
     database_model = find_ntx_database_transport_model_in_model(runtime.models.flux)
     if database_model is None:
+        # The normal segmented runtime already contains the fixed database
+        # model.  Keep the recorded scan-wrapper fallback for the standalone
+        # root boundary and its established contract tests.
+        database_model = find_ntx_runtime_scan_model_in_model(runtime.models.flux)
+    if database_model is None:
         raise ValueError(
-            "Compact database initial-Er support pullback requires a fixed database model."
+            "Compact database initial-Er support pullback requires a database model."
         )
     er_profile = jnp.asarray(er_profile, dtype=state.Er.dtype)
     residual_bars = jnp.asarray(residual_bars, dtype=state.Er.dtype)
@@ -151,27 +156,24 @@ def compact_initial_er_database_support_bars(
     state_with_er = dataclasses.replace(state, Er=er_profile)
     charge_qp = jnp.asarray(runtime.species.charge_qp, dtype=state.Er.dtype)
 
-    def _one_objective(residual_bar):
-        gamma_bar = charge_qp[:, None] * residual_bar[None, :]
-        pullback = getattr(
-            database_model, "pullback_local_particle_flux_support_payload", None
+    gamma_bars = charge_qp[None, :, None] * residual_bars[:, None, :]
+    pullback = getattr(
+        database_model, "pullback_local_particle_flux_support_payload", None
+    )
+    if not callable(pullback):
+        raise ValueError(
+            "Runtime database model did not expose its local particle-flux transpose."
         )
-        if not callable(pullback):
-            raise ValueError(
-                "Runtime database model did not expose its local particle-flux transpose."
-            )
-        support_bar = pullback(
-            state_with_er,
-            {"Gamma": gamma_bar},
-            support,
+    support_bar = pullback(
+        state_with_er,
+        {"Gamma": gamma_bars},
+        support,
+    )
+    if support_bar is None or "database" not in support_bar:
+        raise ValueError(
+            "Runtime database model did not expose its direct particle-flux transpose."
         )
-        if support_bar is None or "database" not in support_bar:
-            raise ValueError(
-                "Runtime database model did not expose its direct particle-flux transpose."
-            )
-        return support_bar["database"]
-
-    return jax.vmap(_one_objective)(residual_bars)
+    return support_bar["database"]
 
 
 def _replace_ntx_support_payload_in_model(model, support):

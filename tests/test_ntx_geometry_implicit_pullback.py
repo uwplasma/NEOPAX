@@ -1595,6 +1595,57 @@ def test_black_box_recorded_database_direct_support_split_matches_generic_payloa
     assert jnp.allclose(actual["surfaces"], 0.0)
 
 
+def test_batched_database_geometry_payload_keeps_objective_axis_inside_hook():
+    """The deferred database geometry boundary receives all objective rows once."""
+
+    class _RecordedDatabaseOwner:
+        def __call__(self, _state):
+            return jnp.asarray(3.0)
+
+        def pullback_direct_rhs_geometry_by_radius(self, _state, flux_bar, _geometry):
+            return flux_bar
+
+    class _FixedFluxEquation:
+        def __init__(self, geometry):
+            self.geometry = geometry
+
+        def _prepare_working_state(self, state):
+            return state, None
+
+        def _evaluate_with_shared_fluxes_from_working_state(
+            self, _working_state, _eidx, _state, shared_fluxes
+        ):
+            return self.geometry + shared_fluxes
+
+    equations = object.__new__(ComposedEquationSystem)
+    owner = _RecordedDatabaseOwner()
+    object.__setattr__(equations, "shared_flux_model", owner)
+    object.__setattr__(
+        equations,
+        "_flux_model_with_realtime_support_payload",
+        lambda _model, _support: owner,
+    )
+    object.__setattr__(equations, "_prepare_working_state", lambda state: (state, None))
+    object.__setattr__(
+        equations, "pullback_shared_fluxes", lambda _state, _fluxes, rhs_bar: rhs_bar
+    )
+    object.__setattr__(
+        equations,
+        "with_realtime_geometry_support_payload",
+        lambda payload: _FixedFluxEquation(payload["geometry"]),
+    )
+    support = {"geometry": jnp.asarray(5.0), "database": jnp.asarray(7.0)}
+    actual = equations.pullback_direct_rhs_database_geometry_payload_batched(
+        jnp.asarray(0.0),
+        None,
+        None,
+        jnp.asarray([2.0, -3.0]),
+        support,
+    )
+    assert jnp.allclose(actual["geometry"], jnp.asarray([4.0, -6.0]))
+    assert jnp.allclose(actual["database"], jnp.zeros((2,)))
+
+
 def test_native_multi_rhs_equation_system_forwarding_hook_is_exposed_to_radau():
     """The real Radau vector-field owner forwards the native hook once."""
 

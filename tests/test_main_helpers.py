@@ -2988,6 +2988,32 @@ def test_radial_database_flux_table_transpose_matches_generic_vjp():
         if jnp.issubdtype(jnp.asarray(expected_leaf).dtype, jnp.inexact):
             assert jnp.allclose(actual_leaf, expected_leaf, rtol=2.0e-10, atol=2.0e-10)
 
+    # Objective rows are the database counterpart of Lij's native multi-RHS
+    # support transpose.  They must equal independently accumulated scalar
+    # table bars while retaining a leading RHS axis.
+    rhs_rows = (
+        (gamma_bar, q_bar, upar_bar),
+        (-0.3 * gamma_bar, 0.2 * q_bar, -0.5 * upar_bar),
+    )
+    batched = pullback_preprocessed_radial_database_fluxes(
+        species, energy_grid, geometry, database, er_center, temperature, density,
+        *(jnp.stack(tuple(row[channel] for row in rhs_rows)) for channel in range(3)),
+    )
+    scalar_rows = tuple(
+        pullback_preprocessed_radial_database_fluxes(
+            species, energy_grid, geometry, database, er_center, temperature, density,
+            *row,
+        )
+        for row in rhs_rows
+    )
+    for table_index, actual_table_bar in enumerate(batched):
+        expected_table_bar = jnp.stack(
+            tuple(row[table_index] for row in scalar_rows)
+        )
+        assert jnp.allclose(
+            actual_table_bar, expected_table_bar, rtol=2.0e-10, atol=2.0e-10
+        )
+
 
 def test_legacy_monoenergetic_flux_table_transpose_matches_generic_vjp():
     """The black-box centre rule remains exact for scan-generated tables."""

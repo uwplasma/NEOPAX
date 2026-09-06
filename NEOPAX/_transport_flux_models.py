@@ -3217,6 +3217,16 @@ class NTXDatabaseTransportModel(TransportFluxModelBase):
             _collisionality_kind(self.collisionality_model),
         )
         database_bar = _float_delta_tree_like(database)
+        batched_rhs = jnp.asarray(d11_bar).ndim == jnp.asarray(database.D11_log).ndim + 1
+        if batched_rhs:
+            rhs_count = jnp.asarray(d11_bar).shape[0]
+            database_bar = jax.tree_util.tree_map(
+                lambda value: jnp.broadcast_to(
+                    jnp.asarray(value)[None, ...],
+                    (rhs_count,) + jnp.asarray(value).shape,
+                ),
+                database_bar,
+            )
         database_bar = dataclasses.replace(
             database_bar,
             D11_log=d11_bar,
@@ -3224,7 +3234,18 @@ class NTXDatabaseTransportModel(TransportFluxModelBase):
             D33=d33_bar,
         )
         support_bar = dict(_float_delta_tree_like(support))
-        support_bar["database"] = _sanitize_float_delta_bar_tree(database, database_bar)
+        if batched_rhs:
+            support_bar = jax.tree_util.tree_map(
+                lambda value: jnp.broadcast_to(
+                    jnp.asarray(value)[None, ...],
+                    (rhs_count,) + jnp.asarray(value).shape,
+                ),
+                support_bar,
+            )
+            support_bar = dict(support_bar)
+            support_bar["database"] = database_bar
+        else:
+            support_bar["database"] = _sanitize_float_delta_bar_tree(database, database_bar)
         return support_bar
 
     def pullback_direct_rhs_geometry_by_radius(self, state, flux_bar, geometry):
@@ -3246,6 +3267,7 @@ class NTXDatabaseTransportModel(TransportFluxModelBase):
             return zero if value.ndim == 0 or value.dtype == jax.dtypes.float0 else value
 
         gamma_bar, q_bar, upar_bar = _bar("Gamma"), _bar("Q"), _bar("Upar")
+        batched_rhs = gamma_bar.ndim == 3
         radius_indices = jnp.arange(gamma_bar.shape[-1], dtype=jnp.int32)
         geometry_delta0 = _float_delta_tree_like(geometry)
         leaves0, treedef = jax.tree_util.tree_flatten(geometry_delta0)
@@ -3259,7 +3281,10 @@ class NTXDatabaseTransportModel(TransportFluxModelBase):
             leaves = []
             offset = 0
             for size, shape in zip(sizes, shapes, strict=True):
-                leaves.append(jnp.reshape(flat_delta[offset : offset + size], shape))
+                leaves.append(jnp.reshape(
+                    flat_delta[..., offset : offset + size],
+                    flat_delta.shape[:-1] + shape,
+                ))
                 offset += size
             return treedef.unflatten(leaves)
 
@@ -3276,20 +3301,31 @@ class NTXDatabaseTransportModel(TransportFluxModelBase):
             _, pullback = jax.vjp(_local_fluxes, flat_delta0)
             local_bar = {
                 "Gamma": jax.lax.dynamic_index_in_dim(
-                    gamma_bar, radius_index, axis=1, keepdims=False
+                    gamma_bar, radius_index,
+                    axis=2 if batched_rhs else 1, keepdims=False
                 ),
                 "Q": jax.lax.dynamic_index_in_dim(
-                    q_bar, radius_index, axis=1, keepdims=False
+                    q_bar, radius_index,
+                    axis=2 if batched_rhs else 1, keepdims=False
                 ),
                 "Upar": jax.lax.dynamic_index_in_dim(
-                    upar_bar, radius_index, axis=1, keepdims=False
+                    upar_bar, radius_index,
+                    axis=2 if batched_rhs else 1, keepdims=False
                 ),
             }
-            (flat_bar,) = pullback(local_bar)
+            if batched_rhs:
+                flat_bar = jax.vmap(lambda one_bar: pullback(one_bar)[0])(local_bar)
+            else:
+                (flat_bar,) = pullback(local_bar)
             return carry + flat_bar, None
 
         flat_bar, _ = jax.lax.scan(
-            _accumulate, jnp.zeros_like(flat_delta0), radius_indices
+            _accumulate,
+            (
+                jnp.zeros((gamma_bar.shape[0],) + flat_delta0.shape, dtype=flat_delta0.dtype)
+                if batched_rhs else jnp.zeros_like(flat_delta0)
+            ),
+            radius_indices,
         )
         return _split(flat_bar)
 
@@ -3324,12 +3360,26 @@ class NTXDatabaseTransportModel(TransportFluxModelBase):
             temperature_right_constraint,
             temperature_right_grad_constraint,
         )
+        database_bar0 = _float_delta_tree_like(database)
+        if jnp.asarray(d11_bar).ndim == jnp.asarray(database.D11_log).ndim + 1:
+            rhs_count = jnp.asarray(d11_bar).shape[0]
+            database_bar0 = jax.tree_util.tree_map(
+                lambda value: jnp.broadcast_to(
+                    jnp.asarray(value)[None, ...],
+                    (rhs_count,) + jnp.asarray(value).shape,
+                ),
+                database_bar0,
+            )
         database_bar = dataclasses.replace(
-            _float_delta_tree_like(database),
+            database_bar0,
             D11_log=d11_bar, D13=d13_bar, D33=d33_bar,
         )
         support_bar = dict(_float_delta_tree_like(support))
-        support_bar["database"] = _sanitize_float_delta_bar_tree(database, database_bar)
+        support_bar["database"] = (
+            database_bar
+            if jnp.asarray(d11_bar).ndim == jnp.asarray(database.D11_log).ndim + 1
+            else _sanitize_float_delta_bar_tree(database, database_bar)
+        )
         return support_bar
 
     def evaluate_momentum_corrected_fluxes(self, state, *, diagnostics: bool = False) -> dict:

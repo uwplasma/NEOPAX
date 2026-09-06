@@ -480,6 +480,15 @@ def pullback_preprocessed_radial_database_fluxes(
     the full database interpolation graph for every Radau stage.
     """
 
+    # A leading RHS axis is used by the database reverse lane to share this
+    # interpolation/table primitive across objective cotangents.  The scalar
+    # public contract remains unchanged.
+    batched_rhs = jnp.asarray(gamma_bar).ndim == 3
+    if batched_rhs and (
+        jnp.asarray(q_bar).ndim != 3 or jnp.asarray(upar_bar).ndim != 3
+    ):
+        raise ValueError("Database flux cotangent RHS axes must be consistent.")
+
     v_thermal = get_v_thermal(species.mass, temperature)
     density_phys = DENSITY_STATE_TO_PHYSICAL * density
     temperature_phys = TEMPERATURE_STATE_TO_PHYSICAL * temperature
@@ -565,15 +574,21 @@ def pullback_preprocessed_radial_database_fluxes(
             a2_species[radius_index],
             a3[radius_index],
         ))
-        lbar = jnp.zeros((3, 3), dtype=temperature.dtype)
-        lbar = lbar.at[0, :].add(-density_phys_species[radius_index] * gamma_bar_local * forces)
-        lbar = lbar.at[1, :].add(
+        lbar = jnp.zeros(
+            jnp.shape(gamma_bar_local) + (3, 3), dtype=temperature.dtype
+        )
+        lbar = lbar.at[..., 0, :].add(
+            -density_phys_species[radius_index] * gamma_bar_local[..., None] * forces
+        )
+        lbar = lbar.at[..., 1, :].add(
             -temperature_phys_species[radius_index]
             * density_phys_species[radius_index]
-            * q_bar_local
+            * q_bar_local[..., None]
             * forces
         )
-        lbar = lbar.at[2, :].add(-density_phys_species[radius_index] * upar_bar_local * forces)
+        lbar = lbar.at[..., 2, :].add(
+            -density_phys_species[radius_index] * upar_bar_local[..., None] * forces
+        )
 
         er_over_vnew = Er[radius_index] * 1.0e3 / (energy_grid.v_norm * vth)
         interpolation_kernel = monoenergetic_interpolation_kernel(database)
@@ -595,10 +610,14 @@ def pullback_preprocessed_radial_database_fluxes(
             ),
             dij,
         )
-        dij_bar = dij_pullback(lbar)[0]
-        d11_log_bar = dij_bar[:, 0]
-        d13_bar = dij_bar[:, 1]
-        d33_bar = dij_bar[:, 2]
+        dij_bar = (
+            jax.vmap(dij_pullback)(lbar)[0]
+            if batched_rhs
+            else dij_pullback(lbar)[0]
+        )
+        d11_log_bar = dij_bar[..., 0]
+        d13_bar = dij_bar[..., 1]
+        d33_bar = dij_bar[..., 2]
 
         is_legacy_monoenergetic = monoenergetic_database_kind(database) == MONOENERGETIC_KIND_GENERIC
 
@@ -627,39 +646,54 @@ def pullback_preprocessed_radial_database_fluxes(
                 radial_preprocessed_interpolation_table_bar(stencil, d33_value, database.D33),
             )
 
-        tables = jax.vmap(_scatter_one)(
-            nu_over_vnew, er_over_vnew, d11_log_bar, d13_bar, d33_bar
+        if batched_rhs:
+            def _one_rhs(d11_rhs, d13_rhs, d33_rhs):
+                return jax.vmap(_scatter_one)(
+                    nu_over_vnew, er_over_vnew, d11_rhs, d13_rhs, d33_rhs
+                )
+
+            tables = jax.vmap(_one_rhs)(d11_log_bar, d13_bar, d33_bar)
+        else:
+            tables = jax.vmap(_scatter_one)(
+                nu_over_vnew, er_over_vnew, d11_log_bar, d13_bar, d33_bar
+            )
+        return tuple(
+            jnp.sum(value, axis=1 if batched_rhs else 0) for value in tables
         )
-        return tuple(jnp.sum(value, axis=0) for value in tables)
 
     species_indices = species.species_indices
     radius_indices = geometry.full_grid_indices
+    if batched_rhs:
+        table_bars = jax.vmap(
+            lambda species_index, a1_species, a2_species, density_phys_species, temperature_phys_species, vthermal_species, gamma_species, q_species, upar_species: jax.vmap(
+                lambda radius_index, gamma_local, q_local, upar_local: _one_species_radius(
+                    species_index, a1_species, a2_species, density_phys_species,
+                    temperature_phys_species, vthermal_species, radius_index,
+                    gamma_local, q_local, upar_local,
+                ),
+                in_axes=(0, 1, 1, 1),
+            )(radius_indices, gamma_species, q_species, upar_species),
+            in_axes=(0, 0, 0, 0, 0, 0, 0, 0, 0),
+        )(
+            species_indices, a1, a2, density_phys, temperature_phys, v_thermal,
+            jnp.moveaxis(gamma_bar, 1, 0),
+            jnp.moveaxis(q_bar, 1, 0),
+            jnp.moveaxis(upar_bar, 1, 0),
+        )
+        return tuple(jnp.sum(value, axis=(0, 1)) for value in table_bars)
+
     table_bars = jax.vmap(
         lambda species_index, a1_species, a2_species, density_phys_species, temperature_phys_species, vthermal_species, gamma_species, q_species, upar_species: jax.vmap(
             lambda radius_index, gamma_local, q_local, upar_local: _one_species_radius(
-                species_index,
-                a1_species,
-                a2_species,
-                density_phys_species,
-                temperature_phys_species,
-                vthermal_species,
-                radius_index,
-                gamma_local,
-                q_local,
-                upar_local,
+                species_index, a1_species, a2_species, density_phys_species,
+                temperature_phys_species, vthermal_species, radius_index,
+                gamma_local, q_local, upar_local,
             )
         )(radius_indices, gamma_species, q_species, upar_species),
         in_axes=(0, 0, 0, 0, 0, 0, 0, 0, 0),
     )(
-        species_indices,
-        a1,
-        a2,
-        density_phys,
-        temperature_phys,
-        v_thermal,
-        gamma_bar,
-        q_bar,
-        upar_bar,
+        species_indices, a1, a2, density_phys, temperature_phys, v_thermal,
+        gamma_bar, q_bar, upar_bar,
     )
     return tuple(jnp.sum(value, axis=(0, 1)) for value in table_bars)
 

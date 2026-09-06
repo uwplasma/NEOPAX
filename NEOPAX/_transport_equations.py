@@ -1891,6 +1891,39 @@ class ComposedEquationSystem:
         )
         return support_bar
 
+    def pullback_direct_rhs_database_table_payload_batched(
+        self, t, state, runtime, rhs_bar, support
+    ):
+        """Batch objective rows through the fixed-table RHS transpose."""
+        if not isinstance(support, dict) or set(support) != {"geometry", "database"}:
+            raise ValueError(
+                "Batched database table RHS pullback requires exactly "
+                "{'geometry', 'database'} support."
+            )
+        active_shared_flux_model = self._flux_model_with_realtime_support_payload(
+            self.shared_flux_model, support
+        )
+        table_pullback = getattr(
+            active_shared_flux_model, "pullback_direct_rhs_support_payload", None
+        )
+        if not callable(table_pullback):
+            raise NotImplementedError(
+                "Batched database table RHS pullback requires a compact flux transpose."
+            )
+        working_state, _ = self._prepare_working_state(state)
+        shared_fluxes = active_shared_flux_model(working_state)
+        flux_bar = jax.vmap(
+            lambda one_rhs_bar: self.pullback_shared_fluxes(
+                state, shared_fluxes, one_rhs_bar
+            )
+        )(rhs_bar)
+        table_support_bar = table_pullback(working_state, flux_bar, support)
+        if not isinstance(table_support_bar, dict) or "database" not in table_support_bar:
+            raise ValueError(
+                "Batched database table RHS pullback did not return a database bar."
+            )
+        return table_support_bar
+
     def pullback_direct_rhs_database_geometry_payload(self, t, state, runtime, rhs_bar, support):
         """Return only the fixed-table geometry bar for a direct database RHS.
 
@@ -1947,6 +1980,67 @@ class ComposedEquationSystem:
         support_bar["geometry"] = _sanitize_float_delta_bar_tree(
             geometry,
             _add_float_delta_tree(flux_geometry_bar, equation_geometry_bar),
+        )
+        return support_bar
+
+    def pullback_direct_rhs_database_geometry_payload_batched(
+        self, t, state, runtime, rhs_bar, support
+    ):
+        """Batch objective rows through the fixed-table geometry transpose."""
+        if not isinstance(support, dict) or set(support) != {"geometry", "database"}:
+            raise ValueError(
+                "Batched database geometry RHS pullback requires exactly "
+                "{'geometry', 'database'} support."
+            )
+        active_shared_flux_model = self._flux_model_with_realtime_support_payload(
+            self.shared_flux_model, support
+        )
+        flux_geometry_pullback = getattr(
+            active_shared_flux_model, "pullback_direct_rhs_geometry_by_radius", None
+        )
+        if not callable(flux_geometry_pullback):
+            raise NotImplementedError(
+                "Batched database geometry RHS pullback requires a compact flux geometry transpose."
+            )
+        working_state, _ = self._prepare_working_state(state)
+        shared_fluxes = active_shared_flux_model(working_state)
+        flux_bar = jax.vmap(
+            lambda one_rhs_bar: self.pullback_shared_fluxes(
+                state, shared_fluxes, one_rhs_bar
+            )
+        )(rhs_bar)
+        geometry = support["geometry"]
+        flux_geometry_bar = flux_geometry_pullback(working_state, flux_bar, geometry)
+        geometry_delta0 = _float_delta_tree_like(geometry)
+
+        def _equation_geometry_with_fixed_fluxes(geometry_delta):
+            geometry_payload = {
+                **support,
+                "geometry": _add_float_delta_tree(geometry, geometry_delta),
+            }
+            system = self.with_realtime_geometry_support_payload(geometry_payload)
+            fixed_working_state, fixed_eidx = system._prepare_working_state(state)
+            return system._evaluate_with_shared_fluxes_from_working_state(
+                fixed_working_state, fixed_eidx, state, shared_fluxes
+            )
+
+        _, equation_geometry_pullback = jax.vjp(
+            _equation_geometry_with_fixed_fluxes, geometry_delta0
+        )
+        equation_geometry_bar = jax.vmap(
+            lambda one_rhs_bar: equation_geometry_pullback(one_rhs_bar)[0]
+        )(rhs_bar)
+        objective_count = jnp.asarray(jax.tree_util.tree_leaves(rhs_bar)[0]).shape[0]
+        support_bar = jax.tree_util.tree_map(
+            lambda value: jnp.broadcast_to(
+                jnp.asarray(value)[None, ...],
+                (objective_count,) + jnp.asarray(value).shape,
+            ),
+            _float_delta_tree_like(support),
+        )
+        support_bar = dict(support_bar)
+        support_bar["geometry"] = _add_float_delta_tree(
+            flux_geometry_bar, equation_geometry_bar
         )
         return support_bar
 
@@ -3508,8 +3602,26 @@ class ComposedEquationSystem:
             raise NotImplementedError(
                 "The active shared flux model does not expose a cached-response tangent."
             )
-        state_flux_direction = tangent_fn(
+        # A pure private-edge probe has identically zero centre-state
+        # direction.  Do not ask a model-owned centre tangent to represent
+        # that zero contribution: the edge column must come solely from the
+        # cached evaluator's explicit ``er_edge_override`` dependence.  This
+        # is also a strict separation of the two derivative coordinates.
+        state_direction_is_zero = jnp.logical_and(
+            jnp.all(jnp.asarray(state_direction.density) == 0),
+            jnp.logical_and(
+                jnp.all(jnp.asarray(state_direction.pressure) == 0),
+                jnp.all(jnp.asarray(state_direction.Er) == 0),
+            ),
+        )
+        state_flux_direction_raw = tangent_fn(
             working_state, working_direction, transport_response, **flux_kwargs
+        )
+        state_flux_direction = jax.tree_util.tree_map(
+            lambda tangent: jnp.where(
+                state_direction_is_zero, jnp.zeros_like(tangent), tangent
+            ),
+            state_flux_direction_raw,
         )
 
         # The generic model tangent accepts a TransportState direction only.
