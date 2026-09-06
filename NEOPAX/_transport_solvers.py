@@ -15248,6 +15248,78 @@ def _radau_run_stage_subsolve_from_inputs(
     )
 
 
+def _radau_residual_decreasing_line_search(
+    z_cur,
+    full_delta,
+    residual_fn,
+    residual_norm_fn,
+    *,
+    dtype,
+    max_backtracks: int = 5,
+):
+    """Return the first halved Newton correction that does not raise residual.
+
+    ``residual_fn`` is intentionally the existing stage residual callback.  In
+    the quadratic cached-response lane this is algebra on the retained
+    response, not a new transport-model evaluation.
+    """
+    current_residual = residual_fn(z_cur)
+    current_norm = residual_norm_fn(current_residual)
+    full_z = z_cur + full_delta
+    full_residual = residual_fn(full_z)
+    full_norm = residual_norm_fn(full_residual)
+    full_accepted = jnp.logical_and(
+        jnp.all(jnp.isfinite(full_z)),
+        jnp.logical_and(
+            jnp.all(jnp.isfinite(full_residual)),
+            jnp.logical_and(jnp.isfinite(full_norm), full_norm <= current_norm),
+        ),
+    )
+
+    def _cond(line_search_state):
+        count, _lambda, _z, _residual, _norm, accepted = line_search_state
+        return jnp.logical_and(
+            jnp.logical_not(accepted),
+            count < jnp.asarray(max_backtracks, dtype=jnp.int32),
+        )
+
+    def _body(line_search_state):
+        count, lambda_value, _z, _residual, _norm, _accepted = line_search_state
+        next_lambda = jnp.asarray(0.5, dtype=dtype) * lambda_value
+        next_z = z_cur + next_lambda * full_delta
+        next_residual = residual_fn(next_z)
+        next_norm = residual_norm_fn(next_residual)
+        next_accepted = jnp.logical_and(
+            jnp.all(jnp.isfinite(next_z)),
+            jnp.logical_and(
+                jnp.all(jnp.isfinite(next_residual)),
+                jnp.logical_and(jnp.isfinite(next_norm), next_norm <= current_norm),
+            ),
+        )
+        return (
+            count + jnp.asarray(1, dtype=jnp.int32),
+            next_lambda,
+            next_z,
+            next_residual,
+            next_norm,
+            next_accepted,
+        )
+
+    _, lambda_value, candidate_z, candidate_residual, candidate_norm, accepted = jax.lax.while_loop(
+        _cond,
+        _body,
+        (
+            jnp.asarray(0, dtype=jnp.int32),
+            jnp.asarray(1.0, dtype=dtype),
+            full_z,
+            full_residual,
+            full_norm,
+            full_accepted,
+        ),
+    )
+    return candidate_z, candidate_z - z_cur, candidate_residual, candidate_norm, lambda_value, accepted
+
+
 def _radau_run_stage_subsolve(
     kernel_context: _RadauAcceptedStepKernelContext,
     physics_context: _RadauAcceptedStepPhysicsContext,
@@ -15336,7 +15408,39 @@ def _radau_run_stage_subsolve(
             stage_residual=residual_cur,
             endpoint_scale=endpoint_newton_scale,
         )
-        z_next = z_cur + delta
+        # A refreshed quadratic tangent is local.  Its LU correction can be
+        # perfectly finite while still stepping beyond the cached response's
+        # Newton basin.  For the coloured quadratic-refresh lane, globalize
+        # *each* correction against the full cached stage residual.  This is
+        # pure cached-response algebra: it never rebuilds NTX or replaces the
+        # existing LU solve.  Keep other solver lanes byte-for-byte on their
+        # established full-step path.
+        if kernel_context.lagged_jacobian_refresh_mode == "quadratic_colored_after_first":
+            (
+                line_search_z,
+                accepted_delta,
+                _line_search_residual,
+                _line_search_residual_norm,
+                _accepted_lambda,
+                line_search_accepted,
+            ) = _radau_residual_decreasing_line_search(
+                z_cur,
+                delta,
+                lambda z: _radau_stage_subsolve_residual(
+                    kernel_context, physics_context, inputs, z
+                ),
+                lambda residual: _radau_residual_norm(kernel_context, residual),
+                dtype=kernel_context.dtype,
+            )
+            # A non-reducing correction is not a valid Newton iterate.  Keep
+            # the state finite and make the normal adaptive retry path shrink
+            # dt, rather than accepting a branch-crossing update.
+            z_next = jnp.where(line_search_accepted, line_search_z, z_cur)
+            delta = jnp.where(line_search_accepted, accepted_delta, jnp.zeros_like(delta))
+            line_search_failed = jnp.logical_not(line_search_accepted)
+        else:
+            z_next = z_cur + delta
+            line_search_failed = jnp.asarray(False)
         current_delta_norm = jnp.linalg.norm(delta)
         stage_newton_norm = _radau_correction_norm(kernel_context, delta)
         endpoint_correction_norms = _radau_endpoint_correction_defect_norms(
@@ -15432,6 +15536,7 @@ def _radau_run_stage_subsolve(
                 jnp.logical_or(residual_blowup, nonfinite_state),
             ),
         )
+        diverged_next = jnp.logical_or(diverged_next, line_search_failed)
         if kernel_context.debug_newton_trace:
             jax.debug.print(
                 "[radau-solver] iter={iter} delta_norm={delta_norm:.6e} residual_norm={residual_norm:.6e} stage_residual_defect={stage_residual_defect:.6e} newton_metric={newton_metric:.6e} newton_tol={newton_tol:.6e} theta={theta:.6e} slow={slow} blowup={blowup} nonfinite={nonfinite} diverged={diverged}",
@@ -23688,6 +23793,33 @@ class RADAUSolver(_RadauSolverConfig):
                     f"{key}={float(jax.device_get(probe[key])):.6e}"
                     for key in scalar_keys
                 )
+                outer_face_coordinate_text = ""
+                outer_face_nu_over_v = probe.get("outer_face_nu_over_v")
+                outer_face_es_over_v = probe.get("outer_face_es_over_v")
+                if outer_face_nu_over_v is not None and outer_face_es_over_v is not None:
+                    nu_values = jax.device_get(outer_face_nu_over_v)
+                    es_values = jax.device_get(outer_face_es_over_v)
+                    coordinate_summary = []
+                    for species_index, (nu_species, es_species) in enumerate(
+                        zip(nu_values, es_values, strict=True)
+                    ):
+                        safe_nu = jnp.maximum(jnp.abs(jnp.asarray(nu_species)), 1.0e-300)
+                        er_over_nu = jnp.abs(jnp.asarray(es_species)) / safe_nu
+                        coordinate_summary.append(
+                            "s{}:nu_over_v=[{:.3e},{:.3e}] Es_over_v=[{:.3e},{:.3e}] "
+                            "abs_Es_over_nu=[{:.3e},{:.3e}]".format(
+                                species_index,
+                                float(jnp.min(nu_species)),
+                                float(jnp.max(nu_species)),
+                                float(jnp.min(es_species)),
+                                float(jnp.max(es_species)),
+                                float(jnp.min(er_over_nu)),
+                                float(jnp.max(er_over_nu)),
+                            )
+                        )
+                    outer_face_coordinate_text = (
+                        " outer_face_coordinates={" + "; ".join(coordinate_summary) + "}"
+                    )
                 print(
                     "[radau-node-edge-live-probe] "
                     f"t={float(jax.device_get(step_state_before_attempt.t)):.6e} "
@@ -23700,7 +23832,8 @@ class RADAUSolver(_RadauSolverConfig):
                     "face_density_by_species="
                     f"{jax.device_get(probe['face_density_by_species']).tolist()} "
                     "face_temperature_by_species="
-                    f"{jax.device_get(probe['face_temperature_by_species']).tolist()}",
+                    f"{jax.device_get(probe['face_temperature_by_species']).tolist()}"
+                    f"{outer_face_coordinate_text}",
                     flush=True,
                 )
                 return True

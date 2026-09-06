@@ -29,7 +29,9 @@ from ._state import (
     apply_transport_temperature_floor,
     safe_density,
     safe_temperature,
+    get_v_thermal,
 )
+from ._neoclassical import _collisionality_kind
 
 DENSITY_STATE_TO_PHYSICAL = 1.0e20
 PARTICLE_FLUX_PHYSICAL_TO_STATE = 1.0e-20
@@ -3849,6 +3851,43 @@ class ComposedEquationSystem:
         live_0, live_gamma = live_at(edge)
         live_plus, _ = live_at(edge + edge_step)
         live_minus, _ = live_at(edge - edge_step)
+        # Density and temperature alone cannot establish whether the outer
+        # face is beyond the database's (nu/v, Es/v) domain: both coordinates
+        # are energy-resolved.  Reuse the direct model's local-coordinate
+        # calculation for this host-only probe; it performs no NTX solve.
+        local_scan_inputs = getattr(self.shared_flux_model, "_local_scan_inputs", None)
+        static_support = getattr(self.shared_flux_model, "_static_support", None)
+        if callable(local_scan_inputs) and callable(static_support):
+            support = static_support()
+            face_drds = jnp.asarray(support.face_channels.drds[-1])
+            face_density = safe_density(face_state_at_edge.density, self.density_floor)
+            face_temperature = face_state_at_edge.temperature
+            face_vthermal = get_v_thermal(self.shared_flux_model.species.mass, face_temperature)
+            collisionality_kind = _collisionality_kind(
+                getattr(self.shared_flux_model, "collisionality_model", "default")
+            )
+            species_indices = jnp.arange(
+                int(self.shared_flux_model.species.number_species), dtype=jnp.int32
+            )
+
+            def _outer_face_scan_inputs(species_index):
+                nu_hat, epsi_hat, _ = local_scan_inputs(
+                    drds_value=face_drds,
+                    species_index=species_index,
+                    er_value=edge,
+                    temperature_local=face_temperature[:, -1],
+                    density_local=face_density[:, -1],
+                    vthermal_local=face_vthermal[:, -1],
+                    collisionality_kind=collisionality_kind,
+                )
+                return nu_hat, epsi_hat
+
+            outer_face_nu_over_v, outer_face_es_over_v = jax.vmap(
+                _outer_face_scan_inputs
+            )(species_indices)
+        else:
+            outer_face_nu_over_v = None
+            outer_face_es_over_v = None
         return {
             "edge": edge,
             "edge_step": edge_step,
@@ -3860,6 +3899,8 @@ class ComposedEquationSystem:
             "live_gamma_by_species": live_gamma,
             "face_density_by_species": face_state_at_edge.density[:, -1],
             "face_temperature_by_species": face_state_at_edge.temperature[:, -1],
+            "outer_face_nu_over_v": outer_face_nu_over_v,
+            "outer_face_es_over_v": outer_face_es_over_v,
             "state_last_center_Er": working_state.Er[-1],
         }
 

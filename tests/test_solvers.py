@@ -156,6 +156,38 @@ def test_radau_stage_residual_defect_is_not_hidden_by_endpoint_cancellation():
     assert jnp.allclose(defect, 0.5, rtol=1.0e-12, atol=1.0e-12)
 
 
+def test_radau_residual_line_search_damps_or_reports_failure():
+    """A coloured-refresh correction must not be accepted after residual growth."""
+
+    dtype = jnp.float64
+    z0 = jnp.asarray([0.1], dtype=dtype)
+    residual = lambda z: z**2 - 1.0
+    residual_norm = lambda value: jnp.linalg.norm(value)
+
+    _, damped_delta, _, damped_norm, damped_lambda, damped_accepted = (
+        transport_solvers._radau_residual_decreasing_line_search(
+            z0,
+            jnp.asarray([10.0], dtype=dtype),
+            residual,
+            residual_norm,
+            dtype=dtype,
+        )
+    )
+    assert bool(damped_accepted)
+    assert float(damped_lambda) < 1.0
+    assert float(damped_norm) <= float(residual_norm(residual(z0)))
+    assert float(jnp.abs(damped_delta[0])) < 10.0
+
+    _, _, _, _, _, no_candidate_accepted = transport_solvers._radau_residual_decreasing_line_search(
+        z0,
+        jnp.asarray([100.0], dtype=dtype),
+        residual,
+        residual_norm,
+        dtype=dtype,
+    )
+    assert not bool(no_candidate_accepted)
+
+
 @pytest.mark.parametrize("order", [0, 6])
 def test_limm_w_config_rejects_unsupported_order(order):
     with pytest.raises(ValueError, match="limm_w_order"):
