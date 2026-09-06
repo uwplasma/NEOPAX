@@ -3486,7 +3486,21 @@ class NTXDatabaseTransportModel(TransportFluxModelBase):
         temperature_right_constraint, temperature_right_grad_constraint = _extract_right_constraints(
             self.bc_temperature, state.temperature, self.geometry.r_grid_half
         )
-        zero = jnp.zeros_like(jnp.asarray(density))
+        # A selected root contributes Gamma only.  Preserve its optional
+        # leading objective axis on the absent Q/Upar channels so the compact
+        # fixed-table transpose receives three congruent cotangent trees.
+        supplied_bars = tuple(
+            jnp.asarray(value)
+            for value in flux_bar.values()
+            if value is not None
+            and jnp.asarray(value).ndim > 0
+            and jnp.asarray(value).dtype != jax.dtypes.float0
+        )
+        zero = (
+            jnp.zeros_like(supplied_bars[0])
+            if supplied_bars
+            else jnp.zeros_like(jnp.asarray(density))
+        )
 
         def _bar(name):
             value = flux_bar.get(name, None)
