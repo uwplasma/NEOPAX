@@ -115,6 +115,26 @@ def test_radau_stage_predictor_does_not_rescale_derivative_history_after_retry()
     assert jnp.allclose(predictor, expected, rtol=1.0e-12, atol=1.0e-12)
 
 
+def test_radau_private_edge_seed_uses_accepted_state_without_touching_public_history():
+    """The floating boundary root is constant-seeded; public fields are not."""
+
+    z0 = jnp.asarray(
+        [[1.0, -2.0, 3.0], [4.0, -5.0, 6.0], [7.0, -8.0, 9.0]],
+        dtype=jnp.float64,
+    ).ravel()
+    node_cache = SimpleNamespace(transport_response=object(), er_edge_anchor=jnp.asarray(-3.0))
+    seeded = transport_solvers._radau_seed_private_edge_from_accepted_state(
+        z0, state_dim=3, lagged_response=node_cache
+    ).reshape((3, 3))
+    assert jnp.allclose(seeded[:, :-1], z0.reshape((3, 3))[:, :-1])
+    assert jnp.allclose(seeded[:, -1], 0.0)
+
+    ordinary = transport_solvers._radau_seed_private_edge_from_accepted_state(
+        z0, state_dim=3, lagged_response=object()
+    )
+    assert jnp.array_equal(ordinary, z0)
+
+
 def test_radau_stage_residual_defect_is_not_hidden_by_endpoint_cancellation():
     """Opposing stage residuals must not pass an endpoint-only Newton test."""
 
