@@ -7859,8 +7859,8 @@ def internal_realtime_geometry_transport_reverse_table_result_builder(
         # Component pullbacks are diagnostic output.  When they are not
         # requested they are discarded by the assembly below, so including
         # their database bars in the recorded scan transpose merely widens
-        # its multi-RHS batch.  That width scales with accepted-step detail
-        # and can make the otherwise single scan transpose exceed GPU memory.
+        # its multi-RHS batch and can make the otherwise single scan
+        # transpose exceed GPU memory.
         # Keep the normal benchmark to its selected objective rows only.
         component_names = (
             tuple(component_bars) if active_component_pullbacks else tuple()
