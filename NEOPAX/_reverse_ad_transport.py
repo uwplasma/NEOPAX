@@ -60,6 +60,9 @@ from ._reverse_ad_parameters import (
 )
 from ._transport_flux_models import (
     DENSITY_STATE_TO_PHYSICAL,
+    NTXDatabaseTransportModel,
+    NTXExactLijRuntimeTransportModel,
+    NTXRuntimeScanTransportModel,
     PRESSURE_SOURCE_STATE_TO_MW_M3,
     compute_net_total_power_volume_average_mw_m3,
     _add_float_delta_tree,
@@ -840,6 +843,84 @@ def implicit_scalar_root_state_pullback(residual_fn, state, root, root_bar):
     residual_bar = -jnp.asarray(root_bar, dtype=root.dtype) / safe_dres_droot
     _, state_pullback = jax.vjp(lambda state_value: residual_fn(state_value, root), state)
     return state_pullback(residual_bar)[0]
+
+
+def implicit_scalar_root_support_pullback(
+    residual_with_support_fn, state, root, root_bar, support
+):
+    """Transpose a fixed-branch scalar root to an explicit support payload.
+
+    ``residual_with_support_fn(state, root, support)`` is the same physical
+    residual used to select the primal branch.  The root scan itself remains
+    primal-only; this applies ``-(dG/dp)/(dG/dE)`` to the incoming edge-root
+    cotangent.  It is deliberately separate from the state rule because the
+    normal Radau state transform has no support-payload input.
+    """
+    root = jnp.asarray(root)
+    _, root_pullback = jax.vjp(
+        lambda value: residual_with_support_fn(state, value, support), root
+    )
+    (dres_droot,) = root_pullback(jnp.asarray(1.0, dtype=root.dtype))
+    safe_dres_droot = jnp.where(
+        jnp.abs(dres_droot) > jnp.asarray(1.0e-30, dtype=root.dtype),
+        dres_droot,
+        jnp.inf,
+    )
+    residual_bar = -jnp.asarray(root_bar, dtype=root.dtype) / safe_dres_droot
+    _, support_pullback = jax.vjp(
+        lambda support_value: residual_with_support_fn(state, root, support_value),
+        support,
+    )
+    return support_pullback(residual_bar)[0]
+
+
+def _flux_model_with_ntx_support_payload(model, support):
+    """Recursively bind an existing differentiable NTX support payload."""
+    if model is None or not dataclasses.is_dataclass(model) or isinstance(model, type):
+        return model, False
+    # The transport reverse uses a combined payload for exact Lij
+    # (``{geometry, ntx_support}``) and a recorded-database payload for the
+    # runtime scan (``{geometry, database}``).  Rebind each model to the
+    # payload shape it owns; passing the wrapper dictionary to exact Lij would
+    # silently give it the wrong pytree.
+    geometry = support.get("geometry") if isinstance(support, dict) else None
+    if isinstance(model, NTXDatabaseTransportModel):
+        if not isinstance(support, dict) or "database" not in support:
+            return model, False
+        updates = {"database": support["database"]}
+        if geometry is not None:
+            updates["geometry"] = geometry
+        return dataclasses.replace(model, **updates), True
+    if isinstance(model, NTXExactLijRuntimeTransportModel):
+        exact_support = support.get("ntx_support", support) if isinstance(support, dict) else support
+        updates = {"support": exact_support}
+        if geometry is not None:
+            updates["geometry"] = geometry
+        return dataclasses.replace(model, **updates), True
+    if isinstance(model, NTXRuntimeScanTransportModel):
+        if not isinstance(support, dict):
+            return model, False
+        return model.with_support_payload(support), True
+    binder = getattr(model, "with_support_payload", None)
+    if callable(binder):
+        return binder(support), True
+    updates = {}
+    if geometry is not None:
+        if hasattr(model, "geometry"):
+            updates["geometry"] = geometry
+        elif hasattr(model, "field"):
+            updates["field"] = geometry
+    changed = False
+    for field in dataclasses.fields(model):
+        value = getattr(model, field.name)
+        if dataclasses.is_dataclass(value) and not isinstance(value, type):
+            updated_value, child_changed = _flux_model_with_ntx_support_payload(
+                value, support
+            )
+            if child_changed:
+                updates[field.name] = updated_value
+                changed = True
+    return (dataclasses.replace(model, **updates), True) if changed else (model, False)
 
 
 def parameterized_profile_set(
@@ -3228,6 +3309,46 @@ def reverse_initial_carry_from_state_with_static_setup(
             _, project_pullback = jax.vjp(project_flat, flat_state0)
             lagged_flat_bars = jax.vmap(project_pullback)(lagged_flat_bars)[0]
         total_flat_bars = direct_flat_bars + lagged_flat_bars
+
+        # The private endpoint coordinate was initialized by a scalar
+        # ambipolar root before Radau began.  The ordinary response support
+        # pullback above correctly treats the coordinate as an independent
+        # Radau unknown; add its omitted *initial-root* dependence on the
+        # NTX/geometry support payload here.  The public TransportState still
+        # has no edge leaf.
+        if node_edge0 is not None and callable(node_residual):
+            edge_value = node_edge0[0]
+
+            def _node_residual_with_support(state_inner, edge_inner, support_inner):
+                rebound_flux_model, rebound = _flux_model_with_ntx_support_payload(
+                    node_owner.shared_flux_model, support_inner
+                )
+                if not rebound:
+                    # A support tree with no NTX-owned leaf cannot affect this
+                    # residual.  Keep the same primal residual so its VJP is
+                    # structurally zero rather than fabricating a dependency.
+                    return node_residual(state_inner, edge_inner)
+                rebound_owner = dataclasses.replace(
+                    node_owner, shared_flux_model=rebound_flux_model
+                )
+                return rebound_owner.node_boundary_charge_residual(
+                    state_inner, edge_inner
+                )
+
+            edge_support_bars = jax.vmap(
+                lambda edge_bar: implicit_scalar_root_support_pullback(
+                    _node_residual_with_support,
+                    state_value,
+                    edge_value,
+                    edge_bar,
+                    support_payload,
+                )
+            )(total_flat_bars[:, -1])
+            support_bars = jax.tree_util.tree_map(
+                lambda accumulated, edge: accumulated + edge,
+                support_bars,
+                edge_support_bars,
+            )
         _, state_pullback = jax.vjp(_flat_state_from_state, state_value)
         state_bars = jax.vmap(lambda flat_bar: state_pullback(flat_bar)[0])(
             total_flat_bars

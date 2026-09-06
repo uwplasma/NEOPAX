@@ -1246,6 +1246,27 @@ def test_fixed_branch_scalar_root_pullback_matches_implicit_derivative():
     assert jnp.allclose(state_bar.density, jnp.zeros_like(state.density))
 
 
+def test_fixed_branch_scalar_root_support_pullback_matches_implicit_derivative():
+    """The private edge root also contributes to NTX/geometry support bars."""
+    state = TransportState(
+        density=jnp.asarray([[1.0, 4.0]]),
+        pressure=jnp.asarray([[1.0, 1.0]]),
+        Er=jnp.asarray([0.0, 4.0]),
+    )
+    support = {"edge_shift": jnp.asarray(2.0)}
+
+    def residual(state_value, edge_value, support_value):
+        return edge_value * edge_value - state_value.Er[-1] - support_value["edge_shift"]
+
+    support_bar = reverse_transport.implicit_scalar_root_support_pullback(
+        residual, state, jnp.sqrt(jnp.asarray(6.0)), jnp.asarray(3.0), support
+    )
+    # dE/dshift=1/(2E), multiplied by the incoming root bar 3.
+    assert jnp.allclose(
+        support_bar["edge_shift"], 3.0 / (2.0 * jnp.sqrt(jnp.asarray(6.0)))
+    )
+
+
 def test_radau_endpoint_defect_correction_runs_on_nonlinear_lagged_rhs():
     class QuadraticLaggedField:
         def __call__(self, _t, y):

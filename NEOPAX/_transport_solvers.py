@@ -14604,6 +14604,36 @@ def _radau_run_stage_subsolve(
     # frozen at y_n for the entire attempted step.
     endpoint_newton_scale = _radau_frozen_endpoint_error_scale(kernel_context, inputs.flat_y)
 
+    # The floating-edge formulation appends one *private* Radau coordinate to
+    # the flattened solve vector.  It is not part of TransportState, so the
+    # ordinary stage-state trace can only report it after Newton has finished.
+    # Print its predictor explicitly here, before the first Newton correction,
+    # to distinguish a bad history predictor from a Newton/LU excursion.  This
+    # is cache-only algebra: no additional RHS or NTX evaluation is made.
+    node_edge_trace = (
+        kernel_context.debug_newton_trace
+        and hasattr(inputs.lagged_response, "transport_response")
+        and hasattr(inputs.lagged_response, "er_edge_anchor")
+    )
+    if node_edge_trace:
+        z0_stages = inputs.z0.reshape((kernel_context.num_stages, kernel_context.state_dim))
+        predictor_edge = inputs.flat_y[-1] + inputs.h_value * (kernel_context.a @ z0_stages[:, -1])
+        predictor_delta = predictor_edge - inputs.flat_y[-1]
+        predictor_max_stage = jnp.argmax(jnp.abs(predictor_delta))
+        jax.debug.print(
+            "[radau-node-edge-newton] phase=predictor t={t:.6e} h={h:.6e} "
+            "edge_base={edge_base:.6e} anchor={anchor:.6e} "
+            "edge_stage_max={edge_stage:.6e} delta_max={delta:.6e} stage={stage}",
+            t=inputs.t_value,
+            h=inputs.h_value,
+            edge_base=inputs.flat_y[-1],
+            anchor=inputs.lagged_response.er_edge_anchor,
+            edge_stage=predictor_edge[predictor_max_stage],
+            delta=predictor_delta[predictor_max_stage],
+            stage=predictor_max_stage,
+            ordered=True,
+        )
+
     def body_fn(newton_state):
         (
             iter_idx,
@@ -14751,6 +14781,24 @@ def _radau_run_stage_subsolve(
                 blowup=residual_blowup,
                 nonfinite=nonfinite_state,
                 diverged=diverged_next,
+            )
+        if node_edge_trace:
+            z_cur_stages = z_cur.reshape((kernel_context.num_stages, kernel_context.state_dim))
+            z_next_stages = z_next.reshape((kernel_context.num_stages, kernel_context.state_dim))
+            edge_before = inputs.flat_y[-1] + inputs.h_value * (kernel_context.a @ z_cur_stages[:, -1])
+            edge_after = inputs.flat_y[-1] + inputs.h_value * (kernel_context.a @ z_next_stages[:, -1])
+            edge_change = edge_after - edge_before
+            edge_stage_index = jnp.argmax(jnp.abs(edge_change))
+            jax.debug.print(
+                "[radau-node-edge-newton] phase=update iter={iter} "
+                "edge_before={edge_before:.6e} edge_after={edge_after:.6e} "
+                "delta={edge_delta:.6e} stage={stage}",
+                iter=iter_idx + 1,
+                edge_before=edge_before[edge_stage_index],
+                edge_after=edge_after[edge_stage_index],
+                edge_delta=edge_change[edge_stage_index],
+                stage=edge_stage_index,
+                ordered=True,
             )
         return (
             iter_idx + 1,
