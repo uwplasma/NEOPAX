@@ -13214,12 +13214,45 @@ def _radau_quadratic_colored_jacobian_update(
             "quadratic_colored_after_first requires an explicit cached-response tangent; "
             "the active transport RHS does not provide one."
         )
-    layout, state_indices = _radau_radial_state_index_map(kernel_context)
+    # A floating ambipolar edge node is appended privately to the otherwise
+    # component-major transport vector.  The three-colour recovery remains a
+    # core finite-volume operation; the one edge row/column is recovered with
+    # local cached-response probes below.
+    full_state_dim = int(kernel_context.state_dim)
+    core_er_size = int(kernel_context.er_size)
+    core_state_dim = full_state_dim
+    core_context = kernel_context
+    has_private_edge_node = False
+    # Do not infer the full augmented vector as radial: with 52 Er entries
+    # and four species it can accidentally admit a false 4-point layout.
+    # Instead, test the only valid private-node interpretation first.
+    if core_er_size >= 2 and full_state_dim >= 2:
+        candidate_context = dataclasses.replace(
+            kernel_context,
+            state_dim=full_state_dim - 1,
+            er_size=core_er_size - 1,
+        )
+        try:
+            candidate_layout = _radau_infer_radial_block_layout(candidate_context)
+            if int(candidate_layout.n_radial) == core_er_size - 1:
+                has_private_edge_node = True
+                core_state_dim = full_state_dim - 1
+                core_context = candidate_context
+        except ValueError:
+            pass
+    core_layout = _radau_infer_radial_block_layout(core_context)
+    nominal_core_dim = int(core_layout.n_radial) * int(core_layout.variables_per_cell)
+    if core_state_dim != nominal_core_dim:
+        raise ValueError(
+            "quadratic_colored_after_first received a state incompatible with "
+            "the radial transport layout."
+        )
+    layout, state_indices = _radau_radial_state_index_map(core_context)
     n_radial = int(layout.n_radial)
     variables_per_cell = int(layout.variables_per_cell)
-    state_dim = int(kernel_context.state_dim)
+    state_dim = core_state_dim
     colors = jnp.mod(jnp.arange(n_radial, dtype=jnp.int32), 3)
-    directions = jnp.zeros((3 * variables_per_cell, state_dim), dtype=kernel_context.dtype)
+    directions = jnp.zeros((3 * variables_per_cell, full_state_dim), dtype=kernel_context.dtype)
     for color in range(3):
         color_mask = (colors == color).astype(kernel_context.dtype)
         for component in range(variables_per_cell):
@@ -13267,6 +13300,41 @@ def _radau_quadratic_colored_jacobian_update(
     ].set(correction_radial)
     updated_jacobian = jacobian_anchor + correction_flat
 
+    if has_private_edge_node:
+        # The native outer-face residual couples to the private edge value and
+        # to the final finite-volume stencil only.  Recover its column exactly
+        # with one cached tangent, then recover the changed node row on the
+        # last two radial blocks (density, pressure, and Er at each point).
+        # This preserves the normal dense LU factorization and costs no NTX
+        # calls or dense state Jacobian.
+        node_index = core_state_dim
+        node_direction = jax.nn.one_hot(
+            node_index, full_state_dim, dtype=kernel_context.dtype
+        )
+        node_tangent = flat_rhs_lagged_response_tangent(
+            t_value, flat_y, node_direction, lagged_response
+        )
+        node_anchor = node_direction @ jacobian_anchor.T
+        updated_jacobian = updated_jacobian.at[:, node_index].add(
+            node_tangent - node_anchor
+        )
+
+        local_start = max(n_radial - 2, 0)
+        local_indices = state_indices[local_start:, :].reshape((-1,))
+        local_directions = jax.nn.one_hot(
+            local_indices, full_state_dim, dtype=kernel_context.dtype
+        )
+        local_tangents = jax.lax.map(
+            lambda direction: flat_rhs_lagged_response_tangent(
+                t_value, flat_y, direction, lagged_response
+            ),
+            local_directions,
+        )
+        local_anchor = local_directions @ jacobian_anchor.T
+        updated_jacobian = updated_jacobian.at[node_index, local_indices].add(
+            (local_tangents - local_anchor)[:, node_index]
+        )
+
     if getattr(kernel_context, "debug_newton_trace", False):
         # This is an exact consistency check for the same colored probes
         # already needed by recovery: it performs no additional tangent or
@@ -13274,9 +13342,18 @@ def _radau_quadratic_colored_jacobian_update(
         # quadratic Jacobian is genuinely captured by the assumed local
         # block-tridiagonal stencil.  Any remainder is the omitted nonlocal
         # part of that *Jacobian change*, rather than a Newton residual.
-        recovered_tangent_values = directions @ updated_jacobian.T
-        omitted_values = tangent_values - recovered_tangent_values
-        exact_norms = jnp.linalg.norm(tangent_values, axis=1)
+        audit_directions = directions
+        audit_tangent_values = tangent_values
+        if has_private_edge_node:
+            audit_directions = jnp.concatenate(
+                (directions, node_direction[None, :], local_directions), axis=0
+            )
+            audit_tangent_values = jnp.concatenate(
+                (tangent_values, node_tangent[None, :], local_tangents), axis=0
+            )
+        recovered_tangent_values = audit_directions @ updated_jacobian.T
+        omitted_values = audit_tangent_values - recovered_tangent_values
+        exact_norms = jnp.linalg.norm(audit_tangent_values, axis=1)
         omitted_norms = jnp.linalg.norm(omitted_values, axis=1)
         relative_norms = omitted_norms / jnp.maximum(
             exact_norms, kernel_context.tiny_scalar
@@ -13285,7 +13362,7 @@ def _radau_quadratic_colored_jacobian_update(
             "[radau-colored-jacobian-audit] jvp_relative_rms={relative_rms:.6e} "
             "jvp_relative_max={relative_max:.6e} jvp_omitted_abs_max={omitted_abs_max:.6e}",
             relative_rms=jnp.linalg.norm(omitted_values) / jnp.maximum(
-                jnp.linalg.norm(tangent_values), kernel_context.tiny_scalar
+                jnp.linalg.norm(audit_tangent_values), kernel_context.tiny_scalar
             ),
             relative_max=jnp.max(relative_norms),
             omitted_abs_max=jnp.max(omitted_norms),
@@ -21293,6 +21370,32 @@ def _build_prepared_radau_accepted_rollout(
             )
             return jnp.concatenate((core_pack_state(core_rhs), jnp.reshape(edge_rhs, (1,))))
 
+        def _node_lagged_rhs_tangent(t_value, flat_y, flat_direction, cache):
+            def _project(value):
+                return _node_project_flat(value)
+
+            projected, projected_direction = jax.jvp(
+                _project, (flat_y,), (flat_direction,)
+            )
+            cache = (
+                cache
+                if isinstance(cache, _RadauNodeBoundaryLaggedCache)
+                else _node_build_from_flat(projected)
+            )
+            core_tangent, edge_tangent = (
+                owner.evaluate_node_boundary_with_lagged_response_tangent(
+                    _node_unpack_flat(projected),
+                    _node_unpack_flat(projected_direction),
+                    projected[-1],
+                    projected_direction[-1],
+                    cache.transport_response,
+                    er_edge_anchor=cache.er_edge_anchor,
+                )
+            )
+            return jnp.concatenate(
+                (core_pack_state(core_tangent), jnp.reshape(edge_tangent, (1,)))
+            )
+
         setattr(
             _node_unpack_flat,
             "radau_node_build_lagged_response_from_flat",
@@ -21307,6 +21410,7 @@ def _build_prepared_radau_accepted_rollout(
             t_value, flat_y, _node_build_from_flat(flat_y)
         )
         flat_rhs_with_lagged_response = _node_lagged_rhs
+        flat_rhs_with_lagged_response_tangent = _node_lagged_rhs_tangent
         # Existing model hooks map the public three-field state only.  Let the
         # generic VJP see the augmented edge coordinate until node-aware
         # specialized hooks are supplied.
@@ -21315,10 +21419,13 @@ def _build_prepared_radau_accepted_rollout(
         flat_rhs_state_pullback = None
         flat_rhs_state_and_lagged_response_pullback = None
         flat_rhs_lagged_response_all_pullback = None
-        if str(getattr(solver, "lagged_jacobian_refresh_mode", "none")).strip().lower() != "none":
+        if str(getattr(solver, "lagged_jacobian_refresh_mode", "none")).strip().lower() not in {
+            "none", "quadratic_colored_after_first"
+        }:
             raise ValueError(
-                "floating_ambipolar_edge_node does not yet support "
-                "radau_lagged_jacobian_refresh_mode; use 'none'."
+                "floating_ambipolar_edge_node supports only 'none' or "
+                "'quadratic_colored_after_first' for "
+                "radau_lagged_jacobian_refresh_mode."
             )
     if (
         str(getattr(solver, "lagged_jacobian_refresh_mode", "none")).strip().lower()
@@ -22137,6 +22244,32 @@ class RADAUSolver(_RadauSolverConfig):
                 )
                 return jnp.concatenate((_core_pack_state(core_rhs), jnp.reshape(edge_rhs, (1,))))
 
+            def _node_lagged_rhs_tangent(t_value, flat_y, flat_direction, cache):
+                def _project(value):
+                    return _node_project_flat(value)
+
+                projected, projected_direction = jax.jvp(
+                    _project, (flat_y,), (flat_direction,)
+                )
+                cache = (
+                    cache
+                    if isinstance(cache, _RadauNodeBoundaryLaggedCache)
+                    else _node_build_from_flat(projected)
+                )
+                core_tangent, edge_tangent = (
+                    owner.evaluate_node_boundary_with_lagged_response_tangent(
+                        _node_unpack_flat(projected),
+                        _node_unpack_flat(projected_direction),
+                        projected[-1],
+                        projected_direction[-1],
+                        cache.transport_response,
+                        er_edge_anchor=cache.er_edge_anchor,
+                    )
+                )
+                return jnp.concatenate(
+                    (_core_pack_state(core_tangent), jnp.reshape(edge_tangent, (1,)))
+                )
+
             setattr(
                 _node_unpack_flat,
                 "radau_node_build_lagged_response_from_flat",
@@ -22160,13 +22293,14 @@ class RADAUSolver(_RadauSolverConfig):
                 t_value, flat_y, _node_build_from_flat(flat_y)
             )
             flat_rhs_with_lagged_response = _node_lagged_rhs
-            # The coloured stage refresh needs the full analytic node tangent;
-            # until that dedicated custom rule is added, reject that opt-in
-            # mode rather than silently taking a finite difference.
-            if str(getattr(self, "lagged_jacobian_refresh_mode", "none")).strip().lower() != "none":
+            flat_rhs_with_lagged_response_tangent = _node_lagged_rhs_tangent
+            if str(getattr(self, "lagged_jacobian_refresh_mode", "none")).strip().lower() not in {
+                "none", "quadratic_colored_after_first"
+            }:
                 raise ValueError(
-                    "floating_ambipolar_edge_node does not yet support "
-                    "radau_lagged_jacobian_refresh_mode; use 'none'."
+                    "floating_ambipolar_edge_node supports only 'none' or "
+                    "'quadratic_colored_after_first' for "
+                    "radau_lagged_jacobian_refresh_mode."
                 )
             build_lagged_response_from_flat = _node_build_from_flat
         if (

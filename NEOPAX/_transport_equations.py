@@ -3466,6 +3466,103 @@ class ComposedEquationSystem:
         edge_rhs = er_eq.edge_rhs(working_state, fluxes=shared_fluxes, er_edge_override=er_edge)
         return core_rhs, edge_rhs
 
+    def evaluate_node_boundary_with_lagged_response_tangent(
+        self,
+        state,
+        state_direction,
+        er_edge,
+        er_edge_direction,
+        transport_response,
+        *,
+        er_edge_anchor,
+    ):
+        """Directional derivative of the private floating-edge node RHS.
+
+        This is deliberately a cached-response rule: the centre-state
+        contribution uses the model's explicit lagged tangent, while the one
+        private edge coordinate is differentiated only through cached flux
+        algebra.  Neither route rebuilds or differentiates an NTX solve.
+        """
+        _density_eq, _temperature_eq, er_eq = self._resolve_equations()
+        if er_eq is None or er_eq.boundary_mode != "floating_ambipolar_edge_node":
+            raise ValueError("Node boundary tangent requested without floating_ambipolar_edge_node.")
+        if self.shared_flux_model is None:
+            raise ValueError("floating_ambipolar_edge_node requires a shared flux model.")
+
+        def _working_state_only(state_value):
+            return self._prepare_working_state(state_value)[0]
+
+        working_state, working_direction = jax.jvp(
+            _working_state_only, (state,), (state_direction,)
+        )
+        _working_reference, eidx = self._prepare_working_state(state)
+        flux_kwargs = self._shared_flux_call_kwargs({
+            "er_edge_override": er_edge,
+            "er_edge_anchor": er_edge_anchor,
+        })
+        shared_fluxes = self.shared_flux_model.evaluate_with_lagged_response(
+            working_state, transport_response, **flux_kwargs
+        )
+        tangent_fn = getattr(self.shared_flux_model, "evaluate_with_lagged_response_tangent", None)
+        if not callable(tangent_fn):
+            raise NotImplementedError(
+                "The active shared flux model does not expose a cached-response tangent."
+            )
+        state_flux_direction = tangent_fn(
+            working_state, working_direction, transport_response, **flux_kwargs
+        )
+
+        # The generic model tangent accepts a TransportState direction only.
+        # Obtain the one scalar edge contribution by JVP of the already-built
+        # response evaluation, never through build_lagged_response.
+        def _flux_from_edge(edge_value):
+            return self.shared_flux_model.evaluate_with_lagged_response(
+                working_state,
+                transport_response,
+                **self._shared_flux_call_kwargs({
+                    "er_edge_override": edge_value,
+                    "er_edge_anchor": er_edge_anchor,
+                }),
+            )
+
+        _, edge_flux_direction = jax.jvp(
+            _flux_from_edge, (er_edge,), (er_edge_direction,)
+        )
+        # Flux payloads can contain integer/index metadata.  Their JVP leaves
+        # must remain float0; only numerical leaves participate in the sum.
+        def _sum_flux_tangent(primal, state_part, edge_part):
+            primal_array = jnp.asarray(primal)
+            if jnp.issubdtype(primal_array.dtype, jnp.inexact):
+                return state_part + edge_part
+            return jnp.zeros_like(primal_array, dtype=jax.dtypes.float0)
+
+        flux_direction = jax.tree_util.tree_map(
+            _sum_flux_tangent,
+            shared_fluxes,
+            state_flux_direction,
+            edge_flux_direction,
+        )
+
+        def _assemble(working_state_value, flux_value, edge_value):
+            core = self._evaluate_with_shared_fluxes_from_working_state(
+                working_state_value,
+                eidx,
+                state,
+                flux_value,
+                er_edge_override=edge_value,
+            )
+            edge = er_eq.edge_rhs(
+                working_state_value, fluxes=flux_value, er_edge_override=edge_value
+            )
+            return core, edge
+
+        _, tangent = jax.jvp(
+            _assemble,
+            (working_state, shared_fluxes, er_edge),
+            (working_direction, flux_direction, er_edge_direction),
+        )
+        return tangent
+
     def debug_node_boundary_live_vs_lagged(
         self,
         state,

@@ -1146,6 +1146,25 @@ def test_radau_floating_edge_node_uses_private_augmented_coordinate():
             )
             return core, -0.5 * er_edge
 
+        def evaluate_node_boundary_with_lagged_response_tangent(
+            self,
+            state,
+            state_direction,
+            er_edge,
+            er_edge_direction,
+            transport_response,
+            *,
+            er_edge_anchor,
+        ):
+            del state, er_edge, transport_response, er_edge_anchor
+            er_rhs = -state_direction.Er
+            er_rhs = er_rhs.at[-1].add(-0.25 * er_edge_direction)
+            return TransportState(
+                density=-0.1 * state_direction.density,
+                pressure=-0.1 * state_direction.pressure,
+                Er=er_rhs,
+            ), -0.5 * er_edge_direction
+
     state0 = TransportState(
         density=jnp.ones((1, 2)),
         pressure=jnp.ones((1, 2)),
@@ -1158,6 +1177,8 @@ def test_radau_floating_edge_node_uses_private_augmented_coordinate():
         rtol=1.0e-6,
         atol=1.0e-8,
         rhs_mode="lagged_transport_response",
+        lagged_jacobian_refresh_mode="quadratic_colored_after_first",
+        lagged_jacobian_refresh_threshold=1.0e-16,
         error_estimator="embedded2_ntss_transport_scale",
         debug_stage_markers=True,
         maxiter=8,
