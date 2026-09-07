@@ -1105,19 +1105,19 @@ def _nu_over_vnew_local_directional_default(
     return _jet_divide(collision_sum, v_new)
 
 
-def _ntx_es_cap_in_state_units(er_tilde_max, er_tilde_to_er, drds_value):
-    """Convert the scan's SI ``Es`` limit to NEOPAX's kV/m state units.
+def _ntx_epsi_cap_from_er_tilde(er_tilde_max, er_tilde_to_er, drds_value):
+    """Return the database scan's bound in NTX ``epsi_hat`` coordinates.
 
-    ``Er`` in :class:`TransportState` is kV/m, whereas the NTX scan channels
-    ``Er_tilde * dr_tildeds * B00`` are V/m.  The caller applies the usual
-    ``1e3`` conversion only after this cap has been imposed, so the cap itself
-    must be converted first.
+    ``ntx_scan_er_tilde`` generates the scan input
+    ``epsi_hat = Er_tilde * dr_tildeds * B00``.  It is consequently a bound
+    on the energy-resolved NTX coordinate, not a physical ``Er`` or ``Es``
+    bound.  Realtime must cap only after forming ``Es / v_new``.
     """
     return jnp.abs(
         jnp.asarray(er_tilde_max, dtype=jnp.float64)
         * jnp.asarray(er_tilde_to_er, dtype=jnp.float64)
         * jnp.asarray(drds_value, dtype=jnp.float64)
-    ) / 1.0e3
+    )
 
 
 def _local_scan_inputs_directional_default(
@@ -1141,22 +1141,20 @@ def _local_scan_inputs_directional_default(
     v_new_a = _jet_multiply(jnp.asarray(energy_grid.v_norm), vth_a)
     finite_drds = jnp.isfinite(drds_value)
     safe_drds = jnp.where(finite_drds, drds_value, jnp.asarray(0.0, dtype=vth_a.value.dtype))
-    # The configured maximum is the same normalized er_tilde coordinate as
-    # the runtime-scan database.  Convert it to Es at this radius before the
-    # energy-dependent division by v_new:
-    # Es_max = er_tilde_max * (2 * psia / a_b**2) * drds.
+    # The configured maximum is the same energy-resolved epsi_hat coordinate
+    # used by the runtime-scan database.  It must be applied after Es/v_new.
     er_times_drds = _jet_multiply(safe_drds, er_value)
+    epsi_hat = _jet_divide(_jet_multiply(1.0e3, er_times_drds), v_new_a)
     if er_tilde_max is not None:
         if er_tilde_to_er is None:
             raise ValueError("A normalized NTX Er cap requires the scan geometry scale.")
-        es_cap = _ntx_es_cap_in_state_units(
+        epsi_cap = _ntx_epsi_cap_from_er_tilde(
             er_tilde_max, er_tilde_to_er, safe_drds
         )
-        sign = jnp.where(er_times_drds.value < 0.0, -1.0, 1.0)
-        es_abs = _jet_abs(er_times_drds)
-        es_abs = _jet_negate(maximum_with_constant_floor(_jet_negate(es_abs), -es_cap))
-        er_times_drds = _jet_multiply(sign, es_abs)
-    epsi_hat = _jet_divide(_jet_multiply(1.0e3, er_times_drds), v_new_a)
+        sign = jnp.where(epsi_hat.value < 0.0, -1.0, 1.0)
+        epsi_abs = _jet_abs(epsi_hat)
+        epsi_abs = _jet_negate(maximum_with_constant_floor(_jet_negate(epsi_abs), -epsi_cap))
+        epsi_hat = _jet_multiply(sign, epsi_abs)
     if er_v_floor is not None:
         sign = jnp.where(epsi_hat.value < 0.0, -1.0, 1.0)
         epsi_abs = maximum_with_constant_floor(_jet_abs(epsi_hat), er_v_floor)
@@ -6612,19 +6610,19 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             jnp.asarray(er_value * drds_value, dtype=jnp.result_type(er_value, drds_value, jnp.float64)),
             jnp.asarray(0.0, dtype=jnp.result_type(er_value, drds_value, jnp.float64)),
         )
+        epsi_hat_a = er_times_drds * 1.0e3 / v_new_a
         if self.er_tilde_max is not None:
-            es_cap = _ntx_es_cap_in_state_units(
+            epsi_cap = _ntx_epsi_cap_from_er_tilde(
                 self.er_tilde_max,
                 self._er_tilde_to_er_scale(),
                 drds_value,
             )
-            sign = jnp.where(er_times_drds < 0.0, -1.0, 1.0)
-            er_times_drds = jnp.where(
+            sign = jnp.where(epsi_hat_a < 0.0, -1.0, 1.0)
+            epsi_hat_a = jnp.where(
                 drds_is_finite,
-                sign * jnp.minimum(jnp.abs(er_times_drds), es_cap),
+                sign * jnp.minimum(jnp.abs(epsi_hat_a), epsi_cap),
                 jnp.asarray(0.0, dtype=jnp.float64),
             )
-        epsi_hat_a = er_times_drds * 1.0e3 / v_new_a
         if self.er_v_floor is not None:
             er_v_floor = jnp.asarray(self.er_v_floor, dtype=jnp.float64)
             sign = jnp.where(epsi_hat_a < 0.0, -1.0, 1.0)
