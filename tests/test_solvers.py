@@ -1458,9 +1458,10 @@ def test_radau_node_edge_live_probe_reaches_host_callback():
         error_estimator="embedded2_ntss_transport_scale",
         debug_walltime_attempts=True,
         # The ordinary stage-state trace is the reliable arming path.  It is
-        # already active in the expensive diagnostic configuration, so a
-        # dropped optional TOML key cannot silently disable this probe.
+        # separate explicit tag is required: ordinary stage tracing must not
+        # make a production run stop after a host-side live probe.
         debug_stage_state_trace=True,
+        debug_node_edge_live_probe=True,
         maxiter=8,
         max_steps=32,
     )

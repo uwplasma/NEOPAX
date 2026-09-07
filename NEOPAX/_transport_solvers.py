@@ -3757,6 +3757,7 @@ class _RadauSolverConfig(TransportSolver):
     debug_newton_bracket: bool = False
     debug_newton_dt_stall: bool = False
     debug_stage_state_trace: bool = False
+    debug_node_edge_live_probe: bool = False
     debug_node_edge_live_probe_jacobian_threshold: float | None = None
 
     def __init__(
@@ -3810,6 +3811,7 @@ class _RadauSolverConfig(TransportSolver):
         debug_newton_bracket: bool = False,
         debug_newton_dt_stall: bool = False,
         debug_stage_state_trace: bool = False,
+        debug_node_edge_live_probe: bool = False,
         debug_node_edge_live_probe_jacobian_threshold: float | None = None,
         save_n=None,
     ):
@@ -4135,6 +4137,7 @@ class _RadauSolverConfig(TransportSolver):
         object.__setattr__(self, "debug_newton_bracket", bool(debug_newton_bracket))
         object.__setattr__(self, "debug_newton_dt_stall", bool(debug_newton_dt_stall))
         object.__setattr__(self, "debug_stage_state_trace", bool(debug_stage_state_trace))
+        object.__setattr__(self, "debug_node_edge_live_probe", bool(debug_node_edge_live_probe))
         probe_threshold = (
             None
             if debug_node_edge_live_probe_jacobian_threshold is None
@@ -23862,18 +23865,13 @@ class RADAUSolver(_RadauSolverConfig):
         node_edge_live_probe_threshold = getattr(
             self, "debug_node_edge_live_probe_jacobian_threshold", None
         )
-        # ``radau_debug_stage_state_trace`` already means that the caller has
-        # explicitly opted into an expensive, host-visible stage diagnostic.
-        # Use it as the reliable arming path for the one decisive node-edge
-        # comparison.  The previous opt-in was silently absent when a config
-        # layer failed to propagate its new key, so the requested probe never
-        # ran.  A caller-provided threshold still takes precedence.
-        probe_armed_by_stage_trace = (
-            node_edge_live_probe_threshold is None
-            and use_node_boundary
-            and bool(getattr(self, "debug_stage_state_trace", False))
+        # Stage-state tracing and the host-side live edge probe are separate
+        # diagnostics. The latter is expensive and intentionally stops after
+        # its first hit, so trace printing must never arm it implicitly.
+        probe_explicitly_enabled = bool(
+            getattr(self, "debug_node_edge_live_probe", False)
         )
-        if probe_armed_by_stage_trace:
+        if probe_explicitly_enabled and node_edge_live_probe_threshold is None:
             node_edge_live_probe_threshold = 1.0e5
         if node_edge_live_probe_threshold is not None:
             if not use_node_boundary:
@@ -23892,7 +23890,7 @@ class RADAUSolver(_RadauSolverConfig):
             print(
                 "[radau-node-edge-live-probe] armed "
                 f"jacobian_threshold={node_edge_live_probe_threshold:.6e} "
-                f"source={'stage_state_trace' if probe_armed_by_stage_trace else 'toml'}",
+                f"source={'boolean_tag' if probe_explicitly_enabled else 'threshold_tag'}",
                 flush=True,
             )
 
@@ -28882,6 +28880,9 @@ def build_time_solver(solver_parameters: Any, solver_override: Any = None) -> Tr
             debug_newton_bracket=bool(_cfg_get("radau_debug_newton_bracket", False)),
             debug_newton_dt_stall=bool(_cfg_get("radau_debug_newton_dt_stall", False)),
             debug_stage_state_trace=bool(_cfg_get("radau_debug_stage_state_trace", False)),
+            debug_node_edge_live_probe=bool(
+                _cfg_get("radau_debug_node_edge_live_probe", False)
+            ),
             debug_node_edge_live_probe_jacobian_threshold=_cfg_get(
                 "radau_debug_node_edge_live_probe_jacobian_threshold"
             ),
