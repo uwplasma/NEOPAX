@@ -179,6 +179,47 @@ def test_radau_frozen_stage_matrix_action_matches_i_minus_h_a_kron_j():
     assert jnp.allclose(observed, expected, rtol=1.0e-12, atol=1.0e-12)
 
 
+def test_radau_cached_stage_residual_is_independent_of_frozen_jacobian():
+    """The cached nonlinear response, not ``J_ref``, defines Radau's R(Z).
+
+    This is the invariant needed by a later triggered Jacobian refresh: a
+    refreshed matrix may change the Newton correction, but it must not change
+    the equation whose root is accepted or differentiated in reverse.
+    """
+    dtype = jnp.float64
+    context = types.SimpleNamespace(
+        num_stages=2,
+        state_dim=1,
+        a=jnp.asarray([[0.25, 0.0], [0.5, 0.25]], dtype=dtype),
+        c=jnp.asarray([0.5, 1.0], dtype=dtype),
+        use_lagged_linear_response=False,
+    )
+    physics = types.SimpleNamespace(
+        flat_rhs=lambda _t, y: -999.0 * y,
+        flat_rhs_with_lagged_response=lambda _t, y, cache: y * y + cache,
+    )
+    z = jnp.asarray([1.5, -0.25], dtype=dtype)
+    common = dict(
+        flat_y=jnp.asarray([0.4], dtype=dtype),
+        t_value=jnp.asarray(0.2, dtype=dtype),
+        h_value=jnp.asarray(0.1, dtype=dtype),
+        z_flat=z,
+        f0=jnp.asarray([123.0], dtype=dtype),
+        lagged_response=jnp.asarray([0.3], dtype=dtype),
+    )
+    residual_a = transport_solvers._radau_stage_residual(
+        context, physics, jacobian_ref=jnp.asarray([[0.0]], dtype=dtype), **common
+    )
+    residual_b = transport_solvers._radau_stage_residual(
+        context, physics, jacobian_ref=jnp.asarray([[1.0e12]], dtype=dtype), **common
+    )
+
+    stage_states = common["flat_y"] + common["h_value"] * (context.a @ z[:, None])
+    expected = z[:, None] - (stage_states * stage_states + common["lagged_response"])
+    assert jnp.allclose(residual_a, expected.ravel(), rtol=1.0e-12, atol=1.0e-12)
+    assert jnp.array_equal(residual_a, residual_b)
+
+
 def test_radau_residual_line_search_damps_or_reports_failure():
     """A coloured-refresh correction must not be accepted after residual growth."""
 
@@ -1174,6 +1215,19 @@ def test_build_time_solver_radau_accepts_stage_drift_jacobian_refresh():
     assert solver.lagged_jacobian_refresh_threshold == pytest.approx(0.75)
 
 
+def test_build_time_solver_radau_accepts_exact_cached_retry_refresh():
+    """The expensive recovery is opt-in and available only to lagged Radau."""
+    solver = build_time_solver(
+        _base_solver_parameters(
+            transport_solver_backend="radau",
+            radau_rhs_mode="lagged_transport_response",
+            radau_lagged_jacobian_refresh_mode="quadratic_exact_retry_after_failure",
+        )
+    )
+    assert isinstance(solver, RADAUSolver)
+    assert solver.lagged_jacobian_refresh_mode == "quadratic_exact_retry_after_failure"
+
+
 def test_radau_stage_drift_jacobian_refresh_requires_transport_lagged_response():
     with pytest.raises(ValueError, match="requires a lagged transport response RHS mode"):
         RADAUSolver(lagged_jacobian_refresh_mode="stage_drift_after_first")
@@ -1641,6 +1695,183 @@ def test_radau_stage_drift_jacobian_refresh_runs_on_nonlinear_lagged_rhs():
     out = solver.solve(jnp.asarray([0.1]), QuadraticLaggedField().__call__)
     assert int(out["n_steps"]) > 0
     assert jnp.all(jnp.isfinite(out["final_state"]))
+
+
+def test_radau_exact_cached_retry_mode_runs_without_a_retry():
+    """The opt-in recovery leaves an already-convergent cached solve alone."""
+
+    class QuadraticLaggedField:
+        def __call__(self, _t, y):
+            return y * y
+
+        def build_lagged_response(self, y):
+            return y
+
+        def evaluate_with_lagged_response(self, _t, y, *, lagged_response):
+            return lagged_response * lagged_response + 2.0 * lagged_response * (y - lagged_response)
+
+    solver = RADAUSolver(
+        t0=0.0,
+        t1=0.05,
+        dt=0.01,
+        rtol=1.0e-5,
+        atol=1.0e-8,
+        rhs_mode="lagged_transport_response",
+        lagged_jacobian_refresh_mode="quadratic_exact_retry_after_failure",
+        maxiter=8,
+        max_steps=32,
+    )
+    out = solver.solve(jnp.asarray([0.1]), QuadraticLaggedField().__call__)
+    assert int(out["n_steps"]) > 0
+    assert jnp.all(jnp.isfinite(out["final_state"]))
+
+
+def test_radau_exact_cached_retry_relinearizes_at_dominant_failed_stage(monkeypatch):
+    """A finite failed solve is retried from its largest-residual Radau stage."""
+    dtype = jnp.float64
+    context = types.SimpleNamespace(
+        num_stages=2,
+        state_dim=1,
+        dtype=dtype,
+        a=jnp.asarray([[0.25, 0.0], [0.5, 0.25]], dtype=dtype),
+    )
+    failed = transport_solvers._RadauStageSubsolveResult(
+        iter_final=jnp.asarray(2, dtype=jnp.int32),
+        z_final=jnp.asarray([1.0, 4.0], dtype=dtype),
+        delta_final=jnp.zeros((2,), dtype=dtype),
+        delta_norm_final=jnp.asarray(0.0, dtype=dtype),
+        newton_metric_final=jnp.asarray(1.0, dtype=dtype),
+        theta_final=jnp.asarray(1.0, dtype=dtype),
+        diverged_final=jnp.asarray(True),
+        shrink_suggest_final=jnp.asarray(0.5, dtype=dtype),
+        slow_contraction_final=jnp.asarray(True),
+        residual_blowup_final=jnp.asarray(False),
+        newton_nonfinite_final=jnp.asarray(False),
+        finite_initial_residual=jnp.asarray(True),
+        nonfinite_stage_state=jnp.asarray(False),
+        nonfinite_stage_residual=jnp.asarray(False),
+        final_residual=jnp.asarray([0.1, -3.0], dtype=dtype),
+        final_residual_norm=jnp.asarray(3.0, dtype=dtype),
+        converged=jnp.asarray(False),
+        newton_state_final=(),
+    )
+    inputs = transport_solvers._RadauStageSubsolveInputs(
+        flat_y=jnp.asarray([2.0], dtype=dtype),
+        t_value=jnp.asarray(0.0, dtype=dtype),
+        h_value=jnp.asarray(0.5, dtype=dtype),
+        z0=jnp.zeros((2,), dtype=dtype),
+        f0=jnp.zeros((1,), dtype=dtype),
+        jacobian_ref=jnp.asarray([[1.0]], dtype=dtype),
+        rhs_time_ref=jnp.zeros((1,), dtype=dtype),
+        lagged_response=None,
+        real_lu_out=jnp.zeros((1, 1), dtype=dtype),
+        real_piv_out=jnp.zeros((1,), dtype=jnp.int32),
+        complex_lu_out=jnp.zeros((0, 1, 1), dtype=dtype),
+        complex_piv_out=jnp.zeros((0, 1), dtype=jnp.int32),
+    )
+    expected_jacobian = jnp.asarray([[7.0]], dtype=dtype)
+
+    def fake_subsolve(_context, _physics, retry_inputs, **_kwargs):
+        return dataclasses.replace(
+            failed,
+            converged=jnp.asarray(True),
+            delta_final=retry_inputs.z0,
+            delta_norm_final=retry_inputs.jacobian_ref[0, 0],
+        )
+
+    monkeypatch.setattr(transport_solvers, "_radau_run_stage_subsolve", fake_subsolve)
+    result = transport_solvers._radau_retry_failed_subsolve_with_exact_cached_jacobian(
+        context,
+        physics_context=None,
+        inputs=inputs,
+        failed_result=failed,
+        jacobian_ref=inputs.jacobian_ref,
+        real_lu_out=inputs.real_lu_out,
+        real_piv_out=inputs.real_piv_out,
+        complex_lu_out=inputs.complex_lu_out,
+        complex_piv_out=inputs.complex_piv_out,
+        rhs_jacobian_at_state=lambda _state: expected_jacobian,
+        factor_linear_systems=lambda jacobian: (
+            jacobian,
+            inputs.real_piv_out,
+            inputs.complex_lu_out,
+            inputs.complex_piv_out,
+        ),
+    )
+    retried, jacobian, *_linear_data, attempted, stage = result
+    assert bool(attempted)
+    assert int(stage) == 1
+    assert bool(retried.converged)
+    assert jnp.array_equal(retried.delta_final, failed.z_final)
+    assert float(retried.delta_norm_final) == pytest.approx(7.0)
+    assert jnp.array_equal(jacobian, expected_jacobian)
+
+
+def test_radau_exact_cached_retry_mode_traces_through_accepted_step_vjp():
+    """The opt-in retry branch remains valid inside the custom step VJP."""
+
+    class LinearLaggedField:
+        def __call__(self, _t, y):
+            return -2.0 * y
+
+        def build_lagged_response(self, y):
+            return y
+
+        def evaluate_with_lagged_response(self, _t, y, *_args, lagged_response):
+            del _args, lagged_response
+            return -2.0 * y
+
+    solver = RADAUSolver(
+        t0=0.0,
+        t1=1.0e-3,
+        dt=1.0e-4,
+        rtol=1.0e-7,
+        atol=1.0e-10,
+        rhs_mode="lagged_transport_response",
+        lagged_jacobian_refresh_mode="quadratic_exact_retry_after_failure",
+        maxiter=8,
+        max_steps=8,
+    )
+    field = LinearLaggedField()
+    prepared = transport_solvers._build_prepared_radau_accepted_rollout(
+        solver=solver,
+        state=jnp.asarray([0.4]),
+        vector_field=field.__call__,
+        species=None,
+    )
+    # The toy cache is the identity map.  Supply its exact rebuild transpose,
+    # as the real lagged-NTX model does, so this covers the rebuild VJP path.
+    prepared = dataclasses.replace(
+        prepared,
+        physics_context=dataclasses.replace(
+            prepared.physics_context,
+            pullback_build_lagged_response=lambda _state, cache_bar: cache_bar,
+        ),
+    )
+    attempt_context = transport_solvers._RadauAcceptedStepAttemptContext(
+        t_final=prepared.initial_carry.t + prepared.initial_carry.dt,
+        use_transport_lagged_response=jnp.asarray(True),
+    )
+
+    def trial_y(initial_y):
+        carry = dataclasses.replace(prepared.initial_carry, y=initial_y)
+        return transport_solvers._execute_radau_accepted_step_trial_y_vjp_lagged_branch(
+            prepared.kernel_context,
+            prepared.physics_context,
+            carry,
+            attempt_context,
+            "rebuild",
+        )
+
+    y0 = jnp.asarray([0.4])
+    value, pullback = jax.vjp(trial_y, y0)
+    (gradient,) = pullback(jnp.ones_like(value))
+    epsilon = jnp.asarray(1.0e-6)
+    finite_difference = (
+        jnp.sum(trial_y(y0 + epsilon)) - jnp.sum(trial_y(y0 - epsilon))
+    ) / (2.0 * epsilon)
+    assert jnp.all(jnp.isfinite(gradient))
+    assert jnp.allclose(gradient[0], finite_difference, rtol=2.0e-4, atol=2.0e-6)
 
 
 def test_build_time_solver_legacy_integrator_fallback():

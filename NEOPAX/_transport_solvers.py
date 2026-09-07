@@ -4072,6 +4072,8 @@ class _RadauSolverConfig(TransportSolver):
             "endpoint_once": "endpoint_after_first",
             "stage": "stage_drift_after_first",
             "stage_drift": "stage_drift_after_first",
+            "quadratic_retry": "quadratic_exact_retry_after_failure",
+            "exact_retry": "quadratic_exact_retry_after_failure",
         }
         jacobian_refresh_mode_norm = jacobian_refresh_mode_aliases.get(
             jacobian_refresh_mode_norm, jacobian_refresh_mode_norm
@@ -4081,10 +4083,12 @@ class _RadauSolverConfig(TransportSolver):
             "endpoint_after_first",
             "stage_drift_after_first",
             "quadratic_colored_after_first",
+            "quadratic_exact_retry_after_failure",
         }:
             raise ValueError(
                 "radau_lagged_jacobian_refresh_mode must be one of: none, endpoint_after_first, "
                 "stage_drift_after_first, quadratic_colored_after_first"
+                ", quadratic_exact_retry_after_failure"
             )
         if float(lagged_jacobian_refresh_threshold) <= 0.0:
             raise ValueError("radau_lagged_jacobian_refresh_threshold must be positive")
@@ -15481,7 +15485,10 @@ def _radau_run_stage_subsolve(
         # pure cached-response algebra: it never rebuilds NTX or replaces the
         # existing LU solve.  Keep other solver lanes byte-for-byte on their
         # established full-step path.
-        if kernel_context.lagged_jacobian_refresh_mode == "quadratic_colored_after_first":
+        if kernel_context.lagged_jacobian_refresh_mode in {
+            "quadratic_colored_after_first",
+            "quadratic_exact_retry_after_failure",
+        }:
             (
                 line_search_z,
                 accepted_delta,
@@ -15844,6 +15851,198 @@ def _radau_run_stage_subsolve(
     )
 
 
+def _radau_after_first_refresh_candidate(
+    kernel_context: _RadauAcceptedStepKernelContext,
+    physics_context: _RadauAcceptedStepPhysicsContext,
+    inputs: _RadauStageSubsolveInputs,
+):
+    """Build the shared safe first-Newton refresh candidate.
+
+    Both the normal primal step and the reverse-only realized-schedule replay
+    must make this decision identically.  This helper deliberately evaluates
+    the full cached stage residual; it does not use the frozen Jacobian to
+    decide whether the first correction is safe.
+    """
+    first_context = dataclasses.replace(
+        kernel_context, maxiter=1, debug_newton_trace=False
+    )
+    first = _radau_run_stage_subsolve_from_inputs(
+        first_context, physics_context, inputs
+    )
+    initial_residual = _radau_stage_subsolve_residual(
+        kernel_context, physics_context, inputs, inputs.z0
+    )
+    initial_norm = _radau_residual_norm(kernel_context, initial_residual)
+    full_delta = first.z_final - inputs.z0
+    accepted_initial = jnp.logical_and(
+        jnp.all(jnp.isfinite(first.z_final)),
+        jnp.logical_and(
+            jnp.isfinite(first.final_residual_norm),
+            first.final_residual_norm <= initial_norm,
+        ),
+    )
+
+    def cond(state):
+        count, _, _, _, _, accepted = state
+        return jnp.logical_and(
+            jnp.logical_not(accepted), count < jnp.asarray(5, dtype=jnp.int32)
+        )
+
+    def body(state):
+        count, weight, _, _, _, _ = state
+        next_weight = jnp.asarray(0.5, dtype=kernel_context.dtype) * weight
+        next_z = inputs.z0 + next_weight * full_delta
+        next_residual = _radau_stage_subsolve_residual(
+            kernel_context, physics_context, inputs, next_z
+        )
+        next_norm = _radau_residual_norm(kernel_context, next_residual)
+        next_accepted = jnp.logical_and(
+            jnp.all(jnp.isfinite(next_z)),
+            jnp.logical_and(jnp.isfinite(next_norm), next_norm <= initial_norm),
+        )
+        return (
+            count + jnp.asarray(1, dtype=jnp.int32), next_weight, next_z,
+            next_residual, next_norm, next_accepted,
+        )
+
+    _, _, refresh_z, refresh_residual, refresh_residual_norm, accepted = jax.lax.while_loop(
+        cond,
+        body,
+        (
+            jnp.asarray(0, dtype=jnp.int32),
+            jnp.asarray(1.0, dtype=kernel_context.dtype),
+            first.z_final,
+            first.final_residual,
+            first.final_residual_norm,
+            accepted_initial,
+        ),
+    )
+    refresh_delta = refresh_z - inputs.z0
+    refresh_defect = _radau_stage_residual_defect_norm(
+        kernel_context,
+        h_value=inputs.h_value,
+        stage_residual=refresh_residual,
+        endpoint_scale=_radau_frozen_endpoint_error_scale(kernel_context, inputs.flat_y),
+    )
+    refresh_norm = _radau_correction_norm(kernel_context, refresh_delta)
+    refresh_newton_state = (
+        jnp.asarray(1, dtype=jnp.int32), refresh_z, refresh_delta,
+        jnp.linalg.norm(refresh_delta), refresh_residual_norm,
+        refresh_defect, refresh_norm, refresh_norm,
+        kernel_context.zero_scalar, kernel_context.zero_scalar,
+        jnp.asarray(False), jnp.asarray(1.0, dtype=kernel_context.dtype),
+        jnp.asarray(False), jnp.asarray(False), jnp.asarray(False),
+    )
+    stages = refresh_z.reshape((kernel_context.num_stages, kernel_context.state_dim))
+    stage_states = inputs.flat_y[None, :] + inputs.h_value * (kernel_context.a @ stages)
+    scale = _radau_frozen_endpoint_error_scale(kernel_context, inputs.flat_y)
+    stage_drift = jnp.sqrt(
+        jnp.mean(((stage_states - inputs.flat_y[None, :]) / scale[None, :]) ** 2, axis=1)
+    )
+    stage_index = jnp.argmax(stage_drift)
+    return (
+        first,
+        refresh_z,
+        refresh_residual,
+        refresh_defect,
+        accepted,
+        refresh_newton_state,
+        stage_states[stage_index],
+        stage_index,
+    )
+
+
+def _radau_retry_failed_subsolve_with_exact_cached_jacobian(
+    kernel_context: _RadauAcceptedStepKernelContext,
+    physics_context: _RadauAcceptedStepPhysicsContext,
+    inputs: _RadauStageSubsolveInputs,
+    failed_result: _RadauStageSubsolveResult,
+    *,
+    jacobian_ref,
+    real_lu_out,
+    real_piv_out,
+    complex_lu_out,
+    complex_piv_out,
+    rhs_jacobian_at_state: Callable[[Any], Any],
+    factor_linear_systems: Callable[[Any], tuple[Any, Any, Any, Any]],
+):
+    """Retry one recoverable stage solve with an exact cached-RHS Jacobian.
+
+    ``rhs_jacobian_at_state`` differentiates the fixed cached quadratic RHS,
+    never the live NTX calculation.  The result uses the existing direct Radau
+    LU blocks and is intentionally a one-shot fallback, not a new Newton
+    backend.  The helper is shared by forward and reverse-only primal replay.
+    """
+    stages = failed_result.z_final.reshape(
+        (kernel_context.num_stages, kernel_context.state_dim)
+    )
+    residuals = failed_result.final_residual.reshape(
+        (kernel_context.num_stages, kernel_context.state_dim)
+    )
+    failed_stage = jnp.argmax(jnp.linalg.norm(residuals, axis=1))
+    failed_state = inputs.flat_y + inputs.h_value * (
+        kernel_context.a @ stages
+    )[failed_stage]
+    retry_allowed = jnp.logical_and(
+        jnp.logical_not(failed_result.converged),
+        jnp.logical_and(
+            jnp.all(jnp.isfinite(failed_result.z_final)),
+            jnp.all(jnp.isfinite(failed_result.final_residual)),
+        ),
+    )
+
+    def keep_failed(_):
+        return (
+            failed_result,
+            jacobian_ref,
+            real_lu_out,
+            real_piv_out,
+            complex_lu_out,
+            complex_piv_out,
+            jnp.asarray(False),
+            failed_stage,
+        )
+
+    def retry(_):
+        refreshed_jacobian = rhs_jacobian_at_state(failed_state)
+
+        def factor_and_retry(_):
+            real_lu, real_piv, complex_lu, complex_piv = factor_linear_systems(
+                refreshed_jacobian
+            )
+            retry_inputs = dataclasses.replace(
+                inputs,
+                z0=failed_result.z_final,
+                jacobian_ref=refreshed_jacobian,
+                real_lu_out=real_lu,
+                real_piv_out=real_piv,
+                complex_lu_out=complex_lu,
+                complex_piv_out=complex_piv,
+            )
+            retry_result = _radau_run_stage_subsolve(
+                kernel_context, physics_context, retry_inputs
+            )
+            return (
+                retry_result,
+                refreshed_jacobian,
+                real_lu,
+                real_piv,
+                complex_lu,
+                complex_piv,
+                jnp.asarray(True),
+                failed_stage,
+            )
+
+        return jax.lax.cond(
+            jnp.all(jnp.isfinite(refreshed_jacobian)),
+            factor_and_retry,
+            keep_failed,
+            operand=None,
+        )
+
+    return jax.lax.cond(retry_allowed, retry, keep_failed, operand=None)
+
+
 def _radau_single_step_primal(
     kernel_context: _RadauAcceptedStepKernelContext,
     physics_context: _RadauAcceptedStepPhysicsContext,
@@ -16008,124 +16207,18 @@ def _radau_single_step_primal(
         # J_n + H_n[delta_stage, .].  The non-cancelling stage defect avoids
         # an endpoint-projection cancellation blind spot and does not call
         # the NTX builder again.
-        first_iteration_context = dataclasses.replace(
-            kernel_context, maxiter=1, debug_newton_trace=False
-        )
-        first_iteration = _radau_run_stage_subsolve_from_inputs(
-            first_iteration_context,
-            physics_context,
-            subsolve_inputs,
-        )
-        # A one-step chord correction is only a candidate refresh point.  In
-        # a stiff root-transition it can cross a branch before Newton has
-        # established any residual decrease.  Globalize this *refresh
-        # candidate* with a short residual backtrack; ordinary Newton
-        # iterations remain unchanged.  Every residual here uses the cached
-        # response already built for this attempt, never a new NTX solve.
-        first_initial_residual = _radau_stage_subsolve_residual(
-            kernel_context, physics_context, subsolve_inputs, subsolve_inputs.z0
-        )
-        first_initial_norm = _radau_residual_norm(
-            kernel_context, first_initial_residual
-        )
-        first_full_delta = first_iteration.z_final - subsolve_inputs.z0
-        first_trial_accepted = jnp.logical_and(
-            jnp.all(jnp.isfinite(first_iteration.z_final)),
-            jnp.logical_and(
-                jnp.isfinite(first_iteration.final_residual_norm),
-                first_iteration.final_residual_norm <= first_initial_norm,
-            ),
-        )
-
-        def _refresh_backtrack_cond(backtrack_state):
-            count, _lambda, _z, _residual, _norm, accepted = backtrack_state
-            return jnp.logical_and(
-                jnp.logical_not(accepted),
-                count < jnp.asarray(5, dtype=jnp.int32),
-            )
-
-        def _refresh_backtrack_body(backtrack_state):
-            count, lambda_value, _z, _residual, _norm, _accepted = backtrack_state
-            next_lambda = jnp.asarray(0.5, dtype=kernel_context.dtype) * lambda_value
-            next_z = subsolve_inputs.z0 + next_lambda * first_full_delta
-            next_residual = _radau_stage_subsolve_residual(
-                kernel_context, physics_context, subsolve_inputs, next_z
-            )
-            next_norm = _radau_residual_norm(kernel_context, next_residual)
-            next_accepted = jnp.logical_and(
-                jnp.all(jnp.isfinite(next_z)),
-                jnp.logical_and(
-                    jnp.isfinite(next_norm), next_norm <= first_initial_norm,
-                ),
-            )
-            return (
-                count + jnp.asarray(1, dtype=jnp.int32),
-                next_lambda,
-                next_z,
-                next_residual,
-                next_norm,
-                next_accepted,
-            )
-
         (
-            _refresh_backtracks,
-            refresh_lambda,
+            first_iteration,
             refresh_z,
             refresh_residual,
-            refresh_residual_norm,
+            first_stage_defect,
             refresh_candidate_accepted,
-        ) = jax.lax.while_loop(
-            _refresh_backtrack_cond,
-            _refresh_backtrack_body,
-            (
-                jnp.asarray(0, dtype=jnp.int32),
-                jnp.asarray(1.0, dtype=kernel_context.dtype),
-                first_iteration.z_final,
-                first_iteration.final_residual,
-                first_iteration.final_residual_norm,
-                first_trial_accepted,
-            ),
+            refresh_newton_state,
+            refresh_state,
+            refresh_stage_index,
+        ) = _radau_after_first_refresh_candidate(
+            kernel_context, physics_context, subsolve_inputs
         )
-        refresh_delta = refresh_z - subsolve_inputs.z0
-        refresh_delta_norm = jnp.linalg.norm(refresh_delta)
-        refresh_stage_defect = _radau_stage_residual_defect_norm(
-            kernel_context,
-            h_value=h_value,
-            stage_residual=refresh_residual,
-            endpoint_scale=_radau_frozen_endpoint_error_scale(kernel_context, flat_y),
-        )
-        refresh_newton_norm = _radau_correction_norm(kernel_context, refresh_delta)
-        refresh_newton_state = (
-            jnp.asarray(1, dtype=jnp.int32),
-            refresh_z,
-            refresh_delta,
-            refresh_delta_norm,
-            refresh_residual_norm,
-            refresh_stage_defect,
-            refresh_newton_norm,
-            refresh_newton_norm,
-            kernel_context.zero_scalar,
-            kernel_context.zero_scalar,
-            jnp.asarray(False),
-            jnp.asarray(1.0, dtype=kernel_context.dtype),
-            jnp.asarray(False),
-            jnp.asarray(False),
-            jnp.asarray(False),
-        )
-        first_stages = refresh_z.reshape(
-            (kernel_context.num_stages, kernel_context.state_dim)
-        )
-        first_stage_states = flat_y[None, :] + h_value * (kernel_context.a @ first_stages)
-        first_stage_scale = _radau_frozen_endpoint_error_scale(kernel_context, flat_y)
-        first_stage_drift = jnp.sqrt(
-            jnp.mean(
-                ((first_stage_states - flat_y[None, :]) / first_stage_scale[None, :]) ** 2,
-                axis=1,
-            )
-        )
-        refresh_stage_index = jnp.argmax(first_stage_drift)
-        refresh_state = first_stage_states[refresh_stage_index]
-        first_stage_defect = refresh_stage_defect
         refresh_jacobian = jnp.logical_and(
             refresh_candidate_accepted,
             jnp.logical_and(
@@ -16264,6 +16357,38 @@ def _radau_single_step_primal(
             physics_context,
             subsolve_inputs,
         )
+    if kernel_context.lagged_jacobian_refresh_mode == "quadratic_exact_retry_after_failure":
+        (
+            subsolve_result,
+            jacobian_ref,
+            real_lu_out,
+            real_piv_out,
+            complex_lu_out,
+            complex_piv_out,
+            retry_attempted,
+            retry_stage,
+        ) = _radau_retry_failed_subsolve_with_exact_cached_jacobian(
+            kernel_context,
+            physics_context,
+            subsolve_inputs,
+            subsolve_result,
+            jacobian_ref=jacobian_ref,
+            real_lu_out=real_lu_out,
+            real_piv_out=real_piv_out,
+            complex_lu_out=complex_lu_out,
+            complex_piv_out=complex_piv_out,
+            rhs_jacobian_at_state=lambda state: jax.jacfwd(
+                _rhs_eval_at_current_time
+            )(state),
+            factor_linear_systems=_factor_linear_systems,
+        )
+        if kernel_context.debug_newton_trace:
+            jax.debug.print(
+                "[radau-solver] exact_cached_jacobian_retry={retry} failed_stage={stage}",
+                retry=retry_attempted,
+                stage=retry_stage,
+                ordered=True,
+            )
     if kernel_context.lagged_response_correction_mode == "endpoint_defect":
         predictor_stages = subsolve_result.z_final.reshape(
             (kernel_context.num_stages, kernel_context.state_dim)
@@ -16790,98 +16915,20 @@ def _radau_single_step_primal_reverse_minimal(
     if kernel_context.lagged_jacobian_refresh_mode in {
         "endpoint_after_first", "stage_drift_after_first", "quadratic_colored_after_first"
     }:
-        # Keep reverse-only realized-schedule replay on precisely the same
-        # primal linearization path as the forward accepted step.
-        first_iteration_context = dataclasses.replace(
-            kernel_context, maxiter=1, debug_newton_trace=False
-        )
-        first_iteration = _radau_run_stage_subsolve_from_inputs(
-            first_iteration_context,
-            physics_context,
-            subsolve_inputs,
-        )
-        first_initial_residual = _radau_stage_subsolve_residual(
-            kernel_context, physics_context, subsolve_inputs, subsolve_inputs.z0
-        )
-        first_initial_norm = _radau_residual_norm(kernel_context, first_initial_residual)
-        first_full_delta = first_iteration.z_final - subsolve_inputs.z0
-        first_trial_accepted = jnp.logical_and(
-            jnp.all(jnp.isfinite(first_iteration.z_final)),
-            jnp.logical_and(
-                jnp.isfinite(first_iteration.final_residual_norm),
-                first_iteration.final_residual_norm <= first_initial_norm,
-            ),
-        )
-
-        def _refresh_backtrack_cond(backtrack_state):
-            count, _lambda, _z, _residual, _norm, accepted = backtrack_state
-            return jnp.logical_and(
-                jnp.logical_not(accepted), count < jnp.asarray(5, dtype=jnp.int32)
-            )
-
-        def _refresh_backtrack_body(backtrack_state):
-            count, lambda_value, _z, _residual, _norm, _accepted = backtrack_state
-            next_lambda = jnp.asarray(0.5, dtype=kernel_context.dtype) * lambda_value
-            next_z = subsolve_inputs.z0 + next_lambda * first_full_delta
-            next_residual = _radau_stage_subsolve_residual(
-                kernel_context, physics_context, subsolve_inputs, next_z
-            )
-            next_norm = _radau_residual_norm(kernel_context, next_residual)
-            next_accepted = jnp.logical_and(
-                jnp.all(jnp.isfinite(next_z)),
-                jnp.logical_and(jnp.isfinite(next_norm), next_norm <= first_initial_norm),
-            )
-            return count + 1, next_lambda, next_z, next_residual, next_norm, next_accepted
-
+        # Reverse-only replay must use precisely the same safe candidate as
+        # the ordinary accepted-step path.
         (
-            _refresh_backtracks,
-            _refresh_lambda,
+            first_iteration,
             refresh_z,
             refresh_residual,
-            refresh_residual_norm,
+            first_stage_defect,
             refresh_candidate_accepted,
-        ) = jax.lax.while_loop(
-            _refresh_backtrack_cond,
-            _refresh_backtrack_body,
-            (
-                jnp.asarray(0, dtype=jnp.int32),
-                jnp.asarray(1.0, dtype=kernel_context.dtype),
-                first_iteration.z_final,
-                first_iteration.final_residual,
-                first_iteration.final_residual_norm,
-                first_trial_accepted,
-            ),
+            refresh_newton_state,
+            refresh_state,
+            refresh_stage_index,
+        ) = _radau_after_first_refresh_candidate(
+            kernel_context, physics_context, subsolve_inputs
         )
-        refresh_delta = refresh_z - subsolve_inputs.z0
-        refresh_stage_defect = _radau_stage_residual_defect_norm(
-            kernel_context,
-            h_value=h_value,
-            stage_residual=refresh_residual,
-            endpoint_scale=_radau_frozen_endpoint_error_scale(kernel_context, flat_y),
-        )
-        refresh_newton_norm = _radau_correction_norm(kernel_context, refresh_delta)
-        refresh_newton_state = (
-            jnp.asarray(1, dtype=jnp.int32), refresh_z, refresh_delta,
-            jnp.linalg.norm(refresh_delta), refresh_residual_norm,
-            refresh_stage_defect, refresh_newton_norm, refresh_newton_norm,
-            kernel_context.zero_scalar, kernel_context.zero_scalar,
-            jnp.asarray(False), jnp.asarray(1.0, dtype=kernel_context.dtype),
-            jnp.asarray(False), jnp.asarray(False), jnp.asarray(False),
-        )
-        first_stages = refresh_z.reshape(
-            (kernel_context.num_stages, kernel_context.state_dim)
-        )
-        first_stage_states = flat_y[None, :] + h_value * (kernel_context.a @ first_stages)
-        first_stage_scale = _radau_frozen_endpoint_error_scale(kernel_context, flat_y)
-        first_stage_drift = jnp.sqrt(
-            jnp.mean(
-                ((first_stage_states - flat_y[None, :]) / first_stage_scale[None, :]) ** 2,
-                axis=1,
-            )
-        )
-        refresh_stage_index = jnp.argmax(first_stage_drift)
-        refresh_state = first_stage_states[refresh_stage_index]
-        first_stage_defect = refresh_stage_defect
         refresh_jacobian = jnp.logical_and(
             refresh_candidate_accepted,
             jnp.logical_and(
@@ -16999,6 +17046,31 @@ def _radau_single_step_primal_reverse_minimal(
             kernel_context,
             physics_context,
             subsolve_inputs,
+        )
+    if kernel_context.lagged_jacobian_refresh_mode == "quadratic_exact_retry_after_failure":
+        (
+            subsolve_result,
+            jacobian_ref,
+            real_lu_out,
+            real_piv_out,
+            complex_lu_out,
+            complex_piv_out,
+            _retry_attempted,
+            _retry_stage,
+        ) = _radau_retry_failed_subsolve_with_exact_cached_jacobian(
+            kernel_context,
+            physics_context,
+            subsolve_inputs,
+            subsolve_result,
+            jacobian_ref=jacobian_ref,
+            real_lu_out=real_lu_out,
+            real_piv_out=real_piv_out,
+            complex_lu_out=complex_lu_out,
+            complex_piv_out=complex_piv_out,
+            rhs_jacobian_at_state=lambda state: jax.jacfwd(
+                _rhs_eval_at_current_time
+            )(state),
+            factor_linear_systems=_factor_linear_systems,
         )
     stages_final = subsolve_result.z_final.reshape((kernel_context.num_stages, kernel_context.state_dim))
     flat_next = flat_y + h_value * (kernel_context.b @ stages_final)
@@ -22008,11 +22080,12 @@ def _build_prepared_radau_accepted_rollout(
         flat_rhs_state_and_lagged_response_pullback = None
         flat_rhs_lagged_response_all_pullback = None
         if str(getattr(solver, "lagged_jacobian_refresh_mode", "none")).strip().lower() not in {
-            "none", "quadratic_colored_after_first"
+            "none", "quadratic_colored_after_first", "quadratic_exact_retry_after_failure"
         }:
             raise ValueError(
-                "floating_ambipolar_edge_node supports only 'none' or "
-                "'quadratic_colored_after_first' for "
+                "floating_ambipolar_edge_node supports only 'none', "
+                "'quadratic_colored_after_first', or "
+                "'quadratic_exact_retry_after_failure' for "
                 "radau_lagged_jacobian_refresh_mode."
             )
     if (
@@ -22913,11 +22986,12 @@ class RADAUSolver(_RadauSolverConfig):
             flat_rhs_with_lagged_response_tangent = _node_lagged_rhs_tangent
             flat_rhs_state_pullback = _node_lagged_rhs_state_pullback
             if str(getattr(self, "lagged_jacobian_refresh_mode", "none")).strip().lower() not in {
-                "none", "quadratic_colored_after_first"
+                "none", "quadratic_colored_after_first", "quadratic_exact_retry_after_failure"
             }:
                 raise ValueError(
-                    "floating_ambipolar_edge_node supports only 'none' or "
-                    "'quadratic_colored_after_first' for "
+                    "floating_ambipolar_edge_node supports only 'none', "
+                    "'quadratic_colored_after_first', or "
+                    "'quadratic_exact_retry_after_failure' for "
                     "radau_lagged_jacobian_refresh_mode."
                 )
             build_lagged_response_from_flat = _node_build_from_flat
