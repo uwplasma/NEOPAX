@@ -23221,6 +23221,9 @@ class RADAUSolver(_RadauSolverConfig):
         divergence_mode = str(getattr(self, "newton_divergence_mode", "legacy")).strip().lower()
         residual_norm_mode = str(getattr(self, "newton_residual_norm", "raw")).strip().lower()
         debug_newton_trace = bool(getattr(self, "debug_stage_markers", False))
+        debug_cached_stage_jacobian_audit = bool(
+            getattr(self, "debug_cached_stage_jacobian_audit", False)
+        )
         conservative_divergence = divergence_mode in {"conservative", "hairer_like", "hairer"}
         use_rms_residual_norm = residual_norm_mode in {"rms", "scaled", "normalized"}
         newton_tol_mode = str(getattr(self, "newton_tol_mode", "residual")).strip().lower()
@@ -23355,6 +23358,7 @@ class RADAUSolver(_RadauSolverConfig):
             tiny_scalar=tiny_scalar,
             zero_scalar=zero_scalar,
             debug_newton_trace=bool(debug_newton_trace),
+            debug_cached_stage_jacobian_audit=bool(debug_cached_stage_jacobian_audit),
             use_transport_lagged_response=bool(use_transport_lagged_response),
             lagged_response_correction_mode=str(
                 getattr(self, "lagged_response_correction_mode", "none")

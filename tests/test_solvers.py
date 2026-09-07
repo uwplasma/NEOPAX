@@ -1355,6 +1355,7 @@ def test_radau_floating_edge_node_uses_private_augmented_coordinate():
         lagged_jacobian_refresh_threshold=1.0e-16,
         error_estimator="embedded2_ntss_transport_scale",
         debug_stage_markers=True,
+        debug_cached_stage_jacobian_audit=True,
         maxiter=8,
         max_steps=32,
     )
