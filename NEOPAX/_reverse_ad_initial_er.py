@@ -6,6 +6,7 @@ import dataclasses
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 
 from ._ambipolarity import solve_ambipolarity_roots_radial_jax
 from ._entropy_models import get_entropy_model
@@ -23,6 +24,42 @@ from ._transport_flux_models import (
     get_Thermodynamical_Forces_A3,
     get_v_thermal,
 )
+
+
+def _nonfinite_tree_entries(tree, *, limit: int = 24):
+    """Return host-readable locations for nonfinite numerical leaves.
+
+    This is deliberately used only at the recorded scan boundary.  A database
+    scan transpose is the last point at which a table cotangent can be
+    distinguished from the scan-generated channel/surface cotangent.  Raising
+    there prevents a later VMEC payload error from obscuring the producer.
+    """
+    entries = []
+    for path, leaf in jax.tree_util.tree_flatten_with_path(tree)[0]:
+        array = jnp.asarray(leaf)
+        if not jnp.issubdtype(array.dtype, jnp.inexact):
+            continue
+        finite = np.asarray(jax.device_get(jnp.isfinite(array)))
+        if bool(np.all(finite)):
+            continue
+        first_index = tuple(int(index) for index in np.argwhere(~finite)[0].tolist())
+        entries.append(
+            f"path={path} shape={tuple(array.shape)} "
+            f"first_nonfinite_index={first_index}"
+        )
+        if len(entries) >= limit:
+            entries.append(f"truncated_after={limit}")
+            break
+    return tuple(entries)
+
+
+def _raise_if_nonfinite_recorded_scan_tree(tree, *, boundary: str):
+    entries = _nonfinite_tree_entries(tree)
+    if entries:
+        raise FloatingPointError(
+            "nonfinite recorded database scan cotangent at "
+            f"{boundary}: " + "; ".join(entries)
+        )
 
 
 def initial_er_root_setup(config: dict, runtime):
@@ -547,6 +584,10 @@ def fold_recorded_ntx_scan_database_bar_groups_into_support(runtime_or_owner, ba
         lambda *values: jnp.stack(values),
         *(bar["database"] for _group_index, _row_index, bar in indexed_bars),
     )
+    _raise_if_nonfinite_recorded_scan_tree(
+        database_bars,
+        boundary="input fixed-table bars",
+    )
     selected_scan = owner.runtime_scan if owner is not None else runtime_scan
     batched_pullback = getattr(
         selected_scan, "recorded_runtime_database_support_bar_batched", None
@@ -557,6 +598,10 @@ def fold_recorded_ntx_scan_database_bar_groups_into_support(runtime_or_owner, ba
         else jax.vmap(
             owner.database_support_bar if owner is not None else runtime_scan.recorded_runtime_database_support_bar,
         )(database_bars)
+    )
+    _raise_if_nonfinite_recorded_scan_tree(
+        database_support_bars,
+        boundary="native scan transpose output",
     )
 
     rebuilt = [list(group) for group in groups]
@@ -572,6 +617,13 @@ def fold_recorded_ntx_scan_database_bar_groups_into_support(runtime_or_owner, ba
                     jnp.zeros_like, database_support_bar[key]
                 )
             merged[key] = _add_float_delta_tree(merged[key], database_support_bar[key])
+        _raise_if_nonfinite_recorded_scan_tree(
+            merged,
+            boundary=(
+                "merged scan payload "
+                f"group={group_index} objective_row={row_index} batch_row={batch_index}"
+            ),
+        )
         rebuilt[group_index][row_index] = merged
     return tuple(tuple(group) for group in rebuilt)
 

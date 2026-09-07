@@ -5356,9 +5356,17 @@ def initial_root_payload_active_leaf_layout(
                 leaf_array = jnp.asarray(leaf)
                 finite_host = np.asarray(jax.device_get(jnp.isfinite(leaf_array)))
                 if not bool(np.all(finite_host)):
+                    first_bad = tuple(
+                        int(value)
+                        for value in np.argwhere(~finite_host)[0].tolist()
+                    )
+                    path = jax.tree_util.tree_flatten_with_path(
+                        payload_bar[branch_name]
+                    )[0][leaf_i][0]
                     raise FloatingPointError(
-                        f"nonfinite payload cotangent reached {branch_name} leaf {leaf_i}; "
-                        "rerun the benchmark diagnostics to inspect first_nonfinite_leaf."
+                        "nonfinite payload cotangent reached "
+                        f"{branch_name} leaf={leaf_i} path={path} "
+                        f"first_nonfinite_index={first_bad}."
                     )
                 active_host = np.asarray(
                     jax.device_get(jnp.abs(leaf_array) > 0.0)
@@ -5830,9 +5838,16 @@ def geometry_payload_pullback_from_param_vector_raw_block_transpose(
                     )
                     has_nonfinite = np.any(np.asarray(jax.device_get(~jnp.isfinite(bar_arr))))
                     if bool(has_nonfinite):
+                        finite_host = np.asarray(jax.device_get(jnp.isfinite(bar_arr)))
+                        first_bad = tuple(
+                            int(value)
+                            for value in np.argwhere(~finite_host)[0].tolist()
+                        )
+                        path = payload_template_paths_and_leaves[leaf_i][0]
                         raise FloatingPointError(
-                            f"nonfinite payload cotangent reached {branch_name} leaf {leaf_i}; "
-                            "rerun the benchmark diagnostics to inspect first_nonfinite_leaf."
+                            "nonfinite payload cotangent reached "
+                            f"{branch_name} leaf={leaf_i} path={path} "
+                            f"first_nonfinite_index={first_bad}."
                         )
                     if bool(is_active):
                         leaf_has_bar = True
