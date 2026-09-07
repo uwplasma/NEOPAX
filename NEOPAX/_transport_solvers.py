@@ -15631,10 +15631,12 @@ def _radau_run_stage_subsolve(
                 jnp.asarray(0.0, dtype=kernel_context.dtype),
             )
             jax.debug.print(
-                "[radau-cached-stage-jacobian-audit] iter={iter} "
+                "[radau-cached-stage-jacobian-audit] t={t:.6e} h={h:.6e} iter={iter} "
                 "stored_vs_base_rel={stored_base_rel:.6e} stored_vs_base_cos={stored_base_cos:.6e} "
                 "stored_vs_current_rel={stored_current_rel:.6e} stored_vs_current_cos={stored_current_cos:.6e} "
                 "current_jvp_vs_fd_rel={current_fd_rel:.6e} current_jvp_vs_fd_cos={current_fd_cos:.6e}",
+                t=inputs.t_value,
+                h=inputs.h_value,
                 iter=iter_idx + 1,
                 stored_base_rel=stored_base_relative,
                 stored_base_cos=stored_base_cosine,
@@ -15645,11 +15647,13 @@ def _radau_run_stage_subsolve(
                 ordered=True,
             )
             jax.debug.print(
-                "[radau-cached-stage-jacobian-audit] iter={iter} "
+                "[radau-cached-stage-jacobian-audit] t={t:.6e} h={h:.6e} iter={iter} "
                 "stored_vs_current_max_abs={max_abs:.6e} stage={stage} state_index={state_index} "
                 "last_public_Er_current_abs={last_current:.6e} last_public_Er_base_abs={last_base:.6e} "
                 "private_edge_present={private_present} private_edge_current_abs={edge_current:.6e} "
                 "private_edge_base_abs={edge_base:.6e}",
+                t=inputs.t_value,
+                h=inputs.h_value,
                 iter=iter_idx + 1,
                 max_abs=jnp.abs(stored_current_difference[max_difference_flat]),
                 stage=max_difference_stage,
