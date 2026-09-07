@@ -1603,11 +1603,10 @@ def test_batched_database_geometry_payload_keeps_objective_axis_inside_hook():
             return jnp.asarray(3.0)
 
         def pullback_direct_rhs_geometry_by_radius(self, _state, flux_bar, _geometry):
-            del flux_bar
-            raise AssertionError(
-                "The fixed-table database geometry sweep must use the single "
-                "RHS geometry VJP, not the retired split flux-geometry hook."
-            )
+            # The fixed-table database owns the direct Gamma/Q/Upar geometry
+            # term.  Equation assembly contributes its independent metric
+            # term below; the deferred sweep must add both exactly once.
+            return 10.0 * flux_bar
 
     class _FixedFluxEquation:
         def __init__(self, geometry):
@@ -1649,7 +1648,9 @@ def test_batched_database_geometry_payload_keeps_objective_axis_inside_hook():
         jnp.asarray([2.0, -3.0]),
         support,
     )
-    assert jnp.allclose(actual["geometry"], jnp.asarray([2.0, -3.0]))
+    # One unit comes from fixed-flux equation assembly and ten from the
+    # fixed-table flux derivative; the objective axis stays inside the hook.
+    assert jnp.allclose(actual["geometry"], jnp.asarray([22.0, -33.0]))
     assert jnp.allclose(actual["database"], jnp.zeros((2,)))
 
 
