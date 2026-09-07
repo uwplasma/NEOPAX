@@ -10990,16 +10990,13 @@ def _radau_exact_stage_residual_input_pullback(
                 lagged_response,
                 cotangent,
             )
-        if (
-            rhs_transpose_mode in {"explicit_database", "database", "explicit_black_box_database"}
-            and physics_context.flat_rhs_direct_black_box_state_pullback is not None
-        ):
-            return physics_context.flat_rhs_direct_black_box_state_pullback(
-                t_eval,
-                y_eval,
-                lagged_response,
-                cotangent,
-            )
+        # ``explicit_database`` owns the table/support transpose below, but
+        # its state adjoint must remain the derivative of the *primal*
+        # black-box RHS.  The former hand-written direct-state shortcut can
+        # produce nonfinite bars for a finite database state at a Radau
+        # stage.  Falling through to the ordinary VJP is the same exact
+        # state-Jacobian contract used by the Lij ``block`` lane; it neither
+        # rebuilds NTX nor differentiates the retained scan record.
         if (
             rhs_transpose_mode in {"explicit", "explicit_ntx_interpolated"}
             and physics_context.flat_rhs_state_pullback is not None

@@ -1120,11 +1120,37 @@ def prepare_transport_solver_components(
                 right_gradient=None,
             )
 
+    # The runtime flux model is constructed before the transport equations,
+    # so historically it held independently-created copies of the density and
+    # temperature boundary models.  Their TOML values are equal, but the
+    # floating-edge root, the cached NTX response, and the FV equations must
+    # have one authoritative face-BC object.  Canonicalise the realtime
+    # neoclassical submodel to the equation-system objects before either the
+    # equations or the private edge-node cache is built.
+    def _with_transport_face_bcs(flux_model):
+        model = flux_model
+        neo = getattr(model, "neoclassical_model", None)
+        if neo is not None:
+            updated_neo = _with_transport_face_bcs(neo)
+            if updated_neo is not neo:
+                return dataclasses.replace(model, neoclassical_model=updated_neo)
+            return model
+        if hasattr(model, "bc_density") or hasattr(model, "bc_temperature"):
+            changes = {}
+            if hasattr(model, "bc_density"):
+                changes["bc_density"] = bc.get("density")
+            if hasattr(model, "bc_temperature"):
+                changes["bc_temperature"] = bc.get("temperature")
+            return dataclasses.replace(model, **changes)
+        return model
+
+    transport_flux_model = _with_transport_face_bcs(runtime.models.flux)
+
     equations_to_evolve = build_equation_system(
         config=config,
         species=runtime.species,
         field=runtime.geometry,
-        flux_model=runtime.models.flux,
+        flux_model=transport_flux_model,
         source_models=runtime.models.source,
         solver_cfg=runtime.solver_parameters,
         boundary_models=bc,
@@ -1134,7 +1160,7 @@ def prepare_transport_solver_components(
         state,
         len(equations_to_evolve),
     )
-    shared_flux_model = runtime.models.flux if len(equations_to_evolve) >= 1 else None
+    shared_flux_model = transport_flux_model if len(equations_to_evolve) >= 1 else None
     temperature_active_mask = jnp.asarray(
         config.get("equations", {}).get(
             "toggle_temperature",

@@ -723,6 +723,58 @@ def test_single_equation_solve_applies_the_lagged_flux_response(monkeypatch):
     assert jnp.allclose(rhs.pressure, LAGGED_HEAT_FLUX)
 
 
+def test_transport_components_canonicalize_flux_face_boundary_models(monkeypatch):
+    """The cached flux model and FV equations share one face-BC definition."""
+
+    @dataclasses.dataclass(frozen=True)
+    class _FaceBCModel:
+        bc_density: object = None
+        bc_temperature: object = None
+
+        def __call__(self, state):
+            return {
+                "Gamma": jnp.zeros_like(state.density),
+                "Q": jnp.zeros_like(state.pressure),
+                "Upar": jnp.zeros_like(state.density),
+            }
+
+    state = _dummy_state()
+    flux_model = _FaceBCModel(
+        bc_density=object(),
+        bc_temperature=object(),
+    )
+    runtime = main_module.RuntimeContext(
+        species=_dummy_species(),
+        energy_grid=None,
+        geometry=SimpleNamespace(dr=0.25),
+        database=None,
+        solver_parameters={"t0": 0.0, "t_final": 1.0, "dt": 0.1, "rtol": 1.0e-6, "atol": 1.0e-8},
+        models=main_module.Models(flux=flux_model, source={}),
+    )
+    captured = {}
+
+    def _build_equations(**kwargs):
+        captured.update(kwargs)
+        return [_SingleTemperatureEquation(kwargs["flux_model"])]
+
+    monkeypatch.setattr(transport_equations_module, "build_equation_system", _build_equations)
+    main_module.prepare_transport_solver_components(
+        {
+            "boundary": {
+                "density": {"right": {"type": "neumann", "gradient": 0.1}},
+                "temperature": {"right": {"type": "robin", "decay_length": 0.5}},
+            }
+        },
+        runtime,
+        state,
+    )
+
+    canonical_flux = captured["flux_model"]
+    canonical_bc = captured["boundary_models"]
+    assert canonical_flux.bc_density is canonical_bc["density"]
+    assert canonical_flux.bc_temperature is canonical_bc["temperature"]
+
+
 def test_with_geometry_payload_keeps_the_shared_flux_model_for_one_equation(monkeypatch):
     flux_model = object()
     equation_system = ComposedEquationSystem(
