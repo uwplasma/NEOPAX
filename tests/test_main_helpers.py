@@ -58,6 +58,7 @@ from NEOPAX._interpolators_preprocessed import (
     radial_preprocessed_interpolation_table_bar,
 )
 from NEOPAX._neoclassical import (
+    _collisionality_kind,
     get_Neoclassical_Fluxes,
     pullback_preprocessed_radial_database_fluxes,
 )
@@ -65,7 +66,7 @@ from NEOPAX._monoenergetic_interpolators import monoenergetic_interpolation_kern
 from NEOPAX._interpolators import get_Dij, monoenergetic_interpolation_table_bar
 from NEOPAX._source_models import get_source_model
 from NEOPAX._species import Species
-from NEOPAX._state import TransportState
+from NEOPAX._state import TransportState, get_v_thermal
 from NEOPAX._transport_flux_models import (
     CombinedTransportFluxModel,
     NTXDatabaseTransportModel,
@@ -376,13 +377,89 @@ def test_ntx_exact_runtime_quadratic_lagged_response_matches_live_reference(resp
             assert bool(jnp.all(jnp.isfinite(value)))
         return
 
+    # Rebuilding at the exact same transport state is not a Taylor test: it
+    # must reproduce the coefficient payload and the RHS exactly.  This
+    # catches accidental cache dependence on build history.
+    repeated_response = model.build_lagged_response(state)
+    for first, repeated in zip(
+        jax.tree_util.tree_leaves(response),
+        jax.tree_util.tree_leaves(repeated_response),
+        strict=True,
+    ):
+        assert jnp.array_equal(first, repeated)
+
     faces = build_face_transport_state(state, geometry)
     direct = model.evaluate_face_fluxes(state, faces)
     lagged = model.evaluate_with_lagged_response(state, response)
+    repeated_lagged = model.evaluate_with_lagged_response(state, repeated_response)
     for name in ("Gamma", "Q", "Upar"):
         assert jnp.allclose(
             lagged[f"{name}_faces"], direct[name], rtol=3.0e-6, atol=1.0e-12
         )
+        assert jnp.array_equal(lagged[f"{name}_faces"], repeated_lagged[f"{name}_faces"])
+
+    # This is deliberately below the Lij/flux reduction: at an unshifted
+    # anchor, the factorized quadratic primitive's C0 must be the ordinary
+    # prepared NTX coefficient solve at the exact same local (nu_hat,
+    # epsi_hat).  Check every face, including the outer face, and every
+    # species/energy coefficient.  A flux-only comparison could otherwise
+    # conceal cancelling errors between transport-moment components.
+    def _assert_axis_coefficients_match_live(*, coefficient_response, channels,
+                                             prepared_all, Er, temperature,
+                                             density):
+        vthermal = get_v_thermal(model.species.mass, temperature)
+        collisionality_kind = _collisionality_kind(model.collisionality_model)
+        for radius in range(Er.shape[0]):
+            prepared_local = jax.tree_util.tree_map(
+                lambda array: jax.lax.dynamic_index_in_dim(
+                    array, radius, axis=0, keepdims=False
+                ),
+                prepared_all,
+            )
+            for species_index in range(model.species.number_species):
+                nu_hat, epsi_hat, _ = model._local_scan_inputs(
+                    drds_value=channels.drds[radius],
+                    species_index=species_index,
+                    er_value=Er[radius],
+                    temperature_local=temperature[:, radius],
+                    density_local=density[:, radius],
+                    vthermal_local=vthermal[:, radius],
+                    collisionality_kind=collisionality_kind,
+                )
+                live_coefficients = model._solve_coefficient_scan_prepared(
+                    prepared_local, nu_hat, epsi_hat
+                )
+                assert jnp.allclose(
+                    coefficient_response.reference_coefficients[radius, species_index],
+                    live_coefficients,
+                    rtol=2.0e-10,
+                    atol=2.0e-12,
+                ), ("radius", radius, "species", species_index)
+
+    _assert_axis_coefficients_match_live(
+        coefficient_response=response.face_response,
+        channels=support.face_channels,
+        prepared_all=support.face_prepared,
+        Er=faces.Er,
+        temperature=faces.temperature,
+        density=faces.density,
+    )
+
+    # The direct-centre option is a second lagged coefficient payload.  Its
+    # construction must use the same collision model and preserve C0 too.
+    centre_model = dataclasses.replace(
+        model, center_response_mode="center_local_response"
+    )
+    centre_response = centre_model.build_lagged_response(state)
+    assert isinstance(centre_response.center_response, NTXQuadraticPreparedCoefficientResponse)
+    _assert_axis_coefficients_match_live(
+        coefficient_response=centre_response.center_response,
+        channels=support.center_channels,
+        prepared_all=support.center_prepared,
+        Er=state.Er,
+        temperature=state.temperature,
+        density=state.density,
+    )
 
     full_state_model = dataclasses.replace(model, full_state_quadratic_response=True)
     full_state_response = dataclasses.replace(

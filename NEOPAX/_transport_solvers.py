@@ -3765,6 +3765,10 @@ class _RadauSolverConfig(TransportSolver):
     # model: all three directional actions use the response already cached for
     # the attempted step.
     debug_cached_stage_jacobian_audit: bool = False
+    # Expensive forensic audit: at every actual lagged-response rebuild,
+    # compare the old cache, the new cache, and the live RHS at one identical
+    # solver state.  This is intentionally separate from Newton diagnostics.
+    debug_lagged_rebuild_audit: bool = False
 
     def __init__(
         self,
@@ -3821,6 +3825,7 @@ class _RadauSolverConfig(TransportSolver):
         debug_node_edge_live_probe: bool = False,
         debug_node_edge_live_probe_jacobian_threshold: float | None = None,
         debug_cached_stage_jacobian_audit: bool = False,
+        debug_lagged_rebuild_audit: bool = False,
         save_n=None,
     ):
         n_steps = max(1, int(jnp.ceil((float(t1) - float(t0)) / float(dt))))
@@ -4187,6 +4192,7 @@ class _RadauSolverConfig(TransportSolver):
         object.__setattr__(
             self, "debug_cached_stage_jacobian_audit", bool(debug_cached_stage_jacobian_audit)
         )
+        object.__setattr__(self, "debug_lagged_rebuild_audit", bool(debug_lagged_rebuild_audit))
         object.__setattr__(self, "save_n", save_n)
 
 @jax.tree_util.register_dataclass
@@ -4794,6 +4800,7 @@ class _RadauAcceptedStepKernelContext:
     zero_scalar: Any
     debug_newton_trace: Any
     debug_cached_stage_jacobian_audit: Any
+    debug_lagged_rebuild_audit: Any
     use_transport_lagged_response: Any
     lagged_response_correction_mode: str
     lagged_jacobian_refresh_mode: str
@@ -15350,6 +15357,64 @@ def _radau_prepare_stage_subsolve_inputs_from_carry(
         return _rhs_eval(t_eval, flat_y)
 
     f0 = _rhs_eval(t_value, flat_y)
+
+    # This audit is intentionally at the *actual* Radau cache boundary.  A
+    # unit test can establish deterministic response construction, but only
+    # here do we have the old cache, the replacement cache, and the exact
+    # state at which the solver will use the replacement.  The live RHS is
+    # expensive (one direct NTX evaluation per rebuild), hence the dedicated
+    # opt-in flag rather than a Newton-trace side effect.
+    if (
+        kernel_context.debug_lagged_rebuild_audit
+        and kernel_context.use_transport_lagged_response
+        and carry_in.lagged_response_cache is not None
+    ):
+        def _emit_rebuild_audit(_):
+            old_rhs = _radau_eval_rhs(
+                t_value,
+                flat_y,
+                carry_in.lagged_response_cache,
+                physics_context.flat_rhs,
+                physics_context.flat_rhs_with_lagged_response,
+            )
+            live_rhs = physics_context.flat_rhs(t_value, flat_y)
+            state_delta = flat_y - carry_in.lagged_reference_y
+            old_to_new_rhs = f0 - old_rhs
+            new_to_live_rhs = f0 - live_rhs
+            state_index = jnp.argmax(jnp.abs(state_delta))
+            old_to_new_index = jnp.argmax(jnp.abs(old_to_new_rhs))
+            new_to_live_index = jnp.argmax(jnp.abs(new_to_live_rhs))
+            jax.debug.print(
+                "[radau-lagged-rebuild-audit] t={t:.6e} "
+                "state_max_abs={state_abs:.6e} state_index={state_index} "
+                "state_old={state_old:.6e} state_new={state_new:.6e} "
+                "old_to_new_rhs_max_abs={old_new_abs:.6e} old_to_new_index={old_new_index} "
+                "old_rhs={old_rhs:.6e} new_rhs={new_rhs:.6e} "
+                "new_to_live_rhs_max_abs={new_live_abs:.6e} new_to_live_index={new_live_index} "
+                "new_rhs_at_live_index={new_rhs_live:.6e} live_rhs={live_rhs:.6e}",
+                t=t_value,
+                state_abs=jnp.abs(state_delta[state_index]),
+                state_index=state_index,
+                state_old=carry_in.lagged_reference_y[state_index],
+                state_new=flat_y[state_index],
+                old_new_abs=jnp.abs(old_to_new_rhs[old_to_new_index]),
+                old_new_index=old_to_new_index,
+                old_rhs=old_rhs[old_to_new_index],
+                new_rhs=f0[old_to_new_index],
+                new_live_abs=jnp.abs(new_to_live_rhs[new_to_live_index]),
+                new_live_index=new_to_live_index,
+                new_rhs_live=f0[new_to_live_index],
+                live_rhs=live_rhs[new_to_live_index],
+                ordered=True,
+            )
+            return jnp.asarray(0, dtype=jnp.int32)
+
+        jax.lax.cond(
+            jnp.logical_not(lagged_response_reused),
+            _emit_rebuild_audit,
+            lambda _: jnp.asarray(0, dtype=jnp.int32),
+            operand=None,
+        )
     rhs_time_ref = jax.jacfwd(_rhs_eval_at_state_time)(t_value)
     z0 = _make_radau_stage_predictor(
         f0,
@@ -22806,6 +22871,9 @@ def _build_prepared_radau_accepted_rollout(
         zero_scalar=zero_scalar,
         debug_newton_trace=bool(debug_newton_trace),
         debug_cached_stage_jacobian_audit=bool(debug_cached_stage_jacobian_audit),
+        debug_lagged_rebuild_audit=bool(
+            getattr(solver, "debug_lagged_rebuild_audit", False)
+        ),
         use_transport_lagged_response=bool(use_transport_lagged_response),
         lagged_response_correction_mode=str(
             getattr(solver, "lagged_response_correction_mode", "none")
@@ -23738,6 +23806,9 @@ class RADAUSolver(_RadauSolverConfig):
             zero_scalar=zero_scalar,
             debug_newton_trace=bool(debug_newton_trace),
             debug_cached_stage_jacobian_audit=bool(debug_cached_stage_jacobian_audit),
+            debug_lagged_rebuild_audit=bool(
+                getattr(self, "debug_lagged_rebuild_audit", False)
+            ),
             use_transport_lagged_response=bool(use_transport_lagged_response),
             lagged_response_correction_mode=str(
                 getattr(self, "lagged_response_correction_mode", "none")
@@ -29470,6 +29541,9 @@ def build_time_solver(solver_parameters: Any, solver_override: Any = None) -> Tr
             ),
             debug_cached_stage_jacobian_audit=bool(
                 _cfg_get("radau_debug_cached_stage_jacobian_audit", False)
+            ),
+            debug_lagged_rebuild_audit=bool(
+                _cfg_get("radau_debug_lagged_rebuild_audit", False)
             ),
             save_n=save_n,
         )
