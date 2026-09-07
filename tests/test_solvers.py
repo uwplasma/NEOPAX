@@ -1265,6 +1265,28 @@ def test_build_time_solver_radau_accepts_exact_cached_retry_refresh():
     assert solver.lagged_jacobian_refresh_mode == "quadratic_exact_retry_after_failure"
 
 
+def test_build_time_solver_radau_accepts_good_broyden_stage_secant():
+    """The new LU-only nonlinear correction is explicit and opt-in."""
+    solver = build_time_solver(
+        _base_solver_parameters(
+            transport_solver_backend="radau",
+            radau_rhs_mode="lagged_transport_response",
+            radau_stage_secant_correction_mode="good_broyden_after_first",
+        )
+    )
+    assert isinstance(solver, RADAUSolver)
+    assert solver.stage_secant_correction_mode == "good_broyden_after_first"
+
+
+def test_radau_stage_secant_correction_rejects_jacobian_refresh_combo():
+    with pytest.raises(ValueError, match="cannot be combined"):
+        RADAUSolver(
+            rhs_mode="lagged_transport_response",
+            lagged_jacobian_refresh_mode="quadratic_colored_after_first",
+            stage_secant_correction_mode="good_broyden_after_first",
+        )
+
+
 def test_radau_stage_drift_jacobian_refresh_requires_transport_lagged_response():
     with pytest.raises(ValueError, match="requires a lagged transport response RHS mode"):
         RADAUSolver(lagged_jacobian_refresh_mode="stage_drift_after_first")

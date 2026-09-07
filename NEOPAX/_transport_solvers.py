@@ -3742,6 +3742,7 @@ class _RadauSolverConfig(TransportSolver):
     lagged_response_correction_mode: str = "none"
     lagged_jacobian_refresh_mode: str = "none"
     lagged_jacobian_refresh_threshold: float = 1.0
+    stage_secant_correction_mode: str = "none"
     lagged_response_defect_mode: str = "off"
     lagged_response_defect_rtol: float = 1.0e-6
     lagged_response_defect_atol: float = 1.0e-8
@@ -3802,6 +3803,7 @@ class _RadauSolverConfig(TransportSolver):
         lagged_response_correction_mode: str = "none",
         lagged_jacobian_refresh_mode: str = "none",
         lagged_jacobian_refresh_threshold: float = 1.0,
+        stage_secant_correction_mode: str = "none",
         lagged_response_defect_mode: str = "off",
         lagged_response_defect_rtol: float = 1.0e-6,
         lagged_response_defect_atol: float = 1.0e-8,
@@ -4117,6 +4119,36 @@ class _RadauSolverConfig(TransportSolver):
         object.__setattr__(
             self, "lagged_jacobian_refresh_threshold", float(lagged_jacobian_refresh_threshold)
         )
+        stage_secant_mode_norm = str(stage_secant_correction_mode).strip().lower()
+        stage_secant_mode_aliases = {
+            "off": "none",
+            "disabled": "none",
+            "broyden": "good_broyden_after_first",
+            "good_broyden": "good_broyden_after_first",
+            "secant": "good_broyden_after_first",
+        }
+        stage_secant_mode_norm = stage_secant_mode_aliases.get(
+            stage_secant_mode_norm, stage_secant_mode_norm
+        )
+        if stage_secant_mode_norm not in {"none", "good_broyden_after_first"}:
+            raise ValueError(
+                "radau_stage_secant_correction_mode must be one of: none, "
+                "good_broyden_after_first"
+            )
+        if stage_secant_mode_norm != "none" and str(rhs_mode).strip().lower() not in {
+            "lagged_transport_response",
+            "lagged_response",
+        }:
+            raise ValueError(
+                "radau_stage_secant_correction_mode requires "
+                "radau_rhs_mode='lagged_transport_response'."
+            )
+        if stage_secant_mode_norm != "none" and jacobian_refresh_mode_norm != "none":
+            raise ValueError(
+                "radau_stage_secant_correction_mode and "
+                "radau_lagged_jacobian_refresh_mode cannot be combined."
+            )
+        object.__setattr__(self, "stage_secant_correction_mode", stage_secant_mode_norm)
         defect_mode_norm = str(lagged_response_defect_mode).strip().lower()
         defect_mode_aliases = {"none": "off", "disabled": "off", "endpoint": "endpoint_diagnostic", "diagnostic": "endpoint_diagnostic", "next": "endpoint_next_step_cap", "cap": "endpoint_next_step_cap"}
         defect_mode_norm = defect_mode_aliases.get(defect_mode_norm, defect_mode_norm)
@@ -4759,6 +4791,7 @@ class _RadauAcceptedStepKernelContext:
     lagged_response_correction_mode: str
     lagged_jacobian_refresh_mode: str
     lagged_jacobian_refresh_threshold: Any
+    stage_secant_correction_mode: str
     newton_stagnation_mode: str
     newton_stagnation_defect_budget: Any
     newton_stagnation_growth_cap: Any
@@ -15522,7 +15555,7 @@ def _radau_run_stage_subsolve(
         (
             iter_idx,
             z_cur,
-            _delta_prev,
+            delta_prev,
             delta_norm,
             residual_norm,
             stage_residual_defect_norm,
@@ -15542,12 +15575,43 @@ def _radau_run_stage_subsolve(
             inputs,
             z_cur,
         )
-        delta = _radau_stage_subsolve_linear_solve(
+        frozen_delta = _radau_stage_subsolve_linear_solve(
             kernel_context,
             inputs,
             -residual_cur,
         )
-        delta = jnp.where(jnp.all(jnp.isfinite(delta)), delta, jnp.zeros_like(delta))
+        frozen_delta = jnp.where(
+            jnp.all(jnp.isfinite(frozen_delta)), frozen_delta, jnp.zeros_like(frozen_delta)
+        )
+        if kernel_context.stage_secant_correction_mode == "good_broyden_after_first":
+            # The previous accepted correction supplies a true secant of the
+            # cached nonlinear stage residual.  Re-evaluating its residual is
+            # cached-response algebra only; no NTX build or live flux solve is
+            # performed.  The rank-one inverse itself calls the existing LU
+            # twice and is guarded internally against a singular update.
+            previous_residual = _radau_stage_subsolve_residual(
+                kernel_context,
+                physics_context,
+                inputs,
+                z_cur - delta_prev,
+            )
+            delta, secant_applied = _radau_rank_one_secant_inverse_apply(
+                lambda rhs: _radau_stage_subsolve_linear_solve(
+                    kernel_context, inputs, rhs
+                ),
+                lambda direction: _radau_frozen_stage_matrix_action(
+                    kernel_context,
+                    h_value=inputs.h_value,
+                    jacobian_ref=inputs.jacobian_ref,
+                    stage_direction=direction,
+                ),
+                -residual_cur,
+                delta_prev,
+                residual_cur - previous_residual,
+                tiny_scalar=kernel_context.tiny_scalar,
+            )
+        else:
+            delta, secant_applied = frozen_delta, jnp.asarray(False)
         current_residual_norm = _radau_residual_norm(kernel_context, residual_cur)
         current_stage_residual_defect_norm = _radau_stage_residual_defect_norm(
             kernel_context,
@@ -15733,10 +15797,13 @@ def _radau_run_stage_subsolve(
         # pure cached-response algebra: it never rebuilds NTX or replaces the
         # existing LU solve.  Keep other solver lanes byte-for-byte on their
         # established full-step path.
-        if kernel_context.lagged_jacobian_refresh_mode in {
+        if (
+            kernel_context.lagged_jacobian_refresh_mode in {
             "quadratic_colored_after_first",
             "quadratic_exact_retry_after_failure",
-        }:
+            }
+            or kernel_context.stage_secant_correction_mode == "good_broyden_after_first"
+        ):
             (
                 line_search_z,
                 accepted_delta,
@@ -15873,6 +15940,13 @@ def _radau_run_stage_subsolve(
                 nonfinite=nonfinite_state,
                 diverged=diverged_next,
             )
+            if kernel_context.stage_secant_correction_mode == "good_broyden_after_first":
+                jax.debug.print(
+                    "[radau-stage-secant] iter={iter} applied={applied}",
+                    iter=iter_idx + 1,
+                    applied=secant_applied,
+                    ordered=True,
+                )
         if node_edge_trace:
             z_cur_stages = z_cur.reshape((kernel_context.num_stages, kernel_context.state_dim))
             z_next_stages = z_next.reshape((kernel_context.num_stages, kernel_context.state_dim))
@@ -22501,6 +22575,9 @@ def _build_prepared_radau_accepted_rollout(
         lagged_jacobian_refresh_threshold=jnp.asarray(
             getattr(solver, "lagged_jacobian_refresh_threshold", 1.0), dtype=dtype
         ),
+        stage_secant_correction_mode=str(
+            getattr(solver, "stage_secant_correction_mode", "none")
+        ).strip().lower(),
         newton_stagnation_mode=str(
             getattr(solver, "newton_stagnation_mode", "off")
         ).strip().lower(),
@@ -23430,6 +23507,9 @@ class RADAUSolver(_RadauSolverConfig):
             lagged_jacobian_refresh_threshold=jnp.asarray(
                 getattr(self, "lagged_jacobian_refresh_threshold", 1.0), dtype=dtype
             ),
+            stage_secant_correction_mode=str(
+                getattr(self, "stage_secant_correction_mode", "none")
+            ).strip().lower(),
             newton_stagnation_mode=str(
                 getattr(self, "newton_stagnation_mode", "off")
             ).strip().lower(),
@@ -29119,6 +29199,9 @@ def build_time_solver(solver_parameters: Any, solver_override: Any = None) -> Tr
             ),
             lagged_jacobian_refresh_threshold=float(
                 _cfg_get("radau_lagged_jacobian_refresh_threshold", 1.0)
+            ),
+            stage_secant_correction_mode=str(
+                _cfg_get("radau_stage_secant_correction_mode", "none")
             ),
             lagged_response_defect_mode=str(_cfg_get("radau_lagged_response_defect_mode", "off")),
             lagged_response_defect_rtol=float(_cfg_get("radau_lagged_response_defect_rtol", 1.0e-6)),
