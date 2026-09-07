@@ -156,6 +156,29 @@ def test_radau_stage_residual_defect_is_not_hidden_by_endpoint_cancellation():
     assert jnp.allclose(defect, 0.5, rtol=1.0e-12, atol=1.0e-12)
 
 
+def test_radau_frozen_stage_matrix_action_matches_i_minus_h_a_kron_j():
+    """The Newton-direction audit must use the same operator as the LU."""
+
+    context = types.SimpleNamespace(
+        num_stages=2,
+        state_dim=2,
+        dtype=jnp.float64,
+        a=jnp.asarray([[0.2, 0.1], [0.3, 0.4]], dtype=jnp.float64),
+    )
+    h_value = jnp.asarray(0.5, dtype=jnp.float64)
+    jacobian = jnp.asarray([[2.0, -1.0], [0.5, 3.0]], dtype=jnp.float64)
+    direction = jnp.asarray([[1.0, -2.0], [3.0, 4.0]], dtype=jnp.float64)
+
+    observed = transport_solvers._radau_frozen_stage_matrix_action(
+        context,
+        h_value=h_value,
+        jacobian_ref=jacobian,
+        stage_direction=direction.ravel(),
+    ).reshape((2, 2))
+    expected = direction - h_value * (context.a @ direction) @ jacobian.T
+    assert jnp.allclose(observed, expected, rtol=1.0e-12, atol=1.0e-12)
+
+
 def test_radau_residual_line_search_damps_or_reports_failure():
     """A coloured-refresh correction must not be accepted after residual growth."""
 

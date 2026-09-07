@@ -14878,6 +14878,30 @@ def _radau_stage_subsolve_residual(
     )
 
 
+def _radau_frozen_stage_matrix_action(
+    kernel_context: _RadauAcceptedStepKernelContext,
+    *,
+    h_value,
+    jacobian_ref,
+    stage_direction,
+):
+    """Apply the exact stage matrix represented by the current frozen LU.
+
+    This is the Newton matrix action for the simplified Jacobian used by
+    Radau: ``I - h A kron J_ref``.  It is deliberately a matvec rather than a
+    materialized stage matrix, so debug audits can compare it to the full
+    nonlinear stage residual without allocating another dense operator.
+    """
+    direction = jnp.asarray(stage_direction, dtype=kernel_context.dtype).reshape(
+        (kernel_context.num_stages, kernel_context.state_dim)
+    )
+    stage_state_direction = jnp.asarray(h_value, dtype=kernel_context.dtype) * (
+        kernel_context.a @ direction
+    )
+    rhs_direction = stage_state_direction @ jnp.asarray(jacobian_ref).T
+    return (direction - rhs_direction).reshape((-1,))
+
+
 def _radau_stage_subsolve_linear_solve(
     kernel_context: _RadauAcceptedStepKernelContext,
     inputs: _RadauStageSubsolveInputs,
@@ -15408,6 +15432,48 @@ def _radau_run_stage_subsolve(
             stage_residual=residual_cur,
             endpoint_scale=endpoint_newton_scale,
         )
+        if kernel_context.debug_newton_trace:
+            # Audit the *actual* proposed Newton direction.  The coloured
+            # recovery audit above only checks its colour probes; this check
+            # asks the relevant question for a failing solve: does the stage
+            # matrix represented by the LU agree with the complete nonlinear
+            # cached stage residual along this correction?  The extra residual
+            # is cached-response algebra only--it does not rebuild NTX.
+            audit_fraction = jnp.asarray(1.0e-4, dtype=kernel_context.dtype)
+            residual_audit = _radau_stage_subsolve_residual(
+                kernel_context,
+                physics_context,
+                inputs,
+                z_cur + audit_fraction * delta,
+            )
+            finite_difference_action = (residual_audit - residual_cur) / audit_fraction
+            frozen_matrix_action = _radau_frozen_stage_matrix_action(
+                kernel_context,
+                h_value=inputs.h_value,
+                jacobian_ref=inputs.jacobian_ref,
+                stage_direction=delta,
+            )
+            action_difference = finite_difference_action - frozen_matrix_action
+            fd_norm = jnp.linalg.norm(finite_difference_action)
+            matrix_norm = jnp.linalg.norm(frozen_matrix_action)
+            action_cosine = jnp.vdot(
+                finite_difference_action, frozen_matrix_action
+            ) / jnp.maximum(
+                fd_norm * matrix_norm, kernel_context.tiny_scalar
+            )
+            jax.debug.print(
+                "[radau-stage-direction-audit] iter={iter} fraction={fraction:.1e} "
+                "fd_norm={fd_norm:.6e} matrix_norm={matrix_norm:.6e} "
+                "relative_error={relative_error:.6e} cosine={cosine:.6e}",
+                iter=iter_idx + 1,
+                fraction=audit_fraction,
+                fd_norm=fd_norm,
+                matrix_norm=matrix_norm,
+                relative_error=jnp.linalg.norm(action_difference)
+                / jnp.maximum(fd_norm, kernel_context.tiny_scalar),
+                cosine=action_cosine,
+                ordered=True,
+            )
         # A refreshed quadratic tangent is local.  Its LU correction can be
         # perfectly finite while still stepping beyond the cached response's
         # Newton basin.  For the coloured quadratic-refresh lane, globalize
