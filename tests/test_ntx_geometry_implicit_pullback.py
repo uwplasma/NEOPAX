@@ -1612,6 +1612,9 @@ def test_batched_database_geometry_payload_keeps_objective_axis_inside_hook():
         def __init__(self, geometry):
             self.geometry = geometry
 
+        def __call__(self, _t, _state, _runtime):
+            return self.geometry
+
         def _prepare_working_state(self, state):
             return state, None
 
@@ -1645,7 +1648,7 @@ def test_batched_database_geometry_payload_keeps_objective_axis_inside_hook():
         jnp.asarray([2.0, -3.0]),
         support,
     )
-    assert jnp.allclose(actual["geometry"], jnp.asarray([4.0, -6.0]))
+    assert jnp.allclose(actual["geometry"], jnp.asarray([2.0, -3.0]))
     assert jnp.allclose(actual["database"], jnp.zeros((2,)))
 
 

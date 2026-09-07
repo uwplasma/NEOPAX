@@ -3476,20 +3476,7 @@ class NTXDatabaseTransportModel(TransportFluxModelBase):
                     radius_index, state.Er[radius_index]
                 )
 
-            # The fixed-table radial interpolation has a finite primal JVP at
-            # the endpoint of the radial stencil, but its reverse rule can
-            # form ``0 * inf`` there.  In a full realtime VMEC payload that
-            # shows up as a nonfinite ``r_grid_half`` cotangent even though
-            # the corresponding forward directional derivative is finite.
-            #
-            # This database-only boundary therefore materializes the small
-            # local flux-vs-geometry Jacobian in forward mode and contracts
-            # it with the flux bars explicitly.  The method is exclusive to
-            # the fixed-database transport model: no Lij transport branch
-            # uses or is changed by this rule.  The database tables
-            # remain fixed; their compact table transpose is still owned by
-            # the separate table boundary and folded through the scan once.
-            local_jacobian = jax.jacfwd(_local_fluxes)(flat_delta0)
+            _, pullback = jax.vjp(_local_fluxes, flat_delta0)
             local_bar = {
                 "Gamma": jax.lax.dynamic_index_in_dim(
                     gamma_bar, radius_index,
@@ -3504,14 +3491,10 @@ class NTXDatabaseTransportModel(TransportFluxModelBase):
                     axis=2 if batched_rhs else 1, keepdims=False
                 ),
             }
-            def _contract(name):
-                value = jnp.asarray(local_bar[name])
-                jacobian = jnp.asarray(local_jacobian[name])
-                if batched_rhs:
-                    return jnp.einsum("...a,ap->...p", value, jacobian)
-                return jnp.einsum("a,ap->p", value, jacobian)
-
-            flat_bar = _contract("Gamma") + _contract("Q") + _contract("Upar")
+            if batched_rhs:
+                flat_bar = jax.vmap(lambda one_bar: pullback(one_bar)[0])(local_bar)
+            else:
+                (flat_bar,) = pullback(local_bar)
             return carry + flat_bar, None
 
         flat_bar, _ = jax.lax.scan(

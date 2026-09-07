@@ -15900,22 +15900,25 @@ def _radau_run_stage_subsolve(
                 )
             )(z_cur)
             frozen_delta = jnp.linalg.solve(current_stage_jacobian, -residual_cur)
+            full_stage_solve_finite = jnp.all(jnp.isfinite(frozen_delta))
         else:
             frozen_delta = _radau_stage_subsolve_linear_solve(
                 kernel_context,
                 inputs,
                 -residual_cur,
             )
+            full_stage_solve_finite = jnp.asarray(True)
         frozen_delta = jnp.where(
             jnp.all(jnp.isfinite(frozen_delta)), frozen_delta, jnp.zeros_like(frozen_delta)
         )
         if full_stage_newton and kernel_context.debug_newton_trace:
             jax.debug.print(
                 "[radau-full-stage-newton] iter={iter} stage_matrix_dim={dim} "
-                "matrix_finite={finite}",
+                "matrix_finite={finite} solve_finite={solve_finite}",
                 iter=iter_idx + 1,
                 dim=current_stage_jacobian.shape[0],
                 finite=jnp.all(jnp.isfinite(current_stage_jacobian)),
+                solve_finite=full_stage_solve_finite,
                 ordered=True,
             )
         if (
@@ -16230,6 +16233,15 @@ def _radau_run_stage_subsolve(
                 jnp.asarray(True),
             ),
         )
+        if full_stage_newton:
+            # The Hairer theta predictor diagnoses convergence of a *fixed*
+            # simplified-Newton matrix.  Here the full coupled stage matrix
+            # is rebuilt at every iteration, so an increasing correction norm
+            # does not establish divergence.  The line search is the correct
+            # globalization criterion: reject only an actual residual
+            # increase, non-finite values, or a non-reducing line-search
+            # direction below.
+            slow_contraction = jnp.asarray(False)
         convergence_metric = jnp.where(theta_valid, faccon * current_newton_norm, current_newton_norm)
         # The endpoint metric is deliberately O(1), unlike the legacy
         # stage-space fnewt.  Observe one contraction ratio before it may
