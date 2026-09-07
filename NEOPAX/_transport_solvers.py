@@ -11024,6 +11024,21 @@ def _radau_exact_stage_residual_input_pullback(
                 physics_context.flat_rhs_with_lagged_response,
             )
 
+        if rhs_transpose_mode in {
+            "explicit_database",
+            "database",
+            "explicit_black_box_database",
+        }:
+            # At the recorded database stages the primal forward-mode
+            # Jacobian is finite, while reverse-mode VJP of the same
+            # piecewise interpolation expression can form 0 * inf terms.
+            # Use the transpose of that finite primal Jacobian here.  This
+            # affects only the state adjoint; database D11/D13/D33 bars still
+            # use the compact table primitive below and are folded through
+            # the recorded NTX scan exactly once after all segments.
+            stage_jacobian = jax.jacfwd(_rhs_at_stage)(y_eval)
+            return stage_jacobian.T @ cotangent
+
         _, rhs_pullback = jax.vjp(_rhs_at_stage, y_eval)
         (jt_cotangent,) = rhs_pullback(cotangent)
         return jt_cotangent
@@ -16709,6 +16724,63 @@ def _radau_single_step_primal(
         return _rhs_eval(t_eval, flat_y)
 
     f0 = _rhs_eval(t_value, flat_y)
+
+    # This is the production accepted-step cache boundary.  On an actual
+    # rebuild, compare the previous cache, the newly built cache, and the
+    # direct/live RHS at exactly the accepted carry state.  The live call is
+    # intentionally opt-in because it performs one extra NTX solve per
+    # rebuild.
+    if (
+        kernel_context.debug_lagged_rebuild_audit
+        and kernel_context.use_transport_lagged_response
+        and carry_in.lagged_response_cache is not None
+    ):
+        def _emit_rebuild_audit(_):
+            old_rhs = _radau_eval_rhs(
+                t_value,
+                flat_y,
+                carry_in.lagged_response_cache,
+                physics_context.flat_rhs,
+                physics_context.flat_rhs_with_lagged_response,
+            )
+            live_rhs = physics_context.flat_rhs(t_value, flat_y)
+            state_delta = flat_y - carry_in.lagged_reference_y
+            old_to_new_rhs = f0 - old_rhs
+            new_to_live_rhs = f0 - live_rhs
+            state_index = jnp.argmax(jnp.abs(state_delta))
+            old_to_new_index = jnp.argmax(jnp.abs(old_to_new_rhs))
+            new_to_live_index = jnp.argmax(jnp.abs(new_to_live_rhs))
+            jax.debug.print(
+                "[radau-lagged-rebuild-audit] t={t:.6e} "
+                "state_max_abs={state_abs:.6e} state_index={state_index} "
+                "state_old={state_old:.6e} state_new={state_new:.6e} "
+                "old_to_new_rhs_max_abs={old_new_abs:.6e} old_to_new_index={old_new_index} "
+                "old_rhs={old_rhs:.6e} new_rhs={new_rhs:.6e} "
+                "new_to_live_rhs_max_abs={new_live_abs:.6e} new_to_live_index={new_live_index} "
+                "new_rhs_at_live_index={new_rhs_live:.6e} live_rhs={live_rhs:.6e}",
+                t=t_value,
+                state_abs=jnp.abs(state_delta[state_index]),
+                state_index=state_index,
+                state_old=carry_in.lagged_reference_y[state_index],
+                state_new=flat_y[state_index],
+                old_new_abs=jnp.abs(old_to_new_rhs[old_to_new_index]),
+                old_new_index=old_to_new_index,
+                old_rhs=old_rhs[old_to_new_index],
+                new_rhs=f0[old_to_new_index],
+                new_live_abs=jnp.abs(new_to_live_rhs[new_to_live_index]),
+                new_live_index=new_to_live_index,
+                new_rhs_live=f0[new_to_live_index],
+                live_rhs=live_rhs[new_to_live_index],
+                ordered=True,
+            )
+            return jnp.asarray(0, dtype=jnp.int32)
+
+        jax.lax.cond(
+            jnp.logical_not(lagged_response_reused),
+            _emit_rebuild_audit,
+            lambda _: jnp.asarray(0, dtype=jnp.int32),
+            operand=None,
+        )
     rhs_time_ref = jax.jacfwd(_rhs_eval_at_state_time)(t_value)
     z0 = _make_radau_stage_predictor(
         f0,
