@@ -5082,6 +5082,9 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
                 f"leaf={leaf_i}:{leaf_label}",
                 flush=True,
             )
+    _database_support_nonfinite_checkpoint(
+        "after_terminal_objectives_before_segments", support_bar_leaves
+    )
     rebuild_component_timing = bool(
         getattr(
             reverse_setup.execution_context.physics_context,
