@@ -5056,6 +5056,32 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
             False,
         )
     )
+
+    def _database_support_nonfinite_checkpoint(label, leaves):
+        """Report the first bad database-table bar without changing AD work.
+
+        The recorded scan fold is intentionally deferred until after this
+        routine.  Therefore this is the last useful provenance boundary for
+        distinguishing a bad transport cotangent from a bad scan transpose.
+        It is opt-in with the existing segment-input diagnostics flag.
+        """
+        if not (segment_input_diagnostics and use_database_table_geometry_split):
+            return
+        bad_rows = _batched_support_first_nonfinite_leaves(
+            tuple(leaves)[: len(_zero_support_leaves)],
+            support_leaf_labels,
+            objective_count,
+        )
+        for objective_i, first_bad in enumerate(bad_rows):
+            if first_bad is None:
+                continue
+            leaf_i, leaf_label = first_bad
+            print(
+                f"{progress_prefix} diagnostic: database table bar checkpoint={label} "
+                f"first_nonfinite objective={objective_labels[objective_i]} "
+                f"leaf={leaf_i}:{leaf_label}",
+                flush=True,
+            )
     rebuild_component_timing = bool(
         getattr(
             reverse_setup.execution_context.physics_context,
@@ -5681,7 +5707,7 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
                 (reduced_bars, segment_support_bar_leaves)
             )
         segment_bad_rows = None
-        if segment_input_diagnostics and not use_database_table_geometry_split:
+        if segment_input_diagnostics:
             segment_bad_rows = _batched_support_first_nonfinite_leaves(
                 segment_support_bar_leaves[: len(_zero_support_leaves)],
                 support_leaf_labels,
@@ -5699,6 +5725,8 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
                     flush=True,
                 )
             if (
+                not use_database_table_geometry_split
+                and
                 not actual_cotangent_nonfinite_segment_diagnosed
                 and any(row is not None for row in segment_bad_rows)
             ):
@@ -5906,6 +5934,7 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
             f"segments={len(database_geometry_records_by_segment)}",
             flush=True,
         )
+    _database_support_nonfinite_checkpoint("after_segment_sweep", support_bar_leaves)
     reduced_bars, support_bar_leaves = jax.block_until_ready((reduced_bars, support_bar_leaves))
     print(
         f"{progress_prefix} progress: support reverse segmented cotangent sweep ready "
@@ -6125,6 +6154,9 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
             f"elapsed_s={initial_cache_compile_plus_execute_elapsed:.3f} "
             f"mode={initial_cache_support_pullback_mode}",
             flush=True,
+        )
+        _database_support_nonfinite_checkpoint(
+            "after_initial_direct_rhs", support_bar_leaves
         )
         if initial_cache_support_warm_call is not None:
             warm_start = time.perf_counter()
@@ -6603,6 +6635,9 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
         support_bar_leaves = tuple(
             accumulated + increment
             for accumulated, increment in zip(support_bar_leaves, initial_er_root_support_bar_leaves)
+        )
+        _database_support_nonfinite_checkpoint(
+            "after_initial_selected_root", support_bar_leaves
         )
     # The native VMEC-coefficient route replaces only the *rebuild face
     # prepared-system* contribution.  Objective, initial-cache, and
