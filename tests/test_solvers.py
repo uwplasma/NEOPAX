@@ -179,6 +179,43 @@ def test_radau_frozen_stage_matrix_action_matches_i_minus_h_a_kron_j():
     assert jnp.allclose(observed, expected, rtol=1.0e-12, atol=1.0e-12)
 
 
+def test_radau_rank_one_secant_inverse_apply_matches_updated_operator():
+    """The LU-only good-Broyden formula equals an explicit rank-one solve."""
+    frozen = jnp.asarray([[2.0, 0.0], [0.0, 3.0]])
+    step = jnp.asarray([1.0, -2.0])
+    local = jnp.asarray([[4.0, 1.0], [1.0, 2.0]])
+    residual_delta = local @ step
+    rhs = jnp.asarray([-3.0, 5.0])
+    observed, applied = transport_solvers._radau_rank_one_secant_inverse_apply(
+        lambda value: jnp.linalg.solve(frozen, value),
+        lambda value: frozen @ value,
+        rhs,
+        step,
+        residual_delta,
+        tiny_scalar=jnp.asarray(1.0e-14),
+    )
+    update = (residual_delta - frozen @ step)[:, None] * step[None, :] / (step @ step)
+    expected = jnp.linalg.solve(frozen + update, rhs)
+    assert bool(applied)
+    assert jnp.allclose(observed, expected, rtol=1.0e-12, atol=1.0e-12)
+
+
+def test_radau_rank_one_secant_inverse_apply_rejects_zero_secant():
+    """A missing secant leaves the established frozen-LU solve unchanged."""
+    frozen = jnp.asarray([[2.0, 0.0], [0.0, 3.0]])
+    rhs = jnp.asarray([-3.0, 5.0])
+    observed, applied = transport_solvers._radau_rank_one_secant_inverse_apply(
+        lambda value: jnp.linalg.solve(frozen, value),
+        lambda value: frozen @ value,
+        rhs,
+        jnp.zeros(2),
+        jnp.zeros(2),
+        tiny_scalar=jnp.asarray(1.0e-14),
+    )
+    assert not bool(applied)
+    assert jnp.allclose(observed, jnp.linalg.solve(frozen, rhs))
+
+
 def test_radau_cached_stage_residual_is_independent_of_frozen_jacobian():
     """The cached nonlinear response, not ``J_ref``, defines Radau's R(Z).
 

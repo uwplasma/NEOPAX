@@ -7226,7 +7226,6 @@ def _execute_radau_accepted_step_next_reduced_cotangent_batched_bwd_with_support
                 lagged_response,
                 rhs=dz_bars.reshape((dz_bars.shape[0], -1)),
             )
-
     rhs_pullback_mode = str(
         getattr(physics_context, "reverse_rhs_pullback_mode", "separate")
     ).strip().lower()
@@ -14687,6 +14686,22 @@ def _radau_solve_exact_stage_residual_transpose_batched(
     rhs_arr = jnp.asarray(rhs, dtype=kernel_context.dtype).reshape(
         (-1, kernel_context.num_stages * kernel_context.state_dim)
     )
+    if bool(getattr(physics_context, "reverse_segment_input_diagnostics", False)):
+        def _print_nonfinite_rhs(_):
+            jax.debug.print(
+                "[database-stage-adjoint] nonfinite stage-solve RHS: "
+                "shape={shape} nonfinite_count={count}",
+                shape=jnp.asarray(rhs_arr.shape),
+                count=jnp.sum(jnp.logical_not(jnp.isfinite(rhs_arr))),
+            )
+            return None
+
+        jax.lax.cond(
+            jnp.all(jnp.isfinite(rhs_arr)),
+            lambda _: None,
+            _print_nonfinite_rhs,
+            operand=None,
+        )
     cotangent_mode = str(getattr(physics_context, "reverse_stage_cotangent_mode", "full")).strip().lower()
     if cotangent_mode in {"zero_stage_solve", "stage_solve_zero", "zero_stage_adjoint"}:
         return jnp.zeros_like(rhs_arr)
@@ -14978,6 +14993,52 @@ def _radau_stage_subsolve_linear_solve(
         complex_lu_out=inputs.complex_lu_out,
         complex_piv_out=inputs.complex_piv_out,
     )
+
+
+def _radau_rank_one_secant_inverse_apply(
+    base_inverse_apply,
+    frozen_operator_apply,
+    rhs,
+    secant_step,
+    secant_residual_delta,
+    *,
+    tiny_scalar,
+):
+    """Apply a guarded good-Broyden inverse update without another matrix.
+
+    With frozen stage operator ``M`` and the previous Newton secant ``(s,y)``,
+    use ``M + (y - M s) s.T / (s.T s)``.  Sherman--Morrison needs only two
+    applications of the existing LU inverse and stage-length vectors: it does
+    not build, factor, or retain a second dense stage matrix.
+    """
+    rhs = jnp.asarray(rhs)
+    step = jnp.asarray(secant_step, dtype=rhs.dtype)
+    residual_delta = jnp.asarray(secant_residual_delta, dtype=rhs.dtype)
+    base_solution = base_inverse_apply(rhs)
+    step_norm_sq = jnp.vdot(step, step)
+    safe_step_norm_sq = jnp.maximum(step_norm_sq, tiny_scalar)
+    update_direction = residual_delta - frozen_operator_apply(step)
+    inverse_update_direction = base_inverse_apply(update_direction)
+    rank_one_denominator = (
+        jnp.asarray(1.0, dtype=rhs.dtype)
+        + jnp.vdot(step, inverse_update_direction) / safe_step_norm_sq
+    )
+    candidate = base_solution - inverse_update_direction * (
+        jnp.vdot(step, base_solution)
+        / (safe_step_norm_sq * rank_one_denominator)
+    )
+    usable = jnp.logical_and(
+        step_norm_sq > tiny_scalar,
+        jnp.logical_and(
+            jnp.abs(rank_one_denominator)
+            > jnp.sqrt(jnp.asarray(tiny_scalar, dtype=rhs.dtype)),
+            jnp.logical_and(
+                jnp.all(jnp.isfinite(candidate)),
+                jnp.all(jnp.isfinite(inverse_update_direction)),
+            ),
+        ),
+    )
+    return jnp.where(usable, candidate, base_solution), usable
 
 
 def _radau_prepare_stage_subsolve_inputs_from_carry(
