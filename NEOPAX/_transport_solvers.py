@@ -4098,12 +4098,13 @@ class _RadauSolverConfig(TransportSolver):
             "endpoint_after_first",
             "stage_drift_after_first",
             "quadratic_colored_after_first",
+            "quadratic_full_stage_each_iteration",
             "quadratic_exact_retry_after_failure",
         }:
             raise ValueError(
-                "radau_lagged_jacobian_refresh_mode must be one of: none, endpoint_after_first, "
-                "stage_drift_after_first, quadratic_colored_after_first"
-                ", quadratic_exact_retry_after_failure"
+            "radau_lagged_jacobian_refresh_mode must be one of: none, endpoint_after_first, "
+            "stage_drift_after_first, quadratic_colored_after_first"
+            ", quadratic_full_stage_each_iteration, quadratic_exact_retry_after_failure"
             )
         if float(lagged_jacobian_refresh_threshold) <= 0.0:
             raise ValueError("radau_lagged_jacobian_refresh_threshold must be positive")
@@ -15857,6 +15858,11 @@ def _radau_run_stage_subsolve(
             ordered=True,
         )
 
+    full_stage_newton = (
+        kernel_context.lagged_jacobian_refresh_mode
+        == "quadratic_full_stage_each_iteration"
+    )
+
     def body_fn(newton_state):
         (
             iter_idx,
@@ -15882,15 +15888,40 @@ def _radau_run_stage_subsolve(
             inputs,
             z_cur,
         )
-        frozen_delta = _radau_stage_subsolve_linear_solve(
-            kernel_context,
-            inputs,
-            -residual_cur,
-        )
+        if full_stage_newton:
+            # Exact Newton matrix of the *fixed cached quadratic response* at
+            # the complete current Radau stage vector.  Unlike simplified
+            # Newton, every stage receives its own current RHS tangent and
+            # the off-diagonal Radau coupling is retained.  The lagged NTX
+            # response is not rebuilt here.
+            current_stage_jacobian = jax.jacfwd(
+                lambda z: _radau_stage_subsolve_residual(
+                    kernel_context, physics_context, inputs, z
+                )
+            )(z_cur)
+            frozen_delta = jnp.linalg.solve(current_stage_jacobian, -residual_cur)
+        else:
+            frozen_delta = _radau_stage_subsolve_linear_solve(
+                kernel_context,
+                inputs,
+                -residual_cur,
+            )
         frozen_delta = jnp.where(
             jnp.all(jnp.isfinite(frozen_delta)), frozen_delta, jnp.zeros_like(frozen_delta)
         )
-        if kernel_context.stage_secant_correction_mode == "good_broyden_after_first":
+        if full_stage_newton and kernel_context.debug_newton_trace:
+            jax.debug.print(
+                "[radau-full-stage-newton] iter={iter} stage_matrix_dim={dim} "
+                "matrix_finite={finite}",
+                iter=iter_idx + 1,
+                dim=current_stage_jacobian.shape[0],
+                finite=jnp.all(jnp.isfinite(current_stage_jacobian)),
+                ordered=True,
+            )
+        if (
+            kernel_context.stage_secant_correction_mode == "good_broyden_after_first"
+            and not full_stage_newton
+        ):
             # The previous accepted correction supplies a true secant of the
             # cached nonlinear stage residual.  Re-evaluating its residual is
             # cached-response algebra only; no NTX build or live flux solve is
@@ -16107,6 +16138,7 @@ def _radau_run_stage_subsolve(
         if (
             kernel_context.lagged_jacobian_refresh_mode in {
             "quadratic_colored_after_first",
+            "quadratic_full_stage_each_iteration",
             "quadratic_exact_retry_after_failure",
             }
             or kernel_context.stage_secant_correction_mode == "good_broyden_after_first"
@@ -22780,11 +22812,12 @@ def _build_prepared_radau_accepted_rollout(
         flat_rhs_state_and_lagged_response_pullback = None
         flat_rhs_lagged_response_all_pullback = None
         if str(getattr(solver, "lagged_jacobian_refresh_mode", "none")).strip().lower() not in {
-            "none", "quadratic_colored_after_first", "quadratic_exact_retry_after_failure"
+            "none", "quadratic_colored_after_first",
+            "quadratic_full_stage_each_iteration", "quadratic_exact_retry_after_failure"
         }:
             raise ValueError(
                 "floating_ambipolar_edge_node supports only 'none', "
-                "'quadratic_colored_after_first', or "
+                "'quadratic_colored_after_first', 'quadratic_full_stage_each_iteration', or "
                 "'quadratic_exact_retry_after_failure' for "
                 "radau_lagged_jacobian_refresh_mode."
             )
@@ -23696,11 +23729,12 @@ class RADAUSolver(_RadauSolverConfig):
             flat_rhs_with_lagged_response_tangent = _node_lagged_rhs_tangent
             flat_rhs_state_pullback = _node_lagged_rhs_state_pullback
             if str(getattr(self, "lagged_jacobian_refresh_mode", "none")).strip().lower() not in {
-                "none", "quadratic_colored_after_first", "quadratic_exact_retry_after_failure"
+                "none", "quadratic_colored_after_first",
+                "quadratic_full_stage_each_iteration", "quadratic_exact_retry_after_failure"
             }:
                 raise ValueError(
                     "floating_ambipolar_edge_node supports only 'none', "
-                    "'quadratic_colored_after_first', or "
+                    "'quadratic_colored_after_first', 'quadratic_full_stage_each_iteration', or "
                     "'quadratic_exact_retry_after_failure' for "
                     "radau_lagged_jacobian_refresh_mode."
                 )

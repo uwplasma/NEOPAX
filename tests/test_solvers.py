@@ -1287,6 +1287,114 @@ def test_build_time_solver_radau_accepts_exact_cached_retry_refresh():
     assert solver.lagged_jacobian_refresh_mode == "quadratic_exact_retry_after_failure"
 
 
+def test_build_time_solver_radau_accepts_full_stage_quadratic_newton():
+    """The exact cached-stage Newton lane is explicitly opt-in."""
+    solver = build_time_solver(
+        _base_solver_parameters(
+            transport_solver_backend="radau",
+            radau_rhs_mode="lagged_transport_response",
+            radau_lagged_jacobian_refresh_mode="quadratic_full_stage_each_iteration",
+        )
+    )
+    assert isinstance(solver, RADAUSolver)
+    assert solver.lagged_jacobian_refresh_mode == "quadratic_full_stage_each_iteration"
+
+
+def test_radau_full_stage_quadratic_newton_runs_on_cached_nonlinear_rhs():
+    """Every correction may use the exact current Jacobian of a fixed cache."""
+
+    class NonlinearCachedField:
+        def __call__(self, _t, y):
+            return y * y
+
+        def build_lagged_response(self, y):
+            return y
+
+        def evaluate_with_lagged_response(self, _t, y, *_args, lagged_response):
+            del _args, lagged_response
+            return y * y
+
+    solver = RADAUSolver(
+        t0=0.0,
+        t1=1.0e-3,
+        dt=1.0e-4,
+        rtol=1.0e-7,
+        atol=1.0e-10,
+        rhs_mode="lagged_transport_response",
+        lagged_jacobian_refresh_mode="quadratic_full_stage_each_iteration",
+        maxiter=8,
+        max_steps=16,
+    )
+    out = solver.solve(jnp.asarray([0.4]), NonlinearCachedField().__call__)
+    assert int(out["n_steps"]) > 0
+    assert jnp.all(jnp.isfinite(out["final_state"]))
+
+
+def test_radau_full_stage_quadratic_newton_traces_through_accepted_step_vjp():
+    """The exact cached-stage mode retains the implicit accepted-step VJP."""
+
+    class NonlinearCachedField:
+        def __call__(self, _t, y):
+            return y * y
+
+        def build_lagged_response(self, y):
+            return y
+
+        def evaluate_with_lagged_response(self, _t, y, *_args, lagged_response):
+            del _args, lagged_response
+            return y * y
+
+    solver = RADAUSolver(
+        t0=0.0,
+        t1=1.0e-3,
+        dt=1.0e-4,
+        rtol=1.0e-7,
+        atol=1.0e-10,
+        rhs_mode="lagged_transport_response",
+        lagged_jacobian_refresh_mode="quadratic_full_stage_each_iteration",
+        maxiter=8,
+        max_steps=8,
+    )
+    field = NonlinearCachedField()
+    prepared = transport_solvers._build_prepared_radau_accepted_rollout(
+        solver=solver,
+        state=jnp.asarray([0.4]),
+        vector_field=field.__call__,
+        species=None,
+    )
+    prepared = dataclasses.replace(
+        prepared,
+        physics_context=dataclasses.replace(
+            prepared.physics_context,
+            pullback_build_lagged_response=lambda _state, cache_bar: cache_bar,
+        ),
+    )
+    attempt_context = transport_solvers._RadauAcceptedStepAttemptContext(
+        t_final=prepared.initial_carry.t + prepared.initial_carry.dt,
+        use_transport_lagged_response=jnp.asarray(True),
+    )
+
+    def trial_y(initial_y):
+        carry = dataclasses.replace(prepared.initial_carry, y=initial_y)
+        return transport_solvers._execute_radau_accepted_step_trial_y_vjp_lagged_branch(
+            prepared.kernel_context,
+            prepared.physics_context,
+            carry,
+            attempt_context,
+            "rebuild",
+        )
+
+    y0 = jnp.asarray([0.4])
+    value, pullback = jax.vjp(trial_y, y0)
+    (gradient,) = pullback(jnp.ones_like(value))
+    epsilon = jnp.asarray(1.0e-6)
+    finite_difference = (
+        jnp.sum(trial_y(y0 + epsilon)) - jnp.sum(trial_y(y0 - epsilon))
+    ) / (2.0 * epsilon)
+    assert jnp.all(jnp.isfinite(gradient))
+    assert jnp.allclose(gradient[0], finite_difference, rtol=2.0e-4, atol=2.0e-6)
+
+
 def test_build_time_solver_radau_accepts_good_broyden_stage_secant():
     """The new LU-only nonlinear correction is explicit and opt-in."""
     solver = build_time_solver(
