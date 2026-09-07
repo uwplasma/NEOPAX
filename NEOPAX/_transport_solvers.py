@@ -4245,6 +4245,8 @@ class _RadauAcceptedStepAttemptResult:
     err_norm: Any
     converged: Any
     stage_history: Any
+    final_stage_newton_delta: Any
+    stage_secant_applied: Any
     jacobian_out: Any
     cache_valid_out: Any
     cache_dt_out: Any
@@ -4283,6 +4285,8 @@ class _RadauAcceptedStepReverseMinimalAttemptResult:
     trial_dt: Any
     trial_y: Any
     stage_history: Any
+    final_stage_newton_delta: Any
+    stage_secant_applied: Any
     jacobian_out: Any
     cache_valid_out: Any
     cache_dt_out: Any
@@ -4310,6 +4314,8 @@ class _RadauAcceptedStepSegmentPrimalRecord:
     trial_dt: Any
     trial_y: Any
     stage_history: Any
+    final_stage_newton_delta: Any
+    stage_secant_applied: Any
     jacobian_out: Any
     cache_valid_out: Any
     cache_dt_out: Any
@@ -4671,6 +4677,7 @@ class _RadauStageSubsolveResult:
     final_residual: Any
     final_residual_norm: Any
     converged: Any
+    secant_applied_final: Any
     newton_state_final: Any
 
 
@@ -5079,6 +5086,12 @@ def _radau_build_approximate_tangent_result(
         trial_dt=tangent_result.dtrial_dt,
         trial_y=tangent_result.dtrial_y,
         stage_history=tangent_result.dstage_history,
+        final_stage_newton_delta=_zero_tangent_like(
+            attempt_result.final_stage_newton_delta
+        ),
+        stage_secant_applied=_zero_tangent_like(
+            attempt_result.stage_secant_applied
+        ),
         jacobian_out=_zero_tangent_like(attempt_result.jacobian_out),
         cache_valid_out=_zero_tangent_like(attempt_result.cache_valid_out),
         cache_dt_out=_zero_tangent_like(attempt_result.cache_dt_out),
@@ -5703,14 +5716,13 @@ def _execute_radau_accepted_step_trial_y_vjp_lagged_branch_bwd(
         solve_mode = str(getattr(physics_context, "reverse_stage_adjoint_solve_mode", "structured")).strip().lower()
 
         if solve_mode == "structured":
-            stage_rhs_bar = _radau_apply_stage_linear_transpose_solve(
+            stage_rhs_bar = _radau_apply_selected_stage_secant_transpose(
                 kernel_context,
+                physics_context,
+                carry_in,
+                primal_result,
+                lagged_response,
                 rhs=dz_bar.reshape((-1,)),
-                real_lu_out=primal_result.real_lu_out,
-                real_piv_out=primal_result.real_piv_out,
-                complex_lu_out=primal_result.complex_lu_out,
-                complex_piv_out=primal_result.complex_piv_out,
-                skip_zero_rhs_shortcut=True,
             )
             stage_rhs_bar = stage_rhs_bar.reshape((kernel_context.num_stages, kernel_context.state_dim))
             stage_state_source_bar = stage_rhs_bar @ primal_result.jacobian_out
@@ -6018,14 +6030,13 @@ def _execute_radau_accepted_step_next_carry_vjp_lagged_branch_bwd(
         solve_mode = str(getattr(physics_context, "reverse_stage_adjoint_solve_mode", "structured")).strip().lower()
 
         if solve_mode == "structured":
-            stage_rhs_bar = _radau_apply_stage_linear_transpose_solve(
+            stage_rhs_bar = _radau_apply_selected_stage_secant_transpose(
                 kernel_context,
+                physics_context,
+                carry_in,
+                primal_result,
+                lagged_response,
                 rhs=dz_bar.reshape((-1,)),
-                real_lu_out=primal_result.real_lu_out,
-                real_piv_out=primal_result.real_piv_out,
-                complex_lu_out=primal_result.complex_lu_out,
-                complex_piv_out=primal_result.complex_piv_out,
-                skip_zero_rhs_shortcut=True,
             )
             stage_rhs_bar = stage_rhs_bar.reshape((kernel_context.num_stages, kernel_context.state_dim))
             stage_state_source_bar = stage_rhs_bar @ primal_result.jacobian_out
@@ -7259,6 +7270,31 @@ def _execute_radau_accepted_step_next_reduced_cotangent_batched_bwd_with_support
                 lagged_response,
                 rhs=dz_bars.reshape((dz_bars.shape[0], -1)),
             )
+    if bool(getattr(physics_context, "reverse_segment_input_diagnostics", False)):
+        component_values_finite = (
+            jnp.all(jnp.isfinite(trial_y_bars))
+            & jnp.all(jnp.isfinite(primal_result.trial_dt))
+            & jnp.all(jnp.isfinite(kernel_context.b))
+        )
+
+        def _print_nonfinite_dz_components(_):
+            jax.debug.print(
+                "[database-stage-adjoint] nonfinite dz-bar input: "
+                "next_y_finite={next_y_finite} trial_dt={trial_dt} "
+                "trial_dt_finite={trial_dt_finite} radau_b_finite={radau_b_finite}",
+                next_y_finite=jnp.all(jnp.isfinite(trial_y_bars)),
+                trial_dt=primal_result.trial_dt,
+                trial_dt_finite=jnp.all(jnp.isfinite(primal_result.trial_dt)),
+                radau_b_finite=jnp.all(jnp.isfinite(kernel_context.b)),
+            )
+            return None
+
+        jax.lax.cond(
+            component_values_finite,
+            lambda _: None,
+            _print_nonfinite_dz_components,
+            operand=None,
+        )
     rhs_pullback_mode = str(
         getattr(physics_context, "reverse_rhs_pullback_mode", "separate")
     ).strip().lower()
@@ -7727,6 +7763,8 @@ def _radau_reverse_minimal_attempt_from_segment_primal_record(
         trial_dt=record.trial_dt,
         trial_y=record.trial_y,
         stage_history=record.stage_history,
+        final_stage_newton_delta=record.final_stage_newton_delta,
+        stage_secant_applied=record.stage_secant_applied,
         jacobian_out=record.jacobian_out,
         cache_valid_out=record.cache_valid_out,
         cache_dt_out=record.cache_dt_out,
@@ -9225,7 +9263,8 @@ def _execute_radau_accepted_step_attempt(
     """
     trial_dt = jnp.minimum(carry_in.dt, context.t_final - carry_in.t)
     (
-        trial_y, err_norm, converged, stage_history, theta_final,
+        trial_y, err_norm, converged, stage_history, final_stage_newton_delta,
+        stage_secant_applied, theta_final,
         newton_iter_count, final_residual_norm, final_delta_norm,
         slow_contraction_final, residual_blowup_final, newton_nonfinite_final,
         jacobian_out, cache_valid_out, cache_dt_out, cache_age_out,
@@ -9249,6 +9288,8 @@ def _execute_radau_accepted_step_attempt(
         err_norm=err_norm,
         converged=converged,
         stage_history=stage_history,
+        final_stage_newton_delta=final_stage_newton_delta,
+        stage_secant_applied=stage_secant_applied,
         jacobian_out=jacobian_out,
         cache_valid_out=cache_valid_out,
         cache_dt_out=cache_dt_out,
@@ -9292,6 +9333,8 @@ def _execute_radau_accepted_step_attempt_reverse_minimal(
     (
         trial_y,
         stage_history,
+        final_stage_newton_delta,
+        stage_secant_applied,
         jacobian_out,
         cache_valid_out,
         cache_dt_out,
@@ -9316,6 +9359,8 @@ def _execute_radau_accepted_step_attempt_reverse_minimal(
         trial_dt=trial_dt,
         trial_y=trial_y,
         stage_history=stage_history,
+        final_stage_newton_delta=final_stage_newton_delta,
+        stage_secant_applied=stage_secant_applied,
         jacobian_out=jacobian_out,
         cache_valid_out=cache_valid_out,
         cache_dt_out=cache_dt_out,
@@ -9346,6 +9391,8 @@ def _execute_radau_accepted_step_attempt_reverse_minimal_with_compact_coefficien
     (
         trial_y,
         stage_history,
+        final_stage_newton_delta,
+        stage_secant_applied,
         jacobian_out,
         cache_valid_out,
         cache_dt_out,
@@ -9377,6 +9424,8 @@ def _execute_radau_accepted_step_attempt_reverse_minimal_with_compact_coefficien
         trial_dt=trial_dt,
         trial_y=trial_y,
         stage_history=stage_history,
+        final_stage_newton_delta=final_stage_newton_delta,
+        stage_secant_applied=stage_secant_applied,
         jacobian_out=jacobian_out,
         cache_valid_out=cache_valid_out,
         cache_dt_out=cache_dt_out,
@@ -9399,6 +9448,8 @@ def _radau_segment_primal_record_from_reverse_minimal_attempt(
         trial_dt=minimal_result.trial_dt,
         trial_y=minimal_result.trial_y,
         stage_history=minimal_result.stage_history,
+        final_stage_newton_delta=minimal_result.final_stage_newton_delta,
+        stage_secant_applied=minimal_result.stage_secant_applied,
         jacobian_out=minimal_result.jacobian_out,
         cache_valid_out=minimal_result.cache_valid_out,
         cache_dt_out=minimal_result.cache_dt_out,
@@ -9422,6 +9473,8 @@ def _radau_segment_primal_record_padding(
         trial_dt=jnp.zeros_like(carry.dt),
         trial_y=carry.y,
         stage_history=carry.prev_stages,
+        final_stage_newton_delta=jnp.zeros_like(carry.prev_stages),
+        stage_secant_applied=jnp.asarray(False),
         jacobian_out=carry.jacobian,
         cache_valid_out=carry.cache_valid,
         cache_dt_out=carry.cache_dt,
@@ -14618,14 +14671,13 @@ def _radau_solve_exact_stage_residual_transpose(
 
     mode = str(getattr(physics_context, "reverse_stage_adjoint_solve_mode", "structured")).strip().lower()
     if mode == "structured":
-        return -_radau_apply_stage_linear_transpose_solve(
+        return -_radau_apply_selected_stage_secant_transpose(
             kernel_context,
+            physics_context,
+            carry_in,
+            primal_result,
+            lagged_response,
             rhs=rhs,
-            real_lu_out=primal_result.real_lu_out,
-            real_piv_out=primal_result.real_piv_out,
-            complex_lu_out=primal_result.complex_lu_out,
-            complex_piv_out=primal_result.complex_piv_out,
-            skip_zero_rhs_shortcut=True,
         )
     if mode == "exact_block_compact":
         return _radau_solve_exact_stage_residual_transpose_compact(
@@ -14742,14 +14794,13 @@ def _radau_solve_exact_stage_residual_transpose_batched(
     mode = str(getattr(physics_context, "reverse_stage_adjoint_solve_mode", "structured")).strip().lower()
     if mode == "structured":
         return -jax.vmap(
-            lambda rhs_row: _radau_apply_stage_linear_transpose_solve(
+            lambda rhs_row: _radau_apply_selected_stage_secant_transpose(
                 kernel_context,
+                physics_context,
+                carry_in,
+                primal_result,
+                lagged_response,
                 rhs=rhs_row,
-                real_lu_out=primal_result.real_lu_out,
-                real_piv_out=primal_result.real_piv_out,
-                complex_lu_out=primal_result.complex_lu_out,
-                complex_piv_out=primal_result.complex_piv_out,
-                skip_zero_rhs_shortcut=True,
             )
         )(rhs_arr)
     if mode == "exact_block_compact":
@@ -15124,6 +15175,93 @@ def _radau_rank_one_secant_transpose_inverse_apply(
     return jnp.where(usable, candidate, base_solution), usable
 
 
+def _radau_apply_selected_stage_secant_transpose(
+    kernel_context: _RadauAcceptedStepKernelContext,
+    physics_context: _RadauAcceptedStepPhysicsContext,
+    carry_in: _RadauAcceptedStepCarry,
+    primal_result: _RadauAcceptedStepAttemptResult | _RadauAcceptedStepReverseMinimalAttemptResult,
+    lagged_response,
+    *,
+    rhs,
+):
+    """Apply the accepted forward secant operator's transpose, if selected.
+
+    The forward solve retains one final Newton correction only.  Its residual
+    partner is reconstructed from the existing cached response at ``Z`` and
+    ``Z-delta``; this deliberately retains no Newton tape, extra Jacobian, or
+    live NTX payload in the reverse carry.
+    """
+    base_inverse_apply = lambda vector: _radau_apply_stage_linear_solve(
+        kernel_context,
+        rhs=vector,
+        real_lu_out=primal_result.real_lu_out,
+        real_piv_out=primal_result.real_piv_out,
+        complex_lu_out=primal_result.complex_lu_out,
+        complex_piv_out=primal_result.complex_piv_out,
+        skip_zero_rhs_shortcut=True,
+    )
+    base_transpose_inverse_apply = lambda vector: _radau_apply_stage_linear_transpose_solve(
+        kernel_context,
+        rhs=vector,
+        real_lu_out=primal_result.real_lu_out,
+        real_piv_out=primal_result.real_piv_out,
+        complex_lu_out=primal_result.complex_lu_out,
+        complex_piv_out=primal_result.complex_piv_out,
+        skip_zero_rhs_shortcut=True,
+    )
+    base_solution = base_transpose_inverse_apply(rhs)
+    if kernel_context.stage_secant_correction_mode != "good_broyden_after_first":
+        return base_solution
+
+    f0 = _radau_eval_rhs(
+        carry_in.t,
+        carry_in.y,
+        lagged_response,
+        physics_context.flat_rhs,
+        physics_context.flat_rhs_with_lagged_response,
+    )
+    z_final = primal_result.stage_history
+    secant_step = primal_result.final_stage_newton_delta
+    residual_final = _radau_stage_residual(
+        kernel_context,
+        physics_context,
+        flat_y=carry_in.y,
+        t_value=carry_in.t,
+        h_value=primal_result.trial_dt,
+        z_flat=z_final,
+        f0=f0,
+        jacobian_ref=primal_result.jacobian_out,
+        lagged_response=lagged_response,
+    )
+    residual_previous = _radau_stage_residual(
+        kernel_context,
+        physics_context,
+        flat_y=carry_in.y,
+        t_value=carry_in.t,
+        h_value=primal_result.trial_dt,
+        z_flat=z_final - secant_step,
+        f0=f0,
+        jacobian_ref=primal_result.jacobian_out,
+        lagged_response=lagged_response,
+    )
+    corrected_solution, usable = _radau_rank_one_secant_transpose_inverse_apply(
+        base_inverse_apply,
+        base_transpose_inverse_apply,
+        lambda direction: _radau_frozen_stage_matrix_action(
+            kernel_context,
+            h_value=primal_result.trial_dt,
+            jacobian_ref=primal_result.jacobian_out,
+            stage_direction=direction,
+        ),
+        rhs,
+        secant_step,
+        residual_final - residual_previous,
+        tiny_scalar=kernel_context.tiny_scalar,
+    )
+    use_secant = jnp.logical_and(primal_result.stage_secant_applied, usable)
+    return jnp.where(use_secant, corrected_solution, base_solution)
+
+
 def _radau_prepare_stage_subsolve_inputs_from_carry(
     kernel_context: _RadauAcceptedStepKernelContext,
     physics_context: _RadauAcceptedStepPhysicsContext,
@@ -15391,6 +15529,7 @@ def _radau_build_stage_subsolve_tangent_result(
         final_residual=_zero_tangent_like(primal_result.final_residual),
         final_residual_norm=_zero_tangent_like(primal_result.final_residual_norm),
         converged=_zero_tangent_like(primal_result.converged),
+        secant_applied_final=_zero_tangent_like(primal_result.secant_applied_final),
         newton_state_final=jax.tree.map(
             _zero_tangent_like, primal_result.newton_state_final
         ),
@@ -15618,6 +15757,7 @@ def _radau_run_stage_subsolve(
             slow_contraction_any,
             residual_blowup_any,
             newton_nonfinite_any,
+            _secant_applied_previous,
         ) = newton_state
         residual_cur = _radau_stage_subsolve_residual(
             kernel_context,
@@ -16052,10 +16192,11 @@ def _radau_run_stage_subsolve(
             jnp.logical_or(slow_contraction_any, slow_contraction),
             jnp.logical_or(residual_blowup_any, residual_blowup),
             jnp.logical_or(newton_nonfinite_any, nonfinite_state),
+            secant_applied,
         )
 
     def cond_fn(newton_state):
-        iter_idx, _, _, delta_norm, residual_norm, stage_residual_defect_norm, _, newton_metric, _, _, diverged, _, _, _, _ = newton_state
+        iter_idx, _, _, delta_norm, residual_norm, stage_residual_defect_norm, _, newton_metric, _, _, diverged, _, _, _, _, _ = newton_state
         endpoint_contraction_not_observed = jnp.logical_and(
             kernel_context.use_transport_endpoint_newton_tol,
             iter_idx < jnp.asarray(2, dtype=jnp.int32),
@@ -16093,6 +16234,7 @@ def _radau_run_stage_subsolve(
         jnp.asarray(False),
         jnp.asarray(False),
         jnp.asarray(False),
+        jnp.asarray(False),
     )
     initial_residual = _radau_stage_subsolve_residual(
         kernel_context,
@@ -16120,6 +16262,7 @@ def _radau_run_stage_subsolve(
         slow_contraction_final,
         residual_blowup_final,
         newton_nonfinite_final,
+        secant_applied_final,
     ) = jax.lax.while_loop(cond_fn, body_fn, init_newton)
     final_residual = _radau_stage_subsolve_residual(
         kernel_context,
@@ -16203,6 +16346,7 @@ def _radau_run_stage_subsolve(
         final_residual=final_residual,
         final_residual_norm=final_residual_norm,
         converged=converged,
+        secant_applied_final=secant_applied_final,
         newton_state_final=(
             iter_final,
             z_final,
@@ -16219,6 +16363,7 @@ def _radau_run_stage_subsolve(
             slow_contraction_final,
             residual_blowup_final,
             newton_nonfinite_final,
+            secant_applied_final,
         ),
     )
 
@@ -16304,6 +16449,7 @@ def _radau_after_first_refresh_candidate(
         kernel_context.zero_scalar, kernel_context.zero_scalar,
         jnp.asarray(False), jnp.asarray(1.0, dtype=kernel_context.dtype),
         jnp.asarray(False), jnp.asarray(False), jnp.asarray(False),
+        jnp.asarray(False),
     )
     stages = refresh_z.reshape((kernel_context.num_stages, kernel_context.state_dim))
     stage_states = inputs.flat_y[None, :] + inputs.h_value * (kernel_context.a @ stages)
@@ -16678,6 +16824,7 @@ def _radau_single_step_primal(
                     kernel_context.zero_scalar, kernel_context.zero_scalar,
                     jnp.asarray(False), jnp.asarray(1.0, dtype=kernel_context.dtype),
                     jnp.asarray(False), jnp.asarray(False), jnp.asarray(False),
+                    jnp.asarray(False),
                 )
                 endpoint_result = _radau_run_stage_subsolve(
                     kernel_context,
@@ -17067,6 +17214,8 @@ def _radau_single_step_primal(
         err_norm_effective,
         converged_effective,
         subsolve_result.z_final,
+        subsolve_result.delta_final,
+        subsolve_result.secant_applied_final,
         subsolve_result.theta_final,
         subsolve_result.iter_final,
         subsolve_result.final_residual_norm,
@@ -17376,6 +17525,7 @@ def _radau_single_step_primal_reverse_minimal(
                     kernel_context.zero_scalar, kernel_context.zero_scalar,
                     jnp.asarray(False), jnp.asarray(1.0, dtype=kernel_context.dtype),
                     jnp.asarray(False), jnp.asarray(False), jnp.asarray(False),
+                    jnp.asarray(False),
                 )
                 endpoint_result = _radau_run_stage_subsolve(
                     kernel_context,
@@ -17452,6 +17602,8 @@ def _radau_single_step_primal_reverse_minimal(
     result = (
         flat_next,
         subsolve_result.z_final,
+        subsolve_result.delta_final,
+        subsolve_result.secant_applied_final,
         jacobian_ref,
         cache_valid_out,
         cache_dt_out,
@@ -19727,6 +19879,8 @@ def _radau_adaptive_final_y_realized_schedule_fused_jvp(
                 err_norm=jnp.asarray(jnp.inf, dtype=dtype),
                 converged=jnp.asarray(False),
                 stage_history=carry.prev_stages,
+                final_stage_newton_delta=jnp.zeros_like(carry.prev_stages),
+                stage_secant_applied=jnp.asarray(False),
                 jacobian_out=carry.jacobian,
                 cache_valid_out=carry.cache_valid,
                 cache_dt_out=carry.cache_dt,

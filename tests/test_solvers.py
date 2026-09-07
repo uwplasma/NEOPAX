@@ -1783,6 +1783,43 @@ def test_radau_stage_drift_jacobian_refresh_runs_on_nonlinear_lagged_rhs():
     assert jnp.all(jnp.isfinite(out["final_state"]))
 
 
+def test_radau_good_broyden_stage_secant_runs_on_nonlinear_lagged_rhs():
+    """The LU-based secant option executes a complete nonlinear Radau step.
+
+    This is deliberately a genuine lagged nonlinear solve rather than an
+    algebra-only Sherman--Morrison test.  It covers the second-and-later
+    Newton-iteration path, where the stage correction obtains its residual
+    secant using the already cached response.
+    """
+
+    class QuadraticLaggedField:
+        def __call__(self, _t, y):
+            return y * y
+
+        def build_lagged_response(self, y):
+            return y
+
+        def evaluate_with_lagged_response(self, _t, y, *, lagged_response):
+            return lagged_response * lagged_response + 2.0 * lagged_response * (
+                y - lagged_response
+            )
+
+    solver = RADAUSolver(
+        t0=0.0,
+        t1=0.05,
+        dt=0.01,
+        rtol=1.0e-5,
+        atol=1.0e-8,
+        rhs_mode="lagged_transport_response",
+        stage_secant_correction_mode="good_broyden_after_first",
+        maxiter=8,
+        max_steps=32,
+    )
+    out = solver.solve(jnp.asarray([0.1]), QuadraticLaggedField().__call__)
+    assert int(out["n_steps"]) > 0
+    assert jnp.all(jnp.isfinite(out["final_state"]))
+
+
 def test_radau_exact_cached_retry_mode_runs_without_a_retry():
     """The opt-in recovery leaves an already-convergent cached solve alone."""
 
@@ -1842,6 +1879,7 @@ def test_radau_exact_cached_retry_relinearizes_at_dominant_failed_stage(monkeypa
         final_residual=jnp.asarray([0.1, -3.0], dtype=dtype),
         final_residual_norm=jnp.asarray(3.0, dtype=dtype),
         converged=jnp.asarray(False),
+        secant_applied_final=jnp.asarray(False),
         newton_state_final=(),
     )
     inputs = transport_solvers._RadauStageSubsolveInputs(
@@ -1961,6 +1999,72 @@ def test_radau_exact_cached_retry_mode_traces_through_accepted_step_vjp():
     ) / (2.0 * epsilon)
     assert jnp.all(jnp.isfinite(gradient))
     assert jnp.allclose(gradient[0], finite_difference, rtol=2.0e-4, atol=2.0e-6)
+
+
+def test_radau_good_broyden_stage_secant_traces_through_structured_vjp():
+    """The structured VJP replays the selected forward secant transpose."""
+
+    class NonlinearCachedField:
+        def __call__(self, _t, y):
+            return y * y
+
+        def build_lagged_response(self, y):
+            return y
+
+        def evaluate_with_lagged_response(self, _t, y, *_args, lagged_response):
+            del _args, lagged_response
+            return y * y
+
+    solver = RADAUSolver(
+        t0=0.0,
+        t1=1.0e-3,
+        dt=1.0e-4,
+        rtol=1.0e-7,
+        atol=1.0e-10,
+        rhs_mode="lagged_transport_response",
+        stage_secant_correction_mode="good_broyden_after_first",
+        maxiter=8,
+        max_steps=8,
+    )
+    field = NonlinearCachedField()
+    prepared = transport_solvers._build_prepared_radau_accepted_rollout(
+        solver=solver,
+        state=jnp.asarray([0.4]),
+        vector_field=field.__call__,
+        species=None,
+    )
+    prepared = dataclasses.replace(
+        prepared,
+        physics_context=dataclasses.replace(
+            prepared.physics_context,
+            pullback_build_lagged_response=lambda _state, cache_bar: cache_bar,
+        ),
+    )
+    attempt_context = transport_solvers._RadauAcceptedStepAttemptContext(
+        t_final=prepared.initial_carry.t + prepared.initial_carry.dt,
+        use_transport_lagged_response=jnp.asarray(True),
+    )
+    attempt = transport_solvers._execute_radau_accepted_step_attempt(
+        prepared.kernel_context,
+        prepared.physics_context,
+        prepared.initial_carry,
+        attempt_context,
+    )
+    assert bool(attempt.stage_secant_applied)
+
+    def trial_y(initial_y):
+        carry = dataclasses.replace(prepared.initial_carry, y=initial_y)
+        return transport_solvers._execute_radau_accepted_step_trial_y_vjp_lagged_branch(
+            prepared.kernel_context,
+            prepared.physics_context,
+            carry,
+            attempt_context,
+            "rebuild",
+        )
+
+    value, pullback = jax.vjp(trial_y, jnp.asarray([0.4]))
+    (gradient,) = pullback(jnp.ones_like(value))
+    assert jnp.all(jnp.isfinite(gradient))
 
 
 def test_build_time_solver_legacy_integrator_fallback():
