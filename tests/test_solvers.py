@@ -216,6 +216,28 @@ def test_radau_rank_one_secant_inverse_apply_rejects_zero_secant():
     assert jnp.allclose(observed, jnp.linalg.solve(frozen, rhs))
 
 
+def test_radau_rank_one_secant_transpose_inverse_apply_matches_transpose():
+    """The reverse helper is the transpose of the forward rank-one update."""
+    frozen = jnp.asarray([[2.0, 0.0], [0.0, 3.0]])
+    step = jnp.asarray([1.0, -2.0])
+    local = jnp.asarray([[4.0, 1.0], [1.0, 2.0]])
+    residual_delta = local @ step
+    rhs = jnp.asarray([-3.0, 5.0])
+    observed, applied = transport_solvers._radau_rank_one_secant_transpose_inverse_apply(
+        lambda value: jnp.linalg.solve(frozen, value),
+        lambda value: jnp.linalg.solve(frozen.T, value),
+        lambda value: frozen @ value,
+        rhs,
+        step,
+        residual_delta,
+        tiny_scalar=jnp.asarray(1.0e-14),
+    )
+    update = (residual_delta - frozen @ step)[:, None] * step[None, :] / (step @ step)
+    expected = jnp.linalg.solve((frozen + update).T, rhs)
+    assert bool(applied)
+    assert jnp.allclose(observed, expected, rtol=1.0e-12, atol=1.0e-12)
+
+
 def test_radau_cached_stage_residual_is_independent_of_frozen_jacobian():
     """The cached nonlinear response, not ``J_ref``, defines Radau's R(Z).
 

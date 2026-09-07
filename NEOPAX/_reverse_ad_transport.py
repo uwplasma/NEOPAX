@@ -5027,6 +5027,31 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
         f"bootstrap_mode={bootstrap_cotangent_mode}",
         flush=True,
     )
+    if (
+        use_database_table_geometry_split
+        and bool(
+            getattr(
+                reverse_setup.execution_context.physics_context,
+                "reverse_segment_input_diagnostics",
+                False,
+            )
+        )
+    ):
+        # The first reverse segment is seeded directly from these terminal
+        # state bars.  Report them before any Radau stage solve so a bad
+        # objective/terminal pullback cannot be misattributed to D11/D13/D33.
+        terminal_bar_rows = np.asarray(jax.device_get(final_y_bars))
+        terminal_bar_flat = terminal_bar_rows.reshape((objective_count, -1))
+        for objective_i, row in enumerate(terminal_bar_flat):
+            nonfinite_indices = np.flatnonzero(~np.isfinite(row))
+            if nonfinite_indices.size:
+                print(
+                    f"{progress_prefix} diagnostic: terminal state cotangent "
+                    f"first_nonfinite objective={objective_labels[objective_i]} "
+                    f"state_index={int(nonfinite_indices[0])} "
+                    f"nonfinite_count={int(nonfinite_indices.size)}",
+                    flush=True,
+                )
     if phase_timing_diagnostics:
         print(
             f"{progress_prefix} diagnostic: final-objective cotangent components "

@@ -15074,6 +15074,56 @@ def _radau_rank_one_secant_inverse_apply(
     return jnp.where(usable, candidate, base_solution), usable
 
 
+def _radau_rank_one_secant_transpose_inverse_apply(
+    base_inverse_apply,
+    base_transpose_inverse_apply,
+    frozen_operator_apply,
+    rhs,
+    secant_step,
+    secant_residual_delta,
+    *,
+    tiny_scalar,
+):
+    """Transpose companion of :func:`_radau_rank_one_secant_inverse_apply`.
+
+    This is the exact transpose of the same guarded Sherman--Morrison map.
+    Keeping it adjacent to the forward formula makes the eventual accepted-step
+    replay use one operator definition in both directions.
+    """
+    rhs = jnp.asarray(rhs)
+    step = jnp.asarray(secant_step, dtype=rhs.dtype)
+    residual_delta = jnp.asarray(secant_residual_delta, dtype=rhs.dtype)
+    base_solution = base_transpose_inverse_apply(rhs)
+    step_norm_sq = jnp.vdot(step, step)
+    safe_step_norm_sq = jnp.maximum(step_norm_sq, tiny_scalar)
+    update_direction = residual_delta - frozen_operator_apply(step)
+    transpose_inverse_step = base_transpose_inverse_apply(step)
+    # The denominator is shared by the primal and transpose
+    # Sherman--Morrison formulas.  It contains M^{-1} u and therefore uses
+    # one ordinary existing-LU application, not a new factorization.
+    inverse_update_direction = base_inverse_apply(update_direction)
+    rank_one_denominator = (
+        jnp.asarray(1.0, dtype=rhs.dtype)
+        + jnp.vdot(step, inverse_update_direction) / safe_step_norm_sq
+    )
+    candidate = base_solution - transpose_inverse_step * (
+        jnp.vdot(update_direction, base_solution)
+        / (safe_step_norm_sq * rank_one_denominator)
+    )
+    usable = jnp.logical_and(
+        step_norm_sq > tiny_scalar,
+        jnp.logical_and(
+            jnp.abs(rank_one_denominator)
+            > jnp.sqrt(jnp.asarray(tiny_scalar, dtype=rhs.dtype)),
+            jnp.logical_and(
+                jnp.all(jnp.isfinite(candidate)),
+                jnp.all(jnp.isfinite(inverse_update_direction)),
+            ),
+        ),
+    )
+    return jnp.where(usable, candidate, base_solution), usable
+
+
 def _radau_prepare_stage_subsolve_inputs_from_carry(
     kernel_context: _RadauAcceptedStepKernelContext,
     physics_context: _RadauAcceptedStepPhysicsContext,
