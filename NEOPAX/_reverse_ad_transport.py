@@ -5680,6 +5680,27 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
         segment_start_carry = _take_tree_axis0(segment_start_carries, segment_index)
         segment_arrays = _take_tree_axis0(segmented_replay_arrays, segment_index)
         segment_reduced_bars_input = reduced_bars
+        if (
+            use_database_table_geometry_split
+            and bool(
+                getattr(
+                    reverse_setup.execution_context.physics_context,
+                    "reverse_segment_input_diagnostics",
+                    False,
+                )
+            )
+        ):
+            # This is outside the segment JIT boundary.  It distinguishes a
+            # bad carry arriving from the preceding segment from corruption
+            # introduced by the terminal segment's own reverse-step kernel.
+            segment_input_y = np.asarray(jax.device_get(segment_reduced_bars_input.y))
+            print(
+                f"{progress_prefix} diagnostic: database segment "
+                f"{segment_index + 1}/{segment_count} incoming state cotangent "
+                f"finite={bool(np.all(np.isfinite(segment_input_y)))} "
+                f"nonfinite_count={int(np.count_nonzero(~np.isfinite(segment_input_y)))}",
+                flush=True,
+            )
         if use_database_table_geometry_split:
             # The database segment owns only the compact table transpose.
             # Replay remains bounded by segment length; the returned numeric

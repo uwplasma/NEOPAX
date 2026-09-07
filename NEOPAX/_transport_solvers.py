@@ -7194,6 +7194,30 @@ def _execute_radau_accepted_step_next_reduced_cotangent_batched_bwd_with_support
         return jax.tree_util.tree_map(lambda a, b: a + b, lhs_aligned, rhs_aligned)
 
     objective_count = jnp.asarray(next_reduced_bars.y).shape[0]
+    database_reverse_trace = (
+        bool(getattr(physics_context, "reverse_segment_input_diagnostics", False))
+        and str(
+            getattr(physics_context, "reverse_rhs_transpose_mode", "")
+        ).strip().lower()
+        == "explicit_database"
+    )
+
+    def _database_trace(label, value):
+        """Emit one bounded, database-only reverse-carry checkpoint."""
+        if database_reverse_trace:
+            value_arr = jnp.asarray(value)
+            nonfinite = jnp.logical_not(jnp.isfinite(value_arr)).reshape((-1,))
+            jax.debug.print(
+                "[database-reverse-trace] {label}: finite={finite} "
+                "nonfinite_count={count} first_nonfinite_flat_index={first}",
+                label=label,
+                finite=jnp.all(jnp.logical_not(nonfinite)),
+                count=jnp.sum(nonfinite),
+                first=jnp.argmax(nonfinite),
+            )
+        return value
+
+    _database_trace("step_incoming_y", next_reduced_bars.y)
     zero_support_bar = _radau_zero_support_delta_tree_like(support)
     collect_native_vmec_coefficients = (
         str(
@@ -7240,12 +7264,14 @@ def _execute_radau_accepted_step_next_reduced_cotangent_batched_bwd_with_support
     if physics_context.project_flat is not None:
         _, project_pullback = jax.vjp(physics_context.project_flat, primal_result.trial_y)
         trial_y_bars = jax.vmap(lambda bar: project_pullback(bar)[0])(trial_y_bars)
+    _database_trace("after_state_projection_pullback", trial_y_bars)
 
     dz_bars = (
         primal_result.trial_dt
         * kernel_context.b[None, :, None]
         * trial_y_bars[:, None, :]
     )
+    _database_trace("stage_adjoint_rhs_dz", dz_bars)
     memory_mode = str(getattr(physics_context, "reverse_stage_adjoint_memory_mode", "default")).strip().lower()
     with _radau_reverse_profile_scope(
         physics_context, "reverse_segment/stage_adjoint_solve"
@@ -7270,6 +7296,7 @@ def _execute_radau_accepted_step_next_reduced_cotangent_batched_bwd_with_support
                 lagged_response,
                 rhs=dz_bars.reshape((dz_bars.shape[0], -1)),
             )
+    _database_trace("stage_adjoint_solution", residual_bars)
     if bool(getattr(physics_context, "reverse_segment_input_diagnostics", False)):
         component_values_finite = (
             jnp.all(jnp.isfinite(trial_y_bars))
@@ -7387,6 +7414,8 @@ def _execute_radau_accepted_step_next_reduced_cotangent_batched_bwd_with_support
         support_bar_leaves = (*support_bar_leaves, *native_vmec_zero_leaves)
 
     y_bars = trial_y_bars + jnp.asarray(residual_y_bars, dtype=kernel_context.dtype)
+    _database_trace("after_rhs_state_pullback", residual_y_bars)
+    _database_trace("step_outgoing_y_before_rebuild", y_bars)
     lagged_cache_bars = _add_tangent_trees(
         residual_lagged_bars,
         next_reduced_bars.lagged_response_cache,
