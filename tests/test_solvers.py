@@ -1722,6 +1722,9 @@ def test_radau_exact_cached_retry_mode_runs_without_a_retry():
         atol=1.0e-8,
         rhs_mode="lagged_transport_response",
         lagged_jacobian_refresh_mode="quadratic_exact_retry_after_failure",
+        # Exercise the non-stopping cached-stage matrix/JVP audit on an
+        # accepted rollout as well as its custom-VJP path.
+        debug_cached_stage_jacobian_audit=True,
         maxiter=8,
         max_steps=32,
     )

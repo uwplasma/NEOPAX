@@ -3759,6 +3759,11 @@ class _RadauSolverConfig(TransportSolver):
     debug_stage_state_trace: bool = False
     debug_node_edge_live_probe: bool = False
     debug_node_edge_live_probe_jacobian_threshold: float | None = None
+    # Explicit, non-stopping audit of the Newton matrix against the retained
+    # cached stage residual.  It intentionally never calls the live transport
+    # model: all three directional actions use the response already cached for
+    # the attempted step.
+    debug_cached_stage_jacobian_audit: bool = False
 
     def __init__(
         self,
@@ -3813,6 +3818,7 @@ class _RadauSolverConfig(TransportSolver):
         debug_stage_state_trace: bool = False,
         debug_node_edge_live_probe: bool = False,
         debug_node_edge_live_probe_jacobian_threshold: float | None = None,
+        debug_cached_stage_jacobian_audit: bool = False,
         save_n=None,
     ):
         n_steps = max(1, int(jnp.ceil((float(t1) - float(t0)) / float(dt))))
@@ -4146,6 +4152,9 @@ class _RadauSolverConfig(TransportSolver):
         if probe_threshold is not None and probe_threshold <= 0.0:
             raise ValueError("radau_debug_node_edge_live_probe_jacobian_threshold must be positive")
         object.__setattr__(self, "debug_node_edge_live_probe_jacobian_threshold", probe_threshold)
+        object.__setattr__(
+            self, "debug_cached_stage_jacobian_audit", bool(debug_cached_stage_jacobian_audit)
+        )
         object.__setattr__(self, "save_n", save_n)
 
 @jax.tree_util.register_dataclass
@@ -4745,6 +4754,7 @@ class _RadauAcceptedStepKernelContext:
     tiny_scalar: Any
     zero_scalar: Any
     debug_newton_trace: Any
+    debug_cached_stage_jacobian_audit: Any
     use_transport_lagged_response: Any
     lagged_response_correction_mode: str
     lagged_jacobian_refresh_mode: str
@@ -11058,11 +11068,16 @@ def _radau_exact_stage_residual_database_table_support_pullback_batched(
     database interpolation transpose; scan ownership and the Lij path are
     deliberately outside it.
     """
-    direct_pullback = physics_context.flat_rhs_direct_database_table_pullback_batched
-    if direct_pullback is None:
+    scalar_direct_pullback = getattr(
+        physics_context, "flat_rhs_direct_database_table_pullback", None
+    )
+    batched_direct_pullback = getattr(
+        physics_context, "flat_rhs_direct_database_table_pullback_batched", None
+    )
+    if scalar_direct_pullback is None and batched_direct_pullback is None:
         raise ValueError(
-            "Database deferred-geometry reverse requires the batched table "
-            "RHS pullback boundary."
+            "Database deferred-geometry reverse requires a scalar or batched "
+            "table RHS pullback boundary."
         )
     residual_bars = jnp.asarray(residual_bars, dtype=kernel_context.dtype)
     if residual_bars.ndim == 2:
@@ -11077,6 +11092,29 @@ def _radau_exact_stage_residual_database_table_support_pullback_batched(
         raise ValueError(
             "Batched Radau database table bars must have shape "
             "[objective, stage * state] or [objective, stage, state]."
+        )
+    # The table transpose is linear: it cannot create a NaN from finite
+    # stage-residual cotangents and finite fixed tables.  When diagnosing the
+    # database lane, report a bad stage-adjoint result *before* it is handed
+    # to the D11/D13/D33 table primitive.  This keeps a failed colored solve
+    # from being misreported as a database-table failure.
+    if bool(getattr(physics_context, "reverse_segment_input_diagnostics", False)):
+        residual_finite = jnp.all(jnp.isfinite(residual_bars))
+
+        def _print_nonfinite_stage_adjoint(_):
+            jax.debug.print(
+                "[database-stage-adjoint] nonfinite residual bars before "
+                "table transpose: shape={shape} nonfinite_count={count}",
+                shape=jnp.asarray(residual_bars.shape),
+                count=jnp.sum(jnp.logical_not(jnp.isfinite(residual_bars))),
+            )
+            return None
+
+        jax.lax.cond(
+            residual_finite,
+            lambda _: None,
+            _print_nonfinite_stage_adjoint,
+            operand=None,
         )
     objective_count = residual_bars.shape[0]
     stages_final = primal_result.stage_history.reshape(
@@ -11097,9 +11135,26 @@ def _radau_exact_stage_residual_database_table_support_pullback_batched(
 
     def _stage_pullback(accumulated_leaves, stage_inputs):
         t_eval, y_eval, rhs_bars_eval = stage_inputs
+        # Keep the objective axis on device, but prefer the established scalar
+        # fixed-table transpose for each row.  The former rank-3 specialised
+        # table path produced nonfinite D11_log/D13 bars for every objective
+        # in the black-box database Radau sweep.  ``vmap`` preserves the same
+        # mathematical batched result without taking that divergent algebraic
+        # branch.  The dedicated batch hook remains a compatibility fallback
+        # for isolated helper contexts which expose no scalar hook.
+        if scalar_direct_pullback is None:
+            stage_value = batched_direct_pullback(
+                t_eval, y_eval, -rhs_bars_eval, support
+            )
+        else:
+            stage_value = jax.vmap(
+                lambda rhs_bar: scalar_direct_pullback(
+                    t_eval, y_eval, -rhs_bar, support
+                )
+            )(rhs_bars_eval)
         stage_support_bar = _radau_sanitize_support_delta_bar_tree(
             support,
-            direct_pullback(t_eval, y_eval, -rhs_bars_eval, support),
+            stage_value,
         )
         stage_leaves = tuple(jax.tree_util.tree_leaves(stage_support_bar))
         return tuple(
@@ -15479,6 +15534,131 @@ def _radau_run_stage_subsolve(
                 relative_error=jnp.linalg.norm(action_difference)
                 / jnp.maximum(fd_norm, kernel_context.tiny_scalar),
                 cosine=action_cosine,
+                ordered=True,
+            )
+        if kernel_context.debug_cached_stage_jacobian_audit:
+            # This resolves the ambiguity left by a finite-difference check at
+            # a failed stage.  The frozen matrix can disagree because its
+            # cached Jacobian was assembled incorrectly *at the accepted
+            # base*, or because that correct base tangent is no longer local
+            # once Newton has moved the stages.  The two exact JVPs below
+            # distinguish those cases without a dense Jacobian and without
+            # evaluating live NTX:
+            #
+            #   M_stored delta  -- the matrix represented by the LU,
+            #   D R_cached(0) delta -- exact cached-stage derivative at base,
+            #   D R_cached(z) delta -- exact cached-stage derivative now.
+            #
+            # The finite difference is retained solely as an independent
+            # check of the current JVP / stage-residual wiring.
+            def cached_stage_residual(stage_values):
+                return _radau_stage_subsolve_residual(
+                    kernel_context, physics_context, inputs, stage_values
+                )
+
+            frozen_matrix_action = _radau_frozen_stage_matrix_action(
+                kernel_context,
+                h_value=inputs.h_value,
+                jacobian_ref=inputs.jacobian_ref,
+                stage_direction=delta,
+            )
+            zero_stages = jnp.zeros_like(z_cur)
+            _, base_jvp_action = jax.jvp(
+                cached_stage_residual, (zero_stages,), (delta,)
+            )
+            _, current_jvp_action = jax.jvp(
+                cached_stage_residual, (z_cur,), (delta,)
+            )
+            audit_fraction = jnp.asarray(1.0e-4, dtype=kernel_context.dtype)
+            finite_difference_action = (
+                cached_stage_residual(z_cur + audit_fraction * delta) - residual_cur
+            ) / audit_fraction
+
+            def _relative_and_cosine(reference, candidate):
+                reference_norm = jnp.linalg.norm(reference)
+                candidate_norm = jnp.linalg.norm(candidate)
+                relative = jnp.linalg.norm(candidate - reference) / jnp.maximum(
+                    reference_norm, kernel_context.tiny_scalar
+                )
+                cosine = jnp.vdot(reference, candidate) / jnp.maximum(
+                    reference_norm * candidate_norm, kernel_context.tiny_scalar
+                )
+                return relative, cosine
+
+            stored_base_relative, stored_base_cosine = _relative_and_cosine(
+                base_jvp_action, frozen_matrix_action
+            )
+            stored_current_relative, stored_current_cosine = _relative_and_cosine(
+                current_jvp_action, frozen_matrix_action
+            )
+            current_fd_relative, current_fd_cosine = _relative_and_cosine(
+                current_jvp_action, finite_difference_action
+            )
+            stored_current_difference = frozen_matrix_action - current_jvp_action
+            max_difference_flat = jnp.argmax(jnp.abs(stored_current_difference))
+            max_difference_stage = max_difference_flat // kernel_context.state_dim
+            max_difference_state = max_difference_flat % kernel_context.state_dim
+            action_shape = (kernel_context.num_stages, kernel_context.state_dim)
+            difference_stages = stored_current_difference.reshape(action_shape)
+            base_difference_stages = (
+                frozen_matrix_action - base_jvp_action
+            ).reshape(action_shape)
+            # The augmented floating edge, when present, is always the final
+            # private coordinate.  The public outer Er centre precedes it.
+            has_private_edge_node = (
+                hasattr(inputs.lagged_response, "transport_response")
+                and hasattr(inputs.lagged_response, "er_edge_anchor")
+            )
+            public_last_er_index = (
+                kernel_context.state_dim - 2
+                if has_private_edge_node
+                else kernel_context.state_dim - 1
+            )
+            public_last_er_current = jnp.linalg.norm(
+                difference_stages[:, public_last_er_index]
+            )
+            public_last_er_base = jnp.linalg.norm(
+                base_difference_stages[:, public_last_er_index]
+            )
+            private_edge_current = jnp.where(
+                has_private_edge_node,
+                jnp.linalg.norm(difference_stages[:, -1]),
+                jnp.asarray(0.0, dtype=kernel_context.dtype),
+            )
+            private_edge_base = jnp.where(
+                has_private_edge_node,
+                jnp.linalg.norm(base_difference_stages[:, -1]),
+                jnp.asarray(0.0, dtype=kernel_context.dtype),
+            )
+            jax.debug.print(
+                "[radau-cached-stage-jacobian-audit] iter={iter} "
+                "stored_vs_base_rel={stored_base_rel:.6e} stored_vs_base_cos={stored_base_cos:.6e} "
+                "stored_vs_current_rel={stored_current_rel:.6e} stored_vs_current_cos={stored_current_cos:.6e} "
+                "current_jvp_vs_fd_rel={current_fd_rel:.6e} current_jvp_vs_fd_cos={current_fd_cos:.6e}",
+                iter=iter_idx + 1,
+                stored_base_rel=stored_base_relative,
+                stored_base_cos=stored_base_cosine,
+                stored_current_rel=stored_current_relative,
+                stored_current_cos=stored_current_cosine,
+                current_fd_rel=current_fd_relative,
+                current_fd_cos=current_fd_cosine,
+                ordered=True,
+            )
+            jax.debug.print(
+                "[radau-cached-stage-jacobian-audit] iter={iter} "
+                "stored_vs_current_max_abs={max_abs:.6e} stage={stage} state_index={state_index} "
+                "last_public_Er_current_abs={last_current:.6e} last_public_Er_base_abs={last_base:.6e} "
+                "private_edge_present={private_present} private_edge_current_abs={edge_current:.6e} "
+                "private_edge_base_abs={edge_base:.6e}",
+                iter=iter_idx + 1,
+                max_abs=jnp.abs(stored_current_difference[max_difference_flat]),
+                stage=max_difference_stage,
+                state_index=max_difference_state,
+                last_current=public_last_er_current,
+                last_base=public_last_er_base,
+                private_present=has_private_edge_node,
+                edge_current=private_edge_current,
+                edge_base=private_edge_base,
                 ordered=True,
             )
         # A refreshed quadratic tangent is local.  Its LU correction can be
@@ -22123,6 +22303,9 @@ def _build_prepared_radau_accepted_rollout(
     divergence_mode = str(getattr(solver, "newton_divergence_mode", "legacy")).strip().lower()
     residual_norm_mode = str(getattr(solver, "newton_residual_norm", "raw")).strip().lower()
     debug_newton_trace = bool(getattr(solver, "debug_stage_markers", False))
+    debug_cached_stage_jacobian_audit = bool(
+        getattr(solver, "debug_cached_stage_jacobian_audit", False)
+    )
     use_rms_residual_norm = residual_norm_mode in {"rms", "scaled_rms"}
     conservative_divergence = divergence_mode in {"ntss", "hairer", "conservative"}
     newton_tol_mode = str(getattr(solver, "newton_tol_mode", "residual")).strip().lower()
@@ -22242,6 +22425,7 @@ def _build_prepared_radau_accepted_rollout(
         tiny_scalar=tiny_scalar,
         zero_scalar=zero_scalar,
         debug_newton_trace=bool(debug_newton_trace),
+        debug_cached_stage_jacobian_audit=bool(debug_cached_stage_jacobian_audit),
         use_transport_lagged_response=bool(use_transport_lagged_response),
         lagged_response_correction_mode=str(
             getattr(solver, "lagged_response_correction_mode", "none")
@@ -28890,6 +29074,9 @@ def build_time_solver(solver_parameters: Any, solver_override: Any = None) -> Tr
             ),
             debug_node_edge_live_probe_jacobian_threshold=_cfg_get(
                 "radau_debug_node_edge_live_probe_jacobian_threshold"
+            ),
+            debug_cached_stage_jacobian_audit=bool(
+                _cfg_get("radau_debug_cached_stage_jacobian_audit", False)
             ),
             save_n=save_n,
         )
