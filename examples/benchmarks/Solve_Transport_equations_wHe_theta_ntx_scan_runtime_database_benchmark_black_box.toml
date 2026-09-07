@@ -110,7 +110,7 @@ type = "dirichlet"
 value = 0.0
 
 [boundary.Er.right]
-type = "floating_ambipolar_edge"
+type = "floating_ambipolar_edge_node"
 
 [equations]
 toggle_density = [false,false,false,true]
