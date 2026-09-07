@@ -23871,7 +23871,12 @@ class RADAUSolver(_RadauSolverConfig):
         probe_explicitly_enabled = bool(
             getattr(self, "debug_node_edge_live_probe", False)
         )
-        if probe_explicitly_enabled and node_edge_live_probe_threshold is None:
+        # The Boolean is the sole arming switch.  A retained threshold in an
+        # old TOML selects sensitivity only; it must not override an explicit
+        # ``radau_debug_node_edge_live_probe = false``.
+        if not probe_explicitly_enabled:
+            node_edge_live_probe_threshold = None
+        elif node_edge_live_probe_threshold is None:
             node_edge_live_probe_threshold = 1.0e5
         if node_edge_live_probe_threshold is not None:
             if not use_node_boundary:
@@ -23890,7 +23895,7 @@ class RADAUSolver(_RadauSolverConfig):
             print(
                 "[radau-node-edge-live-probe] armed "
                 f"jacobian_threshold={node_edge_live_probe_threshold:.6e} "
-                f"source={'boolean_tag' if probe_explicitly_enabled else 'threshold_tag'}",
+                "source=boolean_tag",
                 flush=True,
             )
 

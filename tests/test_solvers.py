@@ -1384,12 +1384,16 @@ def test_radau_floating_edge_node_uses_private_augmented_coordinate():
     assert jnp.allclose(node_bar[-1], -0.25 * rhs_bar[-2] - 0.5 * rhs_bar[-1])
 
 
-def test_radau_node_edge_live_probe_reaches_host_callback():
-    """The one-shot live probe must run after a fresh node-edge attempt.
+@pytest.mark.parametrize(
+    ("probe_enabled", "expected_probe_calls"), ((False, 0), (True, 1))
+)
+def test_radau_node_edge_live_probe_reaches_host_callback(
+    probe_enabled, expected_probe_calls
+):
+    """Only the explicit Boolean may arm the one-shot live probe.
 
-    This guards the host-loop wiring: a large edge Jacobian must not merely
-    appear in the compiled Newton trace while the requested direct comparison
-    is silently skipped.
+    A threshold remains a sensitivity setting, including for old TOMLs, but
+    must not make a run stop when the Boolean is false.
     """
 
     class _NodeOwner:
@@ -1457,17 +1461,16 @@ def test_radau_node_edge_live_probe_reaches_host_callback():
         rhs_mode="lagged_transport_response",
         error_estimator="embedded2_ntss_transport_scale",
         debug_walltime_attempts=True,
-        # The ordinary stage-state trace is the reliable arming path.  It is
-        # separate explicit tag is required: ordinary stage tracing must not
-        # make a production run stop after a host-side live probe.
+        # Stage tracing is intentionally unrelated to probe arming.
         debug_stage_state_trace=True,
-        debug_node_edge_live_probe=True,
+        debug_node_edge_live_probe=probe_enabled,
+        debug_node_edge_live_probe_jacobian_threshold=1.0e5,
         maxiter=8,
         max_steps=32,
     )
     solver.solve(state0, owner.__call__)
 
-    assert owner.probe_calls == 1
+    assert owner.probe_calls == expected_probe_calls
 
 
 def test_radau_floating_edge_node_allows_black_box_rhs():
