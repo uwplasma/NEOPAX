@@ -75,6 +75,7 @@ from NEOPAX._transport_flux_models import (
     NTXQuadraticPreparedCoefficientResponse,
     NTXRuntimeScanChannels,
     _as_float_array,
+    _ntx_es_cap_in_state_units,
     NTXRuntimeScanTransportModel,
     ZeroTransportModel,
     _sanitize_float_delta_bar_tree,
@@ -126,6 +127,21 @@ def test_runtime_scan_axis_validation_is_trace_safe():
     assert jnp.allclose(actual, jnp.asarray([0.25, 0.5]))
     with pytest.raises(ValueError, match="rho_scan contains non-finite"):
         _as_float_array(jnp.asarray([0.25, jnp.nan]), name="rho_scan")
+
+
+def test_exact_runtime_er_tilde_cap_uses_state_kv_per_m_units():
+    """The realtime cap must match a database scan field in SI units."""
+    er_tilde_max = 0.1
+    er_tilde_to_er = 5.0e5  # V/m per unit er_tilde
+    drds = 2.0
+
+    # The scan's Es limit is 1e5 V/m. The state stores Es in kV/m before the
+    # local NTX input conversion multiplies it by 1e3.
+    state_es_cap = _ntx_es_cap_in_state_units(
+        er_tilde_max, er_tilde_to_er, drds
+    )
+    assert jnp.allclose(state_es_cap, 100.0)
+    assert jnp.allclose(state_es_cap * 1.0e3, 1.0e5)
 
 
 def test_runtime_scan_axis_range_validation_is_trace_safe():

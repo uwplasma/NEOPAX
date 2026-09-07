@@ -339,22 +339,53 @@ def _initial_er_root_state_bar(state, er_profile, finite_mask, state_bar, *, run
     return _add_trees(direct_bar, state_residual_bar)
 
 
-def _state_with_initial_er_root_ad(state, *, config: dict[str, Any], runtime, mode: str):
+def _state_with_initial_er_root_ad(
+    state,
+    *,
+    config: dict[str, Any],
+    runtime,
+    mode: str,
+    known_er_profile=None,
+):
     if not _initial_er_root_enabled(config, mode):
         return state
 
-    @jax.custom_vjp
-    def _replace_er_with_selected_root(state_inner):
-        er_profile, _ = _initial_er_selected_root_profile(state_inner, config=config, runtime=runtime)
-        return dataclasses.replace(state_inner, Er=er_profile)
+    if known_er_profile is None:
+        @jax.custom_vjp
+        def _replace_er_with_selected_root(state_inner):
+            er_profile, _ = _initial_er_selected_root_profile(
+                state_inner, config=config, runtime=runtime
+            )
+            return dataclasses.replace(state_inner, Er=er_profile)
 
-    def _replace_er_fwd(state_inner):
-        er_profile, finite_mask = _initial_er_selected_root_profile(
-            state_inner,
-            config=config,
-            runtime=runtime,
-        )
-        return dataclasses.replace(state_inner, Er=er_profile), (state_inner, er_profile, finite_mask)
+        def _replace_er_fwd(state_inner):
+            er_profile, finite_mask = _initial_er_selected_root_profile(
+                state_inner, config=config, runtime=runtime
+            )
+            return dataclasses.replace(state_inner, Er=er_profile), (
+                state_inner,
+                er_profile,
+                finite_mask,
+            )
+    else:
+        # ``build_runtime_context`` has already evaluated the configured
+        # ambipolar initialisation for this exact baseline state.  Reusing its
+        # selected roots avoids a second radial primal solve during benchmark
+        # setup.  The custom backward remains the same implicit selected-root
+        # rule evaluated at those roots, so this changes setup cost only.
+        known_er_profile = jnp.asarray(known_er_profile, dtype=state.Er.dtype)
+
+        @jax.custom_vjp
+        def _replace_er_with_selected_root(state_inner):
+            return dataclasses.replace(state_inner, Er=known_er_profile)
+
+        def _replace_er_fwd(state_inner):
+            finite_mask = jnp.isfinite(known_er_profile)
+            return dataclasses.replace(state_inner, Er=known_er_profile), (
+                state_inner,
+                known_er_profile,
+                finite_mask,
+            )
 
     def _replace_er_bwd(residuals, state_bar):
         state_inner, er_profile, finite_mask = residuals
@@ -728,6 +759,7 @@ def _initial_state_for_parameter_vector(
     runtime,
     config: dict[str, Any] | None = None,
     initial_er_root_ad: str = "off",
+    known_initial_er_profile=None,
 ):
     cfg = dict(profile_cfg)
     for name, value in zip(PARAMETER_ORDER, parameter_values):
@@ -759,7 +791,13 @@ def _initial_state_for_parameter_vector(
     if mode != "off":
         if config is None:
             raise ValueError("config is required when initial_er_root_ad is enabled.")
-        state = _state_with_initial_er_root_ad(state, config=config, runtime=runtime, mode=mode)
+        state = _state_with_initial_er_root_ad(
+            state,
+            config=config,
+            runtime=runtime,
+            mode=mode,
+            known_er_profile=known_initial_er_profile,
+        )
     return state
 
 
@@ -5246,6 +5284,12 @@ def _run_realtime_geometry_reverse_mode(
         baseline_state=baseline_state,
         profile_cfg=profile_cfg,
         runtime=baseline_runtime,
+        known_initial_er_profile=(
+            baseline_state.Er
+            if str(neoclassical_cfg.get("flux_model", "")).strip().lower()
+            == "ntx_scan_runtime"
+            else None
+        ),
     )
     baseline_components = prepare_transport_solver_components(config, baseline_runtime, baseline_profile_state)
     jax.block_until_ready(jax.tree_util.tree_leaves(baseline_profile_state))

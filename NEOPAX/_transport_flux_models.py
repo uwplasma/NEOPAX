@@ -1105,6 +1105,21 @@ def _nu_over_vnew_local_directional_default(
     return _jet_divide(collision_sum, v_new)
 
 
+def _ntx_es_cap_in_state_units(er_tilde_max, er_tilde_to_er, drds_value):
+    """Convert the scan's SI ``Es`` limit to NEOPAX's kV/m state units.
+
+    ``Er`` in :class:`TransportState` is kV/m, whereas the NTX scan channels
+    ``Er_tilde * dr_tildeds * B00`` are V/m.  The caller applies the usual
+    ``1e3`` conversion only after this cap has been imposed, so the cap itself
+    must be converted first.
+    """
+    return jnp.abs(
+        jnp.asarray(er_tilde_max, dtype=jnp.float64)
+        * jnp.asarray(er_tilde_to_er, dtype=jnp.float64)
+        * jnp.asarray(drds_value, dtype=jnp.float64)
+    ) / 1.0e3
+
+
 def _local_scan_inputs_directional_default(
     energy_grid,
     species,
@@ -1134,10 +1149,8 @@ def _local_scan_inputs_directional_default(
     if er_tilde_max is not None:
         if er_tilde_to_er is None:
             raise ValueError("A normalized NTX Er cap requires the scan geometry scale.")
-        es_cap = jnp.abs(
-            jnp.asarray(er_tilde_max, dtype=jnp.float64)
-            * jnp.asarray(er_tilde_to_er, dtype=jnp.float64)
-            * safe_drds
+        es_cap = _ntx_es_cap_in_state_units(
+            er_tilde_max, er_tilde_to_er, safe_drds
         )
         sign = jnp.where(er_times_drds.value < 0.0, -1.0, 1.0)
         es_abs = _jet_abs(er_times_drds)
@@ -6600,10 +6613,10 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             jnp.asarray(0.0, dtype=jnp.result_type(er_value, drds_value, jnp.float64)),
         )
         if self.er_tilde_max is not None:
-            es_cap = jnp.abs(
-                jnp.asarray(self.er_tilde_max, dtype=jnp.float64)
-                * self._er_tilde_to_er_scale()
-                * jnp.asarray(drds_value, dtype=jnp.float64)
+            es_cap = _ntx_es_cap_in_state_units(
+                self.er_tilde_max,
+                self._er_tilde_to_er_scale(),
+                drds_value,
             )
             sign = jnp.where(er_times_drds < 0.0, -1.0, 1.0)
             er_times_drds = jnp.where(
