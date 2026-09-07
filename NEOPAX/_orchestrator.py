@@ -435,7 +435,9 @@ def _normalized_boundary_cfg_for_transport(boundary_cfg: dict) -> dict:
     return out
 
 
-def _initialize_floating_er_edge_node(state, runtime, config, boundary_models):
+def _initialize_floating_er_edge_node(
+    state, runtime, config, boundary_models, *, equation_system=None
+):
     """Return the initial outer-face Er root for the private Radau node.
 
     NTSS evolves an endpoint Er degree of freedom, but initializes that endpoint
@@ -456,28 +458,50 @@ def _initialize_floating_er_edge_node(state, runtime, config, boundary_models):
         )
 
     solver_cfg = runtime.solver_parameters
+    # The edge node must start from a root of the *same* face residual which
+    # the composed RHS advances.  In particular, the latter first applies
+    # quasineutrality, floors, fixed-temperature projection, and any centre
+    # boundary projection.  Using the raw setup state here can select an edge
+    # root for a different plasma state before Radau even forms its first
+    # cache.  Keep the old standalone path for callers/tests which do not yet
+    # have a composed system.
+    if equation_system is None:
+        working_state = state
+        flux_model = runtime.models.flux
+        flux_bc_kwargs = {
+            "bc_density": boundary_models.get("density"),
+            "bc_temperature": boundary_models.get("temperature"),
+            "bc_er": boundary_models.get("Er"),
+        }
+    else:
+        working_state, _ = equation_system._prepare_working_state(state)
+        flux_model = equation_system.shared_flux_model
+        flux_bc_kwargs = equation_system._shared_flux_bc_kwargs()
+        if flux_model is None:
+            raise ValueError(
+                "floating_ambipolar_edge_node requires the composed shared flux model."
+            )
     face_state = build_face_transport_state(
-        state,
+        working_state,
         runtime.geometry,
-        bc_density=boundary_models.get("density"),
-        bc_temperature=boundary_models.get("temperature"),
-        bc_er=boundary_models.get("Er"),
+        bc_density=flux_bc_kwargs["bc_density"],
+        bc_temperature=flux_bc_kwargs["bc_temperature"],
+        bc_er=flux_bc_kwargs["bc_er"],
         density_floor=solver_cfg.get("density_floor", 1.0e-6),
         temperature_floor=solver_cfg.get("temperature_floor"),
     )
     charge = jnp.asarray(runtime.species.charge_qp)
-    seed = jnp.asarray(state.Er[-1])
+    seed = jnp.asarray(working_state.Er[-1])
 
     def _face_gamma(er_value):
         candidate_face_state = dataclasses.replace(
             face_state,
             Er=face_state.Er.at[-1].set(jnp.asarray(er_value, dtype=face_state.Er.dtype)),
         )
-        face_fluxes = runtime.models.flux.evaluate_face_fluxes(
-            state,
+        face_fluxes = flux_model.evaluate_face_fluxes(
+            working_state,
             candidate_face_state,
-            bc_density=boundary_models.get("density"),
-            bc_temperature=boundary_models.get("temperature"),
+            **flux_bc_kwargs,
         )
         if face_fluxes is None or "Gamma" not in face_fluxes:
             raise ValueError(
@@ -1096,21 +1120,6 @@ def prepare_transport_solver_components(
                 right_gradient=None,
             )
 
-    # NTSS initializes its dynamic outer Er node from the ambipolar root at
-    # that endpoint.  Do this once, before the first lagged response is built;
-    # the result is private solver metadata rather than a TransportState leaf.
-    node_boundary_initial_er = None
-    if er_bc_mode == "floating_ambipolar_edge_node":
-        node_boundary_initial_er = _initialize_floating_er_edge_node(
-            state, runtime, config, bc
-        )
-        if bool(runtime.solver_parameters.get("debug_stage_markers", False)):
-            print(
-                "[NEOPAX] floating Er edge-node initialization: "
-                f"last_center={float(jnp.asarray(state.Er[-1])):.6e} "
-                f"face_root={float(jnp.asarray(node_boundary_initial_er)):.6e}"
-            )
-
     equations_to_evolve = build_equation_system(
         config=config,
         species=runtime.species,
@@ -1159,9 +1168,27 @@ def prepare_transport_solver_components(
         source_models=runtime.models.source,
         solver_cfg=solver_cfg,
         boundary_models=bc,
-        node_boundary_initial_er=node_boundary_initial_er,
+        node_boundary_initial_er=None,
         debug_nonfinite_rhs_components=bool(solver_cfg.get("debug_nonfinite_rhs_components", False)),
     )
+    # NTSS initializes its dynamic outer Er node from the ambipolar root at
+    # that endpoint.  Do this after the composed system exists so the root
+    # search uses precisely the first-step working state and flux boundary
+    # convention.  The result remains private solver metadata, not a
+    # TransportState leaf.
+    if er_bc_mode == "floating_ambipolar_edge_node":
+        node_boundary_initial_er = _initialize_floating_er_edge_node(
+            state, runtime, config, bc, equation_system=equation_system
+        )
+        equation_system = dataclasses.replace(
+            equation_system, node_boundary_initial_er=node_boundary_initial_er
+        )
+        if bool(runtime.solver_parameters.get("debug_stage_markers", False)):
+            print(
+                "[NEOPAX] floating Er edge-node initialization: "
+                f"last_center={float(jnp.asarray(state.Er[-1])):.6e} "
+                f"face_root={float(jnp.asarray(node_boundary_initial_er)):.6e}"
+            )
     solver = build_time_solver(solver_cfg)
     return {
         "bc": bc,

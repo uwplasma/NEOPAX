@@ -3530,8 +3530,14 @@ class ComposedEquationSystem:
         """
         if self.shared_flux_model is None:
             raise ValueError("floating_ambipolar_edge_node requires a shared flux model.")
+        # ``build_node_boundary_lagged_response`` owns the conversion from
+        # the public state to the working state.  Do not feed it an already
+        # prepared state here: that made initialization/reverse-root residuals
+        # use a cache anchored at ``prepare(prepare(state))`` while evaluating
+        # it at ``prepare(state)``.  The forward Radau node path prepares just
+        # once, so this must use that same convention.
         working_state, _ = self._prepare_working_state(state)
-        response = self.build_node_boundary_lagged_response(working_state, er_edge)
+        response = self.build_node_boundary_lagged_response(state, er_edge)
         fluxes = self.shared_flux_model.evaluate_with_lagged_response(
             working_state,
             response,

@@ -66,6 +66,55 @@ def test_floating_er_edge_node_initialization_tracks_nearest_face_root():
     assert jnp.allclose(edge, 3.0, atol=1.0e-3)
 
 
+def test_floating_er_edge_node_initialization_uses_composed_working_state():
+    """The first private edge root matches the state the RHS will evaluate."""
+
+    class _FaceFluxModel:
+        def evaluate_face_fluxes(self, state, face_state, **_kwargs):
+            # Root is the final working density, not the raw setup density.
+            residual = face_state.Er - state.density[0, -1]
+            return {
+                "Gamma": residual[None, :],
+                "Q": jnp.zeros((1, face_state.Er.shape[0])),
+                "Upar": jnp.zeros((1, face_state.Er.shape[0])),
+            }
+
+    class _EquationSystem:
+        shared_flux_model = _FaceFluxModel()
+
+        @staticmethod
+        def _prepare_working_state(state):
+            return dataclasses.replace(state, density=state.density + 1.0), None
+
+        @staticmethod
+        def _shared_flux_bc_kwargs():
+            return {"bc_density": None, "bc_temperature": None, "bc_er": None}
+
+    state = TransportState(
+        density=jnp.ones((1, 2)), pressure=jnp.ones((1, 2)), Er=jnp.asarray([0.0, 2.0])
+    )
+    runtime = SimpleNamespace(
+        species=SimpleNamespace(charge_qp=jnp.asarray([1.0])),
+        geometry=SimpleNamespace(r_grid_half=jnp.asarray([0.0, 0.5, 1.0])),
+        solver_parameters={"density_floor": 1.0e-6, "temperature_floor": 1.0e-6},
+        models=SimpleNamespace(flux=_FaceFluxModel()),
+    )
+    config = {
+        "ambipolarity": {
+            "er_ambipolar_method": "two_stage",
+            "er_ambipolar_scan_min": 0.0,
+            "er_ambipolar_scan_max": 4.0,
+            "er_ambipolar_n_coarse": 17,
+            "er_ambipolar_n_refine": 12,
+            "er_ambipolar_max_roots": 3,
+        }
+    }
+    edge = _initialize_floating_er_edge_node(
+        state, runtime, config, {}, equation_system=_EquationSystem()
+    )
+    assert jnp.allclose(edge, 2.0, atol=1.0e-3)
+
+
 def test_node_lagged_cache_is_skipped_by_public_er_component_debugger():
     """The public-state diagnostic must not misread Radau's private cache."""
     cache = SimpleNamespace(transport_response=object(), er_edge_anchor=jnp.asarray(1.0))
@@ -78,6 +127,47 @@ def test_node_lagged_cache_is_skipped_by_public_er_component_debugger():
         )
         is None
     )
+
+
+def test_node_boundary_charge_residual_builds_cache_from_public_state_once():
+    """The edge-root residual must use the same one-prepare convention as Radau.
+
+    A second preparation can alter constrained/floored profiles.  In that
+    case, a cache built from the already prepared state is anchored at a
+    different point than the state at which the residual is evaluated.
+    """
+
+    class _FluxModel:
+        def evaluate_with_lagged_response(self, state, response, **_kwargs):
+            assert jnp.allclose(response, state.density)
+            return {"Gamma_faces": jnp.zeros((1, 3))}
+
+    class _System:
+        shared_flux_model = _FluxModel()
+
+        def _prepare_working_state(self, state):
+            # Deliberately non-idempotent, as a constrained profile operation
+            # can be in the full composed system.
+            return dataclasses.replace(state, density=state.density + 1.0), None
+
+        def build_node_boundary_lagged_response(self, state, _er_edge):
+            return self._prepare_working_state(state)[0].density
+
+        @staticmethod
+        def _shared_flux_call_kwargs(extra_kwargs=None):
+            return {} if extra_kwargs is None else dict(extra_kwargs)
+
+        @staticmethod
+        def _resolve_equations():
+            return None, None, SimpleNamespace(charge_qp=jnp.asarray([1.0]))
+
+    state = TransportState(
+        density=jnp.ones((1, 2)), pressure=jnp.ones((1, 2)), Er=jnp.zeros(2)
+    )
+    residual = ComposedEquationSystem.node_boundary_charge_residual(
+        _System(), state, jnp.asarray(0.0)
+    )
+    assert jnp.allclose(residual, 0.0)
 
 
 def test_enforce_quasi_neutrality_reconstructs_electron_density():
