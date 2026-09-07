@@ -6018,10 +6018,9 @@ def main() -> None:
             "NTSS-midpoint model: it reconstructs the dense block transpose from "
             "colored local actions plus the analytic rank-three correction, then "
             "uses the same dense multi-RHS solve as 'block'; "
-            "'block_colored_database' reconstructs the exact direct-database "
-            "block-tridiagonal transpose from colored custom state-transpose "
-            "actions, then solves its exact radial block-tridiagonal multi-RHS "
-            "system without materializing a dense stage matrix; "
+            "'block_colored_database' is an experimental database-only "
+            "diagnostic candidate and is rejected for the production database "
+            "benchmark until it has parity with 'block'; "
             "'block_explicit_ntx_jacobian' keeps the exact block system but materializes "
             "each fixed-lagged NTX stage Jacobian from the explicit state pullback; "
             "'block_frozen_forward_jacobian' uses each replayed primal step's frozen "
@@ -6615,9 +6614,16 @@ def main() -> None:
         )
     if (
         is_database_geometry_reverse
-        and str(args.reverse_stage_adjoint_solve_mode).strip().lower() == "block"
+        and str(args.reverse_stage_adjoint_solve_mode).strip().lower()
+        == "block_colored_database"
     ):
-        args.reverse_stage_adjoint_solve_mode = "block_colored_database"
+        raise SystemExit(
+            "[autodiff-gate] block_colored_database is disabled for the "
+            "database benchmark: its compact block-Thomas stage-adjoint "
+            "solve produced nonfinite cotangents. Use "
+            "--reverse-stage-adjoint-solve-mode block, which is the "
+            "established exact Radau block solve."
+        )
     if (
         str(args.reverse_rhs_transpose_mode) == "explicit_ntx_interpolated"
         and str(args.reverse_stage_adjoint_solve_mode) == "gmres"
