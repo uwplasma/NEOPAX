@@ -18,6 +18,9 @@ from NEOPAX._orchestrator import (
     _load_ntss_reference_profiles,
     _normalize_solver_config,
     _resolve_reference_path,
+    build_runtime_context,
+    load_config,
+    prepare_transport_solver_components,
     Models,
     RuntimeContext,
 )
@@ -67,6 +70,7 @@ from NEOPAX._interpolators import get_Dij, monoenergetic_interpolation_table_bar
 from NEOPAX._source_models import get_source_model
 from NEOPAX._species import Species
 from NEOPAX._state import TransportState, get_v_thermal
+from NEOPAX._boundary_conditions import BoundaryConditionModel
 from NEOPAX._transport_flux_models import (
     CombinedTransportFluxModel,
     NTXDatabaseTransportModel,
@@ -319,15 +323,18 @@ def test_ntx_exact_runtime_quadratic_lagged_response_matches_live_reference(resp
     """Quadratic realtime payloads work for reduced and full radial layouts."""
     geometry = types.SimpleNamespace(
         a_b=1.0,
-        r_grid=jnp.asarray([0.3, 0.7]),
-        r_grid_half=jnp.asarray([0.1, 0.5, 0.9]),
+        # Keep the outer spacing comparable to the 51-centre benchmark grid.
+        # This makes the Robin face trace a genuine edge value, rather than a
+        # coarse-grid extrapolation unrelated to the benchmark boundary.
+        r_grid=jnp.asarray([0.97, 0.99]),
+        r_grid_half=jnp.asarray([0.96, 0.98, 1.00]),
     )
     species = Species(
-        number_species=2,
-        species_indices=jnp.asarray([0, 1]),
-        mass_mp=jnp.asarray([5.446e-4, 2.0]),
-        charge_qp=jnp.asarray([-1.0, 1.0]),
-        names=("e", "D"),
+        number_species=4,
+        species_indices=jnp.asarray([0, 1, 2, 3]),
+        mass_mp=jnp.asarray([5.446e-4, 2.0, 3.0, 4.0]),
+        charge_qp=jnp.asarray([-1.0, 1.0, 1.0, 2.0]),
+        names=("e", "D", "T", "He"),
     )
     energy_grid = types.SimpleNamespace(
         xWeights=jnp.asarray([0.2, 0.3, 0.5]),
@@ -340,6 +347,19 @@ def test_ntx_exact_runtime_quadratic_lagged_response_matches_live_reference(resp
         v_norm=jnp.asarray([1.7, 1.8, 1.9]),
     )
     prepared = prepare_monoenergetic_system(example_surface(), GridSpec(3, 3, 2))
+    density_bc = BoundaryConditionModel(
+        dr=0.02,
+        right_type="dirichlet",
+        # Exact right-boundary values in the w-He benchmark TOML.
+        right_value=jnp.asarray([0.39, 0.195, 0.195, 0.0]),
+    )
+    temperature_bc = BoundaryConditionModel(
+        dr=0.02,
+        right_type="robin",
+        # Exact active Robin parameter in the benchmark TOML.  The TOML
+        # ``value = 1.0`` is not an imposed face temperature in this BC.
+        right_decay_length=jnp.full((4,), 0.05),
+    )
     support = NTXExactLijRuntimeSupport(
         center_channels=_tiny_ntx_runtime_channels(geometry.r_grid),
         face_channels=_tiny_ntx_runtime_channels(geometry.r_grid_half),
@@ -357,10 +377,19 @@ def test_ntx_exact_runtime_quadratic_lagged_response_matches_live_reference(resp
         center_response_mode="interpolate_from_faces",
         response_anchor_count=response_anchor_count,
         lagged_response_taylor_order=2,
+        bc_density=density_bc,
+        bc_temperature=temperature_bc,
     )
     state = TransportState(
-        density=jnp.asarray([[1.0, 1.15], [1.0, 1.15]]),
-        pressure=jnp.asarray([[1.3, 1.61], [1.1, 1.38]]),
+        # Outer centres are deliberately close to the benchmark n/T edge
+        # values.  The face state must nevertheless use the actual boundary
+        # reconstruction, not a copied centre value.
+        density=jnp.asarray([
+            [0.44, 0.41], [0.22, 0.205], [0.22, 0.205], [1.0e-4, 1.0e-6],
+        ]),
+        pressure=jnp.asarray([
+            [0.352, 0.2952], [0.176, 0.1476], [0.176, 0.1476], [8.0e-5, 7.2e-7],
+        ]),
         Er=jnp.asarray([2.0e-4, 2.5e-4]),
     )
     response = model.build_lagged_response(state)
@@ -388,7 +417,13 @@ def test_ntx_exact_runtime_quadratic_lagged_response_matches_live_reference(resp
     ):
         assert jnp.array_equal(first, repeated)
 
-    faces = build_face_transport_state(state, geometry)
+    faces = build_face_transport_state(
+        state, geometry, bc_density=density_bc, bc_temperature=temperature_bc,
+    )
+    assert jnp.array_equal(faces.density[:, -1], density_bc.right_value)
+    # With the benchmark spacing and lambda, the live Robin reconstruction is
+    # close to the edge profile but is not the unused TOML ``value = 1.0``.
+    assert bool(jnp.all(faces.temperature[:, -1] > 0.0))
     direct = model.evaluate_face_fluxes(state, faces)
     lagged = model.evaluate_with_lagged_response(state, response)
     repeated_lagged = model.evaluate_with_lagged_response(state, repeated_response)
@@ -494,6 +529,8 @@ def test_ntx_exact_runtime_quadratic_lagged_response_matches_live_reference(resp
         live_faces = build_face_transport_state(
             state,
             geometry,
+            bc_density=density_bc,
+            bc_temperature=temperature_bc,
             er_edge_override=edge_value,
         )
         return full_state_model.evaluate_face_fluxes(state, live_faces)
@@ -550,13 +587,35 @@ def test_ntx_exact_runtime_quadratic_lagged_response_matches_live_reference(resp
             atol=3.0e-4,
         )
 
+    # The failure was seen after edge changes of a few 1e-6.  Sweep both
+    # sides of that interval at the actual benchmark density boundary and
+    # Robin-reconstructed temperature boundary.  Compare the outer face
+    # directly: the adjacent interior face has different geometry and is not
+    # an interchangeable reference.
+    for edge_offset in (-1.0e-5, -4.0e-6, -1.0e-6, 0.0, 1.0e-6, 4.0e-6, 1.0e-5):
+        edge_value = edge_anchor + jnp.asarray(edge_offset)
+        cached = full_state_model.evaluate_with_lagged_response(
+            state, edge_response,
+            er_edge_override=edge_value, er_edge_anchor=edge_anchor,
+        )
+        live = _live_edge_face_fluxes(edge_value)
+        for name in ("Gamma", "Q", "Upar"):
+            assert jnp.allclose(
+                cached[f"{name}_faces"][:, -1], live[name][:, -1],
+                rtol=1.0e-2, atol=1.0e-9,
+            ), ("outer-face", name, "edge_offset", edge_offset)
+
     # Exercise the actual Radau case: the cached response remains anchored
     # at the accepted state while both the public stage state and the private
     # edge coordinate have moved.  The former anchor-only check could not
     # detect an erroneous pure-edge-curvature contribution in this branch.
     displaced_state = TransportState(
-        density=state.density * jnp.asarray([[1.03, 0.98], [1.01, 1.02]]),
-        pressure=state.pressure * jnp.asarray([[0.97, 1.04], [1.02, 0.96]]),
+        density=state.density * jnp.asarray([
+            [1.03, 0.98], [1.01, 1.02], [1.02, 0.99], [1.00, 1.00],
+        ]),
+        pressure=state.pressure * jnp.asarray([
+            [0.97, 1.04], [1.02, 0.96], [1.01, 0.98], [1.00, 1.00],
+        ]),
         Er=state.Er + jnp.asarray([1.0e-5, -1.5e-5]),
     )
     displaced_edge = edge_anchor + jnp.asarray(8.0e-5)
@@ -823,6 +882,127 @@ def test_ntx_exact_runtime_quadratic_lagged_response_matches_live_reference(resp
     error_half = _relative_flux_error(0.5)
     assert float(error_full) < 2.0e-2
     assert float(error_half / error_full) < 0.3
+
+
+@pytest.mark.slow
+def test_realtime_boundary_edge_response_matches_fresh_reference_near_observed_roots():
+    """Exercise the production boundary state without a Radau time solve.
+
+    The regression holds the benchmark density/temperature state fixed and
+    compares a response anchored at that state with a freshly anchored
+    realtime reference after small Er-only perturbations.  In particular it
+    covers the edge-root range seen in the failed transport attempts.
+    """
+    config_path = (
+        Path(__file__).resolve().parents[1]
+        / "examples/benchmarks/"
+        "Solve_Transport_equations_wHe_radau_ntx_exact_lagged_runtime_vmec_"
+        "realtime_full_state_quadratic_transport_endpoint_newton_benchmark_center.toml"
+    )
+    config = load_config(config_path)
+    config["_config_dir"] = str(config_path.parent)
+    # This test examines a fixed state.  Avoid creating the configured
+    # initialization plot as a side effect of constructing that state.
+    config["ambipolarity"] = dict(config["ambipolarity"])
+    config["ambipolarity"]["er_ambipolar_plot"] = False
+
+    runtime, state = build_runtime_context(config)
+    assert state is not None
+    prepared = prepare_transport_solver_components(config, runtime, state)
+    owner = prepared["equation_system"]
+    assert owner.er_equation.boundary_mode == "floating_ambipolar_edge_node"
+
+    def _evaluate_with_anchor(test_state, edge_value, response, edge_anchor):
+        return owner.evaluate_node_boundary_with_lagged_response(
+            test_state,
+            edge_value,
+            response,
+            er_edge_anchor=edge_anchor,
+        )
+
+    def _state_with_last_er_offset(base_state, offset):
+        return dataclasses.replace(
+            base_state,
+            Er=base_state.Er.at[-1].add(jnp.asarray(offset, dtype=base_state.Er.dtype)),
+        )
+
+    def _assert_change_matches(*, cached, cached_base, fresh, fresh_base, label):
+        cached_core, cached_edge = cached
+        cached_core_base, cached_edge_base = cached_base
+        fresh_core, fresh_edge = fresh
+        fresh_core_base, fresh_edge_base = fresh_base
+        for name in ("density", "pressure", "Er"):
+            cached_delta = getattr(cached_core, name) - getattr(cached_core_base, name)
+            fresh_delta = getattr(fresh_core, name) - getattr(fresh_core_base, name)
+            assert jnp.allclose(cached_delta, fresh_delta, rtol=3.0e-2, atol=1.0e-8), (
+                label, name,
+                float(jnp.max(jnp.abs(cached_delta - fresh_delta))),
+                float(jnp.max(jnp.abs(fresh_delta))),
+            )
+        assert jnp.allclose(
+            cached_edge - cached_edge_base,
+            fresh_edge - fresh_edge_base,
+            rtol=3.0e-2,
+            atol=1.0e-8,
+        ), (label, "edge_rhs")
+
+    # Values bracket the outer roots/anchors observed in the failed runtime
+    # logs.  These are physical Er values in kV/m, not synthetic normalized
+    # scan coordinates.
+    for edge_anchor_float in (-37.0, -35.0, -33.0):
+        edge_anchor = jnp.asarray(edge_anchor_float, dtype=state.Er.dtype)
+        cached_response = owner.build_node_boundary_lagged_response(state, edge_anchor)
+        cached_base = _evaluate_with_anchor(
+            state, edge_anchor, cached_response, edge_anchor
+        )
+
+        # A newly built cache at the identical state is the direct realtime
+        # reference at its anchor.  This avoids a time solve while retaining
+        # the production face construction, NTX inputs, and full transport
+        # RHS assembly.
+        fresh_base_response = owner.build_node_boundary_lagged_response(state, edge_anchor)
+        fresh_base = _evaluate_with_anchor(
+            state, edge_anchor, fresh_base_response, edge_anchor
+        )
+        _assert_change_matches(
+            cached=cached_base,
+            cached_base=cached_base,
+            fresh=fresh_base,
+            fresh_base=fresh_base,
+            label=("anchor", edge_anchor_float),
+        )
+
+        # Separately perturb the private edge, the final public Er centre,
+        # and both coordinates.  n and T remain exactly the benchmark state;
+        # their outer traces are therefore the same Dirichlet/Robin values in
+        # each live and cached comparison.
+        for offset in (-1.0e-5, -4.0e-6, 4.0e-6, 1.0e-5):
+            cases = (
+                ("edge", state, edge_anchor + offset),
+                ("last_center", _state_with_last_er_offset(state, offset), edge_anchor),
+                (
+                    "combined",
+                    _state_with_last_er_offset(state, offset),
+                    edge_anchor + offset,
+                ),
+            )
+            for case_name, test_state, test_edge in cases:
+                cached = _evaluate_with_anchor(
+                    test_state, test_edge, cached_response, edge_anchor
+                )
+                fresh_response = owner.build_node_boundary_lagged_response(
+                    test_state, test_edge
+                )
+                fresh = _evaluate_with_anchor(
+                    test_state, test_edge, fresh_response, test_edge
+                )
+                _assert_change_matches(
+                    cached=cached,
+                    cached_base=cached_base,
+                    fresh=fresh,
+                    fresh_base=fresh_base,
+                    label=("edge_anchor", edge_anchor_float, case_name, offset),
+                )
 
 
 def test_face_quadratic_coefficient_interpolation_rebases_before_radial_interpolation():
