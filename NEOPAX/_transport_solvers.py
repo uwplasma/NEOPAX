@@ -9735,7 +9735,8 @@ def _radau_attempt_step_forward_solver(
     carry_in = _radau_carry_from_step_state(step_state)
     trial_dt = jnp.minimum(carry_in.dt, execution_context.attempt_context.t_final - carry_in.t)
     (
-        trial_y, err_norm, converged, stage_history, theta_final,
+        trial_y, err_norm, converged, stage_history, _final_stage_newton_delta,
+        _stage_secant_applied, theta_final,
         newton_iter_count, final_residual_norm, final_delta_norm,
         slow_contraction_final, residual_blowup_final, newton_nonfinite_final,
         jacobian_out, cache_valid_out, cache_dt_out, cache_age_out,
