@@ -12210,7 +12210,7 @@ def _radau_exact_stage_residual_matrix(
             stage_states,
         )
     elif (
-        matrix_mode == "block"
+        matrix_mode == "block_explicit_database_jacobian"
         and rhs_transpose_mode in {"explicit_database", "database", "explicit_black_box_database"}
     ):
         if physics_context.flat_rhs_direct_black_box_state_pullback is None:
@@ -14777,7 +14777,12 @@ def _radau_solve_exact_stage_residual_transpose(
             lagged_response,
             rhs=rhs,
         )
-    if mode not in {"block", "block_explicit_ntx_jacobian", "block_frozen_forward_jacobian"}:
+    if mode not in {
+        "block",
+        "block_explicit_ntx_jacobian",
+        "block_explicit_database_jacobian",
+        "block_frozen_forward_jacobian",
+    }:
         raise ValueError(f"Unknown reverse_stage_adjoint_solve_mode '{mode}'.")
     return _radau_solve_exact_stage_residual_transpose_block(
         kernel_context,
@@ -14903,7 +14908,12 @@ def _radau_solve_exact_stage_residual_transpose_batched(
             rhs=rhs_arr,
             batched=True,
         )
-    if mode not in {"block", "block_explicit_ntx_jacobian", "block_frozen_forward_jacobian"}:
+    if mode not in {
+        "block",
+        "block_explicit_ntx_jacobian",
+        "block_explicit_database_jacobian",
+        "block_frozen_forward_jacobian",
+    }:
         raise ValueError(f"Unknown reverse_stage_adjoint_solve_mode '{mode}'.")
     return jax.vmap(
         lambda rhs_row: _radau_solve_exact_stage_residual_transpose_block(

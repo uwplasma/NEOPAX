@@ -407,6 +407,35 @@ def test_ntx_exact_runtime_quadratic_lagged_response_matches_live_reference(resp
     edge_response = full_state_model.build_lagged_response(
         state, er_edge_override=edge_anchor
     )
+    # The private edge belongs to the face state, not the public
+    # TransportState.  A response rebuilt at this exact anchor must therefore
+    # recover the native direct NTX face flux before any Radau stage moves.
+    # This is deliberately a live-versus-cache assertion: testing the cached
+    # tangent only against another cached polynomial cannot detect a mismatch
+    # in the factorized NTX value or its edge slope.
+    def _live_edge_face_fluxes(edge_value):
+        live_faces = build_face_transport_state(
+            state,
+            geometry,
+            er_edge_override=edge_value,
+        )
+        return full_state_model.evaluate_face_fluxes(state, live_faces)
+
+    cached_at_edge_anchor = full_state_model.evaluate_with_lagged_response(
+        state,
+        edge_response,
+        er_edge_override=edge_anchor,
+        er_edge_anchor=edge_anchor,
+    )
+    live_at_edge_anchor = _live_edge_face_fluxes(edge_anchor)
+    for name in ("Gamma", "Q", "Upar"):
+        assert jnp.allclose(
+            cached_at_edge_anchor[f"{name}_faces"],
+            live_at_edge_anchor[name],
+            rtol=3.0e-6,
+            atol=1.0e-12,
+        )
+
     edge_tangent = full_state_model.evaluate_with_lagged_response_edge_tangent(
         state,
         edge_anchor,
@@ -427,11 +456,19 @@ def test_ntx_exact_runtime_quadratic_lagged_response_matches_live_reference(resp
         er_edge_override=edge_anchor - edge_epsilon,
         er_edge_anchor=edge_anchor,
     )
+    live_edge_plus = _live_edge_face_fluxes(edge_anchor + edge_epsilon)
+    live_edge_minus = _live_edge_face_fluxes(edge_anchor - edge_epsilon)
     for name in ("Gamma", "Q", "Upar"):
         assert jnp.allclose(
             edge_tangent[f"{name}_faces"],
             (edge_plus[f"{name}_faces"] - edge_minus[f"{name}_faces"])
             / (2.0 * edge_epsilon),
+            rtol=3.0e-3,
+            atol=3.0e-4,
+        )
+        assert jnp.allclose(
+            edge_tangent[f"{name}_faces"],
+            (live_edge_plus[name] - live_edge_minus[name]) / (2.0 * edge_epsilon),
             rtol=3.0e-3,
             atol=3.0e-4,
         )
