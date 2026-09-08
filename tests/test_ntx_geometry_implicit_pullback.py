@@ -92,6 +92,181 @@ class _TestMomentumGeometry:
     dr: object = None
 
 
+@jax.tree_util.register_dataclass
+@dataclasses.dataclass(frozen=True)
+class _PhysicalMeshGeometry:
+    """Small geometry payload with the VMEC-derived radial mesh relation."""
+
+    a_b: object
+    rho_grid: object
+    rho_grid_half: object
+    r_grid: object
+    r_grid_half: object
+    dr: object
+
+
+def test_database_geometry_delta_restores_vmec_radial_mesh_relations():
+    """Database split VJPs vary the mesh through a_b, never free face nodes."""
+    geometry = _PhysicalMeshGeometry(
+        a_b=jnp.asarray(2.0),
+        rho_grid=jnp.asarray([0.25, 0.75]),
+        rho_grid_half=jnp.asarray([0.0, 0.5, 1.0]),
+        r_grid=jnp.asarray([0.5, 1.5]),
+        r_grid_half=jnp.asarray([0.0, 1.0, 2.0]),
+        dr=jnp.asarray(1.0),
+    )
+    delta = _PhysicalMeshGeometry(
+        a_b=jnp.asarray(0.3),
+        rho_grid=jnp.asarray([7.0, -4.0]),
+        rho_grid_half=jnp.asarray([8.0, -5.0, 9.0]),
+        r_grid=jnp.asarray([3.0, -2.0]),
+        r_grid_half=jnp.asarray([6.0, -1.0, 4.0]),
+        dr=jnp.asarray(-10.0),
+    )
+
+    actual = _database_geometry_with_constrained_axis_face(geometry, delta)
+
+    assert jnp.allclose(actual.r_grid, jnp.asarray([0.575, 1.725]))
+    assert jnp.allclose(actual.r_grid_half, jnp.asarray([0.0, 1.15, 2.3]))
+    assert jnp.allclose(actual.dr, 1.15)
+    assert jnp.array_equal(actual.rho_grid, geometry.rho_grid)
+    assert jnp.array_equal(actual.rho_grid_half, geometry.rho_grid_half)
+
+    zero = jax.tree_util.tree_map(jnp.zeros_like, geometry)
+
+    def response(value):
+        constrained = _database_geometry_with_constrained_axis_face(geometry, value)
+        return (
+            jnp.sum(constrained.r_grid)
+            + jnp.sum(constrained.r_grid_half)
+            + constrained.dr
+        )
+
+    (_, pullback) = jax.vjp(response, zero)
+    (bar,) = pullback(jnp.asarray(1.0))
+    assert jnp.all(jnp.isfinite(bar.r_grid_half))
+    assert jnp.allclose(bar.r_grid, 0.0)
+    assert jnp.allclose(bar.r_grid_half, 0.0)
+    assert jnp.allclose(bar.dr, 0.0)
+    assert jnp.allclose(bar.rho_grid, 0.0)
+    assert jnp.allclose(bar.rho_grid_half, 0.0)
+    assert jnp.allclose(bar.a_b, 3.0)
+
+
+def test_database_equation_payload_routes_physical_mesh_bar_through_a_b():
+    """The real fixed-flux equation boundary uses the coupled mesh helper."""
+    geometry = _PhysicalMeshGeometry(
+        a_b=jnp.asarray(2.0),
+        rho_grid=jnp.asarray([0.25, 0.75]),
+        rho_grid_half=jnp.asarray([0.0, 0.5, 1.0]),
+        r_grid=jnp.asarray([0.5, 1.5]),
+        r_grid_half=jnp.asarray([0.0, 1.0, 2.0]),
+        dr=jnp.asarray(1.0),
+    )
+
+    class _FixedDatabaseOwner:
+        def __call__(self, _state):
+            return jnp.asarray(3.0)
+
+    equations = object.__new__(ComposedEquationSystem)
+    owner = _FixedDatabaseOwner()
+    object.__setattr__(
+        equations,
+        "_flux_model_with_realtime_support_payload",
+        lambda _model, _support: owner,
+    )
+    object.__setattr__(equations, "shared_flux_model", owner)
+    object.__setattr__(equations, "_prepare_working_state", lambda state: (state, None))
+    object.__setattr__(
+        equations,
+        "_with_database_equation_geometry_and_fixed_flux",
+        lambda geometry_value, _flux_model: SimpleNamespace(
+            _evaluate_with_shared_fluxes_from_working_state=(
+                lambda _working_state, _eidx, _state, fixed_fluxes: (
+                    jnp.sum(geometry_value.r_grid)
+                    + jnp.sum(geometry_value.r_grid_half)
+                    + geometry_value.dr
+                    + fixed_fluxes
+                )
+            )
+        ),
+    )
+
+    actual = equations.pullback_direct_rhs_database_equation_geometry_payload(
+        jnp.asarray(0.0),
+        "state",
+        None,
+        jnp.asarray(1.0),
+        {"geometry": geometry, "database": jnp.asarray(7.0)},
+    )
+
+    assert jnp.all(jnp.isfinite(actual["geometry"].r_grid_half))
+    assert jnp.allclose(actual["geometry"].r_grid, 0.0)
+    assert jnp.allclose(actual["geometry"].r_grid_half, 0.0)
+    assert jnp.allclose(actual["geometry"].dr, 0.0)
+    assert jnp.allclose(actual["geometry"].a_b, 3.0)
+
+
+def test_database_compact_flux_payload_routes_physical_mesh_bar_through_a_b():
+    """The compact fixed-table flux boundary has the same mesh constraint."""
+
+    class _ToyDatabaseModel(NTXDatabaseTransportModel):
+        def build_local_direct_flux_evaluator(self, state):
+            del state
+
+            def _evaluate(_radius_index, _er_value):
+                gamma = jnp.broadcast_to(
+                    jnp.sum(self.geometry.r_grid)
+                    + jnp.sum(self.geometry.r_grid_half)
+                    + self.geometry.dr,
+                    (2,),
+                )
+                return {
+                    "Gamma": gamma,
+                    "Q": jnp.zeros_like(gamma),
+                    "Upar": jnp.zeros_like(gamma),
+                }
+
+            return _evaluate
+
+    geometry = _PhysicalMeshGeometry(
+        a_b=jnp.asarray(2.0),
+        rho_grid=jnp.asarray([0.25, 0.75]),
+        rho_grid_half=jnp.asarray([0.0, 0.5, 1.0]),
+        r_grid=jnp.asarray([0.5, 1.5]),
+        r_grid_half=jnp.asarray([0.0, 1.0, 2.0]),
+        dr=jnp.asarray(1.0),
+    )
+    model = _ToyDatabaseModel(
+        species=None,
+        energy_grid=None,
+        geometry=geometry,
+        database=None,
+    )
+    state = TransportState(
+        density=jnp.ones((2, 2)),
+        pressure=jnp.ones((2, 2)),
+        Er=jnp.asarray([0.1, 0.2]),
+    )
+    actual = model.pullback_direct_rhs_geometry_by_radius(
+        state,
+        {
+            "Gamma": jnp.ones((2, 2)),
+            "Q": jnp.zeros((2, 2)),
+            "Upar": jnp.zeros((2, 2)),
+        },
+        geometry,
+    )
+
+    assert jnp.all(jnp.isfinite(actual.r_grid_half))
+    assert jnp.allclose(actual.r_grid, 0.0)
+    assert jnp.allclose(actual.r_grid_half, 0.0)
+    assert jnp.allclose(actual.dr, 0.0)
+    # Two radial local calls, each with two Gamma species bars, multiply the
+    # physical mesh derivative 3 by four.
+    assert jnp.allclose(actual.a_b, 12.0)
+
+
 def test_database_equation_geometry_delta_keeps_axis_face_constrained():
     """Only the permanently-zero axis face is removed from a database delta."""
     geometry = _TestMomentumGeometry(

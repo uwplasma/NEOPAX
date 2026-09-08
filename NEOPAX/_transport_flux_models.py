@@ -4859,13 +4859,20 @@ def _add_float_delta_tree(primal_tree, delta_tree):
 
 
 def _database_geometry_with_constrained_axis_face(geometry, geometry_delta):
-    """Apply a database geometry delta without moving the magnetic axis.
+    """Apply a database geometry delta on the physical radial-mesh manifold.
 
-    ``r_grid_half[0]`` is generated as ``rho_grid_half[0] * a_b`` with a
-    permanently zero first factor.  It is not an independent transport
-    geometry coordinate.  Both compact fixed-table flux and equation VJPs
-    must keep that face at its primal value while perturbing the remaining
-    payload coordinates.
+    The VMEC geometry builder does not expose ``r_grid``, ``r_grid_half``, or
+    ``dr`` as independent coordinates: they are respectively
+    ``rho_grid * a_b``, ``rho_grid_half * a_b``, and the first face spacing.
+    The split database VJPs differentiate an otherwise independent support
+    payload, so they must restore those relations before evaluating the local
+    equation or fixed-table flux.  In particular this prevents an artificial
+    perturbation of the zero axis face, where radial formulas have no valid
+    off-manifold extension.
+
+    Geometry stand-ins used by narrow unit tests may not carry the immutable
+    rho grids.  Keep their historical minimal axis-face constraint rather
+    than imposing a guessed mesh relation on such a stand-in.
     """
     geometry_value = _add_float_delta_tree(geometry, geometry_delta)
     if (
@@ -4880,6 +4887,27 @@ def _database_geometry_with_constrained_axis_face(geometry, geometry_delta):
         raise ValueError(
             "Database geometry requires a non-empty one-dimensional radial face mesh."
         )
+    if (
+        hasattr(geometry, "rho_grid")
+        and hasattr(geometry, "rho_grid_half")
+        and hasattr(geometry_value, "a_b")
+    ):
+        rho_grid = jnp.asarray(geometry.rho_grid)
+        rho_grid_half = jnp.asarray(geometry.rho_grid_half)
+        a_b = jnp.asarray(geometry_value.a_b)
+        replacements = {
+            # These are configured sampling coordinates, not VMEC outputs.
+            # Hold them fixed as the geometry builder does.
+            "rho_grid": rho_grid,
+            "rho_grid_half": rho_grid_half,
+            "r_grid_half": rho_grid_half * a_b,
+        }
+        if hasattr(geometry_value, "r_grid"):
+            replacements["r_grid"] = rho_grid * a_b
+        if hasattr(geometry_value, "dr") and getattr(geometry_value, "dr") is not None:
+            replacements["dr"] = replacements["r_grid_half"][1] - replacements["r_grid_half"][0]
+        return dataclasses.replace(geometry_value, **replacements)
+
     return dataclasses.replace(
         geometry_value,
         r_grid_half=perturbed_faces.at[0].set(primal_faces[0]),
