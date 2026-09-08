@@ -951,7 +951,7 @@ def test_realtime_boundary_edge_response_matches_fresh_reference_near_observed_r
     # Values bracket the outer roots/anchors observed in the failed runtime
     # logs.  These are physical Er values in kV/m, not synthetic normalized
     # scan coordinates.
-    for edge_anchor_float in (-37.0, -35.0, -33.0):
+    for edge_anchor_float in (-50.0, -37.0, -35.0, -33.0, -10.0, 0.0, 10.0):
         edge_anchor = jnp.asarray(edge_anchor_float, dtype=state.Er.dtype)
         cached_response = owner.build_node_boundary_lagged_response(state, edge_anchor)
         cached_base = _evaluate_with_anchor(
