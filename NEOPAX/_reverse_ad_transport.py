@@ -110,8 +110,7 @@ from ._transport_solvers import (
     _radau_eval_rhs,
     _execute_radau_accepted_step_next_reduced_cotangent_batched_bwd_with_support_call,
     _execute_radau_accepted_step_next_reduced_cotangent_batched_bwd_with_support_from_segment_primal_record_call,
-    _radau_database_geometry_support_pullback_from_stage_record,
-    _radau_database_segment_reduced_cotangent_bwd_with_table_support_and_geometry_records_call,
+    _radau_database_segment_reduced_cotangent_bwd_with_table_support_call,
     _radau_segment_reduced_cotangent_bwd_batched_with_support_call,
     _radau_segment_replay_minimal_with_primal_records_call,
     _radau_segment_reduced_cotangent_bwd_batched_with_support_from_primal_records_call,
@@ -4905,11 +4904,10 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
         getattr(reverse_setup.execution_context.physics_context, "reverse_stage_cotangent_mode", "full")
     ).strip().lower()
     segment_count = int(jax.tree_util.tree_leaves(segmented_replay_arrays)[0].shape[0])
-    use_database_table_geometry_split = (
+    use_database_table_reverse = (
         isinstance(support_payload, dict)
         and set(support_payload) == {"geometry", "database"}
     )
-    database_geometry_records_by_segment = []
 
     reduced_bars = _reverse_reduced_cotangent(
         reverse_setup.execution_context,
@@ -5028,7 +5026,7 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
         flush=True,
     )
     if (
-        use_database_table_geometry_split
+        use_database_table_reverse
         and bool(
             getattr(
                 reverse_setup.execution_context.physics_context,
@@ -5090,7 +5088,7 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
         distinguishing a bad transport cotangent from a bad scan transpose.
         It is opt-in with the existing segment-input diagnostics flag.
         """
-        if not (segment_input_diagnostics and use_database_table_geometry_split):
+        if not (segment_input_diagnostics and use_database_table_reverse):
             return
         bad_rows = _batched_support_first_nonfinite_leaves(
             tuple(leaves)[: len(_zero_support_leaves)],
@@ -5502,11 +5500,11 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
         f"objectives={objective_count} cotangent_mode={cotangent_mode}",
         flush=True,
     )
-    if use_database_table_geometry_split:
+    if use_database_table_reverse:
         print(
             f"{progress_prefix} progress: database segment reverse uses fixed-table "
-            "transpose plus deferred fixed-table geometry sweep "
-            "(no scan owner in segment payload)",
+            "transpose; transport metric is frozen and the recorded scan is "
+            "the sole table-to-geometry boundary (no scan owner in segments)",
             flush=True,
         )
 
@@ -5681,7 +5679,7 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
         segment_arrays = _take_tree_axis0(segmented_replay_arrays, segment_index)
         segment_reduced_bars_input = reduced_bars
         if (
-            use_database_table_geometry_split
+            use_database_table_reverse
             and bool(
                 getattr(
                     reverse_setup.execution_context.physics_context,
@@ -5701,10 +5699,10 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
                 f"nonfinite_count={int(np.count_nonzero(~np.isfinite(segment_input_y)))}",
                 flush=True,
             )
-        if use_database_table_geometry_split:
+        if use_database_table_reverse:
             # The database segment owns only the compact table transpose.
-            # Replay remains bounded by segment length; the returned numeric
-            # records are consumed after the complete table sweep below.
+            # The transport metric is frozen at this Lij-style boundary; the
+            # recorded NTX scan is the sole table-to-geometry transpose.
             _, database_step_start_carries, database_step_primal_records = (
                 _radau_segment_replay_minimal_with_primal_records_call(
                     reverse_setup.execution_context,
@@ -5715,8 +5713,7 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
             (
                 reduced_bars,
                 segment_support_bar_leaves,
-                database_geometry_records,
-            ) = _radau_database_segment_reduced_cotangent_bwd_with_table_support_and_geometry_records_call(
+            ) = _radau_database_segment_reduced_cotangent_bwd_with_table_support_call(
                 reverse_setup.execution_context,
                 cotangent_mode,
                 reduced_bars,
@@ -5725,16 +5722,14 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
                 segment_arrays,
                 support_payload,
             )
-            reduced_bars, segment_support_bar_leaves, database_geometry_records = (
+            reduced_bars, segment_support_bar_leaves = (
                 jax.block_until_ready(
                     (
                         reduced_bars,
                         segment_support_bar_leaves,
-                        database_geometry_records,
                     )
                 )
             )
-            database_geometry_records_by_segment.append(database_geometry_records)
         elif host_static_branch_dispatch:
             reduced_bars, segment_support_bar_leaves = _run_host_static_branch_segment(
                 segment_start_carry,
@@ -5774,7 +5769,7 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
                     flush=True,
                 )
             if (
-                not use_database_table_geometry_split
+                not use_database_table_reverse
                 and
                 not actual_cotangent_nonfinite_segment_diagnosed
                 and any(row is not None for row in segment_bad_rows)
@@ -5832,7 +5827,7 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
         if (
             phase_timing_segment_warm_pending
             and not host_static_branch_dispatch
-            and not use_database_table_geometry_split
+            and not use_database_table_reverse
         ):
             first_call_elapsed = time.perf_counter() - segment_phase_start
             warm_start = time.perf_counter()
@@ -5947,42 +5942,6 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
                 "(host diagnostic; not an XLA persistent-cache metric)",
                 flush=True,
             )
-    if use_database_table_geometry_split:
-        geometry_sweep_start = time.perf_counter()
-        for database_geometry_records in database_geometry_records_by_segment:
-            geometry_support_bars = (
-                _radau_database_geometry_support_pullback_from_stage_record(
-                    reverse_setup.execution_context.physics_context,
-                    support_payload,
-                    database_geometry_records,
-                )
-            )
-            geometry_support_bar_leaves = tuple(
-                jax.tree_util.tree_leaves(geometry_support_bars)
-            )
-            support_bar_leaves = tuple(
-                accumulated + increment
-                for accumulated, increment in zip(
-                    support_bar_leaves,
-                    geometry_support_bar_leaves,
-                    strict=True,
-                )
-            )
-            step_support_bar_leaves_accum = tuple(
-                accumulated + increment
-                for accumulated, increment in zip(
-                    step_support_bar_leaves_accum,
-                    geometry_support_bar_leaves,
-                    strict=True,
-                )
-            )
-        support_bar_leaves = jax.block_until_ready(support_bar_leaves)
-        print(
-            f"{progress_prefix} progress: database post-segment geometry sweep ready "
-            f"elapsed_s={time.perf_counter() - geometry_sweep_start:.3f} "
-            f"segments={len(database_geometry_records_by_segment)}",
-            flush=True,
-        )
     _database_support_nonfinite_checkpoint("after_segment_sweep", support_bar_leaves)
     reduced_bars, support_bar_leaves = jax.block_until_ready((reduced_bars, support_bar_leaves))
     print(

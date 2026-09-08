@@ -1595,36 +1595,18 @@ def test_black_box_recorded_database_direct_support_split_matches_generic_payloa
     assert jnp.allclose(actual["surfaces"], 0.0)
 
 
-def test_batched_database_geometry_payload_keeps_objective_axis_inside_hook():
-    """The deferred database geometry boundary receives all objective rows once."""
+def test_database_direct_rhs_support_stops_at_fixed_table_boundary():
+    """Database direct RHS bars do not create a raw transport-geometry VJP."""
 
-    class _RecordedDatabaseOwner:
+    class _FixedDatabaseOwner:
         def __call__(self, _state):
             return jnp.asarray(3.0)
 
-        def pullback_direct_rhs_geometry_by_radius(self, _state, flux_bar, _geometry):
-            # The fixed-table database owns the direct Gamma/Q/Upar geometry
-            # term.  Equation assembly contributes its independent metric
-            # term below; the deferred sweep must add both exactly once.
-            return 10.0 * flux_bar
-
-    class _FixedFluxEquation:
-        def __init__(self, geometry):
-            self.geometry = geometry
-
-        def __call__(self, _t, _state, _runtime):
-            return self.geometry
-
-        def _prepare_working_state(self, state):
-            return state, None
-
-        def _evaluate_with_shared_fluxes_from_working_state(
-            self, _working_state, _eidx, _state, shared_fluxes
-        ):
-            return self.geometry + shared_fluxes
+        def pullback_direct_rhs_support_payload(self, _state, flux_bar, _support):
+            return {"database": 4.0 * flux_bar}
 
     equations = object.__new__(ComposedEquationSystem)
-    owner = _RecordedDatabaseOwner()
+    owner = _FixedDatabaseOwner()
     object.__setattr__(equations, "shared_flux_model", owner)
     object.__setattr__(
         equations,
@@ -1635,23 +1617,21 @@ def test_batched_database_geometry_payload_keeps_objective_axis_inside_hook():
     object.__setattr__(
         equations, "pullback_shared_fluxes", lambda _state, _fluxes, rhs_bar: rhs_bar
     )
+    # Reaching this method would mean the forbidden raw geometry route was
+    # reconstructed instead of returning the fixed-table bar above.
     object.__setattr__(
         equations,
         "with_realtime_geometry_support_payload",
-        lambda payload: _FixedFluxEquation(payload["geometry"]),
+        lambda _payload: (_ for _ in ()).throw(AssertionError("raw geometry VJP")),
     )
     support = {"geometry": jnp.asarray(5.0), "database": jnp.asarray(7.0)}
-    actual = equations.pullback_direct_rhs_database_geometry_payload_batched(
-        jnp.asarray(0.0),
-        None,
-        None,
-        jnp.asarray([2.0, -3.0]),
-        support,
+
+    actual = equations.pullback_direct_rhs_support_payload(
+        jnp.asarray(0.0), None, None, jnp.asarray(2.0), support
     )
-    # One unit comes from fixed-flux equation assembly and ten from the
-    # fixed-table flux derivative; the objective axis stays inside the hook.
-    assert jnp.allclose(actual["geometry"], jnp.asarray([22.0, -33.0]))
-    assert jnp.allclose(actual["database"], jnp.zeros((2,)))
+
+    assert jnp.allclose(actual["database"], 8.0)
+    assert jnp.allclose(actual["geometry"], 0.0)
 
 
 def test_native_multi_rhs_equation_system_forwarding_hook_is_exposed_to_radau():
