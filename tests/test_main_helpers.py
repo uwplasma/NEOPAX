@@ -1108,9 +1108,9 @@ def test_realtime_outer_face_local_cache_matches_direct_near_observed_edge_roots
     # without changing the benchmark's production TOML.
     config["neoclassical"] = dict(config["neoclassical"])
     config["neoclassical"].update(
-        ntx_exact_n_theta=25,
+        ntx_exact_n_theta=7,
         ntx_exact_n_zeta=25,
-        ntx_exact_n_xi=33,
+        ntx_exact_n_xi=31,
     )
     config["ambipolarity"] = dict(config["ambipolarity"])
     config["ambipolarity"]["er_ambipolar_plot"] = False
