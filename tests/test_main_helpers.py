@@ -1134,7 +1134,7 @@ def test_realtime_outer_face_local_cache_matches_direct_near_observed_edge_roots
     # Build exactly one local cache per species at each observed edge-root
     # regime, then sweep only its Er coordinate.  n/T are held fixed at the
     # benchmark state; their face values still come from the real BCs above.
-    for edge_anchor_float in (-37.0, -35.0, -33.0):
+    for edge_anchor_float in (-50.0, -37.0, -35.0, -33.0, -10.0, 0.0, 10.0):
         edge_anchor = jnp.asarray(edge_anchor_float, dtype=state.Er.dtype)
         density, temperature, _, _ = _edge_primitives(edge_anchor)
         vthermal = get_v_thermal(neo.species.mass, temperature)
