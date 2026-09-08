@@ -38,6 +38,37 @@ PARTICLE_FLUX_PHYSICAL_TO_STATE = 1.0e-20
 HEAT_FLUX_PHYSICAL_TO_STATE = 1.0e-23
 
 
+def _database_equation_geometry_with_constrained_axis_face(geometry, geometry_delta):
+    """Apply a database equation-geometry delta on its physical mesh manifold.
+
+    ``r_grid_half[0]`` is the magnetic-axis face.  The realtime geometry
+    builder defines it as ``rho_grid_half[0] * a_b`` with
+    ``rho_grid_half[0] == 0``; it is consequently fixed for every VMEC
+    parameter variation.  The database equation-only transpose must not
+    rebuild finite-volume boundary algebra at an independently perturbed axis
+    coordinate.  Other geometry leaves, including all non-axis face radii,
+    retain their ordinary payload deltas.
+    """
+    geometry_value = _add_float_delta_tree(geometry, geometry_delta)
+    if (
+        not dataclasses.is_dataclass(geometry)
+        or not hasattr(geometry, "r_grid_half")
+        or not hasattr(geometry_value, "r_grid_half")
+    ):
+        return geometry_value
+    primal_faces = jnp.asarray(geometry.r_grid_half)
+    perturbed_faces = jnp.asarray(geometry_value.r_grid_half)
+    if primal_faces.ndim != 1 or perturbed_faces.ndim != 1 or primal_faces.shape[0] == 0:
+        raise ValueError(
+            "Database equation geometry requires a non-empty one-dimensional "
+            "radial face mesh."
+        )
+    return dataclasses.replace(
+        geometry_value,
+        r_grid_half=perturbed_faces.at[0].set(primal_faces[0]),
+    )
+
+
 def _minmod_pair(a, b):
     same_sign = (a * b) > 0.0
     return jnp.where(same_sign, jnp.sign(a) * jnp.minimum(jnp.abs(a), jnp.abs(b)), 0.0)
@@ -2047,7 +2078,10 @@ class ComposedEquationSystem:
         geometry_delta0 = _float_delta_tree_like(geometry)
 
         def _rhs_from_equation_geometry_delta(geometry_delta):
-            geometry_value = _add_float_delta_tree(geometry, geometry_delta)
+            geometry_value = _database_equation_geometry_with_constrained_axis_face(
+                geometry,
+                geometry_delta,
+            )
             equations_at_geometry = self._with_database_equation_geometry_and_fixed_flux(
                 geometry_value,
                 active_shared_flux_model,

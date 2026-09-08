@@ -35,7 +35,10 @@ from NEOPAX._neoclassical import (
 from NEOPAX._energy_grid_models import StandardLaguerreEnergyGrid
 from NEOPAX._species import Species
 from NEOPAX._state import TransportState, get_v_thermal
-from NEOPAX._transport_equations import ComposedEquationSystem
+from NEOPAX._transport_equations import (
+    ComposedEquationSystem,
+    _database_equation_geometry_with_constrained_axis_face,
+)
 from NEOPAX._transport_solvers import (
     _flat_rhs_build_support_pullback_batched_interpolated_faces_factory,
     _flat_rhs_state_and_lagged_response_pullback_factory,
@@ -89,6 +92,89 @@ class _TestMomentumGeometry:
     B0: object
     full_grid_indices: object = None
     dr: object = None
+
+
+def test_database_equation_geometry_delta_keeps_axis_face_constrained():
+    """Only the permanently-zero axis face is removed from a database delta."""
+    geometry = _TestMomentumGeometry(
+        a_b=jnp.asarray(1.0),
+        r_grid=jnp.asarray([0.1, 0.3]),
+        r_grid_half=jnp.asarray([0.0, 0.2, 0.4]),
+        Bsqav=jnp.asarray([1.0, 1.0]),
+        G_PS=jnp.asarray([1.0, 1.0]),
+        B0=jnp.asarray([1.0, 1.0]),
+    )
+    delta = dataclasses.replace(
+        geometry,
+        a_b=jnp.asarray(0.5),
+        r_grid=jnp.asarray([2.0, -3.0]),
+        r_grid_half=jnp.asarray([7.0, 8.0, -9.0]),
+    )
+
+    actual = _database_equation_geometry_with_constrained_axis_face(geometry, delta)
+
+    assert jnp.allclose(actual.r_grid_half, jnp.asarray([0.0, 8.2, -8.6]))
+    assert jnp.allclose(actual.r_grid, jnp.asarray([2.1, -2.7]))
+    assert jnp.allclose(actual.a_b, 1.5)
+
+
+def test_database_equation_geometry_axis_constraint_has_finite_allowed_vjp():
+    """The constrained database mesh has no axis direction and preserves others."""
+    geometry = _TestMomentumGeometry(
+        a_b=jnp.asarray(1.0),
+        r_grid=jnp.asarray([0.1, 0.3]),
+        r_grid_half=jnp.asarray([0.0, 0.2, 0.4]),
+        Bsqav=jnp.asarray([1.0, 1.0]),
+        G_PS=jnp.asarray([1.0, 1.0]),
+        B0=jnp.asarray([1.0, 1.0]),
+    )
+    zero = dataclasses.replace(
+        geometry,
+        a_b=jnp.asarray(0.0),
+        r_grid=jnp.zeros_like(geometry.r_grid),
+        r_grid_half=jnp.zeros_like(geometry.r_grid_half),
+        Bsqav=jnp.zeros_like(geometry.Bsqav),
+        G_PS=jnp.zeros_like(geometry.G_PS),
+        B0=jnp.zeros_like(geometry.B0),
+    )
+
+    def scalar_response(delta):
+        value = _database_equation_geometry_with_constrained_axis_face(
+            geometry, delta
+        )
+        return jnp.sum(jnp.square(value.r_grid_half)) + 0.3 * jnp.sum(value.r_grid)
+
+    direction = dataclasses.replace(
+        zero,
+        r_grid=jnp.asarray([0.25, -0.5]),
+        # This deliberately contains an invalid axis component.  The physical
+        # constrained map must remove it without changing the other faces.
+        r_grid_half=jnp.asarray([9.0, 0.5, -0.25]),
+    )
+    _, tangent = jax.jvp(scalar_response, (zero,), (direction,))
+    _, pullback = jax.vjp(scalar_response, zero)
+    (bar,) = pullback(jnp.asarray(1.0))
+    epsilon = jnp.asarray(1.0e-5)
+
+    def _scale_direction(scale):
+        return dataclasses.replace(
+            direction,
+            a_b=scale * direction.a_b,
+            r_grid=scale * direction.r_grid,
+            r_grid_half=scale * direction.r_grid_half,
+            Bsqav=scale * direction.Bsqav,
+            G_PS=scale * direction.G_PS,
+            B0=scale * direction.B0,
+        )
+
+    fd = (
+        scalar_response(_scale_direction(epsilon))
+        - scalar_response(_scale_direction(-epsilon))
+    ) / (2.0 * epsilon)
+
+    assert jnp.all(jnp.isfinite(bar.r_grid_half))
+    assert jnp.allclose(bar.r_grid_half[0], 0.0)
+    assert jnp.allclose(tangent, fd, rtol=1.0e-5, atol=1.0e-7)
 
 
 @jax.tree_util.register_dataclass
@@ -1756,6 +1842,55 @@ def test_database_direct_equation_geometry_payload_holds_flux_fixed():
     )
 
     assert jnp.allclose(actual["geometry"], 2.0)
+    assert jnp.allclose(actual["database"], 0.0)
+
+
+def test_database_equation_geometry_payload_uses_constrained_axis_vjp():
+    """The real database equation boundary cannot return an axis-face NaN."""
+
+    class _FixedDatabaseOwner:
+        def __call__(self, _state):
+            return jnp.asarray(3.0)
+
+    geometry = _TestMomentumGeometry(
+        a_b=jnp.asarray(1.0),
+        r_grid=jnp.asarray([0.1, 0.3]),
+        r_grid_half=jnp.asarray([0.0, 0.2, 0.4]),
+        Bsqav=jnp.asarray([1.0, 1.0]),
+        G_PS=jnp.asarray([1.0, 1.0]),
+        B0=jnp.asarray([1.0, 1.0]),
+    )
+    equations = object.__new__(ComposedEquationSystem)
+    owner = _FixedDatabaseOwner()
+    object.__setattr__(
+        equations,
+        "_flux_model_with_realtime_support_payload",
+        lambda _model, _support: owner,
+    )
+    object.__setattr__(equations, "shared_flux_model", owner)
+    object.__setattr__(equations, "_prepare_working_state", lambda state: (state, None))
+    object.__setattr__(
+        equations,
+        "_with_database_equation_geometry_and_fixed_flux",
+        lambda geometry_value, flux_model: SimpleNamespace(
+            _evaluate_with_shared_fluxes_from_working_state=(
+                lambda _working_state, _eidx, _state, fixed_fluxes: (
+                    jnp.sum(jnp.square(geometry_value.r_grid_half)) + fixed_fluxes
+                )
+            )
+        ),
+    )
+
+    actual = equations.pullback_direct_rhs_database_equation_geometry_payload(
+        jnp.asarray(0.0),
+        "state",
+        None,
+        jnp.asarray(2.0),
+        {"geometry": geometry, "database": jnp.asarray(7.0)},
+    )
+
+    assert jnp.all(jnp.isfinite(actual["geometry"].r_grid_half))
+    assert jnp.allclose(actual["geometry"].r_grid_half, jnp.asarray([0.0, 0.8, 1.6]))
     assert jnp.allclose(actual["database"], 0.0)
 
 
