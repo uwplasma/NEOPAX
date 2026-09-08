@@ -23371,7 +23371,7 @@ def _build_prepared_radau_accepted_rollout(
         flat_rhs_with_lagged_response=flat_rhs_with_lagged_response,
         node_edge_ambipolar_rhs=node_edge_ambipolar_rhs,
         node_edge_runtime_inputs=(
-            _node_edge_runtime_inputs if node_boundary_mode else None
+            _node_edge_runtime_inputs if use_node_boundary else None
         ),
         node_edge_ambipolar_rhs_tangent=node_edge_ambipolar_rhs_tangent,
         debug_er_components_with_lagged_response=debug_er_components_with_lagged_response,
@@ -24360,7 +24360,7 @@ class RADAUSolver(_RadauSolverConfig):
             flat_rhs_with_lagged_response=flat_rhs_with_lagged_response,
             node_edge_ambipolar_rhs=node_edge_ambipolar_rhs,
             node_edge_runtime_inputs=(
-                _node_edge_runtime_inputs if _node_boundary_mode else None
+                _node_edge_runtime_inputs if use_node_boundary else None
             ),
             node_edge_ambipolar_rhs_tangent=node_edge_ambipolar_rhs_tangent,
             debug_er_components_with_lagged_response=debug_er_components_with_lagged_response,
