@@ -54,6 +54,27 @@ axis.  The current unvalidated correction broadcasts that zero tree to
 `(objective_count, ...)` before it is combined with database table bars.
 This is a shape correction only; it does not restore a geometry VJP.
 
+The next one-step run passed that shape boundary and completed the one batched
+recorded-scan fold.  It then ran out of GPU memory in the *final VMEC
+payload-to-state transpose*, after the scan fold:
+
+```text
+runtime_scan_payload_from_state
+  -> 56 active float payload leaves
+  -> raw payload-to-state VJP batch
+  -> attempted 3.73 GiB allocation
+```
+
+The scan fold itself completed; this is not a scan reverse or table-bar OOM.
+The raw fallback built one retained payload VJP per objective row.  The
+database scan lane had the existing compact JVP/tangent-contraction route
+explicitly disabled.  That guard has now been removed for the combined scan
+payload.  The new route keeps geometry, scan channels, and scan surfaces as
+one coupled function and computes, for each VMEC parameter tangent,
+the JVP/bar contraction.  By VJP/JVP duality this is the same derivative as
+the raw payload-state transpose, without materializing its large state-bar
+batch.  This correction is not yet GPU-validated.
+
 ## Validation completed
 
 ```text
@@ -76,5 +97,7 @@ expected result is:
 - all database reverse trace values finite;
 - no initial-root support leaf-shape error;
 - root timing diagnostics report `direct_geometry_transpose_s=n/a`.
+- `compact_payload_tangent_contract=True` after the recorded scan fold;
+- no raw payload-state-bar allocation / `RESOURCE_EXHAUSTED` error.
 
 Only after that passes should the 16-step / four-segment GPU benchmark be run.

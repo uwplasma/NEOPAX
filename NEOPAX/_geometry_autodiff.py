@@ -6147,7 +6147,6 @@ def geometry_payload_pullback_from_param_vector_raw_block_transpose(
         _probe("compact_tangent_contract_entry")
         if (
             not combined_payload
-            or payload_kind == "ntx_scan_runtime"
             or return_branch_gradients
             or return_state_bars
             or extra_state_bars is not None
@@ -6155,16 +6154,43 @@ def geometry_payload_pullback_from_param_vector_raw_block_transpose(
             or not hasattr(implicit, "implicit_state_tangent_raw_block")
         ):
             return None
-        geometry_bars = tuple(payload_bar["geometry"] for payload_bar in payload_bars)
-        support_bars = tuple(payload_bar[support_branch_name] for payload_bar in payload_bars)
-        _probe("before_compact_geometry_setup")
-        geometry_setup = _payload_branch_pullback_setup("geometry", geometry_from_state, geometry_bars)
-        _probe("after_compact_geometry_setup")
-        _probe("before_compact_ntx_support_setup")
-        support_setup = _payload_branch_pullback_setup(
-            support_branch_name, support_from_state, support_bars
-        )
-        _probe("after_compact_ntx_support_setup")
+        if payload_kind == "ntx_scan_runtime":
+            # The scan payload is one coupled forward function of VMEC state:
+            # geometry, scan channels, and scan surfaces.  Its JVP contracted
+            # with the folded table bars is the exact VJP dual, but avoids the
+            # enormous retained payload-to-state VJP batch used by the raw
+            # fallback.  In particular, it must stay combined: splitting its
+            # geometry branch would double-count the scan geometry chain.
+            _probe("before_compact_runtime_scan_setup")
+            scan_setup = _payload_branch_pullback_setup(
+                support_branch_name,
+                support_from_state,
+                tuple(payload_bars),
+            )
+            _probe("after_compact_runtime_scan_setup")
+
+            def _payload_tangent_contraction(state_tangent):
+                return scan_setup["tangent_contraction"](state_tangent)
+
+        else:
+            geometry_bars = tuple(payload_bar["geometry"] for payload_bar in payload_bars)
+            support_bars = tuple(payload_bar[support_branch_name] for payload_bar in payload_bars)
+            _probe("before_compact_geometry_setup")
+            geometry_setup = _payload_branch_pullback_setup(
+                "geometry", geometry_from_state, geometry_bars
+            )
+            _probe("after_compact_geometry_setup")
+            _probe("before_compact_ntx_support_setup")
+            support_setup = _payload_branch_pullback_setup(
+                support_branch_name, support_from_state, support_bars
+            )
+            _probe("after_compact_ntx_support_setup")
+
+            def _payload_tangent_contraction(state_tangent):
+                return (
+                    geometry_setup["tangent_contraction"](state_tangent)
+                    + support_setup["tangent_contraction"](state_tangent)
+                )
         native_bar_tuple = None
         if native_vmec_face_coefficient_bars is not None:
             native_names = (
@@ -6226,8 +6252,7 @@ def geometry_payload_pullback_from_param_vector_raw_block_transpose(
                 probe_chunk_size=1,
             )
             return (
-                geometry_setup["tangent_contraction"](state_tangent)
-                + support_setup["tangent_contraction"](state_tangent)
+                _payload_tangent_contraction(state_tangent)
                 + _native_coefficient_tangent_contraction(state_tangent)
             )
 
