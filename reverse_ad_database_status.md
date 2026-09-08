@@ -83,6 +83,15 @@ before the differentiated payload function is entered.  VMEC state still
 drives geometry, channels, and surfaces; only the fixed scan coordinate axis
 is excluded from differentiation.  This correction is not yet GPU-validated.
 
+The next compact-JVP attempt passed the scan-coordinate validation and then
+found a second static-data leak while deriving the Boozer `R00` normalization:
+the scan surface-index metadata was recomputed from `context.static.s` inside
+the JVP.  That metadata is now precomputed from the fixed scan radii and
+VMEC grid outside the differentiated payload function and passed to the R00
+builder, together with already-prepared Boozer constants/mode metadata.  The
+R00 values themselves remain functions of the VMEC state.  This correction is
+not yet GPU-validated.
+
 ## Validation completed
 
 ```text

@@ -4900,6 +4900,9 @@ def build_ntx_runtime_scan_inputs_from_vmec_state(
     *,
     rho_scan,
     surface_backend: str = "vmec",
+    r00_boozer_surface_sampling=None,
+    booz_constants_grids=None,
+    booz_mode00: int | None = None,
 ):
     """Build live VMEC scan surfaces and normalization channels for NTX DB.
 
@@ -4975,7 +4978,14 @@ def build_ntx_runtime_scan_inputs_from_vmec_state(
         )
 
     psia = jnp.asarray(geometry.Psia_value, dtype=jnp.float64) / (2.0 * jnp.pi)
-    r00 = _boozer_rmnc00_from_state_at_rho(context, state, rho_np)
+    r00 = _boozer_rmnc00_from_state_at_rho(
+        context,
+        state,
+        rho_np,
+        boozer_surface_sampling=r00_boozer_surface_sampling,
+        booz_constants_grids=booz_constants_grids,
+        booz_mode00=booz_mode00,
+    )
     return (
         _build_ntx_runtime_channels_from_geometry(geometry, rho=rho, psia=psia, r00=r00),
         tuple(surfaces),
@@ -5571,6 +5581,9 @@ def geometry_payload_pullback_from_param_vector_raw_block_transpose(
         # here would make it a traced closure value under the compact JVP
         # route even though it has no state derivative.
         scan_rho_static = np.asarray(jax.device_get(scan_rho), dtype=float)
+        scan_r00_boozer_surface_sampling = _boozer_surface_indices_and_rho(
+            context.static, scan_rho_static
+        )
 
         def runtime_scan_payload_from_state(state_inner):
             geometry_inner = geometry_from_state(state_inner)
@@ -5580,6 +5593,9 @@ def geometry_payload_pullback_from_param_vector_raw_block_transpose(
                 geometry_inner,
                 rho_scan=scan_rho_static,
                 surface_backend=scan_surface_backend,
+                r00_boozer_surface_sampling=scan_r00_boozer_surface_sampling,
+                booz_constants_grids=geometry_booz_constants_grids,
+                booz_mode00=geometry_booz_mode00,
             )
             # The live scan's database is rebuilt from this whole payload.  Do
             # not split geometry into a second branch: doing so would make the
