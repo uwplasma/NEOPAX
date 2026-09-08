@@ -4910,6 +4910,10 @@ class _RadauAcceptedStepPhysicsContext:
     # the last component of the flattened RHS without including core Er
     # diffusion or any solver-coordinate bookkeeping.
     node_edge_ambipolar_rhs: Callable[[Any, Any], Any] | None = None
+    # Matching explicit cached quadratic derivative in the private edge
+    # direction.  Generic AD through ``er_edge_override`` is deliberately
+    # not used for this coordinate.
+    node_edge_ambipolar_rhs_tangent: Callable[[Any, Any, Any], Any] | None = None
 
 
 @contextlib.contextmanager
@@ -15897,6 +15901,8 @@ def _radau_run_stage_subsolve(
             node_edge_trace
             and kernel_context.debug_cached_stage_jacobian_audit
             and physics_context.node_edge_ambipolar_rhs is not None
+            and physics_context.node_edge_ambipolar_rhs_tangent is not None
+            and physics_context.flat_rhs_with_lagged_response_tangent is not None
         ):
             # This is the specific wiring audit for the private edge
             # coordinate.  It holds every public centre coordinate fixed and
@@ -15933,11 +15939,21 @@ def _radau_run_stage_subsolve(
                     inputs.lagged_response,
                 )
 
-            assembled_rhs, assembled_slope = jax.jvp(
-                _assembled_edge_rhs, (edge_value,), (edge_direction,)
+            assembled_rhs = _assembled_edge_rhs(edge_value)
+            ambipolar_rhs = _ambipolar_edge_rhs(edge_value)
+            edge_flat_direction = jnp.zeros_like(endpoint_state).at[-1].set(
+                edge_direction
             )
-            ambipolar_rhs, ambipolar_slope = jax.jvp(
-                _ambipolar_edge_rhs, (edge_value,), (edge_direction,)
+            assembled_slope = physics_context.flat_rhs_with_lagged_response_tangent(
+                endpoint_time,
+                endpoint_state,
+                edge_flat_direction,
+                inputs.lagged_response,
+            )[-1]
+            ambipolar_slope = physics_context.node_edge_ambipolar_rhs_tangent(
+                endpoint_state,
+                edge_direction,
+                inputs.lagged_response,
             )
             jax.debug.print(
                 "[radau-node-edge-rhs-split] iter={iter} stage={stage} "
@@ -22764,6 +22780,7 @@ def _build_prepared_radau_accepted_rollout(
     )
     build_lagged_response_from_flat = None
     node_edge_ambipolar_rhs = None
+    node_edge_ambipolar_rhs_tangent = None
     if use_node_boundary:
         if owner is None or not callable(
             getattr(owner, "build_node_boundary_lagged_response", None)
@@ -22842,6 +22859,21 @@ def _build_prepared_radau_accepted_rollout(
                 er_edge_override=projected[-1],
             )
 
+        def _node_edge_ambipolar_rhs_tangent(flat_y, edge_direction, cache):
+            projected = _node_project_flat(flat_y)
+            zero_state_direction = _node_unpack_flat(jnp.zeros_like(projected))
+            _core_tangent, edge_tangent = (
+                owner.evaluate_node_boundary_with_lagged_response_tangent(
+                    _node_unpack_flat(projected),
+                    zero_state_direction,
+                    projected[-1],
+                    edge_direction,
+                    cache.transport_response,
+                    er_edge_anchor=cache.er_edge_anchor,
+                )
+            )
+            return edge_tangent
+
         def _node_lagged_rhs_tangent(t_value, flat_y, flat_direction, cache):
             def _project(value):
                 return _node_project_flat(value)
@@ -22909,6 +22941,7 @@ def _build_prepared_radau_accepted_rollout(
         flat_rhs_with_lagged_response = _node_lagged_rhs
         flat_rhs_with_lagged_response_tangent = _node_lagged_rhs_tangent
         node_edge_ambipolar_rhs = _node_edge_ambipolar_rhs
+        node_edge_ambipolar_rhs_tangent = _node_edge_ambipolar_rhs_tangent
         # Existing model hooks map the public three-field state only.  The
         # node scalar receives the paired analytic transpose above.
         pullback_build_lagged_response = None
@@ -23121,6 +23154,7 @@ def _build_prepared_radau_accepted_rollout(
         flat_rhs=flat_rhs,
         flat_rhs_with_lagged_response=flat_rhs_with_lagged_response,
         node_edge_ambipolar_rhs=node_edge_ambipolar_rhs,
+        node_edge_ambipolar_rhs_tangent=node_edge_ambipolar_rhs_tangent,
         debug_er_components_with_lagged_response=debug_er_components_with_lagged_response,
         flat_rhs_with_lagged_response_tangent=flat_rhs_with_lagged_response_tangent,
         flat_rhs_lagged_response_pullback=flat_rhs_lagged_response_pullback,
@@ -23711,6 +23745,7 @@ class RADAUSolver(_RadauSolverConfig):
         )
         build_lagged_response_from_flat = None
         node_edge_ambipolar_rhs = None
+        node_edge_ambipolar_rhs_tangent = None
         if use_node_boundary:
             if owner is None or not callable(
                 getattr(owner, "build_node_boundary_lagged_response", None)
@@ -23780,6 +23815,21 @@ class RADAUSolver(_RadauSolverConfig):
                     fluxes=shared_fluxes,
                     er_edge_override=projected[-1],
                 )
+
+            def _node_edge_ambipolar_rhs_tangent(flat_y, edge_direction, cache):
+                projected = _node_project_flat(flat_y)
+                zero_state_direction = _node_unpack_flat(jnp.zeros_like(projected))
+                _core_tangent, edge_tangent = (
+                    owner.evaluate_node_boundary_with_lagged_response_tangent(
+                        _node_unpack_flat(projected),
+                        zero_state_direction,
+                        projected[-1],
+                        edge_direction,
+                        cache.transport_response,
+                        er_edge_anchor=cache.er_edge_anchor,
+                    )
+                )
+                return edge_tangent
 
             def _node_lagged_rhs_tangent(t_value, flat_y, flat_direction, cache):
                 def _project(value):
@@ -23855,6 +23905,7 @@ class RADAUSolver(_RadauSolverConfig):
             flat_rhs_with_lagged_response = _node_lagged_rhs
             flat_rhs_with_lagged_response_tangent = _node_lagged_rhs_tangent
             node_edge_ambipolar_rhs = _node_edge_ambipolar_rhs
+            node_edge_ambipolar_rhs_tangent = _node_edge_ambipolar_rhs_tangent
             flat_rhs_state_pullback = _node_lagged_rhs_state_pullback
             if str(getattr(self, "lagged_jacobian_refresh_mode", "none")).strip().lower() not in {
                 "none", "quadratic_colored_after_first",
@@ -24080,6 +24131,7 @@ class RADAUSolver(_RadauSolverConfig):
             flat_rhs=flat_rhs,
             flat_rhs_with_lagged_response=flat_rhs_with_lagged_response,
             node_edge_ambipolar_rhs=node_edge_ambipolar_rhs,
+            node_edge_ambipolar_rhs_tangent=node_edge_ambipolar_rhs_tangent,
             debug_er_components_with_lagged_response=debug_er_components_with_lagged_response,
             flat_rhs_with_lagged_response_tangent=flat_rhs_with_lagged_response_tangent,
             flat_rhs_lagged_response_pullback=flat_rhs_lagged_response_pullback,

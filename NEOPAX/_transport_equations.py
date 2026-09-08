@@ -38,6 +38,56 @@ PARTICLE_FLUX_PHYSICAL_TO_STATE = 1.0e-20
 HEAT_FLUX_PHYSICAL_TO_STATE = 1.0e-23
 
 
+def _report_nonfinite_database_geometry_component(component, geometry_bar):
+    """Emit a database-only provenance line if a geometry component is bad.
+
+    The deferred database sweep has two mathematically independent terms:
+    direct fixed-table flux geometry and fixed-flux equation assembly.  A
+    final support-tree check cannot distinguish them.  This helper is kept at
+    that boundary, does not change the cotangent, and emits nothing for a
+    finite component.
+    """
+    float_leaves = tuple(
+        jnp.asarray(leaf)
+        for leaf in jax.tree_util.tree_leaves(geometry_bar)
+        if jnp.issubdtype(jnp.asarray(leaf).dtype, jnp.inexact)
+    )
+    if not float_leaves:
+        return geometry_bar
+    finite = jnp.all(
+        jnp.stack(tuple(jnp.all(jnp.isfinite(leaf)) for leaf in float_leaves))
+    )
+    nonfinite_count = sum(
+        (jnp.sum(jnp.logical_not(jnp.isfinite(leaf))) for leaf in float_leaves),
+        jnp.asarray(0, dtype=jnp.int32),
+    )
+    r_grid_half_bar = getattr(geometry_bar, "r_grid_half", None)
+    r_grid_half_finite = (
+        jnp.all(jnp.isfinite(jnp.asarray(r_grid_half_bar)))
+        if r_grid_half_bar is not None
+        else jnp.asarray(True)
+    )
+
+    def _emit(_):
+        jax.debug.print(
+            "[database-geometry-reverse] component={component} finite={finite} "
+            "nonfinite_count={count} r_grid_half_finite={r_grid_half_finite}",
+            component=component,
+            finite=finite,
+            count=nonfinite_count,
+            r_grid_half_finite=r_grid_half_finite,
+        )
+        return jnp.asarray(0, dtype=jnp.int32)
+
+    jax.lax.cond(
+        finite,
+        lambda _: jnp.asarray(0, dtype=jnp.int32),
+        _emit,
+        operand=None,
+    )
+    return geometry_bar
+
+
 def _minmod_pair(a, b):
     same_sign = (a * b) > 0.0
     return jnp.where(same_sign, jnp.sign(a) * jnp.minimum(jnp.abs(a), jnp.abs(b)), 0.0)
@@ -1959,6 +2009,9 @@ class ComposedEquationSystem:
         flux_geometry_bar = flux_geometry_pullback(
             working_state, flux_bar, geometry
         )
+        flux_geometry_bar = _report_nonfinite_database_geometry_component(
+            "fixed_table_flux", flux_geometry_bar
+        )
         geometry_delta0 = _float_delta_tree_like(geometry)
 
         def _equation_geometry_with_fixed_fluxes(geometry_delta):
@@ -1976,6 +2029,9 @@ class ComposedEquationSystem:
             _equation_geometry_with_fixed_fluxes, geometry_delta0
         )
         (equation_geometry_bar,) = equation_geometry_pullback(rhs_bar)
+        equation_geometry_bar = _report_nonfinite_database_geometry_component(
+            "fixed_flux_equation", equation_geometry_bar
+        )
         support_bar = dict(_float_delta_tree_like(support))
         support_bar["geometry"] = _sanitize_float_delta_bar_tree(
             geometry,
@@ -2016,6 +2072,9 @@ class ComposedEquationSystem:
                 working_state, one_flux_bar, geometry
             )
         )(flux_bar)
+        flux_geometry_bar = _report_nonfinite_database_geometry_component(
+            "fixed_table_flux", flux_geometry_bar
+        )
         geometry_delta0 = _float_delta_tree_like(geometry)
 
         def _equation_geometry_with_fixed_fluxes(geometry_delta):
@@ -2035,6 +2094,9 @@ class ComposedEquationSystem:
         geometry_bar = jax.vmap(
             lambda one_rhs_bar: equation_geometry_pullback(one_rhs_bar)[0]
         )(rhs_bar)
+        geometry_bar = _report_nonfinite_database_geometry_component(
+            "fixed_flux_equation", geometry_bar
+        )
         objective_count = jnp.asarray(jax.tree_util.tree_leaves(rhs_bar)[0]).shape[0]
         support_bar = jax.tree_util.tree_map(
             lambda value: jnp.broadcast_to(
