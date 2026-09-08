@@ -71,6 +71,7 @@ from NEOPAX._source_models import get_source_model
 from NEOPAX._species import Species
 from NEOPAX._state import TransportState, get_v_thermal
 from NEOPAX._boundary_conditions import BoundaryConditionModel
+from NEOPAX._constants import elementary_charge
 from NEOPAX._transport_flux_models import (
     CombinedTransportFluxModel,
     NTXDatabaseTransportModel,
@@ -884,7 +885,7 @@ def test_ntx_exact_runtime_quadratic_lagged_response_matches_live_reference(resp
     assert float(error_half / error_full) < 0.3
 
 
-@pytest.mark.slow
+@pytest.mark.skip(reason="superseded by the one-face boundary-cache regression below")
 def test_realtime_boundary_edge_response_matches_fresh_reference_near_observed_roots():
     """Exercise the production boundary state without a Radau time solve.
 
@@ -1003,6 +1004,146 @@ def test_realtime_boundary_edge_response_matches_fresh_reference_near_observed_r
                     fresh_base=fresh_base,
                     label=("edge_anchor", edge_anchor_float, case_name, offset),
                 )
+
+
+@pytest.mark.slow
+def test_realtime_outer_face_local_cache_matches_direct_near_observed_edge_roots():
+    """Compare one known boundary state without building a radial response.
+
+    Only the final prepared NTX face operator is used.  The cache consists of
+    four species-local coefficient jets, rather than a 52-face response.
+    """
+    config_path = (
+        Path(__file__).resolve().parents[1]
+        / "examples/benchmarks/"
+        "Solve_Transport_equations_wHe_radau_ntx_exact_lagged_runtime_vmec_"
+        "realtime_full_state_quadratic_transport_endpoint_newton_benchmark_center.toml"
+    )
+    config = load_config(config_path)
+    config["_config_dir"] = str(config_path.parent)
+    config["ambipolarity"] = dict(config["ambipolarity"])
+    config["ambipolarity"]["er_ambipolar_plot"] = False
+    runtime, state = build_runtime_context(config)
+    assert state is not None
+
+    # Use exactly the canonical BC objects which the transport system uses.
+    components = prepare_transport_solver_components(config, runtime, state)
+    neo = components["equation_system"].shared_flux_model.neoclassical_model
+    support = neo._static_support()
+    prepared_edge = jax.tree_util.tree_map(
+        lambda value: jax.lax.dynamic_index_in_dim(
+            value, value.shape[0] - 1, axis=0, keepdims=False
+        ),
+        support.face_prepared,
+    )
+    drds_edge = support.face_channels.drds[-1]
+    collisionality_kind = _collisionality_kind(neo.collisionality_model)
+
+    def _edge_primitives(edge_er):
+        evaluated = build_evaluated_transport_state(
+            state,
+            runtime.geometry,
+            bc_density=neo.bc_density,
+            bc_temperature=neo.bc_temperature,
+            density_floor=neo.density_floor,
+            temperature_floor=neo.temperature_floor,
+            er_edge_override=edge_er,
+        )
+        return (
+            evaluated.face.density[:, -1],
+            evaluated.face.temperature[:, -1],
+            evaluated.density_grad_face[:, -1],
+            evaluated.temperature_grad_face[:, -1],
+        )
+
+    def _edge_gamma(edge_er, local_responses=None):
+        density, temperature, density_gradient, temperature_gradient = _edge_primitives(edge_er)
+        vthermal = get_v_thermal(neo.species.mass, temperature)
+        gamma = []
+        for species_index in range(neo.species.number_species):
+            if local_responses is None:
+                lij = neo._solve_lij_prepared_local(
+                    prepared_edge,
+                    drds_value=drds_edge,
+                    species_index=species_index,
+                    er_value=edge_er,
+                    temperature_local=temperature,
+                    density_local=density,
+                    vthermal_local=vthermal,
+                    collisionality_kind=collisionality_kind,
+                )
+            else:
+                response = local_responses[species_index]
+                nu_hat, epsi_hat, vth = neo._local_scan_inputs(
+                    drds_value=drds_edge,
+                    species_index=species_index,
+                    er_value=edge_er,
+                    temperature_local=temperature,
+                    density_local=density,
+                    vthermal_local=vthermal,
+                    collisionality_kind=collisionality_kind,
+                )
+                dnu = nu_hat - response.reference_nu_hat
+                depsi = epsi_hat - response.reference_epsi_hat
+                coefficients = (
+                    response.reference_coefficients
+                    + response.dcoefficients_d_nu_hat * dnu[:, None]
+                    + response.dcoefficients_d_epsi_hat * depsi[:, None]
+                    + 0.5 * (
+                        response.d2coefficients_d_nu_hat2 * dnu[:, None] ** 2
+                        + 2.0 * response.d2coefficients_d_nu_hat_d_epsi_hat
+                        * dnu[:, None] * depsi[:, None]
+                        + response.d2coefficients_d_epsi_hat2 * depsi[:, None] ** 2
+                    )
+                )
+                moments = neo._transport_moments_from_coefficient_scan(
+                    coefficients, drds_value=drds_edge
+                )
+                lij = neo._lij_from_transport_moments(
+                    moments, species_index=species_index, vth_a=vth
+                )
+            a1 = (
+                density_gradient[species_index] / density[species_index]
+                - 1.5 * temperature_gradient[species_index] / temperature[species_index]
+                - neo.species.charge[species_index] * edge_er
+                / (elementary_charge * temperature[species_index])
+            )
+            a2 = temperature_gradient[species_index] / temperature[species_index]
+            gamma.append(
+                -1.0e20 * density[species_index] * (lij[0, 0] * a1 + lij[0, 1] * a2)
+            )
+        return jnp.asarray(gamma)
+
+    # Build exactly one local cache per species at each observed edge-root
+    # regime, then sweep only its Er coordinate.  n/T are held fixed at the
+    # benchmark state; their face values still come from the real BCs above.
+    for edge_anchor_float in (-37.0, -35.0, -33.0):
+        edge_anchor = jnp.asarray(edge_anchor_float, dtype=state.Er.dtype)
+        density, temperature, _, _ = _edge_primitives(edge_anchor)
+        vthermal = get_v_thermal(neo.species.mass, temperature)
+        local_responses = tuple(
+            neo._build_quadratic_coefficient_response_local(
+                prepared_edge,
+                drds_value=drds_edge,
+                species_index=species_index,
+                er_value=edge_anchor,
+                temperature_local=temperature,
+                density_local=density,
+                vthermal_local=vthermal,
+                collisionality_kind=collisionality_kind,
+            )
+            for species_index in range(neo.species.number_species)
+        )
+        for edge_offset in (-1.0e-5, -4.0e-6, 0.0, 4.0e-6, 1.0e-5):
+            edge_value = edge_anchor + jnp.asarray(edge_offset, dtype=state.Er.dtype)
+            direct_gamma = _edge_gamma(edge_value)
+            cached_gamma = _edge_gamma(edge_value, local_responses)
+            assert jnp.allclose(cached_gamma, direct_gamma, rtol=3.0e-2, atol=1.0e-8), (
+                "edge_anchor", edge_anchor_float, "offset", edge_offset,
+            )
+            direct_charge = jnp.sum(neo.species.charge * direct_gamma)
+            cached_charge = jnp.sum(neo.species.charge * cached_gamma)
+            assert jnp.allclose(cached_charge, direct_charge, rtol=3.0e-2, atol=1.0e-8)
 
 
 def test_face_quadratic_coefficient_interpolation_rebases_before_radial_interpolation():
