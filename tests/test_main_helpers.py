@@ -1141,8 +1141,11 @@ def test_realtime_outer_face_local_cache_matches_direct_near_observed_edge_roots
             evaluated.temperature_grad_face[:, -1],
         )
 
-    def _edge_gamma(edge_er, local_responses=None):
-        density, temperature, density_gradient, temperature_gradient = _edge_primitives(edge_er)
+    def _edge_gamma(edge_er, local_responses=None, primitives_override=None):
+        if primitives_override is None:
+            density, temperature, density_gradient, temperature_gradient = _edge_primitives(edge_er)
+        else:
+            density, temperature, density_gradient, temperature_gradient = primitives_override
         vthermal = get_v_thermal(neo.species.mass, temperature)
         gamma = []
         for species_index in range(neo.species.number_species):
@@ -1263,6 +1266,83 @@ def test_realtime_outer_face_local_cache_matches_direct_near_observed_edge_roots
                 f"edge_rhs_delta_cached={float(cached_rhs - cached_rhs_base):.6e}"
             )
             assert jnp.allclose(cached_rhs, direct_rhs, rtol=3.0e-2, atol=1.0e-8)
+
+    # Captured from the failing private-edge rebuild at t=9.269939e-03 s.
+    # These are the exact outer-face n, T and Er inputs reported by the
+    # solver, rather than the t=0 values used by the sweep above.  The log did
+    # not contain the contemporaneous force-gradient vector, so retain the
+    # production reconstruction's gradients only for this isolated
+    # coefficient/RHS slope check and print them as part of the evidence.
+    captured_edge = jnp.asarray(-3.6970860e1, dtype=state.Er.dtype)
+    captured_density = jnp.asarray(
+        [3.90e-01, 1.95e-01, 1.95e-01, 1.00e-06], dtype=state.density.dtype
+    )
+    captured_temperature = jnp.asarray(
+        [7.6701323e-01, 7.5509465e-01, 7.5497315e-01, 5.6769859e-01],
+        dtype=state.pressure.dtype,
+    )
+    _, _, captured_density_gradient, captured_temperature_gradient = _edge_primitives(
+        captured_edge
+    )
+    captured_primitives = (
+        captured_density,
+        captured_temperature,
+        captured_density_gradient,
+        captured_temperature_gradient,
+    )
+    captured_vthermal = get_v_thermal(neo.species.mass, captured_temperature)
+    captured_responses = tuple(
+        neo._build_quadratic_coefficient_response_local(
+            prepared_edge,
+            drds_value=drds_edge,
+            species_index=species_index,
+            er_value=captured_edge,
+            temperature_local=captured_temperature,
+            density_local=captured_density,
+            vthermal_local=captured_vthermal,
+            collisionality_kind=collisionality_kind,
+        )
+        for species_index in range(neo.species.number_species)
+    )
+    captured_probe = jnp.asarray(1.0e-6, dtype=state.Er.dtype)
+    captured_direct_minus = _edge_rhs_from_outer_gamma(
+        _edge_gamma(captured_edge - captured_probe, primitives_override=captured_primitives)
+    )
+    captured_direct_plus = _edge_rhs_from_outer_gamma(
+        _edge_gamma(captured_edge + captured_probe, primitives_override=captured_primitives)
+    )
+    captured_cached_minus = _edge_rhs_from_outer_gamma(
+        _edge_gamma(
+            captured_edge - captured_probe,
+            captured_responses,
+            primitives_override=captured_primitives,
+        )
+    )
+    captured_cached_plus = _edge_rhs_from_outer_gamma(
+        _edge_gamma(
+            captured_edge + captured_probe,
+            captured_responses,
+            primitives_override=captured_primitives,
+        )
+    )
+    captured_direct_slope = (captured_direct_plus - captured_direct_minus) / (2.0 * captured_probe)
+    captured_cached_slope = (captured_cached_plus - captured_cached_minus) / (2.0 * captured_probe)
+    print(
+        "[outer-face-captured-failure-state-slope] "
+        f"edge={float(captured_edge):.9e} density={captured_density} "
+        f"temperature={captured_temperature} "
+        f"density_gradient_from_t0={captured_density_gradient} "
+        f"temperature_gradient_from_t0={captured_temperature_gradient} "
+        f"direct_rhs_minus={float(captured_direct_minus):.9e} "
+        f"direct_rhs_plus={float(captured_direct_plus):.9e} "
+        f"cached_rhs_minus={float(captured_cached_minus):.9e} "
+        f"cached_rhs_plus={float(captured_cached_plus):.9e} "
+        f"direct_slope={float(captured_direct_slope):.9e} "
+        f"cached_slope={float(captured_cached_slope):.9e}"
+    )
+    assert jnp.allclose(
+        captured_cached_slope, captured_direct_slope, rtol=3.0e-2, atol=1.0e-5
+    )
 
 
 def test_face_quadratic_coefficient_interpolation_rebases_before_radial_interpolation():
