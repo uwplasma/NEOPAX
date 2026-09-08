@@ -6492,7 +6492,14 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
                 time.perf_counter() - root_ntx_support_pullback_start
             )
             batched_support_bars = {
-                "geometry": _float_delta_tree_like(support_payload["geometry"]),
+                "geometry": jax.tree_util.tree_map(
+                    lambda leaf: jnp.broadcast_to(
+                        jnp.asarray(leaf)[None, ...],
+                        (jnp.asarray(residual_bars).shape[0],)
+                        + jnp.asarray(leaf).shape,
+                    ),
+                    _float_delta_tree_like(support_payload["geometry"]),
+                ),
                 "database": database_bars,
             }
             initial_er_root_support_bars = tuple(
