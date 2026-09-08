@@ -72,6 +72,7 @@ from NEOPAX._species import Species
 from NEOPAX._state import TransportState, get_v_thermal
 from NEOPAX._boundary_conditions import BoundaryConditionModel
 from NEOPAX._constants import elementary_charge
+from NEOPAX._transport_equations import _plasma_permitivity_from_prefactor
 from NEOPAX._transport_flux_models import (
     CombinedTransportFluxModel,
     NTXDatabaseTransportModel,
@@ -1006,7 +1007,6 @@ def test_realtime_boundary_edge_response_matches_fresh_reference_near_observed_r
                 )
 
 
-@pytest.mark.slow
 def test_realtime_outer_face_local_cache_matches_direct_near_observed_edge_roots():
     """Compare one known boundary state without building a radial response.
 
@@ -1028,7 +1028,9 @@ def test_realtime_outer_face_local_cache_matches_direct_near_observed_edge_roots
 
     # Use exactly the canonical BC objects which the transport system uses.
     components = prepare_transport_solver_components(config, runtime, state)
-    neo = components["equation_system"].shared_flux_model.neoclassical_model
+    equation_system = components["equation_system"]
+    neo = equation_system.shared_flux_model.neoclassical_model
+    er_equation = equation_system.er_equation
     support = neo._static_support()
     prepared_edge = jax.tree_util.tree_map(
         lambda value: jax.lax.dynamic_index_in_dim(
@@ -1114,6 +1116,21 @@ def test_realtime_outer_face_local_cache_matches_direct_near_observed_edge_roots
             )
         return jnp.asarray(gamma)
 
+    plasma_permitivity = _plasma_permitivity_from_prefactor(
+        state, er_equation.species_mass, er_equation.permitivity_prefactor
+    )
+
+    def _edge_rhs_from_outer_gamma(gamma_edge):
+        # This is exactly the node equation's outer-face ambipolar term, with
+        # a one-face Gamma payload because only its final column is consumed.
+        ambi_term = er_equation._outer_face_ambi_term(
+            state,
+            Gamma=gamma_edge[:, None],
+            plasma_permitivity=plasma_permitivity,
+            Gamma_faces=gamma_edge[:, None],
+        )
+        return -jnp.asarray(er_equation.Er_relax) * ambi_term
+
     # Build exactly one local cache per species at each observed edge-root
     # regime, then sweep only its Er coordinate.  n/T are held fixed at the
     # benchmark state; their face values still come from the real BCs above.
@@ -1134,6 +1151,10 @@ def test_realtime_outer_face_local_cache_matches_direct_near_observed_edge_roots
             )
             for species_index in range(neo.species.number_species)
         )
+        direct_gamma_base = _edge_gamma(edge_anchor)
+        cached_gamma_base = _edge_gamma(edge_anchor, local_responses)
+        direct_rhs_base = _edge_rhs_from_outer_gamma(direct_gamma_base)
+        cached_rhs_base = _edge_rhs_from_outer_gamma(cached_gamma_base)
         for edge_offset in (-1.0e-5, -4.0e-6, 0.0, 4.0e-6, 1.0e-5):
             edge_value = edge_anchor + jnp.asarray(edge_offset, dtype=state.Er.dtype)
             direct_gamma = _edge_gamma(edge_value)
@@ -1144,6 +1165,21 @@ def test_realtime_outer_face_local_cache_matches_direct_near_observed_edge_roots
             direct_charge = jnp.sum(neo.species.charge * direct_gamma)
             cached_charge = jnp.sum(neo.species.charge * cached_gamma)
             assert jnp.allclose(cached_charge, direct_charge, rtol=3.0e-2, atol=1.0e-8)
+            direct_rhs = _edge_rhs_from_outer_gamma(direct_gamma)
+            cached_rhs = _edge_rhs_from_outer_gamma(cached_gamma)
+            print(
+                "[outer-face-local-cache-audit] "
+                f"anchor={edge_anchor_float:.6e} offset={edge_offset:.6e} "
+                f"charge_direct={float(direct_charge):.6e} "
+                f"charge_cached={float(cached_charge):.6e} "
+                f"charge_abs_error={float(jnp.abs(cached_charge - direct_charge)):.6e} "
+                f"edge_rhs_direct={float(direct_rhs):.6e} "
+                f"edge_rhs_cached={float(cached_rhs):.6e} "
+                f"edge_rhs_abs_error={float(jnp.abs(cached_rhs - direct_rhs)):.6e} "
+                f"edge_rhs_delta_direct={float(direct_rhs - direct_rhs_base):.6e} "
+                f"edge_rhs_delta_cached={float(cached_rhs - cached_rhs_base):.6e}"
+            )
+            assert jnp.allclose(cached_rhs, direct_rhs, rtol=3.0e-2, atol=1.0e-8)
 
 
 def test_face_quadratic_coefficient_interpolation_rebases_before_radial_interpolation():
