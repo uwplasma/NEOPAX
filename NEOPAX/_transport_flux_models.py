@@ -1448,6 +1448,17 @@ class CombinedTransportFluxModel(TransportFluxModelBase):
             )
         object.__setattr__(self, "center_flux_mode", mode)
 
+    def debug_outer_face_scan_inputs(self, state, *, er_edge):
+        """Delegate the private-edge NTX input audit to its owning model."""
+        debug_inputs = getattr(
+            self.neoclassical_model, "debug_outer_face_scan_inputs", None
+        )
+        if not callable(debug_inputs):
+            raise NotImplementedError(
+                "The active neoclassical model does not expose outer-face NTX inputs."
+            )
+        return debug_inputs(state, er_edge=er_edge)
+
     @staticmethod
     def _zero_like_flux(reference, fallback=0):
         if reference is not None:

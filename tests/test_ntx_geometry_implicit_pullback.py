@@ -1621,13 +1621,7 @@ def test_batched_database_geometry_payload_keeps_objective_axis_inside_hook():
         def _evaluate_with_shared_fluxes_from_working_state(
             self, _working_state, _eidx, _state, shared_fluxes
         ):
-            # Match the direct-RHS contract: the database geometry boundary
-            # differentiates a TransportState, not a scalar convenience RHS.
-            return TransportState(
-                density=self.geometry + shared_fluxes,
-                pressure=jnp.zeros_like(self.geometry),
-                Er=jnp.zeros_like(self.geometry),
-            )
+            return self.geometry + shared_fluxes
 
     equations = object.__new__(ComposedEquationSystem)
     owner = _RecordedDatabaseOwner()
@@ -1639,9 +1633,7 @@ def test_batched_database_geometry_payload_keeps_objective_axis_inside_hook():
     )
     object.__setattr__(equations, "_prepare_working_state", lambda state: (state, None))
     object.__setattr__(
-        equations,
-        "pullback_shared_fluxes",
-        lambda _state, _fluxes, rhs_bar: rhs_bar.density,
+        equations, "pullback_shared_fluxes", lambda _state, _fluxes, rhs_bar: rhs_bar
     )
     object.__setattr__(
         equations,
@@ -1653,11 +1645,7 @@ def test_batched_database_geometry_payload_keeps_objective_axis_inside_hook():
         jnp.asarray(0.0),
         None,
         None,
-        TransportState(
-            density=jnp.asarray([2.0, -3.0]),
-            pressure=jnp.zeros((2,)),
-            Er=jnp.zeros((2,)),
-        ),
+        jnp.asarray([2.0, -3.0]),
         support,
     )
     # One unit comes from fixed-flux equation assembly and ten from the
