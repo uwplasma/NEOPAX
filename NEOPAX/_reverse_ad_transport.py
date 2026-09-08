@@ -33,6 +33,7 @@ from ._geometry_autodiff import (
 from ._orchestrator import prepare_transport_solver_components
 from ._profiles import AnalyticalProfileModel
 from ._reverse_ad_initial_er import (
+    compact_initial_er_database_geometry_bars,
     compact_initial_er_database_support_bars,
     fold_recorded_ntx_scan_database_bar_groups_into_support,
     compact_initial_er_ntx_support_pullback_leaves,
@@ -5502,8 +5503,8 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
     if use_database_table_reverse:
         print(
             f"{progress_prefix} progress: database segment reverse uses fixed-table "
-            "transpose; transport metric is frozen and the recorded scan is "
-            "the sole table-to-geometry boundary (no scan owner in segments)",
+            "table transpose plus compact local fixed-table geometry bars; "
+            "only table bars cross the recorded scan (no scan owner in segments)",
             flush=True,
         )
 
@@ -5699,9 +5700,9 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
                 flush=True,
             )
         if use_database_table_reverse:
-            # The database segment owns only the compact table transpose.
-            # The transport metric is frozen at this Lij-style boundary; the
-            # recorded NTX scan is the sole table-to-geometry transpose.
+            # The database segment keeps the compact table transpose and the
+            # two local fixed-table geometry terms separate.  The recorded
+            # NTX scan remains the sole table-to-geometry transpose.
             _, database_step_start_carries, database_step_primal_records = (
                 _radau_segment_replay_minimal_with_primal_records_call(
                     reverse_setup.execution_context,
@@ -6473,11 +6474,10 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
                 tuple(jax.tree_util.tree_leaves(geometry_bars)) + tuple(ntx_bar_leaves)
             )
         elif combined_geometry_payload and "database" in support_payload:
-            # Recorded scan database: transpose the charge-weighted particle
-            # flux only to the three fixed tables.  As for every transport
-            # stage, the table-to-geometry derivative belongs exclusively to
-            # the retained scan fold after the complete reverse sweep; do not
-            # create a second local-radius raw-geometry VJP at the root.
+            # Recorded scan database: the fixed-table particle flux has both
+            # a local transport-geometry term and a table term.  Preserve the
+            # former directly and defer only the latter to the one retained
+            # scan fold after the complete reverse sweep.
             root_ntx_support_pullback_start = time.perf_counter()
             database_bars = compact_initial_er_database_support_bars(
                 runtime=runtime,
@@ -6486,20 +6486,22 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
                 residual_bars=residual_bars,
                 support=support_payload,
             )
+            geometry_bars = compact_initial_er_database_geometry_bars(
+                runtime=runtime,
+                state=pre_root_initial_state,
+                er_profile=er_profile,
+                residual_bars=residual_bars,
+                support=support_payload,
+            )
             if phase_timing_diagnostics:
-                database_bars = jax.block_until_ready(database_bars)
+                database_bars, geometry_bars = jax.block_until_ready(
+                    (database_bars, geometry_bars)
+                )
             root_ntx_support_pullback_elapsed = (
                 time.perf_counter() - root_ntx_support_pullback_start
             )
             batched_support_bars = {
-                "geometry": jax.tree_util.tree_map(
-                    lambda leaf: jnp.broadcast_to(
-                        jnp.asarray(leaf)[None, ...],
-                        (jnp.asarray(residual_bars).shape[0],)
-                        + jnp.asarray(leaf).shape,
-                    ),
-                    _float_delta_tree_like(support_payload["geometry"]),
-                ),
+                "geometry": geometry_bars,
                 "database": database_bars,
             }
             initial_er_root_support_bars = tuple(

@@ -213,6 +213,53 @@ def compact_initial_er_database_support_bars(
     return support_bar["database"]
 
 
+def compact_initial_er_database_geometry_bars(
+    *, runtime, state, er_profile, residual_bars, support
+):
+    """Return selected-root local fixed-table geometry bars.
+
+    The table cotangent remains the responsibility of
+    :func:`compact_initial_er_database_support_bars` and crosses the retained
+    scan exactly once after the whole reverse sweep.  This companion returns
+    only the direct, radius-local dependence of the particle-flux residual on
+    transport geometry; it never rebuilds or transposes the scan.
+    """
+    if not isinstance(support, dict) or set(support) != {"geometry", "database"}:
+        raise ValueError(
+            "Compact database initial-Er geometry pullback requires exactly "
+            "{'geometry', 'database'} support."
+        )
+    database_model = find_ntx_database_transport_model_in_model(runtime.models.flux)
+    if database_model is None:
+        database_model = find_ntx_runtime_scan_model_in_model(runtime.models.flux)
+    if database_model is None:
+        raise ValueError(
+            "Compact database initial-Er geometry pullback requires a database model."
+        )
+    geometry_pullback = getattr(
+        database_model, "pullback_local_particle_flux_geometry_by_radius", None
+    )
+    if not callable(geometry_pullback):
+        raise ValueError(
+            "Runtime database model did not expose its local particle-flux "
+            "geometry transpose."
+        )
+    er_profile = jnp.asarray(er_profile, dtype=state.Er.dtype)
+    residual_bars = jnp.asarray(residual_bars, dtype=state.Er.dtype)
+    if residual_bars.ndim != 2 or residual_bars.shape[1] != er_profile.shape[0]:
+        raise ValueError(
+            "Compact database initial-Er geometry pullback expects residual_bars "
+            "with shape (objective_count, radial_count)."
+        )
+    state_with_er = dataclasses.replace(state, Er=er_profile)
+    return geometry_pullback(
+        state_with_er,
+        er_profile,
+        residual_bars,
+        support["geometry"],
+    )
+
+
 def _replace_ntx_support_payload_in_model(model, support):
     if model is None or not dataclasses.is_dataclass(model) or isinstance(model, type):
         return model, False

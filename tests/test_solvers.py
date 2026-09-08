@@ -2681,6 +2681,99 @@ def test_batched_database_stage_table_pullback_accepts_flattened_radau_rows():
     assert jnp.allclose(actual_leaves[0], expected)
 
 
+def test_batched_database_stage_pullback_keeps_direct_geometry_outside_scan():
+    """Database stage rows retain local geometry beside the table cotangent."""
+    dtype = jnp.float32
+    kernel_context = types.SimpleNamespace(
+        dtype=dtype,
+        num_stages=1,
+        state_dim=2,
+        c=jnp.asarray([0.0], dtype=dtype),
+        a=jnp.eye(1, dtype=dtype),
+    )
+    carry = types.SimpleNamespace(
+        t=jnp.asarray(0.0, dtype=dtype),
+        y=jnp.asarray([1.0, 2.0], dtype=dtype),
+    )
+    primal = types.SimpleNamespace(
+        trial_dt=jnp.asarray(0.5, dtype=dtype),
+        stage_history=jnp.asarray([0.0, 0.0], dtype=dtype),
+    )
+
+    def _split_fixed_database_pullback(_t, _y, rhs_bar, _support):
+        return {"geometry": 3.0 * rhs_bar, "database": 2.0 * rhs_bar}
+
+    physics_context = types.SimpleNamespace(
+        reverse_database_include_direct_geometry=True,
+        flat_rhs_direct_support_pullback=_split_fixed_database_pullback,
+    )
+    rows = jnp.asarray([[1.0, -2.0], [0.5, 3.0]], dtype=dtype)
+    # JAX flattens mapping keys in sorted order: database, then geometry.
+    actual_database, actual_geometry = (
+        transport_solvers._radau_exact_stage_residual_database_table_support_pullback_batched(
+            kernel_context,
+            physics_context,
+            carry,
+            primal,
+            rows,
+            {
+                "geometry": jnp.zeros((2,), dtype=dtype),
+                "database": jnp.zeros((2,), dtype=dtype),
+            },
+        )
+    )
+
+    assert jnp.allclose(actual_geometry, -3.0 * rows)
+    assert jnp.allclose(actual_database, -2.0 * rows)
+
+
+def test_batched_database_stage_pullback_default_remains_table_only():
+    """The direct-geometry extension is opt-in and cannot alter old contexts."""
+    dtype = jnp.float32
+    kernel_context = types.SimpleNamespace(
+        dtype=dtype,
+        num_stages=1,
+        state_dim=2,
+        c=jnp.asarray([0.0], dtype=dtype),
+        a=jnp.eye(1, dtype=dtype),
+    )
+    carry = types.SimpleNamespace(
+        t=jnp.asarray(0.0, dtype=dtype),
+        y=jnp.asarray([1.0, 2.0], dtype=dtype),
+    )
+    primal = types.SimpleNamespace(
+        trial_dt=jnp.asarray(0.5, dtype=dtype),
+        stage_history=jnp.asarray([0.0, 0.0], dtype=dtype),
+    )
+
+    def _table_only_pullback(_t, _y, rhs_bar, _support):
+        return {
+            "geometry": jnp.zeros_like(rhs_bar),
+            "database": 2.0 * rhs_bar,
+        }
+
+    physics_context = types.SimpleNamespace(
+        flat_rhs_direct_database_table_pullback=_table_only_pullback,
+    )
+    rows = jnp.asarray([[1.0, -2.0], [0.5, 3.0]], dtype=dtype)
+    actual_database, actual_geometry = (
+        transport_solvers._radau_exact_stage_residual_database_table_support_pullback_batched(
+            kernel_context,
+            physics_context,
+            carry,
+            primal,
+            rows,
+            {
+                "geometry": jnp.zeros((2,), dtype=dtype),
+                "database": jnp.zeros((2,), dtype=dtype),
+            },
+        )
+    )
+
+    assert jnp.allclose(actual_database, -2.0 * rows)
+    assert jnp.allclose(actual_geometry, 0.0)
+
+
 def test_approximate_tangent_lift_preserves_minimal_segment_record_contract():
     """Generic-RHS fallback must not demand controller fields from a compact record."""
     value = jnp.asarray(1.0)

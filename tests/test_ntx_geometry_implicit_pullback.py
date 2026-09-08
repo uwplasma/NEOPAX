@@ -170,6 +170,42 @@ def test_database_initial_root_support_batches_charge_weighted_particle_bars(mon
     assert jnp.allclose(actual["gamma"], expected, rtol=0.0, atol=0.0)
 
 
+def test_database_initial_root_geometry_bars_stay_separate_from_table_bar(monkeypatch):
+    """Selected-root local database geometry does not enter the scan bar."""
+
+    class _DatabaseModel:
+        def pullback_local_particle_flux_geometry_by_radius(
+            self, state, er_profile, residual_bars, geometry
+        ):
+            assert jnp.allclose(state.Er, er_profile)
+            assert jnp.allclose(geometry, 5.0)
+            return 3.0 * residual_bars
+
+    model = _DatabaseModel()
+    monkeypatch.setattr(
+        initial_er_module,
+        "find_ntx_database_transport_model_in_model",
+        lambda _model: model,
+    )
+    runtime = SimpleNamespace(models=SimpleNamespace(flux=object()))
+    state = TransportState(
+        density=jnp.ones((2, 3)),
+        pressure=2.0 * jnp.ones((2, 3)),
+        Er=jnp.asarray([0.1, 0.2, 0.3]),
+    )
+    residual_bars = jnp.asarray([[0.4, -0.2, 0.1], [-0.3, 0.5, 0.2]])
+
+    actual = initial_er_module.compact_initial_er_database_geometry_bars(
+        runtime=runtime,
+        state=state,
+        er_profile=state.Er,
+        residual_bars=residual_bars,
+        support={"geometry": jnp.asarray(5.0), "database": object()},
+    )
+
+    assert jnp.allclose(actual, 3.0 * residual_bars)
+
+
 def test_momentum_correction_matrix_is_square_for_four_species():
     """The wHe bootstrap system has three Sonine unknowns per species."""
 
@@ -1595,8 +1631,8 @@ def test_black_box_recorded_database_direct_support_split_matches_generic_payloa
     assert jnp.allclose(actual["surfaces"], 0.0)
 
 
-def test_database_direct_rhs_support_stops_at_fixed_table_boundary():
-    """Database direct RHS bars do not create a raw transport-geometry VJP."""
+def test_database_direct_rhs_support_splits_fixed_table_and_geometry_bars():
+    """Database direct RHS keeps table and compact local geometry bars separate."""
 
     class _FixedDatabaseOwner:
         def __call__(self, _state):
@@ -1617,12 +1653,22 @@ def test_database_direct_rhs_support_stops_at_fixed_table_boundary():
     object.__setattr__(
         equations, "pullback_shared_fluxes", lambda _state, _fluxes, rhs_bar: rhs_bar
     )
-    # Reaching this method would mean the forbidden raw geometry route was
-    # reconstructed instead of returning the fixed-table bar above.
+    # Reaching this broad generic route would rebuild the entire live scan;
+    # the compact direct geometry hooks below are the only permitted route.
     object.__setattr__(
         equations,
         "with_realtime_geometry_support_payload",
-        lambda _payload: (_ for _ in ()).throw(AssertionError("raw geometry VJP")),
+        lambda _payload: (_ for _ in ()).throw(AssertionError("live scan VJP")),
+    )
+    object.__setattr__(
+        equations,
+        "pullback_direct_rhs_database_flux_geometry_payload",
+        lambda *_args: {"geometry": jnp.asarray(3.0), "database": jnp.asarray(0.0)},
+    )
+    object.__setattr__(
+        equations,
+        "pullback_direct_rhs_database_equation_geometry_payload",
+        lambda *_args: {"geometry": jnp.asarray(5.0), "database": jnp.asarray(0.0)},
     )
     support = {"geometry": jnp.asarray(5.0), "database": jnp.asarray(7.0)}
 
@@ -1631,7 +1677,157 @@ def test_database_direct_rhs_support_stops_at_fixed_table_boundary():
     )
 
     assert jnp.allclose(actual["database"], 8.0)
-    assert jnp.allclose(actual["geometry"], 0.0)
+    assert jnp.allclose(actual["geometry"], 8.0)
+
+
+def test_database_direct_flux_geometry_payload_is_separate_from_table_bar():
+    """The new database geometry channel uses no scan/table transpose."""
+
+    calls = []
+
+    class _FixedDatabaseOwner:
+        def __call__(self, _state):
+            return jnp.asarray(3.0)
+
+        def pullback_direct_rhs_geometry_by_radius(self, state, flux_bar, geometry):
+            calls.append((state, flux_bar, geometry))
+            return 4.0 * flux_bar
+
+    equations = object.__new__(ComposedEquationSystem)
+    owner = _FixedDatabaseOwner()
+    object.__setattr__(
+        equations,
+        "_flux_model_with_realtime_support_payload",
+        lambda _model, _support: owner,
+    )
+    object.__setattr__(equations, "shared_flux_model", owner)
+    object.__setattr__(equations, "_prepare_working_state", lambda state: (state, None))
+    object.__setattr__(
+        equations, "pullback_shared_fluxes", lambda _state, _fluxes, rhs_bar: rhs_bar
+    )
+    support = {"geometry": jnp.asarray(5.0), "database": jnp.asarray(7.0)}
+
+    actual = equations.pullback_direct_rhs_database_flux_geometry_payload(
+        jnp.asarray(0.0), "state", None, jnp.asarray(2.0), support
+    )
+
+    assert jnp.allclose(actual["geometry"], 8.0)
+    assert jnp.allclose(actual["database"], 0.0)
+    assert len(calls) == 1
+    assert calls[0][0] == "state"
+    assert jnp.allclose(calls[0][1], 2.0)
+    assert jnp.allclose(calls[0][2], support["geometry"])
+
+
+def test_database_direct_equation_geometry_payload_holds_flux_fixed():
+    """Finite-volume geometry bars do not enter the database/scan transpose."""
+
+    class _FixedDatabaseOwner:
+        def __call__(self, _state):
+            return jnp.asarray(3.0)
+
+    equations = object.__new__(ComposedEquationSystem)
+    owner = _FixedDatabaseOwner()
+    object.__setattr__(
+        equations,
+        "_flux_model_with_realtime_support_payload",
+        lambda _model, _support: owner,
+    )
+    object.__setattr__(equations, "shared_flux_model", owner)
+    object.__setattr__(equations, "_prepare_working_state", lambda state: (state, None))
+
+    def _fixed_flux_equations(geometry, flux_model):
+        assert flux_model is owner
+        return SimpleNamespace(
+            _evaluate_with_shared_fluxes_from_working_state=(
+                lambda _working_state, _eidx, _state, fixed_fluxes: geometry + fixed_fluxes
+            )
+        )
+
+    object.__setattr__(
+        equations,
+        "_with_database_equation_geometry_and_fixed_flux",
+        _fixed_flux_equations,
+    )
+    support = {"geometry": jnp.asarray(5.0), "database": jnp.asarray(7.0)}
+
+    actual = equations.pullback_direct_rhs_database_equation_geometry_payload(
+        jnp.asarray(0.0), "state", None, jnp.asarray(2.0), support
+    )
+
+    assert jnp.allclose(actual["geometry"], 2.0)
+    assert jnp.allclose(actual["database"], 0.0)
+
+
+def test_database_fixed_payload_split_geometry_matches_generic_vjp():
+    """The three fixed-database RHS boundaries reconstruct the full VJP.
+
+    This is deliberately an assembly test.  It models a direct RHS with one
+    local fixed-table-flux geometry term, one equation-assembly geometry
+    term, and one table term.  The scan is not present in any of these three
+    local boundaries; it remains downstream of the returned table bar.
+    """
+
+    class _FixedDatabaseOwner:
+        def __call__(self, _state):
+            return jnp.asarray(11.0)
+
+        def pullback_direct_rhs_geometry_by_radius(self, _state, flux_bar, _geometry):
+            return flux_bar
+
+        def pullback_direct_rhs_support_payload(self, _state, flux_bar, _support):
+            return {"database": 2.0 * flux_bar}
+
+    equations = object.__new__(ComposedEquationSystem)
+    owner = _FixedDatabaseOwner()
+    object.__setattr__(
+        equations,
+        "_flux_model_with_realtime_support_payload",
+        lambda _model, _support: owner,
+    )
+    object.__setattr__(equations, "shared_flux_model", owner)
+    object.__setattr__(equations, "_prepare_working_state", lambda state: (state, None))
+    object.__setattr__(
+        equations, "pullback_shared_fluxes", lambda _state, _fluxes, rhs_bar: rhs_bar
+    )
+    object.__setattr__(
+        equations,
+        "_with_database_equation_geometry_and_fixed_flux",
+        lambda _geometry, flux_model: SimpleNamespace(
+            _evaluate_with_shared_fluxes_from_working_state=(
+                lambda _working_state, _eidx, _state, _fixed_fluxes: 2.0 * _geometry
+            )
+        ),
+    )
+    support = {"geometry": jnp.asarray(5.0), "database": jnp.asarray(7.0)}
+    rhs_bar = jnp.asarray(4.0)
+
+    table_bar = equations.pullback_direct_rhs_database_table_payload(
+        jnp.asarray(0.0), "state", None, rhs_bar, support
+    )
+    flux_geometry_bar = equations.pullback_direct_rhs_database_flux_geometry_payload(
+        jnp.asarray(0.0), "state", None, rhs_bar, support
+    )
+    equation_geometry_bar = (
+        equations.pullback_direct_rhs_database_equation_geometry_payload(
+            jnp.asarray(0.0), "state", None, rhs_bar, support
+        )
+    )
+    _, generic_pullback = jax.vjp(
+        lambda geometry, database: 3.0 * geometry + 2.0 * database,
+        support["geometry"],
+        support["database"],
+    )
+    expected_geometry, expected_database = generic_pullback(rhs_bar)
+
+    assert jnp.allclose(
+        flux_geometry_bar["geometry"] + equation_geometry_bar["geometry"],
+        expected_geometry,
+    )
+    assert jnp.allclose(table_bar["database"], expected_database)
+    assert jnp.allclose(table_bar["geometry"], 0.0)
+    assert jnp.allclose(flux_geometry_bar["database"], 0.0)
+    assert jnp.allclose(equation_geometry_bar["database"], 0.0)
 
 
 def test_native_multi_rhs_equation_system_forwarding_hook_is_exposed_to_radau():

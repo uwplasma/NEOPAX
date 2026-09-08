@@ -1926,6 +1926,151 @@ class ComposedEquationSystem:
             )
         return table_support_bar
 
+    def pullback_direct_rhs_database_flux_geometry_payload(
+        self, t, state, runtime, rhs_bar, support
+    ):
+        """Return the direct *flux-model* geometry bar of a fixed database RHS.
+
+        This is deliberately complementary to
+        :meth:`pullback_direct_rhs_database_table_payload`: the latter owns
+        the D11/D13/D33 cotangent that will cross the recorded scan boundary,
+        while this method owns the local dependence of the fixed-table flux
+        algebra on transport geometry.  It neither rebuilds nor transposes a
+        scan and it keeps the database table fixed.
+
+        The equation-assembly geometry term (finite-volume metrics and
+        volume factors outside the flux model) remains a separate boundary.
+        Keeping that distinction explicit prevents a later segment kernel
+        from silently treating this compact flux bar as the complete RHS
+        geometry transpose.
+        """
+        del t, runtime
+        if not isinstance(support, dict) or set(support) != {"geometry", "database"}:
+            raise ValueError(
+                "Database direct-flux geometry pullback requires exactly "
+                "{'geometry', 'database'} support."
+            )
+        active_shared_flux_model = self._flux_model_with_realtime_support_payload(
+            self.shared_flux_model, support
+        )
+        geometry_pullback = getattr(
+            active_shared_flux_model,
+            "pullback_direct_rhs_geometry_by_radius",
+            None,
+        )
+        if not callable(geometry_pullback):
+            raise NotImplementedError(
+                "Database direct-flux geometry pullback requires the compact "
+                "fixed-table geometry transpose."
+            )
+        working_state, _ = self._prepare_working_state(state)
+        shared_fluxes = active_shared_flux_model(working_state)
+        flux_bar = self.pullback_shared_fluxes(state, shared_fluxes, rhs_bar)
+        geometry_bar = geometry_pullback(
+            working_state,
+            flux_bar,
+            support["geometry"],
+        )
+        support_bar = dict(_float_delta_tree_like(support))
+        support_bar["geometry"] = _sanitize_float_delta_bar_tree(
+            support["geometry"], geometry_bar
+        )
+        return support_bar
+
+    def _with_database_equation_geometry_and_fixed_flux(self, geometry, flux_model):
+        """Rebuild equation assembly at ``geometry`` while holding fluxes fixed.
+
+        This is intentionally narrower than :meth:`with_geometry_payload`:
+        it changes the finite-volume/source equation objects but leaves the
+        supplied fixed-table flux model untouched.  Consequently a VJP through
+        the returned system's assembly cannot trace database interpolation or
+        the recorded NTX scan.
+        """
+        if self.config is None or self.solver_cfg is None or self.boundary_models is None:
+            raise ValueError(
+                "Database equation-geometry pullback requires equation-system "
+                "construction metadata."
+            )
+        equations = build_equation_system(
+            config=self.config,
+            species=self.species,
+            field=geometry,
+            flux_model=flux_model,
+            source_models=self.source_models,
+            solver_cfg=self.solver_cfg,
+            boundary_models=self.boundary_models,
+        )
+        return dataclasses.replace(
+            self,
+            equations=tuple(equations),
+            density_equation=next(
+                (eq for eq in equations if getattr(eq, "name", None) == "density"),
+                None,
+            ),
+            temperature_equation=next(
+                (eq for eq in equations if getattr(eq, "name", None) == "temperature"),
+                None,
+            ),
+            er_equation=next(
+                (eq for eq in equations if getattr(eq, "name", None) == "Er"), None
+            ),
+            shared_flux_model=flux_model,
+        )
+
+    def pullback_direct_rhs_database_equation_geometry_payload(
+        self, t, state, runtime, rhs_bar, support
+    ):
+        """Transpose fixed-flux finite-volume RHS geometry without a scan VJP.
+
+        This is the equation-assembly complement to
+        :meth:`pullback_direct_rhs_database_flux_geometry_payload`.  The
+        shared database flux is evaluated once at the primal geometry and is
+        then held constant while the density, temperature, and Er equations
+        are rebuilt at a geometry perturbation.  Thus this VJP captures metric,
+        volume-factor, and source geometry terms, but cannot trace database
+        interpolation, table construction, or the NTX scan.
+        """
+        del t, runtime
+        if not isinstance(support, dict) or set(support) != {"geometry", "database"}:
+            raise ValueError(
+                "Database equation-geometry pullback requires exactly "
+                "{'geometry', 'database'} support."
+            )
+        active_shared_flux_model = self._flux_model_with_realtime_support_payload(
+            self.shared_flux_model, support
+        )
+        if active_shared_flux_model is None:
+            raise ValueError("Database equation-geometry pullback requires a shared flux model.")
+        working_state, eidx = self._prepare_working_state(state)
+        shared_fluxes = active_shared_flux_model(working_state)
+        geometry = support["geometry"]
+        geometry_delta0 = _float_delta_tree_like(geometry)
+
+        def _rhs_from_equation_geometry_delta(geometry_delta):
+            geometry_value = _add_float_delta_tree(geometry, geometry_delta)
+            equations_at_geometry = self._with_database_equation_geometry_and_fixed_flux(
+                geometry_value,
+                active_shared_flux_model,
+            )
+            return equations_at_geometry._evaluate_with_shared_fluxes_from_working_state(
+                working_state,
+                eidx,
+                state,
+                shared_fluxes,
+            )
+
+        _, geometry_pullback = jax.vjp(
+            _rhs_from_equation_geometry_delta,
+            geometry_delta0,
+        )
+        (geometry_bar,) = geometry_pullback(rhs_bar)
+        support_bar = dict(_float_delta_tree_like(support))
+        support_bar["geometry"] = _sanitize_float_delta_bar_tree(
+            geometry,
+            geometry_bar,
+        )
+        return support_bar
+
     def pullback_direct_rhs_support_payload(self, t, state, runtime, rhs_bar, support):
         """Generic black-box RHS transpose with respect to realtime support.
 
@@ -1963,18 +2108,31 @@ class ComposedEquationSystem:
                 working_state, flux_bar, owner_support
             )
             if is_recorded_database_support:
-                # The black-box database lane follows the same fixed-metric
-                # contract as the established Lij lagged path: equation
-                # assembly contracts the RHS to table bars at the primal
-                # transport geometry, then the recorded NTX scan owns the
-                # sole table-to-VMEC transpose.  Do not add a separate raw
-                # r_grid_half/Vprime equation VJP here.
+                # The scan remains the sole table-to-VMEC boundary, but a
+                # fixed database flux still has *local* transport-geometry
+                # dependence.  Keep that direct geometry bar separate from
+                # the table bar: the former goes straight to the ordinary
+                # geometry payload transpose; only the latter crosses the
+                # recorded scan after the complete sweep.
                 if not isinstance(owner_support_bar, dict) or "database" not in owner_support_bar:
                     raise ValueError(
                         "Recorded database direct-RHS pullback must return "
                         "a mapping containing the database table bar."
                     )
+                flux_geometry_bar = self.pullback_direct_rhs_database_flux_geometry_payload(
+                    t, state, runtime, rhs_bar, support
+                )
+                equation_geometry_bar = (
+                    self.pullback_direct_rhs_database_equation_geometry_payload(
+                        t, state, runtime, rhs_bar, support
+                    )
+                )
                 support_bar = dict(_float_delta_tree_like(support))
+                support_bar["geometry"] = jax.tree_util.tree_map(
+                    lambda flux_bar, equation_bar: flux_bar + equation_bar,
+                    flux_geometry_bar["geometry"],
+                    equation_geometry_bar["geometry"],
+                )
                 support_bar["database"] = _sanitize_float_delta_bar_tree(
                     support["database"], owner_support_bar["database"]
                 )

@@ -4875,10 +4875,13 @@ class _RadauAcceptedStepPhysicsContext:
     reverse_stage_adjoint_solve_mode: str = "structured"
     reverse_rhs_transpose_mode: str = "generic"
     reverse_rhs_pullback_mode: str = "separate"
-    # Internal database-lane switch. Database reverse contracts the RHS only
-    # to its fixed interpolation tables; the recorded NTX scan is the sole
-    # database-to-geometry boundary.
+    # Internal database-lane switch. Database reverse always retains a fixed
+    # table cotangent; the recorded NTX scan transposes that table leaf only.
     reverse_database_table_only: bool = False
+    # Database-only extension of the compact table boundary. When enabled,
+    # the same stage loop also carries the local fixed-table geometry terms.
+    # Only the database leaf crosses the recorded scan afterwards.
+    reverse_database_include_direct_geometry: bool = False
     reverse_initial_cache_support_pullback_mode: str = "scalar"
     reverse_rebuild_support_pullback_mode: str = "separate"
     reverse_segment_jit_diagnostics: bool = False
@@ -9176,12 +9179,12 @@ def _radau_database_segment_reduced_cotangent_bwd_with_table_support_call(
     segment_arrays,
     support,
 ) -> tuple[_RadauAcceptedStepReducedCotangent, tuple[Any, ...]]:
-    """Database-only segment reverse with fixed-table support bars.
+    """Database-only segment reverse with split fixed-table support bars.
 
     The caller supplies the bounded primal records produced by the existing
-    minimal segment replay. This kernel deliberately performs no scan VJP
-    and no raw transport-metric VJP: its support output contains only the
-    table cotangent that the recorded scan owner transposes once.
+    minimal segment replay. This kernel deliberately performs no scan VJP.
+    Its support output retains local fixed-table geometry cotangents beside
+    the table cotangent; only the latter is transposed by the recorded scan.
     """
     if str(cotangent_mode).strip().lower() in {
         "zero_step_bwd", "step_bwd_zero", "zero_accepted_step_bwd"
@@ -9197,6 +9200,7 @@ def _radau_database_segment_reduced_cotangent_bwd_with_table_support_call(
         physics_context=dataclasses.replace(
             execution_context.physics_context,
             reverse_database_table_only=True,
+            reverse_database_include_direct_geometry=True,
         ),
     )
     objective_count = jnp.asarray(segment_reduced_bars.y).shape[0]
@@ -11178,23 +11182,30 @@ def _radau_exact_stage_residual_database_table_support_pullback_batched(
     residual_bars,
     support,
 ):
-    """Pull fixed-table bars for all objectives without mapping a support tree.
+    """Pull table bars and optional local fixed-table geometry bars.
 
     This boundary is database-only and is entered only by the deferred-
     geometry segmented reverse.  The objective axis stays inside the compact
     database interpolation transpose; scan ownership and the Lij path are
     deliberately outside it.
     """
-    scalar_direct_pullback = getattr(
-        physics_context, "flat_rhs_direct_database_table_pullback", None
+    include_direct_geometry = bool(
+        getattr(physics_context, "reverse_database_include_direct_geometry", False)
     )
-    batched_direct_pullback = getattr(
-        physics_context, "flat_rhs_direct_database_table_pullback_batched", None
+    scalar_direct_pullback = (
+        getattr(physics_context, "flat_rhs_direct_support_pullback", None)
+        if include_direct_geometry
+        else getattr(physics_context, "flat_rhs_direct_database_table_pullback", None)
+    )
+    batched_direct_pullback = (
+        None
+        if include_direct_geometry
+        else getattr(physics_context, "flat_rhs_direct_database_table_pullback_batched", None)
     )
     if scalar_direct_pullback is None and batched_direct_pullback is None:
         raise ValueError(
-            "Database deferred-geometry reverse requires a scalar or batched "
-            "table RHS pullback boundary."
+            "Database segmented reverse requires a scalar or batched fixed-table "
+            "RHS pullback boundary."
         )
     residual_bars = jnp.asarray(residual_bars, dtype=kernel_context.dtype)
     if residual_bars.ndim == 2:
@@ -11252,13 +11263,11 @@ def _radau_exact_stage_residual_database_table_support_pullback_batched(
 
     def _stage_pullback(accumulated_leaves, stage_inputs):
         t_eval, y_eval, rhs_bars_eval = stage_inputs
-        # Keep the objective axis on device, but prefer the established scalar
-        # fixed-table transpose for each row.  The former rank-3 specialised
-        # table path produced nonfinite D11_log/D13 bars for every objective
-        # in the black-box database Radau sweep.  ``vmap`` preserves the same
-        # mathematical batched result without taking that divergent algebraic
-        # branch.  The dedicated batch hook remains a compatibility fallback
-        # for isolated helper contexts which expose no scalar hook.
+        # Keep the objective axis on device. The scalar fixed-table hook is
+        # deliberately vmapped because the former rank-3 specialised table
+        # path produced nonfinite D11_log/D13 bars. With direct geometry
+        # enabled this instead invokes the compact split payload hook; it has
+        # no scan record and still returns the table leaf separately.
         if scalar_direct_pullback is None:
             stage_value = batched_direct_pullback(
                 t_eval, y_eval, -rhs_bars_eval, support
