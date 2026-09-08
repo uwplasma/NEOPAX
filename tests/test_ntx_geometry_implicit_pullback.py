@@ -20,6 +20,7 @@ from NEOPAX._transport_flux_models import (
     NTXExactLijRuntimeTransportModel,
     NTXRuntimeScanChannels,
     _extract_right_constraints,
+    _database_geometry_with_constrained_axis_face,
     _sanitize_float_delta_bar_tree,
 )
 from NEOPAX._database_preprocessed import PreprocessedMonoenergetic3DNTSSRadius
@@ -35,10 +36,7 @@ from NEOPAX._neoclassical import (
 from NEOPAX._energy_grid_models import StandardLaguerreEnergyGrid
 from NEOPAX._species import Species
 from NEOPAX._state import TransportState, get_v_thermal
-from NEOPAX._transport_equations import (
-    ComposedEquationSystem,
-    _database_equation_geometry_with_constrained_axis_face,
-)
+from NEOPAX._transport_equations import ComposedEquationSystem
 from NEOPAX._transport_solvers import (
     _flat_rhs_build_support_pullback_batched_interpolated_faces_factory,
     _flat_rhs_state_and_lagged_response_pullback_factory,
@@ -111,7 +109,7 @@ def test_database_equation_geometry_delta_keeps_axis_face_constrained():
         r_grid_half=jnp.asarray([7.0, 8.0, -9.0]),
     )
 
-    actual = _database_equation_geometry_with_constrained_axis_face(geometry, delta)
+    actual = _database_geometry_with_constrained_axis_face(geometry, delta)
 
     assert jnp.allclose(actual.r_grid_half, jnp.asarray([0.0, 8.2, -8.6]))
     assert jnp.allclose(actual.r_grid, jnp.asarray([2.1, -2.7]))
@@ -139,7 +137,7 @@ def test_database_equation_geometry_axis_constraint_has_finite_allowed_vjp():
     )
 
     def scalar_response(delta):
-        value = _database_equation_geometry_with_constrained_axis_face(
+        value = _database_geometry_with_constrained_axis_face(
             geometry, delta
         )
         return jnp.sum(jnp.square(value.r_grid_half)) + 0.3 * jnp.sum(value.r_grid)
@@ -1892,6 +1890,59 @@ def test_database_equation_geometry_payload_uses_constrained_axis_vjp():
     assert jnp.all(jnp.isfinite(actual["geometry"].r_grid_half))
     assert jnp.allclose(actual["geometry"].r_grid_half, jnp.asarray([0.0, 0.8, 1.6]))
     assert jnp.allclose(actual["database"], 0.0)
+
+
+def test_database_compact_flux_geometry_vjp_keeps_axis_face_constrained():
+    """The compact fixed-table flux VJP shares the equation mesh constraint."""
+
+    class _ToyDatabaseModel(NTXDatabaseTransportModel):
+        def build_local_direct_flux_evaluator(self, state):
+            del state
+
+            def _evaluate(_radius_index, _er_value):
+                gamma = jnp.broadcast_to(
+                    self.geometry.r_grid_half[0] + 2.0 * self.geometry.r_grid_half[1],
+                    (2,),
+                )
+                return {
+                    "Gamma": gamma,
+                    "Q": jnp.zeros_like(gamma),
+                    "Upar": jnp.zeros_like(gamma),
+                }
+
+            return _evaluate
+
+    geometry = _TestMomentumGeometry(
+        a_b=jnp.asarray(1.0),
+        r_grid=jnp.asarray([0.1, 0.3]),
+        r_grid_half=jnp.asarray([0.0, 0.2, 0.4]),
+        Bsqav=jnp.asarray([1.0, 1.0]),
+        G_PS=jnp.asarray([1.0, 1.0]),
+        B0=jnp.asarray([1.0, 1.0]),
+    )
+    model = _ToyDatabaseModel(
+        species=None,
+        energy_grid=None,
+        geometry=geometry,
+        database=None,
+    )
+    state = TransportState(
+        density=jnp.ones((2, 2)),
+        pressure=jnp.ones((2, 2)),
+        Er=jnp.asarray([0.1, 0.2]),
+    )
+    flux_bar = {
+        "Gamma": jnp.ones((2, 2)),
+        "Q": jnp.zeros((2, 2)),
+        "Upar": jnp.zeros((2, 2)),
+    }
+
+    actual = model.pullback_direct_rhs_geometry_by_radius(
+        state, flux_bar, geometry
+    )
+
+    assert jnp.all(jnp.isfinite(actual.r_grid_half))
+    assert jnp.allclose(actual.r_grid_half, jnp.asarray([0.0, 8.0, 0.0]))
 
 
 def test_database_fixed_payload_split_geometry_matches_generic_vjp():

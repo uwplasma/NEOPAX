@@ -135,6 +135,83 @@ geometry derivatives and are independent of transport segmentation/database
 use; the first six have already been compared above with the existing realtime
 reference table.
 
+## Completed frozen-linearized database profile FD comparison
+
+These FD runs use the same database TOML, 16 accepted steps, accepted-schedule
+replay, and frozen-linearized geometry and initial-Er-root lanes.  Thus the
+comparison below isolates the same profile derivative represented by the
+reverse-AD profile columns above.  FD values are emitted by the benchmark at
+six significant digits, so the reported relative errors are bounded by that
+printing precision.  Relative error is
+`abs(AD - FD) / max(abs(AD), abs(FD))`.
+
+### `n0`
+
+| Objective | Reverse AD | FD | Relative error |
+| --- | ---: | ---: | ---: |
+| `softmax_Er` | -2.870229283213e+00 | -2.870229e+00 | 9.867e-08 |
+| `net_total_power_volume_average_mw_m3` | 2.414499437540e-01 | 2.414499e-01 | 1.812e-07 |
+| `Er_transition_left` | -9.854028863394e-01 | -9.854028e-01 | 8.762e-08 |
+| `Er_transition_right` | -1.099895549700e+00 | -1.099896e+00 | 4.094e-07 |
+| `Er2_volume_average` | 2.584258925801e+00 | 2.584259e+00 | 2.871e-08 |
+| `Er_volume_average` | -1.902403161953e+00 | -1.902403e+00 | 8.513e-08 |
+| `electron_temperature_volume_average_keV` | 8.635230226620e-04 | 8.635236e-04 | 6.686e-07 |
+| `total_pressure_volume_average` | 8.062428661443e+00 | 8.062429e+00 | 4.199e-08 |
+| `alpha_power_volume_average_mw_m3` | 2.796210021162e-01 | 2.796210e-01 | 7.568e-09 |
+| `bootstrap_current_softmax_abs_scaled` | 1.069765860401e-01 | 1.069766e-01 | 1.305e-07 |
+
+### `T0`
+
+| Objective | Reverse AD | FD | Relative error |
+| --- | ---: | ---: | ---: |
+| `softmax_Er` | 2.774011882695e+00 | 2.774012e+00 | 4.229e-08 |
+| `net_total_power_volume_average_mw_m3` | 8.101211771277e-02 | 8.101212e-02 | 2.823e-08 |
+| `Er_transition_left` | 1.588983182064e+00 | 1.588983e+00 | 1.146e-07 |
+| `Er_transition_right` | 1.691440444960e+00 | 1.691440e+00 | 2.631e-07 |
+| `Er2_volume_average` | 3.132042405422e+01 | 3.132042e+01 | 1.294e-07 |
+| `Er_volume_average` | 8.660546286795e-01 | 8.660546e-01 | 3.312e-08 |
+| `electron_temperature_volume_average_keV` | 3.557791789982e-01 | 3.557792e-01 | 5.903e-08 |
+| `total_pressure_volume_average` | 1.865417330779e+00 | 1.865417e+00 | 1.773e-07 |
+| `alpha_power_volume_average_mw_m3` | 8.321610405521e-02 | 8.321610e-02 | 4.873e-08 |
+| `bootstrap_current_softmax_abs_scaled` | 1.747940465558e-01 | 1.747940e-01 | 2.663e-07 |
+
+### `density_shape_power`
+
+| Objective | Reverse AD | FD | Relative error |
+| --- | ---: | ---: | ---: |
+| `softmax_Er` | -8.097000909236e-02 | -8.097001e-02 | 1.121e-08 |
+| `net_total_power_volume_average_mw_m3` | 1.001525151170e-03 | 1.001525e-03 | 1.509e-07 |
+| `Er_transition_left` | -1.226591102776e-02 | -1.226589e-02 | 1.714e-06 |
+| `Er_transition_right` | -1.708680519920e-02 | -1.708679e-02 | 8.895e-07 |
+| `Er2_volume_average` | 2.282433626328e+00 | 2.282434e+00 | 1.637e-07 |
+| `Er_volume_average` | -6.868899394956e-02 | -6.868899e-02 | 5.750e-08 |
+| `electron_temperature_volume_average_keV` | -7.134485771230e-05 | -7.134500e-05 | 1.994e-06 |
+| `total_pressure_volume_average` | 2.442669964820e-01 | 2.442670e-01 | 1.440e-08 |
+| `alpha_power_volume_average_mw_m3` | 2.360917883672e-03 | 2.360918e-03 | 4.927e-08 |
+| `bootstrap_current_softmax_abs_scaled` | -1.199930929329e-02 | -1.199931e-02 | 5.890e-08 |
+
+### `temperature_shape_power`
+
+| Objective | Reverse AD | FD | Relative error |
+| --- | ---: | ---: | ---: |
+| `softmax_Er` | 1.871854895715e+00 | 1.871855e+00 | 5.571e-08 |
+| `net_total_power_volume_average_mw_m3` | 2.745038988131e-01 | 2.745039e-01 | 4.324e-09 |
+| `Er_transition_left` | -7.168755063746e+00 | -7.168755e+00 | 8.892e-09 |
+| `Er_transition_right` | -6.281482073597e+00 | -6.281482e+00 | 1.172e-08 |
+| `Er2_volume_average` | -1.193829755550e+01 | -1.193830e+01 | 2.048e-07 |
+| `Er_volume_average` | -6.940587898690e-01 | -6.940588e-01 | 1.460e-08 |
+| `electron_temperature_volume_average_keV` | 1.524801586181e+00 | 1.524802e+00 | 2.714e-07 |
+| `total_pressure_volume_average` | 7.752335956477e+00 | 7.752336e+00 | 5.614e-09 |
+| `alpha_power_volume_average_mw_m3` | 2.842041456067e-01 | 2.842041e-01 | 1.605e-07 |
+| `bootstrap_current_softmax_abs_scaled` | 7.078898335030e-01 | 7.078898e-01 | 4.733e-08 |
+
+The four completed profile FD columns agree with reverse AD.  Their largest
+displayed relative error is `1.994e-06`, on the small
+`electron_temperature_volume_average_keV` derivative with respect to
+`density_shape_power`; this is consistent with FD output rounding.  The
+remaining FD gradients are `density_shape_alpha` and
+`temperature_shape_alpha`.
+
 ## Remaining validation
 
 1. Run the same database configuration at 16 accepted steps / four segments.

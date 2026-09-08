@@ -3481,7 +3481,10 @@ class NTXDatabaseTransportModel(TransportFluxModelBase):
             def _local_fluxes(flat_delta):
                 model = dataclasses.replace(
                     self,
-                    geometry=_add_float_delta_tree(geometry, _split(flat_delta)),
+                    geometry=_database_geometry_with_constrained_axis_face(
+                        geometry,
+                        _split(flat_delta),
+                    ),
                 )
                 return model.build_local_direct_flux_evaluator(state)(
                     radius_index, state.Er[radius_index]
@@ -4853,6 +4856,34 @@ def _add_float_delta_tree(primal_tree, delta_tree):
         return primal_leaf
 
     return jax.tree_util.tree_map(_add_leaf, primal_tree, delta_tree)
+
+
+def _database_geometry_with_constrained_axis_face(geometry, geometry_delta):
+    """Apply a database geometry delta without moving the magnetic axis.
+
+    ``r_grid_half[0]`` is generated as ``rho_grid_half[0] * a_b`` with a
+    permanently zero first factor.  It is not an independent transport
+    geometry coordinate.  Both compact fixed-table flux and equation VJPs
+    must keep that face at its primal value while perturbing the remaining
+    payload coordinates.
+    """
+    geometry_value = _add_float_delta_tree(geometry, geometry_delta)
+    if (
+        not dataclasses.is_dataclass(geometry)
+        or not hasattr(geometry, "r_grid_half")
+        or not hasattr(geometry_value, "r_grid_half")
+    ):
+        return geometry_value
+    primal_faces = jnp.asarray(geometry.r_grid_half)
+    perturbed_faces = jnp.asarray(geometry_value.r_grid_half)
+    if primal_faces.ndim != 1 or perturbed_faces.ndim != 1 or primal_faces.shape[0] == 0:
+        raise ValueError(
+            "Database geometry requires a non-empty one-dimensional radial face mesh."
+        )
+    return dataclasses.replace(
+        geometry_value,
+        r_grid_half=perturbed_faces.at[0].set(primal_faces[0]),
+    )
 
 
 def _sanitize_float_delta_bar_tree(primal_tree, bar_tree):
