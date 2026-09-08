@@ -1104,6 +1104,14 @@ def test_realtime_outer_face_local_cache_matches_direct_near_observed_edge_roots
     )
     config = load_config(config_path)
     config["_config_dir"] = str(config_path.parent)
+    # Exercise the captured edge state at the requested high NTX resolution
+    # without changing the benchmark's production TOML.
+    config["neoclassical"] = dict(config["neoclassical"])
+    config["neoclassical"].update(
+        ntx_exact_n_theta=25,
+        ntx_exact_n_zeta=25,
+        ntx_exact_n_xi=33,
+    )
     config["ambipolarity"] = dict(config["ambipolarity"])
     config["ambipolarity"]["er_ambipolar_plot"] = False
     runtime, state = build_runtime_context(config)
