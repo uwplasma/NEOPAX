@@ -4915,13 +4915,16 @@ def build_ntx_runtime_scan_inputs_from_vmec_state(
         sys.path.insert(0, ntx_src_str)
     import ntx
 
-    rho = jnp.asarray(rho_scan, dtype=jnp.float64)
-    if rho.ndim != 1:
+    # Scan locations are configuration, not VMEC-dependent quantities.  Keep
+    # their validation on the host so this builder remains valid under a JVP
+    # of the VMEC state (where every JAX operation in the body is traced).
+    rho_np = np.asarray(rho_scan, dtype=float)
+    if rho_np.ndim != 1:
         raise ValueError("ntx_scan_rho must be one-dimensional for realtime VMEC scan input.")
-    if not bool(jnp.all((rho > 0.0) & (rho <= 1.0))):
+    if not bool(np.all((rho_np > 0.0) & (rho_np <= 1.0))):
         raise ValueError("ntx_scan_rho values must satisfy 0 < rho <= 1.")
 
-    rho_np = np.asarray(rho, dtype=float)
+    rho = jnp.asarray(rho_np, dtype=jnp.float64)
     s_values = _positive_transport_s_values_from_rho(rho_np)
     backend = str(surface_backend).strip().lower()
     if backend in {"vmec", "vmec_jax"}:
@@ -5564,6 +5567,10 @@ def geometry_payload_pullback_from_param_vector_raw_block_transpose(
     if payload_kind == "ntx_scan_runtime":
         if scan_rho is None:
             raise ValueError("ntx_scan_runtime payload transpose requires scan_rho.")
+        # ``scan_rho`` is a fixed configuration axis.  Capturing a JAX array
+        # here would make it a traced closure value under the compact JVP
+        # route even though it has no state derivative.
+        scan_rho_static = np.asarray(jax.device_get(scan_rho), dtype=float)
 
         def runtime_scan_payload_from_state(state_inner):
             geometry_inner = geometry_from_state(state_inner)
@@ -5571,7 +5578,7 @@ def geometry_payload_pullback_from_param_vector_raw_block_transpose(
                 context,
                 state_inner,
                 geometry_inner,
-                rho_scan=scan_rho,
+                rho_scan=scan_rho_static,
                 surface_backend=scan_surface_backend,
             )
             # The live scan's database is rebuilt from this whole payload.  Do

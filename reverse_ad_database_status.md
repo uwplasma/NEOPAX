@@ -75,6 +75,14 @@ the JVP/bar contraction.  By VJP/JVP duality this is the same derivative as
 the raw payload-state transpose, without materializing its large state-bar
 batch.  This correction is not yet GPU-validated.
 
+The first compact-JVP attempt reached that route and exposed a trace-safety
+bug, not a physics or memory failure: the static `ntx_scan_rho` validation
+used `bool(jnp.all(...))` inside the JVP.  Scan locations are configuration
+coordinates, so they are now validated and captured as a host NumPy constant
+before the differentiated payload function is entered.  VMEC state still
+drives geometry, channels, and surfaces; only the fixed scan coordinate axis
+is excluded from differentiation.  This correction is not yet GPU-validated.
+
 ## Validation completed
 
 ```text
