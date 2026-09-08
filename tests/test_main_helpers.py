@@ -1325,6 +1325,48 @@ def test_realtime_outer_face_local_cache_matches_direct_near_observed_edge_roots
             primitives_override=captured_primitives,
         )
     )
+    captured_direct_gamma_minus = _edge_gamma(
+        captured_edge - captured_probe, primitives_override=captured_primitives
+    )
+    captured_direct_gamma_plus = _edge_gamma(
+        captured_edge + captured_probe, primitives_override=captured_primitives
+    )
+    captured_cached_gamma_minus = _edge_gamma(
+        captured_edge - captured_probe,
+        captured_responses,
+        primitives_override=captured_primitives,
+    )
+    captured_cached_gamma_plus = _edge_gamma(
+        captured_edge + captured_probe,
+        captured_responses,
+        primitives_override=captured_primitives,
+    )
+    captured_direct_gamma_slope = (
+        captured_direct_gamma_plus - captured_direct_gamma_minus
+    ) / (2.0 * captured_probe)
+    captured_cached_gamma_slope = (
+        captured_cached_gamma_plus - captured_cached_gamma_minus
+    ) / (2.0 * captured_probe)
+    captured_direct_charge_slope_by_species = (
+        neo.species.charge * captured_direct_gamma_slope
+    )
+    captured_cached_charge_slope_by_species = (
+        neo.species.charge * captured_cached_gamma_slope
+    )
+    captured_scan_inputs = tuple(
+        neo._local_scan_inputs(
+            drds_value=drds_edge,
+            species_index=species_index,
+            er_value=captured_edge,
+            temperature_local=captured_temperature,
+            density_local=captured_density,
+            vthermal_local=captured_vthermal,
+            collisionality_kind=collisionality_kind,
+        )
+        for species_index in range(neo.species.number_species)
+    )
+    captured_nu_over_v = jnp.stack(tuple(item[0] for item in captured_scan_inputs))
+    captured_er_over_v = jnp.stack(tuple(item[1] for item in captured_scan_inputs))
     captured_direct_slope = (captured_direct_plus - captured_direct_minus) / (2.0 * captured_probe)
     captured_cached_slope = (captured_cached_plus - captured_cached_minus) / (2.0 * captured_probe)
     print(
@@ -1338,7 +1380,20 @@ def test_realtime_outer_face_local_cache_matches_direct_near_observed_edge_roots
         f"cached_rhs_minus={float(captured_cached_minus):.9e} "
         f"cached_rhs_plus={float(captured_cached_plus):.9e} "
         f"direct_slope={float(captured_direct_slope):.9e} "
-        f"cached_slope={float(captured_cached_slope):.9e}"
+        f"cached_slope={float(captured_cached_slope):.9e}\n"
+        "[outer-face-captured-failure-state-fluxes] "
+        f"species_order=[electron,deuterium,tritium,helium] "
+        f"charge={neo.species.charge} "
+        f"direct_Gamma_minus={captured_direct_gamma_minus} "
+        f"direct_Gamma_plus={captured_direct_gamma_plus} "
+        f"direct_dGamma_dEr={captured_direct_gamma_slope} "
+        f"direct_charge_dGamma_dEr={captured_direct_charge_slope_by_species} "
+        f"cached_dGamma_dEr={captured_cached_gamma_slope} "
+        f"cached_charge_dGamma_dEr={captured_cached_charge_slope_by_species}\n"
+        "[outer-face-captured-failure-state-ntx-inputs] "
+        "species_order=[electron,deuterium,tritium,helium] "
+        f"nu_over_v={captured_nu_over_v} "
+        f"Er_over_v={captured_er_over_v}"
     )
     assert jnp.allclose(
         captured_cached_slope, captured_direct_slope, rtol=3.0e-2, atol=1.0e-5

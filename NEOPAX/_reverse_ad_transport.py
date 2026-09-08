@@ -37,7 +37,6 @@ from ._reverse_ad_initial_er import (
     fold_recorded_ntx_scan_database_bar_groups_into_support,
     compact_initial_er_ntx_support_pullback_leaves,
     compact_initial_er_state_pullback,
-    find_ntx_database_transport_model_in_model,
     find_ntx_runtime_scan_model_in_model,
     find_ntx_support_payload,
     initial_er_charge_flux_residual_er_derivative,
@@ -6474,11 +6473,11 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
                 tuple(jax.tree_util.tree_leaves(geometry_bars)) + tuple(ntx_bar_leaves)
             )
         elif combined_geometry_payload and "database" in support_payload:
-            # Recorded scan database: transpose charge-weighted particle flux
-            # directly to the three tables, then preserve only the explicit
-            # geometry derivative in a database-fixed VJP.  The resulting
-            # table bars are folded through the retained scan once with the
-            # rest of the transport reverse support bars.
+            # Recorded scan database: transpose the charge-weighted particle
+            # flux only to the three fixed tables.  As for every transport
+            # stage, the table-to-geometry derivative belongs exclusively to
+            # the retained scan fold after the complete reverse sweep; do not
+            # create a second local-radius raw-geometry VJP at the root.
             root_ntx_support_pullback_start = time.perf_counter()
             database_bars = compact_initial_er_database_support_bars(
                 runtime=runtime,
@@ -6492,40 +6491,8 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
             root_ntx_support_pullback_elapsed = (
                 time.perf_counter() - root_ntx_support_pullback_start
             )
-            root_geometry_pullback_start = time.perf_counter()
-            # The recorded database is fixed at this boundary.  Use its
-            # existing local-radius root transpose rather than forming a VJP
-            # of the full radial residual vector with a geometry payload.  It
-            # is the same one-radius construction used by the Lij compact
-            # boundary and avoids tracing the all-radii database evaluator.
-            database_model = find_ntx_database_transport_model_in_model(runtime.models.flux)
-            if database_model is None:
-                raise ValueError(
-                    "Recorded database initial-Er geometry pullback requires "
-                    "a fixed NTX database model."
-                )
-            geometry_pullback_fn = getattr(
-                database_model,
-                "pullback_local_particle_flux_geometry_by_radius",
-                None,
-            )
-            if not callable(geometry_pullback_fn):
-                raise NotImplementedError(
-                    "Recorded database initial-Er geometry pullback requires "
-                    "the compact local particle-flux geometry transpose."
-                )
-            geometry_bars = geometry_pullback_fn(
-                pre_root_initial_state,
-                er_profile,
-                residual_bars,
-                support_payload["geometry"],
-            )
-            if phase_timing_diagnostics:
-                geometry_bars = jax.block_until_ready(geometry_bars)
-            root_geometry_pullback_elapsed = time.perf_counter() - root_geometry_pullback_start
-
             batched_support_bars = {
-                "geometry": geometry_bars,
+                "geometry": _float_delta_tree_like(support_payload["geometry"]),
                 "database": database_bars,
             }
             initial_er_root_support_bars = tuple(
