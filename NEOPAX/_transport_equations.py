@@ -2014,23 +2014,33 @@ class ComposedEquationSystem:
         )
         geometry_delta0 = _float_delta_tree_like(geometry)
 
-        def _equation_geometry_with_fixed_fluxes(geometry_delta):
+        def _equation_geometry_with_fixed_fluxes(geometry_delta, component):
             geometry_payload = {
                 **support,
                 "geometry": _add_float_delta_tree(geometry, geometry_delta),
             }
             system = self.with_realtime_geometry_support_payload(geometry_payload)
             fixed_working_state, fixed_eidx = system._prepare_working_state(state)
-            return system._evaluate_with_shared_fluxes_from_working_state(
+            full_rhs = system._evaluate_with_shared_fluxes_from_working_state(
                 fixed_working_state, fixed_eidx, state, shared_fluxes
             )
+            return getattr(full_rhs, component)
 
-        _, equation_geometry_pullback = jax.vjp(
-            _equation_geometry_with_fixed_fluxes, geometry_delta0
-        )
-        (equation_geometry_bar,) = equation_geometry_pullback(rhs_bar)
-        equation_geometry_bar = _report_nonfinite_database_geometry_component(
-            "fixed_flux_equation", equation_geometry_bar
+        equation_geometry_bars = []
+        for component in ("density", "pressure", "Er"):
+            _, equation_geometry_pullback = jax.vjp(
+                lambda delta: _equation_geometry_with_fixed_fluxes(delta, component),
+                geometry_delta0,
+            )
+            (component_bar,) = equation_geometry_pullback(getattr(rhs_bar, component))
+            equation_geometry_bars.append(
+                _report_nonfinite_database_geometry_component(
+                    f"fixed_flux_equation:{component}", component_bar
+                )
+            )
+        equation_geometry_bar = _add_float_delta_tree(
+            equation_geometry_bars[0],
+            _add_float_delta_tree(equation_geometry_bars[1], equation_geometry_bars[2]),
         )
         support_bar = dict(_float_delta_tree_like(support))
         support_bar["geometry"] = _sanitize_float_delta_bar_tree(
@@ -2077,25 +2087,35 @@ class ComposedEquationSystem:
         )
         geometry_delta0 = _float_delta_tree_like(geometry)
 
-        def _equation_geometry_with_fixed_fluxes(geometry_delta):
+        def _equation_geometry_with_fixed_fluxes(geometry_delta, component):
             geometry_payload = {
                 **support,
                 "geometry": _add_float_delta_tree(geometry, geometry_delta),
             }
             system = self.with_realtime_geometry_support_payload(geometry_payload)
             fixed_working_state, fixed_eidx = system._prepare_working_state(state)
-            return system._evaluate_with_shared_fluxes_from_working_state(
+            full_rhs = system._evaluate_with_shared_fluxes_from_working_state(
                 fixed_working_state, fixed_eidx, state, shared_fluxes
             )
+            return getattr(full_rhs, component)
 
-        _, equation_geometry_pullback = jax.vjp(
-            _equation_geometry_with_fixed_fluxes, geometry_delta0
-        )
-        geometry_bar = jax.vmap(
-            lambda one_rhs_bar: equation_geometry_pullback(one_rhs_bar)[0]
-        )(rhs_bar)
-        geometry_bar = _report_nonfinite_database_geometry_component(
-            "fixed_flux_equation", geometry_bar
+        equation_geometry_bars = []
+        for component in ("density", "pressure", "Er"):
+            _, equation_geometry_pullback = jax.vjp(
+                lambda delta: _equation_geometry_with_fixed_fluxes(delta, component),
+                geometry_delta0,
+            )
+            component_bar = jax.vmap(equation_geometry_pullback)(
+                getattr(rhs_bar, component)
+            )[0]
+            equation_geometry_bars.append(
+                _report_nonfinite_database_geometry_component(
+                    f"fixed_flux_equation:{component}", component_bar
+                )
+            )
+        geometry_bar = _add_float_delta_tree(
+            equation_geometry_bars[0],
+            _add_float_delta_tree(equation_geometry_bars[1], equation_geometry_bars[2]),
         )
         objective_count = jnp.asarray(jax.tree_util.tree_leaves(rhs_bar)[0]).shape[0]
         support_bar = jax.tree_util.tree_map(

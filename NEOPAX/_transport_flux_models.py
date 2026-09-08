@@ -6687,6 +6687,54 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             )
         return nu_hat_a, epsi_hat_a, vth_a
 
+    def debug_outer_face_scan_inputs(self, state, *, er_edge):
+        """Return the actual per-species NTX inputs at the outer face.
+
+        This is diagnostic-only plumbing for the Radau floating-edge cache
+        audit.  In particular, ``epsi_hat`` is the *post-limit* NTX electric
+        input, not a separately reconstructed physical proxy.
+        """
+        evaluated = build_evaluated_transport_state(
+            state,
+            self.geometry,
+            bc_density=self.bc_density,
+            bc_temperature=self.bc_temperature,
+            density_floor=self.density_floor,
+            temperature_floor=self.temperature_floor,
+            er_edge_override=er_edge,
+        )
+        face = evaluated.face
+        density = face.density[:, -1]
+        temperature = face.temperature[:, -1]
+        vthermal = get_v_thermal(self.species.mass, temperature)
+        drds = self._static_support().face_channels.drds[-1]
+        collisionality_kind = _collisionality_kind(self.collisionality_model)
+        species_indices = jnp.arange(int(self.species.number_species), dtype=jnp.int32)
+
+        def _per_species(species_index):
+            nu_hat, epsi_hat, vth = self._local_scan_inputs(
+                drds_value=drds,
+                species_index=species_index,
+                er_value=face.Er[-1],
+                temperature_local=temperature,
+                density_local=density,
+                vthermal_local=vthermal,
+                collisionality_kind=collisionality_kind,
+            )
+            return nu_hat, epsi_hat, vth
+
+        nu_hat, epsi_hat, vth = jax.vmap(_per_species)(species_indices)
+        return {
+            "Er": face.Er[-1],
+            "density": density,
+            "temperature": temperature,
+            "vthermal": vth,
+            "vnew": self.energy_grid.v_norm * vth,
+            "nu_hat": nu_hat,
+            "epsi_hat": epsi_hat,
+            "drds": drds,
+        }
+
     def _lij_from_coefficient_scan(
         self,
         coeff_scan,

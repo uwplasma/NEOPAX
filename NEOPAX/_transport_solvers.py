@@ -4910,6 +4910,10 @@ class _RadauAcceptedStepPhysicsContext:
     # the last component of the flattened RHS without including core Er
     # diffusion or any solver-coordinate bookkeeping.
     node_edge_ambipolar_rhs: Callable[[Any, Any], Any] | None = None
+    # Diagnostic-only outer-face state and normalized NTX inputs for the
+    # private edge coordinate.  It is never part of the primal or reverse
+    # solve.
+    node_edge_runtime_inputs: Callable[[Any], dict[str, Any]] | None = None
     # Matching explicit cached quadratic derivative in the private edge
     # direction.  Generic AD through ``er_edge_override`` is deliberately
     # not used for this coordinate.
@@ -15432,6 +15436,108 @@ def _radau_prepare_stage_subsolve_inputs_from_carry(
                 live_rhs=live_rhs[new_to_live_index],
                 ordered=True,
             )
+            # For the private floating-edge coordinate, distinguish a bad
+            # Taylor evaluation from a genuinely sharp direct edge residual.
+            # This is deliberately rebuild-only and behind the existing
+            # expensive audit flag: it adds the anchor and symmetric direct
+            # probes to the pre-existing live RHS check.
+            if physics_context.node_edge_ambipolar_rhs is not None:
+                edge_index = kernel_context.state_dim
+                edge_reference = carry_in.lagged_reference_y[edge_index]
+                edge_current = flat_y[edge_index]
+                edge_delta = edge_current - edge_reference
+                probe = jnp.maximum(
+                    jnp.asarray(1.0e-6, dtype=flat_y.dtype),
+                    0.1 * jnp.abs(edge_delta),
+                )
+                edge_direction = jnp.zeros_like(flat_y).at[edge_index].set(probe)
+                old_plus = _radau_eval_rhs(
+                    t_value, flat_y + edge_direction,
+                    carry_in.lagged_response_cache,
+                    physics_context.flat_rhs,
+                    physics_context.flat_rhs_with_lagged_response,
+                )[edge_index]
+                old_minus = _radau_eval_rhs(
+                    t_value, flat_y - edge_direction,
+                    carry_in.lagged_response_cache,
+                    physics_context.flat_rhs,
+                    physics_context.flat_rhs_with_lagged_response,
+                )[edge_index]
+                live_plus = physics_context.flat_rhs(
+                    t_value, flat_y + edge_direction,
+                )[edge_index]
+                live_minus = physics_context.flat_rhs(
+                    t_value, flat_y - edge_direction,
+                )[edge_index]
+                old_at_reference = _radau_eval_rhs(
+                    t_value, carry_in.lagged_reference_y,
+                    carry_in.lagged_response_cache,
+                    physics_context.flat_rhs,
+                    physics_context.flat_rhs_with_lagged_response,
+                )[edge_index]
+                live_at_reference = physics_context.flat_rhs(
+                    t_value, carry_in.lagged_reference_y,
+                )[edge_index]
+                if physics_context.node_edge_runtime_inputs is not None:
+                    reference_inputs = physics_context.node_edge_runtime_inputs(
+                        carry_in.lagged_reference_y
+                    )
+                    current_inputs = physics_context.node_edge_runtime_inputs(flat_y)
+                    jax.debug.print(
+                        "[radau-node-edge-ntx-inputs] t={t:.6e} "
+                        "ref_Er={ref_er:.9e} current_Er={current_er:.9e} drds={drds:.9e} "
+                        "ref_n={ref_n} current_n={current_n} "
+                        "ref_T={ref_t} current_T={current_t} "
+                        "ref_vth={ref_vth} current_vth={current_vth} "
+                        "ref_vnew={ref_vnew} current_vnew={current_vnew} "
+                        "ref_nu_over_v={ref_nu} current_nu_over_v={current_nu} "
+                        "ref_Er_over_v={ref_epsi} current_Er_over_v={current_epsi}",
+                        t=t_value,
+                        ref_er=reference_inputs["Er"],
+                        current_er=current_inputs["Er"],
+                        drds=current_inputs["drds"],
+                        ref_n=reference_inputs["density"],
+                        current_n=current_inputs["density"],
+                        ref_t=reference_inputs["temperature"],
+                        current_t=current_inputs["temperature"],
+                        ref_vth=reference_inputs["vthermal"],
+                        current_vth=current_inputs["vthermal"],
+                        ref_vnew=reference_inputs["vnew"],
+                        current_vnew=current_inputs["vnew"],
+                        ref_nu=reference_inputs["nu_hat"],
+                        current_nu=current_inputs["nu_hat"],
+                        ref_epsi=reference_inputs["epsi_hat"],
+                        current_epsi=current_inputs["epsi_hat"],
+                        ordered=True,
+                    )
+                jax.debug.print(
+                    "[radau-node-edge-rebuild-probe] t={t:.6e} "
+                    "edge_ref={edge_ref:.9e} edge_current={edge_current:.9e} "
+                    "edge_delta={edge_delta:.9e} probe={probe:.9e} "
+                    "old_at_ref={old_ref:.9e} live_at_ref={live_ref:.9e} "
+                    "old_at_current={old_current:.9e} new_at_current={new_current:.9e} "
+                    "live_at_current={live_current:.9e} "
+                    "old_minus={old_minus:.9e} old_plus={old_plus:.9e} "
+                    "live_minus={live_minus:.9e} live_plus={live_plus:.9e} "
+                    "old_fd={old_fd:.9e} live_fd={live_fd:.9e}",
+                    t=t_value,
+                    edge_ref=edge_reference,
+                    edge_current=edge_current,
+                    edge_delta=edge_delta,
+                    probe=probe,
+                    old_ref=old_at_reference,
+                    live_ref=live_at_reference,
+                    old_current=old_rhs[edge_index],
+                    new_current=f0[edge_index],
+                    live_current=live_rhs[edge_index],
+                    old_minus=old_minus,
+                    old_plus=old_plus,
+                    live_minus=live_minus,
+                    live_plus=live_plus,
+                    old_fd=(old_plus - old_minus) / (2.0 * probe),
+                    live_fd=(live_plus - live_minus) / (2.0 * probe),
+                    ordered=True,
+                )
             return jnp.asarray(0, dtype=jnp.int32)
 
         jax.lax.cond(
@@ -16904,6 +17010,107 @@ def _radau_single_step_primal(
                 live_rhs=live_rhs[new_to_live_index],
                 ordered=True,
             )
+            # Rebuild-only local edge response audit.  The previous cache is
+            # evaluated both at its own anchor and at the replacement state;
+            # symmetric direct probes make a physical sharp residual
+            # distinguishable from a bad cached Taylor displacement.
+            if physics_context.node_edge_ambipolar_rhs is not None:
+                edge_index = kernel_context.state_dim
+                edge_reference = carry_in.lagged_reference_y[edge_index]
+                edge_current = flat_y[edge_index]
+                edge_delta = edge_current - edge_reference
+                probe = jnp.maximum(
+                    jnp.asarray(1.0e-6, dtype=flat_y.dtype),
+                    0.1 * jnp.abs(edge_delta),
+                )
+                edge_direction = jnp.zeros_like(flat_y).at[edge_index].set(probe)
+                old_plus = _radau_eval_rhs(
+                    t_value, flat_y + edge_direction,
+                    carry_in.lagged_response_cache,
+                    physics_context.flat_rhs,
+                    physics_context.flat_rhs_with_lagged_response,
+                )[edge_index]
+                old_minus = _radau_eval_rhs(
+                    t_value, flat_y - edge_direction,
+                    carry_in.lagged_response_cache,
+                    physics_context.flat_rhs,
+                    physics_context.flat_rhs_with_lagged_response,
+                )[edge_index]
+                live_plus = physics_context.flat_rhs(
+                    t_value, flat_y + edge_direction,
+                )[edge_index]
+                live_minus = physics_context.flat_rhs(
+                    t_value, flat_y - edge_direction,
+                )[edge_index]
+                old_at_reference = _radau_eval_rhs(
+                    t_value, carry_in.lagged_reference_y,
+                    carry_in.lagged_response_cache,
+                    physics_context.flat_rhs,
+                    physics_context.flat_rhs_with_lagged_response,
+                )[edge_index]
+                live_at_reference = physics_context.flat_rhs(
+                    t_value, carry_in.lagged_reference_y,
+                )[edge_index]
+                if physics_context.node_edge_runtime_inputs is not None:
+                    reference_inputs = physics_context.node_edge_runtime_inputs(
+                        carry_in.lagged_reference_y
+                    )
+                    current_inputs = physics_context.node_edge_runtime_inputs(flat_y)
+                    jax.debug.print(
+                        "[radau-node-edge-ntx-inputs] t={t:.6e} "
+                        "ref_Er={ref_er:.9e} current_Er={current_er:.9e} drds={drds:.9e} "
+                        "ref_n={ref_n} current_n={current_n} "
+                        "ref_T={ref_t} current_T={current_t} "
+                        "ref_vth={ref_vth} current_vth={current_vth} "
+                        "ref_vnew={ref_vnew} current_vnew={current_vnew} "
+                        "ref_nu_over_v={ref_nu} current_nu_over_v={current_nu} "
+                        "ref_Er_over_v={ref_epsi} current_Er_over_v={current_epsi}",
+                        t=t_value,
+                        ref_er=reference_inputs["Er"],
+                        current_er=current_inputs["Er"],
+                        drds=current_inputs["drds"],
+                        ref_n=reference_inputs["density"],
+                        current_n=current_inputs["density"],
+                        ref_t=reference_inputs["temperature"],
+                        current_t=current_inputs["temperature"],
+                        ref_vth=reference_inputs["vthermal"],
+                        current_vth=current_inputs["vthermal"],
+                        ref_vnew=reference_inputs["vnew"],
+                        current_vnew=current_inputs["vnew"],
+                        ref_nu=reference_inputs["nu_hat"],
+                        current_nu=current_inputs["nu_hat"],
+                        ref_epsi=reference_inputs["epsi_hat"],
+                        current_epsi=current_inputs["epsi_hat"],
+                        ordered=True,
+                    )
+                jax.debug.print(
+                    "[radau-node-edge-rebuild-probe] t={t:.6e} "
+                    "edge_ref={edge_ref:.9e} edge_current={edge_current:.9e} "
+                    "edge_delta={edge_delta:.9e} probe={probe:.9e} "
+                    "old_at_ref={old_ref:.9e} live_at_ref={live_ref:.9e} "
+                    "old_at_current={old_current:.9e} new_at_current={new_current:.9e} "
+                    "live_at_current={live_current:.9e} "
+                    "old_minus={old_minus:.9e} old_plus={old_plus:.9e} "
+                    "live_minus={live_minus:.9e} live_plus={live_plus:.9e} "
+                    "old_fd={old_fd:.9e} live_fd={live_fd:.9e}",
+                    t=t_value,
+                    edge_ref=edge_reference,
+                    edge_current=edge_current,
+                    edge_delta=edge_delta,
+                    probe=probe,
+                    old_ref=old_at_reference,
+                    live_ref=live_at_reference,
+                    old_current=old_rhs[edge_index],
+                    new_current=f0[edge_index],
+                    live_current=live_rhs[edge_index],
+                    old_minus=old_minus,
+                    old_plus=old_plus,
+                    live_minus=live_minus,
+                    live_plus=live_plus,
+                    old_fd=(old_plus - old_minus) / (2.0 * probe),
+                    live_fd=(live_plus - live_minus) / (2.0 * probe),
+                    ordered=True,
+                )
             return jnp.asarray(0, dtype=jnp.int32)
 
         jax.lax.cond(
@@ -22859,6 +23066,15 @@ def _build_prepared_radau_accepted_rollout(
                 er_edge_override=projected[-1],
             )
 
+        def _node_edge_runtime_inputs(flat_y):
+            """Actual outer-face state and NTX coordinates for debug output."""
+            projected = _node_project_flat(flat_y)
+            state_value = _node_unpack_flat(projected)
+            working_state, _ = owner._prepare_working_state(state_value)
+            return owner.shared_flux_model.debug_outer_face_scan_inputs(
+                working_state, er_edge=projected[-1]
+            )
+
         def _node_edge_ambipolar_rhs_tangent(flat_y, edge_direction, cache):
             projected = _node_project_flat(flat_y)
             zero_state_direction = _node_unpack_flat(jnp.zeros_like(projected))
@@ -23154,6 +23370,9 @@ def _build_prepared_radau_accepted_rollout(
         flat_rhs=flat_rhs,
         flat_rhs_with_lagged_response=flat_rhs_with_lagged_response,
         node_edge_ambipolar_rhs=node_edge_ambipolar_rhs,
+        node_edge_runtime_inputs=(
+            _node_edge_runtime_inputs if node_boundary_mode else None
+        ),
         node_edge_ambipolar_rhs_tangent=node_edge_ambipolar_rhs_tangent,
         debug_er_components_with_lagged_response=debug_er_components_with_lagged_response,
         flat_rhs_with_lagged_response_tangent=flat_rhs_with_lagged_response_tangent,
@@ -23816,6 +24035,15 @@ class RADAUSolver(_RadauSolverConfig):
                     er_edge_override=projected[-1],
                 )
 
+            def _node_edge_runtime_inputs(flat_y):
+                """Actual outer-face state and NTX coordinates for debug output."""
+                projected = _node_project_flat(flat_y)
+                state_value = _node_unpack_flat(projected)
+                working_state, _ = owner._prepare_working_state(state_value)
+                return owner.shared_flux_model.debug_outer_face_scan_inputs(
+                    working_state, er_edge=projected[-1]
+                )
+
             def _node_edge_ambipolar_rhs_tangent(flat_y, edge_direction, cache):
                 projected = _node_project_flat(flat_y)
                 zero_state_direction = _node_unpack_flat(jnp.zeros_like(projected))
@@ -24131,6 +24359,9 @@ class RADAUSolver(_RadauSolverConfig):
             flat_rhs=flat_rhs,
             flat_rhs_with_lagged_response=flat_rhs_with_lagged_response,
             node_edge_ambipolar_rhs=node_edge_ambipolar_rhs,
+            node_edge_runtime_inputs=(
+                _node_edge_runtime_inputs if _node_boundary_mode else None
+            ),
             node_edge_ambipolar_rhs_tangent=node_edge_ambipolar_rhs_tangent,
             debug_er_components_with_lagged_response=debug_er_components_with_lagged_response,
             flat_rhs_with_lagged_response_tangent=flat_rhs_with_lagged_response_tangent,

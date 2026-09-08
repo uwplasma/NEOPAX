@@ -1007,6 +1007,89 @@ def test_realtime_boundary_edge_response_matches_fresh_reference_near_observed_r
                 )
 
 
+def test_realtime_node_edge_explicit_tangent_matches_generic_cached_primal_jvp():
+    """Audit the edge column without a Radau time solve.
+
+    The solver has two possible derivative routes for its private edge
+    coordinate: generic JAX through the flattened cached RHS and the
+    model-owned quadratic edge-polarization tangent.  This test compares
+    them directly at a stage-like displaced state with one fixed cache.  A
+    This is a derivative-contract audit only.  It does not explain or fix a
+    primal stage-RHS excursion by itself; it merely prevents a derivative
+    wiring change from being mistaken for the common failure seen across
+    frozen, refreshed, and full-current Jacobian modes.
+    """
+    config_path = (
+        Path(__file__).resolve().parents[1]
+        / "examples/benchmarks/"
+        "Solve_Transport_equations_wHe_radau_ntx_exact_lagged_runtime_vmec_"
+        "realtime_full_state_quadratic_transport_endpoint_newton_benchmark_center.toml"
+    )
+    config = load_config(config_path)
+    config["_config_dir"] = str(config_path.parent)
+    config["ambipolarity"] = dict(config["ambipolarity"])
+    config["ambipolarity"]["er_ambipolar_plot"] = False
+    runtime, state = build_runtime_context(config)
+    assert state is not None
+    prepared = prepare_transport_solver_components(config, runtime, state)
+    owner = prepared["equation_system"]
+    assert owner.er_equation.boundary_mode == "floating_ambipolar_edge_node"
+
+    edge_anchor = jnp.asarray(-35.0, dtype=state.Er.dtype)
+    response = owner.build_node_boundary_lagged_response(state, edge_anchor)
+    stage_state = dataclasses.replace(
+        state,
+        # A public-centre displacement deliberately coexists with the fixed
+        # response anchor, exactly as it does inside a Radau attempt.
+        Er=state.Er.at[-1].add(jnp.asarray(1.0e-4, dtype=state.Er.dtype)),
+    )
+    zero_direction = TransportState(
+        density=jnp.zeros_like(stage_state.density),
+        pressure=jnp.zeros_like(stage_state.pressure),
+        Er=jnp.zeros_like(stage_state.Er),
+    )
+
+    for edge_value_float in (-37.0, -35.0, -33.0):
+        edge_value = jnp.asarray(edge_value_float, dtype=state.Er.dtype)
+
+        def cached_node_primal(edge):
+            return owner.evaluate_node_boundary_with_lagged_response(
+                stage_state,
+                edge,
+                response,
+                er_edge_anchor=edge_anchor,
+            )
+
+        _primal, generic_tangent = jax.jvp(
+            cached_node_primal,
+            (edge_value,),
+            (jnp.asarray(1.0, dtype=state.Er.dtype),),
+        )
+        explicit_tangent = owner.evaluate_node_boundary_with_lagged_response_tangent(
+            stage_state,
+            zero_direction,
+            edge_value,
+            jnp.asarray(1.0, dtype=state.Er.dtype),
+            response,
+            er_edge_anchor=edge_anchor,
+        )
+        generic_core, generic_edge = generic_tangent
+        explicit_core, explicit_edge = explicit_tangent
+        for field in ("density", "pressure", "Er"):
+            assert jnp.allclose(
+                getattr(generic_core, field),
+                getattr(explicit_core, field),
+                rtol=3.0e-6,
+                atol=1.0e-9,
+            ), (edge_value_float, field)
+        assert jnp.allclose(
+            generic_edge,
+            explicit_edge,
+            rtol=3.0e-6,
+            atol=1.0e-9,
+        ), (edge_value_float, "private_edge_rhs")
+
+
 def test_realtime_outer_face_local_cache_matches_direct_near_observed_edge_roots():
     """Compare one known boundary state without building a radial response.
 
