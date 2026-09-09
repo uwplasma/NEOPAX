@@ -6565,6 +6565,10 @@ def main() -> None:
     if (
         str(args.reverse_schedule_artifact_mode) == "reuse_static_probe"
         and not bool(args.full_transport_shared_payload_smoke)
+        # Root-only mode never builds a Radau schedule.  Permit the parser
+        # default so this independent selected-root diagnostic does not need
+        # an irrelevant transport-schedule override.
+        and not bool(args.initial_er_root_only_optimization_smoke)
     ):
         raise SystemExit(
             "[autodiff-gate] --reverse-schedule-artifact-mode reuse_static_probe is currently "
