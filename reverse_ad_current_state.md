@@ -2910,3 +2910,96 @@ Next timing plan:
    - first segment compile/execution time,
    - XLA peak allocation / `preallocated-temp`,
    - derivative agreement with the saved reverse reference.
+
+## 2026-09-09: Black-box NTX database reverse — compact face geometry boundary
+
+Scope: `ntx_scan_runtime` / black-box database benchmark only.  The established
+Lij realtime path is not dispatched through any of the hooks below.
+
+### Required database reverse ownership
+
+```text
+VMEC geometry
+  -> one recorded NTX scan
+  -> fixed D11/D13/D33 database tables
+  -> root, forward transport, and reverse Radau segments
+  -> accumulated table cotangent
+  -> one recorded NTX scan VJP
+  -> VMEC pullback
+```
+
+Transport segments must not capture the scan owner.  They may return direct
+local geometry bars, but only fixed-table bars cross the post-segment scan
+boundary.
+
+### Implemented boundaries
+
+- Centre database flux geometry uses the existing bounded
+  `pullback_direct_rhs_geometry_by_radius` primitive.
+- Native density and temperature face table bars use
+  `pullback_direct_face_flux_support_payload`; this is a table-only
+  transpose and does not invoke the scan.
+- The Radau database split hook separates table, direct-flux geometry, and
+  equation-assembly geometry contributions.
+- Equation assembly keeps fixed primal centre and face flux payloads.  It
+  never rebuilds face fluxes during its geometry transpose.
+- A new face-only geometry hook,
+  `pullback_direct_face_flux_geometry_by_radius`, is routed through the
+  database/combined/runtime models.  It reconstructs only native database
+  face fluxes.  It does not rebuild `ComposedEquationSystem`, sources, or
+  finite-volume equation assembly for every face VJP.
+
+### Axis and mesh rule
+
+Database face coordinates are physical sampling coordinates, not independent
+VMEC variables:
+
+```text
+r_grid       = rho_grid * a_b
+r_grid_half  = rho_grid_half * a_b
+dr           = r_grid_half[1] - r_grid_half[0]
+```
+
+The direct database flux primitive therefore uses
+`_database_geometry_with_constrained_axis_face`.  In particular,
+`r_grid_half[0]` remains exactly zero.  Allowing an independent axis-face
+perturbation creates an invalid off-manifold radial-table evaluation and was
+the source of nonfinite `geometry.r_grid_half` cotangents.  Equation-assembly
+geometry remains the usual full Lij-style tangent; this constraint applies
+only to the database flux primitive.
+
+### Why the former implementation used too much host RAM
+
+The first bounded face implementation did a `jax.vjp` of a rebuilt
+`ComposedEquationSystem` for each native face.  Although it removed the worst
+whole-face retained VJP, it still retained equation/source construction and
+raised host RAM to roughly 16–17 GB on a 30 GB machine.  The model-only hook
+above replaces that route.  A new 16 accepted-step / 4-segment benchmark is
+required to measure the resulting peak memory; no claim of a measured
+reduction has yet been made.
+
+### Latest passing targeted tests
+
+```text
+database_face_geometry_pullback_keeps_table_fixed_on_physical_mesh
+database_face_geometry_pullback_selects_compact_model_boundary
+database_face_table_pullback_rebinds_only_fixed_database_leaf
+batched_database_stage_table_pullback_accepts_flattened_radau_rows
+recorded_ntx_database_bar_groups_share_one_batched_scan_pullback
+```
+
+Latest combined invocation result:
+
+```text
+5 passed, 282 deselected in 13.67s
+```
+
+### Next validation
+
+1. Run the 16-step / 4-segment black-box database reverse benchmark with
+   diagnostics enabled.
+2. Require finite segment geometry bars, specifically no nonfinite
+   `geometry.r_grid_half` leaf.
+3. Compare host-RAM peak to the previous approximately 16–17 GB run.
+4. If still high, profile the new model-only face VJP separately; do not
+   reintroduce a generic full-equation or full-face VJP.

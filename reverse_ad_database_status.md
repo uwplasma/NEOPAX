@@ -118,3 +118,77 @@ expected result is:
 - no raw payload-state-bar allocation / `RESOURCE_EXHAUSTED` error.
 
 Only after that passes should the 16-step / four-segment GPU benchmark be run.
+
+## 2026-09-09 update: compact native face-geometry boundary
+
+This section supersedes the older statement above that the database reverse
+has no local geometry contribution.  The correct fixed-table decomposition is
+now:
+
+```text
+database RHS bar
+  -> table bar                    -> accumulated -> one recorded scan VJP
+  -> direct centre-flux geometry  -> local VMEC/transport geometry bar
+  -> direct native face geometry  -> local VMEC/transport geometry bar
+  -> fixed-flux equation geometry -> local VMEC/transport geometry bar
+```
+
+Only the table bar reaches the recorded scan.  The three geometry terms are
+local and must never capture the scan owner.
+
+### Face geometry correction
+
+The first bounded implementation performed a `jax.vjp` through a newly built
+`ComposedEquationSystem` for each native density/temperature face.  It was
+finite after the axis-mesh correction but still used about 16–17 GB host RAM
+on a 30 GB machine because every local VJP retained equation/source assembly.
+
+The active replacement is
+`pullback_direct_face_flux_geometry_by_radius`:
+
+- routed through the database, runtime-scan, and combined flux models;
+- evaluates only the native fixed-table database face flux primitive;
+- excludes `ComposedEquationSystem`, sources, finite-volume equation
+  assembly, and the scan owner;
+- follows the same local, bounded scan-over-radius structure as the existing
+  direct-centre database geometry primitive;
+- is selected only by the database split support hook, never the Lij path.
+
+### Physical radial-mesh rule
+
+The database direct-flux primitive varies the physical VMEC mesh only through
+`a_b`:
+
+```text
+r_grid = rho_grid * a_b
+r_grid_half = rho_grid_half * a_b
+dr = r_grid_half[1] - r_grid_half[0]
+```
+
+`r_grid_half[0]` is the fixed magnetic axis and is not an independent
+tangent direction.  Leaving it free produced nonfinite
+`geometry.r_grid_half` bars by evaluating the radial database off its
+physical manifold.  This constraint applies to direct database fluxes
+(centre and faces), not the fixed-flux equation-assembly geometry VJP.
+
+### Latest validation
+
+```text
+database_face_geometry_pullback_keeps_table_fixed_on_physical_mesh       PASS
+database_face_geometry_pullback_selects_compact_model_boundary            PASS
+database_face_table_pullback_rebinds_only_fixed_database_leaf             PASS
+batched_database_stage_table_pullback_accepts_flattened_radau_rows        PASS
+recorded_ntx_database_bar_groups_share_one_batched_scan_pullback          PASS
+
+5 passed, 282 deselected in 13.67s
+```
+
+### Required next measurement
+
+Run the 16 accepted-step / 4-segment GPU diagnostic benchmark.  Require both:
+
+1. no nonfinite `geometry.r_grid_half` segment bar; and
+2. a host-RAM peak below the previous roughly 16–17 GB.
+
+The tests establish dispatch and boundary correctness; they do not yet claim
+a measured benchmark memory reduction.
