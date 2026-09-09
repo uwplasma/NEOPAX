@@ -526,10 +526,18 @@ def build_density_equation(
             bc_er=bc_er, reconstruction=reconstruction,
             density_floor=density_floor, temperature_floor=temperature_floor,
         )
-        face_state = build_face_transport_state(
-            state, field, bc_density=bc_density, bc_temperature=bc_temperature,
-            bc_er=bc_er, reconstruction=reconstruction,
-            density_floor=density_floor, temperature_floor=temperature_floor,
+        face_mode = str(particle_face_closure_mode).strip().lower()
+        face_state = (
+            build_ntss_like_face_transport_state(
+                state, field, bc_density=bc_density, bc_temperature=bc_temperature,
+                bc_er=bc_er, density_floor=density_floor, temperature_floor=temperature_floor,
+            )
+            if face_mode in {"ntss_like", "ntss", "half_point"}
+            else build_face_transport_state(
+                state, field, bc_density=bc_density, bc_temperature=bc_temperature,
+                bc_er=bc_er, reconstruction=reconstruction,
+                density_floor=density_floor, temperature_floor=temperature_floor,
+            )
         )
         pullback = getattr(flux_model, "pullback_direct_face_flux_geometry_by_radius", None)
         if not callable(pullback):

@@ -3455,9 +3455,16 @@ class NTXDatabaseTransportModel(TransportFluxModelBase):
                 model = dataclasses.replace(
                     self, geometry=geometry_value, database=database_value
                 )
-                local_face_state = build_face_transport_state(
-                    state, geometry_value,
-                    bc_density=bc_density, bc_temperature=bc_temperature,
+                local_face_state = (
+                    build_ntss_like_face_transport_state(
+                        state, geometry_value,
+                        bc_density=bc_density, bc_temperature=bc_temperature,
+                    )
+                    if str(face_mode).strip().lower() in {"ntss_like", "ntss", "half_point"}
+                    else build_face_transport_state(
+                        state, geometry_value,
+                        bc_density=bc_density, bc_temperature=bc_temperature,
+                    )
                 )
                 evaluated = build_evaluated_transport_state(
                     state, geometry_value,
