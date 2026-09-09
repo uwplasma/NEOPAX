@@ -2705,7 +2705,7 @@ def test_batched_database_stage_pullback_keeps_direct_geometry_outside_scan():
 
     physics_context = types.SimpleNamespace(
         reverse_database_include_direct_geometry=True,
-        flat_rhs_direct_support_pullback=_split_fixed_database_pullback,
+        flat_rhs_direct_database_split_support_pullback=_split_fixed_database_pullback,
     )
     rows = jnp.asarray([[1.0, -2.0], [0.5, 3.0]], dtype=dtype)
     # JAX flattens mapping keys in sorted order: database, then geometry.

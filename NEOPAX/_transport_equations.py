@@ -2316,6 +2316,44 @@ class ComposedEquationSystem:
         )
         return support_bar
 
+    def pullback_direct_rhs_database_split_support_payload(
+        self, t, state, runtime, rhs_bar, support
+    ):
+        """Database-only split RHS transpose for a Radau reverse stage.
+
+        This is deliberately not the historic generic direct-support hook.
+        The table leaf, which is ultimately owned by the one recorded scan
+        transpose, is produced by the compact table hook.  Local fixed-table
+        geometry is carried separately beside it.  The face-geometry helper
+        is replaced by the native bounded rule in the following step; keeping
+        the assembly explicit here makes that replacement local and prevents
+        any Lij dispatch change.
+        """
+        table_support_bar = self.pullback_direct_rhs_database_table_payload(
+            t, state, runtime, rhs_bar, support
+        )
+        flux_geometry_bar = self.pullback_direct_rhs_database_flux_geometry_payload(
+            t, state, runtime, rhs_bar, support
+        )
+        equation_geometry_bar = (
+            self.pullback_direct_rhs_database_equation_geometry_payload(
+                t, state, runtime, rhs_bar, support
+            )
+        )
+        if not all(
+            isinstance(value, dict) and "geometry" in value
+            for value in (table_support_bar, flux_geometry_bar, equation_geometry_bar)
+        ):
+            raise ValueError("Database split RHS transpose returned an invalid support bar.")
+        result = dict(_float_delta_tree_like(support))
+        result["database"] = table_support_bar["database"]
+        result["geometry"] = jax.tree_util.tree_map(
+            lambda flux_bar, equation_bar: flux_bar + equation_bar,
+            flux_geometry_bar["geometry"],
+            equation_geometry_bar["geometry"],
+        )
+        return result
+
     def pullback_direct_rhs_support_payload(self, t, state, runtime, rhs_bar, support):
         """Generic black-box RHS transpose with respect to realtime support.
 
@@ -2699,13 +2737,55 @@ class ComposedEquationSystem:
             raise ValueError("Database face-geometry pullback requires geometry and database support.")
         geometry = support["geometry"]
         geometry_delta0 = _float_delta_tree_like(geometry)
+        geometry_leaves, geometry_treedef = jax.tree_util.tree_flatten(geometry_delta0)
+        geometry_shapes = tuple(jnp.asarray(leaf).shape for leaf in geometry_leaves)
+        geometry_sizes = tuple(int(jnp.asarray(leaf).size) for leaf in geometry_leaves)
+        geometry_flat0 = jnp.concatenate(
+            tuple(jnp.ravel(jnp.asarray(leaf)) for leaf in geometry_leaves)
+        )
+
+        def _split_geometry(flat_delta):
+            leaves = []
+            offset = 0
+            for size, shape in zip(geometry_sizes, geometry_shapes, strict=True):
+                leaves.append(jnp.reshape(
+                    flat_delta[..., offset : offset + size],
+                    flat_delta.shape[:-1] + shape,
+                ))
+                offset += size
+            return geometry_treedef.unflatten(leaves)
 
         def _one_equation_face_bar(equation_name, face_bar):
             if not face_bar:
                 return _float_delta_tree_like(geometry)
 
-            def _face_fluxes_from_geometry_delta(geometry_delta):
-                geometry_value = _add_float_delta_tree(geometry, geometry_delta)
+            equations_at_primal = self.with_realtime_geometry_support_payload(support)
+            primal_equation = getattr(equations_at_primal, f"{equation_name}_equation")
+            if primal_equation is None or primal_equation.face_flux_builder is None:
+                raise ValueError(
+                    f"Database {equation_name} face-geometry pullback requires a face flux builder."
+                )
+            primal_face_fluxes = primal_equation.face_flux_builder(
+                working_state, center_fluxes=center_fluxes
+            )
+            first_face_value = next(iter(primal_face_fluxes.values()))
+            face_count = jnp.asarray(first_face_value).shape[-1]
+            face_indices = jnp.arange(face_count, dtype=jnp.int32)
+            first_face_bar = next(iter(face_bar.values()))
+            batched = (
+                jnp.asarray(first_face_bar).ndim
+                == jnp.asarray(first_face_value).ndim + 1
+            )
+
+            # This mirrors the direct-centre database geometry rule: form a
+            # local output for one radial location, transpose that local map,
+            # and accumulate through a bounded scan.  The former whole-face
+            # VJP retained the complete face closure for every objective row
+            # at once and is not permitted in a transport segment.
+            def _local_face_fluxes(flat_delta, face_index):
+                geometry_value = _add_float_delta_tree(
+                    geometry, _split_geometry(flat_delta)
+                )
                 payload = {
                     "geometry": geometry_value,
                     "database": database_with_geometry_scale(
@@ -2718,23 +2798,50 @@ class ComposedEquationSystem:
                     raise ValueError(
                         f"Database {equation_name} face-geometry pullback requires a face flux builder."
                     )
-                return equation.face_flux_builder(
+                all_faces = equation.face_flux_builder(
                     working_state, center_fluxes=center_fluxes
                 )
+                return jax.tree_util.tree_map(
+                    lambda value: jax.lax.dynamic_index_in_dim(
+                        value, face_index, axis=-1, keepdims=False
+                    ),
+                    all_faces,
+                )
 
-            face_output, pullback = jax.vjp(
-                _face_fluxes_from_geometry_delta, geometry_delta0
+            def _accumulate(flat_carry, face_index):
+                _, pullback = jax.vjp(
+                    lambda flat_delta: _local_face_fluxes(flat_delta, face_index),
+                    geometry_flat0,
+                )
+                local_bar = {
+                    name: jax.lax.dynamic_index_in_dim(
+                        face_bar.get(name, jnp.zeros_like(value)),
+                        face_index,
+                        axis=-1,
+                        keepdims=False,
+                    )
+                    for name, value in primal_face_fluxes.items()
+                }
+                if batched:
+                    local_flat_bar = jax.vmap(
+                        lambda one_bar: pullback(one_bar)[0]
+                    )(local_bar)
+                else:
+                    (local_flat_bar,) = pullback(local_bar)
+                return flat_carry + local_flat_bar, None
+
+            flat_carry0 = (
+                jnp.zeros(
+                    (jnp.asarray(first_face_bar).shape[0],) + geometry_flat0.shape,
+                    dtype=geometry_flat0.dtype,
+                )
+                if batched
+                else jnp.zeros_like(geometry_flat0)
             )
-            normalized_bar = {
-                name: face_bar.get(name, jnp.zeros_like(value))
-                for name, value in face_output.items()
-            }
-            example_output = next(iter(face_output.values()))
-            example_bar = next(iter(normalized_bar.values()))
-            batched = jnp.asarray(example_bar).ndim == jnp.asarray(example_output).ndim + 1
-            if batched:
-                return jax.vmap(lambda one_bar: pullback(one_bar)[0])(normalized_bar)
-            return pullback(normalized_bar)[0]
+            flat_geometry_bar, _ = jax.lax.scan(
+                _accumulate, flat_carry0, face_indices
+            )
+            return _split_geometry(flat_geometry_bar)
 
         density_geometry_bar = _one_equation_face_bar("density", density_faces_bar)
         temperature_geometry_bar = _one_equation_face_bar(
@@ -4039,6 +4146,21 @@ class ComposedEquationSystem:
         if self.shared_flux_model is None:
             raise ValueError("floating_ambipolar_edge_node requires a shared flux model.")
         return self.shared_flux_model.build_lagged_response(
+            working_state,
+            **self._shared_flux_call_kwargs({"er_edge_override": er_edge}),
+        )
+
+    def build_node_boundary_high_resolution_lagged_response(self, state, er_edge):
+        """Build an outer-node cache on NTX's prebuilt higher theta support."""
+        working_state, _ = self._prepare_working_state(state)
+        builder = getattr(
+            self.shared_flux_model, "build_high_resolution_lagged_response", None
+        )
+        if not callable(builder):
+            raise ValueError(
+                "The active flux model does not provide a high-resolution lagged cache."
+            )
+        return builder(
             working_state,
             **self._shared_flux_call_kwargs({"er_edge_override": er_edge}),
         )

@@ -4847,6 +4847,10 @@ class _RadauAcceptedStepPhysicsContext:
     # Database-only fixed-table transpose used by the scan-runtime lane.
     flat_rhs_direct_database_table_pullback: Callable[[Any, Any, Any, Any], Any] | None = None
     flat_rhs_direct_database_table_pullback_batched: Callable[[Any, Any, Any, Any], Any] | None = None
+    # Database-only split support hook.  Unlike the historic generic direct
+    # hook, this owns the compact table and local-geometry pieces explicitly.
+    # It is intentionally separate so selecting it cannot affect Lij.
+    flat_rhs_direct_database_split_support_pullback: Callable[[Any, Any, Any, Any], Any] | None = None
     flat_rhs_lagged_response_all_pullback: Callable[[Any, Any, Any, Any, Any], tuple[Any, Any, Any]] | None = None
     flat_rhs_state_and_lagged_response_pullback: Callable[[Any, Any, Any, Any], tuple[Any, Any]] | None = None
     flat_rhs_state_pullback: Callable[[Any, Any, Any, Any], Any] | None = None
@@ -4917,6 +4921,12 @@ class _RadauAcceptedStepPhysicsContext:
     # direction.  Generic AD through ``er_edge_override`` is deliberately
     # not used for this coordinate.
     node_edge_ambipolar_rhs_tangent: Callable[[Any, Any, Any], Any] | None = None
+    # Optional exact-NTX resolution retry.  It is populated only by the
+    # floating-node adapter when the active realtime model prebuilt a higher
+    # theta support.  The cache is rebuilt at the accepted state, never at a
+    # failed Radau stage.
+    build_node_high_resolution_lagged_response_from_flat: Callable[[Any], Any] | None = None
+    node_edge_stage_slope_retry_threshold: Any = jnp.inf
 
 
 @contextlib.contextmanager
@@ -11193,7 +11203,11 @@ def _radau_exact_stage_residual_database_table_support_pullback_batched(
         getattr(physics_context, "reverse_database_include_direct_geometry", False)
     )
     scalar_direct_pullback = (
-        getattr(physics_context, "flat_rhs_direct_support_pullback", None)
+        getattr(
+            physics_context,
+            "flat_rhs_direct_database_split_support_pullback",
+            None,
+        )
         if include_direct_geometry
         else getattr(physics_context, "flat_rhs_direct_database_table_pullback", None)
     )
@@ -11204,8 +11218,8 @@ def _radau_exact_stage_residual_database_table_support_pullback_batched(
     )
     if scalar_direct_pullback is None and batched_direct_pullback is None:
         raise ValueError(
-            "Database segmented reverse requires a scalar or batched fixed-table "
-            "RHS pullback boundary."
+            "Database segmented reverse requires its explicit split-support "
+            "or fixed-table RHS pullback boundary."
         )
     residual_bars = jnp.asarray(residual_bars, dtype=kernel_context.dtype)
     if residual_bars.ndim == 2:
@@ -16735,6 +16749,80 @@ def _radau_after_first_refresh_candidate(
     )
 
 
+def _radau_maybe_promote_node_edge_resolution(
+    kernel_context: _RadauAcceptedStepKernelContext,
+    physics_context: _RadauAcceptedStepPhysicsContext,
+    inputs: _RadauStageSubsolveInputs,
+    *,
+    factor_linear_systems: Callable[[Any], tuple[Any, Any, Any, Any]],
+):
+    """Restart an attempt on high theta support when its first stage is steep.
+
+    The guard sees the same predicted stage vector that the first Newton
+    residual would see.  A promotion therefore occurs before any Newton
+    update is retained.  Crucially, the high-resolution response is anchored
+    at ``inputs.flat_y`` (the accepted state), not at that predicted stage.
+    """
+    high_builder = physics_context.build_node_high_resolution_lagged_response_from_flat
+    tangent = physics_context.node_edge_ambipolar_rhs_tangent
+    enabled = high_builder is not None and tangent is not None
+    if not enabled:
+        return inputs, jnp.asarray(False), jnp.asarray(0.0, dtype=kernel_context.dtype)
+
+    stages = inputs.z0.reshape((kernel_context.num_stages, kernel_context.state_dim))
+    stage_states = inputs.flat_y[None, :] + inputs.h_value * (kernel_context.a @ stages)
+    edge_direction = jnp.asarray(1.0, dtype=kernel_context.dtype)
+    stage_slopes = jax.vmap(
+        lambda stage_state: tangent(stage_state, edge_direction, inputs.lagged_response)
+    )(stage_states)
+    anchor_slope = inputs.jacobian_ref[-1, -1]
+    relative_slope_change = jnp.max(jnp.abs(stage_slopes - anchor_slope)) / jnp.maximum(
+        jnp.abs(anchor_slope), jnp.asarray(1.0, dtype=kernel_context.dtype)
+    )
+    promote = relative_slope_change > jnp.asarray(
+        physics_context.node_edge_stage_slope_retry_threshold,
+        dtype=kernel_context.dtype,
+    )
+
+    def _promote(_):
+        high_response = high_builder(inputs.flat_y)
+
+        def _high_rhs(t_value, flat_y):
+            return _radau_eval_rhs(
+                t_value,
+                flat_y,
+                high_response,
+                physics_context.flat_rhs,
+                physics_context.flat_rhs_with_lagged_response,
+            )
+
+        high_f0 = _high_rhs(inputs.t_value, inputs.flat_y)
+        high_jacobian = jax.jacfwd(lambda y: _high_rhs(inputs.t_value, y))(inputs.flat_y)
+        high_lu = factor_linear_systems(high_jacobian)
+        return dataclasses.replace(
+            inputs,
+            f0=high_f0,
+            jacobian_ref=high_jacobian,
+            lagged_response=high_response,
+            real_lu_out=high_lu[0],
+            real_piv_out=high_lu[1],
+            complex_lu_out=high_lu[2],
+            complex_piv_out=high_lu[3],
+        )
+
+    promoted_inputs = jax.lax.cond(promote, _promote, lambda _: inputs, operand=None)
+    if kernel_context.debug_newton_trace:
+        jax.debug.print(
+            "[radau-node-edge-resolution-retry] promoted={promoted} "
+            "relative_slope_change={relative:.6e} threshold={threshold:.6e}",
+            promoted=promote,
+            relative=relative_slope_change,
+            threshold=physics_context.node_edge_stage_slope_retry_threshold,
+            ordered=True,
+        )
+    return promoted_inputs, promote, relative_slope_change
+
+
 def _radau_retry_failed_subsolve_with_exact_cached_jacobian(
     kernel_context: _RadauAcceptedStepKernelContext,
     physics_context: _RadauAcceptedStepPhysicsContext,
@@ -17170,6 +17258,20 @@ def _radau_single_step_primal(
         complex_lu_out=complex_lu_out,
         complex_piv_out=complex_piv_out,
     )
+    subsolve_inputs, _node_resolution_promoted, _node_relative_slope_change = (
+        _radau_maybe_promote_node_edge_resolution(
+            kernel_context,
+            physics_context,
+            subsolve_inputs,
+            factor_linear_systems=_factor_linear_systems,
+        )
+    )
+    lagged_response = subsolve_inputs.lagged_response
+    jacobian_ref = subsolve_inputs.jacobian_ref
+    real_lu_out = subsolve_inputs.real_lu_out
+    real_piv_out = subsolve_inputs.real_piv_out
+    complex_lu_out = subsolve_inputs.complex_lu_out
+    complex_piv_out = subsolve_inputs.complex_piv_out
     if kernel_context.lagged_jacobian_refresh_mode in {
         "endpoint_after_first", "stage_drift_after_first", "quadratic_colored_after_first"
     }:
@@ -17886,6 +17988,20 @@ def _radau_single_step_primal_reverse_minimal(
         complex_lu_out=complex_lu_out,
         complex_piv_out=complex_piv_out,
     )
+    subsolve_inputs, _node_resolution_promoted, _node_relative_slope_change = (
+        _radau_maybe_promote_node_edge_resolution(
+            kernel_context,
+            physics_context,
+            subsolve_inputs,
+            factor_linear_systems=_factor_linear_systems,
+        )
+    )
+    lagged_response = subsolve_inputs.lagged_response
+    jacobian_ref = subsolve_inputs.jacobian_ref
+    real_lu_out = subsolve_inputs.real_lu_out
+    real_piv_out = subsolve_inputs.real_piv_out
+    complex_lu_out = subsolve_inputs.complex_lu_out
+    complex_piv_out = subsolve_inputs.complex_piv_out
     if kernel_context.lagged_jacobian_refresh_mode in {
         "endpoint_after_first", "stage_drift_after_first", "quadratic_colored_after_first"
     }:
@@ -22713,6 +22829,16 @@ def _build_prepared_radau_accepted_rollout(
             project_flat=project_flat,
         )
     )
+    flat_rhs_direct_database_split_support_pullback = (
+        _flat_rhs_direct_database_payload_pullback_factory(
+            unravel=unpack_flat,
+            vector_field=vector_field,
+            args=args,
+            kwargs=kwargs,
+            hook_name="pullback_direct_rhs_database_split_support_payload",
+            project_flat=project_flat,
+        )
+    )
     flat_rhs_lagged_response_all_pullback = _flat_rhs_lagged_response_all_pullback_factory(
         unravel=unpack_flat,
         pack_flat=pack_state,
@@ -22909,6 +23035,8 @@ def _build_prepared_radau_accepted_rollout(
     build_lagged_response_from_flat = None
     node_edge_ambipolar_rhs = None
     node_edge_ambipolar_rhs_tangent = None
+    build_node_high_resolution_lagged_response_from_flat = None
+    node_edge_stage_slope_retry_threshold = jnp.asarray(jnp.inf, dtype=dtype)
     if use_node_boundary:
         if owner is None or not callable(
             getattr(owner, "build_node_boundary_lagged_response", None)
@@ -22946,6 +23074,34 @@ def _build_prepared_radau_accepted_rollout(
                     _node_unpack_flat(projected), edge
                 ),
                 er_edge_anchor=edge,
+            )
+
+        flux_model = owner.shared_flux_model
+        resolution_model = getattr(flux_model, "neoclassical_model", flux_model)
+        slope_fallback_enabled = callable(
+            getattr(resolution_model, "_ambipolar_slope_fallback_enabled", None)
+        ) and resolution_model._ambipolar_slope_fallback_enabled()
+        if slope_fallback_enabled and callable(
+            getattr(owner, "build_node_boundary_high_resolution_lagged_response", None)
+        ):
+            def _node_build_high_resolution_from_flat(flat_y):
+                projected = _node_project_flat(flat_y)
+                edge = projected[-1]
+                return _RadauNodeBoundaryLaggedCache(
+                    transport_response=(
+                        owner.build_node_boundary_high_resolution_lagged_response(
+                            _node_unpack_flat(projected), edge
+                        )
+                    ),
+                    er_edge_anchor=edge,
+                )
+
+            build_node_high_resolution_lagged_response_from_flat = (
+                _node_build_high_resolution_from_flat
+            )
+            node_edge_stage_slope_retry_threshold = jnp.asarray(
+                getattr(resolution_model, "ambipolar_slope_fallback_relative_threshold", 1.0),
+                dtype=dtype,
             )
 
         def _node_lagged_rhs(t_value, flat_y, cache):
@@ -23295,6 +23451,10 @@ def _build_prepared_radau_accepted_rollout(
             _node_edge_runtime_inputs if use_node_boundary else None
         ),
         node_edge_ambipolar_rhs_tangent=node_edge_ambipolar_rhs_tangent,
+        build_node_high_resolution_lagged_response_from_flat=(
+            build_node_high_resolution_lagged_response_from_flat
+        ),
+        node_edge_stage_slope_retry_threshold=node_edge_stage_slope_retry_threshold,
         debug_er_components_with_lagged_response=debug_er_components_with_lagged_response,
         flat_rhs_with_lagged_response_tangent=flat_rhs_with_lagged_response_tangent,
         flat_rhs_lagged_response_pullback=flat_rhs_lagged_response_pullback,
@@ -23355,6 +23515,9 @@ def _build_prepared_radau_accepted_rollout(
         flat_rhs_direct_database_table_pullback=flat_rhs_direct_database_table_pullback,
         flat_rhs_direct_database_table_pullback_batched=(
             flat_rhs_direct_database_table_pullback_batched
+        ),
+        flat_rhs_direct_database_split_support_pullback=(
+            flat_rhs_direct_database_split_support_pullback
         ),
         flat_rhs_lagged_response_all_pullback=flat_rhs_lagged_response_all_pullback,
         flat_rhs_state_and_lagged_response_pullback=flat_rhs_state_and_lagged_response_pullback,
@@ -23882,6 +24045,8 @@ class RADAUSolver(_RadauSolverConfig):
         build_lagged_response_from_flat = None
         node_edge_ambipolar_rhs = None
         node_edge_ambipolar_rhs_tangent = None
+        build_node_high_resolution_lagged_response_from_flat = None
+        node_edge_stage_slope_retry_threshold = jnp.asarray(jnp.inf, dtype=dtype)
         if use_node_boundary:
             if owner is None or not callable(
                 getattr(owner, "build_node_boundary_lagged_response", None)
@@ -23919,6 +24084,34 @@ class RADAUSolver(_RadauSolverConfig):
                         _node_unpack_flat(projected), edge
                     ),
                     er_edge_anchor=edge,
+                )
+
+            flux_model = owner.shared_flux_model
+            resolution_model = getattr(flux_model, "neoclassical_model", flux_model)
+            slope_fallback_enabled = callable(
+                getattr(resolution_model, "_ambipolar_slope_fallback_enabled", None)
+            ) and resolution_model._ambipolar_slope_fallback_enabled()
+            if slope_fallback_enabled and callable(
+                getattr(owner, "build_node_boundary_high_resolution_lagged_response", None)
+            ):
+                def _node_build_high_resolution_from_flat(flat_y):
+                    projected = _node_project_flat(flat_y)
+                    edge = projected[-1]
+                    return _RadauNodeBoundaryLaggedCache(
+                        transport_response=(
+                            owner.build_node_boundary_high_resolution_lagged_response(
+                                _node_unpack_flat(projected), edge
+                            )
+                        ),
+                        er_edge_anchor=edge,
+                    )
+
+                build_node_high_resolution_lagged_response_from_flat = (
+                    _node_build_high_resolution_from_flat
+                )
+                node_edge_stage_slope_retry_threshold = jnp.asarray(
+                    getattr(resolution_model, "ambipolar_slope_fallback_relative_threshold", 1.0),
+                    dtype=dtype,
                 )
 
             def _node_lagged_rhs(t_value, flat_y, cache):
@@ -24280,6 +24473,10 @@ class RADAUSolver(_RadauSolverConfig):
                 _node_edge_runtime_inputs if use_node_boundary else None
             ),
             node_edge_ambipolar_rhs_tangent=node_edge_ambipolar_rhs_tangent,
+            build_node_high_resolution_lagged_response_from_flat=(
+                build_node_high_resolution_lagged_response_from_flat
+            ),
+            node_edge_stage_slope_retry_threshold=node_edge_stage_slope_retry_threshold,
             debug_er_components_with_lagged_response=debug_er_components_with_lagged_response,
             flat_rhs_with_lagged_response_tangent=flat_rhs_with_lagged_response_tangent,
             flat_rhs_lagged_response_pullback=flat_rhs_lagged_response_pullback,

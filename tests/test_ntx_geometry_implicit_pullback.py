@@ -386,6 +386,18 @@ def test_database_face_geometry_pullback_keeps_table_fixed_with_full_lij_tangent
     assert jnp.array_equal(actual.r_grid_half, jnp.asarray([2.0, 3.0, 4.0]))
     assert jnp.all(jnp.isfinite(actual.r_grid_half))
 
+    batched = equations._pullback_database_primal_face_geometry_bars(
+        "state",
+        {"Gamma": jnp.asarray(5.0)},
+        {"geometry": geometry, "database": jnp.asarray(7.0)},
+        {"Gamma": jnp.asarray([[2.0, 3.0, 4.0], [-1.0, 0.5, 2.0]])},
+        {},
+    )
+    assert jnp.array_equal(
+        batched.r_grid_half,
+        jnp.asarray([[2.0, 3.0, 4.0], [-1.0, 0.5, 2.0]]),
+    )
+
 
 def test_database_equation_payload_uses_full_geometry_tangent_like_lij():
     """Fixed-flux equation assembly keeps the established Lij tangent space."""
@@ -2414,6 +2426,41 @@ def test_database_compact_flux_geometry_vjp_keeps_axis_face_constrained():
 
     assert jnp.all(jnp.isfinite(actual.r_grid_half))
     assert jnp.allclose(actual.r_grid_half, jnp.asarray([0.0, 8.0, 0.0]))
+
+
+def test_database_split_support_payload_uses_explicit_database_boundaries():
+    """The database Radau hook cannot dispatch through the generic support VJP."""
+    equations = object.__new__(ComposedEquationSystem)
+    calls = []
+    support = {"geometry": {"x": jnp.asarray(0.0)}, "database": jnp.asarray(0.0)}
+
+    def _table(*_args):
+        calls.append("table")
+        return {"geometry": {"x": jnp.asarray(0.0)}, "database": jnp.asarray(7.0)}
+
+    def _flux_geometry(*_args):
+        calls.append("flux_geometry")
+        return {"geometry": {"x": jnp.asarray(2.0)}, "database": jnp.asarray(0.0)}
+
+    def _equation_geometry(*_args):
+        calls.append("equation_geometry")
+        return {"geometry": {"x": jnp.asarray(3.0)}, "database": jnp.asarray(0.0)}
+
+    object.__setattr__(equations, "pullback_direct_rhs_database_table_payload", _table)
+    object.__setattr__(
+        equations, "pullback_direct_rhs_database_flux_geometry_payload", _flux_geometry
+    )
+    object.__setattr__(
+        equations,
+        "pullback_direct_rhs_database_equation_geometry_payload",
+        _equation_geometry,
+    )
+    actual = equations.pullback_direct_rhs_database_split_support_payload(
+        0.0, "state", None, jnp.asarray(1.0), support
+    )
+    assert calls == ["table", "flux_geometry", "equation_geometry"]
+    assert jnp.allclose(actual["database"], 7.0)
+    assert jnp.allclose(actual["geometry"]["x"], 5.0)
 
 
 def test_database_fixed_payload_split_geometry_matches_generic_vjp():

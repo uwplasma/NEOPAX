@@ -1979,6 +1979,25 @@ class CombinedTransportFluxModel(TransportFluxModelBase):
             classical_response=self.classical_model.build_lagged_response(state, **kwargs),
         )
 
+    def build_high_resolution_lagged_response(self, state, **kwargs):
+        """Rebuild only the NTX constituent on its prebuilt high-theta support."""
+        high_builder = getattr(
+            self.neoclassical_model, "build_high_resolution_lagged_response", None
+        )
+        if not callable(high_builder):
+            raise NotImplementedError(
+                "The neoclassical constituent has no high-resolution lagged cache."
+            )
+        er_edge_override = kwargs.pop("er_edge_override", None)
+        neo_kwargs = dict(kwargs)
+        if er_edge_override is not None:
+            neo_kwargs["er_edge_override"] = er_edge_override
+        return CombinedTransportLaggedResponse(
+            neoclassical_response=high_builder(state, **neo_kwargs),
+            turbulent_response=self.turbulent_model.build_lagged_response(state, **kwargs),
+            classical_response=self.classical_model.build_lagged_response(state, **kwargs),
+        )
+
     def build_lagged_response_with_compact_coefficient_record(self, state, **kwargs):
         """Opt-in companion that preserves the ordinary combined response."""
 
@@ -6388,6 +6407,26 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         if not isinstance(response, NTXQuadraticPreparedCoefficientResponse):
             raise AssertionError("The slope fallback requires a quadratic coefficient response.")
         return response
+
+    def build_high_resolution_lagged_response(self, state: TransportState, **kwargs):
+        """Build the same lagged response on the prebuilt higher ``n_theta`` support.
+
+        This is intentionally an all-radius cache.  Radau's stage guard uses
+        it only after a rejected first-stage probe, while retaining the
+        accepted transport state as the Taylor anchor.  It must therefore not
+        manufacture an anchor from the failed stage state.
+        """
+        fallback_support = self.ambipolar_slope_fallback_support
+        if fallback_support is None:
+            raise RuntimeError(
+                "The high-resolution lagged-response support was not prebuilt."
+            )
+        fallback_model = dataclasses.replace(
+            self,
+            support=fallback_support,
+            ambipolar_slope_fallback_mode="off",
+        )
+        return fallback_model.build_lagged_response(state, **kwargs)
 
     def with_face_response_mode(self, face_response_mode: str) -> "NTXExactLijRuntimeTransportModel":
         return dataclasses.replace(self, face_response_mode=str(face_response_mode))
