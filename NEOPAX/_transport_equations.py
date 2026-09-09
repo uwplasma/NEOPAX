@@ -2119,6 +2119,9 @@ class ComposedEquationSystem:
             raise ValueError("Database equation-geometry pullback requires a shared flux model.")
         working_state, eidx = self._prepare_working_state(state)
         shared_fluxes = active_shared_flux_model(working_state)
+        fixed_flux_payloads = self._capture_database_primal_fixed_flux_payloads(
+            working_state, shared_fluxes
+        )
         geometry = support["geometry"]
         geometry_delta0 = _float_delta_tree_like(geometry)
 
@@ -2136,11 +2139,11 @@ class ComposedEquationSystem:
                 geometry_value,
                 active_shared_flux_model,
             )
-            return equations_at_geometry._evaluate_with_shared_fluxes_from_working_state(
+            return equations_at_geometry._evaluate_database_fixed_fluxes_from_working_state(
                 working_state,
                 eidx,
                 state,
-                shared_fluxes,
+                fixed_flux_payloads,
             )
 
         _, geometry_pullback = jax.vjp(
@@ -2372,6 +2375,94 @@ class ComposedEquationSystem:
             "density_faces": density_faces,
             "temperature_faces": temperature_faces,
         }
+
+    def _evaluate_database_fixed_fluxes_from_working_state(
+        self, working_state, eidx, state_reference, fixed_flux_payloads, *, er_edge_override=None
+    ):
+        """Evaluate database equations with captured centre-and-face values.
+
+        Unlike the general shared-flux evaluator, this database-only method
+        gives density and temperature their separately captured primal face
+        payloads.  Therefore a geometry VJP through finite-volume assembly
+        cannot call ``evaluate_face_fluxes`` again at perturbed geometry.
+        """
+        from ._state import TransportState
+
+        density_eq, temperature_eq, er_eq = self._resolve_equations()
+        density_fluxes = fixed_flux_payloads["density"]
+        temperature_fluxes = fixed_flux_payloads["temperature"]
+        center_fluxes = fixed_flux_payloads["center"]
+        density_rhs = (
+            density_eq(working_state, fluxes=density_fluxes)
+            if density_eq is not None
+            else jnp.zeros_like(state_reference.density)
+        )
+        pressure_rhs = (
+            temperature_eq(working_state, fluxes=temperature_fluxes)
+            if temperature_eq is not None
+            else jnp.zeros_like(state_reference.pressure)
+        )
+        Er_rhs = (
+            er_eq(working_state, fluxes=center_fluxes, er_edge_override=er_edge_override)
+            if er_eq is not None
+            else jnp.zeros_like(state_reference.Er)
+        )
+        density_rhs = _expand_density_rhs_to_full_shape(
+            density_rhs, state_reference.density, self.species
+        )
+        if eidx is not None:
+            density_rhs = density_rhs.at[int(eidx), :].set(
+                jnp.zeros_like(density_rhs[int(eidx), :])
+            )
+        if density_eq is not None and hasattr(density_eq, "enforce_dirichlet_boundary_rhs"):
+            density_rhs = density_eq.enforce_dirichlet_boundary_rhs(working_state, density_rhs)
+        if temperature_eq is not None and hasattr(temperature_eq, "enforce_dirichlet_boundary_rhs"):
+            pressure_rhs = temperature_eq.enforce_dirichlet_boundary_rhs(
+                working_state, density_rhs, pressure_rhs
+            )
+        if er_eq is not None and hasattr(er_eq, "enforce_dirichlet_boundary_rhs"):
+            Er_rhs = er_eq.enforce_dirichlet_boundary_rhs(working_state, Er_rhs)
+        return TransportState(density=density_rhs, pressure=pressure_rhs, Er=Er_rhs)
+
+    def _pullback_database_fixed_flux_payloads(
+        self, working_state, eidx, state_reference, rhs_bar, fixed_flux_payloads
+    ):
+        """Split RHS cotangents into centre, density-face, and temperature-face bars.
+
+        This remains entirely below the recorded-scan boundary.  In
+        particular, it does not call a scan transpose or reconstruct a face
+        flux.  The two raw face bars are intentionally retained separately:
+        they correspond to two forward equation closures and must both be
+        folded into the database table bar in the next boundary step.
+        """
+        center0 = fixed_flux_payloads["center"]
+        density_faces0 = fixed_flux_payloads["density_faces"]
+        temperature_faces0 = fixed_flux_payloads["temperature_faces"]
+        density_has_faces = density_faces0 is not None
+        temperature_has_faces = temperature_faces0 is not None
+        density_input0 = {} if density_faces0 is None else density_faces0
+        temperature_input0 = {} if temperature_faces0 is None else temperature_faces0
+
+        def _rhs_from_flux_values(center_fluxes, density_faces, temperature_faces):
+            payloads = {
+                "center": center_fluxes,
+                "density": (
+                    _database_fixed_flux_payload_with_faces(center_fluxes, density_faces)
+                    if density_has_faces else dict(center_fluxes)
+                ),
+                "temperature": (
+                    _database_fixed_flux_payload_with_faces(center_fluxes, temperature_faces)
+                    if temperature_has_faces else dict(center_fluxes)
+                ),
+            }
+            return self._evaluate_database_fixed_fluxes_from_working_state(
+                working_state, eidx, state_reference, payloads
+            )
+
+        _, pullback = jax.vjp(
+            _rhs_from_flux_values, center0, density_input0, temperature_input0
+        )
+        return pullback(rhs_bar)
 
     def _shared_flux_bc_kwargs(self):
         density_eq, temperature_eq, er_eq = self._resolve_equations()

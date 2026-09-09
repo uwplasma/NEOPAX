@@ -5936,6 +5936,10 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
     density_floor: Any = DEFAULT_TRANSPORT_DENSITY_FLOOR
     temperature_floor: Any = DEFAULT_TRANSPORT_TEMPERATURE_FLOOR
     support: NTXExactLijRuntimeSupport | None = None
+    # Prebuilt only when the opt-in slope fallback is enabled.  It must be a
+    # separate support payload because ``GridSpec.n_theta`` is static inside
+    # NTX/JAX and may never be constructed from a traced Radau branch.
+    ambipolar_slope_fallback_support: NTXExactLijRuntimeSupport | None = None
     # Shared with the database/scan response models.  Order two is wired as
     # an explicit forward-only feature gate while the dedicated factorized NTX
     # Hessian primitive is implemented below; order one remains the exact
@@ -6056,9 +6060,38 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         )
 
     def with_static_support(self) -> "NTXExactLijRuntimeTransportModel":
-        if self.support is not None:
+        fallback_enabled = self._ambipolar_slope_fallback_enabled()
+        if self.support is not None and (
+            not fallback_enabled or self.ambipolar_slope_fallback_support is not None
+        ):
             return self
-        return dataclasses.replace(self, support=self._static_support())
+        support = self._static_support()
+        if not fallback_enabled:
+            return dataclasses.replace(self, support=support)
+        if self.vmec_file is None or self.boozer_file is None:
+            raise ValueError(
+                "The ambipolar slope fallback needs vmec_file and boozer_file "
+                "to prebuild its n_theta+increment support."
+            )
+        rho_center, rho_face = self._rho_center_face()
+        fallback_support = build_ntx_exact_lij_runtime_support(
+            self.vmec_file,
+            self.boozer_file,
+            rho_center,
+            rho_face,
+            surface_backend=self.surface_backend,
+            n_theta=(
+                int(self.n_theta)
+                + int(self.ambipolar_slope_fallback_n_theta_increment)
+            ),
+            n_zeta=int(self.n_zeta),
+            n_xi=int(self.n_xi),
+        )
+        return dataclasses.replace(
+            self,
+            support=support,
+            ambipolar_slope_fallback_support=fallback_support,
+        )
 
     def with_support_payload(
         self,
@@ -6071,7 +6104,15 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         arrays produced by the VMEC/NTX geometry path.
         """
 
-        return dataclasses.replace(self, support=support)
+        # A high-resolution support prepared for a previous geometry cannot
+        # safely be reused after the geometry payload changes.  The realtime
+        # geometry route must supply a matching pair explicitly before this
+        # opt-in fallback is enabled there.
+        return dataclasses.replace(
+            self,
+            support=support,
+            ambipolar_slope_fallback_support=None,
+        )
 
     def pullback_direct_rhs_support_payload(self, state, flux_bar, support):
         """Black-box exact-Lij support transpose via the established lowdot rule."""
@@ -6087,6 +6128,7 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             n_zeta=self.n_zeta if n_zeta is None else int(n_zeta),
             n_xi=self.n_xi if n_xi is None else int(n_xi),
             support=None,
+            ambipolar_slope_fallback_support=None,
         )
 
     def _ambipolar_slope_fallback_enabled(self) -> bool:
@@ -6188,13 +6230,20 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         complete axis once and keeps only flagged radii.  It never changes the
         transport-state or lagged-response pytree shape.
         """
+        fallback_support = self.ambipolar_slope_fallback_support
+        if fallback_support is None:
+            raise RuntimeError(
+                "The ambipolar slope fallback support was not prebuilt. "
+                "Construct this model with preload_support=True before entering "
+                "a traced transport solve."
+            )
+        # Keep the higher-resolution support static; the response algebra below
+        # is the only code that may run inside ``lax.cond``.
         fallback_model = dataclasses.replace(
             self,
-            n_theta=int(self.n_theta) + int(self.ambipolar_slope_fallback_n_theta_increment),
-            support=None,
+            support=fallback_support,
             ambipolar_slope_fallback_mode="off",
         )
-        fallback_support = fallback_model._static_support()
         if axis == "center":
             response = fallback_model._build_axis_lagged_response(
                 channels=fallback_support.center_channels,

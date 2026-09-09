@@ -225,6 +225,91 @@ def test_database_primal_fixed_flux_capture_keeps_density_and_temperature_faces_
     assert captured["density_faces"] is not captured["temperature_faces"]
 
 
+def test_database_fixed_equation_evaluation_uses_captured_faces_without_builder():
+    """The equation-only database evaluation cannot reconstruct face fluxes."""
+    equations = object.__new__(ComposedEquationSystem)
+    seen = []
+
+    class _Density:
+        @staticmethod
+        def __call__(state, *, fluxes):
+            seen.append(("density", fluxes))
+            return fluxes["Gamma_faces"][None, :2]
+
+    class _Temperature:
+        @staticmethod
+        def __call__(state, *, fluxes):
+            seen.append(("temperature", fluxes))
+            return fluxes["Q_faces"][None, :2]
+
+    object.__setattr__(equations, "density_equation", _Density())
+    object.__setattr__(equations, "temperature_equation", _Temperature())
+    object.__setattr__(equations, "er_equation", None)
+    object.__setattr__(equations, "equations", ())
+    object.__setattr__(equations, "species", None)
+    state = TransportState(
+        density=jnp.zeros((1, 2)), pressure=jnp.zeros((1, 2)), Er=jnp.zeros((2,))
+    )
+    payloads = {
+        "center": {"Gamma": jnp.zeros((1, 2))},
+        "density": {"Gamma_faces": jnp.asarray([4.0, 5.0, 6.0])},
+        "temperature": {"Q_faces": jnp.asarray([7.0, 8.0, 9.0])},
+    }
+
+    actual = equations._evaluate_database_fixed_fluxes_from_working_state(
+        state, None, state, payloads
+    )
+
+    assert [name for name, _ in seen] == ["density", "temperature"]
+    assert jnp.array_equal(actual.density, jnp.asarray([[4.0, 5.0]]))
+    assert jnp.array_equal(actual.pressure, jnp.asarray([[7.0, 8.0]]))
+
+
+def test_database_fixed_equation_pullback_retains_separate_face_bars():
+    """Each database forward face closure receives its own RHS cotangent."""
+    equations = object.__new__(ComposedEquationSystem)
+
+    class _Density:
+        @staticmethod
+        def __call__(state, *, fluxes):
+            return fluxes["Gamma_faces"][None, :2]
+
+    class _Temperature:
+        @staticmethod
+        def __call__(state, *, fluxes):
+            return fluxes["Q_faces"][None, :2]
+
+    object.__setattr__(equations, "density_equation", _Density())
+    object.__setattr__(equations, "temperature_equation", _Temperature())
+    object.__setattr__(equations, "er_equation", None)
+    object.__setattr__(equations, "equations", ())
+    object.__setattr__(equations, "species", None)
+    state = TransportState(
+        density=jnp.zeros((1, 2)), pressure=jnp.zeros((1, 2)), Er=jnp.zeros((2,))
+    )
+    payloads = {
+        "center": {"Gamma": jnp.zeros((1, 2))},
+        "density": {"Gamma_faces": jnp.asarray([4.0, 5.0, 6.0])},
+        "temperature": {"Q_faces": jnp.asarray([7.0, 8.0, 9.0])},
+        "density_faces": {"Gamma": jnp.asarray([4.0, 5.0, 6.0])},
+        "temperature_faces": {"Q": jnp.asarray([7.0, 8.0, 9.0])},
+    }
+    rhs_bar = TransportState(
+        density=jnp.asarray([[2.0, 3.0]]),
+        pressure=jnp.asarray([[5.0, 7.0]]),
+        Er=jnp.zeros((2,)),
+    )
+
+    _center_bar, density_faces_bar, temperature_faces_bar = (
+        equations._pullback_database_fixed_flux_payloads(
+            state, None, state, rhs_bar, payloads
+        )
+    )
+
+    assert jnp.array_equal(density_faces_bar["Gamma"], jnp.asarray([2.0, 3.0, 0.0]))
+    assert jnp.array_equal(temperature_faces_bar["Q"], jnp.asarray([5.0, 7.0, 0.0]))
+
+
 def test_database_equation_payload_uses_full_geometry_tangent_like_lij():
     """Fixed-flux equation assembly keeps the established Lij tangent space."""
     geometry = _PhysicalMeshGeometry(
