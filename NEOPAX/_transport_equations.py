@@ -2110,17 +2110,27 @@ class ComposedEquationSystem:
         (geometry_bar,) = geometry_pullback(rhs_bar)
         if _database_geometry_vjp_debug_enabled() and hasattr(geometry_bar, "a_b"):
             a_b_bar = jnp.asarray(geometry_bar.a_b)
+            face_bar = (
+                jnp.asarray(geometry_bar.r_grid_half)
+                if hasattr(geometry_bar, "r_grid_half")
+                else jnp.zeros((1,), dtype=a_b_bar.dtype)
+            )
+            face_nonfinite = jnp.logical_not(jnp.isfinite(face_bar))
+            a_b_nonfinite = jnp.logical_not(jnp.isfinite(a_b_bar))
 
             def _print_bad_a_b(_):
                 jax.debug.print(
-                    "[database-geometry-vjp] source=equation a_b_bar "
-                    "nonfinite_count={count}",
-                    count=jnp.sum(jnp.logical_not(jnp.isfinite(a_b_bar))),
+                    "[database-geometry-vjp] source=equation "
+                    "a_b_nonfinite={a_b_count} r_grid_half_nonfinite={face_count} "
+                    "first_r_grid_half_index={face_index}",
+                    a_b_count=jnp.sum(a_b_nonfinite),
+                    face_count=jnp.sum(face_nonfinite),
+                    face_index=jnp.argmax(face_nonfinite),
                 )
                 return None
 
             jax.lax.cond(
-                jnp.all(jnp.isfinite(a_b_bar)),
+                jnp.logical_not(jnp.any(a_b_nonfinite) | jnp.any(face_nonfinite)),
                 lambda _: None,
                 _print_bad_a_b,
                 operand=None,

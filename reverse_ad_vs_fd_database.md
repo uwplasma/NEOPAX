@@ -205,12 +205,44 @@ printing precision.  Relative error is
 | `alpha_power_volume_average_mw_m3` | 2.842041456067e-01 | 2.842041e-01 | 1.605e-07 |
 | `bootstrap_current_softmax_abs_scaled` | 7.078898335030e-01 | 7.078898e-01 | 4.733e-08 |
 
-The four completed profile FD columns agree with reverse AD.  Their largest
-displayed relative error is `1.994e-06`, on the small
+### `density_shape_alpha`
+
+| Objective | Reverse AD | FD | Relative error |
+| --- | ---: | ---: | ---: |
+| `softmax_Er` | 1.531295492132e-01 | 1.531296e-01 | 3.317e-07 |
+| `net_total_power_volume_average_mw_m3` | -2.450476062839e-04 | -2.450479e-04 | 1.199e-06 |
+| `Er_transition_left` | 1.526013687084e-02 | 1.526044e-02 | 1.986e-05 |
+| `Er_transition_right` | 2.255973257002e-02 | 2.255976e-02 | 1.216e-06 |
+| `Er2_volume_average` | 3.086192380921e+00 | 3.086193e+00 | 2.006e-07 |
+| `Er_volume_average` | -1.683207994445e-01 | -1.683208e-01 | 3.300e-09 |
+| `electron_temperature_volume_average_keV` | 1.221864639035e-03 | 1.221864e-03 | 5.230e-07 |
+| `total_pressure_volume_average` | -1.326505315369e+00 | -1.326505e+00 | 2.377e-07 |
+| `alpha_power_volume_average_mw_m3` | -7.638350629771e-03 | -7.638351e-03 | 4.847e-08 |
+| `bootstrap_current_softmax_abs_scaled` | 4.157598581050e-02 | 4.157599e-02 | 1.008e-07 |
+
+### `temperature_shape_alpha`
+
+| Objective | Reverse AD | FD | Relative error |
+| --- | ---: | ---: | ---: |
+| `softmax_Er` | 1.076840729740e+01 | 1.076841e+01 | 2.510e-07 |
+| `net_total_power_volume_average_mw_m3` | -3.939093535316e-01 | -3.939094e-01 | 1.180e-07 |
+| `Er_transition_left` | 1.556805294983e+01 | 1.556805e+01 | 1.895e-07 |
+| `Er_transition_right` | 1.557705491452e+01 | 1.557706e+01 | 3.265e-07 |
+| `Er2_volume_average` | 1.069449215483e+02 | 1.069449e+02 | 2.015e-07 |
+| `Er_volume_average` | 3.016580559690e+00 | 3.016581e+00 | 1.460e-07 |
+| `electron_temperature_volume_average_keV` | -3.044927257787e+00 | -3.044927e+00 | 8.466e-08 |
+| `total_pressure_volume_average` | -1.451660435636e+01 | -1.451660e+01 | 3.001e-07 |
+| `alpha_power_volume_average_mw_m3` | -4.128986884945e-01 | -4.128987e-01 | 2.787e-08 |
+| `bootstrap_current_softmax_abs_scaled` | -6.196723827141e-01 | -6.196724e-01 | 2.790e-08 |
+
+All six completed profile FD columns agree with reverse AD.  The largest
+displayed relative error is `1.986e-05` for the small
+`Er_transition_left` derivative with respect to `density_shape_alpha`; this
+is compatible with a six-significant-digit centered finite difference.  The
+next largest is `1.994e-06` on the small
 `electron_temperature_volume_average_keV` derivative with respect to
-`density_shape_power`; this is consistent with FD output rounding.  The
-remaining FD gradients are `density_shape_alpha` and
-`temperature_shape_alpha`.
+`density_shape_power`.  For `temperature_shape_alpha`, the largest displayed
+relative error is `3.265e-07` (`Er_transition_right`).
 
 ## Remaining validation
 
