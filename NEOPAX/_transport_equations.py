@@ -33,6 +33,7 @@ from ._state import (
     get_v_thermal,
 )
 from ._neoclassical import _collisionality_kind
+from ._monoenergetic import database_with_geometry_scale
 
 DENSITY_STATE_TO_PHYSICAL = 1.0e20
 PARTICLE_FLUX_PHYSICAL_TO_STATE = 1.0e-20
@@ -84,34 +85,6 @@ def _database_geometry_vjp_debug_enabled() -> bool:
     return str(
         os.environ.get("NEOPAX_DATABASE_GEOMETRY_VJP_DIAGNOSTICS", "")
     ).strip().lower() in {"1", "true", "yes", "on"}
-
-
-def _database_equation_geometry_with_fixed_axis_face(geometry, geometry_delta):
-    """Apply the Lij equation tangent, excluding only the nonexistent axis face.
-
-    VMEC supplies the complete geometry payload, so equation assembly must
-    retain its independent mesh, metric, and volume channels.  The left radial
-    face is the magnetic axis and is identically zero, however; treating it as
-    an independent differentiable coordinate creates an invalid 0/0 reverse
-    direction in finite-volume boundary reconstruction.
-    """
-    geometry_value = _add_float_delta_tree(geometry, geometry_delta)
-    if (
-        not dataclasses.is_dataclass(geometry)
-        or not hasattr(geometry, "r_grid_half")
-        or not hasattr(geometry_value, "r_grid_half")
-    ):
-        return geometry_value
-    primal_faces = jnp.asarray(geometry.r_grid_half)
-    perturbed_faces = jnp.asarray(geometry_value.r_grid_half)
-    if primal_faces.ndim != 1 or perturbed_faces.ndim != 1 or primal_faces.size == 0:
-        raise ValueError(
-            "Database equation geometry requires a non-empty one-dimensional radial face mesh."
-        )
-    return dataclasses.replace(
-        geometry_value,
-        r_grid_half=perturbed_faces.at[0].set(primal_faces[0]),
-    )
 
 
 def _minmod_pair(a, b):
@@ -1954,18 +1927,53 @@ class ComposedEquationSystem:
         if not callable(table_pullback):
             raise NotImplementedError(
                 "Database table-only direct-RHS pullback requires a compact flux transpose."
-            )
+        )
         working_state, _ = self._prepare_working_state(state)
         shared_fluxes = active_shared_flux_model(working_state)
-        flux_bar = self.pullback_shared_fluxes(state, shared_fluxes, rhs_bar)
-        table_support_bar = table_pullback(working_state, flux_bar, support)
+        # Minimal algebra fixtures and third-party equation owners may expose
+        # the compact centre transpose without concrete density/temperature
+        # equation objects.  Preserve that established table-only contract;
+        # real database transport systems always take the complete branch.
+        if (
+            not hasattr(self, "equations")
+            or not hasattr(self, "density_equation")
+            or not hasattr(self, "temperature_equation")
+        ):
+            flux_bar = self.pullback_shared_fluxes(state, shared_fluxes, rhs_bar)
+            table_support_bar = table_pullback(working_state, flux_bar, support)
+            support_bar = dict(_float_delta_tree_like(support))
+            support_bar["database"] = _sanitize_float_delta_bar_tree(
+                support["database"], table_support_bar["database"]
+            )
+            return support_bar
+        fixed_flux_payloads = self._capture_database_primal_fixed_flux_payloads(
+            working_state, shared_fluxes
+        )
+        center_flux_bar, density_faces_bar, temperature_faces_bar = (
+            self._pullback_database_fixed_flux_payloads(
+                working_state, None, state, rhs_bar, fixed_flux_payloads
+            )
+        )
+        table_support_bar = table_pullback(working_state, center_flux_bar, support)
+        face_database_bar = self._pullback_database_primal_face_table_bars(
+            working_state,
+            fixed_flux_payloads["center"],
+            support,
+            density_faces_bar,
+            temperature_faces_bar,
+        )
         if not isinstance(table_support_bar, dict) or "database" not in table_support_bar:
             raise ValueError(
                 "Database table-only direct-RHS pullback did not return a database bar."
             )
         support_bar = dict(_float_delta_tree_like(support))
         support_bar["database"] = _sanitize_float_delta_bar_tree(
-            support["database"], table_support_bar["database"]
+            support["database"],
+            jax.tree_util.tree_map(
+                lambda center_bar, face_bar: center_bar + face_bar,
+                table_support_bar["database"],
+                face_database_bar,
+            ),
         )
         return support_bar
 
@@ -1987,19 +1995,49 @@ class ComposedEquationSystem:
         if not callable(table_pullback):
             raise NotImplementedError(
                 "Batched database table RHS pullback requires a compact flux transpose."
-            )
+        )
         working_state, _ = self._prepare_working_state(state)
         shared_fluxes = active_shared_flux_model(working_state)
-        flux_bar = jax.vmap(
-            lambda one_rhs_bar: self.pullback_shared_fluxes(
-                state, shared_fluxes, one_rhs_bar
+        if (
+            not hasattr(self, "equations")
+            or not hasattr(self, "density_equation")
+            or not hasattr(self, "temperature_equation")
+        ):
+            flux_bar = jax.vmap(
+                lambda one_rhs_bar: self.pullback_shared_fluxes(
+                    state, shared_fluxes, one_rhs_bar
+                )
+            )(rhs_bar)
+            return table_pullback(working_state, flux_bar, support)
+        fixed_flux_payloads = self._capture_database_primal_fixed_flux_payloads(
+            working_state, shared_fluxes
+        )
+        center_flux_bar, density_faces_bar, temperature_faces_bar = jax.vmap(
+            lambda one_rhs_bar: self._pullback_database_fixed_flux_payloads(
+                working_state, None, state, one_rhs_bar, fixed_flux_payloads
             )
         )(rhs_bar)
-        table_support_bar = table_pullback(working_state, flux_bar, support)
+        table_support_bar = table_pullback(working_state, center_flux_bar, support)
+        face_database_bar = self._pullback_database_primal_face_table_bars(
+            working_state,
+            fixed_flux_payloads["center"],
+            support,
+            density_faces_bar,
+            temperature_faces_bar,
+        )
         if not isinstance(table_support_bar, dict) or "database" not in table_support_bar:
             raise ValueError(
                 "Batched database table RHS pullback did not return a database bar."
             )
+        table_support_bar = dict(table_support_bar)
+        table_support_bar["database"] = _sanitize_float_delta_bar_tree(
+            support["database"],
+            jax.tree_util.tree_map(
+                lambda center_bar, face_bar: center_bar + face_bar,
+                table_support_bar["database"],
+                face_database_bar,
+            ),
+        )
         return table_support_bar
 
     def pullback_direct_rhs_database_flux_geometry_payload(
@@ -2038,14 +2076,43 @@ class ComposedEquationSystem:
             raise NotImplementedError(
                 "Database direct-flux geometry pullback requires the compact "
                 "fixed-table geometry transpose."
-            )
+        )
         working_state, _ = self._prepare_working_state(state)
         shared_fluxes = active_shared_flux_model(working_state)
-        flux_bar = self.pullback_shared_fluxes(state, shared_fluxes, rhs_bar)
+        if not hasattr(self, "equations"):
+            flux_bar = self.pullback_shared_fluxes(state, shared_fluxes, rhs_bar)
+            geometry_bar = geometry_pullback(
+                working_state, flux_bar, support["geometry"]
+            )
+            support_bar = dict(_float_delta_tree_like(support))
+            support_bar["geometry"] = _sanitize_float_delta_bar_tree(
+                support["geometry"], geometry_bar
+            )
+            return support_bar
+        fixed_flux_payloads = self._capture_database_primal_fixed_flux_payloads(
+            working_state, shared_fluxes
+        )
+        center_flux_bar, density_faces_bar, temperature_faces_bar = (
+            self._pullback_database_fixed_flux_payloads(
+                working_state, None, state, rhs_bar, fixed_flux_payloads
+            )
+        )
         geometry_bar = geometry_pullback(
             working_state,
-            flux_bar,
+            center_flux_bar,
             support["geometry"],
+        )
+        face_geometry_bar = self._pullback_database_primal_face_geometry_bars(
+            working_state,
+            fixed_flux_payloads["center"],
+            support,
+            density_faces_bar,
+            temperature_faces_bar,
+        )
+        geometry_bar = jax.tree_util.tree_map(
+            lambda center_bar, face_bar: center_bar + face_bar,
+            geometry_bar,
+            face_geometry_bar,
         )
         support_bar = dict(_float_delta_tree_like(support))
         support_bar["geometry"] = _sanitize_float_delta_bar_tree(
@@ -2119,8 +2186,13 @@ class ComposedEquationSystem:
             raise ValueError("Database equation-geometry pullback requires a shared flux model.")
         working_state, eidx = self._prepare_working_state(state)
         shared_fluxes = active_shared_flux_model(working_state)
-        fixed_flux_payloads = self._capture_database_primal_fixed_flux_payloads(
-            working_state, shared_fluxes
+        has_concrete_equations = hasattr(self, "equations")
+        fixed_flux_payloads = (
+            self._capture_database_primal_fixed_flux_payloads(
+                working_state, shared_fluxes
+            )
+            if has_concrete_equations
+            else None
         )
         geometry = support["geometry"]
         geometry_delta0 = _float_delta_tree_like(geometry)
@@ -2132,18 +2204,17 @@ class ComposedEquationSystem:
             # provides the complete mutually-consistent field derivative
             # (mesh, volumes, and metric factors), rather than treating a_b
             # as a substitute for the other field leaves here.
-            geometry_value = _database_equation_geometry_with_fixed_axis_face(
-                geometry, geometry_delta
-            )
+            geometry_value = _add_float_delta_tree(geometry, geometry_delta)
             equations_at_geometry = self._with_database_equation_geometry_and_fixed_flux(
                 geometry_value,
                 active_shared_flux_model,
             )
+            if not has_concrete_equations:
+                return equations_at_geometry._evaluate_with_shared_fluxes_from_working_state(
+                    working_state, eidx, state, shared_fluxes
+                )
             return equations_at_geometry._evaluate_database_fixed_fluxes_from_working_state(
-                working_state,
-                eidx,
-                state,
-                fixed_flux_payloads,
+                working_state, eidx, state, fixed_flux_payloads
             )
 
         _, geometry_pullback = jax.vjp(
@@ -2463,6 +2534,125 @@ class ComposedEquationSystem:
             _rhs_from_flux_values, center0, density_input0, temperature_input0
         )
         return pullback(rhs_bar)
+
+    def _pullback_database_primal_face_table_bars(
+        self, working_state, center_fluxes, support, density_faces_bar, temperature_faces_bar
+    ):
+        """Fold captured equation-face bars into fixed database-table bars.
+
+        Rebinding changes only the explicit ``database`` leaf.  Thus this is
+        a table interpolation VJP, not a scan VJP: the retained scan owner is
+        still invoked once later, after every segment has accumulated its
+        complete table cotangent.
+        """
+        if not isinstance(support, dict) or set(support) != {"geometry", "database"}:
+            raise ValueError("Database face-table pullback requires geometry and database support.")
+        database = support["database"]
+        database_delta0 = _float_delta_tree_like(database)
+
+        def _one_equation_face_bar(equation_name, face_bar):
+            if not face_bar:
+                return _float_delta_tree_like(database)
+
+            def _face_fluxes_from_database_delta(database_delta):
+                payload = {
+                    "geometry": support["geometry"],
+                    "database": _add_float_delta_tree(database, database_delta),
+                }
+                equations_at_database = self.with_realtime_geometry_support_payload(payload)
+                equation = getattr(equations_at_database, f"{equation_name}_equation")
+                if equation is None or equation.face_flux_builder is None:
+                    raise ValueError(
+                        f"Database {equation_name} face-table pullback requires a face flux builder."
+                    )
+                return equation.face_flux_builder(
+                    working_state, center_fluxes=center_fluxes
+                )
+
+            face_output, pullback = jax.vjp(
+                _face_fluxes_from_database_delta, database_delta0
+            )
+            normalized_bar = {
+                name: face_bar.get(name, jnp.zeros_like(value))
+                for name, value in face_output.items()
+            }
+            example_output = next(iter(face_output.values()))
+            example_bar = next(iter(normalized_bar.values()))
+            batched = jnp.asarray(example_bar).ndim == jnp.asarray(example_output).ndim + 1
+            if batched:
+                return jax.vmap(lambda one_bar: pullback(one_bar)[0])(normalized_bar)
+            return pullback(normalized_bar)[0]
+
+        density_database_bar = _one_equation_face_bar("density", density_faces_bar)
+        temperature_database_bar = _one_equation_face_bar(
+            "temperature", temperature_faces_bar
+        )
+        return jax.tree_util.tree_map(
+            lambda density_bar, temperature_bar: density_bar + temperature_bar,
+            density_database_bar,
+            temperature_database_bar,
+        )
+
+    def _pullback_database_primal_face_geometry_bars(
+        self, working_state, center_fluxes, support, density_faces_bar, temperature_faces_bar
+    ):
+        """Transpose native database face fluxes to local transport geometry.
+
+        The database values are fixed, but their scale metadata must co-move
+        with ``a_b`` just as in the existing direct-centre database geometry
+        rule.  This is still entirely local: no table bar or scan VJP is
+        formed here.
+        """
+        if not isinstance(support, dict) or set(support) != {"geometry", "database"}:
+            raise ValueError("Database face-geometry pullback requires geometry and database support.")
+        geometry = support["geometry"]
+        geometry_delta0 = _float_delta_tree_like(geometry)
+
+        def _one_equation_face_bar(equation_name, face_bar):
+            if not face_bar:
+                return _float_delta_tree_like(geometry)
+
+            def _face_fluxes_from_geometry_delta(geometry_delta):
+                geometry_value = _add_float_delta_tree(geometry, geometry_delta)
+                payload = {
+                    "geometry": geometry_value,
+                    "database": database_with_geometry_scale(
+                        support["database"], geometry_value.a_b
+                    ),
+                }
+                equations_at_geometry = self.with_realtime_geometry_support_payload(payload)
+                equation = getattr(equations_at_geometry, f"{equation_name}_equation")
+                if equation is None or equation.face_flux_builder is None:
+                    raise ValueError(
+                        f"Database {equation_name} face-geometry pullback requires a face flux builder."
+                    )
+                return equation.face_flux_builder(
+                    working_state, center_fluxes=center_fluxes
+                )
+
+            face_output, pullback = jax.vjp(
+                _face_fluxes_from_geometry_delta, geometry_delta0
+            )
+            normalized_bar = {
+                name: face_bar.get(name, jnp.zeros_like(value))
+                for name, value in face_output.items()
+            }
+            example_output = next(iter(face_output.values()))
+            example_bar = next(iter(normalized_bar.values()))
+            batched = jnp.asarray(example_bar).ndim == jnp.asarray(example_output).ndim + 1
+            if batched:
+                return jax.vmap(lambda one_bar: pullback(one_bar)[0])(normalized_bar)
+            return pullback(normalized_bar)[0]
+
+        density_geometry_bar = _one_equation_face_bar("density", density_faces_bar)
+        temperature_geometry_bar = _one_equation_face_bar(
+            "temperature", temperature_faces_bar
+        )
+        return jax.tree_util.tree_map(
+            lambda density_bar, temperature_bar: density_bar + temperature_bar,
+            density_geometry_bar,
+            temperature_geometry_bar,
+        )
 
     def _shared_flux_bc_kwargs(self):
         density_eq, temperature_eq, er_eq = self._resolve_equations()

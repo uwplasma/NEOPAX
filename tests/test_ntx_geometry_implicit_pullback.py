@@ -12,6 +12,7 @@ import pytest
 
 import NEOPAX._neoclassical as neoclassical_module
 import NEOPAX._reverse_ad_initial_er as initial_er_module
+import NEOPAX._transport_equations as transport_equations_module
 
 from NEOPAX._transport_flux_models import (
     CombinedTransportFluxModel,
@@ -310,6 +311,82 @@ def test_database_fixed_equation_pullback_retains_separate_face_bars():
     assert jnp.array_equal(temperature_faces_bar["Q"], jnp.asarray([5.0, 7.0, 0.0]))
 
 
+def test_database_face_table_pullback_rebinds_only_fixed_database_leaf():
+    """Face bars become table bars without a scan or a centre-flux rebuild."""
+    equations = object.__new__(ComposedEquationSystem)
+    payloads_seen = []
+
+    def _with_payload(payload):
+        payloads_seen.append(payload)
+        database = payload["database"]
+
+        class _Density:
+            face_flux_builder = staticmethod(
+                lambda _state, *, center_fluxes: {
+                    "Gamma": 2.0 * database + 0.0 * center_fluxes["Gamma"],
+                    "Q": jnp.asarray(0.0),
+                    "Upar": jnp.asarray(0.0),
+                }
+            )
+
+        return SimpleNamespace(density_equation=_Density(), temperature_equation=None)
+
+    object.__setattr__(equations, "with_realtime_geometry_support_payload", _with_payload)
+    actual = equations._pullback_database_primal_face_table_bars(
+        "state",
+        {"Gamma": jnp.asarray(5.0)},
+        {"geometry": jnp.asarray(11.0), "database": jnp.asarray(7.0)},
+        {"Gamma": jnp.asarray(3.0)},
+        {},
+    )
+
+    assert jnp.allclose(actual, 6.0)
+    assert payloads_seen
+    assert all(jnp.allclose(item["geometry"], 11.0) for item in payloads_seen)
+
+
+def test_database_face_geometry_pullback_keeps_table_fixed_with_full_lij_tangent(monkeypatch):
+    """Face local geometry bars do not become table or scan cotangents."""
+    equations = object.__new__(ComposedEquationSystem)
+    monkeypatch.setattr(
+        transport_equations_module,
+        "database_with_geometry_scale",
+        lambda database, _a_b: database,
+    )
+    geometry = _PhysicalMeshGeometry(
+        a_b=jnp.asarray(2.0),
+        rho_grid=jnp.asarray([0.25, 0.75]),
+        rho_grid_half=jnp.asarray([0.0, 0.5, 1.0]),
+        r_grid=jnp.asarray([0.5, 1.5]),
+        r_grid_half=jnp.asarray([0.0, 1.0, 2.0]),
+        dr=jnp.asarray(1.0),
+    )
+
+    def _with_payload(payload):
+        geometry_value = payload["geometry"]
+
+        class _Density:
+            face_flux_builder = staticmethod(
+                lambda _state, *, center_fluxes: {
+                    "Gamma": geometry_value.r_grid_half + 0.0 * center_fluxes["Gamma"],
+                }
+            )
+
+        return SimpleNamespace(density_equation=_Density(), temperature_equation=None)
+
+    object.__setattr__(equations, "with_realtime_geometry_support_payload", _with_payload)
+    actual = equations._pullback_database_primal_face_geometry_bars(
+        "state",
+        {"Gamma": jnp.asarray(5.0)},
+        {"geometry": geometry, "database": jnp.asarray(7.0)},
+        {"Gamma": jnp.asarray([2.0, 3.0, 4.0])},
+        {},
+    )
+
+    assert jnp.array_equal(actual.r_grid_half, jnp.asarray([2.0, 3.0, 4.0]))
+    assert jnp.all(jnp.isfinite(actual.r_grid_half))
+
+
 def test_database_equation_payload_uses_full_geometry_tangent_like_lij():
     """Fixed-flux equation assembly keeps the established Lij tangent space."""
     geometry = _PhysicalMeshGeometry(
@@ -359,7 +436,7 @@ def test_database_equation_payload_uses_full_geometry_tangent_like_lij():
 
     assert jnp.all(jnp.isfinite(actual["geometry"].r_grid_half))
     assert jnp.allclose(actual["geometry"].r_grid, jnp.ones((2,)))
-    assert jnp.allclose(actual["geometry"].r_grid_half, jnp.asarray([0.0, 1.0, 1.0]))
+    assert jnp.allclose(actual["geometry"].r_grid_half, jnp.ones((3,)))
     assert jnp.allclose(actual["geometry"].dr, 1.0)
     assert jnp.allclose(actual["geometry"].a_b, 0.0)
 
