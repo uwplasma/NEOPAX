@@ -1288,7 +1288,7 @@ def test_build_time_solver_radau_accepts_exact_cached_retry_refresh():
 
 
 def test_build_time_solver_radau_accepts_full_stage_quadratic_newton():
-    """The exact cached-stage Newton lane is explicitly opt-in."""
+    """The exact cached-stage Newton lane exposes its damping policy."""
     solver = build_time_solver(
         _base_solver_parameters(
             transport_solver_backend="radau",
@@ -1298,6 +1298,17 @@ def test_build_time_solver_radau_accepts_full_stage_quadratic_newton():
     )
     assert isinstance(solver, RADAUSolver)
     assert solver.lagged_jacobian_refresh_mode == "quadratic_full_stage_each_iteration"
+    assert solver.full_stage_line_search is True
+
+    undamped_solver = build_time_solver(
+        _base_solver_parameters(
+            transport_solver_backend="radau",
+            radau_rhs_mode="lagged_transport_response",
+            radau_lagged_jacobian_refresh_mode="quadratic_full_stage_each_iteration",
+            radau_full_stage_line_search=False,
+        )
+    )
+    assert undamped_solver.full_stage_line_search is False
 
 
 def test_radau_full_stage_quadratic_newton_runs_on_cached_nonlinear_rhs():

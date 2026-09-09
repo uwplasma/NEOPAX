@@ -3742,6 +3742,7 @@ class _RadauSolverConfig(TransportSolver):
     lagged_response_correction_mode: str = "none"
     lagged_jacobian_refresh_mode: str = "none"
     lagged_jacobian_refresh_threshold: float = 1.0
+    full_stage_line_search: bool = True
     stage_secant_correction_mode: str = "none"
     lagged_response_defect_mode: str = "off"
     lagged_response_defect_rtol: float = 1.0e-6
@@ -3807,6 +3808,7 @@ class _RadauSolverConfig(TransportSolver):
         lagged_response_correction_mode: str = "none",
         lagged_jacobian_refresh_mode: str = "none",
         lagged_jacobian_refresh_threshold: float = 1.0,
+        full_stage_line_search: bool = True,
         stage_secant_correction_mode: str = "none",
         lagged_response_defect_mode: str = "off",
         lagged_response_defect_rtol: float = 1.0e-6,
@@ -4125,6 +4127,7 @@ class _RadauSolverConfig(TransportSolver):
         object.__setattr__(
             self, "lagged_jacobian_refresh_threshold", float(lagged_jacobian_refresh_threshold)
         )
+        object.__setattr__(self, "full_stage_line_search", bool(full_stage_line_search))
         stage_secant_mode_norm = str(stage_secant_correction_mode).strip().lower()
         stage_secant_mode_aliases = {
             "off": "none",
@@ -4806,6 +4809,7 @@ class _RadauAcceptedStepKernelContext:
     lagged_response_correction_mode: str
     lagged_jacobian_refresh_mode: str
     lagged_jacobian_refresh_threshold: Any
+    full_stage_line_search: bool
     stage_secant_correction_mode: str
     newton_stagnation_mode: str
     newton_stagnation_defect_budget: Any
@@ -16256,14 +16260,19 @@ def _radau_run_stage_subsolve(
         # pure cached-response algebra: it never rebuilds NTX or replaces the
         # existing LU solve.  Keep other solver lanes byte-for-byte on their
         # established full-step path.
-        if (
+        use_residual_line_search = (
             kernel_context.lagged_jacobian_refresh_mode in {
-            "quadratic_colored_after_first",
-            "quadratic_full_stage_each_iteration",
-            "quadratic_exact_retry_after_failure",
+                "quadratic_colored_after_first",
+                "quadratic_exact_retry_after_failure",
             }
+            or (
+                kernel_context.lagged_jacobian_refresh_mode
+                == "quadratic_full_stage_each_iteration"
+                and kernel_context.full_stage_line_search
+            )
             or kernel_context.stage_secant_correction_mode == "good_broyden_after_first"
-        ):
+        )
+        if use_residual_line_search:
             (
                 line_search_z,
                 accepted_delta,
@@ -23428,6 +23437,7 @@ def _build_prepared_radau_accepted_rollout(
         lagged_jacobian_refresh_threshold=jnp.asarray(
             getattr(solver, "lagged_jacobian_refresh_threshold", 1.0), dtype=dtype
         ),
+        full_stage_line_search=bool(getattr(solver, "full_stage_line_search", True)),
         stage_secant_correction_mode=str(
             getattr(solver, "stage_secant_correction_mode", "none")
         ).strip().lower(),
@@ -24453,6 +24463,9 @@ class RADAUSolver(_RadauSolverConfig):
             ).strip().lower(),
             lagged_jacobian_refresh_threshold=jnp.asarray(
                 getattr(self, "lagged_jacobian_refresh_threshold", 1.0), dtype=dtype
+            ),
+            full_stage_line_search=bool(
+                getattr(self, "full_stage_line_search", True)
             ),
             stage_secant_correction_mode=str(
                 getattr(self, "stage_secant_correction_mode", "none")
@@ -30155,6 +30168,9 @@ def build_time_solver(solver_parameters: Any, solver_override: Any = None) -> Tr
             ),
             lagged_jacobian_refresh_threshold=float(
                 _cfg_get("radau_lagged_jacobian_refresh_threshold", 1.0)
+            ),
+            full_stage_line_search=bool(
+                _cfg_get("radau_full_stage_line_search", True)
             ),
             stage_secant_correction_mode=str(
                 _cfg_get("radau_stage_secant_correction_mode", "none")
