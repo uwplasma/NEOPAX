@@ -46,6 +46,34 @@ def _database_geometry_vjp_debug_enabled() -> bool:
     ).strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _database_equation_geometry_with_fixed_axis_face(geometry, geometry_delta):
+    """Apply the Lij equation tangent, excluding only the nonexistent axis face.
+
+    VMEC supplies the complete geometry payload, so equation assembly must
+    retain its independent mesh, metric, and volume channels.  The left radial
+    face is the magnetic axis and is identically zero, however; treating it as
+    an independent differentiable coordinate creates an invalid 0/0 reverse
+    direction in finite-volume boundary reconstruction.
+    """
+    geometry_value = _add_float_delta_tree(geometry, geometry_delta)
+    if (
+        not dataclasses.is_dataclass(geometry)
+        or not hasattr(geometry, "r_grid_half")
+        or not hasattr(geometry_value, "r_grid_half")
+    ):
+        return geometry_value
+    primal_faces = jnp.asarray(geometry.r_grid_half)
+    perturbed_faces = jnp.asarray(geometry_value.r_grid_half)
+    if primal_faces.ndim != 1 or perturbed_faces.ndim != 1 or primal_faces.size == 0:
+        raise ValueError(
+            "Database equation geometry requires a non-empty one-dimensional radial face mesh."
+        )
+    return dataclasses.replace(
+        geometry_value,
+        r_grid_half=perturbed_faces.at[0].set(primal_faces[0]),
+    )
+
+
 def _minmod_pair(a, b):
     same_sign = (a * b) > 0.0
     return jnp.where(same_sign, jnp.sign(a) * jnp.minimum(jnp.abs(a), jnp.abs(b)), 0.0)
@@ -2061,7 +2089,9 @@ class ComposedEquationSystem:
             # provides the complete mutually-consistent field derivative
             # (mesh, volumes, and metric factors), rather than treating a_b
             # as a substitute for the other field leaves here.
-            geometry_value = _add_float_delta_tree(geometry, geometry_delta)
+            geometry_value = _database_equation_geometry_with_fixed_axis_face(
+                geometry, geometry_delta
+            )
             equations_at_geometry = self._with_database_equation_geometry_and_fixed_flux(
                 geometry_value,
                 active_shared_flux_model,

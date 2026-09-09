@@ -202,7 +202,7 @@ def test_database_equation_payload_uses_full_geometry_tangent_like_lij():
 
     assert jnp.all(jnp.isfinite(actual["geometry"].r_grid_half))
     assert jnp.allclose(actual["geometry"].r_grid, jnp.ones((2,)))
-    assert jnp.allclose(actual["geometry"].r_grid_half, jnp.ones((3,)))
+    assert jnp.allclose(actual["geometry"].r_grid_half, jnp.asarray([0.0, 1.0, 1.0]))
     assert jnp.allclose(actual["geometry"].dr, 1.0)
     assert jnp.allclose(actual["geometry"].a_b, 0.0)
 
