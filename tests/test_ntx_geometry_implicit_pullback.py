@@ -345,8 +345,8 @@ def test_database_face_table_pullback_rebinds_only_fixed_database_leaf():
     assert all(jnp.allclose(item["geometry"], 11.0) for item in payloads_seen)
 
 
-def test_database_face_geometry_pullback_keeps_table_fixed_with_full_lij_tangent(monkeypatch):
-    """Face local geometry bars do not become table or scan cotangents."""
+def test_database_face_geometry_pullback_keeps_table_fixed_on_physical_mesh(monkeypatch):
+    """Face local geometry uses the database physical radial-mesh manifold."""
     equations = object.__new__(ComposedEquationSystem)
     monkeypatch.setattr(
         transport_equations_module,
@@ -383,7 +383,12 @@ def test_database_face_geometry_pullback_keeps_table_fixed_with_full_lij_tangent
         {},
     )
 
-    assert jnp.array_equal(actual.r_grid_half, jnp.asarray([2.0, 3.0, 4.0]))
+    # Database face locations are ``rho_grid_half * a_b``.  They are not
+    # independently movable nodes: in particular the axis face remains zero.
+    assert jnp.array_equal(actual.r_grid_half, jnp.zeros((3,)))
+    assert jnp.array_equal(actual.r_grid, jnp.zeros((2,)))
+    assert jnp.allclose(actual.dr, 0.0)
+    assert jnp.allclose(actual.a_b, 5.5)
     assert jnp.all(jnp.isfinite(actual.r_grid_half))
 
     batched = equations._pullback_database_primal_face_geometry_bars(
@@ -393,10 +398,43 @@ def test_database_face_geometry_pullback_keeps_table_fixed_with_full_lij_tangent
         {"Gamma": jnp.asarray([[2.0, 3.0, 4.0], [-1.0, 0.5, 2.0]])},
         {},
     )
-    assert jnp.array_equal(
-        batched.r_grid_half,
-        jnp.asarray([[2.0, 3.0, 4.0], [-1.0, 0.5, 2.0]]),
+    assert jnp.array_equal(batched.r_grid_half, jnp.zeros((2, 3)))
+    assert jnp.array_equal(batched.r_grid, jnp.zeros((2, 2)))
+    assert jnp.allclose(batched.dr, jnp.zeros((2,)))
+    assert jnp.allclose(batched.a_b, jnp.asarray([5.5, 2.25]))
+
+
+def test_database_face_geometry_pullback_selects_compact_model_boundary():
+    """Production face geometry must not rebuild a composed equation system."""
+    equations = object.__new__(ComposedEquationSystem)
+    geometry = jnp.asarray(3.0)
+    calls = []
+
+    def _compact(state, center_fluxes, flux_bar, support):
+        calls.append((state, center_fluxes, flux_bar, support))
+        return 5.0 * flux_bar["Gamma_faces"]
+
+    builder = SimpleNamespace(database_geometry_pullback=_compact)
+    object.__setattr__(
+        equations,
+        "with_realtime_geometry_support_payload",
+        lambda _support: SimpleNamespace(
+            density_equation=SimpleNamespace(face_flux_builder=builder),
+            temperature_equation=None,
+        ),
     )
+    object.__setattr__(equations, "equations", (object(),))
+    actual = equations._pullback_database_primal_face_geometry_bars(
+        "state",
+        {"Gamma": jnp.asarray(2.0)},
+        {"geometry": geometry, "database": jnp.asarray(7.0)},
+        {"Gamma_faces": jnp.asarray(4.0)},
+        {},
+    )
+
+    assert jnp.allclose(actual, 20.0)
+    assert len(calls) == 1
+    assert calls[0][0] == "state"
 
 
 def test_database_equation_payload_uses_full_geometry_tangent_like_lij():

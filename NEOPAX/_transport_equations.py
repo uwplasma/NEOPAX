@@ -17,6 +17,7 @@ from ._transport_flux_models import (
     _add_float_delta_tree,
     _float_delta_tree_like,
     _sanitize_float_delta_bar_tree,
+    _database_geometry_with_constrained_axis_face,
     build_evaluated_transport_state,
     build_face_transport_state,
     build_ntss_like_face_transport_state,
@@ -515,6 +516,32 @@ def build_density_equation(
         )
 
     face_flux_builder.database_table_pullback = database_face_table_pullback
+
+    def database_face_geometry_pullback(state, center_fluxes, flux_bar, support):
+        """Use the database owner's bounded native face-geometry transpose."""
+        state = apply_transport_density_floor(state, density_floor)
+        state = apply_transport_temperature_floor(state, temperature_floor, density_floor)
+        evaluated_state = build_evaluated_transport_state(
+            state, field, bc_density=bc_density, bc_temperature=bc_temperature,
+            bc_er=bc_er, reconstruction=reconstruction,
+            density_floor=density_floor, temperature_floor=temperature_floor,
+        )
+        face_state = build_face_transport_state(
+            state, field, bc_density=bc_density, bc_temperature=bc_temperature,
+            bc_er=bc_er, reconstruction=reconstruction,
+            density_floor=density_floor, temperature_floor=temperature_floor,
+        )
+        pullback = getattr(flux_model, "pullback_direct_face_flux_geometry_by_radius", None)
+        if not callable(pullback):
+            raise NotImplementedError("Database density face closure lacks a compact geometry transpose.")
+        return pullback(
+            state, face_state, flux_bar, support["geometry"],
+            bc_density=bc_density, bc_temperature=bc_temperature, bc_er=bc_er,
+            particle_face_closure_mode=face_mode, center_fluxes=center_fluxes,
+            evaluated_state=evaluated_state,
+        )
+
+    face_flux_builder.database_geometry_pullback = database_face_geometry_pullback
     if active_species_mask is None:
         active_species_mask = jnp.ones(species.number_species, dtype=bool)
     active_species_mask = jnp.asarray(active_species_mask, dtype=bool)
@@ -985,6 +1012,31 @@ def build_temperature_equation(
         )
 
     face_flux_builder.database_table_pullback = database_face_table_pullback
+
+    def database_face_geometry_pullback(state, center_fluxes, flux_bar, support):
+        """Use the database owner's bounded native face-geometry transpose."""
+        state = apply_transport_density_floor(state, density_floor)
+        state = apply_transport_temperature_floor(state, temperature_floor, density_floor)
+        evaluated_state = build_evaluated_transport_state(
+            state, field, bc_density=bc_density, bc_temperature=bc_temperature,
+            bc_er=bc_er, reconstruction=reconstruction,
+            density_floor=density_floor, temperature_floor=temperature_floor,
+        )
+        face_state = build_face_transport_state(
+            state, field, bc_density=bc_density, bc_temperature=bc_temperature,
+            bc_er=bc_er, reconstruction=reconstruction,
+            density_floor=density_floor, temperature_floor=temperature_floor,
+        )
+        pullback = getattr(flux_model, "pullback_direct_face_flux_geometry_by_radius", None)
+        if not callable(pullback):
+            raise NotImplementedError("Database temperature face closure lacks a compact geometry transpose.")
+        return pullback(
+            state, face_state, flux_bar, support["geometry"],
+            bc_density=bc_density, bc_temperature=bc_temperature, bc_er=bc_er,
+            center_fluxes=center_fluxes, evaluated_state=evaluated_state,
+        )
+
+    face_flux_builder.database_geometry_pullback = database_face_geometry_pullback
 
     def er_faces_builder(state):
         return build_face_transport_state(
@@ -2759,6 +2811,32 @@ class ComposedEquationSystem:
             if not face_bar:
                 return _float_delta_tree_like(geometry)
 
+            # Production closures provide a model-only primitive analogous to
+            # the direct-centre database geometry transpose.  It intentionally
+            # excludes ComposedEquationSystem construction, sources, and all
+            # finite-volume assembly from every face VJP.
+            equations_at_primal = self.with_realtime_geometry_support_payload(support)
+            primal_equation = getattr(equations_at_primal, f"{equation_name}_equation")
+            compact_pullback = getattr(
+                getattr(primal_equation, "face_flux_builder", None),
+                "database_geometry_pullback", None,
+            )
+            if callable(compact_pullback):
+                return compact_pullback(
+                    working_state, center_fluxes, face_bar, support
+                )
+
+            # A real transport system must not silently revert to the dense
+            # equation-rebuild path below.  It retains equation/source graphs
+            # per face and is the source of the host-memory growth this
+            # database boundary is designed to avoid.  Keep it only for
+            # deliberately minimal algebra fixtures.
+            if hasattr(self, "equations"):
+                raise NotImplementedError(
+                    f"Database {equation_name} face closure lacks the required "
+                    "compact native geometry transpose."
+                )
+
             equations_at_primal = self.with_realtime_geometry_support_payload(support)
             primal_equation = getattr(equations_at_primal, f"{equation_name}_equation")
             if primal_equation is None or primal_equation.face_flux_builder is None:
@@ -2783,7 +2861,12 @@ class ComposedEquationSystem:
             # VJP retained the complete face closure for every objective row
             # at once and is not permitted in a transport segment.
             def _local_face_fluxes(flat_delta, face_index):
-                geometry_value = _add_float_delta_tree(
+                # Native database faces include the fixed axis face.  Match
+                # the established direct-centre database primitive: that
+                # coordinate is not an independent VMEC/transport degree of
+                # freedom and must remain at the physical axis rather than
+                # probing the radial table below its first knot.
+                geometry_value = _database_geometry_with_constrained_axis_face(
                     geometry, _split_geometry(flat_delta)
                 )
                 payload = {

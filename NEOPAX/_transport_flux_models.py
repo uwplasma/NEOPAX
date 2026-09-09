@@ -1968,6 +1968,38 @@ class CombinedTransportFluxModel(TransportFluxModelBase):
             **kwargs,
         )
 
+    def pullback_direct_face_flux_geometry_by_radius(
+        self, state, face_state, flux_bar, geometry, **kwargs
+    ):
+        """Route compact native face-geometry bars to the database owner."""
+        pullback = getattr(
+            self.neoclassical_model,
+            "pullback_direct_face_flux_geometry_by_radius",
+            None,
+        )
+        if not callable(pullback):
+            return None
+        zero = jnp.zeros_like(jnp.asarray(face_state.density))
+
+        def _bar(name):
+            value = flux_bar.get(f"{name}_faces", flux_bar.get(name, None))
+            if value is None:
+                return zero
+            value = jnp.asarray(value)
+            return zero if value.ndim == 0 or value.dtype == jax.dtypes.float0 else value
+
+        return pullback(
+            state,
+            face_state,
+            {
+                "Gamma": _bar("Gamma") + _bar("Gamma_neo"),
+                "Q": _bar("Q") + _bar("Q_neo"),
+                "Upar": _bar("Upar") + _bar("Upar_neo"),
+            },
+            geometry,
+            **kwargs,
+        )
+
     def build_lagged_response(self, state, **kwargs):
         er_edge_override = kwargs.pop("er_edge_override", None)
         neo_kwargs = dict(kwargs)
@@ -3368,6 +3400,102 @@ class NTXDatabaseTransportModel(TransportFluxModelBase):
             else _sanitize_float_delta_bar_tree(database, database_bar)
         )
         return result
+
+    def pullback_direct_face_flux_geometry_by_radius(
+        self, state, face_state, flux_bar, geometry, **kwargs
+    ):
+        """Transpose direct native faces to geometry without equation assembly.
+
+        This is the face analogue of :meth:`pullback_direct_rhs_geometry_by_radius`.
+        It owns only the fixed-table neoclassical face primitive; finite-volume
+        equations, sources, and the recorded NTX scan are deliberately absent.
+        """
+        zero = jnp.zeros_like(jnp.asarray(face_state.density))
+
+        def _bar(name):
+            value = flux_bar.get(name, None)
+            if value is None:
+                return zero
+            value = jnp.asarray(value)
+            return zero if value.ndim == 0 or value.dtype == jax.dtypes.float0 else value
+
+        gamma_bar, q_bar, upar_bar = _bar("Gamma"), _bar("Q"), _bar("Upar")
+        batched_rhs = gamma_bar.ndim == jnp.asarray(face_state.density).ndim + 1
+        face_indices = jnp.arange(gamma_bar.shape[-1], dtype=jnp.int32)
+        geometry_delta0 = _float_delta_tree_like(geometry)
+        leaves0, treedef = jax.tree_util.tree_flatten(geometry_delta0)
+        shapes = tuple(jnp.asarray(leaf).shape for leaf in leaves0)
+        sizes = tuple(int(jnp.asarray(leaf).size) for leaf in leaves0)
+        flat_delta0 = jnp.concatenate(tuple(jnp.ravel(jnp.asarray(leaf)) for leaf in leaves0))
+        bc_density = kwargs.get("bc_density", self.bc_density)
+        bc_temperature = kwargs.get("bc_temperature", self.bc_temperature)
+        face_mode = kwargs.get("particle_face_closure_mode", "reconstructed")
+
+        def _split(flat_delta):
+            leaves = []
+            offset = 0
+            for size, shape in zip(sizes, shapes, strict=True):
+                leaves.append(jnp.reshape(
+                    flat_delta[..., offset : offset + size],
+                    flat_delta.shape[:-1] + shape,
+                ))
+                offset += size
+            return treedef.unflatten(leaves)
+
+        def _accumulate(carry, face_index):
+            def _local_face_fluxes(flat_delta):
+                geometry_value = _database_geometry_with_constrained_axis_face(
+                    geometry, _split(flat_delta)
+                )
+                database_value = self.database
+                if database_value is not None:
+                    database_value = database_with_geometry_scale(
+                        database_value, geometry_value.a_b
+                    )
+                model = dataclasses.replace(
+                    self, geometry=geometry_value, database=database_value
+                )
+                local_face_state = build_face_transport_state(
+                    state, geometry_value,
+                    bc_density=bc_density, bc_temperature=bc_temperature,
+                )
+                evaluated = build_evaluated_transport_state(
+                    state, geometry_value,
+                    bc_density=bc_density, bc_temperature=bc_temperature,
+                    density_floor=model.density_floor,
+                )
+                all_faces = model.evaluate_face_fluxes(
+                    state, local_face_state, evaluated_state=evaluated,
+                    bc_density=bc_density, bc_temperature=bc_temperature,
+                    particle_face_closure_mode=face_mode,
+                )
+                return jax.tree_util.tree_map(
+                    lambda value: jax.lax.dynamic_index_in_dim(
+                        value, face_index, axis=-1, keepdims=False
+                    ),
+                    all_faces,
+                )
+
+            _, pullback = jax.vjp(_local_face_fluxes, flat_delta0)
+            axis = 2 if batched_rhs else 1
+            local_bar = {
+                "Gamma": jax.lax.dynamic_index_in_dim(gamma_bar, face_index, axis=axis, keepdims=False),
+                "Q": jax.lax.dynamic_index_in_dim(q_bar, face_index, axis=axis, keepdims=False),
+                "Upar": jax.lax.dynamic_index_in_dim(upar_bar, face_index, axis=axis, keepdims=False),
+            }
+            if batched_rhs:
+                flat_bar = jax.vmap(lambda one_bar: pullback(one_bar)[0])(local_bar)
+            else:
+                (flat_bar,) = pullback(local_bar)
+            return carry + flat_bar, None
+
+        flat_bar, _ = jax.lax.scan(
+            _accumulate,
+            (jnp.zeros((gamma_bar.shape[0],) + flat_delta0.shape, dtype=flat_delta0.dtype)
+             if batched_rhs else jnp.zeros_like(flat_delta0)),
+            face_indices,
+        )
+        return _split(flat_bar)
 
     def pullback_direct_rhs_state(self, state, flux_bar):
         """Transpose the direct database flux map with respect to its state.
@@ -5961,6 +6089,14 @@ class NTXRuntimeScanTransportModel(TransportFluxModelBase):
         model = self.with_support_payload(support)
         return model._database_model().pullback_direct_face_flux_support_payload(
             state, face_state, flux_bar, {"database": support["database"]}, **kwargs
+        )
+
+    def pullback_direct_face_flux_geometry_by_radius(
+        self, state, face_state, flux_bar, geometry, **kwargs
+    ):
+        """Delegate the compact fixed-database native-face geometry transpose."""
+        return self._database_model().pullback_direct_face_flux_geometry_by_radius(
+            state, face_state, flux_bar, geometry, **kwargs
         )
 
     def pullback_direct_rhs_geometry_by_radius(self, state, flux_bar, geometry):

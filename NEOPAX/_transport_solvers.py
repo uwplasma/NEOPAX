@@ -23076,7 +23076,7 @@ def _build_prepared_radau_accepted_rollout(
                 er_edge_anchor=edge,
             )
 
-        flux_model = owner.shared_flux_model
+        flux_model = getattr(owner, "shared_flux_model", None)
         resolution_model = getattr(flux_model, "neoclassical_model", flux_model)
         slope_fallback_enabled = callable(
             getattr(resolution_model, "_ambipolar_slope_fallback_enabled", None)
@@ -23233,8 +23233,16 @@ def _build_prepared_radau_accepted_rollout(
         )
         flat_rhs_with_lagged_response = _node_lagged_rhs
         flat_rhs_with_lagged_response_tangent = _node_lagged_rhs_tangent
-        node_edge_ambipolar_rhs = _node_edge_ambipolar_rhs
-        node_edge_ambipolar_rhs_tangent = _node_edge_ambipolar_rhs_tangent
+        # The split ambipolar diagnostic is specific to ComposedEquationSystem
+        # owners with a shared flux model.  Small solver-test owners implement
+        # only the public node-RHS protocol and must not be asked to expose
+        # model-internal working-state helpers.
+        if (
+            getattr(owner, "shared_flux_model", None) is not None
+            and callable(getattr(owner, "_prepare_working_state", None))
+        ):
+            node_edge_ambipolar_rhs = _node_edge_ambipolar_rhs
+            node_edge_ambipolar_rhs_tangent = _node_edge_ambipolar_rhs_tangent
         # Existing model hooks map the public three-field state only.  The
         # node scalar receives the paired analytic transpose above.
         pullback_build_lagged_response = None
@@ -24086,7 +24094,7 @@ class RADAUSolver(_RadauSolverConfig):
                     er_edge_anchor=edge,
                 )
 
-            flux_model = owner.shared_flux_model
+            flux_model = getattr(owner, "shared_flux_model", None)
             resolution_model = getattr(flux_model, "neoclassical_model", flux_model)
             slope_fallback_enabled = callable(
                 getattr(resolution_model, "_ambipolar_slope_fallback_enabled", None)
@@ -24242,8 +24250,12 @@ class RADAUSolver(_RadauSolverConfig):
             )
             flat_rhs_with_lagged_response = _node_lagged_rhs
             flat_rhs_with_lagged_response_tangent = _node_lagged_rhs_tangent
-            node_edge_ambipolar_rhs = _node_edge_ambipolar_rhs
-            node_edge_ambipolar_rhs_tangent = _node_edge_ambipolar_rhs_tangent
+            if (
+                getattr(owner, "shared_flux_model", None) is not None
+                and callable(getattr(owner, "_prepare_working_state", None))
+            ):
+                node_edge_ambipolar_rhs = _node_edge_ambipolar_rhs
+                node_edge_ambipolar_rhs_tangent = _node_edge_ambipolar_rhs_tangent
             flat_rhs_state_pullback = _node_lagged_rhs_state_pullback
             if str(getattr(self, "lagged_jacobian_refresh_mode", "none")).strip().lower() not in {
                 "none", "quadratic_colored_after_first",
