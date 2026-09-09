@@ -3760,6 +3760,31 @@ def test_radial_preprocessed_axis_stencil_has_finite_scale_vjp():
     assert jnp.isfinite(derivative)
 
 
+def test_radial_preprocessed_axis_kernel_has_finite_scale_vjp():
+    """The primal radial kernel has the same finite axis VJP as its stencil."""
+    rho = jnp.asarray([0.0, 0.2, 0.5, 0.8, 1.0])
+    nu_v = jnp.asarray([1.0e-3, 1.0e-2, 1.0e-1])
+    er = jnp.asarray([[1.0e-4, 1.0e-3, 1.0e-2, 1.0e-1]])
+    shape = (rho.size, nu_v.size, er.shape[1])
+    table = jnp.reshape(
+        jnp.arange(int(jnp.prod(jnp.asarray(shape))), dtype=jnp.float64), shape
+    )
+    database = PreprocessedMonoenergetic3DNTSSRadius.read_data(
+        a_b=1.0, rho=rho, nu_v=nu_v, Er=er, drds=jnp.ones_like(rho),
+        D11=1.0 + table, D13=2.0 + table, D33=3.0 + table,
+    )
+
+    def axis_response(a_b):
+        scaled = database_with_geometry_scale(database, a_b)
+        return jnp.sum(get_Dij_preprocessed_3d_ntss_radius(
+            jnp.asarray(0.0), jnp.asarray(2.0e-2), jnp.asarray(3.0e-3), scaled
+        ))
+
+    value, derivative = jax.value_and_grad(axis_response)(jnp.asarray(1.0))
+    assert jnp.isfinite(value)
+    assert jnp.isfinite(derivative)
+
+
 @pytest.mark.parametrize("radius", (0.01, 0.55, 0.95))
 def test_radial_preprocessed_stencil_table_transpose_matches_generic_vjp(radius):
     """The explicit 16-entry scatter is the established table VJP exactly."""

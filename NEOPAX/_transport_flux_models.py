@@ -3494,6 +3494,31 @@ class NTXDatabaseTransportModel(TransportFluxModelBase):
                 flat_bar = jax.vmap(lambda one_bar: pullback(one_bar)[0])(local_bar)
             else:
                 (flat_bar,) = pullback(local_bar)
+            if (
+                str(os.environ.get("NEOPAX_DATABASE_GEOMETRY_VJP_DIAGNOSTICS", ""))
+                .strip()
+                .lower()
+                in {"1", "true", "yes", "on"}
+            ):
+                local_geometry_bar = _split(flat_bar)
+                local_a_b_bar = jnp.asarray(local_geometry_bar.a_b)
+                local_a_b_nonfinite = jnp.logical_not(jnp.isfinite(local_a_b_bar))
+
+                def _print_bad_face_index(_):
+                    jax.debug.print(
+                        "[database-geometry-vjp] source=face_flux "
+                        "bad_face_index={face_index} a_b_nonfinite={a_b_count}",
+                        face_index=face_index,
+                        a_b_count=jnp.sum(local_a_b_nonfinite),
+                    )
+                    return None
+
+                jax.lax.cond(
+                    jnp.any(local_a_b_nonfinite),
+                    _print_bad_face_index,
+                    lambda _: None,
+                    operand=None,
+                )
             return carry + flat_bar, None
 
         flat_bar, _ = jax.lax.scan(

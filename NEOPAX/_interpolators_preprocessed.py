@@ -394,10 +394,17 @@ def _surface_ntss1d_fixed_er(table, ir, inu, ty, grid_er_internal, database):
 @jax.jit
 def get_Dij_preprocessed_3d(grid_x, grid_nu, grid_Er, database):
     grid_nu_internal = jnp.log10(jnp.maximum(1.0e-12, grid_nu))
+    # ``where`` evaluates both operands under JAX.  Keep the inactive
+    # grid_Er / r branch finite at the physical axis so an a_b VJP cannot
+    # receive a 0 * inf contribution.
+    er_denominator = jnp.maximum(
+        jnp.abs(grid_x),
+        jnp.maximum(jnp.asarray(database.low_limit_r, dtype=grid_x.dtype), 1.0e-30),
+    )
     er_ratio = jnp.where(
         grid_x <= database.low_limit_r,
         database.Er_lower_limit,
-        jnp.maximum(database.Er_lower_limit, jnp.abs(grid_Er / grid_x)),
+        jnp.maximum(database.Er_lower_limit, jnp.abs(grid_Er / er_denominator)),
     )
     grid_er_internal = jnp.log10(er_ratio)
 
@@ -477,10 +484,14 @@ def get_Dij_preprocessed_3d_ntss_radius(grid_x, grid_nu, grid_Er, database):
     nr = arr.shape[0]
     xri = jax.lax.cond(nr == 1, lambda: arr[0], lambda: jnp.maximum(1.0e-2 * arr[0], grid_x))
     grid_nu_internal = jnp.log10(jnp.maximum(1.0e-12, grid_nu))
+    er_denominator = jnp.maximum(
+        jnp.abs(xri),
+        jnp.maximum(jnp.asarray(database.low_limit_r, dtype=xri.dtype), 1.0e-30),
+    )
     er_ratio = jnp.where(
         xri <= database.low_limit_r,
         database.Er_lower_limit,
-        jnp.maximum(database.Er_lower_limit, jnp.abs(grid_Er / xri)),
+        jnp.maximum(database.Er_lower_limit, jnp.abs(grid_Er / er_denominator)),
     )
     grid_er_internal = jnp.log10(er_ratio)
 
@@ -598,10 +609,14 @@ def get_Dij_preprocessed_3d_ntss_radius_ntss1d(grid_x, grid_nu, grid_Er, databas
     nr = arr.shape[0]
     xri = jax.lax.cond(nr == 1, lambda: arr[0], lambda: jnp.maximum(1.0e-2 * arr[0], grid_x))
     grid_nu_internal = jnp.log10(jnp.maximum(1.0e-12, grid_nu))
+    er_denominator = jnp.maximum(
+        jnp.abs(xri),
+        jnp.maximum(jnp.asarray(database.low_limit_r, dtype=xri.dtype), 1.0e-30),
+    )
     er_ratio = jnp.where(
         xri <= database.low_limit_r,
         database.Er_lower_limit,
-        jnp.maximum(database.Er_lower_limit, jnp.abs(grid_Er / xri)),
+        jnp.maximum(database.Er_lower_limit, jnp.abs(grid_Er / er_denominator)),
     )
     grid_er_internal = jnp.log10(er_ratio)
 
@@ -719,10 +734,14 @@ def get_Dij_preprocessed_3d_ntss_radius_ntss1d_fixednu(grid_x, grid_nu, grid_Er,
     nr = arr.shape[0]
     xri = jax.lax.cond(nr == 1, lambda: arr[0], lambda: jnp.maximum(1.0e-2 * arr[0], grid_x))
     grid_nu_internal = jnp.log10(jnp.maximum(1.0e-12, grid_nu))
+    er_denominator = jnp.maximum(
+        jnp.abs(xri),
+        jnp.maximum(jnp.asarray(database.low_limit_r, dtype=xri.dtype), 1.0e-30),
+    )
     er_ratio = jnp.where(
         xri <= database.low_limit_r,
         database.Er_lower_limit,
-        jnp.maximum(database.Er_lower_limit, jnp.abs(grid_Er / xri)),
+        jnp.maximum(database.Er_lower_limit, jnp.abs(grid_Er / er_denominator)),
     )
     grid_er_internal = jnp.log10(er_ratio)
 
