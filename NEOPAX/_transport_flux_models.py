@@ -3437,6 +3437,98 @@ class NTXDatabaseTransportModel(TransportFluxModelBase):
             int(diagnostic_face_text) if diagnostic_face_text else None
         )
 
+        # A fixed database has exactly one local geometry degree of freedom
+        # in the native finite-volume face primitive: the physical radial
+        # mesh scale ``a_b``.  The NTX/VMEC dependence of the table values is
+        # deliberately *not* part of this map; it is carried by the explicit
+        # table bar and folded through the recorded scan after the segment
+        # sweep.  The old implementation formed one reverse-mode VJP through
+        # the complete all-face evaluator for every face.  Besides retaining
+        # an unnecessarily large reverse graph, that exposed an undefined
+        # reverse branch at the outer face.  A single scalar JVP is the exact
+        # directional derivative of this local fixed-table map and contracts
+        # directly with all face cotangents.
+        if (
+            dataclasses.is_dataclass(geometry)
+            and hasattr(geometry, "a_b")
+            and hasattr(geometry, "rho_grid")
+            and hasattr(geometry, "rho_grid_half")
+        ):
+            def _geometry_at_physical_scale(a_b_value):
+                replacements = {"a_b": a_b_value}
+                rho_grid = jnp.asarray(geometry.rho_grid)
+                rho_grid_half = jnp.asarray(geometry.rho_grid_half)
+                if hasattr(geometry, "r_grid"):
+                    replacements["r_grid"] = rho_grid * a_b_value
+                if hasattr(geometry, "r_grid_half"):
+                    replacements["r_grid_half"] = rho_grid_half * a_b_value
+                if hasattr(geometry, "dr") and getattr(geometry, "dr") is not None:
+                    replacements["dr"] = (
+                        rho_grid_half[1] - rho_grid_half[0]
+                    ) * a_b_value
+                return dataclasses.replace(geometry, **replacements)
+
+            def _all_fixed_table_face_fluxes(a_b_value):
+                geometry_value = _geometry_at_physical_scale(a_b_value)
+                model = dataclasses.replace(
+                    self, geometry=geometry_value, database=self.database
+                )
+                local_face_state = (
+                    build_ntss_like_face_transport_state(
+                        state, geometry_value,
+                        bc_density=bc_density, bc_temperature=bc_temperature,
+                    )
+                    if str(face_mode).strip().lower()
+                    in {"ntss_like", "ntss", "half_point"}
+                    else build_face_transport_state(
+                        state, geometry_value,
+                        bc_density=bc_density, bc_temperature=bc_temperature,
+                    )
+                )
+                evaluated = build_evaluated_transport_state(
+                    state, geometry_value,
+                    bc_density=bc_density, bc_temperature=bc_temperature,
+                    density_floor=model.density_floor,
+                )
+                return model.evaluate_face_fluxes(
+                    state, local_face_state, evaluated_state=evaluated,
+                    bc_density=bc_density, bc_temperature=bc_temperature,
+                    particle_face_closure_mode=face_mode,
+                )
+
+            _, face_scale_tangent = jax.jvp(
+                _all_fixed_table_face_fluxes,
+                (jnp.asarray(geometry.a_b),),
+                (jnp.ones_like(jnp.asarray(geometry.a_b)),),
+            )
+
+            def _contract(channel_bar, channel_tangent):
+                if batched_rhs:
+                    return jnp.sum(
+                        channel_bar * channel_tangent[None, ...], axis=(-2, -1)
+                    )
+                return jnp.sum(channel_bar * channel_tangent)
+
+            a_b_bar = (
+                _contract(gamma_bar, face_scale_tangent["Gamma"])
+                + _contract(q_bar, face_scale_tangent["Q"])
+                + _contract(upar_bar, face_scale_tangent["Upar"])
+            )
+            geometry_bar = _float_delta_tree_like(geometry)
+            geometry_bar = dataclasses.replace(geometry_bar, a_b=a_b_bar)
+            if (
+                str(os.environ.get("NEOPAX_DATABASE_GEOMETRY_VJP_DIAGNOSTICS", ""))
+                .strip()
+                .lower()
+                in {"1", "true", "yes", "on"}
+            ):
+                jax.debug.print(
+                    "[database-geometry-vjp] source=face_flux_compact "
+                    "a_b_nonfinite={count}",
+                    count=jnp.sum(jnp.logical_not(jnp.isfinite(a_b_bar))),
+                )
+            return geometry_bar
+
         def _evaluate_local_face(geometry_value, database_value, face_index):
             model = dataclasses.replace(
                 self, geometry=geometry_value, database=database_value

@@ -437,6 +437,50 @@ def test_database_face_geometry_pullback_selects_compact_model_boundary():
     assert calls[0][0] == "state"
 
 
+def test_database_native_face_geometry_uses_one_physical_mesh_jvp():
+    """Fixed-table face geometry contracts the physical ``a_b`` tangent once."""
+    geometry = _PhysicalMeshGeometry(
+        a_b=jnp.asarray(2.0),
+        rho_grid=jnp.asarray([0.25, 0.75]),
+        rho_grid_half=jnp.asarray([0.0, 0.5, 1.0]),
+        r_grid=jnp.asarray([0.5, 1.5]),
+        r_grid_half=jnp.asarray([0.0, 1.0, 2.0]),
+        dr=jnp.asarray(1.0),
+    )
+
+    class _ToyDatabaseModel(NTXDatabaseTransportModel):
+        def evaluate_face_fluxes(self, _state, _face_state, **_kwargs):
+            faces = self.geometry.r_grid_half[None, :]
+            return {"Gamma": faces, "Q": 2.0 * faces, "Upar": -faces}
+
+    model = _ToyDatabaseModel(
+        species=None,
+        energy_grid=None,
+        geometry=geometry,
+        database=None,
+    )
+    state = TransportState(
+        density=jnp.ones((1, 2)),
+        pressure=jnp.ones((1, 2)),
+        Er=jnp.zeros((2,)),
+    )
+    face_state = SimpleNamespace(density=jnp.ones((1, 3)))
+    bars = {
+        "Gamma": jnp.asarray([[2.0, 3.0, 4.0]]),
+        "Q": jnp.asarray([[1.0, -2.0, 3.0]]),
+        "Upar": jnp.asarray([[0.5, 1.5, -1.0]]),
+    }
+    actual = model.pullback_direct_face_flux_geometry_by_radius(
+        state, face_state, bars, geometry
+    )
+    expected = jnp.vdot(bars["Gamma"], jnp.asarray([[0.0, 0.5, 1.0]]))
+    expected += jnp.vdot(bars["Q"], jnp.asarray([[0.0, 1.0, 2.0]]))
+    expected += jnp.vdot(bars["Upar"], jnp.asarray([[0.0, -0.5, -1.0]]))
+    assert jnp.allclose(actual.a_b, expected)
+    assert jnp.all(jnp.isfinite(actual.a_b))
+    assert jnp.array_equal(actual.r_grid_half, jnp.zeros_like(geometry.r_grid_half))
+
+
 def test_database_equation_payload_uses_full_geometry_tangent_like_lij():
     """Fixed-flux equation assembly keeps the established Lij tangent space."""
     geometry = _PhysicalMeshGeometry(
