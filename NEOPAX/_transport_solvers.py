@@ -15925,6 +15925,33 @@ def _radau_run_stage_subsolve(
         )
         if (
             node_edge_trace
+            and physics_context.build_node_high_resolution_lagged_response_from_flat
+            is not None
+            and physics_context.node_edge_ambipolar_rhs_tangent is not None
+        ):
+            # The initial resolution guard sees only z0.  Audit each actual
+            # Newton iterate as well, so a threshold crossing caused by the
+            # first correction is visible before deciding whether to restart
+            # the whole attempt on the high-resolution cache.
+            node_slope_change = _radau_node_edge_stage_slope_change(
+                kernel_context, physics_context, inputs, z_cur
+            )
+            node_slope_would_promote = node_slope_change > jnp.asarray(
+                physics_context.node_edge_stage_slope_retry_threshold,
+                dtype=kernel_context.dtype,
+            )
+            jax.debug.print(
+                "[radau-node-edge-resolution-iteration-check] iter={iter} "
+                "relative_slope_change={relative:.6e} threshold={threshold:.6e} "
+                "would_promote={would_promote}",
+                iter=iter_idx + 1,
+                relative=node_slope_change,
+                threshold=physics_context.node_edge_stage_slope_retry_threshold,
+                would_promote=node_slope_would_promote,
+                ordered=True,
+            )
+        if (
+            node_edge_trace
             and kernel_context.debug_cached_stage_jacobian_audit
             and physics_context.node_edge_ambipolar_rhs is not None
             and physics_context.node_edge_ambipolar_rhs_tangent is not None
@@ -16758,6 +16785,29 @@ def _radau_after_first_refresh_candidate(
     )
 
 
+def _radau_node_edge_stage_slope_change(
+    kernel_context: _RadauAcceptedStepKernelContext,
+    physics_context: _RadauAcceptedStepPhysicsContext,
+    inputs: _RadauStageSubsolveInputs,
+    stage_values,
+):
+    """Return the maximum private-edge slope change across stage values."""
+    tangent = physics_context.node_edge_ambipolar_rhs_tangent
+    if tangent is None:
+        return jnp.asarray(0.0, dtype=kernel_context.dtype)
+
+    stages = stage_values.reshape((kernel_context.num_stages, kernel_context.state_dim))
+    stage_states = inputs.flat_y[None, :] + inputs.h_value * (kernel_context.a @ stages)
+    edge_direction = jnp.asarray(1.0, dtype=kernel_context.dtype)
+    stage_slopes = jax.vmap(
+        lambda stage_state: tangent(stage_state, edge_direction, inputs.lagged_response)
+    )(stage_states)
+    anchor_slope = inputs.jacobian_ref[-1, -1]
+    return jnp.max(jnp.abs(stage_slopes - anchor_slope)) / jnp.maximum(
+        jnp.abs(anchor_slope), jnp.asarray(1.0, dtype=kernel_context.dtype)
+    )
+
+
 def _radau_maybe_promote_node_edge_resolution(
     kernel_context: _RadauAcceptedStepKernelContext,
     physics_context: _RadauAcceptedStepPhysicsContext,
@@ -16778,15 +16828,8 @@ def _radau_maybe_promote_node_edge_resolution(
     if not enabled:
         return inputs, jnp.asarray(False), jnp.asarray(0.0, dtype=kernel_context.dtype)
 
-    stages = inputs.z0.reshape((kernel_context.num_stages, kernel_context.state_dim))
-    stage_states = inputs.flat_y[None, :] + inputs.h_value * (kernel_context.a @ stages)
-    edge_direction = jnp.asarray(1.0, dtype=kernel_context.dtype)
-    stage_slopes = jax.vmap(
-        lambda stage_state: tangent(stage_state, edge_direction, inputs.lagged_response)
-    )(stage_states)
-    anchor_slope = inputs.jacobian_ref[-1, -1]
-    relative_slope_change = jnp.max(jnp.abs(stage_slopes - anchor_slope)) / jnp.maximum(
-        jnp.abs(anchor_slope), jnp.asarray(1.0, dtype=kernel_context.dtype)
+    relative_slope_change = _radau_node_edge_stage_slope_change(
+        kernel_context, physics_context, inputs, inputs.z0
     )
     promote = relative_slope_change > jnp.asarray(
         physics_context.node_edge_stage_slope_retry_threshold,
