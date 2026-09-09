@@ -267,6 +267,68 @@ def test_database_compact_flux_payload_routes_physical_mesh_bar_through_a_b():
     assert jnp.allclose(actual.a_b, 12.0)
 
 
+def test_database_compact_flux_payload_comoves_fixed_table_coordinates():
+    """A local geometry VJP must not interpolate with stale database a_b."""
+
+    class _ToyDatabaseModel(NTXDatabaseTransportModel):
+        def build_local_direct_flux_evaluator(self, state):
+            del state
+
+            def _evaluate(_radius_index, _er_value):
+                gamma = jnp.broadcast_to(self.database.a_b, (2,))
+                return {
+                    "Gamma": gamma,
+                    "Q": jnp.zeros_like(gamma),
+                    "Upar": jnp.zeros_like(gamma),
+                }
+
+            return _evaluate
+
+    geometry = _PhysicalMeshGeometry(
+        a_b=jnp.asarray(2.0),
+        rho_grid=jnp.asarray([0.25, 0.75]),
+        rho_grid_half=jnp.asarray([0.0, 0.5, 1.0]),
+        r_grid=jnp.asarray([0.5, 1.5]),
+        r_grid_half=jnp.asarray([0.0, 1.0, 2.0]),
+        dr=jnp.asarray(1.0),
+    )
+    database = Monoenergetic(
+        a_b=jnp.asarray(2.0),
+        rho=jnp.asarray([0.1, 0.3, 0.6, 0.9, 1.0]),
+        nu_log=jnp.asarray([-2.0]),
+        Er_list=jnp.zeros((5, 1)),
+        D11_log=jnp.zeros((5, 1, 1)),
+        D13=jnp.zeros((5, 1, 1)),
+        D33=jnp.zeros((5, 1, 1)),
+    )
+    model = _ToyDatabaseModel(
+        species=None,
+        energy_grid=None,
+        geometry=geometry,
+        database=database,
+    )
+    state = TransportState(
+        density=jnp.ones((2, 2)),
+        pressure=jnp.ones((2, 2)),
+        Er=jnp.asarray([0.1, 0.2]),
+    )
+
+    actual = model.pullback_direct_rhs_geometry_by_radius(
+        state,
+        {
+            "Gamma": jnp.ones((2, 2)),
+            "Q": jnp.zeros((2, 2)),
+            "Upar": jnp.zeros((2, 2)),
+        },
+        geometry,
+    )
+
+    # Two radii and two species each see the database scale co-moving with
+    # geometry.a_b.  Stale primal database coordinates would give zero.
+    assert jnp.all(jnp.isfinite(actual.a_b))
+    assert jnp.allclose(actual.a_b, 4.0)
+
+
 def test_database_equation_geometry_delta_keeps_axis_face_constrained():
     """Only the permanently-zero axis face is removed from a database delta."""
     geometry = _TestMomentumGeometry(

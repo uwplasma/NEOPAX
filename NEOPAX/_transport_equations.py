@@ -1,5 +1,6 @@
 from typing import Dict, Type
 import dataclasses
+import os
 import jax
 import jax.numpy as jnp
 from jax import jit
@@ -37,6 +38,13 @@ from ._neoclassical import _collisionality_kind
 DENSITY_STATE_TO_PHYSICAL = 1.0e20
 PARTICLE_FLUX_PHYSICAL_TO_STATE = 1.0e-20
 HEAT_FLUX_PHYSICAL_TO_STATE = 1.0e-23
+
+
+def _database_geometry_vjp_debug_enabled() -> bool:
+    """Enable provenance prints for the two database-only geometry VJPs."""
+    return str(
+        os.environ.get("NEOPAX_DATABASE_GEOMETRY_VJP_DIAGNOSTICS", "")
+    ).strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _minmod_pair(a, b):
@@ -2068,6 +2076,23 @@ class ComposedEquationSystem:
             geometry_delta0,
         )
         (geometry_bar,) = geometry_pullback(rhs_bar)
+        if _database_geometry_vjp_debug_enabled() and hasattr(geometry_bar, "a_b"):
+            a_b_bar = jnp.asarray(geometry_bar.a_b)
+
+            def _print_bad_a_b(_):
+                jax.debug.print(
+                    "[database-geometry-vjp] source=equation a_b_bar "
+                    "nonfinite_count={count}",
+                    count=jnp.sum(jnp.logical_not(jnp.isfinite(a_b_bar))),
+                )
+                return None
+
+            jax.lax.cond(
+                jnp.all(jnp.isfinite(a_b_bar)),
+                lambda _: None,
+                _print_bad_a_b,
+                operand=None,
+            )
         support_bar = dict(_float_delta_tree_like(support))
         support_bar["geometry"] = _sanitize_float_delta_bar_tree(
             geometry,

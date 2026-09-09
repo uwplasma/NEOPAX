@@ -87,7 +87,11 @@ from ._interpolators_preprocessed import (
     radial_preprocessed_interpolation_table_bar,
 )
 from ._interpolators import monoenergetic_interpolation_table_bar
-from ._monoenergetic import MONOENERGETIC_KIND_GENERIC, monoenergetic_database_kind
+from ._monoenergetic import (
+    MONOENERGETIC_KIND_GENERIC,
+    database_with_geometry_scale,
+    monoenergetic_database_kind,
+)
 from ._monoenergetic_interpolators import monoenergetic_interpolation_kernel
 from ._source_models import assemble_pressure_source_components, sum_source_components
 from ._model_api import (
@@ -3479,12 +3483,23 @@ class NTXDatabaseTransportModel(TransportFluxModelBase):
 
         def _accumulate(carry, radius_index):
             def _local_fluxes(flat_delta):
+                geometry_value = _database_geometry_with_constrained_axis_face(
+                    geometry,
+                    _split(flat_delta),
+                )
+                # The coefficient values stay fixed at this boundary, but the
+                # database interpolation coordinates contain a_b.  Letting
+                # geometry move while retaining the primal database metadata
+                # differentiates an inconsistent (off-manifold) model.
+                database_value = self.database
+                if database_value is not None:
+                    database_value = database_with_geometry_scale(
+                        database_value, geometry_value.a_b
+                    )
                 model = dataclasses.replace(
                     self,
-                    geometry=_database_geometry_with_constrained_axis_face(
-                        geometry,
-                        _split(flat_delta),
-                    ),
+                    geometry=geometry_value,
+                    database=database_value,
                 )
                 return model.build_local_direct_flux_evaluator(state)(
                     radius_index, state.Er[radius_index]
@@ -3519,7 +3534,31 @@ class NTXDatabaseTransportModel(TransportFluxModelBase):
             ),
             radius_indices,
         )
-        return _split(flat_bar)
+        geometry_bar = _split(flat_bar)
+        if (
+            str(os.environ.get("NEOPAX_DATABASE_GEOMETRY_VJP_DIAGNOSTICS", ""))
+            .strip()
+            .lower()
+            in {"1", "true", "yes", "on"}
+            and hasattr(geometry_bar, "a_b")
+        ):
+            a_b_bar = jnp.asarray(geometry_bar.a_b)
+
+            def _print_bad_a_b(_):
+                jax.debug.print(
+                    "[database-geometry-vjp] source=direct_flux a_b_bar "
+                    "nonfinite_count={count}",
+                    count=jnp.sum(jnp.logical_not(jnp.isfinite(a_b_bar))),
+                )
+                return None
+
+            jax.lax.cond(
+                jnp.all(jnp.isfinite(a_b_bar)),
+                lambda _: None,
+                _print_bad_a_b,
+                operand=None,
+            )
+        return geometry_bar
 
     def pullback_local_particle_flux_support_payload(self, state, flux_bar, support):
         """Transpose the boundary-aware database flux used by local Er roots."""
@@ -4154,9 +4193,19 @@ class NTXDatabaseTransportModel(TransportFluxModelBase):
 
         def _accumulate(flat_carry, radius_index):
             def _local_residual(flat_delta):
+                geometry_value = _database_geometry_with_constrained_axis_face(
+                    geometry,
+                    _split(flat_delta),
+                )
+                database_value = self.database
+                if database_value is not None:
+                    database_value = database_with_geometry_scale(
+                        database_value, geometry_value.a_b
+                    )
                 model = dataclasses.replace(
                     self,
-                    geometry=_add_float_delta_tree(geometry, _split(flat_delta)),
+                    geometry=geometry_value,
+                    database=database_value,
                 )
                 gamma = model.build_local_particle_flux_evaluator(state_with_er)(
                     radius_index,

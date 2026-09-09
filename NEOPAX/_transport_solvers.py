@@ -16070,11 +16070,20 @@ def _radau_run_stage_subsolve(
                 z_cur + audit_fraction * delta,
             )
             finite_difference_action = (residual_audit - residual_cur) / audit_fraction
-            frozen_matrix_action = _radau_frozen_stage_matrix_action(
-                kernel_context,
-                h_value=inputs.h_value,
-                jacobian_ref=inputs.jacobian_ref,
-                stage_direction=delta,
+            # In the full-stage lane the Newton solve above used the exact
+            # current coupled-stage matrix, not the frozen anchor matrix.
+            # Audit that same matrix action; otherwise this diagnostic would
+            # falsely report an anchor-Jacobian defect for a solve that did
+            # not use the anchor Jacobian.
+            frozen_matrix_action = (
+                current_stage_jacobian @ delta
+                if full_stage_newton
+                else _radau_frozen_stage_matrix_action(
+                    kernel_context,
+                    h_value=inputs.h_value,
+                    jacobian_ref=inputs.jacobian_ref,
+                    stage_direction=delta,
+                )
             )
             action_difference = finite_difference_action - frozen_matrix_action
             fd_norm = jnp.linalg.norm(finite_difference_action)
