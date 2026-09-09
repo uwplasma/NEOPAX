@@ -3502,7 +3502,43 @@ class NTXDatabaseTransportModel(TransportFluxModelBase):
              if batched_rhs else jnp.zeros_like(flat_delta0)),
             face_indices,
         )
-        return _split(flat_bar)
+        geometry_bar = _split(flat_bar)
+        if (
+            str(os.environ.get("NEOPAX_DATABASE_GEOMETRY_VJP_DIAGNOSTICS", ""))
+            .strip()
+            .lower()
+            in {"1", "true", "yes", "on"}
+            and hasattr(geometry_bar, "a_b")
+        ):
+            a_b_bar = jnp.asarray(geometry_bar.a_b)
+            face_mesh_bar = (
+                jnp.asarray(geometry_bar.r_grid_half)
+                if hasattr(geometry_bar, "r_grid_half")
+                else jnp.zeros((1,), dtype=a_b_bar.dtype)
+            )
+            a_b_nonfinite = jnp.logical_not(jnp.isfinite(a_b_bar))
+            face_mesh_nonfinite = jnp.logical_not(jnp.isfinite(face_mesh_bar))
+
+            def _print_bad_face_flux(_):
+                jax.debug.print(
+                    "[database-geometry-vjp] source=face_flux "
+                    "a_b_nonfinite={a_b_count} r_grid_half_nonfinite={face_count} "
+                    "first_r_grid_half_index={face_index}",
+                    a_b_count=jnp.sum(a_b_nonfinite),
+                    face_count=jnp.sum(face_mesh_nonfinite),
+                    face_index=jnp.argmax(face_mesh_nonfinite),
+                )
+                return None
+
+            jax.lax.cond(
+                jnp.logical_not(
+                    jnp.any(a_b_nonfinite) | jnp.any(face_mesh_nonfinite)
+                ),
+                lambda _: None,
+                _print_bad_face_flux,
+                operand=None,
+            )
+        return geometry_bar
 
     def pullback_direct_rhs_state(self, state, flux_bar):
         """Transpose the direct database flux map with respect to its state.

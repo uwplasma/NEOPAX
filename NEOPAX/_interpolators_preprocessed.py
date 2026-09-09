@@ -130,10 +130,19 @@ def radial_preprocessed_interpolation_stencil(grid_x, grid_nu, grid_Er, database
     nr = arr.shape[0]
     xri = jax.lax.cond(nr == 1, lambda: arr[0], lambda: jnp.maximum(1.0e-2 * arr[0], grid_x))
     grid_nu_internal = jnp.log10(jnp.maximum(1.0e-12, grid_nu))
+    # The magnetic-axis face has ``xri == 0`` when the scan includes rho=0.
+    # The low-radius branch below deliberately returns a fixed Er floor, but
+    # ``jnp.where`` evaluates its inactive division too.  Keep that inactive
+    # expression finite so its reverse rule cannot inject 0*inf/NaN into the
+    # a_b cotangent of a native face flux.
+    er_denominator = jnp.maximum(
+        jnp.abs(xri),
+        jnp.maximum(jnp.asarray(database.low_limit_r, dtype=xri.dtype), 1.0e-30),
+    )
     er_ratio = jnp.where(
         xri <= database.low_limit_r,
         database.Er_lower_limit,
-        jnp.maximum(database.Er_lower_limit, jnp.abs(grid_Er / xri)),
+        jnp.maximum(database.Er_lower_limit, jnp.abs(grid_Er / er_denominator)),
     )
     grid_er_internal = jnp.log10(er_ratio)
     inu = _clamped_interval_index(database.nu_log, grid_nu_internal)
