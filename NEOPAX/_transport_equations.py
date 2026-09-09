@@ -15,7 +15,6 @@ from ._source_models import (
 )
 from ._transport_flux_models import (
     _add_float_delta_tree,
-    _database_geometry_with_constrained_axis_face,
     _float_delta_tree_like,
     _sanitize_float_delta_bar_tree,
     build_evaluated_transport_state,
@@ -2056,10 +2055,13 @@ class ComposedEquationSystem:
         geometry_delta0 = _float_delta_tree_like(geometry)
 
         def _rhs_from_equation_geometry_delta(geometry_delta):
-            geometry_value = _database_geometry_with_constrained_axis_face(
-                geometry,
-                geometry_delta,
-            )
+            # This is finite-volume/source assembly, not database-table
+            # interpolation.  Keep its geometry tangent space identical to
+            # the established Lij realtime equation VJP: the VMEC payload
+            # provides the complete mutually-consistent field derivative
+            # (mesh, volumes, and metric factors), rather than treating a_b
+            # as a substitute for the other field leaves here.
+            geometry_value = _add_float_delta_tree(geometry, geometry_delta)
             equations_at_geometry = self._with_database_equation_geometry_and_fixed_flux(
                 geometry_value,
                 active_shared_flux_model,

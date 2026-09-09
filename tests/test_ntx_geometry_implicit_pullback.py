@@ -153,8 +153,8 @@ def test_database_geometry_delta_restores_vmec_radial_mesh_relations():
     assert jnp.allclose(bar.a_b, 3.0)
 
 
-def test_database_equation_payload_routes_physical_mesh_bar_through_a_b():
-    """The real fixed-flux equation boundary uses the coupled mesh helper."""
+def test_database_equation_payload_uses_full_geometry_tangent_like_lij():
+    """Fixed-flux equation assembly keeps the established Lij tangent space."""
     geometry = _PhysicalMeshGeometry(
         a_b=jnp.asarray(2.0),
         rho_grid=jnp.asarray([0.25, 0.75]),
@@ -201,10 +201,10 @@ def test_database_equation_payload_routes_physical_mesh_bar_through_a_b():
     )
 
     assert jnp.all(jnp.isfinite(actual["geometry"].r_grid_half))
-    assert jnp.allclose(actual["geometry"].r_grid, 0.0)
-    assert jnp.allclose(actual["geometry"].r_grid_half, 0.0)
-    assert jnp.allclose(actual["geometry"].dr, 0.0)
-    assert jnp.allclose(actual["geometry"].a_b, 3.0)
+    assert jnp.allclose(actual["geometry"].r_grid, jnp.ones((2,)))
+    assert jnp.allclose(actual["geometry"].r_grid_half, jnp.ones((3,)))
+    assert jnp.allclose(actual["geometry"].dr, 1.0)
+    assert jnp.allclose(actual["geometry"].a_b, 0.0)
 
 
 def test_database_compact_flux_payload_routes_physical_mesh_bar_through_a_b():
