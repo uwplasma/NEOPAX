@@ -37,6 +37,8 @@ from ._geometry_autodiff import (
     geometry_raw_block_transpose_from_state_bars,
 )
 from ._reverse_ad_initial_er import (
+    compact_initial_er_database_geometry_bars,
+    compact_initial_er_database_support_bars,
     compact_initial_er_ntx_support_pullback_leaves,
     compact_initial_er_state_pullback,
     find_ntx_support_payload,
@@ -45,8 +47,11 @@ from ._reverse_ad_initial_er import (
     initial_er_charge_flux_residuals,
     initial_er_root_setup,
     initial_er_selected_root_profile,
+    find_ntx_runtime_scan_model_in_model,
+    fold_recorded_ntx_scan_database_bar_groups_into_support,
     runtime_with_geometry_payload,
     runtime_with_ntx_support_payload,
+    split_recorded_ntx_database_runtime,
 )
 from ._reverse_ad_transport import (
     RealtimeGeometryTransportReverseTableContext,
@@ -56,6 +61,7 @@ from ._reverse_ad_transport import (
     TransportReverseReportRunner,
     TransportReverseTableResultBuilder,
     bootstrap_current_softmax_abs_scaled,
+    bootstrap_current_softmax_abs_value_and_upar_bar,
     net_total_power_volume_average,
     normalize_transport_objective_names,
     realtime_geometry_transport_reverse_table_from_payload_cotangents,
@@ -779,6 +785,226 @@ def _row_from_batched_tree(tree, row_index: int):
 
 def _stack_tree_rows(rows: Sequence[Any]):
     return jax.tree_util.tree_map(lambda *leaves: jnp.stack(leaves, axis=0), *rows)
+
+
+def _database_geometry_active_initial_er_root_only_reverse_table(
+    *,
+    config: Mapping[str, object],
+    objective_names: Sequence[str] | str,
+    parameter_set: ReverseADParameterSet,
+    parameter_values,
+    runtime,
+    profile_values,
+    pre_root_state_from_profile_values: Callable[[object], object],
+    geometry_context,
+    baseline_geometry_deltas,
+    n_r: int,
+    n_theta: int,
+    n_zeta: int,
+    n_xi: int,
+    surface_backend: str,
+    max_iter,
+    solver_device: str,
+    progress_label: str | None,
+    options: Mapping[str, object] | None,
+) -> ObjectiveTableResult:
+    """Database-native selected-root reverse with one recorded scan fold.
+
+    The implicit selected-root term uses exactly the full database reverse
+    boundary: direct fixed-table geometry bars plus a table bar consumed by
+    one retained scan transpose.  Bootstrap uses the same compact corrected-
+    Upar state/geometry/table split as full transport reverse.
+    """
+    names = normalize_initial_er_root_only_objective_names(objective_names)
+    vmec_specs = tuple(parameter_set.vmec_boundary_specs)
+    if not vmec_specs:
+        raise ValueError("Database geometry root-only reverse requires VMEC boundary parameters.")
+
+    # The fixed runtime is the only object seen by root/objective closures.
+    # Keep the recorded scan owner out of those closures and consume its
+    # database cotangent once below, exactly as full transport reverse does.
+    database_segment, recorded_scan_owner = split_recorded_ntx_database_runtime(runtime)
+    fixed_runtime = database_segment.runtime
+    support = {
+        "geometry": fixed_runtime.geometry,
+        # Use the exact table owned by the retained scan record.  The fixed
+        # model references this same object; spelling it here makes the
+        # one-fold identity explicit and avoids any stale RuntimeContext
+        # convenience field.
+        "database": recorded_scan_owner.runtime_scan.database,
+    }
+    baseline_geometry = support["geometry"]
+    geometry_delta0 = _float_delta_tree_like(baseline_geometry)
+    profile_values_arr = jnp.asarray(profile_values)
+    pre_root_state = pre_root_state_from_profile_values(profile_values_arr)
+    er_profile, finite_mask = initial_er_selected_root_profile(
+        pre_root_state, config=dict(config), runtime=fixed_runtime
+    )
+    er_profile = jnp.asarray(er_profile, dtype=pre_root_state.Er.dtype)
+    finite_mask = jnp.asarray(finite_mask, dtype=bool)
+    rooted_state = dataclasses.replace(pre_root_state, Er=er_profile)
+
+    generic_names = tuple(name for name in names if name != _BOOTSTRAP_CURRENT_OBJECTIVE)
+
+    def _objective_values(state_value, geometry_delta):
+        geometry = _add_float_delta_tree(baseline_geometry, geometry_delta)
+        return _initial_er_root_only_objective_values(
+            state_value,
+            runtime_with_geometry_payload(fixed_runtime, geometry),
+            generic_names,
+            options=options,
+        )
+
+    direct_values = {}
+    direct_state_bars = {}
+    direct_geometry_bars = {}
+    direct_database_bars = {}
+    if generic_names:
+        generic_values, objective_pullback = jax.vjp(
+            _objective_values, rooted_state, geometry_delta0
+        )
+        generic_basis = jnp.eye(len(generic_names), dtype=jnp.asarray(generic_values).dtype)
+        generic_state_bars, generic_geometry_bars = jax.vmap(objective_pullback)(generic_basis)
+        for row, name in enumerate(generic_names):
+            direct_values[name] = generic_values[row]
+            direct_state_bars[name] = _row_from_batched_tree(generic_state_bars, row)
+            direct_geometry_bars[name] = _row_from_batched_tree(generic_geometry_bars, row)
+            direct_database_bars[name] = _float_delta_tree_like(support["database"])
+
+    if _BOOTSTRAP_CURRENT_OBJECTIVE in names:
+        flux_model = getattr(fixed_runtime.models, "flux", None)
+        neoclassical_model = getattr(flux_model, "neoclassical_model", flux_model)
+        upar_only = getattr(neoclassical_model, "evaluate_momentum_corrected_upar_only", None)
+        joint_pullback = getattr(
+            neoclassical_model, "pullback_momentum_corrected_upar_state_geometry_by_radius", None
+        )
+        database_pullback = getattr(
+            neoclassical_model, "pullback_momentum_corrected_upar_database_by_radius", None
+        )
+        if not all(callable(fn) for fn in (upar_only, joint_pullback, database_pullback)):
+            raise NotImplementedError(
+                "Database root-only bootstrap requires compact Upar state/geometry and table pullbacks."
+            )
+        bootstrap_value, upar_bar = bootstrap_current_softmax_abs_value_and_upar_bar(
+            rooted_state, fixed_runtime, {"Upar": upar_only(rooted_state)}
+        )
+        bootstrap_state_bar, bootstrap_geometry_bar = joint_pullback(
+            rooted_state, upar_bar, support["geometry"]
+        )
+        d11_bar, d13_bar, d33_bar = database_pullback(rooted_state, upar_bar)
+        direct_values[_BOOTSTRAP_CURRENT_OBJECTIVE] = bootstrap_value
+        direct_state_bars[_BOOTSTRAP_CURRENT_OBJECTIVE] = bootstrap_state_bar
+        direct_geometry_bars[_BOOTSTRAP_CURRENT_OBJECTIVE] = bootstrap_geometry_bar
+        direct_database_bars[_BOOTSTRAP_CURRENT_OBJECTIVE] = dataclasses.replace(
+            _float_delta_tree_like(support["database"]),
+            D11_log=d11_bar, D13=d13_bar, D33=d33_bar,
+        )
+
+    values = jnp.stack([direct_values[name] for name in names])
+    rooted_state_bars = _stack_tree_rows([direct_state_bars[name] for name in names])
+    direct_geometry_bars = _stack_tree_rows([direct_geometry_bars[name] for name in names])
+    direct_database_bars = _stack_tree_rows([direct_database_bars[name] for name in names])
+
+    dres_der = initial_er_charge_flux_residual_er_derivative(
+        pre_root_state, er_profile, runtime=fixed_runtime
+    )
+    safe_dres_der = jnp.where(
+        jnp.abs(dres_der) > jnp.asarray(1.0e-30, dtype=dres_der.dtype), dres_der, jnp.inf
+    )
+    residual_bars = jnp.where(
+        finite_mask[None, :], -jnp.asarray(rooted_state_bars.Er) / safe_dres_der[None, :], 0.0
+    )
+    state_residual_bars = compact_initial_er_state_pullback(
+        residual_scalar_fn=initial_er_charge_flux_residual_scalar,
+        state=pre_root_state,
+        er_profile=er_profile,
+        residual_bars=residual_bars,
+        runtime=fixed_runtime,
+    )
+    pre_root_state_bars = _add_trees(
+        dataclasses.replace(rooted_state_bars, Er=jnp.zeros_like(rooted_state_bars.Er)),
+        state_residual_bars,
+    )
+
+    profile_specs = tuple(parameter_set.profile_specs)
+    if profile_specs:
+        _, profile_pullback = jax.vjp(pre_root_state_from_profile_values, profile_values_arr)
+        all_profile_bars = jax.vmap(lambda bar: profile_pullback(bar)[0])(pre_root_state_bars)
+        canonical_profile_lookup = {name: i for i, name in enumerate(PROFILE_PARAMETER_ORDER)}
+        profile_matrix = jnp.stack(
+            [all_profile_bars[:, canonical_profile_lookup[spec.name]] for spec in profile_specs], axis=1
+        )
+    else:
+        profile_matrix = jnp.zeros((len(names), 0), dtype=jnp.asarray(values).dtype)
+
+    table_bars = compact_initial_er_database_support_bars(
+        runtime=fixed_runtime, state=pre_root_state, er_profile=er_profile,
+        residual_bars=residual_bars, support=support,
+    )
+    residual_geometry_bars = compact_initial_er_database_geometry_bars(
+        runtime=fixed_runtime, state=pre_root_state, er_profile=er_profile,
+        residual_bars=residual_bars, support=support,
+    )
+    support_bars = tuple(
+        {
+            "geometry": _add_trees(
+                _row_from_batched_tree(direct_geometry_bars, row),
+                _row_from_batched_tree(residual_geometry_bars, row),
+            ),
+            "database": _add_trees(
+                _row_from_batched_tree(table_bars, row),
+                _row_from_batched_tree(direct_database_bars, row),
+            ),
+        }
+        for row in range(len(names))
+    )
+    (support_bars,) = fold_recorded_ntx_scan_database_bar_groups_into_support(
+        recorded_scan_owner, (support_bars,)
+    )
+    support_bars = jax.block_until_ready(support_bars)
+    if progress_label:
+        print(
+            f"{progress_label} database selected-root table fold ready "
+            f"objective_rows={len(names)} contract=one_batched_scan_transpose",
+            flush=True,
+        )
+
+    geometry_param_specs = tuple(spec.as_tuple() for spec in vmec_specs)
+    neoclassical_cfg = config.get("neoclassical", {})
+    assembly = realtime_geometry_transport_reverse_table_from_payload_cotangents(
+        objective_labels=names,
+        profile_parameter_labels=tuple(spec.label for spec in profile_specs),
+        geometry_parameter_labels=tuple(spec.vmec_label for spec in vmec_specs),
+        objective_values=values,
+        profile_gradient_matrix=profile_matrix,
+        geometry_context=geometry_context,
+        baseline_geometry_deltas=baseline_geometry_deltas,
+        geometry_param_specs=geometry_param_specs,
+        support_bars=support_bars,
+        combined_geometry_payload=True,
+        payload_kind="ntx_scan_runtime",
+        scan_rho=neoclassical_cfg.get("ntx_scan_rho"),
+        scan_surface_backend=str(neoclassical_cfg.get("ntx_scan_surface_backend", "vmec")),
+        n_r=int(n_r), n_theta=int(n_theta), n_zeta=int(n_zeta), n_xi=int(n_xi),
+        surface_backend=str(surface_backend), max_iter=max_iter,
+        solver_device=solver_device, progress_label=progress_label,
+        return_branch_gradients=False,
+    )
+    geometry_matrix = jnp.asarray(assembly.table_result.geometry_gradient_matrix)
+    columns = []
+    for row in range(len(names)):
+        row_columns = []
+        profile_index = 0
+        geometry_index = 0
+        for spec in parameter_set.specs:
+            if isinstance(spec, ProfileParameterSpec):
+                row_columns.append(profile_matrix[row, profile_index]); profile_index += 1
+            elif isinstance(spec, VmecBoundaryParameterSpec):
+                row_columns.append(geometry_matrix[row, geometry_index]); geometry_index += 1
+            else:
+                raise TypeError(f"Unsupported reverse-AD parameter spec {type(spec).__name__}.")
+        columns.append(jnp.stack(row_columns))
+    return ObjectiveTableResult(objective_names=names, values=values, jacobian=jnp.stack(columns))
 
 
 def _initial_er_root_only_objective_values(
@@ -1820,6 +2046,32 @@ def geometry_active_initial_er_root_only_reverse_table(
     geometry/support payload cotangents to VMEC boundary columns with the same
     raw-block payload pullback used by the realtime reverse benchmark.
     """
+
+    # A recorded runtime scan is the database architecture.  Do not let it
+    # enter the Lij ``ntx_support`` root-only implementation below: that
+    # would either fail to find a support tree or, worse, bypass the explicit
+    # fixed-table/one-scan-fold reverse boundary used by full transport AD.
+    if find_ntx_runtime_scan_model_in_model(runtime.models.flux) is not None:
+        return _database_geometry_active_initial_er_root_only_reverse_table(
+            config=config,
+            objective_names=objective_names,
+            parameter_set=parameter_set,
+            parameter_values=parameter_values,
+            runtime=runtime,
+            profile_values=profile_values,
+            pre_root_state_from_profile_values=pre_root_state_from_profile_values,
+            geometry_context=geometry_context,
+            baseline_geometry_deltas=baseline_geometry_deltas,
+            n_r=n_r,
+            n_theta=n_theta,
+            n_zeta=n_zeta,
+            n_xi=n_xi,
+            surface_backend=surface_backend,
+            max_iter=max_iter,
+            solver_device=solver_device,
+            progress_label=progress_label,
+            options=options,
+        )
 
     def _probe(label: str) -> None:
         # Test-only instrumentation. Default/benchmark calls leave this unset.

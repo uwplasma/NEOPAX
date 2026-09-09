@@ -12,6 +12,7 @@ import pytest
 
 import NEOPAX._neoclassical as neoclassical_module
 import NEOPAX._reverse_ad_initial_er as initial_er_module
+import NEOPAX._reverse_ad_optimization as reverse_optimization_module
 import NEOPAX._transport_equations as transport_equations_module
 
 from NEOPAX._transport_flux_models import (
@@ -4401,3 +4402,44 @@ def test_compact_record_lagged_preparation_preserves_rebuild_and_reuse_contract(
     assert jnp.allclose(reference_y, reuse_carry.lagged_reference_y)
     assert bool(reused)
     _assert_float_tree_allclose(record, zero_record)
+
+
+def test_database_root_only_geometry_reverse_dispatches_to_recorded_table_boundary(monkeypatch):
+    """A recorded database scan must not enter the Lij root-only support route."""
+    sentinel = object()
+    captured = {}
+
+    monkeypatch.setattr(
+        reverse_optimization_module,
+        "find_ntx_runtime_scan_model_in_model",
+        lambda _model: object(),
+    )
+
+    def _database_boundary(**kwargs):
+        captured.update(kwargs)
+        return sentinel
+
+    monkeypatch.setattr(
+        reverse_optimization_module,
+        "_database_geometry_active_initial_er_root_only_reverse_table",
+        _database_boundary,
+    )
+    runtime = SimpleNamespace(models=SimpleNamespace(flux=object()))
+    actual = reverse_optimization_module.geometry_active_initial_er_root_only_reverse_table(
+        config={},
+        objective_names=("softmax_Er",),
+        parameter_set=object(),
+        parameter_values=jnp.asarray([0.0]),
+        runtime=runtime,
+        profile_values=jnp.asarray([0.0]),
+        pre_root_state_from_profile_values=lambda _value: None,
+        geometry_context=object(),
+        baseline_geometry_deltas=jnp.asarray([0.0]),
+        n_r=7,
+        n_theta=5,
+        n_zeta=5,
+        n_xi=4,
+    )
+    assert actual is sentinel
+    assert captured["runtime"] is runtime
+    assert captured["objective_names"] == ("softmax_Er",)
