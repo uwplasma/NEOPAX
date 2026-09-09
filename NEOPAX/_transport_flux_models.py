@@ -44,6 +44,7 @@ from ._neoclassical import (
     get_Neoclassical_Fluxes_Faces,
     get_Neoclassical_Fluxes_With_Momentum_Correction,
     get_Neoclassical_Upar_With_Momentum_Correction,
+    pullback_preprocessed_radial_database_face_fluxes,
     pullback_preprocessed_radial_database_fluxes,
 )
 from ._species import get_Thermodynamical_Forces_A1, get_Thermodynamical_Forces_A2, get_Thermodynamical_Forces_A3
@@ -1935,6 +1936,38 @@ class CombinedTransportFluxModel(TransportFluxModelBase):
             )
         return out
 
+    def pullback_direct_face_flux_support_payload(
+        self, state, face_state, flux_bar, support, **kwargs
+    ):
+        """Route a direct composite face table bar to its database owner."""
+        pullback = getattr(
+            self.neoclassical_model, "pullback_direct_face_flux_support_payload", None
+        )
+        if not callable(pullback):
+            return None
+        zero = jnp.zeros_like(jnp.asarray(face_state.density))
+
+        def _bar(name):
+            # Equation closures expose native face channels as ``*_faces``.
+            # Keep accepting unsuffixed names for small standalone callers.
+            value = flux_bar.get(f"{name}_faces", flux_bar.get(name, None))
+            if value is None:
+                return zero
+            value = jnp.asarray(value)
+            return zero if value.ndim == 0 or value.dtype == jax.dtypes.float0 else value
+
+        return pullback(
+            state,
+            face_state,
+            {
+                "Gamma": _bar("Gamma") + _bar("Gamma_neo"),
+                "Q": _bar("Q") + _bar("Q_neo"),
+                "Upar": _bar("Upar") + _bar("Upar_neo"),
+            },
+            support,
+            **kwargs,
+        )
+
     def build_lagged_response(self, state, **kwargs):
         er_edge_override = kwargs.pop("er_edge_override", None)
         neo_kwargs = dict(kwargs)
@@ -3243,6 +3276,79 @@ class NTXDatabaseTransportModel(TransportFluxModelBase):
             "Q": q_neo,
             "Upar": upar_neo,
         }
+
+    def pullback_direct_face_flux_support_payload(
+        self, state, face_state, flux_bar, support, **kwargs
+    ):
+        """Compact fixed-table transpose of direct native face fluxes."""
+        if not isinstance(support, dict) or "database" not in support:
+            return None
+        evaluated = kwargs.get("evaluated_state")
+        if evaluated is None:
+            evaluated = build_evaluated_transport_state(
+                state,
+                self.geometry,
+                bc_density=kwargs.get("bc_density", self.bc_density),
+                bc_temperature=kwargs.get("bc_temperature", self.bc_temperature),
+                density_floor=self.density_floor,
+            )
+        mode = str(kwargs.get("particle_face_closure_mode", "reconstructed")).strip().lower()
+        if mode in {"ntss_like", "ntss", "half_point"}:
+            dndr_faces = _ntss_like_face_gradient(
+                evaluated.center.density, self.geometry.r_grid_half,
+                bc_model=kwargs.get("bc_density", self.bc_density),
+            )
+            dtdr_faces = _ntss_like_face_gradient(
+                evaluated.center.temperature, self.geometry.r_grid_half,
+                bc_model=kwargs.get("bc_temperature", self.bc_temperature),
+            )
+        else:
+            dndr_faces = evaluated.density_grad_face
+            dtdr_faces = evaluated.temperature_grad_face
+        database = support["database"]
+        zero = jnp.zeros_like(jnp.asarray(face_state.density))
+
+        def _bar(name):
+            value = flux_bar.get(name, None)
+            if value is None:
+                return zero
+            value = jnp.asarray(value)
+            return zero if value.ndim == 0 or value.dtype == jax.dtypes.float0 else value
+
+        d11_bar, d13_bar, d33_bar = pullback_preprocessed_radial_database_face_fluxes(
+            self.species,
+            self.energy_grid,
+            self.geometry,
+            database,
+            face_state.Er,
+            face_state.temperature,
+            safe_density(face_state.density, self.density_floor),
+            dndr_faces,
+            dtdr_faces,
+            _bar("Gamma"),
+            _bar("Q"),
+            _bar("Upar"),
+            _collisionality_kind(self.collisionality_model),
+        )
+        database_bar = _float_delta_tree_like(database)
+        batched_rhs = jnp.asarray(d11_bar).ndim == jnp.asarray(database.D11_log).ndim + 1
+        if batched_rhs:
+            count = jnp.asarray(d11_bar).shape[0]
+            database_bar = jax.tree_util.tree_map(
+                lambda value: jnp.broadcast_to(
+                    jnp.asarray(value)[None, ...], (count,) + jnp.asarray(value).shape
+                ),
+                database_bar,
+            )
+        database_bar = dataclasses.replace(
+            database_bar, D11_log=d11_bar, D13=d13_bar, D33=d33_bar
+        )
+        result = dict(_float_delta_tree_like(support))
+        result["database"] = (
+            database_bar if batched_rhs
+            else _sanitize_float_delta_bar_tree(database, database_bar)
+        )
+        return result
 
     def pullback_direct_rhs_state(self, state, flux_bar):
         """Transpose the direct database flux map with respect to its state.
@@ -5826,6 +5932,17 @@ class NTXRuntimeScanTransportModel(TransportFluxModelBase):
     def pullback_direct_rhs_state(self, state, flux_bar):
         """Delegate the direct database state transpose without rebuilding."""
         return self._database_model().pullback_direct_rhs_state(state, flux_bar)
+
+    def pullback_direct_face_flux_support_payload(
+        self, state, face_state, flux_bar, support, **kwargs
+    ):
+        """Delegate the compact native face-table transpose without a scan."""
+        if not isinstance(support, dict) or "database" not in support:
+            return None
+        model = self.with_support_payload(support)
+        return model._database_model().pullback_direct_face_flux_support_payload(
+            state, face_state, flux_bar, {"database": support["database"]}, **kwargs
+        )
 
     def pullback_direct_rhs_geometry_by_radius(self, state, flux_bar, geometry):
         """Delegate the compact fixed-database direct-flux geometry transpose."""

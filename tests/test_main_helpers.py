@@ -63,6 +63,8 @@ from NEOPAX._interpolators_preprocessed import (
 from NEOPAX._neoclassical import (
     _collisionality_kind,
     get_Neoclassical_Fluxes,
+    get_Neoclassical_Fluxes_Faces,
+    pullback_preprocessed_radial_database_face_fluxes,
     pullback_preprocessed_radial_database_fluxes,
 )
 from NEOPAX._monoenergetic_interpolators import monoenergetic_interpolation_kernel
@@ -3956,6 +3958,111 @@ def test_radial_database_flux_table_transpose_matches_generic_vjp():
     ):
         assert jnp.allclose(actual_leaf, expected_leaf, rtol=2.0e-10, atol=2.0e-10)
 
+
+def test_radial_database_face_flux_table_transpose_matches_generic_vjp():
+    """The native face transpose is exactly the primal face-flux map's VJP.
+
+    This guards the production path against falling back to a VJP through the
+    complete face/database graph, which is what caused the segment OOM.
+    """
+    rho = jnp.asarray([0.1, 0.3, 0.5, 0.7, 0.9])
+    nu_v = jnp.asarray([1.0e-3, 1.0e-2, 1.0e-1])
+    er = jnp.asarray([[1.0e-4, 1.0e-3, 1.0e-2, 1.0e-1]])
+    shape = (rho.size, nu_v.size, er.shape[1])
+    base = jnp.reshape(jnp.arange(int(jnp.prod(jnp.asarray(shape))), dtype=jnp.float64), shape)
+    database = PreprocessedMonoenergetic3DNTSSRadius.read_data(
+        a_b=1.0, rho=rho, nu_v=nu_v, Er=er, drds=jnp.ones_like(rho),
+        D11=1.0 + 0.01 * base, D13=0.2 + 0.001 * base, D33=0.3 + 0.002 * base,
+    )
+    geometry = collections.namedtuple(
+        "CompactFaceTransposeGeometry", "r_grid r_grid_half dr full_grid_indices"
+    )(
+        jnp.asarray([0.2, 0.4, 0.6, 0.8]), rho,
+        jnp.asarray(0.2), jnp.arange(4, dtype=jnp.int32),
+    )
+    species = Species(
+        number_species=2, species_indices=jnp.asarray([0, 1]),
+        mass_mp=jnp.asarray([5.446e-4, 2.0]), charge_qp=jnp.asarray([-1.0, 1.0]),
+        names=("e", "D"),
+    )
+    energy_grid = collections.namedtuple(
+        "CompactFaceTransposeEnergyGrid",
+        "xWeights L11_weight L12_weight L22_weight L13_weight L23_weight L33_weight v_norm",
+    )(
+        jnp.asarray([0.25, 0.75]), jnp.asarray([1.0, 0.7]),
+        jnp.asarray([0.1, -0.2]), jnp.asarray([0.8, 1.2]),
+        jnp.asarray([0.4, 0.5]), jnp.asarray([-0.3, 0.2]),
+        jnp.asarray([1.1, 0.6]), jnp.asarray([1.2, 1.8]),
+    )
+    density_faces = jnp.asarray([
+        [1.0, 1.03, 1.07, 1.12, 1.18],
+        [0.9, 0.93, 0.97, 1.02, 1.08],
+    ])
+    temperature_faces = jnp.asarray([
+        [2.0, 2.04, 2.09, 2.15, 2.22],
+        [1.6, 1.64, 1.69, 1.75, 1.82],
+    ])
+    dndr_faces = jnp.asarray([
+        [0.10, 0.11, 0.12, 0.13, 0.14],
+        [0.07, 0.08, 0.09, 0.10, 0.11],
+    ])
+    dtdr_faces = jnp.asarray([
+        [0.15, 0.16, 0.17, 0.18, 0.19],
+        [0.11, 0.12, 0.13, 0.14, 0.15],
+    ])
+    er_faces = jnp.asarray([1.0e-4, -1.1e-4, 1.2e-4, -1.3e-4, 1.4e-4])
+    gamma_bar = jnp.asarray([
+        [0.2, -0.1, 0.3, -0.4, 0.1],
+        [-0.3, 0.5, -0.2, 0.1, -0.4],
+    ])
+    q_bar = -0.7 * gamma_bar
+    upar_bar = 0.4 * gamma_bar
+
+    def _fluxes(d11_log, d13, d33):
+        _, gamma, q, upar = get_Neoclassical_Fluxes_Faces(
+            species, energy_grid, geometry,
+            dataclasses.replace(database, D11_log=d11_log, D13=d13, D33=d33),
+            er_faces, temperature_faces, density_faces, dndr_faces, dtdr_faces,
+        )
+        return gamma, q, upar
+
+    _, generic_pullback = jax.vjp(
+        _fluxes, database.D11_log, database.D13, database.D33
+    )
+    expected = generic_pullback((gamma_bar, q_bar, upar_bar))
+    actual = pullback_preprocessed_radial_database_face_fluxes(
+        species, energy_grid, geometry, database, er_faces, temperature_faces,
+        density_faces, dndr_faces, dtdr_faces, gamma_bar, q_bar, upar_bar,
+    )
+    for name, actual_table_bar, expected_table_bar in zip(
+        ("D11_log", "D13", "D33"), actual, expected, strict=True
+    ):
+        assert jnp.allclose(actual_table_bar, expected_table_bar, rtol=2.0e-10, atol=2.0e-10), name
+
+    # Radau objective rows use the same primitive with a leading RHS axis.
+    rows = (
+        (gamma_bar, q_bar, upar_bar),
+        (-0.3 * gamma_bar, 0.2 * q_bar, -0.5 * upar_bar),
+    )
+    batched = pullback_preprocessed_radial_database_face_fluxes(
+        species, energy_grid, geometry, database, er_faces, temperature_faces,
+        density_faces, dndr_faces, dtdr_faces,
+        *(jnp.stack(tuple(row[channel] for row in rows)) for channel in range(3)),
+    )
+    scalar_rows = tuple(
+        pullback_preprocessed_radial_database_face_fluxes(
+            species, energy_grid, geometry, database, er_faces, temperature_faces,
+            density_faces, dndr_faces, dtdr_faces, *row,
+        )
+        for row in rows
+    )
+    for table_index, actual_table_bar in enumerate(batched):
+        assert jnp.allclose(
+            actual_table_bar,
+            jnp.stack(tuple(row[table_index] for row in scalar_rows)),
+            rtol=2.0e-10,
+            atol=2.0e-10,
+        )
 
 def test_legacy_monoenergetic_flux_table_transpose_matches_generic_vjp():
     """The black-box centre rule remains exact for scan-generated tables."""

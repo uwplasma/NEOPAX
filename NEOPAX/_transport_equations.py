@@ -481,6 +481,40 @@ def build_density_equation(
             center_fluxes=center_fluxes,
             evaluated_state=evaluated_state,
         )
+
+    def database_face_table_pullback(state, center_fluxes, flux_bar, support):
+        """Use the database owner's compact native face-table transpose."""
+        state = apply_transport_density_floor(state, density_floor)
+        state = apply_transport_temperature_floor(state, temperature_floor, density_floor)
+        evaluated_state = build_evaluated_transport_state(
+            state, field, bc_density=bc_density, bc_temperature=bc_temperature,
+            bc_er=bc_er, reconstruction=reconstruction,
+            density_floor=density_floor, temperature_floor=temperature_floor,
+        )
+        face_mode = str(particle_face_closure_mode).strip().lower()
+        face_state = (
+            build_ntss_like_face_transport_state(
+                state, field, bc_density=bc_density, bc_temperature=bc_temperature,
+                bc_er=bc_er, density_floor=density_floor, temperature_floor=temperature_floor,
+            )
+            if face_mode in {"ntss_like", "ntss", "half_point"}
+            else build_face_transport_state(
+                state, field, bc_density=bc_density, bc_temperature=bc_temperature,
+                bc_er=bc_er, reconstruction=reconstruction,
+                density_floor=density_floor, temperature_floor=temperature_floor,
+            )
+        )
+        pullback = getattr(flux_model, "pullback_direct_face_flux_support_payload", None)
+        if not callable(pullback):
+            raise NotImplementedError("Database density face closure lacks a compact table transpose.")
+        return pullback(
+            state, face_state, flux_bar, support,
+            bc_density=bc_density, bc_temperature=bc_temperature, bc_er=bc_er,
+            particle_face_closure_mode=face_mode, center_fluxes=center_fluxes,
+            evaluated_state=evaluated_state,
+        )
+
+    face_flux_builder.database_table_pullback = database_face_table_pullback
     if active_species_mask is None:
         active_species_mask = jnp.ones(species.number_species, dtype=bool)
     active_species_mask = jnp.asarray(active_species_mask, dtype=bool)
@@ -926,6 +960,32 @@ def build_temperature_equation(
             center_fluxes=center_fluxes,
             evaluated_state=evaluated_state,
         )
+
+    def database_face_table_pullback(state, center_fluxes, flux_bar, support):
+        """Use the database owner's compact native face-table transpose."""
+        state = apply_transport_density_floor(state, density_floor)
+        state = apply_transport_temperature_floor(state, temperature_floor, density_floor)
+        evaluated_state = build_evaluated_transport_state(
+            state, field, bc_density=bc_density, bc_temperature=bc_temperature,
+            bc_er=bc_er, reconstruction=reconstruction,
+            density_floor=density_floor, temperature_floor=temperature_floor,
+        )
+        face_state = build_face_transport_state(
+            state, field, bc_density=bc_density, bc_temperature=bc_temperature,
+            bc_er=bc_er, reconstruction=reconstruction,
+            density_floor=density_floor, temperature_floor=temperature_floor,
+        )
+        pullback = getattr(flux_model, "pullback_direct_face_flux_support_payload", None)
+        if not callable(pullback):
+            raise NotImplementedError("Database temperature face closure lacks a compact table transpose.")
+        return pullback(
+            state, face_state, flux_bar, support,
+            bc_density=bc_density, bc_temperature=bc_temperature, bc_er=bc_er,
+            center_fluxes=center_fluxes, evaluated_state=evaluated_state,
+        )
+
+    face_flux_builder.database_table_pullback = database_face_table_pullback
+
     def er_faces_builder(state):
         return build_face_transport_state(
             state,
@@ -2553,6 +2613,38 @@ class ComposedEquationSystem:
         def _one_equation_face_bar(equation_name, face_bar):
             if not face_bar:
                 return _float_delta_tree_like(database)
+
+            # Production database equations expose an explicit sparse face
+            # table transpose.  Do not replace it with a generic VJP: that
+            # would retain the full database interpolation graph per face
+            # closure and defeats the whole segmented-memory boundary.
+            equations_at_primal = self.with_realtime_geometry_support_payload(support)
+            equation_at_primal = getattr(
+                equations_at_primal, f"{equation_name}_equation"
+            )
+            compact_pullback = getattr(
+                getattr(equation_at_primal, "face_flux_builder", None),
+                "database_table_pullback",
+                None,
+            )
+            if callable(compact_pullback):
+                support_bar = compact_pullback(
+                    working_state, center_fluxes, face_bar, support
+                )
+                if not isinstance(support_bar, dict) or "database" not in support_bar:
+                    raise ValueError("Compact database face transpose did not return a table bar.")
+                return support_bar["database"]
+
+            # A concrete transport system must never silently take the dense
+            # fallback below.  Its complete VJP captures the full face
+            # database-interpolation graph and was precisely the source of
+            # the high host-memory use and segment GPU OOM.  Retain that
+            # fallback solely for deliberately minimal algebra fixtures.
+            if hasattr(self, "equations"):
+                raise NotImplementedError(
+                    f"Database {equation_name} face closure lacks the required "
+                    "compact native table transpose."
+                )
 
             def _face_fluxes_from_database_delta(database_delta):
                 payload = {
