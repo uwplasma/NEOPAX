@@ -211,6 +211,33 @@ def _repeat_ntx_prepared(prepared, count):
     )
 
 
+def test_ntx_quadratic_resolution_fallback_selects_only_flagged_radii():
+    """The slope guard preserves payload shape and replaces only flagged rows."""
+    def response(offset):
+        values = jnp.arange(2 * 3 * 4 * 5, dtype=jnp.float64).reshape(2, 3, 4, 5)
+        return NTXQuadraticPreparedCoefficientResponse(
+            reference_nu_hat=values[..., 0] + offset,
+            reference_epsi_hat=values[..., 1] + offset,
+            reference_coefficients=values + offset,
+            dcoefficients_d_nu_hat=2.0 * values + offset,
+            dcoefficients_d_epsi_hat=3.0 * values + offset,
+            d2coefficients_d_nu_hat2=4.0 * values + offset,
+            d2coefficients_d_nu_hat_d_epsi_hat=5.0 * values + offset,
+            d2coefficients_d_epsi_hat2=6.0 * values + offset,
+        )
+
+    base = response(0.0)
+    high = response(1000.0)
+    selected = jax.jit(
+        NTXExactLijRuntimeTransportModel._select_quadratic_response_radii
+    )(base, high, jnp.asarray([False, True]))
+    for base_value, high_value, selected_value in zip(
+        dataclasses.astuple(base), dataclasses.astuple(high), dataclasses.astuple(selected), strict=True
+    ):
+        assert jnp.array_equal(selected_value[0], base_value[0])
+        assert jnp.array_equal(selected_value[1], high_value[1])
+
+
 def test_ntx_exact_runtime_lagged_face_response_matches_reference_and_finite_difference():
     """The exact NTX face response must agree locally with its live face flux."""
     geometry = types.SimpleNamespace(

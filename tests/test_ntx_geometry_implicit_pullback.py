@@ -36,7 +36,10 @@ from NEOPAX._neoclassical import (
 from NEOPAX._energy_grid_models import StandardLaguerreEnergyGrid
 from NEOPAX._species import Species
 from NEOPAX._state import TransportState, get_v_thermal
-from NEOPAX._transport_equations import ComposedEquationSystem
+from NEOPAX._transport_equations import (
+    ComposedEquationSystem,
+    _database_fixed_flux_payload_with_faces,
+)
 from NEOPAX._transport_solvers import (
     _flat_rhs_build_support_pullback_batched_interpolated_faces_factory,
     _flat_rhs_state_and_lagged_response_pullback_factory,
@@ -151,6 +154,75 @@ def test_database_geometry_delta_restores_vmec_radial_mesh_relations():
     assert jnp.allclose(bar.rho_grid, 0.0)
     assert jnp.allclose(bar.rho_grid_half, 0.0)
     assert jnp.allclose(bar.a_b, 3.0)
+
+
+def test_database_fixed_flux_payload_keeps_native_faces_distinct_from_centres():
+    """Direct database faces are injected under the equation's ``*_faces`` keys."""
+    centre = {
+        "Gamma": jnp.asarray([1.0, 2.0]),
+        "Q_neo": jnp.asarray([3.0, 4.0]),
+    }
+    faces = {
+        "Gamma": jnp.asarray([5.0, 6.0, 7.0]),
+        "Q_neo_faces": jnp.asarray([8.0, 9.0, 10.0]),
+    }
+
+    payload = _database_fixed_flux_payload_with_faces(centre, faces)
+
+    assert payload["Gamma"] is centre["Gamma"]
+    assert payload["Q_neo"] is centre["Q_neo"]
+    assert payload["Gamma_faces"] is faces["Gamma"]
+    assert payload["Q_neo_faces"] is faces["Q_neo_faces"]
+    assert "Q_faces" not in payload
+
+
+def test_database_primal_fixed_flux_capture_keeps_density_and_temperature_faces_separate():
+    """Database reverse preparation retains each forward equation's face closure."""
+    equations = object.__new__(ComposedEquationSystem)
+    calls = []
+
+    class _Density:
+        face_flux_builder = staticmethod(
+            lambda state, *, center_fluxes: calls.append(("density", state, center_fluxes))
+            or {"Gamma": jnp.asarray([4.0, 5.0, 6.0])}
+        )
+
+        @staticmethod
+        def _use_model_face_particle_fluxes():
+            return True
+
+    class _Temperature:
+        face_flux_builder = staticmethod(
+            lambda state, *, center_fluxes: calls.append(("temperature", state, center_fluxes))
+            or {"Q": jnp.asarray([7.0, 8.0, 9.0])}
+        )
+
+        @staticmethod
+        def _use_model_face_heat_fluxes():
+            return True
+
+        @staticmethod
+        def _use_model_face_particle_fluxes():
+            return False
+
+        @staticmethod
+        def _use_face_completed_work_term():
+            return False
+
+    object.__setattr__(equations, "density_equation", _Density())
+    object.__setattr__(equations, "temperature_equation", _Temperature())
+    object.__setattr__(equations, "er_equation", None)
+    object.__setattr__(equations, "equations", ())
+    centre = {"Gamma": jnp.asarray([1.0, 2.0]), "Q": jnp.asarray([3.0, 4.0])}
+
+    captured = equations._capture_database_primal_fixed_flux_payloads("state", centre)
+
+    assert [call[0] for call in calls] == ["density", "temperature"]
+    assert jnp.array_equal(captured["density"]["Gamma_faces"], jnp.asarray([4.0, 5.0, 6.0]))
+    assert "Q_faces" not in captured["density"]
+    assert jnp.array_equal(captured["temperature"]["Q_faces"], jnp.asarray([7.0, 8.0, 9.0]))
+    assert "Gamma_faces" not in captured["temperature"]
+    assert captured["density_faces"] is not captured["temperature_faces"]
 
 
 def test_database_equation_payload_uses_full_geometry_tangent_like_lij():

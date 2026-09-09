@@ -39,6 +39,46 @@ PARTICLE_FLUX_PHYSICAL_TO_STATE = 1.0e-20
 HEAT_FLUX_PHYSICAL_TO_STATE = 1.0e-23
 
 
+# This is deliberately database-only.  The Lij lane already owns a complete
+# centre-and-face prepared-support contract; do not route that lane through
+# this compatibility helper.
+_DATABASE_FIXED_FLUX_CHANNELS = (
+    "Gamma",
+    "Q",
+    "Upar",
+    "Gamma_neo",
+    "Q_neo",
+    "Upar_neo",
+    "Gamma_turb",
+    "Q_turb",
+    "Upar_turb",
+    "Gamma_classical",
+    "Q_classical",
+    "Upar_classical",
+)
+
+
+def _database_fixed_flux_payload_with_faces(center_fluxes, face_fluxes):
+    """Return the fixed centre-and-face contract for database equation AD.
+
+    Direct database centre evaluation returns ordinary channel names, and its
+    native face evaluator also uses ordinary channel names.  Equation objects,
+    however, recognise faces only through ``*_faces`` names.  The explicit
+    conversion here records that distinction without changing either forward
+    evaluator.  A caller must retain the raw face result separately for its
+    database-table and local-geometry transposes; this helper only supplies
+    the fixed primal values needed by equation assembly.
+    """
+    if not isinstance(center_fluxes, dict) or not isinstance(face_fluxes, dict):
+        raise TypeError("Database fixed flux payload requires centre and face mappings.")
+    payload = dict(center_fluxes)
+    for name in _DATABASE_FIXED_FLUX_CHANNELS:
+        face_value = face_fluxes.get(f"{name}_faces", face_fluxes.get(name))
+        if face_value is not None:
+            payload[f"{name}_faces"] = face_value
+    return payload
+
+
 def _database_geometry_vjp_debug_enabled() -> bool:
     """Enable provenance prints for the two database-only geometry VJPs."""
     return str(
@@ -2276,6 +2316,62 @@ class ComposedEquationSystem:
         if er_eq is None:
             er_eq = next((eq for eq in self.equations if getattr(eq, "name", None) == "Er"), None)
         return density_eq, temperature_eq, er_eq
+
+    def _capture_database_primal_fixed_flux_payloads(
+        self, working_state, center_fluxes
+    ):
+        """Capture the exact database face values selected by each equation.
+
+        This is preparation for the database reverse boundary only.  It is not
+        called by the forward solve and is intentionally separate for density
+        and temperature: their face closures may have different reconstruction
+        policies.  The returned raw face mappings must later receive their own
+        table and local-geometry cotangents; the completed payloads are solely
+        the fixed values supplied to finite-volume equation assembly.
+        """
+        density_eq, temperature_eq, _ = self._resolve_equations()
+
+        def _payload_for_density():
+            if density_eq is None or not density_eq._use_model_face_particle_fluxes():
+                return dict(center_fluxes), None
+            if _flux_has_key(center_fluxes, "Gamma_faces"):
+                return dict(center_fluxes), None
+            if density_eq.face_flux_builder is None:
+                raise ValueError("Database density face closure requires a face flux builder.")
+            raw_faces = density_eq.face_flux_builder(
+                working_state, center_fluxes=center_fluxes
+            )
+            return _database_fixed_flux_payload_with_faces(center_fluxes, raw_faces), raw_faces
+
+        def _payload_for_temperature():
+            if temperature_eq is None:
+                return dict(center_fluxes), None
+            needs_faces = (
+                temperature_eq._use_model_face_heat_fluxes()
+                or temperature_eq._use_model_face_particle_fluxes()
+                or temperature_eq._use_face_completed_work_term()
+            )
+            if not needs_faces or (
+                _flux_has_key(center_fluxes, "Q_faces")
+                or _flux_has_key(center_fluxes, "Gamma_faces")
+            ):
+                return dict(center_fluxes), None
+            if temperature_eq.face_flux_builder is None:
+                raise ValueError("Database temperature face closure requires a face flux builder.")
+            raw_faces = temperature_eq.face_flux_builder(
+                working_state, center_fluxes=center_fluxes
+            )
+            return _database_fixed_flux_payload_with_faces(center_fluxes, raw_faces), raw_faces
+
+        density_payload, density_faces = _payload_for_density()
+        temperature_payload, temperature_faces = _payload_for_temperature()
+        return {
+            "center": dict(center_fluxes),
+            "density": density_payload,
+            "temperature": temperature_payload,
+            "density_faces": density_faces,
+            "temperature_faces": temperature_faces,
+        }
 
     def _shared_flux_bc_kwargs(self):
         density_eq, temperature_eq, er_eq = self._resolve_equations()

@@ -5948,6 +5948,17 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
     # Explicit diagnostic only: compares the interpolated centre Lij against
     # a live direct-centre NTX evaluation at each response rebuild.
     debug_center_lij_comparison: bool = False
+    # Opt-in resolution guard for the realtime full-state quadratic cache.
+    # A small, fixed Er probe is evaluated through the just-built cached
+    # response.  If its charge-flux response is too large, the affected axis
+    # is rebuilt at ``n_theta + ambipolar_slope_fallback_n_theta_increment``.
+    # The branch predicate is stopped in the derivative: AD differentiates
+    # the selected physical-resolution response, never the discrete choice.
+    ambipolar_slope_fallback_mode: str = "off"
+    ambipolar_slope_fallback_relative_threshold: float = 1.0
+    ambipolar_slope_fallback_er_probe: float = 1.0e-6
+    ambipolar_slope_fallback_charge_flux_floor: float = 1.0
+    ambipolar_slope_fallback_n_theta_increment: int = 1
 
     def __post_init__(self):
         order = int(self.lagged_response_taylor_order)
@@ -5963,6 +5974,40 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             raise ValueError("ntx_exact_er_tilde_max must be positive when provided.")
         if self.nu_v_min is not None and float(self.nu_v_min) <= 0.0:
             raise ValueError("ntx_exact_nu_v_min must be positive when provided.")
+        mode = self._normalize_ambipolar_slope_fallback_mode(
+            self.ambipolar_slope_fallback_mode
+        )
+        if mode != "off" and not self.full_state_quadratic_response:
+            raise NotImplementedError(
+                "ntx_exact_ambipolar_slope_fallback requires "
+                "ntx_exact_full_state_quadratic_response = true."
+            )
+        if float(self.ambipolar_slope_fallback_relative_threshold) <= 0.0:
+            raise ValueError("ntx_exact_ambipolar_slope_fallback_relative_threshold must be positive.")
+        if float(self.ambipolar_slope_fallback_er_probe) <= 0.0:
+            raise ValueError("ntx_exact_ambipolar_slope_fallback_er_probe must be positive.")
+        if float(self.ambipolar_slope_fallback_charge_flux_floor) <= 0.0:
+            raise ValueError("ntx_exact_ambipolar_slope_fallback_charge_flux_floor must be positive.")
+        if int(self.ambipolar_slope_fallback_n_theta_increment) < 1:
+            raise ValueError("ntx_exact_ambipolar_slope_fallback_n_theta_increment must be at least one.")
+
+    @staticmethod
+    def _normalize_ambipolar_slope_fallback_mode(value: str | None) -> str:
+        mode = "off" if value is None else str(value).strip().lower()
+        aliases = {
+            "": "off",
+            "none": "off",
+            "false": "off",
+            "off": "off",
+            "ntheta_plus_one": "ntheta_plus_one",
+            "n_theta_plus_one": "ntheta_plus_one",
+        }
+        if mode not in aliases:
+            raise ValueError(
+                "ntx_exact_ambipolar_slope_fallback_mode must be 'off' or "
+                "'ntheta_plus_one'."
+            )
+        return aliases[mode]
 
     def _rho_center_face(self):
         a_b = jnp.asarray(self.geometry.a_b, dtype=jnp.float64)
@@ -6043,6 +6088,140 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             n_xi=self.n_xi if n_xi is None else int(n_xi),
             support=None,
         )
+
+    def _ambipolar_slope_fallback_enabled(self) -> bool:
+        return (
+            self._normalize_ambipolar_slope_fallback_mode(
+                self.ambipolar_slope_fallback_mode
+            )
+            == "ntheta_plus_one"
+        )
+
+    def _ambipolar_charge_flux_probe_mask(
+        self,
+        state: TransportState,
+        response: NTXFullStateQuadraticPreparedCoefficientResponse,
+        *,
+        axis: str,
+    ) -> tuple[jax.Array, jax.Array]:
+        """Flag radii whose cached charge flux changes too much over an Er probe.
+
+        The probe is deliberately performed on the same quadratic cache that
+        Radau will use.  It is therefore a cheap algebraic check, not another
+        NTX solve.  For centre responses the mapping is point-local in Er;
+        for face responses it includes the established centre-to-face Er
+        reconstruction, which is exactly the flux model being guarded.
+        """
+        if axis == "center":
+            key = "Gamma"
+            evaluate = self._evaluate_full_state_quadratic_center_response
+        elif axis == "face":
+            key = "Gamma_faces"
+            evaluate = self._evaluate_full_state_quadratic_face_response
+        else:
+            raise ValueError("axis must be 'center' or 'face'.")
+
+        probe = jnp.asarray(
+            self.ambipolar_slope_fallback_er_probe,
+            dtype=state.Er.dtype,
+        )
+
+        def _charge_flux(er_value):
+            probe_state = dataclasses.replace(state, Er=er_value)
+            gamma = evaluate(probe_state, response)[key]
+            return jnp.sum(self.species.charge[:, None] * gamma, axis=0)
+
+        er0 = state.Er
+        charge0 = _charge_flux(er0)
+        charge_plus = _charge_flux(er0 + probe)
+        charge_minus = _charge_flux(er0 - probe)
+        response_change = jnp.maximum(
+            jnp.abs(charge_plus - charge0),
+            jnp.abs(charge_minus - charge0),
+        )
+        relative_change = response_change / jnp.maximum(
+            jnp.abs(charge0),
+            jnp.asarray(
+                self.ambipolar_slope_fallback_charge_flux_floor,
+                dtype=charge0.dtype,
+            ),
+        )
+        mask = jax.lax.stop_gradient(
+            relative_change
+            > jnp.asarray(
+                self.ambipolar_slope_fallback_relative_threshold,
+                dtype=relative_change.dtype,
+            )
+        )
+        return mask, relative_change
+
+    @staticmethod
+    def _select_quadratic_response_radii(
+        base: NTXQuadraticPreparedCoefficientResponse,
+        fallback: NTXQuadraticPreparedCoefficientResponse,
+        mask: jax.Array,
+    ) -> NTXQuadraticPreparedCoefficientResponse:
+        """Select the higher-resolution coefficient payload only at flagged radii."""
+        def _select(base_value, fallback_value):
+            expanded_mask = jnp.reshape(
+                mask,
+                (mask.shape[0],) + (1,) * (base_value.ndim - 1),
+            )
+            return jnp.where(expanded_mask, fallback_value, base_value)
+
+        return jax.tree_util.tree_map(_select, base, fallback)
+
+    def _fallback_axis_quadratic_response(
+        self,
+        *,
+        axis: str,
+        state: TransportState,
+        face_state,
+        density,
+        temperature,
+        v_thermal,
+    ) -> NTXQuadraticPreparedCoefficientResponse:
+        """Build an ``n_theta + 1`` response for one complete axis.
+
+        The eventual payload selection is radial, but NTX's prepared support
+        is currently axis-batched.  Thus a triggered rebuild computes the
+        complete axis once and keeps only flagged radii.  It never changes the
+        transport-state or lagged-response pytree shape.
+        """
+        fallback_model = dataclasses.replace(
+            self,
+            n_theta=int(self.n_theta) + int(self.ambipolar_slope_fallback_n_theta_increment),
+            support=None,
+            ambipolar_slope_fallback_mode="off",
+        )
+        fallback_support = fallback_model._static_support()
+        if axis == "center":
+            response = fallback_model._build_axis_lagged_response(
+                channels=fallback_support.center_channels,
+                prepared_all=fallback_support.center_prepared,
+                radius_coordinates=self.geometry.r_grid,
+                Er=state.Er,
+                temperature=temperature,
+                density=density,
+                v_thermal=v_thermal,
+            )
+        elif axis == "face":
+            face_density = safe_density(face_state.density, self.density_floor)
+            face_temperature = face_state.temperature
+            response = fallback_model._build_axis_lagged_response(
+                channels=fallback_support.face_channels,
+                prepared_all=fallback_support.face_prepared,
+                radius_coordinates=self.geometry.r_grid_half,
+                Er=face_state.Er,
+                temperature=face_temperature,
+                density=face_density,
+                v_thermal=get_v_thermal(self.species.mass, face_temperature),
+            )
+        else:
+            raise ValueError("axis must be 'center' or 'face'.")
+        if not isinstance(response, NTXQuadraticPreparedCoefficientResponse):
+            raise AssertionError("The slope fallback requires a quadratic coefficient response.")
+        return response
 
     def with_face_response_mode(self, face_response_mode: str) -> "NTXExactLijRuntimeTransportModel":
         return dataclasses.replace(self, face_response_mode=str(face_response_mode))
@@ -13736,6 +13915,68 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                     reference_state=state,
                     coefficient_response=center_response,
                 )
+
+        if self._ambipolar_slope_fallback_enabled():
+            if not isinstance(face_response, NTXFullStateQuadraticPreparedCoefficientResponse):
+                raise AssertionError(
+                    "The ambipolar slope fallback requires a full-state quadratic face response."
+                )
+
+            def _guard_axis(response, *, axis):
+                mask, relative_change = self._ambipolar_charge_flux_probe_mask(
+                    state, response, axis=axis
+                )
+                base_coefficients = response.coefficient_response
+
+                def _rebuild_high_resolution(_):
+                    return self._fallback_axis_quadratic_response(
+                        axis=axis,
+                        state=state,
+                        face_state=face_state,
+                        density=density,
+                        temperature=temperature,
+                        v_thermal=v_thermal,
+                    )
+
+                fallback_coefficients = jax.lax.cond(
+                    jnp.any(mask),
+                    _rebuild_high_resolution,
+                    lambda _: base_coefficients,
+                    operand=None,
+                )
+                selected_coefficients = self._select_quadratic_response_radii(
+                    base_coefficients,
+                    fallback_coefficients,
+                    mask,
+                )
+
+                def _report_trigger(_):
+                    jax.debug.print(
+                        f"[NEOPAX] ambipolar slope resolution fallback: axis={axis} "
+                        f"n_theta={int(self.n_theta)} fallback_n_theta="
+                        f"{int(self.n_theta) + int(self.ambipolar_slope_fallback_n_theta_increment)} "
+                        "flagged={flagged} max_relative_probe_change={maximum:.6e}",
+                        flagged=jnp.sum(mask),
+                        maximum=jnp.max(relative_change),
+                    )
+                    return jnp.asarray(0, dtype=jnp.int32)
+
+                # Host output is intentionally emitted only on a real fallback;
+                # the predicate itself remains outside the differentiated path.
+                _ = jax.lax.cond(
+                    jnp.any(mask),
+                    _report_trigger,
+                    lambda _: jnp.asarray(0, dtype=jnp.int32),
+                    operand=None,
+                )
+                return NTXFullStateQuadraticPreparedCoefficientResponse(
+                    reference_state=response.reference_state,
+                    coefficient_response=selected_coefficients,
+                )
+
+            face_response = _guard_axis(face_response, axis="face")
+            if isinstance(center_response, NTXFullStateQuadraticPreparedCoefficientResponse):
+                center_response = _guard_axis(center_response, axis="center")
         _debug_lagged_response_if_nonfinite(
             "ntx.build_lagged_response.center_response", center_response
         )
@@ -19223,6 +19464,11 @@ def build_ntx_exact_lij_runtime_transport_model(
     ntx_exact_nu_v_min=None,
     ntx_exact_full_state_quadratic_response=False,
     ntx_exact_debug_center_lij_comparison=False,
+    ntx_exact_ambipolar_slope_fallback_mode="off",
+    ntx_exact_ambipolar_slope_fallback_relative_threshold=1.0,
+    ntx_exact_ambipolar_slope_fallback_er_probe=1.0e-6,
+    ntx_exact_ambipolar_slope_fallback_charge_flux_floor=1.0,
+    ntx_exact_ambipolar_slope_fallback_n_theta_increment=1,
     lagged_response_taylor_order=1,
     ntx_exact_lij_support=None,
     preload_support=False,
@@ -19308,6 +19554,17 @@ def build_ntx_exact_lij_runtime_transport_model(
         ),
         full_state_quadratic_response=bool(ntx_exact_full_state_quadratic_response),
         debug_center_lij_comparison=bool(ntx_exact_debug_center_lij_comparison),
+        ambipolar_slope_fallback_mode=str(ntx_exact_ambipolar_slope_fallback_mode),
+        ambipolar_slope_fallback_relative_threshold=float(
+            ntx_exact_ambipolar_slope_fallback_relative_threshold
+        ),
+        ambipolar_slope_fallback_er_probe=float(ntx_exact_ambipolar_slope_fallback_er_probe),
+        ambipolar_slope_fallback_charge_flux_floor=float(
+            ntx_exact_ambipolar_slope_fallback_charge_flux_floor
+        ),
+        ambipolar_slope_fallback_n_theta_increment=int(
+            ntx_exact_ambipolar_slope_fallback_n_theta_increment
+        ),
         collisionality_model=str(collisionality_model),
         bc_density=bc_density,
         bc_temperature=bc_temperature,
