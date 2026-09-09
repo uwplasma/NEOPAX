@@ -3430,6 +3430,44 @@ class NTXDatabaseTransportModel(TransportFluxModelBase):
         bc_density = kwargs.get("bc_density", self.bc_density)
         bc_temperature = kwargs.get("bc_temperature", self.bc_temperature)
         face_mode = kwargs.get("particle_face_closure_mode", "reconstructed")
+        diagnostic_face_text = str(
+            os.environ.get("NEOPAX_DATABASE_GEOMETRY_VJP_DIAGNOSTIC_FACE_INDEX", "")
+        ).strip()
+        diagnostic_face_index = (
+            int(diagnostic_face_text) if diagnostic_face_text else None
+        )
+
+        def _evaluate_local_face(geometry_value, database_value, face_index):
+            model = dataclasses.replace(
+                self, geometry=geometry_value, database=database_value
+            )
+            local_face_state = (
+                build_ntss_like_face_transport_state(
+                    state, geometry_value,
+                    bc_density=bc_density, bc_temperature=bc_temperature,
+                )
+                if str(face_mode).strip().lower() in {"ntss_like", "ntss", "half_point"}
+                else build_face_transport_state(
+                    state, geometry_value,
+                    bc_density=bc_density, bc_temperature=bc_temperature,
+                )
+            )
+            evaluated = build_evaluated_transport_state(
+                state, geometry_value,
+                bc_density=bc_density, bc_temperature=bc_temperature,
+                density_floor=model.density_floor,
+            )
+            all_faces = model.evaluate_face_fluxes(
+                state, local_face_state, evaluated_state=evaluated,
+                bc_density=bc_density, bc_temperature=bc_temperature,
+                particle_face_closure_mode=face_mode,
+            )
+            return jax.tree_util.tree_map(
+                lambda value: jax.lax.dynamic_index_in_dim(
+                    value, face_index, axis=-1, keepdims=False
+                ),
+                all_faces,
+            )
 
         def _split(flat_delta):
             leaves = []
@@ -3452,35 +3490,8 @@ class NTXDatabaseTransportModel(TransportFluxModelBase):
                     database_value = database_with_geometry_scale(
                         database_value, geometry_value.a_b
                     )
-                model = dataclasses.replace(
-                    self, geometry=geometry_value, database=database_value
-                )
-                local_face_state = (
-                    build_ntss_like_face_transport_state(
-                        state, geometry_value,
-                        bc_density=bc_density, bc_temperature=bc_temperature,
-                    )
-                    if str(face_mode).strip().lower() in {"ntss_like", "ntss", "half_point"}
-                    else build_face_transport_state(
-                        state, geometry_value,
-                        bc_density=bc_density, bc_temperature=bc_temperature,
-                    )
-                )
-                evaluated = build_evaluated_transport_state(
-                    state, geometry_value,
-                    bc_density=bc_density, bc_temperature=bc_temperature,
-                    density_floor=model.density_floor,
-                )
-                all_faces = model.evaluate_face_fluxes(
-                    state, local_face_state, evaluated_state=evaluated,
-                    bc_density=bc_density, bc_temperature=bc_temperature,
-                    particle_face_closure_mode=face_mode,
-                )
-                return jax.tree_util.tree_map(
-                    lambda value: jax.lax.dynamic_index_in_dim(
-                        value, face_index, axis=-1, keepdims=False
-                    ),
-                    all_faces,
+                return _evaluate_local_face(
+                    geometry_value, database_value, face_index
                 )
 
             _, pullback = jax.vjp(_local_face_fluxes, flat_delta0)
@@ -3516,6 +3527,66 @@ class NTXDatabaseTransportModel(TransportFluxModelBase):
                 jax.lax.cond(
                     jnp.any(local_a_b_nonfinite),
                     _print_bad_face_index,
+                    lambda _: None,
+                    operand=None,
+                )
+            if diagnostic_face_index is not None:
+                def _diagnose_split(_):
+                    def _database_scale_only(flat_delta):
+                        varied_geometry = _database_geometry_with_constrained_axis_face(
+                            geometry, _split(flat_delta)
+                        )
+                        return _evaluate_local_face(
+                            geometry,
+                            database_with_geometry_scale(self.database, varied_geometry.a_b),
+                            face_index,
+                        )
+
+                    def _face_mesh_only(flat_delta):
+                        varied_geometry = _database_geometry_with_constrained_axis_face(
+                            geometry, _split(flat_delta)
+                        )
+                        return _evaluate_local_face(
+                            varied_geometry, self.database, face_index
+                        )
+
+                    _, database_scale_pullback = jax.vjp(
+                        _database_scale_only, flat_delta0
+                    )
+                    _, face_mesh_pullback = jax.vjp(_face_mesh_only, flat_delta0)
+                    if batched_rhs:
+                        database_scale_bar = jax.vmap(
+                            lambda one_bar: database_scale_pullback(one_bar)[0]
+                        )(local_bar)
+                        face_mesh_bar = jax.vmap(
+                            lambda one_bar: face_mesh_pullback(one_bar)[0]
+                        )(local_bar)
+                    else:
+                        (database_scale_bar,) = database_scale_pullback(local_bar)
+                        (face_mesh_bar,) = face_mesh_pullback(local_bar)
+                    database_scale_a_b = jnp.asarray(
+                        _split(database_scale_bar).a_b
+                    )
+                    face_mesh_a_b = jnp.asarray(_split(face_mesh_bar).a_b)
+                    jax.debug.print(
+                        "[database-geometry-vjp] source=face_flux_split "
+                        "face_index={face_index} database_scale_a_b_nonfinite={database_count} "
+                        "face_mesh_a_b_nonfinite={mesh_count}",
+                        face_index=face_index,
+                        database_count=jnp.sum(
+                            jnp.logical_not(jnp.isfinite(database_scale_a_b))
+                        ),
+                        mesh_count=jnp.sum(
+                            jnp.logical_not(jnp.isfinite(face_mesh_a_b))
+                        ),
+                    )
+                    return None
+
+                jax.lax.cond(
+                    face_index == jnp.asarray(
+                        diagnostic_face_index, dtype=face_index.dtype
+                    ),
+                    _diagnose_split,
                     lambda _: None,
                     operand=None,
                 )
