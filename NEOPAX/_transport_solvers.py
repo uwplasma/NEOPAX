@@ -16808,6 +16808,46 @@ def _radau_node_edge_stage_slope_change(
     )
 
 
+def _radau_build_high_resolution_node_inputs(
+    kernel_context: _RadauAcceptedStepKernelContext,
+    physics_context: _RadauAcceptedStepPhysicsContext,
+    inputs: _RadauStageSubsolveInputs,
+    *,
+    factor_linear_systems: Callable[[Any], tuple[Any, Any, Any, Any]],
+):
+    """Re-anchor the retained node response at the accepted state on high theta."""
+    high_response = physics_context.build_node_high_resolution_lagged_response_from_flat(
+        inputs.flat_y
+    )
+
+    def _high_rhs(t_value, flat_y):
+        return _radau_eval_rhs(
+            t_value,
+            flat_y,
+            high_response,
+            physics_context.flat_rhs,
+            physics_context.flat_rhs_with_lagged_response,
+        )
+
+    high_f0 = _high_rhs(inputs.t_value, inputs.flat_y)
+    high_jacobian = jax.jacfwd(lambda y: _high_rhs(inputs.t_value, y))(inputs.flat_y)
+    high_rhs_time_ref = jax.jacfwd(lambda t: _high_rhs(t, inputs.flat_y))(
+        inputs.t_value
+    )
+    high_lu = factor_linear_systems(high_jacobian)
+    return dataclasses.replace(
+        inputs,
+        f0=high_f0,
+        jacobian_ref=high_jacobian,
+        rhs_time_ref=high_rhs_time_ref,
+        lagged_response=high_response,
+        real_lu_out=high_lu[0],
+        real_piv_out=high_lu[1],
+        complex_lu_out=high_lu[2],
+        complex_piv_out=high_lu[3],
+    )
+
+
 def _radau_maybe_promote_node_edge_resolution(
     kernel_context: _RadauAcceptedStepKernelContext,
     physics_context: _RadauAcceptedStepPhysicsContext,
@@ -16837,29 +16877,11 @@ def _radau_maybe_promote_node_edge_resolution(
     )
 
     def _promote(_):
-        high_response = high_builder(inputs.flat_y)
-
-        def _high_rhs(t_value, flat_y):
-            return _radau_eval_rhs(
-                t_value,
-                flat_y,
-                high_response,
-                physics_context.flat_rhs,
-                physics_context.flat_rhs_with_lagged_response,
-            )
-
-        high_f0 = _high_rhs(inputs.t_value, inputs.flat_y)
-        high_jacobian = jax.jacfwd(lambda y: _high_rhs(inputs.t_value, y))(inputs.flat_y)
-        high_lu = factor_linear_systems(high_jacobian)
-        return dataclasses.replace(
+        return _radau_build_high_resolution_node_inputs(
+            kernel_context,
+            physics_context,
             inputs,
-            f0=high_f0,
-            jacobian_ref=high_jacobian,
-            lagged_response=high_response,
-            real_lu_out=high_lu[0],
-            real_piv_out=high_lu[1],
-            complex_lu_out=high_lu[2],
-            complex_piv_out=high_lu[3],
+            factor_linear_systems=factor_linear_systems,
         )
 
     promoted_inputs = jax.lax.cond(promote, _promote, lambda _: inputs, operand=None)
@@ -16873,6 +16895,67 @@ def _radau_maybe_promote_node_edge_resolution(
             ordered=True,
         )
     return promoted_inputs, promote, relative_slope_change
+
+
+def _radau_maybe_restart_node_edge_resolution(
+    kernel_context: _RadauAcceptedStepKernelContext,
+    physics_context: _RadauAcceptedStepPhysicsContext,
+    inputs: _RadauStageSubsolveInputs,
+    result: "_RadauStageSubsolveResult",
+    *,
+    already_promoted,
+    factor_linear_systems: Callable[[Any], tuple[Any, Any, Any, Any]],
+):
+    """Restart once on high theta if a completed Newton attempt became steep.
+
+    The high-response cache is always rebuilt at ``inputs.flat_y``.  The
+    failed low-resolution stage vector is never reused: the complete Radau
+    subsolve restarts from the original predictor against one coherent cache.
+    """
+    high_builder = physics_context.build_node_high_resolution_lagged_response_from_flat
+    tangent = physics_context.node_edge_ambipolar_rhs_tangent
+    enabled = high_builder is not None and tangent is not None
+    if not enabled:
+        return inputs, result, jnp.asarray(False), jnp.asarray(0.0, dtype=kernel_context.dtype)
+
+    relative_slope_change = _radau_node_edge_stage_slope_change(
+        kernel_context, physics_context, inputs, result.z_final
+    )
+    restart = jnp.logical_and(
+        jnp.logical_not(already_promoted),
+        relative_slope_change > jnp.asarray(
+            physics_context.node_edge_stage_slope_retry_threshold,
+            dtype=kernel_context.dtype,
+        ),
+    )
+
+    def _restart(_):
+        high_inputs = _radau_build_high_resolution_node_inputs(
+            kernel_context,
+            physics_context,
+            inputs,
+            factor_linear_systems=factor_linear_systems,
+        )
+        return high_inputs, _radau_run_stage_subsolve_from_inputs(
+            kernel_context, physics_context, high_inputs
+        )
+
+    restarted_inputs, restarted_result = jax.lax.cond(
+        restart,
+        _restart,
+        lambda _: (inputs, result),
+        operand=None,
+    )
+    if kernel_context.debug_newton_trace:
+        jax.debug.print(
+            "[radau-node-edge-resolution-restart] restart={restart} "
+            "relative_slope_change={relative:.6e} threshold={threshold:.6e}",
+            restart=restart,
+            relative=relative_slope_change,
+            threshold=physics_context.node_edge_stage_slope_retry_threshold,
+            ordered=True,
+        )
+    return restarted_inputs, restarted_result, restart, relative_slope_change
 
 
 def _radau_retry_failed_subsolve_with_exact_cached_jacobian(
@@ -17515,6 +17598,26 @@ def _radau_single_step_primal(
                 stage=retry_stage,
                 ordered=True,
             )
+    (
+        subsolve_inputs,
+        subsolve_result,
+        _node_resolution_restarted,
+        _node_resolution_restart_slope_change,
+    ) = _radau_maybe_restart_node_edge_resolution(
+        kernel_context,
+        physics_context,
+        subsolve_inputs,
+        subsolve_result,
+        already_promoted=_node_resolution_promoted,
+        factor_linear_systems=_factor_linear_systems,
+    )
+    lagged_response = subsolve_inputs.lagged_response
+    f0 = subsolve_inputs.f0
+    jacobian_ref = subsolve_inputs.jacobian_ref
+    real_lu_out = subsolve_inputs.real_lu_out
+    real_piv_out = subsolve_inputs.real_piv_out
+    complex_lu_out = subsolve_inputs.complex_lu_out
+    complex_piv_out = subsolve_inputs.complex_piv_out
     if kernel_context.lagged_response_correction_mode == "endpoint_defect":
         predictor_stages = subsolve_result.z_final.reshape(
             (kernel_context.num_stages, kernel_context.state_dim)
@@ -18215,6 +18318,25 @@ def _radau_single_step_primal_reverse_minimal(
             )(state),
             factor_linear_systems=_factor_linear_systems,
         )
+    (
+        subsolve_inputs,
+        subsolve_result,
+        _node_resolution_restarted,
+        _node_resolution_restart_slope_change,
+    ) = _radau_maybe_restart_node_edge_resolution(
+        kernel_context,
+        physics_context,
+        subsolve_inputs,
+        subsolve_result,
+        already_promoted=_node_resolution_promoted,
+        factor_linear_systems=_factor_linear_systems,
+    )
+    lagged_response = subsolve_inputs.lagged_response
+    jacobian_ref = subsolve_inputs.jacobian_ref
+    real_lu_out = subsolve_inputs.real_lu_out
+    real_piv_out = subsolve_inputs.real_piv_out
+    complex_lu_out = subsolve_inputs.complex_lu_out
+    complex_piv_out = subsolve_inputs.complex_piv_out
     stages_final = subsolve_result.z_final.reshape((kernel_context.num_stages, kernel_context.state_dim))
     flat_next = flat_y + h_value * (kernel_context.b @ stages_final)
     cache_valid_out = jnp.asarray(True)
