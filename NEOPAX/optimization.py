@@ -441,12 +441,15 @@ class GeometryInitialErRootLeastSquaresProblem:
             scaled_values = jnp.asarray(scaled_parameter_values, dtype=jnp.float64)
         physical_values = self._scaled_to_physical(scaled_values)
         base_terms = _base_terms_for_mixed_initial_er_root(self.terms)
-        # ``off`` is the benchmark reference path.  ``optimization`` is an
-        # explicit, separately implemented route; it is intentionally opt-in
+        # ``off`` is the benchmark reference path. ``database`` uses that
+        # same established evaluator deliberately: it selects the
+        # database-native selected-root reverse boundary rather than an
+        # exact-Lij staged support adapter. ``optimization`` is an explicit,
+        # separately implemented exact-Lij route; it is intentionally opt-in
         # so benchmark call graphs and reverse functions remain untouched.
         evaluator = (
             evaluate_geometry_initial_er_root_only_least_squares_benchmark_tables
-            if self.reverse_stage_mode == "off"
+            if self.reverse_stage_mode in {"off", "database"}
             else evaluate_geometry_initial_er_root_only_least_squares_optimization
         )
         evaluator_kwargs = dict(
@@ -1262,8 +1265,14 @@ def _prepare_initial_er_root_config(config_path, *, device: str | None, vmec_inp
     solver_cfg["debug_stage_markers"] = False
     solver_cfg["debug_disable_jit"] = False
     solver_cfg["debug_walltime_attempts"] = False
-    config.setdefault("neoclassical", {})["ntx_exact_derivative_mode"] = "direct"
-    config.setdefault("neoclassical", {})["ntx_exact_derivative_field_pullback_mode"] = "compact_vjp"
+    neoclassical_cfg = config.setdefault("neoclassical", {})
+    neoclassical_cfg["ntx_exact_derivative_mode"] = "direct"
+    neoclassical_cfg["ntx_exact_derivative_field_pullback_mode"] = "compact_vjp"
+    if str(neoclassical_cfg.get("flux_model", "")).strip().lower() == "ntx_scan_runtime":
+        # The selected-root database reverse retains one scan primal and folds
+        # all accumulated table bars through it exactly once.
+        neoclassical_cfg["ntx_scan_coefficient_reverse_mode"] = "structured"
+        neoclassical_cfg["ntx_scan_record_primal"] = True
     if vmec_input is not None:
         config.setdefault("geometry", {})["vmec_input_file"] = str(vmec_input)
     return config
@@ -1410,6 +1419,7 @@ def geometry_initial_er_root_only_least_squares_problem(
     mode = str(reverse_stage_mode).strip().lower()
     if mode not in {
         "off",
+        "database",
         "optimization",
         "optimization_root_experiment",
         "optimization_root_strict_experiment",
@@ -1423,7 +1433,7 @@ def geometry_initial_er_root_only_least_squares_problem(
         "vmex_like",
     }:
         raise ValueError(
-            "reverse_stage_mode must be 'off', 'optimization', "
+            "reverse_stage_mode must be 'off', 'database', 'optimization', "
             "'optimization_root_experiment', 'optimization_root_strict_experiment', "
             "'optimization_root_per_radius_experiment', 'optimization_payload_experiment', "
             "'optimization_payload_root_experiment', 'optimization_payload_root_strict_experiment', "
@@ -1440,6 +1450,20 @@ def geometry_initial_er_root_only_least_squares_problem(
     config_eff = _prepare_initial_er_root_config(config, device=device, vmec_input=vmec_input)
     geom_cfg = config_eff.get("geometry", {})
     neoclassical_cfg = config_eff.get("neoclassical", {})
+    flux_model = str(neoclassical_cfg.get("flux_model", "")).strip().lower()
+    if mode == "database" and flux_model != "ntx_scan_runtime":
+        raise ValueError(
+            "reverse_stage_mode='database' requires "
+            "neoclassical.flux_model='ntx_scan_runtime'; "
+            f"got {flux_model!r}."
+        )
+    if flux_model == "ntx_scan_runtime" and mode not in {"off", "database"}:
+        raise NotImplementedError(
+            "The exact-Lij staged initial-root modes do not support "
+            "neoclassical.flux_model='ntx_scan_runtime'. Use "
+            "reverse_stage_mode='database' while the live-database stage is "
+            "implemented."
+        )
     vmec_input_eff = geom_cfg.get("vmec_input_file")
     if vmec_input_eff is None:
         raise ValueError("geometry.vmec_input_file is required.")

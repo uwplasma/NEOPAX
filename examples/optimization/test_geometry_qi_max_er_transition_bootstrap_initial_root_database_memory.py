@@ -71,7 +71,7 @@ def main() -> int:
     # reverse boundary.  The exact-Lij staged/JIT mode cannot be selected
     # here because it owns an exact support tree.
     base_example.TRANSPORT_CONFIG = DATABASE_TRANSPORT_CONFIG
-    base_example.REVERSE_STAGE_MODE = "off"
+    base_example.REVERSE_STAGE_MODE = "database"
     base = base_example
     problem = base.build_transition_bootstrap_initial_root_problem(
         base.SEED_INPUT, int(base.MAX_MODE_SCHEDULE)
