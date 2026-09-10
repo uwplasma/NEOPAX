@@ -47,6 +47,25 @@ class QuietProblem:
             return self._problem.evaluate(values)
 
 
+def _terms_for_objective_set(objective_set: str):
+    """Match the exact-Lij memory isolation sets for the database lane."""
+
+    selected = []
+    for term in base_example.terms:
+        objective = getattr(term[0], "objective", term[0])
+        is_transport = objective.family == "transport"
+        if objective_set == "geometry_only":
+            if not is_transport:
+                selected.append(term)
+            continue
+        if objective_set == "transport_er_only":
+            if is_transport and objective.name != "bootstrap_current_softmax_abs_scaled":
+                selected.append(term)
+            continue
+        selected.append(term)
+    return selected
+
+
 def _live_jax_array_count() -> int | None:
     live_arrays = getattr(jax, "live_arrays", None)
     if live_arrays is None:
@@ -59,6 +78,12 @@ def _live_jax_array_count() -> int | None:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--objective-set",
+        choices=("all", "geometry_only", "transport_er_only"),
+        default="all",
+        help="Isolate geometry, selected-Er transport, or their combined evaluation.",
+    )
     parser.add_argument("--warmup", type=int, default=1)
     parser.add_argument("--repeats", type=int, default=3)
     args = parser.parse_args()
@@ -72,6 +97,7 @@ def main() -> int:
     # here because it owns an exact support tree.
     base_example.TRANSPORT_CONFIG = DATABASE_TRANSPORT_CONFIG
     base_example.REVERSE_STAGE_MODE = "database"
+    base_example.terms = _terms_for_objective_set(args.objective_set)
     base = base_example
     problem = base.build_transition_bootstrap_initial_root_problem(
         base.SEED_INPUT, int(base.MAX_MODE_SCHEDULE)
@@ -80,7 +106,7 @@ def main() -> int:
     x = np.asarray(jax.device_get(problem.x0), dtype=float)
     print(
         "[database memory test] "
-        f"warmup={args.warmup} repeats={args.repeats} "
+        f"objective_set={args.objective_set} warmup={args.warmup} repeats={args.repeats} "
         f"parameter_count={problem.parameter_count} "
         "path=ntx_scan_runtime_database_selected_root_reverse",
         flush=True,
