@@ -200,6 +200,71 @@ def test_database_root_coordinate_pullback_matches_compact_query_vjp(monkeypatch
     assert jnp.allclose(actual.Er_list, expected_er_list)
 
 
+def test_database_bootstrap_coordinate_pullback_matches_compact_query_vjp(monkeypatch):
+    """Corrected-Upar coordinate bars use the same scan-owned contract."""
+    rho = jnp.asarray([0.0, 0.25, 0.5, 0.75, 1.0])
+    database = Monoenergetic(
+        a_b=jnp.asarray(2.0),
+        rho=rho,
+        nu_log=jnp.asarray([-2.0, -1.0]),
+        Er_list=jnp.asarray(
+            [[-7.0, -5.0], [-6.0, -4.0], [-5.0, -3.0], [-4.0, -2.0], [-3.0, -1.0]]
+        ),
+        D11_log=jnp.zeros((5, 2, 2)),
+        D13=jnp.zeros((5, 2, 2)),
+        D33=jnp.zeros((5, 2, 2)),
+    )
+    model = NTXDatabaseTransportModel(
+        species=object(), energy_grid=object(), geometry=object(), database=database
+    )
+    state = TransportState(
+        density=jnp.ones((2, 2)), pressure=jnp.ones((2, 2)),
+        Er=jnp.asarray([0.1, 0.2]),
+    )
+
+    def _fake_upar(self, _state, radius_index):
+        coordinate = (
+            self.database.a_b * (radius_index + 1)
+            + jnp.sum(self.database.Er_list[radius_index])
+        )
+        return jnp.asarray((coordinate, -0.5 * coordinate))
+
+    monkeypatch.setattr(
+        NTXDatabaseTransportModel, "_momentum_corrected_upar_one_radius", _fake_upar
+    )
+    upar_bar = jnp.asarray([[0.2, -0.3], [0.4, 0.1]])
+
+    def _upar_from_coordinates(a_b, er_list):
+        database_value = dataclasses.replace(
+            database_with_geometry_scale(database, a_b), Er_list=er_list
+        )
+        return jnp.stack(
+            tuple(
+                jnp.asarray((
+                    database_value.a_b * (index + 1)
+                    + jnp.sum(database_value.Er_list[index]),
+                    -0.5 * (
+                        database_value.a_b * (index + 1)
+                        + jnp.sum(database_value.Er_list[index])
+                    ),
+                ))
+                for index in range(state.Er.shape[0])
+            ),
+            axis=1,
+        )
+
+    _, generic_pullback = jax.vjp(
+        _upar_from_coordinates, database.a_b, database.Er_list
+    )
+    expected_a_b, expected_er_list = generic_pullback(upar_bar)
+    actual = model.pullback_momentum_corrected_upar_database_coordinates_by_radius(
+        state, upar_bar
+    )
+
+    assert jnp.allclose(actual.a_b, expected_a_b)
+    assert jnp.allclose(actual.Er_list, expected_er_list)
+
+
 def test_database_geometry_delta_restores_vmec_radial_mesh_relations():
     """Database split VJPs vary the mesh through a_b, never free face nodes."""
     geometry = _PhysicalMeshGeometry(

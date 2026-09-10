@@ -881,9 +881,18 @@ def _database_geometry_active_initial_er_root_only_reverse_table(
         database_pullback = getattr(
             neoclassical_model, "pullback_momentum_corrected_upar_database_by_radius", None
         )
-        if not all(callable(fn) for fn in (upar_only, joint_pullback, database_pullback)):
+        coordinate_pullback = getattr(
+            neoclassical_model,
+            "pullback_momentum_corrected_upar_database_coordinates_by_radius",
+            None,
+        )
+        if not all(
+            callable(fn)
+            for fn in (upar_only, joint_pullback, database_pullback, coordinate_pullback)
+        ):
             raise NotImplementedError(
-                "Database root-only bootstrap requires compact Upar state/geometry and table pullbacks."
+                "Database root-only bootstrap requires compact Upar state/geometry, "
+                "table, and coordinate pullbacks."
             )
         bootstrap_value, upar_bar = bootstrap_current_softmax_abs_value_and_upar_bar(
             rooted_state, fixed_runtime, {"Upar": upar_only(rooted_state)}
@@ -892,12 +901,17 @@ def _database_geometry_active_initial_er_root_only_reverse_table(
             rooted_state, upar_bar, support["geometry"]
         )
         d11_bar, d13_bar, d33_bar = database_pullback(rooted_state, upar_bar)
+        coordinate_bar = coordinate_pullback(rooted_state, upar_bar)
         direct_values[_BOOTSTRAP_CURRENT_OBJECTIVE] = bootstrap_value
         direct_state_bars[_BOOTSTRAP_CURRENT_OBJECTIVE] = bootstrap_state_bar
         direct_geometry_bars[_BOOTSTRAP_CURRENT_OBJECTIVE] = bootstrap_geometry_bar
         direct_database_bars[_BOOTSTRAP_CURRENT_OBJECTIVE] = dataclasses.replace(
             _float_delta_tree_like(support["database"]),
-            D11_log=d11_bar, D13=d13_bar, D33=d33_bar,
+            a_b=coordinate_bar.a_b,
+            Er_list=coordinate_bar.Er_list,
+            D11_log=d11_bar,
+            D13=d13_bar,
+            D33=d33_bar,
         )
 
     values = jnp.stack([direct_values[name] for name in names])

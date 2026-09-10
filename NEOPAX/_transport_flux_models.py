@@ -4680,6 +4680,75 @@ class NTXDatabaseTransportModel(TransportFluxModelBase):
         table_bars, _ = jax.lax.scan(_accumulate, _zero_tables(), radius_indices)
         return table_bars
 
+    def pullback_momentum_corrected_upar_database_coordinates_by_radius(
+        self, state, upar_bar
+    ):
+        """Transpose corrected Upar to scan-owned database coordinates.
+
+        The explicit momentum table rule above supplies the three coefficient
+        bars.  A scan-built Monoenergetic database also owns ``a_b`` and
+        ``Er_list``, which determine the query coordinates of every local
+        Dij interpolation.  These compact bars must join the table bars
+        before the single retained scan transpose.
+        """
+        database = self.database
+        zero = _float_delta_tree_like(database)
+        if not isinstance(database, Monoenergetic):
+            return zero
+        upar_bar = jnp.asarray(upar_bar, dtype=state.pressure.dtype)
+        state_pressure = jnp.asarray(state.pressure)
+        batched = upar_bar.ndim == state_pressure.ndim + 1
+        upar_rows = upar_bar if batched else upar_bar[None, ...]
+        radius_indices = jnp.arange(upar_rows.shape[-1], dtype=jnp.int32)
+
+        def _database_from_coordinates(a_b, er_list):
+            return dataclasses.replace(
+                database_with_geometry_scale(database, a_b), Er_list=er_list
+            )
+
+        def _accumulate(carry, radius_index):
+            def _local_upar(a_b, er_list):
+                model = dataclasses.replace(
+                    self,
+                    database=_database_from_coordinates(a_b, er_list),
+                )
+                return model._momentum_corrected_upar_one_radius(state, radius_index)
+
+            _, pullback = jax.vjp(
+                _local_upar, jnp.asarray(database.a_b), jnp.asarray(database.Er_list)
+            )
+            a_b_rows, er_list_rows = jax.vmap(pullback)(
+                upar_rows[..., radius_index]
+            )
+            return (
+                carry[0] + a_b_rows,
+                carry[1] + er_list_rows,
+            ), None
+
+        (a_b_bar, er_list_bar), _ = jax.lax.scan(
+            _accumulate,
+            (
+                jnp.zeros((upar_rows.shape[0],), dtype=jnp.asarray(database.a_b).dtype),
+                jnp.zeros(
+                    (upar_rows.shape[0],) + jnp.asarray(database.Er_list).shape,
+                    dtype=jnp.asarray(database.Er_list).dtype,
+                ),
+            ),
+            radius_indices,
+        )
+        if not batched:
+            a_b_bar = a_b_bar[0]
+            er_list_bar = er_list_bar[0]
+        if batched:
+            zero = jax.tree_util.tree_map(
+                lambda value: jnp.broadcast_to(
+                    jnp.asarray(value)[None, ...],
+                    (upar_rows.shape[0],) + jnp.asarray(value).shape,
+                ),
+                zero,
+            )
+        return dataclasses.replace(zero, a_b=a_b_bar, Er_list=er_list_bar)
+
     def pullback_momentum_corrected_upar_geometry_by_radius(
         self, state, upar_bar, geometry
     ):
@@ -6346,6 +6415,15 @@ class NTXRuntimeScanTransportModel(TransportFluxModelBase):
         """Delegate compact corrected-bootstrap database table bars."""
 
         return self._database_model().pullback_momentum_corrected_upar_database_by_radius(
+            state, upar_bar
+        )
+
+    def pullback_momentum_corrected_upar_database_coordinates_by_radius(
+        self, state, upar_bar
+    ):
+        """Delegate compact corrected-bootstrap scan-coordinate bars."""
+
+        return self._database_model().pullback_momentum_corrected_upar_database_coordinates_by_radius(
             state, upar_bar
         )
 
