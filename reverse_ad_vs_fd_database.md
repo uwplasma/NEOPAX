@@ -284,6 +284,90 @@ All seven root-only objectives now agree with frozen-linearized FD for both
 geometry parameters.  The largest discrepancy is 0.2245% on the ZBS
 bootstrap derivative; every Er objective is within 0.157%.
 
+### Compact LaTex table: database ambipolar root AD versus FD
+
+The following is the publication-oriented subset of the preceding table.
+Objectives are columns, parameter DOFs are rows, and the power column is the
+**net** total-power objective (not alpha power).  Entries use
+`abs(AD - FD) / max(abs(AD), abs(FD))`.
+
+```latex
+\begin{table}[t]
+\centering
+\def\arraystretch{1.5}
+\scriptsize
+\begin{tabular}{ |l||c|c|c|c|c| }
+    \hline
+    \noalign{\vskip -0.085in}
+    DOF
+      & $E_r^{\max}$ (softmax)
+      & $E_{r,\mathrm{left}}$
+      & $E_{r,\mathrm{right}}$
+      & $P_{\mathrm{net}}$
+      & $J_{\mathrm{boots}}$ \\[-1.5ex]
+    \hline
+    \noalign{\vskip -0.085in}
+    $n_0$
+      & $1.599\times10^{-7}$
+      & $2.111\times10^{-8}$
+      & $1.256\times10^{-7}$
+      & $1.988\times10^{-7}$
+      & $2.681\times10^{-7}$ \\
+    $T_0$
+      & $1.066\times10^{-7}$
+      & $1.132\times10^{-7}$
+      & $7.723\times10^{-8}$
+      & $6.872\times10^{-9}$
+      & $9.498\times10^{-8}$ \\
+    $\alpha_n$
+      & $2.353\times10^{-8}$
+      & $5.039\times10^{-7}$
+      & $4.651\times10^{-7}$
+      & $4.412\times10^{-7}$
+      & $1.282\times10^{-7}$ \\
+    $\alpha_T$
+      & $2.507\times10^{-8}$
+      & $4.765\times10^{-8}$
+      & $3.090\times10^{-8}$
+      & $1.381\times10^{-7}$
+      & $8.736\times10^{-9}$ \\
+    $\beta_n$
+      & $7.138\times10^{-7}$
+      & $6.675\times10^{-6}$
+      & $5.885\times10^{-6}$
+      & $7.169\times10^{-7}$
+      & $5.970\times10^{-9}$ \\
+    $\beta_T$
+      & $1.129\times10^{-7}$
+      & $2.529\times10^{-7}$
+      & $9.510\times10^{-8}$
+      & $6.279\times10^{-8}$
+      & $2.892\times10^{-8}$ \\
+    $\mathrm{RBC}(1,0)$
+      & $5.626\times10^{-6}$
+      & $9.645\times10^{-6}$
+      & $3.824\times10^{-5}$
+      & $8.634\times10^{-6}$
+      & $1.670\times10^{-3}$ \\
+    $\mathrm{ZBS}(1,0)$
+      & $7.915\times10^{-5}$
+      & $2.214\times10^{-4}$
+      & $1.569\times10^{-3}$
+      & $1.404\times10^{-6}$
+      & $2.245\times10^{-3}$ \\
+    \\[-1.5ex]\hline
+\end{tabular}
+\caption{Relative errors between database ambipolar-root reverse AD and
+frozen-linearized finite differences.}
+\label{tab:database-ambipolar-ad-fd-relative-error}
+\end{table}
+```
+
+Here $\alpha_n$, $\alpha_T$, $\beta_n$, and $\beta_T$ denote
+`density_shape_power`, `temperature_shape_power`, `density_shape_alpha`, and
+`temperature_shape_alpha`, respectively.  The profile FD values were recovered
+from the saved root-only FD run record and are now included.
+
 ### Root-only reverse AD: complete parameter table
 
 The same root-only reverse run included all six profile columns as well as

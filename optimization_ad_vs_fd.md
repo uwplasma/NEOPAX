@@ -332,6 +332,73 @@ saved FD reference exists locally.
 | `transport:bootstrap_current_softmax_abs_scaled` | `vmec:RBC:1:0` | `-1.7673950710878303e+00` | `-1.7671640000000000e+00` | `2.310711e-04` | `1.307581e-04` |
 | `transport:bootstrap_current_softmax_abs_scaled` | `vmec:ZBS:1:0` | `-6.2411213048264766e+00` | `-6.2410010000000000e+00` | `1.203048e-04` | `1.927653e-05` |
 
+### Compact LaTex table: realtime 16-step AD versus FD
+
+This is the ruled, publication-oriented view of the saved exact-Lij realtime
+16-step full-transport AD-versus-FD matrix above.  The realtime benchmark
+records `alpha_power_volume_average_mw_m3`, not net total power, so the fourth
+column is $P_\alpha$.
+
+```latex
+\begin{table}
+\centering
+\def\arraystretch{1.5}
+\scriptsize
+\begin{tabular}{ |l||c|c|c|c|c| }
+    \hline
+    \noalign{\vskip -0.085in}
+    DOF
+      & $E_r^{\max}$ (softmax)
+      & $E_{r,\mathrm{left}}$
+      & $E_{r,\mathrm{right}}$
+      & $P_{\alpha}$
+      & $J_{\mathrm{boots}}$ \\[-1.5ex]
+    \hline
+    \noalign{\vskip -0.085in}
+    $n_0$
+      & $7.668686\times10^{-6}$ & $6.675970\times10^{-6}$
+      & $1.120252\times10^{-5}$ & $2.579409\times10^{-6}$
+      & $1.536082\times10^{-3}$ \\
+    $T_0$
+      & $2.497576\times10^{-6}$ & $1.915232\times10^{-6}$
+      & $9.779402\times10^{-7}$ & $4.385301\times10^{-5}$
+      & $1.184628\times10^{-7}$ \\
+    $\alpha_n$
+      & $3.806273\times10^{-2}$ & $8.990363\times10^{-2}$
+      & $1.965821\times10^{1}$ & $1.621582\times10^{-2}$
+      & $5.704444\times10^{-5}$ \\
+    $\alpha_T$
+      & $1.738389\times10^{-5}$ & $9.241768\times10^{-4}$
+      & $1.360505\times10^{-2}$ & $1.770020\times10^{-5}$
+      & $1.491625\times10^{-6}$ \\
+    $\beta_n$
+      & $1.779320\times10^{-3}$ & $1.198361\times10^{-2}$
+      & $8.770466\times10^{-3}$ & $1.501442\times10^{-4}$
+      & $7.036146\times10^{-6}$ \\
+    $\beta_T$
+      & $2.422859\times10^{-6}$ & $1.450625\times10^{-5}$
+      & $1.057018\times10^{-5}$ & $4.270697\times10^{-6}$
+      & $2.025341\times10^{-6}$ \\
+    $\mathrm{RBC}(1,0)$
+      & $3.382592\times10^{-4}$ & $6.591687\times10^{-6}$
+      & $3.774722\times10^{-5}$ & $1.129466\times10^{-3}$
+      & $1.307581\times10^{-4}$ \\
+    $\mathrm{ZBS}(1,0)$
+      & $5.775395\times10^{-4}$ & $4.668363\times10^{-4}$
+      & $3.019394\times10^{-4}$ & $1.027028\times10^{-3}$
+      & $1.927653\times10^{-5}$ \\
+    \\[-1.5ex]\hline
+\end{tabular}
+\caption{Relative errors between exact-Lij realtime 16-step full-transport
+reverse AD and the saved finite-difference references.}
+\label{tab:realtime-16step-ad-fd-relative-error}
+\end{table}
+```
+
+Here $\alpha_n$, $\alpha_T$, $\beta_n$, and $\beta_T$ denote
+`density_shape_power`, `temperature_shape_power`, `density_shape_alpha`, and
+`temperature_shape_alpha`, respectively.
+
 ### Current 16-Step Transport: Worst AD vs Saved FD Rows
 
 Saved FD references currently exist for `n0`, `T0`, `density_shape_power`,

@@ -4452,8 +4452,12 @@ class NTXDatabaseTransportModel(TransportFluxModelBase):
             radius_value = jax.lax.dynamic_index_in_dim(
                 self.geometry.r_grid_half, face_index, axis=0, keepdims=False
             )
+            # ``get_Lij_matrix_at_radius`` indexes the supplied local species
+            # vectors itself (both for v_th and collision frequencies).  Map
+            # only the selected species index; mapping the vectors as well
+            # silently turns them into scalars and fails for real databases.
             lij = jax.vmap(
-                lambda species_index, temperature_species, density_species, vthermal_species: get_Lij_matrix_at_radius(
+                lambda species_index: get_Lij_matrix_at_radius(
                     self.species,
                     self.energy_grid,
                     self.geometry,
@@ -4461,17 +4465,12 @@ class NTXDatabaseTransportModel(TransportFluxModelBase):
                     species_index,
                     radius_value,
                     er_local,
-                    temperature_species,
-                    density_species,
-                    vthermal_species,
+                    temperature_local,
+                    density_local,
+                    vthermal_local,
                     collisionality_kind,
                 )
-            )(
-                self.species.species_indices,
-                temperature_local,
-                density_local,
-                vthermal_local,
-            )
+            )(self.species.species_indices)
             a1 = jax.vmap(get_Thermodynamical_Forces_A1)(
                 self.species.charge,
                 density_local,

@@ -361,14 +361,21 @@ def test_database_direct_face_coordinate_pullback_matches_compact_query_vjp(monk
             temperature_grad_face=jnp.zeros((2, 3)),
         ),
     )
-    monkeypatch.setattr(
-        transport_flux_models_module,
-        "get_Lij_matrix_at_radius",
-        lambda _species, _energy, _geometry, database_value, _species_index,
-        radius_value, *_args: (
+    def _lij_at_radius(
+        _species, _energy, _geometry, database_value, _species_index,
+        radius_value, _er, temperature_local, density_local, vthermal_local,
+        _collisionality_kind,
+    ):
+        # The compact face primitive must keep these as complete local
+        # species vectors.  The production helper indexes them internally.
+        assert temperature_local.ndim == density_local.ndim == vthermal_local.ndim == 1
+        return (
             database_value.a_b
             + database_value.Er_list[jnp.asarray(radius_value, dtype=jnp.int32), 0]
-        ) * jnp.eye(3),
+        ) * jnp.eye(3)
+
+    monkeypatch.setattr(
+        transport_flux_models_module, "get_Lij_matrix_at_radius", _lij_at_radius
     )
     monkeypatch.setattr(
         transport_flux_models_module,
