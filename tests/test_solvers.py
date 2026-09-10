@@ -2798,6 +2798,46 @@ def test_database_plain_block_stage_input_pullback_uses_complete_direct_state_bo
     assert len(calls) == 1
 
 
+def test_database_plain_block_matrix_uses_complete_direct_state_boundary():
+    """Plain database block must materialize the carry-transpose Jacobian."""
+    dtype = jnp.float64
+    kernel_context = types.SimpleNamespace(
+        dtype=dtype,
+        num_stages=1,
+        state_dim=2,
+        c=jnp.asarray([0.0], dtype=dtype),
+        a=jnp.eye(1, dtype=dtype),
+    )
+    carry = types.SimpleNamespace(
+        t=jnp.asarray(0.0, dtype=dtype), y=jnp.zeros((2,), dtype=dtype)
+    )
+    primal = types.SimpleNamespace(
+        trial_dt=jnp.asarray(0.5, dtype=dtype), stage_history=jnp.zeros((2,), dtype=dtype)
+    )
+    direct_jacobian = jnp.asarray([[1.5, -0.25], [0.75, 2.0]], dtype=dtype)
+    calls = []
+
+    def _direct_state_pullback(*args):
+        calls.append(args)
+        return direct_jacobian.T @ args[-1]
+
+    physics_context = types.SimpleNamespace(
+        reverse_rhs_transpose_mode="explicit_database",
+        reverse_stage_adjoint_solve_mode="block",
+        flat_rhs_direct_black_box_state_pullback=_direct_state_pullback,
+        # The generic RHS deliberately has a different Jacobian.  If this is
+        # selected, the matrix/carry contract has regressed.
+        flat_rhs=lambda _t, y: -4.0 * y,
+        flat_rhs_with_lagged_response=None,
+    )
+    actual = transport_solvers._radau_exact_stage_residual_matrix(
+        kernel_context, physics_context, carry, primal, None
+    )
+    expected = jnp.eye(2, dtype=dtype) - primal.trial_dt * direct_jacobian
+    assert jnp.allclose(actual, expected, rtol=1.0e-12, atol=1.0e-12)
+    assert len(calls) == 1
+
+
 def test_batched_database_stage_table_pullback_accepts_flattened_radau_rows():
     """The compact stage-adjoint contract is [objective, stage * state]."""
     dtype = jnp.float32

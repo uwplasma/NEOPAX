@@ -12177,7 +12177,7 @@ def _radau_exact_stage_residual_matrix(
             stage_states,
         )
     elif (
-        matrix_mode == "block_explicit_database_jacobian"
+        matrix_mode in {"block", "block_explicit_database_jacobian"}
         and rhs_transpose_mode in {"explicit_database", "database", "explicit_black_box_database"}
     ):
         if physics_context.flat_rhs_direct_black_box_state_pullback is None:
@@ -12190,6 +12190,11 @@ def _radau_exact_stage_residual_matrix(
         def _stage_jacobian_database(t_eval, y_eval):
             # The direct boundary returns J.T @ e_i.  Vmap materializes rows
             # of J without tracing jacfwd through the full composed RHS.
+            # Plain ``block`` must take this branch too: its carry
+            # pullback uses this same complete direct database operator.
+            # Mixing this operator with a generic-Jacobian block matrix
+            # creates an inconsistent Radau adjoint and can turn otherwise
+            # finite carry bars nonfinite.
             return jax.vmap(
                 lambda rhs_bar: physics_context.flat_rhs_direct_black_box_state_pullback(
                     t_eval, y_eval, lagged_response, rhs_bar
