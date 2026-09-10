@@ -41,6 +41,21 @@ SMALL_DATABASE_TRANSPORT_CONFIG = (
 )
 
 
+def _terms_for_objective_set(objective_set: str):
+    """Keep the FD oracle focused on one selected-root derivative boundary."""
+
+    selected = []
+    for term in base.terms:
+        objective = getattr(term[0], "objective", term[0])
+        is_bootstrap = objective.name == "bootstrap_current_softmax_abs_scaled"
+        if objective_set == "transport_er_only" and is_bootstrap:
+            continue
+        if objective_set == "bootstrap_only" and not is_bootstrap:
+            continue
+        selected.append(term)
+    return selected
+
+
 def _evaluation_arrays(evaluation):
     return (
         np.asarray(jax.device_get(evaluation.residuals), dtype=float),
@@ -102,7 +117,7 @@ def _evaluate_with_frozen_linearized_root(problem, x, root_data):
         return _evaluation_arrays(problem.evaluate(x))
 
 
-def _check_point(problem, x, *, parameter_index: int, fd_step: float, label: str):
+def _check_point(problem, x, *, parameter_index: int, fd_step: float, label: str, objective_set: str):
     (residuals, jacobian, labels), root_data = _evaluate_with_selected_root_capture(problem, x)
     x_plus = np.array(x, copy=True)
     x_minus = np.array(x, copy=True)
@@ -135,7 +150,7 @@ def _check_point(problem, x, *, parameter_index: int, fd_step: float, label: str
     transport_relative = relative[transport_rows]
     transport_max_row = transport_rows[int(np.argmax(np.abs(transport_difference)))]
     print(
-        f"[database directional] point={label} "
+        f"[database directional] point={label} objective_set={objective_set} "
         "fd_root_lane=frozen_linearized "
         f"residual_norm={np.linalg.norm(residuals):.6e} "
         f"fd_jacobian_max_abs={np.max(np.abs(difference)):.6e} "
@@ -164,6 +179,12 @@ def main() -> int:
     parser.add_argument("--fd-step", type=float, default=1.0e-5)
     parser.add_argument("--base-offset", type=float, default=1.0e-3)
     parser.add_argument(
+        "--objective-set",
+        choices=("all", "transport_er_only", "bootstrap_only"),
+        default="all",
+        help="Check all root terms, Er-only rows, or the bootstrap row in isolation.",
+    )
+    parser.add_argument(
         "--small-database",
         action="store_true",
         help="Use the reduced (5, 25, 31) theta/zeta/xi NTX grid.",
@@ -183,6 +204,7 @@ def main() -> int:
         SMALL_DATABASE_TRANSPORT_CONFIG if args.small_database else DATABASE_TRANSPORT_CONFIG
     )
     base.REVERSE_STAGE_MODE = "database"
+    base.terms = _terms_for_objective_set(args.objective_set)
     problem = base.build_transition_bootstrap_initial_root_problem(
         base.SEED_INPUT, int(base.MAX_MODE_SCHEDULE)
     )
@@ -198,6 +220,7 @@ def main() -> int:
             parameter_index=args.parameter_index,
             fd_step=args.fd_step,
             label="x0",
+            objective_set=args.objective_set,
         )
     _check_point(
         problem,
@@ -205,6 +228,7 @@ def main() -> int:
         parameter_index=args.parameter_index,
         fd_step=args.fd_step,
         label="perturbed",
+        objective_set=args.objective_set,
     )
     print("[database directional] complete: transport values respond at the perturbed point.", flush=True)
     return 0
