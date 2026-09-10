@@ -111,7 +111,9 @@ def main() -> int:
     trial = _build(
         mode="database_root_experiment", transport_config=config, objective_set=args.objective_set
     )
-    x = np.asarray(jax.device_get(benchmark.x0), dtype=float)
+    # ``device_get`` can expose a read-only host view. The parity point is
+    # intentionally perturbed, so take an owned writable copy first.
+    x = np.array(jax.device_get(benchmark.x0), dtype=float, copy=True)
     if not 0 <= args.parameter_index < x.size:
         raise ValueError(f"--parameter-index must be in [0, {x.size}); got {args.parameter_index}.")
     x[args.parameter_index] += args.parameter_offset
