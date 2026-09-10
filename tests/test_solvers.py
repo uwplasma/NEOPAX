@@ -2732,6 +2732,7 @@ def test_database_stage_input_pullback_uses_same_direct_state_boundary_as_matrix
 
     physics_context = types.SimpleNamespace(
         reverse_rhs_transpose_mode="explicit_database",
+        reverse_stage_adjoint_solve_mode="block_explicit_database_jacobian",
         reverse_stage_cotangent_mode="full",
         flat_rhs_direct_black_box_state_pullback=_direct_state_pullback,
         # A different fallback derivative must never be used when the compact
@@ -2756,6 +2757,48 @@ def test_database_stage_input_pullback_uses_same_direct_state_boundary_as_matrix
     assert jnp.allclose(actual_dt_bar, 0.0)
     assert actual_lagged_bar is None
     assert len(calls) == 1
+
+
+def test_database_plain_block_stage_input_pullback_keeps_generic_matrix_contract():
+    """Plain block carry bars use the same finite generic RHS Jacobian as its matrix."""
+    dtype = jnp.float64
+    kernel_context = types.SimpleNamespace(
+        dtype=dtype,
+        num_stages=1,
+        state_dim=2,
+        c=jnp.asarray([0.0], dtype=dtype),
+        a=jnp.eye(1, dtype=dtype),
+    )
+    carry = types.SimpleNamespace(
+        t=jnp.asarray(0.0, dtype=dtype), y=jnp.zeros((2,), dtype=dtype)
+    )
+    primal = types.SimpleNamespace(
+        trial_dt=jnp.asarray(0.5, dtype=dtype), stage_history=jnp.zeros((2,), dtype=dtype)
+    )
+    calls = []
+
+    def _compact_hook(*_args):
+        calls.append(True)
+        return jnp.asarray([99.0, 99.0], dtype=dtype)
+
+    physics_context = types.SimpleNamespace(
+        reverse_rhs_transpose_mode="explicit_database",
+        reverse_stage_adjoint_solve_mode="block",
+        reverse_stage_cotangent_mode="full",
+        flat_rhs_direct_black_box_state_pullback=_compact_hook,
+        flat_rhs=lambda _t, y: jnp.asarray([[0.8, -0.2], [0.5, 1.3]], dtype=dtype) @ y,
+        flat_rhs_with_lagged_response=None,
+    )
+    residual_bar = jnp.asarray([[0.4, -0.6]], dtype=dtype)
+    actual_y_bar, _, _ = transport_solvers._radau_exact_stage_residual_input_pullback(
+        kernel_context, physics_context, carry, primal, None, residual_bar,
+        compute_dt_bar=False,
+    )
+    expected = -residual_bar[0] @ jnp.asarray(
+        [[0.8, -0.2], [0.5, 1.3]], dtype=dtype
+    )
+    assert jnp.allclose(actual_y_bar, expected, rtol=1.0e-12, atol=1.0e-12)
+    assert not calls
 
 
 def test_batched_database_stage_table_pullback_accepts_flattened_radau_rows():

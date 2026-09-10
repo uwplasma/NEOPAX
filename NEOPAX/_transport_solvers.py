@@ -11037,20 +11037,27 @@ def _radau_exact_stage_residual_input_pullback(
                 lagged_response,
                 cotangent,
             )
-        # The database stage matrix below uses the complete direct black-box
-        # state boundary.  The residual-input/carry transpose must use the
-        # *same* Jacobian transpose: mixing it with ``jacfwd(flat_rhs)`` here
-        # makes the implicit stage solve and outgoing carry adjoint describe
-        # different maps.  This hook is the complete split state rule (local
-        # fixed-table flux state response plus equation assembly); it is not
-        # the former incomplete direct-state shortcut that produced nonfinite
-        # bars at database Radau stages.
+        # Plain ``block`` materializes its stage matrix with
+        # ``jacfwd(flat_rhs)`` below.  Its carry transpose must retain that
+        # same finite full-RHS Jacobian transpose.  The compact direct-state
+        # rule is valid, but it is a distinct implementation and must only be
+        # selected with ``block_explicit_database_jacobian``, whose matrix is
+        # materialized from that very rule.  Using it for plain ``block``
+        # changed a previously finite carry contract and caused the database
+        # reverse regression.
         if (
             rhs_transpose_mode in {
                 "explicit_database",
                 "database",
                 "explicit_black_box_database",
             }
+            and str(
+                getattr(
+                    physics_context,
+                    "reverse_stage_adjoint_solve_mode",
+                    "structured",
+                )
+            ).strip().lower() == "block_explicit_database_jacobian"
             and physics_context.flat_rhs_direct_black_box_state_pullback is not None
         ):
             return physics_context.flat_rhs_direct_black_box_state_pullback(
