@@ -2646,6 +2646,118 @@ def test_colored_database_stage_matrix_recovers_exact_tridiagonal_transpose(monk
     assert jnp.allclose(compact, dense, rtol=1.0e-12, atol=1.0e-12)
 
 
+def test_database_stage_transpose_uses_complete_direct_black_box_state_boundary():
+    """The database block matvec inserts the direct pressure-state transpose.
+
+    The local direct-state boundary already covers the temperature equation's
+    heat/work/source terms.  This test guards the next composition point:
+    the Radau stage operator must use that boundary for every stage and apply
+    the transposed Butcher coupling without falling back to a different RHS
+    derivative.
+    """
+    dtype = jnp.float64
+    kernel_context = types.SimpleNamespace(
+        dtype=dtype,
+        num_stages=2,
+        state_dim=2,
+        c=jnp.asarray([0.0, 1.0], dtype=dtype),
+        a=jnp.asarray([[0.2, 0.1], [0.3, 0.4]], dtype=dtype),
+    )
+    carry = types.SimpleNamespace(
+        t=jnp.asarray(0.0, dtype=dtype),
+        y=jnp.zeros((2,), dtype=dtype),
+    )
+    primal = types.SimpleNamespace(
+        trial_dt=jnp.asarray(0.5, dtype=dtype),
+        stage_history=jnp.zeros((4,), dtype=dtype),
+    )
+    rhs_jacobian = jnp.asarray([[1.1, -0.3], [0.2, 0.7]], dtype=dtype)
+    calls = []
+
+    def _direct_state_pullback(t_value, y_value, lagged_response, cotangent):
+        calls.append((t_value, y_value, lagged_response))
+        return rhs_jacobian.T @ cotangent
+
+    physics_context = types.SimpleNamespace(
+        reverse_rhs_transpose_mode="explicit_database",
+        reverse_stage_cotangent_mode="full",
+        reverse_stage_adjoint_memory_mode="default",
+        flat_rhs_direct_black_box_state_pullback=_direct_state_pullback,
+        # If the explicit database hook is bypassed this deliberately wrong
+        # primal would make the assertion below fail.
+        flat_rhs=lambda _t, y: 99.0 * y,
+        flat_rhs_with_lagged_response=None,
+    )
+    vectors = jnp.asarray(
+        [[[0.5, -0.4], [0.2, 0.9]], [[-0.3, 0.7], [0.6, -0.1]]],
+        dtype=dtype,
+    )
+    actual = transport_solvers._radau_exact_stage_residual_transpose_matvec_batched(
+        kernel_context, physics_context, carry, primal, None, vectors
+    ).reshape(vectors.shape)
+    jt_vectors = jnp.einsum("ij,bsj->bsi", rhs_jacobian.T, vectors)
+    expected = vectors - primal.trial_dt * jnp.einsum(
+        "ij,bin->bjn", kernel_context.a, jt_vectors
+    )
+    assert jnp.allclose(actual, expected, rtol=1.0e-12, atol=1.0e-12)
+    # ``vmap`` traces this Python hook once, then executes its vectorized JAX
+    # body across objective rows and stages.
+    assert len(calls) == 1
+
+
+def test_database_stage_input_pullback_uses_same_direct_state_boundary_as_matrix():
+    """Database carry bars and stage solve must share one RHS transpose."""
+    dtype = jnp.float64
+    kernel_context = types.SimpleNamespace(
+        dtype=dtype,
+        num_stages=2,
+        state_dim=2,
+        c=jnp.asarray([0.0, 1.0], dtype=dtype),
+        a=jnp.eye(2, dtype=dtype),
+    )
+    carry = types.SimpleNamespace(
+        t=jnp.asarray(0.0, dtype=dtype),
+        y=jnp.zeros((2,), dtype=dtype),
+    )
+    primal = types.SimpleNamespace(
+        trial_dt=jnp.asarray(0.5, dtype=dtype),
+        stage_history=jnp.zeros((4,), dtype=dtype),
+    )
+    rhs_jacobian = jnp.asarray([[0.8, -0.2], [0.5, 1.3]], dtype=dtype)
+    calls = []
+
+    def _direct_state_pullback(t_value, y_value, lagged_response, cotangent):
+        calls.append((t_value, y_value, lagged_response))
+        return rhs_jacobian.T @ cotangent
+
+    physics_context = types.SimpleNamespace(
+        reverse_rhs_transpose_mode="explicit_database",
+        reverse_stage_cotangent_mode="full",
+        flat_rhs_direct_black_box_state_pullback=_direct_state_pullback,
+        # A different fallback derivative must never be used when the compact
+        # database state boundary is available.
+        flat_rhs=lambda _t, y: -7.0 * y,
+        flat_rhs_with_lagged_response=None,
+    )
+    residual_bars = jnp.asarray([[0.4, -0.6], [-0.3, 0.9]], dtype=dtype)
+    actual_y_bar, actual_dt_bar, actual_lagged_bar = (
+        transport_solvers._radau_exact_stage_residual_input_pullback(
+            kernel_context,
+            physics_context,
+            carry,
+            primal,
+            None,
+            residual_bars,
+            compute_dt_bar=False,
+        )
+    )
+    expected_y_bar = -jnp.sum(residual_bars @ rhs_jacobian, axis=0)
+    assert jnp.allclose(actual_y_bar, expected_y_bar, rtol=1.0e-12, atol=1.0e-12)
+    assert jnp.allclose(actual_dt_bar, 0.0)
+    assert actual_lagged_bar is None
+    assert len(calls) == 1
+
+
 def test_batched_database_stage_table_pullback_accepts_flattened_radau_rows():
     """The compact stage-adjoint contract is [objective, stage * state]."""
     dtype = jnp.float32

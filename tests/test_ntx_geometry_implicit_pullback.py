@@ -43,6 +43,7 @@ from NEOPAX._species import Species
 from NEOPAX._state import TransportState, get_v_thermal
 from NEOPAX._transport_equations import (
     ComposedEquationSystem,
+    TemperatureEquation,
     _database_fixed_flux_payload_with_faces,
 )
 from NEOPAX._transport_solvers import (
@@ -129,6 +130,83 @@ class _PhysicalMeshGeometry:
     r_grid: object
     r_grid_half: object
     dr: object
+
+
+def test_database_direct_state_pullback_preserves_temperature_flux_work_and_source_terms():
+    """The black-box state boundary retains the complete pressure RHS.
+
+    This is deliberately a two-cell, one-species oracle.  It covers the
+    temperature equation's heat-flux divergence, centre-local ``q Gamma Er``
+    work term, and state-dependent source at the exact boundary used by the
+    database Radau stage transpose.  The database interpolation itself is
+    represented by a small state-dependent shared-flux owner; its explicit
+    table transpose is deliberately outside this state-only test.
+    """
+
+    class _StateDependentDatabaseFlux:
+        def __call__(self, state):
+            density = state.density[0]
+            pressure = state.pressure[0]
+            return {
+                "Gamma": (0.17 * density - 0.11 * pressure)[None, :],
+                "Q": (0.09 * pressure + 0.04 * state.Er)[None, :],
+            }
+
+        def pullback_direct_rhs_state(self, state, flux_bar):
+            _, pullback = jax.vjp(self, state)
+            return pullback(flux_bar)[0]
+
+    flux_model = _StateDependentDatabaseFlux()
+    temperature_equation = TemperatureEquation(
+        dr_cells=jnp.asarray([0.4, 0.6]),
+        Vprime=jnp.asarray([1.3, 1.8]),
+        Vprime_half=jnp.asarray([1.0, 1.5, 2.1]),
+        flux_model=flux_model,
+        flux_faces_builder=lambda value, _mode: jnp.concatenate(
+            (value[:, :1], 0.5 * (value[:, :-1] + value[:, 1:]), value[:, -1:]),
+            axis=1,
+        ),
+        temperature_ghost_builder=lambda value: jnp.concatenate(
+            (value[:, :1], value, value[:, -1:]), axis=1
+        ),
+        charge_qp=jnp.asarray([1.0]),
+        active_species_mask=jnp.asarray([True]),
+        include_neo_convection=False,
+        include_turbulent_convection=False,
+        include_classical_convection=False,
+        include_work_term=True,
+        work_term_reconstruction="center",
+        # A configured source can depend on state, even though it has no
+        # direct geometry input in the present benchmark contract.
+        source_model=lambda state: 0.06 * state.pressure,
+    )
+    equations = ComposedEquationSystem(
+        equations=(temperature_equation,),
+        temperature_equation=temperature_equation,
+        shared_flux_model=flux_model,
+    )
+    state = TransportState(
+        density=jnp.asarray([[1.2, 0.8]]),
+        pressure=jnp.asarray([[1.5, 2.1]]),
+        Er=jnp.asarray([0.3, -0.2]),
+    )
+    rhs_bar = TransportState(
+        density=jnp.zeros_like(state.density),
+        pressure=jnp.asarray([[0.7, -1.1]]),
+        Er=jnp.zeros_like(state.Er),
+    )
+
+    def _direct_rhs(state_value):
+        return equations.evaluate_with_shared_fluxes(
+            jnp.asarray(0.0), state_value, None, flux_model(state_value)
+        )
+
+    _, generic_pullback = jax.vjp(_direct_rhs, state)
+    expected = generic_pullback(rhs_bar)[0]
+    actual = equations.pullback_direct_rhs_state(
+        jnp.asarray(0.0), state, None, rhs_bar
+    )
+    _assert_float_tree_allclose(actual, expected, rtol=2.0e-10, atol=2.0e-12)
 
 
 def test_database_root_coordinate_pullback_matches_compact_query_vjp(monkeypatch):

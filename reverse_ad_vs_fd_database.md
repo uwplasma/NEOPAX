@@ -413,3 +413,92 @@ Lij path.
 2. Compare database transport-objective geometry derivatives with a matching
    frozen-schedule FD run.  The table above validates only the transport-model
    independent geometry rows.
+
+## 2026-09-10 post compact-face-coordinate 16-step status
+
+The complete black-box database reverse run now finishes after the compact
+native face-coordinate transpose correction.  All direct-flux, compact-face,
+equation-assembly, recorded-scan-fold, and final VMEC parameter bars were
+finite.  The completed run used 16 accepted steps, four reverse segments,
+`block` stage adjoints, `explicit_database` RHS transpose, and both segment
+diagnostic switches.
+
+### Saved 16-step database FD comparison: `RBC:1:0`
+
+The saved frozen-linearized full-transport FD output is available for RBC.
+It was produced before the most recent forward/reverse corrections, so its
+baseline objective differs from the current run (`softmax_Er`: FD
+`2.136291598654e+01`; current AD `2.134759724591e+01`).  It is therefore a
+useful discrepancy diagnostic, but not yet the final same-revision reference.
+
+| Objective | Current reverse AD | Saved FD | Relative difference |
+| --- | ---: | ---: | ---: |
+| `softmax_Er` | -2.768402478133e+01 | -2.823097e+01 | 1.937e-02 |
+| `net_total_power_volume_average_mw_m3` | 1.264105349756e-04 | 2.917166e-04 | 5.667e-01 |
+| `Er_transition_left` | -1.344576040349e+01 | -1.345082e+01 | 3.762e-04 |
+| `Er_transition_right` | -1.527442997592e+01 | -1.529050e+01 | 1.051e-03 |
+| `Er2_volume_average` | -2.960542023652e+02 | -3.004361e+02 | 1.459e-02 |
+| `Er_volume_average` | -6.834827458946e+00 | -6.979576e+00 | 2.074e-02 |
+| `electron_temperature_volume_average_keV` | -1.500766890758e-02 | -1.661841e-02 | 9.693e-02 |
+| `total_pressure_volume_average` | -7.022608365525e-02 | -7.324379e-02 | 4.120e-02 |
+| `alpha_power_volume_average_mw_m3` | -4.466139933500e-05 | 1.144429e-04 | 1.390e+00 (sign differs) |
+| `bootstrap_current_softmax_abs_scaled` | -1.500156216981e+00 | -2.129220e+00 | 2.954e-01 |
+
+The prior full 16-step ZBS FD command was issued, but the completed ZBS
+full-transport output is not in the saved pasted records.  Do not substitute
+the root-only ZBS FD result here: it differentiates a different map.
+
+### Memory/timing observation
+
+The completed diagnostic run remained resident at roughly 58% of the 30 GB
+host-RAM allocation (about 17 GB) through most of the reverse sweep, only
+dropping after completion.  This is still unacceptably high for the intended
+compact database boundary.  The run also reported approximately 1098 s in
+the segmented cotangent sweep and 1055 s in the final recorded-scan fold.
+Future optimization must reduce retained host payload/tape memory without
+moving the recorded NTX scan back inside transport segments.
+
+## 2026-09-10 refreshed same-revision 16-step geometry FD comparison
+
+Fresh frozen-linearized accepted-replay FD was run for both `RBC:1:0` and
+`ZBS:1:0` after the compact native face-coordinate transpose correction.  Its
+baseline objectives agree with the current AD baseline (for example,
+`softmax_Er` differs by about `2e-7` relatively), so this supersedes the stale
+RBC comparison above as the active full-transport validation.
+
+Entries below are `abs(AD - FD) / max(abs(AD), abs(FD))`.
+
+| Objective | RBC relative error | ZBS relative error | Status |
+| --- | ---: | ---: | --- |
+| `softmax_Er` | 1.644e-05 | 1.471e-04 | matches |
+| `net_total_power_volume_average_mw_m3` | 5.443e-01 | 1.046e-02 | RBC missing/wrong contribution |
+| `Er_transition_left` | 2.303e-05 | 1.369e-04 | matches |
+| `Er_transition_right` | 4.125e-05 | 5.292e-04 | matches |
+| `Er2_volume_average` | 9.729e-05 | 9.701e-06 | matches |
+| `Er_volume_average` | 9.854e-05 | 9.107e-05 | matches |
+| `electron_temperature_volume_average_keV` | 6.877e-02 | 2.599e-02 | incomplete explicit geometry contribution |
+| `total_pressure_volume_average` | 4.201e-02 | 1.239e-02 | incomplete explicit geometry contribution |
+| `alpha_power_volume_average_mw_m3` | 6.186e-01 | 1.026e-02 | RBC missing/wrong contribution |
+| `bootstrap_current_softmax_abs_scaled` | 2.995e-01 | 4.905e-01 | missing/wrong terminal bootstrap geometry contribution |
+
+Conclusion: the scan-coordinate terms now repair the geometry sensitivity of
+the ambipolar/Er channels, but the full transport reverse still lacks or
+misroutes explicit geometry terms in power, thermodynamic averages, and the
+terminal bootstrap objective.  The next reverse-AD audit should isolate those
+three boundary classes; it should not change the now-matching Er-coordinate
+path.
+
+### Geometry-dependent-source caveat
+
+The present benchmark source-model interface is state-only:
+`source_model(state)`.  Therefore source terms have no direct geometry
+derivative beyond their dependence on the evolved state and the explicit
+geometry factors in the equation/volume-average algebra.  Both the database
+and exact-Lij paths preserve the same source-model object when rebuilding
+equations at a perturbed geometry.
+
+If a future source model closes over geometry (or is redesigned to accept it
+explicitly), this will be insufficient: the geometry reverse must then rebuild
+or differentiate that source model at the perturbed geometry.  A regression
+test with an intentionally geometry-dependent source is required before such
+a model is enabled.
