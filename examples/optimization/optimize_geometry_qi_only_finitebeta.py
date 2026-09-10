@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import argparse
 import json
 from pathlib import Path
 import sys
@@ -24,6 +25,7 @@ from NEOPAX import optimization as opt  # noqa: E402
 # --------------------------- parameters ------------------------------------
 SEED_INPUT = ROOT / "examples" / "inputs" / "input.QI_nfp2_initial_finitebeta"
 OUT_DIR = ROOT / "outputs" / "geometry_qi_only_finitebeta_optimization"
+DMERC_OUT_DIR = ROOT / "outputs" / "geometry_qi_only_finitebeta_dmerc_optimization"
 
 SURFACES = np.asarray(
     [1 / 51, 5 / 51, 10 / 51, 15 / 51, 20 / 51, 25 / 51, 30 / 51, 35 / 51, 40 / 51, 45 / 51, 50 / 51],
@@ -32,7 +34,7 @@ SURFACES = np.asarray(
 QI_MBOZ = 18
 QI_NBOZ = 18
 
-MAX_MODE_SCHEDULE = (1, 2)
+MAX_MODE_SCHEDULE = (1, 2, 3)
 GEOMETRY_FAMILIES = "RBC,ZBS"
 SCALE_MODE = "ess"
 ESS_ALPHA = 1.0
@@ -47,6 +49,11 @@ MAXJ_WEIGHT = 0.01
 ASPECT_WEIGHT = 1.0
 IOTA_WEIGHT = 100.0
 MIRROR_WEIGHT = 100.0
+
+# ``vmec_dmerc_stability_softmax`` owns VMEX's default smooth-Mercier kernel
+# (zero margin, 1e-6 softplus smoothing, 1e-3 softmax temperature).
+DMERC_TARGET = 0.0
+DMERC_WEIGHT = 0.05
 
 QI_NFEV = 30
 FTOL = 1.0e-6
@@ -366,7 +373,30 @@ def write_outputs(optimized_input, initial_input):
 
 # --------------------------- continuation ladder ----------------------------
 def main() -> int:
-    active_terms = tuple(term for term in qi_terms if float(term[2]) != 0.0)
+    global OUT_DIR
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--include-dmerc",
+        action="store_true",
+        help="Add VMEX's traceable softmax DMerc stability penalty.",
+    )
+    parser.add_argument(
+        "--dmerc-weight",
+        type=float,
+        default=DMERC_WEIGHT,
+        help=f"Least-squares weight used with --include-dmerc (default: {DMERC_WEIGHT:g}).",
+    )
+    args = parser.parse_args()
+    if args.dmerc_weight < 0.0:
+        raise ValueError("--dmerc-weight must be non-negative.")
+
+    active_terms = [term for term in qi_terms if float(term[2]) != 0.0]
+    if args.include_dmerc and args.dmerc_weight != 0.0:
+        active_terms.append(
+            (opt.geometry.vmec_dmerc_stability_softmax, DMERC_TARGET, float(args.dmerc_weight))
+        )
+        OUT_DIR = DMERC_OUT_DIR
+    active_terms = tuple(active_terms)
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     x = None
     current_input = SEED_INPUT
