@@ -128,6 +128,78 @@ class _PhysicalMeshGeometry:
     dr: object
 
 
+def test_database_root_coordinate_pullback_matches_compact_query_vjp(monkeypatch):
+    """Selected-root scan-coordinate bars need no full transport oracle."""
+    rho = jnp.asarray([0.0, 0.25, 0.5, 0.75, 1.0])
+    database = Monoenergetic(
+        a_b=jnp.asarray(2.0),
+        rho=rho,
+        nu_log=jnp.asarray([-2.0, -1.0]),
+        Er_list=jnp.asarray(
+            [[-7.0, -5.0], [-6.0, -4.0], [-5.0, -3.0], [-4.0, -2.0], [-3.0, -1.0]]
+        ),
+        D11_log=jnp.zeros((5, 2, 2)),
+        D13=jnp.zeros((5, 2, 2)),
+        D33=jnp.zeros((5, 2, 2)),
+    )
+    model = NTXDatabaseTransportModel(
+        species=object(), energy_grid=object(), geometry=object(), database=database
+    )
+    state = TransportState(
+        density=jnp.ones((2, 2)), pressure=jnp.ones((2, 2)),
+        Er=jnp.asarray([0.1, 0.2]),
+    )
+
+    def _fake_local_particle_flux(self, _state):
+        def _evaluate(radius_index, _er_value):
+            coordinate = (
+                self.database.a_b * (radius_index + 1)
+                + jnp.sum(self.database.Er_list[radius_index])
+            )
+            return jnp.asarray((coordinate, -0.5 * coordinate))
+
+        return _evaluate
+
+    monkeypatch.setattr(
+        NTXDatabaseTransportModel,
+        "build_local_particle_flux_evaluator",
+        _fake_local_particle_flux,
+    )
+    gamma_bar = jnp.asarray(
+        [[[0.2, -0.3], [0.4, 0.1]], [[-0.5, 0.6], [0.7, -0.2]]]
+    )
+
+    def _fluxes_from_coordinates(a_b, er_list):
+        database_value = dataclasses.replace(
+            database_with_geometry_scale(database, a_b), Er_list=er_list
+        )
+        return jnp.stack(
+            tuple(
+                jnp.asarray((
+                    database_value.a_b * (index + 1)
+                    + jnp.sum(database_value.Er_list[index]),
+                    -0.5 * (
+                        database_value.a_b * (index + 1)
+                        + jnp.sum(database_value.Er_list[index])
+                    ),
+                ))
+                for index in range(state.Er.shape[0])
+            ),
+            axis=1,
+        )
+
+    _, generic_pullback = jax.vjp(
+        _fluxes_from_coordinates, database.a_b, database.Er_list
+    )
+    expected_a_b, expected_er_list = jax.vmap(generic_pullback)(gamma_bar)
+    actual = model._pullback_local_particle_flux_database_coordinates(
+        state, gamma_bar, database
+    )
+
+    assert jnp.allclose(actual.a_b, expected_a_b)
+    assert jnp.allclose(actual.Er_list, expected_er_list)
+
+
 def test_database_geometry_delta_restores_vmec_radial_mesh_relations():
     """Database split VJPs vary the mesh through a_b, never free face nodes."""
     geometry = _PhysicalMeshGeometry(
@@ -1439,44 +1511,12 @@ def test_database_local_bootstrap_state_pullback_matches_full_upar_jvp(
             state, state.Er, runtime=runtime
         )
 
-    if scan_generated_monoenergetic:
-        # The scan owns both coefficient values and the interpolation
-        # coordinates.  The compact root boundary must return cotangents for
-        # all five leaves so the recorded conversion can carry their geometry
-        # dependence exactly once.
-        def _root_residuals_from_scan_outputs(a_b, er_list, d11_log, d13, d33):
-            table_model = dataclasses.replace(
-                model,
-                database=dataclasses.replace(
-                    database_with_geometry_scale(database, a_b),
-                    Er_list=er_list,
-                    D11_log=d11_log,
-                    D13=d13,
-                    D33=d33,
-                ),
-            )
-            runtime = SimpleNamespace(
-                species=species, models=SimpleNamespace(flux=table_model)
-            )
-            return initial_er_module.initial_er_charge_flux_residuals(
-                state, state.Er, runtime=runtime
-            )
-
-        _, generic_root_pullback = jax.vjp(
-            _root_residuals_from_scan_outputs,
-            database.a_b,
-            database.Er_list,
-            database.D11_log,
-            database.D13,
-            database.D33,
-        )
-    else:
-        _, generic_root_pullback = jax.vjp(
-            _root_residuals_from_tables,
-            database.D11_log,
-            database.D13,
-            database.D33,
-        )
+    _, generic_root_pullback = jax.vjp(
+        _root_residuals_from_tables,
+        database.D11_log,
+        database.D13,
+        database.D33,
+    )
     expected_root_table_bars = jax.vmap(generic_root_pullback)(root_residual_bars)
     monkeypatch.setattr(
         initial_er_module,
@@ -1491,10 +1531,6 @@ def test_database_local_bootstrap_state_pullback_matches_full_upar_jvp(
         support={"database": database},
     )
     actual_root_leaves = (
-        (actual_root_database_bars.a_b, actual_root_database_bars.Er_list)
-        if scan_generated_monoenergetic
-        else ()
-    ) + (
         actual_root_database_bars.D11_log,
         actual_root_database_bars.D13,
         actual_root_database_bars.D33,
