@@ -2692,6 +2692,54 @@ def test_batched_database_stage_table_pullback_accepts_flattened_radau_rows():
     assert jnp.allclose(actual_leaves[0], expected)
 
 
+def test_batched_database_stage_table_pullback_preserves_coordinate_leaves():
+    """Stage accumulation retains scan-owned a_b and Er_list bars."""
+    dtype = jnp.float32
+    kernel_context = types.SimpleNamespace(
+        dtype=dtype, num_stages=2, state_dim=2,
+        c=jnp.asarray([0.0, 1.0], dtype=dtype), a=jnp.eye(2, dtype=dtype),
+    )
+    carry = types.SimpleNamespace(
+        t=jnp.asarray(0.0, dtype=dtype), y=jnp.asarray([1.0, 2.0], dtype=dtype),
+    )
+    primal = types.SimpleNamespace(
+        trial_dt=jnp.asarray(0.5, dtype=dtype), stage_history=jnp.zeros((4,), dtype=dtype),
+    )
+    support = {
+        "geometry": jnp.asarray(0.0, dtype=dtype),
+        "database": {
+            "a_b": jnp.asarray(0.0, dtype=dtype),
+            "Er_list": jnp.zeros((3,), dtype=dtype),
+            "D11_log": jnp.asarray(0.0, dtype=dtype),
+        },
+    }
+
+    def _table_pullback(_t, _y, rhs_bar, _support):
+        value = jnp.sum(rhs_bar)
+        return {
+            "geometry": jnp.asarray(0.0, dtype=dtype),
+            "database": {
+                "a_b": value,
+                "Er_list": jnp.full((3,), 2.0 * value, dtype=dtype),
+                "D11_log": 3.0 * value,
+            },
+        }
+
+    physics_context = types.SimpleNamespace(
+        flat_rhs_direct_database_table_pullback=_table_pullback,
+    )
+    rows = jnp.asarray([[1.0, -2.0, 3.0, 4.0], [-1.0, 0.5, 2.0, -3.0]], dtype=dtype)
+    leaves = transport_solvers._radau_exact_stage_residual_database_table_support_pullback_batched(
+        kernel_context, physics_context, carry, primal, rows, support
+    )
+    _, treedef = jax.tree_util.tree_flatten(support)
+    actual = treedef.unflatten(leaves)
+    expected = -jnp.sum(rows.reshape(2, 2, 2), axis=(1, 2))
+    assert jnp.allclose(actual["database"]["a_b"], expected)
+    assert jnp.allclose(actual["database"]["Er_list"], 2.0 * expected[:, None])
+    assert jnp.allclose(actual["database"]["D11_log"], 3.0 * expected)
+
+
 def test_batched_database_stage_pullback_keeps_direct_geometry_outside_scan():
     """Database stage rows retain local geometry beside the table cotangent."""
     dtype = jnp.float32

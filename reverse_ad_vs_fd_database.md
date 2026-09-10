@@ -244,6 +244,85 @@ next largest is `1.994e-06` on the small
 `density_shape_power`.  For `temperature_shape_alpha`, the largest displayed
 relative error is `3.265e-07` (`Er_transition_right`).
 
+## Initial ambipolar-Er root-only geometry FD
+
+Configuration: database black-box realtime-VMEC benchmark; `RBC:1:0` and
+`ZBS:1:0`; `geometry_fd_lane=frozen_linearized`;
+`root_fd_lane=frozen_linearized`.
+This is a no-Radau diagnostic of the selected initial ambipolar root and its
+seven root-only objectives.  It is the matching FD lane for the new
+database-specific root-only reverse boundary.
+
+Baseline objective values:
+
+| Objective | Value |
+| --- | ---: |
+| `softmax_Er` | 2.1328614487713111e+01 |
+| `net_total_power_volume_average_mw_m3` | 5.0833886344044954e-01 |
+| `Er_transition_left` | 1.7886676618640148e+01 |
+| `Er_transition_right` | 1.8650083623318860e+01 |
+| `Er2_volume_average` | 2.7635136665314184e+02 |
+| `Er_volume_average` | -2.8566207362063278e+00 |
+| `bootstrap_current_softmax_abs_scaled` | 1.3756556924177652e+00 |
+
+The corrected database root-only reverse AD run completed with one recorded
+scan transpose (`objective_rows=7`, all raw VMEC parameter bars finite).  It
+includes the scan-owned `a_b` and `Er_list` coordinate bars for both the
+selected-root flux and corrected-bootstrap Upar paths.
+
+| Objective | RBC FD | RBC AD | RBC relative error | ZBS FD | ZBS AD | ZBS relative error |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `softmax_Er` | -2.664020e+01 | -2.664034988650e+01 | 5.626e-06 | 5.781550e+00 | 5.782007566251e+00 | 7.915e-05 |
+| `net_total_power_volume_average_mw_m3` | -1.716389e-03 | -1.716403818524e-03 | 8.634e-06 | -6.398319e-03 | -6.398310018111e-03 | 1.404e-06 |
+| `Er_transition_left` | -1.338278e+01 | -1.338265092869e+01 | 9.645e-06 | -8.848652e-01 | -8.850610698362e-01 | 2.214e-04 |
+| `Er_transition_right` | -1.515964e+01 | -1.515906028260e+01 | 3.824e-05 | -5.230563e-01 | -5.238769121529e-01 | 1.569e-03 |
+| `Er2_volume_average` | -2.831677e+02 | -2.831596471801e+02 | 2.844e-05 | -3.579285e+02 | -3.578981342375e+02 | 8.484e-05 |
+| `Er_volume_average` | -6.422814e+00 | -6.423623674892e+00 | 1.261e-04 | 1.387330e+01 | 1.387366143587e+01 | 2.605e-05 |
+| `bootstrap_current_softmax_abs_scaled` | -1.989528e+00 | -1.986205686675e+00 | 1.670e-03 | -1.611476e+00 | -1.607858441965e+00 | 2.245e-03 |
+
+All seven root-only objectives now agree with frozen-linearized FD for both
+geometry parameters.  The largest discrepancy is 0.2245% on the ZBS
+bootstrap derivative; every Er objective is within 0.157%.
+
+### Root-only reverse AD: complete parameter table
+
+The same root-only reverse run included all six profile columns as well as
+the two VMEC boundary columns (eight parameters total).  These are the AD
+values from the run whose geometry columns are compared above; the profile
+columns agree with their frozen-linearized FD summaries to the printed FD
+precision.
+
+| Objective | `n0` | `T0` | `density_shape_power` | `temperature_shape_power` | `density_shape_alpha` | `temperature_shape_alpha` | `RBC:1:0` | `ZBS:1:0` |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `softmax_Er` | -2.760400441514e+00 | 2.705100711689e+00 | -7.784405183152e-02 | 1.490855037375e+00 | 1.451734036199e-01 | 1.116894873924e+01 | -2.664034988650e+01 | 5.782007566251e+00 |
+| `net_total_power_volume_average_mw_m3` | 2.415416519867e-01 | 8.104652944301e-02 | 1.003726557152e-03 | 2.747697620410e-01 | -2.528779187142e-04 | -3.943101752416e-01 | -1.716403818524e-03 | -6.398310018111e-03 |
+| `Er_transition_left` | -9.896305791113e-01 | 1.586751820313e+00 | -1.208521391007e-02 | -7.173957341868e+00 | 1.496282012102e-02 | 1.556026393455e+01 | -1.338265092869e+01 | -8.850610698362e-01 |
+| `Er_transition_right` | -1.103871861332e+00 | 1.688983130444e+00 | -1.686008784223e-02 | -6.297007194606e+00 | 2.214694965363e-02 | 1.558583851783e+01 | -1.515906028260e+01 | -5.238769121529e-01 |
+| `Er2_volume_average` | 4.020105783137e+00 | 3.110163409143e+01 | 2.611484575702e+00 | -1.258956845674e+01 | -1.927877202344e+00 | 1.051952483229e+02 | -2.831596471801e+02 | -3.578981342375e+02 |
+| `Er_volume_average` | -1.830227971207e+00 | 8.218177549341e-01 | -7.154002818231e-02 | -8.502304591933e-01 | -1.092356862620e-01 | 3.151494487294e+00 | -6.423623674892e+00 | 1.387366143587e+01 |
+| `bootstrap_current_softmax_abs_scaled` | 1.085312709009e-01 | 1.746717834088e-01 | -1.154277852071e-02 | 6.761305940931e-01 | 3.780884022570e-02 | -5.335135845721e-01 | -1.986205686675e+00 | -1.607858441965e+00 |
+
+### Remaining geometry-FD discrepancy: identified linearization mismatch
+
+This is not evidence of a remaining omitted database-table coordinate term.
+The FD lane forms `state_star` with the configured **forward** VMEC solve and
+uses `state_star +/- h * state_tangent`.  The root-only AD table instead
+starts from that forward-built runtime for its objective and selected-root
+values, but its final geometry payload transpose calls
+`geometry_raw_block_solve_from_param_vector`, which performs a second
+`implicit.solve_implicit_with_aux(...)` and rebuilds the geometry/scan payload
+from that second VMEC state.  Consequently the objective/root cotangent and
+the VMEC payload Jacobian can be evaluated at different converged numerical
+states.
+
+The reported baseline values show this directly: the FD and AD root-only
+`Er_transition_right` values differ by about `1.78e-4`, `Er2` by about
+`6.88e-4`, and `Er_volume_average` by about `1.03e-4`, despite having the
+same configured physical parameter point.  The next correction is therefore
+to retain and reuse the original forward VMEC state/mask in the raw-block
+payload transpose.  It must not change the database-table boundary or the
+Lij path.
+
 ## Remaining validation
 
 1. Run the same database configuration at 16 accepted steps / four segments.

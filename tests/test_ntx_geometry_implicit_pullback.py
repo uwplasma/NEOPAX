@@ -14,6 +14,7 @@ import NEOPAX._neoclassical as neoclassical_module
 import NEOPAX._reverse_ad_initial_er as initial_er_module
 import NEOPAX._reverse_ad_optimization as reverse_optimization_module
 import NEOPAX._transport_equations as transport_equations_module
+import NEOPAX._transport_flux_models as transport_flux_models_module
 
 from NEOPAX._transport_flux_models import (
     CombinedTransportFluxModel,
@@ -23,6 +24,7 @@ from NEOPAX._transport_flux_models import (
     NTXRuntimeScanChannels,
     _extract_right_constraints,
     _database_geometry_with_constrained_axis_face,
+    _float_delta_tree_like,
     _sanitize_float_delta_bar_tree,
 )
 from NEOPAX._database_preprocessed import PreprocessedMonoenergetic3DNTSSRadius
@@ -55,6 +57,7 @@ from NEOPAX._geometry_autodiff import (
     _ntx_runtime_channel_payload_bars,
 )
 from NEOPAX._reverse_ad_transport import (
+    _database_bootstrap_table_and_coordinate_bar,
     _initial_cache_support_pullback_from_rebuild_dispatch,
     _initial_direct_rhs_support_pullback_batched,
     _initial_lagged_response_joint_state_and_support_pullback,
@@ -200,6 +203,292 @@ def test_database_root_coordinate_pullback_matches_compact_query_vjp(monkeypatch
     assert jnp.allclose(actual.Er_list, expected_er_list)
 
 
+def test_database_direct_flux_coordinate_pullback_matches_compact_query_vjp(monkeypatch):
+    """Centre direct-flux coordinate bars are separate from coefficient bars."""
+    rho = jnp.asarray([0.0, 0.25, 0.5, 0.75, 1.0])
+    database = Monoenergetic(
+        a_b=jnp.asarray(2.0), rho=rho, nu_log=jnp.asarray([-2.0]),
+        Er_list=jnp.asarray([[-7.0], [-6.0], [-5.0], [-4.0], [-3.0]]),
+        D11_log=jnp.zeros((5, 1, 1)), D13=jnp.zeros((5, 1, 1)),
+        D33=jnp.zeros((5, 1, 1)),
+    )
+    model = NTXDatabaseTransportModel(
+        species=object(), energy_grid=object(), geometry=object(), database=database
+    )
+    state = TransportState(
+        density=jnp.ones((2, 2)), pressure=jnp.ones((2, 2)),
+        Er=jnp.asarray([0.1, 0.2]),
+    )
+
+    def _fake_local_direct_flux(self, _state):
+        def _evaluate(radius_index, _er_value):
+            coordinate = (
+                self.database.a_b * (radius_index + 1)
+                + jnp.sum(self.database.Er_list[radius_index])
+            )
+            return {
+                "Gamma": jnp.asarray((coordinate, -0.5 * coordinate)),
+                "Q": jnp.asarray((2.0 * coordinate, coordinate)),
+                "Upar": jnp.asarray((-coordinate, 3.0 * coordinate)),
+            }
+        return _evaluate
+
+    monkeypatch.setattr(
+        NTXDatabaseTransportModel,
+        "build_local_direct_flux_evaluator",
+        _fake_local_direct_flux,
+    )
+    bars = {
+        "Gamma": jnp.asarray([[[0.2, -0.3], [0.4, 0.1]], [[-0.5, 0.6], [0.7, -0.2]]]),
+        "Q": jnp.asarray([[[0.1, 0.2], [-0.4, 0.3]], [[0.6, -0.1], [0.2, 0.5]]]),
+        "Upar": jnp.asarray([[[-0.2, 0.5], [0.1, -0.4]], [[0.3, 0.2], [-0.5, 0.6]]]),
+    }
+
+    def _fluxes_from_coordinates(a_b, er_list):
+        database_value = dataclasses.replace(
+            database_with_geometry_scale(database, a_b), Er_list=er_list
+        )
+        rows = []
+        for index in range(state.Er.shape[0]):
+            coordinate = database_value.a_b * (index + 1) + jnp.sum(database_value.Er_list[index])
+            rows.append({
+                "Gamma": jnp.asarray((coordinate, -0.5 * coordinate)),
+                "Q": jnp.asarray((2.0 * coordinate, coordinate)),
+                "Upar": jnp.asarray((-coordinate, 3.0 * coordinate)),
+            })
+        return jax.tree_util.tree_map(lambda *values: jnp.stack(values, axis=-1), *rows)
+
+    _, generic_pullback = jax.vjp(
+        _fluxes_from_coordinates, database.a_b, database.Er_list
+    )
+    expected_a_b, expected_er_list = jax.vmap(generic_pullback)(bars)
+    actual = model._pullback_local_direct_flux_database_coordinates(
+        state, bars, database
+    )
+
+    assert jnp.allclose(actual.a_b, expected_a_b)
+    assert jnp.allclose(actual.Er_list, expected_er_list)
+
+
+def test_database_direct_rhs_support_adds_scan_coordinate_bars(monkeypatch):
+    """Centre table support combines coefficient and coordinate bars once."""
+    database = Monoenergetic(
+        a_b=jnp.asarray(2.0), rho=jnp.linspace(0.0, 1.0, 5),
+        nu_log=jnp.asarray([-2.0]),
+        Er_list=jnp.asarray([[-7.0], [-6.0], [-5.0], [-4.0], [-3.0]]),
+        D11_log=jnp.zeros((5, 1, 1)), D13=jnp.zeros((5, 1, 1)),
+        D33=jnp.zeros((5, 1, 1)),
+    )
+    model = NTXDatabaseTransportModel(
+        species=object(), energy_grid=object(), geometry=jnp.asarray(1.0), database=database
+    )
+    state = TransportState(
+        density=jnp.ones((2, 2)), pressure=jnp.ones((2, 2)),
+        Er=jnp.asarray([0.1, 0.2]),
+    )
+
+    def _fake_local_direct_flux(self, _state):
+        def _evaluate(radius_index, _er_value):
+            coordinate = self.database.a_b * (radius_index + 1) + jnp.sum(
+                self.database.Er_list[radius_index]
+            )
+            return {
+                "Gamma": jnp.asarray((coordinate, -coordinate)),
+                "Q": jnp.zeros((2,)), "Upar": jnp.zeros((2,)),
+            }
+        return _evaluate
+
+    monkeypatch.setattr(
+        NTXDatabaseTransportModel, "build_local_direct_flux_evaluator", _fake_local_direct_flux
+    )
+    monkeypatch.setattr(
+        transport_flux_models_module,
+        "pullback_preprocessed_radial_database_fluxes",
+        lambda *_args, **_kwargs: (
+            jnp.zeros_like(database.D11_log), jnp.zeros_like(database.D13),
+            jnp.zeros_like(database.D33),
+        ),
+    )
+    bars = {
+        "Gamma": jnp.asarray([[0.2, -0.3], [0.4, 0.1]]),
+        "Q": jnp.zeros((2, 2)), "Upar": jnp.zeros((2, 2)),
+    }
+    expected = model._pullback_local_direct_flux_database_coordinates(
+        state, bars, database
+    )
+    actual = model.pullback_direct_rhs_support_payload(
+        state, bars, {"geometry": jnp.asarray(1.0), "database": database}
+    )["database"]
+
+    assert jnp.allclose(actual.a_b, expected.a_b)
+    assert jnp.allclose(actual.Er_list, expected.Er_list)
+    assert jnp.allclose(actual.D11_log, 0.0)
+
+
+def test_database_direct_face_coordinate_pullback_matches_compact_query_vjp(monkeypatch):
+    """Native face coordinate bars stop before the table/scan boundary."""
+    rho = jnp.asarray([0.0, 0.25, 0.5, 0.75, 1.0])
+    database = Monoenergetic(
+        a_b=jnp.asarray(2.0), rho=rho, nu_log=jnp.asarray([-2.0]),
+        Er_list=jnp.asarray([[-7.0], [-6.0], [-5.0], [-4.0], [-3.0]]),
+        D11_log=jnp.zeros((5, 1, 1)), D13=jnp.zeros((5, 1, 1)),
+        D33=jnp.zeros((5, 1, 1)),
+    )
+    species = SimpleNamespace(
+        mass=jnp.ones((2,)), species_indices=jnp.arange(2), charge=jnp.ones((2,))
+    )
+    model = NTXDatabaseTransportModel(
+        species=species,
+        energy_grid=SimpleNamespace(),
+        geometry=SimpleNamespace(r_grid_half=jnp.asarray([0.0, 1.0, 2.0])),
+        database=database,
+    )
+    state = TransportState(
+        density=jnp.ones((2, 2)), pressure=jnp.ones((2, 2)),
+        Er=jnp.asarray([0.1, 0.2]),
+    )
+    face_state = SimpleNamespace(
+        density=jnp.ones((2, 3)),
+        temperature=jnp.ones((2, 3)),
+        Er=jnp.zeros((3,)),
+    )
+
+    monkeypatch.setattr(
+        transport_flux_models_module,
+        "build_evaluated_transport_state",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            density_grad_face=jnp.zeros((2, 3)),
+            temperature_grad_face=jnp.zeros((2, 3)),
+        ),
+    )
+    monkeypatch.setattr(
+        transport_flux_models_module,
+        "get_Lij_matrix_at_radius",
+        lambda _species, _energy, _geometry, database_value, _species_index,
+        radius_value, *_args: (
+            database_value.a_b
+            + database_value.Er_list[jnp.asarray(radius_value, dtype=jnp.int32), 0]
+        ) * jnp.eye(3),
+    )
+    monkeypatch.setattr(
+        transport_flux_models_module,
+        "get_Thermodynamical_Forces_A1",
+        lambda *_args: jnp.asarray(1.0),
+    )
+    monkeypatch.setattr(
+        transport_flux_models_module,
+        "get_Thermodynamical_Forces_A2",
+        lambda *_args: jnp.asarray(0.0),
+    )
+    monkeypatch.setattr(
+        transport_flux_models_module,
+        "get_Thermodynamical_Forces_A3",
+        lambda er: jnp.zeros_like(er),
+    )
+    monkeypatch.setattr(
+        NTXDatabaseTransportModel,
+        "evaluate_face_fluxes",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("coordinate pullback must use its one-face primitive")
+        ),
+    )
+    bars = {
+        "Gamma": jnp.asarray([[[0.2, -0.3, 0.4], [0.4, 0.1, -0.2]], [[-0.5, 0.6, 0.1], [0.7, -0.2, 0.3]]]),
+        "Q": jnp.asarray([[[0.1, 0.2, -0.4], [-0.4, 0.3, 0.2]], [[0.6, -0.1, 0.3], [0.2, 0.5, -0.2]]]),
+        "Upar": jnp.asarray([[[-0.2, 0.5, 0.1], [0.1, -0.4, 0.2]], [[0.3, 0.2, -0.5], [-0.5, 0.6, 0.4]]]),
+    }
+
+    def _fluxes_from_coordinates(a_b, er_list):
+        database_value = dataclasses.replace(
+            database_with_geometry_scale(database, a_b), Er_list=er_list
+        )
+        coordinate = database_value.a_b + database_value.Er_list[:3, 0]
+        return {
+            "Gamma": -1.0e20 * jnp.stack((coordinate, coordinate)),
+            "Q": jnp.zeros((2, 3)),
+            "Upar": jnp.zeros((2, 3)),
+        }
+
+    _, generic_pullback = jax.vjp(
+        _fluxes_from_coordinates, database.a_b, database.Er_list
+    )
+    expected_a_b, expected_er_list = jax.vmap(generic_pullback)(bars)
+    actual = model._pullback_direct_face_flux_database_coordinates(
+        state, face_state, bars, database
+    )
+
+    assert jnp.allclose(actual.a_b, expected_a_b)
+    assert jnp.allclose(actual.Er_list, expected_er_list)
+
+
+def test_database_direct_face_support_adds_scan_coordinate_bars(monkeypatch):
+    """Face table support combines scan-coordinate bars before the fold."""
+    database = Monoenergetic(
+        a_b=jnp.asarray(2.0), rho=jnp.linspace(0.0, 1.0, 5),
+        nu_log=jnp.asarray([-2.0]),
+        Er_list=jnp.asarray([[-7.0], [-6.0], [-5.0], [-4.0], [-3.0]]),
+        D11_log=jnp.zeros((5, 1, 1)), D13=jnp.zeros((5, 1, 1)),
+        D33=jnp.zeros((5, 1, 1)),
+    )
+    model = NTXDatabaseTransportModel(
+        species=object(), energy_grid=object(), geometry=jnp.asarray(1.0), database=database
+    )
+    state = TransportState(
+        density=jnp.ones((2, 2)), pressure=jnp.ones((2, 2)),
+        Er=jnp.asarray([0.1, 0.2]),
+    )
+    face_state = SimpleNamespace(
+        density=jnp.ones((2, 3)), temperature=jnp.ones((2, 3)), Er=jnp.zeros((3,))
+    )
+
+    def _fake_face_fluxes(self, _state, _face_state, **_kwargs):
+        coordinate = self.database.a_b + self.database.Er_list[:3, 0]
+        return {
+            "Gamma": jnp.stack((coordinate, -coordinate)),
+            "Q": jnp.zeros((2, 3)), "Upar": jnp.zeros((2, 3)),
+        }
+
+    coordinate = dataclasses.replace(
+        _float_delta_tree_like(database),
+        a_b=jnp.asarray(2.0),
+        Er_list=jnp.full_like(database.Er_list, -0.5),
+    )
+    monkeypatch.setattr(
+        NTXDatabaseTransportModel,
+        "_pullback_direct_face_flux_database_coordinates",
+        lambda *_args, **_kwargs: coordinate,
+    )
+    monkeypatch.setattr(
+        transport_flux_models_module,
+        "build_evaluated_transport_state",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            density_grad_face=jnp.zeros((2, 3)), temperature_grad_face=jnp.zeros((2, 3))
+        ),
+    )
+    monkeypatch.setattr(
+        transport_flux_models_module,
+        "pullback_preprocessed_radial_database_face_fluxes",
+        lambda *_args, **_kwargs: (
+            jnp.zeros_like(database.D11_log), jnp.zeros_like(database.D13),
+            jnp.zeros_like(database.D33),
+        ),
+    )
+    bars = {
+        "Gamma": jnp.asarray([[0.2, -0.3, 0.4], [0.4, 0.1, -0.2]]),
+        "Q": jnp.zeros((2, 3)), "Upar": jnp.zeros((2, 3)),
+    }
+    actual = model.pullback_direct_face_flux_support_payload(
+        state,
+        face_state,
+        bars,
+        {"geometry": jnp.asarray(1.0), "database": database},
+    )["database"]
+
+    assert jnp.allclose(actual.a_b, coordinate.a_b)
+    assert jnp.allclose(actual.Er_list, coordinate.Er_list)
+    assert jnp.allclose(actual.D11_log, 0.0)
+
+
 def test_database_bootstrap_coordinate_pullback_matches_compact_query_vjp(monkeypatch):
     """Corrected-Upar coordinate bars use the same scan-owned contract."""
     rho = jnp.asarray([0.0, 0.25, 0.5, 0.75, 1.0])
@@ -263,6 +552,35 @@ def test_database_bootstrap_coordinate_pullback_matches_compact_query_vjp(monkey
 
     assert jnp.allclose(actual.a_b, expected_a_b)
     assert jnp.allclose(actual.Er_list, expected_er_list)
+
+
+def test_database_terminal_bootstrap_bar_keeps_coordinate_and_table_fields():
+    """Full-transport bootstrap assembly preserves the complete scan bar."""
+    database = Monoenergetic(
+        a_b=jnp.asarray(2.0), rho=jnp.linspace(0.0, 1.0, 3),
+        nu_log=jnp.asarray([-2.0]), Er_list=jnp.zeros((3, 1)),
+        D11_log=jnp.zeros((3, 1, 1)), D13=jnp.zeros((3, 1, 1)),
+        D33=jnp.zeros((3, 1, 1)),
+    )
+    coordinate = dataclasses.replace(
+        database,
+        a_b=jnp.asarray(1.25), Er_list=jnp.full_like(database.Er_list, -0.75),
+        D11_log=jnp.zeros_like(database.D11_log), D13=jnp.zeros_like(database.D13),
+        D33=jnp.zeros_like(database.D33),
+    )
+    actual = _database_bootstrap_table_and_coordinate_bar(
+        database,
+        jnp.full_like(database.D11_log, 2.0),
+        jnp.full_like(database.D13, 3.0),
+        jnp.full_like(database.D33, 4.0),
+        coordinate,
+    )
+
+    assert jnp.allclose(actual.a_b, coordinate.a_b)
+    assert jnp.allclose(actual.Er_list, coordinate.Er_list)
+    assert jnp.allclose(actual.D11_log, 2.0)
+    assert jnp.allclose(actual.D13, 3.0)
+    assert jnp.allclose(actual.D33, 4.0)
 
 
 def test_database_geometry_delta_restores_vmec_radial_mesh_relations():
@@ -751,8 +1069,8 @@ def test_database_compact_flux_payload_routes_physical_mesh_bar_through_a_b():
     assert jnp.allclose(actual.a_b, 12.0)
 
 
-def test_database_compact_flux_payload_comoves_fixed_table_coordinates():
-    """A local geometry VJP must not interpolate with stale database a_b."""
+def test_database_compact_flux_geometry_holds_scan_coordinates_fixed():
+    """Centre physical geometry excludes scan-owned table coordinates."""
 
     class _ToyDatabaseModel(NTXDatabaseTransportModel):
         def build_local_direct_flux_evaluator(self, state):
@@ -807,10 +1125,11 @@ def test_database_compact_flux_payload_comoves_fixed_table_coordinates():
         geometry,
     )
 
-    # Two radii and two species each see the database scale co-moving with
-    # geometry.a_b.  Stale primal database coordinates would give zero.
+    # The scan-owned database coordinate contribution is now carried by the
+    # explicit database support bar.  This physical geometry sibling keeps
+    # the Monoenergetic table fixed, so the toy flux has no local mesh bar.
     assert jnp.all(jnp.isfinite(actual.a_b))
-    assert jnp.allclose(actual.a_b, 4.0)
+    assert jnp.allclose(actual.a_b, 0.0)
 
 
 def test_database_equation_geometry_delta_keeps_axis_face_constrained():

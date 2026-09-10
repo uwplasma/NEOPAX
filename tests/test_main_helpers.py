@@ -3196,6 +3196,11 @@ def test_recorded_ntx_database_bar_is_folded_once_into_scan_support(monkeypatch)
         },
     )
     assert set(actual) == {"geometry", "channels", "surfaces"}
+    # The compact fixed-table geometry cotangent is already in the live
+    # payload's geometry branch.  Folding the recorded table may add only
+    # scan channels/surfaces; dropping or replacing this leaf would omit the
+    # database analogue of Lij's direct residual-geometry term.
+    assert jnp.allclose(actual["geometry"], 7.0)
     assert jnp.allclose(actual["channels"], 13.0)
     assert jnp.allclose(actual["surfaces"], 16.0)
     assert calls == {"count": 1}
@@ -3232,6 +3237,53 @@ def test_recorded_ntx_database_bars_use_one_batched_scan_pullback(monkeypatch):
     assert jnp.allclose(actual[1]["surfaces"], 110.0)
     # ``vmap`` traces the retained transpose once instead of Python-looping
     # through the two objective rows.
+    assert calls == {"count": 1}
+
+
+def test_recorded_ntx_database_fold_preserves_coordinate_leaves(monkeypatch):
+    """One batched recorded transpose receives a_b and Er_list unchanged."""
+    calls = {"count": 0}
+
+    class _RecordedScan:
+        def recorded_runtime_database_support_bar(self, database_bar):
+            calls["count"] += 1
+            coordinate_sum = database_bar["a_b"] + jnp.sum(database_bar["Er_list"])
+            return {
+                "channels": coordinate_sum,
+                "surfaces": 2.0 * coordinate_sum,
+            }
+
+    monkeypatch.setattr(
+        initial_er_module,
+        "find_ntx_runtime_scan_model_in_model",
+        lambda _flux: _RecordedScan(),
+    )
+    runtime = types.SimpleNamespace(models=types.SimpleNamespace(flux=object()))
+    actual = fold_recorded_ntx_scan_database_bars_into_support(
+        runtime,
+        (
+            {
+                "geometry": jnp.asarray(0.0),
+                "database": {
+                    "a_b": jnp.asarray(2.0),
+                    "Er_list": jnp.asarray([0.5, -0.25]),
+                    "D11_log": jnp.asarray(0.0),
+                },
+            },
+            {
+                "geometry": jnp.asarray(0.0),
+                "database": {
+                    "a_b": jnp.asarray(-1.0),
+                    "Er_list": jnp.asarray([0.75, 0.5]),
+                    "D11_log": jnp.asarray(0.0),
+                },
+            },
+        ),
+    )
+    assert jnp.allclose(actual[0]["channels"], 2.25)
+    assert jnp.allclose(actual[1]["channels"], 0.25)
+    assert jnp.allclose(actual[0]["surfaces"], 4.5)
+    assert jnp.allclose(actual[1]["surfaces"], 0.5)
     assert calls == {"count": 1}
 
 

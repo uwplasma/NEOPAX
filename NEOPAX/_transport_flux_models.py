@@ -39,6 +39,7 @@ from ._neoclassical import (
     get_momentum_Correction,
     get_corrected_fluxes,
     get_Lij_matrix,
+    get_Lij_matrix_at_radius,
     get_Lij_matrix_local,
     get_Neoclassical_Fluxes,
     get_Neoclassical_Fluxes_Faces,
@@ -3394,6 +3395,24 @@ class NTXDatabaseTransportModel(TransportFluxModelBase):
         database_bar = dataclasses.replace(
             database_bar, D11_log=d11_bar, D13=d13_bar, D33=d33_bar
         )
+        # As at centres, native face queries depend on the scan-owned radial
+        # scale and electric-field axis as well as on coefficient values.
+        # Preserve that derivative in the explicit database leaf; the
+        # recorded scan consumes the combined bar once after the sweep.
+        coordinate_bar = self._pullback_direct_face_flux_database_coordinates(
+            state,
+            face_state,
+            {"Gamma": _bar("Gamma"), "Q": _bar("Q"), "Upar": _bar("Upar")},
+            database,
+            **kwargs,
+        )
+        database_bar = jax.tree_util.tree_map(
+            lambda coefficient_bar, coordinate_leaf: (
+                jnp.asarray(coefficient_bar) + jnp.asarray(coordinate_leaf)
+            ),
+            database_bar,
+            coordinate_bar,
+        )
         result = dict(_float_delta_tree_like(support))
         result["database"] = (
             database_bar if batched_rhs
@@ -3578,7 +3597,9 @@ class NTXDatabaseTransportModel(TransportFluxModelBase):
                     geometry, _split(flat_delta)
                 )
                 database_value = self.database
-                if database_value is not None:
+                if database_value is not None and not isinstance(
+                    database_value, Monoenergetic
+                ):
                     database_value = database_with_geometry_scale(
                         database_value, geometry_value.a_b
                     )
@@ -3910,6 +3931,22 @@ class NTXDatabaseTransportModel(TransportFluxModelBase):
             D13=d13_bar,
             D33=d33_bar,
         )
+        # A runtime NTX scan owns not just the three coefficient tables but
+        # also their query coordinates.  Keep those coordinate cotangents in
+        # this same explicit database leaf so the retained scan consumes the
+        # complete centre-flux bar exactly once after the segment sweep.
+        coordinate_bar = self._pullback_local_direct_flux_database_coordinates(
+            state,
+            {"Gamma": _bar("Gamma"), "Q": _bar("Q"), "Upar": _bar("Upar")},
+            database,
+        )
+        database_bar = jax.tree_util.tree_map(
+            lambda coefficient_bar, coordinate_leaf: (
+                jnp.asarray(coefficient_bar) + jnp.asarray(coordinate_leaf)
+            ),
+            database_bar,
+            coordinate_bar,
+        )
         support_bar = dict(_float_delta_tree_like(support))
         if batched_rhs:
             support_bar = jax.tree_util.tree_map(
@@ -3971,12 +4008,17 @@ class NTXDatabaseTransportModel(TransportFluxModelBase):
                     geometry,
                     _split(flat_delta),
                 )
-                # The coefficient values stay fixed at this boundary, but the
-                # database interpolation coordinates contain a_b.  Letting
-                # geometry move while retaining the primal database metadata
-                # differentiates an inconsistent (off-manifold) model.
+                # The centre support boundary owns the scan-table and its
+                # interpolation-coordinate bars.  This sibling owns only
+                # physical fixed-table geometry, so a scan-built
+                # Monoenergetic database must remain completely fixed here.
+                # Legacy preprocessed databases retain their established
+                # local scale convention because they have no recorded
+                # scan-coordinate transpose.
                 database_value = self.database
-                if database_value is not None:
+                if database_value is not None and not isinstance(
+                    database_value, Monoenergetic
+                ):
                     database_value = database_with_geometry_scale(
                         database_value, geometry_value.a_b
                     )
@@ -4210,6 +4252,290 @@ class NTXDatabaseTransportModel(TransportFluxModelBase):
                 lambda value: jnp.broadcast_to(
                     jnp.asarray(value)[None, ...],
                     (gamma_rows.shape[0],) + jnp.asarray(value).shape,
+                ),
+                zero,
+            )
+        return dataclasses.replace(zero, a_b=a_b_bar, Er_list=er_list_bar)
+
+    def _pullback_local_direct_flux_database_coordinates(
+        self, state, flux_bar, database
+    ):
+        """Return scan-owned coordinate bars for centre direct fluxes.
+
+        This intentionally stops at ``a_b`` and ``Er_list`` of a fixed
+        Monoenergetic table.  Coefficient bars belong to the explicit table
+        transpose, while the physical-mesh geometry bar belongs to the paired
+        local geometry boundary.  The caller combines all three only after
+        their individual compact rules have been evaluated.
+        """
+        zero = _float_delta_tree_like(database)
+        if not isinstance(database, Monoenergetic):
+            return zero
+
+        density = jnp.asarray(state.density)
+        supplied = tuple(
+            jnp.asarray(value)
+            for value in flux_bar.values()
+            if value is not None
+            and jnp.asarray(value).ndim > 0
+            and jnp.asarray(value).dtype != jax.dtypes.float0
+        )
+        zero_flux = jnp.zeros_like(supplied[0]) if supplied else jnp.zeros_like(density)
+
+        def _bar(name):
+            value = flux_bar.get(name, None)
+            if value is None:
+                return zero_flux
+            value = jnp.asarray(value)
+            return zero_flux if value.ndim == 0 or value.dtype == jax.dtypes.float0 else value
+
+        bars = {name: _bar(name) for name in ("Gamma", "Q", "Upar")}
+        batched = jnp.asarray(bars["Gamma"]).ndim == density.ndim + 1
+        bar_rows = (
+            bars
+            if batched
+            else jax.tree_util.tree_map(lambda value: value[None, ...], bars)
+        )
+        radius_indices = jnp.arange(jnp.asarray(bar_rows["Gamma"]).shape[-1], dtype=jnp.int32)
+
+        def _database_from_coordinates(a_b, er_list):
+            return dataclasses.replace(
+                database_with_geometry_scale(database, a_b), Er_list=er_list
+            )
+
+        def _accumulate(carry, radius_index):
+            def _local_fluxes(a_b, er_list):
+                model = dataclasses.replace(
+                    self, database=_database_from_coordinates(a_b, er_list)
+                )
+                return model.build_local_direct_flux_evaluator(state)(
+                    radius_index, state.Er[radius_index]
+                )
+
+            _, pullback = jax.vjp(
+                _local_fluxes, jnp.asarray(database.a_b), jnp.asarray(database.Er_list)
+            )
+            local_rows = jax.tree_util.tree_map(
+                lambda value: value[..., radius_index], bar_rows
+            )
+            a_b_rows, er_list_rows = jax.vmap(pullback)(local_rows)
+            return (
+                carry[0] + a_b_rows,
+                carry[1] + er_list_rows,
+            ), None
+
+        row_count = jnp.asarray(bar_rows["Gamma"]).shape[0]
+        (a_b_bar, er_list_bar), _ = jax.lax.scan(
+            _accumulate,
+            (
+                jnp.zeros((row_count,), dtype=jnp.asarray(database.a_b).dtype),
+                jnp.zeros(
+                    (row_count,) + jnp.asarray(database.Er_list).shape,
+                    dtype=jnp.asarray(database.Er_list).dtype,
+                ),
+            ),
+            radius_indices,
+        )
+        if not batched:
+            a_b_bar = a_b_bar[0]
+            er_list_bar = er_list_bar[0]
+        else:
+            zero = jax.tree_util.tree_map(
+                lambda value: jnp.broadcast_to(
+                    jnp.asarray(value)[None, ...],
+                    (row_count,) + jnp.asarray(value).shape,
+                ),
+                zero,
+            )
+        return dataclasses.replace(zero, a_b=a_b_bar, Er_list=er_list_bar)
+
+    def _pullback_direct_face_flux_database_coordinates(
+        self, state, face_state, flux_bar, database, **kwargs
+    ):
+        """Return scan-owned coordinate bars for native direct face fluxes.
+
+        Face-state reconstruction and physical mesh are held fixed.  A
+        ``lax.scan`` keeps the reverse graph bounded by one face primitive;
+        no recorded scan or database-table VJP is captured here.
+        """
+        zero = _float_delta_tree_like(database)
+        if not isinstance(database, Monoenergetic):
+            return zero
+
+        face_density = jnp.asarray(face_state.density)
+        supplied = tuple(
+            jnp.asarray(value)
+            for value in flux_bar.values()
+            if value is not None
+            and jnp.asarray(value).ndim > 0
+            and jnp.asarray(value).dtype != jax.dtypes.float0
+        )
+        zero_flux = jnp.zeros_like(supplied[0]) if supplied else jnp.zeros_like(face_density)
+
+        def _bar(name):
+            value = flux_bar.get(name, None)
+            if value is None:
+                return zero_flux
+            value = jnp.asarray(value)
+            return zero_flux if value.ndim == 0 or value.dtype == jax.dtypes.float0 else value
+
+        bars = {name: _bar(name) for name in ("Gamma", "Q", "Upar")}
+        batched = jnp.asarray(bars["Gamma"]).ndim == face_density.ndim + 1
+        bar_rows = (
+            bars
+            if batched
+            else jax.tree_util.tree_map(lambda value: value[None, ...], bars)
+        )
+        face_indices = jnp.arange(jnp.asarray(bar_rows["Gamma"]).shape[-1], dtype=jnp.int32)
+
+        # Build the face-local state algebra once.  It is independent of the
+        # scan coordinates, so retaining it outside the per-face VJP avoids
+        # reconstructing (and differentiating through) the complete face
+        # array for every scan iteration.
+        evaluated = kwargs.get("evaluated_state")
+        if evaluated is None:
+            evaluated = build_evaluated_transport_state(
+                state,
+                self.geometry,
+                bc_density=kwargs.get("bc_density", self.bc_density),
+                bc_temperature=kwargs.get("bc_temperature", self.bc_temperature),
+                density_floor=self.density_floor,
+            )
+        face_mode = str(
+            kwargs.get("particle_face_closure_mode", "reconstructed")
+        ).strip().lower()
+        if face_mode in {"ntss_like", "ntss", "half_point"}:
+            dndr_faces = _ntss_like_face_gradient(
+                evaluated.center.density,
+                self.geometry.r_grid_half,
+                bc_model=kwargs.get("bc_density", self.bc_density),
+            )
+            dtdr_faces = _ntss_like_face_gradient(
+                evaluated.center.temperature,
+                self.geometry.r_grid_half,
+                bc_model=kwargs.get("bc_temperature", self.bc_temperature),
+            )
+        else:
+            dndr_faces = evaluated.density_grad_face
+            dtdr_faces = evaluated.temperature_grad_face
+        density_faces = safe_density(face_state.density, self.density_floor)
+        temperature_faces = jnp.asarray(face_state.temperature)
+        er_faces = jnp.asarray(face_state.Er)
+        vthermal_faces = get_v_thermal(self.species.mass, temperature_faces)
+        collisionality_kind = _collisionality_kind(self.collisionality_model)
+
+        def _database_from_coordinates(a_b, er_list):
+            return dataclasses.replace(
+                database_with_geometry_scale(database, a_b), Er_list=er_list
+            )
+
+        def _local_face_fluxes_from_database(database_value, face_index):
+            """Exact one-face restriction of ``evaluate_face_fluxes``."""
+            density_local = jax.lax.dynamic_index_in_dim(
+                density_faces, face_index, axis=1, keepdims=False
+            )
+            temperature_local = jax.lax.dynamic_index_in_dim(
+                temperature_faces, face_index, axis=1, keepdims=False
+            )
+            dndr_local = jax.lax.dynamic_index_in_dim(
+                dndr_faces, face_index, axis=1, keepdims=False
+            )
+            dtdr_local = jax.lax.dynamic_index_in_dim(
+                dtdr_faces, face_index, axis=1, keepdims=False
+            )
+            vthermal_local = jax.lax.dynamic_index_in_dim(
+                vthermal_faces, face_index, axis=1, keepdims=False
+            )
+            er_local = jax.lax.dynamic_index_in_dim(
+                er_faces, face_index, axis=0, keepdims=False
+            )
+            radius_value = jax.lax.dynamic_index_in_dim(
+                self.geometry.r_grid_half, face_index, axis=0, keepdims=False
+            )
+            lij = jax.vmap(
+                lambda species_index, temperature_species, density_species, vthermal_species: get_Lij_matrix_at_radius(
+                    self.species,
+                    self.energy_grid,
+                    self.geometry,
+                    database_value,
+                    species_index,
+                    radius_value,
+                    er_local,
+                    temperature_species,
+                    density_species,
+                    vthermal_species,
+                    collisionality_kind,
+                )
+            )(
+                self.species.species_indices,
+                temperature_local,
+                density_local,
+                vthermal_local,
+            )
+            a1 = jax.vmap(get_Thermodynamical_Forces_A1)(
+                self.species.charge,
+                density_local,
+                temperature_local,
+                dndr_local,
+                dtdr_local,
+                jnp.broadcast_to(er_local, density_local.shape),
+            )
+            a2 = jax.vmap(get_Thermodynamical_Forces_A2)(
+                temperature_local, dtdr_local
+            )
+            a3 = get_Thermodynamical_Forces_A3(jnp.reshape(er_local, (1,)))[0]
+            density_phys = DENSITY_STATE_TO_PHYSICAL * density_local
+            temperature_phys = TEMPERATURE_STATE_TO_PHYSICAL * temperature_local
+            return {
+                "Gamma": -density_phys * (
+                    lij[:, 0, 0] * a1 + lij[:, 0, 1] * a2 + lij[:, 0, 2] * a3
+                ),
+                "Q": -temperature_phys * density_phys * (
+                    lij[:, 1, 0] * a1 + lij[:, 1, 1] * a2 + lij[:, 1, 2] * a3
+                ),
+                "Upar": -density_phys * (
+                    lij[:, 2, 0] * a1 + lij[:, 2, 1] * a2 + lij[:, 2, 2] * a3
+                ),
+            }
+
+        def _accumulate(carry, face_index):
+            def _local_face_fluxes(a_b, er_list):
+                return _local_face_fluxes_from_database(
+                    _database_from_coordinates(a_b, er_list), face_index
+                )
+
+            _, pullback = jax.vjp(
+                _local_face_fluxes, jnp.asarray(database.a_b), jnp.asarray(database.Er_list)
+            )
+            local_rows = jax.tree_util.tree_map(
+                lambda value: value[..., face_index], bar_rows
+            )
+            a_b_rows, er_list_rows = jax.vmap(pullback)(local_rows)
+            return (
+                carry[0] + a_b_rows,
+                carry[1] + er_list_rows,
+            ), None
+
+        row_count = jnp.asarray(bar_rows["Gamma"]).shape[0]
+        (a_b_bar, er_list_bar), _ = jax.lax.scan(
+            _accumulate,
+            (
+                jnp.zeros((row_count,), dtype=jnp.asarray(database.a_b).dtype),
+                jnp.zeros(
+                    (row_count,) + jnp.asarray(database.Er_list).shape,
+                    dtype=jnp.asarray(database.Er_list).dtype,
+                ),
+            ),
+            face_indices,
+        )
+        if not batched:
+            a_b_bar = a_b_bar[0]
+            er_list_bar = er_list_bar[0]
+        else:
+            zero = jax.tree_util.tree_map(
+                lambda value: jnp.broadcast_to(
+                    jnp.asarray(value)[None, ...],
+                    (row_count,) + jnp.asarray(value).shape,
                 ),
                 zero,
             )

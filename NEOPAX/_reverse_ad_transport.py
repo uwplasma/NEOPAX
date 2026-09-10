@@ -322,6 +322,26 @@ def _objective_vector_vjp_rows(objective_vector_fn: Callable[[object], object], 
     return values, jax.vmap(lambda cotangent: pullback(cotangent)[0])(basis)
 
 
+def _database_bootstrap_table_and_coordinate_bar(
+    database, d11_bar, d13_bar, d33_bar, coordinate_bar
+):
+    """Assemble the complete fixed-table bootstrap cotangent.
+
+    Coefficient and query-coordinate bars are both inputs of the retained
+    database scan.  Keeping this small assembly separate makes it impossible
+    for the terminal bootstrap branch to silently discard ``a_b`` or
+    ``Er_list`` while preserving the one-fold scan boundary.
+    """
+    return dataclasses.replace(
+        _float_delta_tree_like(database),
+        a_b=coordinate_bar.a_b,
+        Er_list=coordinate_bar.Er_list,
+        D11_log=d11_bar,
+        D13=d13_bar,
+        D33=d33_bar,
+    )
+
+
 def _take_batched_pytree_row(tree, row_index: int):
     """Extract one leading objective row from every leaf of a pytree."""
 
@@ -4563,6 +4583,11 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
                 "pullback_momentum_corrected_upar_database_by_radius",
                 None,
             )
+            database_coordinate_pullback_fn = getattr(
+                neoclassical_model,
+                "pullback_momentum_corrected_upar_database_coordinates_by_radius",
+                None,
+            )
             support_pullback_fn = getattr(
                 neoclassical_model,
                 "pullback_momentum_corrected_upar_support_by_radius",
@@ -4602,7 +4627,10 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
                     not callable(state_pullback_fn)
                     or (
                         database_payload
-                        and not callable(database_pullback_fn)
+                        and (
+                            not callable(database_pullback_fn)
+                            or not callable(database_coordinate_pullback_fn)
+                        )
                     )
                     or (not database_payload and not callable(support_pullback_fn))
                 )
@@ -4641,6 +4669,11 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
                 raise NotImplementedError(
                     "joint local bootstrap modes require "
                     "the combined realtime geometry payload."
+                )
+            if database_payload and not callable(database_coordinate_pullback_fn):
+                raise NotImplementedError(
+                    "Recorded database bootstrap AD requires the compact corrected-Upar "
+                    "database-coordinate pullback."
                 )
             if use_joint_bootstrap_pullback:
                 if not callable(joint_pullback_fn):
@@ -4686,12 +4719,16 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
                     d11_bar, d13_bar, d33_bar = database_pullback_fn(
                         final_state_for_bootstrap, upar_bar
                     )
+                    coordinate_bar = database_coordinate_pullback_fn(
+                        final_state_for_bootstrap, upar_bar
+                    )
                     database = support_payload["database"]
-                    database_bar = dataclasses.replace(
-                        _float_delta_tree_like(database),
-                        D11_log=d11_bar,
-                        D13=d13_bar,
-                        D33=d33_bar,
+                    database_bar = _database_bootstrap_table_and_coordinate_bar(
+                        database,
+                        d11_bar,
+                        d13_bar,
+                        d33_bar,
+                        coordinate_bar,
                     )
                     geometry = support_payload["geometry"]
                     if (
