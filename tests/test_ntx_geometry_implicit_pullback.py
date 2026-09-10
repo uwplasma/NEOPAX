@@ -43,6 +43,7 @@ from NEOPAX._species import Species
 from NEOPAX._state import TransportState, get_v_thermal
 from NEOPAX._transport_equations import (
     ComposedEquationSystem,
+    DensityEquation,
     TemperatureEquation,
     _database_fixed_flux_payload_with_faces,
 )
@@ -203,6 +204,127 @@ def test_database_direct_state_pullback_preserves_temperature_flux_work_and_sour
 
     _, generic_pullback = jax.vjp(_direct_rhs, state)
     expected = generic_pullback(rhs_bar)[0]
+    actual = equations.pullback_direct_rhs_state(
+        jnp.asarray(0.0), state, None, rhs_bar
+    )
+    _assert_float_tree_allclose(actual, expected, rtol=2.0e-10, atol=2.0e-12)
+
+
+def test_database_composed_direct_state_pullback_matches_full_rhs_vjp():
+    """Production-shaped database state rule equals the complete RHS VJP.
+
+    This is the oracle required before the compact direct state rule may be
+    used for Radau carry bars.  Unlike the smaller temperature-only test, it
+    includes the electron quasi-neutral working-state projection, density and
+    pressure finite-volume assemblies, centre flux work, and a state-dependent
+    pressure source.  The database table is fixed: this checks exactly the
+    state-Jacobian contract that the stage/carry transpose needs.
+    """
+    species = Species(
+        number_species=2,
+        species_indices=jnp.asarray([0, 1]),
+        mass_mp=jnp.asarray([5.446e-4, 2.0]),
+        charge_qp=jnp.asarray([-1.0, 1.0]),
+        names=("e", "D"),
+    )
+    geometry = _TestPhysicalMomentumGeometry(
+        a_b=jnp.asarray(1.0),
+        rho_grid=jnp.asarray([0.25, 0.75]),
+        rho_grid_half=jnp.asarray([0.0, 0.5, 1.0]),
+        r_grid=jnp.asarray([0.25, 0.75]),
+        r_grid_half=jnp.asarray([0.0, 0.5, 1.0]),
+        Bsqav=jnp.asarray([1.2, 1.3]),
+        G_PS=jnp.asarray([1.0, 1.1]),
+        B0=jnp.asarray([1.0, 1.0]),
+        full_grid_indices=jnp.arange(2, dtype=jnp.int32),
+        dr=jnp.asarray(0.5),
+    )
+    rho = jnp.asarray([0.0, 0.25, 0.5, 0.75, 1.0])
+    nu_v = jnp.asarray([1.0e-4, 1.0e-2, 1.0])
+    er_grid = jnp.asarray([[0.0, 1.0e-4, 1.0e-3, 1.0e-2]])
+    table_shape = (rho.size, nu_v.size, er_grid.shape[1])
+    table_seed = jnp.reshape(
+        jnp.arange(int(jnp.prod(jnp.asarray(table_shape))), dtype=jnp.float64),
+        table_shape,
+    )
+    database = PreprocessedMonoenergetic3DNTSSRadius.read_data(
+        a_b=1.0,
+        rho=rho,
+        nu_v=nu_v,
+        Er=er_grid,
+        drds=jnp.ones_like(rho),
+        D11=1.0 + 1.0e-3 * table_seed,
+        D13=0.2 + 1.0e-4 * table_seed,
+        D33=0.3 + 2.0e-4 * table_seed,
+    )
+    flux_model = NTXDatabaseTransportModel(
+        species=species,
+        energy_grid=StandardLaguerreEnergyGrid(n_x=2),
+        geometry=geometry,
+        database=database,
+    )
+
+    def _faces(values, _mode=None):
+        return jnp.concatenate(
+            (values[:, :1], 0.5 * (values[:, :-1] + values[:, 1:]), values[:, -1:]),
+            axis=1,
+        )
+
+    density_equation = DensityEquation(
+        dr_cells=jnp.asarray([0.5, 0.5]),
+        Vprime=jnp.asarray([1.2, 1.4]),
+        Vprime_half=jnp.asarray([1.0, 1.1, 1.5]),
+        flux_model=flux_model,
+        flux_faces_builder=_faces,
+        active_species_mask=jnp.asarray([True, True]),
+        independent_density_mask=jnp.asarray([False, True]),
+        particle_flux_reconstruction="centered",
+        species=species,
+    )
+    temperature_equation = TemperatureEquation(
+        dr_cells=jnp.asarray([0.5, 0.5]),
+        Vprime=jnp.asarray([1.2, 1.4]),
+        Vprime_half=jnp.asarray([1.0, 1.1, 1.5]),
+        flux_model=flux_model,
+        flux_faces_builder=_faces,
+        temperature_ghost_builder=lambda value: jnp.concatenate(
+            (value[:, :1], value, value[:, -1:]), axis=1
+        ),
+        charge_qp=species.charge_qp,
+        active_species_mask=jnp.asarray([True, True]),
+        convection_reconstruction="centered",
+        heat_flux_reconstruction="centered",
+        include_work_term=True,
+        work_term_reconstruction="center",
+        source_model=lambda value: 0.03 * value.pressure,
+        species=species,
+    )
+    equations = ComposedEquationSystem(
+        equations=(density_equation, temperature_equation),
+        density_equation=density_equation,
+        temperature_equation=temperature_equation,
+        shared_flux_model=flux_model,
+        species=species,
+    )
+    state = TransportState(
+        density=jnp.asarray([[1.1, 1.2], [1.1, 1.2]]),
+        pressure=jnp.asarray([[1.8, 2.04], [1.3, 1.56]]),
+        Er=jnp.asarray([2.0e-4, 2.5e-4]),
+    )
+    rhs_bar = TransportState(
+        density=jnp.asarray([[0.1, -0.2], [0.3, -0.4]]),
+        pressure=jnp.asarray([[-0.2, 0.15], [0.35, -0.1]]),
+        Er=jnp.zeros_like(state.Er),
+    )
+
+    def _rhs(state_value):
+        working_state, _ = equations._prepare_working_state(state_value)
+        return equations.evaluate_with_shared_fluxes(
+            jnp.asarray(0.0), state_value, None, flux_model(working_state)
+        )
+
+    _, generic_pullback = jax.vjp(_rhs, state)
+    (expected,) = generic_pullback(rhs_bar)
     actual = equations.pullback_direct_rhs_state(
         jnp.asarray(0.0), state, None, rhs_bar
     )

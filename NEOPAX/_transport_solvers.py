@@ -14,6 +14,7 @@ from functools import partial
 import inspect
 import json
 import math
+import os
 import time
 import zlib
 import jax
@@ -2069,6 +2070,9 @@ def _flat_rhs_direct_black_box_state_pullback_factory(
     if pullback_fn is None:
         return None
     unravel_bar = getattr(unravel, "cotangent", unravel)
+    state_vjp_diagnostics = os.environ.get(
+        "NEOPAX_DATABASE_STATE_VJP_DIAGNOSTICS", ""
+    ).strip().lower() in {"1", "true", "yes", "on"}
 
     def _pullback(t_value, flat_y, _lagged_response, rhs_bar_flat):
         projected_flat_y = _project_flat_state_if_needed(flat_y, project_flat)
@@ -2083,6 +2087,41 @@ def _flat_rhs_direct_black_box_state_pullback_factory(
             # an explicit failure if a dynamic model violates its contract.
             raise ValueError("Direct black-box RHS state pullback returned None.")
         projected_bar = pack_flat(state_bar)
+        if state_vjp_diagnostics:
+            input_array = jnp.asarray(rhs_bar_flat)
+            density_bar = jnp.asarray(state_bar.density)
+            pressure_bar = jnp.asarray(state_bar.pressure)
+            er_bar = jnp.asarray(state_bar.Er)
+            input_finite = jnp.all(jnp.isfinite(input_array))
+            output_finite = (
+                jnp.all(jnp.isfinite(density_bar))
+                & jnp.all(jnp.isfinite(pressure_bar))
+                & jnp.all(jnp.isfinite(er_bar))
+            )
+
+            def _report_first_compact_failure(_):
+                # This is deliberately conditional: it reports the transition
+                # from a finite Radau cotangent to a nonfinite compact state
+                # transpose without materialising a second full-RHS Jacobian.
+                # If the input is already nonfinite, the originating earlier
+                # reverse step is responsible instead.
+                jax.debug.print(
+                    "[database-state-vjp] compact transition finite_input={input_finite} "
+                    "density_nonfinite={density_bad} pressure_nonfinite={pressure_bad} "
+                    "Er_nonfinite={er_bad}",
+                    input_finite=input_finite,
+                    density_bad=jnp.sum(~jnp.isfinite(density_bar)),
+                    pressure_bad=jnp.sum(~jnp.isfinite(pressure_bar)),
+                    er_bad=jnp.sum(~jnp.isfinite(er_bar)),
+                )
+                return jnp.asarray(0, dtype=jnp.int32)
+
+            jax.lax.cond(
+                input_finite & ~output_finite,
+                _report_first_compact_failure,
+                lambda _: jnp.asarray(0, dtype=jnp.int32),
+                operand=None,
+            )
         if project_flat is None:
             return projected_bar
         _, project_pullback = jax.vjp(project_flat, flat_y)
