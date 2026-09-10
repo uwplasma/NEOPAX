@@ -4099,6 +4099,20 @@ class NTXDatabaseTransportModel(TransportFluxModelBase):
             temperature_right_constraint,
             temperature_right_grad_constraint,
         )
+        # The runtime scan does not only produce the three coefficient
+        # surfaces.  Its ``Er`` normalization and radial scale also produce
+        # the interpolation coordinates stored in ``Er_list`` and ``a_b``.
+        # Sending only D11/D13/D33 through the retained scan therefore loses
+        # the geometry path
+        #
+        #   geometry -> scan channels -> (a_b, Er_list) -> Dij query -> Gamma.
+        #
+        # Keep this a compact *local* transpose: one particle-flux VJP per
+        # radius, batched across objective rows.  The resulting database bars
+        # are folded through the recorded scan exactly once by the caller.
+        coordinate_bar = self._pullback_local_particle_flux_database_coordinates(
+            state, _bar("Gamma"), database
+        )
         database_bar0 = _float_delta_tree_like(database)
         if jnp.asarray(d11_bar).ndim == jnp.asarray(database.D11_log).ndim + 1:
             rhs_count = jnp.asarray(d11_bar).shape[0]
@@ -4113,6 +4127,13 @@ class NTXDatabaseTransportModel(TransportFluxModelBase):
             database_bar0,
             D11_log=d11_bar, D13=d13_bar, D33=d33_bar,
         )
+        database_bar = jax.tree_util.tree_map(
+            lambda coefficient_bar, coordinate_leaf: (
+                jnp.asarray(coefficient_bar) + jnp.asarray(coordinate_leaf)
+            ),
+            database_bar,
+            coordinate_bar,
+        )
         support_bar = dict(_float_delta_tree_like(support))
         support_bar["database"] = (
             database_bar
@@ -4120,6 +4141,79 @@ class NTXDatabaseTransportModel(TransportFluxModelBase):
             else _sanitize_float_delta_bar_tree(database, database_bar)
         )
         return support_bar
+
+    def _pullback_local_particle_flux_database_coordinates(
+        self, state, gamma_bar, database
+    ):
+        """Return local selected-root bars for scan-owned DB coordinates.
+
+        ``a_b`` is represented through :func:`database_with_geometry_scale`
+        so its dependent radius-limit leaves follow the same contract as the
+        primal database construction.  ``Er_list`` is independent afterward:
+        it is the scan-owned log-electric-field interpolation coordinate.
+        """
+        zero = _float_delta_tree_like(database)
+        if not isinstance(database, Monoenergetic):
+            # The explicit runtime NTX scan builds Monoenergetic databases.
+            # Other database kinds have no recorded scan-coordinate contract.
+            return zero
+
+        gamma_bar = jnp.asarray(gamma_bar)
+        state_density = jnp.asarray(state.density)
+        batched = gamma_bar.ndim == state_density.ndim + 1
+        gamma_rows = gamma_bar if batched else gamma_bar[None, ...]
+        radius_count = gamma_rows.shape[-1]
+        radius_indices = jnp.arange(radius_count, dtype=jnp.int32)
+
+        def _database_from_coordinates(a_b, er_list):
+            return dataclasses.replace(
+                database_with_geometry_scale(database, a_b), Er_list=er_list
+            )
+
+        def _accumulate(carry, radius_index):
+            def _local_gamma(a_b, er_list):
+                model = dataclasses.replace(
+                    self,
+                    database=_database_from_coordinates(a_b, er_list),
+                )
+                return model.build_local_particle_flux_evaluator(state)(
+                    radius_index, state.Er[radius_index]
+                )
+
+            _, pullback = jax.vjp(
+                _local_gamma, jnp.asarray(database.a_b), jnp.asarray(database.Er_list)
+            )
+            a_b_rows, er_list_rows = jax.vmap(pullback)(
+                gamma_rows[..., radius_index]
+            )
+            return (
+                carry[0] + a_b_rows,
+                carry[1] + er_list_rows,
+            ), None
+
+        (a_b_bar, er_list_bar), _ = jax.lax.scan(
+            _accumulate,
+            (
+                jnp.zeros((gamma_rows.shape[0],), dtype=jnp.asarray(database.a_b).dtype),
+                jnp.zeros(
+                    (gamma_rows.shape[0],) + jnp.asarray(database.Er_list).shape,
+                    dtype=jnp.asarray(database.Er_list).dtype,
+                ),
+            ),
+            radius_indices,
+        )
+        if not batched:
+            a_b_bar = a_b_bar[0]
+            er_list_bar = er_list_bar[0]
+        if batched:
+            zero = jax.tree_util.tree_map(
+                lambda value: jnp.broadcast_to(
+                    jnp.asarray(value)[None, ...],
+                    (gamma_rows.shape[0],) + jnp.asarray(value).shape,
+                ),
+                zero,
+            )
+        return dataclasses.replace(zero, a_b=a_b_bar, Er_list=er_list_bar)
 
     def evaluate_momentum_corrected_fluxes(self, state, *, diagnostics: bool = False) -> dict:
         """Evaluate database-interpolated neoclassical fluxes with momentum correction.
@@ -4692,10 +4786,18 @@ class NTXDatabaseTransportModel(TransportFluxModelBase):
                     _split(flat_delta),
                 )
                 database_value = self.database
-                if database_value is not None:
+                if database_value is not None and not isinstance(
+                    database_value, Monoenergetic
+                ):
+                    # Preprocessed databases have no recorded runtime scan;
+                    # retain their established local scale contract.
                     database_value = database_with_geometry_scale(
                         database_value, geometry_value.a_b
                     )
+                # Monoenergetic runtime-scan coordinates are instead carried
+                # by the compact coordinate bars in
+                # ``pullback_local_particle_flux_support_payload``.  Holding
+                # that complete table fixed here prevents double counting.
                 model = dataclasses.replace(
                     self,
                     geometry=geometry_value,
