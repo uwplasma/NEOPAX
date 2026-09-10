@@ -3804,18 +3804,42 @@ class NTXDatabaseTransportModel(TransportFluxModelBase):
 
         dndr, dtdr = _gradients(density, temperature)
 
-        def _lij(density_value, temperature_value, er_value):
-            vthermal_value = get_v_thermal(self.species.mass, temperature_value)
+        def _lij_at_radius(
+            density_local, temperature_local, er_local, radius_value
+        ):
+            """One centre's exact fixed-table coefficient map.
+
+            Coefficients at a centre depend only on that centre's species
+            state and electric field.  Keeping this map local is important in
+            the reverse: its forward Jacobian is small and does not invoke the
+            reverse rule of the preprocessed table interpolator.
+            """
+            vthermal_local = get_v_thermal(self.species.mass, temperature_local)
             return jax.vmap(
-                lambda species_index: jax.vmap(
-                    lambda radius_index: get_Lij_matrix(
-                        self.species, self.energy_grid, self.geometry, self.database,
-                        species_index, radius_index, er_value, temperature_value,
-                        density_value, vthermal_value,
-                        _collisionality_kind(self.collisionality_model),
-                    )
-                )(self.geometry.full_grid_indices)
+                lambda species_index: get_Lij_matrix_at_radius(
+                    self.species,
+                    self.energy_grid,
+                    self.geometry,
+                    self.database,
+                    species_index,
+                    radius_value,
+                    er_local,
+                    temperature_local,
+                    density_local,
+                    vthermal_local,
+                    _collisionality_kind(self.collisionality_model),
+                )
             )(self.species.species_indices)
+
+        def _lij(density_value, temperature_value, er_value):
+            return jax.vmap(
+                _lij_at_radius, in_axes=(1, 1, 0, 0), out_axes=1
+            )(
+                density_value,
+                temperature_value,
+                er_value,
+                self.geometry.r_grid,
+            )
 
         lij = _lij(density, temperature, er_profile)
 
@@ -3854,8 +3878,36 @@ class NTXDatabaseTransportModel(TransportFluxModelBase):
         lij_bar, density_bar, temperature_bar, dndr_bar, dtdr_bar, er_bar = algebra_pullback(
             {"Gamma": _bar("Gamma"), "Q": _bar("Q"), "Upar": _bar("Upar")}
         )
-        _, lij_pullback = jax.vjp(_lij, density, temperature, er_profile)
-        lij_density_bar, lij_temperature_bar, lij_er_bar = lij_pullback(lij_bar)
+        def _lij_at_radius_transpose(
+            density_local, temperature_local, er_local, radius_value, local_bar
+        ):
+            # This is mathematically the VJP of ``_lij_at_radius``.  Use its
+            # forward Jacobian because the database interpolation's reverse
+            # stencil can become nonfinite at a clipped table coordinate.
+            # The map has only ``2 * species + 1`` inputs, so this avoids both
+            # the unstable reverse stencil and a dense full-transport matrix.
+            density_jacobian, temperature_jacobian, er_jacobian = jax.jacfwd(
+                _lij_at_radius, argnums=(0, 1, 2)
+            )(density_local, temperature_local, er_local, radius_value)
+            output_axes = tuple(range(jnp.asarray(local_bar).ndim))
+            density_local_bar = jnp.tensordot(
+                local_bar, density_jacobian, axes=(output_axes, output_axes)
+            )
+            temperature_local_bar = jnp.tensordot(
+                local_bar, temperature_jacobian, axes=(output_axes, output_axes)
+            )
+            er_local_bar = jnp.sum(local_bar * er_jacobian)
+            return density_local_bar, temperature_local_bar, er_local_bar
+
+        lij_density_bar, lij_temperature_bar, lij_er_bar = jax.vmap(
+            _lij_at_radius_transpose, in_axes=(1, 1, 0, 0, 1), out_axes=(1, 1, 0)
+        )(
+            density,
+            temperature,
+            er_profile,
+            self.geometry.r_grid,
+            lij_bar,
+        )
         _, gradients_pullback = jax.vjp(_gradients, density, temperature)
         gradient_density_bar, gradient_temperature_bar = gradients_pullback((dndr_bar, dtdr_bar))
         _, state_inputs_pullback = jax.vjp(_primitive_inputs, state)

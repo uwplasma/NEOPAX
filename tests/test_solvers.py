@@ -2759,8 +2759,8 @@ def test_database_stage_input_pullback_uses_same_direct_state_boundary_as_matrix
     assert len(calls) == 1
 
 
-def test_database_plain_block_stage_input_pullback_keeps_generic_matrix_contract():
-    """Plain block carry bars use the same finite generic RHS Jacobian as its matrix."""
+def test_database_plain_block_stage_input_pullback_uses_complete_direct_state_boundary():
+    """Plain block carries retain the corrected complete database state rule."""
     dtype = jnp.float64
     kernel_context = types.SimpleNamespace(
         dtype=dtype,
@@ -2794,11 +2794,8 @@ def test_database_plain_block_stage_input_pullback_keeps_generic_matrix_contract
         kernel_context, physics_context, carry, primal, None, residual_bar,
         compute_dt_bar=False,
     )
-    expected = -residual_bar[0] @ jnp.asarray(
-        [[0.8, -0.2], [0.5, 1.3]], dtype=dtype
-    )
-    assert jnp.allclose(actual_y_bar, expected, rtol=1.0e-12, atol=1.0e-12)
-    assert not calls
+    assert jnp.allclose(actual_y_bar, -jnp.asarray([99.0, 99.0], dtype=dtype))
+    assert len(calls) == 1
 
 
 def test_batched_database_stage_table_pullback_accepts_flattened_radau_rows():
