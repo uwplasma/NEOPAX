@@ -84,6 +84,15 @@ def main() -> int:
         default="all",
         help="Isolate geometry, selected-Er transport, or their combined evaluation.",
     )
+    parser.add_argument(
+        "--mode",
+        choices=("database", "database_root_experiment"),
+        default="database",
+        help=(
+            "Use the unchanged database baseline or the opt-in persistent "
+            "fixed-table selected-root stage."
+        ),
+    )
     parser.add_argument("--warmup", type=int, default=1)
     parser.add_argument("--repeats", type=int, default=3)
     args = parser.parse_args()
@@ -92,11 +101,11 @@ def main() -> int:
     if not np.isscalar(base_example.MAX_MODE_SCHEDULE):
         raise ValueError("The database memory test requires one fixed MAX_MODE_SCHEDULE value.")
 
-    # The benchmark/root evaluator contains the database-native one-fold
-    # reverse boundary.  The exact-Lij staged/JIT mode cannot be selected
-    # here because it owns an exact support tree.
+    # Both modes use the database-native one-fold scan transpose.  The trial
+    # mode compiles only the fixed-table selected-root work and leaves the
+    # current recorded-scan fold in the same outer benchmark evaluator.
     base_example.TRANSPORT_CONFIG = DATABASE_TRANSPORT_CONFIG
-    base_example.REVERSE_STAGE_MODE = "database"
+    base_example.REVERSE_STAGE_MODE = args.mode
     base_example.terms = _terms_for_objective_set(args.objective_set)
     base = base_example
     problem = base.build_transition_bootstrap_initial_root_problem(
@@ -106,7 +115,8 @@ def main() -> int:
     x = np.asarray(jax.device_get(problem.x0), dtype=float)
     print(
         "[database memory test] "
-        f"objective_set={args.objective_set} warmup={args.warmup} repeats={args.repeats} "
+        f"mode={args.mode} objective_set={args.objective_set} "
+        f"warmup={args.warmup} repeats={args.repeats} "
         f"parameter_count={problem.parameter_count} "
         "path=ntx_scan_runtime_database_selected_root_reverse",
         flush=True,

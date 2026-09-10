@@ -47,12 +47,21 @@ def _terms_for_objective_set(objective_set: str):
     selected = []
     for term in base.terms:
         objective = getattr(term[0], "objective", term[0])
-        is_bootstrap = objective.name == "bootstrap_current_softmax_abs_scaled"
-        if objective_set == "transport_er_only" and is_bootstrap:
+        family = getattr(objective, "family", None)
+        is_transport = family == "transport"
+        is_bootstrap = (
+            is_transport
+            and objective.name == "bootstrap_current_softmax_abs_scaled"
+        )
+        if objective_set == "transport_er_only" and (not is_transport or is_bootstrap):
             continue
         if objective_set == "bootstrap_only" and not is_bootstrap:
             continue
+        if objective_set == "geometry_only" and family != "geometry":
+            continue
         selected.append(term)
+    if not selected:
+        raise RuntimeError(f"No terms selected for objective_set={objective_set!r}.")
     return selected
 
 
@@ -138,7 +147,7 @@ def _check_point(problem, x, *, parameter_index: int, fd_step: float, label: str
             for marker in ("softmax_Er", "Er_transition", "bootstrap_current")
         )
     ]
-    if not transport_rows:
+    if objective_set != "geometry_only" and not transport_rows:
         raise RuntimeError("The database directional check did not find any transport residual rows.")
     transport_shift = (
         0.0
@@ -148,7 +157,11 @@ def _check_point(problem, x, *, parameter_index: int, fd_step: float, label: str
     max_row = int(np.argmax(np.abs(difference)))
     transport_difference = difference[transport_rows]
     transport_relative = relative[transport_rows]
-    transport_max_row = transport_rows[int(np.argmax(np.abs(transport_difference)))]
+    transport_max_row = (
+        None
+        if not transport_rows
+        else transport_rows[int(np.argmax(np.abs(transport_difference)))]
+    )
     print(
         f"[database directional] point={label} objective_set={objective_set} "
         "fd_root_lane=frozen_linearized "
@@ -158,15 +171,15 @@ def _check_point(problem, x, *, parameter_index: int, fd_step: float, label: str
         f"fd_max_row={labels[max_row]!s} "
         f"fd_max_row_ad={ad_column[max_row]:.6e} "
         f"fd_max_row_fd={finite_difference[max_row]:.6e} "
-        f"transport_fd_max_abs={np.max(np.abs(transport_difference)):.6e} "
-        f"transport_fd_max_relative={np.max(transport_relative):.6e} "
-        f"transport_fd_max_row={labels[transport_max_row]!s} "
-        f"transport_fd_max_row_ad={ad_column[transport_max_row]:.6e} "
-        f"transport_fd_max_row_fd={finite_difference[transport_max_row]:.6e} "
+        f"transport_fd_max_abs={0.0 if not transport_rows else np.max(np.abs(transport_difference)):.6e} "
+        f"transport_fd_max_relative={0.0 if not transport_rows else np.max(transport_relative):.6e} "
+        f"transport_fd_max_row={'none' if transport_max_row is None else labels[transport_max_row]!s} "
+        f"transport_fd_max_row_ad={0.0 if transport_max_row is None else ad_column[transport_max_row]:.6e} "
+        f"transport_fd_max_row_fd={0.0 if transport_max_row is None else finite_difference[transport_max_row]:.6e} "
         f"transport_residual_two_sided_shift={transport_shift:.6e}",
         flush=True,
     )
-    if transport_shift == 0.0:
+    if objective_set != "geometry_only" and transport_shift == 0.0:
         raise AssertionError(
             "Database transport residuals did not change under a boundary perturbation; "
             "the evaluator may be using a stale baseline database."
@@ -180,9 +193,12 @@ def main() -> int:
     parser.add_argument("--base-offset", type=float, default=1.0e-3)
     parser.add_argument(
         "--objective-set",
-        choices=("all", "transport_er_only", "bootstrap_only"),
+        choices=("all", "transport_er_only", "bootstrap_only", "geometry_only"),
         default="all",
-        help="Check all root terms, Er-only rows, or the bootstrap row in isolation.",
+        help=(
+            "Check all terms, selected-Er transport terms, bootstrap alone, "
+            "or geometry alone."
+        ),
     )
     parser.add_argument(
         "--small-database",

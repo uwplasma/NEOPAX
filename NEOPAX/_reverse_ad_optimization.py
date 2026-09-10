@@ -50,6 +50,7 @@ from ._reverse_ad_initial_er import (
     initial_er_selected_root_profile,
     find_ntx_runtime_scan_model_in_model,
     fold_recorded_ntx_scan_database_bar_groups_into_support,
+    runtime_with_realtime_geometry_payload,
     runtime_with_geometry_payload,
     runtime_with_ntx_support_payload,
     split_recorded_ntx_database_runtime,
@@ -70,6 +71,7 @@ from ._reverse_ad_transport import (
     transport_realtime_geometry_reverse_table,
 )
 from ._optimization_initial_root_stage import (
+    DatabaseInitialErTransportPayloadAdapter,
     InitialErTransportPayloadAdapter,
     InitialRootBootstrapKernelSet,
     build_initial_root_bootstrap_kernels_optimization,
@@ -788,70 +790,113 @@ def _stack_tree_rows(rows: Sequence[Any]):
     return jax.tree_util.tree_map(lambda *leaves: jnp.stack(leaves, axis=0), *rows)
 
 
-def _database_geometry_active_initial_er_root_only_reverse_table(
+def _database_initial_root_to_unfolded_support_bars(
+    *,
+    fixed_runtime,
+    support,
+    pre_root_state,
+    er_profile,
+    finite_mask,
+    rooted_state_bars,
+    direct_geometry_bars,
+    direct_database_bars,
+    parameter_set: ReverseADParameterSet,
+    profile_values_arr,
+    pre_root_state_from_profile_values: Callable[[object], object],
+    objective_count: int,
+):
+    """Map selected-root cotangents to unfurled database support bars.
+
+    This is the exact database-root portion preceding the recorded scan
+    transpose.  The caller owns that one current-scan fold, so this helper
+    intentionally returns ``{geometry, database}`` bars unchanged.
+    """
+
+    dres_der = initial_er_charge_flux_residual_er_derivative(
+        pre_root_state, er_profile, runtime=fixed_runtime
+    )
+    safe_dres_der = jnp.where(
+        jnp.abs(dres_der) > jnp.asarray(1.0e-30, dtype=dres_der.dtype), dres_der, jnp.inf
+    )
+    residual_bars = jnp.where(
+        finite_mask[None, :], -jnp.asarray(rooted_state_bars.Er) / safe_dres_der[None, :], 0.0
+    )
+    state_residual_bars = compact_initial_er_state_pullback(
+        residual_scalar_fn=initial_er_charge_flux_residual_scalar,
+        state=pre_root_state,
+        er_profile=er_profile,
+        residual_bars=residual_bars,
+        runtime=fixed_runtime,
+    )
+    pre_root_state_bars = _add_trees(
+        dataclasses.replace(rooted_state_bars, Er=jnp.zeros_like(rooted_state_bars.Er)),
+        state_residual_bars,
+    )
+
+    profile_specs = tuple(parameter_set.profile_specs)
+    if profile_specs:
+        _, profile_pullback = jax.vjp(pre_root_state_from_profile_values, profile_values_arr)
+        all_profile_bars = jax.vmap(lambda bar: profile_pullback(bar)[0])(pre_root_state_bars)
+        canonical_profile_lookup = {name: i for i, name in enumerate(PROFILE_PARAMETER_ORDER)}
+        profile_matrix = jnp.stack(
+            [all_profile_bars[:, canonical_profile_lookup[spec.name]] for spec in profile_specs], axis=1
+        )
+    else:
+        profile_matrix = jnp.zeros(
+            (objective_count, 0), dtype=jnp.asarray(er_profile).dtype
+        )
+
+    table_bars = compact_initial_er_database_support_bars(
+        runtime=fixed_runtime,
+        state=pre_root_state,
+        er_profile=er_profile,
+        residual_bars=residual_bars,
+        support=support,
+    )
+    residual_geometry_bars = compact_initial_er_database_geometry_bars(
+        runtime=fixed_runtime,
+        state=pre_root_state,
+        er_profile=er_profile,
+        residual_bars=residual_bars,
+        support=support,
+    )
+    support_bars = tuple(
+        {
+            "geometry": _add_trees(
+                _row_from_batched_tree(direct_geometry_bars, row),
+                _row_from_batched_tree(residual_geometry_bars, row),
+            ),
+            "database": _add_trees(
+                _row_from_batched_tree(table_bars, row),
+                _row_from_batched_tree(direct_database_bars, row),
+            ),
+        }
+        for row in range(objective_count)
+    )
+    return profile_matrix, support_bars
+
+
+def _database_selected_root_direct_cotangents(
     *,
     config: Mapping[str, object],
-    objective_names: Sequence[str] | str,
-    parameter_set: ReverseADParameterSet,
-    parameter_values,
-    runtime,
-    profile_values,
+    fixed_runtime,
+    support,
+    objective_names: Sequence[str],
+    profile_values_arr,
     pre_root_state_from_profile_values: Callable[[object], object],
-    geometry_context,
-    baseline_geometry_deltas,
-    n_r: int,
-    n_theta: int,
-    n_zeta: int,
-    n_xi: int,
-    surface_backend: str,
-    max_iter,
-    solver_device: str,
-    progress_label: str | None,
     options: Mapping[str, object] | None,
-    raw_block_solve=None,
-) -> ObjectiveTableResult:
-    """Database-native selected-root reverse with one recorded scan fold.
+):
+    """Evaluate selected-root objective rows before the implicit root pullback.
 
-    The implicit selected-root term uses exactly the full database reverse
-    boundary: direct fixed-table geometry bars plus a table bar consumed by
-    one retained scan transpose.  Bootstrap uses the same compact corrected-
-    Upar state/geometry/table split as full transport reverse.
+    This is the direct half of the database root boundary.  Together with
+    :func:`_database_initial_root_to_unfolded_support_bars`, it contains all
+    work that will later become the optimization-only JIT candidate.  It does
+    not rebuild a live scan or consume a recorded scan transpose.
     """
-    names = normalize_initial_er_root_only_objective_names(objective_names)
-    vmec_specs = tuple(parameter_set.vmec_boundary_specs)
-    if not vmec_specs:
-        raise ValueError("Database geometry root-only reverse requires VMEC boundary parameters.")
 
-    # Build the live scan/database from the current VMEC state before splitting
-    # its recorded scan owner. Previously this always split the baseline
-    # runtime, so transport objective values became stale after an optimizer
-    # changed a boundary coefficient.
-    current_runtime = runtime
-    if raw_block_solve is not None:
-        current_runtime, _current_state = build_runtime_context_for_vmec_state(
-            dict(config),
-            geometry_context,
-            raw_block_solve.state,
-            n_r=int(n_r),
-        )
-        del _current_state
-
-    # The fixed runtime is the only object seen by root/objective closures.
-    # Keep the recorded scan owner out of those closures and consume its
-    # database cotangent once below, exactly as full transport reverse does.
-    database_segment, recorded_scan_owner = split_recorded_ntx_database_runtime(current_runtime)
-    fixed_runtime = database_segment.runtime
-    support = {
-        "geometry": fixed_runtime.geometry,
-        # Use the exact table owned by the retained scan record.  The fixed
-        # model references this same object; spelling it here makes the
-        # one-fold identity explicit and avoids any stale RuntimeContext
-        # convenience field.
-        "database": recorded_scan_owner.runtime_scan.database,
-    }
+    names = tuple(objective_names)
     baseline_geometry = support["geometry"]
     geometry_delta0 = _float_delta_tree_like(baseline_geometry)
-    profile_values_arr = jnp.asarray(profile_values)
     pre_root_state = pre_root_state_from_profile_values(profile_values_arr)
     er_profile, finite_mask = initial_er_selected_root_profile(
         pre_root_state, config=dict(config), runtime=fixed_runtime
@@ -859,7 +904,6 @@ def _database_geometry_active_initial_er_root_only_reverse_table(
     er_profile = jnp.asarray(er_profile, dtype=pre_root_state.Er.dtype)
     finite_mask = jnp.asarray(finite_mask, dtype=bool)
     rooted_state = dataclasses.replace(pre_root_state, Er=er_profile)
-
     generic_names = tuple(name for name in names if name != _BOOTSTRAP_CURRENT_OBJECTIVE)
 
     def _objective_values(state_value, geometry_delta):
@@ -930,64 +974,204 @@ def _database_geometry_active_initial_er_root_only_reverse_table(
             D33=d33_bar,
         )
 
-    values = jnp.stack([direct_values[name] for name in names])
-    rooted_state_bars = _stack_tree_rows([direct_state_bars[name] for name in names])
-    direct_geometry_bars = _stack_tree_rows([direct_geometry_bars[name] for name in names])
-    direct_database_bars = _stack_tree_rows([direct_database_bars[name] for name in names])
-
-    dres_der = initial_er_charge_flux_residual_er_derivative(
-        pre_root_state, er_profile, runtime=fixed_runtime
-    )
-    safe_dres_der = jnp.where(
-        jnp.abs(dres_der) > jnp.asarray(1.0e-30, dtype=dres_der.dtype), dres_der, jnp.inf
-    )
-    residual_bars = jnp.where(
-        finite_mask[None, :], -jnp.asarray(rooted_state_bars.Er) / safe_dres_der[None, :], 0.0
-    )
-    state_residual_bars = compact_initial_er_state_pullback(
-        residual_scalar_fn=initial_er_charge_flux_residual_scalar,
-        state=pre_root_state,
-        er_profile=er_profile,
-        residual_bars=residual_bars,
-        runtime=fixed_runtime,
-    )
-    pre_root_state_bars = _add_trees(
-        dataclasses.replace(rooted_state_bars, Er=jnp.zeros_like(rooted_state_bars.Er)),
-        state_residual_bars,
+    return (
+        pre_root_state,
+        er_profile,
+        finite_mask,
+        jnp.stack([direct_values[name] for name in names]),
+        _stack_tree_rows([direct_state_bars[name] for name in names]),
+        _stack_tree_rows([direct_geometry_bars[name] for name in names]),
+        _stack_tree_rows([direct_database_bars[name] for name in names]),
     )
 
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class DatabaseInitialRootExperimentStage:
+    """Persistent optimization-only root kernel for a fixed database layout."""
+
+    payload_adapter: DatabaseInitialErTransportPayloadAdapter
+    root_to_unfolded_bars: Callable[..., Any]
+
+
+def build_database_initial_root_experiment_stage(
+    *,
+    runtime,
+    config: Mapping[str, object],
+    objective_names: Sequence[str],
+    parameter_set: ReverseADParameterSet,
+    pre_root_state_from_profile_values: Callable[[object], object],
+    options: Mapping[str, object] | None,
+) -> DatabaseInitialRootExperimentStage:
+    """Build the opt-in JIT boundary before any optimization iteration.
+
+    The stage retains only the fixed-table model layout. Each invocation
+    receives fresh geometry/database floating leaves, recreates the fixed
+    database runtime, and returns unfurled bars. The recorded live scan is
+    deliberately absent: its current-primal transpose remains outside JIT.
+    """
+
+    segment, _owner = split_recorded_ntx_database_runtime(runtime)
+    runtime_template = segment.runtime
+    payload_adapter = DatabaseInitialErTransportPayloadAdapter.from_payload(
+        {
+            "geometry": runtime_template.geometry,
+            "database": runtime_template.database,
+        }
+    )
+    names = tuple(objective_names)
+    config_static = dict(config)
+    options_static = None if options is None else dict(options)
+
+    def _root_to_unfolded_bars(geometry_leaves, database_leaves, profile_values_arr):
+        payload = payload_adapter.rebuild(geometry_leaves, database_leaves)
+        fixed_runtime = runtime_with_realtime_geometry_payload(
+            runtime_template,
+            {"kind": "ntx_database", **payload},
+        )
+        (
+            pre_root_state,
+            er_profile,
+            finite_mask,
+            values,
+            rooted_state_bars,
+            direct_geometry_bars,
+            direct_database_bars,
+        ) = _database_selected_root_direct_cotangents(
+            config=config_static,
+            fixed_runtime=fixed_runtime,
+            support=payload,
+            objective_names=names,
+            profile_values_arr=profile_values_arr,
+            pre_root_state_from_profile_values=pre_root_state_from_profile_values,
+            options=options_static,
+        )
+        profile_matrix, support_bars = _database_initial_root_to_unfolded_support_bars(
+            fixed_runtime=fixed_runtime,
+            support=payload,
+            pre_root_state=pre_root_state,
+            er_profile=er_profile,
+            finite_mask=finite_mask,
+            rooted_state_bars=rooted_state_bars,
+            direct_geometry_bars=direct_geometry_bars,
+            direct_database_bars=direct_database_bars,
+            parameter_set=parameter_set,
+            profile_values_arr=profile_values_arr,
+            pre_root_state_from_profile_values=pre_root_state_from_profile_values,
+            objective_count=len(names),
+        )
+        return values, profile_matrix, support_bars
+
+    return DatabaseInitialRootExperimentStage(
+        payload_adapter=payload_adapter,
+        root_to_unfolded_bars=jax.jit(_root_to_unfolded_bars),
+    )
+
+
+def _database_geometry_active_initial_er_root_only_reverse_table(
+    *,
+    config: Mapping[str, object],
+    objective_names: Sequence[str] | str,
+    parameter_set: ReverseADParameterSet,
+    parameter_values,
+    runtime,
+    profile_values,
+    pre_root_state_from_profile_values: Callable[[object], object],
+    geometry_context,
+    baseline_geometry_deltas,
+    n_r: int,
+    n_theta: int,
+    n_zeta: int,
+    n_xi: int,
+    surface_backend: str,
+    max_iter,
+    solver_device: str,
+    progress_label: str | None,
+    options: Mapping[str, object] | None,
+    raw_block_solve=None,
+    database_root_stage: DatabaseInitialRootExperimentStage | None = None,
+) -> ObjectiveTableResult:
+    """Database-native selected-root reverse with one recorded scan fold.
+
+    The implicit selected-root term uses exactly the full database reverse
+    boundary: direct fixed-table geometry bars plus a table bar consumed by
+    one retained scan transpose.  Bootstrap uses the same compact corrected-
+    Upar state/geometry/table split as full transport reverse.
+    """
+    names = normalize_initial_er_root_only_objective_names(objective_names)
+    vmec_specs = tuple(parameter_set.vmec_boundary_specs)
     profile_specs = tuple(parameter_set.profile_specs)
-    if profile_specs:
-        _, profile_pullback = jax.vjp(pre_root_state_from_profile_values, profile_values_arr)
-        all_profile_bars = jax.vmap(lambda bar: profile_pullback(bar)[0])(pre_root_state_bars)
-        canonical_profile_lookup = {name: i for i, name in enumerate(PROFILE_PARAMETER_ORDER)}
-        profile_matrix = jnp.stack(
-            [all_profile_bars[:, canonical_profile_lookup[spec.name]] for spec in profile_specs], axis=1
+    if not vmec_specs:
+        raise ValueError("Database geometry root-only reverse requires VMEC boundary parameters.")
+
+    # Build the live scan/database from the current VMEC state before splitting
+    # its recorded scan owner. Previously this always split the baseline
+    # runtime, so transport objective values became stale after an optimizer
+    # changed a boundary coefficient.
+    current_runtime = runtime
+    if raw_block_solve is not None:
+        current_runtime, _current_state = build_runtime_context_for_vmec_state(
+            dict(config),
+            geometry_context,
+            raw_block_solve.state,
+            n_r=int(n_r),
+        )
+        del _current_state
+
+    # The fixed runtime is the only object seen by root/objective closures.
+    # Keep the recorded scan owner out of those closures and consume its
+    # database cotangent once below, exactly as full transport reverse does.
+    database_segment, recorded_scan_owner = split_recorded_ntx_database_runtime(current_runtime)
+    fixed_runtime = database_segment.runtime
+    support = {
+        "geometry": fixed_runtime.geometry,
+        # Use the exact table owned by the retained scan record.  The fixed
+        # model references this same object; spelling it here makes the
+        # one-fold identity explicit and avoids any stale RuntimeContext
+        # convenience field.
+        "database": recorded_scan_owner.runtime_scan.database,
+    }
+    profile_values_arr = jnp.asarray(profile_values)
+    if database_root_stage is None:
+        (
+            pre_root_state,
+            er_profile,
+            finite_mask,
+            values,
+            rooted_state_bars,
+            direct_geometry_bars,
+            direct_database_bars,
+        ) = _database_selected_root_direct_cotangents(
+            config=config,
+            fixed_runtime=fixed_runtime,
+            support=support,
+            objective_names=names,
+            profile_values_arr=profile_values_arr,
+            pre_root_state_from_profile_values=pre_root_state_from_profile_values,
+            options=options,
+        )
+        profile_matrix, support_bars = _database_initial_root_to_unfolded_support_bars(
+            fixed_runtime=fixed_runtime,
+            support=support,
+            pre_root_state=pre_root_state,
+            er_profile=er_profile,
+            finite_mask=finite_mask,
+            rooted_state_bars=rooted_state_bars,
+            direct_geometry_bars=direct_geometry_bars,
+            direct_database_bars=direct_database_bars,
+            parameter_set=parameter_set,
+            profile_values_arr=profile_values_arr,
+            pre_root_state_from_profile_values=pre_root_state_from_profile_values,
+            objective_count=len(names),
         )
     else:
-        profile_matrix = jnp.zeros((len(names), 0), dtype=jnp.asarray(values).dtype)
-
-    table_bars = compact_initial_er_database_support_bars(
-        runtime=fixed_runtime, state=pre_root_state, er_profile=er_profile,
-        residual_bars=residual_bars, support=support,
-    )
-    residual_geometry_bars = compact_initial_er_database_geometry_bars(
-        runtime=fixed_runtime, state=pre_root_state, er_profile=er_profile,
-        residual_bars=residual_bars, support=support,
-    )
-    support_bars = tuple(
-        {
-            "geometry": _add_trees(
-                _row_from_batched_tree(direct_geometry_bars, row),
-                _row_from_batched_tree(residual_geometry_bars, row),
-            ),
-            "database": _add_trees(
-                _row_from_batched_tree(table_bars, row),
-                _row_from_batched_tree(direct_database_bars, row),
-            ),
-        }
-        for row in range(len(names))
-    )
+        geometry_leaves, database_leaves = database_root_stage.payload_adapter.dynamic_leaves(
+            support
+        )
+        values, profile_matrix, support_bars = database_root_stage.root_to_unfolded_bars(
+            geometry_leaves,
+            database_leaves,
+            profile_values_arr,
+        )
     (support_bars,) = fold_recorded_ntx_scan_database_bar_groups_into_support(
         recorded_scan_owner, (support_bars,)
     )
@@ -2068,6 +2252,7 @@ def geometry_active_initial_er_root_only_reverse_table(
     support_payload_override=None,
     options: Mapping[str, object] | None = None,
     dispatch_cache_probe=None,
+    database_root_stage: DatabaseInitialRootExperimentStage | None = None,
 ) -> ObjectiveTableResult:
     """Return compact initial-Er objective table for active realtime geometry.
 
@@ -2103,6 +2288,7 @@ def geometry_active_initial_er_root_only_reverse_table(
             progress_label=progress_label,
             options=options,
             raw_block_solve=raw_block_solve,
+            database_root_stage=database_root_stage,
         )
 
     def _probe(label: str) -> None:
@@ -3388,6 +3574,7 @@ def evaluate_geometry_initial_er_root_only_least_squares_benchmark_tables(
     geometry_solver_device: str | None = "default",
     root_options: Mapping[str, object] | None = None,
     raw_block_stage=None,
+    database_root_stage: DatabaseInitialRootExperimentStage | None = None,
 ) -> LeastSquaresEvaluation:
     """Evaluate mixed objectives using only benchmark-validated table backends."""
 
@@ -3459,6 +3646,7 @@ def evaluate_geometry_initial_er_root_only_least_squares_benchmark_tables(
                 progress_label="[optimization] initial-Er root geometry payload pullback:",
                 raw_block_solve=shared_raw_block_solve,
                 options=root_runner_options,
+                database_root_stage=database_root_stage,
             )
             transport_values, transport_jacobian = jax.block_until_ready(
                 (transport_result.values, transport_result.jacobian)

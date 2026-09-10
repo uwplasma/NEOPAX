@@ -181,6 +181,64 @@ class InitialErTransportPayloadAdapter:
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
+class DatabaseInitialErTransportPayloadAdapter:
+    """Optimization-only floating-leaf boundary for a recorded NTX database.
+
+    A live database scan is rebuilt from the current VMEC state outside JIT.
+    The resulting geometry and database table have fixed metadata but fresh
+    numerical leaves every trial.  This adapter preserves that distinction:
+    only inexact leaves may cross a later database root-stage boundary.
+
+    It deliberately does not retain a runtime, selected root, state, or
+    cotangent.  The benchmark database reverse path does not use this class.
+    """
+
+    geometry_layout: FloatingPayloadLeafLayout
+    database_layout: FloatingPayloadLeafLayout
+
+    @classmethod
+    def from_payload(
+        cls, payload: dict[str, Any]
+    ) -> "DatabaseInitialErTransportPayloadAdapter":
+        try:
+            geometry = payload["geometry"]
+            database = payload["database"]
+        except KeyError as exc:
+            raise ValueError(
+                "Database initial-Er payload requires geometry and database."
+            ) from exc
+        return cls(
+            geometry_layout=FloatingPayloadLeafLayout.from_template(geometry),
+            database_layout=FloatingPayloadLeafLayout.from_template(database),
+        )
+
+    def dynamic_leaves(
+        self, payload: dict[str, Any]
+    ) -> tuple[tuple[Any, ...], tuple[Any, ...]]:
+        self.validate_static_structure(payload)
+        return (
+            self.geometry_layout.floating_leaves(payload["geometry"]),
+            self.database_layout.floating_leaves(payload["database"]),
+        )
+
+    def validate_static_structure(self, payload: dict[str, Any]) -> None:
+        """Reject a live rebuild whose fixed database layout changed."""
+
+        self.geometry_layout.validate_static_structure(payload["geometry"])
+        self.database_layout.validate_static_structure(payload["database"])
+
+    def rebuild(
+        self,
+        geometry_leaves: tuple[Any, ...],
+        database_leaves: tuple[Any, ...],
+    ) -> dict[str, Any]:
+        return {
+            "geometry": self.geometry_layout.rebuild(geometry_leaves),
+            "database": self.database_layout.rebuild(database_leaves),
+        }
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
 class GeometryInitialRootOptimizationStage:
     """Two bounded optimizer-level operators, analogous to VMEX rows/jac.
 

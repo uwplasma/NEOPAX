@@ -48,6 +48,7 @@ from ._reverse_ad_optimization import (
     evaluate_transport_realtime_geometry_least_squares,
     evaluate_geometry_initial_er_root_only_least_squares_benchmark_tables,
     evaluate_geometry_initial_er_root_only_least_squares_optimization,
+    build_database_initial_root_experiment_stage,
     build_initial_er_transport_reverse_stage,
     _optimization_root_to_payload_cotangents,
     _optimization_payload_to_vmec_table,
@@ -354,6 +355,7 @@ class GeometryInitialErRootLeastSquaresProblem:
     raw_block_stage: object | None = None
     optimization_stage_layout: object | None = None
     optimization_stage: object | None = None
+    database_root_stage: object | None = None
     prepared_payload_static: object | None = None
     payload_assembly_stage: object | None = None
     raw_block_transpose_optimization_stage: object | None = None
@@ -449,7 +451,7 @@ class GeometryInitialErRootLeastSquaresProblem:
         # so benchmark call graphs and reverse functions remain untouched.
         evaluator = (
             evaluate_geometry_initial_er_root_only_least_squares_benchmark_tables
-            if self.reverse_stage_mode in {"off", "database"}
+            if self.reverse_stage_mode in {"off", "database", "database_root_experiment"}
             else evaluate_geometry_initial_er_root_only_least_squares_optimization
         )
         evaluator_kwargs = dict(
@@ -513,6 +515,8 @@ class GeometryInitialErRootLeastSquaresProblem:
                 evaluator_kwargs["raw_block_transpose_optimization_stage"] = (
                     self.raw_block_transpose_optimization_stage
                 )
+        if self.reverse_stage_mode == "database_root_experiment":
+            evaluator_kwargs["database_root_stage"] = self.database_root_stage
         base_evaluation = evaluator(self.config, **evaluator_kwargs)
         result = _assemble_mixed_initial_er_root_result(
             self.terms,
@@ -1420,6 +1424,7 @@ def geometry_initial_er_root_only_least_squares_problem(
     if mode not in {
         "off",
         "database",
+        "database_root_experiment",
         "optimization",
         "optimization_root_experiment",
         "optimization_root_strict_experiment",
@@ -1451,13 +1456,13 @@ def geometry_initial_er_root_only_least_squares_problem(
     geom_cfg = config_eff.get("geometry", {})
     neoclassical_cfg = config_eff.get("neoclassical", {})
     flux_model = str(neoclassical_cfg.get("flux_model", "")).strip().lower()
-    if mode == "database" and flux_model != "ntx_scan_runtime":
+    if mode in {"database", "database_root_experiment"} and flux_model != "ntx_scan_runtime":
         raise ValueError(
-            "reverse_stage_mode='database' requires "
+            "database reverse-stage modes require "
             "neoclassical.flux_model='ntx_scan_runtime'; "
             f"got {flux_model!r}."
         )
-    if flux_model == "ntx_scan_runtime" and mode not in {"off", "database"}:
+    if flux_model == "ntx_scan_runtime" and mode not in {"off", "database", "database_root_experiment"}:
         raise NotImplementedError(
             "The exact-Lij staged initial-root modes do not support "
             "neoclassical.flux_model='ntx_scan_runtime'. Use "
@@ -1541,8 +1546,42 @@ def geometry_initial_er_root_only_least_squares_problem(
         )
     optimization_stage_layout = None
     optimization_stage = None
+    database_root_stage = None
     prepared_payload_static = None
     payload_assembly_stage = None
+    if mode == "database_root_experiment":
+        database_transport_objectives = tuple(
+            term.objective.name
+            for term in normalized_terms
+            if term.objective.family == "transport"
+        )
+        if not database_transport_objectives:
+            raise ValueError("database_root_experiment requires at least one transport objective.")
+        # The benchmark evaluator expands active profile values to the six
+        # canonical profile columns before it invokes the database root table.
+        # Build the staged kernel against that same table parameterization;
+        # the evaluator subsequently adapts it back to the user-selected
+        # optimization columns.
+        database_stage_parameter_set = reverse_ad_optimization_parameter_set(
+            include_profiles=True,
+            profiles=PROFILE_PARAMETER_ORDER,
+            vmec_boundary=() if geometry_parameterization is None else geometry_parameterization.specs,
+        )
+        database_root_stage = build_database_initial_root_experiment_stage(
+            runtime=runtime,
+            config=config_eff,
+            objective_names=database_transport_objectives,
+            parameter_set=database_stage_parameter_set,
+            pre_root_state_from_profile_values=lambda profile_values: initial_state_for_parameter_vector(
+                profile_values,
+                config=config_eff,
+                initial_er_root_ad="off",
+                baseline_state=baseline_state,
+                profile_cfg=config_eff.get("profiles", {}),
+                runtime=runtime,
+            ),
+            options=root_options,
+        )
     if mode in {
         "optimization",
         "optimization_root_experiment",
@@ -1789,6 +1828,7 @@ def geometry_initial_er_root_only_least_squares_problem(
         raw_block_stage=raw_block_stage,
         optimization_stage_layout=optimization_stage_layout,
         optimization_stage=optimization_stage,
+        database_root_stage=database_root_stage,
         prepared_payload_static=prepared_payload_static,
         payload_assembly_stage=payload_assembly_stage,
         raw_block_transpose_optimization_stage=raw_block_transpose_stage,

@@ -290,3 +290,38 @@ def test_initial_er_transport_payload_adapter_rebuilds_only_floating_trial_leave
     assert jnp.array_equal(rebuilt["ntx_support"]["coefficients"], trial["ntx_support"]["coefficients"])
     assert rebuilt["geometry"]["label"] == "fixed"
     assert jnp.array_equal(rebuilt["geometry"]["mode_numbers"], baseline["geometry"]["mode_numbers"])
+
+
+def test_database_initial_er_payload_adapter_rebuilds_only_floating_trial_leaves():
+    baseline = {
+        "geometry": {
+            "metric": jnp.asarray([1.0, 2.0]),
+            "mode_numbers": jnp.asarray([0, 1], dtype=jnp.int32),
+        },
+        "database": {
+            "D11_log": jnp.asarray([[3.0]]),
+            "Er_list": jnp.asarray([-1.0, 0.0, 1.0]),
+            "grid_size": jnp.asarray(3, dtype=jnp.int32),
+        },
+    }
+    adapter = initial_root_stage.DatabaseInitialErTransportPayloadAdapter.from_payload(baseline)
+    trial = {
+        "geometry": {
+            "metric": jnp.asarray([5.0, 6.0]),
+            "mode_numbers": jnp.asarray([0, 1], dtype=jnp.int32),
+        },
+        "database": {
+            "D11_log": jnp.asarray([[7.0]]),
+            "Er_list": jnp.asarray([-2.0, 0.0, 2.0]),
+            "grid_size": jnp.asarray(3, dtype=jnp.int32),
+        },
+    }
+    geometry_leaves, database_leaves = adapter.dynamic_leaves(trial)
+    rebuilt = adapter.rebuild(geometry_leaves, database_leaves)
+
+    assert len(geometry_leaves) == 1
+    assert len(database_leaves) == 2
+    assert jnp.array_equal(rebuilt["geometry"]["metric"], trial["geometry"]["metric"])
+    assert jnp.array_equal(rebuilt["database"]["D11_log"], trial["database"]["D11_log"])
+    assert jnp.array_equal(rebuilt["database"]["Er_list"], trial["database"]["Er_list"])
+    assert jnp.array_equal(rebuilt["database"]["grid_size"], baseline["database"]["grid_size"])
