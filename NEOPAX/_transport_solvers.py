@@ -16300,6 +16300,23 @@ def _radau_run_stage_subsolve(
             or kernel_context.stage_secant_correction_mode == "good_broyden_after_first"
         )
         if use_residual_line_search:
+            if full_stage_newton:
+                # The full-stage matrix is the exact derivative of the fixed
+                # cached response.  Globalize it against the same
+                # transport-scaled, non-cancelling defect used for acceptance
+                # rather than the raw residual magnitude, whose blocks have
+                # incompatible physical units and can reject an adequate
+                # transport stage merely because one RHS component is large.
+                line_search_norm = lambda residual: _radau_stage_residual_defect_norm(
+                    kernel_context,
+                    h_value=inputs.h_value,
+                    stage_residual=residual,
+                    endpoint_scale=endpoint_newton_scale,
+                )
+            else:
+                line_search_norm = lambda residual: _radau_residual_norm(
+                    kernel_context, residual
+                )
             (
                 line_search_z,
                 accepted_delta,
@@ -16313,7 +16330,7 @@ def _radau_run_stage_subsolve(
                 lambda z: _radau_stage_subsolve_residual(
                     kernel_context, physics_context, inputs, z
                 ),
-                lambda residual: _radau_residual_norm(kernel_context, residual),
+                line_search_norm,
                 dtype=kernel_context.dtype,
             )
             # A non-reducing correction is not a valid Newton iterate.  Keep
