@@ -5885,10 +5885,17 @@ def geometry_payload_pullback_from_param_vector_raw_block_transpose(
         payload_template = branch_bars[0]
         payload_template_paths_and_leaves = jax.tree_util.tree_flatten_with_path(payload_template)[0]
         payload_template_leaves = jax.tree_util.tree_leaves(payload_template)
+        def _is_inexact_leaf(leaf):
+            try:
+                return jnp.issubdtype(jnp.asarray(leaf).dtype, jnp.inexact)
+            except TypeError:
+                # Payload pytrees include immutable metadata (for example
+                # byte/string labels) alongside numeric cotangent leaves.
+                # Those leaves are structural and cannot be differentiated.
+                return False
+
         float_leaf_indices = tuple(
-            leaf_i
-            for leaf_i, leaf in enumerate(payload_template_leaves)
-            if jnp.issubdtype(jnp.asarray(leaf).dtype, jnp.inexact)
+            leaf_i for leaf_i, leaf in enumerate(payload_template_leaves) if _is_inexact_leaf(leaf)
         )
         payload_bar_leaves_by_objective = tuple(
             jax.tree_util.tree_leaves(payload_bar) for payload_bar in branch_bars
