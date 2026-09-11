@@ -1105,6 +1105,7 @@ class DatabaseInitialRootExperimentStage:
     ]
     payload_adapter: DatabaseInitialErTransportPayloadAdapter | None = None
     selected_root: Callable[..., Any] | None = None
+    selected_root_scan: Callable[..., Any] | None = None
     direct_cotangents: Callable[..., Any] | None = None
     root_pullback: Callable[..., Any] | None = None
 
@@ -1114,12 +1115,14 @@ class DatabaseInitialRootExperimentStage:
         if (
             self.payload_adapter is None
             or self.selected_root is None
+            or self.selected_root_scan is None
             or self.direct_cotangents is None
             or self.root_pullback is None
         ):
             (
                 self.payload_adapter,
                 self.selected_root,
+                self.selected_root_scan,
                 self.direct_cotangents,
                 self.root_pullback,
             ) = self.build_for_live_runtime(runtime)
@@ -1170,6 +1173,69 @@ def build_database_initial_root_experiment_stage(
             return initial_er_selected_root_profile(
                 state, config=dict(config_static), runtime=fixed_runtime
             )
+
+        # Match the accepted realtime-Lij root boundary: the profile-level
+        # scan remains outside jit, while its one-radius root body has one
+        # stable compiled identity.  This is intentionally not a jit of
+        # ``_selected_root`` above.
+        try:
+            r_grid = np.asarray(runtime_template.geometry.r_grid_half)
+            skip_axis_root = bool(r_grid.size and abs(float(r_grid[0])) <= 1.0e-14)
+        except Exception:
+            skip_axis_root = False
+
+        def _single_radius_root(state, radius_index, geometry_leaves, database_leaves):
+            payload = payload_adapter.rebuild(geometry_leaves, database_leaves)
+            fixed_runtime = runtime_with_realtime_geometry_payload(
+                runtime_template, {"kind": "ntx_database", **payload}
+            )
+            amb_cfg, model_name, _entropy_model, params = initial_er_root_setup(
+                dict(config_static), fixed_runtime
+            )
+            _, _, _, gamma_factory, entropy_factory = _ambipolarity_local_charge_flux_setup(
+                state, params, fixed_runtime.models.flux, amb_cfg
+            )
+            root_finder = AMBIPOLARITY_MODEL_REGISTRY.get(str(model_name).strip().lower())
+            if root_finder is None:
+                raise ValueError(f"Unknown ambipolarity model: {model_name}")
+            normalized = str(model_name).strip().lower()
+            if normalized not in ("two_stage", "adaptive"):
+                raise ValueError(f"Ambipolarity model '{model_name}' not recognized or not implemented.")
+            max_roots = int(amb_cfg.get("er_ambipolar_max_roots", 3))
+            zeros = (
+                jnp.full((max_roots,), jnp.nan, dtype=jnp.float64).at[0].set(0.0),
+                jnp.zeros((max_roots,), dtype=jnp.float64),
+                jnp.asarray(0.0, dtype=jnp.float64),
+                jnp.asarray(1, dtype=jnp.int32),
+            )
+            def _run(_):
+                args = dict(
+                    Er_range=(float(amb_cfg.get("er_ambipolar_scan_min", -20.0)), float(amb_cfg.get("er_ambipolar_scan_max", 20.0))),
+                    n_coarse=int(amb_cfg.get("er_ambipolar_n_coarse", 24)),
+                    n_refine=int(amb_cfg.get("er_ambipolar_n_refine", 8)),
+                    max_roots=max_roots, tol=float(amb_cfg.get("er_ambipolar_tol", 1.0e-6)),
+                    x_tol=float(amb_cfg.get("er_ambipolar_x_tol", 1.0e-6)), maxiter=int(amb_cfg.get("er_ambipolar_maxiter", 12)),
+                    er_scan_batch_mode=amb_cfg.get("er_ambipolar_scan_batch_mode", "vmap"),
+                    er_scan_batch_size=amb_cfg.get("er_ambipolar_scan_batch_size"),
+                    Gamma_func=gamma_factory(radius_index), entropy_func=entropy_factory(radius_index),
+                )
+                if normalized == "adaptive":
+                    args.update(n_init=int(amb_cfg.get("er_ambipolar_adaptive_n_init", 16)), n_subdiv=int(amb_cfg.get("er_ambipolar_adaptive_n_subdiv", 2)), n_rounds=int(amb_cfg.get("er_ambipolar_adaptive_n_rounds", 2)), max_brackets=int(amb_cfg.get("er_ambipolar_adaptive_max_brackets", 24)))
+                    args.pop("n_coarse")
+                return root_finder(**args)
+            return jax.lax.cond(radius_index == 0, lambda _: zeros, _run, None) if skip_axis_root else _run(None)
+
+        _single_radius_root_jit = jax.jit(_single_radius_root, inline=False)
+
+        def _selected_root_scan(state, geometry_leaves, database_leaves):
+            _, rows = jax.lax.scan(
+                lambda carry, index: (carry, _single_radius_root_jit(carry[0], index, carry[1], carry[2])),
+                (state, geometry_leaves, database_leaves),
+                jnp.arange(state.Er.shape[0], dtype=jnp.int32),
+            )
+            roots = jnp.asarray(rows[2], dtype=state.Er.dtype)
+            finite = jnp.isfinite(roots)
+            return jnp.where(finite, roots, state.Er), finite
 
         def _direct_cotangents(rooted_state, geometry_leaves, database_leaves):
             payload = payload_adapter.rebuild(geometry_leaves, database_leaves)
@@ -1226,6 +1292,7 @@ def build_database_initial_root_experiment_stage(
         return (
             payload_adapter,
             _selected_root,
+            _selected_root_scan,
             jax.jit(_direct_cotangents, inline=False),
             jax.jit(_root_pullback, inline=False),
         )
@@ -1321,6 +1388,7 @@ def _database_geometry_active_initial_er_root_only_reverse_table(
         if (
             database_root_stage.payload_adapter is None
             or database_root_stage.selected_root is None
+            or database_root_stage.selected_root_scan is None
             or database_root_stage.direct_cotangents is None
             or database_root_stage.root_pullback is None
         ):
@@ -1328,7 +1396,7 @@ def _database_geometry_active_initial_er_root_only_reverse_table(
         geometry_leaves, database_leaves = database_root_stage.payload_adapter.dynamic_leaves(
             support
         )
-        selected_root = lambda state: database_root_stage.selected_root(
+        selected_root = lambda state: database_root_stage.selected_root_scan(
             state, geometry_leaves, database_leaves
         )
         direct_cotangents = lambda rooted_state: database_root_stage.direct_cotangents(
