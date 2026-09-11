@@ -45,12 +45,48 @@ SMALL_DATABASE_TRANSPORT_CONFIG = (
 class QuietProblem:
     """Suppress existing progress output; test output stays one line per trial."""
 
-    def __init__(self, problem):
+    def __init__(self, problem, *, diagnose_database_dispatch: bool = False):
         self._problem = problem
+        self._diagnose_database_dispatch = bool(diagnose_database_dispatch)
+        self.database_dispatch_points: list[tuple[str, int | None]] = []
 
     def evaluate(self, values):
-        with redirect_stdout(io.StringIO()):
-            return self._problem.evaluate(values)
+        self.database_dispatch_points = []
+        original_evaluator = None
+        if self._diagnose_database_dispatch:
+            # ``GeometryInitialErRootLeastSquaresProblem.evaluate`` resolves
+            # this module global at call time. Temporarily wrapping it lets
+            # the unchanged database benchmark evaluator report phase-local
+            # JAX dispatch-cache sizes without changing its mathematics.
+            original_evaluator = opt.evaluate_geometry_initial_er_root_only_least_squares_benchmark_tables
+
+            def _cache_size() -> int | None:
+                try:
+                    from jax._src import dispatch
+
+                    return int(dispatch.xla_primitive_callable.cache_info().currsize)
+                except (AttributeError, ImportError):
+                    return None
+
+            def _probe(label: str) -> None:
+                self.database_dispatch_points.append((str(label), _cache_size()))
+
+            def _instrumented_evaluator(*args, **kwargs):
+                kwargs["dispatch_cache_probe"] = _probe
+                _probe("benchmark_evaluator_entry")
+                result = original_evaluator(*args, **kwargs)
+                _probe("benchmark_evaluator_return")
+                return result
+
+            opt.evaluate_geometry_initial_er_root_only_least_squares_benchmark_tables = (
+                _instrumented_evaluator
+            )
+        try:
+            with redirect_stdout(io.StringIO()):
+                return self._problem.evaluate(values)
+        finally:
+            if original_evaluator is not None:
+                opt.evaluate_geometry_initial_er_root_only_least_squares_benchmark_tables = original_evaluator
 
 
 def _terms_for_objective_set(objective_set: str):
@@ -106,6 +142,14 @@ def main() -> int:
         action="store_true",
         help="Use the reduced (5, 25, 31) database grid used by the parity test.",
     )
+    parser.add_argument(
+        "--diagnose-database-dispatch",
+        action="store_true",
+        help=(
+            "Report JAX dispatch-cache size at existing database reverse "
+            "phase boundaries; this does not add a JIT boundary."
+        ),
+    )
     args = parser.parse_args()
     if args.warmup < 0 or args.repeats < 1:
         raise ValueError("--warmup must be non-negative and --repeats must be positive.")
@@ -124,7 +168,9 @@ def main() -> int:
     problem = base.build_transition_bootstrap_initial_root_problem(
         base.SEED_INPUT, int(base.MAX_MODE_SCHEDULE)
     )
-    quiet_problem = QuietProblem(problem)
+    quiet_problem = QuietProblem(
+        problem, diagnose_database_dispatch=args.diagnose_database_dispatch
+    )
     x = np.asarray(jax.device_get(problem.x0), dtype=float)
     print(
         "[database memory test] "
@@ -147,6 +193,16 @@ def main() -> int:
             f"elapsed_s={time.perf_counter() - started:.3f}",
             flush=True,
         )
+        if args.diagnose_database_dispatch:
+            points = " ".join(
+                f"{label}={'unavailable' if size is None else size}"
+                for label, size in quiet_problem.database_dispatch_points
+            )
+            print(
+                "[database memory test] database_dispatch_cache "
+                f"{points or 'unavailable'}",
+                flush=True,
+            )
 
     first_rss: int | None = None
 

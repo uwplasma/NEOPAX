@@ -1091,6 +1091,7 @@ def _database_geometry_active_initial_er_root_only_reverse_table(
     options: Mapping[str, object] | None,
     raw_block_solve=None,
     database_root_stage: DatabaseInitialRootExperimentStage | None = None,
+    dispatch_cache_probe=None,
 ) -> ObjectiveTableResult:
     """Database-native selected-root reverse with one recorded scan fold.
 
@@ -1099,6 +1100,12 @@ def _database_geometry_active_initial_er_root_only_reverse_table(
     one retained scan transpose.  Bootstrap uses the same compact corrected-
     Upar state/geometry/table split as full transport reverse.
     """
+    def _probe(label: str) -> None:
+        # Diagnostic-only; normal benchmark evaluations do not provide a probe.
+        if dispatch_cache_probe is not None:
+            dispatch_cache_probe(str(label))
+
+    _probe("database_root_entry")
     names = normalize_initial_er_root_only_objective_names(objective_names)
     vmec_specs = tuple(parameter_set.vmec_boundary_specs)
     profile_specs = tuple(parameter_set.profile_specs)
@@ -1111,6 +1118,7 @@ def _database_geometry_active_initial_er_root_only_reverse_table(
     # changed a boundary coefficient.
     current_runtime = runtime
     if raw_block_solve is not None:
+        _probe("before_database_live_runtime")
         current_runtime, _current_state = build_runtime_context_for_vmec_state(
             dict(config),
             geometry_context,
@@ -1118,11 +1126,14 @@ def _database_geometry_active_initial_er_root_only_reverse_table(
             n_r=int(n_r),
         )
         del _current_state
+        _probe("after_database_live_runtime")
 
     # The fixed runtime is the only object seen by root/objective closures.
     # Keep the recorded scan owner out of those closures and consume its
     # database cotangent once below, exactly as full transport reverse does.
+    _probe("before_database_segment_split")
     database_segment, recorded_scan_owner = split_recorded_ntx_database_runtime(current_runtime)
+    _probe("after_database_segment_split")
     fixed_runtime = database_segment.runtime
     support = {
         "geometry": fixed_runtime.geometry,
@@ -1150,6 +1161,7 @@ def _database_geometry_active_initial_er_root_only_reverse_table(
         selected_root = lambda state: database_root_stage.selected_root(
             state, geometry_leaves, database_leaves
         )
+    _probe("before_database_root_direct")
     (
         pre_root_state,
         er_profile,
@@ -1168,6 +1180,8 @@ def _database_geometry_active_initial_er_root_only_reverse_table(
         options=options,
         selected_root=selected_root,
     )
+    _probe("after_database_root_direct")
+    _probe("before_database_root_pullback")
     profile_matrix, support_bars = _database_initial_root_to_unfolded_support_bars(
         fixed_runtime=fixed_runtime,
         support=support,
@@ -1182,10 +1196,13 @@ def _database_geometry_active_initial_er_root_only_reverse_table(
         pre_root_state_from_profile_values=pre_root_state_from_profile_values,
         objective_count=len(names),
     )
+    _probe("after_database_root_pullback")
+    _probe("before_database_scan_fold")
     (support_bars,) = fold_recorded_ntx_scan_database_bar_groups_into_support(
         recorded_scan_owner, (support_bars,)
     )
     support_bars = jax.block_until_ready(support_bars)
+    _probe("after_database_scan_fold")
     if progress_label:
         print(
             f"{progress_label} database selected-root table fold ready "
@@ -1195,6 +1212,7 @@ def _database_geometry_active_initial_er_root_only_reverse_table(
 
     geometry_param_specs = tuple(spec.as_tuple() for spec in vmec_specs)
     neoclassical_cfg = config.get("neoclassical", {})
+    _probe("before_database_payload_to_vmec")
     assembly = realtime_geometry_transport_reverse_table_from_payload_cotangents(
         objective_labels=names,
         profile_parameter_labels=tuple(spec.label for spec in profile_specs),
@@ -1215,6 +1233,7 @@ def _database_geometry_active_initial_er_root_only_reverse_table(
         raw_block_solve=raw_block_solve,
         return_branch_gradients=False,
     )
+    _probe("after_database_payload_to_vmec")
     geometry_matrix = jnp.asarray(assembly.table_result.geometry_gradient_matrix)
     columns = []
     for row in range(len(names)):
@@ -3585,6 +3604,7 @@ def evaluate_geometry_initial_er_root_only_least_squares_benchmark_tables(
     root_options: Mapping[str, object] | None = None,
     raw_block_stage=None,
     database_root_stage: DatabaseInitialRootExperimentStage | None = None,
+    dispatch_cache_probe=None,
 ) -> LeastSquaresEvaluation:
     """Evaluate mixed objectives using only benchmark-validated table backends."""
 
@@ -3604,6 +3624,11 @@ def evaluate_geometry_initial_er_root_only_least_squares_benchmark_tables(
     shared_raw_block_solve = None
     root_runner_options = {} if root_options is None else dict(root_options)
     t_start = time.perf_counter()
+
+    def _probe(label: str) -> None:
+        # Test-only cache instrumentation. It is inert in normal calls.
+        if dispatch_cache_probe is not None:
+            dispatch_cache_probe(str(label))
 
     if "transport" in grouped_terms:
         active_profile_values = _active_profile_values_from_parameter_vector(
@@ -3657,6 +3682,7 @@ def evaluate_geometry_initial_er_root_only_least_squares_benchmark_tables(
                 raw_block_solve=shared_raw_block_solve,
                 options=root_runner_options,
                 database_root_stage=database_root_stage,
+                dispatch_cache_probe=dispatch_cache_probe,
             )
             transport_values, transport_jacobian = jax.block_until_ready(
                 (transport_result.values, transport_result.jacobian)
@@ -3692,6 +3718,7 @@ def evaluate_geometry_initial_er_root_only_least_squares_benchmark_tables(
             )
 
     if "geometry" in grouped_terms:
+        _probe("before_geometry_table")
         backend_results["geometry"] = geometry_full_ad_reverse_table(
             context=geometry_context,
             parameter_set=parameter_set,
@@ -3704,6 +3731,7 @@ def evaluate_geometry_initial_er_root_only_least_squares_benchmark_tables(
             solver_device=geometry_solver_device,
             raw_block_solve=shared_raw_block_solve,
         )
+        _probe("after_geometry_table")
 
     result = assemble_least_squares_result(
         normalized_terms,
