@@ -112,6 +112,15 @@ def _live_jax_array_count() -> int | None:
     live_arrays = getattr(jax, "live_arrays", None)
     if live_arrays is None:
         return None
+
+
+def _term_summary(problem) -> str:
+    """Show the normalized terms that actually reach the evaluator."""
+
+    return ",".join(
+        f"{term.objective.family}:{term.objective.name}"
+        for term in problem.terms
+    )
     try:
         return len(live_arrays())
     except Exception:
@@ -178,7 +187,8 @@ def main() -> int:
         f"small_database={args.small_database} "
         f"warmup={args.warmup} repeats={args.repeats} "
         f"parameter_count={problem.parameter_count} "
-        "path=ntx_scan_runtime_database_selected_root_reverse",
+        "path=ntx_scan_runtime_database_selected_root_reverse "
+        f"terms={_term_summary(problem)}",
         flush=True,
     )
     for warmup_index in range(args.warmup):
@@ -224,6 +234,16 @@ def main() -> int:
             f"live_jax_arrays={array_text} residual_norm={sample.residual_norm:.6e}",
             flush=True,
         )
+        if args.diagnose_database_dispatch:
+            points = " ".join(
+                f"{label}={'unavailable' if size is None else size}"
+                for label, size in quiet_problem.database_dispatch_points
+            )
+            print(
+                "[database memory test] database_dispatch_cache "
+                f"{points or 'unavailable'}",
+                flush=True,
+            )
 
     opt.repeated_evaluation_memory_samples(
         quiet_problem,
