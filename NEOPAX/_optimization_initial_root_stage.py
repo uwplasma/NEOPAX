@@ -272,6 +272,7 @@ class PreparedInitialRootPayloadStatic:
     geometry_requested_sample_rho: Any
     geometry_boozer_surface_sampling: Any
     r00_boozer_surface_sampling: Any
+    scan_r00_boozer_surface_sampling: Any | None
     booz_constants_grids: Any
     geometry_booz_mode_indices: tuple[int | None, int | None]
     r00_booz_mode00: int | None

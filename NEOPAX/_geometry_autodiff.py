@@ -5642,9 +5642,15 @@ def geometry_payload_pullback_from_param_vector_raw_block_transpose(
         # here would make it a traced closure value under the compact JVP
         # route even though it has no state derivative.
         scan_rho_static = np.asarray(jax.device_get(scan_rho), dtype=float)
-        scan_r00_boozer_surface_sampling = _boozer_surface_indices_and_rho(
-            context.static, scan_rho_static
+        scan_r00_boozer_surface_sampling = (
+            getattr(prepared_static, "scan_r00_boozer_surface_sampling", None)
+            if prepared_static is not None
+            else None
         )
+        if scan_r00_boozer_surface_sampling is None:
+            scan_r00_boozer_surface_sampling = _boozer_surface_indices_and_rho(
+                context.static, scan_rho_static
+            )
 
         def runtime_scan_payload_from_state(state_inner):
             geometry_inner = geometry_from_state(state_inner)

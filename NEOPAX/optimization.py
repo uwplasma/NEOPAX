@@ -1293,6 +1293,7 @@ def _prepare_initial_root_payload_static(
     *,
     n_r: int,
     state=None,
+    scan_rho=None,
 ) -> PreparedInitialRootPayloadStatic | None:
     """Build immutable VMEX/Boozer payload metadata for one opt-in stage.
 
@@ -1319,6 +1320,13 @@ def _prepare_initial_root_payload_static(
         face_sample = np.asarray((0.0, 1.0), dtype=float)
     r00_boozer_surface_sampling = _boozer_surface_indices_and_rho(
         context.static, np.unique(np.concatenate((center_sample, face_sample)))
+    )
+    scan_r00_boozer_surface_sampling = (
+        None
+        if scan_rho is None
+        else _boozer_surface_indices_and_rho(
+            context.static, np.asarray(jax.device_get(scan_rho), dtype=float)
+        )
     )
     booz_constants = context.booz_constants
     grids = context.booz_grids
@@ -1351,6 +1359,7 @@ def _prepare_initial_root_payload_static(
         geometry_requested_sample_rho=geometry_requested_sample_rho,
         geometry_boozer_surface_sampling=geometry_boozer_surface_sampling,
         r00_boozer_surface_sampling=r00_boozer_surface_sampling,
+        scan_r00_boozer_surface_sampling=scan_r00_boozer_surface_sampling,
         booz_constants_grids=(booz_constants, grids),
         geometry_booz_mode_indices=(mode00, _mode_index(1, 0)),
         r00_booz_mode00=mode00,
@@ -1626,6 +1635,7 @@ def geometry_initial_er_root_only_least_squares_problem(
         prepared_payload_static = _prepare_initial_root_payload_static(
             context,
             n_r=int(n_r if n_r is not None else geom_cfg.get("n_radial", 51)),
+            scan_rho=(neoclassical_cfg.get("ntx_scan_rho") if mode == "database_root_experiment" else None),
         )
     if mode in {
         "optimization_payload_experiment",
@@ -1719,9 +1729,10 @@ def geometry_initial_er_root_only_least_squares_problem(
             payload_to_vmec_impl=_stage_payload,
             prepared_static=prepared_payload_static,
             prepared_static_factory=lambda state: _prepare_initial_root_payload_static(
-                context,
-                n_r=int(n_r if n_r is not None else geom_cfg.get("n_radial", 51)),
-                state=state,
+            context,
+            n_r=int(n_r if n_r is not None else geom_cfg.get("n_radial", 51)),
+            state=state,
+            scan_rho=(neoclassical_cfg.get("ntx_scan_rho") if mode == "database_root_experiment" else None),
             ),
             active_payload_layout_factory=(
                 None
