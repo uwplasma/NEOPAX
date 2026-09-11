@@ -1441,7 +1441,6 @@ def geometry_initial_er_root_only_least_squares_problem(
         "optimization_payload_root_scan_experiment",
         "optimization_payload_root_scan_geometry_experiment",
         "optimization_payload_reverse_experiment",
-        "database_root_experiment",
         "vmex_like",
     }:
         raise ValueError(
@@ -1600,6 +1599,7 @@ def geometry_initial_er_root_only_least_squares_problem(
         "optimization_payload_root_scan_geometry_experiment",
         "optimization_payload_reverse_experiment",
         "database_root_experiment",
+        "database_root_experiment",
     }:
         stage_support_payload = find_ntx_support_payload(runtime)
         if not isinstance(stage_support_payload, dict):
@@ -1623,6 +1623,7 @@ def geometry_initial_er_root_only_least_squares_problem(
         "optimization_payload_root_scan_experiment",
         "optimization_payload_root_scan_geometry_experiment",
         "optimization_payload_reverse_experiment",
+        "database_root_experiment",
     }:
         prepared_payload_static = _prepare_initial_root_payload_static(
             context,
