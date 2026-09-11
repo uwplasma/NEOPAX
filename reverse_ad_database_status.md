@@ -192,3 +192,49 @@ Run the 16 accepted-step / 4-segment GPU diagnostic benchmark.  Require both:
 
 The tests establish dispatch and boundary correctness; they do not yet claim
 a measured benchmark memory reduction.
+
+## 2026-09-11 current full-transport diagnostic state
+
+The one-step, one-segment database black-box full-transport reverse completed
+after the compact face-state transpose was added.  This run used both
+`NEOPAX_DATABASE_STATE_VJP_DIAGNOSTICS=1` and
+`NEOPAX_DATABASE_GEOMETRY_VJP_DIAGNOSTICS=1`.
+
+### Finite-status result
+
+The previously failing local boundaries were finite throughout the attached
+run:
+
+- fixed-flux equation geometry: `a_b_nonfinite=0`,
+  `r_grid_half_nonfinite=0`;
+- direct centre-flux geometry: `a_b_nonfinite=0`,
+  `r_grid_half_nonfinite=0`;
+- compact face-flux geometry: `a_b_nonfinite=0`;
+- final recorded scan fold:
+  `raw_block_param_bar_all_finite=True`, with
+  `raw_block_param_bar_l2=4.578905e+02`.
+
+No `nan`, `inf`, traceback, or nonfinite diagnostic was emitted.  Thus the
+compact face-state correction has removed the earlier nonfinite path for this
+one-step diagnostic; it has not been rolled back and the direct-state Radau
+correction remains active.
+
+### Timing result and remaining blocker
+
+The run is finite but still far too expensive, so it is not yet a successful
+16-step production validation:
+
+```text
+one active-step segmented cotangent sweep       1948.746 s
+initial direct-RHS support pullback              342.165 s
+initial state pullback                           162.343 s
+initial-Er root compact pullback                 267.393 s
+final recorded-scan fold                         733.465 s
+```
+
+The active compact contract remains intact:
+`ntx_scan_runtime_active_float_leaves=63`,
+`compact_payload_tangent_contract=True`, and one batched recorded-scan
+transpose.  The next task is therefore performance/memory auditing of these
+retained reverse payloads and local face-state calculations, not another
+change to the finite geometry/table ownership or a generic scan VJP fallback.

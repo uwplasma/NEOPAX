@@ -517,6 +517,10 @@ class GeometryInitialErRootLeastSquaresProblem:
                 )
         if self.reverse_stage_mode == "database_root_experiment":
             evaluator_kwargs["database_root_stage"] = self.database_root_stage
+            if self.raw_block_transpose_optimization_stage is not None:
+                evaluator_kwargs["raw_block_transpose_optimization_stage"] = (
+                    self.raw_block_transpose_optimization_stage
+                )
         base_evaluation = evaluator(self.config, **evaluator_kwargs)
         result = _assemble_mixed_initial_er_root_result(
             self.terms,
@@ -1537,7 +1541,7 @@ def geometry_initial_er_root_only_least_squares_problem(
             max_iter=geometry_max_iter,
         )
     )
-    if mode == "optimization_payload_root_scan_geometry_experiment":
+    if mode in {"optimization_payload_root_scan_geometry_experiment", "database_root_experiment"}:
         if raw_block_stage is None:
             raise ValueError("geometry transpose stage requires VMEC boundary parameters.")
         raw_block_transpose_stage = geometry_raw_block_transpose_optimization_stage(
