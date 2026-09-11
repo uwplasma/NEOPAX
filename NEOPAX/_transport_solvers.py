@@ -11007,6 +11007,9 @@ def _radau_exact_stage_residual_input_pullback(
     stage_times = carry_in.t + kernel_context.c * primal_result.trial_dt
     stage_states = carry_in.y[None, :] + primal_result.trial_dt * stage_source
     rhs_transpose_mode = str(getattr(physics_context, "reverse_rhs_transpose_mode", "generic")).strip().lower()
+    stage_adjoint_mode = str(
+        getattr(physics_context, "reverse_stage_adjoint_solve_mode", "structured")
+    ).strip().lower()
     zero_rhs_state_cotangent = cotangent_mode in {"zero_rhs_state", "zero_state", "state_zero"}
     zero_rhs_direct_cotangent = cotangent_mode in {"zero_rhs_direct", "direct_zero"}
     zero_rhs_flux_cotangent = cotangent_mode in {"zero_rhs_flux", "flux_zero"}
@@ -11037,16 +11040,17 @@ def _radau_exact_stage_residual_input_pullback(
                 lagged_response,
                 cotangent,
             )
-        # Database black-box carries use the complete direct-state boundary.
-        # It includes the local fixed-table flux response and the equation
-        # assembly (finite-volume, work, and source terms), and therefore is
-        # the derivative required by the corrected transport reverse path.
+        # The explicit database-Jacobian lanes use the compact direct-state
+        # boundary.  Plain ``block`` instead uses the finite forward-mode
+        # Jacobian below, matching the dense matrix used by its stage solve.
+        # Mixing those contracts can seed 0 * inf terms in the carry adjoint.
         if (
             rhs_transpose_mode in {
                 "explicit_database",
                 "database",
                 "explicit_black_box_database",
             }
+            and stage_adjoint_mode != "block"
             and physics_context.flat_rhs_direct_black_box_state_pullback is not None
         ):
             return physics_context.flat_rhs_direct_black_box_state_pullback(

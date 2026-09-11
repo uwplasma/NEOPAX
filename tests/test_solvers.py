@@ -2759,8 +2759,8 @@ def test_database_stage_input_pullback_uses_same_direct_state_boundary_as_matrix
     assert len(calls) == 1
 
 
-def test_database_plain_block_stage_input_pullback_uses_complete_direct_state_boundary():
-    """Plain block carries retain the corrected complete database state rule."""
+def test_database_plain_block_stage_input_pullback_keeps_finite_forward_jacobian_contract():
+    """Plain database block uses its finite forward Jacobian for carry bars."""
     dtype = jnp.float64
     kernel_context = types.SimpleNamespace(
         dtype=dtype,
@@ -2794,8 +2794,12 @@ def test_database_plain_block_stage_input_pullback_uses_complete_direct_state_bo
         kernel_context, physics_context, carry, primal, None, residual_bar,
         compute_dt_bar=False,
     )
-    assert jnp.allclose(actual_y_bar, -jnp.asarray([99.0, 99.0], dtype=dtype))
-    assert len(calls) == 1
+    rhs_jacobian = jnp.asarray([[0.8, -0.2], [0.5, 1.3]], dtype=dtype)
+    expected_y_bar = -(residual_bar @ rhs_jacobian)[0]
+    assert jnp.allclose(actual_y_bar, expected_y_bar, rtol=1.0e-12, atol=1.0e-12)
+    # The compact reverse hook remains available to the explicit database
+    # Jacobian mode, but must not be traced by plain block.
+    assert calls == []
 
 
 def test_database_plain_block_matrix_keeps_finite_forward_jacobian_contract():
