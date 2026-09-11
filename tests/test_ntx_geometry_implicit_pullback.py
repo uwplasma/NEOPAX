@@ -996,6 +996,56 @@ def test_database_fixed_equation_pullback_retains_separate_face_bars():
     assert jnp.array_equal(temperature_faces_bar["Q"], jnp.asarray([5.0, 7.0, 0.0]))
 
 
+def test_database_fixed_flux_state_pullback_holds_captured_faces_fixed():
+    """Equation-state transpose does not rebuild a database face closure.
+
+    This is the first half of the direct black-box state boundary: it retains
+    the state-only equation terms while the separately captured face values
+    remain constants.  The compact face-model state transpose is deliberately
+    a later boundary.
+    """
+    equations = object.__new__(ComposedEquationSystem)
+
+    class _Density:
+        @staticmethod
+        def __call__(state, *, fluxes):
+            return state.density + 3.0 * fluxes["Gamma_faces"][None, :2]
+
+    class _Temperature:
+        @staticmethod
+        def __call__(state, *, fluxes):
+            return state.pressure + state.density + 5.0 * fluxes["Q_faces"][None, :2]
+
+    object.__setattr__(equations, "density_equation", _Density())
+    object.__setattr__(equations, "temperature_equation", _Temperature())
+    object.__setattr__(equations, "er_equation", None)
+    object.__setattr__(equations, "equations", ())
+    object.__setattr__(equations, "species", None)
+    state = TransportState(
+        density=jnp.asarray([[1.0, 2.0]]),
+        pressure=jnp.asarray([[3.0, 4.0]]),
+        Er=jnp.asarray([0.0, 0.0]),
+    )
+    rhs_bar = TransportState(
+        density=jnp.asarray([[2.0, -1.0]]),
+        pressure=jnp.asarray([[5.0, 7.0]]),
+        Er=jnp.zeros((2,)),
+    )
+    payloads = {
+        "center": {"Gamma": jnp.zeros((1, 2))},
+        "density": {"Gamma_faces": jnp.asarray([11.0, 12.0, 13.0])},
+        "temperature": {"Q_faces": jnp.asarray([17.0, 18.0, 19.0])},
+    }
+
+    actual = equations._pullback_database_fixed_flux_rhs_state(
+        state, None, state, rhs_bar, payloads
+    )
+
+    assert jnp.array_equal(actual.density, jnp.asarray([[7.0, 6.0]]))
+    assert jnp.array_equal(actual.pressure, jnp.asarray([[5.0, 7.0]]))
+    assert jnp.array_equal(actual.Er, jnp.zeros((2,)))
+
+
 def test_database_face_table_pullback_rebinds_only_fixed_database_leaf():
     """Face bars become table bars without a scan or a centre-flux rebuild."""
     equations = object.__new__(ComposedEquationSystem)

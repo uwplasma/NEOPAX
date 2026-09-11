@@ -2732,6 +2732,35 @@ class ComposedEquationSystem:
         )
         return pullback(rhs_bar)
 
+    def _pullback_database_fixed_flux_rhs_state(
+        self, working_state, eidx, state_reference, rhs_bar, fixed_flux_payloads
+    ):
+        """Transpose equation assembly while all captured database fluxes are fixed.
+
+        The direct database Radau boundary must not re-enter a face flux
+        closure while differentiating finite-volume equation assembly.  Face
+        closures query the database at a distinct physical mesh and therefore
+        have their own compact state/table/geometry boundaries.  This helper
+        owns only the complementary equation-state partial: sources, work
+        terms, boundary rules, quasi-neutral working-state algebra, and the
+        finite-volume map with its centre and face flux inputs held fixed.
+
+        The caller is responsible for adding the centre and face flux-model
+        state partials.  Keeping those ownership boundaries explicit avoids a
+        generic VJP through a database face interpolation graph.
+        """
+        _, pullback = jax.vjp(
+            lambda working_state_value: self._evaluate_database_fixed_fluxes_from_working_state(
+                working_state_value,
+                eidx,
+                state_reference,
+                fixed_flux_payloads,
+            ),
+            working_state,
+        )
+        (working_state_bar,) = pullback(rhs_bar)
+        return working_state_bar
+
     def _pullback_database_primal_face_table_bars(
         self, working_state, center_fluxes, support, density_faces_bar, temperature_faces_bar
     ):

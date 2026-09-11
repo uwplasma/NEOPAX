@@ -2318,6 +2318,7 @@ def geometry_active_initial_er_root_only_reverse_table(
             options=options,
             raw_block_solve=raw_block_solve,
             database_root_stage=database_root_stage,
+            dispatch_cache_probe=dispatch_cache_probe,
         )
 
     def _probe(label: str) -> None:
