@@ -520,7 +520,9 @@ def test_database_direct_rhs_support_adds_scan_coordinate_bars(monkeypatch):
         state, bars, {"geometry": jnp.asarray(1.0), "database": database}
     )["database"]
 
-    assert jnp.allclose(actual.a_b, expected.a_b)
+    # Physical centre geometry owns the co-moving a_b tangent.  The table
+    # boundary keeps only the independent scan coordinate.
+    assert jnp.allclose(actual.a_b, 0.0)
     assert jnp.allclose(actual.Er_list, expected.Er_list)
     assert jnp.allclose(actual.D11_log, 0.0)
 
@@ -1206,6 +1208,52 @@ def test_database_native_face_geometry_comoves_monoenergetic_scale():
         state,
         face_state,
         {"Gamma": jnp.asarray([[2.0, -3.0, 4.0]])},
+        geometry,
+    )
+    assert jnp.all(jnp.isfinite(actual.a_b))
+    assert jnp.allclose(actual.a_b, 0.0)
+
+
+def test_database_native_centre_geometry_comoves_monoenergetic_scale():
+    """Fixed-table centre geometry holds the normalized query radius fixed."""
+    geometry = _PhysicalMeshGeometry(
+        a_b=jnp.asarray(2.0),
+        rho_grid=jnp.asarray([0.25, 0.75]),
+        rho_grid_half=jnp.asarray([0.0, 0.5, 1.0]),
+        r_grid=jnp.asarray([0.5, 1.5]),
+        r_grid_half=jnp.asarray([0.0, 1.0, 2.0]),
+        dr=jnp.asarray(1.0),
+    )
+    database = Monoenergetic(
+        a_b=jnp.asarray(2.0),
+        rho=jnp.asarray([0.0, 0.5, 1.0]),
+        nu_log=jnp.asarray([-2.0]),
+        Er_list=jnp.asarray([[-6.0], [-5.0], [-4.0]]),
+        D11_log=jnp.zeros((3, 1, 1)),
+        D13=jnp.zeros((3, 1, 1)),
+        D33=jnp.zeros((3, 1, 1)),
+    )
+
+    class _QueryRadiusCentreModel(NTXDatabaseTransportModel):
+        def build_local_direct_flux_evaluator(self, _state):
+            def _evaluate(radius_index, _er_value):
+                query_rho = self.geometry.r_grid[radius_index] / self.database.a_b
+                return {
+                    "Gamma": jnp.asarray((query_rho,)),
+                    "Q": jnp.zeros((1,)), "Upar": jnp.zeros((1,)),
+                }
+            return _evaluate
+
+    model = _QueryRadiusCentreModel(
+        species=None, energy_grid=None, geometry=geometry, database=database
+    )
+    state = TransportState(
+        density=jnp.ones((1, 2)), pressure=jnp.ones((1, 2)), Er=jnp.zeros((2,))
+    )
+    actual = model.pullback_direct_rhs_geometry_by_radius(
+        state,
+        {"Gamma": jnp.asarray([[2.0, -3.0]]),
+         "Q": jnp.zeros((1, 2)), "Upar": jnp.zeros((1, 2))},
         geometry,
     )
     assert jnp.all(jnp.isfinite(actual.a_b))

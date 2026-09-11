@@ -4017,6 +4017,15 @@ class NTXDatabaseTransportModel(TransportFluxModelBase):
             {"Gamma": _bar("Gamma"), "Q": _bar("Q"), "Upar": _bar("Upar")},
             database,
         )
+        if isinstance(database, Monoenergetic):
+            # The paired physical-geometry boundary evaluates the centre map
+            # with the database scale co-moving with the physical mesh.  It
+            # therefore owns the a_b derivative.  Only the remaining query
+            # coordinate (Er_list) may cross the recorded scan here.
+            coordinate_bar = dataclasses.replace(
+                coordinate_bar,
+                a_b=jnp.zeros_like(jnp.asarray(coordinate_bar.a_b)),
+            )
         database_bar = jax.tree_util.tree_map(
             lambda coefficient_bar, coordinate_leaf: (
                 jnp.asarray(coefficient_bar) + jnp.asarray(coordinate_leaf)
@@ -4085,17 +4094,18 @@ class NTXDatabaseTransportModel(TransportFluxModelBase):
                     geometry,
                     _split(flat_delta),
                 )
-                # The centre support boundary owns the scan-table and its
-                # interpolation-coordinate bars.  This sibling owns only
-                # physical fixed-table geometry, so a scan-built
-                # Monoenergetic database must remain completely fixed here.
-                # Legacy preprocessed databases retain their established
-                # local scale convention because they have no recorded
-                # scan-coordinate transpose.
+                # Keep the physical mesh and the database's length scale on
+                # the same r/a_b manifold.  Holding a scan-built table scale
+                # fixed while r_grid moves creates the clipped endpoint
+                # interpolation tangent responsible for the prior nonfinite
+                # a_b cotangent.  The table coefficient and Er-list bars are
+                # still owned by the separate recorded-scan boundary.
                 database_value = self.database
-                if database_value is not None and not isinstance(
-                    database_value, Monoenergetic
-                ):
+                if isinstance(database_value, Monoenergetic):
+                    database_value = database_with_geometry_scale(
+                        database_value, geometry_value.a_b
+                    )
+                elif database_value is not None:
                     database_value = database_with_geometry_scale(
                         database_value, geometry_value.a_b
                     )
