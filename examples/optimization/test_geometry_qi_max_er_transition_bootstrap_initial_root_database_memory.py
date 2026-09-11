@@ -34,6 +34,12 @@ DATABASE_TRANSPORT_CONFIG = (
     / "benchmarks"
     / "Solve_Transport_equations_wHe_radau_ntx_scan_runtime_database_vmec_realtime_geometry_benchmark_black_box.toml"
 )
+SMALL_DATABASE_TRANSPORT_CONFIG = (
+    ROOT
+    / "examples"
+    / "benchmarks"
+    / "Solve_Transport_equations_wHe_radau_ntx_scan_runtime_database_vmec_realtime_geometry_benchmark_black_box_small.toml"
+)
 
 
 class QuietProblem:
@@ -95,16 +101,23 @@ def main() -> int:
     )
     parser.add_argument("--warmup", type=int, default=1)
     parser.add_argument("--repeats", type=int, default=3)
+    parser.add_argument(
+        "--small-database",
+        action="store_true",
+        help="Use the reduced (5, 25, 31) database grid used by the parity test.",
+    )
     args = parser.parse_args()
     if args.warmup < 0 or args.repeats < 1:
         raise ValueError("--warmup must be non-negative and --repeats must be positive.")
     if not np.isscalar(base_example.MAX_MODE_SCHEDULE):
         raise ValueError("The database memory test requires one fixed MAX_MODE_SCHEDULE value.")
 
-    # Both modes use the database-native one-fold scan transpose.  The trial
-    # mode compiles only the fixed-table selected-root work and leaves the
-    # current recorded-scan fold in the same outer benchmark evaluator.
-    base_example.TRANSPORT_CONFIG = DATABASE_TRANSPORT_CONFIG
+    # Both modes use the database-native one-fold scan transpose. The trial
+    # mode only persists the fixed-table selected-root operator; the current
+    # recorded-scan fold remains in the same outer benchmark evaluator.
+    base_example.TRANSPORT_CONFIG = (
+        SMALL_DATABASE_TRANSPORT_CONFIG if args.small_database else DATABASE_TRANSPORT_CONFIG
+    )
     base_example.REVERSE_STAGE_MODE = args.mode
     base_example.terms = _terms_for_objective_set(args.objective_set)
     base = base_example
@@ -116,6 +129,7 @@ def main() -> int:
     print(
         "[database memory test] "
         f"mode={args.mode} objective_set={args.objective_set} "
+        f"small_database={args.small_database} "
         f"warmup={args.warmup} repeats={args.repeats} "
         f"parameter_count={problem.parameter_count} "
         "path=ntx_scan_runtime_database_selected_root_reverse",

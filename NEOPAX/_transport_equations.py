@@ -2013,6 +2013,40 @@ class ComposedEquationSystem:
                 state, working_state, eidx, shared_fluxes, rhs_bar
             )
         )
+        if (
+            str(os.environ.get("NEOPAX_DATABASE_STATE_VJP_DIAGNOSTICS", ""))
+            .strip()
+            .lower()
+            in {"1", "true", "yes", "on"}
+        ):
+            def _bad_count(value):
+                return jnp.sum(~jnp.isfinite(jnp.asarray(value)))
+
+            gamma_bad = _bad_count(flux_bar.get("Gamma", 0.0))
+            q_bad = _bad_count(flux_bar.get("Q", 0.0))
+            upar_bad = _bad_count(flux_bar.get("Upar", 0.0))
+            direct_density_bad = _bad_count(direct_working_state_bar.density)
+            direct_pressure_bad = _bad_count(direct_working_state_bar.pressure)
+            direct_er_bad = _bad_count(direct_working_state_bar.Er)
+
+            def _report_bad_assembly_boundary(_):
+                jax.debug.print(
+                    "[database-state-vjp] equation-to-flux boundary nonfinite "
+                    "flux=(Gamma={gamma},Q={q},Upar={upar}) "
+                    "direct_state=(density={density},pressure={pressure},Er={er})",
+                    gamma=gamma_bad, q=q_bad, upar=upar_bad,
+                    density=direct_density_bad, pressure=direct_pressure_bad,
+                    er=direct_er_bad,
+                )
+                return None
+
+            jax.lax.cond(
+                (gamma_bad + q_bad + upar_bad + direct_density_bad
+                 + direct_pressure_bad + direct_er_bad) > 0,
+                _report_bad_assembly_boundary,
+                lambda _: None,
+                operand=None,
+            )
         flux_working_state_bar = flux_state_pullback(working_state, flux_bar)
         if flux_working_state_bar is None:
             return None
