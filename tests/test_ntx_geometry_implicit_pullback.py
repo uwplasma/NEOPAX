@@ -630,6 +630,70 @@ def test_database_direct_face_coordinate_pullback_matches_compact_query_vjp(monk
     assert jnp.allclose(actual.Er_list, expected_er_list)
 
 
+def test_database_direct_face_state_pullback_uses_model_temperature_floor(monkeypatch):
+    """The compact native face-state rule has no runtime-only floor attribute."""
+    database = Monoenergetic(
+        a_b=jnp.asarray(1.0), rho=jnp.asarray([0.0, 0.5, 1.0]),
+        nu_log=jnp.asarray([-2.0]), Er_list=jnp.asarray([[-2.0], [-1.0], [0.0]]),
+        D11_log=jnp.zeros((3, 1, 1)), D13=jnp.zeros((3, 1, 1)), D33=jnp.zeros((3, 1, 1)),
+    )
+    species = SimpleNamespace(
+        mass=jnp.ones((1,)), species_indices=jnp.arange(1), charge=jnp.ones((1,))
+    )
+    model = NTXDatabaseTransportModel(
+        species=species,
+        energy_grid=SimpleNamespace(),
+        geometry=SimpleNamespace(r_grid_half=jnp.asarray([0.0, 0.5, 1.0])),
+        database=database,
+    )
+    state = TransportState(
+        density=jnp.ones((1, 2)), pressure=jnp.ones((1, 2)), Er=jnp.zeros((2,))
+    )
+    face_state = SimpleNamespace(
+        density=jnp.ones((1, 3)), temperature=jnp.ones((1, 3)), Er=jnp.zeros((3,))
+    )
+    evaluated = SimpleNamespace(
+        face=face_state,
+        density_grad_face=jnp.zeros((1, 3)),
+        temperature_grad_face=jnp.zeros((1, 3)),
+    )
+    monkeypatch.setattr(
+        transport_flux_models_module,
+        "build_evaluated_transport_state",
+        lambda *_args, **_kwargs: evaluated,
+    )
+    monkeypatch.setattr(
+        transport_flux_models_module,
+        "get_Lij_matrix_at_radius",
+        lambda *_args: jnp.eye(3),
+    )
+    monkeypatch.setattr(
+        transport_flux_models_module,
+        "get_Thermodynamical_Forces_A1",
+        lambda *_args: jnp.asarray(1.0),
+    )
+    monkeypatch.setattr(
+        transport_flux_models_module,
+        "get_Thermodynamical_Forces_A2",
+        lambda *_args: jnp.asarray(0.0),
+    )
+    monkeypatch.setattr(
+        transport_flux_models_module,
+        "get_Thermodynamical_Forces_A3",
+        lambda er: jnp.zeros_like(er),
+    )
+
+    actual = model.pullback_direct_face_flux_state(
+        state,
+        face_state,
+        {"Gamma": jnp.ones((1, 3)), "Q": jnp.zeros((1, 3)), "Upar": jnp.zeros((1, 3))},
+    )
+
+    # The mocked face inputs are state independent; successful compact
+    # execution therefore has an exact zero transpose.
+    _assert_float_tree_allclose(actual, jax.tree_util.tree_map(jnp.zeros_like, state))
+
+
 def test_database_direct_face_support_adds_scan_coordinate_bars(monkeypatch):
     """Face table support combines scan-coordinate bars before the fold."""
     database = Monoenergetic(

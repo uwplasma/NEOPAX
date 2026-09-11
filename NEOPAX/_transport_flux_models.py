@@ -3503,7 +3503,7 @@ class NTXDatabaseTransportModel(TransportFluxModelBase):
                 bc_temperature=bc_temperature,
                 bc_er=bc_er,
                 density_floor=self.density_floor,
-                temperature_floor=self.temperature_floor,
+                temperature_floor=DEFAULT_TRANSPORT_TEMPERATURE_FLOOR,
             )
             if face_mode in {"ntss_like", "ntss", "half_point"}:
                 dndr_value = _ntss_like_face_gradient(
