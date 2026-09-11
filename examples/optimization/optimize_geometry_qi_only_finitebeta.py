@@ -131,6 +131,7 @@ def iteration_diagnostics(evaluation):
         f"mirror_ratio={value('geometry:vmec_mirror_ratio', 'vmec_mirror_ratio', 'geometry:mirror_penalization', 'mirror_penalization'):.8e} "
         f"magnetic_well={value('geometry:vmec_magnetic_well', 'vmec_magnetic_well'):.8e} "
         f"beta_total={value('geometry:vmec_beta_total', 'vmec_beta_total'):.8e} "
+        f"softmax_dmerc={value('geometry:vmec_dmerc_stability_softmax', 'vmec_dmerc_stability_softmax'):.8e} "
         f"qi_cost={value('geometry:boozer_qi_objective', 'boozer_qi_objective'):.8e} "
         f"maxJ_cost={value('geometry:boozer_maxj_objective', 'boozer_maxj_objective'):.8e}"
     )
