@@ -890,6 +890,7 @@ def _database_selected_root_direct_cotangents(
     pre_root_state_from_profile_values: Callable[[object], object],
     options: Mapping[str, object] | None,
     selected_root=None,
+    direct_cotangents=None,
 ):
     """Evaluate selected-root objective rows before the implicit root pullback.
 
@@ -912,6 +913,19 @@ def _database_selected_root_direct_cotangents(
     er_profile = jnp.asarray(er_profile, dtype=pre_root_state.Er.dtype)
     finite_mask = jnp.asarray(finite_mask, dtype=bool)
     rooted_state = dataclasses.replace(pre_root_state, Er=er_profile)
+    if direct_cotangents is not None:
+        values, rooted_state_bars, direct_geometry_bars, direct_database_bars = direct_cotangents(
+            rooted_state
+        )
+        return (
+            pre_root_state,
+            er_profile,
+            finite_mask,
+            values,
+            rooted_state_bars,
+            direct_geometry_bars,
+            direct_database_bars,
+        )
     generic_names = tuple(name for name in names if name != _BOOTSTRAP_CURRENT_OBJECTIVE)
 
     def _objective_values(state_value, geometry_delta):
@@ -993,21 +1007,109 @@ def _database_selected_root_direct_cotangents(
     )
 
 
+def _database_rooted_state_direct_cotangents(
+    *, rooted_state, fixed_runtime, support, objective_names, options
+):
+    """Direct database objective cotangents after an already-selected root.
+
+    This is algebraically the post-root portion of
+    ``_database_selected_root_direct_cotangents``.  Keeping root selection
+    outside this helper preserves its benchmark operation order, while the
+    optimization stage may give these direct VJPs a persistent JIT boundary.
+    """
+    names = tuple(objective_names)
+    baseline_geometry = support["geometry"]
+    geometry_delta0 = _float_delta_tree_like(baseline_geometry)
+    generic_names = tuple(name for name in names if name != _BOOTSTRAP_CURRENT_OBJECTIVE)
+
+    def _objective_values(state_value, geometry_delta):
+        geometry = _add_float_delta_tree(baseline_geometry, geometry_delta)
+        return _initial_er_root_only_objective_values(
+            state_value,
+            runtime_with_geometry_payload(fixed_runtime, geometry),
+            generic_names,
+            options=options,
+        )
+
+    direct_values = {}
+    direct_state_bars = {}
+    direct_geometry_bars = {}
+    direct_database_bars = {}
+    if generic_names:
+        generic_values, objective_pullback = jax.vjp(
+            _objective_values, rooted_state, geometry_delta0
+        )
+        generic_basis = jnp.eye(len(generic_names), dtype=jnp.asarray(generic_values).dtype)
+        generic_state_bars, generic_geometry_bars = jax.vmap(objective_pullback)(generic_basis)
+        for row, name in enumerate(generic_names):
+            direct_values[name] = generic_values[row]
+            direct_state_bars[name] = _row_from_batched_tree(generic_state_bars, row)
+            direct_geometry_bars[name] = _row_from_batched_tree(generic_geometry_bars, row)
+            direct_database_bars[name] = _float_delta_tree_like(support["database"])
+
+    if _BOOTSTRAP_CURRENT_OBJECTIVE in names:
+        flux_model = getattr(fixed_runtime.models, "flux", None)
+        neoclassical_model = getattr(flux_model, "neoclassical_model", flux_model)
+        upar_only = getattr(neoclassical_model, "evaluate_momentum_corrected_upar_only", None)
+        joint_pullback = getattr(
+            neoclassical_model, "pullback_momentum_corrected_upar_state_geometry_by_radius", None
+        )
+        database_pullback = getattr(
+            neoclassical_model, "pullback_momentum_corrected_upar_database_by_radius", None
+        )
+        coordinate_pullback = getattr(
+            neoclassical_model,
+            "pullback_momentum_corrected_upar_database_coordinates_by_radius",
+            None,
+        )
+        if not all(callable(fn) for fn in (upar_only, joint_pullback, database_pullback, coordinate_pullback)):
+            raise NotImplementedError(
+                "Database root-only bootstrap requires compact Upar state/geometry, "
+                "table, and coordinate pullbacks."
+            )
+        bootstrap_value, upar_bar = bootstrap_current_softmax_abs_value_and_upar_bar(
+            rooted_state, fixed_runtime, {"Upar": upar_only(rooted_state)}
+        )
+        bootstrap_state_bar, bootstrap_geometry_bar = joint_pullback(
+            rooted_state, upar_bar, support["geometry"]
+        )
+        d11_bar, d13_bar, d33_bar = database_pullback(rooted_state, upar_bar)
+        coordinate_bar = coordinate_pullback(rooted_state, upar_bar)
+        direct_values[_BOOTSTRAP_CURRENT_OBJECTIVE] = bootstrap_value
+        direct_state_bars[_BOOTSTRAP_CURRENT_OBJECTIVE] = bootstrap_state_bar
+        direct_geometry_bars[_BOOTSTRAP_CURRENT_OBJECTIVE] = bootstrap_geometry_bar
+        direct_database_bars[_BOOTSTRAP_CURRENT_OBJECTIVE] = dataclasses.replace(
+            _float_delta_tree_like(support["database"]),
+            a_b=coordinate_bar.a_b,
+            Er_list=coordinate_bar.Er_list,
+            D11_log=d11_bar,
+            D13=d13_bar,
+            D33=d33_bar,
+        )
+    return (
+        jnp.stack([direct_values[name] for name in names]),
+        _stack_tree_rows([direct_state_bars[name] for name in names]),
+        _stack_tree_rows([direct_geometry_bars[name] for name in names]),
+        _stack_tree_rows([direct_database_bars[name] for name in names]),
+    )
+
+
 @dataclasses.dataclass(slots=True)
 class DatabaseInitialRootExperimentStage:
     """Persistent optimization-only root kernel for a fixed database layout."""
 
     build_for_live_runtime: Callable[
-        [Any], tuple[DatabaseInitialErTransportPayloadAdapter, Callable[..., Any]]
+        [Any], tuple[DatabaseInitialErTransportPayloadAdapter, Callable[..., Any], Callable[..., Any]]
     ]
     payload_adapter: DatabaseInitialErTransportPayloadAdapter | None = None
     selected_root: Callable[..., Any] | None = None
+    direct_cotangents: Callable[..., Any] | None = None
 
     def initialize_for_live_runtime(self, runtime) -> None:
         """Capture the one stable payload layout seen after the VMEC solve."""
 
-        if self.payload_adapter is None or self.selected_root is None:
-            self.payload_adapter, self.selected_root = self.build_for_live_runtime(runtime)
+        if self.payload_adapter is None or self.selected_root is None or self.direct_cotangents is None:
+            self.payload_adapter, self.selected_root, self.direct_cotangents = self.build_for_live_runtime(runtime)
 
 
 def build_database_initial_root_experiment_stage(
@@ -1028,9 +1130,9 @@ def build_database_initial_root_experiment_stage(
     """
 
     config_static = dict(config)
-    # These belong to the uncompiled baseline reverse below.  The persistent
-    # boundary is deliberately limited to selected-root construction.
-    del objective_names, parameter_set, pre_root_state_from_profile_values, options
+    objective_names_static = tuple(objective_names)
+    options_static = None if options is None else dict(options)
+    del parameter_set, pre_root_state_from_profile_values
 
     def _build_for_live_runtime(live_runtime):
         segment, owner = split_recorded_ntx_database_runtime(live_runtime)
@@ -1055,12 +1157,28 @@ def build_database_initial_root_experiment_stage(
                 state, config=dict(config_static), runtime=fixed_runtime
             )
 
-        # This is the first database optimization boundary.  It wraps the
-        # existing *whole-profile* selected-root operation; it does not JIT
-        # an individual-radius root or alter the recorded scan/final payload
-        # reverse owned by the benchmark route.  Geometry and database table
-        # leaves remain explicit dynamic arguments through ``payload_adapter``.
-        return payload_adapter, jax.jit(_selected_root, inline=False)
+        def _direct_cotangents(rooted_state, geometry_leaves, database_leaves):
+            payload = payload_adapter.rebuild(geometry_leaves, database_leaves)
+            fixed_runtime = runtime_with_realtime_geometry_payload(
+                runtime_template,
+                {"kind": "ntx_database", **payload},
+            )
+            return _database_rooted_state_direct_cotangents(
+                rooted_state=rooted_state,
+                fixed_runtime=fixed_runtime,
+                support=payload,
+                objective_names=objective_names_static,
+                options=options_static,
+            )
+
+        # Keep the outer selected-root profile un-jitted.  The reference
+        # database configuration already uses a mapped per-radius solve; an
+        # enclosing jit fuses that solve and changes its floating-point root
+        # enough to perturb the downstream bootstrap Jacobian.  Retaining
+        # this stable function identity gives the mapped root body a reusable
+        # dispatch/cache boundary, matching the accepted realtime scan stage,
+        # without changing the benchmark's numerical operation order.
+        return payload_adapter, _selected_root, jax.jit(_direct_cotangents, inline=False)
 
     return DatabaseInitialRootExperimentStage(
         build_for_live_runtime=_build_for_live_runtime,
@@ -1143,6 +1261,7 @@ def _database_geometry_active_initial_er_root_only_reverse_table(
     }
     profile_values_arr = jnp.asarray(profile_values)
     selected_root = None
+    direct_cotangents = None
     if database_root_stage is not None:
         # The database payload does not exist until the current VMEC raw solve
         # has rebuilt its live scan. Initialize once from that first live
@@ -1151,6 +1270,7 @@ def _database_geometry_active_initial_er_root_only_reverse_table(
         if (
             database_root_stage.payload_adapter is None
             or database_root_stage.selected_root is None
+            or database_root_stage.direct_cotangents is None
         ):
             raise RuntimeError("Database root stage did not initialize its live payload operator.")
         geometry_leaves, database_leaves = database_root_stage.payload_adapter.dynamic_leaves(
@@ -1158,6 +1278,9 @@ def _database_geometry_active_initial_er_root_only_reverse_table(
         )
         selected_root = lambda state: database_root_stage.selected_root(
             state, geometry_leaves, database_leaves
+        )
+        direct_cotangents = lambda rooted_state: database_root_stage.direct_cotangents(
+            rooted_state, geometry_leaves, database_leaves
         )
     _probe("before_database_root_direct")
     (
@@ -1177,6 +1300,7 @@ def _database_geometry_active_initial_er_root_only_reverse_table(
         pre_root_state_from_profile_values=pre_root_state_from_profile_values,
         options=options,
         selected_root=selected_root,
+        direct_cotangents=direct_cotangents,
     )
     _probe("after_database_root_direct")
     _probe("before_database_root_pullback")
