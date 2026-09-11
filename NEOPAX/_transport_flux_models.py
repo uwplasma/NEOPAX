@@ -3915,13 +3915,28 @@ class NTXDatabaseTransportModel(TransportFluxModelBase):
                 _lij_at_radius, argnums=(0, 1, 2)
             )(density_local, temperature_local, er_local, radius_value)
             output_axes = tuple(range(jnp.asarray(local_bar).ndim))
-            density_local_bar = jnp.tensordot(
-                local_bar, density_jacobian, axes=(output_axes, output_axes)
-            )
-            temperature_local_bar = jnp.tensordot(
-                local_bar, temperature_jacobian, axes=(output_axes, output_axes)
-            )
-            er_local_bar = jnp.sum(local_bar * er_jacobian)
+
+            def _contract_active_bar(bar, jacobian):
+                """Contract an Lij cotangent without propagating 0 * NaN.
+
+                At an intentionally clipped table coordinate, an inactive
+                interpolation branch may have no derivative.  A zero Lij
+                cotangent must remove that branch exactly; multiplying it
+                after the Jacobian has been materialised otherwise turns the
+                algebraic zero into NaN.  Nonzero cotangents are left wholly
+                untouched, so this cannot conceal an active singularity.
+                """
+                if jnp.asarray(jacobian).ndim == jnp.asarray(bar).ndim:
+                    return jnp.sum(
+                        jnp.where(bar == 0, 0.0, bar * jacobian)
+                    )
+                expanded_bar = jnp.expand_dims(bar, axis=-1)
+                product = jnp.where(expanded_bar == 0, 0.0, expanded_bar * jacobian)
+                return jnp.sum(product, axis=output_axes)
+
+            density_local_bar = _contract_active_bar(local_bar, density_jacobian)
+            temperature_local_bar = _contract_active_bar(local_bar, temperature_jacobian)
+            er_local_bar = _contract_active_bar(local_bar, er_jacobian)
             return density_local_bar, temperature_local_bar, er_local_bar
 
         lij_density_bar, lij_temperature_bar, lij_er_bar = jax.vmap(
@@ -3935,6 +3950,45 @@ class NTXDatabaseTransportModel(TransportFluxModelBase):
         )
         _, gradients_pullback = jax.vjp(_gradients, density, temperature)
         gradient_density_bar, gradient_temperature_bar = gradients_pullback((dndr_bar, dtdr_bar))
+        if (
+            str(os.environ.get("NEOPAX_DATABASE_STATE_VJP_DIAGNOSTICS", ""))
+            .strip()
+            .lower()
+            in {"1", "true", "yes", "on"}
+        ):
+            diagnostic_leaves = (
+                density_bar,
+                temperature_bar,
+                er_bar,
+                lij_density_bar,
+                lij_temperature_bar,
+                lij_er_bar,
+                gradient_density_bar,
+                gradient_temperature_bar,
+            )
+            diagnostic_counts = jnp.stack(
+                tuple(jnp.sum(~jnp.isfinite(value)) for value in diagnostic_leaves)
+            )
+
+            def _report_direct_component_failure(_):
+                jax.debug.print(
+                    "[database-state-vjp] components nonfinite "
+                    "algebra=(density={ad},temperature={at},Er={ae}) "
+                    "lij=(density={ld},temperature={lt},Er={le}) "
+                    "gradients=(density={gd},temperature={gt})",
+                    ad=diagnostic_counts[0], at=diagnostic_counts[1],
+                    ae=diagnostic_counts[2], ld=diagnostic_counts[3],
+                    lt=diagnostic_counts[4], le=diagnostic_counts[5],
+                    gd=diagnostic_counts[6], gt=diagnostic_counts[7],
+                )
+                return None
+
+            jax.lax.cond(
+                jnp.any(diagnostic_counts > 0),
+                _report_direct_component_failure,
+                lambda _: None,
+                operand=None,
+            )
         _, state_inputs_pullback = jax.vjp(_primitive_inputs, state)
         (state_bar,) = state_inputs_pullback((
             density_bar + lij_density_bar + gradient_density_bar,
