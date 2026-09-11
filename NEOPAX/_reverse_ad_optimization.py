@@ -985,12 +985,21 @@ def _database_selected_root_direct_cotangents(
     )
 
 
-@dataclasses.dataclass(frozen=True, slots=True)
+@dataclasses.dataclass(slots=True)
 class DatabaseInitialRootExperimentStage:
     """Persistent optimization-only root kernel for a fixed database layout."""
 
-    payload_adapter: DatabaseInitialErTransportPayloadAdapter
-    root_to_unfolded_bars: Callable[..., Any]
+    build_for_live_runtime: Callable[
+        [Any], tuple[DatabaseInitialErTransportPayloadAdapter, Callable[..., Any]]
+    ]
+    payload_adapter: DatabaseInitialErTransportPayloadAdapter | None = None
+    root_to_unfolded_bars: Callable[..., Any] | None = None
+
+    def initialize_for_live_runtime(self, runtime) -> None:
+        """Capture the one stable payload layout seen after the VMEC solve."""
+
+        if self.payload_adapter is None or self.root_to_unfolded_bars is None:
+            self.payload_adapter, self.root_to_unfolded_bars = self.build_for_live_runtime(runtime)
 
 
 def build_database_initial_root_experiment_stage(
@@ -1010,60 +1019,66 @@ def build_database_initial_root_experiment_stage(
     deliberately absent: its current-primal transpose remains outside JIT.
     """
 
-    segment, _owner = split_recorded_ntx_database_runtime(runtime)
-    runtime_template = segment.runtime
-    payload_adapter = DatabaseInitialErTransportPayloadAdapter.from_payload(
-        {
-            "geometry": runtime_template.geometry,
-            "database": runtime_template.database,
-        }
-    )
     names = tuple(objective_names)
     config_static = dict(config)
     options_static = None if options is None else dict(options)
 
-    def _root_to_unfolded_bars(geometry_leaves, database_leaves, profile_values_arr):
-        payload = payload_adapter.rebuild(geometry_leaves, database_leaves)
-        fixed_runtime = runtime_with_realtime_geometry_payload(
-            runtime_template,
-            {"kind": "ntx_database", **payload},
+    def _build_for_live_runtime(live_runtime):
+        segment, owner = split_recorded_ntx_database_runtime(live_runtime)
+        runtime_template = segment.runtime
+        payload_adapter = DatabaseInitialErTransportPayloadAdapter.from_payload(
+            {
+                "geometry": runtime_template.geometry,
+                # The outer reverse boundary consumes the table carried by
+                # the recorded scan owner. It is the payload supplied on
+                # every later live evaluation.
+                "database": owner.runtime_scan.database,
+            }
         )
-        (
-            pre_root_state,
-            er_profile,
-            finite_mask,
-            values,
-            rooted_state_bars,
-            direct_geometry_bars,
-            direct_database_bars,
-        ) = _database_selected_root_direct_cotangents(
-            config=config_static,
-            fixed_runtime=fixed_runtime,
-            support=payload,
-            objective_names=names,
-            profile_values_arr=profile_values_arr,
-            pre_root_state_from_profile_values=pre_root_state_from_profile_values,
-            options=options_static,
-        )
-        profile_matrix, support_bars = _database_initial_root_to_unfolded_support_bars(
-            fixed_runtime=fixed_runtime,
-            support=payload,
-            pre_root_state=pre_root_state,
-            er_profile=er_profile,
-            finite_mask=finite_mask,
-            rooted_state_bars=rooted_state_bars,
-            direct_geometry_bars=direct_geometry_bars,
-            direct_database_bars=direct_database_bars,
-            parameter_set=parameter_set,
-            profile_values_arr=profile_values_arr,
-            pre_root_state_from_profile_values=pre_root_state_from_profile_values,
-            objective_count=len(names),
-        )
-        return values, profile_matrix, support_bars
+
+        def _root_to_unfolded_bars(geometry_leaves, database_leaves, profile_values_arr):
+            payload = payload_adapter.rebuild(geometry_leaves, database_leaves)
+            fixed_runtime = runtime_with_realtime_geometry_payload(
+                runtime_template,
+                {"kind": "ntx_database", **payload},
+            )
+            (
+                pre_root_state,
+                er_profile,
+                finite_mask,
+                values,
+                rooted_state_bars,
+                direct_geometry_bars,
+                direct_database_bars,
+            ) = _database_selected_root_direct_cotangents(
+                config=config_static,
+                fixed_runtime=fixed_runtime,
+                support=payload,
+                objective_names=names,
+                profile_values_arr=profile_values_arr,
+                pre_root_state_from_profile_values=pre_root_state_from_profile_values,
+                options=options_static,
+            )
+            profile_matrix, support_bars = _database_initial_root_to_unfolded_support_bars(
+                fixed_runtime=fixed_runtime,
+                support=payload,
+                pre_root_state=pre_root_state,
+                er_profile=er_profile,
+                finite_mask=finite_mask,
+                rooted_state_bars=rooted_state_bars,
+                direct_geometry_bars=direct_geometry_bars,
+                direct_database_bars=direct_database_bars,
+                parameter_set=parameter_set,
+                profile_values_arr=profile_values_arr,
+                pre_root_state_from_profile_values=pre_root_state_from_profile_values,
+                objective_count=len(names),
+            )
+            return values, profile_matrix, support_bars
+
+        return payload_adapter, jax.jit(_root_to_unfolded_bars)
 
     return DatabaseInitialRootExperimentStage(
-        payload_adapter=payload_adapter,
-        root_to_unfolded_bars=jax.jit(_root_to_unfolded_bars),
+        build_for_live_runtime=_build_for_live_runtime,
     )
 
 
@@ -1164,6 +1179,15 @@ def _database_geometry_active_initial_er_root_only_reverse_table(
             objective_count=len(names),
         )
     else:
+        # The database payload does not exist until the current VMEC raw solve
+        # has rebuilt its live scan. Initialize once from that first live
+        # payload; subsequent trials reuse the same compiled operator.
+        database_root_stage.initialize_for_live_runtime(current_runtime)
+        if (
+            database_root_stage.payload_adapter is None
+            or database_root_stage.root_to_unfolded_bars is None
+        ):
+            raise RuntimeError("Database root stage did not initialize its live payload operator.")
         geometry_leaves, database_leaves = database_root_stage.payload_adapter.dynamic_leaves(
             support
         )
