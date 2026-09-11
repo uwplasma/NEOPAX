@@ -1099,17 +1099,30 @@ class DatabaseInitialRootExperimentStage:
     """Persistent optimization-only root kernel for a fixed database layout."""
 
     build_for_live_runtime: Callable[
-        [Any], tuple[DatabaseInitialErTransportPayloadAdapter, Callable[..., Any], Callable[..., Any]]
+        [Any], tuple[
+            DatabaseInitialErTransportPayloadAdapter, Callable[..., Any], Callable[..., Any], Callable[..., Any]
+        ]
     ]
     payload_adapter: DatabaseInitialErTransportPayloadAdapter | None = None
     selected_root: Callable[..., Any] | None = None
     direct_cotangents: Callable[..., Any] | None = None
+    root_pullback: Callable[..., Any] | None = None
 
     def initialize_for_live_runtime(self, runtime) -> None:
         """Capture the one stable payload layout seen after the VMEC solve."""
 
-        if self.payload_adapter is None or self.selected_root is None or self.direct_cotangents is None:
-            self.payload_adapter, self.selected_root, self.direct_cotangents = self.build_for_live_runtime(runtime)
+        if (
+            self.payload_adapter is None
+            or self.selected_root is None
+            or self.direct_cotangents is None
+            or self.root_pullback is None
+        ):
+            (
+                self.payload_adapter,
+                self.selected_root,
+                self.direct_cotangents,
+                self.root_pullback,
+            ) = self.build_for_live_runtime(runtime)
 
 
 def build_database_initial_root_experiment_stage(
@@ -1132,7 +1145,8 @@ def build_database_initial_root_experiment_stage(
     config_static = dict(config)
     objective_names_static = tuple(objective_names)
     options_static = None if options is None else dict(options)
-    del parameter_set, pre_root_state_from_profile_values
+    parameter_set_static = parameter_set
+    pre_root_state_from_profile_values_static = pre_root_state_from_profile_values
 
     def _build_for_live_runtime(live_runtime):
         segment, owner = split_recorded_ntx_database_runtime(live_runtime)
@@ -1171,6 +1185,37 @@ def build_database_initial_root_experiment_stage(
                 options=options_static,
             )
 
+        def _root_pullback(
+            pre_root_state,
+            er_profile,
+            finite_mask,
+            rooted_state_bars,
+            direct_geometry_bars,
+            direct_database_bars,
+            profile_values_arr,
+            geometry_leaves,
+            database_leaves,
+        ):
+            payload = payload_adapter.rebuild(geometry_leaves, database_leaves)
+            fixed_runtime = runtime_with_realtime_geometry_payload(
+                runtime_template,
+                {"kind": "ntx_database", **payload},
+            )
+            return _database_initial_root_to_unfolded_support_bars(
+                fixed_runtime=fixed_runtime,
+                support=payload,
+                pre_root_state=pre_root_state,
+                er_profile=er_profile,
+                finite_mask=finite_mask,
+                rooted_state_bars=rooted_state_bars,
+                direct_geometry_bars=direct_geometry_bars,
+                direct_database_bars=direct_database_bars,
+                parameter_set=parameter_set_static,
+                profile_values_arr=profile_values_arr,
+                pre_root_state_from_profile_values=pre_root_state_from_profile_values_static,
+                objective_count=len(objective_names_static),
+            )
+
         # Keep the outer selected-root profile un-jitted.  The reference
         # database configuration already uses a mapped per-radius solve; an
         # enclosing jit fuses that solve and changes its floating-point root
@@ -1178,7 +1223,12 @@ def build_database_initial_root_experiment_stage(
         # this stable function identity gives the mapped root body a reusable
         # dispatch/cache boundary, matching the accepted realtime scan stage,
         # without changing the benchmark's numerical operation order.
-        return payload_adapter, _selected_root, jax.jit(_direct_cotangents, inline=False)
+        return (
+            payload_adapter,
+            _selected_root,
+            jax.jit(_direct_cotangents, inline=False),
+            jax.jit(_root_pullback, inline=False),
+        )
 
     return DatabaseInitialRootExperimentStage(
         build_for_live_runtime=_build_for_live_runtime,
@@ -1262,6 +1312,7 @@ def _database_geometry_active_initial_er_root_only_reverse_table(
     profile_values_arr = jnp.asarray(profile_values)
     selected_root = None
     direct_cotangents = None
+    root_pullback = None
     if database_root_stage is not None:
         # The database payload does not exist until the current VMEC raw solve
         # has rebuilt its live scan. Initialize once from that first live
@@ -1271,6 +1322,7 @@ def _database_geometry_active_initial_er_root_only_reverse_table(
             database_root_stage.payload_adapter is None
             or database_root_stage.selected_root is None
             or database_root_stage.direct_cotangents is None
+            or database_root_stage.root_pullback is None
         ):
             raise RuntimeError("Database root stage did not initialize its live payload operator.")
         geometry_leaves, database_leaves = database_root_stage.payload_adapter.dynamic_leaves(
@@ -1282,6 +1334,25 @@ def _database_geometry_active_initial_er_root_only_reverse_table(
         direct_cotangents = lambda rooted_state: database_root_stage.direct_cotangents(
             rooted_state, geometry_leaves, database_leaves
         )
+        def root_pullback(
+            pre_root_state,
+            er_profile,
+            finite_mask,
+            rooted_state_bars,
+            direct_geometry_bars,
+            direct_database_bars,
+        ):
+            return database_root_stage.root_pullback(
+                pre_root_state,
+                er_profile,
+                finite_mask,
+                rooted_state_bars,
+                direct_geometry_bars,
+                direct_database_bars,
+                profile_values_arr,
+                geometry_leaves,
+                database_leaves,
+            )
     _probe("before_database_root_direct")
     (
         pre_root_state,
@@ -1304,20 +1375,30 @@ def _database_geometry_active_initial_er_root_only_reverse_table(
     )
     _probe("after_database_root_direct")
     _probe("before_database_root_pullback")
-    profile_matrix, support_bars = _database_initial_root_to_unfolded_support_bars(
-        fixed_runtime=fixed_runtime,
-        support=support,
-        pre_root_state=pre_root_state,
-        er_profile=er_profile,
-        finite_mask=finite_mask,
-        rooted_state_bars=rooted_state_bars,
-        direct_geometry_bars=direct_geometry_bars,
-        direct_database_bars=direct_database_bars,
-        parameter_set=parameter_set,
-        profile_values_arr=profile_values_arr,
-        pre_root_state_from_profile_values=pre_root_state_from_profile_values,
-        objective_count=len(names),
-    )
+    if root_pullback is None:
+        profile_matrix, support_bars = _database_initial_root_to_unfolded_support_bars(
+            fixed_runtime=fixed_runtime,
+            support=support,
+            pre_root_state=pre_root_state,
+            er_profile=er_profile,
+            finite_mask=finite_mask,
+            rooted_state_bars=rooted_state_bars,
+            direct_geometry_bars=direct_geometry_bars,
+            direct_database_bars=direct_database_bars,
+            parameter_set=parameter_set,
+            profile_values_arr=profile_values_arr,
+            pre_root_state_from_profile_values=pre_root_state_from_profile_values,
+            objective_count=len(names),
+        )
+    else:
+        profile_matrix, support_bars = root_pullback(
+            pre_root_state,
+            er_profile,
+            finite_mask,
+            rooted_state_bars,
+            direct_geometry_bars,
+            direct_database_bars,
+        )
     _probe("after_database_root_pullback")
     _probe("before_database_scan_fold")
     (support_bars,) = fold_recorded_ntx_scan_database_bar_groups_into_support(
