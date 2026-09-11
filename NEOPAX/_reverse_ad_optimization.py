@@ -1169,15 +1169,135 @@ def build_database_initial_root_experiment_stage(
             }
         )
 
-        def _selected_root(state, geometry_leaves, database_leaves):
+        # Match the accepted realtime-Lij stage boundary: retain one compiled
+        # radius-local root solver, while leaving the profile-level scan
+        # un-jitted.  The database benchmark's outer lax.map is untouched.
+        try:
+            stage_r_grid = np.asarray(runtime_template.geometry.r_grid_half)
+            skip_axis_root = bool(
+                stage_r_grid.size and abs(float(stage_r_grid[0])) <= 1.0e-14
+            )
+        except Exception:
+            skip_axis_root = False
+
+        def _runtime_from_leaves(geometry_leaves, database_leaves):
             payload = payload_adapter.rebuild(geometry_leaves, database_leaves)
-            fixed_runtime = runtime_with_realtime_geometry_payload(
+            return runtime_with_realtime_geometry_payload(
                 runtime_template,
                 {"kind": "ntx_database", **payload},
             )
-            return initial_er_selected_root_profile(
-                state, config=dict(config_static), runtime=fixed_runtime
+
+        def _single_radius_root(state, radius_index, geometry_leaves, database_leaves):
+            runtime_current = _runtime_from_leaves(geometry_leaves, database_leaves)
+            amb_cfg, model_name, _entropy_model, params = initial_er_root_setup(
+                dict(config_static), runtime_current
             )
+            (
+                _n_radial,
+                _runtime_skip_axis_root,
+                _local_particle_flux,
+                gamma_func_factory,
+                entropy_func_factory,
+            ) = _ambipolarity_local_charge_flux_setup(
+                state,
+                params,
+                runtime_current.models.flux,
+                amb_cfg,
+            )
+            del _n_radial, _runtime_skip_axis_root, _local_particle_flux
+            root_finder = AMBIPOLARITY_MODEL_REGISTRY.get(
+                str(model_name).strip().lower()
+            )
+            if root_finder is None:
+                raise ValueError(f"Unknown ambipolarity model: {model_name}")
+            model_name_normalized = str(model_name).strip().lower()
+
+            if model_name_normalized in ("two_stage", "adaptive"):
+                max_roots = int(amb_cfg.get("er_ambipolar_max_roots", 3))
+                zero_roots = jnp.full((max_roots,), jnp.nan, dtype=jnp.float64).at[0].set(0.0)
+                zero_entropies = jnp.zeros((max_roots,), dtype=jnp.float64)
+                zero_best = jnp.asarray(0.0, dtype=jnp.float64)
+                zero_count = jnp.asarray(1, dtype=jnp.int32)
+
+                def _skip_center(_):
+                    return zero_roots, zero_entropies, zero_best, zero_count
+
+                def _run_root_finder(_):
+                    arguments = {
+                        "Er_range": (
+                            float(amb_cfg.get("er_ambipolar_scan_min", -20.0)),
+                            float(amb_cfg.get("er_ambipolar_scan_max", 20.0)),
+                        ),
+                        "n_coarse": int(amb_cfg.get("er_ambipolar_n_coarse", 24)),
+                        "n_refine": int(amb_cfg.get("er_ambipolar_n_refine", 8)),
+                        "max_roots": max_roots,
+                        "tol": float(amb_cfg.get("er_ambipolar_tol", 1.0e-6)),
+                        "x_tol": float(amb_cfg.get("er_ambipolar_x_tol", 1.0e-6)),
+                        "maxiter": int(amb_cfg.get("er_ambipolar_maxiter", 12)),
+                        "er_scan_batch_mode": amb_cfg.get("er_ambipolar_scan_batch_mode", "vmap"),
+                        "er_scan_batch_size": amb_cfg.get("er_ambipolar_scan_batch_size"),
+                        "Gamma_func": gamma_func_factory(radius_index),
+                        "entropy_func": entropy_func_factory(radius_index),
+                    }
+                    if model_name_normalized == "adaptive":
+                        arguments.update(
+                            {
+                                "n_init": int(amb_cfg.get("er_ambipolar_adaptive_n_init", 16)),
+                                "n_subdiv": int(amb_cfg.get("er_ambipolar_adaptive_n_subdiv", 2)),
+                                "n_rounds": int(amb_cfg.get("er_ambipolar_adaptive_n_rounds", 2)),
+                                "max_brackets": int(amb_cfg.get("er_ambipolar_adaptive_max_brackets", 24)),
+                            }
+                        )
+                        arguments.pop("n_coarse", None)
+                    return root_finder(**arguments)
+
+                if skip_axis_root:
+                    return jax.lax.cond(
+                        jnp.asarray(radius_index, dtype=jnp.int32) == 0,
+                        _skip_center,
+                        _run_root_finder,
+                        operand=None,
+                    )
+                return _run_root_finder(None)
+
+            if model_name_normalized in ("multistart", "multistart_clustered"):
+                return root_finder(
+                    Gamma_func=gamma_func_factory(radius_index),
+                    entropy_func=entropy_func_factory(radius_index),
+                    Er_range=(
+                        float(amb_cfg.get("er_ambipolar_scan_min", -20.0)),
+                        float(amb_cfg.get("er_ambipolar_scan_max", 20.0)),
+                    ),
+                    n_starts=int(amb_cfg.get("er_ambipolar_n_starts", 32)),
+                    tol=float(amb_cfg.get("er_ambipolar_tol", 1.0e-6)),
+                    maxiter=int(amb_cfg.get("er_ambipolar_maxiter", 12)),
+                    cluster_tol=float(amb_cfg.get("er_ambipolar_cluster_tol", 1.0e-3)),
+                )
+            raise ValueError(f"Ambipolarity model '{model_name}' not recognized or not implemented.")
+
+        single_radius_root = jax.jit(_single_radius_root, inline=False)
+
+        def _selected_root_scan(state, geometry_leaves, database_leaves):
+            radius_indices = jnp.arange(state.Er.shape[0], dtype=jnp.int32)
+
+            def _scan_body(carry, radius_index):
+                state_inner, geometry_inner, database_inner = carry
+                root_row = single_radius_root(
+                    state_inner, radius_index, geometry_inner, database_inner
+                )
+                return carry, root_row
+
+            _, root_rows = jax.lax.scan(
+                _scan_body,
+                (state, geometry_leaves, database_leaves),
+                radius_indices,
+            )
+            best_roots = jnp.asarray(root_rows[2], dtype=state.Er.dtype)
+            finite_mask = jnp.isfinite(best_roots)
+            return jnp.where(finite_mask, best_roots, state.Er), finite_mask
+
+        def _selected_root(state, geometry_leaves, database_leaves):
+            return _selected_root_scan(state, geometry_leaves, database_leaves)
 
         def _direct_cotangents(rooted_state, geometry_leaves, database_leaves):
             payload = payload_adapter.rebuild(geometry_leaves, database_leaves)
