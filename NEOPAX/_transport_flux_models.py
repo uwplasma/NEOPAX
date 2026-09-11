@@ -3406,6 +3406,18 @@ class NTXDatabaseTransportModel(TransportFluxModelBase):
             database,
             **kwargs,
         )
+        if isinstance(database, Monoenergetic):
+            # The paired physical-geometry boundary evaluates the face map
+            # on the co-moving (r/a_b fixed) manifold and therefore already
+            # owns the a_b directional derivative.  Retaining this raw
+            # coordinate a_b bar would differentiate the same scale a second
+            # time through the recorded scan, and at endpoint queries can
+            # expose the clipped interpolation derivative.  Er_list remains
+            # scan-owned and is deliberately retained here.
+            coordinate_bar = dataclasses.replace(
+                coordinate_bar,
+                a_b=jnp.zeros_like(jnp.asarray(coordinate_bar.a_b)),
+            )
         database_bar = jax.tree_util.tree_map(
             lambda coefficient_bar, coordinate_leaf: (
                 jnp.asarray(coefficient_bar) + jnp.asarray(coordinate_leaf)
@@ -3489,8 +3501,21 @@ class NTXDatabaseTransportModel(TransportFluxModelBase):
 
             def _all_fixed_table_face_fluxes(a_b_value):
                 geometry_value = _geometry_at_physical_scale(a_b_value)
+                # A face stays on its primal normalized-radius table query
+                # while the physical mesh is varied.  Move the table's scale
+                # with the mesh here; otherwise ``r_grid_half`` moves against
+                # a fixed ``database.a_b`` and differentiates the clipped
+                # endpoint interpolation coordinate.  That split has an
+                # undefined one-sided derivative at the axis/outer face.
+                # The explicit table transpose still owns D11/D13/D33 and
+                # the remaining scan coordinates.
+                database_value = (
+                    database_with_geometry_scale(self.database, a_b_value)
+                    if isinstance(self.database, Monoenergetic)
+                    else self.database
+                )
                 model = dataclasses.replace(
-                    self, geometry=geometry_value, database=self.database
+                    self, geometry=geometry_value, database=database_value
                 )
                 local_face_state = (
                     build_ntss_like_face_transport_state(

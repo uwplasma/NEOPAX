@@ -691,7 +691,9 @@ def test_database_direct_face_support_adds_scan_coordinate_bars(monkeypatch):
         {"geometry": jnp.asarray(1.0), "database": database},
     )["database"]
 
-    assert jnp.allclose(actual.a_b, coordinate.a_b)
+    # The paired co-moving physical face boundary owns the a_b tangent;
+    # table support retains only scan-owned non-scale coordinates.
+    assert jnp.allclose(actual.a_b, 0.0)
     assert jnp.allclose(actual.Er_list, coordinate.Er_list)
     assert jnp.allclose(actual.D11_log, 0.0)
 
@@ -1160,6 +1162,54 @@ def test_database_native_face_geometry_uses_one_physical_mesh_jvp():
     assert jnp.allclose(actual.a_b, expected)
     assert jnp.all(jnp.isfinite(actual.a_b))
     assert jnp.array_equal(actual.r_grid_half, jnp.zeros_like(geometry.r_grid_half))
+
+
+def test_database_native_face_geometry_comoves_monoenergetic_scale():
+    """Fixed-table face geometry holds the normalized query radius fixed."""
+    geometry = _PhysicalMeshGeometry(
+        a_b=jnp.asarray(2.0),
+        rho_grid=jnp.asarray([0.25, 0.75]),
+        rho_grid_half=jnp.asarray([0.0, 0.5, 1.0]),
+        r_grid=jnp.asarray([0.5, 1.5]),
+        r_grid_half=jnp.asarray([0.0, 1.0, 2.0]),
+        dr=jnp.asarray(1.0),
+    )
+    database = Monoenergetic(
+        a_b=jnp.asarray(2.0),
+        rho=jnp.asarray([0.0, 0.5, 1.0]),
+        nu_log=jnp.asarray([-2.0]),
+        Er_list=jnp.asarray([[-6.0], [-5.0], [-4.0]]),
+        D11_log=jnp.zeros((3, 1, 1)),
+        D13=jnp.zeros((3, 1, 1)),
+        D33=jnp.zeros((3, 1, 1)),
+    )
+
+    class _QueryRadiusFaceModel(NTXDatabaseTransportModel):
+        def evaluate_face_fluxes(self, _state, _face_state, **_kwargs):
+            # This represents a fixed table queried at r/a_b.  It must not
+            # acquire a physical-scale tangent merely because the mesh moves.
+            query_rho = self.geometry.r_grid_half / self.database.a_b
+            return {
+                "Gamma": query_rho[None, :],
+                "Q": jnp.zeros((1, 3)),
+                "Upar": jnp.zeros((1, 3)),
+            }
+
+    model = _QueryRadiusFaceModel(
+        species=None, energy_grid=None, geometry=geometry, database=database
+    )
+    state = TransportState(
+        density=jnp.ones((1, 2)), pressure=jnp.ones((1, 2)), Er=jnp.zeros((2,))
+    )
+    face_state = SimpleNamespace(density=jnp.ones((1, 3)))
+    actual = model.pullback_direct_face_flux_geometry_by_radius(
+        state,
+        face_state,
+        {"Gamma": jnp.asarray([[2.0, -3.0, 4.0]])},
+        geometry,
+    )
+    assert jnp.all(jnp.isfinite(actual.a_b))
+    assert jnp.allclose(actual.a_b, 0.0)
 
 
 def test_database_equation_payload_uses_full_geometry_tangent_like_lij():

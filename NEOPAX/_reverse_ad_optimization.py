@@ -885,6 +885,7 @@ def _database_selected_root_direct_cotangents(
     profile_values_arr,
     pre_root_state_from_profile_values: Callable[[object], object],
     options: Mapping[str, object] | None,
+    selected_root=None,
 ):
     """Evaluate selected-root objective rows before the implicit root pullback.
 
@@ -898,9 +899,12 @@ def _database_selected_root_direct_cotangents(
     baseline_geometry = support["geometry"]
     geometry_delta0 = _float_delta_tree_like(baseline_geometry)
     pre_root_state = pre_root_state_from_profile_values(profile_values_arr)
-    er_profile, finite_mask = initial_er_selected_root_profile(
-        pre_root_state, config=dict(config), runtime=fixed_runtime
-    )
+    if selected_root is None:
+        er_profile, finite_mask = initial_er_selected_root_profile(
+            pre_root_state, config=dict(config), runtime=fixed_runtime
+        )
+    else:
+        er_profile, finite_mask = selected_root(pre_root_state)
     er_profile = jnp.asarray(er_profile, dtype=pre_root_state.Er.dtype)
     finite_mask = jnp.asarray(finite_mask, dtype=bool)
     rooted_state = dataclasses.replace(pre_root_state, Er=er_profile)
@@ -993,13 +997,13 @@ class DatabaseInitialRootExperimentStage:
         [Any], tuple[DatabaseInitialErTransportPayloadAdapter, Callable[..., Any]]
     ]
     payload_adapter: DatabaseInitialErTransportPayloadAdapter | None = None
-    root_to_unfolded_bars: Callable[..., Any] | None = None
+    selected_root: Callable[..., Any] | None = None
 
     def initialize_for_live_runtime(self, runtime) -> None:
         """Capture the one stable payload layout seen after the VMEC solve."""
 
-        if self.payload_adapter is None or self.root_to_unfolded_bars is None:
-            self.payload_adapter, self.root_to_unfolded_bars = self.build_for_live_runtime(runtime)
+        if self.payload_adapter is None or self.selected_root is None:
+            self.payload_adapter, self.selected_root = self.build_for_live_runtime(runtime)
 
 
 def build_database_initial_root_experiment_stage(
@@ -1019,9 +1023,10 @@ def build_database_initial_root_experiment_stage(
     deliberately absent: its current-primal transpose remains outside JIT.
     """
 
-    names = tuple(objective_names)
     config_static = dict(config)
-    options_static = None if options is None else dict(options)
+    # These belong to the uncompiled baseline reverse below.  The persistent
+    # boundary is deliberately limited to selected-root construction.
+    del objective_names, parameter_set, pre_root_state_from_profile_values, options
 
     def _build_for_live_runtime(live_runtime):
         segment, owner = split_recorded_ntx_database_runtime(live_runtime)
@@ -1036,46 +1041,17 @@ def build_database_initial_root_experiment_stage(
             }
         )
 
-        def _root_to_unfolded_bars(geometry_leaves, database_leaves, profile_values_arr):
+        def _selected_root(state, geometry_leaves, database_leaves):
             payload = payload_adapter.rebuild(geometry_leaves, database_leaves)
             fixed_runtime = runtime_with_realtime_geometry_payload(
                 runtime_template,
                 {"kind": "ntx_database", **payload},
             )
-            (
-                pre_root_state,
-                er_profile,
-                finite_mask,
-                values,
-                rooted_state_bars,
-                direct_geometry_bars,
-                direct_database_bars,
-            ) = _database_selected_root_direct_cotangents(
-                config=config_static,
-                fixed_runtime=fixed_runtime,
-                support=payload,
-                objective_names=names,
-                profile_values_arr=profile_values_arr,
-                pre_root_state_from_profile_values=pre_root_state_from_profile_values,
-                options=options_static,
+            return initial_er_selected_root_profile(
+                state, config=dict(config_static), runtime=fixed_runtime
             )
-            profile_matrix, support_bars = _database_initial_root_to_unfolded_support_bars(
-                fixed_runtime=fixed_runtime,
-                support=payload,
-                pre_root_state=pre_root_state,
-                er_profile=er_profile,
-                finite_mask=finite_mask,
-                rooted_state_bars=rooted_state_bars,
-                direct_geometry_bars=direct_geometry_bars,
-                direct_database_bars=direct_database_bars,
-                parameter_set=parameter_set,
-                profile_values_arr=profile_values_arr,
-                pre_root_state_from_profile_values=pre_root_state_from_profile_values,
-                objective_count=len(names),
-            )
-            return values, profile_matrix, support_bars
 
-        return payload_adapter, jax.jit(_root_to_unfolded_bars)
+        return payload_adapter, jax.jit(_selected_root, inline=False)
 
     return DatabaseInitialRootExperimentStage(
         build_for_live_runtime=_build_for_live_runtime,
@@ -1146,56 +1122,55 @@ def _database_geometry_active_initial_er_root_only_reverse_table(
         "database": recorded_scan_owner.runtime_scan.database,
     }
     profile_values_arr = jnp.asarray(profile_values)
-    if database_root_stage is None:
-        (
-            pre_root_state,
-            er_profile,
-            finite_mask,
-            values,
-            rooted_state_bars,
-            direct_geometry_bars,
-            direct_database_bars,
-        ) = _database_selected_root_direct_cotangents(
-            config=config,
-            fixed_runtime=fixed_runtime,
-            support=support,
-            objective_names=names,
-            profile_values_arr=profile_values_arr,
-            pre_root_state_from_profile_values=pre_root_state_from_profile_values,
-            options=options,
-        )
-        profile_matrix, support_bars = _database_initial_root_to_unfolded_support_bars(
-            fixed_runtime=fixed_runtime,
-            support=support,
-            pre_root_state=pre_root_state,
-            er_profile=er_profile,
-            finite_mask=finite_mask,
-            rooted_state_bars=rooted_state_bars,
-            direct_geometry_bars=direct_geometry_bars,
-            direct_database_bars=direct_database_bars,
-            parameter_set=parameter_set,
-            profile_values_arr=profile_values_arr,
-            pre_root_state_from_profile_values=pre_root_state_from_profile_values,
-            objective_count=len(names),
-        )
-    else:
+    selected_root = None
+    if database_root_stage is not None:
         # The database payload does not exist until the current VMEC raw solve
         # has rebuilt its live scan. Initialize once from that first live
         # payload; subsequent trials reuse the same compiled operator.
         database_root_stage.initialize_for_live_runtime(current_runtime)
         if (
             database_root_stage.payload_adapter is None
-            or database_root_stage.root_to_unfolded_bars is None
+            or database_root_stage.selected_root is None
         ):
             raise RuntimeError("Database root stage did not initialize its live payload operator.")
         geometry_leaves, database_leaves = database_root_stage.payload_adapter.dynamic_leaves(
             support
         )
-        values, profile_matrix, support_bars = database_root_stage.root_to_unfolded_bars(
-            geometry_leaves,
-            database_leaves,
-            profile_values_arr,
+        selected_root = lambda state: database_root_stage.selected_root(
+            state, geometry_leaves, database_leaves
         )
+    (
+        pre_root_state,
+        er_profile,
+        finite_mask,
+        values,
+        rooted_state_bars,
+        direct_geometry_bars,
+        direct_database_bars,
+    ) = _database_selected_root_direct_cotangents(
+        config=config,
+        fixed_runtime=fixed_runtime,
+        support=support,
+        objective_names=names,
+        profile_values_arr=profile_values_arr,
+        pre_root_state_from_profile_values=pre_root_state_from_profile_values,
+        options=options,
+        selected_root=selected_root,
+    )
+    profile_matrix, support_bars = _database_initial_root_to_unfolded_support_bars(
+        fixed_runtime=fixed_runtime,
+        support=support,
+        pre_root_state=pre_root_state,
+        er_profile=er_profile,
+        finite_mask=finite_mask,
+        rooted_state_bars=rooted_state_bars,
+        direct_geometry_bars=direct_geometry_bars,
+        direct_database_bars=direct_database_bars,
+        parameter_set=parameter_set,
+        profile_values_arr=profile_values_arr,
+        pre_root_state_from_profile_values=pre_root_state_from_profile_values,
+        objective_count=len(names),
+    )
     (support_bars,) = fold_recorded_ntx_scan_database_bar_groups_into_support(
         recorded_scan_owner, (support_bars,)
     )
