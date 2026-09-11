@@ -1969,6 +1969,31 @@ class CombinedTransportFluxModel(TransportFluxModelBase):
             **kwargs,
         )
 
+    def pullback_direct_face_flux_state(self, state, face_state, flux_bar, **kwargs):
+        """Route native face-state bars to the database owner only."""
+        pullback = getattr(self.neoclassical_model, "pullback_direct_face_flux_state", None)
+        if not callable(pullback):
+            return None
+        zero = jnp.zeros_like(jnp.asarray(face_state.density))
+
+        def _bar(name):
+            value = flux_bar.get(f"{name}_faces", flux_bar.get(name, None))
+            if value is None:
+                return zero
+            value = jnp.asarray(value)
+            return zero if value.ndim == 0 or value.dtype == jax.dtypes.float0 else value
+
+        return pullback(
+            state,
+            face_state,
+            {
+                "Gamma": _bar("Gamma") + _bar("Gamma_neo"),
+                "Q": _bar("Q") + _bar("Q_neo"),
+                "Upar": _bar("Upar") + _bar("Upar_neo"),
+            },
+            **kwargs,
+        )
+
     def pullback_direct_face_flux_geometry_by_radius(
         self, state, face_state, flux_bar, geometry, **kwargs
     ):
@@ -3431,6 +3456,186 @@ class NTXDatabaseTransportModel(TransportFluxModelBase):
             else _sanitize_float_delta_bar_tree(database, database_bar)
         )
         return result
+
+    def pullback_direct_face_flux_state(
+        self, state, face_state, flux_bar, **kwargs
+    ):
+        """Compact fixed-table state transpose of direct native face fluxes.
+
+        This is the face counterpart of :meth:`pullback_direct_rhs_state`.
+        It deliberately differentiates neither equation assembly nor the
+        recorded database table: the caller supplies the face-flux cotangent,
+        while this method owns only the local face Lij algebra and the linear
+        centre-to-face finite-volume stencil.  The local Lij derivative uses
+        forward Jacobians, avoiding the clipped-table reverse stencil that
+        makes a generic VJP through ``evaluate_face_fluxes`` nonfinite.
+        """
+        zero = jnp.zeros_like(jnp.asarray(face_state.density))
+
+        def _bar(name):
+            value = flux_bar.get(name, None)
+            if value is None:
+                return zero
+            value = jnp.asarray(value)
+            if value.ndim == 0 or value.dtype == jax.dtypes.float0:
+                return zero
+            return value
+
+        gamma_bar, q_bar, upar_bar = _bar("Gamma"), _bar("Q"), _bar("Upar")
+        if gamma_bar.ndim != jnp.asarray(face_state.density).ndim:
+            raise NotImplementedError(
+                "The compact direct face-state transpose currently accepts one "
+                "Radau RHS cotangent at a time."
+            )
+
+        bc_density = kwargs.get("bc_density", self.bc_density)
+        bc_temperature = kwargs.get("bc_temperature", self.bc_temperature)
+        bc_er = kwargs.get("bc_er", None)
+        face_mode = str(
+            kwargs.get("particle_face_closure_mode", "reconstructed")
+        ).strip().lower()
+
+        def _face_inputs_from_state(state_value):
+            evaluated = build_evaluated_transport_state(
+                state_value,
+                self.geometry,
+                bc_density=bc_density,
+                bc_temperature=bc_temperature,
+                bc_er=bc_er,
+                density_floor=self.density_floor,
+                temperature_floor=self.temperature_floor,
+            )
+            if face_mode in {"ntss_like", "ntss", "half_point"}:
+                dndr_value = _ntss_like_face_gradient(
+                    evaluated.center.density,
+                    self.geometry.r_grid_half,
+                    bc_model=bc_density,
+                )
+                dtdr_value = _ntss_like_face_gradient(
+                    evaluated.center.temperature,
+                    self.geometry.r_grid_half,
+                    bc_model=bc_temperature,
+                )
+            else:
+                dndr_value = evaluated.density_grad_face
+                dtdr_value = evaluated.temperature_grad_face
+            return (
+                evaluated.face.density,
+                evaluated.face.temperature,
+                evaluated.face.Er,
+                dndr_value,
+                dtdr_value,
+            )
+
+        density, temperature, er_profile, dndr, dtdr = _face_inputs_from_state(state)
+
+        def _lij_at_face(density_local, temperature_local, er_local, radius_value):
+            vthermal_local = get_v_thermal(self.species.mass, temperature_local)
+            return jax.vmap(
+                lambda species_index: get_Lij_matrix_at_radius(
+                    self.species,
+                    self.energy_grid,
+                    self.geometry,
+                    self.database,
+                    species_index,
+                    radius_value,
+                    er_local,
+                    temperature_local,
+                    density_local,
+                    vthermal_local,
+                    _collisionality_kind(self.collisionality_model),
+                )
+            )(self.species.species_indices)
+
+        def _lij(density_value, temperature_value, er_value):
+            return jax.vmap(
+                _lij_at_face, in_axes=(1, 1, 0, 0), out_axes=1
+            )(
+                density_value,
+                temperature_value,
+                er_value,
+                self.geometry.r_grid_half,
+            )
+
+        lij = _lij(density, temperature, er_profile)
+
+        def _flux_algebra(lij_value, density_value, temperature_value, dndr_value, dtdr_value, er_value):
+            a1 = jax.vmap(
+                lambda charge, density_a, temperature_a, dndr_a, dtdr_a:
+                get_Thermodynamical_Forces_A1(
+                    charge, density_a, temperature_a, dndr_a, dtdr_a, er_value
+                )
+            )(self.species.charge, density_value, temperature_value, dndr_value, dtdr_value)
+            a2 = jax.vmap(get_Thermodynamical_Forces_A2)(temperature_value, dtdr_value)
+            a3 = get_Thermodynamical_Forces_A3(er_value)
+            density_phys = DENSITY_STATE_TO_PHYSICAL * density_value
+            temperature_phys = TEMPERATURE_STATE_TO_PHYSICAL * temperature_value
+            return {
+                "Gamma": -density_phys * (
+                    lij_value[:, :, 0, 0] * a1
+                    + lij_value[:, :, 0, 1] * a2
+                    + lij_value[:, :, 0, 2] * a3[None, :]
+                ),
+                "Q": -temperature_phys * density_phys * (
+                    lij_value[:, :, 1, 0] * a1
+                    + lij_value[:, :, 1, 1] * a2
+                    + lij_value[:, :, 1, 2] * a3[None, :]
+                ),
+                "Upar": -density_phys * (
+                    lij_value[:, :, 2, 0] * a1
+                    + lij_value[:, :, 2, 1] * a2
+                    + lij_value[:, :, 2, 2] * a3[None, :]
+                ),
+            }
+
+        _, algebra_pullback = jax.vjp(
+            _flux_algebra, lij, density, temperature, dndr, dtdr, er_profile
+        )
+        lij_bar, density_bar, temperature_bar, dndr_bar, dtdr_bar, er_bar = algebra_pullback(
+            {"Gamma": gamma_bar, "Q": q_bar, "Upar": upar_bar}
+        )
+
+        def _local_lij_transpose(
+            density_local, temperature_local, er_local, radius_value, local_bar
+        ):
+            density_jacobian, temperature_jacobian, er_jacobian = jax.jacfwd(
+                _lij_at_face, argnums=(0, 1, 2)
+            )(density_local, temperature_local, er_local, radius_value)
+            output_axes = tuple(range(jnp.asarray(local_bar).ndim))
+
+            def _contract_active_bar(bar, jacobian):
+                if jnp.asarray(jacobian).ndim == jnp.asarray(bar).ndim:
+                    return jnp.sum(jnp.where(bar == 0, 0.0, bar * jacobian))
+                expanded_bar = jnp.expand_dims(bar, axis=-1)
+                return jnp.sum(
+                    jnp.where(expanded_bar == 0, 0.0, expanded_bar * jacobian),
+                    axis=output_axes,
+                )
+
+            return (
+                _contract_active_bar(local_bar, density_jacobian),
+                _contract_active_bar(local_bar, temperature_jacobian),
+                _contract_active_bar(local_bar, er_jacobian),
+            )
+
+        lij_density_bar, lij_temperature_bar, lij_er_bar = jax.vmap(
+            _local_lij_transpose, in_axes=(1, 1, 0, 0, 1), out_axes=(1, 1, 0)
+        )(
+            density,
+            temperature,
+            er_profile,
+            self.geometry.r_grid_half,
+            lij_bar,
+        )
+        _, inputs_pullback = jax.vjp(_face_inputs_from_state, state)
+        (state_bar,) = inputs_pullback((
+            density_bar + lij_density_bar,
+            temperature_bar + lij_temperature_bar,
+            er_bar + lij_er_bar,
+            dndr_bar,
+            dtdr_bar,
+        ))
+        return state_bar
 
     def pullback_direct_face_flux_geometry_by_radius(
         self, state, face_state, flux_bar, geometry, **kwargs
@@ -6966,6 +7171,12 @@ class NTXRuntimeScanTransportModel(TransportFluxModelBase):
         model = self.with_support_payload(support)
         return model._database_model().pullback_direct_face_flux_support_payload(
             state, face_state, flux_bar, {"database": support["database"]}, **kwargs
+        )
+
+    def pullback_direct_face_flux_state(self, state, face_state, flux_bar, **kwargs):
+        """Delegate the compact native face-state transpose without a scan."""
+        return self._database_model().pullback_direct_face_flux_state(
+            state, face_state, flux_bar, **kwargs
         )
 
     def pullback_direct_face_flux_geometry_by_radius(

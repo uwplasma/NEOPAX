@@ -1046,6 +1046,51 @@ def test_database_fixed_flux_state_pullback_holds_captured_faces_fixed():
     assert jnp.array_equal(actual.Er, jnp.zeros((2,)))
 
 
+def test_database_fixed_face_state_pullback_keeps_equation_closures_separate():
+    """Density and temperature face bars use their own compact state rules."""
+    equations = object.__new__(ComposedEquationSystem)
+    calls = []
+    state = TransportState(
+        density=jnp.zeros((1, 2)), pressure=jnp.zeros((1, 2)), Er=jnp.zeros((2,))
+    )
+
+    def _state_bar(scale):
+        return TransportState(
+            density=jnp.full_like(state.density, scale),
+            pressure=jnp.full_like(state.pressure, 2.0 * scale),
+            Er=jnp.full_like(state.Er, 3.0 * scale),
+        )
+
+    class _Density:
+        face_flux_builder = staticmethod(
+            lambda _state, _centre, bar: calls.append(("density", bar)) or _state_bar(2.0)
+        )
+
+    class _Temperature:
+        face_flux_builder = staticmethod(
+            lambda _state, _centre, bar: calls.append(("temperature", bar)) or _state_bar(5.0)
+        )
+
+    _Density.face_flux_builder.database_state_pullback = _Density.face_flux_builder
+    _Temperature.face_flux_builder.database_state_pullback = _Temperature.face_flux_builder
+    object.__setattr__(equations, "density_equation", _Density())
+    object.__setattr__(equations, "temperature_equation", _Temperature())
+    object.__setattr__(equations, "er_equation", None)
+    object.__setattr__(equations, "equations", ())
+
+    actual = equations._pullback_database_primal_face_state_bars(
+        state,
+        {"Gamma": jnp.zeros((1, 2))},
+        {"Gamma": jnp.ones((1, 3))},
+        {"Q": jnp.ones((1, 3))},
+    )
+
+    assert [name for name, _bar in calls] == ["density", "temperature"]
+    assert jnp.array_equal(actual.density, jnp.full((1, 2), 7.0))
+    assert jnp.array_equal(actual.pressure, jnp.full((1, 2), 14.0))
+    assert jnp.array_equal(actual.Er, jnp.full((2,), 21.0))
+
+
 def test_database_face_table_pullback_rebinds_only_fixed_database_leaf():
     """Face bars become table bars without a scan or a centre-flux rebuild."""
     equations = object.__new__(ComposedEquationSystem)

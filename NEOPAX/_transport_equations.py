@@ -492,6 +492,32 @@ def build_density_equation(
             bc_er=bc_er, reconstruction=reconstruction,
             density_floor=density_floor, temperature_floor=temperature_floor,
         )
+        face_state = build_face_transport_state(
+            state, field, bc_density=bc_density, bc_temperature=bc_temperature,
+            bc_er=bc_er, reconstruction=reconstruction,
+            density_floor=density_floor, temperature_floor=temperature_floor,
+        )
+        pullback = getattr(flux_model, "pullback_direct_face_flux_support_payload", None)
+        if not callable(pullback):
+            raise NotImplementedError("Database density face closure lacks a compact table transpose.")
+        return pullback(
+            state, face_state, flux_bar, support,
+            bc_density=bc_density, bc_temperature=bc_temperature, bc_er=bc_er,
+            center_fluxes=center_fluxes,
+            evaluated_state=evaluated_state,
+        )
+
+    face_flux_builder.database_table_pullback = database_face_table_pullback
+
+    def database_face_state_pullback(state, center_fluxes, flux_bar):
+        """Compact state transpose for this density equation's native faces."""
+        state = apply_transport_density_floor(state, density_floor)
+        state = apply_transport_temperature_floor(state, temperature_floor, density_floor)
+        evaluated_state = build_evaluated_transport_state(
+            state, field, bc_density=bc_density, bc_temperature=bc_temperature,
+            bc_er=bc_er, reconstruction=reconstruction,
+            density_floor=density_floor, temperature_floor=temperature_floor,
+        )
         face_mode = str(particle_face_closure_mode).strip().lower()
         face_state = (
             build_ntss_like_face_transport_state(
@@ -505,17 +531,17 @@ def build_density_equation(
                 density_floor=density_floor, temperature_floor=temperature_floor,
             )
         )
-        pullback = getattr(flux_model, "pullback_direct_face_flux_support_payload", None)
+        pullback = getattr(flux_model, "pullback_direct_face_flux_state", None)
         if not callable(pullback):
-            raise NotImplementedError("Database density face closure lacks a compact table transpose.")
+            raise NotImplementedError("Database density face closure lacks a compact state transpose.")
         return pullback(
-            state, face_state, flux_bar, support,
+            state, face_state, flux_bar,
             bc_density=bc_density, bc_temperature=bc_temperature, bc_er=bc_er,
             particle_face_closure_mode=face_mode, center_fluxes=center_fluxes,
             evaluated_state=evaluated_state,
         )
 
-    face_flux_builder.database_table_pullback = database_face_table_pullback
+    face_flux_builder.database_state_pullback = database_face_state_pullback
 
     def database_face_geometry_pullback(state, center_fluxes, flux_bar, support):
         """Use the database owner's bounded native face-geometry transpose."""
@@ -1020,6 +1046,32 @@ def build_temperature_equation(
         )
 
     face_flux_builder.database_table_pullback = database_face_table_pullback
+
+    def database_face_state_pullback(state, center_fluxes, flux_bar):
+        """Compact state transpose for this temperature equation's native faces."""
+        state = apply_transport_density_floor(state, density_floor)
+        state = apply_transport_temperature_floor(state, temperature_floor, density_floor)
+        evaluated_state = build_evaluated_transport_state(
+            state, field, bc_density=bc_density, bc_temperature=bc_temperature,
+            bc_er=bc_er, reconstruction=reconstruction,
+            density_floor=density_floor, temperature_floor=temperature_floor,
+        )
+        face_state = build_face_transport_state(
+            state, field, bc_density=bc_density, bc_temperature=bc_temperature,
+            bc_er=bc_er, reconstruction=reconstruction,
+            density_floor=density_floor, temperature_floor=temperature_floor,
+        )
+        pullback = getattr(flux_model, "pullback_direct_face_flux_state", None)
+        if not callable(pullback):
+            raise NotImplementedError("Database temperature face closure lacks a compact state transpose.")
+        return pullback(
+            state, face_state, flux_bar,
+            bc_density=bc_density, bc_temperature=bc_temperature, bc_er=bc_er,
+            center_fluxes=center_fluxes,
+            evaluated_state=evaluated_state,
+        )
+
+    face_flux_builder.database_state_pullback = database_face_state_pullback
 
     def database_face_geometry_pullback(state, center_fluxes, flux_bar, support):
         """Use the database owner's bounded native face-geometry transpose."""
@@ -2008,16 +2060,48 @@ class ComposedEquationSystem:
             return None
         working_state, eidx = self._prepare_working_state(state)
         shared_fluxes = self.shared_flux_model(working_state)
+        has_concrete_equations = hasattr(self, "equations")
+        fixed_flux_payloads = (
+            self._capture_database_primal_fixed_flux_payloads(
+                working_state, shared_fluxes
+            )
+            if has_concrete_equations
+            else None
+        )
         # Match the established Lij reverse contract: differentiate equation
         # assembly at fixed fluxes and at fixed state separately.  Their sum
         # is the complete derivative of the black-box RHS (including source,
         # finite-volume, and temperature flux-work terms), but unlike one
         # monolithic VJP it does not multiply cotangents through inactive
         # constrained branches of the other variable family.
-        direct_working_state_bar = self._pullback_shared_flux_rhs_state(
-            state, working_state, eidx, shared_fluxes, rhs_bar
-        )
-        flux_bar = self.pullback_shared_fluxes(state, shared_fluxes, rhs_bar)
+        if fixed_flux_payloads is None:
+            direct_working_state_bar = self._pullback_shared_flux_rhs_state(
+                state, working_state, eidx, shared_fluxes, rhs_bar
+            )
+            flux_bar = self.pullback_shared_fluxes(state, shared_fluxes, rhs_bar)
+            face_working_state_bar = jax.tree_util.tree_map(
+                jnp.zeros_like, working_state
+            )
+        else:
+            # Keep the exact primal face closures as constants in equation
+            # assembly.  Their independent compact state transpose is added
+            # below, alongside the existing compact centre-flux transpose.
+            direct_working_state_bar = self._pullback_database_fixed_flux_rhs_state(
+                working_state, eidx, state, rhs_bar, fixed_flux_payloads
+            )
+            (
+                flux_bar,
+                density_faces_bar,
+                temperature_faces_bar,
+            ) = self._pullback_database_fixed_flux_payloads(
+                working_state, eidx, state, rhs_bar, fixed_flux_payloads
+            )
+            face_working_state_bar = self._pullback_database_primal_face_state_bars(
+                working_state,
+                fixed_flux_payloads["center"],
+                density_faces_bar,
+                temperature_faces_bar,
+            )
         if (
             str(os.environ.get("NEOPAX_DATABASE_STATE_VJP_DIAGNOSTICS", ""))
             .strip()
@@ -2056,9 +2140,10 @@ class ComposedEquationSystem:
         if flux_working_state_bar is None:
             return None
         total_working_state_bar = jax.tree_util.tree_map(
-            lambda direct, flux: direct + flux,
+            lambda direct, flux, face: direct + flux + face,
             direct_working_state_bar,
             flux_working_state_bar,
+            face_working_state_bar,
         )
         return self._prepare_working_state_pullback(state, total_working_state_bar)
 
@@ -2760,6 +2845,48 @@ class ComposedEquationSystem:
         )
         (working_state_bar,) = pullback(rhs_bar)
         return working_state_bar
+
+    def _pullback_database_primal_face_state_bars(
+        self, working_state, center_fluxes, density_faces_bar, temperature_faces_bar
+    ):
+        """Return the compact state bar of the two captured native face maps.
+
+        Density and temperature may select different face closures.  They
+        therefore retain their own cotangent and must each call their own
+        model-only state boundary; combining them before this point would
+        silently differentiate one equation through the other's closure.
+        """
+        density_eq, temperature_eq, _ = self._resolve_equations()
+        zero_state_bar = jax.tree_util.tree_map(jnp.zeros_like, working_state)
+
+        def _one_face_state_bar(equation, face_bar, equation_name):
+            if not face_bar:
+                return zero_state_bar
+            pullback = getattr(
+                getattr(equation, "face_flux_builder", None),
+                "database_state_pullback",
+                None,
+            )
+            if callable(pullback):
+                return pullback(working_state, center_fluxes, face_bar)
+            if hasattr(self, "equations"):
+                raise NotImplementedError(
+                    f"Database {equation_name} face closure lacks the required "
+                    "compact state transpose."
+                )
+            return zero_state_bar
+
+        density_state_bar = _one_face_state_bar(
+            density_eq, density_faces_bar, "density"
+        ) if density_eq is not None else zero_state_bar
+        temperature_state_bar = _one_face_state_bar(
+            temperature_eq, temperature_faces_bar, "temperature"
+        ) if temperature_eq is not None else zero_state_bar
+        return jax.tree_util.tree_map(
+            lambda density_bar, temperature_bar: density_bar + temperature_bar,
+            density_state_bar,
+            temperature_state_bar,
+        )
 
     def _pullback_database_primal_face_table_bars(
         self, working_state, center_fluxes, support, density_faces_bar, temperature_faces_bar
