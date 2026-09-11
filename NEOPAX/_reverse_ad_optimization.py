@@ -891,6 +891,7 @@ def _database_selected_root_direct_cotangents(
     options: Mapping[str, object] | None,
     selected_root=None,
     direct_cotangents=None,
+    dispatch_cache_probe=None,
 ):
     """Evaluate selected-root objective rows before the implicit root pullback.
 
@@ -910,6 +911,11 @@ def _database_selected_root_direct_cotangents(
         )
     else:
         er_profile, finite_mask = selected_root(pre_root_state)
+    # Diagnostic-only split of the broader ``database_root_direct`` phase.
+    # The selected-root map is deliberately outside the direct-cotangent JIT;
+    # distinguish its dispatch activity without changing either operation.
+    if dispatch_cache_probe is not None:
+        dispatch_cache_probe("after_database_selected_root")
     er_profile = jnp.asarray(er_profile, dtype=pre_root_state.Er.dtype)
     finite_mask = jnp.asarray(finite_mask, dtype=bool)
     rooted_state = dataclasses.replace(pre_root_state, Er=er_profile)
@@ -917,6 +923,8 @@ def _database_selected_root_direct_cotangents(
         values, rooted_state_bars, direct_geometry_bars, direct_database_bars = direct_cotangents(
             rooted_state
         )
+        if dispatch_cache_probe is not None:
+            dispatch_cache_probe("after_database_direct_cotangents")
         return (
             pre_root_state,
             er_profile,
@@ -1373,6 +1381,7 @@ def _database_geometry_active_initial_er_root_only_reverse_table(
         options=options,
         selected_root=selected_root,
         direct_cotangents=direct_cotangents,
+        dispatch_cache_probe=dispatch_cache_probe,
     )
     _probe("after_database_root_direct")
     _probe("before_database_root_pullback")
