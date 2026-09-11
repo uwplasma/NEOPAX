@@ -2,9 +2,9 @@
 """Parity check for the opt-in persistent database initial-root stage.
 
 The reference is the unchanged ``database`` evaluator.  The trial mode only
-adds a persistent JIT boundary around the fixed-table selected-root work; it
-still rebuilds the live VMEC-derived database and performs the one recorded
-scan transpose outside that boundary.
+adds a persistent fixed-table selected-root operator; it still rebuilds the
+live VMEC-derived database and performs the one recorded scan transpose
+outside that boundary.
 """
 
 from __future__ import annotations
@@ -143,9 +143,9 @@ def main() -> int:
     )
 
     # Same equations, root selection, and one-scan fold as ``database``;
-    # only the fixed-table root work is compiled.  Keep the established
-    # persistent-stage numerical envelope explicit rather than comparing two
-    # compilation schedules bit-for-bit.
+    # only the fixed-table root operator has a persistent identity. Keep the
+    # established persistent-stage numerical envelope explicit rather than
+    # comparing separate dispatch schedules bit-for-bit.
     np.testing.assert_allclose(trial_residuals, reference_residuals, rtol=1.0e-9, atol=1.0e-10)
     np.testing.assert_allclose(trial_jacobian, reference_jacobian, rtol=2.0e-7, atol=2.0e-8)
     print("[database parity] PASS", flush=True)

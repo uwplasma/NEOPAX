@@ -1019,7 +1019,7 @@ def build_database_initial_root_experiment_stage(
     pre_root_state_from_profile_values: Callable[[object], object],
     options: Mapping[str, object] | None,
 ) -> DatabaseInitialRootExperimentStage:
-    """Build the opt-in JIT boundary before any optimization iteration.
+    """Build the opt-in persistent root boundary before any optimization iteration.
 
     The stage retains only the fixed-table model layout. Each invocation
     receives fresh geometry/database floating leaves, recreates the fixed
@@ -1055,7 +1055,14 @@ def build_database_initial_root_experiment_stage(
                 state, config=dict(config_static), runtime=fixed_runtime
             )
 
-        return payload_adapter, jax.jit(_selected_root, inline=False)
+        # Keep the outer selected-root profile un-jitted.  The reference
+        # database configuration already uses a mapped per-radius solve; an
+        # enclosing jit fuses that solve and changes its floating-point root
+        # enough to perturb the downstream bootstrap Jacobian.  Retaining
+        # this stable function identity gives the mapped root body a reusable
+        # dispatch/cache boundary, matching the accepted realtime scan stage,
+        # without changing the benchmark's numerical operation order.
+        return payload_adapter, _selected_root
 
     return DatabaseInitialRootExperimentStage(
         build_for_live_runtime=_build_for_live_runtime,
