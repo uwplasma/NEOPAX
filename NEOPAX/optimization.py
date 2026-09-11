@@ -1736,7 +1736,9 @@ def geometry_initial_er_root_only_least_squares_problem(
             ),
             active_payload_layout_factory=(
                 (lambda payload_bars: initial_root_payload_active_leaf_layout(
-                    payload_bars, support_branch_name="database"
+                    payload_bars,
+                    support_branch_name="ntx_scan_runtime",
+                    combined_support_payload=True,
                 ))
                 if mode == "database_root_experiment"
                 else initial_root_payload_active_leaf_layout

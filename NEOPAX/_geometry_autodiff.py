@@ -5394,6 +5394,7 @@ def initial_root_payload_active_leaf_layout(
     payload_bars: Sequence[Mapping[str, Any]],
     *,
     support_branch_name: str = "ntx_support",
+    combined_support_payload: bool = False,
 ) -> tuple[tuple[str, tuple[int, ...]], ...]:
     """Return the current nonzero floating-cotangent layout outside a JIT.
 
@@ -5409,9 +5410,22 @@ def initial_root_payload_active_leaf_layout(
     if not payload_bars:
         raise ValueError("Initial-Er payload layout requires at least one cotangent row.")
     layouts = []
-    for branch_name in ("geometry", str(support_branch_name)):
+    # The database recorded-scan transpose consumes its ``database`` bar and
+    # returns one coupled live-scan payload: ``{geometry, channels, surfaces}``.
+    # Its VJP must inspect that entire tree under one label, otherwise geometry
+    # would be split from the scan construction and counted twice.  Exact-Lij
+    # callers retain the established separate geometry/ntx_support layout.
+    branch_selectors = (
+        ((str(support_branch_name), lambda payload_bar: payload_bar),)
+        if combined_support_payload
+        else (
+            ("geometry", lambda payload_bar: payload_bar["geometry"]),
+            (str(support_branch_name), lambda payload_bar: payload_bar[str(support_branch_name)]),
+        )
+    )
+    for branch_name, select_branch in branch_selectors:
         try:
-            template = payload_bars[0][branch_name]
+            template = select_branch(payload_bars[0])
         except (KeyError, TypeError) as exc:
             raise ValueError(
                 f"Initial-Er payload cotangents are missing branch {branch_name!r}."
@@ -5426,7 +5440,7 @@ def initial_root_payload_active_leaf_layout(
         for leaf_i in floating_indices:
             leaf_active = False
             for payload_bar in payload_bars:
-                leaf = jax.tree_util.tree_leaves(payload_bar[branch_name])[leaf_i]
+                leaf = jax.tree_util.tree_leaves(select_branch(payload_bar))[leaf_i]
                 leaf_array = jnp.asarray(leaf)
                 finite_host = np.asarray(jax.device_get(jnp.isfinite(leaf_array)))
                 if not bool(np.all(finite_host)):
