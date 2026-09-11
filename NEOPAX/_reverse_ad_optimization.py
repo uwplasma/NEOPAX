@@ -915,6 +915,9 @@ def _database_selected_root_direct_cotangents(
     # The selected-root map is deliberately outside the direct-cotangent JIT;
     # distinguish its dispatch activity without changing either operation.
     if dispatch_cache_probe is not None:
+        # The selected-root solve is asynchronous on accelerators. This makes
+        # the test probe describe this phase rather than a later direct VJP.
+        jax.block_until_ready((er_profile, finite_mask))
         dispatch_cache_probe("after_database_selected_root")
     er_profile = jnp.asarray(er_profile, dtype=pre_root_state.Er.dtype)
     finite_mask = jnp.asarray(finite_mask, dtype=bool)
@@ -4014,6 +4017,11 @@ def evaluate_geometry_initial_er_root_only_least_squares_benchmark_tables(
                 solver_device=geometry_solver_device,
                 stage=raw_block_stage,
             )
+            if dispatch_cache_probe is not None:
+                # Diagnostic-only synchronization: attribute RSS to the VMEC
+                # solve rather than to a later asynchronous phase.
+                jax.block_until_ready(shared_raw_block_solve.state)
+            _probe("after_raw_block_solve")
             transport_result = geometry_active_initial_er_root_only_reverse_table(
                 config=config,
                 objective_names=requested_transport_objectives,

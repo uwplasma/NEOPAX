@@ -48,7 +48,7 @@ class QuietProblem:
     def __init__(self, problem, *, diagnose_database_dispatch: bool = False):
         self._problem = problem
         self._diagnose_database_dispatch = bool(diagnose_database_dispatch)
-        self.database_dispatch_points: list[tuple[str, int | None]] = []
+        self.database_dispatch_points: list[tuple[str, int | None, int | None]] = []
 
     def evaluate(self, values):
         self.database_dispatch_points = []
@@ -69,7 +69,9 @@ class QuietProblem:
                     return None
 
             def _probe(label: str) -> None:
-                self.database_dispatch_points.append((str(label), _cache_size()))
+                self.database_dispatch_points.append(
+                    (str(label), _cache_size(), opt._process_resident_memory_bytes())
+                )
 
             def _instrumented_evaluator(*args, **kwargs):
                 kwargs["dispatch_cache_probe"] = _probe
@@ -205,8 +207,9 @@ def main() -> int:
         )
         if args.diagnose_database_dispatch:
             points = " ".join(
-                f"{label}={'unavailable' if size is None else size}"
-                for label, size in quiet_problem.database_dispatch_points
+                f"{label}=cache:{'unavailable' if size is None else size},"
+                f"rss:{'unavailable' if rss is None else f'{rss / 2**20:.1f}MiB'}"
+                for label, size, rss in quiet_problem.database_dispatch_points
             )
             print(
                 "[database memory test] database_dispatch_cache "
@@ -236,8 +239,9 @@ def main() -> int:
         )
         if args.diagnose_database_dispatch:
             points = " ".join(
-                f"{label}={'unavailable' if size is None else size}"
-                for label, size in quiet_problem.database_dispatch_points
+                f"{label}=cache:{'unavailable' if size is None else size},"
+                f"rss:{'unavailable' if rss is None else f'{rss / 2**20:.1f}MiB'}"
+                for label, size, rss in quiet_problem.database_dispatch_points
             )
             print(
                 "[database memory test] database_dispatch_cache "
