@@ -1598,8 +1598,6 @@ def geometry_initial_er_root_only_least_squares_problem(
         "optimization_payload_root_scan_experiment",
         "optimization_payload_root_scan_geometry_experiment",
         "optimization_payload_reverse_experiment",
-        "database_root_experiment",
-        "database_root_experiment",
     }:
         stage_support_payload = find_ntx_support_payload(runtime)
         if not isinstance(stage_support_payload, dict):
@@ -1636,6 +1634,7 @@ def geometry_initial_er_root_only_least_squares_problem(
         "optimization_payload_root_scan_experiment",
         "optimization_payload_root_scan_geometry_experiment",
         "optimization_payload_reverse_experiment",
+        "database_root_experiment",
     }:
         if raw_block_stage is None:
             raise ValueError("optimization initial-root stage requires VMEC boundary parameters.")
