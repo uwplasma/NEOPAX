@@ -1055,14 +1055,12 @@ def build_database_initial_root_experiment_stage(
                 state, config=dict(config_static), runtime=fixed_runtime
             )
 
-        # Keep the outer selected-root profile un-jitted.  The reference
-        # database configuration already uses a mapped per-radius solve; an
-        # enclosing jit fuses that solve and changes its floating-point root
-        # enough to perturb the downstream bootstrap Jacobian.  Retaining
-        # this stable function identity gives the mapped root body a reusable
-        # dispatch/cache boundary, matching the accepted realtime scan stage,
-        # without changing the benchmark's numerical operation order.
-        return payload_adapter, _selected_root
+        # This is the first database optimization boundary.  It wraps the
+        # existing *whole-profile* selected-root operation; it does not JIT
+        # an individual-radius root or alter the recorded scan/final payload
+        # reverse owned by the benchmark route.  Geometry and database table
+        # leaves remain explicit dynamic arguments through ``payload_adapter``.
+        return payload_adapter, jax.jit(_selected_root, inline=False)
 
     return DatabaseInitialRootExperimentStage(
         build_for_live_runtime=_build_for_live_runtime,
