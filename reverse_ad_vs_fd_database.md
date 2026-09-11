@@ -488,6 +488,40 @@ terminal bootstrap objective.  The next reverse-AD audit should isolate those
 three boundary classes; it should not change the now-matching Er-coordinate
 path.
 
+## 2026-09-12 restored finite 16-step database reverse
+
+The 16-step / four-segment run after restoring fixed-table scale-cotangent
+ownership completed with every segment, recorded-scan bar, and final VMEC bar
+finite.  The profile derivatives are unchanged and retain their existing FD
+agreement.  The transport geometry derivatives returned to the earlier
+near-matching Er values, while the corrected terminal bootstrap coordinate
+bar remains active.
+
+The matching same-revision frozen-linearized FD values are those recorded in
+the preceding section.  Relative error is
+`abs(AD - FD) / max(abs(AD), abs(FD))`.
+
+| Objective | RBC reverse AD | RBC relative error | ZBS reverse AD | ZBS relative error |
+| --- | ---: | ---: | ---: | ---: |
+| `softmax_Er` | -2.768402478133e+01 | 1.644e-05 | 6.355386240655e+00 | 1.471e-04 |
+| `net_total_power_volume_average_mw_m3` | 1.264105349756e-04 | 5.443e-01 | -6.354428922984e-03 | 1.046e-02 |
+| `Er_transition_left` | -1.344576040349e+01 | 2.303e-05 | -8.668439084257e-01 | 1.369e-04 |
+| `Er_transition_right` | -1.527442997592e+01 | 4.125e-05 | -5.062231912903e-01 | 5.292e-04 |
+| `Er2_volume_average` | -2.960542023652e+02 | 9.729e-05 | -3.304912938498e+02 | 9.701e-06 |
+| `Er_volume_average` | -6.834827458946e+00 | 9.854e-05 | 1.430339257577e+01 | 9.107e-05 |
+| `electron_temperature_volume_average_keV` | -1.500766890758e-02 | 6.877e-02 | -3.895125052489e-02 | 2.599e-02 |
+| `total_pressure_volume_average` | -7.022608365525e-02 | 4.201e-02 | -2.346720852021e-01 | 1.239e-02 |
+| `alpha_power_volume_average_mw_m3` | -4.466139933500e-05 | 6.186e-01 | -6.816570577335e-03 | 1.026e-02 |
+| `bootstrap_current_softmax_abs_scaled` | -2.136081447591e+00 | 2.532e-03 | -1.213281529367e+00 | 3.633e-03 |
+
+The state-adjoint and scale-ownership corrections therefore solve the
+nonfinite regression without removing the bootstrap correction.  The Er rows
+are again within `5.3e-4`, and bootstrap is within `3.7e-3`.  Work should now
+focus only on the RBC power term and the explicit geometry terms in the
+temperature and pressure volume averages; the Radau state transpose and
+recorded-scan coordinate ownership should not be changed again for those
+remaining discrepancies.
+
 ### Geometry-dependent-source caveat
 
 The present benchmark source-model interface is state-only:

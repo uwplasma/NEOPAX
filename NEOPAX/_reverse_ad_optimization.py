@@ -1169,9 +1169,10 @@ def build_database_initial_root_experiment_stage(
             }
         )
 
-        # Match the accepted realtime-Lij stage boundary: retain one compiled
-        # radius-local root solver, while leaving the profile-level scan
-        # un-jitted.  The database benchmark's outer lax.map is untouched.
+        # Compile the entire radial scan once for this opt-in stage. Leaving
+        # the scan outside jit adds one fresh scan dispatch per evaluation;
+        # compiling individual radii instead is a different numerical
+        # boundary. The database benchmark's outer lax.map is untouched.
         try:
             stage_r_grid = np.asarray(runtime_template.geometry.r_grid_half)
             skip_axis_root = bool(
@@ -1275,14 +1276,12 @@ def build_database_initial_root_experiment_stage(
                 )
             raise ValueError(f"Ambipolarity model '{model_name}' not recognized or not implemented.")
 
-        single_radius_root = jax.jit(_single_radius_root, inline=False)
-
         def _selected_root_scan(state, geometry_leaves, database_leaves):
             radius_indices = jnp.arange(state.Er.shape[0], dtype=jnp.int32)
 
             def _scan_body(carry, radius_index):
                 state_inner, geometry_inner, database_inner = carry
-                root_row = single_radius_root(
+                root_row = _single_radius_root(
                     state_inner, radius_index, geometry_inner, database_inner
                 )
                 return carry, root_row
@@ -1296,8 +1295,7 @@ def build_database_initial_root_experiment_stage(
             finite_mask = jnp.isfinite(best_roots)
             return jnp.where(finite_mask, best_roots, state.Er), finite_mask
 
-        def _selected_root(state, geometry_leaves, database_leaves):
-            return _selected_root_scan(state, geometry_leaves, database_leaves)
+        selected_root = jax.jit(_selected_root_scan, inline=False)
 
         def _direct_cotangents(rooted_state, geometry_leaves, database_leaves):
             payload = payload_adapter.rebuild(geometry_leaves, database_leaves)
@@ -1344,16 +1342,11 @@ def build_database_initial_root_experiment_stage(
                 objective_count=len(objective_names_static),
             )
 
-        # Keep the outer selected-root profile un-jitted.  The reference
-        # database configuration already uses a mapped per-radius solve; an
-        # enclosing jit fuses that solve and changes its floating-point root
-        # enough to perturb the downstream bootstrap Jacobian.  Retaining
-        # this stable function identity gives the mapped root body a reusable
-        # dispatch/cache boundary, matching the accepted realtime scan stage,
-        # without changing the benchmark's numerical operation order.
+        # This compiled function is retained by the persistent experiment
+        # stage, so its cache key is stable across optimizer evaluations.
         return (
             payload_adapter,
-            _selected_root,
+            selected_root,
             jax.jit(_direct_cotangents, inline=False),
             jax.jit(_root_pullback, inline=False),
         )
