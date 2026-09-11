@@ -1723,7 +1723,11 @@ def geometry_initial_er_root_only_least_squares_problem(
                 n_r=int(n_r if n_r is not None else geom_cfg.get("n_radial", 51)),
                 state=state,
             ),
-            active_payload_layout_factory=initial_root_payload_active_leaf_layout,
+            active_payload_layout_factory=(
+                None
+                if mode == "database_root_experiment"
+                else initial_root_payload_active_leaf_layout
+            ),
             result_from_kernel=_stage_payload_result_from_kernel,
         )
     if mode == "vmex_like":
