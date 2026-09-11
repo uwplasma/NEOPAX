@@ -2043,12 +2043,12 @@ class ComposedEquationSystem:
         )
 
     def pullback_direct_rhs_state(self, t, state, runtime, rhs_bar):
-        """Split transpose of a direct black-box RHS with respect to state.
+        """Joint assembly transpose of a direct black-box RHS with respect to state.
 
-        This is the database counterpart of the Lij fixed-lagged state
-        boundary: equation assembly is transposed separately from the flux
-        model, and the database model owns only its local interpolation/state
-        derivative.  No lagged response is constructed or substituted.
+        Preserve the state-Jacobian contract validated by the 16-step database
+        AD--FD comparison: transpose equation assembly jointly with its shared
+        flux input, then apply the database model's compact centre-flux state
+        transpose.  No lagged response is constructed or substituted.
         """
         del t, runtime
         if self.shared_flux_model is None:
@@ -2060,48 +2060,17 @@ class ComposedEquationSystem:
             return None
         working_state, eidx = self._prepare_working_state(state)
         shared_fluxes = self.shared_flux_model(working_state)
-        has_concrete_equations = hasattr(self, "equations")
-        fixed_flux_payloads = (
-            self._capture_database_primal_fixed_flux_payloads(
-                working_state, shared_fluxes
-            )
-            if has_concrete_equations
-            else None
-        )
-        # Match the established Lij reverse contract: differentiate equation
-        # assembly at fixed fluxes and at fixed state separately.  Their sum
-        # is the complete derivative of the black-box RHS (including source,
-        # finite-volume, and temperature flux-work terms), but unlike one
-        # monolithic VJP it does not multiply cotangents through inactive
-        # constrained branches of the other variable family.
-        if fixed_flux_payloads is None:
-            direct_working_state_bar = self._pullback_shared_flux_rhs_state(
+        # Preserve the established black-box Radau state-Jacobian contract.
+        # This joint VJP is the pre-2026-09-11 implementation validated by
+        # the 16-step database AD--FD table.  Fixed-face/compact boundaries
+        # remain appropriate for table and geometry bars, but must not alter
+        # the transport state Jacobian unless a full AD--FD regression proves
+        # the replacement equivalent.
+        direct_working_state_bar, flux_bar = (
+            self._pullback_shared_flux_rhs_state_and_fluxes(
                 state, working_state, eidx, shared_fluxes, rhs_bar
             )
-            flux_bar = self.pullback_shared_fluxes(state, shared_fluxes, rhs_bar)
-            face_working_state_bar = jax.tree_util.tree_map(
-                jnp.zeros_like, working_state
-            )
-        else:
-            # Keep the exact primal face closures as constants in equation
-            # assembly.  Their independent compact state transpose is added
-            # below, alongside the existing compact centre-flux transpose.
-            direct_working_state_bar = self._pullback_database_fixed_flux_rhs_state(
-                working_state, eidx, state, rhs_bar, fixed_flux_payloads
-            )
-            (
-                flux_bar,
-                density_faces_bar,
-                temperature_faces_bar,
-            ) = self._pullback_database_fixed_flux_payloads(
-                working_state, eidx, state, rhs_bar, fixed_flux_payloads
-            )
-            face_working_state_bar = self._pullback_database_primal_face_state_bars(
-                working_state,
-                fixed_flux_payloads["center"],
-                density_faces_bar,
-                temperature_faces_bar,
-            )
+        )
         if (
             str(os.environ.get("NEOPAX_DATABASE_STATE_VJP_DIAGNOSTICS", ""))
             .strip()
@@ -2140,10 +2109,9 @@ class ComposedEquationSystem:
         if flux_working_state_bar is None:
             return None
         total_working_state_bar = jax.tree_util.tree_map(
-            lambda direct, flux, face: direct + flux + face,
+            lambda direct, flux: direct + flux,
             direct_working_state_bar,
             flux_working_state_bar,
-            face_working_state_bar,
         )
         return self._prepare_working_state_pullback(state, total_working_state_bar)
 

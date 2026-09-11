@@ -64,11 +64,31 @@ from NEOPAX._reverse_ad_transport import (
     _initial_direct_rhs_support_pullback_batched,
     _initial_lagged_response_joint_state_and_support_pullback,
     _merge_rebuild_ntx_channels_into_generic_payload_bar,
+    _normalize_support_payload_bar_leaf,
     _objective_vector_vjp_rows,
     _realized_reverse_slot_branches,
     _run_realized_reverse_slot_dispatch,
     _take_batched_pytree_row,
 )
+
+
+def test_terminal_support_normalization_preserves_differentiable_scalars():
+    """Terminal assembly keeps scalar a_b bars but zeros static scalars."""
+
+    assert jnp.allclose(
+        _normalize_support_payload_bar_leaf(
+            jnp.asarray(2.0), jnp.asarray(0.0), jnp.asarray(1.25)
+        ),
+        1.25,
+    )
+    assert jnp.allclose(
+        _normalize_support_payload_bar_leaf(
+            jnp.asarray(2, dtype=jnp.int32),
+            jnp.asarray(0.0),
+            jnp.asarray(7.0),
+        ),
+        0.0,
+    )
 
 
 @jax.tree_util.register_dataclass

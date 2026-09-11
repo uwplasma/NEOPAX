@@ -351,6 +351,33 @@ def _take_batched_pytree_row(tree, row_index: int):
     )
 
 
+def _normalize_support_payload_bar_leaf(primal_leaf, expected_leaf, bar_leaf):
+    """Normalize one support cotangent without discarding float scalars.
+
+    Tangent ownership is determined by the primal dtype, not by rank.  In
+    particular, scalar floating-point leaves such as geometry/database
+    ``a_b`` are valid differentiable inputs and must survive terminal
+    objective assembly.  Integer/static primal leaves remain zero even
+    though ``_float_delta_tree_like`` represents their placeholders with a
+    floating dtype.
+    """
+
+    primal_arr = jnp.asarray(primal_leaf)
+    expected_arr = jnp.asarray(expected_leaf)
+    bar_arr = jnp.asarray(bar_leaf)
+    if (
+        bar_arr.dtype == jax.dtypes.float0
+        or not jnp.issubdtype(primal_arr.dtype, jnp.inexact)
+    ):
+        return jnp.zeros_like(expected_arr)
+    if bar_arr.shape != expected_arr.shape:
+        raise ValueError(
+            "Support-payload cotangent shape mismatch: "
+            f"got {bar_arr.shape}, expected {expected_arr.shape}."
+        )
+    return jnp.asarray(bar_arr, dtype=expected_arr.dtype)
+
+
 def _realized_reverse_slot_branches(
     slot_active,
     slot_next_lagged_valid,
@@ -4991,7 +5018,12 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
         jax.tree_util.tree_leaves(payload_bar)
         for payload_bar in objective_payload_bar_rows
     )
+    support_primal_leaves = tuple(jax.tree_util.tree_leaves(support_payload))
     expected_support_leaf_count = len(_zero_support_leaves)
+    if len(support_primal_leaves) != expected_support_leaf_count:
+        raise ValueError(
+            "Support payload and its zero cotangent do not have matching leaves."
+        )
     normalized_objective_payload_bar_leaves = []
     for objective_i, leaves in enumerate(objective_payload_bar_leaves):
         objective_name = objective_labels[objective_i]
@@ -5008,13 +5040,16 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
                 f"{objective_name}: got {len(leaves)}, expected {expected_support_leaf_count}."
             )
         normalized_leaves = []
-        for leaf_i, (expected_leaf, leaf) in enumerate(zip(_zero_support_leaves, leaves, strict=True)):
+        for leaf_i, (primal_leaf, expected_leaf, leaf) in enumerate(
+            zip(support_primal_leaves, _zero_support_leaves, leaves, strict=True)
+        ):
             expected_arr = jnp.asarray(expected_leaf)
             leaf_arr = jnp.asarray(leaf)
-            if leaf_arr.dtype == jax.dtypes.float0 or leaf_arr.shape == ():
-                normalized_leaves.append(jnp.zeros_like(expected_arr))
-                continue
-            if leaf_arr.shape != expected_arr.shape:
+            try:
+                normalized_leaf = _normalize_support_payload_bar_leaf(
+                    primal_leaf, expected_leaf, leaf
+                )
+            except ValueError:
                 if _reverse_tree_debug_enabled():
                     print(
                         "[autodiff-gate] support-payload-bar-structure mismatch "
@@ -5027,8 +5062,8 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
                     "Objective support-payload bar leaf-shape mismatch for "
                     f"{objective_name} leaf {leaf_i}: got {leaf_arr.shape}, "
                     f"expected {expected_arr.shape}."
-                )
-            normalized_leaves.append(jnp.asarray(leaf_arr, dtype=expected_arr.dtype))
+                ) from None
+            normalized_leaves.append(normalized_leaf)
         normalized_objective_payload_bar_leaves.append(tuple(normalized_leaves))
     objective_payload_bar_leaves = tuple(normalized_objective_payload_bar_leaves)
     support_bar_leaves = tuple(
