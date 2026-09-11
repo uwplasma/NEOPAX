@@ -517,6 +517,8 @@ class GeometryInitialErRootLeastSquaresProblem:
                 )
         if self.reverse_stage_mode == "database_root_experiment":
             evaluator_kwargs["database_root_stage"] = self.database_root_stage
+            if self.payload_assembly_stage is not None:
+                evaluator_kwargs["payload_assembly_stage"] = self.payload_assembly_stage
             if self.raw_block_transpose_optimization_stage is not None:
                 evaluator_kwargs["raw_block_transpose_optimization_stage"] = (
                     self.raw_block_transpose_optimization_stage
@@ -1439,6 +1441,7 @@ def geometry_initial_er_root_only_least_squares_problem(
         "optimization_payload_root_scan_experiment",
         "optimization_payload_root_scan_geometry_experiment",
         "optimization_payload_reverse_experiment",
+        "database_root_experiment",
         "vmex_like",
     }:
         raise ValueError(
@@ -1596,6 +1599,7 @@ def geometry_initial_er_root_only_least_squares_problem(
         "optimization_payload_root_scan_experiment",
         "optimization_payload_root_scan_geometry_experiment",
         "optimization_payload_reverse_experiment",
+        "database_root_experiment",
     }:
         stage_support_payload = find_ntx_support_payload(runtime)
         if not isinstance(stage_support_payload, dict):
@@ -1667,6 +1671,9 @@ def geometry_initial_er_root_only_least_squares_problem(
                 support_component_bars_by_name={},
                 include_component_pullbacks=False,
                 combined_geometry_payload=True,
+                payload_kind=("ntx_scan_runtime" if mode == "database_root_experiment" else "ntx_exact"),
+                scan_rho=(neoclassical_cfg.get("ntx_scan_rho") if mode == "database_root_experiment" else None),
+                scan_surface_backend=str(neoclassical_cfg.get("ntx_scan_surface_backend", "vmec")),
                 n_r=int(n_r if n_r is not None else geom_cfg.get("n_radial", 51)),
                 n_theta=int(n_theta if n_theta is not None else neoclassical_cfg.get("ntx_exact_n_theta", 25)),
                 n_zeta=int(n_zeta if n_zeta is not None else neoclassical_cfg.get("ntx_exact_n_zeta", 25)),

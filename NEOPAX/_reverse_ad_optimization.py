@@ -1257,6 +1257,7 @@ def _database_geometry_active_initial_er_root_only_reverse_table(
     options: Mapping[str, object] | None,
     raw_block_solve=None,
     database_root_stage: DatabaseInitialRootExperimentStage | None = None,
+    payload_assembly_stage=None,
     dispatch_cache_probe=None,
 ) -> ObjectiveTableResult:
     """Database-native selected-root reverse with one recorded scan fold.
@@ -1416,7 +1417,18 @@ def _database_geometry_active_initial_er_root_only_reverse_table(
     geometry_param_specs = tuple(spec.as_tuple() for spec in vmec_specs)
     neoclassical_cfg = config.get("neoclassical", {})
     _probe("before_database_payload_to_vmec")
-    assembly = realtime_geometry_transport_reverse_table_from_payload_cotangents(
+    if payload_assembly_stage is not None:
+        if raw_block_solve is None:
+            raise ValueError("Database payload stage requires the shared raw VMEC solve.")
+        assembly = payload_assembly_stage.payload_to_vmec(
+            raw_block_dynamic_payload(raw_block_solve),
+            baseline_geometry_deltas,
+            values,
+            profile_matrix,
+            support_bars,
+        )
+    else:
+        assembly = realtime_geometry_transport_reverse_table_from_payload_cotangents(
         objective_labels=names,
         profile_parameter_labels=tuple(spec.label for spec in profile_specs),
         geometry_parameter_labels=tuple(spec.vmec_label for spec in vmec_specs),
@@ -1435,7 +1447,7 @@ def _database_geometry_active_initial_er_root_only_reverse_table(
         solver_device=solver_device, progress_label=progress_label,
         raw_block_solve=raw_block_solve,
         return_branch_gradients=False,
-    )
+        )
     _probe("after_database_payload_to_vmec")
     geometry_matrix = jnp.asarray(assembly.table_result.geometry_gradient_matrix)
     columns = []
@@ -2485,6 +2497,7 @@ def geometry_active_initial_er_root_only_reverse_table(
     options: Mapping[str, object] | None = None,
     dispatch_cache_probe=None,
     database_root_stage: DatabaseInitialRootExperimentStage | None = None,
+    payload_assembly_stage=None,
 ) -> ObjectiveTableResult:
     """Return compact initial-Er objective table for active realtime geometry.
 
@@ -2521,6 +2534,7 @@ def geometry_active_initial_er_root_only_reverse_table(
             options=options,
             raw_block_solve=raw_block_solve,
             database_root_stage=database_root_stage,
+            payload_assembly_stage=payload_assembly_stage,
             dispatch_cache_probe=dispatch_cache_probe,
         )
 
@@ -2848,6 +2862,7 @@ def _optimization_payload_to_vmec_table(
     n_r, n_theta, n_zeta, n_xi, surface_backend, max_iter,
     solver_device, progress_label, raw_block_solve, prepared_payload_static=None,
     prepared_active_payload_leaves=None, return_raw_matrices: bool = False,
+    payload_kind: str = "ntx_exact", scan_rho=None, scan_surface_backend: str = "vmec",
 ):
     """Optimization-only boundary around the established payload pullback."""
     return realtime_geometry_transport_reverse_table_from_payload_cotangents(
@@ -2863,6 +2878,9 @@ def _optimization_payload_to_vmec_table(
         support_component_bars_by_name=support_component_bars_by_name,
         include_component_pullbacks=include_component_pullbacks,
         combined_geometry_payload=combined_geometry_payload,
+        payload_kind=payload_kind,
+        scan_rho=scan_rho,
+        scan_surface_backend=scan_surface_backend,
         n_r=int(n_r), n_theta=int(n_theta), n_zeta=int(n_zeta), n_xi=int(n_xi),
         surface_backend=str(surface_backend), max_iter=max_iter,
         solver_device=solver_device, progress_label=progress_label,
@@ -3808,6 +3826,7 @@ def evaluate_geometry_initial_er_root_only_least_squares_benchmark_tables(
     root_options: Mapping[str, object] | None = None,
     raw_block_stage=None,
     database_root_stage: DatabaseInitialRootExperimentStage | None = None,
+    payload_assembly_stage=None,
     raw_block_transpose_optimization_stage=None,
     dispatch_cache_probe=None,
 ) -> LeastSquaresEvaluation:
@@ -3887,6 +3906,7 @@ def evaluate_geometry_initial_er_root_only_least_squares_benchmark_tables(
                 raw_block_solve=shared_raw_block_solve,
                 options=root_runner_options,
                 database_root_stage=database_root_stage,
+                payload_assembly_stage=payload_assembly_stage,
                 dispatch_cache_probe=dispatch_cache_probe,
             )
             transport_values, transport_jacobian = jax.block_until_ready(
