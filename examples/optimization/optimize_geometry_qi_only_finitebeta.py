@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-import argparse
 import json
 from pathlib import Path
 import sys
@@ -25,7 +24,6 @@ from NEOPAX import optimization as opt  # noqa: E402
 # --------------------------- parameters ------------------------------------
 SEED_INPUT = ROOT / "examples" / "inputs" / "input.QI_nfp2_initial_finitebeta"
 OUT_DIR = ROOT / "outputs" / "geometry_qi_only_finitebeta_optimization"
-DMERC_OUT_DIR = ROOT / "outputs" / "geometry_qi_only_finitebeta_dmerc_optimization"
 
 SURFACES = np.asarray(
     [1 / 51, 5 / 51, 10 / 51, 15 / 51, 20 / 51, 25 / 51, 30 / 51, 35 / 51, 40 / 51, 45 / 51, 50 / 51],
@@ -54,6 +52,11 @@ MIRROR_WEIGHT = 100.0
 # (zero margin, 1e-6 softplus smoothing, 1e-3 softmax temperature).
 DMERC_TARGET = 0.0
 DMERC_WEIGHT = 0.05
+
+# VMEX WOUT ``betatotal``: the physical volume-averaged total beta, evaluated
+# directly with the traceable VMEX eqfor formula in NEOPAX.
+BETA_TARGET = 0.05
+BETA_WEIGHT = 10.0
 
 QI_NFEV = 30
 FTOL = 1.0e-6
@@ -100,6 +103,10 @@ qi_terms = [
     (qi_maxj_1, 0.0, MAXJ_WEIGHT),
     (mirror_penalization, 0.0, MIRROR_WEIGHT),
     (opt.geometry.vmec_aspect_ratio, ASPECT_TARGET, ASPECT_WEIGHT),
+    # Uncomment to constrain VMEX WOUT total volume-averaged beta to 5%.
+    # (opt.geometry.vmec_beta_total, BETA_TARGET, BETA_WEIGHT),
+    # Uncomment to include VMEX's traceable softmax DMerc stability penalty.
+    # (opt.geometry.vmec_dmerc_stability_softmax, DMERC_TARGET, DMERC_WEIGHT),
     # (iota_shortfall, 0.0, IOTA_WEIGHT),
     (opt.geometry.vmec_iota_mean, IOTA_TARGET, IOTA_WEIGHT),
 ]
@@ -123,6 +130,7 @@ def iteration_diagnostics(evaluation):
         f"iota_mean={value('geometry:vmec_iota_mean', 'vmec_iota_mean'):.8e} "
         f"mirror_ratio={value('geometry:vmec_mirror_ratio', 'vmec_mirror_ratio', 'geometry:mirror_penalization', 'mirror_penalization'):.8e} "
         f"magnetic_well={value('geometry:vmec_magnetic_well', 'vmec_magnetic_well'):.8e} "
+        f"beta_total={value('geometry:vmec_beta_total', 'vmec_beta_total'):.8e} "
         f"qi_cost={value('geometry:boozer_qi_objective', 'boozer_qi_objective'):.8e} "
         f"maxJ_cost={value('geometry:boozer_maxj_objective', 'boozer_maxj_objective'):.8e}"
     )
@@ -336,7 +344,65 @@ def plot_boozer_b_contours(wout, out_dir, label, *, ntheta=128, nphi=128):
         print(f"wrote {png_path}")
 
 
-def write_geometry_artifacts(input_obj, label):
+def plot_active_finite_beta_objectives(eq, out_dir, label, *, include_dmerc, include_beta):
+    """Write plots for optional finite-beta terms from the solved VMEX state."""
+    if not (include_dmerc or include_beta):
+        return
+    try:
+        import matplotlib.pyplot as plt
+    except Exception as exc:
+        print(f"skipping finite-beta objective plots: {exc}")
+        return
+
+    if include_dmerc:
+        try:
+            from vmex.core import stability
+
+            s = np.asarray(eq.runtime.setup.s_full, dtype=float)
+            dmerc = np.asarray(jax.device_get(stability.d_merc_state(eq.state, eq.runtime)), dtype=float)
+            violation = np.asarray(
+                jax.device_get(stability.mercier_stability_residual(eq.state, eq.runtime)),
+                dtype=float,
+            )
+            softmax = float(
+                np.asarray(jax.device_get(stability.mercier_stability_softmax(eq.state, eq.runtime)))
+            )
+            fig, (ax_dmerc, ax_violation) = plt.subplots(2, 1, figsize=(7, 6), sharex=True)
+            ax_dmerc.plot(s, dmerc, linewidth=1.8, label="DMerc")
+            ax_dmerc.axhline(DMERC_TARGET, color="black", linestyle="--", linewidth=1.0, label="target")
+            ax_dmerc.set_ylabel("DMerc")
+            ax_dmerc.grid(True, alpha=0.3)
+            ax_dmerc.legend(loc="best")
+            ax_violation.plot(s[2:-1], violation, linewidth=1.8, color="tab:red")
+            ax_violation.set_xlabel("normalized toroidal flux $s$")
+            ax_violation.set_ylabel("smooth violation")
+            ax_violation.set_title(f"softmax DMerc = {softmax:.8e}")
+            ax_violation.grid(True, alpha=0.3)
+            fig.tight_layout()
+            path = out_dir / f"softmax_dmerc_{label}.png"
+            fig.savefig(path, dpi=180, bbox_inches="tight")
+            plt.close(fig)
+            print(f"wrote {path}")
+        except Exception as exc:
+            print(f"skipping softmax-DMerc plot: {exc}")
+
+    if include_beta:
+        beta_total = float(np.asarray(eq.wout.betatotal, dtype=float))
+        fig, ax = plt.subplots(figsize=(5.5, 4.0))
+        bars = ax.bar(("VMEX total beta", "target"), (beta_total, BETA_TARGET), color=("tab:blue", "tab:orange"))
+        ax.set_ylabel("volume-averaged total beta")
+        ax.set_title(f"VMEX betatotal ({label})")
+        ax.grid(axis="y", alpha=0.3)
+        for bar, value in zip(bars, (beta_total, BETA_TARGET)):
+            ax.text(bar.get_x() + bar.get_width() / 2.0, value, f"{value:.6g}", ha="center", va="bottom")
+        fig.tight_layout()
+        path = out_dir / f"beta_total_{label}.png"
+        fig.savefig(path, dpi=180, bbox_inches="tight")
+        plt.close(fig)
+        print(f"wrote {path}")
+
+
+def write_geometry_artifacts(input_obj, label, *, include_dmerc=False, include_beta=False):
     artifact_dir = OUT_DIR / label
     artifact_dir.mkdir(parents=True, exist_ok=True)
     input_path = artifact_dir / f"input.QI_neopax_geometry_{label}"
@@ -356,9 +422,16 @@ def write_geometry_artifacts(input_obj, label):
         plot_boozer_b_contours(eq.wout, artifact_dir, label)
     if MAKE_J_POLAR_PLOTS:
         plot_j_polar_contours(eq, artifact_dir)
+    plot_active_finite_beta_objectives(
+        eq,
+        artifact_dir,
+        label,
+        include_dmerc=include_dmerc,
+        include_beta=include_beta,
+    )
 
 
-def write_outputs(optimized_input, initial_input):
+def write_outputs(optimized_input, initial_input, *, include_dmerc=False, include_beta=False):
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     seed_copy = OUT_DIR / SEED_INPUT.name
     optimized_input_path = OUT_DIR / "input.QI_neopax_geometry_optimized"
@@ -367,36 +440,27 @@ def write_outputs(optimized_input, initial_input):
     print(f"wrote {seed_copy}")
     print(f"wrote {optimized_input_path}")
     if MAKE_INITIAL_PLOTS:
-        write_geometry_artifacts(initial_input, "initial")
-    write_geometry_artifacts(optimized_input, "optimized")
+        write_geometry_artifacts(
+            initial_input,
+            "initial",
+            include_dmerc=include_dmerc,
+            include_beta=include_beta,
+        )
+    write_geometry_artifacts(
+        optimized_input,
+        "optimized",
+        include_dmerc=include_dmerc,
+        include_beta=include_beta,
+    )
 
 
 # --------------------------- continuation ladder ----------------------------
 def main() -> int:
-    global OUT_DIR
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument(
-        "--include-dmerc",
-        action="store_true",
-        help="Add VMEX's traceable softmax DMerc stability penalty.",
-    )
-    parser.add_argument(
-        "--dmerc-weight",
-        type=float,
-        default=DMERC_WEIGHT,
-        help=f"Least-squares weight used with --include-dmerc (default: {DMERC_WEIGHT:g}).",
-    )
-    args = parser.parse_args()
-    if args.dmerc_weight < 0.0:
-        raise ValueError("--dmerc-weight must be non-negative.")
-
     active_terms = [term for term in qi_terms if float(term[2]) != 0.0]
-    if args.include_dmerc and args.dmerc_weight != 0.0:
-        active_terms.append(
-            (opt.geometry.vmec_dmerc_stability_softmax, DMERC_TARGET, float(args.dmerc_weight))
-        )
-        OUT_DIR = DMERC_OUT_DIR
     active_terms = tuple(active_terms)
+    active_objective_labels = {str(term[0].label) for term in active_terms}
+    include_dmerc = "vmec_dmerc_stability_softmax" in active_objective_labels
+    include_beta = "vmec_beta_total" in active_objective_labels
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     x = None
     current_input = SEED_INPUT
@@ -465,7 +529,12 @@ def main() -> int:
     summary_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
     print(f"wrote {summary_path}")
     if optimized_input is not None and initial_input is not None:
-        write_outputs(optimized_input, initial_input)
+        write_outputs(
+            optimized_input,
+            initial_input,
+            include_dmerc=include_dmerc,
+            include_beta=include_beta,
+        )
     return 0
 
 

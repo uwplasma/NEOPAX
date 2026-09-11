@@ -39,7 +39,7 @@ OBJECTIVE_ALIASES = {
     "mean_iota": "vmec_iota_mean",
     "magnetic_well": "vmec_magnetic_well",
     "mirror_ratio": "vmec_mirror_ratio",
-    "beta_volume": "vmec_beta_volume",
+    "beta_volume": "vmec_beta_total",
     "iota_b_mean": "boozer_iota_b_mean",
     "b00_mean": "boozer_b00_mean",
     "buco_b_mean": "boozer_buco_b_mean",

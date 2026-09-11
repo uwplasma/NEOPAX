@@ -252,8 +252,12 @@ GEOMETRY_FULL_AD_OBJECTIVE_ALIASES: Mapping[str, str] = {
     "mirror": "vmec_mirror_ratio",
     "mirror_ratio": "vmec_mirror_ratio",
     "vmec_mirror_ratio": "vmec_mirror_ratio",
-    "beta_volume": "vmec_beta_volume",
-    "vmec_beta_volume": "vmec_beta_volume",
+    "beta_total": "vmec_beta_total",
+    "vmec_beta_total": "vmec_beta_total",
+    # Backwards-compatible aliases for the former placeholder name.  The
+    # canonical objective is now VMEX's physical WOUT ``betatotal``.
+    "beta_volume": "vmec_beta_total",
+    "vmec_beta_volume": "vmec_beta_total",
     "boozer_iota_b_mean": "boozer_iota_b_mean",
     "boozer_b00_mean": "boozer_b00_mean",
     "boozer_buco_b_mean": "boozer_buco_b_mean",

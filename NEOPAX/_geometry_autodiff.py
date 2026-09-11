@@ -2050,11 +2050,80 @@ def _vmec_scalar_observables_from_state(
     }
 
 
+def _vmec_beta_total_from_state(
+    context: GeometryAutodiffContext,
+    state,
+) -> jnp.ndarray:
+    """VMEX ``wout.betatotal`` evaluated directly from the traced state.
+
+    This is the JAX equivalent of VMEX ``eqfor_beta_scalars(...)[2]``.  It
+    deliberately uses the same half-mesh fields and angular quadrature as
+    WOUT, rather than a profile average or a surrogate pressure metric.
+    """
+    rt = context.static.runtime
+    setup = rt.setup
+    solver_module = _import_vmec_module("core.solver")
+    geometry_module = _import_vmec_module("core.geometry")
+    fields_module = _import_vmec_module("core.fields")
+
+    s_full = jnp.asarray(setup.s_full)
+    _, geometry = solver_module._geometry(state, rt)
+    jacobian = geometry_module.half_mesh_jacobian(geometry, s=s_full)
+    metrics = fields_module.metric_elements(geometry, s=s_full)
+    fields = fields_module.magnetic_fields(
+        geometry=geometry,
+        jacobian=jacobian,
+        metrics=metrics,
+        trig=rt.trig,
+        s=s_full,
+        phips=setup.phips,
+        phipf=setup.phipf,
+        chips=setup.chips,
+        signgs=setup.signgs,
+        gamma=rt.gamma,
+        mass=setup.mass,
+        ncurr=setup.ncurr,
+        enclosed_current=setup.icurv,
+    )
+    norms = fields_module.energies_and_force_norms(
+        jacobian=jacobian,
+        metrics=metrics,
+        fields=fields,
+        trig=rt.trig,
+        s=s_full,
+        signgs=setup.signgs,
+    )
+
+    ns = int(s_full.shape[0])
+    dtype = jnp.asarray(fields.pressure).dtype
+    if ns < 3:
+        return jnp.asarray(0.0, dtype=dtype)
+    hs = jnp.asarray(1.0 / float(ns - 1), dtype=dtype)
+    vnorm = jnp.asarray((2.0 * np.pi) ** 2, dtype=dtype) * hs
+    tau = (
+        jnp.asarray(float(setup.signgs), dtype=dtype)
+        * jnp.asarray(rt.trig.wint, dtype=dtype)[None, :, :]
+        * jnp.asarray(jacobian.sqrt_g, dtype=dtype)
+    )
+    pressure = jnp.asarray(fields.pressure, dtype=dtype)
+    vp = jnp.asarray(norms.vp, dtype=dtype)
+    total_pressure = jnp.asarray(fields.total_pressure, dtype=dtype)
+    pressure_integral = vnorm * jnp.sum(vp[1:] * pressure[1:])
+    magnetic_integral = 2.0 * (
+        vnorm * jnp.sum(total_pressure[1:] * tau[1:]) - pressure_integral
+    )
+    return jnp.where(
+        magnetic_integral != 0.0,
+        2.0 * pressure_integral / magnetic_integral,
+        jnp.asarray(0.0, dtype=dtype),
+    ).reshape(())
+
+
 def _vmec_core_scalar_objectives_from_state(
     context: GeometryAutodiffContext,
     state,
 ) -> dict[str, jnp.ndarray]:
-    """Current vmec_jax traceable scalar objectives used by the AD geometry gate."""
+    """Current VMEX-traceable scalar objectives used by the AD geometry gate."""
 
     optimization = _import_vmec_jax_optimization()
     rt = context.static.runtime
@@ -2069,21 +2138,13 @@ def _vmec_core_scalar_objectives_from_state(
         else optimization.mirror_ratio(state, rt)
     )
 
-    # This input family is vacuum/no-pressure, so beta is expected to be zero.
-    # Keep the objective traceable and explicit without pretending to test a
-    # finite-beta path that the case does not exercise.
-    pressure = jnp.asarray(context.pressure, dtype=jnp.float64)
-    beta_volume = jnp.asarray(0.0, dtype=jnp.float64)
-    if int(pressure.size) > 0:
-        beta_volume = jnp.asarray(jnp.mean(jnp.abs(pressure)) * 0.0, dtype=jnp.float64)
-
     return {
         "aspect_ratio": jnp.asarray(optimization.aspect_ratio(state, rt), dtype=jnp.float64),
         "volume_total": jnp.asarray(optimization.volume(state, rt), dtype=jnp.float64),
         "iota_mean": jnp.asarray(optimization.mean_iota(state, rt), dtype=jnp.float64),
         "magnetic_well": jnp.asarray(optimization.magnetic_well(state, rt), dtype=jnp.float64),
         "mirror_ratio": jnp.asarray(mirror_ratio, dtype=jnp.float64),
-        "beta_volume": beta_volume,
+        "beta_total": _vmec_beta_total_from_state(context, state),
     }
 
 
@@ -2798,7 +2859,7 @@ def _observable_names_for_kind(observable_kind: str) -> list[str]:
             "iota_mean",
             "magnetic_well",
             "mirror_ratio",
-            "beta_volume",
+            "beta_total",
         ]
     if kind == "geometry_full_ad_objectives":
         return [
@@ -2807,7 +2868,7 @@ def _observable_names_for_kind(observable_kind: str) -> list[str]:
             "vmec_iota_mean",
             "vmec_magnetic_well",
             "vmec_mirror_ratio",
-            "vmec_beta_volume",
+            "vmec_beta_total",
             "boozer_iota_b_mean",
             "boozer_b00_mean",
             "boozer_buco_b_mean",
@@ -3705,7 +3766,7 @@ def geometry_full_ad_objective_table_pullback_from_param_vector(
         "iota_mean",
         "magnetic_well",
         "mirror_ratio",
-        "beta_volume",
+        "beta_total",
     )
     vmec_indices = tuple(names.index(f"vmec_{name}") for name in vmec_names)
 
