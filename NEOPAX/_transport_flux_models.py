@@ -3431,18 +3431,6 @@ class NTXDatabaseTransportModel(TransportFluxModelBase):
             database,
             **kwargs,
         )
-        if isinstance(database, Monoenergetic):
-            # The paired physical-geometry boundary evaluates the face map
-            # on the co-moving (r/a_b fixed) manifold and therefore already
-            # owns the a_b directional derivative.  Retaining this raw
-            # coordinate a_b bar would differentiate the same scale a second
-            # time through the recorded scan, and at endpoint queries can
-            # expose the clipped interpolation derivative.  Er_list remains
-            # scan-owned and is deliberately retained here.
-            coordinate_bar = dataclasses.replace(
-                coordinate_bar,
-                a_b=jnp.zeros_like(jnp.asarray(coordinate_bar.a_b)),
-            )
         database_bar = jax.tree_util.tree_map(
             lambda coefficient_bar, coordinate_leaf: (
                 jnp.asarray(coefficient_bar) + jnp.asarray(coordinate_leaf)
@@ -3706,21 +3694,11 @@ class NTXDatabaseTransportModel(TransportFluxModelBase):
 
             def _all_fixed_table_face_fluxes(a_b_value):
                 geometry_value = _geometry_at_physical_scale(a_b_value)
-                # A face stays on its primal normalized-radius table query
-                # while the physical mesh is varied.  Move the table's scale
-                # with the mesh here; otherwise ``r_grid_half`` moves against
-                # a fixed ``database.a_b`` and differentiates the clipped
-                # endpoint interpolation coordinate.  That split has an
-                # undefined one-sided derivative at the axis/outer face.
-                # The explicit table transpose still owns D11/D13/D33 and
-                # the remaining scan coordinates.
-                database_value = (
-                    database_with_geometry_scale(self.database, a_b_value)
-                    if isinstance(self.database, Monoenergetic)
-                    else self.database
-                )
+                # This is the physical-mesh partial derivative.  Keep the
+                # runtime table, including its a_b query coordinate, fixed;
+                # the recorded scan transpose owns that sibling derivative.
                 model = dataclasses.replace(
-                    self, geometry=geometry_value, database=database_value
+                    self, geometry=geometry_value, database=self.database
                 )
                 local_face_state = (
                     build_ntss_like_face_transport_state(
@@ -4276,15 +4254,6 @@ class NTXDatabaseTransportModel(TransportFluxModelBase):
             {"Gamma": _bar("Gamma"), "Q": _bar("Q"), "Upar": _bar("Upar")},
             database,
         )
-        if isinstance(database, Monoenergetic):
-            # The paired physical-geometry boundary evaluates the centre map
-            # with the database scale co-moving with the physical mesh.  It
-            # therefore owns the a_b derivative.  Only the remaining query
-            # coordinate (Er_list) may cross the recorded scan here.
-            coordinate_bar = dataclasses.replace(
-                coordinate_bar,
-                a_b=jnp.zeros_like(jnp.asarray(coordinate_bar.a_b)),
-            )
         database_bar = jax.tree_util.tree_map(
             lambda coefficient_bar, coordinate_leaf: (
                 jnp.asarray(coefficient_bar) + jnp.asarray(coordinate_leaf)
@@ -4353,18 +4322,15 @@ class NTXDatabaseTransportModel(TransportFluxModelBase):
                     geometry,
                     _split(flat_delta),
                 )
-                # Keep the physical mesh and the database's length scale on
-                # the same r/a_b manifold.  Holding a scan-built table scale
-                # fixed while r_grid moves creates the clipped endpoint
-                # interpolation tangent responsible for the prior nonfinite
-                # a_b cotangent.  The table coefficient and Er-list bars are
-                # still owned by the separate recorded-scan boundary.
+                # The recorded scan owns the runtime Monoenergetic table and
+                # its query-coordinate derivatives.  This sibling boundary
+                # differentiates only the physical mesh, so that table must
+                # remain fixed here.  Legacy preprocessed databases retain
+                # their established local scale convention.
                 database_value = self.database
-                if isinstance(database_value, Monoenergetic):
-                    database_value = database_with_geometry_scale(
-                        database_value, geometry_value.a_b
-                    )
-                elif database_value is not None:
+                if database_value is not None and not isinstance(
+                    database_value, Monoenergetic
+                ):
                     database_value = database_with_geometry_scale(
                         database_value, geometry_value.a_b
                     )

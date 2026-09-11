@@ -540,9 +540,8 @@ def test_database_direct_rhs_support_adds_scan_coordinate_bars(monkeypatch):
         state, bars, {"geometry": jnp.asarray(1.0), "database": database}
     )["database"]
 
-    # Physical centre geometry owns the co-moving a_b tangent.  The table
-    # boundary keeps only the independent scan coordinate.
-    assert jnp.allclose(actual.a_b, 0.0)
+    # The recorded scan owns all table-coordinate bars, including a_b.
+    assert jnp.allclose(actual.a_b, expected.a_b)
     assert jnp.allclose(actual.Er_list, expected.Er_list)
     assert jnp.allclose(actual.D11_log, 0.0)
 
@@ -777,9 +776,8 @@ def test_database_direct_face_support_adds_scan_coordinate_bars(monkeypatch):
         {"geometry": jnp.asarray(1.0), "database": database},
     )["database"]
 
-    # The paired co-moving physical face boundary owns the a_b tangent;
-    # table support retains only scan-owned non-scale coordinates.
-    assert jnp.allclose(actual.a_b, 0.0)
+    # The recorded scan owns all table-coordinate bars, including a_b.
+    assert jnp.allclose(actual.a_b, coordinate.a_b)
     assert jnp.allclose(actual.Er_list, coordinate.Er_list)
     assert jnp.allclose(actual.D11_log, 0.0)
 
@@ -1345,8 +1343,8 @@ def test_database_native_face_geometry_uses_one_physical_mesh_jvp():
     assert jnp.array_equal(actual.r_grid_half, jnp.zeros_like(geometry.r_grid_half))
 
 
-def test_database_native_face_geometry_comoves_monoenergetic_scale():
-    """Fixed-table face geometry holds the normalized query radius fixed."""
+def test_database_native_face_geometry_holds_monoenergetic_scale_fixed():
+    """Physical face geometry does not absorb the scan-owned scale tangent."""
     geometry = _PhysicalMeshGeometry(
         a_b=jnp.asarray(2.0),
         rho_grid=jnp.asarray([0.25, 0.75]),
@@ -1367,8 +1365,7 @@ def test_database_native_face_geometry_comoves_monoenergetic_scale():
 
     class _QueryRadiusFaceModel(NTXDatabaseTransportModel):
         def evaluate_face_fluxes(self, _state, _face_state, **_kwargs):
-            # This represents a fixed table queried at r/a_b.  It must not
-            # acquire a physical-scale tangent merely because the mesh moves.
+            # The physical mesh moves here while the scan-owned table is fixed.
             query_rho = self.geometry.r_grid_half / self.database.a_b
             return {
                 "Gamma": query_rho[None, :],
@@ -1390,11 +1387,11 @@ def test_database_native_face_geometry_comoves_monoenergetic_scale():
         geometry,
     )
     assert jnp.all(jnp.isfinite(actual.a_b))
-    assert jnp.allclose(actual.a_b, 0.0)
+    assert jnp.allclose(actual.a_b, 1.25)
 
 
-def test_database_native_centre_geometry_comoves_monoenergetic_scale():
-    """Fixed-table centre geometry holds the normalized query radius fixed."""
+def test_database_native_centre_geometry_holds_monoenergetic_scale_fixed():
+    """Physical centre geometry does not absorb the scan-owned scale tangent."""
     geometry = _PhysicalMeshGeometry(
         a_b=jnp.asarray(2.0),
         rho_grid=jnp.asarray([0.25, 0.75]),
@@ -1436,7 +1433,7 @@ def test_database_native_centre_geometry_comoves_monoenergetic_scale():
         geometry,
     )
     assert jnp.all(jnp.isfinite(actual.a_b))
-    assert jnp.allclose(actual.a_b, 0.0)
+    assert jnp.allclose(actual.a_b, -0.875)
 
 
 def test_database_equation_payload_uses_full_geometry_tangent_like_lij():
