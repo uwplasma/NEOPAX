@@ -2008,11 +2008,16 @@ class ComposedEquationSystem:
             return None
         working_state, eidx = self._prepare_working_state(state)
         shared_fluxes = self.shared_flux_model(working_state)
-        direct_working_state_bar, flux_bar = (
-            self._pullback_shared_flux_rhs_state_and_fluxes(
-                state, working_state, eidx, shared_fluxes, rhs_bar
-            )
+        # Match the established Lij reverse contract: differentiate equation
+        # assembly at fixed fluxes and at fixed state separately.  Their sum
+        # is the complete derivative of the black-box RHS (including source,
+        # finite-volume, and temperature flux-work terms), but unlike one
+        # monolithic VJP it does not multiply cotangents through inactive
+        # constrained branches of the other variable family.
+        direct_working_state_bar = self._pullback_shared_flux_rhs_state(
+            state, working_state, eidx, shared_fluxes, rhs_bar
         )
+        flux_bar = self.pullback_shared_fluxes(state, shared_fluxes, rhs_bar)
         if (
             str(os.environ.get("NEOPAX_DATABASE_STATE_VJP_DIAGNOSTICS", ""))
             .strip()
