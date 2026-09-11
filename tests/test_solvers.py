@@ -2798,8 +2798,8 @@ def test_database_plain_block_stage_input_pullback_uses_complete_direct_state_bo
     assert len(calls) == 1
 
 
-def test_database_plain_block_matrix_uses_complete_direct_state_boundary():
-    """Plain database block must materialize the carry-transpose Jacobian."""
+def test_database_plain_block_matrix_keeps_finite_forward_jacobian_contract():
+    """Plain database block keeps the established forward-mode matrix."""
     dtype = jnp.float64
     kernel_context = types.SimpleNamespace(
         dtype=dtype,
@@ -2833,9 +2833,13 @@ def test_database_plain_block_matrix_uses_complete_direct_state_boundary():
     actual = transport_solvers._radau_exact_stage_residual_matrix(
         kernel_context, physics_context, carry, primal, None
     )
-    expected = jnp.eye(2, dtype=dtype) - primal.trial_dt * direct_jacobian
+    generic_jacobian = -4.0 * jnp.eye(2, dtype=dtype)
+    expected = jnp.eye(2, dtype=dtype) - primal.trial_dt * generic_jacobian
     assert jnp.allclose(actual, expected, rtol=1.0e-12, atol=1.0e-12)
-    assert len(calls) == 1
+    # Applying the reverse VJP to a full output basis can form 0 * inf in the
+    # real database interpolation graph.  It remains opt-in through
+    # ``block_explicit_database_jacobian`` and must not run for plain block.
+    assert calls == []
 
 
 def test_batched_database_stage_table_pullback_accepts_flattened_radau_rows():
