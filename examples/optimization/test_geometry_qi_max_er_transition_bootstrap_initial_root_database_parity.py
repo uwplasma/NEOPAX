@@ -98,10 +98,21 @@ def _print_root_diagnostic(reference: dict[str, np.ndarray], trial: dict[str, np
     mask_mismatch = int(np.count_nonzero(reference["finite_mask"] != trial["finite_mask"]))
     print(f"[database root diagnostic] finite_mask_mismatches={mask_mismatch}", flush=True)
     for name in ("er_profile", "dres_der", "implicit_er_bars"):
-        delta = np.asarray(trial[name] - reference[name], dtype=float)
+        reference_values = np.asarray(reference[name], dtype=float)
+        trial_values = np.asarray(trial[name], dtype=float)
+        delta = np.asarray(trial_values - reference_values, dtype=float)
+        absolute_delta = np.abs(delta)
+        flat_index = int(np.nanargmax(absolute_delta))
+        index = tuple(int(i) for i in np.unravel_index(flat_index, absolute_delta.shape))
+        reference_value = float(reference_values[index])
+        trial_value = float(trial_values[index])
+        relative_at_max_abs = abs(trial_value - reference_value) / max(
+            abs(reference_value), 1.0e-300
+        )
         print(
-            f"[database root diagnostic] {name}_max_abs="
-            f"{np.max(np.abs(delta)):.16e}",
+            f"[database root diagnostic] {name}_max_abs={absolute_delta[index]:.16e} "
+            f"relative_at_max_abs={relative_at_max_abs:.16e} index={index} "
+            f"reference={reference_value:.16e} trial={trial_value:.16e}",
             flush=True,
         )
 
