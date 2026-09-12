@@ -5787,13 +5787,15 @@ def main() -> None:
     )
     parser.add_argument(
         "--reverse-final-objective-cotangent-mode",
-        choices=("scalar", "grouped_vjp"),
+        choices=("scalar", "grouped_vjp", "grouped_joint_vjp"),
         default="scalar",
         help=(
             "Terminal objective-cotangent construction for the segmented realtime "
             "geometry reverse path. 'scalar' preserves the per-objective VJPs. "
             "'grouped_vjp' groups all non-bootstrap objectives into one final-state "
-            "VJP and one explicit-geometry VJP; bootstrap keeps its compact rule."
+            "VJP and one explicit-geometry VJP; 'grouped_joint_vjp' is an opt-in "
+            "database mode that obtains those exact two partials from one shared "
+            "objective trace. Bootstrap keeps its compact rule."
         ),
     )
     parser.add_argument(
@@ -5998,6 +6000,7 @@ def main() -> None:
             "structured",
             "bicgstab",
             "block",
+            "block_database_multi_rhs",
             "block_colored_ntss_midpoint",
             "block_colored_database",
             "block_colored_database_dense",
@@ -6015,6 +6018,8 @@ def main() -> None:
             "transformed LU transpose approximation and is the lightweight reference; "
             "'bicgstab' is the lower-memory exact iterative candidate; 'block' and "
             "'gmres' are correctness oracles but are memory/compile heavy; "
+            "'block_database_multi_rhs' is an isolated database mode using the "
+            "same generic exact block matrix with explicit RHS columns (not a proven speedup); "
             "'block_colored_ntss_midpoint' is an isolated exact candidate for the "
             "NTSS-midpoint model: it reconstructs the dense block transpose from "
             "colored local actions plus the analytic rank-three correction, then "
@@ -6632,6 +6637,24 @@ def main() -> None:
             "solve produced nonfinite cotangents. Use "
             "--reverse-stage-adjoint-solve-mode block, which is the "
             "established exact Radau block solve."
+        )
+    if (
+        str(args.reverse_stage_adjoint_solve_mode).strip().lower()
+        == "block_database_multi_rhs"
+        and not is_database_geometry_reverse
+    ):
+        raise SystemExit(
+            "[autodiff-gate] block_database_multi_rhs is isolated to the "
+            "black-box database geometry benchmark. Use block for other paths."
+        )
+    if (
+        str(args.reverse_final_objective_cotangent_mode).strip().lower()
+        == "grouped_joint_vjp"
+        and not is_database_geometry_reverse
+    ):
+        raise SystemExit(
+            "[autodiff-gate] grouped_joint_vjp is an isolated database geometry "
+            "terminal-objective mode. Use grouped_vjp for other reverse paths."
         )
     if (
         str(args.reverse_rhs_transpose_mode) == "explicit_ntx_interpolated"

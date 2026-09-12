@@ -2646,6 +2646,140 @@ def test_colored_database_stage_matrix_recovers_exact_tridiagonal_transpose(monk
     assert jnp.allclose(compact, dense, rtol=1.0e-12, atol=1.0e-12)
 
 
+def test_database_block_multi_rhs_matches_independent_exact_block_solves(monkeypatch):
+    """Explicit RHS columns preserve the exact block solution."""
+
+    dtype = jnp.float64
+    matrix = jnp.asarray(
+        [
+            [2.0, -0.1, 0.3, 0.0],
+            [0.2, 1.7, -0.4, 0.1],
+            [0.0, 0.5, 1.9, -0.2],
+            [-0.3, 0.0, 0.4, 1.6],
+        ],
+        dtype=dtype,
+    )
+    kernel_context = types.SimpleNamespace(num_stages=2, state_dim=2, dtype=dtype)
+    matrix_calls = []
+
+    def _matrix(*_args):
+        matrix_calls.append(True)
+        return matrix
+
+    monkeypatch.setattr(
+        transport_solvers,
+        "_radau_exact_stage_residual_matrix",
+        _matrix,
+    )
+    rhs_rows = jnp.asarray(
+        [[0.3, -0.2, 0.7, 0.1], [-0.1, 0.5, 0.2, -0.4], [0.6, 0.1, -0.3, 0.8]],
+        dtype=dtype,
+    )
+    actual = (
+        transport_solvers._radau_solve_exact_stage_residual_transpose_block_multi_rhs(
+            kernel_context,
+            object(),
+            object(),
+            object(),
+            None,
+            rhs=rhs_rows,
+        )
+    )
+    expected = jnp.stack(
+        tuple(jnp.linalg.solve(matrix.T, -rhs_row) for rhs_row in rhs_rows)
+    )
+    assert len(matrix_calls) == 1
+    assert jnp.allclose(actual, expected, rtol=1.0e-12, atol=1.0e-12)
+    matrix_calls.clear()
+    dispatched = transport_solvers._radau_solve_exact_stage_residual_transpose_batched(
+        kernel_context,
+        types.SimpleNamespace(
+            reverse_stage_adjoint_solve_mode="block_database_multi_rhs",
+            reverse_stage_cotangent_mode="full",
+            reverse_segment_input_diagnostics=False,
+        ),
+        object(),
+        object(),
+        None,
+        rhs=rhs_rows,
+    )
+    assert len(matrix_calls) == 1
+    assert jnp.allclose(dispatched, expected, rtol=1.0e-12, atol=1.0e-12)
+
+
+@pytest.mark.parametrize("solve_mode", ["block", "block_database_multi_rhs"])
+def test_database_exact_block_solve_and_carry_pullback_match_residual_vjp(solve_mode):
+    """The selected solve and carry transpose share the full finite Jacobian.
+
+    Exercise the real matrix builder, batched solve dispatch and subsequent
+    input pullback together under JIT.  A coupled nonlinear RHS gives distinct
+    Jacobians at each stage; the compact state hook must never be entered.
+    """
+    dtype = jnp.float64
+    kernel = types.SimpleNamespace(
+        dtype=dtype, num_stages=3, state_dim=3,
+        a=jnp.asarray([
+            [0.1968154772, -0.0655354259, 0.0237709743],
+            [0.3944243147, 0.2920734117, -0.0415487521],
+            [0.3764030627, 0.5124858262, 1.0 / 9.0],
+        ], dtype=dtype),
+        c=jnp.asarray([0.1550510257, 0.6449489743, 1.0], dtype=dtype),
+    )
+    coupling = jnp.asarray([
+        [0.8, -0.2, 0.5], [0.5, 1.3, -0.4], [-0.3, 0.7, -0.6],
+    ], dtype=dtype)
+
+    def _rhs(t, y):
+        return coupling @ y + 0.2 * jnp.sin(y) + t * jnp.sum(y) ** 2
+
+    def _forbidden_compact_hook(*_args):
+        raise AssertionError("Exact block layouts must not enter the compact state VJP")
+
+    physics = types.SimpleNamespace(
+        reverse_rhs_transpose_mode="explicit_database",
+        reverse_stage_adjoint_solve_mode=solve_mode,
+        reverse_stage_cotangent_mode="full",
+        flat_rhs_direct_black_box_state_pullback=_forbidden_compact_hook,
+        flat_rhs=_rhs, flat_rhs_with_lagged_response=None,
+    )
+    t = jnp.asarray(0.1, dtype=dtype)
+    y = jnp.asarray([0.7, 1.1, -0.4], dtype=dtype)
+    h = jnp.asarray(0.07, dtype=dtype)
+    z = jnp.arange(9, dtype=dtype) / 13.0 - 0.2
+    rows = jnp.stack((jnp.sin(z), jnp.cos(z), jnp.zeros_like(z)))
+
+    def _residual(stage_values, input_y):
+        stages = stage_values.reshape((3, 3))
+        states = input_y[None, :] + h * (kernel.a @ stages)
+        return (stages - jax.vmap(_rhs)(t + kernel.c * h, states)).reshape((-1,))
+
+    matrix = jax.jacfwd(_residual, argnums=0)(z, y)
+    expected_stage_bars = jnp.linalg.solve(matrix.T, -rows.T).T
+    _, residual_input_vjp = jax.vjp(lambda input_y: _residual(z, input_y), y)
+    expected_y_bars = jax.vmap(lambda bar: residual_input_vjp(bar)[0])(expected_stage_bars)
+
+    @jax.jit
+    def _selected_pullback(input_y, step_size, stage_values, objective_rows):
+        carry = types.SimpleNamespace(t=t, y=input_y)
+        primal = types.SimpleNamespace(trial_dt=step_size, stage_history=stage_values)
+        stage_bars = transport_solvers._radau_solve_exact_stage_residual_transpose_batched(
+            kernel, physics, carry, primal, None, rhs=objective_rows,
+        )
+        y_bars = jax.vmap(
+            lambda bar: transport_solvers._radau_exact_stage_residual_input_pullback(
+                kernel, physics, carry, primal, None, bar, compute_dt_bar=False,
+            )[0]
+        )(stage_bars)
+        return stage_bars, y_bars
+
+    stage_bars, y_bars = _selected_pullback(y, h, z, rows)
+    assert jnp.all(jnp.isfinite(stage_bars))
+    assert jnp.all(jnp.isfinite(y_bars))
+    assert jnp.allclose(stage_bars, expected_stage_bars, rtol=1.0e-12, atol=1.0e-12)
+    assert jnp.allclose(y_bars, expected_y_bars, rtol=1.0e-12, atol=1.0e-12)
+    assert jnp.allclose(stage_bars @ matrix, -rows, rtol=1.0e-12, atol=1.0e-12)
+
+
 def test_colored_database_stage_matrix_restores_ntss_midpoint_low_rank(monkeypatch):
     """Database coloring preserves the nonlocal NTSS midpoint coefficient term."""
 
@@ -2972,8 +3106,9 @@ def test_database_stage_input_pullback_uses_same_direct_state_boundary_as_matrix
     assert len(calls) == 1
 
 
-def test_database_plain_block_stage_input_pullback_keeps_finite_forward_jacobian_contract():
-    """Plain database block uses its finite forward Jacobian for carry bars."""
+@pytest.mark.parametrize("solve_mode", ["block", "block_database_multi_rhs"])
+def test_database_plain_block_stage_input_pullback_keeps_finite_forward_jacobian_contract(solve_mode):
+    """Both exact block layouts use the finite forward Jacobian for carry bars."""
     dtype = jnp.float64
     kernel_context = types.SimpleNamespace(
         dtype=dtype,
@@ -2996,7 +3131,7 @@ def test_database_plain_block_stage_input_pullback_keeps_finite_forward_jacobian
 
     physics_context = types.SimpleNamespace(
         reverse_rhs_transpose_mode="explicit_database",
-        reverse_stage_adjoint_solve_mode="block",
+        reverse_stage_adjoint_solve_mode=solve_mode,
         reverse_stage_cotangent_mode="full",
         flat_rhs_direct_black_box_state_pullback=_compact_hook,
         flat_rhs=lambda _t, y: jnp.asarray([[0.8, -0.2], [0.5, 1.3]], dtype=dtype) @ y,
@@ -3011,12 +3146,13 @@ def test_database_plain_block_stage_input_pullback_keeps_finite_forward_jacobian
     expected_y_bar = -(residual_bar @ rhs_jacobian)[0]
     assert jnp.allclose(actual_y_bar, expected_y_bar, rtol=1.0e-12, atol=1.0e-12)
     # The compact reverse hook remains available to the explicit database
-    # Jacobian mode, but must not be traced by plain block.
+    # Jacobian mode, but must not be traced by either exact block layout.
     assert calls == []
 
 
-def test_database_plain_block_matrix_keeps_finite_forward_jacobian_contract():
-    """Plain database block keeps the established forward-mode matrix."""
+@pytest.mark.parametrize("solve_mode", ["block", "block_database_multi_rhs"])
+def test_database_plain_block_matrix_keeps_finite_forward_jacobian_contract(solve_mode):
+    """Both exact block layouts keep the established forward-mode matrix."""
     dtype = jnp.float64
     kernel_context = types.SimpleNamespace(
         dtype=dtype,
@@ -3040,10 +3176,10 @@ def test_database_plain_block_matrix_keeps_finite_forward_jacobian_contract():
 
     physics_context = types.SimpleNamespace(
         reverse_rhs_transpose_mode="explicit_database",
-        reverse_stage_adjoint_solve_mode="block",
+        reverse_stage_adjoint_solve_mode=solve_mode,
         flat_rhs_direct_black_box_state_pullback=_direct_state_pullback,
-        # The generic RHS deliberately has a different Jacobian.  If this is
-        # selected, the matrix/carry contract has regressed.
+        # The generic RHS deliberately differs from the compact hook. Both
+        # exact block layouts must select this finite forward Jacobian.
         flat_rhs=lambda _t, y: -4.0 * y,
         flat_rhs_with_lagged_response=None,
     )
@@ -3055,7 +3191,7 @@ def test_database_plain_block_matrix_keeps_finite_forward_jacobian_contract():
     assert jnp.allclose(actual, expected, rtol=1.0e-12, atol=1.0e-12)
     # Applying the reverse VJP to a full output basis can form 0 * inf in the
     # real database interpolation graph.  It remains opt-in through
-    # ``block_explicit_database_jacobian`` and must not run for plain block.
+    # ``block_explicit_database_jacobian`` and must not run for either layout.
     assert calls == []
 
 

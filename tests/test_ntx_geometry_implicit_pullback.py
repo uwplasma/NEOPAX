@@ -66,6 +66,7 @@ from NEOPAX._reverse_ad_transport import (
     _initial_lagged_response_joint_state_and_support_pullback,
     _merge_rebuild_ntx_channels_into_generic_payload_bar,
     _normalize_support_payload_bar_leaf,
+    _objective_vector_joint_vjp_rows,
     _objective_vector_vjp_rows,
     _realized_reverse_slot_branches,
     _run_realized_reverse_slot_dispatch,
@@ -2935,6 +2936,36 @@ def test_grouped_objective_vjp_rows_match_scalar_objective_gradients():
     )
     assert jnp.allclose(values, objective_vector(primal), rtol=1e-12, atol=1e-12)
     assert jnp.allclose(grouped_bars, expected_bars, rtol=1e-12, atol=1e-12)
+
+
+def test_joint_grouped_objective_vjp_rows_match_two_separate_grouped_vjps():
+    """One shared trace preserves the independent state and geometry rows."""
+
+    state = jnp.asarray([0.4, -0.7, 1.2])
+    geometry = {"scale": jnp.asarray(1.3), "shape": jnp.asarray([-0.2, 0.8])}
+
+    def objective_vector(state_value, geometry_value):
+        effective = state_value * geometry_value["scale"]
+        return jnp.asarray(
+            [
+                effective[0] ** 2 + geometry_value["shape"][0] * state_value[1],
+                effective[2] - jnp.sin(state_value[1] + geometry_value["shape"][1]),
+                jnp.sum(effective**3),
+            ]
+        )
+
+    values, (joint_state_bars, joint_geometry_bars) = (
+        _objective_vector_joint_vjp_rows(objective_vector, state, geometry)
+    )
+    expected_values, expected_state_bars = _objective_vector_vjp_rows(
+        lambda state_value: objective_vector(state_value, geometry), state
+    )
+    _, expected_geometry_bars = _objective_vector_vjp_rows(
+        lambda geometry_value: objective_vector(state, geometry_value), geometry
+    )
+    assert jnp.allclose(values, expected_values, rtol=1e-12, atol=1e-12)
+    _assert_float_tree_allclose(joint_state_bars, expected_state_bars)
+    _assert_float_tree_allclose(joint_geometry_bars, expected_geometry_bars)
 
 
 def test_take_batched_pytree_row_slices_dataclass_leaves():

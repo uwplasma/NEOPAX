@@ -648,3 +648,75 @@ pullback.}
 \label{tab:database-full-transport-geometry-ad-fd-relative-error}
 \end{table}
 ```
+
+### Non-colored speed/memory audit — 2026-09-12
+
+The clean no-diagnostics baseline used the established exact `block`
+stage-adjoint solve. It reported 320.216 s for terminal-objective cotangents,
+1136.374 s for the four reverse segments (1067.933 s for the first
+compile-plus-execute, then 22.907, 23.099 and 22.433 s), 296.198 s for the
+initial direct-RHS support pullback, and 770.232 s for the final batched
+recorded-database scan fold. Peak host RSS was 15051068 KiB (14.354 GiB).
+The first segment timer is not a warm execution timer; its excess cannot be
+assigned entirely to compilation without measuring the compilation separately.
+
+The user reported four selected tests passing in 13.50 s for the new solve
+layout, joint ordinary-objective VJP, and initial-support reuse. These are
+algebra/dispatch checks, not evidence of reduced memory or execution time.
+
+Follow-up audit caught a selector integration error: the new
+`block_database_multi_rhs` solve used the established generic forward-mode
+Jacobian, but the subsequent input pullback exempted only `block` from the
+compact database state VJP. The exemption now covers both exact layouts.
+Tests cover both selectors' matrix and carry contracts, plus a JIT-compiled,
+three-stage coupled nonlinear solve and input pullback against an independent
+residual VJP. The default `block`, root optimization lane, and caches are
+unchanged.
+
+Local verification used the installed CPU JAX 0.5.0 and the exact function/test
+definitions in an isolated harness: seven checks passed, plus one check
+reproducing the pre-fix selector failure. Full repository pytest collection
+was blocked by missing physics dependencies (`h5py` first); this is not a full
+repository or GPU benchmark pass.
+
+Subsequent user verification ran the actual repository regression selection
+on CPU and passed: **7 passed, 122 deselected in 10.60 s**. This supersedes
+the isolated-harness limitation for those seven targeted checks, but is not
+a complete test-suite or GPU benchmark result:
+
+```bash
+JAX_PLATFORMS=cpu PYTHONPATH="$HOME/VMEX:$HOME/NTX/src" \
+python -m pytest tests/test_solvers.py -q -p no:cacheprovider \
+-k 'database_block_multi_rhs or database_exact_block_solve_and_carry_pullback or database_plain_block' \
+--maxfail=1
+```
+
+**Correction to the proposed factorization speedup:** installed JAX 0.5.0
+already shares the LU across objective rows in the original mapped `block`
+solve. Small compiled CPU examples of mapped-vector and explicit-column RHS
+layouts each have one unbatched LU and two matrix-RHS triangular solves, with
+identical outputs, including when `jacfwd` builds the matrix inside the map.
+The optional new selector therefore does not establish a factorization-count
+saving. Keep `block` as the validated baseline; do not request a long run on
+the premise of avoiding ten factorizations.
+
+Remaining non-colored candidates and evidence limits:
+
+- `grouped_joint_vjp` shares the ordinary terminal state/geometry objective
+  trace. Bootstrap is unchanged; timing and peak memory still require
+  measurement. The established `grouped_vjp` remains available.
+- Matrix construction and outgoing state pullback both express stage
+  `jacfwd` work in source, but run inside the same step JIT in the default
+  memory mode. Compiler common-subexpression elimination may already share
+  this work; do not infer two runtime Jacobian builds from source alone.
+- The fixed-table support pullback has a separate non-inline JIT inside a
+  per-stage scan. Sharing applicable primal work across that boundary is a
+  concrete next investigation. Within the support split, table and local
+  flux-geometry paths also prepare identical flux payloads/cotangents; check
+  compiled reuse before claiming an execution saving.
+- A four-step forward time does not isolate the reverse's exact stage
+  Jacobian construction, objective cotangents, and geometry/table support
+  transposes. Measure those components while keeping the same equations,
+  finite Jacobian contract, full nonlocal coupling and cached executables.
+
+Colored modes remain isolated experiments and are not this optimization plan.

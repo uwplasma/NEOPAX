@@ -1,5 +1,82 @@
 # Database reverse-AD status
 
+## Latest checkpoint - 2026-09-12
+
+This checkpoint supersedes the historical implementation/failure notes below.
+The detailed derivative tables and latest performance audit are in
+[`reverse_ad_vs_fd_database.md`](reverse_ad_vs_fd_database.md).
+
+### Current task and constraints
+
+Reduce both host memory and execution/compilation time for the black-box
+runtime-database full-transport reverse benchmark: 16 accepted steps,
+4-step segments, all objectives, profiles plus `RBC:1:0` and `ZBS:1:0`.
+Preserve the validated derivatives, full nonlocal coupling, finite Radau
+Jacobian contract, root optimization lane and reusable JAX caches.
+Do not clear caches to trade speed for memory; do not revert whole commits.
+Colored solve modes may remain isolated options, but are not the active plan.
+
+Keep `block` / `explicit_database` / `grouped_vjp` as the benchmark reference.
+The active derivative split includes local physical-geometry contributions
+and database table/query-coordinate contributions; the early table-only
+description below is historical, not the current contract.
+
+### Latest verification and pending candidates
+
+- User reported the original four candidate tests passing in 13.50 s.
+- The subsequent audit fixed an integration gap in the optional
+  `block_database_multi_rhs` selector: its solve used the finite generic
+  Jacobian, but its outgoing state pullback could select the compact database
+  state VJP. Both exact block layouts now use the same finite Jacobian contract.
+- The user then ran the actual repository selector regressions:
+  **7 passed, 122 deselected in 10.60 s**. Coverage includes both selectors'
+  matrix/carry dispatch and a JIT-compiled coupled nonlinear three-stage
+  solve plus input pullback against an independent residual VJP.
+- The optional `grouped_joint_vjp` candidate shares ordinary terminal
+  state/geometry objective work; it leaves bootstrap unchanged. The initial
+  direct-RHS support reuse is covered by the earlier four-test result.
+- No new long benchmark, AD/FD comparison or measured speed/RSS improvement
+  is established by these small tests.
+
+The latest successful command was run from the existing NEOPAX checkout:
+
+```bash
+JAX_PLATFORMS=cpu PYTHONPATH="$HOME/VMEX:$HOME/NTX/src" \
+python -m pytest tests/test_solvers.py -q -p no:cacheprovider \
+-k 'database_block_multi_rhs or database_exact_block_solve_and_carry_pullback or database_plain_block' \
+--maxfail=1
+```
+
+### Performance conclusion and next action
+
+Do not claim that `block_database_multi_rhs` avoids ten LU factorizations:
+installed JAX 0.5.0 CPU lowering showed that the original mapped `block`
+already shares one factorization across objective rows. The explicit-column
+layout remains optional, with no demonstrated performance advantage.
+
+The reference run's warm four-step reverse segments took 22.907, 23.099 and
+22.433 s; the first segment took 1067.933 s including first-call overhead.
+Peak host RSS was 15051068 KiB (14.354 GiB). These are pre-measurement
+reference values, not improvements from the candidates.
+
+Next: inspect compiled fixed-table support work and its non-inline JIT / stage
+scan boundary for repeated center/face primal evaluations and excessive
+compilation work. Source-level repetition alone is insufficient: JAX may
+already eliminate common work. Keep density and temperature face closures
+distinct, retain all geometry/table coordinate bars, and validate equivalence
+before measuring speed and memory. Do not request a long run solely to test
+the unsupported factorization-count hypothesis.
+
+### Workspace handoff
+
+At save time: branch `en/reverse_ad_improvement`, HEAD `936fe39`.
+Pending modifications include `_reverse_ad_transport.py`,
+`_transport_solvers.py`, the reverse benchmark CLI, the two relevant test
+files, and these Markdown notes. They have not been committed or pushed in
+this save operation. Preserve unrelated optimization-lane work.
+
+## Historical notes (superseded where inconsistent with the checkpoint)
+
 ## Scope
 
 This note records the current `ntx_scan_runtime` / black-box database

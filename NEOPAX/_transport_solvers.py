@@ -11048,8 +11048,8 @@ def _radau_exact_stage_residual_input_pullback(
                 cotangent,
             )
         # The explicit database-Jacobian lanes use the compact direct-state
-        # boundary.  Plain ``block`` instead uses the finite forward-mode
-        # Jacobian below, matching the dense matrix used by its stage solve.
+        # boundary.  Both exact ``block`` layouts instead use the finite
+        # forward-mode Jacobian below, matching their dense stage matrix.
         # Mixing those contracts can seed 0 * inf terms in the carry adjoint.
         if (
             rhs_transpose_mode in {
@@ -11057,7 +11057,7 @@ def _radau_exact_stage_residual_input_pullback(
                 "database",
                 "explicit_black_box_database",
             }
-            and stage_adjoint_mode != "block"
+            and stage_adjoint_mode not in {"block", "block_database_multi_rhs"}
             and physics_context.flat_rhs_direct_black_box_state_pullback is not None
         ):
             return physics_context.flat_rhs_direct_black_box_state_pullback(
@@ -14373,6 +14373,37 @@ def _radau_solve_exact_stage_residual_transpose_block(
     return jnp.linalg.solve(matrix.T, -rhs_arr).reshape((-1,))
 
 
+def _radau_solve_exact_stage_residual_transpose_block_multi_rhs(
+    kernel_context: _RadauAcceptedStepKernelContext,
+    physics_context: _RadauAcceptedStepPhysicsContext,
+    carry_in: _RadauAcceptedStepCarry,
+    primal_result: _RadauAcceptedStepAttemptResult,
+    lagged_response,
+    *,
+    rhs,
+):
+    """Solve one exact stage matrix against all objective RHS columns.
+
+    This uses the identical generic stage Jacobian and pivoted dense solve as
+    ``block``.  Only the explicit RHS layout changes.  JAX can already share
+    the factorization under the original vmap, so this is not evidence of
+    fewer factorizations or a performance improvement.
+    """
+
+    system_size = int(kernel_context.num_stages) * int(kernel_context.state_dim)
+    rhs_rows = jnp.asarray(rhs, dtype=kernel_context.dtype).reshape(
+        (-1, system_size)
+    )
+    matrix = _radau_exact_stage_residual_matrix(
+        kernel_context,
+        physics_context,
+        carry_in,
+        primal_result,
+        lagged_response,
+    )
+    return jnp.linalg.solve(matrix.T, -rhs_rows.T).T
+
+
 def _radau_solve_exact_stage_residual_transpose_block_colored_ntss_midpoint(
     kernel_context: _RadauAcceptedStepKernelContext,
     physics_context: _RadauAcceptedStepPhysicsContext,
@@ -14815,6 +14846,7 @@ def _radau_solve_exact_stage_residual_transpose(
         )
     if mode not in {
         "block",
+        "block_database_multi_rhs",
         "block_explicit_ntx_jacobian",
         "block_explicit_database_jacobian",
         "block_frozen_forward_jacobian",
@@ -14953,6 +14985,15 @@ def _radau_solve_exact_stage_residual_transpose_batched(
             lagged_response,
             rhs=rhs_arr,
             batched=True,
+        )
+    if mode == "block_database_multi_rhs":
+        return _radau_solve_exact_stage_residual_transpose_block_multi_rhs(
+            kernel_context,
+            physics_context,
+            carry_in,
+            primal_result,
+            lagged_response,
+            rhs=rhs_arr,
         )
     if mode not in {
         "block",

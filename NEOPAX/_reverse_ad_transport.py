@@ -322,6 +322,29 @@ def _objective_vector_vjp_rows(objective_vector_fn: Callable[[object], object], 
     return values, jax.vmap(lambda cotangent: pullback(cotangent)[0])(basis)
 
 
+def _objective_vector_joint_vjp_rows(
+    objective_vector_fn: Callable[..., object], *primals
+):
+    """Return vector values and cotangent rows for every input of one VJP.
+
+    Unlike two independent grouped VJPs, this retains one shared primal trace
+    of the objective vector.  The returned input-bar trees have the same
+    leading objective axis as :func:`_objective_vector_vjp_rows`.
+    """
+
+    if not primals:
+        raise ValueError("Joint grouped final-objective VJP requires an input.")
+    values, pullback = jax.vjp(objective_vector_fn, *primals)
+    values = jnp.asarray(values)
+    if values.ndim != 1:
+        raise ValueError(
+            "Joint grouped final-objective VJP requires a rank-one objective "
+            f"vector; got shape {values.shape}."
+        )
+    basis = jnp.eye(int(values.shape[0]), dtype=values.dtype)
+    return values, jax.vmap(pullback)(basis)
+
+
 def _database_bootstrap_table_and_coordinate_bar(
     database, d11_bar, d13_bar, d33_bar, coordinate_bar
 ):
@@ -3527,10 +3550,14 @@ def prepare_reverse_static_setup(
     reverse_final_objective_cotangent_mode = str(
         reverse_final_objective_cotangent_mode
     ).strip().lower()
-    if reverse_final_objective_cotangent_mode not in {"scalar", "grouped_vjp"}:
+    if reverse_final_objective_cotangent_mode not in {
+        "scalar",
+        "grouped_vjp",
+        "grouped_joint_vjp",
+    }:
         raise ValueError(
             "reverse_final_objective_cotangent_mode must be one of "
-            "{'scalar', 'grouped_vjp'}."
+            "{'scalar', 'grouped_vjp', 'grouped_joint_vjp'}."
         )
     reverse_bootstrap_cotangent_mode = str(reverse_bootstrap_cotangent_mode).strip().lower()
     if reverse_bootstrap_cotangent_mode not in {
@@ -3979,10 +4006,15 @@ def prepare_realtime_geometry_support_segment_core_setup(
         final_cotangent_mode = str(
             getattr(args, "reverse_final_objective_cotangent_mode", "scalar")
         ).strip().lower()
-        if final_cotangent_mode not in {"scalar", "grouped_vjp"}:
+        if final_cotangent_mode not in {
+            "scalar",
+            "grouped_vjp",
+            "grouped_joint_vjp",
+        }:
             raise ValueError(
                 "ntx_scan_runtime requires "
-                "--reverse-final-objective-cotangent-mode scalar or grouped_vjp."
+                "--reverse-final-objective-cotangent-mode scalar, grouped_vjp, "
+                "or grouped_joint_vjp."
             )
         ntx_support_payload = None
         support_payload = realtime_geometry_reverse_support_payload_for_runtime(
@@ -4480,7 +4512,11 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
             "scalar",
         )
     ).strip().lower()
-    if final_objective_cotangent_mode not in {"scalar", "grouped_vjp"}:
+    grouped_final_objective_modes = {"grouped_vjp", "grouped_joint_vjp"}
+    if final_objective_cotangent_mode not in {
+        "scalar",
+        *grouped_final_objective_modes,
+    }:
         raise ValueError(
             "Unknown reverse_final_objective_cotangent_mode "
             f"{final_objective_cotangent_mode!r}."
@@ -4521,7 +4557,10 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
     final_objective_geometry_elapsed = 0.0
     final_objective_bootstrap_elapsed = 0.0
     phase_start = time.perf_counter()
-    if final_objective_cotangent_mode == "grouped_vjp" and ordinary_objective_indices:
+    if (
+        final_objective_cotangent_mode in grouped_final_objective_modes
+        and ordinary_objective_indices
+    ):
         # The scalar reference path constructs one VJP for every ordinary
         # terminal objective.  Group them here, but leave bootstrap on its
         # compact NTX-specific rule below.
@@ -4538,14 +4577,69 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
             )
 
         component_start = time.perf_counter()
-        ordinary_values, ordinary_final_y_bars = _objective_vector_vjp_rows(
-            _ordinary_objective_vector_from_final_y,
-            final_y_for_objective,
-        )
-        if phase_timing_diagnostics:
-            ordinary_values, ordinary_final_y_bars = jax.block_until_ready(
-                (ordinary_values, ordinary_final_y_bars)
+        ordinary_geometry_bars = None
+        if final_objective_cotangent_mode == "grouped_joint_vjp":
+            if not (
+                combined_geometry_payload
+                and isinstance(support_payload, dict)
+                and "database" in support_payload
+            ):
+                raise ValueError(
+                    "reverse_final_objective_cotangent_mode='grouped_joint_vjp' "
+                    "is an opt-in database geometry mode and requires a support "
+                    "payload with geometry and database leaves."
+                )
+            geometry = support_payload["geometry"]
+            geometry_delta0 = _float_delta_tree_like(geometry)
+
+            def _ordinary_objective_vector_joint(final_y_value, geometry_delta):
+                final_state = reverse_setup.prepared_rollout.physics_context.unpack_flat(
+                    final_y_value
+                )
+                runtime_with_geometry = dataclasses.replace(
+                    runtime,
+                    geometry=_add_float_delta_tree(geometry, geometry_delta),
+                )
+                return jnp.stack(
+                    tuple(
+                        dependencies.objective_scalar_by_index(
+                            final_state,
+                            runtime_with_geometry,
+                            objective_i,
+                        )
+                        for objective_i in ordinary_objective_indices
+                    ),
+                    axis=0,
+                )
+
+            ordinary_values, ordinary_input_bars = (
+                _objective_vector_joint_vjp_rows(
+                    _ordinary_objective_vector_joint,
+                    final_y_for_objective,
+                    geometry_delta0,
+                )
             )
+            ordinary_final_y_bars, ordinary_geometry_bars = ordinary_input_bars
+        else:
+            ordinary_values, ordinary_final_y_bars = _objective_vector_vjp_rows(
+                _ordinary_objective_vector_from_final_y,
+                final_y_for_objective,
+            )
+        if phase_timing_diagnostics:
+            if ordinary_geometry_bars is None:
+                ordinary_values, ordinary_final_y_bars = jax.block_until_ready(
+                    (ordinary_values, ordinary_final_y_bars)
+                )
+            else:
+                ordinary_values, ordinary_final_y_bars, ordinary_geometry_bars = (
+                    jax.block_until_ready(
+                        (
+                            ordinary_values,
+                            ordinary_final_y_bars,
+                            ordinary_geometry_bars,
+                        )
+                    )
+                )
             final_objective_state_elapsed += time.perf_counter() - component_start
         grouped_objective_values = {
             objective_i: ordinary_values[row_i]
@@ -4555,7 +4649,10 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
             objective_i: ordinary_final_y_bars[row_i]
             for row_i, objective_i in enumerate(ordinary_objective_indices)
         }
-        if combined_geometry_payload:
+        if (
+            combined_geometry_payload
+            and final_objective_cotangent_mode == "grouped_vjp"
+        ):
             final_state_for_geometry = (
                 reverse_setup.prepared_rollout.physics_context.unpack_flat(
                     final_y_for_objective
@@ -4589,6 +4686,11 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
             if phase_timing_diagnostics:
                 ordinary_geometry_bars = jax.block_until_ready(ordinary_geometry_bars)
                 final_objective_geometry_elapsed += time.perf_counter() - component_start
+            grouped_geometry_bars = {
+                objective_i: _take_batched_pytree_row(ordinary_geometry_bars, row_i)
+                for row_i, objective_i in enumerate(ordinary_objective_indices)
+            }
+        elif ordinary_geometry_bars is not None:
             grouped_geometry_bars = {
                 objective_i: _take_batched_pytree_row(ordinary_geometry_bars, row_i)
                 for row_i, objective_i in enumerate(ordinary_objective_indices)
@@ -4864,7 +4966,7 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
                 final_objective_bootstrap_elapsed += time.perf_counter() - component_start
             continue
 
-        if final_objective_cotangent_mode == "grouped_vjp":
+        if final_objective_cotangent_mode in grouped_final_objective_modes:
             objective_value = grouped_objective_values[objective_i]
             final_y_bar = grouped_final_y_bars[objective_i]
         else:
@@ -4897,7 +4999,7 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
             or "database" in support_payload
             or is_live_database_support
         ):
-            if final_objective_cotangent_mode == "grouped_vjp":
+            if final_objective_cotangent_mode in grouped_final_objective_modes:
                 geometry_objective_bar = grouped_geometry_bars[objective_i]
             else:
                 component_start = time.perf_counter()
@@ -4940,7 +5042,7 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
             )
             objective_payload_bar_rows.append(objective_payload_bar)
         elif combined_geometry_payload:
-            if final_objective_cotangent_mode == "grouped_vjp":
+            if final_objective_cotangent_mode in grouped_final_objective_modes:
                 raise NotImplementedError(
                     "ntx_scan_runtime currently requires "
                     "reverse_final_objective_cotangent_mode='scalar'."
