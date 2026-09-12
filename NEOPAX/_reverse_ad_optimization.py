@@ -4688,12 +4688,41 @@ def evaluate_geometry_transport_realtime_geometry_least_squares(
             request.parameter_set,
             parameter_values_arr,
         )
+        # At the baseline point, use the exact VMEC primal that built the
+        # transport runtime.  The frozen-linearized FD lane uses this same
+        # state deliberately; re-solving here can converge through a different
+        # nonlinear path and contracts otherwise-correct payload bars at the
+        # wrong linearization point.  Nonzero optimizer trials still solve at
+        # their own parameter value.
+        retained_vmec_state = None
+        try:
+            at_baseline = bool(
+                jnp.all(
+                    jnp.asarray(vmec_parameter_values)
+                    == jnp.zeros_like(jnp.asarray(vmec_parameter_values))
+                ).item()
+            )
+        except Exception:
+            at_baseline = False
+        database_runtime_active = (
+            find_ntx_runtime_scan_model_in_model(
+                request.context.baseline_runtime.models.flux
+            )
+            is not None
+        )
+        if at_baseline and database_runtime_active:
+            retained_vmec_state = getattr(
+                request.context.baseline_runtime,
+                "database_vmec_primal_state",
+                None,
+            )
         shared_raw_block_solve = geometry_raw_block_solve_from_param_vector(
             geometry_context,
             vmec_parameter_values,
             tuple(spec.as_tuple() for spec in request.parameter_set.vmec_boundary_specs),
             max_iter=geometry_max_iter,
             solver_device=geometry_solver_device,
+            reference_state=retained_vmec_state,
         )
         opts.setdefault("raw_block_solve", shared_raw_block_solve)
         opts.setdefault("geometry_raw_block_solve", shared_raw_block_solve)

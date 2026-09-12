@@ -1040,6 +1040,7 @@ def geometry_raw_block_solve_from_param_vector(
     implicit_params_from_deltas_runner: Callable[[Any], Any] | None = None,
     state_mask_stop_gradient_runner: Callable[[Any, Any], tuple[Any, Any]] | None = None,
     dispatch_cache_probe: Callable[[str], None] | None = None,
+    reference_state=None,
 ) -> GeometryRawBlockSolve:
     """Solve VMEC once and keep the raw-block transpose auxiliary data."""
 
@@ -1099,7 +1100,16 @@ def geometry_raw_block_solve_from_param_vector(
         implicit_params = jax.tree_util.tree_map(_stop_gradient_if_jax_value, implicit_params)
     if dispatch_cache_probe is not None:
         dispatch_cache_probe("before_vmex_solve")
-    if solve_with_aux_runner is None:
+    if reference_state is not None:
+        if not hasattr(implicit, "_dof_mask") or not hasattr(implicit, "runtime_from_params"):
+            raise AttributeError(
+                "Retained-primal raw-block setup requires VMEX _dof_mask and "
+                "runtime_from_params capabilities."
+            )
+        state = reference_state
+        implicit_runtime = implicit.runtime_from_params(implicit_params, implicit_cfg)
+        dof_mask = implicit._dof_mask(state, implicit_runtime, implicit_cfg)
+    elif solve_with_aux_runner is None:
         state, dof_mask = implicit.solve_implicit_with_aux(implicit_params, implicit_cfg)
     else:
         state, dof_mask = solve_with_aux_runner(implicit_params)
@@ -6712,6 +6722,12 @@ def build_runtime_context_for_vmec_state(
             f"elapsed_s={time.perf_counter() - phase_start:.3f}",
             flush=True,
         )
+    database_vmec_primal_state = None
+    if flux_model_name == "ntx_scan_runtime":
+        database_vmec_primal_state = jax.tree_util.tree_map(
+            _stop_gradient_if_jax_value,
+            state_vmec,
+        )
     runtime = RuntimeContext(
         species=species,
         energy_grid=energy_grid,
@@ -6719,6 +6735,7 @@ def build_runtime_context_for_vmec_state(
         database=database,
         solver_parameters=solver_cfg,
         models=models,
+        database_vmec_primal_state=database_vmec_primal_state,
     )
     mode = str(config_eff.get("general", {}).get("mode", config_eff.get("mode", "transport"))).strip().lower()
     if mode != "ambipolarity":

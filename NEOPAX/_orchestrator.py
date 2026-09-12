@@ -71,6 +71,10 @@ class RuntimeContext:
     database: object | None
     solver_parameters: dict
     models: Models
+    # Database realtime geometry must contract its final VMEC transpose at the
+    # exact forward primal that produced the fixed NTX table.  This is kept
+    # database-specific so the established exact-Lij path is unchanged.
+    database_vmec_primal_state: object | None = None
 
 
 def load_config(path):

@@ -139,6 +139,54 @@ def test_raw_block_stage_rejects_a_different_parameter_layout(monkeypatch):
         raise AssertionError("Expected the mismatched staged layout to be rejected.")
 
 
+def test_raw_block_solve_can_reuse_forward_vmec_primal(monkeypatch):
+    """The transport payload transpose linearizes at its retained forward state."""
+
+    entries = ({"family": "RBC", "m": 1, "n": 0},)
+    observed = {}
+
+    class Implicit:
+        @staticmethod
+        def solve_implicit_with_aux(_params, _cfg):
+            raise AssertionError("A retained forward primal must prevent a second VMEC solve.")
+
+        @staticmethod
+        def runtime_from_params(params, cfg):
+            observed["runtime"] = (params, cfg)
+            return "implicit-runtime"
+
+        @staticmethod
+        def _dof_mask(state, runtime, cfg):
+            observed["mask"] = (state, runtime, cfg)
+            return "forward-mask"
+
+    shared_cfg = object()
+    stage = geometry_ad.GeometryRawBlockStage(
+        implicit=Implicit(), implicit_cfg=shared_cfg, param_entries=entries
+    )
+    monkeypatch.setattr(geometry_ad, "_using_current_vmec_jax_context", lambda _context: True)
+    monkeypatch.setattr(
+        geometry_ad,
+        "_implicit_params_with_boundary_deltas",
+        lambda *_args, **_kwargs: "baseline-params",
+    )
+
+    result = geometry_ad.geometry_raw_block_solve_from_param_vector(
+        SimpleNamespace(),
+        jnp.asarray([0.0]),
+        (("RBC", 1, 0),),
+        stage=stage,
+        reference_state="forward-state",
+    )
+
+    assert result.state == "forward-state"
+    assert result.dof_mask == "forward-mask"
+    assert observed["runtime"] == ("baseline-params", shared_cfg)
+    assert observed["mask"] == (
+        "forward-state", "implicit-runtime", shared_cfg
+    )
+
+
 def test_repeated_evaluation_memory_samples_release_evaluations(monkeypatch):
     """The audit must invoke the existing evaluator without retaining results."""
 
