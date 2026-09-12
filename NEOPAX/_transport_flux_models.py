@@ -21914,31 +21914,42 @@ class FluxesRFileTransportModel(TransportFluxModelBase):
             return None
         return jax.vmap(lambda prof: interpax.interp1d(target_r, self.r_data, prof))(data)
 
-    def _spectrax_fd_basis(self, state):
+    def _spectrax_fd_face_basis(self, state, *, bc_density=None, bc_temperature=None):
+        """Return the Stage-4 FD coordinates on the transport faces.
+
+        The stored SPECTRAX/GX finite differences are with respect to face
+        ``-a d(ln X)/dr`` values.  Rebuilding them from cell-centred gradients
+        and then averaging to faces changes both the stencil and, at a
+        Dirichlet boundary, the boundary value.  In particular it can reverse
+        the response of the final cell.  Use the same BC-aware face state and
+        face-gradient operator as the transport equations and Stage 4.
+        """
         density = safe_density(state.density)
         temperature = safe_temperature(state.temperature, 1.0e-12)
+        face_state = build_face_transport_state(
+            state,
+            self.geometry,
+            bc_density=bc_density,
+            bc_temperature=bc_temperature,
+        )
+        face_density = safe_density(face_state.density)
+        face_temperature = safe_temperature(face_state.temperature, 1.0e-12)
         a_minor = jnp.asarray(getattr(self.geometry, "a_b", 1.0), dtype=density.dtype)
-        dndr_all = jax.vmap(
-            lambda density_a: get_gradient_density(
-                density_a,
-                self.geometry.r_grid,
-                self.geometry.r_grid_half,
-                self.geometry.dr,
-            )
-        )(density)
-        dTdr_all = jax.vmap(
-            lambda temperature_a: get_gradient_temperature(
-                temperature_a,
-                self.geometry.r_grid,
-                self.geometry.r_grid_half,
-                self.geometry.dr,
-            )
-        )(temperature)
-        # Stage 4 currently writes SPECTRAX perturbations in the default
-        # gradient_coordinate='rho' convention, so convert NEOPAX's physical-r
-        # gradients back to d/d rho using rho = r / a_minor.
-        density_basis = -a_minor * dndr_all / density
-        temperature_basis = -a_minor * dTdr_all / temperature
+        dndr_faces = _face_profile_gradient(
+            density,
+            self.geometry.r_grid_half,
+            bc_model=bc_density,
+        )
+        dTdr_faces = _face_profile_gradient(
+            temperature,
+            self.geometry.r_grid_half,
+            bc_model=bc_temperature,
+        )
+        # Stage 4 writes gradient_coordinate='rho': r = a_minor * rho, so
+        # convert NEOPAX physical-r gradients to the matching dimensionless
+        # face coordinates.
+        density_basis = -a_minor * dndr_faces / face_density
+        temperature_basis = -a_minor * dTdr_faces / face_temperature
         return jax.vmap(
             lambda kind_code, species_index: jax.lax.cond(
                 kind_code == 0,
@@ -21947,10 +21958,6 @@ class FluxesRFileTransportModel(TransportFluxModelBase):
                 operand=None,
             )
         )(self.perturb_kind_codes, self.perturb_species_indices)
-
-    def _spectrax_fd_face_basis(self, state):
-        center_basis = self._spectrax_fd_basis(state)
-        return jax.vmap(faces_from_cell_centered)(center_basis)
 
     def __call__(self, state) -> dict:
         del state
@@ -21985,7 +21992,6 @@ class FluxesRFileTransportModel(TransportFluxModelBase):
         return {"Gamma": gamma, "Q": q, "Upar": upar}
 
     def build_lagged_response(self, state, **kwargs):
-        del kwargs
         if str(self.lagged_response_mode).strip().lower() != "fd":
             return JVPTransportFluxResponse(reference_state=state, reference_flux=self(state))
         if (
@@ -22002,7 +22008,11 @@ class FluxesRFileTransportModel(TransportFluxModelBase):
         return SpectraXTurbulenceFDLaggedResponse(
             reference_state=state,
             reference_flux=self(state),
-            reference_basis=self._spectrax_fd_face_basis(state),
+            reference_basis=self._spectrax_fd_face_basis(
+                state,
+                bc_density=kwargs.get("bc_density"),
+                bc_temperature=kwargs.get("bc_temperature"),
+            ),
             perturb_kind_codes=self.perturb_kind_codes,
             perturb_species_indices=self.perturb_species_indices,
             perturb_delta=jnp.asarray(self.perturb_delta_data, dtype=float),
@@ -22012,7 +22022,6 @@ class FluxesRFileTransportModel(TransportFluxModelBase):
         )
 
     def evaluate_with_lagged_response(self, state, lagged_response, **kwargs):
-        del kwargs
         if (
             str(self.lagged_response_mode).strip().lower() != "fd"
             or not isinstance(lagged_response, SpectraXTurbulenceFDLaggedResponse)
@@ -22041,8 +22050,15 @@ class FluxesRFileTransportModel(TransportFluxModelBase):
             state,
             lagged_response.reference_state,
         )
+        def _basis_with_boundary_conditions(state_value):
+            return self._spectrax_fd_face_basis(
+                state_value,
+                bc_density=kwargs.get("bc_density"),
+                bc_temperature=kwargs.get("bc_temperature"),
+            )
+
         delta_basis = jax.jvp(
-            self._spectrax_fd_face_basis,
+            _basis_with_boundary_conditions,
             (lagged_response.reference_state,),
             (delta_state,),
         )[1]

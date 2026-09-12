@@ -8,6 +8,7 @@ import jax.numpy as jnp
 import pytest
 
 from NEOPAX._entropy_models import get_entropy_model
+from NEOPAX._boundary_conditions import BoundaryConditionModel
 from NEOPAX._transport_flux_models import (
     AnalyticalTurbulentTransportModel,
     CombinedTransportFluxModel,
@@ -733,6 +734,62 @@ def test_fd_lagged_response_builds_under_jit(tmp_path):
     assert jnp.allclose(jitted.reference_flux["Q_faces"], eager.reference_flux["Q_faces"])
     assert jnp.allclose(jitted.reference_basis, eager.reference_basis)
     assert jnp.allclose(jitted.q_perturb, eager.q_perturb)
+
+
+def test_fd_lagged_response_uses_dirichlet_face_gradient_for_edge_temperature_response(tmp_path):
+    """The final-cell temperature tangent must respect the fixed edge value.
+
+    A warmer final cell makes the outward drop to a colder Dirichlet boundary
+    steeper, hence the outer ``a/L_T`` coordinate must increase.  The old
+    cell-centred/extrapolated response had the opposite sign.
+    """
+    geometry = DummyFDGeometry()
+    path = tmp_path / "fd_fluxes.h5"
+    _write_fd_flux_file(path, r=geometry.r_grid_half)
+    with contextlib.redirect_stdout(io.StringIO()):
+        model = build_fluxes_r_file_transport_model(
+            DummyFDSpecies(),
+            geometry,
+            fluxes_file=path,
+            lagged_response_mode="fd",
+        )
+    state = _fd_state(geometry.r_grid.shape[0])
+    temperature_bc = BoundaryConditionModel(
+        dr=float(geometry.dr),
+        left_type="neumann",
+        right_type="dirichlet",
+        right_value=jnp.array([1.0, 1.0]),
+    )
+    temperature_direction = jnp.zeros_like(state.temperature).at[0, -1].set(1.0)
+    direction = TransportState(
+        density=jnp.zeros_like(state.density),
+        pressure=state.density * temperature_direction,
+        Er=jnp.zeros_like(state.Er),
+    )
+
+    _, basis_tangent = jax.jvp(
+        lambda state_value: model._spectrax_fd_face_basis(
+            state_value,
+            bc_temperature=temperature_bc,
+        ),
+        (state,),
+        (direction,),
+    )
+
+    assert basis_tangent[0, -1] > 0.0
+
+    response = model.build_lagged_response(state, bc_temperature=temperature_bc)
+    warmer_state = TransportState(
+        density=state.density,
+        pressure=state.pressure + 0.1 * direction.pressure,
+        Er=state.Er,
+    )
+    updated_flux = model.evaluate_with_lagged_response(
+        warmer_state,
+        response,
+        bc_temperature=temperature_bc,
+    )
+    assert updated_flux["Q_faces"][0, -1] > response.reference_flux["Q_faces"][0, -1]
 
 
 def test_analytical_turbulent_transport_model_with_transport_coeffs_updates_coefficients():
