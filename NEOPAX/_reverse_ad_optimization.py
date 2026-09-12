@@ -1282,6 +1282,7 @@ def _database_geometry_active_initial_er_root_only_reverse_table(
     database_root_stage: DatabaseInitialRootExperimentStage | None = None,
     payload_assembly_stage=None,
     dispatch_cache_probe=None,
+    root_diagnostic_probe=None,
 ) -> ObjectiveTableResult:
     """Database-native selected-root reverse with one recorded scan fold.
 
@@ -1398,6 +1399,28 @@ def _database_geometry_active_initial_er_root_only_reverse_table(
         direct_cotangents=direct_cotangents,
         dispatch_cache_probe=dispatch_cache_probe,
     )
+    if root_diagnostic_probe is not None:
+        dres_der = initial_er_charge_flux_residual_er_derivative(
+            pre_root_state, er_profile, runtime=fixed_runtime
+        )
+        safe_dres_der = jnp.where(
+            jnp.abs(dres_der) > jnp.asarray(1.0e-30, dtype=dres_der.dtype),
+            dres_der,
+            jnp.inf,
+        )
+        implicit_er_bars = jnp.where(
+            finite_mask[None, :],
+            -jnp.asarray(rooted_state_bars.Er) / safe_dres_der[None, :],
+            0.0,
+        )
+        root_diagnostic_probe(
+            {
+                "er_profile": er_profile,
+                "finite_mask": finite_mask,
+                "dres_der": dres_der,
+                "implicit_er_bars": implicit_er_bars,
+            }
+        )
     _probe("after_database_root_direct")
     _probe("before_database_root_pullback")
     if root_pullback is None:
@@ -2545,6 +2568,7 @@ def geometry_active_initial_er_root_only_reverse_table(
     dispatch_cache_probe=None,
     database_root_stage: DatabaseInitialRootExperimentStage | None = None,
     payload_assembly_stage=None,
+    root_diagnostic_probe=None,
 ) -> ObjectiveTableResult:
     """Return compact initial-Er objective table for active realtime geometry.
 
@@ -2583,6 +2607,7 @@ def geometry_active_initial_er_root_only_reverse_table(
             database_root_stage=database_root_stage,
             payload_assembly_stage=payload_assembly_stage,
             dispatch_cache_probe=dispatch_cache_probe,
+            root_diagnostic_probe=root_diagnostic_probe,
         )
 
     def _probe(label: str) -> None:
@@ -3876,6 +3901,7 @@ def evaluate_geometry_initial_er_root_only_least_squares_benchmark_tables(
     payload_assembly_stage=None,
     raw_block_transpose_optimization_stage=None,
     dispatch_cache_probe=None,
+    root_diagnostic_probe=None,
 ) -> LeastSquaresEvaluation:
     """Evaluate mixed objectives using only benchmark-validated table backends."""
 
@@ -3960,6 +3986,7 @@ def evaluate_geometry_initial_er_root_only_least_squares_benchmark_tables(
                 database_root_stage=database_root_stage,
                 payload_assembly_stage=payload_assembly_stage,
                 dispatch_cache_probe=dispatch_cache_probe,
+                root_diagnostic_probe=root_diagnostic_probe,
             )
             transport_values, transport_jacobian = jax.block_until_ready(
                 (transport_result.values, transport_result.jacobian)

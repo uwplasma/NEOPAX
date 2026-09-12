@@ -359,6 +359,7 @@ class GeometryInitialErRootLeastSquaresProblem:
     prepared_payload_static: object | None = None
     payload_assembly_stage: object | None = None
     raw_block_transpose_optimization_stage: object | None = None
+    root_diagnostic_probe: Callable[[Mapping[str, object]], None] | None = None
     reverse_stage_mode: str = "off"
 
     @property
@@ -531,6 +532,8 @@ class GeometryInitialErRootLeastSquaresProblem:
                 evaluator_kwargs["raw_block_transpose_optimization_stage"] = (
                     self.raw_block_transpose_optimization_stage
                 )
+        if self.root_diagnostic_probe is not None:
+            evaluator_kwargs["root_diagnostic_probe"] = self.root_diagnostic_probe
         base_evaluation = evaluator(self.config, **evaluator_kwargs)
         result = _assemble_mixed_initial_er_root_result(
             self.terms,

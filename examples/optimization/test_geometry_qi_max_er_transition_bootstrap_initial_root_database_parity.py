@@ -10,6 +10,7 @@ outside that boundary.
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import io
 from contextlib import redirect_stdout
 from pathlib import Path
@@ -82,6 +83,29 @@ def _evaluate(problem, x):
     return jax.block_until_ready((result.residuals, result.jacobian))
 
 
+def _root_record_probe(records: dict[str, dict[str, np.ndarray]], label: str):
+    """Capture diagnostic leaves after the selected-root direct cotangent."""
+
+    def _record(values) -> None:
+        records[label] = {
+            name: np.asarray(jax.device_get(value)) for name, value in values.items()
+        }
+
+    return _record
+
+
+def _print_root_diagnostic(reference: dict[str, np.ndarray], trial: dict[str, np.ndarray]) -> None:
+    mask_mismatch = int(np.count_nonzero(reference["finite_mask"] != trial["finite_mask"]))
+    print(f"[database root diagnostic] finite_mask_mismatches={mask_mismatch}", flush=True)
+    for name in ("er_profile", "dres_der", "implicit_er_bars"):
+        delta = np.asarray(trial[name] - reference[name], dtype=float)
+        print(
+            f"[database root diagnostic] {name}_max_abs="
+            f"{np.max(np.abs(delta)):.16e}",
+            flush=True,
+        )
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -99,6 +123,11 @@ def main() -> int:
         choices=("database_root_experiment", "database_root_jit_experiment"),
         default="database_root_experiment",
         help="Select the opt-in database-root experiment to compare with database.",
+    )
+    parser.add_argument(
+        "--diagnose-root",
+        action="store_true",
+        help="Compare selected-root values and implicit-root cotangent factors.",
     )
     parser.add_argument(
         "--parameter-index", type=int, default=0,
@@ -124,8 +153,26 @@ def main() -> int:
         raise ValueError(f"--parameter-index must be in [0, {x.size}); got {args.parameter_index}.")
     x[args.parameter_index] += args.parameter_offset
 
+    root_records: dict[str, dict[str, np.ndarray]] = {}
+    if args.diagnose_root:
+        benchmark = dataclasses.replace(
+            benchmark,
+            root_diagnostic_probe=_root_record_probe(root_records, "database"),
+        )
+        trial = dataclasses.replace(
+            trial,
+            root_diagnostic_probe=_root_record_probe(root_records, args.trial_mode),
+        )
+
     reference_residuals, reference_jacobian = _evaluate(benchmark, x)
     trial_residuals, trial_jacobian = _evaluate(trial, x)
+    if args.diagnose_root:
+        if set(root_records) != {"database", args.trial_mode}:
+            raise RuntimeError(
+                "Selected-root diagnostic did not receive both database-root records; "
+                f"got {tuple(root_records)!r}."
+            )
+        _print_root_diagnostic(root_records["database"], root_records[args.trial_mode])
     residual_delta = np.asarray(jax.device_get(trial_residuals - reference_residuals), dtype=float)
     jacobian_delta = np.asarray(jax.device_get(trial_jacobian - reference_jacobian), dtype=float)
     reference_jacobian_np = np.asarray(jax.device_get(reference_jacobian), dtype=float)
