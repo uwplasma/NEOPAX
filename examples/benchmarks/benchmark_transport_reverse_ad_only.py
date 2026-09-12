@@ -2273,6 +2273,7 @@ def _prepare_reverse_static_setup(
     reverse_database_support_preparation_mode: str = "shared",
     reverse_database_center_geometry_mode: str = "scalar_jvp",
     reverse_database_stage_jacobian_mode: str = "independent",
+    reverse_database_support_objective_mode: str = "scalar",
     reverse_segment_jit_diagnostics: bool = False,
     reverse_segment_input_diagnostics: bool = False,
     reverse_rebuild_component_timing: bool = False,
@@ -2319,6 +2320,7 @@ def _prepare_reverse_static_setup(
         support_preparation_mode=reverse_database_support_preparation_mode,
         center_geometry_mode=reverse_database_center_geometry_mode,
         stage_jacobian_mode=reverse_database_stage_jacobian_mode,
+        support_objective_mode=reverse_database_support_objective_mode,
     )
     if configured_physics is not execution_context.physics_context:
         execution_context = dataclasses.replace(execution_context, physics_context=configured_physics)
@@ -4075,6 +4077,7 @@ def _run_realtime_geometry_optimization_api_smoke(
             f"database_support_preparation_mode={args.reverse_database_support_preparation_mode} "
             f"database_center_geometry_mode={args.reverse_database_center_geometry_mode} "
             f"database_stage_jacobian_mode={args.reverse_database_stage_jacobian_mode} "
+            f"database_support_objective_mode={args.reverse_database_support_objective_mode} "
             f"segment_jit_diagnostics={args.reverse_segment_jit_diagnostics} "
             f"segment_input_diagnostics={args.reverse_segment_input_diagnostics} "
             f"segment_start_replay_mode={args.reverse_segment_start_replay_mode} "
@@ -4131,6 +4134,9 @@ def _run_realtime_geometry_optimization_api_smoke(
             reverse_database_support_preparation_mode=str(args.reverse_database_support_preparation_mode),
             reverse_database_center_geometry_mode=str(args.reverse_database_center_geometry_mode),
             reverse_database_stage_jacobian_mode=str(args.reverse_database_stage_jacobian_mode),
+            reverse_database_support_objective_mode=str(
+                args.reverse_database_support_objective_mode
+            ),
             reverse_initial_cache_support_pullback_mode=str(
                 args.reverse_initial_cache_support_pullback_mode
             ),
@@ -4240,6 +4246,9 @@ def _run_realtime_geometry_optimization_api_smoke(
         "reverse_database_support_preparation_mode": args.reverse_database_support_preparation_mode,
         "reverse_database_center_geometry_mode": args.reverse_database_center_geometry_mode,
         "reverse_database_stage_jacobian_mode": args.reverse_database_stage_jacobian_mode,
+        "reverse_database_support_objective_mode": (
+            args.reverse_database_support_objective_mode
+        ),
         "shared_payload_note": (
             "Full transport shared-path smoke uses the internal realtime-geometry "
             "transport table-result builder once and writes JSON for offline "
@@ -5827,13 +5836,28 @@ def main() -> None:
     )
     parser.add_argument(
         "--reverse-database-stage-jacobian-mode",
-        choices=("independent", "shared"), default="independent",
+        choices=("independent", "shared", "shared_multi_rhs"), default="independent",
         help=("Database exact-block stage Jacobians: 'independent' preserves the "
               "current solve/state graph; 'shared' constructs the same finite "
-              "jacfwd stage Jacobians once for the dense solve and state transpose. "
+              "jacfwd stage Jacobians once while retaining mapped scalar solves; "
+              "'shared_multi_rhs' additionally solves all objective columns in "
+              "one exact dense factorization. "
               "Requires block, full stage cotangents, separate RHS pullback, and "
               "default stage-adjoint memory mode on the "
               "reduced_cotangent_call_boundary step path."),
+    )
+    parser.add_argument(
+        "--reverse-database-support-objective-mode",
+        choices=("scalar", "batched_split"),
+        default="scalar",
+        help=(
+            "Database exact support transpose across objective rows. 'scalar' "
+            "preserves the validated row-wise split path. 'batched_split' "
+            "shares call-local fixed-table/equation primal preparation and "
+            "applies all objective cotangents together. It is isolated to the "
+            "database full-transport block reverse path; the recorded NTX scan "
+            "is still transposed once after the segmented sweep."
+        ),
     )
     parser.add_argument(
         "--reverse-database-initial-support-mode",
@@ -6684,6 +6708,7 @@ def main() -> None:
         or args.reverse_database_support_preparation_mode != "shared"
         or args.reverse_database_center_geometry_mode != "scalar_jvp"
         or args.reverse_database_stage_jacobian_mode != "independent"
+        or args.reverse_database_support_objective_mode != "scalar"
     )
     if database_performance_override and (
         not is_database_geometry_reverse
@@ -6701,7 +6726,7 @@ def main() -> None:
             if is_database_geometry_reverse
             else "explicit_ntx_interpolated"
         )
-    if args.reverse_database_stage_jacobian_mode == "shared" and (
+    if args.reverse_database_stage_jacobian_mode in {"shared", "shared_multi_rhs"} and (
         args.reverse_stage_adjoint_solve_mode != "block"
         or args.reverse_rhs_transpose_mode != "explicit_database"
         or args.reverse_stage_cotangent_mode != "full"
@@ -6713,6 +6738,21 @@ def main() -> None:
             "[autodiff-gate] Shared database stage Jacobians require block, "
             "explicit_database, full stage cotangents, separate RHS pullback, "
             "default stage-adjoint memory mode and reduced_cotangent_call_boundary."
+        )
+    if args.reverse_database_support_objective_mode == "batched_split" and (
+        args.reverse_stage_adjoint_solve_mode != "block"
+        or args.reverse_rhs_transpose_mode != "explicit_database"
+        or args.reverse_stage_cotangent_mode != "full"
+        or args.reverse_rhs_pullback_mode != "separate"
+        or args.reverse_stage_adjoint_memory_mode != "default"
+        or args.reverse_step_bwd_mode != "reduced_cotangent_call_boundary"
+        or args.reverse_database_support_preparation_mode != "shared"
+    ):
+        raise SystemExit(
+            "[autodiff-gate] Batched database support objectives require block, "
+            "explicit_database, full stage cotangents, separate RHS pullback, "
+            "shared support preparation, default stage-adjoint memory mode and "
+            "reduced_cotangent_call_boundary."
         )
     if (
         is_database_geometry_reverse

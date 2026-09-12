@@ -68,17 +68,27 @@ class _CompactOwner:
         return _center_fluxes(state, **self.support)
 
     def pullback_direct_rhs_support_payload(self, state, flux_bar, support):
-        _, pullback = jax.vjp(
+        fluxes, pullback = jax.vjp(
             lambda database: _center_fluxes(state, support["geometry"], database),
             support["database"],
         )
-        return {"database": pullback(flux_bar)[0]}
+        example_flux = next(iter(fluxes.values()))
+        example_bar = next(iter(flux_bar.values()))
+        if jnp.asarray(example_bar).ndim == jnp.asarray(example_flux).ndim + 1:
+            database_bar = jax.vmap(lambda one_bar: pullback(one_bar)[0])(flux_bar)
+        else:
+            database_bar = pullback(flux_bar)[0]
+        return {"database": database_bar}
 
     def pullback_direct_rhs_geometry_by_radius(self, state, flux_bar, geometry):
-        _, pullback = jax.vjp(
+        fluxes, pullback = jax.vjp(
             lambda value: _center_fluxes(state, value, self.support["database"]),
             geometry,
         )
+        example_flux = next(iter(fluxes.values()))
+        example_bar = next(iter(flux_bar.values()))
+        if jnp.asarray(example_bar).ndim == jnp.asarray(example_flux).ndim + 1:
+            return jax.vmap(lambda one_bar: pullback(one_bar)[0])(flux_bar)
         return pullback(flux_bar)[0]
 
 
@@ -94,21 +104,31 @@ class _NativeFaces:
         return _face_fluxes(self.kind, state, **self.support)
 
     def database_table_pullback(self, state, _centers, face_bar, support):
-        _, pullback = jax.vjp(
+        face_fluxes, pullback = jax.vjp(
             lambda database: _face_fluxes(
                 self.kind, state, support["geometry"], database
             ),
             support["database"],
         )
-        return {"database": pullback(face_bar)[0]}
+        example_flux = next(iter(face_fluxes.values()))
+        example_bar = next(iter(face_bar.values()))
+        if jnp.asarray(example_bar).ndim == jnp.asarray(example_flux).ndim + 1:
+            database_bar = jax.vmap(lambda one_bar: pullback(one_bar)[0])(face_bar)
+        else:
+            database_bar = pullback(face_bar)[0]
+        return {"database": database_bar}
 
     def database_geometry_pullback(self, state, _centers, face_bar, support):
-        _, pullback = jax.vjp(
+        face_fluxes, pullback = jax.vjp(
             lambda geometry: _face_fluxes(
                 self.kind, state, geometry, support["database"]
             ),
             support["geometry"],
         )
+        example_flux = next(iter(face_fluxes.values()))
+        example_bar = next(iter(face_bar.values()))
+        if jnp.asarray(example_bar).ndim == jnp.asarray(example_flux).ndim + 1:
+            return jax.vmap(lambda one_bar: pullback(one_bar)[0])(face_bar)
         return pullback(face_bar)[0]
 
 
@@ -298,6 +318,54 @@ def test_database_split_support_shared_primal_matches_independent_jit_vmap(prepa
         assert reference_calls[name] == 3
     assert calls["flux_vjp"] == (2 if preparation_mode == "separate" else 1)
     assert reference_calls["flux_vjp"] == 2
+
+
+def test_database_batched_split_support_matches_scalar_rows_jit():
+    """Matrix-RHS split preserves every table, coordinate and geometry row."""
+    state, support, rows = _inputs()
+    actual_calls = Counter()
+    reference_calls = Counter()
+    actual_equations = _equations(support, actual_calls)
+    reference_equations = _equations(support, reference_calls)
+
+    def _batched(state_value, support_value, row_values):
+        return actual_equations.pullback_direct_rhs_database_split_support_payload_batched(
+            0.0,
+            state_value,
+            None,
+            row_values,
+            support_value,
+            support_preparation_mode="shared",
+        )
+
+    def _scalar_rows(state_value, support_value, row_values):
+        return jax.vmap(
+            lambda one_row: reference_equations.pullback_direct_rhs_database_split_support_payload(
+                0.0,
+                state_value,
+                None,
+                one_row,
+                support_value,
+                support_preparation_mode="shared",
+            )
+        )(row_values)
+
+    actual = jax.jit(_batched)(state, support, rows)
+    expected = jax.jit(_scalar_rows)(state, support, rows)
+    _assert_same_tree(actual, expected)
+    assert jnp.any(jnp.abs(actual["database"]["coordinate"]) > 0.0)
+    assert jnp.any(jnp.abs(actual["geometry"]["metric"]) > 0.0)
+    # The batched implementation owns one call-local primal preparation. The
+    # objective axis appears only on the cotangent applications.
+    for name in (
+        "bind",
+        "prepare",
+        "centers",
+        "capture",
+        "density_faces",
+        "temperature_faces",
+    ):
+        assert actual_calls[name] == 1
 
 
 @pytest.mark.parametrize(

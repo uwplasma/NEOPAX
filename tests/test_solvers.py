@@ -3335,6 +3335,98 @@ def test_batched_database_stage_pullback_keeps_direct_geometry_outside_scan():
     assert jnp.allclose(actual_database, -2.0 * rows)
 
 
+def test_batched_database_stage_pullback_selects_matrix_rhs_split_mode():
+    """The opt-in mode calls one batched split hook and never the scalar hook."""
+    dtype = jnp.float32
+    kernel_context = types.SimpleNamespace(
+        dtype=dtype,
+        num_stages=1,
+        state_dim=2,
+        c=jnp.asarray([0.0], dtype=dtype),
+        a=jnp.eye(1, dtype=dtype),
+    )
+    carry = types.SimpleNamespace(
+        t=jnp.asarray(0.0, dtype=dtype),
+        y=jnp.asarray([1.0, 2.0], dtype=dtype),
+    )
+    primal = types.SimpleNamespace(
+        trial_dt=jnp.asarray(0.5, dtype=dtype),
+        stage_history=jnp.asarray([0.0, 0.0], dtype=dtype),
+    )
+    calls = []
+
+    def _scalar_pullback(*_args):
+        raise AssertionError("batched_split must not dispatch to the scalar hook")
+
+    def _batched_pullback(_t, _y, rhs_bars, _support):
+        calls.append(rhs_bars.shape)
+        return {
+            "geometry": 3.0 * rhs_bars,
+            "database": 2.0 * rhs_bars,
+        }
+
+    physics_context = types.SimpleNamespace(
+        reverse_database_include_direct_geometry=True,
+        reverse_database_support_objective_mode="batched_split",
+        flat_rhs_direct_database_split_support_pullback=_scalar_pullback,
+        flat_rhs_direct_database_split_support_pullback_batched=_batched_pullback,
+    )
+    rows = jnp.asarray([[1.0, -2.0], [0.5, 3.0]], dtype=dtype)
+    actual_database, actual_geometry = (
+        transport_solvers._radau_exact_stage_residual_database_table_support_pullback_batched(
+            kernel_context,
+            physics_context,
+            carry,
+            primal,
+            rows,
+            {
+                "geometry": jnp.zeros((2,), dtype=dtype),
+                "database": jnp.zeros((2,), dtype=dtype),
+            },
+        )
+    )
+
+    assert calls == [(2, 2)]
+    assert jnp.allclose(actual_geometry, -3.0 * rows)
+    assert jnp.allclose(actual_database, -2.0 * rows)
+
+
+@pytest.mark.parametrize("mode", ["unknown", "batched_split"])
+def test_batched_database_stage_pullback_rejects_invalid_objective_mode(mode):
+    """Unknown modes and batched support without direct geometry fail closed."""
+    dtype = jnp.float32
+    kernel_context = types.SimpleNamespace(
+        dtype=dtype,
+        num_stages=1,
+        state_dim=1,
+        c=jnp.asarray([0.0], dtype=dtype),
+        a=jnp.eye(1, dtype=dtype),
+    )
+    carry = types.SimpleNamespace(
+        t=jnp.asarray(0.0, dtype=dtype), y=jnp.asarray([1.0], dtype=dtype)
+    )
+    primal = types.SimpleNamespace(
+        trial_dt=jnp.asarray(0.5, dtype=dtype),
+        stage_history=jnp.asarray([0.0], dtype=dtype),
+    )
+    physics_context = types.SimpleNamespace(
+        reverse_database_include_direct_geometry=False,
+        reverse_database_support_objective_mode=mode,
+        flat_rhs_direct_database_table_pullback=lambda *_args: {
+            "table": jnp.asarray([0.0], dtype=dtype)
+        },
+    )
+    with pytest.raises(ValueError):
+        transport_solvers._radau_exact_stage_residual_database_table_support_pullback_batched(
+            kernel_context,
+            physics_context,
+            carry,
+            primal,
+            jnp.asarray([[1.0]], dtype=dtype),
+            {"table": jnp.asarray([0.0], dtype=dtype)},
+        )
+
+
 def test_batched_database_stage_pullback_default_remains_table_only():
     """The direct-geometry extension is opt-in and cannot alter old contexts."""
     dtype = jnp.float32

@@ -1882,13 +1882,16 @@ def _flat_rhs_direct_database_payload_pullback_factory(
 
 
 def _flat_rhs_direct_database_payload_pullback_batched_factory(
-    unravel, vector_field, args, kwargs, hook_name: str, project_flat=None
+    unravel, vector_field, args, kwargs, hook_name: str, project_flat=None,
+    *, pullback_options=None,
 ):
     """Flatten one database-only RHS transpose with objective rows batched."""
     pullback_fn = _direct_rhs_database_payload_pullback_hook(vector_field, hook_name)
     if pullback_fn is None:
         return None
     unravel_bar = getattr(unravel, "cotangent", unravel)
+    hook_kwargs = dict(kwargs)
+    hook_kwargs.update(pullback_options or {})
 
     def _pullback(t_value, flat_y, rhs_bars_flat, support):
         projected_flat_y = _project_flat_state_if_needed(flat_y, project_flat)
@@ -1899,7 +1902,12 @@ def _flat_rhs_direct_database_payload_pullback_batched_factory(
             )
         )(rhs_bars_flat)
         return pullback_fn(
-            t_value, state_y, *args, rhs_bar=rhs_bars_state, support=support, **kwargs
+            t_value,
+            state_y,
+            *args,
+            rhs_bar=rhs_bars_state,
+            support=support,
+            **hook_kwargs,
         )
 
     return jax.jit(_pullback, inline=False)
@@ -4906,6 +4914,9 @@ class _RadauAcceptedStepPhysicsContext:
     # hook, this owns the compact table and local-geometry pieces explicitly.
     # It is intentionally separate so selecting it cannot affect Lij.
     flat_rhs_direct_database_split_support_pullback: Callable[[Any, Any, Any, Any], Any] | None = None
+    # Opt-in matrix-RHS sibling of the scalar split hook. It shares only
+    # call-local database/equation primal work across objective rows.
+    flat_rhs_direct_database_split_support_pullback_batched: Callable[[Any, Any, Any, Any], Any] | None = None
     flat_rhs_lagged_response_all_pullback: Callable[[Any, Any, Any, Any, Any], tuple[Any, Any, Any]] | None = None
     flat_rhs_state_and_lagged_response_pullback: Callable[[Any, Any, Any, Any], tuple[Any, Any]] | None = None
     flat_rhs_state_pullback: Callable[[Any, Any, Any, Any], Any] | None = None
@@ -4948,6 +4959,7 @@ class _RadauAcceptedStepPhysicsContext:
     reverse_database_center_geometry_mode: str = "scalar_jvp"
     # Opt-in, call-local reuse of exact stage Jacobians; never a carry/tape field.
     reverse_database_stage_jacobian_mode: str = "independent"
+    reverse_database_support_objective_mode: str = "scalar"
     reverse_initial_cache_support_pullback_mode: str = "scalar"
     reverse_rebuild_support_pullback_mode: str = "separate"
     reverse_segment_jit_diagnostics: bool = False
@@ -11303,20 +11315,44 @@ def _radau_exact_stage_residual_database_table_support_pullback_batched(
     include_direct_geometry = bool(
         getattr(physics_context, "reverse_database_include_direct_geometry", False)
     )
-    scalar_direct_pullback = (
-        getattr(
-            physics_context,
-            "flat_rhs_direct_database_split_support_pullback",
-            None,
+    support_objective_mode = str(
+        getattr(physics_context, "reverse_database_support_objective_mode", "scalar")
+    ).strip().lower()
+    if support_objective_mode not in {"scalar", "batched_split"}:
+        raise ValueError(
+            "reverse_database_support_objective_mode must be 'scalar' or "
+            f"'batched_split'; got {support_objective_mode!r}."
         )
-        if include_direct_geometry
-        else getattr(physics_context, "flat_rhs_direct_database_table_pullback", None)
-    )
-    batched_direct_pullback = (
-        None
-        if include_direct_geometry
-        else getattr(physics_context, "flat_rhs_direct_database_table_pullback_batched", None)
-    )
+    if support_objective_mode == "batched_split" and not include_direct_geometry:
+        raise ValueError(
+            "batched_split database support requires the direct-geometry split path."
+        )
+    if include_direct_geometry:
+        scalar_direct_pullback = (
+            getattr(
+                physics_context,
+                "flat_rhs_direct_database_split_support_pullback",
+                None,
+            )
+            if support_objective_mode == "scalar"
+            else None
+        )
+        batched_direct_pullback = (
+            getattr(
+                physics_context,
+                "flat_rhs_direct_database_split_support_pullback_batched",
+                None,
+            )
+            if support_objective_mode == "batched_split"
+            else None
+        )
+    else:
+        scalar_direct_pullback = getattr(
+            physics_context, "flat_rhs_direct_database_table_pullback", None
+        )
+        batched_direct_pullback = getattr(
+            physics_context, "flat_rhs_direct_database_table_pullback_batched", None
+        )
     if scalar_direct_pullback is None and batched_direct_pullback is None:
         raise ValueError(
             "Database segmented reverse requires its explicit split-support "
@@ -11378,11 +11414,12 @@ def _radau_exact_stage_residual_database_table_support_pullback_batched(
 
     def _stage_pullback(accumulated_leaves, stage_inputs):
         t_eval, y_eval, rhs_bars_eval = stage_inputs
-        # Keep the objective axis on device. The scalar fixed-table hook is
-        # deliberately vmapped because the former rank-3 specialised table
-        # path produced nonfinite D11_log/D13 bars. With direct geometry
-        # enabled this instead invokes the compact split payload hook; it has
-        # no scan record and still returns the table leaf separately.
+        # Keep the objective axis on device. The default scalar mode preserves
+        # the validated row-wise split transpose. ``batched_split`` is an
+        # explicit database-only alternative which shares call-local primal
+        # preparation but returns the same table and local-geometry rows. It
+        # owns no scan record; the recorded scan is still transposed once only
+        # after the complete segmented sweep.
         if scalar_direct_pullback is None:
             stage_value = batched_direct_pullback(
                 t_eval, y_eval, -rhs_bars_eval, support
@@ -12150,9 +12187,10 @@ def _radau_database_shared_stage_jacobian_enabled(physics_context, lagged_respon
     )).strip().lower()
     if mode == "independent":
         return False
-    if mode != "shared":
+    if mode not in {"shared", "shared_multi_rhs"}:
         raise ValueError(
-            "reverse_database_stage_jacobian_mode must be 'independent' or 'shared'; "
+            "reverse_database_stage_jacobian_mode must be 'independent', "
+            "'shared', or 'shared_multi_rhs'; "
             f"got {mode!r}."
         )
     required = {
@@ -12170,7 +12208,7 @@ def _radau_database_shared_stage_jacobian_enabled(physics_context, lagged_respon
         selected = str(getattr(physics_context, name, default)).strip().lower()
         if selected not in choices:
             raise ValueError(
-                "reverse_database_stage_jacobian_mode='shared' requires "
+                f"reverse_database_stage_jacobian_mode={mode!r} requires "
                 f"{name} in {sorted(choices)}; got {selected!r}."
             )
     return True
@@ -12184,14 +12222,19 @@ def _radau_database_shared_stage_solve_and_state_pullback_batched(
     *,
     rhs,
 ):
-    """Reuse exact stage ``jacfwd`` values for the mapped solve and state bar.
+    """Reuse exact stage ``jacfwd`` values for the solve and state bar.
 
-    The dense block assembly, objective-vmapped solve and contraction order
-    match the independent database ``block`` path. These Jacobians exist only
+    Both modes use the same dense block assembly and state contraction as the
+    independent database ``block`` path. ``shared`` retains the established
+    objective-vmapped scalar solves; ``shared_multi_rhs`` presents the same
+    objective rows as columns of one dense solve. These Jacobians exist only
     within this call, not in checkpoints, reduced carries, or a persistent cache.
     """
     if not _radau_database_shared_stage_jacobian_enabled(physics_context, None):
-        raise ValueError("The shared stage helper requires reverse_database_stage_jacobian_mode='shared'.")
+        raise ValueError(
+            "The shared stage helper requires "
+            "reverse_database_stage_jacobian_mode='shared' or 'shared_multi_rhs'."
+        )
     stage_times, stage_states = _radau_exact_stage_times_states(
         kernel_context, carry_in, primal_result
     )
@@ -12220,18 +12263,42 @@ def _radau_database_shared_stage_solve_and_state_pullback_batched(
     rhs_arr = jnp.asarray(rhs, dtype=kernel_context.dtype).reshape(
         (-1, kernel_context.num_stages * kernel_context.state_dim)
     )
-    residual_bars = jax.vmap(
-        lambda rhs_row: jnp.linalg.solve(matrix.T, -rhs_row).reshape((-1,))
-    )(rhs_arr)
+    stage_jacobian_mode = str(
+        physics_context.reverse_database_stage_jacobian_mode
+    ).strip().lower()
+    if stage_jacobian_mode == "shared_multi_rhs":
+        # Present every objective as a column of one dense solve. This owns
+        # one exact stage matrix and one factorization for the objective batch.
+        residual_bars = jnp.linalg.solve(matrix.T, -rhs_arr.T).T
+    else:
+        # Preserve the pre-existing ``shared`` selector byte-for-byte at its
+        # linear-solve boundary so performance A/B runs remain interpretable.
+        residual_bars = jax.vmap(
+            lambda rhs_row: jnp.linalg.solve(matrix.T, -rhs_row).reshape((-1,))
+        )(rhs_arr)
 
-    def _state_pullback(residual_bar):
-        residual_stages = residual_bar.reshape((kernel_context.num_stages, kernel_context.state_dim))
-        jt_residual_stages = jax.vmap(lambda jacobian, bar: jacobian.T @ bar)(
-            stage_jacobians, residual_stages
+    if stage_jacobian_mode == "shared_multi_rhs":
+        residual_stages = residual_bars.reshape(
+            (-1, kernel_context.num_stages, kernel_context.state_dim)
         )
-        return -jnp.sum(jt_residual_stages, axis=0)
+        # ``stage_jacobians[s]`` is d(rhs_s)/d(y_s). Contract the already-built
+        # Jacobians with every objective row without another RHS derivative.
+        jt_residual_stages = jnp.einsum(
+            "sij,osi->osj", stage_jacobians, residual_stages
+        )
+        residual_y_bars = -jnp.sum(jt_residual_stages, axis=1)
+    else:
+        def _state_pullback(residual_bar):
+            residual_stages = residual_bar.reshape(
+                (kernel_context.num_stages, kernel_context.state_dim)
+            )
+            jt_residual_stages = jax.vmap(
+                lambda jacobian, bar: jacobian.T @ bar
+            )(stage_jacobians, residual_stages)
+            return -jnp.sum(jt_residual_stages, axis=0)
 
-    return residual_bars, jax.vmap(_state_pullback)(residual_bars)
+        residual_y_bars = jax.vmap(_state_pullback)(residual_bars)
+    return residual_bars, residual_y_bars
 
 
 def _radau_exact_stage_residual_matrix(

@@ -89,9 +89,14 @@ def _assert_tree_close(actual, expected):
 
 
 @pytest.mark.parametrize("compiled", [False, True], ids=["eager", "jit"])
-def test_shared_stage_jacobian_matches_independent_pair_and_residual_ad(compiled):
+@pytest.mark.parametrize("stage_mode", ["shared", "shared_multi_rhs"])
+def test_shared_stage_jacobian_matches_independent_pair_and_residual_ad(
+    compiled, stage_mode
+):
     kernel, physics, carry, primal, rows = _case()
-    shared_physics = dataclasses.replace(physics, reverse_database_stage_jacobian_mode="shared")
+    shared_physics = dataclasses.replace(
+        physics, reverse_database_stage_jacobian_mode=stage_mode
+    )
 
     def evaluate(t, y, dt, stages, rhs_rows):
         dynamic_carry = dataclasses.replace(carry, t=t, y=y)
@@ -121,6 +126,19 @@ def test_shared_stage_jacobian_matches_independent_pair_and_residual_ad(compiled
 
     run = jax.jit(evaluate) if compiled else evaluate
     for offset in (0.0, 0.11):
+        stage_states = (
+            carry.y[None, :]
+            + offset
+            + primal.trial_dt
+            * (kernel.a @ (primal.stage_history - offset))
+        )
+        stage_times = carry.t + offset + kernel.c * primal.trial_dt
+        stage_jacobians = jax.vmap(jax.jacfwd(physics.flat_rhs, argnums=1))(
+            stage_times, stage_states
+        )
+        # The fixture is genuinely nonlinear and exercises distinct J_i; a
+        # shared frozen Jacobian could otherwise pass this parity test.
+        assert not np.allclose(stage_jacobians[0], stage_jacobians[-1])
         shared, independent, oracle = run(
             carry.t + offset, carry.y + offset, primal.trial_dt,
             primal.stage_history - offset, rows,
@@ -129,6 +147,36 @@ def test_shared_stage_jacobian_matches_independent_pair_and_residual_ad(compiled
         assert shared[1].shape == (10, 4)
         _assert_tree_close(shared, independent)
         _assert_tree_close(shared, oracle)
+
+
+def test_shared_stage_jacobian_uses_one_explicit_multi_rhs_solve(monkeypatch):
+    """The objective batch is columns of one solve, not mapped scalar solves."""
+    kernel, physics, carry, primal, rows = _case()
+    physics = dataclasses.replace(
+        physics, reverse_database_stage_jacobian_mode="shared_multi_rhs"
+    )
+    original_solve = jnp.linalg.solve
+    solve_shapes = []
+
+    def tracked_solve(matrix, rhs):
+        solve_shapes.append((matrix.shape, rhs.shape))
+        return original_solve(matrix, rhs)
+
+    monkeypatch.setattr(solvers.jnp.linalg, "solve", tracked_solve)
+    residual_bars, state_bars = (
+        solvers._radau_database_shared_stage_solve_and_state_pullback_batched(
+            kernel, physics, carry, primal, rhs=rows,
+        )
+    )
+
+    system_size = kernel.num_stages * kernel.state_dim
+    assert solve_shapes == [
+        ((system_size, system_size), (system_size, rows.shape[0]))
+    ]
+    assert residual_bars.shape == rows.shape
+    assert state_bars.shape == (rows.shape[0], kernel.state_dim)
+    assert np.all(np.isfinite(residual_bars))
+    assert np.all(np.isfinite(state_bars))
 
 
 @pytest.mark.parametrize("field, value", [

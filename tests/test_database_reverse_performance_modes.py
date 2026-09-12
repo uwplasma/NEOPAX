@@ -231,6 +231,7 @@ def _physics_context():
         flat_rhs_with_lagged_response=_unexpected_hook,
         flat_rhs_direct_support_pullback=_unexpected_hook,
         flat_rhs_direct_database_split_support_pullback=_unexpected_hook,
+        flat_rhs_direct_database_split_support_pullback_batched=_unexpected_hook,
     )
 
 
@@ -267,6 +268,24 @@ class _SupportOwner:
         self.calls.append(("split", center_geometry_mode, support_preparation_mode))
         return self._result(t, state, species, rhs_bar, support)
 
+    def pullback_direct_rhs_database_split_support_payload_batched(
+        self,
+        t,
+        state,
+        species,
+        *,
+        rhs_bar,
+        support,
+        center_geometry_mode="scalar_jvp",
+        support_preparation_mode="shared",
+    ):
+        self.calls.append(
+            ("batched_split", center_geometry_mode, support_preparation_mode)
+        )
+        return jax.vmap(
+            lambda one_bar: self._result(t, state, species, one_bar, support)
+        )(rhs_bar)
+
 
 def test_configure_current_defaults_preserves_context_and_callable_identities(monkeypatch):
     physics = _physics_context()
@@ -278,6 +297,11 @@ def test_configure_current_defaults_preserves_context_and_callable_identities(mo
         "_flat_rhs_direct_database_payload_pullback_factory",
         _unexpected_hook,
     )
+    monkeypatch.setattr(
+        reverse_transport,
+        "_flat_rhs_direct_database_payload_pullback_batched_factory",
+        _unexpected_hook,
+    )
     actual = _configure_database_reverse_performance(
         physics, vector_field=_unexpected_hook, species=object()
     )
@@ -286,6 +310,61 @@ def test_configure_current_defaults_preserves_context_and_callable_identities(mo
         value = getattr(physics, field.name)
         if callable(value):
             assert getattr(actual, field.name) is value
+
+
+def test_configure_batched_support_objectives_changes_only_selector():
+    physics = _physics_context()
+    actual = _configure_database_reverse_performance(
+        physics,
+        vector_field=_unexpected_hook,
+        species=object(),
+        support_objective_mode="batched_split",
+    )
+    assert actual is not physics
+    assert actual.reverse_database_support_objective_mode == "batched_split"
+    assert (
+        actual.flat_rhs_direct_database_split_support_pullback
+        is physics.flat_rhs_direct_database_split_support_pullback
+    )
+    assert (
+        actual.flat_rhs_direct_database_split_support_pullback_batched
+        is physics.flat_rhs_direct_database_split_support_pullback_batched
+    )
+
+
+def test_configure_batched_support_builds_hook_only_when_selected():
+    species = object()
+    owner = _SupportOwner(species)
+    physics = dataclasses.replace(
+        _physics_context(),
+        flat_rhs_direct_database_split_support_pullback_batched=None,
+    )
+    actual = _configure_database_reverse_performance(
+        physics,
+        vector_field=owner.__call__,
+        species=species,
+        support_objective_mode="batched_split",
+    )
+    assert physics.flat_rhs_direct_database_split_support_pullback_batched is None
+    assert callable(actual.flat_rhs_direct_database_split_support_pullback_batched)
+    t = jnp.asarray(1.5)
+    state = jnp.asarray([2.0, 3.0])
+    rhs_rows = jnp.asarray([[1.0, -0.5], [2.0, -1.0]])
+    support = {
+        "geometry": jnp.asarray(2.0),
+        "database": jnp.asarray([3.0, -1.0]),
+    }
+    result = actual.flat_rhs_direct_database_split_support_pullback_batched(
+        t, state, rhs_rows, support
+    )
+    row_scales = (1.5 + 2.0 * (3.0 + 4.0)) * 5.0 * jnp.sum(
+        rhs_rows, axis=1
+    )
+    expected = jax.vmap(
+        lambda scale: jax.tree_util.tree_map(lambda value: value * scale, support)
+    )(row_scales)
+    _assert_same_finite_tree(result, expected)
+    assert owner.calls == [("batched_split", "scalar_jvp", "shared")]
 
 
 def test_configure_legacy_modes_rebinds_and_forwards_both_support_hooks():
@@ -329,7 +408,13 @@ def test_configure_legacy_modes_rebinds_and_forwards_both_support_hooks():
 
 @pytest.mark.parametrize(
     "option",
-    ["initial_support_mode", "support_preparation_mode", "center_geometry_mode", "stage_jacobian_mode"],
+    [
+        "initial_support_mode",
+        "support_preparation_mode",
+        "center_geometry_mode",
+        "stage_jacobian_mode",
+        "support_objective_mode",
+    ],
 )
 def test_configure_rejects_unknown_modes(option):
     with pytest.raises(ValueError):
@@ -351,6 +436,20 @@ def test_configure_nondefault_modes_require_database_support_capability():
             vector_field=_unexpected_hook,
             species=object(),
             initial_support_mode="generic",
+        )
+
+
+def test_configure_batched_support_requires_matrix_rhs_hook():
+    physics = dataclasses.replace(
+        _physics_context(),
+        flat_rhs_direct_database_split_support_pullback_batched=None,
+    )
+    with pytest.raises(ValueError, match="matrix-RHS"):
+        _configure_database_reverse_performance(
+            physics,
+            vector_field=_unexpected_hook,
+            species=object(),
+            support_objective_mode="batched_split",
         )
 
 

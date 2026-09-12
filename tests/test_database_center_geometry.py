@@ -132,6 +132,42 @@ def test_database_center_mesh_jvp_supports_batched_heat_only_bars():
     _assert_tree_close(actual, expected)
 
 
+def test_database_composite_center_geometry_batches_non_neoclassical_rows():
+    """The opt-in matrix-RHS path retains turbulent centre geometry bars."""
+
+    @dataclasses.dataclass(frozen=True)
+    class _GeometryTurbulence:
+        field: object
+
+        def __call__(self, state):
+            heat = self.field.metric * state.density
+            zero = jnp.zeros_like(heat)
+            return {"Gamma": zero, "Q": heat, "Upar": zero}
+
+    neo, state, geometry = _fixture()
+    model = CombinedTransportFluxModel(
+        neo,
+        _GeometryTurbulence(geometry),
+        ZeroTransportModel(),
+        geometry=geometry,
+    )
+    bars = _bars(3)
+    actual = jax.jit(
+        lambda values: model.pullback_direct_rhs_geometry_by_radius(
+            state, values, geometry
+        )
+    )(bars)
+    expected = jax.jit(
+        jax.vmap(
+            lambda one_row: model.pullback_direct_rhs_geometry_by_radius(
+                state, one_row, geometry
+            )
+        )
+    )(bars)
+    _assert_tree_close(actual, expected)
+    assert jnp.any(jnp.abs(actual.metric) > 1e-8)
+
+
 def test_database_center_mesh_jvp_preserves_custom_geometry_dependencies():
     """A custom local evaluator may depend on more than the radial mesh."""
     class CustomModel(NTXDatabaseTransportModel):

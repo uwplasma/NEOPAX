@@ -1788,6 +1788,10 @@ class CombinedTransportFluxModel(TransportFluxModelBase):
             **_database_center_geometry_pullback_kwargs(neo_pullback, center_geometry_mode),
         )
         geometry_delta0 = _float_delta_tree_like(geometry)
+        batched_rhs = (
+            jnp.asarray(_bar("Q")).ndim
+            == jnp.asarray(state.density).ndim + 1
+        )
         for model, suffix in (
             (self.turbulent_model, "turb"),
             (self.classical_model, "classical"),
@@ -1808,12 +1812,15 @@ class CombinedTransportFluxModel(TransportFluxModelBase):
                 )(state)
 
             _, pullback = jax.vjp(_model_fluxes, geometry_delta0)
-            (model_bar,) = pullback(
-                {
-                    "Gamma": _bar("Gamma") + _bar(f"Gamma_{suffix}"),
-                    "Q": _bar("Q") + _bar(f"Q_{suffix}"),
-                    "Upar": _bar("Upar") + _bar(f"Upar_{suffix}"),
-                }
+            model_flux_bar = {
+                "Gamma": _bar("Gamma") + _bar(f"Gamma_{suffix}"),
+                "Q": _bar("Q") + _bar(f"Q_{suffix}"),
+                "Upar": _bar("Upar") + _bar(f"Upar_{suffix}"),
+            }
+            model_bar = (
+                jax.vmap(lambda one_bar: pullback(one_bar)[0])(model_flux_bar)
+                if batched_rhs
+                else pullback(model_flux_bar)[0]
             )
             geometry_bar = _add_float_delta_tree(geometry_bar, model_bar)
         return geometry_bar

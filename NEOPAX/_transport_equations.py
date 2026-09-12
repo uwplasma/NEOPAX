@@ -2550,6 +2550,47 @@ class ComposedEquationSystem:
             fixed_flux_payloads, flux_bars,
         )
 
+    def _prepare_database_direct_rhs_support_batched(self, state, rhs_bars, support):
+        """Prepare one database primal and matrix-RHS equation-to-flux bars.
+
+        This is the objective-batched sibling of
+        :meth:`_prepare_database_direct_rhs_support`.  Only cotangents carry
+        the leading objective axis: the active fixed-table model, working
+        state, centre fluxes, and native face closures are evaluated once.
+        The record is call-local and never becomes part of a Radau tape.
+        """
+        if not isinstance(support, dict) or set(support) != {"geometry", "database"}:
+            raise ValueError(
+                "Batched database split RHS pullback requires geometry and database support."
+            )
+        active_flux_model = self._flux_model_with_realtime_support_payload(
+            self.shared_flux_model, support
+        )
+        if not callable(
+            getattr(active_flux_model, "pullback_direct_rhs_support_payload", None)
+        ):
+            raise NotImplementedError(
+                "Batched database split RHS pullback requires a compact flux transpose."
+            )
+        working_state, eidx = self._prepare_working_state(state)
+        center_fluxes = active_flux_model(working_state)
+        fixed_flux_payloads = self._capture_database_primal_fixed_flux_payloads(
+            working_state, center_fluxes
+        )
+        flux_bars = jax.vmap(
+            lambda one_rhs_bar: self._pullback_database_fixed_flux_payloads(
+                working_state, None, state, one_rhs_bar, fixed_flux_payloads
+            )
+        )(rhs_bars)
+        return _DatabaseRHSSupportPreparation(
+            active_flux_model,
+            working_state,
+            eidx,
+            center_fluxes,
+            fixed_flux_payloads,
+            flux_bars,
+        )
+
     def pullback_direct_rhs_database_split_support_payload(
         self, t, state, runtime, rhs_bar, support, *,
         support_preparation_mode=None, center_geometry_mode=None,
@@ -2617,6 +2658,119 @@ class ComposedEquationSystem:
             equation_geometry_bar["geometry"],
         )
         return result
+
+    def pullback_direct_rhs_database_split_support_payload_batched(
+        self,
+        t,
+        state,
+        runtime,
+        rhs_bar,
+        support,
+        *,
+        support_preparation_mode=None,
+        center_geometry_mode=None,
+    ):
+        """Matrix-RHS version of the explicit fixed-database support split.
+
+        The database table/coordinate transpose consumes all objective rows
+        together. Local flux geometry consumes the matrix cotangent directly;
+        fixed-flux equation geometry batches only its established scalar
+        pullback application. Both share the same centre and face primal
+        preparation. This is intentionally a separate opt-in hook;
+        the scalar split API and every Lij/root caller remain unchanged.
+        """
+        if support_preparation_mode is not None:
+            support_preparation_mode = str(support_preparation_mode).strip().lower()
+            if support_preparation_mode not in {"separate", "shared"}:
+                raise ValueError(
+                    "support_preparation_mode must be 'separate', 'shared', or None; "
+                    f"got {support_preparation_mode!r}."
+                )
+        center_geometry_mode = _validate_database_center_geometry_mode(
+            center_geometry_mode
+        )
+        if not isinstance(support, dict) or set(support) != {"geometry", "database"}:
+            raise ValueError(
+                "Batched database split RHS pullback requires exactly "
+                "{'geometry', 'database'} support."
+            )
+
+        boundary_names = (
+            "pullback_direct_rhs_database_table_payload",
+            "pullback_direct_rhs_database_flux_geometry_payload",
+            "pullback_direct_rhs_database_equation_geometry_payload",
+        )
+        use_shared_builtin = (
+            support_preparation_mode != "separate"
+            and all(
+                hasattr(self, name)
+                for name in ("equations", "density_equation", "temperature_equation")
+            )
+            and all(
+                getattr(getattr(self, name), "__func__", None)
+                is getattr(ComposedEquationSystem, name)
+                for name in boundary_names
+            )
+        )
+        if not use_shared_builtin:
+            return jax.vmap(
+                lambda one_rhs_bar: self.pullback_direct_rhs_database_split_support_payload(
+                    t,
+                    state,
+                    runtime,
+                    one_rhs_bar,
+                    support,
+                    support_preparation_mode=support_preparation_mode,
+                    center_geometry_mode=center_geometry_mode,
+                )
+            )(rhs_bar)
+
+        prepared = self._prepare_database_direct_rhs_support_batched(
+            state, rhs_bar, support
+        )
+        table_support_bar = self.pullback_direct_rhs_database_table_payload(
+            t, state, runtime, rhs_bar, support, _prepared=prepared
+        )
+        geometry_kwargs = _database_center_geometry_pullback_kwargs(
+            self.pullback_direct_rhs_database_flux_geometry_payload,
+            center_geometry_mode,
+        )
+
+        # The compact centre and native-face geometry primitives already
+        # understand a leading objective axis. Invoke them once so their
+        # physical-mesh JVP and face primal closures are not rebuilt per row.
+        flux_geometry_bar = self.pullback_direct_rhs_database_flux_geometry_payload(
+            t,
+            state,
+            runtime,
+            rhs_bar,
+            support,
+            _prepared=prepared,
+            **geometry_kwargs,
+        )
+
+        # Equation geometry is a fixed-flux linear pullback. Keep its proven
+        # scalar boundary and batch only the cotangent applications; all
+        # database/centre/face primal values still come from ``prepared``.
+        equation_geometry_bar = jax.vmap(
+            lambda one_rhs_bar: self.pullback_direct_rhs_database_equation_geometry_payload(
+                t,
+                state,
+                runtime,
+                one_rhs_bar,
+                support,
+                _prepared=prepared,
+            )["geometry"]
+        )(rhs_bar)
+        geometry_bar = jax.tree_util.tree_map(
+            lambda flux_bar, equation_bar: flux_bar + equation_bar,
+            flux_geometry_bar["geometry"],
+            equation_geometry_bar,
+        )
+        return {
+            "database": table_support_bar["database"],
+            "geometry": geometry_bar,
+        }
 
     def pullback_direct_rhs_support_payload(
         self, t, state, runtime, rhs_bar, support, *, center_geometry_mode=None
