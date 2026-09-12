@@ -1280,18 +1280,23 @@ def build_database_initial_root_experiment_stage(
 
         single_radius_root = jax.jit(_single_radius_root, inline=False)
 
+        # Define the scan body once with the persistent stage.  Creating this
+        # closure inside ``_selected_root_scan`` gives ``lax.scan`` a fresh
+        # callable identity on every optimizer evaluation, which creates a
+        # new dispatch-cache entry despite the unchanged radius-local JIT.
+        # This mirrors the established realtime stage boundary while retaining
+        # its numerical operation order.
+        def _root_scan_body(carry, radius_index):
+            state_inner, geometry_inner, database_inner = carry
+            root_row = single_radius_root(
+                state_inner, radius_index, geometry_inner, database_inner
+            )
+            return carry, root_row
+
         def _selected_root_scan(state, geometry_leaves, database_leaves):
             radius_indices = jnp.arange(state.Er.shape[0], dtype=jnp.int32)
-
-            def _scan_body(carry, radius_index):
-                state_inner, geometry_inner, database_inner = carry
-                root_row = single_radius_root(
-                    state_inner, radius_index, geometry_inner, database_inner
-                )
-                return carry, root_row
-
             _, root_rows = jax.lax.scan(
-                _scan_body,
+                _root_scan_body,
                 (state, geometry_leaves, database_leaves),
                 radius_indices,
             )
