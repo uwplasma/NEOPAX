@@ -18,6 +18,8 @@ from ._transport_flux_models import (
     _float_delta_tree_like,
     _sanitize_float_delta_bar_tree,
     _database_geometry_with_constrained_axis_face,
+    _database_center_geometry_pullback_kwargs,
+    _validate_database_center_geometry_mode,
     build_evaluated_transport_state,
     build_face_transport_state,
     build_ntss_like_face_transport_state,
@@ -2283,7 +2285,8 @@ class ComposedEquationSystem:
         return table_support_bar
 
     def pullback_direct_rhs_database_flux_geometry_payload(
-        self, t, state, runtime, rhs_bar, support, *, _prepared=None
+        self, t, state, runtime, rhs_bar, support, *, _prepared=None,
+        center_geometry_mode=None,
     ):
         """Return the direct *flux-model* geometry bar of a fixed database RHS.
 
@@ -2301,6 +2304,7 @@ class ComposedEquationSystem:
         geometry transpose.
         """
         del t, runtime
+        center_geometry_mode = _validate_database_center_geometry_mode(center_geometry_mode)
         if not isinstance(support, dict) or set(support) != {"geometry", "database"}:
             raise ValueError(
                 "Database direct-flux geometry pullback requires exactly "
@@ -2320,6 +2324,9 @@ class ComposedEquationSystem:
                 "Database direct-flux geometry pullback requires the compact "
                 "fixed-table geometry transpose."
         )
+        geometry_kwargs = _database_center_geometry_pullback_kwargs(
+            geometry_pullback, center_geometry_mode
+        )
         if _prepared is None:
             working_state, _ = self._prepare_working_state(state)
             shared_fluxes = active_shared_flux_model(working_state)
@@ -2329,7 +2336,7 @@ class ComposedEquationSystem:
         if not hasattr(self, "equations"):
             flux_bar = self.pullback_shared_fluxes(state, shared_fluxes, rhs_bar)
             geometry_bar = geometry_pullback(
-                working_state, flux_bar, support["geometry"]
+                working_state, flux_bar, support["geometry"], **geometry_kwargs
             )
             support_bar = dict(_float_delta_tree_like(support))
             support_bar["geometry"] = _sanitize_float_delta_bar_tree(
@@ -2350,6 +2357,7 @@ class ComposedEquationSystem:
             working_state,
             center_flux_bar,
             support["geometry"],
+            **geometry_kwargs,
         )
         face_geometry_bar = self._pullback_database_primal_face_geometry_bars(
             working_state,
@@ -2543,7 +2551,8 @@ class ComposedEquationSystem:
         )
 
     def pullback_direct_rhs_database_split_support_payload(
-        self, t, state, runtime, rhs_bar, support
+        self, t, state, runtime, rhs_bar, support, *,
+        support_preparation_mode=None, center_geometry_mode=None,
     ):
         """Database-only split RHS transpose for a Radau reverse stage.
 
@@ -2553,7 +2562,19 @@ class ComposedEquationSystem:
         geometry is carried separately beside it. The three built-in partials
         share call-local primal values and equation-to-flux cotangents without
         changing their compact transpose rules or any Lij dispatch.
+        ``support_preparation_mode='separate'`` retains the independent
+        partials for benchmark comparisons; omitted options keep current use.
         """
+        if support_preparation_mode is not None:
+            support_preparation_mode = str(support_preparation_mode).strip().lower()
+            if support_preparation_mode not in {"separate", "shared"}:
+                raise ValueError(
+                    "support_preparation_mode must be 'separate', 'shared', or None; "
+                    f"got {support_preparation_mode!r}."
+                )
+        geometry_kwargs = _database_center_geometry_pullback_kwargs(
+            self.pullback_direct_rhs_database_flux_geometry_payload, center_geometry_mode
+        )
         boundary_names = (
             "pullback_direct_rhs_database_table_payload",
             "pullback_direct_rhs_database_flux_geometry_payload",
@@ -2561,7 +2582,7 @@ class ComposedEquationSystem:
         )
         # Third-party overrides keep the original public dispatch/signature;
         # partial algebra fixtures also retain their established fallback.
-        share_preparation = all(
+        share_preparation = support_preparation_mode != "separate" and all(
             hasattr(self, name) for name in ("equations", "density_equation", "temperature_equation")
         ) and all(
             getattr(getattr(self, name), "__func__", None)
@@ -2576,7 +2597,7 @@ class ComposedEquationSystem:
             t, state, runtime, rhs_bar, support, **preparation_kwargs
         )
         flux_geometry_bar = self.pullback_direct_rhs_database_flux_geometry_payload(
-            t, state, runtime, rhs_bar, support, **preparation_kwargs
+            t, state, runtime, rhs_bar, support, **preparation_kwargs, **geometry_kwargs
         )
         equation_geometry_bar = (
             self.pullback_direct_rhs_database_equation_geometry_payload(
@@ -2597,7 +2618,9 @@ class ComposedEquationSystem:
         )
         return result
 
-    def pullback_direct_rhs_support_payload(self, t, state, runtime, rhs_bar, support):
+    def pullback_direct_rhs_support_payload(
+        self, t, state, runtime, rhs_bar, support, *, center_geometry_mode=None
+    ):
         """Generic black-box RHS transpose with respect to realtime support.
 
         Specific models may replace their support reconstruction behind the
@@ -2607,6 +2630,9 @@ class ComposedEquationSystem:
         """
         is_exact_ntx_support = isinstance(support, dict) and "ntx_support" in support
         is_recorded_database_support = isinstance(support, dict) and "database" in support
+        center_geometry_mode = _validate_database_center_geometry_mode(center_geometry_mode)
+        if center_geometry_mode is not None and not is_recorded_database_support:
+            raise ValueError("center_geometry_mode requires a recorded database support payload.")
         # Bind the live payload once before taking any black-box boundary.
         # The runtime-scan model otherwise still owns its construction-time
         # database, while the support tree owns the recorded primal that must
@@ -2646,7 +2672,11 @@ class ComposedEquationSystem:
                         "a mapping containing the database table bar."
                     )
                 flux_geometry_bar = self.pullback_direct_rhs_database_flux_geometry_payload(
-                    t, state, runtime, rhs_bar, support
+                    t, state, runtime, rhs_bar, support,
+                    **_database_center_geometry_pullback_kwargs(
+                        self.pullback_direct_rhs_database_flux_geometry_payload,
+                        center_geometry_mode,
+                    ),
                 )
                 equation_geometry_bar = (
                     self.pullback_direct_rhs_database_equation_geometry_payload(
@@ -2686,6 +2716,10 @@ class ComposedEquationSystem:
                 ),
             }
 
+        if center_geometry_mode is not None:
+            raise TypeError(
+                "Explicit center_geometry_mode requires the database direct-support hook."
+            )
         support_delta0 = _float_delta_tree_like(support)
         _, support_pullback = jax.vjp(
             lambda support_delta: self.with_realtime_geometry_support_payload(

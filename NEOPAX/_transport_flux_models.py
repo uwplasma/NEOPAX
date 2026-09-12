@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import functools
 import contextlib
+import inspect
 import os
 from typing import Any, Callable
 import abc
@@ -1422,6 +1423,45 @@ def build_ntss_like_face_transport_state(
     )
 
 
+def _validate_database_center_geometry_mode(mode):
+    """Normalize the optional, call-local database centre transpose selector."""
+    if mode is None:
+        return None
+    mode = str(mode).strip().lower()
+    if mode not in {"radial_vjp", "scalar_jvp"}:
+        raise ValueError(
+            "center_geometry_mode must be 'radial_vjp', 'scalar_jvp', or None; "
+            f"got {mode!r}."
+        )
+    return mode
+
+
+def _database_center_geometry_pullback_kwargs(pullback, mode):
+    """Preserve legacy hook signatures and reject unsupported explicit modes."""
+    mode = _validate_database_center_geometry_mode(mode)
+    if mode is None:
+        return {}
+    try:
+        parameters = inspect.signature(pullback).parameters
+    except (TypeError, ValueError) as error:
+        raise TypeError(
+            "Explicit center_geometry_mode requires a hook accepting that keyword."
+        ) from error
+    parameter = parameters.get("center_geometry_mode")
+    if (
+        parameter is not None
+        and parameter.kind in {
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+            inspect.Parameter.KEYWORD_ONLY,
+        }
+    ) or any(item.kind == inspect.Parameter.VAR_KEYWORD for item in parameters.values()):
+        return {"center_geometry_mode": mode}
+    raise TypeError(
+        "Explicit center_geometry_mode requires a hook accepting that keyword; "
+        f"{getattr(pullback, '__qualname__', type(pullback).__name__)} does not."
+    )
+
+
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True, eq=False)
 class CombinedTransportLaggedResponse:
@@ -1704,7 +1744,9 @@ class CombinedTransportFluxModel(TransportFluxModelBase):
             state_bar = _add(state_bar, model_state_bar)
         return state_bar
 
-    def pullback_direct_rhs_geometry_by_radius(self, state, flux_bar, geometry):
+    def pullback_direct_rhs_geometry_by_radius(
+        self, state, flux_bar, geometry, *, center_geometry_mode=None
+    ):
         """Split direct-flux geometry bars without tracing the database table.
 
         The neoclassical database branch uses its compact local rule.  Any
@@ -1712,7 +1754,10 @@ class CombinedTransportFluxModel(TransportFluxModelBase):
         composite contract remains exact when, for example, turbulence owns a
         geometry-dependent coefficient.
         """
+        center_geometry_mode = _validate_database_center_geometry_mode(center_geometry_mode)
         if self.center_flux_mode != "direct":
+            if center_geometry_mode is not None:
+                raise ValueError("center_geometry_mode requires center_flux_mode='direct'.")
             return None
         neo_pullback = getattr(
             self.neoclassical_model,
@@ -1720,6 +1765,8 @@ class CombinedTransportFluxModel(TransportFluxModelBase):
             None,
         )
         if not callable(neo_pullback):
+            if center_geometry_mode is not None:
+                raise TypeError("Explicit center_geometry_mode requires a centre geometry pullback hook.")
             return None
         zero = jnp.zeros_like(jnp.asarray(state.density))
 
@@ -1738,6 +1785,7 @@ class CombinedTransportFluxModel(TransportFluxModelBase):
                 "Upar": _bar("Upar") + _bar("Upar_neo"),
             },
             geometry,
+            **_database_center_geometry_pullback_kwargs(neo_pullback, center_geometry_mode),
         )
         geometry_delta0 = _float_delta_tree_like(geometry)
         for model, suffix in (
@@ -4423,7 +4471,9 @@ class NTXDatabaseTransportModel(TransportFluxModelBase):
             support_bar["database"] = _sanitize_float_delta_bar_tree(database, database_bar)
         return support_bar
 
-    def pullback_direct_rhs_geometry_by_radius(self, state, flux_bar, geometry):
+    def pullback_direct_rhs_geometry_by_radius(
+        self, state, flux_bar, geometry, *, center_geometry_mode=None
+    ):
         """Transpose fixed-table centre fluxes on their physical mesh.
 
         The built-in runtime-database primitive depends on local geometry only
@@ -4431,8 +4481,12 @@ class NTXDatabaseTransportModel(TransportFluxModelBase):
         physical direction, ``a_b``. Differentiate that direction once before
         contracting objective rows, instead of reversing each radius against
         every geometry leaf. Custom evaluators and legacy databases retain the
-        general per-radius VJP.
+        general per-radius VJP. ``radial_vjp`` explicitly selects that old
+        rule; ``scalar_jvp`` and an omitted selector keep the guarded mesh rule.
         """
+        center_geometry_mode = _validate_database_center_geometry_mode(center_geometry_mode)
+        if center_geometry_mode == "radial_vjp":
+            return self._pullback_direct_rhs_geometry_by_radius_vjp(state, flux_bar, geometry)
         if (
             type(self) is NTXDatabaseTransportModel
             and isinstance(self.database, Monoenergetic)
@@ -7385,11 +7439,15 @@ class NTXRuntimeScanTransportModel(TransportFluxModelBase):
             state, face_state, flux_bar, geometry, **kwargs
         )
 
-    def pullback_direct_rhs_geometry_by_radius(self, state, flux_bar, geometry):
+    def pullback_direct_rhs_geometry_by_radius(
+        self, state, flux_bar, geometry, *, center_geometry_mode=None
+    ):
         """Delegate the compact fixed-database direct-flux geometry transpose."""
 
-        return self._database_model().pullback_direct_rhs_geometry_by_radius(
-            state, flux_bar, geometry
+        pullback = self._database_model().pullback_direct_rhs_geometry_by_radius
+        return pullback(
+            state, flux_bar, geometry,
+            **_database_center_geometry_pullback_kwargs(pullback, center_geometry_mode),
         )
 
     def pullback_local_particle_flux_support_payload(self, state, flux_bar, support):

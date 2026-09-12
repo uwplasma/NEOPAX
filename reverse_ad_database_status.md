@@ -2,6 +2,106 @@
 
 ## Latest checkpoint - 2026-09-12
 
+### Continued support-cost audit
+
+The focused performance-mode, CLI plumbing, shared-stage Jacobian and support
+reuse gate was rerun: **68 passed in 22.51 s**. Production interpolation is
+unchanged and matches the forward runtime database; the TOML's
+`ntss_like_midpoint` setting belongs to Er permittivity, not interpolation.
+The user confirmed that preserving forward/TOML behaviour is the requirement.
+See [the active support-path audit](docs/benchmarks/database_reverse_support_cost_audit.md)
+for the confirmed generic interpolation dispatch and the standalone fixture's
+`7 x 16 x 12` file-table versus `7 x 16 x 11` runtime-table distinction.
+No new full 16/4 timing or peak-RSS result has been obtained.
+
+The isolated stage/support cost probe now defaults to one component per fresh
+process, saves lowered IR before compilation, and records fixture dimensions,
+input fingerprints and synchronized samples. Its control/metadata/comparison
+gate passed **22 tests in 0.75 s**, without VMEC or JAX compilation. The next
+larger-machine command is in the support audit linked above.
+
+A bounded coefficient-axis batching micro-probe matched all nine finite query
+cases and reduced its compiled graph/time, but increased temporary GPU memory
+(9.358 -> 10.376 MB). It is diagnostic-only and has not been installed in the
+production support path. Radius-coordinate batching is still only a proposed
+next experiment, not an implemented or measured speedup.
+
+### Resumed: isolated performance selectors and initial-support candidate
+
+Implementation has resumed after recording the completed run below. Current
+defaults remain `split / shared / scalar_jvp`; full-transport-only CLI controls
+also select the earlier `generic / separate / radial_vjp` paths.
+An opt-in `reduced_zero` initial-support mode avoids tracing the support
+transpose of structurally zero initial predictor-stage cotangents. It does not
+skip the initial state, ambipolar-root, profile, or recorded-scan pullbacks.
+
+See [performance modes and exact commands](docs/benchmarks/database_reverse_performance_modes.md).
+The current 22.264 s warm segment reference has not yet been improved by these
+selectors. Component-level exact-block/Jacobian timing is being evaluated
+separately; no 6 s full-reverse or reduced peak-RSS claim is established.
+No default Radau derivative, root optimization JIT boundary, or reusable cache
+has been changed.
+
+The fourth control, `--reverse-database-stage-jacobian-mode`, defaults to
+`independent` and adds the opt-in `shared` exact-Jacobian reuse candidate.
+The completed local 51-radius stage-pair probe gave exactly equal finite
+adjoints, warm medians 0.681442 -> 0.415849 s, and compiled temporary **device**
+storage 2.429 -> 1.972 GB. These are not full four-step segment timings or
+process host-RSS values. Raw warm samples and limitations are archived in
+[`database_stage_cost_2026-09-12.json`](docs/benchmarks/database_stage_cost_2026-09-12.json).
+The subsequent support compilation in that multi-kernel probe hit the local
+WSL host limit; no successful support timing or new full-run peak RSS exists.
+
+Validation so far: the focused shared-stage, initial/root preservation,
+selector/callback and support-reuse gate passed **67 tests in 23.76 s**.
+The real-table centre geometry plus existing Radau/root-JIT gate separately
+passed **19 tests in 207.21 s**. No new expensive full 16/4 run was launched.
+After the final CLI guard, **23 CLI/Radau/root-JIT cases passed in 13.20 s**.
+The actual production shared-J helper also passed a five-radius GPU real-table
+exact-equality check. The remaining support-compiler problem was confirmed by
+a fresh small probe approaching the local host limit; it was safely stopped,
+not promoted as a successful timing/memory result. No probe process remains.
+
+### Completed performance run recorded (preceding pause)
+
+The latest completed no-diagnostics 16/4 run is now saved with all 17 residuals,
+136 Jacobian entries, all progress-phase timings, the executed command, and
+resource counters at the top of
+[`reverse_ad_vs_fd_database.md`](reverse_ad_vs_fd_database.md).
+Verbatim baseline and new run archives are in `docs/benchmarks/`.
+This result supersedes the pending-result statements below.
+
+| Completed-run metric | Before | After |
+| --- | ---: | ---: |
+| Whole-process wall time | 1:19:27 | 1:18:20 |
+| Benchmark internal elapsed | 3805.329 s | 3776.534 s |
+| Peak host RSS | 15051068 KiB (14.354 GiB) | 14486496 KiB (13.815 GiB) |
+| Warm four-step segment mean | 22.813 s | 22.264 s |
+| Segment sweep, including first-call overhead | 1136.374 s | 1076.337 s |
+| Initial direct-RHS support | 296.198 s | 568.883 s |
+| Final recorded-scan fold | 770.232 s | 707.702 s |
+
+Overall: 67 s (1.405%) less wall time and 551.340 MiB (3.751%) less peak host
+RSS in this comparison. The initial-support phase is still 272.685 s slower.
+The earlier +112.525 s figure described an incomplete printed-phase subtotal,
+not the final wall time. No large or repeatable speedup is established.
+
+All 17 residuals and all 102 profile-column entries match exactly at printed
+precision. All 136 derivatives are finite. Maximum transport-Jacobian relative
+change is 2.806420e-14; maximum across all rows is 9.929343e-11. The existing
+AD-FD conclusions are unchanged, including the remaining bootstrap geometry
+relative errors of approximately 2.404e-3 (RBC) and 3.413e-3 (ZBS).
+
+The user paused implementation to record these results. No production code or
+CLI options were changed in this recording step. The next authorized task,
+when resumed, is to restore an independently selectable pre-change performance
+baseline and isolate current candidates behind CLI flags before more tuning.
+The target is approximately 6 s warm database reverse against approximately
+2 s forward; the Lij 220 s / 600 s example is a ratio reference, not an absolute
+database timing comparison. The 22.264 s warm segment result does not meet it.
+Preserve the existing derivative fixes, root optimization JIT boundaries,
+unrelated changes and caches; do not revert whole commits.
+
 This checkpoint supersedes the historical implementation/failure notes below.
 The detailed derivative tables and latest performance audit are in
 [`reverse_ad_vs_fd_database.md`](reverse_ad_vs_fd_database.md).

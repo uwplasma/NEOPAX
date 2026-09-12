@@ -1822,13 +1822,15 @@ def _flat_rhs_lagged_response_support_pullback_factory(unravel, vector_field, ar
 
 
 def _flat_rhs_direct_support_pullback_factory(
-    unravel, vector_field, args, kwargs, project_flat=None
+    unravel, vector_field, args, kwargs, project_flat=None, *, pullback_options=None
 ):
     """Flatten the owner-level black-box support transpose."""
     pullback_fn = _direct_rhs_support_pullback_hook(vector_field)
     if pullback_fn is None:
         return None
     unravel_bar = getattr(unravel, "cotangent", unravel)
+    hook_kwargs = dict(kwargs)
+    hook_kwargs.update(pullback_options or {})
 
     def _pullback(t_value, flat_y, rhs_bar_flat, support):
         projected_flat_y = _project_flat_state_if_needed(flat_y, project_flat)
@@ -1837,7 +1839,7 @@ def _flat_rhs_direct_support_pullback_factory(
             jnp.asarray(rhs_bar_flat, dtype=jnp.asarray(flat_y).dtype)
         )
         return pullback_fn(
-            t_value, state_y, *args, rhs_bar=rhs_bar_state, support=support, **kwargs
+            t_value, state_y, *args, rhs_bar=rhs_bar_state, support=support, **hook_kwargs
         )
 
     # The direct hook is used solely by the black-box transport route.  Keep
@@ -1849,7 +1851,8 @@ def _flat_rhs_direct_support_pullback_factory(
 
 
 def _flat_rhs_direct_database_payload_pullback_factory(
-    unravel, vector_field, args, kwargs, hook_name: str, project_flat=None
+    unravel, vector_field, args, kwargs, hook_name: str, project_flat=None,
+    *, pullback_options=None,
 ):
     """Flatten a named, database-only black-box RHS support transpose.
 
@@ -1862,6 +1865,8 @@ def _flat_rhs_direct_database_payload_pullback_factory(
     if pullback_fn is None:
         return None
     unravel_bar = getattr(unravel, "cotangent", unravel)
+    hook_kwargs = dict(kwargs)
+    hook_kwargs.update(pullback_options or {})
 
     def _pullback(t_value, flat_y, rhs_bar_flat, support):
         projected_flat_y = _project_flat_state_if_needed(flat_y, project_flat)
@@ -1870,7 +1875,7 @@ def _flat_rhs_direct_database_payload_pullback_factory(
             jnp.asarray(rhs_bar_flat, dtype=jnp.asarray(flat_y).dtype)
         )
         return pullback_fn(
-            t_value, state_y, *args, rhs_bar=rhs_bar_state, support=support, **kwargs
+            t_value, state_y, *args, rhs_bar=rhs_bar_state, support=support, **hook_kwargs
         )
 
     return jax.jit(_pullback, inline=False)
@@ -4936,6 +4941,13 @@ class _RadauAcceptedStepPhysicsContext:
     # the same stage loop also carries the local fixed-table geometry terms.
     # Only the database leaf crosses the recorded scan afterwards.
     reverse_database_include_direct_geometry: bool = False
+    # Explicit database performance selectors. Defaults preserve the measured
+    # September-12 path; no root-only or Lij hook is rebound by these fields.
+    reverse_database_initial_support_mode: str = "split"
+    reverse_database_support_preparation_mode: str = "shared"
+    reverse_database_center_geometry_mode: str = "scalar_jvp"
+    # Opt-in, call-local reuse of exact stage Jacobians; never a carry/tape field.
+    reverse_database_stage_jacobian_mode: str = "independent"
     reverse_initial_cache_support_pullback_mode: str = "scalar"
     reverse_rebuild_support_pullback_mode: str = "separate"
     reverse_segment_jit_diagnostics: bool = False
@@ -6935,6 +6947,9 @@ def _radau_fixed_lagged_step_reverse_common(
     values are transient slot values: none are added to the segment record or
     to the reverse scan carry.
     """
+    shared_stage_jacobian = _radau_database_shared_stage_jacobian_enabled(
+        physics_context, lagged_response
+    )
 
     def _add_tangent_trees(lhs, rhs, primal):
         lhs_aligned = _radau_align_tangent_tree_to_primal(lhs, primal)
@@ -6958,7 +6973,12 @@ def _radau_fixed_lagged_step_reverse_common(
     dz_bars = primal_result.trial_dt * kernel_context.b[None, :, None] * trial_y_bars[:, None, :]
     memory_mode = str(getattr(physics_context, "reverse_stage_adjoint_memory_mode", "default")).strip().lower()
     with _radau_reverse_profile_scope(physics_context, "reverse_segment/stage_adjoint_solve"):
-        if memory_mode in {"stage_call_boundary", "call_boundary", "call_stage_adjoint"}:
+        if shared_stage_jacobian:
+            residual_bars, shared_residual_y_bars = _radau_database_shared_stage_solve_and_state_pullback_batched(
+                kernel_context, physics_context, carry_in, primal_result,
+                rhs=dz_bars.reshape((dz_bars.shape[0], -1)),
+            )
+        elif memory_mode in {"stage_call_boundary", "call_boundary", "call_stage_adjoint"}:
             residual_bars = jax.vmap(
                 lambda dz_bar: _radau_solve_exact_stage_residual_transpose(
                     kernel_context, physics_context, carry_in, primal_result, lagged_response,
@@ -6986,11 +7006,14 @@ def _radau_fixed_lagged_step_reverse_common(
         support_bar_leaves = tuple(jax.tree_util.tree_leaves(support_bars))
     elif rhs_pullback_mode == "separate":
         with _radau_reverse_profile_scope(physics_context, "reverse_segment/fixed_lagged_rhs_state_transpose"):
-            residual_y_bars, _, residual_lagged_bars = jax.vmap(
-                lambda residual_bar: _radau_exact_stage_residual_input_pullback(
-                    kernel_context, physics_context, carry_in, primal_result, lagged_response, residual_bar, compute_dt_bar=False,
-                )
-            )(residual_bars)
+            if shared_stage_jacobian:
+                residual_y_bars, residual_lagged_bars = shared_residual_y_bars, None
+            else:
+                residual_y_bars, _, residual_lagged_bars = jax.vmap(
+                    lambda residual_bar: _radau_exact_stage_residual_input_pullback(
+                        kernel_context, physics_context, carry_in, primal_result, lagged_response, residual_bar, compute_dt_bar=False,
+                    )
+                )(residual_bars)
         with _radau_reverse_profile_scope(physics_context, "reverse_segment/fixed_lagged_rhs_support_transpose"):
             support_bar_leaves = jax.vmap(
                 lambda residual_bar: tuple(jax.tree_util.tree_leaves(_radau_sanitize_support_delta_bar_tree(
@@ -7242,6 +7265,8 @@ def _execute_radau_accepted_step_next_reduced_cotangent_batched_bwd_with_support
     """
 
     if support is None:
+        if str(getattr(physics_context, "reverse_database_stage_jacobian_mode", "independent")).strip().lower() != "independent":
+            raise ValueError("Shared database stage Jacobians require the batched support reverse path.")
         reduced_bars = _execute_radau_accepted_step_next_reduced_cotangent_batched_bwd(
             kernel_context,
             physics_context,
@@ -7345,6 +7370,9 @@ def _execute_radau_accepted_step_next_reduced_cotangent_batched_bwd_with_support
         _, project_pullback = jax.vjp(physics_context.project_flat, primal_result.trial_y)
         trial_y_bars = jax.vmap(lambda bar: project_pullback(bar)[0])(trial_y_bars)
     _database_trace("after_state_projection_pullback", trial_y_bars)
+    shared_stage_jacobian = _radau_database_shared_stage_jacobian_enabled(
+        physics_context, lagged_response
+    )
 
     dz_bars = (
         primal_result.trial_dt
@@ -7356,7 +7384,12 @@ def _execute_radau_accepted_step_next_reduced_cotangent_batched_bwd_with_support
     with _radau_reverse_profile_scope(
         physics_context, "reverse_segment/stage_adjoint_solve"
     ):
-        if memory_mode in {"stage_call_boundary", "call_boundary", "call_stage_adjoint"}:
+        if shared_stage_jacobian:
+            residual_bars, shared_residual_y_bars = _radau_database_shared_stage_solve_and_state_pullback_batched(
+                kernel_context, physics_context, carry_in, primal_result,
+                rhs=dz_bars.reshape((dz_bars.shape[0], -1)),
+            )
+        elif memory_mode in {"stage_call_boundary", "call_boundary", "call_stage_adjoint"}:
             residual_bars = jax.vmap(
                 lambda dz_bar: _radau_solve_exact_stage_residual_transpose(
                     kernel_context,
@@ -7439,17 +7472,20 @@ def _execute_radau_accepted_step_next_reduced_cotangent_batched_bwd_with_support
         with _radau_reverse_profile_scope(
             physics_context, "reverse_segment/fixed_lagged_rhs_state_transpose"
         ):
-            residual_y_bars, _, residual_lagged_bars = jax.vmap(
-                lambda residual_bar: _radau_exact_stage_residual_input_pullback(
-                    kernel_context,
-                    physics_context,
-                    carry_in,
-                    primal_result,
-                    lagged_response,
-                    residual_bar,
-                    compute_dt_bar=False,
-                )
-            )(residual_bars)
+            if shared_stage_jacobian:
+                residual_y_bars, residual_lagged_bars = shared_residual_y_bars, None
+            else:
+                residual_y_bars, _, residual_lagged_bars = jax.vmap(
+                    lambda residual_bar: _radau_exact_stage_residual_input_pullback(
+                        kernel_context,
+                        physics_context,
+                        carry_in,
+                        primal_result,
+                        lagged_response,
+                        residual_bar,
+                        compute_dt_bar=False,
+                    )
+                )(residual_bars)
         with _radau_reverse_profile_scope(
             physics_context, "reverse_segment/fixed_lagged_rhs_support_transpose"
         ):
@@ -12105,6 +12141,97 @@ def _radau_solve_exact_stage_residual_transpose_batched_iterative(
             )[0]
         )(rhs_arr)
     return solution.reshape(rhs_arr.shape)
+
+
+def _radau_database_shared_stage_jacobian_enabled(physics_context, lagged_response):
+    """Validate the narrow exact database contract before selecting shared work."""
+    mode = str(getattr(
+        physics_context, "reverse_database_stage_jacobian_mode", "independent"
+    )).strip().lower()
+    if mode == "independent":
+        return False
+    if mode != "shared":
+        raise ValueError(
+            "reverse_database_stage_jacobian_mode must be 'independent' or 'shared'; "
+            f"got {mode!r}."
+        )
+    required = {
+        "reverse_stage_adjoint_solve_mode": ("structured", {"block"}),
+        "reverse_rhs_transpose_mode": (
+            "generic", {"explicit_database", "database", "explicit_black_box_database"}
+        ),
+        "reverse_stage_cotangent_mode": ("full", {"full"}),
+        "reverse_stage_adjoint_memory_mode": ("default", {"default"}),
+        "reverse_rhs_pullback_mode": ("separate", {"separate"}),
+    }
+    if lagged_response is not None:
+        raise ValueError("Shared database stage Jacobians require a direct RHS without a lagged response.")
+    for name, (default, choices) in required.items():
+        selected = str(getattr(physics_context, name, default)).strip().lower()
+        if selected not in choices:
+            raise ValueError(
+                "reverse_database_stage_jacobian_mode='shared' requires "
+                f"{name} in {sorted(choices)}; got {selected!r}."
+            )
+    return True
+
+
+def _radau_database_shared_stage_solve_and_state_pullback_batched(
+    kernel_context: _RadauAcceptedStepKernelContext,
+    physics_context: _RadauAcceptedStepPhysicsContext,
+    carry_in: _RadauAcceptedStepCarry,
+    primal_result: _RadauAcceptedStepAttemptResult,
+    *,
+    rhs,
+):
+    """Reuse exact stage ``jacfwd`` values for the mapped solve and state bar.
+
+    The dense block assembly, objective-vmapped solve and contraction order
+    match the independent database ``block`` path. These Jacobians exist only
+    within this call, not in checkpoints, reduced carries, or a persistent cache.
+    """
+    if not _radau_database_shared_stage_jacobian_enabled(physics_context, None):
+        raise ValueError("The shared stage helper requires reverse_database_stage_jacobian_mode='shared'.")
+    stage_times, stage_states = _radau_exact_stage_times_states(
+        kernel_context, carry_in, primal_result
+    )
+
+    def _stage_jacobian(t_eval, y_eval):
+        return jax.jacfwd(
+            lambda y_value: _radau_eval_rhs(
+                t_eval, y_value, None,
+                physics_context.flat_rhs, physics_context.flat_rhs_with_lagged_response,
+            )
+        )(y_eval)
+
+    stage_jacobians = jax.vmap(_stage_jacobian, in_axes=(0, 0))(stage_times, stage_states)
+    eye_s = jnp.eye(kernel_context.num_stages, dtype=kernel_context.dtype)
+    eye_n = jnp.eye(kernel_context.state_dim, dtype=kernel_context.dtype)
+    block_system = (
+        eye_s[:, :, None, None] * eye_n[None, None, :, :]
+        - primal_result.trial_dt
+        * kernel_context.a[:, :, None, None]
+        * stage_jacobians[:, None, :, :]
+    )
+    matrix = jnp.transpose(block_system, (0, 2, 1, 3)).reshape(
+        (kernel_context.num_stages * kernel_context.state_dim,
+         kernel_context.num_stages * kernel_context.state_dim)
+    )
+    rhs_arr = jnp.asarray(rhs, dtype=kernel_context.dtype).reshape(
+        (-1, kernel_context.num_stages * kernel_context.state_dim)
+    )
+    residual_bars = jax.vmap(
+        lambda rhs_row: jnp.linalg.solve(matrix.T, -rhs_row).reshape((-1,))
+    )(rhs_arr)
+
+    def _state_pullback(residual_bar):
+        residual_stages = residual_bar.reshape((kernel_context.num_stages, kernel_context.state_dim))
+        jt_residual_stages = jax.vmap(lambda jacobian, bar: jacobian.T @ bar)(
+            stage_jacobians, residual_stages
+        )
+        return -jnp.sum(jt_residual_stages, axis=0)
+
+    return residual_bars, jax.vmap(_state_pullback)(residual_bars)
 
 
 def _radau_exact_stage_residual_matrix(

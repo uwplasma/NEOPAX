@@ -1,5 +1,250 @@
 # Database reverse AD versus FD status
 
+## Implementation resumed after the completed-run record
+
+The completed timings and derivative values below remain the measured
+reference. Further performance changes are now independently selectable;
+defaults preserve that run. See
+[database reverse performance modes](docs/benchmarks/database_reverse_performance_modes.md)
+for current/earlier selectors, the opt-in structural-zero initial-support
+candidate, validation plan, and no-diagnostics 16/4 commands. No new full GPU
+timing or derivative comparison has replaced the recorded reference.
+
+## 2026-09-12 completed no-diagnostics performance comparison (latest)
+
+This completed record supersedes the earlier partial-run timing conclusions
+and the pending-performance statements below. Implementation is paused at the
+user's request while these results are recorded. No new CLI restoration or
+performance implementation has been applied as part of this record.
+
+Sources (preserved verbatim, including all printed values and resource counters):
+
+- [Pre-change no-diagnostics baseline](docs/benchmarks/database_reverse_16x4_2026-09-12_baseline.md):
+  user attachment `79cfff38-9c8b-4b18-a1c4-26166b9c44e8`.
+- [Completed performance-change run](docs/benchmarks/database_reverse_16x4_2026-09-12_performance_run.md):
+  user attachment `ad2267de-488a-4836-bc6d-8aa7a928b6a1`.
+
+Both use the same database wHe TOML, 16 accepted steps / 4-step segments,
+`block`, `explicit_database`, `grouped_vjp`,
+`joint_local_vjp_upar_only`, `jax_selected_root`, all objectives, six profile
+DOFs and two geometry DOFs. Diagnostics and persistent compilation cache are off.
+The executed commands in the `/usr/bin/time` footers match except that the new
+one explicitly states `--optimization-api-profile-dofs include`, already the
+default. The mangled command at the top is not the executed command.
+Remote commit hashes and identical machine conditions are not printed in these
+logs; do not infer either from `git pull` saying up to date.
+
+### Completed timing and host-memory result
+
+| Metric | Before | After | Change |
+| --- | ---: | ---: | ---: |
+| Whole-process wall time | 1:19:27 (4767 s) | 1:18:20 (4700 s) | -67 s (-1.405%) |
+| Benchmark-reported internal elapsed time | 3805.329 s | 3776.534 s | -28.795 s (-0.757%) |
+| Peak process host RSS | 15051068 KiB (14.353817 GiB) | 14486496 KiB (13.815399 GiB) | -564572 KiB / -551.340 MiB (-3.751%) |
+| User CPU time | 5523.60 s | 5387.23 s | -136.37 s |
+| System CPU time | 274.81 s | 279.79 s | +4.98 s |
+| CPU percentage | 121% | 120% | -1 percentage point |
+| Mean of the three warm four-step segments | 22.813 s | 22.264 s | -0.549 s (-2.407%) |
+| Major page faults | 0 | 1794 | +1794 |
+| Swaps | 0 | 0 | unchanged |
+| Exit status | 0 | 0 | both successful |
+
+The completed run is **slightly faster and uses slightly less peak host memory**,
+not slower overall. This is only a 1.4% wall-time and 3.75% RSS improvement in
+one comparison, not a demonstrated large or repeatable performance gain.
+The initial direct-RHS support phase still regresses from 296.198 to 568.883 s
+(+272.685 s, +92.06%). The user target of approximately 6 s warm reverse
+against approximately 2 s forward is **not achieved**.
+
+The earlier +112.525 s result was the subtotal of 13 matching printed phases
+through initial-profile support, not whole-process wall time. The final fold
+and later geometry phases were then absent. Do not treat printed phase sums
+as exhaustive/disjoint wall-time accounting, or add nested compiler alarms,
+individual segment times and the sweep total together.
+
+### Every reported progress-phase timing
+
+All times are seconds. Individual segment rows are included in the sweep total.
+The first segment includes first-call overhead and is not a warm execution time.
+The `realized-schedule vjp forward` marker measures schedule-artifact reuse
+in this mode, not an independently timed complete forward evolution.
+
+| Reported phase | Before | After | After - before |
+| --- | ---: | ---: | ---: |
+| realtime geometry runtime build ready | 646.782 | 628.126 | -18.656 |
+| realtime geometry solver components ready | 0.566 | 0.654 | +0.088 |
+| support reverse profile-state vjp ready | 116.223 | 108.166 | -8.057 |
+| support reverse initial carry vjp ready | 0.918 | 0.931 | +0.013 |
+| support reverse realized-schedule vjp forward ready | 2.102 | 1.919 | -0.183 |
+| support reverse final-objective cotangents ready | 320.216 | 286.341 | -33.875 |
+| support reverse segment 4/4 ready | 1067.933 | 1009.543 | -58.390 |
+| support reverse segment 3/4 ready | 22.907 | 22.364 | -0.543 |
+| support reverse segment 2/4 ready | 23.099 | 22.391 | -0.708 |
+| support reverse segment 1/4 ready | 22.433 | 22.037 | -0.396 |
+| support reverse segmented cotangent sweep ready | 1136.374 | 1076.337 | -60.037 |
+| support reverse reduced carry bars expanded ready | 0.704 | 0.693 | -0.011 |
+| support reverse initial direct-RHS support pullback ready | 296.198 | 568.883 | +272.685 |
+| support reverse initial state pullback ready | 182.195 | 156.957 | -25.238 |
+| initial-Er root boundary compact pullback ready | 280.169 | 265.768 | -14.401 |
+| support reverse profile parameter pullback ready | 0.960 | 1.063 | +0.103 |
+| support reverse initial-profile scan payload pullback ready | 1.468 | 1.562 | +0.094 |
+| database final recorded-scan fold ready | 770.232 | 707.702 | -62.530 |
+| objective_table vmec implicit state/raw-block aux ready | 0.012 | 0.009 | -0.003 |
+| objective_table booz input tables ready | 2.348 | 1.767 | -0.581 |
+| objective_table booz_xform vjp ready | 8.907 | 7.520 | -1.387 |
+| objective_table vmec objective cotangents ready | 18.757 | 16.327 | -2.430 |
+| objective_table DMerc softmax cotangent ready | 12.440 | 11.926 | -0.514 |
+| objective_table boozer light cotangents ready | 3.271 | 2.502 | -0.769 |
+| objective_table aspect proxy cotangents ready | 0.103 | 0.089 | -0.014 |
+| objective_table j-qi/maxj Boozer cotangents ready | 34.504 | 31.715 | -2.789 |
+| objective_table booz cotangents pulled to state | 9.721 | 6.601 | -3.120 |
+| objective_table final vmec parameter pullback ready | 51.323 | 41.566 | -9.757 |
+
+Compiler events, reported separately (not added to the phase or wall totals):
+
+| Reported compilation | Before | After |
+| --- | ---: | ---: |
+| Early `jit_scan` alarm | 151.718771361 s | 137.964156020 s |
+| Post-sweep `jit__pullback` alarm | 187.536269204 s | 370.032824865 s |
+| Appended `jit__direct_cotangents` alarm | not present | 144.512548761 s |
+
+The last compiler label is associated with an initial-root experiment kernel
+in the inspected source, whereas this full-transport continuation should fold
+the recorded scan. Its ownership remains unverified in the pasted output; retain
+the raw line but do not assign it to a transport subphase or add it to total time.
+
+### Derivatives before versus after
+
+All 17 residuals match exactly at printed precision. All 136 Jacobian entries
+are finite. Of these, 122 printed entries are identical; the other 14 differ
+only at small floating-point levels:
+
+- All 102 entries in the six profile columns are unchanged, including all
+  60 transport-profile derivatives and the 42 zero geometry-profile entries.
+- Maximum relative change in the 80 transport-Jacobian entries:
+  `2.806420e-14` (Er transition right versus ZBS).
+- Maximum relative change over all 136 entries:
+  `9.929343e-11` (Boozer QI versus ZBS).
+- Maximum absolute change: `9.906944e-8` (Boozer max-J versus RBC,
+  whose derivative magnitude is approximately 3843).
+
+Here relative change is `abs(after-before)/max(abs(after),abs(before))`;
+equal zero pairs are assigned zero. These changes do not indicate a material
+derivative regression. They also do not improve the previously recorded AD-FD
+mismatches.
+
+#### All residuals and new geometry derivatives (full printed precision)
+
+| Objective | Residual | d/dRBC:1:0 | d/dZBS:1:0 |
+| --- | ---: | ---: | ---: |
+| `transport:softmax_Er` | 2.1347597245906741e+01 | -2.7683707281136634e+01 | 6.3556954390710576e+00 |
+| `transport:net_total_power_volume_average_mw_m3` | 5.0807530042924676e-01 | 5.7487580005064010e-05 | -6.4216000806514321e-03 |
+| `transport:Er_transition_left` | 1.7902257301111909e+01 | -1.3445891807357173e+01 | -8.6697187673723708e-01 |
+| `transport:Er_transition_right` | 1.8666769949428140e+01 | -1.5274580237777837e+01 | -5.0636952455206419e-01 |
+| `transport:Er2_volume_average` | 2.6970444513292227e+02 | -2.9602462298898990e+02 | -3.3046442994759883e+02 |
+| `transport:Er_volume_average` | -2.8511644406025951e+00 | -6.8360480192986506e+00 | 1.4302240534246733e+01 |
+| `transport:electron_temperature_volume_average_keV` | 6.5667321685714866e+00 | -1.6115942109770211e-02 | -3.9990631490992204e-02 |
+| `transport:total_pressure_volume_average` | 3.4217392413639516e+01 | -7.3305802256671312e-02 | -2.3761691183351247e-01 |
+| `transport:alpha_power_volume_average_mw_m3` | 5.8919528044396130e-01 | -1.1720032048136180e-04 | -6.8872114596785893e-03 |
+| `transport:bootstrap_current_softmax_abs_scaled` | 1.3717342708882792e+00 | -2.1363564988892496e+00 | -1.2135493890455435e+00 |
+| `geometry:boozer_qi_objective` | 2.1192029964274445e-01 | 5.9392891187040391e+00 | -1.2365550093568345e-01 |
+| `geometry:boozer_maxj_objective` | 4.4387332574094023e+02 | -3.8431351876830449e+03 | -1.9205082804617996e+03 |
+| `geometry:vmec_aspect_ratio` | 1.0015330918957178e+01 | -5.4006784187006147e+00 | -5.5226885751318529e+00 |
+| `geometry:vmec_iota_mean` | -5.9365259966101458e-01 | 2.4405140609263865e-01 | 1.4567526019820762e-01 |
+| `geometry:vmec_magnetic_well` | -2.7476128749679612e-02 | -1.1090116065531674e-02 | -4.1682027482238482e-02 |
+| `geometry:vmec_mirror_ratio` | 2.1153803467163693e-01 | -5.9359094714046601e-01 | 4.1437006125401626e-01 |
+| `geometry:vmec_dmerc_stability_softmax` | 3.2329612235882421e+00 | -7.2859943466255244e+00 | -1.5178996489713270e+00 |
+
+#### All six profile columns (full printed precision; identical to baseline)
+
+| Objective | d/dn0 | d/dT0 | d/density_shape_power | d/dtemperature_shape_power | d/ddensity_shape_alpha | d/dtemperature_shape_alpha |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `transport:softmax_Er` | -2.8702292832128968e+00 | 2.7740118826951718e+00 | -8.0970009092364181e-02 | 1.8718548957145615e+00 | 1.5312954921315222e-01 | 1.0768407297399117e+01 |
+| `transport:net_total_power_volume_average_mw_m3` | 2.4144994375404702e-01 | 8.1012117712766646e-02 | 1.0015251511699052e-03 | 2.7450389881309428e-01 | -2.4504760628385079e-04 | -3.9390935353161921e-01 |
+| `transport:Er_transition_left` | -9.8540288633937534e-01 | 1.5889831820635036e+00 | -1.2265911027762052e-02 | -7.1687550637460378e+00 | 1.5260136870844827e-02 | 1.5568052949830751e+01 |
+| `transport:Er_transition_right` | -1.0998955496995126e+00 | 1.6914404449598357e+00 | -1.7086805199196833e-02 | -6.2814820735972869e+00 | 2.2559732570020176e-02 | 1.5577054914522920e+01 |
+| `transport:Er2_volume_average` | 2.5842589258007074e+00 | 3.1320424054222428e+01 | 2.2824336263282099e+00 | -1.1938297555500746e+01 | 3.0861923809212257e+00 | 1.0694492154833915e+02 |
+| `transport:Er_volume_average` | -1.9024031619531510e+00 | 8.6605462867946792e-01 | -6.8688993949557423e-02 | -6.9405878986901259e-01 | -1.6832079944450518e-01 | 3.0165805596904787e+00 |
+| `transport:electron_temperature_volume_average_keV` | 8.6352302266201608e-04 | 3.5577917899824130e-01 | -7.1344857712301452e-05 | 1.5248015861809205e+00 | 1.2218646390351195e-03 | -3.0449272577867226e+00 |
+| `transport:total_pressure_volume_average` | 8.0624286614427199e+00 | 1.8654173307789694e+00 | 2.4426699648199540e-01 | 7.7523359564773786e+00 | -1.3265053153685458e+00 | -1.4516604356364713e+01 |
+| `transport:alpha_power_volume_average_mw_m3` | 2.7962100211621660e-01 | 8.3216104055209142e-02 | 2.3609178836717423e-03 | 2.8420414560668772e-01 | -7.6383506297708842e-03 | -4.1289868849445077e-01 |
+| `transport:bootstrap_current_softmax_abs_scaled` | 1.0697658604014659e-01 | 1.7479404655582315e-01 | -1.1999309293285526e-02 | 7.0788983350295842e-01 | 4.1575985810500586e-02 | -6.1967238271409819e-01 |
+| `geometry:boozer_qi_objective` | 0.0000000000000000e+00 | 0.0000000000000000e+00 | 0.0000000000000000e+00 | 0.0000000000000000e+00 | 0.0000000000000000e+00 | 0.0000000000000000e+00 |
+| `geometry:boozer_maxj_objective` | 0.0000000000000000e+00 | 0.0000000000000000e+00 | 0.0000000000000000e+00 | 0.0000000000000000e+00 | 0.0000000000000000e+00 | 0.0000000000000000e+00 |
+| `geometry:vmec_aspect_ratio` | 0.0000000000000000e+00 | 0.0000000000000000e+00 | 0.0000000000000000e+00 | 0.0000000000000000e+00 | 0.0000000000000000e+00 | 0.0000000000000000e+00 |
+| `geometry:vmec_iota_mean` | 0.0000000000000000e+00 | 0.0000000000000000e+00 | 0.0000000000000000e+00 | 0.0000000000000000e+00 | 0.0000000000000000e+00 | 0.0000000000000000e+00 |
+| `geometry:vmec_magnetic_well` | 0.0000000000000000e+00 | 0.0000000000000000e+00 | 0.0000000000000000e+00 | 0.0000000000000000e+00 | 0.0000000000000000e+00 | 0.0000000000000000e+00 |
+| `geometry:vmec_mirror_ratio` | 0.0000000000000000e+00 | 0.0000000000000000e+00 | 0.0000000000000000e+00 | 0.0000000000000000e+00 | 0.0000000000000000e+00 | 0.0000000000000000e+00 |
+| `geometry:vmec_dmerc_stability_softmax` | 0.0000000000000000e+00 | 0.0000000000000000e+00 | 0.0000000000000000e+00 | 0.0000000000000000e+00 | 0.0000000000000000e+00 | 0.0000000000000000e+00 |
+
+#### Geometry-column comparison against the pre-change AD run
+
+| Objective | RBC before | RBC after | RBC relative change | ZBS before | ZBS after | ZBS relative change |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `transport:softmax_Er` | -2.7683707281136662e+01 | -2.7683707281136634e+01 | 1.027e-15 | 6.3556954390710434e+00 | 6.3556954390710576e+00 | 2.236e-15 |
+| `transport:net_total_power_volume_average_mw_m3` | 5.7487580005064010e-05 | 5.7487580005064010e-05 | 0.000e+0 | -6.4216000806514321e-03 | -6.4216000806514321e-03 | 0.000e+0 |
+| `transport:Er_transition_left` | -1.3445891807357155e+01 | -1.3445891807357173e+01 | 1.321e-15 | -8.6697187673722109e-01 | -8.6697187673723708e-01 | 1.844e-14 |
+| `transport:Er_transition_right` | -1.5274580237777851e+01 | -1.5274580237777837e+01 | 9.304e-16 | -5.0636952455207840e-01 | -5.0636952455206419e-01 | 2.806e-14 |
+| `transport:Er2_volume_average` | -2.9602462298898990e+02 | -2.9602462298898990e+02 | 0.000e+0 | -3.3046442994759906e+02 | -3.3046442994759883e+02 | 6.880e-16 |
+| `transport:Er_volume_average` | -6.8360480192986559e+00 | -6.8360480192986506e+00 | 7.796e-16 | 1.4302240534246726e+01 | 1.4302240534246733e+01 | 4.968e-16 |
+| `transport:electron_temperature_volume_average_keV` | -1.6115942109770211e-02 | -1.6115942109770211e-02 | 0.000e+0 | -3.9990631490992204e-02 | -3.9990631490992204e-02 | 0.000e+0 |
+| `transport:total_pressure_volume_average` | -7.3305802256671312e-02 | -7.3305802256671312e-02 | 0.000e+0 | -2.3761691183351247e-01 | -2.3761691183351247e-01 | 0.000e+0 |
+| `transport:alpha_power_volume_average_mw_m3` | -1.1720032048136180e-04 | -1.1720032048136180e-04 | 0.000e+0 | -6.8872114596785893e-03 | -6.8872114596785893e-03 | 0.000e+0 |
+| `transport:bootstrap_current_softmax_abs_scaled` | -2.1363564988892496e+00 | -2.1363564988892496e+00 | 0.000e+0 | -1.2135493890455427e+00 | -1.2135493890455435e+00 | 7.319e-16 |
+| `geometry:boozer_qi_objective` | 5.9392891187203531e+00 | 5.9392891187040391e+00 | 2.747e-12 | -1.2365550092340527e-01 | -1.2365550093568345e-01 | 9.929e-11 |
+| `geometry:boozer_maxj_objective` | -3.8431351877821144e+03 | -3.8431351876830449e+03 | 2.578e-11 | -1.9205082804683188e+03 | -1.9205082804617996e+03 | 3.395e-12 |
+| `geometry:vmec_aspect_ratio` | -5.4006784187006147e+00 | -5.4006784187006147e+00 | 0.000e+0 | -5.5226885751318529e+00 | -5.5226885751318529e+00 | 0.000e+0 |
+| `geometry:vmec_iota_mean` | 2.4405140609263865e-01 | 2.4405140609263865e-01 | 0.000e+0 | 1.4567526019820762e-01 | 1.4567526019820762e-01 | 0.000e+0 |
+| `geometry:vmec_magnetic_well` | -1.1090116065531674e-02 | -1.1090116065531674e-02 | 0.000e+0 | -4.1682027482238482e-02 | -4.1682027482238482e-02 | 0.000e+0 |
+| `geometry:vmec_mirror_ratio` | -5.9359094714046601e-01 | -5.9359094714046601e-01 | 0.000e+0 | 4.1437006125401626e-01 | 4.1437006125401626e-01 | 0.000e+0 |
+| `geometry:vmec_dmerc_stability_softmax` | -7.2859943466255244e+00 | -7.2859943466255244e+00 | 0.000e+0 | -1.5178996489713270e+00 | -1.5178996489713270e+00 | 0.000e+0 |
+
+#### Comparison with the existing 16-step geometry FD values
+
+No new FD run was performed. The FD references are the existing
+same-revision frozen-linearized accepted-replay values in the composite
+face-geometry correction section below, printed to six significant digits.
+The formula is `abs(AD-FD)/max(abs(AD),abs(FD))`.
+
+| Objective | New RBC AD | Saved RBC FD | RBC relative error | New ZBS AD | Saved ZBS FD | ZBS relative error |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `transport:softmax_Er` | -2.7683707281136634e+01 | -2.768448e+01 | 2.791e-5 | 6.3556954390710576e+00 | 6.356321e+00 | 9.842e-5 |
+| `transport:net_total_power_volume_average_mw_m3` | 5.7487580005064010e-05 | 5.760105e-05 | 1.970e-3 | -6.4216000806514321e-03 | -6.421616e-03 | 2.479e-6 |
+| `transport:Er_transition_left` | -1.3445891807357173e+01 | -1.344607e+01 | 1.325e-5 | -8.6697187673723708e-01 | -8.667252e-01 | 2.845e-4 |
+| `transport:Er_transition_right` | -1.5274580237777837e+01 | -1.527506e+01 | 3.141e-5 | -5.0636952455206419e-01 | -5.059553e-01 | 8.180e-4 |
+| `transport:Er2_volume_average` | -2.9602462298898990e+02 | -2.960254e+02 | 2.625e-6 | -3.3046442994759883e+02 | -3.304945e+02 | 9.099e-5 |
+| `transport:Er_volume_average` | -6.8360480192986506e+00 | -6.835501e+00 | 8.002e-5 | 1.4302240534246733e+01 | 1.430209e+01 | 1.053e-5 |
+| `transport:electron_temperature_volume_average_keV` | -1.6115942109770211e-02 | -1.611605e-02 | 6.695e-6 | -3.9990631490992204e-02 | -3.999069e-02 | 1.463e-6 |
+| `transport:total_pressure_volume_average` | -7.3305802256671312e-02 | -7.330528e-02 | 7.124e-6 | -2.3761691183351247e-01 | -2.376173e-01 | 1.634e-6 |
+| `transport:alpha_power_volume_average_mw_m3` | -1.1720032048136180e-04 | -1.170870e-04 | 9.669e-4 | -6.8872114596785893e-03 | -6.887228e-03 | 2.402e-6 |
+| `transport:bootstrap_current_softmax_abs_scaled` | -2.1363564988892496e+00 | -2.141504e+00 | 2.404e-3 | -1.2135493890455435e+00 | -1.217705e+00 | 3.413e-3 |
+
+The saved profile-FD comparisons also remain unchanged because all profile
+derivatives match the prior AD values exactly. The largest saved transport-profile
+relative error remains approximately `1.986e-5` (Er transition left versus
+density_shape_alpha). The bootstrap geometry errors remain approximately
+`2.404e-3` (RBC) and `3.413e-3` (ZBS), while the small RBC net-power derivative
+retains approximately `1.970e-3` relative error. There is no new FD validation.
+
+### Executed command (from the time footer, not the mangled pasted header)
+
+```bash
+python ./examples/benchmarks/benchmark_transport_reverse_ad_only.py --config ./examples/benchmarks/Solve_Transport_equations_wHe_radau_ntx_scan_runtime_database_vmec_realtime_geometry_benchmark_black_box.toml --reverse-parameter-mode profiles_plus_realtime_geometry --reverse-geometry-parameter RBC:1:0,ZBS:1:0 --realtime-geometry-gradient-path reverse_payload --optimization-api-profile-dofs include --objective all --accepted-step-limit 16 --radau-jacobian-reuse-mode legacy --timing-mode jit-warm --reverse-segment-length 4 --reverse-stage-adjoint-solve-mode block --reverse-rhs-transpose-mode explicit_database --reverse-step-bwd-mode reduced_cotangent_call_boundary --reverse-initial-cache-support-pullback-mode scalar --reverse-rebuild-support-pullback-mode separate --reverse-final-objective-cotangent-mode grouped_vjp --reverse-bootstrap-cotangent-mode joint_local_vjp_upar_only --initial-Er-root-ad jax_selected_root --full-transport-shared-payload-smoke --reverse-schedule-artifact-mode reuse_static_probe
+```
+
+### Resume point after recording
+
+The user requested restoring the previous performance implementation as a
+CLI-selectable baseline, keeping current experiments separately selectable,
+then measuring database warm reverse costs against their approximately
+2 s forward / 6 s reverse target. None of the three automatically applied
+performance changes currently has such a selector. No whole-commit rollback,
+root optimization JIT change, derivative-contract change, or cache eviction
+is authorized by this recording step. Resume that implementation only after
+this recording/comparison handoff.
+
+
+
 ## Completed one-step database reverse run
 
 The black-box `ntx_scan_runtime` database benchmark completed its one accepted

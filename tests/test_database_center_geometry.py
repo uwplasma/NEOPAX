@@ -2,6 +2,7 @@
 
 import collections
 import dataclasses
+import types
 
 import jax
 import jax.numpy as jnp
@@ -11,7 +12,10 @@ from NEOPAX._database import Monoenergetic
 from NEOPAX._species import Species
 from NEOPAX._state import TransportState
 from NEOPAX._transport_flux_models import (
+    CombinedTransportFluxModel,
     NTXDatabaseTransportModel,
+    NTXRuntimeScanTransportModel,
+    ZeroTransportModel,
     _database_geometry_with_constrained_axis_face,
     _float_delta_tree_like,
 )
@@ -105,8 +109,12 @@ def test_database_center_mesh_jvp_matches_radius_vjp_and_direct_flux(rows):
                 if rows > 1 else forward_pullback(bars)[0])
 
     expected = _reference(state, geometry, bars)
-    old = jax.jit(model._pullback_direct_rhs_geometry_by_radius_vjp)(state, bars, geometry)
-    compact = jax.jit(model.pullback_direct_rhs_geometry_by_radius)(state, bars, geometry)
+    old = jax.jit(lambda state, bars, geometry: model.pullback_direct_rhs_geometry_by_radius(
+        state, bars, geometry, center_geometry_mode="radial_vjp"
+    ))(state, bars, geometry)
+    compact = jax.jit(lambda state, bars, geometry: model.pullback_direct_rhs_geometry_by_radius(
+        state, bars, geometry, center_geometry_mode="scalar_jvp"
+    ))(state, bars, geometry)
     _assert_tree_close(compact, old)
     _assert_tree_close(compact, expected)
     assert jnp.any(jnp.abs(compact.a_b) > 1e-8)
@@ -145,3 +153,38 @@ def test_database_center_mesh_jvp_preserves_custom_geometry_dependencies():
     )
     assert jnp.allclose(actual.metric, expected_metric)
     assert jnp.allclose(actual.a_b, 0.0)
+
+
+@pytest.mark.parametrize("mode, expected", [(None, "scalar_jvp"), ("radial_vjp", "radial_vjp"), ("scalar_jvp", "scalar_jvp")])
+def test_database_center_geometry_modes_dispatch_through_composite_and_runtime(mode, expected):
+    """Explicit modes traverse both wrappers; the omitted mode retains current dispatch."""
+    model, state, geometry = _fixture()
+    seen = []
+
+    def _selected(selected):
+        def _pullback(_state, _bars, value):
+            seen.append(selected)
+            return _float_delta_tree_like(value)
+        return _pullback
+
+    object.__setattr__(model, "_pullback_direct_rhs_geometry_by_radius_vjp", _selected("radial_vjp"))
+    object.__setattr__(model, "_pullback_direct_rhs_physical_mesh_geometry", _selected("scalar_jvp"))
+    runtime = types.SimpleNamespace(_database_model=lambda: model)
+    runtime.pullback_direct_rhs_geometry_by_radius = types.MethodType(
+        NTXRuntimeScanTransportModel.pullback_direct_rhs_geometry_by_radius, runtime
+    )
+    composite = CombinedTransportFluxModel(runtime, ZeroTransportModel(), ZeroTransportModel())
+    actual = jax.jit(lambda bars: composite.pullback_direct_rhs_geometry_by_radius(
+        state, bars, geometry, center_geometry_mode=mode
+    ))(_bars(1))
+    assert seen == [expected]
+    _assert_tree_close(actual, _float_delta_tree_like(geometry))
+
+
+@pytest.mark.parametrize("mode", ["unknown", "", "radial"])
+def test_database_center_geometry_rejects_unknown_mode(mode):
+    model, state, geometry = _fixture()
+    with pytest.raises(ValueError, match="center_geometry_mode"):
+        model.pullback_direct_rhs_geometry_by_radius(
+            state, _bars(1), geometry, center_geometry_mode=mode
+        )

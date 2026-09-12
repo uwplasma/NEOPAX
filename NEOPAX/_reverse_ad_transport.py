@@ -81,6 +81,8 @@ from ._transport_solvers import (
     _extract_fixed_temperature_projection,
     _extract_state_regularization,
     _flat_rhs_factory,
+    _flat_rhs_direct_support_pullback_factory,
+    _flat_rhs_direct_database_payload_pullback_factory,
     _flat_rhs_build_support_pullback_factory,
     _flat_rhs_lagged_response_pullback_factory,
     _flat_rhs_lagged_response_support_pullback_factory,
@@ -791,8 +793,30 @@ def _initial_direct_rhs_support_pullback_batched(
     flat_rhs_direct_support_pullback,
     support_payload,
     flat_rhs_direct_database_split_support_pullback=None,
+    mode: str = "split",
+    reduced_prev_stages_are_zero: bool = False,
 ):
-    """Transpose the one direct RHS evaluation used to construct carry zero."""
+    """Transpose carry-zero RHS support with an explicit database mode.
+
+    ``reduced_zero`` is only valid for a caller which constructs zero predictor
+    stage bars by contract. It never tests numerical values or masks NaNs.
+    General full-carry callers retain the nonzero stage-seed transpose.
+    """
+    mode = str(mode).strip().lower()
+    if mode not in {"generic", "split", "reduced_zero"}:
+        raise ValueError(f"Unknown database initial-support mode {mode!r}.")
+    is_database = isinstance(support_payload, dict) and "database" in support_payload
+    if mode == "reduced_zero":
+        if not is_database or reduced_prev_stages_are_zero is not True:
+            raise ValueError(
+                "reduced_zero requires database support and the explicit "
+                "reduced_prev_stages_are_zero contract."
+            )
+        objective_count = int(jnp.asarray(carry0_bars.prev_stages).shape[0])
+        return jax.tree_util.tree_map(
+            lambda leaf: jnp.broadcast_to(leaf, (objective_count,) + leaf.shape),
+            _float_delta_tree_like(support_payload),
+        )
     if (
         flat_rhs_direct_support_pullback is None
         and flat_rhs_direct_database_split_support_pullback is None
@@ -811,17 +835,16 @@ def _initial_direct_rhs_support_pullback_batched(
     # conservative scalar path for live Lij payloads, whose scan-surface
     # metadata has static Boozer arrays that cannot be reconstructed by a
     # generic ``vmap``.
-    if isinstance(support_payload, dict) and "database" in support_payload:
-        # Use the same explicit fixed-table/geometry partition as every
-        # database Radau stage.  Besides making ownership unambiguous, this
-        # reuses the already-compiled objective-batched database boundary
-        # instead of compiling the much larger generic support VJP once more
-        # after the segment sweep.
+    if is_database:
+        # Sharing a hook with stage code does not guarantee reuse of its
+        # standalone executable. Keep both implementations selectable.
         database_pullback = (
             flat_rhs_direct_database_split_support_pullback
-            if flat_rhs_direct_database_split_support_pullback is not None
+            if mode == "split" and flat_rhs_direct_database_split_support_pullback is not None
             else flat_rhs_direct_support_pullback
         )
+        if database_pullback is None:
+            raise ValueError(f"Database initial-support mode {mode!r} has no pullback hook.")
         return jax.vmap(
             lambda rhs_bar: database_pullback(
                 carry0.t, carry0.y, rhs_bar, support_payload
@@ -3470,6 +3493,63 @@ def reverse_initial_carry_from_state_with_static_setup(
     return _build_initial_carry(state)
 
 
+def _configure_database_reverse_performance(
+    physics_context, *, vector_field, species,
+    initial_support_mode="split", support_preparation_mode="shared",
+    center_geometry_mode="scalar_jvp", stage_jacobian_mode="independent",
+):
+    """Rebind only opted-in database support hooks, never primal/root hooks.
+
+    The default returns the very same context and callable identities. Options
+    are call-local Python metadata; geometry, state, tables and bars stay dynamic.
+    """
+    modes = {
+        "reverse_database_initial_support_mode": (
+            str(initial_support_mode).strip().lower(), {"generic", "split", "reduced_zero"}
+        ),
+        "reverse_database_support_preparation_mode": (
+            str(support_preparation_mode).strip().lower(), {"separate", "shared"}
+        ),
+        "reverse_database_center_geometry_mode": (
+            str(center_geometry_mode).strip().lower(), {"radial_vjp", "scalar_jvp"}
+        ),
+        "reverse_database_stage_jacobian_mode": (
+            str(stage_jacobian_mode).strip().lower(), {"independent", "shared"}
+        ),
+    }
+    for name, (value, choices) in modes.items():
+        if value not in choices:
+            raise ValueError(f"{name} must be one of {sorted(choices)}; got {value!r}.")
+    selected = {name: value for name, (value, _) in modes.items()}
+    if (
+        selected["reverse_database_initial_support_mode"] == "split"
+        and selected["reverse_database_support_preparation_mode"] == "shared"
+        and selected["reverse_database_center_geometry_mode"] == "scalar_jvp"
+        and selected["reverse_database_stage_jacobian_mode"] == "independent"
+    ):
+        return physics_context
+    if getattr(physics_context, "flat_rhs_direct_database_split_support_pullback", None) is None:
+        raise ValueError("Database performance modes require the fixed-database split support hook.")
+    kwargs = {}
+    if selected["reverse_database_center_geometry_mode"] != "scalar_jvp":
+        kwargs["center_geometry_mode"] = selected["reverse_database_center_geometry_mode"]
+        selected["flat_rhs_direct_support_pullback"] = _flat_rhs_direct_support_pullback_factory(
+            physics_context.unpack_flat, vector_field, (species,), {},
+            project_flat=physics_context.project_flat, pullback_options=kwargs,
+        )
+    if selected["reverse_database_support_preparation_mode"] != "shared":
+        kwargs["support_preparation_mode"] = selected["reverse_database_support_preparation_mode"]
+    if kwargs:
+        selected["flat_rhs_direct_database_split_support_pullback"] = (
+            _flat_rhs_direct_database_payload_pullback_factory(
+                physics_context.unpack_flat, vector_field, (species,), {},
+                "pullback_direct_rhs_database_split_support_payload",
+                project_flat=physics_context.project_flat, pullback_options=kwargs,
+            )
+        )
+    return dataclasses.replace(physics_context, **selected)
+
+
 def prepare_reverse_static_setup(
     parameter_values,
     *,
@@ -3486,6 +3566,10 @@ def prepare_reverse_static_setup(
     reverse_rhs_pullback_mode: str = "separate",
     reverse_initial_cache_support_pullback_mode: str = "scalar",
     reverse_rebuild_support_pullback_mode: str = "separate",
+    reverse_database_initial_support_mode: str = "split",
+    reverse_database_support_preparation_mode: str = "shared",
+    reverse_database_center_geometry_mode: str = "scalar_jvp",
+    reverse_database_stage_jacobian_mode: str = "independent",
     reverse_segment_jit_diagnostics: bool = False,
     reverse_segment_input_diagnostics: bool = False,
     reverse_rebuild_component_timing: bool = False,
@@ -3654,6 +3738,16 @@ def prepare_reverse_static_setup(
         solver=solver,
         prepared_rollout=prepared_rollout_static,
     )
+    configured_physics = _configure_database_reverse_performance(
+        execution_context.physics_context,
+        vector_field=solve_vector_field_static, species=runtime.species,
+        initial_support_mode=reverse_database_initial_support_mode,
+        support_preparation_mode=reverse_database_support_preparation_mode,
+        center_geometry_mode=reverse_database_center_geometry_mode,
+        stage_jacobian_mode=reverse_database_stage_jacobian_mode,
+    )
+    if configured_physics is not execution_context.physics_context:
+        execution_context = dataclasses.replace(execution_context, physics_context=configured_physics)
     if reverse_direct_stage_adjoint:
         execution_context = dataclasses.replace(
             execution_context,
@@ -4064,6 +4158,10 @@ def prepare_realtime_geometry_support_segment_core_setup(
         reverse_direct_stage_adjoint=True,
         reverse_stage_adjoint_solve_mode=args.reverse_stage_adjoint_solve_mode,
         reverse_rhs_transpose_mode=args.reverse_rhs_transpose_mode,
+        reverse_database_initial_support_mode=getattr(args, "reverse_database_initial_support_mode", "split"),
+        reverse_database_support_preparation_mode=getattr(args, "reverse_database_support_preparation_mode", "shared"),
+        reverse_database_center_geometry_mode=getattr(args, "reverse_database_center_geometry_mode", "scalar_jvp"),
+        reverse_database_stage_jacobian_mode=getattr(args, "reverse_database_stage_jacobian_mode", "independent"),
         reverse_rhs_pullback_mode=getattr(args, "reverse_rhs_pullback_mode", "separate"),
         reverse_initial_cache_support_pullback_mode=getattr(
             args,
@@ -6405,6 +6503,9 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
         "flat_rhs_direct_database_split_support_pullback",
         None,
     )
+    database_initial_support_mode = str(
+        getattr(physics_context, "reverse_database_initial_support_mode", "split")
+    )
     direct_initial_support_bar_leaves = None
     if (
         not bool(getattr(reverse_setup.prepared_rollout.kernel_context, "use_transport_lagged_response", False))
@@ -6416,7 +6517,8 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
     ):
         phase_start = time.perf_counter()
         database_split_initial_support = (
-            isinstance(support_payload, dict)
+            database_initial_support_mode == "split"
+            and isinstance(support_payload, dict)
             and "database" in support_payload
             and direct_database_split_support_pullback is not None
         )
@@ -6429,6 +6531,10 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
             flat_rhs_direct_database_split_support_pullback=(
                 direct_database_split_support_pullback
             ),
+            mode=database_initial_support_mode,
+            # This caller just constructed prev_stages bars as zeros above;
+            # the reduced accepted-step contract excludes predictor metadata.
+            reduced_prev_stages_are_zero=True,
         )
         direct_initial_support_bars = jax.block_until_ready(direct_initial_support_bars)
         direct_initial_support_bar_leaves = tuple(
@@ -6443,7 +6549,7 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
         print(
             f"{progress_prefix} progress: support reverse initial direct-RHS support pullback ready "
             f"elapsed_s={time.perf_counter() - phase_start:.3f} "
-            f"boundary={'database_split' if database_split_initial_support else 'generic'}",
+            f"boundary={'reduced_zero' if database_initial_support_mode == 'reduced_zero' else 'database_split' if database_split_initial_support else 'generic'}",
             flush=True,
         )
     phase_start = time.perf_counter()
@@ -7792,6 +7898,10 @@ def internal_realtime_geometry_transport_reverse_table_result_builder(
     reverse_rhs_pullback_mode: str = "separate",
     reverse_initial_cache_support_pullback_mode: str = "scalar",
     reverse_rebuild_support_pullback_mode: str = "separate",
+    reverse_database_initial_support_mode: str = "split",
+    reverse_database_support_preparation_mode: str = "shared",
+    reverse_database_center_geometry_mode: str = "scalar_jvp",
+    reverse_database_stage_jacobian_mode: str = "independent",
     reverse_segment_jit_diagnostics: bool = False,
     reverse_segment_input_diagnostics: bool = False,
     reverse_rebuild_component_timing: bool = False,
@@ -7931,6 +8041,18 @@ def internal_realtime_geometry_transport_reverse_table_result_builder(
                 opts.get("reverse_stage_adjoint_solve_mode", reverse_stage_adjoint_solve_mode)
             ),
             reverse_rhs_transpose_mode=str(opts.get("reverse_rhs_transpose_mode", reverse_rhs_transpose_mode)),
+            reverse_database_initial_support_mode=str(opts.get(
+                "reverse_database_initial_support_mode", reverse_database_initial_support_mode
+            )),
+            reverse_database_support_preparation_mode=str(opts.get(
+                "reverse_database_support_preparation_mode", reverse_database_support_preparation_mode
+            )),
+            reverse_database_center_geometry_mode=str(opts.get(
+                "reverse_database_center_geometry_mode", reverse_database_center_geometry_mode
+            )),
+            reverse_database_stage_jacobian_mode=str(opts.get(
+                "reverse_database_stage_jacobian_mode", reverse_database_stage_jacobian_mode
+            )),
             reverse_rhs_pullback_mode=str(opts.get("reverse_rhs_pullback_mode", reverse_rhs_pullback_mode)),
             reverse_initial_cache_support_pullback_mode=str(
                 opts.get(

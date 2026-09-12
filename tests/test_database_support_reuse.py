@@ -265,14 +265,16 @@ def _assert_same_tree(actual, expected):
         assert jnp.allclose(actual_leaf, expected_leaf, rtol=2e-6, atol=2e-6)
 
 
-def test_database_split_support_shared_primal_matches_independent_jit_vmap():
+@pytest.mark.parametrize("preparation_mode", [None, "separate", "shared"])
+def test_database_split_support_shared_primal_matches_independent_jit_vmap(preparation_mode):
     """Reusing values preserves all table/coordinate and native-face geometry rows."""
     calls = Counter()
     reference_calls = Counter()
 
     def _split(state, support, rhs_bar):
         return _equations(support, calls).pullback_direct_rhs_database_split_support_payload(
-            0.0, state, None, rhs_bar, support
+            0.0, state, None, rhs_bar, support,
+            support_preparation_mode=preparation_mode,
         )
 
     def _independent(state, support, rhs_bar):
@@ -292,9 +294,9 @@ def test_database_split_support_shared_primal_matches_independent_jit_vmap():
 
     # Count trace-time construction, not compiled runtime work (XLA can CSE).
     for name in ("bind", "prepare", "centers", "capture", "density_faces", "temperature_faces"):
-        assert calls[name] == 1
+        assert calls[name] == (3 if preparation_mode == "separate" else 1)
         assert reference_calls[name] == 3
-    assert calls["flux_vjp"] == 1
+    assert calls["flux_vjp"] == (2 if preparation_mode == "separate" else 1)
     assert reference_calls["flux_vjp"] == 2
 
 
@@ -306,7 +308,10 @@ def test_database_split_support_shared_primal_matches_independent_jit_vmap():
         "pullback_direct_rhs_database_equation_geometry_payload",
     ],
 )
-def test_database_split_support_shared_primal_preserves_overridden_hooks(overridden_hook):
+@pytest.mark.parametrize("preparation_mode", [None, "separate", "shared"])
+def test_database_split_support_shared_primal_preserves_overridden_hooks(
+    overridden_hook, preparation_mode
+):
     """Concrete owners with public hook overrides keep their original dispatch."""
     state, support, rows = _inputs()
     rhs_bar = jax.tree_util.tree_map(lambda value: value[0], rows)
@@ -326,9 +331,91 @@ def test_database_split_support_shared_primal_preserves_overridden_hooks(overrid
 
     object.__setattr__(equations, overridden_hook, _override)
     actual = equations.pullback_direct_rhs_database_split_support_payload(
-        0.0, state, None, rhs_bar, support
+        0.0, state, None, rhs_bar, support,
+        support_preparation_mode=preparation_mode,
     )
     assert calls["override"] == 1
     assert calls["capture"] == 3
     expected = _independent_support_bar(equations, state, rhs_bar, support)
     _assert_same_tree(actual, expected)
+
+
+@pytest.mark.parametrize("option", ["support_preparation_mode", "center_geometry_mode"])
+def test_database_split_support_rejects_unknown_mode(option):
+    state, support, rows = _inputs()
+    rhs_bar = jax.tree_util.tree_map(lambda value: value[0], rows)
+    equations = _equations(support, Counter())
+    with pytest.raises(ValueError, match=option):
+        equations.pullback_direct_rhs_database_split_support_payload(
+            0.0, state, None, rhs_bar, support, **{option: "unknown"}
+        )
+
+
+@pytest.mark.parametrize("override_partial", [False, True])
+def test_database_split_support_explicit_center_mode_rejects_legacy_hook(override_partial):
+    """An explicit mode must not be silently ignored by an old public hook."""
+    state, support, rows = _inputs()
+    rhs_bar = jax.tree_util.tree_map(lambda value: value[0], rows)
+    equations = _equations(support, Counter())
+    if override_partial:
+        original = equations.pullback_direct_rhs_database_flux_geometry_payload
+
+        def _legacy(t, value, runtime, bar, payload):
+            return original(t, value, runtime, bar, payload)
+
+        object.__setattr__(equations, "pullback_direct_rhs_database_flux_geometry_payload", _legacy)
+    # With no partial override, the model's legacy signature is the unsupported boundary.
+    with pytest.raises(TypeError, match="center_geometry_mode.*keyword"):
+        equations.pullback_direct_rhs_database_split_support_payload(
+            0.0, state, None, rhs_bar, support, center_geometry_mode="radial_vjp"
+        )
+
+
+@pytest.mark.parametrize("center_mode", ["radial_vjp", "scalar_jvp"])
+@pytest.mark.parametrize("preparation_mode", ["separate", "shared"])
+def test_database_split_support_forwards_explicit_center_mode(
+    monkeypatch, center_mode, preparation_mode
+):
+    """The option reaches the compact centre hook without changing face/table bars."""
+    seen = []
+    original = _CompactOwner.pullback_direct_rhs_geometry_by_radius
+
+    def _selected(self, state, bar, geometry, *, center_geometry_mode=None):
+        seen.append(center_geometry_mode)
+        return original(self, state, bar, geometry)
+
+    monkeypatch.setattr(_CompactOwner, "pullback_direct_rhs_geometry_by_radius", _selected)
+    state, support, rows = _inputs()
+    rhs_bar = jax.tree_util.tree_map(lambda value: value[0], rows)
+    equations = _equations(support, Counter())
+    expected = _independent_support_bar(equations, state, rhs_bar, support)
+    seen.clear()
+    actual = equations.pullback_direct_rhs_database_split_support_payload(
+        0.0, state, None, rhs_bar, support,
+        support_preparation_mode=preparation_mode, center_geometry_mode=center_mode,
+    )
+    assert seen == [center_mode]
+    _assert_same_tree(actual, expected)
+
+
+@pytest.mark.parametrize("center_mode", ["radial_vjp", "scalar_jvp"])
+def test_database_generic_initial_support_forwards_center_mode(monkeypatch, center_mode):
+    """The independent initial-support selector cannot hide the centre selector."""
+    state, support, rows = _inputs()
+    rhs_bar = jax.tree_util.tree_map(lambda value: value[0], rows)
+    equations = _equations(support, Counter())
+    seen = []
+
+    def _flux_geometry(_self, _t, _state, _runtime, _bar, payload, *, center_geometry_mode=None):
+        seen.append(center_geometry_mode)
+        return {"geometry": jax.tree_util.tree_map(jnp.ones_like, payload["geometry"])}
+
+    # Keep this a hook-wiring check; split-support equivalence is exercised above.
+    monkeypatch.setattr(ComposedEquationSystem, "pullback_direct_rhs_database_flux_geometry_payload", _flux_geometry)
+    object.__setattr__(equations, "pullback_shared_fluxes", lambda *_args: _center_fluxes(state, **support))
+    actual = equations.pullback_direct_rhs_support_payload(
+        0.0, state, None, rhs_bar, support, center_geometry_mode=center_mode
+    )
+    assert seen == [center_mode]
+    assert set(actual) == {"geometry", "database"}
+    assert all(jnp.all(jnp.isfinite(value)) for value in jax.tree_util.tree_leaves(actual))
