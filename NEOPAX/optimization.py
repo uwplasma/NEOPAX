@@ -451,7 +451,12 @@ class GeometryInitialErRootLeastSquaresProblem:
         # so benchmark call graphs and reverse functions remain untouched.
         evaluator = (
             evaluate_geometry_initial_er_root_only_least_squares_benchmark_tables
-            if self.reverse_stage_mode in {"off", "database", "database_root_experiment"}
+            if self.reverse_stage_mode in {
+                "off",
+                "database",
+                "database_root_experiment",
+                "database_root_jit_experiment",
+            }
             else evaluate_geometry_initial_er_root_only_least_squares_optimization
         )
         evaluator_kwargs = dict(
@@ -515,7 +520,10 @@ class GeometryInitialErRootLeastSquaresProblem:
                 evaluator_kwargs["raw_block_transpose_optimization_stage"] = (
                     self.raw_block_transpose_optimization_stage
                 )
-        if self.reverse_stage_mode == "database_root_experiment":
+        if self.reverse_stage_mode in {
+            "database_root_experiment",
+            "database_root_jit_experiment",
+        }:
             evaluator_kwargs["database_root_stage"] = self.database_root_stage
             if self.payload_assembly_stage is not None:
                 evaluator_kwargs["payload_assembly_stage"] = self.payload_assembly_stage
@@ -1440,6 +1448,7 @@ def geometry_initial_er_root_only_least_squares_problem(
         "off",
         "database",
         "database_root_experiment",
+        "database_root_jit_experiment",
         "optimization",
         "optimization_root_experiment",
         "optimization_root_strict_experiment",
@@ -1453,7 +1462,8 @@ def geometry_initial_er_root_only_least_squares_problem(
         "vmex_like",
     }:
         raise ValueError(
-            "reverse_stage_mode must be 'off', 'database', 'optimization', "
+            "reverse_stage_mode must be 'off', 'database', 'database_root_experiment', "
+            "'database_root_jit_experiment', 'optimization', "
             "'optimization_root_experiment', 'optimization_root_strict_experiment', "
             "'optimization_root_per_radius_experiment', 'optimization_payload_experiment', "
             "'optimization_payload_root_experiment', 'optimization_payload_root_strict_experiment', "
@@ -1467,17 +1477,18 @@ def geometry_initial_er_root_only_least_squares_problem(
             "reverse_stage_mode='vmex_like' is disabled while the incomplete "
             "outer-JIT experiment is replaced by retained existing reverse kernels."
         )
+    database_root_modes = {"database_root_experiment", "database_root_jit_experiment"}
     config_eff = _prepare_initial_er_root_config(config, device=device, vmec_input=vmec_input)
     geom_cfg = config_eff.get("geometry", {})
     neoclassical_cfg = config_eff.get("neoclassical", {})
     flux_model = str(neoclassical_cfg.get("flux_model", "")).strip().lower()
-    if mode in {"database", "database_root_experiment"} and flux_model != "ntx_scan_runtime":
+    if mode in {"database", *database_root_modes} and flux_model != "ntx_scan_runtime":
         raise ValueError(
             "database reverse-stage modes require "
             "neoclassical.flux_model='ntx_scan_runtime'; "
             f"got {flux_model!r}."
         )
-    if flux_model == "ntx_scan_runtime" and mode not in {"off", "database", "database_root_experiment"}:
+    if flux_model == "ntx_scan_runtime" and mode not in {"off", "database", *database_root_modes}:
         raise NotImplementedError(
             "The exact-Lij staged initial-root modes do not support "
             "neoclassical.flux_model='ntx_scan_runtime'. Use "
@@ -1552,7 +1563,7 @@ def geometry_initial_er_root_only_least_squares_problem(
             max_iter=geometry_max_iter,
         )
     )
-    if mode in {"optimization_payload_root_scan_geometry_experiment", "database_root_experiment"}:
+    if mode in {"optimization_payload_root_scan_geometry_experiment", *database_root_modes}:
         if raw_block_stage is None:
             raise ValueError("geometry transpose stage requires VMEC boundary parameters.")
         raw_block_transpose_stage = geometry_raw_block_transpose_optimization_stage(
@@ -1564,14 +1575,14 @@ def geometry_initial_er_root_only_least_squares_problem(
     database_root_stage = None
     prepared_payload_static = None
     payload_assembly_stage = None
-    if mode == "database_root_experiment":
+    if mode in database_root_modes:
         database_transport_objectives = tuple(
             term.objective.name
             for term in normalized_terms
             if term.objective.family == "transport"
         )
         if not database_transport_objectives:
-            raise ValueError("database_root_experiment requires at least one transport objective.")
+            raise ValueError("database root experiment requires at least one transport objective.")
         # The benchmark evaluator expands active profile values to the six
         # canonical profile columns before it invokes the database root table.
         # Build the staged kernel against that same table parameterization;
@@ -1596,6 +1607,7 @@ def geometry_initial_er_root_only_least_squares_problem(
                 runtime=runtime,
             ),
             options=root_options,
+            jit_selected_root=(mode == "database_root_jit_experiment"),
         )
     if mode in {
         "optimization",
@@ -1631,11 +1643,12 @@ def geometry_initial_er_root_only_least_squares_problem(
         "optimization_payload_root_scan_geometry_experiment",
         "optimization_payload_reverse_experiment",
         "database_root_experiment",
+        "database_root_jit_experiment",
     }:
         prepared_payload_static = _prepare_initial_root_payload_static(
             context,
             n_r=int(n_r if n_r is not None else geom_cfg.get("n_radial", 51)),
-            scan_rho=(neoclassical_cfg.get("ntx_scan_rho") if mode == "database_root_experiment" else None),
+            scan_rho=(neoclassical_cfg.get("ntx_scan_rho") if mode in database_root_modes else None),
         )
     if mode in {
         "optimization_payload_experiment",
@@ -1645,6 +1658,7 @@ def geometry_initial_er_root_only_least_squares_problem(
         "optimization_payload_root_scan_geometry_experiment",
         "optimization_payload_reverse_experiment",
         "database_root_experiment",
+        "database_root_jit_experiment",
     }:
         if raw_block_stage is None:
             raise ValueError("optimization initial-root stage requires VMEC boundary parameters.")
@@ -1681,8 +1695,8 @@ def geometry_initial_er_root_only_least_squares_problem(
                 support_component_bars_by_name={},
                 include_component_pullbacks=False,
                 combined_geometry_payload=True,
-                payload_kind=("ntx_scan_runtime" if mode == "database_root_experiment" else "ntx_exact"),
-                scan_rho=(neoclassical_cfg.get("ntx_scan_rho") if mode == "database_root_experiment" else None),
+                payload_kind=("ntx_scan_runtime" if mode in database_root_modes else "ntx_exact"),
+                scan_rho=(neoclassical_cfg.get("ntx_scan_rho") if mode in database_root_modes else None),
                 scan_surface_backend=str(neoclassical_cfg.get("ntx_scan_surface_backend", "vmec")),
                 n_r=int(n_r if n_r is not None else geom_cfg.get("n_radial", 51)),
                 n_theta=int(n_theta if n_theta is not None else neoclassical_cfg.get("ntx_exact_n_theta", 25)),
@@ -1732,7 +1746,7 @@ def geometry_initial_er_root_only_least_squares_problem(
             context,
             n_r=int(n_r if n_r is not None else geom_cfg.get("n_radial", 51)),
             state=state,
-            scan_rho=(neoclassical_cfg.get("ntx_scan_rho") if mode == "database_root_experiment" else None),
+            scan_rho=(neoclassical_cfg.get("ntx_scan_rho") if mode in database_root_modes else None),
             ),
             active_payload_layout_factory=(
                 (lambda payload_bars: initial_root_payload_active_leaf_layout(
@@ -1740,7 +1754,7 @@ def geometry_initial_er_root_only_least_squares_problem(
                     support_branch_name="ntx_scan_runtime",
                     combined_support_payload=True,
                 ))
-                if mode == "database_root_experiment"
+                if mode in database_root_modes
                 else initial_root_payload_active_leaf_layout
             ),
             result_from_kernel=_stage_payload_result_from_kernel,

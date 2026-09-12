@@ -1144,6 +1144,7 @@ def build_database_initial_root_experiment_stage(
     parameter_set: ReverseADParameterSet,
     pre_root_state_from_profile_values: Callable[[object], object],
     options: Mapping[str, object] | None,
+    jit_selected_root: bool = False,
 ) -> DatabaseInitialRootExperimentStage:
     """Build the opt-in persistent root boundary before any optimization iteration.
 
@@ -1240,9 +1241,14 @@ def build_database_initial_root_experiment_stage(
         # this stable function identity gives the mapped root body a reusable
         # dispatch/cache boundary, matching the accepted realtime scan stage,
         # without changing the benchmark's numerical operation order.
+        selected_root_operator = (
+            jax.jit(_selected_root, inline=False)
+            if jit_selected_root
+            else _selected_root
+        )
         return (
             payload_adapter,
-            _selected_root,
+            selected_root_operator,
             jax.jit(_direct_cotangents, inline=False),
             jax.jit(_root_pullback, inline=False),
         )

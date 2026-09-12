@@ -139,11 +139,11 @@ def main() -> int:
     )
     parser.add_argument(
         "--mode",
-        choices=("database", "database_root_experiment"),
+        choices=("database", "database_root_experiment", "database_root_jit_experiment"),
         default="database",
         help=(
-            "Use the unchanged database baseline or the opt-in persistent "
-            "fixed-table selected-root stage."
+            "Use the unchanged database baseline, the parity-validated root "
+            "stage, or the exact-root outer-JIT experiment."
         ),
     )
     parser.add_argument("--warmup", type=int, default=1)

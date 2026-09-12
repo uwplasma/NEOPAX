@@ -95,6 +95,12 @@ def main() -> int:
         help="Use the reduced (5, 25, 31) database grid for a quicker check.",
     )
     parser.add_argument(
+        "--trial-mode",
+        choices=("database_root_experiment", "database_root_jit_experiment"),
+        default="database_root_experiment",
+        help="Select the opt-in database-root experiment to compare with database.",
+    )
+    parser.add_argument(
         "--parameter-index", type=int, default=0,
         help="Boundary-vector entry to perturb before both evaluations.",
     )
@@ -109,7 +115,7 @@ def main() -> int:
     config = SMALL_DATABASE_TRANSPORT_CONFIG if args.small_database else DATABASE_TRANSPORT_CONFIG
     benchmark = _build(mode="database", transport_config=config, objective_set=args.objective_set)
     trial = _build(
-        mode="database_root_experiment", transport_config=config, objective_set=args.objective_set
+        mode=args.trial_mode, transport_config=config, objective_set=args.objective_set
     )
     # ``device_get`` can expose a read-only host view. The parity point is
     # intentionally perturbed, so take an owned writable copy first.
@@ -130,7 +136,8 @@ def main() -> int:
     )
     print(
         "[database parity] "
-        f"objective_set={args.objective_set} small_database={args.small_database} "
+        f"trial_mode={args.trial_mode} objective_set={args.objective_set} "
+        f"small_database={args.small_database} "
         f"parameter_index={args.parameter_index} parameter_offset={args.parameter_offset:.6e}",
         flush=True,
     )
