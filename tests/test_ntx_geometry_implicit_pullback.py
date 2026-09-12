@@ -1343,6 +1343,98 @@ def test_database_native_face_geometry_uses_one_physical_mesh_jvp():
     assert jnp.array_equal(actual.r_grid_half, jnp.zeros_like(geometry.r_grid_half))
 
 
+def test_database_native_face_geometry_preserves_forward_boundary_closure():
+    """The compact mesh JVP rebuilds the same bounded faces as the forward map."""
+    geometry = _PhysicalMeshGeometry(
+        a_b=jnp.asarray(2.0),
+        rho_grid=jnp.asarray([0.25, 0.75]),
+        rho_grid_half=jnp.asarray([0.0, 0.5, 1.0]),
+        r_grid=jnp.asarray([0.5, 1.5]),
+        r_grid_half=jnp.asarray([0.0, 1.0, 2.0]),
+        dr=jnp.asarray(1.0),
+    )
+    bc_er = SimpleNamespace(
+        left_type="dirichlet",
+        right_type="dirichlet",
+        left_value=jnp.asarray(0.0),
+        right_value=jnp.asarray(7.0),
+        left_gradient=None,
+        right_gradient=None,
+        left_decay_length=None,
+        right_decay_length=None,
+    )
+
+    class _BoundarySensitiveFaceModel(NTXDatabaseTransportModel):
+        def evaluate_face_fluxes(self, _state, local_face_state, **_kwargs):
+            gamma = (self.geometry.r_grid_half * local_face_state.Er)[None, :]
+            return {
+                "Gamma": gamma,
+                "Q": jnp.zeros_like(gamma),
+                "Upar": jnp.zeros_like(gamma),
+            }
+
+    model = _BoundarySensitiveFaceModel(
+        species=None, energy_grid=None, geometry=geometry, database=None
+    )
+    state = TransportState(
+        density=jnp.ones((1, 2)),
+        pressure=jnp.ones((1, 2)),
+        Er=jnp.asarray([2.0, 4.0]),
+    )
+    face_state = transport_flux_models_module.build_face_transport_state(
+        state, geometry, bc_er=bc_er
+    )
+    bars = {"Gamma": jnp.asarray([[1.0, -2.0, 3.0]])}
+    actual = model.pullback_direct_face_flux_geometry_by_radius(
+        state, face_state, bars, geometry, bc_er=bc_er
+    )
+
+    def _forward_face_flux(a_b):
+        varied_geometry = dataclasses.replace(
+            geometry,
+            a_b=a_b,
+            r_grid=geometry.rho_grid * a_b,
+            r_grid_half=geometry.rho_grid_half * a_b,
+            dr=(geometry.rho_grid_half[1] - geometry.rho_grid_half[0]) * a_b,
+        )
+        varied_face_state = transport_flux_models_module.build_face_transport_state(
+            state, varied_geometry, bc_er=bc_er
+        )
+        varied_model = dataclasses.replace(model, geometry=varied_geometry)
+        return varied_model.evaluate_face_fluxes(state, varied_face_state)["Gamma"]
+
+    _, expected_tangent = jax.jvp(
+        _forward_face_flux,
+        (geometry.a_b,),
+        (jnp.ones_like(geometry.a_b),),
+    )
+    expected = jnp.vdot(bars["Gamma"], expected_tangent)
+
+    def _unbounded_face_flux(a_b):
+        varied_geometry = dataclasses.replace(
+            geometry,
+            a_b=a_b,
+            r_grid=geometry.rho_grid * a_b,
+            r_grid_half=geometry.rho_grid_half * a_b,
+            dr=(geometry.rho_grid_half[1] - geometry.rho_grid_half[0]) * a_b,
+        )
+        varied_face_state = transport_flux_models_module.build_face_transport_state(
+            state, varied_geometry
+        )
+        varied_model = dataclasses.replace(model, geometry=varied_geometry)
+        return varied_model.evaluate_face_fluxes(state, varied_face_state)["Gamma"]
+
+    _, unbounded_tangent = jax.jvp(
+        _unbounded_face_flux,
+        (geometry.a_b,),
+        (jnp.ones_like(geometry.a_b),),
+    )
+    assert not jnp.allclose(
+        expected, jnp.vdot(bars["Gamma"], unbounded_tangent)
+    )
+    assert jnp.allclose(actual.a_b, expected)
+
+
 def test_database_native_face_geometry_holds_monoenergetic_scale_fixed():
     """Physical face geometry does not absorb the scan-owned scale tangent."""
     geometry = _PhysicalMeshGeometry(

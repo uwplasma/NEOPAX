@@ -571,6 +571,8 @@ def build_density_equation(
         return pullback(
             state, face_state, flux_bar, support["geometry"],
             bc_density=bc_density, bc_temperature=bc_temperature, bc_er=bc_er,
+            reconstruction=reconstruction,
+            density_floor=density_floor, temperature_floor=temperature_floor,
             particle_face_closure_mode=face_mode, center_fluxes=center_fluxes,
             evaluated_state=evaluated_state,
         )
@@ -1093,6 +1095,8 @@ def build_temperature_equation(
         return pullback(
             state, face_state, flux_bar, support["geometry"],
             bc_density=bc_density, bc_temperature=bc_temperature, bc_er=bc_er,
+            reconstruction=reconstruction,
+            density_floor=density_floor, temperature_floor=temperature_floor,
             center_fluxes=center_fluxes, evaluated_state=evaluated_state,
         )
 

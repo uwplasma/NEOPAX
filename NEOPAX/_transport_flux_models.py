@@ -3653,6 +3653,12 @@ class NTXDatabaseTransportModel(TransportFluxModelBase):
         flat_delta0 = jnp.concatenate(tuple(jnp.ravel(jnp.asarray(leaf)) for leaf in leaves0))
         bc_density = kwargs.get("bc_density", self.bc_density)
         bc_temperature = kwargs.get("bc_temperature", self.bc_temperature)
+        bc_er = kwargs.get("bc_er", None)
+        reconstruction = str(kwargs.get("reconstruction", "linear"))
+        density_floor = kwargs.get("density_floor", self.density_floor)
+        temperature_floor = kwargs.get(
+            "temperature_floor", DEFAULT_TRANSPORT_TEMPERATURE_FLOOR
+        )
         face_mode = kwargs.get("particle_face_closure_mode", "reconstructed")
         diagnostic_face_text = str(
             os.environ.get("NEOPAX_DATABASE_GEOMETRY_VJP_DIAGNOSTIC_FACE_INDEX", "")
@@ -3704,22 +3710,33 @@ class NTXDatabaseTransportModel(TransportFluxModelBase):
                     build_ntss_like_face_transport_state(
                         state, geometry_value,
                         bc_density=bc_density, bc_temperature=bc_temperature,
+                        bc_er=bc_er,
+                        density_floor=density_floor,
+                        temperature_floor=temperature_floor,
                     )
                     if str(face_mode).strip().lower()
                     in {"ntss_like", "ntss", "half_point"}
                     else build_face_transport_state(
                         state, geometry_value,
                         bc_density=bc_density, bc_temperature=bc_temperature,
+                        bc_er=bc_er,
+                        reconstruction=reconstruction,
+                        density_floor=density_floor,
+                        temperature_floor=temperature_floor,
                     )
                 )
                 evaluated = build_evaluated_transport_state(
                     state, geometry_value,
                     bc_density=bc_density, bc_temperature=bc_temperature,
-                    density_floor=model.density_floor,
+                    bc_er=bc_er,
+                    reconstruction=reconstruction,
+                    density_floor=density_floor,
+                    temperature_floor=temperature_floor,
                 )
                 return model.evaluate_face_fluxes(
                     state, local_face_state, evaluated_state=evaluated,
                     bc_density=bc_density, bc_temperature=bc_temperature,
+                    bc_er=bc_er,
                     particle_face_closure_mode=face_mode,
                 )
 
