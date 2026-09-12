@@ -760,7 +760,9 @@ def test_fd_lagged_response_uses_dirichlet_face_gradient_for_edge_temperature_re
         right_type="dirichlet",
         right_value=jnp.array([1.0, 1.0]),
     )
-    temperature_direction = jnp.zeros_like(state.temperature).at[0, -1].set(1.0)
+    # The file's only perturbation channel is ``temperature_gradient`` for
+    # species ``i`` (index 1), so exercise that selected coordinate.
+    temperature_direction = jnp.zeros_like(state.temperature).at[1, -1].set(1.0)
     direction = TransportState(
         density=jnp.zeros_like(state.density),
         pressure=state.density * temperature_direction,
