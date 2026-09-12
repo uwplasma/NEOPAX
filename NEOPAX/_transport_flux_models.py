@@ -1997,7 +1997,15 @@ class CombinedTransportFluxModel(TransportFluxModelBase):
     def pullback_direct_face_flux_geometry_by_radius(
         self, state, face_state, flux_bar, geometry, **kwargs
     ):
-        """Route compact native face-geometry bars to the database owner."""
+        """Transpose every direct face-flux geometry contribution.
+
+        The database-backed neoclassical model owns a compact fixed-table
+        transpose.  The forward face closure also evaluates the turbulent and
+        classical models, however, so their small model-local geometry VJPs
+        must be added here as well.  This mirrors
+        :meth:`pullback_direct_rhs_geometry_by_radius` and keeps the recorded
+        database scan exclusively in the neoclassical table boundary.
+        """
         pullback = getattr(
             self.neoclassical_model,
             "pullback_direct_face_flux_geometry_by_radius",
@@ -2005,7 +2013,18 @@ class CombinedTransportFluxModel(TransportFluxModelBase):
         )
         if not callable(pullback):
             return None
-        zero = jnp.zeros_like(jnp.asarray(face_state.density))
+        supplied = tuple(
+            jnp.asarray(value)
+            for value in flux_bar.values()
+            if value is not None
+            and jnp.asarray(value).ndim > 0
+            and jnp.asarray(value).dtype != jax.dtypes.float0
+        )
+        zero = (
+            jnp.zeros_like(supplied[0])
+            if supplied
+            else jnp.zeros_like(jnp.asarray(face_state.density))
+        )
 
         def _bar(name):
             value = flux_bar.get(f"{name}_faces", flux_bar.get(name, None))
@@ -2014,7 +2033,7 @@ class CombinedTransportFluxModel(TransportFluxModelBase):
             value = jnp.asarray(value)
             return zero if value.ndim == 0 or value.dtype == jax.dtypes.float0 else value
 
-        return pullback(
+        geometry_bar = pullback(
             state,
             face_state,
             {
@@ -2025,6 +2044,117 @@ class CombinedTransportFluxModel(TransportFluxModelBase):
             geometry,
             **kwargs,
         )
+        geometry_delta0 = _float_delta_tree_like(geometry)
+        face_mode = str(
+            kwargs.get("particle_face_closure_mode", "reconstructed")
+        ).strip().lower()
+        bc_density = kwargs.get("bc_density", None)
+        bc_temperature = kwargs.get("bc_temperature", None)
+        bc_er = kwargs.get("bc_er", None)
+        reconstruction = str(kwargs.get("reconstruction", "linear"))
+        density_floor = kwargs.get("density_floor", DEFAULT_TRANSPORT_DENSITY_FLOOR)
+        temperature_floor = kwargs.get(
+            "temperature_floor", DEFAULT_TRANSPORT_TEMPERATURE_FLOOR
+        )
+        batched_rhs = (
+            jnp.asarray(_bar("Q")).ndim
+            == jnp.asarray(face_state.density).ndim + 1
+        )
+
+        for model, suffix in (
+            (self.turbulent_model, "turb"),
+            (self.classical_model, "classical"),
+        ):
+            if isinstance(model, ZeroTransportModel):
+                continue
+            field_name = (
+                "geometry" if hasattr(model, "geometry") else
+                "field" if hasattr(model, "field") else None
+            )
+            if field_name is None:
+                continue
+
+            def _model_face_fluxes(
+                geometry_delta, model_value=model, name=field_name
+            ):
+                geometry_value = _add_float_delta_tree(geometry, geometry_delta)
+                model_at_geometry = dataclasses.replace(
+                    model_value, **{name: geometry_value}
+                )
+                local_face_state = (
+                    build_ntss_like_face_transport_state(
+                        state,
+                        geometry_value,
+                        bc_density=bc_density,
+                        bc_temperature=bc_temperature,
+                        bc_er=bc_er,
+                        density_floor=density_floor,
+                        temperature_floor=temperature_floor,
+                    )
+                    if face_mode in {"ntss_like", "ntss", "half_point"}
+                    else build_face_transport_state(
+                        state,
+                        geometry_value,
+                        bc_density=bc_density,
+                        bc_temperature=bc_temperature,
+                        bc_er=bc_er,
+                        reconstruction=reconstruction,
+                        density_floor=density_floor,
+                        temperature_floor=temperature_floor,
+                    )
+                )
+                evaluated_at_geometry = build_evaluated_transport_state(
+                    state,
+                    geometry_value,
+                    bc_density=bc_density,
+                    bc_temperature=bc_temperature,
+                    bc_er=bc_er,
+                    reconstruction=reconstruction,
+                    density_floor=density_floor,
+                    temperature_floor=temperature_floor,
+                )
+                model_kwargs = dict(kwargs)
+                model_kwargs["evaluated_state"] = evaluated_at_geometry
+                return model_at_geometry.evaluate_face_fluxes(
+                    state, local_face_state, **model_kwargs
+                )
+
+            model_fluxes, model_pullback = jax.vjp(
+                _model_face_fluxes, geometry_delta0
+            )
+            gamma_bar = (
+                _bar("Gamma") + _bar(f"Gamma_{suffix}")
+                if suffix != "turb" or self.include_turbulent_particle_flux
+                else jnp.zeros_like(_bar("Gamma"))
+            )
+            model_flux_bar = {
+                "Gamma": gamma_bar,
+                "Q": _bar("Q") + _bar(f"Q_{suffix}"),
+                "Upar": _bar("Upar") + _bar(f"Upar_{suffix}"),
+            }
+
+            def _one_model_bar(one_bar):
+                complete_bar = _complete_flux_bar_like(
+                    model_fluxes,
+                    one_bar,
+                    context=(
+                        "CombinedTransportFluxModel.direct_face_geometry."
+                        f"{type(model).__name__}"
+                    ),
+                )
+                return model_pullback(complete_bar)[0]
+
+            model_geometry_bar = (
+                jax.vmap(_one_model_bar)(model_flux_bar)
+                if batched_rhs
+                else _one_model_bar(model_flux_bar)
+            )
+            geometry_bar = jax.tree_util.tree_map(
+                lambda accumulated, local: accumulated + local,
+                geometry_bar,
+                model_geometry_bar,
+            )
+        return geometry_bar
 
     def build_lagged_response(self, state, **kwargs):
         er_edge_override = kwargs.pop("er_edge_override", None)

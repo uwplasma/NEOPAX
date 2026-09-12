@@ -2069,29 +2069,6 @@ def vmec_parameter_values_from_parameter_vector(
     return jnp.asarray(values, dtype=jnp.float64)
 
 
-def _database_forward_vmec_reference_state(runtime, vmec_parameter_values):
-    """Return the database forward VMEC primal only at its baseline point.
-
-    Exact-Lij runtimes and nonzero geometry trials deliberately return
-    ``None`` and therefore retain the established VMEC solve path.
-    """
-
-    try:
-        at_baseline = bool(
-            jnp.all(
-                jnp.asarray(vmec_parameter_values)
-                == jnp.zeros_like(jnp.asarray(vmec_parameter_values))
-            ).item()
-        )
-    except Exception:
-        return None
-    if not at_baseline:
-        return None
-    if find_ntx_runtime_scan_model_in_model(runtime.models.flux) is None:
-        return None
-    return getattr(runtime, "database_vmec_primal_state", None)
-
-
 def build_shared_geometry_transport_payload(
     *,
     geometry_context,
@@ -4630,23 +4607,12 @@ def evaluate_geometry_transport_realtime_geometry_least_squares(
             request.parameter_set,
             parameter_values_arr,
         )
-        # At the baseline point, use the exact VMEC primal that built the
-        # transport runtime.  The frozen-linearized FD lane uses this same
-        # state deliberately; re-solving here can converge through a different
-        # nonlinear path and contracts otherwise-correct payload bars at the
-        # wrong linearization point.  Nonzero optimizer trials still solve at
-        # their own parameter value.
-        retained_vmec_state = _database_forward_vmec_reference_state(
-            request.context.baseline_runtime,
-            vmec_parameter_values,
-        )
         shared_raw_block_solve = geometry_raw_block_solve_from_param_vector(
             geometry_context,
             vmec_parameter_values,
             tuple(spec.as_tuple() for spec in request.parameter_set.vmec_boundary_specs),
             max_iter=geometry_max_iter,
             solver_device=geometry_solver_device,
-            reference_state=retained_vmec_state,
         )
         opts.setdefault("raw_block_solve", shared_raw_block_solve)
         opts.setdefault("geometry_raw_block_solve", shared_raw_block_solve)

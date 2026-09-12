@@ -22,6 +22,7 @@ from NEOPAX._transport_flux_models import (
     NTXExactLijRuntimeSupport,
     NTXExactLijRuntimeTransportModel,
     NTXRuntimeScanChannels,
+    ZeroTransportModel,
     _extract_right_constraints,
     _database_geometry_with_constrained_axis_face,
     _float_delta_tree_like,
@@ -1433,6 +1434,91 @@ def test_database_native_face_geometry_preserves_forward_boundary_closure():
         expected, jnp.vdot(bars["Gamma"], unbounded_tangent)
     )
     assert jnp.allclose(actual.a_b, expected)
+
+
+def test_database_composite_face_geometry_keeps_turbulent_heat_flux_partial():
+    """The compact database face boundary retains non-NTX geometry terms."""
+    geometry = _PhysicalMeshGeometry(
+        a_b=jnp.asarray(2.0),
+        rho_grid=jnp.asarray([0.25, 0.75]),
+        rho_grid_half=jnp.asarray([0.0, 0.5, 1.0]),
+        r_grid=jnp.asarray([0.5, 1.5]),
+        r_grid_half=jnp.asarray([0.0, 1.0, 2.0]),
+        dr=jnp.asarray(1.0),
+    )
+
+    @dataclasses.dataclass(frozen=True)
+    class _CompactNeo:
+        def pullback_direct_face_flux_geometry_by_radius(
+            self, _state, face_state_value, flux_bar_value, geometry_value, **_kwargs
+        ):
+            zero = jax.tree_util.tree_map(jnp.zeros_like, geometry_value)
+            if (
+                jnp.asarray(flux_bar_value["Q"]).ndim
+                == jnp.asarray(face_state_value.density).ndim + 1
+            ):
+                row_count = jnp.asarray(flux_bar_value["Q"]).shape[0]
+                return jax.tree_util.tree_map(
+                    lambda value: jnp.broadcast_to(
+                        value, (row_count,) + jnp.asarray(value).shape
+                    ),
+                    zero,
+                )
+            return zero
+
+    @dataclasses.dataclass(frozen=True)
+    class _GeometryHeatFlux:
+        field: object
+
+        def evaluate_face_fluxes(self, _state, face_state, **_kwargs):
+            q = self.field.r_grid_half[None, :] + 0.0 * face_state.density
+            return {
+                "Gamma": self.field.r_grid_half[None, :],
+                "Q": q,
+                "Upar": jnp.zeros_like(q),
+            }
+
+    model = CombinedTransportFluxModel(
+        neoclassical_model=_CompactNeo(),
+        turbulent_model=_GeometryHeatFlux(geometry),
+        classical_model=ZeroTransportModel(),
+        geometry=geometry,
+        center_flux_mode="direct",
+    )
+    state = TransportState(
+        density=jnp.ones((1, 2)),
+        pressure=jnp.ones((1, 2)),
+        Er=jnp.zeros((2,)),
+    )
+    face_state = transport_flux_models_module.build_face_transport_state(
+        state, geometry
+    )
+    q_bar = jnp.asarray(
+        [
+            [[2.0, -3.0, 4.0]],
+            [[-1.0, 0.5, 3.0]],
+        ]
+    )
+    actual = model.pullback_direct_face_flux_geometry_by_radius(
+        state,
+        face_state,
+        {"Q": q_bar},
+        geometry,
+    )
+
+    assert jnp.allclose(actual.r_grid_half, q_bar[:, 0, :])
+    assert jnp.allclose(actual.a_b, 0.0)
+
+    no_turbulent_particles = dataclasses.replace(
+        model, include_turbulent_particle_flux=False
+    )
+    excluded = no_turbulent_particles.pullback_direct_face_flux_geometry_by_radius(
+        state,
+        face_state,
+        {"Gamma": q_bar},
+        geometry,
+    )
+    assert jnp.allclose(excluded.r_grid_half, 0.0)
 
 
 def test_database_native_face_geometry_holds_monoenergetic_scale_fixed():

@@ -2957,7 +2957,9 @@ class ComposedEquationSystem:
 
         The database values are fixed, but their scale metadata must co-move
         with ``a_b`` just as in the existing direct-centre database geometry
-        rule.  This is still entirely local: no table bar or scan VJP is
+        rule.  The same model-local boundary also retains any turbulent or
+        classical face-flux geometry partial evaluated by the forward
+        composite.  This is still entirely local: no table bar or scan VJP is
         formed here.
         """
         if not isinstance(support, dict) or set(support) != {"geometry", "database"}:
