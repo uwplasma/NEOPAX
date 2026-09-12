@@ -3364,6 +3364,47 @@ def test_black_box_database_initial_direct_rhs_support_uses_objective_batch():
     assert jnp.allclose(result["database"], jnp.asarray([5.0, 0.5]))
 
 
+def test_black_box_database_initial_direct_rhs_support_reuses_split_boundary():
+    """Carry zero uses the same exact split database VJP as Radau stages."""
+
+    carry0 = SimpleNamespace(t=jnp.asarray(1.5), y=jnp.asarray([2.0, 3.0]))
+    carry0_bars = SimpleNamespace(
+        prev_stages=jnp.asarray(
+            [
+                [[1.0, 2.0], [3.0, 4.0]],
+                [[-2.0, 1.0], [5.0, -3.0]],
+            ]
+        )
+    )
+    calls = []
+
+    def _generic_hook(*_args, **_kwargs):
+        raise AssertionError("the generic support VJP must not be compiled")
+
+    def _split_hook(_t, _y, rhs_bar, support):
+        calls.append(jnp.asarray(rhs_bar).shape)
+        contracted = jnp.sum(rhs_bar)
+        return {
+            "geometry": support["geometry"] * contracted,
+            "database": support["database"] * contracted,
+        }
+
+    result = _initial_direct_rhs_support_pullback_batched(
+        carry0=carry0,
+        carry0_bars=carry0_bars,
+        kernel_context=SimpleNamespace(num_stages=2),
+        flat_rhs_direct_support_pullback=_generic_hook,
+        support_payload={
+            "geometry": jnp.asarray(3.0),
+            "database": jnp.asarray(0.5),
+        },
+        flat_rhs_direct_database_split_support_pullback=_split_hook,
+    )
+    assert calls == [(2,)]
+    assert jnp.allclose(result["geometry"], jnp.asarray([30.0, 3.0]))
+    assert jnp.allclose(result["database"], jnp.asarray([5.0, 0.5]))
+
+
 def test_black_box_exact_direct_support_split_matches_generic_payload_vjp():
     """The exact split is a partition of the generic support VJP.
 

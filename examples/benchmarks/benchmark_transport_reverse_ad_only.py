@@ -6000,6 +6000,7 @@ def main() -> None:
             "block",
             "block_colored_ntss_midpoint",
             "block_colored_database",
+            "block_colored_database_dense",
             "block_explicit_ntx_jacobian",
             "block_frozen_forward_jacobian",
             "gmres",
@@ -6021,6 +6022,10 @@ def main() -> None:
             "'block_colored_database' is an experimental database-only "
             "diagnostic candidate and is rejected for the production database "
             "benchmark until it has parity with 'block'; "
+            "'block_colored_database_dense' reconstructs the same exact "
+            "database stage transpose with three radial colors plus the "
+            "analytic NTSS-midpoint low-rank correction, then uses the "
+            "stable pivoted dense multi-RHS solve from 'block'; "
             "'block_explicit_ntx_jacobian' keeps the exact block system but materializes "
             "each fixed-lagged NTX stage Jacobian from the explicit state pullback; "
             "'block_frozen_forward_jacobian' uses each replayed primal step's frozen "

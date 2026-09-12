@@ -761,10 +761,19 @@ class _ThetaReverseScheduleTrace:
 
 
 def _initial_direct_rhs_support_pullback_batched(
-    *, carry0, carry0_bars, kernel_context, flat_rhs_direct_support_pullback, support_payload
+    *,
+    carry0,
+    carry0_bars,
+    kernel_context,
+    flat_rhs_direct_support_pullback,
+    support_payload,
+    flat_rhs_direct_database_split_support_pullback=None,
 ):
     """Transpose the one direct RHS evaluation used to construct carry zero."""
-    if flat_rhs_direct_support_pullback is None:
+    if (
+        flat_rhs_direct_support_pullback is None
+        and flat_rhs_direct_database_split_support_pullback is None
+    ):
         return None
     objective_count = int(jnp.asarray(carry0_bars.prev_stages).shape[0])
     rhs_bars = jnp.sum(
@@ -780,8 +789,18 @@ def _initial_direct_rhs_support_pullback_batched(
     # metadata has static Boozer arrays that cannot be reconstructed by a
     # generic ``vmap``.
     if isinstance(support_payload, dict) and "database" in support_payload:
+        # Use the same explicit fixed-table/geometry partition as every
+        # database Radau stage.  Besides making ownership unambiguous, this
+        # reuses the already-compiled objective-batched database boundary
+        # instead of compiling the much larger generic support VJP once more
+        # after the segment sweep.
+        database_pullback = (
+            flat_rhs_direct_database_split_support_pullback
+            if flat_rhs_direct_database_split_support_pullback is not None
+            else flat_rhs_direct_support_pullback
+        )
         return jax.vmap(
-            lambda rhs_bar: flat_rhs_direct_support_pullback(
+            lambda rhs_bar: database_pullback(
                 carry0.t, carry0.y, rhs_bar, support_payload
             )
         )(rhs_bars)
@@ -6279,18 +6298,35 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
     # sum of the stored stage bars (the same contraction used by the initial
     # carry custom VJP).  Keep this separate from the state VJP below.
     physics_context = reverse_setup.execution_context.physics_context
+    direct_database_split_support_pullback = getattr(
+        physics_context,
+        "flat_rhs_direct_database_split_support_pullback",
+        None,
+    )
     direct_initial_support_bar_leaves = None
     if (
         not bool(getattr(reverse_setup.prepared_rollout.kernel_context, "use_transport_lagged_response", False))
-        and getattr(physics_context, "flat_rhs_direct_support_pullback", None) is not None
+        and (
+            getattr(physics_context, "flat_rhs_direct_support_pullback", None)
+            is not None
+            or direct_database_split_support_pullback is not None
+        )
     ):
         phase_start = time.perf_counter()
+        database_split_initial_support = (
+            isinstance(support_payload, dict)
+            and "database" in support_payload
+            and direct_database_split_support_pullback is not None
+        )
         direct_initial_support_bars = _initial_direct_rhs_support_pullback_batched(
             carry0=carry0,
             carry0_bars=carry0_bars,
             kernel_context=reverse_setup.prepared_rollout.kernel_context,
             flat_rhs_direct_support_pullback=physics_context.flat_rhs_direct_support_pullback,
             support_payload=support_payload,
+            flat_rhs_direct_database_split_support_pullback=(
+                direct_database_split_support_pullback
+            ),
         )
         direct_initial_support_bars = jax.block_until_ready(direct_initial_support_bars)
         direct_initial_support_bar_leaves = tuple(
@@ -6304,7 +6340,8 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
         )
         print(
             f"{progress_prefix} progress: support reverse initial direct-RHS support pullback ready "
-            f"elapsed_s={time.perf_counter() - phase_start:.3f}",
+            f"elapsed_s={time.perf_counter() - phase_start:.3f} "
+            f"boundary={'database_split' if database_split_initial_support else 'generic'}",
             flush=True,
         )
     phase_start = time.perf_counter()

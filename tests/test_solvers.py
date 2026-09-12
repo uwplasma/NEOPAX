@@ -2640,10 +2640,223 @@ def test_colored_database_stage_matrix_recovers_exact_tridiagonal_transpose(monk
     compact = transport_solvers._radau_solve_exact_stage_residual_transpose_block_colored_database(
         kernel_context, physics_context, object(), object(), None, rhs=rhs_rows, batched=True,
     )
-    dense = transport_solvers._radau_solve_exact_stage_residual_transpose_block_colored_database_dense_reference(
+    dense = transport_solvers._radau_solve_exact_stage_residual_transpose_block_colored_database_dense(
         kernel_context, physics_context, object(), object(), None, rhs=rhs_rows, batched=True,
     )
     assert jnp.allclose(compact, dense, rtol=1.0e-12, atol=1.0e-12)
+
+
+def test_colored_database_stage_matrix_restores_ntss_midpoint_low_rank(monkeypatch):
+    """Database coloring preserves the nonlocal NTSS midpoint coefficient term."""
+
+    dtype = jnp.float64
+    local_matrix = jnp.asarray(
+        [[2.0, -0.1, 0.0, 0.0], [0.3, 1.7, 0.2, 0.0],
+         [0.0, -0.4, 1.5, 0.6], [0.0, 0.0, 0.1, 1.2]],
+        dtype=dtype,
+    )
+    low_rank_u = jnp.asarray([[0.2], [-0.3], [0.5], [0.7]], dtype=dtype)
+    low_rank_v = jnp.asarray([[0.4], [0.6], [-0.2], [0.1]], dtype=dtype)
+    transpose_matrix = local_matrix + low_rank_u @ low_rank_v.T
+    kernel_context = types.SimpleNamespace(num_stages=1, state_dim=4, dtype=dtype)
+    layout = types.SimpleNamespace(n_radial=4)
+    permutation = jnp.arange(4, dtype=jnp.int32)
+    correction_calls = []
+
+    def _correction(*_args):
+        correction_calls.append(True)
+        return permutation, 1, low_rank_u, low_rank_v
+
+    physics_context = types.SimpleNamespace(
+        reverse_rhs_transpose_mode="explicit_database",
+        exact_stage_transpose_low_rank_correction=_correction,
+    )
+    monkeypatch.setattr(
+        transport_solvers,
+        "_radau_stage_to_radial_permutation_and_block_dim",
+        lambda _kernel: (layout, permutation, 1),
+    )
+    monkeypatch.setattr(
+        transport_solvers,
+        "_radau_exact_stage_times_states",
+        lambda *_args: (jnp.asarray([0.0], dtype=dtype), jnp.zeros((1, 4), dtype=dtype)),
+    )
+
+    def _matvec(_kernel, seen_physics, *_args, **_kwargs):
+        assert seen_physics is physics_context
+        return _args[-1] @ transpose_matrix.T
+
+    monkeypatch.setattr(
+        transport_solvers,
+        "_radau_exact_stage_residual_transpose_matvec_batched",
+        _matvec,
+    )
+    actual = transport_solvers._radau_exact_stage_residual_transpose_matrix_colored_database(
+        kernel_context, physics_context, object(), object(), None,
+    )
+    assert correction_calls == [True]
+    assert jnp.allclose(actual, transpose_matrix, rtol=1.0e-12, atol=1.0e-12)
+
+
+def test_ntss_midpoint_correction_uses_direct_flux_for_black_box_database(monkeypatch):
+    """The low-rank correction follows the direct black-box database primal."""
+
+    dtype = jnp.float64
+
+    class _DirectDatabaseModel:
+        def __init__(self):
+            self.direct_calls = 0
+
+        def __call__(self, state):
+            self.direct_calls += 1
+            return {"Gamma": state.density}
+
+        def evaluate_with_lagged_response(self, *_args, **_kwargs):
+            raise AssertionError("black-box Radau has no lagged response")
+
+    class _ErEquation:
+        permitivity_mode = "ntss_like_midpoint"
+        ntss_density_indices = (0,)
+        boundary_mode = "fixed"
+        Er_relax = 1.0
+        ntss_B0_mid = 2.0
+        ntss_psfactor_mid = 3.0
+
+        @staticmethod
+        def _charge_flux_from_gamma(gamma):
+            return gamma[0]
+
+    class _Owner:
+        def __init__(self):
+            self.shared_flux_model = _DirectDatabaseModel()
+            self.er_equation = _ErEquation()
+
+        def vector_field(self, state):
+            return state
+
+        def _resolve_equations(self):
+            return None, None, self.er_equation
+
+        @staticmethod
+        def _prepare_working_state(state):
+            return state, None
+
+        @staticmethod
+        def _shared_flux_bc_kwargs():
+            return {}
+
+    owner = _Owner()
+
+    def _unpack(flat_state):
+        return TransportState(
+            density=flat_state[:2].reshape((1, 2)),
+            pressure=flat_state[2:4].reshape((1, 2)),
+            Er=flat_state[4:6],
+        )
+
+    factors_hook = transport_solvers._ntss_midpoint_er_coeff_low_rank_factors_hook(
+        _unpack,
+        owner.vector_field,
+        None,
+    )
+    correction = factors_hook.ntss_midpoint_correction_factors
+    permutation = jnp.arange(6, dtype=jnp.int32)
+    monkeypatch.setattr(
+        transport_solvers,
+        "_radau_stage_to_radial_permutation_and_block_dim",
+        lambda _kernel: (
+            types.SimpleNamespace(
+                active_er_size=2,
+                n_radial=2,
+                density_species_count=1,
+            ),
+            permutation,
+            3,
+        ),
+    )
+    stage_state = jnp.asarray([2.0, 4.0, 3.0, 5.0, 0.1, 0.2], dtype=dtype)
+    monkeypatch.setattr(
+        transport_solvers,
+        "_radau_exact_stage_times_states",
+        lambda *_args: (jnp.asarray([0.0], dtype=dtype), stage_state[None, :]),
+    )
+    _, block_dim, low_rank_u, low_rank_v = correction(
+        types.SimpleNamespace(
+            num_stages=1,
+            state_dim=6,
+            density_size=2,
+            pressure_size=2,
+            dtype=dtype,
+            a=jnp.ones((1, 1), dtype=dtype),
+        ),
+        types.SimpleNamespace(unpack_flat=_unpack),
+        object(),
+        types.SimpleNamespace(trial_dt=jnp.asarray(0.25, dtype=dtype)),
+        None,
+    )
+    assert owner.shared_flux_model.direct_calls == 1
+    assert block_dim == 3
+    assert jnp.all(jnp.isfinite(low_rank_u))
+    assert jnp.all(jnp.isfinite(low_rank_v))
+
+
+def test_colored_database_dense_mode_dispatches_stable_multi_rhs_solve(monkeypatch):
+    """The production colored-dense mode never enters block Thomas."""
+
+    dtype = jnp.float64
+    rhs = jnp.asarray([[1.0, 2.0], [-3.0, 4.0]], dtype=dtype)
+    calls = []
+
+    def _dense_solve(*_args, rhs, batched=False, **_kwargs):
+        calls.append((jnp.asarray(rhs).shape, batched))
+        return 2.0 * rhs
+
+    monkeypatch.setattr(
+        transport_solvers,
+        "_radau_solve_exact_stage_residual_transpose_block_colored_database_dense",
+        _dense_solve,
+    )
+    actual = transport_solvers._radau_solve_exact_stage_residual_transpose_batched(
+        types.SimpleNamespace(num_stages=1, state_dim=2, dtype=dtype),
+        types.SimpleNamespace(
+            reverse_segment_input_diagnostics=False,
+            reverse_stage_cotangent_mode="full",
+            reverse_stage_adjoint_solve_mode="block_colored_database_dense",
+        ),
+        object(),
+        object(),
+        None,
+        rhs=rhs,
+    )
+    assert calls == [((2, 2), True)]
+    assert jnp.allclose(actual, 2.0 * rhs)
+
+
+def test_colored_database_dense_solve_allows_global_pivoting(monkeypatch):
+    """A valid global stage system need not have invertible diagonal blocks."""
+
+    dtype = jnp.float64
+    transpose_matrix = jnp.asarray([[0.0, 1.0], [1.0, 1.0]], dtype=dtype)
+    rhs = jnp.asarray([[2.0, -1.0], [-3.0, 4.0]], dtype=dtype)
+    monkeypatch.setattr(
+        transport_solvers,
+        "_radau_exact_stage_residual_transpose_matrix_colored_database",
+        lambda *_args, **_kwargs: transpose_matrix,
+    )
+    actual = (
+        transport_solvers._radau_solve_exact_stage_residual_transpose_block_colored_database_dense(
+            types.SimpleNamespace(num_stages=1, state_dim=2, dtype=dtype),
+            object(),
+            object(),
+            object(),
+            None,
+            rhs=rhs,
+            batched=True,
+        )
+    )
+    expected = jnp.linalg.solve(transpose_matrix, -rhs.T).T
+    assert jnp.all(jnp.isfinite(actual))
+    assert jnp.allclose(actual, expected, rtol=1.0e-12, atol=1.0e-12)
 
 
 def test_database_stage_transpose_uses_complete_direct_black_box_state_boundary():

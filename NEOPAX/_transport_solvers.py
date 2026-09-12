@@ -1329,16 +1329,23 @@ def _ntss_midpoint_er_coeff_low_rank_factors_hook(
         def _stage_er_coeff_profile(y_eval):
             state_y = physics_context.unpack_flat(y_eval)
             working_state, _eidx = owner._prepare_working_state(state_y)
-            flux_response = (
-                lagged_response.flux_response
-                if hasattr(lagged_response, "flux_response")
-                else lagged_response
-            )
-            shared_fluxes = shared_flux_model.evaluate_with_lagged_response(
-                working_state,
-                flux_response,
-                **owner._shared_flux_bc_kwargs(),
-            )
+            if lagged_response is None:
+                # Match ComposedEquationSystem._evaluate_state exactly for the
+                # black-box database lane.  There is no cached response in this
+                # mode: the fixed database model is evaluated directly at each
+                # Radau stage state.
+                shared_fluxes = shared_flux_model(working_state)
+            else:
+                flux_response = (
+                    lagged_response.flux_response
+                    if hasattr(lagged_response, "flux_response")
+                    else lagged_response
+                )
+                shared_fluxes = shared_flux_model.evaluate_with_lagged_response(
+                    working_state,
+                    flux_response,
+                    **owner._shared_flux_bc_kwargs(),
+                )
             gamma = _get_center_flux(shared_fluxes, "Gamma")
             charge_flux = er_eq._charge_flux_from_gamma(gamma)
             if str(getattr(er_eq, "boundary_mode", "")).strip().lower() == "floating_ambipolar_edge":
@@ -14109,10 +14116,13 @@ def _radau_exact_stage_residual_transpose_matrix_colored_database(
     """Exact direct-database stage transpose from colored local actions.
 
     Direct centre database fluxes depend only on a cell and its two radial
-    neighbours.  Consequently the complete accepted-step transpose is block
-    tridiagonal in radial ordering.  Three colors recover that operator from
-    exact direct-RHS transpose actions, avoiding the old one-action-per-state
-    basis materialization used by ``block``.
+    neighbours.  The NTSS midpoint Er coefficient additionally depends on one
+    midpoint-density scalar per Radau stage, yielding the same analytic rank-3
+    correction used by the established realtime/Lij colored path.  Three
+    colors recover the local operator after that correction is removed; the
+    correction is then restored before the solve.  This avoids the old
+    one-action-per-state basis materialization used by ``block`` without
+    changing the accepted-step operator.
 
     This intentionally retains the dense final solve for now.  It changes
     only construction of the *same* exact stage matrix and is database-only.
@@ -14126,13 +14136,33 @@ def _radau_exact_stage_residual_transpose_matrix_colored_database(
         raise ValueError(
             "block_colored_database requires reverse_rhs_transpose_mode='explicit_database'."
         )
-    radial_permutation, _radial_block_dim, block_lower, block_diagonal, block_upper = (
+    correction_fn = getattr(
+        physics_context,
+        "exact_stage_transpose_low_rank_correction",
+        None,
+    )
+    correction_factors = (
+        correction_fn(
+            kernel_context,
+            physics_context,
+            carry_in,
+            primal_result,
+            lagged_response,
+        )
+        if callable(correction_fn)
+        else None
+    )
+    low_rank_u = None if correction_factors is None else correction_factors[2]
+    low_rank_v = None if correction_factors is None else correction_factors[3]
+    radial_permutation, radial_block_dim, block_lower, block_diagonal, block_upper = (
         _radau_exact_stage_transpose_radial_bands_from_colored_matvec(
             kernel_context,
             physics_context,
             carry_in,
             primal_result,
             lagged_response,
+            low_rank_u=low_rank_u,
+            low_rank_v=low_rank_v,
         )
     )
     radial_matrix = _radau_radial_block_tridiagonal_matrix(
@@ -14140,6 +14170,20 @@ def _radau_exact_stage_residual_transpose_matrix_colored_database(
         block_diagonal,
         block_upper,
     )
+    if correction_factors is not None:
+        correction_permutation, correction_block_dim, _, _ = correction_factors
+        if int(correction_block_dim) != int(radial_block_dim):
+            raise ValueError(
+                "Database colored Radau correction has an inconsistent radial block dimension."
+            )
+        # Both permutations come from the same static packed-state layout.
+        # Avoid a value-dependent equality check inside JIT.
+        del correction_permutation
+        radial_matrix = (
+            radial_matrix
+            + jnp.asarray(low_rank_u, dtype=kernel_context.dtype)
+            @ jnp.asarray(low_rank_v, dtype=kernel_context.dtype).T
+        )
     system_size = int(kernel_context.num_stages) * int(kernel_context.state_dim)
     return jnp.zeros((system_size, system_size), dtype=kernel_context.dtype).at[
         radial_permutation[:, None], radial_permutation[None, :]
@@ -14411,7 +14455,7 @@ def _radau_solve_exact_stage_residual_transpose_block_colored_database(
     return solution_rows if batched else solution_rows[0]
 
 
-def _radau_solve_exact_stage_residual_transpose_block_colored_database_dense_reference(
+def _radau_solve_exact_stage_residual_transpose_block_colored_database_dense(
     kernel_context: _RadauAcceptedStepKernelContext,
     physics_context: _RadauAcceptedStepPhysicsContext,
     carry_in: _RadauAcceptedStepCarry,
@@ -14421,7 +14465,18 @@ def _radau_solve_exact_stage_residual_transpose_block_colored_database_dense_ref
     rhs,
     batched: bool = False,
 ):
-    """Dense reference retained only for tests of the compact database solve."""
+    """Solve the colored database operator with the stable pivoted dense solve.
+
+    The expensive part of the ordinary ``block`` lane is constructing the
+    exact stage matrix with a full forward Jacobian.  The colored database
+    operator reconstructs the local matrix from only three radial colors and
+    restores the analytic NTSS-midpoint low-rank correction when active.
+    Materializing that already-reconstructed matrix is inexpensive at the
+    transport state sizes used here, and ``jnp.linalg.solve`` retains the
+    pivoting/stability of the established exact ``block`` solve.  Keep this
+    separate from the compact block-Thomas candidate, whose elimination can
+    fail on otherwise nonsingular global stage systems.
+    """
     system_size = int(kernel_context.num_stages) * int(kernel_context.state_dim)
     rhs_arr = jnp.asarray(rhs, dtype=kernel_context.dtype)
     rhs_rows = rhs_arr.reshape((-1, system_size)) if batched else rhs_arr.reshape((1, system_size))
@@ -14748,6 +14803,16 @@ def _radau_solve_exact_stage_residual_transpose(
             lagged_response,
             rhs=rhs,
         )
+    if mode == "block_colored_database_dense":
+        return _radau_solve_exact_stage_residual_transpose_block_colored_database_dense(
+            kernel_context,
+            physics_context,
+            carry_in,
+            primal_result,
+            lagged_response,
+            rhs=rhs,
+            batched=False,
+        )
     if mode not in {
         "block",
         "block_explicit_ntx_jacobian",
@@ -14871,6 +14936,16 @@ def _radau_solve_exact_stage_residual_transpose_batched(
         )
     if mode == "block_colored_database":
         return _radau_solve_exact_stage_residual_transpose_block_colored_database(
+            kernel_context,
+            physics_context,
+            carry_in,
+            primal_result,
+            lagged_response,
+            rhs=rhs_arr,
+            batched=True,
+        )
+    if mode == "block_colored_database_dense":
+        return _radau_solve_exact_stage_residual_transpose_block_colored_database_dense(
             kernel_context,
             physics_context,
             carry_in,
@@ -29190,7 +29265,7 @@ def _theta_run_saved_loop(
     walltime_label="theta.attempt",
 ):
     if bool(debug_walltime_attempts):
-        return _run_saved_loop_debug_walltime(
+        loop_result, _diagnostic_stopped = _run_saved_loop_debug_walltime(
             step_state0=step_state0,
             step_fn=step_fn,
             save_n=save_n,
@@ -29202,6 +29277,10 @@ def _theta_run_saved_loop(
             stop_after_accepted_steps=stop_after_accepted_steps,
             walltime_label=walltime_label,
         )
+        # The diagnostic runner returns an additional host-only flag.  Theta
+        # solver callers consume the same 28-field loop result as the normal
+        # compiled runner, so do not expose that flag through this wrapper.
+        return loop_result
     return _run_saved_loop(
         step_state0=step_state0,
         step_fn=step_fn,

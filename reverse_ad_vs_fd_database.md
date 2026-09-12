@@ -536,3 +536,115 @@ explicitly), this will be insufficient: the geometry reverse must then rebuild
 or differentiate that source model at the perturbed geometry.  A regression
 test with an intentionally geometry-dependent source is required before such
 a model is enabled.
+
+## 2026-09-12 composite face-geometry correction: 16-step result
+
+The subsequent 16-step / four-segment database reverse run includes the
+previously omitted turbulent/classical contribution to the composite face-flux
+geometry pullback.  All database geometry, state, recorded-scan, and final VMEC
+cotangents remained finite.  The values below are the complete transport
+geometry derivatives from that run, compared with the matching same-revision
+frozen-linearized accepted-replay FD run.  Relative error is
+`abs(AD - FD) / max(abs(AD), abs(FD))`.
+
+| Objective | RBC reverse AD | RBC FD | RBC relative error | ZBS reverse AD | ZBS FD | ZBS relative error |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `softmax_Er` | -2.768370728114e+01 | -2.768448e+01 | 2.791e-05 | 6.355695439071e+00 | 6.356321e+00 | 9.842e-05 |
+| `net_total_power_volume_average_mw_m3` | 5.748758000506e-05 | 5.760105e-05 | 1.970e-03 | -6.421600080651e-03 | -6.421616e-03 | 2.479e-06 |
+| `Er_transition_left` | -1.344589180736e+01 | -1.344607e+01 | 1.325e-05 | -8.669718767372e-01 | -8.667252e-01 | 2.845e-04 |
+| `Er_transition_right` | -1.527458023778e+01 | -1.527506e+01 | 3.141e-05 | -5.063695245521e-01 | -5.059553e-01 | 8.180e-04 |
+| `Er2_volume_average` | -2.960246229890e+02 | -2.960254e+02 | 2.625e-06 | -3.304644299476e+02 | -3.304945e+02 | 9.099e-05 |
+| `Er_volume_average` | -6.836048019299e+00 | -6.835501e+00 | 8.001e-05 | 1.430224053425e+01 | 1.430209e+01 | 1.052e-05 |
+| `electron_temperature_volume_average_keV` | -1.611594210977e-02 | -1.611605e-02 | 6.695e-06 | -3.999063149099e-02 | -3.999069e-02 | 1.463e-06 |
+| `total_pressure_volume_average` | -7.330580225667e-02 | -7.330528e-02 | 7.124e-06 | -2.376169118335e-01 | -2.376173e-01 | 1.634e-06 |
+| `alpha_power_volume_average_mw_m3` | -1.172003204814e-04 | -1.170870e-04 | 9.668e-04 | -6.887211459679e-03 | -6.887228e-03 | 2.402e-06 |
+| `bootstrap_current_softmax_abs_scaled` | -2.136356498889e+00 | -2.141504e+00 | 2.404e-03 | -1.213549389046e+00 | -1.217705e+00 | 3.413e-03 |
+
+The face-geometry correction closes the earlier temperature and pressure gaps:
+both now agree with FD at `O(1e-6)` to `O(1e-5)`.  The RBC net-power relative
+error is `1.970e-3`, but its absolute AD--FD difference is only `1.135e-7`
+because the derivative is a small cancellation residual.  Bootstrap remains
+the largest material discrepancy, at `2.404e-3` for RBC and `3.413e-3` for
+ZBS.
+
+### Compact LaTeX table: full-transport AD versus FD for all DOFs
+
+Objectives are columns and all six plasma-profile DOFs plus both VMEC boundary
+DOFs are rows.  The power entry is the net total-power objective.  Entries are
+relative errors using the same normalization as above.  Here $\alpha_n$,
+$\alpha_T$, $\beta_n$, and $\beta_T$ denote `density_shape_power`,
+`temperature_shape_power`, `density_shape_alpha`, and
+`temperature_shape_alpha`, respectively.
+
+```latex
+\begin{table}[t]
+\centering
+\def\arraystretch{1.5}
+\begin{tabular}{ |l||c|c|c|c|c| }
+  \hline
+  \noalign{\vskip -0.085in}
+  DOF
+    & $E_r^{\max}$ (softmax)
+    & $E_{r,\mathrm{left}}$
+    & $E_{r,\mathrm{right}}$
+    & $P_{\mathrm{net}}$
+    & $J_{\mathrm{boots}}$ \\[-1.5ex]
+  \hline
+  \noalign{\vskip -0.085in}
+  $n_0$
+    & $9.867\times10^{-8}$
+    & $8.762\times10^{-8}$
+    & $4.094\times10^{-7}$
+    & $1.812\times10^{-7}$
+    & $1.305\times10^{-7}$ \\
+  $T_0$
+    & $4.229\times10^{-8}$
+    & $1.146\times10^{-7}$
+    & $2.631\times10^{-7}$
+    & $2.823\times10^{-8}$
+    & $2.663\times10^{-7}$ \\
+  $\alpha_n$
+    & $1.121\times10^{-8}$
+    & $1.714\times10^{-6}$
+    & $8.895\times10^{-7}$
+    & $1.509\times10^{-7}$
+    & $5.890\times10^{-8}$ \\
+  $\alpha_T$
+    & $5.571\times10^{-8}$
+    & $8.892\times10^{-9}$
+    & $1.172\times10^{-8}$
+    & $4.324\times10^{-9}$
+    & $4.733\times10^{-8}$ \\
+  $\beta_n$
+    & $3.317\times10^{-7}$
+    & $1.986\times10^{-5}$
+    & $1.216\times10^{-6}$
+    & $1.199\times10^{-6}$
+    & $1.008\times10^{-7}$ \\
+  $\beta_T$
+    & $2.510\times10^{-7}$
+    & $1.895\times10^{-7}$
+    & $3.265\times10^{-7}$
+    & $1.180\times10^{-7}$
+    & $2.790\times10^{-8}$ \\
+  $\mathrm{RBC}(1,0)$
+    & $2.791\times10^{-5}$
+    & $1.325\times10^{-5}$
+    & $3.141\times10^{-5}$
+    & $1.970\times10^{-3}$
+    & $2.404\times10^{-3}$ \\
+  $\mathrm{ZBS}(1,0)$
+    & $9.842\times10^{-5}$
+    & $2.845\times10^{-4}$
+    & $8.180\times10^{-4}$
+    & $2.479\times10^{-6}$
+    & $3.413\times10^{-3}$ \\
+  \\[-1.5ex]\hline
+\end{tabular}
+\caption{Relative errors between 16-step database full-transport reverse AD
+and frozen-linearized finite differences for the plasma-profile and VMEC
+boundary DOFs, after restoring the complete composite face-flux geometry
+pullback.}
+\label{tab:database-full-transport-geometry-ad-fd-relative-error}
+\end{table}
+```
