@@ -4424,7 +4424,92 @@ class NTXDatabaseTransportModel(TransportFluxModelBase):
         return support_bar
 
     def pullback_direct_rhs_geometry_by_radius(self, state, flux_bar, geometry):
-        """Transpose direct centre fluxes to fixed-database geometry locally.
+        """Transpose fixed-table centre fluxes on their physical mesh.
+
+        The built-in runtime-database primitive depends on local geometry only
+        through the radial mesh. Its normalized grid is fixed, leaving one
+        physical direction, ``a_b``. Differentiate that direction once before
+        contracting objective rows, instead of reversing each radius against
+        every geometry leaf. Custom evaluators and legacy databases retain the
+        general per-radius VJP.
+        """
+        if (
+            type(self) is NTXDatabaseTransportModel
+            and isinstance(self.database, Monoenergetic)
+            and dataclasses.is_dataclass(geometry)
+            and all(hasattr(geometry, name) for name in (
+                "a_b", "rho_grid", "rho_grid_half", "r_grid", "r_grid_half", "dr"
+            ))
+            and jnp.asarray(geometry.a_b).ndim == 0
+            and jnp.issubdtype(jnp.asarray(geometry.a_b).dtype, jnp.inexact)
+        ):
+            geometry_bar = self._pullback_direct_rhs_physical_mesh_geometry(
+                state, flux_bar, geometry
+            )
+            if (
+                str(os.environ.get("NEOPAX_DATABASE_GEOMETRY_VJP_DIAGNOSTICS", ""))
+                .strip().lower() in {"1", "true", "yes", "on"}
+            ):
+                bad = jnp.logical_not(jnp.isfinite(geometry_bar.a_b))
+
+                def _print_bad(_):
+                    jax.debug.print(
+                        "[database-geometry-vjp] source=direct_flux "
+                        "a_b_nonfinite={count} r_grid_half_nonfinite=0 "
+                        "first_r_grid_half_index=0",
+                        count=jnp.sum(bad),
+                    )
+                    return None
+
+                jax.lax.cond(jnp.any(bad), _print_bad, lambda _: None, None)
+            return geometry_bar
+        return self._pullback_direct_rhs_geometry_by_radius_vjp(
+            state, flux_bar, geometry
+        )
+
+    def _pullback_direct_rhs_physical_mesh_geometry(self, state, flux_bar, geometry):
+        """One scalar JVP; the entire Monoenergetic payload stays fixed."""
+        zero_geometry = _float_delta_tree_like(geometry)
+        radius_indices = jnp.arange(state.Er.shape[0], dtype=jnp.int32)
+
+        def _fluxes_at_mesh_delta(a_b_delta):
+            geometry_value = _database_geometry_with_constrained_axis_face(
+                geometry, dataclasses.replace(zero_geometry, a_b=a_b_delta)
+            )
+            model = dataclasses.replace(self, geometry=geometry_value)
+            evaluator = model.build_local_direct_flux_evaluator(state)
+            # Use the existing direct-centre closure, not the boundary-aware
+            # initial-root evaluator or a face-to-centre interpolation.
+            return jax.vmap(evaluator, out_axes=1)(radius_indices, state.Er)
+
+        _, mesh_tangent = jax.jvp(
+            _fluxes_at_mesh_delta,
+            (jnp.zeros_like(jnp.asarray(geometry.a_b)),),
+            (jnp.ones_like(jnp.asarray(geometry.a_b)),),
+        )
+        objective_shape = ()
+        for name in ("Gamma", "Q", "Upar"):
+            value = flux_bar.get(name)
+            if value is not None and jnp.asarray(value).ndim == 3:
+                objective_shape = jnp.asarray(value).shape[:1]
+                break
+        a_b_bar = jnp.zeros(objective_shape, dtype=jnp.asarray(geometry.a_b).dtype)
+        for name in ("Gamma", "Q", "Upar"):
+            value = flux_bar.get(name)
+            if value is None:
+                continue
+            value = jnp.asarray(value)
+            if value.ndim == 0 or value.dtype == jax.dtypes.float0:
+                continue
+            a_b_bar = a_b_bar + jnp.sum(value * mesh_tangent[name], axis=(-2, -1))
+        geometry_bar = jax.tree_util.tree_map(
+            lambda leaf: jnp.zeros(objective_shape + leaf.shape, dtype=leaf.dtype),
+            zero_geometry,
+        )
+        return dataclasses.replace(geometry_bar, a_b=a_b_bar)
+
+    def _pullback_direct_rhs_geometry_by_radius_vjp(self, state, flux_bar, geometry):
+        """General per-radius VJP for custom and legacy geometry boundaries.
 
         The database table is fixed here: its accumulated cotangent is owned
         by :meth:`pullback_direct_rhs_support_payload` and folded through the

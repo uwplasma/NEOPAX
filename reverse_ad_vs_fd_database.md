@@ -720,3 +720,111 @@ Remaining non-colored candidates and evidence limits:
   finite Jacobian contract, full nonlocal coupling and cached executables.
 
 Colored modes remain isolated experiments and are not this optimization plan.
+
+### Shared database support preparation implemented - 2026-09-12
+
+`ComposedEquationSystem` now prepares the common primal inputs and flux
+cotangents once inside its built-in split-support call. The three existing
+compact contractions consume the same call-local record via a private
+keyword; their standalone behavior is retained. Public-hook overrides and
+incomplete fixtures bypass sharing. Density and temperature native-face
+payloads remain distinct. No change to the root-only lane, Radau state/matrix
+contract, caches, table-coordinate ownership or final recorded scan fold.
+
+Four new cases in `tests/test_database_support_reuse.py`, plus five existing
+boundary regressions, passed through an exact-source CPU harness:
+**9 passed in 5.26 s**. Tests exercise actual fixed-flux capture/assembly and
+equation-to-flux VJPs with small polynomial local flux laws (no NTX or VMEC
+solve), JIT/vmap, dynamic inputs and public overrides. Full project import
+and production GPU tests remain unverified locally.
+
+The small JAX 0.5.0 CPU comparison measured:
+
+| Quantity | Independent partials | Shared preparation |
+| --- | ---: | ---: |
+| Primal preparation/capture calls during tracing | 3 | 1 |
+| Equation-to-flux VJP constructions during tracing | 2 | 1 |
+| JAXPR equation count | 557 | 401 |
+| Compiled temporary buffers (bytes) | 856 | 856 |
+
+Optimized HLO sizes were essentially identical. These measurements support
+less tracing/lowering work without extra temporary buffers in the fixture;
+they do **not** establish reduced production warm time or host RSS. In
+particular the ~23 s warm reverse segments are not yet explained or fixed by
+this result. Existing AD/FD tables above are unchanged, not new benchmark
+measurements of this patch.
+
+Short full-environment gate (six selected cases):
+
+```bash
+JAX_PLATFORMS=cpu PYTHONPATH="$HOME/VMEX:$HOME/NTX/src" \
+python -m pytest \
+  tests/test_database_support_reuse.py \
+  tests/test_ntx_geometry_implicit_pullback.py \
+  -q -p no:cacheprovider \
+  -k 'database_split_support_shared_primal or database_split_support_payload_uses_explicit_database_boundaries or database_fixed_payload_split_geometry_matches_generic_vjp' \
+  --maxfail=1
+```
+
+User subsequently ran that gate successfully: **6 passed, 100 deselected in
+14.06 s**. This is full-project confirmation of those six selected checks,
+not a new AD/FD or timing measurement.
+
+### Centre physical-mesh derivative optimization - 2026-09-12
+
+The direct-centre fixed-table geometry partial now has a built-in physical-mesh
+path using one scalar `a_b` JVP and contraction with all flux objective bars.
+This is the same partial derivative as the retained per-radius VJP: normalized
+coordinates are fixed, the physical radii and spacing move, and the entire
+`Monoenergetic` table (including its query-coordinate scale) stays fixed.
+Table/query-coordinate, native-face, equation, source and root contributions
+are not removed or reassigned. The default exact `block` solve is untouched.
+No caches are cleared and no new table/VMEC solve is introduced.
+
+The new fast path is restricted to the exact built-in database model with a
+complete physical mesh; custom/legacy models retain the original method body.
+`tests/test_database_center_geometry.py` covers a real table and nonconstant
+profiles, scalar and ten-objective bars, heat-only batches, integer geometry
+leaf shapes and custom nonradial geometry dependencies. An isolated harness
+executing the actual source kernels passed **4 tests in 175.42 s** on CPU
+(JAX 0.5.0, interpax 0.3.7, equinox 0.11.12). Both the previous per-radius VJP
+and the direct forward-flux VJP are references. This is not full repository
+import validation and does not update any of the AD/FD tables above.
+
+Performance comparison, actual source kernels on CPU, with a synthetic
+four-species/51-radius/four-energy case and a 7x16x11 table, ten objective
+rows. The database is passed dynamically. Host RSS was measured in separate
+fresh processes; warm calls were synchronized (median of nine). No caches
+were cleared.
+
+| Measurement | Old radius VJP | New scalar mesh JVP |
+| --- | ---: | ---: |
+| Trace/lower | 4.088 s | 2.813 s |
+| Compile | 45.288 s | 4.095 s |
+| Warm execution | 35.039 ms | 3.720 ms |
+| Peak process RSS | 2,158,880 KiB | 865,552 KiB |
+| Compiled temporary buffers | 780,576 B | 1,566,632 B |
+| Output buffers | 20,864 B | 20,864 B |
+
+The retained all-radii JVP adds about 0.75 MiB of temporary arrays but reduces
+the measured **host process peak** from 2.06 to 0.83 GiB, compilation time and
+warm execution. Temporary-buffer-only optimization was not a sufficient
+criterion for the user's host-RAM concern: bounded radius-map alternatives
+used less scratch but kept 45-54 s compilation and slower execution, so they
+were not retained. Real-kernel comparisons at both scalar and ten-objective
+representative shapes were finite and agreed with the original VJP.
+
+Do not extrapolate these component results to the entire 16/4 GPU benchmark:
+its new segment timings, host peak and AD/FD output comparison remain pending.
+There is no new CLI option and no change to root, Radau, cache or derivative
+ownership contracts. The previous full-run derivative tables remain the
+recorded reference values, not results measured after this performance edit.
+
+Subsequent user full-project validation: **8 passed in 185.95 s (3:05)**,
+running all cases in `tests/test_database_center_geometry.py` and
+`tests/test_database_support_reuse.py` with `JAX_PLATFORMS=cpu`,
+`-q -p no:cacheprovider --maxfail=1`. These eight checks now have confirmation
+in the actual project environment, beyond the isolated source harness.
+This is not a complete-suite result and does not establish new full 16/4
+GPU timings, peak RSS or AD/FD values. Those remain pending; no production
+code changes were made while recording this test result.

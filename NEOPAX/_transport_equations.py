@@ -2523,6 +2523,10 @@ class ComposedEquationSystem:
         active_flux_model = self._flux_model_with_realtime_support_payload(
             self.shared_flux_model, support
         )
+        if not callable(getattr(active_flux_model, "pullback_direct_rhs_support_payload", None)):
+            raise NotImplementedError(
+                "Database table-only direct-RHS pullback requires a compact flux transpose."
+            )
         working_state, eidx = self._prepare_working_state(state)
         center_fluxes = active_flux_model(working_state)
         fixed_flux_payloads = self._capture_database_primal_fixed_flux_payloads(

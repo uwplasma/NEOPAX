@@ -23,6 +23,11 @@ description below is historical, not the current contract.
 
 ### Latest verification and pending candidates
 
+- Latest user full-project gate: **8 passed in 185.95 s (3:05)** for
+  `tests/test_database_center_geometry.py` and
+  `tests/test_database_support_reuse.py`. This confirms the centre-geometry
+  and shared-support regressions in the actual project environment. It is
+  not a full test-suite pass or a new GPU timing/AD-FD measurement.
 - User reported the original four candidate tests passing in 13.50 s.
 - The subsequent audit fixed an integration gap in the optional
   `block_database_multi_rhs` selector: its solve used the finite generic
@@ -38,7 +43,7 @@ description below is historical, not the current contract.
 - No new long benchmark, AD/FD comparison or measured speed/RSS improvement
   is established by these small tests.
 
-The latest successful command was run from the existing NEOPAX checkout:
+The earlier selector regression command was:
 
 ```bash
 JAX_PLATFORMS=cpu PYTHONPATH="$HOME/VMEX:$HOME/NTX/src" \
@@ -59,21 +64,134 @@ The reference run's warm four-step reverse segments took 22.907, 23.099 and
 Peak host RSS was 15051068 KiB (14.354 GiB). These are pre-measurement
 reference values, not improvements from the candidates.
 
-Next: inspect compiled fixed-table support work and its non-inline JIT / stage
-scan boundary for repeated center/face primal evaluations and excessive
-compilation work. Source-level repetition alone is insufficient: JAX may
-already eliminate common work. Keep density and temperature face closures
-distinct, retain all geometry/table coordinate bars, and validate equivalence
-before measuring speed and memory. Do not request a long run solely to test
-the unsupported factorization-count hypothesis.
+### Implemented next step: call-local shared support preparation
+
+The three built-in database support partials now share one preparation inside
+`pullback_direct_rhs_database_split_support_payload`. Owner binding, working
+state, center fluxes and the two distinct native-face payloads are prepared
+once rather than three times; the equation-to-flux VJP is built once rather
+than twice. The table/query-coordinate, local flux geometry and equation
+geometry contraction rules are unchanged. Nothing is retained between steps.
+
+The private prepared record is used only when the three built-in public
+methods are unoverridden and the equation system is concrete. Standalone
+methods, partial fixtures and public-hook overrides keep the old path. The
+root-only lane and Radau matrix/state-adjoint code are not changed by this step.
+The existing distinction between `eidx=None` for equation-to-flux bars and
+the actual prepared electron index for equation-geometry bars is preserved.
+
+Four new cases in `tests/test_database_support_reuse.py` cover JIT/vmap
+equivalence against the three standalone partials, dynamic state/support,
+separate density/temperature faces, coordinate bars, trace counts and all
+three public-hook overrides. These plus five existing boundary regressions
+passed in an exact-source CPU harness: **9 passed in 5.26 s**. This is not a
+full repository-import test or production GPU validation.
+
+Small JAX 0.5.0 CPU lowering comparison: 557 -> 401 traced equations;
+compiled temporary buffers remain 856 bytes in both versions. Optimized
+graphs are essentially the same size. This establishes reduced tracing work,
+not a demonstrated warm-segment speedup or lower benchmark peak RSS. No caches
+were cleared, no dense derivative replacement was introduced, and no physics
+contributions were removed. The ~23 s warm-segment cost remains unresolved.
+
+User full-project validation is now recorded: **6 passed, 100 deselected in
+14.06 s**, selecting the shared-primal tests and the existing explicit-boundary
+and split-versus-generic VJP assembly tests. This validates that integration;
+it does not measure the production benchmark's speed or RSS.
+
+Next: continue examining the actual compiled support JIT / stage-scan work
+for the warm cost.
+Keep density/temperature closures distinct and retain all geometry/table
+coordinate bars. Do not substitute the frozen forward Jacobian or request a
+long run solely to test the unsupported factorization-count hypothesis.
+
+### Direct-centre physical-mesh derivative follow-up
+
+The built-in `NTXDatabaseTransportModel` centre flux uses local geometry only
+through `r_grid`, `r_grid_half`, and `dr`. The established constrained geometry
+map derives all three from scalar `a_b` with fixed normalized coordinates.
+The implementation replaces the per-radius flattened-geometry VJP with
+one scalar JVP of the existing direct-centre evaluator, followed by contraction
+with the Gamma/Q/Upar objective bars. It keeps the entire `Monoenergetic`
+payload fixed, including its scale and coordinate fields. Their sibling
+pullback is unchanged. No Radau, face, root, source, or cache changes.
+
+This dispatch is restricted to the exact built-in model and a complete
+physical-mesh dataclass. Custom evaluators, nonphysical geometry stand-ins and
+legacy preprocessed databases retain the original VJP body. All returned
+geometry leaves retain their objective batch dimensions. Nonfinite diagnostics
+remain available; no nonfinite value is replaced with zero.
+
+New regression file: `tests/test_database_center_geometry.py`. Its four cases
+passed in an isolated actual-source CPU harness: **4 passed in 175.42 s**,
+using JAX 0.5.0, interpax 0.3.7 and equinox 0.11.12. These compare against both
+the original radius VJP and the actual direct-centre forward VJP, including
+ten independent objective rows, heat-only cotangents and a custom evaluator
+with an additional geometry dependency. The existing shared-support harness
+also passed again: **9 passed in 5.06 s**. Full project imports and the GPU
+benchmark are not validated locally by this harness.
+
+Representative-shape CPU measurements used four species, 51 radii, four
+energies, a 7x16x11 `Monoenergetic` table, and ten independent objective bars.
+State, geometry, cotangents and database were dynamic JIT arguments; the
+table was not constant-folded. Profiles, table entries and quadrature weights
+were synthetic, evaluated by the actual collision/interpolation/flux kernels.
+The final host-memory comparison used separate fresh processes (no cache
+clearing). Warm numbers are medians of nine synchronized calls.
+
+| CPU component measurement | Original radius VJP | Scalar mesh JVP |
+| --- | ---: | ---: |
+| Trace/lower time | 4.088 s | 2.813 s |
+| Compilation time | 45.288 s | 4.095 s |
+| Warm execution | 35.039 ms | 3.720 ms |
+| Peak process host RSS | 2,158,880 KiB (2.06 GiB) | 865,552 KiB (0.83 GiB) |
+| Compiled temporary buffers | 780,576 B | 1,566,632 B |
+| Compiled output buffers | 20,864 B | 20,864 B |
+
+The temporary-array increase is about 0.75 MiB; it is **not** a host-memory
+saving. The measured whole-process host peak, including compilation, falls
+by approximately 60%, while compilation and warm time also fall. Bounded
+radius-map variants were investigated: they reduced temporary arrays but
+retained roughly 45-54 s compilation and were slower than the all-radii JVP.
+Those variants are not retained. The final implementation is the vectorized
+scalar JVP that passed the four real-kernel tests above; representative-shape
+scalar/ten-row comparisons also remained finite and matched the old VJP.
+
+These are isolated CPU component measurements, not the full GPU 16/4 run.
+They do not predict a 60% drop in the benchmark's 14.35 GiB RSS or establish
+the new total segment time. The remaining table/query-coordinate transposes,
+terminal objectives, initial support/root and final recorded scan fold still
+require their own audit/measurements. Keep the existing benchmark command and
+physics options; no new mode or diagnostic flag is required for this change.
+
+The user has now passed the full-project regression gate below:
+**8 passed in 185.95 s (3:05)**. This supersedes the isolated-import limitation
+for these eight tests, without changing the scope of the CPU component
+performance measurements above.
+
+```bash
+JAX_PLATFORMS=cpu PYTHONPATH="$HOME/VMEX:$HOME/NTX/src" \
+python -m pytest \
+  tests/test_database_center_geometry.py \
+  tests/test_database_support_reuse.py \
+  -q -p no:cacheprovider --maxfail=1
+```
+
+Next validation: the unchanged no-diagnostic 16/4 GPU benchmark, comparing
+all objective derivatives to the saved reference, first/warm segment timings
+and `/usr/bin/time -v` peak host RSS. No new long-run result has been supplied
+after this optimization yet. No production code was changed when recording
+this eight-test result.
 
 ### Workspace handoff
 
-At save time: branch `en/reverse_ad_improvement`, HEAD `936fe39`.
-Pending modifications include `_reverse_ad_transport.py`,
-`_transport_solvers.py`, the reverse benchmark CLI, the two relevant test
-files, and these Markdown notes. They have not been committed or pushed in
-this save operation. Preserve unrelated optimization-lane work.
+Branch: `en/reverse_ad_improvement`. During this implementation HEAD advanced
+concurrently from `936fe39` to `7ac3d92`; that commit includes the main shared
+preparation and new tests. Do not revert it: it also contains unrelated
+optimization work. The final compact-hook capability guard and these updated
+notes, centre-kernel optimization and its tests are later working-tree edits
+at this checkpoint. No commit/push was
+performed by the implementation agent.
 
 ## Historical notes (superseded where inconsistent with the checkpoint)
 
