@@ -50,6 +50,7 @@ from ._reverse_ad_initial_er import (
     initial_er_selected_root_profile,
     find_ntx_runtime_scan_model_in_model,
     fold_recorded_ntx_scan_database_bar_groups_into_support,
+    runtime_with_fresh_ntx_database_payload,
     runtime_with_realtime_geometry_payload,
     runtime_with_geometry_payload,
     runtime_with_ntx_support_payload,
@@ -1145,6 +1146,7 @@ def build_database_initial_root_experiment_stage(
     pre_root_state_from_profile_values: Callable[[object], object],
     options: Mapping[str, object] | None,
     jit_selected_root: bool = False,
+    use_fresh_database_payload: bool = False,
 ) -> DatabaseInitialRootExperimentStage:
     """Build the opt-in persistent root boundary before any optimization iteration.
 
@@ -1175,6 +1177,12 @@ def build_database_initial_root_experiment_stage(
 
         def _runtime_from_leaves(geometry_leaves, database_leaves):
             payload = payload_adapter.rebuild(geometry_leaves, database_leaves)
+            if use_fresh_database_payload:
+                return runtime_with_fresh_ntx_database_payload(
+                    runtime_template,
+                    geometry=payload["geometry"],
+                    database=payload["database"],
+                )
             return runtime_with_realtime_geometry_payload(
                 runtime_template,
                 {"kind": "ntx_database", **payload},

@@ -131,7 +131,11 @@ def main() -> int:
     )
     parser.add_argument(
         "--trial-mode",
-        choices=("database_root_experiment", "database_root_jit_experiment"),
+        choices=(
+            "database_root_experiment",
+            "database_root_jit_experiment",
+            "database_root_fresh_payload_experiment",
+        ),
         default="database_root_experiment",
         help="Select the opt-in database-root experiment to compare with database.",
     )

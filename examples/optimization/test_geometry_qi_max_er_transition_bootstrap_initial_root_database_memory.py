@@ -139,7 +139,12 @@ def main() -> int:
     )
     parser.add_argument(
         "--mode",
-        choices=("database", "database_root_experiment", "database_root_jit_experiment"),
+        choices=(
+            "database",
+            "database_root_experiment",
+            "database_root_jit_experiment",
+            "database_root_fresh_payload_experiment",
+        ),
         default="database",
         help=(
             "Use the unchanged database baseline, the parity-validated root "

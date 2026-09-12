@@ -457,6 +457,7 @@ class GeometryInitialErRootLeastSquaresProblem:
                 "database",
                 "database_root_experiment",
                 "database_root_jit_experiment",
+                "database_root_fresh_payload_experiment",
             }
             else evaluate_geometry_initial_er_root_only_least_squares_optimization
         )
@@ -524,6 +525,7 @@ class GeometryInitialErRootLeastSquaresProblem:
         if self.reverse_stage_mode in {
             "database_root_experiment",
             "database_root_jit_experiment",
+            "database_root_fresh_payload_experiment",
         }:
             evaluator_kwargs["database_root_stage"] = self.database_root_stage
             if self.payload_assembly_stage is not None:
@@ -1452,6 +1454,7 @@ def geometry_initial_er_root_only_least_squares_problem(
         "database",
         "database_root_experiment",
         "database_root_jit_experiment",
+        "database_root_fresh_payload_experiment",
         "optimization",
         "optimization_root_experiment",
         "optimization_root_strict_experiment",
@@ -1466,7 +1469,8 @@ def geometry_initial_er_root_only_least_squares_problem(
     }:
         raise ValueError(
             "reverse_stage_mode must be 'off', 'database', 'database_root_experiment', "
-            "'database_root_jit_experiment', 'optimization', "
+            "'database_root_jit_experiment', 'database_root_fresh_payload_experiment', "
+            "'optimization', "
             "'optimization_root_experiment', 'optimization_root_strict_experiment', "
             "'optimization_root_per_radius_experiment', 'optimization_payload_experiment', "
             "'optimization_payload_root_experiment', 'optimization_payload_root_strict_experiment', "
@@ -1480,7 +1484,11 @@ def geometry_initial_er_root_only_least_squares_problem(
             "reverse_stage_mode='vmex_like' is disabled while the incomplete "
             "outer-JIT experiment is replaced by retained existing reverse kernels."
         )
-    database_root_modes = {"database_root_experiment", "database_root_jit_experiment"}
+    database_root_modes = {
+        "database_root_experiment",
+        "database_root_jit_experiment",
+        "database_root_fresh_payload_experiment",
+    }
     config_eff = _prepare_initial_er_root_config(config, device=device, vmec_input=vmec_input)
     geom_cfg = config_eff.get("geometry", {})
     neoclassical_cfg = config_eff.get("neoclassical", {})
@@ -1611,6 +1619,7 @@ def geometry_initial_er_root_only_least_squares_problem(
             ),
             options=root_options,
             jit_selected_root=(mode == "database_root_jit_experiment"),
+            use_fresh_database_payload=(mode == "database_root_fresh_payload_experiment"),
         )
     if mode in {
         "optimization",
@@ -1647,6 +1656,7 @@ def geometry_initial_er_root_only_least_squares_problem(
         "optimization_payload_reverse_experiment",
         "database_root_experiment",
         "database_root_jit_experiment",
+        "database_root_fresh_payload_experiment",
     }:
         prepared_payload_static = _prepare_initial_root_payload_static(
             context,
@@ -1662,6 +1672,7 @@ def geometry_initial_er_root_only_least_squares_problem(
         "optimization_payload_reverse_experiment",
         "database_root_experiment",
         "database_root_jit_experiment",
+        "database_root_fresh_payload_experiment",
     }:
         if raw_block_stage is None:
             raise ValueError("optimization initial-root stage requires VMEC boundary parameters.")

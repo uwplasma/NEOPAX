@@ -761,6 +761,62 @@ def runtime_with_realtime_geometry_payload(runtime, payload):
     raise ValueError(f"Unknown realtime geometry payload kind {kind!r}.")
 
 
+def _replace_geometry_and_fresh_database_payload_in_model(model, geometry, database):
+    """Replace geometry and an already-current database in one traversal.
+
+    This is intentionally narrower than :func:`runtime_with_geometry_payload`.
+    That generic helper must rescale a database when it receives new geometry
+    while retaining the model's *old* table.  The recorded-database
+    optimization stage instead supplies a table rebuilt from the current VMEC
+    geometry.  Rescaling the template table before replacing it with that
+    supplied table would create a discarded JAX computation on every trial.
+    """
+
+    if model is None or not dataclasses.is_dataclass(model) or isinstance(model, type):
+        return model, False
+    if isinstance(model, NTXDatabaseTransportModel):
+        return dataclasses.replace(model, geometry=geometry, database=database), True
+
+    updates = {}
+    changed = False
+    for field in dataclasses.fields(model):
+        value = getattr(model, field.name)
+        if field.name in {"geometry", "field"}:
+            if value is not geometry:
+                updates[field.name] = geometry
+                changed = True
+            continue
+        if dataclasses.is_dataclass(value) and not isinstance(value, type):
+            replacement, child_changed = _replace_geometry_and_fresh_database_payload_in_model(
+                value, geometry, database
+            )
+            if child_changed:
+                updates[field.name] = replacement
+                changed = True
+    return (dataclasses.replace(model, **updates), True) if changed else (model, False)
+
+
+def runtime_with_fresh_ntx_database_payload(runtime, *, geometry, database):
+    """Return ``runtime`` with new geometry and a matching fresh NTX table.
+
+    Unlike ``runtime_with_realtime_geometry_payload(..., kind='ntx_database')``,
+    this does not first derive a geometry-scaled view of the template table.
+    Callers must supply a database already built for ``geometry``.
+    """
+
+    flux_model, changed = _replace_geometry_and_fresh_database_payload_in_model(
+        runtime.models.flux, geometry, database
+    )
+    if not changed:
+        raise ValueError("No NTX database transport model was found in the runtime.")
+    return dataclasses.replace(
+        runtime,
+        geometry=geometry,
+        database=database,
+        models=dataclasses.replace(runtime.models, flux=flux_model),
+    )
+
+
 def runtime_with_realtime_geometry_reverse_support_payload(runtime, support_payload):
     """Rebuild ``runtime`` from the differentiable reverse support leaves.
 

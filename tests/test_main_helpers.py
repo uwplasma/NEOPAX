@@ -31,6 +31,7 @@ from NEOPAX._reverse_ad_initial_er import (
     realtime_geometry_payload_for_runtime,
     realtime_geometry_reverse_support_payload_for_runtime,
     runtime_with_fixed_ntx_database_model,
+    runtime_with_fresh_ntx_database_payload,
     runtime_with_geometry_payload,
     runtime_with_realtime_geometry_payload,
     runtime_with_realtime_geometry_reverse_support_payload,
@@ -2525,6 +2526,44 @@ def test_runtime_with_tagged_database_payload_replaces_geometry_and_database():
     assert actual.database is new_database
     assert actual.models.flux.geometry is new_geometry
     assert actual.models.flux.database is new_database
+
+
+def test_runtime_with_fresh_database_payload_skips_template_database_rescaling(monkeypatch):
+    database = Monoenergetic(
+        a_b=jnp.asarray(2.0),
+        rho=jnp.asarray([0.1, 0.3, 0.6, 0.9, 1.0]),
+        nu_log=jnp.asarray([-2.0]),
+        Er_list=jnp.asarray([[1.0]] * 5),
+        D11_log=jnp.zeros((5, 1, 1)),
+        D13=jnp.zeros((5, 1, 1)),
+        D33=jnp.zeros((5, 1, 1)),
+    )
+    old_geometry = types.SimpleNamespace(a_b=jnp.asarray(2.0))
+    new_geometry = types.SimpleNamespace(a_b=jnp.asarray(4.0))
+    fresh_database = dataclasses.replace(database, a_b=jnp.asarray(4.0))
+    runtime = RuntimeContext(
+        species="species",
+        energy_grid="grid",
+        geometry=old_geometry,
+        database=database,
+        solver_parameters={},
+        models=Models(
+            flux=NTXDatabaseTransportModel("species", "grid", old_geometry, database)
+        ),
+    )
+
+    def _unexpected_scale(*_args, **_kwargs):
+        pytest.fail("fresh database reconstruction must not rescale the template table")
+
+    monkeypatch.setattr(initial_er_module, "database_with_geometry_scale", _unexpected_scale)
+    actual = runtime_with_fresh_ntx_database_payload(
+        runtime, geometry=new_geometry, database=fresh_database
+    )
+
+    assert actual.geometry is new_geometry
+    assert actual.database is fresh_database
+    assert actual.models.flux.geometry is new_geometry
+    assert actual.models.flux.database is fresh_database
 
 
 def test_monoenergetic_interpolation_kernel_defaults_to_generic():
