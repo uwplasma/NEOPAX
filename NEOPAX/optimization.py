@@ -24,6 +24,7 @@ from ._geometry_autodiff import (
     initial_root_payload_active_leaf_layout,
     boundary_param_entries,
     build_neopax_geometry_and_ntx_exact_lij_support_from_state,
+    build_runtime_context_for_vmec_state,
     build_geometry_autodiff_context,
     geometry_raw_block_stage,
     geometry_raw_block_solve_from_param_vector,
@@ -606,17 +607,32 @@ class GeometryInitialErRootLeastSquaresProblem:
                     max_iter=self.geometry_max_iter,
                     solver_device=self.geometry_solver_device,
                 )
-                payload = build_neopax_geometry_and_ntx_exact_lij_support_from_state(
-                    self.context,
-                    raw_block_solve.state,
-                    n_r=self.n_r,
-                    n_theta=self.n_theta,
-                    n_zeta=self.n_zeta,
-                    n_xi=self.n_xi,
-                    surface_backend=self.surface_backend,
-                )
-                runtime_for_geometry = runtime_with_geometry_payload(runtime_for_geometry, payload["geometry"])
-                runtime_for_geometry = runtime_with_ntx_support_payload(runtime_for_geometry, payload["ntx_support"])
+                flux_model_name = str(
+                    self.config.get("neoclassical", {}).get("flux_model", "")
+                ).strip().lower()
+                if flux_model_name == "ntx_scan_runtime":
+                    runtime_for_geometry, _ = build_runtime_context_for_vmec_state(
+                        dict(self.config),
+                        self.context,
+                        raw_block_solve.state,
+                        n_r=self.n_r,
+                    )
+                else:
+                    payload = build_neopax_geometry_and_ntx_exact_lij_support_from_state(
+                        self.context,
+                        raw_block_solve.state,
+                        n_r=self.n_r,
+                        n_theta=self.n_theta,
+                        n_zeta=self.n_zeta,
+                        n_xi=self.n_xi,
+                        surface_backend=self.surface_backend,
+                    )
+                    runtime_for_geometry = runtime_with_geometry_payload(
+                        runtime_for_geometry, payload["geometry"]
+                    )
+                    runtime_for_geometry = runtime_with_ntx_support_payload(
+                        runtime_for_geometry, payload["ntx_support"]
+                    )
         pre_root_state = self._pre_root_state_from_profile_values(profile_values)
         er_profile, finite_mask = initial_er_selected_root_profile(
             pre_root_state,
@@ -643,16 +659,8 @@ class GeometryInitialErRootLeastSquaresProblem:
         )
         return rho_grid, rooted_state.density, rooted_state.temperature, rooted_state.Er, finite_mask
 
-    def bootstrap_current_profile_from_scaled_parameters(self, scaled_parameter_values=None):
-        """Return rho, momentum-corrected bootstrap current profile, and finite mask.
-
-        The returned current uses the same scaled units as the optimization
-        objective: one unit corresponds to ``1e5 A/m^2``.
-        """
-
-        rho_grid, rooted_state, runtime_for_geometry, finite_mask = (
-            self._initial_er_root_state_runtime_from_scaled_parameters(scaled_parameter_values)
-        )
+    @staticmethod
+    def _bootstrap_current_from_rooted_state_runtime(rooted_state, runtime_for_geometry):
         flux_model = runtime_for_geometry.models.flux
         neoclassical_model = getattr(flux_model, "neoclassical_model", flux_model)
         corrected_fluxes_fn = getattr(neoclassical_model, "evaluate_momentum_corrected_fluxes", None)
@@ -676,10 +684,36 @@ class GeometryInitialErRootLeastSquaresProblem:
         upar_physical = jnp.asarray(DENSITY_STATE_TO_PHYSICAL, dtype=upar_arr.dtype) * upar_arr
         scale = jnp.asarray(elementary_charge * 1.0e-5, dtype=upar_arr.dtype)
         if int(upar_arr.shape[0]) == int(charge_qp.shape[0]):
-            jboot = jnp.sum(upar_physical * current_weights[:, None], axis=0) * scale
-        else:
-            jboot = jnp.sum(upar_physical * current_weights[None, :], axis=1) * scale
+            return jnp.sum(upar_physical * current_weights[:, None], axis=0) * scale
+        return jnp.sum(upar_physical * current_weights[None, :], axis=1) * scale
+
+    def bootstrap_current_profile_from_scaled_parameters(self, scaled_parameter_values=None):
+        """Return rho, momentum-corrected bootstrap current profile, and finite mask.
+
+        The returned current uses the same scaled units as the optimization
+        objective: one unit corresponds to ``1e5 A/m^2``.
+        """
+
+        rho_grid, rooted_state, runtime_for_geometry, finite_mask = (
+            self._initial_er_root_state_runtime_from_scaled_parameters(scaled_parameter_values)
+        )
+        jboot = self._bootstrap_current_from_rooted_state_runtime(
+            rooted_state, runtime_for_geometry
+        )
         return rho_grid, jboot, finite_mask
+
+    def initial_er_and_bootstrap_current_profiles_from_scaled_parameters(
+        self, scaled_parameter_values=None
+    ):
+        """Return selected Er and bootstrap profiles from one shared rooted runtime."""
+
+        rho_grid, rooted_state, runtime_for_geometry, finite_mask = (
+            self._initial_er_root_state_runtime_from_scaled_parameters(scaled_parameter_values)
+        )
+        jboot = self._bootstrap_current_from_rooted_state_runtime(
+            rooted_state, runtime_for_geometry
+        )
+        return rho_grid, rooted_state.Er, jboot, finite_mask
 
 
 @dataclasses.dataclass(frozen=True, slots=True)

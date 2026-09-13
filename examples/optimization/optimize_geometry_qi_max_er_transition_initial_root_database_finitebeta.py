@@ -58,7 +58,7 @@ MAKE_WOUT_PLOTS = True
 MAKE_J_POLAR_PLOTS = True
 MAKE_B_AXIS_PLOTS = True
 MAKE_BOOZER_B_CONTOUR_PLOTS = True
-MAKE_INITIAL_PLOTS = False
+MAKE_INITIAL_PLOTS = True
 
 
 def parser() -> argparse.ArgumentParser:
@@ -173,8 +173,11 @@ def report(tag: str, problem, x) -> dict[str, float]:
     return values
 
 
-def save_er_profile(problem, x, out_dir: Path, label: str) -> None:
-    rho, er, finite_mask = problem.initial_er_profile_from_scaled_parameters(x)
+def save_er_profile(problem, x, out_dir: Path, label: str, *, profiles=None) -> None:
+    if profiles is None:
+        rho, er, finite_mask = problem.initial_er_profile_from_scaled_parameters(x)
+    else:
+        rho, er, _current, finite_mask = profiles
     rho_np = np.asarray(jax.device_get(rho), dtype=float)
     er_np = np.asarray(jax.device_get(er), dtype=float)
     finite_np = np.asarray(jax.device_get(finite_mask), dtype=bool)
@@ -227,6 +230,49 @@ def save_er_profile(problem, x, out_dir: Path, label: str) -> None:
     fig.savefig(png_path, dpi=320, bbox_inches="tight")
     plt.close(fig)
     print(f"wrote {png_path}")
+
+
+def save_bootstrap_current_profile(problem, x, out_dir: Path, label: str, *, profiles=None) -> None:
+    if profiles is None:
+        rho, current, finite_mask = problem.bootstrap_current_profile_from_scaled_parameters(x)
+    else:
+        rho, _er, current, finite_mask = profiles
+    rho_np = np.asarray(jax.device_get(rho), dtype=float)
+    current_np = np.asarray(jax.device_get(current), dtype=float)
+    finite_np = np.asarray(jax.device_get(finite_mask), dtype=bool)
+    csv_path = out_dir / f"bootstrap_current_profile_{label}.csv"
+    np.savetxt(
+        csv_path,
+        np.column_stack((rho_np, current_np, finite_np.astype(float))),
+        delimiter=",",
+        header="rho,Jboot_scaled_1e5_A_m2,finite_mask",
+        comments="",
+    )
+    print(f"wrote {csv_path}")
+    try:
+        import matplotlib.pyplot as plt
+    except Exception as exc:
+        print(f"skipping bootstrap-current profile plot: {exc}")
+        return
+    fig, ax = plt.subplots(figsize=(6.8, 5.6))
+    ax.plot(rho_np, 100.0 * current_np, color="tab:blue", linewidth=3.0, label="bootstrap current")
+    ax.axhline(10.0, color="black", linewidth=2.0, label=r"$10\,\mathrm{kA\,m^{-2}}$")
+    ax.axhline(-10.0, color="black", linewidth=2.0, label=r"$-10\,\mathrm{kA\,m^{-2}}$")
+    ax.set_xlabel(r"$\rho$", fontsize=20)
+    ax.set_ylabel(r"$J^{BOOTSTRAP}$ [$\mathrm{kA\,m^{-2}}$]", fontsize=20)
+    ax.tick_params(axis="both", labelsize=16)
+    ax.legend(loc="best")
+    fig.tight_layout()
+    png_path = out_dir / f"bootstrap_current_profile_{label}.png"
+    fig.savefig(png_path, dpi=320, bbox_inches="tight")
+    plt.close(fig)
+    print(f"wrote {png_path}")
+
+
+def save_transport_profiles(problem, x, out_dir: Path, label: str) -> None:
+    profiles = problem.initial_er_and_bootstrap_current_profiles_from_scaled_parameters(x)
+    save_er_profile(problem, x, out_dir, label, profiles=profiles)
+    save_bootstrap_current_profile(problem, x, out_dir, label, profiles=profiles)
 
 
 def plot_j_polar_contours(eq, out_dir: Path, *, lambda_samples=(0.1, 0.3, 0.5, 0.7, 0.9)) -> None:
@@ -448,9 +494,9 @@ def write_outputs(initial_input, optimized_input, initial_problem, initial_x, fi
     print(f"wrote {optimized_path}")
     if MAKE_INITIAL_PLOTS:
         initial_dir = write_geometry_artifacts(initial_input, "initial")
-        save_er_profile(initial_problem, initial_x, initial_dir, "initial")
+        save_transport_profiles(initial_problem, initial_x, initial_dir, "initial")
     optimized_dir = write_geometry_artifacts(optimized_input, "optimized")
-    save_er_profile(final_problem, final_x, optimized_dir, "optimized")
+    save_transport_profiles(final_problem, final_x, optimized_dir, "optimized")
 
 
 def main() -> int:

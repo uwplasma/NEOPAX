@@ -173,6 +173,83 @@ def test_repeated_evaluation_memory_samples_release_evaluations(monkeypatch):
     assert all(sample.jacobian_shape == (1, 1) for sample in samples)
 
 
+def test_database_profile_diagnostics_rebuild_live_database_runtime(monkeypatch):
+    """Plot helpers must not inject exact-Lij support into a database model."""
+
+    @dataclasses.dataclass(frozen=True)
+    class State:
+        Er: object
+
+    live_runtime = SimpleNamespace(geometry=SimpleNamespace(rho_grid=jnp.asarray([0.2, 0.8])))
+    calls = {}
+
+    monkeypatch.setattr(
+        optimization,
+        "geometry_raw_block_solve_from_param_vector",
+        lambda *args, **kwargs: SimpleNamespace(state="trial-vmec-state"),
+    )
+
+    def rebuild_runtime(config, context, state, *, n_r):
+        calls.update(config=config, context=context, state=state, n_r=n_r)
+        return live_runtime, object()
+
+    monkeypatch.setattr(optimization, "build_runtime_context_for_vmec_state", rebuild_runtime)
+    monkeypatch.setattr(
+        optimization,
+        "build_neopax_geometry_and_ntx_exact_lij_support_from_state",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("database diagnostics must not build exact-Lij support")
+        ),
+    )
+    monkeypatch.setattr(
+        optimization,
+        "initial_er_selected_root_profile",
+        lambda state, *, config, runtime: (
+            jnp.asarray([1.0, -1.0]),
+            jnp.asarray([True, True]),
+        ),
+    )
+
+    boundary_spec = SimpleNamespace(as_tuple=lambda: ("RBC", 1, 0))
+    problem = SimpleNamespace(
+        x0=jnp.asarray([0.0]),
+        _scaled_to_physical=lambda values: jnp.asarray(values),
+        baseline_profile_values=jnp.zeros(6),
+        parameter_set=SimpleNamespace(
+            specs=(boundary_spec,),
+            vmec_boundary_specs=(boundary_spec,),
+        ),
+        runtime=object(),
+        context="geometry-context",
+        geometry_max_iter=None,
+        geometry_solver_device="default",
+        n_r=51,
+        n_theta=5,
+        n_zeta=25,
+        n_xi=31,
+        surface_backend="vmec",
+        config={"neoclassical": {"flux_model": "ntx_scan_runtime"}},
+        _pre_root_state_from_profile_values=lambda values: State(Er=jnp.zeros(2)),
+    )
+
+    profile_helper = (
+        optimization.GeometryInitialErRootLeastSquaresProblem
+        ._initial_er_root_state_runtime_from_scaled_parameters
+    )
+    rho, rooted_state, runtime, finite_mask = profile_helper(problem, jnp.asarray([0.1]))
+
+    assert runtime is live_runtime
+    assert jnp.allclose(rho, jnp.asarray([0.2, 0.8]))
+    assert jnp.allclose(rooted_state.Er, jnp.asarray([1.0, -1.0]))
+    assert jnp.all(finite_mask)
+    assert calls == {
+        "config": problem.config,
+        "context": "geometry-context",
+        "state": "trial-vmec-state",
+        "n_r": 51,
+    }
+
+
 def test_initial_root_reverse_stage_owns_only_callable_kernel_identities():
     layout = initial_root_stage.InitialRootStageLayout(
         objective_names=("maxEr", "J_bootstrap"),
