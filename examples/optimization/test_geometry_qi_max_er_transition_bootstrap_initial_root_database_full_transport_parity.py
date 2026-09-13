@@ -10,10 +10,13 @@ kernels.  This is not an FD test or a physical final-time transport run.
 
 from __future__ import annotations
 
+import argparse
 import io
 from contextlib import redirect_stdout
 from pathlib import Path
+import subprocess
 import sys
+import tempfile
 
 import jax
 import numpy as np
@@ -116,25 +119,86 @@ def evaluate(problem, x):
     return jax.block_until_ready((result.residuals, result.jacobian))
 
 
+def _worker(stage_name: str, output_path: Path) -> int:
+    """Evaluate one lane in its own process and persist only host arrays."""
+
+    stage_mode = REFERENCE_STAGE_MODE if stage_name == "reference" else TRIAL_STAGE_MODE
+    problem = build_problem(reverse_stage_mode=stage_mode)
+    x0 = np.asarray(jax.device_get(problem.x0), dtype=float)
+    residuals, jacobian = evaluate(problem, x0)
+    np.savez(
+        output_path,
+        residuals=np.asarray(jax.device_get(residuals), dtype=float),
+        jacobian=np.asarray(jax.device_get(jacobian), dtype=float),
+        x0=x0,
+        parameter_labels=np.asarray(problem.parameter_labels, dtype=str),
+    )
+    print(
+        f"[database full-transport parity] worker={stage_name} "
+        f"stage={stage_mode} wrote={output_path}",
+        flush=True,
+    )
+    return 0
+
+
+def _run_worker(stage_name: str, output_path: Path) -> None:
+    subprocess.run(
+        [
+            sys.executable,
+            str(Path(__file__).resolve()),
+            "--worker-stage",
+            stage_name,
+            "--worker-output",
+            str(output_path),
+        ],
+        check=True,
+    )
+
+
+def _load_worker_output(path: Path) -> tuple[np.ndarray, np.ndarray, np.ndarray, tuple[str, ...]]:
+    with np.load(path, allow_pickle=False) as data:
+        return (
+            np.asarray(data["residuals"], dtype=float),
+            np.asarray(data["jacobian"], dtype=float),
+            np.asarray(data["x0"], dtype=float),
+            tuple(str(value) for value in data["parameter_labels"]),
+        )
+
+
 def main() -> int:
-    reference = build_problem(reverse_stage_mode=REFERENCE_STAGE_MODE)
-    trial = build_problem(reverse_stage_mode=TRIAL_STAGE_MODE)
-    reference_x0 = np.asarray(jax.device_get(reference.x0), dtype=float)
-    trial_x0 = np.asarray(jax.device_get(trial.x0), dtype=float)
-    if reference.parameter_labels != trial.parameter_labels:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--worker-stage", choices=("reference", "trial"), help=argparse.SUPPRESS)
+    parser.add_argument("--worker-output", type=Path, help=argparse.SUPPRESS)
+    args = parser.parse_args()
+    if args.worker_stage is not None:
+        if args.worker_output is None:
+            parser.error("--worker-output is required with --worker-stage")
+        return _worker(args.worker_stage, args.worker_output)
+    if args.worker_output is not None:
+        parser.error("--worker-output is only valid with --worker-stage")
+
+    # A single process cannot reliably hold both full GPU compilation sets.
+    # Sequential workers release all reference-lane GPU state before the trial
+    # starts while preserving exactly the host arrays needed for parity.
+    with tempfile.TemporaryDirectory(prefix="neopax_full_transport_parity_") as temp_dir:
+        temp_root = Path(temp_dir)
+        reference_path = temp_root / "reference.npz"
+        trial_path = temp_root / "trial.npz"
+        _run_worker("reference", reference_path)
+        reference_residuals, reference_jacobian, reference_x0, reference_labels = (
+            _load_worker_output(reference_path)
+        )
+        _run_worker("trial", trial_path)
+        trial_residuals, trial_jacobian, trial_x0, trial_labels = _load_worker_output(
+            trial_path
+        )
+
+    if reference_labels != trial_labels:
         raise AssertionError("Reference and trial parameter layouts differ.")
     np.testing.assert_array_equal(trial_x0, reference_x0)
-    x = reference_x0
-
-    reference_residuals, reference_jacobian = evaluate(reference, x)
-    trial_residuals, trial_jacobian = evaluate(trial, x)
-    residual_delta = np.asarray(
-        jax.device_get(trial_residuals - reference_residuals), dtype=float
-    )
-    jacobian_delta = np.asarray(
-        jax.device_get(trial_jacobian - reference_jacobian), dtype=float
-    )
-    reference_jacobian_np = np.asarray(jax.device_get(reference_jacobian), dtype=float)
+    residual_delta = trial_residuals - reference_residuals
+    jacobian_delta = trial_jacobian - reference_jacobian
+    reference_jacobian_np = reference_jacobian
     relative_delta = np.abs(jacobian_delta) / np.maximum(
         np.abs(reference_jacobian_np), 1.0e-14
     )
@@ -151,6 +215,7 @@ def main() -> int:
         f"segment_length={REVERSE_SEGMENT_LENGTH} "
         f"reference_stage={REFERENCE_STAGE_MODE} trial_stage={TRIAL_STAGE_MODE} "
         "parameter_point=unperturbed_x0 "
+        "process_isolation=sequential_workers "
         "transport_reverse=block/explicit_database/reduced_cotangent_call_boundary "
         "database_interpolation_transpose=legacy_sparse",
         flush=True,
