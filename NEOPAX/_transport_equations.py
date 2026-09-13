@@ -90,6 +90,41 @@ def _database_geometry_vjp_debug_enabled() -> bool:
     ).strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _validate_database_interpolation_transpose_mode(mode):
+    """Normalize the call-local legacy database interpolation selector."""
+
+    normalized = "established" if mode is None else str(mode).strip().lower()
+    if normalized not in {"established", "legacy_sparse"}:
+        raise ValueError(
+            "interpolation_transpose_mode must be 'established' or "
+            f"'legacy_sparse'; got {normalized!r}."
+        )
+    return normalized
+
+
+def _database_interpolation_pullback(model, mode, *, face):
+    """Select an explicit table hook without changing the default callable."""
+
+    normalized = _validate_database_interpolation_transpose_mode(mode)
+    base_name = (
+        "pullback_direct_face_flux_support_payload"
+        if face
+        else "pullback_direct_rhs_support_payload"
+    )
+    hook_name = (
+        f"{base_name}_legacy_sparse"
+        if normalized == "legacy_sparse"
+        else base_name
+    )
+    pullback = getattr(model, hook_name, None)
+    if not callable(pullback):
+        raise NotImplementedError(
+            f"Database interpolation mode {normalized!r} requires hook "
+            f"{hook_name!r}."
+        )
+    return pullback
+
+
 def _minmod_pair(a, b):
     same_sign = (a * b) > 0.0
     return jnp.where(same_sign, jnp.sign(a) * jnp.minimum(jnp.abs(a), jnp.abs(b)), 0.0)
@@ -485,7 +520,14 @@ def build_density_equation(
             evaluated_state=evaluated_state,
         )
 
-    def database_face_table_pullback(state, center_fluxes, flux_bar, support):
+    def database_face_table_pullback(
+        state,
+        center_fluxes,
+        flux_bar,
+        support,
+        *,
+        interpolation_transpose_mode=None,
+    ):
         """Use the database owner's compact native face-table transpose."""
         state = apply_transport_density_floor(state, density_floor)
         state = apply_transport_temperature_floor(state, temperature_floor, density_floor)
@@ -499,9 +541,9 @@ def build_density_equation(
             bc_er=bc_er, reconstruction=reconstruction,
             density_floor=density_floor, temperature_floor=temperature_floor,
         )
-        pullback = getattr(flux_model, "pullback_direct_face_flux_support_payload", None)
-        if not callable(pullback):
-            raise NotImplementedError("Database density face closure lacks a compact table transpose.")
+        pullback = _database_interpolation_pullback(
+            flux_model, interpolation_transpose_mode, face=True
+        )
         return pullback(
             state, face_state, flux_bar, support,
             bc_density=bc_density, bc_temperature=bc_temperature, bc_er=bc_er,
@@ -1026,7 +1068,14 @@ def build_temperature_equation(
             evaluated_state=evaluated_state,
         )
 
-    def database_face_table_pullback(state, center_fluxes, flux_bar, support):
+    def database_face_table_pullback(
+        state,
+        center_fluxes,
+        flux_bar,
+        support,
+        *,
+        interpolation_transpose_mode=None,
+    ):
         """Use the database owner's compact native face-table transpose."""
         state = apply_transport_density_floor(state, density_floor)
         state = apply_transport_temperature_floor(state, temperature_floor, density_floor)
@@ -1040,9 +1089,9 @@ def build_temperature_equation(
             bc_er=bc_er, reconstruction=reconstruction,
             density_floor=density_floor, temperature_floor=temperature_floor,
         )
-        pullback = getattr(flux_model, "pullback_direct_face_flux_support_payload", None)
-        if not callable(pullback):
-            raise NotImplementedError("Database temperature face closure lacks a compact table transpose.")
+        pullback = _database_interpolation_pullback(
+            flux_model, interpolation_transpose_mode, face=True
+        )
         return pullback(
             state, face_state, flux_bar, support,
             bc_density=bc_density, bc_temperature=bc_temperature, bc_er=bc_er,
@@ -2139,7 +2188,15 @@ class ComposedEquationSystem:
         return self._prepare_working_state_pullback(state, total_working_state_bar)
 
     def pullback_direct_rhs_database_table_payload(
-        self, t, state, runtime, rhs_bar, support, *, _prepared=None
+        self,
+        t,
+        state,
+        runtime,
+        rhs_bar,
+        support,
+        *,
+        _prepared=None,
+        interpolation_transpose_mode=None,
     ):
         """Return only the explicit fixed-database table bar for a direct RHS.
 
@@ -2159,12 +2216,15 @@ class ComposedEquationSystem:
             self._flux_model_with_realtime_support_payload(self.shared_flux_model, support)
             if _prepared is None else _prepared.active_flux_model
         )
-        table_pullback = getattr(
-            active_shared_flux_model, "pullback_direct_rhs_support_payload", None
+        interpolation_transpose_mode = (
+            _validate_database_interpolation_transpose_mode(
+                interpolation_transpose_mode
+            )
         )
-        if not callable(table_pullback):
-            raise NotImplementedError(
-                "Database table-only direct-RHS pullback requires a compact flux transpose."
+        table_pullback = _database_interpolation_pullback(
+            active_shared_flux_model,
+            interpolation_transpose_mode,
+            face=False,
         )
         if _prepared is None:
             working_state, _ = self._prepare_working_state(state)
@@ -2205,6 +2265,7 @@ class ComposedEquationSystem:
             support,
             density_faces_bar,
             temperature_faces_bar,
+            interpolation_transpose_mode=interpolation_transpose_mode,
         )
         if not isinstance(table_support_bar, dict) or "database" not in table_support_bar:
             raise ValueError(
@@ -2222,7 +2283,14 @@ class ComposedEquationSystem:
         return support_bar
 
     def pullback_direct_rhs_database_table_payload_batched(
-        self, t, state, runtime, rhs_bar, support
+        self,
+        t,
+        state,
+        runtime,
+        rhs_bar,
+        support,
+        *,
+        interpolation_transpose_mode=None,
     ):
         """Batch objective rows through the fixed-table RHS transpose."""
         if not isinstance(support, dict) or set(support) != {"geometry", "database"}:
@@ -2233,12 +2301,15 @@ class ComposedEquationSystem:
         active_shared_flux_model = self._flux_model_with_realtime_support_payload(
             self.shared_flux_model, support
         )
-        table_pullback = getattr(
-            active_shared_flux_model, "pullback_direct_rhs_support_payload", None
+        interpolation_transpose_mode = (
+            _validate_database_interpolation_transpose_mode(
+                interpolation_transpose_mode
+            )
         )
-        if not callable(table_pullback):
-            raise NotImplementedError(
-                "Batched database table RHS pullback requires a compact flux transpose."
+        table_pullback = _database_interpolation_pullback(
+            active_shared_flux_model,
+            interpolation_transpose_mode,
+            face=False,
         )
         working_state, _ = self._prepare_working_state(state)
         shared_fluxes = active_shared_flux_model(working_state)
@@ -2268,6 +2339,7 @@ class ComposedEquationSystem:
             support,
             density_faces_bar,
             temperature_faces_bar,
+            interpolation_transpose_mode=interpolation_transpose_mode,
         )
         if not isinstance(table_support_bar, dict) or "database" not in table_support_bar:
             raise ValueError(
@@ -2594,6 +2666,7 @@ class ComposedEquationSystem:
     def pullback_direct_rhs_database_split_support_payload(
         self, t, state, runtime, rhs_bar, support, *,
         support_preparation_mode=None, center_geometry_mode=None,
+        interpolation_transpose_mode=None,
     ):
         """Database-only split RHS transpose for a Radau reverse stage.
 
@@ -2613,6 +2686,11 @@ class ComposedEquationSystem:
                     "support_preparation_mode must be 'separate', 'shared', or None; "
                     f"got {support_preparation_mode!r}."
                 )
+        interpolation_transpose_mode = (
+            _validate_database_interpolation_transpose_mode(
+                interpolation_transpose_mode
+            )
+        )
         geometry_kwargs = _database_center_geometry_pullback_kwargs(
             self.pullback_direct_rhs_database_flux_geometry_payload, center_geometry_mode
         )
@@ -2634,8 +2712,18 @@ class ComposedEquationSystem:
             {"_prepared": self._prepare_database_direct_rhs_support(state, rhs_bar, support)}
             if share_preparation else {}
         )
+        table_kwargs = dict(preparation_kwargs)
+        if interpolation_transpose_mode == "legacy_sparse":
+            table_kwargs["interpolation_transpose_mode"] = (
+                interpolation_transpose_mode
+            )
         table_support_bar = self.pullback_direct_rhs_database_table_payload(
-            t, state, runtime, rhs_bar, support, **preparation_kwargs
+            t,
+            state,
+            runtime,
+            rhs_bar,
+            support,
+            **table_kwargs,
         )
         flux_geometry_bar = self.pullback_direct_rhs_database_flux_geometry_payload(
             t, state, runtime, rhs_bar, support, **preparation_kwargs, **geometry_kwargs
@@ -2669,6 +2757,7 @@ class ComposedEquationSystem:
         *,
         support_preparation_mode=None,
         center_geometry_mode=None,
+        interpolation_transpose_mode=None,
     ):
         """Matrix-RHS version of the explicit fixed-database support split.
 
@@ -2688,6 +2777,11 @@ class ComposedEquationSystem:
                 )
         center_geometry_mode = _validate_database_center_geometry_mode(
             center_geometry_mode
+        )
+        interpolation_transpose_mode = (
+            _validate_database_interpolation_transpose_mode(
+                interpolation_transpose_mode
+            )
         )
         if not isinstance(support, dict) or set(support) != {"geometry", "database"}:
             raise ValueError(
@@ -2722,14 +2816,25 @@ class ComposedEquationSystem:
                     support,
                     support_preparation_mode=support_preparation_mode,
                     center_geometry_mode=center_geometry_mode,
+                    interpolation_transpose_mode=interpolation_transpose_mode,
                 )
             )(rhs_bar)
 
         prepared = self._prepare_database_direct_rhs_support_batched(
             state, rhs_bar, support
         )
+        table_kwargs = {"_prepared": prepared}
+        if interpolation_transpose_mode == "legacy_sparse":
+            table_kwargs["interpolation_transpose_mode"] = (
+                interpolation_transpose_mode
+            )
         table_support_bar = self.pullback_direct_rhs_database_table_payload(
-            t, state, runtime, rhs_bar, support, _prepared=prepared
+            t,
+            state,
+            runtime,
+            rhs_bar,
+            support,
+            **table_kwargs,
         )
         geometry_kwargs = _database_center_geometry_pullback_kwargs(
             self.pullback_direct_rhs_database_flux_geometry_payload,
@@ -3136,7 +3241,14 @@ class ComposedEquationSystem:
         )
 
     def _pullback_database_primal_face_table_bars(
-        self, working_state, center_fluxes, support, density_faces_bar, temperature_faces_bar
+        self,
+        working_state,
+        center_fluxes,
+        support,
+        density_faces_bar,
+        temperature_faces_bar,
+        *,
+        interpolation_transpose_mode=None,
     ):
         """Fold captured equation-face bars into fixed database-table bars.
 
@@ -3147,6 +3259,11 @@ class ComposedEquationSystem:
         """
         if not isinstance(support, dict) or set(support) != {"geometry", "database"}:
             raise ValueError("Database face-table pullback requires geometry and database support.")
+        interpolation_transpose_mode = (
+            _validate_database_interpolation_transpose_mode(
+                interpolation_transpose_mode
+            )
+        )
         database = support["database"]
         database_delta0 = _float_delta_tree_like(database)
 
@@ -3168,8 +3285,17 @@ class ComposedEquationSystem:
                 None,
             )
             if callable(compact_pullback):
+                pullback_kwargs = (
+                    {"interpolation_transpose_mode": interpolation_transpose_mode}
+                    if interpolation_transpose_mode == "legacy_sparse"
+                    else {}
+                )
                 support_bar = compact_pullback(
-                    working_state, center_fluxes, face_bar, support
+                    working_state,
+                    center_fluxes,
+                    face_bar,
+                    support,
+                    **pullback_kwargs,
                 )
                 if not isinstance(support_bar, dict) or "database" not in support_bar:
                     raise ValueError("Compact database face transpose did not return a table bar.")

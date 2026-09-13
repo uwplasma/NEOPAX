@@ -80,6 +80,12 @@ class _CompactOwner:
             database_bar = pullback(flux_bar)[0]
         return {"database": database_bar}
 
+    def pullback_direct_rhs_support_payload_legacy_sparse(
+        self, state, flux_bar, support
+    ):
+        self.calls["center_table_legacy_sparse"] += 1
+        return self.pullback_direct_rhs_support_payload(state, flux_bar, support)
+
     def pullback_direct_rhs_geometry_by_radius(self, state, flux_bar, geometry):
         fluxes, pullback = jax.vjp(
             lambda value: _center_fluxes(state, value, self.support["database"]),
@@ -103,7 +109,17 @@ class _NativeFaces:
         self.calls[f"{self.kind}_faces"] += 1
         return _face_fluxes(self.kind, state, **self.support)
 
-    def database_table_pullback(self, state, _centers, face_bar, support):
+    def database_table_pullback(
+        self,
+        state,
+        _centers,
+        face_bar,
+        support,
+        *,
+        interpolation_transpose_mode=None,
+    ):
+        if interpolation_transpose_mode == "legacy_sparse":
+            self.calls[f"{self.kind}_table_legacy_sparse"] += 1
         face_fluxes, pullback = jax.vjp(
             lambda database: _face_fluxes(
                 self.kind, state, support["geometry"], database
@@ -368,6 +384,51 @@ def test_database_batched_split_support_matches_scalar_rows_jit():
         assert actual_calls[name] == 1
 
 
+@pytest.mark.parametrize("batched", [False, True])
+def test_database_split_support_routes_only_explicit_legacy_sparse_table_hooks(
+    batched,
+):
+    """The call-local selector changes only centre/face table transposes."""
+
+    state, support, rows = _inputs()
+    calls = Counter()
+    equations = _equations(support, calls)
+    if batched:
+        actual = equations.pullback_direct_rhs_database_split_support_payload_batched(
+            0.0,
+            state,
+            None,
+            rows,
+            support,
+            support_preparation_mode="shared",
+            interpolation_transpose_mode="legacy_sparse",
+        )
+        reference = jax.vmap(
+            lambda one_row: _independent_support_bar(
+                _equations(support, Counter()), state, one_row, support
+            )
+        )(rows)
+    else:
+        rhs_bar = jax.tree_util.tree_map(lambda value: value[0], rows)
+        actual = equations.pullback_direct_rhs_database_split_support_payload(
+            0.0,
+            state,
+            None,
+            rhs_bar,
+            support,
+            support_preparation_mode="shared",
+            interpolation_transpose_mode="legacy_sparse",
+        )
+        reference = _independent_support_bar(
+            _equations(support, Counter()), state, rhs_bar, support
+        )
+
+    _assert_same_tree(actual, reference)
+    assert calls["center_table_legacy_sparse"] == 1
+    assert calls["density_table_legacy_sparse"] == 1
+    assert calls["temperature_table_legacy_sparse"] == 1
+
+
 @pytest.mark.parametrize(
     "overridden_hook",
     [
@@ -408,7 +469,14 @@ def test_database_split_support_shared_primal_preserves_overridden_hooks(
     _assert_same_tree(actual, expected)
 
 
-@pytest.mark.parametrize("option", ["support_preparation_mode", "center_geometry_mode"])
+@pytest.mark.parametrize(
+    "option",
+    [
+        "support_preparation_mode",
+        "center_geometry_mode",
+        "interpolation_transpose_mode",
+    ],
+)
 def test_database_split_support_rejects_unknown_mode(option):
     state, support, rows = _inputs()
     rhs_bar = jax.tree_util.tree_map(lambda value: value[0], rows)

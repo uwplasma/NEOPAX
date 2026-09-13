@@ -3501,6 +3501,7 @@ def _configure_database_reverse_performance(
     initial_support_mode="split", support_preparation_mode="shared",
     center_geometry_mode="scalar_jvp", stage_jacobian_mode="independent",
     support_objective_mode="scalar", segment_support_mode="inline",
+    interpolation_transpose_mode="established",
 ):
     """Rebind only opted-in database support hooks, never primal/root hooks.
 
@@ -3528,6 +3529,10 @@ def _configure_database_reverse_performance(
             str(segment_support_mode).strip().lower(),
             {"inline", "deferred_segment_batch"},
         ),
+        "reverse_database_interpolation_transpose_mode": (
+            str(interpolation_transpose_mode).strip().lower(),
+            {"established", "legacy_sparse"},
+        ),
     }
     for name, (value, choices) in modes.items():
         if value not in choices:
@@ -3549,6 +3554,8 @@ def _configure_database_reverse_performance(
         and selected["reverse_database_stage_jacobian_mode"] == "independent"
         and selected["reverse_database_support_objective_mode"] == "scalar"
         and selected["reverse_database_segment_support_mode"] == "inline"
+        and selected["reverse_database_interpolation_transpose_mode"]
+        == "established"
     ):
         return physics_context
     if getattr(physics_context, "flat_rhs_direct_database_split_support_pullback", None) is None:
@@ -3562,6 +3569,10 @@ def _configure_database_reverse_performance(
         )
     if selected["reverse_database_support_preparation_mode"] != "shared":
         kwargs["support_preparation_mode"] = selected["reverse_database_support_preparation_mode"]
+    if selected["reverse_database_interpolation_transpose_mode"] != "established":
+        kwargs["interpolation_transpose_mode"] = selected[
+            "reverse_database_interpolation_transpose_mode"
+        ]
     if kwargs:
         selected["flat_rhs_direct_database_split_support_pullback"] = (
             _flat_rhs_direct_database_payload_pullback_factory(
@@ -3621,6 +3632,7 @@ def prepare_reverse_static_setup(
     reverse_database_stage_jacobian_mode: str = "independent",
     reverse_database_support_objective_mode: str = "scalar",
     reverse_database_segment_support_mode: str = "inline",
+    reverse_database_interpolation_transpose_mode: str = "established",
     reverse_segment_jit_diagnostics: bool = False,
     reverse_segment_input_diagnostics: bool = False,
     reverse_rebuild_component_timing: bool = False,
@@ -3798,6 +3810,9 @@ def prepare_reverse_static_setup(
         stage_jacobian_mode=reverse_database_stage_jacobian_mode,
         support_objective_mode=reverse_database_support_objective_mode,
         segment_support_mode=reverse_database_segment_support_mode,
+        interpolation_transpose_mode=(
+            reverse_database_interpolation_transpose_mode
+        ),
     )
     if configured_physics is not execution_context.physics_context:
         execution_context = dataclasses.replace(execution_context, physics_context=configured_physics)
@@ -4220,6 +4235,11 @@ def prepare_realtime_geometry_support_segment_core_setup(
         ),
         reverse_database_segment_support_mode=getattr(
             args, "reverse_database_segment_support_mode", "inline"
+        ),
+        reverse_database_interpolation_transpose_mode=getattr(
+            args,
+            "reverse_database_interpolation_transpose_mode",
+            "established",
         ),
         reverse_rhs_pullback_mode=getattr(args, "reverse_rhs_pullback_mode", "separate"),
         reverse_initial_cache_support_pullback_mode=getattr(
@@ -8027,6 +8047,7 @@ def internal_realtime_geometry_transport_reverse_table_result_builder(
     reverse_database_stage_jacobian_mode: str = "independent",
     reverse_database_support_objective_mode: str = "scalar",
     reverse_database_segment_support_mode: str = "inline",
+    reverse_database_interpolation_transpose_mode: str = "established",
     reverse_segment_jit_diagnostics: bool = False,
     reverse_segment_input_diagnostics: bool = False,
     reverse_rebuild_component_timing: bool = False,
@@ -8185,6 +8206,10 @@ def internal_realtime_geometry_transport_reverse_table_result_builder(
             reverse_database_segment_support_mode=str(opts.get(
                 "reverse_database_segment_support_mode",
                 reverse_database_segment_support_mode,
+            )),
+            reverse_database_interpolation_transpose_mode=str(opts.get(
+                "reverse_database_interpolation_transpose_mode",
+                reverse_database_interpolation_transpose_mode,
             )),
             reverse_rhs_pullback_mode=str(opts.get("reverse_rhs_pullback_mode", reverse_rhs_pullback_mode)),
             reverse_initial_cache_support_pullback_mode=str(

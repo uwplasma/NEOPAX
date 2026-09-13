@@ -31,7 +31,12 @@ from ._monoenergetic import (
     monoenergetic_database_kind,
 )
 from ._monoenergetic_interpolators import monoenergetic_interpolation_kernel
-from ._interpolators import monoenergetic_interpolation_table_bar
+from ._interpolators import (
+    monoenergetic_interpolation_sparse_coordinate_bar,
+    monoenergetic_interpolation_sparse_table_bar,
+    monoenergetic_interpolation_stencil,
+    monoenergetic_interpolation_table_bar,
+)
 from ._interpolators_preprocessed import (
     get_Dij_preprocessed_3d_ntss_radius,
     radial_preprocessed_interpolation_stencil,
@@ -450,6 +455,425 @@ def _get_Neoclassical_Fluxes_generic(
     )
     Gamma, Q, Upar = results
     return Lij, Gamma, Q, Upar
+
+
+@jit
+def pullback_legacy_monoenergetic_queries_sparse(
+    database,
+    radius_values,
+    nu_queries,
+    er_queries,
+    dij_bar,
+):
+    """Aggregate sparse legacy interpolation bars over a query batch.
+
+    Parameters use a compact ``(query, energy)`` layout.  ``dij_bar`` may be
+    ``(query, energy, 3)`` or carry a leading objective/RHS axis.  Only the
+    final accumulated database bars are dense; no query carries a complete
+    coefficient table or ``Er_list`` cotangent.
+    """
+
+    radius_values = jnp.asarray(radius_values)
+    nu_queries = jnp.asarray(nu_queries)
+    er_queries = jnp.asarray(er_queries)
+    dij_bar = jnp.asarray(dij_bar)
+    batched_rhs = dij_bar.ndim == 4
+    dij_rows = dij_bar if batched_rhs else dij_bar[None, ...]
+    rhs_count = dij_rows.shape[0]
+    query_count, energy_count = nu_queries.shape
+    flat_count = query_count * energy_count
+    flat_radius = jnp.repeat(radius_values, energy_count)
+    flat_nu = jnp.reshape(nu_queries, (flat_count,))
+    flat_er = jnp.reshape(er_queries, (flat_count,))
+    flat_dij_rows = jnp.reshape(dij_rows, (rhs_count, flat_count, 3))
+
+    stencils = jax.vmap(
+        monoenergetic_interpolation_stencil, in_axes=(0, 0, 0, None)
+    )(flat_radius, flat_nu, flat_er, database)
+    unit_table_bars = jax.vmap(
+        lambda stencil: monoenergetic_interpolation_sparse_table_bar(
+            stencil,
+            jnp.asarray(1.0, dtype=database.D11_log.dtype),
+            database.D11_log,
+            database,
+        )
+    )(stencils)
+
+    def _scatter_tables(local_values, table):
+        values = (
+            local_values[:, :, None, None, None]
+            * unit_table_bars.values[None, ...]
+        )
+        output_shape = (rhs_count,) + table.shape
+        output = jnp.zeros(output_shape, dtype=table.dtype)
+        scatter_shape = values.shape
+        rhs_indices = jnp.broadcast_to(
+            jnp.arange(rhs_count, dtype=jnp.int32)[:, None, None, None, None],
+            scatter_shape,
+        )
+        radial_indices = jnp.broadcast_to(
+            unit_table_bars.radial_indices[None, :, :, None, None],
+            scatter_shape,
+        )
+        nu_indices = jnp.broadcast_to(
+            unit_table_bars.nu_indices[None, :, None, :, None],
+            scatter_shape,
+        )
+        er_indices = jnp.broadcast_to(
+            unit_table_bars.er_indices[None, :, :, None, :],
+            scatter_shape,
+        )
+        return output.at[
+            rhs_indices, radial_indices, nu_indices, er_indices
+        ].add(values)
+
+    d11_bar = _scatter_tables(flat_dij_rows[..., 0], database.D11_log)
+    d13_bar = _scatter_tables(flat_dij_rows[..., 1], database.D13)
+    d33_bar = _scatter_tables(flat_dij_rows[..., 2], database.D33)
+
+    def _query_coordinate_rows(stencil, local_rows):
+        return jax.vmap(
+            lambda local_bar: monoenergetic_interpolation_sparse_coordinate_bar(
+                stencil, local_bar, database
+            )
+        )(local_rows)
+
+    coordinate_bars = jax.vmap(_query_coordinate_rows, in_axes=(0, 1))(
+        stencils, flat_dij_rows
+    )
+    a_b_bar = jnp.sum(coordinate_bars.a_b, axis=0)
+    er_values = jnp.moveaxis(coordinate_bars.er_values, 1, 0)
+    er_scatter_shape = er_values.shape
+    rhs_indices = jnp.broadcast_to(
+        jnp.arange(rhs_count, dtype=jnp.int32)[:, None, None, None],
+        er_scatter_shape,
+    )
+    radial_indices = jnp.broadcast_to(
+        coordinate_bars.radial_indices[None, :, 0, :, None],
+        er_scatter_shape,
+    )
+    er_indices = jnp.broadcast_to(
+        coordinate_bars.er_indices[None, :, 0, ...], er_scatter_shape
+    )
+    er_list_bar = jnp.zeros(
+        (rhs_count,) + database.Er_list.shape,
+        dtype=database.Er_list.dtype,
+    ).at[rhs_indices, radial_indices, er_indices].add(er_values)
+
+    result = (a_b_bar, er_list_bar, d11_bar, d13_bar, d33_bar)
+    if batched_rhs:
+        return result
+    return tuple(value[0] for value in result)
+
+
+@jit
+def _pullback_legacy_radial_database_flux_support_sparse(
+    species,
+    energy_grid,
+    database,
+    radius_values,
+    Er_values,
+    temperature,
+    density,
+    dndr,
+    dtdr,
+    gamma_bar,
+    q_bar,
+    upar_bar,
+    collisionality_kind,
+):
+    """Reduce local neoclassical flux bars to sparse interpolation queries."""
+
+    gamma_bar = jnp.asarray(gamma_bar)
+    q_bar = jnp.asarray(q_bar)
+    upar_bar = jnp.asarray(upar_bar)
+    batched_rhs = gamma_bar.ndim == 3
+    if batched_rhs and (q_bar.ndim != 3 or upar_bar.ndim != 3):
+        raise ValueError("Database flux cotangent RHS axes must be consistent.")
+
+    vthermal = get_v_thermal(species.mass, temperature)
+    density_phys = DENSITY_STATE_TO_PHYSICAL * density
+    temperature_phys = TEMPERATURE_STATE_TO_PHYSICAL * temperature
+    a1 = jax.vmap(
+        get_Thermodynamical_Forces_A1,
+        in_axes=(0, 0, 0, 0, 0, None),
+    )(species.charge, density, temperature, dndr, dtdr, Er_values)
+    a2 = jax.vmap(get_Thermodynamical_Forces_A2, in_axes=(0, 0))(
+        temperature, dtdr
+    )
+    a3 = get_Thermodynamical_Forces_A3(Er_values)
+    radius_indices = jnp.arange(Er_values.shape[0], dtype=jnp.int32)
+    interpolation_kernel = monoenergetic_interpolation_kernel(database)
+
+    def _one_species_radius(
+        species_index,
+        radius_index,
+        radius_value,
+        a1_value,
+        a2_value,
+        density_phys_value,
+        temperature_phys_value,
+        vthermal_value,
+        gamma_local,
+        q_local,
+        upar_local,
+    ):
+        vnew = energy_grid.v_norm * vthermal_value
+        nu_over_vnew = _nu_over_vnew_local(
+            species,
+            species_index,
+            vnew,
+            density[:, radius_index],
+            temperature[:, radius_index],
+            vthermal[:, radius_index],
+            collisionality_kind,
+        )
+        er_over_vnew = Er_values[radius_index] * 1.0e3 / (
+            energy_grid.v_norm * vthermal_value
+        )
+        dij = jax.vmap(
+            lambda nu_value, er_value: interpolation_kernel(
+                radius_value, nu_value, er_value, database
+            )
+        )(nu_over_vnew, er_over_vnew)
+        forces = jnp.asarray((a1_value, a2_value, a3[radius_index]))
+        lbar = jnp.zeros(
+            jnp.shape(gamma_local) + (3, 3), dtype=temperature.dtype
+        )
+        lbar = lbar.at[..., 0, :].add(
+            -density_phys_value * gamma_local[..., None] * forces
+        )
+        lbar = lbar.at[..., 1, :].add(
+            -temperature_phys_value
+            * density_phys_value
+            * q_local[..., None]
+            * forces
+        )
+        lbar = lbar.at[..., 2, :].add(
+            -density_phys_value * upar_local[..., None] * forces
+        )
+        _, dij_pullback = jax.vjp(
+            lambda dij_value: _assemble_lij_matrix(
+                species,
+                energy_grid,
+                species_index,
+                vthermal_value,
+                nu_over_vnew,
+                dij_value,
+            ),
+            dij,
+        )
+        dij_bar = (
+            jax.vmap(dij_pullback)(lbar)[0]
+            if batched_rhs
+            else dij_pullback(lbar)[0]
+        )
+        return nu_over_vnew, er_over_vnew, dij_bar
+
+    def _one_species(
+        species_index,
+        a1_species,
+        a2_species,
+        density_phys_species,
+        temperature_phys_species,
+        vthermal_species,
+        gamma_species,
+        q_species,
+        upar_species,
+    ):
+        bar_radius_axis = 1 if batched_rhs else 0
+        return jax.vmap(
+            lambda radius_index, radius_value, a1_value, a2_value, density_value, temperature_value, vthermal_value, gamma_local, q_local, upar_local: _one_species_radius(
+                species_index,
+                radius_index,
+                radius_value,
+                a1_value,
+                a2_value,
+                density_value,
+                temperature_value,
+                vthermal_value,
+                gamma_local,
+                q_local,
+                upar_local,
+            ),
+            in_axes=(0, 0, 0, 0, 0, 0, 0, bar_radius_axis, bar_radius_axis, bar_radius_axis),
+        )(
+            radius_indices,
+            radius_values,
+            a1_species,
+            a2_species,
+            density_phys_species,
+            temperature_phys_species,
+            vthermal_species,
+            gamma_species,
+            q_species,
+            upar_species,
+        )
+
+    species_bars = (
+        jnp.moveaxis(gamma_bar, 1, 0) if batched_rhs else gamma_bar,
+        jnp.moveaxis(q_bar, 1, 0) if batched_rhs else q_bar,
+        jnp.moveaxis(upar_bar, 1, 0) if batched_rhs else upar_bar,
+    )
+    nu_queries, er_queries, dij_bars = jax.vmap(
+        _one_species,
+        in_axes=(0, 0, 0, 0, 0, 0, 0, 0, 0),
+    )(
+        species.species_indices,
+        a1,
+        a2,
+        density_phys,
+        temperature_phys,
+        vthermal,
+        *species_bars,
+    )
+    species_count = species.species_indices.shape[0]
+    radius_count = radius_values.shape[0]
+    energy_count = energy_grid.v_norm.shape[0]
+    query_radius_values = jnp.reshape(
+        jnp.broadcast_to(radius_values, (species_count, radius_count)),
+        (species_count * radius_count,),
+    )
+    nu_queries = jnp.reshape(
+        nu_queries, (species_count * radius_count, energy_count)
+    )
+    er_queries = jnp.reshape(
+        er_queries, (species_count * radius_count, energy_count)
+    )
+    if batched_rhs:
+        dij_bars = jnp.reshape(
+            jnp.moveaxis(dij_bars, 2, 0),
+            (
+                gamma_bar.shape[0],
+                species_count * radius_count,
+                energy_count,
+                3,
+            ),
+        )
+    else:
+        dij_bars = jnp.reshape(
+            dij_bars,
+            (species_count * radius_count, energy_count, 3),
+        )
+    return pullback_legacy_monoenergetic_queries_sparse(
+        database,
+        query_radius_values,
+        nu_queries,
+        er_queries,
+        dij_bars,
+    )
+
+
+@jit
+def pullback_legacy_radial_database_flux_support_sparse(
+    species,
+    energy_grid,
+    geometry,
+    database,
+    Er,
+    temperature,
+    density,
+    gamma_bar,
+    q_bar,
+    upar_bar,
+    collisionality_kind=COLLISIONALITY_MODEL_DEFAULT,
+    density_right_constraint=None,
+    density_right_grad_constraint=None,
+    temperature_right_constraint=None,
+    temperature_right_grad_constraint=None,
+):
+    """Combined sparse table/coordinate transpose for centre fluxes."""
+
+    n_right = (
+        density[:, -1]
+        if density_right_constraint is None
+        else jnp.asarray(density_right_constraint, dtype=density.dtype)
+    )
+    n_right_grad = (
+        jnp.zeros_like(n_right)
+        if density_right_grad_constraint is None
+        else jnp.asarray(density_right_grad_constraint, dtype=density.dtype)
+    )
+    t_right = (
+        temperature[:, -1]
+        if temperature_right_constraint is None
+        else jnp.asarray(temperature_right_constraint, dtype=temperature.dtype)
+    )
+    t_right_grad = (
+        jnp.zeros_like(t_right)
+        if temperature_right_grad_constraint is None
+        else jnp.asarray(temperature_right_grad_constraint, dtype=temperature.dtype)
+    )
+    dndr = jax.vmap(
+        lambda density_a, n_rc, n_rg: get_gradient_density(
+            density_a,
+            geometry.r_grid,
+            geometry.r_grid_half,
+            geometry.dr,
+            right_face_constraint=n_rc,
+            right_face_grad_constraint=n_rg,
+        )
+    )(density, n_right, n_right_grad)
+    dtdr = jax.vmap(
+        lambda temperature_a, t_rc, t_rg: get_gradient_temperature(
+            temperature_a,
+            geometry.r_grid,
+            geometry.r_grid_half,
+            geometry.dr,
+            right_face_constraint=t_rc,
+            right_face_grad_constraint=t_rg,
+        )
+    )(temperature, t_right, t_right_grad)
+    return _pullback_legacy_radial_database_flux_support_sparse(
+        species,
+        energy_grid,
+        database,
+        geometry.r_grid,
+        Er,
+        temperature,
+        density,
+        dndr,
+        dtdr,
+        gamma_bar,
+        q_bar,
+        upar_bar,
+        collisionality_kind,
+    )
+
+
+@jit
+def pullback_legacy_radial_database_face_flux_support_sparse(
+    species,
+    energy_grid,
+    geometry,
+    database,
+    Er_faces,
+    temperature_faces,
+    density_faces,
+    dndr_faces,
+    dtdr_faces,
+    gamma_bar,
+    q_bar,
+    upar_bar,
+    collisionality_kind=COLLISIONALITY_MODEL_DEFAULT,
+):
+    """Combined sparse table/coordinate transpose for one face closure."""
+
+    return _pullback_legacy_radial_database_flux_support_sparse(
+        species,
+        energy_grid,
+        database,
+        geometry.r_grid_half,
+        Er_faces,
+        temperature_faces,
+        density_faces,
+        dndr_faces,
+        dtdr_faces,
+        gamma_bar,
+        q_bar,
+        upar_bar,
+        collisionality_kind,
+    )
 
 
 @jit

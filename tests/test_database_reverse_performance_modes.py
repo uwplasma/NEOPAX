@@ -264,8 +264,12 @@ class _SupportOwner:
         support,
         center_geometry_mode="scalar_jvp",
         support_preparation_mode="shared",
+        interpolation_transpose_mode="established",
     ):
-        self.calls.append(("split", center_geometry_mode, support_preparation_mode))
+        call = ("split", center_geometry_mode, support_preparation_mode)
+        if interpolation_transpose_mode != "established":
+            call += (interpolation_transpose_mode,)
+        self.calls.append(call)
         return self._result(t, state, species, rhs_bar, support)
 
     def pullback_direct_rhs_database_split_support_payload_batched(
@@ -278,10 +282,12 @@ class _SupportOwner:
         support,
         center_geometry_mode="scalar_jvp",
         support_preparation_mode="shared",
+        interpolation_transpose_mode="established",
     ):
-        self.calls.append(
-            ("batched_split", center_geometry_mode, support_preparation_mode)
-        )
+        call = ("batched_split", center_geometry_mode, support_preparation_mode)
+        if interpolation_transpose_mode != "established":
+            call += (interpolation_transpose_mode,)
+        self.calls.append(call)
         return jax.vmap(
             lambda one_bar: self._result(t, state, species, one_bar, support)
         )(rhs_bar)
@@ -406,6 +412,43 @@ def test_configure_legacy_modes_rebinds_and_forwards_both_support_hooks():
     assert owner.calls == [("generic", "radial_vjp"), ("split", "radial_vjp", "separate")]
 
 
+def test_configure_legacy_sparse_rebinds_only_database_split_transposes():
+    """The sparse selector is call-local and leaves generic/root hooks alone."""
+
+    physics = _physics_context()
+    species = object()
+    owner = _SupportOwner(species)
+    actual = _configure_database_reverse_performance(
+        physics,
+        vector_field=owner.__call__,
+        species=species,
+        interpolation_transpose_mode="legacy_sparse",
+    )
+    assert actual is not physics
+    assert (
+        actual.reverse_database_interpolation_transpose_mode
+        == "legacy_sparse"
+    )
+    assert (
+        actual.flat_rhs_direct_support_pullback
+        is physics.flat_rhs_direct_support_pullback
+    )
+
+    t = jnp.asarray(1.5)
+    state = jnp.asarray([2.0, 3.0])
+    rhs_bar = jnp.asarray([1.0, -0.5])
+    support = {
+        "geometry": jnp.asarray(2.0),
+        "database": jnp.asarray([3.0, -1.0]),
+    }
+    actual.flat_rhs_direct_database_split_support_pullback(
+        t, state, rhs_bar, support
+    )
+    assert owner.calls == [
+        ("split", "scalar_jvp", "shared", "legacy_sparse")
+    ]
+
+
 @pytest.mark.parametrize(
     "option",
     [
@@ -415,6 +458,7 @@ def test_configure_legacy_modes_rebinds_and_forwards_both_support_hooks():
         "stage_jacobian_mode",
         "support_objective_mode",
         "segment_support_mode",
+        "interpolation_transpose_mode",
     ],
 )
 def test_configure_rejects_unknown_modes(option):

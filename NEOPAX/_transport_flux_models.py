@@ -46,6 +46,8 @@ from ._neoclassical import (
     get_Neoclassical_Fluxes_Faces,
     get_Neoclassical_Fluxes_With_Momentum_Correction,
     get_Neoclassical_Upar_With_Momentum_Correction,
+    pullback_legacy_radial_database_face_flux_support_sparse,
+    pullback_legacy_radial_database_flux_support_sparse,
     pullback_preprocessed_radial_database_face_fluxes,
     pullback_preprocessed_radial_database_fluxes,
 )
@@ -1901,6 +1903,48 @@ class CombinedTransportFluxModel(TransportFluxModelBase):
         )
         return pullback_fn(state, response_bar.neoclassical_response, support)
 
+    def pullback_direct_rhs_support_payload_legacy_sparse(
+        self, state, flux_bar, support
+    ):
+        """Route opt-in sparse centre bars to the neoclassical DB owner."""
+
+        if self.center_flux_mode != "direct":
+            raise ValueError(
+                "legacy_sparse database support requires center_flux_mode='direct'."
+            )
+        pullback = getattr(
+            self.neoclassical_model,
+            "pullback_direct_rhs_support_payload_legacy_sparse",
+            None,
+        )
+        if not callable(pullback):
+            raise NotImplementedError(
+                "The active neoclassical model has no legacy_sparse centre "
+                "transpose."
+            )
+        zero = jnp.zeros_like(jnp.asarray(state.density))
+
+        def _bar(name):
+            value = flux_bar.get(name, None)
+            if value is None:
+                return zero
+            value = jnp.asarray(value)
+            return (
+                zero
+                if value.ndim == 0 or value.dtype == jax.dtypes.float0
+                else value
+            )
+
+        return pullback(
+            state,
+            {
+                "Gamma": _bar("Gamma") + _bar("Gamma_neo"),
+                "Q": _bar("Q") + _bar("Q_neo"),
+                "Upar": _bar("Upar") + _bar("Upar_neo"),
+            },
+            support,
+        )
+
     def build_local_particle_flux_evaluator(self, state):
         neo_eval = self.neoclassical_model.build_local_particle_flux_evaluator(state)
         turb_eval = self.turbulent_model.build_local_particle_flux_evaluator(state)
@@ -2011,6 +2055,46 @@ class CombinedTransportFluxModel(TransportFluxModelBase):
                 return zero
             value = jnp.asarray(value)
             return zero if value.ndim == 0 or value.dtype == jax.dtypes.float0 else value
+
+        return pullback(
+            state,
+            face_state,
+            {
+                "Gamma": _bar("Gamma") + _bar("Gamma_neo"),
+                "Q": _bar("Q") + _bar("Q_neo"),
+                "Upar": _bar("Upar") + _bar("Upar_neo"),
+            },
+            support,
+            **kwargs,
+        )
+
+    def pullback_direct_face_flux_support_payload_legacy_sparse(
+        self, state, face_state, flux_bar, support, **kwargs
+    ):
+        """Route opt-in sparse native-face bars to the DB owner."""
+
+        pullback = getattr(
+            self.neoclassical_model,
+            "pullback_direct_face_flux_support_payload_legacy_sparse",
+            None,
+        )
+        if not callable(pullback):
+            raise NotImplementedError(
+                "The active neoclassical model has no legacy_sparse face "
+                "transpose."
+            )
+        zero = jnp.zeros_like(jnp.asarray(face_state.density))
+
+        def _bar(name):
+            value = flux_bar.get(f"{name}_faces", flux_bar.get(name, None))
+            if value is None:
+                return zero
+            value = jnp.asarray(value)
+            return (
+                zero
+                if value.ndim == 0 or value.dtype == jax.dtypes.float0
+                else value
+            )
 
         return pullback(
             state,
@@ -3478,6 +3562,50 @@ class NTXDatabaseTransportModel(TransportFluxModelBase):
             )
 
     @staticmethod
+    def _legacy_sparse_support_bar(database, support, interpolation_bars):
+        """Embed the five exact sparse-interpolation bars in ``support``."""
+
+        a_b_bar, er_list_bar, d11_bar, d13_bar, d33_bar = interpolation_bars
+        batched_rhs = (
+            jnp.asarray(d11_bar).ndim
+            == jnp.asarray(database.D11_log).ndim + 1
+        )
+        database_bar = _float_delta_tree_like(database)
+        support_bar = dict(_float_delta_tree_like(support))
+        if batched_rhs:
+            rhs_count = jnp.asarray(d11_bar).shape[0]
+            database_bar = jax.tree_util.tree_map(
+                lambda value: jnp.broadcast_to(
+                    jnp.asarray(value)[None, ...],
+                    (rhs_count,) + jnp.asarray(value).shape,
+                ),
+                database_bar,
+            )
+            support_bar = dict(
+                jax.tree_util.tree_map(
+                    lambda value: jnp.broadcast_to(
+                        jnp.asarray(value)[None, ...],
+                        (rhs_count,) + jnp.asarray(value).shape,
+                    ),
+                    support_bar,
+                )
+            )
+        database_bar = dataclasses.replace(
+            database_bar,
+            a_b=a_b_bar,
+            Er_list=er_list_bar,
+            D11_log=d11_bar,
+            D13=d13_bar,
+            D33=d33_bar,
+        )
+        support_bar["database"] = (
+            database_bar
+            if batched_rhs
+            else _sanitize_float_delta_bar_tree(database, database_bar)
+        )
+        return support_bar
+
+    @staticmethod
     def _anchored_taylor_terms(function, anchor_state, delta_state, order):
         """Return first through third directional Taylor terms at one anchor.
 
@@ -3629,6 +3757,84 @@ class NTXDatabaseTransportModel(TransportFluxModelBase):
             else _sanitize_float_delta_bar_tree(database, database_bar)
         )
         return result
+
+    def pullback_direct_face_flux_support_payload_legacy_sparse(
+        self, state, face_state, flux_bar, support, **kwargs
+    ):
+        """Exact sparse legacy-database transpose of native face fluxes.
+
+        This opt-in sibling does not alter the established face hook.  It
+        combines coefficient and scan-coordinate bars before materializing
+        the final database cotangent, avoiding every per-face dense VJP.
+        """
+
+        if not isinstance(support, dict) or "database" not in support:
+            return None
+        database = support["database"]
+        if not isinstance(database, Monoenergetic):
+            raise TypeError(
+                "The legacy_sparse face transpose requires a Monoenergetic "
+                "runtime-scan database."
+            )
+        evaluated = kwargs.get("evaluated_state")
+        if evaluated is None:
+            evaluated = build_evaluated_transport_state(
+                state,
+                self.geometry,
+                bc_density=kwargs.get("bc_density", self.bc_density),
+                bc_temperature=kwargs.get("bc_temperature", self.bc_temperature),
+                density_floor=self.density_floor,
+            )
+        mode = str(
+            kwargs.get("particle_face_closure_mode", "reconstructed")
+        ).strip().lower()
+        if mode in {"ntss_like", "ntss", "half_point"}:
+            dndr_faces = _ntss_like_face_gradient(
+                evaluated.center.density,
+                self.geometry.r_grid_half,
+                bc_model=kwargs.get("bc_density", self.bc_density),
+            )
+            dtdr_faces = _ntss_like_face_gradient(
+                evaluated.center.temperature,
+                self.geometry.r_grid_half,
+                bc_model=kwargs.get("bc_temperature", self.bc_temperature),
+            )
+        else:
+            dndr_faces = evaluated.density_grad_face
+            dtdr_faces = evaluated.temperature_grad_face
+        zero = jnp.zeros_like(jnp.asarray(face_state.density))
+
+        def _bar(name):
+            value = flux_bar.get(name, None)
+            if value is None:
+                return zero
+            value = jnp.asarray(value)
+            return (
+                zero
+                if value.ndim == 0 or value.dtype == jax.dtypes.float0
+                else value
+            )
+
+        interpolation_bars = (
+            pullback_legacy_radial_database_face_flux_support_sparse(
+                self.species,
+                self.energy_grid,
+                self.geometry,
+                database,
+                face_state.Er,
+                face_state.temperature,
+                safe_density(face_state.density, self.density_floor),
+                dndr_faces,
+                dtdr_faces,
+                _bar("Gamma"),
+                _bar("Q"),
+                _bar("Upar"),
+                _collisionality_kind(self.collisionality_model),
+            )
+        )
+        return self._legacy_sparse_support_bar(
+            database, support, interpolation_bars
+        )
 
     def pullback_direct_face_flux_state(
         self, state, face_state, flux_bar, **kwargs
@@ -4477,6 +4683,67 @@ class NTXDatabaseTransportModel(TransportFluxModelBase):
         else:
             support_bar["database"] = _sanitize_float_delta_bar_tree(database, database_bar)
         return support_bar
+
+    def pullback_direct_rhs_support_payload_legacy_sparse(
+        self, state, flux_bar, support
+    ):
+        """Exact sparse legacy-database transpose of direct centre fluxes.
+
+        Unlike the established hook, this opt-in boundary never constructs
+        a dense table cotangent per interpolation query and never performs a
+        second coordinate VJP.  The initial-root hook is intentionally not
+        redirected here.
+        """
+
+        if not isinstance(support, dict) or "database" not in support:
+            return None
+        database = support["database"]
+        if not isinstance(database, Monoenergetic):
+            raise TypeError(
+                "The legacy_sparse centre transpose requires a Monoenergetic "
+                "runtime-scan database."
+            )
+        density = safe_density(state.density, self.density_floor)
+        supplied_bars = tuple(
+            jnp.asarray(value)
+            for value in flux_bar.values()
+            if value is not None
+            and jnp.asarray(value).ndim > 0
+            and jnp.asarray(value).dtype != jax.dtypes.float0
+        )
+        zero = (
+            jnp.zeros_like(supplied_bars[0])
+            if supplied_bars
+            else jnp.zeros_like(jnp.asarray(density))
+        )
+
+        def _bar(name):
+            value = flux_bar.get(name, None)
+            if value is None:
+                return zero
+            value = jnp.asarray(value)
+            return (
+                zero
+                if value.ndim == 0 or value.dtype == jax.dtypes.float0
+                else value
+            )
+
+        interpolation_bars = pullback_legacy_radial_database_flux_support_sparse(
+            self.species,
+            self.energy_grid,
+            self.geometry,
+            database,
+            state.Er,
+            state.temperature,
+            density,
+            _bar("Gamma"),
+            _bar("Q"),
+            _bar("Upar"),
+            _collisionality_kind(self.collisionality_model),
+        )
+        return self._legacy_sparse_support_bar(
+            database, support, interpolation_bars
+        )
 
     def pullback_direct_rhs_geometry_by_radius(
         self, state, flux_bar, geometry, *, center_geometry_mode=None
@@ -7417,6 +7684,18 @@ class NTXRuntimeScanTransportModel(TransportFluxModelBase):
             state, flux_bar, {"database": support["database"]}
         )
 
+    def pullback_direct_rhs_support_payload_legacy_sparse(
+        self, state, flux_bar, support
+    ):
+        """Delegate the opt-in sparse centre transpose to the built database."""
+
+        if not isinstance(support, dict) or "database" not in support:
+            return None
+        model = self.with_support_payload(support)
+        return model._database_model().pullback_direct_rhs_support_payload_legacy_sparse(
+            state, flux_bar, {"database": support["database"]}
+        )
+
     def pullback_direct_rhs_state(self, state, flux_bar):
         """Delegate the direct database state transpose without rebuilding."""
         return self._database_model().pullback_direct_rhs_state(state, flux_bar)
@@ -7430,6 +7709,25 @@ class NTXRuntimeScanTransportModel(TransportFluxModelBase):
         model = self.with_support_payload(support)
         return model._database_model().pullback_direct_face_flux_support_payload(
             state, face_state, flux_bar, {"database": support["database"]}, **kwargs
+        )
+
+    def pullback_direct_face_flux_support_payload_legacy_sparse(
+        self, state, face_state, flux_bar, support, **kwargs
+    ):
+        """Delegate the opt-in sparse face transpose to the built database."""
+
+        if not isinstance(support, dict) or "database" not in support:
+            return None
+        model = self.with_support_payload(support)
+        return (
+            model._database_model()
+            .pullback_direct_face_flux_support_payload_legacy_sparse(
+                state,
+                face_state,
+                flux_bar,
+                {"database": support["database"]},
+                **kwargs,
+            )
         )
 
     def pullback_direct_face_flux_state(self, state, face_state, flux_bar, **kwargs):

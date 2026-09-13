@@ -65,11 +65,22 @@ from NEOPAX._neoclassical import (
     _collisionality_kind,
     get_Neoclassical_Fluxes,
     get_Neoclassical_Fluxes_Faces,
+    pullback_legacy_radial_database_face_flux_support_sparse,
+    pullback_legacy_radial_database_flux_support_sparse,
     pullback_preprocessed_radial_database_face_fluxes,
     pullback_preprocessed_radial_database_fluxes,
 )
 from NEOPAX._monoenergetic_interpolators import monoenergetic_interpolation_kernel
-from NEOPAX._interpolators import get_Dij, monoenergetic_interpolation_table_bar
+from NEOPAX._interpolators import (
+    evaluate_monoenergetic_interpolation_stencil,
+    get_Dij,
+    materialize_monoenergetic_sparse_coordinate_bar,
+    materialize_monoenergetic_sparse_table_bar,
+    monoenergetic_interpolation_sparse_coordinate_bar,
+    monoenergetic_interpolation_sparse_table_bar,
+    monoenergetic_interpolation_stencil,
+    monoenergetic_interpolation_table_bar,
+)
 from NEOPAX._source_models import get_source_model
 from NEOPAX._species import Species
 from NEOPAX._state import TransportState, get_v_thermal
@@ -3946,6 +3957,168 @@ def test_legacy_monoenergetic_table_transpose_matches_generic_vjp(radius):
     )
 
 
+@pytest.mark.parametrize(
+    (
+        "radius",
+        "expected_radial_indices",
+        "expected_active_count",
+        "grid_nu_value",
+        "grid_er_value",
+    ),
+    (
+        (0.0, (0, 1, 2, 2), 3, 2.4e-2, 0.0),
+        (0.12, (0, 1, 2, 2), 3, 2.4e-2, 2.0e-4),
+        (0.52, (1, 2, 3, 4), 4, 2.4e-2, 2.0e-4),
+        (0.88, (2, 3, 4, 4), 3, 2.4e-2, 2.0e-4),
+        (0.52, (1, 2, 3, 4), 4, 1.0e-5, 1.0e-8),
+        (0.52, (1, 2, 3, 4), 4, 1.0e1, 1.0),
+    ),
+)
+def test_legacy_monoenergetic_sparse_stencil_matches_current_contract(
+    radius,
+    expected_radial_indices,
+    expected_active_count,
+    grid_nu_value,
+    grid_er_value,
+):
+    """The compact query record preserves all three legacy radial branches."""
+
+    rho = jnp.asarray([0.1, 0.3, 0.5, 0.7, 0.9])
+    nu_log = jnp.asarray([-3.0, -2.0, -1.0, 0.0])
+    er_row = jnp.asarray([-5.0, -4.0, -3.0, -2.0])
+    er_list = jnp.broadcast_to(er_row, (rho.size, er_row.size))
+    shape = (rho.size, nu_log.size, er_row.size)
+    base = jnp.reshape(
+        jnp.arange(int(jnp.prod(jnp.asarray(shape))), dtype=jnp.float64), shape
+    )
+    database = Monoenergetic(
+        a_b=1.0,
+        rho=rho,
+        nu_log=nu_log,
+        Er_list=er_list,
+        D11_log=-3.0 + 0.001 * base,
+        D13=0.2 + 0.002 * base,
+        D33=0.4 + 0.003 * base,
+    )
+    grid_x = jnp.asarray(radius)
+    grid_nu = jnp.asarray(grid_nu_value)
+    grid_er = jnp.asarray(grid_er_value)
+    local_bar = jnp.asarray(-0.37)
+
+    stencil = monoenergetic_interpolation_stencil(
+        grid_x, grid_nu, grid_er, database
+    )
+    assert tuple(map(int, stencil.radial_indices)) == expected_radial_indices
+    assert int(jnp.sum(stencil.radial_active)) == expected_active_count
+    assert jnp.all(jnp.isfinite(stencil.radial_weights))
+    assert jnp.all(jnp.isfinite(stencil.er_fractions))
+
+    expected_value = get_Dij(grid_x, grid_nu, grid_er, database)
+    actual_value = evaluate_monoenergetic_interpolation_stencil(stencil, database)
+    assert jnp.allclose(actual_value, expected_value, rtol=2.0e-11, atol=2.0e-12)
+
+    expected_table_bar = monoenergetic_interpolation_table_bar(
+        grid_x, grid_nu, grid_er, local_bar, database.D13, database
+    )
+    sparse_table_bar = monoenergetic_interpolation_sparse_table_bar(
+        stencil, local_bar, database.D13, database
+    )
+    assert sparse_table_bar.values.shape == (4, 4, 4)
+    assert jnp.all(jnp.isfinite(sparse_table_bar.values))
+    actual_table_bar = materialize_monoenergetic_sparse_table_bar(
+        sparse_table_bar, database.D13
+    )
+    assert jnp.allclose(
+        actual_table_bar, expected_table_bar, rtol=2.0e-11, atol=2.0e-12
+    ), (
+        float(jnp.max(jnp.abs(actual_table_bar - expected_table_bar))),
+        float(jnp.max(jnp.abs(expected_table_bar))),
+    )
+    if radius == 0.0:
+        coordinate_bar = monoenergetic_interpolation_sparse_coordinate_bar(
+            stencil, jnp.asarray((-0.17, 0.23, -0.31)), database
+        )
+        assert jnp.isfinite(coordinate_bar.a_b)
+        assert jnp.all(jnp.isfinite(coordinate_bar.er_values))
+
+
+@pytest.mark.parametrize(
+    ("radius", "grid_nu_value", "grid_er_value"),
+    (
+        (0.12, 2.4e-2, 2.0e-4),
+        (0.52, 2.4e-2, 2.0e-4),
+        (0.88, 2.4e-2, 2.0e-4),
+        (0.52, 1.0e-5, 1.0e-8),
+        (0.52, 1.0e1, 1.0),
+    ),
+)
+def test_legacy_monoenergetic_sparse_coordinate_transpose_matches_generic_vjp(
+    radius, grid_nu_value, grid_er_value
+):
+    """Sparse ``a_b``/``Er_list`` bars equal the current piecewise VJP."""
+
+    rho = jnp.asarray([0.1, 0.3, 0.5, 0.7, 0.9])
+    nu_log = jnp.asarray([-3.0, -2.0, -1.0, 0.0])
+    er_row = jnp.asarray([-5.0, -4.0, -3.0, -2.0])
+    er_list = jnp.broadcast_to(er_row, (rho.size, er_row.size))
+    shape = (rho.size, nu_log.size, er_row.size)
+    base = jnp.reshape(
+        jnp.arange(int(jnp.prod(jnp.asarray(shape))), dtype=jnp.float64), shape
+    )
+    database = Monoenergetic(
+        a_b=1.0,
+        rho=rho,
+        nu_log=nu_log,
+        Er_list=er_list,
+        D11_log=-3.0 + 0.001 * base,
+        D13=0.2 + 0.002 * base,
+        D33=0.4 + 0.003 * base,
+    )
+    grid_x = jnp.asarray(radius)
+    grid_nu = jnp.asarray(grid_nu_value)
+    grid_er = jnp.asarray(grid_er_value)
+    local_bar = jnp.asarray((-0.17, 0.23, -0.31))
+
+    def _query_from_coordinates(a_b, er_list_value):
+        varied_database = dataclasses.replace(
+            database_with_geometry_scale(database, a_b),
+            Er_list=er_list_value,
+        )
+        return get_Dij(grid_x, grid_nu, grid_er, varied_database)
+
+    _, generic_pullback = jax.vjp(
+        _query_from_coordinates, database.a_b, database.Er_list
+    )
+    expected_a_b_bar, expected_er_list_bar = generic_pullback(local_bar)
+
+    stencil = monoenergetic_interpolation_stencil(
+        grid_x, grid_nu, grid_er, database
+    )
+    sparse_bar = monoenergetic_interpolation_sparse_coordinate_bar(
+        stencil, local_bar, database
+    )
+    actual_a_b_bar, actual_er_list_bar = (
+        materialize_monoenergetic_sparse_coordinate_bar(sparse_bar, database)
+    )
+    assert jnp.isfinite(actual_a_b_bar)
+    assert jnp.all(jnp.isfinite(sparse_bar.er_values))
+    assert jnp.allclose(
+        actual_a_b_bar,
+        expected_a_b_bar,
+        rtol=5.0e-10,
+        atol=5.0e-11,
+    )
+    assert jnp.allclose(
+        actual_er_list_bar,
+        expected_er_list_bar,
+        rtol=5.0e-10,
+        atol=5.0e-11,
+    ), (
+        float(jnp.max(jnp.abs(actual_er_list_bar - expected_er_list_bar))),
+        float(jnp.max(jnp.abs(expected_er_list_bar))),
+    )
+
+
 def test_radial_database_flux_table_transpose_matches_generic_vjp():
     """The compact black-box centre rule is the established database VJP."""
 
@@ -4245,22 +4418,319 @@ def test_legacy_monoenergetic_flux_table_transpose_matches_generic_vjp():
     gamma_bar = jnp.asarray([[0.2, -0.1, 0.3, -0.4], [-0.3, 0.5, -0.2, 0.1]])
     q_bar, upar_bar = -0.7 * gamma_bar, 0.4 * gamma_bar
 
-    def _fluxes(d11_log, d13, d33):
+    def _fluxes(a_b, er_list_value, d11_log, d13, d33):
+        varied_database = dataclasses.replace(
+            database_with_geometry_scale(database, a_b),
+            Er_list=er_list_value,
+            D11_log=d11_log,
+            D13=d13,
+            D33=d33,
+        )
         _, gamma, q, upar = get_Neoclassical_Fluxes(
-            species, energy_grid, geometry,
-            dataclasses.replace(database, D11_log=d11_log, D13=d13, D33=d33),
-            er_center, temperature, density,
+            species,
+            energy_grid,
+            geometry,
+            varied_database,
+            er_center,
+            temperature,
+            density,
         )
         return gamma, q, upar
 
-    _, generic_pullback = jax.vjp(_fluxes, database.D11_log, database.D13, database.D33)
-    expected = generic_pullback((gamma_bar, q_bar, upar_bar))
+    _, generic_pullback = jax.vjp(
+        _fluxes,
+        database.a_b,
+        database.Er_list,
+        database.D11_log,
+        database.D13,
+        database.D33,
+    )
+    expected_support = generic_pullback((gamma_bar, q_bar, upar_bar))
     actual = pullback_preprocessed_radial_database_fluxes(
         species, energy_grid, geometry, database, er_center, temperature, density,
         gamma_bar, q_bar, upar_bar,
     )
-    for actual_table_bar, expected_table_bar in zip(actual, expected, strict=True):
-        assert jnp.allclose(actual_table_bar, expected_table_bar, rtol=3.0e-10, atol=3.0e-10), (
+    for actual_table_bar, expected_table_bar in zip(
+        actual, expected_support[2:], strict=True
+    ):
+        assert jnp.allclose(
+            actual_table_bar,
+            expected_table_bar,
+            rtol=3.0e-10,
+            atol=3.0e-10,
+        ), (
             float(jnp.max(jnp.abs(actual_table_bar - expected_table_bar))),
             float(jnp.max(jnp.abs(expected_table_bar))),
         )
+
+    actual_support = pullback_legacy_radial_database_flux_support_sparse(
+        species,
+        energy_grid,
+        geometry,
+        database,
+        er_center,
+        temperature,
+        density,
+        gamma_bar,
+        q_bar,
+        upar_bar,
+    )
+    for actual_bar, expected_bar in zip(
+        actual_support, expected_support, strict=True
+    ):
+        assert jnp.allclose(
+            actual_bar, expected_bar, rtol=3.0e-10, atol=3.0e-10
+        ), (
+            float(jnp.max(jnp.abs(actual_bar - expected_bar))),
+            float(jnp.max(jnp.abs(expected_bar))),
+        )
+
+    # The new model hook is a separate opt-in callable.  The established
+    # direct and selected-root hooks remain untouched.
+    model = NTXDatabaseTransportModel(
+        species=species,
+        energy_grid=energy_grid,
+        geometry=geometry,
+        database=database,
+    )
+    state = TransportState(
+        density=density,
+        pressure=density * temperature,
+        Er=er_center,
+    )
+    model_database_bar = (
+        model.pullback_direct_rhs_support_payload_legacy_sparse(
+            state,
+            {"Gamma": gamma_bar, "Q": q_bar, "Upar": upar_bar},
+            {"database": database},
+        )["database"]
+    )
+    for field_name, expected_bar in zip(
+        ("a_b", "Er_list", "D11_log", "D13", "D33"),
+        expected_support,
+        strict=True,
+    ):
+        actual_bar = getattr(model_database_bar, field_name)
+        assert jnp.allclose(
+            actual_bar, expected_bar, rtol=3.0e-10, atol=3.0e-10
+        ), field_name
+
+    # All objective rows share one interpolation transpose.  A batched call
+    # must remain identical to independently accumulated scalar rows.
+    rows = (
+        (gamma_bar, q_bar, upar_bar),
+        (-0.3 * gamma_bar, 0.2 * q_bar, -0.5 * upar_bar),
+    )
+    batched = pullback_legacy_radial_database_flux_support_sparse(
+        species,
+        energy_grid,
+        geometry,
+        database,
+        er_center,
+        temperature,
+        density,
+        *(jnp.stack(tuple(row[channel] for row in rows)) for channel in range(3)),
+    )
+    scalar_rows = tuple(
+        pullback_legacy_radial_database_flux_support_sparse(
+            species,
+            energy_grid,
+            geometry,
+            database,
+            er_center,
+            temperature,
+            density,
+            *row,
+        )
+        for row in rows
+    )
+    for field_index, actual_bar in enumerate(batched):
+        assert jnp.allclose(
+            actual_bar,
+            jnp.stack(tuple(row[field_index] for row in scalar_rows)),
+            rtol=3.0e-10,
+            atol=3.0e-10,
+        )
+
+
+def test_legacy_monoenergetic_face_flux_support_sparse_matches_generic_vjp():
+    """Native-face sparse support bars preserve the forward face closure."""
+
+    rho = jnp.asarray([0.1, 0.3, 0.5, 0.7, 0.9])
+    nu_log = jnp.asarray([-5.0, -3.0, -1.0, 1.0])
+    er_list = jnp.broadcast_to(
+        jnp.asarray([-8.0, -5.0, -2.0, 1.0]), (rho.size, 4)
+    )
+    base = jnp.reshape(jnp.arange(80, dtype=jnp.float64), (5, 4, 4))
+    database = Monoenergetic(
+        a_b=1.0,
+        rho=rho,
+        nu_log=nu_log,
+        Er_list=er_list,
+        D11_log=-3.0 + 0.001 * base,
+        D13=0.2 + 0.001 * base,
+        D33=0.3 + 0.002 * base,
+    )
+    geometry = collections.namedtuple(
+        "LegacyMonoFaceTransposeGeometry",
+        "r_grid r_grid_half dr full_grid_indices",
+    )(
+        jnp.asarray([0.2, 0.4, 0.6, 0.8]),
+        rho,
+        jnp.asarray(0.2),
+        jnp.arange(4, dtype=jnp.int32),
+    )
+    species = Species(
+        number_species=2,
+        species_indices=jnp.asarray([0, 1]),
+        mass_mp=jnp.asarray([5.446e-4, 2.0]),
+        charge_qp=jnp.asarray([-1.0, 1.0]),
+        names=("e", "D"),
+    )
+    energy_grid = collections.namedtuple(
+        "LegacyMonoFaceTransposeEnergyGrid",
+        "xWeights L11_weight L12_weight L22_weight L13_weight L23_weight L33_weight v_norm",
+    )(
+        jnp.asarray([0.25, 0.75]),
+        jnp.asarray([1.0, 0.7]),
+        jnp.asarray([0.1, -0.2]),
+        jnp.asarray([0.8, 1.2]),
+        jnp.asarray([0.4, 0.5]),
+        jnp.asarray([-0.3, 0.2]),
+        jnp.asarray([1.1, 0.6]),
+        jnp.asarray([1.2, 1.8]),
+    )
+    density_faces = jnp.asarray(
+        [
+            [1.0, 1.03, 1.07, 1.12, 1.18],
+            [0.9, 0.93, 0.97, 1.02, 1.08],
+        ]
+    )
+    temperature_faces = jnp.asarray(
+        [
+            [2.0, 2.04, 2.09, 2.15, 2.22],
+            [1.6, 1.64, 1.69, 1.75, 1.82],
+        ]
+    )
+    dndr_faces = jnp.asarray(
+        [
+            [0.10, 0.11, 0.12, 0.13, 0.14],
+            [0.07, 0.08, 0.09, 0.10, 0.11],
+        ]
+    )
+    dtdr_faces = jnp.asarray(
+        [
+            [0.15, 0.16, 0.17, 0.18, 0.19],
+            [0.11, 0.12, 0.13, 0.14, 0.15],
+        ]
+    )
+    er_faces = jnp.asarray(
+        [1.0e-4, -1.1e-4, 1.2e-4, -1.3e-4, 1.4e-4]
+    )
+    gamma_bar = jnp.asarray(
+        [
+            [0.2, -0.1, 0.3, -0.4, 0.1],
+            [-0.3, 0.5, -0.2, 0.1, -0.4],
+        ]
+    )
+    q_bar = -0.7 * gamma_bar
+    upar_bar = 0.4 * gamma_bar
+
+    def _fluxes(a_b, er_list_value, d11_log, d13, d33):
+        varied_database = dataclasses.replace(
+            database_with_geometry_scale(database, a_b),
+            Er_list=er_list_value,
+            D11_log=d11_log,
+            D13=d13,
+            D33=d33,
+        )
+        _, gamma, q, upar = get_Neoclassical_Fluxes_Faces(
+            species,
+            energy_grid,
+            geometry,
+            varied_database,
+            er_faces,
+            temperature_faces,
+            density_faces,
+            dndr_faces,
+            dtdr_faces,
+        )
+        return gamma, q, upar
+
+    _, generic_pullback = jax.vjp(
+        _fluxes,
+        database.a_b,
+        database.Er_list,
+        database.D11_log,
+        database.D13,
+        database.D33,
+    )
+    expected = generic_pullback((gamma_bar, q_bar, upar_bar))
+    actual = pullback_legacy_radial_database_face_flux_support_sparse(
+        species,
+        energy_grid,
+        geometry,
+        database,
+        er_faces,
+        temperature_faces,
+        density_faces,
+        dndr_faces,
+        dtdr_faces,
+        gamma_bar,
+        q_bar,
+        upar_bar,
+    )
+    for actual_bar, expected_bar in zip(actual, expected, strict=True):
+        assert jnp.allclose(
+            actual_bar, expected_bar, rtol=3.0e-10, atol=3.0e-10
+        ), (
+            float(jnp.max(jnp.abs(actual_bar - expected_bar))),
+            float(jnp.max(jnp.abs(expected_bar))),
+        )
+
+    density_center = 0.5 * (density_faces[:, :-1] + density_faces[:, 1:])
+    temperature_center = 0.5 * (
+        temperature_faces[:, :-1] + temperature_faces[:, 1:]
+    )
+    state = TransportState(
+        density=density_center,
+        pressure=density_center * temperature_center,
+        Er=0.5 * (er_faces[:-1] + er_faces[1:]),
+    )
+    face_state = types.SimpleNamespace(
+        density=density_faces,
+        temperature=temperature_faces,
+        Er=er_faces,
+    )
+    evaluated_state = types.SimpleNamespace(
+        center=types.SimpleNamespace(
+            density=density_center,
+            temperature=temperature_center,
+        ),
+        density_grad_face=dndr_faces,
+        temperature_grad_face=dtdr_faces,
+    )
+    model = NTXDatabaseTransportModel(
+        species=species,
+        energy_grid=energy_grid,
+        geometry=geometry,
+        database=database,
+    )
+    model_database_bar = (
+        model.pullback_direct_face_flux_support_payload_legacy_sparse(
+            state,
+            face_state,
+            {"Gamma": gamma_bar, "Q": q_bar, "Upar": upar_bar},
+            {"database": database},
+            evaluated_state=evaluated_state,
+        )["database"]
+    )
+    for field_name, expected_bar in zip(
+        ("a_b", "Er_list", "D11_log", "D13", "D33"),
+        expected,
+        strict=True,
+    ):
+        actual_bar = getattr(model_database_bar, field_name)
+        assert jnp.allclose(
+            actual_bar, expected_bar, rtol=3.0e-10, atol=3.0e-10
+        ), field_name

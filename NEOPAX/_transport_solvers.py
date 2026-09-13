@@ -4961,6 +4961,10 @@ class _RadauAcceptedStepPhysicsContext:
     reverse_database_stage_jacobian_mode: str = "independent"
     reverse_database_support_objective_mode: str = "scalar"
     reverse_database_segment_support_mode: str = "inline"
+    # Opt-in exact sparse transpose for the legacy Monoenergetic database.
+    # The established hook remains the default, and initial-root code never
+    # reads this full-transport Radau selector.
+    reverse_database_interpolation_transpose_mode: str = "established"
     reverse_initial_cache_support_pullback_mode: str = "scalar"
     reverse_rebuild_support_pullback_mode: str = "separate"
     reverse_segment_jit_diagnostics: bool = False
