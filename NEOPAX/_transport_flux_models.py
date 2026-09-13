@@ -46,6 +46,7 @@ from ._neoclassical import (
     get_Neoclassical_Fluxes_Faces,
     get_Neoclassical_Fluxes_With_Momentum_Correction,
     get_Neoclassical_Upar_With_Momentum_Correction,
+    pullback_legacy_monoenergetic_queries_sparse,
     pullback_legacy_radial_database_face_flux_support_sparse,
     pullback_legacy_radial_database_flux_support_sparse,
     pullback_preprocessed_radial_database_face_fluxes,

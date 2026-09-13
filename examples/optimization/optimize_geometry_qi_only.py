@@ -493,8 +493,10 @@ def write_outputs(optimized_input, initial_input):
     print(f"wrote {seed_copy}")
     print(f"wrote {optimized_input_path}")
     if MAKE_TRANSPORT_PROFILE_PLOTS:
-        save_transport_profiles_for_input(initial_input, OUT_DIR / "initial", "initial")
-        save_transport_profiles_for_input(optimized_input, OUT_DIR / "optimized", "optimized")
+        save_transport_profiles_for_input(seed_copy, OUT_DIR / "initial", "initial")
+        save_transport_profiles_for_input(
+            optimized_input_path, OUT_DIR / "optimized", "optimized"
+        )
     if MAKE_INITIAL_PLOTS:
         write_geometry_artifacts(initial_input, "initial")
     write_geometry_artifacts(optimized_input, "optimized")
