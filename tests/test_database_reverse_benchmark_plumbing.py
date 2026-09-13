@@ -134,6 +134,7 @@ def test_validated_full_transport_reverse_modes_are_cli_defaults():
     assert vars(args) == {
         "reverse_bootstrap_cotangent_mode": "joint_local_vjp_upar_only",
         "reverse_database_center_geometry_mode": "scalar_jvp",
+        "reverse_database_initial_state_mode": "generic",
         "reverse_database_initial_support_mode": "split",
         "reverse_database_interpolation_transpose_mode": "legacy_sparse",
         "reverse_database_segment_support_mode": "inline",
@@ -202,7 +203,7 @@ def _check_performance_args(args, is_database=True):
     # Real override detection, lane guard, config RHS resolution, shared-stage
     # guard, batched-support guard, deferred-segment-support guard, and sparse
     # interpolation guard.
-    nodes = main.body[index:index + 7]
+    nodes = main.body[index:index + 8]
     assert all(isinstance(node, ast.If) for node in nodes[1:])
     exec(compile(ast.Module(body=nodes, type_ignores=[]), "<mode-checks>", "exec"), {
         "args": args, "is_database_geometry_reverse": is_database,
@@ -216,6 +217,7 @@ def test_database_performance_cli_defaults_preserve_root_and_lij_lanes():
     assert args.reverse_database_support_objective_mode == "scalar"
     assert args.reverse_database_segment_support_mode == "inline"
     assert args.reverse_database_initial_support_mode == "split"
+    assert args.reverse_database_initial_state_mode == "generic"
     assert args.reverse_database_support_preparation_mode == "shared"
     assert args.reverse_database_center_geometry_mode == "scalar_jvp"
     assert args.reverse_database_interpolation_transpose_mode == "legacy_sparse"
@@ -330,6 +332,28 @@ def test_legacy_performance_cli_is_database_full_transport_only():
         _check_performance_args(args, is_database=False)
 
 
+def test_reduced_zero_rhs_cli_requires_the_reduced_database_contract():
+    args = _performance_args(
+        reverse_database_initial_support_mode="reduced_zero",
+        reverse_database_initial_state_mode="reduced_zero_rhs",
+    )
+    _check_performance_args(args)
+    with pytest.raises(SystemExit, match="reduced_zero_rhs"):
+        _check_performance_args(
+            _performance_args(
+                reverse_database_initial_state_mode="reduced_zero_rhs",
+            )
+        )
+    with pytest.raises(SystemExit, match="reduced_zero_rhs"):
+        _check_performance_args(
+            _performance_args(
+                reverse_database_initial_support_mode="reduced_zero",
+                reverse_database_initial_state_mode="reduced_zero_rhs",
+                reverse_step_bwd_mode="current",
+            )
+        )
+
+
 @pytest.mark.parametrize("override", [False, True])
 def test_benchmark_callback_preserves_configured_execution_and_primal_contexts(override):
     @dataclasses.dataclass(frozen=True)
@@ -342,8 +366,8 @@ def test_benchmark_callback_preserves_configured_execution_and_primal_contexts(o
     solver = SimpleNamespace(max_steps=8)
     species, vector_field = object(), object()
     seen = []
-    modes = ("generic", "separate", "radial_vjp", "shared_multi_rhs", "batched_split", "deferred_segment_batch", "legacy_sparse") if override else (
-        "split", "shared", "scalar_jvp", "independent", "scalar", "inline", "established"
+    modes = ("reduced_zero", "reduced_zero_rhs", "separate", "radial_vjp", "shared_multi_rhs", "batched_split", "deferred_segment_batch", "legacy_sparse") if override else (
+        "split", "generic", "shared", "scalar_jvp", "independent", "scalar", "inline", "established"
     )
 
     def _configure(physics, **kwargs):
@@ -366,6 +390,7 @@ def test_benchmark_callback_preserves_configured_execution_and_primal_contexts(o
     })
     options = dict(zip((
         "reverse_database_initial_support_mode",
+        "reverse_database_initial_state_mode",
         "reverse_database_support_preparation_mode",
         "reverse_database_center_geometry_mode",
         "reverse_database_stage_jacobian_mode",
@@ -378,7 +403,7 @@ def test_benchmark_callback_preserves_configured_execution_and_primal_contexts(o
         baseline_state=None, profile_cfg={}, **options,
     )
     assert seen == [dict(zip((
-        "initial_support_mode", "support_preparation_mode", "center_geometry_mode",
+        "initial_support_mode", "initial_state_mode", "support_preparation_mode", "center_geometry_mode",
         "stage_jacobian_mode", "support_objective_mode", "segment_support_mode",
         "interpolation_transpose_mode",
     ), modes, strict=True))]

@@ -4955,6 +4955,7 @@ class _RadauAcceptedStepPhysicsContext:
     # Explicit database performance selectors. Defaults preserve the measured
     # September-12 path; no root-only or Lij hook is rebound by these fields.
     reverse_database_initial_support_mode: str = "split"
+    reverse_database_initial_state_mode: str = "generic"
     reverse_database_support_preparation_mode: str = "shared"
     reverse_database_center_geometry_mode: str = "scalar_jvp"
     # Opt-in, call-local reuse of exact stage Jacobians; never a carry/tape field.

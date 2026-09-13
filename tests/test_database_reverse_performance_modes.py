@@ -387,6 +387,7 @@ def test_configure_legacy_modes_rebinds_and_forwards_both_support_hooks():
     )
     assert actual is not physics
     assert actual.reverse_database_initial_support_mode == "generic"
+    assert actual.reverse_database_initial_state_mode == "generic"
     assert actual.reverse_database_support_preparation_mode == "separate"
     assert actual.reverse_database_center_geometry_mode == "radial_vjp"
     for name in (
@@ -453,6 +454,7 @@ def test_configure_legacy_sparse_rebinds_only_database_split_transposes():
     "option",
     [
         "initial_support_mode",
+        "initial_state_mode",
         "support_preparation_mode",
         "center_geometry_mode",
         "stage_jacobian_mode",
@@ -482,6 +484,25 @@ def test_configure_nondefault_modes_require_database_support_capability():
             species=object(),
             initial_support_mode="generic",
         )
+
+
+def test_reduced_zero_rhs_configuration_requires_reduced_zero_support():
+    with pytest.raises(ValueError, match="initial_support_mode='reduced_zero'"):
+        _configure_database_reverse_performance(
+            _physics_context(),
+            vector_field=_unexpected_hook,
+            species=object(),
+            initial_state_mode="reduced_zero_rhs",
+        )
+    actual = _configure_database_reverse_performance(
+        _physics_context(),
+        vector_field=_unexpected_hook,
+        species=object(),
+        initial_support_mode="reduced_zero",
+        initial_state_mode="reduced_zero_rhs",
+    )
+    assert actual.reverse_database_initial_support_mode == "reduced_zero"
+    assert actual.reverse_database_initial_state_mode == "reduced_zero_rhs"
 
 
 def test_configure_batched_support_requires_matrix_rhs_hook():
@@ -578,6 +599,17 @@ def test_reduced_zero_preserves_real_initial_carry_root_and_profile_pullbacks():
         )
 
     carry, initial_state_pullback = jax.vjp(_initial_carry, state)
+    reduced_carry, reduced_state_pullback = (
+        reverse_transport.reverse_initial_carry_from_state_with_static_setup(
+            solver=solver,
+            state=state,
+            solve_vector_field=owner.__call__,
+            species=None,
+            prepared_rollout_static=prepared,
+            return_reduced_zero_rhs_pullback=True,
+        )
+    )
+    _assert_same_finite_tree(reduced_carry, carry)
     y_seeds = jnp.stack(
         (jnp.arange(1, carry.y.size + 1, dtype=carry.y.dtype),
          -jnp.arange(2, carry.y.size + 2, dtype=carry.y.dtype))
@@ -665,7 +697,10 @@ def test_reduced_zero_preserves_real_initial_carry_root_and_profile_pullbacks():
             mode=mode,
             reduced_prev_stages_are_zero=True,
         )
-        state_bars = jax.vmap(lambda bar: initial_state_pullback(bar)[0])(carry_bars)
+        state_pullback = (
+            reduced_state_pullback if mode == "reduced_zero" else initial_state_pullback
+        )
+        state_bars = jax.vmap(lambda bar: state_pullback(bar)[0])(carry_bars)
         profile_bars, root_support_bars, remaining_support_bars = jax.vmap(
             _one_root_and_profile
         )(state_bars)

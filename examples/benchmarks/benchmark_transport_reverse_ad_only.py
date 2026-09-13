@@ -2270,6 +2270,7 @@ def _prepare_reverse_static_setup(
     reverse_initial_cache_support_pullback_mode: str = "scalar",
     reverse_rebuild_support_pullback_mode: str = "separate",
     reverse_database_initial_support_mode: str = "split",
+    reverse_database_initial_state_mode: str = "generic",
     reverse_database_support_preparation_mode: str = "shared",
     reverse_database_center_geometry_mode: str = "scalar_jvp",
     reverse_database_stage_jacobian_mode: str = "independent",
@@ -2319,6 +2320,7 @@ def _prepare_reverse_static_setup(
         execution_context.physics_context,
         vector_field=solve_vector_field_static, species=runtime.species,
         initial_support_mode=reverse_database_initial_support_mode,
+        initial_state_mode=reverse_database_initial_state_mode,
         support_preparation_mode=reverse_database_support_preparation_mode,
         center_geometry_mode=reverse_database_center_geometry_mode,
         stage_jacobian_mode=reverse_database_stage_jacobian_mode,
@@ -4080,6 +4082,7 @@ def _run_realtime_geometry_optimization_api_smoke(
             f"initial_cache_support_pullback_mode={args.reverse_initial_cache_support_pullback_mode} "
             f"rebuild_support_pullback_mode={args.reverse_rebuild_support_pullback_mode} "
             f"database_initial_support_mode={args.reverse_database_initial_support_mode} "
+            f"database_initial_state_mode={args.reverse_database_initial_state_mode} "
             f"database_support_preparation_mode={args.reverse_database_support_preparation_mode} "
             f"database_center_geometry_mode={args.reverse_database_center_geometry_mode} "
             f"database_stage_jacobian_mode={args.reverse_database_stage_jacobian_mode} "
@@ -4140,6 +4143,9 @@ def _run_realtime_geometry_optimization_api_smoke(
             reverse_rhs_transpose_mode=str(args.reverse_rhs_transpose_mode),
             reverse_rhs_pullback_mode=str(args.reverse_rhs_pullback_mode),
             reverse_database_initial_support_mode=str(args.reverse_database_initial_support_mode),
+            reverse_database_initial_state_mode=str(
+                args.reverse_database_initial_state_mode
+            ),
             reverse_database_support_preparation_mode=str(args.reverse_database_support_preparation_mode),
             reverse_database_center_geometry_mode=str(args.reverse_database_center_geometry_mode),
             reverse_database_stage_jacobian_mode=str(args.reverse_database_stage_jacobian_mode),
@@ -4258,6 +4264,7 @@ def _run_realtime_geometry_optimization_api_smoke(
         "reverse_segment_profiler_trace_dir": args.reverse_segment_profiler_trace_dir,
         "shared_payload_smoke": bool(getattr(args, "full_transport_shared_payload_smoke", False)),
         "reverse_database_initial_support_mode": args.reverse_database_initial_support_mode,
+        "reverse_database_initial_state_mode": args.reverse_database_initial_state_mode,
         "reverse_database_support_preparation_mode": args.reverse_database_support_preparation_mode,
         "reverse_database_center_geometry_mode": args.reverse_database_center_geometry_mode,
         "reverse_database_stage_jacobian_mode": args.reverse_database_stage_jacobian_mode,
@@ -5938,6 +5945,19 @@ def main() -> None:
               "reduced-carry zero-predictor-cotangent contract. Root AD is unchanged."),
     )
     parser.add_argument(
+        "--reverse-database-initial-state-mode",
+        choices=("generic", "reduced_zero_rhs"),
+        default="generic",
+        help=(
+            "Database full-transport initial-state transpose. 'generic' keeps "
+            "the validated custom-VJP route. 'reduced_zero_rhs' uses the same "
+            "state packing, projection and root dependencies but statically "
+            "omits the initial direct-RHS branch whose predictor cotangent is "
+            "zero. It requires --reverse-database-initial-support-mode "
+            "reduced_zero."
+        ),
+    )
+    parser.add_argument(
         "--reverse-database-support-preparation-mode",
         choices=("separate", "shared"), default="shared",
         help=("Database support preparation: 'separate' restores the three "
@@ -6788,6 +6808,7 @@ def main() -> None:
     )
     database_performance_override = (
         args.reverse_database_initial_support_mode != "split"
+        or args.reverse_database_initial_state_mode != "generic"
         or args.reverse_database_support_preparation_mode != "shared"
         or args.reverse_database_center_geometry_mode != "scalar_jvp"
         or args.reverse_database_stage_jacobian_mode != "independent"
@@ -6804,6 +6825,18 @@ def main() -> None:
             "[autodiff-gate] Database performance overrides require the database "
             "--full-transport-shared-payload-smoke path; root-only and Lij paths "
             "are unchanged."
+        )
+    if (
+        args.reverse_database_initial_state_mode == "reduced_zero_rhs"
+        and (
+            args.reverse_database_initial_support_mode != "reduced_zero"
+            or args.reverse_step_bwd_mode != "reduced_cotangent_call_boundary"
+        )
+    ):
+        raise SystemExit(
+            "[autodiff-gate] reduced_zero_rhs initial state requires "
+            "--reverse-database-initial-support-mode reduced_zero and "
+            "--reverse-step-bwd-mode reduced_cotangent_call_boundary."
         )
     if str(args.reverse_rhs_transpose_mode).strip().lower() == "config":
         args.reverse_rhs_transpose_mode = (

@@ -83,6 +83,21 @@ The next performance work should preserve the verified sparse segment runtime
 and target cold compilation and the independent terminal/root/final-scan
 families.  Those changes require their own CLI modes and parity checks.
 
+Two isolated initial-boundary modes were subsequently added for the first
+follow-up timing experiment:
+
+- `--reverse-database-initial-support-mode reduced_zero` uses the existing
+  structural proof that the reduced accepted-step carry has zero
+  `prev_stages` cotangents and therefore returns an exact zero initial-RHS
+  support bar without tracing a support transpose;
+- `--reverse-database-initial-state-mode reduced_zero_rhs` preserves the
+  initial `y` and `lagged_reference_y` identities and the complete state
+  packing/projection pullback, but does not trace the direct-RHS state branch.
+
+The second mode requires the first and is restricted to the black-box Radau
+database boundary.  Both remain opt-in until their full 16x4 timing and
+Jacobian parity are measured.
+
 ## Resource report
 
 ```text
