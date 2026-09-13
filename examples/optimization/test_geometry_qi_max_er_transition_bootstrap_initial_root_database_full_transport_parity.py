@@ -1,8 +1,8 @@
 #!/usr/bin/env python
 """Parity of benchmark and optimization database full-transport entry points.
 
-Both lanes use the same benchmark TOML, unperturbed VMEC input, selected
-initial-Er root, 16 accepted Radau steps, and four four-step reverse
+Both lanes use the same benchmark TOML, the validated root-only optimization
+seed, selected initial-Er root, 16 accepted Radau steps, and four four-step reverse
 segments.  The reference is the unchanged benchmark composition.  The trial
 is the optimization-only full-transport selector and must invoke that same
 integrated selected-root/transport composition exactly once.  Candidate JIT
@@ -20,16 +20,11 @@ import subprocess
 import sys
 import tempfile
 
-import jax
 import numpy as np
 
 ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
-
-from NEOPAX import optimization as opt  # noqa: E402
-import optimize_geometry_qi_max_er_transition_bootstrap_initial_root as base  # noqa: E402
-
 
 SMALL_DATABASE_TRANSPORT_CONFIG = (
     ROOT
@@ -75,15 +70,25 @@ DATABASE_REVERSE_OPTIONS = {
 
 
 def active_terms():
+    import optimize_geometry_qi_max_er_transition_bootstrap_initial_root as base
+
     return tuple(term for term in base.terms if float(term[2]) != 0.0)
 
 
 def build_problem(*, reverse_stage_mode: str):
+    from NEOPAX import optimization as opt
+    import optimize_geometry_qi_max_er_transition_bootstrap_initial_root as base
+
     if not np.isscalar(base.MAX_MODE_SCHEDULE):
         raise ValueError("The reduced full-transport test requires one fixed max mode.")
     problem = opt.geometry_full_transport_least_squares_problem(
         SMALL_DATABASE_TRANSPORT_CONFIG,
         active_terms(),
+        # Preserve the already validated selected-root optimization prefix.
+        # Without this explicit override, the transport TOML selects the
+        # separate 201-surface benchmark seed instead of the root lane's
+        # 51-surface seed and can exhaust GPU memory before reaching the root.
+        vmec_input=base.SEED_INPUT,
         max_mode=int(base.MAX_MODE_SCHEDULE),
         families=base.GEOMETRY_FAMILIES,
         scale_mode=base.SCALE_MODE,
@@ -119,6 +124,8 @@ def build_problem(*, reverse_stage_mode: str):
 
 
 def evaluate(problem, x):
+    import jax
+
     with redirect_stdout(io.StringIO()):
         result = problem.evaluate(x)
     return jax.block_until_ready((result.residuals, result.jacobian))
@@ -126,6 +133,8 @@ def evaluate(problem, x):
 
 def _worker(stage_name: str, output_path: Path) -> int:
     """Evaluate one lane in its own process and persist only host arrays."""
+
+    import jax
 
     stage_mode = REFERENCE_STAGE_MODE if stage_name == "reference" else TRIAL_STAGE_MODE
     problem = build_problem(reverse_stage_mode=stage_mode)
@@ -182,7 +191,8 @@ def main() -> int:
     if args.worker_output is not None:
         parser.error("--worker-output is only valid with --worker-stage")
 
-    # A single process cannot reliably hold both full GPU compilation sets.
+    # Keep this parent process free of JAX/NEOPAX imports.  Otherwise it can
+    # retain a GPU client/allocation while a supposedly isolated worker runs.
     # Sequential workers release all reference-lane GPU state before the trial
     # starts while preserving exactly the host arrays needed for parity.
     with tempfile.TemporaryDirectory(prefix="neopax_full_transport_parity_") as temp_dir:

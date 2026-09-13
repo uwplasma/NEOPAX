@@ -1,6 +1,8 @@
 """Unit checks for optimization-only reuse of VMEX raw-block setup."""
 
+import ast
 import dataclasses
+from pathlib import Path
 from types import SimpleNamespace
 
 import jax
@@ -572,6 +574,60 @@ def test_database_full_transport_mode_uses_one_integrated_benchmark_builder(monk
         assert calls[0]["reverse_schedule_artifact_mode"] == "reuse_static_probe"
         assert problem.options["reverse_stage_mode"] == stage_mode
         assert problem.table_result_builder is builder
+
+
+def test_full_transport_parity_parent_does_not_import_gpu_stack():
+    """The coordinator must not own a GPU client while its worker runs."""
+
+    script = (
+        Path(__file__).resolve().parents[1]
+        / "examples"
+        / "optimization"
+        / "test_geometry_qi_max_er_transition_bootstrap_initial_root_database_full_transport_parity.py"
+    )
+    module = ast.parse(script.read_text(encoding="utf-8"))
+    top_level_imports = []
+    for node in module.body:
+        if isinstance(node, ast.Import):
+            top_level_imports.extend(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.module is not None:
+            top_level_imports.append(node.module)
+    forbidden = {
+        "jax",
+        "jax.numpy",
+        "NEOPAX",
+        "optimize_geometry_qi_max_er_transition_bootstrap_initial_root",
+    }
+    assert forbidden.isdisjoint(top_level_imports)
+
+
+def test_full_transport_parity_preserves_validated_root_seed():
+    """Full transport must start from the same seed as root-only parity."""
+
+    script = (
+        Path(__file__).resolve().parents[1]
+        / "examples"
+        / "optimization"
+        / "test_geometry_qi_max_er_transition_bootstrap_initial_root_database_full_transport_parity.py"
+    )
+    module = ast.parse(script.read_text(encoding="utf-8"))
+    builder = next(
+        node
+        for node in module.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.name == "build_problem"
+    )
+    call = next(
+        node
+        for node in ast.walk(builder)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "geometry_full_transport_least_squares_problem"
+    )
+    vmec_input = next(keyword.value for keyword in call.keywords if keyword.arg == "vmec_input")
+    assert isinstance(vmec_input, ast.Attribute)
+    assert isinstance(vmec_input.value, ast.Name)
+    assert (vmec_input.value.id, vmec_input.attr) == ("base", "SEED_INPUT")
 
 
 def test_database_full_transport_replay_stage_keeps_support_dynamic_and_cache_stable():
