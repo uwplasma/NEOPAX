@@ -39,8 +39,13 @@ def live_jax_array_count() -> int | None:
         return None
 
 
-def segment_cache_sizes() -> tuple[int | None, int | None, int | None]:
+def segment_cache_sizes(problem) -> tuple[int | None, int | None, int | None, int | None]:
     cache_size = reverse_transport._jax_trace_cache_size
+    optimization_cache_size = getattr(
+        problem.table_result_builder,
+        "optimization_segment_replay_cache_size",
+        lambda: None,
+    )
     return (
         cache_size(
             reverse_transport._radau_database_segment_reduced_cotangent_bwd_with_table_support_call
@@ -51,6 +56,7 @@ def segment_cache_sizes() -> tuple[int | None, int | None, int | None]:
         cache_size(
             transport_solvers._radau_segment_reduced_cotangent_bwd_batched_call
         ),
+        optimization_cache_size(),
     )
 
 
@@ -93,17 +99,18 @@ def main() -> int:
 
     for warmup_index in range(args.warmup):
         started = time.perf_counter()
-        cache_before = segment_cache_sizes()
+        cache_before = segment_cache_sizes(problem)
         residuals, jacobian = evaluate(
             problem, x, show_progress=args.diagnose_segment_dispatch
         )
-        cache_after = segment_cache_sizes()
+        cache_after = segment_cache_sizes(problem)
         del residuals, jacobian
         gc.collect()
         print(
             "[database full-transport memory] "
             f"warmup={warmup_index} elapsed_s={time.perf_counter() - started:.3f} "
-            f"segment_cache={cache_before}->{cache_after}",
+            "segment_cache=(database_bwd,benchmark_replay,generic_bwd,optimization_replay)="
+            f"{cache_before}->{cache_after}",
             flush=True,
         )
 
@@ -112,11 +119,11 @@ def main() -> int:
     baseline_jacobian = None
     for trial_index in range(args.repeats):
         started = time.perf_counter()
-        cache_before = segment_cache_sizes()
+        cache_before = segment_cache_sizes(problem)
         residuals, jacobian = evaluate(
             problem, x, show_progress=args.diagnose_segment_dispatch
         )
-        cache_after = segment_cache_sizes()
+        cache_after = segment_cache_sizes(problem)
         residuals_np = np.asarray(jax.device_get(residuals), dtype=float)
         jacobian_np = np.asarray(jax.device_get(jacobian), dtype=float)
         if baseline_residuals is None:
@@ -145,7 +152,8 @@ def main() -> int:
             "[database full-transport memory] "
             f"trial={trial_index} elapsed_s={time.perf_counter() - started:.3f} "
             f"rss_delta={rss_text} live_jax_arrays={arrays_text} "
-            f"segment_cache={cache_before}->{cache_after} "
+            "segment_cache=(database_bwd,benchmark_replay,generic_bwd,optimization_replay)="
+            f"{cache_before}->{cache_after} "
             f"residual_repeat_max_abs={residual_repeat_delta:.3e} "
             f"jacobian_repeat_max_abs={jacobian_repeat_delta:.3e}",
             flush=True,

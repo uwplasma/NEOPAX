@@ -742,10 +742,16 @@ class RealtimeGeometrySupportReverseDependencies:
     runtime_with_geometry_payload: Callable[[object, object], object]
     runtime_with_ntx_support_payload: Callable[[object, object], object]
     runtime_with_realtime_geometry_reverse_support_payload: Callable[[object, object], object]
+    # Optional optimization-only replay boundary.  Existing benchmark
+    # dependency bundles leave this unset and call the established replay JIT
+    # directly, exactly as before.
+    segment_replay_minimal_with_primal_records: Callable[..., object] | None = None
 
     def __post_init__(self) -> None:
         for field in dataclasses.fields(self):
             value = getattr(self, field.name)
+            if field.name == "segment_replay_minimal_with_primal_records" and value is None:
+                continue
             if not callable(value):
                 raise TypeError(f"{field.name} must be callable.")
 
@@ -4521,6 +4527,28 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
     def _take_tree_axis0(tree, index: int):
         return jax.tree_util.tree_map(lambda value: value[index], tree)
 
+    def _segment_replay_minimal_with_primal_records(
+        execution_context,
+        segment_start_carry,
+        segment_arrays,
+    ):
+        optimization_replay = (
+            dependencies.segment_replay_minimal_with_primal_records
+        )
+        if optimization_replay is None:
+            # Exact existing benchmark path.
+            return _radau_segment_replay_minimal_with_primal_records_call(
+                execution_context,
+                segment_start_carry,
+                segment_arrays,
+            )
+        return optimization_replay(
+            execution_context,
+            segment_start_carry,
+            segment_arrays,
+            support_payload,
+        )
+
     host_static_branch_dispatch = step_bwd_mode == "reduced_cotangent_host_static_branches"
     if host_static_branch_dispatch:
         record_mode = str(
@@ -5949,10 +5977,8 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
             # inspected. They are not additive production timings.
             record_replay_result = _time_rebuild_component(
                 "record_replay_minimal_with_primal_records",
-                lambda segment_carry, segment_arrays: _radau_segment_replay_minimal_with_primal_records_call(
-                    reverse_setup.execution_context,
-                    segment_carry,
-                    segment_arrays,
+                lambda segment_carry, segment_arrays: _segment_replay_minimal_with_primal_records(
+                    reverse_setup.execution_context, segment_carry, segment_arrays
                 ),
                 diagnostic_carry,
                 diagnostic_segment_arrays,
@@ -6158,7 +6184,7 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
         """
 
         _, step_start_carries, step_primal_records = (
-            _radau_segment_replay_minimal_with_primal_records_call(
+            _segment_replay_minimal_with_primal_records(
                 reverse_setup.execution_context,
                 segment_carry,
                 segment_arrays,
@@ -6309,7 +6335,7 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
             # two local fixed-table geometry terms separate.  The recorded
             # NTX scan remains the sole table-to-geometry transpose.
             _, database_step_start_carries, database_step_primal_records = (
-                _radau_segment_replay_minimal_with_primal_records_call(
+                _segment_replay_minimal_with_primal_records(
                     reverse_setup.execution_context,
                     segment_start_carry,
                     segment_arrays,
@@ -8292,6 +8318,7 @@ def internal_realtime_geometry_transport_reverse_table_result_builder(
     realtime_geometry_component_pullbacks: bool = False,
     progress_label: str | None = None,
     raw_block_solve: GeometryRawBlockSolve | None = None,
+    segment_replay_optimization_stage_builder: Callable[..., object] | None = None,
 ) -> TransportReverseTableResultBuilder:
     """Build an experimental direct full transport reverse table builder.
 
@@ -8310,6 +8337,8 @@ def internal_realtime_geometry_transport_reverse_table_result_builder(
         labels = tuple(TRANSPORT_REVERSE_OBJECTIVE_LABELS)
         lookup = {name: i for i, name in enumerate(labels)}
         return tuple(lookup[str(name)] for name in normalize_transport_objective_names(objective_names, objective_labels=labels))
+
+    optimization_segment_replay_stage = None
 
     def _builder(
         objective_names: tuple[str, ...],
@@ -8571,7 +8600,71 @@ def internal_realtime_geometry_transport_reverse_table_result_builder(
                 else ntx_support_payload
             )
         _report_table_builder_phase("prepare_support_payload")
+        active_stage_mode = str(
+            opts.get("reverse_stage_mode", "benchmark")
+        ).strip().lower()
+        reverse_support_callback = None
+        if active_stage_mode == "database_full_transport_optimization":
+            if not (
+                isinstance(support_payload, dict)
+                and set(support_payload) == {"geometry", "database"}
+            ):
+                raise ValueError(
+                    "The database full-transport optimization replay requires "
+                    "the live {geometry, database} support payload."
+                )
+
+            def _optimization_segment_replay(
+                execution_context,
+                segment_start_carry,
+                segment_arrays,
+                active_support_payload,
+            ):
+                del execution_context  # Fresh static identities must not reach JAX.
+                nonlocal optimization_segment_replay_stage
+                if optimization_segment_replay_stage is None:
+                    if not callable(segment_replay_optimization_stage_builder):
+                        raise RuntimeError(
+                            "The database full-transport optimization replay "
+                            "stage builder was not supplied."
+                        )
+                    optimization_segment_replay_stage = (
+                        segment_replay_optimization_stage_builder(
+                            reverse_setup=active_reverse_setup,
+                            species=active_runtime.species,
+                            support_payload=active_support_payload,
+                            segment_start_carry=segment_start_carry,
+                            segment_arrays=segment_arrays,
+                        )
+                    )
+                return optimization_segment_replay_stage.replay(
+                    initial_flat_state=(
+                        active_reverse_setup.prepared_rollout.initial_carry.y
+                    ),
+                    support_payload=active_support_payload,
+                    segment_start_carry=segment_start_carry,
+                    segment_arrays=segment_arrays,
+                )
+
+            optimization_dependencies = dataclasses.replace(
+                default_realtime_geometry_support_reverse_dependencies(),
+                segment_replay_minimal_with_primal_records=(
+                    _optimization_segment_replay
+                ),
+            )
+
+            def _optimization_support_reverse(*args, **kwargs):
+                return realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_vector(
+                    *args,
+                    objective_labels=TRANSPORT_REVERSE_OBJECTIVE_LABELS,
+                    dependencies=optimization_dependencies,
+                    **kwargs,
+                )
+
+            reverse_support_callback = _optimization_support_reverse
+
         support_result = realtime_geometry_support_cotangents_from_parameter_vector(
+            reverse_all_objectives_support_payload_bar=reverse_support_callback,
             profile_values=active_profile_values,
             config=table_context.config,
             baseline_runtime=active_runtime,
@@ -8737,6 +8830,16 @@ def internal_realtime_geometry_transport_reverse_table_result_builder(
                     )
         return assembly.table_result
 
+    def _optimization_segment_replay_cache_size() -> int | None:
+        if optimization_segment_replay_stage is None:
+            return 0
+        return optimization_segment_replay_stage.cache_size()
+
+    setattr(
+        _builder,
+        "optimization_segment_replay_cache_size",
+        _optimization_segment_replay_cache_size,
+    )
     return _builder
 
 

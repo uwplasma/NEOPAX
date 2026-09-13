@@ -70,6 +70,9 @@ from ._optimization_initial_root_stage import (
     build_geometry_initial_root_optimization_stage,
     initial_root_stage_layout,
 )
+from ._optimization_full_transport_stage import (
+    build_database_full_transport_replay_optimization_stage,
+)
 from ._reverse_ad_parameters import (
     PROFILE_PARAMETER_ORDER,
     ProfileParameterSpec,
@@ -2450,6 +2453,11 @@ def geometry_full_transport_least_squares_problem(
             else int(max_reverse_accepted_steps)
         ),
         progress_label="[optimization] full transport geometry payload pullback:",
+        segment_replay_optimization_stage_builder=(
+            build_database_full_transport_replay_optimization_stage
+            if stage_mode == "database_full_transport_optimization"
+            else None
+        ),
     )
     normalized_terms = _normalize_initial_er_root_least_squares_terms(terms)
     return GeometryFullTransportLeastSquaresProblem(

@@ -3,10 +3,13 @@
 import dataclasses
 from types import SimpleNamespace
 
+import jax
 import jax.numpy as jnp
 
 from NEOPAX import _geometry_autodiff as geometry_ad
+from NEOPAX import _optimization_full_transport_stage as full_transport_stage
 from NEOPAX import _optimization_initial_root_stage as initial_root_stage
+from NEOPAX import _transport_solvers as transport_solvers
 from NEOPAX import optimization
 from NEOPAX._reverse_ad_optimization import normalize_geometry_full_ad_objective_names
 
@@ -555,6 +558,13 @@ def test_database_full_transport_mode_uses_one_integrated_benchmark_builder(monk
         assert calls[0]["reverse_stage_adjoint_solve_mode"] == "block"
         assert calls[0]["reverse_rhs_transpose_mode"] == "explicit_database"
         assert calls[0]["reverse_step_bwd_mode"] == "reduced_cotangent_call_boundary"
+        if stage_mode == "benchmark":
+            assert calls[0]["segment_replay_optimization_stage_builder"] is None
+        else:
+            assert (
+                calls[0]["segment_replay_optimization_stage_builder"]
+                is full_transport_stage.build_database_full_transport_replay_optimization_stage
+            )
         assert calls[0]["reverse_database_initial_state_mode"] == "generic"
         assert calls[0]["reverse_database_interpolation_transpose_mode"] == "legacy_sparse"
         assert calls[0]["reverse_database_root_interpolation_transpose_mode"] == "established"
@@ -562,3 +572,203 @@ def test_database_full_transport_mode_uses_one_integrated_benchmark_builder(monk
         assert calls[0]["reverse_schedule_artifact_mode"] == "reuse_static_probe"
         assert problem.options["reverse_stage_mode"] == stage_mode
         assert problem.table_result_builder is builder
+
+
+def test_database_full_transport_replay_stage_keeps_support_dynamic_and_cache_stable():
+    """The optimization replay compiles once while current support stays live."""
+
+    @dataclasses.dataclass(frozen=True)
+    class EquationSystem:
+        support: object
+
+        def with_realtime_geometry_support_payload(self, support):
+            return dataclasses.replace(self, support=support)
+
+        def vector_field(self, _t, state, *_args):
+            scale = self.support["geometry"] * self.support["database"]
+            return -0.2 * state + scale
+
+    solver = transport_solvers.RADAUSolver(
+        t0=0.0,
+        t1=1.0e-3,
+        dt=1.0e-4,
+        maxiter=4,
+        max_steps=4,
+        rhs_mode="black_box",
+    )
+    state = jnp.asarray([0.4])
+    support0 = {
+        "geometry": jnp.asarray(0.3),
+        "database": jnp.asarray(0.7),
+    }
+    equation_system = EquationSystem(support0)
+    prepared = transport_solvers._build_prepared_radau_accepted_rollout(
+        solver=solver,
+        state=state,
+        vector_field=equation_system.vector_field,
+        species=None,
+    )
+    execution_context = transport_solvers._build_prepared_radau_execution_context(
+        solver=solver,
+        prepared_rollout=prepared,
+    )
+    reverse_setup = SimpleNamespace(
+        solver=solver,
+        solve_vector_field=equation_system.vector_field,
+        prepared_rollout=prepared,
+        execution_context=execution_context,
+    )
+    segment_arrays = (
+        jnp.asarray([True]),
+        jnp.asarray([1.0e-4]),
+        jnp.asarray([1.0e-4]),
+        jnp.asarray([0], dtype=jnp.int32),
+        jnp.asarray([0], dtype=jnp.int32),
+        jnp.asarray([0], dtype=jnp.int32),
+        jnp.asarray([False]),
+    )
+    stage = full_transport_stage.build_database_full_transport_replay_optimization_stage(
+        reverse_setup=reverse_setup,
+        species=None,
+        support_payload=support0,
+        segment_start_carry=prepared.initial_carry,
+        segment_arrays=segment_arrays,
+    )
+
+    def run(support, active_prepared=prepared):
+        return jax.block_until_ready(
+            stage.replay(
+                initial_flat_state=active_prepared.initial_carry.y,
+                support_payload=support,
+                segment_start_carry=active_prepared.initial_carry,
+                segment_arrays=segment_arrays,
+            )
+        )
+
+    result0 = run(support0)
+    support1 = {
+        "geometry": jnp.asarray(0.6),
+        "database": jnp.asarray(0.7),
+    }
+    equation_system1 = EquationSystem(support1)
+    state1 = jnp.asarray([0.55])
+    prepared1 = transport_solvers._build_prepared_radau_accepted_rollout(
+        solver=solver,
+        state=state1,
+        vector_field=equation_system1.vector_field,
+        species=None,
+    )
+    execution_context1 = transport_solvers._build_prepared_radau_execution_context(
+        solver=solver,
+        prepared_rollout=prepared1,
+    )
+    result1 = run(support1, prepared1)
+
+    reference_result0 = jax.block_until_ready(
+        transport_solvers._radau_segment_replay_minimal_with_primal_records_call(
+            execution_context,
+            prepared.initial_carry,
+            segment_arrays,
+        )
+    )
+    reference_result1 = jax.block_until_ready(
+        transport_solvers._radau_segment_replay_minimal_with_primal_records_call(
+            execution_context1,
+            prepared1.initial_carry,
+            segment_arrays,
+        )
+    )
+
+    assert stage.cache_size() == 1
+    assert not jnp.allclose(result0[0].y, result1[0].y)
+    for trial, reference in (
+        (result0, reference_result0),
+        (result1, reference_result1),
+    ):
+        for trial_leaf, reference_leaf in zip(
+            jax.tree_util.tree_leaves(trial),
+            jax.tree_util.tree_leaves(reference),
+            strict=True,
+        ):
+            assert jnp.allclose(
+                trial_leaf, reference_leaf, rtol=1.0e-12, atol=1.0e-12
+            )
+
+    incompatible_support = {
+        "geometry": jnp.asarray(0.6),
+        "database": jnp.asarray([0.7]),
+    }
+    try:
+        run(incompatible_support, prepared1)
+    except ValueError as exc:
+        assert "support shape, dtype, or weak type changed" in str(exc)
+    else:  # pragma: no cover - defensive
+        raise AssertionError(
+            "A changed support layout must not create another cache entry."
+        )
+    assert stage.cache_size() == 1
+
+
+def test_database_full_transport_replay_skips_template_database_rescaling(monkeypatch):
+    """The persistent replay uses the root lane's fresh-database replacement."""
+
+    @dataclasses.dataclass(frozen=True)
+    class Equation:
+        name: str
+
+    @dataclasses.dataclass(frozen=True)
+    class EquationSystem:
+        config: object
+        species: object
+        shared_flux_model: object
+        source_models: object
+        solver_cfg: object
+        boundary_models: object
+        equations: tuple = ()
+        density_equation: object = None
+        temperature_equation: object = None
+        er_equation: object = None
+
+        def with_realtime_geometry_support_payload(self, _support):
+            raise AssertionError("generic geometry/database replacement must not run")
+
+    template = EquationSystem(
+        config="config",
+        species="species",
+        shared_flux_model="old-model",
+        source_models="sources",
+        solver_cfg="solver",
+        boundary_models="boundaries",
+    )
+    calls = {}
+
+    def replace(model, geometry, database):
+        calls["replacement"] = (model, geometry, database)
+        return "fresh-model", True
+
+    def build(**kwargs):
+        calls["build"] = kwargs
+        return (Equation("density"), Equation("temperature"), Equation("Er"))
+
+    monkeypatch.setattr(
+        full_transport_stage,
+        "_replace_geometry_and_fresh_database_payload_in_model",
+        replace,
+    )
+    monkeypatch.setattr(full_transport_stage, "build_equation_system", build)
+    result = full_transport_stage._equation_system_with_fresh_database_payload(
+        template,
+        {"geometry": "new-geometry", "database": "new-database"},
+    )
+
+    assert calls["replacement"] == (
+        "old-model",
+        "new-geometry",
+        "new-database",
+    )
+    assert calls["build"]["field"] == "new-geometry"
+    assert calls["build"]["flux_model"] == "fresh-model"
+    assert result.shared_flux_model == "fresh-model"
+    assert result.density_equation.name == "density"
+    assert result.temperature_equation.name == "temperature"
+    assert result.er_equation.name == "Er"
