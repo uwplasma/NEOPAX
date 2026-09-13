@@ -529,6 +529,9 @@ def main() -> int:
             max_iter=GEOMETRY_MAX_ITER,
             solver_device=SOLVER_DEVICE,
         )
+        problem = opt.GeometryInputSavingProblem(
+            problem, OUT_DIR / f"geometry_inputs_m{max_mode}"
+        )
         if x is None or len(x) != problem.parameter_count:
             x = np.zeros((problem.parameter_count,), dtype=float)
         print(

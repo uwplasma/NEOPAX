@@ -541,6 +541,9 @@ def main() -> int:
             device=SOLVER_DEVICE,
             root_options=ROOT_OPTIONS,
         )
+        problem = opt.GeometryInputSavingProblem(
+            problem, OUT_DIR / f"geometry_inputs_m{max_mode}"
+        )
         if x is None or len(x) != problem.parameter_count:
             x = np.asarray(jax.device_get(problem.x0), dtype=float)
         print(

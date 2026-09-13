@@ -173,6 +173,58 @@ def test_repeated_evaluation_memory_samples_release_evaluations(monkeypatch):
     assert all(sample.jacobian_shape == (1, 1) for sample in samples)
 
 
+def test_geometry_input_saving_problem_writes_each_unique_trial_before_evaluation(tmp_path):
+    events = []
+
+    class InputDeck:
+        def __init__(self, values):
+            self.values = values
+
+        def to_indata(self, path):
+            events.append(("write", self.values))
+            path.write_text(",".join(str(value) for value in self.values), encoding="utf-8")
+
+    class Problem:
+        x0 = jnp.asarray([0.0, 0.0], dtype=jnp.float64)
+        parameter_count = 2
+
+        def input_from_scaled_parameters(self, values):
+            return InputDeck(tuple(float(value) for value in values))
+
+        def evaluate(self, values=None):
+            host_values = self.x0 if values is None else values
+            values_tuple = tuple(float(value) for value in host_values)
+            events.append(("evaluate", values_tuple))
+            if values_tuple == (2.0, 3.0):
+                raise RuntimeError("trial failed")
+            return SimpleNamespace(residuals=jnp.asarray([0.0]), jacobian=jnp.asarray([[0.0, 0.0]]))
+
+    wrapped = optimization.GeometryInputSavingProblem(Problem(), tmp_path)
+    wrapped.evaluate(jnp.asarray([0.0, 0.0]))
+    wrapped.evaluate(jnp.asarray([0.0, 0.0]))
+    try:
+        wrapped.evaluate(jnp.asarray([2.0, 3.0]))
+    except RuntimeError as exc:
+        assert str(exc) == "trial failed"
+    else:
+        raise AssertionError("Expected the synthetic trial to fail.")
+
+    paths = sorted(tmp_path.glob("input.geometry_eval_*"))
+    assert [path.name for path in paths] == [
+        "input.geometry_eval_0000",
+        "input.geometry_eval_0001",
+    ]
+    assert paths[0].read_text(encoding="utf-8") == "0.0,0.0"
+    assert paths[1].read_text(encoding="utf-8") == "2.0,3.0"
+    assert events == [
+        ("write", (0.0, 0.0)),
+        ("evaluate", (0.0, 0.0)),
+        ("evaluate", (0.0, 0.0)),
+        ("write", (2.0, 3.0)),
+        ("evaluate", (2.0, 3.0)),
+    ]
+
+
 def test_database_profile_diagnostics_rebuild_live_database_runtime(monkeypatch):
     """Plot helpers must not inject exact-Lij support into a database model."""
 

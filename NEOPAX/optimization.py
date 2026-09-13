@@ -8,6 +8,7 @@ import gc
 import os
 import time
 from collections.abc import Sequence
+from pathlib import Path
 from typing import Callable, Mapping
 from types import SimpleNamespace
 
@@ -231,6 +232,59 @@ def repeated_evaluation_memory_samples(
         if on_sample is not None:
             on_sample(sample)
     return tuple(samples)
+
+
+class GeometryInputSavingProblem:
+    """Decorator that saves one VMEX input for every unique optimizer trial.
+
+    The input is written before the wrapped evaluation starts, so a geometry
+    that later fails its VMEX or transport solve is still available for
+    diagnosis and restart. Repeated residual/Jacobian requests at the same
+    parameter vector share one file.
+    """
+
+    def __init__(
+        self,
+        problem,
+        artifact_dir: str | os.PathLike[str],
+        *,
+        filename_prefix: str = "input.geometry_eval",
+    ) -> None:
+        prefix = str(filename_prefix)
+        if not prefix.startswith("input."):
+            raise ValueError("Geometry evaluation input filenames must start with 'input.'.")
+        self.problem = problem
+        self.artifact_dir = Path(artifact_dir)
+        self.filename_prefix = prefix
+        self.artifact_dir.mkdir(parents=True, exist_ok=True)
+        self._seen: dict[tuple[tuple[int, ...], bytes], Path] = {}
+        self._next_index = 0
+
+    def __getattr__(self, name):
+        return getattr(self.problem, name)
+
+    def _next_path(self) -> Path:
+        while True:
+            path = self.artifact_dir / f"{self.filename_prefix}_{self._next_index:04d}"
+            self._next_index += 1
+            if not path.exists():
+                return path
+
+    def evaluate(self, scaled_parameter_values=None):
+        x = self.problem.x0 if scaled_parameter_values is None else jnp.asarray(
+            scaled_parameter_values,
+            dtype=jnp.float64,
+        )
+        x_host = np.ascontiguousarray(
+            np.asarray(jax.device_get(x), dtype=np.float64)
+        )
+        key = (tuple(int(size) for size in x_host.shape), x_host.tobytes())
+        if key not in self._seen:
+            input_path = self._next_path()
+            self.problem.input_from_scaled_parameters(x).to_indata(input_path)
+            self._seen[key] = input_path
+            print(f"wrote {input_path}", flush=True)
+        return self.problem.evaluate(scaled_parameter_values)
 
 
 @dataclasses.dataclass(frozen=True, slots=True)

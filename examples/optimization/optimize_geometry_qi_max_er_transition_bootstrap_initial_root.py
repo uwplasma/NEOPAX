@@ -584,6 +584,9 @@ def main() -> int:
     for max_mode in max_mode_schedule:
         print(f"\n===== NEOPAX geometry QI + max-Er stage, max_mode={max_mode} =====", flush=True)
         problem = build_transition_bootstrap_initial_root_problem(current_input, max_mode)
+        problem = opt.GeometryInputSavingProblem(
+            problem, OUT_DIR / f"geometry_inputs_m{max_mode}"
+        )
         if x is None or len(x) != problem.parameter_count:
             x = np.asarray(jax.device_get(problem.x0), dtype=float)
         print(

@@ -401,34 +401,6 @@ def write_outputs(optimized_input, initial_input):
     write_transport_report(optimized_input, "optimized")
 
 
-class GeometryInputSavingProblem:
-    """Save the VMEC input corresponding to every successful optimizer evaluation."""
-
-    def __init__(self, problem, artifact_dir):
-        self.problem = problem
-        self.artifact_dir = Path(artifact_dir)
-        self.artifact_dir.mkdir(parents=True, exist_ok=True)
-        self._seen = {}
-
-    def __getattr__(self, name):
-        return getattr(self.problem, name)
-
-    def evaluate(self, scaled_parameter_values=None):
-        evaluation = self.problem.evaluate(scaled_parameter_values)
-        x = self.problem.x0 if scaled_parameter_values is None else jnp.asarray(
-            scaled_parameter_values,
-            dtype=jnp.float64,
-        )
-        key = tuple(np.asarray(jax.device_get(x), dtype=float).tolist())
-        if key not in self._seen:
-            index = len(self._seen)
-            self._seen[key] = index
-            input_path = self.artifact_dir / f"input.QI_neopax_geometry_full_transport_eval_{index:04d}"
-            self.problem.input_from_scaled_parameters(x).to_indata(input_path)
-            print(f"wrote {input_path}", flush=True)
-        return evaluation
-
-
 # --------------------------- continuation ladder ----------------------------
 def main() -> int:
     active_terms = tuple(term for term in terms if float(term[2]) != 0.0)
@@ -466,9 +438,10 @@ def main() -> int:
             reverse_rhs_transpose_mode="explicit_ntx_interpolated",
             reverse_step_bwd_mode="reduced_cotangent",
         )
-        problem = GeometryInputSavingProblem(
+        problem = opt.GeometryInputSavingProblem(
             problem,
             OUT_DIR / f"geometry_inputs_m{max_mode}",
+            filename_prefix="input.QI_neopax_geometry_full_transport_eval",
         )
         if x is None or len(x) != problem.parameter_count:
             x = np.asarray(jax.device_get(problem.x0), dtype=float)

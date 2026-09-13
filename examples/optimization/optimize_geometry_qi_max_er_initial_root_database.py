@@ -86,6 +86,19 @@ GEOMETRY_ARTIFACT_STEM = "QI_neopax_database_max_er"
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--seed-input",
+        type=Path,
+        default=SEED_INPUT,
+        help="VMEX input deck used as the initial geometry.",
+    )
+    parser.add_argument(
+        "--out-dir",
+        type=Path,
+        default=OUT_DIR,
+        help="Output directory for this optimization campaign.",
+    )
+    parser.add_argument("--max-nfev", type=int, default=NFEV)
     parser.add_argument("--database-n-theta", type=int, default=DATABASE_N_THETA)
     parser.add_argument("--database-n-phi", type=int, default=DATABASE_N_PHI)
     parser.add_argument("--database-n-xi", type=int, default=DATABASE_N_XI)
@@ -490,12 +503,20 @@ def write_geometry_artifacts(input_obj, label: str) -> Path:
 
 
 def main() -> int:
+    global OUT_DIR
+
     args = _parser().parse_args()
     if min(args.database_n_theta, args.database_n_phi, args.database_n_xi) < 1:
         raise ValueError("Database theta, phi, and xi resolutions must all be positive.")
+    if args.max_nfev < 1:
+        raise ValueError("--max-nfev must be positive.")
+    seed_input = args.seed_input.expanduser().resolve()
+    if not seed_input.is_file():
+        raise FileNotFoundError(seed_input)
+    OUT_DIR = args.out_dir.expanduser().resolve()
     config = database_config(args)
     OUT_DIR.mkdir(parents=True, exist_ok=True)
-    current_input = SEED_INPUT
+    current_input = seed_input
     final_problem = final_result = optimized_input = initial_input = None
     initial_problem = initial_x = None
 
@@ -506,6 +527,9 @@ def main() -> int:
             flush=True,
         )
         problem = build_problem(config, current_input, int(max_mode), args)
+        problem = opt.GeometryInputSavingProblem(
+            problem, OUT_DIR / f"geometry_inputs_m{max_mode}"
+        )
         x0 = np.asarray(jax.device_get(problem.x0), dtype=float)
         print(f"[setup] parameter_count={problem.parameter_count} parameters={list(problem.parameter_labels)}")
         if initial_input is None:
@@ -515,7 +539,7 @@ def main() -> int:
         report("initial", problem, x0)
         result = opt.least_squares(
             problem,
-            max_nfev=NFEV,
+            max_nfev=int(args.max_nfev),
             ftol=FTOL,
             xtol=XTOL,
             verbose=1,
@@ -540,7 +564,7 @@ def main() -> int:
         )
     ):
         raise RuntimeError("No optimization stage was executed.")
-    initial_input.to_indata(OUT_DIR / SEED_INPUT.name)
+    initial_input.to_indata(OUT_DIR / seed_input.name)
     optimized_input.to_indata(OUT_DIR / "input.QI_neopax_database_max_er_optimized")
     save_transport_profiles(
         initial_problem,
@@ -558,8 +582,9 @@ def main() -> int:
     )
     write_geometry_artifacts(optimized_input, "optimized")
     summary = {
-        "seed_input": str(SEED_INPUT), "database_transport_config": str(DATABASE_TRANSPORT_CONFIG),
+        "seed_input": str(seed_input), "database_transport_config": str(DATABASE_TRANSPORT_CONFIG),
         "database_resolution_theta_phi_xi": [args.database_n_theta, args.database_n_phi, args.database_n_xi],
+        "max_nfev": int(args.max_nfev),
         "reverse_stage_mode": REVERSE_STAGE_MODE, "parameter_labels": list(final_problem.parameter_labels),
         "x": np.asarray(final_result.x, dtype=float).tolist(), "cost": float(final_result.cost),
         "optimality": float(final_result.optimality), "status": int(final_result.status),

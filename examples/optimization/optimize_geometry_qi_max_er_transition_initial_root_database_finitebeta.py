@@ -518,6 +518,9 @@ def main() -> int:
     for max_mode in MAX_MODE_SCHEDULE:
         print(f"\n===== finite-beta database QI + Er transition, max_mode={max_mode}, grid=({args.database_n_theta},{args.database_n_phi},{args.database_n_xi}), beta={INCLUDE_BETA}, dmerc={INCLUDE_DMERC} =====", flush=True)
         problem = build_problem(config, current_input, max_mode, args)
+        problem = opt.GeometryInputSavingProblem(
+            problem, OUT_DIR / f"geometry_inputs_m{max_mode}"
+        )
         x0 = np.asarray(jax.device_get(problem.x0), dtype=float)
         print(f"[setup] parameter_count={problem.parameter_count} parameters={list(problem.parameter_labels)}")
         if initial_input is None:
