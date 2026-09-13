@@ -1,5 +1,22 @@
 # Database reverse AD versus FD status
 
+## 2026-09-13 completed batched-modes timing result
+
+The completed `shared_multi_rhs + batched_split` 16/4 run is recorded in
+[the batched-modes run note](docs/benchmarks/database_reverse_16x4_2026-09-13_batched_modes_run.md).
+It preserved every transport derivative at printed precision and reduced peak
+host RSS from 13.815 GiB to 12.792 GiB. It did **not** improve the steady warm
+segment: the mean changed from 22.264 s to 23.779 s. Thus the objective-row
+batching hypothesis is rejected as the explanation for the approximately
+22-second warm segment. The initial direct-RHS support phase also increased
+from 568.883 s to 617.280 s. No AD-versus-FD conclusion changed.
+
+The next isolated candidate removes the database support transpose from the
+sequential four-step state recurrence, retains the exact solved stage
+cotangents, and batches the independent per-step support contractions after
+the recurrence. It is not part of the completed measurement above and must not
+be described as faster until a full GPU timing is available.
+
 ## Implementation resumed after the completed-run record
 
 The completed timings and derivative values below remain the measured
