@@ -12,6 +12,7 @@ import numpy as np
 from NEOPAX import _geometry_autodiff as geometry_ad
 from NEOPAX import _optimization_full_transport_stage as full_transport_stage
 from NEOPAX import _optimization_initial_root_stage as initial_root_stage
+from NEOPAX import _reverse_ad_transport as reverse_transport
 from NEOPAX import _transport_solvers as transport_solvers
 from NEOPAX import optimization
 from NEOPAX._reverse_ad_optimization import normalize_geometry_full_ad_objective_names
@@ -465,6 +466,41 @@ def test_database_initial_er_payload_adapter_rebuilds_only_floating_trial_leaves
 def test_database_full_transport_mode_uses_one_integrated_benchmark_builder(monkeypatch):
     """The optimization selector must not build the retired two-sweep bridge."""
 
+    production_dependencies = (
+        reverse_transport.default_realtime_geometry_support_reverse_dependencies()
+    )
+    assert production_dependencies.segment_replay_minimal_with_primal_records is None
+    assert (
+        production_dependencies.database_segment_reduced_cotangent_bwd_with_table_support
+        is None
+    )
+
+    expected_database_modes = {
+        "reverse_stage_adjoint_solve_mode": "block",
+        "reverse_rhs_transpose_mode": "explicit_database",
+        "reverse_rhs_pullback_mode": "separate",
+        "reverse_initial_cache_support_pullback_mode": "scalar",
+        "reverse_rebuild_support_pullback_mode": "separate",
+        "reverse_database_initial_support_mode": "reduced_zero",
+        "reverse_database_initial_state_mode": "reduced_zero_rhs",
+        "reverse_database_support_preparation_mode": "shared",
+        "reverse_database_center_geometry_mode": "scalar_jvp",
+        "reverse_database_stage_jacobian_mode": "independent",
+        "reverse_database_support_objective_mode": "scalar",
+        "reverse_database_segment_support_mode": "inline",
+        "reverse_database_interpolation_transpose_mode": "legacy_sparse",
+        "reverse_database_root_interpolation_transpose_mode": "legacy_sparse",
+        "reverse_database_bootstrap_interpolation_transpose_mode": "legacy_sparse",
+        "reverse_final_objective_cotangent_mode": "grouped_joint_vjp",
+        "reverse_bootstrap_cotangent_mode": "joint_local_vjp_upar_only",
+        "reverse_schedule_artifact_mode": "reuse_static_probe",
+        "reverse_segment_start_replay_mode": "minimal",
+        "reverse_segment_primal_record_mode": "reuse_segment_primal_record",
+        "reverse_stage_cotangent_mode": "full",
+        "reverse_step_bwd_mode": "reduced_cotangent_call_boundary",
+        "reverse_stage_adjoint_memory_mode": "default",
+    }
+
     context = object()
     runtime = object()
     baseline_state = SimpleNamespace(pressure=jnp.asarray([1.0]))
@@ -568,11 +604,9 @@ def test_database_full_transport_mode_uses_one_integrated_benchmark_builder(monk
                 calls[0]["segment_replay_optimization_stage_builder"]
                 is full_transport_stage.build_database_full_transport_replay_optimization_stage
             )
-        assert calls[0]["reverse_database_initial_state_mode"] == "generic"
-        assert calls[0]["reverse_database_interpolation_transpose_mode"] == "legacy_sparse"
-        assert calls[0]["reverse_database_root_interpolation_transpose_mode"] == "established"
-        assert calls[0]["reverse_database_bootstrap_interpolation_transpose_mode"] == "established"
-        assert calls[0]["reverse_schedule_artifact_mode"] == "reuse_static_probe"
+        for name, expected in expected_database_modes.items():
+            assert calls[0][name] == expected
+            assert problem.options[name] == expected
         assert problem.options["reverse_stage_mode"] == stage_mode
         assert problem.table_result_builder is builder
 
@@ -631,8 +665,39 @@ def test_full_transport_parity_preserves_validated_root_seed():
     assert (vmec_input.value.id, vmec_input.attr) == ("base", "SEED_INPUT")
 
 
-def test_database_full_transport_replay_stage_keeps_support_dynamic_and_cache_stable():
+def test_database_full_transport_replay_stage_keeps_support_dynamic_and_cache_stable(
+    monkeypatch,
+):
     """The optimization replay compiles once while current support stays live."""
+
+    def database_bwd_body(
+        _execution_context,
+        _cotangent_mode,
+        segment_reduced_bars,
+        _step_start_carries,
+        _step_primal_records,
+        _segment_arrays,
+        support,
+    ):
+        objective_count = jnp.asarray(segment_reduced_bars.y).shape[0]
+        support_bars = tuple(
+            jnp.broadcast_to(
+                jnp.asarray(leaf)[None, ...],
+                (objective_count,) + jnp.shape(leaf),
+            )
+            for leaf in jax.tree_util.tree_leaves(support)
+        )
+        return segment_reduced_bars, support_bars
+
+    def database_bwd_call(*_args, **_kwargs):  # pragma: no cover - wrapper is bypassed
+        raise AssertionError("The persistent stage must use the benchmark JIT body.")
+
+    database_bwd_call.__wrapped__ = database_bwd_body
+    monkeypatch.setattr(
+        full_transport_stage,
+        "_radau_database_segment_reduced_cotangent_bwd_with_table_support_call",
+        database_bwd_call,
+    )
 
     @dataclasses.dataclass(frozen=True)
     class EquationSystem:
@@ -750,6 +815,43 @@ def test_database_full_transport_replay_stage_keeps_support_dynamic_and_cache_st
             assert jnp.allclose(
                 trial_leaf, reference_leaf, rtol=1.0e-12, atol=1.0e-12
             )
+
+    def zero_batched_reduced_cotangent(carry):
+        def batched_zeros(value):
+            return jnp.zeros((1,) + jnp.shape(value), dtype=jnp.asarray(value).dtype)
+
+        return transport_solvers._RadauAcceptedStepReducedCotangent(
+            y=batched_zeros(carry.y),
+            lagged_response_cache=jax.tree_util.tree_map(
+                batched_zeros, carry.lagged_response_cache
+            ),
+            lagged_reference_y=batched_zeros(carry.lagged_reference_y),
+        )
+
+    bwd0 = stage.database_segment_bwd(
+        initial_flat_state=prepared.initial_carry.y,
+        support_payload=support0,
+        cotangent_mode="full",
+        segment_reduced_bars=zero_batched_reduced_cotangent(result0[0]),
+        step_start_carries=result0[1],
+        step_primal_records=result0[2],
+        segment_arrays=segment_arrays,
+    )
+    bwd1 = stage.database_segment_bwd(
+        initial_flat_state=prepared1.initial_carry.y,
+        support_payload=support1,
+        cotangent_mode="full",
+        segment_reduced_bars=zero_batched_reduced_cotangent(result1[0]),
+        step_start_carries=result1[1],
+        step_primal_records=result1[2],
+        segment_arrays=segment_arrays,
+    )
+    jax.block_until_ready((bwd0, bwd1))
+    assert stage.database_bwd_cache_size() == 1
+    assert not jnp.allclose(
+        jax.tree_util.tree_leaves(bwd0[1])[-1],
+        jax.tree_util.tree_leaves(bwd1[1])[-1],
+    )
 
     incompatible_support = {
         "geometry": jnp.asarray(0.6),

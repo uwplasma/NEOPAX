@@ -2340,25 +2340,26 @@ def geometry_full_transport_least_squares_problem(
         "solver_device": geometry_solver_device,
     }
     if str(neoclassical_cfg.get("flux_model", "")).strip().lower() == "ntx_scan_runtime":
-        # Match the current validated defaults of
+        # Match the validated optimized selector bundle passed to
         # benchmark_transport_reverse_ad_only.py for the database
-        # full-transport lane. The Lij/realtime lane is left unchanged.
+        # full-transport lane. The benchmark and Lij/realtime lanes are
+        # left unchanged.
         options.update(
             {
                 "reverse_rhs_pullback_mode": "separate",
                 "reverse_initial_cache_support_pullback_mode": "scalar",
                 "reverse_rebuild_support_pullback_mode": "separate",
-                "reverse_database_initial_support_mode": "split",
-                "reverse_database_initial_state_mode": "generic",
+                "reverse_database_initial_support_mode": "reduced_zero",
+                "reverse_database_initial_state_mode": "reduced_zero_rhs",
                 "reverse_database_support_preparation_mode": "shared",
                 "reverse_database_center_geometry_mode": "scalar_jvp",
                 "reverse_database_stage_jacobian_mode": "independent",
                 "reverse_database_support_objective_mode": "scalar",
                 "reverse_database_segment_support_mode": "inline",
                 "reverse_database_interpolation_transpose_mode": "legacy_sparse",
-                "reverse_database_root_interpolation_transpose_mode": "established",
-                "reverse_database_bootstrap_interpolation_transpose_mode": "established",
-                "reverse_final_objective_cotangent_mode": "grouped_vjp",
+                "reverse_database_root_interpolation_transpose_mode": "legacy_sparse",
+                "reverse_database_bootstrap_interpolation_transpose_mode": "legacy_sparse",
+                "reverse_final_objective_cotangent_mode": "grouped_joint_vjp",
                 "reverse_bootstrap_cotangent_mode": "joint_local_vjp_upar_only",
                 "reverse_schedule_artifact_mode": "reuse_static_probe",
                 "reverse_segment_start_replay_mode": "minimal",

@@ -746,11 +746,20 @@ class RealtimeGeometrySupportReverseDependencies:
     # dependency bundles leave this unset and call the established replay JIT
     # directly, exactly as before.
     segment_replay_minimal_with_primal_records: Callable[..., object] | None = None
+    # Optional optimization-only database segment backward boundary. Existing
+    # benchmark dependency bundles leave this unset and call the established
+    # database backward JIT directly.
+    database_segment_reduced_cotangent_bwd_with_table_support: (
+        Callable[..., object] | None
+    ) = None
 
     def __post_init__(self) -> None:
         for field in dataclasses.fields(self):
             value = getattr(self, field.name)
-            if field.name == "segment_replay_minimal_with_primal_records" and value is None:
+            if field.name in {
+                "segment_replay_minimal_with_primal_records",
+                "database_segment_reduced_cotangent_bwd_with_table_support",
+            } and value is None:
                 continue
             if not callable(value):
                 raise TypeError(f"{field.name} must be callable.")
@@ -4549,6 +4558,38 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
             support_payload,
         )
 
+    def _database_segment_reduced_cotangent_bwd_with_table_support(
+        execution_context,
+        cotangent_mode,
+        segment_reduced_bars,
+        step_start_carries,
+        step_primal_records,
+        segment_arrays,
+    ):
+        optimization_bwd = (
+            dependencies.database_segment_reduced_cotangent_bwd_with_table_support
+        )
+        if optimization_bwd is None:
+            # Exact existing benchmark path.
+            return _radau_database_segment_reduced_cotangent_bwd_with_table_support_call(
+                execution_context,
+                cotangent_mode,
+                segment_reduced_bars,
+                step_start_carries,
+                step_primal_records,
+                segment_arrays,
+                support_payload,
+            )
+        return optimization_bwd(
+            execution_context,
+            cotangent_mode,
+            segment_reduced_bars,
+            step_start_carries,
+            step_primal_records,
+            segment_arrays,
+            support_payload,
+        )
+
     host_static_branch_dispatch = step_bwd_mode == "reduced_cotangent_host_static_branches"
     if host_static_branch_dispatch:
         record_mode = str(
@@ -6375,14 +6416,13 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
                 (
                     reduced_bars,
                     segment_support_bar_leaves,
-                ) = _radau_database_segment_reduced_cotangent_bwd_with_table_support_call(
+                ) = _database_segment_reduced_cotangent_bwd_with_table_support(
                     reverse_setup.execution_context,
                     cotangent_mode,
                     reduced_bars,
                     database_step_start_carries,
                     database_step_primal_records,
                     segment_arrays,
-                    support_payload,
                 )
                 reduced_bars, segment_support_bar_leaves = (
                     jax.block_until_ready(
@@ -8646,10 +8686,40 @@ def internal_realtime_geometry_transport_reverse_table_result_builder(
                     segment_arrays=segment_arrays,
                 )
 
+            def _optimization_database_segment_bwd(
+                execution_context,
+                cotangent_mode,
+                segment_reduced_bars,
+                step_start_carries,
+                step_primal_records,
+                segment_arrays,
+                active_support_payload,
+            ):
+                del execution_context  # Fresh static identities must not reach JAX.
+                if optimization_segment_replay_stage is None:
+                    raise RuntimeError(
+                        "The persistent database backward stage must be initialized "
+                        "by the segment replay before the reverse segment runs."
+                    )
+                return optimization_segment_replay_stage.database_segment_bwd(
+                    initial_flat_state=(
+                        active_reverse_setup.prepared_rollout.initial_carry.y
+                    ),
+                    support_payload=active_support_payload,
+                    cotangent_mode=cotangent_mode,
+                    segment_reduced_bars=segment_reduced_bars,
+                    step_start_carries=step_start_carries,
+                    step_primal_records=step_primal_records,
+                    segment_arrays=segment_arrays,
+                )
+
             optimization_dependencies = dataclasses.replace(
                 default_realtime_geometry_support_reverse_dependencies(),
                 segment_replay_minimal_with_primal_records=(
                     _optimization_segment_replay
+                ),
+                database_segment_reduced_cotangent_bwd_with_table_support=(
+                    _optimization_database_segment_bwd
                 ),
             )
 
@@ -8835,10 +8905,20 @@ def internal_realtime_geometry_transport_reverse_table_result_builder(
             return 0
         return optimization_segment_replay_stage.cache_size()
 
+    def _optimization_segment_bwd_cache_size() -> int | None:
+        if optimization_segment_replay_stage is None:
+            return 0
+        return optimization_segment_replay_stage.database_bwd_cache_size()
+
     setattr(
         _builder,
         "optimization_segment_replay_cache_size",
         _optimization_segment_replay_cache_size,
+    )
+    setattr(
+        _builder,
+        "optimization_segment_bwd_cache_size",
+        _optimization_segment_bwd_cache_size,
     )
     return _builder
 

@@ -28,6 +28,7 @@ from ._transport_solvers import (
     _extract_fixed_temperature_projection,
     _extract_state_regularization,
     _make_solver_state_transform,
+    _radau_database_segment_reduced_cotangent_bwd_with_table_support_call,
     _radau_segment_replay_minimal_with_primal_records_call,
 )
 
@@ -145,6 +146,7 @@ class DatabaseFullTransportReplayOptimizationStage:
     species: Any
     equation_system_template: Any
     compiled_replay: Any
+    compiled_database_bwd: Any
     support_floating_signature: Any
     initial_state_signature: Any
     segment_carry_signature: Any
@@ -185,8 +187,56 @@ class DatabaseFullTransportReplayOptimizationStage:
             segment_arrays,
         )
 
+    def database_segment_bwd(
+        self,
+        *,
+        initial_flat_state,
+        support_payload,
+        cotangent_mode,
+        segment_reduced_bars,
+        step_start_carries,
+        step_primal_records,
+        segment_arrays,
+    ):
+        """Run the benchmark database segment body through one stable JIT."""
+
+        self.support_layout.validate_static_structure(support_payload)
+        support_floating_leaves = self.support_layout.floating_leaves(support_payload)
+        if _tree_signature(support_floating_leaves) != self.support_floating_signature:
+            raise ValueError(
+                "Full-transport optimization support shape, dtype, or weak type "
+                "changed within a stage."
+            )
+        if _tree_signature(initial_flat_state) != self.initial_state_signature:
+            raise ValueError(
+                "Full-transport optimization initial-state layout changed within a stage."
+            )
+        if _tree_signature(segment_arrays) != self.segment_arrays_signature:
+            raise ValueError(
+                "Full-transport optimization segment schedule changed shape or "
+                "dtype within a stage."
+            )
+        return self.compiled_database_bwd(
+            initial_flat_state,
+            support_floating_leaves,
+            str(cotangent_mode),
+            segment_reduced_bars,
+            step_start_carries,
+            step_primal_records,
+            segment_arrays,
+        )
+
     def cache_size(self) -> int | None:
         cache_size = getattr(self.compiled_replay, "_cache_size", None)
+        if not callable(cache_size):
+            return None
+        try:
+            return int(cache_size())
+        except Exception:
+            return None
+
+    def database_bwd_cache_size(self) -> int | None:
+        cache_size = getattr(self.compiled_database_bwd, "_cache_size", None)
         if not callable(cache_size):
             return None
         try:
@@ -219,6 +269,15 @@ def build_database_full_transport_replay_optimization_stage(
     )
     if not callable(replay_body):
         raise RuntimeError("The established Radau segment replay body is unavailable.")
+    database_bwd_body = getattr(
+        _radau_database_segment_reduced_cotangent_bwd_with_table_support_call,
+        "__wrapped__",
+        None,
+    )
+    if not callable(database_bwd_body):
+        raise RuntimeError(
+            "The established Radau database segment backward body is unavailable."
+        )
 
     support_layout = FloatingPayloadLeafLayout.from_template(support_payload)
     support_floating_leaves = support_layout.floating_leaves(support_payload)
@@ -256,12 +315,7 @@ def build_database_full_transport_replay_optimization_stage(
         temperature_floor=temperature_floor,
     )
 
-    def _replay_kernel(
-        active_initial_flat_state,
-        support_floating_leaves,
-        active_segment_start_carry,
-        active_segment_arrays,
-    ):
+    def _active_execution_context(active_initial_flat_state, support_floating_leaves):
         active_support = support_layout.rebuild(support_floating_leaves)
         active_equation_system = _equation_system_with_fresh_database_payload(
             equation_system_template,
@@ -279,6 +333,18 @@ def build_database_full_transport_replay_optimization_stage(
             solver=solver,
             prepared_rollout=active_rollout,
         )
+        return active_execution_context, active_support
+
+    def _replay_kernel(
+        active_initial_flat_state,
+        support_floating_leaves,
+        active_segment_start_carry,
+        active_segment_arrays,
+    ):
+        active_execution_context, _ = _active_execution_context(
+            active_initial_flat_state,
+            support_floating_leaves,
+        )
         # Invoke the exact body underlying the benchmark JIT.  The outer JIT
         # is the sole optimization cache owner, and all trial data above are
         # explicit numerical arguments to it.
@@ -288,7 +354,38 @@ def build_database_full_transport_replay_optimization_stage(
             active_segment_arrays,
         )
 
+    def _database_bwd_kernel(
+        active_initial_flat_state,
+        support_floating_leaves,
+        cotangent_mode,
+        segment_reduced_bars,
+        step_start_carries,
+        step_primal_records,
+        active_segment_arrays,
+    ):
+        active_execution_context, active_support = _active_execution_context(
+            active_initial_flat_state,
+            support_floating_leaves,
+        )
+        # This is the exact body beneath the benchmark database backward JIT.
+        # The optimization JIT owns the stable static context; all geometry,
+        # database, carry, record, and schedule values remain dynamic inputs.
+        return database_bwd_body(
+            active_execution_context,
+            cotangent_mode,
+            segment_reduced_bars,
+            step_start_carries,
+            step_primal_records,
+            active_segment_arrays,
+            active_support,
+        )
+
     compiled_replay = jax.jit(_replay_kernel, inline=False)
+    compiled_database_bwd = jax.jit(
+        _database_bwd_kernel,
+        static_argnums=(2,),
+        inline=False,
+    )
     return DatabaseFullTransportReplayOptimizationStage(
         support_layout=support_layout,
         initial_state_unpack=initial_state_unpack,
@@ -296,6 +393,7 @@ def build_database_full_transport_replay_optimization_stage(
         species=species,
         equation_system_template=equation_system_template,
         compiled_replay=compiled_replay,
+        compiled_database_bwd=compiled_database_bwd,
         support_floating_signature=_tree_signature(support_floating_leaves),
         initial_state_signature=_tree_signature(initial_flat_state),
         segment_carry_signature=_tree_signature(segment_start_carry),

@@ -39,11 +39,18 @@ def live_jax_array_count() -> int | None:
         return None
 
 
-def segment_cache_sizes(problem) -> tuple[int | None, int | None, int | None, int | None]:
+def segment_cache_sizes(
+    problem,
+) -> tuple[int | None, int | None, int | None, int | None, int | None]:
     cache_size = reverse_transport._jax_trace_cache_size
-    optimization_cache_size = getattr(
+    optimization_replay_cache_size = getattr(
         problem.table_result_builder,
         "optimization_segment_replay_cache_size",
+        lambda: None,
+    )
+    optimization_bwd_cache_size = getattr(
+        problem.table_result_builder,
+        "optimization_segment_bwd_cache_size",
         lambda: None,
     )
     return (
@@ -56,7 +63,8 @@ def segment_cache_sizes(problem) -> tuple[int | None, int | None, int | None, in
         cache_size(
             transport_solvers._radau_segment_reduced_cotangent_bwd_batched_call
         ),
-        optimization_cache_size(),
+        optimization_replay_cache_size(),
+        optimization_bwd_cache_size(),
     )
 
 
@@ -109,7 +117,8 @@ def main() -> int:
         print(
             "[database full-transport memory] "
             f"warmup={warmup_index} elapsed_s={time.perf_counter() - started:.3f} "
-            "segment_cache=(database_bwd,benchmark_replay,generic_bwd,optimization_replay)="
+            "segment_cache=(database_bwd,benchmark_replay,generic_bwd,"
+            "optimization_replay,optimization_bwd)="
             f"{cache_before}->{cache_after}",
             flush=True,
         )
@@ -152,7 +161,8 @@ def main() -> int:
             "[database full-transport memory] "
             f"trial={trial_index} elapsed_s={time.perf_counter() - started:.3f} "
             f"rss_delta={rss_text} live_jax_arrays={arrays_text} "
-            "segment_cache=(database_bwd,benchmark_replay,generic_bwd,optimization_replay)="
+            "segment_cache=(database_bwd,benchmark_replay,generic_bwd,"
+            "optimization_replay,optimization_bwd)="
             f"{cache_before}->{cache_after} "
             f"residual_repeat_max_abs={residual_repeat_delta:.3e} "
             f"jacobian_repeat_max_abs={jacobian_repeat_delta:.3e}",
