@@ -671,7 +671,7 @@ def test_database_full_transport_replay_stage_keeps_support_dynamic_and_cache_st
     """The optimization replay compiles once while current support stays live."""
 
     def database_bwd_body(
-        _execution_context,
+        execution_context,
         _cotangent_mode,
         segment_reduced_bars,
         _step_start_carries,
@@ -679,6 +679,11 @@ def test_database_full_transport_replay_stage_keeps_support_dynamic_and_cache_st
         _segment_arrays,
         support,
     ):
+        physics = execution_context.physics_context
+        assert physics.reverse_direct_stage_adjoint is True
+        assert physics.reverse_stage_adjoint_solve_mode == "block"
+        assert physics.reverse_rhs_transpose_mode == "explicit_database"
+        assert physics.reverse_step_bwd_mode == "reduced_cotangent_call_boundary"
         objective_count = jnp.asarray(segment_reduced_bars.y).shape[0]
         support_bars = tuple(
             jnp.broadcast_to(
@@ -733,6 +738,16 @@ def test_database_full_transport_replay_stage_keeps_support_dynamic_and_cache_st
     execution_context = transport_solvers._build_prepared_radau_execution_context(
         solver=solver,
         prepared_rollout=prepared,
+    )
+    execution_context = dataclasses.replace(
+        execution_context,
+        physics_context=dataclasses.replace(
+            execution_context.physics_context,
+            reverse_direct_stage_adjoint=True,
+            reverse_stage_adjoint_solve_mode="block",
+            reverse_rhs_transpose_mode="explicit_database",
+            reverse_step_bwd_mode="reduced_cotangent_call_boundary",
+        ),
     )
     reverse_setup = SimpleNamespace(
         solver=solver,

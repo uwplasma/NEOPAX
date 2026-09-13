@@ -255,6 +255,11 @@ def build_database_full_transport_replay_optimization_stage(
 ) -> DatabaseFullTransportReplayOptimizationStage:
     """Build the persistent database replay without changing benchmark math."""
 
+    # Imported lazily to avoid a module cycle: the production reverse module
+    # owns this established database-hook configurator, while optimization.py
+    # imports this stage before importing the reverse transport entry points.
+    from ._reverse_ad_transport import _configure_database_reverse_performance
+
     equation_system_template = getattr(reverse_setup.solve_vector_field, "__self__", None)
     replace_support = getattr(
         equation_system_template, "with_realtime_geometry_support_payload", None
@@ -282,6 +287,12 @@ def build_database_full_transport_replay_optimization_stage(
     support_layout = FloatingPayloadLeafLayout.from_template(support_payload)
     support_floating_leaves = support_layout.floating_leaves(support_payload)
     solver = reverse_setup.solver
+    template_physics_context = reverse_setup.execution_context.physics_context
+    reverse_control_values = {
+        field.name: getattr(template_physics_context, field.name)
+        for field in dataclasses.fields(template_physics_context)
+        if field.name.startswith("reverse_")
+    }
     template_er_equation = getattr(equation_system_template, "er_equation", None)
     template_ntss_density_indices = getattr(
         template_er_equation, "ntss_density_indices", None
@@ -332,6 +343,34 @@ def build_database_full_transport_replay_optimization_stage(
         active_execution_context = _build_prepared_radau_execution_context(
             solver=solver,
             prepared_rollout=active_rollout,
+        )
+        # Recreate any mode-dependent database pullback callbacks from the
+        # current equation system.  Copying those callbacks from the template
+        # would retain its old geometry/database, defeating this dynamic JIT
+        # boundary.  The reverse_* values themselves are structural controls,
+        # so transplant all of them from the already-validated benchmark
+        # execution context after the fresh callbacks have been constructed.
+        active_physics_context = _configure_database_reverse_performance(
+            active_execution_context.physics_context,
+            vector_field=active_equation_system.vector_field,
+            species=species,
+            initial_support_mode=template_physics_context.reverse_database_initial_support_mode,
+            initial_state_mode=template_physics_context.reverse_database_initial_state_mode,
+            support_preparation_mode=template_physics_context.reverse_database_support_preparation_mode,
+            center_geometry_mode=template_physics_context.reverse_database_center_geometry_mode,
+            stage_jacobian_mode=template_physics_context.reverse_database_stage_jacobian_mode,
+            support_objective_mode=template_physics_context.reverse_database_support_objective_mode,
+            segment_support_mode=template_physics_context.reverse_database_segment_support_mode,
+            interpolation_transpose_mode=template_physics_context.reverse_database_interpolation_transpose_mode,
+            root_interpolation_transpose_mode=template_physics_context.reverse_database_root_interpolation_transpose_mode,
+            bootstrap_interpolation_transpose_mode=template_physics_context.reverse_database_bootstrap_interpolation_transpose_mode,
+        )
+        active_execution_context = dataclasses.replace(
+            active_execution_context,
+            physics_context=dataclasses.replace(
+                active_physics_context,
+                **reverse_control_values,
+            ),
         )
         return active_execution_context, active_support
 
