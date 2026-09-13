@@ -192,7 +192,7 @@ def main() -> int:
         "initial_er_root=jax_selected_root "
         f"stage={parity.TRIAL_STAGE_MODE} "
         "pullback_profile=current_optimized "
-        "database_bwd_boundary=optimization_exact_unwrapped_outer_jit "
+        "database_bwd_boundary=optimization_persistent_lean_context "
         f"warmup={args.warmup} repeats={args.repeats} "
         f"parameter_count={problem.parameter_count}",
         flush=True,
@@ -214,7 +214,7 @@ def main() -> int:
             "[database full-transport memory] "
             f"warmup={warmup_index} elapsed_s={time.perf_counter() - started:.3f} "
             "stage_cache=(benchmark_database_bwd,benchmark_replay,generic_bwd,"
-            "optimization_replay,optimization_outer_bwd,global_dispatch)="
+            "optimization_replay,optimization_lean_bwd,global_dispatch)="
             f"{cache_before}->{cache_after}",
             flush=True,
         )
@@ -261,7 +261,7 @@ def main() -> int:
             f"trial={trial_index} elapsed_s={time.perf_counter() - started:.3f} "
             f"rss_delta={rss_text} live_jax_arrays={arrays_text} "
             "stage_cache=(benchmark_database_bwd,benchmark_replay,generic_bwd,"
-            "optimization_replay,optimization_outer_bwd,global_dispatch)="
+            "optimization_replay,optimization_lean_bwd,global_dispatch)="
             f"{cache_before}->{cache_after} "
             f"residual_repeat_max_abs={residual_repeat_delta:.3e} "
             f"jacobian_repeat_max_abs={jacobian_repeat_delta:.3e}",

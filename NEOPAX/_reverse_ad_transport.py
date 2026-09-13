@@ -8957,9 +8957,10 @@ def internal_realtime_geometry_transport_reverse_table_result_builder(
             return 0
         return optimization_segment_replay_stage.cache_size()
 
-    def _optimization_segment_bwd_cache_size() -> int:
-        # Optimization deliberately has no context-keyed outer BWD JIT.
-        return 0
+    def _optimization_segment_bwd_cache_size() -> int | None:
+        if optimization_segment_replay_stage is None:
+            return 0
+        return optimization_segment_replay_stage.database_bwd_cache_size()
 
     setattr(
         _builder,

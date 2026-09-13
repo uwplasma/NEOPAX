@@ -677,7 +677,7 @@ def test_database_full_transport_replay_stage_keeps_support_dynamic_and_cache_st
         execution_context,
         _cotangent_mode,
         segment_reduced_bars,
-        _step_start_carries,
+        step_start_carries,
         _step_primal_records,
         _segment_arrays,
         support,
@@ -688,6 +688,19 @@ def test_database_full_transport_replay_stage_keeps_support_dynamic_and_cache_st
         assert physics.reverse_stage_adjoint_solve_mode == "block"
         assert physics.reverse_rhs_transpose_mode == "explicit_database"
         assert physics.reverse_step_bwd_mode == "reduced_cotangent_call_boundary"
+        state_bar = physics.flat_rhs_direct_black_box_state_pullback(
+            jnp.asarray(0.0),
+            jnp.asarray(step_start_carries.y)[0],
+            None,
+            jnp.asarray(segment_reduced_bars.y)[0],
+        )
+        active_segment_reduced_bars = dataclasses.replace(
+            segment_reduced_bars,
+            y=jnp.broadcast_to(
+                state_bar,
+                jnp.asarray(segment_reduced_bars.y).shape,
+            ),
+        )
         objective_count = jnp.asarray(segment_reduced_bars.y).shape[0]
         support_bars = tuple(
             jnp.broadcast_to(
@@ -696,7 +709,7 @@ def test_database_full_transport_replay_stage_keeps_support_dynamic_and_cache_st
             )
             for leaf in jax.tree_util.tree_leaves(support)
         )
-        return segment_reduced_bars, support_bars
+        return active_segment_reduced_bars, support_bars
 
     def database_bwd_call(*_args, **_kwargs):
         raise AssertionError("Optimization must not enter the benchmark outer BWD JIT.")
@@ -717,7 +730,11 @@ def test_database_full_transport_replay_stage_keeps_support_dynamic_and_cache_st
 
         def vector_field(self, _t, state, *_args):
             scale = self.support["geometry"] * self.support["database"]
-            return -0.2 * state + scale
+            return -(0.2 + scale) * state + scale
+
+        def pullback_direct_rhs_state(self, _t, _state, _runtime, rhs_bar):
+            scale = self.support["geometry"] * self.support["database"]
+            return -(0.2 + scale) * rhs_bar
 
     solver = transport_solvers.RADAUSolver(
         t0=0.0,
@@ -835,12 +852,12 @@ def test_database_full_transport_replay_stage_keeps_support_dynamic_and_cache_st
                 trial_leaf, reference_leaf, rtol=1.0e-12, atol=1.0e-12
             )
 
-    def zero_batched_reduced_cotangent(carry):
+    def seeded_batched_reduced_cotangent(carry):
         def batched_zeros(value):
             return jnp.zeros((1,) + jnp.shape(value), dtype=jnp.asarray(value).dtype)
 
         return transport_solvers._RadauAcceptedStepReducedCotangent(
-            y=batched_zeros(carry.y),
+            y=jnp.ones((1,) + jnp.shape(carry.y), dtype=jnp.asarray(carry.y).dtype),
             lagged_response_cache=jax.tree_util.tree_map(
                 batched_zeros, carry.lagged_response_cache
             ),
@@ -851,7 +868,7 @@ def test_database_full_transport_replay_stage_keeps_support_dynamic_and_cache_st
         initial_flat_state=prepared.initial_carry.y,
         support_payload=support0,
         cotangent_mode="full",
-        segment_reduced_bars=zero_batched_reduced_cotangent(result0[0]),
+        segment_reduced_bars=seeded_batched_reduced_cotangent(result0[0]),
         step_start_carries=result0[1],
         step_primal_records=result0[2],
         segment_arrays=segment_arrays,
@@ -860,13 +877,15 @@ def test_database_full_transport_replay_stage_keeps_support_dynamic_and_cache_st
         initial_flat_state=prepared1.initial_carry.y,
         support_payload=support1,
         cotangent_mode="full",
-        segment_reduced_bars=zero_batched_reduced_cotangent(result1[0]),
+        segment_reduced_bars=seeded_batched_reduced_cotangent(result1[0]),
         step_start_carries=result1[1],
         step_primal_records=result1[2],
         segment_arrays=segment_arrays,
     )
     jax.block_until_ready((bwd0, bwd1))
-    assert len(body_calls) == 2
+    assert len(body_calls) == 1
+    assert stage.database_bwd_cache_size() == 1
+    assert not jnp.allclose(bwd0[0].y, bwd1[0].y)
     assert not jnp.allclose(
         jax.tree_util.tree_leaves(bwd0[1])[-1],
         jax.tree_util.tree_leaves(bwd1[1])[-1],

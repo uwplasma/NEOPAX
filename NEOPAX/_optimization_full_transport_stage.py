@@ -1,12 +1,13 @@
-"""Optimization-only boundaries for full-transport replay and segment reverse.
+"""Optimization-only persistent boundaries for full-transport reverse.
 
 The benchmark reverse lane constructs a fresh Radau execution context for
 each geometry.  Its segment replay call deliberately treats that context as
 static, which is appropriate for a one-shot benchmark but creates one JAX
 cache entry per optimizer evaluation.  This module keeps the benchmark calls
-unchanged, provides one persistent primal replay with explicit dynamic
-geometry/database arrays, and invokes the exact database segment-backward
-body without its context-keyed outer JIT in optimization mode.
+unchanged and provides persistent replay and database-backward scans whose
+geometry/database arrays are explicit dynamic inputs.  The backward scan
+reuses the fixed solver structure and rebuilds only its support-dependent
+direct-state transpose, rather than tracing a complete rollout/context build.
 """
 
 from __future__ import annotations
@@ -147,8 +148,7 @@ class DatabaseFullTransportReplayOptimizationStage:
     species: Any
     equation_system_template: Any
     compiled_replay: Any
-    active_execution_context_builder: Any
-    database_bwd_body: Any
+    compiled_database_bwd: Any
     support_floating_signature: Any
     initial_state_signature: Any
     segment_carry_signature: Any
@@ -209,14 +209,7 @@ class DatabaseFullTransportReplayOptimizationStage:
         step_primal_records,
         segment_arrays,
     ):
-        """Run the exact benchmark body without its static-context outer JIT.
-
-        The benchmark wrapper treats ``execution_context`` as static, which is
-        correct for its one-shot use but creates one executable per trial
-        geometry in an optimizer.  The optimization stage rebuilds the current
-        context on the host and enters the unchanged wrapped body directly.
-        Existing inner Radau/database call boundaries remain in force.
-        """
+        """Run the exact benchmark scan through one lean persistent JIT."""
 
         self.support_layout.validate_static_structure(support_payload)
         support_floating_leaves = self.support_layout.floating_leaves(support_payload)
@@ -234,21 +227,23 @@ class DatabaseFullTransportReplayOptimizationStage:
                 "Full-transport optimization segment schedule changed shape or "
                 "dtype within a stage."
             )
-        active_execution_context, active_support = (
-            self.active_execution_context_builder(
-                initial_flat_state,
-                support_floating_leaves,
-            )
-        )
-        return self.database_bwd_body(
-            active_execution_context,
+        return self.compiled_database_bwd(
+            support_floating_leaves,
             str(cotangent_mode),
             segment_reduced_bars,
             step_start_carries,
             step_primal_records,
             segment_arrays,
-            active_support,
         )
+
+    def database_bwd_cache_size(self) -> int | None:
+        cache_size = getattr(self.compiled_database_bwd, "_cache_size", None)
+        if not callable(cache_size):
+            return None
+        try:
+            return int(cache_size())
+        except Exception:
+            return None
 
 
 def build_database_full_transport_replay_optimization_stage(
@@ -398,7 +393,122 @@ def build_database_full_transport_replay_optimization_stage(
             active_segment_arrays,
         )
 
+    template_execution_context = reverse_setup.execution_context
+    template_unpack_flat = template_physics_context.unpack_flat
+    template_unpack_bar = getattr(
+        template_unpack_flat,
+        "cotangent",
+        template_unpack_flat,
+    )
+    template_pack_flat = template_physics_context.pack_flat
+    template_project_flat = template_physics_context.project_flat
+
+    def _direct_state_pullback_with_support(
+        active_support,
+        t_value,
+        flat_y,
+        _lagged_response,
+        rhs_bar_flat,
+    ):
+        """Exact benchmark direct-state transpose with live support.
+
+        The ordinary benchmark closure binds this operation to its one fixed
+        equation system.  Optimization instead reconstructs only the current
+        equation-system payload needed by the same transpose.  Solver setup,
+        rollout preparation, and the Radau execution context remain static.
+        """
+
+        active_equation_system = _equation_system_with_fresh_database_payload(
+            equation_system_template,
+            active_support,
+            static_ntss_density_indices=static_ntss_density_indices,
+        )
+        pullback_fn = getattr(
+            active_equation_system,
+            "pullback_direct_rhs_state",
+            None,
+        )
+        if not callable(pullback_fn):
+            raise RuntimeError(
+                "Database full-transport optimization requires the exact "
+                "direct-RHS state pullback."
+            )
+        projected_flat_y = (
+            flat_y
+            if template_project_flat is None
+            else template_project_flat(flat_y)
+        )
+        state_y = template_unpack_flat(projected_flat_y)
+        rhs_bar_state = template_unpack_bar(
+            jnp.asarray(rhs_bar_flat, dtype=jnp.asarray(flat_y).dtype)
+        )
+        state_bar = pullback_fn(
+            t_value,
+            state_y,
+            species,
+            rhs_bar_state,
+        )
+        if state_bar is None:
+            raise ValueError("Direct black-box RHS state pullback returned None.")
+        projected_bar = template_pack_flat(state_bar)
+        if template_project_flat is None:
+            return projected_bar
+        _, project_pullback = jax.vjp(template_project_flat, flat_y)
+        return project_pullback(projected_bar)[0]
+
+    def _database_bwd_kernel(
+        support_floating_leaves,
+        cotangent_mode,
+        segment_reduced_bars,
+        step_start_carries,
+        step_primal_records,
+        active_segment_arrays,
+    ):
+        active_support = support_layout.rebuild(support_floating_leaves)
+
+        def _active_direct_state_pullback(
+            t_value,
+            flat_y,
+            lagged_response,
+            rhs_bar_flat,
+        ):
+            return _direct_state_pullback_with_support(
+                active_support,
+                t_value,
+                flat_y,
+                lagged_response,
+                rhs_bar_flat,
+            )
+
+        active_physics_context = dataclasses.replace(
+            template_physics_context,
+            flat_rhs_direct_black_box_state_pullback=(
+                _active_direct_state_pullback
+            ),
+        )
+        active_execution_context = dataclasses.replace(
+            template_execution_context,
+            physics_context=active_physics_context,
+        )
+        # This is the exact body beneath the benchmark segment JIT.  Unlike
+        # the rejected boundary, no prepared rollout or complete physics
+        # context is rebuilt inside this scan.
+        return database_bwd_body(
+            active_execution_context,
+            cotangent_mode,
+            segment_reduced_bars,
+            step_start_carries,
+            step_primal_records,
+            active_segment_arrays,
+            active_support,
+        )
+
     compiled_replay = jax.jit(_replay_kernel, inline=False)
+    compiled_database_bwd = jax.jit(
+        _database_bwd_kernel,
+        static_argnums=(1,),
+        inline=False,
+    )
     return DatabaseFullTransportReplayOptimizationStage(
         support_layout=support_layout,
         initial_state_unpack=initial_state_unpack,
@@ -406,8 +516,7 @@ def build_database_full_transport_replay_optimization_stage(
         species=species,
         equation_system_template=equation_system_template,
         compiled_replay=compiled_replay,
-        active_execution_context_builder=_active_execution_context,
-        database_bwd_body=database_bwd_body,
+        compiled_database_bwd=compiled_database_bwd,
         support_floating_signature=_tree_signature(support_floating_leaves),
         initial_state_signature=_tree_signature(initial_flat_state),
         segment_carry_signature=_tree_signature(segment_start_carry),
