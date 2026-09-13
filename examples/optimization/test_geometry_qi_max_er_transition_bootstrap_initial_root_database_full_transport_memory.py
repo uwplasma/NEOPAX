@@ -29,6 +29,19 @@ from NEOPAX import _transport_solvers as transport_solvers  # noqa: E402
 import test_geometry_qi_max_er_transition_bootstrap_initial_root_database_full_transport_parity as parity  # noqa: E402
 
 
+# This is the exact selector bundle used by the earlier ~300 MiB/evaluation
+# run, before the database-backward boundary and optimized pullback selectors
+# were introduced together.  Applying it while retaining the current
+# optimization stage isolates the database-backward change from the pullbacks.
+PRE_UPDATE_PULLBACK_OPTIONS = {
+    "reverse_database_initial_support_mode": "split",
+    "reverse_database_initial_state_mode": "generic",
+    "reverse_database_root_interpolation_transpose_mode": "established",
+    "reverse_database_bootstrap_interpolation_transpose_mode": "established",
+    "reverse_final_objective_cotangent_mode": "grouped_vjp",
+}
+
+
 def live_jax_array_count() -> int | None:
     live_arrays = getattr(jax, "live_arrays", None)
     if live_arrays is None:
@@ -37,6 +50,30 @@ def live_jax_array_count() -> int | None:
         return len(live_arrays())
     except Exception:
         return None
+
+
+def global_dispatch_cache_size() -> int | None:
+    try:
+        from jax._src import dispatch
+
+        return int(dispatch.xla_primitive_callable.cache_info().currsize)
+    except Exception:
+        return None
+
+
+def device_memory_text() -> str:
+    try:
+        stats = jax.devices()[0].memory_stats()
+    except Exception:
+        return "unavailable"
+    if not stats:
+        return "unavailable"
+    parts = []
+    for key in ("bytes_in_use", "peak_bytes_in_use", "bytes_limit"):
+        value = stats.get(key)
+        if value is not None:
+            parts.append(f"{key}={int(value) / 2**20:.1f}MiB")
+    return ",".join(parts) if parts else "unavailable"
 
 
 def segment_cache_sizes(
@@ -53,11 +90,6 @@ def segment_cache_sizes(
         "optimization_segment_bwd_cache_size",
         lambda: None,
     )
-    optimization_final_objective_cache_size = getattr(
-        problem.table_result_builder,
-        "optimization_final_objective_cache_size",
-        lambda: None,
-    )
     return (
         cache_size(
             reverse_transport._radau_database_segment_reduced_cotangent_bwd_with_table_support_call
@@ -70,7 +102,7 @@ def segment_cache_sizes(
         ),
         optimization_replay_cache_size(),
         optimization_bwd_cache_size(),
-        optimization_final_objective_cache_size(),
+        global_dispatch_cache_size(),
     )
 
 
@@ -90,13 +122,90 @@ def main() -> int:
         action="store_true",
         help="Print segment-local JAX trace-cache sizes and existing progress output.",
     )
+    parser.add_argument(
+        "--pullback-profile",
+        choices=("pre_update", "current"),
+        default="pre_update",
+        help=(
+            "Use the earlier pullback selectors with the current database-BWD "
+            "boundary (default), or the current optimized selector bundle."
+        ),
+    )
     args = parser.parse_args()
     if args.warmup < 0 or args.repeats < 1:
         raise ValueError("--warmup must be non-negative and --repeats must be positive.")
 
     problem = parity.build_problem(reverse_stage_mode=parity.TRIAL_STAGE_MODE)
+    if args.pullback_profile == "pre_update":
+        problem.options.update(PRE_UPDATE_PULLBACK_OPTIONS)
+    phase_context = {
+        "evaluation": "setup",
+        "previous_rss": None,
+        "previous_dispatch": None,
+    }
+    trial0_phase_rss: dict[str, int] = {}
+    trial0_phase_dispatch: dict[str, int] = {}
     if args.diagnose_segment_dispatch:
         problem.options["reverse_segment_jit_diagnostics"] = True
+
+        def _phase_probe(phase: str) -> None:
+            rss = opt._process_resident_memory_bytes()
+            rss_text = "unavailable" if rss is None else f"{rss / 2**20:.1f}MiB"
+            arrays = live_jax_array_count()
+            arrays_text = "unavailable" if arrays is None else str(arrays)
+            dispatch_cache = global_dispatch_cache_size()
+            dispatch_text = (
+                "unavailable" if dispatch_cache is None else str(dispatch_cache)
+            )
+            previous_rss = phase_context["previous_rss"]
+            rss_step_delta = (
+                None
+                if rss is None or previous_rss is None
+                else (rss - previous_rss) / 2**20
+            )
+            trial0_rss = trial0_phase_rss.get(phase)
+            rss_trial0_delta = (
+                None
+                if rss is None or trial0_rss is None
+                else (rss - trial0_rss) / 2**20
+            )
+            previous_dispatch = phase_context["previous_dispatch"]
+            dispatch_step_delta = (
+                None
+                if dispatch_cache is None or previous_dispatch is None
+                else dispatch_cache - previous_dispatch
+            )
+            trial0_dispatch = trial0_phase_dispatch.get(phase)
+            dispatch_trial0_delta = (
+                None
+                if dispatch_cache is None or trial0_dispatch is None
+                else dispatch_cache - trial0_dispatch
+            )
+            if phase_context["evaluation"] == "trial:0":
+                if rss is not None:
+                    trial0_phase_rss[phase] = rss
+                if dispatch_cache is not None:
+                    trial0_phase_dispatch[phase] = dispatch_cache
+            phase_context["previous_rss"] = rss
+            phase_context["previous_dispatch"] = dispatch_cache
+
+            def _delta_text(value, suffix=""):
+                return "n/a" if value is None else f"{value:+.1f}{suffix}"
+
+            print(
+                "[database full-transport phase] "
+                f"evaluation={phase_context['evaluation']} phase={phase} "
+                f"rss={rss_text} live_jax_arrays={arrays_text} "
+                f"rss_step_delta={_delta_text(rss_step_delta, 'MiB')} "
+                f"rss_vs_trial0_phase={_delta_text(rss_trial0_delta, 'MiB')} "
+                f"global_dispatch_cache={dispatch_text} "
+                f"dispatch_step_delta={_delta_text(dispatch_step_delta)} "
+                f"dispatch_vs_trial0_phase={_delta_text(dispatch_trial0_delta)} "
+                f"device_memory={device_memory_text()}",
+                flush=True,
+            )
+
+        problem.table_result_builder.optimization_phase_probe = _phase_probe
     x = np.asarray(jax.device_get(problem.x0), dtype=float)
     print(
         "[database full-transport memory] "
@@ -106,12 +215,17 @@ def main() -> int:
         f"segments={parity.ACCEPTED_STEP_LIMIT // parity.REVERSE_SEGMENT_LENGTH} "
         "initial_er_root=jax_selected_root "
         f"stage={parity.TRIAL_STAGE_MODE} "
+        f"pullback_profile={args.pullback_profile} "
+        "database_bwd_boundary=optimization_persistent "
         f"warmup={args.warmup} repeats={args.repeats} "
         f"parameter_count={problem.parameter_count}",
         flush=True,
     )
 
     for warmup_index in range(args.warmup):
+        phase_context["evaluation"] = f"warmup:{warmup_index}"
+        phase_context["previous_rss"] = None
+        phase_context["previous_dispatch"] = None
         started = time.perf_counter()
         cache_before = segment_cache_sizes(problem)
         residuals, jacobian = evaluate(
@@ -124,7 +238,7 @@ def main() -> int:
             "[database full-transport memory] "
             f"warmup={warmup_index} elapsed_s={time.perf_counter() - started:.3f} "
             "stage_cache=(database_bwd,benchmark_replay,generic_bwd,"
-            "optimization_replay,optimization_bwd,optimization_final_objective)="
+            "optimization_replay,optimization_bwd,global_dispatch)="
             f"{cache_before}->{cache_after}",
             flush=True,
         )
@@ -133,6 +247,9 @@ def main() -> int:
     baseline_residuals = None
     baseline_jacobian = None
     for trial_index in range(args.repeats):
+        phase_context["evaluation"] = f"trial:{trial_index}"
+        phase_context["previous_rss"] = None
+        phase_context["previous_dispatch"] = None
         started = time.perf_counter()
         cache_before = segment_cache_sizes(problem)
         residuals, jacobian = evaluate(
@@ -168,7 +285,7 @@ def main() -> int:
             f"trial={trial_index} elapsed_s={time.perf_counter() - started:.3f} "
             f"rss_delta={rss_text} live_jax_arrays={arrays_text} "
             "stage_cache=(database_bwd,benchmark_replay,generic_bwd,"
-            "optimization_replay,optimization_bwd,optimization_final_objective)="
+            "optimization_replay,optimization_bwd,global_dispatch)="
             f"{cache_before}->{cache_after} "
             f"residual_repeat_max_abs={residual_repeat_delta:.3e} "
             f"jacobian_repeat_max_abs={jacobian_repeat_delta:.3e}",
