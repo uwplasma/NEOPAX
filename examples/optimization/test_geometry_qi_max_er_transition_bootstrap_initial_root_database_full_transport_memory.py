@@ -25,6 +25,7 @@ if str(ROOT) not in sys.path:
 
 from NEOPAX import optimization as opt  # noqa: E402
 from NEOPAX import _reverse_ad_transport as reverse_transport  # noqa: E402
+from NEOPAX import _transport_solvers as transport_solvers  # noqa: E402
 import test_geometry_qi_max_er_transition_bootstrap_initial_root_database_full_transport_parity as parity  # noqa: E402
 
 
@@ -38,7 +39,7 @@ def live_jax_array_count() -> int | None:
         return None
 
 
-def segment_cache_sizes() -> tuple[int | None, int | None]:
+def segment_cache_sizes() -> tuple[int | None, int | None, int | None]:
     cache_size = reverse_transport._jax_trace_cache_size
     return (
         cache_size(
@@ -46,6 +47,9 @@ def segment_cache_sizes() -> tuple[int | None, int | None]:
         ),
         cache_size(
             reverse_transport._radau_segment_replay_minimal_with_primal_records_call
+        ),
+        cache_size(
+            transport_solvers._radau_segment_reduced_cotangent_bwd_batched_call
         ),
     )
 
@@ -70,9 +74,7 @@ def main() -> int:
     if args.warmup < 0 or args.repeats < 1:
         raise ValueError("--warmup must be non-negative and --repeats must be positive.")
 
-    problem = parity.build_problem(
-        reverse_segment_length=parity.TRIAL_SEGMENT_LENGTH
-    )
+    problem = parity.build_problem(reverse_stage_mode=parity.TRIAL_STAGE_MODE)
     if args.diagnose_segment_dispatch:
         problem.options["reverse_segment_jit_diagnostics"] = True
     x = np.asarray(jax.device_get(problem.x0), dtype=float)
@@ -80,9 +82,10 @@ def main() -> int:
         "[database full-transport memory] "
         f"grid=({parity.DATABASE_N_THETA},{parity.DATABASE_N_PHI},{parity.DATABASE_N_XI}) "
         f"accepted_steps={parity.ACCEPTED_STEP_LIMIT} "
-        f"segment_length={parity.TRIAL_SEGMENT_LENGTH} "
-        f"segments={parity.ACCEPTED_STEP_LIMIT // parity.TRIAL_SEGMENT_LENGTH} "
+        f"segment_length={parity.REVERSE_SEGMENT_LENGTH} "
+        f"segments={parity.ACCEPTED_STEP_LIMIT // parity.REVERSE_SEGMENT_LENGTH} "
         "initial_er_root=jax_selected_root "
+        f"stage={parity.TRIAL_STAGE_MODE} "
         f"warmup={args.warmup} repeats={args.repeats} "
         f"parameter_count={problem.parameter_count}",
         flush=True,
