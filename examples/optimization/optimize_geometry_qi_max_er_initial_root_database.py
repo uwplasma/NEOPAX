@@ -140,6 +140,45 @@ def build_problem(config: dict, vmec_input, max_mode: int, args: argparse.Namesp
     )
 
 
+def iteration_diagnostics(evaluation) -> str:
+    values = {
+        label: float(np.asarray(jax.device_get(value), dtype=float))
+        for label, value in evaluation.result.objective_values.items()
+    }
+    residuals = np.asarray(jax.device_get(evaluation.residuals), dtype=float)
+    residual_lookup = {
+        label: float(residuals[index])
+        for index, label in enumerate(evaluation.result.residual_labels)
+    }
+
+    def value(*labels: str) -> float:
+        return next((values[label] for label in labels if label in values), np.nan)
+
+    def component_cost(*labels: str) -> float:
+        residual = next(
+            (residual_lookup[label] for label in labels if label in residual_lookup),
+            np.nan,
+        )
+        return 0.5 * residual * residual
+
+    return (
+        f"total_cost={0.5 * float(np.dot(residuals, residuals)):.8e} "
+        f"aspect_ratio={value('geometry:vmec_aspect_ratio', 'vmec_aspect_ratio'):.8e} "
+        f"aspect_cost={component_cost('geometry:vmec_aspect_ratio', 'vmec_aspect_ratio'):.8e} "
+        f"iota_mean={value('geometry:vmec_iota_mean', 'vmec_iota_mean'):.8e} "
+        f"iota_cost={component_cost('geometry:vmec_iota_mean', 'vmec_iota_mean'):.8e} "
+        f"mirror_ratio={value('geometry:vmec_mirror_ratio', 'vmec_mirror_ratio'):.8e} "
+        f"mirror_penalty={value('mirror_penalization'):.8e} "
+        f"mirror_cost={component_cost('mirror_penalization'):.8e} "
+        f"qi={value('geometry:boozer_qi_objective', 'boozer_qi_objective'):.8e} "
+        f"qi_cost={component_cost('geometry:boozer_qi_objective', 'boozer_qi_objective'):.8e} "
+        f"maxJ={value('geometry:boozer_maxj_objective', 'boozer_maxj_objective'):.8e} "
+        f"maxJ_cost={component_cost('geometry:boozer_maxj_objective', 'boozer_maxj_objective'):.8e} "
+        f"softmax_Er={value('transport:softmax_Er', 'softmax_Er'):.8e} "
+        f"Er_cost={component_cost('transport:softmax_Er', 'softmax_Er'):.8e}"
+    )
+
+
 def report(tag: str, problem, x) -> None:
     evaluation = problem.evaluate(x)
     values = {
@@ -282,7 +321,14 @@ def main() -> int:
             initial_problem = problem
             initial_x = x0.copy()
         report("initial", problem, x0)
-        result = opt.least_squares(problem, max_nfev=NFEV, ftol=FTOL, xtol=XTOL, verbose=1)
+        result = opt.least_squares(
+            problem,
+            max_nfev=NFEV,
+            ftol=FTOL,
+            xtol=XTOL,
+            verbose=1,
+            iteration_reporter=iteration_diagnostics,
+        )
         report(f"stage_m{max_mode}", problem, result.x)
         optimized_input = problem.input_from_scaled_parameters(result.x)
         current_input = OUT_DIR / f"input.QI_neopax_database_max_er_stage_m{max_mode}"
