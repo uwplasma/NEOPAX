@@ -746,9 +746,9 @@ class RealtimeGeometrySupportReverseDependencies:
     # dependency bundles leave this unset and call the established replay JIT
     # directly, exactly as before.
     segment_replay_minimal_with_primal_records: Callable[..., object] | None = None
-    # Optional optimization-only database segment backward boundary. Existing
-    # benchmark dependency bundles leave this unset and call the established
-    # database backward JIT directly.
+    # Optional optimization-only entry into the exact database segment body.
+    # Benchmark dependency bundles leave this unset and therefore retain the
+    # established context-keyed outer JIT unchanged.
     database_segment_reduced_cotangent_bwd_with_table_support: (
         Callable[..., object] | None
     ) = None
@@ -4579,7 +4579,7 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
             dependencies.database_segment_reduced_cotangent_bwd_with_table_support
         )
         if optimization_bwd is None:
-            # Exact existing benchmark path.
+            # Exact established benchmark path.
             return _radau_database_segment_reduced_cotangent_bwd_with_table_support_call(
                 execution_context,
                 cotangent_mode,
@@ -8732,11 +8732,11 @@ def internal_realtime_geometry_transport_reverse_table_result_builder(
                 segment_arrays,
                 active_support_payload,
             ):
-                del execution_context  # Fresh static identities must not reach JAX.
+                del execution_context  # Never enter the benchmark outer-JIT key.
                 if optimization_segment_replay_stage is None:
                     raise RuntimeError(
-                        "The persistent database backward stage must be initialized "
-                        "by the segment replay before the reverse segment runs."
+                        "The optimization database-BWD adapter requires the "
+                        "replay stage to be initialized first."
                     )
                 return optimization_segment_replay_stage.database_segment_bwd(
                     initial_flat_state=(
@@ -8957,10 +8957,9 @@ def internal_realtime_geometry_transport_reverse_table_result_builder(
             return 0
         return optimization_segment_replay_stage.cache_size()
 
-    def _optimization_segment_bwd_cache_size() -> int | None:
-        if optimization_segment_replay_stage is None:
-            return 0
-        return optimization_segment_replay_stage.database_bwd_cache_size()
+    def _optimization_segment_bwd_cache_size() -> int:
+        # Optimization deliberately has no context-keyed outer BWD JIT.
+        return 0
 
     setattr(
         _builder,

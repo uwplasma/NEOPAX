@@ -671,6 +671,8 @@ def test_database_full_transport_replay_stage_keeps_support_dynamic_and_cache_st
 ):
     """The optimization replay compiles once while current support stays live."""
 
+    body_calls = []
+
     def database_bwd_body(
         execution_context,
         _cotangent_mode,
@@ -680,6 +682,7 @@ def test_database_full_transport_replay_stage_keeps_support_dynamic_and_cache_st
         _segment_arrays,
         support,
     ):
+        body_calls.append(execution_context)
         physics = execution_context.physics_context
         assert physics.reverse_direct_stage_adjoint is True
         assert physics.reverse_stage_adjoint_solve_mode == "block"
@@ -695,8 +698,8 @@ def test_database_full_transport_replay_stage_keeps_support_dynamic_and_cache_st
         )
         return segment_reduced_bars, support_bars
 
-    def database_bwd_call(*_args, **_kwargs):  # pragma: no cover - wrapper is bypassed
-        raise AssertionError("The persistent stage must use the benchmark JIT body.")
+    def database_bwd_call(*_args, **_kwargs):
+        raise AssertionError("Optimization must not enter the benchmark outer BWD JIT.")
 
     database_bwd_call.__wrapped__ = database_bwd_body
     monkeypatch.setattr(
@@ -863,7 +866,7 @@ def test_database_full_transport_replay_stage_keeps_support_dynamic_and_cache_st
         segment_arrays=segment_arrays,
     )
     jax.block_until_ready((bwd0, bwd1))
-    assert stage.database_bwd_cache_size() == 1
+    assert len(body_calls) == 2
     assert not jnp.allclose(
         jax.tree_util.tree_leaves(bwd0[1])[-1],
         jax.tree_util.tree_leaves(bwd1[1])[-1],

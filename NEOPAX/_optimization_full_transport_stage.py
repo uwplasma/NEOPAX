@@ -1,11 +1,12 @@
-"""Optimization-only persistent boundaries for full-transport replay.
+"""Optimization-only boundaries for full-transport replay and segment reverse.
 
 The benchmark reverse lane constructs a fresh Radau execution context for
 each geometry.  Its segment replay call deliberately treats that context as
 static, which is appropriate for a one-shot benchmark but creates one JAX
-cache entry per optimizer evaluation.  This module keeps the benchmark call
-unchanged and provides the optimization lane with one compiled replay whose
-geometry/database arrays are explicit dynamic inputs.
+cache entry per optimizer evaluation.  This module keeps the benchmark calls
+unchanged, provides one persistent primal replay with explicit dynamic
+geometry/database arrays, and invokes the exact database segment-backward
+body without its context-keyed outer JIT in optimization mode.
 """
 
 from __future__ import annotations
@@ -146,7 +147,8 @@ class DatabaseFullTransportReplayOptimizationStage:
     species: Any
     equation_system_template: Any
     compiled_replay: Any
-    compiled_database_bwd: Any
+    active_execution_context_builder: Any
+    database_bwd_body: Any
     support_floating_signature: Any
     initial_state_signature: Any
     segment_carry_signature: Any
@@ -187,6 +189,15 @@ class DatabaseFullTransportReplayOptimizationStage:
             segment_arrays,
         )
 
+    def cache_size(self) -> int | None:
+        cache_size = getattr(self.compiled_replay, "_cache_size", None)
+        if not callable(cache_size):
+            return None
+        try:
+            return int(cache_size())
+        except Exception:
+            return None
+
     def database_segment_bwd(
         self,
         *,
@@ -198,7 +209,14 @@ class DatabaseFullTransportReplayOptimizationStage:
         step_primal_records,
         segment_arrays,
     ):
-        """Run the benchmark database segment body through one stable JIT."""
+        """Run the exact benchmark body without its static-context outer JIT.
+
+        The benchmark wrapper treats ``execution_context`` as static, which is
+        correct for its one-shot use but creates one executable per trial
+        geometry in an optimizer.  The optimization stage rebuilds the current
+        context on the host and enters the unchanged wrapped body directly.
+        Existing inner Radau/database call boundaries remain in force.
+        """
 
         self.support_layout.validate_static_structure(support_payload)
         support_floating_leaves = self.support_layout.floating_leaves(support_payload)
@@ -216,33 +234,21 @@ class DatabaseFullTransportReplayOptimizationStage:
                 "Full-transport optimization segment schedule changed shape or "
                 "dtype within a stage."
             )
-        return self.compiled_database_bwd(
-            initial_flat_state,
-            support_floating_leaves,
+        active_execution_context, active_support = (
+            self.active_execution_context_builder(
+                initial_flat_state,
+                support_floating_leaves,
+            )
+        )
+        return self.database_bwd_body(
+            active_execution_context,
             str(cotangent_mode),
             segment_reduced_bars,
             step_start_carries,
             step_primal_records,
             segment_arrays,
+            active_support,
         )
-
-    def cache_size(self) -> int | None:
-        cache_size = getattr(self.compiled_replay, "_cache_size", None)
-        if not callable(cache_size):
-            return None
-        try:
-            return int(cache_size())
-        except Exception:
-            return None
-
-    def database_bwd_cache_size(self) -> int | None:
-        cache_size = getattr(self.compiled_database_bwd, "_cache_size", None)
-        if not callable(cache_size):
-            return None
-        try:
-            return int(cache_size())
-        except Exception:
-            return None
 
 
 def build_database_full_transport_replay_optimization_stage(
@@ -283,7 +289,6 @@ def build_database_full_transport_replay_optimization_stage(
         raise RuntimeError(
             "The established Radau database segment backward body is unavailable."
         )
-
     support_layout = FloatingPayloadLeafLayout.from_template(support_payload)
     support_floating_leaves = support_layout.floating_leaves(support_payload)
     solver = reverse_setup.solver
@@ -393,38 +398,7 @@ def build_database_full_transport_replay_optimization_stage(
             active_segment_arrays,
         )
 
-    def _database_bwd_kernel(
-        active_initial_flat_state,
-        support_floating_leaves,
-        cotangent_mode,
-        segment_reduced_bars,
-        step_start_carries,
-        step_primal_records,
-        active_segment_arrays,
-    ):
-        active_execution_context, active_support = _active_execution_context(
-            active_initial_flat_state,
-            support_floating_leaves,
-        )
-        # This is the exact body beneath the benchmark database backward JIT.
-        # The optimization JIT owns the stable static context; all geometry,
-        # database, carry, record, and schedule values remain dynamic inputs.
-        return database_bwd_body(
-            active_execution_context,
-            cotangent_mode,
-            segment_reduced_bars,
-            step_start_carries,
-            step_primal_records,
-            active_segment_arrays,
-            active_support,
-        )
-
     compiled_replay = jax.jit(_replay_kernel, inline=False)
-    compiled_database_bwd = jax.jit(
-        _database_bwd_kernel,
-        static_argnums=(2,),
-        inline=False,
-    )
     return DatabaseFullTransportReplayOptimizationStage(
         support_layout=support_layout,
         initial_state_unpack=initial_state_unpack,
@@ -432,7 +406,8 @@ def build_database_full_transport_replay_optimization_stage(
         species=species,
         equation_system_template=equation_system_template,
         compiled_replay=compiled_replay,
-        compiled_database_bwd=compiled_database_bwd,
+        active_execution_context_builder=_active_execution_context,
+        database_bwd_body=database_bwd_body,
         support_floating_signature=_tree_signature(support_floating_leaves),
         initial_state_signature=_tree_signature(initial_flat_state),
         segment_carry_signature=_tree_signature(segment_start_carry),

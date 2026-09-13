@@ -29,19 +29,6 @@ from NEOPAX import _transport_solvers as transport_solvers  # noqa: E402
 import test_geometry_qi_max_er_transition_bootstrap_initial_root_database_full_transport_parity as parity  # noqa: E402
 
 
-# This is the exact selector bundle used by the earlier ~300 MiB/evaluation
-# run, before the database-backward boundary and optimized pullback selectors
-# were introduced together.  Applying it while retaining the current
-# optimization stage isolates the database-backward change from the pullbacks.
-PRE_UPDATE_PULLBACK_OPTIONS = {
-    "reverse_database_initial_support_mode": "split",
-    "reverse_database_initial_state_mode": "generic",
-    "reverse_database_root_interpolation_transpose_mode": "established",
-    "reverse_database_bootstrap_interpolation_transpose_mode": "established",
-    "reverse_final_objective_cotangent_mode": "grouped_vjp",
-}
-
-
 def live_jax_array_count() -> int | None:
     live_arrays = getattr(jax, "live_arrays", None)
     if live_arrays is None:
@@ -122,22 +109,11 @@ def main() -> int:
         action="store_true",
         help="Print segment-local JAX trace-cache sizes and existing progress output.",
     )
-    parser.add_argument(
-        "--pullback-profile",
-        choices=("pre_update", "current"),
-        default="pre_update",
-        help=(
-            "Use the earlier pullback selectors with the current database-BWD "
-            "boundary (default), or the current optimized selector bundle."
-        ),
-    )
     args = parser.parse_args()
     if args.warmup < 0 or args.repeats < 1:
         raise ValueError("--warmup must be non-negative and --repeats must be positive.")
 
     problem = parity.build_problem(reverse_stage_mode=parity.TRIAL_STAGE_MODE)
-    if args.pullback_profile == "pre_update":
-        problem.options.update(PRE_UPDATE_PULLBACK_OPTIONS)
     phase_context = {
         "evaluation": "setup",
         "previous_rss": None,
@@ -215,8 +191,8 @@ def main() -> int:
         f"segments={parity.ACCEPTED_STEP_LIMIT // parity.REVERSE_SEGMENT_LENGTH} "
         "initial_er_root=jax_selected_root "
         f"stage={parity.TRIAL_STAGE_MODE} "
-        f"pullback_profile={args.pullback_profile} "
-        "database_bwd_boundary=optimization_persistent "
+        "pullback_profile=current_optimized "
+        "database_bwd_boundary=optimization_exact_unwrapped_outer_jit "
         f"warmup={args.warmup} repeats={args.repeats} "
         f"parameter_count={problem.parameter_count}",
         flush=True,
@@ -237,8 +213,8 @@ def main() -> int:
         print(
             "[database full-transport memory] "
             f"warmup={warmup_index} elapsed_s={time.perf_counter() - started:.3f} "
-            "stage_cache=(database_bwd,benchmark_replay,generic_bwd,"
-            "optimization_replay,optimization_bwd,global_dispatch)="
+            "stage_cache=(benchmark_database_bwd,benchmark_replay,generic_bwd,"
+            "optimization_replay,optimization_outer_bwd,global_dispatch)="
             f"{cache_before}->{cache_after}",
             flush=True,
         )
@@ -284,8 +260,8 @@ def main() -> int:
             "[database full-transport memory] "
             f"trial={trial_index} elapsed_s={time.perf_counter() - started:.3f} "
             f"rss_delta={rss_text} live_jax_arrays={arrays_text} "
-            "stage_cache=(database_bwd,benchmark_replay,generic_bwd,"
-            "optimization_replay,optimization_bwd,global_dispatch)="
+            "stage_cache=(benchmark_database_bwd,benchmark_replay,generic_bwd,"
+            "optimization_replay,optimization_outer_bwd,global_dispatch)="
             f"{cache_before}->{cache_after} "
             f"residual_repeat_max_abs={residual_repeat_delta:.3e} "
             f"jacobian_repeat_max_abs={jacobian_repeat_delta:.3e}",
