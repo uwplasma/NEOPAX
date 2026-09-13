@@ -5845,14 +5845,15 @@ def main() -> None:
     parser.add_argument(
         "--reverse-final-objective-cotangent-mode",
         choices=("scalar", "grouped_vjp", "grouped_joint_vjp"),
-        default="scalar",
+        default="grouped_vjp",
         help=(
             "Terminal objective-cotangent construction for the segmented realtime "
-            "geometry reverse path. 'scalar' preserves the per-objective VJPs. "
-            "'grouped_vjp' groups all non-bootstrap objectives into one final-state "
+            "geometry reverse path. 'grouped_vjp' (the default) groups all "
+            "non-bootstrap objectives into one final-state "
             "VJP and one explicit-geometry VJP; 'grouped_joint_vjp' is an opt-in "
             "database mode that obtains those exact two partials from one shared "
-            "objective trace. Bootstrap keeps its compact rule."
+            "objective trace. 'scalar' retains the per-objective reference route. "
+            "Bootstrap keeps its compact rule."
         ),
     )
     parser.add_argument(
@@ -5896,13 +5897,14 @@ def main() -> None:
     parser.add_argument(
         "--reverse-database-interpolation-transpose-mode",
         choices=("established", "legacy_sparse"),
-        default="established",
+        default="legacy_sparse",
         help=(
             "Legacy Monoenergetic database interpolation transpose used only "
             "by the full-transport fixed-database support boundary. "
-            "'established' preserves the current generic VJP. "
-            "'legacy_sparse' uses the exact compact stencil/table/coordinate "
-            "transpose. Initial-Er root and Lij paths are unchanged."
+            "'legacy_sparse' (the default) uses the validated exact compact "
+            "stencil/table/coordinate transpose. 'established' retains the "
+            "generic-VJP reference route. Initial-Er root and Lij paths are "
+            "unchanged."
         ),
     )
     parser.add_argument(
@@ -6756,7 +6758,7 @@ def main() -> None:
         or args.reverse_database_stage_jacobian_mode != "independent"
         or args.reverse_database_support_objective_mode != "scalar"
         or args.reverse_database_segment_support_mode != "inline"
-        or args.reverse_database_interpolation_transpose_mode != "established"
+        or args.reverse_database_interpolation_transpose_mode != "legacy_sparse"
     )
     if database_performance_override and (
         not is_database_geometry_reverse
@@ -6822,6 +6824,9 @@ def main() -> None:
         )
     if (
         args.reverse_database_interpolation_transpose_mode == "legacy_sparse"
+        and is_database_geometry_reverse
+        and args.full_transport_shared_payload_smoke
+        and not args.initial_er_root_only_optimization_smoke
         and args.reverse_rhs_transpose_mode != "explicit_database"
     ):
         raise SystemExit(

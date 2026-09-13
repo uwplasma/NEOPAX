@@ -71,6 +71,37 @@ def _performance_args(**overrides):
     return args
 
 
+def test_validated_full_transport_reverse_modes_are_cli_defaults():
+    """The measured sparse/grouped modes require no command-line overrides."""
+
+    main = _function(
+        _ROOT / "examples/benchmarks/benchmark_transport_reverse_ad_only.py", "main"
+    )
+    selected_flags = {
+        "--reverse-database-interpolation-transpose-mode",
+        "--reverse-final-objective-cotangent-mode",
+    }
+    declarations = [
+        node
+        for node in main.body
+        if isinstance(node, ast.Expr)
+        and isinstance(node.value, ast.Call)
+        and isinstance(node.value.func, ast.Attribute)
+        and node.value.func.attr == "add_argument"
+        and node.value.args
+        and isinstance(node.value.args[0], ast.Constant)
+        and node.value.args[0].value in selected_flags
+    ]
+    parser = argparse.ArgumentParser()
+    exec(
+        compile(ast.Module(body=declarations, type_ignores=[]), "<parser>", "exec"),
+        {"parser": parser},
+    )
+    args = parser.parse_args([])
+    assert args.reverse_database_interpolation_transpose_mode == "legacy_sparse"
+    assert args.reverse_final_objective_cotangent_mode == "grouped_vjp"
+
+
 def _check_performance_args(args, is_database=True):
     main = _function(
         _ROOT / "examples/benchmarks/benchmark_transport_reverse_ad_only.py", "main"
@@ -100,7 +131,7 @@ def test_database_performance_cli_defaults_preserve_root_and_lij_lanes():
     assert args.reverse_database_initial_support_mode == "split"
     assert args.reverse_database_support_preparation_mode == "shared"
     assert args.reverse_database_center_geometry_mode == "scalar_jvp"
-    assert args.reverse_database_interpolation_transpose_mode == "established"
+    assert args.reverse_database_interpolation_transpose_mode == "legacy_sparse"
     _check_performance_args(args, is_database=False)
 
 
