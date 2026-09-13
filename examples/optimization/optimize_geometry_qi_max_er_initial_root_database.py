@@ -23,6 +23,9 @@ ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+import vmex as vj  # noqa: E402
+from vmex import optimize as vmex_opt  # noqa: E402
+
 from NEOPAX import optimization as opt  # noqa: E402
 from NEOPAX._orchestrator import load_config  # noqa: E402
 
@@ -72,6 +75,13 @@ FTOL = 1.0e-6
 XTOL = 1.0e-10
 SOLVER_DEVICE = "default"
 REVERSE_STAGE_MODE = "database_root_fresh_payload_experiment"
+
+MAKE_WOUT_PLOTS = True
+MAKE_J_POLAR_PLOTS = True
+MAKE_B_AXIS_PLOTS = True
+MAKE_BOOZER_B_CONTOUR_PLOTS = True
+MAKE_INITIAL_PLOTS = True
+GEOMETRY_ARTIFACT_STEM = "QI_neopax_database_max_er"
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -186,7 +196,11 @@ def report(tag: str, problem, x) -> None:
         for label, value in evaluation.result.objective_values.items()
     }
     residuals = np.asarray(jax.device_get(evaluation.residuals), dtype=float)
-    print(f"[{tag}] elapsed_s={evaluation.elapsed_s:.3f} residual_norm={np.linalg.norm(residuals):.6e}")
+    print(
+        f"[{tag}] elapsed_s={evaluation.elapsed_s:.3f} "
+        f"residual_norm={np.linalg.norm(residuals):.6e} "
+        f"{iteration_diagnostics(evaluation)}"
+    )
     for label, value in values.items():
         print(f"  - {label}: {value:.10e}")
 
@@ -297,6 +311,184 @@ def save_transport_profiles(problem, x, out_dir: Path, label: str) -> None:
     save_bootstrap_current_profile(problem, x, out_dir, label, profiles=profiles)
 
 
+def plot_j_polar_contours(eq, out_dir: Path, *, lambda_samples=(0.1, 0.3, 0.5, 0.7, 0.9)) -> None:
+    """Write polar contours of the second adiabatic invariant and its QI target."""
+
+    try:
+        import matplotlib.pyplot as plt
+        from vmex.core.omnigenity_j import JInvariantQIResidual
+    except Exception as exc:
+        print(f"skipping J-polar plots: {exc}")
+        return
+
+    objective = JInvariantQIResidual(SURFACES, mboz=QI_MBOZ, nboz=QI_NBOZ)
+    try:
+        output = objective.compute_state(eq.state, eq.runtime)
+    except Exception as exc:
+        print(f"skipping J-polar plots: {exc}")
+        return
+
+    alpha = np.asarray(output["alpha"], dtype=float)
+    surfaces = np.asarray(output["surfaces"], dtype=float)
+    ji = np.asarray(output["ji"], dtype=float)
+    jc = np.asarray(output["jc"], dtype=float)
+    lambda_grid = np.power(
+        np.arange(objective.n_bounce, dtype=float) / max(objective.n_bounce - 1, 1),
+        objective.p_lambda,
+    )
+    theta = np.concatenate([alpha, alpha[:1] + 2.0 * np.pi])
+    theta_grid, radius_grid = np.meshgrid(theta, surfaces, indexing="xy")
+    sample_indices = sorted(
+        {
+            int(np.clip(round(value * (objective.n_bounce - 1)), 0, objective.n_bounce - 1))
+            for value in lambda_samples
+        }
+    )
+
+    for name, data in (("ji", ji), ("jc", jc)):
+        for index in sample_indices:
+            values = np.concatenate([data[:, :, index], data[:, :1, index]], axis=1)
+            display_name = r"$\mathcal{J}$" if name == "ji" else r"$J_C$"
+            fig = plt.figure(figsize=(5.4, 5.8))
+            axis = fig.add_subplot(1, 1, 1, projection="polar")
+            contour = axis.contourf(theta_grid, radius_grid, values, levels=40, cmap="plasma")
+            axis.set_title(f"Second adiabatic invariant, {display_name}", fontsize=15, pad=20)
+            axis.set_ylim(0.0, float(surfaces.max()))
+            axis.set_thetagrids(np.arange(0, 360, 45), fontsize=8)
+            radial_ticks = np.linspace(0.2, float(surfaces.max()), 5)
+            axis.set_rticks(radial_ticks)
+            axis.set_yticklabels([f"{tick:.1f}" for tick in radial_ticks], fontsize=8)
+            axis.set_rlabel_position(45)
+            axis.grid(color="white", linewidth=0.8, alpha=0.45)
+            colorbar = fig.colorbar(contour, ax=axis, pad=0.12, shrink=0.78)
+            colorbar.set_label(display_name, fontsize=11)
+            colorbar.ax.tick_params(labelsize=8)
+            fig.text(0.5, 0.035, rf"$\lambda$ = {lambda_grid[index]:.2f}", ha="center", fontsize=15)
+            fig.tight_layout(rect=(0.0, 0.06, 1.0, 1.0))
+            path = out_dir / f"{name}_polar_lambda_{index:02d}.png"
+            fig.savefig(path, dpi=320, bbox_inches="tight")
+            plt.close(fig)
+            print(f"wrote {path}")
+
+
+def plot_b_profiles(wout, out_dir: Path, label: str, *, nphi=256) -> None:
+    """Write |B| profiles on the magnetic axis and first flux surface."""
+
+    try:
+        import matplotlib.pyplot as plt
+        from vmex.core.plotting import surface_modB
+    except Exception as exc:
+        print(f"skipping |B| profile plots: {exc}")
+        return
+
+    phi = np.linspace(0.0, 2.0 * np.pi / int(wout.nfp), int(nphi))
+    theta = np.asarray([0.0], dtype=float)
+    ns = int(getattr(wout, "ns", 2))
+    profiles = (
+        ("axis", 0, "|B| on axis"),
+        ("first_flux_surface", 1 if ns > 1 else 0, "|B| at first flux surface, theta=0"),
+    )
+    for surface_label, surface_index, ylabel in profiles:
+        values = np.asarray(
+            surface_modB(wout, s_index=surface_index, theta=theta, phi=phi), dtype=float
+        ).reshape(-1)
+        csv_path = out_dir / f"B_{surface_label}_{label}.csv"
+        np.savetxt(
+            csv_path,
+            np.column_stack([phi, values]),
+            delimiter=",",
+            header=f"phi,B_{surface_label}",
+            comments="",
+        )
+        print(f"wrote {csv_path}")
+        fig, axis = plt.subplots(figsize=(7, 4))
+        axis.plot(phi, values, linewidth=1.6)
+        axis.set_xlabel("phi")
+        axis.set_ylabel(ylabel)
+        axis.set_title(f"{ylabel} ({label})")
+        axis.grid(True, alpha=0.3)
+        fig.tight_layout()
+        png_path = out_dir / f"B_{surface_label}_{label}.png"
+        fig.savefig(png_path, dpi=180, bbox_inches="tight")
+        plt.close(fig)
+        print(f"wrote {png_path}")
+
+
+def plot_boozer_b_contours(wout, out_dir: Path, label: str, *, ntheta=128, nphi=128) -> None:
+    """Write one-field-period |B| contour plots and their numeric data."""
+
+    try:
+        import matplotlib.pyplot as plt
+        from vmex.core.plotting import surface_modB
+    except Exception as exc:
+        print(f"skipping Boozer |B| contour plots: {exc}")
+        return
+
+    theta = np.linspace(0.0, 2.0 * np.pi, int(ntheta))
+    phi = np.linspace(0.0, 2.0 * np.pi / int(wout.nfp), int(nphi))
+    ns = int(getattr(wout, "ns", 2))
+    for surface_label, surface_index in (("axis", 0), ("first_flux_surface", 1 if ns > 1 else 0)):
+        values = np.asarray(
+            surface_modB(wout, s_index=surface_index, theta=theta, phi=phi), dtype=float
+        )
+        theta_grid, phi_grid = np.meshgrid(theta, phi, indexing="ij")
+        csv_path = out_dir / f"B_boozer_contour_{surface_label}_{label}.csv"
+        np.savetxt(
+            csv_path,
+            np.column_stack([theta_grid.ravel(), phi_grid.ravel(), values.ravel()]),
+            delimiter=",",
+            header="theta,phi,B",
+            comments="",
+        )
+        print(f"wrote {csv_path}")
+        finite = values[np.isfinite(values)]
+        if finite.size and float(finite.max()) > float(finite.min()):
+            levels = np.linspace(float(finite.min()), float(finite.max()), 28)
+        elif finite.size:
+            padding = max(abs(float(finite.min())), 1.0) * 1.0e-8
+            levels = np.linspace(float(finite.min()) - padding, float(finite.max()) + padding, 28)
+        else:
+            levels = 28
+        fig, axis = plt.subplots(figsize=(6.4, 4.8))
+        contour = axis.contour(phi, theta, values, levels=levels, cmap="viridis", linewidths=1.0)
+        colorbar = fig.colorbar(contour, ax=axis, pad=0.05)
+        colorbar.set_label(r"$|B|$ [T]", fontsize=11)
+        axis.set_xlabel(r"toroidal angle $\phi$", fontsize=11)
+        axis.set_ylabel(r"poloidal angle $\theta$", fontsize=11)
+        axis.set_title(f"|B| on {surface_label.replace('_', ' ')} (one field period)", fontsize=12)
+        fig.tight_layout()
+        png_path = out_dir / f"B_boozer_contour_{surface_label}_{label}.png"
+        fig.savefig(png_path, dpi=320, bbox_inches="tight")
+        plt.close(fig)
+        print(f"wrote {png_path}")
+
+
+def write_geometry_artifacts(input_obj, label: str) -> Path:
+    """Solve once and write the standard VMEX, J, and |B| diagnostics."""
+
+    artifact_dir = OUT_DIR / label
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    input_path = artifact_dir / f"input.{GEOMETRY_ARTIFACT_STEM}_{label}"
+    input_obj.to_indata(input_path)
+    print(f"wrote {input_path}")
+    equilibrium = vmex_opt.solve_equilibrium(input_obj)
+    wout_path = vj.write_wout(
+        artifact_dir / f"wout_{GEOMETRY_ARTIFACT_STEM}_{label}.nc",
+        equilibrium.wout,
+    )
+    print(f"wrote {wout_path}")
+    if MAKE_WOUT_PLOTS:
+        for _, path in vj.plot_wout(wout_path, artifact_dir).items():
+            print(f"wrote {path}")
+    if MAKE_B_AXIS_PLOTS:
+        plot_b_profiles(equilibrium.wout, artifact_dir, label)
+    if MAKE_BOOZER_B_CONTOUR_PLOTS:
+        plot_boozer_b_contours(equilibrium.wout, artifact_dir, label)
+    if MAKE_J_POLAR_PLOTS:
+        plot_j_polar_contours(equilibrium, artifact_dir)
+    return artifact_dir
+
+
 def main() -> int:
     args = _parser().parse_args()
     if min(args.database_n_theta, args.database_n_phi, args.database_n_xi) < 1:
@@ -356,12 +548,15 @@ def main() -> int:
         OUT_DIR / "initial",
         "initial",
     )
+    if MAKE_INITIAL_PLOTS:
+        write_geometry_artifacts(initial_input, "initial")
     save_transport_profiles(
         final_problem,
         np.asarray(final_result.x, dtype=float),
         OUT_DIR / "optimized",
         "optimized",
     )
+    write_geometry_artifacts(optimized_input, "optimized")
     summary = {
         "seed_input": str(SEED_INPUT), "database_transport_config": str(DATABASE_TRANSPORT_CONFIG),
         "database_resolution_theta_phi_xi": [args.database_n_theta, args.database_n_phi, args.database_n_xi],
