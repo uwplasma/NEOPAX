@@ -2567,19 +2567,25 @@ def test_database_local_bootstrap_state_pullback_matches_full_upar_jvp(
         "Q": jnp.asarray([[-0.11, 0.04], [0.07, -0.16], [0.09, 0.02], [-0.05, 0.12]]),
         "Upar": jnp.asarray([[0.06, 0.14], [-0.19, 0.08], [0.04, -0.07], [0.11, -0.03]]),
     }
-    # Production database geometry replacement moves both the physical mesh
-    # and the table coordinates derived from a_b.  Use that same map for the
-    # generic oracle; varying only ``model.geometry`` is off-manifold.
+    # The runtime-scan contract splits this transpose into two siblings: this
+    # direct-flux geometry boundary moves only the physical mesh, while the
+    # support boundary owns the Monoenergetic table/query-coordinate bars.
+    # Legacy preprocessed databases retain their established local scale map.
     geometry_delta0 = jax.tree_util.tree_map(jnp.zeros_like, geometry)
 
     def _direct_fluxes_from_geometry_delta(geometry_delta):
         geometry_value = _database_geometry_with_constrained_axis_face(
             geometry, geometry_delta
         )
+        database_value = database
+        if not isinstance(database, Monoenergetic):
+            database_value = database_with_geometry_scale(
+                database, geometry_value.a_b
+            )
         return dataclasses.replace(
             model,
             geometry=geometry_value,
-            database=database_with_geometry_scale(database, geometry_value.a_b),
+            database=database_value,
         )(state)
 
     direct_flux_geometry_tangent = jax.jvp(
