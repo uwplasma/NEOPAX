@@ -50,7 +50,6 @@ from ._reverse_ad_optimization import (
     evaluate_geometry_initial_er_root_only_least_squares_benchmark_tables,
     evaluate_geometry_initial_er_root_only_least_squares_optimization,
     build_database_initial_root_experiment_stage,
-    database_full_transport_optimization_table_result_builder,
     build_initial_er_transport_reverse_stage,
     _optimization_root_to_payload_cotangents,
     _optimization_payload_to_vmec_table,
@@ -2144,7 +2143,12 @@ def geometry_full_transport_least_squares_problem(
     max_reverse_accepted_steps: int | None = None,
     reverse_stage_mode: str = "benchmark",
 ) -> GeometryFullTransportLeastSquaresProblem:
-    """Build a geometry-only optimizer problem for full Radau transport objectives."""
+    """Build a geometry-only optimizer problem for full Radau transport objectives.
+
+    This API is the opt-in full-transport continuation.  Initial-Er/root-only
+    problems use :func:`geometry_initial_er_root_only_least_squares_problem`
+    and never construct this transport reverse table.
+    """
 
     config_eff = _prepare_full_transport_config(config, device=device)
     config_eff.setdefault("transport_solver", {})["radau_jacobian_reuse_mode"] = str(
@@ -2231,17 +2235,22 @@ def geometry_full_transport_least_squares_problem(
     if geometry_solver_device is None:
         geometry_solver_device = geom_cfg.get("vmec_implicit_solver_device", "default")
     stage_mode = str(reverse_stage_mode).strip().lower()
-    if stage_mode not in {"benchmark", "database_root_fresh_payload_experiment"}:
+    database_full_transport_modes = {
+        "database_full_transport_optimization",
+        # Compatibility name used by the first full-transport parity harness.
+        "database_root_fresh_payload_experiment",
+    }
+    if stage_mode not in {"benchmark", *database_full_transport_modes}:
         raise ValueError(
             "reverse_stage_mode must be 'benchmark' or "
-            "'database_root_fresh_payload_experiment'."
+            "'database_full_transport_optimization'."
         )
     if (
-        stage_mode == "database_root_fresh_payload_experiment"
+        stage_mode in database_full_transport_modes
         and str(neoclassical_cfg.get("flux_model", "")).strip().lower()
         != "ntx_scan_runtime"
     ):
-        raise ValueError("The database root bridge requires ntx_scan_runtime.")
+        raise ValueError("The database full-transport mode requires ntx_scan_runtime.")
     options = {
         "quiet": True,
         "accepted_step_limit": None if accepted_step_limit is None else int(accepted_step_limit),
@@ -2283,12 +2292,15 @@ def geometry_full_transport_least_squares_problem(
                 "reverse_initial_cache_support_pullback_mode": "scalar",
                 "reverse_rebuild_support_pullback_mode": "separate",
                 "reverse_database_initial_support_mode": "split",
+                "reverse_database_initial_state_mode": "generic",
                 "reverse_database_support_preparation_mode": "shared",
                 "reverse_database_center_geometry_mode": "scalar_jvp",
                 "reverse_database_stage_jacobian_mode": "independent",
                 "reverse_database_support_objective_mode": "scalar",
                 "reverse_database_segment_support_mode": "inline",
                 "reverse_database_interpolation_transpose_mode": "legacy_sparse",
+                "reverse_database_root_interpolation_transpose_mode": "established",
+                "reverse_database_bootstrap_interpolation_transpose_mode": "established",
                 "reverse_final_objective_cotangent_mode": "grouped_vjp",
                 "reverse_bootstrap_cotangent_mode": "joint_local_vjp_upar_only",
                 "reverse_schedule_artifact_mode": "reuse_static_probe",
@@ -2299,83 +2311,92 @@ def geometry_full_transport_least_squares_problem(
     baseline_geometry_deltas = jnp.zeros(
         (len(parameterization.specs),), dtype=jnp.float64
     )
-    if stage_mode == "benchmark":
-        table_result_builder = internal_realtime_geometry_transport_reverse_table_result_builder(
-            table_context=table_context,
-            geometry_context=context,
-            baseline_geometry_deltas=baseline_geometry_deltas,
-            combined_geometry_payload=True,
-            n_r=n_r_eff,
-            n_theta=n_theta_eff,
-            n_zeta=n_zeta_eff,
-            n_xi=n_xi_eff,
-            surface_backend=surface_backend_eff,
-            max_iter=geometry_max_iter,
-            solver_device=str(geometry_solver_device),
-            accepted_step_limit=accepted_step_limit,
-            reverse_segment_length=reverse_segment_length,
-            initial_er_root_ad=str(initial_er_root_ad),
-            reverse_stage_adjoint_solve_mode=str(reverse_stage_adjoint_solve_mode),
-            reverse_rhs_transpose_mode=str(reverse_rhs_transpose_mode),
-            reverse_stage_cotangent_mode=str(reverse_stage_cotangent_mode),
-            reverse_step_bwd_mode=str(reverse_step_bwd_mode),
-            reverse_stage_adjoint_memory_mode=str(reverse_stage_adjoint_memory_mode),
-            reverse_stage_adjoint_iter_maxiter=int(reverse_stage_adjoint_iter_maxiter),
-            reverse_stage_adjoint_iter_tol=float(reverse_stage_adjoint_iter_tol),
-            reverse_stage_adjoint_woodbury_rank=int(reverse_stage_adjoint_woodbury_rank),
-            max_reverse_accepted_steps=(
-                None
-                if max_reverse_accepted_steps is None
-                else int(max_reverse_accepted_steps)
-            ),
-            progress_label="[optimization] full transport geometry payload pullback:",
-        )
-    else:
-        def _pre_root_state(profile_values):
-            return initial_state_for_parameter_vector(
-                profile_values,
-                config=config_eff,
-                initial_er_root_ad="off",
-                baseline_state=baseline_state,
-                profile_cfg=profile_cfg,
-                runtime=runtime,
-            )
-
-        root_stage = build_database_initial_root_experiment_stage(
-            runtime=runtime,
-            config=config_eff,
-            objective_names=TRANSPORT_REVERSE_OBJECTIVE_LABELS,
-            parameter_set=parameter_set,
-            pre_root_state_from_profile_values=_pre_root_state,
-            options=options,
-            jit_selected_root=False,
-            use_fresh_database_payload=True,
-        )
-        table_result_builder = database_full_transport_optimization_table_result_builder(
-            table_context=table_context,
-            geometry_context=context,
-            baseline_geometry_deltas=baseline_geometry_deltas,
-            database_root_stage=root_stage,
-            n_r=n_r_eff,
-            n_theta=n_theta_eff,
-            n_zeta=n_zeta_eff,
-            n_xi=n_xi_eff,
-            surface_backend=surface_backend_eff,
-            max_iter=geometry_max_iter,
-            solver_device=str(geometry_solver_device),
-            accepted_step_limit=accepted_step_limit,
-            reverse_segment_length=reverse_segment_length,
-            reverse_stage_adjoint_solve_mode=str(reverse_stage_adjoint_solve_mode),
-            reverse_rhs_transpose_mode=str(reverse_rhs_transpose_mode),
-            reverse_stage_cotangent_mode=str(reverse_stage_cotangent_mode),
-            reverse_step_bwd_mode=str(reverse_step_bwd_mode),
-            reverse_stage_adjoint_memory_mode=str(reverse_stage_adjoint_memory_mode),
-            reverse_stage_adjoint_iter_maxiter=int(reverse_stage_adjoint_iter_maxiter),
-            reverse_stage_adjoint_iter_tol=float(reverse_stage_adjoint_iter_tol),
-            reverse_stage_adjoint_woodbury_rank=int(reverse_stage_adjoint_woodbury_rank),
-            max_reverse_accepted_steps=max_reverse_accepted_steps,
-            progress_label="[optimization] database root + benchmark transport:",
-        )
+    # Both modes call the unchanged benchmark full-transport composition.
+    # The experiment mode is an optimization-only selector for subsequent
+    # boundary trials; it must not replace the integrated selected-root path
+    # with a second transport sweep or a manually assembled root derivative.
+    table_result_builder = internal_realtime_geometry_transport_reverse_table_result_builder(
+        table_context=table_context,
+        geometry_context=context,
+        baseline_geometry_deltas=baseline_geometry_deltas,
+        combined_geometry_payload=True,
+        n_r=n_r_eff,
+        n_theta=n_theta_eff,
+        n_zeta=n_zeta_eff,
+        n_xi=n_xi_eff,
+        surface_backend=surface_backend_eff,
+        max_iter=geometry_max_iter,
+        solver_device=str(geometry_solver_device),
+        accepted_step_limit=accepted_step_limit,
+        reverse_segment_length=reverse_segment_length,
+        initial_er_root_ad=str(initial_er_root_ad),
+        reverse_stage_adjoint_solve_mode=str(reverse_stage_adjoint_solve_mode),
+        reverse_rhs_transpose_mode=str(reverse_rhs_transpose_mode),
+        reverse_rhs_pullback_mode=str(options.get("reverse_rhs_pullback_mode", "separate")),
+        reverse_initial_cache_support_pullback_mode=str(
+            options.get("reverse_initial_cache_support_pullback_mode", "scalar")
+        ),
+        reverse_rebuild_support_pullback_mode=str(
+            options.get("reverse_rebuild_support_pullback_mode", "separate")
+        ),
+        reverse_database_initial_support_mode=str(
+            options.get("reverse_database_initial_support_mode", "split")
+        ),
+        reverse_database_initial_state_mode=str(
+            options.get("reverse_database_initial_state_mode", "generic")
+        ),
+        reverse_database_support_preparation_mode=str(
+            options.get("reverse_database_support_preparation_mode", "shared")
+        ),
+        reverse_database_center_geometry_mode=str(
+            options.get("reverse_database_center_geometry_mode", "scalar_jvp")
+        ),
+        reverse_database_stage_jacobian_mode=str(
+            options.get("reverse_database_stage_jacobian_mode", "independent")
+        ),
+        reverse_database_support_objective_mode=str(
+            options.get("reverse_database_support_objective_mode", "scalar")
+        ),
+        reverse_database_segment_support_mode=str(
+            options.get("reverse_database_segment_support_mode", "inline")
+        ),
+        reverse_database_interpolation_transpose_mode=str(
+            options.get("reverse_database_interpolation_transpose_mode", "established")
+        ),
+        reverse_database_root_interpolation_transpose_mode=str(
+            options.get("reverse_database_root_interpolation_transpose_mode", "established")
+        ),
+        reverse_database_bootstrap_interpolation_transpose_mode=str(
+            options.get("reverse_database_bootstrap_interpolation_transpose_mode", "established")
+        ),
+        reverse_segment_start_replay_mode=str(
+            options.get("reverse_segment_start_replay_mode", "legacy")
+        ),
+        reverse_segment_primal_record_mode=str(
+            options.get("reverse_segment_primal_record_mode", "reconstruct")
+        ),
+        reverse_final_objective_cotangent_mode=str(
+            options.get("reverse_final_objective_cotangent_mode", "scalar")
+        ),
+        reverse_bootstrap_cotangent_mode=str(
+            options.get("reverse_bootstrap_cotangent_mode", "separate")
+        ),
+        reverse_schedule_artifact_mode=str(
+            options.get("reverse_schedule_artifact_mode", "legacy")
+        ),
+        reverse_stage_cotangent_mode=str(reverse_stage_cotangent_mode),
+        reverse_step_bwd_mode=str(reverse_step_bwd_mode),
+        reverse_stage_adjoint_memory_mode=str(reverse_stage_adjoint_memory_mode),
+        reverse_stage_adjoint_iter_maxiter=int(reverse_stage_adjoint_iter_maxiter),
+        reverse_stage_adjoint_iter_tol=float(reverse_stage_adjoint_iter_tol),
+        reverse_stage_adjoint_woodbury_rank=int(reverse_stage_adjoint_woodbury_rank),
+        max_reverse_accepted_steps=(
+            None
+            if max_reverse_accepted_steps is None
+            else int(max_reverse_accepted_steps)
+        ),
+        progress_label="[optimization] full transport geometry payload pullback:",
+    )
     normalized_terms = _normalize_initial_er_root_least_squares_terms(terms)
     return GeometryFullTransportLeastSquaresProblem(
         config=config_eff,

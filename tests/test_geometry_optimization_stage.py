@@ -402,3 +402,111 @@ def test_database_initial_er_payload_adapter_rebuilds_only_floating_trial_leaves
     assert jnp.array_equal(rebuilt["database"]["D11_log"], trial["database"]["D11_log"])
     assert jnp.array_equal(rebuilt["database"]["Er_list"], trial["database"]["Er_list"])
     assert jnp.array_equal(rebuilt["database"]["grid_size"], baseline["database"]["grid_size"])
+
+
+def test_database_full_transport_mode_uses_one_integrated_benchmark_builder(monkeypatch):
+    """The optimization selector must not build the retired two-sweep bridge."""
+
+    context = object()
+    runtime = object()
+    baseline_state = SimpleNamespace(pressure=jnp.asarray([1.0]))
+    parameterization = SimpleNamespace(
+        specs=("vmec-spec",),
+        x_scale=jnp.asarray([1.0]),
+    )
+    parameter_set = SimpleNamespace(specs=("parameter-spec",))
+    table_context = object()
+
+    monkeypatch.setattr(
+        optimization,
+        "_prepare_full_transport_config",
+        lambda _config, *, device: {
+            "geometry": {"vmec_input_file": "seed-input", "n_radial": 7},
+            "neoclassical": {
+                "flux_model": "ntx_scan_runtime",
+                "ntx_exact_n_theta": 5,
+                "ntx_exact_n_zeta": 25,
+                "ntx_exact_n_xi": 31,
+            },
+        },
+    )
+    monkeypatch.setattr(
+        optimization,
+        "build_geometry_autodiff_context",
+        lambda *_args, **_kwargs: context,
+    )
+    monkeypatch.setattr(
+        optimization,
+        "vmex_boundary_parameterization",
+        lambda *_args, **_kwargs: parameterization,
+    )
+    monkeypatch.setattr(
+        optimization,
+        "reverse_ad_optimization_parameter_set",
+        lambda **_kwargs: parameter_set,
+    )
+    monkeypatch.setattr(
+        optimization,
+        "build_runtime_context",
+        lambda _config: (runtime, baseline_state),
+    )
+    monkeypatch.setattr(
+        optimization,
+        "_profile_values_from_config",
+        lambda _config, _dtype: jnp.zeros((6,), dtype=jnp.float64),
+    )
+    monkeypatch.setattr(
+        optimization,
+        "realtime_geometry_transport_reverse_table_context",
+        lambda **_kwargs: table_context,
+    )
+    monkeypatch.setattr(
+        optimization,
+        "build_database_initial_root_experiment_stage",
+        lambda **_kwargs: (_ for _ in ()).throw(
+            AssertionError("full transport must not use the retired two-sweep bridge")
+        ),
+    )
+
+    for stage_mode in ("benchmark", "database_full_transport_optimization"):
+        calls = []
+        builder = lambda *_args, **_kwargs: None
+
+        def _builder_factory(**kwargs):
+            calls.append(kwargs)
+            return builder
+
+        monkeypatch.setattr(
+            optimization,
+            "internal_realtime_geometry_transport_reverse_table_result_builder",
+            _builder_factory,
+        )
+        problem = optimization.geometry_full_transport_least_squares_problem(
+            {},
+            ((optimization.geometry.vmec_aspect_ratio, 0.0, 1.0),),
+            max_mode=1,
+            reverse_stage_mode=stage_mode,
+            initial_er_root_ad="jax_selected_root",
+            accepted_step_limit=16,
+            reverse_segment_length=4,
+            max_reverse_accepted_steps=16,
+            reverse_stage_adjoint_solve_mode="block",
+            reverse_rhs_transpose_mode="explicit_database",
+            reverse_step_bwd_mode="reduced_cotangent_call_boundary",
+        )
+
+        assert len(calls) == 1
+        assert calls[0]["initial_er_root_ad"] == "jax_selected_root"
+        assert calls[0]["accepted_step_limit"] == 16
+        assert calls[0]["reverse_segment_length"] == 4
+        assert calls[0]["max_reverse_accepted_steps"] == 16
+        assert calls[0]["reverse_stage_adjoint_solve_mode"] == "block"
+        assert calls[0]["reverse_rhs_transpose_mode"] == "explicit_database"
+        assert calls[0]["reverse_step_bwd_mode"] == "reduced_cotangent_call_boundary"
+        assert calls[0]["reverse_database_initial_state_mode"] == "generic"
+        assert calls[0]["reverse_database_interpolation_transpose_mode"] == "legacy_sparse"
+        assert calls[0]["reverse_database_root_interpolation_transpose_mode"] == "established"
+        assert calls[0]["reverse_database_bootstrap_interpolation_transpose_mode"] == "established"
+        assert calls[0]["reverse_schedule_artifact_mode"] == "reuse_static_probe"
+        assert problem.options["reverse_stage_mode"] == stage_mode
+        assert problem.table_result_builder is builder

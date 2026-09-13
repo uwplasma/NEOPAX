@@ -1,11 +1,13 @@
 #!/usr/bin/env python
-"""Parity of benchmark and optimization database full-transport lanes.
+"""Parity of benchmark and optimization database full-transport entry points.
 
 Both lanes use the same benchmark TOML, unperturbed VMEC input, selected
 initial-Er root, 16 accepted Radau steps, and four four-step reverse
 segments.  The reference is the unchanged benchmark composition.  The trial
-links the accepted optimization-only root boundaries to those same transport
-kernels.  This is not an FD test or a physical final-time transport run.
+is the optimization-only full-transport selector and must invoke that same
+integrated selected-root/transport composition exactly once.  Candidate JIT
+boundaries are added only after this no-duplication baseline passes.  This is
+not an FD test or a physical final-time transport run.
 """
 
 from __future__ import annotations
@@ -38,7 +40,7 @@ SMALL_DATABASE_TRANSPORT_CONFIG = (
 ACCEPTED_STEP_LIMIT = 16
 REVERSE_SEGMENT_LENGTH = 4
 REFERENCE_STAGE_MODE = "benchmark"
-TRIAL_STAGE_MODE = "database_root_fresh_payload_experiment"
+TRIAL_STAGE_MODE = "database_full_transport_optimization"
 DATABASE_N_THETA = 5
 DATABASE_N_PHI = 25
 DATABASE_N_XI = 31
@@ -52,12 +54,15 @@ DATABASE_REVERSE_OPTIONS = {
     "reverse_initial_cache_support_pullback_mode": "scalar",
     "reverse_rebuild_support_pullback_mode": "separate",
     "reverse_database_initial_support_mode": "split",
+    "reverse_database_initial_state_mode": "generic",
     "reverse_database_support_preparation_mode": "shared",
     "reverse_database_center_geometry_mode": "scalar_jvp",
     "reverse_database_stage_jacobian_mode": "independent",
     "reverse_database_support_objective_mode": "scalar",
     "reverse_database_segment_support_mode": "inline",
     "reverse_database_interpolation_transpose_mode": "legacy_sparse",
+    "reverse_database_root_interpolation_transpose_mode": "established",
+    "reverse_database_bootstrap_interpolation_transpose_mode": "established",
     "reverse_final_objective_cotangent_mode": "grouped_vjp",
     "reverse_bootstrap_cotangent_mode": "joint_local_vjp_upar_only",
     "reverse_schedule_artifact_mode": "reuse_static_probe",
