@@ -370,6 +370,55 @@ def _database_bootstrap_table_and_coordinate_bar(
     )
 
 
+def _database_bootstrap_interpolation_bar(
+    database,
+    state,
+    upar_bar,
+    *,
+    mode: str,
+    table_pullback,
+    coordinate_pullback,
+    sparse_pullback,
+):
+    """Select one isolated terminal-bootstrap interpolation transpose."""
+
+    mode = str(mode).strip().lower()
+    if mode == "legacy_sparse":
+        if not callable(sparse_pullback):
+            raise NotImplementedError(
+                "Recorded database sparse bootstrap AD requires the combined "
+                "table/coordinate interpolation pullback."
+            )
+        a_b_bar, er_list_bar, d11_bar, d13_bar, d33_bar = sparse_pullback(
+            state, upar_bar
+        )
+        coordinate_bar = dataclasses.replace(
+            _float_delta_tree_like(database),
+            a_b=a_b_bar,
+            Er_list=er_list_bar,
+        )
+    elif mode == "established":
+        if not callable(table_pullback) or not callable(coordinate_pullback):
+            raise NotImplementedError(
+                "Recorded database bootstrap AD requires compact table and "
+                "coordinate pullbacks."
+            )
+        d11_bar, d13_bar, d33_bar = table_pullback(state, upar_bar)
+        coordinate_bar = coordinate_pullback(state, upar_bar)
+    else:
+        raise ValueError(
+            "database bootstrap interpolation mode must be 'established' or "
+            f"'legacy_sparse'; got {mode!r}."
+        )
+    return _database_bootstrap_table_and_coordinate_bar(
+        database,
+        d11_bar,
+        d13_bar,
+        d33_bar,
+        coordinate_bar,
+    )
+
+
 def _take_batched_pytree_row(tree, row_index: int):
     """Extract one leading objective row from every leaf of a pytree."""
 
@@ -3541,6 +3590,7 @@ def _configure_database_reverse_performance(
     support_objective_mode="scalar", segment_support_mode="inline",
     interpolation_transpose_mode="established",
     root_interpolation_transpose_mode="established",
+    bootstrap_interpolation_transpose_mode="established",
 ):
     """Rebind only opted-in database support hooks, never primal/root hooks.
 
@@ -3579,6 +3629,10 @@ def _configure_database_reverse_performance(
             str(root_interpolation_transpose_mode).strip().lower(),
             {"established", "legacy_sparse"},
         ),
+        "reverse_database_bootstrap_interpolation_transpose_mode": (
+            str(bootstrap_interpolation_transpose_mode).strip().lower(),
+            {"established", "legacy_sparse"},
+        ),
     }
     for name, (value, choices) in modes.items():
         if value not in choices:
@@ -3612,6 +3666,8 @@ def _configure_database_reverse_performance(
         and selected["reverse_database_interpolation_transpose_mode"]
         == "established"
         and selected["reverse_database_root_interpolation_transpose_mode"]
+        == "established"
+        and selected["reverse_database_bootstrap_interpolation_transpose_mode"]
         == "established"
     ):
         return physics_context
@@ -3692,6 +3748,7 @@ def prepare_reverse_static_setup(
     reverse_database_segment_support_mode: str = "inline",
     reverse_database_interpolation_transpose_mode: str = "established",
     reverse_database_root_interpolation_transpose_mode: str = "established",
+    reverse_database_bootstrap_interpolation_transpose_mode: str = "established",
     reverse_segment_jit_diagnostics: bool = False,
     reverse_segment_input_diagnostics: bool = False,
     reverse_rebuild_component_timing: bool = False,
@@ -3875,6 +3932,9 @@ def prepare_reverse_static_setup(
         ),
         root_interpolation_transpose_mode=(
             reverse_database_root_interpolation_transpose_mode
+        ),
+        bootstrap_interpolation_transpose_mode=(
+            reverse_database_bootstrap_interpolation_transpose_mode
         ),
     )
     if configured_physics is not execution_context.physics_context:
@@ -4825,6 +4885,21 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
             "Unknown reverse_bootstrap_cotangent_mode "
             f"{bootstrap_cotangent_mode!r}."
         )
+    database_bootstrap_interpolation_transpose_mode = str(
+        getattr(
+            reverse_setup.execution_context.physics_context,
+            "reverse_database_bootstrap_interpolation_transpose_mode",
+            "established",
+        )
+    ).strip().lower()
+    if database_bootstrap_interpolation_transpose_mode not in {
+        "established",
+        "legacy_sparse",
+    }:
+        raise ValueError(
+            "Unknown reverse_database_bootstrap_interpolation_transpose_mode "
+            f"{database_bootstrap_interpolation_transpose_mode!r}."
+        )
     bootstrap_objective_name = "bootstrap_current_softmax_abs_scaled"
     ordinary_objective_indices = tuple(
         objective_i
@@ -5024,6 +5099,11 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
                 "pullback_momentum_corrected_upar_database_coordinates_by_radius",
                 None,
             )
+            database_sparse_support_pullback_fn = getattr(
+                neoclassical_model,
+                "pullback_momentum_corrected_upar_database_support_legacy_sparse_by_radius",
+                None,
+            )
             support_pullback_fn = getattr(
                 neoclassical_model,
                 "pullback_momentum_corrected_upar_support_by_radius",
@@ -5064,8 +5144,19 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
                     or (
                         database_payload
                         and (
-                            not callable(database_pullback_fn)
-                            or not callable(database_coordinate_pullback_fn)
+                            (
+                                database_bootstrap_interpolation_transpose_mode
+                                == "established"
+                                and (
+                                    not callable(database_pullback_fn)
+                                    or not callable(database_coordinate_pullback_fn)
+                                )
+                            )
+                            or (
+                                database_bootstrap_interpolation_transpose_mode
+                                == "legacy_sparse"
+                                and not callable(database_sparse_support_pullback_fn)
+                            )
                         )
                     )
                     or (not database_payload and not callable(support_pullback_fn))
@@ -5107,9 +5198,19 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
                     "the combined realtime geometry payload."
                 )
             if database_payload and not callable(database_coordinate_pullback_fn):
+                if database_bootstrap_interpolation_transpose_mode == "established":
+                    raise NotImplementedError(
+                        "Recorded database bootstrap AD requires the compact corrected-Upar "
+                        "database-coordinate pullback."
+                    )
+            if (
+                database_payload
+                and database_bootstrap_interpolation_transpose_mode == "legacy_sparse"
+                and not callable(database_sparse_support_pullback_fn)
+            ):
                 raise NotImplementedError(
-                    "Recorded database bootstrap AD requires the compact corrected-Upar "
-                    "database-coordinate pullback."
+                    "Recorded database sparse bootstrap AD requires the combined "
+                    "table/coordinate interpolation pullback."
                 )
             if use_joint_bootstrap_pullback:
                 if not callable(joint_pullback_fn):
@@ -5152,19 +5253,15 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
             objective_values_rows.append(objective_value)
             if combined_geometry_payload:
                 if database_payload:
-                    d11_bar, d13_bar, d33_bar = database_pullback_fn(
-                        final_state_for_bootstrap, upar_bar
-                    )
-                    coordinate_bar = database_coordinate_pullback_fn(
-                        final_state_for_bootstrap, upar_bar
-                    )
                     database = support_payload["database"]
-                    database_bar = _database_bootstrap_table_and_coordinate_bar(
+                    database_bar = _database_bootstrap_interpolation_bar(
                         database,
-                        d11_bar,
-                        d13_bar,
-                        d33_bar,
-                        coordinate_bar,
+                        final_state_for_bootstrap,
+                        upar_bar,
+                        mode=database_bootstrap_interpolation_transpose_mode,
+                        table_pullback=database_pullback_fn,
+                        coordinate_pullback=database_coordinate_pullback_fn,
+                        sparse_pullback=database_sparse_support_pullback_fn,
                     )
                     geometry = support_payload["geometry"]
                     if (
@@ -5517,7 +5614,9 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
         f"{progress_prefix} progress: support reverse final-objective cotangents ready "
         f"elapsed_s={time.perf_counter() - phase_start:.3f} "
         f"ordinary_mode={final_objective_cotangent_mode} "
-        f"bootstrap_mode={bootstrap_cotangent_mode}",
+        f"bootstrap_mode={bootstrap_cotangent_mode} "
+        "database_bootstrap_interpolation_mode="
+        f"{database_bootstrap_interpolation_transpose_mode}",
         flush=True,
     )
     if (
@@ -8172,6 +8271,7 @@ def internal_realtime_geometry_transport_reverse_table_result_builder(
     reverse_database_segment_support_mode: str = "inline",
     reverse_database_interpolation_transpose_mode: str = "established",
     reverse_database_root_interpolation_transpose_mode: str = "established",
+    reverse_database_bootstrap_interpolation_transpose_mode: str = "established",
     reverse_segment_jit_diagnostics: bool = False,
     reverse_segment_input_diagnostics: bool = False,
     reverse_rebuild_component_timing: bool = False,
@@ -8341,6 +8441,10 @@ def internal_realtime_geometry_transport_reverse_table_result_builder(
             reverse_database_root_interpolation_transpose_mode=str(opts.get(
                 "reverse_database_root_interpolation_transpose_mode",
                 reverse_database_root_interpolation_transpose_mode,
+            )),
+            reverse_database_bootstrap_interpolation_transpose_mode=str(opts.get(
+                "reverse_database_bootstrap_interpolation_transpose_mode",
+                reverse_database_bootstrap_interpolation_transpose_mode,
             )),
             reverse_rhs_pullback_mode=str(opts.get("reverse_rhs_pullback_mode", reverse_rhs_pullback_mode)),
             reverse_initial_cache_support_pullback_mode=str(

@@ -96,6 +96,7 @@ def test_validated_full_transport_reverse_modes_are_cli_defaults():
         "--reverse-bootstrap-cotangent-mode",
         "--reverse-database-interpolation-transpose-mode",
         "--reverse-database-root-interpolation-transpose-mode",
+        "--reverse-database-bootstrap-interpolation-transpose-mode",
         "--reverse-database-initial-state-mode",
         "--reverse-database-initial-support-mode",
         "--reverse-database-support-preparation-mode",
@@ -140,6 +141,7 @@ def test_validated_full_transport_reverse_modes_are_cli_defaults():
         "reverse_database_initial_support_mode": "split",
         "reverse_database_interpolation_transpose_mode": "legacy_sparse",
         "reverse_database_root_interpolation_transpose_mode": "established",
+        "reverse_database_bootstrap_interpolation_transpose_mode": "established",
         "reverse_database_segment_support_mode": "inline",
         "reverse_database_stage_jacobian_mode": "independent",
         "reverse_database_support_objective_mode": "scalar",
@@ -226,6 +228,10 @@ def test_database_performance_cli_defaults_preserve_root_and_lij_lanes():
     assert args.reverse_database_interpolation_transpose_mode == "legacy_sparse"
     assert (
         args.reverse_database_root_interpolation_transpose_mode
+        == "established"
+    )
+    assert (
+        args.reverse_database_bootstrap_interpolation_transpose_mode
         == "established"
     )
     _check_performance_args(args, is_database=False)
@@ -339,6 +345,15 @@ def test_selected_root_sparse_interpolation_cli_is_full_transport_only():
         _check_performance_args(args, is_database=False)
 
 
+def test_terminal_bootstrap_sparse_interpolation_cli_is_full_transport_only():
+    args = _performance_args(
+        reverse_database_bootstrap_interpolation_transpose_mode="legacy_sparse"
+    )
+    _check_performance_args(args)
+    with pytest.raises(SystemExit):
+        _check_performance_args(args, is_database=False)
+
+
 def test_legacy_performance_cli_is_database_full_transport_only():
     args = _performance_args(reverse_database_initial_support_mode="generic",
                              reverse_database_support_preparation_mode="separate",
@@ -382,8 +397,8 @@ def test_benchmark_callback_preserves_configured_execution_and_primal_contexts(o
     solver = SimpleNamespace(max_steps=8)
     species, vector_field = object(), object()
     seen = []
-    modes = ("reduced_zero", "reduced_zero_rhs", "separate", "radial_vjp", "shared_multi_rhs", "batched_split", "deferred_segment_batch", "legacy_sparse", "legacy_sparse") if override else (
-        "split", "generic", "shared", "scalar_jvp", "independent", "scalar", "inline", "established", "established"
+    modes = ("reduced_zero", "reduced_zero_rhs", "separate", "radial_vjp", "shared_multi_rhs", "batched_split", "deferred_segment_batch", "legacy_sparse", "legacy_sparse", "legacy_sparse") if override else (
+        "split", "generic", "shared", "scalar_jvp", "independent", "scalar", "inline", "established", "established", "established"
     )
 
     def _configure(physics, **kwargs):
@@ -414,6 +429,7 @@ def test_benchmark_callback_preserves_configured_execution_and_primal_contexts(o
         "reverse_database_segment_support_mode",
         "reverse_database_interpolation_transpose_mode",
         "reverse_database_root_interpolation_transpose_mode",
+        "reverse_database_bootstrap_interpolation_transpose_mode",
     ), modes, strict=True)) if override else {}
     result = callback(
         None, config={}, runtime=SimpleNamespace(species=species),
@@ -423,6 +439,7 @@ def test_benchmark_callback_preserves_configured_execution_and_primal_contexts(o
         "initial_support_mode", "initial_state_mode", "support_preparation_mode", "center_geometry_mode",
         "stage_jacobian_mode", "support_objective_mode", "segment_support_mode",
         "interpolation_transpose_mode", "root_interpolation_transpose_mode",
+        "bootstrap_interpolation_transpose_mode",
     ), modes, strict=True))]
     assert result.prepared_rollout is prepared
     assert prepared.physics_context is original_physics

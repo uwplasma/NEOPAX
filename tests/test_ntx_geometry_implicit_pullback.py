@@ -60,6 +60,7 @@ from NEOPAX._geometry_autodiff import (
     _ntx_runtime_channel_payload_bars,
 )
 from NEOPAX._reverse_ad_transport import (
+    _database_bootstrap_interpolation_bar,
     _database_bootstrap_table_and_coordinate_bar,
     _initial_cache_support_pullback_from_rebuild_dispatch,
     _initial_direct_rhs_support_pullback_batched,
@@ -72,6 +73,77 @@ from NEOPAX._reverse_ad_transport import (
     _run_realized_reverse_slot_dispatch,
     _take_batched_pytree_row,
 )
+
+
+def test_database_terminal_bootstrap_sparse_dispatch_matches_established_assembly():
+    """The opt-in sparse terminal rule replaces exactly two interpolation calls."""
+
+    database = Monoenergetic(
+        a_b=jnp.asarray(2.0),
+        rho=jnp.asarray([0.0, 1.0]),
+        nu_log=jnp.asarray([-2.0]),
+        Er_list=jnp.asarray([[-5.0], [-4.0]]),
+        D11_log=jnp.zeros((2, 1, 1)),
+        D13=jnp.zeros((2, 1, 1)),
+        D33=jnp.zeros((2, 1, 1)),
+    )
+    state = object()
+    upar_bar = object()
+    calls = []
+
+    def _tables(actual_state, actual_bar):
+        calls.append(("tables", actual_state, actual_bar))
+        return (
+            jnp.full_like(database.D11_log, 3.0),
+            jnp.full_like(database.D13, 4.0),
+            jnp.full_like(database.D33, 5.0),
+        )
+
+    def _coordinates(actual_state, actual_bar):
+        calls.append(("coordinates", actual_state, actual_bar))
+        return dataclasses.replace(
+            _float_delta_tree_like(database),
+            a_b=jnp.asarray(1.0),
+            Er_list=jnp.full_like(database.Er_list, 2.0),
+        )
+
+    def _sparse(actual_state, actual_bar):
+        calls.append(("sparse", actual_state, actual_bar))
+        return (
+            jnp.asarray(1.0),
+            jnp.full_like(database.Er_list, 2.0),
+            jnp.full_like(database.D11_log, 3.0),
+            jnp.full_like(database.D13, 4.0),
+            jnp.full_like(database.D33, 5.0),
+        )
+
+    established = _database_bootstrap_interpolation_bar(
+        database,
+        state,
+        upar_bar,
+        mode="established",
+        table_pullback=_tables,
+        coordinate_pullback=_coordinates,
+        sparse_pullback=None,
+    )
+    assert [entry[0] for entry in calls] == ["tables", "coordinates"]
+    calls.clear()
+    sparse = _database_bootstrap_interpolation_bar(
+        database,
+        state,
+        upar_bar,
+        mode="legacy_sparse",
+        table_pullback=None,
+        coordinate_pullback=None,
+        sparse_pullback=_sparse,
+    )
+    assert [entry[0] for entry in calls] == ["sparse"]
+    for actual, expected in zip(
+        jax.tree_util.tree_leaves(sparse),
+        jax.tree_util.tree_leaves(established),
+        strict=True,
+    ):
+        assert jnp.allclose(actual, expected)
 
 
 def test_terminal_support_normalization_preserves_differentiable_scalars():
@@ -2578,6 +2650,26 @@ def test_database_local_bootstrap_state_pullback_matches_full_upar_jvp(
     )
     for actual, expected in zip(actual_table_bars, expected_table_bars, strict=True):
         assert jnp.allclose(actual, expected, rtol=2.0e-10, atol=2.0e-10)
+    if scan_generated_monoenergetic:
+        expected_coordinate_bar = (
+            model.pullback_momentum_corrected_upar_database_coordinates_by_radius(
+                state, upar_bar
+            )
+        )
+        actual_sparse_bars = (
+            model.pullback_momentum_corrected_upar_database_support_legacy_sparse_by_radius(
+                state, upar_bar
+            )
+        )
+        expected_sparse_bars = (
+            expected_coordinate_bar.a_b,
+            expected_coordinate_bar.Er_list,
+            *expected_table_bars,
+        )
+        for actual, expected in zip(
+            actual_sparse_bars, expected_sparse_bars, strict=True
+        ):
+            assert jnp.allclose(actual, expected, rtol=3.0e-10, atol=3.0e-10)
 
     # The selected-root helper reduces exactly the local charge-flux residual,
     # rather than the transport RHS.  Test that complete database boundary

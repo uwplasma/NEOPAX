@@ -4970,6 +4970,9 @@ class _RadauAcceptedStepPhysicsContext:
     # this separate preserves the validated root boundary unless the caller
     # explicitly opts into its sparse analogue.
     reverse_database_root_interpolation_transpose_mode: str = "established"
+    # Independent terminal-bootstrap table/coordinate transpose selector.
+    # It is read only by the recorded-database full-transport boundary.
+    reverse_database_bootstrap_interpolation_transpose_mode: str = "established"
     reverse_initial_cache_support_pullback_mode: str = "scalar"
     reverse_rebuild_support_pullback_mode: str = "separate"
     reverse_segment_jit_diagnostics: bool = False
