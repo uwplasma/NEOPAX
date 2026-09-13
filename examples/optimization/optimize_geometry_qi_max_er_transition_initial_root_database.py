@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Standalone database-backed QI + targeted ambipolar-Er transition optimization."""
+"""Standalone database-default QI + targeted ambipolar-Er transition optimization."""
 
 from __future__ import annotations
 
@@ -91,6 +91,112 @@ def report(tag: str, problem, x) -> None:
         print(f"  - {label}: {value:.10e}")
 
 
+def save_er_profile(problem, x, out_dir: Path, label: str, *, profiles=None) -> None:
+    if profiles is None:
+        rho, er, finite_mask = problem.initial_er_profile_from_scaled_parameters(x)
+    else:
+        rho, er, _current, finite_mask = profiles
+    rho_np = np.asarray(jax.device_get(rho), dtype=float)
+    er_np = np.asarray(jax.device_get(er), dtype=float)
+    finite_np = np.asarray(jax.device_get(finite_mask), dtype=bool)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    csv_path = out_dir / f"initial_er_profile_{label}.csv"
+    np.savetxt(
+        csv_path,
+        np.column_stack((rho_np, er_np, finite_np.astype(float))),
+        delimiter=",",
+        header="rho,Er,finite_mask",
+        comments="",
+    )
+    print(f"wrote {csv_path}")
+    try:
+        import matplotlib.pyplot as plt
+    except Exception as exc:
+        print(f"skipping Er profile plot: {exc}")
+        return
+    finite_rho = rho_np[finite_np]
+    finite_er = er_np[finite_np]
+    marker_rho = None
+    if finite_rho.size >= 2:
+        sign_change = np.flatnonzero(finite_er[:-1] * finite_er[1:] <= 0.0)
+        if sign_change.size:
+            index = int(sign_change[0])
+            denominator = finite_er[index + 1] - finite_er[index]
+            fraction = 0.0 if abs(denominator) < 1.0e-30 else -finite_er[index] / denominator
+            marker_rho = float(
+                finite_rho[index]
+                + np.clip(fraction, 0.0, 1.0) * (finite_rho[index + 1] - finite_rho[index])
+            )
+        else:
+            jump_index = int(np.argmax(np.abs(np.diff(finite_er))))
+            marker_rho = float(0.5 * (finite_rho[jump_index] + finite_rho[jump_index + 1]))
+    fig, ax = plt.subplots(figsize=(6.8, 5.6))
+    ax.plot(rho_np, er_np, color="red", linewidth=3.2, solid_capstyle="round")
+    if marker_rho is not None:
+        ax.axvline(marker_rho, color="black", linewidth=1.8, ymin=0.25, ymax=0.93)
+    ax.set_xlabel(r"$\rho$", fontsize=20)
+    ax.set_ylabel(r"$E_r$ [$\mathrm{kV}/\mathrm{m}$]", fontsize=20)
+    ax.tick_params(axis="both", labelsize=16, width=1.0, length=4)
+    ax.grid(False)
+    for spine in ax.spines.values():
+        spine.set_linewidth(1.0)
+        spine.set_color("0.35")
+    ax.margins(x=0.04, y=0.08)
+    fig.tight_layout()
+    png_path = out_dir / f"initial_er_profile_{label}.png"
+    fig.savefig(png_path, dpi=320, bbox_inches="tight")
+    plt.close(fig)
+    print(f"wrote {png_path}")
+
+
+def save_bootstrap_current_profile(problem, x, out_dir: Path, label: str, *, profiles=None) -> None:
+    """Save bootstrap current even when it is not an optimization objective."""
+
+    if profiles is None:
+        rho, current, finite_mask = problem.bootstrap_current_profile_from_scaled_parameters(x)
+    else:
+        rho, _er, current, finite_mask = profiles
+    rho_np = np.asarray(jax.device_get(rho), dtype=float)
+    current_np = np.asarray(jax.device_get(current), dtype=float)
+    finite_np = np.asarray(jax.device_get(finite_mask), dtype=bool)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    csv_path = out_dir / f"bootstrap_current_profile_{label}.csv"
+    np.savetxt(
+        csv_path,
+        np.column_stack((rho_np, current_np, finite_np.astype(float))),
+        delimiter=",",
+        header="rho,Jboot_scaled_1e5_A_m2,finite_mask",
+        comments="",
+    )
+    print(f"wrote {csv_path}")
+    try:
+        import matplotlib.pyplot as plt
+    except Exception as exc:
+        print(f"skipping bootstrap-current profile plot: {exc}")
+        return
+    fig, ax = plt.subplots(figsize=(6.8, 5.6))
+    ax.plot(rho_np, 100.0 * current_np, color="tab:blue", linewidth=3.0, label="bootstrap current")
+    ax.axhline(10.0, color="black", linewidth=2.0, label=r"$10\,\mathrm{kA\,m^{-2}}$")
+    ax.axhline(-10.0, color="black", linewidth=2.0, label=r"$-10\,\mathrm{kA\,m^{-2}}$")
+    ax.set_xlabel(r"$\rho$", fontsize=20)
+    ax.set_ylabel(r"$J^{BOOTSTRAP}$ [$\mathrm{kA\,m^{-2}}$]", fontsize=20)
+    ax.tick_params(axis="both", labelsize=16)
+    ax.legend(loc="best")
+    fig.tight_layout()
+    png_path = out_dir / f"bootstrap_current_profile_{label}.png"
+    fig.savefig(png_path, dpi=320, bbox_inches="tight")
+    plt.close(fig)
+    print(f"wrote {png_path}")
+
+
+def save_transport_profiles(problem, x, out_dir: Path, label: str) -> None:
+    """Save Er and bootstrap profiles from one shared database/root calculation."""
+
+    profiles = problem.initial_er_and_bootstrap_current_profiles_from_scaled_parameters(x)
+    save_er_profile(problem, x, out_dir, label, profiles=profiles)
+    save_bootstrap_current_profile(problem, x, out_dir, label, profiles=profiles)
+
+
 def main() -> int:
     args = parser().parse_args()
     if min(args.database_n_theta, args.database_n_phi, args.database_n_xi) < 1:
@@ -98,6 +204,7 @@ def main() -> int:
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     config, current_input = config_for_database(args), SEED_INPUT
     initial_input = optimized_input = final_problem = final_result = None
+    initial_problem = initial_x = None
     for max_mode in (MAX_MODE_SCHEDULE if not np.isscalar(MAX_MODE_SCHEDULE) else (MAX_MODE_SCHEDULE,)):
         print(f"\n===== database QI + Er transition, max_mode={max_mode}, grid=({args.database_n_theta},{args.database_n_phi},{args.database_n_xi}) =====", flush=True)
         problem = build_problem(config, current_input, int(max_mode), args)
@@ -105,6 +212,8 @@ def main() -> int:
         print(f"[setup] parameter_count={problem.parameter_count} parameters={list(problem.parameter_labels)}")
         if initial_input is None:
             initial_input = problem.input_from_scaled_parameters(x0)
+            initial_problem = problem
+            initial_x = x0.copy()
         report("initial", problem, x0)
         result = opt.least_squares(problem, max_nfev=NFEV, ftol=FTOL, xtol=XTOL, verbose=1)
         report(f"stage_m{max_mode}", problem, result.x)
@@ -112,10 +221,32 @@ def main() -> int:
         current_input = OUT_DIR / f"input.QI_neopax_database_transition_stage_m{max_mode}"
         optimized_input.to_indata(current_input)
         final_problem, final_result = problem, result
-    if any(value is None for value in (initial_input, optimized_input, final_problem, final_result)):
+    if any(
+        value is None
+        for value in (
+            initial_input,
+            optimized_input,
+            final_problem,
+            final_result,
+            initial_problem,
+            initial_x,
+        )
+    ):
         raise RuntimeError("No optimization stage was executed.")
     initial_input.to_indata(OUT_DIR / SEED_INPUT.name)
     optimized_input.to_indata(OUT_DIR / "input.QI_neopax_database_transition_optimized")
+    save_transport_profiles(
+        initial_problem,
+        initial_x,
+        OUT_DIR / "initial",
+        "initial",
+    )
+    save_transport_profiles(
+        final_problem,
+        np.asarray(final_result.x, dtype=float),
+        OUT_DIR / "optimized",
+        "optimized",
+    )
     summary = {"seed_input": str(SEED_INPUT), "database_transport_config": str(DATABASE_TRANSPORT_CONFIG), "database_resolution_theta_phi_xi": [args.database_n_theta, args.database_n_phi, args.database_n_xi], "reverse_stage_mode": REVERSE_STAGE_MODE, "parameter_labels": list(final_problem.parameter_labels), "x": np.asarray(final_result.x, dtype=float).tolist(), "cost": float(final_result.cost), "optimality": float(final_result.optimality), "status": int(final_result.status), "message": str(final_result.message)}
     (OUT_DIR / "optimization_summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
     print(f"wrote {OUT_DIR / 'optimization_summary.json'}")

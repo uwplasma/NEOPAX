@@ -19,11 +19,21 @@ import vmex as vj  # noqa: E402
 from vmex import optimize as vmex_opt  # noqa: E402
 
 from NEOPAX import optimization as opt  # noqa: E402
+from NEOPAX._orchestrator import load_config  # noqa: E402
 
 
 # --------------------------- parameters ------------------------------------
 SEED_INPUT = ROOT / "examples" / "inputs" / "input.QI_nfp2_initial_finitebeta"
 OUT_DIR = ROOT / "outputs" / "geometry_qi_only_finitebeta_optimization"
+
+# Backend used only to calculate the post-optimization Er/bootstrap profiles.
+# Change this to "realtime" to use the established exact-Lij configuration.
+TRANSPORT_PROFILE_BACKEND = "database"
+DATABASE_TRANSPORT_CONFIG = ROOT / "examples" / "benchmarks" / "Solve_Transport_equations_wHe_radau_ntx_scan_runtime_database_vmec_realtime_geometry_benchmark_black_box.toml"
+REALTIME_TRANSPORT_CONFIG = ROOT / "examples" / "benchmarks" / "Solve_Transport_equations_noHe_radau_ntx_exact_lagged_runtime_vmec_realtime_benchmark.toml"
+DATABASE_N_THETA = 25
+DATABASE_N_PHI = 31
+DATABASE_N_XI = 64
 
 SURFACES = np.asarray(
     [1 / 51, 5 / 51, 10 / 51, 15 / 51, 20 / 51, 25 / 51, 30 / 51, 35 / 51, 40 / 51, 45 / 51, 50 / 51],
@@ -69,6 +79,7 @@ MAKE_J_POLAR_PLOTS = True
 MAKE_B_AXIS_PLOTS = True
 MAKE_BOOZER_B_CONTOUR_PLOTS = True
 MAKE_INITIAL_PLOTS = False
+MAKE_TRANSPORT_PROFILE_PLOTS = True
 
 
 # --------------------------- objective functions ---------------------------
@@ -151,6 +162,128 @@ def report(tag, problem, x):
     print(f"  residual_norm={float(np.linalg.norm(residuals)):.6e}")
     print(f"  jacobian_shape={jacobian.shape}")
     return evaluation
+
+
+def build_transport_profile_problem(vmec_input):
+    """Build a diagnostic-only selected-root problem for Er/bootstrap plots."""
+
+    backend = str(TRANSPORT_PROFILE_BACKEND).strip().lower()
+    if backend not in {"database", "realtime"}:
+        raise ValueError("TRANSPORT_PROFILE_BACKEND must be 'database' or 'realtime'.")
+    config_path = DATABASE_TRANSPORT_CONFIG if backend == "database" else REALTIME_TRANSPORT_CONFIG
+    config = load_config(config_path)
+    resolution_kwargs = {}
+    if backend == "database":
+        config.setdefault("neoclassical", {}).update(
+            ntx_scan_n_theta=int(DATABASE_N_THETA),
+            ntx_scan_n_zeta=int(DATABASE_N_PHI),
+            ntx_scan_n_xi=int(DATABASE_N_XI),
+        )
+        resolution_kwargs = {
+            "n_theta": int(DATABASE_N_THETA),
+            "n_zeta": int(DATABASE_N_PHI),
+            "n_xi": int(DATABASE_N_XI),
+        }
+    max_mode = max(int(value) for value in MAX_MODE_SCHEDULE)
+    return opt.geometry_initial_er_root_only_least_squares_problem(
+        config,
+        ((opt.transport.softmax_Er, 0.0, 1.0),),
+        vmec_input=vmec_input,
+        max_mode=max_mode,
+        include_profiles=False,
+        families=GEOMETRY_FAMILIES,
+        scale_mode=SCALE_MODE,
+        ess_alpha=ESS_ALPHA,
+        mboz=QI_MBOZ,
+        nboz=QI_NBOZ,
+        surfaces=tuple(float(s) for s in SURFACES),
+        geometry_max_iter=GEOMETRY_MAX_ITER,
+        geometry_solver_device=SOLVER_DEVICE,
+        device=SOLVER_DEVICE,
+        reverse_stage_mode="off",
+        **resolution_kwargs,
+    )
+
+
+def save_er_profile(rho, er, finite_mask, out_dir, label):
+    rho_np = np.asarray(jax.device_get(rho), dtype=float)
+    er_np = np.asarray(jax.device_get(er), dtype=float)
+    finite_np = np.asarray(jax.device_get(finite_mask), dtype=bool)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    csv_path = out_dir / f"initial_er_profile_{label}.csv"
+    np.savetxt(
+        csv_path,
+        np.column_stack((rho_np, er_np, finite_np.astype(float))),
+        delimiter=",",
+        header="rho,Er,finite_mask",
+        comments="",
+    )
+    print(f"wrote {csv_path}")
+    try:
+        import matplotlib.pyplot as plt
+    except Exception as exc:
+        print(f"skipping Er profile plot: {exc}")
+        return
+    fig, ax = plt.subplots(figsize=(6.8, 5.6))
+    ax.plot(rho_np, er_np, color="red", linewidth=3.2, solid_capstyle="round")
+    ax.set_xlabel(r"$\rho$", fontsize=20)
+    ax.set_ylabel(r"$E_r$ [$\mathrm{kV}/\mathrm{m}$]", fontsize=20)
+    ax.tick_params(axis="both", labelsize=16)
+    fig.tight_layout()
+    png_path = out_dir / f"initial_er_profile_{label}.png"
+    fig.savefig(png_path, dpi=320, bbox_inches="tight")
+    plt.close(fig)
+    print(f"wrote {png_path}")
+
+
+def save_bootstrap_current_profile(rho, current, finite_mask, out_dir, label):
+    rho_np = np.asarray(jax.device_get(rho), dtype=float)
+    current_np = np.asarray(jax.device_get(current), dtype=float)
+    finite_np = np.asarray(jax.device_get(finite_mask), dtype=bool)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    csv_path = out_dir / f"bootstrap_current_profile_{label}.csv"
+    np.savetxt(
+        csv_path,
+        np.column_stack((rho_np, current_np, finite_np.astype(float))),
+        delimiter=",",
+        header="rho,Jboot_scaled_1e5_A_m2,finite_mask",
+        comments="",
+    )
+    print(f"wrote {csv_path}")
+    try:
+        import matplotlib.pyplot as plt
+    except Exception as exc:
+        print(f"skipping bootstrap-current profile plot: {exc}")
+        return
+    fig, ax = plt.subplots(figsize=(6.8, 5.6))
+    ax.plot(rho_np, 100.0 * current_np, color="tab:blue", linewidth=3.0, label="bootstrap current")
+    ax.axhline(10.0, color="black", linewidth=2.0, label=r"$10\,\mathrm{kA\,m^{-2}}$")
+    ax.axhline(-10.0, color="black", linewidth=2.0, label=r"$-10\,\mathrm{kA\,m^{-2}}$")
+    ax.set_xlabel(r"$\rho$", fontsize=20)
+    ax.set_ylabel(r"$J^{BOOTSTRAP}$ [$\mathrm{kA\,m^{-2}}$]", fontsize=20)
+    ax.tick_params(axis="both", labelsize=16)
+    ax.legend(loc="best")
+    fig.tight_layout()
+    png_path = out_dir / f"bootstrap_current_profile_{label}.png"
+    fig.savefig(png_path, dpi=320, bbox_inches="tight")
+    plt.close(fig)
+    print(f"wrote {png_path}")
+
+
+def save_transport_profiles_for_input(vmec_input, out_dir, label):
+    backend = str(TRANSPORT_PROFILE_BACKEND).strip().lower()
+    resolution = (
+        f"grid=({DATABASE_N_THETA},{DATABASE_N_PHI},{DATABASE_N_XI})"
+        if backend == "database"
+        else "grid=from_realtime_config"
+    )
+    print(f"[transport profiles] label={label} backend={backend} {resolution}", flush=True)
+    problem = build_transport_profile_problem(vmec_input)
+    rho, er, current, finite_mask = (
+        problem.initial_er_and_bootstrap_current_profiles_from_scaled_parameters(problem.x0)
+    )
+    save_er_profile(rho, er, finite_mask, out_dir, label)
+    save_bootstrap_current_profile(rho, current, finite_mask, out_dir, label)
 
 
 def plot_j_polar_contours(eq, out_dir, *, lambda_samples=(0.1, 0.3, 0.5, 0.7, 0.9)):
@@ -440,6 +573,9 @@ def write_outputs(optimized_input, initial_input, *, include_dmerc=False, includ
     optimized_input.to_indata(optimized_input_path)
     print(f"wrote {seed_copy}")
     print(f"wrote {optimized_input_path}")
+    if MAKE_TRANSPORT_PROFILE_PLOTS:
+        save_transport_profiles_for_input(initial_input, OUT_DIR / "initial", "initial")
+        save_transport_profiles_for_input(optimized_input, OUT_DIR / "optimized", "optimized")
     if MAKE_INITIAL_PLOTS:
         write_geometry_artifacts(
             initial_input,
@@ -521,6 +657,13 @@ def main() -> int:
         "surfaces": [float(s) for s in SURFACES],
         "mboz": int(QI_MBOZ),
         "nboz": int(QI_NBOZ),
+        "transport_profile_backend": TRANSPORT_PROFILE_BACKEND,
+        "transport_profile_config": str(
+            DATABASE_TRANSPORT_CONFIG
+            if str(TRANSPORT_PROFILE_BACKEND).strip().lower() == "database"
+            else REALTIME_TRANSPORT_CONFIG
+        ),
+        "database_resolution_theta_phi_xi": [DATABASE_N_THETA, DATABASE_N_PHI, DATABASE_N_XI],
         "terms": [(getattr(term[0], "label", term[0].label), float(term[1]), float(term[2])) for term in active_terms],
         "parameter_labels": [] if last_problem is None else list(last_problem.parameter_labels),
         "final_stage_x_scaled": [] if last_result is None else np.asarray(last_result.x, dtype=float).tolist(),

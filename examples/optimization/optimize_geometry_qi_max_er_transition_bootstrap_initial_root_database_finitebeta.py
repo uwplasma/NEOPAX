@@ -510,10 +510,14 @@ def write_outputs(initial_input, optimized_input, initial_problem, initial_x, fi
     print(f"wrote {seed_copy}")
     print(f"wrote {optimized_path}")
     if MAKE_INITIAL_PLOTS:
-        initial_dir = write_geometry_artifacts(initial_input, "initial")
+        initial_dir = OUT_DIR / "initial"
+        initial_dir.mkdir(parents=True, exist_ok=True)
         save_transport_profiles(initial_problem, initial_x, initial_dir, "initial")
-    optimized_dir = write_geometry_artifacts(optimized_input, "optimized")
+        write_geometry_artifacts(initial_input, "initial")
+    optimized_dir = OUT_DIR / "optimized"
+    optimized_dir.mkdir(parents=True, exist_ok=True)
     save_transport_profiles(final_problem, final_x, optimized_dir, "optimized")
+    write_geometry_artifacts(optimized_input, "optimized")
 
 
 def main() -> int:
