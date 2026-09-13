@@ -11,6 +11,7 @@ from ntx import GridSpec, example_surface, prepare_monoenergetic_system
 
 import NEOPAX._reverse_ad_transport as reverse_transport_module
 import NEOPAX._reverse_ad_initial_er as initial_er_module
+import NEOPAX._transport_flux_models as flux_models_module
 from NEOPAX._orchestrator import (
     _build_database,
     _build_flux_model,
@@ -4551,6 +4552,76 @@ def test_legacy_monoenergetic_flux_table_transpose_matches_generic_vjp():
             rtol=3.0e-10,
             atol=3.0e-10,
         )
+
+
+def test_database_selected_root_sparse_hook_uses_root_boundary_constraints(
+    monkeypatch,
+):
+    """The sparse root hook is batched and keeps its distinct closure."""
+
+    database = Monoenergetic(
+        a_b=jnp.asarray(2.0),
+        rho=jnp.asarray([0.0, 0.5, 1.0]),
+        nu_log=jnp.asarray([-2.0]),
+        Er_list=jnp.asarray([[-6.0], [-5.0], [-4.0]]),
+        D11_log=jnp.zeros((3, 1, 1)),
+        D13=jnp.zeros((3, 1, 1)),
+        D33=jnp.zeros((3, 1, 1)),
+    )
+    geometry = types.SimpleNamespace(
+        r_grid=jnp.asarray([0.5, 1.5]),
+        r_grid_half=jnp.asarray([0.0, 1.0, 2.0]),
+        dr=jnp.asarray(1.0),
+    )
+    state = TransportState(
+        density=jnp.asarray([[1.0, 2.0], [2.0, 4.0]]),
+        pressure=jnp.asarray([[2.0, 8.0], [6.0, 24.0]]),
+        Er=jnp.asarray([0.1, 0.2]),
+    )
+    gamma_bar = jnp.arange(12, dtype=jnp.float64).reshape((3, 2, 2))
+    calls = []
+
+    def _sparse(*args):
+        calls.append(args)
+        rhs_count = args[7].shape[0]
+        return (
+            jnp.full((rhs_count,), 1.0),
+            jnp.full((rhs_count,) + database.Er_list.shape, 2.0),
+            jnp.full((rhs_count,) + database.D11_log.shape, 3.0),
+            jnp.full((rhs_count,) + database.D13.shape, 4.0),
+            jnp.full((rhs_count,) + database.D33.shape, 5.0),
+        )
+
+    monkeypatch.setattr(
+        flux_models_module,
+        "pullback_legacy_radial_database_flux_support_sparse",
+        _sparse,
+    )
+    model = NTXDatabaseTransportModel(
+        species=types.SimpleNamespace(),
+        energy_grid=types.SimpleNamespace(),
+        geometry=geometry,
+        database=database,
+    )
+    actual = model.pullback_local_particle_flux_support_payload_legacy_sparse(
+        state,
+        {"Gamma": gamma_bar},
+        {"database": database},
+    )["database"]
+
+    assert len(calls) == 1
+    assert jnp.allclose(calls[0][7], gamma_bar)
+    assert jnp.allclose(calls[0][8], jnp.zeros_like(gamma_bar))
+    assert jnp.allclose(calls[0][9], jnp.zeros_like(gamma_bar))
+    assert jnp.allclose(calls[0][11], jnp.asarray([2.5, 5.0]))
+    assert jnp.allclose(calls[0][12], jnp.zeros((2,)))
+    assert jnp.allclose(calls[0][13], jnp.asarray([5.0, 7.5]))
+    assert jnp.allclose(calls[0][14], jnp.zeros((2,)))
+    assert jnp.allclose(actual.a_b, 1.0)
+    assert jnp.allclose(actual.Er_list, 2.0)
+    assert jnp.allclose(actual.D11_log, 3.0)
+    assert jnp.allclose(actual.D13, 4.0)
+    assert jnp.allclose(actual.D33, 5.0)
 
 
 def test_legacy_monoenergetic_face_flux_support_sparse_matches_generic_vjp():

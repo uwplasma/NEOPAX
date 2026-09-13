@@ -157,7 +157,13 @@ def initial_er_charge_flux_residual_er_derivative(state, er_profile, *, runtime)
 
 
 def compact_initial_er_database_support_bars(
-    *, runtime, state, er_profile, residual_bars, support
+    *,
+    runtime,
+    state,
+    er_profile,
+    residual_bars,
+    support,
+    interpolation_transpose_mode="established",
 ):
     """Map selected-root charge-residual bars to recorded database tables.
 
@@ -194,12 +200,23 @@ def compact_initial_er_database_support_bars(
     charge_qp = jnp.asarray(runtime.species.charge_qp, dtype=state.Er.dtype)
 
     gamma_bars = charge_qp[None, :, None] * residual_bars[:, None, :]
-    pullback = getattr(
-        database_model, "pullback_local_particle_flux_support_payload", None
+    interpolation_transpose_mode = str(interpolation_transpose_mode).strip().lower()
+    if interpolation_transpose_mode not in {"established", "legacy_sparse"}:
+        raise ValueError(
+            "Initial-Er database interpolation transpose mode must be "
+            f"'established' or 'legacy_sparse'; got "
+            f"{interpolation_transpose_mode!r}."
+        )
+    pullback_name = (
+        "pullback_local_particle_flux_support_payload_legacy_sparse"
+        if interpolation_transpose_mode == "legacy_sparse"
+        else "pullback_local_particle_flux_support_payload"
     )
+    pullback = getattr(database_model, pullback_name, None)
     if not callable(pullback):
         raise ValueError(
-            "Runtime database model did not expose its local particle-flux transpose."
+            "Runtime database model did not expose its selected-root "
+            f"{interpolation_transpose_mode} particle-flux transpose."
         )
     support_bar = pullback(
         state_with_er,

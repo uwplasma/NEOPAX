@@ -4966,6 +4966,10 @@ class _RadauAcceptedStepPhysicsContext:
     # The established hook remains the default, and initial-root code never
     # reads this full-transport Radau selector.
     reverse_database_interpolation_transpose_mode: str = "established"
+    # Independent selected-root table/coordinate transpose selector.  Keeping
+    # this separate preserves the validated root boundary unless the caller
+    # explicitly opts into its sparse analogue.
+    reverse_database_root_interpolation_transpose_mode: str = "established"
     reverse_initial_cache_support_pullback_mode: str = "scalar"
     reverse_rebuild_support_pullback_mode: str = "separate"
     reverse_segment_jit_diagnostics: bool = False

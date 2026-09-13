@@ -3836,6 +3836,86 @@ class NTXDatabaseTransportModel(TransportFluxModelBase):
             database, support, interpolation_bars
         )
 
+    def pullback_local_particle_flux_support_payload_legacy_sparse(
+        self, state, flux_bar, support
+    ):
+        """Sparse selected-root transpose with the physical root closure.
+
+        This is the selected-root counterpart of
+        :meth:`pullback_direct_rhs_support_payload_legacy_sparse`.  The two
+        boundaries deliberately differ only in their outer density and
+        temperature closures: the root residual must retain the configured
+        transport boundary conditions.  Table and scan-coordinate bars are
+        produced by one sparse interpolation transpose, while the companion
+        physical-geometry bar remains on its separate fixed-table boundary.
+        """
+
+        if not isinstance(support, dict) or "database" not in support:
+            return None
+        database = support["database"]
+        if not isinstance(database, Monoenergetic):
+            raise TypeError(
+                "The legacy_sparse selected-root transpose requires a "
+                "Monoenergetic runtime-scan database."
+            )
+        density = safe_density(state.density, self.density_floor)
+        density_right_constraint, density_right_grad_constraint = (
+            _extract_right_constraints(
+                self.bc_density, density, self.geometry.r_grid_half
+            )
+        )
+        temperature_right_constraint, temperature_right_grad_constraint = (
+            _extract_right_constraints(
+                self.bc_temperature,
+                state.temperature,
+                self.geometry.r_grid_half,
+            )
+        )
+        supplied_bars = tuple(
+            jnp.asarray(value)
+            for value in flux_bar.values()
+            if value is not None
+            and jnp.asarray(value).ndim > 0
+            and jnp.asarray(value).dtype != jax.dtypes.float0
+        )
+        zero = (
+            jnp.zeros_like(supplied_bars[0])
+            if supplied_bars
+            else jnp.zeros_like(jnp.asarray(density))
+        )
+
+        def _bar(name):
+            value = flux_bar.get(name, None)
+            if value is None:
+                return zero
+            value = jnp.asarray(value)
+            return (
+                zero
+                if value.ndim == 0 or value.dtype == jax.dtypes.float0
+                else value
+            )
+
+        interpolation_bars = pullback_legacy_radial_database_flux_support_sparse(
+            self.species,
+            self.energy_grid,
+            self.geometry,
+            database,
+            state.Er,
+            state.temperature,
+            density,
+            _bar("Gamma"),
+            _bar("Q"),
+            _bar("Upar"),
+            _collisionality_kind(self.collisionality_model),
+            density_right_constraint,
+            density_right_grad_constraint,
+            temperature_right_constraint,
+            temperature_right_grad_constraint,
+        )
+        return self._legacy_sparse_support_bar(
+            database, support, interpolation_bars
+        )
+
     def pullback_direct_face_flux_state(
         self, state, face_state, flux_bar, **kwargs
     ):
@@ -7762,6 +7842,23 @@ class NTXRuntimeScanTransportModel(TransportFluxModelBase):
         model = self.with_support_payload(support)
         return model._database_model().pullback_local_particle_flux_support_payload(
             state, flux_bar, {"database": support["database"]}
+        )
+
+    def pullback_local_particle_flux_support_payload_legacy_sparse(
+        self, state, flux_bar, support
+    ):
+        """Delegate the sparse selected-root transpose to the built database."""
+
+        if not isinstance(support, dict) or "database" not in support:
+            return None
+        model = self.with_support_payload(support)
+        return (
+            model._database_model()
+            .pullback_local_particle_flux_support_payload_legacy_sparse(
+                state,
+                flux_bar,
+                {"database": support["database"]},
+            )
         )
 
     def with_runtime_database(self) -> "NTXRuntimeScanTransportModel":

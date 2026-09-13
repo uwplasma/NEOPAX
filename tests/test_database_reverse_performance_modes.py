@@ -450,6 +450,35 @@ def test_configure_legacy_sparse_rebinds_only_database_split_transposes():
     ]
 
 
+def test_configure_selected_root_sparse_mode_is_metadata_only():
+    """The root selector must not rebind any Radau or optimization hook."""
+
+    physics = _physics_context()
+    actual = _configure_database_reverse_performance(
+        physics,
+        vector_field=_unexpected_hook,
+        species=object(),
+        root_interpolation_transpose_mode="legacy_sparse",
+    )
+    assert actual is not physics
+    assert (
+        actual.reverse_database_root_interpolation_transpose_mode
+        == "legacy_sparse"
+    )
+    for name in (
+        "flat_rhs",
+        "flat_rhs_with_lagged_response",
+        "build_lagged_response",
+        "pullback_build_lagged_response",
+        "flat_rhs_direct_support_pullback",
+        "flat_rhs_direct_database_split_support_pullback",
+        "unpack_flat",
+        "pack_flat",
+        "project_flat",
+    ):
+        assert getattr(actual, name) is getattr(physics, name)
+
+
 @pytest.mark.parametrize(
     "option",
     [
@@ -461,6 +490,7 @@ def test_configure_legacy_sparse_rebinds_only_database_split_transposes():
         "support_objective_mode",
         "segment_support_mode",
         "interpolation_transpose_mode",
+        "root_interpolation_transpose_mode",
     ],
 )
 def test_configure_rejects_unknown_modes(option):

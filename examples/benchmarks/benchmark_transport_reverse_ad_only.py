@@ -2277,6 +2277,7 @@ def _prepare_reverse_static_setup(
     reverse_database_support_objective_mode: str = "scalar",
     reverse_database_segment_support_mode: str = "inline",
     reverse_database_interpolation_transpose_mode: str = "established",
+    reverse_database_root_interpolation_transpose_mode: str = "established",
     reverse_segment_jit_diagnostics: bool = False,
     reverse_segment_input_diagnostics: bool = False,
     reverse_rebuild_component_timing: bool = False,
@@ -2328,6 +2329,9 @@ def _prepare_reverse_static_setup(
         segment_support_mode=reverse_database_segment_support_mode,
         interpolation_transpose_mode=(
             reverse_database_interpolation_transpose_mode
+        ),
+        root_interpolation_transpose_mode=(
+            reverse_database_root_interpolation_transpose_mode
         ),
     )
     if configured_physics is not execution_context.physics_context:
@@ -4090,6 +4094,8 @@ def _run_realtime_geometry_optimization_api_smoke(
             f"database_segment_support_mode={args.reverse_database_segment_support_mode} "
             "database_interpolation_transpose_mode="
             f"{args.reverse_database_interpolation_transpose_mode} "
+            "database_root_interpolation_transpose_mode="
+            f"{args.reverse_database_root_interpolation_transpose_mode} "
             f"segment_jit_diagnostics={args.reverse_segment_jit_diagnostics} "
             f"segment_input_diagnostics={args.reverse_segment_input_diagnostics} "
             f"segment_start_replay_mode={args.reverse_segment_start_replay_mode} "
@@ -4157,6 +4163,9 @@ def _run_realtime_geometry_optimization_api_smoke(
             ),
             reverse_database_interpolation_transpose_mode=str(
                 args.reverse_database_interpolation_transpose_mode
+            ),
+            reverse_database_root_interpolation_transpose_mode=str(
+                args.reverse_database_root_interpolation_transpose_mode
             ),
             reverse_initial_cache_support_pullback_mode=str(
                 args.reverse_initial_cache_support_pullback_mode
@@ -4276,6 +4285,9 @@ def _run_realtime_geometry_optimization_api_smoke(
         ),
         "reverse_database_interpolation_transpose_mode": (
             args.reverse_database_interpolation_transpose_mode
+        ),
+        "reverse_database_root_interpolation_transpose_mode": (
+            args.reverse_database_root_interpolation_transpose_mode
         ),
         "shared_payload_note": (
             "Full transport shared-path smoke uses the internal realtime-geometry "
@@ -5937,6 +5949,19 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--reverse-database-root-interpolation-transpose-mode",
+        choices=("established", "legacy_sparse"),
+        default="established",
+        help=(
+            "Recorded-database selected-root table/coordinate transpose. "
+            "'established' preserves the validated root boundary. "
+            "'legacy_sparse' uses the same exact compact interpolation "
+            "stencil as the accelerated full-transport database boundary, "
+            "while leaving the root's local physical-geometry transpose "
+            "unchanged. This selector does not affect root-only or Lij runs."
+        ),
+    )
+    parser.add_argument(
         "--reverse-database-initial-support-mode",
         choices=("generic", "split", "reduced_zero"), default="split",
         help=("Database full-transport initial-RHS support only: 'generic' restores "
@@ -6815,6 +6840,8 @@ def main() -> None:
         or args.reverse_database_support_objective_mode != "scalar"
         or args.reverse_database_segment_support_mode != "inline"
         or args.reverse_database_interpolation_transpose_mode != "legacy_sparse"
+        or args.reverse_database_root_interpolation_transpose_mode
+        != "established"
     )
     if database_performance_override and (
         not is_database_geometry_reverse

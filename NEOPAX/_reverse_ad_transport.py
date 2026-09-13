@@ -3540,6 +3540,7 @@ def _configure_database_reverse_performance(
     center_geometry_mode="scalar_jvp", stage_jacobian_mode="independent",
     support_objective_mode="scalar", segment_support_mode="inline",
     interpolation_transpose_mode="established",
+    root_interpolation_transpose_mode="established",
 ):
     """Rebind only opted-in database support hooks, never primal/root hooks.
 
@@ -3574,6 +3575,10 @@ def _configure_database_reverse_performance(
             str(interpolation_transpose_mode).strip().lower(),
             {"established", "legacy_sparse"},
         ),
+        "reverse_database_root_interpolation_transpose_mode": (
+            str(root_interpolation_transpose_mode).strip().lower(),
+            {"established", "legacy_sparse"},
+        ),
     }
     for name, (value, choices) in modes.items():
         if value not in choices:
@@ -3605,6 +3610,8 @@ def _configure_database_reverse_performance(
         and selected["reverse_database_support_objective_mode"] == "scalar"
         and selected["reverse_database_segment_support_mode"] == "inline"
         and selected["reverse_database_interpolation_transpose_mode"]
+        == "established"
+        and selected["reverse_database_root_interpolation_transpose_mode"]
         == "established"
     ):
         return physics_context
@@ -3684,6 +3691,7 @@ def prepare_reverse_static_setup(
     reverse_database_support_objective_mode: str = "scalar",
     reverse_database_segment_support_mode: str = "inline",
     reverse_database_interpolation_transpose_mode: str = "established",
+    reverse_database_root_interpolation_transpose_mode: str = "established",
     reverse_segment_jit_diagnostics: bool = False,
     reverse_segment_input_diagnostics: bool = False,
     reverse_rebuild_component_timing: bool = False,
@@ -3864,6 +3872,9 @@ def prepare_reverse_static_setup(
         segment_support_mode=reverse_database_segment_support_mode,
         interpolation_transpose_mode=(
             reverse_database_interpolation_transpose_mode
+        ),
+        root_interpolation_transpose_mode=(
+            reverse_database_root_interpolation_transpose_mode
         ),
     )
     if configured_physics is not execution_context.physics_context:
@@ -7045,7 +7056,20 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
                 er_profile=er_profile,
                 residual_bars=residual_bars,
                 support=support_payload,
+                interpolation_transpose_mode=str(
+                    getattr(
+                        reverse_setup.execution_context.physics_context,
+                        "reverse_database_root_interpolation_transpose_mode",
+                        "established",
+                    )
+                ),
             )
+            if phase_timing_diagnostics:
+                database_bars = jax.block_until_ready(database_bars)
+            root_ntx_support_pullback_elapsed = (
+                time.perf_counter() - root_ntx_support_pullback_start
+            )
+            root_geometry_pullback_start = time.perf_counter()
             geometry_bars = compact_initial_er_database_geometry_bars(
                 runtime=runtime,
                 state=pre_root_initial_state,
@@ -7054,11 +7078,9 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
                 support=support_payload,
             )
             if phase_timing_diagnostics:
-                database_bars, geometry_bars = jax.block_until_ready(
-                    (database_bars, geometry_bars)
-                )
-            root_ntx_support_pullback_elapsed = (
-                time.perf_counter() - root_ntx_support_pullback_start
+                geometry_bars = jax.block_until_ready(geometry_bars)
+            root_geometry_pullback_elapsed = (
+                time.perf_counter() - root_geometry_pullback_start
             )
             batched_support_bars = {
                 "geometry": geometry_bars,
@@ -8149,6 +8171,7 @@ def internal_realtime_geometry_transport_reverse_table_result_builder(
     reverse_database_support_objective_mode: str = "scalar",
     reverse_database_segment_support_mode: str = "inline",
     reverse_database_interpolation_transpose_mode: str = "established",
+    reverse_database_root_interpolation_transpose_mode: str = "established",
     reverse_segment_jit_diagnostics: bool = False,
     reverse_segment_input_diagnostics: bool = False,
     reverse_rebuild_component_timing: bool = False,
@@ -8314,6 +8337,10 @@ def internal_realtime_geometry_transport_reverse_table_result_builder(
             reverse_database_interpolation_transpose_mode=str(opts.get(
                 "reverse_database_interpolation_transpose_mode",
                 reverse_database_interpolation_transpose_mode,
+            )),
+            reverse_database_root_interpolation_transpose_mode=str(opts.get(
+                "reverse_database_root_interpolation_transpose_mode",
+                reverse_database_root_interpolation_transpose_mode,
             )),
             reverse_rhs_pullback_mode=str(opts.get("reverse_rhs_pullback_mode", reverse_rhs_pullback_mode)),
             reverse_initial_cache_support_pullback_mode=str(

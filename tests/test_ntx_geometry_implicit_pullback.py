@@ -1954,6 +1954,55 @@ def test_database_initial_root_support_batches_charge_weighted_particle_bars(mon
     assert jnp.allclose(actual["gamma"], expected, rtol=0.0, atol=0.0)
 
 
+def test_database_initial_root_support_sparse_dispatch_is_explicit(monkeypatch):
+    """The root table selector changes only its recorded-database transpose."""
+
+    calls = []
+
+    class _DatabaseModel:
+        def pullback_local_particle_flux_support_payload(self, *_args):
+            raise AssertionError("established root transpose was selected")
+
+        def pullback_local_particle_flux_support_payload_legacy_sparse(
+            self, _state, flux_bar, _support
+        ):
+            calls.append(flux_bar["Gamma"])
+            return {"database": {"gamma": 2.0 * flux_bar["Gamma"]}}
+
+    monkeypatch.setattr(
+        initial_er_module,
+        "find_ntx_database_transport_model_in_model",
+        lambda _model: _DatabaseModel(),
+    )
+    runtime = SimpleNamespace(
+        species=SimpleNamespace(charge_qp=jnp.asarray([-1.0, 2.0])),
+        models=SimpleNamespace(flux=object()),
+    )
+    state = TransportState(
+        density=jnp.ones((2, 3)),
+        pressure=2.0 * jnp.ones((2, 3)),
+        Er=jnp.asarray([0.1, 0.2, 0.3]),
+    )
+    residual_bars = jnp.asarray([[0.4, -0.2, 0.1], [-0.3, 0.5, 0.2]])
+
+    actual = initial_er_module.compact_initial_er_database_support_bars(
+        runtime=runtime,
+        state=state,
+        er_profile=state.Er,
+        residual_bars=residual_bars,
+        support={"database": object()},
+        interpolation_transpose_mode="legacy_sparse",
+    )
+
+    expected_gamma = (
+        runtime.species.charge_qp[None, :, None]
+        * residual_bars[:, None, :]
+    )
+    assert len(calls) == 1
+    assert jnp.allclose(calls[0], expected_gamma, rtol=0.0, atol=0.0)
+    assert jnp.allclose(actual["gamma"], 2.0 * expected_gamma)
+
+
 def test_database_initial_root_geometry_bars_stay_separate_from_table_bar(monkeypatch):
     """Selected-root local database geometry does not enter the scan bar."""
 
