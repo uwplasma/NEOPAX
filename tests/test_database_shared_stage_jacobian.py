@@ -51,6 +51,11 @@ def _case():
         reverse_database_table_only=True, reverse_database_include_direct_geometry=True,
         flat_rhs_direct_black_box_state_pullback=compact_state_must_not_run,
         flat_rhs_direct_database_split_support_pullback=support_pullback,
+        flat_rhs_direct_database_split_support_pullback_batched=(
+            lambda t, y, rhs_bars, support: jax.vmap(
+                lambda rhs_bar: support_pullback(t, y, rhs_bar, support)
+            )(rhs_bars)
+        ),
     )
     y = jnp.asarray([0.3, -0.2, 0.7, 0.1], dtype=dtype)
     stages = jnp.linspace(-0.4, 0.6, 12, dtype=dtype).reshape((3, 4))
@@ -255,3 +260,204 @@ def test_batched_database_support_core_dispatch_preserves_outputs(monkeypatch, s
     assert actual[1][0].shape == (10, 2)
     assert actual[1][1].shape == (10, 3)
     assert actual[2] is not None
+
+
+@pytest.mark.parametrize("compiled", [False, True], ids=["eager", "jit"])
+def test_deferred_database_support_matches_inline_step(compiled):
+    """Moving support after the state recurrence preserves the exact VJP."""
+    kernel, physics, carry, primal, rows = _case()
+    physics = dataclasses.replace(
+        physics,
+        reverse_database_stage_jacobian_mode="shared_multi_rhs",
+        reverse_database_support_objective_mode="batched_split",
+    )
+    next_bars = solvers._RadauAcceptedStepReducedCotangent(
+        y=rows[:, :4],
+        lagged_response_cache=None,
+        lagged_reference_y=jnp.zeros((10, 4), dtype=kernel.dtype),
+    )
+    support = {
+        "database": jnp.asarray([0.2, 0.7]),
+        "geometry": jnp.asarray([0.4, 0.1, -0.2]),
+    }
+
+    def evaluate(y, stage_history, rhs_rows, payload):
+        dynamic_carry = dataclasses.replace(carry, y=y)
+        dynamic_primal = dataclasses.replace(primal, stage_history=stage_history)
+        dynamic_next = dataclasses.replace(next_bars, y=rhs_rows[:, :4])
+        inline = solvers._execute_radau_accepted_step_next_reduced_cotangent_batched_bwd_with_support_from_primal_result_core(
+            kernel,
+            physics,
+            None,
+            "rebuild",
+            dynamic_carry,
+            dynamic_primal,
+            dynamic_next,
+            payload,
+            collect_database_geometry_record=True,
+        )
+        deferred = solvers._execute_radau_accepted_step_next_reduced_cotangent_batched_bwd_with_support_from_primal_result_core(
+            kernel,
+            physics,
+            None,
+            "rebuild",
+            dynamic_carry,
+            dynamic_primal,
+            dynamic_next,
+            payload,
+            collect_database_geometry_record=True,
+            collect_support_bar=False,
+        )
+        deferred_support = solvers._radau_database_support_pullback_from_stage_record(
+            physics,
+            deferred[2],
+            payload,
+        )
+        return inline, deferred, deferred_support
+
+    run = jax.jit(evaluate) if compiled else evaluate
+    inline, deferred, deferred_support = run(
+        carry.y,
+        primal.stage_history,
+        rows,
+        support,
+    )
+    _assert_tree_close(deferred[0], inline[0])
+    _assert_tree_close(deferred_support, inline[1])
+    assert all(np.all(value == 0) for value in jax.tree_util.tree_leaves(deferred[1]))
+
+
+def test_deferred_segment_support_batches_steps_and_masks_padding():
+    kernel, physics, carry, primal, rows = _case()
+    physics = dataclasses.replace(
+        physics,
+        reverse_database_stage_jacobian_mode="shared_multi_rhs",
+        reverse_database_support_objective_mode="batched_split",
+    )
+    support = {
+        "database": jnp.asarray([0.2, 0.7]),
+        "geometry": jnp.asarray([0.4, 0.1, -0.2]),
+    }
+    records = tuple(
+        solvers._radau_database_geometry_stage_record(
+            kernel,
+            dataclasses.replace(carry, t=carry.t + offset),
+            dataclasses.replace(primal, stage_history=primal.stage_history + offset),
+            rows * scale,
+        )
+        for offset, scale in ((0.0, 1.0), (0.03, -0.7), (0.08, 0.4))
+    )
+    stacked = jax.tree_util.tree_map(lambda *values: jnp.stack(values), *records)
+    active = jnp.asarray([True, False, True])
+    actual = solvers._radau_database_deferred_segment_support_pullback_call(
+        physics,
+        stacked,
+        active,
+        support,
+    )
+    expected_rows = tuple(
+        solvers._radau_database_support_pullback_from_stage_record(
+            physics, record, support
+        )
+        for record in (records[0], records[2])
+    )
+    expected = tuple(
+        lhs + rhs for lhs, rhs in zip(expected_rows[0], expected_rows[1], strict=True)
+    )
+    _assert_tree_close(actual, expected)
+
+
+def test_deferred_segment_support_matches_inline_segment():
+    """The complete deferred segment preserves state and support cotangents."""
+    kernel, physics, carry, primal, rows = _case()
+
+    @dataclasses.dataclass(frozen=True, eq=False)
+    class _KernelContext:
+        dtype: object
+        num_stages: int
+        state_dim: int
+        a: object
+        b: object
+        c: object
+        use_transport_lagged_response: bool
+
+    kernel = _KernelContext(**vars(kernel))
+    physics = dataclasses.replace(
+        physics,
+        reverse_database_stage_jacobian_mode="shared_multi_rhs",
+        reverse_database_support_objective_mode="batched_split",
+    )
+    attempt_context = solvers._RadauAcceptedStepAttemptContext(
+        t_final=jnp.asarray(1.0, dtype=kernel.dtype),
+        use_transport_lagged_response=False,
+    )
+
+    @dataclasses.dataclass(frozen=True, eq=False)
+    class _ExecutionContext:
+        kernel_context: object
+        physics_context: object
+        attempt_context: object
+
+    execution_context = _ExecutionContext(kernel, physics, attempt_context)
+    next_bars = solvers._RadauAcceptedStepReducedCotangent(
+        y=rows[:, :4],
+        lagged_response_cache=None,
+        lagged_reference_y=jnp.zeros((10, 4), dtype=kernel.dtype),
+    )
+    support = {
+        "database": jnp.asarray([0.2, 0.7]),
+        "geometry": jnp.asarray([0.4, 0.1, -0.2]),
+    }
+    second_carry = dataclasses.replace(
+        carry,
+        t=carry.t + carry.dt,
+        y=carry.y + jnp.asarray([0.02, -0.01, 0.03, 0.04]),
+    )
+    second_primal = dataclasses.replace(
+        primal,
+        carry_after_attempt=second_carry,
+        trial_y=second_carry.y + primal.trial_dt * (kernel.b @ primal.stage_history),
+        stage_history=primal.stage_history + 0.03,
+    )
+    carries = jax.tree_util.tree_map(
+        lambda *values: jnp.stack(values), carry, second_carry
+    )
+    records = jax.tree_util.tree_map(
+        lambda *values: jnp.stack(values),
+        solvers._radau_segment_primal_record_from_reverse_minimal_attempt(primal),
+        solvers._radau_segment_primal_record_from_reverse_minimal_attempt(second_primal),
+    )
+    segment_arrays = (
+        jnp.asarray([True, True]),
+        jnp.asarray([carry.dt, carry.dt]),
+    )
+
+    inline = solvers._radau_database_segment_reduced_cotangent_bwd_with_table_support_call(
+        execution_context,
+        "full",
+        next_bars,
+        carries,
+        records,
+        segment_arrays,
+        support,
+    )
+    deferred_state, stage_records = (
+        solvers._radau_database_segment_reduced_cotangent_bwd_with_deferred_support_call(
+            execution_context,
+            "full",
+            next_bars,
+            carries,
+            records,
+            segment_arrays,
+            support,
+        )
+    )
+    deferred_support = solvers._radau_database_deferred_segment_support_pullback_call(
+        physics,
+        stage_records,
+        segment_arrays[0],
+        support,
+    )
+
+    _assert_tree_close(deferred_state, inline[0])
+    _assert_tree_close(deferred_support, inline[1])

@@ -114,6 +114,8 @@ from ._transport_solvers import (
     _execute_radau_accepted_step_next_reduced_cotangent_batched_bwd_with_support_call,
     _execute_radau_accepted_step_next_reduced_cotangent_batched_bwd_with_support_from_segment_primal_record_call,
     _radau_database_segment_reduced_cotangent_bwd_with_table_support_call,
+    _radau_database_segment_reduced_cotangent_bwd_with_deferred_support_call,
+    _radau_database_deferred_segment_support_pullback_call,
     _radau_segment_reduced_cotangent_bwd_batched_with_support_call,
     _radau_segment_replay_minimal_with_primal_records_call,
     _radau_segment_reduced_cotangent_bwd_batched_with_support_from_primal_records_call,
@@ -3498,7 +3500,7 @@ def _configure_database_reverse_performance(
     physics_context, *, vector_field, species,
     initial_support_mode="split", support_preparation_mode="shared",
     center_geometry_mode="scalar_jvp", stage_jacobian_mode="independent",
-    support_objective_mode="scalar",
+    support_objective_mode="scalar", segment_support_mode="inline",
 ):
     """Rebind only opted-in database support hooks, never primal/root hooks.
 
@@ -3522,17 +3524,31 @@ def _configure_database_reverse_performance(
         "reverse_database_support_objective_mode": (
             str(support_objective_mode).strip().lower(), {"scalar", "batched_split"}
         ),
+        "reverse_database_segment_support_mode": (
+            str(segment_support_mode).strip().lower(),
+            {"inline", "deferred_segment_batch"},
+        ),
     }
     for name, (value, choices) in modes.items():
         if value not in choices:
             raise ValueError(f"{name} must be one of {sorted(choices)}; got {value!r}.")
     selected = {name: value for name, (value, _) in modes.items()}
+    if selected["reverse_database_segment_support_mode"] == "deferred_segment_batch" and (
+        selected["reverse_database_stage_jacobian_mode"] != "shared_multi_rhs"
+        or selected["reverse_database_support_objective_mode"] != "batched_split"
+        or selected["reverse_database_support_preparation_mode"] != "shared"
+    ):
+        raise ValueError(
+            "Deferred database segment support requires shared_multi_rhs stage "
+            "Jacobians, batched_split support objectives, and shared preparation."
+        )
     if (
         selected["reverse_database_initial_support_mode"] == "split"
         and selected["reverse_database_support_preparation_mode"] == "shared"
         and selected["reverse_database_center_geometry_mode"] == "scalar_jvp"
         and selected["reverse_database_stage_jacobian_mode"] == "independent"
         and selected["reverse_database_support_objective_mode"] == "scalar"
+        and selected["reverse_database_segment_support_mode"] == "inline"
     ):
         return physics_context
     if getattr(physics_context, "flat_rhs_direct_database_split_support_pullback", None) is None:
@@ -3604,6 +3620,7 @@ def prepare_reverse_static_setup(
     reverse_database_center_geometry_mode: str = "scalar_jvp",
     reverse_database_stage_jacobian_mode: str = "independent",
     reverse_database_support_objective_mode: str = "scalar",
+    reverse_database_segment_support_mode: str = "inline",
     reverse_segment_jit_diagnostics: bool = False,
     reverse_segment_input_diagnostics: bool = False,
     reverse_rebuild_component_timing: bool = False,
@@ -3780,6 +3797,7 @@ def prepare_reverse_static_setup(
         center_geometry_mode=reverse_database_center_geometry_mode,
         stage_jacobian_mode=reverse_database_stage_jacobian_mode,
         support_objective_mode=reverse_database_support_objective_mode,
+        segment_support_mode=reverse_database_segment_support_mode,
     )
     if configured_physics is not execution_context.physics_context:
         execution_context = dataclasses.replace(execution_context, physics_context=configured_physics)
@@ -4199,6 +4217,9 @@ def prepare_realtime_geometry_support_segment_core_setup(
         reverse_database_stage_jacobian_mode=getattr(args, "reverse_database_stage_jacobian_mode", "independent"),
         reverse_database_support_objective_mode=getattr(
             args, "reverse_database_support_objective_mode", "scalar"
+        ),
+        reverse_database_segment_support_mode=getattr(
+            args, "reverse_database_segment_support_mode", "inline"
         ),
         reverse_rhs_pullback_mode=getattr(args, "reverse_rhs_pullback_mode", "separate"),
         reverse_initial_cache_support_pullback_mode=getattr(
@@ -5229,6 +5250,20 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
         isinstance(support_payload, dict)
         and set(support_payload) == {"geometry", "database"}
     )
+    database_segment_support_mode = str(
+        getattr(
+            reverse_setup.execution_context.physics_context,
+            "reverse_database_segment_support_mode",
+            "inline",
+        )
+    ).strip().lower()
+    if database_segment_support_mode not in {"inline", "deferred_segment_batch"}:
+        raise ValueError(
+            "reverse_database_segment_support_mode must be 'inline' or "
+            f"'deferred_segment_batch'; got {database_segment_support_mode!r}."
+        )
+    if database_segment_support_mode != "inline" and not use_database_table_reverse:
+        raise ValueError("Deferred database segment support requires a database payload.")
 
     reduced_bars = _reverse_reduced_cotangent(
         reverse_setup.execution_context,
@@ -5993,10 +6028,21 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
             )
         return reduced_value, support_value, tuple(rows)
 
+    database_deferred_support_physics = (
+        dataclasses.replace(
+            reverse_setup.execution_context.physics_context,
+            reverse_database_table_only=True,
+            reverse_database_include_direct_geometry=True,
+        )
+        if database_segment_support_mode == "deferred_segment_batch"
+        else None
+    )
     phase_start = time.perf_counter()
     actual_cotangent_nonfinite_segment_diagnosed = False
     for segment_index in range(segment_count - 1, -1, -1):
         segment_phase_start = time.perf_counter()
+        deferred_state_elapsed = None
+        deferred_support_elapsed = None
         if segment_jit_diagnostics:
             cache_before = (
                 _jax_trace_cache_size(_radau_segment_reduced_cotangent_bwd_batched_with_support_call),
@@ -6039,26 +6085,57 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
                     segment_arrays,
                 )
             )
-            (
-                reduced_bars,
-                segment_support_bar_leaves,
-            ) = _radau_database_segment_reduced_cotangent_bwd_with_table_support_call(
-                reverse_setup.execution_context,
-                cotangent_mode,
-                reduced_bars,
-                database_step_start_carries,
-                database_step_primal_records,
-                segment_arrays,
-                support_payload,
-            )
-            reduced_bars, segment_support_bar_leaves = (
-                jax.block_until_ready(
-                    (
+            if database_segment_support_mode == "deferred_segment_batch":
+                deferred_start = time.perf_counter()
+                reduced_bars, database_stage_records = (
+                    _radau_database_segment_reduced_cotangent_bwd_with_deferred_support_call(
+                        reverse_setup.execution_context,
+                        cotangent_mode,
                         reduced_bars,
-                        segment_support_bar_leaves,
+                        database_step_start_carries,
+                        database_step_primal_records,
+                        segment_arrays,
+                        support_payload,
                     )
                 )
-            )
+                reduced_bars, database_stage_records = jax.block_until_ready(
+                    (reduced_bars, database_stage_records)
+                )
+                deferred_state_elapsed = time.perf_counter() - deferred_start
+                deferred_start = time.perf_counter()
+                segment_support_bar_leaves = (
+                    _radau_database_deferred_segment_support_pullback_call(
+                        database_deferred_support_physics,
+                        database_stage_records,
+                        segment_arrays[0],
+                        support_payload,
+                    )
+                )
+                segment_support_bar_leaves = jax.block_until_ready(
+                    segment_support_bar_leaves
+                )
+                deferred_support_elapsed = time.perf_counter() - deferred_start
+            else:
+                (
+                    reduced_bars,
+                    segment_support_bar_leaves,
+                ) = _radau_database_segment_reduced_cotangent_bwd_with_table_support_call(
+                    reverse_setup.execution_context,
+                    cotangent_mode,
+                    reduced_bars,
+                    database_step_start_carries,
+                    database_step_primal_records,
+                    segment_arrays,
+                    support_payload,
+                )
+                reduced_bars, segment_support_bar_leaves = (
+                    jax.block_until_ready(
+                        (
+                            reduced_bars,
+                            segment_support_bar_leaves,
+                        )
+                    )
+                )
         elif host_static_branch_dispatch:
             reduced_bars, segment_support_bar_leaves = _run_host_static_branch_segment(
                 segment_start_carry,
@@ -6226,7 +6303,15 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
             f"elapsed_s={time.perf_counter() - segment_phase_start:.3f} "
             f"active_steps={int(np.count_nonzero(segment_active))} "
             f"support_reuse={segment_support_reuse_count} "
-            f"support_rebuild={segment_support_rebuild_count}",
+            f"support_rebuild={segment_support_rebuild_count}"
+            + (
+                ""
+                if deferred_state_elapsed is None
+                else (
+                    f" deferred_state_s={deferred_state_elapsed:.3f} "
+                    f"deferred_support_s={deferred_support_elapsed:.3f}"
+                )
+            ),
             flush=True,
         )
         if segment_input_diagnostics:
@@ -7941,6 +8026,7 @@ def internal_realtime_geometry_transport_reverse_table_result_builder(
     reverse_database_center_geometry_mode: str = "scalar_jvp",
     reverse_database_stage_jacobian_mode: str = "independent",
     reverse_database_support_objective_mode: str = "scalar",
+    reverse_database_segment_support_mode: str = "inline",
     reverse_segment_jit_diagnostics: bool = False,
     reverse_segment_input_diagnostics: bool = False,
     reverse_rebuild_component_timing: bool = False,
@@ -8095,6 +8181,10 @@ def internal_realtime_geometry_transport_reverse_table_result_builder(
             reverse_database_support_objective_mode=str(opts.get(
                 "reverse_database_support_objective_mode",
                 reverse_database_support_objective_mode,
+            )),
+            reverse_database_segment_support_mode=str(opts.get(
+                "reverse_database_segment_support_mode",
+                reverse_database_segment_support_mode,
             )),
             reverse_rhs_pullback_mode=str(opts.get("reverse_rhs_pullback_mode", reverse_rhs_pullback_mode)),
             reverse_initial_cache_support_pullback_mode=str(

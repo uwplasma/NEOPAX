@@ -414,6 +414,7 @@ def test_configure_legacy_modes_rebinds_and_forwards_both_support_hooks():
         "center_geometry_mode",
         "stage_jacobian_mode",
         "support_objective_mode",
+        "segment_support_mode",
     ],
 )
 def test_configure_rejects_unknown_modes(option):
@@ -451,6 +452,28 @@ def test_configure_batched_support_requires_matrix_rhs_hook():
             species=object(),
             support_objective_mode="batched_split",
         )
+
+
+def test_configure_deferred_segment_support_isolated_to_batched_shared_contract():
+    physics = _physics_context()
+    with pytest.raises(ValueError, match="shared_multi_rhs"):
+        _configure_database_reverse_performance(
+            physics,
+            vector_field=_unexpected_hook,
+            species=object(),
+            segment_support_mode="deferred_segment_batch",
+        )
+    actual = _configure_database_reverse_performance(
+        physics,
+        vector_field=_unexpected_hook,
+        species=object(),
+        stage_jacobian_mode="shared_multi_rhs",
+        support_objective_mode="batched_split",
+        segment_support_mode="deferred_segment_batch",
+    )
+    assert actual.reverse_database_segment_support_mode == "deferred_segment_batch"
+    assert actual.reverse_database_stage_jacobian_mode == "shared_multi_rhs"
+    assert actual.reverse_database_support_objective_mode == "batched_split"
 
 
 def test_reduced_zero_preserves_real_initial_carry_root_and_profile_pullbacks():

@@ -18,7 +18,9 @@ by the selector implementation or its small regression tests.
 | `--reverse-database-initial-support-mode` | `generic` | `split` | `reduced_zero` |
 | `--reverse-database-support-preparation-mode` | `separate` | `shared` | unchanged |
 | `--reverse-database-center-geometry-mode` | `radial_vjp` | `scalar_jvp` | unchanged |
-| `--reverse-database-stage-jacobian-mode` | `independent` | `independent` | `shared` |
+| `--reverse-database-stage-jacobian-mode` | `independent` | `independent` | `shared_multi_rhs` |
+| `--reverse-database-support-objective-mode` | `scalar` | `scalar` | `batched_split` |
+| `--reverse-database-segment-support-mode` | `inline` | `inline` | `deferred_segment_batch` |
 
 Selecting `generic / separate / radial_vjp` restores the earlier performance
 implementations for these three changed boundaries without reverting commits.
@@ -154,15 +156,46 @@ Verification: 67 focused mode/shared-J/support/root-preservation tests passed;
 final CLI restriction was added, 23 CLI/Radau/root-JIT cases passed again.
 The actual benchmark `--help` also exposes all four controls successfully.
 
+## Completed `shared_multi_rhs + batched_split` result
+
+The completed 2026-09-13 16/4 run preserved every transport derivative at
+printed precision and reduced peak host RSS from 13.815 GiB to 12.792 GiB.
+It reduced the cold segment from 1009.543 s to 823.761 s, but the mean warm
+segment increased from 22.264 s to 23.779 s. It therefore did not meet the
+warm-runtime target. See
+[the completed batched-modes record](database_reverse_16x4_2026-09-13_batched_modes_run.md).
+
+## Deferred segment-support candidate
+
+For the direct database RHS, a step's support cotangent does not feed the
+state-adjoint recurrence. The exact residual-stage cotangents can therefore be
+retained as a bounded numeric record while the four state steps run
+sequentially, after which the four independent fixed-table/local-geometry
+support contractions can be transformed together. The final recorded NTX
+scan is still transposed exactly once after the complete segmented sweep.
+
+`deferred_segment_batch` implements that schedule without changing the seven
+converged-stage Jacobians, dense block solve, signs, state recurrence,
+coordinate/table ownership or derivative formulas. It requires
+`shared_multi_rhs`, `batched_split`, shared support preparation, `block`,
+`explicit_database`, full cotangents, separate RHS pullback, default stage
+memory, and the reduced-cotangent call boundary. All other combinations are
+rejected, and the default remains `inline`.
+
+The exact eager/JIT step result, padding mask, complete two-step segment result,
+CLI isolation and mode plumbing passed 82 focused CPU tests. This establishes
+mathematical and routing parity only. Warm GPU speed and peak RSS remain
+unmeasured.
+
 ## Reproducible no-diagnostics 16/4 command
 
 Run from the NEOPAX repository. This explicitly selects the completed-run
 reference. For the initial-support candidate change only `split` to
 `reduced_zero`. For the earlier implementation change the three values to
 `generic`, `separate`, `radial_vjp` respectively.
-For the warm-stage candidate change `independent` to `shared`.
-The two new candidates are independent and can be tested separately or together;
-neither changes the default.
+For the completed batched candidate select `shared_multi_rhs` and
+`batched_split`. For the deferred candidate additionally select
+`deferred_segment_batch`. These options do not change the default.
 
 ```bash
 env -u JAX_COMPILATION_CACHE_DIR \
@@ -196,10 +229,12 @@ env -u JAX_COMPILATION_CACHE_DIR \
   --reverse-database-initial-support-mode split \
   --reverse-database-support-preparation-mode shared \
   --reverse-database-center-geometry-mode scalar_jvp \
-  --reverse-database-stage-jacobian-mode independent
+  --reverse-database-stage-jacobian-mode shared_multi_rhs \
+  --reverse-database-support-objective-mode batched_split \
+  --reverse-database-segment-support-mode deferred_segment_batch
 ```
 
-All four selectors are printed in the full-transport progress banner and
+All selectors are printed in the full-transport progress banner and
 stored in its JSON result. Keep the executed command and `/usr/bin/time -v`
 footer alongside every comparison; do not infer the settings from a pasted,
 possibly mangled shell header.

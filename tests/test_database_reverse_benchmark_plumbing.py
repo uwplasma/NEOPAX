@@ -82,8 +82,8 @@ def _check_performance_args(args, is_database=True):
                 for target in node.targets)
     )
     # Real override detection, lane guard, config RHS resolution, shared-stage
-    # guard and batched-support guard.
-    nodes = main.body[index:index + 5]
+    # guard, batched-support guard, and deferred-segment-support guard.
+    nodes = main.body[index:index + 6]
     assert all(isinstance(node, ast.If) for node in nodes[1:])
     exec(compile(ast.Module(body=nodes, type_ignores=[]), "<mode-checks>", "exec"), {
         "args": args, "is_database_geometry_reverse": is_database,
@@ -95,6 +95,7 @@ def test_database_performance_cli_defaults_preserve_root_and_lij_lanes():
                              full_transport_shared_payload_smoke=False)
     assert args.reverse_database_stage_jacobian_mode == "independent"
     assert args.reverse_database_support_objective_mode == "scalar"
+    assert args.reverse_database_segment_support_mode == "inline"
     assert args.reverse_database_initial_support_mode == "split"
     assert args.reverse_database_support_preparation_mode == "shared"
     assert args.reverse_database_center_geometry_mode == "scalar_jvp"
@@ -151,6 +152,40 @@ def test_batched_split_support_cli_resolves_database_config_before_validation():
     assert args.reverse_rhs_transpose_mode == "explicit_database"
 
 
+@pytest.mark.parametrize("options", [
+    {"initial_er_root_only_optimization_smoke": True},
+    {"full_transport_shared_payload_smoke": False},
+    {"reverse_stage_adjoint_solve_mode": "block_database_multi_rhs"},
+    {"reverse_stage_cotangent_mode": "zero_stage_solve"},
+    {"reverse_rhs_pullback_mode": "fused_ntx"},
+    {"reverse_stage_adjoint_memory_mode": "stage_call_boundary"},
+    {"reverse_rhs_transpose_mode": "generic"},
+    {"reverse_step_bwd_mode": "current"},
+    {"reverse_database_stage_jacobian_mode": "shared"},
+    {"reverse_database_support_objective_mode": "scalar"},
+    {"reverse_database_support_preparation_mode": "separate"},
+])
+def test_deferred_segment_support_cli_rejects_incompatible_contracts(options):
+    selected = {
+        "reverse_database_stage_jacobian_mode": "shared_multi_rhs",
+        "reverse_database_support_objective_mode": "batched_split",
+        "reverse_database_segment_support_mode": "deferred_segment_batch",
+    }
+    selected.update(options)
+    with pytest.raises(SystemExit):
+        _check_performance_args(_performance_args(**selected))
+
+
+def test_deferred_segment_support_cli_resolves_database_config_before_validation():
+    args = _performance_args(
+        reverse_database_stage_jacobian_mode="shared_multi_rhs",
+        reverse_database_support_objective_mode="batched_split",
+        reverse_database_segment_support_mode="deferred_segment_batch",
+    )
+    _check_performance_args(args)
+    assert args.reverse_rhs_transpose_mode == "explicit_database"
+
+
 def test_legacy_performance_cli_is_database_full_transport_only():
     args = _performance_args(reverse_database_initial_support_mode="generic",
                              reverse_database_support_preparation_mode="separate",
@@ -172,8 +207,8 @@ def test_benchmark_callback_preserves_configured_execution_and_primal_contexts(o
     solver = SimpleNamespace(max_steps=8)
     species, vector_field = object(), object()
     seen = []
-    modes = ("generic", "separate", "radial_vjp", "shared", "batched_split") if override else (
-        "split", "shared", "scalar_jvp", "independent", "scalar"
+    modes = ("generic", "separate", "radial_vjp", "shared_multi_rhs", "batched_split", "deferred_segment_batch") if override else (
+        "split", "shared", "scalar_jvp", "independent", "scalar", "inline"
     )
 
     def _configure(physics, **kwargs):
@@ -200,6 +235,7 @@ def test_benchmark_callback_preserves_configured_execution_and_primal_contexts(o
         "reverse_database_center_geometry_mode",
         "reverse_database_stage_jacobian_mode",
         "reverse_database_support_objective_mode",
+        "reverse_database_segment_support_mode",
     ), modes, strict=True)) if override else {}
     result = callback(
         None, config={}, runtime=SimpleNamespace(species=species),
@@ -207,7 +243,7 @@ def test_benchmark_callback_preserves_configured_execution_and_primal_contexts(o
     )
     assert seen == [dict(zip((
         "initial_support_mode", "support_preparation_mode", "center_geometry_mode",
-        "stage_jacobian_mode", "support_objective_mode",
+        "stage_jacobian_mode", "support_objective_mode", "segment_support_mode",
     ), modes, strict=True))]
     assert result.prepared_rollout is prepared
     assert prepared.physics_context is original_physics

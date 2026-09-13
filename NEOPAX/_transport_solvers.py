@@ -4960,6 +4960,7 @@ class _RadauAcceptedStepPhysicsContext:
     # Opt-in, call-local reuse of exact stage Jacobians; never a carry/tape field.
     reverse_database_stage_jacobian_mode: str = "independent"
     reverse_database_support_objective_mode: str = "scalar"
+    reverse_database_segment_support_mode: str = "inline"
     reverse_initial_cache_support_pullback_mode: str = "scalar"
     reverse_rebuild_support_pullback_mode: str = "separate"
     reverse_segment_jit_diagnostics: bool = False
@@ -7264,6 +7265,7 @@ def _execute_radau_accepted_step_next_reduced_cotangent_batched_bwd_with_support
     support,
     *,
     collect_database_geometry_record: bool,
+    collect_support_bar: bool = True,
 ) -> tuple[
     _RadauAcceptedStepReducedCotangent,
     tuple[Any, ...],
@@ -7498,44 +7500,58 @@ def _execute_radau_accepted_step_next_reduced_cotangent_batched_bwd_with_support
                         compute_dt_bar=False,
                     )
                 )(residual_bars)
-        with _radau_reverse_profile_scope(
-            physics_context, "reverse_segment/fixed_lagged_rhs_support_transpose"
-        ):
-            if (
-                lagged_response is None
-                and bool(
-                    getattr(physics_context, "reverse_database_table_only", False)
-                )
+        if collect_support_bar:
+            with _radau_reverse_profile_scope(
+                physics_context, "reverse_segment/fixed_lagged_rhs_support_transpose"
             ):
-                support_bar_leaves = (
-                    _radau_exact_stage_residual_database_table_support_pullback_batched(
-                        kernel_context,
-                        physics_context,
-                        carry_in,
-                        primal_result,
-                        residual_bars,
-                        support,
+                if (
+                    lagged_response is None
+                    and bool(
+                        getattr(physics_context, "reverse_database_table_only", False)
                     )
-                )
-            else:
-                support_bar_leaves = jax.vmap(
-                    lambda residual_bar: tuple(
-                        jax.tree_util.tree_leaves(
-                            _radau_sanitize_support_delta_bar_tree(
-                                support,
-                                _radau_exact_stage_residual_support_pullback(
-                                    kernel_context,
-                                    physics_context,
-                                    carry_in,
-                                    primal_result,
-                                    lagged_response,
-                                    residual_bar,
-                                    support,
-                                ),
-                            )
+                ):
+                    support_bar_leaves = (
+                        _radau_exact_stage_residual_database_table_support_pullback_batched(
+                            kernel_context,
+                            physics_context,
+                            carry_in,
+                            primal_result,
+                            residual_bars,
+                            support,
                         )
                     )
-                )(residual_bars)
+                else:
+                    support_bar_leaves = jax.vmap(
+                        lambda residual_bar: tuple(
+                            jax.tree_util.tree_leaves(
+                                _radau_sanitize_support_delta_bar_tree(
+                                    support,
+                                    _radau_exact_stage_residual_support_pullback(
+                                        kernel_context,
+                                        physics_context,
+                                        carry_in,
+                                        primal_result,
+                                        lagged_response,
+                                        residual_bar,
+                                        support,
+                                    ),
+                                )
+                            )
+                        )
+                    )(residual_bars)
+        else:
+            if lagged_response is not None:
+                raise ValueError(
+                    "Deferred support collection is restricted to the direct "
+                    "database RHS."
+                )
+            support_bar_leaves = tuple(
+                jnp.broadcast_to(
+                    jnp.asarray(leaf)[None, ...],
+                    (objective_count,) + jnp.asarray(leaf).shape,
+                )
+                for leaf in jax.tree_util.tree_leaves(zero_support_bar)
+            )
     else:
         raise ValueError(f"Unknown reverse_rhs_pullback_mode '{rhs_pullback_mode}'.")
     if collect_native_vmec_coefficients:
@@ -8033,6 +8049,46 @@ def _execute_radau_accepted_step_next_reduced_cotangent_batched_bwd_with_databas
     )
 
 
+def _execute_radau_database_step_reduced_cotangent_with_deferred_support_from_segment_primal_record(
+    kernel_context: _RadauAcceptedStepKernelContext,
+    physics_context: _RadauAcceptedStepPhysicsContext,
+    context: _RadauAcceptedStepAttemptContext,
+    carry_in: _RadauAcceptedStepCarry,
+    primal_record: _RadauAcceptedStepSegmentPrimalRecord,
+    next_reduced_bars: _RadauAcceptedStepReducedCotangent,
+    support,
+) -> tuple[_RadauAcceptedStepReducedCotangent, _RadauDatabaseGeometryStageRecord]:
+    """Run the exact database state recurrence and defer its support transpose.
+
+    The stage residual cotangents are already required for the state adjoint.
+    Retaining those small numerical rows lets the independent table/geometry
+    transpose run after the reverse scan, without recomputing a stage matrix
+    or changing any Radau derivative.
+    """
+    primal_result = _radau_reverse_minimal_attempt_from_segment_primal_record(
+        carry_in,
+        context,
+        primal_record,
+    )
+    reduced_bars, _, stage_record = (
+        _execute_radau_accepted_step_next_reduced_cotangent_batched_bwd_with_support_from_primal_result_core(
+            kernel_context,
+            physics_context,
+            context,
+            "rebuild",
+            carry_in,
+            primal_result,
+            next_reduced_bars,
+            support,
+            collect_database_geometry_record=True,
+            collect_support_bar=False,
+        )
+    )
+    if stage_record is None:
+        raise AssertionError("Deferred database support requires a stage record.")
+    return reduced_bars, stage_record
+
+
 @partial(jax.jit, static_argnums=(0, 1, 2, 3), inline=False)
 def _execute_radau_accepted_step_next_reduced_cotangent_batched_bwd_with_support_call(
     kernel_context: _RadauAcceptedStepKernelContext,
@@ -8106,6 +8162,28 @@ def _execute_radau_accepted_step_next_reduced_cotangent_batched_bwd_with_databas
         physics_context,
         context,
         lagged_response_branch,
+        carry_in,
+        primal_record,
+        next_reduced_bars,
+        support,
+    )
+
+
+@partial(jax.jit, static_argnums=(0, 1, 2), inline=False)
+def _execute_radau_database_step_reduced_cotangent_with_deferred_support_from_segment_primal_record_call(
+    kernel_context: _RadauAcceptedStepKernelContext,
+    physics_context: _RadauAcceptedStepPhysicsContext,
+    context: _RadauAcceptedStepAttemptContext,
+    carry_in: _RadauAcceptedStepCarry,
+    primal_record: _RadauAcceptedStepSegmentPrimalRecord,
+    next_reduced_bars: _RadauAcceptedStepReducedCotangent,
+    support,
+) -> tuple[_RadauAcceptedStepReducedCotangent, _RadauDatabaseGeometryStageRecord]:
+    """Non-inlined exact database state step for deferred segment support."""
+    return _execute_radau_database_step_reduced_cotangent_with_deferred_support_from_segment_primal_record(
+        kernel_context,
+        physics_context,
+        context,
         carry_in,
         primal_record,
         next_reduced_bars,
@@ -9358,6 +9436,99 @@ def _radau_database_segment_reduced_cotangent_bwd_with_table_support_call(
         reverse=True,
     )
     return segment_start_reduced_bars, segment_support_bar_leaves
+
+
+@partial(jax.jit, static_argnums=(0, 1), inline=False)
+def _radau_database_segment_reduced_cotangent_bwd_with_deferred_support_call(
+    execution_context: _RadauSolveExecutionContext,
+    cotangent_mode: str,
+    segment_reduced_bars: _RadauAcceptedStepReducedCotangent,
+    step_start_carries: _RadauAcceptedStepCarry,
+    step_primal_records: _RadauAcceptedStepSegmentPrimalRecord,
+    segment_arrays,
+    support,
+) -> tuple[
+    _RadauAcceptedStepReducedCotangent,
+    _RadauDatabaseGeometryStageRecord,
+]:
+    """Run the exact database state recurrence and expose support-only records.
+
+    Support cotangents never feed the state adjoint. Keeping them out of this
+    reverse scan allows the caller to batch the independent per-step support
+    contractions without changing the sequential Radau state recurrence.
+    """
+    if str(cotangent_mode).strip().lower() in {
+        "zero_step_bwd", "step_bwd_zero", "zero_accepted_step_bwd"
+    }:
+        raise ValueError("The deferred database segment requires a full step reverse.")
+    if not isinstance(support, dict) or set(support) != {"geometry", "database"}:
+        raise ValueError(
+            "Deferred database segments require exactly {'geometry', 'database'} support."
+        )
+    physics_context = dataclasses.replace(
+        execution_context.physics_context,
+        reverse_database_table_only=True,
+        reverse_database_include_direct_geometry=True,
+    )
+    objective_count = jnp.asarray(segment_reduced_bars.y).shape[0]
+    zero_record = _RadauDatabaseGeometryStageRecord(
+        stage_times=jnp.zeros(
+            (execution_context.kernel_context.num_stages,),
+            dtype=execution_context.kernel_context.dtype,
+        ),
+        stage_states=jnp.zeros(
+            (
+                execution_context.kernel_context.num_stages,
+                execution_context.kernel_context.state_dim,
+            ),
+            dtype=execution_context.kernel_context.dtype,
+        ),
+        residual_bars=jnp.zeros(
+            (
+                objective_count,
+                execution_context.kernel_context.num_stages,
+                execution_context.kernel_context.state_dim,
+            ),
+            dtype=execution_context.kernel_context.dtype,
+        ),
+    )
+
+    def _slot_bwd(slot_reduced_bars, slot_xs):
+        step_start_carry, primal_record, slot_arrays = slot_xs
+        active, dt_value, *_ = slot_arrays
+        residual_carry = _radau_carry_with_forward_only_jvp_fields(
+            dataclasses.replace(step_start_carry, dt=dt_value)
+        )
+
+        def _do_step(_):
+            return _execute_radau_database_step_reduced_cotangent_with_deferred_support_from_segment_primal_record_call(
+                execution_context.kernel_context,
+                physics_context,
+                execution_context.attempt_context,
+                residual_carry,
+                primal_record,
+                slot_reduced_bars,
+                support,
+            )
+
+        def _skip(_):
+            return slot_reduced_bars, zero_record
+
+        next_reduced_bars, stage_record = jax.lax.cond(
+            active,
+            _do_step,
+            _skip,
+            operand=None,
+        )
+        return next_reduced_bars, stage_record
+
+    segment_start_reduced_bars, stage_records = jax.lax.scan(
+        _slot_bwd,
+        segment_reduced_bars,
+        (step_start_carries, step_primal_records, segment_arrays),
+        reverse=True,
+    )
+    return segment_start_reduced_bars, stage_records
 
 
 @partial(jax.jit, static_argnums=(0, 1, 2, 3), inline=False)
@@ -11447,6 +11618,149 @@ def _radau_exact_stage_residual_database_table_support_pullback_batched(
         (stage_times, stage_states, jnp.moveaxis(residual_bars, 1, 0)),
     )
     return support_bar_leaves
+
+
+def _radau_database_support_pullback_from_stage_record(
+    physics_context: _RadauAcceptedStepPhysicsContext,
+    stage_record: _RadauDatabaseGeometryStageRecord,
+    support,
+):
+    """Apply the exact split database support transpose to saved stage rows.
+
+    This is the record-consuming form of
+    ``_radau_exact_stage_residual_database_table_support_pullback_batched``.
+    It reconstructs neither a Radau step nor an NTX scan; the record contains
+    exactly the stage time, state and residual cotangent consumed by the
+    established direct-support boundary.
+    """
+    if not isinstance(support, dict) or set(support) != {"geometry", "database"}:
+        raise ValueError(
+            "Deferred database support requires exactly {'geometry', 'database'}."
+        )
+    include_direct_geometry = bool(
+        getattr(physics_context, "reverse_database_include_direct_geometry", False)
+    )
+    support_objective_mode = str(
+        getattr(physics_context, "reverse_database_support_objective_mode", "scalar")
+    ).strip().lower()
+    if support_objective_mode not in {"scalar", "batched_split"}:
+        raise ValueError(
+            "reverse_database_support_objective_mode must be 'scalar' or "
+            f"'batched_split'; got {support_objective_mode!r}."
+        )
+    if support_objective_mode == "batched_split" and not include_direct_geometry:
+        raise ValueError(
+            "batched_split database support requires the direct-geometry split path."
+        )
+    if include_direct_geometry:
+        scalar_direct_pullback = (
+            getattr(
+                physics_context,
+                "flat_rhs_direct_database_split_support_pullback",
+                None,
+            )
+            if support_objective_mode == "scalar"
+            else None
+        )
+        batched_direct_pullback = (
+            getattr(
+                physics_context,
+                "flat_rhs_direct_database_split_support_pullback_batched",
+                None,
+            )
+            if support_objective_mode == "batched_split"
+            else None
+        )
+    else:
+        scalar_direct_pullback = getattr(
+            physics_context, "flat_rhs_direct_database_table_pullback", None
+        )
+        batched_direct_pullback = getattr(
+            physics_context, "flat_rhs_direct_database_table_pullback_batched", None
+        )
+    if scalar_direct_pullback is None and batched_direct_pullback is None:
+        raise ValueError(
+            "Deferred database support requires its explicit split-support "
+            "or fixed-table RHS pullback boundary."
+        )
+
+    residual_bars = jnp.asarray(stage_record.residual_bars)
+    objective_count = residual_bars.shape[0]
+    support_zero = _radau_zero_support_delta_tree_like(support)
+    zero_leaves = tuple(
+        jnp.broadcast_to(
+            jnp.asarray(leaf)[None, ...],
+            (objective_count,) + jnp.asarray(leaf).shape,
+        )
+        for leaf in jax.tree_util.tree_leaves(support_zero)
+    )
+
+    def _stage_pullback(accumulated_leaves, stage_inputs):
+        t_eval, y_eval, rhs_bars_eval = stage_inputs
+        if scalar_direct_pullback is None:
+            stage_value = batched_direct_pullback(
+                t_eval, y_eval, -rhs_bars_eval, support
+            )
+        else:
+            stage_value = jax.vmap(
+                lambda rhs_bar: scalar_direct_pullback(
+                    t_eval, y_eval, -rhs_bar, support
+                )
+            )(rhs_bars_eval)
+        stage_support_bar = _radau_sanitize_support_delta_bar_tree(
+            support,
+            stage_value,
+        )
+        stage_leaves = tuple(jax.tree_util.tree_leaves(stage_support_bar))
+        return tuple(
+            accumulated + stage
+            for accumulated, stage in zip(
+                accumulated_leaves, stage_leaves, strict=True
+            )
+        ), None
+
+    support_bar_leaves, _ = jax.lax.scan(
+        _stage_pullback,
+        zero_leaves,
+        (
+            stage_record.stage_times,
+            stage_record.stage_states,
+            jnp.moveaxis(residual_bars, 1, 0),
+        ),
+    )
+    return support_bar_leaves
+
+
+@partial(jax.jit, static_argnums=(0,), inline=False)
+def _radau_database_deferred_segment_support_pullback_call(
+    physics_context: _RadauAcceptedStepPhysicsContext,
+    stage_records: _RadauDatabaseGeometryStageRecord,
+    active_slots,
+    support,
+):
+    """Batch independent support transposes after a segment state recurrence."""
+    step_support_leaves = jax.vmap(
+        lambda record: _radau_database_support_pullback_from_stage_record(
+            physics_context,
+            record,
+            support,
+        )
+    )(stage_records)
+    active_slots = jnp.asarray(active_slots, dtype=bool)
+    return tuple(
+        jnp.sum(
+            jnp.where(
+                active_slots.reshape(
+                    (active_slots.shape[0],)
+                    + (1,) * (jnp.asarray(leaf).ndim - 1)
+                ),
+                leaf,
+                jnp.zeros_like(leaf),
+            ),
+            axis=0,
+        )
+        for leaf in step_support_leaves
+    )
 
 
 def _radau_exact_stage_residual_support_pullback(

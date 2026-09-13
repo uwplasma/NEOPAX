@@ -2274,6 +2274,7 @@ def _prepare_reverse_static_setup(
     reverse_database_center_geometry_mode: str = "scalar_jvp",
     reverse_database_stage_jacobian_mode: str = "independent",
     reverse_database_support_objective_mode: str = "scalar",
+    reverse_database_segment_support_mode: str = "inline",
     reverse_segment_jit_diagnostics: bool = False,
     reverse_segment_input_diagnostics: bool = False,
     reverse_rebuild_component_timing: bool = False,
@@ -2321,6 +2322,7 @@ def _prepare_reverse_static_setup(
         center_geometry_mode=reverse_database_center_geometry_mode,
         stage_jacobian_mode=reverse_database_stage_jacobian_mode,
         support_objective_mode=reverse_database_support_objective_mode,
+        segment_support_mode=reverse_database_segment_support_mode,
     )
     if configured_physics is not execution_context.physics_context:
         execution_context = dataclasses.replace(execution_context, physics_context=configured_physics)
@@ -4078,6 +4080,7 @@ def _run_realtime_geometry_optimization_api_smoke(
             f"database_center_geometry_mode={args.reverse_database_center_geometry_mode} "
             f"database_stage_jacobian_mode={args.reverse_database_stage_jacobian_mode} "
             f"database_support_objective_mode={args.reverse_database_support_objective_mode} "
+            f"database_segment_support_mode={args.reverse_database_segment_support_mode} "
             f"segment_jit_diagnostics={args.reverse_segment_jit_diagnostics} "
             f"segment_input_diagnostics={args.reverse_segment_input_diagnostics} "
             f"segment_start_replay_mode={args.reverse_segment_start_replay_mode} "
@@ -4136,6 +4139,9 @@ def _run_realtime_geometry_optimization_api_smoke(
             reverse_database_stage_jacobian_mode=str(args.reverse_database_stage_jacobian_mode),
             reverse_database_support_objective_mode=str(
                 args.reverse_database_support_objective_mode
+            ),
+            reverse_database_segment_support_mode=str(
+                args.reverse_database_segment_support_mode
             ),
             reverse_initial_cache_support_pullback_mode=str(
                 args.reverse_initial_cache_support_pullback_mode
@@ -4248,6 +4254,9 @@ def _run_realtime_geometry_optimization_api_smoke(
         "reverse_database_stage_jacobian_mode": args.reverse_database_stage_jacobian_mode,
         "reverse_database_support_objective_mode": (
             args.reverse_database_support_objective_mode
+        ),
+        "reverse_database_segment_support_mode": (
+            args.reverse_database_segment_support_mode
         ),
         "shared_payload_note": (
             "Full transport shared-path smoke uses the internal realtime-geometry "
@@ -5860,6 +5869,19 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--reverse-database-segment-support-mode",
+        choices=("inline", "deferred_segment_batch"),
+        default="inline",
+        help=(
+            "Database segment support scheduling. 'inline' preserves the "
+            "current per-step support transpose inside the reverse recurrence. "
+            "'deferred_segment_batch' records the exact solved stage cotangents "
+            "and batches the four independent support transposes after each "
+            "segment recurrence. The dense block solve and final one-scan fold "
+            "are unchanged."
+        ),
+    )
+    parser.add_argument(
         "--reverse-database-initial-support-mode",
         choices=("generic", "split", "reduced_zero"), default="split",
         help=("Database full-transport initial-RHS support only: 'generic' restores "
@@ -6709,6 +6731,7 @@ def main() -> None:
         or args.reverse_database_center_geometry_mode != "scalar_jvp"
         or args.reverse_database_stage_jacobian_mode != "independent"
         or args.reverse_database_support_objective_mode != "scalar"
+        or args.reverse_database_segment_support_mode != "inline"
     )
     if database_performance_override and (
         not is_database_geometry_reverse
@@ -6753,6 +6776,24 @@ def main() -> None:
             "explicit_database, full stage cotangents, separate RHS pullback, "
             "shared support preparation, default stage-adjoint memory mode and "
             "reduced_cotangent_call_boundary."
+        )
+    if args.reverse_database_segment_support_mode == "deferred_segment_batch" and (
+        args.reverse_stage_adjoint_solve_mode != "block"
+        or args.reverse_rhs_transpose_mode != "explicit_database"
+        or args.reverse_stage_cotangent_mode != "full"
+        or args.reverse_rhs_pullback_mode != "separate"
+        or args.reverse_stage_adjoint_memory_mode != "default"
+        or args.reverse_step_bwd_mode != "reduced_cotangent_call_boundary"
+        or args.reverse_database_stage_jacobian_mode != "shared_multi_rhs"
+        or args.reverse_database_support_objective_mode != "batched_split"
+        or args.reverse_database_support_preparation_mode != "shared"
+    ):
+        raise SystemExit(
+            "[autodiff-gate] Deferred database segment support requires block, "
+            "explicit_database, full stage cotangents, separate RHS pullback, "
+            "shared_multi_rhs stage Jacobians, batched_split support, shared "
+            "support preparation, default stage memory, and the reduced "
+            "cotangent call boundary."
         )
     if (
         is_database_geometry_reverse
