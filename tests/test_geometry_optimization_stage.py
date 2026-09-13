@@ -7,6 +7,7 @@ from types import SimpleNamespace
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 
 from NEOPAX import _geometry_autodiff as geometry_ad
 from NEOPAX import _optimization_full_transport_stage as full_transport_stage
@@ -763,6 +764,68 @@ def test_database_full_transport_replay_stage_keeps_support_dynamic_and_cache_st
             "A changed support layout must not create another cache entry."
         )
     assert stage.cache_size() == 1
+
+
+def test_full_transport_fresh_equations_keep_ntss_density_indices_static(monkeypatch):
+    """Optimization replay must not expose fixed species indices as tracers."""
+
+    @dataclasses.dataclass(frozen=True)
+    class ErEquation:
+        ntss_density_indices: object
+        name: str = "Er"
+
+    @dataclasses.dataclass(frozen=True)
+    class EquationSystem:
+        equations: tuple
+        density_equation: object = None
+        temperature_equation: object = None
+        er_equation: object = None
+        config: object = None
+        species: object = None
+        shared_flux_model: object = None
+        source_models: object = None
+        solver_cfg: object = None
+        boundary_models: object = None
+
+    template_indices = np.asarray([0, 1], dtype=np.int32)
+    template_er = ErEquation(template_indices)
+    template = EquationSystem(
+        equations=(template_er,),
+        er_equation=template_er,
+        config={},
+        species=object(),
+        shared_flux_model=object(),
+        source_models=(),
+        solver_cfg={},
+        boundary_models={},
+    )
+    monkeypatch.setattr(
+        full_transport_stage,
+        "_replace_geometry_and_fresh_database_payload_in_model",
+        lambda model, geometry, database: (model, True),
+    )
+
+    def build_equations(*, field, **_kwargs):
+        traced_indices = jnp.asarray([0, 1], dtype=jnp.int32) + (
+            jnp.asarray(field, dtype=jnp.int32) * 0
+        )
+        return (ErEquation(traced_indices),)
+
+    monkeypatch.setattr(full_transport_stage, "build_equation_system", build_equations)
+
+    @jax.jit
+    def probe(value):
+        active = full_transport_stage._equation_system_with_fresh_database_payload(
+            template,
+            {"geometry": value, "database": value},
+            static_ntss_density_indices=template_indices,
+        )
+        # Mirror the established Radau setup conversion which requires these
+        # fixed indices to remain concrete while the outer replay is traced.
+        concrete_indices = np.asarray(active.er_equation.ntss_density_indices)
+        return value + jnp.asarray(concrete_indices.sum(), dtype=value.dtype)
+
+    assert float(probe(jnp.asarray(2.0))) == 3.0
 
 
 def test_database_full_transport_replay_skips_template_database_rescaling(monkeypatch):

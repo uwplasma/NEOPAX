@@ -15,6 +15,7 @@ from typing import Any
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 
 from ._optimization_initial_root_stage import FloatingPayloadLeafLayout
 from ._reverse_ad_initial_er import (
@@ -48,7 +49,12 @@ def _tree_signature(
     return treedef, tuple(signature)
 
 
-def _equation_system_with_fresh_database_payload(template, support_payload):
+def _equation_system_with_fresh_database_payload(
+    template,
+    support_payload,
+    *,
+    static_ntss_density_indices=None,
+):
     """Bind an already-current database without rescaling the template table."""
 
     if not (
@@ -89,6 +95,22 @@ def _equation_system_with_fresh_database_payload(template, support_payload):
             boundary_models=template.boundary_models,
         )
     )
+    if static_ntss_density_indices is not None:
+        # ``build_electric_field_equation`` represents these fixed species
+        # indices as a JAX array. Rebuilding the equations inside the
+        # optimization replay JIT would therefore turn the indices into a
+        # tracer, while the established Radau setup correctly treats them as
+        # structural metadata. Restore the concrete template value here.
+        equations = tuple(
+            dataclasses.replace(
+                equation,
+                ntss_density_indices=static_ntss_density_indices,
+            )
+            if getattr(equation, "name", None) == "Er"
+            and hasattr(equation, "ntss_density_indices")
+            else equation
+            for equation in equations
+        )
     return dataclasses.replace(
         template,
         equations=equations,
@@ -201,6 +223,19 @@ def build_database_full_transport_replay_optimization_stage(
     support_layout = FloatingPayloadLeafLayout.from_template(support_payload)
     support_floating_leaves = support_layout.floating_leaves(support_payload)
     solver = reverse_setup.solver
+    template_er_equation = getattr(equation_system_template, "er_equation", None)
+    template_ntss_density_indices = getattr(
+        template_er_equation, "ntss_density_indices", None
+    )
+    static_ntss_density_indices = (
+        None
+        if template_ntss_density_indices is None
+        else np.array(
+            jax.device_get(template_ntss_density_indices),
+            dtype=np.int32,
+            copy=True,
+        ).reshape((-1,))
+    )
     initial_flat_state = reverse_setup.prepared_rollout.initial_carry.y
     current_initial_state = (
         reverse_setup.execution_context.physics_context.unpack_flat(initial_flat_state)
@@ -231,6 +266,7 @@ def build_database_full_transport_replay_optimization_stage(
         active_equation_system = _equation_system_with_fresh_database_payload(
             equation_system_template,
             active_support,
+            static_ntss_density_indices=static_ntss_density_indices,
         )
         active_initial_state = initial_state_unpack(active_initial_flat_state)
         active_rollout = _build_prepared_radau_accepted_rollout(
