@@ -1,9 +1,9 @@
 #!/usr/bin/env python
-"""Repeated-memory test for four-step database full-transport reverse segments.
+"""Repeated-memory test for the 16-step database full-transport reverse lane.
 
-The selected initial-Er root is followed by four accepted Radau steps on the
-small ``(5,25,31)`` database.  Each accepted step occupies one fixed reverse
-segment.  This diagnostic intentionally does not require transport ``t_final``.
+The selected initial-Er root is followed by 16 accepted Radau steps on the
+small ``(5,25,31)`` database, divided into four fixed four-step reverse
+segments. This diagnostic intentionally does not require transport ``t_final``.
 """
 
 from __future__ import annotations

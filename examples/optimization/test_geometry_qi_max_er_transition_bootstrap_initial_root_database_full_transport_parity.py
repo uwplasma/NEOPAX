@@ -2,7 +2,7 @@
 """Parity of benchmark and optimization database full-transport lanes.
 
 Both lanes use the same benchmark TOML, unperturbed VMEC input, selected
-initial-Er root, four accepted Radau steps, and four one-step reverse
+initial-Er root, 16 accepted Radau steps, and four four-step reverse
 segments.  The reference is the unchanged benchmark composition.  The trial
 links the accepted optimization-only root boundaries to those same transport
 kernels.  This is not an FD test or a physical final-time transport run.
@@ -32,8 +32,8 @@ SMALL_DATABASE_TRANSPORT_CONFIG = (
     / "benchmarks"
     / "Solve_Transport_equations_wHe_radau_ntx_scan_runtime_database_vmec_realtime_geometry_benchmark_black_box_small.toml"
 )
-ACCEPTED_STEP_LIMIT = 4
-REVERSE_SEGMENT_LENGTH = 1
+ACCEPTED_STEP_LIMIT = 16
+REVERSE_SEGMENT_LENGTH = 4
 REFERENCE_STAGE_MODE = "benchmark"
 TRIAL_STAGE_MODE = "database_root_fresh_payload_experiment"
 DATABASE_N_THETA = 5
@@ -147,7 +147,8 @@ def main() -> int:
         "[database full-transport parity] "
         f"grid=({DATABASE_N_THETA},{DATABASE_N_PHI},{DATABASE_N_XI}) "
         f"accepted_steps={ACCEPTED_STEP_LIMIT} initial_er_root=jax_selected_root "
-        f"segments={ACCEPTED_STEP_LIMIT} segment_length={REVERSE_SEGMENT_LENGTH} "
+        f"segments={ACCEPTED_STEP_LIMIT // REVERSE_SEGMENT_LENGTH} "
+        f"segment_length={REVERSE_SEGMENT_LENGTH} "
         f"reference_stage={REFERENCE_STAGE_MODE} trial_stage={TRIAL_STAGE_MODE} "
         "parameter_point=unperturbed_x0 "
         "transport_reverse=block/explicit_database/reduced_cotangent_call_boundary "

@@ -29,6 +29,14 @@ def _callback(namespace):
     return namespace[node.name]
 
 
+def _mode_default_resolver():
+    path = _ROOT / "examples/benchmarks/benchmark_transport_reverse_ad_only.py"
+    node = _function(path, "_resolve_reverse_benchmark_mode_defaults")
+    namespace = {}
+    exec(compile(ast.Module(body=[node], type_ignores=[]), str(path), "exec"), namespace)
+    return namespace[node.name]
+
+
 def test_benchmark_callback_accepts_all_support_core_keywords():
     core = _function(
         _ROOT / "NEOPAX/_reverse_ad_transport.py",
@@ -54,7 +62,14 @@ def _performance_args(**overrides):
         and isinstance(node.value.func, ast.Attribute)
         and node.value.func.attr == "add_argument" and node.value.args
         and isinstance(node.value.args[0], ast.Constant)
-        and str(node.value.args[0].value).startswith("--reverse-database-")
+        and (
+            str(node.value.args[0].value).startswith("--reverse-database-")
+            or node.value.args[0].value
+            in {
+                "--reverse-initial-cache-support-pullback-mode",
+                "--reverse-rebuild-support-pullback-mode",
+            }
+        )
     ]
     parser = argparse.ArgumentParser()
     exec(compile(ast.Module(body=declarations, type_ignores=[]), "<parser>", "exec"), {"parser": parser})
@@ -78,8 +93,26 @@ def test_validated_full_transport_reverse_modes_are_cli_defaults():
         _ROOT / "examples/benchmarks/benchmark_transport_reverse_ad_only.py", "main"
     )
     selected_flags = {
+        "--reverse-bootstrap-cotangent-mode",
         "--reverse-database-interpolation-transpose-mode",
+        "--reverse-database-initial-support-mode",
+        "--reverse-database-support-preparation-mode",
+        "--reverse-database-center-geometry-mode",
+        "--reverse-database-stage-jacobian-mode",
+        "--reverse-database-support-objective-mode",
+        "--reverse-database-segment-support-mode",
         "--reverse-final-objective-cotangent-mode",
+        "--reverse-initial-cache-support-pullback-mode",
+        "--reverse-rebuild-support-pullback-mode",
+        "--reverse-rhs-pullback-mode",
+        "--reverse-rhs-transpose-mode",
+        "--reverse-schedule-artifact-mode",
+        "--reverse-segment-primal-record-mode",
+        "--reverse-segment-start-replay-mode",
+        "--reverse-stage-adjoint-memory-mode",
+        "--reverse-stage-adjoint-solve-mode",
+        "--reverse-stage-cotangent-mode",
+        "--reverse-step-bwd-mode",
     }
     declarations = [
         node
@@ -98,8 +131,62 @@ def test_validated_full_transport_reverse_modes_are_cli_defaults():
         {"parser": parser},
     )
     args = parser.parse_args([])
-    assert args.reverse_database_interpolation_transpose_mode == "legacy_sparse"
-    assert args.reverse_final_objective_cotangent_mode == "grouped_vjp"
+    assert vars(args) == {
+        "reverse_bootstrap_cotangent_mode": "joint_local_vjp_upar_only",
+        "reverse_database_center_geometry_mode": "scalar_jvp",
+        "reverse_database_initial_support_mode": "split",
+        "reverse_database_interpolation_transpose_mode": "legacy_sparse",
+        "reverse_database_segment_support_mode": "inline",
+        "reverse_database_stage_jacobian_mode": "independent",
+        "reverse_database_support_objective_mode": "scalar",
+        "reverse_database_support_preparation_mode": "shared",
+        "reverse_final_objective_cotangent_mode": "grouped_vjp",
+        "reverse_initial_cache_support_pullback_mode": "config",
+        "reverse_rebuild_support_pullback_mode": "config",
+        "reverse_rhs_pullback_mode": "separate",
+        "reverse_rhs_transpose_mode": "config",
+        "reverse_schedule_artifact_mode": "reuse_static_probe",
+        "reverse_segment_primal_record_mode": "reuse_segment_primal_record",
+        "reverse_segment_start_replay_mode": "minimal",
+        "reverse_stage_adjoint_memory_mode": "default",
+        "reverse_stage_adjoint_solve_mode": "block",
+        "reverse_stage_cotangent_mode": "full",
+        "reverse_step_bwd_mode": "reduced_cotangent_call_boundary",
+    }
+
+
+def test_database_full_transport_resolves_the_validated_support_defaults():
+    args = _performance_args()
+    _mode_default_resolver()(args, database_full_transport=True)
+    assert args.reverse_initial_cache_support_pullback_mode == "scalar"
+    assert args.reverse_rebuild_support_pullback_mode == "separate"
+
+
+def test_non_database_lanes_retain_their_existing_support_defaults():
+    args = _performance_args()
+    _mode_default_resolver()(args, database_full_transport=False)
+    assert (
+        args.reverse_initial_cache_support_pullback_mode
+        == "ntx_batched_interpolated_faces"
+    )
+    assert args.reverse_rebuild_support_pullback_mode == (
+        "ntx_batched_interpolated_faces_native_multi_rhs_reuse_moment_"
+        "drds_jvp_shared_primal_with_vmec_coefficients_direct_directional_"
+        "product_rule"
+    )
+
+
+def test_explicit_support_modes_are_not_overwritten_by_default_resolution():
+    args = _performance_args(
+        reverse_initial_cache_support_pullback_mode="rebuild_dispatch",
+        reverse_rebuild_support_pullback_mode="ntx_batched_interpolated_faces",
+    )
+    _mode_default_resolver()(args, database_full_transport=True)
+    assert args.reverse_initial_cache_support_pullback_mode == "rebuild_dispatch"
+    assert (
+        args.reverse_rebuild_support_pullback_mode
+        == "ntx_batched_interpolated_faces"
+    )
 
 
 def _check_performance_args(args, is_database=True):

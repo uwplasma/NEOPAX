@@ -16,11 +16,14 @@ matched the established 2026-09-12 performance run.
 
 Following this validation, the reverse benchmark CLI now selects
 `legacy_sparse` for the database interpolation transpose and `grouped_vjp` for
-the ordinary terminal-objective cotangents by default.  The reference modes
-remain available explicitly as `established` and `scalar`.  This promotion is
-limited to the benchmark CLI; the generic internal callback retains its prior
-defaults so initial-Er root-only, Lij, and unrelated programmatic callers are
-not rerouted.
+the ordinary terminal-objective cotangents by default.  Its lane-local
+`config` defaults also resolve initial-cache and rebuild support pullbacks to
+the validated `scalar` and `separate` routes for database full transport.
+Realtime/Lij keeps its existing NTX selections, and explicit user selections
+are not overwritten.  The reference interpolation/objective modes remain
+available explicitly as `established` and `scalar`.  This promotion is limited
+to the benchmark CLI; the generic internal callback retains its prior defaults
+so initial-Er root-only and unrelated programmatic callers are not rerouted.
 
 | Quantity | Established run | Legacy sparse | Change |
 |---|---:|---:|---:|

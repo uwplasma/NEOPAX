@@ -5656,6 +5656,28 @@ def _run_realtime_geometry_reverse_mode(
     print(f"Wrote {outpath.relative_to(ROOT)}")
 
 
+def _resolve_reverse_benchmark_mode_defaults(args, *, database_full_transport: bool):
+    """Resolve lane-local defaults without changing root-only or Lij modes."""
+
+    if args.reverse_initial_cache_support_pullback_mode == "config":
+        args.reverse_initial_cache_support_pullback_mode = (
+            "scalar"
+            if database_full_transport
+            else "ntx_batched_interpolated_faces"
+        )
+    if args.reverse_rebuild_support_pullback_mode == "config":
+        args.reverse_rebuild_support_pullback_mode = (
+            "separate"
+            if database_full_transport
+            else (
+                "ntx_batched_interpolated_faces_native_multi_rhs_reuse_moment_"
+                "drds_jvp_shared_primal_with_vmec_coefficients_direct_directional_"
+                "product_rule"
+            )
+        )
+    return args
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Reverse-only adaptive benchmark lane using the current reverse-capable realized-schedule helper."
@@ -6206,6 +6228,7 @@ def main() -> None:
     parser.add_argument(
         "--reverse-initial-cache-support-pullback-mode",
         choices=(
+            "config",
             "scalar",
             "ntx_batched_interpolated_faces",
             "ntx_native_joint_state_and_support",
@@ -6214,9 +6237,12 @@ def main() -> None:
             "ntx_native_joint_state_and_ntx_support_split_geometry_vmec_fused_rhs",
             "rebuild_dispatch",
         ),
-        default="ntx_batched_interpolated_faces",
+        default="config",
         help=(
-            "Initial lagged-cache support transpose. 'scalar' preserves the reference "
+            "Initial lagged-cache support transpose. 'config' selects 'scalar' "
+            "for fixed-database full transport and preserves the existing "
+            "'ntx_batched_interpolated_faces' default for other lanes. "
+            "'scalar' preserves the reference "
             "lax.map path. 'ntx_batched_interpolated_faces' is an exact, opt-in "
             "multi-objective NTX face-interpolation transpose; it is limited to the "
             "realtime interpolate_from_faces configuration and has no scalar fallback. "
@@ -6239,6 +6265,7 @@ def main() -> None:
     parser.add_argument(
         "--reverse-rebuild-support-pullback-mode",
         choices=(
+            "config",
             "separate",
             "separate_reuse_local_vjp_primal",
             "separate_reuse_local_vjp_primal_geometry_only_prepared",
@@ -6261,12 +6288,12 @@ def main() -> None:
             "ntx_joint_implicit_interpolated_faces_reuse_local_vjp_primal",
             "ntx_joint_implicit_interpolated_faces_reuse_local_vjp_primal_compact_prepared_carry",
         ),
-        default=(
-            "ntx_batched_interpolated_faces_native_multi_rhs_reuse_moment_drds_jvp_"
-            "shared_primal_with_vmec_coefficients_direct_directional_product_rule"
-        ),
+        default="config",
         help=(
             "Lagged-response rebuild support transpose inside each reverse step. "
+            "'config' selects 'separate' for fixed-database full transport and "
+            "preserves the existing native NTX directional-product default for "
+            "other lanes. "
             "'separate' preserves the reference vmapped scalar path. "
             "'separate_reuse_local_vjp_primal' is an exact experimental variant "
             "that uses the primal output of each existing local NTX VJP instead "
@@ -6750,6 +6777,14 @@ def main() -> None:
         str(neoclassical_cfg.get("flux_model", "")).strip().lower()
         == "ntx_scan_runtime"
         and str(args.reverse_parameter_mode) == "profiles_plus_realtime_geometry"
+    )
+    _resolve_reverse_benchmark_mode_defaults(
+        args,
+        database_full_transport=(
+            is_database_geometry_reverse
+            and bool(args.full_transport_shared_payload_smoke)
+            and not bool(args.initial_er_root_only_optimization_smoke)
+        ),
     )
     database_performance_override = (
         args.reverse_database_initial_support_mode != "split"
