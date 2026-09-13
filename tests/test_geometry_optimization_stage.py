@@ -474,6 +474,7 @@ def test_database_full_transport_mode_uses_one_integrated_benchmark_builder(monk
         production_dependencies.database_segment_reduced_cotangent_bwd_with_table_support
         is None
     )
+    assert production_dependencies.grouped_joint_final_objective_vjp_rows is None
 
     expected_database_modes = {
         "reverse_stage_adjoint_solve_mode": "block",
@@ -599,10 +600,15 @@ def test_database_full_transport_mode_uses_one_integrated_benchmark_builder(monk
         assert calls[0]["reverse_step_bwd_mode"] == "reduced_cotangent_call_boundary"
         if stage_mode == "benchmark":
             assert calls[0]["segment_replay_optimization_stage_builder"] is None
+            assert calls[0]["final_objective_optimization_stage_builder"] is None
         else:
             assert (
                 calls[0]["segment_replay_optimization_stage_builder"]
                 is full_transport_stage.build_database_full_transport_replay_optimization_stage
+            )
+            assert (
+                calls[0]["final_objective_optimization_stage_builder"]
+                is full_transport_stage.build_database_full_transport_final_objective_optimization_stage
             )
         for name, expected in expected_database_modes.items():
             assert calls[0][name] == expected
@@ -881,6 +887,72 @@ def test_database_full_transport_replay_stage_keeps_support_dynamic_and_cache_st
             "A changed support layout must not create another cache entry."
         )
     assert stage.cache_size() == 1
+
+
+def test_database_full_transport_final_objective_stage_keeps_geometry_dynamic_and_cache_stable():
+    """The grouped terminal VJP compiles once and uses each trial geometry."""
+
+    @dataclasses.dataclass(frozen=True)
+    class Runtime:
+        geometry: object
+
+    geometry0 = {
+        "metric": jnp.asarray([1.0, 2.0]),
+        "mode": jnp.asarray([0, 1], dtype=jnp.int32),
+    }
+    support0 = {
+        "geometry": geometry0,
+        "database": {"table": jnp.asarray([3.0])},
+    }
+    reverse_setup = SimpleNamespace(
+        prepared_rollout=SimpleNamespace(
+            initial_carry=SimpleNamespace(y=jnp.asarray([0.5, -0.25])),
+            physics_context=SimpleNamespace(unpack_flat=lambda value: value),
+        )
+    )
+
+    def objective(final_state, runtime, objective_index):
+        geometry_sum = jnp.sum(runtime.geometry["metric"])
+        if int(objective_index) == 0:
+            return final_state[0] * geometry_sum
+        return final_state[1] + 2.0 * geometry_sum
+
+    stage = (
+        full_transport_stage.build_database_full_transport_final_objective_optimization_stage(
+            runtime=Runtime(geometry0),
+            reverse_setup=reverse_setup,
+            support_payload=support0,
+            objective_indices=(0, 1),
+            objective_scalar_by_index=objective,
+        )
+    )
+
+    final_y0 = jnp.asarray([0.5, -0.25])
+    values0, (state_bars0, geometry_bars0) = jax.block_until_ready(
+        stage.joint_vjp_rows(final_y=final_y0, geometry=geometry0)
+    )
+    geometry1 = {
+        "metric": jnp.asarray([4.0, 5.0]),
+        "mode": jnp.asarray([0, 1], dtype=jnp.int32),
+    }
+    final_y1 = jnp.asarray([0.75, 0.125])
+    values1, (state_bars1, geometry_bars1) = jax.block_until_ready(
+        stage.joint_vjp_rows(final_y=final_y1, geometry=geometry1)
+    )
+
+    assert stage.cache_size() == 1
+    assert jnp.allclose(values0, jnp.asarray([1.5, 5.75]))
+    assert jnp.allclose(values1, jnp.asarray([6.75, 18.125]))
+    assert jnp.allclose(state_bars0, jnp.asarray([[3.0, 0.0], [0.0, 1.0]]))
+    assert jnp.allclose(state_bars1, jnp.asarray([[9.0, 0.0], [0.0, 1.0]]))
+    assert jnp.allclose(
+        geometry_bars0["metric"],
+        jnp.asarray([[0.5, 0.5], [2.0, 2.0]]),
+    )
+    assert jnp.allclose(
+        geometry_bars1["metric"],
+        jnp.asarray([[0.75, 0.75], [2.0, 2.0]]),
+    )
 
 
 def test_full_transport_fresh_equations_keep_ntss_density_indices_static(monkeypatch):

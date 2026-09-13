@@ -752,6 +752,10 @@ class RealtimeGeometrySupportReverseDependencies:
     database_segment_reduced_cotangent_bwd_with_table_support: (
         Callable[..., object] | None
     ) = None
+    # Optional optimization-only grouped terminal-objective boundary.  The
+    # benchmark dependency bundle leaves this unset and retains its exact
+    # one-shot grouped VJP composition.
+    grouped_joint_final_objective_vjp_rows: Callable[..., object] | None = None
 
     def __post_init__(self) -> None:
         for field in dataclasses.fields(self):
@@ -759,6 +763,7 @@ class RealtimeGeometrySupportReverseDependencies:
             if field.name in {
                 "segment_replay_minimal_with_primal_records",
                 "database_segment_reduced_cotangent_bwd_with_table_support",
+                "grouped_joint_final_objective_vjp_rows",
             } and value is None:
                 continue
             if not callable(value):
@@ -5044,11 +5049,22 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
                     axis=0,
                 )
 
+            grouped_joint_boundary = (
+                dependencies.grouped_joint_final_objective_vjp_rows
+            )
             ordinary_values, ordinary_input_bars = (
                 _objective_vector_joint_vjp_rows(
                     _ordinary_objective_vector_joint,
                     final_y_for_objective,
                     geometry_delta0,
+                )
+                if grouped_joint_boundary is None
+                else grouped_joint_boundary(
+                    final_y_for_objective,
+                    geometry,
+                    runtime,
+                    ordinary_objective_indices,
+                    dependencies.objective_scalar_by_index,
                 )
             )
             ordinary_final_y_bars, ordinary_geometry_bars = ordinary_input_bars
@@ -8359,6 +8375,7 @@ def internal_realtime_geometry_transport_reverse_table_result_builder(
     progress_label: str | None = None,
     raw_block_solve: GeometryRawBlockSolve | None = None,
     segment_replay_optimization_stage_builder: Callable[..., object] | None = None,
+    final_objective_optimization_stage_builder: Callable[..., object] | None = None,
 ) -> TransportReverseTableResultBuilder:
     """Build an experimental direct full transport reverse table builder.
 
@@ -8379,6 +8396,7 @@ def internal_realtime_geometry_transport_reverse_table_result_builder(
         return tuple(lookup[str(name)] for name in normalize_transport_objective_names(objective_names, objective_labels=labels))
 
     optimization_segment_replay_stage = None
+    optimization_final_objective_stage = None
 
     def _builder(
         objective_names: tuple[str, ...],
@@ -8654,6 +8672,34 @@ def internal_realtime_geometry_transport_reverse_table_result_builder(
                     "the live {geometry, database} support payload."
                 )
 
+            def _optimization_grouped_joint_final_objective_vjp_rows(
+                final_y,
+                geometry,
+                runtime,
+                objective_indices,
+                objective_scalar_by_index_fn,
+            ):
+                nonlocal optimization_final_objective_stage
+                if optimization_final_objective_stage is None:
+                    if not callable(final_objective_optimization_stage_builder):
+                        raise RuntimeError(
+                            "The database full-transport terminal-objective "
+                            "optimization stage builder was not supplied."
+                        )
+                    optimization_final_objective_stage = (
+                        final_objective_optimization_stage_builder(
+                            runtime=runtime,
+                            reverse_setup=active_reverse_setup,
+                            support_payload=support_payload,
+                            objective_indices=objective_indices,
+                            objective_scalar_by_index=objective_scalar_by_index_fn,
+                        )
+                    )
+                return optimization_final_objective_stage.joint_vjp_rows(
+                    final_y=final_y,
+                    geometry=geometry,
+                )
+
             def _optimization_segment_replay(
                 execution_context,
                 segment_start_carry,
@@ -8720,6 +8766,9 @@ def internal_realtime_geometry_transport_reverse_table_result_builder(
                 ),
                 database_segment_reduced_cotangent_bwd_with_table_support=(
                     _optimization_database_segment_bwd
+                ),
+                grouped_joint_final_objective_vjp_rows=(
+                    _optimization_grouped_joint_final_objective_vjp_rows
                 ),
             )
 
@@ -8910,6 +8959,11 @@ def internal_realtime_geometry_transport_reverse_table_result_builder(
             return 0
         return optimization_segment_replay_stage.database_bwd_cache_size()
 
+    def _optimization_final_objective_cache_size() -> int | None:
+        if optimization_final_objective_stage is None:
+            return 0
+        return optimization_final_objective_stage.cache_size()
+
     setattr(
         _builder,
         "optimization_segment_replay_cache_size",
@@ -8919,6 +8973,11 @@ def internal_realtime_geometry_transport_reverse_table_result_builder(
         _builder,
         "optimization_segment_bwd_cache_size",
         _optimization_segment_bwd_cache_size,
+    )
+    setattr(
+        _builder,
+        "optimization_final_objective_cache_size",
+        _optimization_final_objective_cache_size,
     )
     return _builder
 

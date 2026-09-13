@@ -71,6 +71,7 @@ from ._optimization_initial_root_stage import (
     initial_root_stage_layout,
 )
 from ._optimization_full_transport_stage import (
+    build_database_full_transport_final_objective_optimization_stage,
     build_database_full_transport_replay_optimization_stage,
 )
 from ._reverse_ad_parameters import (
@@ -2456,6 +2457,11 @@ def geometry_full_transport_least_squares_problem(
         progress_label="[optimization] full transport geometry payload pullback:",
         segment_replay_optimization_stage_builder=(
             build_database_full_transport_replay_optimization_stage
+            if stage_mode == "database_full_transport_optimization"
+            else None
+        ),
+        final_objective_optimization_stage_builder=(
+            build_database_full_transport_final_objective_optimization_stage
             if stage_mode == "database_full_transport_optimization"
             else None
         ),
