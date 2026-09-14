@@ -8470,7 +8470,6 @@ def internal_realtime_geometry_transport_reverse_table_result_builder(
     raw_block_solve: GeometryRawBlockSolve | None = None,
     segment_replay_optimization_stage_builder: Callable[..., object] | None = None,
     support_optimization_stage_builder: Callable[..., object] | None = None,
-    payload_assembly_optimization_stage: object | None = None,
 ) -> TransportReverseTableResultBuilder:
     """Build an experimental direct full transport reverse table builder.
 
@@ -9005,63 +9004,43 @@ def internal_realtime_geometry_transport_reverse_table_result_builder(
         )
         active_neoclassical_cfg = table_context.config.get("neoclassical", {})
         _report_table_builder_phase("prepare_transport_table_inputs")
-        use_payload_optimization_stage = (
-            active_stage_mode == "database_full_transport_optimization"
-            and payload_assembly_optimization_stage is not None
-            and active_raw_block_solve is not None
-            and not active_component_pullbacks
-            and native_vmec_face_coefficient_bars is None
+        assembly = realtime_geometry_transport_reverse_table_from_payload_cotangents(
+            objective_labels=objective_names,
+            profile_parameter_labels=tuple(spec.label for spec in parameter_set.profile_specs),
+            geometry_parameter_labels=tuple(spec.vmec_label for spec in parameter_set.vmec_boundary_specs),
+            objective_values=selected_objective_values,
+            profile_gradient_matrix=selected_profile_matrix,
+            geometry_context=geometry_context,
+            baseline_geometry_deltas=active_baseline_geometry_deltas,
+            geometry_param_specs=vmec_specs,
+            support_bars=support_bars,
+            support_component_bars_by_name=component_bars,
+            native_vmec_face_coefficient_bars=native_vmec_face_coefficient_bars,
+            include_component_pullbacks=active_component_pullbacks,
+            combined_geometry_payload=combined_geometry_payload,
+            payload_kind=active_payload_kind,
+            scan_rho=active_neoclassical_cfg.get("ntx_scan_rho"),
+            scan_surface_backend=str(
+                active_neoclassical_cfg.get("ntx_scan_surface_backend", "vmec")
+            ),
+            n_r=int(opts.get("n_r", n_r)),
+            n_theta=int(opts.get("n_theta", n_theta)),
+            n_zeta=int(opts.get("n_zeta", n_zeta)),
+            n_xi=int(opts.get("n_xi", n_xi)),
+            surface_backend=str(opts.get("surface_backend", surface_backend)),
+            max_iter=opts.get("max_iter", max_iter),
+            solver_device=str(opts.get("solver_device", solver_device)),
+            progress_label=progress_label,
+            return_branch_gradients=bool(opts.get("return_branch_gradients", False)),
+            raw_block_solve=active_raw_block_solve,
+            dispatch_cache_probe=(
+                None
+                if optimization_phase_probe is None
+                else lambda phase: optimization_phase_probe(
+                    f"geometry_payload.{phase}"
+                )
+            ),
         )
-        if use_payload_optimization_stage:
-            assembly = payload_assembly_optimization_stage.payload_to_vmec(
-                (
-                    active_raw_block_solve.implicit_params,
-                    active_raw_block_solve.state,
-                    active_raw_block_solve.dof_mask,
-                ),
-                active_baseline_geometry_deltas,
-                selected_objective_values,
-                selected_profile_matrix,
-                support_bars,
-            )
-        else:
-            assembly = realtime_geometry_transport_reverse_table_from_payload_cotangents(
-                objective_labels=objective_names,
-                profile_parameter_labels=tuple(spec.label for spec in parameter_set.profile_specs),
-                geometry_parameter_labels=tuple(spec.vmec_label for spec in parameter_set.vmec_boundary_specs),
-                objective_values=selected_objective_values,
-                profile_gradient_matrix=selected_profile_matrix,
-                geometry_context=geometry_context,
-                baseline_geometry_deltas=active_baseline_geometry_deltas,
-                geometry_param_specs=vmec_specs,
-                support_bars=support_bars,
-                support_component_bars_by_name=component_bars,
-                native_vmec_face_coefficient_bars=native_vmec_face_coefficient_bars,
-                include_component_pullbacks=active_component_pullbacks,
-                combined_geometry_payload=combined_geometry_payload,
-                payload_kind=active_payload_kind,
-                scan_rho=active_neoclassical_cfg.get("ntx_scan_rho"),
-                scan_surface_backend=str(
-                    active_neoclassical_cfg.get("ntx_scan_surface_backend", "vmec")
-                ),
-                n_r=int(opts.get("n_r", n_r)),
-                n_theta=int(opts.get("n_theta", n_theta)),
-                n_zeta=int(opts.get("n_zeta", n_zeta)),
-                n_xi=int(opts.get("n_xi", n_xi)),
-                surface_backend=str(opts.get("surface_backend", surface_backend)),
-                max_iter=opts.get("max_iter", max_iter),
-                solver_device=str(opts.get("solver_device", solver_device)),
-                progress_label=progress_label,
-                return_branch_gradients=bool(opts.get("return_branch_gradients", False)),
-                raw_block_solve=active_raw_block_solve,
-                dispatch_cache_probe=(
-                    None
-                    if optimization_phase_probe is None
-                    else lambda phase: optimization_phase_probe(
-                        f"geometry_payload.{phase}"
-                    )
-                ),
-            )
         if optimization_phase_probe is not None:
             jax.block_until_ready(assembly.table_result)
             optimization_phase_probe("geometry_payload_pullback")

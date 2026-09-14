@@ -567,23 +567,6 @@ def test_database_full_transport_mode_uses_one_integrated_benchmark_builder(monk
             AssertionError("full transport must not use the retired two-sweep bridge")
         ),
     )
-    payload_stage = object()
-    monkeypatch.setattr(
-        optimization,
-        "geometry_raw_block_stage",
-        lambda *_args, **_kwargs: object(),
-    )
-    monkeypatch.setattr(
-        optimization,
-        "_prepare_initial_root_payload_static",
-        lambda *_args, **_kwargs: object(),
-    )
-    monkeypatch.setattr(
-        optimization,
-        "build_initial_root_payload_assembly_stage",
-        lambda **_kwargs: payload_stage,
-    )
-
     for stage_mode in ("benchmark", "database_full_transport_optimization"):
         calls = []
         builder = lambda *_args, **_kwargs: None
@@ -622,7 +605,6 @@ def test_database_full_transport_mode_uses_one_integrated_benchmark_builder(monk
         if stage_mode == "benchmark":
             assert calls[0]["segment_replay_optimization_stage_builder"] is None
             assert calls[0]["support_optimization_stage_builder"] is None
-            assert calls[0]["payload_assembly_optimization_stage"] is None
         else:
             assert (
                 calls[0]["segment_replay_optimization_stage_builder"]
@@ -632,7 +614,6 @@ def test_database_full_transport_mode_uses_one_integrated_benchmark_builder(monk
                 calls[0]["support_optimization_stage_builder"]
                 is full_transport_stage.build_database_full_transport_support_optimization_stage
             )
-            assert calls[0]["payload_assembly_optimization_stage"] is payload_stage
         for name, expected in expected_database_modes.items():
             assert calls[0][name] == expected
             assert problem.options[name] == expected
