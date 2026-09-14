@@ -845,6 +845,47 @@ def test_database_full_transport_changed_geometry_uses_persistent_live_scan_runt
     assert builder.optimization_runtime_scan_cache_size() == 1
 
 
+def test_full_transport_runtime_scan_record_crosses_jit_as_array_payload():
+    """The optimization JIT must not return NTX's unregistered record class."""
+
+    @dataclasses.dataclass(frozen=True)
+    class _HostRecord:
+        surfaces: tuple
+        prepared: tuple
+        Es: object
+        nu_v: object
+        grid: object
+
+    template = _HostRecord(
+        surfaces=(jnp.asarray([0.0]),),
+        prepared=(jnp.asarray([0.0]),),
+        Es=jnp.asarray([0.0]),
+        nu_v=jnp.asarray([0.0]),
+        grid="fixed-grid",
+    )
+
+    def _kernel(value):
+        record = dataclasses.replace(
+            template,
+            surfaces=(value,),
+            prepared=(2.0 * value,),
+            Es=3.0 * value,
+            nu_v=4.0 * value,
+        )
+        return full_transport_stage._scan_primal_record_payload(record)
+
+    payload = jax.jit(_kernel)(jnp.asarray([2.0]))
+    rebuilt = full_transport_stage._scan_primal_record_from_payload(
+        template, payload
+    )
+
+    assert rebuilt.grid == "fixed-grid"
+    assert jnp.array_equal(rebuilt.surfaces[0], jnp.asarray([2.0]))
+    assert jnp.array_equal(rebuilt.prepared[0], jnp.asarray([4.0]))
+    assert jnp.array_equal(rebuilt.Es, jnp.asarray([6.0]))
+    assert jnp.array_equal(rebuilt.nu_v, jnp.asarray([8.0]))
+
+
 def test_database_full_transport_bootstrap_stage_keeps_trial_values_dynamic(
     monkeypatch,
 ):

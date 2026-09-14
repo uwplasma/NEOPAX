@@ -86,6 +86,30 @@ def _replace_runtime_scan_model(model, replacement):
     return dataclasses.replace(model, **updates), True
 
 
+def _scan_primal_record_payload(record):
+    """Expose only the registered PyTree contents of an NTX scan record."""
+
+    return (
+        tuple(record.surfaces),
+        tuple(record.prepared),
+        record.Es,
+        record.nu_v,
+    )
+
+
+def _scan_primal_record_from_payload(template, payload):
+    """Restore NTX's host-side record wrapper and fixed grid metadata."""
+
+    surfaces, prepared, es, nu_v = payload
+    return dataclasses.replace(
+        template,
+        surfaces=tuple(surfaces),
+        prepared=tuple(prepared),
+        Es=es,
+        nu_v=nu_v,
+    )
+
+
 @dataclasses.dataclass
 class DatabaseFullTransportRuntimeOptimizationStage:
     """Persistent live NTX forward scan for changing optimizer geometries.
@@ -127,8 +151,12 @@ class DatabaseFullTransportRuntimeOptimizationStage:
                 "Full-transport optimization live-scan payload shape or dtype "
                 "changed within a stage."
             )
-        database, scan_primal_record, raw_scan = self.compiled_scan(
+        database, scan_primal_record_payload, raw_scan = self.compiled_scan(
             scan_payload_leaves
+        )
+        scan_primal_record = _scan_primal_record_from_payload(
+            self.scan_model_template.scan_primal_record,
+            scan_primal_record_payload,
         )
         active_scan_model = self.scan_model_template.with_runtime_scan_payload(
             geometry=geometry,
@@ -189,7 +217,11 @@ def build_database_full_transport_runtime_optimization_stage(
         raise ValueError(
             "Full-transport runtime optimization requires preloaded scan inputs."
         )
-    if not bool(scan_model.record_scan_primal):
+    if (
+        not bool(scan_model.record_scan_primal)
+        or scan_model.scan_primal_record is None
+        or scan_model.scan_primal is None
+    ):
         raise ValueError(
             "Full-transport runtime optimization requires a recorded scan primal."
         )
@@ -208,7 +240,17 @@ def build_database_full_transport_runtime_optimization_stage(
             scan_surfaces=tuple(active_payload["surfaces"]),
             database=None,
         )
-        return active_scan_model._build_runtime_database_and_record()
+        database, scan_primal_record, raw_scan = (
+            active_scan_model._build_runtime_database_and_record()
+        )
+        # NTX deliberately keeps the record itself as an ordinary host-side
+        # dataclass.  Its contents are valid JAX PyTrees, so return those
+        # numerical fields across this optimization-only JIT and restore the
+        # unchanged record type/grid immediately outside the boundary.
+        scan_primal_record_payload = _scan_primal_record_payload(
+            scan_primal_record
+        )
+        return database, scan_primal_record_payload, raw_scan
 
     return DatabaseFullTransportRuntimeOptimizationStage(
         runtime_template=runtime,
