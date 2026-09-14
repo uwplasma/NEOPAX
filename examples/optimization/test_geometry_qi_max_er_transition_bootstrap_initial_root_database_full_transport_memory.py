@@ -65,7 +65,7 @@ def device_memory_text() -> str:
 
 def segment_cache_sizes(
     problem,
-) -> tuple[int | None, ...]:
+) -> tuple[int | None, int | None, int | None, int | None, int | None, int | None]:
     cache_size = reverse_transport._jax_trace_cache_size
     optimization_replay_cache_size = getattr(
         problem.table_result_builder,
@@ -76,11 +76,6 @@ def segment_cache_sizes(
         problem.table_result_builder,
         "optimization_segment_bwd_cache_size",
         lambda: None,
-    )
-    optimization_support_cache_sizes = getattr(
-        problem.table_result_builder,
-        "optimization_support_cache_sizes",
-        lambda: (None,) * 5,
     )
     return (
         cache_size(
@@ -94,7 +89,6 @@ def segment_cache_sizes(
         ),
         optimization_replay_cache_size(),
         optimization_bwd_cache_size(),
-        *optimization_support_cache_sizes(),
         global_dispatch_cache_size(),
     )
 
@@ -220,9 +214,7 @@ def main() -> int:
             "[database full-transport memory] "
             f"warmup={warmup_index} elapsed_s={time.perf_counter() - started:.3f} "
             "stage_cache=(benchmark_database_bwd,benchmark_replay,generic_bwd,"
-            "optimization_replay,optimization_lean_bwd,profile_primal,"
-            "profile_pullback,root_pullback,final_objectives,bootstrap_unpack,"
-            "global_dispatch)="
+            "optimization_replay,optimization_lean_bwd,global_dispatch)="
             f"{cache_before}->{cache_after}",
             flush=True,
         )
@@ -269,9 +261,7 @@ def main() -> int:
             f"trial={trial_index} elapsed_s={time.perf_counter() - started:.3f} "
             f"rss_delta={rss_text} live_jax_arrays={arrays_text} "
             "stage_cache=(benchmark_database_bwd,benchmark_replay,generic_bwd,"
-            "optimization_replay,optimization_lean_bwd,profile_primal,"
-            "profile_pullback,root_pullback,final_objectives,bootstrap_unpack,"
-            "global_dispatch)="
+            "optimization_replay,optimization_lean_bwd,global_dispatch)="
             f"{cache_before}->{cache_after} "
             f"residual_repeat_max_abs={residual_repeat_delta:.3e} "
             f"jacobian_repeat_max_abs={jacobian_repeat_delta:.3e}",

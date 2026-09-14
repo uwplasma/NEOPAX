@@ -752,14 +752,6 @@ class RealtimeGeometrySupportReverseDependencies:
     database_segment_reduced_cotangent_bwd_with_table_support: (
         Callable[..., object] | None
     ) = None
-    # Optional optimization-only persistent boundaries.  Production/default
-    # dependencies leave these unset, so the benchmark continues to execute
-    # the expressions below exactly as it did before optimization staging.
-    profile_state_primal: Callable[..., object] | None = None
-    profile_parameter_pullback: Callable[..., object] | None = None
-    grouped_joint_final_objective_vjp_rows: Callable[..., object] | None = None
-    flat_state_pullback: Callable[..., object] | None = None
-    database_initial_er_root_pullback: Callable[..., object] | None = None
     # Optional optimization-memory diagnostic. Production benchmark bundles
     # leave this unset, preserving their existing execution and synchronization.
     optimization_phase_probe: Callable[[str], None] | None = None
@@ -770,11 +762,6 @@ class RealtimeGeometrySupportReverseDependencies:
             if field.name in {
                 "segment_replay_minimal_with_primal_records",
                 "database_segment_reduced_cotangent_bwd_with_table_support",
-                "profile_state_primal",
-                "profile_parameter_pullback",
-                "grouped_joint_final_objective_vjp_rows",
-                "flat_state_pullback",
-                "database_initial_er_root_pullback",
                 "optimization_phase_probe",
             } and value is None:
                 continue
@@ -4676,13 +4663,7 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
         )
     )
     phase_start = time.perf_counter()
-    if dependencies.profile_state_primal is None:
-        pre_root_initial_state, profile_state_pullback = jax.vjp(
-            _state_from_profiles, parameter_values
-        )
-    else:
-        pre_root_initial_state = dependencies.profile_state_primal(parameter_values)
-        profile_state_pullback = None
+    pre_root_initial_state, profile_state_pullback = jax.vjp(_state_from_profiles, parameter_values)
     profile_state_vjp_elapsed = None
     if phase_timing_diagnostics:
         # Do not conflate the profile pytree VJP with the separately executed
@@ -5078,22 +5059,13 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
                     axis=0,
                 )
 
-            if dependencies.grouped_joint_final_objective_vjp_rows is None:
-                ordinary_values, ordinary_input_bars = (
-                    _objective_vector_joint_vjp_rows(
-                        _ordinary_objective_vector_joint,
-                        final_y_for_objective,
-                        geometry_delta0,
-                    )
+            ordinary_values, ordinary_input_bars = (
+                _objective_vector_joint_vjp_rows(
+                    _ordinary_objective_vector_joint,
+                    final_y_for_objective,
+                    geometry_delta0,
                 )
-            else:
-                ordinary_values, ordinary_input_bars = (
-                    dependencies.grouped_joint_final_objective_vjp_rows(
-                        final_y_for_objective,
-                        geometry,
-                        ordinary_objective_indices,
-                    )
-                )
+            )
             ordinary_final_y_bars, ordinary_geometry_bars = ordinary_input_bars
         else:
             ordinary_values, ordinary_final_y_bars = _objective_vector_vjp_rows(
@@ -5361,18 +5333,11 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
                 )
             else:
                 final_state_bar = state_pullback_fn(final_state_for_bootstrap, upar_bar)
-            if dependencies.flat_state_pullback is None:
-                _, unpack_pullback = jax.vjp(
-                    reverse_setup.prepared_rollout.physics_context.unpack_flat,
-                    final_y_for_objective,
-                )
-                final_y_bar = unpack_pullback(final_state_bar)[0]
-            else:
-                final_y_bar = dependencies.flat_state_pullback(
-                    final_y_for_objective,
-                    final_state_bar,
-                )
-            final_y_bar_rows.append(final_y_bar)
+            _, unpack_pullback = jax.vjp(
+                reverse_setup.prepared_rollout.physics_context.unpack_flat,
+                final_y_for_objective,
+            )
+            final_y_bar_rows.append(unpack_pullback(final_state_bar)[0])
             objective_values_rows.append(objective_value)
             if combined_geometry_payload:
                 if database_payload:
@@ -7185,73 +7150,43 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
         er_profile = jnp.asarray(er_profile, dtype=pre_root_initial_state.Er.dtype)
         finite_mask = jnp.asarray(finite_mask, dtype=bool)
 
-        database_root_boundary_result = None
-        if (
-            dependencies.database_initial_er_root_pullback is not None
-            and combined_geometry_payload
-            and "database" in support_payload
-        ):
-            root_linearization_start = time.perf_counter()
-            database_root_boundary_result = (
-                dependencies.database_initial_er_root_pullback(
-                    pre_root_initial_state,
-                    er_profile,
-                    finite_mask,
-                    initial_state_bars,
-                    support_payload,
-                )
-            )
-            (
-                pre_root_initial_state_bars,
-                residual_bars,
-                batched_support_bars,
-            ) = database_root_boundary_result
-            root_linearization_elapsed = (
-                time.perf_counter() - root_linearization_start
-            )
-            root_state_pullback_elapsed = None
-        else:
-            root_linearization_start = time.perf_counter()
-            dres_der = dependencies.initial_er_charge_flux_residual_er_derivative(
-                pre_root_initial_state,
-                er_profile,
-                runtime=runtime,
-            )
-            safe_dres_der = jnp.where(
-                jnp.abs(dres_der) > jnp.asarray(1.0e-30, dtype=dres_der.dtype),
-                dres_der,
-                jnp.inf,
-            )
-            residual_bars = jnp.where(
-                finite_mask[None, :],
-                -jnp.asarray(initial_state_bars.Er) / safe_dres_der[None, :],
-                0.0,
-            )
-            root_linearization_elapsed = (
-                time.perf_counter() - root_linearization_start
-            )
+        root_linearization_start = time.perf_counter()
+        dres_der = dependencies.initial_er_charge_flux_residual_er_derivative(
+            pre_root_initial_state,
+            er_profile,
+            runtime=runtime,
+        )
+        safe_dres_der = jnp.where(
+            jnp.abs(dres_der) > jnp.asarray(1.0e-30, dtype=dres_der.dtype),
+            dres_der,
+            jnp.inf,
+        )
+        residual_bars = jnp.where(
+            finite_mask[None, :],
+            -jnp.asarray(initial_state_bars.Er) / safe_dres_der[None, :],
+            0.0,
+        )
+        root_linearization_elapsed = time.perf_counter() - root_linearization_start
 
-            root_state_pullback_start = time.perf_counter()
-            state_residual_bars = dependencies.compact_initial_er_state_pullback(
-                residual_scalar_fn=dependencies.initial_er_charge_flux_residual_scalar,
-                state=pre_root_initial_state,
-                er_profile=er_profile,
-                residual_bars=residual_bars,
-                runtime=runtime,
-            )
-            if phase_timing_diagnostics:
-                state_residual_bars = jax.block_until_ready(state_residual_bars)
-            root_state_pullback_elapsed = (
-                time.perf_counter() - root_state_pullback_start
-            )
-            direct_initial_state_bars = dataclasses.replace(
-                initial_state_bars,
-                Er=jnp.zeros_like(initial_state_bars.Er),
-            )
-            pre_root_initial_state_bars = dependencies.add_trees(
-                direct_initial_state_bars,
-                state_residual_bars,
-            )
+        root_state_pullback_start = time.perf_counter()
+        state_residual_bars = dependencies.compact_initial_er_state_pullback(
+            residual_scalar_fn=dependencies.initial_er_charge_flux_residual_scalar,
+            state=pre_root_initial_state,
+            er_profile=er_profile,
+            residual_bars=residual_bars,
+            runtime=runtime,
+        )
+        if phase_timing_diagnostics:
+            state_residual_bars = jax.block_until_ready(state_residual_bars)
+        root_state_pullback_elapsed = time.perf_counter() - root_state_pullback_start
+        direct_initial_state_bars = dataclasses.replace(
+            initial_state_bars,
+            Er=jnp.zeros_like(initial_state_bars.Er),
+        )
+        pre_root_initial_state_bars = dependencies.add_trees(
+            direct_initial_state_bars,
+            state_residual_bars,
+        )
 
         root_geometry_pullback_elapsed = None
         root_ntx_support_pullback_elapsed = None
@@ -7307,53 +7242,46 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
             # a local transport-geometry term and a table term.  Preserve the
             # former directly and defer only the latter to the one retained
             # scan fold after the complete reverse sweep.
-            if database_root_boundary_result is not None:
-                initial_er_root_support_bars = tuple(
-                    jax.tree_util.tree_leaves(batched_support_bars)
-                )
-                root_ntx_support_pullback_elapsed = None
-                root_geometry_pullback_elapsed = None
-            else:
-                root_ntx_support_pullback_start = time.perf_counter()
-                database_bars = compact_initial_er_database_support_bars(
-                    runtime=runtime,
-                    state=pre_root_initial_state,
-                    er_profile=er_profile,
-                    residual_bars=residual_bars,
-                    support=support_payload,
-                    interpolation_transpose_mode=str(
-                        getattr(
-                            reverse_setup.execution_context.physics_context,
-                            "reverse_database_root_interpolation_transpose_mode",
-                            "established",
-                        )
-                    ),
-                )
-                if phase_timing_diagnostics:
-                    database_bars = jax.block_until_ready(database_bars)
-                root_ntx_support_pullback_elapsed = (
-                    time.perf_counter() - root_ntx_support_pullback_start
-                )
-                root_geometry_pullback_start = time.perf_counter()
-                geometry_bars = compact_initial_er_database_geometry_bars(
-                    runtime=runtime,
-                    state=pre_root_initial_state,
-                    er_profile=er_profile,
-                    residual_bars=residual_bars,
-                    support=support_payload,
-                )
-                if phase_timing_diagnostics:
-                    geometry_bars = jax.block_until_ready(geometry_bars)
-                root_geometry_pullback_elapsed = (
-                    time.perf_counter() - root_geometry_pullback_start
-                )
-                batched_support_bars = {
-                    "geometry": geometry_bars,
-                    "database": database_bars,
-                }
-                initial_er_root_support_bars = tuple(
-                    jax.tree_util.tree_leaves(batched_support_bars)
-                )
+            root_ntx_support_pullback_start = time.perf_counter()
+            database_bars = compact_initial_er_database_support_bars(
+                runtime=runtime,
+                state=pre_root_initial_state,
+                er_profile=er_profile,
+                residual_bars=residual_bars,
+                support=support_payload,
+                interpolation_transpose_mode=str(
+                    getattr(
+                        reverse_setup.execution_context.physics_context,
+                        "reverse_database_root_interpolation_transpose_mode",
+                        "established",
+                    )
+                ),
+            )
+            if phase_timing_diagnostics:
+                database_bars = jax.block_until_ready(database_bars)
+            root_ntx_support_pullback_elapsed = (
+                time.perf_counter() - root_ntx_support_pullback_start
+            )
+            root_geometry_pullback_start = time.perf_counter()
+            geometry_bars = compact_initial_er_database_geometry_bars(
+                runtime=runtime,
+                state=pre_root_initial_state,
+                er_profile=er_profile,
+                residual_bars=residual_bars,
+                support=support_payload,
+            )
+            if phase_timing_diagnostics:
+                geometry_bars = jax.block_until_ready(geometry_bars)
+            root_geometry_pullback_elapsed = (
+                time.perf_counter() - root_geometry_pullback_start
+            )
+            batched_support_bars = {
+                "geometry": geometry_bars,
+                "database": database_bars,
+            }
+            initial_er_root_support_bars = tuple(
+                jax.tree_util.tree_leaves(batched_support_bars)
+            )
         elif combined_geometry_payload:
             # Compatibility path for unrecorded scan payloads.
             support_delta0 = _float_delta_tree_like(support_payload)
@@ -7429,15 +7357,9 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
 
     phase_start = time.perf_counter()
     with _reverse_profile_scope(reverse_setup, "reverse_post_sweep/profile_parameter_pullback"):
-        if dependencies.profile_parameter_pullback is None:
-            gradient_matrix = jax.vmap(
-                lambda state_bar: profile_state_pullback(state_bar)[0]
-            )(initial_state_bars)
-        else:
-            gradient_matrix = dependencies.profile_parameter_pullback(
-                parameter_values,
-                initial_state_bars,
-            )
+        gradient_matrix = jax.vmap(
+            lambda state_bar: profile_state_pullback(state_bar)[0]
+        )(initial_state_bars)
     gradient_matrix = jax.block_until_ready(gradient_matrix)
     print(
         f"{progress_prefix} progress: support reverse profile parameter pullback ready "
@@ -8469,7 +8391,6 @@ def internal_realtime_geometry_transport_reverse_table_result_builder(
     progress_label: str | None = None,
     raw_block_solve: GeometryRawBlockSolve | None = None,
     segment_replay_optimization_stage_builder: Callable[..., object] | None = None,
-    support_optimization_stage_builder: Callable[..., object] | None = None,
 ) -> TransportReverseTableResultBuilder:
     """Build an experimental direct full transport reverse table builder.
 
@@ -8490,7 +8411,6 @@ def internal_realtime_geometry_transport_reverse_table_result_builder(
         return tuple(lookup[str(name)] for name in normalize_transport_objective_names(objective_names, objective_labels=labels))
 
     optimization_segment_replay_stage = None
-    optimization_support_stage = None
 
     def _builder(
         objective_names: tuple[str, ...],
@@ -8771,49 +8691,6 @@ def internal_realtime_geometry_transport_reverse_table_result_builder(
                     "the live {geometry, database} support payload."
                 )
 
-            nonlocal optimization_support_stage
-            base_dependencies = (
-                default_realtime_geometry_support_reverse_dependencies()
-            )
-            if optimization_support_stage is None:
-                if not callable(support_optimization_stage_builder):
-                    raise RuntimeError(
-                        "The database full-transport support optimization "
-                        "stage builder was not supplied."
-                    )
-                ordinary_objective_indices = tuple(
-                    objective_i
-                    for objective_i, objective_name in enumerate(
-                        TRANSPORT_REVERSE_OBJECTIVE_LABELS
-                    )
-                    if objective_name
-                    != "bootstrap_current_softmax_abs_scaled"
-                )
-                optimization_support_stage = support_optimization_stage_builder(
-                    config=table_context.config,
-                    runtime=active_runtime,
-                    baseline_state=table_context.baseline_state,
-                    profile_cfg=table_context.profile_cfg,
-                    reverse_setup=active_reverse_setup,
-                    support_payload=support_payload,
-                    ordinary_objective_indices=ordinary_objective_indices,
-                    dependencies=base_dependencies,
-                    initial_state_for_parameter_vector_compact=(
-                        initial_state_for_parameter_vector_compact
-                    ),
-                    compact_initial_er_database_support_bars=(
-                        compact_initial_er_database_support_bars
-                    ),
-                    compact_initial_er_database_geometry_bars=(
-                        compact_initial_er_database_geometry_bars
-                    ),
-                    objective_vector_joint_vjp_rows=(
-                        _objective_vector_joint_vjp_rows
-                    ),
-                    float_delta_tree_like=_float_delta_tree_like,
-                    add_float_delta_tree=_add_float_delta_tree,
-                )
-
             def _optimization_segment_replay(
                 execution_context,
                 segment_start_carry,
@@ -8874,9 +8751,7 @@ def internal_realtime_geometry_transport_reverse_table_result_builder(
                 )
 
             optimization_dependencies = dataclasses.replace(
-                optimization_support_stage.dependencies_for(
-                    base_dependencies, support_payload
-                ),
+                default_realtime_geometry_support_reverse_dependencies(),
                 segment_replay_minimal_with_primal_records=(
                     _optimization_segment_replay
                 ),
@@ -9087,11 +8962,6 @@ def internal_realtime_geometry_transport_reverse_table_result_builder(
             return 0
         return optimization_segment_replay_stage.database_bwd_cache_size()
 
-    def _optimization_support_cache_sizes() -> tuple[int | None, ...]:
-        if optimization_support_stage is None:
-            return (0,) * 5
-        return optimization_support_stage.cache_sizes()
-
     setattr(
         _builder,
         "optimization_segment_replay_cache_size",
@@ -9101,11 +8971,6 @@ def internal_realtime_geometry_transport_reverse_table_result_builder(
         _builder,
         "optimization_segment_bwd_cache_size",
         _optimization_segment_bwd_cache_size,
-    )
-    setattr(
-        _builder,
-        "optimization_support_cache_sizes",
-        _optimization_support_cache_sizes,
     )
     setattr(_builder, "optimization_phase_probe", None)
     return _builder
