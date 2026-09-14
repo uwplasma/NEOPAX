@@ -1052,6 +1052,13 @@ def test_database_full_transport_replay_stage_keeps_support_dynamic_and_cache_st
             None,
             jnp.asarray(segment_reduced_bars.y)[0],
         )
+        # The block/explicit-database stage matrix differentiates flat_rhs.
+        # Exercise it here so a persistent template RHS cannot silently keep
+        # the first evaluation's geometry while the direct pullback is live.
+        state_bar = state_bar + physics.flat_rhs(
+            jnp.asarray(0.0),
+            jnp.asarray(step_start_carries.y)[0],
+        )
         active_segment_reduced_bars = dataclasses.replace(
             segment_reduced_bars,
             y=jnp.broadcast_to(
@@ -1288,6 +1295,17 @@ def test_database_full_transport_replay_stage_keeps_support_dynamic_and_cache_st
     jax.block_until_ready((bwd0, bwd1))
     assert len(body_calls) == 1
     assert stage.database_bwd_cache_size() == 1
+    for bwd, support, replay_result in (
+        (bwd0, support0, result0),
+        (bwd1, support1, result1),
+    ):
+        scale = support["geometry"] * support["database"]
+        step_state = replay_result[1].y[0]
+        expected_state_bar = (
+            -(0.2 + scale)
+            + (-(0.2 + scale) * step_state + scale)
+        )
+        assert jnp.allclose(bwd[0].y[0], expected_state_bar)
     assert not jnp.allclose(bwd0[0].y, bwd1[0].y)
     assert not jnp.allclose(
         jax.tree_util.tree_leaves(bwd0[1])[-1],

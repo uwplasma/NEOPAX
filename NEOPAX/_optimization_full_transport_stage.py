@@ -42,6 +42,7 @@ from ._transport_solvers import (
     _build_prepared_radau_execution_context,
     _extract_fixed_temperature_projection,
     _extract_state_regularization,
+    _flat_rhs_factory,
     _make_solver_state_transform,
     _radau_database_segment_reduced_cotangent_bwd_with_table_support_call,
     _radau_segment_replay_minimal_with_primal_records_call,
@@ -809,8 +810,8 @@ def build_database_full_transport_replay_optimization_stage(
     template_pack_flat = template_physics_context.pack_flat
     template_project_flat = template_physics_context.project_flat
 
-    def _direct_state_pullback_with_support(
-        active_support,
+    def _direct_state_pullback_with_equation_system(
+        active_equation_system,
         t_value,
         flat_y,
         _lagged_response,
@@ -824,11 +825,6 @@ def build_database_full_transport_replay_optimization_stage(
         rollout preparation, and the Radau execution context remain static.
         """
 
-        active_equation_system = _equation_system_with_fresh_database_payload(
-            equation_system_template,
-            active_support,
-            static_ntss_density_indices=static_ntss_density_indices,
-        )
         pullback_fn = getattr(
             active_equation_system,
             "pullback_direct_rhs_state",
@@ -871,6 +867,25 @@ def build_database_full_transport_replay_optimization_stage(
         active_segment_arrays,
     ):
         active_support = support_layout.rebuild(support_floating_leaves)
+        active_equation_system = _equation_system_with_fresh_database_payload(
+            equation_system_template,
+            active_support,
+            static_ntss_density_indices=static_ntss_density_indices,
+        )
+        # The exact block database stage adjoint forms its state Jacobian from
+        # ``physics_context.flat_rhs``.  Keeping the template callable here
+        # would therefore differentiate the first optimization geometry even
+        # though replay and support cotangents use the current trial payload.
+        # Rebuild just this numerical RHS closure from the live equation
+        # system; the benchmark kernel and all solver/root structure remain
+        # unchanged and static.
+        active_flat_rhs = _flat_rhs_factory(
+            template_unpack_flat,
+            active_equation_system.vector_field,
+            (species,),
+            {},
+            project_flat=template_project_flat,
+        )
 
         def _active_direct_state_pullback(
             t_value,
@@ -878,8 +893,8 @@ def build_database_full_transport_replay_optimization_stage(
             lagged_response,
             rhs_bar_flat,
         ):
-            return _direct_state_pullback_with_support(
-                active_support,
+            return _direct_state_pullback_with_equation_system(
+                active_equation_system,
                 t_value,
                 flat_y,
                 lagged_response,
@@ -888,6 +903,7 @@ def build_database_full_transport_replay_optimization_stage(
 
         active_physics_context = dataclasses.replace(
             template_physics_context,
+            flat_rhs=active_flat_rhs,
             flat_rhs_direct_black_box_state_pullback=(
                 _active_direct_state_pullback
             ),
