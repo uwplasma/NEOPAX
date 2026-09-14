@@ -2,6 +2,7 @@
 
 import ast
 import dataclasses
+import importlib.util
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -1022,6 +1023,62 @@ def test_full_transport_parity_preserves_validated_root_seed():
     assert isinstance(vmec_input, ast.Attribute)
     assert isinstance(vmec_input.value, ast.Name)
     assert (vmec_input.value.id, vmec_input.attr) == ("base", "SEED_INPUT")
+
+
+def test_full_transport_parity_perturbation_reuses_only_trial_stage(
+    monkeypatch, tmp_path
+):
+    """Perturbed parity must expose state retained across optimization calls."""
+
+    script = (
+        Path(__file__).resolve().parents[1]
+        / "examples"
+        / "optimization"
+        / "test_geometry_qi_max_er_transition_bootstrap_initial_root_database_full_transport_parity.py"
+    )
+    spec = importlib.util.spec_from_file_location(
+        "full_transport_persistent_parity_test_script",
+        script,
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    problem = SimpleNamespace(
+        x0=jnp.asarray([0.0, 0.0]),
+        parameter_labels=("RBC:1:0", "ZBS:1:0"),
+    )
+    evaluations = []
+    monkeypatch.setattr(module, "build_problem", lambda **_kwargs: problem)
+
+    def fake_evaluate(_problem, values):
+        point = np.asarray(values, dtype=float).copy()
+        evaluations.append(point)
+        return jnp.asarray([point.sum()]), jnp.asarray([point])
+
+    monkeypatch.setattr(module, "evaluate", fake_evaluate)
+
+    trial_output = tmp_path / "trial.npz"
+    module._worker(
+        "trial",
+        trial_output,
+        parameter_index=1,
+        parameter_offset=0.25,
+    )
+    assert len(evaluations) == 2
+    np.testing.assert_array_equal(evaluations[0], np.asarray([0.0, 0.0]))
+    np.testing.assert_array_equal(evaluations[1], np.asarray([0.0, 0.25]))
+
+    evaluations.clear()
+    reference_output = tmp_path / "reference.npz"
+    module._worker(
+        "reference",
+        reference_output,
+        parameter_index=1,
+        parameter_offset=0.25,
+    )
+    assert len(evaluations) == 1
+    np.testing.assert_array_equal(evaluations[0], np.asarray([0.0, 0.25]))
 
 
 def test_database_full_transport_replay_stage_keeps_support_dynamic_and_cache_stable(

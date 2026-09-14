@@ -8,6 +8,12 @@ is the optimization-only full-transport selector and must invoke that same
 integrated selected-root/transport composition exactly once.  Candidate JIT
 boundaries are added only after this no-duplication baseline passes.  This is
 not an FD test or a physical final-time transport run.
+
+By default both workers evaluate the unperturbed point.  With a nonzero
+``--parameter-offset``, the benchmark worker evaluates the perturbed point
+fresh, while the optimization worker first evaluates ``x0`` and then the
+perturbed point through the same persistent stages.  That second mode detects
+trial data accidentally retained by an optimization-only JIT boundary.
 """
 
 from __future__ import annotations
@@ -131,31 +137,56 @@ def evaluate(problem, x):
     return jax.block_until_ready((result.residuals, result.jacobian))
 
 
-def _worker(stage_name: str, output_path: Path) -> int:
+def _worker(
+    stage_name: str,
+    output_path: Path,
+    *,
+    parameter_index: int,
+    parameter_offset: float,
+) -> int:
     """Evaluate one lane in its own process and persist only host arrays."""
 
     import jax
 
     stage_mode = REFERENCE_STAGE_MODE if stage_name == "reference" else TRIAL_STAGE_MODE
     problem = build_problem(reverse_stage_mode=stage_mode)
-    x0 = np.asarray(jax.device_get(problem.x0), dtype=float)
-    residuals, jacobian = evaluate(problem, x0)
+    x0 = np.array(jax.device_get(problem.x0), dtype=float, copy=True)
+    if not 0 <= parameter_index < x0.size:
+        raise ValueError(
+            f"--parameter-index must be in [0, {x0.size}); got {parameter_index}."
+        )
+    evaluation_point = np.array(x0, copy=True)
+    evaluation_point[parameter_index] += float(parameter_offset)
+    primed_at_x0 = stage_name == "trial" and float(parameter_offset) != 0.0
+    if primed_at_x0:
+        # Keep the optimization stage alive across two distinct geometries.
+        # The fresh benchmark worker deliberately does not take this step.
+        priming_residuals, priming_jacobian = evaluate(problem, x0)
+        del priming_residuals, priming_jacobian
+    residuals, jacobian = evaluate(problem, evaluation_point)
     np.savez(
         output_path,
         residuals=np.asarray(jax.device_get(residuals), dtype=float),
         jacobian=np.asarray(jax.device_get(jacobian), dtype=float),
         x0=x0,
+        evaluation_point=evaluation_point,
         parameter_labels=np.asarray(problem.parameter_labels, dtype=str),
     )
     print(
         f"[database full-transport parity] worker={stage_name} "
-        f"stage={stage_mode} wrote={output_path}",
+        f"stage={stage_mode} primed_at_x0={primed_at_x0} wrote={output_path}",
         flush=True,
     )
     return 0
 
 
-def _run_worker(stage_name: str, output_path: Path) -> None:
+def _run_worker(
+    stage_name: str,
+    output_path: Path,
+    *,
+    parameter_index: int,
+    parameter_offset: float,
+) -> None:
     subprocess.run(
         [
             sys.executable,
@@ -164,17 +195,24 @@ def _run_worker(stage_name: str, output_path: Path) -> None:
             stage_name,
             "--worker-output",
             str(output_path),
+            "--parameter-index",
+            str(parameter_index),
+            "--parameter-offset",
+            repr(float(parameter_offset)),
         ],
         check=True,
     )
 
 
-def _load_worker_output(path: Path) -> tuple[np.ndarray, np.ndarray, np.ndarray, tuple[str, ...]]:
+def _load_worker_output(
+    path: Path,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, tuple[str, ...]]:
     with np.load(path, allow_pickle=False) as data:
         return (
             np.asarray(data["residuals"], dtype=float),
             np.asarray(data["jacobian"], dtype=float),
             np.asarray(data["x0"], dtype=float),
+            np.asarray(data["evaluation_point"], dtype=float),
             tuple(str(value) for value in data["parameter_labels"]),
         )
 
@@ -183,11 +221,31 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--worker-stage", choices=("reference", "trial"), help=argparse.SUPPRESS)
     parser.add_argument("--worker-output", type=Path, help=argparse.SUPPRESS)
+    parser.add_argument(
+        "--parameter-index",
+        type=int,
+        default=0,
+        help="Scaled geometry parameter to perturb in persistent-stage parity mode.",
+    )
+    parser.add_argument(
+        "--parameter-offset",
+        type=float,
+        default=0.0,
+        help=(
+            "Offset applied to the selected scaled parameter. A nonzero value "
+            "primes the trial at x0 before comparing both lanes at the offset point."
+        ),
+    )
     args = parser.parse_args()
     if args.worker_stage is not None:
         if args.worker_output is None:
             parser.error("--worker-output is required with --worker-stage")
-        return _worker(args.worker_stage, args.worker_output)
+        return _worker(
+            args.worker_stage,
+            args.worker_output,
+            parameter_index=args.parameter_index,
+            parameter_offset=args.parameter_offset,
+        )
     if args.worker_output is not None:
         parser.error("--worker-output is only valid with --worker-stage")
 
@@ -199,18 +257,39 @@ def main() -> int:
         temp_root = Path(temp_dir)
         reference_path = temp_root / "reference.npz"
         trial_path = temp_root / "trial.npz"
-        _run_worker("reference", reference_path)
-        reference_residuals, reference_jacobian, reference_x0, reference_labels = (
+        _run_worker(
+            "reference",
+            reference_path,
+            parameter_index=args.parameter_index,
+            parameter_offset=args.parameter_offset,
+        )
+        (
+            reference_residuals,
+            reference_jacobian,
+            reference_x0,
+            reference_point,
+            reference_labels,
+        ) = (
             _load_worker_output(reference_path)
         )
-        _run_worker("trial", trial_path)
-        trial_residuals, trial_jacobian, trial_x0, trial_labels = _load_worker_output(
-            trial_path
+        _run_worker(
+            "trial",
+            trial_path,
+            parameter_index=args.parameter_index,
+            parameter_offset=args.parameter_offset,
         )
+        (
+            trial_residuals,
+            trial_jacobian,
+            trial_x0,
+            trial_point,
+            trial_labels,
+        ) = _load_worker_output(trial_path)
 
     if reference_labels != trial_labels:
         raise AssertionError("Reference and trial parameter layouts differ.")
     np.testing.assert_array_equal(trial_x0, reference_x0)
+    np.testing.assert_array_equal(trial_point, reference_point)
     residual_delta = trial_residuals - reference_residuals
     jacobian_delta = trial_jacobian - reference_jacobian
     reference_jacobian_np = reference_jacobian
@@ -229,7 +308,10 @@ def main() -> int:
         f"segments={ACCEPTED_STEP_LIMIT // REVERSE_SEGMENT_LENGTH} "
         f"segment_length={REVERSE_SEGMENT_LENGTH} "
         f"reference_stage={REFERENCE_STAGE_MODE} trial_stage={TRIAL_STAGE_MODE} "
-        "parameter_point=unperturbed_x0 "
+        f"parameter_point={'unperturbed_x0' if args.parameter_offset == 0.0 else 'reused_stage_perturbed_x1'} "
+        f"parameter_index={args.parameter_index} "
+        f"parameter_offset={args.parameter_offset:.6e} "
+        f"trial_primed_at_x0={args.parameter_offset != 0.0} "
         "process_isolation=sequential_workers "
         "transport_reverse=block/explicit_database/reduced_cotangent_call_boundary "
         "database_interpolation_transpose=legacy_sparse",
