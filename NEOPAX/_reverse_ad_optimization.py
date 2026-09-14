@@ -4534,6 +4534,8 @@ def evaluate_geometry_transport_realtime_geometry_least_squares(
     geometry_final_vmec_pullback_mode: str = "raw_block_transpose",
     geometry_solver_device: str | None = "default",
     share_raw_block_solve: bool = True,
+    raw_block_optimization_stage=None,
+    raw_block_transpose_optimization_stage=None,
 ) -> LeastSquaresEvaluation:
     """Evaluate mixed geometry + realtime-transport least-squares terms.
 
@@ -4616,12 +4618,38 @@ def evaluate_geometry_transport_realtime_geometry_least_squares(
             request.parameter_set,
             parameter_values_arr,
         )
+        raw_stage = (
+            None
+            if raw_block_optimization_stage is None
+            else raw_block_optimization_stage.raw_block_stage
+        )
         shared_raw_block_solve = geometry_raw_block_solve_from_param_vector(
             geometry_context,
             vmec_parameter_values,
             tuple(spec.as_tuple() for spec in request.parameter_set.vmec_boundary_specs),
             max_iter=geometry_max_iter,
             solver_device=geometry_solver_device,
+            stage=raw_stage,
+            solve_with_aux_runner=(
+                None
+                if raw_block_optimization_stage is None
+                else raw_block_optimization_stage.solve_with_aux_runner
+            ),
+            base_implicit_params=(
+                None
+                if raw_block_optimization_stage is None
+                else raw_block_optimization_stage.base_implicit_params
+            ),
+            implicit_params_from_deltas_runner=(
+                None
+                if raw_block_optimization_stage is None
+                else raw_block_optimization_stage.implicit_params_from_deltas_runner
+            ),
+            state_mask_stop_gradient_runner=(
+                None
+                if raw_block_optimization_stage is None
+                else raw_block_optimization_stage.state_mask_stop_gradient_runner
+            ),
         )
         opts.setdefault("raw_block_solve", shared_raw_block_solve)
         opts.setdefault("geometry_raw_block_solve", shared_raw_block_solve)
@@ -4668,6 +4696,9 @@ def evaluate_geometry_transport_realtime_geometry_least_squares(
             final_vmec_pullback_mode=geometry_final_vmec_pullback_mode,
             solver_device=geometry_solver_device,
             raw_block_solve=shared_raw_block_solve,
+            raw_block_transpose_optimization_stage=(
+                raw_block_transpose_optimization_stage
+            ),
         )
         _report_outer_phase("geometry_table")
 

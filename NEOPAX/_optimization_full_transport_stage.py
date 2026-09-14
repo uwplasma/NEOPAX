@@ -22,6 +22,8 @@ import numpy as np
 from ._optimization_initial_root_stage import FloatingPayloadLeafLayout
 from ._reverse_ad_initial_er import (
     _replace_geometry_and_fresh_database_payload_in_model,
+    find_ntx_database_transport_model_in_model,
+    runtime_with_fresh_ntx_database_payload,
 )
 from ._transport_equations import build_equation_system
 from ._transport_solvers import (
@@ -130,6 +132,130 @@ def _equation_system_with_fresh_database_payload(
             None,
         ),
         shared_flux_model=flux_model,
+    )
+
+
+@dataclasses.dataclass
+class DatabaseFullTransportBootstrapOptimizationStage:
+    """Persistent terminal-bootstrap boundary for one optimization stage."""
+
+    support_layout: FloatingPayloadLeafLayout
+    compiled_bootstrap: Any
+    support_floating_signature: Any
+
+    def evaluate(self, final_y, support_payload):
+        self.support_layout.validate_static_structure(support_payload)
+        support_leaves = self.support_layout.floating_leaves(support_payload)
+        if _tree_signature(support_leaves) != self.support_floating_signature:
+            raise ValueError(
+                "Full-transport bootstrap support shape or dtype changed "
+                "within an optimization stage."
+            )
+        return self.compiled_bootstrap(final_y, support_leaves)
+
+    def cache_size(self) -> int | None:
+        cache_size = getattr(self.compiled_bootstrap, "_cache_size", None)
+        if not callable(cache_size):
+            return None
+        try:
+            return int(cache_size())
+        except Exception:
+            return None
+
+
+def build_database_full_transport_bootstrap_optimization_stage(
+    *,
+    runtime,
+    reverse_setup,
+    support_payload,
+) -> DatabaseFullTransportBootstrapOptimizationStage:
+    """Retain the existing database bootstrap calculation behind one JIT."""
+
+    from ._reverse_ad_transport import (
+        _database_bootstrap_interpolation_bar,
+        bootstrap_current_softmax_abs_value_and_upar_bar,
+    )
+    from ._transport_flux_models import _sanitize_float_delta_bar_tree
+
+    if not (
+        isinstance(support_payload, dict)
+        and set(support_payload) == {"geometry", "database"}
+    ):
+        raise ValueError(
+            "Full-transport bootstrap optimization requires exactly "
+            "{'geometry', 'database'} support."
+        )
+    support_layout = FloatingPayloadLeafLayout.from_template(support_payload)
+    support_leaves = support_layout.floating_leaves(support_payload)
+    unpack_flat = reverse_setup.prepared_rollout.physics_context.unpack_flat
+    runtime_template = runtime
+
+    def _bootstrap(final_y, active_support_leaves):
+        active_support = support_layout.rebuild(active_support_leaves)
+        geometry = active_support["geometry"]
+        database = active_support["database"]
+        active_runtime = runtime_with_fresh_ntx_database_payload(
+            runtime_template,
+            geometry=geometry,
+            database=database,
+        )
+        database_model = find_ntx_database_transport_model_in_model(
+            active_runtime.models.flux
+        )
+        if database_model is None:
+            raise ValueError(
+                "Full-transport bootstrap stage requires an NTX database model."
+            )
+        final_state = unpack_flat(final_y)
+        corrected_fluxes = {
+            "Upar": database_model.evaluate_momentum_corrected_upar_only(
+                final_state
+            )
+        }
+        objective_value, upar_bar = (
+            bootstrap_current_softmax_abs_value_and_upar_bar(
+                final_state,
+                active_runtime,
+                corrected_fluxes,
+            )
+        )
+        state_bar, geometry_bar = (
+            database_model.pullback_momentum_corrected_upar_state_geometry_by_radius(
+                final_state,
+                upar_bar,
+                geometry,
+            )
+        )
+        database_bar = _database_bootstrap_interpolation_bar(
+            database,
+            final_state,
+            upar_bar,
+            mode="legacy_sparse",
+            table_pullback=None,
+            coordinate_pullback=None,
+            sparse_pullback=(
+                database_model.pullback_momentum_corrected_upar_database_support_legacy_sparse_by_radius
+            ),
+        )
+        _, unpack_pullback = jax.vjp(unpack_flat, final_y)
+        final_y_bar = unpack_pullback(state_bar)[0]
+        return (
+            objective_value,
+            final_y_bar,
+            {
+                "geometry": _sanitize_float_delta_bar_tree(
+                    geometry, geometry_bar
+                ),
+                "database": _sanitize_float_delta_bar_tree(
+                    database, database_bar
+                ),
+            },
+        )
+
+    return DatabaseFullTransportBootstrapOptimizationStage(
+        support_layout=support_layout,
+        compiled_bootstrap=jax.jit(_bootstrap, inline=False),
+        support_floating_signature=_tree_signature(support_leaves),
     )
 
 

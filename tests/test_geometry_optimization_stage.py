@@ -474,6 +474,7 @@ def test_database_full_transport_mode_uses_one_integrated_benchmark_builder(monk
         production_dependencies.database_segment_reduced_cotangent_bwd_with_table_support
         is None
     )
+    assert production_dependencies.database_bootstrap_objective_row is None
     assert production_dependencies.optimization_phase_probe is None
 
     expected_database_modes = {
@@ -505,8 +506,9 @@ def test_database_full_transport_mode_uses_one_integrated_benchmark_builder(monk
     context = object()
     runtime = object()
     baseline_state = SimpleNamespace(pressure=jnp.asarray([1.0]))
+    vmec_spec = SimpleNamespace(as_tuple=lambda: ("RBC", 1, 0))
     parameterization = SimpleNamespace(
-        specs=("vmec-spec",),
+        specs=(vmec_spec,),
         x_scale=jnp.asarray([1.0]),
     )
     parameter_set = SimpleNamespace(specs=("parameter-spec",))
@@ -562,6 +564,29 @@ def test_database_full_transport_mode_uses_one_integrated_benchmark_builder(monk
             AssertionError("full transport must not use the retired two-sweep bridge")
         ),
     )
+    raw_stage = SimpleNamespace(raw_block_stage=object())
+    transpose_stage = object()
+    payload_stage = object()
+    monkeypatch.setattr(
+        optimization,
+        "geometry_raw_block_optimization_stage",
+        lambda *_args, **_kwargs: raw_stage,
+    )
+    monkeypatch.setattr(
+        optimization,
+        "geometry_raw_block_transpose_optimization_stage",
+        lambda *_args, **_kwargs: transpose_stage,
+    )
+    monkeypatch.setattr(
+        optimization,
+        "_prepare_initial_root_payload_static",
+        lambda *_args, **_kwargs: object(),
+    )
+    monkeypatch.setattr(
+        optimization,
+        "build_initial_root_payload_assembly_stage",
+        lambda **_kwargs: payload_stage,
+    )
 
     for stage_mode in ("benchmark", "database_full_transport_optimization"):
         calls = []
@@ -600,16 +625,111 @@ def test_database_full_transport_mode_uses_one_integrated_benchmark_builder(monk
         assert calls[0]["reverse_step_bwd_mode"] == "reduced_cotangent_call_boundary"
         if stage_mode == "benchmark":
             assert calls[0]["segment_replay_optimization_stage_builder"] is None
+            assert calls[0]["bootstrap_optimization_stage_builder"] is None
+            assert calls[0]["payload_assembly_optimization_stage"] is None
+            assert problem.raw_block_optimization_stage is None
+            assert problem.raw_block_transpose_optimization_stage is None
         else:
             assert (
                 calls[0]["segment_replay_optimization_stage_builder"]
                 is full_transport_stage.build_database_full_transport_replay_optimization_stage
             )
+            assert (
+                calls[0]["bootstrap_optimization_stage_builder"]
+                is full_transport_stage.build_database_full_transport_bootstrap_optimization_stage
+            )
+            assert calls[0]["payload_assembly_optimization_stage"] is payload_stage
+            assert problem.raw_block_optimization_stage is raw_stage
+            assert problem.raw_block_transpose_optimization_stage is transpose_stage
         for name, expected in expected_database_modes.items():
             assert calls[0][name] == expected
             assert problem.options[name] == expected
         assert problem.options["reverse_stage_mode"] == stage_mode
         assert problem.table_result_builder is builder
+
+
+def test_database_full_transport_bootstrap_stage_keeps_trial_values_dynamic(
+    monkeypatch,
+):
+    """The terminal bootstrap JIT has one owner and no captured trial leaves."""
+
+    class _Model:
+        def __init__(self, geometry, database):
+            self.geometry = geometry
+            self.database = database
+
+        def evaluate_momentum_corrected_upar_only(self, state):
+            return state + self.geometry["g"] + self.database["d"]
+
+        def pullback_momentum_corrected_upar_state_geometry_by_radius(
+            self, state, upar_bar, geometry
+        ):
+            del upar_bar
+            return jnp.ones_like(state), {"g": 2.0 * geometry["g"]}
+
+        def pullback_momentum_corrected_upar_database_support_legacy_sparse_by_radius(
+            self, state, upar_bar
+        ):
+            del state, upar_bar
+            value = 3.0 * self.database["d"]
+            return value, value, value, value, value
+
+    def _runtime_with_payload(_runtime, *, geometry, database):
+        return SimpleNamespace(
+            models=SimpleNamespace(flux=(geometry, database)),
+        )
+
+    monkeypatch.setattr(
+        full_transport_stage,
+        "runtime_with_fresh_ntx_database_payload",
+        _runtime_with_payload,
+    )
+    monkeypatch.setattr(
+        full_transport_stage,
+        "find_ntx_database_transport_model_in_model",
+        lambda payload: _Model(*payload),
+    )
+    monkeypatch.setattr(
+        reverse_transport,
+        "bootstrap_current_softmax_abs_value_and_upar_bar",
+        lambda state, _runtime, fluxes: (
+            jnp.sum(fluxes["Upar"]),
+            jnp.ones_like(state),
+        ),
+    )
+    monkeypatch.setattr(
+        reverse_transport,
+        "_database_bootstrap_interpolation_bar",
+        lambda database, _state, _upar_bar, **_kwargs: {
+            "d": 4.0 * database["d"]
+        },
+    )
+
+    reverse_setup = SimpleNamespace(
+        prepared_rollout=SimpleNamespace(
+            physics_context=SimpleNamespace(unpack_flat=lambda value: value)
+        )
+    )
+    support0 = {"geometry": {"g": jnp.asarray(1.0)}, "database": {"d": jnp.asarray(2.0)}}
+    stage = full_transport_stage.build_database_full_transport_bootstrap_optimization_stage(
+        runtime=object(),
+        reverse_setup=reverse_setup,
+        support_payload=support0,
+    )
+
+    value0, final_bar0, support_bar0 = stage.evaluate(jnp.asarray([5.0]), support0)
+    support1 = {"geometry": {"g": jnp.asarray(4.0)}, "database": {"d": jnp.asarray(6.0)}}
+    value1, final_bar1, support_bar1 = stage.evaluate(jnp.asarray([7.0]), support1)
+
+    assert stage.cache_size() == 1
+    assert jnp.allclose(value0, 8.0)
+    assert jnp.allclose(value1, 17.0)
+    assert jnp.allclose(final_bar0, jnp.ones((1,)))
+    assert jnp.allclose(final_bar1, jnp.ones((1,)))
+    assert jnp.allclose(support_bar0["geometry"]["g"], 2.0)
+    assert jnp.allclose(support_bar1["geometry"]["g"], 8.0)
+    assert jnp.allclose(support_bar0["database"]["d"], 8.0)
+    assert jnp.allclose(support_bar1["database"]["d"], 24.0)
 
 
 def test_full_transport_parity_parent_does_not_import_gpu_stack():

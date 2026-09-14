@@ -27,6 +27,7 @@ from ._geometry_autodiff import (
     build_neopax_geometry_and_ntx_exact_lij_support_from_state,
     build_runtime_context_for_vmec_state,
     build_geometry_autodiff_context,
+    geometry_raw_block_optimization_stage,
     geometry_raw_block_stage,
     geometry_raw_block_solve_from_param_vector,
     geometry_raw_block_transpose_optimization_stage,
@@ -71,6 +72,7 @@ from ._optimization_initial_root_stage import (
     initial_root_stage_layout,
 )
 from ._optimization_full_transport_stage import (
+    build_database_full_transport_bootstrap_optimization_stage,
     build_database_full_transport_replay_optimization_stage,
 )
 from ._reverse_ad_parameters import (
@@ -915,6 +917,8 @@ class GeometryFullTransportLeastSquaresProblem:
     table_context: object
     table_result_builder: object
     options: Mapping[str, object]
+    raw_block_optimization_stage: object | None = None
+    raw_block_transpose_optimization_stage: object | None = None
     geometry_lane: str = "ad"
     geometry_max_iter: int | None = None
     geometry_step_size: float | None = None
@@ -976,6 +980,10 @@ class GeometryFullTransportLeastSquaresProblem:
             geometry_final_vmec_pullback_mode="raw_block_transpose",
             geometry_solver_device=self.geometry_solver_device,
             share_raw_block_solve=True,
+            raw_block_optimization_stage=self.raw_block_optimization_stage,
+            raw_block_transpose_optimization_stage=(
+                self.raw_block_transpose_optimization_stage
+            ),
         )
         result = _assemble_mixed_initial_er_root_result(
             self.terms,
@@ -2369,6 +2377,138 @@ def geometry_full_transport_least_squares_problem(
     baseline_geometry_deltas = jnp.zeros(
         (len(parameterization.specs),), dtype=jnp.float64
     )
+    raw_block_optimization_stage = None
+    raw_block_transpose_stage = None
+    full_transport_payload_stage = None
+    if stage_mode == "database_full_transport_optimization":
+        # Keep the VMEX solve identical to the established shared raw-block
+        # path, but retain its fixed callable/configuration owners for the
+        # lifetime of this optimization problem.  Boundary deltas, the
+        # converged state, and the DoF mask remain fresh numerical values on
+        # every evaluation.  Benchmark mode deliberately keeps its existing
+        # one-shot entrypoint.
+        raw_block_optimization_stage = geometry_raw_block_optimization_stage(
+            context,
+            tuple(spec.as_tuple() for spec in parameterization.specs),
+            max_iter=geometry_max_iter,
+            solver_device=geometry_solver_device,
+        )
+        raw_block_transpose_stage = geometry_raw_block_transpose_optimization_stage(
+            raw_block_optimization_stage.raw_block_stage,
+            context=context,
+        )
+
+        stage_transport_objectives = tuple(
+            dict.fromkeys(
+                term.objective.name
+                for term in _normalize_initial_er_root_least_squares_terms(terms)
+                if term.objective.family == "transport"
+            )
+        )
+        prepared_payload_static = _prepare_initial_root_payload_static(
+            context,
+            n_r=n_r_eff,
+            scan_rho=neoclassical_cfg.get("ntx_scan_rho"),
+        )
+
+        def _full_transport_payload_kernel(
+            raw_block_solve,
+            geometry_deltas,
+            objective_values,
+            profile_gradient_matrix,
+            support_bars,
+            *,
+            prepared_static=None,
+            prepared_active_payload_leaves=None,
+        ):
+            # This is the existing transport-payload/VMEX bridge, placed
+            # behind one stage-owned JIT.  No derivative is reconstructed or
+            # altered here.
+            return _optimization_payload_to_vmec_table(
+                objective_labels=stage_transport_objectives,
+                profile_parameter_labels=tuple(
+                    spec.label for spec in parameter_set.profile_specs
+                ),
+                geometry_parameter_labels=tuple(
+                    spec.vmec_label for spec in parameter_set.vmec_boundary_specs
+                ),
+                objective_values=objective_values,
+                profile_gradient_matrix=profile_gradient_matrix,
+                geometry_context=context,
+                baseline_geometry_deltas=geometry_deltas,
+                geometry_param_specs=tuple(
+                    spec.as_tuple() for spec in parameter_set.vmec_boundary_specs
+                ),
+                support_bars=support_bars,
+                support_component_bars_by_name={},
+                include_component_pullbacks=False,
+                combined_geometry_payload=True,
+                payload_kind="ntx_scan_runtime",
+                scan_rho=neoclassical_cfg.get("ntx_scan_rho"),
+                scan_surface_backend=str(
+                    neoclassical_cfg.get("ntx_scan_surface_backend", "vmec")
+                ),
+                n_r=n_r_eff,
+                n_theta=n_theta_eff,
+                n_zeta=n_zeta_eff,
+                n_xi=n_xi_eff,
+                surface_backend=surface_backend_eff,
+                max_iter=geometry_max_iter,
+                solver_device=geometry_solver_device,
+                progress_label=None,
+                raw_block_solve=raw_block_solve,
+                prepared_payload_static=prepared_static,
+                prepared_active_payload_leaves=prepared_active_payload_leaves,
+                return_raw_matrices=True,
+                return_branch_gradients=False,
+            )
+
+        def _full_transport_payload_result(kernel_result):
+            values, profile_gradient, geometry_gradient = kernel_result
+            table_result = realtime_geometry_transport_reverse_table_result(
+                objective_labels=stage_transport_objectives,
+                profile_parameter_labels=tuple(
+                    spec.label for spec in parameter_set.profile_specs
+                ),
+                geometry_parameter_labels=tuple(
+                    spec.vmec_label for spec in parameter_set.vmec_boundary_specs
+                ),
+                objective_values=values,
+                profile_gradient_matrix=profile_gradient,
+                geometry_gradient_matrix=geometry_gradient,
+            )
+            payload_result = RealtimeGeometryPayloadPullbackResult(
+                geometry_gradient_matrix=geometry_gradient,
+                geometry_branch_gradient_matrix=None,
+                ntx_support_branch_gradient_matrix=None,
+                component_gradient_matrices={},
+                component_geometry_branch_matrices={},
+                component_ntx_support_branch_matrices={},
+            )
+            return RealtimeGeometryTransportReverseAssemblyResult(
+                table_result=table_result,
+                payload_pullback_result=payload_result,
+            )
+
+        full_transport_payload_stage = build_initial_root_payload_assembly_stage(
+            raw_block_stage=raw_block_optimization_stage.raw_block_stage,
+            payload_to_vmec_impl=_full_transport_payload_kernel,
+            prepared_static=prepared_payload_static,
+            prepared_static_factory=lambda state: _prepare_initial_root_payload_static(
+                context,
+                n_r=n_r_eff,
+                state=state,
+                scan_rho=neoclassical_cfg.get("ntx_scan_rho"),
+            ),
+            active_payload_layout_factory=lambda payload_bars: (
+                initial_root_payload_active_leaf_layout(
+                    payload_bars,
+                    support_branch_name="ntx_scan_runtime",
+                    combined_support_payload=True,
+                )
+            ),
+            result_from_kernel=_full_transport_payload_result,
+        )
     # Both modes call the unchanged benchmark full-transport composition.
     # The experiment mode is an optimization-only selector for subsequent
     # boundary trials; it must not replace the integrated selected-root path
@@ -2459,6 +2599,12 @@ def geometry_full_transport_least_squares_problem(
             if stage_mode == "database_full_transport_optimization"
             else None
         ),
+        bootstrap_optimization_stage_builder=(
+            build_database_full_transport_bootstrap_optimization_stage
+            if stage_mode == "database_full_transport_optimization"
+            else None
+        ),
+        payload_assembly_optimization_stage=full_transport_payload_stage,
     )
     normalized_terms = _normalize_initial_er_root_least_squares_terms(terms)
     return GeometryFullTransportLeastSquaresProblem(
@@ -2472,6 +2618,8 @@ def geometry_full_transport_least_squares_problem(
         table_context=table_context,
         table_result_builder=table_result_builder,
         options=options,
+        raw_block_optimization_stage=raw_block_optimization_stage,
+        raw_block_transpose_optimization_stage=raw_block_transpose_stage,
         geometry_lane=geometry_lane,
         geometry_max_iter=geometry_max_iter,
         geometry_step_size=geometry_step_size,

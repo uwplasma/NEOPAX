@@ -752,6 +752,9 @@ class RealtimeGeometrySupportReverseDependencies:
     database_segment_reduced_cotangent_bwd_with_table_support: (
         Callable[..., object] | None
     ) = None
+    # Optional optimization-only terminal bootstrap boundary. Benchmark
+    # dependency bundles leave this unset and execute their established code.
+    database_bootstrap_objective_row: Callable[..., object] | None = None
     # Optional optimization-memory diagnostic. Production benchmark bundles
     # leave this unset, preserving their existing execution and synchronization.
     optimization_phase_probe: Callable[[str], None] | None = None
@@ -762,6 +765,7 @@ class RealtimeGeometrySupportReverseDependencies:
             if field.name in {
                 "segment_replay_minimal_with_primal_records",
                 "database_segment_reduced_cotangent_bwd_with_table_support",
+                "database_bootstrap_objective_row",
                 "optimization_phase_probe",
             } and value is None:
                 continue
@@ -5155,6 +5159,35 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
                 or "database" in support_payload
             )
         ):
+            if dependencies.database_bootstrap_objective_row is not None:
+                (
+                    objective_value,
+                    final_y_bar,
+                    bootstrap_payload_bar,
+                ) = dependencies.database_bootstrap_objective_row(
+                    final_y_for_objective,
+                    support_payload,
+                )
+                objective_values_rows.append(objective_value)
+                final_y_bar_rows.append(final_y_bar)
+                objective_payload_bar_rows.append(bootstrap_payload_bar)
+                if (
+                    phase_timing_diagnostics
+                    or dependencies.optimization_phase_probe is not None
+                ):
+                    (
+                        objective_values_rows[-1],
+                        final_y_bar_rows[-1],
+                        objective_payload_bar_rows[-1],
+                    ) = jax.block_until_ready(
+                        (
+                            objective_values_rows[-1],
+                            final_y_bar_rows[-1],
+                            objective_payload_bar_rows[-1],
+                        )
+                    )
+                _report_optimization_phase("final_objective_bootstrap_row")
+                continue
             component_start = time.perf_counter()
             final_state_for_bootstrap = reverse_setup.prepared_rollout.physics_context.unpack_flat(
                 final_y_for_objective
@@ -8391,6 +8424,8 @@ def internal_realtime_geometry_transport_reverse_table_result_builder(
     progress_label: str | None = None,
     raw_block_solve: GeometryRawBlockSolve | None = None,
     segment_replay_optimization_stage_builder: Callable[..., object] | None = None,
+    bootstrap_optimization_stage_builder: Callable[..., object] | None = None,
+    payload_assembly_optimization_stage: object | None = None,
 ) -> TransportReverseTableResultBuilder:
     """Build an experimental direct full transport reverse table builder.
 
@@ -8411,6 +8446,7 @@ def internal_realtime_geometry_transport_reverse_table_result_builder(
         return tuple(lookup[str(name)] for name in normalize_transport_objective_names(objective_names, objective_labels=labels))
 
     optimization_segment_replay_stage = None
+    optimization_bootstrap_stage = None
 
     def _builder(
         objective_names: tuple[str, ...],
@@ -8750,6 +8786,26 @@ def internal_realtime_geometry_transport_reverse_table_result_builder(
                     segment_arrays=segment_arrays,
                 )
 
+            def _optimization_database_bootstrap(final_y, active_support_payload):
+                nonlocal optimization_bootstrap_stage
+                if optimization_bootstrap_stage is None:
+                    if not callable(bootstrap_optimization_stage_builder):
+                        raise RuntimeError(
+                            "The database full-transport optimization bootstrap "
+                            "stage builder was not supplied."
+                        )
+                    optimization_bootstrap_stage = (
+                        bootstrap_optimization_stage_builder(
+                            runtime=active_runtime,
+                            reverse_setup=active_reverse_setup,
+                            support_payload=active_support_payload,
+                        )
+                    )
+                return optimization_bootstrap_stage.evaluate(
+                    final_y,
+                    active_support_payload,
+                )
+
             optimization_dependencies = dataclasses.replace(
                 default_realtime_geometry_support_reverse_dependencies(),
                 segment_replay_minimal_with_primal_records=(
@@ -8757,6 +8813,11 @@ def internal_realtime_geometry_transport_reverse_table_result_builder(
                 ),
                 database_segment_reduced_cotangent_bwd_with_table_support=(
                     _optimization_database_segment_bwd
+                ),
+                database_bootstrap_objective_row=(
+                    _optimization_database_bootstrap
+                    if callable(bootstrap_optimization_stage_builder)
+                    else None
                 ),
                 optimization_phase_probe=optimization_phase_probe,
             )
@@ -8879,43 +8940,69 @@ def internal_realtime_geometry_transport_reverse_table_result_builder(
         )
         active_neoclassical_cfg = table_context.config.get("neoclassical", {})
         _report_table_builder_phase("prepare_transport_table_inputs")
-        assembly = realtime_geometry_transport_reverse_table_from_payload_cotangents(
-            objective_labels=objective_names,
-            profile_parameter_labels=tuple(spec.label for spec in parameter_set.profile_specs),
-            geometry_parameter_labels=tuple(spec.vmec_label for spec in parameter_set.vmec_boundary_specs),
-            objective_values=selected_objective_values,
-            profile_gradient_matrix=selected_profile_matrix,
-            geometry_context=geometry_context,
-            baseline_geometry_deltas=active_baseline_geometry_deltas,
-            geometry_param_specs=vmec_specs,
-            support_bars=support_bars,
-            support_component_bars_by_name=component_bars,
-            native_vmec_face_coefficient_bars=native_vmec_face_coefficient_bars,
-            include_component_pullbacks=active_component_pullbacks,
-            combined_geometry_payload=combined_geometry_payload,
-            payload_kind=active_payload_kind,
-            scan_rho=active_neoclassical_cfg.get("ntx_scan_rho"),
-            scan_surface_backend=str(
-                active_neoclassical_cfg.get("ntx_scan_surface_backend", "vmec")
-            ),
-            n_r=int(opts.get("n_r", n_r)),
-            n_theta=int(opts.get("n_theta", n_theta)),
-            n_zeta=int(opts.get("n_zeta", n_zeta)),
-            n_xi=int(opts.get("n_xi", n_xi)),
-            surface_backend=str(opts.get("surface_backend", surface_backend)),
-            max_iter=opts.get("max_iter", max_iter),
-            solver_device=str(opts.get("solver_device", solver_device)),
-            progress_label=progress_label,
-            return_branch_gradients=bool(opts.get("return_branch_gradients", False)),
-            raw_block_solve=active_raw_block_solve,
-            dispatch_cache_probe=(
-                None
-                if optimization_phase_probe is None
-                else lambda phase: optimization_phase_probe(
-                    f"geometry_payload.{phase}"
-                )
-            ),
+        use_payload_optimization_stage = (
+            active_stage_mode == "database_full_transport_optimization"
+            and payload_assembly_optimization_stage is not None
+            and active_raw_block_solve is not None
+            and not active_component_pullbacks
+            and native_vmec_face_coefficient_bars is None
         )
+        if use_payload_optimization_stage:
+            assembly = payload_assembly_optimization_stage.payload_to_vmec(
+                (
+                    active_raw_block_solve.implicit_params,
+                    active_raw_block_solve.state,
+                    active_raw_block_solve.dof_mask,
+                ),
+                active_baseline_geometry_deltas,
+                selected_objective_values,
+                selected_profile_matrix,
+                support_bars,
+            )
+        else:
+            assembly = realtime_geometry_transport_reverse_table_from_payload_cotangents(
+                objective_labels=objective_names,
+                profile_parameter_labels=tuple(
+                    spec.label for spec in parameter_set.profile_specs
+                ),
+                geometry_parameter_labels=tuple(
+                    spec.vmec_label for spec in parameter_set.vmec_boundary_specs
+                ),
+                objective_values=selected_objective_values,
+                profile_gradient_matrix=selected_profile_matrix,
+                geometry_context=geometry_context,
+                baseline_geometry_deltas=active_baseline_geometry_deltas,
+                geometry_param_specs=vmec_specs,
+                support_bars=support_bars,
+                support_component_bars_by_name=component_bars,
+                native_vmec_face_coefficient_bars=native_vmec_face_coefficient_bars,
+                include_component_pullbacks=active_component_pullbacks,
+                combined_geometry_payload=combined_geometry_payload,
+                payload_kind=active_payload_kind,
+                scan_rho=active_neoclassical_cfg.get("ntx_scan_rho"),
+                scan_surface_backend=str(
+                    active_neoclassical_cfg.get("ntx_scan_surface_backend", "vmec")
+                ),
+                n_r=int(opts.get("n_r", n_r)),
+                n_theta=int(opts.get("n_theta", n_theta)),
+                n_zeta=int(opts.get("n_zeta", n_zeta)),
+                n_xi=int(opts.get("n_xi", n_xi)),
+                surface_backend=str(opts.get("surface_backend", surface_backend)),
+                max_iter=opts.get("max_iter", max_iter),
+                solver_device=str(opts.get("solver_device", solver_device)),
+                progress_label=progress_label,
+                return_branch_gradients=bool(
+                    opts.get("return_branch_gradients", False)
+                ),
+                raw_block_solve=active_raw_block_solve,
+                dispatch_cache_probe=(
+                    None
+                    if optimization_phase_probe is None
+                    else lambda phase: optimization_phase_probe(
+                        f"geometry_payload.{phase}"
+                    )
+                ),
+            )
         if optimization_phase_probe is not None:
             jax.block_until_ready(assembly.table_result)
             optimization_phase_probe("geometry_payload_pullback")
@@ -8962,6 +9049,11 @@ def internal_realtime_geometry_transport_reverse_table_result_builder(
             return 0
         return optimization_segment_replay_stage.database_bwd_cache_size()
 
+    def _optimization_bootstrap_cache_size() -> int | None:
+        if optimization_bootstrap_stage is None:
+            return 0
+        return optimization_bootstrap_stage.cache_size()
+
     setattr(
         _builder,
         "optimization_segment_replay_cache_size",
@@ -8971,6 +9063,11 @@ def internal_realtime_geometry_transport_reverse_table_result_builder(
         _builder,
         "optimization_segment_bwd_cache_size",
         _optimization_segment_bwd_cache_size,
+    )
+    setattr(
+        _builder,
+        "optimization_bootstrap_cache_size",
+        _optimization_bootstrap_cache_size,
     )
     setattr(_builder, "optimization_phase_probe", None)
     return _builder

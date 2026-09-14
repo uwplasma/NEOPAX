@@ -65,7 +65,7 @@ def device_memory_text() -> str:
 
 def segment_cache_sizes(
     problem,
-) -> tuple[int | None, int | None, int | None, int | None, int | None, int | None]:
+):
     cache_size = reverse_transport._jax_trace_cache_size
     optimization_replay_cache_size = getattr(
         problem.table_result_builder,
@@ -77,6 +77,22 @@ def segment_cache_sizes(
         "optimization_segment_bwd_cache_size",
         lambda: None,
     )
+    optimization_bootstrap_cache_size = getattr(
+        problem.table_result_builder,
+        "optimization_bootstrap_cache_size",
+        lambda: None,
+    )
+
+    def _compiled_cache_size(compiled):
+        cache_size_fn = getattr(compiled, "_cache_size", None)
+        if not callable(cache_size_fn):
+            return None
+        try:
+            return int(cache_size_fn())
+        except Exception:
+            return None
+
+    raw_stage = getattr(problem, "raw_block_optimization_stage", None)
     return (
         cache_size(
             reverse_transport._radau_database_segment_reduced_cotangent_bwd_with_table_support_call
@@ -89,6 +105,16 @@ def segment_cache_sizes(
         ),
         optimization_replay_cache_size(),
         optimization_bwd_cache_size(),
+        optimization_bootstrap_cache_size(),
+        _compiled_cache_size(
+            None if raw_stage is None else raw_stage.implicit_params_from_deltas_runner
+        ),
+        _compiled_cache_size(
+            None if raw_stage is None else raw_stage.solve_with_aux_runner
+        ),
+        _compiled_cache_size(
+            None if raw_stage is None else raw_stage.state_mask_stop_gradient_runner
+        ),
         global_dispatch_cache_size(),
     )
 
@@ -214,7 +240,8 @@ def main() -> int:
             "[database full-transport memory] "
             f"warmup={warmup_index} elapsed_s={time.perf_counter() - started:.3f} "
             "stage_cache=(benchmark_database_bwd,benchmark_replay,generic_bwd,"
-            "optimization_replay,optimization_lean_bwd,global_dispatch)="
+            "optimization_replay,optimization_lean_bwd,optimization_bootstrap,"
+            "raw_parameter_setup,raw_solve,raw_stop_gradient,global_dispatch)="
             f"{cache_before}->{cache_after}",
             flush=True,
         )
@@ -261,7 +288,8 @@ def main() -> int:
             f"trial={trial_index} elapsed_s={time.perf_counter() - started:.3f} "
             f"rss_delta={rss_text} live_jax_arrays={arrays_text} "
             "stage_cache=(benchmark_database_bwd,benchmark_replay,generic_bwd,"
-            "optimization_replay,optimization_lean_bwd,global_dispatch)="
+            "optimization_replay,optimization_lean_bwd,optimization_bootstrap,"
+            "raw_parameter_setup,raw_solve,raw_stop_gradient,global_dispatch)="
             f"{cache_before}->{cache_after} "
             f"residual_repeat_max_abs={residual_repeat_delta:.3e} "
             f"jacobian_repeat_max_abs={jacobian_repeat_delta:.3e}",
