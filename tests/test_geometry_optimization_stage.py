@@ -740,6 +740,91 @@ def test_database_full_transport_mode_uses_one_integrated_benchmark_builder(monk
     )
 
 
+def test_database_full_transport_changed_geometry_rebuilds_live_scan_runtime(monkeypatch):
+    """A changed database trial must not enter the exact-Lij payload branch."""
+
+    class _PreparedInputsReached(RuntimeError):
+        pass
+
+    baseline_runtime = object()
+    fresh_runtime = object()
+    fixed_runtime = object()
+    raw_state = object()
+    geometry_context = object()
+    calls = []
+
+    monkeypatch.setattr(
+        reverse_transport,
+        "_validate_transport_reverse_parameter_set",
+        lambda _parameter_set: None,
+    )
+
+    def _build_fresh_runtime(config, context, state, *, n_r):
+        calls.append((config, context, state, n_r))
+        return fresh_runtime, object()
+
+    monkeypatch.setattr(
+        reverse_transport,
+        "build_runtime_context_for_vmec_state",
+        _build_fresh_runtime,
+    )
+    monkeypatch.setattr(
+        reverse_transport,
+        "build_neopax_geometry_and_ntx_exact_lij_support_from_state",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("database optimization entered the exact-Lij payload branch")
+        ),
+    )
+    monkeypatch.setattr(
+        reverse_transport,
+        "realtime_geometry_payload_for_runtime",
+        lambda runtime: {"kind": "ntx_scan_runtime"},
+    )
+    monkeypatch.setattr(
+        reverse_transport,
+        "split_recorded_ntx_database_runtime",
+        lambda runtime: (SimpleNamespace(runtime=fixed_runtime), object()),
+    )
+    monkeypatch.setattr(
+        reverse_transport,
+        "prepare_reverse_static_setup",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(_PreparedInputsReached()),
+    )
+
+    table_context = reverse_transport.RealtimeGeometryTransportReverseTableContext(
+        config={"geometry": {"n_radial": 7}},
+        baseline_values=jnp.zeros((6,), dtype=jnp.float64),
+        baseline_runtime=baseline_runtime,
+        baseline_state=object(),
+        profile_cfg={},
+        neoclassical_cfg={"flux_model": "ntx_scan_runtime"},
+    )
+    builder = reverse_transport.internal_realtime_geometry_transport_reverse_table_result_builder(
+        table_context=table_context,
+        geometry_context=geometry_context,
+        raw_block_solve=SimpleNamespace(state=raw_state),
+        n_r=7,
+    )
+
+    try:
+        builder(
+            ("particle_flux",),
+            object(),
+            {
+                "reverse_stage_mode": "database_full_transport_optimization",
+                "use_runtime_payload": False,
+            },
+        )
+    except _PreparedInputsReached:
+        pass
+    else:  # pragma: no cover - the sentinel must stop the heavy setup
+        raise AssertionError("test did not reach reverse static setup")
+
+    assert calls == [
+        ({"geometry": {"n_radial": 7}}, geometry_context, raw_state, 7)
+    ]
+
+
 def test_database_full_transport_bootstrap_stage_keeps_trial_values_dynamic(
     monkeypatch,
 ):

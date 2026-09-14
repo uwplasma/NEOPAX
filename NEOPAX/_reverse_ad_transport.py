@@ -26,6 +26,7 @@ from ._constants import elementary_charge
 from ._geometry_autodiff import (
     boundary_param_entries,
     build_neopax_geometry_and_ntx_exact_lij_support_from_state,
+    build_runtime_context_for_vmec_state,
     build_geometry_autodiff_context,
     GeometryRawBlockSolve,
     geometry_payload_pullback_from_param_vector_raw_block_transpose,
@@ -8583,25 +8584,41 @@ def internal_realtime_geometry_transport_reverse_table_result_builder(
         active_runtime = table_context.baseline_runtime
         active_support_payload = None
         use_runtime_payload = bool(opts.get("use_runtime_payload", active_raw_block_solve is None))
+        active_stage_mode = str(
+            opts.get("reverse_stage_mode", "benchmark")
+        ).strip().lower()
         _report_table_builder_phase("prepare_builder_inputs")
         if active_raw_block_solve is not None and not use_runtime_payload:
-            active_support_payload = build_neopax_geometry_and_ntx_exact_lij_support_from_state(
-                geometry_context,
-                active_raw_block_solve.state,
-                n_r=int(opts.get("n_r", n_r)),
-                n_theta=int(opts.get("n_theta", n_theta)),
-                n_zeta=int(opts.get("n_zeta", n_zeta)),
-                n_xi=int(opts.get("n_xi", n_xi)),
-                surface_backend=str(opts.get("surface_backend", surface_backend)),
-            )
-            active_runtime = runtime_with_geometry_payload(
-                active_runtime,
-                active_support_payload["geometry"],
-            )
-            active_runtime = runtime_with_ntx_support_payload(
-                active_runtime,
-                active_support_payload["ntx_support"],
-            )
+            if active_stage_mode == "database_full_transport_optimization":
+                # Match the validated database root-only lane: a changed VMEX
+                # state needs a newly built live scan/database runtime. The
+                # exact-Lij builder does not produce the mapping required by
+                # LiveNtxScanModel.with_support_payload().
+                active_runtime, _active_state = build_runtime_context_for_vmec_state(
+                    dict(table_context.config),
+                    geometry_context,
+                    active_raw_block_solve.state,
+                    n_r=int(opts.get("n_r", n_r)),
+                )
+                del _active_state
+            else:
+                active_support_payload = build_neopax_geometry_and_ntx_exact_lij_support_from_state(
+                    geometry_context,
+                    active_raw_block_solve.state,
+                    n_r=int(opts.get("n_r", n_r)),
+                    n_theta=int(opts.get("n_theta", n_theta)),
+                    n_zeta=int(opts.get("n_zeta", n_zeta)),
+                    n_xi=int(opts.get("n_xi", n_xi)),
+                    surface_backend=str(opts.get("surface_backend", surface_backend)),
+                )
+                active_runtime = runtime_with_geometry_payload(
+                    active_runtime,
+                    active_support_payload["geometry"],
+                )
+                active_runtime = runtime_with_ntx_support_payload(
+                    active_runtime,
+                    active_support_payload["ntx_support"],
+                )
         # Keep the heavy retained scan record outside all generic segment
         # VJPs.  The database itself remains in the support payload, while
         # the original runtime below is retained solely for the final one-time
@@ -8796,9 +8813,6 @@ def internal_realtime_geometry_transport_reverse_table_result_builder(
                 else ntx_support_payload
             )
         _report_table_builder_phase("prepare_support_payload")
-        active_stage_mode = str(
-            opts.get("reverse_stage_mode", "benchmark")
-        ).strip().lower()
         optimization_phase_probe = (
             getattr(_builder, "optimization_phase_probe", None)
             if active_stage_mode == "database_full_transport_optimization"
