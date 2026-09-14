@@ -7,7 +7,9 @@ segments.  The reference is the unchanged benchmark composition.  The trial
 is the optimization-only full-transport selector and must invoke that same
 integrated selected-root/transport composition exactly once.  Candidate JIT
 boundaries are added only after this no-duplication baseline passes.  This is
-not an FD test or a physical final-time transport run.
+not an FD test or a physical final-time transport run.  Its compared rows
+explicitly include maximum Er and net power in addition to the root-position
+and bootstrap objectives.
 
 By default both workers evaluate the unperturbed point.  With a nonzero
 ``--parameter-offset``, the optimization worker first evaluates ``x0`` and
@@ -47,6 +49,13 @@ TRIAL_STAGE_MODE = "database_full_transport_optimization"
 DATABASE_N_THETA = 5
 DATABASE_N_PHI = 25
 DATABASE_N_XI = 31
+ER_TRANSITION_LEFT_INDEX = 25
+ER_TRANSITION_RIGHT_INDEX = 26
+SOFTMAX_ER_WEIGHT = 0.5
+NET_POWER_TARGET_MW = 300.0
+NET_POWER_REFERENCE_VOLUME_M3 = 331.0187969899648
+NET_POWER_TARGET_MW_M3 = NET_POWER_TARGET_MW / NET_POWER_REFERENCE_VOLUME_M3
+NET_POWER_WEIGHT = 1.0
 # Defaults of the current validated database full-transport benchmark lane.
 # Keep these explicit so this parity test cannot silently fall back to the
 # generic/Lij-oriented defaults of the public optimization API.
@@ -78,12 +87,45 @@ DATABASE_REVERSE_OPTIONS = {
 
 
 def active_terms():
+    from NEOPAX import optimization as opt
     import optimize_geometry_qi_max_er_transition_bootstrap_initial_root as base
 
-    return tuple(term for term in base.terms if float(term[2]) != 0.0)
+    terms = [term for term in base.terms if float(term[2]) != 0.0]
+    # The imported ambipolar-root script deliberately disables maximum Er and
+    # does not define the full-transport net-power objective. Include both
+    # explicitly so parity covers every terminal observable used by the two
+    # standalone full-transport optimization scripts.
+    geometry_term_count = sum(
+        1
+        for objective, _target, _weight in terms
+        if (
+            objective.objective.family
+            if hasattr(objective, "objective")
+            else objective.family
+        )
+        == "geometry"
+    )
+    terms.insert(
+        geometry_term_count,
+        (opt.transport.softmax_Er, base.MAX_ER_TARGET, SOFTMAX_ER_WEIGHT),
+    )
+    terms.append(
+        (
+            opt.transport.net_total_power_volume_average_mw_m3,
+            NET_POWER_TARGET_MW_M3,
+            NET_POWER_WEIGHT,
+        )
+    )
+    return tuple(terms)
 
 
-def build_problem(*, reverse_stage_mode: str, vmec_input=None):
+def build_problem(
+    *,
+    reverse_stage_mode: str,
+    vmec_input=None,
+    er_transition_left_index: int = ER_TRANSITION_LEFT_INDEX,
+    er_transition_right_index: int = ER_TRANSITION_RIGHT_INDEX,
+):
     from NEOPAX import optimization as opt
     import optimize_geometry_qi_max_er_transition_bootstrap_initial_root as base
 
@@ -113,6 +155,8 @@ def build_problem(*, reverse_stage_mode: str, vmec_input=None):
         reverse_segment_length=REVERSE_SEGMENT_LENGTH,
         max_reverse_accepted_steps=ACCEPTED_STEP_LIMIT,
         initial_er_root_ad="jax_selected_root",
+        er_transition_left_index=er_transition_left_index,
+        er_transition_right_index=er_transition_right_index,
         radau_jacobian_reuse_mode="legacy",
         reverse_stage_adjoint_solve_mode="block",
         reverse_rhs_transpose_mode="explicit_database",
@@ -128,6 +172,12 @@ def build_problem(*, reverse_stage_mode: str, vmec_input=None):
                 f"Database benchmark option {name!r} is {actual!r}; "
                 f"expected {expected!r}."
             )
+    if problem.options.get("Er_transition_left_index") != int(
+        er_transition_left_index
+    ) or problem.options.get("Er_transition_right_index") != int(
+        er_transition_right_index
+    ):
+        raise AssertionError("Full-transport Er transition indices were not retained.")
     return problem
 
 
@@ -145,6 +195,8 @@ def _worker(
     *,
     parameter_index: int,
     parameter_offset: float,
+    er_transition_left_index: int = ER_TRANSITION_LEFT_INDEX,
+    er_transition_right_index: int = ER_TRANSITION_RIGHT_INDEX,
     vmec_input: Path | None = None,
     perturbed_input_output: Path | None = None,
 ) -> int:
@@ -153,7 +205,12 @@ def _worker(
     import jax
 
     stage_mode = REFERENCE_STAGE_MODE if stage_name == "reference" else TRIAL_STAGE_MODE
-    problem = build_problem(reverse_stage_mode=stage_mode, vmec_input=vmec_input)
+    problem = build_problem(
+        reverse_stage_mode=stage_mode,
+        vmec_input=vmec_input,
+        er_transition_left_index=er_transition_left_index,
+        er_transition_right_index=er_transition_right_index,
+    )
     x0 = np.array(jax.device_get(problem.x0), dtype=float, copy=True)
     if not 0 <= parameter_index < x0.size:
         raise ValueError(
@@ -204,6 +261,8 @@ def _run_worker(
     *,
     parameter_index: int,
     parameter_offset: float,
+    er_transition_left_index: int = ER_TRANSITION_LEFT_INDEX,
+    er_transition_right_index: int = ER_TRANSITION_RIGHT_INDEX,
     vmec_input: Path | None = None,
     perturbed_input_output: Path | None = None,
 ) -> None:
@@ -218,6 +277,10 @@ def _run_worker(
         str(parameter_index),
         "--parameter-offset",
         repr(float(parameter_offset)),
+        "--er-transition-left-index",
+        str(int(er_transition_left_index)),
+        "--er-transition-right-index",
+        str(int(er_transition_right_index)),
     ]
     if vmec_input is not None:
         command.extend(("--worker-vmec-input", str(vmec_input)))
@@ -274,7 +337,23 @@ def main() -> int:
             "primes the trial at x0 before comparing both lanes at the offset point."
         ),
     )
+    parser.add_argument(
+        "--er-transition-left-index",
+        type=int,
+        default=ER_TRANSITION_LEFT_INDEX,
+        help="Final-time Er radial-cell index for the left transition objective.",
+    )
+    parser.add_argument(
+        "--er-transition-right-index",
+        type=int,
+        default=ER_TRANSITION_RIGHT_INDEX,
+        help="Final-time Er radial-cell index for the right transition objective.",
+    )
     args = parser.parse_args()
+    for name in ("er_transition_left_index", "er_transition_right_index"):
+        index = int(getattr(args, name))
+        if not 0 <= index < 51:
+            parser.error(f"--{name.replace('_', '-')} must be in [0, 51).")
     if args.worker_stage is not None:
         if args.worker_output is None:
             parser.error("--worker-output is required with --worker-stage")
@@ -283,6 +362,8 @@ def main() -> int:
             args.worker_output,
             parameter_index=args.parameter_index,
             parameter_offset=args.parameter_offset,
+            er_transition_left_index=args.er_transition_left_index,
+            er_transition_right_index=args.er_transition_right_index,
             vmec_input=args.worker_vmec_input,
             perturbed_input_output=args.worker_perturbed_input_output,
         )
@@ -307,6 +388,8 @@ def main() -> int:
                 trial_path,
                 parameter_index=args.parameter_index,
                 parameter_offset=args.parameter_offset,
+                er_transition_left_index=args.er_transition_left_index,
+                er_transition_right_index=args.er_transition_right_index,
                 perturbed_input_output=perturbed_input_path,
             )
             _run_worker(
@@ -314,6 +397,8 @@ def main() -> int:
                 reference_path,
                 parameter_index=args.parameter_index,
                 parameter_offset=args.parameter_offset,
+                er_transition_left_index=args.er_transition_left_index,
+                er_transition_right_index=args.er_transition_right_index,
                 vmec_input=perturbed_input_path,
             )
         else:
@@ -322,12 +407,16 @@ def main() -> int:
                 reference_path,
                 parameter_index=args.parameter_index,
                 parameter_offset=args.parameter_offset,
+                er_transition_left_index=args.er_transition_left_index,
+                er_transition_right_index=args.er_transition_right_index,
             )
             _run_worker(
                 "trial",
                 trial_path,
                 parameter_index=args.parameter_index,
                 parameter_offset=args.parameter_offset,
+                er_transition_left_index=args.er_transition_left_index,
+                er_transition_right_index=args.er_transition_right_index,
             )
         (
             reference_residuals,
@@ -400,6 +489,8 @@ def main() -> int:
         f"parameter_point={'unperturbed_x0' if args.parameter_offset == 0.0 else 'reused_stage_perturbed_x1'} "
         f"parameter_index={args.parameter_index} "
         f"parameter_offset={args.parameter_offset:.6e} "
+        f"Er_transition_indices=({args.er_transition_left_index},"
+        f"{args.er_transition_right_index}) "
         f"trial_primed_at_x0={args.parameter_offset != 0.0} "
         f"reference_geometry={'original_baseline' if args.parameter_offset == 0.0 else 'fresh_perturbed_baseline'} "
         "jacobian_coordinates=trial_seed_scaled "

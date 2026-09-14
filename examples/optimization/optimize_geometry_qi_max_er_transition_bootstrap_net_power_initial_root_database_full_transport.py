@@ -72,6 +72,8 @@ MIRROR_TARGET = 0.19
 MAX_ER_TARGET = 25.0
 ER_TRANSITION_LEFT_TARGET = 26.0
 ER_TRANSITION_RIGHT_TARGET = -10.0
+ER_TRANSITION_LEFT_INDEX = 25
+ER_TRANSITION_RIGHT_INDEX = 26
 BOOTSTRAP_LIMIT_SCALED = 0.1
 NET_POWER_TARGET_MW = 300.0
 # The reverse-AD transport objective is the signed volume average in MW/m^3.
@@ -119,6 +121,18 @@ def parser() -> argparse.ArgumentParser:
     out.add_argument("--database-n-theta", type=int, default=DATABASE_N_THETA)
     out.add_argument("--database-n-phi", type=int, default=DATABASE_N_PHI)
     out.add_argument("--database-n-xi", type=int, default=DATABASE_N_XI)
+    out.add_argument(
+        "--er-transition-left-index",
+        type=int,
+        default=ER_TRANSITION_LEFT_INDEX,
+        help="Final-time Er radial-cell index for the left transition target.",
+    )
+    out.add_argument(
+        "--er-transition-right-index",
+        type=int,
+        default=ER_TRANSITION_RIGHT_INDEX,
+        help="Final-time Er radial-cell index for the right transition target.",
+    )
     out.add_argument(
         "--max-er",
         action=argparse.BooleanOptionalAction,
@@ -519,6 +533,13 @@ def main() -> int:
     seed_input = args.seed_input.resolve()
     out_dir = args.out_dir.resolve()
     config = transport_config(args)
+    n_radial = int(config.get("geometry", {}).get("n_radial", 51))
+    for name in ("er_transition_left_index", "er_transition_right_index"):
+        index = int(getattr(args, name))
+        if not 0 <= index < n_radial:
+            raise ValueError(
+                f"--{name.replace('_', '-')} must be in [0, {n_radial}); got {index}."
+            )
     terms = active_terms(args)
     out_dir.mkdir(parents=True, exist_ok=True)
     x = None
@@ -557,6 +578,8 @@ def main() -> int:
             reverse_segment_length=REVERSE_SEGMENT_LENGTH,
             max_reverse_accepted_steps=MAX_REVERSE_ACCEPTED_STEPS,
             initial_er_root_ad="jax_selected_root",
+            er_transition_left_index=args.er_transition_left_index,
+            er_transition_right_index=args.er_transition_right_index,
             radau_jacobian_reuse_mode="legacy",
             reverse_stage_adjoint_solve_mode="block",
             reverse_rhs_transpose_mode="explicit_database",
@@ -582,7 +605,9 @@ def main() -> int:
             f"t_final={TRANSPORT_FINAL_TIME} max_steps={TRANSPORT_MAX_STEPS} "
             f"accepted_step_limit={FULL_TRANSPORT_ACCEPTED_STEP_LIMIT} "
             f"reverse_segment_length={REVERSE_SEGMENT_LENGTH} "
-            f"max_reverse_accepted_steps={MAX_REVERSE_ACCEPTED_STEPS}",
+            f"max_reverse_accepted_steps={MAX_REVERSE_ACCEPTED_STEPS} "
+            f"Er_transition_indices=({args.er_transition_left_index},"
+            f"{args.er_transition_right_index})",
             flush=True,
         )
         if initial_input is None:

@@ -1436,7 +1436,14 @@ def bootstrap_current_softmax_abs_value_and_upar_bar(
     return value, upar_bar
 
 
-def objective_scalar_by_index(final_state, runtime, objective_index: int):
+def objective_scalar_by_index(
+    final_state,
+    runtime,
+    objective_index: int,
+    *,
+    er_transition_left_index: int = 20,
+    er_transition_right_index: int = 21,
+):
     objective_name = TRANSPORT_REVERSE_OBJECTIVE_LABELS[int(objective_index)]
     er = jnp.asarray(final_state.Er)
     if objective_name == "softmax_Er":
@@ -1444,9 +1451,13 @@ def objective_scalar_by_index(final_state, runtime, objective_index: int):
     if objective_name == "net_total_power_volume_average_mw_m3":
         return net_total_power_volume_average(final_state, runtime)
     if objective_name == "Er_transition_left":
-        return er[max(0, min(20, int(er.shape[-1]) - 1))]
+        return er[
+            max(0, min(int(er_transition_left_index), int(er.shape[-1]) - 1))
+        ]
     if objective_name == "Er_transition_right":
-        return er[max(0, min(21, int(er.shape[-1]) - 1))]
+        return er[
+            max(0, min(int(er_transition_right_index), int(er.shape[-1]) - 1))
+        ]
     if objective_name == "Er2_volume_average":
         return volume_average(er * er, runtime.geometry)
     if objective_name == "Er_volume_average":
@@ -8481,6 +8492,8 @@ def internal_realtime_geometry_transport_reverse_table_result_builder(
     accepted_step_limit: int | None = None,
     reverse_segment_length: int | None = 1,
     initial_er_root_ad: str = "off",
+    er_transition_left_index: int = 20,
+    er_transition_right_index: int = 21,
     reverse_stage_adjoint_solve_mode: str = "bicgstab",
     reverse_rhs_transpose_mode: str = "explicit_ntx_interpolated",
     reverse_rhs_pullback_mode: str = "separate",
@@ -8542,6 +8555,46 @@ def internal_realtime_geometry_transport_reverse_table_result_builder(
 
     optimization_segment_replay_stage = None
     optimization_bootstrap_stage = None
+    configured_er_transition_left_index = int(er_transition_left_index)
+    configured_er_transition_right_index = int(er_transition_right_index)
+    configured_objective_dependencies = (
+        default_realtime_geometry_support_reverse_dependencies()
+    )
+    configured_support_reverse_callback = None
+    if (
+        configured_er_transition_left_index != 20
+        or configured_er_transition_right_index != 21
+    ):
+        # This callback is created once with the table builder, not once per
+        # evaluation. Its identity is therefore stable across optimizer
+        # trials, while final_state remains a fresh numerical argument.
+        def _configured_objective_scalar_by_index(
+            final_state,
+            objective_runtime,
+            objective_index,
+        ):
+            return objective_scalar_by_index(
+                final_state,
+                objective_runtime,
+                objective_index,
+                er_transition_left_index=configured_er_transition_left_index,
+                er_transition_right_index=configured_er_transition_right_index,
+            )
+
+        configured_objective_dependencies = dataclasses.replace(
+            configured_objective_dependencies,
+            objective_scalar_by_index=_configured_objective_scalar_by_index,
+        )
+
+        def _configured_support_reverse(*args, **kwargs):
+            return realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_vector(
+                *args,
+                objective_labels=TRANSPORT_REVERSE_OBJECTIVE_LABELS,
+                dependencies=configured_objective_dependencies,
+                **kwargs,
+            )
+
+        configured_support_reverse_callback = _configured_support_reverse
 
     def _builder(
         objective_names: tuple[str, ...],
@@ -8576,6 +8629,21 @@ def internal_realtime_geometry_transport_reverse_table_result_builder(
             max_reverse_accepted_steps,
         )
         active_initial_er_root_ad = str(opts.get("initial_er_root_ad", initial_er_root_ad))
+        active_er_transition_left_index = int(
+            opts.get("Er_transition_left_index", er_transition_left_index)
+        )
+        active_er_transition_right_index = int(
+            opts.get("Er_transition_right_index", er_transition_right_index)
+        )
+        if (
+            active_er_transition_left_index != configured_er_transition_left_index
+            or active_er_transition_right_index
+            != configured_er_transition_right_index
+        ):
+            raise ValueError(
+                "Er transition indices are fixed when the full-transport table "
+                "builder is created; rebuild the optimization problem to change them."
+            )
         active_raw_block_solve = opts.get("raw_block_solve", raw_block_solve)
         active_component_pullbacks = bool(
             opts.get(
@@ -8855,7 +8923,12 @@ def internal_realtime_geometry_transport_reverse_table_result_builder(
             if active_stage_mode == "database_full_transport_optimization"
             else None
         )
-        reverse_support_callback = None
+        objective_dependencies = configured_objective_dependencies
+        reverse_support_callback = (
+            configured_support_reverse_callback
+            if active_stage_mode != "database_full_transport_optimization"
+            else None
+        )
         if active_stage_mode == "database_full_transport_optimization":
             if not (
                 isinstance(support_payload, dict)
@@ -9008,7 +9081,7 @@ def internal_realtime_geometry_transport_reverse_table_result_builder(
                 )
 
             optimization_dependencies = dataclasses.replace(
-                default_realtime_geometry_support_reverse_dependencies(),
+                objective_dependencies,
                 segment_replay_minimal_with_primal_records=(
                     _optimization_segment_replay
                 ),

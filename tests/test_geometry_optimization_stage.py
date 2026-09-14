@@ -699,6 +699,8 @@ def test_database_full_transport_mode_uses_one_integrated_benchmark_builder(monk
             max_mode=1,
             reverse_stage_mode=stage_mode,
             initial_er_root_ad="jax_selected_root",
+            er_transition_left_index=25,
+            er_transition_right_index=26,
             accepted_step_limit=16,
             reverse_segment_length=4,
             max_reverse_accepted_steps=16,
@@ -709,6 +711,8 @@ def test_database_full_transport_mode_uses_one_integrated_benchmark_builder(monk
 
         assert len(calls) == 1
         assert calls[0]["initial_er_root_ad"] == "jax_selected_root"
+        assert calls[0]["er_transition_left_index"] == 25
+        assert calls[0]["er_transition_right_index"] == 26
         assert calls[0]["accepted_step_limit"] == 16
         assert calls[0]["reverse_segment_length"] == 4
         assert calls[0]["max_reverse_accepted_steps"] == 16
@@ -741,6 +745,8 @@ def test_database_full_transport_mode_uses_one_integrated_benchmark_builder(monk
             assert calls[0][name] == expected
             assert problem.options[name] == expected
         assert problem.options["reverse_stage_mode"] == stage_mode
+        assert problem.options["Er_transition_left_index"] == 25
+        assert problem.options["Er_transition_right_index"] == 26
         assert problem.table_result_builder is builder
 
     assert len(root_stage_builds) == 1
@@ -1028,6 +1034,66 @@ def test_full_transport_parity_preserves_validated_root_seed():
     assert (vmec_input.body.value.id, vmec_input.body.attr) == ("base", "SEED_INPUT")
     assert isinstance(vmec_input.orelse, ast.Name)
     assert vmec_input.orelse.id == "vmec_input"
+
+
+def test_full_transport_parity_covers_softmax_er_and_net_power():
+    """Parity must include both terminal objectives used by full transport."""
+
+    script = (
+        Path(__file__).resolve().parents[1]
+        / "examples"
+        / "optimization"
+        / "test_geometry_qi_max_er_transition_bootstrap_initial_root_database_full_transport_parity.py"
+    )
+    module = ast.parse(script.read_text(encoding="utf-8"))
+    active_terms = next(
+        node
+        for node in module.body
+        if isinstance(node, ast.FunctionDef) and node.name == "active_terms"
+    )
+    selected_attributes = {
+        node.attr for node in ast.walk(active_terms) if isinstance(node, ast.Attribute)
+    }
+    assert "softmax_Er" in selected_attributes
+    assert "net_total_power_volume_average_mw_m3" in selected_attributes
+
+    constants = {
+        node.targets[0].id: ast.literal_eval(node.value)
+        for node in module.body
+        if isinstance(node, ast.Assign)
+        and len(node.targets) == 1
+        and isinstance(node.targets[0], ast.Name)
+        and node.targets[0].id
+        in {"ER_TRANSITION_LEFT_INDEX", "ER_TRANSITION_RIGHT_INDEX"}
+    }
+    assert constants == {
+        "ER_TRANSITION_LEFT_INDEX": 25,
+        "ER_TRANSITION_RIGHT_INDEX": 26,
+    }
+
+
+def test_full_transport_transition_objective_indices_are_selectable():
+    """Configured terminal-Er cells override only the two transition rows."""
+
+    state = SimpleNamespace(Er=jnp.arange(51, dtype=jnp.float64))
+    labels = tuple(reverse_transport.TRANSPORT_REVERSE_OBJECTIVE_LABELS)
+    left = reverse_transport.objective_scalar_by_index(
+        state,
+        object(),
+        labels.index("Er_transition_left"),
+        er_transition_left_index=25,
+        er_transition_right_index=26,
+    )
+    right = reverse_transport.objective_scalar_by_index(
+        state,
+        object(),
+        labels.index("Er_transition_right"),
+        er_transition_left_index=25,
+        er_transition_right_index=26,
+    )
+
+    assert float(left) == 25.0
+    assert float(right) == 26.0
 
 
 def test_full_transport_parity_perturbation_reuses_only_trial_stage(
