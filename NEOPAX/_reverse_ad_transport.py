@@ -4673,6 +4673,9 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
             False,
         )
     )
+    combined_geometry_payload = (
+        isinstance(support_payload, dict) and "geometry" in support_payload
+    )
     phase_start = time.perf_counter()
     persistent_database_root = (
         initial_er_root_enabled
@@ -4970,7 +4973,6 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
     objective_values_rows = []
     final_y_bar_rows = []
     objective_payload_bar_rows = []
-    combined_geometry_payload = isinstance(support_payload, dict) and "geometry" in support_payload
     zero_payload_bar = _reverse_zero_support_delta_tree_like(reverse_setup.solver, support_payload)
     final_objective_cotangent_mode = str(
         getattr(

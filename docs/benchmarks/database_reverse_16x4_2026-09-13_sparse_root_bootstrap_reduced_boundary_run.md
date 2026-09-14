@@ -38,6 +38,41 @@ The log confirmed that every mode above was active.  Geometry/state diagnostics,
 the JAX persistent compilation cache, and experimental deferred/batched segment
 paths were disabled.
 
+## CLI defaults and required fast-path overrides
+
+The validated fast configuration must remain reproducible even while the newer
+modes stay opt-in.  As of this run, the following selections are already the
+benchmark CLI defaults (or are selected automatically by the database `config`
+dispatch):
+
+- `block`, `full`, and `default` for the stage adjoint;
+- `explicit_database` through the RHS-transpose `config` dispatch;
+- `separate` RHS and rebuild-support pullbacks;
+- `reduced_cotangent_call_boundary`;
+- `independent` stage Jacobians, `scalar` objective support, and `inline`
+  segment support;
+- `legacy_sparse` transport interpolation;
+- `shared` support preparation and `scalar_jvp` centre geometry;
+- `joint_local_vjp_upar_only` bootstrap cotangents;
+- `scalar` initial-cache support through the database `config` dispatch;
+- `reuse_static_probe` schedule artifacts.
+
+The following faster selections were validated by this run but remain explicit
+opt-ins and must be present in a command intended to reproduce these timings:
+
+```text
+--full-transport-shared-payload-smoke
+--reverse-database-root-interpolation-transpose-mode legacy_sparse
+--reverse-database-bootstrap-interpolation-transpose-mode legacy_sparse
+--reverse-database-initial-support-mode reduced_zero
+--reverse-database-initial-state-mode reduced_zero_rhs
+--reverse-final-objective-cotangent-mode grouped_joint_vjp
+```
+
+The 16-step/4-step measurement shape also remains explicit through
+`--accepted-step-limit 16` and `--reverse-segment-length 4`.  Root-only and Lij
+lanes are not changed by the database full-transport opt-ins above.
+
 ## Performance comparison
 
 The immediate reference is the validated legacy-sparse run recorded in
