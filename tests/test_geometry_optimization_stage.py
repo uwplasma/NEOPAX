@@ -474,6 +474,11 @@ def test_database_full_transport_mode_uses_one_integrated_benchmark_builder(monk
         production_dependencies.database_segment_reduced_cotangent_bwd_with_table_support
         is None
     )
+    assert production_dependencies.profile_state_primal is None
+    assert production_dependencies.profile_parameter_pullback is None
+    assert production_dependencies.grouped_joint_final_objective_vjp_rows is None
+    assert production_dependencies.flat_state_pullback is None
+    assert production_dependencies.database_initial_er_root_pullback is None
     assert production_dependencies.optimization_phase_probe is None
 
     expected_database_modes = {
@@ -506,7 +511,7 @@ def test_database_full_transport_mode_uses_one_integrated_benchmark_builder(monk
     runtime = object()
     baseline_state = SimpleNamespace(pressure=jnp.asarray([1.0]))
     parameterization = SimpleNamespace(
-        specs=("vmec-spec",),
+        specs=(SimpleNamespace(as_tuple=lambda: ("RBC", 1, 0)),),
         x_scale=jnp.asarray([1.0]),
     )
     parameter_set = SimpleNamespace(specs=("parameter-spec",))
@@ -562,6 +567,22 @@ def test_database_full_transport_mode_uses_one_integrated_benchmark_builder(monk
             AssertionError("full transport must not use the retired two-sweep bridge")
         ),
     )
+    payload_stage = object()
+    monkeypatch.setattr(
+        optimization,
+        "geometry_raw_block_stage",
+        lambda *_args, **_kwargs: object(),
+    )
+    monkeypatch.setattr(
+        optimization,
+        "_prepare_initial_root_payload_static",
+        lambda *_args, **_kwargs: object(),
+    )
+    monkeypatch.setattr(
+        optimization,
+        "build_initial_root_payload_assembly_stage",
+        lambda **_kwargs: payload_stage,
+    )
 
     for stage_mode in ("benchmark", "database_full_transport_optimization"):
         calls = []
@@ -600,11 +621,18 @@ def test_database_full_transport_mode_uses_one_integrated_benchmark_builder(monk
         assert calls[0]["reverse_step_bwd_mode"] == "reduced_cotangent_call_boundary"
         if stage_mode == "benchmark":
             assert calls[0]["segment_replay_optimization_stage_builder"] is None
+            assert calls[0]["support_optimization_stage_builder"] is None
+            assert calls[0]["payload_assembly_optimization_stage"] is None
         else:
             assert (
                 calls[0]["segment_replay_optimization_stage_builder"]
                 is full_transport_stage.build_database_full_transport_replay_optimization_stage
             )
+            assert (
+                calls[0]["support_optimization_stage_builder"]
+                is full_transport_stage.build_database_full_transport_support_optimization_stage
+            )
+            assert calls[0]["payload_assembly_optimization_stage"] is payload_stage
         for name, expected in expected_database_modes.items():
             assert calls[0][name] == expected
             assert problem.options[name] == expected
@@ -966,6 +994,167 @@ def test_full_transport_fresh_equations_keep_ntss_density_indices_static(monkeyp
         return value + jnp.asarray(concrete_indices.sum(), dtype=value.dtype)
 
     assert float(probe(jnp.asarray(2.0))) == 3.0
+
+
+def test_database_full_transport_support_stage_keeps_trial_leaves_dynamic_and_cache_stable(
+    monkeypatch,
+):
+    """Each non-segment optimization boundary has one persistent cache owner."""
+
+    @dataclasses.dataclass(frozen=True)
+    class Species:
+        number_species: int = 1
+
+    @dataclasses.dataclass(frozen=True)
+    class Runtime:
+        geometry: object
+        database: object
+        species: object
+
+    @dataclasses.dataclass(frozen=True)
+    class State:
+        Er: object
+
+    jax.tree_util.register_dataclass(
+        State,
+        data_fields=("Er",),
+        meta_fields=(),
+    )
+
+    monkeypatch.setattr(
+        full_transport_stage,
+        "runtime_with_fresh_ntx_database_payload",
+        lambda runtime, *, geometry, database: dataclasses.replace(
+            runtime, geometry=geometry, database=database
+        ),
+    )
+    support0 = {
+        "geometry": {"metric": jnp.asarray([1.0, 2.0])},
+        "database": {"table": jnp.asarray([3.0, 4.0])},
+    }
+    runtime = Runtime(
+        geometry=support0["geometry"],
+        database=support0["database"],
+        species=Species(),
+    )
+    reverse_setup = SimpleNamespace(
+        prepared_rollout=SimpleNamespace(
+            physics_context=SimpleNamespace(unpack_flat=lambda value: value)
+        ),
+        execution_context=SimpleNamespace(
+            physics_context=SimpleNamespace(
+                reverse_database_root_interpolation_transpose_mode="legacy_sparse"
+            )
+        ),
+    )
+
+    def profile_state(parameters, *, geometry, **_kwargs):
+        return State(Er=parameters + jnp.sum(geometry["metric"]))
+
+    dependencies = SimpleNamespace(
+        initial_er_charge_flux_residual_er_derivative=(
+            lambda state, er_profile, *, runtime: (
+                state.Er + er_profile + jnp.sum(runtime.database["table"])
+            )
+        ),
+        compact_initial_er_state_pullback=(
+            lambda *, state, residual_bars, runtime, **_kwargs: (
+                State(
+                    Er=jnp.sum(residual_bars, axis=1)[:, None]
+                    * jnp.ones_like(state.Er)[None, :]
+                    * jnp.sum(runtime.geometry["metric"])
+                )
+            )
+        ),
+        initial_er_charge_flux_residual_scalar=lambda *_args, **_kwargs: 0.0,
+        add_trees=lambda left, right: jax.tree_util.tree_map(
+            lambda x, y: x + y, left, right
+        ),
+        objective_scalar_by_index=(
+            lambda state, active_runtime, objective_index: (
+                jnp.sum(state) * (objective_index + 1)
+                + jnp.sum(active_runtime.geometry["metric"])
+            )
+        ),
+    )
+
+    def objective_vjp_rows(function, *primals):
+        values, pullback = jax.vjp(function, *primals)
+        bars = jax.vmap(pullback)(jnp.eye(values.shape[0], dtype=values.dtype))
+        return values, bars
+
+    def delta_tree(tree):
+        return jax.tree_util.tree_map(jnp.zeros_like, tree)
+
+    def add_tree(tree, delta):
+        return jax.tree_util.tree_map(
+            lambda value, change: value + change, tree, delta
+        )
+
+    def database_bars(*, residual_bars, support, **_kwargs):
+        return {
+            "table": jnp.ones_like(support["database"]["table"])
+            * jnp.sum(residual_bars)
+        }
+
+    def geometry_bars(*, residual_bars, support, **_kwargs):
+        return {
+            "metric": jnp.ones_like(support["geometry"]["metric"])
+            * jnp.sum(residual_bars)
+        }
+
+    stage = full_transport_stage.build_database_full_transport_support_optimization_stage(
+        config={},
+        runtime=runtime,
+        baseline_state=jnp.zeros((2,)),
+        profile_cfg={},
+        reverse_setup=reverse_setup,
+        support_payload=support0,
+        ordinary_objective_indices=(0, 1),
+        dependencies=dependencies,
+        initial_state_for_parameter_vector_compact=profile_state,
+        compact_initial_er_database_support_bars=database_bars,
+        compact_initial_er_database_geometry_bars=geometry_bars,
+        objective_vector_joint_vjp_rows=objective_vjp_rows,
+        float_delta_tree_like=delta_tree,
+        add_float_delta_tree=add_tree,
+    )
+
+    parameters = jnp.asarray([0.5, -0.25])
+    state_bars = State(Er=jnp.asarray([[1.0, 0.0], [0.0, 2.0]]))
+    residual_bars = jnp.asarray([[1.0, 2.0], [3.0, 4.0]])
+
+    def run(support):
+        state = stage.profile_state_primal(parameters, support)
+        return jax.block_until_ready(
+            (
+                state,
+                stage.profile_parameter_pullback(parameters, state_bars, support),
+                stage.root_pullback(
+                    state,
+                    state.Er,
+                    jnp.ones_like(state.Er, dtype=bool),
+                    state_bars,
+                    support,
+                ),
+                stage.grouped_final_objective_rows(
+                    parameters, support["geometry"], (0, 1)
+                ),
+                stage.flat_state_pullback(parameters, jnp.ones_like(parameters)),
+            )
+        )
+
+    result0 = run(support0)
+    support1 = {
+        "geometry": {"metric": jnp.asarray([5.0, 6.0])},
+        "database": {"table": jnp.asarray([7.0, 8.0])},
+    }
+    result1 = run(support1)
+
+    assert stage.cache_sizes() == (1,) * 5
+    assert not jnp.allclose(result0[0].Er, result1[0].Er)
+    assert not jnp.allclose(result0[2][0].Er, result1[2][0].Er)
+    assert not jnp.allclose(result0[3][0], result1[3][0])
 
 
 def test_database_full_transport_replay_skips_template_database_rescaling(monkeypatch):
