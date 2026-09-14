@@ -9,6 +9,7 @@ from types import SimpleNamespace
 import jax
 import jax.numpy as jnp
 import numpy as np
+import pytest
 
 from NEOPAX import _geometry_autodiff as geometry_ad
 from NEOPAX import _optimization_full_transport_stage as full_transport_stage
@@ -1059,6 +1060,7 @@ def test_full_transport_parity_perturbation_reuses_only_trial_stage(
         x0=jnp.asarray([0.0, 0.0]),
         x_scale=jnp.asarray([2.0, 3.0]),
         parameter_labels=("RBC:1:0", "ZBS:1:0"),
+        terms=(SimpleNamespace(residual_label="transport:test"),),
         input_from_scaled_parameters=lambda _values: Input(),
     )
     evaluations = []
@@ -1105,8 +1107,13 @@ def test_full_transport_parity_perturbation_reuses_only_trial_stage(
     assert build_calls[-1]["vmec_input"] == perturbed_input
 
 
+@pytest.mark.parametrize(
+    "interpolation_transpose_mode",
+    ("established", "legacy_sparse"),
+)
 def test_database_full_transport_replay_stage_keeps_support_dynamic_and_cache_stable(
     monkeypatch,
+    interpolation_transpose_mode,
 ):
     """The optimization replay compiles once while current support stays live."""
 
@@ -1140,6 +1147,12 @@ def test_database_full_transport_replay_stage_keeps_support_dynamic_and_cache_st
             jnp.asarray(0.0),
             jnp.asarray(step_start_carries.y)[0],
         )
+        support_bar = physics.flat_rhs_direct_database_split_support_pullback(
+            jnp.asarray(0.0),
+            jnp.asarray(step_start_carries.y)[0],
+            jnp.asarray(segment_reduced_bars.y)[0],
+            support,
+        )
         active_segment_reduced_bars = dataclasses.replace(
             segment_reduced_bars,
             y=jnp.broadcast_to(
@@ -1153,7 +1166,7 @@ def test_database_full_transport_replay_stage_keeps_support_dynamic_and_cache_st
                 jnp.asarray(leaf)[None, ...],
                 (objective_count,) + jnp.shape(leaf),
             )
-            for leaf in jax.tree_util.tree_leaves(support)
+            for leaf in jax.tree_util.tree_leaves(support_bar)
         )
         return active_segment_reduced_bars, support_bars
 
@@ -1203,6 +1216,24 @@ def test_database_full_transport_replay_stage_keeps_support_dynamic_and_cache_st
             scale = self.support["geometry"] * self.support["database"]
             return -(0.2 + scale) * rhs_bar
 
+        def pullback_direct_rhs_database_split_support_payload(
+            self,
+            _t,
+            _state,
+            _runtime,
+            rhs_bar,
+            support,
+            **_kwargs,
+        ):
+            # Deliberately read the bound equation owner. This mirrors the
+            # production equation-geometry partial and catches a callback
+            # retained from the stage's first optimization geometry.
+            rhs_scale = jnp.sum(rhs_bar)
+            return {
+                "geometry": rhs_scale * self.support["geometry"],
+                "database": rhs_scale * self.support["database"],
+            }
+
     solver = transport_solvers.RADAUSolver(
         t0=0.0,
         t1=1.0e-3,
@@ -1235,6 +1266,9 @@ def test_database_full_transport_replay_stage_keeps_support_dynamic_and_cache_st
             reverse_stage_adjoint_solve_mode="block",
             reverse_rhs_transpose_mode="explicit_database",
             reverse_step_bwd_mode="reduced_cotangent_call_boundary",
+            reverse_database_interpolation_transpose_mode=(
+                interpolation_transpose_mode
+            ),
         ),
     )
     reverse_setup = SimpleNamespace(
@@ -1387,6 +1421,12 @@ def test_database_full_transport_replay_stage_keeps_support_dynamic_and_cache_st
             + (-(0.2 + scale) * step_state + scale)
         )
         assert jnp.allclose(bwd[0].y[0], expected_state_bar)
+        support_bar = jax.tree_util.tree_unflatten(
+            jax.tree_util.tree_structure(support),
+            tuple(leaf[0] for leaf in bwd[1]),
+        )
+        assert jnp.allclose(support_bar["geometry"], support["geometry"])
+        assert jnp.allclose(support_bar["database"], support["database"])
     assert not jnp.allclose(bwd0[0].y, bwd1[0].y)
     assert not jnp.allclose(
         jax.tree_util.tree_leaves(bwd0[1])[-1],

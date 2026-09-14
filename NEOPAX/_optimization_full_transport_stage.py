@@ -42,6 +42,8 @@ from ._transport_solvers import (
     _build_prepared_radau_execution_context,
     _extract_fixed_temperature_projection,
     _extract_state_regularization,
+    _flat_rhs_direct_database_payload_pullback_batched_factory,
+    _flat_rhs_direct_database_payload_pullback_factory,
     _flat_rhs_factory,
     _make_solver_state_transform,
     _radau_database_segment_reduced_cotangent_bwd_with_table_support_call,
@@ -901,12 +903,80 @@ def build_database_full_transport_replay_optimization_stage(
                 rhs_bar_flat,
             )
 
+        # The split table/geometry support transpose is a bound equation-system
+        # method.  It accepts the live support tree, but its equation-geometry
+        # branch still belongs to the equation owner on which it was created.
+        # Rebind that callback to the current equation system as well; otherwise
+        # a persistent stage returns the first geometry's transport derivatives
+        # even though its primal, table and state transpose are current.
+        split_options = {
+            name: value
+            for name, value, default in (
+                (
+                    "center_geometry_mode",
+                    template_physics_context.reverse_database_center_geometry_mode,
+                    "scalar_jvp",
+                ),
+                (
+                    "support_preparation_mode",
+                    template_physics_context.reverse_database_support_preparation_mode,
+                    "shared",
+                ),
+                (
+                    "interpolation_transpose_mode",
+                    template_physics_context.reverse_database_interpolation_transpose_mode,
+                    "established",
+                ),
+            )
+            if value != default
+        }
+        split_support_pullback = _flat_rhs_direct_database_payload_pullback_factory(
+            template_unpack_flat,
+            active_equation_system.vector_field,
+            (species,),
+            {},
+            "pullback_direct_rhs_database_split_support_payload",
+            project_flat=template_project_flat,
+            pullback_options=split_options,
+        )
+        if split_support_pullback is None:
+            raise ValueError(
+                "Database full-transport optimization requires the fixed-"
+                "database split support hook."
+            )
+        split_callback_values = {
+            "flat_rhs_direct_database_split_support_pullback": split_support_pullback
+        }
+        if (
+            template_physics_context.reverse_database_support_objective_mode
+            == "batched_split"
+        ):
+            batched_split_support_pullback = (
+                _flat_rhs_direct_database_payload_pullback_batched_factory(
+                    template_unpack_flat,
+                    active_equation_system.vector_field,
+                    (species,),
+                    {},
+                    "pullback_direct_rhs_database_split_support_payload_batched",
+                    project_flat=template_project_flat,
+                    pullback_options=split_options,
+                )
+            )
+            if batched_split_support_pullback is None:
+                raise ValueError(
+                    "Database full-transport optimization requires the batched "
+                    "fixed-database split support hook."
+                )
+            split_callback_values[
+                "flat_rhs_direct_database_split_support_pullback_batched"
+            ] = batched_split_support_pullback
         active_physics_context = dataclasses.replace(
             template_physics_context,
             flat_rhs=active_flat_rhs,
             flat_rhs_direct_black_box_state_pullback=(
                 _active_direct_state_pullback
             ),
+            **split_callback_values,
         )
         active_execution_context = dataclasses.replace(
             template_execution_context,

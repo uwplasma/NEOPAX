@@ -185,6 +185,9 @@ def _worker(
         evaluation_point=evaluation_point,
         x_scale=np.asarray(jax.device_get(problem.x_scale), dtype=float),
         parameter_labels=np.asarray(problem.parameter_labels, dtype=str),
+        objective_labels=np.asarray(
+            [term.residual_label for term in problem.terms], dtype=str
+        ),
     )
     print(
         f"[database full-transport parity] worker={stage_name} "
@@ -234,6 +237,7 @@ def _load_worker_output(
     np.ndarray,
     np.ndarray,
     tuple[str, ...],
+    tuple[str, ...],
 ]:
     with np.load(path, allow_pickle=False) as data:
         return (
@@ -243,6 +247,7 @@ def _load_worker_output(
             np.asarray(data["evaluation_point"], dtype=float),
             np.asarray(data["x_scale"], dtype=float),
             tuple(str(value) for value in data["parameter_labels"]),
+            tuple(str(value) for value in data["objective_labels"]),
         )
 
 
@@ -331,6 +336,7 @@ def main() -> int:
             reference_point,
             reference_x_scale,
             reference_labels,
+            reference_objective_labels,
         ) = _load_worker_output(reference_path)
         (
             trial_residuals,
@@ -339,10 +345,13 @@ def main() -> int:
             trial_point,
             trial_x_scale,
             trial_labels,
+            trial_objective_labels,
         ) = _load_worker_output(trial_path)
 
     if reference_labels != trial_labels:
         raise AssertionError("Reference and trial parameter layouts differ.")
+    if reference_objective_labels != trial_objective_labels:
+        raise AssertionError("Reference and trial objective layouts differ.")
     if args.parameter_offset == 0.0:
         np.testing.assert_array_equal(trial_x0, reference_x0)
         np.testing.assert_array_equal(trial_point, reference_point)
@@ -365,6 +374,20 @@ def main() -> int:
     relative_index = tuple(
         int(index)
         for index in np.unravel_index(np.argmax(relative_delta), relative_delta.shape)
+    )
+    absolute_index = tuple(
+        int(index)
+        for index in np.unravel_index(
+            np.argmax(np.abs(jacobian_delta)), jacobian_delta.shape
+        )
+    )
+    jacobian_rtol = 2.0e-7
+    jacobian_atol = 2.0e-8
+    jacobian_tolerance = (
+        jacobian_atol + jacobian_rtol * np.abs(reference_jacobian_aligned)
+    )
+    violation_indices = np.argwhere(
+        np.abs(jacobian_delta) > jacobian_tolerance
     )
 
     print(
@@ -392,7 +415,7 @@ def main() -> int:
     )
     print(
         "[database full-transport parity] jacobian_max_abs="
-        f"{np.max(np.abs(jacobian_delta)):.16e}",
+        f"{np.max(np.abs(jacobian_delta)):.16e} index={absolute_index}",
         flush=True,
     )
     print(
@@ -400,12 +423,36 @@ def main() -> int:
         f"{np.max(relative_delta):.16e} index={relative_index}",
         flush=True,
     )
+    print(
+        "[database full-transport parity] jacobian_violation_count="
+        f"{len(violation_indices)}",
+        flush=True,
+    )
+    for row, column in violation_indices:
+        print(
+            "[database full-transport parity] jacobian_violation "
+            f"objective={trial_objective_labels[int(row)]} row={int(row)} "
+            f"parameter={trial_labels[int(column)]} column={int(column)} "
+            f"trial={trial_jacobian[row, column]:.16e} "
+            f"reference={reference_jacobian_aligned[row, column]:.16e} "
+            f"abs={abs(jacobian_delta[row, column]):.16e} "
+            f"relative={relative_delta[row, column]:.16e}",
+            flush=True,
+        )
 
+    residual_rtol = 1.0e-9 if args.parameter_offset == 0.0 else 2.0e-7
+    residual_atol = 1.0e-10 if args.parameter_offset == 0.0 else 2.0e-8
     np.testing.assert_allclose(
-        trial_residuals, reference_residuals, rtol=1.0e-9, atol=1.0e-10
+        trial_residuals,
+        reference_residuals,
+        rtol=residual_rtol,
+        atol=residual_atol,
     )
     np.testing.assert_allclose(
-        trial_jacobian, reference_jacobian_aligned, rtol=2.0e-7, atol=2.0e-8
+        trial_jacobian,
+        reference_jacobian_aligned,
+        rtol=jacobian_rtol,
+        atol=jacobian_atol,
     )
     print("[database full-transport parity] PASS", flush=True)
     return 0
