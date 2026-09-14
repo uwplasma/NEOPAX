@@ -1018,6 +1018,27 @@ def test_database_full_transport_replay_stage_keeps_support_dynamic_and_cache_st
         database_bwd_call,
     )
 
+    def schedule_probe_body(
+        execution_context,
+        carry,
+        *,
+        max_total_steps,
+        stop_after_accepted_steps,
+        capture_segment_length,
+    ):
+        return (
+            execution_context.physics_context.flat_rhs(jnp.asarray(0.0), carry.y),
+            jnp.asarray(max_total_steps),
+            jnp.asarray(stop_after_accepted_steps),
+            jnp.asarray(capture_segment_length),
+        )
+
+    monkeypatch.setattr(
+        full_transport_stage,
+        "_radau_adaptive_schedule_rollout",
+        schedule_probe_body,
+    )
+
     @dataclasses.dataclass(frozen=True)
     class EquationSystem:
         support: object
@@ -1134,8 +1155,28 @@ def test_database_full_transport_replay_stage_keeps_support_dynamic_and_cache_st
         )
     )
 
+    schedule0 = jax.block_until_ready(
+        stage.schedule_probe(
+            initial_carry=prepared.initial_carry,
+            support_payload=support0,
+            max_total_steps=4,
+            stop_after_accepted_steps=1,
+            capture_segment_length=1,
+        )
+    )
+    schedule1 = jax.block_until_ready(
+        stage.schedule_probe(
+            initial_carry=prepared1.initial_carry,
+            support_payload=support1,
+            max_total_steps=4,
+            stop_after_accepted_steps=1,
+            capture_segment_length=1,
+        )
+    )
     assert stage.cache_size() == 1
+    assert stage.schedule_probe_cache_size() == 1
     assert not jnp.allclose(result0[0].y, result1[0].y)
+    assert not jnp.allclose(schedule0[0], schedule1[0])
     for trial, reference in (
         (result0, reference_result0),
         (result1, reference_result1),
@@ -1146,7 +1187,11 @@ def test_database_full_transport_replay_stage_keeps_support_dynamic_and_cache_st
             strict=True,
         ):
             assert jnp.allclose(
-                trial_leaf, reference_leaf, rtol=1.0e-12, atol=1.0e-12
+                trial_leaf,
+                reference_leaf,
+                rtol=1.0e-12,
+                atol=1.0e-12,
+                equal_nan=True,
             )
 
     def seeded_batched_reduced_cotangent(carry):

@@ -27,6 +27,7 @@ from ._reverse_ad_initial_er import (
 )
 from ._transport_equations import build_equation_system
 from ._transport_solvers import (
+    _radau_adaptive_schedule_rollout,
     _build_prepared_radau_accepted_rollout,
     _build_prepared_radau_execution_context,
     _extract_fixed_temperature_projection,
@@ -275,6 +276,7 @@ class DatabaseFullTransportReplayOptimizationStage:
     equation_system_template: Any
     compiled_replay: Any
     compiled_database_bwd: Any
+    compiled_schedule_probe: Any
     support_floating_signature: Any
     initial_state_signature: Any
     segment_carry_signature: Any
@@ -364,6 +366,54 @@ class DatabaseFullTransportReplayOptimizationStage:
 
     def database_bwd_cache_size(self) -> int | None:
         cache_size = getattr(self.compiled_database_bwd, "_cache_size", None)
+        if not callable(cache_size):
+            return None
+        try:
+            return int(cache_size())
+        except Exception:
+            return None
+
+    def schedule_probe(
+        self,
+        *,
+        initial_carry,
+        support_payload,
+        max_total_steps,
+        stop_after_accepted_steps,
+        capture_segment_length,
+    ):
+        """Run the exact adaptive schedule through one persistent JIT."""
+
+        self.support_layout.validate_static_structure(support_payload)
+        support_floating_leaves = self.support_layout.floating_leaves(support_payload)
+        if _tree_signature(support_floating_leaves) != self.support_floating_signature:
+            raise ValueError(
+                "Full-transport optimization support shape, dtype, or weak type "
+                "changed within a stage."
+            )
+        if _tree_signature(initial_carry.y) != self.initial_state_signature:
+            raise ValueError(
+                "Full-transport optimization initial-state layout changed within a stage."
+            )
+        return self.compiled_schedule_probe(
+            initial_carry.y,
+            support_floating_leaves,
+            initial_carry,
+            int(max_total_steps),
+            (
+                None
+                if stop_after_accepted_steps is None
+                else int(stop_after_accepted_steps)
+            ),
+            (
+                None
+                if capture_segment_length is None
+                else int(capture_segment_length)
+            ),
+        )
+
+    def schedule_probe_cache_size(self) -> int | None:
+        cache_size = getattr(self.compiled_schedule_probe, "_cache_size", None)
         if not callable(cache_size):
             return None
         try:
@@ -519,6 +569,26 @@ def build_database_full_transport_replay_optimization_stage(
             active_segment_arrays,
         )
 
+    def _schedule_probe_kernel(
+        active_initial_flat_state,
+        support_floating_leaves,
+        active_initial_carry,
+        max_total_steps,
+        stop_after_accepted_steps,
+        capture_segment_length,
+    ):
+        active_execution_context, _ = _active_execution_context(
+            active_initial_flat_state,
+            support_floating_leaves,
+        )
+        return _radau_adaptive_schedule_rollout(
+            active_execution_context,
+            active_initial_carry,
+            max_total_steps=max_total_steps,
+            stop_after_accepted_steps=stop_after_accepted_steps,
+            capture_segment_length=capture_segment_length,
+        )
+
     template_execution_context = reverse_setup.execution_context
     template_unpack_flat = template_physics_context.unpack_flat
     template_unpack_bar = getattr(
@@ -630,6 +700,11 @@ def build_database_full_transport_replay_optimization_stage(
         )
 
     compiled_replay = jax.jit(_replay_kernel, inline=False)
+    compiled_schedule_probe = jax.jit(
+        _schedule_probe_kernel,
+        static_argnums=(3, 4, 5),
+        inline=False,
+    )
     compiled_database_bwd = jax.jit(
         _database_bwd_kernel,
         static_argnums=(1,),
@@ -643,6 +718,7 @@ def build_database_full_transport_replay_optimization_stage(
         equation_system_template=equation_system_template,
         compiled_replay=compiled_replay,
         compiled_database_bwd=compiled_database_bwd,
+        compiled_schedule_probe=compiled_schedule_probe,
         support_floating_signature=_tree_signature(support_floating_leaves),
         initial_state_signature=_tree_signature(initial_flat_state),
         segment_carry_signature=_tree_signature(segment_start_carry),

@@ -3798,6 +3798,7 @@ def prepare_reverse_static_setup(
     reverse_single_segment_vjp_forward_mode: str = "legacy",
     reverse_schedule_artifact_mode: str = "legacy",
     max_reverse_accepted_steps: int | None = None,
+    schedule_probe_runner: Callable[..., object] | None = None,
 ) -> RealtimeGeometryReverseStaticSetup:
     state0_static = initial_state_for_parameter_vector(
         parameter_values,
@@ -4078,7 +4079,12 @@ def prepare_reverse_static_setup(
                 int(probe_stop_after_accepted_steps) + 16,
             ),
         ) if probe_stop_after_accepted_steps is not None else max_total_steps
-        schedule_probe = _reverse_adaptive_schedule_rollout(
+        schedule_probe_call = (
+            _reverse_adaptive_schedule_rollout
+            if schedule_probe_runner is None
+            else schedule_probe_runner
+        )
+        schedule_probe = schedule_probe_call(
             execution_context,
             prepared_rollout_static.initial_carry,
             max_total_steps=probe_max_total_steps,
@@ -8631,6 +8637,35 @@ def internal_realtime_geometry_transport_reverse_table_result_builder(
             )
             active_runtime = database_segment_runtime.runtime
         _report_table_builder_phase("prepare_runtime_payload")
+        optimization_schedule_probe_runner = None
+        if (
+            active_stage_mode == "database_full_transport_optimization"
+            and optimization_segment_replay_stage is not None
+            and recorded_scan_owner is not None
+        ):
+            current_schedule_support = {
+                "geometry": active_runtime.geometry,
+                "database": recorded_scan_owner.runtime_scan.database,
+            }
+
+            def _optimization_schedule_probe(
+                _execution_context,
+                initial_carry,
+                *,
+                max_total_steps,
+                stop_after_accepted_steps,
+                capture_segment_length,
+            ):
+                del _execution_context
+                return optimization_segment_replay_stage.schedule_probe(
+                    initial_carry=initial_carry,
+                    support_payload=current_schedule_support,
+                    max_total_steps=max_total_steps,
+                    stop_after_accepted_steps=stop_after_accepted_steps,
+                    capture_segment_length=capture_segment_length,
+                )
+
+            optimization_schedule_probe_runner = _optimization_schedule_probe
         active_reverse_setup = prepare_reverse_static_setup(
             active_profile_values,
             config=table_context.config,
@@ -8762,6 +8797,7 @@ def internal_realtime_geometry_transport_reverse_table_result_builder(
                 if active_max_reverse_accepted_steps is None
                 else int(active_max_reverse_accepted_steps)
             ),
+            schedule_probe_runner=optimization_schedule_probe_runner,
         )
         _report_table_builder_phase("prepare_reverse_static_setup")
         if (
@@ -9219,6 +9255,11 @@ def internal_realtime_geometry_transport_reverse_table_result_builder(
             return 0
         return optimization_segment_replay_stage.database_bwd_cache_size()
 
+    def _optimization_schedule_probe_cache_size() -> int | None:
+        if optimization_segment_replay_stage is None:
+            return 0
+        return optimization_segment_replay_stage.schedule_probe_cache_size()
+
     def _optimization_bootstrap_cache_size() -> int | None:
         if optimization_bootstrap_stage is None:
             return 0
@@ -9233,6 +9274,11 @@ def internal_realtime_geometry_transport_reverse_table_result_builder(
         _builder,
         "optimization_segment_bwd_cache_size",
         _optimization_segment_bwd_cache_size,
+    )
+    setattr(
+        _builder,
+        "optimization_schedule_probe_cache_size",
+        _optimization_schedule_probe_cache_size,
     )
     setattr(
         _builder,
