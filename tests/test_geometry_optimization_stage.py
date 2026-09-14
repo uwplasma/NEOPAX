@@ -1020,9 +1020,13 @@ def test_full_transport_parity_preserves_validated_root_seed():
         and node.func.attr == "geometry_full_transport_least_squares_problem"
     )
     vmec_input = next(keyword.value for keyword in call.keywords if keyword.arg == "vmec_input")
-    assert isinstance(vmec_input, ast.Attribute)
-    assert isinstance(vmec_input.value, ast.Name)
-    assert (vmec_input.value.id, vmec_input.attr) == ("base", "SEED_INPUT")
+    assert isinstance(vmec_input, ast.IfExp)
+    assert isinstance(vmec_input.test, ast.Compare)
+    assert isinstance(vmec_input.body, ast.Attribute)
+    assert isinstance(vmec_input.body.value, ast.Name)
+    assert (vmec_input.body.value.id, vmec_input.body.attr) == ("base", "SEED_INPUT")
+    assert isinstance(vmec_input.orelse, ast.Name)
+    assert vmec_input.orelse.id == "vmec_input"
 
 
 def test_full_transport_parity_perturbation_reuses_only_trial_stage(
@@ -1044,12 +1048,27 @@ def test_full_transport_parity_perturbation_reuses_only_trial_stage(
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
 
+    written_inputs = []
+
+    class Input:
+        def to_indata(self, path):
+            written_inputs.append(Path(path))
+            Path(path).write_text("perturbed", encoding="utf-8")
+
     problem = SimpleNamespace(
         x0=jnp.asarray([0.0, 0.0]),
+        x_scale=jnp.asarray([2.0, 3.0]),
         parameter_labels=("RBC:1:0", "ZBS:1:0"),
+        input_from_scaled_parameters=lambda _values: Input(),
     )
     evaluations = []
-    monkeypatch.setattr(module, "build_problem", lambda **_kwargs: problem)
+    build_calls = []
+
+    def fake_build_problem(**kwargs):
+        build_calls.append(kwargs)
+        return problem
+
+    monkeypatch.setattr(module, "build_problem", fake_build_problem)
 
     def fake_evaluate(_problem, values):
         point = np.asarray(values, dtype=float).copy()
@@ -1059,12 +1078,15 @@ def test_full_transport_parity_perturbation_reuses_only_trial_stage(
     monkeypatch.setattr(module, "evaluate", fake_evaluate)
 
     trial_output = tmp_path / "trial.npz"
+    perturbed_input = tmp_path / "input.perturbed"
     module._worker(
         "trial",
         trial_output,
         parameter_index=1,
         parameter_offset=0.25,
+        perturbed_input_output=perturbed_input,
     )
+    assert written_inputs == [perturbed_input]
     assert len(evaluations) == 2
     np.testing.assert_array_equal(evaluations[0], np.asarray([0.0, 0.0]))
     np.testing.assert_array_equal(evaluations[1], np.asarray([0.0, 0.25]))
@@ -1076,9 +1098,11 @@ def test_full_transport_parity_perturbation_reuses_only_trial_stage(
         reference_output,
         parameter_index=1,
         parameter_offset=0.25,
+        vmec_input=perturbed_input,
     )
     assert len(evaluations) == 1
-    np.testing.assert_array_equal(evaluations[0], np.asarray([0.0, 0.25]))
+    np.testing.assert_array_equal(evaluations[0], np.asarray([0.0, 0.0]))
+    assert build_calls[-1]["vmec_input"] == perturbed_input
 
 
 def test_database_full_transport_replay_stage_keeps_support_dynamic_and_cache_stable(

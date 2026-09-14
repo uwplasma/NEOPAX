@@ -10,10 +10,12 @@ boundaries are added only after this no-duplication baseline passes.  This is
 not an FD test or a physical final-time transport run.
 
 By default both workers evaluate the unperturbed point.  With a nonzero
-``--parameter-offset``, the benchmark worker evaluates the perturbed point
-fresh, while the optimization worker first evaluates ``x0`` and then the
-perturbed point through the same persistent stages.  That second mode detects
-trial data accidentally retained by an optimization-only JIT boundary.
+``--parameter-offset``, the optimization worker first evaluates ``x0`` and
+then the perturbed point through the same persistent stages.  It also writes
+that perturbed VMEX input.  The benchmark worker then builds a fresh problem
+whose baseline is that input and evaluates its local ``x0``.  That second mode
+detects trial data accidentally retained by an optimization-only JIT boundary
+without asking the unchanged benchmark lane to update a live scan runtime.
 """
 
 from __future__ import annotations
@@ -81,7 +83,7 @@ def active_terms():
     return tuple(term for term in base.terms if float(term[2]) != 0.0)
 
 
-def build_problem(*, reverse_stage_mode: str):
+def build_problem(*, reverse_stage_mode: str, vmec_input=None):
     from NEOPAX import optimization as opt
     import optimize_geometry_qi_max_er_transition_bootstrap_initial_root as base
 
@@ -94,7 +96,7 @@ def build_problem(*, reverse_stage_mode: str):
         # Without this explicit override, the transport TOML selects the
         # separate 201-surface benchmark seed instead of the root lane's
         # 51-surface seed and can exhaust GPU memory before reaching the root.
-        vmec_input=base.SEED_INPUT,
+        vmec_input=base.SEED_INPUT if vmec_input is None else vmec_input,
         max_mode=int(base.MAX_MODE_SCHEDULE),
         families=base.GEOMETRY_FAMILIES,
         scale_mode=base.SCALE_MODE,
@@ -143,22 +145,33 @@ def _worker(
     *,
     parameter_index: int,
     parameter_offset: float,
+    vmec_input: Path | None = None,
+    perturbed_input_output: Path | None = None,
 ) -> int:
     """Evaluate one lane in its own process and persist only host arrays."""
 
     import jax
 
     stage_mode = REFERENCE_STAGE_MODE if stage_name == "reference" else TRIAL_STAGE_MODE
-    problem = build_problem(reverse_stage_mode=stage_mode)
+    problem = build_problem(reverse_stage_mode=stage_mode, vmec_input=vmec_input)
     x0 = np.array(jax.device_get(problem.x0), dtype=float, copy=True)
     if not 0 <= parameter_index < x0.size:
         raise ValueError(
             f"--parameter-index must be in [0, {x0.size}); got {parameter_index}."
         )
+    fresh_perturbed_reference = stage_name == "reference" and vmec_input is not None
     evaluation_point = np.array(x0, copy=True)
-    evaluation_point[parameter_index] += float(parameter_offset)
+    if not fresh_perturbed_reference:
+        evaluation_point[parameter_index] += float(parameter_offset)
     primed_at_x0 = stage_name == "trial" and float(parameter_offset) != 0.0
     if primed_at_x0:
+        if perturbed_input_output is None:
+            raise ValueError(
+                "The perturbed trial worker requires --worker-perturbed-input-output."
+            )
+        problem.input_from_scaled_parameters(evaluation_point).to_indata(
+            perturbed_input_output
+        )
         # Keep the optimization stage alive across two distinct geometries.
         # The fresh benchmark worker deliberately does not take this step.
         priming_residuals, priming_jacobian = evaluate(problem, x0)
@@ -170,11 +183,13 @@ def _worker(
         jacobian=np.asarray(jax.device_get(jacobian), dtype=float),
         x0=x0,
         evaluation_point=evaluation_point,
+        x_scale=np.asarray(jax.device_get(problem.x_scale), dtype=float),
         parameter_labels=np.asarray(problem.parameter_labels, dtype=str),
     )
     print(
         f"[database full-transport parity] worker={stage_name} "
-        f"stage={stage_mode} primed_at_x0={primed_at_x0} wrote={output_path}",
+        f"stage={stage_mode} primed_at_x0={primed_at_x0} "
+        f"fresh_perturbed_reference={fresh_perturbed_reference} wrote={output_path}",
         flush=True,
     )
     return 0
@@ -186,33 +201,47 @@ def _run_worker(
     *,
     parameter_index: int,
     parameter_offset: float,
+    vmec_input: Path | None = None,
+    perturbed_input_output: Path | None = None,
 ) -> None:
-    subprocess.run(
-        [
-            sys.executable,
-            str(Path(__file__).resolve()),
-            "--worker-stage",
-            stage_name,
-            "--worker-output",
-            str(output_path),
-            "--parameter-index",
-            str(parameter_index),
-            "--parameter-offset",
-            repr(float(parameter_offset)),
-        ],
-        check=True,
-    )
+    command = [
+        sys.executable,
+        str(Path(__file__).resolve()),
+        "--worker-stage",
+        stage_name,
+        "--worker-output",
+        str(output_path),
+        "--parameter-index",
+        str(parameter_index),
+        "--parameter-offset",
+        repr(float(parameter_offset)),
+    ]
+    if vmec_input is not None:
+        command.extend(("--worker-vmec-input", str(vmec_input)))
+    if perturbed_input_output is not None:
+        command.extend(
+            ("--worker-perturbed-input-output", str(perturbed_input_output))
+        )
+    subprocess.run(command, check=True)
 
 
 def _load_worker_output(
     path: Path,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, tuple[str, ...]]:
+) -> tuple[
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    tuple[str, ...],
+]:
     with np.load(path, allow_pickle=False) as data:
         return (
             np.asarray(data["residuals"], dtype=float),
             np.asarray(data["jacobian"], dtype=float),
             np.asarray(data["x0"], dtype=float),
             np.asarray(data["evaluation_point"], dtype=float),
+            np.asarray(data["x_scale"], dtype=float),
             tuple(str(value) for value in data["parameter_labels"]),
         )
 
@@ -221,6 +250,10 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--worker-stage", choices=("reference", "trial"), help=argparse.SUPPRESS)
     parser.add_argument("--worker-output", type=Path, help=argparse.SUPPRESS)
+    parser.add_argument("--worker-vmec-input", type=Path, help=argparse.SUPPRESS)
+    parser.add_argument(
+        "--worker-perturbed-input-output", type=Path, help=argparse.SUPPRESS
+    )
     parser.add_argument(
         "--parameter-index",
         type=int,
@@ -245,6 +278,8 @@ def main() -> int:
             args.worker_output,
             parameter_index=args.parameter_index,
             parameter_offset=args.parameter_offset,
+            vmec_input=args.worker_vmec_input,
+            perturbed_input_output=args.worker_perturbed_input_output,
         )
     if args.worker_output is not None:
         parser.error("--worker-output is only valid with --worker-stage")
@@ -257,42 +292,73 @@ def main() -> int:
         temp_root = Path(temp_dir)
         reference_path = temp_root / "reference.npz"
         trial_path = temp_root / "trial.npz"
-        _run_worker(
-            "reference",
-            reference_path,
-            parameter_index=args.parameter_index,
-            parameter_offset=args.parameter_offset,
-        )
+        perturbed_input_path = temp_root / "input.full_transport_parity_perturbed"
+        if args.parameter_offset != 0.0:
+            # The trial must run first so it can materialize the exact VMEX
+            # geometry used at x1. The reference process then treats that
+            # geometry as its baseline, keeping the benchmark lane untouched.
+            _run_worker(
+                "trial",
+                trial_path,
+                parameter_index=args.parameter_index,
+                parameter_offset=args.parameter_offset,
+                perturbed_input_output=perturbed_input_path,
+            )
+            _run_worker(
+                "reference",
+                reference_path,
+                parameter_index=args.parameter_index,
+                parameter_offset=args.parameter_offset,
+                vmec_input=perturbed_input_path,
+            )
+        else:
+            _run_worker(
+                "reference",
+                reference_path,
+                parameter_index=args.parameter_index,
+                parameter_offset=args.parameter_offset,
+            )
+            _run_worker(
+                "trial",
+                trial_path,
+                parameter_index=args.parameter_index,
+                parameter_offset=args.parameter_offset,
+            )
         (
             reference_residuals,
             reference_jacobian,
             reference_x0,
             reference_point,
+            reference_x_scale,
             reference_labels,
-        ) = (
-            _load_worker_output(reference_path)
-        )
-        _run_worker(
-            "trial",
-            trial_path,
-            parameter_index=args.parameter_index,
-            parameter_offset=args.parameter_offset,
-        )
+        ) = _load_worker_output(reference_path)
         (
             trial_residuals,
             trial_jacobian,
             trial_x0,
             trial_point,
+            trial_x_scale,
             trial_labels,
         ) = _load_worker_output(trial_path)
 
     if reference_labels != trial_labels:
         raise AssertionError("Reference and trial parameter layouts differ.")
-    np.testing.assert_array_equal(trial_x0, reference_x0)
-    np.testing.assert_array_equal(trial_point, reference_point)
+    if args.parameter_offset == 0.0:
+        np.testing.assert_array_equal(trial_x0, reference_x0)
+        np.testing.assert_array_equal(trial_point, reference_point)
+        reference_jacobian_aligned = reference_jacobian
+    else:
+        if np.any(reference_x_scale == 0.0) or np.any(trial_x_scale == 0.0):
+            raise ValueError("Full-transport parity parameter scales must be nonzero.")
+        # Each problem reports derivatives in its own scaled coordinates.
+        # Convert the fresh-baseline benchmark Jacobian into the original
+        # trial problem's scaled coordinates before comparing all columns.
+        reference_jacobian_aligned = (
+            reference_jacobian / reference_x_scale[None, :]
+        ) * trial_x_scale[None, :]
     residual_delta = trial_residuals - reference_residuals
-    jacobian_delta = trial_jacobian - reference_jacobian
-    reference_jacobian_np = reference_jacobian
+    jacobian_delta = trial_jacobian - reference_jacobian_aligned
+    reference_jacobian_np = reference_jacobian_aligned
     relative_delta = np.abs(jacobian_delta) / np.maximum(
         np.abs(reference_jacobian_np), 1.0e-14
     )
@@ -312,6 +378,8 @@ def main() -> int:
         f"parameter_index={args.parameter_index} "
         f"parameter_offset={args.parameter_offset:.6e} "
         f"trial_primed_at_x0={args.parameter_offset != 0.0} "
+        f"reference_geometry={'original_baseline' if args.parameter_offset == 0.0 else 'fresh_perturbed_baseline'} "
+        "jacobian_coordinates=trial_seed_scaled "
         "process_isolation=sequential_workers "
         "transport_reverse=block/explicit_database/reduced_cotangent_call_boundary "
         "database_interpolation_transpose=legacy_sparse",
@@ -337,7 +405,7 @@ def main() -> int:
         trial_residuals, reference_residuals, rtol=1.0e-9, atol=1.0e-10
     )
     np.testing.assert_allclose(
-        trial_jacobian, reference_jacobian, rtol=2.0e-7, atol=2.0e-8
+        trial_jacobian, reference_jacobian_aligned, rtol=2.0e-7, atol=2.0e-8
     )
     print("[database full-transport parity] PASS", flush=True)
     return 0
