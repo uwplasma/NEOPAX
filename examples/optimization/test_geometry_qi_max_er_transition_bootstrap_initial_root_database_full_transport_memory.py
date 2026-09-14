@@ -82,6 +82,11 @@ def segment_cache_sizes(
         "optimization_schedule_probe_cache_size",
         lambda: None,
     )
+    optimization_runtime_scan_cache_size = getattr(
+        problem.table_result_builder,
+        "optimization_runtime_scan_cache_size",
+        lambda: None,
+    )
     optimization_bootstrap_cache_size = getattr(
         problem.table_result_builder,
         "optimization_bootstrap_cache_size",
@@ -108,6 +113,7 @@ def segment_cache_sizes(
         cache_size(
             transport_solvers._radau_segment_reduced_cotangent_bwd_batched_call
         ),
+        optimization_runtime_scan_cache_size(),
         optimization_replay_cache_size(),
         optimization_bwd_cache_size(),
         optimization_schedule_cache_size(),
@@ -246,7 +252,7 @@ def main() -> int:
             "[database full-transport memory] "
             f"warmup={warmup_index} elapsed_s={time.perf_counter() - started:.3f} "
             "stage_cache=(benchmark_database_bwd,benchmark_replay,generic_bwd,"
-            "optimization_replay,optimization_lean_bwd,optimization_schedule,"
+            "optimization_runtime_scan,optimization_replay,optimization_lean_bwd,optimization_schedule,"
             "optimization_bootstrap,"
             "raw_parameter_setup,raw_solve,raw_stop_gradient,global_dispatch)="
             f"{cache_before}->{cache_after}",
@@ -295,7 +301,7 @@ def main() -> int:
             f"trial={trial_index} elapsed_s={time.perf_counter() - started:.3f} "
             f"rss_delta={rss_text} live_jax_arrays={arrays_text} "
             "stage_cache=(benchmark_database_bwd,benchmark_replay,generic_bwd,"
-            "optimization_replay,optimization_lean_bwd,optimization_schedule,"
+            "optimization_runtime_scan,optimization_replay,optimization_lean_bwd,optimization_schedule,"
             "optimization_bootstrap,"
             "raw_parameter_setup,raw_solve,raw_stop_gradient,global_dispatch)="
             f"{cache_before}->{cache_after} "

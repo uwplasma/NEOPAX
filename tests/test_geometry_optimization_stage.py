@@ -650,6 +650,8 @@ def test_database_full_transport_mode_uses_one_integrated_benchmark_builder(monk
     raw_stage = SimpleNamespace(raw_block_stage=object())
     transpose_stage = object()
     payload_stage = object()
+    runtime_stage = object()
+    runtime_stage_builds = []
     monkeypatch.setattr(
         optimization,
         "geometry_raw_block_optimization_stage",
@@ -669,6 +671,11 @@ def test_database_full_transport_mode_uses_one_integrated_benchmark_builder(monk
         optimization,
         "build_initial_root_payload_assembly_stage",
         lambda **_kwargs: payload_stage,
+    )
+    monkeypatch.setattr(
+        optimization,
+        "build_database_full_transport_runtime_optimization_stage",
+        lambda **kwargs: runtime_stage_builds.append(kwargs) or runtime_stage,
     )
 
     for stage_mode in ("benchmark", "database_full_transport_optimization"):
@@ -711,6 +718,7 @@ def test_database_full_transport_mode_uses_one_integrated_benchmark_builder(monk
             assert calls[0]["bootstrap_optimization_stage_builder"] is None
             assert calls[0]["payload_assembly_optimization_stage"] is None
             assert calls[0]["initial_root_optimization_stage"] is None
+            assert calls[0]["runtime_optimization_stage"] is None
             assert problem.raw_block_optimization_stage is None
             assert problem.raw_block_transpose_optimization_stage is None
         else:
@@ -724,6 +732,7 @@ def test_database_full_transport_mode_uses_one_integrated_benchmark_builder(monk
             )
             assert calls[0]["payload_assembly_optimization_stage"] is payload_stage
             assert calls[0]["initial_root_optimization_stage"] is root_stage
+            assert calls[0]["runtime_optimization_stage"] is runtime_stage
             assert problem.raw_block_optimization_stage is raw_stage
             assert problem.raw_block_transpose_optimization_stage is transpose_stage
         for name, expected in expected_database_modes.items():
@@ -738,10 +747,19 @@ def test_database_full_transport_mode_uses_one_integrated_benchmark_builder(monk
     assert root_stage_builds[0]["objective_names"] == tuple(
         reverse_transport.TRANSPORT_REVERSE_OBJECTIVE_LABELS
     )
+    assert runtime_stage_builds == [
+        {
+            "runtime": runtime,
+            "geometry_context": context,
+            "n_r": 7,
+        }
+    ]
 
 
-def test_database_full_transport_changed_geometry_rebuilds_live_scan_runtime(monkeypatch):
-    """A changed database trial must not enter the exact-Lij payload branch."""
+def test_database_full_transport_changed_geometry_uses_persistent_live_scan_runtime(
+    monkeypatch,
+):
+    """A changed trial uses the optimization owner, not common runtime setup."""
 
     class _PreparedInputsReached(RuntimeError):
         pass
@@ -759,14 +777,12 @@ def test_database_full_transport_changed_geometry_rebuilds_live_scan_runtime(mon
         lambda _parameter_set: None,
     )
 
-    def _build_fresh_runtime(config, context, state, *, n_r):
-        calls.append((config, context, state, n_r))
-        return fresh_runtime, object()
-
     monkeypatch.setattr(
         reverse_transport,
         "build_runtime_context_for_vmec_state",
-        _build_fresh_runtime,
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("optimization entered common runtime construction")
+        ),
     )
     monkeypatch.setattr(
         reverse_transport,
@@ -799,11 +815,16 @@ def test_database_full_transport_changed_geometry_rebuilds_live_scan_runtime(mon
         profile_cfg={},
         neoclassical_cfg={"flux_model": "ntx_scan_runtime"},
     )
+    runtime_stage = SimpleNamespace(
+        runtime_for_vmec_state=lambda state: calls.append(state) or fresh_runtime,
+        cache_size=lambda: 1,
+    )
     builder = reverse_transport.internal_realtime_geometry_transport_reverse_table_result_builder(
         table_context=table_context,
         geometry_context=geometry_context,
         raw_block_solve=SimpleNamespace(state=raw_state),
         n_r=7,
+        runtime_optimization_stage=runtime_stage,
     )
 
     try:
@@ -820,9 +841,8 @@ def test_database_full_transport_changed_geometry_rebuilds_live_scan_runtime(mon
     else:  # pragma: no cover - the sentinel must stop the heavy setup
         raise AssertionError("test did not reach reverse static setup")
 
-    assert calls == [
-        ({"geometry": {"n_radial": 7}}, geometry_context, raw_state, 7)
-    ]
+    assert calls == [raw_state]
+    assert builder.optimization_runtime_scan_cache_size() == 1
 
 
 def test_database_full_transport_bootstrap_stage_keeps_trial_values_dynamic(

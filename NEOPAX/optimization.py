@@ -74,6 +74,7 @@ from ._optimization_initial_root_stage import (
 from ._optimization_full_transport_stage import (
     build_database_full_transport_bootstrap_optimization_stage,
     build_database_full_transport_replay_optimization_stage,
+    build_database_full_transport_runtime_optimization_stage,
 )
 from ._reverse_ad_parameters import (
     PROFILE_PARAMETER_ORDER,
@@ -2381,6 +2382,7 @@ def geometry_full_transport_least_squares_problem(
     raw_block_transpose_stage = None
     full_transport_payload_stage = None
     database_root_stage = None
+    database_runtime_optimization_stage = None
     if stage_mode == "database_full_transport_optimization":
         # Keep the VMEX solve identical to the established shared raw-block
         # path, but retain its fixed callable/configuration owners for the
@@ -2397,6 +2399,14 @@ def geometry_full_transport_least_squares_problem(
         raw_block_transpose_stage = geometry_raw_block_transpose_optimization_stage(
             raw_block_optimization_stage.raw_block_stage,
             context=context,
+        )
+
+        database_runtime_optimization_stage = (
+            build_database_full_transport_runtime_optimization_stage(
+                runtime=runtime,
+                geometry_context=context,
+                n_r=n_r_eff,
+            )
         )
 
         # Reuse the same persistent database selected-root/pullback stage that
@@ -2643,6 +2653,7 @@ def geometry_full_transport_least_squares_problem(
         ),
         payload_assembly_optimization_stage=full_transport_payload_stage,
         initial_root_optimization_stage=database_root_stage,
+        runtime_optimization_stage=database_runtime_optimization_stage,
     )
     normalized_terms = _normalize_initial_er_root_least_squares_terms(terms)
     return GeometryFullTransportLeastSquaresProblem(

@@ -4,10 +4,11 @@ The benchmark reverse lane constructs a fresh Radau execution context for
 each geometry.  Its segment replay call deliberately treats that context as
 static, which is appropriate for a one-shot benchmark but creates one JAX
 cache entry per optimizer evaluation.  This module keeps the benchmark calls
-unchanged and provides persistent replay and database-backward scans whose
-geometry/database arrays are explicit dynamic inputs.  The backward scan
-reuses the fixed solver structure and rebuilds only its support-dependent
-direct-state transpose, rather than tracing a complete rollout/context build.
+unchanged and provides persistent live-database, replay, and database-backward
+scans whose geometry/database arrays are explicit dynamic inputs.  The
+backward scan reuses the fixed solver structure and rebuilds only its
+support-dependent direct-state transpose, rather than tracing a complete
+rollout/context build.
 """
 
 from __future__ import annotations
@@ -19,13 +20,22 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
+from ._geometry_autodiff import (
+    _build_neopax_geometry_from_state,
+    build_ntx_runtime_scan_inputs_from_vmec_state,
+)
 from ._optimization_initial_root_stage import FloatingPayloadLeafLayout
 from ._reverse_ad_initial_er import (
     _replace_geometry_and_fresh_database_payload_in_model,
     find_ntx_database_transport_model_in_model,
+    find_ntx_runtime_scan_model_in_model,
     runtime_with_fresh_ntx_database_payload,
+    runtime_with_geometry_payload,
 )
 from ._transport_equations import build_equation_system
+from ._transport_flux_models import (
+    NTXRuntimeScanTransportModel,
+)
 from ._transport_solvers import (
     _radau_adaptive_schedule_rollout,
     _build_prepared_radau_accepted_rollout,
@@ -53,6 +63,164 @@ def _tree_signature(
             )
         )
     return treedef, tuple(signature)
+
+
+def _replace_runtime_scan_model(model, replacement):
+    """Replace only the live NTX scan owner in a composite flux model."""
+
+    if model is None or not dataclasses.is_dataclass(model) or isinstance(model, type):
+        return model, False
+    if isinstance(model, NTXRuntimeScanTransportModel):
+        return replacement, True
+    updates = {}
+    changed = False
+    for field in dataclasses.fields(model):
+        value = getattr(model, field.name)
+        if dataclasses.is_dataclass(value) and not isinstance(value, type):
+            new_value, child_changed = _replace_runtime_scan_model(value, replacement)
+            if child_changed:
+                updates[field.name] = new_value
+                changed = True
+    if not changed:
+        return model, False
+    return dataclasses.replace(model, **updates), True
+
+
+@dataclasses.dataclass
+class DatabaseFullTransportRuntimeOptimizationStage:
+    """Persistent live NTX forward scan for changing optimizer geometries.
+
+    Geometry and the VMEC-derived scan payload are rebuilt for every trial.
+    Only the fixed NTX grid/configuration and compiled scan identity persist.
+    This is deliberately an optimization-only owner; the benchmark runtime
+    construction remains unchanged.
+    """
+
+    runtime_template: Any
+    geometry_context: Any
+    n_r: int
+    rho_scan: Any
+    surface_backend: str
+    scan_model_template: NTXRuntimeScanTransportModel
+    scan_payload_layout: FloatingPayloadLeafLayout
+    scan_payload_signature: Any
+    compiled_scan: Any
+
+    def runtime_for_vmec_state(self, state_vmec):
+        geometry = _build_neopax_geometry_from_state(
+            self.geometry_context,
+            state_vmec,
+            n_r=int(self.n_r),
+        )
+        channels, surfaces = build_ntx_runtime_scan_inputs_from_vmec_state(
+            self.geometry_context,
+            state_vmec,
+            geometry,
+            rho_scan=self.rho_scan,
+            surface_backend=self.surface_backend,
+        )
+        scan_payload = {"channels": channels, "surfaces": surfaces}
+        self.scan_payload_layout.validate_static_structure(scan_payload)
+        scan_payload_leaves = self.scan_payload_layout.floating_leaves(scan_payload)
+        if _tree_signature(scan_payload_leaves) != self.scan_payload_signature:
+            raise ValueError(
+                "Full-transport optimization live-scan payload shape or dtype "
+                "changed within a stage."
+            )
+        database, scan_primal_record, raw_scan = self.compiled_scan(
+            scan_payload_leaves
+        )
+        active_scan_model = self.scan_model_template.with_runtime_scan_payload(
+            geometry=geometry,
+            channels=channels,
+            scan_surfaces=tuple(surfaces),
+            database=database,
+        )
+        active_scan_model = dataclasses.replace(
+            active_scan_model,
+            scan_primal_record=scan_primal_record,
+            scan_primal=raw_scan,
+        )
+        runtime_with_geometry = runtime_with_geometry_payload(
+            self.runtime_template,
+            geometry,
+        )
+        flux_model, changed = _replace_runtime_scan_model(
+            runtime_with_geometry.models.flux,
+            active_scan_model,
+        )
+        if not changed:
+            raise ValueError(
+                "Full-transport optimization runtime has no live NTX scan model."
+            )
+        return dataclasses.replace(
+            runtime_with_geometry,
+            database=database,
+            models=dataclasses.replace(
+                runtime_with_geometry.models,
+                flux=flux_model,
+            ),
+        )
+
+    def cache_size(self) -> int | None:
+        cache_size = getattr(self.compiled_scan, "_cache_size", None)
+        if not callable(cache_size):
+            return None
+        try:
+            return int(cache_size())
+        except Exception:
+            return None
+
+
+def build_database_full_transport_runtime_optimization_stage(
+    *,
+    runtime,
+    geometry_context,
+    n_r: int,
+) -> DatabaseFullTransportRuntimeOptimizationStage:
+    """Build one persistent wrapper around the existing live NTX scan."""
+
+    scan_model = find_ntx_runtime_scan_model_in_model(runtime.models.flux)
+    if scan_model is None:
+        raise ValueError(
+            "Full-transport runtime optimization requires an NTX runtime scan model."
+        )
+    if scan_model.channels is None or scan_model.scan_surfaces is None:
+        raise ValueError(
+            "Full-transport runtime optimization requires preloaded scan inputs."
+        )
+    if not bool(scan_model.record_scan_primal):
+        raise ValueError(
+            "Full-transport runtime optimization requires a recorded scan primal."
+        )
+    scan_payload = {
+        "channels": scan_model.channels,
+        "surfaces": scan_model.scan_surfaces,
+    }
+    scan_payload_layout = FloatingPayloadLeafLayout.from_template(scan_payload)
+    scan_payload_leaves = scan_payload_layout.floating_leaves(scan_payload)
+
+    def _scan_kernel(active_scan_payload_leaves):
+        active_payload = scan_payload_layout.rebuild(active_scan_payload_leaves)
+        active_scan_model = scan_model.with_runtime_scan_payload(
+            geometry=scan_model.geometry,
+            channels=active_payload["channels"],
+            scan_surfaces=tuple(active_payload["surfaces"]),
+            database=None,
+        )
+        return active_scan_model._build_runtime_database_and_record()
+
+    return DatabaseFullTransportRuntimeOptimizationStage(
+        runtime_template=runtime,
+        geometry_context=geometry_context,
+        n_r=int(n_r),
+        rho_scan=np.asarray(jax.device_get(scan_model.rho_scan), dtype=float),
+        surface_backend=str(scan_model.surface_backend),
+        scan_model_template=scan_model,
+        scan_payload_layout=scan_payload_layout,
+        scan_payload_signature=_tree_signature(scan_payload_leaves),
+        compiled_scan=jax.jit(_scan_kernel, inline=False),
+    )
 
 
 def _equation_system_with_fresh_database_payload(

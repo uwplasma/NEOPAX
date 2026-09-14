@@ -26,7 +26,6 @@ from ._constants import elementary_charge
 from ._geometry_autodiff import (
     boundary_param_entries,
     build_neopax_geometry_and_ntx_exact_lij_support_from_state,
-    build_runtime_context_for_vmec_state,
     build_geometry_autodiff_context,
     GeometryRawBlockSolve,
     geometry_payload_pullback_from_param_vector_raw_block_transpose,
@@ -8521,6 +8520,7 @@ def internal_realtime_geometry_transport_reverse_table_result_builder(
     bootstrap_optimization_stage_builder: Callable[..., object] | None = None,
     payload_assembly_optimization_stage: object | None = None,
     initial_root_optimization_stage: object | None = None,
+    runtime_optimization_stage: object | None = None,
 ) -> TransportReverseTableResultBuilder:
     """Build an experimental direct full transport reverse table builder.
 
@@ -8600,13 +8600,14 @@ def internal_realtime_geometry_transport_reverse_table_result_builder(
                 # state needs a newly built live scan/database runtime. The
                 # exact-Lij builder does not produce the mapping required by
                 # LiveNtxScanModel.with_support_payload().
-                active_runtime, _active_state = build_runtime_context_for_vmec_state(
-                    dict(table_context.config),
-                    geometry_context,
-                    active_raw_block_solve.state,
-                    n_r=int(opts.get("n_r", n_r)),
+                if runtime_optimization_stage is None:
+                    raise RuntimeError(
+                        "The database full-transport optimization requires its "
+                        "persistent live-scan runtime stage."
+                    )
+                active_runtime = runtime_optimization_stage.runtime_for_vmec_state(
+                    active_raw_block_solve.state
                 )
-                del _active_state
             else:
                 active_support_payload = build_neopax_geometry_and_ntx_exact_lij_support_from_state(
                     geometry_context,
@@ -9265,6 +9266,11 @@ def internal_realtime_geometry_transport_reverse_table_result_builder(
             return 0
         return optimization_bootstrap_stage.cache_size()
 
+    def _optimization_runtime_scan_cache_size() -> int | None:
+        if runtime_optimization_stage is None:
+            return 0
+        return runtime_optimization_stage.cache_size()
+
     setattr(
         _builder,
         "optimization_segment_replay_cache_size",
@@ -9284,6 +9290,11 @@ def internal_realtime_geometry_transport_reverse_table_result_builder(
         _builder,
         "optimization_bootstrap_cache_size",
         _optimization_bootstrap_cache_size,
+    )
+    setattr(
+        _builder,
+        "optimization_runtime_scan_cache_size",
+        _optimization_runtime_scan_cache_size,
     )
     setattr(_builder, "optimization_phase_probe", None)
     return _builder
