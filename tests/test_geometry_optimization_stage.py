@@ -12,10 +12,86 @@ import numpy as np
 from NEOPAX import _geometry_autodiff as geometry_ad
 from NEOPAX import _optimization_full_transport_stage as full_transport_stage
 from NEOPAX import _optimization_initial_root_stage as initial_root_stage
+from NEOPAX import _reverse_ad_optimization as reverse_optimization
 from NEOPAX import _reverse_ad_transport as reverse_transport
 from NEOPAX import _transport_solvers as transport_solvers
 from NEOPAX import optimization
 from NEOPAX._reverse_ad_optimization import normalize_geometry_full_ad_objective_names
+
+
+def test_database_initial_root_unfolded_support_bars_sanitize_float0(monkeypatch):
+    """The full-transport root adapter emits ordinary float-delta payloads."""
+
+    @dataclasses.dataclass
+    class _StateBars:
+        Er: object
+
+    geometry = {
+        "coefficient": jnp.asarray([2.0]),
+        "mode": jnp.asarray([1], dtype=jnp.int32),
+    }
+    database = {
+        "table": jnp.asarray([3.0]),
+        "index": jnp.asarray([0], dtype=jnp.int32),
+    }
+    direct_geometry = {
+        "coefficient": jnp.asarray([[1.0]]),
+        "mode": jnp.zeros((1, 1), dtype=jax.dtypes.float0),
+    }
+    residual_geometry = {
+        "coefficient": jnp.asarray([[2.0]]),
+        "mode": jnp.zeros((1, 1), dtype=jax.dtypes.float0),
+    }
+    table_bars = {
+        "table": jnp.asarray([[4.0]]),
+        "index": jnp.zeros((1, 1), dtype=jax.dtypes.float0),
+    }
+    direct_database = {
+        "table": jnp.asarray([[5.0]]),
+        "index": jnp.zeros((1, 1), dtype=jax.dtypes.float0),
+    }
+
+    monkeypatch.setattr(
+        reverse_optimization,
+        "initial_er_charge_flux_residual_er_derivative",
+        lambda *args, **kwargs: jnp.ones((1,)),
+    )
+    monkeypatch.setattr(
+        reverse_optimization,
+        "compact_initial_er_state_pullback",
+        lambda **kwargs: _StateBars(Er=jnp.zeros((1, 1))),
+    )
+    monkeypatch.setattr(
+        reverse_optimization,
+        "compact_initial_er_database_support_bars",
+        lambda **kwargs: table_bars,
+    )
+    monkeypatch.setattr(
+        reverse_optimization,
+        "compact_initial_er_database_geometry_bars",
+        lambda **kwargs: residual_geometry,
+    )
+    monkeypatch.setattr(reverse_optimization, "_add_trees", lambda lhs, rhs: lhs)
+
+    _, support_rows = reverse_optimization._database_initial_root_to_unfolded_support_bars(
+        fixed_runtime=object(),
+        support={"geometry": geometry, "database": database},
+        pre_root_state=object(),
+        er_profile=jnp.zeros((1,)),
+        finite_mask=jnp.ones((1,), dtype=bool),
+        rooted_state_bars=_StateBars(Er=jnp.zeros((1, 1))),
+        direct_geometry_bars=direct_geometry,
+        direct_database_bars=direct_database,
+        parameter_set=SimpleNamespace(profile_specs=()),
+        profile_values_arr=jnp.zeros((0,)),
+        pre_root_state_from_profile_values=lambda value: value,
+        objective_count=1,
+    )
+
+    assert jnp.allclose(support_rows[0]["geometry"]["coefficient"], jnp.asarray([3.0]))
+    assert support_rows[0]["geometry"]["mode"].dtype == jnp.float64
+    assert jnp.allclose(support_rows[0]["database"]["table"], jnp.asarray([9.0]))
+    assert support_rows[0]["database"]["index"].dtype == jnp.float64
 
 
 def test_local_vmex_mercier_softmax_adapter_uses_state_runtime_path(monkeypatch):

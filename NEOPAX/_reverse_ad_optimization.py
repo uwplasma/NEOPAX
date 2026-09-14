@@ -28,7 +28,12 @@ from ._reverse_ad_parameters import (
     VmecBoundaryParameterSpec,
     parameter_labels,
 )
-from ._transport_flux_models import DENSITY_STATE_TO_PHYSICAL, _add_float_delta_tree, _float_delta_tree_like
+from ._transport_flux_models import (
+    DENSITY_STATE_TO_PHYSICAL,
+    _add_float_delta_tree,
+    _float_delta_tree_like,
+    _sum_float_delta_bar_trees,
+)
 from ._geometry_autodiff import (
     build_runtime_context_for_vmec_state,
     build_neopax_geometry_and_ntx_exact_lij_support_from_state,
@@ -870,11 +875,13 @@ def _database_initial_root_to_unfolded_support_bars(
     )
     support_bars = tuple(
         {
-            "geometry": _add_trees(
+            "geometry": _sum_float_delta_bar_trees(
+                support["geometry"],
                 _row_from_batched_tree(direct_geometry_bars, row),
                 _row_from_batched_tree(residual_geometry_bars, row),
             ),
-            "database": _add_trees(
+            "database": _sum_float_delta_bar_trees(
+                support["database"],
                 _row_from_batched_tree(table_bars, row),
                 _row_from_batched_tree(direct_database_bars, row),
             ),
