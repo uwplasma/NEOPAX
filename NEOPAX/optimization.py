@@ -2380,6 +2380,7 @@ def geometry_full_transport_least_squares_problem(
     raw_block_optimization_stage = None
     raw_block_transpose_stage = None
     full_transport_payload_stage = None
+    database_root_stage = None
     if stage_mode == "database_full_transport_optimization":
         # Keep the VMEX solve identical to the established shared raw-block
         # path, but retain its fixed callable/configuration owners for the
@@ -2396,6 +2397,42 @@ def geometry_full_transport_least_squares_problem(
         raw_block_transpose_stage = geometry_raw_block_transpose_optimization_stage(
             raw_block_optimization_stage.raw_block_stage,
             context=context,
+        )
+
+        # Reuse the same persistent database selected-root/pullback stage that
+        # was validated by the root-only optimization lane. The full transport
+        # continuation supplies its current state cotangents to that stage;
+        # geometry and database leaves remain fresh numerical arguments.
+        database_root_parameter_set = reverse_ad_optimization_parameter_set(
+            include_profiles=True,
+            profiles=PROFILE_PARAMETER_ORDER,
+            vmec_boundary=parameterization.specs,
+        )
+        database_root_stage = build_database_initial_root_experiment_stage(
+            runtime=runtime,
+            config=config_eff,
+            objective_names=TRANSPORT_REVERSE_OBJECTIVE_LABELS,
+            parameter_set=database_root_parameter_set,
+            pre_root_state_from_profile_values=lambda profile_values: (
+                initial_state_for_parameter_vector(
+                    profile_values,
+                    config=config_eff,
+                    initial_er_root_ad="off",
+                    baseline_state=baseline_state,
+                    profile_cfg=profile_cfg,
+                    runtime=runtime,
+                )
+            ),
+            options={
+                "reverse_database_root_interpolation_transpose_mode": str(
+                    options.get(
+                        "reverse_database_root_interpolation_transpose_mode",
+                        "established",
+                    )
+                )
+            },
+            jit_selected_root=False,
+            use_fresh_database_payload=True,
         )
 
         stage_transport_objectives = tuple(
@@ -2605,6 +2642,7 @@ def geometry_full_transport_least_squares_problem(
             else None
         ),
         payload_assembly_optimization_stage=full_transport_payload_stage,
+        initial_root_optimization_stage=database_root_stage,
     )
     normalized_terms = _normalize_initial_er_root_least_squares_terms(terms)
     return GeometryFullTransportLeastSquaresProblem(

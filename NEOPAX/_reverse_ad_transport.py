@@ -755,6 +755,11 @@ class RealtimeGeometrySupportReverseDependencies:
     # Optional optimization-only terminal bootstrap boundary. Benchmark
     # dependency bundles leave this unset and execute their established code.
     database_bootstrap_objective_row: Callable[..., object] | None = None
+    # Optional optimization-only reuse of the validated database initial-root
+    # stage. Benchmark dependency bundles leave both callbacks unset, so the
+    # established selected-root and compact pullback sequence is unchanged.
+    database_initial_root_selected_profile: Callable[..., object] | None = None
+    database_initial_root_pullback: Callable[..., object] | None = None
     # Optional optimization-memory diagnostic. Production benchmark bundles
     # leave this unset, preserving their existing execution and synchronization.
     optimization_phase_probe: Callable[[str], None] | None = None
@@ -766,6 +771,8 @@ class RealtimeGeometrySupportReverseDependencies:
                 "segment_replay_minimal_with_primal_records",
                 "database_segment_reduced_cotangent_bwd_with_table_support",
                 "database_bootstrap_objective_row",
+                "database_initial_root_selected_profile",
+                "database_initial_root_pullback",
                 "optimization_phase_probe",
             } and value is None:
                 continue
@@ -4667,7 +4674,23 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
         )
     )
     phase_start = time.perf_counter()
-    pre_root_initial_state, profile_state_pullback = jax.vjp(_state_from_profiles, parameter_values)
+    persistent_database_root = (
+        initial_er_root_enabled
+        and dependencies.database_initial_root_selected_profile is not None
+        and dependencies.database_initial_root_pullback is not None
+        and combined_geometry_payload
+        and "database" in support_payload
+    )
+    if persistent_database_root:
+        # The validated database-root stage owns the profile transpose together
+        # with the implicit-root pullback. Avoid creating a fresh VJP closure
+        # here on every full-transport optimizer evaluation.
+        pre_root_initial_state = _state_from_profiles(parameter_values)
+        profile_state_pullback = None
+    else:
+        pre_root_initial_state, profile_state_pullback = jax.vjp(
+            _state_from_profiles, parameter_values
+        )
     profile_state_vjp_elapsed = None
     if phase_timing_diagnostics:
         # Do not conflate the profile pytree VJP with the separately executed
@@ -4686,11 +4709,19 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
     selected_root_primal_elapsed = None
     if initial_er_root_enabled:
         selected_root_start = time.perf_counter()
-        initial_er_root_primal = dependencies.initial_er_selected_root_profile(
-            pre_root_initial_state,
-            config=config,
-            runtime=runtime,
-        )
+        if persistent_database_root:
+            initial_er_root_primal = (
+                dependencies.database_initial_root_selected_profile(
+                    pre_root_initial_state,
+                    support_payload,
+                )
+            )
+        else:
+            initial_er_root_primal = dependencies.initial_er_selected_root_profile(
+                pre_root_initial_state,
+                config=config,
+                runtime=runtime,
+            )
         initial_state = dataclasses.replace(
             pre_root_initial_state,
             Er=jnp.asarray(
@@ -7172,7 +7203,56 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
             flush=True,
         )
     initial_er_root_support_bars = None
-    if initial_er_root_enabled:
+    persistent_root_profile_gradient = None
+    if persistent_database_root:
+        phase_start = time.perf_counter()
+        if initial_er_root_primal is None:
+            raise RuntimeError(
+                "Persistent database initial-root boundary requires the forward "
+                "selected-root primal."
+            )
+        er_profile, finite_mask = initial_er_root_primal
+        objective_count = int(jnp.asarray(initial_state_bars.Er).shape[0])
+        (
+            persistent_root_profile_gradient,
+            persistent_root_support_rows,
+        ) = dependencies.database_initial_root_pullback(
+            pre_root_initial_state,
+            jnp.asarray(er_profile, dtype=pre_root_initial_state.Er.dtype),
+            jnp.asarray(finite_mask, dtype=bool),
+            initial_state_bars,
+            _batched_zero_tangent_tree_like(
+                support_payload["geometry"], objective_count
+            ),
+            _batched_zero_tangent_tree_like(
+                support_payload["database"], objective_count
+            ),
+            parameter_values,
+            support_payload,
+        )
+        persistent_root_support_tree = jax.tree_util.tree_map(
+            lambda *rows: jnp.stack(rows, axis=0),
+            *persistent_root_support_rows,
+        )
+        initial_er_root_support_bars = tuple(
+            jax.tree_util.tree_leaves(persistent_root_support_tree)
+        )
+        (
+            persistent_root_profile_gradient,
+            initial_er_root_support_bars,
+        ) = jax.block_until_ready(
+            (
+                persistent_root_profile_gradient,
+                initial_er_root_support_bars,
+            )
+        )
+        print(
+            f"{progress_prefix} progress: initial-Er root boundary compact pullback ready "
+            f"elapsed_s={time.perf_counter() - phase_start:.3f}",
+            flush=True,
+        )
+        _report_optimization_phase("initial_er_root_pullback")
+    if initial_er_root_enabled and not persistent_database_root:
         phase_start = time.perf_counter()
         if initial_er_root_primal is None:
             raise RuntimeError(
@@ -7389,10 +7469,15 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
         initial_state_bars = pre_root_initial_state_bars
 
     phase_start = time.perf_counter()
-    with _reverse_profile_scope(reverse_setup, "reverse_post_sweep/profile_parameter_pullback"):
-        gradient_matrix = jax.vmap(
-            lambda state_bar: profile_state_pullback(state_bar)[0]
-        )(initial_state_bars)
+    if persistent_root_profile_gradient is None:
+        if profile_state_pullback is None:
+            raise RuntimeError("Profile-state pullback was not prepared.")
+        with _reverse_profile_scope(reverse_setup, "reverse_post_sweep/profile_parameter_pullback"):
+            gradient_matrix = jax.vmap(
+                lambda state_bar: profile_state_pullback(state_bar)[0]
+            )(initial_state_bars)
+    else:
+        gradient_matrix = persistent_root_profile_gradient
     gradient_matrix = jax.block_until_ready(gradient_matrix)
     print(
         f"{progress_prefix} progress: support reverse profile parameter pullback ready "
@@ -8426,6 +8511,7 @@ def internal_realtime_geometry_transport_reverse_table_result_builder(
     segment_replay_optimization_stage_builder: Callable[..., object] | None = None,
     bootstrap_optimization_stage_builder: Callable[..., object] | None = None,
     payload_assembly_optimization_stage: object | None = None,
+    initial_root_optimization_stage: object | None = None,
 ) -> TransportReverseTableResultBuilder:
     """Build an experimental direct full transport reverse table builder.
 
@@ -8726,6 +8812,68 @@ def internal_realtime_geometry_transport_reverse_table_result_builder(
                     "The database full-transport optimization replay requires "
                     "the live {geometry, database} support payload."
                 )
+            if initial_root_optimization_stage is None:
+                raise RuntimeError(
+                    "The database full-transport optimization requires the "
+                    "validated persistent initial-root stage."
+                )
+            initial_root_optimization_stage.initialize_for_live_runtime(
+                recorded_scan_runtime
+            )
+            root_payload_adapter = initial_root_optimization_stage.payload_adapter
+            root_selected_profile = initial_root_optimization_stage.selected_root
+            root_pullback = initial_root_optimization_stage.root_pullback
+            if (
+                root_payload_adapter is None
+                or root_selected_profile is None
+                or root_pullback is None
+            ):
+                raise RuntimeError(
+                    "The persistent database initial-root stage failed to initialize."
+                )
+            def _optimization_initial_root_selected_profile(
+                pre_root_state,
+                active_support_payload,
+            ):
+                root_payload_adapter.validate_static_structure(
+                    active_support_payload
+                )
+                geometry_leaves, database_leaves = (
+                    root_payload_adapter.dynamic_leaves(active_support_payload)
+                )
+                return root_selected_profile(
+                    pre_root_state,
+                    geometry_leaves,
+                    database_leaves,
+                )
+
+            def _optimization_initial_root_pullback(
+                pre_root_state,
+                er_profile,
+                finite_mask,
+                rooted_state_bars,
+                direct_geometry_bars,
+                direct_database_bars,
+                profile_values,
+                active_support_payload,
+            ):
+                root_payload_adapter.validate_static_structure(
+                    active_support_payload
+                )
+                geometry_leaves, database_leaves = (
+                    root_payload_adapter.dynamic_leaves(active_support_payload)
+                )
+                return root_pullback(
+                    pre_root_state,
+                    er_profile,
+                    finite_mask,
+                    rooted_state_bars,
+                    direct_geometry_bars,
+                    direct_database_bars,
+                    profile_values,
+                    geometry_leaves,
+                    database_leaves,
+                )
 
             def _optimization_segment_replay(
                 execution_context,
@@ -8818,6 +8966,12 @@ def internal_realtime_geometry_transport_reverse_table_result_builder(
                     _optimization_database_bootstrap
                     if callable(bootstrap_optimization_stage_builder)
                     else None
+                ),
+                database_initial_root_selected_profile=(
+                    _optimization_initial_root_selected_profile
+                ),
+                database_initial_root_pullback=(
+                    _optimization_initial_root_pullback
                 ),
                 optimization_phase_probe=optimization_phase_probe,
             )

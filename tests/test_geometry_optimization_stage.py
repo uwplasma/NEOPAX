@@ -475,6 +475,8 @@ def test_database_full_transport_mode_uses_one_integrated_benchmark_builder(monk
         is None
     )
     assert production_dependencies.database_bootstrap_objective_row is None
+    assert production_dependencies.database_initial_root_selected_profile is None
+    assert production_dependencies.database_initial_root_pullback is None
     assert production_dependencies.optimization_phase_probe is None
 
     expected_database_modes = {
@@ -557,12 +559,17 @@ def test_database_full_transport_mode_uses_one_integrated_benchmark_builder(monk
         "realtime_geometry_transport_reverse_table_context",
         lambda **_kwargs: table_context,
     )
+    root_stage = object()
+    root_stage_builds = []
+
+    def _root_stage_factory(**kwargs):
+        root_stage_builds.append(kwargs)
+        return root_stage
+
     monkeypatch.setattr(
         optimization,
         "build_database_initial_root_experiment_stage",
-        lambda **_kwargs: (_ for _ in ()).throw(
-            AssertionError("full transport must not use the retired two-sweep bridge")
-        ),
+        _root_stage_factory,
     )
     raw_stage = SimpleNamespace(raw_block_stage=object())
     transpose_stage = object()
@@ -627,6 +634,7 @@ def test_database_full_transport_mode_uses_one_integrated_benchmark_builder(monk
             assert calls[0]["segment_replay_optimization_stage_builder"] is None
             assert calls[0]["bootstrap_optimization_stage_builder"] is None
             assert calls[0]["payload_assembly_optimization_stage"] is None
+            assert calls[0]["initial_root_optimization_stage"] is None
             assert problem.raw_block_optimization_stage is None
             assert problem.raw_block_transpose_optimization_stage is None
         else:
@@ -639,6 +647,7 @@ def test_database_full_transport_mode_uses_one_integrated_benchmark_builder(monk
                 is full_transport_stage.build_database_full_transport_bootstrap_optimization_stage
             )
             assert calls[0]["payload_assembly_optimization_stage"] is payload_stage
+            assert calls[0]["initial_root_optimization_stage"] is root_stage
             assert problem.raw_block_optimization_stage is raw_stage
             assert problem.raw_block_transpose_optimization_stage is transpose_stage
         for name, expected in expected_database_modes.items():
@@ -646,6 +655,13 @@ def test_database_full_transport_mode_uses_one_integrated_benchmark_builder(monk
             assert problem.options[name] == expected
         assert problem.options["reverse_stage_mode"] == stage_mode
         assert problem.table_result_builder is builder
+
+    assert len(root_stage_builds) == 1
+    assert root_stage_builds[0]["jit_selected_root"] is False
+    assert root_stage_builds[0]["use_fresh_database_payload"] is True
+    assert root_stage_builds[0]["objective_names"] == tuple(
+        reverse_transport.TRANSPORT_REVERSE_OBJECTIVE_LABELS
+    )
 
 
 def test_database_full_transport_bootstrap_stage_keeps_trial_values_dynamic(

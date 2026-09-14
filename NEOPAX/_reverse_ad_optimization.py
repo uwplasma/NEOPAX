@@ -810,6 +810,7 @@ def _database_initial_root_to_unfolded_support_bars(
     profile_values_arr,
     pre_root_state_from_profile_values: Callable[[object], object],
     objective_count: int,
+    interpolation_transpose_mode: str = "established",
 ):
     """Map selected-root cotangents to unfurled database support bars.
 
@@ -858,6 +859,7 @@ def _database_initial_root_to_unfolded_support_bars(
         er_profile=er_profile,
         residual_bars=residual_bars,
         support=support,
+        interpolation_transpose_mode=interpolation_transpose_mode,
     )
     residual_geometry_bars = compact_initial_er_database_geometry_bars(
         runtime=fixed_runtime,
@@ -1241,6 +1243,12 @@ def build_database_initial_root_experiment_stage(
                 profile_values_arr=profile_values_arr,
                 pre_root_state_from_profile_values=pre_root_state_from_profile_values_static,
                 objective_count=len(objective_names_static),
+                interpolation_transpose_mode=str(
+                    (options_static or {}).get(
+                        "reverse_database_root_interpolation_transpose_mode",
+                        "established",
+                    )
+                ),
             )
 
         # Keep the outer selected-root profile un-jitted.  The reference
