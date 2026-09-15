@@ -444,7 +444,7 @@ def _project_packed_transport_state_arrays(
     temperature_floor: Any = None,
 ) -> Any:
     """Project packed solver arrays without rebuilding a full TransportState."""
-    from ._state import safe_density, safe_temperature
+    from ._state import _broadcast_species_floor, safe_density
 
     if not (isinstance(state_like, tuple) and len(state_like) == 3):
         return state_like
@@ -490,8 +490,21 @@ def _project_packed_transport_state_arrays(
         fixed_pressure = floored_density * fixed_temperature
         projected_pressure = jnp.where(active_mask, projected_pressure, fixed_pressure)
     if temperature_floor is not None:
-        projected_temperature = safe_temperature(projected_pressure / floored_density, temperature_floor)
-        projected_pressure = floored_density * projected_temperature
+        # ``floored_density`` is positive by construction, so this is exactly
+        # equivalent to
+        #
+        #   n * maximum(p / n, temperature_floor)
+        #
+        # while avoiding a divide/multiply VJP whose density terms cancel
+        # analytically.  Large but finite long-horizon adjoints could make the
+        # two intermediate terms overflow before that cancellation, producing
+        # ``inf - inf == nan`` in the reverse Radau replay even though both the
+        # primal state and its true derivative were finite.
+        pressure_floor = floored_density * _broadcast_species_floor(
+            projected_pressure,
+            temperature_floor,
+        )
+        projected_pressure = jnp.maximum(projected_pressure, pressure_floor)
     return (packed_density, projected_pressure, er)
 
 

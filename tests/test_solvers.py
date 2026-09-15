@@ -80,6 +80,43 @@ def test_combined_private_edge_polarization_is_exact_quadratic_and_transposed():
     assert jnp.allclose(edge_bar, jnp.asarray(2.0))
 
 
+def test_packed_temperature_floor_projection_vjp_stays_finite_for_large_cotangent():
+    """Pressure-space flooring avoids an overflowing cancelling density VJP."""
+
+    dtype = jnp.float64
+    template_state = SimpleNamespace(density=jnp.ones((1, 1), dtype=dtype))
+    state = (
+        jnp.asarray([[1.0e-6]], dtype=dtype),
+        jnp.asarray([[1.0]], dtype=dtype),
+        jnp.asarray([0.0], dtype=dtype),
+    )
+
+    def project(state_like):
+        return transport_solvers._project_packed_transport_state_arrays(
+            state_like,
+            template_state,
+            species=None,
+            density_floor=1.0e-6,
+            temperature_floor=1.0,
+        )
+
+    projected, pullback = jax.vjp(project, state)
+    incoming = (
+        jnp.zeros_like(projected[0]),
+        jnp.full_like(projected[1], 1.0e308),
+        jnp.zeros_like(projected[2]),
+    )
+    (state_bar,) = pullback(incoming)
+
+    assert jnp.all(jnp.isfinite(projected[1]))
+    assert jnp.all(jnp.isfinite(state_bar[0]))
+    assert jnp.all(jnp.isfinite(state_bar[1]))
+    assert jnp.all(jnp.isfinite(state_bar[2]))
+    assert jnp.allclose(state_bar[0], 0.0)
+    assert jnp.allclose(state_bar[1], incoming[1])
+    assert jnp.allclose(state_bar[2], 0.0)
+
+
 def test_limm_w_config_keeps_current_flux_and_jacobian_reuse_separate():
     """LIMM-W may reuse its matrix, but never its physical RHS anchor."""
 
