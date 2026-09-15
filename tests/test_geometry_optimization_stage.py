@@ -1172,6 +1172,19 @@ def test_full_transport_parity_perturbation_reuses_only_trial_stage(
     np.testing.assert_array_equal(evaluations[0], np.asarray([0.0, 0.0]))
     assert build_calls[-1]["vmec_input"] == perturbed_input
 
+    evaluations.clear()
+    fresh_trial_output = tmp_path / "trial_fresh.npz"
+    module._worker(
+        "trial_fresh",
+        fresh_trial_output,
+        parameter_index=1,
+        parameter_offset=0.25,
+    )
+    assert len(evaluations) == 1
+    np.testing.assert_array_equal(evaluations[0], np.asarray([0.0, 0.25]))
+    assert build_calls[-1]["reverse_stage_mode"] == module.TRIAL_STAGE_MODE
+    assert build_calls[-1]["vmec_input"] is None
+
 
 @pytest.mark.parametrize(
     "interpolation_transpose_mode",

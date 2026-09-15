@@ -64,6 +64,15 @@ PHYSICAL_J_MAX_WELLS = 16
 PHYSICAL_J_QUADRATURE_ORDER = 16
 PHYSICAL_MAXJ_TARGET = 0.0
 
+# Dense post-processing resolution used only for the VMEX-style J contour.
+# The physical pitch remains exactly the frozen optimization pitch; increasing
+# these values does not alter the optimization objective or its derivatives.
+PHYSICAL_J_PLOT_NALPHA = 96
+PHYSICAL_J_PLOT_POINTS_PER_PERIOD = 64
+PHYSICAL_J_PLOT_NUM_PERIODS = 6
+PHYSICAL_J_PLOT_MAX_WELLS = 24
+PHYSICAL_J_PLOT_QUADRATURE_ORDER = 32
+
 MAX_MODE_SCHEDULE = (1, 2)
 # Boundary degrees of freedom.  ``None`` selects the standard VMEX packed
 # parameters independently at every stage in ``MAX_MODE_SCHEDULE``: all RBC
@@ -335,13 +344,13 @@ def plot_physical_j_polar_contours(wout_path, out_dir, *, physical_pitches=None)
             surfaces=tuple(float(value) for value in SURFACES),
             mboz=QI_MBOZ,
             nboz=QI_NBOZ,
-            nalpha=settings.physical_nalpha,
-            points_per_period=settings.physical_points_per_period,
-            num_periods=settings.physical_num_periods,
+            nalpha=PHYSICAL_J_PLOT_NALPHA,
+            points_per_period=PHYSICAL_J_PLOT_POINTS_PER_PERIOD,
+            num_periods=PHYSICAL_J_PLOT_NUM_PERIODS,
             trapping_depths=settings.trapping_depths,
             physical_pitches=(settings.physical_pitches or ()),
-            max_wells=settings.physical_max_wells,
-            quadrature_order=settings.physical_quadrature_order,
+            max_wells=PHYSICAL_J_PLOT_MAX_WELLS,
+            quadrature_order=PHYSICAL_J_PLOT_QUADRATURE_ORDER,
             jit_boozer=True,
         )
         print(
@@ -721,6 +730,13 @@ def main() -> int:
             "num_periods": int(PHYSICAL_J_NUM_PERIODS),
             "max_wells": PHYSICAL_J_MAX_WELLS,
             "quadrature_order": int(PHYSICAL_J_QUADRATURE_ORDER),
+        },
+        "physical_j_plot_resolution": {
+            "nalpha": int(PHYSICAL_J_PLOT_NALPHA),
+            "points_per_period": int(PHYSICAL_J_PLOT_POINTS_PER_PERIOD),
+            "num_periods": int(PHYSICAL_J_PLOT_NUM_PERIODS),
+            "max_wells": PHYSICAL_J_PLOT_MAX_WELLS,
+            "quadrature_order": int(PHYSICAL_J_PLOT_QUADRATURE_ORDER),
         },
         "physical_maxj_target": float(PHYSICAL_MAXJ_TARGET),
         "transport_profile_backend": TRANSPORT_PROFILE_BACKEND,

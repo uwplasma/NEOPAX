@@ -316,7 +316,11 @@ def _load_worker_output(
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--worker-stage", choices=("reference", "trial"), help=argparse.SUPPRESS)
+    parser.add_argument(
+        "--worker-stage",
+        choices=("reference", "trial", "trial_fresh"),
+        help=argparse.SUPPRESS,
+    )
     parser.add_argument("--worker-output", type=Path, help=argparse.SUPPRESS)
     parser.add_argument("--worker-vmec-input", type=Path, help=argparse.SUPPRESS)
     parser.add_argument(
@@ -335,6 +339,15 @@ def main() -> int:
         help=(
             "Offset applied to the selected scaled parameter. A nonzero value "
             "primes the trial at x0 before comparing both lanes at the offset point."
+        ),
+    )
+    parser.add_argument(
+        "--diagnose-fresh-trial",
+        action="store_true",
+        help=(
+            "Also evaluate a separate optimization worker initialized directly "
+            "at the perturbed point. This isolates persistent-stage reuse from "
+            "benchmark-versus-optimization numerical differences."
         ),
     )
     parser.add_argument(
@@ -378,6 +391,7 @@ def main() -> int:
         temp_root = Path(temp_dir)
         reference_path = temp_root / "reference.npz"
         trial_path = temp_root / "trial.npz"
+        fresh_trial_path = temp_root / "trial_fresh.npz"
         perturbed_input_path = temp_root / "input.full_transport_parity_perturbed"
         if args.parameter_offset != 0.0:
             # The trial must run first so it can materialize the exact VMEX
@@ -401,6 +415,15 @@ def main() -> int:
                 er_transition_right_index=args.er_transition_right_index,
                 vmec_input=perturbed_input_path,
             )
+            if args.diagnose_fresh_trial:
+                _run_worker(
+                    "trial_fresh",
+                    fresh_trial_path,
+                    parameter_index=args.parameter_index,
+                    parameter_offset=args.parameter_offset,
+                    er_transition_left_index=args.er_transition_left_index,
+                    er_transition_right_index=args.er_transition_right_index,
+                )
         else:
             _run_worker(
                 "reference",
@@ -436,6 +459,54 @@ def main() -> int:
             trial_labels,
             trial_objective_labels,
         ) = _load_worker_output(trial_path)
+        fresh_trial_output = (
+            _load_worker_output(fresh_trial_path)
+            if args.diagnose_fresh_trial and args.parameter_offset != 0.0
+            else None
+        )
+
+    if args.diagnose_fresh_trial and args.parameter_offset == 0.0:
+        print(
+            "[database full-transport parity] fresh-trial diagnostic skipped: "
+            "--parameter-offset is zero",
+            flush=True,
+        )
+
+    if fresh_trial_output is not None:
+        (
+            fresh_trial_residuals,
+            fresh_trial_jacobian,
+            fresh_trial_x0,
+            fresh_trial_point,
+            fresh_trial_x_scale,
+            fresh_trial_labels,
+            fresh_trial_objective_labels,
+        ) = fresh_trial_output
+        if fresh_trial_labels != trial_labels:
+            raise AssertionError("Fresh and reused trial parameter layouts differ.")
+        if fresh_trial_objective_labels != trial_objective_labels:
+            raise AssertionError("Fresh and reused trial objective layouts differ.")
+        np.testing.assert_array_equal(fresh_trial_x0, trial_x0)
+        np.testing.assert_array_equal(fresh_trial_point, trial_point)
+        np.testing.assert_array_equal(fresh_trial_x_scale, trial_x_scale)
+        reuse_residual_delta = trial_residuals - fresh_trial_residuals
+        reuse_jacobian_delta = trial_jacobian - fresh_trial_jacobian
+        print(
+            "[database full-transport parity] fresh-trial reuse diagnostic "
+            "comparison=reused_x0_to_x1_minus_fresh_direct_x1 "
+            f"residual_max_abs={np.max(np.abs(reuse_residual_delta)):.16e} "
+            f"jacobian_max_abs={np.max(np.abs(reuse_jacobian_delta)):.16e}",
+            flush=True,
+        )
+        for row, label in enumerate(trial_objective_labels):
+            print(
+                "[database full-transport parity] fresh-trial row "
+                f"objective={label} row={row} "
+                f"residual_abs={abs(reuse_residual_delta[row]):.16e} "
+                "jacobian_max_abs="
+                f"{np.max(np.abs(reuse_jacobian_delta[row])):.16e}",
+                flush=True,
+            )
 
     if reference_labels != trial_labels:
         raise AssertionError("Reference and trial parameter layouts differ.")
@@ -454,6 +525,31 @@ def main() -> int:
         reference_jacobian_aligned = (
             reference_jacobian / reference_x_scale[None, :]
         ) * trial_x_scale[None, :]
+    if fresh_trial_output is not None:
+        fresh_reference_residual_delta = (
+            fresh_trial_residuals - reference_residuals
+        )
+        fresh_reference_jacobian_delta = (
+            fresh_trial_jacobian - reference_jacobian_aligned
+        )
+        print(
+            "[database full-transport parity] fresh-trial benchmark diagnostic "
+            "comparison=fresh_direct_x1_minus_fresh_benchmark_x1 "
+            "residual_max_abs="
+            f"{np.max(np.abs(fresh_reference_residual_delta)):.16e} "
+            "jacobian_max_abs="
+            f"{np.max(np.abs(fresh_reference_jacobian_delta)):.16e}",
+            flush=True,
+        )
+        for row, label in enumerate(trial_objective_labels):
+            print(
+                "[database full-transport parity] fresh-trial benchmark row "
+                f"objective={label} row={row} "
+                f"residual_abs={abs(fresh_reference_residual_delta[row]):.16e} "
+                "jacobian_max_abs="
+                f"{np.max(np.abs(fresh_reference_jacobian_delta[row])):.16e}",
+                flush=True,
+            )
     residual_delta = trial_residuals - reference_residuals
     jacobian_delta = trial_jacobian - reference_jacobian_aligned
     reference_jacobian_np = reference_jacobian_aligned
