@@ -18,6 +18,12 @@ that perturbed VMEX input.  The benchmark worker then builds a fresh problem
 whose baseline is that input and evaluates its local ``x0``.  That second mode
 detects trial data accidentally retained by an optimization-only JIT boundary
 without asking the unchanged benchmark lane to update a live scan runtime.
+
+``--same-perturbed-baseline`` instead materializes the perturbed input without
+running transport, then constructs both the benchmark and optimization lanes
+from that exact input and evaluates each at its local ``x0``.  This isolates
+the full-transport optimization implementation from seed-to-perturbation VMEX
+rebaselining differences.
 """
 
 from __future__ import annotations
@@ -216,11 +222,26 @@ def _worker(
         raise ValueError(
             f"--parameter-index must be in [0, {x0.size}); got {parameter_index}."
         )
-    fresh_perturbed_reference = stage_name == "reference" and vmec_input is not None
-    evaluation_point = np.array(x0, copy=True)
-    if not fresh_perturbed_reference:
+    if stage_name == "materialize":
+        evaluation_point = np.array(x0, copy=True)
         evaluation_point[parameter_index] += float(parameter_offset)
-    primed_at_x0 = stage_name == "trial" and float(parameter_offset) != 0.0
+        problem.input_from_scaled_parameters(evaluation_point).to_indata(output_path)
+        print(
+            "[database full-transport parity] worker=materialize "
+            f"stage={stage_mode} wrote={output_path}",
+            flush=True,
+        )
+        return 0
+
+    fresh_perturbed_baseline = vmec_input is not None
+    evaluation_point = np.array(x0, copy=True)
+    if not fresh_perturbed_baseline:
+        evaluation_point[parameter_index] += float(parameter_offset)
+    primed_at_x0 = (
+        stage_name == "trial"
+        and vmec_input is None
+        and float(parameter_offset) != 0.0
+    )
     if primed_at_x0:
         if perturbed_input_output is None:
             raise ValueError(
@@ -249,7 +270,7 @@ def _worker(
     print(
         f"[database full-transport parity] worker={stage_name} "
         f"stage={stage_mode} primed_at_x0={primed_at_x0} "
-        f"fresh_perturbed_reference={fresh_perturbed_reference} wrote={output_path}",
+        f"fresh_perturbed_baseline={fresh_perturbed_baseline} wrote={output_path}",
         flush=True,
     )
     return 0
@@ -318,7 +339,13 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--worker-stage",
-        choices=("reference", "trial", "trial_fresh"),
+        choices=(
+            "reference",
+            "trial",
+            "trial_fresh",
+            "trial_rebased",
+            "materialize",
+        ),
         help=argparse.SUPPRESS,
     )
     parser.add_argument("--worker-output", type=Path, help=argparse.SUPPRESS)
@@ -348,6 +375,14 @@ def main() -> int:
             "Also evaluate a separate optimization worker initialized directly "
             "at the perturbed point. This isolates persistent-stage reuse from "
             "benchmark-versus-optimization numerical differences."
+        ),
+    )
+    parser.add_argument(
+        "--same-perturbed-baseline",
+        action="store_true",
+        help=(
+            "Build both full-transport lanes from the exact serialized "
+            "perturbed VMEC input and compare them at their local x0."
         ),
     )
     parser.add_argument(
@@ -382,6 +417,12 @@ def main() -> int:
         )
     if args.worker_output is not None:
         parser.error("--worker-output is only valid with --worker-stage")
+    if args.same_perturbed_baseline and args.parameter_offset == 0.0:
+        parser.error("--same-perturbed-baseline requires a nonzero --parameter-offset")
+    if args.same_perturbed_baseline and args.diagnose_fresh_trial:
+        parser.error(
+            "--same-perturbed-baseline and --diagnose-fresh-trial are separate diagnostics"
+        )
 
     # Keep this parent process free of JAX/NEOPAX imports.  Otherwise it can
     # retain a GPU client/allocation while a supposedly isolated worker runs.
@@ -393,7 +434,37 @@ def main() -> int:
         trial_path = temp_root / "trial.npz"
         fresh_trial_path = temp_root / "trial_fresh.npz"
         perturbed_input_path = temp_root / "input.full_transport_parity_perturbed"
-        if args.parameter_offset != 0.0:
+        if args.same_perturbed_baseline:
+            # Materialization runs in its own short-lived child so the parent
+            # remains free of a JAX GPU client. Neither transport lane is used
+            # to manufacture the shared perturbed baseline.
+            _run_worker(
+                "materialize",
+                perturbed_input_path,
+                parameter_index=args.parameter_index,
+                parameter_offset=args.parameter_offset,
+                er_transition_left_index=args.er_transition_left_index,
+                er_transition_right_index=args.er_transition_right_index,
+            )
+            _run_worker(
+                "reference",
+                reference_path,
+                parameter_index=args.parameter_index,
+                parameter_offset=args.parameter_offset,
+                er_transition_left_index=args.er_transition_left_index,
+                er_transition_right_index=args.er_transition_right_index,
+                vmec_input=perturbed_input_path,
+            )
+            _run_worker(
+                "trial_rebased",
+                trial_path,
+                parameter_index=args.parameter_index,
+                parameter_offset=args.parameter_offset,
+                er_transition_left_index=args.er_transition_left_index,
+                er_transition_right_index=args.er_transition_right_index,
+                vmec_input=perturbed_input_path,
+            )
+        elif args.parameter_offset != 0.0:
             # The trial must run first so it can materialize the exact VMEX
             # geometry used at x1. The reference process then treats that
             # geometry as its baseline, keeping the benchmark lane untouched.
@@ -512,9 +583,10 @@ def main() -> int:
         raise AssertionError("Reference and trial parameter layouts differ.")
     if reference_objective_labels != trial_objective_labels:
         raise AssertionError("Reference and trial objective layouts differ.")
-    if args.parameter_offset == 0.0:
+    if args.parameter_offset == 0.0 or args.same_perturbed_baseline:
         np.testing.assert_array_equal(trial_x0, reference_x0)
         np.testing.assert_array_equal(trial_point, reference_point)
+        np.testing.assert_array_equal(trial_x_scale, reference_x_scale)
         reference_jacobian_aligned = reference_jacobian
     else:
         if np.any(reference_x_scale == 0.0) or np.any(trial_x_scale == 0.0):
@@ -582,14 +654,17 @@ def main() -> int:
         f"segments={ACCEPTED_STEP_LIMIT // REVERSE_SEGMENT_LENGTH} "
         f"segment_length={REVERSE_SEGMENT_LENGTH} "
         f"reference_stage={REFERENCE_STAGE_MODE} trial_stage={TRIAL_STAGE_MODE} "
-        f"parameter_point={'unperturbed_x0' if args.parameter_offset == 0.0 else 'reused_stage_perturbed_x1'} "
+        "parameter_point="
+        f"{('shared_perturbed_baseline_x0' if args.same_perturbed_baseline else ('unperturbed_x0' if args.parameter_offset == 0.0 else 'reused_stage_perturbed_x1'))} "
         f"parameter_index={args.parameter_index} "
         f"parameter_offset={args.parameter_offset:.6e} "
         f"Er_transition_indices=({args.er_transition_left_index},"
         f"{args.er_transition_right_index}) "
-        f"trial_primed_at_x0={args.parameter_offset != 0.0} "
+        "trial_primed_at_x0="
+        f"{args.parameter_offset != 0.0 and not args.same_perturbed_baseline} "
         f"reference_geometry={'original_baseline' if args.parameter_offset == 0.0 else 'fresh_perturbed_baseline'} "
-        "jacobian_coordinates=trial_seed_scaled "
+        "jacobian_coordinates="
+        f"{'shared_perturbed_baseline_scaled' if args.same_perturbed_baseline else 'trial_seed_scaled'} "
         "process_isolation=sequential_workers "
         "transport_reverse=block/explicit_database/reduced_cotangent_call_boundary "
         "database_interpolation_transpose=legacy_sparse",
@@ -627,8 +702,11 @@ def main() -> int:
             flush=True,
         )
 
-    residual_rtol = 1.0e-9 if args.parameter_offset == 0.0 else 2.0e-7
-    residual_atol = 1.0e-10 if args.parameter_offset == 0.0 else 2.0e-8
+    exact_shared_baseline = (
+        args.parameter_offset == 0.0 or args.same_perturbed_baseline
+    )
+    residual_rtol = 1.0e-9 if exact_shared_baseline else 2.0e-7
+    residual_atol = 1.0e-10 if exact_shared_baseline else 2.0e-8
     np.testing.assert_allclose(
         trial_residuals,
         reference_residuals,
