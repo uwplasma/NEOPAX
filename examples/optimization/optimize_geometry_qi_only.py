@@ -39,22 +39,29 @@ SURFACES = np.asarray(
     [1 / 51, 5 / 51, 10 / 51, 15 / 51, 20 / 51, 25 / 51, 30 / 51, 35 / 51, 40 / 51, 45 / 51, 50 / 51],
     dtype=float,
 )
-QI_MBOZ = 18
-QI_NBOZ = 18
+# Physical-J Boozer/action resolution.  These defaults match the coarse action
+# stage used by VMEX main's QI_maxJ_continuation optimization.  For its
+# resolved-action settings use MBOZ=NBOZ=10 together with the alternative
+# values documented below.
+QI_MBOZ = 8
+QI_NBOZ = 8
 
 # Select the J definition used by the active QI/max-J terms below.
 # "surrogate" preserves the established en/local_test objective;
 # "physical" uses resolved actual magnetic wells at fixed physical pitch.
 QI_MAXJ_BACKEND = "physical"  # Change to "surrogate" for the established objective.
 PHYSICAL_J_PITCHES = None  # Optional tuple in T^-1; None selects once at the seed.
-# VMEX physical-J defaults.  These are optimization settings, not plotting-only
-# settings, and can be edited here explicitly.
+# VMEX QI+maximum-J coarse optimization settings.  These are optimization
+# settings, not plotting-only settings, and can be edited here explicitly.
+# VMEX's resolved-action alternative is:
+#   NALPHA=9, POINTS_PER_PERIOD=32, NUM_PERIODS=10,
+#   MAX_WELLS=24, QUADRATURE_ORDER=24, with QI_MBOZ=QI_NBOZ=10 above.
 PHYSICAL_J_TRAPPING_DEPTHS = (0.35, 0.55, 0.75)
-PHYSICAL_J_NALPHA = 17
-PHYSICAL_J_POINTS_PER_PERIOD = 128
-PHYSICAL_J_NUM_PERIODS = 4
-PHYSICAL_J_MAX_WELLS = None
-PHYSICAL_J_QUADRATURE_ORDER = 64
+PHYSICAL_J_NALPHA = 5
+PHYSICAL_J_POINTS_PER_PERIOD = 24
+PHYSICAL_J_NUM_PERIODS = 6
+PHYSICAL_J_MAX_WELLS = 16
+PHYSICAL_J_QUADRATURE_ORDER = 16
 PHYSICAL_MAXJ_TARGET = 0.0
 
 MAX_MODE_SCHEDULE = (1, 2)
@@ -625,6 +632,17 @@ def main() -> int:
             f"J_backend={QI_MAXJ_BACKEND} =====",
             flush=True,
         )
+        if str(QI_MAXJ_BACKEND).strip().lower() == "physical":
+            print(
+                "[setup] physical_J_resolution "
+                f"mboz={QI_MBOZ} nboz={QI_NBOZ} "
+                f"nalpha={PHYSICAL_J_NALPHA} "
+                f"points_per_period={PHYSICAL_J_POINTS_PER_PERIOD} "
+                f"num_periods={PHYSICAL_J_NUM_PERIODS} "
+                f"max_wells={PHYSICAL_J_MAX_WELLS} "
+                f"quadrature_order={PHYSICAL_J_QUADRATURE_ORDER}",
+                flush=True,
+            )
         problem = opt.geometry_least_squares_problem(
             current_input,
             active_terms,
