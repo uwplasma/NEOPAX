@@ -7049,6 +7049,38 @@ def _radau_fixed_lagged_step_reverse_common(
             )(residual_bars)
     else:
         raise ValueError(f"Unknown reverse_rhs_pullback_mode '{rhs_pullback_mode}'.")
+    if (
+        bool(getattr(physics_context, "reverse_segment_input_diagnostics", False))
+        and str(
+            getattr(physics_context, "reverse_stage_adjoint_solve_mode", "")
+        ).strip().lower()
+        == "block"
+    ):
+        support_bad_rows = jnp.zeros((objective_count,), dtype=bool)
+        for support_bar_leaf in support_bar_leaves:
+            support_leaf_rows = jnp.asarray(support_bar_leaf).reshape(
+                (objective_count, -1)
+            )
+            support_bad_rows = support_bad_rows | jnp.any(
+                ~jnp.isfinite(support_leaf_rows), axis=1
+            )
+        residual_rows_finite = jnp.all(
+            jnp.isfinite(jnp.asarray(residual_bars).reshape((objective_count, -1))),
+            axis=1,
+        )
+        support_bad_from_finite_adjoint = support_bad_rows & residual_rows_finite
+        _radau_diagnose_exact_vs_frozen_stage_adjoint_batched(
+            kernel_context,
+            physics_context,
+            carry_in,
+            primal_result,
+            lagged_response,
+            rhs=dz_bars.reshape((objective_count, -1)),
+            exact_solution=residual_bars,
+            force_trigger=jnp.any(support_bad_from_finite_adjoint),
+            forced_objective_row=jnp.argmax(support_bad_from_finite_adjoint),
+            support_output_nonfinite=jnp.any(support_bad_from_finite_adjoint),
+        )
     if collect_native_vmec_coefficients:
         support_bar_leaves = (*support_bar_leaves, *native_vmec_zero_leaves)
     y_bars = trial_y_bars + jnp.asarray(residual_y_bars, dtype=kernel_context.dtype)
@@ -14893,6 +14925,151 @@ def _radau_solve_exact_stage_residual_transpose_block(
     return jnp.linalg.solve(matrix.T, -rhs_arr).reshape((-1,))
 
 
+def _radau_diagnose_exact_vs_frozen_stage_adjoint_batched(
+    kernel_context: _RadauAcceptedStepKernelContext,
+    physics_context: _RadauAcceptedStepPhysicsContext,
+    carry_in: _RadauAcceptedStepCarry,
+    primal_result: _RadauAcceptedStepAttemptResult,
+    lagged_response,
+    *,
+    rhs,
+    exact_solution,
+    force_trigger=False,
+    forced_objective_row=0,
+    support_output_nonfinite=False,
+):
+    """Report the first useful provenance boundary for a bad block adjoint.
+
+    This is reached only through the opt-in segment-input diagnostic. It does
+    not select a different derivative: the frozen-forward solve is evaluated
+    solely as an A/B diagnostic against the established exact block result.
+    """
+
+    rhs_rows = jnp.asarray(rhs, dtype=kernel_context.dtype).reshape(
+        (-1, kernel_context.num_stages * kernel_context.state_dim)
+    )
+    exact_rows = jnp.asarray(exact_solution, dtype=kernel_context.dtype).reshape(
+        rhs_rows.shape
+    )
+    rhs_finite = jnp.all(jnp.isfinite(rhs_rows), axis=1)
+    exact_solution_finite = jnp.all(jnp.isfinite(exact_rows), axis=1)
+    bad_exact_row = rhs_finite & ~exact_solution_finite
+    diagnostic_trigger = jnp.asarray(force_trigger) | jnp.any(bad_exact_row)
+
+    def _print_diagnostic(_):
+        exact_matrix = _radau_exact_stage_residual_matrix(
+            kernel_context,
+            physics_context,
+            carry_in,
+            primal_result,
+            lagged_response,
+        )
+        exact_defect = exact_rows @ exact_matrix + rhs_rows
+        rhs_norm = jnp.linalg.norm(rhs_rows, axis=1)
+        exact_relative_residual = jnp.linalg.norm(
+            exact_defect, axis=1
+        ) / jnp.maximum(
+            rhs_norm, jnp.asarray(1.0e-300, dtype=kernel_context.dtype)
+        )
+
+        eye_s = jnp.eye(kernel_context.num_stages, dtype=kernel_context.dtype)
+        eye_n = jnp.eye(kernel_context.state_dim, dtype=kernel_context.dtype)
+        frozen_jacobian = jnp.asarray(
+            primal_result.jacobian_out, dtype=kernel_context.dtype
+        )
+        frozen_blocks = (
+            eye_s[:, :, None, None] * eye_n[None, None, :, :]
+            - primal_result.trial_dt
+            * kernel_context.a[:, :, None, None]
+            * frozen_jacobian[None, None, :, :]
+        )
+        frozen_matrix = jnp.transpose(frozen_blocks, (0, 2, 1, 3)).reshape(
+            exact_matrix.shape
+        )
+        frozen_rows = jnp.linalg.solve(frozen_matrix.T, -rhs_rows.T).T
+        frozen_defect = frozen_rows @ frozen_matrix + rhs_rows
+        frozen_relative_residual = jnp.linalg.norm(
+            frozen_defect, axis=1
+        ) / jnp.maximum(
+            rhs_norm, jnp.asarray(1.0e-300, dtype=kernel_context.dtype)
+        )
+
+        stage_slopes = jnp.asarray(
+            primal_result.stage_history, dtype=kernel_context.dtype
+        ).reshape((kernel_context.num_stages, kernel_context.state_dim))
+        stage_times, stage_states = _radau_exact_stage_times_states(
+            kernel_context, carry_in, primal_result
+        )
+        stage_rhs = jax.vmap(
+            lambda t_eval, y_eval: _radau_eval_rhs(
+                t_eval,
+                y_eval,
+                lagged_response,
+                physics_context.flat_rhs,
+                physics_context.flat_rhs_with_lagged_response,
+            ),
+            in_axes=(0, 0),
+        )(stage_times, stage_states)
+        stage_residual = (stage_slopes - stage_rhs).reshape((-1,))
+        stage_residual_norm = _radau_residual_norm(kernel_context, stage_residual)
+        first_bad_row = jnp.where(
+            jnp.any(bad_exact_row),
+            jnp.argmax(bad_exact_row),
+            jnp.asarray(forced_objective_row, dtype=jnp.int32),
+        )
+        jax.debug.print(
+            "[database-stage-adjoint-comparison] t={t:.16e} dt={dt:.16e} "
+            "first_bad_objective_row={row} replay_stage_residual_finite={replay_finite} "
+            "replay_stage_residual_norm={replay_norm:.16e} newton_tolerance={newton_tol:.16e} "
+            "support_output_nonfinite={support_nonfinite} rhs_finite={rhs_finite} "
+            "exact_matrix_finite={exact_matrix_finite} "
+            "exact_solution_finite={exact_solution_finite} "
+            "exact_solution_norm={exact_solution_norm:.16e} "
+            "exact_solution_to_rhs_norm={exact_amplification:.16e} "
+            "exact_relative_residual={exact_residual:.16e} "
+            "frozen_matrix_finite={frozen_matrix_finite} "
+            "frozen_solution_finite={frozen_solution_finite} "
+            "frozen_solution_norm={frozen_solution_norm:.16e} "
+            "frozen_solution_to_rhs_norm={frozen_amplification:.16e} "
+            "frozen_relative_residual={frozen_residual:.16e}",
+            t=carry_in.t,
+            dt=primal_result.trial_dt,
+            row=first_bad_row,
+            replay_finite=jnp.all(jnp.isfinite(stage_residual)),
+            replay_norm=stage_residual_norm,
+            newton_tol=kernel_context.newton_convergence_tol,
+            support_nonfinite=jnp.asarray(support_output_nonfinite),
+            rhs_finite=rhs_finite[first_bad_row],
+            exact_matrix_finite=jnp.all(jnp.isfinite(exact_matrix)),
+            exact_solution_finite=exact_solution_finite[first_bad_row],
+            exact_solution_norm=jnp.linalg.norm(exact_rows[first_bad_row]),
+            exact_amplification=jnp.linalg.norm(exact_rows[first_bad_row])
+            / jnp.maximum(
+                rhs_norm[first_bad_row],
+                jnp.asarray(1.0e-300, dtype=kernel_context.dtype),
+            ),
+            exact_residual=exact_relative_residual[first_bad_row],
+            frozen_matrix_finite=jnp.all(jnp.isfinite(frozen_matrix)),
+            frozen_solution_finite=jnp.all(jnp.isfinite(frozen_rows[first_bad_row])),
+            frozen_solution_norm=jnp.linalg.norm(frozen_rows[first_bad_row]),
+            frozen_amplification=jnp.linalg.norm(frozen_rows[first_bad_row])
+            / jnp.maximum(
+                rhs_norm[first_bad_row],
+                jnp.asarray(1.0e-300, dtype=kernel_context.dtype),
+            ),
+            frozen_residual=frozen_relative_residual[first_bad_row],
+            ordered=True,
+        )
+        return jnp.asarray(0, dtype=jnp.int32)
+
+    return jax.lax.cond(
+        diagnostic_trigger,
+        _print_diagnostic,
+        lambda _: jnp.asarray(0, dtype=jnp.int32),
+        operand=None,
+    )
+
+
 def _radau_solve_exact_stage_residual_transpose_block_multi_rhs(
     kernel_context: _RadauAcceptedStepKernelContext,
     physics_context: _RadauAcceptedStepPhysicsContext,
@@ -15522,7 +15699,7 @@ def _radau_solve_exact_stage_residual_transpose_batched(
         "block_frozen_forward_jacobian",
     }:
         raise ValueError(f"Unknown reverse_stage_adjoint_solve_mode '{mode}'.")
-    return jax.vmap(
+    solution = jax.vmap(
         lambda rhs_row: _radau_solve_exact_stage_residual_transpose_block(
             kernel_context,
             physics_context,
@@ -15532,6 +15709,7 @@ def _radau_solve_exact_stage_residual_transpose_batched(
             rhs=rhs_row,
         )
     )(rhs_arr)
+    return solution
 
 
 def _radau_approximate_accepted_step_tangent(
