@@ -42,8 +42,31 @@ SURFACES = np.asarray(
 QI_MBOZ = 18
 QI_NBOZ = 18
 
+# Select the J definition used by the active QI/max-J terms below.
+# "surrogate" preserves the established en/local_test objective;
+# "physical" uses resolved actual magnetic wells at fixed physical pitch.
+QI_MAXJ_BACKEND = "physical"  # Change to "surrogate" for the established objective.
+PHYSICAL_J_PITCHES = None  # Optional tuple in T^-1; None selects once at the seed.
+# VMEX physical-J defaults.  These are optimization settings, not plotting-only
+# settings, and can be edited here explicitly.
+PHYSICAL_J_TRAPPING_DEPTHS = (0.35, 0.55, 0.75)
+PHYSICAL_J_NALPHA = 17
+PHYSICAL_J_POINTS_PER_PERIOD = 128
+PHYSICAL_J_NUM_PERIODS = 4
+PHYSICAL_J_MAX_WELLS = None
+PHYSICAL_J_QUADRATURE_ORDER = 64
+PHYSICAL_MAXJ_TARGET = 0.0
+
 MAX_MODE_SCHEDULE = (1, 2)
-GEOMETRY_FAMILIES = "RBC,ZBS"
+# Boundary degrees of freedom.  ``None`` selects the standard VMEX packed
+# parameters independently at every stage in ``MAX_MODE_SCHEDULE``: all RBC
+# and ZBS harmonics through that max_mode, with the scale direction RBC(0,0)
+# fixed.  To optimize an exact list instead, replace ``None`` with NEOPAX
+# ``FAMILY:m:n`` labels, for example:
+# GEOMETRY_PARAMETERS = ("RBC:0:1", "RBC:1:0", "ZBS:0:1", "ZBS:1:0")
+# An explicit list is reused unchanged at every continuation stage.
+GEOMETRY_PARAMETERS = None
+GEOMETRY_FAMILIES = ("RBC", "ZBS")
 SCALE_MODE = "ess"
 ESS_ALPHA = 1.0
 
@@ -107,6 +130,22 @@ qi_terms = [
     # (iota_shortfall, 0.0, IOTA_WEIGHT),
     (opt.geometry.vmec_iota_mean, IOTA_TARGET, IOTA_WEIGHT),
 ]
+
+
+def qi_maxj_backend_settings(physical_pitches=None):
+    return opt.QImaxJBackendSettings(
+        backend=QI_MAXJ_BACKEND,
+        physical_pitches=(
+            PHYSICAL_J_PITCHES if physical_pitches is None else physical_pitches
+        ),
+        trapping_depths=PHYSICAL_J_TRAPPING_DEPTHS,
+        physical_nalpha=PHYSICAL_J_NALPHA,
+        physical_points_per_period=PHYSICAL_J_POINTS_PER_PERIOD,
+        physical_num_periods=PHYSICAL_J_NUM_PERIODS,
+        physical_max_wells=PHYSICAL_J_MAX_WELLS,
+        physical_quadrature_order=PHYSICAL_J_QUADRATURE_ORDER,
+        physical_maxj_target=PHYSICAL_MAXJ_TARGET,
+    )
 
 
 # --------------------------- reporting / plots ------------------------------
@@ -270,7 +309,64 @@ def save_transport_profiles_for_input(vmec_input, out_dir, label):
     save_bootstrap_current_profile(rho, current, finite_mask, out_dir, label)
 
 
-def plot_j_polar_contours(eq, out_dir, *, lambda_samples=(0.1, 0.3, 0.5, 0.7, 0.9)):
+def plot_physical_j_polar_contours(wout_path, out_dir, *, physical_pitches=None):
+    """Plot the same resolved physical J and Boozer tables as the objective."""
+
+    try:
+        from examples.optimization.plot_j_contours_from_wout import (
+            _physical_j_invariant_from_wout,
+            plot_physical_j_polar_contours as write_physical_j_plots,
+        )
+    except Exception as exc:
+        print(f"skipping physical-J polar plots: {exc}")
+        return
+
+    settings = qi_maxj_backend_settings(physical_pitches)
+    try:
+        out = _physical_j_invariant_from_wout(
+            Path(wout_path),
+            surfaces=tuple(float(value) for value in SURFACES),
+            mboz=QI_MBOZ,
+            nboz=QI_NBOZ,
+            nalpha=settings.physical_nalpha,
+            points_per_period=settings.physical_points_per_period,
+            num_periods=settings.physical_num_periods,
+            trapping_depths=settings.trapping_depths,
+            physical_pitches=(settings.physical_pitches or ()),
+            max_wells=settings.physical_max_wells,
+            quadrature_order=settings.physical_quadrature_order,
+            jit_boozer=True,
+        )
+        print(
+            "[physical J] pitches_T^-1="
+            + ",".join(f"{value:.16g}" for value in out["physical_pitches"]),
+            flush=True,
+        )
+        write_physical_j_plots(out, out_dir)
+    except Exception as exc:
+        print(f"skipping physical-J polar plots: {exc}")
+
+
+def plot_j_polar_contours(
+    eq,
+    out_dir,
+    *,
+    wout_path=None,
+    lambda_samples=(0.1, 0.3, 0.5, 0.7, 0.9),
+    physical_pitches=None,
+):
+    backend = str(QI_MAXJ_BACKEND).strip().lower()
+    if backend == "physical":
+        plot_physical_j_polar_contours(
+            wout_path, out_dir, physical_pitches=physical_pitches
+        )
+        return
+    if backend != "surrogate":
+        print(
+            "skipping J-polar plots: QI_MAXJ_BACKEND must be "
+            "'surrogate' or 'physical'"
+        )
+        return
     try:
         import matplotlib.pyplot as plt
         from vmex.core.omnigenity_j import JInvariantQIResidual
@@ -462,7 +558,7 @@ def plot_boozer_b_contours(wout, out_dir, label, *, ntheta=128, nphi=128):
         print(f"wrote {png_path}")
 
 
-def write_geometry_artifacts(input_obj, label):
+def write_geometry_artifacts(input_obj, label, *, physical_pitches=None):
     artifact_dir = OUT_DIR / label
     artifact_dir.mkdir(parents=True, exist_ok=True)
     input_path = artifact_dir / f"input.QI_neopax_geometry_{label}"
@@ -481,10 +577,15 @@ def write_geometry_artifacts(input_obj, label):
     if MAKE_BOOZER_B_CONTOUR_PLOTS:
         plot_boozer_b_contours(eq.wout, artifact_dir, label)
     if MAKE_J_POLAR_PLOTS:
-        plot_j_polar_contours(eq, artifact_dir)
+        plot_j_polar_contours(
+            eq,
+            artifact_dir,
+            wout_path=wout_path,
+            physical_pitches=physical_pitches,
+        )
 
 
-def write_outputs(optimized_input, initial_input):
+def write_outputs(optimized_input, initial_input, *, physical_pitches=None):
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     seed_copy = OUT_DIR / SEED_INPUT.name
     optimized_input_path = OUT_DIR / "input.QI_neopax_geometry_optimized"
@@ -498,8 +599,12 @@ def write_outputs(optimized_input, initial_input):
             optimized_input_path, OUT_DIR / "optimized", "optimized"
         )
     if MAKE_INITIAL_PLOTS:
-        write_geometry_artifacts(initial_input, "initial")
-    write_geometry_artifacts(optimized_input, "optimized")
+        write_geometry_artifacts(
+            initial_input, "initial", physical_pitches=physical_pitches
+        )
+    write_geometry_artifacts(
+        optimized_input, "optimized", physical_pitches=physical_pitches
+    )
 
 
 # --------------------------- continuation ladder ----------------------------
@@ -512,14 +617,19 @@ def main() -> int:
     initial_input = None
     last_problem = None
     last_result = None
+    frozen_physical_pitches = PHYSICAL_J_PITCHES
 
     for max_mode in MAX_MODE_SCHEDULE:
-        print(f"\n===== NEOPAX geometry-only QI stage, max_mode={max_mode} =====", flush=True)
+        print(
+            f"\n===== NEOPAX geometry-only QI stage, max_mode={max_mode}, "
+            f"J_backend={QI_MAXJ_BACKEND} =====",
+            flush=True,
+        )
         problem = opt.geometry_least_squares_problem(
             current_input,
             active_terms,
             max_mode=max_mode,
-            parameters=None,
+            parameters=GEOMETRY_PARAMETERS,
             families=GEOMETRY_FAMILIES,
             scale_mode=SCALE_MODE,
             ess_alpha=ESS_ALPHA,
@@ -528,7 +638,20 @@ def main() -> int:
             surfaces=tuple(float(s) for s in SURFACES),
             max_iter=GEOMETRY_MAX_ITER,
             solver_device=SOLVER_DEVICE,
+            qi_maxj_settings=qi_maxj_backend_settings(frozen_physical_pitches),
         )
+        if (
+            str(QI_MAXJ_BACKEND).strip().lower() == "physical"
+            and frozen_physical_pitches is None
+        ):
+            frozen_physical_pitches = tuple(
+                float(value) for value in problem.context.qi_maxj_physical_pitches
+            )
+            print(
+                "[setup] frozen_physical_J_pitches_T^-1="
+                + ",".join(f"{value:.16g}" for value in frozen_physical_pitches),
+                flush=True,
+            )
         problem = opt.GeometryInputSavingProblem(
             problem, OUT_DIR / f"geometry_inputs_m{max_mode}"
         )
@@ -567,6 +690,21 @@ def main() -> int:
         "surfaces": [float(s) for s in SURFACES],
         "mboz": int(QI_MBOZ),
         "nboz": int(QI_NBOZ),
+        "qi_maxj_backend": QI_MAXJ_BACKEND,
+        "physical_j_pitches_T_inverse": (
+            None
+            if frozen_physical_pitches is None
+            else list(frozen_physical_pitches)
+        ),
+        "physical_j_trapping_depths": list(PHYSICAL_J_TRAPPING_DEPTHS),
+        "physical_j_resolution": {
+            "nalpha": int(PHYSICAL_J_NALPHA),
+            "points_per_period": int(PHYSICAL_J_POINTS_PER_PERIOD),
+            "num_periods": int(PHYSICAL_J_NUM_PERIODS),
+            "max_wells": PHYSICAL_J_MAX_WELLS,
+            "quadrature_order": int(PHYSICAL_J_QUADRATURE_ORDER),
+        },
+        "physical_maxj_target": float(PHYSICAL_MAXJ_TARGET),
         "transport_profile_backend": TRANSPORT_PROFILE_BACKEND,
         "transport_profile_config": str(
             DATABASE_TRANSPORT_CONFIG
@@ -583,7 +721,11 @@ def main() -> int:
     summary_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
     print(f"wrote {summary_path}")
     if optimized_input is not None and initial_input is not None:
-        write_outputs(optimized_input, initial_input)
+        write_outputs(
+            optimized_input,
+            initial_input,
+            physical_pitches=frozen_physical_pitches,
+        )
     return 0
 
 

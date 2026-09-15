@@ -17,6 +17,7 @@ import jax.numpy as jnp
 import numpy as np
 
 from ._geometry_autodiff import (
+    QImaxJBackendSettings,
     _booz_constants_and_grids_for_inputs,
     _booz_xform_inputs_from_state,
     _boozer_surface_indices_and_rho,
@@ -31,6 +32,8 @@ from ._geometry_autodiff import (
     geometry_raw_block_stage,
     geometry_raw_block_solve_from_param_vector,
     geometry_raw_block_transpose_optimization_stage,
+    freeze_physical_qi_maxj_pitches,
+    normalize_qi_maxj_backend_settings,
 )
 from ._constants import elementary_charge
 from ._orchestrator import build_runtime_context
@@ -99,6 +102,14 @@ from ._reverse_ad_transport import (
 )
 from ._transport_flux_models import DENSITY_STATE_TO_PHYSICAL
 from .api import prepare_config
+
+
+def _resolve_qi_maxj_settings(
+    explicit: QImaxJBackendSettings | Mapping[str, object] | str | None,
+) -> QImaxJBackendSettings:
+    """Resolve only an explicit optimization-script/API backend selection."""
+
+    return normalize_qi_maxj_backend_settings(explicit)
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -1328,6 +1339,7 @@ def geometry_least_squares_problem(
     max_iter: int | None = None,
     step_size: float | None = None,
     solver_device: str | None = "default",
+    qi_maxj_settings: QImaxJBackendSettings | Mapping[str, object] | str | None = None,
 ) -> GeometryLeastSquaresProblem:
     """Build a VMEX-style geometry least-squares problem.
 
@@ -1335,6 +1347,7 @@ def geometry_least_squares_problem(
     ``parameters`` such as ``"RBC:1:0,ZBS:1:0"`` for diagnostic runs.
     """
 
+    qi_maxj_settings_eff = _resolve_qi_maxj_settings(qi_maxj_settings)
     context = build_geometry_autodiff_context(
         vmec_input,
         param_family="RBC",
@@ -1343,6 +1356,7 @@ def geometry_least_squares_problem(
         mboz=int(mboz),
         nboz=int(nboz),
         surface_s=tuple(float(s) for s in surfaces),
+        qi_maxj_settings=qi_maxj_settings_eff,
     )
     if parameters is not None:
         specs = parse_vmec_boundary_parameter_specs(
@@ -1363,6 +1377,12 @@ def geometry_least_squares_problem(
             scale_mode=scale_mode,
             ess_alpha=float(ess_alpha),
         )
+    context = freeze_physical_qi_maxj_pitches(
+        context,
+        tuple(spec.as_tuple() for spec in parameterization.specs),
+        max_iter=max_iter,
+        solver_device=solver_device,
+    )
     normalized_terms = _normalize_geometry_least_squares_terms(terms)
     return GeometryLeastSquaresProblem(
         context=context,
@@ -1540,6 +1560,7 @@ def geometry_initial_er_root_only_least_squares_problem(
     device: str | None = "default",
     root_options: Mapping[str, object] | None = None,
     reverse_stage_mode: str = "off",
+    qi_maxj_settings: QImaxJBackendSettings | Mapping[str, object] | str | None = None,
 ) -> GeometryInitialErRootLeastSquaresProblem:
     """Build an optimizer problem for geometry terms plus initial-Er root terms.
 
@@ -1591,6 +1612,7 @@ def geometry_initial_er_root_only_least_squares_problem(
     }
     config_eff = _prepare_initial_er_root_config(config, device=device, vmec_input=vmec_input)
     geom_cfg = config_eff.get("geometry", {})
+    qi_maxj_settings_eff = _resolve_qi_maxj_settings(qi_maxj_settings)
     neoclassical_cfg = config_eff.get("neoclassical", {})
     flux_model = str(neoclassical_cfg.get("flux_model", "")).strip().lower()
     if mode in {"database", *database_root_modes} and flux_model != "ntx_scan_runtime":
@@ -1617,6 +1639,7 @@ def geometry_initial_er_root_only_least_squares_problem(
         mboz=int(mboz),
         nboz=int(nboz),
         surface_s=tuple(float(s) for s in surfaces),
+        qi_maxj_settings=qi_maxj_settings_eff,
     )
     if parameters is not None:
         specs = parse_vmec_boundary_parameter_specs(
@@ -1663,6 +1686,14 @@ def geometry_initial_er_root_only_least_squares_problem(
         geometry_max_iter = geom_cfg.get("vmec_max_iter")
     if geometry_solver_device is None:
         geometry_solver_device = geom_cfg.get("vmec_implicit_solver_device", "default")
+    context = freeze_physical_qi_maxj_pitches(
+        context,
+        () if geometry_parameterization is None else tuple(
+            spec.as_tuple() for spec in geometry_parameterization.specs
+        ),
+        max_iter=geometry_max_iter,
+        solver_device=geometry_solver_device,
+    )
     normalized_terms = _normalize_initial_er_root_least_squares_terms(terms)
     raw_block_transpose_stage = None
     raw_block_stage = (
@@ -2210,6 +2241,7 @@ def geometry_full_transport_least_squares_problem(
     reverse_stage_adjoint_woodbury_rank: int = 24,
     max_reverse_accepted_steps: int | None = None,
     reverse_stage_mode: str = "benchmark",
+    qi_maxj_settings: QImaxJBackendSettings | Mapping[str, object] | str | None = None,
 ) -> GeometryFullTransportLeastSquaresProblem:
     """Build a geometry-only optimizer problem for full Radau transport objectives.
 
@@ -2225,6 +2257,7 @@ def geometry_full_transport_least_squares_problem(
     if vmec_input is not None:
         config_eff.setdefault("geometry", {})["vmec_input_file"] = str(vmec_input)
     geom_cfg = config_eff.get("geometry", {})
+    qi_maxj_settings_eff = _resolve_qi_maxj_settings(qi_maxj_settings)
     neoclassical_cfg = config_eff.get("neoclassical", {})
     vmec_input_eff = geom_cfg.get("vmec_input_file")
     if vmec_input_eff is None:
@@ -2237,6 +2270,7 @@ def geometry_full_transport_least_squares_problem(
         mboz=int(mboz),
         nboz=int(nboz),
         surface_s=tuple(float(s) for s in surfaces),
+        qi_maxj_settings=qi_maxj_settings_eff,
     )
     if parameters is not None:
         specs = parse_vmec_boundary_parameter_specs(
@@ -2302,6 +2336,12 @@ def geometry_full_transport_least_squares_problem(
         geometry_max_iter = geom_cfg.get("vmec_max_iter")
     if geometry_solver_device is None:
         geometry_solver_device = geom_cfg.get("vmec_implicit_solver_device", "default")
+    context = freeze_physical_qi_maxj_pitches(
+        context,
+        tuple(spec.as_tuple() for spec in parameterization.specs),
+        max_iter=geometry_max_iter,
+        solver_device=geometry_solver_device,
+    )
     stage_mode = str(reverse_stage_mode).strip().lower()
     database_full_transport_modes = {
         "database_full_transport_optimization",
@@ -2814,6 +2854,7 @@ def least_squares(problem: GeometryLeastSquaresProblem, **kwargs):
 
 
 __all__ = [
+    "QImaxJBackendSettings",
     "GeometryLeastSquaresTerm",
     "GeometryObjectiveTransform",
     "GeometryInitialErRootLeastSquaresProblem",

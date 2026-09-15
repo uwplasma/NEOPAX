@@ -1639,3 +1639,78 @@ def test_database_full_transport_replay_skips_template_database_rescaling(monkey
     assert result.density_equation.name == "density"
     assert result.temperature_equation.name == "temperature"
     assert result.er_equation.name == "Er"
+
+
+def test_physical_qi_maxj_adapter_uses_frozen_pitch_and_actual_well_functions(monkeypatch):
+    calls = {}
+
+    class _QI:
+        @staticmethod
+        def j_invariant_qi_residual_from_boozer(**kwargs):
+            calls["qi"] = kwargs
+            return {"total": jnp.asarray(2.5)}
+
+    class _MaxJ:
+        @staticmethod
+        def maximum_j_residual_from_boozer(**kwargs):
+            calls["maxj"] = kwargs
+            return {"total": jnp.asarray(3.5)}
+
+    monkeypatch.setattr(
+        geometry_ad,
+        "_import_vmec_module",
+        lambda name: _QI if name == "core.qi" else _MaxJ,
+    )
+    settings = geometry_ad.QImaxJBackendSettings(
+        backend="physical",
+        physical_pitches=(0.51, 0.73),
+        physical_nalpha=7,
+        physical_points_per_period=24,
+        physical_num_periods=3,
+        physical_max_wells=8,
+        physical_quadrature_order=16,
+        physical_maxj_target=-0.02,
+    )
+    context = SimpleNamespace(
+        qi_maxj_settings=settings,
+        qi_maxj_physical_pitches=settings.physical_pitches,
+        cfg=SimpleNamespace(nfp=2),
+        static=SimpleNamespace(s=jnp.asarray([0.0, 0.2, 0.6, 1.0])),
+        surface_indices=jnp.asarray([0, 1]),
+    )
+    booz = {
+        "bmnc_b": jnp.asarray([[1.0, 0.1], [1.1, 0.2]]),
+        "ixm_b": jnp.asarray([0, 1]),
+        "ixn_b": jnp.asarray([0, 0]),
+        "iota_b": jnp.asarray([0.4, 0.5]),
+        "bvco_b": jnp.asarray([3.0, 3.1]),
+        "buco_b": jnp.asarray([0.2, 0.3]),
+    }
+
+    result = geometry_ad._vmec_j_invariant_qi_maxj_objectives_from_boozer(
+        context, booz, include_qi=True, include_maxj=True
+    )
+
+    assert float(result["qi_objective"]) == 2.5
+    assert float(result["maxj_objective"]) == 3.5
+    assert jnp.allclose(calls["qi"]["pitch"], jnp.asarray([0.51, 0.73]))
+    assert jnp.allclose(calls["maxj"]["pitch"], jnp.asarray([0.51, 0.73]))
+    assert calls["maxj"]["target"] == -0.02
+    assert calls["maxj"]["nalpha"] == 7
+    assert jnp.allclose(calls["maxj"]["psi_b"], jnp.asarray([0.1, 0.4]))
+    assert calls["maxj"]["psi_edge"] == 1.0
+
+
+def test_qi_maxj_backend_settings_preserve_surrogate_default_and_aliases():
+    assert geometry_ad.normalize_qi_maxj_backend_settings().backend == "surrogate"
+    assert geometry_ad.normalize_qi_maxj_backend_settings("old").backend == "surrogate"
+    assert geometry_ad.normalize_qi_maxj_backend_settings("new").backend == "physical"
+    configured = geometry_ad.normalize_qi_maxj_backend_settings(
+        {"backend": "physical", "physical_pitches": [0.5, 0.75]}
+    )
+    assert configured.physical_pitches == (0.5, 0.75)
+    explicit = optimization._resolve_qi_maxj_settings(
+        {"backend": "physical", "trapping_depths": [0.25, 0.8]},
+    )
+    assert explicit.backend == "physical"
+    assert explicit.trapping_depths == (0.25, 0.8)

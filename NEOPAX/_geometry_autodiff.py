@@ -16,6 +16,85 @@ import interpax
 import numpy as np
 
 
+@dataclasses.dataclass(frozen=True, slots=True)
+class QImaxJBackendSettings:
+    """Static selection and resolution for the QI/maximum-J objectives.
+
+    ``surrogate`` preserves the established ``VMEX en/local_test`` objective.
+    ``physical`` uses the resolved fixed-pitch, actual-well action from the
+    additive VMEX physical-J modules.  Physical pitches can be supplied
+    directly; otherwise they are selected once from the baseline equilibrium
+    using ``trapping_depths`` and then frozen for the optimization stage.
+    """
+
+    backend: str = "surrogate"
+    physical_pitches: tuple[float, ...] | None = None
+    trapping_depths: tuple[float, ...] = (0.35, 0.55, 0.75)
+    physical_nalpha: int = 17
+    physical_points_per_period: int = 128
+    physical_num_periods: int = 4
+    physical_max_wells: int | None = None
+    physical_quadrature_order: int = 64
+    physical_maxj_target: float = 0.0
+
+
+def normalize_qi_maxj_backend_settings(
+    settings: QImaxJBackendSettings | Mapping[str, Any] | str | None = None,
+) -> QImaxJBackendSettings:
+    """Normalize one QI/maximum-J backend selection without executing it."""
+
+    if settings is None:
+        resolved = QImaxJBackendSettings()
+    elif isinstance(settings, QImaxJBackendSettings):
+        resolved = settings
+    elif isinstance(settings, str):
+        resolved = QImaxJBackendSettings(backend=settings)
+    elif isinstance(settings, Mapping):
+        values = dict(settings)
+        for name in ("physical_pitches", "trapping_depths"):
+            if values.get(name) is not None:
+                values[name] = tuple(float(value) for value in values[name])
+        resolved = QImaxJBackendSettings(**values)
+    else:
+        raise TypeError(
+            "qi_maxj_settings must be a backend string, mapping, "
+            "QImaxJBackendSettings, or None."
+        )
+
+    aliases = {"old": "surrogate", "new": "physical", "resolved": "physical"}
+    backend = aliases.get(str(resolved.backend).strip().lower(), str(resolved.backend).strip().lower())
+    if backend not in {"surrogate", "physical"}:
+        raise ValueError("QI/max-J backend must be 'surrogate' or 'physical'.")
+    if backend != resolved.backend:
+        resolved = dataclasses.replace(resolved, backend=backend)
+
+    positive = (
+        resolved.physical_nalpha,
+        resolved.physical_points_per_period,
+        resolved.physical_num_periods,
+        resolved.physical_quadrature_order,
+    )
+    if any(int(value) <= 0 for value in positive):
+        raise ValueError("Physical-J sampling resolutions must be positive.")
+    if resolved.physical_nalpha < 2:
+        raise ValueError("physical_nalpha must be at least 2.")
+    if resolved.physical_max_wells is not None and int(resolved.physical_max_wells) <= 0:
+        raise ValueError("physical_max_wells must be positive or None.")
+    if not np.isfinite(resolved.physical_maxj_target):
+        raise ValueError("physical_maxj_target must be finite.")
+    if not resolved.trapping_depths or any(
+        not np.isfinite(value) or value <= 0.0 or value >= 1.0
+        for value in resolved.trapping_depths
+    ):
+        raise ValueError("trapping_depths must lie strictly between zero and one.")
+    if resolved.physical_pitches is not None and (
+        not resolved.physical_pitches
+        or any(not np.isfinite(value) or value <= 0.0 for value in resolved.physical_pitches)
+    ):
+        raise ValueError("physical_pitches must contain positive finite inverse-tesla values.")
+    return resolved
+
+
 def _repo_root() -> Path:
     return Path(__file__).resolve().parents[2]
 
@@ -1353,6 +1432,8 @@ class GeometryAutodiffContext:
     pressure: jnp.ndarray
     surface_s: tuple[float, ...]
     surface_indices: jnp.ndarray
+    qi_maxj_settings: QImaxJBackendSettings
+    qi_maxj_physical_pitches: tuple[float, ...]
     mboz: int
     nboz: int
     booz_constants: Any
@@ -1473,7 +1554,9 @@ def build_geometry_autodiff_context(
     mboz: int | None = None,
     nboz: int | None = None,
     surface_s: Sequence[float] = (0.25, 0.5, 0.75),
+    qi_maxj_settings: QImaxJBackendSettings | Mapping[str, Any] | str | None = None,
 ) -> GeometryAutodiffContext:
+    backend_settings = normalize_qi_maxj_backend_settings(qi_maxj_settings)
     vmec_backend = _import_vmec_jax()
     booz_api = _import_booz_xform_jax_api()
 
@@ -1558,6 +1641,12 @@ def build_geometry_autodiff_context(
         pressure=jnp.asarray(fixed_context["pressure"]),
         surface_s=tuple(float(val) for val in surface_s),
         surface_indices=jnp.asarray(surface_indices, dtype=jnp.int32),
+        qi_maxj_settings=backend_settings,
+        qi_maxj_physical_pitches=(
+            ()
+            if backend_settings.physical_pitches is None
+            else tuple(float(value) for value in backend_settings.physical_pitches)
+        ),
         mboz=resolved_mboz,
         nboz=resolved_nboz,
         booz_constants=booz_constants,
@@ -2378,6 +2467,69 @@ def _vmec_j_invariant_qi_maxj_objectives_from_state(
     )
 
 
+def _physical_qi_maxj_pitches_from_boozer(
+    context: GeometryAutodiffContext,
+    booz,
+) -> jnp.ndarray:
+    """Select physical pitches common to every sampled surface and field line."""
+
+    settings = context.qi_maxj_settings
+    maxj = _import_vmec_module("core.maxj")
+    bmnc_b = jnp.asarray(booz["bmnc_b"], dtype=jnp.float64)
+    xm_b = jnp.asarray(booz["ixm_b"], dtype=jnp.float64)
+    xn_b = jnp.asarray(booz["ixn_b"], dtype=jnp.float64)
+    iota_b = jnp.asarray(booz["iota_b"], dtype=jnp.float64)
+    bmns_b = jnp.asarray(
+        booz.get("bmns_b", jnp.zeros_like(bmnc_b)), dtype=jnp.float64
+    )
+    nalpha = int(settings.physical_nalpha)
+    points_per_period = int(settings.physical_points_per_period)
+    num_periods = int(settings.physical_num_periods)
+    alpha = 2.0 * jnp.pi * jnp.arange(nalpha, dtype=bmnc_b.dtype) / nalpha
+    phi = (
+        2.0
+        * jnp.pi
+        * jnp.arange(points_per_period * num_periods, dtype=bmnc_b.dtype)
+        / (int(context.cfg.nfp) * points_per_period)
+    )
+    theta = alpha[None, :, None] + iota_b[:, None, None] * phi[None, None, :]
+    phase = theta[..., None] * xm_b - phi[None, None, :, None] * xn_b
+    bmag = (
+        jnp.einsum("sapm,sm->sap", jnp.cos(phase), bmnc_b)
+        + jnp.einsum("sapm,sm->sap", jnp.sin(phase), bmns_b)
+    )
+    pitches = maxj.common_trapped_pitches(
+        jnp.swapaxes(bmag, 1, 2), settings.trapping_depths
+    )
+    return jax.lax.stop_gradient(jnp.asarray(pitches, dtype=jnp.float64))
+
+
+def freeze_physical_qi_maxj_pitches(
+    context: GeometryAutodiffContext,
+    param_specs: Sequence[tuple[str, int, int]],
+    *,
+    max_iter: int | None = None,
+    solver_device: str | None = None,
+) -> GeometryAutodiffContext:
+    """Select physical pitches once at the baseline and retain them in context."""
+
+    if context.qi_maxj_settings.backend != "physical" or context.qi_maxj_physical_pitches:
+        return context
+    specs = tuple(param_specs) or ((context.param_family, context.param_m, context.param_n),)
+    baseline = geometry_raw_block_solve_from_param_vector(
+        context,
+        jnp.zeros((len(specs),), dtype=jnp.float64),
+        specs,
+        max_iter=max_iter,
+        solver_device=solver_device,
+    )
+    pitches = _physical_qi_maxj_pitches_from_boozer(
+        context, _boozer_output_from_state(context, baseline.state)
+    )
+    frozen = tuple(float(value) for value in np.asarray(jax.device_get(pitches)))
+    return dataclasses.replace(context, qi_maxj_physical_pitches=frozen)
+
+
 def _vmec_j_invariant_qi_maxj_objectives_from_boozer(
     context: GeometryAutodiffContext,
     booz,
@@ -2385,15 +2537,67 @@ def _vmec_j_invariant_qi_maxj_objectives_from_boozer(
     include_qi: bool,
     include_maxj: bool,
 ) -> dict[str, jnp.ndarray]:
-    """Keep the existing Boozer path and only swap the QI/max-J post-processing."""
+    """Evaluate the selected J backend from the existing Boozer transform."""
+
+    settings = context.qi_maxj_settings
+    if settings.backend == "physical":
+        if not context.qi_maxj_physical_pitches:
+            raise RuntimeError(
+                "Physical QI/max-J pitches were not frozen. Build the optimization "
+                "problem through a NEOPAX geometry problem builder, or provide "
+                "qi_maxj_settings with physical_pitches explicitly."
+            )
+        qi = _import_vmec_module("core.qi")
+        maxj = _import_vmec_module("core.maxj")
+        pitches = jnp.asarray(context.qi_maxj_physical_pitches, dtype=jnp.float64)
+        common = dict(
+            bmnc_b=booz["bmnc_b"],
+            xm_b=booz["ixm_b"],
+            xn_b=booz["ixn_b"],
+            iota_b=booz["iota_b"],
+            G_b=booz["bvco_b"],
+            I_b=booz["buco_b"],
+            nfp=int(context.cfg.nfp),
+            pitch=pitches,
+            nalpha=int(settings.physical_nalpha),
+            points_per_period=int(settings.physical_points_per_period),
+            num_periods=int(settings.physical_num_periods),
+            max_wells=settings.physical_max_wells,
+            quadrature_order=int(settings.physical_quadrature_order),
+        )
+        if "bmns_b" in booz:
+            common["bmns_b"] = booz["bmns_b"]
+        qi_total = (
+            qi.j_invariant_qi_residual_from_boozer(**common)["total"]
+            if include_qi
+            else jnp.asarray(0.0, dtype=jnp.float64)
+        )
+        surface_indices = np.asarray(context.surface_indices, dtype=np.int32).reshape(-1)
+        s_half = 0.5 * (
+            np.asarray(context.static.s[:-1], dtype=float)
+            + np.asarray(context.static.s[1:], dtype=float)
+        )
+        maxj_total = (
+            maxj.maximum_j_residual_from_boozer(
+                **common,
+                psi_b=jnp.asarray(s_half[surface_indices], dtype=jnp.float64),
+                psi_edge=jnp.asarray(1.0, dtype=jnp.float64),
+                target=float(settings.physical_maxj_target),
+            )["total"]
+            if include_maxj
+            else jnp.asarray(0.0, dtype=jnp.float64)
+        )
+        return {
+            "qi_objective": jnp.asarray(qi_total, dtype=jnp.float64),
+            "maxj_objective": jnp.asarray(maxj_total, dtype=jnp.float64),
+        }
 
     vmec_backend = _import_vmec_jax()
     helper = getattr(vmec_backend, "j_invariant_qi_maxj_residual_from_boozer", None)
     if helper is None:
         raise AttributeError(
-            "The active VMEC backend does not expose j_invariant_qi_maxj_residual_from_boozer. "
-            "This benchmark path is intentionally restricted to the existing Boozer output plus "
-            "the VMEX J-based QI/max-J post-processing."
+            "The active VMEX backend does not expose the established "
+            "j_invariant_qi_maxj_residual_from_boozer surrogate."
         )
 
     gi_b = jnp.asarray(booz["bvco_b"], dtype=jnp.float64) + (

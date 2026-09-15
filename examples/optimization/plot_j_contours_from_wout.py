@@ -53,6 +53,10 @@ def _boozer_tables_from_wout(wout_path: Path, *, surfaces, mboz: int, nboz: int,
     xm_b = np.asarray(bx.xm_b, dtype=float)
     if bmnc_b.shape[0] == xm_b.shape[0]:
         bmnc_b = bmnc_b.T
+    bmns_raw = getattr(bx, "bmns_b", None)
+    bmns_b = None if bmns_raw is None else np.asarray(bmns_raw, dtype=float)
+    if bmns_b is not None and bmns_b.shape[0] == xm_b.shape[0]:
+        bmns_b = bmns_b.T
 
     iota_b = np.asarray(bx.iota, dtype=float)[indices]
     boozer_i = np.asarray(bx.Boozer_I, dtype=float)
@@ -61,12 +65,88 @@ def _boozer_tables_from_wout(wout_path: Path, *, surfaces, mboz: int, nboz: int,
 
     return {
         "bmnc_b": bmnc_b,
+        "bmns_b": bmns_b,
         "xm_b": xm_b,
         "xn_b": np.asarray(bx.xn_b, dtype=float),
         "iota_b": iota_b,
         "gi_b": gi_b,
+        "G_b": boozer_g,
+        "I_b": boozer_i,
         "s_b": s_in[indices],
         "nfp": int(bx.nfp),
+    }
+
+
+def _physical_j_invariant_from_wout(
+    wout_path: Path,
+    *,
+    surfaces,
+    mboz: int,
+    nboz: int,
+    nalpha: int,
+    points_per_period: int,
+    num_periods: int,
+    trapping_depths,
+    physical_pitches,
+    max_wells: int | None,
+    quadrature_order: int,
+    jit_boozer: bool,
+):
+    """Return resolved actual-well J at fixed physical pitches."""
+
+    from vmex.core import maxj
+    from vmex.core.bounce import bounce_action_from_boozer, trace_boozer_field_lines
+
+    booz = _boozer_tables_from_wout(
+        wout_path,
+        surfaces=surfaces,
+        mboz=mboz,
+        nboz=nboz,
+        jit_boozer=jit_boozer,
+    )
+    dtype = np.asarray(booz["bmnc_b"]).dtype
+    alpha = np.arange(int(nalpha), dtype=dtype) * (2.0 * np.pi / int(nalpha))
+    trace_args = dict(
+        bmnc_b=booz["bmnc_b"],
+        xm_b=booz["xm_b"],
+        xn_b=booz["xn_b"],
+        iota_b=booz["iota_b"],
+        G_b=booz["G_b"],
+        I_b=booz["I_b"],
+        nfp=booz["nfp"],
+        alpha=alpha,
+        points_per_period=int(points_per_period),
+        num_periods=int(num_periods),
+    )
+    if booz["bmns_b"] is not None:
+        trace_args["bmns_b"] = booz["bmns_b"]
+    if physical_pitches:
+        pitches = np.asarray(physical_pitches, dtype=float)
+    else:
+        trace = trace_boozer_field_lines(**trace_args)
+        pitches = np.asarray(
+            maxj.common_trapped_pitches(
+                np.swapaxes(np.asarray(jax.device_get(trace["bmag"])), 1, 2),
+                trapping_depths,
+            ),
+            dtype=float,
+        )
+    bounce = bounce_action_from_boozer(
+        **trace_args,
+        pitch=pitches,
+        max_wells=max_wells,
+        quadrature_order=int(quadrature_order),
+    )
+    action = np.asarray(jax.device_get(bounce["action"]), dtype=float)
+    usable = np.asarray(jax.device_get(bounce["usable_mask"]), dtype=bool)
+    count = np.sum(usable, axis=-1)
+    action_mean = np.sum(np.where(usable, action, 0.0), axis=-1) / np.maximum(count, 1)
+    action_mean = np.where(count > 0, action_mean, np.nan)
+    return {
+        "alpha": alpha,
+        "surfaces": booz["s_b"],
+        "ji": action_mean,
+        "physical_pitches": pitches,
     }
 
 
@@ -166,12 +246,65 @@ def plot_j_polar_contours(out, out_dir: Path, *, p_lambda: float, lambda_samples
     return written
 
 
+def plot_physical_j_polar_contours(out, out_dir: Path):
+    """Plot resolved physical J; the last data axis is inverse-tesla pitch."""
+
+    import matplotlib.pyplot as plt
+
+    alpha = np.asarray(out["alpha"], dtype=float)
+    surfaces = np.asarray(out["surfaces"], dtype=float)
+    action = np.asarray(out["ji"], dtype=float)
+    pitches = np.asarray(out["physical_pitches"], dtype=float)
+    if surfaces.size < 2:
+        raise ValueError(
+            "Physical-J polar contours require at least two --surfaces values."
+        )
+    theta = np.concatenate([alpha, alpha[:1] + 2.0 * np.pi])
+    theta_grid, radius_grid = np.meshgrid(theta, surfaces, indexing="xy")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    written = []
+    for pitch_index, pitch in enumerate(pitches):
+        values = action[:, :, pitch_index]
+        values_periodic = np.concatenate([values, values[:, :1]], axis=1)
+        fig = plt.figure(figsize=(5.4, 5.8))
+        ax_polar = fig.add_subplot(1, 1, 1, projection="polar")
+        contour = ax_polar.contourf(
+            theta_grid, radius_grid, values_periodic, levels=40, cmap="viridis"
+        )
+        ax_polar.set_title(r"Resolved second adiabatic invariant, $J$", fontsize=15, pad=20)
+        ax_polar.set_ylim(0.0, float(surfaces.max()))
+        ax_polar.grid(color="white", linewidth=0.8, alpha=0.45)
+        colorbar = fig.colorbar(contour, ax=ax_polar, pad=0.12, shrink=0.78)
+        colorbar.set_label(r"$J$", fontsize=11)
+        fig.text(
+            0.5,
+            0.035,
+            rf"physical pitch $\lambda$ = {pitch:.8g} $\mathrm{{T}}^{{-1}}$",
+            ha="center",
+            fontsize=13,
+        )
+        fig.tight_layout(rect=(0.0, 0.06, 1.0, 1.0))
+        path = out_dir / f"physical_ji_polar_pitch_{pitch_index:02d}.png"
+        fig.savefig(path, dpi=320, bbox_inches="tight")
+        plt.close(fig)
+        written.append(path)
+        print(f"wrote {path}")
+    return written
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("wout", type=Path, help="Path to wout_*.nc.")
     parser.add_argument("--out-dir", type=Path, default=None, help="Output directory for PNGs.")
     parser.add_argument("--surfaces", default=",".join(f"{value:.16g}" for value in DEFAULT_SURFACES))
     parser.add_argument("--lambda-samples", default=",".join(str(value) for value in DEFAULT_LAMBDA_SAMPLES))
+    parser.add_argument("--j-backend", choices=("surrogate", "physical"), default="surrogate")
+    parser.add_argument("--physical-pitches", default="", help="Comma-separated fixed pitches in inverse tesla.")
+    parser.add_argument("--trapping-depths", default="0.35,0.55,0.75")
+    parser.add_argument("--points-per-period", type=int, default=128)
+    parser.add_argument("--num-periods", type=int, default=4)
+    parser.add_argument("--max-wells", type=int, default=None)
+    parser.add_argument("--quadrature-order", type=int, default=64)
     parser.add_argument("--mboz", type=int, default=18)
     parser.add_argument("--nboz", type=int, default=18)
     parser.add_argument("--nphi", type=int, default=101)
@@ -193,8 +326,31 @@ def main() -> int:
     lambda_samples = _parse_float_list(args.lambda_samples)
     print(
         "[j-contours-from-wout] "
-        f"wout={wout_path} out_dir={out_dir} surfaces={','.join(f'{s:.3g}' for s in surfaces)}"
+        f"backend={args.j_backend} wout={wout_path} out_dir={out_dir} "
+        f"surfaces={','.join(f'{s:.3g}' for s in surfaces)}"
     )
+
+    if args.j_backend == "physical":
+        out = _physical_j_invariant_from_wout(
+            wout_path,
+            surfaces=surfaces,
+            mboz=args.mboz,
+            nboz=args.nboz,
+            nalpha=args.nalpha,
+            points_per_period=args.points_per_period,
+            num_periods=args.num_periods,
+            trapping_depths=_parse_float_list(args.trapping_depths),
+            physical_pitches=_parse_float_list(args.physical_pitches),
+            max_wells=args.max_wells,
+            quadrature_order=args.quadrature_order,
+            jit_boozer=args.jit_boozer,
+        )
+        print(
+            "[j-contours-from-wout] physical_pitches_T^-1="
+            + ",".join(f"{value:.16g}" for value in out["physical_pitches"])
+        )
+        plot_physical_j_polar_contours(out, out_dir)
+        return 0
 
     out = _j_invariant_from_wout(
         wout_path,
