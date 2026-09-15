@@ -74,6 +74,7 @@ def _boozer_tables_from_wout(wout_path: Path, *, surfaces, mboz: int, nboz: int,
         "I_b": boozer_i,
         "s_b": s_in[indices],
         "nfp": int(bx.nfp),
+        "r_major": float(wout.Rmajor_p),
     }
 
 
@@ -147,6 +148,7 @@ def _physical_j_invariant_from_wout(
         "surfaces": booz["s_b"],
         "ji": action_mean,
         "physical_pitches": pitches,
+        "r_major": booz["r_major"],
     }
 
 
@@ -247,7 +249,7 @@ def plot_j_polar_contours(out, out_dir: Path, *, p_lambda: float, lambda_samples
 
 
 def plot_physical_j_polar_contours(out, out_dir: Path):
-    """Plot resolved physical J; the last data axis is inverse-tesla pitch."""
+    """Plot the VMEX-style physical-J map in ``s cos(alpha), s sin(alpha)``."""
 
     import matplotlib.pyplot as plt
 
@@ -255,36 +257,70 @@ def plot_physical_j_polar_contours(out, out_dir: Path):
     surfaces = np.asarray(out["surfaces"], dtype=float)
     action = np.asarray(out["ji"], dtype=float)
     pitches = np.asarray(out["physical_pitches"], dtype=float)
+    r_major = abs(float(out.get("r_major", 1.0)))
+    if not np.isfinite(r_major) or r_major <= np.finfo(float).tiny:
+        r_major = 1.0
     if surfaces.size < 2:
         raise ValueError(
             "Physical-J polar contours require at least two --surfaces values."
         )
-    theta = np.concatenate([alpha, alpha[:1] + 2.0 * np.pi])
-    theta_grid, radius_grid = np.meshgrid(theta, surfaces, indexing="xy")
+    alpha_periodic = np.concatenate([alpha, alpha[:1] + 2.0 * np.pi])
+    alpha_grid, surface_grid = np.meshgrid(alpha_periodic, surfaces, indexing="xy")
+    x_grid = surface_grid * np.cos(alpha_grid)
+    y_grid = surface_grid * np.sin(alpha_grid)
     out_dir.mkdir(parents=True, exist_ok=True)
     written = []
     for pitch_index, pitch in enumerate(pitches):
-        values = action[:, :, pitch_index]
-        values_periodic = np.concatenate([values, values[:, :1]], axis=1)
-        fig = plt.figure(figsize=(5.4, 5.8))
-        ax_polar = fig.add_subplot(1, 1, 1, projection="polar")
-        contour = ax_polar.contourf(
-            theta_grid, radius_grid, values_periodic, levels=40, cmap="viridis"
+        values = action[:, :, pitch_index] / r_major
+        values_periodic = np.ma.concatenate(
+            [np.ma.masked_invalid(values), np.ma.masked_invalid(values[:, :1])],
+            axis=1,
         )
-        ax_polar.set_title(r"Resolved second adiabatic invariant, $J$", fontsize=15, pad=20)
-        ax_polar.set_ylim(0.0, float(surfaces.max()))
-        ax_polar.grid(color="white", linewidth=0.8, alpha=0.45)
-        colorbar = fig.colorbar(contour, ax=ax_polar, pad=0.12, shrink=0.78)
-        colorbar.set_label(r"$J$", fontsize=11)
-        fig.text(
-            0.5,
-            0.035,
-            rf"physical pitch $\lambda$ = {pitch:.8g} $\mathrm{{T}}^{{-1}}$",
-            ha="center",
-            fontsize=13,
+        fig, axis = plt.subplots(figsize=(5.8, 5.2), layout="constrained")
+        if values_periodic.count() < 4 or np.ptp(values_periodic.compressed()) == 0.0:
+            axis.text(
+                0.5,
+                0.5,
+                "no trapped-particle wells\nresolved at this pitch",
+                ha="center",
+                va="center",
+                transform=axis.transAxes,
+            )
+        else:
+            levels = np.linspace(
+                float(values_periodic.min()), float(values_periodic.max()), 15
+            )
+            contour = axis.contourf(
+                x_grid,
+                y_grid,
+                values_periodic,
+                levels=levels,
+                cmap="viridis",
+                extend="both",
+            )
+            axis.contour(
+                x_grid,
+                y_grid,
+                values_periodic,
+                levels=levels,
+                colors="0.25",
+                linewidths=0.35,
+                alpha=0.65,
+            )
+            fig.colorbar(contour, ax=axis, pad=0.02, label=r"$J\,/\,(v R_0)$")
+        radius = max(1.0, float(np.max(surfaces)))
+        axis.axhline(0.0, color="white", linewidth=0.6, alpha=0.75)
+        axis.axvline(0.0, color="white", linewidth=0.6, alpha=0.75)
+        axis.set_xlim(-radius, radius)
+        axis.set_ylim(-radius, radius)
+        axis.set_aspect("equal", adjustable="box")
+        axis.set_xlabel(r"$s\cos\alpha$")
+        axis.set_ylabel(r"$s\sin\alpha$")
+        axis.set_title(
+            "second adiabatic invariant\n"
+            rf"$1/\lambda={1.0 / float(pitch):.3g}$ T"
         )
-        fig.tight_layout(rect=(0.0, 0.06, 1.0, 1.0))
-        path = out_dir / f"physical_ji_polar_pitch_{pitch_index:02d}.png"
+        path = out_dir / f"physical_j_contour_pitch_{pitch_index:02d}.png"
         fig.savefig(path, dpi=320, bbox_inches="tight")
         plt.close(fig)
         written.append(path)
