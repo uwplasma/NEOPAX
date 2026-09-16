@@ -21,6 +21,37 @@ from NEOPAX import optimization
 from NEOPAX._reverse_ad_optimization import normalize_geometry_full_ad_objective_names
 
 
+def test_least_squares_does_not_reapply_problem_coordinate_scale(monkeypatch):
+    """ESS/profile scaling lives in the problem coordinates, not SciPy twice."""
+
+    captured = {}
+    evaluation = SimpleNamespace(
+        residuals=jnp.asarray([1.0]),
+        jacobian=jnp.asarray([[0.25, 0.5]]),
+    )
+
+    class _Problem:
+        parameter_count = 2
+        x0 = jnp.asarray([0.0, 0.0])
+        x_scale = jnp.asarray([0.25, 0.125])
+
+        @staticmethod
+        def evaluate(_values):
+            return evaluation
+
+    def fake_scipy_least_squares(fun, x0, *, jac, **kwargs):
+        captured["x_scale"] = np.asarray(kwargs["x_scale"], dtype=float)
+        np.testing.assert_allclose(fun(x0), np.asarray([1.0]))
+        np.testing.assert_allclose(jac(x0), np.asarray([[0.25, 0.5]]))
+        return SimpleNamespace(x=np.asarray(x0, dtype=float))
+
+    monkeypatch.setattr("scipy.optimize.least_squares", fake_scipy_least_squares)
+
+    optimization.least_squares(_Problem())
+
+    np.testing.assert_array_equal(captured["x_scale"], np.ones(2))
+
+
 def test_database_initial_root_unfolded_support_bars_sanitize_float0(monkeypatch):
     """The full-transport root adapter emits ordinary float-delta payloads."""
 

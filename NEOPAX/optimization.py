@@ -2848,8 +2848,15 @@ def least_squares(problem: GeometryLeastSquaresProblem, **kwargs):
                 f"jacobian.shape={initial_jacobian.shape}, parameter_count={problem.parameter_count}."
             )
         cache[_key(x0)] = initial_evaluation
-    x_scale = np.asarray(jax.device_get(problem.x_scale), dtype=float)
-    kwargs.setdefault("x_scale", x_scale)
+    # ``problem`` already uses scaled optimizer coordinates: it maps
+    # physical parameters as ``p = problem.x_scale * x`` and returns the
+    # corresponding chain-rule Jacobian ``dr/dx = dr/dp * problem.x_scale``.
+    # Reusing that vector as SciPy's trust-region ``x_scale`` would apply the
+    # same spectral/profile scaling a second time.  VMEX instead applies ESS
+    # once; unit SciPy scaling is the equivalent convention for these already
+    # scaled NEOPAX coordinates.  An explicit caller-supplied ``x_scale`` is
+    # still respected.
+    kwargs.setdefault("x_scale", np.ones((problem.parameter_count,), dtype=float))
     return scipy_least_squares(_fun, x0, jac=_jac, **kwargs)
 
 
