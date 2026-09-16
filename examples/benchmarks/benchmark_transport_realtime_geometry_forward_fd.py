@@ -96,6 +96,86 @@ def _tree_all_finite(tree) -> bool:
     return True
 
 
+def _print_fd_endpoint_diagnostics(*, label: str, replay, runtime) -> None:
+    """Print bounded host diagnostics before an FD endpoint objective call."""
+
+    final_carry = replay["final_carry"]
+    final_state = replay["final_state"]
+    rollout = replay["rollout"]
+
+    final_time = float(np.asarray(jax.device_get(final_carry.t)))
+    converged_mask = np.asarray(
+        jax.device_get(getattr(rollout, "converged_mask", jnp.asarray([], dtype=bool))),
+        dtype=bool,
+    )
+    accepted_dts = np.asarray(
+        jax.device_get(getattr(rollout, "accepted_dts", jnp.asarray([], dtype=float))),
+        dtype=float,
+    )
+    active_mask = np.not_equal(accepted_dts, 0.0)
+    active_count = int(np.count_nonzero(active_mask))
+    nonconverged_count = int(
+        np.count_nonzero(active_mask & ~converged_mask)
+    ) if converged_mask.shape == active_mask.shape else -1
+    print(
+        "[fd-endpoint-diagnostic] "
+        f"label={label} final_time={final_time:.16e} "
+        f"replay_slots={converged_mask.size} replay_active_steps={active_count} "
+        f"replay_active_nonconverged={nonconverged_count}",
+        flush=True,
+    )
+
+    def _print_array(name: str, value) -> None:
+        array = np.asarray(jax.device_get(value))
+        if not np.issubdtype(array.dtype, np.inexact):
+            return
+        finite = np.isfinite(array)
+        finite_values = array[finite]
+        minimum = float(np.min(finite_values)) if finite_values.size else float("nan")
+        maximum = float(np.max(finite_values)) if finite_values.size else float("nan")
+        first_bad = None
+        if not bool(np.all(finite)):
+            first_bad = tuple(int(item) for item in np.argwhere(~finite)[0])
+        print(
+            "[fd-endpoint-diagnostic] "
+            f"label={label} array={name} shape={array.shape} "
+            f"finite={bool(np.all(finite))} nonfinite_count={int(np.count_nonzero(~finite))} "
+            f"first_nonfinite_index={first_bad} finite_min={minimum:.16e} "
+            f"finite_max={maximum:.16e}",
+            flush=True,
+        )
+
+    _print_array("carry_y", final_carry.y)
+    _print_array("density", final_state.density)
+    _print_array("pressure", final_state.pressure)
+    _print_array("temperature", final_state.temperature)
+    _print_array("Er", final_state.Er)
+
+    flux_model = getattr(getattr(runtime, "models", None), "flux", None)
+    neoclassical_model = getattr(flux_model, "neoclassical_model", flux_model)
+    for tree_name, tree in (
+        ("geometry", getattr(runtime, "geometry", None)),
+        ("database", getattr(neoclassical_model, "database", None)),
+    ):
+        bad_paths = []
+        float_leaf_count = 0
+        if tree is not None:
+            for path, leaf in jax.tree_util.tree_flatten_with_path(tree)[0]:
+                array = np.asarray(jax.device_get(leaf))
+                if not np.issubdtype(array.dtype, np.inexact):
+                    continue
+                float_leaf_count += 1
+                if not bool(np.all(np.isfinite(array))):
+                    bad_paths.append(str(path))
+        print(
+            "[fd-endpoint-diagnostic] "
+            f"label={label} tree={tree_name} float_leaves={float_leaf_count} "
+            f"nonfinite_leaf_count={len(bad_paths)} "
+            f"first_nonfinite_paths={bad_paths[:5]}",
+            flush=True,
+        )
+
+
 def _profile_state_from_values(
     values,
     *,
@@ -173,6 +253,8 @@ def _objectives_on_realtime_geometry_frozen_trace(
     baseline_er_profile=None,
     baseline_residual=None,
     baseline_dres_der=None,
+    endpoint_diagnostics: bool = False,
+    endpoint_label: str = "endpoint",
 ):
     root_lane = str(initial_er_root_fd_root_lane).strip().lower()
     if root_lane == "frozen_linearized":
@@ -218,6 +300,12 @@ def _objectives_on_realtime_geometry_frozen_trace(
             frozen_trace,
             replay_mode=replay_mode_normalized,
             carry0=prepared_rollout.initial_carry,
+        )
+    if endpoint_diagnostics:
+        _print_fd_endpoint_diagnostics(
+            label=endpoint_label,
+            replay=replay,
+            runtime=runtime,
         )
     return _objective_vector(replay["final_state"], runtime), replay
 
@@ -423,6 +511,8 @@ def _geometry_fd_objectives(
     baseline_er_profile=None,
     baseline_residual=None,
     baseline_dres_der=None,
+    endpoint_diagnostics: bool = False,
+    endpoint_label: str = "endpoint",
 ):
     if str(geometry_fd_lane).strip().lower() == "frozen_linearized":
         if frozen_linearized_bundle is None:
@@ -449,6 +539,8 @@ def _geometry_fd_objectives(
         baseline_er_profile=baseline_er_profile,
         baseline_residual=baseline_residual,
         baseline_dres_der=baseline_dres_der,
+        endpoint_diagnostics=endpoint_diagnostics,
+        endpoint_label=endpoint_label,
     )
 
 
@@ -656,6 +748,15 @@ def main() -> None:
         ),
     )
     parser.add_argument("--radau-jacobian-reuse-mode", default=None)
+    parser.add_argument(
+        "--diagnose-fd-endpoint",
+        action="store_true",
+        help=(
+            "Before each frozen FD endpoint objective evaluation, print replay "
+            "convergence/final-time information and finite-value summaries for "
+            "the final state plus its geometry/database payloads. Diagnostic only."
+        ),
+    )
     parser.add_argument(
         "--diagnose-bootstrap-correction",
         action="store_true",
@@ -1085,6 +1186,8 @@ def main() -> None:
             baseline_er_profile=baseline_er_profile,
             baseline_residual=baseline_residual,
             baseline_dres_der=baseline_dres_der,
+            endpoint_diagnostics=bool(args.diagnose_fd_endpoint),
+            endpoint_label=f"{parameter_name}:minus",
         )
         print("[autodiff-gate] progress: running profile fd_plus replay", flush=True)
         plus_profile_values = profile_values.at[param_index].set(
@@ -1103,6 +1206,8 @@ def main() -> None:
             baseline_er_profile=baseline_er_profile,
             baseline_residual=baseline_residual,
             baseline_dres_der=baseline_dres_der,
+            endpoint_diagnostics=bool(args.diagnose_fd_endpoint),
+            endpoint_label=f"{parameter_name}:plus",
         )
         del param_index
     else:
@@ -1136,6 +1241,8 @@ def main() -> None:
             baseline_er_profile=baseline_er_profile,
             baseline_residual=baseline_residual,
             baseline_dres_der=baseline_dres_der,
+            endpoint_diagnostics=bool(args.diagnose_fd_endpoint),
+            endpoint_label=f"{parameter_name}:minus",
         )
         print(
             "[autodiff-gate] progress: running fixed-final-state explicit geometry FD diagnostic",
@@ -1178,6 +1285,8 @@ def main() -> None:
             baseline_er_profile=baseline_er_profile,
             baseline_residual=baseline_residual,
             baseline_dres_der=baseline_dres_der,
+            endpoint_diagnostics=bool(args.diagnose_fd_endpoint),
+            endpoint_label=f"{parameter_name}:plus",
         )
         baseline_geometry_final_state_fd = (
             _objective_vector(plus_replay["final_state"], baseline_runtime)
