@@ -34,6 +34,14 @@ OUT_DIR = ROOT / "outputs" / "geometry_qi_max_er_transition_initial_root_databas
 DATABASE_N_THETA, DATABASE_N_PHI, DATABASE_N_XI = 25, 31, 64  # phi is NTX zeta.
 SURFACES = np.asarray([1 / 51, 5 / 51, 10 / 51, 15 / 51, 20 / 51, 25 / 51, 30 / 51, 35 / 51, 40 / 51, 45 / 51, 51 / 51], dtype=float)
 QI_MBOZ = QI_NBOZ = 18
+# ``surrogate`` preserves the established objective and all weights below;
+# ``physical`` selects the VMEX-like fixed-pitch, actual-well action.
+QI_MAXJ_BACKEND = "surrogate"
+PHYSICAL_J_PITCHES = None
+PHYSICAL_J_TRAPPING_DEPTHS = (0.35, 0.55, 0.75)
+PHYSICAL_J_NALPHA, PHYSICAL_J_POINTS_PER_PERIOD = 5, 24
+PHYSICAL_J_NUM_PERIODS, PHYSICAL_J_MAX_WELLS = 6, 16
+PHYSICAL_J_QUADRATURE_ORDER, PHYSICAL_MAXJ_TARGET = 16, 0.0
 MAX_MODE_SCHEDULE = (4,)
 GEOMETRY_FAMILIES, SCALE_MODE, ESS_ALPHA = "RBC,ZBS", "ess", 1.2
 ASPECT_TARGET, IOTA_TARGET, MIRROR_TARGET = 10.0, -0.61, 0.19
@@ -99,13 +107,28 @@ def active_terms():
     return tuple(terms)
 
 
-def build_problem(config: dict, vmec_input, max_mode: int, args: argparse.Namespace):
+def qi_maxj_backend_settings(physical_pitches=None):
+    return opt.QImaxJBackendSettings(
+        backend=QI_MAXJ_BACKEND,
+        physical_pitches=PHYSICAL_J_PITCHES if physical_pitches is None else physical_pitches,
+        trapping_depths=PHYSICAL_J_TRAPPING_DEPTHS,
+        physical_nalpha=PHYSICAL_J_NALPHA,
+        physical_points_per_period=PHYSICAL_J_POINTS_PER_PERIOD,
+        physical_num_periods=PHYSICAL_J_NUM_PERIODS,
+        physical_max_wells=PHYSICAL_J_MAX_WELLS,
+        physical_quadrature_order=PHYSICAL_J_QUADRATURE_ORDER,
+        physical_maxj_target=PHYSICAL_MAXJ_TARGET,
+    )
+
+
+def build_problem(config: dict, vmec_input, max_mode: int, args: argparse.Namespace, *, physical_pitches=None):
     return opt.geometry_initial_er_root_only_least_squares_problem(
         config, active_terms(), vmec_input=vmec_input, max_mode=max_mode, include_profiles=False,
         families=GEOMETRY_FAMILIES, scale_mode=SCALE_MODE, ess_alpha=ESS_ALPHA, mboz=QI_MBOZ, nboz=QI_NBOZ,
         surfaces=tuple(float(item) for item in SURFACES), n_theta=args.database_n_theta, n_zeta=args.database_n_phi,
         n_xi=args.database_n_xi, geometry_solver_device=SOLVER_DEVICE, device=SOLVER_DEVICE,
         root_options=ROOT_OPTIONS, reverse_stage_mode=REVERSE_STAGE_MODE,
+        qi_maxj_settings=qi_maxj_backend_settings(physical_pitches),
     )
 
 
@@ -515,9 +538,13 @@ def main() -> int:
     initial_input = optimized_input = final_problem = final_result = initial_values = final_values = None
     initial_problem = None
     initial_x = None
+    frozen_physical_pitches = PHYSICAL_J_PITCHES
     for max_mode in MAX_MODE_SCHEDULE:
-        print(f"\n===== finite-beta database QI + Er transition, max_mode={max_mode}, grid=({args.database_n_theta},{args.database_n_phi},{args.database_n_xi}), beta={INCLUDE_BETA}, dmerc={INCLUDE_DMERC} =====", flush=True)
-        problem = build_problem(config, current_input, max_mode, args)
+        print(f"\n===== finite-beta database QI + Er transition, max_mode={max_mode}, grid=({args.database_n_theta},{args.database_n_phi},{args.database_n_xi}), beta={INCLUDE_BETA}, dmerc={INCLUDE_DMERC}, J_backend={QI_MAXJ_BACKEND} =====", flush=True)
+        problem = build_problem(config, current_input, max_mode, args, physical_pitches=frozen_physical_pitches)
+        if QI_MAXJ_BACKEND.strip().lower() == "physical" and frozen_physical_pitches is None:
+            frozen_physical_pitches = tuple(float(value) for value in problem.context.qi_maxj_physical_pitches)
+            print("[setup] frozen_physical_J_pitches_T^-1=" + ",".join(f"{value:.16g}" for value in frozen_physical_pitches), flush=True)
         problem = opt.GeometryInputSavingProblem(
             problem, OUT_DIR / f"geometry_inputs_m{max_mode}"
         )

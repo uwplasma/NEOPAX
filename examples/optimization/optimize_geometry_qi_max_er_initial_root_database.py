@@ -52,6 +52,17 @@ SURFACES = np.asarray(
 )
 QI_MBOZ = 18
 QI_NBOZ = 18
+# QI/max-J objective backend. ``surrogate`` preserves this script's existing
+# objective and weights; ``physical`` selects the VMEX-like resolved action.
+QI_MAXJ_BACKEND = "surrogate"
+PHYSICAL_J_PITCHES = None  # Optional tuple in T^-1; None freezes seed pitches.
+PHYSICAL_J_TRAPPING_DEPTHS = (0.35, 0.55, 0.75)
+PHYSICAL_J_NALPHA = 5
+PHYSICAL_J_POINTS_PER_PERIOD = 24
+PHYSICAL_J_NUM_PERIODS = 6
+PHYSICAL_J_MAX_WELLS = 16
+PHYSICAL_J_QUADRATURE_ORDER = 16
+PHYSICAL_MAXJ_TARGET = 0.0
 MAX_MODE_SCHEDULE = 2
 GEOMETRY_FAMILIES = "RBC,ZBS"
 SCALE_MODE = "ess"
@@ -141,7 +152,28 @@ TERMS = (
 )
 
 
-def build_problem(config: dict, vmec_input, max_mode: int, args: argparse.Namespace):
+def qi_maxj_backend_settings(physical_pitches=None):
+    return opt.QImaxJBackendSettings(
+        backend=QI_MAXJ_BACKEND,
+        physical_pitches=PHYSICAL_J_PITCHES if physical_pitches is None else physical_pitches,
+        trapping_depths=PHYSICAL_J_TRAPPING_DEPTHS,
+        physical_nalpha=PHYSICAL_J_NALPHA,
+        physical_points_per_period=PHYSICAL_J_POINTS_PER_PERIOD,
+        physical_num_periods=PHYSICAL_J_NUM_PERIODS,
+        physical_max_wells=PHYSICAL_J_MAX_WELLS,
+        physical_quadrature_order=PHYSICAL_J_QUADRATURE_ORDER,
+        physical_maxj_target=PHYSICAL_MAXJ_TARGET,
+    )
+
+
+def build_problem(
+    config: dict,
+    vmec_input,
+    max_mode: int,
+    args: argparse.Namespace,
+    *,
+    physical_pitches=None,
+):
     return opt.geometry_initial_er_root_only_least_squares_problem(
         config,
         TERMS,
@@ -160,6 +192,7 @@ def build_problem(config: dict, vmec_input, max_mode: int, args: argparse.Namesp
         geometry_solver_device=SOLVER_DEVICE,
         device=SOLVER_DEVICE,
         reverse_stage_mode=REVERSE_STAGE_MODE,
+        qi_maxj_settings=qi_maxj_backend_settings(physical_pitches),
     )
 
 
@@ -519,14 +552,31 @@ def main() -> int:
     current_input = seed_input
     final_problem = final_result = optimized_input = initial_input = None
     initial_problem = initial_x = None
+    frozen_physical_pitches = PHYSICAL_J_PITCHES
 
     for max_mode in (MAX_MODE_SCHEDULE if not np.isscalar(MAX_MODE_SCHEDULE) else (MAX_MODE_SCHEDULE,)):
         print(
             f"\n===== database QI + max-Er, max_mode={max_mode}, "
-            f"grid=({args.database_n_theta},{args.database_n_phi},{args.database_n_xi}) =====",
+            f"grid=({args.database_n_theta},{args.database_n_phi},{args.database_n_xi}), "
+            f"J_backend={QI_MAXJ_BACKEND} =====",
             flush=True,
         )
-        problem = build_problem(config, current_input, int(max_mode), args)
+        problem = build_problem(
+            config,
+            current_input,
+            int(max_mode),
+            args,
+            physical_pitches=frozen_physical_pitches,
+        )
+        if QI_MAXJ_BACKEND.strip().lower() == "physical" and frozen_physical_pitches is None:
+            frozen_physical_pitches = tuple(
+                float(value) for value in problem.context.qi_maxj_physical_pitches
+            )
+            print(
+                "[setup] frozen_physical_J_pitches_T^-1="
+                + ",".join(f"{value:.16g}" for value in frozen_physical_pitches),
+                flush=True,
+            )
         problem = opt.GeometryInputSavingProblem(
             problem, OUT_DIR / f"geometry_inputs_m{max_mode}"
         )

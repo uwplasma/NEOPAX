@@ -52,6 +52,14 @@ SURFACES = np.asarray(
 )
 QI_MBOZ = 18
 QI_NBOZ = 18
+# ``surrogate`` preserves the established objective and all weights below;
+# ``physical`` selects the VMEX-like fixed-pitch, actual-well action.
+QI_MAXJ_BACKEND = "surrogate"
+PHYSICAL_J_PITCHES = None
+PHYSICAL_J_TRAPPING_DEPTHS = (0.35, 0.55, 0.75)
+PHYSICAL_J_NALPHA, PHYSICAL_J_POINTS_PER_PERIOD = 5, 24
+PHYSICAL_J_NUM_PERIODS, PHYSICAL_J_MAX_WELLS = 6, 16
+PHYSICAL_J_QUADRATURE_ORDER, PHYSICAL_MAXJ_TARGET = 16, 0.0
 
 MAX_MODE_SCHEDULE = 2
 GEOMETRY_FAMILIES = "RBC,ZBS"
@@ -111,6 +119,20 @@ MAKE_B_AXIS_PLOTS = True
 MAKE_BOOZER_B_CONTOUR_PLOTS = True
 MAKE_INITIAL_PLOTS = True
 MAKE_TRANSPORT_REPORTS = True
+
+
+def qi_maxj_backend_settings(physical_pitches=None):
+    return opt.QImaxJBackendSettings(
+        backend=QI_MAXJ_BACKEND,
+        physical_pitches=PHYSICAL_J_PITCHES if physical_pitches is None else physical_pitches,
+        trapping_depths=PHYSICAL_J_TRAPPING_DEPTHS,
+        physical_nalpha=PHYSICAL_J_NALPHA,
+        physical_points_per_period=PHYSICAL_J_POINTS_PER_PERIOD,
+        physical_num_periods=PHYSICAL_J_NUM_PERIODS,
+        physical_max_wells=PHYSICAL_J_MAX_WELLS,
+        physical_quadrature_order=PHYSICAL_J_QUADRATURE_ORDER,
+        physical_maxj_target=PHYSICAL_MAXJ_TARGET,
+    )
 
 
 def parser() -> argparse.ArgumentParser:
@@ -548,13 +570,15 @@ def main() -> int:
     initial_input = None
     last_problem = None
     last_result = None
+    frozen_physical_pitches = PHYSICAL_J_PITCHES
 
     max_mode_schedule = max_mode_schedule_values()
     for max_mode in max_mode_schedule:
         print(
             "\n===== vacuum database QI + max-Er/root/bootstrap/net-power full transport "
             f"stage, max_mode={max_mode}, grid=({args.database_n_theta},"
-            f"{args.database_n_phi},{args.database_n_xi}) =====",
+            f"{args.database_n_phi},{args.database_n_xi}), "
+            f"J_backend={QI_MAXJ_BACKEND} =====",
             flush=True,
         )
         problem = opt.geometry_full_transport_least_squares_problem(
@@ -587,7 +611,17 @@ def main() -> int:
             reverse_step_bwd_mode="reduced_cotangent_call_boundary",
             reverse_stage_adjoint_memory_mode="default",
             reverse_stage_mode=REVERSE_STAGE_MODE,
+            qi_maxj_settings=qi_maxj_backend_settings(frozen_physical_pitches),
         )
+        if QI_MAXJ_BACKEND.strip().lower() == "physical" and frozen_physical_pitches is None:
+            frozen_physical_pitches = tuple(
+                float(value) for value in problem.context.qi_maxj_physical_pitches
+            )
+            print(
+                "[setup] frozen_physical_J_pitches_T^-1="
+                + ",".join(f"{value:.16g}" for value in frozen_physical_pitches),
+                flush=True,
+            )
         problem = opt.GeometryInputSavingProblem(
             problem,
             out_dir / f"geometry_inputs_m{max_mode}",
