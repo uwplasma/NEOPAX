@@ -738,6 +738,7 @@ def test_database_full_transport_mode_uses_one_integrated_benchmark_builder(monk
             reverse_stage_adjoint_solve_mode="block",
             reverse_rhs_transpose_mode="explicit_database",
             reverse_step_bwd_mode="reduced_cotangent_call_boundary",
+            reverse_segment_input_diagnostics=True,
         )
 
         assert len(calls) == 1
@@ -750,6 +751,8 @@ def test_database_full_transport_mode_uses_one_integrated_benchmark_builder(monk
         assert calls[0]["reverse_stage_adjoint_solve_mode"] == "block"
         assert calls[0]["reverse_rhs_transpose_mode"] == "explicit_database"
         assert calls[0]["reverse_step_bwd_mode"] == "reduced_cotangent_call_boundary"
+        assert calls[0]["reverse_segment_input_diagnostics"] is True
+        assert problem.options["reverse_segment_input_diagnostics"] is True
         if stage_mode == "benchmark":
             assert calls[0]["segment_replay_optimization_stage_builder"] is None
             assert calls[0]["bootstrap_optimization_stage_builder"] is None

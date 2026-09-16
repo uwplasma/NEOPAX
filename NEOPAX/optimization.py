@@ -2239,6 +2239,7 @@ def geometry_full_transport_least_squares_problem(
     reverse_stage_adjoint_iter_maxiter: int = 40,
     reverse_stage_adjoint_iter_tol: float = 1.0e-10,
     reverse_stage_adjoint_woodbury_rank: int = 24,
+    reverse_segment_input_diagnostics: bool = False,
     max_reverse_accepted_steps: int | None = None,
     reverse_stage_mode: str = "benchmark",
     qi_maxj_settings: QImaxJBackendSettings | Mapping[str, object] | str | None = None,
@@ -2380,6 +2381,7 @@ def geometry_full_transport_least_squares_problem(
         "reverse_stage_adjoint_iter_maxiter": int(reverse_stage_adjoint_iter_maxiter),
         "reverse_stage_adjoint_iter_tol": float(reverse_stage_adjoint_iter_tol),
         "reverse_stage_adjoint_woodbury_rank": int(reverse_stage_adjoint_woodbury_rank),
+        "reverse_segment_input_diagnostics": bool(reverse_segment_input_diagnostics),
         "max_reverse_accepted_steps": (
             None if max_reverse_accepted_steps is None else int(max_reverse_accepted_steps)
         ),
@@ -2681,6 +2683,7 @@ def geometry_full_transport_least_squares_problem(
         reverse_stage_adjoint_iter_maxiter=int(reverse_stage_adjoint_iter_maxiter),
         reverse_stage_adjoint_iter_tol=float(reverse_stage_adjoint_iter_tol),
         reverse_stage_adjoint_woodbury_rank=int(reverse_stage_adjoint_woodbury_rank),
+        reverse_segment_input_diagnostics=bool(reverse_segment_input_diagnostics),
         max_reverse_accepted_steps=(
             None
             if max_reverse_accepted_steps is None
