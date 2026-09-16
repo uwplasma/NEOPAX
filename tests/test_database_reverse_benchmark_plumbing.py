@@ -37,6 +37,50 @@ def _mode_default_resolver():
     return namespace[node.name]
 
 
+def _forward_fd_replay_contract_args(argv):
+    """Build only the FD replay-contract CLI without importing JAX/VMEX."""
+
+    path = _ROOT / "examples/benchmarks/benchmark_transport_realtime_geometry_forward_fd.py"
+    main = _function(path, "main")
+    declarations = [
+        node
+        for node in main.body
+        if isinstance(node, ast.Expr)
+        and isinstance(node.value, ast.Call)
+        and isinstance(node.value.func, ast.Attribute)
+        and node.value.func.attr == "add_argument"
+        and node.value.args
+        and isinstance(node.value.args[0], ast.Constant)
+        and node.value.args[0].value == "--fd-accepted-replay-contract"
+    ]
+    parser = argparse.ArgumentParser()
+    exec(
+        compile(ast.Module(body=declarations, type_ignores=[]), "<fd-parser>", "exec"),
+        {"parser": parser},
+    )
+    return parser.parse_args(argv)
+
+
+def test_forward_fd_reverse_frozen_metadata_contract_is_opt_in():
+    assert _forward_fd_replay_contract_args([]).fd_accepted_replay_contract == "current"
+    assert (
+        _forward_fd_replay_contract_args(
+            ["--fd-accepted-replay-contract", "reverse_frozen_metadata"]
+        ).fd_accepted_replay_contract
+        == "reverse_frozen_metadata"
+    )
+
+
+def test_forward_fd_current_contract_keeps_existing_replay_call():
+    path = _ROOT / "examples/benchmarks/benchmark_transport_realtime_geometry_forward_fd.py"
+    function_source = ast.unparse(
+        _function(path, "_objectives_on_realtime_geometry_frozen_trace")
+    )
+    assert "if accepted_contract == 'current'" in function_source
+    assert "_radau_forward_fd_run_prepared_on_realized_trace" in function_source
+    assert "_fd_reverse_frozen_metadata_accepted_rollout" in function_source
+
+
 def test_benchmark_callback_accepts_all_support_core_keywords():
     core = _function(
         _ROOT / "NEOPAX/_reverse_ad_transport.py",

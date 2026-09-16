@@ -63,8 +63,11 @@ from NEOPAX._orchestrator import (  # noqa: E402
     prepare_transport_solver_components,
 )
 from NEOPAX._transport_solvers import (  # noqa: E402
+    _RadauAcceptedRolloutResult,
+    _RadauAcceptedStepAttemptContext,
     _build_prepared_radau_accepted_rollout,
     _build_prepared_radau_execution_context,
+    _radau_apply_accepted_step_map,
     _radau_adaptive_schedule_rollout,
     _radau_forward_fd_run_prepared_on_realized_trace,
     _radau_run_prepared_on_realized_trace,
@@ -94,6 +97,204 @@ def _tree_all_finite(tree) -> bool:
         if np.issubdtype(arr.dtype, np.inexact) and not np.all(np.isfinite(arr)):
             return False
     return True
+
+
+def _fd_reverse_frozen_metadata_accepted_rollout(
+    *,
+    baseline_prepared_rollout,
+    endpoint_prepared_rollout,
+    trace,
+    endpoint_carry0,
+):
+    """FD-only accepted replay with reverse-fixed solver metadata.
+
+    Reverse AD differentiates the accepted physical state map while treating
+    predictor, controller, Jacobian, and factorization fields as replay
+    metadata.  A conventional finite difference of the existing replay lets
+    those acceleration fields acquire an endpoint-dependent history.  This
+    opt-in oracle instead evolves an unperturbed accepted replay in lockstep
+    and copies its nonphysical carry fields into the perturbed endpoint after
+    every step.  Only the endpoint physical state and (when present) the
+    lagged-response physical payload are allowed to evolve independently.
+
+    This helper is intentionally local to the FD benchmark.  It neither
+    changes nor wraps the replay functions used by reverse AD or optimization.
+    """
+
+    dtype = endpoint_prepared_rollout.kernel_context.dtype
+    accepted_active_mask = jax.lax.stop_gradient(
+        jnp.logical_and(trace.active_mask, trace.accepted_mask)
+    )
+    attempted_dts = jax.lax.stop_gradient(trace.attempted_dts)
+    next_dts = jax.lax.stop_gradient(trace.next_dts)
+    next_recent_reject_count = jax.lax.stop_gradient(trace.next_recent_reject_count)
+    next_regrowth_cooldown = jax.lax.stop_gradient(trace.next_regrowth_cooldown)
+    next_easy_growth_streak = jax.lax.stop_gradient(trace.next_easy_growth_streak)
+    next_lagged_response_valid = jax.lax.stop_gradient(trace.next_lagged_response_valid)
+
+    def _step_with_trace_metadata(
+        prepared_rollout,
+        carry,
+        dt_value,
+        next_dt_value,
+        recent_reject_count_value,
+        regrowth_cooldown_value,
+        easy_growth_streak_value,
+        lagged_response_valid_value,
+    ):
+        carry_for_step = dataclasses.replace(carry, dt=dt_value)
+        attempt_context = _RadauAcceptedStepAttemptContext(
+            t_final=carry.t + dt_value,
+            use_transport_lagged_response=jnp.asarray(
+                prepared_rollout.kernel_context.use_transport_lagged_response
+            ),
+        )
+        result = _radau_apply_accepted_step_map(
+            prepared_rollout.kernel_context,
+            prepared_rollout.physics_context,
+            carry_for_step,
+            attempt_context,
+        )
+        next_carry = dataclasses.replace(
+            result.next_carry,
+            dt=next_dt_value,
+            prev_error=jnp.maximum(result.err_norm, jnp.asarray(1.0e-12, dtype=dtype)),
+            recent_reject_count=recent_reject_count_value,
+            regrowth_cooldown=regrowth_cooldown_value,
+            easy_growth_streak=easy_growth_streak_value,
+            lagged_response_valid=lagged_response_valid_value,
+        )
+        return next_carry, result
+
+    def _endpoint_carry_with_baseline_metadata(endpoint_carry, baseline_carry):
+        # These are the physical/differentiable carry fields retained by the
+        # reduced reverse contract. Everything else comes from the baseline
+        # replay and is therefore identical for fd- and fd+.
+        return dataclasses.replace(
+            baseline_carry,
+            t=endpoint_carry.t,
+            y=endpoint_carry.y,
+            lagged_response_cache=endpoint_carry.lagged_response_cache,
+            lagged_reference_y=endpoint_carry.lagged_reference_y,
+        )
+
+    def _scan_body(scan_carry, xs):
+        baseline_carry, endpoint_carry = scan_carry
+        (
+            active,
+            dt_value,
+            next_dt_value,
+            recent_reject_count_value,
+            regrowth_cooldown_value,
+            easy_growth_streak_value,
+            lagged_response_valid_value,
+        ) = xs
+
+        def _do_step(_):
+            baseline_next, _baseline_result = _step_with_trace_metadata(
+                baseline_prepared_rollout,
+                baseline_carry,
+                dt_value,
+                next_dt_value,
+                recent_reject_count_value,
+                regrowth_cooldown_value,
+                easy_growth_streak_value,
+                lagged_response_valid_value,
+            )
+            endpoint_in = _endpoint_carry_with_baseline_metadata(
+                endpoint_carry,
+                baseline_carry,
+            )
+            endpoint_raw_next, endpoint_result = _step_with_trace_metadata(
+                endpoint_prepared_rollout,
+                endpoint_in,
+                dt_value,
+                next_dt_value,
+                recent_reject_count_value,
+                regrowth_cooldown_value,
+                easy_growth_streak_value,
+                lagged_response_valid_value,
+            )
+            endpoint_next = _endpoint_carry_with_baseline_metadata(
+                endpoint_raw_next,
+                baseline_next,
+            )
+            scan_out = (
+                endpoint_result.accepted_y,
+                endpoint_result.err_norm,
+                jnp.asarray(True),
+                dt_value,
+            )
+            return (baseline_next, endpoint_next), scan_out
+
+        def _skip(_):
+            scan_out = (
+                endpoint_carry.y,
+                jnp.asarray(jnp.inf, dtype=dtype),
+                jnp.asarray(False),
+                jnp.asarray(0.0, dtype=dtype),
+            )
+            return (baseline_carry, endpoint_carry), scan_out
+
+        return jax.lax.cond(active, _do_step, _skip, operand=None)
+
+    initial_scan_carry = (
+        baseline_prepared_rollout.initial_carry,
+        endpoint_carry0,
+    )
+    final_scan_carry, scan_outputs = jax.lax.scan(
+        _scan_body,
+        initial_scan_carry,
+        (
+            accepted_active_mask,
+            attempted_dts,
+            next_dts,
+            next_recent_reject_count,
+            next_regrowth_cooldown,
+            next_easy_growth_streak,
+            next_lagged_response_valid,
+        ),
+    )
+    _, final_endpoint_carry = final_scan_carry
+    trial_ys, err_norms, converged_mask, accepted_dts = scan_outputs
+    return _RadauAcceptedRolloutResult(
+        final_carry=final_endpoint_carry,
+        final_y=final_endpoint_carry.y,
+        trial_ys=trial_ys,
+        err_norms=err_norms,
+        converged_mask=converged_mask,
+        accepted_dts=accepted_dts,
+    )
+
+
+def _require_complete_frozen_metadata_replay(*, rollout, prepared_rollout, trace) -> None:
+    """Reject an incomplete opt-in FD replay before evaluating objectives."""
+
+    initial_time = float(
+        np.asarray(jax.device_get(prepared_rollout.initial_carry.t))
+    )
+    expected_dts = np.asarray(
+        jax.device_get(
+            jnp.where(
+                jnp.logical_and(trace.active_mask, trace.accepted_mask),
+                trace.attempted_dts,
+                jnp.asarray(0.0, dtype=trace.attempted_dts.dtype),
+            )
+        ),
+        dtype=float,
+    )
+    expected_final_time = initial_time + float(np.sum(expected_dts))
+    actual_final_time = float(np.asarray(jax.device_get(rollout.final_carry.t)))
+    time_tolerance = 1.0e-12 * max(1.0, abs(expected_final_time))
+    if (
+        not np.isfinite(actual_final_time)
+        or abs(actual_final_time - expected_final_time) > time_tolerance
+    ):
+        raise RuntimeError(
+            "reverse-frozen-metadata FD replay did not complete the frozen "
+            f"accepted-step map (final_time={actual_final_time:.16e}, "
+            f"expected_final_time={expected_final_time:.16e})."
+        )
 
 
 def _print_fd_endpoint_diagnostics(*, label: str, replay, runtime) -> None:
@@ -235,7 +436,7 @@ def _schedule_rollout(config: dict[str, Any], runtime, state0, *, accepted_step_
         stop_after_accepted_steps=stop_after_accepted_steps,
     )
     final_state = prepared_rollout.physics_context.unpack_flat(rollout.final_carry.y)
-    return components, rollout, final_state
+    return components, prepared_rollout, execution_context, rollout, final_state
 
 
 def _objectives_on_realtime_geometry_frozen_trace(
@@ -247,6 +448,8 @@ def _objectives_on_realtime_geometry_frozen_trace(
     profile_values,
     frozen_trace,
     replay_mode: str,
+    fd_accepted_replay_contract: str = "current",
+    baseline_replay_reference=None,
     solver_override=None,
     initial_er_root_ad: str = "off",
     initial_er_root_fd_root_lane: str = "selected",
@@ -285,15 +488,53 @@ def _objectives_on_realtime_geometry_frozen_trace(
         solver_override=solver_override,
     )
     replay_mode_normalized = str(replay_mode).strip().lower()
+    accepted_contract = str(fd_accepted_replay_contract).strip().lower()
     if replay_mode_normalized == "accepted":
-        replay = _radau_forward_fd_run_prepared_on_realized_trace(
-            prepared_rollout,
-            execution_context,
-            frozen_trace,
-            replay_mode="accepted",
-            carry0=prepared_rollout.initial_carry,
-        )
+        if accepted_contract == "current":
+            replay = _radau_forward_fd_run_prepared_on_realized_trace(
+                prepared_rollout,
+                execution_context,
+                frozen_trace,
+                replay_mode="accepted",
+                carry0=prepared_rollout.initial_carry,
+            )
+        elif accepted_contract == "reverse_frozen_metadata":
+            if baseline_replay_reference is None:
+                raise ValueError(
+                    "reverse_frozen_metadata FD replay requires the unperturbed "
+                    "baseline prepared rollout."
+                )
+            rollout = _fd_reverse_frozen_metadata_accepted_rollout(
+                baseline_prepared_rollout=baseline_replay_reference,
+                endpoint_prepared_rollout=prepared_rollout,
+                trace=frozen_trace,
+                endpoint_carry0=prepared_rollout.initial_carry,
+            )
+            _require_complete_frozen_metadata_replay(
+                rollout=rollout,
+                prepared_rollout=prepared_rollout,
+                trace=frozen_trace,
+            )
+            replay = {
+                "final_state": prepared_rollout.physics_context.unpack_flat(
+                    rollout.final_carry.y
+                ),
+                "final_carry": rollout.final_carry,
+                "rollout": rollout,
+                "replay_mode": "accepted",
+                "fd_accepted_replay_contract": accepted_contract,
+            }
+        else:
+            raise ValueError(
+                "fd_accepted_replay_contract must be one of "
+                "{'current', 'reverse_frozen_metadata'}."
+            )
     else:
+        if accepted_contract != "current":
+            raise ValueError(
+                "--fd-accepted-replay-contract reverse_frozen_metadata requires "
+                "--replay-mode accepted."
+            )
         replay = _radau_run_prepared_on_realized_trace(
             prepared_rollout,
             execution_context,
@@ -503,6 +744,8 @@ def _geometry_fd_objectives(
     profile_cfg: dict[str, Any],
     frozen_trace,
     replay_mode: str,
+    fd_accepted_replay_contract: str = "current",
+    baseline_replay_reference=None,
     geometry_fd_lane: str,
     frozen_linearized_bundle: dict[str, Any] | None = None,
     fixed_initial_er=None,
@@ -534,6 +777,8 @@ def _geometry_fd_objectives(
         profile_values=profile_values,
         frozen_trace=frozen_trace,
         replay_mode=replay_mode,
+        fd_accepted_replay_contract=fd_accepted_replay_contract,
+        baseline_replay_reference=baseline_replay_reference,
         initial_er_root_ad=initial_er_root_ad,
         initial_er_root_fd_root_lane=initial_er_root_fd_root_lane,
         baseline_er_profile=baseline_er_profile,
@@ -747,6 +992,18 @@ def main() -> None:
             "map as benchmark_transport_frozen_fd_only; 'attempt' keeps the older diagnostic trace replay."
         ),
     )
+    parser.add_argument(
+        "--fd-accepted-replay-contract",
+        choices=("current", "reverse_frozen_metadata"),
+        default="current",
+        help=(
+            "FD-only contract for --replay-mode accepted. 'current' preserves the "
+            "existing endpoint-dependent replay behavior. 'reverse_frozen_metadata' "
+            "evolves an unperturbed accepted replay in lockstep and freezes the "
+            "predictor/controller/Jacobian/LU metadata seen by fd- and fd+ to that "
+            "reference, matching the fields held nondifferentiable by reverse AD."
+        ),
+    )
     parser.add_argument("--radau-jacobian-reuse-mode", default=None)
     parser.add_argument(
         "--diagnose-fd-endpoint",
@@ -833,6 +1090,15 @@ def main() -> None:
         ),
     )
     args = parser.parse_args()
+    if (
+        str(args.fd_accepted_replay_contract).strip().lower()
+        == "reverse_frozen_metadata"
+        and str(args.replay_mode).strip().lower() != "accepted"
+    ):
+        parser.error(
+            "--fd-accepted-replay-contract reverse_frozen_metadata requires "
+            "--replay-mode accepted"
+        )
     initial_er_root_ad = _initial_er_root_ad_mode(args.initial_er_root_ad)
 
     device_arg = str(args.device).strip().lower() if args.device is not None else "default"
@@ -1097,12 +1363,19 @@ def main() -> None:
         return
 
     print("[autodiff-gate] progress: running baseline realtime rollout for FD trace", flush=True)
-    baseline_components, baseline_rollout, _baseline_final_state = _schedule_rollout(
+    (
+        baseline_components,
+        baseline_prepared_rollout,
+        baseline_execution_context,
+        baseline_rollout,
+        _baseline_final_state,
+    ) = _schedule_rollout(
         config,
         baseline_runtime,
         baseline_profile_state,
         accepted_step_limit=args.accepted_step_limit,
     )
+    baseline_replay_reference = baseline_prepared_rollout
     frozen_trace = _truncate_rollout_trace_by_accepted_steps(
         baseline_rollout.trace,
         args.accepted_step_limit,
@@ -1181,6 +1454,8 @@ def main() -> None:
             profile_values=minus_profile_values,
             frozen_trace=frozen_trace,
             replay_mode=args.replay_mode,
+            fd_accepted_replay_contract=args.fd_accepted_replay_contract,
+            baseline_replay_reference=baseline_replay_reference,
             initial_er_root_ad=initial_er_root_ad,
             initial_er_root_fd_root_lane=full_root_fd_lane,
             baseline_er_profile=baseline_er_profile,
@@ -1201,6 +1476,8 @@ def main() -> None:
             profile_values=plus_profile_values,
             frozen_trace=frozen_trace,
             replay_mode=args.replay_mode,
+            fd_accepted_replay_contract=args.fd_accepted_replay_contract,
+            baseline_replay_reference=baseline_replay_reference,
             initial_er_root_ad=initial_er_root_ad,
             initial_er_root_fd_root_lane=full_root_fd_lane,
             baseline_er_profile=baseline_er_profile,
@@ -1233,6 +1510,8 @@ def main() -> None:
             profile_cfg=profile_cfg,
             frozen_trace=frozen_trace,
             replay_mode=args.replay_mode,
+            fd_accepted_replay_contract=args.fd_accepted_replay_contract,
+            baseline_replay_reference=baseline_replay_reference,
             geometry_fd_lane=geometry_fd_lane,
             frozen_linearized_bundle=frozen_linearized_bundle,
             fixed_initial_er=fixed_initial_er,
@@ -1277,6 +1556,8 @@ def main() -> None:
             profile_cfg=profile_cfg,
             frozen_trace=frozen_trace,
             replay_mode=args.replay_mode,
+            fd_accepted_replay_contract=args.fd_accepted_replay_contract,
+            baseline_replay_reference=baseline_replay_reference,
             geometry_fd_lane=geometry_fd_lane,
             frozen_linearized_bundle=frozen_linearized_bundle,
             fixed_initial_er=fixed_initial_er,
@@ -1328,6 +1609,8 @@ def main() -> None:
                 profile_values=profile_values,
                 frozen_trace=frozen_trace,
                 replay_mode=args.replay_mode,
+                fd_accepted_replay_contract=args.fd_accepted_replay_contract,
+                baseline_replay_reference=baseline_replay_reference,
                 initial_er_root_ad=initial_er_root_ad,
                 initial_er_root_fd_root_lane=full_root_fd_lane,
                 baseline_er_profile=baseline_er_profile,
@@ -1342,6 +1625,8 @@ def main() -> None:
                 profile_values=profile_values,
                 frozen_trace=frozen_trace,
                 replay_mode=args.replay_mode,
+                fd_accepted_replay_contract=args.fd_accepted_replay_contract,
+                baseline_replay_reference=baseline_replay_reference,
                 initial_er_root_ad=initial_er_root_ad,
                 initial_er_root_fd_root_lane=full_root_fd_lane,
                 baseline_er_profile=baseline_er_profile,
@@ -1356,6 +1641,8 @@ def main() -> None:
                 profile_values=profile_values,
                 frozen_trace=frozen_trace,
                 replay_mode=args.replay_mode,
+                fd_accepted_replay_contract=args.fd_accepted_replay_contract,
+                baseline_replay_reference=baseline_replay_reference,
                 initial_er_root_ad=initial_er_root_ad,
                 initial_er_root_fd_root_lane=full_root_fd_lane,
                 baseline_er_profile=baseline_er_profile,
@@ -1370,6 +1657,8 @@ def main() -> None:
                 profile_values=profile_values,
                 frozen_trace=frozen_trace,
                 replay_mode=args.replay_mode,
+                fd_accepted_replay_contract=args.fd_accepted_replay_contract,
+                baseline_replay_reference=baseline_replay_reference,
                 initial_er_root_ad=initial_er_root_ad,
                 initial_er_root_fd_root_lane=full_root_fd_lane,
                 baseline_er_profile=baseline_er_profile,
@@ -1505,6 +1794,7 @@ def main() -> None:
         "baseline_value": float(baseline_value),
         "fd_step": float(h),
         "replay_mode": str(args.replay_mode),
+        "fd_accepted_replay_contract": str(args.fd_accepted_replay_contract),
         "geometry_fd_lane": str(geometry_fd_lane),
         "initial_er_root_ad": str(initial_er_root_ad),
         "initial_er_root_fd_root_lane": str(full_root_fd_lane),
@@ -1564,7 +1854,9 @@ def main() -> None:
         "[autodiff-gate] mode=transport_realtime_geometry_forward_fd "
         f"parameter={parameter_name} parameter_kind={parameter_kind} "
         f"baseline_value={baseline_value:.6e} fd_step={h:.6e} "
-        f"replay_mode={args.replay_mode} geometry_fd_lane={geometry_fd_lane} "
+        f"replay_mode={args.replay_mode} "
+        f"fd_accepted_replay_contract={args.fd_accepted_replay_contract} "
+        f"geometry_fd_lane={geometry_fd_lane} "
         f"root_fd_lane={full_root_fd_lane}"
     )
     print("[autodiff-gate] objective values:")
