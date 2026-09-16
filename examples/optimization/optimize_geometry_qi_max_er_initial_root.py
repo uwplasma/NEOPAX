@@ -122,7 +122,7 @@ terms = [
     (mirror_penalization, 0.0, MIRROR_WEIGHT),
     (opt.geometry.vmec_aspect_ratio, ASPECT_TARGET, ASPECT_WEIGHT),
     (opt.geometry.vmec_iota_mean, IOTA_TARGET, IOTA_WEIGHT),
-    # (softmax_er, MAX_ER_TARGET, MAX_ER_WEIGHT),
+    (softmax_er, MAX_ER_TARGET, MAX_ER_WEIGHT),
 ]
 
 

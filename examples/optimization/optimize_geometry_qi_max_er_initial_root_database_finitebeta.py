@@ -208,27 +208,8 @@ def save_er_profile(problem, x, out_dir: Path, label: str, *, profiles=None) -> 
         print(f"skipping Er profile plot: {exc}")
         return
 
-    finite_rho = rho_np[finite_np]
-    finite_er = er_np[finite_np]
-    marker_rho = None
-    if finite_rho.size >= 2:
-        sign_change = np.flatnonzero(finite_er[:-1] * finite_er[1:] <= 0.0)
-        if sign_change.size:
-            index = int(sign_change[0])
-            denominator = finite_er[index + 1] - finite_er[index]
-            fraction = 0.0 if abs(denominator) < 1.0e-30 else -finite_er[index] / denominator
-            marker_rho = float(
-                finite_rho[index]
-                + np.clip(fraction, 0.0, 1.0) * (finite_rho[index + 1] - finite_rho[index])
-            )
-        else:
-            jump_index = int(np.argmax(np.abs(np.diff(finite_er))))
-            marker_rho = float(0.5 * (finite_rho[jump_index] + finite_rho[jump_index + 1]))
-
     fig, ax = plt.subplots(figsize=(6.8, 5.6))
     ax.plot(rho_np, er_np, color="red", linewidth=3.2, solid_capstyle="round")
-    if marker_rho is not None:
-        ax.axvline(marker_rho, color="black", linewidth=1.8, ymin=0.25, ymax=0.93)
     ax.set_xlabel(r"$\rho$", fontsize=20)
     ax.set_ylabel(r"$E_r$ [$\mathrm{kV}/\mathrm{m}$]", fontsize=20)
     ax.tick_params(axis="both", labelsize=16, width=1.0, length=4)
