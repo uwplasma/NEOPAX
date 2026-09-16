@@ -328,6 +328,52 @@ def plot_physical_j_polar_contours(out, out_dir: Path):
     return written
 
 
+def plot_vmex_physical_j_contours_from_wout(
+    wout_path,
+    out_dir,
+    *,
+    surfaces,
+    mboz: int,
+    nboz: int,
+    trapping_depths=(0.35, 0.55, 0.75),
+    physical_pitches=None,
+    nalpha: int = 96,
+    points_per_period: int = 64,
+    num_periods: int = 6,
+    max_wells: int | None = 24,
+    quadrature_order: int = 32,
+    jit_boozer: bool = True,
+):
+    """Evaluate and plot VMEX's resolved actual-well physical ``J`` maps.
+
+    This is deliberately independent of the QI/max-J objective backend used by
+    an optimization.  Surrogate and physical objectives therefore receive the
+    same physical post-processing diagnostic.
+    """
+
+    pitches = () if physical_pitches is None else tuple(physical_pitches)
+    out = _physical_j_invariant_from_wout(
+        Path(wout_path),
+        surfaces=tuple(float(value) for value in surfaces),
+        mboz=int(mboz),
+        nboz=int(nboz),
+        nalpha=int(nalpha),
+        points_per_period=int(points_per_period),
+        num_periods=int(num_periods),
+        trapping_depths=tuple(float(value) for value in trapping_depths),
+        physical_pitches=pitches,
+        max_wells=max_wells,
+        quadrature_order=int(quadrature_order),
+        jit_boozer=bool(jit_boozer),
+    )
+    print(
+        "[vmex physical J] pitches_T^-1="
+        + ",".join(f"{value:.16g}" for value in out["physical_pitches"]),
+        flush=True,
+    )
+    return plot_physical_j_polar_contours(out, Path(out_dir))
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("wout", type=Path, help="Path to wout_*.nc.")

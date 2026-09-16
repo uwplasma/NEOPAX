@@ -298,7 +298,24 @@ def save_transport_profiles(problem, x, out_dir: Path, label: str) -> None:
     save_bootstrap_current_profile(problem, x, out_dir, label, profiles=profiles)
 
 
-def plot_j_polar_contours(eq, out_dir: Path, *, lambda_samples=(0.1, 0.3, 0.5, 0.7, 0.9)) -> None:
+def plot_j_polar_contours(
+    eq, out_dir: Path, *, wout_path=None, physical_pitches=None,
+    lambda_samples=(0.1, 0.3, 0.5, 0.7, 0.9)
+) -> None:
+    if wout_path is not None:
+        try:
+            from examples.optimization.plot_j_contours_from_wout import (
+                plot_vmex_physical_j_contours_from_wout,
+            )
+
+            plot_vmex_physical_j_contours_from_wout(
+                wout_path, out_dir, surfaces=SURFACES, mboz=QI_MBOZ, nboz=QI_NBOZ,
+                trapping_depths=PHYSICAL_J_TRAPPING_DEPTHS,
+                physical_pitches=physical_pitches,
+            )
+        except Exception as exc:
+            print(f"skipping VMEX physical-J plots: {exc}")
+        return
     try:
         import matplotlib.pyplot as plt
         from vmex.core.omnigenity_j import JInvariantQIResidual
@@ -483,7 +500,7 @@ def plot_active_finite_beta_objectives(eq, out_dir: Path, label: str) -> None:
             print(f"skipping beta-total plot: {exc}")
 
 
-def write_geometry_artifacts(input_obj, label: str) -> Path:
+def write_geometry_artifacts(input_obj, label: str, *, physical_pitches=None) -> Path:
     artifact_dir = OUT_DIR / label
     artifact_dir.mkdir(parents=True, exist_ok=True)
     input_path = artifact_dir / f"input.QI_neopax_database_finitebeta_transition_{label}"
@@ -503,12 +520,18 @@ def write_geometry_artifacts(input_obj, label: str) -> Path:
     if MAKE_BOOZER_B_CONTOUR_PLOTS:
         plot_boozer_b_contours(eq.wout, artifact_dir, label)
     if MAKE_J_POLAR_PLOTS:
-        plot_j_polar_contours(eq, artifact_dir)
+        plot_j_polar_contours(
+            eq, artifact_dir, wout_path=wout_path,
+            physical_pitches=physical_pitches,
+        )
     plot_active_finite_beta_objectives(eq, artifact_dir, label)
     return artifact_dir
 
 
-def write_outputs(initial_input, optimized_input, initial_problem, initial_x, final_problem, final_x) -> None:
+def write_outputs(
+    initial_input, optimized_input, initial_problem, initial_x, final_problem, final_x,
+    *, physical_pitches=None,
+) -> None:
     seed_copy = OUT_DIR / SEED_INPUT.name
     optimized_path = OUT_DIR / "input.QI_neopax_database_finitebeta_transition_optimized"
     initial_input.to_indata(seed_copy)
@@ -519,11 +542,15 @@ def write_outputs(initial_input, optimized_input, initial_problem, initial_x, fi
         initial_dir = OUT_DIR / "initial"
         initial_dir.mkdir(parents=True, exist_ok=True)
         save_transport_profiles(initial_problem, initial_x, initial_dir, "initial")
-        write_geometry_artifacts(initial_input, "initial")
+        write_geometry_artifacts(
+            initial_input, "initial", physical_pitches=physical_pitches
+        )
     optimized_dir = OUT_DIR / "optimized"
     optimized_dir.mkdir(parents=True, exist_ok=True)
     save_transport_profiles(final_problem, final_x, optimized_dir, "optimized")
-    write_geometry_artifacts(optimized_input, "optimized")
+    write_geometry_artifacts(
+        optimized_input, "optimized", physical_pitches=physical_pitches
+    )
 
 
 def main() -> int:
@@ -590,6 +617,7 @@ def main() -> int:
         initial_x,
         final_problem,
         np.asarray(final_result.x, dtype=float),
+        physical_pitches=frozen_physical_pitches,
     )
     summary = {"seed_input": str(SEED_INPUT), "database_transport_config": str(DATABASE_TRANSPORT_CONFIG), "database_resolution_theta_phi_xi": [args.database_n_theta, args.database_n_phi, args.database_n_xi], "reverse_stage_mode": REVERSE_STAGE_MODE, "include_beta": INCLUDE_BETA, "include_dmerc": INCLUDE_DMERC, "parameter_labels": list(final_problem.parameter_labels), "x": np.asarray(final_result.x, dtype=float).tolist(), "cost": float(final_result.cost), "optimality": float(final_result.optimality), "status": int(final_result.status), "message": str(final_result.message)}
     (OUT_DIR / "optimization_summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")

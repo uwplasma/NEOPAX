@@ -357,8 +357,34 @@ def save_transport_profiles(problem, x, out_dir: Path, label: str) -> None:
     save_bootstrap_current_profile(problem, x, out_dir, label, profiles=profiles)
 
 
-def plot_j_polar_contours(eq, out_dir: Path, *, lambda_samples=(0.1, 0.3, 0.5, 0.7, 0.9)) -> None:
+def plot_j_polar_contours(
+    eq,
+    out_dir: Path,
+    *,
+    wout_path=None,
+    physical_pitches=None,
+    lambda_samples=(0.1, 0.3, 0.5, 0.7, 0.9),
+) -> None:
     """Write polar contours of the second adiabatic invariant and its QI target."""
+
+    if wout_path is not None:
+        try:
+            from examples.optimization.plot_j_contours_from_wout import (
+                plot_vmex_physical_j_contours_from_wout,
+            )
+
+            plot_vmex_physical_j_contours_from_wout(
+                wout_path,
+                out_dir,
+                surfaces=SURFACES,
+                mboz=QI_MBOZ,
+                nboz=QI_NBOZ,
+                trapping_depths=PHYSICAL_J_TRAPPING_DEPTHS,
+                physical_pitches=physical_pitches,
+            )
+        except Exception as exc:
+            print(f"skipping VMEX physical-J plots: {exc}")
+        return
 
     try:
         import matplotlib.pyplot as plt
@@ -509,7 +535,7 @@ def plot_boozer_b_contours(wout, out_dir: Path, label: str, *, ntheta=128, nphi=
         print(f"wrote {png_path}")
 
 
-def write_geometry_artifacts(input_obj, label: str) -> Path:
+def write_geometry_artifacts(input_obj, label: str, *, physical_pitches=None) -> Path:
     """Solve once and write the standard VMEX, J, and |B| diagnostics."""
 
     artifact_dir = OUT_DIR / label
@@ -531,7 +557,12 @@ def write_geometry_artifacts(input_obj, label: str) -> Path:
     if MAKE_BOOZER_B_CONTOUR_PLOTS:
         plot_boozer_b_contours(equilibrium.wout, artifact_dir, label)
     if MAKE_J_POLAR_PLOTS:
-        plot_j_polar_contours(equilibrium, artifact_dir)
+        plot_j_polar_contours(
+            equilibrium,
+            artifact_dir,
+            wout_path=wout_path,
+            physical_pitches=physical_pitches,
+        )
     return artifact_dir
 
 
@@ -623,14 +654,18 @@ def main() -> int:
         "initial",
     )
     if MAKE_INITIAL_PLOTS:
-        write_geometry_artifacts(initial_input, "initial")
+        write_geometry_artifacts(
+            initial_input, "initial", physical_pitches=frozen_physical_pitches
+        )
     save_transport_profiles(
         final_problem,
         np.asarray(final_result.x, dtype=float),
         OUT_DIR / "optimized",
         "optimized",
     )
-    write_geometry_artifacts(optimized_input, "optimized")
+    write_geometry_artifacts(
+        optimized_input, "optimized", physical_pitches=frozen_physical_pitches
+    )
     summary = {
         "seed_input": str(seed_input), "database_transport_config": str(DATABASE_TRANSPORT_CONFIG),
         "database_resolution_theta_phi_xi": [args.database_n_theta, args.database_n_phi, args.database_n_xi],

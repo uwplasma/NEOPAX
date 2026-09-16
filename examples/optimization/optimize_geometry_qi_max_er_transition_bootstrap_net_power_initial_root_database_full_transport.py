@@ -335,7 +335,24 @@ def report(tag, problem, x):
     return evaluation
 
 
-def plot_j_polar_contours(eq, out_dir, *, lambda_samples=(0.1, 0.3, 0.5, 0.7, 0.9)):
+def plot_j_polar_contours(
+    eq, out_dir, *, wout_path=None, physical_pitches=None,
+    lambda_samples=(0.1, 0.3, 0.5, 0.7, 0.9)
+):
+    if wout_path is not None:
+        try:
+            from examples.optimization.plot_j_contours_from_wout import (
+                plot_vmex_physical_j_contours_from_wout,
+            )
+
+            plot_vmex_physical_j_contours_from_wout(
+                wout_path, out_dir, surfaces=SURFACES, mboz=QI_MBOZ, nboz=QI_NBOZ,
+                trapping_depths=PHYSICAL_J_TRAPPING_DEPTHS,
+                physical_pitches=physical_pitches,
+            )
+        except Exception as exc:
+            print(f"skipping VMEX physical-J plots: {exc}")
+        return
     """Write polar contours of the second adiabatic invariant and its QI target."""
 
     try:
@@ -486,7 +503,7 @@ def plot_boozer_b_contours(wout, out_dir, label, *, ntheta=128, nphi=128):
         print(f"wrote {png_path}")
 
 
-def write_geometry_artifacts(input_obj, label, out_dir):
+def write_geometry_artifacts(input_obj, label, out_dir, *, physical_pitches=None):
     artifact_dir = out_dir / label
     artifact_dir.mkdir(parents=True, exist_ok=True)
     input_path = artifact_dir / f"input.QI_neopax_geometry_full_transport_{label}"
@@ -504,7 +521,10 @@ def write_geometry_artifacts(input_obj, label, out_dir):
     if MAKE_BOOZER_B_CONTOUR_PLOTS:
         plot_boozer_b_contours(eq.wout, artifact_dir, label)
     if MAKE_J_POLAR_PLOTS:
-        plot_j_polar_contours(eq, artifact_dir)
+        plot_j_polar_contours(
+            eq, artifact_dir, wout_path=wout_path,
+            physical_pitches=physical_pitches,
+        )
     return artifact_dir
 
 
@@ -529,7 +549,10 @@ def write_transport_report(input_obj, label, config, out_dir):
     return result
 
 
-def write_outputs(optimized_input, initial_input, *, config, out_dir, seed_input, make_initial_plots):
+def write_outputs(
+    optimized_input, initial_input, *, config, out_dir, seed_input,
+    make_initial_plots, physical_pitches=None,
+):
     out_dir.mkdir(parents=True, exist_ok=True)
     seed_copy = out_dir / seed_input.name
     optimized_input_path = out_dir / "input.QI_neopax_database_full_transport_net_power_optimized"
@@ -538,9 +561,13 @@ def write_outputs(optimized_input, initial_input, *, config, out_dir, seed_input
     print(f"wrote {seed_copy}")
     print(f"wrote {optimized_input_path}")
     if make_initial_plots:
-        write_geometry_artifacts(initial_input, "initial", out_dir)
+        write_geometry_artifacts(
+            initial_input, "initial", out_dir, physical_pitches=physical_pitches
+        )
         write_transport_report(initial_input, "initial", config, out_dir)
-    write_geometry_artifacts(optimized_input, "optimized", out_dir)
+    write_geometry_artifacts(
+        optimized_input, "optimized", out_dir, physical_pitches=physical_pitches
+    )
     write_transport_report(optimized_input, "optimized", config, out_dir)
 
 
@@ -704,6 +731,7 @@ def main() -> int:
         out_dir=out_dir,
         seed_input=seed_input,
         make_initial_plots=args.initial_plots,
+        physical_pitches=frozen_physical_pitches,
     )
     return 0
 

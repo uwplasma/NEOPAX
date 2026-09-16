@@ -326,39 +326,32 @@ def save_transport_profiles_for_input(vmec_input, out_dir, label):
 
 
 def plot_physical_j_polar_contours(wout_path, out_dir, *, physical_pitches=None):
-    """Plot the same resolved physical J and Boozer tables as the objective."""
+    """Plot VMEX's resolved actual-well physical J diagnostic."""
 
     try:
         from examples.optimization.plot_j_contours_from_wout import (
-            _physical_j_invariant_from_wout,
-            plot_physical_j_polar_contours as write_physical_j_plots,
+            plot_vmex_physical_j_contours_from_wout,
         )
     except Exception as exc:
         print(f"skipping physical-J polar plots: {exc}")
         return
 
-    settings = qi_maxj_backend_settings(physical_pitches)
     try:
-        out = _physical_j_invariant_from_wout(
-            Path(wout_path),
+        plot_vmex_physical_j_contours_from_wout(
+            wout_path,
+            out_dir,
             surfaces=tuple(float(value) for value in SURFACES),
             mboz=QI_MBOZ,
             nboz=QI_NBOZ,
+            trapping_depths=PHYSICAL_J_TRAPPING_DEPTHS,
+            physical_pitches=physical_pitches,
             nalpha=PHYSICAL_J_PLOT_NALPHA,
             points_per_period=PHYSICAL_J_PLOT_POINTS_PER_PERIOD,
             num_periods=PHYSICAL_J_PLOT_NUM_PERIODS,
-            trapping_depths=settings.trapping_depths,
-            physical_pitches=(settings.physical_pitches or ()),
             max_wells=PHYSICAL_J_PLOT_MAX_WELLS,
             quadrature_order=PHYSICAL_J_PLOT_QUADRATURE_ORDER,
             jit_boozer=True,
         )
-        print(
-            "[physical J] pitches_T^-1="
-            + ",".join(f"{value:.16g}" for value in out["physical_pitches"]),
-            flush=True,
-        )
-        write_physical_j_plots(out, out_dir)
     except Exception as exc:
         print(f"skipping physical-J polar plots: {exc}")
 
@@ -371,80 +364,12 @@ def plot_j_polar_contours(
     lambda_samples=(0.1, 0.3, 0.5, 0.7, 0.9),
     physical_pitches=None,
 ):
-    backend = str(QI_MAXJ_BACKEND).strip().lower()
-    if backend == "physical":
-        plot_physical_j_polar_contours(
-            wout_path, out_dir, physical_pitches=physical_pitches
-        )
-        return
-    if backend != "surrogate":
-        print(
-            "skipping J-polar plots: QI_MAXJ_BACKEND must be "
-            "'surrogate' or 'physical'"
-        )
-        return
-    try:
-        import matplotlib.pyplot as plt
-        from vmex.core.omnigenity_j import JInvariantQIResidual
-    except Exception as exc:
-        print(f"skipping J-polar plots: {exc}")
-        return
-
-    objective = JInvariantQIResidual(
-        SURFACES,
-        mboz=QI_MBOZ,
-        nboz=QI_NBOZ,
+    del eq, lambda_samples
+    plot_physical_j_polar_contours(
+        wout_path,
+        out_dir,
+        physical_pitches=physical_pitches,
     )
-    try:
-        out = objective.compute_state(eq.state, eq.runtime)
-    except Exception as exc:
-        print(f"skipping J-polar plots: {exc}")
-        return
-
-    alpha = np.asarray(out["alpha"], dtype=float)
-    surfaces = np.asarray(out["surfaces"], dtype=float)
-    ji = np.asarray(out["ji"], dtype=float)
-    jc = np.asarray(out["jc"], dtype=float)
-    lambda_grid = np.power(
-        np.arange(objective.n_bounce, dtype=float) / max(objective.n_bounce - 1, 1),
-        objective.p_lambda,
-    )
-
-    theta = np.concatenate([alpha, alpha[:1] + 2.0 * np.pi])
-    theta_grid, radius_grid = np.meshgrid(theta, surfaces, indexing="xy")
-    sample_idx = sorted(
-        {
-            int(np.clip(round(lam * (objective.n_bounce - 1)), 0, objective.n_bounce - 1))
-            for lam in lambda_samples
-        }
-    )
-
-    for name, data in (("ji", ji), ("jc", jc)):
-        for idx in sample_idx:
-            values = data[:, :, idx]
-            values_periodic = np.concatenate([values, values[:, :1]], axis=1)
-            display_name = r"$\mathcal{J}$" if name == "ji" else r"$J_C$"
-            title_name = r"$\mathcal{J}$" if name == "ji" else r"$J_C$"
-            fig = plt.figure(figsize=(5.4, 5.8))
-            ax_polar = fig.add_subplot(1, 1, 1, projection="polar")
-            contour = ax_polar.contourf(theta_grid, radius_grid, values_periodic, levels=40, cmap="plasma")
-            ax_polar.set_title(f"Second adiabatic invariant, {title_name}", fontsize=15, pad=20)
-            ax_polar.set_ylim(0.0, float(surfaces.max()))
-            ax_polar.set_thetagrids(np.arange(0, 360, 45), fontsize=8)
-            radial_ticks = np.linspace(0.2, float(surfaces.max()), 5)
-            ax_polar.set_rticks(radial_ticks)
-            ax_polar.set_yticklabels([f"{tick:.1f}" for tick in radial_ticks], fontsize=8)
-            ax_polar.set_rlabel_position(45)
-            ax_polar.grid(color="white", linewidth=0.8, alpha=0.45)
-            colorbar = fig.colorbar(contour, ax=ax_polar, pad=0.12, shrink=0.78)
-            colorbar.set_label(display_name, fontsize=11)
-            colorbar.ax.tick_params(labelsize=8)
-            fig.text(0.5, 0.035, rf"$\lambda$ = {lambda_grid[idx]:.2f}", ha="center", va="center", fontsize=15)
-            fig.tight_layout(rect=(0.0, 0.06, 1.0, 1.0))
-            path = out_dir / f"{name}_polar_lambda_{idx:02d}.png"
-            fig.savefig(path, dpi=320, bbox_inches="tight")
-            plt.close(fig)
-            print(f"wrote {path}")
 
 
 def plot_b_on_axis(wout, out_dir, label, *, nphi=256):
