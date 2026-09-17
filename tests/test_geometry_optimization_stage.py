@@ -1180,7 +1180,7 @@ def test_full_transport_transition_objective_indices_are_selectable():
 
 
 def test_full_transport_smooth_transition_location_ignores_near_axis_zero():
-    """The optional location row selects the outward +Er to -Er transition."""
+    """The optional rows require an ordered +Er to -Er bracket."""
 
     rho = jnp.linspace(0.0, 1.0, 11, dtype=jnp.float64)
     er = jnp.asarray(
@@ -1211,6 +1211,33 @@ def test_full_transport_smooth_transition_location_ignores_near_axis_zero():
             flat_er,
             rho,
             target_rho=0.55,
+            rho_min=0.25,
+            rho_max=0.75,
+            temperature_kv_m=1.0,
+        )
+    )
+    all_negative_strength = (
+        reverse_transport.smooth_positive_to_negative_er_transition_strength(
+            -jnp.linspace(1.0, 11.0, 11, dtype=jnp.float64),
+            rho,
+            rho_min=0.25,
+            rho_max=0.75,
+            temperature_kv_m=1.0,
+        )
+    )
+    all_positive_strength = (
+        reverse_transport.smooth_positive_to_negative_er_transition_strength(
+            jnp.linspace(11.0, 1.0, 11, dtype=jnp.float64),
+            rho,
+            rho_min=0.25,
+            rho_max=0.75,
+            temperature_kv_m=1.0,
+        )
+    )
+    reversed_strength = (
+        reverse_transport.smooth_positive_to_negative_er_transition_strength(
+            -er,
+            rho,
             rho_min=0.25,
             rho_max=0.75,
             temperature_kv_m=1.0,
@@ -1247,6 +1274,9 @@ def test_full_transport_smooth_transition_location_ignores_near_axis_zero():
     assert float(strength) > 0.9
     assert bool(jnp.isfinite(flat_location))
     assert float(flat_strength) < 1.0e-4
+    assert float(all_negative_strength) < 0.5
+    assert float(all_positive_strength) < 0.5
+    assert float(reversed_strength) < 0.5
     assert abs(float(flat_location_moment)) < 1.0e-4
     assert bool(jnp.all(jnp.isfinite(flat_strength_gradient)))
     assert float(jnp.linalg.norm(flat_strength_gradient)) > 0.0

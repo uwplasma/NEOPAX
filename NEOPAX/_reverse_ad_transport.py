@@ -1327,20 +1327,24 @@ def smooth_positive_to_negative_er_transition_metrics(
     *,
     rho_min: float = 0.25,
     rho_max: float = 0.75,
+    rho_prior: float | None = None,
     temperature_kv_m: float = 2.0,
     positive_part_eps: float = 1.0e-6,
 ) -> tuple[jax.Array, jax.Array]:
-    """Smooth location and strength of an ion-to-electron Er transition.
+    """Return a finite smooth location and ordered sign-crossing strength.
 
-    The score is the smooth positive part of the radial drop in
-    ``sigmoid(Er / temperature_kv_m)``.  Consequently a positive-to-negative
-    transition receives order-one weight, while a flat near-zero axis does
-    not.  The fixed radial window is deliberately applied on cell faces so a
-    near-axis zero cannot win the soft location objective.
+    Every ordered radial pair inside the fixed window contributes evidence
+    only when the inner point is positive and the outer point is negative.
+    The neutral ``Er=0`` pair probability is subtracted before taking a smooth
+    positive part, so a zero profile has zero strength while retaining a
+    useful gradient.  Strong all-positive or all-negative profiles cannot
+    produce strength above one third; a strength near one therefore requires
+    a genuine ordered positive-to-negative bracket.
 
-    ``Er_transition_left`` and ``Er_transition_right`` remain independent
-    objectives.  They can be retained alongside this location objective to
-    enforce the desired signs and transition strength.
+    Each ordered pair also supplies a smooth linearly interpolated zero
+    location.  When crossing evidence is weak the location is smoothly
+    regularized to ``rho_prior`` (the window midpoint by default), keeping the
+    objective finite without inventing a high-confidence crossing.
     """
 
     er = jnp.asarray(er_profile)
@@ -1353,20 +1357,65 @@ def smooth_positive_to_negative_er_transition_metrics(
     temperature = jnp.asarray(temperature_kv_m, dtype=er.dtype)
     eps = jnp.asarray(positive_part_eps, dtype=er.dtype)
     ion_probability = jax.nn.sigmoid(er / temperature)
-    signed_drop = ion_probability[:-1] - ion_probability[1:]
-    transition_score = 0.5 * (
-        signed_drop + jnp.sqrt(signed_drop * signed_drop + eps * eps)
+
+    inner_probability = ion_probability[:, None]
+    outer_negative_probability = (1.0 - ion_probability)[None, :]
+    neutral_pair_probability = jnp.asarray(0.25, dtype=er.dtype)
+    pair_probability_scale = jnp.asarray(0.75, dtype=er.dtype)
+    raw_pair_score = (
+        inner_probability * outer_negative_probability
+        - neutral_pair_probability
+    ) / pair_probability_scale
+    pair_score = 0.5 * (
+        raw_pair_score + jnp.sqrt(raw_pair_score * raw_pair_score + eps * eps)
     )
-    rho_faces = 0.5 * (rho[:-1] + rho[1:])
-    radial_mask = (rho_faces >= jnp.asarray(rho_min, dtype=er.dtype)) & (
-        rho_faces <= jnp.asarray(rho_max, dtype=er.dtype)
+
+    node_mask = (rho >= jnp.asarray(rho_min, dtype=er.dtype)) & (
+        rho <= jnp.asarray(rho_max, dtype=er.dtype)
     )
-    weights = jnp.where(radial_mask, transition_score, 0.0)
-    weight_sum = jnp.sum(weights)
-    location = jnp.sum(rho_faces * weights) / jnp.maximum(
-        weight_sum, jnp.asarray(1.0e-30, dtype=er.dtype)
+    ordered_mask = (
+        node_mask[:, None]
+        & node_mask[None, :]
+        & (rho[:, None] < rho[None, :])
     )
-    return location, weight_sum
+    pair_score = jnp.where(ordered_mask, pair_score, 0.0)
+
+    # A softmax-weighted maximum stays smooth and bounded by the strongest
+    # ordered pair.  Unlike a sum, many weak same-sign pairs cannot masquerade
+    # as one strong crossing.
+    softmax_beta = jnp.asarray(32.0, dtype=er.dtype)
+    flat_pair_score = jnp.reshape(pair_score, (-1,))
+    strength_weights = jax.nn.softmax(softmax_beta * flat_pair_score)
+    strength = jnp.sum(strength_weights * flat_pair_score)
+
+    smooth_abs_er = jnp.sqrt(
+        er * er + (temperature * eps) * (temperature * eps)
+    )
+    inner_abs = smooth_abs_er[:, None]
+    outer_abs = smooth_abs_er[None, :]
+    interpolation_fraction = inner_abs / jnp.maximum(
+        inner_abs + outer_abs,
+        jnp.asarray(1.0e-30, dtype=er.dtype),
+    )
+    pair_location = rho[:, None] + (
+        rho[None, :] - rho[:, None]
+    ) * interpolation_fraction
+    candidate_location = jnp.sum(
+        jnp.reshape(strength_weights, pair_score.shape) * pair_location
+    )
+
+    prior = jnp.asarray(
+        0.5 * (float(rho_min) + float(rho_max))
+        if rho_prior is None
+        else rho_prior,
+        dtype=er.dtype,
+    )
+    location_confidence = jax.nn.sigmoid(
+        jnp.asarray(32.0, dtype=er.dtype)
+        * (strength - jnp.asarray(0.5, dtype=er.dtype))
+    )
+    location = prior + location_confidence * (candidate_location - prior)
+    return location, strength
 
 
 def smooth_positive_to_negative_er_transition_rho(
@@ -1405,7 +1454,7 @@ def smooth_positive_to_negative_er_transition_location_moment(
     """Return ``strength * (location - target)`` for an existence-gated cost."""
 
     location, strength = smooth_positive_to_negative_er_transition_metrics(
-        er_profile, rho_grid, **kwargs
+        er_profile, rho_grid, rho_prior=target_rho, **kwargs
     )
     return strength * (
         location - jnp.asarray(target_rho, dtype=jnp.asarray(er_profile).dtype)
@@ -1578,6 +1627,7 @@ def objective_scalar_by_index(
             runtime.geometry.rho_grid,
             rho_min=er_transition_rho_min,
             rho_max=er_transition_rho_max,
+            rho_prior=er_transition_rho_target,
             temperature_kv_m=er_transition_temperature_kv_m,
             positive_part_eps=er_transition_positive_part_eps,
         )

@@ -246,6 +246,12 @@ def positive_part(value):
     return jnp.maximum(value, 0.0)
 
 
+def smooth_positive_part(value, eps: float = 1.0e-6):
+    value_arr = jnp.asarray(value)
+    eps_arr = jnp.asarray(eps, dtype=value_arr.dtype)
+    return 0.5 * (value_arr + jnp.sqrt(value_arr * value_arr + eps_arr * eps_arr))
+
+
 mirror_penalization = opt.transformed_geometry_objective(
     opt.geometry.vmec_mirror_ratio,
     lambda mirror_ratio: positive_part(mirror_ratio - MIRROR_TARGET),
@@ -279,6 +285,13 @@ def active_terms(args: argparse.Namespace):
             )
         )
     if args.transition_location_objective:
+        transition_strength_deficit = opt.transformed_transport_objective(
+            opt.transport.Er_transition_strength,
+            lambda strength: smooth_positive_part(
+                args.er_transition_strength_target - strength
+            ),
+            label="Er_transition_strength_deficit",
+        )
         terms.extend(
             (
                 # Report the normalized location without optimizing its undefined
@@ -291,7 +304,12 @@ def active_terms(args: argparse.Namespace):
                 ),
                 (
                     opt.transport.Er_transition_strength,
-                    args.er_transition_strength_target,
+                    0.0,
+                    0.0,
+                ),
+                (
+                    transition_strength_deficit,
+                    0.0,
                     ER_TRANSITION_STRENGTH_WEIGHT,
                 ),
             )
@@ -368,7 +386,8 @@ def iteration_diagnostics(evaluation):
         f"Er_transition_location_moment={value('transport:Er_transition_location_moment', 'Er_transition_location_moment'):.8e} "
         f"Er_transition_location_cost={component_cost('transport:Er_transition_location_moment', 'Er_transition_location_moment'):.8e} "
         f"Er_transition_strength={value('transport:Er_transition_strength', 'Er_transition_strength'):.8e} "
-        f"Er_transition_strength_cost={component_cost('transport:Er_transition_strength', 'Er_transition_strength'):.8e} "
+        f"Er_transition_strength_deficit={value('Er_transition_strength_deficit'):.8e} "
+        f"Er_transition_strength_cost={component_cost('Er_transition_strength_deficit'):.8e} "
         f"bootstrap_penalty={value('bootstrap_current_penalty', 'transport:bootstrap_current_penalty'):.8e} "
         f"bootstrap_cost={component_cost('bootstrap_current_penalty', 'transport:bootstrap_current_penalty'):.8e} "
         f"net_power_average_MW_m3={net_power_average:.8e} "
