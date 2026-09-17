@@ -2093,6 +2093,8 @@ def full_transport_profile_least_squares_problem(
     er_transition_rho_target: float = 0.5,
     er_transition_temperature_kv_m: float = 2.0,
     er_transition_positive_part_eps: float = 1.0e-6,
+    er_transition_rho_softness: float = 0.05,
+    er_transition_softmax_beta: float = 16.0,
     radau_jacobian_reuse_mode: str = "legacy",
     reverse_stage_adjoint_solve_mode: str = "bicgstab",
     reverse_rhs_transpose_mode: str = "explicit_ntx_interpolated",
@@ -2120,6 +2122,10 @@ def full_transport_profile_least_squares_problem(
         raise ValueError("er_transition_temperature_kv_m must be positive.")
     if float(er_transition_positive_part_eps) <= 0.0:
         raise ValueError("er_transition_positive_part_eps must be positive.")
+    if float(er_transition_rho_softness) <= 0.0:
+        raise ValueError("er_transition_rho_softness must be positive.")
+    if float(er_transition_softmax_beta) <= 0.0:
+        raise ValueError("er_transition_softmax_beta must be positive.")
 
     config_eff = _prepare_full_transport_config(config, device=device)
     solver_cfg = config_eff.setdefault("transport_solver", {})
@@ -2230,6 +2236,8 @@ def full_transport_profile_least_squares_problem(
         "Er_transition_positive_part_eps": float(
             er_transition_positive_part_eps
         ),
+        "Er_transition_rho_softness": float(er_transition_rho_softness),
+        "Er_transition_softmax_beta": float(er_transition_softmax_beta),
         "reverse_stage_adjoint_solve_mode": str(reverse_stage_adjoint_solve_mode),
         "reverse_rhs_transpose_mode": str(reverse_rhs_transpose_mode),
         "reverse_stage_cotangent_mode": str(reverse_stage_cotangent_mode),
@@ -2347,6 +2355,8 @@ def full_transport_profile_least_squares_problem(
                 er_transition_positive_part_eps=float(
                     er_transition_positive_part_eps
                 ),
+                er_transition_rho_softness=float(er_transition_rho_softness),
+                er_transition_softmax_beta=float(er_transition_softmax_beta),
                 reverse_stage_adjoint_solve_mode=str(
                     reverse_stage_adjoint_solve_mode
                 ),
@@ -2476,6 +2486,8 @@ def geometry_full_transport_least_squares_problem(
     er_transition_rho_target: float = 0.5,
     er_transition_temperature_kv_m: float = 2.0,
     er_transition_positive_part_eps: float = 1.0e-6,
+    er_transition_rho_softness: float = 0.05,
+    er_transition_softmax_beta: float = 16.0,
     radau_jacobian_reuse_mode: str = "legacy",
     reverse_stage_adjoint_solve_mode: str = "bicgstab",
     reverse_rhs_transpose_mode: str = "explicit_ntx_interpolated",
@@ -2510,6 +2522,10 @@ def geometry_full_transport_least_squares_problem(
         raise ValueError("er_transition_temperature_kv_m must be positive.")
     if float(er_transition_positive_part_eps) <= 0.0:
         raise ValueError("er_transition_positive_part_eps must be positive.")
+    if float(er_transition_rho_softness) <= 0.0:
+        raise ValueError("er_transition_rho_softness must be positive.")
+    if float(er_transition_softmax_beta) <= 0.0:
+        raise ValueError("er_transition_softmax_beta must be positive.")
 
     normalized_terms = _normalize_initial_er_root_least_squares_terms(terms)
     reverse_objective_labels = _full_transport_reverse_objective_labels(
@@ -2645,6 +2661,8 @@ def geometry_full_transport_least_squares_problem(
         "Er_transition_positive_part_eps": float(
             er_transition_positive_part_eps
         ),
+        "Er_transition_rho_softness": float(er_transition_rho_softness),
+        "Er_transition_softmax_beta": float(er_transition_softmax_beta),
         "reverse_stage_adjoint_solve_mode": str(reverse_stage_adjoint_solve_mode),
         "reverse_rhs_transpose_mode": str(reverse_rhs_transpose_mode),
         "reverse_stage_cotangent_mode": str(reverse_stage_cotangent_mode),
@@ -2918,6 +2936,8 @@ def geometry_full_transport_least_squares_problem(
         er_transition_positive_part_eps=float(
             er_transition_positive_part_eps
         ),
+        er_transition_rho_softness=float(er_transition_rho_softness),
+        er_transition_softmax_beta=float(er_transition_softmax_beta),
         reverse_stage_adjoint_solve_mode=str(reverse_stage_adjoint_solve_mode),
         reverse_rhs_transpose_mode=str(reverse_rhs_transpose_mode),
         reverse_rhs_pullback_mode=str(options.get("reverse_rhs_pullback_mode", "separate")),

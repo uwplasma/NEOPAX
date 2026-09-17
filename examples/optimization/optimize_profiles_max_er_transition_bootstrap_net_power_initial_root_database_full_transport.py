@@ -75,6 +75,8 @@ ER_TRANSITION_RHO_TARGET = 0.514
 ER_TRANSITION_RHO_MIN = 0.25
 ER_TRANSITION_RHO_MAX = 0.75
 ER_TRANSITION_TEMPERATURE_KV_M = 2.0
+ER_TRANSITION_RHO_SOFTNESS = 0.05
+ER_TRANSITION_SOFTMAX_BETA = 16.0
 BOOTSTRAP_LIMIT_SCALED = 0.1
 NET_POWER_TARGET_MW = 300.0
 NET_POWER_REFERENCE_VOLUME_M3 = 331.0187969899648
@@ -150,7 +152,7 @@ def parser() -> argparse.ArgumentParser:
         "--er-transition-strength-target",
         type=float,
         default=ER_TRANSITION_STRENGTH_TARGET,
-        help="Required smooth positive-to-negative Er drop across the radial window.",
+        help="Required soft-selected crossing margin in units of the Er temperature scale.",
     )
     out.add_argument(
         "--er-transition-rho-min", type=float, default=ER_TRANSITION_RHO_MIN
@@ -162,6 +164,18 @@ def parser() -> argparse.ArgumentParser:
         "--er-transition-temperature-kv-m",
         type=float,
         default=ER_TRANSITION_TEMPERATURE_KV_M,
+    )
+    out.add_argument(
+        "--er-transition-rho-softness",
+        type=float,
+        default=ER_TRANSITION_RHO_SOFTNESS,
+        help="Radial width of the soft preference around the requested transition.",
+    )
+    out.add_argument(
+        "--er-transition-softmax-beta",
+        type=float,
+        default=ER_TRANSITION_SOFTMAX_BETA,
+        help="Sharpness of the soft selection over all radial transition faces.",
     )
     out.add_argument(
         "--bootstrap-penalty",
@@ -251,8 +265,8 @@ def active_terms(args: argparse.Namespace):
         )
         terms.extend(
             (
-                # Report the normalized location without optimizing its undefined
-                # value when no transition exists.
+                # Report the soft-selected location; the location-moment row
+                # moves its best candidate while the strength row creates it.
                 (opt.transport.Er_transition_rho, 0.0, 0.0),
                 (
                     opt.transport.Er_transition_location_moment,
@@ -443,10 +457,14 @@ def main() -> int:
         <= args.er_transition_rho_max
     ):
         raise ValueError("Er transition target must lie inside the radial window.")
-    if not 0.0 < args.er_transition_strength_target <= 1.0:
-        raise ValueError("--er-transition-strength-target must lie in (0, 1].")
+    if args.er_transition_strength_target <= 0.0:
+        raise ValueError("--er-transition-strength-target must be positive.")
     if args.er_transition_temperature_kv_m <= 0.0:
         raise ValueError("--er-transition-temperature-kv-m must be positive.")
+    if args.er_transition_rho_softness <= 0.0:
+        raise ValueError("--er-transition-rho-softness must be positive.")
+    if args.er_transition_softmax_beta <= 0.0:
+        raise ValueError("--er-transition-softmax-beta must be positive.")
     terms = active_terms(args)
     out_dir = args.out_dir.resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -483,6 +501,8 @@ def main() -> int:
         er_transition_rho_max=args.er_transition_rho_max,
         er_transition_rho_target=args.er_transition_rho_target,
         er_transition_temperature_kv_m=args.er_transition_temperature_kv_m,
+        er_transition_rho_softness=args.er_transition_rho_softness,
+        er_transition_softmax_beta=args.er_transition_softmax_beta,
         radau_jacobian_reuse_mode="legacy",
         reverse_stage_adjoint_solve_mode="block",
         reverse_rhs_transpose_mode="explicit_database",
@@ -514,7 +534,9 @@ def main() -> int:
         f"Er_transition_rho_target={args.er_transition_rho_target} "
         f"Er_transition_strength_target={args.er_transition_strength_target} "
         f"Er_transition_rho_window=({args.er_transition_rho_min},"
-        f"{args.er_transition_rho_max})",
+        f"{args.er_transition_rho_max}) "
+        f"Er_transition_rho_softness={args.er_transition_rho_softness} "
+        f"Er_transition_softmax_beta={args.er_transition_softmax_beta}",
         flush=True,
     )
     initial_evaluation = report("initial", problem, x0)

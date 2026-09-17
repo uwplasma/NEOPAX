@@ -1330,21 +1330,26 @@ def smooth_positive_to_negative_er_transition_metrics(
     rho_prior: float | None = None,
     temperature_kv_m: float = 2.0,
     positive_part_eps: float = 1.0e-6,
+    rho_softness: float = 0.05,
+    softmax_beta: float = 16.0,
 ) -> tuple[jax.Array, jax.Array]:
-    """Return a finite smooth location and ordered sign-crossing strength.
+    """Return a soft-selected positive-to-negative transition and its strength.
 
-    Every ordered radial pair inside the fixed window contributes evidence
-    only when the inner point is positive and the outer point is negative.
-    The neutral ``Er=0`` pair probability is subtracted before taking a smooth
-    positive part, so a zero profile has zero strength while retaining a
-    useful gradient.  Strong all-positive or all-negative profiles cannot
-    produce strength above one third; a strength near one therefore requires
-    a genuine ordered positive-to-negative bracket.
+    Each adjacent radial face is assigned the smooth crossing score
 
-    Each ordered pair also supplies a smooth linearly interpolated zero
-    location.  When crossing evidence is weak the location is smoothly
-    regularized to ``rho_prior`` (the window midpoint by default), keeping the
-    objective finite without inventing a high-confidence crossing.
+    ``smooth_min(Er_inner / T, -Er_outer / T)``.
+
+    The score is positive only when that face brackets an inner-positive,
+    outer-negative transition.  Unlike a sigmoid probability, it remains
+    linear in a badly violated one-sign profile, so the no-transition penalty
+    retains a useful gradient.  A Gaussian radial bias centred on ``rho_prior``
+    makes the selection prefer the requested location without fixing either
+    endpoint index or endpoint value.
+
+    ``strength`` is a log-sum-exp soft maximum of the crossing scores.  The
+    log-sum-exp of the radial bias alone is subtracted, removing the entropy /
+    number-of-faces offset: a zero profile therefore has zero strength (up to
+    ``positive_part_eps``), while a genuine crossing has positive strength.
     """
 
     er = jnp.asarray(er_profile)
@@ -1354,67 +1359,64 @@ def smooth_positive_to_negative_er_transition_metrics(
     if int(er.shape[0]) < 2:
         raise ValueError("Er transition location requires at least two radial cells.")
 
-    temperature = jnp.asarray(temperature_kv_m, dtype=er.dtype)
-    eps = jnp.asarray(positive_part_eps, dtype=er.dtype)
-    ion_probability = jax.nn.sigmoid(er / temperature)
-
-    inner_probability = ion_probability[:, None]
-    outer_negative_probability = (1.0 - ion_probability)[None, :]
-    neutral_pair_probability = jnp.asarray(0.25, dtype=er.dtype)
-    pair_probability_scale = jnp.asarray(0.75, dtype=er.dtype)
-    raw_pair_score = (
-        inner_probability * outer_negative_probability
-        - neutral_pair_probability
-    ) / pair_probability_scale
-    pair_score = 0.5 * (
-        raw_pair_score + jnp.sqrt(raw_pair_score * raw_pair_score + eps * eps)
-    )
-
-    node_mask = (rho >= jnp.asarray(rho_min, dtype=er.dtype)) & (
-        rho <= jnp.asarray(rho_max, dtype=er.dtype)
-    )
-    ordered_mask = (
-        node_mask[:, None]
-        & node_mask[None, :]
-        & (rho[:, None] < rho[None, :])
-    )
-    pair_score = jnp.where(ordered_mask, pair_score, 0.0)
-
-    # A softmax-weighted maximum stays smooth and bounded by the strongest
-    # ordered pair.  Unlike a sum, many weak same-sign pairs cannot masquerade
-    # as one strong crossing.
-    softmax_beta = jnp.asarray(32.0, dtype=er.dtype)
-    flat_pair_score = jnp.reshape(pair_score, (-1,))
-    strength_weights = jax.nn.softmax(softmax_beta * flat_pair_score)
-    strength = jnp.sum(strength_weights * flat_pair_score)
-
-    smooth_abs_er = jnp.sqrt(
-        er * er + (temperature * eps) * (temperature * eps)
-    )
-    inner_abs = smooth_abs_er[:, None]
-    outer_abs = smooth_abs_er[None, :]
-    interpolation_fraction = inner_abs / jnp.maximum(
-        inner_abs + outer_abs,
-        jnp.asarray(1.0e-30, dtype=er.dtype),
-    )
-    pair_location = rho[:, None] + (
-        rho[None, :] - rho[:, None]
-    ) * interpolation_fraction
-    candidate_location = jnp.sum(
-        jnp.reshape(strength_weights, pair_score.shape) * pair_location
-    )
-
     prior = jnp.asarray(
         0.5 * (float(rho_min) + float(rho_max))
         if rho_prior is None
         else rho_prior,
         dtype=er.dtype,
     )
-    location_confidence = jax.nn.sigmoid(
-        jnp.asarray(32.0, dtype=er.dtype)
-        * (strength - jnp.asarray(0.5, dtype=er.dtype))
+    temperature = jnp.asarray(temperature_kv_m, dtype=er.dtype)
+    eps = jnp.asarray(positive_part_eps, dtype=er.dtype)
+    radial_softness = jnp.asarray(rho_softness, dtype=er.dtype)
+    beta = jnp.asarray(softmax_beta, dtype=er.dtype)
+
+    inner_score = er[:-1] / temperature
+    outer_score = -er[1:] / temperature
+    score_delta = inner_score - outer_score
+    crossing_score = 0.5 * (
+        inner_score
+        + outer_score
+        - jnp.sqrt(score_delta * score_delta + eps * eps)
     )
-    location = prior + location_confidence * (candidate_location - prior)
+
+    face_rho = 0.5 * (rho[:-1] + rho[1:])
+    radial_mask = (face_rho >= jnp.asarray(rho_min, dtype=er.dtype)) & (
+        face_rho <= jnp.asarray(rho_max, dtype=er.dtype)
+    )
+    # Retain a finite result for an exceptionally narrow user window by
+    # selecting the closest face when no face centre lies inside it.
+    fallback_index = jnp.argmin(jnp.abs(face_rho - prior))
+    fallback_mask = jnp.arange(face_rho.shape[0]) == fallback_index
+    radial_mask = radial_mask | ((jnp.sum(radial_mask) == 0) & fallback_mask)
+
+    # The candidate location is the smooth chord-interpolated zero for a true
+    # bracket. It remains finite for one-sign/zero pairs, whose negative
+    # crossing score prevents them from masquerading as an existing root.
+    er_smoothing = temperature * eps
+    inner_abs = jnp.sqrt(er[:-1] * er[:-1] + er_smoothing * er_smoothing)
+    outer_abs = jnp.sqrt(er[1:] * er[1:] + er_smoothing * er_smoothing)
+    zero_fraction = inner_abs / jnp.maximum(
+        inner_abs + outer_abs,
+        jnp.asarray(1.0e-30, dtype=er.dtype),
+    )
+    candidate_rho = rho[:-1] + (rho[1:] - rho[:-1]) * zero_fraction
+
+    radial_bias = -0.5 * ((candidate_rho - prior) / radial_softness) ** 2
+    negative_infinity = jnp.asarray(-jnp.inf, dtype=er.dtype)
+    # Keep the radial width independent of the softmax sharpness: the prior is
+    # exp(radial_bias), while beta controls only selection by crossing score.
+    baseline_logits = jnp.where(radial_mask, radial_bias, negative_infinity)
+    active_logits = jnp.where(
+        radial_mask,
+        radial_bias + beta * crossing_score,
+        negative_infinity,
+    )
+    strength = (
+        jax.scipy.special.logsumexp(active_logits)
+        - jax.scipy.special.logsumexp(baseline_logits)
+    ) / beta
+    weights = jax.nn.softmax(active_logits)
+    location = jnp.sum(jnp.where(radial_mask, weights * candidate_rho, 0.0))
     return location, strength
 
 
@@ -1436,7 +1438,7 @@ def smooth_positive_to_negative_er_transition_strength(
     rho_grid: jax.Array,
     **kwargs,
 ) -> jax.Array:
-    """Return transition existence/strength (near zero absent, near one strong)."""
+    """Return the normalized soft-maximum transition strength."""
 
     _, strength = smooth_positive_to_negative_er_transition_metrics(
         er_profile, rho_grid, **kwargs
@@ -1451,13 +1453,20 @@ def smooth_positive_to_negative_er_transition_location_moment(
     target_rho: float,
     **kwargs,
 ) -> jax.Array:
-    """Return ``strength * (location - target)`` for an existence-gated cost."""
+    """Return the soft-selected candidate location minus its requested radius.
 
-    location, strength = smooth_positive_to_negative_er_transition_metrics(
+    The residual remains active before a crossing exists, just as a soft
+    argmax has a location even when every candidate score is poor.  The
+    independent strength-deficit row determines whether the selected face is
+    an actual positive-to-negative bracket.
+    """
+
+    location, _ = smooth_positive_to_negative_er_transition_metrics(
         er_profile, rho_grid, rho_prior=target_rho, **kwargs
     )
-    return strength * (
-        location - jnp.asarray(target_rho, dtype=jnp.asarray(er_profile).dtype)
+    return location - jnp.asarray(
+        target_rho,
+        dtype=jnp.asarray(er_profile).dtype,
     )
 
 
@@ -1594,6 +1603,8 @@ def objective_scalar_by_index(
     er_transition_rho_target: float = 0.5,
     er_transition_temperature_kv_m: float = 2.0,
     er_transition_positive_part_eps: float = 1.0e-6,
+    er_transition_rho_softness: float = 0.05,
+    er_transition_softmax_beta: float = 16.0,
 ):
     objective_name = tuple(objective_labels)[int(objective_index)]
     er = jnp.asarray(final_state.Er)
@@ -1630,6 +1641,8 @@ def objective_scalar_by_index(
             rho_prior=er_transition_rho_target,
             temperature_kv_m=er_transition_temperature_kv_m,
             positive_part_eps=er_transition_positive_part_eps,
+            rho_softness=er_transition_rho_softness,
+            softmax_beta=er_transition_softmax_beta,
         )
     if objective_name == "Er_transition_location_moment":
         return smooth_positive_to_negative_er_transition_location_moment(
@@ -1640,6 +1653,8 @@ def objective_scalar_by_index(
             rho_max=er_transition_rho_max,
             temperature_kv_m=er_transition_temperature_kv_m,
             positive_part_eps=er_transition_positive_part_eps,
+            rho_softness=er_transition_rho_softness,
+            softmax_beta=er_transition_softmax_beta,
         )
     if objective_name == "Er_transition_strength":
         return smooth_positive_to_negative_er_transition_strength(
@@ -1649,6 +1664,9 @@ def objective_scalar_by_index(
             rho_max=er_transition_rho_max,
             temperature_kv_m=er_transition_temperature_kv_m,
             positive_part_eps=er_transition_positive_part_eps,
+            rho_prior=er_transition_rho_target,
+            rho_softness=er_transition_rho_softness,
+            softmax_beta=er_transition_softmax_beta,
         )
     raise ValueError(f"Unknown objective index {objective_index}: {objective_name!r}")
 
@@ -8679,6 +8697,8 @@ def internal_realtime_geometry_transport_reverse_table_result_builder(
     er_transition_rho_target: float = 0.5,
     er_transition_temperature_kv_m: float = 2.0,
     er_transition_positive_part_eps: float = 1.0e-6,
+    er_transition_rho_softness: float = 0.05,
+    er_transition_softmax_beta: float = 16.0,
     reverse_stage_adjoint_solve_mode: str = "bicgstab",
     reverse_rhs_transpose_mode: str = "explicit_ntx_interpolated",
     reverse_rhs_pullback_mode: str = "separate",
@@ -8754,6 +8774,8 @@ def internal_realtime_geometry_transport_reverse_table_result_builder(
     configured_er_transition_positive_part_eps = float(
         er_transition_positive_part_eps
     )
+    configured_er_transition_rho_softness = float(er_transition_rho_softness)
+    configured_er_transition_softmax_beta = float(er_transition_softmax_beta)
     configured_objective_dependencies = (
         default_realtime_geometry_support_reverse_dependencies()
     )
@@ -8766,6 +8788,8 @@ def internal_realtime_geometry_transport_reverse_table_result_builder(
         or configured_er_transition_rho_target != 0.5
         or configured_er_transition_temperature_kv_m != 2.0
         or configured_er_transition_positive_part_eps != 1.0e-6
+        or configured_er_transition_rho_softness != 0.05
+        or configured_er_transition_softmax_beta != 16.0
         or configured_objective_labels != TRANSPORT_REVERSE_OBJECTIVE_LABELS
     ):
         # This callback is created once with the table builder, not once per
@@ -8791,6 +8815,12 @@ def internal_realtime_geometry_transport_reverse_table_result_builder(
                 ),
                 er_transition_positive_part_eps=(
                     configured_er_transition_positive_part_eps
+                ),
+                er_transition_rho_softness=(
+                    configured_er_transition_rho_softness
+                ),
+                er_transition_softmax_beta=(
+                    configured_er_transition_softmax_beta
                 ),
             )
 
@@ -8869,6 +8899,12 @@ def internal_realtime_geometry_transport_reverse_table_result_builder(
                 er_transition_positive_part_eps,
             )
         )
+        active_er_transition_rho_softness = float(
+            opts.get("Er_transition_rho_softness", er_transition_rho_softness)
+        )
+        active_er_transition_softmax_beta = float(
+            opts.get("Er_transition_softmax_beta", er_transition_softmax_beta)
+        )
         if (
             active_er_transition_left_index != configured_er_transition_left_index
             or active_er_transition_right_index
@@ -8881,6 +8917,10 @@ def internal_realtime_geometry_transport_reverse_table_result_builder(
             != configured_er_transition_temperature_kv_m
             or active_er_transition_positive_part_eps
             != configured_er_transition_positive_part_eps
+            or active_er_transition_rho_softness
+            != configured_er_transition_rho_softness
+            or active_er_transition_softmax_beta
+            != configured_er_transition_softmax_beta
         ):
             raise ValueError(
                 "Er transition settings are fixed when the full-transport table "

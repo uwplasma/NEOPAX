@@ -694,6 +694,11 @@ def test_database_full_transport_mode_uses_one_integrated_benchmark_builder(monk
     )
     monkeypatch.setattr(
         optimization,
+        "freeze_physical_qi_maxj_pitches",
+        lambda value, *_args, **_kwargs: value,
+    )
+    monkeypatch.setattr(
+        optimization,
         "vmex_boundary_parameterization",
         lambda *_args, **_kwargs: parameterization,
     )
@@ -1180,7 +1185,7 @@ def test_full_transport_transition_objective_indices_are_selectable():
 
 
 def test_full_transport_smooth_transition_location_ignores_near_axis_zero():
-    """The optional rows require an ordered +Er to -Er bracket."""
+    """The optional rows soft-select an ordered +Er to -Er radial face."""
 
     rho = jnp.linspace(0.0, 1.0, 11, dtype=jnp.float64)
     er = jnp.asarray(
@@ -1252,6 +1257,30 @@ def test_full_transport_smooth_transition_location_ignores_near_axis_zero():
             temperature_kv_m=1.0,
         )
     )(flat_er)
+    all_negative_gradient = jax.grad(
+        lambda values: reverse_transport.smooth_positive_to_negative_er_transition_strength(
+            values,
+            rho,
+            rho_min=0.25,
+            rho_max=0.75,
+            rho_prior=0.55,
+            temperature_kv_m=1.0,
+            rho_softness=0.05,
+            softmax_beta=16.0,
+        )
+    )(-jnp.ones_like(er) * 10.0)
+    all_positive_gradient = jax.grad(
+        lambda values: reverse_transport.smooth_positive_to_negative_er_transition_strength(
+            values,
+            rho,
+            rho_min=0.25,
+            rho_max=0.75,
+            rho_prior=0.55,
+            temperature_kv_m=1.0,
+            rho_softness=0.05,
+            softmax_beta=16.0,
+        )
+    )(jnp.ones_like(er) * 10.0)
     raw_location = reverse_transport.smooth_positive_to_negative_er_transition_rho(
         er,
         rho,
@@ -1274,12 +1303,18 @@ def test_full_transport_smooth_transition_location_ignores_near_axis_zero():
     assert float(strength) > 0.9
     assert bool(jnp.isfinite(flat_location))
     assert float(flat_strength) < 1.0e-4
-    assert float(all_negative_strength) < 0.5
-    assert float(all_positive_strength) < 0.5
-    assert float(reversed_strength) < 0.5
+    assert float(all_negative_strength) < 0.0
+    assert float(all_positive_strength) < 0.0
+    assert float(reversed_strength) < 0.0
     assert abs(float(flat_location_moment)) < 1.0e-4
     assert bool(jnp.all(jnp.isfinite(flat_strength_gradient)))
     assert float(jnp.linalg.norm(flat_strength_gradient)) > 0.0
+    # Maximizing the soft crossing strength pushes the target's inner side
+    # positive and its outer side negative even from either one-sign limit.
+    assert float(all_negative_gradient[5]) > 0.0
+    assert float(all_positive_gradient[6]) < 0.0
+    assert bool(jnp.all(jnp.isfinite(all_negative_gradient)))
+    assert bool(jnp.all(jnp.isfinite(all_positive_gradient)))
     assert bool(jnp.all(jnp.isfinite(gradient)))
     assert "Er_transition_rho" not in (
         reverse_transport.TRANSPORT_REVERSE_OBJECTIVE_LABELS
