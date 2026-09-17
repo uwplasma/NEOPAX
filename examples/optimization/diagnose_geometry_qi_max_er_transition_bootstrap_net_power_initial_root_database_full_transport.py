@@ -75,6 +75,7 @@ TRANSPORT_MAX_STEPS = 1000
 TRANSPORT_FINAL_TIME = 2.0
 REVERSE_STAGE_MODE = "database_full_transport_optimization"
 REVERSE_SEGMENT_INPUT_DIAGNOSTICS = True
+PRINT_FINAL_ER_PROFILE = True
 
 ASPECT_TARGET = 10.0
 IOTA_TARGET = -0.61
@@ -640,6 +641,7 @@ def main() -> int:
             reverse_step_bwd_mode="reduced_cotangent_call_boundary",
             reverse_stage_adjoint_memory_mode="default",
             reverse_segment_input_diagnostics=REVERSE_SEGMENT_INPUT_DIAGNOSTICS,
+            print_final_er_profile=PRINT_FINAL_ER_PROFILE,
             reverse_stage_mode=REVERSE_STAGE_MODE,
             qi_maxj_settings=qi_maxj_backend_settings(frozen_physical_pitches),
         )
@@ -671,6 +673,7 @@ def main() -> int:
             f"reverse_segment_length={REVERSE_SEGMENT_LENGTH} "
             f"max_reverse_accepted_steps={MAX_REVERSE_ACCEPTED_STEPS} "
             f"reverse_segment_input_diagnostics={REVERSE_SEGMENT_INPUT_DIAGNOSTICS} "
+            f"print_final_Er_profile={PRINT_FINAL_ER_PROFILE} "
             f"Er_transition_indices=({args.er_transition_left_index},"
             f"{args.er_transition_right_index})",
             flush=True,
@@ -742,4 +745,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

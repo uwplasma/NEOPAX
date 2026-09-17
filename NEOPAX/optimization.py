@@ -2240,6 +2240,7 @@ def geometry_full_transport_least_squares_problem(
     reverse_stage_adjoint_iter_tol: float = 1.0e-10,
     reverse_stage_adjoint_woodbury_rank: int = 24,
     reverse_segment_input_diagnostics: bool = False,
+    print_final_er_profile: bool = False,
     max_reverse_accepted_steps: int | None = None,
     reverse_stage_mode: str = "benchmark",
     qi_maxj_settings: QImaxJBackendSettings | Mapping[str, object] | str | None = None,
@@ -2382,6 +2383,7 @@ def geometry_full_transport_least_squares_problem(
         "reverse_stage_adjoint_iter_tol": float(reverse_stage_adjoint_iter_tol),
         "reverse_stage_adjoint_woodbury_rank": int(reverse_stage_adjoint_woodbury_rank),
         "reverse_segment_input_diagnostics": bool(reverse_segment_input_diagnostics),
+        "print_final_er_profile": bool(print_final_er_profile),
         "max_reverse_accepted_steps": (
             None if max_reverse_accepted_steps is None else int(max_reverse_accepted_steps)
         ),
@@ -2606,6 +2608,21 @@ def geometry_full_transport_least_squares_problem(
     # The experiment mode is an optimization-only selector for subsequent
     # boundary trials; it must not replace the integrated selected-root path
     # with a second transport sweep or a manually assembled root derivative.
+    segment_replay_stage_builder = None
+    if stage_mode == "database_full_transport_optimization":
+        if print_final_er_profile:
+            def _diagnostic_segment_replay_stage_builder(**kwargs):
+                return build_database_full_transport_replay_optimization_stage(
+                    **kwargs,
+                    print_final_er_profile=True,
+                )
+
+            segment_replay_stage_builder = _diagnostic_segment_replay_stage_builder
+        else:
+            segment_replay_stage_builder = (
+                build_database_full_transport_replay_optimization_stage
+            )
+
     table_result_builder = internal_realtime_geometry_transport_reverse_table_result_builder(
         table_context=table_context,
         geometry_context=context,
@@ -2690,11 +2707,7 @@ def geometry_full_transport_least_squares_problem(
             else int(max_reverse_accepted_steps)
         ),
         progress_label="[optimization] full transport geometry payload pullback:",
-        segment_replay_optimization_stage_builder=(
-            build_database_full_transport_replay_optimization_stage
-            if stage_mode == "database_full_transport_optimization"
-            else None
-        ),
+        segment_replay_optimization_stage_builder=segment_replay_stage_builder,
         bootstrap_optimization_stage_builder=(
             build_database_full_transport_bootstrap_optimization_stage
             if stage_mode == "database_full_transport_optimization"

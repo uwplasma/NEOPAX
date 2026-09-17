@@ -494,6 +494,7 @@ class DatabaseFullTransportReplayOptimizationStage:
     initial_state_signature: Any
     segment_carry_signature: Any
     segment_arrays_signature: Any
+    print_final_er_profile: bool = False
 
     def replay(
         self,
@@ -608,7 +609,7 @@ class DatabaseFullTransportReplayOptimizationStage:
             raise ValueError(
                 "Full-transport optimization initial-state layout changed within a stage."
             )
-        return self.compiled_schedule_probe(
+        result = self.compiled_schedule_probe(
             initial_carry.y,
             support_floating_leaves,
             initial_carry,
@@ -624,6 +625,18 @@ class DatabaseFullTransportReplayOptimizationStage:
                 else int(capture_segment_length)
             ),
         )
+        if self.print_final_er_profile:
+            final_state = self.initial_state_unpack(result.final_carry.y)
+            er_profile = np.asarray(
+                jax.device_get(final_state.Er), dtype=float
+            ).reshape(-1)
+            er_text = ",".join(f"{value:.16e}" for value in er_profile)
+            print(
+                "[optimization] final_Er_profile "
+                f"count={er_profile.size} values=[{er_text}]",
+                flush=True,
+            )
+        return result
 
     def schedule_probe_cache_size(self) -> int | None:
         cache_size = getattr(self.compiled_schedule_probe, "_cache_size", None)
@@ -642,6 +655,7 @@ def build_database_full_transport_replay_optimization_stage(
     support_payload,
     segment_start_carry,
     segment_arrays,
+    print_final_er_profile: bool = False,
 ) -> DatabaseFullTransportReplayOptimizationStage:
     """Build the persistent database replay without changing benchmark math."""
 
@@ -1019,4 +1033,5 @@ def build_database_full_transport_replay_optimization_stage(
         initial_state_signature=_tree_signature(initial_flat_state),
         segment_carry_signature=_tree_signature(segment_start_carry),
         segment_arrays_signature=_tree_signature(segment_arrays),
+        print_final_er_profile=bool(print_final_er_profile),
     )
