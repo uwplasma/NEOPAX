@@ -82,6 +82,10 @@ ER_TRANSITION_LEFT_TARGET = 26.0
 ER_TRANSITION_RIGHT_TARGET = -10.0
 ER_TRANSITION_LEFT_INDEX = 25
 ER_TRANSITION_RIGHT_INDEX = 26
+ER_TRANSITION_RHO_TARGET = 0.514
+ER_TRANSITION_RHO_MIN = 0.25
+ER_TRANSITION_RHO_MAX = 0.75
+ER_TRANSITION_TEMPERATURE_KV_M = 2.0
 BOOTSTRAP_LIMIT_SCALED = 0.1
 # Preserve the established root/bootstrap geometry weights, the established
 # maximum-Er weight, and each transport target from the standalone root lanes.
@@ -93,10 +97,12 @@ MIRROR_WEIGHT = 500.0
 MAX_ER_WEIGHT = 0.5
 ER_TRANSITION_LEFT_WEIGHT = 0.09
 ER_TRANSITION_RIGHT_WEIGHT = 0.09
+ER_TRANSITION_RHO_WEIGHT = 100.0
 BOOTSTRAP_WEIGHT = 2.0
 
 USE_MAX_ER_OBJECTIVE = True
 USE_ER_TRANSITION_OBJECTIVES = True
+USE_ER_TRANSITION_LOCATION_OBJECTIVE = False
 USE_BOOTSTRAP_PENALTY = False
 
 NFEV = 30
@@ -158,6 +164,26 @@ def parser() -> argparse.ArgumentParser:
         action=argparse.BooleanOptionalAction,
         default=USE_ER_TRANSITION_OBJECTIVES,
         help="Enable/disable both Er-transition/root-position objectives.",
+    )
+    out.add_argument(
+        "--transition-location-objective",
+        action=argparse.BooleanOptionalAction,
+        default=USE_ER_TRANSITION_LOCATION_OBJECTIVE,
+        help="Enable/disable the smooth final-time Er transition-location objective.",
+    )
+    out.add_argument(
+        "--er-transition-rho-target", type=float, default=ER_TRANSITION_RHO_TARGET
+    )
+    out.add_argument(
+        "--er-transition-rho-min", type=float, default=ER_TRANSITION_RHO_MIN
+    )
+    out.add_argument(
+        "--er-transition-rho-max", type=float, default=ER_TRANSITION_RHO_MAX
+    )
+    out.add_argument(
+        "--er-transition-temperature-kv-m",
+        type=float,
+        default=ER_TRANSITION_TEMPERATURE_KV_M,
     )
     out.add_argument(
         "--bootstrap-penalty",
@@ -229,6 +255,14 @@ def active_terms(args: argparse.Namespace):
                 (opt.transport.Er_transition_right, ER_TRANSITION_RIGHT_TARGET, ER_TRANSITION_RIGHT_WEIGHT),
             )
         )
+    if args.transition_location_objective:
+        terms.append(
+            (
+                opt.transport.Er_transition_rho,
+                args.er_transition_rho_target,
+                ER_TRANSITION_RHO_WEIGHT,
+            )
+        )
     if args.bootstrap_penalty:
         terms.append((bootstrap_penalty, 0.0, BOOTSTRAP_WEIGHT))
     if not any(term[0].objective.family == "transport" if hasattr(term[0], "objective") else term[0].family == "transport" for term in terms):
@@ -283,6 +317,8 @@ def iteration_diagnostics(evaluation):
         f"Er_left_cost={component_cost('transport:Er_transition_left', 'Er_transition_left'):.8e} "
         f"Er_right={value('transport:Er_transition_right', 'Er_transition_right'):.8e} "
         f"Er_right_cost={component_cost('transport:Er_transition_right', 'Er_transition_right'):.8e} "
+        f"Er_transition_rho={value('transport:Er_transition_rho', 'Er_transition_rho'):.8e} "
+        f"Er_transition_rho_cost={component_cost('transport:Er_transition_rho', 'Er_transition_rho'):.8e} "
         f"bootstrap_penalty={value('bootstrap_current_penalty', 'transport:bootstrap_current_penalty'):.8e} "
         f"bootstrap_cost={component_cost('bootstrap_current_penalty', 'transport:bootstrap_current_penalty'):.8e}"
     )
@@ -511,6 +547,7 @@ def write_transport_report(input_obj, label, config, out_dir):
     transport_output = config.setdefault("transport_output", {})
     transport_output["transport_plot"] = True
     transport_output["transport_write_hdf5"] = True
+    transport_output["transport_bootstrap_current_evolution"] = True
     transport_output["transport_output_dir"] = str(artifact_dir)
     print(f"[transport-report] running {label} forward transport output", flush=True)
     result = run_config(config)
@@ -558,6 +595,10 @@ def main() -> int:
             raise ValueError(
                 f"--{name.replace('_', '-')} must be in [0, {n_radial}); got {index}."
             )
+    if not 0.0 <= args.er_transition_rho_min < args.er_transition_rho_max <= 1.0:
+        raise ValueError("Er transition radial window must satisfy 0 <= min < max <= 1.")
+    if args.er_transition_temperature_kv_m <= 0.0:
+        raise ValueError("--er-transition-temperature-kv-m must be positive.")
     terms = active_terms(args)
     out_dir.mkdir(parents=True, exist_ok=True)
     x = None
@@ -600,6 +641,11 @@ def main() -> int:
             initial_er_root_ad="jax_selected_root",
             er_transition_left_index=args.er_transition_left_index,
             er_transition_right_index=args.er_transition_right_index,
+            er_transition_rho_min=args.er_transition_rho_min,
+            er_transition_rho_max=args.er_transition_rho_max,
+            er_transition_temperature_kv_m=(
+                args.er_transition_temperature_kv_m
+            ),
             radau_jacobian_reuse_mode="legacy",
             reverse_stage_adjoint_solve_mode="block",
             reverse_rhs_transpose_mode="explicit_database",
@@ -639,7 +685,11 @@ def main() -> int:
             f"max_reverse_accepted_steps={MAX_REVERSE_ACCEPTED_STEPS} "
             f"print_final_softmax_Er={PRINT_FINAL_SOFTMAX_ER} "
             f"Er_transition_indices=({args.er_transition_left_index},"
-            f"{args.er_transition_right_index})",
+            f"{args.er_transition_right_index}) "
+            f"Er_transition_location={args.transition_location_objective} "
+            f"Er_transition_rho_target={args.er_transition_rho_target} "
+            f"Er_transition_rho_window=({args.er_transition_rho_min},"
+            f"{args.er_transition_rho_max})",
             flush=True,
         )
         if initial_input is None:

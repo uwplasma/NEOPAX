@@ -1,6 +1,7 @@
 """Unit checks for optimization-only reuse of VMEX raw-block setup."""
 
 import ast
+import copy
 import dataclasses
 import importlib.util
 from pathlib import Path
@@ -12,6 +13,7 @@ import numpy as np
 import pytest
 
 from NEOPAX import _geometry_autodiff as geometry_ad
+from NEOPAX import _orchestrator as orchestrator
 from NEOPAX import _optimization_full_transport_stage as full_transport_stage
 from NEOPAX import _optimization_initial_root_stage as initial_root_stage
 from NEOPAX import _reverse_ad_optimization as reverse_optimization
@@ -19,6 +21,53 @@ from NEOPAX import _reverse_ad_transport as reverse_transport
 from NEOPAX import _transport_solvers as transport_solvers
 from NEOPAX import optimization
 from NEOPAX._reverse_ad_optimization import normalize_geometry_full_ad_objective_names
+from NEOPAX._state import TransportState
+from NEOPAX._transport_flux_models import DENSITY_STATE_TO_PHYSICAL
+from NEOPAX._constants import elementary_charge
+
+
+def test_database_transport_bootstrap_evolution_reuses_saved_states(tmp_path):
+    class _DatabaseFluxModel:
+        @staticmethod
+        def evaluate_momentum_corrected_fluxes(state):
+            return {"Upar_neo": state.density}
+
+    saved_states = TransportState(
+        density=jnp.asarray(
+            [
+                [[2.0, 4.0], [1.0, 3.0]],
+                [[100.0, 100.0], [0.0, 0.0]],
+                [[7.0, 11.0], [2.0, 5.0]],
+            ]
+        ),
+        pressure=jnp.ones((3, 2, 2)),
+        Er=jnp.zeros((3, 2)),
+    )
+    solution = {
+        "ys": saved_states,
+        "ts": jnp.asarray([0.0, 1.0, 2.0]),
+        "accepted_mask": jnp.asarray([True, False, True]),
+    }
+    runtime = SimpleNamespace(
+        database=object(),
+        species=SimpleNamespace(charge_qp=jnp.asarray([1.0, -1.0])),
+        models=SimpleNamespace(flux=_DatabaseFluxModel()),
+    )
+
+    result = orchestrator.write_transport_bootstrap_current_evolution(
+        jnp.asarray([0.25, 0.75]),
+        solution,
+        tmp_path,
+        runtime=runtime,
+    )
+
+    scale = DENSITY_STATE_TO_PHYSICAL * elementary_charge * 1.0e-5
+    np.testing.assert_allclose(result["times"], [0.0, 2.0])
+    np.testing.assert_allclose(
+        result["profiles"],
+        np.asarray([[1.0, 1.0], [5.0, 6.0]]) * scale,
+    )
+    assert (tmp_path / "bootstrap_current_evolution.csv").is_file()
 
 
 def test_least_squares_does_not_reapply_problem_coordinate_scale(monkeypatch):
@@ -1130,6 +1179,41 @@ def test_full_transport_transition_objective_indices_are_selectable():
     assert float(right) == 26.0
 
 
+def test_full_transport_smooth_transition_location_ignores_near_axis_zero():
+    """The optional location row selects the outward +Er to -Er transition."""
+
+    rho = jnp.linspace(0.0, 1.0, 11, dtype=jnp.float64)
+    er = jnp.asarray(
+        [0.0, 8.0, 12.0, 10.0, 6.0, 2.0, -4.0, -8.0, -9.0, -10.0, -10.0],
+        dtype=jnp.float64,
+    )
+    location = reverse_transport.smooth_positive_to_negative_er_transition_rho(
+        er,
+        rho,
+        rho_min=0.25,
+        rho_max=0.75,
+        temperature_kv_m=1.0,
+    )
+    gradient = jax.grad(
+        lambda values: reverse_transport.smooth_positive_to_negative_er_transition_rho(
+            values,
+            rho,
+            rho_min=0.25,
+            rho_max=0.75,
+            temperature_kv_m=1.0,
+        )
+    )(er)
+
+    assert 0.50 < float(location) < 0.65
+    assert bool(jnp.all(jnp.isfinite(gradient)))
+    assert "Er_transition_rho" not in (
+        reverse_transport.TRANSPORT_REVERSE_OBJECTIVE_LABELS
+    )
+    assert reverse_transport.TRANSPORT_OPTIMIZATION_OPTIONAL_OBJECTIVE_LABELS == (
+        "Er_transition_rho",
+    )
+
+
 def test_full_transport_parity_perturbation_reuses_only_trial_stage(
     monkeypatch, tmp_path
 ):
@@ -1786,3 +1870,90 @@ def test_qi_maxj_backend_settings_preserve_surrogate_default_and_aliases():
     )
     assert explicit.backend == "physical"
     assert explicit.trapping_depths == (0.25, 0.8)
+
+
+def test_database_full_transport_profile_problem_uses_configured_direct_builder(
+    monkeypatch,
+):
+    """Profile optimization keeps the configured Er cells and database lane."""
+
+    config = {
+        "geometry": {"n_radial": 51},
+        "neoclassical": {
+            "flux_model": "ntx_scan_runtime",
+            "ntx_scan_n_theta": 25,
+            "ntx_scan_n_zeta": 31,
+            "ntx_scan_n_xi": 64,
+            "ntx_scan_surface_backend": "vmec",
+        },
+        "profiles": {
+            "n0": 4.21,
+            "T0": 17.8,
+            "density_shape_power": 10.0,
+            "temperature_shape_power": 2.0,
+        },
+        "transport_solver": {},
+    }
+    runtime = SimpleNamespace()
+    baseline_state = SimpleNamespace(pressure=jnp.ones((1, 2), dtype=jnp.float64))
+    builder = object()
+    builder_calls = []
+    root_stage = object()
+
+    monkeypatch.setattr(
+        optimization,
+        "_prepare_full_transport_config",
+        lambda value, **_kwargs: copy.deepcopy(value),
+    )
+    monkeypatch.setattr(
+        optimization,
+        "build_runtime_context",
+        lambda _config: (runtime, baseline_state),
+    )
+    monkeypatch.setattr(
+        optimization,
+        "build_database_initial_root_experiment_stage",
+        lambda **_kwargs: root_stage,
+    )
+
+    def _builder_factory(**kwargs):
+        builder_calls.append(kwargs)
+        return builder
+
+    monkeypatch.setattr(
+        optimization,
+        "internal_realtime_geometry_transport_reverse_table_result_builder",
+        _builder_factory,
+    )
+
+    problem = optimization.full_transport_profile_least_squares_problem(
+        config,
+        (
+            (optimization.transport.Er_transition_left, 26.0, 0.09),
+            (optimization.transport.Er_transition_right, -10.0, 0.09),
+        ),
+        accepted_step_limit=None,
+        reverse_segment_length=50,
+        max_reverse_accepted_steps=500,
+        er_transition_left_index=25,
+        er_transition_right_index=26,
+        reverse_stage_adjoint_solve_mode="block",
+        reverse_rhs_transpose_mode="explicit_database",
+        reverse_step_bwd_mode="reduced_cotangent_call_boundary",
+        reverse_stage_mode="database_full_transport_optimization",
+    )
+
+    assert len(builder_calls) == 1
+    call = builder_calls[0]
+    assert call["er_transition_left_index"] == 25
+    assert call["er_transition_right_index"] == 26
+    assert call["reverse_segment_length"] == 50
+    assert call["max_reverse_accepted_steps"] == 500
+    assert call["initial_root_optimization_stage"] is root_stage
+    assert problem.table_result_builder is builder
+    assert problem.run_grouped_report is None
+    assert problem.options["Er_transition_left_index"] == 25
+    assert problem.options["Er_transition_right_index"] == 26
+    assert problem.options["reverse_stage_mode"] == (
+        "database_full_transport_optimization"
+    )

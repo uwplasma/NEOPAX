@@ -91,6 +91,7 @@ from ._reverse_ad_parameters import (
 from ._reverse_ad_transport import (
     RealtimeGeometryPayloadPullbackResult,
     RealtimeGeometryTransportReverseAssemblyResult,
+    TRANSPORT_OPTIMIZATION_OPTIONAL_OBJECTIVE_LABELS,
     TRANSPORT_REVERSE_OBJECTIVE_LABELS,
     internal_realtime_geometry_transport_reverse_table_result_builder,
     initial_state_for_parameter_vector,
@@ -809,6 +810,7 @@ class ProfileFullTransportLeastSquaresProblem:
     table_context: object
     run_grouped_report: object
     options: Mapping[str, object]
+    table_result_builder: object | None = None
 
     @property
     def parameter_count(self) -> int:
@@ -868,8 +870,17 @@ class ProfileFullTransportLeastSquaresProblem:
             self.config,
             request=request,
             terms=base_terms,
-            run_grouped_report=self.run_grouped_report,
-            objective_labels=TRANSPORT_REVERSE_OBJECTIVE_LABELS,
+            table_result_builder=self.table_result_builder,
+            run_grouped_report=(
+                None
+                if self.table_result_builder is not None
+                else self.run_grouped_report
+            ),
+            objective_labels=(
+                None
+                if self.table_result_builder is not None
+                else TRANSPORT_REVERSE_OBJECTIVE_LABELS
+            ),
             options=options | {"profile_values": physical_values},
             quiet_default=True,
         )
@@ -2047,6 +2058,20 @@ def _prepare_full_transport_config(config_path, *, device: str | None) -> dict:
     return config
 
 
+def _full_transport_reverse_objective_labels(
+    terms: Sequence[GeometryLeastSquaresTerm | LeastSquaresTerm],
+) -> tuple[str, ...]:
+    """Extend the established reverse rows only for selected optional terms."""
+
+    requested = {term.objective.name for term in terms}
+    optional = tuple(
+        name
+        for name in TRANSPORT_OPTIMIZATION_OPTIONAL_OBJECTIVE_LABELS
+        if name in requested
+    )
+    return (*TRANSPORT_REVERSE_OBJECTIVE_LABELS, *optional)
+
+
 def full_transport_profile_least_squares_problem(
     config,
     terms: Sequence[
@@ -2061,6 +2086,12 @@ def full_transport_profile_least_squares_problem(
     accepted_step_limit: int | None = 16,
     reverse_segment_length: int | str | None = 4,
     initial_er_root_ad: str = "jax_selected_root",
+    er_transition_left_index: int = 20,
+    er_transition_right_index: int = 21,
+    er_transition_rho_min: float = 0.25,
+    er_transition_rho_max: float = 0.75,
+    er_transition_temperature_kv_m: float = 2.0,
+    er_transition_positive_part_eps: float = 1.0e-6,
     radau_jacobian_reuse_mode: str = "legacy",
     reverse_stage_adjoint_solve_mode: str = "bicgstab",
     reverse_rhs_transpose_mode: str = "explicit_ntx_interpolated",
@@ -2070,8 +2101,18 @@ def full_transport_profile_least_squares_problem(
     reverse_stage_adjoint_iter_maxiter: int = 40,
     reverse_stage_adjoint_iter_tol: float = 1.0e-10,
     reverse_stage_adjoint_woodbury_rank: int = 24,
+    print_final_softmax_er: bool = False,
+    max_reverse_accepted_steps: int | None = None,
+    reverse_stage_mode: str = "benchmark",
 ) -> ProfileFullTransportLeastSquaresProblem:
     """Build a profile-only optimizer problem for full Radau transport objectives."""
+
+    if not 0.0 <= float(er_transition_rho_min) < float(er_transition_rho_max) <= 1.0:
+        raise ValueError("Er transition radial window must satisfy 0 <= min < max <= 1.")
+    if float(er_transition_temperature_kv_m) <= 0.0:
+        raise ValueError("er_transition_temperature_kv_m must be positive.")
+    if float(er_transition_positive_part_eps) <= 0.0:
+        raise ValueError("er_transition_positive_part_eps must be positive.")
 
     config_eff = _prepare_full_transport_config(config, device=device)
     solver_cfg = config_eff.setdefault("transport_solver", {})
@@ -2091,6 +2132,9 @@ def full_transport_profile_least_squares_problem(
         vmec_boundary=(),
     )
     normalized_terms = _normalize_initial_er_root_least_squares_terms(terms)
+    reverse_objective_labels = _full_transport_reverse_objective_labels(
+        normalized_terms
+    )
     profile_cfg = copy.deepcopy(config_eff.get("profiles", {}))
     profile_cfg.setdefault("model", "standard_analytical")
     neoclassical_cfg = dict(config_eff.get("neoclassical", {}))
@@ -2102,6 +2146,21 @@ def full_transport_profile_least_squares_problem(
         profile_cfg=profile_cfg,
         neoclassical_cfg=neoclassical_cfg,
     )
+
+    stage_mode = str(reverse_stage_mode).strip().lower()
+    if stage_mode not in {"benchmark", "database_full_transport_optimization"}:
+        raise ValueError(
+            "reverse_stage_mode must be 'benchmark' or "
+            "'database_full_transport_optimization'."
+        )
+    is_database_runtime = (
+        str(neoclassical_cfg.get("flux_model", "")).strip().lower()
+        == "ntx_scan_runtime"
+    )
+    if stage_mode == "database_full_transport_optimization" and not is_database_runtime:
+        raise ValueError(
+            "The database full-transport profile mode requires ntx_scan_runtime."
+        )
 
     args = SimpleNamespace(
         realtime_geometry_gradient_path="reverse_payload",
@@ -2144,25 +2203,6 @@ def full_transport_profile_least_squares_problem(
             suppress_diagnostics=True,
         )
 
-    support_segment_executor = realtime_geometry_transport_reverse_support_segment_executor(
-        support_segment_probe=_internal_support_segment_probe,
-        config=config_eff,
-        baseline_values=baseline_profile_values,
-        baseline_runtime=runtime,
-        baseline_state=baseline_state,
-        profile_cfg=profile_cfg,
-        neoclassical_cfg=neoclassical_cfg,
-    )
-    grouped_inputs = realtime_geometry_transport_reverse_grouped_inputs(
-        args=args,
-        config=config_eff,
-        baseline_values=baseline_profile_values,
-        baseline_runtime=runtime,
-        baseline_state=baseline_state,
-        profile_cfg=profile_cfg,
-        neoclassical_cfg=neoclassical_cfg,
-        support_segment_executor=support_segment_executor,
-    )
     options = {
         "quiet": True,
         "accepted_step_limit": None if accepted_step_limit is None else int(accepted_step_limit),
@@ -2174,6 +2214,14 @@ def full_transport_profile_least_squares_problem(
             else int(reverse_segment_length)
         ),
         "initial_er_root_ad": str(initial_er_root_ad),
+        "Er_transition_left_index": int(er_transition_left_index),
+        "Er_transition_right_index": int(er_transition_right_index),
+        "Er_transition_rho_min": float(er_transition_rho_min),
+        "Er_transition_rho_max": float(er_transition_rho_max),
+        "Er_transition_temperature_kv_m": float(er_transition_temperature_kv_m),
+        "Er_transition_positive_part_eps": float(
+            er_transition_positive_part_eps
+        ),
         "reverse_stage_adjoint_solve_mode": str(reverse_stage_adjoint_solve_mode),
         "reverse_rhs_transpose_mode": str(reverse_rhs_transpose_mode),
         "reverse_stage_cotangent_mode": str(reverse_stage_cotangent_mode),
@@ -2181,7 +2229,190 @@ def full_transport_profile_least_squares_problem(
         "reverse_stage_adjoint_memory_mode": str(reverse_stage_adjoint_memory_mode),
         "reverse_stage_adjoint_iter_maxiter": int(reverse_stage_adjoint_iter_maxiter),
         "reverse_stage_adjoint_iter_tol": float(reverse_stage_adjoint_iter_tol),
+        "reverse_stage_adjoint_woodbury_rank": int(
+            reverse_stage_adjoint_woodbury_rank
+        ),
+        "print_final_softmax_er": bool(print_final_softmax_er),
+        "max_reverse_accepted_steps": (
+            None
+            if max_reverse_accepted_steps is None
+            else int(max_reverse_accepted_steps)
+        ),
+        "reverse_stage_mode": stage_mode,
     }
+
+    table_result_builder = None
+    run_grouped_report = None
+    table_context_eff = table_context
+    if stage_mode == "database_full_transport_optimization":
+        options.update(
+            {
+                "reverse_rhs_pullback_mode": "separate",
+                "reverse_initial_cache_support_pullback_mode": "scalar",
+                "reverse_rebuild_support_pullback_mode": "separate",
+                "reverse_database_initial_support_mode": "reduced_zero",
+                "reverse_database_initial_state_mode": "reduced_zero_rhs",
+                "reverse_database_support_preparation_mode": "shared",
+                "reverse_database_center_geometry_mode": "scalar_jvp",
+                "reverse_database_stage_jacobian_mode": "independent",
+                "reverse_database_support_objective_mode": "scalar",
+                "reverse_database_segment_support_mode": "inline",
+                "reverse_database_interpolation_transpose_mode": "legacy_sparse",
+                "reverse_database_root_interpolation_transpose_mode": "legacy_sparse",
+                "reverse_database_bootstrap_interpolation_transpose_mode": "legacy_sparse",
+                "reverse_final_objective_cotangent_mode": "grouped_joint_vjp",
+                "reverse_bootstrap_cotangent_mode": "joint_local_vjp_upar_only",
+                "reverse_schedule_artifact_mode": "reuse_static_probe",
+                "reverse_segment_start_replay_mode": "minimal",
+                "reverse_segment_primal_record_mode": "reuse_segment_primal_record",
+            }
+        )
+        database_root_parameter_set = reverse_ad_optimization_parameter_set(
+            include_profiles=True,
+            profiles=PROFILE_PARAMETER_ORDER,
+            vmec_boundary=(),
+        )
+        database_root_stage = build_database_initial_root_experiment_stage(
+            runtime=runtime,
+            config=config_eff,
+            objective_names=reverse_objective_labels,
+            parameter_set=database_root_parameter_set,
+            pre_root_state_from_profile_values=lambda profile_values: (
+                initial_state_for_parameter_vector(
+                    profile_values,
+                    config=config_eff,
+                    initial_er_root_ad="off",
+                    baseline_state=baseline_state,
+                    profile_cfg=profile_cfg,
+                    runtime=runtime,
+                )
+            ),
+            options={
+                "reverse_database_root_interpolation_transpose_mode": (
+                    "legacy_sparse"
+                )
+            },
+            jit_selected_root=False,
+            use_fresh_database_payload=True,
+        )
+
+        if print_final_softmax_er:
+            def _profile_segment_replay_stage_builder(**kwargs):
+                return build_database_full_transport_replay_optimization_stage(
+                    **kwargs,
+                    print_final_softmax_er=True,
+                )
+        else:
+            _profile_segment_replay_stage_builder = (
+                build_database_full_transport_replay_optimization_stage
+            )
+
+        geom_cfg = config_eff.get("geometry", {})
+        n_r_eff = int(geom_cfg.get("n_radial", 51))
+        n_theta_eff = int(neoclassical_cfg.get("ntx_scan_n_theta", 25))
+        n_zeta_eff = int(neoclassical_cfg.get("ntx_scan_n_zeta", 25))
+        n_xi_eff = int(neoclassical_cfg.get("ntx_scan_n_xi", 64))
+        table_result_builder = (
+            internal_realtime_geometry_transport_reverse_table_result_builder(
+                table_context=table_context,
+                geometry_context=None,
+                baseline_geometry_deltas=jnp.zeros((0,), dtype=jnp.float64),
+                combined_geometry_payload=True,
+                n_r=n_r_eff,
+                n_theta=n_theta_eff,
+                n_zeta=n_zeta_eff,
+                n_xi=n_xi_eff,
+                surface_backend=str(
+                    neoclassical_cfg.get("ntx_scan_surface_backend", "vmec")
+                ),
+                accepted_step_limit=accepted_step_limit,
+                reverse_segment_length=reverse_segment_length,
+                initial_er_root_ad=str(initial_er_root_ad),
+                er_transition_left_index=int(er_transition_left_index),
+                er_transition_right_index=int(er_transition_right_index),
+                er_transition_rho_min=float(er_transition_rho_min),
+                er_transition_rho_max=float(er_transition_rho_max),
+                er_transition_temperature_kv_m=float(
+                    er_transition_temperature_kv_m
+                ),
+                er_transition_positive_part_eps=float(
+                    er_transition_positive_part_eps
+                ),
+                reverse_stage_adjoint_solve_mode=str(
+                    reverse_stage_adjoint_solve_mode
+                ),
+                reverse_rhs_transpose_mode=str(reverse_rhs_transpose_mode),
+                reverse_rhs_pullback_mode="separate",
+                reverse_initial_cache_support_pullback_mode="scalar",
+                reverse_rebuild_support_pullback_mode="separate",
+                reverse_database_initial_support_mode="reduced_zero",
+                reverse_database_initial_state_mode="reduced_zero_rhs",
+                reverse_database_support_preparation_mode="shared",
+                reverse_database_center_geometry_mode="scalar_jvp",
+                reverse_database_stage_jacobian_mode="independent",
+                reverse_database_support_objective_mode="scalar",
+                reverse_database_segment_support_mode="inline",
+                reverse_database_interpolation_transpose_mode="legacy_sparse",
+                reverse_database_root_interpolation_transpose_mode="legacy_sparse",
+                reverse_database_bootstrap_interpolation_transpose_mode=(
+                    "legacy_sparse"
+                ),
+                reverse_segment_start_replay_mode="minimal",
+                reverse_segment_primal_record_mode="reuse_segment_primal_record",
+                reverse_final_objective_cotangent_mode="grouped_joint_vjp",
+                reverse_bootstrap_cotangent_mode="joint_local_vjp_upar_only",
+                reverse_schedule_artifact_mode="reuse_static_probe",
+                reverse_stage_cotangent_mode=str(reverse_stage_cotangent_mode),
+                reverse_step_bwd_mode=str(reverse_step_bwd_mode),
+                reverse_stage_adjoint_memory_mode=str(
+                    reverse_stage_adjoint_memory_mode
+                ),
+                reverse_stage_adjoint_iter_maxiter=int(
+                    reverse_stage_adjoint_iter_maxiter
+                ),
+                reverse_stage_adjoint_iter_tol=float(
+                    reverse_stage_adjoint_iter_tol
+                ),
+                reverse_stage_adjoint_woodbury_rank=int(
+                    reverse_stage_adjoint_woodbury_rank
+                ),
+                max_reverse_accepted_steps=max_reverse_accepted_steps,
+                progress_label="[optimization] full transport profile pullback:",
+                segment_replay_optimization_stage_builder=(
+                    _profile_segment_replay_stage_builder
+                ),
+                bootstrap_optimization_stage_builder=(
+                    build_database_full_transport_bootstrap_optimization_stage
+                ),
+                initial_root_optimization_stage=database_root_stage,
+                objective_labels=reverse_objective_labels,
+            )
+        )
+    else:
+        support_segment_executor = (
+            realtime_geometry_transport_reverse_support_segment_executor(
+                support_segment_probe=_internal_support_segment_probe,
+                config=config_eff,
+                baseline_values=baseline_profile_values,
+                baseline_runtime=runtime,
+                baseline_state=baseline_state,
+                profile_cfg=profile_cfg,
+                neoclassical_cfg=neoclassical_cfg,
+            )
+        )
+        grouped_inputs = realtime_geometry_transport_reverse_grouped_inputs(
+            args=args,
+            config=config_eff,
+            baseline_values=baseline_profile_values,
+            baseline_runtime=runtime,
+            baseline_state=baseline_state,
+            profile_cfg=profile_cfg,
+            neoclassical_cfg=neoclassical_cfg,
+            support_segment_executor=support_segment_executor,
+        )
+        table_context_eff = grouped_inputs.table_context
+        run_grouped_report = grouped_inputs.run_grouped_report
+
     return ProfileFullTransportLeastSquaresProblem(
         config=config_eff,
         runtime=runtime,
@@ -2192,9 +2423,10 @@ def full_transport_profile_least_squares_problem(
         profile_scales=profile_scales,
         parameter_set=parameter_set,
         terms=normalized_terms,
-        table_context=grouped_inputs.table_context,
-        run_grouped_report=grouped_inputs.run_grouped_report,
+        table_context=table_context_eff,
+        run_grouped_report=run_grouped_report,
         options=options,
+        table_result_builder=table_result_builder,
     )
 
 
@@ -2230,6 +2462,10 @@ def geometry_full_transport_least_squares_problem(
     initial_er_root_ad: str = "jax_selected_root",
     er_transition_left_index: int = 20,
     er_transition_right_index: int = 21,
+    er_transition_rho_min: float = 0.25,
+    er_transition_rho_max: float = 0.75,
+    er_transition_temperature_kv_m: float = 2.0,
+    er_transition_positive_part_eps: float = 1.0e-6,
     radau_jacobian_reuse_mode: str = "legacy",
     reverse_stage_adjoint_solve_mode: str = "bicgstab",
     reverse_rhs_transpose_mode: str = "explicit_ntx_interpolated",
@@ -2251,6 +2487,18 @@ def geometry_full_transport_least_squares_problem(
     problems use :func:`geometry_initial_er_root_only_least_squares_problem`
     and never construct this transport reverse table.
     """
+
+    if not 0.0 <= float(er_transition_rho_min) < float(er_transition_rho_max) <= 1.0:
+        raise ValueError("Er transition radial window must satisfy 0 <= min < max <= 1.")
+    if float(er_transition_temperature_kv_m) <= 0.0:
+        raise ValueError("er_transition_temperature_kv_m must be positive.")
+    if float(er_transition_positive_part_eps) <= 0.0:
+        raise ValueError("er_transition_positive_part_eps must be positive.")
+
+    normalized_terms = _normalize_initial_er_root_least_squares_terms(terms)
+    reverse_objective_labels = _full_transport_reverse_objective_labels(
+        normalized_terms
+    )
 
     config_eff = _prepare_full_transport_config(config, device=device)
     config_eff.setdefault("transport_solver", {})["radau_jacobian_reuse_mode"] = str(
@@ -2374,6 +2622,12 @@ def geometry_full_transport_least_squares_problem(
         "initial_er_root_ad": str(initial_er_root_ad),
         "Er_transition_left_index": int(er_transition_left_index),
         "Er_transition_right_index": int(er_transition_right_index),
+        "Er_transition_rho_min": float(er_transition_rho_min),
+        "Er_transition_rho_max": float(er_transition_rho_max),
+        "Er_transition_temperature_kv_m": float(er_transition_temperature_kv_m),
+        "Er_transition_positive_part_eps": float(
+            er_transition_positive_part_eps
+        ),
         "reverse_stage_adjoint_solve_mode": str(reverse_stage_adjoint_solve_mode),
         "reverse_rhs_transpose_mode": str(reverse_rhs_transpose_mode),
         "reverse_stage_cotangent_mode": str(reverse_stage_cotangent_mode),
@@ -2469,7 +2723,7 @@ def geometry_full_transport_least_squares_problem(
         database_root_stage = build_database_initial_root_experiment_stage(
             runtime=runtime,
             config=config_eff,
-            objective_names=TRANSPORT_REVERSE_OBJECTIVE_LABELS,
+            objective_names=reverse_objective_labels,
             parameter_set=database_root_parameter_set,
             pre_root_state_from_profile_values=lambda profile_values: (
                 initial_state_for_parameter_vector(
@@ -2640,6 +2894,12 @@ def geometry_full_transport_least_squares_problem(
         initial_er_root_ad=str(initial_er_root_ad),
         er_transition_left_index=int(er_transition_left_index),
         er_transition_right_index=int(er_transition_right_index),
+        er_transition_rho_min=float(er_transition_rho_min),
+        er_transition_rho_max=float(er_transition_rho_max),
+        er_transition_temperature_kv_m=float(er_transition_temperature_kv_m),
+        er_transition_positive_part_eps=float(
+            er_transition_positive_part_eps
+        ),
         reverse_stage_adjoint_solve_mode=str(reverse_stage_adjoint_solve_mode),
         reverse_rhs_transpose_mode=str(reverse_rhs_transpose_mode),
         reverse_rhs_pullback_mode=str(options.get("reverse_rhs_pullback_mode", "separate")),
@@ -2716,8 +2976,8 @@ def geometry_full_transport_least_squares_problem(
         payload_assembly_optimization_stage=full_transport_payload_stage,
         initial_root_optimization_stage=database_root_stage,
         runtime_optimization_stage=database_runtime_optimization_stage,
+        objective_labels=reverse_objective_labels,
     )
-    normalized_terms = _normalize_initial_er_root_least_squares_terms(terms)
     return GeometryFullTransportLeastSquaresProblem(
         config=config_eff,
         context=context,

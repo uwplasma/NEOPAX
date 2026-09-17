@@ -975,6 +975,9 @@ TRANSPORT_REVERSE_OBJECTIVE_LABELS: tuple[str, ...] = (
     "alpha_power_volume_average_mw_m3",
     "bootstrap_current_softmax_abs_scaled",
 )
+TRANSPORT_OPTIMIZATION_OPTIONAL_OBJECTIVE_LABELS: tuple[str, ...] = (
+    "Er_transition_rho",
+)
 TRANSPORT_REVERSE_PROFILE_PARAMETER_ORDER: tuple[str, ...] = (
     "n0",
     "T0",
@@ -1316,6 +1319,53 @@ def smooth_root_proxy(
     return jnp.sum(rho_grid * weights) / jnp.maximum(jnp.sum(weights), jnp.asarray(1.0e-30, dtype=er_profile.dtype))
 
 
+def smooth_positive_to_negative_er_transition_rho(
+    er_profile: jax.Array,
+    rho_grid: jax.Array,
+    *,
+    rho_min: float = 0.25,
+    rho_max: float = 0.75,
+    temperature_kv_m: float = 2.0,
+    positive_part_eps: float = 1.0e-6,
+) -> jax.Array:
+    """Smooth final-time location of an ion-to-electron Er transition.
+
+    The score is the smooth positive part of the radial drop in
+    ``sigmoid(Er / temperature_kv_m)``.  Consequently a positive-to-negative
+    transition receives order-one weight, while a flat near-zero axis does
+    not.  The fixed radial window is deliberately applied on cell faces so a
+    near-axis zero cannot win the soft location objective.
+
+    ``Er_transition_left`` and ``Er_transition_right`` remain independent
+    objectives.  They can be retained alongside this location objective to
+    enforce the desired signs and transition strength.
+    """
+
+    er = jnp.asarray(er_profile)
+    rho = jnp.asarray(rho_grid, dtype=er.dtype)
+    if er.ndim != 1 or rho.ndim != 1 or er.shape != rho.shape:
+        raise ValueError("er_profile and rho_grid must be equal-length 1D arrays.")
+    if int(er.shape[0]) < 2:
+        raise ValueError("Er transition location requires at least two radial cells.")
+
+    temperature = jnp.asarray(temperature_kv_m, dtype=er.dtype)
+    eps = jnp.asarray(positive_part_eps, dtype=er.dtype)
+    ion_probability = jax.nn.sigmoid(er / temperature)
+    signed_drop = ion_probability[:-1] - ion_probability[1:]
+    transition_score = 0.5 * (
+        signed_drop + jnp.sqrt(signed_drop * signed_drop + eps * eps)
+    )
+    rho_faces = 0.5 * (rho[:-1] + rho[1:])
+    radial_mask = (rho_faces >= jnp.asarray(rho_min, dtype=er.dtype)) & (
+        rho_faces <= jnp.asarray(rho_max, dtype=er.dtype)
+    )
+    weights = jnp.where(radial_mask, transition_score, 0.0)
+    weight_sum = jnp.sum(weights)
+    return jnp.sum(rho_faces * weights) / jnp.maximum(
+        weight_sum, jnp.asarray(1.0e-30, dtype=er.dtype)
+    )
+
+
 def volume_average(profile: jax.Array, geometry) -> jax.Array:
     volume = jnp.trapezoid(jnp.asarray(geometry.Vprime), x=jnp.asarray(geometry.r_grid))
     integral = jnp.trapezoid(profile * jnp.asarray(geometry.Vprime), x=jnp.asarray(geometry.r_grid))
@@ -1441,10 +1491,15 @@ def objective_scalar_by_index(
     runtime,
     objective_index: int,
     *,
+    objective_labels: Sequence[str] = TRANSPORT_REVERSE_OBJECTIVE_LABELS,
     er_transition_left_index: int = 20,
     er_transition_right_index: int = 21,
+    er_transition_rho_min: float = 0.25,
+    er_transition_rho_max: float = 0.75,
+    er_transition_temperature_kv_m: float = 2.0,
+    er_transition_positive_part_eps: float = 1.0e-6,
 ):
-    objective_name = TRANSPORT_REVERSE_OBJECTIVE_LABELS[int(objective_index)]
+    objective_name = tuple(objective_labels)[int(objective_index)]
     er = jnp.asarray(final_state.Er)
     if objective_name == "softmax_Er":
         return softmax_objective(er)
@@ -1470,6 +1525,15 @@ def objective_scalar_by_index(
         return alpha_power_volume_average(final_state, runtime)
     if objective_name == "bootstrap_current_softmax_abs_scaled":
         return bootstrap_current_softmax_abs_scaled(final_state, runtime)
+    if objective_name == "Er_transition_rho":
+        return smooth_positive_to_negative_er_transition_rho(
+            er,
+            runtime.geometry.rho_grid,
+            rho_min=er_transition_rho_min,
+            rho_max=er_transition_rho_max,
+            temperature_kv_m=er_transition_temperature_kv_m,
+            positive_part_eps=er_transition_positive_part_eps,
+        )
     raise ValueError(f"Unknown objective index {objective_index}: {objective_name!r}")
 
 
@@ -8494,6 +8558,10 @@ def internal_realtime_geometry_transport_reverse_table_result_builder(
     initial_er_root_ad: str = "off",
     er_transition_left_index: int = 20,
     er_transition_right_index: int = 21,
+    er_transition_rho_min: float = 0.25,
+    er_transition_rho_max: float = 0.75,
+    er_transition_temperature_kv_m: float = 2.0,
+    er_transition_positive_part_eps: float = 1.0e-6,
     reverse_stage_adjoint_solve_mode: str = "bicgstab",
     reverse_rhs_transpose_mode: str = "explicit_ntx_interpolated",
     reverse_rhs_pullback_mode: str = "separate",
@@ -8534,6 +8602,7 @@ def internal_realtime_geometry_transport_reverse_table_result_builder(
     payload_assembly_optimization_stage: object | None = None,
     initial_root_optimization_stage: object | None = None,
     runtime_optimization_stage: object | None = None,
+    objective_labels: Sequence[str] = TRANSPORT_REVERSE_OBJECTIVE_LABELS,
 ) -> TransportReverseTableResultBuilder:
     """Build an experimental direct full transport reverse table builder.
 
@@ -8548,8 +8617,10 @@ def internal_realtime_geometry_transport_reverse_table_result_builder(
         table_context.baseline_values[: len(TRANSPORT_REVERSE_PROFILE_PARAMETER_ORDER)]
     )
 
+    configured_objective_labels = tuple(str(name) for name in objective_labels)
+
     def _row_indices(objective_names: Sequence[str]) -> tuple[int, ...]:
-        labels = tuple(TRANSPORT_REVERSE_OBJECTIVE_LABELS)
+        labels = configured_objective_labels
         lookup = {name: i for i, name in enumerate(labels)}
         return tuple(lookup[str(name)] for name in normalize_transport_objective_names(objective_names, objective_labels=labels))
 
@@ -8557,6 +8628,14 @@ def internal_realtime_geometry_transport_reverse_table_result_builder(
     optimization_bootstrap_stage = None
     configured_er_transition_left_index = int(er_transition_left_index)
     configured_er_transition_right_index = int(er_transition_right_index)
+    configured_er_transition_rho_min = float(er_transition_rho_min)
+    configured_er_transition_rho_max = float(er_transition_rho_max)
+    configured_er_transition_temperature_kv_m = float(
+        er_transition_temperature_kv_m
+    )
+    configured_er_transition_positive_part_eps = float(
+        er_transition_positive_part_eps
+    )
     configured_objective_dependencies = (
         default_realtime_geometry_support_reverse_dependencies()
     )
@@ -8564,6 +8643,11 @@ def internal_realtime_geometry_transport_reverse_table_result_builder(
     if (
         configured_er_transition_left_index != 20
         or configured_er_transition_right_index != 21
+        or configured_er_transition_rho_min != 0.25
+        or configured_er_transition_rho_max != 0.75
+        or configured_er_transition_temperature_kv_m != 2.0
+        or configured_er_transition_positive_part_eps != 1.0e-6
+        or configured_objective_labels != TRANSPORT_REVERSE_OBJECTIVE_LABELS
     ):
         # This callback is created once with the table builder, not once per
         # evaluation. Its identity is therefore stable across optimizer
@@ -8577,8 +8661,17 @@ def internal_realtime_geometry_transport_reverse_table_result_builder(
                 final_state,
                 objective_runtime,
                 objective_index,
+                objective_labels=configured_objective_labels,
                 er_transition_left_index=configured_er_transition_left_index,
                 er_transition_right_index=configured_er_transition_right_index,
+                er_transition_rho_min=configured_er_transition_rho_min,
+                er_transition_rho_max=configured_er_transition_rho_max,
+                er_transition_temperature_kv_m=(
+                    configured_er_transition_temperature_kv_m
+                ),
+                er_transition_positive_part_eps=(
+                    configured_er_transition_positive_part_eps
+                ),
             )
 
         configured_objective_dependencies = dataclasses.replace(
@@ -8589,7 +8682,7 @@ def internal_realtime_geometry_transport_reverse_table_result_builder(
         def _configured_support_reverse(*args, **kwargs):
             return realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_vector(
                 *args,
-                objective_labels=TRANSPORT_REVERSE_OBJECTIVE_LABELS,
+                objective_labels=configured_objective_labels,
                 dependencies=configured_objective_dependencies,
                 **kwargs,
             )
@@ -8635,13 +8728,37 @@ def internal_realtime_geometry_transport_reverse_table_result_builder(
         active_er_transition_right_index = int(
             opts.get("Er_transition_right_index", er_transition_right_index)
         )
+        active_er_transition_rho_min = float(
+            opts.get("Er_transition_rho_min", er_transition_rho_min)
+        )
+        active_er_transition_rho_max = float(
+            opts.get("Er_transition_rho_max", er_transition_rho_max)
+        )
+        active_er_transition_temperature_kv_m = float(
+            opts.get(
+                "Er_transition_temperature_kv_m",
+                er_transition_temperature_kv_m,
+            )
+        )
+        active_er_transition_positive_part_eps = float(
+            opts.get(
+                "Er_transition_positive_part_eps",
+                er_transition_positive_part_eps,
+            )
+        )
         if (
             active_er_transition_left_index != configured_er_transition_left_index
             or active_er_transition_right_index
             != configured_er_transition_right_index
+            or active_er_transition_rho_min != configured_er_transition_rho_min
+            or active_er_transition_rho_max != configured_er_transition_rho_max
+            or active_er_transition_temperature_kv_m
+            != configured_er_transition_temperature_kv_m
+            or active_er_transition_positive_part_eps
+            != configured_er_transition_positive_part_eps
         ):
             raise ValueError(
-                "Er transition indices are fixed when the full-transport table "
+                "Er transition settings are fixed when the full-transport table "
                 "builder is created; rebuild the optimization problem to change them."
             )
         active_raw_block_solve = opts.get("raw_block_solve", raw_block_solve)
@@ -9105,7 +9222,7 @@ def internal_realtime_geometry_transport_reverse_table_result_builder(
             def _optimization_support_reverse(*args, **kwargs):
                 return realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_vector(
                     *args,
-                    objective_labels=TRANSPORT_REVERSE_OBJECTIVE_LABELS,
+                    objective_labels=configured_objective_labels,
                     dependencies=optimization_dependencies,
                     **kwargs,
                 )
@@ -9128,6 +9245,56 @@ def internal_realtime_geometry_transport_reverse_table_result_builder(
             optimization_phase_probe("transport_support_result")
         _report_table_builder_phase("transport_support_cotangents")
         rows = _row_indices(objective_names)
+
+        # A profile-only optimization consumes the profile-gradient block
+        # directly. There are no VMEC columns to assemble, so folding the
+        # recorded database bars through the scan and VMEX would be redundant.
+        # This opt-in direct-builder branch does not change the benchmark or
+        # geometry-optimization paths, both of which have VMEC parameters.
+        if not parameter_set.vmec_boundary_specs:
+            all_objective_values = jnp.asarray(support_result.objective_values)
+            all_profile_gradient_matrix = jnp.asarray(
+                support_result.profile_gradient_matrix
+            )
+            if int(all_profile_gradient_matrix.shape[1]) == len(
+                PROFILE_PARAMETER_ORDER
+            ):
+                all_profile_parameter_labels = PROFILE_PARAMETER_ORDER
+            else:
+                all_profile_parameter_labels = (
+                    TRANSPORT_REVERSE_PROFILE_PARAMETER_ORDER
+                )
+            profile_lookup = {
+                name: i for i, name in enumerate(all_profile_parameter_labels)
+            }
+            profile_cols = tuple(
+                profile_lookup[spec.name] for spec in parameter_set.profile_specs
+            )
+            selected_objective_values = all_objective_values[
+                jnp.asarray(rows, dtype=jnp.int32)
+            ]
+            selected_profile_matrix = all_profile_gradient_matrix[
+                jnp.asarray(rows, dtype=jnp.int32), :
+            ]
+            if profile_cols:
+                selected_profile_matrix = selected_profile_matrix[
+                    :, jnp.asarray(profile_cols, dtype=jnp.int32)
+                ]
+            else:
+                selected_profile_matrix = selected_profile_matrix[:, :0]
+            return realtime_geometry_transport_reverse_table_result(
+                objective_labels=objective_names,
+                profile_parameter_labels=tuple(
+                    spec.label for spec in parameter_set.profile_specs
+                ),
+                geometry_parameter_labels=(),
+                objective_values=selected_objective_values,
+                profile_gradient_matrix=selected_profile_matrix,
+                geometry_gradient_matrix=jnp.zeros(
+                    (len(rows), 0), dtype=selected_profile_matrix.dtype
+                ),
+            )
+
         support_bars = tuple(support_result.support_bars[i] for i in rows)
         native_vmec_face_coefficient_bars = (
             None

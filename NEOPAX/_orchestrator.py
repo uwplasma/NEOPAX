@@ -1760,6 +1760,9 @@ def run_transport(config: dict, runtime: RuntimeContext, state: TransportState):
     transport_cfg = config.get("transport_output", {})
     do_plot = transport_cfg.get("transport_plot", False)
     do_hdf5 = transport_cfg.get("transport_write_hdf5", False)
+    do_bootstrap_evolution = bool(
+        transport_cfg.get("transport_bootstrap_current_evolution", False)
+    )
     do_print_summary = bool(transport_cfg.get("transport_print_summary", False))
     do_residual_compare = transport_cfg.get("transport_compare_ambipolarity_residual", False)
     do_residual_scan = transport_cfg.get("transport_scan_ambipolarity_residual", False)
@@ -1779,7 +1782,7 @@ def run_transport(config: dict, runtime: RuntimeContext, state: TransportState):
                     dr,
                     species_names=runtime.species.names if key in {"density", "temperature", "gamma"} else None,
                 )
-    if do_plot or do_hdf5 or do_residual_compare:
+    if do_plot or do_hdf5 or do_bootstrap_evolution or do_residual_compare:
         if output_dir is None:
             output_dir = Path("outputs")
         elif not isinstance(output_dir, Path):
@@ -1817,6 +1820,13 @@ def run_transport(config: dict, runtime: RuntimeContext, state: TransportState):
                 boundary_models=transport_boundary_models,
                 density_floor=solver_cfg.get("density_floor", 1.0e-6),
                 temperature_floor=solver_cfg.get("temperature_floor"),
+            )
+        if do_bootstrap_evolution:
+            write_transport_bootstrap_current_evolution(
+                rho,
+                result,
+                output_dir,
+                runtime=runtime,
             )
         if do_print_summary:
             if isinstance(result, dict):
@@ -3992,6 +4002,180 @@ def plot_transport_solution(
         "power_exchange_species": power_exchange_species_png,
         "power_exchange_species_individual": power_exchange_species_pngs,
         **flux_plot_paths,
+    }
+
+
+def write_transport_bootstrap_current_evolution(
+    rho,
+    solution,
+    output_dir,
+    *,
+    runtime,
+):
+    """Write bootstrap-current profiles at the saved transport times.
+
+    This post-processes the trajectory already produced by the transport
+    solver. It does not perform a second rollout. The current uses the same
+    momentum-corrected ``Upar_neo`` definition and scaled units as the database
+    bootstrap optimization objective.
+    """
+
+    import csv
+    import numpy as np
+
+    from ._constants import elementary_charge
+    from ._transport_flux_models import DENSITY_STATE_TO_PHYSICAL
+
+    ys = getattr(solution, "ys", None)
+    if ys is None and isinstance(solution, dict):
+        ys = solution.get("ys")
+    ts = getattr(solution, "ts", None)
+    if ts is None and isinstance(solution, dict):
+        ts = solution.get("ts")
+    accepted_mask = getattr(solution, "accepted_mask", None)
+    if accepted_mask is None and isinstance(solution, dict):
+        accepted_mask = solution.get("accepted_mask")
+    if ys is None or ts is None:
+        raise ValueError(
+            "Bootstrap-current evolution requires saved transport states and times."
+        )
+
+    ts_np = np.asarray(jax.device_get(ts), dtype=float).reshape(-1)
+    valid = np.isfinite(ts_np)
+    if accepted_mask is not None:
+        accepted_np = np.asarray(jax.device_get(accepted_mask), dtype=bool).reshape(-1)
+        if accepted_np.shape == valid.shape:
+            valid &= accepted_np
+    valid_indices = np.flatnonzero(valid)
+    if valid_indices.size == 0:
+        raise ValueError("Transport result contains no valid saved states.")
+
+    # Dense saved times are unique. This also protects legacy accepted-step
+    # output from generating duplicate curves and duplicate legend entries.
+    _, unique_positions = np.unique(ts_np[valid_indices], return_index=True)
+    valid_indices = valid_indices[np.sort(unique_positions)]
+
+    flux_model = runtime.models.flux
+    neoclassical_model = getattr(flux_model, "neoclassical_model", flux_model)
+    model_database = getattr(neoclassical_model, "database", None)
+    if runtime.database is None and model_database is None:
+        raise ValueError(
+            "Bootstrap-current evolution currently requires a database transport model."
+        )
+    corrected_fluxes_fn = getattr(
+        neoclassical_model, "evaluate_momentum_corrected_fluxes", None
+    )
+    if corrected_fluxes_fn is None:
+        raise ValueError(
+            "Bootstrap-current evolution requires "
+            "evaluate_momentum_corrected_fluxes on the database flux model."
+        )
+
+    charge_qp = jnp.asarray(runtime.species.charge_qp)
+    current_weights = jnp.sign(charge_qp)
+    scale = elementary_charge * 1.0e-5
+    profiles = []
+    times = []
+    for index in valid_indices:
+        state = TransportState(
+            density=jnp.asarray(ys.density)[int(index)],
+            pressure=jnp.asarray(ys.pressure)[int(index)],
+            Er=jnp.asarray(ys.Er)[int(index)],
+        )
+        fluxes = corrected_fluxes_fn(state)
+        if hasattr(fluxes, "get"):
+            upar = fluxes.get("Upar_neo", fluxes.get("Upar", None))
+        else:
+            upar = getattr(fluxes, "Upar_neo", getattr(fluxes, "Upar", None))
+        if upar is None:
+            raise ValueError(
+                "Momentum-corrected database fluxes did not provide Upar_neo or Upar."
+            )
+        upar_arr = jnp.asarray(upar, dtype=jnp.asarray(state.pressure).dtype)
+        weights = jnp.asarray(current_weights, dtype=upar_arr.dtype)
+        upar_physical = (
+            jnp.asarray(DENSITY_STATE_TO_PHYSICAL, dtype=upar_arr.dtype) * upar_arr
+        )
+        if int(upar_arr.shape[0]) == int(weights.shape[0]):
+            current = jnp.sum(upar_physical * weights[:, None], axis=0) * scale
+        else:
+            current = jnp.sum(upar_physical * weights[None, :], axis=1) * scale
+        profiles.append(np.asarray(jax.device_get(current), dtype=float))
+        times.append(float(ts_np[int(index)]))
+
+    rho_np = np.asarray(jax.device_get(rho), dtype=float).reshape(-1)
+    profiles_np = np.stack(profiles, axis=0)
+    if profiles_np.shape[1] != rho_np.size:
+        raise ValueError(
+            "Bootstrap-current radial size does not match the transport rho grid: "
+            f"{profiles_np.shape[1]} != {rho_np.size}."
+        )
+
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    csv_path = output_dir / "bootstrap_current_evolution.csv"
+    with csv_path.open("w", newline="", encoding="utf-8") as stream:
+        writer = csv.writer(stream)
+        writer.writerow(
+            ["time_s", "rho", "Jboot_scaled_1e5_A_m2", "Jboot_kA_m2"]
+        )
+        for time_value, profile in zip(times, profiles_np, strict=True):
+            for rho_value, current_value in zip(rho_np, profile, strict=True):
+                writer.writerow(
+                    [
+                        f"{time_value:.17e}",
+                        f"{rho_value:.17e}",
+                        f"{current_value:.17e}",
+                        f"{100.0 * current_value:.17e}",
+                    ]
+                )
+    print(f"wrote {csv_path}")
+
+    try:
+        import matplotlib.pyplot as plt
+    except Exception as exc:
+        print(f"skipping bootstrap-current evolution plot: {exc}")
+        return {"times": np.asarray(times), "profiles": profiles_np, "csv": csv_path}
+
+    fig, ax = plt.subplots(figsize=(7.2, 5.8))
+    colors = plt.cm.viridis(np.linspace(0.0, 1.0, len(times)))
+    for time_value, profile, color in zip(times, profiles_np, colors, strict=True):
+        ax.plot(
+            rho_np,
+            100.0 * profile,
+            color=color,
+            linewidth=2.0,
+            label=f"t={time_value:.3g}",
+        )
+    ax.axhline(
+        10.0,
+        color="black",
+        linewidth=2.2,
+        linestyle="-",
+        label=r"$+10\;\mathrm{kA\,m^{-2}}$",
+    )
+    ax.axhline(
+        -10.0,
+        color="black",
+        linewidth=2.2,
+        linestyle="-",
+        label=r"$-10\;\mathrm{kA\,m^{-2}}$",
+    )
+    ax.set_xlabel(r"$\rho$")
+    ax.set_ylabel(r"$J^{\mathrm{bootstrap}}\;[\mathrm{kA\,m^{-2}}]$")
+    ax.set_title("Bootstrap current evolution")
+    ax.grid(alpha=0.25)
+    ax.legend(title="Time", loc="best", fontsize="small", ncol=2)
+    fig.tight_layout()
+    png_path = output_dir / "bootstrap_current_evolution.png"
+    fig.savefig(png_path, dpi=300, bbox_inches="tight")
+    plt.close(fig)
+    print(f"wrote {png_path}")
+    return {
+        "times": np.asarray(times),
+        "profiles": profiles_np,
+        "csv": csv_path,
+        "plot": png_path,
     }
 
 
