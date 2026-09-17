@@ -72,6 +72,7 @@ MAX_REVERSE_ACCEPTED_STEPS = 500
 TRANSPORT_MAX_STEPS = 1000
 TRANSPORT_FINAL_TIME = 2.0
 REVERSE_STAGE_MODE = "database_full_transport_optimization"
+PRINT_FINAL_SOFTMAX_ER = True
 
 ASPECT_TARGET = 10.0
 IOTA_TARGET = -0.61
@@ -605,6 +606,7 @@ def main() -> int:
             reverse_stage_cotangent_mode="full",
             reverse_step_bwd_mode="reduced_cotangent_call_boundary",
             reverse_stage_adjoint_memory_mode="default",
+            print_final_softmax_er=PRINT_FINAL_SOFTMAX_ER,
             reverse_stage_mode=REVERSE_STAGE_MODE,
             qi_maxj_settings=qi_maxj_backend_settings(frozen_physical_pitches),
         )
@@ -635,6 +637,7 @@ def main() -> int:
             f"accepted_step_limit={FULL_TRANSPORT_ACCEPTED_STEP_LIMIT} "
             f"reverse_segment_length={REVERSE_SEGMENT_LENGTH} "
             f"max_reverse_accepted_steps={MAX_REVERSE_ACCEPTED_STEPS} "
+            f"print_final_softmax_Er={PRINT_FINAL_SOFTMAX_ER} "
             f"Er_transition_indices=({args.er_transition_left_index},"
             f"{args.er_transition_right_index})",
             flush=True,

@@ -2240,7 +2240,7 @@ def geometry_full_transport_least_squares_problem(
     reverse_stage_adjoint_iter_tol: float = 1.0e-10,
     reverse_stage_adjoint_woodbury_rank: int = 24,
     reverse_segment_input_diagnostics: bool = False,
-    print_final_er_profile: bool = False,
+    print_final_softmax_er: bool = False,
     max_reverse_accepted_steps: int | None = None,
     reverse_stage_mode: str = "benchmark",
     qi_maxj_settings: QImaxJBackendSettings | Mapping[str, object] | str | None = None,
@@ -2383,7 +2383,7 @@ def geometry_full_transport_least_squares_problem(
         "reverse_stage_adjoint_iter_tol": float(reverse_stage_adjoint_iter_tol),
         "reverse_stage_adjoint_woodbury_rank": int(reverse_stage_adjoint_woodbury_rank),
         "reverse_segment_input_diagnostics": bool(reverse_segment_input_diagnostics),
-        "print_final_er_profile": bool(print_final_er_profile),
+        "print_final_softmax_er": bool(print_final_softmax_er),
         "max_reverse_accepted_steps": (
             None if max_reverse_accepted_steps is None else int(max_reverse_accepted_steps)
         ),
@@ -2610,11 +2610,11 @@ def geometry_full_transport_least_squares_problem(
     # with a second transport sweep or a manually assembled root derivative.
     segment_replay_stage_builder = None
     if stage_mode == "database_full_transport_optimization":
-        if print_final_er_profile:
+        if print_final_softmax_er:
             def _diagnostic_segment_replay_stage_builder(**kwargs):
                 return build_database_full_transport_replay_optimization_stage(
                     **kwargs,
-                    print_final_er_profile=True,
+                    print_final_softmax_er=True,
                 )
 
             segment_replay_stage_builder = _diagnostic_segment_replay_stage_builder

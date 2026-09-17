@@ -494,7 +494,7 @@ class DatabaseFullTransportReplayOptimizationStage:
     initial_state_signature: Any
     segment_carry_signature: Any
     segment_arrays_signature: Any
-    print_final_er_profile: bool = False
+    print_final_softmax_er: bool = False
 
     def replay(
         self,
@@ -625,15 +625,19 @@ class DatabaseFullTransportReplayOptimizationStage:
                 else int(capture_segment_length)
             ),
         )
-        if self.print_final_er_profile:
+        if self.print_final_softmax_er:
             final_state = self.initial_state_unpack(result.final_carry.y)
             er_profile = np.asarray(
                 jax.device_get(final_state.Er), dtype=float
             ).reshape(-1)
-            er_text = ",".join(f"{value:.16e}" for value in er_profile)
+            beta = 16.0
+            er_max = float(np.max(er_profile))
+            softmax_er = er_max + float(
+                np.log(np.sum(np.exp(beta * (er_profile - er_max)))) / beta
+            )
             print(
-                "[optimization] final_Er_profile "
-                f"count={er_profile.size} values=[{er_text}]",
+                "[optimization] final transport monitor: "
+                f"softmax_Er={softmax_er:.16e}",
                 flush=True,
             )
         return result
@@ -655,7 +659,7 @@ def build_database_full_transport_replay_optimization_stage(
     support_payload,
     segment_start_carry,
     segment_arrays,
-    print_final_er_profile: bool = False,
+    print_final_softmax_er: bool = False,
 ) -> DatabaseFullTransportReplayOptimizationStage:
     """Build the persistent database replay without changing benchmark math."""
 
@@ -1033,5 +1037,5 @@ def build_database_full_transport_replay_optimization_stage(
         initial_state_signature=_tree_signature(initial_flat_state),
         segment_carry_signature=_tree_signature(segment_start_carry),
         segment_arrays_signature=_tree_signature(segment_arrays),
-        print_final_er_profile=bool(print_final_er_profile),
+        print_final_softmax_er=bool(print_final_softmax_er),
     )
