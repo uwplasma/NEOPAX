@@ -2288,6 +2288,95 @@ def test_radau_transport_endpoint_newton_tolerance_runs_scalar_decay_problem():
     assert float(out["final_state"][0]) == pytest.approx(float(jnp.exp(-0.2)), rel=2.0e-5)
 
 
+def test_radau_dense_coefficients_reproduce_tableau_and_endpoint_weights():
+    stage = transport_solvers._RADAU_STAGE_CONFIGS[3]
+    powers_at_nodes = stage.c[:, None] ** jnp.arange(4)[None, :]
+    dense_at_nodes = powers_at_nodes @ jnp.asarray(stage.dense_coefficients)
+    endpoint_weights = jnp.ones((4,)) @ jnp.asarray(stage.dense_coefficients)
+
+    assert jnp.allclose(dense_at_nodes, jnp.asarray(stage.a), rtol=1.0e-13, atol=1.0e-13)
+    assert jnp.allclose(endpoint_weights, jnp.asarray(stage.b), rtol=1.0e-13, atol=1.0e-13)
+
+
+def test_radau_dense_saved_slots_use_exact_requested_times_and_states():
+    dtype = jnp.float64
+    stage = transport_solvers._RADAU_STAGE_CONFIGS[3]
+    save_times = jnp.linspace(0.0, 1.0, 5, dtype=dtype)
+    ys = jnp.zeros((5, 1), dtype=dtype).at[0].set(jnp.asarray([1.0], dtype=dtype))
+    ts = jnp.zeros((5,), dtype=dtype)
+    dts = jnp.zeros((5,), dtype=dtype)
+    accs = jnp.zeros((5,), dtype=bool).at[0].set(True)
+    fails = jnp.zeros((5,), dtype=bool)
+    codes = jnp.zeros((5,), dtype=jnp.int32)
+
+    result = transport_solvers._fill_radau_dense_saved_slots(
+        jnp.asarray(1, dtype=jnp.int32),
+        save_times,
+        jnp.asarray(0.0, dtype=dtype),
+        jnp.asarray([1.0], dtype=dtype),
+        jnp.asarray(1.0, dtype=dtype),
+        jnp.asarray([3.0], dtype=dtype),
+        jnp.asarray(1.0, dtype=dtype),
+        jnp.full((3, 1), 2.0, dtype=dtype),
+        jnp.asarray(stage.dense_coefficients, dtype=dtype),
+        jnp.asarray(True),
+        jnp.asarray(False),
+        jnp.asarray(0, dtype=jnp.int32),
+        ys,
+        ts,
+        dts,
+        accs,
+        fails,
+        codes,
+    )
+    save_idx, ys_out, ts_out, dts_out, accs_out, fails_out, codes_out = result
+
+    assert int(save_idx) == 5
+    assert jnp.allclose(ts_out, save_times, rtol=0.0, atol=0.0)
+    assert jnp.allclose(ys_out[:, 0], 1.0 + 2.0 * save_times, rtol=1.0e-13, atol=1.0e-13)
+    assert jnp.allclose(dts_out[1:], jnp.ones((4,), dtype=dtype))
+    assert bool(jnp.all(accs_out))
+    assert not bool(jnp.any(fails_out))
+    assert bool(jnp.all(codes_out == 0))
+
+
+def test_radau_solver_dense_output_uses_uniform_physical_times():
+    solver = RADAUSolver(
+        t0=0.0,
+        t1=0.1,
+        dt=0.1,
+        min_step=1.0e-12,
+        max_step=0.1,
+        rtol=1.0e-8,
+        atol=1.0e-10,
+        tol=1.0e-9,
+        maxiter=12,
+        num_stages=3,
+        max_steps=100,
+        save_n=5,
+    )
+    result = solver.solve(
+        jnp.asarray([1.0], dtype=jnp.float64),
+        lambda _time, state: -2.0 * state,
+    )
+    expected_times = jnp.linspace(0.0, 0.1, 5, dtype=jnp.float64)
+
+    assert not bool(result["failed"])
+    assert jnp.allclose(result["ts"], expected_times, rtol=0.0, atol=0.0)
+    assert jnp.allclose(
+        result["ys"][:, 0],
+        jnp.exp(-2.0 * expected_times),
+        rtol=2.0e-6,
+        atol=2.0e-8,
+    )
+    assert jnp.allclose(
+        result["final_state"],
+        jnp.asarray([jnp.exp(-0.2)], dtype=jnp.float64),
+        rtol=2.0e-6,
+        atol=2.0e-8,
+    )
+
+
 def _radau_controller_arguments(*, newton_iter_count, theta_final=0.0, controller_mode="current"):
     dtype = jnp.float64
     y = jnp.zeros((2,), dtype=dtype)

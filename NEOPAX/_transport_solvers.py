@@ -68,6 +68,7 @@ class _RadauStageConfig:
     c: np.ndarray
     a: np.ndarray
     b: np.ndarray
+    dense_coefficients: np.ndarray
     b_error: np.ndarray
     embedded_f0_weight: float
     has_embedded_estimator: bool
@@ -93,9 +94,15 @@ def _build_radau_iia_stage_config(num_stages: int) -> _RadauStageConfig:
         polys.append(poly / denom)
     a = np.zeros((num_stages, num_stages), dtype=np.float64)
     b = np.zeros((num_stages,), dtype=np.float64)
+    # Column j contains the increasing-power coefficients of
+    # B_j(theta) = integral_0^theta l_j(s) ds, where l_j is the Lagrange
+    # polynomial through the Radau nodes. These coefficients provide the
+    # collocation dense output without another RHS evaluation.
+    dense_coefficients = np.zeros((num_stages + 1, num_stages), dtype=np.float64)
     for j, poly in enumerate(polys):
         pint = np.zeros((len(poly) + 1,), dtype=np.float64)
         pint[1:] = poly / np.arange(1, len(poly) + 1, dtype=np.float64)
+        dense_coefficients[:, j] = pint
         for i, c_i in enumerate(c):
             a[i, j] = np.polyval(pint[::-1], c_i)
         b[j] = np.polyval(pint[::-1], 1.0)
@@ -124,6 +131,7 @@ def _build_radau_iia_stage_config(num_stages: int) -> _RadauStageConfig:
         c=c,
         a=a,
         b=b,
+        dense_coefficients=dense_coefficients,
         b_error=b_error,
         embedded_f0_weight=embedded_f0_weight,
         has_embedded_estimator=has_embedded,
@@ -897,6 +905,161 @@ def _fill_saved_slots(
         cond_fn,
         body_fn,
         (save_idx, ys, ts, dts, accs, fails, codes),
+    )
+
+
+def _radau_dense_output_state(
+    step_y0,
+    step_dt,
+    stage_history,
+    theta,
+    dense_coefficients,
+):
+    """Evaluate the accepted Radau collocation polynomial at ``theta``.
+
+    ``stage_history`` stores the converged stage derivatives K_i. This is an
+    output-only interpolation: its result is never fed back to the adaptive
+    solver or its reverse/replay paths.
+    """
+    coefficients = jnp.asarray(dense_coefficients, dtype=step_y0.dtype)
+    stages = jnp.asarray(stage_history, dtype=step_y0.dtype).reshape(
+        (coefficients.shape[1], step_y0.shape[0])
+    )
+    theta_value = jnp.asarray(theta, dtype=step_y0.dtype)
+    powers = theta_value ** jnp.arange(coefficients.shape[0], dtype=step_y0.dtype)
+    weights = powers @ coefficients
+    return step_y0 + jnp.asarray(step_dt, dtype=step_y0.dtype) * (weights @ stages)
+
+
+def _fill_radau_dense_saved_slots(
+    save_idx,
+    save_times,
+    step_t0,
+    step_y0,
+    step_t1,
+    step_y1,
+    step_dt,
+    stage_history,
+    dense_coefficients,
+    accepted,
+    failed,
+    fail_code,
+    ys,
+    ts,
+    dts,
+    accs,
+    fails,
+    codes,
+):
+    """Fill crossed output times from one accepted Radau step."""
+    save_n = save_times.shape[0]
+
+    def cond_fn(loop_state):
+        save_i, *_ = loop_state
+        has_slot = save_i < save_n
+        next_save_time = jnp.where(
+            has_slot,
+            save_times[jnp.minimum(save_i, save_n - 1)],
+            step_t1,
+        )
+        time_tol = (
+            jnp.asarray(16.0, dtype=ts.dtype)
+            * jnp.finfo(ts.dtype).eps
+            * jnp.maximum(jnp.asarray(1.0, dtype=ts.dtype), jnp.abs(step_t1))
+        )
+        return jnp.logical_and(
+            accepted,
+            jnp.logical_and(has_slot, step_t1 + time_tol >= next_save_time),
+        )
+
+    def body_fn(loop_state):
+        save_i, ys_l, ts_l, dts_l, accs_l, fails_l, codes_l = loop_state
+        save_time = save_times[save_i]
+        theta = jnp.clip(
+            (save_time - step_t0) / jnp.maximum(step_dt, jnp.finfo(ys_l.dtype).tiny),
+            jnp.asarray(0.0, dtype=ys_l.dtype),
+            jnp.asarray(1.0, dtype=ys_l.dtype),
+        )
+        dense_y = _radau_dense_output_state(
+            step_y0,
+            step_dt,
+            stage_history,
+            theta,
+            dense_coefficients,
+        )
+        endpoint_tol = (
+            jnp.asarray(16.0, dtype=ys_l.dtype)
+            * jnp.finfo(ys_l.dtype).eps
+            * jnp.maximum(jnp.asarray(1.0, dtype=ys_l.dtype), jnp.abs(step_t1))
+        )
+        saved_y = jnp.where(jnp.abs(save_time - step_t1) <= endpoint_tol, step_y1, dense_y)
+        ys_l = ys_l.at[save_i].set(saved_y)
+        ts_l = ts_l.at[save_i].set(save_time)
+        # Preserve the established meaning of dts: the accepted adaptive step
+        # containing this saved output point.
+        dts_l = dts_l.at[save_i].set(step_dt)
+        accs_l = accs_l.at[save_i].set(accepted)
+        fails_l = fails_l.at[save_i].set(failed)
+        codes_l = codes_l.at[save_i].set(fail_code)
+        return save_i + 1, ys_l, ts_l, dts_l, accs_l, fails_l, codes_l
+
+    return jax.lax.while_loop(
+        cond_fn,
+        body_fn,
+        (save_idx, ys, ts, dts, accs, fails, codes),
+    )
+
+
+def _fill_saved_slots_for_attempt(
+    save_idx,
+    save_times,
+    step_state_before_attempt,
+    step_info,
+    ys,
+    ts,
+    dts,
+    accs,
+    fails,
+    codes,
+    *,
+    radau_dense_coefficients=None,
+):
+    if radau_dense_coefficients is None:
+        return _fill_saved_slots(
+            save_idx,
+            save_times,
+            step_info.t,
+            step_info.y,
+            step_info.dt,
+            step_info.accepted,
+            step_info.failed,
+            step_info.fail_code,
+            ys,
+            ts,
+            dts,
+            accs,
+            fails,
+            codes,
+        )
+    return _fill_radau_dense_saved_slots(
+        save_idx,
+        save_times,
+        step_state_before_attempt.t,
+        step_state_before_attempt.y,
+        step_info.t,
+        step_info.y,
+        step_info.dt,
+        step_info.stage_history,
+        radau_dense_coefficients,
+        step_info.accepted,
+        step_info.failed,
+        step_info.fail_code,
+        ys,
+        ts,
+        dts,
+        accs,
+        fails,
+        codes,
     )
 
 
@@ -2359,6 +2522,7 @@ def _run_saved_loop(
     dtype,
     max_total_steps,
     stop_after_accepted_steps=None,
+    radau_dense_coefficients=None,
 ):
     save_times = jnp.linspace(t0, t_final, save_n)
     ys_saved = jnp.zeros((save_n, state_dim), dtype=dtype)
@@ -2426,22 +2590,20 @@ def _run_saved_loop(
             _last_lagged_reused,
             _last_jacobian_reused,
         ) = loop_carry
+        step_state_before_attempt = step_state
         step_state, step_info = step_fn(step_state, None)
-        save_idx, ys, ts, dts, accs, fails, codes = _fill_saved_slots(
+        save_idx, ys, ts, dts, accs, fails, codes = _fill_saved_slots_for_attempt(
             save_idx,
             save_times,
-            step_info.t,
-            step_info.y,
-            step_info.dt,
-            step_info.accepted,
-            step_info.failed,
-            step_info.fail_code,
+            step_state_before_attempt,
+            step_info,
             ys,
             ts,
             dts,
             accs,
             fails,
             codes,
+            radau_dense_coefficients=radau_dense_coefficients,
         )
         return (
             step_state,
@@ -2607,6 +2769,7 @@ def _run_saved_loop_debug_walltime(
     stop_after_first_nonconverged_attempt=False,
     on_first_nonconverged_attempt=None,
     on_attempt=None,
+    radau_dense_coefficients=None,
 ):
     compiled_step_fn = jax.jit(lambda step_state: step_fn(step_state, None))
     save_times = jnp.linspace(t0, t_final, save_n)
@@ -2663,21 +2826,18 @@ def _run_saved_loop_debug_walltime(
         elapsed = time.perf_counter() - start
         print(f"[debug-walltime] {walltime_label} #{attempt_idx} elapsed_s={elapsed:.6f}", flush=True)
 
-        save_idx, ys_saved, ts_saved, dts_saved, accepted_mask_saved, failed_mask_saved, fail_codes_saved = _fill_saved_slots(
+        save_idx, ys_saved, ts_saved, dts_saved, accepted_mask_saved, failed_mask_saved, fail_codes_saved = _fill_saved_slots_for_attempt(
             save_idx,
             save_times,
-            step_info.t,
-            step_info.y,
-            step_info.dt,
-            step_info.accepted,
-            step_info.failed,
-            step_info.fail_code,
+            step_state_before_attempt,
+            step_info,
             ys_saved,
             ts_saved,
             dts_saved,
             accepted_mask_saved,
             failed_mask_saved,
             fail_codes_saved,
+            radau_dense_coefficients=radau_dense_coefficients,
         )
 
         last_attempt_accepted = jnp.asarray(step_info.accepted)
@@ -26372,6 +26532,9 @@ class RADAUSolver(_RadauSolverConfig):
                     else None
                 ),
                 on_attempt=node_edge_live_probe,
+                radau_dense_coefficients=jnp.asarray(
+                    stage_cfg.dense_coefficients, dtype=dtype
+                ),
             )
         else:
             loop_result = _run_saved_loop(
@@ -26384,6 +26547,9 @@ class RADAUSolver(_RadauSolverConfig):
                 dtype=dtype,
                 max_total_steps=max_total_steps,
                 stop_after_accepted_steps=stop_after_accepted_steps,
+                radau_dense_coefficients=jnp.asarray(
+                    stage_cfg.dense_coefficients, dtype=dtype
+                ),
             )
             diagnostic_stopped = False
         (
