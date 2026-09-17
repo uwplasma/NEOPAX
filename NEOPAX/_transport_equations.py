@@ -1818,15 +1818,29 @@ def build_equation_system_from_config(config, species):
     n_x = int(energy_grid_cfg.get("n_x", 4))
     energy_grid = get_energy_grid_model("standard_laguerre", n_x=n_x, n_order=3)
     neoclassical_cfg = config.get("neoclassical", {})
+    neoclassical_name = str(
+        neoclassical_cfg.get(
+            "flux_model", neoclassical_cfg.get("model", "ntx_database")
+        )
+    ).strip().lower()
     database = None
     neoclassical_file = neoclassical_cfg.get("neoclassical_file")
-    if neoclassical_file and field is not None:
+    if (
+        neoclassical_file
+        and field is not None
+        and neoclassical_name not in {"fluxes_r_file", "dkx_fluxes_r_file"}
+    ):
         database = Monoenergetic.read_ntx(field.a_b, neoclassical_file)
 
-    neoclassical_factory = get_transport_flux_model(neoclassical_cfg.get("flux_model", "ntx_database"))
+    neoclassical_factory = get_transport_flux_model(neoclassical_name)
     turbulence_factory = get_transport_flux_model(config.get("turbulence", {}).get("flux_model", "none"))
     classical_factory = get_transport_flux_model(config.get("classical", {}).get("flux_model", "none")) if "classical" in config else None
-    neoclassical_model = neoclassical_factory(species, energy_grid, field, database)
+    if neoclassical_name in {"fluxes_r_file", "dkx_fluxes_r_file"}:
+        neoclassical_model = neoclassical_factory(
+            species, energy_grid, field, database, **dict(neoclassical_cfg)
+        )
+    else:
+        neoclassical_model = neoclassical_factory(species, energy_grid, field, database)
     turbulence_model = turbulence_factory(species, energy_grid, field, database) if turbulence_factory is not None else ZeroTransportModel()
     classical_model = classical_factory(species, energy_grid, field, database) if classical_factory is not None else ZeroTransportModel()
     flux_model = build_transport_flux_model(neoclassical_model, turbulence_model, classical_model)

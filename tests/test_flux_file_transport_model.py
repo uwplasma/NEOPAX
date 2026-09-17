@@ -20,6 +20,7 @@ from NEOPAX._transport_flux_models import (
     ReLUAnalyticalTurbulentTransportModel,
     ZeroTransportModel,
     _sum_float_delta_bar_trees,
+    build_dkx_fluxes_r_file_transport_model,
     build_fluxes_r_file_transport_model,
     read_flux_profile_file,
 )
@@ -671,6 +672,94 @@ def _write_fd_flux_file(path: Path, r):
         f["perturb_present"] = jnp.ones((1, n_r), dtype=bool)
         f["perturb_kind"] = ["temperature_gradient"]
         f["perturb_species"] = ["i"]
+
+
+def _write_dkx_fd_flux_file(path: Path, rho):
+    n_r = len(rho)
+    # Deliberately use the opposite order from DummyFDSpecies to verify that
+    # the DKX adapter maps output rows by name rather than by position.
+    gamma_ion = 10.0 + jnp.arange(n_r, dtype=float)
+    gamma_electron = 1.0 + jnp.arange(n_r, dtype=float)
+    gamma = jnp.stack((gamma_ion, gamma_electron))
+    q = 10.0 * gamma
+    with h5py.File(path, "w") as f:
+        f["rho"] = jnp.asarray(rho)
+        # rHat is intentionally different from NEOPAX's physical radius.
+        f["rHat"] = 0.8 * jnp.asarray(rho)
+        f["r"] = f["rHat"][...]
+        f["species_names"] = ["i", "e"]
+        f["Gamma"] = gamma
+        f["Q"] = q
+        f["Upar"] = jnp.zeros_like(gamma)
+        f["Gamma_perturbed"] = (1.05 * gamma)[None, :, :]
+        f["Q_perturbed"] = (1.05 * q)[None, :, :]
+        f["perturb_delta"] = 0.05 * jnp.ones((1, n_r))
+        f["perturb_present"] = jnp.ones((1, n_r), dtype=bool)
+        f["response_label"] = ["temperature_gradient"]
+        f["perturb_species"] = ["i"]
+
+
+def test_dkx_flux_file_fd_adapter_uses_rho_and_runtime_species_order(tmp_path):
+    geometry = DummyFDGeometry()
+    rho = geometry.r_grid_half / geometry.a_b
+    path = tmp_path / "dkx_flux_profiles.h5"
+    _write_dkx_fd_flux_file(path, rho)
+
+    with contextlib.redirect_stdout(io.StringIO()):
+        model = build_dkx_fluxes_r_file_transport_model(
+            DummyFDSpecies(),
+            geometry,
+            neoclassical_file=path,
+            lagged_response_mode="fd",
+        )
+
+    assert jnp.allclose(model.r_data, geometry.r_grid_half)
+    # Runtime order is (e, i), while the file order is (i, e).
+    assert jnp.allclose(model.gamma_data[0], 1.0 + jnp.arange(rho.size))
+    assert jnp.allclose(model.gamma_data[1], 10.0 + jnp.arange(rho.size))
+    assert jnp.allclose(model.gamma_perturb_data[0, 0], 1.05 * model.gamma_data[0])
+    assert jnp.allclose(model.gamma_perturb_data[0, 1], 1.05 * model.gamma_data[1])
+    assert int(model.perturb_kind_codes[0]) == 1
+    assert int(model.perturb_species_indices[0]) == 1
+
+    state = _fd_state(geometry.r_grid.shape[0])
+    response = model.build_lagged_response(state)
+    assert isinstance(response, SpectraXTurbulenceFDLaggedResponse)
+
+    combined = CombinedTransportFluxModel(
+        neoclassical_model=model,
+        turbulent_model=ZeroTransportModel(),
+        classical_model=ZeroTransportModel(),
+        geometry=geometry,
+    )
+    combined_response = combined.build_lagged_response(state)
+    warmer_ion_pressure = state.pressure.at[1, -1].add(0.1 * state.density[1, -1])
+    warmer_state = TransportState(
+        density=state.density,
+        pressure=warmer_ion_pressure,
+        Er=state.Er,
+    )
+    combined_flux = combined.evaluate_with_lagged_response(
+        warmer_state, combined_response
+    )
+    assert jnp.allclose(combined_flux["Q_neo_faces"], combined_flux["Q_faces"])
+    assert not jnp.allclose(
+        combined_flux["Q_neo_faces"], response.reference_flux["Q_faces"]
+    )
+
+
+def test_dkx_flux_file_adapter_rejects_species_mismatch(tmp_path):
+    geometry = DummyFDGeometry()
+    path = tmp_path / "dkx_wrong_species.h5"
+    _write_dkx_fd_flux_file(path, geometry.r_grid_half / geometry.a_b)
+    with h5py.File(path, "r+") as f:
+        del f["species_names"]
+        f["species_names"] = ["i", "T"]
+
+    with pytest.raises(ValueError, match="species do not match"):
+        build_dkx_fluxes_r_file_transport_model(
+            DummyFDSpecies(), geometry, neoclassical_file=path
+        )
 
 
 def _fd_state(n_r):

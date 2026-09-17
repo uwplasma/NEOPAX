@@ -22109,6 +22109,54 @@ def read_flux_profile_file(path, n_species):
     return r_arr, gamma_arr, q_arr, upar_arr
 
 
+def _decode_flux_file_labels(values):
+    return tuple(
+        str(value.decode("utf-8") if isinstance(value, bytes) else value).strip()
+        for value in values
+    )
+
+
+def _read_dkx_flux_file_adapter(path, species_names):
+    """Return the DKX rho grid and the file-to-runtime species permutation."""
+    with h5py.File(path, "r") as f:
+        missing = [name for name in ("rho", "species_names") if name not in f]
+        if missing:
+            raise ValueError(
+                f"DKX flux file '{path}' is missing required datasets: {', '.join(missing)}."
+            )
+        rho = jnp.ravel(jnp.asarray(f["rho"][...], dtype=float))
+        file_names = _decode_flux_file_labels(f["species_names"][...])
+
+    runtime_names = tuple(str(name).strip() for name in species_names)
+    file_keys = tuple(name.lower() for name in file_names)
+    runtime_keys = tuple(name.lower() for name in runtime_names)
+    if len(set(file_keys)) != len(file_keys):
+        raise ValueError(f"DKX flux file '{path}' contains duplicate species names ignoring case.")
+    if len(set(runtime_keys)) != len(runtime_keys):
+        raise ValueError("NEOPAX runtime species names must be unique ignoring case.")
+
+    file_lookup = {name: index for index, name in enumerate(file_keys)}
+    missing_runtime = [
+        runtime_names[index]
+        for index, name in enumerate(runtime_keys)
+        if name not in file_lookup
+    ]
+    unexpected_file = [
+        file_names[index]
+        for index, name in enumerate(file_keys)
+        if name not in set(runtime_keys)
+    ]
+    if missing_runtime or unexpected_file:
+        raise ValueError(
+            f"DKX flux file '{path}' species do not match the NEOPAX runtime: "
+            f"missing={missing_runtime}, unexpected={unexpected_file}."
+        )
+    permutation = jnp.asarray(
+        [file_lookup[name] for name in runtime_keys], dtype=jnp.int32
+    )
+    return rho, permutation
+
+
 def read_flux_profile_center_file(path, n_species):
     with h5py.File(path, "r") as f:
         keys = set(f.keys())
@@ -22148,7 +22196,7 @@ def read_flux_profile_fd_response_file(path, n_species, species_names):
         missing.extend(sorted(shared_required - keys))
         if missing:
             raise ValueError(
-                f"Flux file '{path}' is missing SPECTRAX FD lagged-response datasets: {', '.join(missing)}."
+                f"Flux file '{path}' is missing finite-difference lagged-response datasets: {', '.join(missing)}."
             )
         gamma_perturb = _normalize_perturb_species_flux_dataset(f[gamma_key][...], n_species)
         q_perturb = _normalize_perturb_species_flux_dataset(f[q_key][...], n_species)
@@ -22167,7 +22215,7 @@ def read_flux_profile_fd_response_file(path, n_species, species_names):
             )
         else:
             raise ValueError(
-                f"Flux file '{path}' is missing SPECTRAX FD perturbation labels. "
+                f"Flux file '{path}' is missing finite-difference perturbation labels. "
                 "Expected either (perturb_kind, perturb_species) or response_label."
             )
     return (
@@ -22291,6 +22339,7 @@ def build_fluxes_r_file_transport_model(
     classical_file=None,
     grid_location="face_centered",
     profile_location=None,
+    file_format="generic",
     **kwargs,
 ):
     q_scale = float(
@@ -22329,7 +22378,31 @@ def build_fluxes_r_file_transport_model(
     )
     location = profile_location if profile_location is not None else grid_location
     r_data, gamma_data, q_data, upar_data = read_flux_profile_file(path, species.number_species)
+    file_format = str(file_format).strip().lower()
+    species_permutation = None
+    if file_format == "dkx":
+        if not hasattr(species, "names"):
+            raise ValueError("dkx_fluxes_r_file requires named NEOPAX species.")
+        rho_data, species_permutation = _read_dkx_flux_file_adapter(path, species.names)
+        a_minor = float(getattr(geometry, "a_b", float("nan")))
+        if not np.isfinite(a_minor) or a_minor <= 0.0:
+            raise ValueError("dkx_fluxes_r_file requires a finite positive geometry.a_b.")
+        # DKX's rHat is a solver-normalized coordinate and is not NEOPAX's
+        # physical transport radius.  Stage 3 also records its source rho,
+        # which maps exactly onto the NEOPAX face grid as r = a_b * rho.
+        r_data = a_minor * rho_data
+        gamma_data = None if gamma_data is None else jnp.take(gamma_data, species_permutation, axis=0)
+        q_data = None if q_data is None else jnp.take(q_data, species_permutation, axis=0)
+        upar_data = None if upar_data is None else jnp.take(upar_data, species_permutation, axis=0)
+    elif file_format not in {"generic", "auto"}:
+        raise ValueError(
+            f"Unsupported flux-file format '{file_format}'. Expected 'generic' or 'dkx'."
+        )
     normalized_location_for_check = str(location).strip().lower()
+    if file_format == "dkx" and normalized_location_for_check not in {
+        "face", "faces", "face_centered", "face-centred", "face_centred",
+    }:
+        raise ValueError("dkx_fluxes_r_file contains face-centered flux profiles.")
     if normalized_location_for_check in {"face", "faces", "face_centered", "face-centred", "face_centred"}:
         _require_interpolatable_flux_grid(r_data, geometry.r_grid_half, "geometry.r_grid_half")
     elif normalized_location_for_check in {"cell", "cells", "center", "centers", "cell_centered", "cell-centred", "cell_centred"}:
@@ -22368,6 +22441,9 @@ def build_fluxes_r_file_transport_model(
             perturb_kind_codes,
             perturb_species_indices,
         ) = read_flux_profile_fd_response_file(path, species.number_species, species.names)
+        if species_permutation is not None:
+            gamma_perturb_data = jnp.take(gamma_perturb_data, species_permutation, axis=1)
+            q_perturb_data = jnp.take(q_perturb_data, species_permutation, axis=1)
         _require_matching_fd_grid(r_data, geometry.r_grid_half)
         _require_fd_response_radial_shape("Gamma_perturb/Gamma_perturbed", gamma_perturb_data, geometry.r_grid_half)
         _require_fd_response_radial_shape("Q_perturb/Q_perturbed", q_perturb_data, geometry.r_grid_half)
@@ -22386,7 +22462,7 @@ def build_fluxes_r_file_transport_model(
         r_summary = f"finite=0/{r_data.shape[0]}"
     print(
         "[NEOPAX] fluxes_r_file loaded: "
-        f"path={path} profile_location={str(location).strip().lower()} "
+        f"path={path} file_format={file_format} profile_location={str(location).strip().lower()} "
         f"center_flux_mode={center_flux_mode} r.shape={tuple(r_data.shape)} q_scale={q_scale:.6e} {r_summary}"
     )
     print(f"[NEOPAX] fluxes_r_file dataset: {_flux_profile_debug_summary('Gamma', gamma_data)}")
@@ -22413,6 +22489,16 @@ def build_fluxes_r_file_transport_model(
         center_gamma_data=center_gamma_data,
         center_q_data=center_q_data,
         center_upar_data=center_upar_data,
+    )
+
+
+def build_dkx_fluxes_r_file_transport_model(species, geometry, **kwargs):
+    """Build a Stage-3 DKX face-flux model on NEOPAX's physical face grid."""
+    return build_fluxes_r_file_transport_model(
+        species=species,
+        geometry=geometry,
+        file_format="dkx",
+        **kwargs,
     )
 
 
@@ -22531,10 +22617,11 @@ class FluxesRFileTransportModel(TransportFluxModelBase):
         return jax.vmap(lambda prof: interpax.interp1d(target_r, self.r_data, prof))(data)
 
     def _spectrax_fd_face_basis(self, state, *, bc_density=None, bc_temperature=None):
-        """Return the Stage-4 FD coordinates on the transport faces.
+        """Return the file-backed FD coordinates on the transport faces.
 
-        The stored SPECTRAX/GX finite differences are with respect to face
-        ``-a d(ln X)/dr`` values.  Rebuilding them from cell-centred gradients
+        The stored Stage-3 DKX and Stage-4 SPECTRAX/GX finite differences are
+        with respect to face ``-a d(ln X)/dr`` values.  Rebuilding them from
+        cell-centred gradients
         and then averaging to faces changes both the stencil and, at a
         Dirichlet boundary, the boundary value.  In particular it can reverse
         the response of the final cell.  Use the same BC-aware face state and
@@ -22561,7 +22648,8 @@ class FluxesRFileTransportModel(TransportFluxModelBase):
             self.geometry.r_grid_half,
             bc_model=bc_temperature,
         )
-        # Stage 4 writes gradient_coordinate='rho': r = a_minor * rho, so
+        # The Stage-3 and Stage-4 files use gradient_coordinate='rho':
+        # r = a_minor * rho, so
         # convert NEOPAX physical-r gradients to the matching dimensionless
         # face coordinates.
         density_basis = -a_minor * dndr_faces / face_density
@@ -22619,7 +22707,8 @@ class FluxesRFileTransportModel(TransportFluxModelBase):
             or self.perturb_species_indices is None
         ):
             raise ValueError(
-                "fluxes_r_file lagged_response_mode='fd' requires SPECTRAX perturbation datasets in the file."
+                "fluxes_r_file lagged_response_mode='fd' requires perturbed-flux "
+                "datasets in the file."
             )
         return SpectraXTurbulenceFDLaggedResponse(
             reference_state=state,
@@ -23534,6 +23623,15 @@ register_transport_flux_model(
 register_transport_flux_model(
     "fluxes_r_file",
     lambda species, energy_grid, geometry, database, **kwargs: build_fluxes_r_file_transport_model(
+        species=species,
+        geometry=geometry,
+        **kwargs,
+    ),
+)
+
+register_transport_flux_model(
+    "dkx_fluxes_r_file",
+    lambda species, energy_grid, geometry, database=None, **kwargs: build_dkx_fluxes_r_file_transport_model(
         species=species,
         geometry=geometry,
         **kwargs,

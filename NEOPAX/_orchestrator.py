@@ -360,8 +360,12 @@ def _build_geometry(config: dict):
 
 def _build_database(config: dict, geometry):
     neoclassical_cfg = config.get("neoclassical", {})
-    neoclassical_name = str(neoclassical_cfg.get("flux_model", "ntx_database")).strip().lower()
-    if neoclassical_name == "fluxes_r_file":
+    neoclassical_name = str(
+        neoclassical_cfg.get(
+            "flux_model", neoclassical_cfg.get("model", "ntx_database")
+        )
+    ).strip().lower()
+    if neoclassical_name in {"fluxes_r_file", "dkx_fluxes_r_file"}:
         return None
     neoclassical_file = neoclassical_cfg.get("neoclassical_file")
     if neoclassical_file and geometry is not None:
@@ -745,7 +749,7 @@ def _build_flux_model(config: dict, species, energy_grid, geometry, database, so
     )
     solver_cfg = _normalize_solver_config(config)
 
-    if neoclassical_name == "fluxes_r_file":
+    if neoclassical_name in {"fluxes_r_file", "dkx_fluxes_r_file"}:
         neoclassical_model = neoclassical_factory(
             species,
             energy_grid,
