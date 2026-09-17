@@ -977,6 +977,8 @@ TRANSPORT_REVERSE_OBJECTIVE_LABELS: tuple[str, ...] = (
 )
 TRANSPORT_OPTIMIZATION_OPTIONAL_OBJECTIVE_LABELS: tuple[str, ...] = (
     "Er_transition_rho",
+    "Er_transition_location_moment",
+    "Er_transition_strength",
 )
 TRANSPORT_REVERSE_PROFILE_PARAMETER_ORDER: tuple[str, ...] = (
     "n0",
@@ -1319,7 +1321,7 @@ def smooth_root_proxy(
     return jnp.sum(rho_grid * weights) / jnp.maximum(jnp.sum(weights), jnp.asarray(1.0e-30, dtype=er_profile.dtype))
 
 
-def smooth_positive_to_negative_er_transition_rho(
+def smooth_positive_to_negative_er_transition_metrics(
     er_profile: jax.Array,
     rho_grid: jax.Array,
     *,
@@ -1327,8 +1329,8 @@ def smooth_positive_to_negative_er_transition_rho(
     rho_max: float = 0.75,
     temperature_kv_m: float = 2.0,
     positive_part_eps: float = 1.0e-6,
-) -> jax.Array:
-    """Smooth final-time location of an ion-to-electron Er transition.
+) -> tuple[jax.Array, jax.Array]:
+    """Smooth location and strength of an ion-to-electron Er transition.
 
     The score is the smooth positive part of the radial drop in
     ``sigmoid(Er / temperature_kv_m)``.  Consequently a positive-to-negative
@@ -1361,8 +1363,52 @@ def smooth_positive_to_negative_er_transition_rho(
     )
     weights = jnp.where(radial_mask, transition_score, 0.0)
     weight_sum = jnp.sum(weights)
-    return jnp.sum(rho_faces * weights) / jnp.maximum(
+    location = jnp.sum(rho_faces * weights) / jnp.maximum(
         weight_sum, jnp.asarray(1.0e-30, dtype=er.dtype)
+    )
+    return location, weight_sum
+
+
+def smooth_positive_to_negative_er_transition_rho(
+    er_profile: jax.Array,
+    rho_grid: jax.Array,
+    **kwargs,
+) -> jax.Array:
+    """Return the smooth transition location; use strength to ensure existence."""
+
+    location, _ = smooth_positive_to_negative_er_transition_metrics(
+        er_profile, rho_grid, **kwargs
+    )
+    return location
+
+
+def smooth_positive_to_negative_er_transition_strength(
+    er_profile: jax.Array,
+    rho_grid: jax.Array,
+    **kwargs,
+) -> jax.Array:
+    """Return transition existence/strength (near zero absent, near one strong)."""
+
+    _, strength = smooth_positive_to_negative_er_transition_metrics(
+        er_profile, rho_grid, **kwargs
+    )
+    return strength
+
+
+def smooth_positive_to_negative_er_transition_location_moment(
+    er_profile: jax.Array,
+    rho_grid: jax.Array,
+    *,
+    target_rho: float,
+    **kwargs,
+) -> jax.Array:
+    """Return ``strength * (location - target)`` for an existence-gated cost."""
+
+    location, strength = smooth_positive_to_negative_er_transition_metrics(
+        er_profile, rho_grid, **kwargs
+    )
+    return strength * (
+        location - jnp.asarray(target_rho, dtype=jnp.asarray(er_profile).dtype)
     )
 
 
@@ -1496,6 +1542,7 @@ def objective_scalar_by_index(
     er_transition_right_index: int = 21,
     er_transition_rho_min: float = 0.25,
     er_transition_rho_max: float = 0.75,
+    er_transition_rho_target: float = 0.5,
     er_transition_temperature_kv_m: float = 2.0,
     er_transition_positive_part_eps: float = 1.0e-6,
 ):
@@ -1527,6 +1574,25 @@ def objective_scalar_by_index(
         return bootstrap_current_softmax_abs_scaled(final_state, runtime)
     if objective_name == "Er_transition_rho":
         return smooth_positive_to_negative_er_transition_rho(
+            er,
+            runtime.geometry.rho_grid,
+            rho_min=er_transition_rho_min,
+            rho_max=er_transition_rho_max,
+            temperature_kv_m=er_transition_temperature_kv_m,
+            positive_part_eps=er_transition_positive_part_eps,
+        )
+    if objective_name == "Er_transition_location_moment":
+        return smooth_positive_to_negative_er_transition_location_moment(
+            er,
+            runtime.geometry.rho_grid,
+            target_rho=er_transition_rho_target,
+            rho_min=er_transition_rho_min,
+            rho_max=er_transition_rho_max,
+            temperature_kv_m=er_transition_temperature_kv_m,
+            positive_part_eps=er_transition_positive_part_eps,
+        )
+    if objective_name == "Er_transition_strength":
+        return smooth_positive_to_negative_er_transition_strength(
             er,
             runtime.geometry.rho_grid,
             rho_min=er_transition_rho_min,
@@ -8560,6 +8626,7 @@ def internal_realtime_geometry_transport_reverse_table_result_builder(
     er_transition_right_index: int = 21,
     er_transition_rho_min: float = 0.25,
     er_transition_rho_max: float = 0.75,
+    er_transition_rho_target: float = 0.5,
     er_transition_temperature_kv_m: float = 2.0,
     er_transition_positive_part_eps: float = 1.0e-6,
     reverse_stage_adjoint_solve_mode: str = "bicgstab",
@@ -8630,6 +8697,7 @@ def internal_realtime_geometry_transport_reverse_table_result_builder(
     configured_er_transition_right_index = int(er_transition_right_index)
     configured_er_transition_rho_min = float(er_transition_rho_min)
     configured_er_transition_rho_max = float(er_transition_rho_max)
+    configured_er_transition_rho_target = float(er_transition_rho_target)
     configured_er_transition_temperature_kv_m = float(
         er_transition_temperature_kv_m
     )
@@ -8645,6 +8713,7 @@ def internal_realtime_geometry_transport_reverse_table_result_builder(
         or configured_er_transition_right_index != 21
         or configured_er_transition_rho_min != 0.25
         or configured_er_transition_rho_max != 0.75
+        or configured_er_transition_rho_target != 0.5
         or configured_er_transition_temperature_kv_m != 2.0
         or configured_er_transition_positive_part_eps != 1.0e-6
         or configured_objective_labels != TRANSPORT_REVERSE_OBJECTIVE_LABELS
@@ -8666,6 +8735,7 @@ def internal_realtime_geometry_transport_reverse_table_result_builder(
                 er_transition_right_index=configured_er_transition_right_index,
                 er_transition_rho_min=configured_er_transition_rho_min,
                 er_transition_rho_max=configured_er_transition_rho_max,
+                er_transition_rho_target=configured_er_transition_rho_target,
                 er_transition_temperature_kv_m=(
                     configured_er_transition_temperature_kv_m
                 ),
@@ -8734,6 +8804,9 @@ def internal_realtime_geometry_transport_reverse_table_result_builder(
         active_er_transition_rho_max = float(
             opts.get("Er_transition_rho_max", er_transition_rho_max)
         )
+        active_er_transition_rho_target = float(
+            opts.get("Er_transition_rho_target", er_transition_rho_target)
+        )
         active_er_transition_temperature_kv_m = float(
             opts.get(
                 "Er_transition_temperature_kv_m",
@@ -8752,6 +8825,8 @@ def internal_realtime_geometry_transport_reverse_table_result_builder(
             != configured_er_transition_right_index
             or active_er_transition_rho_min != configured_er_transition_rho_min
             or active_er_transition_rho_max != configured_er_transition_rho_max
+            or active_er_transition_rho_target
+            != configured_er_transition_rho_target
             or active_er_transition_temperature_kv_m
             != configured_er_transition_temperature_kv_m
             or active_er_transition_positive_part_eps

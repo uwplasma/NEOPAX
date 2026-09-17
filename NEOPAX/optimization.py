@@ -2090,6 +2090,7 @@ def full_transport_profile_least_squares_problem(
     er_transition_right_index: int = 21,
     er_transition_rho_min: float = 0.25,
     er_transition_rho_max: float = 0.75,
+    er_transition_rho_target: float = 0.5,
     er_transition_temperature_kv_m: float = 2.0,
     er_transition_positive_part_eps: float = 1.0e-6,
     radau_jacobian_reuse_mode: str = "legacy",
@@ -2109,6 +2110,12 @@ def full_transport_profile_least_squares_problem(
 
     if not 0.0 <= float(er_transition_rho_min) < float(er_transition_rho_max) <= 1.0:
         raise ValueError("Er transition radial window must satisfy 0 <= min < max <= 1.")
+    if not (
+        float(er_transition_rho_min)
+        <= float(er_transition_rho_target)
+        <= float(er_transition_rho_max)
+    ):
+        raise ValueError("Er transition target must lie inside the radial window.")
     if float(er_transition_temperature_kv_m) <= 0.0:
         raise ValueError("er_transition_temperature_kv_m must be positive.")
     if float(er_transition_positive_part_eps) <= 0.0:
@@ -2218,6 +2225,7 @@ def full_transport_profile_least_squares_problem(
         "Er_transition_right_index": int(er_transition_right_index),
         "Er_transition_rho_min": float(er_transition_rho_min),
         "Er_transition_rho_max": float(er_transition_rho_max),
+        "Er_transition_rho_target": float(er_transition_rho_target),
         "Er_transition_temperature_kv_m": float(er_transition_temperature_kv_m),
         "Er_transition_positive_part_eps": float(
             er_transition_positive_part_eps
@@ -2332,6 +2340,7 @@ def full_transport_profile_least_squares_problem(
                 er_transition_right_index=int(er_transition_right_index),
                 er_transition_rho_min=float(er_transition_rho_min),
                 er_transition_rho_max=float(er_transition_rho_max),
+                er_transition_rho_target=float(er_transition_rho_target),
                 er_transition_temperature_kv_m=float(
                     er_transition_temperature_kv_m
                 ),
@@ -2464,6 +2473,7 @@ def geometry_full_transport_least_squares_problem(
     er_transition_right_index: int = 21,
     er_transition_rho_min: float = 0.25,
     er_transition_rho_max: float = 0.75,
+    er_transition_rho_target: float = 0.5,
     er_transition_temperature_kv_m: float = 2.0,
     er_transition_positive_part_eps: float = 1.0e-6,
     radau_jacobian_reuse_mode: str = "legacy",
@@ -2490,6 +2500,12 @@ def geometry_full_transport_least_squares_problem(
 
     if not 0.0 <= float(er_transition_rho_min) < float(er_transition_rho_max) <= 1.0:
         raise ValueError("Er transition radial window must satisfy 0 <= min < max <= 1.")
+    if not (
+        float(er_transition_rho_min)
+        <= float(er_transition_rho_target)
+        <= float(er_transition_rho_max)
+    ):
+        raise ValueError("Er transition target must lie inside the radial window.")
     if float(er_transition_temperature_kv_m) <= 0.0:
         raise ValueError("er_transition_temperature_kv_m must be positive.")
     if float(er_transition_positive_part_eps) <= 0.0:
@@ -2624,6 +2640,7 @@ def geometry_full_transport_least_squares_problem(
         "Er_transition_right_index": int(er_transition_right_index),
         "Er_transition_rho_min": float(er_transition_rho_min),
         "Er_transition_rho_max": float(er_transition_rho_max),
+        "Er_transition_rho_target": float(er_transition_rho_target),
         "Er_transition_temperature_kv_m": float(er_transition_temperature_kv_m),
         "Er_transition_positive_part_eps": float(
             er_transition_positive_part_eps
@@ -2896,6 +2913,7 @@ def geometry_full_transport_least_squares_problem(
         er_transition_right_index=int(er_transition_right_index),
         er_transition_rho_min=float(er_transition_rho_min),
         er_transition_rho_max=float(er_transition_rho_max),
+        er_transition_rho_target=float(er_transition_rho_target),
         er_transition_temperature_kv_m=float(er_transition_temperature_kv_m),
         er_transition_positive_part_eps=float(
             er_transition_positive_part_eps

@@ -1187,7 +1187,45 @@ def test_full_transport_smooth_transition_location_ignores_near_axis_zero():
         [0.0, 8.0, 12.0, 10.0, 6.0, 2.0, -4.0, -8.0, -9.0, -10.0, -10.0],
         dtype=jnp.float64,
     )
-    location = reverse_transport.smooth_positive_to_negative_er_transition_rho(
+    location, strength = (
+        reverse_transport.smooth_positive_to_negative_er_transition_metrics(
+            er,
+            rho,
+            rho_min=0.25,
+            rho_max=0.75,
+            temperature_kv_m=1.0,
+        )
+    )
+    flat_er = jnp.zeros_like(er)
+    flat_location, flat_strength = (
+        reverse_transport.smooth_positive_to_negative_er_transition_metrics(
+            flat_er,
+            rho,
+            rho_min=0.25,
+            rho_max=0.75,
+            temperature_kv_m=1.0,
+        )
+    )
+    flat_location_moment = (
+        reverse_transport.smooth_positive_to_negative_er_transition_location_moment(
+            flat_er,
+            rho,
+            target_rho=0.55,
+            rho_min=0.25,
+            rho_max=0.75,
+            temperature_kv_m=1.0,
+        )
+    )
+    flat_strength_gradient = jax.grad(
+        lambda values: reverse_transport.smooth_positive_to_negative_er_transition_strength(
+            values,
+            rho,
+            rho_min=0.25,
+            rho_max=0.75,
+            temperature_kv_m=1.0,
+        )
+    )(flat_er)
+    raw_location = reverse_transport.smooth_positive_to_negative_er_transition_rho(
         er,
         rho,
         rho_min=0.25,
@@ -1205,12 +1243,21 @@ def test_full_transport_smooth_transition_location_ignores_near_axis_zero():
     )(er)
 
     assert 0.50 < float(location) < 0.65
+    assert float(raw_location) == pytest.approx(float(location))
+    assert float(strength) > 0.9
+    assert bool(jnp.isfinite(flat_location))
+    assert float(flat_strength) < 1.0e-4
+    assert abs(float(flat_location_moment)) < 1.0e-4
+    assert bool(jnp.all(jnp.isfinite(flat_strength_gradient)))
+    assert float(jnp.linalg.norm(flat_strength_gradient)) > 0.0
     assert bool(jnp.all(jnp.isfinite(gradient)))
     assert "Er_transition_rho" not in (
         reverse_transport.TRANSPORT_REVERSE_OBJECTIVE_LABELS
     )
     assert reverse_transport.TRANSPORT_OPTIMIZATION_OPTIONAL_OBJECTIVE_LABELS == (
         "Er_transition_rho",
+        "Er_transition_location_moment",
+        "Er_transition_strength",
     )
 
 

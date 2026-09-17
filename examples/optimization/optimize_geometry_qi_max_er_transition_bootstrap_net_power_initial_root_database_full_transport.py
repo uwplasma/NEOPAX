@@ -105,6 +105,8 @@ MAX_ER_WEIGHT = 0.5
 ER_TRANSITION_LEFT_WEIGHT = 0.09
 ER_TRANSITION_RIGHT_WEIGHT = 0.09
 ER_TRANSITION_RHO_WEIGHT = 100.0
+ER_TRANSITION_STRENGTH_TARGET = 0.90
+ER_TRANSITION_STRENGTH_WEIGHT = 100.0
 BOOTSTRAP_WEIGHT = 2.0
 NET_POWER_WEIGHT = 1.0
 
@@ -178,10 +180,16 @@ def parser() -> argparse.ArgumentParser:
         "--transition-location-objective",
         action=argparse.BooleanOptionalAction,
         default=USE_ER_TRANSITION_LOCATION_OBJECTIVE,
-        help="Enable/disable the smooth final-time Er transition-location objective.",
+        help="Enable/disable the coupled final-time Er transition location/existence objectives.",
     )
     out.add_argument(
         "--er-transition-rho-target", type=float, default=ER_TRANSITION_RHO_TARGET
+    )
+    out.add_argument(
+        "--er-transition-strength-target",
+        type=float,
+        default=ER_TRANSITION_STRENGTH_TARGET,
+        help="Required smooth positive-to-negative Er drop across the radial window.",
     )
     out.add_argument(
         "--er-transition-rho-min", type=float, default=ER_TRANSITION_RHO_MIN
@@ -271,11 +279,21 @@ def active_terms(args: argparse.Namespace):
             )
         )
     if args.transition_location_objective:
-        terms.append(
+        terms.extend(
             (
-                opt.transport.Er_transition_rho,
-                args.er_transition_rho_target,
-                ER_TRANSITION_RHO_WEIGHT,
+                # Report the normalized location without optimizing its undefined
+                # value when no transition exists.
+                (opt.transport.Er_transition_rho, 0.0, 0.0),
+                (
+                    opt.transport.Er_transition_location_moment,
+                    0.0,
+                    ER_TRANSITION_RHO_WEIGHT,
+                ),
+                (
+                    opt.transport.Er_transition_strength,
+                    args.er_transition_strength_target,
+                    ER_TRANSITION_STRENGTH_WEIGHT,
+                ),
             )
         )
     if args.bootstrap_penalty:
@@ -347,7 +365,10 @@ def iteration_diagnostics(evaluation):
         f"Er_right={value('transport:Er_transition_right', 'Er_transition_right'):.8e} "
         f"Er_right_cost={component_cost('transport:Er_transition_right', 'Er_transition_right'):.8e} "
         f"Er_transition_rho={value('transport:Er_transition_rho', 'Er_transition_rho'):.8e} "
-        f"Er_transition_rho_cost={component_cost('transport:Er_transition_rho', 'Er_transition_rho'):.8e} "
+        f"Er_transition_location_moment={value('transport:Er_transition_location_moment', 'Er_transition_location_moment'):.8e} "
+        f"Er_transition_location_cost={component_cost('transport:Er_transition_location_moment', 'Er_transition_location_moment'):.8e} "
+        f"Er_transition_strength={value('transport:Er_transition_strength', 'Er_transition_strength'):.8e} "
+        f"Er_transition_strength_cost={component_cost('transport:Er_transition_strength', 'Er_transition_strength'):.8e} "
         f"bootstrap_penalty={value('bootstrap_current_penalty', 'transport:bootstrap_current_penalty'):.8e} "
         f"bootstrap_cost={component_cost('bootstrap_current_penalty', 'transport:bootstrap_current_penalty'):.8e} "
         f"net_power_average_MW_m3={net_power_average:.8e} "
@@ -629,6 +650,14 @@ def main() -> int:
             )
     if not 0.0 <= args.er_transition_rho_min < args.er_transition_rho_max <= 1.0:
         raise ValueError("Er transition radial window must satisfy 0 <= min < max <= 1.")
+    if not (
+        args.er_transition_rho_min
+        <= args.er_transition_rho_target
+        <= args.er_transition_rho_max
+    ):
+        raise ValueError("Er transition target must lie inside the radial window.")
+    if not 0.0 < args.er_transition_strength_target <= 1.0:
+        raise ValueError("--er-transition-strength-target must lie in (0, 1].")
     if args.er_transition_temperature_kv_m <= 0.0:
         raise ValueError("--er-transition-temperature-kv-m must be positive.")
     terms = active_terms(args)
@@ -675,6 +704,7 @@ def main() -> int:
             er_transition_right_index=args.er_transition_right_index,
             er_transition_rho_min=args.er_transition_rho_min,
             er_transition_rho_max=args.er_transition_rho_max,
+            er_transition_rho_target=args.er_transition_rho_target,
             er_transition_temperature_kv_m=(
                 args.er_transition_temperature_kv_m
             ),
@@ -720,6 +750,7 @@ def main() -> int:
             f"{args.er_transition_right_index}) "
             f"Er_transition_location={args.transition_location_objective} "
             f"Er_transition_rho_target={args.er_transition_rho_target} "
+            f"Er_transition_strength_target={args.er_transition_strength_target} "
             f"Er_transition_rho_window=({args.er_transition_rho_min},"
             f"{args.er_transition_rho_max})",
             flush=True,
