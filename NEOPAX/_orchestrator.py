@@ -3968,7 +3968,7 @@ def plot_transport_solution(
             except Exception as e:
                 print(f"Could not plot transport reference Er: {e}")
         _style_transport_axes(ax, ylabel="Er")
-        ax.legend(loc="lower left", fontsize=15, frameon=True)
+        ax.legend(loc="upper right", fontsize=15, frameon=True)
         fig.tight_layout()
         fig.savefig(output_dir / "transport_Er.png", dpi=_TRANSPORT_DPI, bbox_inches="tight")
         plt.close(fig)
@@ -4137,38 +4137,53 @@ def write_transport_bootstrap_current_evolution(
         print(f"skipping bootstrap-current evolution plot: {exc}")
         return {"times": np.asarray(times), "profiles": profiles_np, "csv": csv_path}
 
-    fig, ax = plt.subplots(figsize=(7.2, 5.8))
-    colors = plt.cm.viridis(np.linspace(0.0, 1.0, len(times)))
-    for time_value, profile, color in zip(times, profiles_np, colors, strict=True):
+    transport_figsize = (6.8, 5.6)
+    transport_linewidth = 3.0
+    transport_dpi = 320
+    color_cycle = plt.rcParams["axes.prop_cycle"].by_key().get("color", [])
+    if not color_cycle:
+        color_cycle = [f"C{i}" for i in range(max(1, len(times)))]
+
+    fig, ax = plt.subplots(figsize=transport_figsize)
+    for time_index, (time_value, profile) in enumerate(
+        zip(times, profiles_np, strict=True)
+    ):
         ax.plot(
             rho_np,
             100.0 * profile,
-            color=color,
-            linewidth=2.0,
+            color=color_cycle[time_index % len(color_cycle)],
+            linewidth=transport_linewidth,
             label=f"t={time_value:.3g}",
         )
     ax.axhline(
         10.0,
         color="black",
-        linewidth=2.2,
+        linewidth=transport_linewidth,
         linestyle="-",
         label=r"$+10\;\mathrm{kA\,m^{-2}}$",
     )
     ax.axhline(
         -10.0,
         color="black",
-        linewidth=2.2,
+        linewidth=transport_linewidth,
         linestyle="-",
         label=r"$-10\;\mathrm{kA\,m^{-2}}$",
     )
-    ax.set_xlabel(r"$\rho$")
-    ax.set_ylabel(r"$J^{\mathrm{bootstrap}}\;[\mathrm{kA\,m^{-2}}]$")
+    ax.set_xlabel(r"$\rho$", fontsize=20)
+    ax.set_ylabel(r"$J^{\mathrm{bootstrap}}\;[\mathrm{kA\,m^{-2}}]$", fontsize=20)
     ax.set_title("Bootstrap current evolution")
-    ax.grid(alpha=0.25)
-    ax.legend(title="Time", loc="best", fontsize="small", ncol=2)
+    ax.grid(False)
+    ax.tick_params(axis="both", labelsize=16, width=1.0, length=4)
+    for spine in ax.spines.values():
+        spine.set_linewidth(1.0)
+        spine.set_color("0.35")
+    if rho_np.size:
+        ax.set_xlim(float(np.min(rho_np)), float(np.max(rho_np)))
+    ax.margins(x=0.04, y=0.08)
+    ax.legend(title="Time", loc="best", fontsize=15, frameon=True, ncol=2)
     fig.tight_layout()
     png_path = output_dir / "bootstrap_current_evolution.png"
-    fig.savefig(png_path, dpi=300, bbox_inches="tight")
+    fig.savefig(png_path, dpi=transport_dpi, bbox_inches="tight")
     plt.close(fig)
     print(f"wrote {png_path}")
     return {
