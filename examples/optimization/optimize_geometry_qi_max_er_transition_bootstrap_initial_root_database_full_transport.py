@@ -569,7 +569,10 @@ def write_geometry_artifacts(input_obj, label, out_dir, *, physical_pitches=None
     input_obj.to_indata(input_path)
     print(f"wrote {input_path}")
 
-    eq = vmex_opt.solve_equilibrium(input_obj)
+    eq = vmex_opt.solve_equilibrium(
+        input_obj,
+        raise_on_max_iterations=True,
+    )
     wout_path = vj.write_wout(artifact_dir / f"wout_QI_neopax_geometry_full_transport_{label}.nc", eq.wout)
     print(f"wrote {wout_path}")
     if MAKE_WOUT_PLOTS:

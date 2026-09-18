@@ -979,6 +979,7 @@ def geometry_raw_block_stage(
     param_specs: Sequence[tuple[str, int, int]],
     *,
     max_iter: int | None = None,
+    raise_on_max_iterations: bool = False,
 ) -> GeometryRawBlockStage:
     """Build immutable raw-block configuration for a fixed optimization stage."""
 
@@ -989,6 +990,7 @@ def geometry_raw_block_stage(
         "ns": int(context.static.resolution.ns),
         "mode": "cli",
         "multigrid": True,
+        "raise_on_max_iterations": bool(raise_on_max_iterations),
     }
     if max_iter is not None:
         config_kwargs["max_iterations"] = int(max_iter)
@@ -1008,7 +1010,17 @@ def geometry_raw_block_optimization_stage(
 ) -> GeometryRawBlockOptimizationStage:
     """Create opt-in persistent VMEX setup for one fixed optimizer stage."""
 
-    raw_stage = geometry_raw_block_stage(context, param_specs, max_iter=max_iter)
+    # Unlike the benchmark/default one-shot raw-block lane, an optimization
+    # trial must be a genuine VMEX fixed point.  A final-stage NITER exhaustion
+    # therefore crosses the callback as VmecConvergenceError and is converted
+    # by NEOPAX's existing zero-crash least-squares wrapper into its 1e6
+    # penalty residual.  The benchmark lane keeps the default False above.
+    raw_stage = geometry_raw_block_stage(
+        context,
+        param_specs,
+        max_iter=max_iter,
+        raise_on_max_iterations=True,
+    )
     factory = getattr(raw_stage.implicit, "make_solve_implicit_with_aux_runner", None)
     if callable(factory):
         runner = factory(raw_stage.implicit_cfg)

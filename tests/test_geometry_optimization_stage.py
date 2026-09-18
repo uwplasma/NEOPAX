@@ -26,6 +26,22 @@ from NEOPAX._transport_flux_models import DENSITY_STATE_TO_PHYSICAL
 from NEOPAX._constants import elementary_charge
 
 
+def test_geometry_optimization_rejects_vmex_niter_exhaustion(monkeypatch):
+    """Only the optimization stage opts into strict final-stage convergence."""
+
+    captured = {}
+
+    def _raw_stage(*_args, **kwargs):
+        captured.update(kwargs)
+        raise RuntimeError("stop after configuration capture")
+
+    monkeypatch.setattr(geometry_ad, "geometry_raw_block_stage", _raw_stage)
+    with pytest.raises(RuntimeError, match="configuration capture"):
+        geometry_ad.geometry_raw_block_optimization_stage(object(), ())
+
+    assert captured["raise_on_max_iterations"] is True
+
+
 def test_database_transport_bootstrap_evolution_reuses_saved_states(tmp_path):
     class _DatabaseFluxModel:
         @staticmethod
