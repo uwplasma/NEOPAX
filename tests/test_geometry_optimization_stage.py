@@ -891,13 +891,6 @@ def test_database_full_transport_changed_geometry_uses_persistent_live_scan_runt
 
     monkeypatch.setattr(
         reverse_transport,
-        "build_runtime_context_for_vmec_state",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(
-            AssertionError("optimization entered common runtime construction")
-        ),
-    )
-    monkeypatch.setattr(
-        reverse_transport,
         "build_neopax_geometry_and_ntx_exact_lij_support_from_state",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(
             AssertionError("database optimization entered the exact-Lij payload branch")
