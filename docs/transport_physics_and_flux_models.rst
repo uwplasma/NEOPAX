@@ -383,6 +383,63 @@ In the code, the total-power factor is either provided explicitly or inferred
 from the active pressure-source model.
 
 
+``turbulent_relu_analytical`` / ``turbulent_power_relu_analytical``
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+This model is an independent analytic analogue of the T3D ReLU test model.  It
+does not inherit the power-over-density scaling from
+``turbulent_power_analytical``.  On transport faces it evaluates logarithmic
+gradient drives
+
+.. math::
+
+   k_n = -\frac{1}{n}\frac{\partial n}{\partial \rho},
+   \qquad
+   k_T = -\frac{1}{T}\frac{\partial T}{\partial \rho},
+
+and applies the same threshold forms as T3D:
+
+.. math::
+
+   \Gamma_s^{\mathrm{turb}} =
+   \mathrm{sign}(k_{n,s} - k_{n,\mathrm{crit},s})
+   \left|s_{n,s}(k_{n,s} - k_{n,\mathrm{crit},s})\right|^p,
+
+.. math::
+
+   Q_s^{\mathrm{turb}} =
+   \begin{cases}
+   10^{-16}, & |k_{T,s}| < k_{T,\mathrm{crit},s}, \\
+   s_{T,s}(k_{T,s} - k_{T,\mathrm{crit},s}\,\mathrm{sign}(k_{T,s}))^p,
+   & |k_{T,s}| \ge k_{T,\mathrm{crit},s}.
+   \end{cases}
+
+.. code-block:: toml
+
+    [turbulence]
+    flux_model = "turbulent_relu_analytical"
+    # Arrays follow the NEOPAX species order. For a W7-X T3D-like electron/ion
+    # case this maps T3D electron values first, ion values second.
+    density_relu_flux = {critical_gradient = [100.0, 100.0], slope = [0.0, 0.0]}
+    pressure_relu_flux = {critical_gradient = [100.0, 0.1], slope = [0.0, 1.2]}
+    power = 1.0
+
+The threshold and slope can also be supplied separately with
+``density_critical_gradient``, ``temperature_critical_gradient``,
+``density_relu_slope``, and ``temperature_relu_slope``; scalars broadcast to all
+species and arrays are interpreted species-by-species. These values are
+dimensionless thresholds/slopes for normalized :math:`\rho` gradients, matching
+the T3D ReLU input convention. T3D-style nested
+``density_relu_flux = {critical_gradient = ..., slope = ...}`` and
+``pressure_relu_flux = {critical_gradient = ..., slope = ...}`` tables are also
+accepted under ``[turbulence]``.
+
+Internally the threshold algebra first produces T3D-style normalized ReLU
+flux amplitudes. The model then converts those amplitudes to the physical
+NEOPAX flux units expected by the transport equations: particle flux in
+:math:`m^{-2}s^{-1}` and heat flux in :math:`eV\,m^{-2}s^{-1}`.
+
+
 File-Driven Flux Model
 ----------------------
 

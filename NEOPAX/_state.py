@@ -35,6 +35,8 @@ def apply_transport_density_floor(state, density_floor=DEFAULT_TRANSPORT_DENSITY
     density = getattr(state, "density", None)
     if density is None:
         return state
+    if density_floor is None:
+        density_floor = DEFAULT_TRANSPORT_DENSITY_FLOOR
     return dataclasses.replace(state, density=safe_density(density, density_floor))
 
 

@@ -6,6 +6,7 @@ transport, and direct flux evaluation.
 from __future__ import annotations
 
 import contextlib
+import copy
 import dataclasses
 import importlib
 import importlib.util
@@ -17,6 +18,8 @@ import jax
 import jax.numpy as jnp
 
 from ._ambipolarity import (
+    find_ambipolar_Er_min_entropy_jit_adaptive,
+    find_ambipolar_Er_min_entropy_jit_multires,
     pad_and_sort_roots_for_plotting,
     plot_roots,
     solve_ambipolarity_roots_from_config,
@@ -37,16 +40,21 @@ from ._species import Species
 from ._state import TransportState, safe_density, safe_temperature
 from ._transport_flux_models import (
     ZeroTransportModel,
+    build_face_transport_state,
     build_transport_flux_model,
     compute_total_power_breakdown_mw,
     compute_total_power_mw,
     get_transport_flux_model,
 )
+from ._boundary_conditions import left_constraints_from_bc_model, right_constraints_from_bc_model
 
 try:
     import tomli as toml
 except ImportError:
     import toml
+
+
+PRESSURE_SOURCE_STATE_TO_MW_M3 = 1.0 / 62.422
 
 
 @dataclasses.dataclass(frozen=True)
@@ -68,6 +76,113 @@ class RuntimeContext:
 def load_config(path):
     text = Path(path).read_text(encoding="utf-8")
     return toml.loads(text)
+
+
+def _normalize_transport_center_flux_mode(mode: object) -> str:
+    """Normalize the universal transport face/centre representation policy.
+
+    This is deliberately independent of the flux-model family and RHS mode.
+    Evaluation paths will consume the normalized value in a subsequent
+    representation-layer refactor; defining it here lets configurations carry
+    one unambiguous policy before that wiring changes any physics.
+    """
+
+    normalized = "direct" if mode in (None, "") else str(mode).strip().lower()
+    aliases = {
+        "default": "direct",
+        "direct_center": "direct",
+        "direct_centers": "direct",
+        "center_local_response": "direct",
+        "interpolate": "interpolate_from_faces",
+        "interpolate_faces": "interpolate_from_faces",
+        "interpolate_face_fluxes": "interpolate_from_faces",
+        "face_interpolated": "interpolate_from_faces",
+    }
+    normalized = aliases.get(normalized, normalized)
+    if normalized not in {"direct", "interpolate_from_faces"}:
+        raise ValueError(
+            "transport_solver.center_flux_mode must be one of: "
+            "direct, interpolate_from_faces"
+        )
+    return normalized
+
+
+def _resolve_transport_center_flux_mode(config: dict) -> str:
+    """Resolve the universal transport representation with exact-NTX fallback.
+
+    ``ntx_exact_center_response_mode`` remains a compatibility alias only for
+    the exact NTX model.  A universal setting always wins, provided it agrees
+    with an explicitly supplied legacy setting.
+    """
+
+    solver_cfg = config.get("transport_solver", {})
+    if not solver_cfg:
+        solver_cfg = config.get("solver", config.get("transport", {}))
+    if solver_cfg is None:
+        solver_cfg = {}
+    if not isinstance(solver_cfg, dict):
+        raise ValueError("transport_solver must be a TOML table.")
+
+    # ``center_flux_mode`` is a transport-solver representation policy: it
+    # governs how the combined RHS consumes every flux model, rather than a
+    # property of one flux model.  Reject the old table rather than silently
+    # ignoring it and falling back to direct centres.
+    old_flux_cfg = config.get("transport_flux", {})
+    if old_flux_cfg is not None and not isinstance(old_flux_cfg, dict):
+        raise ValueError("transport_flux must be a TOML table.")
+    if isinstance(old_flux_cfg, dict) and "center_flux_mode" in old_flux_cfg:
+        raise ValueError(
+            "transport_flux.center_flux_mode has moved to "
+            "transport_solver.center_flux_mode."
+        )
+
+    has_universal_mode = "center_flux_mode" in solver_cfg
+    universal_mode = _normalize_transport_center_flux_mode(
+        solver_cfg.get("center_flux_mode")
+    )
+
+    neo_cfg = config.get("neoclassical", {})
+    if not isinstance(neo_cfg, dict):
+        return universal_mode
+    neo_name = str(neo_cfg.get("flux_model", neo_cfg.get("model", ""))).strip().lower()
+    legacy_mode = neo_cfg.get("ntx_exact_center_response_mode")
+    if neo_name != "ntx_exact_lij_runtime" or legacy_mode is None:
+        return universal_mode
+
+    # This is an exact-NTX implementation detail under the universal direct
+    # centre representation: faces still supply the conservative divergence,
+    # while a face-built coefficient model is interpolated and evaluated at
+    # centres for local terms.  It is not the old flux-averaging policy.
+    if str(legacy_mode).strip().lower() in {
+        "interpolate_face_coefficients",
+        "interpolate_coefficients",
+        "face_coefficient_interpolation",
+        "interpolate_face_coefficients_cubic",
+        "interpolate_face_coefficients_four_point",
+        "face_coefficient_cubic",
+        "interpolate_face_coefficients_physical_coordinates",
+        "interpolate_face_coefficients_er_over_v",
+        "face_coefficient_physical_coordinates",
+        "interpolate_face_coefficients_native_distance",
+        "face_coefficient_native_distance",
+        "interpolate_face_coefficients_taylor_reliability",
+        "face_coefficient_taylor_reliability",
+    }:
+        if has_universal_mode and universal_mode != "direct":
+            raise ValueError(
+                "neoclassical.ntx_exact_center_response_mode="
+                "a face-coefficient interpolation mode requires "
+                "transport_solver.center_flux_mode='direct'."
+            )
+        return "direct"
+
+    legacy_as_universal = _normalize_transport_center_flux_mode(legacy_mode)
+    if has_universal_mode and universal_mode != legacy_as_universal:
+        raise ValueError(
+            "transport_solver.center_flux_mode conflicts with "
+            "neoclassical.ntx_exact_center_response_mode."
+        )
+    return universal_mode if has_universal_mode else legacy_as_universal
 
 
 def _normalized_general_device(config: dict) -> str:
@@ -110,6 +225,17 @@ def _as_string_list(value):
         return [str(v).strip() for v in value if str(v).strip()]
     value = str(value).strip()
     return [value] if value else []
+
+
+def _optional_config_int(value):
+    if value is None:
+        return None
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text in {"", "none", "null"}:
+            return None
+        return int(text)
+    return int(value)
 
 
 def _load_python_extension_file(path: Path) -> None:
@@ -156,6 +282,17 @@ def _normalize_solver_config(config: dict) -> dict:
     solver_cfg["integrator"] = solver_cfg["transport_solver_backend"]
     solver_cfg["neoclassical_flux_model"] = config.get("neoclassical", {}).get("flux_model", "none")
     solver_cfg["turbulence_flux_model"] = config.get("turbulence", {}).get("flux_model", "none")
+    backend = str(solver_cfg["transport_solver_backend"]).strip().lower()
+    if backend == "theta_t3d_outer":
+        configured_rhs_mode = str(
+            solver_cfg.get("theta_rhs_mode", solver_cfg.get("rhs_mode", "lagged_transport_response"))
+        ).strip().lower()
+        if configured_rhs_mode not in {"lagged_transport_response", "lagged_response"}:
+            raise ValueError(
+                "theta_t3d_outer requires theta_rhs_mode='lagged_transport_response'."
+            )
+        solver_cfg["theta_rhs_mode"] = "lagged_transport_response"
+    solver_cfg["transport_center_flux_mode"] = _resolve_transport_center_flux_mode(config)
     solver_cfg.setdefault("Er_relax", 1.0)
     solver_cfg.setdefault("DEr", 1.0)
     solver_cfg.setdefault("density_floor", 1.0e-6)
@@ -209,18 +346,26 @@ def _build_geometry(config: dict):
     from ._geometry_models import get_geometry_model
 
     geom_cfg = config.get("geometry", {})
+    backend = str(geom_cfg.get("backend", "")).strip().lower()
+    if backend in {"vmec_jax_booz_xform_jax", "vmec_runtime", "vmec_realtime"}:
+        return None
     n_radial = int(geom_cfg.get("n_radial", 51))
+    rho_edge = float(geom_cfg.get("rho_edge", 1.0))
     vmec_file = geom_cfg.get("vmec_file")
     boozer_file = geom_cfg.get("boozer_file")
     if vmec_file is None or boozer_file is None:
         return None
-    return get_geometry_model("vmec_booz", n_r=n_radial, vmec=vmec_file, booz=boozer_file)
+    return get_geometry_model("vmec_booz", n_r=n_radial, vmec=vmec_file, booz=boozer_file, rho_edge=rho_edge)
 
 
 def _build_database(config: dict, geometry):
     neoclassical_cfg = config.get("neoclassical", {})
-    neoclassical_name = str(neoclassical_cfg.get("flux_model", "ntx_database")).strip().lower()
-    if neoclassical_name == "fluxes_r_file":
+    neoclassical_name = str(
+        neoclassical_cfg.get(
+            "flux_model", neoclassical_cfg.get("model", "ntx_database")
+        )
+    ).strip().lower()
+    if neoclassical_name in {"fluxes_r_file", "dkx_fluxes_r_file"}:
         return None
     neoclassical_file = neoclassical_cfg.get("neoclassical_file")
     if neoclassical_file and geometry is not None:
@@ -260,32 +405,17 @@ def _build_state(config: dict, geometry, species: Species):
 
 
 def _apply_configured_er_dirichlet_boundaries(config: dict, state: TransportState | None):
-    if state is None:
-        return state
-
-    er_cfg = config.get("boundary", {}).get("Er", {})
-    if not isinstance(er_cfg, dict):
-        return state
-
-    er = state.Er
-    left_cfg = er_cfg.get("left", {})
-    if isinstance(left_cfg, dict) and str(left_cfg.get("type", "")).strip().lower() == "dirichlet" and "value" in left_cfg:
-        left_value = jnp.asarray(left_cfg.get("value"), dtype=er.dtype).reshape(-1)[0]
-        er = er.at[0].set(left_value)
-
-    right_cfg = er_cfg.get("right", {})
-    if isinstance(right_cfg, dict) and str(right_cfg.get("type", "")).strip().lower() == "dirichlet" and "value" in right_cfg:
-        right_value = jnp.asarray(right_cfg.get("value"), dtype=er.dtype).reshape(-1)[0]
-        er = er.at[-1].set(right_value)
-
-    return dataclasses.replace(state, Er=er)
+    del config
+    # Face-based FV transport keeps BCs in the face closures. State
+    # initialization should not collapse cell centers onto boundary values.
+    return state
 
 
 def _resolve_er_right_boundary_mode(config: dict, solver_cfg: dict) -> str:
     er_right_cfg = config.get("boundary", {}).get("Er", {}).get("right", {})
     if isinstance(er_right_cfg, dict):
         right_type = er_right_cfg.get("type")
-        if str(right_type).strip().lower() in {"floating_ambipolar_edge", "ambipolar_edge_root"}:
+        if str(right_type).strip().lower() in {"floating_ambipolar_edge", "floating_ambipolar_edge_node", "ambipolar_edge_root"}:
             return str(right_type).strip().lower()
     return str(solver_cfg.get("Er_right_boundary_mode", solver_cfg.get("Er_boundary_mode", "config"))).strip().lower()
 
@@ -301,7 +431,7 @@ def _normalized_boundary_cfg_for_transport(boundary_cfg: dict) -> dict:
     if isinstance(right_cfg, dict):
         right_cfg = dict(right_cfg)
         right_type = str(right_cfg.get("type", "")).strip().lower()
-        if right_type in {"floating_ambipolar_edge", "ambipolar_edge_root"}:
+        if right_type in {"floating_ambipolar_edge", "floating_ambipolar_edge_node", "ambipolar_edge_root"}:
             right_cfg["type"] = "neumann"
             right_cfg.setdefault("gradient", 0.0)
         er_cfg["right"] = right_cfg
@@ -309,45 +439,133 @@ def _normalized_boundary_cfg_for_transport(boundary_cfg: dict) -> dict:
     return out
 
 
-def _apply_boundary_corrected_state_for_ambipolarity(config: dict, runtime: RuntimeContext, state: TransportState | None):
-    if state is None or runtime.geometry is None:
-        return state
+def _initialize_floating_er_edge_node(
+    state, runtime, config, boundary_models, *, equation_system=None
+):
+    """Return the initial outer-face Er root for the private Radau node.
 
-    from ._boundary_conditions import build_boundary_condition_model, apply_cell_centered_boundary_state
+    NTSS evolves an endpoint Er degree of freedom, but initializes that endpoint
+    by continuing the selected ambipolar root from the preceding radial point.
+    The FV counterpart must do the same at the outer *face*.  In particular, an
+    extrapolation of the last two cell-centre Er values is not an ambipolar
+    boundary condition and changes the first transport RHS.
 
-    boundary_cfg = _normalized_boundary_cfg_for_transport(config.get("boundary", {}))
-    dr = getattr(runtime.geometry, "dr", 1.0)
-    face_centers = runtime.geometry.r_grid_half
-
-    density = state.density
-    pressure = state.pressure
-
-    density_bc_cfg = boundary_cfg.get("density")
-    if density_bc_cfg is not None:
-        density_bc = build_boundary_condition_model(
-            density_bc_cfg,
-            dr,
-            species_names=runtime.species.names,
+    This is setup-only work: it neither changes ``TransportState`` nor adds an
+    implicit root solve to Radau stages.
+    """
+    amb_cfg = dict(config.get("ambipolarity", {}))
+    method = str(amb_cfg.get("er_ambipolar_method", "two_stage")).strip().lower()
+    if method not in {"two_stage", "adaptive"}:
+        raise ValueError(
+            "floating_ambipolar_edge_node initialization currently requires "
+            "er_ambipolar_method='two_stage' or 'adaptive'."
         )
-        density = apply_cell_centered_boundary_state(density, density_bc, face_centers)
 
-    temperature = pressure / safe_density(density, runtime.solver_parameters.get("density_floor", 1.0e-6))
-    temperature_bc_cfg = boundary_cfg.get("temperature")
-    if temperature_bc_cfg is not None:
-        temperature_bc = build_boundary_condition_model(
-            temperature_bc_cfg,
-            dr,
-            species_names=runtime.species.names,
-        )
-        temperature = apply_cell_centered_boundary_state(temperature, temperature_bc, face_centers)
-
-    temperature = safe_temperature(temperature, runtime.solver_parameters.get("temperature_floor"))
-    corrected = dataclasses.replace(
-        state,
-        density=density,
-        pressure=safe_density(density, runtime.solver_parameters.get("density_floor", 1.0e-6)) * temperature,
+    solver_cfg = runtime.solver_parameters
+    # The edge node must start from a root of the *same* face residual which
+    # the composed RHS advances.  In particular, the latter first applies
+    # quasineutrality, floors, fixed-temperature projection, and any centre
+    # boundary projection.  Using the raw setup state here can select an edge
+    # root for a different plasma state before Radau even forms its first
+    # cache.  Keep the old standalone path for callers/tests which do not yet
+    # have a composed system.
+    if equation_system is None:
+        working_state = state
+        flux_model = runtime.models.flux
+        flux_bc_kwargs = {
+            "bc_density": boundary_models.get("density"),
+            "bc_temperature": boundary_models.get("temperature"),
+            "bc_er": boundary_models.get("Er"),
+        }
+    else:
+        working_state, _ = equation_system._prepare_working_state(state)
+        flux_model = equation_system.shared_flux_model
+        flux_bc_kwargs = equation_system._shared_flux_bc_kwargs()
+        if flux_model is None:
+            raise ValueError(
+                "floating_ambipolar_edge_node requires the composed shared flux model."
+            )
+    face_state = build_face_transport_state(
+        working_state,
+        runtime.geometry,
+        bc_density=flux_bc_kwargs["bc_density"],
+        bc_temperature=flux_bc_kwargs["bc_temperature"],
+        bc_er=flux_bc_kwargs["bc_er"],
+        density_floor=solver_cfg.get("density_floor", 1.0e-6),
+        temperature_floor=solver_cfg.get("temperature_floor"),
     )
-    return _apply_configured_er_dirichlet_boundaries(config, corrected)
+    charge = jnp.asarray(runtime.species.charge_qp)
+    seed = jnp.asarray(working_state.Er[-1])
+
+    def _face_gamma(er_value):
+        candidate_face_state = dataclasses.replace(
+            face_state,
+            Er=face_state.Er.at[-1].set(jnp.asarray(er_value, dtype=face_state.Er.dtype)),
+        )
+        face_fluxes = flux_model.evaluate_face_fluxes(
+            working_state,
+            candidate_face_state,
+            **flux_bc_kwargs,
+        )
+        if face_fluxes is None or "Gamma" not in face_fluxes:
+            raise ValueError(
+                "floating_ambipolar_edge_node requires native face particle fluxes."
+            )
+        return jnp.asarray(face_fluxes["Gamma"])[:, -1]
+
+    def gamma_func(er_value):
+        return jnp.sum(charge * _face_gamma(er_value))
+
+    def entropy_func(er_value):
+        return jnp.sum(jnp.abs(_face_gamma(er_value)))
+
+    root_args = {
+        "Gamma_func": gamma_func,
+        "entropy_func": entropy_func,
+        "Er_range": (
+            float(amb_cfg.get("er_ambipolar_scan_min", -20.0)),
+            float(amb_cfg.get("er_ambipolar_scan_max", 20.0)),
+        ),
+        "n_refine": int(amb_cfg.get("er_ambipolar_n_refine", 8)),
+        "max_roots": int(amb_cfg.get("er_ambipolar_max_roots", 3)),
+        "tol": float(amb_cfg.get("er_ambipolar_tol", 1.0e-6)),
+        "x_tol": float(amb_cfg.get("er_ambipolar_x_tol", 1.0e-6)),
+        "maxiter": int(amb_cfg.get("er_ambipolar_maxiter", 12)),
+        "er_scan_batch_mode": amb_cfg.get("er_ambipolar_scan_batch_mode", "vmap"),
+        "er_scan_batch_size": amb_cfg.get("er_ambipolar_scan_batch_size", None),
+    }
+    if method == "two_stage":
+        roots, _entropies, _best, n_roots = find_ambipolar_Er_min_entropy_jit_multires(
+            n_coarse=int(amb_cfg.get("er_ambipolar_n_coarse", 24)),
+            **root_args,
+        )
+    else:
+        roots, _entropies, _best, n_roots = find_ambipolar_Er_min_entropy_jit_adaptive(
+            n_init=int(amb_cfg.get("er_ambipolar_adaptive_n_init", 16)),
+            n_subdiv=int(amb_cfg.get("er_ambipolar_adaptive_n_subdiv", 2)),
+            n_rounds=int(amb_cfg.get("er_ambipolar_adaptive_n_rounds", 2)),
+            max_brackets=int(amb_cfg.get("er_ambipolar_adaptive_max_brackets", 24)),
+            **root_args,
+        )
+    del _entropies, _best
+    valid = jnp.arange(roots.shape[0]) < n_roots
+    nearest_index = jnp.argmin(jnp.where(valid, jnp.abs(roots - seed), jnp.inf))
+    edge_root = roots[nearest_index]
+    if not bool(jnp.asarray(jnp.isfinite(edge_root))):
+        raise RuntimeError(
+            "No finite ambipolar root was found at the outer face for "
+            "floating_ambipolar_edge_node. Refusing to initialize it from a "
+            "non-ambipolar extrapolation."
+        )
+    return edge_root
+
+
+def _apply_boundary_corrected_state_for_ambipolarity(config: dict, runtime: RuntimeContext, state: TransportState | None):
+    del config, runtime
+    # Keep initialization states cell-centered; do not project endpoints onto
+    # boundary values or gradients. Ambipolar/root solvers should see the same
+    # center state that the FV transport solver evolves.
+    return state
 
 
 def _maybe_initialize_er_from_ambipolarity(config: dict, runtime: RuntimeContext, state: TransportState | None):
@@ -431,7 +649,13 @@ def _maybe_initialize_er_from_ambipolarity(config: dict, runtime: RuntimeContext
                 f"min={float(jnp.min(finite_roots)):.6e}",
                 f"max={float(jnp.max(finite_roots)):.6e}",
             )
-        if runtime.models.flux is not None and runtime.geometry is not None:
+        run_scan_diagnostic = bool(
+            amb_cfg.get(
+                "er_initialization_debug_scan_diagnostic",
+                runtime.solver_parameters.get("er_initialization_debug_scan_diagnostic", False),
+            )
+        )
+        if run_scan_diagnostic and runtime.models.flux is not None and runtime.geometry is not None:
             try:
                 local_particle_flux = runtime.models.flux.build_local_particle_flux_evaluator(state)
                 if local_particle_flux is not None:
@@ -469,16 +693,17 @@ def _maybe_initialize_er_from_ambipolarity(config: dict, runtime: RuntimeContext
                             sign_change_count,
                         )
 
-                    gamma_debug = jax.vmap(gamma_scan_for_radius)(sample_radii)
-                    for radius_idx, vals in zip(sample_radii.tolist(), gamma_debug):
-                        g_left, g_right, g_best, er_best, n_changes = vals
+                    gamma_left, gamma_right, gamma_best, er_best, n_changes = jax.vmap(gamma_scan_for_radius)(
+                        sample_radii
+                    )
+                    for k, radius_idx in enumerate(sample_radii.tolist()):
                         print(
                             f"[NEOPAX] ambipolar scan diagnostic[r={int(radius_idx)}]:",
-                            f"gamma_at_scan_min={float(g_left):.6e}",
-                            f"gamma_at_scan_max={float(g_right):.6e}",
-                            f"minabs_gamma={float(g_best):.6e}",
-                            f"minabs_gamma_Er={float(er_best):.6e}",
-                            f"coarse_sign_changes={int(n_changes)}",
+                            f"gamma_at_scan_min={float(gamma_left[k]):.6e}",
+                            f"gamma_at_scan_max={float(gamma_right[k]):.6e}",
+                            f"minabs_gamma={float(gamma_best[k]):.6e}",
+                            f"minabs_gamma_Er={float(er_best[k]):.6e}",
+                            f"coarse_sign_changes={int(n_changes[k])}",
                         )
             except Exception as exc:
                 print(f"[NEOPAX] ambipolar scan diagnostic unavailable: {exc}")
@@ -522,8 +747,9 @@ def _build_flux_model(config: dict, species, energy_grid, geometry, database, so
         if "classical" in config
         else None
     )
+    solver_cfg = _normalize_solver_config(config)
 
-    if neoclassical_name == "fluxes_r_file":
+    if neoclassical_name in {"fluxes_r_file", "dkx_fluxes_r_file"}:
         neoclassical_model = neoclassical_factory(
             species,
             energy_grid,
@@ -538,8 +764,53 @@ def _build_flux_model(config: dict, species, energy_grid, geometry, database, so
         runtime_kwargs.setdefault("collisionality_model", neoclassical_cfg.get("collisionality_model", "default"))
         runtime_kwargs.setdefault("bc_density", bc_density)
         runtime_kwargs.setdefault("bc_temperature", bc_temperature)
+        # The NTX runtime model evaluates its own state reconstruction for the
+        # momentum-correction/bootstrap objective.  Use the transport-solver
+        # floors unless the neoclassical block explicitly overrides them.
+        runtime_kwargs.setdefault(
+            "density_floor",
+            neoclassical_cfg.get("density_floor", solver_cfg.get("density_floor", 1.0e-6)),
+        )
+        runtime_kwargs.setdefault(
+            "temperature_floor",
+            neoclassical_cfg.get("temperature_floor", solver_cfg.get("temperature_floor")),
+        )
         if neoclassical_name == "ntx_exact_lij_runtime":
             runtime_kwargs.setdefault("preload_support", True)
+            # The exact model retains two internal response primitives, but
+            # their selection is now owned by the universal transport policy.
+            requested_center_response_mode = runtime_kwargs.get(
+                "ntx_exact_center_response_mode"
+            )
+            if str(requested_center_response_mode).strip().lower() in {
+                "interpolate_face_coefficients",
+                "interpolate_coefficients",
+                "face_coefficient_interpolation",
+                "interpolate_face_coefficients_cubic",
+                "interpolate_face_coefficients_four_point",
+                "face_coefficient_cubic",
+                "interpolate_face_coefficients_physical_coordinates",
+                "interpolate_face_coefficients_er_over_v",
+                "face_coefficient_physical_coordinates",
+                "interpolate_face_coefficients_native_distance",
+                "face_coefficient_native_distance",
+                "interpolate_face_coefficients_taylor_reliability",
+                "face_coefficient_taylor_reliability",
+            }:
+                if solver_cfg["transport_center_flux_mode"] != "direct":
+                    raise ValueError(
+                        "face-coefficient interpolation requires "
+                        "transport_solver.center_flux_mode='direct'."
+                    )
+                runtime_kwargs["ntx_exact_center_response_mode"] = str(
+                    requested_center_response_mode
+                )
+            else:
+                runtime_kwargs["ntx_exact_center_response_mode"] = (
+                    "center_local_response"
+                    if solver_cfg["transport_center_flux_mode"] == "direct"
+                    else "interpolate_from_faces"
+                )
         neoclassical_model = neoclassical_factory(
             species,
             energy_grid,
@@ -575,7 +846,25 @@ def _build_flux_model(config: dict, species, energy_grid, geometry, database, so
             dtype=float,
         )
         turbulence_model = turbulence_factory(species, energy_grid, chi_t, chi_n, geometry)
-    elif turbulence_name in {"turbulent_power_analytical", "ntss_power_over_n"}:
+    elif turbulence_name in {
+        "turbulent_power_analytical",
+        "ntss_power_over_n",
+        "turbulent_relu_analytical",
+        "turbulent_power_relu_analytical",
+    }:
+        def _species_vector(value, default):
+            if value is None:
+                value = default
+            if isinstance(value, dict):
+                out = [value.get(name, value.get(str(name), default)) for name in species.names]
+                return jnp.asarray(out, dtype=float)
+            arr = jnp.asarray(value, dtype=float)
+            if arr.ndim == 0:
+                return jnp.full((species.number_species,), arr, dtype=float)
+            if arr.shape[0] < species.number_species:
+                arr = jnp.pad(arr, (0, species.number_species - arr.shape[0]), mode="edge")
+            return arr[: species.number_species]
+
         chi_t = jnp.asarray(
             turbulence_cfg.get(
                 "chi_temperature",
@@ -599,12 +888,26 @@ def _build_flux_model(config: dict, species, energy_grid, geometry, database, so
             chi_t = jnp.full((species.number_species,), ion_value, dtype=float).at[electron_idx].set(electron_value)
         total_power_mw = turbulence_cfg.get("total_power_mw", turbulence_cfg.get("power_mw"))
         pressure_source_model = None if source_models is None else source_models.get("temperature")
-        if total_power_mw is None and pressure_source_model is None:
+        if (
+            turbulence_name
+            in {
+                "turbulent_power_analytical",
+                "ntss_power_over_n",
+            }
+            and total_power_mw is None
+            and pressure_source_model is None
+        ):
             raise ValueError(
                 f"[turbulence] flux_model='{turbulence_name}' requires a power source. "
                 "Provide 'total_power_mw' (or 'power_mw') in [turbulence], or configure "
                 "temperature sources so NEOPAX can build the scalar power automatically."
             )
+        density_relu_cfg = turbulence_cfg.get("density_relu_flux", {})
+        pressure_relu_cfg = turbulence_cfg.get("pressure_relu_flux", {})
+        if not isinstance(density_relu_cfg, dict):
+            density_relu_cfg = {}
+        if not isinstance(pressure_relu_cfg, dict):
+            pressure_relu_cfg = {}
         turbulence_model = turbulence_factory(
             species,
             energy_grid,
@@ -613,6 +916,67 @@ def _build_flux_model(config: dict, species, energy_grid, geometry, database, so
             chi_n,
             pressure_source_model,
             total_power_mw,
+            **(
+                {
+                    "density_critical_gradient": _species_vector(
+                        turbulence_cfg.get(
+                            "density_critical_gradient",
+                            turbulence_cfg.get(
+                                "n_critical_gradient",
+                                turbulence_cfg.get(
+                                    "critical_gradient_density",
+                                    density_relu_cfg.get("critical_gradient"),
+                                ),
+                            ),
+                        ),
+                        turbulence_cfg.get("critical_gradient", 1.0),
+                    ),
+                    "temperature_critical_gradient": _species_vector(
+                        turbulence_cfg.get(
+                            "temperature_critical_gradient",
+                            turbulence_cfg.get(
+                                "pressure_critical_gradient",
+                                turbulence_cfg.get(
+                                    "critical_gradient_temperature",
+                                    pressure_relu_cfg.get("critical_gradient"),
+                                ),
+                            ),
+                        ),
+                        turbulence_cfg.get("critical_gradient", 1.0),
+                    ),
+                    "density_relu_slope": _species_vector(
+                        turbulence_cfg.get(
+                            "density_relu_slope",
+                            turbulence_cfg.get(
+                                "n_relu_slope",
+                                turbulence_cfg.get("slope_density", density_relu_cfg.get("slope")),
+                            ),
+                        ),
+                        turbulence_cfg.get("slope", 1.0),
+                    ),
+                    "temperature_relu_slope": _species_vector(
+                        turbulence_cfg.get(
+                            "temperature_relu_slope",
+                            turbulence_cfg.get(
+                                "pressure_relu_slope",
+                                turbulence_cfg.get("slope_temperature", pressure_relu_cfg.get("slope")),
+                            ),
+                        ),
+                        turbulence_cfg.get("slope", 1.0),
+                    ),
+                    "relu_power": float(turbulence_cfg.get("relu_power", turbulence_cfg.get("power", 1.0))),
+                }
+                if turbulence_name in {"turbulent_relu_analytical", "turbulent_power_relu_analytical"}
+                else {}
+            ),
+        )
+    elif turbulence_name in {"spectrax_quasilinear_runtime", "spectrax_quasilinear_runtime_lagged"}:
+        turbulence_model = turbulence_factory(
+            species,
+            energy_grid,
+            geometry,
+            database,
+            **dict(turbulence_cfg),
         )
     else:
         turbulence_model = turbulence_factory(species, energy_grid, geometry, database)
@@ -625,7 +989,6 @@ def _build_flux_model(config: dict, species, energy_grid, geometry, database, so
             else ZeroTransportModel()
         )
     )
-    solver_cfg = _normalize_solver_config(config)
     include_turbulent_particle_flux = bool(
         solver_cfg.get(
             "include_turbulent_particle_flux",
@@ -637,10 +1000,41 @@ def _build_flux_model(config: dict, species, energy_grid, geometry, database, so
         turbulence_model,
         classical_model,
         include_turbulent_particle_flux=include_turbulent_particle_flux,
+        geometry=geometry,
+        center_flux_mode=solver_cfg["transport_center_flux_mode"],
     )
 
 
 def build_runtime_context(config: dict) -> tuple[RuntimeContext, TransportState | None]:
+    geom_cfg = config.get("geometry", {})
+    geometry_backend = str(geom_cfg.get("backend", "")).strip().lower()
+    if geometry_backend in {"vmec_jax_booz_xform_jax", "vmec_runtime", "vmec_realtime"}:
+        from ._geometry_autodiff import (
+            build_geometry_autodiff_context,
+            build_runtime_context_for_geometry_param,
+        )
+
+        context = build_geometry_autodiff_context(
+            geom_cfg.get("vmec_input_file"),
+            param_family=str(geom_cfg.get("vmec_param_family", "RBC")),
+            param_m=int(geom_cfg.get("vmec_param_m", 1)),
+            param_n=int(geom_cfg.get("vmec_param_n", 0)),
+            mboz=_optional_config_int(geom_cfg.get("mboz", geom_cfg.get("vmec_mboz"))),
+            nboz=_optional_config_int(geom_cfg.get("nboz", geom_cfg.get("vmec_nboz"))),
+        )
+        lane = str(geom_cfg.get("vmec_lane", "forward")).strip().lower()
+        param_delta = float(geom_cfg.get("vmec_param_delta", 0.0))
+        return build_runtime_context_for_geometry_param(
+            config,
+            context,
+            jnp.asarray(param_delta, dtype=jnp.float64),
+            lane=lane,
+            n_r=int(geom_cfg.get("n_radial", 51)),
+            max_iter=geom_cfg.get("vmec_max_iter"),
+            step_size=geom_cfg.get("vmec_step_size"),
+            jacobian_penalty=float(geom_cfg.get("vmec_jacobian_penalty", 1.0e3)),
+        )
+
     species = _build_species(config)
     energy_grid = _build_energy_grid(config)
     geometry = _build_geometry(config)
@@ -669,7 +1063,18 @@ def build_runtime_context(config: dict) -> tuple[RuntimeContext, TransportState 
     return runtime, state
 
 
-def run_transport(config: dict, runtime: RuntimeContext, state: TransportState):
+def prepare_transport_solver_components(
+    config: dict,
+    runtime: RuntimeContext,
+    state: TransportState,
+) -> dict[str, Any]:
+    """Build the reusable transport solve components without executing solve.
+
+    This is a forward-neutral extraction of the setup portion of
+    `run_transport(...)`. It is intended for tooling and diagnostics that need
+    access to the exact production solver, equation system, and vector field
+    without duplicating the orchestration logic.
+    """
     from ._boundary_conditions import build_boundary_condition_model
     from ._transport_equations import ComposedEquationSystem, build_equation_system
     from ._transport_solvers import build_time_solver
@@ -718,14 +1123,38 @@ def run_transport(config: dict, runtime: RuntimeContext, state: TransportState):
                 right_value=jnp.asarray(er_edge),
                 right_gradient=None,
             )
-        if bool(runtime.solver_parameters.get("debug_stage_markers", False)):
-            print(f"[NEOPAX] using ambipolar edge Er BC: Er_edge={er_edge}")
+
+    # The runtime flux model is constructed before the transport equations,
+    # so historically it held independently-created copies of the density and
+    # temperature boundary models.  Their TOML values are equal, but the
+    # floating-edge root, the cached NTX response, and the FV equations must
+    # have one authoritative face-BC object.  Canonicalise the realtime
+    # neoclassical submodel to the equation-system objects before either the
+    # equations or the private edge-node cache is built.
+    def _with_transport_face_bcs(flux_model):
+        model = flux_model
+        neo = getattr(model, "neoclassical_model", None)
+        if neo is not None:
+            updated_neo = _with_transport_face_bcs(neo)
+            if updated_neo is not neo:
+                return dataclasses.replace(model, neoclassical_model=updated_neo)
+            return model
+        if hasattr(model, "bc_density") or hasattr(model, "bc_temperature"):
+            changes = {}
+            if hasattr(model, "bc_density"):
+                changes["bc_density"] = bc.get("density")
+            if hasattr(model, "bc_temperature"):
+                changes["bc_temperature"] = bc.get("temperature")
+            return dataclasses.replace(model, **changes)
+        return model
+
+    transport_flux_model = _with_transport_face_bcs(runtime.models.flux)
 
     equations_to_evolve = build_equation_system(
         config=config,
         species=runtime.species,
         field=runtime.geometry,
-        flux_model=runtime.models.flux,
+        flux_model=transport_flux_model,
         source_models=runtime.models.source,
         solver_cfg=runtime.solver_parameters,
         boundary_models=bc,
@@ -735,7 +1164,7 @@ def run_transport(config: dict, runtime: RuntimeContext, state: TransportState):
         state,
         len(equations_to_evolve),
     )
-    shared_flux_model = runtime.models.flux if len(equations_to_evolve) > 1 else None
+    shared_flux_model = transport_flux_model if len(equations_to_evolve) >= 1 else None
     temperature_active_mask = jnp.asarray(
         config.get("equations", {}).get(
             "toggle_temperature",
@@ -765,16 +1194,75 @@ def run_transport(config: dict, runtime: RuntimeContext, state: TransportState):
         temperature_active_mask=temperature_active_mask,
         fixed_temperature_profile=fixed_temperature_profile,
         er_bc_model=bc.get("Er"),
+        config=config,
+        source_models=runtime.models.source,
+        solver_cfg=solver_cfg,
+        boundary_models=bc,
+        node_boundary_initial_er=None,
+        debug_nonfinite_rhs_components=bool(solver_cfg.get("debug_nonfinite_rhs_components", False)),
     )
+    # NTSS initializes its dynamic outer Er node from the ambipolar root at
+    # that endpoint.  Do this after the composed system exists so the root
+    # search uses precisely the first-step working state and flux boundary
+    # convention.  The result remains private solver metadata, not a
+    # TransportState leaf.
+    if er_bc_mode == "floating_ambipolar_edge_node":
+        node_boundary_initial_er = _initialize_floating_er_edge_node(
+            state, runtime, config, bc, equation_system=equation_system
+        )
+        equation_system = dataclasses.replace(
+            equation_system, node_boundary_initial_er=node_boundary_initial_er
+        )
+        if bool(runtime.solver_parameters.get("debug_stage_markers", False)):
+            print(
+                "[NEOPAX] floating Er edge-node initialization: "
+                f"last_center={float(jnp.asarray(state.Er[-1])):.6e} "
+                f"face_root={float(jnp.asarray(node_boundary_initial_er)):.6e}"
+            )
     solver = build_time_solver(solver_cfg)
+    return {
+        "bc": bc,
+        "equations_to_evolve": equations_to_evolve,
+        "solver_cfg": solver_cfg,
+        "equation_system": equation_system,
+        "solver": solver,
+        "solve_state": state,
+        "solve_vector_field": equation_system.vector_field,
+    }
+
+
+def run_transport(config: dict, runtime: RuntimeContext, state: TransportState):
+    prepared = prepare_transport_solver_components(config, runtime, state)
+    bc = prepared["bc"]
+    equations_to_evolve = prepared["equations_to_evolve"]
+    solver_cfg = prepared["solver_cfg"]
+    equation_system = prepared["equation_system"]
+    solver = prepared["solver"]
     backend_name = str(solver_cfg.get("transport_solver_backend", solver_cfg.get("integrator", ""))).strip().lower()
     debug_markers = bool(solver_cfg.get("debug_stage_markers", False))
     debug_disable_jit = bool(solver_cfg.get("debug_disable_jit", False))
+    # This is deliberately a benchmark-only setting.  The first full solve
+    # includes JAX tracing/compilation; subsequent identical solves expose the
+    # steady-state wall time.  The result and output of the first solve remain
+    # authoritative.
+    forward_warm_timing_repeats = int(solver_cfg.get("forward_warm_timing_repeats", 0))
+    if forward_warm_timing_repeats < 0:
+        raise ValueError("forward_warm_timing_repeats must be non-negative.")
+    if debug_markers and _resolve_er_right_boundary_mode(config, runtime.solver_parameters) == "ambipolar_edge_root" and "Er" in bc:
+        print(f"[NEOPAX] using ambipolar edge Er BC: Er_edge={float(jnp.asarray(getattr(bc['Er'], 'right_value', 0.0))):.6e}")
     if debug_markers:
         rhs_mode = solver_cfg.get(
             "theta_rhs_mode" if backend_name in {"theta", "theta_newton"} else "radau_rhs_mode",
             solver_cfg.get("rhs_mode", "black_box"),
         ) if backend_name in {"theta", "theta_newton", "radau"} else "default"
+        rhs_mode_key = str(rhs_mode).strip().lower()
+        use_lagged_initial_rhs_debug = rhs_mode_key in {"lagged_response", "lagged_transport_response"}
+        run_initial_rhs_components = bool(
+            solver_cfg.get(
+                "debug_initial_rhs_components",
+                not use_lagged_initial_rhs_debug,
+            )
+        )
         print(
             "[NEOPAX] transport setup complete:",
             f"backend={solver_cfg.get('transport_solver_backend', solver_cfg.get('integrator'))}",
@@ -862,11 +1350,20 @@ def run_transport(config: dict, runtime: RuntimeContext, state: TransportState):
                     "[NEOPAX] temperature heat_flux_reconstruction:",
                     getattr(temperature_equation, "heat_flux_reconstruction"),
                 )
-        rhs0 = equation_system.vector_field(jnp.asarray(0.0), state, runtime.species)
         try:
             working_state_debug, _ = equation_system._prepare_working_state(state)
         except Exception:
             working_state_debug = state
+        if use_lagged_initial_rhs_debug:
+            lagged_response_debug = equation_system.build_lagged_response(state)
+            rhs0 = equation_system.evaluate_with_lagged_response(
+                jnp.asarray(0.0),
+                state,
+                runtime.species,
+                lagged_response_debug,
+            )
+        else:
+            rhs0 = equation_system.vector_field(jnp.asarray(0.0), state, runtime.species)
         density_rhs0 = getattr(rhs0, "density", None)
         if density_rhs0 is not None:
             density_rhs0_arr = jnp.asarray(density_rhs0)
@@ -878,7 +1375,7 @@ def run_transport(config: dict, runtime: RuntimeContext, state: TransportState):
                     f"min={float(jnp.min(arr)):.6e}",
                     f"max={float(jnp.max(arr)):.6e}",
                 )
-            if density_equation is not None:
+            if density_equation is not None and run_initial_rhs_components:
                 components = density_equation.debug_components(working_state_debug)
                 for label, arr in components.items():
                     arr = jnp.asarray(arr)
@@ -1034,7 +1531,7 @@ def run_transport(config: dict, runtime: RuntimeContext, state: TransportState):
                     f"min={float(jnp.min(arr)):.6e}",
                     f"max={float(jnp.max(arr)):.6e}",
                 )
-            if temperature_equation is not None:
+            if temperature_equation is not None and run_initial_rhs_components:
                 components = temperature_equation.debug_components(working_state_debug)
                 for label, arr in components.items():
                     arr = jnp.asarray(arr)
@@ -1127,7 +1624,7 @@ def run_transport(config: dict, runtime: RuntimeContext, state: TransportState):
                 f"min={float(jnp.min(er_rhs0)):.6e}",
                 f"max={float(jnp.max(er_rhs0)):.6e}",
             )
-            if er_equation is not None:
+            if er_equation is not None and run_initial_rhs_components:
                 components = er_equation.debug_components(working_state_debug)
                 for label, arr in components.items():
                     arr = jnp.asarray(arr)
@@ -1160,29 +1657,61 @@ def run_transport(config: dict, runtime: RuntimeContext, state: TransportState):
         except Exception:
             return result_obj
 
-    solve_wall_start = None
-    if debug_markers:
-        solve_wall_start = time.perf_counter()
+    def _solve_once(active_solver):
+        if debug_disable_jit:
+            with jax.disable_jit(True):
+                return active_solver.solve(solve_state, solve_vector_field, runtime.species)
+        return active_solver.solve(solve_state, solve_vector_field, runtime.species)
 
-    if debug_disable_jit:
-        import jax
-
-        if debug_markers:
-            print("[NEOPAX] debug_disable_jit=true, forcing eager execution for diagnosis")
-        with jax.disable_jit(True):
-            result = solver.solve(solve_state, solve_vector_field, runtime.species)
-    else:
-        result = solver.solve(solve_state, solve_vector_field, runtime.species)
-
-    solve_wall_mid = time.perf_counter() if debug_markers else None
-    if debug_markers:
+    record_solver_timing = debug_markers or bool(forward_warm_timing_repeats)
+    solve_wall_start = time.perf_counter() if record_solver_timing else None
+    if debug_disable_jit and debug_markers:
+        print("[NEOPAX] debug_disable_jit=true, forcing eager execution for diagnosis")
+    result = _solve_once(solver)
+    solve_wall_mid = time.perf_counter() if record_solver_timing else None
+    if record_solver_timing:
         _block_until_ready_result(result)
         solve_wall_end = time.perf_counter()
         print(
-            "[NEOPAX] solver timing:",
+            "[NEOPAX] solver timing:" if debug_markers else "[NEOPAX] forward first-call timing:",
             f"host_return_elapsed_s={solve_wall_mid - solve_wall_start:.3f}",
             f"synchronized_elapsed_s={solve_wall_end - solve_wall_start:.3f}",
             f"device_tail_s={solve_wall_end - solve_wall_mid:.3f}",
+        )
+
+    # The stage-repeat probe intentionally stops after its first rejected
+    # Newton attempt.  Do not run a warm repeat or try to make transport
+    # products from this deliberately incomplete trajectory.
+    if isinstance(result, dict) and result.get("diagnostic_stopped", False):
+        print("[NEOPAX] diagnostic probe completed; skipping warm runs and transport output")
+        return result
+
+    if forward_warm_timing_repeats:
+        # Avoid duplicating per-attempt/Newton diagnostics in the warm timing
+        # output.  The warm solve has exactly the same numerical settings and
+        # starts from the same original state; it is discarded after timing.
+        # Several solver dataclasses compute derived fields in their custom
+        # ``__init__`` (Radau's ``n_steps`` is one example).  ``replace``
+        # forwards those fields as constructor arguments and therefore fails.
+        # A shallow copy is sufficient: solver configuration is immutable and
+        # the warm pass only needs to silence diagnostic output.
+        warm_solver = copy.copy(solver)
+        solver_field_names = {field.name for field in dataclasses.fields(solver)}
+        for name in ("debug_stage_markers", "debug_walltime_attempts"):
+            if name in solver_field_names:
+                object.__setattr__(warm_solver, name, False)
+        warm_times = []
+        for _ in range(forward_warm_timing_repeats):
+            warm_start = time.perf_counter()
+            warm_result = _solve_once(warm_solver)
+            _block_until_ready_result(warm_result)
+            warm_times.append(time.perf_counter() - warm_start)
+        print(
+            "[NEOPAX] forward warm timing:",
+            f"repeats={forward_warm_timing_repeats}",
+            "execute_times_s=[" + ", ".join(f"{elapsed:.3f}" for elapsed in warm_times) + "]",
+            f"mean_execute_s={sum(warm_times) / len(warm_times):.3f}",
+            f"min_execute_s={min(warm_times):.3f}",
         )
     if debug_markers:
         ys = getattr(result, "ys", None)
@@ -1231,12 +1760,29 @@ def run_transport(config: dict, runtime: RuntimeContext, state: TransportState):
     transport_cfg = config.get("transport_output", {})
     do_plot = transport_cfg.get("transport_plot", False)
     do_hdf5 = transport_cfg.get("transport_write_hdf5", False)
+    do_bootstrap_evolution = bool(
+        transport_cfg.get("transport_bootstrap_current_evolution", False)
+    )
+    do_print_summary = bool(transport_cfg.get("transport_print_summary", False))
     do_residual_compare = transport_cfg.get("transport_compare_ambipolarity_residual", False)
     do_residual_scan = transport_cfg.get("transport_scan_ambipolarity_residual", False)
     output_dir = transport_cfg.get("transport_output_dir", None)
     plot_n_times = int(transport_cfg.get("transport_plot_n_times", 1))
     rho = runtime.geometry.rho_grid if runtime.geometry is not None and hasattr(runtime.geometry, "rho_grid") else None
-    if do_plot or do_hdf5 or do_residual_compare:
+    transport_boundary_models = {}
+    if do_plot or do_hdf5:
+        from ._boundary_conditions import build_boundary_condition_model
+
+        boundary_cfg = _normalized_boundary_cfg_for_transport(config.get("boundary", {}))
+        dr = getattr(runtime.geometry, "dr", 1.0) if runtime.geometry is not None else 1.0
+        for key in ("density", "temperature", "Er", "gamma"):
+            if key in boundary_cfg:
+                transport_boundary_models[key] = build_boundary_condition_model(
+                    boundary_cfg[key],
+                    dr,
+                    species_names=runtime.species.names if key in {"density", "temperature", "gamma"} else None,
+                )
+    if do_plot or do_hdf5 or do_bootstrap_evolution or do_residual_compare:
         if output_dir is None:
             output_dir = Path("outputs")
         elif not isinstance(output_dir, Path):
@@ -1259,6 +1805,9 @@ def run_transport(config: dict, runtime: RuntimeContext, state: TransportState):
                 species=runtime.species,
                 flux_model=runtime.models.flux,
                 geometry=runtime.geometry,
+                boundary_models=transport_boundary_models,
+                density_floor=solver_cfg.get("density_floor", 1.0e-6),
+                temperature_floor=solver_cfg.get("temperature_floor"),
             )
         if do_hdf5:
             write_transport_hdf5(
@@ -1268,7 +1817,49 @@ def run_transport(config: dict, runtime: RuntimeContext, state: TransportState):
                 geometry=runtime.geometry,
                 species=runtime.species,
                 source_models=runtime.models.source,
+                boundary_models=transport_boundary_models,
+                density_floor=solver_cfg.get("density_floor", 1.0e-6),
+                temperature_floor=solver_cfg.get("temperature_floor"),
             )
+        if do_bootstrap_evolution:
+            write_transport_bootstrap_current_evolution(
+                rho,
+                result,
+                output_dir,
+                runtime=runtime,
+            )
+        if do_print_summary:
+            if isinstance(result, dict):
+                def _scalar_value(key, default=None):
+                    import jax as _jax
+
+                    value = result.get(key, default)
+                    if value is None:
+                        return default
+                    return _jax.device_get(value)
+
+                n_steps = _scalar_value("n_steps", None)
+                done = _scalar_value("done", None)
+                failed = _scalar_value("failed", None)
+                fail_code = _scalar_value("fail_code", None)
+                final_time = _scalar_value("final_time", None)
+                print(
+                    "[NEOPAX] transport summary:",
+                    f"output_dir={output_dir}",
+                    f"n_steps={int(n_steps) if n_steps is not None else 'na'}",
+                    f"final_time={float(final_time):.6e}" if final_time is not None else "final_time=na",
+                    f"done={bool(done) if done is not None else 'na'}",
+                    f"failed={bool(failed) if failed is not None else 'na'}",
+                    f"fail_code={int(fail_code) if fail_code is not None else 'na'}",
+                    flush=True,
+                )
+            else:
+                print(
+                    "[NEOPAX] transport summary:",
+                    f"output_dir={output_dir}",
+                    "solver_result_type=non_dict",
+                    flush=True,
+                )
         if do_residual_compare:
             write_transport_ambipolarity_residual_comparison(
                 state=state,
@@ -1286,6 +1877,45 @@ def run_transport(config: dict, runtime: RuntimeContext, state: TransportState):
                 output_dir=output_dir,
             )
     return result
+
+
+def run_transport_on_time_list(
+    config: dict,
+    runtime: RuntimeContext,
+    state: TransportState,
+    time_list,
+):
+    """Run the custom Radau accepted-step map on a caller-provided absolute time list."""
+
+    from ._transport_solvers import (
+        RADAUSolver,
+        _build_prepared_radau_accepted_rollout,
+        _build_prepared_radau_execution_context,
+        _radau_run_prepared_on_time_list,
+    )
+
+    prepared = prepare_transport_solver_components(config, runtime, state)
+    solver = prepared["solver"]
+    if not isinstance(solver, RADAUSolver):
+        raise TypeError(
+            "run_transport_on_time_list currently supports only the custom RADAUSolver."
+        )
+
+    prepared_rollout = _build_prepared_radau_accepted_rollout(
+        solver=solver,
+        state=prepared["solve_state"],
+        vector_field=prepared["solve_vector_field"],
+        species=runtime.species,
+    )
+    execution_context = _build_prepared_radau_execution_context(
+        solver=solver,
+        prepared_rollout=prepared_rollout,
+    )
+    return _radau_run_prepared_on_time_list(
+        prepared_rollout,
+        execution_context,
+        time_list,
+    )
 
 
 def run_ambipolarity(config: dict, runtime: RuntimeContext, state: TransportState):
@@ -1579,6 +2209,158 @@ def calculate_sources_from_config(state, config, params, source_models=None):
     return sources, do_plot, do_hdf5, output_dir
 
 
+def _radial_axes_from_geometry(rho, geometry=None):
+    rho_center = None if rho is None else jnp.asarray(rho)
+    rho_face = None
+    if geometry is not None and hasattr(geometry, "rho_grid_half"):
+        rho_face = jnp.asarray(getattr(geometry, "rho_grid_half"))
+    return rho_center, rho_face
+
+
+def _radial_axis_for_array(arr, rho, geometry=None):
+    arr = jnp.asarray(arr)
+    rho_center, rho_face = _radial_axes_from_geometry(rho, geometry)
+    radial_n = int(arr.shape[-1]) if arr.ndim > 0 else None
+    if rho_center is not None and radial_n == int(rho_center.shape[0]):
+        return rho_center
+    if rho_face is not None and radial_n == int(rho_face.shape[0]):
+        return rho_face
+    return rho_center
+
+
+def _interpolate_reference_to_axis(values, source_axis, target_axis):
+    if values is None or source_axis is None or target_axis is None:
+        return values
+    source_axis = jnp.asarray(source_axis)
+    target_axis = jnp.asarray(target_axis)
+    values = jnp.asarray(values)
+    if values.ndim != 1 or source_axis.ndim != 1 or target_axis.ndim != 1:
+        return values
+    if values.shape[0] != source_axis.shape[0] or target_axis.shape[0] == source_axis.shape[0]:
+        return values
+    import numpy as np
+
+    return jnp.asarray(
+        np.interp(
+            np.asarray(target_axis, dtype=float),
+            np.asarray(source_axis, dtype=float),
+            np.asarray(values, dtype=float),
+        )
+    )
+
+
+def _plot_domain_limits(rho, geometry=None):
+    _rho_center, rho_face = _radial_axes_from_geometry(rho, geometry)
+    if rho_face is not None and rho_face.ndim == 1 and rho_face.shape[0] >= 2:
+        return float(rho_face[0]), float(rho_face[-1])
+    if rho is not None:
+        rho_arr = jnp.asarray(rho)
+        if rho_arr.ndim == 1 and rho_arr.shape[0] >= 1:
+            return 0.0, float(rho_arr[-1])
+    return None, None
+
+
+def _append_outer_face_point_for_plot(values, rho, geometry=None):
+    values = jnp.asarray(values)
+    rho_center, rho_face = _radial_axes_from_geometry(rho, geometry)
+    if (
+        values.ndim == 0
+        or rho_center is None
+        or rho_face is None
+        or values.shape[-1] != rho_center.shape[0]
+        or rho_face.shape[0] != rho_center.shape[0] + 1
+    ):
+        return _radial_axis_for_array(values, rho, geometry), values
+
+    if values.shape[-1] >= 2:
+        right_value = (1.5 * values[..., -1:] - 0.5 * values[..., -2:-1]).astype(values.dtype)
+    else:
+        right_value = values[..., -1:]
+    rho_plot = jnp.concatenate([rho_center, rho_face[-1:]], axis=0)
+    values_plot = jnp.concatenate([values, right_value], axis=-1)
+    return rho_plot, values_plot
+
+
+def _append_outer_face_point_for_species_plot(values, rho, geometry=None, bc_model=None, species_index=None):
+    values = jnp.asarray(values)
+    rho_center, rho_face = _radial_axes_from_geometry(rho, geometry)
+    if (
+        values.ndim != 1
+        or rho_center is None
+        or rho_face is None
+        or values.shape[0] != rho_center.shape[0]
+        or rho_face.shape[0] != rho_center.shape[0] + 1
+    ):
+        return _radial_axis_for_array(values, rho, geometry), values
+
+    left_value = None
+    right_value = None
+    if bc_model is not None:
+        if species_index is not None:
+            def _pick_species_bc(value):
+                if value is None:
+                    return None
+                arr = jnp.asarray(value)
+                if arr.ndim == 0:
+                    return arr
+                idx = min(int(species_index), int(arr.shape[0]) - 1)
+                return arr[idx]
+
+            bc_model = dataclasses.replace(
+                bc_model,
+                left_value=_pick_species_bc(getattr(bc_model, "left_value", None)),
+                right_value=_pick_species_bc(getattr(bc_model, "right_value", None)),
+                left_gradient=_pick_species_bc(getattr(bc_model, "left_gradient", None)),
+                right_gradient=_pick_species_bc(getattr(bc_model, "right_gradient", None)),
+                left_decay_length=_pick_species_bc(getattr(bc_model, "left_decay_length", None)),
+                right_decay_length=_pick_species_bc(getattr(bc_model, "right_decay_length", None)),
+            )
+        face_centers = None
+        if geometry is not None and hasattr(geometry, "r_grid_half"):
+            face_centers = getattr(geometry, "r_grid_half")
+        elif rho_face is not None:
+            face_centers = rho_face
+        lv, _ = left_constraints_from_bc_model(
+            bc_model,
+            values[0],
+            profile=values,
+            face_centers=face_centers,
+        )
+        rv, _ = right_constraints_from_bc_model(
+            bc_model,
+            values[-1],
+            profile=values,
+            face_centers=face_centers,
+        )
+        if lv is not None:
+            left_value = jnp.asarray(lv).reshape(1)
+        if rv is not None:
+            right_value = jnp.asarray(rv).reshape(1)
+    if left_value is None:
+        left_value = values[:1].astype(values.dtype)
+    if right_value is None:
+        if values.shape[0] >= 2:
+            right_value = (1.5 * values[-1:] - 0.5 * values[-2:-1]).astype(values.dtype)
+        else:
+            right_value = values[-1:]
+    rho_plot = jnp.concatenate([rho_face[:1], rho_center, rho_face[-1:]], axis=0)
+    values_plot = jnp.concatenate([left_value.astype(values.dtype), values, right_value.astype(values.dtype)], axis=0)
+    return rho_plot, values_plot
+
+
+def _boundary_model_for_plot_name(name, boundary_models):
+    if boundary_models is None:
+        return None
+    name_lower = str(name).lower()
+    if "density" in name_lower:
+        return boundary_models.get("density")
+    if "temperature" in name_lower:
+        return boundary_models.get("temperature")
+    if name_lower.startswith("er") or "electric_field" in name_lower:
+        return boundary_models.get("Er")
+    return None
+
+
 def plot_fluxes(
     rho,
     fluxes,
@@ -1587,6 +2369,7 @@ def plot_fluxes(
     overlay_reference=False,
     reference_file=None,
     reference_label="reference",
+    geometry=None,
 ):
     import matplotlib.pyplot as plt
 
@@ -1612,7 +2395,7 @@ def plot_fluxes(
         return None
 
     def _plot_flux_group(quantity_keys, ylabel, title, out_name):
-        fig, ax = plt.subplots(figsize=(9, 4))
+        fig, ax = plt.subplots(figsize=(6.8, 5.6))
         plotted = False
         plotted_reference = False
         for key in quantity_keys:
@@ -1622,33 +2405,41 @@ def plot_fluxes(
             arr = jnp.asarray(arr)
             if arr.ndim == 2:
                 for i in range(arr.shape[0]):
-                    ax.plot(rho, arr[i], label=f"{key}[{i}]")
+                    rho_axis, arr_plot = _append_outer_face_point_for_plot(arr[i], rho, geometry)
+                    if rho_axis is None:
+                        continue
+                    ax.plot(rho_axis, arr_plot, linewidth=3.0, label=f"{key}[{i}]")
                     if overlay_reference and ntss_reference:
                         ref_values = _reference_flux_profile(key, i)
                         if ref_values is not None:
+                            ref_values = _interpolate_reference_to_axis(ref_values, rho, rho_axis)
                             ax.plot(
-                                rho,
+                                rho_axis,
                                 ref_values,
                                 color="black",
-                                linewidth=2.2,
+                                linewidth=3.0,
                                 alpha=0.9,
                                 label=f"{reference_label} {key}[{_species_label(i)}]",
                             )
                             plotted_reference = True
             else:
-                ax.plot(rho, arr, label=key)
+                rho_axis, arr_plot = _append_outer_face_point_for_plot(arr, rho, geometry)
+                if rho_axis is None:
+                    continue
+                ax.plot(rho_axis, arr_plot, linewidth=3.0, label=key)
             plotted = True
         if not plotted:
             plt.close(fig)
             return None
-        ax.set_xlabel("rho")
-        ax.set_ylabel(ylabel)
+        ax.set_xlabel(r"$\rho$", fontsize=20)
+        ax.set_ylabel(ylabel, fontsize=20)
         ax.set_title(title)
-        ax.legend()
-        ax.grid(True, alpha=0.3)
+        ax.tick_params(axis="both", labelsize=16, width=1.0, length=4)
+        ax.legend(fontsize=14, frameon=True)
+        ax.grid(False)
         fig.tight_layout()
         out_png = output_dir / out_name
-        fig.savefig(out_png, dpi=170)
+        fig.savefig(out_png, dpi=320, bbox_inches="tight")
         plt.close(fig)
         return out_png
 
@@ -1670,7 +2461,7 @@ def plot_fluxes(
     }
 
 
-def plot_sources(rho, sources, output_dir):
+def plot_sources(rho, sources, output_dir, geometry=None):
     import matplotlib.pyplot as plt
 
     def _sanitize(name):
@@ -1680,17 +2471,21 @@ def plot_sources(rho, sources, output_dir):
         arr = jnp.asarray(arr)
         if arr.ndim != 2:
             return None
-        fig, ax = plt.subplots(figsize=(9, 4))
+        fig, ax = plt.subplots(figsize=(6.8, 5.6))
         for i in range(arr.shape[0]):
-            ax.plot(rho, arr[i], label=f"{prefix}[{i}]")
-        ax.set_xlabel("rho")
-        ax.set_ylabel(ylabel)
+            rho_axis, arr_plot = _append_outer_face_point_for_plot(arr[i], rho, geometry)
+            if rho_axis is None:
+                continue
+            ax.plot(rho_axis, arr_plot, linewidth=3.0, label=f"{prefix}[{i}]")
+        ax.set_xlabel(r"$\rho$", fontsize=20)
+        ax.set_ylabel(ylabel, fontsize=20)
         ax.set_title(title)
-        ax.legend()
-        ax.grid(True, alpha=0.3)
+        ax.tick_params(axis="both", labelsize=16, width=1.0, length=4)
+        ax.legend(fontsize=14, frameon=True)
+        ax.grid(False)
         fig.tight_layout()
         out_png = output_dir / out_name
-        fig.savefig(out_png, dpi=170)
+        fig.savefig(out_png, dpi=320, bbox_inches="tight")
         plt.close(fig)
         return out_png
 
@@ -1736,25 +2531,37 @@ def plot_sources(rho, sources, output_dir):
     return written
 
 
-def write_fluxes_hdf5(rho, fluxes, output_dir):
+def write_fluxes_hdf5(rho, fluxes, output_dir, geometry=None):
     import h5py
 
     out_h5 = output_dir / "fluxes.h5"
     with h5py.File(out_h5, "w") as f:
         if rho is not None:
             f.create_dataset("rho", data=jnp.asarray(rho))
+        if geometry is not None and hasattr(geometry, "rho_grid_half"):
+            f.create_dataset("rho_face", data=jnp.asarray(geometry.rho_grid_half))
+        if geometry is not None and hasattr(geometry, "r_grid"):
+            f.create_dataset("r_grid", data=jnp.asarray(geometry.r_grid))
+        if geometry is not None and hasattr(geometry, "r_grid_half"):
+            f.create_dataset("r_grid_half", data=jnp.asarray(geometry.r_grid_half))
         for key, val in fluxes.items():
             f.create_dataset(key, data=jnp.asarray(val))
     return out_h5
 
 
-def write_sources_hdf5(rho, sources, output_dir):
+def write_sources_hdf5(rho, sources, output_dir, geometry=None):
     import h5py
 
     out_h5 = output_dir / "sources.h5"
     with h5py.File(out_h5, "w") as f:
         if rho is not None:
             f.create_dataset("rho", data=jnp.asarray(rho))
+        if geometry is not None and hasattr(geometry, "rho_grid_half"):
+            f.create_dataset("rho_face", data=jnp.asarray(geometry.rho_grid_half))
+        if geometry is not None and hasattr(geometry, "r_grid"):
+            f.create_dataset("r_grid", data=jnp.asarray(geometry.r_grid))
+        if geometry is not None and hasattr(geometry, "r_grid_half"):
+            f.create_dataset("r_grid_half", data=jnp.asarray(geometry.r_grid_half))
         f.create_dataset("density_total", data=jnp.asarray(sources["density_total"]))
         f.create_dataset("pressure_total", data=jnp.asarray(sources["pressure_total"]))
 
@@ -1784,6 +2591,9 @@ def plot_transport_solution(
     species=None,
     flux_model=None,
     geometry=None,
+    boundary_models=None,
+    density_floor=1.0e-6,
+    temperature_floor=None,
 ):
     import matplotlib.pyplot as plt
     from matplotlib.lines import Line2D
@@ -1909,8 +2719,63 @@ def plot_transport_solution(
     pressure_series = _select_time_slices(getattr(ys, "pressure", None), kind="species")
     temperature_series = _select_time_slices(getattr(ys, "temperature", None), kind="species")
     er_series = _select_time_slices(getattr(ys, "Er", None), kind="scalar")
-    species_names = list(getattr(species, "names", ())) if species is not None else []
+    face_rho = getattr(geometry, "rho_grid_half", None) if geometry is not None else None
+    density_face_series = []
+    pressure_face_series = []
+    temperature_face_series = []
+    er_face_series = []
+    density_face_grad_series = []
+    temperature_face_grad_series = []
+    er_face_grad_series = []
+    if face_rho is not None and density_series and pressure_series and er_series:
+        from ._transport_flux_models import _face_profile_gradient
 
+        n_face_snapshots = min(len(density_series), len(pressure_series), len(er_series))
+        for idx in range(n_face_snapshots):
+            time_label = density_series[idx][0]
+            snapshot_state = TransportState(
+                density=jnp.asarray(density_series[idx][1]),
+                pressure=jnp.asarray(pressure_series[idx][1]),
+                Er=jnp.asarray(er_series[idx][1]),
+            )
+            face_state = build_face_transport_state(
+                snapshot_state,
+                geometry,
+                bc_density=None if boundary_models is None else boundary_models.get("density"),
+                bc_temperature=None if boundary_models is None else boundary_models.get("temperature"),
+                bc_er=None if boundary_models is None else boundary_models.get("Er"),
+                density_floor=density_floor,
+                temperature_floor=temperature_floor,
+            )
+            density_face_series.append((time_label, face_state.density))
+            pressure_face_series.append((time_label, face_state.pressure))
+            temperature_face_series.append((time_label, face_state.temperature))
+            er_face_series.append((time_label, face_state.Er))
+            density_face_grad_series.append((
+                time_label,
+                _face_profile_gradient(
+                    snapshot_state.density,
+                    geometry.r_grid_half,
+                    bc_model=None if boundary_models is None else boundary_models.get("density"),
+                ),
+            ))
+            temperature_face_grad_series.append((
+                time_label,
+                _face_profile_gradient(
+                    snapshot_state.temperature,
+                    geometry.r_grid_half,
+                    bc_model=None if boundary_models is None else boundary_models.get("temperature"),
+                ),
+            ))
+            er_face_grad_series.append((
+                time_label,
+                _face_profile_gradient(
+                    snapshot_state.Er,
+                    geometry.r_grid_half,
+                    bc_model=None if boundary_models is None else boundary_models.get("Er"),
+                ),
+            ))
+    species_names = list(getattr(species, "names", ())) if species is not None else []
     def _resolve_reference_path(path_value):
         if path_value is None:
             return None
@@ -2139,10 +3004,54 @@ def plot_transport_solution(
             return str(species_names[species_idx])
         return f"species[{species_idx}]"
 
+    _TRANSPORT_FIGSIZE = (6.8, 5.6)
+    _TRANSPORT_DPI = 320
+    _TRANSPORT_LINEWIDTH = 3.0
+    _TRANSPORT_REFERENCE_LINEWIDTH = 3.0
+
+    def _transport_ylabel(label):
+        replacements = {
+            "Density": r"$n$ [$10^{20} m^{-3}$]",
+            "Temperature": r"$T$ [$keV$]",
+            "Pressure": r"$p$ [$10^{20} m^{-3} keV$]",
+            "Er": r"$E_r$ [$\mathrm{kV}/\mathrm{m}$]",
+            "Total Power Source [MW/m^3]": r"Total Power Source [$MW/m^3$]",
+            "Alpha Particle Source [1e20 m^-3 s^-1]": r"Alpha Particle Source [$10^{20} m^{-3} s^{-1}$]",
+            "Total Heat Flux [MW]": r"Total Heat Flux [$MW$]",
+            "Neo Heat Flux [MW]": r"Neo Heat Flux [$MW$]",
+            "Turbulent Heat Flux [MW]": r"Turbulent Heat Flux [$MW$]",
+            "Ion Neo Heat Flux [MW]": r"Ion Neo Heat Flux [$MW$]",
+            "Ion Turbulent Heat Flux [MW]": r"Ion Turbulent Heat Flux [$MW$]",
+            "Neo Energy Flux Approx. [MW]": r"Neo Energy Flux Approx. [$MW$]",
+            "Turbulent Energy Flux Approx. [MW]": r"Turbulent Energy Flux Approx. [$MW$]",
+            "Alpha Power [MW/m^3]": r"Alpha Power [$MW/m^3$]",
+            "Bremsstrahlung Power [MW/m^3]": r"Bremsstrahlung Power [$MW/m^3$]",
+            "Power Exchange [MW/m^3]": r"Power Exchange [$MW/m^3$]",
+            "Heat Diffusivity chi_t [m^2/s]": r"Heat Diffusivity $\chi_t$ [$m^2/s$]",
+            "Particle Diffusivity chi_n [m^2/s]": r"Particle Diffusivity $\chi_n$ [$m^2/s$]",
+        }
+        return replacements.get(label, label)
+
+    def _style_transport_axes(ax, *, xlabel=r"$\rho$", ylabel=None, title=None):
+        ax.set_xlabel(xlabel, fontsize=20)
+        if ylabel is not None:
+            ax.set_ylabel(_transport_ylabel(ylabel), fontsize=20)
+        if title is not None:
+            ax.set_title(title)
+        ax.grid(False)
+        ax.tick_params(axis="both", labelsize=16, width=1.0, length=4)
+        for spine in ax.spines.values():
+            spine.set_linewidth(1.0)
+            spine.set_color("0.35")
+        x_min, x_max = _plot_domain_limits(rho, geometry)
+        if x_min is not None and x_max is not None:
+            ax.set_xlim(x_min, x_max)
+        ax.margins(x=0.04, y=0.08)
+
     def _plot_species_time_series(series, ylabel, out_name):
         if not series:
             return None
-        fig, ax = plt.subplots(figsize=(9, 4))
+        fig, ax = plt.subplots(figsize=_TRANSPORT_FIGSIZE)
         color_cycle = plt.rcParams["axes.prop_cycle"].by_key().get("color", [])
         if not color_cycle:
             color_cycle = [f"C{i}" for i in range(max(1, len(series)))]
@@ -2152,6 +3061,7 @@ def plot_transport_solution(
             return None
         species_count = int(first_values.shape[0])
         linestyle_cycle = ["-", "--", ":", "-."]
+        bc_plot_model = _boundary_model_for_plot_name(out_name, boundary_models)
 
         for time_idx, (time_label, values) in enumerate(series):
             values = jnp.asarray(values)
@@ -2160,7 +3070,14 @@ def plot_transport_solution(
             color = color_cycle[time_idx % len(color_cycle)]
             for species_idx in range(values.shape[0]):
                 linestyle = linestyle_cycle[species_idx % len(linestyle_cycle)]
-                ax.plot(rho, values[species_idx], color=color, linestyle=linestyle, linewidth=1.8)
+                rho_plot, values_plot = _append_outer_face_point_for_species_plot(
+                    values[species_idx],
+                    rho,
+                    geometry,
+                    bc_model=bc_plot_model,
+                    species_index=species_idx,
+                )
+                ax.plot(rho_plot, values_plot, color=color, linestyle=linestyle, linewidth=_TRANSPORT_LINEWIDTH)
         reference_kind = None
         flux_reference_key = None
         out_name_lower = out_name.lower()
@@ -2188,12 +3105,13 @@ def plot_transport_solution(
                     ref_values = reference_profiles.get(species_name)
                     if ref_values is not None:
                         linestyle = linestyle_cycle[species_idx % len(linestyle_cycle)]
+                        rho_plot, ref_plot = _append_outer_face_point_for_plot(ref_values, rho, geometry)
                         ax.plot(
-                            rho,
-                            ref_values,
+                            rho_plot,
+                            ref_plot,
                             color=ref_spec["color"],
                             linestyle=linestyle,
-                            linewidth=2.2,
+                            linewidth=_TRANSPORT_REFERENCE_LINEWIDTH,
                             alpha=0.9,
                         )
                         used = True
@@ -2211,12 +3129,13 @@ def plot_transport_solution(
                         ref_values = ref_spec["data"].get("scalar", {}).get(scalar_key)
                     if ref_values is not None:
                         linestyle = linestyle_cycle[species_idx % len(linestyle_cycle)]
+                        rho_plot, ref_plot = _append_outer_face_point_for_species_plot(ref_values, rho, geometry)
                         ax.plot(
-                            rho,
-                            ref_values,
+                            rho_plot,
+                            ref_plot,
                             color=ref_spec["color"],
                             linestyle=linestyle,
-                            linewidth=2.2,
+                            linewidth=_TRANSPORT_REFERENCE_LINEWIDTH,
                             alpha=0.9,
                         )
                         used = True
@@ -2227,13 +3146,13 @@ def plot_transport_solution(
         for time_idx, (time_label, _) in enumerate(series):
             color = color_cycle[time_idx % len(color_cycle)]
             label = f"t={time_label:.3g}" if time_label is not None else f"series {time_idx}"
-            time_handles.append(Line2D([0], [0], color=color, linestyle="-", linewidth=2.0, label=label))
+            time_handles.append(Line2D([0], [0], color=color, linestyle="-", linewidth=_TRANSPORT_LINEWIDTH, label=label))
 
         species_handles = []
         for species_idx in range(species_count):
             linestyle = linestyle_cycle[species_idx % len(linestyle_cycle)]
             species_handles.append(
-                Line2D([0], [0], color="black", linestyle=linestyle, linewidth=2.0, label=_species_label(species_idx))
+                Line2D([0], [0], color="black", linestyle=linestyle, linewidth=_TRANSPORT_LINEWIDTH, label=_species_label(species_idx))
             )
         for ref_spec in reference_labels_present:
             species_handles.append(
@@ -2242,14 +3161,12 @@ def plot_transport_solution(
                     [0],
                     color=ref_spec["color"],
                     linestyle=ref_spec["linestyle"],
-                    linewidth=2.2,
+                    linewidth=_TRANSPORT_REFERENCE_LINEWIDTH,
                     label=ref_spec["label"],
                 )
             )
 
-        ax.set_xlabel("rho")
-        ax.set_ylabel(ylabel)
-        ax.grid(True, alpha=0.3)
+        _style_transport_axes(ax, ylabel=ylabel)
 
         legend_times = ax.legend(handles=time_handles, title="Time", loc="upper left")
         ax.add_artist(legend_times)
@@ -2257,7 +3174,7 @@ def plot_transport_solution(
 
         fig.tight_layout()
         out_png = output_dir / out_name
-        fig.savefig(out_png, dpi=170)
+        fig.savefig(out_png, dpi=_TRANSPORT_DPI, bbox_inches="tight")
         plt.close(fig)
         return out_png
 
@@ -2269,12 +3186,20 @@ def plot_transport_solution(
         if not color_cycle:
             color_cycle = [f"C{i}" for i in range(max(1, len(series)))]
         species_count = int(jnp.asarray(series[0][1]).shape[0])
+        bc_plot_model = _boundary_model_for_plot_name(out_stem, boundary_models)
         for species_idx in range(species_count):
-            fig, ax = plt.subplots(figsize=(9, 4))
+            fig, ax = plt.subplots(figsize=_TRANSPORT_FIGSIZE)
             for time_idx, (time_label, values) in enumerate(series):
                 color = color_cycle[time_idx % len(color_cycle)]
                 label = f"t={time_label:.3g}" if time_label is not None else f"series {time_idx}"
-                ax.plot(rho, values[species_idx], color=color, linewidth=1.8, label=label)
+                rho_plot, values_plot = _append_outer_face_point_for_species_plot(
+                    values[species_idx],
+                    rho,
+                    geometry,
+                    bc_model=bc_plot_model,
+                    species_index=species_idx,
+                )
+                ax.plot(rho_plot, values_plot, color=color, linewidth=_TRANSPORT_LINEWIDTH, label=label)
             reference_kind = "density" if "density" in out_stem.lower() else "temperature" if "temperature" in out_stem.lower() else None
             species_name = _species_label(species_idx)
             for ref_spec in reference_profile_sets:
@@ -2308,54 +3233,152 @@ def plot_transport_solution(
                     if species_name in {"D", "T"} and ref_values is not None:
                         ref_label = f"{ref_spec['label']} ion"
                 if ref_values is not None:
+                    rho_plot, ref_plot = _append_outer_face_point_for_plot(ref_values, rho, geometry)
                     ax.plot(
-                        rho,
-                        ref_values,
+                        rho_plot,
+                        ref_plot,
                         color=ref_spec["color"],
-                        linewidth=2.2,
+                        linewidth=_TRANSPORT_REFERENCE_LINEWIDTH,
                         linestyle=ref_spec["linestyle"],
                         label=ref_label,
                     )
-            ax.set_xlabel("rho")
-            ax.set_ylabel(ylabel)
-            ax.set_title(f"{ylabel}: {_species_label(species_idx)}")
-            ax.grid(True, alpha=0.3)
+            _style_transport_axes(ax, ylabel=ylabel, title=f"{_transport_ylabel(ylabel)}: {_species_label(species_idx)}")
             ax.legend(title="Time")
             fig.tight_layout()
             out_png = output_dir / f"{out_stem}_{_species_label(species_idx)}.png"
-            fig.savefig(out_png, dpi=170)
+            fig.savefig(out_png, dpi=_TRANSPORT_DPI, bbox_inches="tight")
             plt.close(fig)
             written[_species_label(species_idx)] = out_png
         return written
 
+    def _plot_species_time_series_on_grid(series, x_grid, ylabel, out_name, *, title=None):
+        if not series or x_grid is None:
+            return None
+        fig, ax = plt.subplots(figsize=_TRANSPORT_FIGSIZE)
+        color_cycle = plt.rcParams["axes.prop_cycle"].by_key().get("color", [])
+        if not color_cycle:
+            color_cycle = [f"C{i}" for i in range(max(1, len(series)))]
+        first_values = jnp.asarray(series[0][1])
+        if first_values.ndim == 0:
+            plt.close(fig)
+            return None
+        species_count = int(first_values.shape[0])
+        linestyle_cycle = ["-", "--", ":", "-."]
+        x_arr = jnp.asarray(x_grid)
+
+        for time_idx, (time_label, values) in enumerate(series):
+            values = jnp.asarray(values)
+            if values.ndim == 0 or values.shape[-1] != x_arr.shape[0]:
+                continue
+            color = color_cycle[time_idx % len(color_cycle)]
+            for species_idx in range(values.shape[0]):
+                linestyle = linestyle_cycle[species_idx % len(linestyle_cycle)]
+                ax.plot(x_arr, values[species_idx], color=color, linestyle=linestyle, linewidth=_TRANSPORT_LINEWIDTH)
+
+        time_handles = []
+        for time_idx, (time_label, _) in enumerate(series):
+            color = color_cycle[time_idx % len(color_cycle)]
+            label = f"t={time_label:.3g}" if time_label is not None else f"series {time_idx}"
+            time_handles.append(Line2D([0], [0], color=color, linestyle="-", linewidth=_TRANSPORT_LINEWIDTH, label=label))
+
+        species_handles = []
+        for species_idx in range(species_count):
+            linestyle = linestyle_cycle[species_idx % len(linestyle_cycle)]
+            species_handles.append(
+                Line2D([0], [0], color="black", linestyle=linestyle, linewidth=_TRANSPORT_LINEWIDTH, label=_species_label(species_idx))
+            )
+
+        _style_transport_axes(ax, ylabel=ylabel, title=title)
+        legend_times = ax.legend(handles=time_handles, title="Time", loc="upper left")
+        ax.add_artist(legend_times)
+        ax.legend(handles=species_handles, title="Species", loc="upper right")
+        fig.tight_layout()
+        out_png = output_dir / out_name
+        fig.savefig(out_png, dpi=_TRANSPORT_DPI, bbox_inches="tight")
+        plt.close(fig)
+        return out_png
+
+    def _plot_individual_species_series_on_grid(series, x_grid, ylabel, out_stem):
+        if not series or x_grid is None:
+            return {}
+        written = {}
+        color_cycle = plt.rcParams["axes.prop_cycle"].by_key().get("color", [])
+        if not color_cycle:
+            color_cycle = [f"C{i}" for i in range(max(1, len(series)))]
+        first_values = jnp.asarray(series[0][1])
+        if first_values.ndim == 0:
+            return written
+        species_count = int(first_values.shape[0])
+        x_arr = jnp.asarray(x_grid)
+        for species_idx in range(species_count):
+            fig, ax = plt.subplots(figsize=_TRANSPORT_FIGSIZE)
+            for time_idx, (time_label, values) in enumerate(series):
+                values = jnp.asarray(values)
+                if values.ndim == 0 or values.shape[-1] != x_arr.shape[0]:
+                    continue
+                color = color_cycle[time_idx % len(color_cycle)]
+                label = f"t={time_label:.3g}" if time_label is not None else f"series {time_idx}"
+                ax.plot(x_arr, values[species_idx], color=color, linewidth=_TRANSPORT_LINEWIDTH, label=label)
+            _style_transport_axes(ax, ylabel=ylabel, title=f"{_transport_ylabel(ylabel)} faces: {_species_label(species_idx)}")
+            ax.legend(title="Time")
+            fig.tight_layout()
+            out_png = output_dir / f"{out_stem}_{_species_label(species_idx)}.png"
+            fig.savefig(out_png, dpi=_TRANSPORT_DPI, bbox_inches="tight")
+            plt.close(fig)
+            written[_species_label(species_idx)] = out_png
+        return written
+
+    def _plot_scalar_time_series_on_grid(series, x_grid, ylabel, out_name, *, title=None, legend_loc="best"):
+        if not series or x_grid is None:
+            return None
+        x_arr = jnp.asarray(x_grid)
+        fig, ax = plt.subplots(figsize=_TRANSPORT_FIGSIZE)
+        for time_idx, (time_label, values) in enumerate(series):
+            values = jnp.asarray(values)
+            if values.ndim == 0 or values.shape[-1] != x_arr.shape[0]:
+                continue
+            label = f"t={time_label:.3g}" if time_label is not None else f"series {time_idx}"
+            ax.plot(x_arr, values, linewidth=_TRANSPORT_LINEWIDTH, label=label)
+        _style_transport_axes(ax, ylabel=ylabel, title=title)
+        ax.legend(loc=legend_loc, fontsize=15, frameon=True)
+        fig.tight_layout()
+        out_png = output_dir / out_name
+        fig.savefig(out_png, dpi=_TRANSPORT_DPI, bbox_inches="tight")
+        plt.close(fig)
+        return out_png
+
     def _plot_scalar_time_series(series, ylabel, out_name, title=None, reference_key=None, reference_label="NTSS reference"):
         if not series:
             return None
-        fig, ax = plt.subplots(figsize=(9, 4))
+        fig, ax = plt.subplots(figsize=_TRANSPORT_FIGSIZE)
+        bc_plot_model = _boundary_model_for_plot_name(out_name, boundary_models)
         for time_idx, (time_label, values) in enumerate(series):
             label = f"t={time_label:.3g}" if time_label is not None else f"series {time_idx}"
-            ax.plot(rho, values, linewidth=1.8, label=label)
+            rho_plot, values_plot = _append_outer_face_point_for_species_plot(
+                values,
+                rho,
+                geometry,
+                bc_model=bc_plot_model,
+            )
+            ax.plot(rho_plot, values_plot, linewidth=_TRANSPORT_LINEWIDTH, label=label)
         if reference_key is not None:
             for ref_spec in reference_profile_sets:
                 ref_values = ref_spec["data"].get("scalar", {}).get(reference_key)
                 if ref_values is not None:
+                    rho_plot, ref_plot = _append_outer_face_point_for_plot(ref_values, rho, geometry)
                     ax.plot(
-                        rho,
-                        ref_values,
+                        rho_plot,
+                        ref_plot,
                         color=ref_spec["color"],
-                        linewidth=2.2,
+                        linewidth=_TRANSPORT_REFERENCE_LINEWIDTH,
                         linestyle=ref_spec["linestyle"],
                         label=ref_spec["label"] if reference_label == "NTSS reference" else f"{ref_spec['label']} {reference_label}",
                     )
-        ax.set_xlabel("rho")
-        ax.set_ylabel(ylabel)
-        if title is not None:
-            ax.set_title(title)
-        ax.grid(True, alpha=0.3)
+        _style_transport_axes(ax, ylabel=ylabel, title=title)
         ax.legend(title="Time")
         fig.tight_layout()
         out_png = output_dir / out_name
-        fig.savefig(out_png, dpi=170)
+        fig.savefig(out_png, dpi=_TRANSPORT_DPI, bbox_inches="tight")
         plt.close(fig)
         return out_png
 
@@ -2375,13 +3398,15 @@ def plot_transport_solution(
     ):
         if not series_left and not series_right:
             return None
-        fig, ax = plt.subplots(figsize=(9, 4))
+        fig, ax = plt.subplots(figsize=_TRANSPORT_FIGSIZE)
         for time_idx, (time_label, values) in enumerate(series_left):
             label = f"{left_label} t={time_label:.3g}" if time_label is not None else left_label
-            ax.plot(rho, values, linewidth=1.8, label=label)
+            rho_plot, values_plot = _append_outer_face_point_for_plot(values, rho, geometry)
+            ax.plot(rho_plot, values_plot, linewidth=_TRANSPORT_LINEWIDTH, label=label)
         for time_idx, (time_label, values) in enumerate(series_right):
             label = f"{right_label} t={time_label:.3g}" if time_label is not None else right_label
-            ax.plot(rho, values, linewidth=1.8, linestyle="--", label=label)
+            rho_plot, values_plot = _append_outer_face_point_for_plot(values, rho, geometry)
+            ax.plot(rho_plot, values_plot, linewidth=_TRANSPORT_LINEWIDTH, linestyle="--", label=label)
         for ref_spec in reference_profile_sets:
             if reference_left_values is not None:
                 ref_values = reference_left_values
@@ -2392,11 +3417,12 @@ def plot_transport_solution(
             else:
                 ref_values = None
             if ref_values is not None:
+                rho_plot, ref_plot = _append_outer_face_point_for_plot(ref_values, rho, geometry)
                 ax.plot(
-                    rho,
-                    ref_values,
+                    rho_plot,
+                    ref_plot,
                     color=ref_spec["color"],
-                    linewidth=2.2,
+                    linewidth=_TRANSPORT_REFERENCE_LINEWIDTH,
                     linestyle=ref_spec["linestyle"],
                     label=f"{ref_spec['label']} {left_label}",
                 )
@@ -2407,40 +3433,33 @@ def plot_transport_solution(
             else:
                 ref_values = None
             if ref_values is not None:
+                rho_plot, ref_plot = _append_outer_face_point_for_plot(ref_values, rho, geometry)
                 ax.plot(
-                    rho,
-                    ref_values,
+                    rho_plot,
+                    ref_plot,
                     color=ref_spec["color"],
-                    linewidth=2.2,
+                    linewidth=_TRANSPORT_REFERENCE_LINEWIDTH,
                     linestyle=ref_spec["linestyle"],
                     alpha=0.75,
                     label=f"{ref_spec['label']} {right_label}",
                 )
-        ax.set_xlabel("rho")
-        ax.set_ylabel(ylabel)
-        if title is not None:
-            ax.set_title(title)
-        ax.grid(True, alpha=0.3)
+        _style_transport_axes(ax, ylabel=ylabel, title=title)
         ax.legend(title="Series")
         fig.tight_layout()
         out_png = output_dir / out_name
-        fig.savefig(out_png, dpi=170)
+        fig.savefig(out_png, dpi=_TRANSPORT_DPI, bbox_inches="tight")
         plt.close(fig)
         return out_png
 
     def _plot_geometry_profile(x, values, xlabel, ylabel, out_name, title=None):
         if x is None or values is None:
             return None
-        fig, ax = plt.subplots(figsize=(9, 4))
-        ax.plot(jnp.asarray(x), jnp.asarray(values), linewidth=2.0)
-        ax.set_xlabel(xlabel)
-        ax.set_ylabel(ylabel)
-        if title is not None:
-            ax.set_title(title)
-        ax.grid(True, alpha=0.3)
+        fig, ax = plt.subplots(figsize=_TRANSPORT_FIGSIZE)
+        ax.plot(jnp.asarray(x), jnp.asarray(values), linewidth=_TRANSPORT_LINEWIDTH)
+        _style_transport_axes(ax, xlabel=xlabel, ylabel=ylabel, title=title)
         fig.tight_layout()
         out_png = output_dir / out_name
-        fig.savefig(out_png, dpi=170)
+        fig.savefig(out_png, dpi=_TRANSPORT_DPI, bbox_inches="tight")
         plt.close(fig)
         return out_png
 
@@ -2452,11 +3471,113 @@ def plot_transport_solution(
         _plot_species_time_series(temperature_series, "Temperature", "transport_temperature.png")
         _plot_individual_species_series(temperature_series, "Temperature", "transport_temperature")
 
+    density_faces_png = None
+    pressure_faces_png = None
+    temperature_faces_png = None
+    er_faces_png = None
+    density_face_grad_png = None
+    temperature_face_grad_png = None
+    er_face_grad_png = None
+    density_faces_species_pngs = {}
+    pressure_faces_species_pngs = {}
+    temperature_faces_species_pngs = {}
+    density_face_grad_species_pngs = {}
+    temperature_face_grad_species_pngs = {}
+    if density_face_series:
+        density_faces_png = _plot_species_time_series_on_grid(
+            density_face_series,
+            face_rho,
+            "Density",
+            "transport_density_faces.png",
+            title="Density on Faces",
+        )
+        density_faces_species_pngs = _plot_individual_species_series_on_grid(
+            density_face_series,
+            face_rho,
+            "Density",
+            "transport_density_faces",
+        )
+    if pressure_face_series:
+        pressure_faces_png = _plot_species_time_series_on_grid(
+            pressure_face_series,
+            face_rho,
+            "Pressure",
+            "transport_pressure_faces.png",
+            title="Pressure on Faces",
+        )
+        pressure_faces_species_pngs = _plot_individual_species_series_on_grid(
+            pressure_face_series,
+            face_rho,
+            "Pressure",
+            "transport_pressure_faces",
+        )
+    if temperature_face_series:
+        temperature_faces_png = _plot_species_time_series_on_grid(
+            temperature_face_series,
+            face_rho,
+            "Temperature",
+            "transport_temperature_faces.png",
+            title="Temperature on Faces",
+        )
+        temperature_faces_species_pngs = _plot_individual_species_series_on_grid(
+            temperature_face_series,
+            face_rho,
+            "Temperature",
+            "transport_temperature_faces",
+        )
+    if er_face_series:
+        er_faces_png = _plot_scalar_time_series_on_grid(
+            er_face_series,
+            face_rho,
+            "Er",
+            "transport_Er_faces.png",
+            title=r"$E_r$ on Faces",
+            legend_loc="lower left",
+        )
+    if density_face_grad_series:
+        density_face_grad_png = _plot_species_time_series_on_grid(
+            density_face_grad_series,
+            face_rho,
+            "Density Gradient",
+            "transport_density_face_gradients.png",
+            title="Density Gradient on Faces",
+        )
+        density_face_grad_species_pngs = _plot_individual_species_series_on_grid(
+            density_face_grad_series,
+            face_rho,
+            "Density Gradient",
+            "transport_density_face_gradients",
+        )
+    if temperature_face_grad_series:
+        temperature_face_grad_png = _plot_species_time_series_on_grid(
+            temperature_face_grad_series,
+            face_rho,
+            "Temperature Gradient",
+            "transport_temperature_face_gradients.png",
+            title="Temperature Gradient on Faces",
+        )
+        temperature_face_grad_species_pngs = _plot_individual_species_series_on_grid(
+            temperature_face_grad_series,
+            face_rho,
+            "Temperature Gradient",
+            "transport_temperature_face_gradients",
+        )
+    if er_face_grad_series:
+        er_face_grad_png = _plot_scalar_time_series_on_grid(
+            er_face_grad_series,
+            face_rho,
+            "Er Gradient",
+            "transport_Er_face_gradients.png",
+            title=r"$\partial E_r / \partial r$ on Faces",
+            legend_loc="lower left",
+        )
+
     power_source_series = []
     he_source_series = []
     alpha_power_series = []
     pbrems_series = []
     power_exchange_series = []
+    power_exchange_species_series = []
     total_heat_flux_series = []
     neo_heat_flux_series = []
     turb_heat_flux_series = []
@@ -2517,11 +3638,20 @@ def plot_transport_solution(
                     he_source_series.append((time_label, he_arr))
 
             pressure_components = sources.get("pressure_components", {})
-            power_exchange_component = pressure_components.get("power_exchange")
-            if power_exchange_component is not None:
-                power_exchange_arr = jnp.asarray(power_exchange_component)
+            power_exchange_components = [
+                pressure_components.get("power_exchange"),
+                pressure_components.get("power_exchange_temperature_equilibration"),
+            ]
+            power_exchange_arrays = [
+                jnp.asarray(component) for component in power_exchange_components if component is not None
+            ]
+            if power_exchange_arrays:
+                power_exchange_arr = sum(power_exchange_arrays[1:], power_exchange_arrays[0])
                 power_exchange_series.append(
                     (time_label, PRESSURE_SOURCE_STATE_TO_MW_M3 * jnp.sum(power_exchange_arr, axis=0))
+                )
+                power_exchange_species_series.append(
+                    (time_label, PRESSURE_SOURCE_STATE_TO_MW_M3 * power_exchange_arr)
                 )
             alpha_component = pressure_components.get("alpha_power")
             if alpha_component is not None:
@@ -2752,6 +3882,16 @@ def plot_transport_solution(
         "transport_pressure_source_power_exchange.png",
         title="Power Exchange vs rho",
     )
+    power_exchange_species_png = _plot_species_time_series(
+        power_exchange_species_series,
+        "Power Exchange [MW/m^3]",
+        "transport_pressure_source_power_exchange_species.png",
+    )
+    power_exchange_species_pngs = _plot_individual_species_series(
+        power_exchange_species_series,
+        "Power Exchange [MW/m^3]",
+        "transport_pressure_source_power_exchange",
+    )
 
     vprime_png = _plot_geometry_profile(
         getattr(geometry, "r_grid", None) if geometry is not None else None,
@@ -2801,12 +3941,12 @@ def plot_transport_solution(
             flux_plot_paths[f"{key}_{species_name}"] = path
 
     if er_series:
-        fig, ax = plt.subplots(figsize=(9, 4))
+        fig, ax = plt.subplots(figsize=_TRANSPORT_FIGSIZE)
         for time_label, er in er_series:
             label = "Er"
             if time_label is not None:
                 label += f" t={time_label:.3g}"
-            ax.plot(rho, er, label=label)
+            ax.plot(rho, er, linewidth=_TRANSPORT_LINEWIDTH, label=label)
         if overlay_reference_er and rho is not None:
             try:
                 plotted_reference = False
@@ -2818,7 +3958,7 @@ def plot_transport_solution(
                         rho,
                         er_ref,
                         color=ref_spec["color"],
-                        linewidth=2.2,
+                        linewidth=_TRANSPORT_REFERENCE_LINEWIDTH,
                         linestyle=ref_spec["linestyle"],
                         label=ref_spec["label"],
                     )
@@ -2827,18 +3967,28 @@ def plot_transport_solution(
                     print("[NEOPAX] transport Er overlay requested, but no usable reference Er profiles were loaded.")
             except Exception as e:
                 print(f"Could not plot transport reference Er: {e}")
-        ax.set_xlabel("rho")
-        ax.set_ylabel("Er")
-        ax.legend()
-        ax.grid(True, alpha=0.3)
+        _style_transport_axes(ax, ylabel="Er")
+        ax.legend(loc="upper right", fontsize=15, frameon=True)
         fig.tight_layout()
-        fig.savefig(output_dir / "transport_Er.png", dpi=170)
+        fig.savefig(output_dir / "transport_Er.png", dpi=_TRANSPORT_DPI, bbox_inches="tight")
         plt.close(fig)
 
     return {
         "density": output_dir / "transport_density.png" if density_series else None,
         "temperature": output_dir / "transport_temperature.png" if temperature_series else None,
         "Er": output_dir / "transport_Er.png" if er_series else None,
+        "density_faces": density_faces_png,
+        "pressure_faces": pressure_faces_png,
+        "temperature_faces": temperature_faces_png,
+        "Er_faces": er_faces_png,
+        "density_face_gradients": density_face_grad_png,
+        "temperature_face_gradients": temperature_face_grad_png,
+        "Er_face_gradients": er_face_grad_png,
+        "density_faces_species": density_faces_species_pngs,
+        "pressure_faces_species": pressure_faces_species_pngs,
+        "temperature_faces_species": temperature_faces_species_pngs,
+        "density_face_gradient_species": density_face_grad_species_pngs,
+        "temperature_face_gradient_species": temperature_face_grad_species_pngs,
         "Vprime": vprime_png,
         "Vprime_half": vprime_half_png,
         "power_sources_total": power_sources_png,
@@ -2849,12 +3999,214 @@ def plot_transport_solution(
         "alpha_power": alpha_power_png,
         "bremsstrahlung_power": pbrems_png,
         "power_exchange": power_exchange_png,
+        "power_exchange_species": power_exchange_species_png,
+        "power_exchange_species_individual": power_exchange_species_pngs,
         **flux_plot_paths,
     }
 
 
-def write_transport_hdf5(rho, solution, output_dir, geometry=None, species=None, source_models=None):
+def write_transport_bootstrap_current_evolution(
+    rho,
+    solution,
+    output_dir,
+    *,
+    runtime,
+):
+    """Write bootstrap-current profiles at the saved transport times.
+
+    This post-processes the trajectory already produced by the transport
+    solver. It does not perform a second rollout. The current uses the same
+    momentum-corrected ``Upar_neo`` definition and scaled units as the database
+    bootstrap optimization objective.
+    """
+
+    import csv
+    import numpy as np
+
+    from ._constants import elementary_charge
+    from ._transport_flux_models import DENSITY_STATE_TO_PHYSICAL
+
+    ys = getattr(solution, "ys", None)
+    if ys is None and isinstance(solution, dict):
+        ys = solution.get("ys")
+    ts = getattr(solution, "ts", None)
+    if ts is None and isinstance(solution, dict):
+        ts = solution.get("ts")
+    accepted_mask = getattr(solution, "accepted_mask", None)
+    if accepted_mask is None and isinstance(solution, dict):
+        accepted_mask = solution.get("accepted_mask")
+    if ys is None or ts is None:
+        raise ValueError(
+            "Bootstrap-current evolution requires saved transport states and times."
+        )
+
+    ts_np = np.asarray(jax.device_get(ts), dtype=float).reshape(-1)
+    valid = np.isfinite(ts_np)
+    if accepted_mask is not None:
+        accepted_np = np.asarray(jax.device_get(accepted_mask), dtype=bool).reshape(-1)
+        if accepted_np.shape == valid.shape:
+            valid &= accepted_np
+    valid_indices = np.flatnonzero(valid)
+    if valid_indices.size == 0:
+        raise ValueError("Transport result contains no valid saved states.")
+
+    # Dense saved times are unique. This also protects legacy accepted-step
+    # output from generating duplicate curves and duplicate legend entries.
+    _, unique_positions = np.unique(ts_np[valid_indices], return_index=True)
+    valid_indices = valid_indices[np.sort(unique_positions)]
+
+    flux_model = runtime.models.flux
+    neoclassical_model = getattr(flux_model, "neoclassical_model", flux_model)
+    model_database = getattr(neoclassical_model, "database", None)
+    if runtime.database is None and model_database is None:
+        raise ValueError(
+            "Bootstrap-current evolution currently requires a database transport model."
+        )
+    corrected_fluxes_fn = getattr(
+        neoclassical_model, "evaluate_momentum_corrected_fluxes", None
+    )
+    if corrected_fluxes_fn is None:
+        raise ValueError(
+            "Bootstrap-current evolution requires "
+            "evaluate_momentum_corrected_fluxes on the database flux model."
+        )
+
+    charge_qp = jnp.asarray(runtime.species.charge_qp)
+    current_weights = jnp.sign(charge_qp)
+    scale = elementary_charge * 1.0e-5
+    profiles = []
+    times = []
+    for index in valid_indices:
+        state = TransportState(
+            density=jnp.asarray(ys.density)[int(index)],
+            pressure=jnp.asarray(ys.pressure)[int(index)],
+            Er=jnp.asarray(ys.Er)[int(index)],
+        )
+        fluxes = corrected_fluxes_fn(state)
+        if hasattr(fluxes, "get"):
+            upar = fluxes.get("Upar_neo", fluxes.get("Upar", None))
+        else:
+            upar = getattr(fluxes, "Upar_neo", getattr(fluxes, "Upar", None))
+        if upar is None:
+            raise ValueError(
+                "Momentum-corrected database fluxes did not provide Upar_neo or Upar."
+            )
+        upar_arr = jnp.asarray(upar, dtype=jnp.asarray(state.pressure).dtype)
+        weights = jnp.asarray(current_weights, dtype=upar_arr.dtype)
+        upar_physical = (
+            jnp.asarray(DENSITY_STATE_TO_PHYSICAL, dtype=upar_arr.dtype) * upar_arr
+        )
+        if int(upar_arr.shape[0]) == int(weights.shape[0]):
+            current = jnp.sum(upar_physical * weights[:, None], axis=0) * scale
+        else:
+            current = jnp.sum(upar_physical * weights[None, :], axis=1) * scale
+        profiles.append(np.asarray(jax.device_get(current), dtype=float))
+        times.append(float(ts_np[int(index)]))
+
+    rho_np = np.asarray(jax.device_get(rho), dtype=float).reshape(-1)
+    profiles_np = np.stack(profiles, axis=0)
+    if profiles_np.shape[1] != rho_np.size:
+        raise ValueError(
+            "Bootstrap-current radial size does not match the transport rho grid: "
+            f"{profiles_np.shape[1]} != {rho_np.size}."
+        )
+
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    csv_path = output_dir / "bootstrap_current_evolution.csv"
+    with csv_path.open("w", newline="", encoding="utf-8") as stream:
+        writer = csv.writer(stream)
+        writer.writerow(
+            ["time_s", "rho", "Jboot_scaled_1e5_A_m2", "Jboot_kA_m2"]
+        )
+        for time_value, profile in zip(times, profiles_np, strict=True):
+            for rho_value, current_value in zip(rho_np, profile, strict=True):
+                writer.writerow(
+                    [
+                        f"{time_value:.17e}",
+                        f"{rho_value:.17e}",
+                        f"{current_value:.17e}",
+                        f"{100.0 * current_value:.17e}",
+                    ]
+                )
+    print(f"wrote {csv_path}")
+
+    try:
+        import matplotlib.pyplot as plt
+    except Exception as exc:
+        print(f"skipping bootstrap-current evolution plot: {exc}")
+        return {"times": np.asarray(times), "profiles": profiles_np, "csv": csv_path}
+
+    transport_figsize = (6.8, 5.6)
+    transport_linewidth = 3.0
+    transport_dpi = 320
+    color_cycle = plt.rcParams["axes.prop_cycle"].by_key().get("color", [])
+    if not color_cycle:
+        color_cycle = [f"C{i}" for i in range(max(1, len(times)))]
+
+    fig, ax = plt.subplots(figsize=transport_figsize)
+    for time_index, (time_value, profile) in enumerate(
+        zip(times, profiles_np, strict=True)
+    ):
+        ax.plot(
+            rho_np,
+            100.0 * profile,
+            color=color_cycle[time_index % len(color_cycle)],
+            linewidth=transport_linewidth,
+            label=f"t={time_value:.3g}",
+        )
+    ax.axhline(
+        10.0,
+        color="black",
+        linewidth=transport_linewidth,
+        linestyle="-",
+        label=r"$+10\;\mathrm{kA\,m^{-2}}$",
+    )
+    ax.axhline(
+        -10.0,
+        color="black",
+        linewidth=transport_linewidth,
+        linestyle="-",
+        label=r"$-10\;\mathrm{kA\,m^{-2}}$",
+    )
+    ax.set_xlabel(r"$\rho$", fontsize=20)
+    ax.set_ylabel(r"$J^{\mathrm{bootstrap}}\;[\mathrm{kA\,m^{-2}}]$", fontsize=20)
+    ax.set_title("Bootstrap current evolution")
+    ax.grid(False)
+    ax.tick_params(axis="both", labelsize=16, width=1.0, length=4)
+    for spine in ax.spines.values():
+        spine.set_linewidth(1.0)
+        spine.set_color("0.35")
+    if rho_np.size:
+        ax.set_xlim(float(np.min(rho_np)), float(np.max(rho_np)))
+    ax.margins(x=0.04, y=0.08)
+    ax.legend(title="Time", loc="best", fontsize=15, frameon=True, ncol=2)
+    fig.tight_layout()
+    png_path = output_dir / "bootstrap_current_evolution.png"
+    fig.savefig(png_path, dpi=transport_dpi, bbox_inches="tight")
+    plt.close(fig)
+    print(f"wrote {png_path}")
+    return {
+        "times": np.asarray(times),
+        "profiles": profiles_np,
+        "csv": csv_path,
+        "plot": png_path,
+    }
+
+
+def write_transport_hdf5(
+    rho,
+    solution,
+    output_dir,
+    geometry=None,
+    species=None,
+    source_models=None,
+    boundary_models=None,
+    density_floor=1.0e-6,
+    temperature_floor=None,
+):
     import h5py
+    from ._transport_flux_models import _face_profile_gradient, build_face_transport_state
 
     ys = getattr(solution, "ys", None)
     if ys is None:
@@ -2866,14 +4218,101 @@ def write_transport_hdf5(rho, solution, output_dir, geometry=None, species=None,
     if dts is None:
         dts = solution.get("dts") if isinstance(solution, dict) else None
 
+    def _solution_value(name):
+        value = getattr(solution, name, None)
+        if value is None and isinstance(solution, dict):
+            value = solution.get(name)
+        return value
+
+    def _face_states_from_saved(density, pressure, er):
+        if density is None or pressure is None or er is None or geometry is None:
+            return None
+        density_arr = jnp.asarray(density)
+        pressure_arr = jnp.asarray(pressure)
+        er_arr = jnp.asarray(er)
+
+        def _build_one(dens, pres, er_prof):
+            return build_face_transport_state(
+                TransportState(
+                    density=jnp.asarray(dens),
+                    pressure=jnp.asarray(pres),
+                    Er=jnp.asarray(er_prof),
+                ),
+                geometry,
+                bc_density=None if boundary_models is None else boundary_models.get("density"),
+                bc_temperature=None if boundary_models is None else boundary_models.get("temperature"),
+                bc_er=None if boundary_models is None else boundary_models.get("Er"),
+                density_floor=density_floor,
+                temperature_floor=temperature_floor,
+            )
+
+        if density_arr.ndim == 2:
+            return _build_one(density_arr, pressure_arr, er_arr)
+        return jax.vmap(_build_one)(density_arr, pressure_arr, er_arr)
+
+    def _face_gradients_from_saved(density, temperature, er):
+        if density is None or temperature is None or er is None or geometry is None:
+            return None
+        density_arr = jnp.asarray(density)
+        temperature_arr = jnp.asarray(temperature)
+        er_arr = jnp.asarray(er)
+
+        def _build_one(dens, temp, er_prof):
+            return {
+                "density": _face_profile_gradient(
+                    jnp.asarray(dens),
+                    geometry.r_grid_half,
+                    bc_model=None if boundary_models is None else boundary_models.get("density"),
+                ),
+                "temperature": _face_profile_gradient(
+                    jnp.asarray(temp),
+                    geometry.r_grid_half,
+                    bc_model=None if boundary_models is None else boundary_models.get("temperature"),
+                ),
+                "Er": _face_profile_gradient(
+                    jnp.asarray(er_prof),
+                    geometry.r_grid_half,
+                    bc_model=None if boundary_models is None else boundary_models.get("Er"),
+                ),
+            }
+
+        if density_arr.ndim == 2:
+            return _build_one(density_arr, temperature_arr, er_arr)
+        return jax.vmap(_build_one)(density_arr, temperature_arr, er_arr)
+
     out_h5 = output_dir / "transport_solution.h5"
     with h5py.File(out_h5, "w") as f:
         if rho is not None:
             f.create_dataset("rho", data=jnp.asarray(rho))
+        if geometry is not None:
+            r_grid = getattr(geometry, "r_grid", None)
+            r_grid_half = getattr(geometry, "r_grid_half", None)
+            vprime = getattr(geometry, "Vprime", None)
+            vprime_half = getattr(geometry, "Vprime_half", None)
+            if r_grid is not None:
+                f.create_dataset("r_grid", data=jnp.asarray(r_grid))
+            if r_grid_half is not None:
+                f.create_dataset("r_grid_half", data=jnp.asarray(r_grid_half))
+            if vprime is not None:
+                f.create_dataset("Vprime", data=jnp.asarray(vprime))
+            if vprime_half is not None:
+                f.create_dataset("Vprime_half", data=jnp.asarray(vprime_half))
+            if hasattr(geometry, "rho_grid_half"):
+                f.create_dataset("rho_face", data=jnp.asarray(geometry.rho_grid_half))
         if ts is not None:
             f.create_dataset("ts", data=jnp.asarray(ts))
         if dts is not None:
             f.create_dataset("dts", data=jnp.asarray(dts))
+        final_time = _solution_value("final_time")
+        if final_time is not None:
+            final_time_arr = jnp.asarray(final_time)
+            f.create_dataset("final_time", data=final_time_arr)
+            f.create_dataset("t_final", data=final_time_arr)
+        next_dt = _solution_value("next_dt")
+        if next_dt is not None:
+            next_dt_arr = jnp.asarray(next_dt)
+            f.create_dataset("next_dt", data=next_dt_arr)
+            f.create_dataset("dt_next", data=next_dt_arr)
         if ys is not None:
             density = getattr(ys, "density", None)
             pressure = getattr(ys, "pressure", None)
@@ -2887,6 +4326,17 @@ def write_transport_hdf5(rho, solution, output_dir, geometry=None, species=None,
                 f.create_dataset("temperature", data=jnp.asarray(temperature))
             if er is not None:
                 f.create_dataset("Er", data=jnp.asarray(er))
+            face_state = _face_states_from_saved(density, pressure, er)
+            if face_state is not None:
+                f.create_dataset("density_faces", data=jnp.asarray(face_state.density))
+                f.create_dataset("pressure_faces", data=jnp.asarray(face_state.pressure))
+                f.create_dataset("temperature_faces", data=jnp.asarray(face_state.temperature))
+                f.create_dataset("Er_faces", data=jnp.asarray(face_state.Er))
+            face_gradients = _face_gradients_from_saved(density, temperature, er)
+            if face_gradients is not None:
+                f.create_dataset("density_grad_faces", data=jnp.asarray(face_gradients["density"]))
+                f.create_dataset("temperature_grad_faces", data=jnp.asarray(face_gradients["temperature"]))
+                f.create_dataset("Er_grad_faces", data=jnp.asarray(face_gradients["Er"]))
             if (
                 density is not None
                 and pressure is not None
@@ -2909,6 +4359,45 @@ def write_transport_hdf5(rho, solution, output_dir, geometry=None, species=None,
                     )
                 )(jnp.asarray(density), jnp.asarray(pressure), jnp.asarray(er))
                 f.create_dataset("P_total_mw", data=jnp.asarray(power_total))
+                alpha_profiles = []
+                alpha_volume_averages = []
+                for dens, pres, er_prof in zip(jnp.asarray(density), jnp.asarray(pressure), jnp.asarray(er)):
+                    snapshot_state = TransportState(
+                        density=jnp.asarray(dens),
+                        pressure=jnp.asarray(pres),
+                        Er=jnp.asarray(er_prof),
+                    )
+                    sources, _, _, _ = calculate_sources_from_config(
+                        snapshot_state,
+                        {},
+                        {"species": species},
+                        source_models=source_models,
+                    )
+                    alpha_component = sources.get("pressure_components", {}).get("alpha_power")
+                    if alpha_component is None and isinstance(sources.get("pressure_raw"), dict):
+                        alpha_component = sources["pressure_raw"].get("AlphaPower")
+                    if alpha_component is None:
+                        continue
+                    alpha_arr = PRESSURE_SOURCE_STATE_TO_MW_M3 * jnp.asarray(alpha_component)
+                    alpha_profile = jnp.sum(alpha_arr, axis=0) if alpha_arr.ndim == 2 else alpha_arr
+                    alpha_profiles.append(alpha_profile)
+                    if getattr(geometry, "Vprime", None) is not None and getattr(geometry, "r_grid", None) is not None:
+                        volume = jnp.trapezoid(jnp.asarray(geometry.Vprime), x=jnp.asarray(geometry.r_grid))
+                        integral = jnp.trapezoid(alpha_profile * jnp.asarray(geometry.Vprime), x=jnp.asarray(geometry.r_grid))
+                    else:
+                        rho_arr = jnp.asarray(rho, dtype=alpha_profile.dtype)
+                        weights = jnp.maximum(rho_arr, jnp.asarray(0.0, dtype=alpha_profile.dtype))
+                        volume = jnp.trapezoid(weights, x=rho_arr)
+                        integral = jnp.trapezoid(alpha_profile * weights, x=rho_arr)
+                    alpha_volume_averages.append(
+                        integral / jnp.maximum(volume, jnp.asarray(1.0e-30, dtype=integral.dtype))
+                    )
+                if alpha_profiles:
+                    f.create_dataset("alpha_power_mw_m3", data=jnp.stack(alpha_profiles))
+                    f.create_dataset(
+                        "alpha_power_volume_average_mw_m3",
+                        data=jnp.asarray(alpha_volume_averages),
+                    )
     return out_h5
 
 
@@ -2964,15 +4453,16 @@ def write_transport_ambipolarity_residual_comparison(state, runtime, transport_e
         f.create_dataset("ambipolar_charge_flux_local", data=jnp.asarray(local_charge_flux))
 
     if rho is not None:
-        fig, ax = plt.subplots(figsize=(9, 4))
-        ax.plot(rho, transport_charge_flux, label="transport charge flux")
-        ax.plot(rho, local_charge_flux, label="ambipolar local charge flux", linestyle="--")
-        ax.set_xlabel("rho")
-        ax.set_ylabel("charge-weighted flux")
-        ax.grid(True, alpha=0.3)
-        ax.legend()
+        fig, ax = plt.subplots(figsize=(6.8, 5.6))
+        ax.plot(rho, transport_charge_flux, linewidth=3.0, label="transport charge flux")
+        ax.plot(rho, local_charge_flux, linewidth=3.0, label="ambipolar local charge flux", linestyle="--")
+        ax.set_xlabel(r"$\rho$", fontsize=20)
+        ax.set_ylabel("charge-weighted flux", fontsize=20)
+        ax.grid(False)
+        ax.tick_params(axis="both", labelsize=16, width=1.0, length=4)
+        ax.legend(fontsize=14, frameon=True)
         fig.tight_layout()
-        fig.savefig(output_dir / "transport_ambipolarity_residual_compare.png", dpi=170)
+        fig.savefig(output_dir / "transport_ambipolarity_residual_compare.png", dpi=320, bbox_inches="tight")
         plt.close(fig)
 
     return out_h5
@@ -3013,7 +4503,7 @@ def write_transport_ambipolarity_residual_scan(state, runtime, transport_equatio
         resolved_radii = [0, n_radial - 1]
 
     out_h5 = output_dir / "transport_ambipolarity_residual_scan.h5"
-    fig, axes = plt.subplots(len(resolved_radii), 1, figsize=(9, 4 * len(resolved_radii)), sharex=True)
+    fig, axes = plt.subplots(len(resolved_radii), 1, figsize=(6.8, 5.6 * len(resolved_radii)), sharex=True)
     if len(resolved_radii) == 1:
         axes = [axes]
 
@@ -3053,16 +4543,17 @@ def write_transport_ambipolarity_residual_scan(state, runtime, transport_equatio
             label_suffix = f"i={i}"
             if rho is not None:
                 label_suffix += f", rho={float(rho[i]):.3g}"
-            ax.plot(er_scan, transport_scan, label=f"transport ({label_suffix})")
-            ax.plot(er_scan, ambipolar_scan, "--", label=f"ambipolar ({label_suffix})")
+            ax.plot(er_scan, transport_scan, linewidth=3.0, label=f"transport ({label_suffix})")
+            ax.plot(er_scan, ambipolar_scan, "--", linewidth=3.0, label=f"ambipolar ({label_suffix})")
             ax.axhline(0.0, color="k", linewidth=0.8, alpha=0.5)
-            ax.set_ylabel("charge-weighted flux")
-            ax.legend()
-            ax.grid(True, alpha=0.3)
+            ax.set_ylabel("charge-weighted flux", fontsize=20)
+            ax.tick_params(axis="both", labelsize=16, width=1.0, length=4)
+            ax.legend(fontsize=14, frameon=True)
+            ax.grid(False)
 
-    axes[-1].set_xlabel("Er")
+    axes[-1].set_xlabel(r"$E_r$ [$\mathrm{kV}/\mathrm{m}$]", fontsize=20)
     fig.tight_layout()
-    fig.savefig(output_dir / "transport_ambipolarity_residual_scan.png", dpi=170)
+    fig.savefig(output_dir / "transport_ambipolarity_residual_scan.png", dpi=320, bbox_inches="tight")
     plt.close(fig)
     return out_h5
 
@@ -3108,9 +4599,10 @@ def run_config(config: dict):
                     overlay_reference=overlay_reference,
                     reference_file=reference_file,
                     reference_label=reference_label,
+                    geometry=runtime.geometry,
                 )
             if do_hdf5:
-                write_fluxes_hdf5(rho, fluxes, output_dir)
+                write_fluxes_hdf5(rho, fluxes, output_dir, geometry=runtime.geometry)
             return {"rho": rho, "fluxes": fluxes, "output_dir": output_dir}
 
         if mode == "sources":
@@ -3133,9 +4625,9 @@ def run_config(config: dict):
                 output_dir = Path(str(output_dir))
             output_dir.mkdir(parents=True, exist_ok=True)
             if do_plot:
-                plot_sources(rho, sources, output_dir)
+                plot_sources(rho, sources, output_dir, geometry=runtime.geometry)
             if do_hdf5:
-                write_sources_hdf5(rho, sources, output_dir)
+                write_sources_hdf5(rho, sources, output_dir, geometry=runtime.geometry)
             return {"rho": rho, "sources": sources, "output_dir": output_dir}
 
         raise ValueError(f"Unknown mode '{mode}'. Supported: 'ambipolarity', 'transport', 'fluxes', 'sources'.")

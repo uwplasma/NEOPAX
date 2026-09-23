@@ -33,10 +33,22 @@ class Solver_Parameters:
     theta_linear_solver: str
     theta_gmres_tol: float
     theta_gmres_maxiter: int
+    theta_controller_mode: str
+    theta_jacobian_reuse_mode: str
+    theta_jacobian_reuse_rtol: float
+    theta_max_jacobian_age: int
+    theta_lagged_response_reuse_mode: str
+    theta_lagged_response_reuse_rtol: float
+    theta_lagged_response_reuse_atol: float
     theta_trust_region_enabled: bool
     theta_trust_radius: float
     theta_homotopy_steps: int
     theta_differentiable_mode: bool
+    limm_w_order: int
+    limm_w_coefficient_family: str
+    limm_w_jacobian_reuse_mode: str
+    limm_w_jacobian_reuse_rtol: float
+    limm_w_jacobian_reuse_atol: float
     er_ambipolar_scan_min: float
     er_ambipolar_scan_max: float
     er_ambipolar_n_scan: int
@@ -86,9 +98,17 @@ class Solver_Parameters:
                         theta_line_search_min_alpha=None,theta_line_search_c=None,
                         theta_max_step_retries=None,
                         theta_linear_solver=None,theta_gmres_tol=None,theta_gmres_maxiter=None,
+                        theta_controller_mode=None,
+                        theta_jacobian_reuse_mode=None,
+                        theta_jacobian_reuse_rtol=None,theta_max_jacobian_age=None,
+                        theta_lagged_response_reuse_mode=None,
+                        theta_lagged_response_reuse_rtol=None,theta_lagged_response_reuse_atol=None,
                         theta_trust_region_enabled=None,theta_trust_radius=None,
                         theta_homotopy_steps=None,
                         theta_differentiable_mode=None,
+                        limm_w_order=None,limm_w_coefficient_family=None,
+                        limm_w_jacobian_reuse_mode=None,limm_w_jacobian_reuse_rtol=None,
+                        limm_w_jacobian_reuse_atol=None,
                         er_ambipolar_scan_min=None,er_ambipolar_scan_max=None,er_ambipolar_n_scan=None,
                         er_ambipolar_tol=None,er_ambipolar_maxiter=None,
                         er_ambipolar_n_coarse=None,er_ambipolar_n_fine=None,
@@ -248,6 +268,41 @@ class Solver_Parameters:
         else:
             self.theta_gmres_maxiter = int(theta_gmres_maxiter)
 
+        if theta_controller_mode is None:
+            self.theta_controller_mode = "current"
+        else:
+            self.theta_controller_mode = str(theta_controller_mode)
+
+        if theta_jacobian_reuse_mode is None:
+            self.theta_jacobian_reuse_mode = "refresh_each_iteration"
+        else:
+            self.theta_jacobian_reuse_mode = str(theta_jacobian_reuse_mode)
+
+        if theta_jacobian_reuse_rtol is None:
+            self.theta_jacobian_reuse_rtol = 0.1
+        else:
+            self.theta_jacobian_reuse_rtol = float(theta_jacobian_reuse_rtol)
+
+        if theta_max_jacobian_age is None:
+            self.theta_max_jacobian_age = 8
+        else:
+            self.theta_max_jacobian_age = int(theta_max_jacobian_age)
+
+        if theta_lagged_response_reuse_mode is None:
+            self.theta_lagged_response_reuse_mode = "retry_only"
+        else:
+            self.theta_lagged_response_reuse_mode = str(theta_lagged_response_reuse_mode)
+
+        if theta_lagged_response_reuse_rtol is None:
+            self.theta_lagged_response_reuse_rtol = 5.0e-2
+        else:
+            self.theta_lagged_response_reuse_rtol = float(theta_lagged_response_reuse_rtol)
+
+        if theta_lagged_response_reuse_atol is None:
+            self.theta_lagged_response_reuse_atol = 1.0e-8
+        else:
+            self.theta_lagged_response_reuse_atol = float(theta_lagged_response_reuse_atol)
+
         if theta_trust_region_enabled is None:
             self.theta_trust_region_enabled = False
         else:
@@ -267,6 +322,31 @@ class Solver_Parameters:
             self.theta_differentiable_mode = False
         else:
             self.theta_differentiable_mode = bool(theta_differentiable_mode)
+
+        if limm_w_order is None:
+            self.limm_w_order = 3
+        else:
+            self.limm_w_order = int(limm_w_order)
+
+        if limm_w_coefficient_family is None:
+            self.limm_w_coefficient_family = "o16_published"
+        else:
+            self.limm_w_coefficient_family = str(limm_w_coefficient_family)
+
+        if limm_w_jacobian_reuse_mode is None:
+            self.limm_w_jacobian_reuse_mode = "retry_only"
+        else:
+            self.limm_w_jacobian_reuse_mode = str(limm_w_jacobian_reuse_mode)
+
+        if limm_w_jacobian_reuse_rtol is None:
+            self.limm_w_jacobian_reuse_rtol = 5.0e-2
+        else:
+            self.limm_w_jacobian_reuse_rtol = float(limm_w_jacobian_reuse_rtol)
+
+        if limm_w_jacobian_reuse_atol is None:
+            self.limm_w_jacobian_reuse_atol = 1.0e-8
+        else:
+            self.limm_w_jacobian_reuse_atol = float(limm_w_jacobian_reuse_atol)
 
         if er_ambipolar_scan_min is None:
             self.er_ambipolar_scan_min = -20.0

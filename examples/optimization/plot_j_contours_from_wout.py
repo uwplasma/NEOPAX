@@ -1,0 +1,455 @@
+#!/usr/bin/env python
+"""Plot J-invariant QI contour diagnostics from a VMEX/VMEC wout file."""
+
+from __future__ import annotations
+
+import argparse
+from pathlib import Path
+import sys
+
+import jax
+import numpy as np
+
+ROOT = Path(__file__).resolve().parents[2]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+
+DEFAULT_SURFACES = (
+    1 / 51,
+    5 / 51,
+    10 / 51,
+    15 / 51,
+    20 / 51,
+    25 / 51,
+    30 / 51,
+    35 / 51,
+    40 / 51,
+    45 / 51,
+    50 / 51,
+)
+DEFAULT_LAMBDA_SAMPLES = (0.1, 0.3, 0.5, 0.7, 0.9)
+
+
+def _parse_float_list(text: str) -> tuple[float, ...]:
+    return tuple(float(item.strip()) for item in text.split(",") if item.strip())
+
+
+def _boozer_tables_from_wout(wout_path: Path, *, surfaces, mboz: int, nboz: int, jit_boozer: bool):
+    import vmex as vj
+    from booz_xform_jax import Booz_xform
+
+    wout = vj.read_wout(wout_path)
+    bx = Booz_xform(verbose=0, mboz=int(mboz), nboz=int(nboz))
+    bx.read_wout_data(wout)
+
+    s_in = np.asarray(bx.s_in, dtype=float)
+    requested_surfaces = np.atleast_1d(np.asarray(surfaces, dtype=float))
+    indices = sorted({int(np.argmin(np.abs(s_in - value))) for value in requested_surfaces})
+    bx.compute_surfs = indices
+    bx.run(jit=bool(jit_boozer))
+
+    bmnc_b = np.asarray(bx.bmnc_b, dtype=float)
+    xm_b = np.asarray(bx.xm_b, dtype=float)
+    if bmnc_b.shape[0] == xm_b.shape[0]:
+        bmnc_b = bmnc_b.T
+    bmns_raw = getattr(bx, "bmns_b", None)
+    bmns_b = None if bmns_raw is None else np.asarray(bmns_raw, dtype=float)
+    if bmns_b is not None and bmns_b.shape[0] == xm_b.shape[0]:
+        bmns_b = bmns_b.T
+
+    iota_b = np.asarray(bx.iota, dtype=float)[indices]
+    boozer_i = np.asarray(bx.Boozer_I, dtype=float)
+    boozer_g = np.asarray(bx.Boozer_G, dtype=float)
+    gi_b = boozer_g + iota_b * boozer_i
+
+    return {
+        "bmnc_b": bmnc_b,
+        "bmns_b": bmns_b,
+        "xm_b": xm_b,
+        "xn_b": np.asarray(bx.xn_b, dtype=float),
+        "iota_b": iota_b,
+        "gi_b": gi_b,
+        "G_b": boozer_g,
+        "I_b": boozer_i,
+        "s_b": s_in[indices],
+        "nfp": int(bx.nfp),
+        "r_major": float(wout.Rmajor_p),
+    }
+
+
+def _physical_j_invariant_from_wout(
+    wout_path: Path,
+    *,
+    surfaces,
+    mboz: int,
+    nboz: int,
+    nalpha: int,
+    points_per_period: int,
+    num_periods: int,
+    trapping_depths,
+    physical_pitches,
+    max_wells: int | None,
+    quadrature_order: int,
+    jit_boozer: bool,
+):
+    """Return resolved actual-well J at fixed physical pitches."""
+
+    from vmex.core import maxj
+    from vmex.core.bounce import bounce_action_from_boozer, trace_boozer_field_lines
+
+    booz = _boozer_tables_from_wout(
+        wout_path,
+        surfaces=surfaces,
+        mboz=mboz,
+        nboz=nboz,
+        jit_boozer=jit_boozer,
+    )
+    dtype = np.asarray(booz["bmnc_b"]).dtype
+    alpha = np.arange(int(nalpha), dtype=dtype) * (2.0 * np.pi / int(nalpha))
+    trace_args = dict(
+        bmnc_b=booz["bmnc_b"],
+        xm_b=booz["xm_b"],
+        xn_b=booz["xn_b"],
+        iota_b=booz["iota_b"],
+        G_b=booz["G_b"],
+        I_b=booz["I_b"],
+        nfp=booz["nfp"],
+        alpha=alpha,
+        points_per_period=int(points_per_period),
+        num_periods=int(num_periods),
+    )
+    if booz["bmns_b"] is not None:
+        trace_args["bmns_b"] = booz["bmns_b"]
+    if physical_pitches:
+        pitches = np.asarray(physical_pitches, dtype=float)
+    else:
+        trace = trace_boozer_field_lines(**trace_args)
+        pitches = np.asarray(
+            maxj.common_trapped_pitches(
+                np.swapaxes(np.asarray(jax.device_get(trace["bmag"])), 1, 2),
+                trapping_depths,
+            ),
+            dtype=float,
+        )
+    bounce = bounce_action_from_boozer(
+        **trace_args,
+        pitch=pitches,
+        max_wells=max_wells,
+        quadrature_order=int(quadrature_order),
+    )
+    action = np.asarray(jax.device_get(bounce["action"]), dtype=float)
+    usable = np.asarray(jax.device_get(bounce["usable_mask"]), dtype=bool)
+    count = np.sum(usable, axis=-1)
+    action_mean = np.sum(np.where(usable, action, 0.0), axis=-1) / np.maximum(count, 1)
+    action_mean = np.where(count > 0, action_mean, np.nan)
+    return {
+        "alpha": alpha,
+        "surfaces": booz["s_b"],
+        "ji": action_mean,
+        "physical_pitches": pitches,
+        "r_major": booz["r_major"],
+    }
+
+
+def _j_invariant_from_wout(
+    wout_path: Path,
+    *,
+    surfaces,
+    mboz: int,
+    nboz: int,
+    nphi: int,
+    nalpha: int,
+    n_bounce: int,
+    p_j: float,
+    p_lambda: float,
+    nphi_int: int,
+    jit_boozer: bool,
+):
+    from vmex.core.omnigenity_j import j_invariant_qi_maxj_residual_from_boozer
+
+    booz = _boozer_tables_from_wout(
+        wout_path,
+        surfaces=surfaces,
+        mboz=mboz,
+        nboz=nboz,
+        jit_boozer=jit_boozer,
+    )
+    return j_invariant_qi_maxj_residual_from_boozer(
+        bmnc_b=booz["bmnc_b"],
+        xm_b=booz["xm_b"],
+        xn_b=booz["xn_b"],
+        iota_b=booz["iota_b"],
+        gi_b=booz["gi_b"],
+        s_b=booz["s_b"],
+        nfp=booz["nfp"],
+        nphi=nphi,
+        nalpha=nalpha,
+        n_bounce=n_bounce,
+        p_j=p_j,
+        p_lambda=p_lambda,
+        nphi_int=nphi_int,
+        include_qi=True,
+        include_maxj=False,
+    )
+
+
+def plot_j_polar_contours(out, out_dir: Path, *, p_lambda: float, lambda_samples):
+    import matplotlib.pyplot as plt
+
+    alpha = np.asarray(jax.device_get(out["alpha"]), dtype=float)
+    surfaces = np.asarray(jax.device_get(out["surfaces"]), dtype=float)
+    ji = np.asarray(jax.device_get(out["ji"]), dtype=float)
+    jc = np.asarray(jax.device_get(out["jc"]), dtype=float)
+    n_bounce = int(ji.shape[-1])
+    lambda_grid = np.power(
+        np.arange(n_bounce, dtype=float) / max(n_bounce - 1, 1),
+        float(p_lambda),
+    )
+
+    theta = np.concatenate([alpha, alpha[:1] + 2.0 * np.pi])
+    theta_grid, radius_grid = np.meshgrid(theta, surfaces, indexing="xy")
+    sample_idx = sorted(
+        {
+            int(np.clip(round(lam * (n_bounce - 1)), 0, n_bounce - 1))
+            for lam in lambda_samples
+        }
+    )
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    written: list[Path] = []
+    for name, data in (("ji", ji), ("jc", jc)):
+        for idx in sample_idx:
+            values = data[:, :, idx]
+            values_periodic = np.concatenate([values, values[:, :1]], axis=1)
+            display_name = r"$\mathcal{J}$" if name == "ji" else r"$J_C$"
+            title_name = r"$\mathcal{J}$" if name == "ji" else r"$J_C$"
+            fig = plt.figure(figsize=(5.4, 5.8))
+            ax_polar = fig.add_subplot(1, 1, 1, projection="polar")
+            contour = ax_polar.contourf(theta_grid, radius_grid, values_periodic, levels=40, cmap="plasma")
+            ax_polar.set_title(f"Second adiabatic invariant, {title_name}", fontsize=15, pad=20)
+            ax_polar.set_ylim(0.0, float(surfaces.max()))
+            ax_polar.set_thetagrids(np.arange(0, 360, 45), fontsize=8)
+            radial_ticks = np.linspace(0.2, float(surfaces.max()), 5)
+            ax_polar.set_rticks(radial_ticks)
+            ax_polar.set_yticklabels([f"{tick:.1f}" for tick in radial_ticks], fontsize=8)
+            ax_polar.set_rlabel_position(45)
+            ax_polar.grid(color="white", linewidth=0.8, alpha=0.45)
+            colorbar = fig.colorbar(contour, ax=ax_polar, pad=0.12, shrink=0.78)
+            colorbar.set_label(display_name, fontsize=11)
+            colorbar.ax.tick_params(labelsize=8)
+            fig.text(0.5, 0.035, rf"$\lambda$ = {lambda_grid[idx]:.2f}", ha="center", va="center", fontsize=15)
+            fig.tight_layout(rect=(0.0, 0.06, 1.0, 1.0))
+            path = out_dir / f"{name}_polar_lambda_{idx:02d}.png"
+            fig.savefig(path, dpi=320, bbox_inches="tight")
+            plt.close(fig)
+            written.append(path)
+            print(f"wrote {path}")
+    return written
+
+
+def plot_physical_j_polar_contours(out, out_dir: Path):
+    """Plot the VMEX-style physical-J map in ``s cos(alpha), s sin(alpha)``."""
+
+    import matplotlib.pyplot as plt
+
+    alpha = np.asarray(out["alpha"], dtype=float)
+    surfaces = np.asarray(out["surfaces"], dtype=float)
+    action = np.asarray(out["ji"], dtype=float)
+    pitches = np.asarray(out["physical_pitches"], dtype=float)
+    r_major = abs(float(out.get("r_major", 1.0)))
+    if not np.isfinite(r_major) or r_major <= np.finfo(float).tiny:
+        r_major = 1.0
+    if surfaces.size < 2:
+        raise ValueError(
+            "Physical-J polar contours require at least two --surfaces values."
+        )
+    alpha_periodic = np.concatenate([alpha, alpha[:1] + 2.0 * np.pi])
+    alpha_grid, surface_grid = np.meshgrid(alpha_periodic, surfaces, indexing="xy")
+    x_grid = surface_grid * np.cos(alpha_grid)
+    y_grid = surface_grid * np.sin(alpha_grid)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    written = []
+    for pitch_index, pitch in enumerate(pitches):
+        values = action[:, :, pitch_index] / r_major
+        values_periodic = np.ma.concatenate(
+            [np.ma.masked_invalid(values), np.ma.masked_invalid(values[:, :1])],
+            axis=1,
+        )
+        fig, axis = plt.subplots(figsize=(5.8, 5.2), layout="constrained")
+        if values_periodic.count() < 4 or np.ptp(values_periodic.compressed()) == 0.0:
+            axis.text(
+                0.5,
+                0.5,
+                "no trapped-particle wells\nresolved at this pitch",
+                ha="center",
+                va="center",
+                transform=axis.transAxes,
+            )
+        else:
+            levels = np.linspace(
+                float(values_periodic.min()), float(values_periodic.max()), 15
+            )
+            contour = axis.contourf(
+                x_grid,
+                y_grid,
+                values_periodic,
+                levels=levels,
+                cmap="viridis",
+                extend="both",
+            )
+            axis.contour(
+                x_grid,
+                y_grid,
+                values_periodic,
+                levels=levels,
+                colors="0.25",
+                linewidths=0.35,
+                alpha=0.65,
+            )
+            fig.colorbar(contour, ax=axis, pad=0.02, label=r"$J\,/\,(v R_0)$")
+        radius = max(1.0, float(np.max(surfaces)))
+        axis.axhline(0.0, color="white", linewidth=0.6, alpha=0.75)
+        axis.axvline(0.0, color="white", linewidth=0.6, alpha=0.75)
+        axis.set_xlim(-radius, radius)
+        axis.set_ylim(-radius, radius)
+        axis.set_aspect("equal", adjustable="box")
+        axis.set_xlabel(r"$s\cos\alpha$")
+        axis.set_ylabel(r"$s\sin\alpha$")
+        axis.set_title(
+            "second adiabatic invariant\n"
+            rf"$1/\lambda={1.0 / float(pitch):.3g}$ T"
+        )
+        path = out_dir / f"physical_j_contour_pitch_{pitch_index:02d}.png"
+        fig.savefig(path, dpi=320, bbox_inches="tight")
+        plt.close(fig)
+        written.append(path)
+        print(f"wrote {path}")
+    return written
+
+
+def plot_vmex_physical_j_contours_from_wout(
+    wout_path,
+    out_dir,
+    *,
+    surfaces,
+    mboz: int,
+    nboz: int,
+    trapping_depths=(0.35, 0.55, 0.75),
+    physical_pitches=None,
+    nalpha: int = 96,
+    points_per_period: int = 64,
+    num_periods: int = 6,
+    max_wells: int | None = 24,
+    quadrature_order: int = 32,
+    jit_boozer: bool = True,
+):
+    """Evaluate and plot VMEX's resolved actual-well physical ``J`` maps.
+
+    This is deliberately independent of the QI/max-J objective backend used by
+    an optimization.  Surrogate and physical objectives therefore receive the
+    same physical post-processing diagnostic.
+    """
+
+    pitches = () if physical_pitches is None else tuple(physical_pitches)
+    out = _physical_j_invariant_from_wout(
+        Path(wout_path),
+        surfaces=tuple(float(value) for value in surfaces),
+        mboz=int(mboz),
+        nboz=int(nboz),
+        nalpha=int(nalpha),
+        points_per_period=int(points_per_period),
+        num_periods=int(num_periods),
+        trapping_depths=tuple(float(value) for value in trapping_depths),
+        physical_pitches=pitches,
+        max_wells=max_wells,
+        quadrature_order=int(quadrature_order),
+        jit_boozer=bool(jit_boozer),
+    )
+    print(
+        "[vmex physical J] pitches_T^-1="
+        + ",".join(f"{value:.16g}" for value in out["physical_pitches"]),
+        flush=True,
+    )
+    return plot_physical_j_polar_contours(out, Path(out_dir))
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("wout", type=Path, help="Path to wout_*.nc.")
+    parser.add_argument("--out-dir", type=Path, default=None, help="Output directory for PNGs.")
+    parser.add_argument("--surfaces", default=",".join(f"{value:.16g}" for value in DEFAULT_SURFACES))
+    parser.add_argument("--lambda-samples", default=",".join(str(value) for value in DEFAULT_LAMBDA_SAMPLES))
+    parser.add_argument("--j-backend", choices=("surrogate", "physical"), default="surrogate")
+    parser.add_argument("--physical-pitches", default="", help="Comma-separated fixed pitches in inverse tesla.")
+    parser.add_argument("--trapping-depths", default="0.35,0.55,0.75")
+    parser.add_argument("--points-per-period", type=int, default=128)
+    parser.add_argument("--num-periods", type=int, default=4)
+    parser.add_argument("--max-wells", type=int, default=None)
+    parser.add_argument("--quadrature-order", type=int, default=64)
+    parser.add_argument("--mboz", type=int, default=18)
+    parser.add_argument("--nboz", type=int, default=18)
+    parser.add_argument("--nphi", type=int, default=101)
+    parser.add_argument("--nalpha", type=int, default=51)
+    parser.add_argument("--n-bounce", type=int, default=66)
+    parser.add_argument("--p-j", type=float, default=1.0)
+    parser.add_argument("--p-lambda", type=float, default=1.0)
+    parser.add_argument("--nphi-int", type=int, default=128)
+    parser.add_argument("--jit-boozer", action="store_true")
+    args = parser.parse_args()
+
+    wout_path = args.wout.resolve()
+    if not wout_path.exists():
+        raise FileNotFoundError(wout_path)
+    out_dir = args.out_dir or (wout_path.parent / f"{wout_path.stem}_j_contours")
+
+    jax.config.update("jax_enable_x64", True)
+    surfaces = _parse_float_list(args.surfaces)
+    lambda_samples = _parse_float_list(args.lambda_samples)
+    print(
+        "[j-contours-from-wout] "
+        f"backend={args.j_backend} wout={wout_path} out_dir={out_dir} "
+        f"surfaces={','.join(f'{s:.3g}' for s in surfaces)}"
+    )
+
+    if args.j_backend == "physical":
+        out = _physical_j_invariant_from_wout(
+            wout_path,
+            surfaces=surfaces,
+            mboz=args.mboz,
+            nboz=args.nboz,
+            nalpha=args.nalpha,
+            points_per_period=args.points_per_period,
+            num_periods=args.num_periods,
+            trapping_depths=_parse_float_list(args.trapping_depths),
+            physical_pitches=_parse_float_list(args.physical_pitches),
+            max_wells=args.max_wells,
+            quadrature_order=args.quadrature_order,
+            jit_boozer=args.jit_boozer,
+        )
+        print(
+            "[j-contours-from-wout] physical_pitches_T^-1="
+            + ",".join(f"{value:.16g}" for value in out["physical_pitches"])
+        )
+        plot_physical_j_polar_contours(out, out_dir)
+        return 0
+
+    out = _j_invariant_from_wout(
+        wout_path,
+        surfaces=surfaces,
+        mboz=args.mboz,
+        nboz=args.nboz,
+        nphi=args.nphi,
+        nalpha=args.nalpha,
+        n_bounce=args.n_bounce,
+        p_j=args.p_j,
+        p_lambda=args.p_lambda,
+        nphi_int=args.nphi_int,
+        jit_boozer=args.jit_boozer,
+    )
+    plot_j_polar_contours(out, out_dir, p_lambda=args.p_lambda, lambda_samples=lambda_samples)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

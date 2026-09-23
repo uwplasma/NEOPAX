@@ -1,9 +1,11 @@
 import dataclasses
 from types import SimpleNamespace
 
+import jax
 import jax.numpy as jnp
 
 import NEOPAX._orchestrator as main_module
+import NEOPAX._transport_equations as transport_equations_module
 import NEOPAX._transport_flux_models as flux_models_module
 from NEOPAX._boundary_conditions import BoundaryConditionModel
 from NEOPAX._state import TransportState
@@ -75,12 +77,13 @@ def test_build_flux_model_passes_boundary_conditions_and_particle_flux_toggle(mo
 
         return factory
 
-    def fake_build_transport_flux_model(neo, turb, classical, include_turbulent_particle_flux=True):
+    def fake_build_transport_flux_model(neo, turb, classical, include_turbulent_particle_flux=True, **kwargs):
         return {
             "neo": neo,
             "turb": turb,
             "classical": classical,
             "include_turbulent_particle_flux": include_turbulent_particle_flux,
+            **kwargs,
         }
 
     monkeypatch.setattr(main_module, "get_transport_flux_model", fake_get_transport_flux_model)
@@ -96,6 +99,7 @@ def test_build_flux_model_passes_boundary_conditions_and_particle_flux_toggle(mo
     )
 
     assert out["include_turbulent_particle_flux"] is False
+    assert out["center_flux_mode"] == "direct"
     assert out["neo"] == "neo_model_instance"
     assert out["turb"] == "none_instance"
     assert out["classical"] == "none_instance"
@@ -183,23 +187,23 @@ def test_extract_right_constraints_handles_bc_types():
     state_arr = jnp.array([[1.0, 2.0], [3.0, 4.0]])
 
     rv, rg = flux_models_module._extract_right_constraints(None, state_arr)
-    assert jnp.allclose(rv, jnp.array([2.0, 4.0]))
+    assert jnp.allclose(rv, jnp.array([2.5, 4.5]))
     assert jnp.allclose(rg, jnp.zeros(2))
 
     bc_neumann = BoundaryConditionModel(dr=1.0, right_type="neumann", right_gradient=jnp.array([0.5, -0.5]))
     rv, rg = flux_models_module._extract_right_constraints(bc_neumann, state_arr)
-    assert jnp.allclose(rv, jnp.array([2.0, 4.0]))
+    assert jnp.allclose(rv, jnp.array([2.5, 4.5]))
     assert jnp.allclose(rg, jnp.array([0.5, -0.5]))
 
     bc_robin = BoundaryConditionModel(dr=1.0, right_type="robin", right_decay_length=jnp.array([2.0, 4.0]))
     rv, rg = flux_models_module._extract_right_constraints(bc_robin, state_arr)
-    assert jnp.allclose(rv, jnp.array([2.0, 4.0]))
-    assert jnp.allclose(rg, jnp.array([-1.0, -1.0]))
+    assert jnp.allclose(rv, jnp.array([2.5, 4.5]))
+    assert jnp.allclose(rg, jnp.array([-1.25, -1.125]))
 
 
 def test_ntx_local_particle_flux_evaluator_passes_bc_constraints(monkeypatch):
     species = _dummy_species()
-    geometry = SimpleNamespace()
+    geometry = SimpleNamespace(r_grid_half=jnp.asarray([0.0, 0.5, 1.0]))
     state = _dummy_state()
 
     captured = {}
@@ -243,6 +247,392 @@ def test_ntx_local_particle_flux_evaluator_passes_bc_constraints(monkeypatch):
     assert float(captured["er_profile"][1]) == 9.0
 
 
+def test_ntx_database_exposes_momentum_corrected_parallel_flow(monkeypatch):
+    """The black-box database keeps bootstrap on the corrected-Upar physics path."""
+
+    species = _dummy_species()
+    geometry = SimpleNamespace(r_grid_half=jnp.asarray([0.0, 0.5, 1.0]))
+    state = _dummy_state()
+    captured = {}
+
+    def fake_corrected_fluxes(*args, **kwargs):
+        captured["args"] = args
+        captured["kwargs"] = kwargs
+        shape = state.density.shape
+        gamma = jnp.full(shape, 1.0)
+        q = jnp.full(shape, 2.0)
+        upar = jnp.full(shape, 3.0)
+        qpar = jnp.full(shape, 4.0)
+        upar2 = jnp.full(shape, 5.0)
+        return gamma, q, upar, qpar, upar2
+
+    monkeypatch.setattr(
+        flux_models_module,
+        "get_Neoclassical_Fluxes_With_Momentum_Correction",
+        fake_corrected_fluxes,
+    )
+    model = flux_models_module.NTXDatabaseTransportModel(
+        species=species,
+        energy_grid="grid",
+        geometry=geometry,
+        database="db",
+    )
+
+    corrected = model.evaluate_momentum_corrected_fluxes(state)
+
+    assert jnp.allclose(corrected["Upar"], 3.0)
+    assert jnp.allclose(corrected["Upar_neo"], 3.0)
+    assert jnp.allclose(model.evaluate_momentum_corrected_upar_only(state), 3.0)
+    assert "density_right_constraint" in captured["kwargs"]
+    assert "temperature_right_constraint" in captured["kwargs"]
+
+
+def test_ntx_database_lagged_face_response_matches_reference_and_finite_difference(monkeypatch):
+    """The database lagged response preserves direct centres and face JVPs.
+
+    This uses a nonlinear stand-in for the database interpolation so that the
+    finite-difference comparison exercises density, temperature, Er, and face
+    gradient dependence rather than passing trivially for a linear flux.
+    """
+    species = _dummy_species()
+    geometry = SimpleNamespace(
+        r_grid_half=jnp.asarray([0.0, 0.25, 0.65, 1.0]),
+        r_grid=jnp.asarray([0.125, 0.45, 0.825]),
+    )
+    state0 = TransportState(
+        density=jnp.asarray(
+            [[1.2, 1.4, 1.7], [0.8, 0.9, 1.1], [0.5, 0.6, 0.75]]
+        ),
+        pressure=jnp.asarray(
+            [[2.4, 3.08, 4.25], [1.04, 1.26, 1.65], [0.45, 0.66, 0.975]]
+        ),
+        Er=jnp.asarray([0.15, 0.22, 0.31]),
+    )
+    direction = TransportState(
+        density=jnp.asarray(
+            [[0.06, -0.03, 0.04], [-0.02, 0.05, -0.01], [0.03, 0.01, -0.02]]
+        ),
+        pressure=jnp.asarray(
+            [[0.08, -0.04, 0.05], [-0.03, 0.06, -0.02], [0.02, 0.03, -0.01]]
+        ),
+        Er=jnp.asarray([0.02, -0.01, 0.03]),
+    )
+
+    def fake_face_database_fluxes(
+        species_arg,
+        energy_grid_arg,
+        geometry_arg,
+        database_arg,
+        er_faces,
+        temperature_faces,
+        density_faces,
+        dndr_faces,
+        dtdr_faces,
+        **kwargs,
+    ):
+        del species_arg, energy_grid_arg, geometry_arg, database_arg, kwargs
+        er_by_species = er_faces[None, :]
+        gamma = (
+            density_faces * er_by_species
+            + 0.3 * dndr_faces
+            + 0.1 * temperature_faces**2
+        )
+        heat = density_faces * temperature_faces**2 + 0.2 * dtdr_faces * er_by_species
+        upar = er_by_species**2 + 0.4 * density_faces * dtdr_faces
+        return None, gamma, heat, upar
+
+    def fake_center_database_fluxes(
+        species_arg,
+        energy_grid_arg,
+        geometry_arg,
+        database_arg,
+        er,
+        temperature,
+        density,
+        **kwargs,
+    ):
+        del species_arg, energy_grid_arg, geometry_arg, database_arg, kwargs
+        er_by_species = er[None, :]
+        gamma = density * er_by_species + 0.1 * temperature**2
+        heat = density * temperature**2 + 0.2 * er_by_species**2
+        upar = er_by_species * temperature + 0.3 * density**2
+        return None, gamma, heat, upar
+
+    monkeypatch.setattr(
+        flux_models_module,
+        "get_Neoclassical_Fluxes_Faces",
+        fake_face_database_fluxes,
+    )
+    monkeypatch.setattr(
+        flux_models_module,
+        "get_Neoclassical_Fluxes",
+        fake_center_database_fluxes,
+    )
+    model = flux_models_module.NTXDatabaseTransportModel(
+        species=species,
+        energy_grid="grid",
+        geometry=geometry,
+        database="database",
+    )
+
+    def face_fluxes_from_state(state):
+        face_state = flux_models_module.build_face_transport_state(state, geometry)
+        return model.evaluate_face_fluxes(state, face_state)
+
+    response = model.build_lagged_response(state0)
+    lagged_at_reference = model.evaluate_with_lagged_response(state0, response)
+    direct_at_reference = face_fluxes_from_state(state0)
+    for name in ("Gamma", "Q", "Upar"):
+        assert jnp.allclose(
+            lagged_at_reference[name],
+            model(state0)[name],
+            rtol=1.0e-6,
+            atol=1.0e-6,
+        )
+        assert jnp.allclose(
+            lagged_at_reference[f"{name}_faces"],
+            direct_at_reference[name],
+            rtol=1.0e-6,
+            atol=1.0e-6,
+        )
+
+    # This is the transport-RHS boundary: a rebuild anchor must agree with the
+    # black-box composite whether the universal policy keeps direct centres or
+    # reconstructs them from the canonical face fluxes.
+    for center_flux_mode in ("direct", "interpolate_from_faces"):
+        combined = flux_models_module.CombinedTransportFluxModel(
+            neoclassical_model=model,
+            turbulent_model=flux_models_module.ZeroTransportModel(),
+            classical_model=flux_models_module.ZeroTransportModel(),
+            geometry=geometry,
+            center_flux_mode=center_flux_mode,
+        )
+        combined_lagged = combined.evaluate_with_lagged_response(
+            state0,
+            combined.build_lagged_response(state0),
+        )
+        combined_black_box = combined(state0)
+        face_state = flux_models_module.build_face_transport_state(state0, geometry)
+        combined_black_box_faces = combined.evaluate_face_fluxes(state0, face_state)
+        for name in ("Gamma", "Q", "Upar"):
+            assert jnp.allclose(
+                combined_lagged[name],
+                combined_black_box[name],
+                rtol=1.0e-6,
+                atol=1.0e-6,
+            )
+            assert jnp.allclose(
+                combined_lagged[f"{name}_faces"],
+                combined_black_box_faces[name],
+                rtol=1.0e-6,
+                atol=1.0e-6,
+            )
+
+    epsilon = jnp.asarray(1.0e-3)
+    state_plus = jax.tree_util.tree_map(
+        lambda value, delta: value + epsilon * delta,
+        state0,
+        direction,
+    )
+    state_minus = jax.tree_util.tree_map(
+        lambda value, delta: value - epsilon * delta,
+        state0,
+        direction,
+    )
+    finite_difference = jax.tree_util.tree_map(
+        lambda plus, minus: (plus - minus) / (2.0 * epsilon),
+        face_fluxes_from_state(state_plus),
+        face_fluxes_from_state(state_minus),
+    )
+    lagged_direction = jax.tree_util.tree_map(
+        lambda value, reference: value - reference,
+        model.evaluate_with_lagged_response(state_plus, response),
+        lagged_at_reference,
+    )
+    center_finite_difference = jax.tree_util.tree_map(
+        lambda plus, minus: (plus - minus) / (2.0 * epsilon),
+        model(state_plus),
+        model(state_minus),
+    )
+    for name in ("Gamma", "Q", "Upar"):
+        assert jnp.allclose(
+            lagged_direction[name] / epsilon,
+            center_finite_difference[name],
+            rtol=3.0e-3,
+            atol=3.0e-4,
+        )
+        assert jnp.allclose(
+            lagged_direction[f"{name}_faces"] / epsilon,
+            finite_difference[name],
+            rtol=3.0e-3,
+            atol=3.0e-4,
+        )
+
+    # The private floating-edge node must be an actual face-response Taylor
+    # coordinate.  Previously the database lagged path discarded these two
+    # keywords, so its edge ambipolar residual was insensitive to E_edge even
+    # though realtime NTX used it.
+    edge_anchor = jnp.asarray(0.47)
+    edge_step = jnp.asarray(1.0e-4)
+    edge_response = model.build_lagged_response(
+        state0, er_edge_override=edge_anchor
+    )
+
+    def _direct_face_fluxes_at_edge(edge_value):
+        face_state = flux_models_module.build_face_transport_state(
+            state0, geometry, er_edge_override=edge_value
+        )
+        return model.evaluate_face_fluxes(state0, face_state)
+
+    edge_reference = model.evaluate_with_lagged_response(
+        state0,
+        edge_response,
+        er_edge_override=edge_anchor,
+        er_edge_anchor=edge_anchor,
+    )
+    edge_plus = model.evaluate_with_lagged_response(
+        state0,
+        edge_response,
+        er_edge_override=edge_anchor + edge_step,
+        er_edge_anchor=edge_anchor,
+    )
+    edge_minus = model.evaluate_with_lagged_response(
+        state0,
+        edge_response,
+        er_edge_override=edge_anchor - edge_step,
+        er_edge_anchor=edge_anchor,
+    )
+    direct_edge_reference = _direct_face_fluxes_at_edge(edge_anchor)
+    direct_edge_plus = _direct_face_fluxes_at_edge(edge_anchor + edge_step)
+    direct_edge_minus = _direct_face_fluxes_at_edge(edge_anchor - edge_step)
+    for name in ("Gamma", "Q", "Upar"):
+        assert jnp.allclose(
+            edge_reference[f"{name}_faces"], direct_edge_reference[name],
+            rtol=1.0e-6, atol=1.0e-6,
+        )
+        assert jnp.allclose(
+            (edge_plus[f"{name}_faces"] - edge_minus[f"{name}_faces"])
+            / (2.0 * edge_step),
+            (direct_edge_plus[name] - direct_edge_minus[name]) / (2.0 * edge_step),
+            rtol=3.0e-3, atol=3.0e-4,
+        )
+
+    # Node-mode reverse uses a generic VJP over its private augmented edge
+    # coordinate.  Verify the database response payload exposes that exact
+    # dependency, rather than silently returning a zero edge cotangent.
+    edge_cache, edge_cache_pullback = jax.vjp(
+        lambda edge_value: model.build_lagged_response(
+            state0, er_edge_override=edge_value
+        ),
+        edge_anchor,
+    )
+    edge_cache_bar = jax.tree_util.tree_map(
+        lambda leaf: jnp.zeros_like(leaf), edge_cache
+    )
+    edge_cache_bar = dataclasses.replace(
+        edge_cache_bar,
+        reference_face_flux={
+            name: jnp.ones_like(value) if name == "Gamma" else jnp.zeros_like(value)
+            for name, value in edge_cache.reference_face_flux.items()
+        },
+    )
+    (edge_cache_bar_value,) = edge_cache_pullback(edge_cache_bar)
+    direct_edge_cache_derivative = jax.grad(
+        lambda edge_value: jnp.sum(
+            model.build_lagged_response(
+                state0, er_edge_override=edge_value
+            ).reference_face_flux["Gamma"]
+        )
+    )(edge_anchor)
+    assert jnp.allclose(
+        edge_cache_bar_value, direct_edge_cache_derivative,
+        rtol=1.0e-6, atol=1.0e-6,
+    )
+
+    # The quadratic experimental lane is a Taylor response of the same
+    # database primitives.  Its remaining local error must be cubic in a
+    # smooth profile perturbation, whereas the established lagged response
+    # leaves a quadratic remainder.
+    quadratic_model = flux_models_module.NTXDatabaseTransportModel(
+        species=species,
+        energy_grid="grid",
+        geometry=geometry,
+        database="database",
+        lagged_response_taylor_order=2,
+    )
+    quadratic_response = quadratic_model.build_lagged_response(state0)
+
+    def _state_at_scale(scale):
+        return jax.tree_util.tree_map(
+            lambda value, delta: value + scale * delta,
+            state0,
+            direction,
+        )
+
+    def _response_error(response_model, response_value, scale):
+        state_value = _state_at_scale(scale)
+        approximate = response_model.evaluate_with_lagged_response(state_value, response_value)
+        direct_faces = face_fluxes_from_state(state_value)
+        direct_centres = response_model(state_value)
+        squared_error = jnp.asarray(0.0)
+        for name in ("Gamma", "Q", "Upar"):
+            squared_error = squared_error + jnp.sum(
+                (approximate[name] - direct_centres[name]) ** 2
+            )
+            squared_error = squared_error + jnp.sum(
+                (approximate[f"{name}_faces"] - direct_faces[name]) ** 2
+            )
+        return jnp.sqrt(squared_error)
+
+    quadratic_at_reference = quadratic_model.evaluate_with_lagged_response(
+        state0,
+        quadratic_response,
+    )
+    for name in ("Gamma", "Q", "Upar"):
+        assert jnp.allclose(quadratic_at_reference[name], quadratic_model(state0)[name])
+        assert jnp.allclose(quadratic_at_reference[f"{name}_faces"], direct_at_reference[name])
+
+    scales = (jnp.asarray(0.10), jnp.asarray(0.05), jnp.asarray(0.025))
+    linear_errors = jnp.asarray([_response_error(model, response, scale) for scale in scales])
+    quadratic_errors = jnp.asarray(
+        [_response_error(quadratic_model, quadratic_response, scale) for scale in scales]
+    )
+    assert float(linear_errors[1] / linear_errors[0]) < 0.35
+    assert float(linear_errors[2] / linear_errors[1]) < 0.35
+    assert float(quadratic_errors[1] / quadratic_errors[0]) < 0.18
+    assert float(quadratic_errors[2] / quadratic_errors[1]) < 0.18
+
+    cubic_model = flux_models_module.NTXDatabaseTransportModel(
+        species=species,
+        energy_grid="grid",
+        geometry=geometry,
+        database="database",
+        lagged_response_taylor_order=3,
+    )
+    cubic_response = cubic_model.build_lagged_response(state0)
+    cubic_errors = jnp.asarray(
+        [_response_error(cubic_model, cubic_response, scale) for scale in scales]
+    )
+    assert float(cubic_errors[1] / cubic_errors[0]) < 0.10
+    assert float(cubic_errors[2] / cubic_errors[1]) < 0.10
+
+
+def test_ntx_database_quadratic_lagged_response_rejects_reverse_build():
+    model = flux_models_module.NTXDatabaseTransportModel(
+        species="species",
+        energy_grid="grid",
+        geometry="geometry",
+        database="database",
+        lagged_response_taylor_order=2,
+    )
+    try:
+        model.pullback_build_lagged_response(None, None)
+    except NotImplementedError as exc:
+        assert "forward-only" in str(exc)
+    else:
+        raise AssertionError("quadratic database response unexpectedly entered reverse AD")
+
+
 def test_pack_and_unpack_transport_state_arrays_restore_electron_row():
     species = _dummy_species()
     state = _dummy_state()
@@ -262,6 +652,150 @@ def test_pack_and_unpack_transport_state_arrays_restore_electron_row():
     assert unpacked.density.shape == state.density.shape
     assert jnp.allclose(unpacked.density[1:], state.density[1:])
     assert jnp.allclose(unpacked.density[0], state.density[1] + state.density[2])
+
+
+LAGGED_HEAT_FLUX = 7.0
+
+
+class _SingleTemperatureEquation:
+    name = "temperature"
+
+    def __init__(self, flux_model=None):
+        self.flux_model = flux_model
+
+    def __call__(self, working_state, fluxes=None):
+        if fluxes is None:
+            fluxes = self.flux_model(working_state)
+        return fluxes["Q"]
+
+
+class _LaggedFluxModel:
+    """Flux model whose lagged response returns a heat flux the direct call never produces."""
+
+    def __call__(self, state):
+        return {
+            "Gamma": jnp.zeros_like(state.density),
+            "Q": jnp.zeros_like(state.pressure),
+            "Upar": jnp.zeros_like(state.density),
+        }
+
+    def build_lagged_response(self, state, **kwargs):
+        del kwargs
+        return {"reference_pressure": state.pressure}
+
+    def evaluate_with_lagged_response(self, state, lagged_response, **kwargs):
+        del lagged_response, kwargs
+        return {
+            "Gamma": jnp.zeros_like(state.density),
+            "Q": jnp.full_like(state.pressure, LAGGED_HEAT_FLUX),
+            "Upar": jnp.zeros_like(state.density),
+        }
+
+
+def test_single_equation_solve_applies_the_lagged_flux_response(monkeypatch):
+    state = _dummy_state()
+    flux_model = _LaggedFluxModel()
+    runtime = main_module.RuntimeContext(
+        species=_dummy_species(),
+        energy_grid=None,
+        geometry=SimpleNamespace(dr=0.25),
+        database=None,
+        solver_parameters={"t0": 0.0, "t_final": 1.0, "dt": 0.1, "rtol": 1.0e-6, "atol": 1.0e-8},
+        models=main_module.Models(flux=flux_model, source={}),
+    )
+    monkeypatch.setattr(
+        transport_equations_module,
+        "build_equation_system",
+        lambda **kwargs: [_SingleTemperatureEquation(flux_model)],
+    )
+
+    prepared = main_module.prepare_transport_solver_components({}, runtime, state)
+    equation_system = prepared["equation_system"]
+
+    assert len(prepared["equations_to_evolve"]) == 1
+    assert equation_system.shared_flux_model is flux_model
+
+    # The solver drives exactly this pair via _lagged_response_hooks.
+    lagged = equation_system.build_lagged_response(state)
+    assert lagged.flux_response is not None
+
+    rhs = equation_system.evaluate_with_lagged_response(0.0, state, None, lagged)
+    assert jnp.allclose(rhs.pressure, LAGGED_HEAT_FLUX)
+
+
+def test_transport_components_canonicalize_flux_face_boundary_models(monkeypatch):
+    """The cached flux model and FV equations share one face-BC definition."""
+
+    @dataclasses.dataclass(frozen=True)
+    class _FaceBCModel:
+        bc_density: object = None
+        bc_temperature: object = None
+
+        def __call__(self, state):
+            return {
+                "Gamma": jnp.zeros_like(state.density),
+                "Q": jnp.zeros_like(state.pressure),
+                "Upar": jnp.zeros_like(state.density),
+            }
+
+    state = _dummy_state()
+    flux_model = _FaceBCModel(
+        bc_density=object(),
+        bc_temperature=object(),
+    )
+    runtime = main_module.RuntimeContext(
+        species=_dummy_species(),
+        energy_grid=None,
+        geometry=SimpleNamespace(dr=0.25),
+        database=None,
+        solver_parameters={"t0": 0.0, "t_final": 1.0, "dt": 0.1, "rtol": 1.0e-6, "atol": 1.0e-8},
+        models=main_module.Models(flux=flux_model, source={}),
+    )
+    captured = {}
+
+    def _build_equations(**kwargs):
+        captured.update(kwargs)
+        return [_SingleTemperatureEquation(kwargs["flux_model"])]
+
+    monkeypatch.setattr(transport_equations_module, "build_equation_system", _build_equations)
+    main_module.prepare_transport_solver_components(
+        {
+            "boundary": {
+                "density": {"right": {"type": "neumann", "gradient": 0.1}},
+                "temperature": {"right": {"type": "robin", "decay_length": 0.5}},
+            }
+        },
+        runtime,
+        state,
+    )
+
+    canonical_flux = captured["flux_model"]
+    canonical_bc = captured["boundary_models"]
+    assert canonical_flux.bc_density is canonical_bc["density"]
+    assert canonical_flux.bc_temperature is canonical_bc["temperature"]
+
+
+def test_with_geometry_payload_keeps_the_shared_flux_model_for_one_equation(monkeypatch):
+    flux_model = object()
+    equation_system = ComposedEquationSystem(
+        equations=(_SingleTemperatureEquation(),),
+        temperature_equation=_SingleTemperatureEquation(),
+        species=_dummy_species(),
+        shared_flux_model=flux_model,
+        config={},
+        solver_cfg={},
+        boundary_models={},
+    )
+    monkeypatch.setattr(
+        transport_equations_module,
+        "build_equation_system",
+        lambda **kwargs: [_SingleTemperatureEquation()],
+    )
+
+    rebuilt = equation_system.with_geometry_payload(SimpleNamespace(dr=0.25))
+
+    assert len(rebuilt.equations) == 1
+    assert rebuilt.shared_flux_model is flux_model
 
 
 def test_project_state_to_quasi_neutrality_and_fixed_temperature_projection():

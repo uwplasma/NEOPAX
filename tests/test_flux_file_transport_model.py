@@ -3,21 +3,52 @@ import io
 from pathlib import Path
 
 import h5py
+import jax
 import jax.numpy as jnp
 import pytest
 
 from NEOPAX._entropy_models import get_entropy_model
+from NEOPAX._boundary_conditions import BoundaryConditionModel
 from NEOPAX._transport_flux_models import (
     AnalyticalTurbulentTransportModel,
     CombinedTransportFluxModel,
+    CombinedTransportLaggedResponse,
     FluxesRFileTransportModel,
+    JVPTransportFluxResponse,
     PowerAnalyticalTurbulentTransportModel,
+    SpectraXTurbulenceFDLaggedResponse,
+    ReLUAnalyticalTurbulentTransportModel,
+    ZeroTransportModel,
+    _sum_float_delta_bar_trees,
+    build_dkx_fluxes_r_file_transport_model,
     build_fluxes_r_file_transport_model,
     read_flux_profile_file,
 )
 from NEOPAX._fem import cell_centered_from_faces, faces_from_cell_centered
 from NEOPAX._orchestrator import calculate_fluxes_from_config
 from NEOPAX._state import TransportState
+
+
+def test_sum_float_delta_bar_trees_converts_prepared_static_float0_leaves():
+    """Joint prepared-support paths retain mapped bar axes for static leaves."""
+    primal = {
+        "coefficient": jnp.asarray([2.0, -1.0]),
+        "mode_index": jnp.asarray([1, 3], dtype=jnp.int32),
+    }
+    # The energy-map axis is present on every cotangent leaf, including the
+    # float0 cotangent of an integer/static prepared-system leaf.
+    float0_index_bar = jnp.zeros((2, 2), dtype=jax.dtypes.float0)
+    total = _sum_float_delta_bar_trees(
+        primal,
+        {"coefficient": jnp.asarray([[1.0, 2.0], [0.0, 1.0]]), "mode_index": float0_index_bar},
+        {"coefficient": jnp.asarray([[-0.5, 3.0], [2.0, 0.0]]), "mode_index": float0_index_bar},
+        {"coefficient": jnp.asarray([[0.25, -1.0], [1.0, -2.0]]), "mode_index": float0_index_bar},
+        {"coefficient": jnp.asarray([[0.0, 0.5], [0.0, 1.0]]), "mode_index": float0_index_bar},
+    )
+    assert jnp.allclose(total["coefficient"], jnp.asarray([[0.75, 4.5], [3.0, 0.0]]))
+    assert total["mode_index"].shape == (2, 2)
+    assert total["mode_index"].dtype == jnp.float64
+    assert jnp.allclose(total["mode_index"], jnp.zeros((2, 2)))
 
 
 class DummySpecies:
@@ -54,6 +85,203 @@ class DummyFluxModel:
         return {"Gamma": self.gamma, "Q": self.q, "Upar": self.upar}
 
 
+def test_combined_flux_model_applies_interpolate_from_faces_to_black_box_centres():
+    """The universal mode owns the centre representation, not a submodel."""
+
+    class _CentreAndFaceModel:
+        def __call__(self, state):
+            del state
+            centre = jnp.asarray([[10.0, 20.0], [30.0, 40.0]])
+            return {"Gamma": centre, "Q": 2.0 * centre, "Upar": 3.0 * centre}
+
+        def evaluate_face_fluxes(self, state, face_state, **kwargs):
+            del state, face_state, kwargs
+            face = jnp.asarray([[1.0, 3.0, 5.0], [2.0, 4.0, 6.0]])
+            return {"Gamma": face, "Q": 2.0 * face, "Upar": 3.0 * face}
+
+    state = TransportState(
+        density=jnp.ones((2, 2)),
+        pressure=jnp.ones((2, 2)),
+        Er=jnp.zeros(2),
+    )
+    model = _CentreAndFaceModel()
+    combined = CombinedTransportFluxModel(
+        model,
+        model,
+        model,
+        geometry=DummyGeometry(),
+        center_flux_mode="interpolate_from_faces",
+    )
+
+    out = combined(state)
+    expected_faces = 3.0 * jnp.asarray([[1.0, 3.0, 5.0], [2.0, 4.0, 6.0]])
+    expected_centres = jax.vmap(cell_centered_from_faces)(expected_faces)
+
+    assert jnp.allclose(out["Gamma_faces"], expected_faces)
+    assert jnp.allclose(out["Gamma"], expected_centres)
+    # Direct/black-box mode must retain component face keys too: pressure
+    # convection consumes Gamma_neo on the face grid when face fluxes are
+    # selected globally.
+    assert jnp.allclose(out["Gamma_neo_faces"], jnp.asarray([[1.0, 3.0, 5.0], [2.0, 4.0, 6.0]]))
+
+
+def test_combined_lagged_flux_model_applies_interpolate_from_faces_to_centres():
+    """Lagged and black-box composite primals share the centre policy."""
+
+    class _LaggedCentreAndFaceModel:
+        def __call__(self, state):
+            del state
+            centre = jnp.asarray([[10.0, 20.0], [30.0, 40.0]])
+            return {"Gamma": centre, "Q": 2.0 * centre, "Upar": 3.0 * centre}
+
+        def build_lagged_response(self, state, **kwargs):
+            del state, kwargs
+            return object()
+
+        def evaluate_with_lagged_response(self, state, lagged_response, **kwargs):
+            del lagged_response, kwargs
+            out = self(state)
+            face = jnp.asarray([[1.0, 3.0, 5.0], [2.0, 4.0, 6.0]])
+            out.update({"Gamma_faces": face, "Q_faces": 2.0 * face, "Upar_faces": 3.0 * face})
+            return out
+
+    state = TransportState(
+        density=jnp.ones((2, 2)),
+        pressure=jnp.ones((2, 2)),
+        Er=jnp.zeros(2),
+    )
+    model = _LaggedCentreAndFaceModel()
+    combined = CombinedTransportFluxModel(
+        model,
+        model,
+        model,
+        geometry=DummyGeometry(),
+        center_flux_mode="interpolate_from_faces",
+    )
+
+    out = combined.evaluate_with_lagged_response(state, combined.build_lagged_response(state))
+    expected_faces = 3.0 * jnp.asarray([[1.0, 3.0, 5.0], [2.0, 4.0, 6.0]])
+
+    assert jnp.allclose(out["Gamma_faces"], expected_faces)
+    assert jnp.allclose(out["Gamma"], jax.vmap(cell_centered_from_faces)(expected_faces))
+
+
+def test_combined_lagged_flux_does_not_zero_missing_neoclassical_faces():
+    """A centre-only model may not be silently erased from face divergence.
+
+    This is the direct-centre quadratic-NTX shape: the neoclassical cached
+    response supplies centres, while a face-based turbulent response supplies
+    faces.  The composite must leave the face keys absent so the equation
+    layer takes its explicit face fallback; manufacturing face keys with zero
+    neoclassical contribution loses the neoclassical divergence.
+    """
+
+    class _CentreOnlyModel:
+        def __call__(self, state):
+            del state
+            centre = jnp.asarray([[10.0, 20.0], [30.0, 40.0]])
+            return {"Gamma": centre, "Q": 2.0 * centre, "Upar": 3.0 * centre}
+
+        def build_lagged_response(self, state, **kwargs):
+            del state, kwargs
+            return object()
+
+        def evaluate_with_lagged_response(self, state, response, **kwargs):
+            del response, kwargs
+            return self(state)
+
+    class _FaceModel(_CentreOnlyModel):
+        def evaluate_with_lagged_response(self, state, response, **kwargs):
+            out = super().evaluate_with_lagged_response(state, response, **kwargs)
+            face = jnp.asarray([[1.0, 3.0, 5.0], [2.0, 4.0, 6.0]])
+            out.update({"Gamma_faces": face, "Q_faces": 2.0 * face, "Upar_faces": 3.0 * face})
+            return out
+
+    state = TransportState(
+        density=jnp.ones((2, 2)), pressure=jnp.ones((2, 2)), Er=jnp.zeros(2)
+    )
+    neo = _CentreOnlyModel()
+    turb = _FaceModel()
+    combined = CombinedTransportFluxModel(
+        neo,
+        turb,
+        ZeroTransportModel(shape=(2, 2)),
+        geometry=DummyGeometry(),
+        center_flux_mode="direct",
+    )
+
+    output = combined.evaluate_with_lagged_response(
+        state, combined.build_lagged_response(state)
+    )
+
+    assert "Gamma_faces" not in output
+    assert "Q_faces" not in output
+    assert "Upar_faces" not in output
+    assert jnp.allclose(output["Gamma"], 2.0 * neo(state)["Gamma"])
+
+
+def test_combined_lagged_pullback_transposes_interpolated_centres_to_faces():
+    """The universal centre policy must have the matching AD transpose."""
+
+    class _ResponseModel:
+        def build_lagged_response(self, state, **kwargs):
+            del kwargs
+            return JVPTransportFluxResponse(reference_state=state, reference_flux={})
+
+        def evaluate_with_lagged_response(self, state, response, **kwargs):
+            del state, kwargs
+            density = response.reference_state.density
+            face = jnp.concatenate(
+                (density[:, :1], density),
+                axis=1,
+            )
+            return {
+                "Gamma": 10.0 * density,
+                "Q": 20.0 * density,
+                "Upar": 30.0 * density,
+                "Gamma_faces": face,
+                "Q_faces": 2.0 * face,
+                "Upar_faces": 3.0 * face,
+            }
+
+    state = TransportState(
+        density=jnp.asarray([[1.0, 2.0], [3.0, 4.0]]),
+        pressure=jnp.ones((2, 2)),
+        Er=jnp.zeros(2),
+    )
+    model = _ResponseModel()
+    combined = CombinedTransportFluxModel(
+        model,
+        model,
+        model,
+        geometry=DummyGeometry(),
+        center_flux_mode="interpolate_from_faces",
+    )
+    response = combined.build_lagged_response(state)
+    output = combined.evaluate_with_lagged_response(state, response)
+    output_bar = jax.tree_util.tree_map(jnp.zeros_like, output)
+    gamma_bar = jnp.asarray([[2.0, -1.0], [0.5, 3.0]])
+    output_bar["Gamma"] = gamma_bar
+
+    _, pullback = jax.vjp(
+        lambda response_value: combined.evaluate_with_lagged_response(state, response_value),
+        response,
+    )
+    expected = pullback(output_bar)[0]
+    actual = combined.pullback_evaluate_with_lagged_response(
+        state,
+        response,
+        {"Gamma": gamma_bar},
+    )
+
+    for expected_leaf, actual_leaf in zip(
+        jax.tree_util.tree_leaves(expected),
+        jax.tree_util.tree_leaves(actual),
+        strict=True,
+    ):
+        assert jnp.allclose(actual_leaf, expected_leaf)
+
+
 def test_transport_flux_base_lagged_response_is_flux_linearization():
     from NEOPAX._transport_flux_models import TransportFluxModelBase
 
@@ -86,7 +314,18 @@ def test_transport_flux_base_lagged_response_is_flux_linearization():
     assert jnp.allclose(out["Upar"], exact["Upar"])
 
 
-def _write_flux_file(path: Path, r, gamma=None, q=None, upar=None):
+def _write_flux_file(
+    path: Path,
+    r,
+    gamma=None,
+    q=None,
+    upar=None,
+    *,
+    r_center=None,
+    gamma_center=None,
+    q_center=None,
+    upar_center=None,
+):
     with h5py.File(path, "w") as f:
         f["r"] = jnp.asarray(r)
         if gamma is not None:
@@ -95,6 +334,14 @@ def _write_flux_file(path: Path, r, gamma=None, q=None, upar=None):
             f["Q"] = jnp.asarray(q)
         if upar is not None:
             f["Upar"] = jnp.asarray(upar)
+        if r_center is not None:
+            f["r_center"] = jnp.asarray(r_center)
+        if gamma_center is not None:
+            f["Gamma_center"] = jnp.asarray(gamma_center)
+        if q_center is not None:
+            f["Q_center"] = jnp.asarray(q_center)
+        if upar_center is not None:
+            f["Upar_center"] = jnp.asarray(upar_center)
 
 
 def test_read_flux_profile_file_accepts_1d_and_2d_inputs(tmp_path):
@@ -113,6 +360,131 @@ def test_read_flux_profile_file_accepts_1d_and_2d_inputs(tmp_path):
     assert upar_data is None
     assert jnp.allclose(gamma_data[0], jnp.array([1.0, 2.0, 3.0]))
     assert jnp.allclose(gamma_data[1], jnp.array([1.0, 2.0, 3.0]))
+
+
+def test_fluxes_r_file_default_is_face_centered_and_reconstructs_cells(tmp_path):
+    path = tmp_path / "default_face_fluxes.h5"
+    gamma_faces = jnp.array([[1.0, 3.0, 5.0], [2.0, 4.0, 6.0]])
+    q_faces = jnp.array([[10.0, 30.0, 50.0], [20.0, 40.0, 60.0]])
+    _write_flux_file(path, r=[0.0, 0.5, 1.0], gamma=gamma_faces, q=q_faces)
+
+    with contextlib.redirect_stdout(io.StringIO()):
+        model = build_fluxes_r_file_transport_model(
+            DummySpecies(),
+            DummyGeometry(),
+            fluxes_file=path,
+        )
+
+    center_fluxes = model(state=None)
+    face_fluxes = model.evaluate_face_fluxes(state=None, face_state=None)
+
+    assert jnp.allclose(face_fluxes["Gamma"], gamma_faces)
+    assert jnp.allclose(face_fluxes["Q"], q_faces)
+    assert jnp.allclose(center_fluxes["Gamma"], jnp.vstack([cell_centered_from_faces(gamma_faces[0]), cell_centered_from_faces(gamma_faces[1])]))
+    assert jnp.allclose(center_fluxes["Q"], jnp.vstack([cell_centered_from_faces(q_faces[0]), cell_centered_from_faces(q_faces[1])]))
+    assert jnp.allclose(center_fluxes["Gamma_faces"], gamma_faces)
+    assert jnp.allclose(center_fluxes["Q_faces"], q_faces)
+
+
+def test_fluxes_r_file_default_rejects_center_only_grid_that_misses_boundary_faces(tmp_path):
+    path = tmp_path / "center_only_fluxes.h5"
+    gamma = jnp.array([[1.0, 3.0], [2.0, 4.0]])
+    q = jnp.array([[10.0, 30.0], [20.0, 40.0]])
+    _write_flux_file(path, r=[0.25, 0.75], gamma=gamma, q=q)
+
+    with contextlib.redirect_stdout(io.StringIO()):
+        with pytest.raises(ValueError, match="does not cover"):
+            build_fluxes_r_file_transport_model(
+                DummySpecies(),
+                DummyGeometry(),
+                fluxes_file=path,
+            )
+
+
+def test_fluxes_r_file_rejects_a_file_that_does_not_span_the_cell_grid(tmp_path):
+    path = tmp_path / "narrow_cell_fluxes.h5"
+    _write_flux_file(path, r=[0.3, 0.7], gamma=jnp.ones((2, 2)), q=jnp.ones((2, 2)))
+
+    with contextlib.redirect_stdout(io.StringIO()):
+        with pytest.raises(ValueError, match=r"does not cover geometry\.r_grid"):
+            build_fluxes_r_file_transport_model(
+                DummySpecies(),
+                DummyGeometry(),
+                fluxes_file=path,
+                grid_location="cell_centered",
+            )
+
+
+def test_fluxes_r_file_rejects_a_file_that_does_not_span_the_face_grid(tmp_path):
+    path = tmp_path / "narrow_face_fluxes.h5"
+    _write_flux_file(path, r=[0.0, 0.5, 0.9], gamma=jnp.ones((2, 3)), q=jnp.ones((2, 3)))
+
+    with contextlib.redirect_stdout(io.StringIO()):
+        with pytest.raises(ValueError, match=r"does not cover geometry\.r_grid_half"):
+            build_fluxes_r_file_transport_model(
+                DummySpecies(),
+                DummyGeometry(),
+                fluxes_file=path,
+                grid_location="face_centered",
+            )
+
+
+def test_fluxes_r_file_rejects_a_file_grid_too_short_to_interpolate(tmp_path):
+    path = tmp_path / "single_point_fluxes.h5"
+    _write_flux_file(path, r=[0.5], gamma=jnp.ones((2, 1)), q=jnp.ones((2, 1)))
+
+    with contextlib.redirect_stdout(io.StringIO()):
+        with pytest.raises(ValueError, match=r"at least 2"):
+            build_fluxes_r_file_transport_model(
+                DummySpecies(),
+                DummyGeometry(),
+                fluxes_file=path,
+                grid_location="cell_centered",
+            )
+
+
+def test_fluxes_r_file_rejects_a_descending_file_grid(tmp_path):
+    path = tmp_path / "descending_fluxes.h5"
+    _write_flux_file(path, r=[0.75, 0.25], gamma=jnp.ones((2, 2)), q=jnp.ones((2, 2)))
+
+    with contextlib.redirect_stdout(io.StringIO()):
+        with pytest.raises(ValueError, match=r"strictly increasing"):
+            build_fluxes_r_file_transport_model(
+                DummySpecies(),
+                DummyGeometry(),
+                fluxes_file=path,
+                grid_location="cell_centered",
+            )
+
+
+def test_fluxes_r_file_rejects_a_file_grid_with_non_finite_radii(tmp_path):
+    path = tmp_path / "nonfinite_fluxes.h5"
+    _write_flux_file(path, r=[0.25, jnp.nan], gamma=jnp.ones((2, 2)), q=jnp.ones((2, 2)))
+
+    with contextlib.redirect_stdout(io.StringIO()):
+        with pytest.raises(ValueError, match=r"non-finite"):
+            build_fluxes_r_file_transport_model(
+                DummySpecies(),
+                DummyGeometry(),
+                fluxes_file=path,
+                grid_location="cell_centered",
+            )
+
+
+def test_fluxes_r_file_accepts_a_file_whose_endpoints_touch_the_grid(tmp_path):
+    path = tmp_path / "touching_fluxes.h5"
+    gamma = jnp.array([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])
+    _write_flux_file(path, r=[0.25, 0.5, 0.75], gamma=gamma, q=gamma)
+
+    with contextlib.redirect_stdout(io.StringIO()):
+        model = build_fluxes_r_file_transport_model(
+            DummySpecies(),
+            DummyGeometry(),
+            fluxes_file=path,
+            grid_location="cell_centered",
+        )
+
+    assert jnp.all(jnp.isfinite(model(state=None)["Gamma"]))
 
 
 def test_fluxes_r_file_model_cell_centered_reconstructs_faces(tmp_path):
@@ -187,6 +559,55 @@ def test_fluxes_r_file_model_face_centered_reconstructs_cells(tmp_path):
     assert jnp.allclose(center_fluxes["Q"], jnp.vstack([cell_centered_from_faces(q_faces[0]), cell_centered_from_faces(q_faces[1])]))
 
 
+def test_fluxes_r_file_direct_center_mode_reads_center_datasets(tmp_path):
+    path = tmp_path / "face_and_center_fluxes.h5"
+    gamma_faces = jnp.array([[1.0, 3.0, 5.0], [2.0, 4.0, 6.0]])
+    q_faces = jnp.array([[10.0, 30.0, 50.0], [20.0, 40.0, 60.0]])
+    gamma_center = jnp.array([[11.0, 13.0], [12.0, 14.0]])
+    q_center = jnp.array([[110.0, 130.0], [120.0, 140.0]])
+    _write_flux_file(
+        path,
+        r=[0.0, 0.5, 1.0],
+        gamma=gamma_faces,
+        q=q_faces,
+        r_center=[0.25, 0.75],
+        gamma_center=gamma_center,
+        q_center=q_center,
+    )
+
+    with contextlib.redirect_stdout(io.StringIO()):
+        model = build_fluxes_r_file_transport_model(
+            DummySpecies(),
+            DummyGeometry(),
+            fluxes_file=path,
+            center_flux_mode="file_center",
+        )
+
+    center_fluxes = model(state=None)
+    face_fluxes = model.evaluate_face_fluxes(state=None, face_state=None)
+
+    assert jnp.allclose(face_fluxes["Gamma"], gamma_faces)
+    assert jnp.allclose(face_fluxes["Q"], q_faces)
+    assert jnp.allclose(center_fluxes["Gamma"], gamma_center)
+    assert jnp.allclose(center_fluxes["Q"], q_center)
+
+
+def test_fluxes_r_file_direct_center_mode_requires_center_datasets(tmp_path):
+    path = tmp_path / "missing_center_fluxes.h5"
+    gamma_faces = jnp.array([[1.0, 3.0, 5.0], [2.0, 4.0, 6.0]])
+    _write_flux_file(path, r=[0.0, 0.5, 1.0], gamma=gamma_faces)
+
+    with contextlib.redirect_stdout(io.StringIO()):
+        with pytest.warns(RuntimeWarning, match="center_flux_mode='file_center'"):
+            with pytest.raises(ValueError, match="requires center-grid datasets"):
+                build_fluxes_r_file_transport_model(
+                    DummySpecies(),
+                    DummyGeometry(),
+                    fluxes_file=path,
+                    center_flux_mode="file_center",
+                )
+
+
 def test_fluxes_r_file_with_q_scale_returns_updated_model(tmp_path):
     path = tmp_path / "scale_update_fluxes.h5"
     gamma = jnp.array([[1.0, 3.0], [2.0, 4.0]])
@@ -220,6 +641,246 @@ def test_fluxes_r_file_invalid_profile_location_raises():
     )
     with pytest.raises(ValueError):
         model._normalize_profile_location()
+
+
+class DummyFDSpecies:
+    number_species = 2
+    names = ("e", "i")
+
+
+class DummyFDGeometry:
+    def __init__(self):
+        self.r_grid_half = jnp.array([0.0, 0.25, 0.5, 0.75, 1.0])
+        self.r_grid = jnp.array([0.125, 0.375, 0.625, 0.875])
+        self.dr = 0.25
+        self.a_b = 0.5
+
+
+def _write_fd_flux_file(path: Path, r):
+    n_r = len(r)
+    gamma = 1.0 + jnp.arange(2 * n_r, dtype=float).reshape(2, n_r)
+    q = 10.0 * gamma
+    with h5py.File(path, "w") as f:
+        f["r"] = jnp.asarray(r)
+        f["Gamma"] = gamma
+        f["Q"] = q
+        f["Upar"] = jnp.zeros_like(gamma)
+        # One perturbation channel: (n_perturb, n_species, n_radius).
+        f["Gamma_perturb"] = (1.05 * gamma)[None, :, :]
+        f["Q_perturb"] = (1.05 * q)[None, :, :]
+        f["perturb_delta"] = 0.05 * jnp.ones((1, n_r))
+        f["perturb_present"] = jnp.ones((1, n_r), dtype=bool)
+        f["perturb_kind"] = ["temperature_gradient"]
+        f["perturb_species"] = ["i"]
+
+
+def _write_dkx_fd_flux_file(path: Path, rho):
+    n_r = len(rho)
+    # Deliberately use the opposite order from DummyFDSpecies to verify that
+    # the DKX adapter maps output rows by name rather than by position.
+    gamma_ion = 10.0 + jnp.arange(n_r, dtype=float)
+    gamma_electron = 1.0 + jnp.arange(n_r, dtype=float)
+    gamma = jnp.stack((gamma_ion, gamma_electron))
+    q = 10.0 * gamma
+    with h5py.File(path, "w") as f:
+        f["rho"] = jnp.asarray(rho)
+        # rHat is intentionally different from NEOPAX's physical radius.
+        f["rHat"] = 0.8 * jnp.asarray(rho)
+        f["r"] = f["rHat"][...]
+        f["species_names"] = ["i", "e"]
+        f["Gamma"] = gamma
+        f["Q"] = q
+        f["Upar"] = jnp.zeros_like(gamma)
+        f["Gamma_perturbed"] = (1.05 * gamma)[None, :, :]
+        f["Q_perturbed"] = (1.05 * q)[None, :, :]
+        f["perturb_delta"] = 0.05 * jnp.ones((1, n_r))
+        f["perturb_present"] = jnp.ones((1, n_r), dtype=bool)
+        f["response_label"] = ["temperature_gradient"]
+        f["perturb_species"] = ["i"]
+
+
+def test_dkx_flux_file_fd_adapter_uses_rho_and_runtime_species_order(tmp_path):
+    geometry = DummyFDGeometry()
+    rho = geometry.r_grid_half / geometry.a_b
+    path = tmp_path / "dkx_flux_profiles.h5"
+    _write_dkx_fd_flux_file(path, rho)
+
+    with contextlib.redirect_stdout(io.StringIO()):
+        model = build_dkx_fluxes_r_file_transport_model(
+            DummyFDSpecies(),
+            geometry,
+            neoclassical_file=path,
+            lagged_response_mode="fd",
+        )
+
+    assert jnp.allclose(model.r_data, geometry.r_grid_half)
+    # Runtime order is (e, i), while the file order is (i, e).
+    assert jnp.allclose(model.gamma_data[0], 1.0 + jnp.arange(rho.size))
+    assert jnp.allclose(model.gamma_data[1], 10.0 + jnp.arange(rho.size))
+    assert jnp.allclose(model.gamma_perturb_data[0, 0], 1.05 * model.gamma_data[0])
+    assert jnp.allclose(model.gamma_perturb_data[0, 1], 1.05 * model.gamma_data[1])
+    assert int(model.perturb_kind_codes[0]) == 1
+    assert int(model.perturb_species_indices[0]) == 1
+
+    state = _fd_state(geometry.r_grid.shape[0])
+    response = model.build_lagged_response(state)
+    assert isinstance(response, SpectraXTurbulenceFDLaggedResponse)
+
+    combined = CombinedTransportFluxModel(
+        neoclassical_model=model,
+        turbulent_model=ZeroTransportModel(),
+        classical_model=ZeroTransportModel(),
+        geometry=geometry,
+    )
+    combined_response = combined.build_lagged_response(state)
+    warmer_ion_pressure = state.pressure.at[1, -1].add(0.1 * state.density[1, -1])
+    warmer_state = TransportState(
+        density=state.density,
+        pressure=warmer_ion_pressure,
+        Er=state.Er,
+    )
+    combined_flux = combined.evaluate_with_lagged_response(
+        warmer_state, combined_response
+    )
+    assert jnp.allclose(combined_flux["Q_neo_faces"], combined_flux["Q_faces"])
+    assert not jnp.allclose(
+        combined_flux["Q_neo_faces"], response.reference_flux["Q_faces"]
+    )
+
+
+def test_dkx_flux_file_adapter_rejects_species_mismatch(tmp_path):
+    geometry = DummyFDGeometry()
+    path = tmp_path / "dkx_wrong_species.h5"
+    _write_dkx_fd_flux_file(path, geometry.r_grid_half / geometry.a_b)
+    with h5py.File(path, "r+") as f:
+        del f["species_names"]
+        f["species_names"] = ["i", "T"]
+
+    with pytest.raises(ValueError, match="species do not match"):
+        build_dkx_fluxes_r_file_transport_model(
+            DummyFDSpecies(), geometry, neoclassical_file=path
+        )
+
+
+def _fd_state(n_r):
+    profile = jnp.linspace(2.0, 1.0, n_r)
+    density = jnp.stack([profile, profile])
+    temperature = jnp.stack([3.0 * profile, 2.0 * profile])
+    return TransportState(density=density, pressure=density * temperature, Er=jnp.zeros(n_r))
+
+
+def test_fd_lagged_response_rejects_a_flux_file_off_the_geometry_grid(tmp_path):
+    path = tmp_path / "fd_mismatched_fluxes.h5"
+    _write_fd_flux_file(path, r=[0.1, 0.3, 0.6, 0.9])
+
+    with contextlib.redirect_stdout(io.StringIO()):
+        with pytest.raises(ValueError, match="does not cover|primary NEOPAX flux grid"):
+            build_fluxes_r_file_transport_model(
+                DummyFDSpecies(),
+                DummyFDGeometry(),
+                fluxes_file=path,
+                lagged_response_mode="fd",
+            )
+
+
+def test_fd_lagged_response_rejects_center_length_perturbation_data_on_face_grid(tmp_path):
+    geometry = DummyFDGeometry()
+    path = tmp_path / "fd_bad_perturb_shape_fluxes.h5"
+    _write_fd_flux_file(path, r=geometry.r_grid_half)
+    with h5py.File(path, "r+") as f:
+        center_n = geometry.r_grid.shape[0]
+        del f["Q_perturb"]
+        f["Q_perturb"] = jnp.ones((1, 2, center_n))
+
+    with contextlib.redirect_stdout(io.StringIO()):
+        with pytest.raises(ValueError, match="Q_perturb/Q_perturbed"):
+            build_fluxes_r_file_transport_model(
+                DummyFDSpecies(),
+                geometry,
+                fluxes_file=path,
+                lagged_response_mode="fd",
+            )
+
+
+def test_fd_lagged_response_builds_under_jit(tmp_path):
+    geometry = DummyFDGeometry()
+    path = tmp_path / "fd_fluxes.h5"
+    _write_fd_flux_file(path, r=geometry.r_grid_half)
+
+    with contextlib.redirect_stdout(io.StringIO()):
+        model = build_fluxes_r_file_transport_model(
+            DummyFDSpecies(),
+            geometry,
+            fluxes_file=path,
+            lagged_response_mode="fd",
+        )
+    state = _fd_state(geometry.r_grid.shape[0])
+
+    eager = model.build_lagged_response(state)
+    jitted = jax.jit(model.build_lagged_response)(state)
+
+    assert isinstance(jitted, SpectraXTurbulenceFDLaggedResponse)
+    assert jnp.allclose(jitted.reference_flux["Q_faces"], eager.reference_flux["Q_faces"])
+    assert jnp.allclose(jitted.reference_basis, eager.reference_basis)
+    assert jnp.allclose(jitted.q_perturb, eager.q_perturb)
+
+
+def test_fd_lagged_response_uses_dirichlet_face_gradient_for_edge_temperature_response(tmp_path):
+    """The final-cell temperature tangent must respect the fixed edge value.
+
+    A warmer final cell makes the outward drop to a colder Dirichlet boundary
+    steeper, hence the outer ``a/L_T`` coordinate must increase.  The old
+    cell-centred/extrapolated response had the opposite sign.
+    """
+    geometry = DummyFDGeometry()
+    path = tmp_path / "fd_fluxes.h5"
+    _write_fd_flux_file(path, r=geometry.r_grid_half)
+    with contextlib.redirect_stdout(io.StringIO()):
+        model = build_fluxes_r_file_transport_model(
+            DummyFDSpecies(),
+            geometry,
+            fluxes_file=path,
+            lagged_response_mode="fd",
+        )
+    state = _fd_state(geometry.r_grid.shape[0])
+    temperature_bc = BoundaryConditionModel(
+        dr=float(geometry.dr),
+        left_type="neumann",
+        right_type="dirichlet",
+        right_value=jnp.array([1.0, 1.0]),
+    )
+    # The file's only perturbation channel is ``temperature_gradient`` for
+    # species ``i`` (index 1), so exercise that selected coordinate.
+    temperature_direction = jnp.zeros_like(state.temperature).at[1, -1].set(1.0)
+    direction = TransportState(
+        density=jnp.zeros_like(state.density),
+        pressure=state.density * temperature_direction,
+        Er=jnp.zeros_like(state.Er),
+    )
+
+    _, basis_tangent = jax.jvp(
+        lambda state_value: model._spectrax_fd_face_basis(
+            state_value,
+            bc_temperature=temperature_bc,
+        ),
+        (state,),
+        (direction,),
+    )
+
+    assert basis_tangent[0, -1] > 0.0
+
+    response = model.build_lagged_response(state, bc_temperature=temperature_bc)
+    warmer_state = TransportState(
+        density=state.density,
+        pressure=state.pressure + 0.1 * direction.pressure,
+        Er=state.Er,
+    )
+    updated_flux = model.evaluate_with_lagged_response(
+        warmer_state,
+        response,
+        bc_temperature=temperature_bc,
+    )
+    assert updated_flux["Q_faces"][0, -1] > response.reference_flux["Q_faces"][0, -1]
 
 
 def test_analytical_turbulent_transport_model_with_transport_coeffs_updates_coefficients():
@@ -261,6 +922,51 @@ def test_power_analytical_turbulent_transport_model_with_transport_coeffs_update
     assert updated.total_power_mw == 9.0
 
 
+def test_relu_analytical_turbulent_transport_model_thresholds_fluxes():
+    species = type(
+        "Species",
+        (),
+        {
+            "species_idx": {"e": 0},
+            "species_indices": jnp.array([0, 1]),
+            "names": ("e", "D"),
+            "number_species": 2,
+            # The ReLU model converts gyro-Bohm amplitudes to physical units
+            # using a non-electron reference species.
+            "mass_mp": jnp.array([1.0 / 1836.0, 2.0]),
+        },
+    )()
+    field = DummyGeometry()
+    state = TransportState(
+        density=jnp.array([[2.0, 1.0], [2.0, 1.0]]),
+        pressure=jnp.array([[20.0, 4.0], [20.0, 4.0]]),
+        Er=jnp.zeros((2, 2)),
+    )
+
+    off_model = ReLUAnalyticalTurbulentTransportModel(
+        species=species,
+        field=field,
+        density_critical_gradient=jnp.array([1.0e30, 1.0e30]),
+        temperature_critical_gradient=jnp.array([1.0e30, 1.0e30]),
+        density_relu_slope=jnp.array([0.0, 0.0]),
+        temperature_relu_slope=jnp.array([0.0, 0.0]),
+    )
+    on_model = off_model.with_transport_coeffs(
+        density_critical_gradient=0.0,
+        temperature_critical_gradient=0.0,
+        density_relu_slope=1.0,
+        temperature_relu_slope=1.0,
+    )
+
+    off_fluxes = off_model(state)
+    on_fluxes = on_model(state)
+
+    assert jnp.allclose(off_fluxes["Gamma"], 0.0)
+    assert jnp.allclose(off_fluxes["Q"], 0.0)
+    assert jnp.any(jnp.abs(on_fluxes["Gamma"]) > 0.0)
+    assert jnp.any(jnp.abs(on_fluxes["Q"]) > 0.0)
+
+
 def test_combined_transport_flux_model_can_drop_turbulent_particle_flux():
     gamma_neo = jnp.array([[1.0, 1.0], [1.0, 1.0]])
     gamma_turb = jnp.array([[2.0, 2.0], [2.0, 2.0]])
@@ -288,6 +994,105 @@ def test_combined_transport_flux_model_can_drop_turbulent_particle_flux():
     local_eval = model.build_local_particle_flux_evaluator(state=None)
     gamma_local = local_eval(0, 0.0)
     assert jnp.allclose(gamma_local, gamma_neo[:, 0] + gamma_classical[:, 0])
+
+
+def test_combined_joint_lagged_pullback_preserves_submodel_state_bars():
+    """The joint NTX hook must not forward BC kwargs or drop combined bars."""
+
+    class LinearLaggedModel:
+        def __init__(self, factor, *, joint=False):
+            self.factor = factor
+            self.joint = joint
+
+        def pullback_build_lagged_response(self, state, response_bar, **kwargs):
+            assert kwargs["bc_density"] == "density-bc"
+            assert kwargs["bc_temperature"] == "temperature-bc"
+            return self.factor * response_bar
+
+        def pullback_build_lagged_response_state_and_support_payload_batched_interpolated_faces(
+            self,
+            state,
+            response_bars,
+            support,
+        ):
+            assert self.joint
+            return self.factor * response_bars, 11.0 * response_bars
+
+    model = CombinedTransportFluxModel(
+        neoclassical_model=LinearLaggedModel(3.0, joint=True),
+        turbulent_model=LinearLaggedModel(5.0),
+        classical_model=LinearLaggedModel(7.0),
+    )
+    bars = jnp.asarray([2.0, -1.0])
+    state_bars, support_bars = (
+        model.pullback_build_lagged_response_state_and_support_payload_batched_interpolated_faces(
+            jnp.asarray(1.0),
+            CombinedTransportLaggedResponse(bars, bars, bars),
+            jnp.asarray(4.0),
+            bc_density="density-bc",
+            bc_temperature="temperature-bc",
+        )
+    )
+
+    assert jnp.allclose(state_bars, 15.0 * bars)
+    assert jnp.allclose(support_bars, 11.0 * bars)
+
+    state_bars_without_classical, _ = (
+        model.pullback_build_lagged_response_state_and_support_payload_batched_interpolated_faces(
+            jnp.asarray(1.0),
+            CombinedTransportLaggedResponse(bars, bars, None),
+            jnp.asarray(4.0),
+            bc_density="density-bc",
+            bc_temperature="temperature-bc",
+        )
+    )
+    assert jnp.allclose(state_bars_without_classical, 8.0 * bars)
+
+
+def test_combined_native_joint_lagged_pullback_selects_native_hook_only():
+    """The initial-carry native hook is isolated from existing joint modes."""
+
+    class NativeJointModel:
+        def pullback_build_lagged_response_state_and_support_payload_batched_interpolated_faces_native_multi_rhs_reuse_moment_drds_jvp_shared_primal(
+            self, state, response_bars, support, **kwargs
+        ):
+            assert kwargs["packed_support_directional_adjoint"] is False
+            del state
+            return 3.0 * response_bars, 5.0 * support
+
+    model = CombinedTransportFluxModel(
+        neoclassical_model=NativeJointModel(),
+        turbulent_model=None,
+        classical_model=None,
+    )
+    bars = jnp.asarray([2.0, -1.0])
+    state_bars, support_bars = (
+        model.pullback_build_lagged_response_state_and_support_payload_batched_interpolated_faces_native_multi_rhs_reuse_moment_drds_jvp_shared_primal(
+            jnp.asarray(1.0),
+            CombinedTransportLaggedResponse(bars, None, None),
+            jnp.asarray(4.0),
+        )
+    )
+    assert jnp.allclose(state_bars, 3.0 * bars)
+    assert jnp.allclose(support_bars, jnp.asarray(20.0))
+
+
+def test_combined_batched_primal_reuse_support_pullback_delegates_to_neoclassical():
+    class Neoclassical:
+        def pullback_build_lagged_response_support_payload_batched_interpolated_faces_reuse_local_vjp_primal(
+            self, state, response_bars, support
+        ):
+            return response_bars + support
+
+    model = CombinedTransportFluxModel(
+        neoclassical_model=Neoclassical(), turbulent_model=None, classical_model=None
+    )
+    bars = jnp.asarray([2.0, -1.0])
+    result = model.pullback_build_lagged_response_support_payload_batched_interpolated_faces_reuse_local_vjp_primal(
+        jnp.asarray(1.0), CombinedTransportLaggedResponse(bars, None, None), jnp.asarray(4.0),
+        bc_density="ignored", bc_temperature="ignored",
+    )
+    assert jnp.allclose(result, bars + 4.0)
 
 
 def test_calculate_fluxes_from_config_uses_flux_output_flags():

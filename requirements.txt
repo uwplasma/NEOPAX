@@ -12,3 +12,5 @@ netcdf4
 matplotlib
 toml
 tomli
+vmex @ git+https://github.com/uwplasma/vmex.git@en/local_test
+ntx @ git+https://github.com/uwplasma/NTX.git@en/custom_rule_NEOPAX

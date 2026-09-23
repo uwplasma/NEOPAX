@@ -1,0 +1,269 @@
+#!/usr/bin/env python
+"""Repeated-evaluation memory boundary test for the live NTX database path.
+
+No SciPy optimization is run.  Each trial evaluates the same geometry vector
+through the database-native selected-root reverse path, including its one
+database-to-scan transpose.  This is intentionally separate from the exact
+Lij staged-lane memory test.
+"""
+
+from __future__ import annotations
+
+import argparse
+import gc
+import io
+from contextlib import redirect_stdout
+from pathlib import Path
+import sys
+import time
+
+import jax
+import numpy as np
+
+ROOT = Path(__file__).resolve().parents[2]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from NEOPAX import optimization as opt  # noqa: E402
+import optimize_geometry_qi_max_er_transition_bootstrap_initial_root as base_example  # noqa: E402
+
+
+DATABASE_TRANSPORT_CONFIG = (
+    ROOT
+    / "examples"
+    / "benchmarks"
+    / "Solve_Transport_equations_wHe_radau_ntx_scan_runtime_database_vmec_realtime_geometry_benchmark_black_box.toml"
+)
+SMALL_DATABASE_TRANSPORT_CONFIG = (
+    ROOT
+    / "examples"
+    / "benchmarks"
+    / "Solve_Transport_equations_wHe_radau_ntx_scan_runtime_database_vmec_realtime_geometry_benchmark_black_box_small.toml"
+)
+
+
+class QuietProblem:
+    """Suppress existing progress output; test output stays one line per trial."""
+
+    def __init__(self, problem, *, diagnose_database_dispatch: bool = False):
+        self._problem = problem
+        self._diagnose_database_dispatch = bool(diagnose_database_dispatch)
+        self.database_dispatch_points: list[tuple[str, int | None, int | None]] = []
+
+    def evaluate(self, values):
+        self.database_dispatch_points = []
+        original_evaluator = None
+        if self._diagnose_database_dispatch:
+            # ``GeometryInitialErRootLeastSquaresProblem.evaluate`` resolves
+            # this module global at call time. Temporarily wrapping it lets
+            # the unchanged database benchmark evaluator report phase-local
+            # JAX dispatch-cache sizes without changing its mathematics.
+            original_evaluator = opt.evaluate_geometry_initial_er_root_only_least_squares_benchmark_tables
+
+            def _cache_size() -> int | None:
+                try:
+                    from jax._src import dispatch
+
+                    return int(dispatch.xla_primitive_callable.cache_info().currsize)
+                except (AttributeError, ImportError):
+                    return None
+
+            def _probe(label: str) -> None:
+                self.database_dispatch_points.append(
+                    (str(label), _cache_size(), opt._process_resident_memory_bytes())
+                )
+
+            def _instrumented_evaluator(*args, **kwargs):
+                kwargs["dispatch_cache_probe"] = _probe
+                _probe("benchmark_evaluator_entry")
+                result = original_evaluator(*args, **kwargs)
+                _probe("benchmark_evaluator_return")
+                return result
+
+            opt.evaluate_geometry_initial_er_root_only_least_squares_benchmark_tables = (
+                _instrumented_evaluator
+            )
+        try:
+            with redirect_stdout(io.StringIO()):
+                return self._problem.evaluate(values)
+        finally:
+            if original_evaluator is not None:
+                opt.evaluate_geometry_initial_er_root_only_least_squares_benchmark_tables = original_evaluator
+
+
+def _terms_for_objective_set(objective_set: str):
+    """Match the exact-Lij memory isolation sets for the database lane."""
+
+    selected = []
+    for term in base_example.terms:
+        objective = getattr(term[0], "objective", term[0])
+        is_transport = objective.family == "transport"
+        if objective_set == "geometry_only":
+            if not is_transport:
+                selected.append(term)
+            continue
+        if objective_set == "transport_er_only":
+            if is_transport and objective.name != "bootstrap_current_softmax_abs_scaled":
+                selected.append(term)
+            continue
+        selected.append(term)
+    return selected
+
+
+def _live_jax_array_count() -> int | None:
+    live_arrays = getattr(jax, "live_arrays", None)
+    if live_arrays is None:
+        return None
+
+
+def _term_summary(problem) -> str:
+    """Show the normalized terms that actually reach the evaluator."""
+
+    return ",".join(
+        f"{term.objective.family}:{term.objective.name}"
+        for term in problem.terms
+    )
+    try:
+        return len(live_arrays())
+    except Exception:
+        return None
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--objective-set",
+        choices=("all", "geometry_only", "transport_er_only"),
+        default="all",
+        help="Isolate geometry, selected-Er transport, or their combined evaluation.",
+    )
+    parser.add_argument(
+        "--mode",
+        choices=(
+            "database",
+            "database_root_experiment",
+            "database_root_jit_experiment",
+            "database_root_fresh_payload_experiment",
+        ),
+        default="database",
+        help=(
+            "Use the unchanged database baseline, the parity-validated root "
+            "stage, or the exact-root outer-JIT experiment."
+        ),
+    )
+    parser.add_argument("--warmup", type=int, default=1)
+    parser.add_argument("--repeats", type=int, default=3)
+    parser.add_argument(
+        "--small-database",
+        action="store_true",
+        help="Use the reduced (5, 25, 31) database grid used by the parity test.",
+    )
+    parser.add_argument(
+        "--diagnose-database-dispatch",
+        action="store_true",
+        help=(
+            "Report JAX dispatch-cache size at existing database reverse "
+            "phase boundaries; this does not add a JIT boundary."
+        ),
+    )
+    args = parser.parse_args()
+    if args.warmup < 0 or args.repeats < 1:
+        raise ValueError("--warmup must be non-negative and --repeats must be positive.")
+    if not np.isscalar(base_example.MAX_MODE_SCHEDULE):
+        raise ValueError("The database memory test requires one fixed MAX_MODE_SCHEDULE value.")
+
+    # Both modes use the database-native one-fold scan transpose. The trial
+    # mode only persists the fixed-table selected-root operator; the current
+    # recorded-scan fold remains in the same outer benchmark evaluator.
+    base_example.TRANSPORT_CONFIG = (
+        SMALL_DATABASE_TRANSPORT_CONFIG if args.small_database else DATABASE_TRANSPORT_CONFIG
+    )
+    base_example.REVERSE_STAGE_MODE = args.mode
+    base_example.terms = _terms_for_objective_set(args.objective_set)
+    base = base_example
+    problem = base.build_transition_bootstrap_initial_root_problem(
+        base.SEED_INPUT, int(base.MAX_MODE_SCHEDULE)
+    )
+    quiet_problem = QuietProblem(
+        problem, diagnose_database_dispatch=args.diagnose_database_dispatch
+    )
+    x = np.asarray(jax.device_get(problem.x0), dtype=float)
+    print(
+        "[database memory test] "
+        f"mode={args.mode} objective_set={args.objective_set} "
+        f"small_database={args.small_database} "
+        f"warmup={args.warmup} repeats={args.repeats} "
+        f"parameter_count={problem.parameter_count} "
+        "path=ntx_scan_runtime_database_selected_root_reverse "
+        f"terms={_term_summary(problem)}",
+        flush=True,
+    )
+    for warmup_index in range(args.warmup):
+        print(f"[database memory test] warmup={warmup_index} starting", flush=True)
+        started = time.perf_counter()
+        evaluation = quiet_problem.evaluate(x)
+        jax.block_until_ready((evaluation.residuals, evaluation.jacobian))
+        del evaluation
+        gc.collect()
+        print(
+            f"[database memory test] warmup={warmup_index} complete "
+            f"elapsed_s={time.perf_counter() - started:.3f}",
+            flush=True,
+        )
+        if args.diagnose_database_dispatch:
+            points = " ".join(
+                f"{label}=cache:{'unavailable' if size is None else size},"
+                f"rss:{'unavailable' if rss is None else f'{rss / 2**20:.1f}MiB'}"
+                for label, size, rss in quiet_problem.database_dispatch_points
+            )
+            print(
+                "[database memory test] database_dispatch_cache "
+                f"{points or 'unavailable'}",
+                flush=True,
+            )
+
+    first_rss: int | None = None
+
+    def report(sample) -> None:
+        nonlocal first_rss
+        if first_rss is None:
+            first_rss = sample.resident_memory_bytes
+        delta = (
+            None
+            if first_rss is None or sample.resident_memory_bytes is None
+            else (sample.resident_memory_bytes - first_rss) / 2**20
+        )
+        rss_text = "unavailable" if delta is None else f"{delta:+.1f} MiB"
+        arrays = _live_jax_array_count()
+        array_text = "unavailable" if arrays is None else str(arrays)
+        print(
+            f"[database memory test] trial={sample.iteration} "
+            f"elapsed_s={sample.elapsed_s:.3f} rss_delta={rss_text} "
+            f"live_jax_arrays={array_text} residual_norm={sample.residual_norm:.6e}",
+            flush=True,
+        )
+        if args.diagnose_database_dispatch:
+            points = " ".join(
+                f"{label}=cache:{'unavailable' if size is None else size},"
+                f"rss:{'unavailable' if rss is None else f'{rss / 2**20:.1f}MiB'}"
+                for label, size, rss in quiet_problem.database_dispatch_points
+            )
+            print(
+                "[database memory test] database_dispatch_cache "
+                f"{points or 'unavailable'}",
+                flush=True,
+            )
+
+    opt.repeated_evaluation_memory_samples(
+        quiet_problem,
+        warmup=0,
+        repeats=args.repeats,
+        scaled_parameter_values=x,
+        on_sample=report,
+    )
+    print("[database memory test] complete; SciPy was not run.", flush=True)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

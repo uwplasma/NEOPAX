@@ -161,7 +161,7 @@ Er_permittivity_mode = "ntss_like_midpoint"
 
 [transport_output]
 transport_plot = true
-transport_write_hdf5 = false
+transport_write_hdf5 = true
 transport_compare_ambipolarity_residual = false
 transport_scan_ambipolarity_residual = false
 transport_overlay_reference_er = true

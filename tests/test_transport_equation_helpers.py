@@ -1,10 +1,17 @@
 import dataclasses
+from types import SimpleNamespace
 
 import jax.numpy as jnp
 
 from NEOPAX._boundary_conditions import BoundaryConditionModel
+from NEOPAX._ambipolarity import _ambipolar_root_grid_has_axis_state_entry
+from NEOPAX._orchestrator import _initialize_floating_er_edge_node
 from NEOPAX._state import TransportState
 from NEOPAX._transport_equations import (
+    ComposedEquationSystem,
+    ElectricFieldEquation,
+    PARTICLE_FLUX_PHYSICAL_TO_STATE,
+    TemperatureEquation,
     _expand_density_rhs_to_full_shape,
     apply_er_dirichlet_boundary_state,
     enforce_quasi_neutrality,
@@ -17,6 +24,150 @@ class DummySpecies:
     charge_qp: jnp.ndarray
     names: tuple[str, ...]
     ion_indices: tuple[int, ...]
+
+
+def test_floating_er_edge_node_initialization_tracks_nearest_face_root():
+    """The private endpoint starts on the final-centre ambipolar branch."""
+
+    class _FaceFluxModel:
+        def evaluate_face_fluxes(self, _state, face_state, **_kwargs):
+            # The outer face has two roots, 1 and 3.  The selected final
+            # centre lies on the 3 branch, as in NTSS's forward continuation.
+            residual = (face_state.Er - 1.0) * (face_state.Er - 3.0)
+            return {
+                "Gamma": residual[None, :],
+                "Q": jnp.zeros((1, face_state.Er.shape[0])),
+                "Upar": jnp.zeros((1, face_state.Er.shape[0])),
+            }
+
+    state = TransportState(
+        density=jnp.ones((1, 2)),
+        pressure=jnp.ones((1, 2)),
+        Er=jnp.asarray([2.5, 2.8]),
+    )
+    runtime = SimpleNamespace(
+        species=SimpleNamespace(charge_qp=jnp.asarray([1.0])),
+        geometry=SimpleNamespace(r_grid_half=jnp.asarray([0.0, 0.5, 1.0])),
+        solver_parameters={"density_floor": 1.0e-6, "temperature_floor": 1.0e-6},
+        models=SimpleNamespace(flux=_FaceFluxModel()),
+    )
+    config = {
+        "ambipolarity": {
+            "er_ambipolar_method": "two_stage",
+            "er_ambipolar_scan_min": 0.0,
+            "er_ambipolar_scan_max": 4.0,
+            "er_ambipolar_n_coarse": 17,
+            "er_ambipolar_n_refine": 12,
+            "er_ambipolar_max_roots": 3,
+        }
+    }
+
+    edge = _initialize_floating_er_edge_node(state, runtime, config, {})
+    assert jnp.allclose(edge, 3.0, atol=1.0e-3)
+
+
+def test_floating_er_edge_node_initialization_uses_composed_working_state():
+    """The first private edge root matches the state the RHS will evaluate."""
+
+    class _FaceFluxModel:
+        def evaluate_face_fluxes(self, state, face_state, **_kwargs):
+            # Root is the final working density, not the raw setup density.
+            residual = face_state.Er - state.density[0, -1]
+            return {
+                "Gamma": residual[None, :],
+                "Q": jnp.zeros((1, face_state.Er.shape[0])),
+                "Upar": jnp.zeros((1, face_state.Er.shape[0])),
+            }
+
+    class _EquationSystem:
+        shared_flux_model = _FaceFluxModel()
+
+        @staticmethod
+        def _prepare_working_state(state):
+            return dataclasses.replace(state, density=state.density + 1.0), None
+
+        @staticmethod
+        def _shared_flux_bc_kwargs():
+            return {"bc_density": None, "bc_temperature": None, "bc_er": None}
+
+    state = TransportState(
+        density=jnp.ones((1, 2)), pressure=jnp.ones((1, 2)), Er=jnp.asarray([0.0, 2.0])
+    )
+    runtime = SimpleNamespace(
+        species=SimpleNamespace(charge_qp=jnp.asarray([1.0])),
+        geometry=SimpleNamespace(r_grid_half=jnp.asarray([0.0, 0.5, 1.0])),
+        solver_parameters={"density_floor": 1.0e-6, "temperature_floor": 1.0e-6},
+        models=SimpleNamespace(flux=_FaceFluxModel()),
+    )
+    config = {
+        "ambipolarity": {
+            "er_ambipolar_method": "two_stage",
+            "er_ambipolar_scan_min": 0.0,
+            "er_ambipolar_scan_max": 4.0,
+            "er_ambipolar_n_coarse": 17,
+            "er_ambipolar_n_refine": 12,
+            "er_ambipolar_max_roots": 3,
+        }
+    }
+    edge = _initialize_floating_er_edge_node(
+        state, runtime, config, {}, equation_system=_EquationSystem()
+    )
+    assert jnp.allclose(edge, 2.0, atol=1.0e-3)
+
+
+def test_node_lagged_cache_is_skipped_by_public_er_component_debugger():
+    """The public-state diagnostic must not misread Radau's private cache."""
+    cache = SimpleNamespace(transport_response=object(), er_edge_anchor=jnp.asarray(1.0))
+    state = TransportState(
+        density=jnp.ones((1, 2)), pressure=jnp.ones((1, 2)), Er=jnp.ones(2)
+    )
+    assert (
+        ComposedEquationSystem.debug_er_components_with_lagged_response(
+            object(), state, cache
+        )
+        is None
+    )
+
+
+def test_node_boundary_charge_residual_builds_cache_from_public_state_once():
+    """The edge-root residual must use the same one-prepare convention as Radau.
+
+    A second preparation can alter constrained/floored profiles.  In that
+    case, a cache built from the already prepared state is anchored at a
+    different point than the state at which the residual is evaluated.
+    """
+
+    class _FluxModel:
+        def evaluate_with_lagged_response(self, state, response, **_kwargs):
+            assert jnp.allclose(response, state.density)
+            return {"Gamma_faces": jnp.zeros((1, 3))}
+
+    class _System:
+        shared_flux_model = _FluxModel()
+
+        def _prepare_working_state(self, state):
+            # Deliberately non-idempotent, as a constrained profile operation
+            # can be in the full composed system.
+            return dataclasses.replace(state, density=state.density + 1.0), None
+
+        def build_node_boundary_lagged_response(self, state, _er_edge):
+            return self._prepare_working_state(state)[0].density
+
+        @staticmethod
+        def _shared_flux_call_kwargs(extra_kwargs=None):
+            return {} if extra_kwargs is None else dict(extra_kwargs)
+
+        @staticmethod
+        def _resolve_equations():
+            return None, None, SimpleNamespace(charge_qp=jnp.asarray([1.0]))
+
+    state = TransportState(
+        density=jnp.ones((1, 2)), pressure=jnp.ones((1, 2)), Er=jnp.zeros(2)
+    )
+    residual = ComposedEquationSystem.node_boundary_charge_residual(
+        _System(), state, jnp.asarray(0.0)
+    )
+    assert jnp.allclose(residual, 0.0)
 
 
 def test_enforce_quasi_neutrality_reconstructs_electron_density():
@@ -97,3 +248,166 @@ def test_expand_density_rhs_to_full_shape_returns_zero_template_on_mismatch():
     bad_rhs = jnp.ones((4,))
     out = _expand_density_rhs_to_full_shape(bad_rhs, template, species=None)
     assert jnp.allclose(out, jnp.zeros_like(template))
+
+
+def test_ambipolar_axis_skip_uses_state_centres_not_axis_face():
+    cell_centred_geometry = SimpleNamespace(
+        r_grid=jnp.asarray([0.01, 0.03]),
+        r_grid_half=jnp.asarray([0.0, 0.02, 0.04]),
+    )
+    axis_node_geometry = SimpleNamespace(r_grid=jnp.asarray([0.0, 0.02]))
+
+    assert not _ambipolar_root_grid_has_axis_state_entry(cell_centred_geometry)
+    assert _ambipolar_root_grid_has_axis_state_entry(axis_node_geometry)
+
+
+def test_face_completed_ambipolar_term_cell_centres_completed_face_scalar():
+    """The opt-in Er source uses supplied model faces, not reconstructed centres."""
+
+    state = TransportState(
+        density=jnp.ones((1, 2)),
+        pressure=jnp.ones((1, 2)),
+        Er=jnp.zeros(2),
+    )
+    gamma_faces = jnp.asarray([[2.0, 4.0, 8.0]])
+    equation = ElectricFieldEquation(
+        dr_cells=jnp.ones(2),
+        Vprime=jnp.ones(2),
+        Vprime_half=jnp.ones(3),
+        flux_model=None,
+        species_mass=jnp.ones(1),
+        charge_qp=jnp.ones(1),
+        permitivity_prefactor=jnp.ones(2),
+        gamma_faces_builder=lambda gamma: jnp.zeros((1, gamma.shape[1] + 1)),
+        er_diffusive_flux_builder=lambda er: jnp.zeros(er.shape[0] + 1),
+        source_mode="ambipolar_face_completed",
+        permitivity_mode="ntss_like_midpoint",
+        ntss_B0_mid=1.0,
+        ntss_psfactor_mid=1.0,
+        ntss_density_indices=jnp.asarray([0]),
+    )
+    # Deliberately inconsistent centre Gamma: if the implementation silently
+    # reconstructed faces from it, this assertion would fail.
+    charge_flux, ambi_term = equation._charge_flux_and_ambi_term(
+        state,
+        Gamma=jnp.asarray([[100.0, 200.0]]),
+        plasma_permitivity=jnp.ones(2),
+        Gamma_faces=gamma_faces,
+    )
+    expected_charge_flux = jnp.asarray([3.0, 6.0])
+    expected_coeff = 95780.0
+    assert jnp.allclose(charge_flux, expected_charge_flux)
+    assert jnp.allclose(ambi_term, expected_coeff * expected_charge_flux * 1.0e-20)
+
+
+def test_floating_er_edge_prefers_native_face_flux_over_center_reconstruction():
+    """The floating condition must use the model's outer face flux directly."""
+
+    state = TransportState(
+        density=jnp.ones((1, 2)),
+        pressure=jnp.ones((1, 2)),
+        Er=jnp.zeros(2),
+    )
+    equation = ElectricFieldEquation(
+        dr_cells=jnp.ones(2),
+        Vprime=jnp.ones(2),
+        Vprime_half=jnp.ones(3),
+        flux_model=None,
+        species_mass=jnp.ones(1),
+        charge_qp=jnp.ones(1),
+        permitivity_prefactor=jnp.ones(2),
+        # A deliberately incompatible fallback makes it clear that the
+        # native `Gamma_faces` payload, not reconstruction, is selected.
+        gamma_faces_builder=lambda gamma: jnp.zeros((1, gamma.shape[1] + 1)),
+        er_diffusive_flux_builder=lambda er: jnp.zeros(er.shape[0] + 1),
+        source_mode="ambipolar_local",
+        permitivity_mode="ntss_like_midpoint",
+        boundary_mode="floating_ambipolar_edge",
+        ntss_B0_mid=1.0,
+        ntss_psfactor_mid=1.0,
+        ntss_density_indices=jnp.asarray([0]),
+    )
+
+    rhs = equation(
+        state,
+        fluxes={
+            "Gamma": jnp.asarray([[100.0, 200.0]]),
+            "Gamma_faces": jnp.asarray([[2.0, 4.0, 8.0]]),
+        },
+    )
+    assert jnp.allclose(rhs[-1], -95780.0 * 8.0e-20)
+
+
+def test_floating_er_edge_node_keeps_last_cell_diffusion_and_evolves_face_node():
+    """The NTSS-like mode must not replace the last FV-cell equation."""
+    state = TransportState(
+        density=jnp.ones((1, 2)),
+        pressure=jnp.ones((1, 2)),
+        Er=jnp.asarray([1.0, 2.0]),
+    )
+    equation = ElectricFieldEquation(
+        dr_cells=jnp.ones(2),
+        Vprime=jnp.ones(2),
+        Vprime_half=jnp.ones(3),
+        flux_model=None,
+        species_mass=jnp.ones(1),
+        charge_qp=jnp.ones(1),
+        permitivity_prefactor=jnp.ones(2),
+        gamma_faces_builder=lambda gamma: jnp.zeros((1, gamma.shape[1] + 1)),
+        # A nonzero outer diffusive face makes a replacement of rhs[-1]
+        # immediately detectable: conservative_update gives [-0, -3].
+        er_diffusive_flux_builder=lambda er, er_edge: jnp.asarray([0.0, 0.0, 3.0]),
+        source_mode="ambipolar_local",
+        permitivity_mode="ntss_like_midpoint",
+        boundary_mode="floating_ambipolar_edge_node",
+        ntss_B0_mid=1.0,
+        ntss_psfactor_mid=1.0,
+        ntss_density_indices=jnp.asarray([0]),
+    )
+    fluxes = {
+        "Gamma": jnp.zeros((1, 2)),
+        "Gamma_faces": jnp.asarray([[0.0, 0.0, 8.0]]),
+    }
+    rhs = equation(state, fluxes=fluxes, er_edge_override=jnp.asarray(5.0))
+
+    # The node is deliberately not a public TransportState field.  It is a
+    # Radau-local scalar so ordinary forward/reverse state pytrees remain the
+    # same three leaves.
+    assert not hasattr(state, "Er_edge")
+    assert len(jax.tree_util.tree_leaves(state)) == 3
+    assert jnp.allclose(rhs, jnp.asarray([0.0, -3.0]))
+    assert jnp.allclose(
+        equation.edge_rhs(state, fluxes=fluxes, er_edge_override=jnp.asarray(5.0)),
+        -95780.0 * 8.0e-20,
+    )
+
+
+def test_face_completed_work_term_cell_centres_completed_face_product():
+    """Work interpolation must average ``q Gamma_face Er_face`` as one scalar."""
+
+    state = TransportState(
+        density=jnp.ones((1, 2)),
+        pressure=jnp.ones((1, 2)),
+        Er=jnp.asarray([1.0, 2.0]),
+    )
+    equation = TemperatureEquation(
+        dr_cells=jnp.ones(2),
+        Vprime=jnp.ones(2),
+        Vprime_half=jnp.ones(3),
+        flux_model=None,
+        flux_faces_builder=lambda gamma: gamma,
+        temperature_ghost_builder=lambda temperature: temperature,
+        charge_qp=jnp.asarray([1.0]),
+        active_species_mask=jnp.asarray([True]),
+        er_faces_builder=lambda unused_state: jnp.asarray([10.0, 20.0, 30.0]),
+        include_work_term=True,
+        work_term_reconstruction="face_completed",
+    )
+    work_rhs = equation._work_rhs(
+        state,
+        fluxes={"Gamma": jnp.asarray([[100.0, 200.0]])},
+        face_fluxes={"Gamma_faces": jnp.asarray([[2.0, 4.0, 8.0]])},
+    )
+    # centre values are 0.5 * [2*10 + 4*20, 4*20 + 8*30].
+    expected = PARTICLE_FLUX_PHYSICAL_TO_STATE * jnp.asarray([[50.0, 160.0]])
+    assert jnp.allclose(work_rhs, expected)

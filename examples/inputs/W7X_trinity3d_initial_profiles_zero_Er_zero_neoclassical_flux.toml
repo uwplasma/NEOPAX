@@ -1,0 +1,87 @@
+# Benchmark-style NEOPAX input using the W7-X geometry files added in
+# examples/inputs, with initial profiles matched to the Trinity3D W7-X example.
+# This file is configured for direct flux evaluation with Er initialized to zero,
+# no neoclassical/classical fluxes, and turbulence read from a Stage-4 SPECTRAX-GK
+# flux file.
+
+[general]
+mode = "fluxes"
+
+[geometry]
+vmec_file = "./examples/inputs/wout_w7x.nc"
+boozer_file = "./examples/inputs/boozmn_w7x.nc"
+n_radial = 9
+rho_edge = 0.7
+
+[neoclassical]
+flux_model = "none"
+entropy_model = "none"
+
+[turbulence]
+flux_model = "fluxes_r_file"
+turbulence_file = "./examples/inputs/neopax_fluxes_w7x_t3d.h5"
+
+[classical]
+flux_model = "none"
+
+[energy_grid]
+n_x = 4
+
+[species]
+n_species = 2
+names = ["e", "H"]
+mass_mp = [0.000544617, 1.0]
+charge_qp = [-1.0, 1.0]
+
+[profiles]
+model = "standard_analytical"
+n0 = [0.35, 0.35]
+n_edge = [0.29, 0.29]
+T0 = [6.7, 1.0]
+T_edge = [0.8, 0.8]
+density_shape_power = [2.0, 2.0]
+density_shape_alpha = [1.0, 1.0]
+temperature_shape_power = [2.0, 2.0]
+temperature_shape_alpha = [2.0, 1.0]
+er_initialization_mode = "analytical"
+er0_scale = 0.0
+er0_peak_rho = 0.8
+
+[boundary.density.left]
+type = "neumann"
+
+[boundary.density.left.gradient]
+default = 0.0
+
+[boundary.density.right]
+type = "dirichlet"
+
+[boundary.density.right.value]
+e = 0.29
+H = 0.29
+
+[boundary.temperature.left]
+type = "neumann"
+
+[boundary.temperature.left.gradient]
+default = 0.0
+
+[boundary.temperature.right]
+type = "dirichlet"
+
+[boundary.temperature.right.value]
+e = 0.8
+H = 0.8
+
+[boundary.Er.left]
+type = "dirichlet"
+value = 0.0
+
+[boundary.Er.right]
+type = "dirichlet"
+value = 0.0
+
+[fluxes]
+fluxes_plot = true
+fluxes_write_hdf5 = true
+fluxes_output_dir = "./outputs/w7x_trinity3d_zero_er_zero_neoclassical_flux"

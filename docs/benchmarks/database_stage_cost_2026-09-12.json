@@ -1,0 +1,56 @@
+{
+  "scope": "Local production-equation fixed-database stage solve and outgoing-state pullback; not the full reverse benchmark",
+  "fixture": {
+    "geometry_and_database": "stored files; no VMEC, NTX scan, ambipolar-root solve or rollout",
+    "stages": "constructed locally, not recorded converged transport stages",
+    "species": 4,
+    "radial_points": 51,
+    "state_dimension": 408,
+    "radau_stages": 7,
+    "objective_rows": 10,
+    "jax": "0.5.0",
+    "device": "NVIDIA GeForce RTX 3060 Laptop GPU (6144 MiB)",
+    "candidate": "local shared-J reference algebra subsequently implemented in the production helper"
+  },
+  "stage_pair": {
+    "independent": {
+      "lowering_s": 14.436705537000307,
+      "compile_s": 95.99525492099929,
+      "warm_median_s": 0.6814416510005685,
+      "warm_samples_s": [0.8274683710005775, 0.719080913999278, 0.6826689740009897, 0.6814416510005685, 0.6499540019995038, 0.6024917680006183, 0.558049392000612],
+      "optimized_hlo_bytes": 16466113,
+      "generated_code_bytes": 3534336,
+      "temporary_device_bytes": 2429468512,
+      "argument_bytes": 58760,
+      "output_bytes": 261136
+    },
+    "shared": {
+      "lowering_s": 2.639328471999761,
+      "compile_s": 58.24590513000112,
+      "warm_median_s": 0.41584938900086854,
+      "warm_samples_s": [0.5509393739994266, 0.4955560099988361, 0.4470928920000006, 0.41584938900086854, 0.38615460300025006, 0.36182258400003775, 0.33962690599946654],
+      "optimized_hlo_bytes": 8593362,
+      "generated_code_bytes": 2193792,
+      "temporary_device_bytes": 1971966472,
+      "argument_bytes": 58760,
+      "output_bytes": 261136
+    },
+    "residual_max_abs_difference": 0.0,
+    "outgoing_state_max_abs_difference": 0.0,
+    "all_outputs_finite": true
+  },
+  "standalone_components": {
+    "stage_jacobians": {"lowering_s": 2.6672812979995797, "compile_s": 49.240787662, "warm_median_s": 0.2960100219988817, "temporary_device_bytes": 1883399944},
+    "matrix_assembly": {"lowering_s": 0.007477428998754476, "compile_s": 0.04990299199926085, "warm_median_s": 0.0014816759994573658, "temporary_device_bytes": 392},
+    "dense_solve": {"lowering_s": 0.008906155000659055, "compile_s": 0.07737876400096866, "warm_median_s": 0.2250164870001754, "temporary_device_bytes": 130508161},
+    "state_contraction": {"lowering_s": 0.005134347000421258, "compile_s": 0.03900535000138916, "warm_median_s": 0.001568961000884883, "temporary_device_bytes": 4422800}
+  },
+  "limitations": [
+    "Warm samples show drift; sequential A/B medians do not establish a repeatable full-run speedup.",
+    "Standalone timings are not additive estimates of a fused production kernel.",
+    "Compiled temporary device bytes are not peak process host RSS.",
+    "No 16/4 reverse/forward ratio or full-run host-memory result is measured here.",
+    "Subsequent support-table compilation in the same multi-kernel probe was killed by the local host OOM killer; no support timing was obtained. Kernel journal reported anonymous RSS 7018620 KiB for the killed process. The completed stage results above were already saved."
+  ],
+  "raw_artifacts": "/tmp/database-stage-cost-51/{baseline,shared_jacobian,stage_jacobians,matrix_from_jacobians,solve_matrix,state_from_jacobians}.{json,optimized.hlo.txt,stablehlo.txt}"
+}

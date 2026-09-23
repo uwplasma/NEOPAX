@@ -212,7 +212,11 @@ def get_profile_gradient(
 ):
     del r_grid, dr
     if right_face_constraint is None and right_face_grad_constraint is None:
-        right_face_constraint = jnp.asarray(profile)[-1]
+        profile_arr = jnp.asarray(profile)
+        if profile_arr.shape[0] >= 2:
+            right_face_constraint = 1.5 * profile_arr[-1] - 0.5 * profile_arr[-2]
+        else:
+            right_face_constraint = profile_arr[-1]
 
     cell_var = make_profile_cell_variable(
         profile,

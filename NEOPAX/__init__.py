@@ -47,10 +47,13 @@ from ._transport_flux_models import (
     NTXRuntimeScanChannels,
     NTXRuntimeScanTransportModel,
     PowerAnalyticalTurbulentTransportModel,
+    ReLUAnalyticalTurbulentTransportModel,
+    SpectraXQuasilinearRuntimeTransportModel,
     build_ntx_exact_lij_runtime_support,
     build_ntx_exact_lij_runtime_transport_model,
     build_ntx_runtime_scan_channels,
     ZeroTransportModel,
+    build_dkx_fluxes_r_file_transport_model,
     build_fluxes_r_file_transport_model,
     build_ntx_runtime_scan_transport_model,
     build_transport_flux_model,
@@ -85,6 +88,12 @@ def run_config_path(*args, **kwargs):
     return _run_config_path(*args, **kwargs)
 
 
+def run_transport_on_time_list(*args, **kwargs):
+    from ._orchestrator import run_transport_on_time_list as _run_transport_on_time_list
+
+    return _run_transport_on_time_list(*args, **kwargs)
+
+
 __all__ = [
     "__version__",
     "__version_tuple__",
@@ -112,9 +121,11 @@ __all__ = [
     "NewtonThetaMethodSolver",
     "PowerAnalyticalTurbulentTransportModel",
     "RADAUSolver",
+    "ReLUAnalyticalTurbulentTransportModel",
     "RobinBC",
     "RunResult",
     "Solver_Parameters",
+    "SpectraXQuasilinearRuntimeTransportModel",
     "Species",
     "TemperatureEquation",
     "ThetaMethodSolver",
@@ -122,6 +133,7 @@ __all__ = [
     "ZeroTransportModel",
     "build_equation_system",
     "build_equation_system_from_config",
+    "build_dkx_fluxes_r_file_transport_model",
     "build_fluxes_r_file_transport_model",
     "build_ntx_exact_lij_runtime_support",
     "build_ntx_exact_lij_runtime_transport_model",
@@ -145,6 +157,7 @@ __all__ = [
     "run",
     "run_config",
     "run_config_path",
+    "run_transport_on_time_list",
     "source_model",
     "transport_flux_model",
 ]

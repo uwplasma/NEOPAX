@@ -1,9 +1,17 @@
-from pathlib import Path
+import dataclasses
+import collections
 import types
+from pathlib import Path
 
 import h5py
+import jax
 import jax.numpy as jnp
+import pytest
+from ntx import GridSpec, example_surface, prepare_monoenergetic_system
 
+import NEOPAX._reverse_ad_transport as reverse_transport_module
+import NEOPAX._reverse_ad_initial_er as initial_er_module
+import NEOPAX._transport_flux_models as flux_models_module
 from NEOPAX._orchestrator import (
     _build_database,
     _build_flux_model,
@@ -11,30 +19,2195 @@ from NEOPAX._orchestrator import (
     _load_ntss_reference_profiles,
     _normalize_solver_config,
     _resolve_reference_path,
+    build_runtime_context,
+    load_config,
+    prepare_transport_solver_components,
+    Models,
+    RuntimeContext,
+)
+from NEOPAX._reverse_ad_initial_er import (
+    fold_recorded_ntx_scan_database_bar_into_support,
+    fold_recorded_ntx_scan_database_bar_groups_into_support,
+    fold_recorded_ntx_scan_database_bars_into_support,
+    realtime_geometry_payload_for_runtime,
+    realtime_geometry_reverse_support_payload_for_runtime,
+    runtime_with_fixed_ntx_database_model,
+    runtime_with_fresh_ntx_database_payload,
+    runtime_with_geometry_payload,
+    runtime_with_realtime_geometry_payload,
+    runtime_with_realtime_geometry_reverse_support_payload,
+)
+from NEOPAX._reverse_ad_transport import (
+    prepare_realtime_geometry_support_segment_core_setup,
+    realtime_geometry_payload_pullback_result,
 )
 from NEOPAX._monoenergetic import (
     MONOENERGETIC_KIND_GENERIC,
     MONOENERGETIC_KIND_PREPROCESSED_3D_NTSS1D_FIXED,
     MONOENERGETIC_KIND_PREPROCESSED_3D_RADIAL_NTSS1D,
     load_monoenergetic_database,
+    database_with_geometry_scale,
     monoenergetic_database_kind,
 )
+from NEOPAX._database import Monoenergetic
 from NEOPAX._database_preprocessed import (
+    PreprocessedMonoenergetic3D,
+    PreprocessedMonoenergetic3DNTSSRadius,
     PreprocessedMonoenergetic3DNTSSRadiusNTSS1D,
     PreprocessedMonoenergetic3DNTSSRadiusNTSS1DFixedNU,
 )
+from NEOPAX._interpolators_preprocessed import (
+    _bilinear,
+    get_Dij_preprocessed_3d_ntss_radius,
+    radial_preprocessed_interpolation_stencil,
+    radial_preprocessed_interpolation_table_bar,
+)
+from NEOPAX._neoclassical import (
+    _collisionality_kind,
+    get_Neoclassical_Fluxes,
+    get_Neoclassical_Fluxes_Faces,
+    pullback_legacy_radial_database_face_flux_support_sparse,
+    pullback_legacy_radial_database_flux_support_sparse,
+    pullback_preprocessed_radial_database_face_fluxes,
+    pullback_preprocessed_radial_database_fluxes,
+)
 from NEOPAX._monoenergetic_interpolators import monoenergetic_interpolation_kernel
-from NEOPAX._interpolators import get_Dij
+from NEOPAX._interpolators import (
+    evaluate_monoenergetic_interpolation_stencil,
+    get_Dij,
+    materialize_monoenergetic_sparse_coordinate_bar,
+    materialize_monoenergetic_sparse_table_bar,
+    monoenergetic_interpolation_sparse_coordinate_bar,
+    monoenergetic_interpolation_sparse_table_bar,
+    monoenergetic_interpolation_stencil,
+    monoenergetic_interpolation_table_bar,
+)
 from NEOPAX._source_models import get_source_model
+from NEOPAX._species import Species
+from NEOPAX._state import TransportState, get_v_thermal
+from NEOPAX._boundary_conditions import BoundaryConditionModel
+from NEOPAX._constants import elementary_charge
+from NEOPAX._transport_equations import _plasma_permitivity_from_prefactor
 from NEOPAX._transport_flux_models import (
+    CombinedTransportFluxModel,
+    NTXDatabaseTransportModel,
     NTXExactLijRuntimeTransportModel,
+    NTXExactLijRuntimeSupport,
+    NTXFullStateQuadraticPreparedCoefficientResponse,
+    NTXQuadraticPreparedCoefficientResponse,
     NTXRuntimeScanChannels,
+    _as_float_array,
+    _ntx_epsi_cap_from_er_tilde,
     NTXRuntimeScanTransportModel,
+    ZeroTransportModel,
+    _sanitize_float_delta_bar_tree,
+    _ntx_runtime_scan_to_neopax_monoenergetic,
+    build_evaluated_transport_state,
+    build_face_transport_state,
     build_ntx_exact_lij_runtime_transport_model,
     build_ntx_runtime_scan_channels,
     build_ntx_runtime_scan_transport_model,
     get_transport_flux_model,
 )
+
+
+def _tiny_ntx_runtime_channels(rho):
+    values = jnp.asarray(rho, dtype=jnp.float64)
+    ones = jnp.ones_like(values)
+    return NTXRuntimeScanChannels.from_mapping(
+        values,
+        {
+            "a_b": 1.0,
+            "psia": 1.0,
+            "b00": ones,
+            "r00": ones,
+            "boozer_i": ones,
+            "boozer_g": ones,
+            "iota": ones,
+            "drds": ones,
+            "dr_tildedr": ones,
+            "dr_tildeds": ones,
+            "fac_reference_to_sfincs_11": ones,
+            "fac_reference_to_sfincs_31": ones,
+            "fac_reference_to_sfincs_33": ones,
+            "fac_sfincs_to_dkes_11": ones,
+            "fac_sfincs_to_dkes_31": ones,
+            "fac_sfincs_to_dkes_33": ones,
+            "fac_dkes_to_d11star": ones,
+            "fac_dkes_to_d31star": ones,
+            "fac_dkes_to_d33star": ones,
+        },
+    )
+
+
+def test_runtime_scan_axis_validation_is_trace_safe():
+    """Recorded database support VJPs may carry the scan axes as tracers."""
+
+    actual = jax.jit(lambda values: _as_float_array(values, name="rho_scan"))(
+        jnp.asarray([0.25, 0.5])
+    )
+    assert jnp.allclose(actual, jnp.asarray([0.25, 0.5]))
+    with pytest.raises(ValueError, match="rho_scan contains non-finite"):
+        _as_float_array(jnp.asarray([0.25, jnp.nan]), name="rho_scan")
+
+
+def test_exact_runtime_er_tilde_cap_uses_database_epsi_coordinate():
+    """The realtime cap is the database's energy-resolved NTX coordinate."""
+    er_tilde_max = 0.1
+    er_tilde_to_er = 5.0e5  # V/m per unit er_tilde
+    drds = 2.0
+
+    # This is exactly the field-channel value passed to NTX as epsi_hat by
+    # the database scan. It is not converted to a kV/m state-field cap.
+    epsi_cap = _ntx_epsi_cap_from_er_tilde(
+        er_tilde_max, er_tilde_to_er, drds
+    )
+    assert jnp.allclose(epsi_cap, 1.0e5)
+
+
+def test_runtime_scan_axis_range_validation_is_trace_safe():
+    model = build_ntx_runtime_scan_transport_model(
+        species="species", energy_grid="grid", geometry="geometry",
+        vmec_file=None, boozer_file=None,
+        ntx_scan_rho=[0.25, 0.5], ntx_scan_nu_v=[1.0e-4, 1.0e-3],
+        ntx_scan_er_tilde=[0.0, 1.0e-4], prebuild_database=False,
+    )
+    actual = jax.jit(
+        lambda rho: dataclasses.replace(model, rho_scan=rho)._scan_axes()[0]
+    )(jnp.asarray([0.25, 0.5]))
+    assert jnp.allclose(actual, jnp.asarray([0.25, 0.5]))
+    with pytest.raises(ValueError, match="rho_scan values must satisfy"):
+        dataclasses.replace(model, rho_scan=jnp.asarray([0.0, 0.5]))._scan_axes()
+
+
+def test_reverse_initial_state_preserves_fixed_temperature_at_density_floor(monkeypatch):
+    """The reverse initial root must see the same floor regularization as forward."""
+
+    baseline_state = TransportState(
+        density=jnp.ones((4, 2)),
+        pressure=jnp.ones((4, 2)),
+        Er=jnp.zeros((2,)),
+    )
+    profile_set = types.SimpleNamespace(
+        density=jnp.asarray(
+            [[2.0e20, 2.0e20], [1.0e20, 1.0e20], [1.0e20, 1.0e20], [0.0, 0.0]]
+        ),
+        temperature=jnp.asarray(
+            [[8.0e3, 8.0e3], [7.0e3, 7.0e3], [7.0e3, 7.0e3], [0.7e3, 0.7e3]]
+        ),
+    )
+    runtime = types.SimpleNamespace(
+        geometry=object(),
+        species=types.SimpleNamespace(number_species=4),
+    )
+    monkeypatch.setattr(
+        reverse_transport_module,
+        "parameterized_profile_set",
+        lambda *args, **kwargs: profile_set,
+    )
+
+    state = reverse_transport_module.initial_state_for_parameter_vector(
+        jnp.asarray([4.21, 17.8, 2.0, 2.0]),
+        baseline_state=baseline_state,
+        profile_cfg={},
+        runtime=runtime,
+        config={"transport_solver": {"density_floor": 1.0e-6, "temperature_floor": 1.0e-6}},
+    )
+
+    assert jnp.allclose(state.density[3], 0.0)
+    assert jnp.allclose(state.pressure[3], 0.7e-6)
+    assert jnp.allclose(state.temperature[3], 0.7)
+
+
+def _repeat_ntx_prepared(prepared, count):
+    return jax.tree_util.tree_map(
+        lambda *values: None if values[0] is None else jnp.stack(values, axis=0),
+        *([prepared] * count),
+    )
+
+
+def test_ntx_quadratic_resolution_fallback_selects_only_flagged_radii():
+    """The slope guard preserves payload shape and replaces only flagged rows."""
+    def response(offset):
+        values = jnp.arange(2 * 3 * 4 * 5, dtype=jnp.float64).reshape(2, 3, 4, 5)
+        return NTXQuadraticPreparedCoefficientResponse(
+            reference_nu_hat=values[..., 0] + offset,
+            reference_epsi_hat=values[..., 1] + offset,
+            reference_coefficients=values + offset,
+            dcoefficients_d_nu_hat=2.0 * values + offset,
+            dcoefficients_d_epsi_hat=3.0 * values + offset,
+            d2coefficients_d_nu_hat2=4.0 * values + offset,
+            d2coefficients_d_nu_hat_d_epsi_hat=5.0 * values + offset,
+            d2coefficients_d_epsi_hat2=6.0 * values + offset,
+        )
+
+    base = response(0.0)
+    high = response(1000.0)
+    selected = jax.jit(
+        NTXExactLijRuntimeTransportModel._select_quadratic_response_radii
+    )(base, high, jnp.asarray([False, True]))
+    for base_value, high_value, selected_value in zip(
+        dataclasses.astuple(base), dataclasses.astuple(high), dataclasses.astuple(selected), strict=True
+    ):
+        assert jnp.array_equal(selected_value[0], base_value[0])
+        assert jnp.array_equal(selected_value[1], high_value[1])
+
+
+def test_ntx_exact_runtime_lagged_face_response_matches_reference_and_finite_difference():
+    """The exact NTX face response must agree locally with its live face flux."""
+    geometry = types.SimpleNamespace(
+        a_b=1.0,
+        r_grid=jnp.asarray([0.3, 0.7]),
+        r_grid_half=jnp.asarray([0.1, 0.5, 0.9]),
+    )
+    species = Species(
+        number_species=2,
+        species_indices=jnp.asarray([0, 1]),
+        mass_mp=jnp.asarray([5.446e-4, 2.0]),
+        charge_qp=jnp.asarray([-1.0, 1.0]),
+        names=("e", "D"),
+    )
+    energy_grid = types.SimpleNamespace(
+        xWeights=jnp.asarray([0.2, 0.3, 0.5]),
+        L11_weight=jnp.asarray([1.0, 0.8, 1.2]),
+        L12_weight=jnp.asarray([0.1, -0.2, 0.3]),
+        L22_weight=jnp.asarray([0.9, 1.1, 0.7]),
+        L13_weight=jnp.asarray([0.4, 0.5, 0.6]),
+        L23_weight=jnp.asarray([-0.3, 0.2, 0.1]),
+        L33_weight=jnp.asarray([1.3, 0.6, 0.9]),
+        v_norm=jnp.asarray([1.7, 1.8, 1.9]),
+    )
+    prepared = prepare_monoenergetic_system(example_surface(), GridSpec(3, 3, 2))
+    support = NTXExactLijRuntimeSupport(
+        center_channels=_tiny_ntx_runtime_channels(geometry.r_grid),
+        face_channels=_tiny_ntx_runtime_channels(geometry.r_grid_half),
+        center_prepared=_repeat_ntx_prepared(prepared, 2),
+        face_prepared=_repeat_ntx_prepared(prepared, 3),
+        grid=GridSpec(3, 3, 2),
+    )
+    model = NTXExactLijRuntimeTransportModel(
+        species=species,
+        energy_grid=energy_grid,
+        geometry=geometry,
+        vmec_file=None,
+        boozer_file=None,
+        support=support,
+        center_response_mode="interpolate_from_faces",
+        response_anchor_count=2,
+    )
+    state0 = TransportState(
+        density=jnp.asarray([[1.0, 1.15], [1.0, 1.15]]),
+        pressure=jnp.asarray([[1.3, 1.61], [1.1, 1.38]]),
+        Er=jnp.asarray([2.0e-4, 2.5e-4]),
+    )
+    direction = TransportState(
+        density=jnp.asarray([[0.03, -0.02], [0.02, -0.01]]),
+        pressure=jnp.asarray([[0.04, -0.03], [0.03, -0.02]]),
+        Er=jnp.asarray([1.0e-5, -0.8e-5]),
+    )
+
+    def face_fluxes_from_state(state):
+        faces = build_face_transport_state(state, geometry)
+        return model.evaluate_face_fluxes(state, faces)
+
+    response = model.build_lagged_response(state0)
+    recorded_response, compact_record = model.build_lagged_response_with_compact_coefficient_record(state0)
+    for ordinary_leaf, recorded_leaf in zip(
+        jax.tree_util.tree_leaves(response),
+        jax.tree_util.tree_leaves(recorded_response),
+        strict=True,
+    ):
+        if jnp.issubdtype(jnp.asarray(ordinary_leaf).dtype, jnp.inexact):
+            assert jnp.allclose(recorded_leaf, ordinary_leaf, rtol=1.0e-9, atol=1.0e-11)
+    assert compact_record.face_anchor_coefficients.coefficient_scan.shape == (2, 2, 3, 5)
+    assert compact_record.face_anchor_coefficients.dcoefficient_scan_d_er.shape == (2, 2, 3, 5)
+    assert compact_record.face_anchor_coefficients.dcoefficient_scan_d_log_nu_star.shape == (2, 2, 3, 5)
+    lagged_at_reference = model.evaluate_with_lagged_response(state0, response)
+    direct_at_reference = face_fluxes_from_state(state0)
+    for name in ("Gamma", "Q", "Upar"):
+        assert jnp.allclose(
+            lagged_at_reference[f"{name}_faces"],
+            direct_at_reference[name],
+            rtol=3.0e-6,
+            atol=1.0e-12,
+        )
+
+    epsilon = jnp.asarray(1.0e-4)
+    state_plus = jax.tree_util.tree_map(
+        lambda value, delta: value + epsilon * delta,
+        state0,
+        direction,
+    )
+    state_minus = jax.tree_util.tree_map(
+        lambda value, delta: value - epsilon * delta,
+        state0,
+        direction,
+    )
+    finite_difference = jax.tree_util.tree_map(
+        lambda plus, minus: (plus - minus) / (2.0 * epsilon),
+        face_fluxes_from_state(state_plus),
+        face_fluxes_from_state(state_minus),
+    )
+    lagged_direction = jax.tree_util.tree_map(
+        lambda value, reference: value - reference,
+        model.evaluate_with_lagged_response(state_plus, response),
+        lagged_at_reference,
+    )
+    for name in ("Gamma", "Q", "Upar"):
+        assert jnp.allclose(
+            lagged_direction[f"{name}_faces"] / epsilon,
+            finite_difference[name],
+            rtol=2.0e-2,
+            atol=1.0e-8,
+        )
+
+
+@pytest.mark.parametrize("response_anchor_count", (2, 3))
+def test_ntx_exact_runtime_quadratic_lagged_response_matches_live_reference(response_anchor_count):
+    """Quadratic realtime payloads work for reduced and full radial layouts."""
+    geometry = types.SimpleNamespace(
+        a_b=1.0,
+        # Keep the outer spacing comparable to the 51-centre benchmark grid.
+        # This makes the Robin face trace a genuine edge value, rather than a
+        # coarse-grid extrapolation unrelated to the benchmark boundary.
+        r_grid=jnp.asarray([0.97, 0.99]),
+        r_grid_half=jnp.asarray([0.96, 0.98, 1.00]),
+    )
+    species = Species(
+        number_species=4,
+        species_indices=jnp.asarray([0, 1, 2, 3]),
+        mass_mp=jnp.asarray([5.446e-4, 2.0, 3.0, 4.0]),
+        charge_qp=jnp.asarray([-1.0, 1.0, 1.0, 2.0]),
+        names=("e", "D", "T", "He"),
+    )
+    energy_grid = types.SimpleNamespace(
+        xWeights=jnp.asarray([0.2, 0.3, 0.5]),
+        L11_weight=jnp.asarray([1.0, 0.8, 1.2]),
+        L12_weight=jnp.asarray([0.1, -0.2, 0.3]),
+        L22_weight=jnp.asarray([0.9, 1.1, 0.7]),
+        L13_weight=jnp.asarray([0.4, 0.5, 0.6]),
+        L23_weight=jnp.asarray([-0.3, 0.2, 0.1]),
+        L33_weight=jnp.asarray([1.3, 0.6, 0.9]),
+        v_norm=jnp.asarray([1.7, 1.8, 1.9]),
+    )
+    prepared = prepare_monoenergetic_system(example_surface(), GridSpec(3, 3, 2))
+    density_bc = BoundaryConditionModel(
+        dr=0.02,
+        right_type="dirichlet",
+        # Exact right-boundary values in the w-He benchmark TOML.
+        right_value=jnp.asarray([0.39, 0.195, 0.195, 0.0]),
+    )
+    temperature_bc = BoundaryConditionModel(
+        dr=0.02,
+        right_type="robin",
+        # Exact active Robin parameter in the benchmark TOML.  The TOML
+        # ``value = 1.0`` is not an imposed face temperature in this BC.
+        right_decay_length=jnp.full((4,), 0.05),
+    )
+    support = NTXExactLijRuntimeSupport(
+        center_channels=_tiny_ntx_runtime_channels(geometry.r_grid),
+        face_channels=_tiny_ntx_runtime_channels(geometry.r_grid_half),
+        center_prepared=_repeat_ntx_prepared(prepared, 2),
+        face_prepared=_repeat_ntx_prepared(prepared, 3),
+        grid=GridSpec(3, 3, 2),
+    )
+    model = NTXExactLijRuntimeTransportModel(
+        species=species,
+        energy_grid=energy_grid,
+        geometry=geometry,
+        vmec_file=None,
+        boozer_file=None,
+        support=support,
+        center_response_mode="interpolate_from_faces",
+        response_anchor_count=response_anchor_count,
+        lagged_response_taylor_order=2,
+        bc_density=density_bc,
+        bc_temperature=temperature_bc,
+    )
+    state = TransportState(
+        # Outer centres are deliberately close to the benchmark n/T edge
+        # values.  The face state must nevertheless use the actual boundary
+        # reconstruction, not a copied centre value.
+        density=jnp.asarray([
+            [0.44, 0.41], [0.22, 0.205], [0.22, 0.205], [1.0e-4, 1.0e-6],
+        ]),
+        pressure=jnp.asarray([
+            [0.352, 0.2952], [0.176, 0.1476], [0.176, 0.1476], [8.0e-5, 7.2e-7],
+        ]),
+        Er=jnp.asarray([2.0e-4, 2.5e-4]),
+    )
+    response = model.build_lagged_response(state)
+    assert isinstance(response.face_response, NTXQuadraticPreparedCoefficientResponse)
+    assert response.center_response is None
+    with pytest.raises(NotImplementedError, match="linear-response reverse-replay"):
+        model.build_lagged_response_with_compact_coefficient_record(state)
+
+    # A reduced radial payload interpolates coefficient data onto the omitted
+    # face.  It is therefore valid, but cannot be an anchor-identity test.
+    if response_anchor_count != 3:
+        lagged = model.evaluate_with_lagged_response(state, response)
+        for value in lagged.values():
+            assert bool(jnp.all(jnp.isfinite(value)))
+        return
+
+    # Rebuilding at the exact same transport state is not a Taylor test: it
+    # must reproduce the coefficient payload and the RHS exactly.  This
+    # catches accidental cache dependence on build history.
+    repeated_response = model.build_lagged_response(state)
+    for first, repeated in zip(
+        jax.tree_util.tree_leaves(response),
+        jax.tree_util.tree_leaves(repeated_response),
+        strict=True,
+    ):
+        assert jnp.array_equal(first, repeated)
+
+    faces = build_face_transport_state(
+        state, geometry, bc_density=density_bc, bc_temperature=temperature_bc,
+    )
+    assert jnp.array_equal(faces.density[:, -1], density_bc.right_value)
+    # With the benchmark spacing and lambda, the live Robin reconstruction is
+    # close to the edge profile but is not the unused TOML ``value = 1.0``.
+    assert bool(jnp.all(faces.temperature[:, -1] > 0.0))
+    direct = model.evaluate_face_fluxes(state, faces)
+    lagged = model.evaluate_with_lagged_response(state, response)
+    repeated_lagged = model.evaluate_with_lagged_response(state, repeated_response)
+    for name in ("Gamma", "Q", "Upar"):
+        assert jnp.allclose(
+            lagged[f"{name}_faces"], direct[name], rtol=3.0e-6, atol=1.0e-12
+        )
+        assert jnp.array_equal(lagged[f"{name}_faces"], repeated_lagged[f"{name}_faces"])
+
+    # This is deliberately below the Lij/flux reduction: at an unshifted
+    # anchor, the factorized quadratic primitive's C0 must be the ordinary
+    # prepared NTX coefficient solve at the exact same local (nu_hat,
+    # epsi_hat).  Check every face, including the outer face, and every
+    # species/energy coefficient.  A flux-only comparison could otherwise
+    # conceal cancelling errors between transport-moment components.
+    def _assert_axis_coefficients_match_live(*, coefficient_response, channels,
+                                             prepared_all, Er, temperature,
+                                             density):
+        vthermal = get_v_thermal(model.species.mass, temperature)
+        collisionality_kind = _collisionality_kind(model.collisionality_model)
+        for radius in range(Er.shape[0]):
+            prepared_local = jax.tree_util.tree_map(
+                lambda array: jax.lax.dynamic_index_in_dim(
+                    array, radius, axis=0, keepdims=False
+                ),
+                prepared_all,
+            )
+            for species_index in range(model.species.number_species):
+                nu_hat, epsi_hat, _ = model._local_scan_inputs(
+                    drds_value=channels.drds[radius],
+                    species_index=species_index,
+                    er_value=Er[radius],
+                    temperature_local=temperature[:, radius],
+                    density_local=density[:, radius],
+                    vthermal_local=vthermal[:, radius],
+                    collisionality_kind=collisionality_kind,
+                )
+                live_coefficients = model._solve_coefficient_scan_prepared(
+                    prepared_local, nu_hat, epsi_hat
+                )
+                assert jnp.allclose(
+                    coefficient_response.reference_coefficients[radius, species_index],
+                    live_coefficients,
+                    rtol=2.0e-10,
+                    atol=2.0e-12,
+                ), ("radius", radius, "species", species_index)
+
+    _assert_axis_coefficients_match_live(
+        coefficient_response=response.face_response,
+        channels=support.face_channels,
+        prepared_all=support.face_prepared,
+        Er=faces.Er,
+        temperature=faces.temperature,
+        density=faces.density,
+    )
+
+    # The direct-centre option is a second lagged coefficient payload.  Its
+    # construction must use the same collision model and preserve C0 too.
+    centre_model = dataclasses.replace(
+        model, center_response_mode="center_local_response"
+    )
+    centre_response = centre_model.build_lagged_response(state)
+    assert isinstance(centre_response.center_response, NTXQuadraticPreparedCoefficientResponse)
+    _assert_axis_coefficients_match_live(
+        coefficient_response=centre_response.center_response,
+        channels=support.center_channels,
+        prepared_all=support.center_prepared,
+        Er=state.Er,
+        temperature=state.temperature,
+        density=state.density,
+    )
+
+    full_state_model = dataclasses.replace(model, full_state_quadratic_response=True)
+    full_state_response = dataclasses.replace(
+        response,
+        face_response=NTXFullStateQuadraticPreparedCoefficientResponse(
+            reference_state=state,
+            coefficient_response=response.face_response,
+        ),
+    )
+    assert isinstance(full_state_response.face_response, NTXFullStateQuadraticPreparedCoefficientResponse)
+    full_state = full_state_model.evaluate_with_lagged_response(state, full_state_response)
+    for name in ("Gamma", "Q", "Upar"):
+        assert jnp.allclose(
+            full_state[f"{name}_faces"], direct[name], rtol=3.0e-6, atol=1.0e-12
+        )
+
+    # The private floating-edge direction is a Taylor coordinate of the same
+    # cached face response.  Its written jet tangent must agree with the
+    # local derivative of that response without obtaining the tangent by
+    # subtracting large flux values in production.
+    edge_anchor = jnp.asarray(3.0e-4)
+    edge_response = full_state_model.build_lagged_response(
+        state, er_edge_override=edge_anchor
+    )
+    # The private edge belongs to the face state, not the public
+    # TransportState.  A response rebuilt at this exact anchor must therefore
+    # recover the native direct NTX face flux before any Radau stage moves.
+    # This is deliberately a live-versus-cache assertion: testing the cached
+    # tangent only against another cached polynomial cannot detect a mismatch
+    # in the factorized NTX value or its edge slope.
+    def _live_edge_face_fluxes(edge_value):
+        live_faces = build_face_transport_state(
+            state,
+            geometry,
+            bc_density=density_bc,
+            bc_temperature=temperature_bc,
+            er_edge_override=edge_value,
+        )
+        return full_state_model.evaluate_face_fluxes(state, live_faces)
+
+    cached_at_edge_anchor = full_state_model.evaluate_with_lagged_response(
+        state,
+        edge_response,
+        er_edge_override=edge_anchor,
+        er_edge_anchor=edge_anchor,
+    )
+    live_at_edge_anchor = _live_edge_face_fluxes(edge_anchor)
+    for name in ("Gamma", "Q", "Upar"):
+        assert jnp.allclose(
+            cached_at_edge_anchor[f"{name}_faces"],
+            live_at_edge_anchor[name],
+            rtol=3.0e-6,
+            atol=1.0e-12,
+        )
+
+    edge_tangent = full_state_model.evaluate_with_lagged_response_edge_tangent(
+        state,
+        edge_anchor,
+        jnp.asarray(1.0),
+        edge_response,
+        er_edge_anchor=edge_anchor,
+    )
+    edge_epsilon = jnp.asarray(1.0e-7)
+    edge_plus = full_state_model.evaluate_with_lagged_response(
+        state,
+        edge_response,
+        er_edge_override=edge_anchor + edge_epsilon,
+        er_edge_anchor=edge_anchor,
+    )
+    edge_minus = full_state_model.evaluate_with_lagged_response(
+        state,
+        edge_response,
+        er_edge_override=edge_anchor - edge_epsilon,
+        er_edge_anchor=edge_anchor,
+    )
+    live_edge_plus = _live_edge_face_fluxes(edge_anchor + edge_epsilon)
+    live_edge_minus = _live_edge_face_fluxes(edge_anchor - edge_epsilon)
+    for name in ("Gamma", "Q", "Upar"):
+        assert jnp.allclose(
+            edge_tangent[f"{name}_faces"],
+            (edge_plus[f"{name}_faces"] - edge_minus[f"{name}_faces"])
+            / (2.0 * edge_epsilon),
+            rtol=3.0e-3,
+            atol=3.0e-4,
+        )
+        assert jnp.allclose(
+            edge_tangent[f"{name}_faces"],
+            (live_edge_plus[name] - live_edge_minus[name]) / (2.0 * edge_epsilon),
+            rtol=3.0e-3,
+            atol=3.0e-4,
+        )
+
+    # The failure was seen after edge changes of a few 1e-6.  Sweep both
+    # sides of that interval at the actual benchmark density boundary and
+    # Robin-reconstructed temperature boundary.  Compare the outer face
+    # directly: the adjacent interior face has different geometry and is not
+    # an interchangeable reference.
+    for edge_offset in (-1.0e-5, -4.0e-6, -1.0e-6, 0.0, 1.0e-6, 4.0e-6, 1.0e-5):
+        edge_value = edge_anchor + jnp.asarray(edge_offset)
+        cached = full_state_model.evaluate_with_lagged_response(
+            state, edge_response,
+            er_edge_override=edge_value, er_edge_anchor=edge_anchor,
+        )
+        live = _live_edge_face_fluxes(edge_value)
+        for name in ("Gamma", "Q", "Upar"):
+            assert jnp.allclose(
+                cached[f"{name}_faces"][:, -1], live[name][:, -1],
+                rtol=1.0e-2, atol=1.0e-9,
+            ), ("outer-face", name, "edge_offset", edge_offset)
+
+    # Exercise the actual Radau case: the cached response remains anchored
+    # at the accepted state while both the public stage state and the private
+    # edge coordinate have moved.  The former anchor-only check could not
+    # detect an erroneous pure-edge-curvature contribution in this branch.
+    displaced_state = TransportState(
+        density=state.density * jnp.asarray([
+            [1.03, 0.98], [1.01, 1.02], [1.02, 0.99], [1.00, 1.00],
+        ]),
+        pressure=state.pressure * jnp.asarray([
+            [0.97, 1.04], [1.02, 0.96], [1.01, 0.98], [1.00, 1.00],
+        ]),
+        Er=state.Er + jnp.asarray([1.0e-5, -1.5e-5]),
+    )
+    displaced_edge = edge_anchor + jnp.asarray(8.0e-5)
+    displaced_tangent = full_state_model.evaluate_with_lagged_response_edge_tangent(
+        displaced_state,
+        displaced_edge,
+        jnp.asarray(1.0),
+        edge_response,
+        er_edge_anchor=edge_anchor,
+    )
+    displaced_plus = full_state_model.evaluate_with_lagged_response(
+        displaced_state,
+        edge_response,
+        er_edge_override=displaced_edge + edge_epsilon,
+        er_edge_anchor=edge_anchor,
+    )
+    displaced_minus = full_state_model.evaluate_with_lagged_response(
+        displaced_state,
+        edge_response,
+        er_edge_override=displaced_edge - edge_epsilon,
+        er_edge_anchor=edge_anchor,
+    )
+    for name in ("Gamma", "Q", "Upar"):
+        assert jnp.allclose(
+            displaced_tangent[f"{name}_faces"],
+            (displaced_plus[f"{name}_faces"] - displaced_minus[f"{name}_faces"])
+            / (2.0 * edge_epsilon),
+            rtol=5.0e-3,
+            atol=5.0e-4,
+        )
+
+    def _cached_displaced_edge_primal(edge_value):
+        return full_state_model.evaluate_with_lagged_response(
+            displaced_state,
+            edge_response,
+            er_edge_override=edge_value,
+            er_edge_anchor=edge_anchor,
+        )
+
+    # This is the exact forward AD derivative of the *cached primal
+    # polynomial*.  It never sees a live NTX solve and has no differencing
+    # interval.  Keep it as a test oracle for the written edge tangent.
+    _, displaced_primal_jvp = jax.jvp(
+        _cached_displaced_edge_primal,
+        (displaced_edge,),
+        (jnp.asarray(1.0),),
+    )
+    for name in ("Gamma", "Q", "Upar"):
+        assert jnp.allclose(
+            displaced_tangent[f"{name}_faces"],
+            displaced_primal_jvp[f"{name}_faces"],
+            rtol=3.0e-6,
+            atol=1.0e-9,
+        )
+
+    # Jacobian refreshes evaluate the edge column at the cache anchor while
+    # the Radau centre state is already displaced.  This is the exact
+    # configuration that must be correct for the refreshed edge diagonal.
+    anchor_stage_tangent = full_state_model.evaluate_with_lagged_response_edge_tangent(
+        displaced_state,
+        edge_anchor,
+        jnp.asarray(1.0),
+        edge_response,
+        er_edge_anchor=edge_anchor,
+    )
+    anchor_stage_plus = full_state_model.evaluate_with_lagged_response(
+        displaced_state,
+        edge_response,
+        er_edge_override=edge_anchor + edge_epsilon,
+        er_edge_anchor=edge_anchor,
+    )
+    anchor_stage_minus = full_state_model.evaluate_with_lagged_response(
+        displaced_state,
+        edge_response,
+        er_edge_override=edge_anchor - edge_epsilon,
+        er_edge_anchor=edge_anchor,
+    )
+    for name in ("Gamma", "Q", "Upar"):
+        assert jnp.allclose(
+            anchor_stage_tangent[f"{name}_faces"],
+            (anchor_stage_plus[f"{name}_faces"] - anchor_stage_minus[f"{name}_faces"])
+            / (2.0 * edge_epsilon),
+            rtol=5.0e-3,
+            atol=5.0e-4,
+        )
+    _, anchor_stage_primal_jvp = jax.jvp(
+        _cached_displaced_edge_primal,
+        (edge_anchor,),
+        (jnp.asarray(1.0),),
+    )
+    for name in ("Gamma", "Q", "Upar"):
+        assert jnp.allclose(
+            anchor_stage_tangent[f"{name}_faces"],
+            anchor_stage_primal_jvp[f"{name}_faces"],
+            rtol=3.0e-6,
+            atol=1.0e-9,
+        )
+
+    # The composite VJP is the transpose of the same written edge tangent,
+    # not a generic VJP through ``er_edge_override``.
+    edge_combined = CombinedTransportFluxModel(
+        neoclassical_model=full_state_model,
+        turbulent_model=ZeroTransportModel(),
+        classical_model=ZeroTransportModel(),
+        geometry=geometry,
+        center_flux_mode="interpolate_from_faces",
+    )
+    edge_combined_response = edge_combined.build_lagged_response(
+        state, er_edge_override=edge_anchor
+    )
+    edge_combined_tangent = edge_combined.evaluate_with_lagged_response_edge_tangent(
+        state,
+        edge_anchor,
+        jnp.asarray(1.0),
+        edge_combined_response,
+        er_edge_anchor=edge_anchor,
+    )
+    edge_flux_bar = jax.tree_util.tree_map(jnp.ones_like, edge_combined_tangent)
+    edge_bar = edge_combined.pullback_evaluate_with_lagged_response_edge(
+        state,
+        edge_anchor,
+        edge_combined_response,
+        edge_flux_bar,
+        er_edge_anchor=edge_anchor,
+    )
+    expected_edge_bar = sum(
+        jnp.sum(value)
+        for value in jax.tree_util.tree_leaves(edge_combined_tangent)
+        if jnp.issubdtype(jnp.asarray(value).dtype, jnp.inexact)
+    )
+    assert jnp.allclose(edge_bar, expected_edge_bar, rtol=1.0e-12, atol=1.0e-12)
+
+    direct_full_state_model = dataclasses.replace(
+        model,
+        center_response_mode="center_local_response",
+        full_state_quadratic_response=True,
+    )
+    direct_full_state_response = direct_full_state_model.build_lagged_response(state)
+    assert isinstance(
+        direct_full_state_response.center_response,
+        NTXFullStateQuadraticPreparedCoefficientResponse,
+    )
+    assert isinstance(
+        direct_full_state_response.face_response,
+        NTXFullStateQuadraticPreparedCoefficientResponse,
+    )
+    direct_full_state = direct_full_state_model.evaluate_with_lagged_response(
+        state, direct_full_state_response
+    )
+    direct_center = direct_full_state_model(state)
+    for name in ("Gamma", "Q", "Upar"):
+        assert jnp.allclose(
+            direct_full_state[name], direct_center[name], rtol=3.0e-6, atol=1.0e-12
+        )
+        assert jnp.allclose(
+            direct_full_state[f"{name}_faces"], direct[name], rtol=3.0e-6, atol=1.0e-12
+        )
+
+    # The diagnostic Lij recovery used by face-coefficient interpolation must
+    # reproduce a directly prepared centre response at its own anchor.
+    recovered_direct_lij = direct_full_state_model._lij_from_quadratic_response_at_reference(
+        direct_full_state_response.center_response, axis="center"
+    )
+    evaluated_state = build_evaluated_transport_state(state, geometry)
+    live_direct_lij = direct_full_state_model._lij_center(
+        state.Er, evaluated_state.center.temperature, evaluated_state.center.density
+    )
+    assert jnp.allclose(recovered_direct_lij, live_direct_lij, rtol=3.0e-6, atol=1.0e-12)
+
+    face_coefficient_model = dataclasses.replace(
+        model,
+        center_response_mode="interpolate_face_coefficients",
+        full_state_quadratic_response=True,
+    )
+    face_coefficient_response = face_coefficient_model.build_lagged_response(state)
+    assert isinstance(
+        face_coefficient_response.face_response,
+        NTXFullStateQuadraticPreparedCoefficientResponse,
+    )
+    assert isinstance(
+        face_coefficient_response.center_response,
+        NTXFullStateQuadraticPreparedCoefficientResponse,
+    )
+    face_coefficient_flux = face_coefficient_model.evaluate_with_lagged_response(
+        state, face_coefficient_response
+    )
+    for name in ("Gamma", "Q", "Upar"):
+        assert name in face_coefficient_flux
+        assert f"{name}_faces" in face_coefficient_flux
+        assert bool(jnp.all(jnp.isfinite(face_coefficient_flux[name])))
+        # Face divergence remains the original face-local response; only the
+        # centre-local representation changes.
+        assert jnp.allclose(
+            face_coefficient_flux[f"{name}_faces"], direct[name], rtol=3.0e-6, atol=1.0e-12
+        )
+
+    native_distance_model = dataclasses.replace(
+        model,
+        center_response_mode="interpolate_face_coefficients_native_distance",
+        full_state_quadratic_response=True,
+    )
+    native_distance_response = native_distance_model.build_lagged_response(state)
+    native_distance_flux = native_distance_model.evaluate_with_lagged_response(
+        state, native_distance_response
+    )
+    for name in ("Gamma", "Q", "Upar"):
+        assert bool(jnp.all(jnp.isfinite(native_distance_flux[name])))
+        # The candidate changes centre-local terms only; faces remain the
+        # original face-local response used by conservative divergence.
+        assert jnp.allclose(
+            native_distance_flux[f"{name}_faces"], direct[name], rtol=3.0e-6, atol=1.0e-12
+        )
+
+    direction = TransportState(
+        density=jnp.asarray([[0.04, -0.03], [-0.02, 0.01]]),
+        pressure=jnp.asarray([[0.06, -0.04], [-0.03, 0.02]]),
+        Er=jnp.asarray([2.0e-5, -1.5e-5]),
+    )
+
+    direct_full_state_tangent = (
+        direct_full_state_model.evaluate_with_lagged_response_tangent(
+            state, direction, direct_full_state_response
+        )
+    )
+    for name in ("Gamma", "Q", "Upar"):
+        assert name in direct_full_state_tangent
+        assert f"{name}_faces" in direct_full_state_tangent
+
+    face_coefficient_tangent = (
+        face_coefficient_model.evaluate_with_lagged_response_tangent(
+            state, direction, face_coefficient_response
+        )
+    )
+    for name in ("Gamma", "Q", "Upar"):
+        assert name in face_coefficient_tangent
+        assert f"{name}_faces" in face_coefficient_tangent
+
+    def _state_at(scale):
+        return TransportState(
+            density=state.density + scale * direction.density,
+            pressure=state.pressure + scale * direction.pressure,
+            Er=state.Er + scale * direction.Er,
+        )
+
+    def _relative_flux_error(scale):
+        perturbed = _state_at(scale)
+        direct_perturbed = model.evaluate_face_fluxes(
+            perturbed, build_face_transport_state(perturbed, geometry)
+        )
+        full_perturbed = full_state_model.evaluate_with_lagged_response(
+            perturbed, full_state_response
+        )
+        errors = tuple(
+            jnp.max(jnp.abs(full_perturbed[f"{name}_faces"] - direct_perturbed[name]))
+            / (1.0 + jnp.max(jnp.abs(direct_perturbed[name])))
+            for name in ("Gamma", "Q", "Upar")
+        )
+        return jnp.max(jnp.asarray(errors))
+
+    # The full-state payload is a quadratic Taylor model.  Away from its
+    # anchor its direct-flux defect must decrease cubically as the same state
+    # displacement is halved.
+    error_full = _relative_flux_error(1.0)
+    error_half = _relative_flux_error(0.5)
+    assert float(error_full) < 2.0e-2
+    assert float(error_half / error_full) < 0.3
+
+
+@pytest.mark.skip(reason="superseded by the one-face boundary-cache regression below")
+def test_realtime_boundary_edge_response_matches_fresh_reference_near_observed_roots():
+    """Exercise the production boundary state without a Radau time solve.
+
+    The regression holds the benchmark density/temperature state fixed and
+    compares a response anchored at that state with a freshly anchored
+    realtime reference after small Er-only perturbations.  In particular it
+    covers the edge-root range seen in the failed transport attempts.
+    """
+    config_path = (
+        Path(__file__).resolve().parents[1]
+        / "examples/benchmarks/"
+        "Solve_Transport_equations_wHe_radau_ntx_exact_lagged_runtime_vmec_"
+        "realtime_full_state_quadratic_transport_endpoint_newton_benchmark_center.toml"
+    )
+    config = load_config(config_path)
+    config["_config_dir"] = str(config_path.parent)
+    # This test examines a fixed state.  Avoid creating the configured
+    # initialization plot as a side effect of constructing that state.
+    config["ambipolarity"] = dict(config["ambipolarity"])
+    config["ambipolarity"]["er_ambipolar_plot"] = False
+
+    runtime, state = build_runtime_context(config)
+    assert state is not None
+    prepared = prepare_transport_solver_components(config, runtime, state)
+    owner = prepared["equation_system"]
+    assert owner.er_equation.boundary_mode == "floating_ambipolar_edge_node"
+
+    def _evaluate_with_anchor(test_state, edge_value, response, edge_anchor):
+        return owner.evaluate_node_boundary_with_lagged_response(
+            test_state,
+            edge_value,
+            response,
+            er_edge_anchor=edge_anchor,
+        )
+
+    def _state_with_last_er_offset(base_state, offset):
+        return dataclasses.replace(
+            base_state,
+            Er=base_state.Er.at[-1].add(jnp.asarray(offset, dtype=base_state.Er.dtype)),
+        )
+
+    def _assert_change_matches(*, cached, cached_base, fresh, fresh_base, label):
+        cached_core, cached_edge = cached
+        cached_core_base, cached_edge_base = cached_base
+        fresh_core, fresh_edge = fresh
+        fresh_core_base, fresh_edge_base = fresh_base
+        for name in ("density", "pressure", "Er"):
+            cached_delta = getattr(cached_core, name) - getattr(cached_core_base, name)
+            fresh_delta = getattr(fresh_core, name) - getattr(fresh_core_base, name)
+            assert jnp.allclose(cached_delta, fresh_delta, rtol=3.0e-2, atol=1.0e-8), (
+                label, name,
+                float(jnp.max(jnp.abs(cached_delta - fresh_delta))),
+                float(jnp.max(jnp.abs(fresh_delta))),
+            )
+        assert jnp.allclose(
+            cached_edge - cached_edge_base,
+            fresh_edge - fresh_edge_base,
+            rtol=3.0e-2,
+            atol=1.0e-8,
+        ), (label, "edge_rhs")
+
+    # Values bracket the outer roots/anchors observed in the failed runtime
+    # logs.  These are physical Er values in kV/m, not synthetic normalized
+    # scan coordinates.
+    for edge_anchor_float in (-50.0, -37.0, -35.0, -33.0, -10.0, 0.0, 10.0):
+        edge_anchor = jnp.asarray(edge_anchor_float, dtype=state.Er.dtype)
+        cached_response = owner.build_node_boundary_lagged_response(state, edge_anchor)
+        cached_base = _evaluate_with_anchor(
+            state, edge_anchor, cached_response, edge_anchor
+        )
+
+        # A newly built cache at the identical state is the direct realtime
+        # reference at its anchor.  This avoids a time solve while retaining
+        # the production face construction, NTX inputs, and full transport
+        # RHS assembly.
+        fresh_base_response = owner.build_node_boundary_lagged_response(state, edge_anchor)
+        fresh_base = _evaluate_with_anchor(
+            state, edge_anchor, fresh_base_response, edge_anchor
+        )
+        _assert_change_matches(
+            cached=cached_base,
+            cached_base=cached_base,
+            fresh=fresh_base,
+            fresh_base=fresh_base,
+            label=("anchor", edge_anchor_float),
+        )
+
+        # Separately perturb the private edge, the final public Er centre,
+        # and both coordinates.  n and T remain exactly the benchmark state;
+        # their outer traces are therefore the same Dirichlet/Robin values in
+        # each live and cached comparison.
+        for offset in (-1.0e-5, -4.0e-6, 4.0e-6, 1.0e-5):
+            cases = (
+                ("edge", state, edge_anchor + offset),
+                ("last_center", _state_with_last_er_offset(state, offset), edge_anchor),
+                (
+                    "combined",
+                    _state_with_last_er_offset(state, offset),
+                    edge_anchor + offset,
+                ),
+            )
+            for case_name, test_state, test_edge in cases:
+                cached = _evaluate_with_anchor(
+                    test_state, test_edge, cached_response, edge_anchor
+                )
+                fresh_response = owner.build_node_boundary_lagged_response(
+                    test_state, test_edge
+                )
+                fresh = _evaluate_with_anchor(
+                    test_state, test_edge, fresh_response, test_edge
+                )
+                _assert_change_matches(
+                    cached=cached,
+                    cached_base=cached_base,
+                    fresh=fresh,
+                    fresh_base=fresh_base,
+                    label=("edge_anchor", edge_anchor_float, case_name, offset),
+                )
+
+
+def test_realtime_node_edge_explicit_tangent_matches_generic_cached_primal_jvp():
+    """Audit the edge column without a Radau time solve.
+
+    The solver has two possible derivative routes for its private edge
+    coordinate: generic JAX through the flattened cached RHS and the
+    model-owned quadratic edge-polarization tangent.  This test compares
+    them directly at a stage-like displaced state with one fixed cache.  A
+    This is a derivative-contract audit only.  It does not explain or fix a
+    primal stage-RHS excursion by itself; it merely prevents a derivative
+    wiring change from being mistaken for the common failure seen across
+    frozen, refreshed, and full-current Jacobian modes.
+    """
+    config_path = (
+        Path(__file__).resolve().parents[1]
+        / "examples/benchmarks/"
+        "Solve_Transport_equations_wHe_radau_ntx_exact_lagged_runtime_vmec_"
+        "realtime_full_state_quadratic_transport_endpoint_newton_benchmark_center.toml"
+    )
+    config = load_config(config_path)
+    config["_config_dir"] = str(config_path.parent)
+    config["ambipolarity"] = dict(config["ambipolarity"])
+    config["ambipolarity"]["er_ambipolar_plot"] = False
+    runtime, state = build_runtime_context(config)
+    assert state is not None
+    prepared = prepare_transport_solver_components(config, runtime, state)
+    owner = prepared["equation_system"]
+    assert owner.er_equation.boundary_mode == "floating_ambipolar_edge_node"
+
+    edge_anchor = jnp.asarray(-35.0, dtype=state.Er.dtype)
+    response = owner.build_node_boundary_lagged_response(state, edge_anchor)
+    stage_state = dataclasses.replace(
+        state,
+        # A public-centre displacement deliberately coexists with the fixed
+        # response anchor, exactly as it does inside a Radau attempt.
+        Er=state.Er.at[-1].add(jnp.asarray(1.0e-4, dtype=state.Er.dtype)),
+    )
+    zero_direction = TransportState(
+        density=jnp.zeros_like(stage_state.density),
+        pressure=jnp.zeros_like(stage_state.pressure),
+        Er=jnp.zeros_like(stage_state.Er),
+    )
+
+    for edge_value_float in (-37.0, -35.0, -33.0):
+        edge_value = jnp.asarray(edge_value_float, dtype=state.Er.dtype)
+
+        def cached_node_primal(edge):
+            return owner.evaluate_node_boundary_with_lagged_response(
+                stage_state,
+                edge,
+                response,
+                er_edge_anchor=edge_anchor,
+            )
+
+        _primal, generic_tangent = jax.jvp(
+            cached_node_primal,
+            (edge_value,),
+            (jnp.asarray(1.0, dtype=state.Er.dtype),),
+        )
+        explicit_tangent = owner.evaluate_node_boundary_with_lagged_response_tangent(
+            stage_state,
+            zero_direction,
+            edge_value,
+            jnp.asarray(1.0, dtype=state.Er.dtype),
+            response,
+            er_edge_anchor=edge_anchor,
+        )
+        generic_core, generic_edge = generic_tangent
+        explicit_core, explicit_edge = explicit_tangent
+        for field in ("density", "pressure", "Er"):
+            assert jnp.allclose(
+                getattr(generic_core, field),
+                getattr(explicit_core, field),
+                rtol=3.0e-6,
+                atol=1.0e-9,
+            ), (edge_value_float, field)
+        assert jnp.allclose(
+            generic_edge,
+            explicit_edge,
+            rtol=3.0e-6,
+            atol=1.0e-9,
+        ), (edge_value_float, "private_edge_rhs")
+
+
+def test_realtime_outer_face_local_cache_matches_direct_near_observed_edge_roots():
+    """Compare one known boundary state without building a radial response.
+
+    Only the final prepared NTX face operator is used.  The cache consists of
+    four species-local coefficient jets, rather than a 52-face response.
+    """
+    config_path = (
+        Path(__file__).resolve().parents[1]
+        / "examples/benchmarks/"
+        "Solve_Transport_equations_wHe_radau_ntx_exact_lagged_runtime_vmec_"
+        "realtime_full_state_quadratic_transport_endpoint_newton_benchmark_center.toml"
+    )
+    config = load_config(config_path)
+    config["_config_dir"] = str(config_path.parent)
+    # Exercise the captured edge state at the requested high NTX resolution
+    # without changing the benchmark's production TOML.
+    config["neoclassical"] = dict(config["neoclassical"])
+    config["neoclassical"].update(
+        ntx_exact_n_theta=7,
+        ntx_exact_n_zeta=25,
+        ntx_exact_n_xi=31,
+    )
+    config["ambipolarity"] = dict(config["ambipolarity"])
+    config["ambipolarity"]["er_ambipolar_plot"] = False
+    runtime, state = build_runtime_context(config)
+    assert state is not None
+
+    # Use exactly the canonical BC objects which the transport system uses.
+    components = prepare_transport_solver_components(config, runtime, state)
+    equation_system = components["equation_system"]
+    neo = equation_system.shared_flux_model.neoclassical_model
+    er_equation = equation_system.er_equation
+    support = neo._static_support()
+    prepared_edge = jax.tree_util.tree_map(
+        lambda value: jax.lax.dynamic_index_in_dim(
+            value, value.shape[0] - 1, axis=0, keepdims=False
+        ),
+        support.face_prepared,
+    )
+    drds_edge = support.face_channels.drds[-1]
+    collisionality_kind = _collisionality_kind(neo.collisionality_model)
+
+    def _edge_primitives(edge_er):
+        evaluated = build_evaluated_transport_state(
+            state,
+            runtime.geometry,
+            bc_density=neo.bc_density,
+            bc_temperature=neo.bc_temperature,
+            density_floor=neo.density_floor,
+            temperature_floor=neo.temperature_floor,
+            er_edge_override=edge_er,
+        )
+        return (
+            evaluated.face.density[:, -1],
+            evaluated.face.temperature[:, -1],
+            evaluated.density_grad_face[:, -1],
+            evaluated.temperature_grad_face[:, -1],
+        )
+
+    def _edge_gamma(edge_er, local_responses=None, primitives_override=None):
+        if primitives_override is None:
+            density, temperature, density_gradient, temperature_gradient = _edge_primitives(edge_er)
+        else:
+            density, temperature, density_gradient, temperature_gradient = primitives_override
+        vthermal = get_v_thermal(neo.species.mass, temperature)
+        gamma = []
+        for species_index in range(neo.species.number_species):
+            if local_responses is None:
+                lij = neo._solve_lij_prepared_local(
+                    prepared_edge,
+                    drds_value=drds_edge,
+                    species_index=species_index,
+                    er_value=edge_er,
+                    temperature_local=temperature,
+                    density_local=density,
+                    vthermal_local=vthermal,
+                    collisionality_kind=collisionality_kind,
+                )
+            else:
+                response = local_responses[species_index]
+                nu_hat, epsi_hat, vth = neo._local_scan_inputs(
+                    drds_value=drds_edge,
+                    species_index=species_index,
+                    er_value=edge_er,
+                    temperature_local=temperature,
+                    density_local=density,
+                    vthermal_local=vthermal,
+                    collisionality_kind=collisionality_kind,
+                )
+                dnu = nu_hat - response.reference_nu_hat
+                depsi = epsi_hat - response.reference_epsi_hat
+                coefficients = (
+                    response.reference_coefficients
+                    + response.dcoefficients_d_nu_hat * dnu[:, None]
+                    + response.dcoefficients_d_epsi_hat * depsi[:, None]
+                    + 0.5 * (
+                        response.d2coefficients_d_nu_hat2 * dnu[:, None] ** 2
+                        + 2.0 * response.d2coefficients_d_nu_hat_d_epsi_hat
+                        * dnu[:, None] * depsi[:, None]
+                        + response.d2coefficients_d_epsi_hat2 * depsi[:, None] ** 2
+                    )
+                )
+                moments = neo._transport_moments_from_coefficient_scan(
+                    coefficients, drds_value=drds_edge
+                )
+                lij = neo._lij_from_transport_moments(
+                    moments, species_index=species_index, vth_a=vth
+                )
+            a1 = (
+                density_gradient[species_index] / density[species_index]
+                - 1.5 * temperature_gradient[species_index] / temperature[species_index]
+                - neo.species.charge[species_index] * edge_er
+                / (elementary_charge * temperature[species_index])
+            )
+            a2 = temperature_gradient[species_index] / temperature[species_index]
+            gamma.append(
+                -1.0e20 * density[species_index] * (lij[0, 0] * a1 + lij[0, 1] * a2)
+            )
+        return jnp.asarray(gamma)
+
+    plasma_permitivity = _plasma_permitivity_from_prefactor(
+        state, er_equation.species_mass, er_equation.permitivity_prefactor
+    )
+
+    def _edge_rhs_from_outer_gamma(gamma_edge):
+        # This is exactly the node equation's outer-face ambipolar term, with
+        # a one-face Gamma payload because only its final column is consumed.
+        ambi_term = er_equation._outer_face_ambi_term(
+            state,
+            Gamma=gamma_edge[:, None],
+            plasma_permitivity=plasma_permitivity,
+            Gamma_faces=gamma_edge[:, None],
+        )
+        return -jnp.asarray(er_equation.Er_relax) * ambi_term
+
+    # Build exactly one local cache per species at each observed edge-root
+    # regime, then sweep only its Er coordinate.  n/T are held fixed at the
+    # benchmark state; their face values still come from the real BCs above.
+    for edge_anchor_float in (-50.0, -37.0, -35.0, -33.0, -10.0, 0.0, 10.0):
+        edge_anchor = jnp.asarray(edge_anchor_float, dtype=state.Er.dtype)
+        density, temperature, _, _ = _edge_primitives(edge_anchor)
+        vthermal = get_v_thermal(neo.species.mass, temperature)
+        local_responses = tuple(
+            neo._build_quadratic_coefficient_response_local(
+                prepared_edge,
+                drds_value=drds_edge,
+                species_index=species_index,
+                er_value=edge_anchor,
+                temperature_local=temperature,
+                density_local=density,
+                vthermal_local=vthermal,
+                collisionality_kind=collisionality_kind,
+            )
+            for species_index in range(neo.species.number_species)
+        )
+        direct_gamma_base = _edge_gamma(edge_anchor)
+        cached_gamma_base = _edge_gamma(edge_anchor, local_responses)
+        direct_rhs_base = _edge_rhs_from_outer_gamma(direct_gamma_base)
+        cached_rhs_base = _edge_rhs_from_outer_gamma(cached_gamma_base)
+        for edge_offset in (-1.0e-5, -4.0e-6, 0.0, 4.0e-6, 1.0e-5):
+            edge_value = edge_anchor + jnp.asarray(edge_offset, dtype=state.Er.dtype)
+            direct_gamma = _edge_gamma(edge_value)
+            cached_gamma = _edge_gamma(edge_value, local_responses)
+            assert jnp.allclose(cached_gamma, direct_gamma, rtol=3.0e-2, atol=1.0e-8), (
+                "edge_anchor", edge_anchor_float, "offset", edge_offset,
+            )
+            direct_charge = jnp.sum(neo.species.charge * direct_gamma)
+            cached_charge = jnp.sum(neo.species.charge * cached_gamma)
+            assert jnp.allclose(cached_charge, direct_charge, rtol=3.0e-2, atol=1.0e-8)
+            direct_rhs = _edge_rhs_from_outer_gamma(direct_gamma)
+            cached_rhs = _edge_rhs_from_outer_gamma(cached_gamma)
+            print(
+                "[outer-face-local-cache-audit] "
+                f"anchor={edge_anchor_float:.6e} offset={edge_offset:.6e} "
+                f"charge_direct={float(direct_charge):.6e} "
+                f"charge_cached={float(cached_charge):.6e} "
+                f"charge_abs_error={float(jnp.abs(cached_charge - direct_charge)):.6e} "
+                f"edge_rhs_direct={float(direct_rhs):.6e} "
+                f"edge_rhs_cached={float(cached_rhs):.6e} "
+                f"edge_rhs_abs_error={float(jnp.abs(cached_rhs - direct_rhs)):.6e} "
+                f"edge_rhs_delta_direct={float(direct_rhs - direct_rhs_base):.6e} "
+                f"edge_rhs_delta_cached={float(cached_rhs - cached_rhs_base):.6e}"
+            )
+            assert jnp.allclose(cached_rhs, direct_rhs, rtol=3.0e-2, atol=1.0e-8)
+
+    # Captured from the failing private-edge rebuild at t=9.269939e-03 s.
+    # These are the exact outer-face n, T and Er inputs reported by the
+    # solver, rather than the t=0 values used by the sweep above.  The log did
+    # not contain the contemporaneous force-gradient vector, so retain the
+    # production reconstruction's gradients only for this isolated
+    # coefficient/RHS slope check and print them as part of the evidence.
+    captured_edge = jnp.asarray(-3.6970860e1, dtype=state.Er.dtype)
+    captured_density = jnp.asarray(
+        [3.90e-01, 1.95e-01, 1.95e-01, 1.00e-06], dtype=state.density.dtype
+    )
+    captured_temperature = jnp.asarray(
+        [7.6701323e-01, 7.5509465e-01, 7.5497315e-01, 5.6769859e-01],
+        dtype=state.pressure.dtype,
+    )
+    _, _, captured_density_gradient, captured_temperature_gradient = _edge_primitives(
+        captured_edge
+    )
+    captured_primitives = (
+        captured_density,
+        captured_temperature,
+        captured_density_gradient,
+        captured_temperature_gradient,
+    )
+    captured_vthermal = get_v_thermal(neo.species.mass, captured_temperature)
+    captured_responses = tuple(
+        neo._build_quadratic_coefficient_response_local(
+            prepared_edge,
+            drds_value=drds_edge,
+            species_index=species_index,
+            er_value=captured_edge,
+            temperature_local=captured_temperature,
+            density_local=captured_density,
+            vthermal_local=captured_vthermal,
+            collisionality_kind=collisionality_kind,
+        )
+        for species_index in range(neo.species.number_species)
+    )
+    captured_probe = jnp.asarray(1.0e-6, dtype=state.Er.dtype)
+    captured_direct_minus = _edge_rhs_from_outer_gamma(
+        _edge_gamma(captured_edge - captured_probe, primitives_override=captured_primitives)
+    )
+    captured_direct_plus = _edge_rhs_from_outer_gamma(
+        _edge_gamma(captured_edge + captured_probe, primitives_override=captured_primitives)
+    )
+    captured_cached_minus = _edge_rhs_from_outer_gamma(
+        _edge_gamma(
+            captured_edge - captured_probe,
+            captured_responses,
+            primitives_override=captured_primitives,
+        )
+    )
+    captured_cached_plus = _edge_rhs_from_outer_gamma(
+        _edge_gamma(
+            captured_edge + captured_probe,
+            captured_responses,
+            primitives_override=captured_primitives,
+        )
+    )
+    captured_direct_gamma_minus = _edge_gamma(
+        captured_edge - captured_probe, primitives_override=captured_primitives
+    )
+    captured_direct_gamma_plus = _edge_gamma(
+        captured_edge + captured_probe, primitives_override=captured_primitives
+    )
+    captured_cached_gamma_minus = _edge_gamma(
+        captured_edge - captured_probe,
+        captured_responses,
+        primitives_override=captured_primitives,
+    )
+    captured_cached_gamma_plus = _edge_gamma(
+        captured_edge + captured_probe,
+        captured_responses,
+        primitives_override=captured_primitives,
+    )
+    captured_direct_gamma_slope = (
+        captured_direct_gamma_plus - captured_direct_gamma_minus
+    ) / (2.0 * captured_probe)
+    captured_cached_gamma_slope = (
+        captured_cached_gamma_plus - captured_cached_gamma_minus
+    ) / (2.0 * captured_probe)
+    captured_direct_charge_slope_by_species = (
+        neo.species.charge * captured_direct_gamma_slope
+    )
+    captured_cached_charge_slope_by_species = (
+        neo.species.charge * captured_cached_gamma_slope
+    )
+    captured_scan_inputs = tuple(
+        neo._local_scan_inputs(
+            drds_value=drds_edge,
+            species_index=species_index,
+            er_value=captured_edge,
+            temperature_local=captured_temperature,
+            density_local=captured_density,
+            vthermal_local=captured_vthermal,
+            collisionality_kind=collisionality_kind,
+        )
+        for species_index in range(neo.species.number_species)
+    )
+    captured_nu_over_v = jnp.stack(tuple(item[0] for item in captured_scan_inputs))
+    captured_er_over_v = jnp.stack(tuple(item[1] for item in captured_scan_inputs))
+    captured_direct_slope = (captured_direct_plus - captured_direct_minus) / (2.0 * captured_probe)
+    captured_cached_slope = (captured_cached_plus - captured_cached_minus) / (2.0 * captured_probe)
+    print(
+        "[outer-face-captured-failure-state-slope] "
+        f"edge={float(captured_edge):.9e} density={captured_density} "
+        f"temperature={captured_temperature} "
+        f"density_gradient_from_t0={captured_density_gradient} "
+        f"temperature_gradient_from_t0={captured_temperature_gradient} "
+        f"direct_rhs_minus={float(captured_direct_minus):.9e} "
+        f"direct_rhs_plus={float(captured_direct_plus):.9e} "
+        f"cached_rhs_minus={float(captured_cached_minus):.9e} "
+        f"cached_rhs_plus={float(captured_cached_plus):.9e} "
+        f"direct_slope={float(captured_direct_slope):.9e} "
+        f"cached_slope={float(captured_cached_slope):.9e}\n"
+        "[outer-face-captured-failure-state-fluxes] "
+        f"species_order=[electron,deuterium,tritium,helium] "
+        f"charge={neo.species.charge} "
+        f"direct_Gamma_minus={captured_direct_gamma_minus} "
+        f"direct_Gamma_plus={captured_direct_gamma_plus} "
+        f"direct_dGamma_dEr={captured_direct_gamma_slope} "
+        f"direct_charge_dGamma_dEr={captured_direct_charge_slope_by_species} "
+        f"cached_dGamma_dEr={captured_cached_gamma_slope} "
+        f"cached_charge_dGamma_dEr={captured_cached_charge_slope_by_species}\n"
+        "[outer-face-captured-failure-state-ntx-inputs] "
+        "species_order=[electron,deuterium,tritium,helium] "
+        f"nu_over_v={captured_nu_over_v} "
+        f"Er_over_v={captured_er_over_v}"
+    )
+    assert jnp.allclose(
+        captured_cached_slope, captured_direct_slope, rtol=3.0e-2, atol=1.0e-5
+    )
+
+
+def test_face_quadratic_coefficient_interpolation_rebases_before_radial_interpolation():
+    """A common global polynomial survives face-to-centre rebasing exactly."""
+
+    geometry = types.SimpleNamespace(
+        a_b=1.0,
+        r_grid=jnp.asarray([0.25, 0.75]),
+        r_grid_half=jnp.asarray([0.0, 0.5, 1.0]),
+    )
+    model = NTXExactLijRuntimeTransportModel(
+        species=types.SimpleNamespace(number_species=1),
+        energy_grid=object(),
+        geometry=geometry,
+        vmec_file=None,
+        boozer_file=None,
+    )
+    u_face = jnp.asarray([[[1.0]], [[2.0]], [[3.0]]])
+    e_face = jnp.asarray([[[0.5]], [[1.5]], [[2.5]]])
+    # One coefficient with a radius-independent polynomial in absolute u,e.
+    # C = 2 + 3u - 5e + 7/2 u^2 + 11ue + 13/2 e^2.
+    coefficient = lambda u, e: 2.0 + 3.0 * u - 5.0 * e + 3.5 * u**2 + 11.0 * u * e + 6.5 * e**2
+    du = 3.0 + 7.0 * u_face + 11.0 * e_face
+    de = -5.0 + 11.0 * u_face + 13.0 * e_face
+    response = NTXQuadraticPreparedCoefficientResponse(
+        reference_nu_hat=u_face,
+        reference_epsi_hat=e_face,
+        reference_coefficients=coefficient(u_face, e_face)[..., None],
+        dcoefficients_d_nu_hat=du[..., None],
+        dcoefficients_d_epsi_hat=de[..., None],
+        d2coefficients_d_nu_hat2=jnp.full((3, 1, 1, 1), 7.0),
+        d2coefficients_d_nu_hat_d_epsi_hat=jnp.full((3, 1, 1, 1), 11.0),
+        d2coefficients_d_epsi_hat2=jnp.full((3, 1, 1, 1), 13.0),
+    )
+    u_center = jnp.asarray([[[1.5]], [[2.5]]])
+    e_center = jnp.asarray([[[1.0]], [[2.0]]])
+    interpolated = model._interpolate_face_quadratic_coefficients_to_centres(
+        response,
+        center_reference_nu_hat=u_center,
+        center_reference_epsi_hat=e_center,
+    )
+    assert jnp.allclose(
+        interpolated.reference_coefficients[..., 0], coefficient(u_center, e_center)
+    )
+    assert jnp.allclose(interpolated.dcoefficients_d_nu_hat[..., 0], 3.0 + 7.0 * u_center + 11.0 * e_center)
+    assert jnp.allclose(interpolated.dcoefficients_d_epsi_hat[..., 0], -5.0 + 11.0 * u_center + 13.0 * e_center)
+    assert jnp.allclose(interpolated.d2coefficients_d_nu_hat2, 7.0)
+    assert jnp.allclose(interpolated.d2coefficients_d_nu_hat_d_epsi_hat, 11.0)
+    assert jnp.allclose(interpolated.d2coefficients_d_epsi_hat2, 13.0)
+
+    # A globally consistent polynomial has identical translated left/right
+    # values, so the reliability weighting must preserve it exactly.
+    reliability_weighted = model._interpolate_face_quadratic_coefficients_to_centres(
+        response,
+        center_reference_nu_hat=u_center,
+        center_reference_epsi_hat=e_center,
+        weight_mode="taylor_reliability",
+    )
+    assert jnp.allclose(
+        reliability_weighted.reference_coefficients[..., 0],
+        coefficient(u_center, e_center),
+    )
+
+
+def test_face_quadratic_coefficient_cubic_interpolation_rebases_before_radial_interpolation():
+    """The opt-in four-face reconstruction preserves a cubic radial field."""
+
+    geometry = types.SimpleNamespace(
+        a_b=1.0,
+        r_grid=jnp.asarray([0.125, 0.375, 0.625, 0.875]),
+        r_grid_half=jnp.asarray([0.0, 0.25, 0.5, 0.75, 1.0]),
+    )
+    model = NTXExactLijRuntimeTransportModel(
+        species=types.SimpleNamespace(number_species=1),
+        energy_grid=object(),
+        geometry=geometry,
+        vmec_file=None,
+        boozer_file=None,
+    )
+    radius_face = geometry.r_grid_half[:, None, None]
+    u_face = jnp.asarray([[[1.0]], [[2.0]], [[3.0]], [[4.0]], [[5.0]]])
+    e_face = jnp.asarray([[[0.5]], [[1.5]], [[2.5]], [[3.5]], [[4.5]]])
+    radial = lambda r: 1.0 - 2.0 * r + 3.0 * r**2 - 4.0 * r**3
+    coefficient = lambda r, u, e: radial(r) + 3.0 * u - 5.0 * e + 3.5 * u**2 + 11.0 * u * e + 6.5 * e**2
+    du = 3.0 + 7.0 * u_face + 11.0 * e_face
+    de = -5.0 + 11.0 * u_face + 13.0 * e_face
+    response = NTXQuadraticPreparedCoefficientResponse(
+        reference_nu_hat=u_face,
+        reference_epsi_hat=e_face,
+        reference_coefficients=coefficient(radius_face, u_face, e_face)[..., None],
+        dcoefficients_d_nu_hat=du[..., None],
+        dcoefficients_d_epsi_hat=de[..., None],
+        d2coefficients_d_nu_hat2=jnp.full((5, 1, 1, 1), 7.0),
+        d2coefficients_d_nu_hat_d_epsi_hat=jnp.full((5, 1, 1, 1), 11.0),
+        d2coefficients_d_epsi_hat2=jnp.full((5, 1, 1, 1), 13.0),
+    )
+    u_center = jnp.asarray([[[1.5]], [[2.5]], [[3.5]], [[4.5]]])
+    e_center = jnp.asarray([[[1.0]], [[2.0]], [[3.0]], [[4.0]]])
+    interpolated = model._interpolate_face_quadratic_coefficients_to_centres(
+        response,
+        center_reference_nu_hat=u_center,
+        center_reference_epsi_hat=e_center,
+        weight_mode="radial_cubic",
+    )
+    expected = coefficient(geometry.r_grid[:, None, None], u_center, e_center)
+    assert jnp.allclose(interpolated.reference_coefficients[..., 0], expected)
+    assert jnp.allclose(interpolated.dcoefficients_d_nu_hat[..., 0], 3.0 + 7.0 * u_center + 11.0 * e_center)
+    assert jnp.allclose(interpolated.dcoefficients_d_epsi_hat[..., 0], -5.0 + 11.0 * u_center + 13.0 * e_center)
+
+
+def test_face_quadratic_coefficient_interpolation_uses_common_er_over_v_coordinate():
+    """Face Taylor models must be translated at one physical ``Er / v``.
+
+    The NTX electric coordinate is ``epsi_hat = drds * Er / v``.  A raw
+    centre-epsi query therefore represents different physical electric fields
+    at the two faces whenever ``drds`` varies radially.  This test uses a
+    polynomial in ``(nu / v, Er / v)`` and verifies both the reparameterized
+    value and all electric-coordinate chain-rule derivatives.
+    """
+
+    geometry = types.SimpleNamespace(
+        a_b=1.0,
+        r_grid=jnp.asarray([0.25, 0.75]),
+        r_grid_half=jnp.asarray([0.0, 0.5, 1.0]),
+    )
+    model = NTXExactLijRuntimeTransportModel(
+        species=types.SimpleNamespace(number_species=1),
+        energy_grid=object(),
+        geometry=geometry,
+        vmec_file=None,
+        boozer_file=None,
+    )
+    face_drds = jnp.asarray([2.0, 3.0, 4.0])
+    center_drds = jnp.asarray([2.5, 3.5])
+    u_face = jnp.asarray([[[1.0]], [[2.0]], [[3.0]]])
+    eta_face = jnp.asarray([[[0.5]], [[1.5]], [[2.5]]])
+    e_face = eta_face * face_drds[:, None, None]
+    # C = 2 + 3u - 5 eta + 7/2 u^2 + 11 u eta + 13/2 eta^2.
+    coefficient = lambda u, eta: 2.0 + 3.0 * u - 5.0 * eta + 3.5 * u**2 + 11.0 * u * eta + 6.5 * eta**2
+    d_u = 3.0 + 7.0 * u_face + 11.0 * eta_face
+    d_eta = -5.0 + 11.0 * u_face + 13.0 * eta_face
+    response = NTXQuadraticPreparedCoefficientResponse(
+        reference_nu_hat=u_face,
+        reference_epsi_hat=e_face,
+        reference_coefficients=coefficient(u_face, eta_face)[..., None],
+        dcoefficients_d_nu_hat=d_u[..., None],
+        dcoefficients_d_epsi_hat=(d_eta / face_drds[:, None, None])[..., None],
+        d2coefficients_d_nu_hat2=jnp.full((3, 1, 1, 1), 7.0),
+        d2coefficients_d_nu_hat_d_epsi_hat=(11.0 / face_drds[:, None, None])[..., None],
+        d2coefficients_d_epsi_hat2=(13.0 / face_drds[:, None, None] ** 2)[..., None],
+    )
+    u_center = jnp.asarray([[[1.5]], [[2.5]]])
+    eta_center = jnp.asarray([[[1.0]], [[2.0]]])
+    e_center = eta_center * center_drds[:, None, None]
+    interpolated = model._interpolate_face_quadratic_coefficients_to_centres(
+        response,
+        center_reference_nu_hat=u_center,
+        center_reference_epsi_hat=e_center,
+        coordinate_mode="physical_er_over_v",
+        center_drds=center_drds,
+        face_drds=face_drds,
+    )
+    assert jnp.allclose(
+        interpolated.reference_coefficients[..., 0], coefficient(u_center, eta_center)
+    )
+    assert jnp.allclose(
+        interpolated.dcoefficients_d_nu_hat[..., 0],
+        3.0 + 7.0 * u_center + 11.0 * eta_center,
+    )
+    assert jnp.allclose(
+        interpolated.dcoefficients_d_epsi_hat[..., 0],
+        (-5.0 + 11.0 * u_center + 13.0 * eta_center) / center_drds[:, None, None],
+    )
+    assert jnp.allclose(interpolated.d2coefficients_d_nu_hat2, 7.0)
+    assert jnp.allclose(
+        interpolated.d2coefficients_d_nu_hat_d_epsi_hat,
+        11.0 / center_drds[:, None, None, None],
+    )
+    assert jnp.allclose(
+        interpolated.d2coefficients_d_epsi_hat2,
+        13.0 / center_drds[:, None, None, None] ** 2,
+    )
+
+def test_ntx_exact_fused_lowdot_local_pullback_matches_ntx_helper():
+    """The opt-in fused local NTX path must preserve the scalar local bars."""
+    energy_grid = types.SimpleNamespace(
+        xWeights=jnp.asarray([0.2, 0.3, 0.5]),
+        L11_weight=jnp.asarray([1.0, 0.8, 1.2]),
+        L12_weight=jnp.asarray([0.1, -0.2, 0.3]),
+        L22_weight=jnp.asarray([0.9, 1.1, 0.7]),
+        L13_weight=jnp.asarray([0.4, 0.5, 0.6]),
+        L23_weight=jnp.asarray([-0.3, 0.2, 0.1]),
+        L33_weight=jnp.asarray([1.3, 0.6, 0.9]),
+        v_norm=jnp.asarray([1.7, 1.8, 1.9]),
+    )
+    common = dict(
+        species=object(),
+        energy_grid=energy_grid,
+        geometry=object(),
+        vmec_file=None,
+        boozer_file=None,
+    )
+    reference = NTXExactLijRuntimeTransportModel(**common)
+    fused = reference.with_derivative_pullback_algebra("ntx_helper_lowdot_fused")
+    prepared = prepare_monoenergetic_system(example_surface(), GridSpec(5, 5, 4))
+    field_bars = (
+        jnp.asarray(0.2),
+        jnp.asarray([0.4, -0.2, 0.1, 0.3, -0.5, 0.2]),
+        jnp.asarray([-0.3, 0.2, 0.4, -0.1, 0.5, 0.2]),
+        jnp.asarray([0.1, 0.3, -0.2, 0.5, -0.4, 0.2]),
+    )
+    kwargs = dict(
+        prepared=prepared,
+        drds_value=jnp.asarray(1.2),
+        reference_nu_hat=jnp.asarray([1.0e-2, 1.5e-2, 2.0e-2]),
+        reference_epsi_hat=jnp.asarray([1.0e-3, -2.0e-3, 1.5e-3]),
+        vth_a=jnp.asarray(2.3),
+        field_bars=field_bars,
+    )
+    reference_bars = reference._pullback_interpolated_moment_reduced_local_outputs(**kwargs)
+    fused_bars = fused._pullback_interpolated_moment_reduced_local_outputs(**kwargs)
+    for fused_bar, reference_bar in zip(fused_bars, reference_bars, strict=True):
+        assert jnp.allclose(fused_bar, reference_bar, rtol=1.0e-9, atol=1.0e-11)
+
+
+def test_ntx_exact_factorized_two_directional_local_response_matches_generic_jvps():
+    """The isolated rebuild primitive must match the existing local response."""
+    energy_grid = types.SimpleNamespace(
+        xWeights=jnp.asarray([0.2, 0.3, 0.5]),
+        L11_weight=jnp.asarray([1.0, 0.8, 1.2]),
+        L12_weight=jnp.asarray([0.1, -0.2, 0.3]),
+        L22_weight=jnp.asarray([0.9, 1.1, 0.7]),
+        L13_weight=jnp.asarray([0.4, 0.5, 0.6]),
+        L23_weight=jnp.asarray([-0.3, 0.2, 0.1]),
+        L33_weight=jnp.asarray([1.3, 0.6, 0.9]),
+        v_norm=jnp.asarray([1.7, 1.8, 1.9]),
+    )
+    model = NTXExactLijRuntimeTransportModel(
+        species=object(),
+        energy_grid=energy_grid,
+        geometry=object(),
+        vmec_file=None,
+        boozer_file=None,
+    )
+    prepared = prepare_monoenergetic_system(example_surface(), GridSpec(3, 3, 2))
+    nu_hat = jnp.asarray([1.0e-2, 1.5e-2, 2.0e-2])
+    epsi_hat = jnp.asarray([1.0e-3, -2.0e-3, 1.5e-3])
+    vth_a = jnp.asarray(2.3)
+    drds = jnp.asarray(1.2)
+
+    def _response(prepared_value, drds_value, *, factorized):
+        return model._interpolated_moment_reduced_local_outputs_from_primitives(
+            prepared_value,
+            drds_value=drds_value,
+            nu_hat_a=nu_hat,
+            epsi_hat_a=epsi_hat,
+            vth_a=vth_a,
+            use_factorized_ntx_two_directional_prepared_vjp=factorized,
+        )
+
+    reference = _response(prepared, drds, factorized=False)
+    factorized = jax.jit(
+        lambda prepared_value, drds_value: _response(
+            prepared_value, drds_value, factorized=True
+        )
+    )(prepared, drds)
+    for actual, expected in zip(factorized, reference, strict=True):
+        assert jnp.allclose(actual, expected, rtol=1.0e-9, atol=1.0e-11)
+
+
+def test_ntx_exact_support_only_prepared_pullback_matches_joint_helper():
+    """The isolated rebuild helper preserves prepared, ``drds``, and primal fields."""
+    energy_grid = types.SimpleNamespace(
+        xWeights=jnp.asarray([0.2, 0.3, 0.5]),
+        L11_weight=jnp.asarray([1.0, 0.8, 1.2]),
+        L12_weight=jnp.asarray([0.1, -0.2, 0.3]),
+        L22_weight=jnp.asarray([0.9, 1.1, 0.7]),
+        L13_weight=jnp.asarray([0.4, 0.5, 0.6]),
+        L23_weight=jnp.asarray([-0.3, 0.2, 0.1]),
+        L33_weight=jnp.asarray([1.3, 0.6, 0.9]),
+        v_norm=jnp.asarray([1.7, 1.8, 1.9]),
+    )
+    model = NTXExactLijRuntimeTransportModel(
+        species=object(),
+        energy_grid=energy_grid,
+        geometry=object(),
+        vmec_file=None,
+        boozer_file=None,
+    )
+    prepared = prepare_monoenergetic_system(example_surface(), GridSpec(5, 5, 4))
+    kwargs = dict(
+        prepared=prepared,
+        drds_value=jnp.asarray(1.2),
+        reference_nu_hat=jnp.asarray([1.0e-2, 1.5e-2, 2.0e-2]),
+        reference_epsi_hat=jnp.asarray([1.0e-3, -2.0e-3, 1.5e-3]),
+        vth_a=jnp.asarray(2.3),
+        field_bars=(
+            jnp.asarray(0.2),
+            jnp.asarray([0.4, -0.2, 0.1, 0.3, -0.5, 0.2]),
+            jnp.asarray([-0.3, 0.2, 0.4, -0.1, 0.5, 0.2]),
+            jnp.asarray([0.1, 0.3, -0.2, 0.5, -0.4, 0.2]),
+        ),
+    )
+    joint = model._pullback_interpolated_moment_reduced_local_outputs_with_prepared_support_and_drds(
+        **kwargs
+    )
+    support_only = jax.jit(
+        lambda: model._pullback_interpolated_moment_prepared_support_and_drds_only(**kwargs)
+    )()
+    expected_primal = model._interpolated_moment_reduced_local_outputs_from_primitives(
+        prepared,
+        drds_value=kwargs["drds_value"],
+        nu_hat_a=kwargs["reference_nu_hat"],
+        epsi_hat_a=kwargs["reference_epsi_hat"],
+        vth_a=kwargs["vth_a"],
+    )
+    actual_prepared, actual_drds, actual_primal = support_only
+    for actual_leaf, expected_leaf in zip(
+        jax.tree_util.tree_leaves(actual_prepared),
+        jax.tree_util.tree_leaves(joint[3]),
+        strict=True,
+    ):
+        if jnp.issubdtype(jnp.asarray(expected_leaf).dtype, jnp.inexact):
+            assert jnp.allclose(actual_leaf, expected_leaf, rtol=1.0e-9, atol=1.0e-11)
+    assert jnp.allclose(actual_drds, joint[4], rtol=1.0e-9, atol=1.0e-11)
+    for actual_field, expected_field in zip(actual_primal, expected_primal, strict=True):
+        assert jnp.allclose(actual_field, expected_field, rtol=1.0e-9, atol=1.0e-11)
+
+    batched_field_bars = tuple(
+        jnp.stack([field_bar, field_bar], axis=0)
+        for field_bar in kwargs["field_bars"]
+    )
+    def _sanitized_support_only(first_bar, second_bar, third_bar, fourth_bar):
+        prepared_bar, drds_bar, primal_response = (
+            model._pullback_interpolated_moment_prepared_support_and_drds_only(
+                prepared,
+                drds_value=kwargs["drds_value"],
+                reference_nu_hat=kwargs["reference_nu_hat"],
+                reference_epsi_hat=kwargs["reference_epsi_hat"],
+                vth_a=kwargs["vth_a"],
+                field_bars=(first_bar, second_bar, third_bar, fourth_bar),
+            )
+        )
+        return (
+            *jax.tree_util.tree_leaves(
+                _sanitize_float_delta_bar_tree(prepared, prepared_bar)
+            ),
+            drds_bar,
+            *primal_response,
+        )
+
+    batched_support_only = jax.jit(jax.vmap(_sanitized_support_only))(
+        *batched_field_bars
+    )
+    expected_batched = tuple(
+        jnp.broadcast_to(value, (2,) + jnp.asarray(value).shape)
+        for value in _sanitized_support_only(*kwargs["field_bars"])
+    )
+    for actual_leaf, expected_leaf in zip(batched_support_only, expected_batched, strict=True):
+        if jnp.issubdtype(jnp.asarray(expected_leaf).dtype, jnp.inexact):
+            assert jnp.allclose(actual_leaf, expected_leaf, rtol=1.0e-9, atol=1.0e-11)
+
+
+def test_joint_local_pullback_primal_output_preserves_existing_bars():
+    """The opt-in joint helper must add only the local primal response."""
+    model = NTXExactLijRuntimeTransportModel(
+        species=types.SimpleNamespace(number_species=1, mass=jnp.asarray([1.0])),
+        energy_grid=object(),
+        geometry=object(),
+        vmec_file=None,
+        boozer_file=None,
+    )
+    prepared = {"coefficient": jnp.asarray([2.0, -1.0])}
+    primal_response = (
+        jnp.asarray([0.25]),
+        jnp.asarray([[1.0, -2.0]]),
+        jnp.asarray([[3.0, 4.0]]),
+        jnp.asarray([[5.0, 6.0]]),
+    )
+    object.__setattr__(model, "_interpolated_moment_local_scan_primitives", lambda **_kwargs: (
+        jnp.asarray(1.0),
+        jnp.asarray(2.0),
+        jnp.asarray(3.0),
+    ))
+    object.__setattr__(model, "_pullback_interpolated_moment_reduced_local_outputs_with_prepared_support_and_drds", (
+        lambda prepared, **_kwargs: (
+            jnp.asarray(7.0),
+            jnp.asarray(8.0),
+            jnp.asarray(9.0),
+            {"coefficient": jnp.asarray([10.0, 11.0])},
+            jnp.asarray(12.0),
+        )
+    ))
+    object.__setattr__(model, "_pullback_local_scan_inputs_and_drds_from_primitives", lambda **_kwargs: (
+        jnp.asarray(13.0),
+        jnp.asarray(14.0),
+        jnp.asarray(15.0),
+        jnp.asarray(16.0),
+    ))
+    object.__setattr__(model, "_interpolated_moment_reduced_local_outputs_from_primitives", (
+        lambda *_args, **_kwargs: primal_response
+    ))
+    field_bars = (
+        jnp.asarray([0.1]),
+        jnp.asarray([[0.2, 0.3]]),
+        jnp.asarray([[0.4, 0.5]]),
+        jnp.asarray([[0.6, 0.7]]),
+    )
+    common = dict(
+        prepared=prepared,
+        drds_value=jnp.asarray(1.0),
+        er_value=jnp.asarray(2.0),
+        temperature_local=jnp.asarray(3.0),
+        density_local=jnp.asarray(4.0),
+        collisionality_kind="none",
+        field_bars=field_bars,
+    )
+    reference = model._pullback_interpolated_moment_response_local_fields_and_prepared_support_and_drds_flat_prepared(
+        **common
+    )
+    actual = model._pullback_interpolated_moment_response_local_fields_and_prepared_support_and_drds_flat_prepared(
+        **common,
+        return_primal_response=True,
+    )
+    for actual_leaf, reference_leaf in zip(actual[:5], reference, strict=True):
+        if isinstance(actual_leaf, tuple):
+            for actual_subleaf, reference_subleaf in zip(actual_leaf, reference_leaf, strict=True):
+                assert jnp.allclose(actual_subleaf, reference_subleaf)
+        else:
+            assert jnp.allclose(actual_leaf, reference_leaf)
+    for actual_field, expected_field in zip(actual[5], primal_response, strict=True):
+        assert jnp.allclose(actual_field, expected_field)
+
+
+def test_scalar_joint_local_pullback_mock_retains_outer_objective_batch_only():
+    """The scalar joint primitive is trace-once under an outer RHS batch.
+
+    This is deliberately a tiny mocked contract test.  It guards the intended
+    next rebuild route: state and support bars are returned together by the
+    scalar local primitive, while the caller alone owns the objective/RHS
+    axis.  No production NTX solve, transport rollout, profiling, or file
+    output is involved.
+    """
+    model = NTXExactLijRuntimeTransportModel(
+        species=types.SimpleNamespace(number_species=1, mass=jnp.asarray([1.0])),
+        energy_grid=object(),
+        geometry=object(),
+        vmec_file=None,
+        boozer_file=None,
+    )
+    prepared = {"coefficient": jnp.asarray([2.0, -1.0])}
+    calls = {"joint_lowdot_contract": 0}
+
+    object.__setattr__(model, "_interpolated_moment_local_scan_primitives", lambda **_kwargs: (
+        jnp.asarray(1.0),
+        jnp.asarray(2.0),
+        jnp.asarray(3.0),
+    ))
+
+    def _joint_lowdot_contract(prepared_value, **_kwargs):
+        calls["joint_lowdot_contract"] += 1
+        return (
+            jnp.asarray(7.0),
+            jnp.asarray(8.0),
+            jnp.asarray(9.0),
+            {"coefficient": jnp.asarray([10.0, 11.0])},
+            jnp.asarray(12.0),
+        )
+
+    object.__setattr__(
+        model,
+        "_pullback_interpolated_moment_reduced_local_outputs_with_prepared_support_and_drds",
+        _joint_lowdot_contract,
+    )
+    object.__setattr__(model, "_pullback_local_scan_inputs_and_drds_from_primitives", lambda **_kwargs: (
+        jnp.asarray(13.0),
+        jnp.asarray(14.0),
+        jnp.asarray(15.0),
+        jnp.asarray(16.0),
+    ))
+
+    common = dict(
+        prepared=prepared,
+        drds_value=jnp.asarray(1.0),
+        er_value=jnp.asarray(2.0),
+        temperature_local=jnp.asarray(3.0),
+        density_local=jnp.asarray(4.0),
+        collisionality_kind="none",
+    )
+    one_rhs = (
+        jnp.asarray([0.1]),
+        jnp.asarray([[0.2, 0.3]]),
+        jnp.asarray([[0.4, 0.5]]),
+        jnp.asarray([[0.6, 0.7]]),
+    )
+
+    def _one_objective(*field_bars):
+        return model._pullback_interpolated_moment_response_local_fields_and_prepared_support_and_drds_flat_prepared(
+            **common,
+            field_bars=field_bars,
+        )
+
+    single = _one_objective(*one_rhs)
+    assert calls["joint_lowdot_contract"] == 1
+    assert jnp.allclose(single[0], 25.0)  # implicit + direct drds bars
+    assert jnp.allclose(single[1], 14.0)
+    assert jnp.allclose(single[2], 15.0)
+    assert jnp.allclose(single[3], 16.0)
+    assert jnp.allclose(single[4][0], jnp.asarray([10.0, 11.0]))
+
+    objective_count = 20
+    calls["joint_lowdot_contract"] = 0
+    batched_rhs = tuple(
+        jnp.broadcast_to(value, (objective_count,) + value.shape)
+        for value in one_rhs
+    )
+    batched = jax.jit(jax.vmap(_one_objective))(*batched_rhs)
+
+    # Python mock calls occur while JAX traces the one scalar body.  This
+    # proves the objective axis is supplied by the outer vmap rather than a
+    # host loop or an inner objective-specific helper construction.
+    assert calls["joint_lowdot_contract"] == 1
+    for actual, expected in zip(batched[:4], single[:4], strict=True):
+        assert actual.shape[0] == objective_count
+        assert jnp.allclose(actual, jnp.broadcast_to(expected, actual.shape))
+    assert batched[4][0].shape[0] == objective_count
+    assert jnp.allclose(
+        batched[4][0],
+        jnp.broadcast_to(single[4][0], batched[4][0].shape),
+    )
+
+
+def test_scalar_joint_local_pullback_mock_matches_existing_state_pullback():
+    """Joint local bars retain the established scalar state-bar contract."""
+    model = NTXExactLijRuntimeTransportModel(
+        species=types.SimpleNamespace(number_species=1, mass=jnp.asarray([1.0])),
+        energy_grid=object(),
+        geometry=object(),
+        vmec_file=None,
+        boozer_file=None,
+    )
+    prepared = {"coefficient": jnp.asarray([2.0, -1.0])}
+    object.__setattr__(model, "_interpolated_moment_local_scan_primitives", lambda **_kwargs: (
+        jnp.asarray(1.0),
+        jnp.asarray(2.0),
+        jnp.asarray(3.0),
+    ))
+    object.__setattr__(model, "_pullback_interpolated_moment_reduced_local_outputs", lambda *_args, **_kwargs: (
+        jnp.asarray(8.0),
+        jnp.asarray(9.0),
+        jnp.asarray(10.0),
+    ))
+    object.__setattr__(model, "_pullback_local_scan_inputs_from_primitives", lambda **_kwargs: (
+        jnp.asarray(14.0),
+        jnp.asarray(15.0),
+        jnp.asarray(16.0),
+    ))
+    object.__setattr__(model, "_pullback_interpolated_moment_reduced_local_outputs_with_prepared_support_and_drds", (
+        lambda prepared_value, **_kwargs: (
+            jnp.asarray(8.0),
+            jnp.asarray(9.0),
+            jnp.asarray(10.0),
+            {"coefficient": jnp.asarray([10.0, 11.0])},
+            jnp.asarray(12.0),
+        )
+    ))
+    object.__setattr__(model, "_pullback_local_scan_inputs_and_drds_from_primitives", lambda **_kwargs: (
+        jnp.asarray(25.0),
+        jnp.asarray(14.0),
+        jnp.asarray(15.0),
+        jnp.asarray(16.0),
+    ))
+    field_bars = (
+        jnp.asarray([0.1]),
+        jnp.asarray([[0.2, 0.3]]),
+        jnp.asarray([[0.4, 0.5]]),
+        jnp.asarray([[0.6, 0.7]]),
+    )
+    common = dict(
+        prepared=prepared,
+        drds_value=jnp.asarray(1.0),
+        er_value=jnp.asarray(2.0),
+        temperature_local=jnp.asarray(3.0),
+        density_local=jnp.asarray(4.0),
+        collisionality_kind="none",
+        field_bars=field_bars,
+    )
+
+    state_bars = model._pullback_interpolated_moment_response_local_fields(**common)
+    joint_bars = (
+        model._pullback_interpolated_moment_response_local_fields_and_prepared_support_and_drds_flat_prepared(
+            **common
+        )
+    )
+
+    for joint_state_bar, state_bar in zip(joint_bars[1:4], state_bars, strict=True):
+        assert jnp.allclose(joint_state_bar, state_bar)
+    # The scalar joint contract includes both the primitive-mediated drds bar
+    # and the direct transport-moment drds bar.
+    assert jnp.allclose(joint_bars[0], 37.0)
+    assert jnp.allclose(joint_bars[4][0], jnp.asarray([10.0, 11.0]))
+
+
+def test_native_joint_local_adapter_keeps_objective_rhs_inside_ntx_mock():
+    """The native joint adapter calls NTX once per species, not per RHS.
+
+    This is intentionally a pure mocked layout gate.  It verifies the only
+    structural property needed before a remote numerical oracle: the local
+    helper receives a species-major, objective-batched field cotangent and
+    returns objective-major state/support bars.  No NTX solve, transport
+    rollout, device compilation, or file output is involved.
+    """
+    model = NTXExactLijRuntimeTransportModel(
+        species=types.SimpleNamespace(number_species=2, mass=jnp.asarray([1.0, 2.0])),
+        energy_grid=types.SimpleNamespace(v_norm=jnp.asarray([1.0])),
+        geometry=object(),
+        vmec_file=None,
+        boozer_file=None,
+    )
+    calls = []
+    object.__setattr__(
+        model,
+        "_interpolated_moment_local_scan_primitives",
+        lambda **_kwargs: (jnp.asarray([1.0]), jnp.asarray([2.0]), jnp.asarray(3.0)),
+    )
+
+    def _native_support_only(_prepared, *, field_bars, **_kwargs):
+        calls.append(tuple(jnp.asarray(value).shape for value in field_bars))
+        rhs_count = field_bars[0].shape[0]
+        rhs = jnp.arange(rhs_count, dtype=jnp.float64)
+        return (
+            {"coefficient": jnp.stack((rhs + 1.0, rhs + 2.0), axis=1)},
+            rhs + 0.5,
+            None,
+            (
+                jnp.broadcast_to((rhs + 2.0)[:, None], (rhs_count, 1)),
+                jnp.broadcast_to((rhs + 3.0)[:, None], (rhs_count, 1)),
+                rhs + 4.0,
+            ),
+        )
+
+    object.__setattr__(
+        model,
+        "_pullback_interpolated_moment_prepared_support_and_drds_only_multi_rhs",
+        _native_support_only,
+    )
+    object.__setattr__(
+        model,
+        "_pullback_local_scan_inputs_and_drds_from_primitives",
+        lambda *, reference_nu_hat_bar, reference_epsi_hat_bar, vth_a_bar, **_kwargs: (
+            5.0 * jnp.sum(reference_nu_hat_bar),
+            7.0 * jnp.sum(reference_epsi_hat_bar),
+            11.0 * vth_a_bar,
+            13.0 * vth_a_bar,
+        ),
+    )
+    rhs_count = 3
+    field_bars = tuple(
+        jnp.arange(2 * rhs_count * 2, dtype=jnp.float64).reshape(2, rhs_count, 2)
+        for _ in range(4)
+    )
+    result = model._pullback_interpolated_moment_response_local_fields_and_prepared_support_and_drds_flat_prepared(
+        {"coefficient": jnp.asarray([0.0, 0.0])},
+        drds_value=jnp.asarray(1.0),
+        er_value=jnp.asarray(2.0),
+        temperature_local=jnp.asarray([3.0, 4.0]),
+        density_local=jnp.asarray([5.0, 6.0]),
+        collisionality_kind="none",
+        field_bars=field_bars,
+        native_factorized_ntx_rhs=True,
+        reuse_joint_moment_drds_jvp=True,
+    )
+    # ``vmap`` traces the species body once.  Its native field argument still
+    # has the complete RHS leading axis, proving objective batching was not
+    # placed outside NTX.
+    assert calls == [((rhs_count, 2),) * 4]
+    drds_bar, er_bar, temperature_bar, density_bar, prepared_leaves = result
+    rhs = jnp.arange(rhs_count, dtype=jnp.float64)
+    assert jnp.allclose(drds_bar, 2.0 * (5.0 * (rhs + 2.0) + rhs + 0.5))
+    assert jnp.allclose(er_bar, 2.0 * 7.0 * (rhs + 3.0))
+    assert jnp.allclose(temperature_bar, 2.0 * 11.0 * (rhs + 4.0))
+    assert jnp.allclose(density_bar, 2.0 * 13.0 * (rhs + 4.0))
+    assert prepared_leaves[0].shape == (rhs_count, 2)
+
+
+def test_joint_lowdot_scalar_rhs_layout_does_not_hide_rhs_axis_from_anchor_scan():
+    """Reject a merely relocated objective ``vmap`` as a compile optimisation.
+
+    The rejected joint prepared-lowdot route carries objective-batched support
+    leaves through its anchor scan.  A tempting rewrite is to make the anchor
+    function scalar in the objective RHS and wrap it in ``vmap`` outside the
+    scan.  JAX's scan batching rule pushes that outer axis back into the scan
+    carry, so this rewrite alone cannot make the segment HLO smaller.
+
+    This is a pure-array, in-memory structural test: no transport or NTX
+    solver is constructed or executed, and ``make_jaxpr`` does not compile for
+    a device or write files.
+    """
+    objective_count = 3
+    anchor_count = 4
+    rhs = jnp.arange(objective_count * anchor_count, dtype=jnp.float64).reshape(
+        objective_count, anchor_count
+    )
+    anchors = jnp.arange(anchor_count, dtype=jnp.int32)
+
+    def _joint_with_batched_scan_carry(rhs_values):
+        def _body(carry, anchor):
+            state_bar, support_bar = carry
+            local_bar = jax.lax.dynamic_index_in_dim(rhs_values, anchor, axis=1)
+            return (
+                state_bar + local_bar[:, None],
+                {"geometry": support_bar["geometry"] + local_bar[:, None]},
+            ), None
+
+        return jax.lax.scan(
+            _body,
+            (
+                jnp.zeros((objective_count, 2), dtype=rhs_values.dtype),
+                {"geometry": jnp.zeros((objective_count, 5), dtype=rhs_values.dtype)},
+            ),
+            anchors,
+        )[0]
+
+    def _scalar_rhs_then_outer_vmap(rhs_values):
+        def _one_rhs(one_rhs):
+            def _body(carry, anchor):
+                state_bar, support_bar = carry
+                local_bar = jax.lax.dynamic_index_in_dim(one_rhs, anchor, axis=0)
+                return (
+                    state_bar + local_bar,
+                    {"geometry": support_bar["geometry"] + local_bar},
+                ), None
+
+            return jax.lax.scan(
+                _body,
+                (
+                    jnp.zeros((2,), dtype=one_rhs.dtype),
+                    {"geometry": jnp.zeros((5,), dtype=one_rhs.dtype)},
+                ),
+                anchors,
+            )[0]
+
+        return jax.vmap(_one_rhs)(rhs_values)
+
+    def _scan_carry_shapes(function):
+        closed = jax.make_jaxpr(function)(rhs)
+        scan_equations = [eqn for eqn in closed.jaxpr.eqns if eqn.primitive.name == "scan"]
+        assert len(scan_equations) == 1
+        scan = scan_equations[0]
+        carry_count = scan.params["num_carry"]
+        body = scan.params["jaxpr"].jaxpr
+        return tuple(
+            tuple(invar.aval.shape)
+            for invar in body.invars[:carry_count]
+        )
+
+    # The proposed outer-vmap arrangement has exactly the same batched carry
+    # shapes: moving the vmap syntactically is not a valid production change.
+    assert _scan_carry_shapes(_joint_with_batched_scan_carry) == ((3, 2), (3, 5))
+    assert _scan_carry_shapes(_scalar_rhs_then_outer_vmap) == ((3, 2), (3, 5))
 
 
 def test_normalize_solver_config_prefers_transport_solver_section():
@@ -74,6 +2247,87 @@ def test_normalize_solver_config_falls_back_to_legacy_solver_section():
     assert out["integrator"] == "radau"
     assert out["density_floor"] == 1.0e-6
     assert out["turbulence_flux_model"] == "turbulent_power_analytical"
+
+
+def test_normalize_solver_config_t3d_outer_uses_lagged_response_for_any_flux_model():
+    config = {
+        "transport_solver": {"transport_solver_backend": "theta_t3d_outer"},
+        "turbulence": {"flux_model": "turbulent_power_analytical"},
+    }
+
+    out = _normalize_solver_config(config)
+    assert out["theta_rhs_mode"] == "lagged_transport_response"
+
+
+@pytest.mark.parametrize(
+    "rhs_mode",
+    [
+        "black_box",
+        "lagged_linear_state",
+    ],
+)
+def test_normalize_solver_config_t3d_outer_rejects_non_transport_lagged_rhs(rhs_mode):
+    with pytest.raises(ValueError, match="lagged_transport_response"):
+        _normalize_solver_config(
+            {
+                "transport_solver": {
+                    "transport_solver_backend": "theta_t3d_outer",
+                    "theta_rhs_mode": rhs_mode,
+                },
+            }
+        )
+
+
+@pytest.mark.parametrize(
+    ("configured", "expected"),
+    [
+        ("direct", "direct"),
+        ("direct_center", "direct"),
+        ("interpolate_from_faces", "interpolate_from_faces"),
+        ("interpolate_faces", "interpolate_from_faces"),
+    ],
+)
+def test_normalize_solver_config_resolves_universal_center_flux_mode(configured, expected):
+    config = {
+        "transport_solver": {"center_flux_mode": configured},
+        "neoclassical": {"flux_model": "ntx_scan_runtime"},
+    }
+
+    assert _normalize_solver_config(config)["transport_center_flux_mode"] == expected
+
+
+def test_normalize_solver_config_maps_exact_ntx_center_response_mode_as_compatibility_alias():
+    config = {
+        "neoclassical": {
+            "flux_model": "ntx_exact_lij_runtime",
+            "ntx_exact_center_response_mode": "interpolate_from_faces",
+        },
+    }
+
+    assert (
+        _normalize_solver_config(config)["transport_center_flux_mode"]
+        == "interpolate_from_faces"
+    )
+
+
+def test_normalize_solver_config_rejects_conflicting_universal_and_exact_ntx_center_modes():
+    config = {
+        "transport_solver": {"center_flux_mode": "direct"},
+        "neoclassical": {
+            "flux_model": "ntx_exact_lij_runtime",
+            "ntx_exact_center_response_mode": "interpolate_from_faces",
+        },
+    }
+
+    with pytest.raises(ValueError, match="conflicts"):
+        _normalize_solver_config(config)
+
+
+def test_normalize_solver_config_rejects_center_flux_mode_in_old_transport_flux_table():
+    with pytest.raises(ValueError, match="has moved"):
+        _normalize_solver_config(
+            {"transport_flux": {"center_flux_mode": "interpolate_from_faces"}}
+        )
 
 
 def test_resolve_reference_path_handles_relative_paths(tmp_path, monkeypatch):
@@ -135,6 +2389,193 @@ def test_monoenergetic_database_kind_prefers_most_specific_subclass():
     ntss1d = object.__new__(PreprocessedMonoenergetic3DNTSSRadiusNTSS1D)
     assert monoenergetic_database_kind(fixed) == MONOENERGETIC_KIND_PREPROCESSED_3D_NTSS1D_FIXED
     assert monoenergetic_database_kind(ntss1d) == MONOENERGETIC_KIND_PREPROCESSED_3D_RADIAL_NTSS1D
+
+
+def test_database_with_geometry_scale_rebuilds_generic_scale_coordinates():
+    database = Monoenergetic(
+        a_b=jnp.asarray(2.0),
+        rho=jnp.asarray([0.1, 0.3, 0.6, 0.9, 1.0]),
+        nu_log=jnp.asarray([-2.0, -1.0]),
+        Er_list=jnp.asarray([[1.0, 2.0]] * 5),
+        D11_log=jnp.zeros((5, 2, 2)),
+        D13=jnp.zeros((5, 2, 2)),
+        D33=jnp.zeros((5, 2, 2)),
+    )
+
+    actual = database_with_geometry_scale(database, jnp.asarray(4.0))
+
+    assert jnp.allclose(actual.a_b, 4.0)
+    assert jnp.allclose(actual.Er_list, database.Er_list + jnp.log10(0.5))
+    assert jnp.allclose(actual.low_limit_r, 4.0e-3)
+    assert jnp.allclose(actual.r1_lim, 4.0 * database.rho[1])
+    assert jnp.allclose(actual.rnm1, 4.0 * database.rho[-1])
+    assert actual.D11_log is database.D11_log
+
+    _, tangent = jax.jvp(
+        lambda scale: database_with_geometry_scale(database, scale).Er_list,
+        (jnp.asarray(2.0),),
+        (jnp.asarray(0.2),),
+    )
+    assert jnp.allclose(tangent, -0.2 / (2.0 * jnp.log(10.0)))
+
+
+def test_database_with_geometry_scale_rebuilds_preprocessed_coordinates():
+    database = PreprocessedMonoenergetic3D(
+        a_b=jnp.asarray(2.0),
+        rho=jnp.asarray([0.2, 0.5, 0.8]),
+        r_grid=jnp.asarray([0.4, 1.0, 1.6]),
+        nu_log=jnp.asarray([-2.0]),
+        Er_grid=jnp.asarray([[1.0, 2.0]] * 3),
+        D11_log=jnp.zeros((3, 1, 2)),
+        D13=jnp.zeros((3, 1, 2)),
+        D33=jnp.zeros((3, 1, 2)),
+        Er_lower_limit=jnp.asarray(1.0e-8),
+        low_limit_r=jnp.asarray(2.0e-3),
+        del_r=jnp.asarray(1.0e-3),
+    )
+
+    actual = database_with_geometry_scale(database, jnp.asarray(4.0))
+
+    assert jnp.allclose(actual.r_grid, 4.0 * database.rho)
+    assert jnp.allclose(actual.Er_grid, database.Er_grid + jnp.log10(0.5))
+    assert jnp.allclose(actual.low_limit_r, 4.0e-3)
+    assert actual.D33 is database.D33
+
+
+def test_runtime_geometry_replacement_rebuilds_database_scale():
+    database = Monoenergetic(
+        a_b=jnp.asarray(2.0),
+        rho=jnp.asarray([0.1, 0.3, 0.6, 0.9, 1.0]),
+        nu_log=jnp.asarray([-2.0]),
+        Er_list=jnp.asarray([[1.0]] * 5),
+        D11_log=jnp.zeros((5, 1, 1)),
+        D13=jnp.zeros((5, 1, 1)),
+        D33=jnp.zeros((5, 1, 1)),
+    )
+    old_geometry = types.SimpleNamespace(a_b=jnp.asarray(2.0))
+    new_geometry = types.SimpleNamespace(a_b=jnp.asarray(4.0))
+    model = NTXDatabaseTransportModel(
+        species="species",
+        energy_grid="grid",
+        geometry=old_geometry,
+        database=database,
+    )
+    runtime = RuntimeContext(
+        species="species",
+        energy_grid="grid",
+        geometry=old_geometry,
+        database=database,
+        solver_parameters={},
+        models=Models(flux=model),
+    )
+
+    actual = runtime_with_geometry_payload(runtime, new_geometry)
+
+    assert actual.geometry is new_geometry
+    assert actual.models.flux.geometry is new_geometry
+    assert jnp.allclose(actual.models.flux.database.a_b, 4.0)
+    assert actual.database is actual.models.flux.database
+    assert jnp.allclose(
+        actual.models.flux.database.Er_list,
+        database.Er_list + jnp.log10(0.5),
+    )
+
+
+def test_realtime_geometry_payload_tags_database_without_exact_support_lookup():
+    database = Monoenergetic(
+        a_b=jnp.asarray(2.0),
+        rho=jnp.asarray([0.1, 0.3, 0.6, 0.9, 1.0]),
+        nu_log=jnp.asarray([-2.0]),
+        Er_list=jnp.asarray([[1.0]] * 5),
+        D11_log=jnp.zeros((5, 1, 1)),
+        D13=jnp.zeros((5, 1, 1)),
+        D33=jnp.zeros((5, 1, 1)),
+    )
+    geometry = types.SimpleNamespace(a_b=jnp.asarray(2.0))
+    model = NTXDatabaseTransportModel("species", "grid", geometry, database)
+    runtime = RuntimeContext(
+        species="species",
+        energy_grid="grid",
+        geometry=geometry,
+        database=database,
+        solver_parameters={},
+        models=Models(flux=model),
+    )
+
+    actual = realtime_geometry_payload_for_runtime(runtime)
+
+    assert actual["kind"] == "ntx_database"
+    assert actual["geometry"] is geometry
+    assert actual["database"] is database
+    assert "ntx_support" not in actual
+
+
+def test_runtime_with_tagged_database_payload_replaces_geometry_and_database():
+    database = Monoenergetic(
+        a_b=jnp.asarray(2.0),
+        rho=jnp.asarray([0.1, 0.3, 0.6, 0.9, 1.0]),
+        nu_log=jnp.asarray([-2.0]),
+        Er_list=jnp.asarray([[1.0]] * 5),
+        D11_log=jnp.zeros((5, 1, 1)),
+        D13=jnp.zeros((5, 1, 1)),
+        D33=jnp.zeros((5, 1, 1)),
+    )
+    old_geometry = types.SimpleNamespace(a_b=jnp.asarray(2.0))
+    new_geometry = types.SimpleNamespace(a_b=jnp.asarray(4.0))
+    model = NTXDatabaseTransportModel("species", "grid", old_geometry, database)
+    runtime = RuntimeContext(
+        species="species", energy_grid="grid", geometry=old_geometry,
+        database=database, solver_parameters={}, models=Models(flux=model),
+    )
+    new_database = database_with_geometry_scale(database, new_geometry.a_b)
+
+    actual = runtime_with_realtime_geometry_payload(
+        runtime,
+        {"kind": "ntx_database", "geometry": new_geometry, "database": new_database},
+    )
+
+    assert actual.geometry is new_geometry
+    assert actual.database is new_database
+    assert actual.models.flux.geometry is new_geometry
+    assert actual.models.flux.database is new_database
+
+
+def test_runtime_with_fresh_database_payload_skips_template_database_rescaling(monkeypatch):
+    database = Monoenergetic(
+        a_b=jnp.asarray(2.0),
+        rho=jnp.asarray([0.1, 0.3, 0.6, 0.9, 1.0]),
+        nu_log=jnp.asarray([-2.0]),
+        Er_list=jnp.asarray([[1.0]] * 5),
+        D11_log=jnp.zeros((5, 1, 1)),
+        D13=jnp.zeros((5, 1, 1)),
+        D33=jnp.zeros((5, 1, 1)),
+    )
+    old_geometry = types.SimpleNamespace(a_b=jnp.asarray(2.0))
+    new_geometry = types.SimpleNamespace(a_b=jnp.asarray(4.0))
+    fresh_database = dataclasses.replace(database, a_b=jnp.asarray(4.0))
+    runtime = RuntimeContext(
+        species="species",
+        energy_grid="grid",
+        geometry=old_geometry,
+        database=database,
+        solver_parameters={},
+        models=Models(
+            flux=NTXDatabaseTransportModel("species", "grid", old_geometry, database)
+        ),
+    )
+
+    def _unexpected_scale(*_args, **_kwargs):
+        pytest.fail("fresh database reconstruction must not rescale the template table")
+
+    monkeypatch.setattr(initial_er_module, "database_with_geometry_scale", _unexpected_scale)
+    actual = runtime_with_fresh_ntx_database_payload(
+        runtime, geometry=new_geometry, database=fresh_database
+    )
+
+    assert actual.geometry is new_geometry
+    assert actual.database is fresh_database
+    assert actual.models.flux.geometry is new_geometry
+    assert actual.models.flux.database is fresh_database
 
 
 def test_monoenergetic_interpolation_kernel_defaults_to_generic():
@@ -283,11 +2724,12 @@ def test_build_flux_model_passes_runtime_ntx_scan_inputs(monkeypatch):
     monkeypatch.setattr("NEOPAX._orchestrator.get_transport_flux_model", fake_get_transport_flux_model)
     monkeypatch.setattr(
         "NEOPAX._orchestrator.build_transport_flux_model",
-        lambda neo, turb, classical, include_turbulent_particle_flux=True: {
+        lambda neo, turb, classical, include_turbulent_particle_flux=True, **kwargs: {
             "neo": neo,
             "turb": turb,
             "classical": classical,
             "include_turbulent_particle_flux": include_turbulent_particle_flux,
+            **kwargs,
         },
     )
 
@@ -317,9 +2759,21 @@ def test_build_flux_model_passes_runtime_ntx_scan_inputs(monkeypatch):
     assert captured["ntx_scan_runtime"]["kwargs"]["vmec_file"] == "wout.nc"
     assert captured["ntx_scan_runtime"]["kwargs"]["boozer_file"] == "boozmn.nc"
     assert captured["ntx_scan_runtime"]["kwargs"]["ntx_scan_rho"] == [0.25, 0.5]
+    assert out["center_flux_mode"] == "direct"
 
 
-def test_build_flux_model_passes_runtime_ntx_exact_lij_inputs(monkeypatch):
+@pytest.mark.parametrize(
+    ("center_flux_mode", "expected_exact_mode"),
+    [
+        ("direct", "center_local_response"),
+        ("interpolate_from_faces", "interpolate_from_faces"),
+    ],
+)
+def test_build_flux_model_passes_runtime_ntx_exact_lij_inputs(
+    monkeypatch,
+    center_flux_mode,
+    expected_exact_mode,
+):
     captured = {}
 
     def fake_get_transport_flux_model(name):
@@ -332,11 +2786,12 @@ def test_build_flux_model_passes_runtime_ntx_exact_lij_inputs(monkeypatch):
     monkeypatch.setattr("NEOPAX._orchestrator.get_transport_flux_model", fake_get_transport_flux_model)
     monkeypatch.setattr(
         "NEOPAX._orchestrator.build_transport_flux_model",
-        lambda neo, turb, classical, include_turbulent_particle_flux=True: {
+        lambda neo, turb, classical, include_turbulent_particle_flux=True, **kwargs: {
             "neo": neo,
             "turb": turb,
             "classical": classical,
             "include_turbulent_particle_flux": include_turbulent_particle_flux,
+            **kwargs,
         },
     )
 
@@ -352,6 +2807,11 @@ def test_build_flux_model_passes_runtime_ntx_exact_lij_inputs(monkeypatch):
                 "ntx_exact_n_zeta": 21,
                 "ntx_exact_n_xi": 48,
             },
+            "transport_solver": {
+                "density_floor": 2.5e-6,
+                "temperature_floor": 7.5e-6,
+                "center_flux_mode": center_flux_mode,
+            },
             "turbulence": {"flux_model": "none"},
             "classical": {"flux_model": "none"},
         },
@@ -366,6 +2826,13 @@ def test_build_flux_model_passes_runtime_ntx_exact_lij_inputs(monkeypatch):
     assert captured["ntx_exact_lij_runtime"]["kwargs"]["vmec_file"] == "wout.nc"
     assert captured["ntx_exact_lij_runtime"]["kwargs"]["boozer_file"] == "boozmn.nc"
     assert captured["ntx_exact_lij_runtime"]["kwargs"]["ntx_exact_n_theta"] == 19
+    assert captured["ntx_exact_lij_runtime"]["kwargs"]["density_floor"] == 2.5e-6
+    assert captured["ntx_exact_lij_runtime"]["kwargs"]["temperature_floor"] == 7.5e-6
+    assert (
+        captured["ntx_exact_lij_runtime"]["kwargs"]["ntx_exact_center_response_mode"]
+        == expected_exact_mode
+    )
+    assert out["center_flux_mode"] == center_flux_mode
 
 
 def test_build_ntx_runtime_scan_transport_model_can_skip_prebuild():
@@ -387,6 +2854,638 @@ def test_build_ntx_runtime_scan_transport_model_can_skip_prebuild():
     assert model.boozer_file == "boozmn.nc"
 
 
+def test_ntx_runtime_scan_model_accepts_live_scan_inputs_without_files():
+    """Realtime VMEC may supply explicit scan surfaces instead of files."""
+    surfaces = (object(), object())
+    model = build_ntx_runtime_scan_transport_model(
+        species="species",
+        energy_grid="grid",
+        geometry="geometry",
+        vmec_file=None,
+        boozer_file=None,
+        ntx_scan_rho=[0.25, 0.5],
+        ntx_scan_nu_v=[1.0e-4, 1.0e-3],
+        ntx_scan_er_tilde=[0.0, 1.0e-4],
+        ntx_scan_channels=_tiny_ntx_runtime_channels([0.25, 0.5]),
+        ntx_scan_surfaces=surfaces,
+        prebuild_database=False,
+    )
+
+    assert model.vmec_file is None
+    assert model.boozer_file is None
+    assert model._scan_surfaces(None, jnp.asarray([0.25, 0.5])) == surfaces
+
+
+def test_ntx_runtime_scan_payload_replacement_clears_only_stale_database():
+    """A realtime scan replacement retains live inputs and never file loaders."""
+    old_surfaces = (object(), object())
+    new_surfaces = (object(), object())
+    old_channels = _tiny_ntx_runtime_channels([0.25, 0.5])
+    new_channels = _tiny_ntx_runtime_channels([0.25, 0.5])
+    model = build_ntx_runtime_scan_transport_model(
+        species="species",
+        energy_grid="grid",
+        geometry="old_geometry",
+        vmec_file=None,
+        boozer_file=None,
+        ntx_scan_rho=[0.25, 0.5],
+        ntx_scan_nu_v=[1.0e-4, 1.0e-3],
+        ntx_scan_er_tilde=[0.0, 1.0e-4],
+        ntx_scan_channels=old_channels,
+        ntx_scan_surfaces=old_surfaces,
+        prebuild_database=False,
+    )
+    stale_database = object()
+    model = dataclasses.replace(model, database=stale_database)
+
+    actual = model.with_runtime_scan_payload(
+        geometry="new_geometry",
+        channels=new_channels,
+        scan_surfaces=new_surfaces,
+    )
+
+    assert actual.geometry == "new_geometry"
+    assert actual.channels is new_channels
+    assert actual.scan_surfaces == new_surfaces
+    assert actual.database is None
+    assert actual.vmec_file is None
+    assert actual.boozer_file is None
+
+
+def test_tagged_realtime_payload_round_trips_live_ntx_scan_model():
+    """The tagged reverse seam keeps live NTX scan inputs, not a static DB."""
+    surfaces = (object(), object())
+    channels = _tiny_ntx_runtime_channels([0.25, 0.5])
+    model = build_ntx_runtime_scan_transport_model(
+        species="species", energy_grid="grid", geometry="old_geometry",
+        vmec_file=None, boozer_file=None,
+        ntx_scan_rho=[0.25, 0.5], ntx_scan_nu_v=[1.0e-4, 1.0e-3],
+        ntx_scan_er_tilde=[0.0, 1.0e-4], ntx_scan_channels=channels,
+        ntx_scan_surfaces=surfaces, prebuild_database=False,
+    )
+    database = object()
+    model = dataclasses.replace(model, database=database)
+    runtime = RuntimeContext(
+        species="species", energy_grid="grid", geometry="old_geometry",
+        database=database, solver_parameters={}, models=Models(flux=model),
+    )
+
+    payload = realtime_geometry_payload_for_runtime(runtime)
+    assert payload["kind"] == "ntx_scan_runtime"
+    assert payload["channels"] is channels
+    assert payload["surfaces"] == surfaces
+    assert payload["database"] is database
+    support_payload = realtime_geometry_reverse_support_payload_for_runtime(runtime)
+    assert set(support_payload) == {"geometry", "channels", "surfaces"}
+    assert support_payload["channels"] is channels
+    assert support_payload["surfaces"] == surfaces
+
+    new_surfaces = (object(), object())
+    new_database = object()
+    actual = runtime_with_realtime_geometry_payload(
+        runtime,
+        {
+            **payload,
+            "geometry": "new_geometry",
+            "surfaces": new_surfaces,
+            "database": new_database,
+        },
+    )
+    assert actual.geometry == "new_geometry"
+    assert actual.database is new_database
+    assert actual.models.flux.channels is channels
+    assert actual.models.flux.scan_surfaces == new_surfaces
+    assert actual.models.flux.database is new_database
+
+
+def test_live_ntx_scan_reverse_support_replacement_clears_cached_database():
+    """The reverse payload cannot accidentally treat the scan cache as input."""
+
+    surfaces = (object(), object())
+    channels = _tiny_ntx_runtime_channels([0.25, 0.5])
+    model = build_ntx_runtime_scan_transport_model(
+        species="species", energy_grid="grid", geometry="old_geometry",
+        vmec_file=None, boozer_file=None,
+        ntx_scan_rho=[0.25, 0.5], ntx_scan_nu_v=[1.0e-4, 1.0e-3],
+        ntx_scan_er_tilde=[0.0, 1.0e-4], ntx_scan_channels=channels,
+        ntx_scan_surfaces=surfaces, prebuild_database=False,
+    )
+    cached_database = object()
+    runtime = RuntimeContext(
+        species="species", energy_grid="grid", geometry="old_geometry",
+        database=cached_database, solver_parameters={},
+        models=Models(flux=dataclasses.replace(model, database=cached_database)),
+    )
+
+    actual = runtime_with_realtime_geometry_reverse_support_payload(
+        runtime,
+        {"geometry": "new_geometry", "channels": channels, "surfaces": surfaces},
+    )
+
+    assert actual.geometry == "new_geometry"
+    assert actual.models.flux.database is None
+    assert actual.database is None
+
+
+def test_reverse_setup_selects_live_scan_payload_without_exact_support_lookup():
+    """The segment probe uses the combined live scan tree without exact lookup."""
+
+    surfaces = (object(), object())
+    channels = _tiny_ntx_runtime_channels([0.25, 0.5])
+    model = build_ntx_runtime_scan_transport_model(
+        species="species", energy_grid="grid", geometry="geometry",
+        vmec_file=None, boozer_file=None,
+        ntx_scan_rho=[0.25, 0.5], ntx_scan_nu_v=[1.0e-4, 1.0e-3],
+        ntx_scan_er_tilde=[0.0, 1.0e-4], ntx_scan_channels=channels,
+        ntx_scan_surfaces=surfaces, prebuild_database=False,
+    )
+    runtime = RuntimeContext(
+        species="species", energy_grid="grid", geometry="geometry",
+        database=None, solver_parameters={}, models=Models(flux=model),
+    )
+    args = types.SimpleNamespace(
+        realtime_geometry_gradient_path="support_segment_probe",
+        reverse_stage_cotangent_mode="full",
+        initial_er_root_ad="off",
+        accepted_step_limit=None,
+        reverse_segment_length=1,
+        reverse_stage_adjoint_solve_mode="block",
+        reverse_rhs_transpose_mode="generic",
+        reverse_step_bwd_mode="reduced_cotangent_call_boundary",
+        reverse_stage_adjoint_memory_mode="legacy",
+        reverse_stage_adjoint_iter_maxiter=1,
+        reverse_stage_adjoint_iter_tol=1.0e-8,
+        reverse_rebuild_support_pullback_mode="separate",
+        reverse_initial_cache_support_pullback_mode="scalar",
+        reverse_segment_input_diagnostics=True,
+        reverse_segment_start_replay_mode="minimal",
+        reverse_segment_primal_record_mode="reuse_segment_primal_record",
+        reverse_final_objective_cotangent_mode="scalar",
+        reverse_bootstrap_cotangent_mode="joint_local_vjp_upar_only",
+    )
+    captured = {}
+
+    def _unexpected_exact_lookup(_runtime):
+        raise AssertionError("scan setup must not request an exact NTX support payload")
+
+    def _prepare(_profile_values, **kwargs):
+        captured.update(kwargs)
+        return types.SimpleNamespace(schedule_artifact=None)
+
+    setup = prepare_realtime_geometry_support_segment_core_setup(
+        args=args, config={}, baseline_values=jnp.asarray([]), baseline_runtime=runtime,
+        baseline_state="state", profile_cfg={},
+        neoclassical_cfg={"flux_model": "ntx_scan_runtime"}, parameter_order=(),
+        find_ntx_support_payload=_unexpected_exact_lookup,
+        prepare_reverse_static_setup=_prepare,
+    )
+
+    assert setup.payload_kind == "ntx_scan_runtime"
+    assert set(setup.support_payload) == {"geometry", "channels", "surfaces"}
+    assert captured["runtime"] is runtime
+    assert captured["reverse_initial_cache_support_pullback_mode"] == "scalar"
+    assert captured["reverse_rebuild_support_pullback_mode"] == "separate"
+    assert captured["reverse_segment_start_replay_mode"] == "minimal"
+    assert captured["reverse_segment_primal_record_mode"] == "reuse_segment_primal_record"
+    assert captured["reverse_bootstrap_cotangent_mode"] == "joint_local_vjp_upar_only"
+
+
+def test_payload_transpose_forwards_live_scan_contract(monkeypatch):
+    """The outer transport wrapper forwards scan metadata to the VMEC seam."""
+
+    captured = {}
+
+    def _fake_transpose(*_args, **kwargs):
+        captured.update(kwargs)
+        return jnp.asarray([[1.0]])
+
+    monkeypatch.setattr(
+        "NEOPAX._reverse_ad_transport.geometry_payload_pullback_from_param_vector_raw_block_transpose",
+        _fake_transpose,
+    )
+    result = realtime_geometry_payload_pullback_result(
+        geometry_context="context",
+        baseline_geometry_deltas=jnp.asarray([0.0]),
+        geometry_param_specs=(("RBC", 1, 0),),
+        support_bars=({"geometry": "g", "ntx_scan_runtime": "scan"},),
+        payload_kind="ntx_scan_runtime",
+        scan_rho=(0.25, 0.5),
+        scan_surface_backend="vmec",
+    )
+
+    assert captured["payload_kind"] == "ntx_scan_runtime"
+    assert captured["scan_rho"] == (0.25, 0.5)
+    assert captured["scan_surface_backend"] == "vmec"
+    assert jnp.allclose(result.geometry_gradient_matrix, jnp.asarray([[1.0]]))
+
+
+def test_live_ntx_scan_payload_rebuild_keeps_channel_jvp(monkeypatch):
+    """A support payload regenerates the database through the live NTX seam."""
+
+    captured_builder_kwargs = {}
+
+    @dataclasses.dataclass(frozen=True)
+    class _FakeScan:
+        rho: object
+        nu_v: object
+        Er: object
+        drds: object
+        D11: object
+        D13: object
+        D33: object
+        Er_tilde: object = None
+        Er_to_Ertilde: object = None
+        dr_tildedr: object = None
+        dr_tildeds: object = None
+        a_b: object = None
+        psia: object = None
+        b00: object = None
+        r00: object = None
+        boozer_i: object = None
+        boozer_g: object = None
+        iota: object = None
+        fac_reference_to_sfincs_11: object = None
+        fac_reference_to_sfincs_31: object = None
+        fac_reference_to_sfincs_33: object = None
+        fac_monkes_to_sfincs_11: object = None
+        fac_monkes_to_sfincs_31: object = None
+        fac_monkes_to_sfincs_33: object = None
+        fac_sfincs_to_dkes_11: object = None
+        fac_sfincs_to_dkes_31: object = None
+        fac_sfincs_to_dkes_33: object = None
+        fac_dkes_to_d11star: object = None
+        fac_dkes_to_d31star: object = None
+        fac_dkes_to_d33star: object = None
+
+    class _FakeNTX:
+        class GridSpec:
+            def __init__(self, **kwargs):
+                self.__dict__.update(kwargs)
+
+        @staticmethod
+        def build_ntx_neopax_scan_from_surfaces(surfaces, *, rho, nu_v, Er, drds, **kwargs):
+            captured_builder_kwargs.update(kwargs)
+            assert len(surfaces) == int(rho.shape[0])
+            shape = (rho.shape[0], nu_v.shape[0], Er.shape[1])
+            return _FakeScan(
+                rho=rho,
+                nu_v=nu_v,
+                Er=Er,
+                drds=drds,
+                D11=jnp.broadcast_to(drds[:, None, None], shape),
+                D13=jnp.broadcast_to(2.0 * drds[:, None, None], shape),
+                D33=jnp.ones(shape),
+            )
+
+    monkeypatch.setattr("NEOPAX._transport_flux_models._import_ntx", lambda: _FakeNTX)
+    surfaces = (object(), object())
+    channels = _tiny_ntx_runtime_channels([0.25, 0.5])
+    model = build_ntx_runtime_scan_transport_model(
+        species="species", energy_grid="grid", geometry="geometry",
+        vmec_file=None, boozer_file=None,
+        ntx_scan_rho=[0.25, 0.5], ntx_scan_nu_v=[1.0e-4, 1.0e-3],
+        ntx_scan_er_tilde=[0.0, 1.0e-4], ntx_scan_channels=channels,
+        ntx_scan_surfaces=surfaces, prebuild_database=False,
+    )
+
+    def _database_from_ab(a_b):
+        updated_channels = dataclasses.replace(channels, a_b=a_b)
+        return model.with_support_payload(
+            {"geometry": "geometry", "channels": updated_channels, "surfaces": surfaces}
+        ).database
+
+    database, tangent = jax.jvp(
+        lambda a_b: _database_from_ab(a_b).Er_list,
+        (jnp.asarray(2.0),),
+        (jnp.asarray(0.2),),
+    )
+    assert jnp.all(jnp.isfinite(database))
+    # The zero ``Er_tilde`` column is clamped at the database's log-space
+    # floor, so its derivative is correctly zero.  The non-clamped column
+    # retains the analytic ``-da_b / (a_b log(10))`` radius chain.
+    expected_tangent = jnp.where(
+        jnp.asarray([0.0, 1.0e-4])[None, :] != 0.0,
+        -0.2 / (2.0 * jnp.log(10.0)),
+        0.0,
+    )
+    assert jnp.allclose(tangent, expected_tangent)
+    assert captured_builder_kwargs["coefficient_reverse_mode"] == "generic"
+
+
+def test_live_ntx_scan_explicit_database_support_does_not_rebuild(monkeypatch):
+    """The recorded reverse support leaf must bypass the NTX scan builder."""
+    calls = {"count": 0}
+
+    class _FakeNTX:
+        class GridSpec:
+            def __init__(self, **kwargs):
+                self.__dict__.update(kwargs)
+
+        @staticmethod
+        def build_ntx_neopax_scan_from_surfaces(*_args, **_kwargs):
+            calls["count"] += 1
+            raise AssertionError("explicit recorded database support must not rebuild the scan")
+
+    monkeypatch.setattr("NEOPAX._transport_flux_models._import_ntx", lambda: _FakeNTX)
+    surfaces = (object(), object())
+    channels = _tiny_ntx_runtime_channels([0.25, 0.5])
+    database = object()
+    model = build_ntx_runtime_scan_transport_model(
+        species="species", energy_grid="grid", geometry="geometry",
+        vmec_file=None, boozer_file=None,
+        ntx_scan_rho=[0.25, 0.5], ntx_scan_nu_v=[1.0e-4, 1.0e-3],
+        ntx_scan_er_tilde=[0.0, 1.0e-4], ntx_scan_channels=channels,
+        ntx_scan_surfaces=surfaces, prebuild_database=False,
+    )
+
+    result = model.with_support_payload(
+        {"geometry": "geometry", "channels": channels, "surfaces": surfaces, "database": database}
+    )
+    assert result.database is database
+    # This is the path used by the direct black-box RHS and its compact
+    # pullbacks.  It must preserve the explicit database rather than invoking
+    # the runtime NTX scan builder a second time.
+    assert result._database_model().database is database
+    assert calls == {"count": 0}
+
+    # Segment and terminal database VJPs deliberately receive only their two
+    # differentiable leaves.  Channels/surfaces remain fixed model metadata
+    # until the single recorded scan transpose after the sweep.
+    reduced_result = model.with_support_payload(
+        {"geometry": "geometry", "database": database}
+    )
+    assert reduced_result.database is database
+    assert reduced_result._database_model().database is database
+    assert calls == {"count": 0}
+
+
+def test_recorded_ntx_database_bar_is_folded_once_into_scan_support(monkeypatch):
+    calls = {"count": 0}
+
+    class _RecordedScan:
+        def recorded_runtime_database_support_bar(self, database_bar):
+            calls["count"] += 1
+            assert database_bar == jnp.asarray(5.0)
+            return {
+                "channels": jnp.asarray(2.0),
+                "surfaces": jnp.asarray(3.0),
+            }
+
+    monkeypatch.setattr(
+        initial_er_module,
+        "find_ntx_runtime_scan_model_in_model",
+        lambda _flux: _RecordedScan(),
+    )
+    runtime = types.SimpleNamespace(models=types.SimpleNamespace(flux=object()))
+    actual = fold_recorded_ntx_scan_database_bar_into_support(
+        runtime,
+        {
+            "geometry": jnp.asarray(7.0),
+            "channels": jnp.asarray(11.0),
+            "surfaces": jnp.asarray(13.0),
+            "database": jnp.asarray(5.0),
+        },
+    )
+    assert set(actual) == {"geometry", "channels", "surfaces"}
+    # The compact fixed-table geometry cotangent is already in the live
+    # payload's geometry branch.  Folding the recorded table may add only
+    # scan channels/surfaces; dropping or replacing this leaf would omit the
+    # database analogue of Lij's direct residual-geometry term.
+    assert jnp.allclose(actual["geometry"], 7.0)
+    assert jnp.allclose(actual["channels"], 13.0)
+    assert jnp.allclose(actual["surfaces"], 16.0)
+    assert calls == {"count": 1}
+
+
+def test_recorded_ntx_database_bars_use_one_batched_scan_pullback(monkeypatch):
+    calls = {"count": 0}
+
+    class _RecordedScan:
+        def recorded_runtime_database_support_bar(self, database_bar):
+            calls["count"] += 1
+            return {
+                "channels": 2.0 * database_bar,
+                "surfaces": 3.0 * database_bar,
+            }
+
+    monkeypatch.setattr(
+        initial_er_module,
+        "find_ntx_runtime_scan_model_in_model",
+        lambda _flux: _RecordedScan(),
+    )
+    runtime = types.SimpleNamespace(models=types.SimpleNamespace(flux=object()))
+    actual = fold_recorded_ntx_scan_database_bars_into_support(
+        runtime,
+        (
+            {"geometry": jnp.asarray(7.0), "channels": jnp.asarray(11.0), "surfaces": jnp.asarray(13.0), "database": jnp.asarray(5.0)},
+            {"geometry": jnp.asarray(17.0), "channels": jnp.asarray(19.0), "surfaces": jnp.asarray(23.0), "database": jnp.asarray(29.0)},
+        ),
+    )
+    assert len(actual) == 2
+    assert jnp.allclose(actual[0]["channels"], 21.0)
+    assert jnp.allclose(actual[0]["surfaces"], 28.0)
+    assert jnp.allclose(actual[1]["channels"], 77.0)
+    assert jnp.allclose(actual[1]["surfaces"], 110.0)
+    # ``vmap`` traces the retained transpose once instead of Python-looping
+    # through the two objective rows.
+    assert calls == {"count": 1}
+
+
+def test_recorded_ntx_database_fold_preserves_coordinate_leaves(monkeypatch):
+    """One batched recorded transpose receives a_b and Er_list unchanged."""
+    calls = {"count": 0}
+
+    class _RecordedScan:
+        def recorded_runtime_database_support_bar(self, database_bar):
+            calls["count"] += 1
+            coordinate_sum = database_bar["a_b"] + jnp.sum(database_bar["Er_list"])
+            return {
+                "channels": coordinate_sum,
+                "surfaces": 2.0 * coordinate_sum,
+            }
+
+    monkeypatch.setattr(
+        initial_er_module,
+        "find_ntx_runtime_scan_model_in_model",
+        lambda _flux: _RecordedScan(),
+    )
+    runtime = types.SimpleNamespace(models=types.SimpleNamespace(flux=object()))
+    actual = fold_recorded_ntx_scan_database_bars_into_support(
+        runtime,
+        (
+            {
+                "geometry": jnp.asarray(0.0),
+                "database": {
+                    "a_b": jnp.asarray(2.0),
+                    "Er_list": jnp.asarray([0.5, -0.25]),
+                    "D11_log": jnp.asarray(0.0),
+                },
+            },
+            {
+                "geometry": jnp.asarray(0.0),
+                "database": {
+                    "a_b": jnp.asarray(-1.0),
+                    "Er_list": jnp.asarray([0.75, 0.5]),
+                    "D11_log": jnp.asarray(0.0),
+                },
+            },
+        ),
+    )
+    assert jnp.allclose(actual[0]["channels"], 2.25)
+    assert jnp.allclose(actual[1]["channels"], 0.25)
+    assert jnp.allclose(actual[0]["surfaces"], 4.5)
+    assert jnp.allclose(actual[1]["surfaces"], 0.5)
+    assert calls == {"count": 1}
+
+
+def test_recorded_ntx_database_bar_groups_share_one_batched_scan_pullback(monkeypatch):
+    """Report components must not each replay the retained database transpose."""
+    calls = {"count": 0}
+
+    class _RecordedScan:
+        def recorded_runtime_database_support_bar(self, database_bar):
+            calls["count"] += 1
+            return {"channels": 2.0 * database_bar, "surfaces": 3.0 * database_bar}
+
+    monkeypatch.setattr(
+        initial_er_module,
+        "find_ntx_runtime_scan_model_in_model",
+        lambda _flux: _RecordedScan(),
+    )
+    runtime = types.SimpleNamespace(models=types.SimpleNamespace(flux=object()))
+    groups = (
+        (
+            {"geometry": jnp.asarray(0.0), "channels": jnp.asarray(1.0), "surfaces": jnp.asarray(2.0), "database": jnp.asarray(3.0)},
+            {"geometry": jnp.asarray(0.0), "channels": jnp.asarray(4.0), "surfaces": jnp.asarray(5.0), "database": jnp.asarray(6.0)},
+        ),
+        (
+            {"geometry": jnp.asarray(0.0), "channels": jnp.asarray(7.0), "surfaces": jnp.asarray(8.0), "database": jnp.asarray(9.0)},
+        ),
+    )
+    actual = fold_recorded_ntx_scan_database_bar_groups_into_support(runtime, groups)
+    assert jnp.allclose(actual[0][0]["channels"], 7.0)
+    assert jnp.allclose(actual[0][1]["surfaces"], 23.0)
+    assert jnp.allclose(actual[1][0]["channels"], 25.0)
+    # All three rows were stacked into one retained scan transpose.
+    assert calls == {"count": 1}
+
+
+def test_recorded_live_ntx_scan_support_exposes_only_the_existing_database():
+    """The recorded route is opt-in and never asks the support VJP to rebuild."""
+
+    surfaces = (object(), object())
+    channels = _tiny_ntx_runtime_channels([0.25, 0.5])
+    database = object()
+    model = build_ntx_runtime_scan_transport_model(
+        species="species", energy_grid="grid", geometry="geometry",
+        vmec_file=None, boozer_file=None,
+        ntx_scan_rho=[0.25, 0.5], ntx_scan_nu_v=[1.0e-4, 1.0e-3],
+        ntx_scan_er_tilde=[0.0, 1.0e-4], ntx_scan_channels=channels,
+        ntx_scan_surfaces=surfaces,
+        ntx_scan_coefficient_reverse_mode="structured",
+        ntx_scan_record_primal=True,
+        prebuild_database=False,
+    )
+    # The actual record is opaque to this payload-seam test; it simply marks
+    # that the forward scan recorded the retained prepared primal.
+    model = dataclasses.replace(
+        model, database=database, scan_primal_record=object(), scan_primal=object()
+    )
+    runtime = RuntimeContext(
+        species="species", energy_grid="grid", geometry="geometry",
+        database=database, solver_parameters={}, models=Models(flux=model),
+    )
+
+    support = realtime_geometry_reverse_support_payload_for_runtime(runtime)
+
+    assert set(support) == {"geometry", "channels", "surfaces", "database"}
+    assert support["database"] is database
+    assert support["channels"] is channels
+    assert support["surfaces"] is surfaces
+
+
+def test_recorded_live_ntx_scan_is_not_captured_by_database_segment_runtime():
+    """Database segments retain tables only; the owner retains the live scan."""
+
+    channels = _tiny_ntx_runtime_channels([0.25, 0.5])
+    database = object()
+    model = build_ntx_runtime_scan_transport_model(
+        species="species", energy_grid="grid", geometry="geometry",
+        vmec_file=None, boozer_file=None,
+        ntx_scan_rho=[0.25, 0.5], ntx_scan_nu_v=[1.0e-4, 1.0e-3],
+        ntx_scan_er_tilde=[0.0, 1.0e-4], ntx_scan_channels=channels,
+        ntx_scan_surfaces=(object(), object()),
+        ntx_scan_coefficient_reverse_mode="structured",
+        ntx_scan_record_primal=True,
+        prebuild_database=False,
+    )
+    record = object()
+    raw_scan = object()
+    runtime = RuntimeContext(
+        species="species", energy_grid="grid", geometry="geometry",
+        database=database, solver_parameters={},
+        models=Models(flux=dataclasses.replace(
+            model, database=database, scan_primal_record=record, scan_primal=raw_scan
+        )),
+    )
+
+    segment_runtime = runtime_with_fixed_ntx_database_model(runtime)
+    segment_model = segment_runtime.models.flux
+    assert isinstance(segment_model, NTXDatabaseTransportModel)
+    assert segment_model.database is database
+    assert not hasattr(segment_model, "channels")
+    assert not hasattr(segment_model, "scan_surfaces")
+    assert not hasattr(segment_model, "scan_primal_record")
+    assert not hasattr(segment_model, "scan_primal")
+    # The original remains available to execute the single final transpose.
+    assert runtime.models.flux.scan_primal_record is record
+    assert runtime.models.flux.scan_primal is raw_scan
+
+
+def test_live_ntx_scan_payload_can_select_structured_coefficient_reverse_mode():
+    """The scan builder mode is a narrow opt-in, with generic kept as default."""
+
+    model = build_ntx_runtime_scan_transport_model(
+        species="species",
+        energy_grid="grid",
+        geometry="geometry",
+        vmec_file=None,
+        boozer_file=None,
+        ntx_scan_rho=[0.25, 0.5],
+        ntx_scan_nu_v=[1.0e-4, 1.0e-3],
+        ntx_scan_er_tilde=[0.0, 1.0e-4],
+        ntx_scan_coefficient_reverse_mode="structured",
+        prebuild_database=False,
+    )
+    assert model.coefficient_reverse_mode == "structured"
+
+
+def test_ntx_runtime_scan_database_keeps_radius_local_er_axis():
+    scan = types.SimpleNamespace(
+        rho=jnp.asarray([0.25, 0.5]),
+        nu_v=jnp.asarray([1.0e-4, 1.0e-3]),
+        Er=jnp.asarray(
+            [
+                [1.0e-6, 2.0e-6],
+                [3.0e-6, 6.0e-6],
+            ]
+        ),
+        drds=jnp.asarray([2.0, 4.0]),
+        D11=jnp.ones((2, 2, 2)),
+        D13=2.0 * jnp.ones((2, 2, 2)),
+        D33=3.0 * jnp.ones((2, 2, 2)),
+    )
+
+    database = _ntx_runtime_scan_to_neopax_monoenergetic(scan, a_b=2.0)
+
+    expected_er_list = jnp.log10(jnp.maximum(1.0e-8, jnp.abs(scan.Er) / (2.0 * scan.rho[:, None])))
+    assert jnp.allclose(database.Er_list, expected_er_list)
+    assert not jnp.allclose(database.Er_list[1], database.Er_list[0] + jnp.log10(scan.rho[0] / scan.rho[1]))
+    assert jnp.allclose(10.0 ** database.D11_log, scan.D11 * scan.drds[:, None, None] ** 2)
+    assert jnp.allclose(database.D13, scan.D13 * scan.drds[:, None, None])
+    assert jnp.allclose(database.D33, scan.D33 * scan.nu_v[None, :, None])
+
+
 def test_build_ntx_exact_lij_runtime_transport_model_can_skip_preload():
     model = build_ntx_exact_lij_runtime_transport_model(
         species="species",
@@ -401,6 +3500,23 @@ def test_build_ntx_exact_lij_runtime_transport_model_can_skip_preload():
     assert model.support is None
     assert model.vmec_file == "wout.nc"
     assert model.boozer_file == "boozmn.nc"
+    assert model.lagged_response_taylor_order == 1
+
+
+def test_build_ntx_exact_lij_runtime_transport_model_accepts_quadratic_feature_gate():
+    model = build_ntx_exact_lij_runtime_transport_model(
+        species="species",
+        energy_grid="grid",
+        geometry="geometry",
+        vmec_file="wout.nc",
+        boozer_file="boozmn.nc",
+        lagged_response_taylor_order=2,
+        preload_support=False,
+    )
+
+    assert model.lagged_response_taylor_order == 2
+    with pytest.raises(ValueError, match="must be 1 or 2"):
+        model.with_lagged_response_taylor_order(3)
 
 
 def test_build_ntx_runtime_scan_channels_uses_loader(monkeypatch):
@@ -510,6 +3626,18 @@ def test_ntx_runtime_scan_transport_model_delegates_face_and_local_evaluators(mo
         calls.append(("face", self.database, state, face_state, kwargs))
         return "face_eval"
 
+    def fake_build_lagged(self, state, **kwargs):
+        calls.append(("build_lagged", self.database, state, kwargs))
+        return "face_lagged_response"
+
+    def fake_eval_lagged(self, state, lagged_response, **kwargs):
+        calls.append(("eval_lagged", self.database, state, lagged_response, kwargs))
+        return "lagged_face_fluxes"
+
+    def fake_pullback_lagged(self, state, lagged_response_bar, **kwargs):
+        calls.append(("pullback_lagged", self.database, state, lagged_response_bar, kwargs))
+        return "state_bar"
+
     monkeypatch.setattr(
         "NEOPAX._transport_flux_models.NTXDatabaseTransportModel.build_local_particle_flux_evaluator",
         fake_build_local,
@@ -518,11 +3646,29 @@ def test_ntx_runtime_scan_transport_model_delegates_face_and_local_evaluators(mo
         "NEOPAX._transport_flux_models.NTXDatabaseTransportModel.evaluate_face_fluxes",
         fake_face,
     )
+    monkeypatch.setattr(
+        "NEOPAX._transport_flux_models.NTXDatabaseTransportModel.build_lagged_response",
+        fake_build_lagged,
+    )
+    monkeypatch.setattr(
+        "NEOPAX._transport_flux_models.NTXDatabaseTransportModel.evaluate_with_lagged_response",
+        fake_eval_lagged,
+    )
+    monkeypatch.setattr(
+        "NEOPAX._transport_flux_models.NTXDatabaseTransportModel.pullback_build_lagged_response",
+        fake_pullback_lagged,
+    )
 
     assert model.build_local_particle_flux_evaluator("state") == "local_eval"
     assert model.evaluate_face_fluxes("state", "face_state", marker=True) == "face_eval"
+    assert model.build_lagged_response("state", marker=True) == "face_lagged_response"
+    assert model.evaluate_with_lagged_response("state", "response", marker=True) == "lagged_face_fluxes"
+    assert model.pullback_build_lagged_response("state", "response_bar", marker=True) == "state_bar"
     assert calls[0] == ("local", "runtime_db", "state")
     assert calls[1] == ("face", "runtime_db", "state", "face_state", {"marker": True})
+    assert calls[2] == ("build_lagged", "runtime_db", "state", {"marker": True})
+    assert calls[3] == ("eval_lagged", "runtime_db", "state", "response", {"marker": True})
+    assert calls[4] == ("pullback_lagged", "runtime_db", "state", "response_bar", {"marker": True})
 
 
 def test_ntx_runtime_scan_transport_model_with_scan_inputs_preserves_channels_for_same_rho():
@@ -635,3 +3781,1027 @@ def test_build_ntx_exact_lij_runtime_transport_model_can_preload_support(monkeyp
     )
 
     assert model.support == "sentinel_support"
+
+
+@pytest.mark.parametrize("radius", (0.01, 0.2, 0.55, 0.95))
+def test_radial_preprocessed_stencil_reconstructs_established_interpolation(radius):
+    """The compact stencil is exactly the production radial interpolation."""
+
+    rho = jnp.asarray([0.1, 0.3, 0.5, 0.7, 0.9])
+    nu_v = jnp.asarray([1.0e-3, 1.0e-2, 1.0e-1])
+    er = jnp.asarray([[1.0e-4, 1.0e-3, 1.0e-2, 1.0e-1]])
+    shape = (rho.size, nu_v.size, er.shape[1])
+    base = jnp.reshape(jnp.arange(int(jnp.prod(jnp.asarray(shape))), dtype=jnp.float64), shape)
+    database = PreprocessedMonoenergetic3DNTSSRadius.read_data(
+        a_b=1.0,
+        rho=rho,
+        nu_v=nu_v,
+        Er=er,
+        drds=jnp.ones_like(rho),
+        D11=1.0 + base,
+        D13=2.0 + base,
+        D33=3.0 + base,
+    )
+    grid_nu = jnp.asarray(2.0e-2)
+    grid_er = jnp.asarray(3.0e-3)
+    stencil = radial_preprocessed_interpolation_stencil(
+        jnp.asarray(radius), grid_nu, grid_er, database
+    )
+
+    def _reconstruct(table):
+        def _one_surface(ir, ier, tz):
+            return _bilinear(
+                table[ir, stencil.nu_index, ier],
+                table[ir, stencil.nu_index, ier + 1],
+                table[ir, stencil.nu_index + 1, ier],
+                table[ir, stencil.nu_index + 1, ier + 1],
+                stencil.nu_fraction,
+                tz,
+            )
+
+        values = jax.vmap(_one_surface)(
+            stencil.radial_indices, stencil.er_indices, stencil.er_fractions
+        )
+        return jnp.sum(stencil.radial_weights * values)
+
+    expected = get_Dij_preprocessed_3d_ntss_radius(
+        jnp.asarray(radius), grid_nu, grid_er, database
+    )
+    actual = jnp.asarray(
+        (
+            _reconstruct(database.D11_log),
+            _reconstruct(database.D13),
+            _reconstruct(database.D33),
+        )
+    )
+    assert jnp.allclose(actual, expected, rtol=1.0e-12, atol=1.0e-12)
+
+
+def test_radial_preprocessed_axis_stencil_has_finite_scale_vjp():
+    """The rho=0 face cannot hide an inactive Er/zero reverse singularity."""
+    rho = jnp.asarray([0.0, 0.2, 0.5, 0.8, 1.0])
+    nu_v = jnp.asarray([1.0e-3, 1.0e-2, 1.0e-1])
+    er = jnp.asarray([[1.0e-4, 1.0e-3, 1.0e-2, 1.0e-1]])
+    shape = (rho.size, nu_v.size, er.shape[1])
+    table = jnp.reshape(
+        jnp.arange(int(jnp.prod(jnp.asarray(shape))), dtype=jnp.float64), shape
+    )
+    database = PreprocessedMonoenergetic3DNTSSRadius.read_data(
+        a_b=1.0, rho=rho, nu_v=nu_v, Er=er, drds=jnp.ones_like(rho),
+        D11=1.0 + table, D13=2.0 + table, D33=3.0 + table,
+    )
+
+    def axis_response(a_b):
+        scaled = database_with_geometry_scale(database, a_b)
+        stencil = radial_preprocessed_interpolation_stencil(
+            jnp.asarray(0.0), jnp.asarray(2.0e-2), jnp.asarray(3.0e-3), scaled
+        )
+        return jnp.sum(stencil.radial_weights) + jnp.sum(stencil.er_fractions)
+
+    value, derivative = jax.value_and_grad(axis_response)(jnp.asarray(1.0))
+    assert jnp.isfinite(value)
+    assert jnp.isfinite(derivative)
+
+
+def test_radial_preprocessed_axis_kernel_has_finite_scale_vjp():
+    """The primal radial kernel has the same finite axis VJP as its stencil."""
+    rho = jnp.asarray([0.0, 0.2, 0.5, 0.8, 1.0])
+    nu_v = jnp.asarray([1.0e-3, 1.0e-2, 1.0e-1])
+    er = jnp.asarray([[1.0e-4, 1.0e-3, 1.0e-2, 1.0e-1]])
+    shape = (rho.size, nu_v.size, er.shape[1])
+    table = jnp.reshape(
+        jnp.arange(int(jnp.prod(jnp.asarray(shape))), dtype=jnp.float64), shape
+    )
+    database = PreprocessedMonoenergetic3DNTSSRadius.read_data(
+        a_b=1.0, rho=rho, nu_v=nu_v, Er=er, drds=jnp.ones_like(rho),
+        D11=1.0 + table, D13=2.0 + table, D33=3.0 + table,
+    )
+
+    def axis_response(a_b):
+        scaled = database_with_geometry_scale(database, a_b)
+        return jnp.sum(get_Dij_preprocessed_3d_ntss_radius(
+            jnp.asarray(0.0), jnp.asarray(2.0e-2), jnp.asarray(3.0e-3), scaled
+        ))
+
+    value, derivative = jax.value_and_grad(axis_response)(jnp.asarray(1.0))
+    assert jnp.isfinite(value)
+    assert jnp.isfinite(derivative)
+
+
+@pytest.mark.parametrize("radius", (0.01, 0.55, 0.95))
+def test_radial_preprocessed_stencil_table_transpose_matches_generic_vjp(radius):
+    """The explicit 16-entry scatter is the established table VJP exactly."""
+
+    rho = jnp.asarray([0.1, 0.3, 0.5, 0.7, 0.9])
+    nu_v = jnp.asarray([1.0e-3, 1.0e-2, 1.0e-1])
+    er = jnp.asarray([[1.0e-4, 1.0e-3, 1.0e-2, 1.0e-1]])
+    shape = (rho.size, nu_v.size, er.shape[1])
+    base = jnp.reshape(jnp.arange(int(jnp.prod(jnp.asarray(shape))), dtype=jnp.float64), shape)
+    database = PreprocessedMonoenergetic3DNTSSRadius.read_data(
+        a_b=1.0, rho=rho, nu_v=nu_v, Er=er, drds=jnp.ones_like(rho),
+        D11=1.0 + base, D13=2.0 + base, D33=3.0 + base,
+    )
+    grid_nu = jnp.asarray(2.0e-2)
+    grid_er = jnp.asarray(3.0e-3)
+    local_bar = jnp.asarray(-0.37)
+    stencil = radial_preprocessed_interpolation_stencil(
+        jnp.asarray(radius), grid_nu, grid_er, database
+    )
+
+    def _interpolate(table):
+        return get_Dij_preprocessed_3d_ntss_radius(
+            jnp.asarray(radius), grid_nu, grid_er,
+            dataclasses.replace(database, D13=table),
+        )[1]
+
+    _, generic_pullback = jax.vjp(_interpolate, database.D13)
+    expected = generic_pullback(local_bar)[0]
+    actual = radial_preprocessed_interpolation_table_bar(
+        stencil, local_bar, database.D13
+    )
+    assert jnp.allclose(actual, expected, rtol=1.0e-12, atol=1.0e-12)
+
+
+@pytest.mark.parametrize("radius", (0.12, 0.52, 0.88))
+def test_legacy_monoenergetic_table_transpose_matches_generic_vjp(radius):
+    """The explicit C1 bicubic/radial Monoenergetic transpose is exact."""
+
+    rho = jnp.asarray([0.1, 0.3, 0.5, 0.7, 0.9])
+    nu_log = jnp.asarray([-3.0, -2.0, -1.0, 0.0])
+    er_row = jnp.asarray([-5.0, -4.0, -3.0, -2.0])
+    er_list = jnp.broadcast_to(er_row, (rho.size, er_row.size))
+    shape = (rho.size, nu_log.size, er_row.size)
+    base = jnp.reshape(jnp.arange(int(jnp.prod(jnp.asarray(shape))), dtype=jnp.float64), shape)
+    database = Monoenergetic(
+        a_b=1.0, rho=rho, nu_log=nu_log, Er_list=er_list,
+        D11_log=-3.0 + 0.001 * base, D13=0.2 + 0.002 * base,
+        D33=0.4 + 0.003 * base,
+    )
+    grid_nu = jnp.asarray(2.4e-2)
+    grid_er = jnp.asarray(2.0e-4)
+    local_bar = jnp.asarray(-0.37)
+
+    def _interpolate(table):
+        return get_Dij(
+            jnp.asarray(radius), grid_nu, grid_er,
+            dataclasses.replace(database, D13=table),
+        )[1]
+
+    _, generic_pullback = jax.vjp(_interpolate, database.D13)
+    expected = generic_pullback(local_bar)[0]
+    actual = monoenergetic_interpolation_table_bar(
+        jnp.asarray(radius), grid_nu, grid_er, local_bar, database.D13, database
+    )
+    assert jnp.allclose(actual, expected, rtol=2.0e-11, atol=2.0e-12), (
+        float(jnp.max(jnp.abs(actual - expected))),
+        float(jnp.max(jnp.abs(expected))),
+    )
+
+
+@pytest.mark.parametrize(
+    (
+        "radius",
+        "expected_radial_indices",
+        "expected_active_count",
+        "grid_nu_value",
+        "grid_er_value",
+    ),
+    (
+        (0.0, (0, 1, 2, 2), 3, 2.4e-2, 0.0),
+        (0.12, (0, 1, 2, 2), 3, 2.4e-2, 2.0e-4),
+        (0.52, (1, 2, 3, 4), 4, 2.4e-2, 2.0e-4),
+        (0.88, (2, 3, 4, 4), 3, 2.4e-2, 2.0e-4),
+        (0.52, (1, 2, 3, 4), 4, 1.0e-5, 1.0e-8),
+        (0.52, (1, 2, 3, 4), 4, 1.0e1, 1.0),
+    ),
+)
+def test_legacy_monoenergetic_sparse_stencil_matches_current_contract(
+    radius,
+    expected_radial_indices,
+    expected_active_count,
+    grid_nu_value,
+    grid_er_value,
+):
+    """The compact query record preserves all three legacy radial branches."""
+
+    rho = jnp.asarray([0.1, 0.3, 0.5, 0.7, 0.9])
+    nu_log = jnp.asarray([-3.0, -2.0, -1.0, 0.0])
+    er_row = jnp.asarray([-5.0, -4.0, -3.0, -2.0])
+    er_list = jnp.broadcast_to(er_row, (rho.size, er_row.size))
+    shape = (rho.size, nu_log.size, er_row.size)
+    base = jnp.reshape(
+        jnp.arange(int(jnp.prod(jnp.asarray(shape))), dtype=jnp.float64), shape
+    )
+    database = Monoenergetic(
+        a_b=1.0,
+        rho=rho,
+        nu_log=nu_log,
+        Er_list=er_list,
+        D11_log=-3.0 + 0.001 * base,
+        D13=0.2 + 0.002 * base,
+        D33=0.4 + 0.003 * base,
+    )
+    grid_x = jnp.asarray(radius)
+    grid_nu = jnp.asarray(grid_nu_value)
+    grid_er = jnp.asarray(grid_er_value)
+    local_bar = jnp.asarray(-0.37)
+
+    stencil = monoenergetic_interpolation_stencil(
+        grid_x, grid_nu, grid_er, database
+    )
+    assert tuple(map(int, stencil.radial_indices)) == expected_radial_indices
+    assert int(jnp.sum(stencil.radial_active)) == expected_active_count
+    assert jnp.all(jnp.isfinite(stencil.radial_weights))
+    assert jnp.all(jnp.isfinite(stencil.er_fractions))
+
+    expected_value = get_Dij(grid_x, grid_nu, grid_er, database)
+    actual_value = evaluate_monoenergetic_interpolation_stencil(stencil, database)
+    assert jnp.allclose(actual_value, expected_value, rtol=2.0e-11, atol=2.0e-12)
+
+    expected_table_bar = monoenergetic_interpolation_table_bar(
+        grid_x, grid_nu, grid_er, local_bar, database.D13, database
+    )
+    sparse_table_bar = monoenergetic_interpolation_sparse_table_bar(
+        stencil, local_bar, database.D13, database
+    )
+    assert sparse_table_bar.values.shape == (4, 4, 4)
+    assert jnp.all(jnp.isfinite(sparse_table_bar.values))
+    actual_table_bar = materialize_monoenergetic_sparse_table_bar(
+        sparse_table_bar, database.D13
+    )
+    assert jnp.allclose(
+        actual_table_bar, expected_table_bar, rtol=2.0e-11, atol=2.0e-12
+    ), (
+        float(jnp.max(jnp.abs(actual_table_bar - expected_table_bar))),
+        float(jnp.max(jnp.abs(expected_table_bar))),
+    )
+    if radius == 0.0:
+        coordinate_bar = monoenergetic_interpolation_sparse_coordinate_bar(
+            stencil, jnp.asarray((-0.17, 0.23, -0.31)), database
+        )
+        assert jnp.isfinite(coordinate_bar.a_b)
+        assert jnp.all(jnp.isfinite(coordinate_bar.er_values))
+
+
+@pytest.mark.parametrize(
+    ("radius", "grid_nu_value", "grid_er_value"),
+    (
+        (0.12, 2.4e-2, 2.0e-4),
+        (0.52, 2.4e-2, 2.0e-4),
+        (0.88, 2.4e-2, 2.0e-4),
+        (0.52, 1.0e-5, 1.0e-8),
+        (0.52, 1.0e1, 1.0),
+    ),
+)
+def test_legacy_monoenergetic_sparse_coordinate_transpose_matches_generic_vjp(
+    radius, grid_nu_value, grid_er_value
+):
+    """Sparse ``a_b``/``Er_list`` bars equal the current piecewise VJP."""
+
+    rho = jnp.asarray([0.1, 0.3, 0.5, 0.7, 0.9])
+    nu_log = jnp.asarray([-3.0, -2.0, -1.0, 0.0])
+    er_row = jnp.asarray([-5.0, -4.0, -3.0, -2.0])
+    er_list = jnp.broadcast_to(er_row, (rho.size, er_row.size))
+    shape = (rho.size, nu_log.size, er_row.size)
+    base = jnp.reshape(
+        jnp.arange(int(jnp.prod(jnp.asarray(shape))), dtype=jnp.float64), shape
+    )
+    database = Monoenergetic(
+        a_b=1.0,
+        rho=rho,
+        nu_log=nu_log,
+        Er_list=er_list,
+        D11_log=-3.0 + 0.001 * base,
+        D13=0.2 + 0.002 * base,
+        D33=0.4 + 0.003 * base,
+    )
+    grid_x = jnp.asarray(radius)
+    grid_nu = jnp.asarray(grid_nu_value)
+    grid_er = jnp.asarray(grid_er_value)
+    local_bar = jnp.asarray((-0.17, 0.23, -0.31))
+
+    def _query_from_coordinates(a_b, er_list_value):
+        varied_database = dataclasses.replace(
+            database_with_geometry_scale(database, a_b),
+            Er_list=er_list_value,
+        )
+        return get_Dij(grid_x, grid_nu, grid_er, varied_database)
+
+    _, generic_pullback = jax.vjp(
+        _query_from_coordinates, database.a_b, database.Er_list
+    )
+    expected_a_b_bar, expected_er_list_bar = generic_pullback(local_bar)
+
+    stencil = monoenergetic_interpolation_stencil(
+        grid_x, grid_nu, grid_er, database
+    )
+    sparse_bar = monoenergetic_interpolation_sparse_coordinate_bar(
+        stencil, local_bar, database
+    )
+    actual_a_b_bar, actual_er_list_bar = (
+        materialize_monoenergetic_sparse_coordinate_bar(sparse_bar, database)
+    )
+    assert jnp.isfinite(actual_a_b_bar)
+    assert jnp.all(jnp.isfinite(sparse_bar.er_values))
+    assert jnp.allclose(
+        actual_a_b_bar,
+        expected_a_b_bar,
+        rtol=5.0e-10,
+        atol=5.0e-11,
+    )
+    assert jnp.allclose(
+        actual_er_list_bar,
+        expected_er_list_bar,
+        rtol=5.0e-10,
+        atol=5.0e-11,
+    ), (
+        float(jnp.max(jnp.abs(actual_er_list_bar - expected_er_list_bar))),
+        float(jnp.max(jnp.abs(expected_er_list_bar))),
+    )
+
+
+def test_radial_database_flux_table_transpose_matches_generic_vjp():
+    """The compact black-box centre rule is the established database VJP."""
+
+    rho = jnp.asarray([0.1, 0.3, 0.5, 0.7, 0.9])
+    nu_v = jnp.asarray([1.0e-3, 1.0e-2, 1.0e-1])
+    er = jnp.asarray([[1.0e-4, 1.0e-3, 1.0e-2, 1.0e-1]])
+    shape = (rho.size, nu_v.size, er.shape[1])
+    base = jnp.reshape(jnp.arange(int(jnp.prod(jnp.asarray(shape))), dtype=jnp.float64), shape)
+    database = PreprocessedMonoenergetic3DNTSSRadius.read_data(
+        a_b=1.0, rho=rho, nu_v=nu_v, Er=er, drds=jnp.ones_like(rho),
+        D11=1.0 + 0.01 * base, D13=0.2 + 0.001 * base, D33=0.3 + 0.002 * base,
+    )
+    geometry = collections.namedtuple(
+        "CompactTransposeGeometry", "r_grid r_grid_half dr full_grid_indices"
+    )(
+        jnp.asarray([0.2, 0.4, 0.6, 0.8]),
+        jnp.asarray([0.1, 0.3, 0.5, 0.7, 0.9]),
+        jnp.asarray(0.2),
+        jnp.arange(4, dtype=jnp.int32),
+    )
+    species = Species(
+        number_species=2,
+        species_indices=jnp.asarray([0, 1]),
+        mass_mp=jnp.asarray([5.446e-4, 2.0]),
+        charge_qp=jnp.asarray([-1.0, 1.0]),
+        names=("e", "D"),
+    )
+    energy_grid = collections.namedtuple(
+        "CompactTransposeEnergyGrid",
+        "xWeights L11_weight L12_weight L22_weight L13_weight L23_weight L33_weight v_norm",
+    )(
+        jnp.asarray([0.25, 0.75]), jnp.asarray([1.0, 0.7]),
+        jnp.asarray([0.1, -0.2]), jnp.asarray([0.8, 1.2]),
+        jnp.asarray([0.4, 0.5]), jnp.asarray([-0.3, 0.2]),
+        jnp.asarray([1.1, 0.6]), jnp.asarray([1.2, 1.8]),
+    )
+    density = jnp.asarray([[1.0, 1.05, 1.1, 1.15], [0.9, 0.95, 1.0, 1.05]])
+    temperature = jnp.asarray([[2.0, 2.1, 2.2, 2.3], [1.6, 1.7, 1.8, 1.9]])
+    er_center = jnp.asarray([1.0e-4, -1.2e-4, 1.5e-4, -1.8e-4])
+    gamma_bar = jnp.asarray([[0.2, -0.1, 0.3, -0.4], [-0.3, 0.5, -0.2, 0.1]])
+    q_bar = -0.7 * gamma_bar
+    upar_bar = 0.4 * gamma_bar
+
+    def _fluxes(d11_log, d13, d33):
+        _, gamma, q, upar = get_Neoclassical_Fluxes(
+            species, energy_grid, geometry,
+            dataclasses.replace(database, D11_log=d11_log, D13=d13, D33=d33),
+            er_center, temperature, density,
+        )
+        return gamma, q, upar
+
+    _, generic_pullback = jax.vjp(
+        _fluxes, database.D11_log, database.D13, database.D33
+    )
+    zero_bar = jnp.zeros_like(gamma_bar)
+    for channel, output_bars in (
+        ("Gamma", (gamma_bar, zero_bar, zero_bar)),
+        ("Q", (zero_bar, q_bar, zero_bar)),
+        ("Upar", (zero_bar, zero_bar, upar_bar)),
+        ("joint", (gamma_bar, q_bar, upar_bar)),
+    ):
+        expected = generic_pullback(output_bars)
+        actual = pullback_preprocessed_radial_database_fluxes(
+            species, energy_grid, geometry, database, er_center, temperature, density,
+            *output_bars,
+        )
+        for table_name, actual_table_bar, expected_table_bar in zip(
+            ("D11_log", "D13", "D33"), actual, expected, strict=True
+        ):
+            assert jnp.allclose(actual_table_bar, expected_table_bar, rtol=2.0e-10, atol=2.0e-10), (
+                channel,
+                table_name,
+                float(jnp.max(jnp.abs(actual_table_bar - expected_table_bar))),
+                float(jnp.max(jnp.abs(expected_table_bar))),
+            )
+
+    # The separate direct-state boundary must be exactly the established
+    # local database flux VJP.  It is intentionally tested independently of
+    # the table transpose above: Radau uses this path at every stage whereas
+    # table bars are accumulated and folded only once after the sweep.
+    model = NTXDatabaseTransportModel(
+        species=species,
+        energy_grid=energy_grid,
+        geometry=geometry,
+        database=database,
+    )
+    state = TransportState(
+        density=density,
+        pressure=density * temperature,
+        Er=er_center,
+    )
+    model_flux_bar = {"Gamma": gamma_bar, "Q": q_bar, "Upar": upar_bar}
+    _, state_pullback = jax.vjp(lambda state_value: model(state_value), state)
+    (expected_state_bar,) = state_pullback(model_flux_bar)
+    actual_state_bar = model.pullback_direct_rhs_state(state, model_flux_bar)
+    for actual_leaf, expected_leaf in zip(
+        jax.tree_util.tree_leaves(actual_state_bar),
+        jax.tree_util.tree_leaves(expected_state_bar),
+        strict=True,
+    ):
+        if jnp.issubdtype(jnp.asarray(expected_leaf).dtype, jnp.inexact):
+            assert jnp.allclose(actual_leaf, expected_leaf, rtol=2.0e-10, atol=2.0e-10)
+
+    # Objective rows are the database counterpart of Lij's native multi-RHS
+    # support transpose.  They must equal independently accumulated scalar
+    # table bars while retaining a leading RHS axis.
+    rhs_rows = (
+        (gamma_bar, q_bar, upar_bar),
+        (-0.3 * gamma_bar, 0.2 * q_bar, -0.5 * upar_bar),
+    )
+    batched = pullback_preprocessed_radial_database_fluxes(
+        species, energy_grid, geometry, database, er_center, temperature, density,
+        *(jnp.stack(tuple(row[channel] for row in rhs_rows)) for channel in range(3)),
+    )
+    scalar_rows = tuple(
+        pullback_preprocessed_radial_database_fluxes(
+            species, energy_grid, geometry, database, er_center, temperature, density,
+            *row,
+        )
+        for row in rhs_rows
+    )
+    for table_index, actual_table_bar in enumerate(batched):
+        expected_table_bar = jnp.stack(
+            tuple(row[table_index] for row in scalar_rows)
+        )
+        assert jnp.allclose(
+            actual_table_bar, expected_table_bar, rtol=2.0e-10, atol=2.0e-10
+        )
+
+    # Selected initial-Er roots contribute only particle-flux (Gamma) bars.
+    # Missing channels must inherit Gamma's leading objective axis rather
+    # than fall back to an unbatched density-shaped zero.
+    gamma_rows = jnp.stack((gamma_bar, -0.3 * gamma_bar))
+    root_only = model.pullback_local_particle_flux_support_payload(
+        state,
+        {"Gamma": gamma_rows},
+        {"database": database},
+    )["database"]
+    explicit_zero_channels = model.pullback_local_particle_flux_support_payload(
+        state,
+        {
+            "Gamma": gamma_rows,
+            "Q": jnp.zeros_like(gamma_rows),
+            "Upar": jnp.zeros_like(gamma_rows),
+        },
+        {"database": database},
+    )["database"]
+    for actual_leaf, expected_leaf in zip(
+        jax.tree_util.tree_leaves(root_only),
+        jax.tree_util.tree_leaves(explicit_zero_channels),
+        strict=True,
+    ):
+        assert jnp.allclose(actual_leaf, expected_leaf, rtol=2.0e-10, atol=2.0e-10)
+
+
+def test_radial_database_face_flux_table_transpose_matches_generic_vjp():
+    """The native face transpose is exactly the primal face-flux map's VJP.
+
+    This guards the production path against falling back to a VJP through the
+    complete face/database graph, which is what caused the segment OOM.
+    """
+    rho = jnp.asarray([0.1, 0.3, 0.5, 0.7, 0.9])
+    nu_v = jnp.asarray([1.0e-3, 1.0e-2, 1.0e-1])
+    er = jnp.asarray([[1.0e-4, 1.0e-3, 1.0e-2, 1.0e-1]])
+    shape = (rho.size, nu_v.size, er.shape[1])
+    base = jnp.reshape(jnp.arange(int(jnp.prod(jnp.asarray(shape))), dtype=jnp.float64), shape)
+    database = PreprocessedMonoenergetic3DNTSSRadius.read_data(
+        a_b=1.0, rho=rho, nu_v=nu_v, Er=er, drds=jnp.ones_like(rho),
+        D11=1.0 + 0.01 * base, D13=0.2 + 0.001 * base, D33=0.3 + 0.002 * base,
+    )
+    geometry = collections.namedtuple(
+        "CompactFaceTransposeGeometry", "r_grid r_grid_half dr full_grid_indices"
+    )(
+        jnp.asarray([0.2, 0.4, 0.6, 0.8]), rho,
+        jnp.asarray(0.2), jnp.arange(4, dtype=jnp.int32),
+    )
+    species = Species(
+        number_species=2, species_indices=jnp.asarray([0, 1]),
+        mass_mp=jnp.asarray([5.446e-4, 2.0]), charge_qp=jnp.asarray([-1.0, 1.0]),
+        names=("e", "D"),
+    )
+    energy_grid = collections.namedtuple(
+        "CompactFaceTransposeEnergyGrid",
+        "xWeights L11_weight L12_weight L22_weight L13_weight L23_weight L33_weight v_norm",
+    )(
+        jnp.asarray([0.25, 0.75]), jnp.asarray([1.0, 0.7]),
+        jnp.asarray([0.1, -0.2]), jnp.asarray([0.8, 1.2]),
+        jnp.asarray([0.4, 0.5]), jnp.asarray([-0.3, 0.2]),
+        jnp.asarray([1.1, 0.6]), jnp.asarray([1.2, 1.8]),
+    )
+    density_faces = jnp.asarray([
+        [1.0, 1.03, 1.07, 1.12, 1.18],
+        [0.9, 0.93, 0.97, 1.02, 1.08],
+    ])
+    temperature_faces = jnp.asarray([
+        [2.0, 2.04, 2.09, 2.15, 2.22],
+        [1.6, 1.64, 1.69, 1.75, 1.82],
+    ])
+    dndr_faces = jnp.asarray([
+        [0.10, 0.11, 0.12, 0.13, 0.14],
+        [0.07, 0.08, 0.09, 0.10, 0.11],
+    ])
+    dtdr_faces = jnp.asarray([
+        [0.15, 0.16, 0.17, 0.18, 0.19],
+        [0.11, 0.12, 0.13, 0.14, 0.15],
+    ])
+    er_faces = jnp.asarray([1.0e-4, -1.1e-4, 1.2e-4, -1.3e-4, 1.4e-4])
+    gamma_bar = jnp.asarray([
+        [0.2, -0.1, 0.3, -0.4, 0.1],
+        [-0.3, 0.5, -0.2, 0.1, -0.4],
+    ])
+    q_bar = -0.7 * gamma_bar
+    upar_bar = 0.4 * gamma_bar
+
+    def _fluxes(d11_log, d13, d33):
+        _, gamma, q, upar = get_Neoclassical_Fluxes_Faces(
+            species, energy_grid, geometry,
+            dataclasses.replace(database, D11_log=d11_log, D13=d13, D33=d33),
+            er_faces, temperature_faces, density_faces, dndr_faces, dtdr_faces,
+        )
+        return gamma, q, upar
+
+    _, generic_pullback = jax.vjp(
+        _fluxes, database.D11_log, database.D13, database.D33
+    )
+    expected = generic_pullback((gamma_bar, q_bar, upar_bar))
+    actual = pullback_preprocessed_radial_database_face_fluxes(
+        species, energy_grid, geometry, database, er_faces, temperature_faces,
+        density_faces, dndr_faces, dtdr_faces, gamma_bar, q_bar, upar_bar,
+    )
+    for name, actual_table_bar, expected_table_bar in zip(
+        ("D11_log", "D13", "D33"), actual, expected, strict=True
+    ):
+        assert jnp.allclose(actual_table_bar, expected_table_bar, rtol=2.0e-10, atol=2.0e-10), name
+
+    # Radau objective rows use the same primitive with a leading RHS axis.
+    rows = (
+        (gamma_bar, q_bar, upar_bar),
+        (-0.3 * gamma_bar, 0.2 * q_bar, -0.5 * upar_bar),
+    )
+    batched = pullback_preprocessed_radial_database_face_fluxes(
+        species, energy_grid, geometry, database, er_faces, temperature_faces,
+        density_faces, dndr_faces, dtdr_faces,
+        *(jnp.stack(tuple(row[channel] for row in rows)) for channel in range(3)),
+    )
+    scalar_rows = tuple(
+        pullback_preprocessed_radial_database_face_fluxes(
+            species, energy_grid, geometry, database, er_faces, temperature_faces,
+            density_faces, dndr_faces, dtdr_faces, *row,
+        )
+        for row in rows
+    )
+    for table_index, actual_table_bar in enumerate(batched):
+        assert jnp.allclose(
+            actual_table_bar,
+            jnp.stack(tuple(row[table_index] for row in scalar_rows)),
+            rtol=2.0e-10,
+            atol=2.0e-10,
+        )
+
+def test_legacy_monoenergetic_flux_table_transpose_matches_generic_vjp():
+    """The black-box centre rule remains exact for scan-generated tables."""
+
+    rho = jnp.asarray([0.1, 0.3, 0.5, 0.7, 0.9])
+    nu_log = jnp.asarray([-5.0, -3.0, -1.0, 1.0])
+    er_list = jnp.broadcast_to(jnp.asarray([-8.0, -5.0, -2.0, 1.0]), (rho.size, 4))
+    base = jnp.reshape(jnp.arange(80, dtype=jnp.float64), (5, 4, 4))
+    database = Monoenergetic(
+        a_b=1.0, rho=rho, nu_log=nu_log, Er_list=er_list,
+        D11_log=-3.0 + 0.001 * base, D13=0.2 + 0.001 * base,
+        D33=0.3 + 0.002 * base,
+    )
+    geometry = collections.namedtuple(
+        "LegacyMonoTransposeGeometry", "r_grid r_grid_half dr full_grid_indices"
+    )(
+        jnp.asarray([0.2, 0.4, 0.6, 0.8]),
+        jnp.asarray([0.1, 0.3, 0.5, 0.7, 0.9]),
+        jnp.asarray(0.2), jnp.arange(4, dtype=jnp.int32),
+    )
+    species = Species(
+        number_species=2, species_indices=jnp.asarray([0, 1]),
+        mass_mp=jnp.asarray([5.446e-4, 2.0]), charge_qp=jnp.asarray([-1.0, 1.0]),
+        names=("e", "D"),
+    )
+    energy_grid = collections.namedtuple(
+        "LegacyMonoTransposeEnergyGrid",
+        "xWeights L11_weight L12_weight L22_weight L13_weight L23_weight L33_weight v_norm",
+    )(
+        jnp.asarray([0.25, 0.75]), jnp.asarray([1.0, 0.7]),
+        jnp.asarray([0.1, -0.2]), jnp.asarray([0.8, 1.2]),
+        jnp.asarray([0.4, 0.5]), jnp.asarray([-0.3, 0.2]),
+        jnp.asarray([1.1, 0.6]), jnp.asarray([1.2, 1.8]),
+    )
+    density = jnp.asarray([[1.0, 1.05, 1.1, 1.15], [0.9, 0.95, 1.0, 1.05]])
+    temperature = jnp.asarray([[2.0, 2.1, 2.2, 2.3], [1.6, 1.7, 1.8, 1.9]])
+    er_center = jnp.asarray([1.0e-4, -1.2e-4, 1.5e-4, -1.8e-4])
+    gamma_bar = jnp.asarray([[0.2, -0.1, 0.3, -0.4], [-0.3, 0.5, -0.2, 0.1]])
+    q_bar, upar_bar = -0.7 * gamma_bar, 0.4 * gamma_bar
+
+    def _fluxes(a_b, er_list_value, d11_log, d13, d33):
+        varied_database = dataclasses.replace(
+            database_with_geometry_scale(database, a_b),
+            Er_list=er_list_value,
+            D11_log=d11_log,
+            D13=d13,
+            D33=d33,
+        )
+        _, gamma, q, upar = get_Neoclassical_Fluxes(
+            species,
+            energy_grid,
+            geometry,
+            varied_database,
+            er_center,
+            temperature,
+            density,
+        )
+        return gamma, q, upar
+
+    _, generic_pullback = jax.vjp(
+        _fluxes,
+        database.a_b,
+        database.Er_list,
+        database.D11_log,
+        database.D13,
+        database.D33,
+    )
+    expected_support = generic_pullback((gamma_bar, q_bar, upar_bar))
+    actual = pullback_preprocessed_radial_database_fluxes(
+        species, energy_grid, geometry, database, er_center, temperature, density,
+        gamma_bar, q_bar, upar_bar,
+    )
+    for actual_table_bar, expected_table_bar in zip(
+        actual, expected_support[2:], strict=True
+    ):
+        assert jnp.allclose(
+            actual_table_bar,
+            expected_table_bar,
+            rtol=3.0e-10,
+            atol=3.0e-10,
+        ), (
+            float(jnp.max(jnp.abs(actual_table_bar - expected_table_bar))),
+            float(jnp.max(jnp.abs(expected_table_bar))),
+        )
+
+    actual_support = pullback_legacy_radial_database_flux_support_sparse(
+        species,
+        energy_grid,
+        geometry,
+        database,
+        er_center,
+        temperature,
+        density,
+        gamma_bar,
+        q_bar,
+        upar_bar,
+    )
+    for actual_bar, expected_bar in zip(
+        actual_support, expected_support, strict=True
+    ):
+        assert jnp.allclose(
+            actual_bar, expected_bar, rtol=3.0e-10, atol=3.0e-10
+        ), (
+            float(jnp.max(jnp.abs(actual_bar - expected_bar))),
+            float(jnp.max(jnp.abs(expected_bar))),
+        )
+
+    # The new model hook is a separate opt-in callable.  The established
+    # direct and selected-root hooks remain untouched.
+    model = NTXDatabaseTransportModel(
+        species=species,
+        energy_grid=energy_grid,
+        geometry=geometry,
+        database=database,
+    )
+    state = TransportState(
+        density=density,
+        pressure=density * temperature,
+        Er=er_center,
+    )
+    model_database_bar = (
+        model.pullback_direct_rhs_support_payload_legacy_sparse(
+            state,
+            {"Gamma": gamma_bar, "Q": q_bar, "Upar": upar_bar},
+            {"database": database},
+        )["database"]
+    )
+    for field_name, expected_bar in zip(
+        ("a_b", "Er_list", "D11_log", "D13", "D33"),
+        expected_support,
+        strict=True,
+    ):
+        actual_bar = getattr(model_database_bar, field_name)
+        assert jnp.allclose(
+            actual_bar, expected_bar, rtol=3.0e-10, atol=3.0e-10
+        ), field_name
+
+    # All objective rows share one interpolation transpose.  A batched call
+    # must remain identical to independently accumulated scalar rows.
+    rows = (
+        (gamma_bar, q_bar, upar_bar),
+        (-0.3 * gamma_bar, 0.2 * q_bar, -0.5 * upar_bar),
+    )
+    batched = pullback_legacy_radial_database_flux_support_sparse(
+        species,
+        energy_grid,
+        geometry,
+        database,
+        er_center,
+        temperature,
+        density,
+        *(jnp.stack(tuple(row[channel] for row in rows)) for channel in range(3)),
+    )
+    scalar_rows = tuple(
+        pullback_legacy_radial_database_flux_support_sparse(
+            species,
+            energy_grid,
+            geometry,
+            database,
+            er_center,
+            temperature,
+            density,
+            *row,
+        )
+        for row in rows
+    )
+    for field_index, actual_bar in enumerate(batched):
+        assert jnp.allclose(
+            actual_bar,
+            jnp.stack(tuple(row[field_index] for row in scalar_rows)),
+            rtol=3.0e-10,
+            atol=3.0e-10,
+        )
+
+
+def test_database_selected_root_sparse_hook_uses_root_boundary_constraints(
+    monkeypatch,
+):
+    """The sparse root hook is batched and keeps its distinct closure."""
+
+    database = Monoenergetic(
+        a_b=jnp.asarray(2.0),
+        rho=jnp.asarray([0.0, 0.5, 1.0]),
+        nu_log=jnp.asarray([-2.0]),
+        Er_list=jnp.asarray([[-6.0], [-5.0], [-4.0]]),
+        D11_log=jnp.zeros((3, 1, 1)),
+        D13=jnp.zeros((3, 1, 1)),
+        D33=jnp.zeros((3, 1, 1)),
+    )
+    geometry = types.SimpleNamespace(
+        r_grid=jnp.asarray([0.5, 1.5]),
+        r_grid_half=jnp.asarray([0.0, 1.0, 2.0]),
+        dr=jnp.asarray(1.0),
+    )
+    state = TransportState(
+        density=jnp.asarray([[1.0, 2.0], [2.0, 4.0]]),
+        pressure=jnp.asarray([[2.0, 8.0], [6.0, 24.0]]),
+        Er=jnp.asarray([0.1, 0.2]),
+    )
+    gamma_bar = jnp.arange(12, dtype=jnp.float64).reshape((3, 2, 2))
+    calls = []
+
+    def _sparse(*args):
+        calls.append(args)
+        rhs_count = args[7].shape[0]
+        return (
+            jnp.full((rhs_count,), 1.0),
+            jnp.full((rhs_count,) + database.Er_list.shape, 2.0),
+            jnp.full((rhs_count,) + database.D11_log.shape, 3.0),
+            jnp.full((rhs_count,) + database.D13.shape, 4.0),
+            jnp.full((rhs_count,) + database.D33.shape, 5.0),
+        )
+
+    monkeypatch.setattr(
+        flux_models_module,
+        "pullback_legacy_radial_database_flux_support_sparse",
+        _sparse,
+    )
+    model = NTXDatabaseTransportModel(
+        species=types.SimpleNamespace(),
+        energy_grid=types.SimpleNamespace(),
+        geometry=geometry,
+        database=database,
+    )
+    actual = model.pullback_local_particle_flux_support_payload_legacy_sparse(
+        state,
+        {"Gamma": gamma_bar},
+        {"database": database},
+    )["database"]
+
+    assert len(calls) == 1
+    assert jnp.allclose(calls[0][7], gamma_bar)
+    assert jnp.allclose(calls[0][8], jnp.zeros_like(gamma_bar))
+    assert jnp.allclose(calls[0][9], jnp.zeros_like(gamma_bar))
+    assert jnp.allclose(calls[0][11], jnp.asarray([2.5, 5.0]))
+    assert jnp.allclose(calls[0][12], jnp.zeros((2,)))
+    assert jnp.allclose(calls[0][13], jnp.asarray([5.0, 7.5]))
+    assert jnp.allclose(calls[0][14], jnp.zeros((2,)))
+    assert jnp.allclose(actual.a_b, 1.0)
+    assert jnp.allclose(actual.Er_list, 2.0)
+    assert jnp.allclose(actual.D11_log, 3.0)
+    assert jnp.allclose(actual.D13, 4.0)
+    assert jnp.allclose(actual.D33, 5.0)
+
+
+def test_legacy_monoenergetic_face_flux_support_sparse_matches_generic_vjp():
+    """Native-face sparse support bars preserve the forward face closure."""
+
+    rho = jnp.asarray([0.1, 0.3, 0.5, 0.7, 0.9])
+    nu_log = jnp.asarray([-5.0, -3.0, -1.0, 1.0])
+    er_list = jnp.broadcast_to(
+        jnp.asarray([-8.0, -5.0, -2.0, 1.0]), (rho.size, 4)
+    )
+    base = jnp.reshape(jnp.arange(80, dtype=jnp.float64), (5, 4, 4))
+    database = Monoenergetic(
+        a_b=1.0,
+        rho=rho,
+        nu_log=nu_log,
+        Er_list=er_list,
+        D11_log=-3.0 + 0.001 * base,
+        D13=0.2 + 0.001 * base,
+        D33=0.3 + 0.002 * base,
+    )
+    geometry = collections.namedtuple(
+        "LegacyMonoFaceTransposeGeometry",
+        "r_grid r_grid_half dr full_grid_indices",
+    )(
+        jnp.asarray([0.2, 0.4, 0.6, 0.8]),
+        rho,
+        jnp.asarray(0.2),
+        jnp.arange(4, dtype=jnp.int32),
+    )
+    species = Species(
+        number_species=2,
+        species_indices=jnp.asarray([0, 1]),
+        mass_mp=jnp.asarray([5.446e-4, 2.0]),
+        charge_qp=jnp.asarray([-1.0, 1.0]),
+        names=("e", "D"),
+    )
+    energy_grid = collections.namedtuple(
+        "LegacyMonoFaceTransposeEnergyGrid",
+        "xWeights L11_weight L12_weight L22_weight L13_weight L23_weight L33_weight v_norm",
+    )(
+        jnp.asarray([0.25, 0.75]),
+        jnp.asarray([1.0, 0.7]),
+        jnp.asarray([0.1, -0.2]),
+        jnp.asarray([0.8, 1.2]),
+        jnp.asarray([0.4, 0.5]),
+        jnp.asarray([-0.3, 0.2]),
+        jnp.asarray([1.1, 0.6]),
+        jnp.asarray([1.2, 1.8]),
+    )
+    density_faces = jnp.asarray(
+        [
+            [1.0, 1.03, 1.07, 1.12, 1.18],
+            [0.9, 0.93, 0.97, 1.02, 1.08],
+        ]
+    )
+    temperature_faces = jnp.asarray(
+        [
+            [2.0, 2.04, 2.09, 2.15, 2.22],
+            [1.6, 1.64, 1.69, 1.75, 1.82],
+        ]
+    )
+    dndr_faces = jnp.asarray(
+        [
+            [0.10, 0.11, 0.12, 0.13, 0.14],
+            [0.07, 0.08, 0.09, 0.10, 0.11],
+        ]
+    )
+    dtdr_faces = jnp.asarray(
+        [
+            [0.15, 0.16, 0.17, 0.18, 0.19],
+            [0.11, 0.12, 0.13, 0.14, 0.15],
+        ]
+    )
+    er_faces = jnp.asarray(
+        [1.0e-4, -1.1e-4, 1.2e-4, -1.3e-4, 1.4e-4]
+    )
+    gamma_bar = jnp.asarray(
+        [
+            [0.2, -0.1, 0.3, -0.4, 0.1],
+            [-0.3, 0.5, -0.2, 0.1, -0.4],
+        ]
+    )
+    q_bar = -0.7 * gamma_bar
+    upar_bar = 0.4 * gamma_bar
+
+    def _fluxes(a_b, er_list_value, d11_log, d13, d33):
+        varied_database = dataclasses.replace(
+            database_with_geometry_scale(database, a_b),
+            Er_list=er_list_value,
+            D11_log=d11_log,
+            D13=d13,
+            D33=d33,
+        )
+        _, gamma, q, upar = get_Neoclassical_Fluxes_Faces(
+            species,
+            energy_grid,
+            geometry,
+            varied_database,
+            er_faces,
+            temperature_faces,
+            density_faces,
+            dndr_faces,
+            dtdr_faces,
+        )
+        return gamma, q, upar
+
+    _, generic_pullback = jax.vjp(
+        _fluxes,
+        database.a_b,
+        database.Er_list,
+        database.D11_log,
+        database.D13,
+        database.D33,
+    )
+    expected = generic_pullback((gamma_bar, q_bar, upar_bar))
+    actual = pullback_legacy_radial_database_face_flux_support_sparse(
+        species,
+        energy_grid,
+        geometry,
+        database,
+        er_faces,
+        temperature_faces,
+        density_faces,
+        dndr_faces,
+        dtdr_faces,
+        gamma_bar,
+        q_bar,
+        upar_bar,
+    )
+    for actual_bar, expected_bar in zip(actual, expected, strict=True):
+        assert jnp.allclose(
+            actual_bar, expected_bar, rtol=3.0e-10, atol=3.0e-10
+        ), (
+            float(jnp.max(jnp.abs(actual_bar - expected_bar))),
+            float(jnp.max(jnp.abs(expected_bar))),
+        )
+
+    density_center = 0.5 * (density_faces[:, :-1] + density_faces[:, 1:])
+    temperature_center = 0.5 * (
+        temperature_faces[:, :-1] + temperature_faces[:, 1:]
+    )
+    state = TransportState(
+        density=density_center,
+        pressure=density_center * temperature_center,
+        Er=0.5 * (er_faces[:-1] + er_faces[1:]),
+    )
+    face_state = types.SimpleNamespace(
+        density=density_faces,
+        temperature=temperature_faces,
+        Er=er_faces,
+    )
+    evaluated_state = types.SimpleNamespace(
+        center=types.SimpleNamespace(
+            density=density_center,
+            temperature=temperature_center,
+        ),
+        density_grad_face=dndr_faces,
+        temperature_grad_face=dtdr_faces,
+    )
+    model = NTXDatabaseTransportModel(
+        species=species,
+        energy_grid=energy_grid,
+        geometry=geometry,
+        database=database,
+    )
+    model_database_bar = (
+        model.pullback_direct_face_flux_support_payload_legacy_sparse(
+            state,
+            face_state,
+            {"Gamma": gamma_bar, "Q": q_bar, "Upar": upar_bar},
+            {"database": database},
+            evaluated_state=evaluated_state,
+        )["database"]
+    )
+    for field_name, expected_bar in zip(
+        ("a_b", "Er_list", "D11_log", "D13", "D33"),
+        expected,
+        strict=True,
+    ):
+        actual_bar = getattr(model_database_bar, field_name)
+        assert jnp.allclose(
+            actual_bar, expected_bar, rtol=3.0e-10, atol=3.0e-10
+        ), field_name

@@ -1,9 +1,10 @@
 from typing import Dict, Type
 import dataclasses
+import os
 import jax
 import jax.numpy as jnp
 from jax import jit
-from ._fem import conservative_update, faces_from_cell_centered
+from ._fem import cell_centered_from_faces, conservative_update, faces_from_cell_centered
 from ._cell_variable import make_profile_cell_variable
 from ._boundary_conditions import left_constraints_from_bc_model, right_constraints_from_bc_model
 from ._constants import elementary_charge
@@ -12,19 +13,116 @@ from ._source_models import (
     assemble_pressure_source_components,
     sum_source_components,
 )
-from ._transport_flux_models import build_face_transport_state, build_ntss_like_face_transport_state
+from ._transport_flux_models import (
+    _add_float_delta_tree,
+    _float_delta_tree_like,
+    _sanitize_float_delta_bar_tree,
+    _database_geometry_with_constrained_axis_face,
+    _database_center_geometry_pullback_kwargs,
+    _validate_database_center_geometry_mode,
+    build_evaluated_transport_state,
+    build_face_transport_state,
+    build_ntss_like_face_transport_state,
+)
 from ._transport_debug import lagged_timing_enabled, lagged_timing_start, lagged_timing_end
 from ._state import (
     DEFAULT_TRANSPORT_DENSITY_FLOOR,
     DEFAULT_TRANSPORT_TEMPERATURE_FLOOR,
+    _broadcast_species_floor,
     apply_transport_density_floor,
     apply_transport_temperature_floor,
     safe_density,
+    safe_temperature,
+    get_v_thermal,
 )
+from ._neoclassical import _collisionality_kind
+from ._monoenergetic import database_with_geometry_scale
 
 DENSITY_STATE_TO_PHYSICAL = 1.0e20
 PARTICLE_FLUX_PHYSICAL_TO_STATE = 1.0e-20
 HEAT_FLUX_PHYSICAL_TO_STATE = 1.0e-23
+
+
+# This is deliberately database-only.  The Lij lane already owns a complete
+# centre-and-face prepared-support contract; do not route that lane through
+# this compatibility helper.
+_DATABASE_FIXED_FLUX_CHANNELS = (
+    "Gamma",
+    "Q",
+    "Upar",
+    "Gamma_neo",
+    "Q_neo",
+    "Upar_neo",
+    "Gamma_turb",
+    "Q_turb",
+    "Upar_turb",
+    "Gamma_classical",
+    "Q_classical",
+    "Upar_classical",
+)
+
+
+def _database_fixed_flux_payload_with_faces(center_fluxes, face_fluxes):
+    """Return the fixed centre-and-face contract for database equation AD.
+
+    Direct database centre evaluation returns ordinary channel names, and its
+    native face evaluator also uses ordinary channel names.  Equation objects,
+    however, recognise faces only through ``*_faces`` names.  The explicit
+    conversion here records that distinction without changing either forward
+    evaluator.  A caller must retain the raw face result separately for its
+    database-table and local-geometry transposes; this helper only supplies
+    the fixed primal values needed by equation assembly.
+    """
+    if not isinstance(center_fluxes, dict) or not isinstance(face_fluxes, dict):
+        raise TypeError("Database fixed flux payload requires centre and face mappings.")
+    payload = dict(center_fluxes)
+    for name in _DATABASE_FIXED_FLUX_CHANNELS:
+        face_value = face_fluxes.get(f"{name}_faces", face_fluxes.get(name))
+        if face_value is not None:
+            payload[f"{name}_faces"] = face_value
+    return payload
+
+
+def _database_geometry_vjp_debug_enabled() -> bool:
+    """Enable provenance prints for the two database-only geometry VJPs."""
+    return str(
+        os.environ.get("NEOPAX_DATABASE_GEOMETRY_VJP_DIAGNOSTICS", "")
+    ).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _validate_database_interpolation_transpose_mode(mode):
+    """Normalize the call-local legacy database interpolation selector."""
+
+    normalized = "established" if mode is None else str(mode).strip().lower()
+    if normalized not in {"established", "legacy_sparse"}:
+        raise ValueError(
+            "interpolation_transpose_mode must be 'established' or "
+            f"'legacy_sparse'; got {normalized!r}."
+        )
+    return normalized
+
+
+def _database_interpolation_pullback(model, mode, *, face):
+    """Select an explicit table hook without changing the default callable."""
+
+    normalized = _validate_database_interpolation_transpose_mode(mode)
+    base_name = (
+        "pullback_direct_face_flux_support_payload"
+        if face
+        else "pullback_direct_rhs_support_payload"
+    )
+    hook_name = (
+        f"{base_name}_legacy_sparse"
+        if normalized == "legacy_sparse"
+        else base_name
+    )
+    pullback = getattr(model, hook_name, None)
+    if not callable(pullback):
+        raise NotImplementedError(
+            f"Database interpolation mode {normalized!r} requires hook "
+            f"{hook_name!r}."
+        )
+    return pullback
 
 
 def _minmod_pair(a, b):
@@ -118,22 +216,14 @@ def project_fixed_temperature_species(
 
 
 def apply_er_dirichlet_boundary_state(state, er_bc_model):
-    """Clamp Er state values at configured Dirichlet boundaries."""
-    if er_bc_model is None or getattr(state, "Er", None) is None:
-        return state
+    """Legacy helper kept for compatibility.
 
-    er = state.Er
-    left_type = str(getattr(er_bc_model, "left_type", "")).strip().lower()
-    if left_type == "dirichlet" and getattr(er_bc_model, "left_value", None) is not None:
-        left_value = jnp.asarray(getattr(er_bc_model, "left_value"), dtype=er.dtype).reshape(-1)[0]
-        er = er.at[0].set(left_value)
-
-    right_type = str(getattr(er_bc_model, "right_type", "")).strip().lower()
-    if right_type == "dirichlet" and getattr(er_bc_model, "right_value", None) is not None:
-        right_value = jnp.asarray(getattr(er_bc_model, "right_value"), dtype=er.dtype).reshape(-1)[0]
-        er = er.at[-1].set(right_value)
-
-    return dataclasses.replace(state, Er=er)
+    In the cell-centered FV layout, Dirichlet values belong on faces and should
+    influence the solution through face constraints/flux closure, not by
+    overwriting the first or last cell-centered Er state directly.
+    """
+    del er_bc_model
+    return state
 
 
 def _expand_density_rhs_to_full_shape(density_rhs, template_density, species):
@@ -207,6 +297,41 @@ class TransportLaggedResponse:
     flux_response: object = dataclasses.field(repr=False, default=None)
 
 
+def _flux_has_key(fluxes, key):
+    return isinstance(fluxes, dict) and key in fluxes and fluxes.get(key, None) is not None
+
+
+def _get_face_flux(fluxes, key):
+    face_key = f"{key}_faces"
+    if _flux_has_key(fluxes, face_key):
+        return fluxes[face_key]
+    if _flux_has_key(fluxes, key):
+        return fluxes[key]
+    return None
+
+
+def _get_center_flux(fluxes, key):
+    if _flux_has_key(fluxes, key):
+        return fluxes[key]
+    face_value = _get_face_flux(fluxes, key)
+    if face_value is None:
+        return None
+    return jax.vmap(cell_centered_from_faces)(face_value)
+
+
+def _with_center_fluxes_from_faces(fluxes, keys=("Gamma", "Q", "Upar")):
+    """Return a center-view of face-primary fluxes without changing lagged storage."""
+    if not isinstance(fluxes, dict):
+        return fluxes
+    out = dict(fluxes)
+    for key in keys:
+        if not _flux_has_key(out, key):
+            center_value = _get_center_flux(out, key)
+            if center_value is not None:
+                out[key] = center_value
+    return out
+
+
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True, eq=False)
 class DensityEquation(EquationBase):
@@ -233,38 +358,39 @@ class DensityEquation(EquationBase):
         return self._mode_requests_face_fluxes(self.particle_flux_reconstruction)
 
     def enforce_dirichlet_boundary_rhs(self, state, density_rhs):
-        bc = self.density_bc_model
-        if bc is None:
-            return density_rhs
-
-        out = density_rhs
-        left_type = str(getattr(bc, "left_type", "")).strip().lower()
-        if left_type == "dirichlet":
-            out = out.at[:, 0].set(jnp.zeros_like(out[:, 0]))
-
-        right_type = str(getattr(bc, "right_type", "")).strip().lower()
-        if right_type == "dirichlet":
-            out = out.at[:, -1].set(jnp.zeros_like(out[:, -1]))
-
-        return out
+        del state
+        return density_rhs
 
     def debug_components(self, state, fluxes=None, source_outputs=None):
         if fluxes is None:
             fluxes = self.flux_model(state)
         use_face_gamma = self._use_model_face_particle_fluxes()
         need_face_fluxes = use_face_gamma
-        face_fluxes = self.face_flux_builder(state, center_fluxes=fluxes) if (self.face_flux_builder is not None and need_face_fluxes) else None
-        Gamma = PARTICLE_FLUX_PHYSICAL_TO_STATE * fluxes["Gamma"]
+        face_fluxes = (
+            fluxes
+            if (need_face_fluxes and _flux_has_key(fluxes, "Gamma_faces"))
+            else (
+                self.face_flux_builder(state, center_fluxes=fluxes)
+                if (self.face_flux_builder is not None and need_face_fluxes)
+                else None
+            )
+        )
+        gamma_center = _get_center_flux(fluxes, "Gamma")
+        Gamma = (
+            PARTICLE_FLUX_PHYSICAL_TO_STATE * gamma_center
+            if gamma_center is not None
+            else None
+        )
         Gamma_faces_raw = (
-            PARTICLE_FLUX_PHYSICAL_TO_STATE * face_fluxes["Gamma"]
-            if (face_fluxes is not None and face_fluxes.get("Gamma", None) is not None and use_face_gamma)
+            PARTICLE_FLUX_PHYSICAL_TO_STATE * _get_face_flux(face_fluxes, "Gamma")
+            if (face_fluxes is not None and _get_face_flux(face_fluxes, "Gamma") is not None and use_face_gamma)
             else self.flux_faces_builder(Gamma, self.particle_flux_reconstruction)
         )
         gamma_divergence_raw = jax.vmap(
             lambda flux: conservative_update(flux, self.dr_cells, self.Vprime, self.Vprime_half)
         )(Gamma_faces_raw)
         source_components = assemble_density_source_components(
-            source_outputs if self.source_model is not None else None,
+            None if self.source_model is None else (self.source_model(state) if source_outputs is None else source_outputs),
             state,
             self.species,
         )
@@ -291,11 +417,26 @@ class DensityEquation(EquationBase):
             fluxes = self.flux_model(state)
         use_face_gamma = self._use_model_face_particle_fluxes()
         need_face_fluxes = use_face_gamma
-        face_fluxes = self.face_flux_builder(state, center_fluxes=fluxes) if (self.face_flux_builder is not None and need_face_fluxes) else None
-        Gamma = PARTICLE_FLUX_PHYSICAL_TO_STATE * fluxes["Gamma"]
+        face_fluxes = (
+            fluxes
+            if (need_face_fluxes and _flux_has_key(fluxes, "Gamma_faces"))
+            else (
+                self.face_flux_builder(state, center_fluxes=fluxes)
+                if (self.face_flux_builder is not None and need_face_fluxes)
+                else None
+            )
+        )
+        gamma_center = _get_center_flux(fluxes, "Gamma")
+        Gamma = (
+            PARTICLE_FLUX_PHYSICAL_TO_STATE * gamma_center
+            if gamma_center is not None
+            else None
+        )
         Gamma_faces = (
-            PARTICLE_FLUX_PHYSICAL_TO_STATE * face_fluxes["Gamma"]
-            if (face_fluxes is not None and face_fluxes.get("Gamma", None) is not None and use_face_gamma)
+            PARTICLE_FLUX_PHYSICAL_TO_STATE * (
+                _get_face_flux(face_fluxes, "Gamma")
+            )
+            if (face_fluxes is not None and use_face_gamma)
             else self.flux_faces_builder(Gamma, self.particle_flux_reconstruction)
         )
         gamma_divergence = jax.vmap(
@@ -336,6 +477,16 @@ def build_density_equation(
     def face_flux_builder(state, center_fluxes=None):
         state = apply_transport_density_floor(state, density_floor)
         state = apply_transport_temperature_floor(state, temperature_floor, density_floor)
+        evaluated_state = build_evaluated_transport_state(
+            state,
+            field,
+            bc_density=bc_density,
+            bc_temperature=bc_temperature,
+            bc_er=bc_er,
+            reconstruction=reconstruction,
+            density_floor=density_floor,
+            temperature_floor=temperature_floor,
+        )
         face_mode = str(particle_face_closure_mode).strip().lower()
         if face_mode in {"ntss_like", "ntss", "half_point"}:
             face_state = build_ntss_like_face_transport_state(
@@ -366,7 +517,111 @@ def build_density_equation(
             bc_er=bc_er,
             particle_face_closure_mode=face_mode,
             center_fluxes=center_fluxes,
+            evaluated_state=evaluated_state,
         )
+
+    def database_face_table_pullback(
+        state,
+        center_fluxes,
+        flux_bar,
+        support,
+        *,
+        interpolation_transpose_mode=None,
+    ):
+        """Use the database owner's compact native face-table transpose."""
+        state = apply_transport_density_floor(state, density_floor)
+        state = apply_transport_temperature_floor(state, temperature_floor, density_floor)
+        evaluated_state = build_evaluated_transport_state(
+            state, field, bc_density=bc_density, bc_temperature=bc_temperature,
+            bc_er=bc_er, reconstruction=reconstruction,
+            density_floor=density_floor, temperature_floor=temperature_floor,
+        )
+        face_state = build_face_transport_state(
+            state, field, bc_density=bc_density, bc_temperature=bc_temperature,
+            bc_er=bc_er, reconstruction=reconstruction,
+            density_floor=density_floor, temperature_floor=temperature_floor,
+        )
+        pullback = _database_interpolation_pullback(
+            flux_model, interpolation_transpose_mode, face=True
+        )
+        return pullback(
+            state, face_state, flux_bar, support,
+            bc_density=bc_density, bc_temperature=bc_temperature, bc_er=bc_er,
+            center_fluxes=center_fluxes,
+            evaluated_state=evaluated_state,
+        )
+
+    face_flux_builder.database_table_pullback = database_face_table_pullback
+
+    def database_face_state_pullback(state, center_fluxes, flux_bar):
+        """Compact state transpose for this density equation's native faces."""
+        state = apply_transport_density_floor(state, density_floor)
+        state = apply_transport_temperature_floor(state, temperature_floor, density_floor)
+        evaluated_state = build_evaluated_transport_state(
+            state, field, bc_density=bc_density, bc_temperature=bc_temperature,
+            bc_er=bc_er, reconstruction=reconstruction,
+            density_floor=density_floor, temperature_floor=temperature_floor,
+        )
+        face_mode = str(particle_face_closure_mode).strip().lower()
+        face_state = (
+            build_ntss_like_face_transport_state(
+                state, field, bc_density=bc_density, bc_temperature=bc_temperature,
+                bc_er=bc_er, density_floor=density_floor, temperature_floor=temperature_floor,
+            )
+            if face_mode in {"ntss_like", "ntss", "half_point"}
+            else build_face_transport_state(
+                state, field, bc_density=bc_density, bc_temperature=bc_temperature,
+                bc_er=bc_er, reconstruction=reconstruction,
+                density_floor=density_floor, temperature_floor=temperature_floor,
+            )
+        )
+        pullback = getattr(flux_model, "pullback_direct_face_flux_state", None)
+        if not callable(pullback):
+            raise NotImplementedError("Database density face closure lacks a compact state transpose.")
+        return pullback(
+            state, face_state, flux_bar,
+            bc_density=bc_density, bc_temperature=bc_temperature, bc_er=bc_er,
+            particle_face_closure_mode=face_mode, center_fluxes=center_fluxes,
+            evaluated_state=evaluated_state,
+        )
+
+    face_flux_builder.database_state_pullback = database_face_state_pullback
+
+    def database_face_geometry_pullback(state, center_fluxes, flux_bar, support):
+        """Use the database owner's bounded native face-geometry transpose."""
+        state = apply_transport_density_floor(state, density_floor)
+        state = apply_transport_temperature_floor(state, temperature_floor, density_floor)
+        evaluated_state = build_evaluated_transport_state(
+            state, field, bc_density=bc_density, bc_temperature=bc_temperature,
+            bc_er=bc_er, reconstruction=reconstruction,
+            density_floor=density_floor, temperature_floor=temperature_floor,
+        )
+        face_mode = str(particle_face_closure_mode).strip().lower()
+        face_state = (
+            build_ntss_like_face_transport_state(
+                state, field, bc_density=bc_density, bc_temperature=bc_temperature,
+                bc_er=bc_er, density_floor=density_floor, temperature_floor=temperature_floor,
+            )
+            if face_mode in {"ntss_like", "ntss", "half_point"}
+            else build_face_transport_state(
+                state, field, bc_density=bc_density, bc_temperature=bc_temperature,
+                bc_er=bc_er, reconstruction=reconstruction,
+                density_floor=density_floor, temperature_floor=temperature_floor,
+            )
+        )
+        pullback = getattr(flux_model, "pullback_direct_face_flux_geometry_by_radius", None)
+        if not callable(pullback):
+            raise NotImplementedError("Database density face closure lacks a compact geometry transpose.")
+        return pullback(
+            state, face_state, flux_bar, support["geometry"],
+            bc_density=bc_density, bc_temperature=bc_temperature, bc_er=bc_er,
+            reconstruction=reconstruction,
+            density_floor=density_floor, temperature_floor=temperature_floor,
+            particle_face_closure_mode=face_mode, center_fluxes=center_fluxes,
+            evaluated_state=evaluated_state,
+        )
+
+    face_flux_builder.database_geometry_pullback = database_face_geometry_pullback
     if active_species_mask is None:
         active_species_mask = jnp.ones(species.number_species, dtype=bool)
     active_species_mask = jnp.asarray(active_species_mask, dtype=bool)
@@ -406,6 +661,7 @@ class TemperatureEquation(EquationBase):
     charge_qp: jax.Array = dataclasses.field(repr=False)
     active_species_mask: jax.Array = dataclasses.field(repr=False)
     face_flux_builder: callable = dataclasses.field(repr=False, default=None)
+    er_faces_builder: callable = dataclasses.field(repr=False, default=None)
     temperature_bc_model: object = dataclasses.field(repr=False, default=None)
     convection_reconstruction: str = "tvd_mc"
     heat_flux_reconstruction: str = "tvd_mc"
@@ -413,6 +669,7 @@ class TemperatureEquation(EquationBase):
     include_turbulent_convection: bool = True
     include_classical_convection: bool = True
     include_work_term: bool = True
+    work_term_reconstruction: str = "center"
     source_model: callable = dataclasses.field(repr=False, default=None)
     species: object = dataclasses.field(repr=False, default=None)
     name: str = "temperature"
@@ -427,48 +684,73 @@ class TemperatureEquation(EquationBase):
     def _use_model_face_particle_fluxes(self):
         return self._mode_requests_face_fluxes(self.convection_reconstruction)
 
+    def _use_face_completed_work_term(self):
+        return str(self.work_term_reconstruction).strip().lower() in {
+            "face_completed",
+            "interpolate_completed_faces",
+            "face_interpolated",
+        }
+
+    def _work_rhs(self, state, fluxes, face_fluxes):
+        """Return the local electric work term on cell centres.
+
+        ``face_completed`` is an opt-in comparison lane: it forms
+        ``q_a Gamma_a Er`` at the already evaluated finite-volume faces and
+        then cell-centres that completed scalar.  It deliberately does not
+        change any conservative flux divergence.
+        """
+        if not self.include_work_term:
+            return jnp.zeros_like(state.pressure)
+        if not self._use_face_completed_work_term():
+            return (
+                self.charge_qp[:, None]
+                * PARTICLE_FLUX_PHYSICAL_TO_STATE
+                * _get_center_flux(fluxes, "Gamma")
+                * state.Er[None, :]
+            )
+        gamma_faces = _get_face_flux(face_fluxes, "Gamma")
+        if gamma_faces is None:
+            gamma_faces = self.flux_faces_builder(_get_center_flux(fluxes, "Gamma"))
+        if self.er_faces_builder is None:
+            raise ValueError("face_completed work reconstruction requires er_faces_builder.")
+        er_faces = self.er_faces_builder(state)
+        work_faces = (
+            self.charge_qp[:, None]
+            * PARTICLE_FLUX_PHYSICAL_TO_STATE
+            * gamma_faces
+            * er_faces[None, :]
+        )
+        return jax.vmap(cell_centered_from_faces)(work_faces)
+
     def enforce_dirichlet_boundary_rhs(self, state, density_rhs, pressure_rhs):
-        bc = self.temperature_bc_model
-        if bc is None:
-            return pressure_rhs
-
-        out = pressure_rhs
-
-        left_type = str(getattr(bc, "left_type", "")).strip().lower()
-        if left_type == "dirichlet":
-            left_value = getattr(bc, "left_value", None)
-            if left_value is None:
-                t_left = state.temperature[:, 0]
-            else:
-                t_left = jnp.asarray(left_value, dtype=pressure_rhs.dtype)
-                if t_left.ndim == 0:
-                    t_left = jnp.broadcast_to(t_left, (pressure_rhs.shape[0],))
-            out = out.at[:, 0].set(t_left * density_rhs[:, 0])
-
-        right_type = str(getattr(bc, "right_type", "")).strip().lower()
-        if right_type == "dirichlet":
-            right_value = getattr(bc, "right_value", None)
-            if right_value is None:
-                t_right = state.temperature[:, -1]
-            else:
-                t_right = jnp.asarray(right_value, dtype=pressure_rhs.dtype)
-                if t_right.ndim == 0:
-                    t_right = jnp.broadcast_to(t_right, (pressure_rhs.shape[0],))
-            out = out.at[:, -1].set(t_right * density_rhs[:, -1])
-
-        return out
+        del state, density_rhs
+        return pressure_rhs
 
     def debug_components(self, state, fluxes=None, source_outputs=None):
         if fluxes is None:
             fluxes = self.flux_model(state)
         use_face_q = self._use_model_face_heat_fluxes()
         use_face_gamma = self._use_model_face_particle_fluxes()
-        need_face_fluxes = use_face_q or use_face_gamma
-        face_fluxes = self.face_flux_builder(state, center_fluxes=fluxes) if (self.face_flux_builder is not None and need_face_fluxes) else None
-        Q = HEAT_FLUX_PHYSICAL_TO_STATE * fluxes["Q"]
+        need_face_fluxes = use_face_q or use_face_gamma or self._use_face_completed_work_term()
+        face_fluxes = (
+            fluxes
+            if (
+                need_face_fluxes
+                and (_flux_has_key(fluxes, "Q_faces") or _flux_has_key(fluxes, "Gamma_faces"))
+            )
+            else (
+                self.face_flux_builder(state, center_fluxes=fluxes)
+                if (self.face_flux_builder is not None and need_face_fluxes)
+                else None
+            )
+        )
+        q_center = _get_center_flux(fluxes, "Q")
+        Q = HEAT_FLUX_PHYSICAL_TO_STATE * q_center if q_center is not None else None
         temperature_ghost = self.temperature_ghost_builder(state.temperature)
         Q_faces = (
-            HEAT_FLUX_PHYSICAL_TO_STATE * face_fluxes["Q"]
+            HEAT_FLUX_PHYSICAL_TO_STATE * (
+                _get_face_flux(face_fluxes, "Q")
+            )
             if (face_fluxes is not None and use_face_q)
             else self.flux_faces_builder(Q, self.heat_flux_reconstruction)
         )
@@ -478,7 +760,12 @@ class TemperatureEquation(EquationBase):
         )
 
         def _convective_component(gamma_key):
-            gamma_comp = (face_fluxes.get(gamma_key, None) if (face_fluxes is not None and use_face_gamma) else fluxes.get(gamma_key, None))
+            gamma_face_key = f"{gamma_key}_faces"
+            gamma_comp = (
+                _get_face_flux(face_fluxes, gamma_key)
+                if (face_fluxes is not None and use_face_gamma)
+                else _get_center_flux(fluxes, gamma_key)
+            )
             if gamma_comp is None:
                 gamma_faces = jnp.zeros_like(Q_faces)
             elif face_fluxes is not None and use_face_gamma:
@@ -521,19 +808,12 @@ class TemperatureEquation(EquationBase):
             lambda flux: conservative_update(flux, self.dr_cells, self.Vprime, self.Vprime_half)
         )(total_energy_flux_faces)
         source_components = assemble_pressure_source_components(
-            source_outputs if self.source_model is not None else None,
+            None if self.source_model is None else (self.source_model(state) if source_outputs is None else source_outputs),
             state,
             self.species,
         )
         source_rhs = sum_source_components(source_components, state.pressure)
-        work_rhs = (
-            self.charge_qp[:, None]
-            * PARTICLE_FLUX_PHYSICAL_TO_STATE
-            * fluxes["Gamma"]
-            * state.Er[None, :]
-            if self.include_work_term
-            else jnp.zeros_like(state.pressure)
-        )
+        work_rhs = self._work_rhs(state, fluxes, face_fluxes)
         total_rhs = (2.0 / 3.0) * (thermal_flux_rhs + source_rhs + work_rhs)
         return {
             "Q_faces": Q_faces,
@@ -559,12 +839,24 @@ class TemperatureEquation(EquationBase):
             fluxes = self.flux_model(state)
         use_face_q = self._use_model_face_heat_fluxes()
         use_face_gamma = self._use_model_face_particle_fluxes()
-        need_face_fluxes = use_face_q or use_face_gamma
-        face_fluxes = self.face_flux_builder(state, center_fluxes=fluxes) if (self.face_flux_builder is not None and need_face_fluxes) else None
-        Q = HEAT_FLUX_PHYSICAL_TO_STATE * fluxes["Q"]
+        need_face_fluxes = use_face_q or use_face_gamma or self._use_face_completed_work_term()
+        face_fluxes = (
+            fluxes
+            if (
+                need_face_fluxes
+                and (_flux_has_key(fluxes, "Q_faces") or _flux_has_key(fluxes, "Gamma_faces"))
+            )
+            else (
+                self.face_flux_builder(state, center_fluxes=fluxes)
+                if (self.face_flux_builder is not None and need_face_fluxes)
+                else None
+            )
+        )
+        q_center = _get_center_flux(fluxes, "Q")
+        Q = HEAT_FLUX_PHYSICAL_TO_STATE * q_center if q_center is not None else None
         temperature_ghost = self.temperature_ghost_builder(state.temperature)
         Q_faces = (
-            HEAT_FLUX_PHYSICAL_TO_STATE * face_fluxes["Q"]
+            HEAT_FLUX_PHYSICAL_TO_STATE * _get_face_flux(face_fluxes, "Q")
             if (face_fluxes is not None and use_face_q)
             else self.flux_faces_builder(Q, self.heat_flux_reconstruction)
         )
@@ -574,7 +866,11 @@ class TemperatureEquation(EquationBase):
         )
 
         def _convective_component(gamma_key):
-            gamma_comp = (face_fluxes.get(gamma_key, None) if (face_fluxes is not None and use_face_gamma) else fluxes.get(gamma_key, None))
+            gamma_comp = (
+                _get_face_flux(face_fluxes, gamma_key)
+                if (face_fluxes is not None and use_face_gamma)
+                else _get_center_flux(fluxes, gamma_key)
+            )
             if gamma_comp is None:
                 gamma_faces = jnp.zeros_like(Q_faces)
             elif face_fluxes is not None and use_face_gamma:
@@ -602,14 +898,7 @@ class TemperatureEquation(EquationBase):
             self.species,
         )
         source_rhs = sum_source_components(source_components, state.pressure)
-        work_rhs = (
-            self.charge_qp[:, None]
-            * PARTICLE_FLUX_PHYSICAL_TO_STATE
-            * fluxes["Gamma"]
-            * state.Er[None, :]
-            if self.include_work_term
-            else jnp.zeros_like(state.pressure)
-        )
+        work_rhs = self._work_rhs(state, fluxes, face_fluxes)
         return (2.0 / 3.0) * (thermal_flux_rhs + source_rhs + work_rhs) * self.active_species_mask[:, None]
 
 def _build_species_faces_builder(field, bc_model, reconstruction="linear"):
@@ -660,22 +949,61 @@ def _build_species_faces_builder(field, bc_model, reconstruction="linear"):
                     prof,
                     field.r_grid_half,
                     left_face_grad_constraint=jnp.asarray(0.0, dtype=prof.dtype),
-                    right_face_grad_constraint=jnp.asarray(0.0, dtype=prof.dtype),
+                    right_face_constraint=(
+                        1.5 * prof[-1] - 0.5 * prof[-2]
+                        if prof.shape[0] >= 2
+                        else prof[-1]
+                    ),
                 ).face_value(reconstruction=reconstruction)
             )(profile)
     return faces_builder
 
 
-def _build_species_ghost_builder(bc_model):
+def _build_species_ghost_builder(field, bc_model):
     if bc_model is not None and hasattr(bc_model, "apply_ghost_all"):
         def ghost_builder(profile):
             return bc_model.apply_ghost_all(profile)
     elif bc_model is not None and hasattr(bc_model, "apply_ghost"):
         def ghost_builder(profile):
             return jax.vmap(lambda prof: bc_model.apply_ghost(prof))(profile)
+    elif bc_model is not None and hasattr(bc_model, "right_type"):
+        def ghost_builder(profile):
+            left_value, left_grad = left_constraints_from_bc_model(
+                bc_model,
+                profile[:, 0],
+                profile=profile,
+                face_centers=field.r_grid_half,
+            )
+            right_value, right_grad = right_constraints_from_bc_model(
+                bc_model,
+                profile[:, -1],
+                profile=profile,
+                face_centers=field.r_grid_half,
+            )
+            dx_left = field.r_grid_half[1] - field.r_grid_half[0]
+            dx_right = field.r_grid_half[-1] - field.r_grid_half[-2]
+
+            if left_value is None:
+                left_face = profile[:, 0] - 0.5 * dx_left * jnp.asarray(left_grad)
+            else:
+                left_face = jnp.asarray(left_value)
+            if right_value is None:
+                right_face = profile[:, -1] + 0.5 * dx_right * jnp.asarray(right_grad)
+            else:
+                right_face = jnp.asarray(right_value)
+
+            left_ghost = 2.0 * left_face - profile[:, 0]
+            right_ghost = 2.0 * right_face - profile[:, -1]
+            return jnp.concatenate([left_ghost[:, None], profile, right_ghost[:, None]], axis=1)
     else:
         def ghost_builder(profile):
-            return jnp.concatenate([profile[:, :1], profile, profile[:, -1:]], axis=1)
+            left_ghost = profile[:, :1]
+            if profile.shape[1] >= 2:
+                right_face = 1.5 * profile[:, -1] - 0.5 * profile[:, -2]
+            else:
+                right_face = profile[:, -1]
+            right_ghost = 2.0 * right_face[:, None] - profile[:, -1:]
+            return jnp.concatenate([left_ghost, profile, right_ghost], axis=1)
     return ghost_builder
 
 
@@ -695,6 +1023,7 @@ def build_temperature_equation(
     include_turbulent_convection=True,
     include_classical_convection=True,
     include_work_term=True,
+    work_term_reconstruction="center",
     convection_reconstruction="tvd_mc",
     heat_flux_reconstruction="tvd_mc",
     reconstruction="linear",
@@ -709,6 +1038,16 @@ def build_temperature_equation(
     def face_flux_builder(state, center_fluxes=None):
         state = apply_transport_density_floor(state, density_floor)
         state = apply_transport_temperature_floor(state, temperature_floor, density_floor)
+        evaluated_state = build_evaluated_transport_state(
+            state,
+            field,
+            bc_density=bc_density,
+            bc_temperature=bc_temperature,
+            bc_er=bc_er,
+            reconstruction=reconstruction,
+            density_floor=density_floor,
+            temperature_floor=temperature_floor,
+        )
         face_state = build_face_transport_state(
             state,
             field,
@@ -726,8 +1065,106 @@ def build_temperature_equation(
             bc_temperature=bc_temperature,
             bc_er=bc_er,
             center_fluxes=center_fluxes,
+            evaluated_state=evaluated_state,
         )
-    temperature_ghost_builder = _build_species_ghost_builder(bc_temperature)
+
+    def database_face_table_pullback(
+        state,
+        center_fluxes,
+        flux_bar,
+        support,
+        *,
+        interpolation_transpose_mode=None,
+    ):
+        """Use the database owner's compact native face-table transpose."""
+        state = apply_transport_density_floor(state, density_floor)
+        state = apply_transport_temperature_floor(state, temperature_floor, density_floor)
+        evaluated_state = build_evaluated_transport_state(
+            state, field, bc_density=bc_density, bc_temperature=bc_temperature,
+            bc_er=bc_er, reconstruction=reconstruction,
+            density_floor=density_floor, temperature_floor=temperature_floor,
+        )
+        face_state = build_face_transport_state(
+            state, field, bc_density=bc_density, bc_temperature=bc_temperature,
+            bc_er=bc_er, reconstruction=reconstruction,
+            density_floor=density_floor, temperature_floor=temperature_floor,
+        )
+        pullback = _database_interpolation_pullback(
+            flux_model, interpolation_transpose_mode, face=True
+        )
+        return pullback(
+            state, face_state, flux_bar, support,
+            bc_density=bc_density, bc_temperature=bc_temperature, bc_er=bc_er,
+            center_fluxes=center_fluxes, evaluated_state=evaluated_state,
+        )
+
+    face_flux_builder.database_table_pullback = database_face_table_pullback
+
+    def database_face_state_pullback(state, center_fluxes, flux_bar):
+        """Compact state transpose for this temperature equation's native faces."""
+        state = apply_transport_density_floor(state, density_floor)
+        state = apply_transport_temperature_floor(state, temperature_floor, density_floor)
+        evaluated_state = build_evaluated_transport_state(
+            state, field, bc_density=bc_density, bc_temperature=bc_temperature,
+            bc_er=bc_er, reconstruction=reconstruction,
+            density_floor=density_floor, temperature_floor=temperature_floor,
+        )
+        face_state = build_face_transport_state(
+            state, field, bc_density=bc_density, bc_temperature=bc_temperature,
+            bc_er=bc_er, reconstruction=reconstruction,
+            density_floor=density_floor, temperature_floor=temperature_floor,
+        )
+        pullback = getattr(flux_model, "pullback_direct_face_flux_state", None)
+        if not callable(pullback):
+            raise NotImplementedError("Database temperature face closure lacks a compact state transpose.")
+        return pullback(
+            state, face_state, flux_bar,
+            bc_density=bc_density, bc_temperature=bc_temperature, bc_er=bc_er,
+            center_fluxes=center_fluxes,
+            evaluated_state=evaluated_state,
+        )
+
+    face_flux_builder.database_state_pullback = database_face_state_pullback
+
+    def database_face_geometry_pullback(state, center_fluxes, flux_bar, support):
+        """Use the database owner's bounded native face-geometry transpose."""
+        state = apply_transport_density_floor(state, density_floor)
+        state = apply_transport_temperature_floor(state, temperature_floor, density_floor)
+        evaluated_state = build_evaluated_transport_state(
+            state, field, bc_density=bc_density, bc_temperature=bc_temperature,
+            bc_er=bc_er, reconstruction=reconstruction,
+            density_floor=density_floor, temperature_floor=temperature_floor,
+        )
+        face_state = build_face_transport_state(
+            state, field, bc_density=bc_density, bc_temperature=bc_temperature,
+            bc_er=bc_er, reconstruction=reconstruction,
+            density_floor=density_floor, temperature_floor=temperature_floor,
+        )
+        pullback = getattr(flux_model, "pullback_direct_face_flux_geometry_by_radius", None)
+        if not callable(pullback):
+            raise NotImplementedError("Database temperature face closure lacks a compact geometry transpose.")
+        return pullback(
+            state, face_state, flux_bar, support["geometry"],
+            bc_density=bc_density, bc_temperature=bc_temperature, bc_er=bc_er,
+            reconstruction=reconstruction,
+            density_floor=density_floor, temperature_floor=temperature_floor,
+            center_fluxes=center_fluxes, evaluated_state=evaluated_state,
+        )
+
+    face_flux_builder.database_geometry_pullback = database_face_geometry_pullback
+
+    def er_faces_builder(state):
+        return build_face_transport_state(
+            state,
+            field,
+            bc_density=bc_density,
+            bc_temperature=bc_temperature,
+            bc_er=bc_er,
+            reconstruction=reconstruction,
+            density_floor=density_floor,
+            temperature_floor=temperature_floor,
+        ).Er
+    temperature_ghost_builder = _build_species_ghost_builder(field, bc_temperature)
     if active_species_mask is None:
         active_species_mask = jnp.ones(species.number_species, dtype=bool)
     return TemperatureEquation(
@@ -739,6 +1176,7 @@ def build_temperature_equation(
         species=species,
         flux_faces_builder=flux_faces_builder,
         face_flux_builder=face_flux_builder,
+        er_faces_builder=er_faces_builder,
         temperature_ghost_builder=temperature_ghost_builder,
         temperature_bc_model=bc_temperature,
         charge_qp=jnp.asarray(charge_qp),
@@ -747,6 +1185,7 @@ def build_temperature_equation(
         include_turbulent_convection=bool(include_turbulent_convection),
         include_classical_convection=bool(include_classical_convection),
         include_work_term=bool(include_work_term),
+        work_term_reconstruction=str(work_term_reconstruction).strip().lower(),
         convection_reconstruction=str(convection_reconstruction),
         heat_flux_reconstruction=str(heat_flux_reconstruction),
     )
@@ -767,7 +1206,13 @@ class ElectricFieldEquation(EquationBase):
     permitivity_prefactor: jax.Array = dataclasses.field(repr=False)
     gamma_faces_builder: callable = dataclasses.field(repr=False)
     er_diffusive_flux_builder: callable = dataclasses.field(repr=False)
+    face_state_builder: callable = dataclasses.field(repr=False, default=None)
     er_bc_model: object = dataclasses.field(repr=False, default=None)
+    # The axis face is not a state/geometry centre.  This value is used only
+    # when a face-completed ambipolar source needs a left-face prefactor.
+    axis_face_permitivity_prefactor: jax.Array | None = dataclasses.field(
+        repr=False, default=None
+    )
     source_mode: str = "ambipolar_local"
     permitivity_mode: str = "neopax_local"
     Er_relax: float = 1.0
@@ -787,20 +1232,43 @@ class ElectricFieldEquation(EquationBase):
         ambipolar_flux_center = 0.5 * (Gamma_faces[:, :-1] + Gamma_faces[:, 1:])
         return jnp.sum(self.charge_qp[:, None] * ambipolar_flux_center, axis=0)
 
-    def _er_diffusion(self, Er):
+    def _uses_face_completed_ambi_term(self):
+        return str(self.source_mode).strip().lower() in {
+            "ambipolar_face_completed",
+            "face_completed",
+            "interpolate_completed_faces",
+        }
+
+    def _charge_flux_faces_from_gamma(self, Gamma):
+        Gamma_faces = self.gamma_faces_builder(Gamma)
+        return jnp.sum(self.charge_qp[:, None] * Gamma_faces, axis=0)
+
+    def _er_diffusion(self, Er, Er_edge=None):
         # When DEr == 0 we want a true pure-ambipolar RHS, not 0 * NaN.
         if float(self.DEr) == 0.0:
             er_diffusive_flux = jnp.zeros(Er.shape[0] + 1, dtype=Er.dtype)
             er_diffusion = jnp.zeros_like(Er)
         else:
-            er_diffusive_flux = self.er_diffusive_flux_builder(Er)
+            # Keep hand-written/test builders with the historical one-argument
+            # signature working for ordinary centre-only states.
+            er_diffusive_flux = (
+                self.er_diffusive_flux_builder(Er)
+                if Er_edge is None
+                else self.er_diffusive_flux_builder(Er, Er_edge)
+            )
             er_diffusion = conservative_update(
                 er_diffusive_flux, self.dr_cells, self.Vprime, self.Vprime_half
             )
         return er_diffusive_flux, er_diffusion
 
-    def _charge_flux_and_ambi_term(self, state, Gamma, plasma_permitivity):
-        charge_flux = self._charge_flux_from_gamma(Gamma)
+    def _charge_flux_and_ambi_term(self, state, Gamma, plasma_permitivity, Gamma_faces=None):
+        if self._uses_face_completed_ambi_term():
+            if Gamma_faces is None:
+                Gamma_faces = self.gamma_faces_builder(Gamma)
+            charge_flux_faces = jnp.sum(self.charge_qp[:, None] * Gamma_faces, axis=0)
+            charge_flux = cell_centered_from_faces(charge_flux_faces)
+        else:
+            charge_flux = self._charge_flux_from_gamma(Gamma)
         mode = str(self.permitivity_mode).strip().lower()
         if mode in {"ntss_like_midpoint", "ntss_like", "ntssfusion_midpoint"}:
             density_indices = self.ntss_density_indices
@@ -814,13 +1282,93 @@ class ElectricFieldEquation(EquationBase):
                 * jnp.asarray(self.ntss_B0_mid, dtype=charge_flux.dtype) ** 2
                 / (ni_mid * jnp.asarray(self.ntss_psfactor_mid, dtype=charge_flux.dtype))
             )
-            ambi_term = coeffG * (charge_flux * jnp.asarray(1.0e-20, dtype=charge_flux.dtype))
+            if self._uses_face_completed_ambi_term():
+                ambi_faces = coeffG * (
+                    charge_flux_faces * jnp.asarray(1.0e-20, dtype=charge_flux.dtype)
+                )
+                ambi_term = cell_centered_from_faces(ambi_faces)
+            else:
+                ambi_term = coeffG * (charge_flux * jnp.asarray(1.0e-20, dtype=charge_flux.dtype))
             return charge_flux, ambi_term
+
+        if self._uses_face_completed_ambi_term():
+            if self.face_state_builder is None:
+                raise ValueError("face_completed ambipolar term requires face_state_builder.")
+            face_state = self.face_state_builder(state)
+            face_prefactor = jnp.concatenate(
+                (
+                    self.permitivity_prefactor[:1],
+                    0.5 * (self.permitivity_prefactor[:-1] + self.permitivity_prefactor[1:]),
+                    self.permitivity_prefactor[-1:],
+                )
+            )
+            # Do not regularize the first finite-radius centre.  The axis
+            # guard belongs only to the synthetic left face used by this
+            # face-completed reconstruction.
+            if self.axis_face_permitivity_prefactor is not None:
+                face_prefactor = face_prefactor.at[0].set(
+                    self.axis_face_permitivity_prefactor
+                )
+            face_mass_density = DENSITY_STATE_TO_PHYSICAL * jnp.sum(
+                self.species_mass[:, None] * face_state.density, axis=0
+            )
+            face_permitivity = jnp.maximum(
+                face_mass_density * face_prefactor,
+                jnp.asarray(1.0e-30, dtype=charge_flux_faces.dtype),
+            )
+            ambi_faces = charge_flux_faces * elementary_charge * 1.0e-3 / face_permitivity
+            return charge_flux, cell_centered_from_faces(ambi_faces)
 
         ambi_term = charge_flux * elementary_charge * 1.0e-3 / plasma_permitivity
         return charge_flux, ambi_term
 
-    def debug_components(self, state, fluxes=None):
+    def _outer_face_ambi_term(self, state, Gamma, plasma_permitivity, Gamma_faces=None):
+        charge_flux_faces = (
+            jnp.sum(self.charge_qp[:, None] * Gamma_faces, axis=0)
+            if Gamma_faces is not None
+            else self._charge_flux_faces_from_gamma(Gamma)
+        )
+        charge_flux_edge = charge_flux_faces[-1]
+        mode = str(self.permitivity_mode).strip().lower()
+        if mode in {"ntss_like_midpoint", "ntss_like", "ntssfusion_midpoint"}:
+            density_indices = self.ntss_density_indices
+            if density_indices is None:
+                ni_mid = jnp.asarray(1.0, dtype=charge_flux_edge.dtype)
+            else:
+                ni_mid = jnp.sum(state.density[density_indices, state.density.shape[1] // 2])
+            ni_mid = jnp.maximum(ni_mid, jnp.asarray(1.0e-30, dtype=charge_flux_edge.dtype))
+            coeffG = (
+                jnp.asarray(95780.0, dtype=charge_flux_edge.dtype)
+                * jnp.asarray(self.ntss_B0_mid, dtype=charge_flux_edge.dtype) ** 2
+                / (ni_mid * jnp.asarray(self.ntss_psfactor_mid, dtype=charge_flux_edge.dtype))
+            )
+            return coeffG * (charge_flux_edge * jnp.asarray(1.0e-20, dtype=charge_flux_edge.dtype))
+
+        if self._uses_face_completed_ambi_term():
+            if self.face_state_builder is None:
+                raise ValueError("face_completed ambipolar term requires face_state_builder.")
+            face_state = self.face_state_builder(state)
+            edge_mass_density = DENSITY_STATE_TO_PHYSICAL * jnp.sum(
+                self.species_mass * face_state.density[:, -1]
+            )
+            edge_permitivity = jnp.maximum(
+                edge_mass_density * self.permitivity_prefactor[-1],
+                jnp.asarray(1.0e-30, dtype=charge_flux_edge.dtype),
+            )
+            return charge_flux_edge * elementary_charge * 1.0e-3 / edge_permitivity
+
+        plasma_permitivity_edge = (
+            1.5 * plasma_permitivity[-1] - 0.5 * plasma_permitivity[-2]
+            if plasma_permitivity.shape[0] >= 2
+            else plasma_permitivity[-1]
+        )
+        plasma_permitivity_edge = jnp.maximum(
+            plasma_permitivity_edge,
+            jnp.asarray(1.0e-30, dtype=charge_flux_edge.dtype),
+        )
+        return charge_flux_edge * elementary_charge * 1.0e-3 / plasma_permitivity_edge
+
+    def debug_components(self, state, fluxes=None, *, er_edge_override=None):
         if fluxes is None:
             fluxes = self.flux_model(state)
         Er = state.Er
@@ -829,18 +1377,38 @@ class ElectricFieldEquation(EquationBase):
             self.species_mass,
             self.permitivity_prefactor,
         )
-        Gamma = fluxes["Gamma"]
-        charge_flux, ambi_term = self._charge_flux_and_ambi_term(state, Gamma, plasma_permitivity)
-        er_diffusive_flux, er_diffusion = self._er_diffusion(Er)
+        Gamma = _get_center_flux(fluxes, "Gamma")
+        # The floating edge condition is intrinsically a face condition.  Use
+        # native model faces whenever present, independently of the interior
+        # Er-source reconstruction mode; `_outer_face_ambi_term` reconstructs
+        # only when this remains ``None``.
+        Gamma_faces = (
+            fluxes["Gamma_faces"]
+            if _flux_has_key(fluxes, "Gamma_faces")
+            else None
+        )
+        charge_flux, ambi_term = self._charge_flux_and_ambi_term(
+            state, Gamma, plasma_permitivity, Gamma_faces
+        )
+        ambi_term_edge = self._outer_face_ambi_term(
+            state, Gamma, plasma_permitivity, Gamma_faces
+        )
+        er_diffusive_flux, er_diffusion = self._er_diffusion(Er, er_edge_override)
+        ambipolar_rhs = -self.Er_relax * ambi_term
+        diffusion_rhs = self.Er_relax * self.DEr * er_diffusion
         return {
             "charge_flux": charge_flux,
             "plasma_permitivity": plasma_permitivity,
             "ambi_term": ambi_term,
+            "ambi_term_edge": ambi_term_edge,
             "er_diffusive_flux": er_diffusive_flux,
             "er_diffusion": er_diffusion,
+            "ambipolar_rhs": ambipolar_rhs,
+            "diffusion_rhs": diffusion_rhs,
+            "unconstrained_rhs": diffusion_rhs + ambipolar_rhs,
         }
 
-    def __call__(self, state, fluxes=None):
+    def __call__(self, state, fluxes=None, *, er_edge_override=None):
         if fluxes is None:
             fluxes = self.flux_model(state)
         Er = state.Er
@@ -849,30 +1417,46 @@ class ElectricFieldEquation(EquationBase):
             self.species_mass,
             self.permitivity_prefactor,
         )
-        Gamma = fluxes["Gamma"]
-        _, ambi_term = self._charge_flux_and_ambi_term(state, Gamma, plasma_permitivity)
-        _, Er_diffusion = self._er_diffusion(Er)
+        Gamma = _get_center_flux(fluxes, "Gamma")
+        # Retain direct face data for the floating-edge residual even when
+        # the interior source is the centre-local `ambipolar_local` form.
+        Gamma_faces = (
+            fluxes["Gamma_faces"]
+            if _flux_has_key(fluxes, "Gamma_faces")
+            else None
+        )
+        _, ambi_term = self._charge_flux_and_ambi_term(
+            state, Gamma, plasma_permitivity, Gamma_faces
+        )
+        _, Er_diffusion = self._er_diffusion(Er, er_edge_override)
         SourceEr = self.Er_relax * (self.DEr * Er_diffusion - ambi_term)
         if self.boundary_mode == "floating_ambipolar_edge":
-            SourceEr = SourceEr.at[-1].set(-self.Er_relax * ambi_term[-1])
+            SourceEr = SourceEr.at[-1].set(
+                -self.Er_relax * self._outer_face_ambi_term(
+                    state, Gamma, plasma_permitivity, Gamma_faces
+                )
+            )
         SourceEr = self.enforce_dirichlet_boundary_rhs(state, SourceEr)
         return SourceEr
 
+    def edge_rhs(self, state, fluxes=None, *, er_edge_override=None):
+        """Ambipolar relaxation for the separate physical outer-face node."""
+        if self.boundary_mode != "floating_ambipolar_edge_node":
+            return None
+        if fluxes is None:
+            fluxes = self.flux_model(state)
+        plasma_permitivity = _plasma_permitivity_from_prefactor(
+            state, self.species_mass, self.permitivity_prefactor
+        )
+        Gamma = _get_center_flux(fluxes, "Gamma")
+        Gamma_faces = fluxes["Gamma_faces"] if _flux_has_key(fluxes, "Gamma_faces") else None
+        return -self.Er_relax * self._outer_face_ambi_term(
+            state, Gamma, plasma_permitivity, Gamma_faces
+        )
+
     def enforce_dirichlet_boundary_rhs(self, state, er_rhs):
-        bc = self.er_bc_model
-        if bc is None:
-            return er_rhs.at[0].set(0.0)
-
-        out = er_rhs
-        left_type = str(getattr(bc, "left_type", "")).strip().lower()
-        if left_type == "dirichlet":
-            out = out.at[0].set(jnp.asarray(0.0, dtype=out.dtype))
-
-        right_type = str(getattr(bc, "right_type", "")).strip().lower()
-        if right_type == "dirichlet" and self.boundary_mode != "floating_ambipolar_edge":
-            out = out.at[-1].set(jnp.asarray(0.0, dtype=out.dtype))
-
-        return out
+        del state
+        return er_rhs
 
     def ap_linear_split(self, state):
         """
@@ -898,6 +1482,8 @@ def build_electric_field_equation(
     charge_qp,
     bc_gamma,
     bc_er,
+    bc_density=None,
+    bc_temperature=None,
     Er_relax=1.0,
     DEr=1.0,
     source_mode="ambipolar_local",
@@ -908,9 +1494,17 @@ def build_electric_field_equation(
     dr_cells = jnp.diff(field.r_grid_half)
     Vprime = field.Vprime
     Vprime_half = field.Vprime_half
-    psi_fac = 1.0 + 1.0 / (field.enlogation * jnp.square(field.iota))
-    psi_fac = psi_fac.at[0].set(1.0)
+    psi_den = field.enlogation * jnp.square(field.iota)
+    psi_den_active = jnp.abs(psi_den) > 0.0
+    psi_den_safe = jnp.where(psi_den_active, psi_den, 1.0)
+    psi_fac = 1.0 + jnp.where(psi_den_active, 1.0 / psi_den_safe, 0.0)
+    # ``field`` quantities live at cell centres.  Index zero is therefore the
+    # first finite-radius centre, not the magnetic-axis boundary face; retain
+    # its evaluated geometry factor rather than applying an axis override.
     permitivity_prefactor = psi_fac / jnp.square(field.B0)
+    # Preserve the historical axis regularization only for reconstructions at
+    # the axis face. ``field.B0[0]`` is the nearest available centre value.
+    axis_face_permitivity_prefactor = 1.0 / jnp.square(field.B0[0])
     mid_idx = int(field.r_grid.shape[0] // 2)
     ntss_B0_mid = jnp.asarray(field.B0[mid_idx])
     ntss_psfactor_mid = jnp.asarray(psi_fac[mid_idx])
@@ -970,12 +1564,16 @@ def build_electric_field_equation(
                     G,
                     field.r_grid_half,
                     left_face_grad_constraint=jnp.asarray(0.0, dtype=G.dtype),
-                    right_face_grad_constraint=jnp.asarray(0.0, dtype=G.dtype),
+                    right_face_constraint=(
+                        1.5 * G[-1] - 0.5 * G[-2]
+                        if G.shape[0] >= 2
+                        else G[-1]
+                    ),
                 ).face_value(reconstruction=reconstruction)
             )(Gamma)
     # Pre-build the diffusive Er face-flux builder for BC handling.
     if bc_er is not None and hasattr(bc_er, "right_type"):
-        def er_diffusive_flux_builder(er_profile):
+        def er_diffusive_flux_builder(er_profile, er_edge=None):
             lv_er, lg_er = left_constraints_from_bc_model(
                 bc_er,
                 er_profile[0],
@@ -988,7 +1586,15 @@ def build_electric_field_equation(
                 profile=er_profile,
                 face_centers=field.r_grid_half,
             )
-            if rv_er is not None:
+            if er_edge is not None:
+                er_cell_var = make_profile_cell_variable(
+                    er_profile,
+                    field.r_grid_half,
+                    left_face_constraint=None if lv_er is None else jnp.asarray(lv_er).reshape(-1)[0],
+                    left_face_grad_constraint=None if lg_er is None else jnp.asarray(lg_er).reshape(-1)[0],
+                    right_face_constraint=jnp.asarray(er_edge).reshape(-1)[0],
+                )
+            elif rv_er is not None:
                 er_cell_var = make_profile_cell_variable(
                     er_profile,
                     field.r_grid_half,
@@ -1006,18 +1612,36 @@ def build_electric_field_equation(
                 )
             return -er_cell_var.face_grad()
     elif bc_er is not None and hasattr(bc_er, "apply_ghost"):
-        def er_diffusive_flux_builder(er_profile):
+        def er_diffusive_flux_builder(er_profile, er_edge=None):
             er_ghost = bc_er.apply_ghost(er_profile)
-            return -jnp.diff(er_ghost) / jnp.diff(field.r_grid_half)
+            flux = -jnp.diff(er_ghost) / jnp.diff(field.r_grid_half)
+            if er_edge is None:
+                return flux
+            return flux.at[-1].set(
+                -(jnp.asarray(er_edge) - er_profile[-1])
+                / (field.r_grid_half[-1] - field.r_grid_half[-2])
+            )
     else:
-        def er_diffusive_flux_builder(er_profile):
+        def er_diffusive_flux_builder(er_profile, er_edge=None):
             er_cell_var = make_profile_cell_variable(
                 er_profile,
                 field.r_grid_half,
                 left_face_grad_constraint=jnp.asarray(0.0, dtype=er_profile.dtype),
-                right_face_constraint=er_profile[-1],
+                right_face_constraint=(jnp.asarray(er_edge).reshape(-1)[0] if er_edge is not None else (
+                    1.5 * er_profile[-1] - 0.5 * er_profile[-2]
+                    if er_profile.shape[0] >= 2 else er_profile[-1]
+                )),
             )
             return -er_cell_var.face_grad()
+    def face_state_builder(state):
+        return build_face_transport_state(
+            state,
+            field,
+            bc_density=bc_density,
+            bc_temperature=bc_temperature,
+            bc_er=bc_er,
+            reconstruction=reconstruction,
+        )
     return ElectricFieldEquation(
         dr_cells=dr_cells,
         Vprime=Vprime,
@@ -1028,7 +1652,9 @@ def build_electric_field_equation(
         permitivity_prefactor=permitivity_prefactor,
         gamma_faces_builder=gamma_faces_builder,
         er_diffusive_flux_builder=er_diffusive_flux_builder,
+        face_state_builder=face_state_builder,
         er_bc_model=bc_er,
+        axis_face_permitivity_prefactor=axis_face_permitivity_prefactor,
         source_mode=str(source_mode).strip().lower(),
         permitivity_mode=str(permitivity_mode).strip().lower(),
         Er_relax=Er_relax,
@@ -1044,7 +1670,7 @@ def _resolve_er_boundary_mode(config, solver_cfg):
     er_right_cfg = config.get("boundary", {}).get("Er", {}).get("right", {})
     if isinstance(er_right_cfg, dict):
         right_type = er_right_cfg.get("type")
-        if str(right_type).strip().lower() in {"floating_ambipolar_edge", "ambipolar_edge_root"}:
+        if str(right_type).strip().lower() in {"floating_ambipolar_edge", "floating_ambipolar_edge_node", "ambipolar_edge_root"}:
             return str(right_type).strip().lower()
     return str(solver_cfg.get("Er_right_boundary_mode", solver_cfg.get("Er_boundary_mode", "standard"))).strip().lower()
 
@@ -1084,7 +1710,10 @@ def build_equation_system(
     temperature_source_model = source_models.get("temperature")
     Er_relax = solver_cfg.get("Er_relax", 1.0)
     DEr = solver_cfg.get("DEr", 1.0)
-    Er_source_mode = solver_cfg.get("Er_source_mode", "transport_centered")
+    Er_source_mode = solver_cfg.get(
+        "Er_source_mode",
+        config.get("ambipolarity", {}).get("er_ambipolar_flux_mode", "ambipolar_local"),
+    )
     Er_permitivity_mode = solver_cfg.get(
         "Er_permittivity_mode",
         solver_cfg.get("Er_permitivity_mode", "neopax_local"),
@@ -1098,6 +1727,9 @@ def build_equation_system(
     include_work_term = solver_cfg.get(
         "temperature_include_work_term",
         solver_cfg.get("temperature_include_work_source_term", True),
+    )
+    work_term_reconstruction = solver_cfg.get(
+        "temperature_work_term_reconstruction", "center"
     )
     convection_reconstruction = solver_cfg.get("temperature_convection_reconstruction", "closure_face_flux")
     heat_flux_reconstruction = solver_cfg.get("temperature_heat_flux_reconstruction", "closure_face_flux")
@@ -1135,6 +1767,7 @@ def build_equation_system(
             include_turbulent_convection=include_turbulent_convection,
             include_classical_convection=include_classical_convection,
             include_work_term=include_work_term,
+            work_term_reconstruction=work_term_reconstruction,
             convection_reconstruction=convection_reconstruction,
             heat_flux_reconstruction=heat_flux_reconstruction,
             density_floor=density_floor,
@@ -1149,6 +1782,8 @@ def build_equation_system(
             charge_qp,
             bc_gamma,
             bc_er,
+            bc_density=bc_density,
+            bc_temperature=bc_temperature,
             Er_relax=Er_relax,
             DEr=DEr,
             source_mode=Er_source_mode,
@@ -1172,25 +1807,40 @@ def build_equation_system_from_config(config, species):
 
     geom_cfg = config.get("geometry", {})
     n_radial = int(geom_cfg.get("n_radial", 51))
+    rho_edge = float(geom_cfg.get("rho_edge", 1.0))
     vmec_file = geom_cfg.get("vmec_file")
     boozer_file = geom_cfg.get("boozer_file")
     field = None
     if vmec_file is not None and boozer_file is not None:
-        field = get_geometry_model("vmec_booz", n_r=n_radial, vmec=vmec_file, booz=boozer_file)
+        field = get_geometry_model("vmec_booz", n_r=n_radial, vmec=vmec_file, booz=boozer_file, rho_edge=rho_edge)
 
     energy_grid_cfg = config.get("energy_grid", {})
     n_x = int(energy_grid_cfg.get("n_x", 4))
     energy_grid = get_energy_grid_model("standard_laguerre", n_x=n_x, n_order=3)
     neoclassical_cfg = config.get("neoclassical", {})
+    neoclassical_name = str(
+        neoclassical_cfg.get(
+            "flux_model", neoclassical_cfg.get("model", "ntx_database")
+        )
+    ).strip().lower()
     database = None
     neoclassical_file = neoclassical_cfg.get("neoclassical_file")
-    if neoclassical_file and field is not None:
+    if (
+        neoclassical_file
+        and field is not None
+        and neoclassical_name not in {"fluxes_r_file", "dkx_fluxes_r_file"}
+    ):
         database = Monoenergetic.read_ntx(field.a_b, neoclassical_file)
 
-    neoclassical_factory = get_transport_flux_model(neoclassical_cfg.get("flux_model", "ntx_database"))
+    neoclassical_factory = get_transport_flux_model(neoclassical_name)
     turbulence_factory = get_transport_flux_model(config.get("turbulence", {}).get("flux_model", "none"))
     classical_factory = get_transport_flux_model(config.get("classical", {}).get("flux_model", "none")) if "classical" in config else None
-    neoclassical_model = neoclassical_factory(species, energy_grid, field, database)
+    if neoclassical_name in {"fluxes_r_file", "dkx_fluxes_r_file"}:
+        neoclassical_model = neoclassical_factory(
+            species, energy_grid, field, database, **dict(neoclassical_cfg)
+        )
+    else:
+        neoclassical_model = neoclassical_factory(species, energy_grid, field, database)
     turbulence_model = turbulence_factory(species, energy_grid, field, database) if turbulence_factory is not None else ZeroTransportModel()
     classical_model = classical_factory(species, energy_grid, field, database) if classical_factory is not None else ZeroTransportModel()
     flux_model = build_transport_flux_model(neoclassical_model, turbulence_model, classical_model)
@@ -1203,7 +1853,7 @@ def build_equation_system_from_config(config, species):
         if isinstance(right_cfg, dict):
             right_cfg = dict(right_cfg)
             right_type = str(right_cfg.get("type", "")).strip().lower()
-            if right_type in {"floating_ambipolar_edge", "ambipolar_edge_root"}:
+            if right_type in {"floating_ambipolar_edge", "floating_ambipolar_edge_node", "ambipolar_edge_root"}:
                 right_cfg["type"] = "neumann"
                 right_cfg.setdefault("gradient", 0.0)
             er_cfg["right"] = right_cfg
@@ -1234,6 +1884,23 @@ def build_equation_system_from_config(config, species):
     )
 
 
+@dataclasses.dataclass(frozen=True, eq=False)
+class _DatabaseRHSSupportPreparation:
+    """Call-local primal values and flux bars, never a retained reverse tape.
+
+    This Python record exists only inside the fixed-table support hook. It
+    neither crosses a JIT boundary nor changes the recorded scan payload.
+    Density and temperature face closures deliberately remain distinct.
+    """
+
+    active_flux_model: object
+    working_state: object
+    eidx: object
+    center_fluxes: object
+    fixed_flux_payloads: object
+    flux_bars: object
+
+
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True, eq=False)
 class ComposedEquationSystem:
@@ -1248,6 +1915,1093 @@ class ComposedEquationSystem:
     temperature_active_mask: object | None = None
     fixed_temperature_profile: object | None = None
     er_bc_model: object | None = None
+    config: object | None = None
+    source_models: object | None = None
+    solver_cfg: object | None = None
+    boundary_models: object | None = None
+    # Setup-only value for the private Radau outer-face Er coordinate.  It is
+    # deliberately not part of TransportState or a cached response payload.
+    node_boundary_initial_er: object | None = None
+    debug_nonfinite_rhs_components: bool = False
+
+    @staticmethod
+    def _split_realtime_geometry_payload(payload):
+        if isinstance(payload, dict) and "ntx_support" in payload and "geometry" in payload:
+            return payload["ntx_support"], payload["geometry"]
+        return payload, None
+
+    @staticmethod
+    def _realtime_geometry_payload_bar(payload, ntx_support_bar, geometry_bar):
+        if isinstance(payload, dict) and "ntx_support" in payload and "geometry" in payload:
+            return {
+                "ntx_support": _sanitize_float_delta_bar_tree(payload["ntx_support"], ntx_support_bar),
+                "geometry": _sanitize_float_delta_bar_tree(payload["geometry"], geometry_bar),
+            }
+        return _sanitize_float_delta_bar_tree(payload, ntx_support_bar)
+
+    @staticmethod
+    def _flux_model_with_geometry_payload(model, geometry):
+        if model is None or not dataclasses.is_dataclass(model):
+            return model
+        updates = {}
+        for field in dataclasses.fields(model):
+            value = getattr(model, field.name)
+            if field.name in {"geometry", "field"}:
+                if value is not geometry:
+                    updates[field.name] = geometry
+                continue
+            if dataclasses.is_dataclass(value):
+                new_value = ComposedEquationSystem._flux_model_with_geometry_payload(value, geometry)
+                if new_value is not value:
+                    updates[field.name] = new_value
+        if not updates:
+            return model
+        return dataclasses.replace(model, **updates)
+
+    @staticmethod
+    def _flux_model_geometry(model):
+        if model is None or not dataclasses.is_dataclass(model):
+            return None
+        for name in ("geometry", "field"):
+            if hasattr(model, name):
+                value = getattr(model, name)
+                if hasattr(value, "r_grid_half"):
+                    return value
+        for field in dataclasses.fields(model):
+            value = getattr(model, field.name)
+            if dataclasses.is_dataclass(value):
+                geometry = ComposedEquationSystem._flux_model_geometry(value)
+                if geometry is not None:
+                    return geometry
+        return None
+
+    @staticmethod
+    def _direct_geometry_build_lagged_response_bar(model, geometry, state, response_bar):
+        """Geometry cotangent for non-NTX lagged-response rebuilds.
+
+        The NTX exact model exposes its realtime geometry through an explicit
+        support payload and is handled by the ntx_support branch.  This helper
+        only covers transport submodels that store the transport geometry
+        directly as ``field``/``geometry`` and build a lagged response from it
+        (for example the turbulent power-over-n model).
+        """
+        if model is None or response_bar is None:
+            return _float_delta_tree_like(geometry)
+
+        if (
+            dataclasses.is_dataclass(model)
+            and hasattr(model, "neoclassical_model")
+            and hasattr(model, "turbulent_model")
+            and hasattr(model, "classical_model")
+        ):
+            bars = []
+            for model_name, response_name in (
+                ("turbulent_model", "turbulent_response"),
+                ("classical_model", "classical_response"),
+            ):
+                submodel = getattr(model, model_name, None)
+                subresponse_bar = getattr(response_bar, response_name, None)
+                bars.append(
+                    ComposedEquationSystem._direct_geometry_build_lagged_response_bar(
+                        submodel,
+                        geometry,
+                        state,
+                        subresponse_bar,
+                    )
+                )
+            return jax.tree_util.tree_map(lambda *values: sum(values), *bars)
+
+        if not dataclasses.is_dataclass(model) or not callable(getattr(model, "build_lagged_response", None)):
+            return _float_delta_tree_like(geometry)
+
+        field_names = {field.name for field in dataclasses.fields(model)}
+        geometry_field_names = tuple(name for name in ("geometry", "field") if name in field_names)
+        if not geometry_field_names:
+            return _float_delta_tree_like(geometry)
+
+        geometry_delta0 = _float_delta_tree_like(geometry)
+
+        def _response_from_geometry_delta(geometry_delta):
+            geometry_value = _add_float_delta_tree(geometry, geometry_delta)
+            updates = {name: geometry_value for name in geometry_field_names}
+            return dataclasses.replace(model, **updates).build_lagged_response(state)
+
+        _, geometry_pullback = jax.vjp(_response_from_geometry_delta, geometry_delta0)
+        (geometry_bar,) = geometry_pullback(response_bar)
+        return _sanitize_float_delta_bar_tree(geometry, geometry_bar)
+
+    def with_geometry_payload(self, geometry):
+        if self.config is None or self.solver_cfg is None or self.boundary_models is None:
+            raise ValueError("Geometry-payload pullback requires equation-system construction metadata.")
+        flux_model_source = self.shared_flux_model
+        if flux_model_source is None:
+            flux_model_source = next(
+                (
+                    getattr(eq, "flux_model", None)
+                    for eq in self.equations
+                    if getattr(eq, "flux_model", None) is not None
+                ),
+                None,
+            )
+        flux_model = self._flux_model_with_geometry_payload(flux_model_source, geometry)
+        equations = build_equation_system(
+            config=self.config,
+            species=self.species,
+            field=geometry,
+            flux_model=flux_model,
+            source_models=self.source_models,
+            solver_cfg=self.solver_cfg,
+            boundary_models=self.boundary_models,
+        )
+        return dataclasses.replace(
+            self,
+            equations=tuple(equations),
+            density_equation=next((eq for eq in equations if getattr(eq, "name", None) == "density"), None),
+            temperature_equation=next((eq for eq in equations if getattr(eq, "name", None) == "temperature"), None),
+            er_equation=next((eq for eq in equations if getattr(eq, "name", None) == "Er"), None),
+            shared_flux_model=flux_model if len(equations) >= 1 else None,
+        )
+
+    @staticmethod
+    def _flux_model_with_realtime_support_payload(model, support_payload):
+        """Replace only the neoclassical subtree that owns a live payload.
+
+        This is deliberately a capability boundary rather than a list of flux
+        model names.  A composite keeps its non-neoclassical models intact;
+        a model that implements ``with_support_payload`` owns the replacement.
+        Models without that capability are geometry-only participants and are
+        already handled by :meth:`with_geometry_payload`.
+        """
+        if model is None or not dataclasses.is_dataclass(model):
+            return model
+        if all(
+            hasattr(model, name)
+            for name in ("neoclassical_model", "turbulent_model", "classical_model")
+        ):
+            neoclassical_model = ComposedEquationSystem._flux_model_with_realtime_support_payload(
+                model.neoclassical_model, support_payload
+            )
+            if neoclassical_model is model.neoclassical_model:
+                return model
+            return dataclasses.replace(model, neoclassical_model=neoclassical_model)
+        replace_payload = support_payload
+        # The exact model's established API owns the ``ntx_support`` inner
+        # payload; the live scan model owns the complete map because its
+        # channels and surfaces are also differentiable inputs.
+        if isinstance(support_payload, dict) and "ntx_support" in support_payload:
+            replace_payload = support_payload["ntx_support"]
+        replace_fn = getattr(model, "with_support_payload", None)
+        return replace_fn(replace_payload) if callable(replace_fn) else model
+
+    def with_realtime_geometry_support_payload(self, support_payload):
+        """Return the direct-RHS system reconstructed from a live payload.
+
+        This is used only by black-box reverse support differentiation.  The
+        lagged-response paths keep their established support hooks.
+        """
+        geometry = (
+            support_payload.get("geometry")
+            if isinstance(support_payload, dict)
+            else None
+        )
+        base = self.with_geometry_payload(geometry) if geometry is not None else self
+        flux_model = self._flux_model_with_realtime_support_payload(
+            base.shared_flux_model, support_payload
+        )
+        if flux_model is base.shared_flux_model:
+            return base
+        equations = build_equation_system(
+            config=base.config,
+            species=base.species,
+            field=geometry if geometry is not None else self._flux_model_geometry(flux_model),
+            flux_model=flux_model,
+            source_models=base.source_models,
+            solver_cfg=base.solver_cfg,
+            boundary_models=base.boundary_models,
+        )
+        return dataclasses.replace(
+            base,
+            equations=tuple(equations),
+            density_equation=next((eq for eq in equations if getattr(eq, "name", None) == "density"), None),
+            temperature_equation=next((eq for eq in equations if getattr(eq, "name", None) == "temperature"), None),
+            er_equation=next((eq for eq in equations if getattr(eq, "name", None) == "Er"), None),
+            shared_flux_model=flux_model,
+        )
+
+    def pullback_direct_rhs_state(self, t, state, runtime, rhs_bar):
+        """Joint assembly transpose of a direct black-box RHS with respect to state.
+
+        Preserve the state-Jacobian contract validated by the 16-step database
+        AD--FD comparison: transpose equation assembly jointly with its shared
+        flux input, then apply the database model's compact centre-flux state
+        transpose.  No lagged response is constructed or substituted.
+        """
+        del t, runtime
+        if self.shared_flux_model is None:
+            return None
+        flux_state_pullback = getattr(
+            self.shared_flux_model, "pullback_direct_rhs_state", None
+        )
+        if not callable(flux_state_pullback):
+            return None
+        working_state, eidx = self._prepare_working_state(state)
+        shared_fluxes = self.shared_flux_model(working_state)
+        # Preserve the established black-box Radau state-Jacobian contract.
+        # This joint VJP is the pre-2026-09-11 implementation validated by
+        # the 16-step database AD--FD table.  Fixed-face/compact boundaries
+        # remain appropriate for table and geometry bars, but must not alter
+        # the transport state Jacobian unless a full AD--FD regression proves
+        # the replacement equivalent.
+        direct_working_state_bar, flux_bar = (
+            self._pullback_shared_flux_rhs_state_and_fluxes(
+                state, working_state, eidx, shared_fluxes, rhs_bar
+            )
+        )
+        if (
+            str(os.environ.get("NEOPAX_DATABASE_STATE_VJP_DIAGNOSTICS", ""))
+            .strip()
+            .lower()
+            in {"1", "true", "yes", "on"}
+        ):
+            def _bad_count(value):
+                return jnp.sum(~jnp.isfinite(jnp.asarray(value)))
+
+            gamma_bad = _bad_count(flux_bar.get("Gamma", 0.0))
+            q_bad = _bad_count(flux_bar.get("Q", 0.0))
+            upar_bad = _bad_count(flux_bar.get("Upar", 0.0))
+            direct_density_bad = _bad_count(direct_working_state_bar.density)
+            direct_pressure_bad = _bad_count(direct_working_state_bar.pressure)
+            direct_er_bad = _bad_count(direct_working_state_bar.Er)
+
+            def _report_bad_assembly_boundary(_):
+                jax.debug.print(
+                    "[database-state-vjp] equation-to-flux boundary nonfinite "
+                    "flux=(Gamma={gamma},Q={q},Upar={upar}) "
+                    "direct_state=(density={density},pressure={pressure},Er={er})",
+                    gamma=gamma_bad, q=q_bad, upar=upar_bad,
+                    density=direct_density_bad, pressure=direct_pressure_bad,
+                    er=direct_er_bad,
+                )
+                return None
+
+            jax.lax.cond(
+                (gamma_bad + q_bad + upar_bad + direct_density_bad
+                 + direct_pressure_bad + direct_er_bad) > 0,
+                _report_bad_assembly_boundary,
+                lambda _: None,
+                operand=None,
+            )
+        flux_working_state_bar = flux_state_pullback(working_state, flux_bar)
+        if flux_working_state_bar is None:
+            return None
+        total_working_state_bar = jax.tree_util.tree_map(
+            lambda direct, flux: direct + flux,
+            direct_working_state_bar,
+            flux_working_state_bar,
+        )
+        return self._prepare_working_state_pullback(state, total_working_state_bar)
+
+    def pullback_direct_rhs_database_table_payload(
+        self,
+        t,
+        state,
+        runtime,
+        rhs_bar,
+        support,
+        *,
+        _prepared=None,
+        interpolation_transpose_mode=None,
+    ):
+        """Return only the explicit fixed-database table bar for a direct RHS.
+
+        This is intentionally narrower than
+        :meth:`pullback_direct_rhs_support_payload`: it owns the exact
+        equation-to-flux contraction and the compact database interpolation
+        transpose, but never forms the geometry VJP.  The database segmented
+        reverse uses this as its table boundary; separate local flux and
+        equation geometry contractions own the complementary contributions.
+        """
+        if not isinstance(support, dict) or set(support) != {"geometry", "database"}:
+            raise ValueError(
+                "Database table-only direct-RHS pullback requires exactly "
+                "{'geometry', 'database'} support."
+            )
+        active_shared_flux_model = (
+            self._flux_model_with_realtime_support_payload(self.shared_flux_model, support)
+            if _prepared is None else _prepared.active_flux_model
+        )
+        interpolation_transpose_mode = (
+            _validate_database_interpolation_transpose_mode(
+                interpolation_transpose_mode
+            )
+        )
+        table_pullback = _database_interpolation_pullback(
+            active_shared_flux_model,
+            interpolation_transpose_mode,
+            face=False,
+        )
+        if _prepared is None:
+            working_state, _ = self._prepare_working_state(state)
+            shared_fluxes = active_shared_flux_model(working_state)
+        else:
+            working_state = _prepared.working_state
+            shared_fluxes = _prepared.center_fluxes
+        # Minimal algebra fixtures and third-party equation owners may expose
+        # the compact centre transpose without concrete density/temperature
+        # equation objects.  Preserve that established table-only contract;
+        # real database transport systems always take the complete branch.
+        if (
+            not hasattr(self, "equations")
+            or not hasattr(self, "density_equation")
+            or not hasattr(self, "temperature_equation")
+        ):
+            flux_bar = self.pullback_shared_fluxes(state, shared_fluxes, rhs_bar)
+            table_support_bar = table_pullback(working_state, flux_bar, support)
+            support_bar = dict(_float_delta_tree_like(support))
+            support_bar["database"] = _sanitize_float_delta_bar_tree(
+                support["database"], table_support_bar["database"]
+            )
+            return support_bar
+        fixed_flux_payloads = (
+            self._capture_database_primal_fixed_flux_payloads(working_state, shared_fluxes)
+            if _prepared is None else _prepared.fixed_flux_payloads
+        )
+        center_flux_bar, density_faces_bar, temperature_faces_bar = (
+            self._pullback_database_fixed_flux_payloads(
+                working_state, None, state, rhs_bar, fixed_flux_payloads
+            )
+            if _prepared is None else _prepared.flux_bars
+        )
+        table_support_bar = table_pullback(working_state, center_flux_bar, support)
+        face_database_bar = self._pullback_database_primal_face_table_bars(
+            working_state,
+            fixed_flux_payloads["center"],
+            support,
+            density_faces_bar,
+            temperature_faces_bar,
+            interpolation_transpose_mode=interpolation_transpose_mode,
+        )
+        if not isinstance(table_support_bar, dict) or "database" not in table_support_bar:
+            raise ValueError(
+                "Database table-only direct-RHS pullback did not return a database bar."
+            )
+        support_bar = dict(_float_delta_tree_like(support))
+        support_bar["database"] = _sanitize_float_delta_bar_tree(
+            support["database"],
+            jax.tree_util.tree_map(
+                lambda center_bar, face_bar: center_bar + face_bar,
+                table_support_bar["database"],
+                face_database_bar,
+            ),
+        )
+        return support_bar
+
+    def pullback_direct_rhs_database_table_payload_batched(
+        self,
+        t,
+        state,
+        runtime,
+        rhs_bar,
+        support,
+        *,
+        interpolation_transpose_mode=None,
+    ):
+        """Batch objective rows through the fixed-table RHS transpose."""
+        if not isinstance(support, dict) or set(support) != {"geometry", "database"}:
+            raise ValueError(
+                "Batched database table RHS pullback requires exactly "
+                "{'geometry', 'database'} support."
+            )
+        active_shared_flux_model = self._flux_model_with_realtime_support_payload(
+            self.shared_flux_model, support
+        )
+        interpolation_transpose_mode = (
+            _validate_database_interpolation_transpose_mode(
+                interpolation_transpose_mode
+            )
+        )
+        table_pullback = _database_interpolation_pullback(
+            active_shared_flux_model,
+            interpolation_transpose_mode,
+            face=False,
+        )
+        working_state, _ = self._prepare_working_state(state)
+        shared_fluxes = active_shared_flux_model(working_state)
+        if (
+            not hasattr(self, "equations")
+            or not hasattr(self, "density_equation")
+            or not hasattr(self, "temperature_equation")
+        ):
+            flux_bar = jax.vmap(
+                lambda one_rhs_bar: self.pullback_shared_fluxes(
+                    state, shared_fluxes, one_rhs_bar
+                )
+            )(rhs_bar)
+            return table_pullback(working_state, flux_bar, support)
+        fixed_flux_payloads = self._capture_database_primal_fixed_flux_payloads(
+            working_state, shared_fluxes
+        )
+        center_flux_bar, density_faces_bar, temperature_faces_bar = jax.vmap(
+            lambda one_rhs_bar: self._pullback_database_fixed_flux_payloads(
+                working_state, None, state, one_rhs_bar, fixed_flux_payloads
+            )
+        )(rhs_bar)
+        table_support_bar = table_pullback(working_state, center_flux_bar, support)
+        face_database_bar = self._pullback_database_primal_face_table_bars(
+            working_state,
+            fixed_flux_payloads["center"],
+            support,
+            density_faces_bar,
+            temperature_faces_bar,
+            interpolation_transpose_mode=interpolation_transpose_mode,
+        )
+        if not isinstance(table_support_bar, dict) or "database" not in table_support_bar:
+            raise ValueError(
+                "Batched database table RHS pullback did not return a database bar."
+            )
+        table_support_bar = dict(table_support_bar)
+        table_support_bar["database"] = _sanitize_float_delta_bar_tree(
+            support["database"],
+            jax.tree_util.tree_map(
+                lambda center_bar, face_bar: center_bar + face_bar,
+                table_support_bar["database"],
+                face_database_bar,
+            ),
+        )
+        return table_support_bar
+
+    def pullback_direct_rhs_database_flux_geometry_payload(
+        self, t, state, runtime, rhs_bar, support, *, _prepared=None,
+        center_geometry_mode=None,
+    ):
+        """Return the direct *flux-model* geometry bar of a fixed database RHS.
+
+        This is deliberately complementary to
+        :meth:`pullback_direct_rhs_database_table_payload`: the latter owns
+        the D11/D13/D33 cotangent that will cross the recorded scan boundary,
+        while this method owns the local dependence of the fixed-table flux
+        algebra on transport geometry.  It neither rebuilds nor transposes a
+        scan and it keeps the database table fixed.
+
+        The equation-assembly geometry term (finite-volume metrics and
+        volume factors outside the flux model) remains a separate boundary.
+        Keeping that distinction explicit prevents a later segment kernel
+        from silently treating this compact flux bar as the complete RHS
+        geometry transpose.
+        """
+        del t, runtime
+        center_geometry_mode = _validate_database_center_geometry_mode(center_geometry_mode)
+        if not isinstance(support, dict) or set(support) != {"geometry", "database"}:
+            raise ValueError(
+                "Database direct-flux geometry pullback requires exactly "
+                "{'geometry', 'database'} support."
+            )
+        active_shared_flux_model = (
+            self._flux_model_with_realtime_support_payload(self.shared_flux_model, support)
+            if _prepared is None else _prepared.active_flux_model
+        )
+        geometry_pullback = getattr(
+            active_shared_flux_model,
+            "pullback_direct_rhs_geometry_by_radius",
+            None,
+        )
+        if not callable(geometry_pullback):
+            raise NotImplementedError(
+                "Database direct-flux geometry pullback requires the compact "
+                "fixed-table geometry transpose."
+        )
+        geometry_kwargs = _database_center_geometry_pullback_kwargs(
+            geometry_pullback, center_geometry_mode
+        )
+        if _prepared is None:
+            working_state, _ = self._prepare_working_state(state)
+            shared_fluxes = active_shared_flux_model(working_state)
+        else:
+            working_state = _prepared.working_state
+            shared_fluxes = _prepared.center_fluxes
+        if not hasattr(self, "equations"):
+            flux_bar = self.pullback_shared_fluxes(state, shared_fluxes, rhs_bar)
+            geometry_bar = geometry_pullback(
+                working_state, flux_bar, support["geometry"], **geometry_kwargs
+            )
+            support_bar = dict(_float_delta_tree_like(support))
+            support_bar["geometry"] = _sanitize_float_delta_bar_tree(
+                support["geometry"], geometry_bar
+            )
+            return support_bar
+        fixed_flux_payloads = (
+            self._capture_database_primal_fixed_flux_payloads(working_state, shared_fluxes)
+            if _prepared is None else _prepared.fixed_flux_payloads
+        )
+        center_flux_bar, density_faces_bar, temperature_faces_bar = (
+            self._pullback_database_fixed_flux_payloads(
+                working_state, None, state, rhs_bar, fixed_flux_payloads
+            )
+            if _prepared is None else _prepared.flux_bars
+        )
+        geometry_bar = geometry_pullback(
+            working_state,
+            center_flux_bar,
+            support["geometry"],
+            **geometry_kwargs,
+        )
+        face_geometry_bar = self._pullback_database_primal_face_geometry_bars(
+            working_state,
+            fixed_flux_payloads["center"],
+            support,
+            density_faces_bar,
+            temperature_faces_bar,
+        )
+        geometry_bar = jax.tree_util.tree_map(
+            lambda center_bar, face_bar: center_bar + face_bar,
+            geometry_bar,
+            face_geometry_bar,
+        )
+        support_bar = dict(_float_delta_tree_like(support))
+        support_bar["geometry"] = _sanitize_float_delta_bar_tree(
+            support["geometry"], geometry_bar
+        )
+        return support_bar
+
+    def _with_database_equation_geometry_and_fixed_flux(self, geometry, flux_model):
+        """Rebuild equation assembly at ``geometry`` while holding fluxes fixed.
+
+        This is intentionally narrower than :meth:`with_geometry_payload`:
+        it changes the finite-volume/source equation objects but leaves the
+        supplied fixed-table flux model untouched.  Consequently a VJP through
+        the returned system's assembly cannot trace database interpolation or
+        the recorded NTX scan.
+        """
+        if self.config is None or self.solver_cfg is None or self.boundary_models is None:
+            raise ValueError(
+                "Database equation-geometry pullback requires equation-system "
+                "construction metadata."
+            )
+        equations = build_equation_system(
+            config=self.config,
+            species=self.species,
+            field=geometry,
+            flux_model=flux_model,
+            source_models=self.source_models,
+            solver_cfg=self.solver_cfg,
+            boundary_models=self.boundary_models,
+        )
+        return dataclasses.replace(
+            self,
+            equations=tuple(equations),
+            density_equation=next(
+                (eq for eq in equations if getattr(eq, "name", None) == "density"),
+                None,
+            ),
+            temperature_equation=next(
+                (eq for eq in equations if getattr(eq, "name", None) == "temperature"),
+                None,
+            ),
+            er_equation=next(
+                (eq for eq in equations if getattr(eq, "name", None) == "Er"), None
+            ),
+            shared_flux_model=flux_model,
+        )
+
+    def pullback_direct_rhs_database_equation_geometry_payload(
+        self, t, state, runtime, rhs_bar, support, *, _prepared=None
+    ):
+        """Transpose fixed-flux finite-volume RHS geometry without a scan VJP.
+
+        This is the equation-assembly complement to
+        :meth:`pullback_direct_rhs_database_flux_geometry_payload`.  The
+        shared database flux is evaluated once at the primal geometry and is
+        then held constant while the density, temperature, and Er equations
+        are rebuilt at a geometry perturbation.  Thus this VJP captures metric,
+        volume-factor, and source geometry terms, but cannot trace database
+        interpolation, table construction, or the NTX scan.
+        """
+        del t, runtime
+        if not isinstance(support, dict) or set(support) != {"geometry", "database"}:
+            raise ValueError(
+                "Database equation-geometry pullback requires exactly "
+                "{'geometry', 'database'} support."
+            )
+        active_shared_flux_model = (
+            self._flux_model_with_realtime_support_payload(self.shared_flux_model, support)
+            if _prepared is None else _prepared.active_flux_model
+        )
+        if active_shared_flux_model is None:
+            raise ValueError("Database equation-geometry pullback requires a shared flux model.")
+        if _prepared is None:
+            working_state, eidx = self._prepare_working_state(state)
+            shared_fluxes = active_shared_flux_model(working_state)
+        else:
+            working_state, eidx = _prepared.working_state, _prepared.eidx
+            shared_fluxes = _prepared.center_fluxes
+        has_concrete_equations = hasattr(self, "equations")
+        fixed_flux_payloads = (
+            (
+                self._capture_database_primal_fixed_flux_payloads(working_state, shared_fluxes)
+                if _prepared is None else _prepared.fixed_flux_payloads
+            )
+            if has_concrete_equations
+            else None
+        )
+        geometry = support["geometry"]
+        geometry_delta0 = _float_delta_tree_like(geometry)
+
+        def _rhs_from_equation_geometry_delta(geometry_delta):
+            # This is finite-volume/source assembly, not database-table
+            # interpolation.  Keep its geometry tangent space identical to
+            # the established Lij realtime equation VJP: the VMEC payload
+            # provides the complete mutually-consistent field derivative
+            # (mesh, volumes, and metric factors), rather than treating a_b
+            # as a substitute for the other field leaves here.
+            geometry_value = _add_float_delta_tree(geometry, geometry_delta)
+            equations_at_geometry = self._with_database_equation_geometry_and_fixed_flux(
+                geometry_value,
+                active_shared_flux_model,
+            )
+            if not has_concrete_equations:
+                return equations_at_geometry._evaluate_with_shared_fluxes_from_working_state(
+                    working_state, eidx, state, shared_fluxes
+                )
+            return equations_at_geometry._evaluate_database_fixed_fluxes_from_working_state(
+                working_state, eidx, state, fixed_flux_payloads
+            )
+
+        _, geometry_pullback = jax.vjp(
+            _rhs_from_equation_geometry_delta,
+            geometry_delta0,
+        )
+        (geometry_bar,) = geometry_pullback(rhs_bar)
+        if _database_geometry_vjp_debug_enabled() and hasattr(geometry_bar, "a_b"):
+            a_b_bar = jnp.asarray(geometry_bar.a_b)
+            face_bar = (
+                jnp.asarray(geometry_bar.r_grid_half)
+                if hasattr(geometry_bar, "r_grid_half")
+                else jnp.zeros((1,), dtype=a_b_bar.dtype)
+            )
+            face_nonfinite = jnp.logical_not(jnp.isfinite(face_bar))
+            a_b_nonfinite = jnp.logical_not(jnp.isfinite(a_b_bar))
+
+            def _print_bad_a_b(_):
+                jax.debug.print(
+                    "[database-geometry-vjp] source=equation "
+                    "a_b_nonfinite={a_b_count} r_grid_half_nonfinite={face_count} "
+                    "first_r_grid_half_index={face_index}",
+                    a_b_count=jnp.sum(a_b_nonfinite),
+                    face_count=jnp.sum(face_nonfinite),
+                    face_index=jnp.argmax(face_nonfinite),
+                )
+                return None
+
+            jax.lax.cond(
+                jnp.logical_not(jnp.any(a_b_nonfinite) | jnp.any(face_nonfinite)),
+                lambda _: None,
+                _print_bad_a_b,
+                operand=None,
+            )
+        support_bar = dict(_float_delta_tree_like(support))
+        support_bar["geometry"] = _sanitize_float_delta_bar_tree(
+            geometry,
+            geometry_bar,
+        )
+        return support_bar
+
+    def _prepare_database_direct_rhs_support(self, state, rhs_bar, support):
+        """Prepare the common part of the three built-in support contractions.
+
+        No persistent cache or new segment residual is created. Sharing here
+        removes repeated tracing of the primal closures and flux-value VJP;
+        runtime savings still depend on what XLA would already have shared.
+        """
+        if not isinstance(support, dict) or set(support) != {"geometry", "database"}:
+            raise ValueError("Database split RHS pullback requires geometry and database support.")
+        active_flux_model = self._flux_model_with_realtime_support_payload(
+            self.shared_flux_model, support
+        )
+        if not callable(getattr(active_flux_model, "pullback_direct_rhs_support_payload", None)):
+            raise NotImplementedError(
+                "Database table-only direct-RHS pullback requires a compact flux transpose."
+            )
+        working_state, eidx = self._prepare_working_state(state)
+        center_fluxes = active_flux_model(working_state)
+        fixed_flux_payloads = self._capture_database_primal_fixed_flux_payloads(
+            working_state, center_fluxes
+        )
+        # Preserve the established equation-to-flux contract (eidx=None).
+        # Equation-geometry assembly separately uses the actual prepared eidx.
+        flux_bars = self._pullback_database_fixed_flux_payloads(
+            working_state, None, state, rhs_bar, fixed_flux_payloads
+        )
+        return _DatabaseRHSSupportPreparation(
+            active_flux_model, working_state, eidx, center_fluxes,
+            fixed_flux_payloads, flux_bars,
+        )
+
+    def _prepare_database_direct_rhs_support_batched(self, state, rhs_bars, support):
+        """Prepare one database primal and matrix-RHS equation-to-flux bars.
+
+        This is the objective-batched sibling of
+        :meth:`_prepare_database_direct_rhs_support`.  Only cotangents carry
+        the leading objective axis: the active fixed-table model, working
+        state, centre fluxes, and native face closures are evaluated once.
+        The record is call-local and never becomes part of a Radau tape.
+        """
+        if not isinstance(support, dict) or set(support) != {"geometry", "database"}:
+            raise ValueError(
+                "Batched database split RHS pullback requires geometry and database support."
+            )
+        active_flux_model = self._flux_model_with_realtime_support_payload(
+            self.shared_flux_model, support
+        )
+        if not callable(
+            getattr(active_flux_model, "pullback_direct_rhs_support_payload", None)
+        ):
+            raise NotImplementedError(
+                "Batched database split RHS pullback requires a compact flux transpose."
+            )
+        working_state, eidx = self._prepare_working_state(state)
+        center_fluxes = active_flux_model(working_state)
+        fixed_flux_payloads = self._capture_database_primal_fixed_flux_payloads(
+            working_state, center_fluxes
+        )
+        flux_bars = jax.vmap(
+            lambda one_rhs_bar: self._pullback_database_fixed_flux_payloads(
+                working_state, None, state, one_rhs_bar, fixed_flux_payloads
+            )
+        )(rhs_bars)
+        return _DatabaseRHSSupportPreparation(
+            active_flux_model,
+            working_state,
+            eidx,
+            center_fluxes,
+            fixed_flux_payloads,
+            flux_bars,
+        )
+
+    def pullback_direct_rhs_database_split_support_payload(
+        self, t, state, runtime, rhs_bar, support, *,
+        support_preparation_mode=None, center_geometry_mode=None,
+        interpolation_transpose_mode=None,
+    ):
+        """Database-only split RHS transpose for a Radau reverse stage.
+
+        This is deliberately not the historic generic direct-support hook.
+        The table leaf, which is ultimately owned by the one recorded scan
+        transpose, is produced by the compact table hook.  Local fixed-table
+        geometry is carried separately beside it. The three built-in partials
+        share call-local primal values and equation-to-flux cotangents without
+        changing their compact transpose rules or any Lij dispatch.
+        ``support_preparation_mode='separate'`` retains the independent
+        partials for benchmark comparisons; omitted options keep current use.
+        """
+        if support_preparation_mode is not None:
+            support_preparation_mode = str(support_preparation_mode).strip().lower()
+            if support_preparation_mode not in {"separate", "shared"}:
+                raise ValueError(
+                    "support_preparation_mode must be 'separate', 'shared', or None; "
+                    f"got {support_preparation_mode!r}."
+                )
+        interpolation_transpose_mode = (
+            _validate_database_interpolation_transpose_mode(
+                interpolation_transpose_mode
+            )
+        )
+        geometry_kwargs = _database_center_geometry_pullback_kwargs(
+            self.pullback_direct_rhs_database_flux_geometry_payload, center_geometry_mode
+        )
+        boundary_names = (
+            "pullback_direct_rhs_database_table_payload",
+            "pullback_direct_rhs_database_flux_geometry_payload",
+            "pullback_direct_rhs_database_equation_geometry_payload",
+        )
+        # Third-party overrides keep the original public dispatch/signature;
+        # partial algebra fixtures also retain their established fallback.
+        share_preparation = support_preparation_mode != "separate" and all(
+            hasattr(self, name) for name in ("equations", "density_equation", "temperature_equation")
+        ) and all(
+            getattr(getattr(self, name), "__func__", None)
+            is getattr(ComposedEquationSystem, name)
+            for name in boundary_names
+        )
+        preparation_kwargs = (
+            {"_prepared": self._prepare_database_direct_rhs_support(state, rhs_bar, support)}
+            if share_preparation else {}
+        )
+        table_kwargs = dict(preparation_kwargs)
+        if interpolation_transpose_mode == "legacy_sparse":
+            table_kwargs["interpolation_transpose_mode"] = (
+                interpolation_transpose_mode
+            )
+        table_support_bar = self.pullback_direct_rhs_database_table_payload(
+            t,
+            state,
+            runtime,
+            rhs_bar,
+            support,
+            **table_kwargs,
+        )
+        flux_geometry_bar = self.pullback_direct_rhs_database_flux_geometry_payload(
+            t, state, runtime, rhs_bar, support, **preparation_kwargs, **geometry_kwargs
+        )
+        equation_geometry_bar = (
+            self.pullback_direct_rhs_database_equation_geometry_payload(
+                t, state, runtime, rhs_bar, support, **preparation_kwargs
+            )
+        )
+        if not all(
+            isinstance(value, dict) and "geometry" in value
+            for value in (table_support_bar, flux_geometry_bar, equation_geometry_bar)
+        ):
+            raise ValueError("Database split RHS transpose returned an invalid support bar.")
+        result = dict(_float_delta_tree_like(support))
+        result["database"] = table_support_bar["database"]
+        result["geometry"] = jax.tree_util.tree_map(
+            lambda flux_bar, equation_bar: flux_bar + equation_bar,
+            flux_geometry_bar["geometry"],
+            equation_geometry_bar["geometry"],
+        )
+        return result
+
+    def pullback_direct_rhs_database_split_support_payload_batched(
+        self,
+        t,
+        state,
+        runtime,
+        rhs_bar,
+        support,
+        *,
+        support_preparation_mode=None,
+        center_geometry_mode=None,
+        interpolation_transpose_mode=None,
+    ):
+        """Matrix-RHS version of the explicit fixed-database support split.
+
+        The database table/coordinate transpose consumes all objective rows
+        together. Local flux geometry consumes the matrix cotangent directly;
+        fixed-flux equation geometry batches only its established scalar
+        pullback application. Both share the same centre and face primal
+        preparation. This is intentionally a separate opt-in hook;
+        the scalar split API and every Lij/root caller remain unchanged.
+        """
+        if support_preparation_mode is not None:
+            support_preparation_mode = str(support_preparation_mode).strip().lower()
+            if support_preparation_mode not in {"separate", "shared"}:
+                raise ValueError(
+                    "support_preparation_mode must be 'separate', 'shared', or None; "
+                    f"got {support_preparation_mode!r}."
+                )
+        center_geometry_mode = _validate_database_center_geometry_mode(
+            center_geometry_mode
+        )
+        interpolation_transpose_mode = (
+            _validate_database_interpolation_transpose_mode(
+                interpolation_transpose_mode
+            )
+        )
+        if not isinstance(support, dict) or set(support) != {"geometry", "database"}:
+            raise ValueError(
+                "Batched database split RHS pullback requires exactly "
+                "{'geometry', 'database'} support."
+            )
+
+        boundary_names = (
+            "pullback_direct_rhs_database_table_payload",
+            "pullback_direct_rhs_database_flux_geometry_payload",
+            "pullback_direct_rhs_database_equation_geometry_payload",
+        )
+        use_shared_builtin = (
+            support_preparation_mode != "separate"
+            and all(
+                hasattr(self, name)
+                for name in ("equations", "density_equation", "temperature_equation")
+            )
+            and all(
+                getattr(getattr(self, name), "__func__", None)
+                is getattr(ComposedEquationSystem, name)
+                for name in boundary_names
+            )
+        )
+        if not use_shared_builtin:
+            return jax.vmap(
+                lambda one_rhs_bar: self.pullback_direct_rhs_database_split_support_payload(
+                    t,
+                    state,
+                    runtime,
+                    one_rhs_bar,
+                    support,
+                    support_preparation_mode=support_preparation_mode,
+                    center_geometry_mode=center_geometry_mode,
+                    interpolation_transpose_mode=interpolation_transpose_mode,
+                )
+            )(rhs_bar)
+
+        prepared = self._prepare_database_direct_rhs_support_batched(
+            state, rhs_bar, support
+        )
+        table_kwargs = {"_prepared": prepared}
+        if interpolation_transpose_mode == "legacy_sparse":
+            table_kwargs["interpolation_transpose_mode"] = (
+                interpolation_transpose_mode
+            )
+        table_support_bar = self.pullback_direct_rhs_database_table_payload(
+            t,
+            state,
+            runtime,
+            rhs_bar,
+            support,
+            **table_kwargs,
+        )
+        geometry_kwargs = _database_center_geometry_pullback_kwargs(
+            self.pullback_direct_rhs_database_flux_geometry_payload,
+            center_geometry_mode,
+        )
+
+        # The compact centre and native-face geometry primitives already
+        # understand a leading objective axis. Invoke them once so their
+        # physical-mesh JVP and face primal closures are not rebuilt per row.
+        flux_geometry_bar = self.pullback_direct_rhs_database_flux_geometry_payload(
+            t,
+            state,
+            runtime,
+            rhs_bar,
+            support,
+            _prepared=prepared,
+            **geometry_kwargs,
+        )
+
+        # Equation geometry is a fixed-flux linear pullback. Keep its proven
+        # scalar boundary and batch only the cotangent applications; all
+        # database/centre/face primal values still come from ``prepared``.
+        equation_geometry_bar = jax.vmap(
+            lambda one_rhs_bar: self.pullback_direct_rhs_database_equation_geometry_payload(
+                t,
+                state,
+                runtime,
+                one_rhs_bar,
+                support,
+                _prepared=prepared,
+            )["geometry"]
+        )(rhs_bar)
+        geometry_bar = jax.tree_util.tree_map(
+            lambda flux_bar, equation_bar: flux_bar + equation_bar,
+            flux_geometry_bar["geometry"],
+            equation_geometry_bar,
+        )
+        return {
+            "database": table_support_bar["database"],
+            "geometry": geometry_bar,
+        }
+
+    def pullback_direct_rhs_support_payload(
+        self, t, state, runtime, rhs_bar, support, *, center_geometry_mode=None
+    ):
+        """Generic black-box RHS transpose with respect to realtime support.
+
+        Specific models may replace their support reconstruction behind the
+        same capability.  This equation-level fallback preserves arbitrary
+        composite fluxes and includes the direct geometry terms from transport
+        equation assembly.
+        """
+        is_exact_ntx_support = isinstance(support, dict) and "ntx_support" in support
+        is_recorded_database_support = isinstance(support, dict) and "database" in support
+        center_geometry_mode = _validate_database_center_geometry_mode(center_geometry_mode)
+        if center_geometry_mode is not None and not is_recorded_database_support:
+            raise ValueError("center_geometry_mode requires a recorded database support payload.")
+        # Bind the live payload once before taking any black-box boundary.
+        # The runtime-scan model otherwise still owns its construction-time
+        # database, while the support tree owns the recorded primal that must
+        # be used consistently by the table, flux-geometry, and outer-RHS
+        # transposes below.
+        active_shared_flux_model = self._flux_model_with_realtime_support_payload(
+            self.shared_flux_model, support
+        )
+        exact_pullback = getattr(
+            active_shared_flux_model, "pullback_direct_rhs_support_payload", None
+        )
+        if (
+            callable(exact_pullback)
+            and isinstance(support, dict)
+            and "geometry" in support
+            and (is_exact_ntx_support or is_recorded_database_support)
+        ):
+            working_state, _ = self._prepare_working_state(state)
+            shared_fluxes = active_shared_flux_model(working_state)
+            flux_bar = self.pullback_shared_fluxes(state, shared_fluxes, rhs_bar)
+            owner_support = (
+                support["ntx_support"] if is_exact_ntx_support else support
+            )
+            owner_support_bar = exact_pullback(
+                working_state, flux_bar, owner_support
+            )
+            if is_recorded_database_support:
+                # The scan remains the sole table-to-VMEC boundary, but a
+                # fixed database flux still has *local* transport-geometry
+                # dependence.  Keep that direct geometry bar separate from
+                # the table bar: the former goes straight to the ordinary
+                # geometry payload transpose; only the latter crosses the
+                # recorded scan after the complete sweep.
+                if not isinstance(owner_support_bar, dict) or "database" not in owner_support_bar:
+                    raise ValueError(
+                        "Recorded database direct-RHS pullback must return "
+                        "a mapping containing the database table bar."
+                    )
+                flux_geometry_bar = self.pullback_direct_rhs_database_flux_geometry_payload(
+                    t, state, runtime, rhs_bar, support,
+                    **_database_center_geometry_pullback_kwargs(
+                        self.pullback_direct_rhs_database_flux_geometry_payload,
+                        center_geometry_mode,
+                    ),
+                )
+                equation_geometry_bar = (
+                    self.pullback_direct_rhs_database_equation_geometry_payload(
+                        t, state, runtime, rhs_bar, support
+                    )
+                )
+                support_bar = dict(_float_delta_tree_like(support))
+                support_bar["geometry"] = jax.tree_util.tree_map(
+                    lambda flux_bar, equation_bar: flux_bar + equation_bar,
+                    flux_geometry_bar["geometry"],
+                    equation_geometry_bar["geometry"],
+                )
+                support_bar["database"] = _sanitize_float_delta_bar_tree(
+                    support["database"], owner_support_bar["database"]
+                )
+                return support_bar
+            geometry = support["geometry"]
+            geometry_delta0 = _float_delta_tree_like(geometry)
+
+            def _rhs_from_geometry_delta(geometry_delta):
+                return self.with_realtime_geometry_support_payload(
+                    {
+                        "geometry": _add_float_delta_tree(geometry, geometry_delta),
+                        "ntx_support": support["ntx_support"],
+                    }
+                )(t, state, runtime)
+
+            _, geometry_pullback = jax.vjp(
+                _rhs_from_geometry_delta,
+                geometry_delta0,
+            )
+            (geometry_bar,) = geometry_pullback(rhs_bar)
+            return {
+                "geometry": _sanitize_float_delta_bar_tree(geometry, geometry_bar),
+                "ntx_support": _sanitize_float_delta_bar_tree(
+                    support["ntx_support"], owner_support_bar
+                ),
+            }
+
+        if center_geometry_mode is not None:
+            raise TypeError(
+                "Explicit center_geometry_mode requires the database direct-support hook."
+            )
+        support_delta0 = _float_delta_tree_like(support)
+        _, support_pullback = jax.vjp(
+            lambda support_delta: self.with_realtime_geometry_support_payload(
+                _add_float_delta_tree(support, support_delta)
+            )(t, state, runtime),
+            support_delta0,
+        )
+        (support_bar,) = support_pullback(rhs_bar)
+        return _sanitize_float_delta_bar_tree(support, support_bar)
 
     def _prepare_working_state(self, state):
         working_state = state
@@ -1264,6 +3018,7 @@ class ComposedEquationSystem:
             working_state,
             self.temperature_active_mask,
             self.fixed_temperature_profile,
+            density_floor=self.density_floor,
         )
         working_state = apply_transport_temperature_floor(
             working_state,
@@ -1284,22 +3039,3163 @@ class ComposedEquationSystem:
             er_eq = next((eq for eq in self.equations if getattr(eq, "name", None) == "Er"), None)
         return density_eq, temperature_eq, er_eq
 
+    def _capture_database_primal_fixed_flux_payloads(
+        self, working_state, center_fluxes
+    ):
+        """Capture the exact database face values selected by each equation.
+
+        This is preparation for the database reverse boundary only.  It is not
+        called by the forward solve and is intentionally separate for density
+        and temperature: their face closures may have different reconstruction
+        policies.  The returned raw face mappings must later receive their own
+        table and local-geometry cotangents; the completed payloads are solely
+        the fixed values supplied to finite-volume equation assembly.
+        """
+        density_eq, temperature_eq, _ = self._resolve_equations()
+
+        def _payload_for_density():
+            if density_eq is None or not density_eq._use_model_face_particle_fluxes():
+                return dict(center_fluxes), None
+            if _flux_has_key(center_fluxes, "Gamma_faces"):
+                return dict(center_fluxes), None
+            if density_eq.face_flux_builder is None:
+                raise ValueError("Database density face closure requires a face flux builder.")
+            raw_faces = density_eq.face_flux_builder(
+                working_state, center_fluxes=center_fluxes
+            )
+            return _database_fixed_flux_payload_with_faces(center_fluxes, raw_faces), raw_faces
+
+        def _payload_for_temperature():
+            if temperature_eq is None:
+                return dict(center_fluxes), None
+            needs_faces = (
+                temperature_eq._use_model_face_heat_fluxes()
+                or temperature_eq._use_model_face_particle_fluxes()
+                or temperature_eq._use_face_completed_work_term()
+            )
+            if not needs_faces or (
+                _flux_has_key(center_fluxes, "Q_faces")
+                or _flux_has_key(center_fluxes, "Gamma_faces")
+            ):
+                return dict(center_fluxes), None
+            if temperature_eq.face_flux_builder is None:
+                raise ValueError("Database temperature face closure requires a face flux builder.")
+            raw_faces = temperature_eq.face_flux_builder(
+                working_state, center_fluxes=center_fluxes
+            )
+            return _database_fixed_flux_payload_with_faces(center_fluxes, raw_faces), raw_faces
+
+        density_payload, density_faces = _payload_for_density()
+        temperature_payload, temperature_faces = _payload_for_temperature()
+        return {
+            "center": dict(center_fluxes),
+            "density": density_payload,
+            "temperature": temperature_payload,
+            "density_faces": density_faces,
+            "temperature_faces": temperature_faces,
+        }
+
+    def _evaluate_database_fixed_fluxes_from_working_state(
+        self, working_state, eidx, state_reference, fixed_flux_payloads, *, er_edge_override=None
+    ):
+        """Evaluate database equations with captured centre-and-face values.
+
+        Unlike the general shared-flux evaluator, this database-only method
+        gives density and temperature their separately captured primal face
+        payloads.  Therefore a geometry VJP through finite-volume assembly
+        cannot call ``evaluate_face_fluxes`` again at perturbed geometry.
+        """
+        from ._state import TransportState
+
+        density_eq, temperature_eq, er_eq = self._resolve_equations()
+        density_fluxes = fixed_flux_payloads["density"]
+        temperature_fluxes = fixed_flux_payloads["temperature"]
+        center_fluxes = fixed_flux_payloads["center"]
+        density_rhs = (
+            density_eq(working_state, fluxes=density_fluxes)
+            if density_eq is not None
+            else jnp.zeros_like(state_reference.density)
+        )
+        pressure_rhs = (
+            temperature_eq(working_state, fluxes=temperature_fluxes)
+            if temperature_eq is not None
+            else jnp.zeros_like(state_reference.pressure)
+        )
+        Er_rhs = (
+            er_eq(working_state, fluxes=center_fluxes, er_edge_override=er_edge_override)
+            if er_eq is not None
+            else jnp.zeros_like(state_reference.Er)
+        )
+        density_rhs = _expand_density_rhs_to_full_shape(
+            density_rhs, state_reference.density, self.species
+        )
+        if eidx is not None:
+            density_rhs = density_rhs.at[int(eidx), :].set(
+                jnp.zeros_like(density_rhs[int(eidx), :])
+            )
+        if density_eq is not None and hasattr(density_eq, "enforce_dirichlet_boundary_rhs"):
+            density_rhs = density_eq.enforce_dirichlet_boundary_rhs(working_state, density_rhs)
+        if temperature_eq is not None and hasattr(temperature_eq, "enforce_dirichlet_boundary_rhs"):
+            pressure_rhs = temperature_eq.enforce_dirichlet_boundary_rhs(
+                working_state, density_rhs, pressure_rhs
+            )
+        if er_eq is not None and hasattr(er_eq, "enforce_dirichlet_boundary_rhs"):
+            Er_rhs = er_eq.enforce_dirichlet_boundary_rhs(working_state, Er_rhs)
+        return TransportState(density=density_rhs, pressure=pressure_rhs, Er=Er_rhs)
+
+    def _pullback_database_fixed_flux_payloads(
+        self, working_state, eidx, state_reference, rhs_bar, fixed_flux_payloads
+    ):
+        """Split RHS cotangents into centre, density-face, and temperature-face bars.
+
+        This remains entirely below the recorded-scan boundary.  In
+        particular, it does not call a scan transpose or reconstruct a face
+        flux.  The two raw face bars are intentionally retained separately:
+        they correspond to two forward equation closures and must both be
+        folded into the database table bar in the next boundary step.
+        """
+        center0 = fixed_flux_payloads["center"]
+        density_faces0 = fixed_flux_payloads["density_faces"]
+        temperature_faces0 = fixed_flux_payloads["temperature_faces"]
+        density_has_faces = density_faces0 is not None
+        temperature_has_faces = temperature_faces0 is not None
+        density_input0 = {} if density_faces0 is None else density_faces0
+        temperature_input0 = {} if temperature_faces0 is None else temperature_faces0
+
+        def _rhs_from_flux_values(center_fluxes, density_faces, temperature_faces):
+            payloads = {
+                "center": center_fluxes,
+                "density": (
+                    _database_fixed_flux_payload_with_faces(center_fluxes, density_faces)
+                    if density_has_faces else dict(center_fluxes)
+                ),
+                "temperature": (
+                    _database_fixed_flux_payload_with_faces(center_fluxes, temperature_faces)
+                    if temperature_has_faces else dict(center_fluxes)
+                ),
+            }
+            return self._evaluate_database_fixed_fluxes_from_working_state(
+                working_state, eidx, state_reference, payloads
+            )
+
+        _, pullback = jax.vjp(
+            _rhs_from_flux_values, center0, density_input0, temperature_input0
+        )
+        return pullback(rhs_bar)
+
+    def _pullback_database_fixed_flux_rhs_state(
+        self, working_state, eidx, state_reference, rhs_bar, fixed_flux_payloads
+    ):
+        """Transpose equation assembly while all captured database fluxes are fixed.
+
+        The direct database Radau boundary must not re-enter a face flux
+        closure while differentiating finite-volume equation assembly.  Face
+        closures query the database at a distinct physical mesh and therefore
+        have their own compact state/table/geometry boundaries.  This helper
+        owns only the complementary equation-state partial: sources, work
+        terms, boundary rules, quasi-neutral working-state algebra, and the
+        finite-volume map with its centre and face flux inputs held fixed.
+
+        The caller is responsible for adding the centre and face flux-model
+        state partials.  Keeping those ownership boundaries explicit avoids a
+        generic VJP through a database face interpolation graph.
+        """
+        _, pullback = jax.vjp(
+            lambda working_state_value: self._evaluate_database_fixed_fluxes_from_working_state(
+                working_state_value,
+                eidx,
+                state_reference,
+                fixed_flux_payloads,
+            ),
+            working_state,
+        )
+        (working_state_bar,) = pullback(rhs_bar)
+        return working_state_bar
+
+    def _pullback_database_primal_face_state_bars(
+        self, working_state, center_fluxes, density_faces_bar, temperature_faces_bar
+    ):
+        """Return the compact state bar of the two captured native face maps.
+
+        Density and temperature may select different face closures.  They
+        therefore retain their own cotangent and must each call their own
+        model-only state boundary; combining them before this point would
+        silently differentiate one equation through the other's closure.
+        """
+        density_eq, temperature_eq, _ = self._resolve_equations()
+        zero_state_bar = jax.tree_util.tree_map(jnp.zeros_like, working_state)
+
+        def _one_face_state_bar(equation, face_bar, equation_name):
+            if not face_bar:
+                return zero_state_bar
+            pullback = getattr(
+                getattr(equation, "face_flux_builder", None),
+                "database_state_pullback",
+                None,
+            )
+            if callable(pullback):
+                return pullback(working_state, center_fluxes, face_bar)
+            if hasattr(self, "equations"):
+                raise NotImplementedError(
+                    f"Database {equation_name} face closure lacks the required "
+                    "compact state transpose."
+                )
+            return zero_state_bar
+
+        density_state_bar = _one_face_state_bar(
+            density_eq, density_faces_bar, "density"
+        ) if density_eq is not None else zero_state_bar
+        temperature_state_bar = _one_face_state_bar(
+            temperature_eq, temperature_faces_bar, "temperature"
+        ) if temperature_eq is not None else zero_state_bar
+        return jax.tree_util.tree_map(
+            lambda density_bar, temperature_bar: density_bar + temperature_bar,
+            density_state_bar,
+            temperature_state_bar,
+        )
+
+    def _pullback_database_primal_face_table_bars(
+        self,
+        working_state,
+        center_fluxes,
+        support,
+        density_faces_bar,
+        temperature_faces_bar,
+        *,
+        interpolation_transpose_mode=None,
+    ):
+        """Fold captured equation-face bars into fixed database-table bars.
+
+        Rebinding changes only the explicit ``database`` leaf.  Thus this is
+        a table interpolation VJP, not a scan VJP: the retained scan owner is
+        still invoked once later, after every segment has accumulated its
+        complete table cotangent.
+        """
+        if not isinstance(support, dict) or set(support) != {"geometry", "database"}:
+            raise ValueError("Database face-table pullback requires geometry and database support.")
+        interpolation_transpose_mode = (
+            _validate_database_interpolation_transpose_mode(
+                interpolation_transpose_mode
+            )
+        )
+        database = support["database"]
+        database_delta0 = _float_delta_tree_like(database)
+
+        def _one_equation_face_bar(equation_name, face_bar):
+            if not face_bar:
+                return _float_delta_tree_like(database)
+
+            # Production database equations expose an explicit sparse face
+            # table transpose.  Do not replace it with a generic VJP: that
+            # would retain the full database interpolation graph per face
+            # closure and defeats the whole segmented-memory boundary.
+            equations_at_primal = self.with_realtime_geometry_support_payload(support)
+            equation_at_primal = getattr(
+                equations_at_primal, f"{equation_name}_equation"
+            )
+            compact_pullback = getattr(
+                getattr(equation_at_primal, "face_flux_builder", None),
+                "database_table_pullback",
+                None,
+            )
+            if callable(compact_pullback):
+                pullback_kwargs = (
+                    {"interpolation_transpose_mode": interpolation_transpose_mode}
+                    if interpolation_transpose_mode == "legacy_sparse"
+                    else {}
+                )
+                support_bar = compact_pullback(
+                    working_state,
+                    center_fluxes,
+                    face_bar,
+                    support,
+                    **pullback_kwargs,
+                )
+                if not isinstance(support_bar, dict) or "database" not in support_bar:
+                    raise ValueError("Compact database face transpose did not return a table bar.")
+                return support_bar["database"]
+
+            # A concrete transport system must never silently take the dense
+            # fallback below.  Its complete VJP captures the full face
+            # database-interpolation graph and was precisely the source of
+            # the high host-memory use and segment GPU OOM.  Retain that
+            # fallback solely for deliberately minimal algebra fixtures.
+            if hasattr(self, "equations"):
+                raise NotImplementedError(
+                    f"Database {equation_name} face closure lacks the required "
+                    "compact native table transpose."
+                )
+
+            def _face_fluxes_from_database_delta(database_delta):
+                payload = {
+                    "geometry": support["geometry"],
+                    "database": _add_float_delta_tree(database, database_delta),
+                }
+                equations_at_database = self.with_realtime_geometry_support_payload(payload)
+                equation = getattr(equations_at_database, f"{equation_name}_equation")
+                if equation is None or equation.face_flux_builder is None:
+                    raise ValueError(
+                        f"Database {equation_name} face-table pullback requires a face flux builder."
+                    )
+                return equation.face_flux_builder(
+                    working_state, center_fluxes=center_fluxes
+                )
+
+            face_output, pullback = jax.vjp(
+                _face_fluxes_from_database_delta, database_delta0
+            )
+            normalized_bar = {
+                name: face_bar.get(name, jnp.zeros_like(value))
+                for name, value in face_output.items()
+            }
+            example_output = next(iter(face_output.values()))
+            example_bar = next(iter(normalized_bar.values()))
+            batched = jnp.asarray(example_bar).ndim == jnp.asarray(example_output).ndim + 1
+            if batched:
+                return jax.vmap(lambda one_bar: pullback(one_bar)[0])(normalized_bar)
+            return pullback(normalized_bar)[0]
+
+        density_database_bar = _one_equation_face_bar("density", density_faces_bar)
+        temperature_database_bar = _one_equation_face_bar(
+            "temperature", temperature_faces_bar
+        )
+        return jax.tree_util.tree_map(
+            lambda density_bar, temperature_bar: density_bar + temperature_bar,
+            density_database_bar,
+            temperature_database_bar,
+        )
+
+    def _pullback_database_primal_face_geometry_bars(
+        self, working_state, center_fluxes, support, density_faces_bar, temperature_faces_bar
+    ):
+        """Transpose native database face fluxes to local transport geometry.
+
+        The database values are fixed, but their scale metadata must co-move
+        with ``a_b`` just as in the existing direct-centre database geometry
+        rule.  The same model-local boundary also retains any turbulent or
+        classical face-flux geometry partial evaluated by the forward
+        composite.  This is still entirely local: no table bar or scan VJP is
+        formed here.
+        """
+        if not isinstance(support, dict) or set(support) != {"geometry", "database"}:
+            raise ValueError("Database face-geometry pullback requires geometry and database support.")
+        geometry = support["geometry"]
+        geometry_delta0 = _float_delta_tree_like(geometry)
+        geometry_leaves, geometry_treedef = jax.tree_util.tree_flatten(geometry_delta0)
+        geometry_shapes = tuple(jnp.asarray(leaf).shape for leaf in geometry_leaves)
+        geometry_sizes = tuple(int(jnp.asarray(leaf).size) for leaf in geometry_leaves)
+        geometry_flat0 = jnp.concatenate(
+            tuple(jnp.ravel(jnp.asarray(leaf)) for leaf in geometry_leaves)
+        )
+
+        def _split_geometry(flat_delta):
+            leaves = []
+            offset = 0
+            for size, shape in zip(geometry_sizes, geometry_shapes, strict=True):
+                leaves.append(jnp.reshape(
+                    flat_delta[..., offset : offset + size],
+                    flat_delta.shape[:-1] + shape,
+                ))
+                offset += size
+            return geometry_treedef.unflatten(leaves)
+
+        def _one_equation_face_bar(equation_name, face_bar):
+            if not face_bar:
+                return _float_delta_tree_like(geometry)
+
+            # Production closures provide a model-only primitive analogous to
+            # the direct-centre database geometry transpose.  It intentionally
+            # excludes ComposedEquationSystem construction, sources, and all
+            # finite-volume assembly from every face VJP.
+            equations_at_primal = self.with_realtime_geometry_support_payload(support)
+            primal_equation = getattr(equations_at_primal, f"{equation_name}_equation")
+            compact_pullback = getattr(
+                getattr(primal_equation, "face_flux_builder", None),
+                "database_geometry_pullback", None,
+            )
+            if callable(compact_pullback):
+                return compact_pullback(
+                    working_state, center_fluxes, face_bar, support
+                )
+
+            # A real transport system must not silently revert to the dense
+            # equation-rebuild path below.  It retains equation/source graphs
+            # per face and is the source of the host-memory growth this
+            # database boundary is designed to avoid.  Keep it only for
+            # deliberately minimal algebra fixtures.
+            if hasattr(self, "equations"):
+                raise NotImplementedError(
+                    f"Database {equation_name} face closure lacks the required "
+                    "compact native geometry transpose."
+                )
+
+            equations_at_primal = self.with_realtime_geometry_support_payload(support)
+            primal_equation = getattr(equations_at_primal, f"{equation_name}_equation")
+            if primal_equation is None or primal_equation.face_flux_builder is None:
+                raise ValueError(
+                    f"Database {equation_name} face-geometry pullback requires a face flux builder."
+                )
+            primal_face_fluxes = primal_equation.face_flux_builder(
+                working_state, center_fluxes=center_fluxes
+            )
+            first_face_value = next(iter(primal_face_fluxes.values()))
+            face_count = jnp.asarray(first_face_value).shape[-1]
+            face_indices = jnp.arange(face_count, dtype=jnp.int32)
+            first_face_bar = next(iter(face_bar.values()))
+            batched = (
+                jnp.asarray(first_face_bar).ndim
+                == jnp.asarray(first_face_value).ndim + 1
+            )
+
+            # This mirrors the direct-centre database geometry rule: form a
+            # local output for one radial location, transpose that local map,
+            # and accumulate through a bounded scan.  The former whole-face
+            # VJP retained the complete face closure for every objective row
+            # at once and is not permitted in a transport segment.
+            def _local_face_fluxes(flat_delta, face_index):
+                # Native database faces include the fixed axis face.  Match
+                # the established direct-centre database primitive: that
+                # coordinate is not an independent VMEC/transport degree of
+                # freedom and must remain at the physical axis rather than
+                # probing the radial table below its first knot.
+                geometry_value = _database_geometry_with_constrained_axis_face(
+                    geometry, _split_geometry(flat_delta)
+                )
+                payload = {
+                    "geometry": geometry_value,
+                    "database": database_with_geometry_scale(
+                        support["database"], geometry_value.a_b
+                    ),
+                }
+                equations_at_geometry = self.with_realtime_geometry_support_payload(payload)
+                equation = getattr(equations_at_geometry, f"{equation_name}_equation")
+                if equation is None or equation.face_flux_builder is None:
+                    raise ValueError(
+                        f"Database {equation_name} face-geometry pullback requires a face flux builder."
+                    )
+                all_faces = equation.face_flux_builder(
+                    working_state, center_fluxes=center_fluxes
+                )
+                return jax.tree_util.tree_map(
+                    lambda value: jax.lax.dynamic_index_in_dim(
+                        value, face_index, axis=-1, keepdims=False
+                    ),
+                    all_faces,
+                )
+
+            def _accumulate(flat_carry, face_index):
+                _, pullback = jax.vjp(
+                    lambda flat_delta: _local_face_fluxes(flat_delta, face_index),
+                    geometry_flat0,
+                )
+                local_bar = {
+                    name: jax.lax.dynamic_index_in_dim(
+                        face_bar.get(name, jnp.zeros_like(value)),
+                        face_index,
+                        axis=-1,
+                        keepdims=False,
+                    )
+                    for name, value in primal_face_fluxes.items()
+                }
+                if batched:
+                    local_flat_bar = jax.vmap(
+                        lambda one_bar: pullback(one_bar)[0]
+                    )(local_bar)
+                else:
+                    (local_flat_bar,) = pullback(local_bar)
+                return flat_carry + local_flat_bar, None
+
+            flat_carry0 = (
+                jnp.zeros(
+                    (jnp.asarray(first_face_bar).shape[0],) + geometry_flat0.shape,
+                    dtype=geometry_flat0.dtype,
+                )
+                if batched
+                else jnp.zeros_like(geometry_flat0)
+            )
+            flat_geometry_bar, _ = jax.lax.scan(
+                _accumulate, flat_carry0, face_indices
+            )
+            return _split_geometry(flat_geometry_bar)
+
+        density_geometry_bar = _one_equation_face_bar("density", density_faces_bar)
+        temperature_geometry_bar = _one_equation_face_bar(
+            "temperature", temperature_faces_bar
+        )
+        return jax.tree_util.tree_map(
+            lambda density_bar, temperature_bar: density_bar + temperature_bar,
+            density_geometry_bar,
+            temperature_geometry_bar,
+        )
+
+    def _shared_flux_bc_kwargs(self):
+        density_eq, temperature_eq, er_eq = self._resolve_equations()
+        return {
+            "bc_density": getattr(density_eq, "density_bc_model", None),
+            "bc_temperature": getattr(temperature_eq, "temperature_bc_model", None),
+            "bc_er": getattr(er_eq, "er_bc_model", self.er_bc_model),
+        }
+
+    def _shared_flux_call_kwargs(self, extra_kwargs=None):
+        call_kwargs = dict(self._shared_flux_bc_kwargs())
+        if extra_kwargs:
+            call_kwargs.update(extra_kwargs)
+        return call_kwargs
+
+    @staticmethod
+    def _shared_fluxes_zero_like(shared_fluxes):
+        return jax.tree_util.tree_map(jnp.zeros_like, shared_fluxes)
+
+    @staticmethod
+    def _shared_fluxes_add(lhs, rhs):
+        def _add_leaf(a, b):
+            a_arr = jnp.asarray(a)
+            b_arr = jnp.asarray(b)
+            if a_arr.dtype == jax.dtypes.float0:
+                if b_arr.dtype == jax.dtypes.float0:
+                    return jnp.zeros(b_arr.shape, dtype=jnp.float64)
+                return b_arr
+            if b_arr.dtype == jax.dtypes.float0:
+                return a_arr
+            return a_arr + b_arr
+
+        return jax.tree_util.tree_map(_add_leaf, lhs, rhs)
+
+    def _debug_nonfinite_rhs_components(
+        self,
+        working_state,
+        shared_fluxes,
+        density_rhs,
+        pressure_rhs,
+        Er_rhs,
+    ):
+        if not self.debug_nonfinite_rhs_components:
+            return
+
+        rhs_finite = jnp.logical_and(
+            jnp.all(jnp.isfinite(density_rhs)),
+            jnp.logical_and(
+                jnp.all(jnp.isfinite(pressure_rhs)),
+                jnp.all(jnp.isfinite(Er_rhs)),
+            ),
+        )
+
+        def _print_array_stats(label, value):
+            value = jnp.asarray(value)
+            finite_mask = jnp.isfinite(value)
+            flat_bad = jnp.ravel(jnp.logical_not(finite_mask))
+            first_bad = jnp.argmax(flat_bad)
+            flat_value = jnp.ravel(value)
+            first_bad_value = flat_value[jnp.minimum(first_bad, flat_value.shape[0] - 1)]
+            jax.debug.print(
+                f"[nonfinite-rhs] {label}: finite={{finite}} min={{min:.6e}} max={{max:.6e}} "
+                f"first_bad_flat={{first_bad}} first_bad_value={{first_bad_value:.6e}}",
+                finite=jnp.all(finite_mask),
+                min=jnp.nanmin(value),
+                max=jnp.nanmax(value),
+                first_bad=first_bad,
+                first_bad_value=first_bad_value,
+            )
+
+        def _print_edge_stats(label, value):
+            value = jnp.asarray(value)
+            if value.ndim < 1:
+                return
+            _print_array_stats(f"{label}.left_edge", value[..., 0])
+            _print_array_stats(f"{label}.right_edge", value[..., -1])
+            if int(value.shape[-1]) > 1:
+                _print_array_stats(f"{label}.left_edge_1", value[..., 1])
+                _print_array_stats(f"{label}.right_edge_1", value[..., -2])
+
+        def _print_center_from_faces_stats(fluxes, key):
+            center_key = key
+            face_key = f"{key}_faces"
+            if _flux_has_key(fluxes, center_key) or not _flux_has_key(fluxes, face_key):
+                return
+            _print_array_stats(
+                f"flux.{key}_center_from_faces",
+                jax.vmap(cell_centered_from_faces)(fluxes[face_key]),
+            )
+
+        diagnostic_geometry = self._flux_model_geometry(self.shared_flux_model)
+        if diagnostic_geometry is None:
+            for equation in self.equations:
+                diagnostic_geometry = self._flux_model_geometry(getattr(equation, "flux_model", None))
+                if diagnostic_geometry is not None:
+                    break
+        evaluated_state = None
+        if diagnostic_geometry is not None:
+            evaluated_state = build_evaluated_transport_state(
+                working_state,
+                diagnostic_geometry,
+                **self._shared_flux_bc_kwargs(),
+                density_floor=self.density_floor,
+                temperature_floor=self.temperature_floor,
+            )
+
+        def _print(_):
+            _print_array_stats("state.density", working_state.density)
+            _print_array_stats("state.temperature", working_state.temperature)
+            _print_array_stats("state.pressure", working_state.pressure)
+            _print_array_stats("state.Er", working_state.Er)
+            _print_edge_stats("state.density", working_state.density)
+            _print_edge_stats("state.temperature", working_state.temperature)
+            _print_edge_stats("state.pressure", working_state.pressure)
+            _print_edge_stats("state.Er", working_state.Er)
+            if evaluated_state is not None:
+                _print_array_stats("evaluated.center.density", evaluated_state.center.density)
+                _print_array_stats("evaluated.center.temperature", evaluated_state.center.temperature)
+                _print_array_stats("evaluated.center.pressure", evaluated_state.center.pressure)
+                _print_array_stats("evaluated.center.Er", evaluated_state.center.Er)
+                _print_array_stats("evaluated.face.density", evaluated_state.face.density)
+                _print_array_stats("evaluated.face.temperature", evaluated_state.face.temperature)
+                _print_array_stats("evaluated.face.pressure", evaluated_state.face.pressure)
+                _print_array_stats("evaluated.face.Er", evaluated_state.face.Er)
+                _print_array_stats("evaluated.grad_center.density", evaluated_state.density_grad_center)
+                _print_array_stats("evaluated.grad_center.temperature", evaluated_state.temperature_grad_center)
+                _print_array_stats("evaluated.grad_center.Er", evaluated_state.Er_grad_center)
+                _print_array_stats("evaluated.grad_face.density", evaluated_state.density_grad_face)
+                _print_array_stats("evaluated.grad_face.temperature", evaluated_state.temperature_grad_face)
+                _print_array_stats("evaluated.grad_face.Er", evaluated_state.Er_grad_face)
+                _print_edge_stats("evaluated.face.density", evaluated_state.face.density)
+                _print_edge_stats("evaluated.face.temperature", evaluated_state.face.temperature)
+                _print_edge_stats("evaluated.face.pressure", evaluated_state.face.pressure)
+                _print_edge_stats("evaluated.face.Er", evaluated_state.face.Er)
+                _print_edge_stats("evaluated.grad_face.density", evaluated_state.density_grad_face)
+                _print_edge_stats("evaluated.grad_face.temperature", evaluated_state.temperature_grad_face)
+                _print_edge_stats("evaluated.grad_face.Er", evaluated_state.Er_grad_face)
+            _print_array_stats("rhs.density", density_rhs)
+            _print_array_stats("rhs.pressure", pressure_rhs)
+            _print_array_stats("rhs.Er", Er_rhs)
+            _print_edge_stats("rhs.density", density_rhs)
+            _print_edge_stats("rhs.pressure", pressure_rhs)
+            _print_edge_stats("rhs.Er", Er_rhs)
+            if isinstance(shared_fluxes, dict):
+                for key in sorted(shared_fluxes):
+                    value = shared_fluxes.get(key)
+                    if value is not None:
+                        _print_array_stats(f"flux.{key}", value)
+                        _print_edge_stats(f"flux.{key}", value)
+                for key in ("Gamma", "Q", "Upar", "Gamma_neo", "Q_neo", "Upar_neo"):
+                    _print_center_from_faces_stats(shared_fluxes, key)
+            return jnp.asarray(0, dtype=jnp.int32)
+
+        def _skip(_):
+            return jnp.asarray(0, dtype=jnp.int32)
+
+        jax.lax.cond(jnp.logical_not(rhs_finite), _print, _skip, operand=None)
+
+    def _prepare_working_state_pullback(self, state, working_state_bar):
+        def _prepared_state(state_value):
+            return self._prepare_working_state(state_value)[0]
+
+        _, prepare_pullback = jax.vjp(_prepared_state, state)
+        (state_bar,) = prepare_pullback(working_state_bar)
+        return state_bar
+
     def build_lagged_response(self, state):
-        working_state, _ = self._prepare_working_state(state)
+        working_state, eidx = self._prepare_working_state(state)
         if lagged_timing_enabled():
             jax.debug.callback(lambda: lagged_timing_start("equations.build_lagged_response"), ordered=True)
         flux_response = None
         if self.shared_flux_model is not None:
-            flux_response = self.shared_flux_model.build_lagged_response(working_state)
+            flux_response = self.shared_flux_model.build_lagged_response(
+                working_state,
+                **self._shared_flux_bc_kwargs(),
+            )
         if lagged_timing_enabled():
             jax.debug.callback(lambda: lagged_timing_end("equations.build_lagged_response"), ordered=True)
         return TransportLaggedResponse(
             flux_response=flux_response,
         )
 
+    def pullback_build_lagged_response(self, state, lagged_response_bar, **kwargs):
+        working_state, eidx = self._prepare_working_state(state)
+        flux_response_bar = None if lagged_response_bar is None else lagged_response_bar.flux_response
+        if self.shared_flux_model is None or flux_response_bar is None:
+            working_state_bar = jax.tree_util.tree_map(jnp.zeros_like, working_state)
+        else:
+            pullback_fn = getattr(self.shared_flux_model, "pullback_build_lagged_response", None)
+            if callable(pullback_fn):
+                working_state_bar = pullback_fn(
+                    working_state,
+                    flux_response_bar,
+                    **self._shared_flux_call_kwargs(kwargs),
+                )
+            else:
+                _, flux_pullback = jax.vjp(
+                    lambda working_state_value: self.shared_flux_model.build_lagged_response(
+                        working_state_value,
+                        **self._shared_flux_call_kwargs(kwargs),
+                    ),
+                    working_state,
+                )
+                (working_state_bar,) = flux_pullback(flux_response_bar)
+        return self._prepare_working_state_pullback(state, working_state_bar)
+
+    def pullback_build_lagged_response_support_payload(self, state, lagged_response_bar, support, **kwargs):
+        support, geometry = self._split_realtime_geometry_payload(support)
+        if geometry is not None:
+            support_bar = self.pullback_build_lagged_response_support_payload(
+                state,
+                lagged_response_bar,
+                support,
+                **kwargs,
+            )
+            working_state, _eidx = self._prepare_working_state(state)
+            flux_response_bar = None if lagged_response_bar is None else lagged_response_bar.flux_response
+            geometry_bar = self._direct_geometry_build_lagged_response_bar(
+                self.shared_flux_model,
+                geometry,
+                working_state,
+                flux_response_bar,
+            )
+            return self._realtime_geometry_payload_bar(
+                {"ntx_support": support, "geometry": geometry},
+                support_bar,
+                geometry_bar,
+            )
+        working_state, _eidx = self._prepare_working_state(state)
+        flux_response_bar = None if lagged_response_bar is None else lagged_response_bar.flux_response
+        if self.shared_flux_model is None or flux_response_bar is None:
+            return jax.tree_util.tree_map(jnp.zeros_like, support)
+        pullback_fn = getattr(self.shared_flux_model, "pullback_build_lagged_response_support_payload", None)
+        if callable(pullback_fn):
+            return _sanitize_float_delta_bar_tree(
+                support,
+                pullback_fn(
+                    working_state,
+                    flux_response_bar,
+                    support,
+                    **self._shared_flux_call_kwargs(kwargs),
+                ),
+            )
+        support_delta0 = _float_delta_tree_like(support)
+        _, support_delta_pullback = jax.vjp(
+            lambda support_delta: self.shared_flux_model.with_support_payload(
+                _add_float_delta_tree(support, support_delta)
+            ).build_lagged_response(
+                working_state,
+                **self._shared_flux_call_kwargs(kwargs),
+            ),
+            support_delta0,
+        )
+        (support_bar,) = support_delta_pullback(flux_response_bar)
+        return _sanitize_float_delta_bar_tree(support, support_bar)
+
+    def pullback_build_lagged_response_support_payload_batched_interpolated_faces(
+        self,
+        state,
+        lagged_response_bars,
+        support,
+        **kwargs,
+    ):
+        """Batched counterpart for the exact NTX interpolated-face support lane.
+
+        The geometry branch remains a device VJP over its already-batched
+        cotangent leaves. The NTX branch is delegated to the dedicated local
+        multi-RHS implementation rather than mapped through the scalar rule.
+        """
+        support, geometry = self._split_realtime_geometry_payload(support)
+        if geometry is not None:
+            ntx_support_bar = self.pullback_build_lagged_response_support_payload_batched_interpolated_faces(
+                state,
+                lagged_response_bars,
+                support,
+                **kwargs,
+            )
+            working_state, _eidx = self._prepare_working_state(state)
+            flux_response_bars = (
+                None if lagged_response_bars is None else lagged_response_bars.flux_response
+            )
+            if flux_response_bars is None:
+                geometry_bar = jax.tree_util.tree_map(
+                    lambda leaf: jnp.broadcast_to(
+                        jnp.zeros_like(jnp.asarray(leaf)),
+                        (0,) + jnp.asarray(leaf).shape,
+                    ),
+                    geometry,
+                )
+            else:
+                geometry_bar = jax.vmap(
+                    lambda flux_response_bar: self._direct_geometry_build_lagged_response_bar(
+                        self.shared_flux_model,
+                        geometry,
+                        working_state,
+                        flux_response_bar,
+                    )
+                )(flux_response_bars)
+            # Both bars already carry the leading objective axis. The scalar
+            # payload sanitizer deliberately restores primal-shaped non-float
+            # leaves, which would discard that axis here.
+            return {"ntx_support": ntx_support_bar, "geometry": geometry_bar}
+
+        working_state, _eidx = self._prepare_working_state(state)
+        flux_response_bars = None if lagged_response_bars is None else lagged_response_bars.flux_response
+        if self.shared_flux_model is None or flux_response_bars is None:
+            raise NotImplementedError(
+                "batched interpolated-face support pullback requires an active shared flux response."
+            )
+        pullback_fn = getattr(
+            self.shared_flux_model,
+            "pullback_build_lagged_response_support_payload_batched_interpolated_faces",
+            None,
+        )
+        if not callable(pullback_fn):
+            raise NotImplementedError(
+                "The active shared flux model does not expose the batched interpolated-face "
+                "support pullback."
+            )
+        return pullback_fn(
+            working_state,
+            flux_response_bars,
+            support,
+            **self._shared_flux_call_kwargs(kwargs),
+        )
+
+    def pullback_build_lagged_response_support_payload_batched_interpolated_faces_reuse_local_vjp_primal(
+        self, state, lagged_response_bars, support, **kwargs,
+    ):
+        """Geometry wrapper for the isolated batched/primal-reuse NTX rule."""
+        support, geometry = self._split_realtime_geometry_payload(support)
+        if geometry is not None:
+            ntx_support_bar = (
+                self.pullback_build_lagged_response_support_payload_batched_interpolated_faces_reuse_local_vjp_primal(
+                    state, lagged_response_bars, support, **kwargs,
+                )
+            )
+            working_state, _eidx = self._prepare_working_state(state)
+            flux_response_bars = None if lagged_response_bars is None else lagged_response_bars.flux_response
+            if flux_response_bars is None:
+                geometry_bar = jax.tree_util.tree_map(
+                    lambda leaf: jnp.broadcast_to(jnp.zeros_like(jnp.asarray(leaf)),
+                                                   (0,) + jnp.asarray(leaf).shape),
+                    geometry,
+                )
+            else:
+                geometry_bar = jax.vmap(
+                    lambda flux_response_bar: self._direct_geometry_build_lagged_response_bar(
+                        self.shared_flux_model, geometry, working_state, flux_response_bar,
+                    )
+                )(flux_response_bars)
+            return {"ntx_support": ntx_support_bar, "geometry": geometry_bar}
+        working_state, _eidx = self._prepare_working_state(state)
+        flux_response_bars = None if lagged_response_bars is None else lagged_response_bars.flux_response
+        if self.shared_flux_model is None or flux_response_bars is None:
+            raise NotImplementedError(
+                "batched primal-reuse interpolated-face support pullback requires an active shared flux response."
+            )
+        pullback_fn = getattr(
+            self.shared_flux_model,
+            "pullback_build_lagged_response_support_payload_batched_interpolated_faces_reuse_local_vjp_primal",
+            None,
+        )
+        if not callable(pullback_fn):
+            raise NotImplementedError(
+                "The active shared flux model does not expose the batched primal-reuse "
+                "interpolated-face support pullback."
+            )
+        return pullback_fn(
+            working_state, flux_response_bars, support, **self._shared_flux_call_kwargs(kwargs),
+        )
+
+    def pullback_build_lagged_response_support_payload_batched_interpolated_faces_multi_rhs_shared_primal(
+        self, state, lagged_response_bars, support, **kwargs,
+    ):
+        """Geometry wrapper for the isolated shared-primal multi-RHS rule."""
+        support, geometry = self._split_realtime_geometry_payload(support)
+        if geometry is not None:
+            ntx_support_bar = (
+                self.pullback_build_lagged_response_support_payload_batched_interpolated_faces_multi_rhs_shared_primal(
+                    state, lagged_response_bars, support, **kwargs,
+                )
+            )
+            working_state, _eidx = self._prepare_working_state(state)
+            flux_response_bars = None if lagged_response_bars is None else lagged_response_bars.flux_response
+            if flux_response_bars is None:
+                geometry_bar = jax.tree_util.tree_map(
+                    lambda leaf: jnp.broadcast_to(jnp.zeros_like(jnp.asarray(leaf)),
+                                                   (0,) + jnp.asarray(leaf).shape),
+                    geometry,
+                )
+            else:
+                geometry_bar = jax.vmap(
+                    lambda flux_response_bar: self._direct_geometry_build_lagged_response_bar(
+                        self.shared_flux_model, geometry, working_state, flux_response_bar,
+                    )
+                )(flux_response_bars)
+            return {"ntx_support": ntx_support_bar, "geometry": geometry_bar}
+
+        working_state, _eidx = self._prepare_working_state(state)
+        flux_response_bars = None if lagged_response_bars is None else lagged_response_bars.flux_response
+        if self.shared_flux_model is None or flux_response_bars is None:
+            raise NotImplementedError(
+                "batched multi-RHS shared-primal support pullback requires an active shared flux response."
+            )
+        pullback_fn = getattr(
+            self.shared_flux_model,
+            "pullback_build_lagged_response_support_payload_batched_interpolated_faces_multi_rhs_shared_primal",
+            None,
+        )
+        if not callable(pullback_fn):
+            raise NotImplementedError(
+                "The active shared flux model does not expose the batched multi-RHS "
+                "shared-primal interpolated-face support pullback."
+            )
+        return pullback_fn(
+            working_state, flux_response_bars, support, **self._shared_flux_call_kwargs(kwargs),
+        )
+
+    def pullback_build_lagged_response_support_payload_batched_interpolated_faces_native_multi_rhs_shared_primal(
+        self, state, lagged_response_bars, support, **kwargs,
+    ):
+        """Geometry wrapper for the native matrix-RHS NTX support rule.
+
+        The Radau vector field is a method of this equation-system layer.
+        Therefore the dedicated inner NTX rule needs this forwarding method in
+        addition to the corresponding composite-flux-model wrapper.
+        """
+
+        support, geometry = self._split_realtime_geometry_payload(support)
+        if geometry is not None:
+            ntx_support_bar = (
+                self.pullback_build_lagged_response_support_payload_batched_interpolated_faces_native_multi_rhs_shared_primal(
+                    state, lagged_response_bars, support, **kwargs,
+                )
+            )
+            working_state, _eidx = self._prepare_working_state(state)
+            flux_response_bars = (
+                None if lagged_response_bars is None else lagged_response_bars.flux_response
+            )
+            if flux_response_bars is None:
+                geometry_bar = jax.tree_util.tree_map(
+                    lambda leaf: jnp.broadcast_to(
+                        jnp.zeros_like(jnp.asarray(leaf)),
+                        (0,) + jnp.asarray(leaf).shape,
+                    ),
+                    geometry,
+                )
+            else:
+                geometry_bar = jax.vmap(
+                    lambda flux_response_bar: self._direct_geometry_build_lagged_response_bar(
+                        self.shared_flux_model,
+                        geometry,
+                        working_state,
+                        flux_response_bar,
+                    )
+                )(flux_response_bars)
+            return {"ntx_support": ntx_support_bar, "geometry": geometry_bar}
+
+        working_state, _eidx = self._prepare_working_state(state)
+        flux_response_bars = (
+            None if lagged_response_bars is None else lagged_response_bars.flux_response
+        )
+        if self.shared_flux_model is None or flux_response_bars is None:
+            raise NotImplementedError(
+                "native matrix-RHS interpolated-face support pullback requires an active "
+                "shared flux response."
+            )
+        pullback_fn = getattr(
+            self.shared_flux_model,
+            "pullback_build_lagged_response_support_payload_batched_interpolated_faces_"
+            "native_multi_rhs_shared_primal",
+            None,
+        )
+        if not callable(pullback_fn):
+            raise NotImplementedError(
+                "The active shared flux model does not expose the native matrix-RHS "
+                "interpolated-face support pullback."
+            )
+        return pullback_fn(
+            working_state,
+            flux_response_bars,
+            support,
+            **self._shared_flux_call_kwargs(kwargs),
+        )
+
+    def pullback_build_lagged_response_support_payload_batched_interpolated_faces_native_multi_rhs_reuse_moment_drds_jvp_shared_primal(
+        self, state, lagged_response_bars, support, **kwargs,
+    ):
+        """Geometry wrapper for the native drds-JVP reuse matrix-RHS rule."""
+
+        support, geometry = self._split_realtime_geometry_payload(support)
+        if geometry is not None:
+            ntx_support_bar = self.pullback_build_lagged_response_support_payload_batched_interpolated_faces_native_multi_rhs_reuse_moment_drds_jvp_shared_primal(
+                state, lagged_response_bars, support, **kwargs,
+            )
+            working_state, _eidx = self._prepare_working_state(state)
+            flux_response_bars = None if lagged_response_bars is None else lagged_response_bars.flux_response
+            geometry_bar = jax.tree_util.tree_map(
+                lambda leaf: jnp.broadcast_to(jnp.zeros_like(jnp.asarray(leaf)), (0,) + jnp.asarray(leaf).shape),
+                geometry,
+            ) if flux_response_bars is None else jax.vmap(
+                lambda flux_response_bar: self._direct_geometry_build_lagged_response_bar(
+                    self.shared_flux_model, geometry, working_state, flux_response_bar,
+                )
+            )(flux_response_bars)
+            return {"ntx_support": ntx_support_bar, "geometry": geometry_bar}
+
+        working_state, _eidx = self._prepare_working_state(state)
+        flux_response_bars = None if lagged_response_bars is None else lagged_response_bars.flux_response
+        if self.shared_flux_model is None or flux_response_bars is None:
+            raise NotImplementedError(
+                "native drds-JVP reuse matrix-RHS support pullback requires an active shared flux response."
+            )
+        pullback_fn = getattr(
+            self.shared_flux_model,
+            "pullback_build_lagged_response_support_payload_batched_interpolated_faces_"
+            "native_multi_rhs_reuse_moment_drds_jvp_shared_primal",
+            None,
+        )
+        if not callable(pullback_fn):
+            raise NotImplementedError(
+                "The active shared flux model does not expose the native drds-JVP reuse matrix-RHS support pullback."
+            )
+        return pullback_fn(
+            working_state, flux_response_bars, support, **self._shared_flux_call_kwargs(kwargs),
+        )
+
+    def pullback_build_lagged_response_support_payload_batched_interpolated_faces_native_multi_rhs_reuse_moment_drds_jvp_shared_primal_with_vmec_coefficients(
+        self, state, lagged_response_bars, support, **kwargs,
+    ):
+        """Geometry wrapper retaining a parallel NTX VMEC-coefficient bar.
+
+        The ordinary result still exactly matches the combined support payload
+        tree.  The second result is intentionally separate because it is a
+        face-surface coefficient cotangent, to be pulled to VMEC state later.
+        """
+
+        support, geometry = self._split_realtime_geometry_payload(support)
+        if geometry is not None:
+            ntx_support_bar, native_vmec_coefficient_bars = (
+                self.pullback_build_lagged_response_support_payload_batched_interpolated_faces_native_multi_rhs_reuse_moment_drds_jvp_shared_primal_with_vmec_coefficients(
+                    state, lagged_response_bars, support, **kwargs,
+                )
+            )
+            working_state, _eidx = self._prepare_working_state(state)
+            flux_response_bars = None if lagged_response_bars is None else lagged_response_bars.flux_response
+            geometry_bar = jax.tree_util.tree_map(
+                lambda leaf: jnp.broadcast_to(
+                    jnp.zeros_like(jnp.asarray(leaf)), (0,) + jnp.asarray(leaf).shape
+                ),
+                geometry,
+            ) if flux_response_bars is None else jax.vmap(
+                lambda flux_response_bar: self._direct_geometry_build_lagged_response_bar(
+                    self.shared_flux_model, geometry, working_state, flux_response_bar,
+                )
+            )(flux_response_bars)
+            return (
+                {"ntx_support": ntx_support_bar, "geometry": geometry_bar},
+                native_vmec_coefficient_bars,
+            )
+
+        working_state, _eidx = self._prepare_working_state(state)
+        flux_response_bars = None if lagged_response_bars is None else lagged_response_bars.flux_response
+        if self.shared_flux_model is None or flux_response_bars is None:
+            raise NotImplementedError(
+                "native VMEC coefficient support pullback requires an active shared flux response."
+            )
+        pullback_fn = getattr(
+            self.shared_flux_model,
+            "pullback_build_lagged_response_support_payload_batched_interpolated_faces_"
+            "native_multi_rhs_reuse_moment_drds_jvp_shared_primal_with_vmec_coefficients",
+            None,
+        )
+        if not callable(pullback_fn):
+            raise NotImplementedError(
+                "The active shared flux model does not expose native VMEC coefficient bars."
+            )
+        return pullback_fn(
+            working_state, flux_response_bars, support, **self._shared_flux_call_kwargs(kwargs),
+        )
+
+    def pullback_build_lagged_response_support_payload_batched_interpolated_faces_native_multi_rhs_reuse_moment_drds_jvp_shared_primal_with_vmec_coefficients_direct_directional_product_rule(
+        self, state, lagged_response_bars, support, **kwargs,
+    ):
+        """Opt-in VMEC bridge using NTX's explicit directional contraction.
+
+        This preserves the current native VMEC-coefficient support contract;
+        only the two post-adjoint low-dot primitive JVPs are replaced inside
+        NTX.  The direct realtime-geometry contribution remains unchanged.
+        """
+        support, geometry = self._split_realtime_geometry_payload(support)
+        if geometry is not None:
+            ntx_support_bar, native_vmec_coefficient_bars = (
+                self.pullback_build_lagged_response_support_payload_batched_interpolated_faces_native_multi_rhs_reuse_moment_drds_jvp_shared_primal_with_vmec_coefficients_direct_directional_product_rule(
+                    state, lagged_response_bars, support, **kwargs,
+                )
+            )
+            working_state, _eidx = self._prepare_working_state(state)
+            flux_response_bars = None if lagged_response_bars is None else lagged_response_bars.flux_response
+            geometry_bar = jax.tree_util.tree_map(
+                lambda leaf: jnp.broadcast_to(
+                    jnp.zeros_like(jnp.asarray(leaf)), (0,) + jnp.asarray(leaf).shape
+                ),
+                geometry,
+            ) if flux_response_bars is None else jax.vmap(
+                lambda flux_response_bar: self._direct_geometry_build_lagged_response_bar(
+                    self.shared_flux_model, geometry, working_state, flux_response_bar,
+                )
+            )(flux_response_bars)
+            return (
+                {"ntx_support": ntx_support_bar, "geometry": geometry_bar},
+                native_vmec_coefficient_bars,
+            )
+
+        working_state, _eidx = self._prepare_working_state(state)
+        flux_response_bars = None if lagged_response_bars is None else lagged_response_bars.flux_response
+        if self.shared_flux_model is None or flux_response_bars is None:
+            raise NotImplementedError(
+                "native VMEC coefficient support pullback requires an active shared flux response."
+            )
+        pullback_fn = getattr(
+            self.shared_flux_model,
+            "pullback_build_lagged_response_support_payload_batched_interpolated_faces_"
+            "native_multi_rhs_reuse_moment_drds_jvp_shared_primal_with_vmec_coefficients_"
+            "direct_directional_product_rule",
+            None,
+        )
+        if not callable(pullback_fn):
+            raise NotImplementedError(
+                "The active shared flux model does not expose the direct native VMEC coefficient rule."
+            )
+        return pullback_fn(
+            working_state, flux_response_bars, support, **self._shared_flux_call_kwargs(kwargs),
+        )
+
+    def pullback_build_lagged_response_support_payload_batched_interpolated_faces_native_multi_rhs_reuse_moment_drds_jvp_shared_primal_with_vmec_coefficients_direct_coefficient_pullback(
+        self, state, lagged_response_bars, support, **kwargs,
+    ):
+        """Opt-in VMEC bridge with NTX's direct coefficient transpose.
+
+        The realtime-geometry split and direct geometry contribution are the
+        same as the established native VMEC path; only NTX's affine
+        coefficient VJP/JVP nest is replaced.
+        """
+        support, geometry = self._split_realtime_geometry_payload(support)
+        if geometry is not None:
+            ntx_support_bar, native_vmec_coefficient_bars = (
+                self.pullback_build_lagged_response_support_payload_batched_interpolated_faces_native_multi_rhs_reuse_moment_drds_jvp_shared_primal_with_vmec_coefficients_direct_coefficient_pullback(
+                    state, lagged_response_bars, support, **kwargs,
+                )
+            )
+            working_state, _eidx = self._prepare_working_state(state)
+            flux_response_bars = None if lagged_response_bars is None else lagged_response_bars.flux_response
+            geometry_bar = jax.tree_util.tree_map(
+                lambda leaf: jnp.broadcast_to(
+                    jnp.zeros_like(jnp.asarray(leaf)), (0,) + jnp.asarray(leaf).shape
+                ),
+                geometry,
+            ) if flux_response_bars is None else jax.vmap(
+                lambda flux_response_bar: self._direct_geometry_build_lagged_response_bar(
+                    self.shared_flux_model, geometry, working_state, flux_response_bar,
+                )
+            )(flux_response_bars)
+            return (
+                {"ntx_support": ntx_support_bar, "geometry": geometry_bar},
+                native_vmec_coefficient_bars,
+            )
+
+        working_state, _eidx = self._prepare_working_state(state)
+        flux_response_bars = None if lagged_response_bars is None else lagged_response_bars.flux_response
+        if self.shared_flux_model is None or flux_response_bars is None:
+            raise NotImplementedError(
+                "native VMEC coefficient support pullback requires an active shared flux response."
+            )
+        pullback_fn = getattr(
+            self.shared_flux_model,
+            "pullback_build_lagged_response_support_payload_batched_interpolated_faces_"
+            "native_multi_rhs_reuse_moment_drds_jvp_shared_primal_with_vmec_coefficients_"
+            "direct_coefficient_pullback",
+            None,
+        )
+        if not callable(pullback_fn):
+            raise NotImplementedError(
+                "The active shared flux model does not expose the direct coefficient transpose rule."
+            )
+        return pullback_fn(
+            working_state, flux_response_bars, support, **self._shared_flux_call_kwargs(kwargs),
+        )
+
+    def pullback_build_lagged_response_support_payload_batched_interpolated_faces_native_multi_rhs_reuse_moment_drds_jvp_shared_primal_with_vmec_coefficients_direct_directional_product_rule_per_energy_call_boundary(
+        self, state, lagged_response_bars, support, **kwargs,
+    ):
+        """Native VMEC bridge with the complete local operation as a call."""
+        support, geometry = self._split_realtime_geometry_payload(support)
+        if geometry is not None:
+            ntx_support_bar, native_vmec_coefficient_bars = (
+                self.pullback_build_lagged_response_support_payload_batched_interpolated_faces_native_multi_rhs_reuse_moment_drds_jvp_shared_primal_with_vmec_coefficients_direct_directional_product_rule_per_energy_call_boundary(
+                    state, lagged_response_bars, support, **kwargs,
+                )
+            )
+            working_state, _eidx = self._prepare_working_state(state)
+            flux_response_bars = None if lagged_response_bars is None else lagged_response_bars.flux_response
+            geometry_bar = jax.tree_util.tree_map(
+                lambda leaf: jnp.broadcast_to(
+                    jnp.zeros_like(jnp.asarray(leaf)), (0,) + jnp.asarray(leaf).shape
+                ),
+                geometry,
+            ) if flux_response_bars is None else jax.vmap(
+                lambda flux_response_bar: self._direct_geometry_build_lagged_response_bar(
+                    self.shared_flux_model, geometry, working_state, flux_response_bar,
+                )
+            )(flux_response_bars)
+            return (
+                {"ntx_support": ntx_support_bar, "geometry": geometry_bar},
+                native_vmec_coefficient_bars,
+            )
+
+        working_state, _eidx = self._prepare_working_state(state)
+        flux_response_bars = None if lagged_response_bars is None else lagged_response_bars.flux_response
+        if self.shared_flux_model is None or flux_response_bars is None:
+            raise NotImplementedError(
+                "native VMEC coefficient support pullback requires an active shared flux response."
+            )
+        pullback_fn = getattr(
+            self.shared_flux_model,
+            "pullback_build_lagged_response_support_payload_batched_interpolated_faces_"
+            "native_multi_rhs_reuse_moment_drds_jvp_shared_primal_with_vmec_coefficients_"
+            "direct_directional_product_rule_per_energy_call_boundary",
+            None,
+        )
+        if not callable(pullback_fn):
+            raise NotImplementedError(
+                "The active shared flux model does not expose the local call-boundary rule."
+            )
+        return pullback_fn(
+            working_state, flux_response_bars, support, **self._shared_flux_call_kwargs(kwargs),
+        )
+
+    def pullback_build_lagged_response_support_payload_batched_interpolated_faces_native_multi_rhs_compact_residual_reuse_moment_drds_jvp_shared_primal(
+        self, state, lagged_response_bars, support, **kwargs,
+    ):
+        """Geometry wrapper for the isolated split-residual native rule."""
+
+        support, geometry = self._split_realtime_geometry_payload(support)
+        if geometry is not None:
+            ntx_support_bar = self.pullback_build_lagged_response_support_payload_batched_interpolated_faces_native_multi_rhs_compact_residual_reuse_moment_drds_jvp_shared_primal(
+                state, lagged_response_bars, support, **kwargs,
+            )
+            working_state, _eidx = self._prepare_working_state(state)
+            flux_response_bars = (
+                None if lagged_response_bars is None else lagged_response_bars.flux_response
+            )
+            geometry_bar = jax.tree_util.tree_map(
+                lambda leaf: jnp.broadcast_to(
+                    jnp.zeros_like(jnp.asarray(leaf)),
+                    (0,) + jnp.asarray(leaf).shape,
+                ),
+                geometry,
+            ) if flux_response_bars is None else jax.vmap(
+                lambda flux_response_bar: self._direct_geometry_build_lagged_response_bar(
+                    self.shared_flux_model, geometry, working_state, flux_response_bar,
+                )
+            )(flux_response_bars)
+            return {"ntx_support": ntx_support_bar, "geometry": geometry_bar}
+
+        working_state, _eidx = self._prepare_working_state(state)
+        flux_response_bars = (
+            None if lagged_response_bars is None else lagged_response_bars.flux_response
+        )
+        if self.shared_flux_model is None or flux_response_bars is None:
+            raise NotImplementedError(
+                "split-residual native matrix-RHS support pullback requires an active "
+                "shared flux response."
+            )
+        pullback_fn = getattr(
+            self.shared_flux_model,
+            "pullback_build_lagged_response_support_payload_batched_interpolated_faces_"
+            "native_multi_rhs_compact_residual_reuse_moment_drds_jvp_shared_primal",
+            None,
+        )
+        if not callable(pullback_fn):
+            raise NotImplementedError(
+                "The active shared flux model does not expose the split-residual "
+                "native matrix-RHS interpolated-face support pullback."
+            )
+        return pullback_fn(
+            working_state,
+            flux_response_bars,
+            support,
+            **self._shared_flux_call_kwargs(kwargs),
+        )
+
+    def pullback_build_lagged_response_support_payload_batched_interpolated_faces_native_multi_rhs_compact_shared_primal(
+        self, state, lagged_response_bars, support, **kwargs,
+    ):
+        """Geometry wrapper for the compact native matrix-RHS NTX rule."""
+
+        support, geometry = self._split_realtime_geometry_payload(support)
+        if geometry is not None:
+            ntx_support_bar = (
+                self.pullback_build_lagged_response_support_payload_batched_interpolated_faces_native_multi_rhs_compact_shared_primal(
+                    state, lagged_response_bars, support, **kwargs,
+                )
+            )
+            working_state, _eidx = self._prepare_working_state(state)
+            flux_response_bars = (
+                None if lagged_response_bars is None else lagged_response_bars.flux_response
+            )
+            geometry_bar = jax.tree_util.tree_map(
+                lambda leaf: jnp.broadcast_to(
+                    jnp.zeros_like(jnp.asarray(leaf)),
+                    (0,) + jnp.asarray(leaf).shape,
+                ),
+                geometry,
+            ) if flux_response_bars is None else jax.vmap(
+                lambda flux_response_bar: self._direct_geometry_build_lagged_response_bar(
+                    self.shared_flux_model, geometry, working_state, flux_response_bar,
+                )
+            )(flux_response_bars)
+            return {"ntx_support": ntx_support_bar, "geometry": geometry_bar}
+
+        working_state, _eidx = self._prepare_working_state(state)
+        flux_response_bars = (
+            None if lagged_response_bars is None else lagged_response_bars.flux_response
+        )
+        if self.shared_flux_model is None or flux_response_bars is None:
+            raise NotImplementedError(
+                "compact native matrix-RHS interpolated-face support pullback requires an active "
+                "shared flux response."
+            )
+        pullback_fn = getattr(
+            self.shared_flux_model,
+            "pullback_build_lagged_response_support_payload_batched_interpolated_faces_"
+            "native_multi_rhs_compact_shared_primal",
+            None,
+        )
+        if not callable(pullback_fn):
+            raise NotImplementedError(
+                "The active shared flux model does not expose the compact native matrix-RHS "
+                "interpolated-face support pullback."
+            )
+        return pullback_fn(
+            working_state, flux_response_bars, support, **self._shared_flux_call_kwargs(kwargs),
+        )
+
+    def pullback_build_lagged_response_state_and_support_payload_batched_interpolated_faces(
+        self,
+        state,
+        lagged_response_bars,
+        support,
+        **kwargs,
+    ):
+        """Joint objective-batched state/support transpose for the NTX face lane.
+
+        This is intentionally separate from the established scalar and
+        support-only APIs.  The model returns both cotangent trees from one
+        local NTX implicit-adjoint construction; this wrapper only translates
+        the working-state and realtime-geometry payload boundaries.
+        """
+        native_multi_rhs_reuse_moment_drds_jvp_shared_primal = bool(
+            kwargs.pop("native_multi_rhs_reuse_moment_drds_jvp_shared_primal", False)
+        )
+        support, geometry = self._split_realtime_geometry_payload(support)
+        working_state, _eidx = self._prepare_working_state(state)
+        flux_response_bars = None if lagged_response_bars is None else lagged_response_bars.flux_response
+        if self.shared_flux_model is None or flux_response_bars is None:
+            raise NotImplementedError(
+                "batched joint interpolated-face pullback requires an active shared flux response."
+            )
+        pullback_fn = getattr(
+            self.shared_flux_model,
+            (
+                "pullback_build_lagged_response_state_and_support_payload_"
+                "batched_interpolated_faces_native_multi_rhs_reuse_moment_drds_jvp_shared_primal"
+                if native_multi_rhs_reuse_moment_drds_jvp_shared_primal
+                else "pullback_build_lagged_response_state_and_support_payload_"
+                "batched_interpolated_faces"
+            ),
+            None,
+        )
+        if not callable(pullback_fn):
+            raise NotImplementedError(
+                "The active shared flux model does not expose the batched joint "
+                "interpolated-face state/support pullback."
+            )
+        working_state_bars, ntx_support_bar = pullback_fn(
+            working_state,
+            flux_response_bars,
+            support,
+            packed_support_directional_adjoint=bool(
+                kwargs.pop("packed_support_directional_adjoint", False)
+            ),
+            **self._shared_flux_call_kwargs(kwargs),
+        )
+        state_bars = jax.vmap(
+            lambda working_state_bar: self._prepare_working_state_pullback(state, working_state_bar)
+        )(working_state_bars)
+        if geometry is None:
+            return state_bars, ntx_support_bar
+        geometry_bar = jax.vmap(
+            lambda flux_response_bar: self._direct_geometry_build_lagged_response_bar(
+                self.shared_flux_model,
+                geometry,
+                working_state,
+                flux_response_bar,
+            )
+        )(flux_response_bars)
+        return state_bars, {"ntx_support": ntx_support_bar, "geometry": geometry_bar}
+
+    def pullback_build_lagged_response_state_and_support_payload_batched_interpolated_faces_native_multi_rhs_reuse_moment_drds_jvp_shared_primal(
+        self,
+        state,
+        lagged_response_bars,
+        support,
+        **kwargs,
+    ):
+        """Forward the native joint pullback without changing rebuild modes."""
+
+        return self.pullback_build_lagged_response_state_and_support_payload_batched_interpolated_faces(
+            state,
+            lagged_response_bars,
+            support,
+            native_multi_rhs_reuse_moment_drds_jvp_shared_primal=True,
+            **kwargs,
+        )
+
+    def pullback_build_lagged_response_state_and_ntx_support_payload_batched_interpolated_faces_native_multi_rhs_reuse_moment_drds_jvp_shared_primal_with_vmec_coefficients(
+        self,
+        state,
+        lagged_response_bars,
+        support,
+        **kwargs,
+    ):
+        """Return native NTX state/support bars without staging direct geometry.
+
+        This is deliberately narrower than the legacy joint helper.  Its
+        caller evaluates the direct realtime-geometry transpose separately,
+        which keeps that outer VMEC graph out of the native NTX matrix-RHS
+        compilation while retaining one NTX adjoint for state and NTX support.
+        """
+        support_ntx, _geometry = self._split_realtime_geometry_payload(support)
+        working_state, _eidx = self._prepare_working_state(state)
+        flux_response_bars = (
+            None if lagged_response_bars is None else lagged_response_bars.flux_response
+        )
+        if self.shared_flux_model is None or flux_response_bars is None:
+            raise NotImplementedError(
+                "split native joint pullback requires an active shared flux response."
+            )
+        pullback_fn = getattr(
+            self.shared_flux_model,
+            "pullback_build_lagged_response_state_and_support_payload_"
+            "batched_interpolated_faces_native_multi_rhs_reuse_moment_drds_jvp_"
+            "shared_primal_with_vmec_coefficients",
+            None,
+        )
+        if not callable(pullback_fn):
+            raise NotImplementedError(
+                "The active shared flux model does not expose the native VMEC "
+                "coefficient state/NTX-support pullback."
+            )
+        working_state_bars, ntx_support_bar, native_vmec_coefficient_bars = pullback_fn(
+            working_state,
+            flux_response_bars,
+            support_ntx,
+            packed_support_directional_adjoint=bool(
+                kwargs.pop("packed_support_directional_adjoint", False)
+            ),
+            **self._shared_flux_call_kwargs(kwargs),
+        )
+        state_bars = jax.vmap(
+            lambda working_state_bar: self._prepare_working_state_pullback(
+                state, working_state_bar
+            )
+        )(working_state_bars)
+        return state_bars, ntx_support_bar, native_vmec_coefficient_bars
+
+    def pullback_build_lagged_response_state_and_ntx_support_payload_batched_interpolated_faces_native_multi_rhs_reuse_moment_drds_jvp_shared_primal_with_vmec_coefficients_no_prepared_carry(
+        self,
+        state,
+        lagged_response_bars,
+        support,
+        **kwargs,
+    ):
+        """Native state/NTX-support pullback with no generic prepared scan carry."""
+        support_ntx, _geometry = self._split_realtime_geometry_payload(support)
+        working_state, _eidx = self._prepare_working_state(state)
+        flux_response_bars = (
+            None if lagged_response_bars is None else lagged_response_bars.flux_response
+        )
+        if self.shared_flux_model is None or flux_response_bars is None:
+            raise NotImplementedError(
+                "split native compact pullback requires an active shared flux response."
+            )
+        pullback_fn = getattr(
+            self.shared_flux_model,
+            "pullback_build_lagged_response_state_and_support_payload_"
+            "batched_interpolated_faces_native_multi_rhs_reuse_moment_drds_jvp_"
+            "shared_primal_with_vmec_coefficients_no_prepared_carry",
+            None,
+        )
+        if not callable(pullback_fn):
+            raise NotImplementedError(
+                "The active shared flux model does not expose the compact native "
+                "VMEC coefficient state/NTX-support pullback."
+            )
+        working_state_bars, ntx_support_bar, native_vmec_coefficient_bars = pullback_fn(
+            working_state,
+            flux_response_bars,
+            support_ntx,
+            packed_support_directional_adjoint=bool(
+                kwargs.pop("packed_support_directional_adjoint", False)
+            ),
+            **self._shared_flux_call_kwargs(kwargs),
+        )
+        state_bars = jax.vmap(
+            lambda working_state_bar: self._prepare_working_state_pullback(
+                state, working_state_bar
+            )
+        )(working_state_bars)
+        return state_bars, ntx_support_bar, native_vmec_coefficient_bars
+
+    def pullback_build_lagged_response_direct_geometry_payload_batched_interpolated_faces(
+        self, state, lagged_response_bars, support, **kwargs,
+    ):
+        """Direct outer geometry transpose, intentionally independent of NTX."""
+        _support_ntx, geometry = self._split_realtime_geometry_payload(support)
+        if geometry is None:
+            return None
+        working_state, _eidx = self._prepare_working_state(state)
+        flux_response_bars = (
+            None if lagged_response_bars is None else lagged_response_bars.flux_response
+        )
+        if self.shared_flux_model is None or flux_response_bars is None:
+            raise NotImplementedError(
+                "direct geometry pullback requires an active shared flux response."
+            )
+        del kwargs
+        return jax.vmap(
+            lambda flux_response_bar: self._direct_geometry_build_lagged_response_bar(
+                self.shared_flux_model, geometry, working_state, flux_response_bar,
+            )
+        )(flux_response_bars)
+
+    def pullback_build_lagged_response_state_and_support_payload_batched_interpolated_faces_reuse_local_vjp_primal(
+        self,
+        state,
+        lagged_response_bars,
+        support,
+        **kwargs,
+    ):
+        """Exact joint NTX state/support transpose with local-primal reuse."""
+        compact_prepared_support_carry = bool(
+            kwargs.pop("compact_prepared_support_carry", False)
+        )
+        support_ntx, geometry = self._split_realtime_geometry_payload(support)
+        working_state, _eidx = self._prepare_working_state(state)
+        flux_response_bars = None if lagged_response_bars is None else lagged_response_bars.flux_response
+        if self.shared_flux_model is None or flux_response_bars is None:
+            raise NotImplementedError(
+                "batched joint local-primal-reuse pullback requires an active shared flux response."
+            )
+        pullback_fn = getattr(
+            self.shared_flux_model,
+            (
+                "pullback_build_lagged_response_state_and_support_payload_"
+                "batched_interpolated_faces_reuse_local_vjp_primal_compact_prepared_carry"
+                if compact_prepared_support_carry
+                else "pullback_build_lagged_response_state_and_support_payload_"
+                "batched_interpolated_faces_reuse_local_vjp_primal"
+            ),
+            None,
+        )
+        if not callable(pullback_fn):
+            raise NotImplementedError(
+                "The active shared flux model does not expose the batched joint "
+                "local-primal-reuse pullback."
+            )
+        working_state_bars, ntx_support_bar = pullback_fn(
+            working_state,
+            flux_response_bars,
+            support_ntx,
+            packed_support_directional_adjoint=bool(
+                kwargs.pop("packed_support_directional_adjoint", False)
+            ),
+            **self._shared_flux_call_kwargs(kwargs),
+        )
+        state_bars = jax.vmap(
+            lambda working_state_bar: self._prepare_working_state_pullback(state, working_state_bar)
+        )(working_state_bars)
+        if geometry is None:
+            return state_bars, ntx_support_bar
+        geometry_bar = jax.vmap(
+            lambda flux_response_bar: self._direct_geometry_build_lagged_response_bar(
+                self.shared_flux_model,
+                geometry,
+                working_state,
+                flux_response_bar,
+            )
+        )(flux_response_bars)
+        return state_bars, {"ntx_support": ntx_support_bar, "geometry": geometry_bar}
+
+    def pullback_build_lagged_response_state_and_support_payload_batched_interpolated_faces_reuse_local_vjp_primal_compact_prepared_carry(
+        self,
+        state,
+        lagged_response_bars,
+        support,
+        **kwargs,
+    ):
+        """Opt-in compact-carry form of the joint local-primal-reuse rule."""
+        return self.pullback_build_lagged_response_state_and_support_payload_batched_interpolated_faces_reuse_local_vjp_primal(
+            state,
+            lagged_response_bars,
+            support,
+            compact_prepared_support_carry=True,
+            **kwargs,
+        )
+
     def evaluate_with_lagged_response(self, t, state, runtime, lagged_response):
         del t, runtime
         return self._evaluate_state(state, lagged_response=lagged_response)
+
+    def debug_er_components_with_lagged_response(self, state, lagged_response):
+        """Return the assembled Er terms using an existing cached flux response.
+
+        This is deliberately diagnostic-only: it evaluates the inexpensive
+        cached-response assembly but never builds a new NTX response.
+        """
+        # A floating outer-node Radau solve keeps its physical edge scalar and
+        # response anchor in a solver-private wrapper.  This generic callback
+        # is deliberately passed only a public TransportState, so it cannot
+        # reconstruct the corresponding stage edge value without inventing
+        # one.  Do not unwrap the payload and print a misleading decomposition;
+        # the node-specific stage diagnostic owns that richer tuple.
+        if (
+            hasattr(lagged_response, "transport_response")
+            and hasattr(lagged_response, "er_edge_anchor")
+        ):
+            return None
+        working_state, _ = self._prepare_working_state(state)
+        density_eq, temperature_eq, er_eq = self._resolve_equations()
+        del density_eq, temperature_eq
+        if (
+            er_eq is None
+            or self.shared_flux_model is None
+            or lagged_response is None
+            or lagged_response.flux_response is None
+        ):
+            return None
+        shared_fluxes = self.shared_flux_model.evaluate_with_lagged_response(
+            working_state,
+            lagged_response.flux_response,
+            **self._shared_flux_bc_kwargs(),
+        )
+        components = er_eq.debug_components(working_state, fluxes=shared_fluxes)
+        er_rhs = er_eq(working_state, fluxes=shared_fluxes)
+        return components, er_rhs
+
+    def evaluate_with_lagged_response_tangent(
+        self, t, state, state_direction, runtime, lagged_response
+    ):
+        """Directional RHS derivative of a cached transport response.
+
+        This is deliberately a split rule.  The expensive neoclassical flux
+        derivative comes from the model's explicit cached-response tangent;
+        JAX differentiates only the inexpensive local transport assembly and
+        boundary/projection maps.  In particular, this does not trace through
+        a live NTX solve or a lagged-response rebuild.
+        """
+        del t, runtime
+
+        def _working_state_only(state_value):
+            return self._prepare_working_state(state_value)[0]
+
+        working_state, working_direction = jax.jvp(
+            _working_state_only, (state,), (state_direction,)
+        )
+        _working_reference, eidx = self._prepare_working_state(state)
+        shared_fluxes = self.shared_flux_model.evaluate_with_lagged_response(
+            working_state,
+            lagged_response.flux_response,
+            **self._shared_flux_bc_kwargs(),
+        )
+        tangent_fn = getattr(
+            self.shared_flux_model, "evaluate_with_lagged_response_tangent", None
+        )
+        if not callable(tangent_fn):
+            raise NotImplementedError(
+                "The active shared flux model does not expose a cached-response tangent."
+            )
+        shared_flux_direction = tangent_fn(
+            working_state,
+            working_direction,
+            lagged_response.flux_response,
+            **self._shared_flux_bc_kwargs(),
+        )
+
+        # The flux dictionary also carries structural leaves for some
+        # reconstruction modes (for example integer face/index metadata).
+        # They are held fixed by the assembly, but JAX still requires their
+        # tangent leaves to be ``float0`` rather than ordinary floating
+        # zeros.  The custom NTX tangent intentionally returns numerical
+        # zeros for every dictionary leaf, so normalise those structural
+        # tangents here at the equation/assembly boundary.
+        def _jvp_tangent_like(primal, tangent):
+            primal_array = jnp.asarray(primal)
+            if jnp.issubdtype(primal_array.dtype, jnp.inexact):
+                return tangent
+            return jnp.zeros_like(primal_array, dtype=jax.dtypes.float0)
+
+        shared_flux_direction = jax.tree_util.tree_map(
+            _jvp_tangent_like,
+            shared_fluxes,
+            shared_flux_direction,
+        )
+
+        def _assemble(working_state_value, flux_value):
+            return self._evaluate_with_shared_fluxes_from_working_state(
+                working_state_value, eidx, state, flux_value
+            )
+
+        return jax.jvp(
+            _assemble,
+            (working_state, shared_fluxes),
+            (working_direction, shared_flux_direction),
+        )[1]
+
+    def _evaluate_with_shared_fluxes_from_working_state(
+        self, working_state, eidx, state_reference, shared_fluxes, *, er_edge_override=None
+    ):
+        from ._state import TransportState
+        density_eq, temperature_eq, er_eq = self._resolve_equations()
+
+        density_rhs = (
+            density_eq(working_state, fluxes=shared_fluxes)
+            if density_eq is not None
+            else jnp.zeros_like(state_reference.density)
+        )
+        pressure_rhs = (
+            temperature_eq(working_state, fluxes=shared_fluxes)
+            if temperature_eq is not None
+            else jnp.zeros_like(state_reference.pressure)
+        )
+        Er_rhs = (
+            er_eq(working_state, fluxes=shared_fluxes, er_edge_override=er_edge_override)
+            if er_eq is not None
+            else jnp.zeros_like(state_reference.Er)
+        )
+
+        density_rhs = _expand_density_rhs_to_full_shape(density_rhs, state_reference.density, self.species)
+
+        if eidx is not None:
+            density_rhs = density_rhs.at[int(eidx), :].set(jnp.zeros_like(density_rhs[int(eidx), :]))
+
+        if density_eq is not None and hasattr(density_eq, "enforce_dirichlet_boundary_rhs"):
+            density_rhs = density_eq.enforce_dirichlet_boundary_rhs(working_state, density_rhs)
+
+        if temperature_eq is not None and hasattr(temperature_eq, "enforce_dirichlet_boundary_rhs"):
+            pressure_rhs = temperature_eq.enforce_dirichlet_boundary_rhs(working_state, density_rhs, pressure_rhs)
+
+        if er_eq is not None and hasattr(er_eq, "enforce_dirichlet_boundary_rhs"):
+            Er_rhs = er_eq.enforce_dirichlet_boundary_rhs(working_state, Er_rhs)
+
+        self._debug_nonfinite_rhs_components(
+            working_state,
+            shared_fluxes,
+            density_rhs,
+            pressure_rhs,
+            Er_rhs,
+        )
+
+        return TransportState(density=density_rhs, pressure=pressure_rhs, Er=Er_rhs)
+
+    def evaluate_with_shared_fluxes(self, t, state, runtime, shared_fluxes):
+        del t, runtime
+        working_state, eidx = self._prepare_working_state(state)
+        return self._evaluate_with_shared_fluxes_from_working_state(
+            working_state,
+            eidx,
+            state,
+            shared_fluxes,
+        )
+
+    def build_node_boundary_lagged_response(self, state, er_edge):
+        """Build the ordinary cached response with one explicit outer-face anchor.
+
+        The returned transport response keeps its established tree structure;
+        the owning Radau adapter stores ``er_edge`` separately.
+        """
+        working_state, _ = self._prepare_working_state(state)
+        if self.shared_flux_model is None:
+            raise ValueError("floating_ambipolar_edge_node requires a shared flux model.")
+        return self.shared_flux_model.build_lagged_response(
+            working_state,
+            **self._shared_flux_call_kwargs({"er_edge_override": er_edge}),
+        )
+
+    def build_node_boundary_high_resolution_lagged_response(self, state, er_edge):
+        """Build an outer-node cache on NTX's prebuilt higher theta support."""
+        working_state, _ = self._prepare_working_state(state)
+        builder = getattr(
+            self.shared_flux_model, "build_high_resolution_lagged_response", None
+        )
+        if not callable(builder):
+            raise ValueError(
+                "The active flux model does not provide a high-resolution lagged cache."
+            )
+        return builder(
+            working_state,
+            **self._shared_flux_call_kwargs({"er_edge_override": er_edge}),
+        )
+
+    def node_boundary_charge_residual(self, state, er_edge):
+        """Outer-face ambipolar residual used by node initialization and AD.
+
+        It intentionally evaluates the same native face flux path as the
+        node RHS.  The scalar is zero at the selected floating-edge root;
+        keeping it here gives reverse AD a precise implicit-root residual
+        without introducing the edge node into ``TransportState``.
+        """
+        if self.shared_flux_model is None:
+            raise ValueError("floating_ambipolar_edge_node requires a shared flux model.")
+        # ``build_node_boundary_lagged_response`` owns the conversion from
+        # the public state to the working state.  Do not feed it an already
+        # prepared state here: that made initialization/reverse-root residuals
+        # use a cache anchored at ``prepare(prepare(state))`` while evaluating
+        # it at ``prepare(state)``.  The forward Radau node path prepares just
+        # once, so this must use that same convention.
+        working_state, _ = self._prepare_working_state(state)
+        response = self.build_node_boundary_lagged_response(state, er_edge)
+        fluxes = self.shared_flux_model.evaluate_with_lagged_response(
+            working_state,
+            response,
+            **self._shared_flux_call_kwargs({
+                "er_edge_override": er_edge,
+                "er_edge_anchor": er_edge,
+            }),
+        )
+        if not _flux_has_key(fluxes, "Gamma_faces"):
+            raise ValueError(
+                "floating_ambipolar_edge_node requires native face particle fluxes."
+            )
+        gamma_faces = fluxes["Gamma_faces"]
+        _density_eq, _temperature_eq, er_eq = self._resolve_equations()
+        if er_eq is None:
+            raise ValueError("floating_ambipolar_edge_node requires an Er equation.")
+        return jnp.sum(er_eq.charge_qp * jnp.asarray(gamma_faces)[:, -1])
+
+    def evaluate_node_boundary_with_lagged_response(
+        self, state, er_edge, transport_response, *, er_edge_anchor
+    ):
+        """Return core RHS and outer-node RHS for the Radau-only node adapter."""
+        working_state, eidx = self._prepare_working_state(state)
+        _density_eq, _temperature_eq, er_eq = self._resolve_equations()
+        if er_eq is None or er_eq.boundary_mode != "floating_ambipolar_edge_node":
+            raise ValueError("Node boundary evaluation requested without floating_ambipolar_edge_node.")
+        shared_fluxes = self.shared_flux_model.evaluate_with_lagged_response(
+            working_state,
+            transport_response,
+            **self._shared_flux_call_kwargs({
+                "er_edge_override": er_edge,
+                "er_edge_anchor": er_edge_anchor,
+            }),
+        )
+        core_rhs = self._evaluate_with_shared_fluxes_from_working_state(
+            working_state, eidx, state, shared_fluxes, er_edge_override=er_edge
+        )
+        edge_rhs = er_eq.edge_rhs(working_state, fluxes=shared_fluxes, er_edge_override=er_edge)
+        return core_rhs, edge_rhs
+
+    def evaluate_node_boundary_with_lagged_response_tangent(
+        self,
+        state,
+        state_direction,
+        er_edge,
+        er_edge_direction,
+        transport_response,
+        *,
+        er_edge_anchor,
+    ):
+        """Directional derivative of the private floating-edge node RHS.
+
+        This is deliberately a cached-response rule: the centre-state
+        contribution uses the model's explicit lagged tangent, while the one
+        private edge coordinate is differentiated only through cached flux
+        algebra.  Neither route rebuilds or differentiates an NTX solve.
+        """
+        _density_eq, _temperature_eq, er_eq = self._resolve_equations()
+        if er_eq is None or er_eq.boundary_mode != "floating_ambipolar_edge_node":
+            raise ValueError("Node boundary tangent requested without floating_ambipolar_edge_node.")
+        if self.shared_flux_model is None:
+            raise ValueError("floating_ambipolar_edge_node requires a shared flux model.")
+
+        def _working_state_only(state_value):
+            return self._prepare_working_state(state_value)[0]
+
+        working_state, working_direction = jax.jvp(
+            _working_state_only, (state,), (state_direction,)
+        )
+        _working_reference, eidx = self._prepare_working_state(state)
+        flux_kwargs = self._shared_flux_call_kwargs({
+            "er_edge_override": er_edge,
+            "er_edge_anchor": er_edge_anchor,
+        })
+        shared_fluxes = self.shared_flux_model.evaluate_with_lagged_response(
+            working_state, transport_response, **flux_kwargs
+        )
+        tangent_fn = getattr(self.shared_flux_model, "evaluate_with_lagged_response_tangent", None)
+        if not callable(tangent_fn):
+            raise NotImplementedError(
+                "The active shared flux model does not expose a cached-response tangent."
+            )
+        # A pure private-edge probe has identically zero centre-state
+        # direction.  Do not ask a model-owned centre tangent to represent
+        # that zero contribution: the edge column must come solely from the
+        # cached evaluator's explicit ``er_edge_override`` dependence.  This
+        # is also a strict separation of the two derivative coordinates.
+        state_direction_is_zero = jnp.logical_and(
+            jnp.all(jnp.asarray(state_direction.density) == 0),
+            jnp.logical_and(
+                jnp.all(jnp.asarray(state_direction.pressure) == 0),
+                jnp.all(jnp.asarray(state_direction.Er) == 0),
+            ),
+        )
+        state_flux_direction_raw = tangent_fn(
+            working_state, working_direction, transport_response, **flux_kwargs
+        )
+        state_flux_direction = jax.tree_util.tree_map(
+            lambda tangent: jnp.where(
+                state_direction_is_zero, jnp.zeros_like(tangent), tangent
+            ),
+            state_flux_direction_raw,
+        )
+
+        # The private edge direction has its own exact quadratic
+        # polarization rule.  Do not JVP through ``er_edge_override``: its
+        # generic AD path was inconsistent with both the cached polynomial
+        # and live NTX at the captured failure.
+        edge_tangent_fn = getattr(
+            self.shared_flux_model, "evaluate_with_lagged_response_edge_tangent", None
+        )
+        if not callable(edge_tangent_fn):
+            raise NotImplementedError(
+                "floating_ambipolar_edge_node quadratic refresh requires an "
+                "analytic cached edge tangent."
+            )
+
+        def _edge_direction_tangent(_):
+            return edge_tangent_fn(
+                working_state,
+                er_edge,
+                er_edge_direction,
+                transport_response,
+                er_edge_anchor=er_edge_anchor,
+            )
+
+        def _zero_edge_tangent(_):
+            return jax.tree_util.tree_map(jnp.zeros_like, shared_fluxes)
+
+        edge_flux_direction = jax.lax.cond(
+            jnp.asarray(er_edge_direction) != 0,
+            _edge_direction_tangent,
+            _zero_edge_tangent,
+            operand=None,
+        )
+        # Flux payloads can contain integer/index metadata.  Their JVP leaves
+        # must remain float0; only numerical leaves participate in the sum.
+        def _sum_flux_tangent(primal, state_part, edge_part):
+            primal_array = jnp.asarray(primal)
+            if jnp.issubdtype(primal_array.dtype, jnp.inexact):
+                return state_part + edge_part
+            return jnp.zeros_like(primal_array, dtype=jax.dtypes.float0)
+
+        flux_direction = jax.tree_util.tree_map(
+            _sum_flux_tangent,
+            shared_fluxes,
+            state_flux_direction,
+            edge_flux_direction,
+        )
+
+        def _assemble(working_state_value, flux_value, edge_value):
+            core = self._evaluate_with_shared_fluxes_from_working_state(
+                working_state_value,
+                eidx,
+                state,
+                flux_value,
+                er_edge_override=edge_value,
+            )
+            edge = er_eq.edge_rhs(
+                working_state_value, fluxes=flux_value, er_edge_override=edge_value
+            )
+            return core, edge
+
+        _, tangent = jax.jvp(
+            _assemble,
+            (working_state, shared_fluxes, er_edge),
+            (working_direction, flux_direction, er_edge_direction),
+        )
+        return tangent
+
+    def pullback_node_boundary_with_lagged_response_edge(
+        self,
+        state,
+        er_edge,
+        transport_response,
+        rhs_bar,
+        *,
+        er_edge_anchor,
+    ):
+        """Exact cached transpose from node-RHS bars to ``Er_edge``.
+
+        The flux contribution uses the model's analytic edge-polarization
+        transpose.  The remaining finite-volume boundary assembly is a cheap
+        ordinary VJP at fixed cached fluxes.  No VJP crosses a live NTX solve
+        or the known-bad generic ``er_edge_override`` AD path.
+        """
+        _density_eq, _temperature_eq, er_eq = self._resolve_equations()
+        if er_eq is None or er_eq.boundary_mode != "floating_ambipolar_edge_node":
+            raise ValueError("Node edge pullback requested without floating_ambipolar_edge_node.")
+        if self.shared_flux_model is None:
+            raise ValueError("floating_ambipolar_edge_node requires a shared flux model.")
+        edge_pullback_fn = getattr(
+            self.shared_flux_model, "pullback_evaluate_with_lagged_response_edge", None
+        )
+        if not callable(edge_pullback_fn):
+            raise NotImplementedError(
+                "floating_ambipolar_edge_node reverse requires an analytic cached edge pullback."
+            )
+
+        working_state, eidx = self._prepare_working_state(state)
+        flux_kwargs = self._shared_flux_call_kwargs({
+            "er_edge_override": er_edge,
+            "er_edge_anchor": er_edge_anchor,
+        })
+        shared_fluxes = self.shared_flux_model.evaluate_with_lagged_response(
+            working_state, transport_response, **flux_kwargs
+        )
+
+        def _assemble(flux_value, edge_value):
+            core = self._evaluate_with_shared_fluxes_from_working_state(
+                working_state,
+                eidx,
+                state,
+                flux_value,
+                er_edge_override=edge_value,
+            )
+            edge = er_eq.edge_rhs(
+                working_state, fluxes=flux_value, er_edge_override=edge_value
+            )
+            return core, edge
+
+        _, assembly_pullback = jax.vjp(_assemble, shared_fluxes, er_edge)
+        flux_bar, direct_edge_bar = assembly_pullback(rhs_bar)
+        flux_edge_bar = edge_pullback_fn(
+            working_state,
+            er_edge,
+            transport_response,
+            flux_bar,
+            er_edge_anchor=er_edge_anchor,
+        )
+        return direct_edge_bar + flux_edge_bar
+
+    def debug_node_boundary_live_vs_lagged(
+        self,
+        state,
+        er_edge,
+        transport_response,
+        *,
+        er_edge_anchor,
+        relative_edge_step=1.0e-5,
+    ):
+        """One-shot host diagnostic of the private outer-face response.
+
+        This is intentionally not part of the traced transport RHS.  It is
+        invoked only by the Radau host-loop threshold probe, where comparing a
+        cached Taylor response to direct NTX at the *same accepted base state*
+        is worth the extra direct evaluations.
+        """
+        if self.shared_flux_model is None:
+            raise ValueError("node edge probe requires a shared flux model.")
+        working_state, _ = self._prepare_working_state(state)
+        _density_eq, _temperature_eq, er_eq = self._resolve_equations()
+        if er_eq is None:
+            raise ValueError("node edge probe requires an Er equation.")
+        geometry = getattr(self.shared_flux_model, "geometry", None)
+        if geometry is None:
+            raise ValueError("node edge probe requires shared flux-model geometry.")
+        bc_kwargs = self._shared_flux_bc_kwargs()
+        edge = jnp.asarray(er_edge, dtype=working_state.Er.dtype)
+        edge_step = jnp.asarray(relative_edge_step, dtype=edge.dtype) * jnp.maximum(
+            jnp.abs(edge), jnp.asarray(1.0, dtype=edge.dtype)
+        )
+        face_state_at_edge = build_face_transport_state(
+            working_state,
+            geometry,
+            bc_density=bc_kwargs["bc_density"],
+            bc_temperature=bc_kwargs["bc_temperature"],
+            er_edge_override=edge,
+            density_floor=self.density_floor,
+            temperature_floor=self.temperature_floor,
+        )
+
+        def edge_rhs_from_faces(face_fluxes):
+            gamma_faces = jnp.asarray(face_fluxes["Gamma_faces"])
+            plasma_permitivity = _plasma_permitivity_from_prefactor(
+                working_state, er_eq.species_mass, er_eq.permitivity_prefactor
+            )
+            ambi = er_eq._outer_face_ambi_term(
+                working_state, None, plasma_permitivity, gamma_faces
+            )
+            return -er_eq.Er_relax * ambi, gamma_faces[:, -1]
+
+        def cached_at(edge_value):
+            fluxes = self.shared_flux_model.evaluate_with_lagged_response(
+                working_state,
+                transport_response,
+                **self._shared_flux_call_kwargs({
+                    "er_edge_override": edge_value,
+                    "er_edge_anchor": er_edge_anchor,
+                }),
+            )
+            return edge_rhs_from_faces(fluxes)
+
+        def live_at(edge_value):
+            face_state = build_face_transport_state(
+                working_state,
+                geometry,
+                bc_density=bc_kwargs["bc_density"],
+                bc_temperature=bc_kwargs["bc_temperature"],
+                er_edge_override=edge_value,
+                density_floor=self.density_floor,
+                temperature_floor=self.temperature_floor,
+            )
+            raw_face_fluxes = self.shared_flux_model.evaluate_face_fluxes(
+                working_state, face_state, **bc_kwargs
+            )
+            if raw_face_fluxes is None:
+                raise ValueError("node edge probe requires complete native face fluxes.")
+            gamma_faces = raw_face_fluxes.get("Gamma_faces", raw_face_fluxes.get("Gamma"))
+            if gamma_faces is None:
+                raise ValueError("node edge probe requires native face particle fluxes.")
+            return edge_rhs_from_faces({"Gamma_faces": gamma_faces})
+
+        cached_0, cached_gamma = cached_at(edge)
+        cached_plus, _ = cached_at(edge + edge_step)
+        cached_minus, _ = cached_at(edge - edge_step)
+        live_0, live_gamma = live_at(edge)
+        live_plus, _ = live_at(edge + edge_step)
+        live_minus, _ = live_at(edge - edge_step)
+        # Density and temperature alone cannot establish whether the outer
+        # face is beyond the database's (nu/v, Es/v) domain: both coordinates
+        # are energy-resolved.  Reuse the direct model's local-coordinate
+        # calculation for this host-only probe; it performs no NTX solve.
+        # The shared model is normally a CombinedTransportFluxModel.  The
+        # runtime NTX coordinate routine lives on its neoclassical component,
+        # not on the composite wrapper.
+        diagnostic_model = getattr(
+            self.shared_flux_model, "neoclassical_model", self.shared_flux_model
+        )
+        local_scan_inputs = getattr(diagnostic_model, "_local_scan_inputs", None)
+        static_support = getattr(diagnostic_model, "_static_support", None)
+        if callable(local_scan_inputs) and callable(static_support):
+            support = static_support()
+            face_drds = jnp.asarray(support.face_channels.drds[-1])
+            face_density = safe_density(face_state_at_edge.density, self.density_floor)
+            face_temperature = face_state_at_edge.temperature
+            face_vthermal = get_v_thermal(diagnostic_model.species.mass, face_temperature)
+            collisionality_kind = _collisionality_kind(
+                getattr(diagnostic_model, "collisionality_model", "default")
+            )
+            species_indices = jnp.arange(
+                int(diagnostic_model.species.number_species), dtype=jnp.int32
+            )
+
+            def _outer_face_scan_inputs(species_index):
+                nu_hat, epsi_hat, _ = local_scan_inputs(
+                    drds_value=face_drds,
+                    species_index=species_index,
+                    er_value=edge,
+                    temperature_local=face_temperature[:, -1],
+                    density_local=face_density[:, -1],
+                    vthermal_local=face_vthermal[:, -1],
+                    collisionality_kind=collisionality_kind,
+                )
+                return nu_hat, epsi_hat
+
+            outer_face_nu_over_v, outer_face_es_over_v = jax.vmap(
+                _outer_face_scan_inputs
+            )(species_indices)
+        else:
+            outer_face_nu_over_v = None
+            outer_face_es_over_v = None
+        return {
+            "edge": edge,
+            "edge_step": edge_step,
+            "cached_rhs": cached_0,
+            "cached_drhs_dedge_fd": (cached_plus - cached_minus) / (2.0 * edge_step),
+            "cached_gamma_by_species": cached_gamma,
+            "live_rhs": live_0,
+            "live_drhs_dedge_fd": (live_plus - live_minus) / (2.0 * edge_step),
+            "live_gamma_by_species": live_gamma,
+            "face_density_by_species": face_state_at_edge.density[:, -1],
+            "face_temperature_by_species": face_state_at_edge.temperature[:, -1],
+            "outer_face_nu_over_v": outer_face_nu_over_v,
+            "outer_face_es_over_v": outer_face_es_over_v,
+            "state_last_center_Er": working_state.Er[-1],
+        }
+
+    def pullback_shared_fluxes(self, state, shared_fluxes, rhs_bar):
+        """Reverse-only pullback for the shared-flux -> RHS assembly.
+
+        This keeps the primal map unchanged, but lets reverse split the shared
+        transport flux assembly by equation instead of VJP-ing the whole
+        composed RHS map as one giant object.
+        """
+        working_state, eidx = self._prepare_working_state(state)
+        density_eq, temperature_eq, er_eq = self._resolve_equations()
+        zero_flux_bar = self._shared_fluxes_zero_like(shared_fluxes)
+
+        density_bar = rhs_bar.density
+        pressure_bar = rhs_bar.pressure
+        er_bar = rhs_bar.Er
+
+        def _density_map(fluxes_value):
+            density_rhs = (
+                density_eq(working_state, fluxes=fluxes_value)
+                if density_eq is not None
+                else jnp.zeros_like(state.density)
+            )
+            density_rhs = _expand_density_rhs_to_full_shape(density_rhs, state.density, self.species)
+            if eidx is not None:
+                density_rhs = density_rhs.at[int(eidx), :].set(jnp.zeros_like(density_rhs[int(eidx), :]))
+            if density_eq is not None and hasattr(density_eq, "enforce_dirichlet_boundary_rhs"):
+                density_rhs = density_eq.enforce_dirichlet_boundary_rhs(working_state, density_rhs)
+            return density_rhs
+
+        def _pressure_map(fluxes_value):
+            density_rhs = (
+                density_eq(working_state, fluxes=fluxes_value)
+                if density_eq is not None
+                else jnp.zeros_like(state.density)
+            )
+            density_rhs = _expand_density_rhs_to_full_shape(density_rhs, state.density, self.species)
+            if eidx is not None:
+                density_rhs = density_rhs.at[int(eidx), :].set(jnp.zeros_like(density_rhs[int(eidx), :]))
+            pressure_rhs = (
+                temperature_eq(working_state, fluxes=fluxes_value)
+                if temperature_eq is not None
+                else jnp.zeros_like(state.pressure)
+            )
+            if temperature_eq is not None and hasattr(temperature_eq, "enforce_dirichlet_boundary_rhs"):
+                pressure_rhs = temperature_eq.enforce_dirichlet_boundary_rhs(working_state, density_rhs, pressure_rhs)
+            return pressure_rhs
+
+        def _er_map(fluxes_value):
+            er_rhs = (
+                er_eq(working_state, fluxes=fluxes_value)
+                if er_eq is not None
+                else jnp.zeros_like(state.Er)
+            )
+            if er_eq is not None and hasattr(er_eq, "enforce_dirichlet_boundary_rhs"):
+                er_rhs = er_eq.enforce_dirichlet_boundary_rhs(working_state, er_rhs)
+            return er_rhs
+
+        flux_bar = zero_flux_bar
+        if density_eq is not None:
+            _, density_pullback = jax.vjp(_density_map, shared_fluxes)
+            (density_flux_bar,) = density_pullback(density_bar)
+            flux_bar = self._shared_fluxes_add(flux_bar, density_flux_bar)
+        if temperature_eq is not None:
+            _, pressure_pullback = jax.vjp(_pressure_map, shared_fluxes)
+            (pressure_flux_bar,) = pressure_pullback(pressure_bar)
+            flux_bar = self._shared_fluxes_add(flux_bar, pressure_flux_bar)
+        if er_eq is not None:
+            _, er_pullback = jax.vjp(_er_map, shared_fluxes)
+            (er_flux_bar,) = er_pullback(er_bar)
+            flux_bar = self._shared_fluxes_add(flux_bar, er_flux_bar)
+        return flux_bar
+
+    def _pullback_shared_flux_rhs_state_and_fluxes(self, state, working_state, eidx, shared_fluxes, rhs_bar):
+        """Joint assembly pullback with respect to working state and shared fluxes."""
+
+        def _assembly_map(working_state_value, fluxes_value):
+            return self._evaluate_with_shared_fluxes_from_working_state(
+                working_state_value,
+                eidx,
+                state,
+                fluxes_value,
+            )
+
+        _, assembly_pullback = jax.vjp(_assembly_map, working_state, shared_fluxes)
+        return assembly_pullback(rhs_bar)
+
+    def _pullback_shared_flux_rhs_state(self, state, working_state, eidx, shared_fluxes, rhs_bar):
+        """Reverse-only split pullback for fixed-shared-flux RHS state dependence."""
+        density_eq, temperature_eq, er_eq = self._resolve_equations()
+        zero_working_state_bar = jax.tree_util.tree_map(jnp.zeros_like, working_state)
+
+        density_bar = rhs_bar.density
+        pressure_bar = rhs_bar.pressure
+        er_bar = rhs_bar.Er
+
+        def _add_state_bars(lhs, rhs):
+            return jax.tree_util.tree_map(lambda a, b: a + b, lhs, rhs)
+
+        def _density_map(working_state_value):
+            density_rhs = (
+                density_eq(working_state_value, fluxes=shared_fluxes)
+                if density_eq is not None
+                else jnp.zeros_like(state.density)
+            )
+            density_rhs = _expand_density_rhs_to_full_shape(density_rhs, state.density, self.species)
+            if eidx is not None:
+                density_rhs = density_rhs.at[int(eidx), :].set(jnp.zeros_like(density_rhs[int(eidx), :]))
+            if density_eq is not None and hasattr(density_eq, "enforce_dirichlet_boundary_rhs"):
+                density_rhs = density_eq.enforce_dirichlet_boundary_rhs(working_state_value, density_rhs)
+            return density_rhs
+
+        def _pressure_map(working_state_value):
+            density_rhs = (
+                density_eq(working_state_value, fluxes=shared_fluxes)
+                if density_eq is not None
+                else jnp.zeros_like(state.density)
+            )
+            density_rhs = _expand_density_rhs_to_full_shape(density_rhs, state.density, self.species)
+            if eidx is not None:
+                density_rhs = density_rhs.at[int(eidx), :].set(jnp.zeros_like(density_rhs[int(eidx), :]))
+            pressure_rhs = (
+                temperature_eq(working_state_value, fluxes=shared_fluxes)
+                if temperature_eq is not None
+                else jnp.zeros_like(state.pressure)
+            )
+            if temperature_eq is not None and hasattr(temperature_eq, "enforce_dirichlet_boundary_rhs"):
+                pressure_rhs = temperature_eq.enforce_dirichlet_boundary_rhs(
+                    working_state_value,
+                    density_rhs,
+                    pressure_rhs,
+                )
+            return pressure_rhs
+
+        def _er_map(working_state_value):
+            er_rhs = (
+                er_eq(working_state_value, fluxes=shared_fluxes)
+                if er_eq is not None
+                else jnp.zeros_like(state.Er)
+            )
+            if er_eq is not None and hasattr(er_eq, "enforce_dirichlet_boundary_rhs"):
+                er_rhs = er_eq.enforce_dirichlet_boundary_rhs(working_state_value, er_rhs)
+            return er_rhs
+
+        working_state_bar = zero_working_state_bar
+        if density_eq is not None:
+            _, density_pullback = jax.vjp(_density_map, working_state)
+            (density_state_bar,) = density_pullback(density_bar)
+            working_state_bar = _add_state_bars(working_state_bar, density_state_bar)
+        if temperature_eq is not None:
+            _, pressure_pullback = jax.vjp(_pressure_map, working_state)
+            (pressure_state_bar,) = pressure_pullback(pressure_bar)
+            working_state_bar = _add_state_bars(working_state_bar, pressure_state_bar)
+        if er_eq is not None:
+            _, er_pullback = jax.vjp(_er_map, working_state)
+            (er_state_bar,) = er_pullback(er_bar)
+            working_state_bar = _add_state_bars(working_state_bar, er_state_bar)
+        return working_state_bar
+
+    def _pullback_shared_flux_rhs_state_component(
+        self,
+        state,
+        working_state,
+        eidx,
+        shared_fluxes,
+        rhs_bar,
+        *,
+        component: str,
+    ):
+        """Diagnostic fixed-shared-flux state pullback for one equation block."""
+        density_eq, temperature_eq, er_eq = self._resolve_equations()
+        zero_working_state_bar = jax.tree_util.tree_map(jnp.zeros_like, working_state)
+        component_name = str(component).strip().lower()
+
+        def _er_direct_subterm_map(working_state_value, subterm_name):
+            if er_eq is None:
+                return jnp.zeros_like(state.Er)
+            Er = working_state_value.Er
+            plasma_permitivity = _plasma_permitivity_from_prefactor(
+                working_state_value,
+                er_eq.species_mass,
+                er_eq.permitivity_prefactor,
+            )
+            Gamma = _get_center_flux(shared_fluxes, "Gamma")
+            _, ambi_term = er_eq._charge_flux_and_ambi_term(
+                working_state_value,
+                Gamma,
+                plasma_permitivity,
+            )
+            _, er_diffusion = er_eq._er_diffusion(Er)
+            if subterm_name == "er_diffusion":
+                er_rhs = er_eq.Er_relax * er_eq.DEr * er_diffusion
+            elif subterm_name in {"er_ambipolar", "er_ambi_coeff"}:
+                er_rhs = -er_eq.Er_relax * ambi_term
+                if er_eq.boundary_mode == "floating_ambipolar_edge":
+                    er_rhs = er_rhs.at[-1].set(
+                        -er_eq.Er_relax
+                        * er_eq._outer_face_ambi_term(
+                            working_state_value,
+                            Gamma,
+                            plasma_permitivity,
+                        )
+                    )
+            elif subterm_name == "er_ambi_charge_flux":
+                # In this fixed-shared-flux diagnostic, charge_flux is held
+                # fixed; any nonzero state pullback here would indicate we
+                # accidentally differentiated through the flux model again.
+                er_rhs = jnp.zeros_like(state.Er)
+            else:
+                raise ValueError(f"Unknown Er direct RHS subterm {subterm_name!r}.")
+            if hasattr(er_eq, "enforce_dirichlet_boundary_rhs"):
+                er_rhs = er_eq.enforce_dirichlet_boundary_rhs(working_state_value, er_rhs)
+            return er_rhs
+
+        def _density_map(working_state_value):
+            density_rhs = (
+                density_eq(working_state_value, fluxes=shared_fluxes)
+                if density_eq is not None
+                else jnp.zeros_like(state.density)
+            )
+            density_rhs = _expand_density_rhs_to_full_shape(density_rhs, state.density, self.species)
+            if eidx is not None:
+                density_rhs = density_rhs.at[int(eidx), :].set(jnp.zeros_like(density_rhs[int(eidx), :]))
+            if density_eq is not None and hasattr(density_eq, "enforce_dirichlet_boundary_rhs"):
+                density_rhs = density_eq.enforce_dirichlet_boundary_rhs(working_state_value, density_rhs)
+            return density_rhs
+
+        def _pressure_map(working_state_value):
+            density_rhs = (
+                density_eq(working_state_value, fluxes=shared_fluxes)
+                if density_eq is not None
+                else jnp.zeros_like(state.density)
+            )
+            density_rhs = _expand_density_rhs_to_full_shape(density_rhs, state.density, self.species)
+            if eidx is not None:
+                density_rhs = density_rhs.at[int(eidx), :].set(jnp.zeros_like(density_rhs[int(eidx), :]))
+            pressure_rhs = (
+                temperature_eq(working_state_value, fluxes=shared_fluxes)
+                if temperature_eq is not None
+                else jnp.zeros_like(state.pressure)
+            )
+            if temperature_eq is not None and hasattr(temperature_eq, "enforce_dirichlet_boundary_rhs"):
+                pressure_rhs = temperature_eq.enforce_dirichlet_boundary_rhs(
+                    working_state_value,
+                    density_rhs,
+                    pressure_rhs,
+                )
+            return pressure_rhs
+
+        def _er_map(working_state_value):
+            er_rhs = (
+                er_eq(working_state_value, fluxes=shared_fluxes)
+                if er_eq is not None
+                else jnp.zeros_like(state.Er)
+            )
+            if er_eq is not None and hasattr(er_eq, "enforce_dirichlet_boundary_rhs"):
+                er_rhs = er_eq.enforce_dirichlet_boundary_rhs(working_state_value, er_rhs)
+            return er_rhs
+
+        if component_name == "density":
+            if density_eq is None:
+                return zero_working_state_bar
+            _, density_pullback = jax.vjp(_density_map, working_state)
+            (density_state_bar,) = density_pullback(rhs_bar.density)
+            return density_state_bar
+        if component_name == "pressure":
+            if temperature_eq is None:
+                return zero_working_state_bar
+            _, pressure_pullback = jax.vjp(_pressure_map, working_state)
+            (pressure_state_bar,) = pressure_pullback(rhs_bar.pressure)
+            return pressure_state_bar
+        if component_name == "er":
+            if er_eq is None:
+                return zero_working_state_bar
+            _, er_pullback = jax.vjp(_er_map, working_state)
+            (er_state_bar,) = er_pullback(rhs_bar.Er)
+            return er_state_bar
+        if component_name in {"er_diffusion", "er_ambipolar", "er_ambi_coeff", "er_ambi_charge_flux"}:
+            if er_eq is None:
+                return zero_working_state_bar
+            _, er_pullback = jax.vjp(
+                lambda working_state_value: _er_direct_subterm_map(working_state_value, component_name),
+                working_state,
+            )
+            (er_state_bar,) = er_pullback(rhs_bar.Er)
+            return er_state_bar
+        raise ValueError(f"Unknown direct RHS state component {component!r}.")
+
+    def pullback_evaluate_with_lagged_response(self, t, state, runtime, lagged_response, rhs_bar):
+        """Reverse-only pullback for lagged-response dependence of the RHS."""
+        del t, runtime
+        if self.shared_flux_model is None or lagged_response is None or lagged_response.flux_response is None:
+            return TransportLaggedResponse(flux_response=None)
+
+        working_state, eidx = self._prepare_working_state(state)
+        shared_fluxes = self.shared_flux_model.evaluate_with_lagged_response(
+            working_state,
+            lagged_response.flux_response,
+            **self._shared_flux_bc_kwargs(),
+        )
+        flux_bar = self.pullback_shared_fluxes(state, shared_fluxes, rhs_bar)
+        pullback_fn = getattr(self.shared_flux_model, "pullback_evaluate_with_lagged_response", None)
+        if callable(pullback_fn):
+            flux_response_bar = pullback_fn(
+                working_state,
+                lagged_response.flux_response,
+                flux_bar,
+                **self._shared_flux_bc_kwargs(),
+            )
+        else:
+            _, flux_pullback = jax.vjp(
+                lambda response_value: self.shared_flux_model.evaluate_with_lagged_response(
+                    working_state,
+                    response_value,
+                    **self._shared_flux_bc_kwargs(),
+                ),
+                lagged_response.flux_response,
+            )
+            (flux_response_bar,) = flux_pullback(flux_bar)
+        return TransportLaggedResponse(flux_response=flux_response_bar)
+
+    def pullback_evaluate_with_lagged_response_support_payload(
+        self,
+        t,
+        state,
+        runtime,
+        lagged_response,
+        rhs_bar,
+        support,
+    ):
+        support, geometry = self._split_realtime_geometry_payload(support)
+        if geometry is not None:
+            support_bar = self.pullback_evaluate_with_lagged_response_support_payload(
+                t,
+                state,
+                runtime,
+                lagged_response,
+                rhs_bar,
+                support,
+            )
+            geometry_delta0 = _float_delta_tree_like(geometry)
+            _, geometry_pullback = jax.vjp(
+                lambda geometry_delta: self.with_geometry_payload(
+                    _add_float_delta_tree(geometry, geometry_delta)
+                ).evaluate_with_lagged_response(
+                    t,
+                    state,
+                    runtime,
+                    lagged_response,
+                ),
+                geometry_delta0,
+            )
+            (geometry_bar,) = geometry_pullback(rhs_bar)
+            return self._realtime_geometry_payload_bar(
+                {"ntx_support": support, "geometry": geometry},
+                support_bar,
+                geometry_bar,
+            )
+        if self.shared_flux_model is None or lagged_response is None or lagged_response.flux_response is None:
+            return jax.tree_util.tree_map(jnp.zeros_like, support)
+
+        working_state, _eidx = self._prepare_working_state(state)
+        shared_fluxes = self.shared_flux_model.evaluate_with_lagged_response(
+            working_state,
+            lagged_response.flux_response,
+            **self._shared_flux_bc_kwargs(),
+        )
+        flux_bar = self.pullback_shared_fluxes(state, shared_fluxes, rhs_bar)
+        pullback_fn = getattr(
+            self.shared_flux_model,
+            "pullback_evaluate_with_lagged_response_support_payload",
+            None,
+        )
+        if callable(pullback_fn):
+            return _sanitize_float_delta_bar_tree(
+                support,
+                pullback_fn(
+                    working_state,
+                    lagged_response.flux_response,
+                    flux_bar,
+                    support,
+                    **self._shared_flux_bc_kwargs(),
+                ),
+            )
+        support_delta0 = _float_delta_tree_like(support)
+        _, support_delta_pullback = jax.vjp(
+            lambda support_delta: self.shared_flux_model.with_support_payload(
+                _add_float_delta_tree(support, support_delta)
+            ).evaluate_with_lagged_response(
+                working_state,
+                lagged_response.flux_response,
+                **self._shared_flux_bc_kwargs(),
+            ),
+            support_delta0,
+        )
+        (support_bar,) = support_delta_pullback(flux_bar)
+        return _sanitize_float_delta_bar_tree(support, support_bar)
+
+    def pullback_evaluate_with_lagged_response_state(self, t, state, runtime, lagged_response, rhs_bar):
+        """Reverse-only split pullback for state dependence of the lagged RHS."""
+        del t, runtime
+        if self.shared_flux_model is None or lagged_response is None or lagged_response.flux_response is None:
+            _, rhs_pullback = jax.vjp(
+                lambda state_value: self._evaluate_state(state_value, lagged_response=lagged_response),
+                state,
+            )
+            (state_bar,) = rhs_pullback(rhs_bar)
+            return state_bar
+
+        working_state, eidx = self._prepare_working_state(state)
+        shared_fluxes = self.shared_flux_model.evaluate_with_lagged_response(
+            working_state,
+            lagged_response.flux_response,
+            **self._shared_flux_bc_kwargs(),
+        )
+
+        direct_working_state_bar, flux_bar = self._pullback_shared_flux_rhs_state_and_fluxes(
+            state,
+            working_state,
+            eidx,
+            shared_fluxes,
+            rhs_bar,
+        )
+        flux_state_pullback_fn = getattr(self.shared_flux_model, "pullback_evaluate_with_lagged_response_state", None)
+        if callable(flux_state_pullback_fn):
+            working_state_bar = flux_state_pullback_fn(
+                working_state,
+                lagged_response.flux_response,
+                flux_bar,
+                **self._shared_flux_bc_kwargs(),
+            )
+        else:
+            _, flux_state_pullback = jax.vjp(
+                lambda working_state_value: self.shared_flux_model.evaluate_with_lagged_response(
+                    working_state_value,
+                    lagged_response.flux_response,
+                    **self._shared_flux_bc_kwargs(),
+                ),
+                working_state,
+            )
+            (working_state_bar,) = flux_state_pullback(flux_bar)
+
+        total_working_state_bar = jax.tree_util.tree_map(
+            lambda a, b: a + b,
+            direct_working_state_bar,
+            working_state_bar,
+        )
+        return self._prepare_working_state_pullback(state, total_working_state_bar)
+
+    def pullback_evaluate_with_lagged_response_state_and_response(
+        self, t, state, runtime, lagged_response, rhs_bar
+    ):
+        """Joint fixed-lagged RHS transpose for state and response only.
+
+        The initial reverse needs these two bars before its native NTX
+        build/support transpose.  Sharing RHS assembly here avoids the two
+        formerly independent state and response pullbacks, without adding a
+        support or geometry transpose to this graph.
+        """
+        del t, runtime
+        if (
+            self.shared_flux_model is None
+            or lagged_response is None
+            or lagged_response.flux_response is None
+        ):
+            _, pullback = jax.vjp(
+                lambda state_value, response_value: self._evaluate_state(
+                    state_value, lagged_response=response_value
+                ),
+                state,
+                lagged_response,
+            )
+            return pullback(rhs_bar)
+
+        working_state, eidx = self._prepare_working_state(state)
+        shared_fluxes = self.shared_flux_model.evaluate_with_lagged_response(
+            working_state,
+            lagged_response.flux_response,
+            **self._shared_flux_bc_kwargs(),
+        )
+        direct_working_state_bar, flux_bar = self._pullback_shared_flux_rhs_state_and_fluxes(
+            state, working_state, eidx, shared_fluxes, rhs_bar
+        )
+        state_pullback_fn = getattr(
+            self.shared_flux_model,
+            "pullback_evaluate_with_lagged_response_state",
+            None,
+        )
+        if callable(state_pullback_fn):
+            working_state_bar = state_pullback_fn(
+                working_state,
+                lagged_response.flux_response,
+                flux_bar,
+                **self._shared_flux_bc_kwargs(),
+            )
+        else:
+            _, state_pullback = jax.vjp(
+                lambda state_value: self.shared_flux_model.evaluate_with_lagged_response(
+                    state_value,
+                    lagged_response.flux_response,
+                    **self._shared_flux_bc_kwargs(),
+                ),
+                working_state,
+            )
+            (working_state_bar,) = state_pullback(flux_bar)
+        response_pullback_fn = getattr(
+            self.shared_flux_model,
+            "pullback_evaluate_with_lagged_response",
+            None,
+        )
+        if callable(response_pullback_fn):
+            response_bar = response_pullback_fn(
+                working_state,
+                lagged_response.flux_response,
+                flux_bar,
+                **self._shared_flux_bc_kwargs(),
+            )
+        else:
+            _, response_pullback = jax.vjp(
+                lambda response_value: self.shared_flux_model.evaluate_with_lagged_response(
+                    working_state,
+                    response_value,
+                    **self._shared_flux_bc_kwargs(),
+                ),
+                lagged_response.flux_response,
+            )
+            (response_bar,) = response_pullback(flux_bar)
+        state_bar = self._prepare_working_state_pullback(
+            state,
+            jax.tree_util.tree_map(
+                lambda direct_bar, flux_state_bar: direct_bar + flux_state_bar,
+                direct_working_state_bar,
+                working_state_bar,
+            ),
+        )
+        return state_bar, TransportLaggedResponse(flux_response=response_bar)
+
+    def pullback_evaluate_with_lagged_response_all(
+        self,
+        t,
+        state,
+        runtime,
+        lagged_response,
+        rhs_bar,
+        support,
+    ):
+        """Joint fixed-lagged RHS pullback for state, response, and NTX support.
+
+        This is an exact reverse-only convenience hook.  When the support
+        payload contains a realtime-geometry component, retain the existing
+        geometry pullback path: it differentiates the VMEC payload separately
+        and must not be replaced by a generic transport VJP.  For the normal
+        NTX-support-only path, evaluate shared fluxes and the RHS assembly
+        pullback once, then fan its common flux cotangent out to the three
+        existing exact flux-model pullbacks.
+        """
+        del t, runtime
+        support_ntx, geometry = self._split_realtime_geometry_payload(support)
+        if (
+            self.shared_flux_model is None
+            or lagged_response is None
+            or lagged_response.flux_response is None
+            or support_ntx is None
+        ):
+            return (
+                self.pullback_evaluate_with_lagged_response_state(
+                    0.0, state, None, lagged_response, rhs_bar
+                ),
+                self.pullback_evaluate_with_lagged_response(
+                    0.0, state, None, lagged_response, rhs_bar
+                ),
+                self.pullback_evaluate_with_lagged_response_support_payload(
+                    0.0, state, None, lagged_response, rhs_bar, support
+                ),
+            )
+
+        working_state, eidx = self._prepare_working_state(state)
+        shared_fluxes = self.shared_flux_model.evaluate_with_lagged_response(
+            working_state,
+            lagged_response.flux_response,
+            **self._shared_flux_bc_kwargs(),
+        )
+        direct_working_state_bar, flux_bar = self._pullback_shared_flux_rhs_state_and_fluxes(
+            state,
+            working_state,
+            eidx,
+            shared_fluxes,
+            rhs_bar,
+        )
+
+        flux_state_pullback_fn = getattr(
+            self.shared_flux_model,
+            "pullback_evaluate_with_lagged_response_state",
+            None,
+        )
+        if callable(flux_state_pullback_fn):
+            working_state_bar = flux_state_pullback_fn(
+                working_state,
+                lagged_response.flux_response,
+                flux_bar,
+                **self._shared_flux_bc_kwargs(),
+            )
+        else:
+            _, flux_state_pullback = jax.vjp(
+                lambda working_state_value: self.shared_flux_model.evaluate_with_lagged_response(
+                    working_state_value,
+                    lagged_response.flux_response,
+                    **self._shared_flux_bc_kwargs(),
+                ),
+                working_state,
+            )
+            (working_state_bar,) = flux_state_pullback(flux_bar)
+
+        response_pullback_fn = getattr(
+            self.shared_flux_model,
+            "pullback_evaluate_with_lagged_response",
+            None,
+        )
+        if callable(response_pullback_fn):
+            flux_response_bar = response_pullback_fn(
+                working_state,
+                lagged_response.flux_response,
+                flux_bar,
+                **self._shared_flux_bc_kwargs(),
+            )
+        else:
+            _, response_pullback = jax.vjp(
+                lambda response_value: self.shared_flux_model.evaluate_with_lagged_response(
+                    working_state,
+                    response_value,
+                    **self._shared_flux_bc_kwargs(),
+                ),
+                lagged_response.flux_response,
+            )
+            (flux_response_bar,) = response_pullback(flux_bar)
+
+        if geometry is not None:
+            # Geometry remains on the established VMEC payload reverse path.
+            # State and response above still shared their assembly traversal.
+            support_bar = self.pullback_evaluate_with_lagged_response_support_payload(
+                0.0,
+                state,
+                None,
+                lagged_response,
+                rhs_bar,
+                support,
+            )
+        else:
+            support_pullback_fn = getattr(
+                self.shared_flux_model,
+                "pullback_evaluate_with_lagged_response_support_payload",
+                None,
+            )
+            if callable(support_pullback_fn):
+                support_bar = support_pullback_fn(
+                    working_state,
+                    lagged_response.flux_response,
+                    flux_bar,
+                    support_ntx,
+                    **self._shared_flux_bc_kwargs(),
+                )
+            else:
+                support_delta0 = _float_delta_tree_like(support_ntx)
+                _, support_pullback = jax.vjp(
+                    lambda support_delta: self.shared_flux_model.with_support_payload(
+                        _add_float_delta_tree(support_ntx, support_delta)
+                    ).evaluate_with_lagged_response(
+                        working_state,
+                        lagged_response.flux_response,
+                        **self._shared_flux_bc_kwargs(),
+                    ),
+                    support_delta0,
+                )
+                (support_bar,) = support_pullback(flux_bar)
+
+        state_bar = self._prepare_working_state_pullback(
+            state,
+            jax.tree_util.tree_map(lambda a, b: a + b, direct_working_state_bar, working_state_bar),
+        )
+        return (
+            state_bar,
+            TransportLaggedResponse(flux_response=flux_response_bar),
+            (
+                support_bar
+                if geometry is not None
+                else _sanitize_float_delta_bar_tree(support_ntx, support_bar)
+            ),
+        )
+
+    def pullback_evaluate_with_lagged_response_state_direct(self, t, state, runtime, lagged_response, rhs_bar):
+        """State pullback through equation assembly with shared fluxes held fixed."""
+        del t, runtime
+        if self.shared_flux_model is None or lagged_response is None or lagged_response.flux_response is None:
+            return jax.tree_util.tree_map(jnp.zeros_like, state)
+
+        working_state, eidx = self._prepare_working_state(state)
+        shared_fluxes = self.shared_flux_model.evaluate_with_lagged_response(
+            working_state,
+            lagged_response.flux_response,
+            **self._shared_flux_bc_kwargs(),
+        )
+        direct_working_state_bar = self._pullback_shared_flux_rhs_state(
+            state,
+            working_state,
+            eidx,
+            shared_fluxes,
+            rhs_bar,
+        )
+        return self._prepare_working_state_pullback(state, direct_working_state_bar)
+
+    def _pullback_evaluate_with_lagged_response_state_direct_component(
+        self,
+        t,
+        state,
+        runtime,
+        lagged_response,
+        rhs_bar,
+        *,
+        component: str,
+    ):
+        del t, runtime
+        if self.shared_flux_model is None or lagged_response is None or lagged_response.flux_response is None:
+            return jax.tree_util.tree_map(jnp.zeros_like, state)
+
+        working_state, eidx = self._prepare_working_state(state)
+        shared_fluxes = self.shared_flux_model.evaluate_with_lagged_response(
+            working_state,
+            lagged_response.flux_response,
+            **self._shared_flux_bc_kwargs(),
+        )
+        direct_working_state_bar = self._pullback_shared_flux_rhs_state_component(
+            state,
+            working_state,
+            eidx,
+            shared_fluxes,
+            rhs_bar,
+            component=component,
+        )
+        return self._prepare_working_state_pullback(state, direct_working_state_bar)
+
+    def pullback_evaluate_with_lagged_response_state_direct_density(self, t, state, runtime, lagged_response, rhs_bar):
+        return self._pullback_evaluate_with_lagged_response_state_direct_component(
+            t,
+            state,
+            runtime,
+            lagged_response,
+            rhs_bar,
+            component="density",
+        )
+
+    def pullback_evaluate_with_lagged_response_state_direct_pressure(self, t, state, runtime, lagged_response, rhs_bar):
+        return self._pullback_evaluate_with_lagged_response_state_direct_component(
+            t,
+            state,
+            runtime,
+            lagged_response,
+            rhs_bar,
+            component="pressure",
+        )
+
+    def pullback_evaluate_with_lagged_response_state_direct_er(self, t, state, runtime, lagged_response, rhs_bar):
+        return self._pullback_evaluate_with_lagged_response_state_direct_component(
+            t,
+            state,
+            runtime,
+            lagged_response,
+            rhs_bar,
+            component="er",
+        )
+
+    def pullback_evaluate_with_lagged_response_state_direct_er_diffusion(self, t, state, runtime, lagged_response, rhs_bar):
+        return self._pullback_evaluate_with_lagged_response_state_direct_component(
+            t,
+            state,
+            runtime,
+            lagged_response,
+            rhs_bar,
+            component="er_diffusion",
+        )
+
+    def pullback_evaluate_with_lagged_response_state_direct_er_ambipolar(self, t, state, runtime, lagged_response, rhs_bar):
+        return self._pullback_evaluate_with_lagged_response_state_direct_component(
+            t,
+            state,
+            runtime,
+            lagged_response,
+            rhs_bar,
+            component="er_ambipolar",
+        )
+
+    def pullback_evaluate_with_lagged_response_state_direct_er_ambi_coeff(self, t, state, runtime, lagged_response, rhs_bar):
+        return self._pullback_evaluate_with_lagged_response_state_direct_component(
+            t,
+            state,
+            runtime,
+            lagged_response,
+            rhs_bar,
+            component="er_ambi_coeff",
+        )
+
+    def pullback_evaluate_with_lagged_response_state_direct_er_ambi_charge_flux(self, t, state, runtime, lagged_response, rhs_bar):
+        return self._pullback_evaluate_with_lagged_response_state_direct_component(
+            t,
+            state,
+            runtime,
+            lagged_response,
+            rhs_bar,
+            component="er_ambi_charge_flux",
+        )
+
+    def pullback_evaluate_with_lagged_response_state_direct_generic(self, t, state, runtime, lagged_response, rhs_bar):
+        """Diagnostic generic VJP for fixed-shared-flux RHS state dependence."""
+        del t, runtime
+        if self.shared_flux_model is None or lagged_response is None or lagged_response.flux_response is None:
+            return jax.tree_util.tree_map(jnp.zeros_like, state)
+
+        working_state, eidx = self._prepare_working_state(state)
+        shared_fluxes = self.shared_flux_model.evaluate_with_lagged_response(
+            working_state,
+            lagged_response.flux_response,
+            **self._shared_flux_bc_kwargs(),
+        )
+
+        def _rhs_from_working_state(working_state_value):
+            return self._evaluate_with_shared_fluxes_from_working_state(
+                working_state_value,
+                eidx,
+                state,
+                shared_fluxes,
+            )
+
+        _, direct_pullback = jax.vjp(_rhs_from_working_state, working_state)
+        (direct_working_state_bar,) = direct_pullback(rhs_bar)
+        return self._prepare_working_state_pullback(state, direct_working_state_bar)
+
+    def pullback_evaluate_with_lagged_response_state_flux(self, t, state, runtime, lagged_response, rhs_bar):
+        """State pullback through the shared-flux model, with equation assembly transposed separately."""
+        del t, runtime
+        if self.shared_flux_model is None or lagged_response is None or lagged_response.flux_response is None:
+            return jax.tree_util.tree_map(jnp.zeros_like, state)
+
+        working_state, _eidx = self._prepare_working_state(state)
+        shared_fluxes = self.shared_flux_model.evaluate_with_lagged_response(
+            working_state,
+            lagged_response.flux_response,
+            **self._shared_flux_bc_kwargs(),
+        )
+        flux_bar = self.pullback_shared_fluxes(state, shared_fluxes, rhs_bar)
+        flux_state_pullback_fn = getattr(self.shared_flux_model, "pullback_evaluate_with_lagged_response_state", None)
+        if callable(flux_state_pullback_fn):
+            working_state_bar = flux_state_pullback_fn(
+                working_state,
+                lagged_response.flux_response,
+                flux_bar,
+                **self._shared_flux_bc_kwargs(),
+            )
+        else:
+            _, flux_state_pullback = jax.vjp(
+                lambda working_state_value: self.shared_flux_model.evaluate_with_lagged_response(
+                    working_state_value,
+                    lagged_response.flux_response,
+                    **self._shared_flux_bc_kwargs(),
+                ),
+                working_state,
+            )
+            (working_state_bar,) = flux_state_pullback(flux_bar)
+        return self._prepare_working_state_pullback(state, working_state_bar)
+
+    def pullback_evaluate_with_lagged_response_state_flux_generic(self, t, state, runtime, lagged_response, rhs_bar):
+        """Diagnostic generic VJP for flux-model state dependence."""
+        del t, runtime
+        if self.shared_flux_model is None or lagged_response is None or lagged_response.flux_response is None:
+            return jax.tree_util.tree_map(jnp.zeros_like, state)
+
+        working_state, _eidx = self._prepare_working_state(state)
+        shared_fluxes = self.shared_flux_model.evaluate_with_lagged_response(
+            working_state,
+            lagged_response.flux_response,
+            **self._shared_flux_bc_kwargs(),
+        )
+        flux_bar = self.pullback_shared_fluxes(state, shared_fluxes, rhs_bar)
+
+        def _complete_bar_like(output, bar):
+            if not isinstance(output, dict) or not isinstance(bar, dict):
+                return bar
+
+            def _bar_or_zero(key, template):
+                value = bar.get(key, None)
+                if value is None:
+                    return jnp.zeros_like(template)
+                arr = jnp.asarray(value)
+                if arr.dtype == jax.dtypes.float0:
+                    return jnp.zeros_like(template)
+                return jnp.asarray(value, dtype=jnp.asarray(template).dtype)
+
+            return {key: _bar_or_zero(key, value) for key, value in output.items()}
+
+        def _fluxes_from_working_state(working_state_value):
+            fluxes = self.shared_flux_model.evaluate_with_lagged_response(
+                working_state_value,
+                lagged_response.flux_response,
+                **self._shared_flux_bc_kwargs(),
+            )
+            return _with_center_fluxes_from_faces(fluxes)
+
+        flux_output, flux_state_pullback = jax.vjp(_fluxes_from_working_state, working_state)
+        flux_bar = _complete_bar_like(flux_output, flux_bar)
+        (working_state_bar,) = flux_state_pullback(flux_bar)
+        return self._prepare_working_state_pullback(state, working_state_bar)
+
+    def pullback_evaluate_with_lagged_response_state_joint_generic(self, t, state, runtime, lagged_response, rhs_bar):
+        """Diagnostic joint assembly pullback with generic flux-model state VJP."""
+        del t, runtime
+        if self.shared_flux_model is None or lagged_response is None or lagged_response.flux_response is None:
+            return jax.tree_util.tree_map(jnp.zeros_like, state)
+
+        working_state, eidx = self._prepare_working_state(state)
+        shared_fluxes = self.shared_flux_model.evaluate_with_lagged_response(
+            working_state,
+            lagged_response.flux_response,
+            **self._shared_flux_bc_kwargs(),
+        )
+        direct_working_state_bar, flux_bar = self._pullback_shared_flux_rhs_state_and_fluxes(
+            state,
+            working_state,
+            eidx,
+            shared_fluxes,
+            rhs_bar,
+        )
+
+        def _complete_bar_like(output, bar):
+            if not isinstance(output, dict) or not isinstance(bar, dict):
+                return bar
+
+            def _bar_or_zero(key, template):
+                value = bar.get(key, None)
+                if value is None:
+                    return jnp.zeros_like(template)
+                arr = jnp.asarray(value)
+                if arr.dtype == jax.dtypes.float0:
+                    return jnp.zeros_like(template)
+                return jnp.asarray(value, dtype=jnp.asarray(template).dtype)
+
+            return {key: _bar_or_zero(key, value) for key, value in output.items()}
+
+        def _fluxes_from_working_state(working_state_value):
+            fluxes = self.shared_flux_model.evaluate_with_lagged_response(
+                working_state_value,
+                lagged_response.flux_response,
+                **self._shared_flux_bc_kwargs(),
+            )
+            return _with_center_fluxes_from_faces(fluxes)
+
+        flux_output, flux_state_pullback = jax.vjp(_fluxes_from_working_state, working_state)
+        flux_bar = _complete_bar_like(flux_output, flux_bar)
+        (flux_working_state_bar,) = flux_state_pullback(flux_bar)
+        total_working_state_bar = jax.tree_util.tree_map(
+            lambda a, b: a + b,
+            direct_working_state_bar,
+            flux_working_state_bar,
+        )
+        return self._prepare_working_state_pullback(state, total_working_state_bar)
 
     def _evaluate_state(self, state, lagged_response=None):
         import jax.numpy as jnp
@@ -1316,7 +6212,11 @@ class ComposedEquationSystem:
                 shared_fluxes = self.shared_flux_model.evaluate_with_lagged_response(
                     working_state,
                     lagged_response.flux_response,
+                    **self._shared_flux_bc_kwargs(),
                 )
+
+        if shared_fluxes is not None:
+            return self.evaluate_with_shared_fluxes(0.0, state, None, shared_fluxes)
 
         density_rhs = (
             density_eq(working_state, fluxes=shared_fluxes)
@@ -1348,11 +6248,7 @@ class ComposedEquationSystem:
         if er_eq is not None and hasattr(er_eq, "enforce_dirichlet_boundary_rhs"):
             Er_rhs = er_eq.enforce_dirichlet_boundary_rhs(working_state, Er_rhs)
 
-        return TransportState(
-            density=density_rhs,
-            pressure=pressure_rhs,
-            Er=Er_rhs,
-        )
+        return TransportState(density=density_rhs, pressure=pressure_rhs, Er=Er_rhs)
 
     def __call__(self, t, state, runtime):
         """

@@ -55,6 +55,89 @@ proving ground for new implicit-RHS strategies because its structure is simpler
 than Radau while still exercising the same transport-state machinery.
 
 
+Theta vs Radau In NEOPAX
+------------------------
+
+Although both ``theta_newton`` and ``radau`` are implicit backends, they do not
+currently reuse their nonlinear linearizations in the same way.
+
+``theta_newton``
+^^^^^^^^^^^^^^^^
+
+The theta backend solves a one-state implicit residual of the form
+
+.. math::
+
+   R(y_{n+1})
+   =
+   y_{n+1}
+   -
+   y_n
+   -
+   h \left[(1-\theta) f_n + \theta f(t_{n+1}, y_{n+1})\right].
+
+In the current implementation, the most Newton-like path linearizes this
+residual directly. That means the Jacobian is naturally tied to the current
+nonlinear iterate:
+
+.. math::
+
+   \frac{\partial R}{\partial y}
+   =
+   I - h \theta \frac{\partial f}{\partial y}(t_{n+1}, y_{n+1}).
+
+As a consequence, ``theta_newton`` currently behaves as follows:
+
+- ``refresh_each_iteration`` rebuilds the residual Jacobian at every Newton iteration
+- ``retry_only`` still rebuilds during a normal accepted attempt, but may reuse cached data on reduced-``dt`` retries
+- ``freeze_attempt`` is the mode that most closely resembles a modified-Newton or chord solve within one attempt
+
+The current theta path also includes a damping / line-search check on the trial
+Newton update, so one nonlinear iteration can require multiple residual
+evaluations even when the Jacobian is not rebuilt.
+
+``radau``
+^^^^^^^^^
+
+The custom Radau backend solves a coupled stage system rather than a single
+end-of-step residual. In the current implementation, the linear solve data are
+prepared at the accepted-attempt level and then reused through the inner stage
+Newton solve.
+
+Practically, this means that ``radau`` is already organized around:
+
+- a prepared attempt-level stage linearization
+- LU factors reused inside the stage Newton loop
+- embedded local-error estimation for timestep acceptance
+
+So even when both backends use similarly named reuse settings such as
+``retry_only``, the runtime behavior is not identical. In particular, Radau
+already reuses more within a normal accepted attempt than theta currently does.
+
+Practical consequence
+^^^^^^^^^^^^^^^^^^^^^
+
+For expensive transport RHS evaluations, ``theta_newton`` can therefore be
+slower per accepted step than ``radau`` even though the theta residual is
+formally simpler. The difference comes mainly from solver infrastructure rather
+than from the theta method itself.
+
+Possible future alignment
+^^^^^^^^^^^^^^^^^^^^^^^^^
+
+This is not an inherent limitation of the theta scheme. The theta implicit
+equation could also be solved with a more Radau-like reuse policy, for example
+by:
+
+- building the theta residual Jacobian once at the predictor or first iterate
+- freezing that linearization for the whole accepted attempt
+- optionally reusing it across retries or timestep-close attempts
+
+That would make ``theta_newton`` closer to a modified-Newton backend with
+attempt-level linearization reuse, which may reduce its cost substantially on
+expensive transport problems.
+
+
 Custom Radau Solver
 -------------------
 

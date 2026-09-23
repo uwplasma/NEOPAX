@@ -176,3 +176,10 @@ debug.log
 *.vtu
 *.vts
 *.xml
+
+# Generated NEOPAX run products and local recovery artifacts
+/outputs/
+/examples/outputs/
+*.bak
+/.codex*
+/*.patch

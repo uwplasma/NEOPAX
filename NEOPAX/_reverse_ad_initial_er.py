@@ -1,0 +1,1218 @@
+"""Reverse-AD helpers for differentiable initial-Er ambipolar roots."""
+
+from __future__ import annotations
+
+import dataclasses
+
+import jax
+import jax.numpy as jnp
+import numpy as np
+
+from ._ambipolarity import solve_ambipolarity_roots_radial_jax
+from ._entropy_models import get_entropy_model
+from ._monoenergetic import database_with_geometry_scale
+from ._transport_flux_models import (
+    DENSITY_STATE_TO_PHYSICAL,
+    NTXDatabaseTransportModel,
+    NTXRuntimeScanTransportModel,
+    _add_float_delta_tree,
+    _collisionality_kind,
+    _float_delta_tree_like,
+    build_evaluated_transport_state,
+    get_Thermodynamical_Forces_A1,
+    get_Thermodynamical_Forces_A2,
+    get_Thermodynamical_Forces_A3,
+    get_v_thermal,
+)
+
+
+def _nonfinite_tree_entries(tree, *, limit: int = 24):
+    """Return host-readable locations for nonfinite numerical leaves.
+
+    This is deliberately used only at the recorded scan boundary.  A database
+    scan transpose is the last point at which a table cotangent can be
+    distinguished from the scan-generated channel/surface cotangent.  Raising
+    there prevents a later VMEC payload error from obscuring the producer.
+    """
+    entries = []
+    for path, leaf in jax.tree_util.tree_flatten_with_path(tree)[0]:
+        array = jnp.asarray(leaf)
+        if not jnp.issubdtype(array.dtype, jnp.inexact):
+            continue
+        finite = np.asarray(jax.device_get(jnp.isfinite(array)))
+        if bool(np.all(finite)):
+            continue
+        first_index = tuple(int(index) for index in np.argwhere(~finite)[0].tolist())
+        entries.append(
+            f"path={path} shape={tuple(array.shape)} "
+            f"first_nonfinite_index={first_index}"
+        )
+        if len(entries) >= limit:
+            entries.append(f"truncated_after={limit}")
+            break
+    return tuple(entries)
+
+
+def _raise_if_nonfinite_recorded_scan_tree(tree, *, boundary: str):
+    entries = _nonfinite_tree_entries(tree)
+    if entries:
+        raise FloatingPointError(
+            "nonfinite recorded database scan cotangent at "
+            f"{boundary}: " + "; ".join(entries)
+        )
+
+
+def initial_er_root_setup(config: dict, runtime):
+    """Return the TOML/runtime-backed setup for selected ambipolar-Er AD."""
+
+    amb_cfg = dict(config.get("ambipolarity", {}))
+    # Keep the production TOML unchanged, but use JAX-side chunking for the
+    # AD boundary so the root profile stays traced without fusing all radii and
+    # scan points into one large NTX kernel.
+    amb_cfg["er_ambipolar_blocksize"] = int(amb_cfg.get("er_ambipolar_blocksize", 1) or 1)
+    amb_cfg["er_ambipolar_scan_batch_mode"] = "hybrid"
+    model_name = str(amb_cfg.get("er_ambipolar_method", "two_stage")).lower()
+    entropy_model_name = config.get("neoclassical", {}).get(
+        "entropy_model",
+        runtime.solver_parameters.get("neoclassical_flux_model", "ntx_database"),
+    )
+    entropy_model = get_entropy_model(entropy_model_name)
+    params = {
+        "species": runtime.species,
+        "energy_grid": runtime.energy_grid,
+        "geometry": runtime.geometry,
+        "database": runtime.database,
+        "solver_parameters": runtime.solver_parameters,
+    }
+    return amb_cfg, model_name, entropy_model, params
+
+
+def initial_er_selected_root_profile(state, *, config: dict, runtime):
+    """Return the selected ambipolar Er profile and finite-root mask."""
+
+    amb_cfg, model_name, entropy_model, params = initial_er_root_setup(config, runtime)
+    _, _, best_roots, _ = solve_ambipolarity_roots_radial_jax(
+        state=state,
+        config=config,
+        params=params,
+        model_name=model_name,
+        flux_model=runtime.models.flux,
+        entropy_model=entropy_model,
+        amb_cfg=amb_cfg,
+    )
+    best_roots = jnp.asarray(best_roots, dtype=state.Er.dtype)
+    finite_mask = jnp.isfinite(best_roots)
+    return jnp.where(finite_mask, best_roots, state.Er), finite_mask
+
+
+def initial_er_charge_flux_residuals(state, er_profile, *, runtime):
+    """Return charge-weighted particle-flux residuals at the selected root."""
+
+    charge_qp = jnp.asarray(runtime.species.charge_qp)
+    state_with_er = dataclasses.replace(state, Er=er_profile)
+    local_particle_flux = runtime.models.flux.build_local_particle_flux_evaluator(state_with_er)
+    if local_particle_flux is None:
+        raise ValueError("Initial-Er root AD requires a local particle-flux evaluator.")
+
+    def _residual_i(i):
+        gamma = local_particle_flux(i, er_profile[i])
+        return jnp.sum(charge_qp * gamma)
+
+    indices = jnp.arange(jnp.asarray(er_profile).shape[0], dtype=jnp.int32)
+    return jax.lax.map(_residual_i, indices)
+
+
+def initial_er_charge_flux_residual_scalar(state, er_profile, radius_index, *, runtime):
+    """Return one scalar charge-flux residual for compact transposition."""
+
+    charge_qp = jnp.asarray(runtime.species.charge_qp)
+    state_with_er = dataclasses.replace(state, Er=er_profile)
+    local_particle_flux = runtime.models.flux.build_local_particle_flux_evaluator(state_with_er)
+    if local_particle_flux is None:
+        raise ValueError("Initial-Er root AD requires a local particle-flux evaluator.")
+    gamma = local_particle_flux(radius_index, er_profile[radius_index])
+    return jnp.sum(charge_qp * gamma)
+
+
+def initial_er_charge_flux_residual_er_derivative(state, er_profile, *, runtime):
+    """Return d residual / d Er at each radius for selected-root AD."""
+
+    charge_qp = jnp.asarray(runtime.species.charge_qp)
+    er_profile = jnp.asarray(er_profile, dtype=state.Er.dtype)
+
+    def _residual_i_er(i, er_value):
+        er_eval = er_profile.at[i].set(er_value)
+        state_with_er = dataclasses.replace(state, Er=er_eval)
+        local_particle_flux = runtime.models.flux.build_local_particle_flux_evaluator(state_with_er)
+        if local_particle_flux is None:
+            raise ValueError("Initial-Er root AD requires a local particle-flux evaluator.")
+        gamma = local_particle_flux(i, er_value)
+        return jnp.sum(charge_qp * gamma)
+
+    indices = jnp.arange(er_profile.shape[0], dtype=jnp.int32)
+    return jax.lax.map(
+        lambda i: jax.grad(lambda er_value: _residual_i_er(i, er_value))(er_profile[i]),
+        indices,
+    )
+
+
+def compact_initial_er_database_support_bars(
+    *,
+    runtime,
+    state,
+    er_profile,
+    residual_bars,
+    support,
+    interpolation_transpose_mode="established",
+):
+    """Map selected-root charge-residual bars to recorded database tables.
+
+    The selected-root residual uses the local particle flux.  Its only
+    database-dependent contribution is therefore the neoclassical ``Gamma``
+    channel, with cotangent ``Z_a * residual_bar``.  This companion to the
+    black-box direct-RHS rule intentionally stops at the explicit database
+    leaf; the caller folds the accumulated table bars through the retained
+    runtime scan exactly once.
+    """
+    if not isinstance(support, dict) or "database" not in support:
+        raise ValueError(
+            "Compact database initial-Er support pullback requires an explicit "
+            "recorded database support leaf."
+        )
+    database_model = find_ntx_database_transport_model_in_model(runtime.models.flux)
+    if database_model is None:
+        # The normal segmented runtime already contains the fixed database
+        # model.  Keep the recorded scan-wrapper fallback for the standalone
+        # root boundary and its established contract tests.
+        database_model = find_ntx_runtime_scan_model_in_model(runtime.models.flux)
+    if database_model is None:
+        raise ValueError(
+            "Compact database initial-Er support pullback requires a database model."
+        )
+    er_profile = jnp.asarray(er_profile, dtype=state.Er.dtype)
+    residual_bars = jnp.asarray(residual_bars, dtype=state.Er.dtype)
+    if residual_bars.ndim != 2 or residual_bars.shape[1] != er_profile.shape[0]:
+        raise ValueError(
+            "Compact database initial-Er support pullback expects residual_bars "
+            "with shape (objective_count, radial_count)."
+        )
+    state_with_er = dataclasses.replace(state, Er=er_profile)
+    charge_qp = jnp.asarray(runtime.species.charge_qp, dtype=state.Er.dtype)
+
+    gamma_bars = charge_qp[None, :, None] * residual_bars[:, None, :]
+    interpolation_transpose_mode = str(interpolation_transpose_mode).strip().lower()
+    if interpolation_transpose_mode not in {"established", "legacy_sparse"}:
+        raise ValueError(
+            "Initial-Er database interpolation transpose mode must be "
+            f"'established' or 'legacy_sparse'; got "
+            f"{interpolation_transpose_mode!r}."
+        )
+    pullback_name = (
+        "pullback_local_particle_flux_support_payload_legacy_sparse"
+        if interpolation_transpose_mode == "legacy_sparse"
+        else "pullback_local_particle_flux_support_payload"
+    )
+    pullback = getattr(database_model, pullback_name, None)
+    if not callable(pullback):
+        raise ValueError(
+            "Runtime database model did not expose its selected-root "
+            f"{interpolation_transpose_mode} particle-flux transpose."
+        )
+    support_bar = pullback(
+        state_with_er,
+        {"Gamma": gamma_bars},
+        support,
+    )
+    if support_bar is None or "database" not in support_bar:
+        raise ValueError(
+            "Runtime database model did not expose its direct particle-flux transpose."
+        )
+    return support_bar["database"]
+
+
+def compact_initial_er_database_geometry_bars(
+    *, runtime, state, er_profile, residual_bars, support
+):
+    """Return selected-root local fixed-table geometry bars.
+
+    The table cotangent remains the responsibility of
+    :func:`compact_initial_er_database_support_bars` and crosses the retained
+    scan exactly once after the whole reverse sweep.  This companion returns
+    only the direct, radius-local dependence of the particle-flux residual on
+    transport geometry; it never rebuilds or transposes the scan.
+    """
+    if not isinstance(support, dict) or set(support) != {"geometry", "database"}:
+        raise ValueError(
+            "Compact database initial-Er geometry pullback requires exactly "
+            "{'geometry', 'database'} support."
+        )
+    database_model = find_ntx_database_transport_model_in_model(runtime.models.flux)
+    if database_model is None:
+        database_model = find_ntx_runtime_scan_model_in_model(runtime.models.flux)
+    if database_model is None:
+        raise ValueError(
+            "Compact database initial-Er geometry pullback requires a database model."
+        )
+    geometry_pullback = getattr(
+        database_model, "pullback_local_particle_flux_geometry_by_radius", None
+    )
+    if not callable(geometry_pullback):
+        raise ValueError(
+            "Runtime database model did not expose its local particle-flux "
+            "geometry transpose."
+        )
+    er_profile = jnp.asarray(er_profile, dtype=state.Er.dtype)
+    residual_bars = jnp.asarray(residual_bars, dtype=state.Er.dtype)
+    if residual_bars.ndim != 2 or residual_bars.shape[1] != er_profile.shape[0]:
+        raise ValueError(
+            "Compact database initial-Er geometry pullback expects residual_bars "
+            "with shape (objective_count, radial_count)."
+        )
+    state_with_er = dataclasses.replace(state, Er=er_profile)
+    return geometry_pullback(
+        state_with_er,
+        er_profile,
+        residual_bars,
+        support["geometry"],
+    )
+
+
+def _replace_ntx_support_payload_in_model(model, support):
+    if model is None or not dataclasses.is_dataclass(model) or isinstance(model, type):
+        return model, False
+    if hasattr(model, "with_support_payload"):
+        return model.with_support_payload(support), True
+    updates = {}
+    changed = False
+    for field in dataclasses.fields(model):
+        value = getattr(model, field.name)
+        if dataclasses.is_dataclass(value) and not isinstance(value, type):
+            new_value, child_changed = _replace_ntx_support_payload_in_model(value, support)
+            if child_changed:
+                updates[field.name] = new_value
+                changed = True
+    if not changed:
+        return model, False
+    return dataclasses.replace(model, **updates), True
+
+
+def runtime_with_ntx_support_payload(runtime, support):
+    """Return runtime with an explicit NTX exact-runtime support payload."""
+
+    flux_model, changed = _replace_ntx_support_payload_in_model(runtime.models.flux, support)
+    if not changed:
+        raise ValueError("Could not find an NTX exact-runtime model that accepts an explicit support payload.")
+    return dataclasses.replace(
+        runtime,
+        models=dataclasses.replace(runtime.models, flux=flux_model),
+    )
+
+
+def _replace_geometry_payload_in_model(model, geometry):
+    if model is None or not dataclasses.is_dataclass(model) or isinstance(model, type):
+        return model, False
+    if isinstance(model, NTXDatabaseTransportModel):
+        return dataclasses.replace(
+            model,
+            geometry=geometry,
+            database=database_with_geometry_scale(model.database, geometry.a_b),
+        ), True
+    updates = {}
+    changed = False
+    for field in dataclasses.fields(model):
+        value = getattr(model, field.name)
+        if field.name in {"geometry", "field"}:
+            if value is not geometry:
+                updates[field.name] = geometry
+                changed = True
+            continue
+        if dataclasses.is_dataclass(value) and not isinstance(value, type):
+            new_value, child_changed = _replace_geometry_payload_in_model(value, geometry)
+            if child_changed:
+                updates[field.name] = new_value
+                changed = True
+    if not changed:
+        return model, False
+    return dataclasses.replace(model, **updates), True
+
+
+def find_database_payload_in_model(model):
+    """Return the rebuilt database owned by a nested database flux model."""
+
+    if isinstance(model, NTXDatabaseTransportModel):
+        return model.database
+    if dataclasses.is_dataclass(model) and not isinstance(model, type):
+        for field in dataclasses.fields(model):
+            found = find_database_payload_in_model(getattr(model, field.name))
+            if found is not None:
+                return found
+    return None
+
+
+def find_ntx_database_transport_model_in_model(model):
+    """Return the nested fixed-table NTX model, if present."""
+
+    if isinstance(model, NTXDatabaseTransportModel):
+        return model
+    if dataclasses.is_dataclass(model) and not isinstance(model, type):
+        for field in dataclasses.fields(model):
+            found = find_ntx_database_transport_model_in_model(getattr(model, field.name))
+            if found is not None:
+                return found
+    return None
+
+
+def find_ntx_runtime_scan_model_in_model(model):
+    """Return the nested live NTX scan model, if the runtime owns one."""
+
+    if isinstance(model, NTXRuntimeScanTransportModel):
+        return model
+    if dataclasses.is_dataclass(model) and not isinstance(model, type):
+        for field in dataclasses.fields(model):
+            found = find_ntx_runtime_scan_model_in_model(getattr(model, field.name))
+            if found is not None:
+                return found
+    return None
+
+
+@dataclasses.dataclass(frozen=True)
+class RecordedNTXDatabaseScanOwner:
+    """The sole owner of a recorded NTX scan and its final table transpose.
+
+    This object is intentionally host-side reverse orchestration state.  It
+    is not part of a Radau segment runtime and must only be used after the
+    transport sweep has accumulated database-table cotangents.
+    """
+
+    runtime_scan: NTXRuntimeScanTransportModel
+
+    def database_support_bar(self, database_bar):
+        return self.runtime_scan.recorded_runtime_database_support_bar(database_bar)
+
+
+@dataclasses.dataclass(frozen=True)
+class DatabaseSegmentRuntime:
+    """Fixed-table runtime safe to capture by forward and segment reverse work."""
+
+    runtime: Any
+
+
+def split_recorded_ntx_database_runtime(runtime):
+    """Split fixed-table segment state from the retained scan-transpose owner.
+
+    The segment runtime keeps the concrete database and all normal transport
+    inputs, but removes the prepared scan primal.  The returned owner is the
+    only object permitted to retain that primal for the one post-sweep scan
+    VJP.
+    """
+
+    runtime_scan = find_ntx_runtime_scan_model_in_model(runtime.models.flux)
+    if runtime_scan is None:
+        raise ValueError("Database reverse ownership requires an NTX runtime scan model.")
+    if runtime_scan.scan_primal_record is None or runtime_scan.scan_primal is None:
+        raise ValueError(
+            "Database reverse ownership requires a recorded NTX scan primal."
+        )
+    if runtime_scan.database is None:
+        raise ValueError("Database reverse ownership requires a built runtime database.")
+    segment_runtime = runtime_with_fixed_ntx_database_model(runtime)
+    if find_ntx_runtime_scan_model_in_model(segment_runtime.models.flux) is not None:
+        raise RuntimeError("Database segment runtime must not retain an NTX scan model.")
+    if find_database_payload_in_model(segment_runtime.models.flux) is not runtime_scan.database:
+        raise RuntimeError("Database segment runtime failed to retain the fixed scan database.")
+    return DatabaseSegmentRuntime(segment_runtime), RecordedNTXDatabaseScanOwner(runtime_scan)
+
+
+def runtime_with_fixed_ntx_database_model(runtime):
+    """Replace live scan models by their fixed-table flux models.
+
+    This is the database segment boundary.  In particular it removes scan
+    surfaces, channels, scan primal, and scan record from all transport and
+    terminal VJP closures.  The caller retains the original scan model only
+    through :class:`RecordedNTXDatabaseScanOwner` for the final one-time
+    table-to-scan transpose.
+    """
+
+    def _replace(model):
+        if model is None or not dataclasses.is_dataclass(model) or isinstance(model, type):
+            return model, False
+        if isinstance(model, NTXRuntimeScanTransportModel):
+            if model.database is None:
+                raise ValueError("Fixed database segment runtime requires a built database.")
+            return model._database_model(), True
+        updates = {}
+        changed = False
+        for field in dataclasses.fields(model):
+            replacement, child_changed = _replace(getattr(model, field.name))
+            if child_changed:
+                updates[field.name] = replacement
+                changed = True
+        return (dataclasses.replace(model, **updates), True) if changed else (model, False)
+
+    flux_model, changed = _replace(runtime.models.flux)
+    if not changed:
+        return runtime
+    return dataclasses.replace(runtime, models=dataclasses.replace(runtime.models, flux=flux_model))
+
+
+def realtime_geometry_payload_for_runtime(runtime):
+    """Return the additive tagged geometry payload for a supported runtime.
+
+    This is intentionally not yet consumed by the established exact reverse
+    setup.  It gives database reverse setup a pure model capability boundary
+    without changing the legacy exact payload shape.
+    """
+
+    runtime_scan = find_ntx_runtime_scan_model_in_model(runtime.models.flux)
+    if runtime_scan is not None:
+        return {
+            "kind": "ntx_scan_runtime",
+            "geometry": runtime.geometry,
+            "channels": runtime_scan.channels,
+            "surfaces": runtime_scan.scan_surfaces,
+            "database": runtime_scan.database,
+        }
+    database = find_database_payload_in_model(runtime.models.flux)
+    if database is not None:
+        return {
+            "kind": "ntx_database",
+            "geometry": runtime.geometry,
+            "database": database,
+        }
+    return {
+        "kind": "ntx_exact",
+        "geometry": runtime.geometry,
+        "ntx_support": find_ntx_support_payload(runtime),
+    }
+
+
+def realtime_geometry_reverse_support_payload_for_runtime(runtime):
+    """Return only the differentiable support leaves for a runtime payload.
+
+    A normal live runtime scan deliberately excludes its cached database: it
+    is regenerated from geometry/channels/surfaces by the NTX scan model during
+    the support VJP.  The opt-in recorded route instead exposes that database
+    as a fixed explicit leaf, then folds its accumulated cotangent through the
+    retained NTX scan primal after the segmented sweep.
+    """
+
+    payload = realtime_geometry_payload_for_runtime(runtime)
+    if payload["kind"] == "ntx_scan_runtime":
+        support = {
+            "geometry": payload["geometry"],
+            "channels": payload["channels"],
+            "surfaces": payload["surfaces"],
+        }
+        runtime_scan = find_ntx_runtime_scan_model_in_model(runtime.models.flux)
+        if (
+            runtime_scan is not None
+            and bool(getattr(runtime_scan, "record_scan_primal", False))
+            and runtime_scan.scan_primal_record is not None
+            and runtime_scan.database is not None
+        ):
+            # This is an explicit differentiable leaf only for the recorded
+            # route.  Its accumulated bar is folded back into channels and
+            # surfaces exactly once after the segmented sweep.
+            support["database"] = runtime_scan.database
+        return support
+    if payload["kind"] == "ntx_exact":
+        return {
+            "geometry": payload["geometry"],
+            "ntx_support": payload["ntx_support"],
+        }
+    if payload["kind"] == "ntx_database":
+        return {
+            "geometry": payload["geometry"],
+            "database": payload["database"],
+        }
+    raise ValueError(f"Unknown realtime geometry payload kind {payload['kind']!r}.")
+
+
+def fold_recorded_ntx_scan_database_bar_into_support(runtime, support_bar):
+    """Consume a recorded scan database bar after a segmented reverse sweep.
+
+    Per-step reverse treats ``database`` as a fixed explicit leaf.  This
+    helper performs the single retained NTX coefficient transpose afterwards
+    and returns the ordinary VMEC scan-support shape, with no database leaf.
+    """
+    if not isinstance(support_bar, dict) or "database" not in support_bar:
+        return support_bar
+    runtime_scan = find_ntx_runtime_scan_model_in_model(runtime.models.flux)
+    if runtime_scan is None:
+        raise ValueError("Recorded database support bar requires an NTX runtime scan model.")
+    database_support_bar = runtime_scan.recorded_runtime_database_support_bar(
+        support_bar["database"]
+    )
+    merged = dict(support_bar)
+    merged.pop("database")
+    for key in ("channels", "surfaces"):
+        if key not in merged:
+            merged[key] = jax.tree_util.tree_map(
+                jnp.zeros_like, database_support_bar[key]
+            )
+        merged[key] = _add_float_delta_tree(merged[key], database_support_bar[key])
+    return merged
+
+
+def fold_recorded_ntx_scan_database_bars_into_support(runtime, support_bars):
+    """Fold a table of recorded database bars through one batched scan transpose.
+
+    The outer transport reverse carries one support bar per objective.  Doing
+    the retained NTX coefficient transpose separately for every row would
+    avoid the database rebuild but would still repeat its prepared adjoint.
+    Stack those independent database bars and let ``vmap`` form one batched
+    retained-scan pullback instead.  The returned tuple has exactly the same
+    row order and support-tree contract as the input.
+    """
+    support_bars = tuple(support_bars)
+    if not support_bars or not isinstance(support_bars[0], dict):
+        return support_bars
+    if "database" not in support_bars[0]:
+        return support_bars
+    if any("database" not in bar for bar in support_bars):
+        raise ValueError("Recorded database support bars must use one consistent tree.")
+    runtime_scan = find_ntx_runtime_scan_model_in_model(runtime.models.flux)
+    if runtime_scan is None:
+        raise ValueError("Recorded database support bars require an NTX runtime scan model.")
+
+    database_bars = jax.tree_util.tree_map(
+        lambda *values: jnp.stack(values),
+        *(bar["database"] for bar in support_bars),
+    )
+    batched_pullback = getattr(
+        runtime_scan, "recorded_runtime_database_support_bar_batched", None
+    )
+    database_support_bars = (
+        batched_pullback(database_bars)
+        if batched_pullback is not None
+        else jax.vmap(runtime_scan.recorded_runtime_database_support_bar)(database_bars)
+    )
+
+    def _row(tree, index):
+        return jax.tree_util.tree_map(lambda value: value[index], tree)
+
+    folded = []
+    for index, support_bar in enumerate(support_bars):
+        merged = dict(support_bar)
+        merged.pop("database")
+        database_support_bar = _row(database_support_bars, index)
+        for key in ("channels", "surfaces"):
+            if key not in merged:
+                merged[key] = jax.tree_util.tree_map(
+                    jnp.zeros_like, database_support_bar[key]
+                )
+            merged[key] = _add_float_delta_tree(merged[key], database_support_bar[key])
+        folded.append(merged)
+    return tuple(folded)
+
+
+def fold_recorded_ntx_scan_database_bar_groups_into_support(runtime_or_owner, bar_groups):
+    """Fold every report-row database bar through one retained scan transpose.
+
+    ``support_bars`` and the named component bars describe the same transport
+    reverse but used to call the retained scan VJP once per report group.  The
+    database is fixed throughout all of those groups, so concatenate their
+    objective rows and execute one batched scan transpose, then restore the
+    original grouping.  This is reporting-only bookkeeping: it changes no
+    cotangent, objective, or Lij path.
+    """
+    groups = tuple(tuple(group) for group in bar_groups)
+    indexed_bars = tuple(
+        (group_index, row_index, bar)
+        for group_index, group in enumerate(groups)
+        for row_index, bar in enumerate(group)
+        if isinstance(bar, dict) and "database" in bar
+    )
+    if not indexed_bars:
+        return groups
+    if any(
+        not isinstance(bar, dict) or "database" not in bar
+        for group in groups
+        for bar in group
+    ):
+        raise ValueError(
+            "Recorded database support-bar groups must consistently carry a database leaf."
+        )
+    owner = (
+        runtime_or_owner
+        if isinstance(runtime_or_owner, RecordedNTXDatabaseScanOwner)
+        else None
+    )
+    runtime_scan = None if owner is not None else find_ntx_runtime_scan_model_in_model(
+        runtime_or_owner.models.flux
+    )
+    if owner is None and runtime_scan is None:
+        raise ValueError("Recorded database support bars require an NTX runtime scan model.")
+
+    database_bars = jax.tree_util.tree_map(
+        lambda *values: jnp.stack(values),
+        *(bar["database"] for _group_index, _row_index, bar in indexed_bars),
+    )
+    _raise_if_nonfinite_recorded_scan_tree(
+        database_bars,
+        boundary="input fixed-table bars",
+    )
+    selected_scan = owner.runtime_scan if owner is not None else runtime_scan
+    batched_pullback = getattr(
+        selected_scan, "recorded_runtime_database_support_bar_batched", None
+    )
+    database_support_bars = (
+        batched_pullback(database_bars)
+        if batched_pullback is not None
+        else jax.vmap(
+            owner.database_support_bar if owner is not None else runtime_scan.recorded_runtime_database_support_bar,
+        )(database_bars)
+    )
+    _raise_if_nonfinite_recorded_scan_tree(
+        database_support_bars,
+        boundary="native scan transpose output",
+    )
+
+    rebuilt = [list(group) for group in groups]
+    for batch_index, (group_index, row_index, support_bar) in enumerate(indexed_bars):
+        database_support_bar = jax.tree_util.tree_map(
+            lambda value: value[batch_index], database_support_bars
+        )
+        merged = dict(support_bar)
+        merged.pop("database")
+        for key in ("channels", "surfaces"):
+            if key not in merged:
+                merged[key] = jax.tree_util.tree_map(
+                    jnp.zeros_like, database_support_bar[key]
+                )
+            merged[key] = _add_float_delta_tree(merged[key], database_support_bar[key])
+        _raise_if_nonfinite_recorded_scan_tree(
+            merged,
+            boundary=(
+                "merged scan payload "
+                f"group={group_index} objective_row={row_index} batch_row={batch_index}"
+            ),
+        )
+        rebuilt[group_index][row_index] = merged
+    return tuple(tuple(group) for group in rebuilt)
+
+
+def _replace_database_payload_in_model(model, database):
+    if model is None or not dataclasses.is_dataclass(model) or isinstance(model, type):
+        return model, False
+    if isinstance(model, NTXDatabaseTransportModel):
+        return dataclasses.replace(model, database=database), True
+    updates = {}
+    changed = False
+    for field in dataclasses.fields(model):
+        value = getattr(model, field.name)
+        if dataclasses.is_dataclass(value) and not isinstance(value, type):
+            replacement, child_changed = _replace_database_payload_in_model(value, database)
+            if child_changed:
+                updates[field.name] = replacement
+                changed = True
+    return (dataclasses.replace(model, **updates), True) if changed else (model, False)
+
+
+def _replace_ntx_runtime_scan_payload_in_model(model, payload):
+    if model is None or not dataclasses.is_dataclass(model) or isinstance(model, type):
+        return model, False
+    if isinstance(model, NTXRuntimeScanTransportModel):
+        return model.with_runtime_scan_payload(
+            geometry=payload["geometry"],
+            channels=payload.get("channels", model.channels),
+            scan_surfaces=payload.get("surfaces", model.scan_surfaces),
+            database=payload.get("database"),
+        ), True
+    updates = {}
+    changed = False
+    for field in dataclasses.fields(model):
+        value = getattr(model, field.name)
+        if dataclasses.is_dataclass(value) and not isinstance(value, type):
+            replacement, child_changed = _replace_ntx_runtime_scan_payload_in_model(value, payload)
+            if child_changed:
+                updates[field.name] = replacement
+                changed = True
+    return (dataclasses.replace(model, **updates), True) if changed else (model, False)
+
+
+def runtime_with_realtime_geometry_payload(runtime, payload):
+    """Replace a runtime from the tagged exact/database geometry payload.
+
+    The tag is Python setup metadata, not a traced JAX value.  This helper is
+    additive: the established exact callers continue to use their existing
+    geometry/support replacement functions unchanged.
+    """
+
+    if not isinstance(payload, dict):
+        raise TypeError("realtime geometry payload must be a mapping.")
+    kind = str(payload.get("kind", "")).strip().lower()
+    if kind == "ntx_exact":
+        return runtime_with_ntx_support_payload(
+            runtime_with_geometry_payload(runtime, payload["geometry"]),
+            payload["ntx_support"],
+        )
+    if kind == "ntx_database":
+        geometry = payload["geometry"]
+        database = payload["database"]
+        runtime_with_geometry = runtime_with_geometry_payload(runtime, geometry)
+        flux_model, changed = _replace_database_payload_in_model(
+            runtime_with_geometry.models.flux,
+            database,
+        )
+        if not changed:
+            raise ValueError("No NTX database transport model was found in the runtime.")
+        return dataclasses.replace(
+            runtime_with_geometry,
+            database=database,
+            models=dataclasses.replace(runtime_with_geometry.models, flux=flux_model),
+        )
+    if kind == "ntx_scan_runtime":
+        flux_model, changed = _replace_ntx_runtime_scan_payload_in_model(
+            runtime.models.flux,
+            payload,
+        )
+        if not changed:
+            raise ValueError("No live NTX runtime scan model was found in the runtime.")
+        return dataclasses.replace(
+            runtime,
+            geometry=payload["geometry"],
+            database=payload.get("database"),
+            models=dataclasses.replace(runtime.models, flux=flux_model),
+        )
+    raise ValueError(f"Unknown realtime geometry payload kind {kind!r}.")
+
+
+def _replace_geometry_and_fresh_database_payload_in_model(model, geometry, database):
+    """Replace geometry and an already-current database in one traversal.
+
+    This is intentionally narrower than :func:`runtime_with_geometry_payload`.
+    That generic helper must rescale a database when it receives new geometry
+    while retaining the model's *old* table.  The recorded-database
+    optimization stage instead supplies a table rebuilt from the current VMEC
+    geometry.  Rescaling the template table before replacing it with that
+    supplied table would create a discarded JAX computation on every trial.
+    """
+
+    if model is None or not dataclasses.is_dataclass(model) or isinstance(model, type):
+        return model, False
+    if isinstance(model, NTXDatabaseTransportModel):
+        return dataclasses.replace(model, geometry=geometry, database=database), True
+
+    updates = {}
+    changed = False
+    for field in dataclasses.fields(model):
+        value = getattr(model, field.name)
+        if field.name in {"geometry", "field"}:
+            if value is not geometry:
+                updates[field.name] = geometry
+                changed = True
+            continue
+        if dataclasses.is_dataclass(value) and not isinstance(value, type):
+            replacement, child_changed = _replace_geometry_and_fresh_database_payload_in_model(
+                value, geometry, database
+            )
+            if child_changed:
+                updates[field.name] = replacement
+                changed = True
+    return (dataclasses.replace(model, **updates), True) if changed else (model, False)
+
+
+def runtime_with_fresh_ntx_database_payload(runtime, *, geometry, database):
+    """Return ``runtime`` with new geometry and a matching fresh NTX table.
+
+    Unlike ``runtime_with_realtime_geometry_payload(..., kind='ntx_database')``,
+    this does not first derive a geometry-scaled view of the template table.
+    Callers must supply a database already built for ``geometry``.
+    """
+
+    flux_model, changed = _replace_geometry_and_fresh_database_payload_in_model(
+        runtime.models.flux, geometry, database
+    )
+    if not changed:
+        raise ValueError("No NTX database transport model was found in the runtime.")
+    return dataclasses.replace(
+        runtime,
+        geometry=geometry,
+        database=database,
+        models=dataclasses.replace(runtime.models, flux=flux_model),
+    )
+
+
+def runtime_with_realtime_geometry_reverse_support_payload(runtime, support_payload):
+    """Rebuild ``runtime`` from the differentiable reverse support leaves.
+
+    Unlike :func:`runtime_with_realtime_geometry_payload`, this accepts the
+    payload tree owned by a reverse VJP.  In particular, a live NTX scan has
+    no database leaf here: the database is regenerated from the supplied
+    geometry, channels, and surfaces.  This keeps the cache on the primal
+    side of the contract and gives later reverse boundaries one model-aware
+    replacement function.
+    """
+
+    if not isinstance(support_payload, dict):
+        raise TypeError("realtime geometry reverse support payload must be a mapping.")
+    payload = realtime_geometry_payload_for_runtime(runtime)
+    kind = str(payload["kind"])
+    if kind == "ntx_scan_runtime":
+        recorded_database_leaf = "database" in support_payload
+        required = {"geometry", "database"} if recorded_database_leaf else {"geometry", "channels", "surfaces"}
+        missing = required.difference(support_payload)
+        if missing:
+            raise ValueError(
+                "Live NTX scan reverse support payload is missing "
+                f"{sorted(missing)!r}."
+            )
+        replacement = {"kind": kind, "geometry": support_payload["geometry"], "database": support_payload.get("database")}
+        if not recorded_database_leaf:
+            replacement.update(channels=support_payload["channels"], surfaces=support_payload["surfaces"])
+        return runtime_with_realtime_geometry_payload(runtime, replacement)
+    if kind == "ntx_exact":
+        required = {"geometry", "ntx_support"}
+        missing = required.difference(support_payload)
+        if missing:
+            raise ValueError(
+                "Exact NTX reverse support payload is missing "
+                f"{sorted(missing)!r}."
+            )
+        return runtime_with_realtime_geometry_payload(
+            runtime,
+            {"kind": kind, **support_payload},
+        )
+    if kind == "ntx_database":
+        required = {"geometry", "database"}
+        missing = required.difference(support_payload)
+        if missing:
+            raise ValueError(
+                "NTX database reverse support payload is missing "
+                f"{sorted(missing)!r}."
+            )
+        return runtime_with_realtime_geometry_payload(
+            runtime,
+            {"kind": kind, **support_payload},
+        )
+    raise ValueError(f"Unknown realtime geometry payload kind {kind!r}.")
+
+
+def runtime_with_geometry_payload(runtime, geometry):
+    """Return runtime with transport geometry payload replaced everywhere needed."""
+
+    flux_model, _changed = _replace_geometry_payload_in_model(runtime.models.flux, geometry)
+    database = find_database_payload_in_model(flux_model)
+    return dataclasses.replace(
+        runtime,
+        geometry=geometry,
+        database=runtime.database if database is None else database,
+        models=dataclasses.replace(runtime.models, flux=flux_model),
+    )
+
+
+def find_ntx_support_payload_in_model(model):
+    """Return the nested NTX support payload from a flux model."""
+
+    support = getattr(model, "support", None)
+    if support is not None and hasattr(model, "with_support_payload"):
+        return support
+    if dataclasses.is_dataclass(model) and not isinstance(model, type):
+        for field in dataclasses.fields(model):
+            found = find_ntx_support_payload_in_model(getattr(model, field.name))
+            if found is not None:
+                return found
+    return None
+
+
+def find_ntx_support_payload(runtime):
+    """Return the preloaded NTX exact-runtime support payload from a runtime."""
+
+    support = find_ntx_support_payload_in_model(runtime.models.flux)
+    if support is None:
+        raise ValueError("No preloaded NTX exact-runtime support payload was found in the realtime runtime.")
+    return support
+
+
+def find_ntx_exact_support_model(model):
+    """Return the nested NTX exact-runtime model that owns prepared Lij solves."""
+
+    if (
+        model is not None
+        and callable(getattr(model, "with_support_payload", None))
+        and callable(getattr(model, "_solve_lij_prepared_local", None))
+    ):
+        return model
+    if dataclasses.is_dataclass(model) and not isinstance(model, type):
+        for field in dataclasses.fields(model):
+            found = find_ntx_exact_support_model(getattr(model, field.name))
+            if found is not None:
+                return found
+    return None
+
+
+def compact_initial_er_ntx_support_pullback_leaves(
+    *,
+    runtime,
+    state,
+    er_profile,
+    residual_bars,
+    support,
+):
+    """Compact support pullback for the initial-Er ambipolar residual.
+
+    This mirrors the local NTX particle-flux evaluator but transposes only the
+    per-radius prepared support and drds entries. It avoids a full-payload VJP
+    through ``build_local_particle_flux_evaluator`` and returns flat support-bar
+    leaves in the ``NTXExactLijRuntimeSupport`` pytree order expected by the
+    realtime-geometry reverse payload path.
+    """
+
+    model = find_ntx_exact_support_model(runtime.models.flux)
+    if model is None:
+        raise ValueError("Could not find an NTX exact-runtime model for compact initial-Er support pullback.")
+
+    er_profile = jnp.asarray(er_profile, dtype=state.Er.dtype)
+    residual_bars = jnp.asarray(residual_bars, dtype=state.Er.dtype)
+    if residual_bars.ndim != 2:
+        raise ValueError(
+            "compact initial-Er support pullback expects residual_bars with shape "
+            "(objective_count, radial_count)."
+        )
+    if er_profile.ndim != 1:
+        raise ValueError("compact initial-Er support pullback expects a 1D er_profile.")
+    if int(residual_bars.shape[1]) != int(er_profile.shape[0]):
+        raise ValueError(
+            "compact initial-Er support pullback residual radial dimension does not match er_profile: "
+            f"residual_bars.shape={residual_bars.shape}, er_profile.shape={er_profile.shape}."
+        )
+    objective_count = int(residual_bars.shape[0])
+    # Match ``NTXExactLijRuntimeTransportModel.build_local_particle_flux_evaluator``
+    # exactly.  In particular, the wHe initial state has an inactive He
+    # density at its configured floor.  The compact rule previously used the
+    # global default floor and manually reconstructed gradients, whereas the
+    # primal evaluator uses this model's configured floors, fixed-species
+    # projection, and boundary treatment.  That mismatch made the compact
+    # drds transpose nonfinite although the primal root residual was finite.
+    evaluated = build_evaluated_transport_state(
+        state,
+        model.geometry,
+        bc_density=model.bc_density,
+        bc_temperature=model.bc_temperature,
+        density_floor=model.density_floor,
+        temperature_floor=model.temperature_floor,
+    )
+    density = evaluated.center.density
+    temperature = evaluated.center.temperature
+    v_thermal = get_v_thermal(model.species.mass, temperature)
+    species_indices = jnp.arange(int(model.species.number_species), dtype=jnp.int32)
+    charge_qp = jnp.asarray(runtime.species.charge_qp, dtype=state.Er.dtype)
+    collisionality_kind = _collisionality_kind(model.collisionality_model)
+    dndr_all = evaluated.density_grad_center
+    dTdr_all = evaluated.temperature_grad_center
+
+    radius_indices = jnp.arange(er_profile.shape[0], dtype=jnp.int32)
+
+    def _batched_zero_tree_leaves(tree):
+        return tuple(
+            jnp.broadcast_to(
+                jnp.zeros_like(jnp.asarray(leaf, dtype=jnp.float64))
+                if not jnp.issubdtype(jnp.asarray(leaf).dtype, jnp.inexact)
+                else jnp.zeros_like(jnp.asarray(leaf)),
+                (objective_count,) + jnp.asarray(leaf).shape,
+            )
+            for leaf in jax.tree_util.tree_leaves(tree)
+        )
+
+    center_channels_bar = jax.tree_util.tree_map(
+        lambda leaf: jnp.broadcast_to(
+            jnp.zeros_like(jnp.asarray(leaf, dtype=jnp.float64))
+            if not jnp.issubdtype(jnp.asarray(leaf).dtype, jnp.inexact)
+            else jnp.zeros_like(jnp.asarray(leaf)),
+            (objective_count,) + jnp.asarray(leaf).shape,
+        ),
+        support.center_channels,
+    )
+    center_prepared_bar_leaves = _batched_zero_tree_leaves(support.center_prepared)
+    face_channels_bar_leaves = _batched_zero_tree_leaves(support.face_channels)
+    face_prepared_bar_leaves = _batched_zero_tree_leaves(support.face_prepared)
+
+    def _split_flat_vector(flat, sizes, shapes, treedef):
+        leaves = []
+        offset = 0
+        for size, shape in zip(sizes, shapes, strict=True):
+            leaves.append(jnp.reshape(flat[offset : offset + size], shape))
+            offset += size
+        return treedef.unflatten(leaves), flat[offset]
+
+    def _accumulate_radius(carry, radius_index):
+        channels_carry, prepared_leaf_carry = carry
+        prepared = jax.tree_util.tree_map(
+            lambda arr: jax.lax.dynamic_index_in_dim(arr, radius_index, axis=0, keepdims=False),
+            support.center_prepared,
+        )
+        drds_value = jax.lax.dynamic_index_in_dim(
+            support.center_channels.drds,
+            radius_index,
+            axis=0,
+            keepdims=False,
+        )
+        er_scalar = jax.lax.dynamic_index_in_dim(er_profile, radius_index, axis=0, keepdims=False)
+        temperature_local = jax.lax.dynamic_index_in_dim(temperature, radius_index, axis=1, keepdims=False)
+        density_local = jax.lax.dynamic_index_in_dim(density, radius_index, axis=1, keepdims=False)
+        vthermal_local = jax.lax.dynamic_index_in_dim(v_thermal, radius_index, axis=1, keepdims=False)
+        gamma_bars = residual_bars[:, radius_index, None] * charge_qp[None, :]
+        prepared_delta0 = _float_delta_tree_like(prepared)
+        prepared_delta_leaves0, prepared_delta_treedef = jax.tree_util.tree_flatten(prepared_delta0)
+        prepared_delta_shapes = tuple(jnp.asarray(leaf).shape for leaf in prepared_delta_leaves0)
+        prepared_delta_sizes = tuple(int(jnp.asarray(leaf).size) for leaf in prepared_delta_leaves0)
+        flat_delta0 = jnp.concatenate(
+            [jnp.ravel(jnp.asarray(leaf)) for leaf in prepared_delta_leaves0]
+            + [jnp.ravel(jnp.zeros_like(drds_value))]
+        )
+
+        def _gamma_from_local_support_flat(flat_delta):
+            prepared_delta, drds_delta = _split_flat_vector(
+                flat_delta,
+                prepared_delta_sizes,
+                prepared_delta_shapes,
+                prepared_delta_treedef,
+            )
+            prepared_value = _add_float_delta_tree(prepared, prepared_delta)
+            drds_local = drds_value + drds_delta
+            er_local_profile = jnp.asarray(er_profile).at[radius_index].set(er_scalar)
+            lij = jax.vmap(
+                lambda species_index: model._solve_lij_prepared_local(
+                    prepared_value,
+                    drds_value=drds_local,
+                    species_index=species_index,
+                    er_value=er_scalar,
+                    temperature_local=temperature_local,
+                    density_local=density_local,
+                    vthermal_local=vthermal_local,
+                    collisionality_kind=collisionality_kind,
+                    derivative_mode_override="direct",
+                )
+            )(species_indices)
+            a1 = jax.vmap(
+                lambda charge, density_a, temperature_a, dndr_a, dTdr_a: get_Thermodynamical_Forces_A1(
+                    charge,
+                    density_a,
+                    temperature_a,
+                    dndr_a,
+                    dTdr_a,
+                    er_local_profile,
+                )
+            )(model.species.charge, density, temperature, dndr_all, dTdr_all)
+            a2 = jax.vmap(get_Thermodynamical_Forces_A2)(temperature, dTdr_all)
+            a3 = get_Thermodynamical_Forces_A3(er_local_profile)
+            density_phys = DENSITY_STATE_TO_PHYSICAL * density_local
+            return -density_phys * (
+                lij[:, 0, 0] * jax.lax.dynamic_index_in_dim(a1, radius_index, axis=1, keepdims=False)
+                + lij[:, 0, 1] * jax.lax.dynamic_index_in_dim(a2, radius_index, axis=1, keepdims=False)
+                + lij[:, 0, 2] * jax.lax.dynamic_index_in_dim(a3, radius_index, axis=0, keepdims=False)
+            )
+
+        local_jacobian = jax.jacrev(_gamma_from_local_support_flat)(flat_delta0)
+        flat_bars = jnp.tensordot(gamma_bars, local_jacobian, axes=([1], [0]))
+        prepared_flat_size = int(sum(prepared_delta_sizes))
+        drds_bars = flat_bars[:, prepared_flat_size]
+
+        updated_prepared_leaves = []
+        offset = 0
+        for carry_leaf, size, shape in zip(
+            prepared_leaf_carry,
+            prepared_delta_sizes,
+            prepared_delta_shapes,
+            strict=True,
+        ):
+            local_bar = jnp.reshape(flat_bars[:, offset : offset + size], (objective_count,) + shape)
+            updated_prepared_leaves.append(carry_leaf.at[:, radius_index].add(local_bar))
+            offset += size
+
+        return (
+            dataclasses.replace(
+                channels_carry,
+                drds=channels_carry.drds.at[:, radius_index].add(drds_bars),
+            ),
+            tuple(updated_prepared_leaves),
+        ), None
+
+    (center_channels_bar, center_prepared_bar_leaves), _ = jax.lax.scan(
+        _accumulate_radius,
+        (center_channels_bar, center_prepared_bar_leaves),
+        radius_indices,
+    )
+    return (
+        tuple(jax.tree_util.tree_leaves(center_channels_bar))
+        + face_channels_bar_leaves
+        + tuple(center_prepared_bar_leaves)
+        + face_prepared_bar_leaves
+    )
+
+
+def compact_initial_er_state_pullback(
+    *,
+    residual_scalar_fn,
+    state,
+    er_profile,
+    residual_bars,
+    runtime,
+):
+    """Compact state pullback for the initial-Er ambipolar residual.
+
+    The generic rule forms a VJP for the full radial residual vector and then
+    batches over objective cotangents. That is the memory-heavy path that can
+    OOM after the transport cotangent sweep. This transposes one scalar radial
+    residual at a time and contracts all objective residual bars immediately,
+    matching the compact/local behavior used for the NTX support payload.
+    """
+
+    er_profile = jnp.asarray(er_profile, dtype=state.Er.dtype)
+    residual_bars = jnp.asarray(residual_bars, dtype=state.Er.dtype)
+    if residual_bars.ndim == 1:
+        residual_bars = residual_bars[None, :]
+        squeeze_result = True
+    elif residual_bars.ndim == 2:
+        squeeze_result = False
+    else:
+        raise ValueError(
+            "compact initial-Er state pullback expects residual_bars with shape "
+            "(radial_count,) or (objective_count, radial_count)."
+        )
+    if er_profile.ndim != 1:
+        raise ValueError("compact initial-Er state pullback expects a 1D er_profile.")
+    if int(residual_bars.shape[1]) != int(er_profile.shape[0]):
+        raise ValueError(
+            "compact initial-Er state pullback residual radial dimension does not match er_profile: "
+            f"residual_bars.shape={residual_bars.shape}, er_profile.shape={er_profile.shape}."
+        )
+
+    objective_count = int(residual_bars.shape[0])
+
+    def _zero_batched_like(leaf):
+        arr = jnp.asarray(leaf)
+        if not jnp.issubdtype(arr.dtype, jnp.inexact):
+            arr = arr.astype(jnp.float64)
+        return jnp.broadcast_to(jnp.zeros_like(arr), (objective_count,) + arr.shape)
+
+    state_bar0 = jax.tree_util.tree_map(_zero_batched_like, state)
+    radius_indices = jnp.arange(er_profile.shape[0], dtype=jnp.int32)
+
+    def _add_batched_trees(lhs, rhs):
+        return jax.tree_util.tree_map(lambda a, b: a + b, lhs, rhs)
+
+    def _accumulate_radius(carry, radius_index):
+        _, residual_pullback = jax.vjp(
+            lambda state_value: residual_scalar_fn(
+                state_value,
+                er_profile,
+                radius_index,
+                runtime=runtime,
+            ),
+            state,
+        )
+        (state_bar_i,) = residual_pullback(jnp.asarray(1.0, dtype=er_profile.dtype))
+        weights = residual_bars[:, radius_index]
+
+        def _scale_leaf(leaf):
+            leaf_arr = jnp.asarray(leaf)
+            return weights.reshape((objective_count,) + (1,) * leaf_arr.ndim) * leaf_arr
+
+        return _add_batched_trees(carry, jax.tree_util.tree_map(_scale_leaf, state_bar_i)), None
+
+    state_bars, _ = jax.lax.scan(_accumulate_radius, state_bar0, radius_indices)
+    if squeeze_result:
+        return jax.tree_util.tree_map(lambda leaf: leaf[0], state_bars)
+    return state_bars

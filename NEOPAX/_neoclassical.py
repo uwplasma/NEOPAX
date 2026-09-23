@@ -31,9 +31,20 @@ from ._monoenergetic import (
     monoenergetic_database_kind,
 )
 from ._monoenergetic_interpolators import monoenergetic_interpolation_kernel
+from ._interpolators import (
+    monoenergetic_interpolation_sparse_coordinate_bar,
+    monoenergetic_interpolation_sparse_table_bar,
+    monoenergetic_interpolation_stencil,
+    monoenergetic_interpolation_table_bar,
+)
+from ._interpolators_preprocessed import (
+    get_Dij_preprocessed_3d_ntss_radius,
+    radial_preprocessed_interpolation_stencil,
+    radial_preprocessed_interpolation_table_bar,
+)
 from ._species import get_Thermodynamical_Forces_A1, get_Thermodynamical_Forces_A2, get_Thermodynamical_Forces_A3
 from ._cell_variable import get_gradient_density, get_gradient_temperature
-from ._state import get_v_thermal
+from ._state import JOULE_PER_KEV, get_v_thermal
 
 DENSITY_STATE_TO_PHYSICAL = 1.0e20
 TEMPERATURE_STATE_TO_PHYSICAL = 1.0e3
@@ -49,12 +60,26 @@ COLLISIONALITY_MODEL_NTSS_ZEFF = 4
 @jit
 def get_plasma_permitivity(state, species_mass, geometry, grid_x):
     """Return epsilon(r) used in Er diffusion/ambipolar source term."""
-    psi_fac = 1.0 + 1.0 / (geometry.enlogation * jnp.square(geometry.iota))
-    psi_fac = psi_fac.at[0].set(1.0)
+    psi_den = geometry.enlogation * jnp.square(geometry.iota)
+    psi_den_active = jnp.abs(psi_den) > 0.0
+    psi_den_safe = jnp.where(psi_den_active, psi_den, 1.0)
+    psi_fac = 1.0 + jnp.where(psi_den_active, 1.0 / psi_den_safe, 0.0)
+    # Geometry is evaluated at cell centres, so index zero is not the axis
+    # face.  Keep the physically evaluated first-centre factor in sync with
+    # the transport Er equation.
     mass_density = DENSITY_STATE_TO_PHYSICAL * jnp.sum(species_mass[:, None] * state.density, axis=0)
     epsilon_r = mass_density * psi_fac / jnp.square(geometry.B0)
     plasma_permitivity = interpax.Interpolator1D(geometry.r_grid, epsilon_r, extrap=True)
-    return plasma_permitivity(grid_x)
+    evaluated = plasma_permitivity(grid_x)
+    # This helper may be queried at the axis face although its primitive
+    # geometry/state samples are cell-centred.  Apply the regularized factor
+    # only for that synthetic face; centre evaluations retain ``psi_fac``.
+    axis_face_value = mass_density[0] / jnp.square(geometry.B0[0])
+    return jnp.where(
+        jnp.asarray(grid_x) == jnp.asarray(geometry.r_grid_half[0]),
+        axis_face_value,
+        evaluated,
+    )
 
 
 def _as_species_constraint(arr, n_species):
@@ -212,6 +237,76 @@ def _assemble_lij_matrix(species, energy_grid, index_species, vth_a, nu_vnew_a, 
     return Lij
 
 
+def assemble_momentum_lij_matrices(
+    species, energy_grid, index_species, vth_a, nu_a, nu_vnew_a, Dij
+):
+    """Assemble the extended Sonine moments from local monoenergetic values.
+
+    Kept separate from database interpolation so a database transpose can
+    first reduce a corrected-flow bar to this compact ``Dij`` tensor and only
+    then scatter it through the radial interpolation stencil.
+    """
+    lij = jnp.zeros((5, 5), dtype=Dij.dtype)
+    eij = jnp.zeros((5, 5), dtype=Dij.dtype)
+    l11 = -1.0 / jnp.sqrt(jnp.pi) * (species.mass[index_species] / species.charge[index_species]) ** 2 * vth_a**3
+    l13 = -1.0 / jnp.sqrt(jnp.pi) * (species.mass[index_species] / species.charge[index_species]) * vth_a**2
+    l33 = -1.0 / jnp.sqrt(jnp.pi) * vth_a
+    d11, d13, d33 = -(10.0**Dij[:, 0]), -Dij[:, 1], -Dij[:, 2] / nu_vnew_a
+    weighted = energy_grid.xWeights
+    lij = lij.at[0, 0].set(l11 * jnp.sum(energy_grid.L11_weight * weighted * d11))
+    lij = lij.at[0, 1].set(l11 * jnp.sum(energy_grid.L12_weight * weighted * d11))
+    lij = lij.at[1, 0].set(lij[0, 1])
+    lij = lij.at[1, 1].set(l11 * jnp.sum(energy_grid.L22_weight * weighted * d11))
+    lij = lij.at[0, 2].set(l13 * jnp.sum(energy_grid.L13_weight * weighted * d13))
+    lij = lij.at[1, 2].set(l13 * jnp.sum(energy_grid.L23_weight * weighted * d13))
+    lij = lij.at[2, 0].set(-lij[0, 2])
+    lij = lij.at[2, 1].set(-lij[1, 2])
+    lij = lij.at[2, 2].set(l33 * jnp.sum(energy_grid.L33_weight * weighted * d33))
+    lij = lij.at[0, 3].set(lij[1, 2])
+    lij = lij.at[1, 3].set(l13 * jnp.sum(energy_grid.L24_weight * weighted * d13))
+    lij = lij.at[0, 4].set(lij[1, 3])
+    lij = lij.at[1, 4].set(l13 * jnp.sum(energy_grid.L25_weight * weighted * d13))
+    lij = lij.at[3, 0].set(-lij[0, 3])
+    lij = lij.at[4, 0].set(-lij[0, 4])
+    lij = lij.at[3, 1].set(-lij[1, 3])
+    lij = lij.at[4, 1].set(-lij[1, 4])
+    lij = lij.at[3, 2].set(l33 * jnp.sum(energy_grid.L43_weight * weighted * d33))
+    lij = lij.at[2, 3].set(lij[3, 2])
+    lij = lij.at[3, 3].set(l33 * jnp.sum(energy_grid.L44_weight * weighted * d33))
+    lij = lij.at[2, 4].set(lij[3, 3])
+    lij = lij.at[4, 2].set(lij[3, 3])
+    lij = lij.at[3, 4].set(l33 * jnp.sum(energy_grid.L45_weight * weighted * d33))
+    lij = lij.at[4, 3].set(lij[3, 4])
+    lij = lij.at[4, 4].set(l33 * jnp.sum(energy_grid.L55_weight * weighted * d33))
+    eij = eij.at[0, 2].set(l13 * jnp.sum(energy_grid.L13_weight * nu_a * weighted * d13))
+    eij = eij.at[1, 2].set(l13 * jnp.sum(energy_grid.L23_weight * nu_a * weighted * d13))
+    eij = eij.at[2, 0].set(-eij[0, 2])
+    eij = eij.at[2, 1].set(-eij[1, 2])
+    eij = eij.at[2, 2].set(l33 * jnp.sum(energy_grid.L33_weight * nu_a * weighted * d33))
+    eij = eij.at[0, 3].set(eij[1, 2])
+    eij = eij.at[1, 3].set(l13 * jnp.sum(energy_grid.L24_weight * nu_a * weighted * d13))
+    eij = eij.at[0, 4].set(eij[1, 3])
+    eij = eij.at[1, 4].set(l13 * jnp.sum(energy_grid.L25_weight * nu_a * weighted * d13))
+    eij = eij.at[3, 0].set(-eij[0, 3])
+    eij = eij.at[4, 0].set(-eij[0, 4])
+    eij = eij.at[3, 1].set(-eij[1, 3])
+    eij = eij.at[4, 1].set(-eij[1, 4])
+    eij = eij.at[3, 2].set(l33 * jnp.sum(energy_grid.L43_weight * nu_a * weighted * d33))
+    eij = eij.at[2, 3].set(eij[3, 2])
+    eij = eij.at[3, 3].set(l33 * jnp.sum(energy_grid.L44_weight * nu_a * weighted * d33))
+    eij = eij.at[2, 4].set(eij[3, 3])
+    eij = eij.at[4, 2].set(eij[3, 3])
+    eij = eij.at[3, 4].set(l33 * jnp.sum(energy_grid.L45_weight * nu_a * weighted * d33))
+    eij = eij.at[4, 3].set(eij[3, 4])
+    eij = eij.at[4, 4].set(l33 * jnp.sum(energy_grid.L55_weight * nu_a * weighted * d33))
+    nu_av = jnp.stack((
+        jnp.sum(nu_a * energy_grid.L13_weight * weighted),
+        jnp.sum(nu_a * energy_grid.L23_weight * weighted),
+        jnp.sum(nu_a * energy_grid.L24_weight * weighted),
+    ))
+    return lij, eij, nu_av
+
+
 def _interpolated_lij_matrix(
     species,
     energy_grid,
@@ -360,6 +455,841 @@ def _get_Neoclassical_Fluxes_generic(
     )
     Gamma, Q, Upar = results
     return Lij, Gamma, Q, Upar
+
+
+@jit
+def pullback_legacy_monoenergetic_queries_sparse(
+    database,
+    radius_values,
+    nu_queries,
+    er_queries,
+    dij_bar,
+):
+    """Aggregate sparse legacy interpolation bars over a query batch.
+
+    Parameters use a compact ``(query, energy)`` layout.  ``dij_bar`` may be
+    ``(query, energy, 3)`` or carry a leading objective/RHS axis.  Only the
+    final accumulated database bars are dense; no query carries a complete
+    coefficient table or ``Er_list`` cotangent.
+    """
+
+    radius_values = jnp.asarray(radius_values)
+    nu_queries = jnp.asarray(nu_queries)
+    er_queries = jnp.asarray(er_queries)
+    dij_bar = jnp.asarray(dij_bar)
+    batched_rhs = dij_bar.ndim == 4
+    dij_rows = dij_bar if batched_rhs else dij_bar[None, ...]
+    rhs_count = dij_rows.shape[0]
+    query_count, energy_count = nu_queries.shape
+    flat_count = query_count * energy_count
+    flat_radius = jnp.repeat(radius_values, energy_count)
+    flat_nu = jnp.reshape(nu_queries, (flat_count,))
+    flat_er = jnp.reshape(er_queries, (flat_count,))
+    flat_dij_rows = jnp.reshape(dij_rows, (rhs_count, flat_count, 3))
+
+    stencils = jax.vmap(
+        monoenergetic_interpolation_stencil, in_axes=(0, 0, 0, None)
+    )(flat_radius, flat_nu, flat_er, database)
+    unit_table_bars = jax.vmap(
+        lambda stencil: monoenergetic_interpolation_sparse_table_bar(
+            stencil,
+            jnp.asarray(1.0, dtype=database.D11_log.dtype),
+            database.D11_log,
+            database,
+        )
+    )(stencils)
+
+    def _scatter_tables(local_values, table):
+        values = (
+            local_values[:, :, None, None, None]
+            * unit_table_bars.values[None, ...]
+        )
+        output_shape = (rhs_count,) + table.shape
+        output = jnp.zeros(output_shape, dtype=table.dtype)
+        scatter_shape = values.shape
+        rhs_indices = jnp.broadcast_to(
+            jnp.arange(rhs_count, dtype=jnp.int32)[:, None, None, None, None],
+            scatter_shape,
+        )
+        radial_indices = jnp.broadcast_to(
+            unit_table_bars.radial_indices[None, :, :, None, None],
+            scatter_shape,
+        )
+        nu_indices = jnp.broadcast_to(
+            unit_table_bars.nu_indices[None, :, None, :, None],
+            scatter_shape,
+        )
+        er_indices = jnp.broadcast_to(
+            unit_table_bars.er_indices[None, :, :, None, :],
+            scatter_shape,
+        )
+        return output.at[
+            rhs_indices, radial_indices, nu_indices, er_indices
+        ].add(values)
+
+    d11_bar = _scatter_tables(flat_dij_rows[..., 0], database.D11_log)
+    d13_bar = _scatter_tables(flat_dij_rows[..., 1], database.D13)
+    d33_bar = _scatter_tables(flat_dij_rows[..., 2], database.D33)
+
+    def _query_coordinate_rows(stencil, local_rows):
+        return jax.vmap(
+            lambda local_bar: monoenergetic_interpolation_sparse_coordinate_bar(
+                stencil, local_bar, database
+            )
+        )(local_rows)
+
+    coordinate_bars = jax.vmap(_query_coordinate_rows, in_axes=(0, 1))(
+        stencils, flat_dij_rows
+    )
+    a_b_bar = jnp.sum(coordinate_bars.a_b, axis=0)
+    er_values = jnp.moveaxis(coordinate_bars.er_values, 1, 0)
+    er_scatter_shape = er_values.shape
+    rhs_indices = jnp.broadcast_to(
+        jnp.arange(rhs_count, dtype=jnp.int32)[:, None, None, None],
+        er_scatter_shape,
+    )
+    radial_indices = jnp.broadcast_to(
+        coordinate_bars.radial_indices[None, :, 0, :, None],
+        er_scatter_shape,
+    )
+    er_indices = jnp.broadcast_to(
+        coordinate_bars.er_indices[None, :, 0, ...], er_scatter_shape
+    )
+    er_list_bar = jnp.zeros(
+        (rhs_count,) + database.Er_list.shape,
+        dtype=database.Er_list.dtype,
+    ).at[rhs_indices, radial_indices, er_indices].add(er_values)
+
+    result = (a_b_bar, er_list_bar, d11_bar, d13_bar, d33_bar)
+    if batched_rhs:
+        return result
+    return tuple(value[0] for value in result)
+
+
+@jit
+def _pullback_legacy_radial_database_flux_support_sparse(
+    species,
+    energy_grid,
+    database,
+    radius_values,
+    Er_values,
+    temperature,
+    density,
+    dndr,
+    dtdr,
+    gamma_bar,
+    q_bar,
+    upar_bar,
+    collisionality_kind,
+):
+    """Reduce local neoclassical flux bars to sparse interpolation queries."""
+
+    gamma_bar = jnp.asarray(gamma_bar)
+    q_bar = jnp.asarray(q_bar)
+    upar_bar = jnp.asarray(upar_bar)
+    batched_rhs = gamma_bar.ndim == 3
+    if batched_rhs and (q_bar.ndim != 3 or upar_bar.ndim != 3):
+        raise ValueError("Database flux cotangent RHS axes must be consistent.")
+
+    vthermal = get_v_thermal(species.mass, temperature)
+    density_phys = DENSITY_STATE_TO_PHYSICAL * density
+    temperature_phys = TEMPERATURE_STATE_TO_PHYSICAL * temperature
+    a1 = jax.vmap(
+        get_Thermodynamical_Forces_A1,
+        in_axes=(0, 0, 0, 0, 0, None),
+    )(species.charge, density, temperature, dndr, dtdr, Er_values)
+    a2 = jax.vmap(get_Thermodynamical_Forces_A2, in_axes=(0, 0))(
+        temperature, dtdr
+    )
+    a3 = get_Thermodynamical_Forces_A3(Er_values)
+    radius_indices = jnp.arange(Er_values.shape[0], dtype=jnp.int32)
+    interpolation_kernel = monoenergetic_interpolation_kernel(database)
+
+    def _one_species_radius(
+        species_index,
+        radius_index,
+        radius_value,
+        a1_value,
+        a2_value,
+        density_phys_value,
+        temperature_phys_value,
+        vthermal_value,
+        gamma_local,
+        q_local,
+        upar_local,
+    ):
+        vnew = energy_grid.v_norm * vthermal_value
+        nu_over_vnew = _nu_over_vnew_local(
+            species,
+            species_index,
+            vnew,
+            density[:, radius_index],
+            temperature[:, radius_index],
+            vthermal[:, radius_index],
+            collisionality_kind,
+        )
+        er_over_vnew = Er_values[radius_index] * 1.0e3 / (
+            energy_grid.v_norm * vthermal_value
+        )
+        dij = jax.vmap(
+            lambda nu_value, er_value: interpolation_kernel(
+                radius_value, nu_value, er_value, database
+            )
+        )(nu_over_vnew, er_over_vnew)
+        forces = jnp.asarray((a1_value, a2_value, a3[radius_index]))
+        lbar = jnp.zeros(
+            jnp.shape(gamma_local) + (3, 3), dtype=temperature.dtype
+        )
+        lbar = lbar.at[..., 0, :].add(
+            -density_phys_value * gamma_local[..., None] * forces
+        )
+        lbar = lbar.at[..., 1, :].add(
+            -temperature_phys_value
+            * density_phys_value
+            * q_local[..., None]
+            * forces
+        )
+        lbar = lbar.at[..., 2, :].add(
+            -density_phys_value * upar_local[..., None] * forces
+        )
+        _, dij_pullback = jax.vjp(
+            lambda dij_value: _assemble_lij_matrix(
+                species,
+                energy_grid,
+                species_index,
+                vthermal_value,
+                nu_over_vnew,
+                dij_value,
+            ),
+            dij,
+        )
+        dij_bar = (
+            jax.vmap(dij_pullback)(lbar)[0]
+            if batched_rhs
+            else dij_pullback(lbar)[0]
+        )
+        return nu_over_vnew, er_over_vnew, dij_bar
+
+    def _one_species(
+        species_index,
+        a1_species,
+        a2_species,
+        density_phys_species,
+        temperature_phys_species,
+        vthermal_species,
+        gamma_species,
+        q_species,
+        upar_species,
+    ):
+        bar_radius_axis = 1 if batched_rhs else 0
+        return jax.vmap(
+            lambda radius_index, radius_value, a1_value, a2_value, density_value, temperature_value, vthermal_value, gamma_local, q_local, upar_local: _one_species_radius(
+                species_index,
+                radius_index,
+                radius_value,
+                a1_value,
+                a2_value,
+                density_value,
+                temperature_value,
+                vthermal_value,
+                gamma_local,
+                q_local,
+                upar_local,
+            ),
+            in_axes=(0, 0, 0, 0, 0, 0, 0, bar_radius_axis, bar_radius_axis, bar_radius_axis),
+        )(
+            radius_indices,
+            radius_values,
+            a1_species,
+            a2_species,
+            density_phys_species,
+            temperature_phys_species,
+            vthermal_species,
+            gamma_species,
+            q_species,
+            upar_species,
+        )
+
+    species_bars = (
+        jnp.moveaxis(gamma_bar, 1, 0) if batched_rhs else gamma_bar,
+        jnp.moveaxis(q_bar, 1, 0) if batched_rhs else q_bar,
+        jnp.moveaxis(upar_bar, 1, 0) if batched_rhs else upar_bar,
+    )
+    nu_queries, er_queries, dij_bars = jax.vmap(
+        _one_species,
+        in_axes=(0, 0, 0, 0, 0, 0, 0, 0, 0),
+    )(
+        species.species_indices,
+        a1,
+        a2,
+        density_phys,
+        temperature_phys,
+        vthermal,
+        *species_bars,
+    )
+    species_count = species.species_indices.shape[0]
+    radius_count = radius_values.shape[0]
+    energy_count = energy_grid.v_norm.shape[0]
+    query_radius_values = jnp.reshape(
+        jnp.broadcast_to(radius_values, (species_count, radius_count)),
+        (species_count * radius_count,),
+    )
+    nu_queries = jnp.reshape(
+        nu_queries, (species_count * radius_count, energy_count)
+    )
+    er_queries = jnp.reshape(
+        er_queries, (species_count * radius_count, energy_count)
+    )
+    if batched_rhs:
+        dij_bars = jnp.reshape(
+            jnp.moveaxis(dij_bars, 2, 0),
+            (
+                gamma_bar.shape[0],
+                species_count * radius_count,
+                energy_count,
+                3,
+            ),
+        )
+    else:
+        dij_bars = jnp.reshape(
+            dij_bars,
+            (species_count * radius_count, energy_count, 3),
+        )
+    return pullback_legacy_monoenergetic_queries_sparse(
+        database,
+        query_radius_values,
+        nu_queries,
+        er_queries,
+        dij_bars,
+    )
+
+
+@jit
+def pullback_legacy_radial_database_flux_support_sparse(
+    species,
+    energy_grid,
+    geometry,
+    database,
+    Er,
+    temperature,
+    density,
+    gamma_bar,
+    q_bar,
+    upar_bar,
+    collisionality_kind=COLLISIONALITY_MODEL_DEFAULT,
+    density_right_constraint=None,
+    density_right_grad_constraint=None,
+    temperature_right_constraint=None,
+    temperature_right_grad_constraint=None,
+):
+    """Combined sparse table/coordinate transpose for centre fluxes."""
+
+    n_right = (
+        density[:, -1]
+        if density_right_constraint is None
+        else jnp.asarray(density_right_constraint, dtype=density.dtype)
+    )
+    n_right_grad = (
+        jnp.zeros_like(n_right)
+        if density_right_grad_constraint is None
+        else jnp.asarray(density_right_grad_constraint, dtype=density.dtype)
+    )
+    t_right = (
+        temperature[:, -1]
+        if temperature_right_constraint is None
+        else jnp.asarray(temperature_right_constraint, dtype=temperature.dtype)
+    )
+    t_right_grad = (
+        jnp.zeros_like(t_right)
+        if temperature_right_grad_constraint is None
+        else jnp.asarray(temperature_right_grad_constraint, dtype=temperature.dtype)
+    )
+    dndr = jax.vmap(
+        lambda density_a, n_rc, n_rg: get_gradient_density(
+            density_a,
+            geometry.r_grid,
+            geometry.r_grid_half,
+            geometry.dr,
+            right_face_constraint=n_rc,
+            right_face_grad_constraint=n_rg,
+        )
+    )(density, n_right, n_right_grad)
+    dtdr = jax.vmap(
+        lambda temperature_a, t_rc, t_rg: get_gradient_temperature(
+            temperature_a,
+            geometry.r_grid,
+            geometry.r_grid_half,
+            geometry.dr,
+            right_face_constraint=t_rc,
+            right_face_grad_constraint=t_rg,
+        )
+    )(temperature, t_right, t_right_grad)
+    return _pullback_legacy_radial_database_flux_support_sparse(
+        species,
+        energy_grid,
+        database,
+        geometry.r_grid,
+        Er,
+        temperature,
+        density,
+        dndr,
+        dtdr,
+        gamma_bar,
+        q_bar,
+        upar_bar,
+        collisionality_kind,
+    )
+
+
+@jit
+def pullback_legacy_radial_database_face_flux_support_sparse(
+    species,
+    energy_grid,
+    geometry,
+    database,
+    Er_faces,
+    temperature_faces,
+    density_faces,
+    dndr_faces,
+    dtdr_faces,
+    gamma_bar,
+    q_bar,
+    upar_bar,
+    collisionality_kind=COLLISIONALITY_MODEL_DEFAULT,
+):
+    """Combined sparse table/coordinate transpose for one face closure."""
+
+    return _pullback_legacy_radial_database_flux_support_sparse(
+        species,
+        energy_grid,
+        database,
+        geometry.r_grid_half,
+        Er_faces,
+        temperature_faces,
+        density_faces,
+        dndr_faces,
+        dtdr_faces,
+        gamma_bar,
+        q_bar,
+        upar_bar,
+        collisionality_kind,
+    )
+
+
+@jit
+def pullback_preprocessed_radial_database_fluxes(
+    species,
+    energy_grid,
+    geometry,
+    database,
+    Er,
+    temperature,
+    density,
+    gamma_bar,
+    q_bar,
+    upar_bar,
+    collisionality_kind=COLLISIONALITY_MODEL_DEFAULT,
+    density_right_constraint=None,
+    density_right_grad_constraint=None,
+    temperature_right_constraint=None,
+    temperature_right_grad_constraint=None,
+):
+    """Explicit table transpose for centre black-box database fluxes.
+
+    This is deliberately a transpose with respect to the three NTX scan
+    tables only.  State/geometry derivatives remain on their established
+    paths.  Each local flux bar is reduced analytically through ``Lij`` and
+    the energy quadrature, then scattered through the compact 4x2x2 radial
+    interpolation stencil.  It therefore avoids constructing a JAX VJP of
+    the full database interpolation graph for every Radau stage.
+    """
+
+    # A leading RHS axis is used by the database reverse lane to share this
+    # interpolation/table primitive across objective cotangents.  The scalar
+    # public contract remains unchanged.
+    batched_rhs = jnp.asarray(gamma_bar).ndim == 3
+    if batched_rhs and (
+        jnp.asarray(q_bar).ndim != 3 or jnp.asarray(upar_bar).ndim != 3
+    ):
+        raise ValueError("Database flux cotangent RHS axes must be consistent.")
+
+    v_thermal = get_v_thermal(species.mass, temperature)
+    density_phys = DENSITY_STATE_TO_PHYSICAL * density
+    temperature_phys = TEMPERATURE_STATE_TO_PHYSICAL * temperature
+    # Match ``_get_Neoclassical_Fluxes_generic`` exactly.  The ordinary
+    # black-box RHS has no explicit constraints; the selected-root local
+    # evaluator does, so both are accepted by this table-only transpose.
+    # Keep this species-local, not merely species-batched.  The primal
+    # centre routine invokes the gradient helper once per species, and that
+    # helper interprets a rank-one profile differently from a rank-two batch.
+    n_right = (
+        density[:, -1]
+        if density_right_constraint is None
+        else jnp.asarray(density_right_constraint, dtype=density.dtype)
+    )
+    n_right_grad = (
+        jnp.zeros_like(n_right)
+        if density_right_grad_constraint is None
+        else jnp.asarray(density_right_grad_constraint, dtype=density.dtype)
+    )
+    t_right = (
+        temperature[:, -1]
+        if temperature_right_constraint is None
+        else jnp.asarray(temperature_right_constraint, dtype=temperature.dtype)
+    )
+    t_right_grad = (
+        jnp.zeros_like(t_right)
+        if temperature_right_grad_constraint is None
+        else jnp.asarray(temperature_right_grad_constraint, dtype=temperature.dtype)
+    )
+    dndr = jax.vmap(
+        lambda density_a, n_rc, n_rg: get_gradient_density(
+            density_a,
+            geometry.r_grid,
+            geometry.r_grid_half,
+            geometry.dr,
+            right_face_constraint=n_rc,
+            right_face_grad_constraint=n_rg,
+        )
+    )(density, n_right, n_right_grad)
+    dTdr = jax.vmap(
+        lambda temperature_a, t_rc, t_rg: get_gradient_temperature(
+            temperature_a,
+            geometry.r_grid,
+            geometry.r_grid_half,
+            geometry.dr,
+            right_face_constraint=t_rc,
+            right_face_grad_constraint=t_rg,
+        )
+    )(temperature, t_right, t_right_grad)
+    a1 = jax.vmap(
+        get_Thermodynamical_Forces_A1,
+        in_axes=(0, 0, 0, 0, 0, None),
+    )(species.charge, density, temperature, dndr, dTdr, Er)
+    a2 = jax.vmap(get_Thermodynamical_Forces_A2, in_axes=(0, 0))(temperature, dTdr)
+    a3 = get_Thermodynamical_Forces_A3(Er)
+
+    def _one_species_radius(
+        species_index,
+        a1_species,
+        a2_species,
+        density_phys_species,
+        temperature_phys_species,
+        vthermal_species,
+        radius_index,
+        gamma_bar_local,
+        q_bar_local,
+        upar_bar_local,
+    ):
+        vth = vthermal_species[radius_index]
+        v_new = energy_grid.v_norm * vth
+        nu_over_vnew = _nu_over_vnew(
+            species,
+            species_index,
+            v_new,
+            radius_index,
+            density,
+            temperature,
+            v_thermal,
+            collisionality_kind,
+        )
+        forces = jnp.asarray((
+            a1_species[radius_index],
+            a2_species[radius_index],
+            a3[radius_index],
+        ))
+        lbar = jnp.zeros(
+            jnp.shape(gamma_bar_local) + (3, 3), dtype=temperature.dtype
+        )
+        lbar = lbar.at[..., 0, :].add(
+            -density_phys_species[radius_index] * gamma_bar_local[..., None] * forces
+        )
+        lbar = lbar.at[..., 1, :].add(
+            -temperature_phys_species[radius_index]
+            * density_phys_species[radius_index]
+            * q_bar_local[..., None]
+            * forces
+        )
+        lbar = lbar.at[..., 2, :].add(
+            -density_phys_species[radius_index] * upar_bar_local[..., None] * forces
+        )
+
+        er_over_vnew = Er[radius_index] * 1.0e3 / (energy_grid.v_norm * vth)
+        interpolation_kernel = monoenergetic_interpolation_kernel(database)
+        dij = jax.vmap(
+            lambda nu_value, er_value: interpolation_kernel(
+                geometry.r_grid[radius_index], nu_value, er_value, database
+            )
+        )(nu_over_vnew, er_over_vnew)
+
+        # The database interpolation is the expensive part and is handled by
+        # the explicit sparse stencil below.  Retain JAX only for this tiny
+        # fixed-size 3x3 Lij algebra transpose.  It has no database pytree or
+        # interpolation graph in its residual, and is an exact safeguard for
+        # the coupled/symmetric Lij assignments while that algebra is kept in
+        # one canonical forward definition.
+        _, dij_pullback = jax.vjp(
+            lambda dij_value: _assemble_lij_matrix(
+                species, energy_grid, species_index, vth, nu_over_vnew, dij_value
+            ),
+            dij,
+        )
+        dij_bar = (
+            jax.vmap(dij_pullback)(lbar)[0]
+            if batched_rhs
+            else dij_pullback(lbar)[0]
+        )
+        d11_log_bar = dij_bar[..., 0]
+        d13_bar = dij_bar[..., 1]
+        d33_bar = dij_bar[..., 2]
+
+        is_legacy_monoenergetic = monoenergetic_database_kind(database) == MONOENERGETIC_KIND_GENERIC
+
+        def _scatter_one(nu_value, er_value, d11_value, d13_value, d33_value):
+            if is_legacy_monoenergetic:
+                return (
+                    monoenergetic_interpolation_table_bar(
+                        geometry.r_grid[radius_index], nu_value, er_value,
+                        d11_value, database.D11_log, database,
+                    ),
+                    monoenergetic_interpolation_table_bar(
+                        geometry.r_grid[radius_index], nu_value, er_value,
+                        d13_value, database.D13, database,
+                    ),
+                    monoenergetic_interpolation_table_bar(
+                        geometry.r_grid[radius_index], nu_value, er_value,
+                        d33_value, database.D33, database,
+                    ),
+                )
+            stencil = radial_preprocessed_interpolation_stencil(
+                geometry.r_grid[radius_index], nu_value, er_value, database
+            )
+            return (
+                radial_preprocessed_interpolation_table_bar(stencil, d11_value, database.D11_log),
+                radial_preprocessed_interpolation_table_bar(stencil, d13_value, database.D13),
+                radial_preprocessed_interpolation_table_bar(stencil, d33_value, database.D33),
+            )
+
+        if batched_rhs:
+            def _one_rhs(d11_rhs, d13_rhs, d33_rhs):
+                return jax.vmap(_scatter_one)(
+                    nu_over_vnew, er_over_vnew, d11_rhs, d13_rhs, d33_rhs
+                )
+
+            tables = jax.vmap(_one_rhs)(d11_log_bar, d13_bar, d33_bar)
+        else:
+            tables = jax.vmap(_scatter_one)(
+                nu_over_vnew, er_over_vnew, d11_log_bar, d13_bar, d33_bar
+            )
+        return tuple(
+            jnp.sum(value, axis=1 if batched_rhs else 0) for value in tables
+        )
+
+    species_indices = species.species_indices
+    radius_indices = geometry.full_grid_indices
+    if batched_rhs:
+        table_bars = jax.vmap(
+            lambda species_index, a1_species, a2_species, density_phys_species, temperature_phys_species, vthermal_species, gamma_species, q_species, upar_species: jax.vmap(
+                lambda radius_index, gamma_local, q_local, upar_local: _one_species_radius(
+                    species_index, a1_species, a2_species, density_phys_species,
+                    temperature_phys_species, vthermal_species, radius_index,
+                    gamma_local, q_local, upar_local,
+                ),
+                in_axes=(0, 1, 1, 1),
+            )(radius_indices, gamma_species, q_species, upar_species),
+            in_axes=(0, 0, 0, 0, 0, 0, 0, 0, 0),
+        )(
+            species_indices, a1, a2, density_phys, temperature_phys, v_thermal,
+            jnp.moveaxis(gamma_bar, 1, 0),
+            jnp.moveaxis(q_bar, 1, 0),
+            jnp.moveaxis(upar_bar, 1, 0),
+        )
+        return tuple(jnp.sum(value, axis=(0, 1)) for value in table_bars)
+
+    table_bars = jax.vmap(
+        lambda species_index, a1_species, a2_species, density_phys_species, temperature_phys_species, vthermal_species, gamma_species, q_species, upar_species: jax.vmap(
+            lambda radius_index, gamma_local, q_local, upar_local: _one_species_radius(
+                species_index, a1_species, a2_species, density_phys_species,
+                temperature_phys_species, vthermal_species, radius_index,
+                gamma_local, q_local, upar_local,
+            )
+        )(radius_indices, gamma_species, q_species, upar_species),
+        in_axes=(0, 0, 0, 0, 0, 0, 0, 0, 0),
+    )(
+        species_indices, a1, a2, density_phys, temperature_phys, v_thermal,
+        gamma_bar, q_bar, upar_bar,
+    )
+    return tuple(jnp.sum(value, axis=(0, 1)) for value in table_bars)
+
+
+@jit
+def pullback_preprocessed_radial_database_face_fluxes(
+    species,
+    energy_grid,
+    geometry,
+    database,
+    Er_faces,
+    temperature_faces,
+    density_faces,
+    dndr_faces,
+    dtdr_faces,
+    gamma_bar,
+    q_bar,
+    upar_bar,
+    collisionality_kind=COLLISIONALITY_MODEL_DEFAULT,
+):
+    """Compact table-only transpose of native database face fluxes.
+
+    This is the face analogue of ``pullback_preprocessed_radial_database_fluxes``.
+    It deliberately retains only the small 3x3 Lij algebra VJP and scatters
+    its table cotangent through the explicit radial interpolation stencil.
+    In particular it never forms a VJP of the full face-flux/database graph.
+    """
+    batched_rhs = jnp.asarray(gamma_bar).ndim == 3
+    if batched_rhs and (
+        jnp.asarray(q_bar).ndim != 3 or jnp.asarray(upar_bar).ndim != 3
+    ):
+        raise ValueError("Database face-flux cotangent RHS axes must be consistent.")
+    vthermal = get_v_thermal(species.mass, temperature_faces)
+    density_phys = DENSITY_STATE_TO_PHYSICAL * density_faces
+    temperature_phys = TEMPERATURE_STATE_TO_PHYSICAL * temperature_faces
+    a1 = jax.vmap(
+        get_Thermodynamical_Forces_A1,
+        in_axes=(0, 0, 0, 0, 0, None),
+    )(
+        species.charge, density_faces, temperature_faces,
+        dndr_faces, dtdr_faces, Er_faces,
+    )
+    a2 = jax.vmap(get_Thermodynamical_Forces_A2, in_axes=(0, 0))(
+        temperature_faces, dtdr_faces
+    )
+    a3 = get_Thermodynamical_Forces_A3(Er_faces)
+    radius_indices = jnp.arange(Er_faces.shape[0], dtype=jnp.int32)
+    is_legacy = monoenergetic_database_kind(database) == MONOENERGETIC_KIND_GENERIC
+    interpolation_kernel = monoenergetic_interpolation_kernel(database)
+
+    def _one_species_face(
+        species_index, a1_species, a2_species, density_phys_species,
+        temperature_phys_species, vthermal_species, radius_index,
+        gamma_local, q_local, upar_local,
+    ):
+        vth = vthermal_species[radius_index]
+        vnew = energy_grid.v_norm * vth
+        # Face fluxes are evaluated at *local* face states in the primal
+        # map.  Do not use the centre-indexed collisionality helper here:
+        # that happens to have compatible shapes, but is a different
+        # mathematical map for the two boundary faces.
+        nu_over_vnew = _nu_over_vnew_local(
+            species,
+            species_index,
+            vnew,
+            density_faces[:, radius_index],
+            temperature_faces[:, radius_index],
+            vthermal[:, radius_index],
+            collisionality_kind,
+        )
+        forces = jnp.asarray((
+            a1_species[radius_index], a2_species[radius_index], a3[radius_index]
+        ))
+        lbar = jnp.zeros(jnp.shape(gamma_local) + (3, 3), dtype=temperature_faces.dtype)
+        lbar = lbar.at[..., 0, :].add(
+            -density_phys_species[radius_index] * gamma_local[..., None] * forces
+        )
+        lbar = lbar.at[..., 1, :].add(
+            -temperature_phys_species[radius_index]
+            * density_phys_species[radius_index]
+            * q_local[..., None] * forces
+        )
+        lbar = lbar.at[..., 2, :].add(
+            -density_phys_species[radius_index] * upar_local[..., None] * forces
+        )
+        er_over_vnew = Er_faces[radius_index] * 1.0e3 / (energy_grid.v_norm * vth)
+        dij = jax.vmap(
+            lambda nu_value, er_value: interpolation_kernel(
+                geometry.r_grid_half[radius_index], nu_value, er_value, database
+            )
+        )(nu_over_vnew, er_over_vnew)
+        _, dij_pullback = jax.vjp(
+            lambda dij_value: _assemble_lij_matrix(
+                species, energy_grid, species_index, vth, nu_over_vnew, dij_value
+            ),
+            dij,
+        )
+        dij_bar = jax.vmap(dij_pullback)(lbar)[0] if batched_rhs else dij_pullback(lbar)[0]
+
+        def _scatter_one(nu_value, er_value, d11_value, d13_value, d33_value):
+            if is_legacy:
+                return (
+                    monoenergetic_interpolation_table_bar(
+                        geometry.r_grid_half[radius_index], nu_value, er_value,
+                        d11_value, database.D11_log, database,
+                    ),
+                    monoenergetic_interpolation_table_bar(
+                        geometry.r_grid_half[radius_index], nu_value, er_value,
+                        d13_value, database.D13, database,
+                    ),
+                    monoenergetic_interpolation_table_bar(
+                        geometry.r_grid_half[radius_index], nu_value, er_value,
+                        d33_value, database.D33, database,
+                    ),
+                )
+            stencil = radial_preprocessed_interpolation_stencil(
+                geometry.r_grid_half[radius_index], nu_value, er_value, database
+            )
+            return (
+                radial_preprocessed_interpolation_table_bar(stencil, d11_value, database.D11_log),
+                radial_preprocessed_interpolation_table_bar(stencil, d13_value, database.D13),
+                radial_preprocessed_interpolation_table_bar(stencil, d33_value, database.D33),
+            )
+
+        if batched_rhs:
+            tables = jax.vmap(
+                lambda d11_rhs, d13_rhs, d33_rhs: jax.vmap(_scatter_one)(
+                    nu_over_vnew, er_over_vnew, d11_rhs, d13_rhs, d33_rhs
+                )
+            )(dij_bar[..., 0], dij_bar[..., 1], dij_bar[..., 2])
+        else:
+            tables = jax.vmap(_scatter_one)(
+                nu_over_vnew, er_over_vnew,
+                dij_bar[..., 0], dij_bar[..., 1], dij_bar[..., 2],
+            )
+        return tuple(jnp.sum(value, axis=1 if batched_rhs else 0) for value in tables)
+
+    def _species_tables(
+        species_index, a1_species, a2_species, density_phys_species,
+        temperature_phys_species, vthermal_species, gamma_species, q_species,
+        upar_species,
+    ):
+        # After selecting a species, scalar bars are ``(face,)`` while a
+        # batched Radau/objective bar is ``(rhs, face)``.
+        face_axis = 1 if batched_rhs else 0
+        return jax.vmap(
+            lambda radius_index, gamma_local, q_local, upar_local: _one_species_face(
+                species_index, a1_species, a2_species, density_phys_species,
+                temperature_phys_species, vthermal_species, radius_index,
+                gamma_local, q_local, upar_local,
+            ),
+            in_axes=(0, face_axis, face_axis, face_axis),
+        )(radius_indices, gamma_species, q_species, upar_species)
+
+    if batched_rhs:
+        table_bars = jax.vmap(
+            _species_tables,
+            in_axes=(0, 0, 0, 0, 0, 0, 0, 0, 0),
+        )(
+            species.species_indices, a1, a2, density_phys, temperature_phys, vthermal,
+            jnp.moveaxis(gamma_bar, 1, 0), jnp.moveaxis(q_bar, 1, 0),
+            jnp.moveaxis(upar_bar, 1, 0),
+        )
+        return tuple(jnp.sum(value, axis=(0, 1)) for value in table_bars)
+    table_bars = jax.vmap(
+        _species_tables,
+        in_axes=(0, 0, 0, 0, 0, 0, 0, 0, 0),
+    )(
+        species.species_indices, a1, a2, density_phys, temperature_phys, vthermal,
+        gamma_bar, q_bar, upar_bar,
+    )
+    return tuple(jnp.sum(value, axis=(0, 1)) for value in table_bars)
 
 
 @jit
@@ -524,7 +1454,15 @@ def get_Lij_matrix_with_momentum_correction(species, energy_grid, geometry, data
     T = temperature[index_species, r_index]
     #same species collisionalities
     ##nu_vnew_T=collisionality(species_a_loc, v_new_a, *global_species_loc)/v_new_a 
-    nu_a=collisionality(index_species, species,v_new_a, r_index)#/v_new_a   
+    nu_a = collisionality(
+        index_species,
+        species,
+        v_new_a,
+        r_index,
+        density,
+        temperature,
+        v_thermal,
+    )
     nu_vnew_a=nu_a/v_new_a
     #L11_fac_T=nT*2./jnp.sqrt(jnp.pi)*(tritium_loc.species.mass/tritium_loc.species.charge)**2*vth_T**3
     #L11_fac_a=n/jnp.sqrt(jnp.pi)*(species.mass[index_species]/species.charge[index_species])**2*vth_a**3
@@ -680,8 +1618,12 @@ def get_A_matrix(grid, a, b, coeff, nucoeff, CN, sum, tau, v_thermal, field, r_i
     I=jnp.identity(3)
     A=jnp.zeros((3,3))
     factor = 2. / jnp.power(v_thermal[a, r_index], 2) / field.Bsqav[r_index]
-    A = (I - factor * jnp.multiply(jnp.matmul(jnp.transpose(coeff), sum) + nucoeff, grid.Sonine_expansion)) * I.at[a, b].get() \
-        - factor * jnp.multiply(jnp.matmul(jnp.transpose(coeff), CN.at[a, b, :, :].get() / tau.at[a, b].get()), grid.Sonine_expansion) * (1. - I.at[a, b].get())
+    # ``I`` lives in Sonine-moment space.  It must not be used to decide
+    # whether two *species* are equal: doing so aliases species index 3 to
+    # the final Sonine index and corrupts the four-species (wHe) system.
+    same_species = jnp.equal(a, b).astype(coeff.dtype)
+    A = (I - factor * jnp.multiply(jnp.matmul(jnp.transpose(coeff), sum) + nucoeff, grid.Sonine_expansion)) * same_species \
+        - factor * jnp.multiply(jnp.matmul(jnp.transpose(coeff), CN.at[a, b, :, :].get() / tau.at[a, b].get()), grid.Sonine_expansion) * (1. - same_species)
     #A=A.at[0,0].set(I.at[a,b].get()*(1.-factor*(jnp.sum(coeff.at[:,0].get()*sum.at[:,0].get())+nucoeff.at[0,0].get())*Sonine_expansion.at[0].get())-factor*jnp.sum(coeff.at[:,0].get()*CN.at[a,b,:,0].get())/tau.at[a,b].get()*Sonine_expansion.at[0].get()*(1.-I.at[a,b].get()))
     #A=A.at[0,1].set(I.at[a,b].get()*(-factor*(jnp.sum(coeff.at[:,0].get()*sum.at[:,1].get())+nucoeff.at[1,0].get())*Sonine_expansion.at[1].get())-factor*jnp.sum(coeff.at[:,0].get()*CN.at[a,b,:,1].get())/tau.at[a,b].get()*Sonine_expansion.at[1].get()*(1.-I.at[a,b].get()))
     #A=A.at[0,2].set(I.at[a,b].get()*(-factor*(jnp.sum(coeff.at[:,0].get()*sum.at[:,2].get())+nucoeff.at[2,0].get())*Sonine_expansion.at[2].get())-factor*jnp.sum(coeff.at[:,0].get()*CN.at[a,b,:,2].get())/tau.at[a,b].get()*Sonine_expansion.at[2].get()*(1.-I.at[a,b].get()))
@@ -697,24 +1639,26 @@ def get_A_matrix(grid, a, b, coeff, nucoeff, CN, sum, tau, v_thermal, field, r_i
 #auxilir matrix to construct matrix for species a
 def get_correction_matrix(grid, a, b, coeff, nucoeff, CM, CN, sum, tau, factor, correction, r_index,
                          dndr, dTdr, temperature, density, charge):
-    I = jnp.identity(3)
+    # The Sonine identity has no role in the species-diagonal predicate.
+    # Keep that predicate explicit, as in NTSSfusion's ``ia == ib`` branch.
+    same_species = jnp.equal(a, b).astype(coeff.dtype)
     A = -factor * jnp.matmul(jnp.matmul(jnp.transpose(coeff), sum) + nucoeff,
-                            jnp.multiply(grid.Sonine_expansion, correction.at[b].get())) * I.at[a, b].get() \
+                            jnp.multiply(grid.Sonine_expansion, correction.at[b].get())) * same_species \
         - factor * jnp.matmul(jnp.matmul(jnp.transpose(coeff), CN.at[a, b, :, :].get() / tau.at[a, b].get()),
-                            jnp.multiply(grid.Sonine_expansion, correction.at[b].get())) * (1. - I.at[a, b].get())
-    add1 = (1. - I.at[a, b].get()) * (
+                            jnp.multiply(grid.Sonine_expansion, correction.at[b].get())) * (1. - same_species)
+    add1 = (1. - same_species) * (
         dndr[a, r_index] / density[a, r_index] + dTdr[a, r_index] / temperature[a, r_index]
         - charge[a] / charge[b] * temperature[b, r_index] / temperature[a, r_index]
-        * (dndr[b, r_index] / density[b, r_index] + dndr[b, r_index] / density[b, r_index])
+        * (dndr[b, r_index] / density[b, r_index] + dTdr[b, r_index] / temperature[b, r_index])
     ) * CM.at[a, b, 0, 0].get() / tau.at[a, b].get()
-    add2 = (1. - I.at[a, b].get()) * (
+    add2 = (1. - same_species) * (
         dndr[a, r_index] / density[a, r_index] + dTdr[a, r_index] / temperature[a, r_index]
         - charge[a] / charge[b] * temperature[b, r_index] / temperature[a, r_index]
-        * (dndr[b, r_index] / density[b, r_index] + dndr[b, r_index] / density[b, r_index])
+        * (dndr[b, r_index] / density[b, r_index] + dTdr[b, r_index] / temperature[b, r_index])
     ) * (2.5 * CM.at[a, b, 0, 0].get() - CM.at[a, b, 1, 0].get()) / tau.at[a, b].get()
-    add3 = (1. - I.at[a, b].get()) * charge[a] / charge[b] * temperature[b, r_index] / temperature[a, r_index] \
+    add3 = (1. - same_species) * charge[a] / charge[b] * temperature[b, r_index] / temperature[a, r_index] \
         * (dTdr[b, r_index] / temperature[b, r_index]) * CN.at[a, b, 0, 1].get() / tau.at[a, b].get()
-    add4 = (1. - I.at[a, b].get()) * charge[a] / charge[b] * temperature[b, r_index] / temperature[a, r_index] \
+    add4 = (1. - same_species) * charge[a] / charge[b] * temperature[b, r_index] / temperature[a, r_index] \
         * (dTdr[b, r_index] / temperature[b, r_index]) * (2.5 * CN.at[a, b, 0, 1].get() - CN.at[a, b, 1, 1].get()) / tau.at[a, b].get()
     return A, add1, add2, add3, add4
 
@@ -747,13 +1691,74 @@ def get_Matrix(grid, field, a, r_index, Lij, Eij, CM_ab, CN_ab, tau, v_thermal):
     #Get a 3x3 for each species
     M = jax.vmap(get_A_matrix, in_axes=(None, None, 0, None, None, None, None, None, None, None, None))(
         grid, a, jnp.arange(v_thermal.shape[0]), coeff, nucoeff, CN_ab, sum, tau, v_thermal, field, r_index)
-    M = jax.lax.reshape(M, (M.shape[0], M.shape[1] * M.shape[2]), (1, 0, 2))
+    # ``M`` is indexed as (collision species, Sonine row, Sonine column).
+    # Keep the Sonine row as the output row and concatenate the collision
+    # species/Sonine-column block into the output column.  The previous target
+    # shape used ``M.shape[0]`` for the row count, which happened to be correct
+    # only for three kinetic species; four-species (wHe) runs then produced a
+    # 16x12 operator for a length-12 RHS.
+    M = jnp.reshape(
+        jnp.transpose(M, (1, 0, 2)),
+        (M.shape[1], M.shape[0] * M.shape[2]),
+    )
     return M
 
 
-@jit 
+@jit
+def _ntss_radial_flux_correction_terms(
+    field,
+    a,
+    r_index,
+    sum,
+    add1,
+    add2,
+    add3,
+    add4,
+    nu_av,
+    A1,
+    A2,
+    dTdr,
+    temperature,
+    mass,
+    charge,
+):
+    """Return NTSSfusion's added particle/heat flux velocities.
+
+    NTSSfusion stores temperature in eV and charge as ``Z``.  NEOPAX stores
+    temperature in keV and charge in Coulomb, so the common prefactor is
+    written directly in SI here.  The two returned quantities are ``Gamma/n``
+    and ``Q/(n T)`` respectively; their outer state-unit factors belong to
+    :func:`get_corrected_fluxes`.
+    """
+
+    temperature_joule = temperature[a, r_index] * JOULE_PER_KEV
+    prefactor = (
+        mass[a]
+        * temperature_joule
+        * field.G_PS[r_index]
+        / jnp.square(charge[a] * field.B0[r_index])
+    )
+    dln_temperature = dTdr[a, r_index] / temperature[a, r_index]
+    particle = prefactor * (
+        add1
+        - dln_temperature * sum[0, 1]
+        - add3
+        + A1[a, r_index] * nu_av[0] / 1.5
+        + A2[a, r_index] * nu_av[1] / 1.5
+    )
+    heat = prefactor * (
+        add2
+        - dln_temperature * (2.5 * sum[0, 1] - sum[1, 1])
+        - add4
+        + A1[a, r_index] * nu_av[1] / 1.5
+        + A2[a, r_index] * nu_av[2] / 1.5
+    )
+    return particle, heat
+
+
+@jit
 def get_corrected_fluxes(grid, field, a, r_index, Lij, Eij, nu_av, CM_ab, CN_ab, tau, correction,
-                         v_thermal, density, temperature, A1, A2, A3, charge, dndr, dTdr):
+                         v_thermal, density, temperature, A1, A2, A3, mass, charge, dndr, dTdr):
     coeff=jnp.zeros((3,3))
     nucoeff=jnp.zeros((3,3))
     #Get coeff matrices for the correction
@@ -776,7 +1781,10 @@ def get_corrected_fluxes(grid, field, a, r_index, Lij, Eij, nu_av, CM_ab, CN_ab,
     # get vector for correction
     M, add1, add2, add3, add4 = jax.vmap(
         get_correction_matrix,
-        in_axes=(None, None, None, 0, None, None, None, None, None, None, None, None, None, None, None, None, None)
+        # Vectorize over collision species ``b``.  Mapping ``coeff`` instead
+        # happened to broadcast for three species, but passed a length-four
+        # correction vector into the 3-Sonine matvec in the wHe case.
+        in_axes=(None, None, 0, None, None, None, None, None, None, None, None, None, None, None, None, None, None)
     )(
         grid, a, jnp.arange(density.shape[0]), coeff, nucoeff, CM_ab, CN_ab, sum, tau, factor, correction, r_index,
         dndr, dTdr, temperature, density, charge
@@ -786,14 +1794,28 @@ def get_corrected_fluxes(grid, field, a, r_index, Lij, Eij, nu_av, CM_ab, CN_ab,
     ADD2 = jnp.sum(add2)
     ADD3 = jnp.sum(add3)
     ADD4 = jnp.sum(add4)
+    particle_ps, heat_ps = _ntss_radial_flux_correction_terms(
+        field,
+        a,
+        r_index,
+        sum,
+        ADD1,
+        ADD2,
+        ADD3,
+        ADD4,
+        nu_av,
+        A1,
+        A2,
+        dTdr,
+        temperature,
+        mass,
+        charge,
+    )
     # calculate corrected fluxes for species a
     Gamma = density[a, r_index] * (-(Lij.at[0, 0].get() * A1[a, r_index] + Lij.at[0, 1].get() * A2[a, r_index] + Lij.at[0, 2].get() * A3[r_index])
-        + C.at[0].get())
-    #+mass[a]*temperature[a,r_index]*G_PS[r_index]/elementary_charge/jnp.power(charge[a]*B0,2)*(ADD1-A2[a,r_index]*sum.at[0,1].get()
-    #-ADD3+A1[a,r_index]*nu_av.at[0].get()/1.5+A2[a,r_index]*nu_av.at[1].get()/1.5))
+        + C.at[0].get() + particle_ps)
     Q = temperature[a, r_index] * density[a, r_index] * (-(Lij.at[1, 0].get() * A1[a, r_index] + Lij.at[1, 1].get() * A2[a, r_index] + Lij.at[1, 2].get() * A3[r_index])
-    +C.at[1].get())#+species.mass[a]*species.temperature[a,r_index]*G_PS[r_index]/elementary_charge/jnp.power(species.charge[a]*B0,2)*(ADD2-species.A2[a,r_index]*(2.5*sum.at[0,1].get()-sum.at[1,1].get())
-    #-ADD4+species.A1[a,r_index]*nu_av.at[1].get()/1.5+species.A2[a,r_index]*nu_av.at[2].get()/1.5))
+    +C.at[1].get() + heat_ps)
     Upar = correction.at[a, 0].get() * density[a, r_index]
     qpar = correction.at[a, 1].get()
     Upar2 = correction.at[a, 2].get()
@@ -803,33 +1825,125 @@ def get_corrected_fluxes(grid, field, a, r_index, Lij, Eij, nu_av, CM_ab, CN_ab,
 
 @jit
 #Get momentum correction at one radial position
-def get_momentum_Correction(grid, field, r_index, Lij, Eij, nu_av,
-                            v_thermal, density, temperature, A1, A2, A3, charge, dndr, dTdr):
+def get_momentum_Correction(species, energy_grid, geometry, r_index, Lij, Eij, nu_av,
+                            v_thermal, density, temperature, A1, A2, A3, mass, charge, dndr, dTdr):
     #Get collisional operator expansion matrix for a radial position
     n_species = density.shape[0]
     species_indices = jnp.arange(n_species)
     CM_ab, CN_ab, tau = jax.vmap(
-        jax.vmap(get_Collision_Operator_terms, in_axes=(None, None, 0, None)),
-        in_axes=(None, 0, None, None)
-    )(grid, species_indices, species_indices, r_index)
+        lambda species_a: jax.vmap(
+            lambda species_b: get_Collision_Operator_terms(
+                species,
+                species_a,
+                species_b,
+                r_index,
+                temperature,
+                density,
+                v_thermal,
+            )
+        )(species_indices)
+    )(species_indices)
     #construct the linear system M*solution = rhs to be solved
     #Construct rhs vector
-    rhs = jax.vmap(get_rhs, in_axes=(None, 0, None, 0))(
-        grid, species_indices, r_index, Lij)
+    rhs = jax.vmap(
+        lambda species_a, lij_a: get_rhs(species_a, r_index, lij_a, A1, A2, A3)
+    )(species_indices, Lij)
     rhs = jnp.reshape(rhs, rhs.shape[0] * rhs.shape[1])
     #Construct matrix M=
-    M = jax.vmap(get_Matrix, in_axes=(None, None, None, 0, None, 0, 0, None, None, None, None))(
-        grid, field, species_indices, r_index, Lij, Eij, CM_ab, CN_ab, tau, v_thermal)
+    M = jax.vmap(
+        # ``get_Matrix`` constructs the block row for ``species_a`` and
+        # indexes every collision partner internally.  Therefore CM/CN/tau
+        # must stay as the full (a, b, sonine, sonine) / (a, b) tensors;
+        # mapping them here stripped their leading ``a`` axis and led to the
+        # four-index-on-three-dimensional-tensor failure in the wHe database
+        # bootstrap objective.
+        lambda species_a, lij_a, eij_a: get_Matrix(
+            energy_grid,
+            geometry,
+            species_a,
+            r_index,
+            lij_a,
+            eij_a,
+            CM_ab,
+            CN_ab,
+            tau,
+            v_thermal,
+        )
+    )(species_indices, Lij, Eij)
     S = lineax.MatrixLinearOperator(jnp.reshape(M, (M.shape[0] * M.shape[1], M.shape[2])))
     #Solve linear system using lineax to get the correction 
     solution = lineax.linear_solve(S, rhs)
     corr = jnp.reshape(solution.value, (CM_ab.shape[0], CM_ab.shape[-1]))
     #Now we need to get corrected fluxes
     #Then we apply correction to fluxes for each species in a function similar to the one for getting matrix M 
-    Gamma, Q, Upar, qpar, Upar2 = jax.vmap(get_corrected_fluxes, in_axes=(None, None, None, 0, None, 0, 0, 0, None, None, None, None, None, None, None, None, None, None, None, None, None, None))(
-        grid, field, species_indices, r_index, Lij, Eij, nu_av, CM_ab, CN_ab, tau, corr,
-        v_thermal, density, temperature, A1, A2, A3, charge, dndr, dTdr)
+    Gamma, Q, Upar, qpar, Upar2 = jax.vmap(
+        lambda species_a, lij_a, eij_a, nu_a: get_corrected_fluxes(
+            energy_grid,
+            geometry,
+            species_a,
+            r_index,
+            lij_a,
+            eij_a,
+            nu_a,
+            CM_ab,
+            CN_ab,
+            tau,
+            corr,
+            v_thermal,
+            density,
+            temperature,
+            A1,
+            A2,
+            A3,
+            mass,
+            charge,
+            dndr,
+            dTdr,
+        )
+    )(species_indices, Lij, Eij, nu_av)
     return Gamma, Q, Upar, qpar, Upar2
+
+
+@jit
+def get_momentum_Correction_Upar_Only(
+    species, energy_grid, geometry, r_index, Lij, Eij, nu_av,
+    v_thermal, density, temperature, A1, A2, A3, mass, charge, dndr, dTdr,
+):
+    """Return only corrected Upar after the shared momentum solve.
+
+    The bootstrap objective never consumes Gamma, Q, qpar, or Upar2.  Keep
+    the collision matrix and correction solve identical to
+    :func:`get_momentum_Correction`, but avoid the per-species corrected-flux
+    construction used exclusively by the general output table.
+    """
+    del nu_av, mass, charge, dndr, dTdr
+    n_species = density.shape[0]
+    species_indices = jnp.arange(n_species)
+    CM_ab, CN_ab, tau = jax.vmap(
+        lambda species_a: jax.vmap(
+            lambda species_b: get_Collision_Operator_terms(
+                species, species_a, species_b, r_index,
+                temperature, density, v_thermal,
+            )
+        )(species_indices)
+    )(species_indices)
+    rhs = jax.vmap(
+        lambda species_a, lij_a: get_rhs(species_a, r_index, lij_a, A1, A2, A3)
+    )(species_indices, Lij)
+    matrix = jax.vmap(
+        lambda species_a, lij_a, eij_a: get_Matrix(
+            energy_grid, geometry, species_a, r_index, lij_a, eij_a,
+            CM_ab, CN_ab, tau, v_thermal,
+        )
+    )(species_indices, Lij, Eij)
+    operator = lineax.MatrixLinearOperator(
+        jnp.reshape(matrix, (matrix.shape[0] * matrix.shape[1], matrix.shape[2]))
+    )
+    solution = lineax.linear_solve(
+        operator, jnp.reshape(rhs, rhs.shape[0] * rhs.shape[1])
+    )
+    correction = jnp.reshape(solution.value, (n_species, 3))
+    return correction[:, 0] * density[:, r_index]
 
 
 
@@ -840,8 +1954,8 @@ def get_momentum_Correction(grid, field, r_index, Lij, Eij, nu_av,
 #Get_fluxes with momentum correction, unified interface
 def get_Neoclassical_Fluxes_With_Momentum_Correction(
     species,
-    grid,
-    field,
+    energy_grid,
+    geometry,
     database,
     Er,
     temperature,
@@ -855,9 +1969,9 @@ def get_Neoclassical_Fluxes_With_Momentum_Correction(
     # temperature in keV). The low-level species/collision helpers convert
     # those to physical units internally where needed, so do not rescale here.
     v_thermal = get_v_thermal(species.mass, temperature)
-    r_grid = field.r_grid
-    r_grid_half = field.r_grid_half
-    dr = field.dr
+    r_grid = geometry.r_grid
+    r_grid_half = geometry.r_grid_half
+    dr = geometry.dr
 
     n_species = int(temperature.shape[0])
     n_right = _as_species_constraint(density_right_constraint, n_species)
@@ -893,8 +2007,11 @@ def get_Neoclassical_Fluxes_With_Momentum_Correction(
         )
         A1 = get_Thermodynamical_Forces_A1(species.charge[a], density, temperature, dndr, dTdr, Er)
         A2 = get_Thermodynamical_Forces_A2(temperature, dTdr)
-        A3 = get_Thermodynamical_Forces_A3(Er)
-        return dndr, dTdr, A1, A2, A3
+        # ``A3`` is common to all species.  Do not construct it inside this
+        # species-vmapped helper: that used to give it shape
+        # ``(n_species, n_radius)``, while ``get_rhs`` correctly expects the
+        # single radial vector and indexes it as ``A3[r_index]``.
+        return dndr, dTdr, A1, A2
 
     # Vectorize over species
     grads_forces = jax.vmap(get_gradients_and_forces, in_axes=(0,0,0,0,0,0,None,0))(
@@ -907,33 +2024,157 @@ def get_Neoclassical_Fluxes_With_Momentum_Correction(
         Er,
         jnp.arange(n_species),
     )
-    dndr, dTdr, A1, A2, A3 = grads_forces
+    dndr, dTdr, A1, A2 = grads_forces
+    A3 = get_Thermodynamical_Forces_A3(Er)
 
     species_indices = jnp.arange(n_species)
-    radial_indices = grid.full_grid_indices
+    # ``energy_grid`` is the velocity/Sonine grid while ``geometry`` is the
+    # transport geometry.  The radial loop must therefore come from the
+    # latter; StandardLaguerreEnergyGrid deliberately has no radial indices.
+    radial_indices = geometry.full_grid_indices
     # Compute Lij, Eij, nu_weighted_average for all species and radial points
-    Lij, Eij, nu_weighted_average = jax.vmap(
-        jax.vmap(
-            get_Lij_matrix_with_momentum_correction,
-            in_axes=(None, None, None, None, 0, 0, None, 0, 0, 0)
-        ),
-        in_axes=(None, None, None, None, 0, None, None, None, None, None)
-    )(
-        species, grid, field, database, species_indices, radial_indices, Er, temperature, density, v_thermal
-    )
+    # The coefficient kernel consumes full profile arrays and extracts both
+    # the species and radius internally.  Map only those scalar indices: the
+    # former nested ``in_axes`` also mapped temperature/density over axis zero
+    # during the radial loop, which is invalid when n_radius != n_species.
+    def _one_species(species_index):
+        return jax.vmap(
+            lambda radial_index: get_Lij_matrix_with_momentum_correction(
+                species,
+                energy_grid,
+                geometry,
+                database,
+                species_index,
+                radial_index,
+                Er,
+                temperature,
+                density,
+                v_thermal,
+            )
+        )(radial_indices)
+
+    Lij, Eij, nu_weighted_average = jax.vmap(_one_species)(species_indices)
     # Adjust Lij and Eij as before
     Lij = Lij.at[:, 0, :, :].set(Lij.at[:, 1, :, :].get())
     Eij = Eij.at[:, 0, :, :].set(Eij.at[:, 1, :, :].get())
     # Compute momentum correction for all radial points
     correction = jax.vmap(
-        get_momentum_Correction,
-        in_axes=(None, None, 0, 1, 1, 1, None, None, None, None, None, None, None, None, None, None)
+        lambda radial_index, lij_at_radius, eij_at_radius, nu_at_radius: (
+            get_momentum_Correction(
+                species,
+                energy_grid,
+                geometry,
+                radial_index,
+                lij_at_radius,
+                eij_at_radius,
+                nu_at_radius,
+                v_thermal,
+                density,
+                temperature,
+                A1,
+                A2,
+                A3,
+                species.mass,
+                species.charge,
+                dndr,
+                dTdr,
+            )
+        )
     )(
-        grid, field, radial_indices, Lij, Eij, nu_weighted_average,
-        v_thermal, density, temperature, A1, A2, A3, species.charge, dndr, dTdr
+        radial_indices,
+        jnp.moveaxis(Lij, 1, 0),
+        jnp.moveaxis(Eij, 1, 0),
+        jnp.moveaxis(nu_weighted_average, 1, 0),
     )
-    # correction is (Gamma, Q, Upar, qpar, Upar2)
-    return correction  #, Lij, Eij, nu_weighted_average
+    # The radial map returns (radius, species); NEOPAX flux-model consumers
+    # uniformly use (species, radius).
+    return tuple(jnp.swapaxes(component, 0, 1) for component in correction)
+
+
+@jit
+def get_Neoclassical_Upar_With_Momentum_Correction(
+    species,
+    energy_grid,
+    geometry,
+    database,
+    Er,
+    temperature,
+    density,
+    density_right_constraint=None,
+    density_right_grad_constraint=None,
+    temperature_right_constraint=None,
+    temperature_right_grad_constraint=None,
+):
+    """Bootstrap-only corrected parallel flow for an interpolated database.
+
+    This shares the exact gradients, Lij/Eij construction, axis convention,
+    collision matrices, and momentum solve of the full corrected-flux path.
+    It omits only output channels which the bootstrap scalar never reads.
+    """
+    v_thermal = get_v_thermal(species.mass, temperature)
+    n_species = int(temperature.shape[0])
+    n_right = _as_species_constraint(density_right_constraint, n_species)
+    n_right = density[:, -1] if n_right is None else n_right
+    n_right_grad = _as_species_constraint(density_right_grad_constraint, n_species)
+    n_right_grad = jnp.zeros_like(n_right) if n_right_grad is None else n_right_grad
+    t_right = _as_species_constraint(temperature_right_constraint, n_species)
+    t_right = temperature[:, -1] if t_right is None else t_right
+    t_right_grad = _as_species_constraint(temperature_right_grad_constraint, n_species)
+    t_right_grad = jnp.zeros_like(t_right) if t_right_grad is None else t_right_grad
+
+    def _gradients_and_forces(density_a, temperature_a, n_rc, n_rg, t_rc, t_rg, species_index):
+        dndr = get_gradient_density(
+            density_a, geometry.r_grid, geometry.r_grid_half, geometry.dr,
+            right_face_constraint=n_rc, right_face_grad_constraint=n_rg,
+        )
+        dtdr = get_gradient_temperature(
+            temperature_a, geometry.r_grid, geometry.r_grid_half, geometry.dr,
+            right_face_constraint=t_rc, right_face_grad_constraint=t_rg,
+        )
+        return (
+            dndr,
+            dtdr,
+            get_Thermodynamical_Forces_A1(
+                species.charge[species_index], density_a, temperature_a, dndr, dtdr, Er
+            ),
+            get_Thermodynamical_Forces_A2(temperature_a, dtdr),
+        )
+
+    dndr, dtdr, a1, a2 = jax.vmap(
+        _gradients_and_forces, in_axes=(0, 0, 0, 0, 0, 0, 0)
+    )(
+        density, temperature, n_right, n_right_grad, t_right, t_right_grad,
+        jnp.arange(n_species),
+    )
+    a3 = get_Thermodynamical_Forces_A3(Er)
+    species_indices = jnp.arange(n_species)
+    radial_indices = geometry.full_grid_indices
+
+    def _one_species(species_index):
+        return jax.vmap(
+            lambda radial_index: get_Lij_matrix_with_momentum_correction(
+                species, energy_grid, geometry, database, species_index,
+                radial_index, Er, temperature, density, v_thermal,
+            )
+        )(radial_indices)
+
+    lij, eij, nu_weighted_average = jax.vmap(_one_species)(species_indices)
+    lij = lij.at[:, 0, :, :].set(lij[:, 1, :, :])
+    eij = eij.at[:, 0, :, :].set(eij[:, 1, :, :])
+    upar_by_radius = jax.vmap(
+        lambda radial_index, lij_at_radius, eij_at_radius, nu_at_radius:
+        get_momentum_Correction_Upar_Only(
+            species, energy_grid, geometry, radial_index, lij_at_radius,
+            eij_at_radius, nu_at_radius, v_thermal, density, temperature,
+            a1, a2, a3, species.mass, species.charge, dndr, dtdr,
+        )
+    )(
+        radial_indices,
+        jnp.moveaxis(lij, 1, 0),
+        jnp.moveaxis(eij, 1, 0),
+        jnp.moveaxis(nu_weighted_average, 1, 0),
+    )
+    return jnp.swapaxes(upar_by_radius, 0, 1)
 
 
 

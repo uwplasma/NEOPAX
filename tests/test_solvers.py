@@ -1,11 +1,26 @@
+import dataclasses
+import types
+from types import SimpleNamespace
+
+import jax
 import jax.numpy as jnp
 import pytest
 
+import NEOPAX._transport_solvers as transport_solvers
+import NEOPAX._reverse_ad_transport as reverse_transport
+from NEOPAX._state import TransportState
+from NEOPAX._transport_flux_models import CombinedTransportFluxModel
+
 from NEOPAX._transport_solvers import (
     DiffraxSolver,
+    LIMMWBaselineSolver,
     NewtonThetaMethodSolver,
     RADAUSolver,
+    T3DOuterThetaMethodSolver,
     ThetaMethodSolver,
+    _T3DOuterThetaSolverConfig,
+    _apply_radau_lean_timestep_controller,
+    _RadauStepState,
     build_time_solver,
 )
 
@@ -30,6 +45,1007 @@ def _base_solver_parameters(**overrides):
     return params
 
 
+def test_combined_private_edge_polarization_is_exact_quadratic_and_transposed():
+    """The private-node rule is an exact quadratic tangent, not an FD rule."""
+    model = object.__new__(CombinedTransportFluxModel)
+
+    def _quadratic_response(_self, _state, _response, *, er_edge_override, **_kwargs):
+        edge = jnp.asarray(er_edge_override)
+        return {"Gamma_faces": jnp.asarray([edge * edge, 3.0 * edge * edge])}
+
+    object.__setattr__(
+        model,
+        "evaluate_with_lagged_response",
+        types.MethodType(_quadratic_response, model),
+    )
+    edge = jnp.asarray(2.0)
+    direction = jnp.asarray(1.0)
+    tangent = model.evaluate_with_lagged_response_edge_tangent(
+        state=None,
+        er_edge=edge,
+        er_edge_direction=direction,
+        lagged_response=None,
+        er_edge_anchor=jnp.asarray(0.0),
+    )
+    # d/de [e^2, 3e^2] at e=2, applied to direction one.
+    assert jnp.allclose(tangent["Gamma_faces"], jnp.asarray([4.0, 12.0]))
+
+    edge_bar = model.pullback_evaluate_with_lagged_response_edge(
+        state=None,
+        er_edge=edge,
+        lagged_response=None,
+        flux_bar={"Gamma_faces": jnp.asarray([2.0, -0.5])},
+        er_edge_anchor=jnp.asarray(0.0),
+    )
+    assert jnp.allclose(edge_bar, jnp.asarray(2.0))
+
+
+def test_packed_temperature_floor_projection_vjp_stays_finite_for_large_cotangent():
+    """Pressure-space flooring avoids an overflowing cancelling density VJP."""
+
+    dtype = jnp.float64
+    template_state = SimpleNamespace(density=jnp.ones((1, 1), dtype=dtype))
+    state = (
+        jnp.asarray([[1.0e-6]], dtype=dtype),
+        jnp.asarray([[1.0]], dtype=dtype),
+        jnp.asarray([0.0], dtype=dtype),
+    )
+
+    def project(state_like):
+        return transport_solvers._project_packed_transport_state_arrays(
+            state_like,
+            template_state,
+            species=None,
+            density_floor=1.0e-6,
+            temperature_floor=1.0,
+        )
+
+    projected, pullback = jax.vjp(project, state)
+    incoming = (
+        jnp.zeros_like(projected[0]),
+        jnp.full_like(projected[1], 1.0e308),
+        jnp.zeros_like(projected[2]),
+    )
+    (state_bar,) = pullback(incoming)
+
+    assert jnp.all(jnp.isfinite(projected[1]))
+    assert jnp.all(jnp.isfinite(state_bar[0]))
+    assert jnp.all(jnp.isfinite(state_bar[1]))
+    assert jnp.all(jnp.isfinite(state_bar[2]))
+    assert jnp.allclose(state_bar[0], 0.0)
+    assert jnp.allclose(state_bar[1], incoming[1])
+    assert jnp.allclose(state_bar[2], 0.0)
+
+
+def test_limm_w_config_keeps_current_flux_and_jacobian_reuse_separate():
+    """LIMM-W may reuse its matrix, but never its physical RHS anchor."""
+
+    config = transport_solvers._LIMMWSolverConfig(
+        order=5,
+        jacobian_reuse_mode="global_state_drift_max",
+    )
+
+    assert config.order == 5
+    assert config.jacobian_reuse_mode == "global_state_drift_max"
+    assert not hasattr(config, "rhs_mode")
+
+
+def test_radau_stage_predictor_does_not_rescale_derivative_history_after_retry():
+    """K-history is a derivative history, not a history of h*K increments."""
+
+    dtype = jnp.float64
+    f0 = jnp.asarray([2.0, -3.0], dtype=dtype)
+    previous_stages = jnp.tile(jnp.asarray([5.0, -7.0], dtype=dtype), 3)
+    c = jnp.asarray([0.1, 0.5, 1.0], dtype=dtype)
+
+    predictor = transport_solvers._make_radau_stage_predictor(
+        f0,
+        previous_stages,
+        jnp.asarray(1.0, dtype=dtype),
+        jnp.asarray(0.01, dtype=dtype),
+        c,
+        dtype,
+        predictor_mode="current",
+    ).reshape((3, 2))
+
+    expected = 0.85 * jnp.asarray([5.0, -7.0]) + 0.15 * c[:, None] * f0[None, :]
+    assert jnp.allclose(predictor, expected, rtol=1.0e-12, atol=1.0e-12)
+
+
+def test_radau_private_edge_seed_uses_accepted_state_without_touching_public_history():
+    """The floating boundary root is constant-seeded; public fields are not."""
+
+    z0 = jnp.asarray(
+        [[1.0, -2.0, 3.0], [4.0, -5.0, 6.0], [7.0, -8.0, 9.0]],
+        dtype=jnp.float64,
+    ).ravel()
+    node_cache = SimpleNamespace(transport_response=object(), er_edge_anchor=jnp.asarray(-3.0))
+    seeded = transport_solvers._radau_seed_private_edge_from_accepted_state(
+        z0, state_dim=3, lagged_response=node_cache
+    ).reshape((3, 3))
+    assert jnp.allclose(seeded[:, :-1], z0.reshape((3, 3))[:, :-1])
+    assert jnp.allclose(seeded[:, -1], 0.0)
+
+    ordinary = transport_solvers._radau_seed_private_edge_from_accepted_state(
+        z0, state_dim=3, lagged_response=object()
+    )
+    assert jnp.array_equal(ordinary, z0)
+
+
+def test_radau_stage_residual_defect_is_not_hidden_by_endpoint_cancellation():
+    """Opposing stage residuals must not pass an endpoint-only Newton test."""
+
+    context = types.SimpleNamespace(
+        num_stages=2,
+        state_dim=1,
+        dtype=jnp.float64,
+        tiny_scalar=jnp.asarray(1.0e-30, dtype=jnp.float64),
+    )
+    # With equal endpoint weights these two residuals would cancel, while the
+    # full collocation defect remains one half of the state scale.
+    defect = transport_solvers._radau_stage_residual_defect_norm(
+        context,
+        h_value=jnp.asarray(0.5, dtype=jnp.float64),
+        stage_residual=jnp.asarray([1.0, -1.0], dtype=jnp.float64),
+        endpoint_scale=jnp.asarray([1.0], dtype=jnp.float64),
+    )
+
+    assert jnp.allclose(defect, 0.5, rtol=1.0e-12, atol=1.0e-12)
+
+
+def test_radau_frozen_stage_matrix_action_matches_i_minus_h_a_kron_j():
+    """The Newton-direction audit must use the same operator as the LU."""
+
+    context = types.SimpleNamespace(
+        num_stages=2,
+        state_dim=2,
+        dtype=jnp.float64,
+        a=jnp.asarray([[0.2, 0.1], [0.3, 0.4]], dtype=jnp.float64),
+    )
+    h_value = jnp.asarray(0.5, dtype=jnp.float64)
+    jacobian = jnp.asarray([[2.0, -1.0], [0.5, 3.0]], dtype=jnp.float64)
+    direction = jnp.asarray([[1.0, -2.0], [3.0, 4.0]], dtype=jnp.float64)
+
+    observed = transport_solvers._radau_frozen_stage_matrix_action(
+        context,
+        h_value=h_value,
+        jacobian_ref=jacobian,
+        stage_direction=direction.ravel(),
+    ).reshape((2, 2))
+    expected = direction - h_value * (context.a @ direction) @ jacobian.T
+    assert jnp.allclose(observed, expected, rtol=1.0e-12, atol=1.0e-12)
+
+
+def test_radau_rank_one_secant_inverse_apply_matches_updated_operator():
+    """The LU-only good-Broyden formula equals an explicit rank-one solve."""
+    frozen = jnp.asarray([[2.0, 0.0], [0.0, 3.0]])
+    step = jnp.asarray([1.0, -2.0])
+    local = jnp.asarray([[4.0, 1.0], [1.0, 2.0]])
+    residual_delta = local @ step
+    rhs = jnp.asarray([-3.0, 5.0])
+    observed, applied = transport_solvers._radau_rank_one_secant_inverse_apply(
+        lambda value: jnp.linalg.solve(frozen, value),
+        lambda value: frozen @ value,
+        rhs,
+        step,
+        residual_delta,
+        tiny_scalar=jnp.asarray(1.0e-14),
+    )
+    update = (residual_delta - frozen @ step)[:, None] * step[None, :] / (step @ step)
+    expected = jnp.linalg.solve(frozen + update, rhs)
+    assert bool(applied)
+    assert jnp.allclose(observed, expected, rtol=1.0e-12, atol=1.0e-12)
+
+
+def test_radau_rank_one_secant_inverse_apply_rejects_zero_secant():
+    """A missing secant leaves the established frozen-LU solve unchanged."""
+    frozen = jnp.asarray([[2.0, 0.0], [0.0, 3.0]])
+    rhs = jnp.asarray([-3.0, 5.0])
+    observed, applied = transport_solvers._radau_rank_one_secant_inverse_apply(
+        lambda value: jnp.linalg.solve(frozen, value),
+        lambda value: frozen @ value,
+        rhs,
+        jnp.zeros(2),
+        jnp.zeros(2),
+        tiny_scalar=jnp.asarray(1.0e-14),
+    )
+    assert not bool(applied)
+    assert jnp.allclose(observed, jnp.linalg.solve(frozen, rhs))
+
+
+def test_radau_rank_one_secant_transpose_inverse_apply_matches_transpose():
+    """The reverse helper is the transpose of the forward rank-one update."""
+    frozen = jnp.asarray([[2.0, 0.0], [0.0, 3.0]])
+    step = jnp.asarray([1.0, -2.0])
+    local = jnp.asarray([[4.0, 1.0], [1.0, 2.0]])
+    residual_delta = local @ step
+    rhs = jnp.asarray([-3.0, 5.0])
+    observed, applied = transport_solvers._radau_rank_one_secant_transpose_inverse_apply(
+        lambda value: jnp.linalg.solve(frozen, value),
+        lambda value: jnp.linalg.solve(frozen.T, value),
+        lambda value: frozen @ value,
+        rhs,
+        step,
+        residual_delta,
+        tiny_scalar=jnp.asarray(1.0e-14),
+    )
+    update = (residual_delta - frozen @ step)[:, None] * step[None, :] / (step @ step)
+    expected = jnp.linalg.solve((frozen + update).T, rhs)
+    assert bool(applied)
+    assert jnp.allclose(observed, expected, rtol=1.0e-12, atol=1.0e-12)
+
+
+def test_radau_cached_stage_residual_is_independent_of_frozen_jacobian():
+    """The cached nonlinear response, not ``J_ref``, defines Radau's R(Z).
+
+    This is the invariant needed by a later triggered Jacobian refresh: a
+    refreshed matrix may change the Newton correction, but it must not change
+    the equation whose root is accepted or differentiated in reverse.
+    """
+    dtype = jnp.float64
+    context = types.SimpleNamespace(
+        num_stages=2,
+        state_dim=1,
+        a=jnp.asarray([[0.25, 0.0], [0.5, 0.25]], dtype=dtype),
+        c=jnp.asarray([0.5, 1.0], dtype=dtype),
+        use_lagged_linear_response=False,
+    )
+    physics = types.SimpleNamespace(
+        flat_rhs=lambda _t, y: -999.0 * y,
+        flat_rhs_with_lagged_response=lambda _t, y, cache: y * y + cache,
+    )
+    z = jnp.asarray([1.5, -0.25], dtype=dtype)
+    common = dict(
+        flat_y=jnp.asarray([0.4], dtype=dtype),
+        t_value=jnp.asarray(0.2, dtype=dtype),
+        h_value=jnp.asarray(0.1, dtype=dtype),
+        z_flat=z,
+        f0=jnp.asarray([123.0], dtype=dtype),
+        lagged_response=jnp.asarray([0.3], dtype=dtype),
+    )
+    residual_a = transport_solvers._radau_stage_residual(
+        context, physics, jacobian_ref=jnp.asarray([[0.0]], dtype=dtype), **common
+    )
+    residual_b = transport_solvers._radau_stage_residual(
+        context, physics, jacobian_ref=jnp.asarray([[1.0e12]], dtype=dtype), **common
+    )
+
+    stage_states = common["flat_y"] + common["h_value"] * (context.a @ z[:, None])
+    expected = z[:, None] - (stage_states * stage_states + common["lagged_response"])
+    assert jnp.allclose(residual_a, expected.ravel(), rtol=1.0e-12, atol=1.0e-12)
+    assert jnp.array_equal(residual_a, residual_b)
+
+
+def test_radau_residual_line_search_damps_or_reports_failure():
+    """A coloured-refresh correction must not be accepted after residual growth."""
+
+    dtype = jnp.float64
+    z0 = jnp.asarray([0.1], dtype=dtype)
+    residual = lambda z: z**2 - 1.0
+    residual_norm = lambda value: jnp.linalg.norm(value)
+
+    _, damped_delta, _, damped_norm, damped_lambda, damped_accepted = (
+        transport_solvers._radau_residual_decreasing_line_search(
+            z0,
+            jnp.asarray([10.0], dtype=dtype),
+            residual,
+            residual_norm,
+            dtype=dtype,
+        )
+    )
+    assert bool(damped_accepted)
+    assert float(damped_lambda) < 1.0
+    assert float(damped_norm) <= float(residual_norm(residual(z0)))
+    assert float(jnp.abs(damped_delta[0])) < 10.0
+
+    _, _, _, _, _, no_candidate_accepted = transport_solvers._radau_residual_decreasing_line_search(
+        z0,
+        jnp.asarray([100.0], dtype=dtype),
+        residual,
+        residual_norm,
+        dtype=dtype,
+    )
+    assert not bool(no_candidate_accepted)
+
+
+@pytest.mark.parametrize("order", [0, 6])
+def test_limm_w_config_rejects_unsupported_order(order):
+    with pytest.raises(ValueError, match="limm_w_order"):
+        transport_solvers._LIMMWSolverConfig(order=order)
+
+
+def test_limm_w_published_o16_configuration_exposes_fixed_w3_and_w5_lanes():
+    assert transport_solvers._LIMMWSolverConfig(order=3, coefficient_family="o16_published").coefficient_family == "o16_published"
+    assert transport_solvers._LIMMWSolverConfig(order=5, coefficient_family="o16_published").coefficient_family == "o16_published"
+    with pytest.raises(ValueError, match="order 3 or 5"):
+        transport_solvers._LIMMWSolverConfig(order=4, coefficient_family="o16_published")
+
+
+@pytest.mark.parametrize("order", [1, 2, 3, 4, 5])
+def test_limm_w_baseline_coefficients_satisfy_variable_step_order_conditions(order):
+    """The private baseline is a valid W family before stability optimization."""
+
+    dtype = jnp.float64
+    current_dt = jnp.asarray(0.07, dtype=dtype)
+    previous_dts = jnp.asarray([0.05, 0.09, 0.06, 0.08], dtype=dtype)
+    beta, mu_past, gamma = transport_solvers._limm_w_baseline_coefficients(
+        current_dt, previous_dts, order=order, dtype=dtype
+    )
+    c = jnp.concatenate(
+        (
+            jnp.zeros((1,), dtype=dtype),
+            jnp.cumsum(previous_dts[: order - 1]) / current_dt,
+        )
+    )
+    powers = jnp.arange(order, dtype=dtype)
+
+    # Explicit Adams--Bashforth consistency conditions.
+    assert jnp.allclose(
+        ((-c)[None, :] ** powers[:, None]) @ beta,
+        1.0 / (powers + 1.0),
+        rtol=1.0e-12,
+        atol=1.0e-12,
+    )
+    # W correction: sum_i mu_i c_i^m + gamma (-1)^m = 0.
+    assert jnp.allclose(
+        (c[None, :] ** powers[:, None]) @ mu_past
+        + gamma * ((-jnp.ones_like(powers)) ** powers),
+        jnp.zeros_like(powers),
+        rtol=1.0e-12,
+        atol=1.0e-12,
+    )
+
+
+@pytest.mark.parametrize("order", [1, 2, 3, 4, 5])
+def test_limm_w_baseline_trial_step_preserves_constant_rhs(order):
+    """A response-only trial is exact for a constant nonlinear RHS sample."""
+
+    dtype = jnp.float64
+    h = jnp.asarray(0.1, dtype=dtype)
+    y = jnp.asarray([1.5, -2.0], dtype=dtype)
+    f = jnp.asarray([3.0, -4.0], dtype=dtype)
+    state_history = jnp.broadcast_to(y, (order, y.size))
+    rhs_history = jnp.broadcast_to(f, (order, y.size))
+    y_new = transport_solvers._limm_w_baseline_trial_step(
+        y,
+        rhs_history,
+        state_history,
+        jnp.zeros((y.size, y.size), dtype=dtype),
+        h,
+        jnp.full((max(order - 1, 0),), h, dtype=dtype),
+        order=order,
+    )
+    assert jnp.allclose(y_new, y + h * f, rtol=1.0e-12, atol=1.0e-12)
+
+
+def test_limm_w_baseline_trial_step_uses_one_response_matrix_solve():
+    """The kernel is an explicit RHS/history combination plus one LHS solve."""
+
+    dtype = jnp.float64
+    h = jnp.asarray(0.1, dtype=dtype)
+    y = jnp.asarray([1.0], dtype=dtype)
+    jacobian = jnp.asarray([[-5.0]], dtype=dtype)
+    rhs_history = jnp.asarray([[-5.0], [-6.0]], dtype=dtype)
+    state_history = jnp.asarray([[1.0], [1.2]], dtype=dtype)
+    beta, mu, gamma = transport_solvers._limm_w_baseline_coefficients(
+        h, jnp.asarray([h], dtype=dtype), order=2, dtype=dtype
+    )
+    expected = jnp.linalg.solve(
+        jnp.eye(1, dtype=dtype) - h * gamma * jacobian,
+        y
+        + h * jnp.einsum("i,ij->j", beta, rhs_history)
+        + h * (jacobian @ jnp.einsum("i,ij->j", mu, state_history)),
+    )
+    actual = transport_solvers._limm_w_baseline_trial_step(
+        y,
+        rhs_history,
+        state_history,
+        jacobian,
+        h,
+        jnp.asarray([h], dtype=dtype),
+        order=2,
+    )
+    assert jnp.allclose(actual, expected, rtol=1.0e-12, atol=1.0e-12)
+
+
+def test_limm_w_general_multistep_kernel_matches_provisional_coefficient_adapter():
+    """The published alpha/beta/gamma form must preserve the old baseline."""
+
+    dtype = jnp.float64
+    order = 3
+    h = jnp.asarray(0.08, dtype=dtype)
+    previous_dts = jnp.asarray([0.07, 0.09], dtype=dtype)
+    states = jnp.asarray([[1.0, -0.5], [0.9, -0.45], [0.8, -0.4]], dtype=dtype)
+    rhs = jnp.asarray([[0.2, 0.3], [0.1, 0.25], [0.05, 0.2]], dtype=dtype)
+    jacobian = jnp.asarray([[2.0, 0.1], [0.0, -1.5]], dtype=dtype)
+    beta, gamma_past, gamma_new = transport_solvers._limm_w_baseline_coefficients(
+        h, previous_dts, order=order, dtype=dtype
+    )
+    alpha = jnp.asarray([-1.0, 0.0, 0.0], dtype=dtype)
+    generic = transport_solvers._limm_w_linear_multistep_trial_step(
+        rhs_history=rhs,
+        state_history=states,
+        current_jacobian=jacobian,
+        current_dt=h,
+        alpha_past=alpha,
+        beta_past=beta,
+        gamma_past=gamma_past,
+        gamma_new=gamma_new,
+    )
+    baseline = transport_solvers._limm_w_baseline_trial_step(
+        states[0], rhs, states, jacobian, h, previous_dts, order=order
+    )
+    assert jnp.allclose(generic, baseline, rtol=1.0e-12, atol=1.0e-12)
+
+
+@pytest.mark.parametrize("order", [1, 2, 3, 4, 5])
+def test_limm_w_published_o16_coefficients_preserve_constant_rhs(order):
+    """The vendored public variable-step tables satisfy the basic consistency law."""
+
+    dtype = jnp.float64
+    h = jnp.asarray(0.08, dtype=dtype)
+    previous_dts = jnp.asarray([0.11, 0.05, 0.09, 0.06], dtype=dtype)
+    alpha, beta, gamma_past, gamma_new = transport_solvers._limm_w_o16_coefficients(
+        h, previous_dts, order=order, dtype=dtype
+    )
+    y = jnp.asarray([1.5, -2.0], dtype=dtype)
+    f = jnp.asarray([3.0, -4.0], dtype=dtype)
+    past_offsets = jnp.concatenate((jnp.zeros((1,), dtype=dtype), jnp.cumsum(previous_dts[: order - 1])))
+    state_history = y[None, :] - past_offsets[:, None] * f[None, :]
+    trial = transport_solvers._limm_w_linear_multistep_trial_step(
+        rhs_history=jnp.broadcast_to(f, (order, f.size)),
+        state_history=state_history,
+        current_jacobian=jnp.zeros((y.size, y.size), dtype=dtype),
+        current_dt=h,
+        alpha_past=alpha,
+        beta_past=beta,
+        gamma_past=gamma_past,
+        gamma_new=gamma_new,
+    )
+    assert alpha.shape == beta.shape == gamma_past.shape == (order,)
+    assert jnp.isfinite(gamma_new)
+    assert jnp.allclose(trial, y + h * f, rtol=1.0e-11, atol=1.0e-11)
+
+
+def test_limm_w_history_advances_only_from_accepted_values():
+    dtype = jnp.float64
+    history = transport_solvers._limm_w_initial_history(
+        jnp.asarray([1.0, 2.0], dtype=dtype),
+        jnp.asarray([3.0, 4.0], dtype=dtype),
+        max_order=3,
+    )
+    advanced = transport_solvers._limm_w_advance_history_on_accept(
+        history,
+        jnp.asarray([5.0, 6.0], dtype=dtype),
+        jnp.asarray([7.0, 8.0], dtype=dtype),
+        jnp.asarray(0.1, dtype=dtype),
+    )
+
+    assert jnp.array_equal(history.states[0], jnp.asarray([1.0, 2.0], dtype=dtype))
+    assert jnp.array_equal(advanced.states[:2], jnp.asarray([[5.0, 6.0], [1.0, 2.0]], dtype=dtype))
+    assert jnp.array_equal(advanced.rhs_values[:2], jnp.asarray([[7.0, 8.0], [3.0, 4.0]], dtype=dtype))
+    assert float(advanced.accepted_dts[0]) == pytest.approx(0.1)
+    assert int(advanced.valid_count) == 2
+
+
+def test_limm_w_step_state_ramps_order_with_accepted_history():
+    dtype = jnp.float64
+    state = transport_solvers._limm_w_initial_step_state(
+        0.0,
+        jnp.asarray([1.0], dtype=dtype),
+        jnp.asarray([-2.0], dtype=dtype),
+        0.1,
+        max_order=5,
+    )
+    assert int(transport_solvers._limm_w_available_order(state, 5)) == 1
+    state = dataclasses.replace(
+        state,
+        history=transport_solvers._limm_w_advance_history_on_accept(
+            state.history,
+            jnp.asarray([0.8], dtype=dtype),
+            jnp.asarray([-1.6], dtype=dtype),
+            jnp.asarray(0.1, dtype=dtype),
+        ),
+    )
+    assert int(transport_solvers._limm_w_available_order(state, 5)) == 1
+    state = dataclasses.replace(
+        state,
+        history=transport_solvers._limm_w_advance_history_on_accept(
+            state.history,
+            jnp.asarray([0.7], dtype=dtype),
+            jnp.asarray([-1.4], dtype=dtype),
+            jnp.asarray(0.1, dtype=dtype),
+        ),
+    )
+    assert int(transport_solvers._limm_w_available_order(state, 5)) == 2
+    assert int(transport_solvers._limm_w_available_order(state, 1)) == 1
+
+
+def test_limm_w_embedded_error_uses_only_current_response_and_history():
+    dtype = jnp.float64
+    h = jnp.asarray(0.1, dtype=dtype)
+    y = jnp.asarray([1.0], dtype=dtype)
+    jacobian = jnp.asarray([[-2.0]], dtype=dtype)
+    states = jnp.asarray([[1.0], [1.1], [1.3]], dtype=dtype)
+    rhs = jnp.asarray([[-2.0], [-2.2], [-2.6]], dtype=dtype)
+    trial = transport_solvers._limm_w_baseline_trial_step(
+        y, rhs, states, jacobian, h, jnp.asarray([h, h], dtype=dtype), order=2
+    )
+    error = transport_solvers._limm_w_embedded_trial_error(
+        trial_y=trial,
+        current_y=y,
+        rhs_history=rhs,
+        state_history=states,
+        current_jacobian=jacobian,
+        current_dt=h,
+        previous_dts=jnp.asarray([h, h], dtype=dtype),
+        order=2,
+    )
+    higher = transport_solvers._limm_w_baseline_trial_step(
+        y, rhs, states, jacobian, h, jnp.asarray([h, h], dtype=dtype), order=3
+    )
+    assert jnp.allclose(error, trial - higher, rtol=1.0e-12, atol=1.0e-12)
+
+
+def test_limm_w_fixed_pi_controller_shrinks_and_grows_dt_from_scaled_error():
+    dtype = jnp.float64
+    y = jnp.asarray([1.0, 2.0], dtype=dtype)
+    err_norm = transport_solvers._limm_w_scaled_error_norm(
+        jnp.asarray([0.1, 0.2], dtype=dtype), y, y, rtol=0.1, atol=0.0
+    )
+    assert float(err_norm) == pytest.approx(1.0)
+    shrink = transport_solvers._limm_w_fixed_pi_controller(
+        trial_dt=0.1, error_norm=100.0, previous_accepted_error=1.0,
+        error_order=4, reject_last=False, min_step=1.0e-14, max_step=1.0,
+        safety_factor=0.9, min_step_factor=0.2, max_step_factor=2.0,
+    )
+    grow = transport_solvers._limm_w_fixed_pi_controller(
+        trial_dt=0.1, error_norm=1.0e-8, previous_accepted_error=1.0,
+        error_order=4, reject_last=False, min_step=1.0e-14, max_step=1.0,
+        safety_factor=0.9, min_step_factor=0.2, max_step_factor=2.0,
+    )
+    assert float(shrink.next_dt) < 0.1
+    assert float(grow.next_dt) > 0.1
+
+
+def test_limm_w_fixed_pi_retry_never_increases_step():
+    retry = transport_solvers._limm_w_fixed_pi_controller(
+        trial_dt=jnp.asarray(0.1), error_norm=jnp.asarray(4.0),
+        previous_accepted_error=jnp.asarray(0.1), error_order=4,
+        reject_last=jnp.asarray(True), min_step=1.0e-8, max_step=1.0,
+        safety_factor=0.9, min_step_factor=0.2, max_step_factor=2.0,
+    )
+    assert not bool(retry.accepted)
+    assert float(retry.next_dt) < 0.1
+    assert bool(retry.reject_last)
+
+
+def test_limm_w_attempt_commit_shifts_history_on_fixed_order_startup_accept():
+    dtype = jnp.float64
+    state = transport_solvers._limm_w_initial_step_state(
+        0.0,
+        jnp.asarray([1.0], dtype=dtype),
+        jnp.asarray([-10.0], dtype=dtype),
+        0.1,
+        max_order=4,
+    )
+
+    accept_solver = transport_solvers._LIMMWSolverConfig(
+        t0=0.0, t1=1.0, dt=0.1, order=3, rtol=1.0e3, atol=1.0e3
+    )
+    accepted_attempt = transport_solvers._limm_w_attempt_at_order(
+        state,
+        jnp.asarray([-10.0], dtype=dtype),
+        jnp.asarray([[-10.0]], dtype=dtype),
+        t_final=1.0,
+        solver=accept_solver,
+        order=1,
+    )
+    assert bool(accepted_attempt.accepted)
+    accepted = transport_solvers._limm_w_commit_attempt(
+        state, accepted_attempt, jnp.asarray([-5.0], dtype=dtype)
+    )
+    assert float(accepted.t) == pytest.approx(0.1)
+    assert jnp.array_equal(accepted.history.states[0], accepted.y)
+    assert jnp.array_equal(accepted.history.rhs_values[0], jnp.asarray([-5.0], dtype=dtype))
+    assert int(accepted.status[2]) == 1
+
+
+def test_limm_w_fixed_order_rejection_retains_every_accepted_history_row():
+    """A rejected W3 retry may change h, but must never restart history."""
+
+    dtype = jnp.float64
+    state = transport_solvers._limm_w_initial_step_state(
+        0.0, jnp.asarray([1.0], dtype=dtype), jnp.asarray([-1.0], dtype=dtype), 0.1, max_order=4
+    )
+    history = transport_solvers._LIMMWHistory(
+        states=jnp.asarray([[1.0], [0.9], [0.8], [0.7]], dtype=dtype),
+        rhs_values=jnp.asarray([[-1.0], [-0.8], [-0.6], [-0.4]], dtype=dtype),
+        accepted_dts=jnp.asarray([0.1, 0.1, 0.1], dtype=dtype),
+        valid_count=jnp.asarray(4, dtype=jnp.int32),
+    )
+    state = dataclasses.replace(state, history=history)
+    solver = transport_solvers._LIMMWSolverConfig(
+        t0=0.0, t1=1.0, dt=0.1, order=3, coefficient_family="o16_published", rtol=1.0e-14, atol=1.0e-14
+    )
+    attempt = transport_solvers._limm_w_attempt_at_order(
+        state, history.rhs_values[0], jnp.zeros((1, 1), dtype=dtype), t_final=1.0, solver=solver, order=3
+    )
+    assert not bool(attempt.accepted)
+    retried = transport_solvers._limm_w_commit_attempt(state, attempt, history.rhs_values[0])
+    assert float(retried.t) == pytest.approx(float(state.t))
+    assert jnp.array_equal(retried.history.states, state.history.states)
+    assert jnp.array_equal(retried.history.rhs_values, state.history.rhs_values)
+    assert jnp.array_equal(retried.history.accepted_dts, state.history.accepted_dts)
+    assert int(retried.restart_count) == 0
+
+
+def test_limm_w_full_rhs_adapter_keeps_sources_direct_and_response_only_in_jacobian():
+    """The response accelerates dF/dy; F itself remains the full direct RHS."""
+
+    dtype = jnp.float64
+    state = transport_solvers._limm_w_initial_step_state(
+        0.0,
+        jnp.asarray([2.0], dtype=dtype),
+        jnp.asarray([10.0], dtype=dtype),
+        0.1,
+        max_order=2,
+    )
+    # A structurally compatible cache is required for the compiled cond path.
+    state = dataclasses.replace(
+        state,
+        reuse_state=dataclasses.replace(
+            state.reuse_state,
+            response_cache=jnp.asarray([2.0], dtype=dtype),
+            response_available=jnp.asarray(True),
+        ),
+    )
+
+    def full_rhs(_t, y):
+        return y * y + 3.0 * y  # nonlinear flux-like term + a separate source
+
+    def build_response(y):
+        return y
+
+    def response_rhs(_t, y, response):
+        return response * response + 2.0 * response * (y - response) + 3.0 * y
+
+    current_rhs, jacobian, reuse = transport_solvers._limm_w_prepare_full_rhs_and_jacobian(
+        state,
+        flat_rhs=full_rhs,
+        build_lagged_response=build_response,
+        flat_rhs_with_lagged_response=response_rhs,
+        jacobian_reuse_mode="fresh",
+    )
+    assert jnp.allclose(current_rhs, jnp.asarray([10.0], dtype=dtype))
+    assert jnp.allclose(jacobian, jnp.asarray([[7.0]], dtype=dtype))
+    assert not bool(reuse.last_jacobian_reused)
+
+
+def test_limm_w_anchor_build_uses_one_response_for_exact_full_rhs_and_jacobian():
+    """A rebuilt accepted anchor must not duplicate its direct NTX call."""
+
+    y0 = jnp.asarray([2.0])
+    t0 = jnp.asarray(0.0)
+    calls = {"build": 0, "direct": 0}
+
+    def flat_rhs(_t, y):
+        calls["direct"] += 1
+        return y**2 + 3.0 * y
+
+    def build_response(y):
+        calls["build"] += 1
+        return y**2
+
+    def response_rhs(_t, y, response):
+        # Linearized NTX flux plus the direct non-NTX source.
+        return response + 2.0 * jnp.sqrt(response) * (y - jnp.sqrt(response)) + 3.0 * y
+
+    rhs0, reuse0 = transport_solvers._limm_w_initial_anchor_full_rhs_and_jacobian(
+        y0,
+        t0=t0,
+        flat_rhs=flat_rhs,
+        build_lagged_response=build_response,
+        flat_rhs_with_lagged_response=response_rhs,
+    )
+
+    assert calls == {"build": 1, "direct": 0}
+    assert jnp.allclose(rhs0, y0**2 + 3.0 * y0)
+    assert jnp.allclose(reuse0.jacobian, jnp.asarray([[7.0]]))
+
+    y1 = jnp.asarray([3.0])
+    rhs1, reuse1 = transport_solvers._limm_w_prepare_next_accepted_anchor(
+        y1,
+        accepted_t=jnp.asarray(0.1),
+        reuse_state=reuse0,
+        flat_rhs=flat_rhs,
+        build_lagged_response=build_response,
+        flat_rhs_with_lagged_response=response_rhs,
+        jacobian_reuse_mode="fresh",
+    )
+    # ``lax.cond`` traces both branches in eager mode, so Python counters are
+    # not an execution-count instrument.  The solver invariant is instead
+    # that the selected rebuilt branch returns the exact anchor F and J.
+    assert calls["build"] >= 2
+    assert jnp.allclose(rhs1, y1**2 + 3.0 * y1)
+    assert jnp.allclose(reuse1.jacobian, jnp.asarray([[9.0]]))
+
+
+def test_limm_w_anchor_global_jacobian_reuse_keeps_rhs_direct():
+    """Reusing J across anchors must never reuse the old response value F."""
+
+    y0 = jnp.asarray([2.0])
+    calls = {"build": 0, "direct": 0}
+
+    def flat_rhs(_t, y):
+        calls["direct"] += 1
+        return y**2 + 3.0 * y
+
+    def build_response(y):
+        calls["build"] += 1
+        return y**2
+
+    def response_rhs(_t, y, response):
+        return response + 2.0 * jnp.sqrt(response) * (y - jnp.sqrt(response)) + 3.0 * y
+
+    _, reuse0 = transport_solvers._limm_w_initial_anchor_full_rhs_and_jacobian(
+        y0,
+        t0=jnp.asarray(0.0),
+        flat_rhs=flat_rhs,
+        build_lagged_response=build_response,
+        flat_rhs_with_lagged_response=response_rhs,
+    )
+    y1 = jnp.asarray([2.001])
+    rhs1, reuse1 = transport_solvers._limm_w_prepare_next_accepted_anchor(
+        y1,
+        accepted_t=jnp.asarray(0.1),
+        reuse_state=reuse0,
+        flat_rhs=flat_rhs,
+        build_lagged_response=build_response,
+        flat_rhs_with_lagged_response=response_rhs,
+        jacobian_reuse_mode="global_state_drift_max",
+        jacobian_reuse_rtol=1.0e-2,
+        jacobian_reuse_atol=1.0e-12,
+    )
+    assert calls["direct"] >= 1
+    assert bool(reuse1.last_jacobian_reused)
+    assert jnp.allclose(rhs1, y1**2 + 3.0 * y1)
+
+
+def test_limm_w_baseline_forward_harness_advances_complete_rhs_without_response_hook():
+    """The private forward lane is usable before backend/TOML exposure."""
+
+    solver = LIMMWBaselineSolver(
+        t0=0.0,
+        t1=0.2,
+        dt=0.05,
+        order=3,
+        rtol=1.0e-8,
+        atol=1.0e-10,
+        max_steps=20,
+        save_n=3,
+    )
+    out = solver.solve(jnp.asarray([1.0]), lambda _t, y: jnp.ones_like(y))
+
+    assert not bool(out["failed"])
+    assert float(out["final_time"]) == pytest.approx(0.2)
+    assert jnp.allclose(out["final_state"], jnp.asarray([1.2]), rtol=1.0e-12, atol=1.0e-12)
+    assert int(out["n_steps"]) >= 1
+
+
+def test_limm_w_published_o16_forward_harness_advances_complete_rhs_without_response_hook():
+    """The production candidate uses the same accepted-anchor physics path."""
+
+    solver = LIMMWBaselineSolver(
+        t0=0.0,
+        t1=0.2,
+        dt=0.05,
+        order=3,
+        coefficient_family="o16_published",
+        rtol=1.0e-8,
+        atol=1.0e-10,
+        max_steps=20,
+        save_n=3,
+    )
+    out = solver.solve(jnp.asarray([1.0]), lambda _t, y: jnp.ones_like(y))
+
+    assert not bool(out["failed"])
+    assert float(out["final_time"]) == pytest.approx(0.2)
+    assert jnp.allclose(out["final_state"], jnp.asarray([1.2]), rtol=1.0e-12, atol=1.0e-12)
+
+
+def test_limm_w_published_o16_compiled_loop_controls_stiff_linear_rhs():
+    """Regression for the compiled adaptive path on y' = -100 y."""
+
+    solver = LIMMWBaselineSolver(
+        t0=0.0,
+        t1=0.1,
+        dt=1.0e-3,
+        max_step=2.0e-2,
+        order=3,
+        coefficient_family="o16_published",
+        rtol=1.0e-6,
+        atol=1.0e-10,
+        max_steps=2000,
+    )
+    out = solver.solve(jnp.asarray([1.0]), lambda _t, y: -100.0 * y)
+
+    assert not bool(out["failed"])
+    assert float(out["final_time"]) == pytest.approx(0.1)
+    assert jnp.allclose(out["final_state"], jnp.asarray([jnp.exp(-10.0)]), rtol=2.0e-3, atol=2.0e-7)
+
+
+def test_limm_w5_uses_fixed_order_history_and_lower_embedded_companion():
+    """W5 must reach its fixed production pair without a p=6 table/NTX call."""
+
+    solver = LIMMWBaselineSolver(
+        t0=0.0,
+        t1=0.3,
+        dt=0.02,
+        order=5,
+        coefficient_family="o16_published",
+        rtol=1.0e-6,
+        atol=1.0e-10,
+        max_steps=200,
+    )
+    out = solver.solve(jnp.asarray([1.0]), lambda _t, y: jnp.ones_like(y))
+
+    assert not bool(out["failed"])
+    assert float(out["final_time"]) == pytest.approx(0.3)
+    assert jnp.allclose(out["final_state"], jnp.asarray([1.3]), rtol=1.0e-11, atol=1.0e-11)
+
+
+def test_limm_w_history_predictor_reproduces_linear_trajectory():
+    dtype = jnp.float64
+    # y(t) = 3 - 2 t; current state is at t=0 and older accepted states are
+    # at -0.1 and -0.3, exactly matching the variable-step history convention.
+    history = jnp.asarray([[3.0], [3.2], [3.6]], dtype=dtype)
+    predicted = transport_solvers._limm_w_history_predictor(
+        history, jnp.asarray([0.1, 0.2], dtype=dtype), jnp.asarray(0.05, dtype=dtype), order=3
+    )
+    assert jnp.allclose(predicted, jnp.asarray([2.9], dtype=dtype), rtol=1.0e-12, atol=1.0e-12)
+
+
+
+def test_lagged_response_global_state_drift_max_uses_componentwise_max_norm():
+    """A single out-of-tolerance component must invalidate max-norm reuse."""
+
+    reference = jnp.zeros(4)
+    current = jnp.asarray([1.2, 0.0, 0.0, 0.0])
+    rms = transport_solvers._lagged_response_global_reuse_metric(
+        current, reference, atol=1.0, rtol=0.0, norm="rms"
+    )
+    max_norm = transport_solvers._lagged_response_global_reuse_metric(
+        current, reference, atol=1.0, rtol=0.0, norm="max"
+    )
+
+    assert float(rms) < 1.0
+    assert float(max_norm) == pytest.approx(1.2)
+    assert transport_solvers._lagged_response_reuse_uses_global_drift(
+        "global_state_drift_max"
+    )
+    assert transport_solvers._lagged_response_drift_norm("global_state_drift_max") == "max"
+    assert float(
+        transport_solvers._lagged_response_global_reuse_metric(
+            reference, reference, atol=0.0, rtol=0.0, norm="max"
+        )
+    ) == 0.0
+    assert bool(
+        jnp.isinf(
+            transport_solvers._lagged_response_global_reuse_metric(
+                current, reference, atol=0.0, rtol=0.0, norm="max"
+            )
+        )
+    )
+
+
+def test_theta_global_max_rebuilds_at_new_accepted_step_start():
+    """A tight global-max threshold cannot accidentally retain the old anchor."""
+
+    state_dim = 1
+    dtype = jnp.float64
+    step_state = transport_solvers._theta_initial_step_state(
+        jnp.asarray(0.1, dtype=dtype),
+        jnp.asarray([1.0], dtype=dtype),
+        jnp.asarray(0.01, dtype=dtype),
+        state_dim,
+        dtype,
+        lagged_response_cache=jnp.asarray([0.0], dtype=dtype),
+        lagged_response_valid=True,
+    )
+    step_state = dataclasses.replace(
+        step_state,
+        reuse_state=dataclasses.replace(
+            step_state.reuse_state,
+            lagged_reference_y=jnp.asarray([0.0], dtype=dtype),
+        ),
+    )
+
+    response, reference, reused = transport_solvers._theta_prepare_lagged_response(
+        step_state,
+        use_transport_lagged_response=True,
+        lagged_response_reuse_mode="global_state_drift_max",
+        lagged_response_reuse_rtol=1.0e-7,
+        lagged_response_reuse_atol=1.0e-8,
+        unpack_flat=lambda value: value,
+        project_flat=None,
+        build_lagged_response=lambda value: 10.0 * value,
+    )
+
+    assert not bool(reused)
+    assert jnp.array_equal(reference, jnp.asarray([1.0], dtype=dtype))
+    assert jnp.array_equal(response, jnp.asarray([10.0], dtype=dtype))
+
+
+def test_theta_preserves_actual_anchor_after_global_response_reuse():
+    """The cache anchor must not drift forward when the response is reused."""
+
+    dtype = jnp.float32
+    identity = jnp.eye(1, dtype=dtype)
+    step_state = transport_solvers._theta_initial_step_state(
+        jnp.asarray(0.1, dtype=dtype),
+        jnp.asarray([0.05], dtype=dtype),
+        jnp.asarray(0.01, dtype=dtype),
+        1,
+        dtype,
+        lagged_response_cache=jnp.asarray([0.0], dtype=dtype),
+        lagged_response_valid=True,
+    )
+    step_state = dataclasses.replace(
+        step_state,
+        reuse_state=dataclasses.replace(
+            step_state.reuse_state,
+            lagged_reference_y=jnp.asarray([0.0], dtype=dtype),
+        ),
+    )
+    response, reference, reused = transport_solvers._theta_prepare_lagged_response(
+        step_state,
+        use_transport_lagged_response=True,
+        lagged_response_reuse_mode="global_state_drift_max",
+        lagged_response_reuse_rtol=0.0,
+        lagged_response_reuse_atol=0.1,
+        unpack_flat=lambda value: value,
+        project_flat=None,
+        build_lagged_response=lambda value: value,
+    )
+    context = transport_solvers._ThetaAttemptContext(
+        t=jnp.asarray(0.1, dtype=dtype),
+        y=step_state.y,
+        trial_dt=jnp.asarray(0.01, dtype=dtype),
+        t_new=jnp.asarray(0.11, dtype=dtype),
+        f_old=step_state.y * step_state.y,
+        lagged_response=response,
+        lagged_reference_y=reference,
+        lagged_response_reused=reused,
+        reuse_state=step_state.reuse_state,
+    )
+    result = transport_solvers._theta_newton_accepted_step_attempt(
+        context,
+        predictor_mode="euler",
+        n_linearized_solves=1,
+        theta=jnp.asarray(1.0, dtype=dtype),
+        one=jnp.asarray(1.0, dtype=dtype),
+        identity_n=identity,
+        flat_rhs=lambda _t, y: y * y,
+        flat_rhs_with_lagged_response=lambda _t, y, response: response * response + 2.0 * response * (y - response),
+        use_lagged_linear_response=False,
+        use_transport_lagged_response=True,
+        lagged_response_reuse_mode="global_state_drift_max",
+        jacobian_reuse_rtol=jnp.asarray(0.1, dtype=dtype),
+        max_jacobian_age=jnp.asarray(8, dtype=jnp.int32),
+        delta_reduction_factor=jnp.asarray(0.5, dtype=dtype),
+        tau_min=jnp.asarray(0.01, dtype=dtype),
+        project_flat=None,
+        dtype=dtype,
+        tol=jnp.asarray(1.0e-6, dtype=dtype),
+        maxiter=jnp.asarray(4, dtype=jnp.int32),
+        debug_newton_trace=False,
+    )
+
+    assert bool(reused)
+    assert jnp.array_equal(result.lagged_reference_y_out, jnp.asarray([0.0], dtype=dtype))
+
+
 def test_build_time_solver_theta_newton_backend():
     pytest.importorskip("diffrax")
     solver = build_time_solver(_base_solver_parameters(transport_solver_backend="theta_newton"))
@@ -37,6 +1053,157 @@ def test_build_time_solver_theta_newton_backend():
     assert float(solver.t0) == 0.0
     assert float(solver.t1) == 1.0
     assert solver.rhs_mode == "black_box"
+
+
+def test_build_time_solver_t3d_outer_theta_backend():
+    pytest.importorskip("diffrax")
+    solver = build_time_solver(
+        _base_solver_parameters(
+            transport_solver_backend="theta_t3d_outer",
+            theta_rhs_mode="lagged_transport_response",
+        )
+    )
+    assert isinstance(solver, T3DOuterThetaMethodSolver)
+    assert solver.rhs_mode == "lagged_transport_response"
+
+
+def test_build_time_solver_limm_w_forward_backend_is_explicitly_forward_only():
+    solver = build_time_solver(
+        _base_solver_parameters(
+            transport_solver_backend="limm_w_forward",
+            limm_w_order=3,
+            limm_w_coefficient_family="o16_published",
+            limm_w_jacobian_reuse_mode="retry_only",
+        )
+    )
+    assert isinstance(solver, LIMMWBaselineSolver)
+    assert solver.coefficient_family == "o16_published"
+    assert solver.jacobian_reuse_mode == "retry_only"
+
+
+def test_t3d_outer_theta_solver_rebuilds_lagged_response_before_accepting_time():
+    class QuadraticLaggedField:
+        def __init__(self):
+            self.anchors = []
+
+        def __call__(self, _t, y):
+            return y * y
+
+        def build_lagged_response(self, y):
+            self.anchors.append(float(y[0]))
+            return y
+
+        def evaluate_with_lagged_response(self, _t, y, *, lagged_response):
+            return lagged_response * lagged_response + 2.0 * lagged_response * (y - lagged_response)
+
+    field = QuadraticLaggedField()
+    solver = T3DOuterThetaMethodSolver(
+        t0=0.0,
+        t1=0.1,
+        dt=0.1,
+        theta_implicit=1.0,
+        outer_maxiter=2,
+        outer_rms_threshold=1.0e-8,
+        outer_rms_tolerance=1.0e-2,
+        max_steps=4,
+    )
+    out = solver.solve(jnp.asarray([1.0]), field.__call__)
+
+    assert field.anchors == pytest.approx([1.0, 1.125])
+    assert int(out["n_steps"]) == 1
+    assert float(out["final_time"]) == pytest.approx(0.1)
+    assert jnp.asarray(out["ts"]).tolist() == pytest.approx([0.0, 0.1])
+    assert jnp.asarray(out["accepted_mask"]).tolist() == [True, True]
+    assert int(out["t3d_outer_iterations"]) == 2
+
+
+def test_t3d_outer_theta_config_has_t3d_outer_iteration_contract():
+    config = _T3DOuterThetaSolverConfig(
+        t0=0.0,
+        t1=1.0,
+        dt=0.1,
+        outer_maxiter=4,
+        outer_rms_threshold=2.0e-2,
+        outer_rms_tolerance=1.0e-1,
+        dt_adjust=2.0,
+    )
+    assert config.rhs_mode == "lagged_transport_response"
+    assert config.outer_maxiter == 4
+    assert config.outer_rms_threshold == pytest.approx(2.0e-2)
+    assert config.outer_rms_tolerance == pytest.approx(1.0e-1)
+    assert config.dt_adjust == pytest.approx(2.0)
+    assert config.dt_increase_threshold == pytest.approx(5.0e-3)
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    [
+        ({"outer_maxiter": 0}, "at least one"),
+        ({"outer_rms_threshold": 0.2, "outer_rms_tolerance": 0.1}, "greater than or equal"),
+        ({"dt_adjust": 1.0}, "greater than one"),
+    ],
+)
+def test_t3d_outer_theta_config_rejects_invalid_outer_controls(kwargs, message):
+    with pytest.raises(ValueError, match=message):
+        _T3DOuterThetaSolverConfig(t0=0.0, t1=1.0, dt=0.1, **kwargs)
+
+
+def test_t3d_outer_theta_rebuilds_response_at_endpoint_iterates():
+    anchors = []
+
+    def build_response(anchor):
+        anchors.append(float(anchor[0]))
+        return anchor
+
+    def direct_rhs(_t, y):
+        return y * y
+
+    def lagged_rhs(_t, y, response):
+        return response * response + 2.0 * response * (y - response)
+
+    result = transport_solvers._t3d_outer_theta_fixed_target(
+        y_start=jnp.asarray([1.0]),
+        t_start=jnp.asarray(0.0),
+        dt=jnp.asarray(0.1),
+        theta=jnp.asarray(1.0),
+        flat_rhs=direct_rhs,
+        flat_rhs_with_lagged_response=lagged_rhs,
+        build_lagged_response_at_flat=build_response,
+        rms_fn=lambda trial, anchor: jnp.linalg.norm(trial - anchor),
+        outer_maxiter=2,
+        outer_rms_threshold=1.0e-8,
+        outer_rms_tolerance=1.0e-2,
+    )
+
+    # The first response is built at y_n.  The second is built at the first
+    # candidate endpoint, while the theta left endpoint remains y_n.
+    assert anchors == pytest.approx([1.0, 1.125])
+    assert result.outer_iterations == 2
+    assert not result.converged
+    assert result.accepted
+    assert not result.failed
+    assert float(result.trial_y[0]) == pytest.approx(1.127016129, rel=1.0e-8)
+
+
+def test_t3d_outer_theta_reports_failure_without_advancing_step_start():
+    y_start = jnp.asarray([1.0])
+    result = transport_solvers._t3d_outer_theta_fixed_target(
+        y_start=y_start,
+        t_start=jnp.asarray(0.0),
+        dt=jnp.asarray(0.1),
+        theta=jnp.asarray(1.0),
+        flat_rhs=lambda _t, y: y * y,
+        flat_rhs_with_lagged_response=lambda _t, y, response: response * response + 2.0 * response * (y - response),
+        build_lagged_response_at_flat=lambda anchor: anchor,
+        rms_fn=lambda trial, anchor: jnp.linalg.norm(trial - anchor),
+        outer_maxiter=1,
+        outer_rms_threshold=1.0e-12,
+        outer_rms_tolerance=1.0e-12,
+    )
+
+    assert result.failed
+    assert not result.accepted
+    assert jnp.array_equal(y_start, jnp.asarray([1.0]))
 
 
 def test_build_time_solver_theta_backend_accepts_shared_lagged_rhs_mode():
@@ -72,6 +1239,23 @@ def test_build_time_solver_radau_backend():
     assert solver.rhs_mode == "black_box"
 
 
+@pytest.mark.parametrize("backend", ["radau", "theta_newton"])
+def test_build_time_solver_accepts_global_state_drift_max(backend):
+    pytest.importorskip("diffrax")
+    reuse_key = (
+        "lagged_response_reuse_mode"
+        if backend == "radau"
+        else "theta_lagged_response_reuse_mode"
+    )
+    solver = build_time_solver(
+        _base_solver_parameters(
+            transport_solver_backend=backend,
+            **{reuse_key: "global_state_drift_max"},
+        )
+    )
+    assert solver.lagged_response_reuse_mode == "global_state_drift_max"
+
+
 def test_build_time_solver_radau_accepts_lagged_rhs_mode():
     pytest.importorskip("diffrax")
     solver = build_time_solver(
@@ -94,6 +1278,949 @@ def test_build_time_solver_radau_accepts_shared_lagged_rhs_mode():
     )
     assert isinstance(solver, RADAUSolver)
     assert solver.rhs_mode == "lagged_linear_state"
+
+
+def test_build_time_solver_radau_accepts_endpoint_defect_correction():
+    solver = build_time_solver(
+        _base_solver_parameters(
+            transport_solver_backend="radau",
+            radau_rhs_mode="lagged_transport_response",
+            radau_lagged_response_correction_mode="endpoint_defect",
+        )
+    )
+    assert isinstance(solver, RADAUSolver)
+    assert solver.lagged_response_correction_mode == "endpoint_defect"
+
+
+def test_radau_endpoint_defect_correction_requires_transport_lagged_response():
+    with pytest.raises(ValueError, match="requires radau_rhs_mode='lagged_transport_response'"):
+        RADAUSolver(lagged_response_correction_mode="endpoint_defect")
+
+
+def test_build_time_solver_radau_accepts_stage_drift_jacobian_refresh():
+    solver = build_time_solver(
+        _base_solver_parameters(
+            transport_solver_backend="radau",
+            radau_rhs_mode="lagged_transport_response",
+            radau_lagged_jacobian_refresh_mode="stage_drift_after_first",
+            radau_lagged_jacobian_refresh_threshold=0.75,
+        )
+    )
+    assert isinstance(solver, RADAUSolver)
+    assert solver.lagged_jacobian_refresh_mode == "stage_drift_after_first"
+    assert solver.lagged_jacobian_refresh_threshold == pytest.approx(0.75)
+
+
+def test_build_time_solver_radau_accepts_exact_cached_retry_refresh():
+    """The expensive recovery is opt-in and available only to lagged Radau."""
+    solver = build_time_solver(
+        _base_solver_parameters(
+            transport_solver_backend="radau",
+            radau_rhs_mode="lagged_transport_response",
+            radau_lagged_jacobian_refresh_mode="quadratic_exact_retry_after_failure",
+        )
+    )
+    assert isinstance(solver, RADAUSolver)
+    assert solver.lagged_jacobian_refresh_mode == "quadratic_exact_retry_after_failure"
+
+
+def test_build_time_solver_radau_accepts_full_stage_quadratic_newton():
+    """The exact cached-stage Newton lane exposes its damping policy."""
+    solver = build_time_solver(
+        _base_solver_parameters(
+            transport_solver_backend="radau",
+            radau_rhs_mode="lagged_transport_response",
+            radau_lagged_jacobian_refresh_mode="quadratic_full_stage_each_iteration",
+        )
+    )
+    assert isinstance(solver, RADAUSolver)
+    assert solver.lagged_jacobian_refresh_mode == "quadratic_full_stage_each_iteration"
+    assert solver.full_stage_line_search is True
+
+    undamped_solver = build_time_solver(
+        _base_solver_parameters(
+            transport_solver_backend="radau",
+            radau_rhs_mode="lagged_transport_response",
+            radau_lagged_jacobian_refresh_mode="quadratic_full_stage_each_iteration",
+            radau_full_stage_line_search=False,
+        )
+    )
+    assert undamped_solver.full_stage_line_search is False
+
+
+def test_radau_full_stage_quadratic_newton_runs_on_cached_nonlinear_rhs():
+    """Every correction may use the exact current Jacobian of a fixed cache."""
+
+    class NonlinearCachedField:
+        def __call__(self, _t, y):
+            return y * y
+
+        def build_lagged_response(self, y):
+            return y
+
+        def evaluate_with_lagged_response(self, _t, y, *_args, lagged_response):
+            del _args, lagged_response
+            return y * y
+
+    solver = RADAUSolver(
+        t0=0.0,
+        t1=1.0e-3,
+        dt=1.0e-4,
+        rtol=1.0e-7,
+        atol=1.0e-10,
+        rhs_mode="lagged_transport_response",
+        lagged_jacobian_refresh_mode="quadratic_full_stage_each_iteration",
+        maxiter=8,
+        max_steps=16,
+    )
+    out = solver.solve(jnp.asarray([0.4]), NonlinearCachedField().__call__)
+    assert int(out["n_steps"]) > 0
+    assert jnp.all(jnp.isfinite(out["final_state"]))
+
+
+def test_radau_full_stage_quadratic_newton_traces_through_accepted_step_vjp():
+    """The exact cached-stage mode retains the implicit accepted-step VJP."""
+
+    class NonlinearCachedField:
+        def __call__(self, _t, y):
+            return y * y
+
+        def build_lagged_response(self, y):
+            return y
+
+        def evaluate_with_lagged_response(self, _t, y, *_args, lagged_response):
+            del _args, lagged_response
+            return y * y
+
+    solver = RADAUSolver(
+        t0=0.0,
+        t1=1.0e-3,
+        dt=1.0e-4,
+        rtol=1.0e-7,
+        atol=1.0e-10,
+        rhs_mode="lagged_transport_response",
+        lagged_jacobian_refresh_mode="quadratic_full_stage_each_iteration",
+        maxiter=8,
+        max_steps=8,
+    )
+    field = NonlinearCachedField()
+    prepared = transport_solvers._build_prepared_radau_accepted_rollout(
+        solver=solver,
+        state=jnp.asarray([0.4]),
+        vector_field=field.__call__,
+        species=None,
+    )
+    prepared = dataclasses.replace(
+        prepared,
+        physics_context=dataclasses.replace(
+            prepared.physics_context,
+            pullback_build_lagged_response=lambda _state, cache_bar: cache_bar,
+        ),
+    )
+    attempt_context = transport_solvers._RadauAcceptedStepAttemptContext(
+        t_final=prepared.initial_carry.t + prepared.initial_carry.dt,
+        use_transport_lagged_response=jnp.asarray(True),
+    )
+
+    def trial_y(initial_y):
+        carry = dataclasses.replace(prepared.initial_carry, y=initial_y)
+        return transport_solvers._execute_radau_accepted_step_trial_y_vjp_lagged_branch(
+            prepared.kernel_context,
+            prepared.physics_context,
+            carry,
+            attempt_context,
+            "rebuild",
+        )
+
+    y0 = jnp.asarray([0.4])
+    value, pullback = jax.vjp(trial_y, y0)
+    (gradient,) = pullback(jnp.ones_like(value))
+    epsilon = jnp.asarray(1.0e-6)
+    finite_difference = (
+        jnp.sum(trial_y(y0 + epsilon)) - jnp.sum(trial_y(y0 - epsilon))
+    ) / (2.0 * epsilon)
+    assert jnp.all(jnp.isfinite(gradient))
+    assert jnp.allclose(gradient[0], finite_difference, rtol=2.0e-4, atol=2.0e-6)
+
+
+def test_build_time_solver_radau_accepts_good_broyden_stage_secant():
+    """The new LU-only nonlinear correction is explicit and opt-in."""
+    solver = build_time_solver(
+        _base_solver_parameters(
+            transport_solver_backend="radau",
+            radau_rhs_mode="lagged_transport_response",
+            radau_stage_secant_correction_mode="good_broyden_after_first",
+        )
+    )
+    assert isinstance(solver, RADAUSolver)
+    assert solver.stage_secant_correction_mode == "good_broyden_after_first"
+
+
+def test_radau_stage_secant_correction_rejects_jacobian_refresh_combo():
+    with pytest.raises(ValueError, match="cannot be combined"):
+        RADAUSolver(
+            rhs_mode="lagged_transport_response",
+            lagged_jacobian_refresh_mode="quadratic_colored_after_first",
+            stage_secant_correction_mode="good_broyden_after_first",
+        )
+
+
+def test_radau_stage_drift_jacobian_refresh_requires_transport_lagged_response():
+    with pytest.raises(ValueError, match="requires a lagged transport response RHS mode"):
+        RADAUSolver(lagged_jacobian_refresh_mode="stage_drift_after_first")
+
+
+def test_radau_quadratic_colored_refresh_recovers_block_tridiagonal_jacobian():
+    """Colored cached-response tangents recover the exact local Jacobian."""
+    dtype = jnp.float64
+    context = types.SimpleNamespace(
+        density_size=4,
+        pressure_size=4,
+        er_size=0,
+        state_dim=8,
+        num_stages=1,
+        dtype=dtype,
+        zero_scalar=jnp.asarray(0.0, dtype=dtype),
+    )
+
+    def rhs(y):
+        density, pressure = y[:4], y[4:]
+        density_left = jnp.concatenate([jnp.zeros((1,), dtype=dtype), density[:-1]])
+        pressure_right = jnp.concatenate([pressure[1:], jnp.zeros((1,), dtype=dtype)])
+        density_rhs = 0.2 * density * density + 0.3 * density * pressure + 0.1 * density_left * density
+        pressure_rhs = 0.4 * pressure * pressure + 0.2 * density * pressure_right + 0.1 * density_left * pressure
+        return jnp.concatenate([density_rhs, pressure_rhs])
+
+    anchor = jnp.asarray([0.2, 0.4, -0.3, 0.7, 0.1, -0.2, 0.5, 0.3], dtype=dtype)
+    current = jnp.asarray([0.5, -0.1, 0.8, 0.3, -0.4, 0.2, 0.6, -0.5], dtype=dtype)
+    jacobian_anchor = jax.jacfwd(rhs)(anchor)
+    updated = transport_solvers._radau_quadratic_colored_jacobian_update(
+        context,
+        t_value=jnp.asarray(0.0, dtype=dtype),
+        flat_y=current,
+        jacobian_anchor=jacobian_anchor,
+        lagged_response=None,
+        flat_rhs_lagged_response_tangent=lambda _t, y, direction, _response: jax.jvp(
+            rhs, (y,), (direction,)
+        )[1],
+    )
+    assert jnp.allclose(updated, jax.jacfwd(rhs)(current), rtol=1.0e-12, atol=1.0e-12)
+
+
+def test_radau_floating_edge_node_uses_private_augmented_coordinate():
+    """The node mode must integrate an edge scalar without changing output state."""
+
+    class _NodeOwner:
+        er_equation = SimpleNamespace(boundary_mode="floating_ambipolar_edge_node")
+
+        def __call__(self, _t, state, *_args):
+            return TransportState(
+                density=-0.1 * state.density,
+                pressure=-0.1 * state.pressure,
+                Er=-state.Er,
+            )
+
+        def build_lagged_response(self, state):
+            return state
+
+        def evaluate_with_lagged_response(self, _t, state, *_args, lagged_response):
+            del lagged_response
+            return self(0.0, state)
+
+        def build_node_boundary_lagged_response(self, state, er_edge):
+            # The cache is intentionally an ordinary model payload; Radau
+            # owns the separate edge anchor.
+            del state
+            return er_edge
+
+        def evaluate_node_boundary_with_lagged_response(
+            self, state, er_edge, transport_response, *, er_edge_anchor
+        ):
+            # Exercise both coupling directions: the final centre sees the
+            # node, and the node evolves independently from its anchor.
+            del transport_response, er_edge_anchor
+            er_rhs = -state.Er
+            er_rhs = er_rhs.at[-1].add(-0.25 * er_edge)
+            core = TransportState(
+                density=-0.1 * state.density,
+                pressure=-0.1 * state.pressure,
+                Er=er_rhs,
+            )
+            return core, -0.5 * er_edge
+
+        def evaluate_node_boundary_with_lagged_response_tangent(
+            self,
+            state,
+            state_direction,
+            er_edge,
+            er_edge_direction,
+            transport_response,
+            *,
+            er_edge_anchor,
+        ):
+            del state, er_edge, transport_response, er_edge_anchor
+            er_rhs = -state_direction.Er
+            er_rhs = er_rhs.at[-1].add(-0.25 * er_edge_direction)
+            return TransportState(
+                density=-0.1 * state_direction.density,
+                pressure=-0.1 * state_direction.pressure,
+                Er=er_rhs,
+            ), -0.5 * er_edge_direction
+
+        def pullback_node_boundary_with_lagged_response_edge(
+            self, state, er_edge, transport_response, rhs_bar, *, er_edge_anchor
+        ):
+            del state, er_edge, transport_response, er_edge_anchor
+            core_bar, edge_bar = rhs_bar
+            # Core Er[-1] contains -0.25 * E_edge and the node RHS contains
+            # -0.5 * E_edge.
+            return -0.25 * core_bar.Er[-1] - 0.5 * edge_bar
+
+    state0 = TransportState(
+        density=jnp.ones((1, 2)),
+        pressure=jnp.ones((1, 2)),
+        Er=jnp.asarray([1.0, 2.0]),
+    )
+    solver = RADAUSolver(
+        t0=0.0,
+        t1=1.0e-2,
+        dt=1.0e-3,
+        rtol=1.0e-6,
+        atol=1.0e-8,
+        rhs_mode="lagged_transport_response",
+        lagged_jacobian_refresh_mode="quadratic_colored_after_first",
+        lagged_jacobian_refresh_threshold=1.0e-16,
+        error_estimator="embedded2_ntss_transport_scale",
+        debug_stage_markers=True,
+        debug_cached_stage_jacobian_audit=True,
+        maxiter=8,
+        max_steps=32,
+    )
+    owner = _NodeOwner()
+    out = solver.solve(state0, owner.__call__)
+    prepared = transport_solvers._build_prepared_radau_accepted_rollout(
+        solver=solver,
+        state=state0,
+        vector_field=owner.__call__,
+        species=None,
+    )
+
+    assert int(out["n_steps"]) > 0
+    assert isinstance(out["final_state"], TransportState)
+    assert len(jax.tree_util.tree_leaves(out["final_state"])) == 3
+    assert jnp.all(jnp.isfinite(out["final_state"].Er))
+    # The accepted-rollout builder is also the reverse replay entry point. It
+    # must use the same private outer-Er coordinate as RADAUSolver.solve.
+    assert int(prepared.initial_carry.y.shape[0]) == 7
+    rhs_bar = jnp.arange(7.0)
+    node_bar = prepared.physics_context.flat_rhs_state_pullback(
+        0.0,
+        prepared.initial_carry.y,
+        prepared.initial_carry.lagged_response_cache,
+        rhs_bar,
+    )
+    assert jnp.allclose(node_bar[-1], -0.25 * rhs_bar[-2] - 0.5 * rhs_bar[-1])
+
+
+@pytest.mark.parametrize(
+    ("probe_enabled", "expected_probe_calls"), ((False, 0), (True, 1))
+)
+def test_radau_node_edge_live_probe_reaches_host_callback(
+    probe_enabled, expected_probe_calls
+):
+    """Only the explicit Boolean may arm the one-shot live probe.
+
+    A threshold remains a sensitivity setting, including for old TOMLs, but
+    must not make a run stop when the Boolean is false.
+    """
+
+    class _NodeOwner:
+        er_equation = SimpleNamespace(boundary_mode="floating_ambipolar_edge_node")
+
+        def __init__(self):
+            self.probe_calls = 0
+
+        def __call__(self, _t, state, *_args):
+            return TransportState(
+                density=-0.1 * state.density,
+                pressure=-0.1 * state.pressure,
+                Er=-state.Er,
+            )
+
+        def build_lagged_response(self, state):
+            return state
+
+        def evaluate_with_lagged_response(self, _t, state, *_args, lagged_response):
+            del lagged_response
+            return self(0.0, state)
+
+        def build_node_boundary_lagged_response(self, state, er_edge):
+            del state
+            return er_edge
+
+        def evaluate_node_boundary_with_lagged_response(
+            self, state, er_edge, transport_response, *, er_edge_anchor
+        ):
+            del transport_response, er_edge_anchor
+            return self(0.0, state), -2.0e5 * er_edge
+
+        def debug_node_boundary_live_vs_lagged(
+            self, state, er_edge, transport_response, *, er_edge_anchor
+        ):
+            del state, transport_response, er_edge_anchor
+            self.probe_calls += 1
+            value = jnp.asarray(er_edge)
+            return {
+                "edge": value,
+                "edge_step": jnp.asarray(1.0e-6),
+                "cached_rhs": -2.0e5 * value,
+                "cached_drhs_dedge_fd": jnp.asarray(-2.0e5),
+                "live_rhs": -2.0e5 * value,
+                "live_drhs_dedge_fd": jnp.asarray(-2.0e5),
+                "state_last_center_Er": value,
+                "cached_gamma_by_species": jnp.asarray([0.0]),
+                "live_gamma_by_species": jnp.asarray([0.0]),
+                "face_density_by_species": jnp.asarray([1.0]),
+                "face_temperature_by_species": jnp.asarray([1.0]),
+            }
+
+    owner = _NodeOwner()
+    state0 = TransportState(
+        density=jnp.ones((1, 2)),
+        pressure=jnp.ones((1, 2)),
+        Er=jnp.asarray([1.0, 2.0]),
+    )
+    solver = RADAUSolver(
+        t0=0.0,
+        t1=1.0e-2,
+        dt=1.0e-3,
+        rtol=1.0e-6,
+        atol=1.0e-8,
+        rhs_mode="lagged_transport_response",
+        error_estimator="embedded2_ntss_transport_scale",
+        debug_walltime_attempts=True,
+        # Stage tracing is intentionally unrelated to probe arming.
+        debug_stage_state_trace=True,
+        debug_node_edge_live_probe=probe_enabled,
+        debug_node_edge_live_probe_jacobian_threshold=1.0e5,
+        maxiter=8,
+        max_steps=32,
+    )
+    solver.solve(state0, owner.__call__)
+
+    assert owner.probe_calls == expected_probe_calls
+
+
+def test_radau_floating_edge_node_allows_black_box_rhs():
+    """The node is a discretization feature, not a lagged-response feature."""
+
+    class _NodeOwner:
+        er_equation = SimpleNamespace(boundary_mode="floating_ambipolar_edge_node")
+
+        def __call__(self, _t, state, *_args):
+            return TransportState(
+                density=-0.1 * state.density,
+                pressure=-0.1 * state.pressure,
+                Er=-state.Er,
+            )
+
+        def build_lagged_response(self, state):
+            return state
+
+        def evaluate_with_lagged_response(self, _t, state, *_args, lagged_response):
+            del lagged_response
+            return self(0.0, state)
+
+        def build_node_boundary_lagged_response(self, state, er_edge):
+            del state
+            return er_edge
+
+        def evaluate_node_boundary_with_lagged_response(
+            self, state, er_edge, transport_response, *, er_edge_anchor
+        ):
+            del transport_response, er_edge_anchor
+            core = TransportState(
+                density=-0.1 * state.density,
+                pressure=-0.1 * state.pressure,
+                Er=-state.Er.at[-1].add(0.25 * er_edge),
+            )
+            return core, -0.5 * er_edge
+
+    state0 = TransportState(
+        density=jnp.ones((1, 2)), pressure=jnp.ones((1, 2)), Er=jnp.asarray([1.0, 2.0])
+    )
+    solver = RADAUSolver(
+        t0=0.0, t1=1.0e-3, dt=1.0e-4, rtol=1.0e-6, atol=1.0e-8,
+        rhs_mode="black_box", maxiter=8, max_steps=32,
+    )
+    out = solver.solve(state0, _NodeOwner().__call__)
+    assert int(out["n_steps"]) > 0
+    assert jnp.all(jnp.isfinite(out["final_state"].Er))
+
+
+def test_fixed_branch_scalar_root_pullback_matches_implicit_derivative():
+    """The edge-root rule is dE/dx = -(dG/dx)/(dG/dE)."""
+    state = TransportState(
+        density=jnp.asarray([[1.0, 4.0]]),
+        pressure=jnp.asarray([[1.0, 1.0]]),
+        Er=jnp.asarray([0.0, 4.0]),
+    )
+
+    def residual(state_value, edge_value):
+        return edge_value * edge_value - state_value.Er[-1]
+
+    state_bar = reverse_transport.implicit_scalar_root_state_pullback(
+        residual, state, jnp.asarray(2.0), jnp.asarray(3.0)
+    )
+    # dE/dEr_last=1/(2E)=1/4, multiplied by the incoming root bar 3.
+    assert jnp.allclose(state_bar.Er, jnp.asarray([0.0, 0.75]))
+    assert jnp.allclose(state_bar.density, jnp.zeros_like(state.density))
+
+
+def test_fixed_branch_scalar_root_support_pullback_matches_implicit_derivative():
+    """The private edge root also contributes to NTX/geometry support bars."""
+    state = TransportState(
+        density=jnp.asarray([[1.0, 4.0]]),
+        pressure=jnp.asarray([[1.0, 1.0]]),
+        Er=jnp.asarray([0.0, 4.0]),
+    )
+    support = {"edge_shift": jnp.asarray(2.0)}
+
+    def residual(state_value, edge_value, support_value):
+        return edge_value * edge_value - state_value.Er[-1] - support_value["edge_shift"]
+
+    support_bar = reverse_transport.implicit_scalar_root_support_pullback(
+        residual, state, jnp.sqrt(jnp.asarray(6.0)), jnp.asarray(3.0), support
+    )
+    # dE/dshift=1/(2E), multiplied by the incoming root bar 3.
+    assert jnp.allclose(
+        support_bar["edge_shift"], 3.0 / (2.0 * jnp.sqrt(jnp.asarray(6.0)))
+    )
+
+
+def test_radau_node_initial_carry_reverse_includes_selected_edge_root_state_bar():
+    """The private node's initial scalar reaches the public-state reverse bar."""
+
+    class _NodeOwner:
+        er_equation = SimpleNamespace(boundary_mode="floating_ambipolar_edge_node")
+        node_boundary_initial_er = jnp.asarray(3.0)
+
+        def __call__(self, _t, state, *_args):
+            return TransportState(
+                density=-0.1 * state.density,
+                pressure=-0.1 * state.pressure,
+                Er=-state.Er,
+            )
+
+        def build_lagged_response(self, state):
+            return state
+
+        def evaluate_with_lagged_response(self, _t, state, *_args, lagged_response):
+            del lagged_response
+            return self(0.0, state)
+
+        def build_node_boundary_lagged_response(self, state, er_edge):
+            del state
+            return er_edge
+
+        def evaluate_node_boundary_with_lagged_response(
+            self, state, er_edge, transport_response, *, er_edge_anchor
+        ):
+            del transport_response, er_edge_anchor
+            return self(0.0, state), -0.5 * er_edge
+
+        def node_boundary_charge_residual(self, state, er_edge):
+            # At the selected initial root, E_edge = 1.5 E_last.  The exact
+            # fixed-branch pullback is therefore dE_edge/dE_last = 1.5.
+            return er_edge - 1.5 * state.Er[-1]
+
+    state0 = TransportState(
+        density=jnp.ones((1, 2)),
+        pressure=jnp.ones((1, 2)),
+        Er=jnp.asarray([1.0, 2.0]),
+    )
+    owner = _NodeOwner()
+    solver = RADAUSolver(
+        t0=0.0,
+        t1=1.0e-3,
+        dt=1.0e-4,
+        rtol=1.0e-6,
+        atol=1.0e-8,
+        rhs_mode="lagged_transport_response",
+        maxiter=8,
+        max_steps=32,
+    )
+    prepared = transport_solvers._build_prepared_radau_accepted_rollout(
+        solver=solver,
+        state=state0,
+        vector_field=owner.__call__,
+        species=None,
+    )
+
+    def _initial_carry(state_value):
+        return reverse_transport.reverse_initial_carry_from_state_with_static_setup(
+            solver=solver,
+            state=state_value,
+            solve_vector_field=owner.__call__,
+            species=None,
+            prepared_rollout_static=prepared,
+        )
+
+    carry, carry_pullback = jax.vjp(_initial_carry, state0)
+    carry_bar = jax.tree_util.tree_map(
+        lambda leaf: None if leaf is None else jnp.zeros_like(leaf), carry
+    )
+    # Seed only the Radau-private edge coordinate.  Its bar must reach the
+    # final public centre through the selected scalar-root rule.
+    carry_bar = dataclasses.replace(
+        carry_bar,
+        y=carry_bar.y.at[-1].set(4.0),
+    )
+    (state_bar,) = carry_pullback(carry_bar)
+
+    assert jnp.allclose(state_bar.Er, jnp.asarray([0.0, 6.0]))
+    assert jnp.allclose(state_bar.density, jnp.zeros_like(state0.density))
+    assert jnp.allclose(state_bar.pressure, jnp.zeros_like(state0.pressure))
+
+
+def test_radau_endpoint_defect_correction_runs_on_nonlinear_lagged_rhs():
+    class QuadraticLaggedField:
+        def __call__(self, _t, y):
+            return y * y
+
+        def build_lagged_response(self, y):
+            return y
+
+        def evaluate_with_lagged_response(self, _t, y, *, lagged_response):
+            return lagged_response * lagged_response + 2.0 * lagged_response * (y - lagged_response)
+
+    solver = RADAUSolver(
+        t0=0.0,
+        t1=0.05,
+        dt=0.01,
+        rtol=1.0e-5,
+        atol=1.0e-8,
+        rhs_mode="lagged_transport_response",
+        lagged_response_correction_mode="endpoint_defect",
+        maxiter=8,
+        max_steps=32,
+    )
+    out = solver.solve(jnp.asarray([0.1]), QuadraticLaggedField().__call__)
+    assert int(out["n_steps"]) > 0
+    assert jnp.all(jnp.isfinite(out["final_state"]))
+
+
+def test_radau_stage_drift_jacobian_refresh_runs_on_nonlinear_lagged_rhs():
+    class QuadraticLaggedField:
+        def __call__(self, _t, y):
+            return y * y
+
+        def build_lagged_response(self, y):
+            return y
+
+        def evaluate_with_lagged_response(self, _t, y, *, lagged_response):
+            return lagged_response * lagged_response + 2.0 * lagged_response * (y - lagged_response)
+
+    solver = RADAUSolver(
+        t0=0.0,
+        t1=0.05,
+        dt=0.01,
+        rtol=1.0e-5,
+        atol=1.0e-8,
+        rhs_mode="lagged_transport_response",
+        lagged_jacobian_refresh_mode="stage_drift_after_first",
+        # Force the refresh path in this small regression test.
+        lagged_jacobian_refresh_threshold=1.0e-16,
+        maxiter=8,
+        max_steps=32,
+    )
+    out = solver.solve(jnp.asarray([0.1]), QuadraticLaggedField().__call__)
+    assert int(out["n_steps"]) > 0
+    assert jnp.all(jnp.isfinite(out["final_state"]))
+
+
+def test_radau_good_broyden_stage_secant_runs_on_nonlinear_lagged_rhs():
+    """The LU-based secant option executes a complete nonlinear Radau step.
+
+    This is deliberately a genuine lagged nonlinear solve rather than an
+    algebra-only Sherman--Morrison test.  It covers the second-and-later
+    Newton-iteration path, where the stage correction obtains its residual
+    secant using the already cached response.
+    """
+
+    class QuadraticLaggedField:
+        def __call__(self, _t, y):
+            return y * y
+
+        def build_lagged_response(self, y):
+            return y
+
+        def evaluate_with_lagged_response(self, _t, y, *, lagged_response):
+            return lagged_response * lagged_response + 2.0 * lagged_response * (
+                y - lagged_response
+            )
+
+    solver = RADAUSolver(
+        t0=0.0,
+        t1=0.05,
+        dt=0.01,
+        rtol=1.0e-5,
+        atol=1.0e-8,
+        rhs_mode="lagged_transport_response",
+        stage_secant_correction_mode="good_broyden_after_first",
+        maxiter=8,
+        max_steps=32,
+    )
+    out = solver.solve(jnp.asarray([0.1]), QuadraticLaggedField().__call__)
+    assert int(out["n_steps"]) > 0
+    assert jnp.all(jnp.isfinite(out["final_state"]))
+
+
+def test_radau_exact_cached_retry_mode_runs_without_a_retry():
+    """The opt-in recovery leaves an already-convergent cached solve alone."""
+
+    class QuadraticLaggedField:
+        def __call__(self, _t, y):
+            return y * y
+
+        def build_lagged_response(self, y):
+            return y
+
+        def evaluate_with_lagged_response(self, _t, y, *, lagged_response):
+            return lagged_response * lagged_response + 2.0 * lagged_response * (y - lagged_response)
+
+    solver = RADAUSolver(
+        t0=0.0,
+        t1=0.05,
+        dt=0.01,
+        rtol=1.0e-5,
+        atol=1.0e-8,
+        rhs_mode="lagged_transport_response",
+        lagged_jacobian_refresh_mode="quadratic_exact_retry_after_failure",
+        # Exercise the non-stopping cached-stage matrix/JVP audit on an
+        # accepted rollout as well as its custom-VJP path.
+        debug_cached_stage_jacobian_audit=True,
+        maxiter=8,
+        max_steps=32,
+    )
+    out = solver.solve(jnp.asarray([0.1]), QuadraticLaggedField().__call__)
+    assert int(out["n_steps"]) > 0
+    assert jnp.all(jnp.isfinite(out["final_state"]))
+
+
+def test_radau_exact_cached_retry_relinearizes_at_dominant_failed_stage(monkeypatch):
+    """A finite failed solve is retried from its largest-residual Radau stage."""
+    dtype = jnp.float64
+    context = types.SimpleNamespace(
+        num_stages=2,
+        state_dim=1,
+        dtype=dtype,
+        a=jnp.asarray([[0.25, 0.0], [0.5, 0.25]], dtype=dtype),
+    )
+    failed = transport_solvers._RadauStageSubsolveResult(
+        iter_final=jnp.asarray(2, dtype=jnp.int32),
+        z_final=jnp.asarray([1.0, 4.0], dtype=dtype),
+        delta_final=jnp.zeros((2,), dtype=dtype),
+        delta_norm_final=jnp.asarray(0.0, dtype=dtype),
+        newton_metric_final=jnp.asarray(1.0, dtype=dtype),
+        theta_final=jnp.asarray(1.0, dtype=dtype),
+        diverged_final=jnp.asarray(True),
+        shrink_suggest_final=jnp.asarray(0.5, dtype=dtype),
+        slow_contraction_final=jnp.asarray(True),
+        residual_blowup_final=jnp.asarray(False),
+        newton_nonfinite_final=jnp.asarray(False),
+        finite_initial_residual=jnp.asarray(True),
+        nonfinite_stage_state=jnp.asarray(False),
+        nonfinite_stage_residual=jnp.asarray(False),
+        final_residual=jnp.asarray([0.1, -3.0], dtype=dtype),
+        final_residual_norm=jnp.asarray(3.0, dtype=dtype),
+        converged=jnp.asarray(False),
+        secant_applied_final=jnp.asarray(False),
+        newton_state_final=(),
+    )
+    inputs = transport_solvers._RadauStageSubsolveInputs(
+        flat_y=jnp.asarray([2.0], dtype=dtype),
+        t_value=jnp.asarray(0.0, dtype=dtype),
+        h_value=jnp.asarray(0.5, dtype=dtype),
+        z0=jnp.zeros((2,), dtype=dtype),
+        f0=jnp.zeros((1,), dtype=dtype),
+        jacobian_ref=jnp.asarray([[1.0]], dtype=dtype),
+        rhs_time_ref=jnp.zeros((1,), dtype=dtype),
+        lagged_response=None,
+        real_lu_out=jnp.zeros((1, 1), dtype=dtype),
+        real_piv_out=jnp.zeros((1,), dtype=jnp.int32),
+        complex_lu_out=jnp.zeros((0, 1, 1), dtype=dtype),
+        complex_piv_out=jnp.zeros((0, 1), dtype=jnp.int32),
+    )
+    expected_jacobian = jnp.asarray([[7.0]], dtype=dtype)
+
+    def fake_subsolve(_context, _physics, retry_inputs, **_kwargs):
+        return dataclasses.replace(
+            failed,
+            converged=jnp.asarray(True),
+            delta_final=retry_inputs.z0,
+            delta_norm_final=retry_inputs.jacobian_ref[0, 0],
+        )
+
+    monkeypatch.setattr(transport_solvers, "_radau_run_stage_subsolve", fake_subsolve)
+    result = transport_solvers._radau_retry_failed_subsolve_with_exact_cached_jacobian(
+        context,
+        physics_context=None,
+        inputs=inputs,
+        failed_result=failed,
+        jacobian_ref=inputs.jacobian_ref,
+        real_lu_out=inputs.real_lu_out,
+        real_piv_out=inputs.real_piv_out,
+        complex_lu_out=inputs.complex_lu_out,
+        complex_piv_out=inputs.complex_piv_out,
+        rhs_jacobian_at_state=lambda _state: expected_jacobian,
+        factor_linear_systems=lambda jacobian: (
+            jacobian,
+            inputs.real_piv_out,
+            inputs.complex_lu_out,
+            inputs.complex_piv_out,
+        ),
+    )
+    retried, jacobian, *_linear_data, attempted, stage = result
+    assert bool(attempted)
+    assert int(stage) == 1
+    assert bool(retried.converged)
+    assert jnp.array_equal(retried.delta_final, failed.z_final)
+    assert float(retried.delta_norm_final) == pytest.approx(7.0)
+    assert jnp.array_equal(jacobian, expected_jacobian)
+
+
+def test_radau_exact_cached_retry_mode_traces_through_accepted_step_vjp():
+    """The opt-in retry branch remains valid inside the custom step VJP."""
+
+    class LinearLaggedField:
+        def __call__(self, _t, y):
+            return -2.0 * y
+
+        def build_lagged_response(self, y):
+            return y
+
+        def evaluate_with_lagged_response(self, _t, y, *_args, lagged_response):
+            del _args, lagged_response
+            return -2.0 * y
+
+    solver = RADAUSolver(
+        t0=0.0,
+        t1=1.0e-3,
+        dt=1.0e-4,
+        rtol=1.0e-7,
+        atol=1.0e-10,
+        rhs_mode="lagged_transport_response",
+        lagged_jacobian_refresh_mode="quadratic_exact_retry_after_failure",
+        maxiter=8,
+        max_steps=8,
+    )
+    field = LinearLaggedField()
+    prepared = transport_solvers._build_prepared_radau_accepted_rollout(
+        solver=solver,
+        state=jnp.asarray([0.4]),
+        vector_field=field.__call__,
+        species=None,
+    )
+    # The toy cache is the identity map.  Supply its exact rebuild transpose,
+    # as the real lagged-NTX model does, so this covers the rebuild VJP path.
+    prepared = dataclasses.replace(
+        prepared,
+        physics_context=dataclasses.replace(
+            prepared.physics_context,
+            pullback_build_lagged_response=lambda _state, cache_bar: cache_bar,
+        ),
+    )
+    attempt_context = transport_solvers._RadauAcceptedStepAttemptContext(
+        t_final=prepared.initial_carry.t + prepared.initial_carry.dt,
+        use_transport_lagged_response=jnp.asarray(True),
+    )
+
+    def trial_y(initial_y):
+        carry = dataclasses.replace(prepared.initial_carry, y=initial_y)
+        return transport_solvers._execute_radau_accepted_step_trial_y_vjp_lagged_branch(
+            prepared.kernel_context,
+            prepared.physics_context,
+            carry,
+            attempt_context,
+            "rebuild",
+        )
+
+    y0 = jnp.asarray([0.4])
+    value, pullback = jax.vjp(trial_y, y0)
+    (gradient,) = pullback(jnp.ones_like(value))
+    epsilon = jnp.asarray(1.0e-6)
+    finite_difference = (
+        jnp.sum(trial_y(y0 + epsilon)) - jnp.sum(trial_y(y0 - epsilon))
+    ) / (2.0 * epsilon)
+    assert jnp.all(jnp.isfinite(gradient))
+    assert jnp.allclose(gradient[0], finite_difference, rtol=2.0e-4, atol=2.0e-6)
+
+
+def test_radau_good_broyden_stage_secant_traces_through_structured_vjp():
+    """The structured VJP replays the selected forward secant transpose."""
+
+    class NonlinearCachedField:
+        def __call__(self, _t, y):
+            return y * y
+
+        def build_lagged_response(self, y):
+            return y
+
+        def evaluate_with_lagged_response(self, _t, y, *_args, lagged_response):
+            del _args, lagged_response
+            return y * y
+
+    solver = RADAUSolver(
+        t0=0.0,
+        t1=1.0e-3,
+        dt=1.0e-4,
+        rtol=1.0e-7,
+        atol=1.0e-10,
+        rhs_mode="lagged_transport_response",
+        stage_secant_correction_mode="good_broyden_after_first",
+        maxiter=8,
+        max_steps=8,
+    )
+    field = NonlinearCachedField()
+    prepared = transport_solvers._build_prepared_radau_accepted_rollout(
+        solver=solver,
+        state=jnp.asarray([0.4]),
+        vector_field=field.__call__,
+        species=None,
+    )
+    prepared = dataclasses.replace(
+        prepared,
+        physics_context=dataclasses.replace(
+            prepared.physics_context,
+            pullback_build_lagged_response=lambda _state, cache_bar: cache_bar,
+        ),
+    )
+    attempt_context = transport_solvers._RadauAcceptedStepAttemptContext(
+        t_final=prepared.initial_carry.t + prepared.initial_carry.dt,
+        use_transport_lagged_response=jnp.asarray(True),
+    )
+    attempt = transport_solvers._execute_radau_accepted_step_attempt(
+        prepared.kernel_context,
+        prepared.physics_context,
+        prepared.initial_carry,
+        attempt_context,
+    )
+    assert bool(attempt.stage_secant_applied)
+
+    def trial_y(initial_y):
+        carry = dataclasses.replace(prepared.initial_carry, y=initial_y)
+        return transport_solvers._execute_radau_accepted_step_trial_y_vjp_lagged_branch(
+            prepared.kernel_context,
+            prepared.physics_context,
+            carry,
+            attempt_context,
+            "rebuild",
+        )
+
+    value, pullback = jax.vjp(trial_y, jnp.asarray([0.4]))
+    (gradient,) = pullback(jnp.ones_like(value))
+    assert jnp.all(jnp.isfinite(gradient))
 
 
 def test_build_time_solver_legacy_integrator_fallback():
@@ -132,3 +2259,1535 @@ def test_theta_newton_solver_runs_scalar_decay_problem():
     assert jnp.all(jnp.isfinite(final_state))
     assert final_state.shape == (1,)
     assert float(final_state[0]) < 1.0
+
+
+def test_radau_transport_endpoint_newton_tolerance_runs_scalar_decay_problem():
+    """The endpoint metric is an in-loop Newton criterion, not a fallback."""
+    solver = RADAUSolver(
+        t0=0.0,
+        t1=0.1,
+        dt=0.01,
+        rtol=1.0e-6,
+        atol=1.0e-8,
+        tol=1.0e-7,
+        maxiter=12,
+        num_stages=3,
+        newton_tol_mode="transport_endpoint",
+        newton_fnewt_mode="hairer",
+        newton_transport_endpoint_tol=0.1,
+        max_steps=100,
+        save_n=3,
+    )
+
+    def vector_field(t, y):
+        del t
+        return -2.0 * y
+
+    out = solver.solve(jnp.array([1.0]), vector_field)
+    assert not bool(out["failed"])
+    assert float(out["final_state"][0]) == pytest.approx(float(jnp.exp(-0.2)), rel=2.0e-5)
+
+
+def test_radau_dense_coefficients_reproduce_tableau_and_endpoint_weights():
+    stage = transport_solvers._RADAU_STAGE_CONFIGS[3]
+    powers_at_nodes = stage.c[:, None] ** jnp.arange(4)[None, :]
+    dense_at_nodes = powers_at_nodes @ jnp.asarray(stage.dense_coefficients)
+    endpoint_weights = jnp.ones((4,)) @ jnp.asarray(stage.dense_coefficients)
+
+    assert jnp.allclose(dense_at_nodes, jnp.asarray(stage.a), rtol=1.0e-13, atol=1.0e-13)
+    assert jnp.allclose(endpoint_weights, jnp.asarray(stage.b), rtol=1.0e-13, atol=1.0e-13)
+
+
+def test_radau_dense_saved_slots_use_exact_requested_times_and_states():
+    dtype = jnp.float64
+    stage = transport_solvers._RADAU_STAGE_CONFIGS[3]
+    save_times = jnp.linspace(0.0, 1.0, 5, dtype=dtype)
+    ys = jnp.zeros((5, 1), dtype=dtype).at[0].set(jnp.asarray([1.0], dtype=dtype))
+    ts = jnp.zeros((5,), dtype=dtype)
+    dts = jnp.zeros((5,), dtype=dtype)
+    accs = jnp.zeros((5,), dtype=bool).at[0].set(True)
+    fails = jnp.zeros((5,), dtype=bool)
+    codes = jnp.zeros((5,), dtype=jnp.int32)
+
+    result = transport_solvers._fill_radau_dense_saved_slots(
+        jnp.asarray(1, dtype=jnp.int32),
+        save_times,
+        jnp.asarray(0.0, dtype=dtype),
+        jnp.asarray([1.0], dtype=dtype),
+        jnp.asarray(1.0, dtype=dtype),
+        jnp.asarray([3.0], dtype=dtype),
+        jnp.asarray(1.0, dtype=dtype),
+        jnp.full((3, 1), 2.0, dtype=dtype),
+        jnp.asarray(stage.dense_coefficients, dtype=dtype),
+        jnp.asarray(True),
+        jnp.asarray(False),
+        jnp.asarray(0, dtype=jnp.int32),
+        ys,
+        ts,
+        dts,
+        accs,
+        fails,
+        codes,
+    )
+    save_idx, ys_out, ts_out, dts_out, accs_out, fails_out, codes_out = result
+
+    assert int(save_idx) == 5
+    assert jnp.allclose(ts_out, save_times, rtol=0.0, atol=0.0)
+    assert jnp.allclose(ys_out[:, 0], 1.0 + 2.0 * save_times, rtol=1.0e-13, atol=1.0e-13)
+    assert jnp.allclose(dts_out[1:], jnp.ones((4,), dtype=dtype))
+    assert bool(jnp.all(accs_out))
+    assert not bool(jnp.any(fails_out))
+    assert bool(jnp.all(codes_out == 0))
+
+
+def test_radau_solver_dense_output_uses_uniform_physical_times():
+    solver = RADAUSolver(
+        t0=0.0,
+        t1=0.1,
+        dt=0.1,
+        min_step=1.0e-12,
+        max_step=0.1,
+        rtol=1.0e-8,
+        atol=1.0e-10,
+        tol=1.0e-9,
+        maxiter=12,
+        num_stages=3,
+        max_steps=100,
+        save_n=5,
+    )
+    result = solver.solve(
+        jnp.asarray([1.0], dtype=jnp.float64),
+        lambda _time, state: -2.0 * state,
+    )
+    expected_times = jnp.linspace(0.0, 0.1, 5, dtype=jnp.float64)
+
+    assert not bool(result["failed"])
+    assert jnp.allclose(result["ts"], expected_times, rtol=0.0, atol=0.0)
+    assert jnp.allclose(
+        result["ys"][:, 0],
+        jnp.exp(-2.0 * expected_times),
+        rtol=2.0e-6,
+        atol=2.0e-8,
+    )
+    assert jnp.allclose(
+        result["final_state"],
+        jnp.asarray([jnp.exp(-0.2)], dtype=jnp.float64),
+        rtol=2.0e-6,
+        atol=2.0e-8,
+    )
+
+
+def _radau_controller_arguments(*, newton_iter_count, theta_final=0.0, controller_mode="current"):
+    dtype = jnp.float64
+    y = jnp.zeros((2,), dtype=dtype)
+    dt = jnp.asarray(1.0e-6, dtype=dtype)
+    zero_int = jnp.asarray(0, dtype=jnp.int32)
+    step_state = _RadauStepState(
+        t=jnp.asarray(0.0, dtype=dtype),
+        y=y,
+        dt=dt,
+        status=jnp.asarray([0, 0, 0], dtype=jnp.int32),
+        prev_error=jnp.asarray(1.0, dtype=dtype),
+        prev_stages=jnp.zeros((3, 2), dtype=dtype),
+        prev_dt=dt,
+        recent_reject_count=zero_int,
+        regrowth_cooldown=zero_int,
+        easy_growth_streak=zero_int,
+        lagged_response_cache=None,
+        lagged_response_valid=jnp.asarray(False),
+        lagged_reference_y=y,
+        jacobian=jnp.zeros((2, 2), dtype=dtype),
+        cache_valid=jnp.asarray(False),
+        cache_dt=dt,
+        cache_age=zero_int,
+        real_lu=jnp.zeros((2, 2), dtype=dtype),
+        real_piv=jnp.zeros((2,), dtype=jnp.int32),
+        complex_lu=jnp.zeros((2, 2), dtype=dtype),
+        complex_piv=jnp.zeros((2,), dtype=jnp.int32),
+        prev_theta_final=jnp.asarray(0.0, dtype=dtype),
+        prev_newton_iter_count=zero_int,
+    )
+    return {
+        "step_state": step_state,
+        "trial_dt": dt,
+        "trial_y": y,
+        # Error norms small enough that the raw controller factor saturates at max_step_factor,
+        # so the returned growth is whichever difficulty cap applies and nothing else.
+        "err_norm": jnp.asarray(1.0e-8, dtype=dtype),
+        "density_err_norm": jnp.asarray(1.0e-8, dtype=dtype),
+        "pressure_err_norm": jnp.asarray(1.0e-8, dtype=dtype),
+        "er_err_norm": jnp.asarray(1.0e-8, dtype=dtype),
+        "converged": jnp.asarray(True),
+        "stage_history": jnp.zeros((3, 2), dtype=dtype),
+        "jacobian_out": jnp.zeros((2, 2), dtype=dtype),
+        "cache_valid_out": jnp.asarray(False),
+        "cache_dt_out": dt,
+        "cache_age_out": zero_int,
+        "real_lu_out": jnp.zeros((2, 2), dtype=dtype),
+        "real_piv_out": jnp.zeros((2,), dtype=jnp.int32),
+        "complex_lu_out": jnp.zeros((2, 2), dtype=dtype),
+        "complex_piv_out": jnp.zeros((2,), dtype=jnp.int32),
+        "newton_shrink": jnp.asarray(0.5, dtype=dtype),
+        "diverged_final": jnp.asarray(False),
+        "nonfinite_stage_state": jnp.asarray(False),
+        "nonfinite_stage_residual": jnp.asarray(False),
+        "finite_f0": jnp.asarray(True),
+        "finite_z0": jnp.asarray(True),
+        "finite_initial_residual": jnp.asarray(True),
+        "newton_iter_count": jnp.asarray(newton_iter_count, dtype=jnp.int32),
+        "final_residual_norm": jnp.asarray(1.0e-10, dtype=dtype),
+        "final_delta_norm": jnp.asarray(1.0e-10, dtype=dtype),
+        "theta_final": jnp.asarray(theta_final, dtype=dtype),
+        "slow_contraction": jnp.asarray(False),
+        "residual_blowup": jnp.asarray(False),
+        "newton_nonfinite": jnp.asarray(False),
+        "stagnation_accepted": jnp.asarray(False),
+        "stagnation_defect_norm": jnp.asarray(0.0, dtype=dtype),
+        "stagnation_growth_cap": jnp.asarray(1.25, dtype=dtype),
+        "lagged_reused": jnp.asarray(False),
+        "jacobian_reused": jnp.asarray(False),
+        "fail_code": zero_int,
+        "n_accepted": zero_int,
+        "dtype": dtype,
+        "dt_min": jnp.asarray(1.0e-12, dtype=dtype),
+        "dt_max": jnp.asarray(1.0e-2, dtype=dtype),
+        "safety_factor": jnp.asarray(0.9, dtype=dtype),
+        "controller_alpha": jnp.asarray(0.175, dtype=dtype),
+        "min_step_factor": jnp.asarray(0.1, dtype=dtype),
+        "max_step_factor": jnp.asarray(5.0, dtype=dtype),
+        "controller_mode": controller_mode,
+        "use_transport_lagged_response": False,
+        "lagged_response_reuse_mode": "current",
+        "lagged_response_reuse_rtol": 1.0e-6,
+        "lagged_response_reuse_atol": 1.0e-8,
+        "project_flat": None,
+    }
+
+
+# The three controller modes that share the difficulty ladder; every hairer_* mode is exempt from it.
+@pytest.mark.parametrize("controller_mode", ["current", "current_legacy", "gustafsson"])
+def test_radau_controller_regrows_dt_after_a_difficult_accepted_step(controller_mode):
+    _, info = _apply_radau_lean_timestep_controller(
+        **_radau_controller_arguments(newton_iter_count=6, controller_mode=controller_mode)
+    )
+    assert float(info.growth) == pytest.approx(1.25)
+    # Compare the ratio rather than next_dt itself so the assertion stays relative at any step size.
+    assert float(info.next_dt / info.dt) == pytest.approx(1.25)
+
+
+def test_radau_controller_holds_dt_after_a_very_difficult_accepted_step():
+    _, info = _apply_radau_lean_timestep_controller(**_radau_controller_arguments(newton_iter_count=8))
+    assert float(info.growth) == pytest.approx(1.0)
+
+
+def test_radau_controller_caps_only_an_endpoint_correction_plateau_acceptance():
+    args = _radau_controller_arguments(
+        newton_iter_count=3,
+        controller_mode="hairer_lean_transport_discounted",
+    )
+    args["stagnation_accepted"] = jnp.asarray(True)
+    args["stagnation_defect_norm"] = jnp.asarray(0.4, dtype=jnp.float64)
+    args["stagnation_growth_cap"] = jnp.asarray(1.1, dtype=jnp.float64)
+    _, info = _apply_radau_lean_timestep_controller(**args)
+    assert bool(info.accepted)
+    assert bool(info.stagnation_accepted)
+    assert float(info.stagnation_defect_norm) == pytest.approx(0.4)
+    assert float(info.growth) == pytest.approx(1.1)
+
+
+def test_radau_discounted_newton_bracket_avoids_immediate_regrowth_to_failed_dt():
+    """A successful small retry must probe below, not jump past, a Newton failure."""
+
+    args = _radau_controller_arguments(
+        newton_iter_count=3,
+        controller_mode="hairer_lean_transport_discounted_newton_bracket",
+    )
+    failed_dt = jnp.asarray(5.0e-6, dtype=jnp.float64)
+    retry_dt = jnp.asarray(1.0e-6, dtype=jnp.float64)
+    args["step_state"] = dataclasses.replace(
+        args["step_state"],
+        newton_reject_dt_upper=failed_dt,
+    )
+    args["trial_dt"] = retry_dt
+
+    next_state, info = _apply_radau_lean_timestep_controller(**args)
+
+    assert bool(info.accepted)
+    # The uncorrected Hairer-lean controller would choose the 5x proposal.
+    assert float(info.next_dt) == pytest.approx(0.9 * float(failed_dt))
+    assert float(info.growth) == pytest.approx(0.9 * float(failed_dt) / float(retry_dt))
+    assert float(info.next_dt) < float(failed_dt)
+    assert float(next_state.newton_reject_dt_upper) == pytest.approx(float(failed_dt))
+
+
+def test_radau_discounted_newton_bracket_records_only_newton_rejections():
+    """An LTE rejection must not be mistaken for a stage-convergence bound."""
+
+    args = _radau_controller_arguments(
+        newton_iter_count=3,
+        controller_mode="hairer_lean_transport_discounted_newton_bracket",
+    )
+    args["converged"] = jnp.asarray(False)
+    args["err_norm"] = jnp.asarray(2.0, dtype=jnp.float64)
+    failed_state, _ = _apply_radau_lean_timestep_controller(**args)
+    assert float(failed_state.newton_reject_dt_upper) == pytest.approx(1.0e-6)
+
+    args = _radau_controller_arguments(
+        newton_iter_count=3,
+        controller_mode="hairer_lean_transport_discounted_newton_bracket",
+    )
+    args["converged"] = jnp.asarray(True)
+    args["err_norm"] = jnp.asarray(2.0, dtype=jnp.float64)
+    lte_failed_state, _ = _apply_radau_lean_timestep_controller(**args)
+    assert float(lte_failed_state.newton_reject_dt_upper) == pytest.approx(0.0)
+
+
+def test_radau_discounted_newton_bracket_mode_is_an_explicit_opt_in():
+    solver = RADAUSolver(
+        t0=0.0,
+        t1=1.0,
+        dt=1.0e-3,
+        controller_mode="discounted_newton_bracket",
+    )
+    assert solver.controller_mode == "hairer_lean_transport_discounted_newton_bracket"
+
+
+def test_radau_newton_bracket_trace_is_an_independent_opt_in():
+    solver = RADAUSolver(
+        t0=0.0,
+        t1=1.0,
+        dt=1.0e-3,
+        controller_mode="discounted_newton_bracket",
+        debug_newton_bracket=True,
+    )
+    assert solver.controller_mode == "hairer_lean_transport_discounted_newton_bracket"
+    assert solver.debug_newton_bracket
+
+
+def test_radau_discounted_newton_bracket_runs_through_jitted_adaptive_loop():
+    """Exercise the new carry leaf in the compiled adaptive solver loop."""
+
+    solver = RADAUSolver(
+        t0=0.0,
+        t1=1.0e-2,
+        dt=1.0e-3,
+        rtol=1.0e-6,
+        atol=1.0e-8,
+        max_steps=64,
+        controller_mode="hairer_lean_transport_discounted_newton_bracket",
+    )
+    out = solver.solve(jnp.asarray([1.0]), lambda _t, y: -y)
+    assert int(out["n_steps"]) > 0
+    assert jnp.all(jnp.isfinite(out["final_state"]))
+
+
+def test_flat_support_pullback_forwards_local_vjp_primal_reuse_flag():
+    """The isolated rebuild mode must reach the NTX support hook unchanged."""
+
+    observed = {}
+
+    class _Owner:
+        def vector_field(self, state):
+            return state
+
+        def pullback_build_lagged_response_support_payload(
+            self,
+            state,
+            lagged_response_bar,
+            support,
+            **kwargs,
+        ):
+            observed["state"] = state
+            observed["lagged_response_bar"] = lagged_response_bar
+            observed["support"] = support
+            observed["reuse"] = kwargs["reuse_local_vjp_primal_anchor_response"]
+            observed["support_only"] = kwargs["support_only_ntx_implicit_pullback"]
+            observed["profile_annotations"] = kwargs["reverse_segment_profile_annotations"]
+            observed["inner_timing_component"] = kwargs[
+                "reverse_rebuild_inner_timing_component"
+            ]
+            return {"x": jnp.asarray(3.0)}
+
+    owner = _Owner()
+    pullback = transport_solvers._flat_rhs_build_support_pullback_factory(
+        lambda flat_state: flat_state,
+        owner.vector_field,
+        (),
+        {},
+    )
+    result = pullback(
+        jnp.asarray([2.0]),
+        jnp.asarray([5.0]),
+        {"x": jnp.asarray(7.0)},
+        reverse_segment_profile_annotations_override=True,
+        reuse_local_vjp_primal_anchor_response=True,
+        support_only_ntx_implicit_pullback=True,
+        reverse_rebuild_inner_timing_component="local_ntx_vjp_and_accumulation",
+    )
+
+    assert jnp.allclose(result["x"], jnp.asarray(3.0))
+    assert observed["reuse"] is True
+    assert observed["support_only"] is True
+    assert observed["profile_annotations"] is True
+    assert observed["inner_timing_component"] == "local_ntx_vjp_and_accumulation"
+    assert jnp.allclose(observed["state"], jnp.asarray([2.0]))
+    assert jnp.allclose(observed["lagged_response_bar"], jnp.asarray([5.0]))
+    assert jnp.allclose(observed["support"]["x"], jnp.asarray(7.0))
+
+
+def test_flat_support_pullback_omits_inner_timing_selector_by_default():
+    """The diagnostic selector must not alter the normal model-hook contract."""
+
+    observed = {}
+
+    class _Owner:
+        def vector_field(self, state):
+            return state
+
+        def pullback_build_lagged_response_support_payload(
+            self,
+            state,
+            lagged_response_bar,
+            support,
+            **kwargs,
+        ):
+            del state, lagged_response_bar, support
+            observed.update(kwargs)
+            return {"x": jnp.asarray(0.0)}
+
+    owner = _Owner()
+    pullback = transport_solvers._flat_rhs_build_support_pullback_factory(
+        lambda flat_state: flat_state,
+        owner.vector_field,
+        (),
+        {},
+    )
+    pullback(jnp.asarray([1.0]), jnp.asarray([2.0]), {"x": jnp.asarray(3.0)})
+
+    assert "reverse_rebuild_inner_timing_component" not in observed
+    assert "support_only_ntx_implicit_pullback" not in observed
+
+
+def test_segment_primal_record_bwd_avoids_second_minimal_attempt_reconstruction(monkeypatch):
+    """The record route must consume the replayed primal, not reconstruct it again.
+
+    This is deliberately a tiny routing test: the full numerical direct-adjoint
+    contract is covered elsewhere, while this protects the exact structural
+    property relevant to reverse cost.  No Radau/NTX solve is performed.
+    """
+
+    observed = {"minimal_attempt_calls": 0, "record_adapter_calls": 0}
+    sentinel_primal = object()
+
+    def _minimal_attempt(*_args):
+        observed["minimal_attempt_calls"] += 1
+        return sentinel_primal
+
+    def _record_adapter(*_args):
+        observed["record_adapter_calls"] += 1
+        return sentinel_primal
+
+    def _from_primal(*args):
+        assert args[5] is sentinel_primal
+        return "reduced-bars", ("support-bars",)
+
+    monkeypatch.setattr(
+        transport_solvers,
+        "_execute_radau_accepted_step_attempt_reverse_minimal",
+        _minimal_attempt,
+    )
+    monkeypatch.setattr(
+        transport_solvers,
+        "_radau_reverse_minimal_attempt_from_segment_primal_record",
+        _record_adapter,
+    )
+    monkeypatch.setattr(
+        transport_solvers,
+        "_execute_radau_accepted_step_next_reduced_cotangent_batched_bwd_with_support_from_primal_result",
+        _from_primal,
+    )
+
+    common_args = (object(), object(), object(), "rebuild", object(), object(), object())
+    reconstruct_result = (
+        transport_solvers._execute_radau_accepted_step_next_reduced_cotangent_batched_bwd_with_support(
+            *common_args
+        )
+    )
+    record_result = (
+        transport_solvers._execute_radau_accepted_step_next_reduced_cotangent_batched_bwd_with_support_from_segment_primal_record(
+            object(), object(), object(), "rebuild", object(), object(), object(), object()
+        )
+    )
+
+    assert reconstruct_result == record_result == ("reduced-bars", ("support-bars",))
+    assert observed == {"minimal_attempt_calls": 1, "record_adapter_calls": 1}
+
+
+def test_colored_database_stage_matrix_recovers_exact_tridiagonal_transpose(monkeypatch):
+    """The database colored path is algebraically identical to its full matrix."""
+    dtype = jnp.float64
+    transpose_matrix = jnp.asarray(
+        [[2.0, -0.1, 0.0, 0.0], [0.3, 1.7, 0.2, 0.0],
+         [0.0, -0.4, 1.5, 0.6], [0.0, 0.0, 0.1, 1.2]],
+        dtype=dtype,
+    )
+    kernel_context = types.SimpleNamespace(num_stages=1, state_dim=4, dtype=dtype)
+    layout = types.SimpleNamespace(n_radial=4)
+    physics_context = types.SimpleNamespace(
+        reverse_rhs_transpose_mode="explicit_database",
+    )
+
+    monkeypatch.setattr(
+        transport_solvers,
+        "_radau_stage_to_radial_permutation_and_block_dim",
+        lambda _kernel: (layout, jnp.arange(4, dtype=jnp.int32), 1),
+    )
+    monkeypatch.setattr(
+        transport_solvers,
+        "_radau_exact_stage_times_states",
+        lambda *_args: (jnp.asarray([0.0], dtype=dtype), jnp.zeros((1, 4), dtype=dtype)),
+    )
+
+    def _matvec(_kernel, seen_physics, *_args, **_kwargs):
+        assert seen_physics is physics_context
+        # Each row is a direction; the helper returns the transpose action.
+        return _args[-1] @ transpose_matrix.T
+
+    monkeypatch.setattr(
+        transport_solvers,
+        "_radau_exact_stage_residual_transpose_matvec_batched",
+        _matvec,
+    )
+    actual = transport_solvers._radau_exact_stage_residual_transpose_matrix_colored_database(
+        kernel_context, physics_context, object(), object(), None,
+    )
+    assert jnp.allclose(actual, transpose_matrix, rtol=1.0e-12, atol=1.0e-12)
+    rhs_rows = jnp.asarray([[0.3, -0.2, 0.7, 0.1], [-0.1, 0.5, 0.2, -0.4]], dtype=dtype)
+    compact = transport_solvers._radau_solve_exact_stage_residual_transpose_block_colored_database(
+        kernel_context, physics_context, object(), object(), None, rhs=rhs_rows, batched=True,
+    )
+    dense = transport_solvers._radau_solve_exact_stage_residual_transpose_block_colored_database_dense(
+        kernel_context, physics_context, object(), object(), None, rhs=rhs_rows, batched=True,
+    )
+    assert jnp.allclose(compact, dense, rtol=1.0e-12, atol=1.0e-12)
+
+
+def test_database_block_multi_rhs_matches_independent_exact_block_solves(monkeypatch):
+    """Explicit RHS columns preserve the exact block solution."""
+
+    dtype = jnp.float64
+    matrix = jnp.asarray(
+        [
+            [2.0, -0.1, 0.3, 0.0],
+            [0.2, 1.7, -0.4, 0.1],
+            [0.0, 0.5, 1.9, -0.2],
+            [-0.3, 0.0, 0.4, 1.6],
+        ],
+        dtype=dtype,
+    )
+    kernel_context = types.SimpleNamespace(num_stages=2, state_dim=2, dtype=dtype)
+    matrix_calls = []
+
+    def _matrix(*_args):
+        matrix_calls.append(True)
+        return matrix
+
+    monkeypatch.setattr(
+        transport_solvers,
+        "_radau_exact_stage_residual_matrix",
+        _matrix,
+    )
+    rhs_rows = jnp.asarray(
+        [[0.3, -0.2, 0.7, 0.1], [-0.1, 0.5, 0.2, -0.4], [0.6, 0.1, -0.3, 0.8]],
+        dtype=dtype,
+    )
+    actual = (
+        transport_solvers._radau_solve_exact_stage_residual_transpose_block_multi_rhs(
+            kernel_context,
+            object(),
+            object(),
+            object(),
+            None,
+            rhs=rhs_rows,
+        )
+    )
+    expected = jnp.stack(
+        tuple(jnp.linalg.solve(matrix.T, -rhs_row) for rhs_row in rhs_rows)
+    )
+    assert len(matrix_calls) == 1
+    assert jnp.allclose(actual, expected, rtol=1.0e-12, atol=1.0e-12)
+    matrix_calls.clear()
+    dispatched = transport_solvers._radau_solve_exact_stage_residual_transpose_batched(
+        kernel_context,
+        types.SimpleNamespace(
+            reverse_stage_adjoint_solve_mode="block_database_multi_rhs",
+            reverse_stage_cotangent_mode="full",
+            reverse_segment_input_diagnostics=False,
+        ),
+        object(),
+        object(),
+        None,
+        rhs=rhs_rows,
+    )
+    assert len(matrix_calls) == 1
+    assert jnp.allclose(dispatched, expected, rtol=1.0e-12, atol=1.0e-12)
+
+
+@pytest.mark.parametrize("solve_mode", ["block", "block_database_multi_rhs"])
+def test_database_exact_block_solve_and_carry_pullback_match_residual_vjp(solve_mode):
+    """The selected solve and carry transpose share the full finite Jacobian.
+
+    Exercise the real matrix builder, batched solve dispatch and subsequent
+    input pullback together under JIT.  A coupled nonlinear RHS gives distinct
+    Jacobians at each stage; the compact state hook must never be entered.
+    """
+    dtype = jnp.float64
+    kernel = types.SimpleNamespace(
+        dtype=dtype, num_stages=3, state_dim=3,
+        a=jnp.asarray([
+            [0.1968154772, -0.0655354259, 0.0237709743],
+            [0.3944243147, 0.2920734117, -0.0415487521],
+            [0.3764030627, 0.5124858262, 1.0 / 9.0],
+        ], dtype=dtype),
+        c=jnp.asarray([0.1550510257, 0.6449489743, 1.0], dtype=dtype),
+    )
+    coupling = jnp.asarray([
+        [0.8, -0.2, 0.5], [0.5, 1.3, -0.4], [-0.3, 0.7, -0.6],
+    ], dtype=dtype)
+
+    def _rhs(t, y):
+        return coupling @ y + 0.2 * jnp.sin(y) + t * jnp.sum(y) ** 2
+
+    def _forbidden_compact_hook(*_args):
+        raise AssertionError("Exact block layouts must not enter the compact state VJP")
+
+    physics = types.SimpleNamespace(
+        reverse_rhs_transpose_mode="explicit_database",
+        reverse_stage_adjoint_solve_mode=solve_mode,
+        reverse_stage_cotangent_mode="full",
+        flat_rhs_direct_black_box_state_pullback=_forbidden_compact_hook,
+        flat_rhs=_rhs, flat_rhs_with_lagged_response=None,
+    )
+    t = jnp.asarray(0.1, dtype=dtype)
+    y = jnp.asarray([0.7, 1.1, -0.4], dtype=dtype)
+    h = jnp.asarray(0.07, dtype=dtype)
+    z = jnp.arange(9, dtype=dtype) / 13.0 - 0.2
+    rows = jnp.stack((jnp.sin(z), jnp.cos(z), jnp.zeros_like(z)))
+
+    def _residual(stage_values, input_y):
+        stages = stage_values.reshape((3, 3))
+        states = input_y[None, :] + h * (kernel.a @ stages)
+        return (stages - jax.vmap(_rhs)(t + kernel.c * h, states)).reshape((-1,))
+
+    matrix = jax.jacfwd(_residual, argnums=0)(z, y)
+    expected_stage_bars = jnp.linalg.solve(matrix.T, -rows.T).T
+    _, residual_input_vjp = jax.vjp(lambda input_y: _residual(z, input_y), y)
+    expected_y_bars = jax.vmap(lambda bar: residual_input_vjp(bar)[0])(expected_stage_bars)
+
+    @jax.jit
+    def _selected_pullback(input_y, step_size, stage_values, objective_rows):
+        carry = types.SimpleNamespace(t=t, y=input_y)
+        primal = types.SimpleNamespace(trial_dt=step_size, stage_history=stage_values)
+        stage_bars = transport_solvers._radau_solve_exact_stage_residual_transpose_batched(
+            kernel, physics, carry, primal, None, rhs=objective_rows,
+        )
+        y_bars = jax.vmap(
+            lambda bar: transport_solvers._radau_exact_stage_residual_input_pullback(
+                kernel, physics, carry, primal, None, bar, compute_dt_bar=False,
+            )[0]
+        )(stage_bars)
+        return stage_bars, y_bars
+
+    stage_bars, y_bars = _selected_pullback(y, h, z, rows)
+    assert jnp.all(jnp.isfinite(stage_bars))
+    assert jnp.all(jnp.isfinite(y_bars))
+    assert jnp.allclose(stage_bars, expected_stage_bars, rtol=1.0e-12, atol=1.0e-12)
+    assert jnp.allclose(y_bars, expected_y_bars, rtol=1.0e-12, atol=1.0e-12)
+    assert jnp.allclose(stage_bars @ matrix, -rows, rtol=1.0e-12, atol=1.0e-12)
+
+
+def test_colored_database_stage_matrix_restores_ntss_midpoint_low_rank(monkeypatch):
+    """Database coloring preserves the nonlocal NTSS midpoint coefficient term."""
+
+    dtype = jnp.float64
+    local_matrix = jnp.asarray(
+        [[2.0, -0.1, 0.0, 0.0], [0.3, 1.7, 0.2, 0.0],
+         [0.0, -0.4, 1.5, 0.6], [0.0, 0.0, 0.1, 1.2]],
+        dtype=dtype,
+    )
+    low_rank_u = jnp.asarray([[0.2], [-0.3], [0.5], [0.7]], dtype=dtype)
+    low_rank_v = jnp.asarray([[0.4], [0.6], [-0.2], [0.1]], dtype=dtype)
+    transpose_matrix = local_matrix + low_rank_u @ low_rank_v.T
+    kernel_context = types.SimpleNamespace(num_stages=1, state_dim=4, dtype=dtype)
+    layout = types.SimpleNamespace(n_radial=4)
+    permutation = jnp.arange(4, dtype=jnp.int32)
+    correction_calls = []
+
+    def _correction(*_args):
+        correction_calls.append(True)
+        return permutation, 1, low_rank_u, low_rank_v
+
+    physics_context = types.SimpleNamespace(
+        reverse_rhs_transpose_mode="explicit_database",
+        exact_stage_transpose_low_rank_correction=_correction,
+    )
+    monkeypatch.setattr(
+        transport_solvers,
+        "_radau_stage_to_radial_permutation_and_block_dim",
+        lambda _kernel: (layout, permutation, 1),
+    )
+    monkeypatch.setattr(
+        transport_solvers,
+        "_radau_exact_stage_times_states",
+        lambda *_args: (jnp.asarray([0.0], dtype=dtype), jnp.zeros((1, 4), dtype=dtype)),
+    )
+
+    def _matvec(_kernel, seen_physics, *_args, **_kwargs):
+        assert seen_physics is physics_context
+        return _args[-1] @ transpose_matrix.T
+
+    monkeypatch.setattr(
+        transport_solvers,
+        "_radau_exact_stage_residual_transpose_matvec_batched",
+        _matvec,
+    )
+    actual = transport_solvers._radau_exact_stage_residual_transpose_matrix_colored_database(
+        kernel_context, physics_context, object(), object(), None,
+    )
+    assert correction_calls == [True]
+    assert jnp.allclose(actual, transpose_matrix, rtol=1.0e-12, atol=1.0e-12)
+
+
+def test_ntss_midpoint_correction_uses_direct_flux_for_black_box_database(monkeypatch):
+    """The low-rank correction follows the direct black-box database primal."""
+
+    dtype = jnp.float64
+
+    class _DirectDatabaseModel:
+        def __init__(self):
+            self.direct_calls = 0
+
+        def __call__(self, state):
+            self.direct_calls += 1
+            return {"Gamma": state.density}
+
+        def evaluate_with_lagged_response(self, *_args, **_kwargs):
+            raise AssertionError("black-box Radau has no lagged response")
+
+    class _ErEquation:
+        permitivity_mode = "ntss_like_midpoint"
+        ntss_density_indices = (0,)
+        boundary_mode = "fixed"
+        Er_relax = 1.0
+        ntss_B0_mid = 2.0
+        ntss_psfactor_mid = 3.0
+
+        @staticmethod
+        def _charge_flux_from_gamma(gamma):
+            return gamma[0]
+
+    class _Owner:
+        def __init__(self):
+            self.shared_flux_model = _DirectDatabaseModel()
+            self.er_equation = _ErEquation()
+
+        def vector_field(self, state):
+            return state
+
+        def _resolve_equations(self):
+            return None, None, self.er_equation
+
+        @staticmethod
+        def _prepare_working_state(state):
+            return state, None
+
+        @staticmethod
+        def _shared_flux_bc_kwargs():
+            return {}
+
+    owner = _Owner()
+
+    def _unpack(flat_state):
+        return TransportState(
+            density=flat_state[:2].reshape((1, 2)),
+            pressure=flat_state[2:4].reshape((1, 2)),
+            Er=flat_state[4:6],
+        )
+
+    factors_hook = transport_solvers._ntss_midpoint_er_coeff_low_rank_factors_hook(
+        _unpack,
+        owner.vector_field,
+        None,
+    )
+    correction = factors_hook.ntss_midpoint_correction_factors
+    permutation = jnp.arange(6, dtype=jnp.int32)
+    monkeypatch.setattr(
+        transport_solvers,
+        "_radau_stage_to_radial_permutation_and_block_dim",
+        lambda _kernel: (
+            types.SimpleNamespace(
+                active_er_size=2,
+                n_radial=2,
+                density_species_count=1,
+            ),
+            permutation,
+            3,
+        ),
+    )
+    stage_state = jnp.asarray([2.0, 4.0, 3.0, 5.0, 0.1, 0.2], dtype=dtype)
+    monkeypatch.setattr(
+        transport_solvers,
+        "_radau_exact_stage_times_states",
+        lambda *_args: (jnp.asarray([0.0], dtype=dtype), stage_state[None, :]),
+    )
+    _, block_dim, low_rank_u, low_rank_v = correction(
+        types.SimpleNamespace(
+            num_stages=1,
+            state_dim=6,
+            density_size=2,
+            pressure_size=2,
+            dtype=dtype,
+            a=jnp.ones((1, 1), dtype=dtype),
+        ),
+        types.SimpleNamespace(unpack_flat=_unpack),
+        object(),
+        types.SimpleNamespace(trial_dt=jnp.asarray(0.25, dtype=dtype)),
+        None,
+    )
+    assert owner.shared_flux_model.direct_calls == 1
+    assert block_dim == 3
+    assert jnp.all(jnp.isfinite(low_rank_u))
+    assert jnp.all(jnp.isfinite(low_rank_v))
+
+
+def test_colored_database_dense_mode_dispatches_stable_multi_rhs_solve(monkeypatch):
+    """The production colored-dense mode never enters block Thomas."""
+
+    dtype = jnp.float64
+    rhs = jnp.asarray([[1.0, 2.0], [-3.0, 4.0]], dtype=dtype)
+    calls = []
+
+    def _dense_solve(*_args, rhs, batched=False, **_kwargs):
+        calls.append((jnp.asarray(rhs).shape, batched))
+        return 2.0 * rhs
+
+    monkeypatch.setattr(
+        transport_solvers,
+        "_radau_solve_exact_stage_residual_transpose_block_colored_database_dense",
+        _dense_solve,
+    )
+    actual = transport_solvers._radau_solve_exact_stage_residual_transpose_batched(
+        types.SimpleNamespace(num_stages=1, state_dim=2, dtype=dtype),
+        types.SimpleNamespace(
+            reverse_segment_input_diagnostics=False,
+            reverse_stage_cotangent_mode="full",
+            reverse_stage_adjoint_solve_mode="block_colored_database_dense",
+        ),
+        object(),
+        object(),
+        None,
+        rhs=rhs,
+    )
+    assert calls == [((2, 2), True)]
+    assert jnp.allclose(actual, 2.0 * rhs)
+
+
+def test_colored_database_dense_solve_allows_global_pivoting(monkeypatch):
+    """A valid global stage system need not have invertible diagonal blocks."""
+
+    dtype = jnp.float64
+    transpose_matrix = jnp.asarray([[0.0, 1.0], [1.0, 1.0]], dtype=dtype)
+    rhs = jnp.asarray([[2.0, -1.0], [-3.0, 4.0]], dtype=dtype)
+    monkeypatch.setattr(
+        transport_solvers,
+        "_radau_exact_stage_residual_transpose_matrix_colored_database",
+        lambda *_args, **_kwargs: transpose_matrix,
+    )
+    actual = (
+        transport_solvers._radau_solve_exact_stage_residual_transpose_block_colored_database_dense(
+            types.SimpleNamespace(num_stages=1, state_dim=2, dtype=dtype),
+            object(),
+            object(),
+            object(),
+            None,
+            rhs=rhs,
+            batched=True,
+        )
+    )
+    expected = jnp.linalg.solve(transpose_matrix, -rhs.T).T
+    assert jnp.all(jnp.isfinite(actual))
+    assert jnp.allclose(actual, expected, rtol=1.0e-12, atol=1.0e-12)
+
+
+def test_database_stage_transpose_uses_complete_direct_black_box_state_boundary():
+    """The database block matvec inserts the direct pressure-state transpose.
+
+    The local direct-state boundary already covers the temperature equation's
+    heat/work/source terms.  This test guards the next composition point:
+    the Radau stage operator must use that boundary for every stage and apply
+    the transposed Butcher coupling without falling back to a different RHS
+    derivative.
+    """
+    dtype = jnp.float64
+    kernel_context = types.SimpleNamespace(
+        dtype=dtype,
+        num_stages=2,
+        state_dim=2,
+        c=jnp.asarray([0.0, 1.0], dtype=dtype),
+        a=jnp.asarray([[0.2, 0.1], [0.3, 0.4]], dtype=dtype),
+    )
+    carry = types.SimpleNamespace(
+        t=jnp.asarray(0.0, dtype=dtype),
+        y=jnp.zeros((2,), dtype=dtype),
+    )
+    primal = types.SimpleNamespace(
+        trial_dt=jnp.asarray(0.5, dtype=dtype),
+        stage_history=jnp.zeros((4,), dtype=dtype),
+    )
+    rhs_jacobian = jnp.asarray([[1.1, -0.3], [0.2, 0.7]], dtype=dtype)
+    calls = []
+
+    def _direct_state_pullback(t_value, y_value, lagged_response, cotangent):
+        calls.append((t_value, y_value, lagged_response))
+        return rhs_jacobian.T @ cotangent
+
+    physics_context = types.SimpleNamespace(
+        reverse_rhs_transpose_mode="explicit_database",
+        reverse_stage_cotangent_mode="full",
+        reverse_stage_adjoint_memory_mode="default",
+        flat_rhs_direct_black_box_state_pullback=_direct_state_pullback,
+        # If the explicit database hook is bypassed this deliberately wrong
+        # primal would make the assertion below fail.
+        flat_rhs=lambda _t, y: 99.0 * y,
+        flat_rhs_with_lagged_response=None,
+    )
+    vectors = jnp.asarray(
+        [[[0.5, -0.4], [0.2, 0.9]], [[-0.3, 0.7], [0.6, -0.1]]],
+        dtype=dtype,
+    )
+    actual = transport_solvers._radau_exact_stage_residual_transpose_matvec_batched(
+        kernel_context, physics_context, carry, primal, None, vectors
+    ).reshape(vectors.shape)
+    jt_vectors = jnp.einsum("ij,bsj->bsi", rhs_jacobian.T, vectors)
+    expected = vectors - primal.trial_dt * jnp.einsum(
+        "ij,bin->bjn", kernel_context.a, jt_vectors
+    )
+    assert jnp.allclose(actual, expected, rtol=1.0e-12, atol=1.0e-12)
+    # ``vmap`` traces this Python hook once, then executes its vectorized JAX
+    # body across objective rows and stages.
+    assert len(calls) == 1
+
+
+def test_database_stage_input_pullback_uses_same_direct_state_boundary_as_matrix():
+    """Database carry bars and stage solve must share one RHS transpose."""
+    dtype = jnp.float64
+    kernel_context = types.SimpleNamespace(
+        dtype=dtype,
+        num_stages=2,
+        state_dim=2,
+        c=jnp.asarray([0.0, 1.0], dtype=dtype),
+        a=jnp.eye(2, dtype=dtype),
+    )
+    carry = types.SimpleNamespace(
+        t=jnp.asarray(0.0, dtype=dtype),
+        y=jnp.zeros((2,), dtype=dtype),
+    )
+    primal = types.SimpleNamespace(
+        trial_dt=jnp.asarray(0.5, dtype=dtype),
+        stage_history=jnp.zeros((4,), dtype=dtype),
+    )
+    rhs_jacobian = jnp.asarray([[0.8, -0.2], [0.5, 1.3]], dtype=dtype)
+    calls = []
+
+    def _direct_state_pullback(t_value, y_value, lagged_response, cotangent):
+        calls.append((t_value, y_value, lagged_response))
+        return rhs_jacobian.T @ cotangent
+
+    physics_context = types.SimpleNamespace(
+        reverse_rhs_transpose_mode="explicit_database",
+        reverse_stage_adjoint_solve_mode="block_explicit_database_jacobian",
+        reverse_stage_cotangent_mode="full",
+        flat_rhs_direct_black_box_state_pullback=_direct_state_pullback,
+        # A different fallback derivative must never be used when the compact
+        # database state boundary is available.
+        flat_rhs=lambda _t, y: -7.0 * y,
+        flat_rhs_with_lagged_response=None,
+    )
+    residual_bars = jnp.asarray([[0.4, -0.6], [-0.3, 0.9]], dtype=dtype)
+    actual_y_bar, actual_dt_bar, actual_lagged_bar = (
+        transport_solvers._radau_exact_stage_residual_input_pullback(
+            kernel_context,
+            physics_context,
+            carry,
+            primal,
+            None,
+            residual_bars,
+            compute_dt_bar=False,
+        )
+    )
+    expected_y_bar = -jnp.sum(residual_bars @ rhs_jacobian, axis=0)
+    assert jnp.allclose(actual_y_bar, expected_y_bar, rtol=1.0e-12, atol=1.0e-12)
+    assert jnp.allclose(actual_dt_bar, 0.0)
+    assert actual_lagged_bar is None
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize("solve_mode", ["block", "block_database_multi_rhs"])
+def test_database_plain_block_stage_input_pullback_keeps_finite_forward_jacobian_contract(solve_mode):
+    """Both exact block layouts use the finite forward Jacobian for carry bars."""
+    dtype = jnp.float64
+    kernel_context = types.SimpleNamespace(
+        dtype=dtype,
+        num_stages=1,
+        state_dim=2,
+        c=jnp.asarray([0.0], dtype=dtype),
+        a=jnp.eye(1, dtype=dtype),
+    )
+    carry = types.SimpleNamespace(
+        t=jnp.asarray(0.0, dtype=dtype), y=jnp.zeros((2,), dtype=dtype)
+    )
+    primal = types.SimpleNamespace(
+        trial_dt=jnp.asarray(0.5, dtype=dtype), stage_history=jnp.zeros((2,), dtype=dtype)
+    )
+    calls = []
+
+    def _compact_hook(*_args):
+        calls.append(True)
+        return jnp.asarray([99.0, 99.0], dtype=dtype)
+
+    physics_context = types.SimpleNamespace(
+        reverse_rhs_transpose_mode="explicit_database",
+        reverse_stage_adjoint_solve_mode=solve_mode,
+        reverse_stage_cotangent_mode="full",
+        flat_rhs_direct_black_box_state_pullback=_compact_hook,
+        flat_rhs=lambda _t, y: jnp.asarray([[0.8, -0.2], [0.5, 1.3]], dtype=dtype) @ y,
+        flat_rhs_with_lagged_response=None,
+    )
+    residual_bar = jnp.asarray([[0.4, -0.6]], dtype=dtype)
+    actual_y_bar, _, _ = transport_solvers._radau_exact_stage_residual_input_pullback(
+        kernel_context, physics_context, carry, primal, None, residual_bar,
+        compute_dt_bar=False,
+    )
+    rhs_jacobian = jnp.asarray([[0.8, -0.2], [0.5, 1.3]], dtype=dtype)
+    expected_y_bar = -(residual_bar @ rhs_jacobian)[0]
+    assert jnp.allclose(actual_y_bar, expected_y_bar, rtol=1.0e-12, atol=1.0e-12)
+    # The compact reverse hook remains available to the explicit database
+    # Jacobian mode, but must not be traced by either exact block layout.
+    assert calls == []
+
+
+@pytest.mark.parametrize("solve_mode", ["block", "block_database_multi_rhs"])
+def test_database_plain_block_matrix_keeps_finite_forward_jacobian_contract(solve_mode):
+    """Both exact block layouts keep the established forward-mode matrix."""
+    dtype = jnp.float64
+    kernel_context = types.SimpleNamespace(
+        dtype=dtype,
+        num_stages=1,
+        state_dim=2,
+        c=jnp.asarray([0.0], dtype=dtype),
+        a=jnp.eye(1, dtype=dtype),
+    )
+    carry = types.SimpleNamespace(
+        t=jnp.asarray(0.0, dtype=dtype), y=jnp.zeros((2,), dtype=dtype)
+    )
+    primal = types.SimpleNamespace(
+        trial_dt=jnp.asarray(0.5, dtype=dtype), stage_history=jnp.zeros((2,), dtype=dtype)
+    )
+    direct_jacobian = jnp.asarray([[1.5, -0.25], [0.75, 2.0]], dtype=dtype)
+    calls = []
+
+    def _direct_state_pullback(*args):
+        calls.append(args)
+        return direct_jacobian.T @ args[-1]
+
+    physics_context = types.SimpleNamespace(
+        reverse_rhs_transpose_mode="explicit_database",
+        reverse_stage_adjoint_solve_mode=solve_mode,
+        flat_rhs_direct_black_box_state_pullback=_direct_state_pullback,
+        # The generic RHS deliberately differs from the compact hook. Both
+        # exact block layouts must select this finite forward Jacobian.
+        flat_rhs=lambda _t, y: -4.0 * y,
+        flat_rhs_with_lagged_response=None,
+    )
+    actual = transport_solvers._radau_exact_stage_residual_matrix(
+        kernel_context, physics_context, carry, primal, None
+    )
+    generic_jacobian = -4.0 * jnp.eye(2, dtype=dtype)
+    expected = jnp.eye(2, dtype=dtype) - primal.trial_dt * generic_jacobian
+    assert jnp.allclose(actual, expected, rtol=1.0e-12, atol=1.0e-12)
+    # Applying the reverse VJP to a full output basis can form 0 * inf in the
+    # real database interpolation graph.  It remains opt-in through
+    # ``block_explicit_database_jacobian`` and must not run for either layout.
+    assert calls == []
+
+
+def test_batched_database_stage_table_pullback_accepts_flattened_radau_rows():
+    """The compact stage-adjoint contract is [objective, stage * state]."""
+    dtype = jnp.float32
+    kernel_context = types.SimpleNamespace(
+        dtype=dtype,
+        num_stages=2,
+        state_dim=3,
+        c=jnp.asarray([0.0, 1.0], dtype=dtype),
+        a=jnp.eye(2, dtype=dtype),
+    )
+    carry = types.SimpleNamespace(
+        t=jnp.asarray(2.0, dtype=dtype),
+        y=jnp.asarray([1.0, 2.0, 3.0], dtype=dtype),
+    )
+    primal = types.SimpleNamespace(
+        trial_dt=jnp.asarray(0.5, dtype=dtype),
+        stage_history=jnp.arange(6, dtype=dtype),
+    )
+
+    def _database_table_pullback(_t, _y, rhs_bars, _support):
+        return {"table": rhs_bars}
+
+    physics_context = types.SimpleNamespace(
+        flat_rhs_direct_database_table_pullback_batched=_database_table_pullback,
+    )
+    flattened_rows = jnp.asarray(
+        [[1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+         [-2.0, 1.0, 0.5, 3.0, -1.0, 2.0]],
+        dtype=dtype,
+    )
+    actual_leaves = (
+        transport_solvers._radau_exact_stage_residual_database_table_support_pullback_batched(
+            kernel_context,
+            physics_context,
+            carry,
+            primal,
+            flattened_rows,
+            {"table": jnp.zeros((3,), dtype=dtype)},
+        )
+    )
+
+    expected = -flattened_rows.reshape(2, 2, 3).sum(axis=1)
+    assert len(actual_leaves) == 1
+    assert jnp.allclose(actual_leaves[0], expected)
+
+
+def test_batched_database_stage_table_pullback_preserves_coordinate_leaves():
+    """Stage accumulation retains scan-owned a_b and Er_list bars."""
+    dtype = jnp.float32
+    kernel_context = types.SimpleNamespace(
+        dtype=dtype, num_stages=2, state_dim=2,
+        c=jnp.asarray([0.0, 1.0], dtype=dtype), a=jnp.eye(2, dtype=dtype),
+    )
+    carry = types.SimpleNamespace(
+        t=jnp.asarray(0.0, dtype=dtype), y=jnp.asarray([1.0, 2.0], dtype=dtype),
+    )
+    primal = types.SimpleNamespace(
+        trial_dt=jnp.asarray(0.5, dtype=dtype), stage_history=jnp.zeros((4,), dtype=dtype),
+    )
+    support = {
+        "geometry": jnp.asarray(0.0, dtype=dtype),
+        "database": {
+            "a_b": jnp.asarray(0.0, dtype=dtype),
+            "Er_list": jnp.zeros((3,), dtype=dtype),
+            "D11_log": jnp.asarray(0.0, dtype=dtype),
+        },
+    }
+
+    def _table_pullback(_t, _y, rhs_bar, _support):
+        value = jnp.sum(rhs_bar)
+        return {
+            "geometry": jnp.asarray(0.0, dtype=dtype),
+            "database": {
+                "a_b": value,
+                "Er_list": jnp.full((3,), 2.0 * value, dtype=dtype),
+                "D11_log": 3.0 * value,
+            },
+        }
+
+    physics_context = types.SimpleNamespace(
+        flat_rhs_direct_database_table_pullback=_table_pullback,
+    )
+    rows = jnp.asarray([[1.0, -2.0, 3.0, 4.0], [-1.0, 0.5, 2.0, -3.0]], dtype=dtype)
+    leaves = transport_solvers._radau_exact_stage_residual_database_table_support_pullback_batched(
+        kernel_context, physics_context, carry, primal, rows, support
+    )
+    _, treedef = jax.tree_util.tree_flatten(support)
+    actual = treedef.unflatten(leaves)
+    expected = -jnp.sum(rows.reshape(2, 2, 2), axis=(1, 2))
+    assert jnp.allclose(actual["database"]["a_b"], expected)
+    assert jnp.allclose(actual["database"]["Er_list"], 2.0 * expected[:, None])
+    assert jnp.allclose(actual["database"]["D11_log"], 3.0 * expected)
+
+
+def test_batched_database_stage_pullback_keeps_direct_geometry_outside_scan():
+    """Database stage rows retain local geometry beside the table cotangent."""
+    dtype = jnp.float32
+    kernel_context = types.SimpleNamespace(
+        dtype=dtype,
+        num_stages=1,
+        state_dim=2,
+        c=jnp.asarray([0.0], dtype=dtype),
+        a=jnp.eye(1, dtype=dtype),
+    )
+    carry = types.SimpleNamespace(
+        t=jnp.asarray(0.0, dtype=dtype),
+        y=jnp.asarray([1.0, 2.0], dtype=dtype),
+    )
+    primal = types.SimpleNamespace(
+        trial_dt=jnp.asarray(0.5, dtype=dtype),
+        stage_history=jnp.asarray([0.0, 0.0], dtype=dtype),
+    )
+
+    def _split_fixed_database_pullback(_t, _y, rhs_bar, _support):
+        return {"geometry": 3.0 * rhs_bar, "database": 2.0 * rhs_bar}
+
+    physics_context = types.SimpleNamespace(
+        reverse_database_include_direct_geometry=True,
+        flat_rhs_direct_database_split_support_pullback=_split_fixed_database_pullback,
+    )
+    rows = jnp.asarray([[1.0, -2.0], [0.5, 3.0]], dtype=dtype)
+    # JAX flattens mapping keys in sorted order: database, then geometry.
+    actual_database, actual_geometry = (
+        transport_solvers._radau_exact_stage_residual_database_table_support_pullback_batched(
+            kernel_context,
+            physics_context,
+            carry,
+            primal,
+            rows,
+            {
+                "geometry": jnp.zeros((2,), dtype=dtype),
+                "database": jnp.zeros((2,), dtype=dtype),
+            },
+        )
+    )
+
+    assert jnp.allclose(actual_geometry, -3.0 * rows)
+    assert jnp.allclose(actual_database, -2.0 * rows)
+
+
+def test_batched_database_stage_pullback_selects_matrix_rhs_split_mode():
+    """The opt-in mode calls one batched split hook and never the scalar hook."""
+    dtype = jnp.float32
+    kernel_context = types.SimpleNamespace(
+        dtype=dtype,
+        num_stages=1,
+        state_dim=2,
+        c=jnp.asarray([0.0], dtype=dtype),
+        a=jnp.eye(1, dtype=dtype),
+    )
+    carry = types.SimpleNamespace(
+        t=jnp.asarray(0.0, dtype=dtype),
+        y=jnp.asarray([1.0, 2.0], dtype=dtype),
+    )
+    primal = types.SimpleNamespace(
+        trial_dt=jnp.asarray(0.5, dtype=dtype),
+        stage_history=jnp.asarray([0.0, 0.0], dtype=dtype),
+    )
+    calls = []
+
+    def _scalar_pullback(*_args):
+        raise AssertionError("batched_split must not dispatch to the scalar hook")
+
+    def _batched_pullback(_t, _y, rhs_bars, _support):
+        calls.append(rhs_bars.shape)
+        return {
+            "geometry": 3.0 * rhs_bars,
+            "database": 2.0 * rhs_bars,
+        }
+
+    physics_context = types.SimpleNamespace(
+        reverse_database_include_direct_geometry=True,
+        reverse_database_support_objective_mode="batched_split",
+        flat_rhs_direct_database_split_support_pullback=_scalar_pullback,
+        flat_rhs_direct_database_split_support_pullback_batched=_batched_pullback,
+    )
+    rows = jnp.asarray([[1.0, -2.0], [0.5, 3.0]], dtype=dtype)
+    actual_database, actual_geometry = (
+        transport_solvers._radau_exact_stage_residual_database_table_support_pullback_batched(
+            kernel_context,
+            physics_context,
+            carry,
+            primal,
+            rows,
+            {
+                "geometry": jnp.zeros((2,), dtype=dtype),
+                "database": jnp.zeros((2,), dtype=dtype),
+            },
+        )
+    )
+
+    assert calls == [(2, 2)]
+    assert jnp.allclose(actual_geometry, -3.0 * rows)
+    assert jnp.allclose(actual_database, -2.0 * rows)
+
+
+@pytest.mark.parametrize("mode", ["unknown", "batched_split"])
+def test_batched_database_stage_pullback_rejects_invalid_objective_mode(mode):
+    """Unknown modes and batched support without direct geometry fail closed."""
+    dtype = jnp.float32
+    kernel_context = types.SimpleNamespace(
+        dtype=dtype,
+        num_stages=1,
+        state_dim=1,
+        c=jnp.asarray([0.0], dtype=dtype),
+        a=jnp.eye(1, dtype=dtype),
+    )
+    carry = types.SimpleNamespace(
+        t=jnp.asarray(0.0, dtype=dtype), y=jnp.asarray([1.0], dtype=dtype)
+    )
+    primal = types.SimpleNamespace(
+        trial_dt=jnp.asarray(0.5, dtype=dtype),
+        stage_history=jnp.asarray([0.0], dtype=dtype),
+    )
+    physics_context = types.SimpleNamespace(
+        reverse_database_include_direct_geometry=False,
+        reverse_database_support_objective_mode=mode,
+        flat_rhs_direct_database_table_pullback=lambda *_args: {
+            "table": jnp.asarray([0.0], dtype=dtype)
+        },
+    )
+    with pytest.raises(ValueError):
+        transport_solvers._radau_exact_stage_residual_database_table_support_pullback_batched(
+            kernel_context,
+            physics_context,
+            carry,
+            primal,
+            jnp.asarray([[1.0]], dtype=dtype),
+            {"table": jnp.asarray([0.0], dtype=dtype)},
+        )
+
+
+def test_batched_database_stage_pullback_default_remains_table_only():
+    """The direct-geometry extension is opt-in and cannot alter old contexts."""
+    dtype = jnp.float32
+    kernel_context = types.SimpleNamespace(
+        dtype=dtype,
+        num_stages=1,
+        state_dim=2,
+        c=jnp.asarray([0.0], dtype=dtype),
+        a=jnp.eye(1, dtype=dtype),
+    )
+    carry = types.SimpleNamespace(
+        t=jnp.asarray(0.0, dtype=dtype),
+        y=jnp.asarray([1.0, 2.0], dtype=dtype),
+    )
+    primal = types.SimpleNamespace(
+        trial_dt=jnp.asarray(0.5, dtype=dtype),
+        stage_history=jnp.asarray([0.0, 0.0], dtype=dtype),
+    )
+
+    def _table_only_pullback(_t, _y, rhs_bar, _support):
+        return {
+            "geometry": jnp.zeros_like(rhs_bar),
+            "database": 2.0 * rhs_bar,
+        }
+
+    physics_context = types.SimpleNamespace(
+        flat_rhs_direct_database_table_pullback=_table_only_pullback,
+    )
+    rows = jnp.asarray([[1.0, -2.0], [0.5, 3.0]], dtype=dtype)
+    actual_database, actual_geometry = (
+        transport_solvers._radau_exact_stage_residual_database_table_support_pullback_batched(
+            kernel_context,
+            physics_context,
+            carry,
+            primal,
+            rows,
+            {
+                "geometry": jnp.zeros((2,), dtype=dtype),
+                "database": jnp.zeros((2,), dtype=dtype),
+            },
+        )
+    )
+
+    assert jnp.allclose(actual_database, -2.0 * rows)
+    assert jnp.allclose(actual_geometry, 0.0)
+
+
+def test_approximate_tangent_lift_preserves_minimal_segment_record_contract():
+    """Generic-RHS fallback must not demand controller fields from a compact record."""
+    value = jnp.asarray(1.0)
+    carry = transport_solvers._RadauAcceptedStepCarry(
+        t=value, y=jnp.asarray([value]), dt=value, prev_error=value,
+        prev_stages=jnp.asarray([value]), prev_dt=value,
+        recent_reject_count=value, regrowth_cooldown=value, easy_growth_streak=value,
+        lagged_response_cache=value, lagged_response_valid=value,
+        lagged_reference_y=jnp.asarray([value]), jacobian=jnp.asarray([[value]]),
+        cache_valid=value, cache_dt=value, cache_age=value, real_lu=jnp.asarray([[value]]),
+        real_piv=jnp.asarray([value]), complex_lu=jnp.asarray([[value]]),
+        complex_piv=jnp.asarray([value]), prev_theta_final=value,
+        prev_newton_iter_count=value,
+    )
+    minimal = transport_solvers._RadauAcceptedStepReverseMinimalAttemptResult(
+        carry_after_attempt=carry, trial_dt=value, trial_y=jnp.asarray([value]),
+        stage_history=jnp.asarray([value]), jacobian_out=jnp.asarray([[value]]),
+        cache_valid_out=value, cache_dt_out=value, cache_age_out=value,
+        real_lu_out=jnp.asarray([[value]]), real_piv_out=jnp.asarray([value]),
+        complex_lu_out=jnp.asarray([[value]]), complex_piv_out=jnp.asarray([value]),
+        theta_final=value, newton_iter_count=value,
+    )
+    tangent = transport_solvers._radau_build_approximate_tangent_result(
+        transport_solvers._RadauAcceptedStepTangentInputs(
+            dy=jnp.asarray([2.0]), dh=jnp.asarray(3.0), dlagged_response_cache=value,
+        ),
+        transport_solvers._RadauAcceptedStepApproximateTangentResult(
+            dy_next=jnp.asarray([4.0]), dz_stages=jnp.asarray([5.0]),
+            dtrial_dt=jnp.asarray(6.0), dtrial_y=jnp.asarray([7.0]),
+            dstage_history=jnp.asarray([8.0]),
+        ),
+        attempt_result=minimal,
+        dlagged_response_cache_out=value,
+        dlagged_reference_y_out=jnp.asarray([value]),
+    )
+
+    assert isinstance(tangent, transport_solvers._RadauAcceptedStepReverseMinimalAttemptResult)
+    assert tangent.trial_dt == jnp.asarray(6.0)
+    assert not hasattr(tangent, "err_norm")
+
+
+def test_radau_controller_keeps_the_moderate_cap_on_an_easy_accepted_step():
+    _, info = _apply_radau_lean_timestep_controller(**_radau_controller_arguments(newton_iter_count=3))
+    assert float(info.growth) == pytest.approx(1.5)
+
+
+def test_radau_joint_rebuild_support_pullback_accumulates_batched_bars(monkeypatch):
+    """Exercise the Radau rebuild branch that dispatches the joint NTX hook.
+
+    The stage residual kernels are deliberately zeroed here: their numerical
+    transpose is covered separately.  This test protects the integration
+    contract that previously failed only in the full transport benchmark:
+    batched rebuild bars must reach the joint state+support pullback, then be
+    accumulated into the reduced carry and the support cotangent leaves.
+    """
+    dtype = jnp.float64
+    y = jnp.zeros((1,), dtype=dtype)
+    zero_int = jnp.asarray(0, dtype=jnp.int32)
+    carry = transport_solvers._RadauAcceptedStepCarry(
+        t=jnp.asarray(0.0, dtype=dtype),
+        y=y,
+        dt=jnp.asarray(1.0, dtype=dtype),
+        prev_error=jnp.asarray(0.0, dtype=dtype),
+        prev_stages=jnp.zeros((3, 1), dtype=dtype),
+        prev_dt=jnp.asarray(1.0, dtype=dtype),
+        recent_reject_count=zero_int,
+        regrowth_cooldown=zero_int,
+        easy_growth_streak=zero_int,
+        lagged_response_cache=jnp.asarray(0.0, dtype=dtype),
+        lagged_response_valid=jnp.asarray(True),
+        lagged_reference_y=y,
+        jacobian=jnp.zeros((1, 1), dtype=dtype),
+        cache_valid=jnp.asarray(True),
+        cache_dt=jnp.asarray(1.0, dtype=dtype),
+        cache_age=zero_int,
+        real_lu=jnp.eye(1, dtype=dtype),
+        real_piv=jnp.zeros((1,), dtype=jnp.int32),
+        complex_lu=jnp.eye(2, dtype=dtype),
+        complex_piv=jnp.zeros((2,), dtype=jnp.int32),
+        prev_theta_final=jnp.asarray(0.0, dtype=dtype),
+        prev_newton_iter_count=zero_int,
+    )
+    primal_result = transport_solvers._RadauAcceptedStepReverseMinimalAttemptResult(
+        carry_after_attempt=carry,
+        trial_dt=jnp.asarray(1.0, dtype=dtype),
+        trial_y=y,
+        stage_history=jnp.zeros((3, 1), dtype=dtype),
+        jacobian_out=jnp.zeros((1, 1), dtype=dtype),
+        cache_valid_out=jnp.asarray(True),
+        cache_dt_out=jnp.asarray(1.0, dtype=dtype),
+        cache_age_out=zero_int,
+        real_lu_out=jnp.eye(1, dtype=dtype),
+        real_piv_out=jnp.zeros((1,), dtype=jnp.int32),
+        complex_lu_out=jnp.eye(2, dtype=dtype),
+        complex_piv_out=jnp.zeros((2,), dtype=jnp.int32),
+        theta_final=jnp.asarray(0.0, dtype=dtype),
+        newton_iter_count=zero_int,
+    )
+
+    monkeypatch.setattr(
+        transport_solvers,
+        "_radau_prepare_lagged_response",
+        lambda *args, **kwargs: (jnp.asarray(1.0, dtype=dtype), jnp.asarray(False), jnp.asarray(False)),
+    )
+    monkeypatch.setattr(
+        transport_solvers,
+        "_radau_solve_exact_stage_residual_transpose_batched",
+        lambda *args, **kwargs: jnp.zeros_like(kwargs["rhs"]),
+    )
+    monkeypatch.setattr(
+        transport_solvers,
+        "_radau_exact_stage_residual_input_pullback",
+        lambda *args, **kwargs: (
+            jnp.zeros_like(y),
+            jnp.asarray(0.0, dtype=dtype),
+            jnp.asarray(0.0, dtype=dtype),
+        ),
+    )
+    monkeypatch.setattr(
+        transport_solvers,
+        "_radau_exact_stage_residual_support_pullback",
+        lambda *args, **kwargs: {"x": jnp.asarray(0.0, dtype=dtype)},
+    )
+
+    def joint_rebuild_pullback(state, lagged_response_bars, support):
+        assert state.shape == (1,)
+        assert support["x"].shape == ()
+        return 3.0 * lagged_response_bars[:, None], {"x": 11.0 * lagged_response_bars}
+
+    physics_context = types.SimpleNamespace(
+        reverse_direct_stage_adjoint=True,
+        reverse_rhs_pullback_mode="separate",
+        reverse_stage_cotangent_mode="full",
+        reverse_stage_adjoint_memory_mode="default",
+        reverse_rebuild_support_pullback_mode="ntx_joint_implicit_interpolated_faces",
+        reverse_segment_profile_annotations=False,
+        pullback_build_lagged_response=object(),
+        unpack_flat=lambda value: value,
+        project_flat=None,
+        build_lagged_response=object(),
+        flat_rhs_build_support_pullback=None,
+        flat_rhs_build_state_and_support_pullback_batched_interpolated_faces=joint_rebuild_pullback,
+    )
+    kernel_context = types.SimpleNamespace(dtype=dtype, b=jnp.ones((3,), dtype=dtype))
+    next_bars = transport_solvers._RadauAcceptedStepReducedCotangent(
+        y=jnp.asarray([[10.0], [20.0]], dtype=dtype),
+        lagged_response_cache=jnp.asarray([2.0, -1.0], dtype=dtype),
+        lagged_reference_y=jnp.zeros((2, 1), dtype=dtype),
+    )
+
+    reduced_bars, support_leaves = (
+        transport_solvers._execute_radau_accepted_step_next_reduced_cotangent_batched_bwd_with_support_from_primal_result(
+            kernel_context,
+            physics_context,
+            types.SimpleNamespace(),
+            "rebuild",
+            carry,
+            primal_result,
+            next_bars,
+            {"x": jnp.asarray(0.0, dtype=dtype)},
+        )
+    )
+
+    assert jnp.allclose(reduced_bars.y, jnp.asarray([[16.0], [17.0]], dtype=dtype))
+    assert jnp.allclose(reduced_bars.lagged_response_cache, jnp.zeros((2,), dtype=dtype))
+    assert jnp.allclose(reduced_bars.lagged_reference_y, jnp.zeros((2, 1), dtype=dtype))
+    assert len(support_leaves) == 1
+    assert jnp.allclose(support_leaves[0], jnp.asarray([22.0, -11.0], dtype=dtype))
+
+    # The new selector must use its dedicated context hook, while preserving
+    # the same combined rebuild-state/support contract.
+    physics_context.reverse_rebuild_support_pullback_mode = (
+        "ntx_joint_implicit_interpolated_faces_reuse_local_vjp_primal"
+    )
+    physics_context.flat_rhs_build_state_and_support_pullback_batched_interpolated_faces_reuse_local_vjp_primal = (
+        joint_rebuild_pullback
+    )
+    reused_reduced_bars, reused_support_leaves = (
+        transport_solvers._execute_radau_accepted_step_next_reduced_cotangent_batched_bwd_with_support_from_primal_result(
+            kernel_context,
+            physics_context,
+            types.SimpleNamespace(),
+            "rebuild",
+            carry,
+            primal_result,
+            next_bars,
+            {"x": jnp.asarray(0.0, dtype=dtype)},
+        )
+    )
+    assert jnp.allclose(reused_reduced_bars.y, reduced_bars.y)
+    assert jnp.allclose(reused_support_leaves[0], support_leaves[0])
