@@ -1096,6 +1096,11 @@ class GeometryFullTransportLeastSquaresProblem:
         """Return a transport config containing the active profile values."""
 
         config_eff = copy.deepcopy(self.config)
+        general = config_eff.setdefault("general", {})
+        if str(general.get("device", "auto")).strip().lower() == "default":
+            # ``default`` is the optimization API's JAX-device selector.
+            # Normal forward runs use the orchestrator vocabulary instead.
+            general["device"] = "auto"
         profiles = config_eff.setdefault("profiles", {})
         profile_values = self.profile_values_from_scaled_parameters(
             scaled_parameter_values

@@ -51,7 +51,7 @@ def test_geometry_full_transport_problem_mixes_profile_and_boundary_scaling(monk
     baseline_profiles = jnp.asarray([4.0, 10.0, 2.0, 3.0, 1.5, 0.8])
     profile_scales = jnp.asarray([4.0, 10.0, 2.0, 3.0, 1.5, 0.8])
     problem = optimization.GeometryFullTransportLeastSquaresProblem(
-        config={"profiles": {}},
+        config={"general": {"device": "default"}, "profiles": {}},
         context=object(),
         runtime=object(),
         baseline_state=object(),
@@ -74,6 +74,7 @@ def test_geometry_full_transport_problem_mixes_profile_and_boundary_scaling(monk
 
     x = jnp.asarray([1.25, 0.9, 1.5, 0.5, 2.0, 0.25, 2.0])
     config = problem.config_from_scaled_parameters(x)
+    assert config["general"]["device"] == "auto"
     np.testing.assert_allclose(
         [config["profiles"][name] for name in profile_names],
         [5.0, 9.0, 3.0, 1.5, 3.0, 0.2],

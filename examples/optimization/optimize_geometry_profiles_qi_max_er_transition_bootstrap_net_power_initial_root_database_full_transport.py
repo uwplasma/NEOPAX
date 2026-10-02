@@ -144,6 +144,14 @@ def parser() -> argparse.ArgumentParser:
     out = argparse.ArgumentParser(description=__doc__)
     out.add_argument("--seed-input", type=Path, default=SEED_INPUT)
     out.add_argument("--out-dir", type=Path, default=OUT_DIR)
+    out.add_argument(
+        "--postprocess-existing",
+        action="store_true",
+        help=(
+            "read existing initial/optimized transport_solution.h5 files and "
+            "write only the density/temperature profile comparison"
+        ),
+    )
     out.add_argument("--max-nfev", type=int, default=NFEV)
     out.add_argument("--database-n-theta", type=int, default=DATABASE_N_THETA)
     out.add_argument("--database-n-phi", type=int, default=DATABASE_N_PHI)
@@ -411,6 +419,243 @@ def report(tag, problem, x):
     return evaluation
 
 
+def _transport_profile_snapshots(h5_path: Path) -> dict:
+    """Load the first and last finite e/D/T profiles from a transport HDF5."""
+    import h5py
+
+    with h5py.File(h5_path, "r") as h5_file:
+        missing = {
+            name
+            for name in ("rho", "ts", "density", "temperature")
+            if name not in h5_file
+        }
+        if missing:
+            raise ValueError(
+                f"{h5_path} is missing required datasets: {sorted(missing)}"
+            )
+        rho = np.asarray(h5_file["rho"], dtype=float).reshape(-1)
+        times = np.asarray(h5_file["ts"], dtype=float).reshape(-1)
+        raw_profiles = {
+            name: np.asarray(h5_file[name], dtype=float)
+            for name in ("density", "temperature")
+        }
+
+    finite_time_indices = np.flatnonzero(np.isfinite(times))
+    if finite_time_indices.size == 0:
+        raise ValueError(f"{h5_path} contains no finite saved transport times.")
+    initial_index = int(finite_time_indices[np.argmin(times[finite_time_indices])])
+    final_index = int(finite_time_indices[np.argmax(times[finite_time_indices])])
+
+    def _time_species_rho(name: str, values: np.ndarray) -> np.ndarray:
+        values = np.asarray(values, dtype=float).squeeze()
+        if values.ndim == 2 and times.size == 1:
+            values = values[np.newaxis, ...]
+        if values.ndim != 3:
+            raise ValueError(
+                f"Cannot interpret {name} in {h5_path}: expected a three-axis "
+                f"time/species/rho array, got shape={values.shape}."
+            )
+
+        # The writer uses (time, species, rho).  Infer the axes as a guard
+        # against older files that may store an equivalent permutation.
+        if values.shape[0] == times.size and values.shape[-1] == rho.size:
+            normalized = values
+        else:
+            time_axes = [
+                axis for axis, size in enumerate(values.shape) if size == times.size
+            ]
+            rho_axes = [
+                axis for axis, size in enumerate(values.shape) if size == rho.size
+            ]
+            candidates = [
+                (time_axis, rho_axis)
+                for time_axis in time_axes
+                for rho_axis in rho_axes
+                if time_axis != rho_axis
+            ]
+            if len(candidates) != 1:
+                raise ValueError(
+                    f"Cannot identify unique time/rho axes for {name} in {h5_path}: "
+                    f"shape={values.shape}, n_times={times.size}, n_rho={rho.size}."
+                )
+            time_axis, rho_axis = candidates[0]
+            species_axis = next(
+                axis for axis in range(values.ndim) if axis not in (time_axis, rho_axis)
+            )
+            normalized = np.moveaxis(
+                values,
+                (time_axis, species_axis, rho_axis),
+                (0, 1, 2),
+            )
+        if normalized.shape[1] < 3:
+            raise ValueError(
+                f"{h5_path} contains only {normalized.shape[1]} species; e, D, and T "
+                "profiles are required."
+            )
+        return normalized
+
+    profiles = {
+        name: _time_species_rho(name, values)
+        for name, values in raw_profiles.items()
+    }
+    return {
+        "rho": rho,
+        "initial_time": float(times[initial_index]),
+        "final_time": float(times[final_index]),
+        "density_initial": profiles["density"][initial_index, :3],
+        "density_final": profiles["density"][final_index, :3],
+        "temperature_initial": profiles["temperature"][initial_index, :3],
+        "temperature_final": profiles["temperature"][final_index, :3],
+    }
+
+
+def write_initial_optimized_profile_comparison(out_dir: Path) -> tuple[Path, Path]:
+    """Plot and export initial/final e/D/T profiles for both configurations."""
+    import csv
+
+    import matplotlib.pyplot as plt
+    from matplotlib.lines import Line2D
+
+    h5_paths = {
+        label: out_dir / label / "transport" / "transport_solution.h5"
+        for label in ("initial", "optimized")
+    }
+    missing = [str(path) for path in h5_paths.values() if not path.is_file()]
+    if missing:
+        raise FileNotFoundError(
+            "Run the initial and optimized forward transport reports before the "
+            "profile comparison. Missing: " + ", ".join(missing)
+        )
+
+    snapshots = {
+        label: _transport_profile_snapshots(path)
+        for label, path in h5_paths.items()
+    }
+    rho = snapshots["initial"]["rho"]
+    optimized_rho = snapshots["optimized"]["rho"]
+    if rho.shape != optimized_rho.shape or not np.allclose(
+        rho,
+        optimized_rho,
+        rtol=0.0,
+        atol=1.0e-12,
+    ):
+        raise ValueError(
+            "Initial and optimized transport outputs use different rho grids; "
+            "a side-by-side pointwise comparison is not valid."
+        )
+
+    species = ("e", "D", "T")
+    colors = {"e": "C0", "D": "C1", "T": "C2"}
+    time_states = (("initial", "--"), ("final", "-"))
+    quantities = (
+        ("density", r"$n$ [$10^{20}\,\mathrm{m}^{-3}$]"),
+        ("temperature", r"$T$ [$\mathrm{keV}$]"),
+    )
+
+    figure_path = out_dir / "initial_optimized_density_temperature_profiles.png"
+    csv_path = out_dir / "initial_optimized_density_temperature_profiles.csv"
+
+    fig, axes = plt.subplots(2, 2, figsize=(14.0, 10.0), sharex="col")
+    for column, label in enumerate(("initial", "optimized")):
+        snapshot = snapshots[label]
+        axes[0, column].set_title(
+            f"{label.capitalize()} configuration\n"
+            f"$t={snapshot['initial_time']:.3g}$ to "
+            rf"$t={snapshot['final_time']:.3g}\,\mathrm{{s}}$",
+            fontsize=19,
+        )
+        for row, (quantity, ylabel) in enumerate(quantities):
+            ax = axes[row, column]
+            for species_index, species_name in enumerate(species):
+                for time_state, linestyle in time_states:
+                    ax.plot(
+                        rho,
+                        snapshot[f"{quantity}_{time_state}"][species_index],
+                        color=colors[species_name],
+                        linestyle=linestyle,
+                        linewidth=3.0,
+                    )
+            ax.set_ylabel(ylabel, fontsize=20)
+            ax.grid(False)
+            ax.tick_params(axis="both", labelsize=16, width=1.0, length=4)
+            ax.margins(x=0.04, y=0.08)
+            for spine in ax.spines.values():
+                spine.set_linewidth(1.0)
+                spine.set_color("0.35")
+        axes[1, column].set_xlabel(r"$\rho$", fontsize=20)
+
+    species_handles = [
+        Line2D([0], [0], color=colors[name], linewidth=3.0, label=name)
+        for name in species
+    ]
+    time_handles = [
+        Line2D(
+            [0],
+            [0],
+            color="black",
+            linestyle=linestyle,
+            linewidth=3.0,
+            label=f"Transport {time_state}",
+        )
+        for time_state, linestyle in time_states
+    ]
+    figure_species_legend = fig.legend(
+        handles=species_handles,
+        title="Species",
+        loc="lower center",
+        bbox_to_anchor=(0.35, 0.005),
+        ncol=3,
+        fontsize=15,
+        title_fontsize=15,
+        frameon=True,
+    )
+    fig.add_artist(figure_species_legend)
+    fig.legend(
+        handles=time_handles,
+        title="Profile time",
+        loc="lower center",
+        bbox_to_anchor=(0.72, 0.005),
+        ncol=2,
+        fontsize=15,
+        title_fontsize=15,
+        frameon=True,
+    )
+    fig.tight_layout(rect=(0.0, 0.09, 1.0, 1.0))
+    fig.savefig(figure_path, dpi=320, bbox_inches="tight")
+    plt.close(fig)
+
+    fieldnames = ["rho"]
+    for quantity, _ in quantities:
+        units = "1e20_m-3" if quantity == "density" else "keV"
+        for label in ("initial", "optimized"):
+            for time_state, _ in time_states:
+                for species_name in species:
+                    fieldnames.append(
+                        f"{label}_{time_state}_{species_name}_{quantity}_{units}"
+                    )
+    with csv_path.open("w", newline="", encoding="utf-8") as csv_file:
+        writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
+        writer.writeheader()
+        for radial_index, rho_value in enumerate(rho):
+            row = {"rho": f"{rho_value:.16e}"}
+            for quantity, _ in quantities:
+                units = "1e20_m-3" if quantity == "density" else "keV"
+                for label in ("initial", "optimized"):
+                    for time_state, _ in time_states:
+                        values = snapshots[label][f"{quantity}_{time_state}"]
+                        for species_index, species_name in enumerate(species):
+                            key = (
+                                f"{label}_{time_state}_{species_name}_"
+                                f"{quantity}_{units}"
+                            )
+                            row[key] = f"{values[species_index, radial_index]:.16e}"
+            writer.writerow(row)
+
+    print(f"wrote {figure_path}", flush=True)
+    print(f"wrote {csv_path}", flush=True)
+    return figure_path, csv_path
+
+
 def write_outputs(
     *,
     initial_input,
@@ -458,10 +703,15 @@ def write_outputs(
     geometry_example.write_transport_report(
         optimized_input, "optimized", optimized_config, out_dir
     )
+    if make_initial_plots:
+        write_initial_optimized_profile_comparison(out_dir)
 
 
 def main() -> int:
     args = parser().parse_args()
+    if args.postprocess_existing:
+        write_initial_optimized_profile_comparison(args.out_dir.resolve())
+        return 0
     if args.max_nfev < 1:
         raise ValueError("--max-nfev must be positive.")
     for name in ("database_n_theta", "database_n_phi", "database_n_xi"):
