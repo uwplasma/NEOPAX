@@ -26,6 +26,68 @@ from NEOPAX._transport_flux_models import DENSITY_STATE_TO_PHYSICAL
 from NEOPAX._constants import elementary_charge
 
 
+def test_geometry_full_transport_problem_mixes_profile_and_boundary_scaling(monkeypatch):
+    """Combined full-transport variables retain their distinct conventions."""
+
+    geometry_specs = optimization.parse_vmec_boundary_parameter_specs("RBC:1:0")
+    parameterization = optimization.VmexBoundaryParameterization(
+        specs=geometry_specs,
+        scales=(0.5,),
+        scale_mode="ess",
+    )
+    profile_names = (
+        "n0",
+        "T0",
+        "density_shape_power",
+        "temperature_shape_power",
+        "density_shape_alpha",
+        "temperature_shape_alpha",
+    )
+    parameter_set = optimization.reverse_ad_optimization_parameter_set(
+        include_profiles=True,
+        profiles=profile_names,
+        vmec_boundary=geometry_specs,
+    )
+    baseline_profiles = jnp.asarray([4.0, 10.0, 2.0, 3.0, 1.5, 0.8])
+    profile_scales = jnp.asarray([4.0, 10.0, 2.0, 3.0, 1.5, 0.8])
+    problem = optimization.GeometryFullTransportLeastSquaresProblem(
+        config={"profiles": {}},
+        context=object(),
+        runtime=object(),
+        baseline_state=object(),
+        baseline_profile_values=baseline_profiles,
+        profile_scales=profile_scales,
+        parameterization=parameterization,
+        parameter_set=parameter_set,
+        terms=(),
+        table_context=object(),
+        table_result_builder=object(),
+        options={},
+    )
+
+    np.testing.assert_allclose(
+        np.asarray(problem.x0), [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.0]
+    )
+    np.testing.assert_allclose(
+        np.asarray(problem.x_scale), [4.0, 10.0, 2.0, 3.0, 1.5, 0.8, 0.5]
+    )
+
+    x = jnp.asarray([1.25, 0.9, 1.5, 0.5, 2.0, 0.25, 2.0])
+    config = problem.config_from_scaled_parameters(x)
+    np.testing.assert_allclose(
+        [config["profiles"][name] for name in profile_names],
+        [5.0, 9.0, 3.0, 1.5, 3.0, 0.2],
+    )
+
+    monkeypatch.setattr(optimization, "boundary_param_entries", lambda *_args: object())
+    monkeypatch.setattr(
+        optimization,
+        "_input_with_boundary_deltas",
+        lambda _context, deltas, _entries: np.asarray(deltas),
+    )
+    np.testing.assert_allclose(problem.input_from_scaled_parameters(x), [1.0])
+
+
 def test_geometry_optimization_rejects_vmex_niter_exhaustion(monkeypatch):
     """Only the optimization stage opts into strict final-stage convergence."""
 
