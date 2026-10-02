@@ -928,12 +928,14 @@ class ProfileFullTransportLeastSquaresProblem:
 
 @dataclasses.dataclass(frozen=True, slots=True)
 class GeometryFullTransportLeastSquaresProblem:
-    """Geometry-only QI + full-transport least-squares problem."""
+    """Geometry and optional profile full-transport least-squares problem."""
 
     config: dict
     context: object
     runtime: object
     baseline_state: object
+    baseline_profile_values: object
+    profile_scales: object
     parameterization: VmexBoundaryParameterization
     parameter_set: object
     terms: tuple[GeometryLeastSquaresTerm | LeastSquaresTerm, ...]
@@ -957,11 +959,41 @@ class GeometryFullTransportLeastSquaresProblem:
 
     @property
     def x0(self):
-        return jnp.zeros((self.parameter_count,), dtype=jnp.float64)
+        profile_lookup = {name: i for i, name in enumerate(PROFILE_PARAMETER_ORDER)}
+        values = []
+        for spec in self.parameter_set.specs:
+            if isinstance(spec, ProfileParameterSpec):
+                index = profile_lookup[spec.name]
+                values.append(
+                    self.baseline_profile_values[index] / self.profile_scales[index]
+                )
+            else:
+                values.append(jnp.asarray(0.0, dtype=jnp.float64))
+        return jnp.asarray(values, dtype=jnp.float64)
 
     @property
     def x_scale(self):
-        return self.parameterization.x_scale
+        profile_scale_lookup = {
+            name: self.profile_scales[i]
+            for i, name in enumerate(PROFILE_PARAMETER_ORDER)
+        }
+        geometry_scale_lookup = {
+            spec: scale
+            for spec, scale in zip(
+                self.parameterization.specs,
+                self.parameterization.scales,
+                strict=True,
+            )
+        }
+        return jnp.asarray(
+            [
+                profile_scale_lookup[spec.name]
+                if isinstance(spec, ProfileParameterSpec)
+                else geometry_scale_lookup[spec]
+                for spec in self.parameter_set.specs
+            ],
+            dtype=jnp.float64,
+        )
 
     def _scaled_to_physical(self, scaled_parameter_values):
         scaled_values = jnp.asarray(scaled_parameter_values, dtype=jnp.float64)
@@ -970,7 +1002,7 @@ class GeometryFullTransportLeastSquaresProblem:
                 "scaled_parameter_values must have shape "
                 f"({self.parameter_count},); got {tuple(scaled_values.shape)}."
             )
-        return self.parameterization.scaled_to_physical_delta(scaled_values)
+        return scaled_values * self.x_scale
 
     def evaluate(self, scaled_parameter_values=None) -> LeastSquaresEvaluation:
         physical_values = self._scaled_to_physical(
@@ -1032,8 +1064,47 @@ class GeometryFullTransportLeastSquaresProblem:
         physical_values = self._scaled_to_physical(
             self.x0 if scaled_parameter_values is None else scaled_parameter_values
         )
+        geometry_values = jnp.asarray(
+            [
+                physical_values[i]
+                for i, spec in enumerate(self.parameter_set.specs)
+                if not isinstance(spec, ProfileParameterSpec)
+            ],
+            dtype=jnp.float64,
+        )
         entries = boundary_param_entries(self.context, self.parameterization.vmec_tuples)
-        return _input_with_boundary_deltas(self.context, physical_values, entries)
+        return _input_with_boundary_deltas(self.context, geometry_values, entries)
+
+    def profile_values_from_scaled_parameters(self, scaled_parameter_values=None):
+        """Return the full canonical profile vector for optimizer variables."""
+
+        physical_values = self._scaled_to_physical(
+            self.x0 if scaled_parameter_values is None else scaled_parameter_values
+        )
+        profile_values = jnp.asarray(
+            self.baseline_profile_values, dtype=jnp.float64
+        )
+        profile_lookup = {name: i for i, name in enumerate(PROFILE_PARAMETER_ORDER)}
+        for i, spec in enumerate(self.parameter_set.specs):
+            if isinstance(spec, ProfileParameterSpec):
+                profile_values = profile_values.at[profile_lookup[spec.name]].set(
+                    physical_values[i]
+                )
+        return profile_values
+
+    def config_from_scaled_parameters(self, scaled_parameter_values=None):
+        """Return a transport config containing the active profile values."""
+
+        config_eff = copy.deepcopy(self.config)
+        profiles = config_eff.setdefault("profiles", {})
+        profile_values = self.profile_values_from_scaled_parameters(
+            scaled_parameter_values
+        )
+        for name, value in zip(
+            PROFILE_PARAMETER_ORDER, profile_values, strict=True
+        ):
+            profiles[name] = float(np.asarray(jax.device_get(value)))
+        return config_eff
 
 
 def geometry_objective(name: str | ObjectiveRef) -> ObjectiveRef:
@@ -2460,6 +2531,12 @@ def geometry_full_transport_least_squares_problem(
     vmec_input=None,
     max_mode: int | None = None,
     parameters: str | Sequence[str] | None = None,
+    include_profiles: bool = False,
+    profile_parameters: str | Sequence[str] | None = (
+        "n0,T0,density_shape_power,temperature_shape_power,"
+        "density_shape_alpha,temperature_shape_alpha"
+    ),
+    profile_scale_mode: str = "nominal",
     families: str | Sequence[str] | None = "RBC,ZBS",
     scale_mode: str = "ess",
     ess_alpha: float = 1.0,
@@ -2503,11 +2580,13 @@ def geometry_full_transport_least_squares_problem(
     reverse_stage_mode: str = "benchmark",
     qi_maxj_settings: QImaxJBackendSettings | Mapping[str, object] | str | None = None,
 ) -> GeometryFullTransportLeastSquaresProblem:
-    """Build a geometry-only optimizer problem for full Radau transport objectives.
+    """Build a geometry and optional profile full-transport optimizer problem.
 
     This API is the opt-in full-transport continuation.  Initial-Er/root-only
     problems use :func:`geometry_initial_er_root_only_least_squares_problem`
-    and never construct this transport reverse table.
+    and never construct this transport reverse table. Profile variables are
+    opt-in so existing geometry-only callers retain their exact parameter
+    layout and behavior.
     """
 
     if not 0.0 <= float(er_transition_rho_min) < float(er_transition_rho_max) <= 1.0:
@@ -2573,8 +2652,14 @@ def geometry_full_transport_least_squares_problem(
             scale_mode=scale_mode,
             ess_alpha=float(ess_alpha),
         )
+    profile_specs = (
+        parse_profile_parameter_specs(profile_parameters)
+        if include_profiles
+        else ()
+    )
     parameter_set = reverse_ad_optimization_parameter_set(
-        include_profiles=False,
+        include_profiles=bool(profile_specs),
+        profiles=tuple(spec.name for spec in profile_specs) if profile_specs else None,
         vmec_boundary=parameterization.specs,
     )
     runtime, baseline_state = build_runtime_context(config_eff)
@@ -2583,6 +2668,9 @@ def geometry_full_transport_least_squares_problem(
     baseline_profile_values = _profile_values_from_config(
         config_eff,
         jnp.asarray(baseline_state.pressure).dtype,
+    )
+    profile_scales = _profile_scales_from_values(
+        baseline_profile_values, profile_scale_mode
     )
     baseline_values = jnp.concatenate(
         [
@@ -3021,6 +3109,8 @@ def geometry_full_transport_least_squares_problem(
         context=context,
         runtime=runtime,
         baseline_state=baseline_state,
+        baseline_profile_values=baseline_profile_values,
+        profile_scales=profile_scales,
         parameterization=parameterization,
         parameter_set=parameter_set,
         terms=normalized_terms,
