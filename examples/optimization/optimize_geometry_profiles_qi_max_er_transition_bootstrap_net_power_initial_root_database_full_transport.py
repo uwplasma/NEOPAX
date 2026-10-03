@@ -509,8 +509,10 @@ def _transport_profile_snapshots(h5_path: Path) -> dict:
     }
 
 
-def write_initial_optimized_profile_comparison(out_dir: Path) -> tuple[Path, Path]:
-    """Plot and export initial/final e/D/T profiles for both configurations."""
+def write_initial_optimized_profile_comparison(
+    out_dir: Path,
+) -> tuple[Path, Path, Path]:
+    """Compare initial/optimized configurations at initial and final time."""
     import csv
 
     import matplotlib.pyplot as plt
@@ -546,89 +548,102 @@ def write_initial_optimized_profile_comparison(out_dir: Path) -> tuple[Path, Pat
 
     species = ("e", "D", "T")
     colors = {"e": "C0", "D": "C1", "T": "C2"}
-    time_states = (("initial", "--"), ("final", "-"))
+    configurations = (("initial", "--"), ("optimized", "-"))
+    time_states = ("initial", "final")
     quantities = (
         ("density", r"$n$ [$10^{20}\,\mathrm{m}^{-3}$]"),
         ("temperature", r"$T$ [$\mathrm{keV}$]"),
     )
 
-    figure_path = out_dir / "initial_optimized_density_temperature_profiles.png"
+    figure_paths = {
+        time_state: out_dir
+        / f"{time_state}_profiles_initial_vs_optimized.png"
+        for time_state in time_states
+    }
     csv_path = out_dir / "initial_optimized_density_temperature_profiles.csv"
 
-    fig, axes = plt.subplots(2, 2, figsize=(14.0, 10.0), sharex="col")
-    for column, label in enumerate(("initial", "optimized")):
-        snapshot = snapshots[label]
-        axes[0, column].set_title(
-            f"{label.capitalize()} configuration\n"
-            f"$t={snapshot['initial_time']:.3g}$ to "
-            rf"$t={snapshot['final_time']:.3g}\,\mathrm{{s}}$",
-            fontsize=19,
-        )
-        for row, (quantity, ylabel) in enumerate(quantities):
-            ax = axes[row, column]
-            for species_index, species_name in enumerate(species):
-                for time_state, linestyle in time_states:
-                    ax.plot(
+    for time_state in time_states:
+        fig, axes = plt.subplots(1, 2, figsize=(14.0, 5.6), sharex=True)
+        for axis, (quantity, ylabel) in zip(axes, quantities):
+            axis.set_title(quantity.capitalize(), fontsize=19)
+            for label, linestyle in configurations:
+                snapshot = snapshots[label]
+                values = snapshot[f"{quantity}_{time_state}"]
+                for species_index, species_name in enumerate(species):
+                    axis.plot(
                         rho,
-                        snapshot[f"{quantity}_{time_state}"][species_index],
+                        values[species_index],
                         color=colors[species_name],
                         linestyle=linestyle,
                         linewidth=3.0,
                     )
-            ax.set_ylabel(ylabel, fontsize=20)
-            ax.grid(False)
-            ax.tick_params(axis="both", labelsize=16, width=1.0, length=4)
-            ax.margins(x=0.04, y=0.08)
-            for spine in ax.spines.values():
+            axis.set_xlabel(r"$\rho$", fontsize=20)
+            axis.set_ylabel(ylabel, fontsize=20)
+            axis.grid(False)
+            axis.tick_params(axis="both", labelsize=16, width=1.0, length=4)
+            axis.margins(x=0.04, y=0.08)
+            for spine in axis.spines.values():
                 spine.set_linewidth(1.0)
                 spine.set_color("0.35")
-        axes[1, column].set_xlabel(r"$\rho$", fontsize=20)
 
-    species_handles = [
-        Line2D([0], [0], color=colors[name], linewidth=3.0, label=name)
-        for name in species
-    ]
-    time_handles = [
-        Line2D(
-            [0],
-            [0],
-            color="black",
-            linestyle=linestyle,
-            linewidth=3.0,
-            label=f"Transport {time_state}",
+        species_handles = [
+            Line2D([0], [0], color=colors[name], linewidth=3.0, label=name)
+            for name in species
+        ]
+        configuration_handles = [
+            Line2D(
+                [0],
+                [0],
+                color="black",
+                linestyle=linestyle,
+                linewidth=3.0,
+                label=f"{label.capitalize()} configuration",
+            )
+            for label, linestyle in configurations
+        ]
+        figure_species_legend = fig.legend(
+            handles=species_handles,
+            title="Species",
+            loc="lower center",
+            bbox_to_anchor=(0.35, 0.005),
+            ncol=3,
+            fontsize=15,
+            title_fontsize=15,
+            frameon=True,
         )
-        for time_state, linestyle in time_states
-    ]
-    figure_species_legend = fig.legend(
-        handles=species_handles,
-        title="Species",
-        loc="lower center",
-        bbox_to_anchor=(0.35, 0.005),
-        ncol=3,
-        fontsize=15,
-        title_fontsize=15,
-        frameon=True,
-    )
-    fig.add_artist(figure_species_legend)
-    fig.legend(
-        handles=time_handles,
-        title="Profile time",
-        loc="lower center",
-        bbox_to_anchor=(0.72, 0.005),
-        ncol=2,
-        fontsize=15,
-        title_fontsize=15,
-        frameon=True,
-    )
-    fig.tight_layout(rect=(0.0, 0.09, 1.0, 1.0))
-    fig.savefig(figure_path, dpi=320, bbox_inches="tight")
-    plt.close(fig)
+        fig.add_artist(figure_species_legend)
+        fig.legend(
+            handles=configuration_handles,
+            title="Configuration",
+            loc="lower center",
+            bbox_to_anchor=(0.72, 0.005),
+            ncol=2,
+            fontsize=15,
+            title_fontsize=15,
+            frameon=True,
+        )
+        initial_time = snapshots["initial"][f"{time_state}_time"]
+        optimized_time = snapshots["optimized"][f"{time_state}_time"]
+        if np.isclose(initial_time, optimized_time, rtol=0.0, atol=1.0e-12):
+            time_label = rf"$t={initial_time:.3g}\,\mathrm{{s}}$"
+        else:
+            time_label = (
+                rf"$t_{{\mathrm{{initial\ config}}}}={initial_time:.3g}\,\mathrm{{s}}$, "
+                rf"$t_{{\mathrm{{optimized\ config}}}}={optimized_time:.3g}\,\mathrm{{s}}$"
+            )
+        fig.suptitle(
+            f"{time_state.capitalize()} transport profiles: " + time_label,
+            fontsize=20,
+        )
+        fig.tight_layout(rect=(0.0, 0.12, 1.0, 0.94))
+        fig.savefig(figure_paths[time_state], dpi=320, bbox_inches="tight")
+        plt.close(fig)
 
     fieldnames = ["rho"]
     for quantity, _ in quantities:
         units = "1e20_m-3" if quantity == "density" else "keV"
         for label in ("initial", "optimized"):
-            for time_state, _ in time_states:
+            for time_state in time_states:
                 for species_name in species:
                     fieldnames.append(
                         f"{label}_{time_state}_{species_name}_{quantity}_{units}"
@@ -641,7 +656,7 @@ def write_initial_optimized_profile_comparison(out_dir: Path) -> tuple[Path, Pat
             for quantity, _ in quantities:
                 units = "1e20_m-3" if quantity == "density" else "keV"
                 for label in ("initial", "optimized"):
-                    for time_state, _ in time_states:
+                    for time_state in time_states:
                         values = snapshots[label][f"{quantity}_{time_state}"]
                         for species_index, species_name in enumerate(species):
                             key = (
@@ -651,9 +666,10 @@ def write_initial_optimized_profile_comparison(out_dir: Path) -> tuple[Path, Pat
                             row[key] = f"{values[species_index, radial_index]:.16e}"
             writer.writerow(row)
 
-    print(f"wrote {figure_path}", flush=True)
+    for figure_path in figure_paths.values():
+        print(f"wrote {figure_path}", flush=True)
     print(f"wrote {csv_path}", flush=True)
-    return figure_path, csv_path
+    return figure_paths["initial"], figure_paths["final"], csv_path
 
 
 def write_outputs(
