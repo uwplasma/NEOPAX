@@ -82,11 +82,14 @@ PROFILE_PARAMETERS = (
 )
 PROFILE_SCALE_MODE = "nominal"
 PROFILE_COORDINATE_MODE = "delta"
-# The problem already converts optimizer coordinates to physical profile and
-# geometry DoFs exactly once.  ``"jac"`` is a separate, dimensionless SciPy
-# trust-region metric: it equilibrates steps using the weighted Jacobian column
-# norms, allowing weaker profile directions to compete with geometry directions.
-OPTIMIZER_TRUST_REGION_X_SCALE = "jac"
+# Keep the established ESS geometry metric, while equilibrating the profile
+# block against it once at the beginning of each continuation stage.  This is
+# deliberately one multiplier for the whole profile block rather than SciPy's
+# per-column ``x_scale="jac"``: the latter would also rescale every geometry
+# direction and largely erase the intended ESS hierarchy.
+OPTIMIZER_TRUST_REGION_X_SCALE = "initial_block_median"
+PROFILE_TRUST_REGION_SCALE_MIN = 1.0e-2
+PROFILE_TRUST_REGION_SCALE_MAX = 1.0e2
 PROFILE_PHYSICAL_LOWER = {
     "n0": 0.6,
     "T0": 5.0,
@@ -433,7 +436,74 @@ def report(tag, problem, x):
     return evaluation
 
 
-def write_parameter_scaling_audit(out_dir, max_mode, problem, x, evaluation):
+def initial_block_trust_region_x_scale(problem, evaluation):
+    """Balance profile sensitivity against ESS geometry without changing ESS.
+
+    The problem Jacobian is already expressed in its optimizer coordinates:
+    nominal relative deltas for profiles and ESS-scaled deltas for geometry.
+    Geometry therefore receives unit *additional* SciPy trust scaling.  A
+    single robust profile multiplier is computed from the median finite,
+    positive column norm in each block and frozen for the complete stage.
+    """
+
+    labels = tuple(problem.parameter_labels)
+    jacobian = np.asarray(jax.device_get(evaluation.jacobian), dtype=float)
+    if jacobian.ndim != 2 or jacobian.shape[1] != len(labels):
+        raise ValueError(
+            "Block trust scaling Jacobian columns do not match parameters: "
+            f"jacobian.shape={jacobian.shape}, parameter_count={len(labels)}."
+        )
+
+    profile_mask = np.asarray(
+        [label in PROFILE_PHYSICAL_LOWER for label in labels], dtype=bool
+    )
+    geometry_mask = ~profile_mask
+    trust_scale = np.ones((len(labels),), dtype=float)
+    column_norms = np.linalg.norm(jacobian, axis=0)
+
+    def _robust_block_median(mask, name):
+        values = column_norms[mask]
+        usable = values[np.isfinite(values) & (values > 0.0)]
+        if usable.size == 0:
+            raise ValueError(
+                f"Cannot construct block trust scaling: the initial weighted "
+                f"Jacobian has no finite positive {name} column norms."
+            )
+        return float(np.median(usable))
+
+    if np.any(profile_mask) and np.any(geometry_mask):
+        profile_median = _robust_block_median(profile_mask, "profile")
+        geometry_median = _robust_block_median(geometry_mask, "geometry")
+        raw_multiplier = geometry_median / profile_median
+        profile_multiplier = float(
+            np.clip(
+                raw_multiplier,
+                PROFILE_TRUST_REGION_SCALE_MIN,
+                PROFILE_TRUST_REGION_SCALE_MAX,
+            )
+        )
+        trust_scale[profile_mask] = profile_multiplier
+        print(
+            "[block-scaling] "
+            f"profile_jacobian_l2_median={profile_median:.6e} "
+            f"geometry_ess_jacobian_l2_median={geometry_median:.6e} "
+            f"raw_profile_multiplier={raw_multiplier:.6e} "
+            f"frozen_profile_multiplier={profile_multiplier:.6e} "
+            "geometry_additional_multiplier=1.000000e+00",
+            flush=True,
+        )
+    else:
+        print(
+            "[block-scaling] only one parameter block is active; using unit "
+            "additional SciPy trust scaling",
+            flush=True,
+        )
+    return trust_scale
+
+
+def write_parameter_scaling_audit(
+    out_dir, max_mode, problem, x, evaluation, trust_region_x_scale
+):
     """Record optimizer scales and weighted Jacobian norms without reevaluation."""
 
     labels = tuple(problem.parameter_labels)
@@ -470,6 +540,12 @@ def write_parameter_scaling_audit(out_dir, max_mode, problem, x, evaluation):
         out=np.zeros_like(optimizer_gradient),
         where=scaled_column_norms > 0.0,
     )
+    trust_region_x_scale = np.asarray(trust_region_x_scale, dtype=float)
+    if trust_region_x_scale.shape != (len(labels),):
+        raise ValueError(
+            "trust_region_x_scale must have one entry per parameter; "
+            f"got {trust_region_x_scale.shape}, expected {(len(labels),)}."
+        )
 
     path = Path(out_dir) / f"parameter_scaling_audit_m{int(max_mode)}.csv"
     with path.open("w", newline="", encoding="utf-8") as stream:
@@ -481,6 +557,7 @@ def write_parameter_scaling_audit(out_dir, max_mode, problem, x, evaluation):
                 "coordinate_convention",
                 "optimizer_value",
                 "coordinate_scale",
+                "scipy_trust_region_x_scale",
                 "physical_value_or_delta",
                 "weighted_jacobian_optimizer_l2",
                 "weighted_jacobian_physical_l2",
@@ -502,6 +579,7 @@ def write_parameter_scaling_audit(out_dir, max_mode, problem, x, evaluation):
                     ),
                     scaled_values[i],
                     scales[i],
+                    trust_region_x_scale[i],
                     physical_values[i],
                     scaled_column_norms[i],
                     physical_column_norms[i],
@@ -950,19 +1028,27 @@ def main() -> int:
             f"[setup] parameter_count={problem.parameter_count} "
             f"parameters={list(problem.parameter_labels)} "
             f"profile_coordinates={PROFILE_COORDINATE_MODE} "
-            f"trust_region_x_scale={OPTIMIZER_TRUST_REGION_X_SCALE}",
+            f"trust_region_x_scale_mode={OPTIMIZER_TRUST_REGION_X_SCALE}",
             flush=True,
         )
         initial_evaluation = report("initial", problem, x0)
+        trust_region_x_scale = initial_block_trust_region_x_scale(
+            problem, initial_evaluation
+        )
         write_parameter_scaling_audit(
-            out_dir, max_mode, problem, x0, initial_evaluation
+            out_dir,
+            max_mode,
+            problem,
+            x0,
+            initial_evaluation,
+            trust_region_x_scale,
         )
         last_result = opt.least_squares(
             problem,
             max_nfev=args.max_nfev,
             ftol=FTOL,
             xtol=XTOL,
-            x_scale=OPTIMIZER_TRUST_REGION_X_SCALE,
+            x_scale=trust_region_x_scale,
             bounds=scaled_bounds(problem),
             verbose=1,
             iteration_reporter=geometry_example.iteration_diagnostics,
@@ -1006,7 +1092,10 @@ def main() -> int:
         "max_mode_schedule": list(max_modes),
         "profile_parameters": PROFILE_PARAMETERS.split(","),
         "profile_coordinate_mode": PROFILE_COORDINATE_MODE,
-        "optimizer_trust_region_x_scale": OPTIMIZER_TRUST_REGION_X_SCALE,
+        "optimizer_trust_region_x_scale_mode": OPTIMIZER_TRUST_REGION_X_SCALE,
+        "optimizer_trust_region_x_scale": np.asarray(
+            trust_region_x_scale, dtype=float
+        ).tolist(),
         "initial_physical_profiles": initial_profiles,
         "optimized_physical_profiles": optimized_profiles,
         "parameter_labels": list(last_problem.parameter_labels),

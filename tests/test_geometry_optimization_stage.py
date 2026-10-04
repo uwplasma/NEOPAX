@@ -24,6 +24,10 @@ from NEOPAX._reverse_ad_optimization import normalize_geometry_full_ad_objective
 from NEOPAX._state import TransportState
 from NEOPAX._transport_flux_models import DENSITY_STATE_TO_PHYSICAL
 from NEOPAX._constants import elementary_charge
+from examples.optimization import (
+    optimize_geometry_profiles_qi_max_er_transition_bootstrap_net_power_initial_root_database_full_transport
+    as combined_full_transport_example,
+)
 
 
 def test_geometry_full_transport_problem_mixes_profile_and_boundary_scaling(monkeypatch):
@@ -157,6 +161,36 @@ def test_geometry_full_transport_problem_mixes_profile_and_boundary_scaling(monk
         delta_evaluation.jacobian,
         raw_jacobian * np.asarray(delta_problem.x_scale)[None, :],
     )
+
+
+def test_combined_full_transport_uses_one_frozen_profile_block_trust_scale():
+    """Profile equilibration leaves every ESS geometry trust entry at one."""
+
+    labels = (
+        "n0",
+        "T0",
+        "density_shape_power",
+        "temperature_shape_power",
+        "density_shape_alpha",
+        "temperature_shape_alpha",
+        "RBC:1:0",
+        "ZBS:1:0",
+    )
+    # One residual row is enough to prescribe these column norms.  The profile
+    # median is 3.5 and the geometry median is 21, hence one block factor of 6.
+    evaluation = SimpleNamespace(
+        jacobian=jnp.asarray([[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 14.0, 28.0]])
+    )
+    problem = SimpleNamespace(parameter_labels=labels)
+
+    trust_scale = (
+        combined_full_transport_example.initial_block_trust_region_x_scale(
+            problem, evaluation
+        )
+    )
+
+    np.testing.assert_allclose(trust_scale[:6], 6.0)
+    np.testing.assert_allclose(trust_scale[6:], 1.0)
 
 
 def test_geometry_optimization_rejects_vmex_niter_exhaustion(monkeypatch):
