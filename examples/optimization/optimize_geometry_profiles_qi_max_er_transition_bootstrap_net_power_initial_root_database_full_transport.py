@@ -81,6 +81,11 @@ PROFILE_PARAMETERS = (
     "density_shape_alpha,temperature_shape_alpha"
 )
 PROFILE_SCALE_MODE = "nominal"
+# The problem already converts optimizer coordinates to physical profile and
+# geometry DoFs exactly once.  ``"jac"`` is a separate, dimensionless SciPy
+# trust-region metric: it equilibrates steps using the weighted Jacobian column
+# norms, allowing weaker profile directions to compete with geometry directions.
+OPTIMIZER_TRUST_REGION_X_SCALE = "jac"
 PROFILE_PHYSICAL_LOWER = {
     "n0": 0.6,
     "T0": 5.0,
@@ -928,7 +933,8 @@ def main() -> int:
             initial_profiles = profile_parameter_values(problem, x0)
         print(
             f"[setup] parameter_count={problem.parameter_count} "
-            f"parameters={list(problem.parameter_labels)}",
+            f"parameters={list(problem.parameter_labels)} "
+            f"trust_region_x_scale={OPTIMIZER_TRUST_REGION_X_SCALE}",
             flush=True,
         )
         initial_evaluation = report("initial", problem, x0)
@@ -940,7 +946,7 @@ def main() -> int:
             max_nfev=args.max_nfev,
             ftol=FTOL,
             xtol=XTOL,
-            x_scale=np.ones_like(x0),
+            x_scale=OPTIMIZER_TRUST_REGION_X_SCALE,
             bounds=scaled_bounds(problem),
             verbose=1,
             iteration_reporter=geometry_example.iteration_diagnostics,
@@ -983,6 +989,7 @@ def main() -> int:
         ],
         "max_mode_schedule": list(max_modes),
         "profile_parameters": PROFILE_PARAMETERS.split(","),
+        "optimizer_trust_region_x_scale": OPTIMIZER_TRUST_REGION_X_SCALE,
         "initial_physical_profiles": initial_profiles,
         "optimized_physical_profiles": optimized_profiles,
         "parameter_labels": list(last_problem.parameter_labels),
