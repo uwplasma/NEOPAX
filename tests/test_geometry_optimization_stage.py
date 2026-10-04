@@ -136,6 +136,28 @@ def test_geometry_full_transport_problem_mixes_profile_and_boundary_scaling(monk
         raw_jacobian * np.asarray(problem.x_scale)[None, :],
     )
 
+    delta_problem = dataclasses.replace(problem, profile_coordinate_mode="delta")
+    np.testing.assert_allclose(np.asarray(delta_problem.x0), np.zeros(7))
+    delta_x = jnp.asarray([0.25, -0.1, 0.5, -0.5, 1.0, -0.75, 2.0])
+    expected_physical = [5.0, 9.0, 3.0, 1.5, 3.0, 0.2, 1.0]
+    np.testing.assert_allclose(
+        delta_problem._scaled_to_physical(delta_x), expected_physical
+    )
+    delta_config = delta_problem.config_from_scaled_parameters(delta_x)
+    np.testing.assert_allclose(
+        [delta_config["profiles"][name] for name in profile_names],
+        expected_physical[:6],
+    )
+    np.testing.assert_allclose(
+        delta_problem.input_from_scaled_parameters(delta_x), [1.0]
+    )
+    delta_evaluation = delta_problem.evaluate(delta_x)
+    np.testing.assert_allclose(captured["parameter_values"], expected_physical)
+    np.testing.assert_allclose(
+        delta_evaluation.jacobian,
+        raw_jacobian * np.asarray(delta_problem.x_scale)[None, :],
+    )
+
 
 def test_geometry_optimization_rejects_vmex_niter_exhaustion(monkeypatch):
     """Only the optimization stage opts into strict final-stage convergence."""

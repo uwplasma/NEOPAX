@@ -81,6 +81,7 @@ PROFILE_PARAMETERS = (
     "density_shape_alpha,temperature_shape_alpha"
 )
 PROFILE_SCALE_MODE = "nominal"
+PROFILE_COORDINATE_MODE = "delta"
 # The problem already converts optimizer coordinates to physical profile and
 # geometry DoFs exactly once.  ``"jac"`` is a separate, dimensionless SciPy
 # trust-region metric: it equilibrates steps using the weighted Jacobian column
@@ -365,10 +366,17 @@ def profile_parameter_values(problem, x) -> dict[str, float]:
 
 def scaled_bounds(problem):
     scales = np.asarray(jax.device_get(problem.x_scale), dtype=float)
+    profile_coordinate_mode = str(problem.profile_coordinate_mode).strip().lower()
+    baseline_profiles = profile_parameter_values(problem, problem.x0)
     lower, upper = [], []
     for label, scale in zip(problem.parameter_labels, scales, strict=True):
-        lower.append(PROFILE_PHYSICAL_LOWER.get(label, -np.inf) / scale)
-        upper.append(PROFILE_PHYSICAL_UPPER.get(label, np.inf) / scale)
+        offset = (
+            baseline_profiles[label]
+            if profile_coordinate_mode == "delta" and label in baseline_profiles
+            else 0.0
+        )
+        lower.append((PROFILE_PHYSICAL_LOWER.get(label, -np.inf) - offset) / scale)
+        upper.append((PROFILE_PHYSICAL_UPPER.get(label, np.inf) - offset) / scale)
     return np.asarray(lower), np.asarray(upper)
 
 
@@ -431,7 +439,9 @@ def write_parameter_scaling_audit(out_dir, max_mode, problem, x, evaluation):
     labels = tuple(problem.parameter_labels)
     scales = np.asarray(jax.device_get(problem.x_scale), dtype=float)
     scaled_values = np.asarray(x, dtype=float)
-    physical_values = scaled_values * scales
+    physical_values = np.asarray(
+        jax.device_get(problem._scaled_to_physical(scaled_values)), dtype=float
+    )
     residuals = np.asarray(jax.device_get(evaluation.residuals), dtype=float)
     jacobian = np.asarray(jax.device_get(evaluation.jacobian), dtype=float)
     if jacobian.shape[1] != len(labels):
@@ -485,7 +495,11 @@ def write_parameter_scaling_audit(out_dir, max_mode, problem, x, evaluation):
                 (
                     label,
                     "profile" if is_profile else "geometry",
-                    "scaled_absolute" if is_profile else "scaled_delta",
+                    (
+                        f"scaled_{problem.profile_coordinate_mode}"
+                        if is_profile
+                        else "scaled_delta"
+                    ),
                     scaled_values[i],
                     scales[i],
                     physical_values[i],
@@ -885,6 +899,7 @@ def main() -> int:
             include_profiles=True,
             profile_parameters=PROFILE_PARAMETERS,
             profile_scale_mode=PROFILE_SCALE_MODE,
+            profile_coordinate_mode=PROFILE_COORDINATE_MODE,
             families=GEOMETRY_FAMILIES,
             scale_mode=GEOMETRY_SCALE_MODE,
             ess_alpha=ESS_ALPHA,
@@ -934,6 +949,7 @@ def main() -> int:
         print(
             f"[setup] parameter_count={problem.parameter_count} "
             f"parameters={list(problem.parameter_labels)} "
+            f"profile_coordinates={PROFILE_COORDINATE_MODE} "
             f"trust_region_x_scale={OPTIMIZER_TRUST_REGION_X_SCALE}",
             flush=True,
         )
@@ -989,6 +1005,7 @@ def main() -> int:
         ],
         "max_mode_schedule": list(max_modes),
         "profile_parameters": PROFILE_PARAMETERS.split(","),
+        "profile_coordinate_mode": PROFILE_COORDINATE_MODE,
         "optimizer_trust_region_x_scale": OPTIMIZER_TRUST_REGION_X_SCALE,
         "initial_physical_profiles": initial_profiles,
         "optimized_physical_profiles": optimized_profiles,

@@ -942,6 +942,7 @@ class GeometryFullTransportLeastSquaresProblem:
     table_context: object
     table_result_builder: object
     options: Mapping[str, object]
+    profile_coordinate_mode: str = "absolute"
     raw_block_optimization_stage: object | None = None
     raw_block_transpose_optimization_stage: object | None = None
     geometry_lane: str = "ad"
@@ -960,12 +961,20 @@ class GeometryFullTransportLeastSquaresProblem:
     @property
     def x0(self):
         profile_lookup = {name: i for i, name in enumerate(PROFILE_PARAMETER_ORDER)}
+        profile_coordinate_mode = str(self.profile_coordinate_mode).strip().lower()
+        if profile_coordinate_mode not in {"absolute", "delta"}:
+            raise ValueError(
+                "profile_coordinate_mode must be 'absolute' or 'delta'; "
+                f"got {self.profile_coordinate_mode!r}."
+            )
         values = []
         for spec in self.parameter_set.specs:
             if isinstance(spec, ProfileParameterSpec):
                 index = profile_lookup[spec.name]
                 values.append(
-                    self.baseline_profile_values[index] / self.profile_scales[index]
+                    jnp.asarray(0.0, dtype=jnp.float64)
+                    if profile_coordinate_mode == "delta"
+                    else self.baseline_profile_values[index] / self.profile_scales[index]
                 )
             else:
                 values.append(jnp.asarray(0.0, dtype=jnp.float64))
@@ -1002,7 +1011,23 @@ class GeometryFullTransportLeastSquaresProblem:
                 "scaled_parameter_values must have shape "
                 f"({self.parameter_count},); got {tuple(scaled_values.shape)}."
             )
-        return scaled_values * self.x_scale
+        physical_values = scaled_values * self.x_scale
+        profile_coordinate_mode = str(self.profile_coordinate_mode).strip().lower()
+        if profile_coordinate_mode not in {"absolute", "delta"}:
+            raise ValueError(
+                "profile_coordinate_mode must be 'absolute' or 'delta'; "
+                f"got {self.profile_coordinate_mode!r}."
+            )
+        if profile_coordinate_mode == "delta":
+            profile_lookup = {
+                name: i for i, name in enumerate(PROFILE_PARAMETER_ORDER)
+            }
+            for i, spec in enumerate(self.parameter_set.specs):
+                if isinstance(spec, ProfileParameterSpec):
+                    physical_values = physical_values.at[i].add(
+                        self.baseline_profile_values[profile_lookup[spec.name]]
+                    )
+        return physical_values
 
     def evaluate(self, scaled_parameter_values=None) -> LeastSquaresEvaluation:
         physical_values = self._scaled_to_physical(
@@ -2542,6 +2567,7 @@ def geometry_full_transport_least_squares_problem(
         "density_shape_alpha,temperature_shape_alpha"
     ),
     profile_scale_mode: str = "nominal",
+    profile_coordinate_mode: str = "absolute",
     families: str | Sequence[str] | None = "RBC,ZBS",
     scale_mode: str = "ess",
     ess_alpha: float = 1.0,
@@ -2602,6 +2628,12 @@ def geometry_full_transport_least_squares_problem(
         <= float(er_transition_rho_max)
     ):
         raise ValueError("Er transition target must lie inside the radial window.")
+    profile_coordinate_mode_eff = str(profile_coordinate_mode).strip().lower()
+    if profile_coordinate_mode_eff not in {"absolute", "delta"}:
+        raise ValueError(
+            "profile_coordinate_mode must be 'absolute' or 'delta'; "
+            f"got {profile_coordinate_mode!r}."
+        )
     if float(er_transition_temperature_kv_m) <= 0.0:
         raise ValueError("er_transition_temperature_kv_m must be positive.")
     if float(er_transition_positive_part_eps) <= 0.0:
@@ -3122,6 +3154,7 @@ def geometry_full_transport_least_squares_problem(
         table_context=table_context,
         table_result_builder=table_result_builder,
         options=options,
+        profile_coordinate_mode=profile_coordinate_mode_eff,
         raw_block_optimization_stage=raw_block_optimization_stage,
         raw_block_transpose_optimization_stage=raw_block_transpose_stage,
         geometry_lane=geometry_lane,
