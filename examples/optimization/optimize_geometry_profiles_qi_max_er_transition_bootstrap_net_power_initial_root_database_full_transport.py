@@ -82,8 +82,8 @@ PROFILE_PARAMETERS = (
 )
 PROFILE_SCALE_MODE = "nominal"
 PROFILE_PHYSICAL_LOWER = {
-    "n0": 2.0,
-    "T0": 7.0,
+    "n0": 0.6,
+    "T0": 5.0,
     "density_shape_power": 0.1,
     "temperature_shape_power": 0.1,
     "density_shape_alpha": 0.1,
@@ -427,6 +427,7 @@ def write_parameter_scaling_audit(out_dir, max_mode, problem, x, evaluation):
     scales = np.asarray(jax.device_get(problem.x_scale), dtype=float)
     scaled_values = np.asarray(x, dtype=float)
     physical_values = scaled_values * scales
+    residuals = np.asarray(jax.device_get(evaluation.residuals), dtype=float)
     jacobian = np.asarray(jax.device_get(evaluation.jacobian), dtype=float)
     if jacobian.shape[1] != len(labels):
         raise ValueError(
@@ -439,6 +440,20 @@ def write_parameter_scaling_audit(out_dir, max_mode, problem, x, evaluation):
         np.abs(scales),
         out=np.full_like(scaled_column_norms, np.nan),
         where=np.abs(scales) > 0.0,
+    )
+    optimizer_gradient = jacobian.T @ residuals
+    residual_norm = np.linalg.norm(residuals)
+    residual_alignment = np.divide(
+        optimizer_gradient,
+        scaled_column_norms * residual_norm,
+        out=np.zeros_like(optimizer_gradient),
+        where=(scaled_column_norms > 0.0) & (residual_norm > 0.0),
+    )
+    one_column_linearized_step = np.divide(
+        -optimizer_gradient,
+        scaled_column_norms**2,
+        out=np.zeros_like(optimizer_gradient),
+        where=scaled_column_norms > 0.0,
     )
 
     path = Path(out_dir) / f"parameter_scaling_audit_m{int(max_mode)}.csv"
@@ -454,6 +469,9 @@ def write_parameter_scaling_audit(out_dir, max_mode, problem, x, evaluation):
                 "physical_value_or_delta",
                 "weighted_jacobian_optimizer_l2",
                 "weighted_jacobian_physical_l2",
+                "weighted_gradient_optimizer",
+                "residual_alignment_cosine",
+                "one_column_linearized_optimizer_step",
             )
         )
         for i, label in enumerate(labels):
@@ -468,6 +486,9 @@ def write_parameter_scaling_audit(out_dir, max_mode, problem, x, evaluation):
                     physical_values[i],
                     scaled_column_norms[i],
                     physical_column_norms[i],
+                    optimizer_gradient[i],
+                    residual_alignment[i],
+                    one_column_linearized_step[i],
                 )
             )
 
@@ -476,12 +497,17 @@ def write_parameter_scaling_audit(out_dir, max_mode, problem, x, evaluation):
         ("geometry", np.asarray([label not in PROFILE_PHYSICAL_LOWER for label in labels])),
     ):
         norms = scaled_column_norms[mask]
-        finite = norms[np.isfinite(norms)]
-        if finite.size:
+        gradients = np.abs(optimizer_gradient[mask])
+        steps = np.abs(one_column_linearized_step[mask])
+        finite = np.isfinite(norms) & np.isfinite(gradients) & np.isfinite(steps)
+        if np.any(finite):
             print(
                 f"[scaling-audit] kind={kind} "
-                f"scaled_jacobian_l2_min={np.min(finite):.6e} "
-                f"median={np.median(finite):.6e} max={np.max(finite):.6e}",
+                f"scaled_jacobian_l2_min={np.min(norms[finite]):.6e} "
+                f"median={np.median(norms[finite]):.6e} "
+                f"max={np.max(norms[finite]):.6e} "
+                f"abs_gradient_median={np.median(gradients[finite]):.6e} "
+                f"linearized_step_median={np.median(steps[finite]):.6e}",
                 flush=True,
             )
     print(f"wrote {path}", flush=True)
