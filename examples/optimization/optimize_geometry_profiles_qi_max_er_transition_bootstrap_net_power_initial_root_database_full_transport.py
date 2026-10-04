@@ -11,6 +11,7 @@ including both profile-alpha shape parameters.
 from __future__ import annotations
 
 import argparse
+import csv
 import copy
 import json
 from pathlib import Path
@@ -417,6 +418,74 @@ def report(tag, problem, x):
     print(f"  residual_norm={np.linalg.norm(residuals):.6e}", flush=True)
     print(f"  jacobian_shape={jacobian.shape}", flush=True)
     return evaluation
+
+
+def write_parameter_scaling_audit(out_dir, max_mode, problem, x, evaluation):
+    """Record optimizer scales and weighted Jacobian norms without reevaluation."""
+
+    labels = tuple(problem.parameter_labels)
+    scales = np.asarray(jax.device_get(problem.x_scale), dtype=float)
+    scaled_values = np.asarray(x, dtype=float)
+    physical_values = scaled_values * scales
+    jacobian = np.asarray(jax.device_get(evaluation.jacobian), dtype=float)
+    if jacobian.shape[1] != len(labels):
+        raise ValueError(
+            "Scaling audit Jacobian columns do not match parameter labels: "
+            f"jacobian.shape={jacobian.shape}, parameter_count={len(labels)}."
+        )
+    scaled_column_norms = np.linalg.norm(jacobian, axis=0)
+    physical_column_norms = np.divide(
+        scaled_column_norms,
+        np.abs(scales),
+        out=np.full_like(scaled_column_norms, np.nan),
+        where=np.abs(scales) > 0.0,
+    )
+
+    path = Path(out_dir) / f"parameter_scaling_audit_m{int(max_mode)}.csv"
+    with path.open("w", newline="", encoding="utf-8") as stream:
+        writer = csv.writer(stream)
+        writer.writerow(
+            (
+                "parameter",
+                "kind",
+                "coordinate_convention",
+                "optimizer_value",
+                "coordinate_scale",
+                "physical_value_or_delta",
+                "weighted_jacobian_optimizer_l2",
+                "weighted_jacobian_physical_l2",
+            )
+        )
+        for i, label in enumerate(labels):
+            is_profile = label in PROFILE_PHYSICAL_LOWER
+            writer.writerow(
+                (
+                    label,
+                    "profile" if is_profile else "geometry",
+                    "scaled_absolute" if is_profile else "scaled_delta",
+                    scaled_values[i],
+                    scales[i],
+                    physical_values[i],
+                    scaled_column_norms[i],
+                    physical_column_norms[i],
+                )
+            )
+
+    for kind, mask in (
+        ("profile", np.asarray([label in PROFILE_PHYSICAL_LOWER for label in labels])),
+        ("geometry", np.asarray([label not in PROFILE_PHYSICAL_LOWER for label in labels])),
+    ):
+        norms = scaled_column_norms[mask]
+        finite = norms[np.isfinite(norms)]
+        if finite.size:
+            print(
+                f"[scaling-audit] kind={kind} "
+                f"scaled_jacobian_l2_min={np.min(finite):.6e} "
+                f"median={np.median(finite):.6e} max={np.max(finite):.6e}",
+                flush=True,
+            )
+    print(f"wrote {path}", flush=True)
+    return path
 
 
 def _transport_profile_snapshots(h5_path: Path) -> dict:
@@ -837,6 +906,9 @@ def main() -> int:
             flush=True,
         )
         initial_evaluation = report("initial", problem, x0)
+        write_parameter_scaling_audit(
+            out_dir, max_mode, problem, x0, initial_evaluation
+        )
         last_result = opt.least_squares(
             problem,
             max_nfev=args.max_nfev,

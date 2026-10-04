@@ -27,7 +27,7 @@ from NEOPAX._constants import elementary_charge
 
 
 def test_geometry_full_transport_problem_mixes_profile_and_boundary_scaling(monkeypatch):
-    """Combined full-transport variables retain their distinct conventions."""
+    """Combined profile and boundary scales are each applied exactly once."""
 
     geometry_specs = optimization.parse_vmec_boundary_parameter_specs("RBC:1:0")
     parameterization = optimization.VmexBoundaryParameterization(
@@ -50,6 +50,9 @@ def test_geometry_full_transport_problem_mixes_profile_and_boundary_scaling(monk
     )
     baseline_profiles = jnp.asarray([4.0, 10.0, 2.0, 3.0, 1.5, 0.8])
     profile_scales = jnp.asarray([4.0, 10.0, 2.0, 3.0, 1.5, 0.8])
+    term = reverse_optimization.LeastSquaresTerm(
+        objective=optimization.transport_objective("softmax_Er"),
+    )
     problem = optimization.GeometryFullTransportLeastSquaresProblem(
         config={"general": {"device": "default"}, "profiles": {}},
         context=object(),
@@ -59,7 +62,7 @@ def test_geometry_full_transport_problem_mixes_profile_and_boundary_scaling(monk
         profile_scales=profile_scales,
         parameterization=parameterization,
         parameter_set=parameter_set,
-        terms=(),
+        terms=(term,),
         table_context=object(),
         table_result_builder=object(),
         options={},
@@ -73,6 +76,10 @@ def test_geometry_full_transport_problem_mixes_profile_and_boundary_scaling(monk
     )
 
     x = jnp.asarray([1.25, 0.9, 1.5, 0.5, 2.0, 0.25, 2.0])
+    np.testing.assert_allclose(
+        problem._scaled_to_physical(x),
+        [5.0, 9.0, 3.0, 1.5, 3.0, 0.2, 1.0],
+    )
     config = problem.config_from_scaled_parameters(x)
     assert config["general"]["device"] == "auto"
     np.testing.assert_allclose(
@@ -87,6 +94,47 @@ def test_geometry_full_transport_problem_mixes_profile_and_boundary_scaling(monk
         lambda _context, deltas, _entries: np.asarray(deltas),
     )
     np.testing.assert_allclose(problem.input_from_scaled_parameters(x), [1.0])
+
+    captured = {}
+    raw_jacobian = jnp.asarray([[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0]])
+
+    monkeypatch.setattr(
+        optimization,
+        "realtime_geometry_transport_reverse_table_request",
+        lambda **_kwargs: object(),
+    )
+
+    def _evaluate_physical(_config, *, parameter_values, **_kwargs):
+        captured["parameter_values"] = np.asarray(parameter_values)
+        result = reverse_optimization.LeastSquaresResult(
+            residuals=jnp.asarray([2.0]),
+            jacobian=raw_jacobian,
+            residual_labels=(term.residual_label,),
+            parameter_labels=problem.parameter_labels,
+            objective_values={term.residual_label: jnp.asarray(2.0)},
+        )
+        return reverse_optimization.LeastSquaresEvaluation(
+            result=result,
+            residuals=result.residuals,
+            jacobian=result.jacobian,
+            elapsed_s=0.0,
+        )
+
+    monkeypatch.setattr(
+        optimization,
+        "evaluate_geometry_transport_realtime_geometry_least_squares",
+        _evaluate_physical,
+    )
+    evaluation = problem.evaluate(x)
+
+    np.testing.assert_allclose(
+        captured["parameter_values"],
+        [5.0, 9.0, 3.0, 1.5, 3.0, 0.2, 1.0],
+    )
+    np.testing.assert_allclose(
+        evaluation.jacobian,
+        raw_jacobian * np.asarray(problem.x_scale)[None, :],
+    )
 
 
 def test_geometry_optimization_rejects_vmex_niter_exhaustion(monkeypatch):
