@@ -5,7 +5,8 @@ This is the combined-DoF counterpart of the standalone geometry database
 full-transport example.  It retains the same QI, maximum-J, final-time Er,
 bootstrap-current, and net-power objectives while optimizing the selected
 RBC/ZBS boundary modes together with all six analytical-profile parameters,
-including both profile-alpha shape parameters.
+including both profile-alpha shape parameters.  Pass ``--no-profile-dofs`` to
+run the identical objective set with geometry DoFs only.
 """
 
 from __future__ import annotations
@@ -13,7 +14,6 @@ from __future__ import annotations
 import argparse
 import csv
 import copy
-import dataclasses
 import json
 from pathlib import Path
 import sys
@@ -81,15 +81,10 @@ PROFILE_PARAMETERS = (
     "n0,T0,density_shape_power,temperature_shape_power,"
     "density_shape_alpha,temperature_shape_alpha"
 )
-PROFILE_SCALE_MODE = "physical_response"
-PROFILE_COORDINATE_MODE = "delta"
-# A unit optimizer displacement in any profile coordinate produces, to first
-# order at the stage baseline, this RMS fractional change in the corresponding
-# physical density or temperature curve.  These scales use only the analytical
-# profile model and radial quadrature--never objective values or weights.
-PROFILE_RESPONSE_RMS_DELTA = 0.1
-PROFILE_RESPONSE_RADIAL_WEIGHTING = "volume"
+PROFILE_SCALE_MODE = "nominal"
+PROFILE_COORDINATE_MODE = "absolute"
 OPTIMIZER_TRUST_REGION_X_SCALE = "unit"
+USE_PROFILE_DOFS = True
 PROFILE_PHYSICAL_LOWER = {
     "n0": 0.6,
     "T0": 5.0,
@@ -166,6 +161,15 @@ def parser() -> argparse.ArgumentParser:
     out.add_argument("--database-n-theta", type=int, default=DATABASE_N_THETA)
     out.add_argument("--database-n-phi", type=int, default=DATABASE_N_PHI)
     out.add_argument("--database-n-xi", type=int, default=DATABASE_N_XI)
+    out.add_argument(
+        "--profile-dofs",
+        action=argparse.BooleanOptionalAction,
+        default=USE_PROFILE_DOFS,
+        help=(
+            "optimize all six analytical-profile DoFs; use --no-profile-dofs "
+            "for geometry DoFs only"
+        ),
+    )
     out.add_argument(
         "--er-transition-left-index", type=int, default=ER_TRANSITION_LEFT_INDEX
     )
@@ -434,140 +438,6 @@ def report(tag, problem, x):
     print(f"  residual_norm={np.linalg.norm(residuals):.6e}", flush=True)
     print(f"  jacobian_shape={jacobian.shape}", flush=True)
     return evaluation
-
-
-def physical_profile_response_scales(
-    problem,
-    *,
-    rms_delta: float = PROFILE_RESPONSE_RMS_DELTA,
-    radial_weighting: str = PROFILE_RESPONSE_RADIAL_WEIGHTING,
-):
-    """Return objective-independent scales for the six analytical-profile DoFs.
-
-    For each parameter, a unit optimizer displacement is normalized to produce
-    ``rms_delta`` RMS change in ``log(n(rho))`` or ``log(T(rho))`` at the stage
-    baseline.  The logarithmic response measures fractional profile change.
-    The calculation contains no least-squares residuals or objective weights.
-    """
-
-    delta = float(rms_delta)
-    if not np.isfinite(delta) or delta <= 0.0:
-        raise ValueError(f"Profile response RMS delta must be positive; got {rms_delta!r}.")
-    weighting = str(radial_weighting).strip().lower()
-    if weighting not in {"uniform", "volume"}:
-        raise ValueError("Profile response radial weighting must be 'uniform' or 'volume'.")
-
-    baseline = jnp.asarray(problem.baseline_profile_values, dtype=jnp.float64)
-    if baseline.shape != (6,):
-        raise ValueError(
-            "Physical profile-response scaling requires all six analytical "
-            f"profile values; got shape={baseline.shape}."
-        )
-    geometry = problem.runtime.geometry
-    r_grid = np.asarray(jax.device_get(geometry.r_grid), dtype=float).reshape(-1)
-    r_grid_half = np.asarray(
-        jax.device_get(geometry.r_grid_half), dtype=float
-    ).reshape(-1)
-    if r_grid.size < 2 or r_grid_half.size == 0 or not r_grid_half[-1] > 0.0:
-        raise ValueError("Cannot construct normalized radius for profile-response scaling.")
-    rho_host = r_grid / r_grid_half[-1]
-    if not np.all(np.isfinite(rho_host)) or np.any(rho_host < 0.0) or np.any(rho_host >= 1.0):
-        raise ValueError(
-            "Profile-response scaling requires finite cell-centered radii in [0, 1)."
-        )
-
-    profile_cfg = problem.config.get("profiles", {})
-
-    def _first_scalar(name, default):
-        raw = profile_cfg.get(name, default)
-        if isinstance(raw, (list, tuple)):
-            if not raw:
-                raise ValueError(f"profiles.{name} cannot be empty.")
-            raw = raw[0]
-        return float(raw)
-
-    n_edge = jnp.asarray(_first_scalar("n_edge", 0.0), dtype=jnp.float64)
-    t_edge = jnp.asarray(_first_scalar("T_edge", 0.0), dtype=jnp.float64)
-    rho = jnp.asarray(rho_host, dtype=jnp.float64)
-    tiny = jnp.asarray(1.0e-30, dtype=jnp.float64)
-
-    def _log_profiles(values):
-        n0, t0, density_power, temperature_power, density_alpha, temperature_alpha = values
-        density_base = jnp.maximum(1.0 - rho**density_power, tiny)
-        temperature_base = jnp.maximum(1.0 - rho**temperature_power, tiny)
-        density = (n0 - n_edge) * density_base**density_alpha + n_edge
-        temperature = (
-            (t0 - t_edge) * temperature_base**temperature_alpha + t_edge
-        )
-        return jnp.stack(
-            (
-                jnp.log(jnp.maximum(density, tiny)),
-                jnp.log(jnp.maximum(temperature, tiny)),
-            ),
-            axis=0,
-        )
-
-    # Shape: (density/temperature, radial cell, profile parameter).
-    log_profile_jacobian = np.asarray(
-        jax.device_get(jax.jacfwd(_log_profiles)(baseline)), dtype=float
-    )
-
-    # Cell-centered trapezoidal weights on normalized radius.  Optional Vprime
-    # weighting measures the RMS in physical plasma volume while remaining
-    # independent of every optimization objective and objective weight.
-    radial_weights = np.empty_like(rho_host)
-    radial_weights[0] = 0.5 * (rho_host[1] - rho_host[0])
-    radial_weights[-1] = 0.5 * (rho_host[-1] - rho_host[-2])
-    radial_weights[1:-1] = 0.5 * (rho_host[2:] - rho_host[:-2])
-    if weighting == "volume":
-        vprime = np.asarray(jax.device_get(geometry.Vprime), dtype=float).reshape(-1)
-        if vprime.shape != rho_host.shape:
-            raise ValueError(
-                "geometry.Vprime shape does not match the profile radial grid: "
-                f"Vprime={vprime.shape}, rho={rho_host.shape}."
-            )
-        radial_weights *= np.maximum(vprime, 0.0)
-    weight_sum = float(np.sum(radial_weights))
-    if not np.isfinite(weight_sum) or weight_sum <= 0.0:
-        raise ValueError("Profile-response radial quadrature has nonpositive weight.")
-    radial_weights /= weight_sum
-
-    density_parameter_indices = {0, 2, 4}
-    response_scales = []
-    response_rms = []
-    for parameter_index in range(6):
-        profile_index = 0 if parameter_index in density_parameter_indices else 1
-        derivative = log_profile_jacobian[profile_index, :, parameter_index]
-        rms = float(np.sqrt(np.sum(radial_weights * derivative**2)))
-        if not np.isfinite(rms) or rms <= 0.0:
-            raise ValueError(
-                "Profile parameter has no finite positive fractional-profile "
-                f"response: index={parameter_index}, rms={rms}."
-            )
-        response_rms.append(rms)
-        response_scales.append(delta / rms)
-
-    labels = (
-        "n0",
-        "T0",
-        "density_shape_power",
-        "temperature_shape_power",
-        "density_shape_alpha",
-        "temperature_shape_alpha",
-    )
-    print(
-        f"[profile-scaling] mode=physical_response rms_delta={delta:.6e} "
-        f"radial_weighting={weighting}",
-        flush=True,
-    )
-    for label, rms, scale in zip(labels, response_rms, response_scales, strict=True):
-        print(
-            f"[profile-scaling] parameter={label} "
-            f"fractional_response_per_physical_unit={rms:.6e} "
-            f"physical_scale_per_optimizer_unit={scale:.6e}",
-            flush=True,
-        )
-    return jnp.asarray(response_scales, dtype=jnp.float64)
 
 
 def write_parameter_scaling_audit(
@@ -1031,8 +901,13 @@ def main() -> int:
         else tuple(int(value) for value in MAX_MODE_SCHEDULE)
     )
     for max_mode in max_modes:
+        dof_description = (
+            "geometry + six-profile-DoF"
+            if args.profile_dofs
+            else "geometry-only"
+        )
         print(
-            "\n===== combined geometry + six-profile-DoF database full-transport "
+            f"\n===== {dof_description} database full-transport "
             f"stage, max_mode={max_mode}, grid=({args.database_n_theta},"
             f"{args.database_n_phi},{args.database_n_xi}), "
             f"J_backend={QI_MAXJ_BACKEND} =====",
@@ -1043,15 +918,9 @@ def main() -> int:
             terms,
             vmec_input=current_input,
             max_mode=max_mode,
-            include_profiles=True,
-            profile_parameters=PROFILE_PARAMETERS,
-            # The builder establishes the baseline first.  Physical-response
-            # scales are installed immediately below before any evaluation.
-            profile_scale_mode=(
-                "nominal"
-                if PROFILE_SCALE_MODE == "physical_response"
-                else PROFILE_SCALE_MODE
-            ),
+            include_profiles=bool(args.profile_dofs),
+            profile_parameters=(PROFILE_PARAMETERS if args.profile_dofs else None),
+            profile_scale_mode=PROFILE_SCALE_MODE,
             profile_coordinate_mode=PROFILE_COORDINATE_MODE,
             families=GEOMETRY_FAMILIES,
             scale_mode=GEOMETRY_SCALE_MODE,
@@ -1087,11 +956,6 @@ def main() -> int:
             reverse_stage_mode=REVERSE_STAGE_MODE,
             qi_maxj_settings=qi_maxj_backend_settings(frozen_physical_pitches),
         )
-        if PROFILE_SCALE_MODE == "physical_response":
-            problem = dataclasses.replace(
-                problem,
-                profile_scales=physical_profile_response_scales(problem),
-            )
         if QI_MAXJ_BACKEND.strip().lower() == "physical" and frozen_physical_pitches is None:
             frozen_physical_pitches = tuple(
                 float(value) for value in problem.context.qi_maxj_physical_pitches
@@ -1107,15 +971,16 @@ def main() -> int:
         print(
             f"[setup] parameter_count={problem.parameter_count} "
             f"parameters={list(problem.parameter_labels)} "
+            f"profile_dofs={bool(args.profile_dofs)} "
             f"profile_scale_mode={PROFILE_SCALE_MODE} "
             f"profile_coordinates={PROFILE_COORDINATE_MODE} "
             f"trust_region_x_scale_mode={OPTIMIZER_TRUST_REGION_X_SCALE}",
             flush=True,
         )
         initial_evaluation = report("initial", problem, x0)
-        # Both physical maps have already been applied exactly once: response
-        # scaling for profiles and ESS for geometry.  Do not add a second,
-        # objective-dependent SciPy metric.
+        # Both physical maps have already been applied exactly once: nominal
+        # scaling for profiles and ESS for geometry.  Keep the original unit
+        # SciPy trust metric so neither map is applied a second time.
         trust_region_x_scale = np.ones((problem.parameter_count,), dtype=float)
         write_parameter_scaling_audit(
             out_dir,
@@ -1172,10 +1037,11 @@ def main() -> int:
             args.database_n_xi,
         ],
         "max_mode_schedule": list(max_modes),
-        "profile_parameters": PROFILE_PARAMETERS.split(","),
+        "profile_dofs_enabled": bool(args.profile_dofs),
+        "profile_parameters": (
+            PROFILE_PARAMETERS.split(",") if args.profile_dofs else []
+        ),
         "profile_scale_mode": PROFILE_SCALE_MODE,
-        "profile_response_rms_delta": PROFILE_RESPONSE_RMS_DELTA,
-        "profile_response_radial_weighting": PROFILE_RESPONSE_RADIAL_WEIGHTING,
         "profile_coordinate_mode": PROFILE_COORDINATE_MODE,
         "optimizer_trust_region_x_scale_mode": OPTIMIZER_TRUST_REGION_X_SCALE,
         "optimizer_trust_region_x_scale": np.asarray(

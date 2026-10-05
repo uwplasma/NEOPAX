@@ -163,43 +163,18 @@ def test_geometry_full_transport_problem_mixes_profile_and_boundary_scaling(monk
     )
 
 
-def test_combined_full_transport_profile_response_scaling_is_physical():
-    """Profile scales use baseline curves and not an objective Jacobian."""
+def test_combined_full_transport_example_uses_original_profile_coordinates():
+    assert combined_full_transport_example.PROFILE_SCALE_MODE == "nominal"
+    assert combined_full_transport_example.PROFILE_COORDINATE_MODE == "absolute"
+    assert combined_full_transport_example.OPTIMIZER_TRUST_REGION_X_SCALE == "unit"
 
-    rho = jnp.linspace(0.01, 0.99, 51, dtype=jnp.float64)
-    problem = SimpleNamespace(
-        baseline_profile_values=jnp.asarray(
-            [4.21, 17.8, 10.0, 2.0, 1.0, 1.0], dtype=jnp.float64
-        ),
-        config={"profiles": {"n_edge": 0.6, "T_edge": 0.7}},
-        runtime=SimpleNamespace(
-            geometry=SimpleNamespace(
-                r_grid=rho,
-                r_grid_half=jnp.linspace(0.0, 1.0, 52, dtype=jnp.float64),
-                Vprime=1.0 + rho,
-            )
-        ),
-    )
 
-    scales_10_percent = (
-        combined_full_transport_example.physical_profile_response_scales(
-            problem, rms_delta=0.1, radial_weighting="volume"
-        )
-    )
-    scales_20_percent = (
-        combined_full_transport_example.physical_profile_response_scales(
-            problem, rms_delta=0.2, radial_weighting="volume"
-        )
-    )
+def test_combined_full_transport_profile_dofs_cli_switch():
+    parser = combined_full_transport_example.parser()
 
-    assert scales_10_percent.shape == (6,)
-    assert bool(jnp.all(jnp.isfinite(scales_10_percent)))
-    assert bool(jnp.all(scales_10_percent > 0.0))
-    np.testing.assert_allclose(scales_20_percent, 2.0 * scales_10_percent)
-    assert not np.allclose(
-        np.asarray(scales_10_percent),
-        np.asarray(problem.baseline_profile_values),
-    )
+    assert parser.parse_args([]).profile_dofs is True
+    assert parser.parse_args(["--profile-dofs"]).profile_dofs is True
+    assert parser.parse_args(["--no-profile-dofs"]).profile_dofs is False
 
 
 def test_geometry_optimization_rejects_vmex_niter_exhaustion(monkeypatch):
