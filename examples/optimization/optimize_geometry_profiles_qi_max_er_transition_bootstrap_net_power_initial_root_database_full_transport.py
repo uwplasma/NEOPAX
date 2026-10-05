@@ -83,7 +83,14 @@ PROFILE_PARAMETERS = (
 )
 PROFILE_SCALE_MODE = "nominal"
 PROFILE_COORDINATE_MODE = "absolute"
-OPTIMIZER_TRUST_REGION_X_SCALE = "unit"
+# Weight-invariant block equilibration.  Residual-Jacobian rows are normalized
+# before comparing profile and geometry blocks, so multiplying an objective by
+# any nonzero least-squares weight leaves this metric unchanged.  Geometry gets
+# no additional per-mode scaling: all geometry entries remain one and the ESS
+# hierarchy is preserved exactly.
+OPTIMIZER_TRUST_REGION_X_SCALE = "row_equilibrated_block_rms"
+PROFILE_BLOCK_TRUST_SCALE_MIN = 0.1
+PROFILE_BLOCK_TRUST_SCALE_MAX = 10.0
 USE_PROFILE_DOFS = True
 PROFILE_PHYSICAL_LOWER = {
     "n0": 0.6,
@@ -438,6 +445,109 @@ def report(tag, problem, x):
     print(f"  residual_norm={np.linalg.norm(residuals):.6e}", flush=True)
     print(f"  jacobian_shape={jacobian.shape}", flush=True)
     return evaluation
+
+
+def row_equilibrated_block_trust_scale(problem, evaluation):
+    """Return an objective-weight-invariant profile/geometry block metric.
+
+    The Jacobian is already expressed in nominal profile coordinates and ESS
+    geometry coordinates.  Use only shared residual rows with nonzero response
+    in *both* blocks; geometry-only objectives cannot define a relative block
+    scale.  Normalize each shared row to unit Euclidean norm, which exactly
+    removes any nonzero scalar residual weight:
+    ``(w J_i) / ||w J_i|| = sign(w) J_i / ||J_i||``.  Then choose one common
+    profile scale so the profile and geometry blocks have equal mean squared
+    column norm.  Geometry entries remain exactly one, preserving every ESS
+    mode ratio, and the scale is frozen for the complete continuation stage.
+    """
+
+    labels = tuple(problem.parameter_labels)
+    jacobian = np.asarray(jax.device_get(evaluation.jacobian), dtype=float)
+    if jacobian.ndim != 2 or jacobian.shape[1] != len(labels):
+        raise ValueError(
+            "Block equilibration Jacobian columns do not match parameters: "
+            f"jacobian.shape={jacobian.shape}, parameter_count={len(labels)}."
+        )
+    if not np.all(np.isfinite(jacobian)):
+        raise ValueError("Block equilibration requires a finite initial Jacobian.")
+
+    profile_mask = np.asarray(
+        [label in PROFILE_PHYSICAL_LOWER for label in labels], dtype=bool
+    )
+    geometry_mask = ~profile_mask
+    trust_scale = np.ones((len(labels),), dtype=float)
+    if not np.any(profile_mask) or not np.any(geometry_mask):
+        print(
+            "[block-scaling] only one parameter block is active; using unit "
+            "additional SciPy trust scaling",
+            flush=True,
+        )
+        return trust_scale
+
+    profile_row_norms = np.linalg.norm(jacobian[:, profile_mask], axis=1)
+    geometry_row_norms = np.linalg.norm(jacobian[:, geometry_mask], axis=1)
+    shared = (profile_row_norms > 0.0) & (geometry_row_norms > 0.0)
+    if not np.any(shared):
+        print(
+            "[block-scaling] no residual row is shared by profile and geometry "
+            "blocks; using unit additional SciPy trust scaling",
+            flush=True,
+        )
+        return trust_scale
+    shared_jacobian = jacobian[shared]
+    row_norms = np.linalg.norm(shared_jacobian, axis=1)
+    equilibrated = shared_jacobian / row_norms[:, None]
+
+    def _block_rms(mask, name):
+        block = equilibrated[:, mask]
+        mean_squared_column_norm = float(
+            np.sum(block * block) / block.shape[1]
+        )
+        if (
+            not np.isfinite(mean_squared_column_norm)
+            or mean_squared_column_norm <= 0.0
+        ):
+            raise ValueError(
+                "Cannot construct block trust scaling: the row-equilibrated "
+                f"{name} block has nonpositive mean squared column norm."
+            )
+        return float(np.sqrt(mean_squared_column_norm))
+
+    profile_rms = _block_rms(profile_mask, "profile")
+    geometry_rms = _block_rms(geometry_mask, "geometry")
+    raw_profile_scale = geometry_rms / profile_rms
+    profile_scale = float(
+        np.clip(
+            raw_profile_scale,
+            PROFILE_BLOCK_TRUST_SCALE_MIN,
+            PROFILE_BLOCK_TRUST_SCALE_MAX,
+        )
+    )
+    trust_scale[profile_mask] = profile_scale
+    print(
+        "[block-scaling] mode=row_equilibrated_block_rms "
+        f"shared_rows={int(np.count_nonzero(shared))} "
+        f"profile_rms={profile_rms:.6e} geometry_ess_rms={geometry_rms:.6e} "
+        f"raw_profile_scale={raw_profile_scale:.6e} "
+        f"frozen_profile_scale={profile_scale:.6e} "
+        "geometry_additional_scale=1.000000e+00 weight_invariant=True",
+        flush=True,
+    )
+    return trust_scale
+
+
+def optimizer_trust_region_x_scale(problem, evaluation):
+    """Return the explicitly selected additional optimizer metric."""
+
+    mode = str(OPTIMIZER_TRUST_REGION_X_SCALE).strip().lower()
+    if mode == "unit":
+        return np.ones((problem.parameter_count,), dtype=float)
+    if mode == "row_equilibrated_block_rms":
+        return row_equilibrated_block_trust_scale(problem, evaluation)
+    raise ValueError(
+        "OPTIMIZER_TRUST_REGION_X_SCALE must be 'unit' or "
+        f"'row_equilibrated_block_rms'; got {OPTIMIZER_TRUST_REGION_X_SCALE!r}."
+    )
 
 
 def write_parameter_scaling_audit(
@@ -960,9 +1070,22 @@ def main() -> int:
             frozen_physical_pitches = tuple(
                 float(value) for value in problem.context.qi_maxj_physical_pitches
             )
-        problem = CombinedTrialSavingProblem(
-            problem, out_dir / f"combined_inputs_m{max_mode}", max_mode
-        )
+        if args.profile_dofs:
+            problem = CombinedTrialSavingProblem(
+                problem, out_dir / f"combined_inputs_m{max_mode}", max_mode
+            )
+        else:
+            # Keep the geometry-only lane numerically identical to the
+            # standalone example while remaining an independent execution of
+            # this script.  In particular, do not introduce profile bounds or
+            # an additional optimizer metric when no profile variables exist.
+            problem = opt.GeometryInputSavingProblem(
+                problem,
+                out_dir / f"geometry_inputs_m{max_mode}",
+                filename_prefix=(
+                    "input.QI_neopax_database_full_transport_net_power_eval"
+                ),
+            )
         x0 = np.asarray(jax.device_get(problem.x0), dtype=float)
         if initial_input is None:
             initial_input = problem.input_from_scaled_parameters(x0)
@@ -974,33 +1097,47 @@ def main() -> int:
             f"profile_dofs={bool(args.profile_dofs)} "
             f"profile_scale_mode={PROFILE_SCALE_MODE} "
             f"profile_coordinates={PROFILE_COORDINATE_MODE} "
-            f"trust_region_x_scale_mode={OPTIMIZER_TRUST_REGION_X_SCALE}",
+            "trust_region_x_scale_mode="
+            f"{OPTIMIZER_TRUST_REGION_X_SCALE if args.profile_dofs else 'unit'}",
             flush=True,
         )
         initial_evaluation = report("initial", problem, x0)
-        # Both physical maps have already been applied exactly once: nominal
-        # scaling for profiles and ESS for geometry.  Keep the original unit
-        # SciPy trust metric so neither map is applied a second time.
-        trust_region_x_scale = np.ones((problem.parameter_count,), dtype=float)
-        write_parameter_scaling_audit(
-            out_dir,
-            max_mode,
-            problem,
-            x0,
-            initial_evaluation,
-            trust_region_x_scale,
-        )
-        last_result = opt.least_squares(
-            problem,
-            max_nfev=args.max_nfev,
-            ftol=FTOL,
-            xtol=XTOL,
-            x_scale=trust_region_x_scale,
-            bounds=scaled_bounds(problem),
-            verbose=1,
-            iteration_reporter=geometry_example.iteration_diagnostics,
-            initial_evaluation=initial_evaluation,
-        )
+        least_squares_options = {
+            "max_nfev": args.max_nfev,
+            "ftol": FTOL,
+            "xtol": XTOL,
+            "verbose": 1,
+            "iteration_reporter": geometry_example.iteration_diagnostics,
+            "initial_evaluation": initial_evaluation,
+        }
+        if args.profile_dofs:
+            # Both physical maps have already been applied exactly once:
+            # nominal profiles and ESS geometry. Row equilibration derives one
+            # additional profile-block trust metric while leaving every
+            # geometry entry exactly one.
+            trust_region_x_scale = optimizer_trust_region_x_scale(
+                problem, initial_evaluation
+            )
+            least_squares_options.update(
+                x_scale=trust_region_x_scale,
+                bounds=scaled_bounds(problem),
+            )
+            write_parameter_scaling_audit(
+                out_dir,
+                max_mode,
+                problem,
+                x0,
+                initial_evaluation,
+                trust_region_x_scale,
+            )
+        else:
+            # Match the standalone geometry-only call: opt.least_squares adds
+            # its unit SciPy x_scale default and SciPy supplies unbounded
+            # bounds.  Omitting both keywords is intentional.
+            trust_region_x_scale = np.ones(
+                (problem.parameter_count,), dtype=float
+            )
+        last_result = opt.least_squares(problem, **least_squares_options)
         x_opt = np.asarray(last_result.x, dtype=float)
         report(f"combined stage {max_mode}", problem, x_opt)
         optimized_input = problem.input_from_scaled_parameters(x_opt)
@@ -1010,7 +1147,12 @@ def main() -> int:
         optimized_input.to_indata(stage_input)
         print(f"wrote {stage_input}")
         current_input = stage_input
-        current_config = optimized_config
+        if args.profile_dofs:
+            # Profile changes live in the transport config and must seed a
+            # later continuation stage. Geometry-only continuation, like the
+            # standalone example, keeps the original transport config and
+            # advances only through the written VMEC input.
+            current_config = optimized_config
         last_problem = problem
 
     if any(
@@ -1043,7 +1185,14 @@ def main() -> int:
         ),
         "profile_scale_mode": PROFILE_SCALE_MODE,
         "profile_coordinate_mode": PROFILE_COORDINATE_MODE,
-        "optimizer_trust_region_x_scale_mode": OPTIMIZER_TRUST_REGION_X_SCALE,
+        "optimizer_trust_region_x_scale_mode": (
+            OPTIMIZER_TRUST_REGION_X_SCALE if args.profile_dofs else "unit"
+        ),
+        "profile_block_trust_scale_bounds": (
+            [PROFILE_BLOCK_TRUST_SCALE_MIN, PROFILE_BLOCK_TRUST_SCALE_MAX]
+            if args.profile_dofs
+            else None
+        ),
         "optimizer_trust_region_x_scale": np.asarray(
             trust_region_x_scale, dtype=float
         ).tolist(),

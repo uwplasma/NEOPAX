@@ -166,7 +166,42 @@ def test_geometry_full_transport_problem_mixes_profile_and_boundary_scaling(monk
 def test_combined_full_transport_example_uses_original_profile_coordinates():
     assert combined_full_transport_example.PROFILE_SCALE_MODE == "nominal"
     assert combined_full_transport_example.PROFILE_COORDINATE_MODE == "absolute"
-    assert combined_full_transport_example.OPTIMIZER_TRUST_REGION_X_SCALE == "unit"
+    assert (
+        combined_full_transport_example.OPTIMIZER_TRUST_REGION_X_SCALE
+        == "row_equilibrated_block_rms"
+    )
+
+
+def test_combined_block_equilibration_is_invariant_to_objective_weights():
+    labels = ("n0", "T0", "RBC:1:0", "ZBS:2:1")
+    base_jacobian = np.asarray(
+        [
+            [1.0, 0.0, 4.0, 0.0],
+            [0.0, 1.0, 0.0, 4.0],
+            # A geometry-only objective must not affect cross-block scaling.
+            [0.0, 0.0, 1.0e9, 0.0],
+        ]
+    )
+    problem = SimpleNamespace(parameter_labels=labels, parameter_count=len(labels))
+    base = SimpleNamespace(jacobian=jnp.asarray(base_jacobian))
+    weighted = SimpleNamespace(
+        jacobian=jnp.asarray(
+            np.asarray([1.0e4, 1.0e-4, 1.0e8])[:, None] * base_jacobian
+        )
+    )
+
+    base_scale = combined_full_transport_example.row_equilibrated_block_trust_scale(
+        problem, base
+    )
+    weighted_scale = (
+        combined_full_transport_example.row_equilibrated_block_trust_scale(
+            problem, weighted
+        )
+    )
+
+    np.testing.assert_allclose(base_scale, [4.0, 4.0, 1.0, 1.0])
+    np.testing.assert_allclose(weighted_scale, base_scale, rtol=1.0e-12, atol=0.0)
+    np.testing.assert_array_equal(weighted_scale[2:], np.ones(2))
 
 
 def test_combined_full_transport_profile_dofs_cli_switch():
