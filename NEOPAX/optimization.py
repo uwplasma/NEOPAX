@@ -993,22 +993,15 @@ class GeometryFullTransportLeastSquaresProblem:
             name: self.profile_scales[i]
             for i, name in enumerate(PROFILE_PARAMETER_ORDER)
         }
-        geometry_scale_lookup = {
-            spec: scale
-            for spec, scale in zip(
-                self.parameterization.specs,
-                self.parameterization.scales,
-                strict=True,
-            )
-        }
-        return jnp.asarray(
-            [
-                profile_scale_lookup[spec.name]
-                if isinstance(spec, ProfileParameterSpec)
-                else geometry_scale_lookup[spec]
-                for spec in self.parameter_set.specs
-            ],
+        profile_scale = jnp.asarray(
+            [profile_scale_lookup[spec.name] for spec in self.parameter_set.profile_specs],
             dtype=jnp.float64,
+        )
+        # The geometry block is the exact validated ESS vector. Profile
+        # support is composed in front of it and never reconstructs or
+        # reinterprets any geometry scale.
+        return jnp.concatenate(
+            (profile_scale, self.parameterization.x_scale), axis=0
         )
 
     def _scaled_to_physical(self, scaled_parameter_values):
@@ -1021,7 +1014,31 @@ class GeometryFullTransportLeastSquaresProblem:
         if not self.parameter_set.profile_specs:
             return self.parameterization.scaled_to_physical_delta(scaled_values)
 
-        physical_values = scaled_values * self.x_scale
+        profile_count = len(self.parameter_set.profile_specs)
+        profile_scaled = scaled_values[:profile_count]
+        geometry_scaled = scaled_values[profile_count:]
+        if tuple(self.parameter_set.vmec_boundary_specs) != tuple(
+            self.parameterization.specs
+        ):
+            raise ValueError(
+                "Mixed full-transport parameters must retain the validated "
+                "geometry parameterization order."
+            )
+        geometry_physical = self.parameterization.scaled_to_physical_delta(
+            geometry_scaled
+        )
+        profile_scale_lookup = {
+            name: self.profile_scales[i]
+            for i, name in enumerate(PROFILE_PARAMETER_ORDER)
+        }
+        active_profile_scales = jnp.asarray(
+            [
+                profile_scale_lookup[spec.name]
+                for spec in self.parameter_set.profile_specs
+            ],
+            dtype=jnp.float64,
+        )
+        profile_physical = profile_scaled * active_profile_scales
         profile_coordinate_mode = str(self.profile_coordinate_mode).strip().lower()
         if profile_coordinate_mode not in {"absolute", "delta"}:
             raise ValueError(
@@ -1032,12 +1049,15 @@ class GeometryFullTransportLeastSquaresProblem:
             profile_lookup = {
                 name: i for i, name in enumerate(PROFILE_PARAMETER_ORDER)
             }
-            for i, spec in enumerate(self.parameter_set.specs):
-                if isinstance(spec, ProfileParameterSpec):
-                    physical_values = physical_values.at[i].add(
-                        self.baseline_profile_values[profile_lookup[spec.name]]
-                    )
-        return physical_values
+            profile_baseline = jnp.asarray(
+                [
+                    self.baseline_profile_values[profile_lookup[spec.name]]
+                    for spec in self.parameter_set.profile_specs
+                ],
+                dtype=jnp.float64,
+            )
+            profile_physical = profile_physical + profile_baseline
+        return jnp.concatenate((profile_physical, geometry_physical), axis=0)
 
     def evaluate(self, scaled_parameter_values=None) -> LeastSquaresEvaluation:
         physical_values = self._scaled_to_physical(
@@ -1107,14 +1127,8 @@ class GeometryFullTransportLeastSquaresProblem:
                 self.context, physical_values, entries
             )
 
-        geometry_values = jnp.asarray(
-            [
-                physical_values[i]
-                for i, spec in enumerate(self.parameter_set.specs)
-                if not isinstance(spec, ProfileParameterSpec)
-            ],
-            dtype=jnp.float64,
-        )
+        profile_count = len(self.parameter_set.profile_specs)
+        geometry_values = physical_values[profile_count:]
         entries = boundary_param_entries(self.context, self.parameterization.vmec_tuples)
         return _input_with_boundary_deltas(self.context, geometry_values, entries)
 

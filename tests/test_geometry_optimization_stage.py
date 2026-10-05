@@ -247,6 +247,75 @@ def test_geometry_full_transport_geometry_only_uses_exact_legacy_scaling_path(
     )
 
 
+def test_combined_full_transport_composes_profiles_around_exact_geometry_map(
+    monkeypatch,
+):
+    """Adding profiles leaves every geometry coordinate and delta unchanged."""
+
+    geometry_specs = optimization.parse_vmec_boundary_parameter_specs(
+        "RBC:1:0,ZBS:2:1"
+    )
+    parameterization = optimization.VmexBoundaryParameterization(
+        specs=geometry_specs, scales=(0.5, 0.125), scale_mode="ess"
+    )
+    geometry_parameter_set = optimization.reverse_ad_optimization_parameter_set(
+        include_profiles=False, vmec_boundary=geometry_specs
+    )
+    mixed_parameter_set = optimization.reverse_ad_optimization_parameter_set(
+        include_profiles=True,
+        profiles=("n0", "T0"),
+        vmec_boundary=geometry_specs,
+    )
+    baseline_profiles = jnp.asarray([4.0, 10.0, 2.0, 3.0, 1.5, 0.8])
+    profile_scales = jnp.asarray([4.0, 10.0, 2.0, 3.0, 1.5, 0.8])
+    common = dict(
+        config={"profiles": {}},
+        context=object(),
+        runtime=object(),
+        baseline_state=object(),
+        baseline_profile_values=baseline_profiles,
+        profile_scales=profile_scales,
+        parameterization=parameterization,
+        terms=(),
+        table_context=object(),
+        table_result_builder=object(),
+        options={},
+    )
+    geometry_problem = optimization.GeometryFullTransportLeastSquaresProblem(
+        parameter_set=geometry_parameter_set, **common
+    )
+    mixed_problem = optimization.GeometryFullTransportLeastSquaresProblem(
+        parameter_set=mixed_parameter_set, **common
+    )
+
+    geometry_x = jnp.asarray([2.0, -4.0])
+    mixed_x = jnp.asarray([1.25, 0.9, *np.asarray(geometry_x)])
+    geometry_physical = geometry_problem._scaled_to_physical(geometry_x)
+    mixed_physical = mixed_problem._scaled_to_physical(mixed_x)
+
+    np.testing.assert_array_equal(
+        np.asarray(mixed_problem.x_scale[-2:]),
+        np.asarray(geometry_problem.x_scale),
+    )
+    np.testing.assert_array_equal(
+        np.asarray(mixed_physical[-2:]), np.asarray(geometry_physical)
+    )
+    np.testing.assert_allclose(np.asarray(mixed_physical[:2]), [5.0, 9.0])
+
+    monkeypatch.setattr(
+        optimization, "boundary_param_entries", lambda *_args: object()
+    )
+    monkeypatch.setattr(
+        optimization,
+        "_input_with_boundary_deltas",
+        lambda _context, deltas, _entries: np.asarray(deltas),
+    )
+    np.testing.assert_array_equal(
+        mixed_problem.input_from_scaled_parameters(mixed_x),
+        geometry_problem.input_from_scaled_parameters(geometry_x),
+    )
+
+
 def test_combined_full_transport_example_uses_original_profile_coordinates():
     assert combined_full_transport_example.PROFILE_SCALE_MODE == "nominal"
     assert combined_full_transport_example.PROFILE_COORDINATE_MODE == "absolute"
@@ -294,6 +363,19 @@ def test_combined_full_transport_profile_dofs_cli_switch():
     assert parser.parse_args([]).profile_dofs is True
     assert parser.parse_args(["--profile-dofs"]).profile_dofs is True
     assert parser.parse_args(["--no-profile-dofs"]).profile_dofs is False
+
+    assert combined_full_transport_example.optional_profile_problem_kwargs(False) == {}
+    profile_kwargs = (
+        combined_full_transport_example.optional_profile_problem_kwargs(True)
+    )
+    assert profile_kwargs == {
+        "include_profiles": True,
+        "profile_parameters": combined_full_transport_example.PROFILE_PARAMETERS,
+        "profile_scale_mode": combined_full_transport_example.PROFILE_SCALE_MODE,
+        "profile_coordinate_mode": (
+            combined_full_transport_example.PROFILE_COORDINATE_MODE
+        ),
+    }
 
 
 def test_geometry_optimization_rejects_vmex_niter_exhaustion(monkeypatch):

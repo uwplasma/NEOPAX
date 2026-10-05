@@ -27,7 +27,6 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from NEOPAX import optimization as opt  # noqa: E402
-from NEOPAX._orchestrator import load_config  # noqa: E402
 from examples.optimization import (  # noqa: E402
     optimize_geometry_qi_max_er_transition_bootstrap_net_power_initial_root_database_full_transport
     as geometry_example,
@@ -35,46 +34,36 @@ from examples.optimization import (  # noqa: E402
 
 
 # --------------------------- editable settings -----------------------------
-SEED_INPUT = ROOT / "examples" / "inputs" / "input.QI_nfp2_initial"
-TRANSPORT_CONFIG = (
-    ROOT / "examples" / "optimization" / "full_transport_database_vacuum_t2.toml"
-)
+# Geometry, transport, and objective defaults have one source of truth: the
+# standalone geometry example. This script adds only the profile block below.
+SEED_INPUT = geometry_example.SEED_INPUT
+TRANSPORT_CONFIG = geometry_example.TRANSPORT_CONFIG
 OUT_DIR = (
     ROOT
     / "outputs"
     / "geometry_profiles_qi_max_er_transition_bootstrap_net_power_initial_root_database_full_transport_optimization"
 )
 
-DATABASE_N_THETA, DATABASE_N_PHI, DATABASE_N_XI = 25, 25, 33
-SURFACES = np.asarray(
-    [
-        1 / 51,
-        5 / 51,
-        10 / 51,
-        15 / 51,
-        20 / 51,
-        25 / 51,
-        30 / 51,
-        35 / 51,
-        40 / 51,
-        45 / 51,
-        51 / 51,
-    ],
-    dtype=float,
-)
-QI_MBOZ = 18
-QI_NBOZ = 18
-QI_MAXJ_BACKEND = "surrogate"
-PHYSICAL_J_PITCHES = None
-PHYSICAL_J_TRAPPING_DEPTHS = (0.35, 0.55, 0.75)
-PHYSICAL_J_NALPHA, PHYSICAL_J_POINTS_PER_PERIOD = 5, 24
-PHYSICAL_J_NUM_PERIODS, PHYSICAL_J_MAX_WELLS = 6, 16
-PHYSICAL_J_QUADRATURE_ORDER, PHYSICAL_MAXJ_TARGET = 16, 0.0
+DATABASE_N_THETA = geometry_example.DATABASE_N_THETA
+DATABASE_N_PHI = geometry_example.DATABASE_N_PHI
+DATABASE_N_XI = geometry_example.DATABASE_N_XI
+SURFACES = np.asarray(geometry_example.SURFACES, dtype=float)
+QI_MBOZ = geometry_example.QI_MBOZ
+QI_NBOZ = geometry_example.QI_NBOZ
+QI_MAXJ_BACKEND = geometry_example.QI_MAXJ_BACKEND
+PHYSICAL_J_PITCHES = geometry_example.PHYSICAL_J_PITCHES
+PHYSICAL_J_TRAPPING_DEPTHS = geometry_example.PHYSICAL_J_TRAPPING_DEPTHS
+PHYSICAL_J_NALPHA = geometry_example.PHYSICAL_J_NALPHA
+PHYSICAL_J_POINTS_PER_PERIOD = geometry_example.PHYSICAL_J_POINTS_PER_PERIOD
+PHYSICAL_J_NUM_PERIODS = geometry_example.PHYSICAL_J_NUM_PERIODS
+PHYSICAL_J_MAX_WELLS = geometry_example.PHYSICAL_J_MAX_WELLS
+PHYSICAL_J_QUADRATURE_ORDER = geometry_example.PHYSICAL_J_QUADRATURE_ORDER
+PHYSICAL_MAXJ_TARGET = geometry_example.PHYSICAL_MAXJ_TARGET
 
-MAX_MODE_SCHEDULE = 2
-GEOMETRY_FAMILIES = "RBC,ZBS"
-GEOMETRY_SCALE_MODE = "ess"
-ESS_ALPHA = 1.2
+MAX_MODE_SCHEDULE = geometry_example.MAX_MODE_SCHEDULE
+GEOMETRY_FAMILIES = geometry_example.GEOMETRY_FAMILIES
+GEOMETRY_SCALE_MODE = geometry_example.SCALE_MODE
+ESS_ALPHA = geometry_example.ESS_ALPHA
 
 # All supported analytical-profile DoFs, explicitly editable here.
 PROFILE_PARAMETERS = (
@@ -109,47 +98,62 @@ PROFILE_PHYSICAL_UPPER = {
     "temperature_shape_alpha": 12.0,
 }
 
-FULL_TRANSPORT_ACCEPTED_STEP_LIMIT = None
-REVERSE_SEGMENT_LENGTH = 50
-MAX_REVERSE_ACCEPTED_STEPS = 500
-TRANSPORT_MAX_STEPS = 1000
-TRANSPORT_FINAL_TIME = 2.0
-REVERSE_STAGE_MODE = "database_full_transport_optimization"
-PRINT_FINAL_SOFTMAX_ER = True
+FULL_TRANSPORT_ACCEPTED_STEP_LIMIT = (
+    geometry_example.FULL_TRANSPORT_ACCEPTED_STEP_LIMIT
+)
+REVERSE_SEGMENT_LENGTH = geometry_example.REVERSE_SEGMENT_LENGTH
+MAX_REVERSE_ACCEPTED_STEPS = geometry_example.MAX_REVERSE_ACCEPTED_STEPS
+TRANSPORT_MAX_STEPS = geometry_example.TRANSPORT_MAX_STEPS
+TRANSPORT_FINAL_TIME = geometry_example.TRANSPORT_FINAL_TIME
+REVERSE_STAGE_MODE = geometry_example.REVERSE_STAGE_MODE
+PRINT_FINAL_SOFTMAX_ER = geometry_example.PRINT_FINAL_SOFTMAX_ER
 
-ASPECT_TARGET, IOTA_TARGET, MIRROR_TARGET = 10.0, -0.61, 0.25
-MAX_ER_TARGET = 25.0
-ER_TRANSITION_LEFT_TARGET, ER_TRANSITION_RIGHT_TARGET = 26.0, -10.0
-ER_TRANSITION_LEFT_INDEX, ER_TRANSITION_RIGHT_INDEX = 25, 26
-ER_TRANSITION_RHO_TARGET = 0.514
-ER_TRANSITION_RHO_MIN, ER_TRANSITION_RHO_MAX = 0.05, 0.9
-ER_TRANSITION_TEMPERATURE_KV_M = 2.0
-ER_TRANSITION_RHO_SOFTNESS = 0.05
-ER_TRANSITION_SOFTMAX_BETA = 16.0
-ER_TRANSITION_STRENGTH_TARGET = 0.90
-BOOTSTRAP_LIMIT_SCALED = 0.1
-NET_POWER_TARGET_MW = 300.0
-NET_POWER_REFERENCE_VOLUME_M3 = 331.0187969899648
-NET_POWER_TARGET_MW_M3 = NET_POWER_TARGET_MW / NET_POWER_REFERENCE_VOLUME_M3
+ASPECT_TARGET = geometry_example.ASPECT_TARGET
+IOTA_TARGET = geometry_example.IOTA_TARGET
+MIRROR_TARGET = geometry_example.MIRROR_TARGET
+MAX_ER_TARGET = geometry_example.MAX_ER_TARGET
+ER_TRANSITION_LEFT_TARGET = geometry_example.ER_TRANSITION_LEFT_TARGET
+ER_TRANSITION_RIGHT_TARGET = geometry_example.ER_TRANSITION_RIGHT_TARGET
+ER_TRANSITION_LEFT_INDEX = geometry_example.ER_TRANSITION_LEFT_INDEX
+ER_TRANSITION_RIGHT_INDEX = geometry_example.ER_TRANSITION_RIGHT_INDEX
+ER_TRANSITION_RHO_TARGET = geometry_example.ER_TRANSITION_RHO_TARGET
+ER_TRANSITION_RHO_MIN = geometry_example.ER_TRANSITION_RHO_MIN
+ER_TRANSITION_RHO_MAX = geometry_example.ER_TRANSITION_RHO_MAX
+ER_TRANSITION_TEMPERATURE_KV_M = geometry_example.ER_TRANSITION_TEMPERATURE_KV_M
+ER_TRANSITION_RHO_SOFTNESS = geometry_example.ER_TRANSITION_RHO_SOFTNESS
+ER_TRANSITION_SOFTMAX_BETA = geometry_example.ER_TRANSITION_SOFTMAX_BETA
+ER_TRANSITION_STRENGTH_TARGET = geometry_example.ER_TRANSITION_STRENGTH_TARGET
+BOOTSTRAP_LIMIT_SCALED = geometry_example.BOOTSTRAP_LIMIT_SCALED
+NET_POWER_TARGET_MW = geometry_example.NET_POWER_TARGET_MW
+NET_POWER_REFERENCE_VOLUME_M3 = geometry_example.NET_POWER_REFERENCE_VOLUME_M3
+NET_POWER_TARGET_MW_M3 = geometry_example.NET_POWER_TARGET_MW_M3
 
-QI_WEIGHT, MAXJ_WEIGHT = 1.0, 0.0
-ASPECT_WEIGHT, IOTA_WEIGHT, MIRROR_WEIGHT = 1.0, 1.0, 100.0
-MAX_ER_WEIGHT = 0.5
-ER_TRANSITION_LEFT_WEIGHT, ER_TRANSITION_RIGHT_WEIGHT = 0.09, 0.09
-ER_TRANSITION_RHO_WEIGHT = 1000.0
-ER_TRANSITION_STRENGTH_WEIGHT = 100.0
-BOOTSTRAP_WEIGHT, NET_POWER_WEIGHT = 4.0, 10000.0
+QI_WEIGHT = geometry_example.QI_WEIGHT
+MAXJ_WEIGHT = geometry_example.MAXJ_WEIGHT
+ASPECT_WEIGHT = geometry_example.ASPECT_WEIGHT
+IOTA_WEIGHT = geometry_example.IOTA_WEIGHT
+MIRROR_WEIGHT = geometry_example.MIRROR_WEIGHT
+MAX_ER_WEIGHT = geometry_example.MAX_ER_WEIGHT
+ER_TRANSITION_LEFT_WEIGHT = geometry_example.ER_TRANSITION_LEFT_WEIGHT
+ER_TRANSITION_RIGHT_WEIGHT = geometry_example.ER_TRANSITION_RIGHT_WEIGHT
+ER_TRANSITION_RHO_WEIGHT = geometry_example.ER_TRANSITION_RHO_WEIGHT
+ER_TRANSITION_STRENGTH_WEIGHT = geometry_example.ER_TRANSITION_STRENGTH_WEIGHT
+BOOTSTRAP_WEIGHT = geometry_example.BOOTSTRAP_WEIGHT
+NET_POWER_WEIGHT = geometry_example.NET_POWER_WEIGHT
 
-USE_MAX_ER_OBJECTIVE = False
-USE_ER_TRANSITION_OBJECTIVES = False
-USE_ER_TRANSITION_LOCATION_OBJECTIVE = True
-USE_BOOTSTRAP_PENALTY = True
-USE_NET_POWER_OBJECTIVE = True
+USE_MAX_ER_OBJECTIVE = geometry_example.USE_MAX_ER_OBJECTIVE
+USE_ER_TRANSITION_OBJECTIVES = geometry_example.USE_ER_TRANSITION_OBJECTIVES
+USE_ER_TRANSITION_LOCATION_OBJECTIVE = (
+    geometry_example.USE_ER_TRANSITION_LOCATION_OBJECTIVE
+)
+USE_BOOTSTRAP_PENALTY = geometry_example.USE_BOOTSTRAP_PENALTY
+USE_NET_POWER_OBJECTIVE = geometry_example.USE_NET_POWER_OBJECTIVE
 
-NFEV = 30
-FTOL, XTOL = 1.0e-6, 1.0e-10
-GEOMETRY_MAX_ITER = None
-SOLVER_DEVICE = "default"
+NFEV = geometry_example.NFEV
+FTOL = geometry_example.FTOL
+XTOL = geometry_example.XTOL
+GEOMETRY_MAX_ITER = geometry_example.GEOMETRY_MAX_ITER
+SOLVER_DEVICE = geometry_example.SOLVER_DEVICE
 
 
 def parser() -> argparse.ArgumentParser:
@@ -244,123 +248,15 @@ def parser() -> argparse.ArgumentParser:
 
 
 def transport_config(args: argparse.Namespace) -> dict:
-    config = copy.deepcopy(load_config(TRANSPORT_CONFIG))
-    neoclassical = config.setdefault("neoclassical", {})
-    neoclassical["ntx_scan_n_theta"] = int(args.database_n_theta)
-    neoclassical["ntx_scan_n_zeta"] = int(args.database_n_phi)
-    neoclassical["ntx_scan_n_xi"] = int(args.database_n_xi)
-    solver = config.setdefault("transport_solver", {})
-    solver["t_final"] = float(TRANSPORT_FINAL_TIME)
-    solver["max_steps"] = int(TRANSPORT_MAX_STEPS)
-    return config
+    return geometry_example.transport_config(args)
 
 
 def qi_maxj_backend_settings(physical_pitches=None):
-    return opt.QImaxJBackendSettings(
-        backend=QI_MAXJ_BACKEND,
-        physical_pitches=(
-            PHYSICAL_J_PITCHES if physical_pitches is None else physical_pitches
-        ),
-        trapping_depths=PHYSICAL_J_TRAPPING_DEPTHS,
-        physical_nalpha=PHYSICAL_J_NALPHA,
-        physical_points_per_period=PHYSICAL_J_POINTS_PER_PERIOD,
-        physical_num_periods=PHYSICAL_J_NUM_PERIODS,
-        physical_max_wells=PHYSICAL_J_MAX_WELLS,
-        physical_quadrature_order=PHYSICAL_J_QUADRATURE_ORDER,
-        physical_maxj_target=PHYSICAL_MAXJ_TARGET,
-    )
-
-
-def positive_part(value):
-    return jnp.maximum(value, 0.0)
-
-
-def smooth_positive_part(value, eps: float = 1.0e-6):
-    value_arr = jnp.asarray(value)
-    eps_arr = jnp.asarray(eps, dtype=value_arr.dtype)
-    return 0.5 * (
-        value_arr + jnp.sqrt(value_arr * value_arr + eps_arr * eps_arr)
-    )
-
-
-mirror_penalization = opt.transformed_geometry_objective(
-    opt.geometry.vmec_mirror_ratio,
-    lambda value: positive_part(value - MIRROR_TARGET),
-    label="mirror_penalization",
-)
-bootstrap_penalty = opt.transformed_transport_objective(
-    opt.transport.bootstrap_current_softmax_abs_scaled,
-    lambda value: positive_part(value - BOOTSTRAP_LIMIT_SCALED),
-    label="bootstrap_current_penalty",
-)
+    return geometry_example.qi_maxj_backend_settings(physical_pitches)
 
 
 def active_terms(args: argparse.Namespace):
-    terms = [
-        (opt.geometry.boozer_qi_objective, 0.0, QI_WEIGHT),
-        (opt.geometry.boozer_maxj_objective, 0.0, MAXJ_WEIGHT),
-        (mirror_penalization, 0.0, MIRROR_WEIGHT),
-        (opt.geometry.vmec_aspect_ratio, ASPECT_TARGET, ASPECT_WEIGHT),
-        (opt.geometry.vmec_iota_mean, IOTA_TARGET, IOTA_WEIGHT),
-    ]
-    if args.max_er:
-        terms.append((opt.transport.softmax_Er, MAX_ER_TARGET, MAX_ER_WEIGHT))
-    if args.root_objectives:
-        terms.extend(
-            [
-                (
-                    opt.transport.Er_transition_left,
-                    ER_TRANSITION_LEFT_TARGET,
-                    ER_TRANSITION_LEFT_WEIGHT,
-                ),
-                (
-                    opt.transport.Er_transition_right,
-                    ER_TRANSITION_RIGHT_TARGET,
-                    ER_TRANSITION_RIGHT_WEIGHT,
-                ),
-            ]
-        )
-    if args.transition_location_objective:
-        strength_deficit = opt.transformed_transport_objective(
-            opt.transport.Er_transition_strength,
-            lambda strength: smooth_positive_part(
-                args.er_transition_strength_target - strength
-            ),
-            label="Er_transition_strength_deficit",
-        )
-        terms.extend(
-            [
-                (opt.transport.Er_transition_rho, 0.0, 0.0),
-                (
-                    opt.transport.Er_transition_location_moment,
-                    0.0,
-                    ER_TRANSITION_RHO_WEIGHT,
-                ),
-                (opt.transport.Er_transition_strength, 0.0, 0.0),
-                (strength_deficit, 0.0, ER_TRANSITION_STRENGTH_WEIGHT),
-            ]
-        )
-    if args.bootstrap_penalty:
-        terms.append((bootstrap_penalty, 0.0, BOOTSTRAP_WEIGHT))
-    if args.net_power:
-        terms.append(
-            (
-                opt.transport.net_total_power_volume_average_mw_m3,
-                NET_POWER_TARGET_MW_M3,
-                NET_POWER_WEIGHT,
-            )
-        )
-    if not any(
-        (
-            term[0].objective.family
-            if hasattr(term[0], "objective")
-            else term[0].family
-        )
-        == "transport"
-        for term in terms
-    ):
-        raise ValueError("Enable at least one full-transport objective.")
-    return tuple(terms)
+    return geometry_example.active_terms(args)
 
 
 def profile_parameter_values(problem, x) -> dict[str, float]:
@@ -376,6 +272,19 @@ def profile_parameter_values(problem, x) -> dict[str, float]:
         "temperature_shape_alpha",
     )
     return dict(zip(names, values.tolist(), strict=True))
+
+
+def optional_profile_problem_kwargs(enabled: bool) -> dict[str, object]:
+    """Return only the opt-in profile extension to the geometry problem."""
+
+    if not enabled:
+        return {}
+    return {
+        "include_profiles": True,
+        "profile_parameters": PROFILE_PARAMETERS,
+        "profile_scale_mode": PROFILE_SCALE_MODE,
+        "profile_coordinate_mode": PROFILE_COORDINATE_MODE,
+    }
 
 
 def scaled_bounds(problem):
@@ -1023,15 +932,9 @@ def main() -> int:
             f"J_backend={QI_MAXJ_BACKEND} =====",
             flush=True,
         )
-        problem = opt.geometry_full_transport_least_squares_problem(
-            current_config,
-            terms,
+        problem_kwargs = dict(
             vmec_input=current_input,
             max_mode=max_mode,
-            include_profiles=bool(args.profile_dofs),
-            profile_parameters=(PROFILE_PARAMETERS if args.profile_dofs else None),
-            profile_scale_mode=PROFILE_SCALE_MODE,
-            profile_coordinate_mode=PROFILE_COORDINATE_MODE,
             families=GEOMETRY_FAMILIES,
             scale_mode=GEOMETRY_SCALE_MODE,
             ess_alpha=ESS_ALPHA,
@@ -1065,6 +968,14 @@ def main() -> int:
             print_final_softmax_er=PRINT_FINAL_SOFTMAX_ER,
             reverse_stage_mode=REVERSE_STAGE_MODE,
             qi_maxj_settings=qi_maxj_backend_settings(frozen_physical_pitches),
+        )
+        # With profile DOFs disabled this update is exactly empty, so the
+        # standalone geometry problem is built without any profile arguments.
+        problem_kwargs.update(optional_profile_problem_kwargs(args.profile_dofs))
+        problem = opt.geometry_full_transport_least_squares_problem(
+            current_config,
+            terms,
+            **problem_kwargs,
         )
         if QI_MAXJ_BACKEND.strip().lower() == "physical" and frozen_physical_pitches is None:
             frozen_physical_pitches = tuple(
