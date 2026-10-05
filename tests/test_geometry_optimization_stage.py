@@ -163,6 +163,90 @@ def test_geometry_full_transport_problem_mixes_profile_and_boundary_scaling(monk
     )
 
 
+def test_geometry_full_transport_geometry_only_uses_exact_legacy_scaling_path(
+    monkeypatch,
+):
+    """Profile support must not alter the established geometry-only map."""
+
+    geometry_specs = optimization.parse_vmec_boundary_parameter_specs(
+        "RBC:1:0,ZBS:2:1"
+    )
+    parameterization = optimization.VmexBoundaryParameterization(
+        specs=geometry_specs, scales=(0.5, 0.125), scale_mode="ess"
+    )
+    parameter_set = optimization.reverse_ad_optimization_parameter_set(
+        include_profiles=False, vmec_boundary=geometry_specs
+    )
+    term = reverse_optimization.LeastSquaresTerm(
+        objective=optimization.transport_objective("softmax_Er")
+    )
+    nan_profiles = jnp.full((6,), jnp.nan)
+    problem = optimization.GeometryFullTransportLeastSquaresProblem(
+        config={"profiles": {}},
+        context=object(),
+        runtime=object(),
+        baseline_state=object(),
+        baseline_profile_values=nan_profiles,
+        profile_scales=nan_profiles,
+        parameterization=parameterization,
+        parameter_set=parameter_set,
+        terms=(term,),
+        table_context=object(),
+        table_result_builder=object(),
+        options={},
+        profile_coordinate_mode="delta",
+    )
+
+    x = jnp.asarray([2.0, -4.0])
+    expected_physical = np.asarray(
+        parameterization.scaled_to_physical_delta(x)
+    )
+    np.testing.assert_array_equal(np.asarray(problem.x0), np.zeros(2))
+    np.testing.assert_array_equal(
+        np.asarray(problem.x_scale), np.asarray(parameterization.x_scale)
+    )
+    np.testing.assert_array_equal(
+        np.asarray(problem._scaled_to_physical(x)), expected_physical
+    )
+
+    captured = {}
+    raw_jacobian = jnp.asarray([[3.0, -5.0]])
+    monkeypatch.setattr(
+        optimization,
+        "realtime_geometry_transport_reverse_table_request",
+        lambda **_kwargs: object(),
+    )
+
+    def _evaluate_physical(_config, *, parameter_values, **_kwargs):
+        captured["parameter_values"] = np.asarray(parameter_values)
+        result = reverse_optimization.LeastSquaresResult(
+            residuals=jnp.asarray([2.0]),
+            jacobian=raw_jacobian,
+            residual_labels=(term.residual_label,),
+            parameter_labels=problem.parameter_labels,
+            objective_values={term.residual_label: jnp.asarray(2.0)},
+        )
+        return reverse_optimization.LeastSquaresEvaluation(
+            result=result,
+            residuals=result.residuals,
+            jacobian=result.jacobian,
+            elapsed_s=0.0,
+        )
+
+    monkeypatch.setattr(
+        optimization,
+        "evaluate_geometry_transport_realtime_geometry_least_squares",
+        _evaluate_physical,
+    )
+    evaluation = problem.evaluate(x)
+    np.testing.assert_array_equal(captured["parameter_values"], expected_physical)
+    np.testing.assert_array_equal(
+        np.asarray(evaluation.jacobian),
+        np.asarray(raw_jacobian)
+        * np.asarray(parameterization.x_scale)[None, :],
+    )
+
+
 def test_combined_full_transport_example_uses_original_profile_coordinates():
     assert combined_full_transport_example.PROFILE_SCALE_MODE == "nominal"
     assert combined_full_transport_example.PROFILE_COORDINATE_MODE == "absolute"

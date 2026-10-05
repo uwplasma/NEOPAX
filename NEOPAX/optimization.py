@@ -960,6 +960,10 @@ class GeometryFullTransportLeastSquaresProblem:
 
     @property
     def x0(self):
+        # Profile support must not alter the validated geometry-only map.
+        if not self.parameter_set.profile_specs:
+            return jnp.zeros((self.parameter_count,), dtype=jnp.float64)
+
         profile_lookup = {name: i for i, name in enumerate(PROFILE_PARAMETER_ORDER)}
         profile_coordinate_mode = str(self.profile_coordinate_mode).strip().lower()
         if profile_coordinate_mode not in {"absolute", "delta"}:
@@ -982,6 +986,9 @@ class GeometryFullTransportLeastSquaresProblem:
 
     @property
     def x_scale(self):
+        if not self.parameter_set.profile_specs:
+            return self.parameterization.x_scale
+
         profile_scale_lookup = {
             name: self.profile_scales[i]
             for i, name in enumerate(PROFILE_PARAMETER_ORDER)
@@ -1011,6 +1018,9 @@ class GeometryFullTransportLeastSquaresProblem:
                 "scaled_parameter_values must have shape "
                 f"({self.parameter_count},); got {tuple(scaled_values.shape)}."
             )
+        if not self.parameter_set.profile_specs:
+            return self.parameterization.scaled_to_physical_delta(scaled_values)
+
         physical_values = scaled_values * self.x_scale
         profile_coordinate_mode = str(self.profile_coordinate_mode).strip().lower()
         if profile_coordinate_mode not in {"absolute", "delta"}:
@@ -1089,6 +1099,14 @@ class GeometryFullTransportLeastSquaresProblem:
         physical_values = self._scaled_to_physical(
             self.x0 if scaled_parameter_values is None else scaled_parameter_values
         )
+        if not self.parameter_set.profile_specs:
+            entries = boundary_param_entries(
+                self.context, self.parameterization.vmec_tuples
+            )
+            return _input_with_boundary_deltas(
+                self.context, physical_values, entries
+            )
+
         geometry_values = jnp.asarray(
             [
                 physical_values[i]
