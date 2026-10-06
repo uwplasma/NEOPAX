@@ -1000,8 +1000,9 @@ def main() -> int:
         x0 = np.asarray(jax.device_get(problem.x0), dtype=float)
         if initial_input is None:
             initial_input = problem.input_from_scaled_parameters(x0)
-            initial_config = problem.config_from_scaled_parameters(x0)
-            initial_profiles = profile_parameter_values(problem, x0)
+            if args.profile_dofs:
+                initial_config = problem.config_from_scaled_parameters(x0)
+                initial_profiles = profile_parameter_values(problem, x0)
         print(
             f"[setup] parameter_count={problem.parameter_count} "
             f"parameters={list(problem.parameter_labels)} "
@@ -1012,7 +1013,11 @@ def main() -> int:
             f"{OPTIMIZER_TRUST_REGION_X_SCALE if args.profile_dofs else 'unit'}",
             flush=True,
         )
-        initial_evaluation = report("initial", problem, x0)
+        initial_evaluation = (
+            report("initial", problem, x0)
+            if args.profile_dofs
+            else geometry_example.report("initial", problem, x0)
+        )
         least_squares_options = {
             "max_nfev": args.max_nfev,
             "ftol": FTOL,
@@ -1050,10 +1055,18 @@ def main() -> int:
             )
         last_result = opt.least_squares(problem, **least_squares_options)
         x_opt = np.asarray(last_result.x, dtype=float)
-        report(f"combined stage {max_mode}", problem, x_opt)
+        if args.profile_dofs:
+            report(f"combined stage {max_mode}", problem, x_opt)
+        else:
+            geometry_example.report(
+                f"QI + database full-transport/net-power stage {max_mode}",
+                problem,
+                x_opt,
+            )
         optimized_input = problem.input_from_scaled_parameters(x_opt)
-        optimized_config = problem.config_from_scaled_parameters(x_opt)
-        optimized_profiles = profile_parameter_values(problem, x_opt)
+        if args.profile_dofs:
+            optimized_config = problem.config_from_scaled_parameters(x_opt)
+            optimized_profiles = profile_parameter_values(problem, x_opt)
         stage_input = out_dir / f"input.QI_neopax_combined_stage_m{max_mode}"
         optimized_input.to_indata(stage_input)
         print(f"wrote {stage_input}")
@@ -1066,19 +1079,20 @@ def main() -> int:
             current_config = optimized_config
         last_problem = problem
 
-    if any(
-        value is None
-        for value in (
-            initial_input,
+    required_results = (
+        initial_input,
+        optimized_input,
+        last_problem,
+        last_result,
+    )
+    if args.profile_dofs:
+        required_results += (
             initial_config,
             initial_profiles,
-            optimized_input,
             optimized_config,
             optimized_profiles,
-            last_problem,
-            last_result,
         )
-    ):
+    if any(value is None for value in required_results):
         raise RuntimeError("No combined optimization stage was executed.")
 
     summary = {
@@ -1126,18 +1140,29 @@ def main() -> int:
     summary_path = out_dir / "optimization_summary.json"
     summary_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
     print(f"wrote {summary_path}")
-    write_outputs(
-        initial_input=initial_input,
-        optimized_input=optimized_input,
-        initial_config=initial_config,
-        optimized_config=optimized_config,
-        initial_profiles=initial_profiles,
-        optimized_profiles=optimized_profiles,
-        out_dir=out_dir,
-        seed_input=seed_input,
-        make_initial_plots=args.initial_plots,
-        physical_pitches=frozen_physical_pitches,
-    )
+    if args.profile_dofs:
+        write_outputs(
+            initial_input=initial_input,
+            optimized_input=optimized_input,
+            initial_config=initial_config,
+            optimized_config=optimized_config,
+            initial_profiles=initial_profiles,
+            optimized_profiles=optimized_profiles,
+            out_dir=out_dir,
+            seed_input=seed_input,
+            make_initial_plots=args.initial_plots,
+            physical_pitches=frozen_physical_pitches,
+        )
+    else:
+        geometry_example.write_outputs(
+            optimized_input,
+            initial_input,
+            config=current_config,
+            out_dir=out_dir,
+            seed_input=seed_input,
+            make_initial_plots=args.initial_plots,
+            physical_pitches=frozen_physical_pitches,
+        )
     return 0
 
 
