@@ -26,11 +26,18 @@ ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from NEOPAX import optimization as opt  # noqa: E402
+# Match the established geometry-only process initialization exactly.  VMEX
+# must own its JAX/cache initialization before NEOPAX imports the implicit
+# geometry stack; reversing these imports produced a slightly different first
+# Jacobian/step and the nonlinear full-transport trajectory then diverged.
+import vmex as vj  # noqa: E402,F401
+from vmex import optimize as vmex_opt  # noqa: E402,F401
+
 from examples.optimization import (  # noqa: E402
     optimize_geometry_qi_max_er_transition_bootstrap_net_power_initial_root_database_full_transport
     as geometry_example,
 )
+from NEOPAX import optimization as opt  # noqa: E402
 
 
 # --------------------------- editable settings -----------------------------
