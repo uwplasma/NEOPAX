@@ -1,19 +1,22 @@
 #!/usr/bin/env python
-"""Audit a geometry-anchored one-shot geometry/profile Gauss-Newton step.
+"""Audit one-shot geometry/profile block Gauss-Newton candidates.
 
 This diagnostic does not run an optimization and does not modify either the
 geometry-only or the existing combined optimization example.  It evaluates
 the geometry-only and combined problems at the identical physical seed in
 separate worker processes, checks that the combined problem embeds the exact
-geometry residual/Jacobian, and then compares three linearized steps:
+geometry residual/Jacobian, and then compares five linearized candidates:
 
 1. the established geometry-only step;
-2. the ordinary simultaneous geometry/profile step; and
-3. the geometry-only step followed by a profile correction using the same
-   residual and Jacobian evaluation.
+2. the geometry-only step followed by a profile correction;
+3. a profile-only first step;
+4. the profile step followed by a geometry correction; and
+5. the ordinary simultaneous geometry/profile step.
 
-Only the two worker evaluations are expensive.  Every step comparison after
-that is host-side linear algebra and does not call VMEC, NTX, or transport.
+The seed comparison requires two expensive worker evaluations.  Optional
+``--nonlinear-candidates`` are each evaluated in another isolated worker at
+the actual candidate point.  Those evaluations distinguish an affine
+Gauss--Newton prediction from a genuine nonlinear VMEC/NTX/transport result.
 """
 
 from __future__ import annotations
@@ -49,6 +52,13 @@ PROFILE_LABELS = (
     "density_shape_alpha",
     "temperature_shape_alpha",
 )
+NONLINEAR_CANDIDATE_NAMES = (
+    "geometry_only",
+    "geometry_then_profile",
+    "profile_first",
+    "profile_then_geometry",
+    "ordinary_direct_joint",
+)
 
 
 def parser() -> argparse.ArgumentParser:
@@ -70,11 +80,33 @@ def parser() -> argparse.ArgumentParser:
     out.add_argument("--parity-rtol", type=float, default=1.0e-6)
     out.add_argument("--parity-atol", type=float, default=1.0e-8)
     out.add_argument(
+        "--reuse-linear-audit-npz",
+        type=Path,
+        help=(
+            "Reuse residuals and geometry/profile Jacobian blocks from a "
+            "previous audit NPZ instead of repeating the two seed "
+            "evaluations. Candidate points are rebuilt with the current "
+            "trust radii and bounds."
+        ),
+    )
+    out.add_argument(
+        "--nonlinear-candidates",
+        nargs="+",
+        choices=NONLINEAR_CANDIDATE_NAMES,
+        default=(),
+        help=(
+            "Evaluate the selected linearized steps as actual nonlinear "
+            "full-transport trials. Each candidate adds one expensive "
+            "isolated problem evaluation."
+        ),
+    )
+    out.add_argument(
         "--worker-kind",
-        choices=("geometry", "combined"),
+        choices=("geometry", "combined", "nonlinear_candidate"),
         help=argparse.SUPPRESS,
     )
     out.add_argument("--worker-output", type=Path, help=argparse.SUPPRESS)
+    out.add_argument("--candidate-input", type=Path, help=argparse.SUPPRESS)
     return out
 
 
@@ -96,6 +128,13 @@ def _validate_args(args: argparse.Namespace) -> None:
             raise ValueError(f"--{name.replace('_', '-')} must be positive.")
     if args.parity_rtol < 0.0 or args.parity_atol < 0.0:
         raise ValueError("Parity tolerances must be nonnegative.")
+    if (
+        args.reuse_linear_audit_npz is not None
+        and not args.reuse_linear_audit_npz.is_file()
+    ):
+        raise FileNotFoundError(
+            f"Saved audit NPZ not found: {args.reuse_linear_audit_npz}"
+        )
 
 
 def _problem_kwargs(args: argparse.Namespace) -> dict[str, object]:
@@ -159,39 +198,97 @@ def _build_problem(args: argparse.Namespace, *, include_profiles: bool):
 def _worker(args: argparse.Namespace) -> int:
     import jax
 
-    include_profiles = args.worker_kind == "combined"
+    include_profiles = args.worker_kind in {"combined", "nonlinear_candidate"}
     problem = _build_problem(args, include_profiles=include_profiles)
     x0 = np.asarray(jax.device_get(problem.x0), dtype=float)
-    evaluation = problem.evaluate(x0)
+    labels = np.asarray(tuple(problem.parameter_labels), dtype=np.str_)
+    candidate_name = "seed"
+    values = x0
+    if args.worker_kind == "nonlinear_candidate":
+        if args.candidate_input is None:
+            raise ValueError(
+                "--candidate-input is required for a nonlinear candidate worker."
+            )
+        candidate = _load(args.candidate_input)
+        candidate_name = str(np.asarray(candidate["candidate_name"]).item())
+        expected_labels = np.asarray(candidate["parameter_labels"], dtype=np.str_)
+        if not np.array_equal(labels, expected_labels):
+            raise AssertionError(
+                "Nonlinear candidate parameter labels do not match the "
+                "freshly built combined problem."
+            )
+        expected_x0 = np.asarray(candidate["x0"], dtype=float)
+        if not np.array_equal(x0, expected_x0):
+            maximum, relative = _max_error(expected_x0, x0)
+            raise AssertionError(
+                "Nonlinear candidate seed coordinates do not match the "
+                "freshly built combined problem: "
+                f"max_abs={maximum:.16e}, max_relative={relative:.16e}."
+            )
+        values = np.asarray(candidate["candidate_x"], dtype=float)
+
+    evaluation = problem.evaluate(values)
     residuals = np.asarray(jax.device_get(evaluation.residuals), dtype=float)
     jacobian = np.asarray(jax.device_get(evaluation.jacobian), dtype=float)
-    labels = np.asarray(tuple(problem.parameter_labels), dtype=np.str_)
     scales = np.asarray(jax.device_get(problem.x_scale), dtype=float)
     lower = np.full_like(x0, -np.inf)
     upper = np.full_like(x0, np.inf)
     if include_profiles:
         lower, upper = combined_example.scaled_bounds(problem)
     args.worker_output.parent.mkdir(parents=True, exist_ok=True)
-    np.savez(
-        args.worker_output,
-        residuals=residuals,
-        jacobian=jacobian,
-        parameter_labels=labels,
-        x0=x0,
-        coordinate_scales=scales,
-        lower_bounds=np.asarray(lower, dtype=float),
-        upper_bounds=np.asarray(upper, dtype=float),
-    )
+    output = {
+        "residuals": residuals,
+        "jacobian": jacobian,
+        "parameter_labels": labels,
+        "x0": x0,
+        "evaluated_x": values,
+        "coordinate_scales": scales,
+        "lower_bounds": np.asarray(lower, dtype=float),
+        "upper_bounds": np.asarray(upper, dtype=float),
+        "cost": np.asarray(_cost(residuals), dtype=float),
+        "elapsed_s": np.asarray(float(evaluation.elapsed_s), dtype=float),
+        "finite": np.asarray(bool(np.all(np.isfinite(residuals))), dtype=bool),
+    }
+    if include_profiles:
+        physical_profiles = combined_example.profile_parameter_values(
+            problem, values
+        )
+        output["physical_profile_labels"] = np.asarray(
+            tuple(physical_profiles), dtype=np.str_
+        )
+        output["physical_profile_values"] = np.asarray(
+            tuple(physical_profiles.values()), dtype=float
+        )
+    np.savez(args.worker_output, **output)
     print(
         "[block-step-audit] "
-        f"worker={args.worker_kind} residuals={residuals.shape} "
+        f"worker={args.worker_kind} candidate={candidate_name} "
+        f"cost={_cost(residuals):.16e} residuals={residuals.shape} "
         f"jacobian={jacobian.shape} wrote={args.worker_output}",
         flush=True,
     )
+    if args.worker_kind == "nonlinear_candidate":
+        print(
+            "[block-step-audit] nonlinear candidate physical_profiles="
+            f"{physical_profiles}",
+            flush=True,
+        )
+        print(
+            "[block-step-audit] nonlinear candidate objectives "
+            + combined_example.geometry_example.iteration_diagnostics(
+                evaluation
+            ),
+            flush=True,
+        )
     return 0
 
 
-def _run_worker(kind: str, output: Path) -> None:
+def _run_worker(
+    kind: str,
+    output: Path,
+    *,
+    candidate_input: Path | None = None,
+) -> None:
     command = [
         sys.executable,
         str(Path(__file__).resolve()),
@@ -201,12 +298,148 @@ def _run_worker(kind: str, output: Path) -> None:
         "--worker-output",
         str(output),
     ]
+    if candidate_input is not None:
+        command.extend(("--candidate-input", str(candidate_input)))
     subprocess.run(command, check=True)
 
 
 def _load(path: Path) -> dict[str, np.ndarray]:
     with np.load(path, allow_pickle=False) as data:
         return {name: np.asarray(data[name]) for name in data.files}
+
+
+def _combined_coordinate_metadata(
+    args: argparse.Namespace,
+    labels: tuple[str, ...],
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Rebuild combined seed coordinates/bounds without an AD evaluation."""
+
+    config = combined_example.transport_config(args)
+    profile_config = config.get("profiles", {})
+    defaults = {
+        "n0": 4.21,
+        "T0": 17.8,
+        "density_shape_power": 2.0,
+        "temperature_shape_power": 2.0,
+        "density_shape_alpha": 1.0,
+        "temperature_shape_alpha": 1.0,
+    }
+    baseline = {}
+    for name in PROFILE_LABELS:
+        value = profile_config.get(name, defaults[name])
+        if isinstance(value, (list, tuple)):
+            value = value[0]
+        baseline[name] = float(value)
+
+    scale_mode = str(combined_example.PROFILE_SCALE_MODE).strip().lower()
+    coordinate_mode = str(combined_example.PROFILE_COORDINATE_MODE).strip().lower()
+    if scale_mode not in {"identity", "none", "unit", "nominal", "baseline"}:
+        raise ValueError(f"Unsupported profile scale mode {scale_mode!r}.")
+    if coordinate_mode not in {"absolute", "delta"}:
+        raise ValueError(f"Unsupported profile coordinate mode {coordinate_mode!r}.")
+
+    x0 = np.zeros((len(labels),), dtype=float)
+    scales = np.full((len(labels),), np.nan, dtype=float)
+    lower = np.full((len(labels),), -np.inf, dtype=float)
+    upper = np.full((len(labels),), np.inf, dtype=float)
+    for index, label in enumerate(labels):
+        if label not in PROFILE_LABELS:
+            continue
+        physical_seed = baseline[label]
+        scale = (
+            max(abs(physical_seed), 1.0e-12)
+            if scale_mode in {"nominal", "baseline"}
+            else 1.0
+        )
+        offset = physical_seed if coordinate_mode == "delta" else 0.0
+        x0[index] = (
+            0.0 if coordinate_mode == "delta" else physical_seed / scale
+        )
+        scales[index] = scale
+        lower[index] = (
+            combined_example.PROFILE_PHYSICAL_LOWER.get(label, -np.inf)
+            - offset
+        ) / scale
+        upper[index] = (
+            combined_example.PROFILE_PHYSICAL_UPPER.get(label, np.inf)
+            - offset
+        ) / scale
+    return x0, scales, lower, upper
+
+
+def _seed_data_from_saved_linear_audit(
+    args: argparse.Namespace,
+    path: Path,
+) -> tuple[dict[str, np.ndarray], dict[str, np.ndarray]]:
+    """Adapt either the original or extended audit NPZ to seed worker data."""
+
+    saved = _load(path.resolve())
+    required = {
+        "residuals",
+        "jacobian_geometry",
+        "jacobian_profile",
+        "combined_parameter_labels",
+    }
+    missing = sorted(required.difference(saved))
+    if missing:
+        raise ValueError(
+            f"Saved audit NPZ {path} is missing arrays: {missing}."
+        )
+    labels = tuple(str(value) for value in saved["combined_parameter_labels"])
+    profile_indices = np.asarray(
+        [index for index, label in enumerate(labels) if label in PROFILE_LABELS],
+        dtype=int,
+    )
+    geometry_indices = np.asarray(
+        [index for index, label in enumerate(labels) if label not in PROFILE_LABELS],
+        dtype=int,
+    )
+    if tuple(labels[index] for index in profile_indices) != PROFILE_LABELS:
+        raise ValueError(
+            "Saved audit does not contain the expected six profile parameters "
+            "in canonical order."
+        )
+    residuals = np.asarray(saved["residuals"], dtype=float)
+    jacobian_geometry = np.asarray(saved["jacobian_geometry"], dtype=float)
+    jacobian_profile = np.asarray(saved["jacobian_profile"], dtype=float)
+    if jacobian_geometry.shape != (residuals.size, geometry_indices.size):
+        raise ValueError(
+            "Saved geometry Jacobian shape is inconsistent with residuals "
+            "and parameter labels."
+        )
+    if jacobian_profile.shape != (residuals.size, profile_indices.size):
+        raise ValueError(
+            "Saved profile Jacobian shape is inconsistent with residuals "
+            "and parameter labels."
+        )
+    jacobian_combined = np.zeros((residuals.size, len(labels)), dtype=float)
+    jacobian_combined[:, geometry_indices] = jacobian_geometry
+    jacobian_combined[:, profile_indices] = jacobian_profile
+    x0, scales, lower, upper = _combined_coordinate_metadata(args, labels)
+    geometry_labels = np.asarray(
+        tuple(labels[index] for index in geometry_indices), dtype=np.str_
+    )
+    geometry = {
+        "residuals": residuals.copy(),
+        "jacobian": jacobian_geometry,
+        "parameter_labels": geometry_labels,
+        "x0": np.zeros((geometry_indices.size,), dtype=float),
+        "coordinate_scales": np.full(
+            (geometry_indices.size,), np.nan, dtype=float
+        ),
+        "lower_bounds": np.full((geometry_indices.size,), -np.inf, dtype=float),
+        "upper_bounds": np.full((geometry_indices.size,), np.inf, dtype=float),
+    }
+    combined = {
+        "residuals": residuals.copy(),
+        "jacobian": jacobian_combined,
+        "parameter_labels": np.asarray(labels, dtype=np.str_),
+        "x0": x0,
+        "coordinate_scales": scales,
+        "lower_bounds": lower,
+        "upper_bounds": upper,
+    }
+    return geometry, combined
 
 
 def _max_error(reference: np.ndarray, trial: np.ndarray) -> tuple[float, float]:
@@ -382,6 +615,33 @@ def _linear_step_audit(
     profile_step = profile_step * profile_bound_fraction
     anchored_model_residual = geometry_model_residual + jacobian_profile @ profile_step
 
+    profile_first_step, profile_first_damping = _trust_region_step(
+        jacobian_profile,
+        residual_combined,
+        float(args.profile_trust_radius),
+    )
+    profile_first_bound_fraction = _fraction_to_bounds(
+        profile_x0,
+        profile_first_step,
+        profile_lower,
+        profile_upper,
+    )
+    profile_first_step = profile_first_step * profile_first_bound_fraction
+    profile_first_model_residual = (
+        residual_combined + jacobian_profile @ profile_first_step
+    )
+    profile_then_geometry_step, profile_then_geometry_damping = (
+        _trust_region_step(
+            jacobian_embedded_geometry,
+            profile_first_model_residual,
+            float(args.geometry_trust_radius),
+        )
+    )
+    profile_then_geometry_model_residual = (
+        profile_first_model_residual
+        + jacobian_embedded_geometry @ profile_then_geometry_step
+    )
+
     joint_radius = float(
         np.hypot(args.geometry_trust_radius, args.profile_trust_radius)
     )
@@ -411,8 +671,33 @@ def _linear_step_audit(
     direct_profile_step = direct_step[profile_indices]
     profile_added_reduction = geometry_cost - anchored_cost
 
+    geometry_only_full_step = np.zeros_like(direct_step)
+    geometry_only_full_step[geometry_indices] = geometry_step
+    geometry_then_profile_full_step = geometry_only_full_step.copy()
+    geometry_then_profile_full_step[profile_indices] = profile_step
+    profile_first_full_step = np.zeros_like(direct_step)
+    profile_first_full_step[profile_indices] = profile_first_step
+    profile_then_geometry_full_step = profile_first_full_step.copy()
+    profile_then_geometry_full_step[geometry_indices] = (
+        profile_then_geometry_step
+    )
+
+    candidate_steps = {
+        "geometry_only": geometry_only_full_step,
+        "geometry_then_profile": geometry_then_profile_full_step,
+        "profile_first": profile_first_full_step,
+        "profile_then_geometry": profile_then_geometry_full_step,
+        "ordinary_direct_joint": direct_step,
+    }
+    candidate_model_residuals = {
+        "geometry_only": geometry_model_residual,
+        "geometry_then_profile": anchored_model_residual,
+        "profile_first": profile_first_model_residual,
+        "profile_then_geometry": profile_then_geometry_model_residual,
+        "ordinary_direct_joint": direct_model_residual,
+    }
+
     report = {
-        "expensive_problem_evaluations": 2,
         "parameter_counts": {
             "geometry": len(geometry_labels),
             "profile": len(PROFILE_LABELS),
@@ -447,17 +732,29 @@ def _linear_step_audit(
             "initial": initial_cost,
             "geometry_only_step": geometry_cost,
             "geometry_anchored_profile_correction": anchored_cost,
+            "profile_first_step": _cost(profile_first_model_residual),
+            "profile_then_geometry_step": _cost(
+                profile_then_geometry_model_residual
+            ),
             "ordinary_direct_joint_step": direct_cost,
         },
         "linearized_reductions": {
             "geometry_only": initial_cost - geometry_cost,
             "profile_added_after_geometry": profile_added_reduction,
             "anchored_total": initial_cost - anchored_cost,
+            "profile_first": initial_cost - _cost(profile_first_model_residual),
+            "profile_then_geometry": (
+                initial_cost - _cost(profile_then_geometry_model_residual)
+            ),
             "ordinary_direct_joint": initial_cost - direct_cost,
         },
         "steps": {
             "geometry_only_l2": float(np.linalg.norm(geometry_step)),
             "anchored_profile_l2": float(np.linalg.norm(profile_step)),
+            "profile_first_l2": float(np.linalg.norm(profile_first_step)),
+            "profile_then_geometry_l2": float(
+                np.linalg.norm(profile_then_geometry_step)
+            ),
             "ordinary_direct_geometry_l2": float(
                 np.linalg.norm(direct_geometry_step)
             ),
@@ -470,8 +767,11 @@ def _linear_step_audit(
             ),
             "geometry_damping": geometry_damping,
             "profile_damping": profile_damping,
+            "profile_first_damping": profile_first_damping,
+            "profile_then_geometry_damping": profile_then_geometry_damping,
             "ordinary_direct_damping": direct_damping,
             "profile_bound_fraction": profile_bound_fraction,
+            "profile_first_bound_fraction": profile_first_bound_fraction,
             "ordinary_direct_bound_fraction": direct_bound_fraction,
         },
         "profile_projected_gradient": {
@@ -482,11 +782,12 @@ def _linear_step_audit(
                 np.linalg.norm(jacobian_profile.T @ geometry_model_residual)
             ),
         },
-        "supports_geometry_anchored_direction": bool(
+        "linear_model_geometry_then_profile_adds_reduction": bool(
             residual_parity
             and jacobian_parity
             and profile_added_reduction > max(1.0e-12, 1.0e-12 * initial_cost)
         ),
+        "nonlinear_candidate_results": {},
     }
     arrays = {
         "residuals": residual_combined,
@@ -495,12 +796,127 @@ def _linear_step_audit(
         "geometry_step": geometry_step,
         "anchored_profile_step": profile_step,
         "ordinary_direct_step": direct_step,
+        "profile_first_step": profile_first_step,
+        "profile_then_geometry_step": profile_then_geometry_step,
         "geometry_model_residual": geometry_model_residual,
         "anchored_model_residual": anchored_model_residual,
+        "profile_first_model_residual": profile_first_model_residual,
+        "profile_then_geometry_model_residual": (
+            profile_then_geometry_model_residual
+        ),
         "ordinary_direct_model_residual": direct_model_residual,
         "combined_parameter_labels": np.asarray(combined_labels, dtype=np.str_),
+        "combined_x0": combined_x0,
+        "combined_coordinate_scales": np.asarray(
+            combined["coordinate_scales"], dtype=float
+        ),
+        "combined_lower_bounds": np.asarray(combined["lower_bounds"], dtype=float),
+        "combined_upper_bounds": np.asarray(combined["upper_bounds"], dtype=float),
+        "geometry_indices": geometry_indices,
+        "profile_indices": profile_indices,
     }
+    for name, step_value in candidate_steps.items():
+        arrays[f"candidate_step_{name}"] = step_value
+        arrays[f"candidate_x_{name}"] = combined_x0 + step_value
+        arrays[f"candidate_model_residual_{name}"] = (
+            candidate_model_residuals[name]
+        )
     return report, arrays
+
+
+def _evaluate_nonlinear_candidates(
+    args: argparse.Namespace,
+    report: dict[str, object],
+    arrays: dict[str, np.ndarray],
+    temporary_path: Path,
+    *,
+    seed_evaluations_this_run: int,
+) -> None:
+    """Evaluate requested candidate points with the actual nonlinear model."""
+
+    initial_cost = float(report["linearized_costs"]["initial"])
+    labels = np.asarray(arrays["combined_parameter_labels"], dtype=np.str_)
+    x0 = np.asarray(arrays["combined_x0"], dtype=float)
+    nonlinear_results = report["nonlinear_candidate_results"]
+    for name in dict.fromkeys(args.nonlinear_candidates):
+        candidate_x = np.asarray(arrays[f"candidate_x_{name}"], dtype=float)
+        model_residual = np.asarray(
+            arrays[f"candidate_model_residual_{name}"], dtype=float
+        )
+        model_cost = _cost(model_residual)
+        model_reduction = initial_cost - model_cost
+        candidate_input = temporary_path / f"candidate_input_{name}.npz"
+        candidate_output = temporary_path / f"candidate_output_{name}.npz"
+        np.savez(
+            candidate_input,
+            candidate_name=np.asarray(name, dtype=np.str_),
+            parameter_labels=labels,
+            x0=x0,
+            candidate_x=candidate_x,
+        )
+        print(
+            "[block-step-audit] running actual nonlinear candidate "
+            f"name={name} predicted_cost={model_cost:.16e}",
+            flush=True,
+        )
+        _run_worker(
+            "nonlinear_candidate",
+            candidate_output,
+            candidate_input=candidate_input,
+        )
+        actual = _load(candidate_output)
+        actual_residual = np.asarray(actual["residuals"], dtype=float)
+        actual_cost = float(np.asarray(actual["cost"]).item())
+        actual_reduction = initial_cost - actual_cost
+        agreement_ratio = (
+            actual_reduction / model_reduction
+            if model_reduction > 0.0
+            else float("nan")
+        )
+        finite = bool(np.asarray(actual["finite"]).item())
+        nonlinear_results[name] = {
+            "finite": finite,
+            "step_l2": float(
+                np.linalg.norm(candidate_x - x0)
+            ),
+            "predicted_linearized_cost": model_cost,
+            "predicted_reduction": model_reduction,
+            "actual_nonlinear_cost": actual_cost,
+            "actual_reduction": actual_reduction,
+            "actual_to_predicted_reduction_ratio": agreement_ratio,
+            "actual_residual_norm": float(np.linalg.norm(actual_residual)),
+            "worker_elapsed_s": float(np.asarray(actual["elapsed_s"]).item()),
+            "physical_profiles": dict(
+                zip(
+                    (
+                        str(value)
+                        for value in actual["physical_profile_labels"]
+                    ),
+                    (
+                        float(value)
+                        for value in actual["physical_profile_values"]
+                    ),
+                    strict=True,
+                )
+            ),
+        }
+        arrays[f"actual_residual_{name}"] = actual_residual
+        print(
+            "[block-step-audit] actual nonlinear candidate "
+            f"name={name} actual_cost={actual_cost:.16e} "
+            f"actual_reduction={actual_reduction:.16e} "
+            f"agreement_ratio={agreement_ratio:.16e}",
+            flush=True,
+        )
+    report["seed_problem_evaluations_this_run"] = int(
+        seed_evaluations_this_run
+    )
+    report["nonlinear_candidate_evaluations_this_run"] = len(
+        nonlinear_results
+    )
+    report["expensive_problem_evaluations_this_run"] = (
+        int(seed_evaluations_this_run) + len(nonlinear_results)
+    )
 
 
 def main() -> int:
@@ -509,30 +925,67 @@ def main() -> int:
     if args.worker_kind is not None:
         if args.worker_output is None:
             raise ValueError("--worker-output is required with --worker-kind.")
+        if (
+            args.worker_kind != "nonlinear_candidate"
+            and args.candidate_input is not None
+        ):
+            raise ValueError(
+                "--candidate-input is only valid for a nonlinear candidate worker."
+            )
         return _worker(args)
     if args.worker_output is not None:
         raise ValueError("--worker-output is only valid with --worker-kind.")
+    if args.candidate_input is not None:
+        raise ValueError("--candidate-input is only valid with --worker-kind.")
 
     out_dir = args.out_dir.resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="neopax_block_step_audit_") as temporary:
         temporary_path = Path(temporary)
-        geometry_path = temporary_path / "geometry.npz"
-        combined_path = temporary_path / "combined.npz"
-        print(
-            "[block-step-audit] running isolated geometry-only seed evaluation",
-            flush=True,
+        if args.reuse_linear_audit_npz is None:
+            geometry_path = temporary_path / "geometry.npz"
+            combined_path = temporary_path / "combined.npz"
+            print(
+                "[block-step-audit] running isolated geometry-only seed evaluation",
+                flush=True,
+            )
+            _run_worker("geometry", geometry_path)
+            print(
+                "[block-step-audit] running isolated combined seed evaluation",
+                flush=True,
+            )
+            _run_worker("combined", combined_path)
+            geometry = _load(geometry_path)
+            combined = _load(combined_path)
+            seed_evaluations_this_run = 2
+            seed_source = "fresh_isolated_workers"
+        else:
+            print(
+                "[block-step-audit] reusing saved seed residual/Jacobian "
+                f"from {args.reuse_linear_audit_npz.resolve()}",
+                flush=True,
+            )
+            print(
+                "[block-step-audit] reuse assumes that the saved NPZ used "
+                "the same seed, database grid, objectives, and CLI settings "
+                "as this invocation",
+                flush=True,
+            )
+            geometry, combined = _seed_data_from_saved_linear_audit(
+                args, args.reuse_linear_audit_npz
+            )
+            seed_evaluations_this_run = 0
+            seed_source = str(args.reuse_linear_audit_npz.resolve())
+        report, arrays = _linear_step_audit(args, geometry, combined)
+        report["seed_data_source"] = seed_source
+        _evaluate_nonlinear_candidates(
+            args,
+            report,
+            arrays,
+            temporary_path,
+            seed_evaluations_this_run=seed_evaluations_this_run,
         )
-        _run_worker("geometry", geometry_path)
-        print(
-            "[block-step-audit] running isolated combined seed evaluation",
-            flush=True,
-        )
-        _run_worker("combined", combined_path)
-        geometry = _load(geometry_path)
-        combined = _load(combined_path)
 
-    report, arrays = _linear_step_audit(args, geometry, combined)
     json_path = out_dir / "geometry_profiles_one_shot_block_step_audit.json"
     npz_path = out_dir / "geometry_profiles_one_shot_block_step_audit.npz"
     json_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
@@ -546,19 +999,30 @@ def main() -> int:
     if not report["parity"]["geometry_jacobian_pass"]:
         print("[block-step-audit] FAIL: geometry Jacobian embedding parity", flush=True)
         return 2
-    if report["supports_geometry_anchored_direction"]:
+    nonlinear_results = report["nonlinear_candidate_results"]
+    if nonlinear_results and not all(
+        result["finite"] for result in nonlinear_results.values()
+    ):
         print(
-            "[block-step-audit] PASS: the same seed/Jacobian supports a "
-            "cost-reducing profile correction after the geometry step",
+            "[block-step-audit] FAIL: at least one requested nonlinear "
+            "candidate produced nonfinite residuals",
+            flush=True,
+        )
+        return 4
+    if nonlinear_results:
+        print(
+            "[block-step-audit] COMPLETE: actual nonlinear candidate costs "
+            "were evaluated; inspect nonlinear_candidate_results rather than "
+            "the affine costs when choosing a method",
             flush=True,
         )
         return 0
     print(
-        "[block-step-audit] INCONCLUSIVE: embedding parity passed but the "
-        "linearized profile correction did not add meaningful reduction",
+        "[block-step-audit] COMPLETE: seed embedding and affine steps were "
+        "audited, but no nonlinear candidate was requested",
         flush=True,
     )
-    return 3
+    return 0
 
 
 if __name__ == "__main__":
