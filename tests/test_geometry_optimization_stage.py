@@ -319,9 +319,13 @@ def test_combined_full_transport_composes_profiles_around_exact_geometry_map(
 def test_combined_full_transport_example_uses_original_profile_coordinates():
     assert combined_full_transport_example.PROFILE_SCALE_MODE == "nominal"
     assert combined_full_transport_example.PROFILE_COORDINATE_MODE == "absolute"
-    assert (
-        combined_full_transport_example.OPTIMIZER_TRUST_REGION_X_SCALE
-        == "row_equilibrated_block_rms"
+    assert combined_full_transport_example.OPTIMIZER_TRUST_REGION_X_SCALE == "unit"
+    problem = SimpleNamespace(parameter_count=30)
+    np.testing.assert_array_equal(
+        combined_full_transport_example.optimizer_trust_region_x_scale(
+            problem, evaluation=None
+        ),
+        np.ones(30),
     )
 
 

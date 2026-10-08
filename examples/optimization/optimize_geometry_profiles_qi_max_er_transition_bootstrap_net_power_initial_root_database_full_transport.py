@@ -79,12 +79,12 @@ PROFILE_PARAMETERS = (
 )
 PROFILE_SCALE_MODE = "nominal"
 PROFILE_COORDINATE_MODE = "absolute"
-# Weight-invariant block equilibration.  Residual-Jacobian rows are normalized
-# before comparing profile and geometry blocks, so multiplying an objective by
-# any nonzero least-squares weight leaves this metric unchanged.  Geometry gets
-# no additional per-mode scaling: all geometry entries remain one and the ESS
-# hierarchy is preserved exactly.
-OPTIMIZER_TRUST_REGION_X_SCALE = "row_equilibrated_block_rms"
+# Both parameter blocks are already nondimensionalized exactly once: profiles
+# by their nominal values and geometry by the established ESS map.  Keep the
+# SciPy trust-region metric in those coordinates.  A Jacobian-derived metric
+# couples the two blocks a second time, suppresses the profile directions, and
+# changes the otherwise validated ESS geometry trajectory.
+OPTIMIZER_TRUST_REGION_X_SCALE = "unit"
 PROFILE_BLOCK_TRUST_SCALE_MIN = 0.1
 PROFILE_BLOCK_TRUST_SCALE_MAX = 10.0
 USE_PROFILE_DOFS = True
@@ -1035,9 +1035,8 @@ def main() -> int:
         }
         if args.profile_dofs:
             # Both physical maps have already been applied exactly once:
-            # nominal profiles and ESS geometry. Row equilibration derives one
-            # additional profile-block trust metric while leaving every
-            # geometry entry exactly one.
+            # nominal profiles and ESS geometry.  The default unit metric
+            # passes those coordinates to SciPy without a second block scale.
             trust_region_x_scale = optimizer_trust_region_x_scale(
                 problem, initial_evaluation
             )
