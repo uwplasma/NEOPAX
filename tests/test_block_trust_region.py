@@ -149,3 +149,26 @@ def test_block_model_step_projects_infeasible_slsqp_descent(monkeypatch):
     assert block_trust_region._cost(residuals + jacobian @ step) < (
         block_trust_region._cost(residuals)
     )
+
+
+def test_block_example_owns_cli_configurable_objective_weights():
+    from examples.optimization import (
+        optimize_geometry_profiles_qi_max_er_transition_bootstrap_net_power_initial_root_database_full_transport_block_trust_region
+        as block_example,
+    )
+
+    args = block_example.parser().parse_args(
+        ("--qi-weight", "2.5", "--net-power-weight", "7.0")
+    )
+    terms = block_example.active_terms(args)
+    weights = {objective.label: weight for objective, _target, weight in terms}
+
+    assert weights[block_example.combined_example.opt.geometry.boozer_qi_objective.label] == 2.5
+    assert (
+        weights[
+            block_example.combined_example.opt.transport.net_total_power_volume_average_mw_m3.label
+        ]
+        == 7.0
+    )
+    assert block_example.combined_example.QI_WEIGHT != 2.5
+    assert block_example.combined_example.NET_POWER_WEIGHT != 7.0

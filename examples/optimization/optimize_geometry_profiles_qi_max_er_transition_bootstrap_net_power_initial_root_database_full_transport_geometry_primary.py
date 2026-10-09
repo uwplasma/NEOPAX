@@ -1,16 +1,24 @@
 #!/usr/bin/env python
-"""One-run geometry/profile optimization with physical block trust limits.
+"""Optimize geometry first, then add a profile correction to each step.
 
-This experiment starts geometry and profile degrees of freedom together at
-the original seed. Geometry uses the established ESS coordinates. Profiles
-use centered nominal deltas, so all optimizer coordinates start at zero and a
-profile step of 0.1 is a ten-percent change from the seed profile. One joint
-Gauss--Newton model is constrained by independent geometry and profile trust
-limits, and every step is accepted or rejected using the actual nonlinear
-VMEC/NTX/full-transport cost.
+This is an opt-in, standalone full-transport optimization lane.  At every
+accepted nonlinear state it:
 
-The established geometry-only and ordinary combined optimization scripts are
-not called or modified by this example.
+1. constructs an ESS-coordinate geometry Gauss--Newton proposal;
+2. freezes that geometry proposal;
+3. constructs a nominal-profile correction for the residual predicted after
+   the geometry proposal; and
+4. evaluates the combined proposal once with VMEC/NTX/full transport.
+
+A rejected combined proposal contracts the profile correction first.  The
+geometry radius is contracted only after the corresponding exact
+geometry-only proposal is also rejected.  Thus profiles can improve a
+geometry-led path without replacing its step in the local model.
+
+The established geometry-only, ordinary combined, and symmetric block-trust
+optimization paths are not modified or called by this script.  Their shared
+physics, objective, parameter, and output definitions are imported so this
+experiment starts from exactly the same configured problem.
 """
 
 from __future__ import annotations
@@ -28,7 +36,8 @@ ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-# Preserve the validated VMEX-first initialization order.
+# Preserve the validated VMEX-first initialization order used by the
+# established geometry-only path.
 import vmex as vj  # noqa: E402,F401
 from vmex import optimize as vmex_opt  # noqa: E402,F401
 
@@ -36,8 +45,8 @@ from examples.optimization import (  # noqa: E402
     optimize_geometry_profiles_qi_max_er_transition_bootstrap_net_power_initial_root_database_full_transport
     as combined_example,
 )
-from NEOPAX._block_trust_region import (  # noqa: E402
-    block_trust_region_least_squares,
+from NEOPAX._geometry_primary_trust_region import (  # noqa: E402
+    geometry_primary_profile_correction_least_squares,
 )
 
 
@@ -45,12 +54,13 @@ OUT_DIR = (
     ROOT
     / "outputs"
     / "geometry_profiles_qi_max_er_transition_bootstrap_net_power_initial_root_"
-    "database_full_transport_block_trust_region_optimization"
+    "database_full_transport_geometry_primary_optimization"
 )
 
-# Objective weights are local to this opt-in experiment. They intentionally
-# default to the established combined example but can be edited here or
-# overridden on the command line without mutating either established script.
+# These defaults are copied by reference from the established combined
+# example, whose geometry settings in turn come directly from the validated
+# geometry-only example.  They remain editable here and on the CLI without
+# mutating either existing optimization lane.
 QI_WEIGHT = combined_example.QI_WEIGHT
 MAXJ_WEIGHT = combined_example.MAXJ_WEIGHT
 MIRROR_WEIGHT = combined_example.MIRROR_WEIGHT
@@ -65,7 +75,7 @@ BOOTSTRAP_WEIGHT = combined_example.BOOTSTRAP_WEIGHT
 NET_POWER_WEIGHT = combined_example.NET_POWER_WEIGHT
 
 
-def _add_weight_arguments(parser: argparse.ArgumentParser) -> None:
+def _add_weight_arguments(out: argparse.ArgumentParser) -> None:
     for flag, default in (
         ("qi", QI_WEIGHT),
         ("maxj", MAXJ_WEIGHT),
@@ -80,7 +90,7 @@ def _add_weight_arguments(parser: argparse.ArgumentParser) -> None:
         ("bootstrap", BOOTSTRAP_WEIGHT),
         ("net-power", NET_POWER_WEIGHT),
     ):
-        parser.add_argument(
+        out.add_argument(
             f"--{flag}-weight",
             type=float,
             default=float(default),
@@ -89,6 +99,8 @@ def _add_weight_arguments(parser: argparse.ArgumentParser) -> None:
 
 
 def parser() -> argparse.ArgumentParser:
+    """Return this lane's CLI while retaining the shared problem defaults."""
+
     out = combined_example.parser()
     out.description = __doc__
     out.set_defaults(out_dir=OUT_DIR, profile_dofs=True)
@@ -110,8 +122,6 @@ def parser() -> argparse.ArgumentParser:
 
 
 def objective_weights(args: argparse.Namespace) -> dict[str, float]:
-    """Return this experiment's explicit least-squares weights."""
-
     return {
         "qi": float(args.qi_weight),
         "maxj": float(args.maxj_weight),
@@ -129,7 +139,7 @@ def objective_weights(args: argparse.Namespace) -> dict[str, float]:
 
 
 def active_terms(args: argparse.Namespace):
-    """Apply local weights to the established objective definitions/targets."""
+    """Apply this lane's local weights to the shared objective definitions."""
 
     opt = combined_example.opt
     geometry_example = combined_example.geometry_example
@@ -157,17 +167,14 @@ def active_terms(args: argparse.Namespace):
             args.net_power_weight
         ),
     }
-    terms = []
-    for objective, target, inherited_weight in combined_example.active_terms(args):
-        label = objective.label
-        terms.append(
-            (
-                objective,
-                target,
-                weights_by_label.get(label, float(inherited_weight)),
-            )
+    return tuple(
+        (
+            objective,
+            target,
+            weights_by_label.get(objective.label, float(inherited_weight)),
         )
-    return tuple(terms)
+        for objective, target, inherited_weight in combined_example.active_terms(args)
+    )
 
 
 def _problem_kwargs(args: argparse.Namespace, physical_pitches):
@@ -244,16 +251,62 @@ def _build_problem(
     )
 
 
-def _validate_args(args: argparse.Namespace) -> None:
+def _validate_args(args) -> None:
     if not args.profile_dofs:
         raise ValueError(
-            "This new block optimizer is only for the combined problem. "
-            "Use the established geometry-only script for --no-profile-dofs."
+            "The geometry-primary correction lane requires profile DoFs. "
+            "Use the established geometry-only script for geometry only."
         )
     if args.postprocess_existing:
         raise ValueError("--postprocess-existing is not supported here.")
     if int(args.max_nfev) < 1:
         raise ValueError("--max-nfev must be positive.")
+    for name in ("database_n_theta", "database_n_phi", "database_n_xi"):
+        if int(getattr(args, name)) < 1:
+            raise ValueError(f"--{name.replace('_', '-')} must be positive.")
+    config = combined_example.transport_config(args)
+    n_radial = int(config.get("geometry", {}).get("n_radial", 51))
+    for name in ("er_transition_left_index", "er_transition_right_index"):
+        index = int(getattr(args, name))
+        if not 0 <= index < n_radial:
+            raise ValueError(
+                f"--{name.replace('_', '-')} must be in [0, {n_radial}); "
+                f"got {index}."
+            )
+    if not (
+        0.0
+        <= float(args.er_transition_rho_min)
+        < float(args.er_transition_rho_max)
+        <= 1.0
+    ):
+        raise ValueError(
+            "Er transition radial window must satisfy 0 <= min < max <= 1."
+        )
+    if not (
+        float(args.er_transition_rho_min)
+        <= float(args.er_transition_rho_target)
+        <= float(args.er_transition_rho_max)
+    ):
+        raise ValueError("Er transition target must lie inside the radial window.")
+    if min(
+        float(args.er_transition_strength_target),
+        float(args.er_transition_temperature_kv_m),
+        float(args.er_transition_rho_softness),
+        float(args.er_transition_softmax_beta),
+    ) <= 0.0:
+        raise ValueError(
+            "Er transition strength/temperature/softness/beta must be positive."
+        )
+    negative_weights = {
+        name: value
+        for name, value in objective_weights(args).items()
+        if value < 0.0
+    }
+    if negative_weights:
+        raise ValueError(
+            "Least-squares objective weights must be nonnegative; got "
+            f"{negative_weights}."
+        )
     for name in (
         "geometry_initial_radius",
         "geometry_min_radius",
@@ -320,7 +373,7 @@ def main() -> int:
 
     for max_mode in max_modes:
         print(
-            "\n===== geometry + profile block-trust-region full transport "
+            "\n===== geometry-primary + profile-correction full transport "
             f"stage, max_mode={max_mode}, grid=({args.database_n_theta},"
             f"{args.database_n_phi},{args.database_n_xi}), "
             f"J_backend={combined_example.QI_MAXJ_BACKEND} =====",
@@ -343,7 +396,7 @@ def main() -> int:
             )
         problem = combined_example.CombinedTrialSavingProblem(
             problem,
-            out_dir / f"block_trust_inputs_m{max_mode}",
+            out_dir / f"geometry_primary_inputs_m{max_mode}",
             max_mode,
         )
         x0 = np.asarray(jax.device_get(problem.x0), dtype=float)
@@ -362,10 +415,14 @@ def main() -> int:
             f"[setup] parameter_count={problem.parameter_count} "
             f"parameters={list(problem.parameter_labels)} "
             "geometry_coordinates=ESS_delta profile_coordinates="
-            "centered_nominal_delta optimizer=block_trust_region",
+            "centered_nominal_delta "
+            "optimizer=geometry_primary_profile_correction",
             flush=True,
         )
-        print(f"[setup] objective_weights={objective_weights(args)}", flush=True)
+        print(
+            f"[setup] objective_weights={objective_weights(args)}",
+            flush=True,
+        )
         initial_evaluation = problem.evaluate(x0)
         _print_evaluation("initial", problem, x0, initial_evaluation)
         lower, upper = combined_example.scaled_bounds(problem)
@@ -376,7 +433,7 @@ def main() -> int:
             ],
             dtype=bool,
         )
-        result = block_trust_region_least_squares(
+        result = geometry_primary_profile_correction_least_squares(
             problem,
             profile_mask=profile_mask,
             bounds=(lower, upper),
@@ -404,7 +461,7 @@ def main() -> int:
         )
         x_opt = np.asarray(result.x, dtype=float)
         _print_evaluation(
-            f"block trust stage {max_mode}",
+            f"geometry-primary stage {max_mode}",
             problem,
             x_opt,
             result.evaluation,
@@ -414,7 +471,9 @@ def main() -> int:
         optimized_profiles = combined_example.profile_parameter_values(
             problem, x_opt
         )
-        stage_input = out_dir / f"input.QI_neopax_block_trust_stage_m{max_mode}"
+        stage_input = (
+            out_dir / f"input.QI_neopax_geometry_primary_stage_m{max_mode}"
+        )
         optimized_input.to_indata(stage_input)
         print(f"wrote {stage_input}", flush=True)
         current_input = stage_input
@@ -433,7 +492,7 @@ def main() -> int:
         last_result,
     )
     if any(value is None for value in required):
-        raise RuntimeError("No block trust-region optimization stage was executed.")
+        raise RuntimeError("No geometry-primary optimization stage was executed.")
 
     summary = {
         "seed_input": str(seed_input),
@@ -444,7 +503,11 @@ def main() -> int:
             int(args.database_n_xi),
         ],
         "max_mode_schedule": list(max_modes),
-        "optimizer": "joint_block_trust_region",
+        "optimizer": "geometry_primary_profile_correction_trust_region",
+        "step_policy": (
+            "geometry_first_then_profile_correction; "
+            "contract_profile_before_geometry"
+        ),
         "geometry_coordinate_mode": "ESS_delta",
         "profile_scale_mode": combined_example.PROFILE_SCALE_MODE,
         "profile_coordinate_mode": "delta",
@@ -453,7 +516,7 @@ def main() -> int:
         "parameter_labels": list(last_problem.parameter_labels),
         "objective_weights": objective_weights(args),
         "x_scaled_delta": np.asarray(last_result.x, dtype=float).tolist(),
-        "block_trust_settings": {
+        "trust_settings": {
             "geometry_initial_radius": float(args.geometry_initial_radius),
             "geometry_min_radius": float(args.geometry_min_radius),
             "geometry_max_radius": float(args.geometry_max_radius),
@@ -474,16 +537,21 @@ def main() -> int:
         "nit": int(last_result.nit),
         "accepted_steps": int(last_result.accepted_steps),
         "rejected_steps": int(last_result.rejected_steps),
+        "profile_contractions": int(last_result.profile_contractions),
+        "geometry_contractions": int(last_result.geometry_contractions),
+        "geometry_only_trials": int(last_result.geometry_only_trials),
         "final_geometry_radius": float(last_result.geometry_radius),
         "final_profile_fraction_limit": float(
             last_result.profile_fraction_limit
         ),
         "status": int(last_result.status),
+        "success": bool(last_result.success),
         "message": str(last_result.message),
     }
     summary_path = out_dir / "optimization_summary.json"
     summary_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
     print(f"wrote {summary_path}", flush=True)
+
     combined_example.write_outputs(
         initial_input=initial_input,
         optimized_input=optimized_input,
