@@ -4,7 +4,7 @@ from pathlib import Path
 import numpy as np
 
 
-def test_simple_combined_baseline_uses_ess_nominal_absolute_coordinates():
+def test_simple_combined_baseline_uses_ess_nominal_delta_coordinates():
     from examples.optimization import (
         optimize_geometry_profiles_qi_max_er_transition_bootstrap_net_power_initial_root_database_full_transport_simple_least_squares
         as example,
@@ -20,7 +20,16 @@ def test_simple_combined_baseline_uses_ess_nominal_absolute_coordinates():
     assert kwargs["include_profiles"] is True
     assert kwargs["profile_parameters"] == example.PROFILE_PARAMETERS
     assert kwargs["profile_scale_mode"] == "nominal"
-    assert kwargs["profile_coordinate_mode"] == "absolute"
+    assert args.profile_coordinate_mode == "delta"
+    assert kwargs["profile_coordinate_mode"] == "delta"
+
+    absolute_args = example.parser().parse_args(
+        ("--profile-coordinate-mode", "absolute")
+    )
+    absolute_kwargs = example._problem_kwargs(
+        absolute_args, physical_pitches=None
+    )
+    assert absolute_kwargs["profile_coordinate_mode"] == "absolute"
 
 
 def test_simple_combined_baseline_is_geometry_problem_plus_profiles_only():
@@ -81,6 +90,51 @@ def test_simple_combined_profile_bounds_are_physical_nominal_bounds():
     assert example.PROFILE_PHYSICAL_UPPER["n0"] == 10.0
     assert example.PROFILE_PHYSICAL_LOWER["T0"] == 5.0
     assert example.PROFILE_PHYSICAL_UPPER["T0"] == 25.0
+
+
+def test_simple_combined_delta_bounds_are_shifted_from_physical_baseline():
+    from examples.optimization import (
+        optimize_geometry_profiles_qi_max_er_transition_bootstrap_net_power_initial_root_database_full_transport_simple_least_squares
+        as example,
+    )
+
+    baseline = np.asarray([4.21, 17.8, 10.0, 2.0, 1.0, 1.0])
+
+    class Problem:
+        parameter_labels = (*example.PROFILE_PARAMETERS.split(","), "RBC:1:0")
+        x_scale = np.asarray([*baseline, 0.25])
+        x0 = np.zeros(7)
+        profile_coordinate_mode = "delta"
+
+        @staticmethod
+        def profile_values_from_scaled_parameters(_x):
+            return baseline
+
+    lower, upper = example.scaled_bounds(Problem())
+    np.testing.assert_allclose(
+        lower[:6],
+        np.asarray(
+            [
+                (example.PROFILE_PHYSICAL_LOWER[name] - value) / value
+                for name, value in zip(
+                    example.PROFILE_PARAMETERS.split(","), baseline, strict=True
+                )
+            ]
+        ),
+    )
+    np.testing.assert_allclose(
+        upper[:6],
+        np.asarray(
+            [
+                (example.PROFILE_PHYSICAL_UPPER[name] - value) / value
+                for name, value in zip(
+                    example.PROFILE_PARAMETERS.split(","), baseline, strict=True
+                )
+            ]
+        ),
+    )
+    assert np.isneginf(lower[-1])
+    assert np.isposinf(upper[-1])
 
 
 def test_simple_combined_postprocess_runs_both_fresh_transport_reports():

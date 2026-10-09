@@ -6,9 +6,9 @@ uses the validated ESS geometry coordinates, all six nominally scaled
 analytical-profile coordinates, and the established
 ``NEOPAX.optimization.least_squares`` SciPy-TRF path.  A single configurable
 SciPy trust multiplier is applied only to the profile block; every geometry
-entry remains exactly one.  Profile coordinates are absolute nominal
-coordinates, so their seed values are exactly one while the ESS geometry
-deltas start at zero.
+entry remains exactly one.  By default the profile coordinates are nominal
+relative deltas, so every optimizer coordinate starts at zero and the profile
+trust multiplier is not cancelled by SciPy's initial-radius normalization.
 
 The script exists as a clean reference for deciding how to increase profile
 motion without changing the validated geometry/objective implementation.
@@ -54,7 +54,7 @@ PROFILE_PARAMETERS = (
     "density_shape_alpha,temperature_shape_alpha"
 )
 PROFILE_SCALE_MODE = "nominal"
-PROFILE_COORDINATE_MODE = "absolute"
+PROFILE_COORDINATE_MODE = "delta"
 # The earlier fully Jacobian-scaled experiment gave the profile block about
 # 3.7 times the median trust scale of the ESS geometry block.  Reproduce only
 # that block-level effect here: no individual geometry or profile column is
@@ -93,6 +93,16 @@ def parser() -> argparse.ArgumentParser:
             "Fixed SciPy trust-region x_scale applied only to profile "
             "coordinates. Geometry coordinates always retain x_scale=1. "
             "Use 1 to reproduce the previous unit-metric baseline."
+        ),
+    )
+    out.add_argument(
+        "--profile-coordinate-mode",
+        choices=("delta", "absolute"),
+        default=PROFILE_COORDINATE_MODE,
+        help=(
+            "Profile optimizer origin. 'delta' starts profiles at zero and "
+            "is the intended block-trust experiment; 'absolute' reproduces "
+            "the previous nominal-coordinate run starting at one."
         ),
     )
     return out
@@ -197,7 +207,7 @@ def _problem_kwargs(args: argparse.Namespace, physical_pitches):
         "include_profiles": True,
         "profile_parameters": PROFILE_PARAMETERS,
         "profile_scale_mode": PROFILE_SCALE_MODE,
-        "profile_coordinate_mode": PROFILE_COORDINATE_MODE,
+        "profile_coordinate_mode": str(args.profile_coordinate_mode),
     }
 
 
@@ -282,10 +292,21 @@ def scaled_bounds(problem):
     """Bound only profile variables; every ESS geometry variable is free."""
 
     scales = np.asarray(jax.device_get(problem.x_scale), dtype=float)
+    coordinate_mode = str(problem.profile_coordinate_mode).strip().lower()
+    baseline_profiles = profile_parameter_values(problem, problem.x0)
     lower, upper = [], []
     for label, scale in zip(problem.parameter_labels, scales, strict=True):
-        lower.append(PROFILE_PHYSICAL_LOWER.get(label, -np.inf) / scale)
-        upper.append(PROFILE_PHYSICAL_UPPER.get(label, np.inf) / scale)
+        offset = (
+            baseline_profiles[label]
+            if coordinate_mode == "delta" and label in baseline_profiles
+            else 0.0
+        )
+        lower.append(
+            (PROFILE_PHYSICAL_LOWER.get(label, -np.inf) - offset) / scale
+        )
+        upper.append(
+            (PROFILE_PHYSICAL_UPPER.get(label, np.inf) - offset) / scale
+        )
     return np.asarray(lower), np.asarray(upper)
 
 
@@ -474,9 +495,13 @@ def main() -> int:
             ],
             dtype=bool,
         )
-        if not np.all(x0[profile_mask] == 1.0):
+        expected_profile_x0 = (
+            0.0 if args.profile_coordinate_mode == "delta" else 1.0
+        )
+        if not np.all(x0[profile_mask] == expected_profile_x0):
             raise AssertionError(
-                "Nominal absolute profile coordinates must start exactly at one."
+                f"Nominal {args.profile_coordinate_mode} profile coordinates "
+                f"must start exactly at {expected_profile_x0}."
             )
         if not np.all(x0[~profile_mask] == 0.0):
             raise AssertionError("ESS geometry deltas must start exactly at zero.")
@@ -491,7 +516,7 @@ def main() -> int:
             f"[setup] parameter_count={problem.parameter_count} "
             f"parameters={list(problem.parameter_labels)} "
             "geometry_coordinates=ESS_delta "
-            "profile_coordinates=absolute_nominal "
+            f"profile_coordinates={args.profile_coordinate_mode}_nominal "
             "optimizer=scipy_least_squares_TRF "
             f"profile_trust_multiplier={args.profile_trust_multiplier:.8g} "
             "geometry_trust_multiplier=1",
@@ -563,7 +588,7 @@ def main() -> int:
         "geometry_trust_multiplier": 1.0,
         "geometry_coordinate_mode": "ESS_delta",
         "profile_scale_mode": "nominal",
-        "profile_coordinate_mode": "absolute",
+        "profile_coordinate_mode": str(args.profile_coordinate_mode),
         "profile_dofs_enabled": True,
         "initial_physical_profiles": initial_profiles,
         "optimized_physical_profiles": optimized_profiles,
