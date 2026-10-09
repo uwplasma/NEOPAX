@@ -58,6 +58,82 @@ def _projected_gradient(
     return projected
 
 
+def _project_block_step(
+    step: np.ndarray,
+    step_lower: np.ndarray,
+    step_upper: np.ndarray,
+    geometry_indices: np.ndarray,
+    profile_indices: np.ndarray,
+    *,
+    geometry_radius: float,
+    profile_radius: float,
+) -> np.ndarray:
+    """Return a finite step inside the box and both disjoint block balls."""
+
+    projected = np.asarray(step, dtype=float).copy()
+    if not np.all(np.isfinite(projected)):
+        return np.zeros_like(projected)
+    projected = np.clip(projected, step_lower, step_upper)
+    for indices, radius in (
+        (geometry_indices, float(geometry_radius)),
+        (profile_indices, float(profile_radius)),
+    ):
+        if not indices.size:
+            continue
+        norm = float(np.linalg.norm(projected[indices]))
+        if norm > radius:
+            projected[indices] *= radius / norm
+
+    # Zero is feasible because the current iterate is inside the parameter
+    # bounds. Scaling either block toward zero therefore preserves its box
+    # bounds; the final clip only protects against roundoff at a finite bound.
+    return np.clip(projected, step_lower, step_upper)
+
+
+def _cauchy_block_step(
+    residuals: np.ndarray,
+    jacobian: np.ndarray,
+    step_lower: np.ndarray,
+    step_upper: np.ndarray,
+    geometry_indices: np.ndarray,
+    profile_indices: np.ndarray,
+    *,
+    geometry_radius: float,
+    profile_radius: float,
+    proximal_weight: float,
+) -> np.ndarray:
+    """Build a feasible descent step if the numerical QP solve stalls."""
+
+    gradient = jacobian.T @ residuals
+    direction = _project_block_step(
+        -gradient,
+        step_lower,
+        step_upper,
+        geometry_indices,
+        profile_indices,
+        geometry_radius=geometry_radius,
+        profile_radius=profile_radius,
+    )
+    slope = float(gradient @ direction)
+    if not np.isfinite(slope) or slope >= 0.0:
+        return np.zeros_like(direction)
+
+    model_direction = jacobian @ direction
+    curvature = float(model_direction @ model_direction)
+    if proximal_weight > 0.0:
+        if geometry_indices.size:
+            block = direction[geometry_indices] / geometry_radius
+            curvature += float(proximal_weight) * float(block @ block)
+        if profile_indices.size:
+            block = direction[profile_indices] / profile_radius
+            curvature += float(proximal_weight) * float(block @ block)
+    if np.isfinite(curvature) and curvature > 0.0:
+        alpha = min(1.0, max(0.0, -slope / curvature))
+    else:
+        alpha = 1.0
+    return alpha * direction
+
+
 def _block_model_step(
     residuals: np.ndarray,
     jacobian: np.ndarray,
@@ -100,35 +176,43 @@ def _block_model_step(
     )
     geometry_radius_eff = max(float(geometry_radius), np.finfo(float).eps)
 
+    # Scaling the complete quadratic by a positive constant leaves its exact
+    # minimizer unchanged but prevents SLSQP's absolute stopping tests from
+    # seeing objective/gradient magnitudes spanning many orders of magnitude.
+    model_scale = max(float(np.linalg.norm(residuals)), 1.0)
+    model_residuals = residuals / model_scale
+    model_jacobian = jacobian / model_scale
+    model_proximal_weight = float(proximal_weight) / model_scale**2
+
     def objective(step):
-        linearized = residuals + jacobian @ step
+        linearized = model_residuals + model_jacobian @ step
         value = 0.5 * float(linearized @ linearized)
-        if proximal_weight > 0.0:
+        if model_proximal_weight > 0.0:
             if geometry_indices.size:
                 normalized = step[geometry_indices] / geometry_radius_eff
-                value += 0.5 * float(proximal_weight) * float(
+                value += 0.5 * model_proximal_weight * float(
                     normalized @ normalized
                 )
             if profile_indices.size:
                 normalized = step[profile_indices] / profile_radius
-                value += 0.5 * float(proximal_weight) * float(
+                value += 0.5 * model_proximal_weight * float(
                     normalized @ normalized
                 )
         return value
 
     def gradient(step):
-        linearized = residuals + jacobian @ step
-        value = jacobian.T @ linearized
-        if proximal_weight > 0.0:
+        linearized = model_residuals + model_jacobian @ step
+        value = model_jacobian.T @ linearized
+        if model_proximal_weight > 0.0:
             if geometry_indices.size:
                 value[geometry_indices] += (
-                    float(proximal_weight)
+                    model_proximal_weight
                     * step[geometry_indices]
                     / geometry_radius_eff**2
                 )
             if profile_indices.size:
                 value[profile_indices] += (
-                    float(proximal_weight)
+                    model_proximal_weight
                     * step[profile_indices]
                     / profile_radius**2
                 )
@@ -170,39 +254,74 @@ def _block_model_step(
             }
         )
 
-    result = minimize(
-        objective,
-        np.zeros_like(x),
-        jac=gradient,
-        method="SLSQP",
-        bounds=Bounds(step_lower, step_upper),
-        constraints=constraints,
-        options={"ftol": 1.0e-12, "maxiter": 500, "disp": False},
-    )
-    step = np.asarray(result.x, dtype=float)
+    try:
+        result = minimize(
+            objective,
+            np.zeros_like(x),
+            jac=gradient,
+            method="SLSQP",
+            bounds=Bounds(step_lower, step_upper),
+            constraints=constraints,
+            options={"ftol": 1.0e-12, "maxiter": 500, "disp": False},
+        )
+        raw_step = np.asarray(result.x, dtype=float)
+        slsqp_success = bool(result.success)
+        slsqp_message = str(result.message)
+    except Exception as exc:
+        raw_step = np.zeros_like(x)
+        slsqp_success = False
+        slsqp_message = f"SLSQP raised {type(exc).__name__}: {exc}"
     feasibility_tolerance = 1.0e-8
-    feasible = bool(
-        np.all(step >= step_lower - feasibility_tolerance)
-        and np.all(step <= step_upper + feasibility_tolerance)
+    raw_feasible = bool(
+        np.all(np.isfinite(raw_step))
+        and np.all(raw_step >= step_lower - feasibility_tolerance)
+        and np.all(raw_step <= step_upper + feasibility_tolerance)
     )
     if geometry_indices.size:
-        feasible = feasible and bool(
-            np.linalg.norm(step[geometry_indices])
+        raw_feasible = raw_feasible and bool(
+            np.linalg.norm(raw_step[geometry_indices])
             <= geometry_radius_eff * (1.0 + feasibility_tolerance)
         )
     if profile_indices.size:
-        feasible = feasible and bool(
-            np.linalg.norm(step[profile_indices])
+        raw_feasible = raw_feasible and bool(
+            np.linalg.norm(raw_step[profile_indices])
             <= profile_radius * (1.0 + feasibility_tolerance)
         )
-    if not feasible:
-        raise RuntimeError(
-            "Block trust-region subproblem returned an infeasible step: "
-            f"status={result.status}, message={result.message}."
+
+    step = _project_block_step(
+        raw_step,
+        step_lower,
+        step_upper,
+        geometry_indices,
+        profile_indices,
+        geometry_radius=geometry_radius_eff,
+        profile_radius=profile_radius,
+    )
+    initial_cost = _cost(residuals)
+    projected_reduction = initial_cost - _cost(residuals + jacobian @ step)
+    subproblem_solver = "slsqp"
+    if not raw_feasible or not slsqp_success:
+        subproblem_solver = "slsqp_projected"
+    if not np.isfinite(projected_reduction) or projected_reduction <= 0.0:
+        step = _cauchy_block_step(
+            residuals,
+            jacobian,
+            step_lower,
+            step_upper,
+            geometry_indices,
+            profile_indices,
+            geometry_radius=geometry_radius_eff,
+            profile_radius=profile_radius,
+            proximal_weight=proximal_weight,
         )
+        subproblem_solver = "cauchy_fallback"
+
     metadata: dict[str, float | bool | str] = {
-        "success": bool(result.success),
-        "message": str(result.message),
+        "success": bool(np.any(step)),
+        "message": slsqp_message,
+        "slsqp_success": slsqp_success,
+        "slsqp_raw_feasible": raw_feasible,
+        "subproblem_solver": subproblem_solver,
         "geometry_step_norm": float(
             np.linalg.norm(step[geometry_indices])
         ),
@@ -375,6 +494,7 @@ def block_trust_region_least_squares(
                 f"predicted_reduction={predicted_reduction:.8e} "
                 f"ratio={ratio:.8e} geometry_radius={geometry_radius:.6e} "
                 f"profile_fraction_limit={profile_fraction_limit:.6e} "
+                f"model_step={step_metadata['subproblem_solver']} "
                 f"geometry_step_l2={step_metadata['geometry_step_norm']:.6e} "
                 f"profile_step_max_abs={step_metadata['profile_step_max_abs']:.6e}"
                 f"{details}",

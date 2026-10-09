@@ -5,6 +5,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
+import NEOPAX._block_trust_region as block_trust_region
 from NEOPAX._block_trust_region import block_trust_region_least_squares
 
 
@@ -77,3 +78,74 @@ def test_block_trust_region_rejects_noncentered_initial_point_outside_bounds():
             bounds=(np.asarray((-1.0, -1.0)), np.asarray((1.0, 1.0))),
             verbose=0,
         )
+
+
+def test_block_model_step_falls_back_when_slsqp_returns_nonfinite_step(
+    monkeypatch,
+):
+    def failed_minimize(*_args, **_kwargs):
+        return SimpleNamespace(
+            x=np.asarray((np.nan, np.nan)),
+            success=False,
+            status=8,
+            message="Positive directional derivative for linesearch",
+        )
+
+    import scipy.optimize
+
+    monkeypatch.setattr(scipy.optimize, "minimize", failed_minimize)
+    residuals = np.asarray((2.0, -1.0))
+    jacobian = np.eye(2)
+    step, metadata = block_trust_region._block_model_step(
+        residuals,
+        jacobian,
+        np.zeros((2,)),
+        np.asarray((-1.0, -1.0)),
+        np.asarray((1.0, 1.0)),
+        np.asarray((True, False)),
+        geometry_radius=0.25,
+        profile_fraction_limit=0.10,
+        proximal_weight=1.0e-10,
+    )
+
+    assert metadata["subproblem_solver"] == "cauchy_fallback"
+    assert np.all(np.isfinite(step))
+    assert abs(step[0]) <= 0.10 + 1.0e-12
+    assert abs(step[1]) <= 0.25 + 1.0e-12
+    assert block_trust_region._cost(residuals + jacobian @ step) < (
+        block_trust_region._cost(residuals)
+    )
+
+
+def test_block_model_step_projects_infeasible_slsqp_descent(monkeypatch):
+    def infeasible_minimize(*_args, **_kwargs):
+        return SimpleNamespace(
+            x=np.asarray((-10.0, 10.0)),
+            success=False,
+            status=8,
+            message="Positive directional derivative for linesearch",
+        )
+
+    import scipy.optimize
+
+    monkeypatch.setattr(scipy.optimize, "minimize", infeasible_minimize)
+    residuals = np.asarray((1.0, -1.0))
+    jacobian = np.eye(2)
+    step, metadata = block_trust_region._block_model_step(
+        residuals,
+        jacobian,
+        np.zeros((2,)),
+        np.asarray((-1.0, -1.0)),
+        np.asarray((1.0, 1.0)),
+        np.asarray((True, False)),
+        geometry_radius=0.25,
+        profile_fraction_limit=0.10,
+        proximal_weight=1.0e-10,
+    )
+
+    assert metadata["subproblem_solver"] == "slsqp_projected"
+    assert abs(step[0]) <= 0.10 + 1.0e-12
+    assert abs(step[1]) <= 0.25 + 1.0e-12
+    assert block_trust_region._cost(residuals + jacobian @ step) < (
+        block_trust_region._cost(residuals)
+    )
