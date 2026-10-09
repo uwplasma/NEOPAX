@@ -460,11 +460,10 @@ def main() -> int:
             verbose=1,
         )
         x_opt = np.asarray(result.x, dtype=float)
-        _print_evaluation(
+        combined_example.report(
             f"geometry-primary stage {max_mode}",
             problem,
             x_opt,
-            result.evaluation,
         )
         optimized_input = problem.input_from_scaled_parameters(x_opt)
         optimized_config = problem.config_from_scaled_parameters(x_opt)
