@@ -6,9 +6,10 @@ full-transport problem:
 
 1. Run the established geometry-only SciPy-TRF optimization with its exact
    ESS parameterization and objective definitions.
-2. Rebase the same full-transport problem on the accepted geometry, add all
-   six nominally scaled analytical-profile DoFs, and run ordinary nonlinear
-   SciPy-TRF least squares again.
+2. Rebuild the same full-transport problem with the same baseline and ESS
+   scales, initialize its geometry block at the accepted phase-1 coordinates,
+   add all six nominally scaled analytical-profile DoFs, and run ordinary
+   nonlinear SciPy-TRF least squares again.
 
 The validated geometry-only example and its library path are not modified.
 The second phase starts at the geometry-only result with nominal profiles, so
@@ -188,9 +189,11 @@ def _run_geometry_phase(
     final_input = None
     final_problem = None
     final_result = None
+    final_baseline_input = None
     initial_cost = None
 
     for max_mode in max_modes:
+        stage_baseline_input = current_input
         print(
             "\n===== phase 1/2: validated geometry-only full transport "
             f"stage, max_mode={max_mode}, grid=({args.database_n_theta},"
@@ -265,10 +268,17 @@ def _run_geometry_phase(
         current_input = stage_input
         final_problem = problem
         final_result = result
+        final_baseline_input = stage_baseline_input
 
     if any(
         value is None
-        for value in (initial_input, final_input, final_problem, final_result)
+        for value in (
+            initial_input,
+            final_input,
+            final_problem,
+            final_result,
+            final_baseline_input,
+        )
     ):
         raise RuntimeError("No geometry-only warm-start stage was executed.")
 
@@ -279,11 +289,58 @@ def _run_geometry_phase(
         "initial_input": initial_input,
         "warm_input": final_input,
         "warm_path": warm_path,
+        "baseline_input": final_baseline_input,
         "problem": final_problem,
         "result": final_result,
         "initial_cost": initial_cost,
         "physical_pitches": physical_pitches,
     }
+
+
+def _combined_starting_point(geometry_problem, geometry_result, combined_problem):
+    """Append nominal profile coordinates without rebasing geometry.
+
+    Geometry values and scales are matched by label so this remains correct if
+    the mixed parameter set stores its profile block before its boundary block.
+    """
+
+    geometry_labels = tuple(geometry_problem.parameter_labels)
+    geometry_x = np.asarray(geometry_result.x, dtype=float)
+    geometry_scales = np.asarray(
+        jax.device_get(geometry_problem.x_scale), dtype=float
+    )
+    combined_labels = tuple(combined_problem.parameter_labels)
+    combined_scales = np.asarray(
+        jax.device_get(combined_problem.x_scale), dtype=float
+    )
+    if geometry_x.shape != (len(geometry_labels),):
+        raise ValueError("The accepted geometry vector has an unexpected shape.")
+
+    geometry_by_label = dict(zip(geometry_labels, geometry_x, strict=True))
+    scale_by_label = dict(zip(geometry_labels, geometry_scales, strict=True))
+    missing = [label for label in geometry_labels if label not in combined_labels]
+    if missing:
+        raise ValueError(
+            "The combined problem is missing accepted geometry coordinates: "
+            + ", ".join(missing)
+        )
+
+    start = np.asarray(jax.device_get(combined_problem.x0), dtype=float).copy()
+    geometry_scale_differences = []
+    for index, label in enumerate(combined_labels):
+        if label not in geometry_by_label:
+            continue
+        start[index] = geometry_by_label[label]
+        geometry_scale_differences.append(
+            abs(combined_scales[index] - scale_by_label[label])
+        )
+    max_scale_difference = max(geometry_scale_differences, default=0.0)
+    if max_scale_difference != 0.0:
+        raise AssertionError(
+            "Phase 2 changed the phase-1 ESS geometry scales; "
+            f"max_abs_difference={max_scale_difference:.16e}."
+        )
+    return start
 
 
 def main() -> int:
@@ -320,7 +377,10 @@ def main() -> int:
     )
 
     combined_helper._validate_args(args)
-    current_input = geometry_phase["warm_path"]
+    # Keep the final geometry phase's original baseline. The accepted geometry
+    # is represented by its existing ESS coordinate vector, not by replacing
+    # the baseline and resetting those coordinates to zero.
+    current_input = geometry_phase["baseline_input"]
     current_config = copy.deepcopy(forward_config)
     physical_pitches = geometry_phase["physical_pitches"]
     # Phase 1 has already completed the whole resolution continuation. Keep
@@ -355,7 +415,9 @@ def main() -> int:
             problem,
             out_dir / f"combined_warm_start_inputs_m{max_mode}",
         )
-        x0 = np.asarray(jax.device_get(problem.x0), dtype=float)
+        x0 = _combined_starting_point(
+            geometry_phase["problem"], geometry_phase["result"], problem
+        )
         profile_names = frozenset(combined_helper.PROFILE_PARAMETERS.split(","))
         profile_mask = np.asarray(
             [label in profile_names for label in problem.parameter_labels],
@@ -368,10 +430,40 @@ def main() -> int:
             raise AssertionError(
                 "Combined nominal profile coordinates have an unexpected origin."
             )
-        if not np.all(x0[~profile_mask] == 0.0):
-            raise AssertionError(
-                "Combined ESS geometry deltas must start at the warm geometry."
+        accepted_geometry_by_label = dict(
+            zip(
+                geometry_phase["problem"].parameter_labels,
+                np.asarray(geometry_phase["result"].x, dtype=float),
+                strict=True,
             )
+        )
+        expected_geometry_x = np.asarray(
+            [
+                accepted_geometry_by_label[label]
+                for label in np.asarray(problem.parameter_labels)[~profile_mask]
+            ],
+            dtype=float,
+        )
+        if not np.array_equal(x0[~profile_mask], expected_geometry_x):
+            raise AssertionError(
+                "Combined ESS coordinates do not equal the accepted geometry "
+                "coordinates from phase 1."
+            )
+
+        reconstructed_path = out_dir / (
+            "input.QI_neopax_combined_initial_reconstructed_from_phase_1"
+        )
+        problem.input_from_scaled_parameters(x0).to_indata(reconstructed_path)
+        if reconstructed_path.read_bytes() != geometry_phase["warm_path"].read_bytes():
+            raise AssertionError(
+                "Phase 2 did not reconstruct the exact accepted phase-1 VMEC "
+                "input from the preserved ESS coordinates."
+            )
+        print(
+            "[warm-start coordinate parity] preserved_phase_1_ESS_scales=True "
+            "reconstructed_boundary_exact=True",
+            flush=True,
+        )
 
         if nominal_profiles is None:
             nominal_profiles = combined_helper.profile_parameter_values(problem, x0)
@@ -384,7 +476,7 @@ def main() -> int:
         print(
             f"[setup] phase=combined parameter_count={problem.parameter_count} "
             f"parameters={list(problem.parameter_labels)} max_nfev={combined_budget} "
-            "geometry_coordinates=ESS_delta "
+            "geometry_coordinates=preserved_phase_1_ESS_delta "
             f"profile_coordinates={args.profile_coordinate_mode}_nominal "
             f"profile_trust_multiplier={args.profile_trust_multiplier:.8g} "
             "geometry_trust_multiplier=1 optimizer=scipy_least_squares_TRF",
@@ -471,6 +563,9 @@ def main() -> int:
                 geometry_phase["result"].x, dtype=float
             ).tolist(),
             "accepted_geometry_input": str(geometry_phase["warm_path"]),
+            "geometry_coordinate_baseline_input": str(
+                geometry_phase["baseline_input"]
+            ),
         },
         "combined_phase": {
             "max_nfev": combined_budget,
@@ -479,6 +574,7 @@ def main() -> int:
             "profile_scale_mode": "nominal",
             "profile_trust_multiplier": float(args.profile_trust_multiplier),
             "geometry_trust_multiplier": 1.0,
+            "geometry_coordinate_origin": "preserved_phase_1_baseline_and_scales",
             "initial_cost_at_geometry_warm_start": float(combined_initial_cost),
             "initial_cost_minus_geometry_final_cost": warm_cost_difference,
             "cost": float(final_result.cost),

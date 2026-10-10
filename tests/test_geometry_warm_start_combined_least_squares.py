@@ -1,6 +1,8 @@
 import ast
 from pathlib import Path
 
+import numpy as np
+
 
 def _example():
     from examples.optimization import (
@@ -75,6 +77,54 @@ def test_warm_start_uses_nonlinear_least_squares_in_both_phases():
     assert len(calls) == 2
 
 
+def test_warm_start_appends_profiles_to_accepted_geometry_coordinates():
+    example = _example()
+
+    class GeometryProblem:
+        parameter_labels = ("RBC:1:0", "ZBS:1:0")
+        x_scale = np.asarray((0.25, 0.5))
+
+    class GeometryResult:
+        x = np.asarray((0.125, -0.375))
+
+    class CombinedProblem:
+        parameter_labels = ("n0", "T0", "RBC:1:0", "ZBS:1:0")
+        x_scale = np.asarray((4.21, 17.8, 0.25, 0.5))
+        x0 = np.zeros(4)
+
+    np.testing.assert_array_equal(
+        example._combined_starting_point(
+            GeometryProblem(), GeometryResult(), CombinedProblem()
+        ),
+        np.asarray((0.0, 0.0, 0.125, -0.375)),
+    )
+
+
+def test_warm_start_rejects_recomputed_geometry_scale():
+    example = _example()
+
+    class GeometryProblem:
+        parameter_labels = ("RBC:1:0",)
+        x_scale = np.asarray((0.25,))
+
+    class GeometryResult:
+        x = np.asarray((0.125,))
+
+    class CombinedProblem:
+        parameter_labels = ("n0", "RBC:1:0")
+        x_scale = np.asarray((4.21, 0.5))
+        x0 = np.zeros(2)
+
+    try:
+        example._combined_starting_point(
+            GeometryProblem(), GeometryResult(), CombinedProblem()
+        )
+    except AssertionError as exc:
+        assert "changed the phase-1 ESS geometry scales" in str(exc)
+    else:
+        raise AssertionError("A recomputed ESS scale must be rejected.")
+
+
 def test_warm_start_does_not_modify_geometry_only_source():
     example = _example()
     source = Path(example.__file__).read_text(encoding="utf-8")
@@ -84,3 +134,5 @@ def test_warm_start_does_not_modify_geometry_only_source():
     assert "include_profiles" not in source[
         source.index("def _build_geometry_problem(") : source.index("def _cost(")
     ]
+    assert 'current_input = geometry_phase["baseline_input"]' in source
+    assert 'current_input = geometry_phase["warm_path"]' not in source
