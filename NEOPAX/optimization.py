@@ -3196,8 +3196,34 @@ def geometry_full_transport_least_squares_problem(
     )
 
 
-def least_squares(problem: GeometryLeastSquaresProblem, **kwargs):
-    """Run SciPy least_squares on a NEOPAX geometry least-squares problem."""
+def _is_resource_exhaustion(error: BaseException) -> bool:
+    """Distinguish exhausted process/device resources from a bad trial point."""
+
+    seen = set()
+    while error is not None and id(error) not in seen:
+        seen.add(id(error))
+        message = str(error).lower()
+        if isinstance(error, MemoryError) or any(
+            marker in message
+            for marker in (
+                "resource_exhausted",
+                "cuda_error_out_of_memory",
+                "out of memory",
+            )
+        ):
+            return True
+        error = error.__cause__ or error.__context__
+    return False
+
+
+def least_squares(problem: GeometryLeastSquaresProblem, *, x0=None, **kwargs):
+    """Run SciPy least_squares in the problem's scaled coordinates.
+
+    An explicit ``x0`` supports continuation without changing the problem's
+    coordinate origin or scaling. If supplied, ``initial_evaluation`` must
+    have been evaluated at that same point. Resource exhaustion is fatal;
+    nonconverged physical trials retain the existing penalty behavior.
+    """
 
     from scipy.optimize import least_squares as scipy_least_squares
 
@@ -3238,6 +3264,8 @@ def least_squares(problem: GeometryLeastSquaresProblem, **kwargs):
         try:
             residuals = np.asarray(jax.device_get(_evaluate(x).residuals), dtype=float)
         except Exception as exc:
+            if _is_resource_exhaustion(exc):
+                raise
             if state["nres"] is None:
                 raise
             state["eval_count"] = int(state["eval_count"]) + 1
@@ -3283,6 +3311,8 @@ def least_squares(problem: GeometryLeastSquaresProblem, **kwargs):
         try:
             jacobian = np.asarray(jax.device_get(_evaluate(x).jacobian), dtype=float)
         except Exception as exc:
+            if _is_resource_exhaustion(exc):
+                raise
             if state["nres"] is None:
                 raise
             jacobian = np.zeros((int(state["nres"]), int(state["npar"])), dtype=float)
@@ -3297,7 +3327,12 @@ def least_squares(problem: GeometryLeastSquaresProblem, **kwargs):
             return jacobian
         return np.where(np.isfinite(jacobian), jacobian, 0.0)
 
-    x0 = np.asarray(jax.device_get(problem.x0), dtype=float)
+    x0 = np.asarray(jax.device_get(problem.x0 if x0 is None else x0), dtype=float)
+    if x0.shape != (problem.parameter_count,) or not np.all(np.isfinite(x0)):
+        raise ValueError(
+            "x0 must contain finite scaled coordinates with shape "
+            f"({problem.parameter_count},); got shape={x0.shape}."
+        )
     if initial_evaluation is not None:
         initial_residuals = np.asarray(jax.device_get(initial_evaluation.residuals), dtype=float)
         initial_jacobian = np.asarray(jax.device_get(initial_evaluation.jacobian), dtype=float)

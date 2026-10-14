@@ -21,9 +21,13 @@ from __future__ import annotations
 
 import argparse
 import copy
+import gc
+import hashlib
 import json
+import os
 from pathlib import Path
 import sys
+from types import SimpleNamespace
 
 import jax
 import numpy as np
@@ -62,6 +66,11 @@ def parser() -> argparse.ArgumentParser:
     out = geometry_example.parser()
     out.description = __doc__
     out.set_defaults(out_dir=OUT_DIR)
+    out.add_argument(
+        "--diagnose-memory",
+        action="store_true",
+        help="Log RSS, live JAX arrays, device allocation, and stage cache sizes per evaluation.",
+    )
     out.add_argument(
         "--geometry-max-nfev",
         type=int,
@@ -172,6 +181,92 @@ def _cost(evaluation) -> float:
     return 0.5 * float(np.dot(residuals, residuals))
 
 
+class MemoryDiagnosticProblem:
+    """Observe the delegated evaluation without running another physics solve."""
+
+    def __init__(self, problem, phase: str):
+        self.problem = problem
+        self.phase = phase
+        self.evaluation_count = 0
+
+    def __getattr__(self, name):
+        return getattr(self.problem, name)
+
+    def evaluate(self, scaled_parameter_values=None):
+        self.evaluation_count += 1
+        try:
+            return self.problem.evaluate(scaled_parameter_values)
+        finally:
+            builder = getattr(self.problem, "table_result_builder", None)
+            cache_sizes = {}
+            for name in ("runtime_scan", "segment_replay", "segment_bwd", "schedule_probe", "bootstrap"):
+                probe = getattr(builder, f"optimization_{name}_cache_size", None)
+                if callable(probe):
+                    cache_sizes[name] = probe()
+            try:
+                live_arrays = len(jax.live_arrays())
+                stats = jax.devices()[0].memory_stats() or {}
+            except Exception:
+                live_arrays, stats = None, {}
+            rss = opt._process_resident_memory_bytes()
+            print(
+                f"[memory] phase={self.phase} evaluation={self.evaluation_count} "
+                f"rss_MiB={None if rss is None else round(rss / 2**20, 1)} "
+                f"live_jax_arrays={live_arrays} "
+                f"device_bytes_in_use={stats.get('bytes_in_use')} "
+                f"device_peak_bytes_in_use={stats.get('peak_bytes_in_use')} "
+                f"stage_caches={cache_sizes}",
+                flush=True,
+            )
+
+
+def _write_geometry_phase_summary(phase, *, args, config, max_modes, budget, out_dir):
+    """Save the accepted phase before phase 2 can fail, with parity inputs."""
+
+    result = phase["result"]
+    terms = opt._normalize_initial_er_root_least_squares_terms(
+        geometry_example.active_terms(args)
+    )
+    seed_input = args.seed_input.resolve()
+    summary = {
+        "seed_input": str(seed_input),
+        "accepted_geometry_input": str(phase["warm_path"]),
+        "geometry_coordinate_baseline_input": str(phase["baseline_input"]),
+        "seed_sha256": hashlib.sha256(seed_input.read_bytes()).hexdigest(),
+        "geometry_script_sha256": hashlib.sha256(
+            Path(geometry_example.__file__).read_bytes()
+        ).hexdigest(),
+        "config": config,
+        "max_mode_schedule": list(max_modes),
+        "terms": [
+            {"family": term.objective.family, "objective": term.objective.name,
+             "target": term.target, "weight": term.weight, "label": term.label}
+            for term in terms
+        ],
+        "objectives": {
+            "max_er": bool(args.max_er), "root_objectives": bool(args.root_objectives),
+            "transition_location": bool(args.transition_location_objective),
+            "bootstrap_penalty": bool(args.bootstrap_penalty), "net_power": bool(args.net_power),
+        },
+        "optimizer": {"max_nfev": budget, "ftol": geometry_example.FTOL,
+                      "xtol": geometry_example.XTOL, "x_scale": "unit"},
+        "parameter_labels": list(phase["coordinates"].parameter_labels),
+        "coordinate_scales": phase["coordinates"].x_scale.tolist(),
+        "x": np.asarray(result.x, dtype=float).tolist(),
+        "initial_cost": float(phase["initial_cost"]),
+        "cost": float(result.cost),
+        "nfev": int(result.nfev),
+        "status": int(result.status),
+        "message": str(result.message),
+        "jax_version": jax.__version__,
+        "vmex_version": getattr(vj, "__version__", None),
+        "XLA_FLAGS": os.environ.get("XLA_FLAGS", ""),
+    }
+    path = out_dir / "geometry_phase_summary.json"
+    path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
+    print(f"wrote {path}", flush=True)
+
+
 def _run_geometry_phase(
     args: argparse.Namespace,
     *,
@@ -228,6 +323,8 @@ def _run_geometry_phase(
                 "input.QI_neopax_geometry_warm_start_eval"
             ),
         )
+        if args.diagnose_memory:
+            problem = MemoryDiagnosticProblem(problem, f"geometry_m{max_mode}")
         x0 = np.asarray(jax.device_get(problem.x0), dtype=float)
         if not np.all(x0 == 0.0):
             raise AssertionError(
@@ -290,7 +387,13 @@ def _run_geometry_phase(
         "warm_input": final_input,
         "warm_path": warm_path,
         "baseline_input": final_baseline_input,
-        "problem": final_problem,
+        # Only these host-side coordinates are needed by phase 2. Retaining
+        # the whole problem also retains phase-1 runtime arrays and compiled
+        # stage owners for the duration of the combined optimization.
+        "coordinates": SimpleNamespace(
+            parameter_labels=tuple(final_problem.parameter_labels),
+            x_scale=np.asarray(jax.device_get(final_problem.x_scale), dtype=float).copy(),
+        ),
         "result": final_result,
         "initial_cost": initial_cost,
         "physical_pitches": physical_pitches,
@@ -368,6 +471,11 @@ def main() -> int:
         max_nfev=geometry_budget,
         physical_pitches=geometry_example.PHYSICAL_J_PITCHES,
     )
+    _write_geometry_phase_summary(
+        geometry_phase, args=args, config=forward_config, max_modes=max_modes,
+        budget=geometry_budget, out_dir=out_dir,
+    )
+    gc.collect()
 
     # Import the combined helper only after phase 1. This keeps all imports
     # preceding the geometry-only solve identical to the validated example.
@@ -415,8 +523,10 @@ def main() -> int:
             problem,
             out_dir / f"combined_warm_start_inputs_m{max_mode}",
         )
+        if args.diagnose_memory:
+            problem = MemoryDiagnosticProblem(problem, f"combined_m{max_mode}")
         x0 = _combined_starting_point(
-            geometry_phase["problem"], geometry_phase["result"], problem
+            geometry_phase["coordinates"], geometry_phase["result"], problem
         )
         profile_names = frozenset(combined_helper.PROFILE_PARAMETERS.split(","))
         profile_mask = np.asarray(
@@ -432,7 +542,7 @@ def main() -> int:
             )
         accepted_geometry_by_label = dict(
             zip(
-                geometry_phase["problem"].parameter_labels,
+                geometry_phase["coordinates"].parameter_labels,
                 np.asarray(geometry_phase["result"].x, dtype=float),
                 strict=True,
             )
@@ -503,7 +613,7 @@ def main() -> int:
             trust_scale,
         )
         least_squares_options["max_nfev"] = combined_budget
-        result = opt.least_squares(problem, **least_squares_options)
+        result = opt.least_squares(problem, x0=x0, **least_squares_options)
         x_opt = np.asarray(result.x, dtype=float)
         combined_helper.report(
             f"combined warm-start stage {max_mode}", problem, x_opt
@@ -552,7 +662,7 @@ def main() -> int:
         "combined_max_mode_schedule": list(combined_modes),
         "geometry_phase": {
             "max_nfev": geometry_budget,
-            "parameter_labels": list(geometry_phase["problem"].parameter_labels),
+            "parameter_labels": list(geometry_phase["coordinates"].parameter_labels),
             "initial_cost": float(geometry_phase["initial_cost"]),
             "cost": float(geometry_phase["result"].cost),
             "optimality": float(geometry_phase["result"].optimality),
