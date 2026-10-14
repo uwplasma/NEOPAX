@@ -172,6 +172,7 @@ from NEOPAX._reverse_ad_optimization import (  # noqa: E402
     transport_least_squares_terms,
 )
 from NEOPAX._reverse_ad_transport import (  # noqa: E402
+    TRANSPORT_OPTIMIZATION_OPTIONAL_OBJECTIVE_LABELS,
     TRANSPORT_REVERSE_OBJECTIVE_LABELS,
     _configure_database_reverse_performance,
     grouped_transport_reverse_report_builder,
@@ -225,6 +226,15 @@ from NEOPAX._transport_solvers import (  # noqa: E402
     _radau_zero_support_delta_tree_like,
 )
 
+
+FULL_TRANSPORT_OBJECTIVE_LABELS = (
+    *(
+        name
+        for name in TRANSPORT_REVERSE_OBJECTIVE_LABELS
+        if name not in {"Er_transition_left", "Er_transition_right"}
+    ),
+    *TRANSPORT_OPTIMIZATION_OPTIONAL_OBJECTIVE_LABELS,
+)
 
 PARAMETER_ORDER = PROFILE_PARAMETER_ORDER
 _PROFILE_PARAMETER_DEFAULTS = {
@@ -4027,7 +4037,7 @@ def _run_realtime_geometry_optimization_api_smoke(
         ),
     )
     objective_labels = (
-        TRANSPORT_REVERSE_OBJECTIVE_LABELS
+        FULL_TRANSPORT_OBJECTIVE_LABELS
         if bool(getattr(args, "full_transport_shared_payload_smoke", False))
         else tuple(OBJECTIVE_LABELS)
     )
@@ -4133,6 +4143,7 @@ def _run_realtime_geometry_optimization_api_smoke(
         )
         table_result_builder = internal_realtime_geometry_transport_reverse_table_result_builder(
             table_context=table_context,
+            objective_labels=objective_labels,
             geometry_context=geometry_context,
             baseline_geometry_deltas=geometry_values0,
             combined_geometry_payload=True,
@@ -5718,10 +5729,17 @@ def main() -> None:
         "--objective",
         type=str,
         default="softmax_Er",
-        choices=tuple(dict.fromkeys(tuple(OBJECTIVE_LABELS) + tuple(INITIAL_ER_ROOT_ONLY_EXPLICIT_OBJECTIVES) + ("all",))),
+        choices=tuple(dict.fromkeys(
+            tuple(OBJECTIVE_LABELS)
+            + tuple(INITIAL_ER_ROOT_ONLY_EXPLICIT_OBJECTIVES)
+            + TRANSPORT_OPTIMIZATION_OPTIONAL_OBJECTIVE_LABELS
+            + ("all",)
+        )),
         help=(
             "Scalar objective for reverse mode. Use 'all' to return the "
-            "objective-by-parameter reverse derivative matrix for every metric."
+            "objective-by-parameter reverse derivative matrix for every metric. "
+            "Full-transport shared-payload mode replaces the fixed left/right "
+            "Er rows with transition radius, location moment, and strength."
         ),
     )
     parser.add_argument(
@@ -6800,6 +6818,20 @@ def main() -> None:
         ),
     )
     args = parser.parse_args()
+    if args.objective in TRANSPORT_OPTIMIZATION_OPTIONAL_OBJECTIVE_LABELS and (
+        not args.full_transport_shared_payload_smoke
+        or args.reverse_parameter_mode != "profiles_plus_realtime_geometry"
+        or args.realtime_geometry_gradient_path != "reverse_payload"
+        or args.initial_er_root_only_optimization_smoke
+        or args.transport_solver_forward_smoke
+    ):
+        parser.error(
+            "The transition radius/location/strength objectives require "
+            "--full-transport-shared-payload-smoke, "
+            "--reverse-parameter-mode profiles_plus_realtime_geometry and "
+            "--realtime-geometry-gradient-path reverse_payload, without "
+            "root-only or forward-only smoke modes."
+        )
     if (
         str(args.reverse_schedule_artifact_mode) == "reuse_static_probe"
         and not bool(args.full_transport_shared_payload_smoke)
