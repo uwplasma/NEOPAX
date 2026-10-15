@@ -681,7 +681,8 @@ def _frozen_linearized_vmec_geometry_bundle(
     # before the +/- h tangent endpoints are even formed.
     print(
         "[autodiff-gate] progress: baseline forward VMEC solve for "
-        "frozen-linearized geometry FD",
+        "frozen-linearized geometry FD "
+        f"(mboz={geometry_context.mboz}, nboz={geometry_context.nboz})",
         flush=True,
     )
     state_star = _solve_state_for_single_param(

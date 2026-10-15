@@ -1,0 +1,79 @@
+env -u JAX_COMPILATION_CACHE_DIR \
+JAX_ENABLE_COMPILATION_CACHE=0 \
+PYTHONPATH="$HOME/VMEX:$HOME/NTX/src" \
+/usr/bin/time -v \
+python examples/benchmarks/benchmark_transport_realtime_geometry_forward_fd.py \ 
+  --config examples/benchmarks/Solve_Transport_equations_wHe_radau_ntx_scan_runtime_database_vmec_realtime_geometry_benchmark_black_box.toml \
+  --parameter n0 \
+  --accepted-step-limit 16 \
+  --radau-jacobian-reuse-mode legacy \
+  --geometry-fd-lane frozen_linearized \
+  --replay-mode accepted \
+  --fd-accepted-replay-contract reverse_frozen_metadata \
+  --initial-Er-root-ad jax_selected_root \
+  --initial-Er-root-fd-root-lane frozen_linearized
+[autodiff-gate] device placement: requested=default default_backend=gpu selected_device=cuda:0
+[NEOPAX] built runtime NTX scan database: rho=7 nu_v=16 Er_tilde=11 grid=(25,31,64) backend=vmec
+[autodiff-gate] progress: running baseline realtime rollout for FD trace
+E1015 00:49:01.037953  243646 slow_operation_alarm.cc:73] 
+********************************
+[Compiling module jit_scan for GPU] Very slow compile? If you want to file a bug, run with envvar XLA_FLAGS=--xla_dump_to=/tmp/foo and attach the results.
+********************************
+E1015 00:49:19.390221  243605 slow_operation_alarm.cc:140] The operation took 2m18.352377385s
+
+********************************
+[Compiling module jit_scan for GPU] Very slow compile? If you want to file a bug, run with envvar XLA_FLAGS=--xla_dump_to=/tmp/foo and attach the results.
+********************************
+[autodiff-gate] progress: preparing frozen-linearized initial-Er root branch for full-transport FD
+[autodiff-gate] progress: running profile fd_minus replay
+[autodiff-gate] progress: running profile fd_plus replay
+[autodiff-gate] mode=transport_realtime_geometry_forward_fd parameter=n0 parameter_kind=profile baseline_value=4.210000e+00 fd_step=1.263000e-06 replay_mode=accepted fd_accepted_replay_contract=reverse_frozen_metadata geometry_fd_lane=frozen_linearized root_fd_lane=frozen_linearized
+[autodiff-gate] objective values:
+  - softmax_Er: value=2.1347597195937237e+01
+  - net_total_power_volume_average_mw_m3: value=5.0807530056153805e-01
+  - Er2_volume_average: value=2.6970444770780875e+02
+  - Er_volume_average: value=-2.8511644595415109e+00
+  - electron_temperature_volume_average_keV: value=6.5667321668602181e+00
+  - total_pressure_volume_average: value=3.4217392410449378e+01
+  - alpha_power_volume_average_mw_m3: value=5.8919528056733395e-01
+  - bootstrap_current_softmax_abs_scaled: value=1.3717342728662278e+00
+  - Er_transition_rho: value=6.1293923577522791e-01
+  - Er_transition_location_moment: value=1.1293923577522791e-01
+  - Er_transition_strength: value=2.2261594486928726e+00
+[autodiff-gate] objective finite-difference gradients:
+  - softmax_Er: fd=-2.870229e+00
+  - net_total_power_volume_average_mw_m3: fd=2.414499e-01
+  - Er2_volume_average: fd=2.584262e+00
+  - Er_volume_average: fd=-1.902403e+00
+  - electron_temperature_volume_average_keV: fd=8.635229e-04
+  - total_pressure_volume_average: fd=8.062429e+00
+  - alpha_power_volume_average_mw_m3: fd=2.796210e-01
+  - bootstrap_current_softmax_abs_scaled: fd=1.069766e-01
+  - Er_transition_rho: fd=-2.633738e-03
+  - Er_transition_location_moment: fd=-2.633738e-03
+  - Er_transition_strength: fd=5.164756e-02
+Wrote outputs/autodiff_transport_lagged_ntx/realtime_geometry_fd/n0_forward_fd_frozen_linearized_summary.json
+	Command being timed: "python examples/benchmarks/benchmark_transport_realtime_geometry_forward_fd.py --config examples/benchmarks/Solve_Transport_equations_wHe_radau_ntx_scan_runtime_database_vmec_realtime_geometry_benchmark_black_box.toml --parameter n0 --accepted-step-limit 16 --radau-jacobian-reuse-mode legacy --geometry-fd-lane frozen_linearized --replay-mode accepted --fd-accepted-replay-contract reverse_frozen_metadata --initial-Er-root-ad jax_selected_root --initial-Er-root-fd-root-lane frozen_linearized"
+	User time (seconds): 1873.16
+	System time (seconds): 55.33
+	Percent of CPU this job got: 109%
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 29:18.06
+	Average shared text size (kbytes): 0
+	Average unshared data size (kbytes): 0
+	Average stack size (kbytes): 0
+	Average total size (kbytes): 0
+	Maximum resident set size (kbytes): 9384052
+	Average resident set size (kbytes): 0
+	Major (requiring I/O) page faults: 0
+	Minor (reclaiming a frame) page faults: 8231140
+	Voluntary context switches: 2682183
+	Involuntary context switches: 240577
+	Swaps: 0
+	File system inputs: 0
+	File system outputs: 273960
+	Socket messages sent: 0
+	Socket messages received: 0
+	Signals delivered: 0
+	Page size (bytes): 4096
+	Exit status: 0
+(jax_env) exouser@neopax-22:~/NEOPAX$

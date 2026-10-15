@@ -16,6 +16,7 @@ import numpy as np
 from NEOPAX import _reverse_ad_optimization as optimization
 from NEOPAX import _reverse_ad_parameters as parameters
 from NEOPAX import _reverse_ad_transport as transport
+from NEOPAX import _orchestrator as orchestrator
 
 
 BENCHMARK = (
@@ -83,6 +84,62 @@ class _EvaluationReached(Exception):
 
 
 class ReverseBenchmarkRootObjectiveTests(unittest.TestCase):
+    def test_geometry_context_uses_the_runtime_boozer_resolution_settings(self):
+        """Omitted modes must not silently select a different FD geometry resolution."""
+        function = next(
+            node for node in MODULE.body
+            if isinstance(node, ast.FunctionDef) and node.name == "_geometry_context_from_config"
+        )
+        runtime_module = ast.parse(Path(orchestrator.__file__).read_text(encoding="utf-8"))
+        runtime_function = next(
+            node for node in runtime_module.body
+            if isinstance(node, ast.FunctionDef) and node.name == "build_runtime_context"
+        )
+        runtime_context_call = next(
+            node for node in ast.walk(runtime_function)
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+            and node.func.id == "build_geometry_autodiff_context"
+        )
+        for overrides in (
+            {},
+            {"mboz": 36, "nboz": 11},
+            {"vmec_mboz": "24", "vmec_nboz": "7"},
+            {"mboz": None, "nboz": "none"},
+            {"mboz": "", "nboz": 0},
+            {"mboz": 30, "nboz": 9, "vmec_mboz": 18, "vmec_nboz": 18},
+        ):
+            with self.subTest(settings=overrides):
+                geom_cfg = {
+                    "backend": "vmec_jax_booz_xform_jax",
+                    "vmec_input_file": "input.synthetic", **overrides,
+                }
+                runtime_builder = Mock()
+                eval(compile(ast.Expression(runtime_context_call), "<runtime-context>", "eval"), {
+                    "geom_cfg": geom_cfg,
+                    "_optional_config_int": orchestrator._optional_config_int,
+                    "build_geometry_autodiff_context": runtime_builder,
+                })
+                benchmark_builder = Mock()
+                namespace = {
+                    "_parse_reverse_geometry_parameter": lambda _: ("RBC", 1, 0),
+                    "_REALTIME_GEOMETRY_BACKENDS": {"vmec_jax_booz_xform_jax"},
+                    "_optional_config_int": orchestrator._optional_config_int,
+                    "build_geometry_autodiff_context": benchmark_builder,
+                }
+                extracted = ast.Module(body=[
+                    ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0),
+                    function,
+                ], type_ignores=[])
+                exec(compile(ast.fix_missing_locations(extracted), str(BENCHMARK), "exec"), namespace)
+                namespace[function.name]({"geometry": geom_cfg}, "RBC:1:0")
+                for key in ("mboz", "nboz"):
+                    self.assertEqual(
+                        benchmark_builder.call_args.kwargs[key], runtime_builder.call_args.kwargs[key],
+                    )
+                if not overrides:
+                    self.assertIsNone(benchmark_builder.call_args.kwargs["mboz"])
+                    self.assertIsNone(benchmark_builder.call_args.kwargs["nboz"])
+
     def test_fd_objective_order_and_root_endpoint_differences_match_terminal_ad(self):
         namespace = _fd_namespace()
         labels = namespace["OBJECTIVE_LABELS"]

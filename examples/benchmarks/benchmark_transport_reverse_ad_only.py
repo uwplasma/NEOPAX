@@ -132,7 +132,7 @@ from NEOPAX._geometry_autodiff import (  # noqa: E402
     boundary_param_entries,
     build_geometry_autodiff_context,
 )
-from NEOPAX._orchestrator import build_runtime_context  # noqa: E402
+from NEOPAX._orchestrator import _optional_config_int, build_runtime_context  # noqa: E402
 from NEOPAX._orchestrator import prepare_transport_solver_components  # noqa: E402
 from NEOPAX._reverse_ad_initial_er import (  # noqa: E402
     compact_initial_er_state_pullback,
@@ -879,8 +879,10 @@ def _geometry_context_from_config(config: dict[str, Any], geometry_parameter: st
         param_family=family,
         param_m=m,
         param_n=n,
-        mboz=int(geom_cfg.get("mboz", geom_cfg.get("vmec_mboz", 18))),
-        nboz=int(geom_cfg.get("nboz", geom_cfg.get("vmec_nboz", 18))),
+        # Preserve unset values so the shared context builder uses the same
+        # input-dependent Boozer resolution as build_runtime_context().
+        mboz=_optional_config_int(geom_cfg.get("mboz", geom_cfg.get("vmec_mboz"))),
+        nboz=_optional_config_int(geom_cfg.get("nboz", geom_cfg.get("vmec_nboz"))),
         surface_s=surface_s,
     )
 

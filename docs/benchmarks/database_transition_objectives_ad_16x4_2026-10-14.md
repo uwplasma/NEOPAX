@@ -104,8 +104,17 @@ The first segment includes cold work; the three later segments total 2.314 s.
 
 ## Remaining FD validation
 
-No matching FD result is present in this attachment. Use the
-[paired FD instructions](database_transition_objectives_ad_fd.md) and compare
-the eleven transport rows by name and parameter column against the archived
-CSV. The seven geometry-only AD rows require their separate geometry checks.
-The complete AD/FD comparison and the original optimization issues remain open.
+The AD attachment itself contains no FD result. A subsequently supplied
+sixteen-step `n0` FD run matches all eleven baseline values and agrees with the
+AD derivatives to a maximum relative error of 3.367259e-07 using the printed
+FD precision. The
+[current AD/FD tables](../../reverse_ad_vs_fd_database.md#2026-10-15-transition-objective-adfd-comparison-current-eleven-row-case)
+and [FD comparison CSV](database_transition_objectives_fd_n0_16_2026-10-15.csv)
+record that result. The other seven parameter columns now also have FD
+results: all six profile columns agree to a maximum relative error of
+1.948462e-06, but both geometry FD runs have different baseline values from
+the archived AD run. Their discrepancies are recorded in the updated tables
+and [full comparison CSV](database_transition_objectives_ad_fd_16_2026-10-15.csv),
+with baseline-mismatch flags. Geometry validation remains unresolved; the
+seven geometry-only AD rows require their separate geometry checks. The
+original optimization issues remain open.

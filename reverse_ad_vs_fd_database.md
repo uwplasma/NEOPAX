@@ -1,5 +1,348 @@
 # Database reverse AD versus FD status
 
+## 2026-10-15 transition-objective AD/FD comparison: current eleven-row case
+
+This updates the AD/FD tables for the current `en/v0_new` benchmark. The three
+new transition objectives replace the old fixed left/right Er rows. Historical
+ten-row comparisons below retain their original data and do not supply the
+unmeasured columns of this new case.
+
+The AD reference is the completed sixteen-step / four-step-segment run with
+eighteen residuals and eight parameters, archived in
+[the AD run note](docs/benchmarks/database_transition_objectives_ad_16x4_2026-10-14.md).
+The new user-supplied FD run checks `n0` with the same wHe runtime-database
+black-box TOML, sixteen accepted steps, legacy Jacobian reuse, accepted replay,
+`reverse_frozen_metadata`, `jax_selected_root`, and a frozen-linearized initial
+root branch. The baseline `n0` is 4.21 and the central FD step is 1.263000e-06.
+All eleven baseline objective values match the archived AD values exactly at
+printed precision.
+
+The remaining seven FD runs have now been supplied in attachment
+`bf519cb4-9e1d-41d3-98dd-087f3855eb1b/Pasted text.txt`; all exited with status
+zero. The five additional profile runs also match all eleven AD baseline
+values exactly at printed precision. Both geometry FD runs share a different
+baseline from AD, so their numerical discrepancies below are recorded but do
+not validate or invalidate the geometry derivatives at the AD point.
+
+Saved evidence:
+
+- [Transcribed FD command and console output](docs/benchmarks/database_transition_objectives_fd_n0_16_2026-10-15.txt).
+- [AD/FD values and errors as CSV](docs/benchmarks/database_transition_objectives_fd_n0_16_2026-10-15.csv).
+- [Complete seven-run pasted output](docs/benchmarks/database_transition_objectives_fd_remaining_16_2026-10-15.txt),
+  preserved byte for byte; SHA-256
+  `9b0b5656cc9b4246ee81ec8b41068e1650936ef28410312bb72e7bed60861ea1`.
+- [New seven-column comparison CSV](docs/benchmarks/database_transition_objectives_fd_remaining_16_2026-10-15.csv),
+  including the explicit-geometry and final-state diagnostic contributions.
+- [Combined eleven-objective / eight-parameter comparison CSV](docs/benchmarks/database_transition_objectives_ad_fd_16_2026-10-15.csv):
+  all 88 derivative pairs, absolute/relative errors, baseline differences,
+  FD steps, and baseline-match status.
+
+The loop header in the pasted output is mangled at `done--initial-Er...`;
+each run's time footer and progress banner record the actual flags. All seven
+used accepted replay, `reverse_frozen_metadata`, and frozen-linearized geometry
+and initial-root lanes. No physics tests were run locally to archive or
+compare these results.
+
+The FD run exited successfully, took 29:18.06 wall time, and reached a maximum
+host RSS of 9,384,052 KiB with no swaps. Remote Git commit and dependency
+versions were not printed. No new solve was run locally to record these data.
+
+### `n0`: reverse AD versus finite differences
+
+Relative error is `abs(AD - FD) / max(abs(AD), abs(FD))`. FD derivatives come
+from the pasted `.6e` console output: six digits after the decimal, or seven
+significant digits. AD values retain their full printed precision. Errors
+therefore describe agreement with rounded FD values; the remote JSON may
+contain more precision.
+
+| Objective | Reverse AD | FD | Relative error |
+| --- | ---: | ---: | ---: |
+| `softmax_Er` | -2.8702290705710656e+00 | -2.870229e+00 | 2.459e-08 |
+| `net_total_power_volume_average_mw_m3` | 2.4144994379889473e-01 | 2.414499e-01 | 1.814e-07 |
+| `Er2_volume_average` | 2.5842614640242676e+00 | 2.584262e+00 | 2.074e-07 |
+| `Er_volume_average` | -1.9024030783823500e+00 | -1.902403e+00 | 4.120e-08 |
+| `electron_temperature_volume_average_keV` | 8.6352260922950563e-04 | 8.635229e-04 | 3.367e-07 |
+| `total_pressure_volume_average` | 8.0624286595262724e+00 | 8.062429e+00 | 4.223e-08 |
+| `alpha_power_volume_average_mw_m3` | 2.7962100215485974e-01 | 2.796210e-01 | 7.706e-09 |
+| `bootstrap_current_softmax_abs_scaled` | 1.0697658659370296e-01 | 1.069766e-01 | 1.253e-07 |
+| `Er_transition_rho` | -2.6337380588872350e-03 | -2.633738e-03 | 2.236e-08 |
+| `Er_transition_location_moment` | -2.6337380588872350e-03 | -2.633738e-03 | 2.236e-08 |
+| `Er_transition_strength` | 5.1647553223378662e-02 | 5.164756e-02 | 1.312e-07 |
+
+All eleven `n0` derivatives agree to a maximum displayed relative error of
+3.367259e-07, on electron temperature. The new root-row errors are 2.236e-08
+for radius and location moment, and 1.312e-07 for strength. This checks the
+`n0` column through the sixteen-step transport/root chain at this benchmark
+point. The additional columns are recorded below. This is not a full-final-time
+trajectory or validation at the saved combined-optimization point.
+
+### Comparison outcome and geometry-baseline mismatch
+
+All six profile columns agree with AD to a maximum relative error of
+1.948462e-06, on the small radius/location derivative with respect to
+`density_shape_alpha` (absolute error 6.044863e-11). For the profile columns,
+the largest strength error is 2.213691e-07 and the largest net-power error is
+3.666790e-07. FD values are printed with seven significant digits.
+
+The two geometry FD baselines are identical to each other but differ from
+the AD reference, including these four requested observables:
+
+| Observable | AD / profile-FD baseline | Geometry-FD baseline |
+| --- | ---: | ---: |
+| `net_total_power_volume_average_mw_m3` | 5.0807530056153805e-01 | 5.0804023882399219e-01 |
+| `Er_transition_rho` | 6.1293923577522791e-01 | 6.1290799115125838e-01 |
+| `Er_transition_location_moment` | 1.1293923577522791e-01 | 1.1290799115125838e-01 |
+| `Er_transition_strength` | 2.2261594486928726e+00 | 2.1958860308890658e+00 |
+
+Consequently the geometry columns are unresolved. Their apparent radius and
+location discrepancies are 7.249889% (RBC) and 6.297522% (ZBS); strength
+discrepancies are 24.208012% and 17.115679%; net-power discrepancies are
+80.292974% and 0.056215%. Net power here means the benchmark's volume-averaged
+MW/m3 objective. The RBC net-power derivative is 5.7486694403498812e-05 in AD
+versus 2.917066e-04 in FD (absolute difference 2.342199e-04).
+
+The FD root rows have zero fixed-final-state explicit-geometry contribution
+in both geometry runs; their reported FD derivatives come through the final
+state. This observation does not identify the source of the mismatch.
+Reconcile the geometry primal baseline before interpreting these differences
+as an AD or FD derivative defect. Memory growth and nonfinite optimization
+trials remain separate open issues.
+
+The subsequent [command/context audit](docs/benchmarks/database_geometry_fd_context_mismatch_2026-10-15.md)
+checked the saved `reverse_ad_improvement` notes and identified a concrete
+configuration mismatch: the benchmark geometry helper defaulted to Boozer
+`(18, 18)`, while the production runtime automatically selected `(36, 11)`
+for this input. Geometry FD rebuilt its baseline with the helper; the AD
+transport primal and profile FD used the runtime path. The shared helper now
+preserves unset settings and uses the runtime defaults, with a mocked
+regression check. The FD startup banner prints the selected resolution.
+This corrects a demonstrated source mismatch, but its numerical effect has
+not been checked by a new GPU run. The mode flags already used were the
+intended local-derivative flags; switching replay modes cannot fix a baseline
+computed before replay. Because the helper also serves AD geometry, refreshed
+AD and geometry-FD references are needed after the correction. Values below
+retain the original pre-correction results.
+
+### Raw gradient vectors: AD versus FD
+
+These are gradients of the raw benchmark observables with respect to the
+physical parameter labels below. They are not weighted or transformed into
+the optimizer's scaled coordinates. Tables are grouped by objective so each
+column is its complete eight-component gradient vector.
+
+All 32 AD/FD component pairs for the three transition observables and net
+power have the same sign. The six profile components agree closely. Geometry
+components have the same signs but unresolved magnitude discrepancies because
+the geometry FD baselines differ from AD, as documented above.
+
+Radius and location-moment gradients differ by at most 5.773160e-15 in AD;
+their printed FD components are identical. The first table therefore applies
+to both (the location moment subtracts a constant target of 0.5). An asterisk
+marks a baseline-mismatched geometry FD comparison.
+
+#### Transition radius and location moment
+
+| Parameter | AD gradient component | FD gradient component |
+| --- | ---: | ---: |
+| `n0` | -2.6337380588872350e-03 | -2.633738e-03 |
+| `T0` | 1.5282952072607615e-03 | 1.528295e-03 |
+| `density_shape_power` | -2.1121013889685432e-05 | -2.112101e-05 |
+| `temperature_shape_power` | 4.6804569570486499e-03 | 4.680457e-03 |
+| `density_shape_alpha` | 3.1023760448633077e-05 | 3.102370e-05 |
+| `temperature_shape_alpha` | -2.4039530568412291e-03 | -2.403953e-03 |
+| `RBC:1:0*` | -1.1324538116205816e-02 | -1.220973e-02 |
+| `ZBS:1:0*` | 1.5717194578232549e-02 | 1.677351e-02 |
+
+#### Transition strength
+
+| Parameter | AD gradient component | FD gradient component |
+| --- | ---: | ---: |
+| `n0` | 5.1647553223378662e-02 | 5.164756e-02 |
+| `T0` | 9.8169949792032918e-02 | 9.816995e-02 |
+| `density_shape_power` | -2.4817004425355314e-02 | -2.481700e-02 |
+| `temperature_shape_power` | -1.0421302306954468e-01 | -1.042130e-01 |
+| `density_shape_alpha` | 6.4696761242981321e-02 | 6.469675e-02 |
+| `temperature_shape_alpha` | 1.2571427443046261e+00 | 1.257143e+00 |
+| `RBC:1:0*` | -2.9056647289399873e-01 | -3.833736e-01 |
+| `ZBS:1:0*` | -1.9689043382835039e+00 | -1.631913e+00 |
+
+#### Volume-averaged net power (MW/m3)
+
+| Parameter | AD gradient component | FD gradient component |
+| --- | ---: | ---: |
+| `n0` | 2.4144994379889473e-01 | 2.414499e-01 |
+| `T0` | 8.1012117730636768e-02 | 8.101212e-02 |
+| `density_shape_power` | 1.0015251522452790e-03 | 1.001525e-03 |
+| `temperature_shape_power` | 2.7450389894711430e-01 | 2.745039e-01 |
+| `density_shape_alpha` | -2.4504761014614560e-04 | -2.450477e-04 |
+| `temperature_shape_alpha` | -3.9390935373231989e-01 | -3.939094e-01 |
+| `RBC:1:0*` | 5.7486694403498812e-05 | 2.917066e-04 |
+| `ZBS:1:0*` | -6.4216000655884509e-03 | -6.425212e-03 |
+
+The RBC net-power component is +5.7486694403498812e-05 in AD and
++2.917066e-04 in FD: FD is 5.074332 times AD, with an absolute difference
+of 2.342199e-04. Both components are positive. The FD diagnostics split this
+component into -1.714972e-03 (explicit geometry) and +2.006678e-03
+(final state), showing cancellation in that small total component. This
+does not resolve the geometry-baseline mismatch or identify an AD defect.
+
+### Current-case relative-error matrix
+
+All eight columns now have FD results for this eleven-row case. The six
+profile columns have matching baselines. An asterisk marks geometry columns
+whose FD baseline differs from AD; those entries are unresolved apparent
+differences. Errors use `abs(AD - FD) / max(abs(AD), abs(FD))`, not percent.
+
+| Objective | `n0` | `T0` | `density_shape_power` | `temperature_shape_power` | `density_shape_alpha` | `temperature_shape_alpha` | `RBC:1:0` | `ZBS:1:0` |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `softmax_Er` | 2.459e-08 | 8.851e-08 | 8.493e-08 | 9.489e-08 | 1.079e-06 | 1.866e-07 | 1.938e-02* | 4.965e-02* |
+| `net_total_power_volume_average_mw_m3` | 1.814e-07 | 2.801e-08 | 1.520e-07 | 3.836e-09 | 3.667e-07 | 1.175e-07 | 8.029e-01* | 5.622e-04* |
+| `Er2_volume_average` | 2.074e-07 | 8.968e-08 | 8.201e-08 | 9.973e-08 | 3.203e-09 | 2.025e-07 | 1.468e-02* | 1.887e-02* |
+| `Er_volume_average` | 4.120e-08 | 2.628e-08 | 6.589e-08 | 5.603e-08 | 1.922e-07 | 1.062e-07 | 2.056e-02* | 9.716e-03* |
+| `electron_temperature_volume_average_keV` | 3.367e-07 | 5.987e-08 | 5.370e-07 | 2.722e-07 | 5.837e-08 | 8.429e-08 | 3.023e-02* | 5.101e-04* |
+| `total_pressure_volume_average` | 4.223e-08 | 1.770e-07 | 1.442e-08 | 5.761e-09 | 2.378e-07 | 3.003e-07 | 8.462e-04* | 1.073e-04* |
+| `alpha_power_volume_average_mw_m3` | 7.706e-09 | 4.893e-08 | 4.888e-08 | 1.609e-07 | 4.809e-08 | 2.738e-08 | 1.976e+00* | 4.604e-04* |
+| `bootstrap_current_softmax_abs_scaled` | 1.253e-07 | 2.677e-07 | 7.095e-08 | 3.292e-08 | 1.344e-07 | 7.894e-08 | 3.341e-03* | 2.014e-02* |
+| `Er_transition_rho` | 2.236e-08 | 1.356e-07 | 1.842e-07 | 9.177e-09 | 1.948e-06 | 2.364e-08 | 7.250e-02* | 6.298e-02* |
+| `Er_transition_location_moment` | 2.236e-08 | 1.356e-07 | 1.842e-07 | 9.177e-09 | 1.948e-06 | 2.364e-08 | 7.250e-02* | 6.298e-02* |
+| `Er_transition_strength` | 1.312e-07 | 2.118e-09 | 1.783e-07 | 2.214e-07 | 1.738e-07 | 2.034e-07 | 2.421e-01* | 1.712e-01* |
+
+The geometry-column asterisks identify baseline-mismatched comparisons. Their
+numbers are apparent AD/FD discrepancies, not validated same-baseline errors.
+
+### `T0`: reverse AD versus finite differences
+
+Central FD step: `5.340000e-06`.
+All eleven baseline objective values match the AD reference at printed precision.
+
+| Objective | Reverse AD | FD | Relative error |
+| --- | ---: | ---: | ---: |
+| `softmax_Er` | 2.7740117544715255e+00 | 2.774012e+00 | 8.851e-08 |
+| `net_total_power_volume_average_mw_m3` | 8.1012117730636768e-02 | 8.101212e-02 | 2.801e-08 |
+| `Er2_volume_average` | 3.1320422808908159e+01 | 3.132042e+01 | 8.968e-08 |
+| `Er_volume_average` | 8.6605457724331347e-01 | 8.660546e-01 | 2.628e-08 |
+| `electron_temperature_volume_average_keV` | 3.5577917869824194e-01 | 3.557792e-01 | 5.987e-08 |
+| `total_pressure_volume_average` | 1.8654173302655452e+00 | 1.865417e+00 | 1.770e-07 |
+| `alpha_power_volume_average_mw_m3` | 8.3216104071882416e-02 | 8.321610e-02 | 4.893e-08 |
+| `bootstrap_current_softmax_abs_scaled` | 1.7479404679039118e-01 | 1.747940e-01 | 2.677e-07 |
+| `Er_transition_rho` | 1.5282952072607615e-03 | 1.528295e-03 | 1.356e-07 |
+| `Er_transition_location_moment` | 1.5282952072607615e-03 | 1.528295e-03 | 1.356e-07 |
+| `Er_transition_strength` | 9.8169949792032918e-02 | 9.816995e-02 | 2.118e-09 |
+
+### `density_shape_power`: reverse AD versus finite differences
+
+Central FD step: `3.000000e-06`.
+All eleven baseline objective values match the AD reference at printed precision.
+
+| Objective | Reverse AD | FD | Relative error |
+| --- | ---: | ---: | ---: |
+| `softmax_Er` | -8.0970003122978890e-02 | -8.097001e-02 | 8.493e-08 |
+| `net_total_power_volume_average_mw_m3` | 1.0015251522452790e-03 | 1.001525e-03 | 1.520e-07 |
+| `Er2_volume_average` | 2.2824338128221822e+00 | 2.282434e+00 | 8.201e-08 |
+| `Er_volume_average` | -6.8688994525788180e-02 | -6.868899e-02 | 6.589e-08 |
+| `electron_temperature_volume_average_keV` | -7.1344821689783150e-05 | -7.134486e-05 | 5.370e-07 |
+| `total_pressure_volume_average` | 2.4426699647736677e-01 | 2.442670e-01 | 1.442e-08 |
+| `alpha_power_volume_average_mw_m3` | 2.3609178845952067e-03 | 2.360918e-03 | 4.888e-08 |
+| `bootstrap_current_softmax_abs_scaled` | -1.1999309148606450e-02 | -1.199931e-02 | 7.095e-08 |
+| `Er_transition_rho` | -2.1121013889685432e-05 | -2.112101e-05 | 1.842e-07 |
+| `Er_transition_location_moment` | -2.1121013889685432e-05 | -2.112101e-05 | 1.842e-07 |
+| `Er_transition_strength` | -2.4817004425355314e-02 | -2.481700e-02 | 1.783e-07 |
+
+### `temperature_shape_power`: reverse AD versus finite differences
+
+Central FD step: `6.000000e-07`.
+All eleven baseline objective values match the AD reference at printed precision.
+
+| Objective | Reverse AD | FD | Relative error |
+| --- | ---: | ---: | ---: |
+| `softmax_Er` | 1.8718541776218229e+00 | 1.871854e+00 | 9.489e-08 |
+| `net_total_power_volume_average_mw_m3` | 2.7450389894711430e-01 | 2.745039e-01 | 3.836e-09 |
+| `Er2_volume_average` | -1.1938301190576318e+01 | -1.193830e+01 | 9.973e-08 |
+| `Er_volume_average` | -6.9405896111072662e-01 | -6.940590e-01 | 5.603e-08 |
+| `electron_temperature_volume_average_keV` | 1.5248015849376320e+00 | 1.524802e+00 | 2.722e-07 |
+| `total_pressure_volume_average` | 7.7523359553390927e+00 | 7.752336e+00 | 5.761e-09 |
+| `alpha_power_volume_average_mw_m3` | 2.8420414573713065e-01 | 2.842041e-01 | 1.609e-07 |
+| `bootstrap_current_softmax_abs_scaled` | 7.0788982330264971e-01 | 7.078898e-01 | 3.292e-08 |
+| `Er_transition_rho` | 4.6804569570486499e-03 | 4.680457e-03 | 9.177e-09 |
+| `Er_transition_location_moment` | 4.6804569570486499e-03 | 4.680457e-03 | 9.177e-09 |
+| `Er_transition_strength` | -1.0421302306954468e-01 | -1.042130e-01 | 2.214e-07 |
+
+### `density_shape_alpha`: reverse AD versus finite differences
+
+Central FD step: `3.000000e-07`.
+All eleven baseline objective values match the AD reference at printed precision.
+
+| Objective | Reverse AD | FD | Relative error |
+| --- | ---: | ---: | ---: |
+| `softmax_Er` | 1.5312953474636126e-01 | 1.531297e-01 | 1.079e-06 |
+| `net_total_power_volume_average_mw_m3` | -2.4504761014614560e-04 | -2.450477e-04 | 3.667e-07 |
+| `Er2_volume_average` | 3.0861899901143133e+00 | 3.086190e+00 | 3.203e-09 |
+| `Er_volume_average` | -1.6832076765293957e-01 | -1.683208e-01 | 1.922e-07 |
+| `electron_temperature_volume_average_keV` | 1.2218640713144158e-03 | 1.221864e-03 | 5.837e-08 |
+| `total_pressure_volume_average` | -1.3265053154535749e+00 | -1.326505e+00 | 2.378e-07 |
+| `alpha_power_volume_average_mw_m3` | -7.6383506326871686e-03 | -7.638351e-03 | 4.809e-08 |
+| `bootstrap_current_softmax_abs_scaled` | 4.1575984411776998e-02 | 4.157599e-02 | 1.344e-07 |
+| `Er_transition_rho` | 3.1023760448633077e-05 | 3.102370e-05 | 1.948e-06 |
+| `Er_transition_location_moment` | 3.1023760448633077e-05 | 3.102370e-05 | 1.948e-06 |
+| `Er_transition_strength` | 6.4696761242981321e-02 | 6.469675e-02 | 1.738e-07 |
+
+### `temperature_shape_alpha`: reverse AD versus finite differences
+
+Central FD step: `3.000000e-07`.
+All eleven baseline objective values match the AD reference at printed precision.
+
+| Objective | Reverse AD | FD | Relative error |
+| --- | ---: | ---: | ---: |
+| `softmax_Er` | 1.0768407990308489e+01 | 1.076841e+01 | 1.866e-07 |
+| `net_total_power_volume_average_mw_m3` | -3.9390935373231989e-01 | -3.939094e-01 | 1.175e-07 |
+| `Er2_volume_average` | 1.0694492165944183e+02 | 1.069449e+02 | 2.025e-07 |
+| `Er_volume_average` | 3.0165806795182641e+00 | 3.016581e+00 | 1.062e-07 |
+| `electron_temperature_volume_average_keV` | -3.0449272566583652e+00 | -3.044927e+00 | 8.429e-08 |
+| `total_pressure_volume_average` | -1.4516604358720285e+01 | -1.451660e+01 | 3.003e-07 |
+| `alpha_power_volume_average_mw_m3` | -4.1289868869676005e-01 | -4.128987e-01 | 2.738e-08 |
+| `bootstrap_current_softmax_abs_scaled` | -6.1967235108408603e-01 | -6.196724e-01 | 7.894e-08 |
+| `Er_transition_rho` | -2.4039530568412291e-03 | -2.403953e-03 | 2.364e-08 |
+| `Er_transition_location_moment` | -2.4039530568412291e-03 | -2.403953e-03 | 2.364e-08 |
+| `Er_transition_strength` | 1.2571427443046261e+00 | 1.257143e+00 | 2.034e-07 |
+
+### `RBC:1:0`: reverse AD versus finite differences
+
+Central FD step: `3.313117e-07`.
+The FD baseline differs from AD; interpret this column as unresolved.
+
+| Objective | Reverse AD | FD | Relative error |
+| --- | ---: | ---: | ---: |
+| `softmax_Er` | -2.7683705591738523e+01 | -2.823094e+01 | 1.938e-02 |
+| `net_total_power_volume_average_mw_m3` | 5.7486694403498812e-05 | 2.917066e-04 | 8.029e-01 |
+| `Er2_volume_average` | -2.9602460723728939e+02 | -3.004359e+02 | 1.468e-02 |
+| `Er_volume_average` | -6.8360475150461735e+00 | -6.979569e+00 | 2.056e-02 |
+| `electron_temperature_volume_average_keV` | -1.6115940210746589e-02 | -1.661838e-02 | 3.023e-02 |
+| `total_pressure_volume_average` | -7.3305802495047409e-02 | -7.324377e-02 | 8.462e-04 |
+| `alpha_power_volume_average_mw_m3` | -1.1720119630332564e-04 | 1.144329e-04 | 1.976e+00 |
+| `bootstrap_current_softmax_abs_scaled` | -2.1363565358058780e+00 | -2.129220e+00 | 3.341e-03 |
+| `Er_transition_rho` | -1.1324538116205816e-02 | -1.220973e-02 | 7.250e-02 |
+| `Er_transition_location_moment` | -1.1324538116211589e-02 | -1.220973e-02 | 7.250e-02 |
+| `Er_transition_strength` | -2.9056647289399873e-01 | -3.833736e-01 | 2.421e-01 |
+
+### `ZBS:1:0`: reverse AD versus finite differences
+
+Central FD step: `3.394619e-07`.
+The FD baseline differs from AD; interpret this column as unresolved.
+
+| Objective | Reverse AD | FD | Relative error |
+| --- | ---: | ---: | ---: |
+| `softmax_Er` | 6.3556944419356958e+00 | 6.687726e+00 | 4.965e-02 |
+| `net_total_power_volume_average_mw_m3` | -6.4216000655884509e-03 | -6.425212e-03 | 5.622e-04 |
+| `Er2_volume_average` | -3.3046445244949155e+02 | -3.242291e+02 | 1.887e-02 |
+| `Er_volume_average` | 1.4302240047419559e+01 | 1.444257e+01 | 9.716e-03 |
+| `electron_temperature_volume_average_keV` | -3.9990631413653221e-02 | -4.001104e-02 | 5.101e-04 |
+| `total_pressure_volume_average` | -2.3761691174869282e-01 | -2.376424e-01 | 1.073e-04 |
+| `alpha_power_volume_average_mw_m3` | -6.8872114463127358e-03 | -6.890384e-03 | 4.604e-04 |
+| `bootstrap_current_softmax_abs_scaled` | -1.2135494721232387e+00 | -1.189105e+00 | 2.014e-02 |
+| `Er_transition_rho` | 1.5717194578232549e-02 | 1.677351e-02 | 6.298e-02 |
+| `Er_transition_location_moment` | 1.5717194578231904e-02 | 1.677351e-02 | 6.298e-02 |
+| `Er_transition_strength` | -1.9689043382835039e+00 | -1.631913e+00 | 1.712e-01 |
+
 ## 2026-09-13 completed batched-modes timing result
 
 The completed `shared_multi_rhs + batched_split` 16/4 run is recorded in

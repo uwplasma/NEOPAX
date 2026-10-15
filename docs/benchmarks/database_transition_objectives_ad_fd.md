@@ -80,9 +80,38 @@ mode, FD step size, and commit when comparing results.
 the AD reverse-builder request, FD replay endpoint routing, and synthetic
 central differences of the new terminal root rows against local AD. It runs
 without VMEC, NTX, or transport solves. It does not validate the complete GPU
-Jacobian. The 16-step AD/FD comparison remains pending a remote run.
+Jacobian. Remote comparison results are recorded below.
 
 The updated 16-step AD run has now completed successfully: 18 residual rows,
 eight parameter columns, and all 144 Jacobian entries finite. Its
 [run note, original output, and CSV reference](database_transition_objectives_ad_16x4_2026-10-14.md)
-are archived for comparison. A matching FD result remains pending.
+are archived for comparison.
+
+The matching sixteen-step `n0` FD run has now completed successfully. All
+eleven baseline values match the AD reference at printed precision. Across
+the eleven derivatives, the largest relative error is 3.367259e-07; the new
+radius and location-moment rows each give 2.236e-08, and strength gives
+1.312e-07. These comparisons use the rounded `.6e` console gradients (seven
+significant digits). The
+[current AD/FD tables](../../reverse_ad_vs_fd_database.md#2026-10-15-transition-objective-adfd-comparison-current-eleven-row-case)
+contain the detailed comparisons and the eight-column matrix.
+
+The remaining seven FD runs have also completed. All six profile columns
+match the AD baseline, with a largest relative derivative error of 1.948462e-06
+across all eleven objectives. Both geometry FD runs have different baseline
+values from AD, so their discrepancies are unresolved rather than a successful
+validation. For RBC/ZBS respectively, the apparent relative differences are
+7.249889%/6.297522% for radius and location, 24.208012%/17.115679% for strength,
+and 80.292974%/0.056215% for net power. The
+[combined CSV](database_transition_objectives_ad_fd_16_2026-10-15.csv) retains
+all 88 pairs and flags the mismatched baselines. The next geometry check must
+first reproduce the AD primal baseline; no extra local physics run was used
+to record these results.
+
+The [geometry context audit](database_geometry_fd_context_mismatch_2026-10-15.md)
+subsequently found and corrected a default-resolution mismatch: geometry FD
+used `(mboz, nboz) = (18, 18)` while the runtime used automatic `(36, 11)`.
+The FD command's mode flags remain appropriate. After updating the code, its
+geometry startup banner should print `(36, 11)`. Matching baselines and a
+refreshed AD geometry reference are still required before judging the
+corrected geometry derivatives. Only mocked/synthetic local checks are used.

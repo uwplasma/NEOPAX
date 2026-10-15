@@ -145,8 +145,9 @@ diagnostics, and JSON labels use that order; derivatives are still obtained
 from central endpoint differences. The independent root-only FD mode retains
 its existing objectives. The paired GPU command and comparison scope are in
 [the AD/FD benchmark note](benchmarks/database_transition_objectives_ad_fd.md).
-Only local synthetic objective/routing checks have been run for this update;
-the complete 16-step GPU comparison remains pending.
+The local checks for this update use synthetic objectives and mocked routing.
+Remote validation results are recorded below; all eight columns now have
+FD results, with the geometry comparisons still unresolved.
 
 The user subsequently supplied a successful updated 16-step AD run. It contains
 all eleven transport rows plus seven geometry rows, with every entry of the
@@ -154,7 +155,38 @@ all eleven transport rows plus seven geometry rows, with every entry of the
 parameter column. The
 [archived AD reference](benchmarks/database_transition_objectives_ad_16x4_2026-10-14.md)
 preserves the full output and CSV table. This confirms participation of the
-new rows, while their full-chain numerical FD comparison remains pending.
+new rows.
+
+A subsequently supplied sixteen-step `n0` FD run matches all eleven baseline
+values exactly at printed precision and agrees with the AD column to a maximum
+relative error of 3.367259e-07. The new radius/location errors are 2.236e-08 and
+the strength error is 1.312e-07, computed from the rounded `.6e` console
+gradients. The [updated comparison table](../reverse_ad_vs_fd_database.md#2026-10-15-transition-objective-adfd-comparison-current-eleven-row-case)
+records the values. The remaining seven FD runs have subsequently completed:
+all six profile columns share the AD baseline and agree to a maximum relative
+error of 1.948462e-06 across all eleven objectives. The largest profile error
+for strength is 2.213691e-07, and for net power it is 3.666790e-07.
+
+Both geometry FD runs use a baseline whose root radius is
+0.61290799115125838 instead of AD's 0.61293923577522791, strength is
+2.1958860308890658 instead of 2.2261594486928726, and volume-averaged net power
+is 0.50804023882399219 instead of 0.50807530056153805. Their apparent root
+location errors are 7.25%/6.30%, strength errors 24.21%/17.12%, and net-power
+errors 80.29%/0.0562% for RBC/ZBS. These are baseline-mismatched comparisons;
+the source of the primal difference must be resolved before attributing them
+to incorrect geometry derivatives. The profile checks apply at the benchmark
+point, not the saved combined-optimization point. Memory growth and failed
+reverse trials remain open.
+
+A subsequent [historical-command and source audit](benchmarks/database_geometry_fd_context_mismatch_2026-10-15.md)
+found a concrete geometry configuration mismatch: the benchmark helper
+hard-coded Boozer resolution `(18, 18)` when the TOML omitted it, while the
+production runtime selected automatic `(36, 11)` for the same VMEC input.
+The helper now follows the runtime's optional-value handling, and geometry FD
+prints its resolved resolution. The same helper is used by AD geometry, so
+new geometry checks need a refreshed AD reference and matching baselines.
+The supplied command's replay/root flags were appropriate; no new full GPU
+comparison has yet verified the effect of the configuration correction.
 
 ### Independent derivative audit
 
