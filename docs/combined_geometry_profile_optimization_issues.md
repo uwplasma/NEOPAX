@@ -139,6 +139,23 @@ Jacobian. Individual new rows are also selectable with `--objective` in that
 lane. This is a reverse-Jacobian benchmark, not an independent finite-difference
 validation of the complete transport/geometry chain.
 
+The matching full-transport FD runner now uses the same eleven objective labels
+and production scalar value functions. Baseline, perturbed endpoints, split
+diagnostics, and JSON labels use that order; derivatives are still obtained
+from central endpoint differences. The independent root-only FD mode retains
+its existing objectives. The paired GPU command and comparison scope are in
+[the AD/FD benchmark note](benchmarks/database_transition_objectives_ad_fd.md).
+Only local synthetic objective/routing checks have been run for this update;
+the complete 16-step GPU comparison remains pending.
+
+The user subsequently supplied a successful updated 16-step AD run. It contains
+all eleven transport rows plus seven geometry rows, with every entry of the
+18-by-8 Jacobian finite. The new root rows have nonzero derivatives in every
+parameter column. The
+[archived AD reference](benchmarks/database_transition_objectives_ad_16x4_2026-10-14.md)
+preserves the full output and CSV table. This confirms participation of the
+new rows, while their full-chain numerical FD comparison remains pending.
+
 ### Independent derivative audit
 
 Added `tests/test_root_bootstrap_objective_derivatives.py`, executable with:

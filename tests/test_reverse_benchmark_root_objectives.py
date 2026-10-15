@@ -9,6 +9,8 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock
 
+import jax
+import jax.numpy as jnp
 import numpy as np
 
 from NEOPAX import _reverse_ad_optimization as optimization
@@ -21,6 +23,8 @@ BENCHMARK = (
     / "examples/benchmarks/benchmark_transport_reverse_ad_only.py"
 )
 MODULE = ast.parse(BENCHMARK.read_text(encoding="utf-8"))
+FD_BENCHMARK = BENCHMARK.with_name("benchmark_transport_realtime_geometry_forward_fd.py")
+FD_MODULE = ast.parse(FD_BENCHMARK.read_text(encoding="utf-8"))
 NEW_ROOT_ROWS = (
     "Er_transition_rho", "Er_transition_location_moment", "Er_transition_strength",
 )
@@ -43,11 +47,102 @@ def _namespace():
     return namespace
 
 
+def _fd_namespace():
+    namespace = _namespace()
+    selected = [
+        node for node in FD_MODULE.body
+        if (
+            isinstance(node, ast.Assign)
+            and any(isinstance(target, ast.Name) and target.id == "OBJECTIVE_LABELS"
+                    for target in node.targets)
+        ) or (
+            isinstance(node, ast.FunctionDef)
+            and node.name in {"_objective_vector", "_objectives_on_realtime_geometry_frozen_trace"}
+        )
+    ]
+
+    def terminal_value(state, runtime, index, *, objective_labels):
+        if objective_labels[index] in NEW_ROOT_ROWS:
+            return transport.objective_scalar_by_index(
+                state, runtime, index, objective_labels=objective_labels,
+            )
+        # Other rows include bootstrap/NTX physics, which this test never runs.
+        return jnp.asarray(index, dtype=state.Er.dtype)
+
+    namespace.update({"jnp": jnp, "objective_scalar_by_index": terminal_value})
+    module = ast.Module(body=[
+        ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0),
+        *selected,
+    ], type_ignores=[])
+    exec(compile(ast.fix_missing_locations(module), str(FD_BENCHMARK), "exec"), namespace)
+    return namespace
+
+
 class _EvaluationReached(Exception):
     pass
 
 
 class ReverseBenchmarkRootObjectiveTests(unittest.TestCase):
+    def test_fd_objective_order_and_root_endpoint_differences_match_terminal_ad(self):
+        namespace = _fd_namespace()
+        labels = namespace["OBJECTIVE_LABELS"]
+        self.assertEqual(labels, _namespace()["FULL_TRANSPORT_OBJECTIVE_LABELS"])
+        rho = jnp.linspace(0.003, 0.997, 51)
+        er = 40 * jnp.tanh((0.56 - rho) / 0.018)
+        direction = 0.3 + jnp.sin(4 * rho)
+        runtime = SimpleNamespace(geometry=SimpleNamespace(rho_grid=rho))
+
+        def objective_values(delta):
+            return namespace["_objective_vector"](
+                SimpleNamespace(Er=er + delta * direction), runtime,
+            )
+
+        values = np.asarray(objective_values(0.0))
+        self.assertEqual(values.shape, (11,))
+        self.assertTrue(np.isfinite(values).all())
+        indices = [labels.index(name) for name in NEW_ROOT_ROWS]
+        radius, moment, strength = values[indices]
+        self.assertAlmostEqual(moment, radius - 0.5, places=12)
+        self.assertGreater(strength, 0.0)
+        step = 1e-4
+        fd = np.asarray((objective_values(step) - objective_values(-step)) / (2 * step))
+        ad = np.asarray(jax.jacfwd(objective_values)(0.0))
+        np.testing.assert_allclose(fd[indices], ad[indices], rtol=1e-5, atol=1e-8)
+        self.assertTrue((np.abs(ad[indices]) > 1e-8).all())
+
+    def test_fd_replay_endpoints_return_all_new_objectives(self):
+        namespace = _fd_namespace()
+        rho = jnp.linspace(0.003, 0.997, 51)
+        state = SimpleNamespace(Er=40 * jnp.tanh((0.56 - rho) / 0.018))
+        runtime = SimpleNamespace(geometry=SimpleNamespace(rho_grid=rho))
+        prepared = SimpleNamespace(
+            initial_carry=object(),
+            physics_context=SimpleNamespace(unpack_flat=lambda _: state),
+        )
+        frozen_replay = SimpleNamespace(final_carry=SimpleNamespace(y=object()))
+        namespace.update({
+            "_profile_state_from_values": lambda *_args, **_kwargs: state,
+            "_prepare_rollout": lambda *_args, **_kwargs: (None, prepared, object()),
+            "_radau_forward_fd_run_prepared_on_realized_trace": Mock(return_value={"final_state": state}),
+            "_radau_run_prepared_on_realized_trace": Mock(return_value={"final_state": state}),
+            "_fd_reverse_frozen_metadata_accepted_rollout": Mock(return_value=frozen_replay),
+            "_require_complete_frozen_metadata_replay": Mock(),
+        })
+        expected = namespace["_objective_vector"](state, runtime)
+        for mode, contract in (
+            ("accepted", "current"),
+            ("accepted", "reverse_frozen_metadata"),
+            ("attempt", "current"),
+        ):
+            with self.subTest(mode=mode, contract=contract):
+                values, replay = namespace["_objectives_on_realtime_geometry_frozen_trace"](
+                    config={}, runtime=runtime, baseline_state=state, profile_cfg={},
+                    profile_values=None, frozen_trace=object(), replay_mode=mode,
+                    fd_accepted_replay_contract=contract, baseline_replay_reference=object(),
+                )
+                self.assertIs(replay["final_state"], state)
+                np.testing.assert_array_equal(values, expected)
+
     def test_all_and_individual_root_rows_reach_the_reverse_builder(self):
         """Catch a new request list paired with the builder's old default rows."""
         function = next(

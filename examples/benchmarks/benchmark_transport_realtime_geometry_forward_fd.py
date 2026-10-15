@@ -22,16 +22,15 @@ for path in (ROOT, WORKSPACE_ROOT / "vmec_jax"):
 
 from benchmark_transport_autodiff_lagged_ntx import (  # noqa: E402
     DEFAULT_CONFIG,
-    OBJECTIVE_LABELS,
     _adaptive_rollout_diagnostics,
     _baseline_profile_cfg,
     _fd_step,
     _forward_benchmark_adaptive_rollout_objectives_for_parameter_on_frozen_trace,
-    _objective_vector,
     _prepare_benchmark_config,
     _truncate_rollout_trace_by_accepted_steps,
 )
 from benchmark_transport_reverse_ad_only import (  # noqa: E402
+    FULL_TRANSPORT_OBJECTIVE_LABELS,
     PARAMETER_ORDER,
     _find_ntx_support_payload,
     _geometry_context_from_config,
@@ -50,6 +49,7 @@ from NEOPAX._reverse_ad_initial_er import (  # noqa: E402
     initial_er_charge_flux_residual_er_derivative,
     initial_er_charge_flux_residuals,
 )
+from NEOPAX._reverse_ad_transport import objective_scalar_by_index  # noqa: E402
 from NEOPAX._geometry_autodiff import (  # noqa: E402
     _implicit_params_with_boundary_deltas,
     _solve_state_for_single_param,
@@ -73,6 +73,20 @@ from NEOPAX._transport_solvers import (  # noqa: E402
     _radau_run_prepared_on_realized_trace,
 )
 from vmex.core import implicit as im  # noqa: E402
+
+
+OBJECTIVE_LABELS = FULL_TRANSPORT_OBJECTIVE_LABELS
+
+
+def _objective_vector(final_state, runtime) -> jax.Array:
+    """Evaluate the shared AD benchmark rows; endpoint differences supply FD."""
+
+    return jnp.stack(tuple(
+        objective_scalar_by_index(
+            final_state, runtime, index, objective_labels=OBJECTIVE_LABELS,
+        )
+        for index in range(len(OBJECTIVE_LABELS))
+    ))
 
 
 def _report_path(parameter_name: str, *, root_fd_lane: str = "selected") -> Path:
