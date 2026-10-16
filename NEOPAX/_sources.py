@@ -158,10 +158,11 @@ def _power_exchange_temperature_equilibration_impl(state, species, pair_active_m
     nB = state.density[idx_j]
     TA = state.temperature[idx_i]
     TB = state.temperature[idx_j]
-    mA = species.mass_mp[idx_i]
-    mB = species.mass_mp[idx_j]
-    qA = species.charge_qp[idx_i]
-    qB = species.charge_qp[idx_j]
+    # Pair properties vary along the first axis, not the radial axis.
+    mA = species.mass_mp[idx_i, None]
+    mB = species.mass_mp[idx_j, None]
+    qA = species.charge_qp[idx_i, None]
+    qB = species.charge_qp[idx_j, None]
 
     nA_cgs = jnp.maximum(nA * 1.0e14, 1.0e-30)
     nB_cgs = jnp.maximum(nB * 1.0e14, 1.0e-30)
@@ -198,8 +199,8 @@ def _power_exchange_temperature_equilibration_impl(state, species, pair_active_m
 
     pair_prefactor = (
         (4.0 * 2.85e2 / jnp.sqrt(jnp.pi))
-        * jnp.sqrt(mA[:, None] * mB[:, None])
-        * jnp.square((qA * qB)[:, None])
+        * jnp.sqrt(mA * mB)
+        * jnp.square(qA * qB)
     )
     Pab = (
         pair_prefactor
@@ -207,7 +208,7 @@ def _power_exchange_temperature_equilibration_impl(state, species, pair_active_m
         * nB
         * lnL
         * (TB - TA)
-        / jnp.power(mA[:, None] * TB + mB[:, None] * TA, 1.5)
+        / jnp.power(mA * TB + mB * TA, 1.5)
     )
     pair_mask = jnp.asarray(pair_active_mask, dtype=Pab.dtype)[:, None]
     Pab = Pab * pair_mask
