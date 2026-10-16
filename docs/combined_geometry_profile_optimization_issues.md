@@ -853,8 +853,8 @@ initial zero-density/fixed-temperature regression both pass in that selection.
 This establishes a numerical defect in a live reverse path. It does **not**
 yet prove that it is the only cause of the remote trial failures: the console
 does not record the arithmetic operation or incoming-bar magnitude inside the
-first failing compiled segment. A GPU evaluation of an existing failing point
-is still needed. Segment-state checkpoints now include finite magnitudes per
+first failing compiled segment. The GPU reevaluation below now passes at saved
+trial 2; the other failing points remain unverified. Segment-state checkpoints now include finite magnitudes per
 objective, using the already-computed bars and no extra RHS/VJP evaluation.
 
 ### Reevaluate one saved failing point instead of rerunning optimization
@@ -886,6 +886,64 @@ python examples/optimization/optimize_geometry_profiles_from_geometry_result.py 
 small residual/Jacobian snapshot when available. Nonfinite returned arrays
 are preserved separately, and exceptions propagate instead of becoming an
 artificial optimizer penalty. No such GPU evaluation has been run locally.
+
+### GPU reevaluation of saved failing trial 2 now succeeds
+
+The user ran the one-trial command on the GPU machine after syncing the patch.
+The complete console attachment is archived as
+[trial-2 replay output](benchmarks/profiles_only_reverse_replay_trial_0002_2026-10-16.txt),
+with a [parsed result and comparisons](benchmarks/profiles_only_reverse_replay_trial_0002_2026-10-16.csv).
+The source attachment is `9d3201bc-814f-46e8-8abf-4a0b1ecb7d78/Pasted text.txt`,
+6637 bytes, SHA256
+`8d16f4f18717ef2a84b05394021878a7ab12375b3465b86426ffcef981e72280`.
+
+The runner identifies `source_trial=2 previous_event=failed_trial`, uses six
+profile coordinates with fixed saved geometry, and prints `optimizer=skipped`.
+All six reverse segments complete with no first-bad checkpoint printed. The
+initial-state, selected-root, profile, recorded-scan, and final VMEC pullbacks
+all complete. The final line is `finite=True cost=1.71015613e+00`; this flag is
+set only after checking every returned residual and Jacobian entry, without
+the optimizer's penalty or nonfinite-replacement fallback.
+
+| Quantity | Stage-2 starting point | Saved trial 2 after patch |
+| --- | ---: | ---: |
+| Total cost | 3.58735782 | 1.71015613 |
+| Root radius, target 0.514 | 0.556547106 | 0.556540936 |
+| Root location cost | 0.905128115 | 0.904865627 |
+| Bootstrap penalty | 0.464691425 | 0.460275840 |
+| Bootstrap cost | 0.431876241 | 0.423707698 |
+| Net power, MW | 293.597137 | 299.792329 |
+| Power cost | 1.87073863 | 0.00196796905 |
+
+Compared with the starting point, this candidate improves all three active
+transport penalties. Location cost falls 0.0290 percent and bootstrap cost
+falls 1.8914 percent; total cost falls 52.3283 percent. It also has lower cost
+than the old run's only accepted update shown (trial 5, cost 1.73138136), by
+0.02122523. Thus the old reverse failure excluded coordinates that now produce
+a useful physical candidate, including a small improvement in root location.
+The root-radius change is still only `-6.17e-06`; one evaluation does not
+establish meaningful root convergence or reliable full-trajectory derivatives
+throughout an optimization.
+
+This is positive GPU evidence for the remaining floor fix at this saved point.
+It is not a replay of identical Radau stages: the fresh trajectory takes 268
+accepted steps, versus 269 in the original failed trial. The algebraic change
+can remove floating-point round trips and change the adaptive schedule. The
+original first-bad arithmetic operation was not recorded, so this evidence
+does not prove that every failure had this sole cause. The remaining failed
+profile-only trials are 3, 4, 7, 8, and 9.
+
+The new diagnostic directory is
+`outputs/profiles_only_reverse_replay_trial_0002/replay_diagnostics/run_3zq4cnev`.
+One memory sample reports RSS 10371.0 MiB, 690 live JAX arrays, 48481024 live
+device bytes, and a device peak of 5882109696 bytes. A single evaluation cannot
+establish iteration-to-iteration memory stability; that issue remains open.
+The long first reverse-segment time (586.063 seconds) is followed by segments
+of about 11-12 seconds. Its precise compilation/execution split is not reported.
+Printed NaNs for disabled diagnostics such as the old left/right Er terms are
+not nonfinite returned optimizer residuals; the finite check above covers the
+actual residual and Jacobian arrays. No physics test was run locally to
+archive or analyze this result.
 
 ## 6. Original geometry-stage reproducibility report
 
