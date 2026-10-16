@@ -27,6 +27,70 @@ two-stage script does not automatically apply that backend flag. The updated
 two-stage handoff also keeps host-side coordinates/scales instead of retaining
 the entire geometry-only problem during phase 2.
 
+### Stage-2 profile-only control and initial-profile plots (2026-10-16)
+
+The saved-result runner now accepts `--profile-only`. SciPy then receives only
+the six profile coordinates and six Jacobian columns; every evaluation and
+saved VMEC input uses the accepted geometry coordinates from stage 1. All
+existing objective rows and weights are retained. The same combined evaluator
+is used internally, including its geometry reverse work, so this is a control
+of optimizer variables rather than a separate, faster profile-AD backend.
+The existing reverse failures and memory issue are still under investigation.
+
+Run on the GPU machine, with the usual environment active:
+
+```bash
+cd ~/NEOPAX
+PYTHONPATH="$HOME/VMEX:$HOME/NTX/src" \
+python examples/optimization/optimize_geometry_profiles_from_geometry_result.py \
+  --geometry-result-dir outputs/geometry_qi_max_er_transition_bootstrap_net_power_initial_root_database_full_transport_optimization \
+  --profile-only \
+  --out-dir outputs/profiles_only_from_geometry_result_diagnostics \
+  --diagnose-optimization
+```
+
+Omitting `--profile-only` runs the existing geometry-plus-profiles case. The
+default output directories are separate (`profiles_from_geometry_result` and
+`combined_from_geometry_result`); an explicit `--out-dir` takes precedence.
+
+Both modes now save `profile_parameters_initial.json` as well as the optimized
+parameters, and by default write:
+
+- `initial_profiles_initial_vs_optimized.png`: density and temperature at
+  **t = 0** for the starting and optimized cases, plus their differences.
+  All configured species, including zero-density helium, are included.
+- `initial_optimized_initial_profiles.csv`: the plotted radial values in
+  units of `1e20 m^-3` and `keV`.
+
+The plots reconstruct the existing analytical initialization map on the
+normalized radial grid, preserving configured temperatures and density-floor
+handling. They do not solve VMEC, an ambipolar root, or transport again. Use
+`--no-plot-initial-profiles` to omit this postprocessing. The summary records
+both the six-variable optimizer vector and the full vector with fixed geometry
+in profile-only mode.
+
+To plot an already completed combined run, including one made before this
+plotting addition, use its existing output directory:
+
+```bash
+PYTHONPATH="$HOME/VMEX:$HOME/NTX/src" \
+python examples/optimization/optimize_geometry_profiles_from_geometry_result.py \
+  --geometry-result-dir outputs/geometry_qi_max_er_transition_bootstrap_net_power_initial_root_database_full_transport_optimization \
+  --out-dir outputs/combined_from_geometry_result_diagnostics \
+  --plot-profiles-only
+```
+
+This mode reads the stored optimized parameters, uses stored initial parameters
+when available (otherwise the saved geometry run's nominal profile config),
+and exits without constructing a physics problem or running an optimizer. New
+stage-2 summaries also store their config for reproducible plot regeneration.
+
+Validation: 25 lightweight diagnostics/lifecycle/continuation checks pass,
+including an actual small SciPy solve that never changes the saved geometry,
+six-column diagnostic output, initial-profile CSV values and finite helium
+temperature, and plotting a legacy completed run with physics builders and
+the optimizer forbidden. No VMEC, NTX, transport, or FD solve was run locally.
+
 ## 1. Host-memory growth remains open
 
 The combined-only run avoids the previous CUDA graph-instantiation OOM, but
@@ -392,7 +456,311 @@ No VMEC, NTX, transport, or GPU optimization was run locally.
 
 These expensive end-to-end checks have not been run on the local CPU machine.
 
-## 4. Original geometry-stage reproducibility report
+## 4. Instrumented remote run supplied 2026-10-16
+
+The user supplied the complete console output of the saved-geometry
+combined-only runner with `--diagnose-optimization`. The output is archived
+byte for byte in [the console record](benchmarks/combined_from_geometry_result_diagnostics_2026-10-16.txt)
+and parsed into [a 30-evaluation CSV](benchmarks/combined_from_geometry_result_diagnostics_2026-10-16.csv).
+Source attachment: `dcabc25e-abdf-490f-bcd4-10d625f77996/Pasted text.txt`.
+Raw SHA-256: `65307552afb53fb46a8d0efb476ca37b0d459a51f298bf231fe42caef04ed067`.
+The remote Git commit/dependency versions are not printed.
+
+The runner confirms that geometry phase 1 was skipped, 30 combined parameters
+were active, the database grid was `(25,25,33)`, and CUDA command buffers were
+disabled. The initial objective values match the previous saved-geometry
+start at printed precision. The diagnostic directory is:
+
+```text
+/home/exouser/NEOPAX/outputs/combined_from_geometry_result_diagnostics/optimization_diagnostics/run_jumo5hl4
+```
+
+### Accepted solution still exhibits the root plateau
+
+There are 23 evaluations returning residuals/Jacobians, including the initial
+point, 17 accepted updates, and 5 rejected successful evaluations. Seven
+evaluations fail in reverse AD. The final accepted point is trial 29; trial
+30 has higher cost and is rejected. The 30-evaluation limit stops the solve
+with status 0 and first-order optimality `3.10e+05`. This stopping condition
+does not explain why the root fails to improve.
+
+| Quantity | Initial point | Final accepted trial 29 |
+| --- | ---: | ---: |
+| Total cost | 3.58735782 | 1.61019709 |
+| Transition radius (target 0.514) | 0.556547106 | 0.556570780 |
+| Location cost | 0.905128115 | 0.906135666 |
+| Transition strength | 1.75939014 | 1.75650827 |
+| Bootstrap penalty | 0.464691425 | 0.417396899 |
+| Bootstrap cost | 0.431876241 | 0.348440343 |
+| Net power (MW) | 293.597137 | 300.134477 |
+| Net-power cost | 1.87073863 | 0.000825206979 |
+
+The radius changes by only `+2.3674e-05`, slightly worsening its target
+error. Bootstrap cost improves by 19.3194 percent. Strength already exceeds
+its 0.9 target and its deficit cost remains negligible. Power contributes
+only 0.051249 percent of the final accepted cost, so continued power-cost
+dominance is not established by the cost breakdown. Row sensitivities and
+curvature at this point are still needed to assess the actual step choice.
+
+The successful and failed sequence differs from the previous run (for
+example trial 5 now fails), and the final cost is 1.61019709 rather than
+1.58009824. Trial numbers alone do not establish identical coordinates
+between runs; the console does not establish why their trajectories differ.
+
+### First nonfinite checkpoint is within segmented transport reverse
+
+Every failed trial first reports the reduced state cotangent leaf `.y`
+with shape `(13,408)`, and all 5304 entries are nonfinite. All thirteen
+objective rows are affected, including pressure, temperature, power,
+bootstrap, and the transition observables.
+
+| Failed trial | First bad checkpoint | Total segments |
+| --- | --- | ---: |
+| 2 | `segment_2_state_bars` | 4 |
+| 5 | `segment_4_state_bars` | 5 |
+| 7 | `segment_3_state_bars` | 5 |
+| 9 | `segment_4_state_bars` | 5 |
+| 10 | `segment_4_state_bars` | 5 |
+| 23 | `segment_3_state_bars` | 5 |
+| 24 | `segment_3_state_bars` | 5 |
+
+The reverse segments execute in descending order. Thus these checkpoints
+follow already-completed later-time segments and precede the initial-state
+and selected-initial-root pullbacks and the final recorded scan transpose.
+The eventual `input fixed-table bars` exception detects downstream
+nonfinite bars; it is not the first observed failure boundary.
+
+Source tracing confirms that the database segment executes a reverse scan
+over its recorded accepted-step primal data, using the common transport
+state adjoint and rebuild pullback for the objective batch. The exact
+`block` lane solves the transposed stage-residual matrix before assembling
+the state/support pullbacks. A nonfinite or singular shared stage system,
+bad RHS derivative, a bad rebuild pullback, or adjoint overflow are possible
+producers inside the first bad segment. The console does not distinguish
+them. In particular, all-objective contamination does not establish a root
+metric derivative error or prove a helium density-floor cause. No physics
+formula or derivative was changed on this evidence alone.
+
+### Host-memory growth persists, including successful trials
+
+| Evaluation | RSS (MiB) | Live JAX arrays | Live device bytes |
+| --- | ---: | ---: | ---: |
+| 1 | 6318.4 | 689 | 48504576 |
+| 13 | 8525.0 | 744 | 48517888 |
+| 26 | 10038.3 | 744 | 48517888 |
+| 29 | 10506.0 | 744 | 48517888 |
+| 30 | 10662.8 | 744 | 48517888 |
+
+RSS increases 4344.4 MiB (4.24 GiB) across the run. Evaluations 26-30 alone
+add 624.5 MiB despite identical sampled live-array counts/device bytes and
+all five measured stage caches staying at one entry. The five evaluations
+all return residuals and Jacobians, though trial 30 is rejected by TRF.
+Therefore failed-trial traceback lifetimes alone do not explain the late
+growth. Successful live GPU allocation is about 46 MiB and sampled peak GPU
+allocation plateaus at 5882395648 bytes. Failed-evaluation samples temporarily
+rise to about 449 MB, returning to the successful baseline afterward.
+This is persistent host-RSS growth, not a demonstrated persistent live
+GPU-array increase. It does not identify the responsible host allocation or
+establish whether the new metadata checks contribute to that growth.
+
+### Initial request for the saved event artifact
+
+The attachment is the console output only. The existing remote
+`events.jsonl`, NPZ snapshots, and failed-trial traceback files were not
+attached and are not present in the local checkout. Weighted row/column
+gradients, model predictions, bounds, and species/root-mask summaries are
+saved in that JSONL; they are not printed in the console excerpt.
+
+The next input is `events.jsonl` from the completed `run_jumo5hl4` directory.
+It also contains terminal transport objective values for failed candidates
+when computed before failure, which can reveal whether a promising physical
+trial was discarded due to reverse AD. Reading that existing file requires
+no new optimization run. No expensive local test or physics solve was run
+to parse, archive, or inspect this evidence.
+
+### Event excerpts supplied subsequently: mechanism of the root plateau
+
+The user subsequently supplied seven event-file fragments. They are archived
+with byte hashes and line coverage in
+[the excerpt manifest](benchmarks/combined_diagnostics_events_2026-10-16/manifest.json).
+Raw parts are preserved separately. The normalized excerpt contains 784
+unique complete JSON events after removing five exact duplicate records;
+five cut JSON lines and one shell prompt are omitted only from that derived
+excerpt. In particular, the setup and early trial records are absent, and
+trial 18's Jacobian record is cut across an unrecoverable gap. No missing
+values or JSON records were reconstructed.
+
+There are 17 complete trial/Jacobian records (11-17, 19-22, 25-30), three
+failed-trial records (10, 23, 24), and the final solver record. Their values
+agree with the archived console run. The recorder stores each weighted
+row's contribution `g_i = r_i * J_i`, so its nonzero-residual Jacobian rows
+can be recovered from these records without the NPZ files. Zero-residual
+rows here also have zero logged Jacobian norms. The host-only
+[analysis script](benchmarks/combined_diagnostics_events_2026-10-16/analyze_excerpt.py)
+verifies reconstructed row norms, `J.T @ r`, costs, and available model
+predictions against the saved data. It imports JSON/CSV/NumPy only and runs
+no physics or finite differences.
+
+Derived records:
+
+- [Weighted objective gradients](benchmarks/combined_diagnostics_events_2026-10-16/objective_rows.csv).
+- [Point sensitivities, correlations, and conditioning](benchmarks/combined_diagnostics_events_2026-10-16/point_analysis.csv).
+- [Predicted and actual changes](benchmarks/combined_diagnostics_events_2026-10-16/step_predictions.csv).
+- [Transport values at failed trials](benchmarks/combined_diagnostics_events_2026-10-16/failed_transport_values.csv).
+- [Selected numerical analysis](benchmarks/combined_diagnostics_events_2026-10-16/analysis.json).
+
+**The location objective is active and its gradient is nonzero.** The row
+`transport:Er_transition_rho` is deliberately a zero-weight diagnostic;
+`transport:Er_transition_location_moment` is the active weight-1000 row.
+The zero diagnostic row must not be mistaken for an omitted root objective.
+
+**A small power cost still creates a large gradient.** At accepted trial 28,
+location cost is 0.906137 and power cost is only 0.000944268, but their
+geometry-block cost-gradient norms are 0.766054 and 65.3964 respectively.
+Bootstrap's corresponding norm is 32.9428. The root/power weighted Jacobian
+row cosine is 0.973843: most location sensitivity lies along the very steep
+power-sensitive direction. Projection of the location row onto directions
+preserving power reduces its norm from 0.573467 to 0.130304; preserving all
+other active rows reduces it to 0.100754. These are local linear quantities,
+not feasibility guarantees for a large nonlinear step.
+
+**Step contractions make meaningful root motion impossible at the observed
+scale.** The parameter-step norm falls from `1.97816e-05` at trial 22 to
+`4.93623e-06` and `1.23422e-06` at failed trials 23 and 24, then to
+`3.08565e-07` at accepted trial 25. These are recorded parameter-step norms,
+not direct measurements of SciPy's internal trust radius. They exhibit the
+contractions expected after the poor model agreement and rejected reverse
+failures. Trial 25 predicts a radius change of only `-6.17e-09`; its actual
+change is about `-4.55e-09`. The root is not frozen, but changes at this scale
+cannot appreciably reduce the remaining radius error of about 0.04257.
+
+**Finite derivatives also show a severe shared spike.** The following norms
+are the geometry block of each weighted cost-gradient contribution:
+
+| Row | Trial 28 | Trial 29 | Trial 30 |
+| --- | ---: | ---: | ---: |
+| Location | 0.766054 | 3887.79 | 0.769934 |
+| Bootstrap | 32.9428 | 62527.6 | 31.7596 |
+| Net power | 65.3964 | 355818 | 69.3672 |
+
+At trial 29 the root/power row cosine is 0.999999998978 and root/bootstrap is
+0.999999864596. The largest singular value rises from about 1565 to
+8.93225e+06 and returns to 1580 at trial 30; the other six active singular
+values stay much smaller. The active seven-row Jacobian condition number
+rises from about 1.55e+04 to 9.80e+07. The independent location sensitivity
+after preserving the other rows stays near 0.09-0.11 even during this spike:
+the large new component is overwhelmingly shared with the other transport
+rows rather than providing a useful independent root direction.
+
+Trial 29 was reached using the preceding, relatively regular Jacobian and
+had good model agreement (ratio 0.97445). Its newly computed, spiky Jacobian
+then drives trial 30. That model predicts a cost reduction of 0.00132997;
+the actual cost increases by 0.0000892746. It predicts a weighted power
+residual change of `-0.0482044`, whereas the actual change is `+0.00497337`.
+This is direct evidence of poor local model reliability at the realized
+step size, not an independent FD proof that the infinitesimal derivative is
+incorrect. It is consistent with strong ill-conditioning or an unstable
+shared full-trajectory reverse contribution. The precise producing
+operation has not yet been localized inside the compiled segment.
+
+**The observations do not support profiles consuming all the motion.** In
+the available successful trials, roughly 90-99.99 percent of the squared
+parameter-step norm is in ESS geometry coordinates. The final profile
+coordinates are nominal relative deltas; their largest absolute change is
+only 0.02205 percent from nominal. The final active-bound mask is zero in
+every coordinate. Thus neither frozen geometry nor an active profile bound
+explains this plateau in the recorded run.
+
+**Bad reverse trials discard improving transport candidates.** Failed
+trial 10 has location/bootstrap/power cost changes of `-2.35e-05`,
+`-0.00666482`, and `-0.00195537` relative to accepted trial 8. All three
+transport terms improve, but reverse failure still produces the adapter's
+huge artificial penalty. Failed trials 23 and 24 also reduce the sum of
+these three transport costs by about 0.000254152 and 0.0000658407 respectively,
+although bootstrap alone slightly worsens there. Their total physical costs
+are unknown because the remaining geometry objective values were not
+reported before the reverse failure. These observations establish useful
+transport progress being excluded, not that every failed candidate would
+have improved total cost.
+
+Initial and final states and terminal cotangents in the supplied failed
+trials are finite. In trials 23/24, the helium density starts at zero but its
+recorded temperature is finite (roughly 0.72-12.46 keV), and terminal helium
+density is positive. This supports the previous initialization-floor fix
+being active; it does not rule out a floor-related derivative issue at an
+intermediate Radau stage. The first observed nonfinite output remains the
+segmented transport state reverse, preceding initial-root and scan folds.
+
+Together these records explain the observed step mechanism: a weak
+independent root direction competes with much steeper, correlated transport
+directions while failed reverse evaluations and unreliable models contract
+the available steps. The outstanding source-level diagnosis is the shared
+stage-adjoint matrix/solve and subsequent state/rebuild pullbacks, including
+their finite-but-large amplification at trial 29. The 16-step benchmark
+agreement does not establish the conditioning or accuracy of this much
+longer warm-geometry trajectory. No objective weights, solver equations, or
+physical derivatives were changed on the basis of this excerpt analysis.
+
+### Why the nonzero profile gradient does not produce visible root motion
+
+The profile-only calculation sharpens the explanation above: objective
+competition is insufficient to explain the stall, and the available data do
+not establish a stationary trade-off between root location and power.
+
+The host-only analysis now also saves
+[per-profile sensitivities](benchmarks/combined_diagnostics_events_2026-10-16/profile_sensitivities.csv),
+[hypothetical profile directions](benchmarks/combined_diagnostics_events_2026-10-16/profile_direction_models.csv), and
+[the actual profile-step projections](benchmarks/combined_diagnostics_events_2026-10-16/chosen_profile_steps.csv).
+All numbers below use the stored weighted Jacobian at accepted trial 28,
+before the shared derivative spike at trial 29. Profile coordinates are
+nominal relative deltas, so a coordinate change of 0.01 means a one-percent
+change in that profile parameter.
+
+- The actual profile step from trial 28 to 29 has norm `7.42888e-07` and
+  cosine `0.804944` with the negative root profile gradient. It is already
+  directed toward improving the root. Its predicted contribution to radius
+  change is only `-1.34387e-09`; geometry contributes `-3.14210e-08`.
+  The remaining radius error is about `0.04257`.
+- Even reallocating that entire joint step's norm (`2.47667e-06`) to the
+  steepest root-improving profile direction would reduce radius by at most
+  `5.56591e-09` in this linear model. A change of allocation alone cannot
+  make this particular tiny step useful for the root.
+- The radius derivative with respect to the relative `T0` coordinate is
+  `0.00167190`. A one-percent decrease in `T0` therefore predicts a radius
+  decrease of only `1.67190e-05` locally. Such a step has not been evaluated;
+  it illustrates the small sensitivity, not a validated finite-step result.
+- A feasible infinitesimal profile direction improving the root while
+  preserving both power and bootstrap to first order exists. Its unit
+  vector, in the six documented profile coordinates, is approximately
+  `(0.264898, -0.571459, -0.698778, -0.222239, 0.199328, 0.160785)`.
+  Multiplying it by `1e-04` predicts radius change `-6.43278e-08` and total
+  cost decrease `2.73849e-06`, with negligible first-order power/bootstrap
+  changes. These are saved-linear-model quantities, not a physics trial.
+  This specifically rules out a necessary local conflict with these two
+  objectives as the complete explanation.
+
+The recorded failures and solver adapter explain an observed route to these
+tiny steps. `optimization.least_squares._fun` requests a joint residual and
+Jacobian evaluation. A non-resource exception during the reverse part of
+that evaluation returns all-`1e6` residuals to SciPy, even when the forward
+transport objectives were already finite and improving. SciPy consequently
+rejects the trial and contracts its common trust region; there is no
+independent profile trust region in this run. The logged step contractions
+after failed trials 23 and 24 are consistent with that mechanism. Poor
+predictions from the finite Jacobian spikes also cause rejections. The run
+then reaches its 30-evaluation budget with profile changes below 0.023
+percent, far too small to appreciably affect the location at the ordinary
+saved sensitivities.
+
+Thus the root profile gradient is present and is used by successful steps.
+The unresolved problem is obtaining reliable full-trajectory derivatives
+and useful accepted step sizes. The exact arithmetic operation responsible
+for nonfinite and spiking reverse contributions remains unlocalized; the
+excerpt analysis does not prove a global profile limitation or justify
+calling the result a converged compromise. No physics solve or FD test was
+run for this additional analysis.
+
+## 5. Original geometry-stage reproducibility report
 
 The user also reported that phase 1 of the original two-stage script did not
 match the standalone geometry-only optimization result. Mocked setup checks

@@ -1,0 +1,180 @@
+{
+    "record_type":  "Partial diagnostic event excerpts; not a complete run",
+    "remote_run":  "run_jumo5hl4 (matched against supplied console)",
+    "parts":  [
+                  {
+                      "file":  "part_01.txt",
+                      "attachment_id":  "79a9fbce-def9-4ce0-a85d-ba249bcaa1f4",
+                      "bytes":  109463,
+                      "sha256":  "bdfcd221defa2d707d61d8c7d2b292c4d3ecb1865fce6be361e7d7b3132f5d90",
+                      "complete_events":  130,
+                      "duplicate_events":  0,
+                      "trials":  [
+                                     10,
+                                     11,
+                                     12,
+                                     13,
+                                     14
+                                 ],
+                      "incomplete_lines":  [
+                                               {
+                                                   "line":  1,
+                                                   "characters":  11462,
+                                                   "prefix":  "t64\", \"first_nonfinite_index\": [], \"nonfinite_count\": 1}, {\"path\": \"[\u0027alpha_power_volume_average_mw_",
+                                                   "reason":  "Incomplete or non-event JSON line; raw fragment preserved without reconstruction."
+                                               }
+                                           ]
+                  },
+                  {
+                      "file":  "part_02.txt",
+                      "attachment_id":  "989a4518-bf2d-42c0-9312-e5373f290a47",
+                      "bytes":  91937,
+                      "sha256":  "ac23d3c6e4a11ddcd7bc11c7ef5f620ce84454a3f6cb9f5a3eca96476d2215ad",
+                      "complete_events":  152,
+                      "duplicate_events":  4,
+                      "trials":  [
+                                     14,
+                                     15,
+                                     16,
+                                     17
+                                 ],
+                      "incomplete_lines":  [
+                                               {
+                                                   "line":  1,
+                                                   "characters":  31,
+                                                   "prefix":  "leading_index\": [0, 0, 0, 0]}]}",
+                                                   "reason":  "Incomplete or non-event JSON line; raw fragment preserved without reconstruction."
+                                               },
+                                               {
+                                                   "line":  154,
+                                                   "characters":  80,
+                                                   "prefix":  "{\"event\": \"reverse_checkpoint\", \"trial\": 17, \"stage\": \"recorded_scan/merged scan",
+                                                   "reason":  "Incomplete or non-event JSON line; raw fragment preserved without reconstruction."
+                                               }
+                                           ]
+                  },
+                  {
+                      "file":  "part_03.txt",
+                      "attachment_id":  "a2a6ffa2-34b6-466c-a72d-69a954c7692e",
+                      "bytes":  42550,
+                      "sha256":  "473041fd08da029e36aa3eae9ad2a48415d775548e673938fd73c72b0e91c784",
+                      "complete_events":  40,
+                      "duplicate_events":  0,
+                      "trials":  [
+                                     17,
+                                     18
+                                 ],
+                      "incomplete_lines":  [
+                                               {
+                                                   "line":  41,
+                                                   "characters":  13840,
+                                                   "prefix":  "{\"event\": \"trial\", \"trial\": 18, \"snapshot\": \"trial_0018.npz\", \"x\": [0.00023090735060585097, 3.126397",
+                                                   "reason":  "Incomplete or non-event JSON line; raw fragment preserved without reconstruction."
+                                               }
+                                           ]
+                  },
+                  {
+                      "file":  "part_04.txt",
+                      "attachment_id":  "854e5223-15d9-4cfd-adeb-edee57345eb3",
+                      "bytes":  90170,
+                      "sha256":  "824816c075e703b06e494984b5ad8f053ac542374b94dbe1e5d20539dfb1d558",
+                      "complete_events":  122,
+                      "duplicate_events":  0,
+                      "trials":  [
+                                     18,
+                                     19,
+                                     20,
+                                     21,
+                                     22
+                                 ],
+                      "incomplete_lines":  [
+                                               {
+                                                   "line":  1,
+                                                   "characters":  2315,
+                                                   "prefix":  "0.0}, {\"label\": \"mirror_penalization\", \"linear_residual_change\": -0.00033122895301343264, \"geometry_",
+                                                   "reason":  "Incomplete or non-event JSON line; raw fragment preserved without reconstruction."
+                                               }
+                                           ]
+                  },
+                  {
+                      "file":  "part_05.txt",
+                      "attachment_id":  "3daaac0c-cb66-4e18-bd80-b78d3d87b2ba",
+                      "bytes":  158615,
+                      "sha256":  "ba1c5230be9dccd2ba5532a7bdabf463ff0768dab8b5eefc015de1e496cd4a90",
+                      "complete_events":  88,
+                      "duplicate_events":  1,
+                      "trials":  [
+                                     22,
+                                     23,
+                                     24
+                                 ],
+                      "incomplete_lines":  [
+
+                                           ]
+                  },
+                  {
+                      "file":  "part_06.txt",
+                      "attachment_id":  "08790056-2d5c-4eeb-a098-f89f7c5c3bcc",
+                      "bytes":  176627,
+                      "sha256":  "0469a775795154f9a712df12adb72c533c2a3a234815a50ca4b3b8e02e1a7921",
+                      "complete_events":  137,
+                      "duplicate_events":  0,
+                      "trials":  [
+                                     24,
+                                     25,
+                                     26,
+                                     27
+                                 ],
+                      "incomplete_lines":  [
+
+                                           ]
+                  },
+                  {
+                      "file":  "part_07.txt",
+                      "attachment_id":  "d396239d-4eca-4c29-80d2-3b6450e0a16b",
+                      "bytes":  86336,
+                      "sha256":  "4d8730d265053f78d2e297df0fa01260c01b14aed6b935886ed19e574e155f46",
+                      "complete_events":  120,
+                      "duplicate_events":  0,
+                      "trials":  [
+                                     28,
+                                     29,
+                                     30
+                                 ],
+                      "incomplete_lines":  [
+                                               {
+                                                   "line":  121,
+                                                   "characters":  38,
+                                                   "prefix":  "(jax_env) exouser@neopax-22:~/NEOPAX$ ",
+                                                   "reason":  "Incomplete or non-event JSON line; raw fragment preserved without reconstruction."
+                                               }
+                                           ]
+                  }
+              ],
+    "complete_unique_events":  784,
+    "trial_records":  [
+                          11,
+                          12,
+                          13,
+                          14,
+                          15,
+                          16,
+                          17,
+                          19,
+                          20,
+                          21,
+                          22,
+                          25,
+                          26,
+                          27,
+                          28,
+                          29,
+                          30
+                      ],
+    "failure_records":  [
+                            10,
+                            23,
+                            24
+                        ],
+    "finished_records":  1
+}
