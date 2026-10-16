@@ -1,0 +1,2 @@
+source_trial,replay_trial,first_bad_segment,time,dt,adjoint_rhs_abs_max,step_input_y_finite,trial_y_finite,cached_jacobian_finite,newton_iter_count,nonfinite_stage_slope_blocks,nonfinite_stage_state_blocks,nonfinite_stage_rhs_blocks,nonfinite_stage_jacobian_blocks,matrix_nonfinite_count,rss_MiB,live_jax_arrays,device_bytes_in_use,device_peak_bytes_in_use
+2,1,5,0.23283061626736629,0.030139674511190269,1.7897597282504262e-06,False,False,False,1,7,7,7,7,8156736,10028.8,2300,2377989632,5321470976

@@ -1893,6 +1893,7 @@ def test_database_full_transport_replay_stage_keeps_support_dynamic_and_cache_st
         max_total_steps,
         stop_after_accepted_steps,
         capture_segment_length,
+        capture_newton_setup=False,
     ):
         return (
             execution_context.physics_context.flat_rhs(jnp.asarray(0.0), carry.y),
@@ -2000,13 +2001,14 @@ def test_database_full_transport_replay_stage_keeps_support_dynamic_and_cache_st
         segment_arrays=segment_arrays,
     )
 
-    def run(support, active_prepared=prepared):
+    def run(support, active_prepared=prepared, force_rebuild=None):
         return jax.block_until_ready(
             stage.replay(
                 initial_flat_state=active_prepared.initial_carry.y,
                 support_payload=support,
                 segment_start_carry=active_prepared.initial_carry,
                 segment_arrays=segment_arrays,
+                force_jacobian_rebuild=force_rebuild,
             )
         )
 
@@ -2034,6 +2036,7 @@ def test_database_full_transport_replay_stage_keeps_support_dynamic_and_cache_st
             execution_context,
             prepared.initial_carry,
             segment_arrays,
+            validate_primal=True,
         )
     )
     reference_result1 = jax.block_until_ready(
@@ -2041,6 +2044,7 @@ def test_database_full_transport_replay_stage_keeps_support_dynamic_and_cache_st
             execution_context1,
             prepared1.initial_carry,
             segment_arrays,
+            validate_primal=True,
         )
     )
 
@@ -2062,6 +2066,9 @@ def test_database_full_transport_replay_stage_keeps_support_dynamic_and_cache_st
             capture_segment_length=1,
         )
     )
+    # Forward decisions are numerical arguments, not new static JIT identities.
+    forced_result = run(support1, prepared1, force_rebuild=jnp.asarray([True]))
+    assert jnp.allclose(forced_result[0].y, result1[0].y)
     assert stage.cache_size() == 1
     assert stage.schedule_probe_cache_size() == 1
     assert not jnp.allclose(result0[0].y, result1[0].y)

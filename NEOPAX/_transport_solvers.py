@@ -4545,6 +4545,8 @@ class _RadauAcceptedStepReverseMinimalAttemptResult:
     complex_piv_out: Any
     theta_final: Any
     newton_iter_count: Any
+    converged: Any = None
+    final_residual_norm: Any = None
 
 
 @jax.tree_util.register_dataclass
@@ -4576,6 +4578,11 @@ class _RadauAcceptedStepSegmentPrimalRecord:
     newton_iter_count: Any
     lagged_response_cache: Any
     lagged_reference_y: Any
+    # Optimization's checked primal replay records scalar solve status only.
+    # Legacy benchmark records retain None and their established contract.
+    replay_valid: Any = None
+    replay_converged: Any = None
+    replay_residual_norm: Any = None
 
 
 @jax.tree_util.register_dataclass
@@ -4712,6 +4719,8 @@ class _RadauAdaptiveScheduleTrace:
     next_regrowth_cooldown: Any
     next_easy_growth_streak: Any
     next_lagged_response_valid: Any
+    # Optional scalar decisions retained by optimization, not a cache/stage tape.
+    jacobian_reused: Any = None
 
 
 @jax.tree_util.register_dataclass
@@ -9438,18 +9447,49 @@ def _radau_segment_reduced_cotangent_bwd_batched_with_support_call(
     return segment_start_reduced_bars, segment_support_bar_leaves
 
 
-@partial(jax.jit, static_argnums=(0,), inline=False)
+@partial(jax.jit, static_argnums=(0,), static_argnames=("validate_primal",), inline=False)
 def _radau_segment_replay_minimal_with_primal_records_call(
     execution_context: _RadauSolveExecutionContext,
     segment_start_carry: _RadauAcceptedStepCarry,
     segment_arrays,
+    *,
+    validate_primal: bool = False,
 ) -> tuple[_RadauAcceptedStepCarry, _RadauAcceptedStepCarry, _RadauAcceptedStepSegmentPrimalRecord]:
-    """Diagnostic boundary for the segment-local record-producing replay.
+    """Replay bounded segment records, optionally checking prescribed steps.
 
-    This is deliberately separate from the production fused segment kernel.
-    It exists only to measure the exact minimal replay which creates the
-    bounded records consumed by the record-mode reverse path.
+    Optimization uses the checked path. Benchmark callers retain the existing
+    reverse-minimal reconstruction unless explicitly requesting validation.
     """
+
+    if validate_primal:
+        # Optimization appends the original forward rebuild decisions. Reverse
+        # kernels still consume the established seven controller arrays.
+        checked_arrays = (
+            segment_arrays if len(segment_arrays) == 8
+            else (*segment_arrays, jnp.zeros_like(segment_arrays[0]))
+        )
+
+        def _collect_checked(scan_carry, slot_xs):
+            carry, failed = scan_carry
+            active, *metadata, force_rebuild = slot_xs
+            carry_for_step = dataclasses.replace(
+                carry, cache_valid=carry.cache_valid & ~force_rebuild,
+            )
+            proposed_carry, record = _radau_replay_realized_accepted_slot_reverse_minimal_with_primal_record(
+                execution_context, carry_for_step, active & ~failed, *metadata,
+                validate_primal=True,
+            )
+            valid = record.replay_valid & jnp.all(jnp.isfinite(proposed_carry.y))
+            record = dataclasses.replace(record, replay_valid=valid)
+            # Keep the last valid state if reconstruction failed. Later
+            # slots are padding, and the host rejects this segment before AD.
+            next_carry = jax.lax.cond(valid, lambda _: proposed_carry, lambda _: carry, operand=None)
+            return (next_carry, failed | ~valid), (carry_for_step, record)
+
+        (final_carry, _), (step_start_carries, step_primal_records) = jax.lax.scan(
+            _collect_checked, (segment_start_carry, jnp.asarray(False)), checked_arrays,
+        )
+        return final_carry, step_start_carries, step_primal_records
 
     def _collect(carry, slot_xs):
         next_carry, record = _radau_replay_realized_accepted_slot_reverse_minimal_with_primal_record(
@@ -9872,9 +9912,15 @@ def _execute_radau_accepted_step_attempt_reverse_minimal(
     physics_context: _RadauAcceptedStepPhysicsContext,
     carry_in: _RadauAcceptedStepCarry,
     context: _RadauAcceptedStepAttemptContext,
+    *,
+    return_convergence: bool = False,
 ) -> _RadauAcceptedStepReverseMinimalAttemptResult:
     """Reverse-only accepted-step attempt data for the direct adjoint path."""
     trial_dt = jnp.minimum(carry_in.dt, context.t_final - carry_in.t)
+    step_result = _radau_single_step_primal_reverse_minimal(
+        kernel_context, physics_context, carry_in, trial_dt,
+        return_convergence=return_convergence,
+    )
     (
         trial_y,
         stage_history,
@@ -9892,7 +9938,7 @@ def _execute_radau_accepted_step_attempt_reverse_minimal(
         newton_iter_count,
         lagged_response_out,
         lagged_reference_y_out,
-    ) = _radau_single_step_primal_reverse_minimal(kernel_context, physics_context, carry_in, trial_dt)
+    ) = step_result[:16]
     carry_after_attempt = dataclasses.replace(
         carry_in,
         lagged_response_cache=lagged_response_out,
@@ -9916,6 +9962,8 @@ def _execute_radau_accepted_step_attempt_reverse_minimal(
         complex_piv_out=complex_piv_out,
         theta_final=theta_final,
         newton_iter_count=newton_iter_count,
+        converged=step_result[16] if return_convergence else None,
+        final_residual_norm=step_result[17] if return_convergence else None,
     )
 
 
@@ -19125,6 +19173,7 @@ def _radau_single_step_primal_reverse_minimal(
     h_value,
     *,
     return_compact_coefficient_record: bool = False,
+    return_convergence: bool = False,
 ):
     """Reverse-only primal step data needed by the accepted-step adjoint.
 
@@ -19518,6 +19567,8 @@ def _radau_single_step_primal_reverse_minimal(
         lagged_response,
         lagged_reference_y,
     )
+    if return_convergence:
+        result = (*result, subsolve_result.converged, subsolve_result.final_residual_norm)
     if return_compact_coefficient_record:
         return (*result, compact_coefficient_record)
     return result
@@ -20285,6 +20336,7 @@ def _radau_adaptive_schedule_rollout(
     max_total_steps: int,
     stop_after_accepted_steps: int | None = None,
     capture_segment_length: int | None = None,
+    capture_newton_setup: bool = False,
 ) -> _RadauAdaptiveScheduleRolloutResult:
     """Run the real adaptive rollout while saving only schedule/controller metadata."""
 
@@ -20388,11 +20440,14 @@ def _radau_adaptive_schedule_rollout(
             next_step_state.easy_growth_streak,
             next_step_state.lagged_response_valid,
         )
+        if capture_newton_setup:
+            scan_out = (*scan_out, step_info.jacobian_reused)
         return (next_step_state, accepted_next, segment_starts), scan_out
 
     (final_step_state, _, segment_start_carries), scan_outputs = jax.lax.scan(
         _scan_body_with_idx, (step_state0, jnp.asarray(0, dtype=jnp.int32), segment_starts0), xs
     )
+    schedule_outputs = scan_outputs[:10]
     (
         active_mask,
         accepted_mask,
@@ -20404,7 +20459,7 @@ def _radau_adaptive_schedule_rollout(
         next_regrowth_cooldown,
         next_easy_growth_streak,
         next_lagged_response_valid,
-    ) = scan_outputs
+    ) = schedule_outputs
     final_carry = _radau_carry_from_step_state(final_step_state)
     trace = _RadauAdaptiveScheduleTrace(
         accepted_mask=accepted_mask,
@@ -20417,6 +20472,7 @@ def _radau_adaptive_schedule_rollout(
         next_regrowth_cooldown=next_regrowth_cooldown,
         next_easy_growth_streak=next_easy_growth_streak,
         next_lagged_response_valid=next_lagged_response_valid,
+        jacobian_reused=scan_outputs[10] if capture_newton_setup else None,
     )
     completed = jnp.logical_or(
         final_step_state.t >= (execution_context.attempt_context.t_final - 1.0e-15),
@@ -20957,6 +21013,26 @@ def _radau_replay_realized_accepted_slot_reverse_minimal(
     return jax.lax.cond(active, _do_step, _skip, operand=None)
 
 
+def _radau_checked_primal_replay_record(
+    execution_context: _RadauSolveExecutionContext,
+    carry: _RadauAcceptedStepCarry,
+) -> _RadauAcceptedStepSegmentPrimalRecord:
+    """Expose the original minimal Newton solve's status without changing it."""
+    result = _execute_radau_accepted_step_attempt_reverse_minimal(
+        execution_context.kernel_context, execution_context.physics_context,
+        carry, execution_context.attempt_context, return_convergence=True,
+    )
+    valid = (jnp.asarray(result.converged)
+             & jnp.all(jnp.isfinite(result.trial_y))
+             & jnp.all(jnp.isfinite(result.stage_history))
+             & jnp.all(jnp.isfinite(result.jacobian_out)))
+    record = _radau_segment_primal_record_from_reverse_minimal_attempt(result)
+    return dataclasses.replace(
+        record, replay_valid=valid, replay_converged=result.converged,
+        replay_residual_norm=result.final_residual_norm,
+    )
+
+
 def _radau_replay_realized_accepted_slot_reverse_minimal_with_primal_record(
     execution_context: _RadauSolveExecutionContext,
     carry: _RadauAcceptedStepCarry,
@@ -20967,24 +21043,28 @@ def _radau_replay_realized_accepted_slot_reverse_minimal_with_primal_record(
     regrowth_cooldown_value,
     easy_growth_streak_value,
     lagged_response_valid_value,
+    *,
+    validate_primal: bool = False,
 ):
-    """Minimal accepted-slot replay that also returns its exact primal record.
+    """Reconstruct an accepted slot and retain its segment-local primal record.
 
-    This helper is intentionally not connected to the default segment path.
-    The later opt-in fusion mode will retain its record for only one segment
-    and consume it immediately in the reverse scan.
+    Validation retains the minimal solve's convergence flag. The nonlinear
+    solve, accepted timesteps and cache/predictor choices remain unchanged.
     """
 
     def _do_step(_):
         carry_for_step = dataclasses.replace(carry, dt=dt_value)
         carry_for_minimal = _radau_carry_with_forward_only_jvp_fields(carry_for_step)
-        minimal_result = _execute_radau_accepted_step_attempt_reverse_minimal(
-            execution_context.kernel_context,
-            execution_context.physics_context,
-            carry_for_minimal,
-            execution_context.attempt_context,
-        )
-        record = _radau_segment_primal_record_from_reverse_minimal_attempt(minimal_result)
+        if validate_primal:
+            record = _radau_checked_primal_replay_record(execution_context, carry_for_minimal)
+        else:
+            minimal_result = _execute_radau_accepted_step_attempt_reverse_minimal(
+                execution_context.kernel_context,
+                execution_context.physics_context,
+                carry_for_minimal,
+                execution_context.attempt_context,
+            )
+            record = _radau_segment_primal_record_from_reverse_minimal_attempt(minimal_result)
         next_carry = _radau_next_carry_from_reverse_minimal_record(
             execution_context.physics_context,
             carry_for_minimal,
@@ -20998,7 +21078,13 @@ def _radau_replay_realized_accepted_slot_reverse_minimal_with_primal_record(
         return next_carry, record
 
     def _skip(_):
-        return carry, _radau_segment_primal_record_padding(carry)
+        record = _radau_segment_primal_record_padding(carry)
+        if validate_primal:
+            record = dataclasses.replace(
+                record, replay_valid=jnp.asarray(True), replay_converged=jnp.asarray(True),
+                replay_residual_norm=jnp.zeros_like(carry.t),
+            )
+        return carry, record
 
     return jax.lax.cond(active, _do_step, _skip, operand=None)
 

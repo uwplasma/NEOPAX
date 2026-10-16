@@ -1,0 +1,17 @@
+Scalar CPU probe; no transport, VMEC or NTX calculation.
+Command: python docs/benchmarks/probe_accepted_replay_newton_cache_2026-10-16.py
+
+ODE: y' = -100*y**3; identical physical input y/t/dt for the compared accepted step
+kernel Jacobian reuse mode: dt_close
+first accepted / large rejected / final accepted: True False True
+first accepted Newton iterations: 7
+checkpoint state: [0.91287092]
+forward Jacobian used: [[-249.99999339]]
+accepted-only replay Jacobian used: [[-300.]]
+forward / replay Newton iterations: 6 7
+forward / replay Newton converged: True True
+forward / replay final state: [0.84515424] [0.84515424]
+absolute state difference: [3.77475828e-15]
+recorded-decision replay Jacobian / iterations: [[-249.99999339]] 6
+recorded-decision replay absolute state difference: [0.]
+This probes a cache mismatch, not the cause of the remote transport NaNs.

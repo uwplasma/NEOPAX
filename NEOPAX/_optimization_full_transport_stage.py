@@ -25,6 +25,7 @@ from ._geometry_autodiff import (
     build_ntx_runtime_scan_inputs_from_vmec_state,
 )
 from ._optimization_initial_root_stage import FloatingPayloadLeafLayout
+from ._reverse_step_diagnostics import save_reverse_step_snapshot
 from ._reverse_ad_initial_er import (
     _replace_geometry_and_fresh_database_payload_in_model,
     find_ntx_database_transport_model_in_model,
@@ -111,6 +112,43 @@ def _scan_primal_record_from_payload(template, payload):
         Es=es,
         nu_v=nu_v,
     )
+
+
+def _validate_database_primal_replay(result, segment_arrays):
+    """Reject a failed prescribed-step solve before it reaches any adjoint."""
+    _, carries, records = result
+    active = np.asarray(jax.device_get(segment_arrays[0]), dtype=bool)
+    if records.replay_valid is None:
+        raise RuntimeError("Optimization replay requires checked primal records.")
+    good = np.asarray(jax.device_get(records.replay_valid), dtype=bool)
+    bad = np.flatnonzero(active & ~good)
+    if bad.size:
+        slot = int(bad[0])
+        t, dt, residual = jax.device_get((
+            carries.t[slot], records.trial_dt[slot], records.replay_residual_norm[slot],
+        ))
+        save_reverse_step_snapshot(
+            "primal_replay_failed", jax.device_get({
+                "step_input_y": carries.y[slot], "trial_y": records.trial_y[slot],
+                "stage_slopes": records.stage_history[slot],
+                "replay_valid": records.replay_valid[slot],
+                "newton_converged": records.replay_converged[slot],
+                "replay_residual_norm": records.replay_residual_norm[slot],
+                "cached_jacobian": carries.jacobian[slot],
+                "cached_jacobian_valid": carries.cache_valid[slot],
+                "cached_dt": carries.cache_dt[slot],
+                "previous_stages": carries.prev_stages[slot],
+                "previous_dt": carries.prev_dt[slot],
+                "recent_reject_count": carries.recent_reject_count[slot],
+                "newton_iter_count": records.newton_iter_count[slot],
+            }), t, dt,
+        )
+        raise FloatingPointError(
+            f"invalid primal replay at slot={slot} t={float(t):.16e} dt={float(dt):.16e}: "
+            f"prescribed-step reconstruction failed (residual_norm={float(residual):.6e}); "
+            "transport adjoint was not evaluated for this segment."
+        )
+    return result
 
 
 @dataclasses.dataclass
@@ -503,6 +541,7 @@ class DatabaseFullTransportReplayOptimizationStage:
         support_payload,
         segment_start_carry,
         segment_arrays,
+        force_jacobian_rebuild=None,
     ):
         self.support_layout.validate_static_structure(support_payload)
         support_floating_leaves = self.support_layout.floating_leaves(support_payload)
@@ -524,12 +563,22 @@ class DatabaseFullTransportReplayOptimizationStage:
                 "Full-transport optimization segment schedule changed shape or "
                 "dtype within a stage."
             )
-        return self.compiled_replay(
+        if not bool(jax.device_get(jnp.all(jnp.isfinite(segment_start_carry.y)))):
+            raise FloatingPointError("Adaptive segment checkpoint has a nonfinite primal state before replay.")
+        force_jacobian_rebuild = (
+            jnp.zeros_like(segment_arrays[0]) if force_jacobian_rebuild is None
+            else jnp.asarray(force_jacobian_rebuild, dtype=bool)
+        )
+        if force_jacobian_rebuild.shape != segment_arrays[0].shape:
+            raise ValueError("Forward Jacobian rebuild mask must match the segment slots.")
+        result = self.compiled_replay(
             initial_flat_state,
             support_floating_leaves,
             segment_start_carry,
             segment_arrays,
+            force_jacobian_rebuild,
         )
+        return _validate_database_primal_replay(result, segment_arrays)
 
     def cache_size(self) -> int | None:
         cache_size = getattr(self.compiled_replay, "_cache_size", None)
@@ -786,6 +835,7 @@ def build_database_full_transport_replay_optimization_stage(
         support_floating_leaves,
         active_segment_start_carry,
         active_segment_arrays,
+        force_jacobian_rebuild,
     ):
         active_execution_context, _ = _active_execution_context(
             active_initial_flat_state,
@@ -797,7 +847,8 @@ def build_database_full_transport_replay_optimization_stage(
         return replay_body(
             active_execution_context,
             active_segment_start_carry,
-            active_segment_arrays,
+            (*active_segment_arrays, force_jacobian_rebuild),
+            validate_primal=True,
         )
 
     def _schedule_probe_kernel(
@@ -818,6 +869,7 @@ def build_database_full_transport_replay_optimization_stage(
             max_total_steps=max_total_steps,
             stop_after_accepted_steps=stop_after_accepted_steps,
             capture_segment_length=capture_segment_length,
+            capture_newton_setup=True,
         )
 
     template_execution_context = reverse_setup.execution_context

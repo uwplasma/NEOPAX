@@ -1321,6 +1321,127 @@ primal RHS values makes no second RHS call, and verify a snapshot is written
 only at a finite-input/nonfinite-output transition. No expensive physics test
 was run locally.
 
+### Latest GPU evidence: the reconstructed primal state is already nonfinite
+
+The next instrumented saved-point run is archived as
+[complete output](benchmarks/profiles_only_floor_fix_trial_0002_stage_inputs_2026-10-16.txt)
+and [extracted fields](benchmarks/profiles_only_floor_fix_trial_0002_stage_inputs_2026-10-16.csv).
+Source attachment: `6fb7591e-3efd-4bed-a20d-e3586b439872/Pasted text.txt`,
+9358 bytes, SHA256
+`f5b3692c0f4393f20e5d64f8231a0dcc735a4908207ae964b196dfad4a929162`.
+The new run is
+`outputs/profiles_only_floor_fix_trial_0002_stage_inputs/replay_diagnostics/run_mhm7s1k1`.
+
+The failure repeats in segment 5 at `t=0.23283061626736629`,
+`dt=0.030139674511190269`. The incoming adjoint RHS remains finite with
+maximum magnitude `1.7897597282504262e-6`. Crucially, the captured step input
+and trial state are already nonfinite. All seven stage slope/state/RHS/
+Jacobian blocks contain nonfinite values, as does the cached Jacobian. The
+reported Newton iteration count is 1, and every entry of the 2856-square
+stage-adjoint matrix is nonfinite.
+
+This distinguishes invalid reconstructed primal data from a derivative
+failure at finite primal inputs. The reported reverse step is not the first
+primal failure: its input is already bad, so an earlier reconstruction inside
+that segment must be examined. The original adaptive forward result is
+finite; its accepted trajectory and its reverse reconstruction should agree.
+The exact first divergence in this GPU run is not yet identified.
+
+The remote snapshot is
+`outputs/profiles_only_floor_fix_trial_0002_stage_inputs/bad_steps/bad_reverse_step_brf2omsa.npz`.
+Its contents have not been supplied locally. One memory sample (RSS 10028.8
+MiB, device live 2377989632 bytes and peak 5321470976 bytes) cannot establish
+iteration-to-iteration memory growth.
+
+### Verified discrepancy in accepted-step Newton cache reconstruction
+
+Source inspection found that the configured `radau_jacobian_reuse_mode="legacy"`
+is an alias for `dt_close`. A checkpoint restores the complete carry at its
+segment start, but subsequent accepted-only replay slots recompute Jacobian
+reuse decisions from the replay's evolving cache. Those decisions were not
+recorded from the forward solve.
+
+A rejected forward attempt can refresh a Jacobian without changing physical
+`y` or `t`. A later accepted timestep can be close to the previous accepted
+timestep but far from that rejected attempt's timestep. The forward accepted
+step then rebuilds its Jacobian, while accepted-only replay can reuse an older
+Jacobian. Thus equal physical state and timestep did not imply equal Newton
+setup in this implementation. This does not require differentiating or
+replaying rejected attempts to correct the accepted-step reconstruction.
+
+A tiny scalar ODE probe demonstrates this discrepancy with actual Radau
+attempts. It prescribes a small accepted step, a large rejected attempt and
+another small accepted step. For `y'=-100*y**3`, the compared final accepted
+step starts at the same `y=0.91287092`, time and timestep in both lanes:
+
+| Lane | Jacobian used | Newton iterations | Endpoint difference from forward |
+| --- | ---: | ---: | ---: |
+| Forward accepted step | -249.99999339 | 6 | 0 |
+| Existing accepted-only replay | -300 | 7 | 3.77475828e-15 |
+| Replay with recorded forward rebuild decisions | -249.99999339 | 6 | 0 |
+
+Both original scalar solves converge and stay finite. This establishes a
+numerical-setup discrepancy, not a reproduction of the GPU NaNs. The scalar
+probe uses caller-prescribed attempt sizes to isolate the cache behavior;
+it is not a full adaptive transport validation. Its
+[script](benchmarks/probe_accepted_replay_newton_cache_2026-10-16.py) and
+[output](benchmarks/accepted_replay_newton_cache_probe_2026-10-16.txt) are saved.
+
+The optimization correction records one boolean Jacobian-reuse decision per
+forward attempt alongside the existing scalar schedule. Only the accepted
+positions are used during reconstruction. A recorded forward rebuild
+invalidates the replay cache for that slot, ensuring Newton rebuilds there.
+Rejected attempts are not reconstructed or differentiated. No per-step
+Jacobian/LU matrices, stage solutions or full carries are added to the
+forward tape. The boolean mask is a numerical argument to the persistent
+optimization replay executable, so changing its values does not create new
+static JIT identities per iteration. Existing benchmark replay defaults keep
+their established numerical path.
+
+Separately, the minimal replay previously discarded its existing Newton
+convergence flag and advanced even an unsuccessful reconstruction. Checked
+optimization replay now retains that scalar flag and residual norm, freezes
+at the first unconverged/nonfinite reconstructed step, and stops before
+differentiating that segment. An explicitly enabled snapshot captures its
+state, stages, previous stages, cached Jacobian and Newton/cache metadata.
+It also checks each reconstructed segment's endpoint against the next
+adaptive checkpoint (or the adaptive final state), using the configured state
+tolerances. Agreement at endpoints does not prove every internal stage is
+bitwise identical. No automatic fresh-cache retry or timestep adjustment is
+performed to hide a failed reconstruction.
+
+Validation: 36 small scalar, four-state analytic and mocked replay checks,
+plus 6 subtests, pass. They include the actual accepted/rejected/accepted
+cache scenario, preservation of healthy minimal replay values, retention of
+the scalar forward decisions, rejection of a finite but unconverged solve,
+stopping later slots, snapshot creation and endpoint mismatch detection.
+No expensive transport, VMEC, NTX or FD calculation was run locally.
+
+**Status:** the cache discrepancy is corrected in the optimization path and
+the scalar comparison passes. The saved GPU trial has not been reevaluated
+with this correction; elimination of its nonfinite failure is not claimed.
+Other cache/predictor differences are not ruled out. If reconstruction still
+fails, the convergence guard should identify its first failing accepted slot
+instead of reporting the downstream nonfinite stage-adjoint matrix.
+
+The existing saved-point replay can verify the correction without rerunning
+optimization. Preserve the previous evidence by using a new output directory:
+
+```bash
+cd ~/NEOPAX
+set -o pipefail
+NEOPAX_REVERSE_STEP_DIAGNOSTICS=1 \
+NEOPAX_REVERSE_STEP_SNAPSHOT_DIR=outputs/profiles_only_trial_0002_checked_replay/bad_steps \
+PYTHONPATH="$HOME/VMEX:$HOME/NTX/src" \
+python examples/optimization/optimize_geometry_profiles_from_geometry_result.py \
+  --geometry-result-dir outputs/geometry_qi_max_er_transition_bootstrap_net_power_initial_root_database_full_transport_optimization \
+  --profile-only \
+  --replay-diagnostics outputs/profiles_only_from_geometry_result_floor_fix/optimization_diagnostics/run_q_i_mrcl \
+  --replay-trial 2 \
+  --out-dir outputs/profiles_only_trial_0002_checked_replay \
+  2>&1 | tee outputs/profiles_only_trial_0002_checked_replay.log
+```
+
 ## 6. Original geometry-stage reproducibility report
 
 The user also reported that phase 1 of the original two-stage script did not

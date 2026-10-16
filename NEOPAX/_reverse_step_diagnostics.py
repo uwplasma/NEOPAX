@@ -23,6 +23,24 @@ def reverse_step_diagnostics_enabled():
     }
 
 
+def save_reverse_step_snapshot(stage, values, time_value, dt_value, *, directory=None):
+    """Save one small host snapshot when its directory was explicitly enabled."""
+    directory = directory or os.environ.get("NEOPAX_REVERSE_STEP_SNAPSHOT_DIR", "")
+    if not directory:
+        return
+    directory = Path(directory)
+    directory.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(
+        dir=directory, prefix="bad_reverse_step_", suffix=".npz", delete=False,
+    ) as stream:
+        np.savez_compressed(
+            stream, **{name: np.asarray(value) for name, value in values.items()},
+            t=np.asarray(time_value), dt=np.asarray(dt_value), diagnostic_stage=np.asarray(stage),
+        )
+        filename = stream.name
+    print(f"[reverse-step-snapshot] wrote {filename}", flush=True)
+
+
 def _finite_summary(tree):
     leaves = [jnp.asarray(x) for x in jax.tree_util.tree_leaves(tree)]
     leaves = [x for x in leaves if x.size]
@@ -65,17 +83,7 @@ def reverse_step_finite_transition(stage, before, after, *, t, dt, details=None,
         )
         if snapshot is not None and snapshot_dir:
             def save_snapshot(values, time_value, dt_value):
-                directory = Path(snapshot_dir)
-                directory.mkdir(parents=True, exist_ok=True)
-                with tempfile.NamedTemporaryFile(
-                    dir=directory, prefix="bad_reverse_step_", suffix=".npz", delete=False,
-                ) as stream:
-                    np.savez_compressed(
-                        stream, **{name: np.asarray(value) for name, value in values.items()},
-                        t=np.asarray(time_value), dt=np.asarray(dt_value), diagnostic_stage=np.asarray(stage),
-                    )
-                    filename = stream.name
-                print(f"[reverse-step-snapshot] wrote {filename}", flush=True)
+                save_reverse_step_snapshot(stage, values, time_value, dt_value, directory=snapshot_dir)
 
             jax.debug.callback(save_snapshot, snapshot, t, dt, ordered=True)
         return jnp.asarray(0, dtype=jnp.int32)
@@ -114,3 +122,21 @@ def check_reverse_segment_state(y, segment_number):
             "NEOPAX_REVERSE_STEP_DIAGNOSTICS stopped at the first bad segment. "
             "See [reverse-step-first-nonfinite] for the per-step boundary."
         )
+
+
+def check_primal_replay_endpoint(actual, expected, *, atol, rtol):
+    """Require a checked replay to match its adaptive endpoint within state tolerances."""
+    actual, expected = jnp.asarray(actual), jnp.asarray(expected)
+    difference = jnp.abs(actual - expected)
+    scale = jnp.asarray(atol) + jnp.asarray(rtol) * jnp.maximum(jnp.abs(actual), jnp.abs(expected))
+    peak, scaled_peak = jax.device_get((
+        jnp.max(difference),
+        jnp.max(difference / jnp.maximum(scale, jnp.finfo(actual.dtype).tiny)),
+    ))
+    if not np.isfinite(scaled_peak) or scaled_peak > 1.0:
+        raise FloatingPointError(
+            f"primal replay endpoint differs from adaptive checkpoint: "
+            f"max_abs_difference={float(peak):.6e} max_scaled_difference={float(scaled_peak):.6e}; "
+            "transport adjoint was not evaluated for this segment."
+        )
+    return float(peak), float(scaled_peak)

@@ -24,7 +24,11 @@ import numpy as np
 
 from ._constants import elementary_charge
 from ._optimization_diagnostics import reverse_checkpoint, reverse_diagnostics_active, reverse_objective_values
-from ._reverse_step_diagnostics import check_reverse_segment_state
+from ._reverse_step_diagnostics import (
+    check_primal_replay_endpoint,
+    check_reverse_segment_state,
+    reverse_step_diagnostics_enabled,
+)
 from ._geometry_autodiff import (
     boundary_param_entries,
     build_neopax_geometry_and_ntx_exact_lij_support_from_state,
@@ -2046,6 +2050,7 @@ def _reverse_adaptive_schedule_rollout(
         max_total_steps=max_total_steps,
         stop_after_accepted_steps=stop_after_accepted_steps,
         capture_segment_length=capture_segment_length,
+        capture_newton_setup=capture_segment_length is not None,
     )
 
 
@@ -4777,6 +4782,7 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
         execution_context,
         segment_start_carry,
         segment_arrays,
+        force_jacobian_rebuild=None,
     ):
         optimization_replay = (
             dependencies.segment_replay_minimal_with_primal_records
@@ -4788,11 +4794,16 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
                 segment_start_carry,
                 segment_arrays,
             )
+        setup_kwargs = (
+            {} if force_jacobian_rebuild is None
+            else {"force_jacobian_rebuild": force_jacobian_rebuild}
+        )
         return optimization_replay(
             execution_context,
             segment_start_carry,
             segment_arrays,
             support_payload,
+            **setup_kwargs,
         )
 
     def _database_segment_reduced_cotangent_bwd_with_table_support(
@@ -5182,6 +5193,26 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
     )
     if segment_start_carries is None or segmented_final_carry is None or segmented_replay_arrays is None:
         raise ValueError("support payload reverse probe requires segmented reverse residuals.")
+
+    # Keep the recorded forward Newton rebuild choices without replaying or
+    # differentiating rejected attempts. Only one boolean per attempt is stored.
+    forward_rebuild_mask = None
+    if (
+        dependencies.segment_replay_minimal_with_primal_records is not None
+        and schedule_artifact is not None
+        and getattr(schedule_artifact, "jacobian_reused", None) is not None
+    ):
+        trace_active, trace_accepted, trace_reused = jax.device_get((
+            schedule_artifact.active_mask, schedule_artifact.accepted_mask,
+            schedule_artifact.jacobian_reused,
+        ))
+        accepted_rebuilds = ~np.asarray(trace_reused, dtype=bool)[
+            np.asarray(trace_active, dtype=bool) & np.asarray(trace_accepted, dtype=bool)
+        ]
+        forward_rebuild_mask = np.zeros(segmented_replay_arrays[0].shape, dtype=bool)
+        if accepted_rebuilds.size > forward_rebuild_mask.size:
+            raise ValueError("Forward Newton decisions exceed the accepted replay schedule.")
+        forward_rebuild_mask.reshape(-1)[:accepted_rebuilds.size] = accepted_rebuilds
 
     final_y_for_objective = segmented_final_carry.y
     if bool(getattr(reverse_setup, "require_final_time", False)):
@@ -6704,13 +6735,34 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
             # The database segment keeps the compact table transpose and the
             # two local fixed-table geometry terms separate.  The recorded
             # NTX scan remains the sole table-to-geometry transpose.
-            _, database_step_start_carries, database_step_primal_records = (
+            database_replayed_final_carry, database_step_start_carries, database_step_primal_records = (
                 _segment_replay_minimal_with_primal_records(
                     reverse_setup.execution_context,
                     segment_start_carry,
                     segment_arrays,
+                    force_jacobian_rebuild=(
+                        None if forward_rebuild_mask is None else forward_rebuild_mask[segment_index]
+                    ),
                 )
             )
+            if database_step_primal_records.replay_valid is not None:
+                expected_final_y = (
+                    _take_tree_axis0(segment_start_carries, segment_index + 1).y
+                    if segment_index + 1 < segment_count else segmented_final_carry.y
+                )
+                endpoint_absolute, endpoint_scaled = check_primal_replay_endpoint(
+                    database_replayed_final_carry.y, expected_final_y,
+                    atol=reverse_setup.execution_context.kernel_context.atol,
+                    rtol=reverse_setup.execution_context.kernel_context.rtol,
+                )
+                reverse_checkpoint(f"segment_{segment_index + 1}_primal_replay_endpoint", {
+                    "max_abs_difference": jnp.asarray(endpoint_absolute),
+                    "max_scaled_difference": jnp.asarray(endpoint_scaled),
+                }, summarize=True)
+                if reverse_step_diagnostics_enabled():
+                    print(f"[primal-replay] segment={segment_index + 1} "
+                          f"endpoint_max_abs_difference={endpoint_absolute:.6e} "
+                          f"endpoint_max_scaled_difference={endpoint_scaled:.6e}", flush=True)
             if database_segment_support_mode == "deferred_segment_batch":
                 deferred_start = time.perf_counter()
                 reduced_bars, database_stage_records = (
@@ -9339,6 +9391,8 @@ def internal_realtime_geometry_transport_reverse_table_result_builder(
                 segment_start_carry,
                 segment_arrays,
                 active_support_payload,
+                *,
+                force_jacobian_rebuild=None,
             ):
                 del execution_context  # Fresh static identities must not reach JAX.
                 nonlocal optimization_segment_replay_stage
@@ -9364,6 +9418,7 @@ def internal_realtime_geometry_transport_reverse_table_result_builder(
                     support_payload=active_support_payload,
                     segment_start_carry=segment_start_carry,
                     segment_arrays=segment_arrays,
+                    force_jacobian_rebuild=force_jacobian_rebuild,
                 )
 
             def _optimization_database_segment_bwd(
