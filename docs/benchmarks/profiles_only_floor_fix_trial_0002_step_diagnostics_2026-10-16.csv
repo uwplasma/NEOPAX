@@ -1,0 +1,2 @@
+source_trial,replay_trial,first_bad_segment,time,dt,adjoint_rhs_abs_max,adjoint_solution_nonfinite_count,matrix_finite,matrix_nonfinite_count,matrix_first_nonfinite_row,matrix_first_nonfinite_column,matrix_finite_abs_max,rss_MiB,live_jax_arrays,device_bytes_in_use,device_peak_bytes_in_use
+2,1,5,0.23283061626736629,0.030139674511190269,1.7897597282504262e-06,37128,False,8156736,0,0,0.0,9993.3,2299,2377989376,5321471488

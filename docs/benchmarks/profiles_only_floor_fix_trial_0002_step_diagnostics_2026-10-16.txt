@@ -1,0 +1,82 @@
+cd ~/NEOPAX
+set -o pipefail
+
+NEOPAX_REVERSE_STEP_DIAGNOSTICS=1 \
+PYTHONPATH="$HOME/VMEX:$HOME/NTX/src" \
+python examples/optimization/optimize_geometry_profiles_from_geometry_result.py \
+  --geometry-result-dir outputs/geometry_qi_max_er_transition_bootstrap_net_power_initial_root_database_full_transport_optimization \
+  --profile-only \
+  --replay-diagnostics outputs/profiles_only_from_geometry_result_floor_fix/optimization_diagnostics/run_q_i_mrcl \
+  --replay-trial 2 \
+  --out-dir outputs/profiles_only_floor_fix_trial_0002_step_diagnostics \
+  2>&1 | tee outputs/profiles_only_floor_fix_trial_0002_step_diagnostics.log
+[NEOPAX] built runtime NTX scan database: rho=7 nu_v=16 Er_tilde=11 grid=(25,25,33) backend=vmec
+[optimization diagnostic] writing /home/exouser/NEOPAX/outputs/profiles_only_floor_fix_trial_0002_step_diagnostics/replay_diagnostics/run_a2n6soqo
+[trial replay] source_trial=2 previous_event=failed_trial parameter_count=6 optimizer=skipped
+wrote /home/exouser/NEOPAX/outputs/profiles_only_floor_fix_trial_0002_step_diagnostics/replay_inputs/input.QI_neopax_database_full_transport_combined_eval_0000
+wrote /home/exouser/NEOPAX/outputs/profiles_only_floor_fix_trial_0002_step_diagnostics/replay_inputs/profile_parameters_eval_0000.json
+[NEOPAX] built runtime NTX scan database: rho=7 nu_v=16 Er_tilde=11 grid=(25,25,33) backend=vmec
+[autodiff-gate] progress: support reverse profile-state vjp ready elapsed_s=3.445
+[autodiff-gate] progress: support reverse initial carry reduced-zero-RHS forward ready elapsed_s=0.684
+[autodiff-gate] progress: support reverse reusing static schedule artifact (no second adaptive rollout; no per-step carry tape)
+[autodiff-gate] progress: support reverse realized-schedule vjp forward ready elapsed_s=0.464
+[autodiff-gate] progress: support reverse final-objective cotangents ready elapsed_s=129.877 ordinary_mode=grouped_joint_vjp bootstrap_mode=joint_local_vjp_upar_only database_bootstrap_interpolation_mode=legacy_sparse
+[autodiff-gate] progress: support reverse segmented cotangent sweep start segments=6 segment_length=50 objectives=13 cotangent_mode=full
+[autodiff-gate] progress: database segment reverse uses fixed-table table transpose plus compact local fixed-table geometry bars; only table bars cross the recorded scan (no scan owner in segments)
+E1016 19:22:20.739100  445905 slow_operation_alarm.cc:73] 
+********************************
+[Compiling module jit__database_bwd_kernel for GPU] Very slow compile? If you want to file a bug, run with envvar XLA_FLAGS=--xla_dump_to=/tmp/foo and attach the results.
+********************************
+E1016 19:24:39.888057  445753 slow_operation_alarm.cc:140] The operation took 4m19.150014594s
+
+********************************
+[Compiling module jit__database_bwd_kernel for GPU] Very slow compile? If you want to file a bug, run with envvar XLA_FLAGS=--xla_dump_to=/tmp/foo and attach the results.
+********************************
+[autodiff-gate] progress: support reverse segment 6/6 ready elapsed_s=402.953 active_steps=10 support_reuse=0 support_rebuild=10
+[reverse-step-first-nonfinite] stage=stage_adjoint_dense_solve t=2.3283061626736629e-01 dt=3.0139674511190269e-02 input_abs_max=1.7897597282504262e-06 output_finite_abs_max=0.0000000000000000e+00 nonfinite_count=37128 details={'matrix_diagonal_min_abs': Array(nan, dtype=float64), 'matrix_finite': Array(False, dtype=bool), 'matrix_finite_abs_max': Array(0., dtype=float64), 'matrix_first_nonfinite_column': Array(0, dtype=int64), 'matrix_first_nonfinite_row': Array(0, dtype=int64), 'matrix_nonfinite_count': Array(8156736, dtype=int64)}
+[reverse-step-first-nonfinite] stage=stage_adjoint_solution t=2.3283061626736629e-01 dt=3.0139674511190269e-02 input_abs_max=1.7897597282504262e-06 output_finite_abs_max=0.0000000000000000e+00 nonfinite_count=37128 details={}
+[optimization diagnostic] trial=1 first bad reverse boundary stage=segment_5_state_bars entries=[{"path": ".y", "shape": [13, 408], "dtype": "float64", "first_nonfinite_index": [0, 0], "nonfinite_count": 5304, "objectives": ["softmax_Er", "net_total_power_volume_average_mw_m3", "Er_transition_left", "Er_transition_right", "Er2_volume_average", "Er_volume_average", "electron_temperature_volume_average_keV", "total_pressure_volume_average", "alpha_power_volume_average_mw_m3", "bootstrap_current_softmax_abs_scaled", "Er_transition_rho", "Er_transition_location_moment", "Er_transition_strength"]}]
+[memory] phase=profiles_from_saved_geometry evaluation=1 rss_MiB=9993.3 live_jax_arrays=2299 device_bytes_in_use=2377989376 device_peak_bytes_in_use=5321471488 stage_caches={'runtime_scan': 1, 'segment_replay': 1, 'segment_bwd': 1, 'schedule_probe': 0, 'bootstrap': 1}
+Traceback (most recent call last):
+  File "/home/exouser/NEOPAX/examples/optimization/optimize_geometry_profiles_from_geometry_result.py", line 488, in <module>
+    raise SystemExit(main())
+                     ^^^^^^
+  File "/home/exouser/NEOPAX/examples/optimization/optimize_geometry_profiles_from_geometry_result.py", line 449, in main
+    return replay_saved_trial(problem, source=args.replay_diagnostics, trial=args.replay_trial, out_dir=out_dir)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/exouser/NEOPAX/examples/optimization/optimize_geometry_profiles_from_geometry_result.py", line 391, in replay_saved_trial
+    evaluation = problem.evaluate(x)
+                 ^^^^^^^^^^^^^^^^^^^
+  File "/home/exouser/NEOPAX/examples/optimization/optimize_geometry_warm_start_profiles_qi_max_er_transition_bootstrap_net_power_initial_root_database_full_transport.py", line 202, in evaluate
+    return self.problem.evaluate(scaled_parameter_values)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/exouser/NEOPAX/examples/optimization/optimize_geometry_profiles_qi_max_er_transition_bootstrap_net_power_initial_root_database_full_transport_simple_least_squares.py", line 357, in evaluate
+    return self.problem.evaluate(x)
+           ^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/exouser/NEOPAX/examples/optimization/optimize_geometry_profiles_from_geometry_result.py", line 212, in evaluate
+    evaluation = self.problem.evaluate(self.full_parameters(x))
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/exouser/NEOPAX/NEOPAX/optimization.py", line 1078, in evaluate
+    base_evaluation = evaluate_geometry_transport_realtime_geometry_least_squares(
+                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/exouser/NEOPAX/NEOPAX/_reverse_ad_optimization.py", line 4687, in evaluate_geometry_transport_realtime_geometry_least_squares
+    table_result = transport_realtime_geometry_reverse_table(
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/exouser/NEOPAX/NEOPAX/_reverse_ad_transport.py", line 8709, in transport_realtime_geometry_reverse_table
+    return table_result_builder(
+           ^^^^^^^^^^^^^^^^^^^^^
+  File "/home/exouser/NEOPAX/NEOPAX/_reverse_ad_transport.py", line 9448, in _builder
+    support_result = realtime_geometry_support_cotangents_from_parameter_vector(
+                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/exouser/NEOPAX/NEOPAX/_reverse_ad_transport.py", line 8032, in realtime_geometry_support_cotangents_from_parameter_vector
+    callback_result = reverse_all_objectives_support_payload_bar(
+                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/exouser/NEOPAX/NEOPAX/_reverse_ad_transport.py", line 9439, in _optimization_support_reverse
+    return realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_vector(
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/exouser/NEOPAX/NEOPAX/_reverse_ad_transport.py", line 6786, in realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_vector
+    check_reverse_segment_state(reduced_bars.y, segment_index + 1)
+  File "/home/exouser/NEOPAX/NEOPAX/_reverse_step_diagnostics.py", line 89, in check_reverse_segment_state
+    raise FloatingPointError(
+FloatingPointError: nonfinite transport state adjoint after reverse segment 5; NEOPAX_REVERSE_STEP_DIAGNOSTICS stopped at the first bad segment. See [reverse-step-first-nonfinite] for the per-step boundary.
+(jax_env) exouser@neopax-22:~/NEOPAX$ 

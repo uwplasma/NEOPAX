@@ -2,13 +2,18 @@
 
 Set NEOPAX_REVERSE_STEP_DIAGNOSTICS=1 before starting a fresh process. Calls
 belong outside objective vmaps: batching a conditional debug print can execute
-both branches. No callback retains arrays, replays physics, or changes bars.
+both branches. NEOPAX_REVERSE_STEP_SNAPSHOT_DIR optionally saves the failing
+stage inputs. No callback retains device history, replays physics, or changes
+bars.
 """
 
 import os
+from pathlib import Path
+import tempfile
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 
 
 def reverse_step_diagnostics_enabled():
@@ -31,15 +36,18 @@ def _finite_summary(tree):
     return all_finite, count, peak
 
 
-def reverse_step_finite_transition(stage, before, after, *, t, dt, details=None):
+def reverse_step_finite_transition(stage, before, after, *, t, dt, details=None, snapshot=None):
     """Print compact metadata only for a finite-input/nonfinite-output boundary.
 
     ``before`` may be a tuple for an addition boundary. The function returns
     the exact ``after`` object. It neither clips nor substitutes any values.
     Disabled calls return before converting inputs or introducing JAX effects.
+    A supplied snapshot is saved only at a transition and only when its output
+    directory is explicitly enabled through the environment.
     """
     if not reverse_step_diagnostics_enabled():
         return after
+    snapshot_dir = os.environ.get("NEOPAX_REVERSE_STEP_SNAPSHOT_DIR", "")
     before_finite, _, _ = _finite_summary(before)
     after_finite, _, _ = _finite_summary(after)
 
@@ -55,6 +63,21 @@ def reverse_step_finite_transition(stage, before, after, *, t, dt, details=None)
             count=count, details={} if details is None else details,
             ordered=True,
         )
+        if snapshot is not None and snapshot_dir:
+            def save_snapshot(values, time_value, dt_value):
+                directory = Path(snapshot_dir)
+                directory.mkdir(parents=True, exist_ok=True)
+                with tempfile.NamedTemporaryFile(
+                    dir=directory, prefix="bad_reverse_step_", suffix=".npz", delete=False,
+                ) as stream:
+                    np.savez_compressed(
+                        stream, **{name: np.asarray(value) for name, value in values.items()},
+                        t=np.asarray(time_value), dt=np.asarray(dt_value), diagnostic_stage=np.asarray(stage),
+                    )
+                    filename = stream.name
+                print(f"[reverse-step-snapshot] wrote {filename}", flush=True)
+
+            jax.debug.callback(save_snapshot, snapshot, t, dt, ordered=True)
         return jnp.asarray(0, dtype=jnp.int32)
 
     jax.lax.cond(before_finite & ~after_finite, emit,

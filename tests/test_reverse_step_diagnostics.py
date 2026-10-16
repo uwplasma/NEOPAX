@@ -3,6 +3,8 @@
 from contextlib import redirect_stdout
 import io
 import os
+from pathlib import Path
+import tempfile
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
@@ -76,8 +78,14 @@ class ReverseStepDiagnosticsTests(unittest.TestCase):
         for matrix in matrices:
             with self.subTest(matrix=matrix):
                 output = io.StringIO()
+                def build_matrix(*args, return_diagnostics=False):
+                    value = jnp.asarray(matrix)
+                    if return_diagnostics:
+                        return value, {}, {"stage_states": jnp.ones((1, 2))}
+                    return value
+
                 with patch.dict(os.environ, {"NEOPAX_REVERSE_STEP_DIAGNOSTICS": "1"}), \
-                        patch.object(solvers, "_radau_exact_stage_residual_matrix", return_value=jnp.asarray(matrix)) as assembly, \
+                        patch.object(solvers, "_radau_exact_stage_residual_matrix", side_effect=build_matrix) as assembly, \
                         redirect_stdout(output):
                     run = jax.jit(lambda value: solvers._radau_solve_exact_stage_residual_transpose_batched(
                         kernel, physics, carry, primal, None, rhs=value))
@@ -94,6 +102,79 @@ class ReverseStepDiagnosticsTests(unittest.TestCase):
                     self.assertIn("stage=stage_adjoint_dense_solve", text)
                     self.assertIn("matrix_finite", text)
                     self.assertIn("matrix_first_nonfinite_row", text)
+
+    def test_primal_aux_separates_bad_replay_values_from_bad_derivatives(self):
+        kernel = SimpleNamespace(dtype=jnp.float64, num_stages=1, state_dim=2,
+                                 a=jnp.array([[.5]]), c=jnp.array([.5]))
+        carry = SimpleNamespace(t=jnp.asarray(.25), y=jnp.array([1., 2.]))
+
+        @jax.custom_jvp
+        def bad_derivative(y):
+            return -(y ** 2)
+
+        @bad_derivative.defjvp
+        def bad_derivative_jvp(primals, tangents):
+            (y,), (dy,) = primals, tangents
+            return -(y ** 2), jnp.full_like(dy, jnp.nan)
+
+        for kind in ("finite", "bad_derivative", "bad_primal"):
+            with self.subTest(kind=kind):
+                calls = []
+
+                def rhs(t, y):
+                    calls.append(True)
+                    return bad_derivative(y) if kind == "bad_derivative" else -(y ** 2)
+
+                physics = SimpleNamespace(reverse_stage_adjoint_solve_mode="block",
+                                          flat_rhs=rhs, flat_rhs_with_lagged_response=None)
+                slopes = jnp.array([[-1., -2.]])
+                if kind == "bad_primal":
+                    slopes = jnp.full_like(slopes, jnp.nan)
+                primal = SimpleNamespace(trial_dt=jnp.asarray(.1), trial_y=jnp.array([.9, 1.8]),
+                                         stage_history=slopes)
+                run = jax.jit(lambda: solvers._radau_exact_stage_residual_matrix(
+                    kernel, physics, carry, primal, None, return_diagnostics=True))
+                matrix, details, snapshot = jax.device_get(run())
+                # The primal RHS is aux from that same jacfwd, not a second
+                # function call to get diagnostic values.
+                self.assertEqual(len(calls), 1)
+                self.assertTrue(details["step_input_y_finite"])
+                self.assertTrue(details["trial_y_finite"])
+                self.assertTrue(details["stage_rhs_captured"])
+                self.assertEqual(bool(details["stage_states_finite"][0]), kind != "bad_primal")
+                self.assertEqual(bool(details["stage_rhs_finite"][0]), kind != "bad_primal")
+                self.assertEqual(bool(details["stage_jacobians_finite"][0]), kind == "finite")
+                if kind == "finite":
+                    states = np.asarray(carry.y)[None, :] + .05 * np.asarray(slopes)
+                    np.testing.assert_allclose(matrix, np.diag(1 + .1 * states[0]))
+                    np.testing.assert_allclose(snapshot["stage_rhs"], -(states ** 2))
+                else:
+                    self.assertFalse(np.all(np.isfinite(matrix)))
+
+    def test_only_transition_saves_the_small_snapshot(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = io.StringIO()
+            with patch.dict(os.environ, {"NEOPAX_REVERSE_STEP_DIAGNOSTICS": "1",
+                                        "NEOPAX_REVERSE_STEP_SNAPSHOT_DIR": directory}), redirect_stdout(output):
+                @jax.jit
+                def run(before, after):
+                    return reverse_step_finite_transition(
+                        "snapshot_test", before, after, t=.25, dt=.1,
+                        snapshot={"stage_states": before[None, :]})
+
+                good = jnp.array([1., 2.])
+                bad = jnp.array([jnp.nan, jnp.nan])
+                run(good, good).block_until_ready()
+                run(good, bad).block_until_ready()
+                run(bad, bad).block_until_ready()
+                jax.effects_barrier()
+            files = list(Path(directory).glob("*.npz"))
+            self.assertEqual(len(files), 1)
+            self.assertEqual(output.getvalue().count("[reverse-step-snapshot] wrote"), 1)
+            with np.load(files[0]) as data:
+                np.testing.assert_array_equal(data["stage_states"], [[1., 2.]])
+                self.assertEqual(float(data["t"]), .25)
+                self.assertEqual(str(data["diagnostic_stage"]), "snapshot_test")
 
     def test_segment_guard_is_opt_in_and_preserves_finite_values(self):
         with patch.dict(os.environ, {"NEOPAX_REVERSE_STEP_DIAGNOSTICS": "0"}):

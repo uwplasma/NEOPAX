@@ -1204,7 +1204,8 @@ This is one fresh adaptive forward/reverse evaluation at the stored six
 coordinates, with fixed saved geometry and no optimizer or nominal objective
 evaluation. A fresh passing result would be evidence to investigate evaluation
 history or compilation/trajectory sensitivity, rather than a reproduced
-failure. The new GPU evaluation has not yet been run in this workspace.
+failure. The GPU result below now reproduces the failure at these new saved
+coordinates in a fresh process.
 
 Local validation used only small arrays, synthetic four-state analytic RHS
 functions and mocked optimization/replay setup: 32 unittest checks and 20
@@ -1212,6 +1213,113 @@ existing analytic Radau checks pass. The new checks cover a finite-to-NaN
 scan transition emitting once, finite-operand overflow, finite/singular/
 nonfinite 2x2 stage matrices with one matrix assembly, and the opt-in host
 segment guard. No expensive transport, VMEC, NTX or FD test was run locally.
+
+### GPU replay locates an already nonfinite stage matrix
+
+The user ran the instrumented single-point replay on the GPU machine. Its
+complete console output is archived as
+[raw replay output](benchmarks/profiles_only_floor_fix_trial_0002_step_diagnostics_2026-10-16.txt),
+with the [first-failure and memory fields](benchmarks/profiles_only_floor_fix_trial_0002_step_diagnostics_2026-10-16.csv).
+The source attachment is `f309d43d-8d05-4a19-be89-06a52e64248e/Pasted text.txt`,
+8520 bytes, SHA256
+`0ec772b3d506f239a7c0fca93a9579dae3f3c5bdf81152cfc54be50be610d50a`.
+New diagnostics are in
+`outputs/profiles_only_floor_fix_trial_0002_step_diagnostics/replay_diagnostics/run_a2n6soqo`.
+
+The source is the new failed trial 2 in `run_q_i_mrcl`, not the old saved trial
+2 that passed. Its local replay trial number is 1 because the optimizer and
+nominal objective evaluation are skipped. Segment 6 completes with ten active
+steps; the first bad segment is again segment 5.
+
+| First failing dense stage-adjoint solve | Value |
+| --- | ---: |
+| Transport time | 0.23283061626736629 |
+| Timestep | 0.030139674511190269 |
+| Maximum absolute incoming stage-adjoint RHS | 1.7897597282504262e-6 |
+| Stage matrix finite | False |
+| Nonfinite matrix entries | 8156736 |
+| First nonfinite matrix row/column | 0 / 0 |
+| Nonfinite stage-adjoint solution entries | 37128 |
+
+The seven-stage, 408-state system has dimension `7*408 = 2856`, and
+`2856**2 = 8156736`: every matrix entry is nonfinite before the solve.
+All `13*2856 = 37128` solution entries then become nonfinite. The reported
+`matrix_finite_abs_max=0` is the reduction's default for no surviving finite
+entries; it does not mean the matrix is zero. Its diagonal minimum is NaN.
+
+This establishes a local nonfinite linearization before the dense solve, with
+a small finite RHS. Overflow caused by large incoming adjoints is not the
+observed cause at this step, and a merely ill-conditioned finite matrix does
+not describe the captured matrix. All objective rows fail together because
+they share it. This result does not identify the first bad scalar operation
+or establish that helium flooring caused the nonfinite matrix.
+
+The matrix builder computes stage states as
+`Y_i = y_start + h * sum_j A_ij * z_j`, obtains forward-mode RHS Jacobians at
+those states, and assembles `M_ij = delta_ij*I - h*A_ij*J_i`. The console does
+not contain the replayed `y_start`, `z_j`, stage states or primal RHS values.
+It therefore cannot yet distinguish invalid replayed primal stages from
+nonfinite RHS values/derivatives at finite stage inputs. The source's minimal
+accepted-step replay strips the ordinary convergence/error diagnostics and
+advances its prescribed accepted schedule, so replay validity must be checked
+rather than inferred solely from a successful adaptive baseline.
+
+This fresh-process reproduction shows that an earlier optimizer evaluation is
+not necessary for the failure at these coordinates with instrumentation. It
+does not prove bitwise equality of the original and instrumented trajectories.
+The first reverse segment takes 402.953 seconds, including a reported 259.150
+second GPU compile; this is a single-point diagnostic, not an inexpensive
+runtime benchmark. The one memory sample (RSS 9993.3 MiB, live device bytes
+2377989376, peak 5321471488) cannot establish iteration-to-iteration growth.
+
+### Capture primal stage values from the same differentiation call
+
+The opt-in dense-block diagnostic now also reports finiteness of the step
+input, trial output, each stage's slopes/states, primal RHS and RHS Jacobian.
+The primal RHS is retained with `jax.jacfwd(..., has_aux=True)` from the same
+RHS call that builds the Jacobian. No separate RHS evaluation is added. Other
+matrix lanes report `stage_rhs_captured=False` where no primal RHS was retained.
+Available Newton iteration counts and cached-Jacobian finiteness are included.
+
+Setting `NEOPAX_REVERSE_STEP_SNAPSHOT_DIR` additionally saves a compressed NPZ
+only when a finite stage-adjoint RHS produces a nonfinite solve output. The
+file contains the step input/trial state, stage times/slopes/states, captured
+primal RHS, first objective's incoming stage bar, finite flags and available
+Newton metadata. It contains no full stage matrix or per-iteration history.
+The callback writes and releases these small host arrays; no device history is
+retained. Existing diagnostics and solve arithmetic remain unchanged when the
+diagnostic flag is unset. Diagnostic compilation can differ, as before.
+
+After syncing this extension, one saved-point GPU replay captures the missing
+data without rerunning optimization:
+
+```bash
+cd ~/NEOPAX
+set -o pipefail
+NEOPAX_REVERSE_STEP_DIAGNOSTICS=1 \
+NEOPAX_REVERSE_STEP_SNAPSHOT_DIR=outputs/profiles_only_floor_fix_trial_0002_stage_inputs/bad_steps \
+PYTHONPATH="$HOME/VMEX:$HOME/NTX/src" \
+python examples/optimization/optimize_geometry_profiles_from_geometry_result.py \
+  --geometry-result-dir outputs/geometry_qi_max_er_transition_bootstrap_net_power_initial_root_database_full_transport_optimization \
+  --profile-only \
+  --replay-diagnostics outputs/profiles_only_from_geometry_result_floor_fix/optimization_diagnostics/run_q_i_mrcl \
+  --replay-trial 2 \
+  --out-dir outputs/profiles_only_floor_fix_trial_0002_stage_inputs \
+  2>&1 | tee outputs/profiles_only_floor_fix_trial_0002_stage_inputs.log
+```
+
+The first-failure line now distinguishes nonfinite primal values from bad
+derivatives of a finite RHS. `[reverse-step-snapshot] wrote ...npz` identifies
+the saved step. This extends diagnostic evidence; it is not a fix for the
+underlying physics/replay derivative failure. No new GPU result is claimed for
+this extension yet.
+
+Validation: 34 small unittest checks and 20 existing four-state analytic Radau
+checks pass. The new cases explicitly distinguish a finite primal RHS with a
+deliberately nonfinite JVP from nonfinite replay stages, check that capturing
+primal RHS values makes no second RHS call, and verify a snapshot is written
+only at a finite-input/nonfinite-output transition. No expensive physics test
+was run locally.
 
 ## 6. Original geometry-stage reproducibility report
 

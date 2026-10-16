@@ -12864,6 +12864,8 @@ def _radau_exact_stage_residual_matrix(
     carry_in: _RadauAcceptedStepCarry,
     primal_result: _RadauAcceptedStepAttemptResult,
     lagged_response,
+    *,
+    return_diagnostics: bool = False,
 ):
     """Materialize the exact one-step Radau stage-residual Jacobian.
 
@@ -12887,6 +12889,7 @@ def _radau_exact_stage_residual_matrix(
     rhs_transpose_mode = str(
         getattr(physics_context, "reverse_rhs_transpose_mode", "generic")
     ).strip().lower()
+    capture_rhs = return_diagnostics and matrix_mode == "block"
 
     def _stage_jacobian_generic(t_eval, y_eval):
         def _rhs_at_stage(y_value):
@@ -12898,6 +12901,14 @@ def _radau_exact_stage_residual_matrix(
                 physics_context.flat_rhs_with_lagged_response,
             )
 
+        if capture_rhs:
+            def _rhs_with_primal_aux(y_value):
+                value = _rhs_at_stage(y_value)
+                return value, value
+
+            # Retain the primal value already evaluated by jacfwd. Do not run
+            # another RHS just to distinguish bad primals from bad tangents.
+            return jax.jacfwd(_rhs_with_primal_aux, has_aux=True)(y_eval)
         return jax.jacfwd(_rhs_at_stage)(y_eval)
 
     if matrix_mode == "block_frozen_forward_jacobian":
@@ -12963,10 +12974,14 @@ def _radau_exact_stage_residual_matrix(
             stage_states,
         )
     else:
-        stage_jacobians = jax.vmap(_stage_jacobian_generic, in_axes=(0, 0))(
+        generic_results = jax.vmap(_stage_jacobian_generic, in_axes=(0, 0))(
             stage_times,
             stage_states,
         )
+        if capture_rhs:
+            stage_jacobians, stage_rhs = generic_results
+        else:
+            stage_jacobians = generic_results
     eye_s = jnp.eye(kernel_context.num_stages, dtype=kernel_context.dtype)
     eye_n = jnp.eye(kernel_context.state_dim, dtype=kernel_context.dtype)
     block_system = (
@@ -12978,7 +12993,40 @@ def _radau_exact_stage_residual_matrix(
     matrix = jnp.transpose(block_system, (0, 2, 1, 3)).reshape(
         (kernel_context.num_stages * kernel_context.state_dim, kernel_context.num_stages * kernel_context.state_dim)
     )
-    return matrix
+    if not return_diagnostics:
+        return matrix
+    if not capture_rhs:
+        stage_rhs = jnp.zeros((0, kernel_context.state_dim), dtype=kernel_context.dtype)
+    stage_slopes = primal_result.stage_history.reshape(
+        (kernel_context.num_stages, kernel_context.state_dim)
+    )
+    diagnostics = {
+        "step_input_y_finite": jnp.all(jnp.isfinite(carry_in.y)),
+        "trial_y_finite": jnp.all(jnp.isfinite(primal_result.trial_y)),
+        "stage_slopes_finite": jnp.all(jnp.isfinite(stage_slopes), axis=1),
+        "stage_states_finite": jnp.all(jnp.isfinite(stage_states), axis=1),
+        "stage_rhs_captured": jnp.asarray(capture_rhs),
+        "stage_rhs_finite": jnp.all(jnp.isfinite(stage_rhs), axis=1),
+        "stage_jacobians_finite": jnp.all(jnp.isfinite(stage_jacobians), axis=(1, 2)),
+    }
+    snapshot = {
+        "step_input_y": carry_in.y,
+        "trial_y": primal_result.trial_y,
+        "stage_times": stage_times,
+        "stage_slopes": stage_slopes,
+        "stage_states": stage_states,
+        "stage_rhs": stage_rhs,
+        **diagnostics,
+    }
+    for name in ("newton_iter_count", "theta_final", "final_stage_newton_delta"):
+        if hasattr(primal_result, name):
+            snapshot[name] = jnp.asarray(getattr(primal_result, name))
+    if hasattr(primal_result, "newton_iter_count"):
+        diagnostics["newton_iter_count"] = jnp.asarray(primal_result.newton_iter_count)
+    if hasattr(primal_result, "jacobian_out"):
+        diagnostics["cached_jacobian_finite"] = jnp.all(jnp.isfinite(primal_result.jacobian_out))
+    snapshot.update(diagnostics)
+    return matrix, diagnostics, snapshot
 
 
 def _radau_exact_stage_residual_transpose_matvec_diagnostic(
@@ -15115,16 +15163,19 @@ def _radau_solve_exact_stage_residual_transpose_block(
 ):
     """Solve the exact stage-residual transpose system from stage Jacobian blocks."""
     rhs_arr = jnp.asarray(rhs, dtype=kernel_context.dtype).reshape((-1,))
-    matrix = _radau_exact_stage_residual_matrix(
-        kernel_context,
-        physics_context,
-        carry_in,
-        primal_result,
-        lagged_response,
-    )
+    if return_matrix_summary:
+        matrix, input_summary, snapshot = _radau_exact_stage_residual_matrix(
+            kernel_context, physics_context, carry_in, primal_result,
+            lagged_response, return_diagnostics=True,
+        )
+    else:
+        matrix = _radau_exact_stage_residual_matrix(
+            kernel_context, physics_context, carry_in, primal_result,
+            lagged_response,
+        )
     solution = jnp.linalg.solve(matrix.T, -rhs_arr).reshape((-1,))
     if return_matrix_summary:
-        return solution, reverse_step_matrix_summary(matrix)
+        return solution, {**reverse_step_matrix_summary(matrix), **input_summary}, snapshot
     return solution
 
 
@@ -15905,17 +15956,20 @@ def _radau_solve_exact_stage_residual_transpose_batched(
     if reverse_step_diagnostics_enabled():
         # Keep the existing objective-vmapped solve. Only reduce its already
         # materialized matrix; never build a second matrix or frozen solve.
-        solution, matrix_summaries = jax.vmap(
+        solution, matrix_summaries, snapshots = jax.vmap(
             lambda rhs_row: _radau_solve_exact_stage_residual_transpose_block(
                 kernel_context, physics_context, carry_in, primal_result,
                 lagged_response, rhs=rhs_row, return_matrix_summary=True,
             )
         )(rhs_arr)
         matrix_summary = jax.tree_util.tree_map(lambda x: x[0], matrix_summaries)
+        snapshot = jax.tree_util.tree_map(lambda x: x[0], snapshots)
+        snapshot["adjoint_rhs_first_objective"] = rhs_arr[0]
         # Outside the objective vmap, so one transition emits one message.
         reverse_step_finite_transition(
             "stage_adjoint_dense_solve", rhs_arr, solution,
             t=carry_in.t, dt=primal_result.trial_dt, details=matrix_summary,
+            snapshot=snapshot,
         )
         return solution
     solution = jax.vmap(
