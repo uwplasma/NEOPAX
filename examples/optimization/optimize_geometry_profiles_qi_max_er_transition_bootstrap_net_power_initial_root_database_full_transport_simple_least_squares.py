@@ -105,6 +105,10 @@ def parser() -> argparse.ArgumentParser:
             "the previous nominal-coordinate run starting at one."
         ),
     )
+    out.add_argument(
+        "--diagnose-optimization", action=argparse.BooleanOptionalAction, default=True,
+        help="Save weighted Jacobians, accepted/trial steps, and reverse-boundary checks without extra physics solves.",
+    )
     return out
 
 
@@ -247,7 +251,7 @@ def _least_squares_options(args, initial_evaluation, bounds, x_scale):
     """Return only the established SciPy-TRF options for this baseline."""
 
     x_scale_array = np.asarray(x_scale, dtype=float)
-    return {
+    options = {
         "max_nfev": int(args.max_nfev),
         "ftol": geometry_example.FTOL,
         "xtol": geometry_example.XTOL,
@@ -257,6 +261,9 @@ def _least_squares_options(args, initial_evaluation, bounds, x_scale):
         "bounds": bounds,
         "x_scale": x_scale_array,
     }
+    if getattr(args, "diagnose_optimization", False):
+        options["diagnostics_dir"] = Path(args.out_dir).resolve() / "optimization_diagnostics"
+    return options
 
 
 def profile_parameter_values(problem, x) -> dict[str, float]:

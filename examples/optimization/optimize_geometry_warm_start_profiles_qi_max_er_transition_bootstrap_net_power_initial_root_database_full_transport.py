@@ -72,6 +72,10 @@ def parser() -> argparse.ArgumentParser:
         help="Log RSS, live JAX arrays, device allocation, and stage cache sizes per evaluation.",
     )
     out.add_argument(
+        "--diagnose-optimization", action=argparse.BooleanOptionalAction, default=True,
+        help="Record phase-2 weighted Jacobians, trial/accepted steps, and reverse-boundary diagnostics without replay.",
+    )
+    out.add_argument(
         "--geometry-max-nfev",
         type=int,
         default=None,
@@ -613,6 +617,8 @@ def main() -> int:
             trust_scale,
         )
         least_squares_options["max_nfev"] = combined_budget
+        if args.diagnose_optimization:
+            least_squares_options["diagnostics_dir"] = out_dir / f"combined_diagnostics_m{max_mode}"
         result = opt.least_squares(problem, x0=x0, **least_squares_options)
         x_opt = np.asarray(result.x, dtype=float)
         combined_helper.report(

@@ -1,5 +1,156 @@
 # Database reverse AD versus FD status
 
+## 2026-10-15 Boozer-aligned FD rerun: all eight DoFs
+
+The user reran all eight FD parameters after the geometry-context default
+correction. Both geometry startup banners report `mboz=36, nboz=11`. All
+eight runs exited with status zero, and all 88 reported baseline objective
+values match the archived AD reference exactly at printed precision. The
+profile FD gradients are unchanged at their printed precision; the geometry
+FD baselines now match too.
+
+Evidence:
+
+- [Complete rerun command and output](docs/benchmarks/database_transition_objectives_fd_boozer_aligned_16_2026-10-15.txt),
+  copied byte for byte from attachment
+  `b1db715e-cb91-4f81-a93c-9bc8cb093fc0/Pasted text.txt`; SHA-256
+  `04c361518db882468940e3adbe2e63f44832b2e5539cb523107e4454aeed865a`.
+- [Full 88-pair AD/FD comparison CSV](docs/benchmarks/database_transition_objectives_fd_boozer_aligned_16_2026-10-15.csv),
+  including baseline checks, raw gradients, absolute/relative errors,
+  previous FD values/errors, FD steps, and geometry diagnostic splits.
+
+The reference remains the [2026-10-14 archived AD run](docs/benchmarks/database_transition_objectives_ad_16x4_2026-10-14.md).
+This attachment contains FD runs only; it does not contain a refreshed AD run
+after the shared-context correction. Matching reported baselines is now
+confirmed, while a completely refreshed AD/FD reference remains outstanding.
+Remote Git commit and dependency versions are not printed. No physics solve
+was run locally to archive or compare these records.
+
+The executed commands in the time footers confirm sixteen accepted steps,
+legacy Jacobian reuse, accepted replay with `reverse_frozen_metadata`,
+`jax_selected_root`, and frozen-linearized geometry and initial-root lanes.
+The pasted loop header is truncated at `done--initial-Er...`; the actual
+per-run footers and progress banners take precedence over that header.
+
+### Updated relative-error matrix against the archived AD reference
+
+Entries are `abs(AD - FD) / max(abs(AD), abs(FD))`, not percent. FD gradient
+values use the `.6e` console output (seven significant digits); finer error
+estimates need the remote JSON data. Every baseline in this matrix matches.
+
+| Objective | `n0` | `T0` | `density_shape_power` | `temperature_shape_power` | `density_shape_alpha` | `temperature_shape_alpha` | `RBC:1:0` | `ZBS:1:0` |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `softmax_Er` | 2.459e-08 | 8.851e-08 | 8.493e-08 | 9.489e-08 | 1.079e-06 | 1.866e-07 | 5.326e-05 | 7.827e-05 |
+| `net_total_power_volume_average_mw_m3` | 1.814e-07 | 2.801e-08 | 1.520e-07 | 3.836e-09 | 3.667e-07 | 1.175e-07 | 4.998e-04 | 5.596e-06 |
+| `Er2_volume_average` | 2.074e-07 | 8.968e-08 | 8.201e-08 | 9.973e-08 | 3.203e-09 | 2.025e-07 | 4.862e-05 | 1.769e-05 |
+| `Er_volume_average` | 4.120e-08 | 2.628e-08 | 6.589e-08 | 5.603e-08 | 1.922e-07 | 1.062e-07 | 6.911e-05 | 4.198e-06 |
+| `electron_temperature_volume_average_keV` | 3.367e-07 | 5.987e-08 | 5.370e-07 | 2.722e-07 | 5.837e-08 | 8.429e-08 | 1.848e-06 | 3.465e-06 |
+| `total_pressure_volume_average` | 4.223e-08 | 1.770e-07 | 1.442e-08 | 5.761e-09 | 2.378e-07 | 3.003e-07 | 1.330e-06 | 3.317e-06 |
+| `alpha_power_volume_average_mw_m3` | 7.706e-09 | 4.893e-08 | 4.888e-08 | 1.609e-07 | 4.809e-08 | 2.738e-08 | 2.500e-04 | 5.453e-06 |
+| `bootstrap_current_softmax_abs_scaled` | 1.253e-07 | 2.677e-07 | 7.095e-08 | 3.292e-08 | 1.344e-07 | 7.894e-08 | 3.220e-03 | 7.551e-03 |
+| `Er_transition_rho` | 2.236e-08 | 1.356e-07 | 1.842e-07 | 9.177e-09 | 1.948e-06 | 2.364e-08 | 1.520e-04 | 2.320e-05 |
+| `Er_transition_location_moment` | 2.236e-08 | 1.356e-07 | 1.842e-07 | 9.177e-09 | 1.948e-06 | 2.364e-08 | 1.520e-04 | 2.320e-05 |
+| `Er_transition_strength` | 1.312e-07 | 2.118e-09 | 1.783e-07 | 2.214e-07 | 1.738e-07 | 2.034e-07 | 5.968e-04 | 3.284e-05 |
+
+All six profile columns retain a maximum relative error of 1.948462e-06.
+For the geometry columns, the largest remaining discrepancy is bootstrap:
+3.220081e-03 (RBC) and 7.550967e-03 (ZBS). The new transition rows and net
+power now agree much more closely than in the baseline-mismatched run.
+
+### Raw AD and FD gradients for all eight DoFs
+
+These are derivatives of the benchmark observables with respect to each
+parameter, before applying optimization residual weights. AD columns retain
+the archived full precision; FD columns retain the printed `.6e` output.
+Root radius and location moment have the same gradients up to floating-point
+roundoff, but are listed separately to preserve the recorded values.
+
+#### `Er_transition_rho`
+
+| Parameter | Archived AD | New FD | Relative error |
+| --- | ---: | ---: | ---: |
+| `n0` | -2.6337380588872350e-03 | -2.633738e-03 | 2.236e-08 |
+| `T0` | 1.5282952072607615e-03 | 1.528295e-03 | 1.356e-07 |
+| `density_shape_power` | -2.1121013889685432e-05 | -2.112101e-05 | 1.842e-07 |
+| `temperature_shape_power` | 4.6804569570486499e-03 | 4.680457e-03 | 9.177e-09 |
+| `density_shape_alpha` | 3.1023760448633077e-05 | 3.102370e-05 | 1.948e-06 |
+| `temperature_shape_alpha` | -2.4039530568412291e-03 | -2.403953e-03 | 2.364e-08 |
+| `RBC:1:0` | -1.1324538116205816e-02 | -1.132626e-02 | 1.520e-04 |
+| `ZBS:1:0` | 1.5717194578232549e-02 | 1.571683e-02 | 2.320e-05 |
+
+#### `Er_transition_location_moment`
+
+| Parameter | Archived AD | New FD | Relative error |
+| --- | ---: | ---: | ---: |
+| `n0` | -2.6337380588872350e-03 | -2.633738e-03 | 2.236e-08 |
+| `T0` | 1.5282952072607615e-03 | 1.528295e-03 | 1.356e-07 |
+| `density_shape_power` | -2.1121013889685432e-05 | -2.112101e-05 | 1.842e-07 |
+| `temperature_shape_power` | 4.6804569570486499e-03 | 4.680457e-03 | 9.177e-09 |
+| `density_shape_alpha` | 3.1023760448633077e-05 | 3.102370e-05 | 1.948e-06 |
+| `temperature_shape_alpha` | -2.4039530568412291e-03 | -2.403953e-03 | 2.364e-08 |
+| `RBC:1:0` | -1.1324538116211589e-02 | -1.132626e-02 | 1.520e-04 |
+| `ZBS:1:0` | 1.5717194578231904e-02 | 1.571683e-02 | 2.320e-05 |
+
+#### `Er_transition_strength`
+
+| Parameter | Archived AD | New FD | Relative error |
+| --- | ---: | ---: | ---: |
+| `n0` | 5.1647553223378662e-02 | 5.164756e-02 | 1.312e-07 |
+| `T0` | 9.8169949792032918e-02 | 9.816995e-02 | 2.118e-09 |
+| `density_shape_power` | -2.4817004425355314e-02 | -2.481700e-02 | 1.783e-07 |
+| `temperature_shape_power` | -1.0421302306954468e-01 | -1.042130e-01 | 2.214e-07 |
+| `density_shape_alpha` | 6.4696761242981321e-02 | 6.469675e-02 | 1.738e-07 |
+| `temperature_shape_alpha` | 1.2571427443046261e+00 | 1.257143e+00 | 2.034e-07 |
+| `RBC:1:0` | -2.9056647289399873e-01 | -2.907400e-01 | 5.968e-04 |
+| `ZBS:1:0` | -1.9689043382835039e+00 | -1.968969e+00 | 3.284e-05 |
+
+#### `net_total_power_volume_average_mw_m3`
+
+| Parameter | Archived AD | New FD | Relative error |
+| --- | ---: | ---: | ---: |
+| `n0` | 2.4144994379889473e-01 | 2.414499e-01 | 1.814e-07 |
+| `T0` | 8.1012117730636768e-02 | 8.101212e-02 | 2.801e-08 |
+| `density_shape_power` | 1.0015251522452790e-03 | 1.001525e-03 | 1.520e-07 |
+| `temperature_shape_power` | 2.7450389894711430e-01 | 2.745039e-01 | 3.836e-09 |
+| `density_shape_alpha` | -2.4504761014614560e-04 | -2.450477e-04 | 3.667e-07 |
+| `temperature_shape_alpha` | -3.9390935373231989e-01 | -3.939094e-01 | 1.175e-07 |
+| `RBC:1:0` | 5.7486694403498812e-05 | 5.745796e-05 | 4.998e-04 |
+| `ZBS:1:0` | -6.4216000655884509e-03 | -6.421636e-03 | 5.596e-06 |
+
+#### `bootstrap_current_softmax_abs_scaled`
+
+| Parameter | Archived AD | New FD | Relative error |
+| --- | ---: | ---: | ---: |
+| `n0` | 1.0697658659370296e-01 | 1.069766e-01 | 1.253e-07 |
+| `T0` | 1.7479404679039118e-01 | 1.747940e-01 | 2.677e-07 |
+| `density_shape_power` | -1.1999309148606450e-02 | -1.199931e-02 | 7.095e-08 |
+| `temperature_shape_power` | 7.0788982330264971e-01 | 7.078898e-01 | 3.292e-08 |
+| `density_shape_alpha` | 4.1575984411776998e-02 | 4.157599e-02 | 1.344e-07 |
+| `temperature_shape_alpha` | -6.1967235108408603e-01 | -6.196724e-01 | 7.894e-08 |
+| `RBC:1:0` | -2.1363565358058780e+00 | -2.143258e+00 | 3.220e-03 |
+| `ZBS:1:0` | -1.2135494721232387e+00 | -1.204386e+00 | 7.551e-03 |
+
+### Geometry discrepancy before and after the FD correction
+
+The following entries are percent, using the same archived AD column for
+both comparisons. Radius and location-moment results coincide at the shown
+precision. Net power is the volume-averaged MW/m3 benchmark observable.
+
+| Observable | RBC before (%) | RBC after (%) | ZBS before (%) | ZBS after (%) |
+| --- | ---: | ---: | ---: | ---: |
+| `Er_transition_rho` | 7.249889 | 0.015203 | 6.297522 | 0.00232 |
+| `Er_transition_strength` | 24.208012 | 0.059685 | 17.115679 | 0.003284 |
+| `net_total_power_volume_average_mw_m3` | 80.292974 | 0.049984 | 0.056215 | 0.00056 |
+| `bootstrap_current_softmax_abs_scaled` | 0.334052 | 0.322008 | 2.014295 | 0.755097 |
+
+This rerun numerically confirms that the Boozer-resolution correction
+removes the observed FD baseline mismatch and greatly reduces the major
+geometry discrepancies against the saved AD result. It does not establish
+zero derivative error, resolve the remaining bootstrap differences, validate
+the full-final-time or combined-optimization point, or resolve host-memory
+growth and failed reverse trials. The prior comparisons below are preserved
+as pre-correction history.
+
 ## 2026-10-15 transition-objective AD/FD comparison: current eleven-row case
 
 This updates the AD/FD tables for the current `en/v0_new` benchmark. The three

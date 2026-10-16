@@ -1,0 +1,602 @@
+ cd ~/NEOPAX
+git switch en/v0_new
+git pull --ff-only origin en/v0_new
+
+for parameter in \
+  n0 \
+  T0 \
+  density_shape_power \
+  temperature_shape_power \
+  density_shape_alpha \
+  temperature_shape_alpha \
+  RBC:1:0 \
+  ZBS:1:0
+do
+  env -u JAX_COMPILATION_CACHE_DIR \
+  JAX_ENABLE_COMPILATION_CACHE=0 \
+  PYTHONPATH="$HOME/VMEX:$HOME/NTX/src" \
+  /usr/bin/time -v \
+  python examples/benchmarks/benchmark_transport_realtime_geometry_forward_fd.py \
+    --config examples/benchmarks/Solve_Transport_equations_wHe_radau_ntx_scan_runtime_database_vmec_realtime_geometry_benchmark_black_box.toml \
+    --parameter "$parameter" \
+    --accepted-step-limit 16 \
+done--initial-Er-root-fd-root-lane frozen_linearized || break
+M	NEOPAX/version.py
+Already on 'en/v0_new'
+Your branch is up to date with 'origin/en/v0_new'.
+From https://github.com/uwplasma/NEOPAX
+ * branch            en/v0_new  -> FETCH_HEAD
+Already up to date.
+[autodiff-gate] device placement: requested=default default_backend=gpu selected_device=cuda:0
+[NEOPAX] built runtime NTX scan database: rho=7 nu_v=16 Er_tilde=11 grid=(25,31,64) backend=vmec
+[autodiff-gate] progress: running baseline realtime rollout for FD trace
+E1015 17:26:38.767344  325647 slow_operation_alarm.cc:73] 
+********************************
+[Compiling module jit_scan for GPU] Very slow compile? If you want to file a bug, run with envvar XLA_FLAGS=--xla_dump_to=/tmp/foo and attach the results.
+********************************
+E1015 17:26:57.181215  325606 slow_operation_alarm.cc:140] The operation took 2m18.414005547s
+
+********************************
+[Compiling module jit_scan for GPU] Very slow compile? If you want to file a bug, run with envvar XLA_FLAGS=--xla_dump_to=/tmp/foo and attach the results.
+********************************
+[autodiff-gate] progress: preparing frozen-linearized initial-Er root branch for full-transport FD
+[autodiff-gate] progress: running profile fd_minus replay
+[autodiff-gate] progress: running profile fd_plus replay
+[autodiff-gate] mode=transport_realtime_geometry_forward_fd parameter=n0 parameter_kind=profile baseline_value=4.210000e+00 fd_step=1.263000e-06 replay_mode=accepted fd_accepted_replay_contract=reverse_frozen_metadata geometry_fd_lane=frozen_linearized root_fd_lane=frozen_linearized
+[autodiff-gate] objective values:
+  - softmax_Er: value=2.1347597195937237e+01
+  - net_total_power_volume_average_mw_m3: value=5.0807530056153805e-01
+  - Er2_volume_average: value=2.6970444770780875e+02
+  - Er_volume_average: value=-2.8511644595415109e+00
+  - electron_temperature_volume_average_keV: value=6.5667321668602181e+00
+  - total_pressure_volume_average: value=3.4217392410449378e+01
+  - alpha_power_volume_average_mw_m3: value=5.8919528056733395e-01
+  - bootstrap_current_softmax_abs_scaled: value=1.3717342728662278e+00
+  - Er_transition_rho: value=6.1293923577522791e-01
+  - Er_transition_location_moment: value=1.1293923577522791e-01
+  - Er_transition_strength: value=2.2261594486928726e+00
+[autodiff-gate] objective finite-difference gradients:
+  - softmax_Er: fd=-2.870229e+00
+  - net_total_power_volume_average_mw_m3: fd=2.414499e-01
+  - Er2_volume_average: fd=2.584262e+00
+  - Er_volume_average: fd=-1.902403e+00
+  - electron_temperature_volume_average_keV: fd=8.635229e-04
+  - total_pressure_volume_average: fd=8.062429e+00
+  - alpha_power_volume_average_mw_m3: fd=2.796210e-01
+  - bootstrap_current_softmax_abs_scaled: fd=1.069766e-01
+  - Er_transition_rho: fd=-2.633738e-03
+  - Er_transition_location_moment: fd=-2.633738e-03
+  - Er_transition_strength: fd=5.164756e-02
+Wrote outputs/autodiff_transport_lagged_ntx/realtime_geometry_fd/n0_forward_fd_frozen_linearized_summary.json
+	Command being timed: "python examples/benchmarks/benchmark_transport_realtime_geometry_forward_fd.py --config examples/benchmarks/Solve_Transport_equations_wHe_radau_ntx_scan_runtime_database_vmec_realtime_geometry_benchmark_black_box.toml --parameter n0 --accepted-step-limit 16 --radau-jacobian-reuse-mode legacy --geometry-fd-lane frozen_linearized --replay-mode accepted --fd-accepted-replay-contract reverse_frozen_metadata --initial-Er-root-ad jax_selected_root --initial-Er-root-fd-root-lane frozen_linearized"
+	User time (seconds): 1869.93
+	System time (seconds): 55.77
+	Percent of CPU this job got: 109%
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 29:18.67
+	Average shared text size (kbytes): 0
+	Average unshared data size (kbytes): 0
+	Average stack size (kbytes): 0
+	Average total size (kbytes): 0
+	Maximum resident set size (kbytes): 9383820
+	Average resident set size (kbytes): 0
+	Major (requiring I/O) page faults: 0
+	Minor (reclaiming a frame) page faults: 8325600
+	Voluntary context switches: 2675328
+	Involuntary context switches: 247435
+	Swaps: 0
+	File system inputs: 0
+	File system outputs: 273112
+	Socket messages sent: 0
+	Socket messages received: 0
+	Signals delivered: 0
+	Page size (bytes): 4096
+	Exit status: 0
+[autodiff-gate] device placement: requested=default default_backend=gpu selected_device=cuda:0
+[NEOPAX] built runtime NTX scan database: rho=7 nu_v=16 Er_tilde=11 grid=(25,31,64) backend=vmec
+[autodiff-gate] progress: running baseline realtime rollout for FD trace
+E1015 17:55:44.526789  328231 slow_operation_alarm.cc:73] 
+********************************
+[Compiling module jit_scan for GPU] Very slow compile? If you want to file a bug, run with envvar XLA_FLAGS=--xla_dump_to=/tmp/foo and attach the results.
+********************************
+E1015 17:56:02.870744  328190 slow_operation_alarm.cc:140] The operation took 2m18.344069804s
+
+********************************
+[Compiling module jit_scan for GPU] Very slow compile? If you want to file a bug, run with envvar XLA_FLAGS=--xla_dump_to=/tmp/foo and attach the results.
+********************************
+[autodiff-gate] progress: preparing frozen-linearized initial-Er root branch for full-transport FD
+[autodiff-gate] progress: running profile fd_minus replay
+[autodiff-gate] progress: running profile fd_plus replay
+[autodiff-gate] mode=transport_realtime_geometry_forward_fd parameter=T0 parameter_kind=profile baseline_value=1.780000e+01 fd_step=5.340000e-06 replay_mode=accepted fd_accepted_replay_contract=reverse_frozen_metadata geometry_fd_lane=frozen_linearized root_fd_lane=frozen_linearized
+[autodiff-gate] objective values:
+  - softmax_Er: value=2.1347597195937237e+01
+  - net_total_power_volume_average_mw_m3: value=5.0807530056153805e-01
+  - Er2_volume_average: value=2.6970444770780875e+02
+  - Er_volume_average: value=-2.8511644595415109e+00
+  - electron_temperature_volume_average_keV: value=6.5667321668602181e+00
+  - total_pressure_volume_average: value=3.4217392410449378e+01
+  - alpha_power_volume_average_mw_m3: value=5.8919528056733395e-01
+  - bootstrap_current_softmax_abs_scaled: value=1.3717342728662278e+00
+  - Er_transition_rho: value=6.1293923577522791e-01
+  - Er_transition_location_moment: value=1.1293923577522791e-01
+  - Er_transition_strength: value=2.2261594486928726e+00
+[autodiff-gate] objective finite-difference gradients:
+  - softmax_Er: fd=2.774012e+00
+  - net_total_power_volume_average_mw_m3: fd=8.101212e-02
+  - Er2_volume_average: fd=3.132042e+01
+  - Er_volume_average: fd=8.660546e-01
+  - electron_temperature_volume_average_keV: fd=3.557792e-01
+  - total_pressure_volume_average: fd=1.865417e+00
+  - alpha_power_volume_average_mw_m3: fd=8.321610e-02
+  - bootstrap_current_softmax_abs_scaled: fd=1.747940e-01
+  - Er_transition_rho: fd=1.528295e-03
+  - Er_transition_location_moment: fd=1.528295e-03
+  - Er_transition_strength: fd=9.816995e-02
+Wrote outputs/autodiff_transport_lagged_ntx/realtime_geometry_fd/T0_forward_fd_frozen_linearized_summary.json
+	Command being timed: "python examples/benchmarks/benchmark_transport_realtime_geometry_forward_fd.py --config examples/benchmarks/Solve_Transport_equations_wHe_radau_ntx_scan_runtime_database_vmec_realtime_geometry_benchmark_black_box.toml --parameter T0 --accepted-step-limit 16 --radau-jacobian-reuse-mode legacy --geometry-fd-lane frozen_linearized --replay-mode accepted --fd-accepted-replay-contract reverse_frozen_metadata --initial-Er-root-ad jax_selected_root --initial-Er-root-fd-root-lane frozen_linearized"
+	User time (seconds): 1845.10
+	System time (seconds): 53.50
+	Percent of CPU this job got: 109%
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 28:59.21
+	Average shared text size (kbytes): 0
+	Average unshared data size (kbytes): 0
+	Average stack size (kbytes): 0
+	Average total size (kbytes): 0
+	Maximum resident set size (kbytes): 9382900
+	Average resident set size (kbytes): 0
+	Major (requiring I/O) page faults: 0
+	Minor (reclaiming a frame) page faults: 8318837
+	Voluntary context switches: 2530049
+	Involuntary context switches: 195381
+	Swaps: 0
+	File system inputs: 0
+	File system outputs: 272256
+	Socket messages sent: 0
+	Socket messages received: 0
+	Signals delivered: 0
+	Page size (bytes): 4096
+	Exit status: 0
+[autodiff-gate] device placement: requested=default default_backend=gpu selected_device=cuda:0
+[NEOPAX] built runtime NTX scan database: rho=7 nu_v=16 Er_tilde=11 grid=(25,31,64) backend=vmec
+[autodiff-gate] progress: running baseline realtime rollout for FD trace
+E1015 18:24:48.869045  331476 slow_operation_alarm.cc:73] 
+********************************
+[Compiling module jit_scan for GPU] Very slow compile? If you want to file a bug, run with envvar XLA_FLAGS=--xla_dump_to=/tmp/foo and attach the results.
+********************************
+E1015 18:25:07.996572  331433 slow_operation_alarm.cc:140] The operation took 2m19.127638322s
+
+********************************
+[Compiling module jit_scan for GPU] Very slow compile? If you want to file a bug, run with envvar XLA_FLAGS=--xla_dump_to=/tmp/foo and attach the results.
+********************************
+[autodiff-gate] progress: preparing frozen-linearized initial-Er root branch for full-transport FD
+[autodiff-gate] progress: running profile fd_minus replay
+[autodiff-gate] progress: running profile fd_plus replay
+[autodiff-gate] mode=transport_realtime_geometry_forward_fd parameter=density_shape_power parameter_kind=profile baseline_value=1.000000e+01 fd_step=3.000000e-06 replay_mode=accepted fd_accepted_replay_contract=reverse_frozen_metadata geometry_fd_lane=frozen_linearized root_fd_lane=frozen_linearized
+[autodiff-gate] objective values:
+  - softmax_Er: value=2.1347597195937237e+01
+  - net_total_power_volume_average_mw_m3: value=5.0807530056153805e-01
+  - Er2_volume_average: value=2.6970444770780875e+02
+  - Er_volume_average: value=-2.8511644595415109e+00
+  - electron_temperature_volume_average_keV: value=6.5667321668602181e+00
+  - total_pressure_volume_average: value=3.4217392410449378e+01
+  - alpha_power_volume_average_mw_m3: value=5.8919528056733395e-01
+  - bootstrap_current_softmax_abs_scaled: value=1.3717342728662278e+00
+  - Er_transition_rho: value=6.1293923577522791e-01
+  - Er_transition_location_moment: value=1.1293923577522791e-01
+  - Er_transition_strength: value=2.2261594486928726e+00
+[autodiff-gate] objective finite-difference gradients:
+  - softmax_Er: fd=-8.097001e-02
+  - net_total_power_volume_average_mw_m3: fd=1.001525e-03
+  - Er2_volume_average: fd=2.282434e+00
+  - Er_volume_average: fd=-6.868899e-02
+  - electron_temperature_volume_average_keV: fd=-7.134486e-05
+  - total_pressure_volume_average: fd=2.442670e-01
+  - alpha_power_volume_average_mw_m3: fd=2.360918e-03
+  - bootstrap_current_softmax_abs_scaled: fd=-1.199931e-02
+  - Er_transition_rho: fd=-2.112101e-05
+  - Er_transition_location_moment: fd=-2.112101e-05
+  - Er_transition_strength: fd=-2.481700e-02
+Wrote outputs/autodiff_transport_lagged_ntx/realtime_geometry_fd/density_shape_power_forward_fd_frozen_linearized_summary.json
+	Command being timed: "python examples/benchmarks/benchmark_transport_realtime_geometry_forward_fd.py --config examples/benchmarks/Solve_Transport_equations_wHe_radau_ntx_scan_runtime_database_vmec_realtime_geometry_benchmark_black_box.toml --parameter density_shape_power --accepted-step-limit 16 --radau-jacobian-reuse-mode legacy --geometry-fd-lane frozen_linearized --replay-mode accepted --fd-accepted-replay-contract reverse_frozen_metadata --initial-Er-root-ad jax_selected_root --initial-Er-root-fd-root-lane frozen_linearized"
+	User time (seconds): 1862.90
+	System time (seconds): 54.77
+	Percent of CPU this job got: 109%
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 29:13.97
+	Average shared text size (kbytes): 0
+	Average unshared data size (kbytes): 0
+	Average stack size (kbytes): 0
+	Average total size (kbytes): 0
+	Maximum resident set size (kbytes): 9342652
+	Average resident set size (kbytes): 0
+	Major (requiring I/O) page faults: 0
+	Minor (reclaiming a frame) page faults: 8287771
+	Voluntary context switches: 2619623
+	Involuntary context switches: 237425
+	Swaps: 0
+	File system inputs: 0
+	File system outputs: 272448
+	Socket messages sent: 0
+	Socket messages received: 0
+	Signals delivered: 0
+	Page size (bytes): 4096
+	Exit status: 0
+[autodiff-gate] device placement: requested=default default_backend=gpu selected_device=cuda:0
+[NEOPAX] built runtime NTX scan database: rho=7 nu_v=16 Er_tilde=11 grid=(25,31,64) backend=vmec
+[autodiff-gate] progress: running baseline realtime rollout for FD trace
+E1015 18:54:01.614593  334633 slow_operation_alarm.cc:73] 
+********************************
+[Compiling module jit_scan for GPU] Very slow compile? If you want to file a bug, run with envvar XLA_FLAGS=--xla_dump_to=/tmp/foo and attach the results.
+********************************
+E1015 18:54:20.215354  334590 slow_operation_alarm.cc:140] The operation took 2m18.600863259s
+
+********************************
+[Compiling module jit_scan for GPU] Very slow compile? If you want to file a bug, run with envvar XLA_FLAGS=--xla_dump_to=/tmp/foo and attach the results.
+********************************
+[autodiff-gate] progress: preparing frozen-linearized initial-Er root branch for full-transport FD
+[autodiff-gate] progress: running profile fd_minus replay
+[autodiff-gate] progress: running profile fd_plus replay
+[autodiff-gate] mode=transport_realtime_geometry_forward_fd parameter=temperature_shape_power parameter_kind=profile baseline_value=2.000000e+00 fd_step=6.000000e-07 replay_mode=accepted fd_accepted_replay_contract=reverse_frozen_metadata geometry_fd_lane=frozen_linearized root_fd_lane=frozen_linearized
+[autodiff-gate] objective values:
+  - softmax_Er: value=2.1347597195937237e+01
+  - net_total_power_volume_average_mw_m3: value=5.0807530056153805e-01
+  - Er2_volume_average: value=2.6970444770780875e+02
+  - Er_volume_average: value=-2.8511644595415109e+00
+  - electron_temperature_volume_average_keV: value=6.5667321668602181e+00
+  - total_pressure_volume_average: value=3.4217392410449378e+01
+  - alpha_power_volume_average_mw_m3: value=5.8919528056733395e-01
+  - bootstrap_current_softmax_abs_scaled: value=1.3717342728662278e+00
+  - Er_transition_rho: value=6.1293923577522791e-01
+  - Er_transition_location_moment: value=1.1293923577522791e-01
+  - Er_transition_strength: value=2.2261594486928726e+00
+[autodiff-gate] objective finite-difference gradients:
+  - softmax_Er: fd=1.871854e+00
+  - net_total_power_volume_average_mw_m3: fd=2.745039e-01
+  - Er2_volume_average: fd=-1.193830e+01
+  - Er_volume_average: fd=-6.940590e-01
+  - electron_temperature_volume_average_keV: fd=1.524802e+00
+  - total_pressure_volume_average: fd=7.752336e+00
+  - alpha_power_volume_average_mw_m3: fd=2.842041e-01
+  - bootstrap_current_softmax_abs_scaled: fd=7.078898e-01
+  - Er_transition_rho: fd=4.680457e-03
+  - Er_transition_location_moment: fd=4.680457e-03
+  - Er_transition_strength: fd=-1.042130e-01
+Wrote outputs/autodiff_transport_lagged_ntx/realtime_geometry_fd/temperature_shape_power_forward_fd_frozen_linearized_summary.json
+	Command being timed: "python examples/benchmarks/benchmark_transport_realtime_geometry_forward_fd.py --config examples/benchmarks/Solve_Transport_equations_wHe_radau_ntx_scan_runtime_database_vmec_realtime_geometry_benchmark_black_box.toml --parameter temperature_shape_power --accepted-step-limit 16 --radau-jacobian-reuse-mode legacy --geometry-fd-lane frozen_linearized --replay-mode accepted --fd-accepted-replay-contract reverse_frozen_metadata --initial-Er-root-ad jax_selected_root --initial-Er-root-fd-root-lane frozen_linearized"
+	User time (seconds): 1859.19
+	System time (seconds): 55.00
+	Percent of CPU this job got: 109%
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 29:07.19
+	Average shared text size (kbytes): 0
+	Average unshared data size (kbytes): 0
+	Average stack size (kbytes): 0
+	Average total size (kbytes): 0
+	Maximum resident set size (kbytes): 9380984
+	Average resident set size (kbytes): 0
+	Major (requiring I/O) page faults: 0
+	Minor (reclaiming a frame) page faults: 8233477
+	Voluntary context switches: 2650136
+	Involuntary context switches: 250294
+	Swaps: 0
+	File system inputs: 0
+	File system outputs: 272304
+	Socket messages sent: 0
+	Socket messages received: 0
+	Signals delivered: 0
+	Page size (bytes): 4096
+	Exit status: 0
+[autodiff-gate] device placement: requested=default default_backend=gpu selected_device=cuda:0
+[NEOPAX] built runtime NTX scan database: rho=7 nu_v=16 Er_tilde=11 grid=(25,31,64) backend=vmec
+[autodiff-gate] progress: running baseline realtime rollout for FD trace
+E1015 19:23:08.558315  337544 slow_operation_alarm.cc:73] 
+********************************
+[Compiling module jit_scan for GPU] Very slow compile? If you want to file a bug, run with envvar XLA_FLAGS=--xla_dump_to=/tmp/foo and attach the results.
+********************************
+E1015 19:23:26.896674  337496 slow_operation_alarm.cc:140] The operation took 2m18.338472692s
+
+********************************
+[Compiling module jit_scan for GPU] Very slow compile? If you want to file a bug, run with envvar XLA_FLAGS=--xla_dump_to=/tmp/foo and attach the results.
+********************************
+[autodiff-gate] progress: preparing frozen-linearized initial-Er root branch for full-transport FD
+[autodiff-gate] progress: running profile fd_minus replay
+[autodiff-gate] progress: running profile fd_plus replay
+[autodiff-gate] mode=transport_realtime_geometry_forward_fd parameter=density_shape_alpha parameter_kind=profile baseline_value=1.000000e+00 fd_step=3.000000e-07 replay_mode=accepted fd_accepted_replay_contract=reverse_frozen_metadata geometry_fd_lane=frozen_linearized root_fd_lane=frozen_linearized
+[autodiff-gate] objective values:
+  - softmax_Er: value=2.1347597195937237e+01
+  - net_total_power_volume_average_mw_m3: value=5.0807530056153805e-01
+  - Er2_volume_average: value=2.6970444770780875e+02
+  - Er_volume_average: value=-2.8511644595415109e+00
+  - electron_temperature_volume_average_keV: value=6.5667321668602181e+00
+  - total_pressure_volume_average: value=3.4217392410449378e+01
+  - alpha_power_volume_average_mw_m3: value=5.8919528056733395e-01
+  - bootstrap_current_softmax_abs_scaled: value=1.3717342728662278e+00
+  - Er_transition_rho: value=6.1293923577522791e-01
+  - Er_transition_location_moment: value=1.1293923577522791e-01
+  - Er_transition_strength: value=2.2261594486928726e+00
+[autodiff-gate] objective finite-difference gradients:
+  - softmax_Er: fd=1.531297e-01
+  - net_total_power_volume_average_mw_m3: fd=-2.450477e-04
+  - Er2_volume_average: fd=3.086190e+00
+  - Er_volume_average: fd=-1.683208e-01
+  - electron_temperature_volume_average_keV: fd=1.221864e-03
+  - total_pressure_volume_average: fd=-1.326505e+00
+  - alpha_power_volume_average_mw_m3: fd=-7.638351e-03
+  - bootstrap_current_softmax_abs_scaled: fd=4.157599e-02
+  - Er_transition_rho: fd=3.102370e-05
+  - Er_transition_location_moment: fd=3.102370e-05
+  - Er_transition_strength: fd=6.469675e-02
+Wrote outputs/autodiff_transport_lagged_ntx/realtime_geometry_fd/density_shape_alpha_forward_fd_frozen_linearized_summary.json
+	Command being timed: "python examples/benchmarks/benchmark_transport_realtime_geometry_forward_fd.py --config examples/benchmarks/Solve_Transport_equations_wHe_radau_ntx_scan_runtime_database_vmec_realtime_geometry_benchmark_black_box.toml --parameter density_shape_alpha --accepted-step-limit 16 --radau-jacobian-reuse-mode legacy --geometry-fd-lane frozen_linearized --replay-mode accepted --fd-accepted-replay-contract reverse_frozen_metadata --initial-Er-root-ad jax_selected_root --initial-Er-root-fd-root-lane frozen_linearized"
+	User time (seconds): 1870.02
+	System time (seconds): 55.68
+	Percent of CPU this job got: 109%
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 29:16.39
+	Average shared text size (kbytes): 0
+	Average unshared data size (kbytes): 0
+	Average stack size (kbytes): 0
+	Average total size (kbytes): 0
+	Maximum resident set size (kbytes): 9336444
+	Average resident set size (kbytes): 0
+	Major (requiring I/O) page faults: 0
+	Minor (reclaiming a frame) page faults: 8410448
+	Voluntary context switches: 2663620
+	Involuntary context switches: 222683
+	Swaps: 0
+	File system inputs: 0
+	File system outputs: 272304
+	Socket messages sent: 0
+	Socket messages received: 0
+	Signals delivered: 0
+	Page size (bytes): 4096
+	Exit status: 0
+[autodiff-gate] device placement: requested=default default_backend=gpu selected_device=cuda:0
+[NEOPAX] built runtime NTX scan database: rho=7 nu_v=16 Er_tilde=11 grid=(25,31,64) backend=vmec
+[autodiff-gate] progress: running baseline realtime rollout for FD trace
+E1015 19:52:29.941402  339768 slow_operation_alarm.cc:73] 
+********************************
+[Compiling module jit_scan for GPU] Very slow compile? If you want to file a bug, run with envvar XLA_FLAGS=--xla_dump_to=/tmp/foo and attach the results.
+********************************
+E1015 19:52:48.673190  339727 slow_operation_alarm.cc:140] The operation took 2m18.73274719s
+
+********************************
+[Compiling module jit_scan for GPU] Very slow compile? If you want to file a bug, run with envvar XLA_FLAGS=--xla_dump_to=/tmp/foo and attach the results.
+********************************
+[autodiff-gate] progress: preparing frozen-linearized initial-Er root branch for full-transport FD
+[autodiff-gate] progress: running profile fd_minus replay
+[autodiff-gate] progress: running profile fd_plus replay
+[autodiff-gate] mode=transport_realtime_geometry_forward_fd parameter=temperature_shape_alpha parameter_kind=profile baseline_value=1.000000e+00 fd_step=3.000000e-07 replay_mode=accepted fd_accepted_replay_contract=reverse_frozen_metadata geometry_fd_lane=frozen_linearized root_fd_lane=frozen_linearized
+[autodiff-gate] objective values:
+  - softmax_Er: value=2.1347597195937237e+01
+  - net_total_power_volume_average_mw_m3: value=5.0807530056153805e-01
+  - Er2_volume_average: value=2.6970444770780875e+02
+  - Er_volume_average: value=-2.8511644595415109e+00
+  - electron_temperature_volume_average_keV: value=6.5667321668602181e+00
+  - total_pressure_volume_average: value=3.4217392410449378e+01
+  - alpha_power_volume_average_mw_m3: value=5.8919528056733395e-01
+  - bootstrap_current_softmax_abs_scaled: value=1.3717342728662278e+00
+  - Er_transition_rho: value=6.1293923577522791e-01
+  - Er_transition_location_moment: value=1.1293923577522791e-01
+  - Er_transition_strength: value=2.2261594486928726e+00
+[autodiff-gate] objective finite-difference gradients:
+  - softmax_Er: fd=1.076841e+01
+  - net_total_power_volume_average_mw_m3: fd=-3.939094e-01
+  - Er2_volume_average: fd=1.069449e+02
+  - Er_volume_average: fd=3.016581e+00
+  - electron_temperature_volume_average_keV: fd=-3.044927e+00
+  - total_pressure_volume_average: fd=-1.451660e+01
+  - alpha_power_volume_average_mw_m3: fd=-4.128987e-01
+  - bootstrap_current_softmax_abs_scaled: fd=-6.196724e-01
+  - Er_transition_rho: fd=-2.403953e-03
+  - Er_transition_location_moment: fd=-2.403953e-03
+  - Er_transition_strength: fd=1.257143e+00
+Wrote outputs/autodiff_transport_lagged_ntx/realtime_geometry_fd/temperature_shape_alpha_forward_fd_frozen_linearized_summary.json
+	Command being timed: "python examples/benchmarks/benchmark_transport_realtime_geometry_forward_fd.py --config examples/benchmarks/Solve_Transport_equations_wHe_radau_ntx_scan_runtime_database_vmec_realtime_geometry_benchmark_black_box.toml --parameter temperature_shape_alpha --accepted-step-limit 16 --radau-jacobian-reuse-mode legacy --geometry-fd-lane frozen_linearized --replay-mode accepted --fd-accepted-replay-contract reverse_frozen_metadata --initial-Er-root-ad jax_selected_root --initial-Er-root-fd-root-lane frozen_linearized"
+	User time (seconds): 1865.83
+	System time (seconds): 55.65
+	Percent of CPU this job got: 109%
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 29:12.85
+	Average shared text size (kbytes): 0
+	Average unshared data size (kbytes): 0
+	Average stack size (kbytes): 0
+	Average total size (kbytes): 0
+	Maximum resident set size (kbytes): 9382812
+	Average resident set size (kbytes): 0
+	Major (requiring I/O) page faults: 0
+	Minor (reclaiming a frame) page faults: 8325160
+	Voluntary context switches: 2652785
+	Involuntary context switches: 240834
+	Swaps: 0
+	File system inputs: 0
+	File system outputs: 272304
+	Socket messages sent: 0
+	Socket messages received: 0
+	Signals delivered: 0
+	Page size (bytes): 4096
+	Exit status: 0
+[autodiff-gate] device placement: requested=default default_backend=gpu selected_device=cuda:0
+[autodiff-gate] progress: baseline forward VMEC solve for frozen-linearized geometry FD (mboz=36, nboz=11)
+[NEOPAX] built runtime NTX scan database: rho=7 nu_v=16 Er_tilde=11 grid=(25,31,64) backend=vmec
+[autodiff-gate] progress: running baseline realtime rollout for FD trace
+E1015 20:22:37.790202  341847 slow_operation_alarm.cc:73] 
+********************************
+[Compiling module jit_scan for GPU] Very slow compile? If you want to file a bug, run with envvar XLA_FLAGS=--xla_dump_to=/tmp/foo and attach the results.
+********************************
+E1015 20:22:57.057059  341806 slow_operation_alarm.cc:140] The operation took 2m19.268953966s
+
+********************************
+[Compiling module jit_scan for GPU] Very slow compile? If you want to file a bug, run with envvar XLA_FLAGS=--xla_dump_to=/tmp/foo and attach the results.
+********************************
+[autodiff-gate] progress: preparing frozen-linearized initial-Er root branch for full-transport FD
+[autodiff-gate] progress: running realtime geometry fd_minus replay
+[NEOPAX] built runtime NTX scan database: rho=7 nu_v=16 Er_tilde=11 grid=(25,31,64) backend=vmec
+[autodiff-gate] progress: running fixed-final-state explicit geometry FD diagnostic
+[NEOPAX] built runtime NTX scan database: rho=7 nu_v=16 Er_tilde=11 grid=(25,31,64) backend=vmec
+[NEOPAX] built runtime NTX scan database: rho=7 nu_v=16 Er_tilde=11 grid=(25,31,64) backend=vmec
+[autodiff-gate] progress: running realtime geometry fd_plus replay
+[NEOPAX] built runtime NTX scan database: rho=7 nu_v=16 Er_tilde=11 grid=(25,31,64) backend=vmec
+[autodiff-gate] mode=transport_realtime_geometry_forward_fd parameter=RBC:1:0 parameter_kind=realtime_geometry baseline_value=0.000000e+00 fd_step=3.313117e-07 replay_mode=accepted fd_accepted_replay_contract=reverse_frozen_metadata geometry_fd_lane=frozen_linearized root_fd_lane=frozen_linearized
+[autodiff-gate] objective values:
+  - softmax_Er: value=2.1347597195937237e+01
+  - net_total_power_volume_average_mw_m3: value=5.0807530056153805e-01
+  - Er2_volume_average: value=2.6970444770780875e+02
+  - Er_volume_average: value=-2.8511644595415109e+00
+  - electron_temperature_volume_average_keV: value=6.5667321668602181e+00
+  - total_pressure_volume_average: value=3.4217392410449378e+01
+  - alpha_power_volume_average_mw_m3: value=5.8919528056733395e-01
+  - bootstrap_current_softmax_abs_scaled: value=1.3717342728662278e+00
+  - Er_transition_rho: value=6.1293923577522791e-01
+  - Er_transition_location_moment: value=1.1293923577522791e-01
+  - Er_transition_strength: value=2.2261594486928726e+00
+[autodiff-gate] objective finite-difference gradients:
+  - softmax_Er: fd=-2.768518e+01
+  - net_total_power_volume_average_mw_m3: fd=5.745796e-05
+  - Er2_volume_average: fd=-2.960390e+02
+  - Er_volume_average: fd=-6.836520e+00
+  - electron_temperature_volume_average_keV: fd=-1.611597e-02
+  - total_pressure_volume_average: fd=-7.330590e-02
+  - alpha_power_volume_average_mw_m3: fd=-1.172305e-04
+  - bootstrap_current_softmax_abs_scaled: fd=-2.143258e+00
+  - Er_transition_rho: fd=-1.132626e-02
+  - Er_transition_location_moment: fd=-1.132626e-02
+  - Er_transition_strength: fd=-2.907400e-01
+[autodiff-gate] fixed-final-state explicit geometry finite-difference gradients:
+  - softmax_Er: fd_explicit_geometry=0.000000e+00
+  - net_total_power_volume_average_mw_m3: fd_explicit_geometry=-1.715143e-03
+  - Er2_volume_average: fd_explicit_geometry=3.615508e-01
+  - Er_volume_average: fd_explicit_geometry=-5.631949e-02
+  - electron_temperature_volume_average_keV: fd_explicit_geometry=-1.225833e-02
+  - total_pressure_volume_average: fd_explicit_geometry=-7.380397e-02
+  - alpha_power_volume_average_mw_m3: fd_explicit_geometry=-1.870079e-03
+  - bootstrap_current_softmax_abs_scaled: fd_explicit_geometry=-2.264432e+00
+  - Er_transition_rho: fd_explicit_geometry=0.000000e+00
+  - Er_transition_location_moment: fd_explicit_geometry=0.000000e+00
+  - Er_transition_strength: fd_explicit_geometry=0.000000e+00
+[autodiff-gate] baseline-geometry final-state finite-difference gradients:
+  - softmax_Er: fd_final_state_geometry=-2.768518e+01
+  - net_total_power_volume_average_mw_m3: fd_final_state_geometry=1.772600e-03
+  - Er2_volume_average: fd_final_state_geometry=-2.964005e+02
+  - Er_volume_average: fd_final_state_geometry=-6.780201e+00
+  - electron_temperature_volume_average_keV: fd_final_state_geometry=-3.857643e-03
+  - total_pressure_volume_average: fd_final_state_geometry=4.980701e-04
+  - alpha_power_volume_average_mw_m3: fd_final_state_geometry=1.752848e-03
+  - bootstrap_current_softmax_abs_scaled: fd_final_state_geometry=1.211738e-01
+  - Er_transition_rho: fd_final_state_geometry=-1.132626e-02
+  - Er_transition_location_moment: fd_final_state_geometry=-1.132626e-02
+  - Er_transition_strength: fd_final_state_geometry=-2.907400e-01
+Wrote outputs/autodiff_transport_lagged_ntx/realtime_geometry_fd/RBC_1_0_forward_fd_frozen_linearized_summary.json
+	Command being timed: "python examples/benchmarks/benchmark_transport_realtime_geometry_forward_fd.py --config examples/benchmarks/Solve_Transport_equations_wHe_radau_ntx_scan_runtime_database_vmec_realtime_geometry_benchmark_black_box.toml --parameter RBC:1:0 --accepted-step-limit 16 --radau-jacobian-reuse-mode legacy --geometry-fd-lane frozen_linearized --replay-mode accepted --fd-accepted-replay-contract reverse_frozen_metadata --initial-Er-root-ad jax_selected_root --initial-Er-root-fd-root-lane frozen_linearized"
+	User time (seconds): 3364.56
+	System time (seconds): 77.01
+	Percent of CPU this job got: 106%
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 53:38.57
+	Average shared text size (kbytes): 0
+	Average unshared data size (kbytes): 0
+	Average stack size (kbytes): 0
+	Average total size (kbytes): 0
+	Maximum resident set size (kbytes): 10449568
+	Average resident set size (kbytes): 0
+	Major (requiring I/O) page faults: 0
+	Minor (reclaiming a frame) page faults: 10673754
+	Voluntary context switches: 3852407
+	Involuntary context switches: 318544
+	Swaps: 0
+	File system inputs: 0
+	File system outputs: 329752
+	Socket messages sent: 0
+	Socket messages received: 0
+	Signals delivered: 0
+	Page size (bytes): 4096
+	Exit status: 0
+[autodiff-gate] device placement: requested=default default_backend=gpu selected_device=cuda:0
+[autodiff-gate] progress: baseline forward VMEC solve for frozen-linearized geometry FD (mboz=36, nboz=11)
+[NEOPAX] built runtime NTX scan database: rho=7 nu_v=16 Er_tilde=11 grid=(25,31,64) backend=vmec
+[autodiff-gate] progress: running baseline realtime rollout for FD trace
+E1015 21:16:12.455598  345424 slow_operation_alarm.cc:73] 
+********************************
+[Compiling module jit_scan for GPU] Very slow compile? If you want to file a bug, run with envvar XLA_FLAGS=--xla_dump_to=/tmp/foo and attach the results.
+********************************
+E1015 21:16:29.653781  345383 slow_operation_alarm.cc:140] The operation took 2m17.198269674s
+
+********************************
+[Compiling module jit_scan for GPU] Very slow compile? If you want to file a bug, run with envvar XLA_FLAGS=--xla_dump_to=/tmp/foo and attach the results.
+********************************
+[autodiff-gate] progress: preparing frozen-linearized initial-Er root branch for full-transport FD
+[autodiff-gate] progress: running realtime geometry fd_minus replay
+[NEOPAX] built runtime NTX scan database: rho=7 nu_v=16 Er_tilde=11 grid=(25,31,64) backend=vmec
+[autodiff-gate] progress: running fixed-final-state explicit geometry FD diagnostic
+[NEOPAX] built runtime NTX scan database: rho=7 nu_v=16 Er_tilde=11 grid=(25,31,64) backend=vmec
+[NEOPAX] built runtime NTX scan database: rho=7 nu_v=16 Er_tilde=11 grid=(25,31,64) backend=vmec
+[autodiff-gate] progress: running realtime geometry fd_plus replay
+[NEOPAX] built runtime NTX scan database: rho=7 nu_v=16 Er_tilde=11 grid=(25,31,64) backend=vmec
+[autodiff-gate] mode=transport_realtime_geometry_forward_fd parameter=ZBS:1:0 parameter_kind=realtime_geometry baseline_value=0.000000e+00 fd_step=3.394619e-07 replay_mode=accepted fd_accepted_replay_contract=reverse_frozen_metadata geometry_fd_lane=frozen_linearized root_fd_lane=frozen_linearized
+[autodiff-gate] objective values:
+  - softmax_Er: value=2.1347597195937237e+01
+  - net_total_power_volume_average_mw_m3: value=5.0807530056153805e-01
+  - Er2_volume_average: value=2.6970444770780875e+02
+  - Er_volume_average: value=-2.8511644595415109e+00
+  - electron_temperature_volume_average_keV: value=6.5667321668602181e+00
+  - total_pressure_volume_average: value=3.4217392410449378e+01
+  - alpha_power_volume_average_mw_m3: value=5.8919528056733395e-01
+  - bootstrap_current_softmax_abs_scaled: value=1.3717342728662278e+00
+  - Er_transition_rho: value=6.1293923577522791e-01
+  - Er_transition_location_moment: value=1.1293923577522791e-01
+  - Er_transition_strength: value=2.2261594486928726e+00
+[autodiff-gate] objective finite-difference gradients:
+  - softmax_Er: fd=6.355197e+00
+  - net_total_power_volume_average_mw_m3: fd=-6.421636e-03
+  - Er2_volume_average: fd=-3.304703e+02
+  - Er_volume_average: fd=1.430218e+01
+  - electron_temperature_volume_average_keV: fd=-3.999077e-02
+  - total_pressure_volume_average: fd=-2.376177e-01
+  - alpha_power_volume_average_mw_m3: fd=-6.887249e-03
+  - bootstrap_current_softmax_abs_scaled: fd=-1.204386e+00
+  - Er_transition_rho: fd=1.571683e-02
+  - Er_transition_location_moment: fd=1.571683e-02
+  - Er_transition_strength: fd=-1.968969e+00
+[autodiff-gate] fixed-final-state explicit geometry finite-difference gradients:
+  - softmax_Er: fd_explicit_geometry=0.000000e+00
+  - net_total_power_volume_average_mw_m3: fd_explicit_geometry=-6.395828e-03
+  - Er2_volume_average: fd_explicit_geometry=9.327123e-01
+  - Er_volume_average: fd_explicit_geometry=-1.724656e-01
+  - electron_temperature_volume_average_keV: fd_explicit_geometry=-3.981590e-02
+  - total_pressure_volume_average: fd_explicit_geometry=-2.375994e-01
+  - alpha_power_volume_average_mw_m3: fd_explicit_geometry=-6.865352e-03
+  - bootstrap_current_softmax_abs_scaled: fd_explicit_geometry=-7.970261e-01
+  - Er_transition_rho: fd_explicit_geometry=0.000000e+00
+  - Er_transition_location_moment: fd_explicit_geometry=0.000000e+00
+  - Er_transition_strength: fd_explicit_geometry=0.000000e+00
+[autodiff-gate] baseline-geometry final-state finite-difference gradients:
+  - softmax_Er: fd_final_state_geometry=6.355197e+00
+  - net_total_power_volume_average_mw_m3: fd_final_state_geometry=-2.580749e-05
+  - Er2_volume_average: fd_final_state_geometry=-3.314030e+02
+  - Er_volume_average: fd_final_state_geometry=1.447464e+01
+  - electron_temperature_volume_average_keV: fd_final_state_geometry=-1.748757e-04
+  - total_pressure_volume_average: fd_final_state_geometry=-1.828362e-05
+  - alpha_power_volume_average_mw_m3: fd_final_state_geometry=-2.189658e-05
+  - bootstrap_current_softmax_abs_scaled: fd_final_state_geometry=-4.073597e-01
+  - Er_transition_rho: fd_final_state_geometry=1.571683e-02
+  - Er_transition_location_moment: fd_final_state_geometry=1.571683e-02
+  - Er_transition_strength: fd_final_state_geometry=-1.968969e+00
+Wrote outputs/autodiff_transport_lagged_ntx/realtime_geometry_fd/ZBS_1_0_forward_fd_frozen_linearized_summary.json
+	Command being timed: "python examples/benchmarks/benchmark_transport_realtime_geometry_forward_fd.py --config examples/benchmarks/Solve_Transport_equations_wHe_radau_ntx_scan_runtime_database_vmec_realtime_geometry_benchmark_black_box.toml --parameter ZBS:1:0 --accepted-step-limit 16 --radau-jacobian-reuse-mode legacy --geometry-fd-lane frozen_linearized --replay-mode accepted --fd-accepted-replay-contract reverse_frozen_metadata --initial-Er-root-ad jax_selected_root --initial-Er-root-fd-root-lane frozen_linearized"
+	User time (seconds): 3358.60
+	System time (seconds): 77.18
+	Percent of CPU this job got: 106%
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 53:35.35
+	Average shared text size (kbytes): 0
+	Average unshared data size (kbytes): 0
+	Average stack size (kbytes): 0
+	Average total size (kbytes): 0
+	Maximum resident set size (kbytes): 10471296
+	Average resident set size (kbytes): 0
+	Major (requiring I/O) page faults: 0
+	Minor (reclaiming a frame) page faults: 10879214
+	Voluntary context switches: 3837835
+	Involuntary context switches: 342747
+	Swaps: 0
+	File system inputs: 0
+	File system outputs: 329736
+	Socket messages sent: 0
+	Socket messages received: 0
+	Signals delivered: 0
+	Page size (bytes): 4096
+	Exit status: 0
+(jax_env) exouser@neopax-22:~/NEOPAX$ 

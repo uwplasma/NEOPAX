@@ -93,13 +93,13 @@ the eleven derivatives, the largest relative error is 3.367259e-07; the new
 radius and location-moment rows each give 2.236e-08, and strength gives
 1.312e-07. These comparisons use the rounded `.6e` console gradients (seven
 significant digits). The
-[current AD/FD tables](../../reverse_ad_vs_fd_database.md#2026-10-15-transition-objective-adfd-comparison-current-eleven-row-case)
+[current AD/FD tables](../../reverse_ad_vs_fd_database.md#2026-10-15-boozer-aligned-fd-rerun-all-eight-dofs)
 contain the detailed comparisons and the eight-column matrix.
 
-The remaining seven FD runs have also completed. All six profile columns
+The first remaining-seven-DoF FD batch completed. All six profile columns
 match the AD baseline, with a largest relative derivative error of 1.948462e-06
-across all eleven objectives. Both geometry FD runs have different baseline
-values from AD, so their discrepancies are unresolved rather than a successful
+across all eleven objectives. Both geometry FD runs in that batch had different
+baseline values from AD, so those discrepancies did not establish a successful
 validation. For RBC/ZBS respectively, the apparent relative differences are
 7.249889%/6.297522% for radius and location, 24.208012%/17.115679% for strength,
 and 80.292974%/0.056215% for net power. The
@@ -114,4 +114,24 @@ used `(mboz, nboz) = (18, 18)` while the runtime used automatic `(36, 11)`.
 The FD command's mode flags remain appropriate. After updating the code, its
 geometry startup banner should print `(36, 11)`. Matching baselines and a
 refreshed AD geometry reference are still required before judging the
-corrected geometry derivatives. Only mocked/synthetic local checks are used.
+corrected geometry derivatives. Only mocked/synthetic local checks were used
+for that source correction.
+
+## Boozer-aligned remote FD rerun
+
+The user has now supplied the full eight-DoF FD rerun after the correction.
+All runs exited successfully. Both geometry banners report `(36, 11)`, and
+all 88 baseline objective values match the archived AD reference exactly at
+printed precision. The profile FD gradients are unchanged at printed
+precision. The observed geometry baseline mismatch is resolved in this rerun.
+
+Against the archived AD geometry columns, RBC/ZBS relative errors are now
+1.520258e-04/2.319614e-05 for radius and location moment,
+5.968463e-04/3.284039e-05 for strength, and
+4.998444e-04/5.595834e-06 for net power. Bootstrap has the largest remaining
+geometry differences, 3.220081e-03/7.550967e-03. The
+[updated tables](../../reverse_ad_vs_fd_database.md#2026-10-15-boozer-aligned-fd-rerun-all-eight-dofs)
+and [comparison CSV](database_transition_objectives_fd_boozer_aligned_16_2026-10-15.csv)
+record every pair and retain the before-fix discrepancies. A refreshed AD run
+after the shared-context correction is not included in the supplied evidence,
+so these comparisons remain explicitly against the older archived AD run.

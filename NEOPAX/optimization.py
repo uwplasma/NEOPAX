@@ -103,6 +103,7 @@ from ._reverse_ad_transport import (
 )
 from ._transport_flux_models import DENSITY_STATE_TO_PHYSICAL
 from .api import prepare_config
+from ._optimization_diagnostics import LeastSquaresDiagnostics
 
 
 def _resolve_qi_maxj_settings(
@@ -3229,6 +3230,12 @@ def least_squares(problem: GeometryLeastSquaresProblem, *, x0=None, **kwargs):
 
     iteration_reporter = kwargs.pop("iteration_reporter", None)
     initial_evaluation = kwargs.pop("initial_evaluation", None)
+    diagnostics_dir = kwargs.pop("diagnostics_dir", None)
+    if diagnostics_dir is not None and (
+        kwargs.get("method", "trf") != "trf" or kwargs.get("loss", "linear") != "linear"
+    ):
+        raise ValueError("Optimization diagnostics require method='trf' and loss='linear'.")
+    diagnostics = None
     cache: dict[tuple[float, ...], LeastSquaresEvaluation] = {}
     failed_cache: dict[tuple[float, ...], tuple[np.ndarray, np.ndarray, str]] = {}
     verbose = int(kwargs.get("verbose", 0) or 0)
@@ -3243,7 +3250,11 @@ def least_squares(problem: GeometryLeastSquaresProblem, *, x0=None, **kwargs):
             raise RuntimeError(f"cached failed least-squares trial: {failed_cache[key][2]}")
         evaluation = cache.get(key)
         if evaluation is None:
-            evaluation = problem.evaluate(jnp.asarray(x, dtype=jnp.float64))
+            if diagnostics is None:
+                evaluation = problem.evaluate(jnp.asarray(x, dtype=jnp.float64))
+            else:
+                with diagnostics.evaluation_scope():
+                    evaluation = problem.evaluate(jnp.asarray(x, dtype=jnp.float64))
             cache.clear()
             cache[key] = evaluation
         return evaluation
@@ -3253,6 +3264,8 @@ def least_squares(problem: GeometryLeastSquaresProblem, *, x0=None, **kwargs):
         failed = failed_cache.get(key)
         if failed is not None:
             residuals, _jacobian, reason = failed
+            if diagnostics is not None:
+                diagnostics.failure(x, None, phase="cached_residual", reason=reason)
             state["eval_count"] = int(state["eval_count"]) + 1
             if verbose:
                 print(
@@ -3264,6 +3277,8 @@ def least_squares(problem: GeometryLeastSquaresProblem, *, x0=None, **kwargs):
         try:
             residuals = np.asarray(jax.device_get(_evaluate(x).residuals), dtype=float)
         except Exception as exc:
+            if diagnostics is not None:
+                diagnostics.failure(x, exc, phase="residual_and_jacobian_evaluation")
             if _is_resource_exhaustion(exc):
                 raise
             if state["nres"] is None:
@@ -3280,6 +3295,8 @@ def least_squares(problem: GeometryLeastSquaresProblem, *, x0=None, **kwargs):
                     flush=True,
                 )
             return residuals
+        if diagnostics is not None:
+            diagnostics.evaluation(x, _evaluate(x))
         residuals = np.where(np.isfinite(residuals), residuals, 1.0e6)
         state["nres"] = int(residuals.size)
         state["eval_count"] = int(state["eval_count"]) + 1
@@ -3311,6 +3328,8 @@ def least_squares(problem: GeometryLeastSquaresProblem, *, x0=None, **kwargs):
         try:
             jacobian = np.asarray(jax.device_get(_evaluate(x).jacobian), dtype=float)
         except Exception as exc:
+            if diagnostics is not None:
+                diagnostics.failure(x, exc, phase="jacobian_evaluation")
             if _is_resource_exhaustion(exc):
                 raise
             if state["nres"] is None:
@@ -3325,6 +3344,8 @@ def least_squares(problem: GeometryLeastSquaresProblem, *, x0=None, **kwargs):
                     flush=True,
                 )
             return jacobian
+        if diagnostics is not None:
+            diagnostics.accepted(x)
         return np.where(np.isfinite(jacobian), jacobian, 0.0)
 
     x0 = np.asarray(jax.device_get(problem.x0 if x0 is None else x0), dtype=float)
@@ -3366,7 +3387,20 @@ def least_squares(problem: GeometryLeastSquaresProblem, *, x0=None, **kwargs):
     # scaled NEOPAX coordinates.  An explicit caller-supplied ``x_scale`` is
     # still respected.
     kwargs.setdefault("x_scale", np.ones((problem.parameter_count,), dtype=float))
-    return scipy_least_squares(_fun, x0, jac=_jac, **kwargs)
+    if diagnostics_dir is not None:
+        diagnostics = LeastSquaresDiagnostics(
+            diagnostics_dir, problem, bounds=kwargs.get("bounds", (-np.inf, np.inf)),
+            trust_scale=kwargs["x_scale"],
+        )
+    try:
+        result = scipy_least_squares(_fun, x0, jac=_jac, **kwargs)
+    except BaseException as exc:
+        if diagnostics is not None:
+            diagnostics.write("aborted", exception_type=type(exc).__name__, reason=str(exc))
+        raise
+    if diagnostics is not None:
+        diagnostics.finish(result)
+    return result
 
 
 __all__ = [

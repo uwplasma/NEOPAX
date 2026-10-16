@@ -95,3 +95,20 @@ AD geometry reference using the same code and resolution. First check that
 their baseline observables match. The archived pre-correction AD/FD values
 remain evidence of the mismatch, rather than validation data for the
 corrected setup. No expensive local physics test was run for this audit.
+
+## Subsequent remote confirmation
+
+Attachment `b1db715e-cb91-4f81-a93c-9bc8cb093fc0/Pasted text.txt` contains the
+complete eight-parameter FD rerun after the correction. Both geometry banners
+print `(36, 11)`, all eight runs succeed, and all 88 baseline objective values
+now match the archived AD run at printed precision. This numerically confirms
+that the observed baseline mismatch has been removed by the corrected setup.
+
+The [updated comparison](../../reverse_ad_vs_fd_database.md#2026-10-15-boozer-aligned-fd-rerun-all-eight-dofs)
+shows large reductions in the geometry discrepancies. For example, RBC
+net-power error versus the same archived AD column falls from 80.292974% to
+0.049984%, and RBC strength error from 24.208012% to 0.059685%. Bootstrap
+remains the largest geometry discrepancy at 0.322008% (RBC) and 0.755097%
+(ZBS). No refreshed post-correction AD run is present in this attachment;
+the comparison identifies its older AD reference accordingly. Raw output
+and all 88 pairs are archived without changing the previous results.

@@ -167,7 +167,7 @@ all six profile columns share the AD baseline and agree to a maximum relative
 error of 1.948462e-06 across all eleven objectives. The largest profile error
 for strength is 2.213691e-07, and for net power it is 3.666790e-07.
 
-Both geometry FD runs use a baseline whose root radius is
+The first pair of geometry FD runs used a baseline whose root radius is
 0.61290799115125838 instead of AD's 0.61293923577522791, strength is
 2.1958860308890658 instead of 2.2261594486928726, and volume-averaged net power
 is 0.50804023882399219 instead of 0.50807530056153805. Their apparent root
@@ -185,8 +185,22 @@ production runtime selected automatic `(36, 11)` for the same VMEC input.
 The helper now follows the runtime's optional-value handling, and geometry FD
 prints its resolved resolution. The same helper is used by AD geometry, so
 new geometry checks need a refreshed AD reference and matching baselines.
-The supplied command's replay/root flags were appropriate; no new full GPU
-comparison has yet verified the effect of the configuration correction.
+The supplied command's replay/root flags were appropriate. At the time of
+that correction, only mocked/synthetic checks had verified the change.
+
+The user has subsequently supplied the full eight-parameter FD rerun with
+geometry banners reporting `(36, 11)`. All runs succeed and all 88 baseline
+objective values match the archived AD reference at printed precision.
+The [new comparison](../reverse_ad_vs_fd_database.md#2026-10-15-boozer-aligned-fd-rerun-all-eight-dofs)
+confirms that the observed geometry baseline mismatch is resolved. Against
+the same archived AD columns, RBC/ZBS relative errors are 1.520258e-04/
+2.319614e-05 for radius/location, 5.968463e-04/3.284039e-05 for strength,
+and 4.998444e-04/5.595834e-06 for net power. Bootstrap remains at
+3.220081e-03/7.550967e-03. Profile gradients are unchanged at printed
+precision. These are comparisons with the older AD run; a refreshed AD
+reference using the corrected shared context remains outstanding. No new
+evidence resolves host-memory growth, failed trials, or behavior at the
+saved combined-optimization point.
 
 ### Independent derivative audit
 
@@ -236,6 +250,129 @@ point has not been established. In particular, correctness of local terminal
 cost derivatives does not certify the segmented transport reverse, selected
 initial-root pullback, momentum-corrected flux pullback, or VMEC transpose.
 No VMEC, NTX database, or full transport solves were run locally.
+
+### Interpretation after the benchmark gradient comparison (2026-10-15)
+
+The improved AD/FD agreement makes an omitted or identically zero transition
+derivative less likely at the benchmark point. It does not establish the
+full-final-time Jacobian at the saved optimized geometry, or explain why the
+optimizer stops making progress there.
+
+Re-reading the supplied combined-only logs gives a concrete rejected trial:
+
+| Quantity | Initial evaluation 1 | Trial evaluation 5 | Final accepted evaluation 29 |
+| --- | ---: | ---: | ---: |
+| Transition radius | 0.556547106 | 0.536939071 | 0.556570729 |
+| Transition-location cost | 0.905128115 | 0.263100495 | 0.906133480 |
+| Bootstrap cost | 0.431876241 | 0.227883226 | 0.323727376 |
+| Net power (MW) | 293.597137 | 274.038798 | 300.102792 |
+| Net-power cost | 1.87073863 | 30.7548979 | 0.000482147657 |
+| Total cost | 3.58735782 | 31.5602133 | 1.58009824 |
+
+Trial 5 improves both location and bootstrap, but its power error raises the
+total cost above the current point, so ordinary TRF rejects it. This is direct
+evidence that the evaluated trial points can move the root; it does not prove
+that this trial direction is the best available tradeoff. The subsequent
+accepted points favor correcting power while keeping the root near 0.55657.
+The geometry variables remain active in the combined problem; warm starting
+does not constrain the individual phase-1 objective values to improve.
+
+However, power accounts for only 0.030514 percent of the final accepted cost.
+The nominal power weight alone therefore does not establish why the later
+root plateau persists. Small objective cost also does not imply a small
+gradient or curvature: those depend on the weighted Jacobian. Bootstrap cost
+falls by 25.0416 percent over the run, while root location moves only
+2.3623e-05 and slightly worsens its target error. Strength is already above
+its target, so its inactive penalty is expected.
+
+At least six evaluations in the supplied excerpts (2, 7, 10, 16, 17, 18) fail
+in reverse AD. The least-squares adapter evaluates residuals and Jacobian
+together; an exception in that reverse computation is returned to SciPy as
+an all-1e6 residual vector. Thus derivative failures can cause rejection of
+trial points regardless of their physical objective values, restricting the
+search. The logs do not establish the first upstream nonfinite producer or
+prove that these failures alone cause the plateau.
+
+The solve terminates on the 30-function-evaluation budget, with first-order
+optimality about 127, rather than convergence. Function evaluations include
+rejected and failed trials; they are not 30 accepted iterations. Adding
+profile freedom changes the local step allocation and trajectory, even
+though holding profiles fixed still permits the geometry-only directions.
+
+The unresolved diagnosis is the balance of weighted Jacobian rows, parameter
+scales, bounds, and realized versus predicted reductions at the actual warm
+point, together with the failed reverse trials. The successful benchmark
+does not provide those quantities. Recording the already-computed residuals,
+Jacobians, and trial coordinates would permit that analysis without adding
+physics solves; no expensive local test was run for this log/source audit.
+
+### Diagnostics added for the next combined run
+
+The two-stage runner's combined phase, the simple combined runner, and the
+saved-geometry combined-only runner now default to `--diagnose-optimization`.
+Use `--no-diagnose-optimization` to disable it. The geometry-only phase does
+not enable this recorder. The core `optimization.least_squares` adapter
+accepts an optional `diagnostics_dir`; its ordinary default remains disabled.
+
+Each invocation creates a unique `run_*` subdirectory. For the saved-geometry
+runner this is under `OUT_DIR/optimization_diagnostics`; for the two-stage
+runner it is under `OUT_DIR/combined_diagnostics_mMODE`. Files contain:
+
+- `events.jsonl`: initial/accepted points distinguished from evaluated trials,
+  residual costs, geometry/profile Jacobian norms and `J.T @ r` contributions,
+  row-sensitivity correlations, singular values, physical coordinate scales,
+  trust scales, bounds, and the final SciPy status/optimality.
+- `trial_NNNN.npz`: each successful evaluation's unmodified residual vector,
+  full weighted Jacobian, optimizer coordinates, parameter/residual labels,
+  and physical coordinate scales. Nonfinite entries are recorded before the
+  adapter's existing residual/Jacobian replacement policy.
+- Trial records compare each step from the last accepted point against that
+  point's linear residual model, separating geometry/profile contributions
+  and reporting predicted versus actual changes. This is the unregularized
+  weighted residual model, not SciPy's internal augmented bounded-TRF ratio.
+- Failed-trial events retain coordinates, exception type, traceback filename,
+  the preceding linear model's prediction, and any terminal transport
+  objective values computed before the reverse failure. They identify the
+  first observed nonfinite reverse boundary when available.
+- Reverse checkpoint events inspect the terminal objective bars, each
+  segment's state/support bars and accumulated support, initial direct-RHS
+  and state pullbacks, selected-root contributions, initial-profile support,
+  and recorded scan boundaries. Entries identify affected objectives and
+  leaves, shapes, first nonfinite indices, and counts. Initial/final state
+  summaries include density/pressure/temperature ranges by species; selected
+  root masks include the number of selected roots and unselected indices.
+
+Acceptance is observed at SciPy's Jacobian request at its initial/accepted
+TRF points. A successful residual evaluation alone is not labeled accepted.
+The recorder supports the examples' linear-loss TRF path. A precomputed
+initial evaluation is saved without repeating its physics or reverse work;
+reverse checkpoints are active during subsequent delegated evaluations.
+
+The recorder keeps only small host arrays for the last trial and accepted
+linearization, and streams records to disk. It adds metadata reductions,
+synchronizations, small host linear algebra, and file I/O, but no forward
+solve, VJP, reverse-segment replay, or retained device-array history. It does
+not enable the older opt-in segment replay diagnostics. A first bad boundary
+locates a phase or segment; it does not identify an individual operation
+inside a compiled segment.
+
+GPU-only command continuing from the existing geometry result:
+
+```bash
+PYTHONPATH="$HOME/VMEX:$HOME/NTX/src" \
+python examples/optimization/optimize_geometry_profiles_from_geometry_result.py \
+  --geometry-result-dir outputs/geometry_qi_max_er_transition_bootstrap_net_power_initial_root_database_full_transport_optimization \
+  --out-dir outputs/combined_from_geometry_result_diagnostics \
+  --diagnose-optimization
+```
+
+Local verification ran only synthetic/mocked tests: 17 diagnostics/solver
+tests and 3 saved-result runner tests passed. A bounded scalar SciPy problem
+follows the same evaluation coordinates and count with diagnostics on/off;
+other checks cover rejected/failed versus accepted points, exact analytic
+step predictions, raw nonfinite Jacobian preservation, scan-guard failure
+provenance, root-mask/species-floor summaries, and fatal OOM propagation.
+No VMEC, NTX, transport, or GPU optimization was run locally.
 
 ### Remaining validation needed to explain the plateau
 

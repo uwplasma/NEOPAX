@@ -7,6 +7,7 @@ import dataclasses
 import jax
 import jax.numpy as jnp
 import numpy as np
+from ._optimization_diagnostics import reverse_checkpoint
 
 from ._ambipolarity import solve_ambipolarity_roots_radial_jax
 from ._entropy_models import get_entropy_model
@@ -54,6 +55,7 @@ def _nonfinite_tree_entries(tree, *, limit: int = 24):
 
 
 def _raise_if_nonfinite_recorded_scan_tree(tree, *, boundary: str):
+    reverse_checkpoint(f"recorded_scan/{boundary}", tree)
     entries = _nonfinite_tree_entries(tree)
     if entries:
         raise FloatingPointError(

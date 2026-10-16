@@ -118,3 +118,11 @@ and [full comparison CSV](database_transition_objectives_ad_fd_16_2026-10-15.csv
 with baseline-mismatch flags. Geometry validation remains unresolved; the
 seven geometry-only AD rows require their separate geometry checks. The
 original optimization issues remain open.
+
+The subsequent [Boozer-aligned FD rerun](../../reverse_ad_vs_fd_database.md#2026-10-15-boozer-aligned-fd-rerun-all-eight-dofs)
+now matches all 88 baseline values to this AD archive at printed precision.
+Its geometry discrepancies against this archive are greatly reduced; the
+[new CSV](database_transition_objectives_fd_boozer_aligned_16_2026-10-15.csv)
+contains the full comparison. This remains the pre-correction AD reference;
+the supplied rerun contains FD results only, so a refreshed AD reference is
+still outstanding.

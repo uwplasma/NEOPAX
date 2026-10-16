@@ -23,6 +23,7 @@ import jax.numpy as jnp
 import numpy as np
 
 from ._constants import elementary_charge
+from ._optimization_diagnostics import reverse_checkpoint, reverse_diagnostics_active, reverse_objective_values
 from ._geometry_autodiff import (
     boundary_param_entries,
     build_neopax_geometry_and_ntx_exact_lij_support_from_state,
@@ -4952,6 +4953,15 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
     else:
         initial_state = pre_root_initial_state
     initial_state = jax.block_until_ready(initial_state)
+    if reverse_diagnostics_active():
+        reverse_checkpoint("initial_state", {
+            "density": initial_state.density, "pressure": initial_state.pressure,
+            "temperature": initial_state.temperature, "Er": initial_state.Er,
+        }, summarize=True)
+        if initial_er_root_primal is not None:
+            reverse_checkpoint("initial_selected_root_primal", {
+                "Er": initial_er_root_primal[0], "finite_root_mask": initial_er_root_primal[1],
+            }, summarize=True)
     print(
         f"{progress_prefix} progress: support reverse profile-state vjp ready "
         f"elapsed_s={time.perf_counter() - phase_start:.3f}",
@@ -5840,7 +5850,17 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
         else:
             objective_payload_bar_rows.append(zero_payload_bar)
     objective_values = jnp.stack(objective_values_rows, axis=0)
+    reverse_objective_values(objective_values, objective_labels)
     final_y_bars = jnp.stack(final_y_bar_rows, axis=0)
+    reverse_checkpoint("terminal_objective_state_bars", final_y_bars,
+                       objective_labels=objective_labels)
+    if reverse_diagnostics_active():
+        diagnostic_final_state = reverse_setup.prepared_rollout.physics_context.unpack_flat(final_y_for_objective)
+        reverse_checkpoint("final_state", {
+            "density": diagnostic_final_state.density, "pressure": diagnostic_final_state.pressure,
+            "temperature": diagnostic_final_state.temperature, "Er": diagnostic_final_state.Er,
+        }, summarize=True)
+        del diagnostic_final_state
 
     cotangent_mode = str(
         getattr(reverse_setup.execution_context.physics_context, "reverse_stage_cotangent_mode", "full")
@@ -6055,6 +6075,10 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
         distinguishing a bad transport cotangent from a bad scan transpose.
         It is opt-in with the existing segment-input diagnostics flag.
         """
+        if reverse_diagnostics_active():
+            reverse_checkpoint(label, dict(zip(
+                support_leaf_labels, tuple(leaves)[:len(_zero_support_leaves)], strict=True,
+            )), objective_labels=objective_labels)
         if not (segment_input_diagnostics and use_database_table_reverse):
             return
         bad_rows = _batched_support_first_nonfinite_leaves(
@@ -6756,6 +6780,11 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
             reduced_bars, segment_support_bar_leaves = jax.block_until_ready(
                 (reduced_bars, segment_support_bar_leaves)
             )
+        reverse_checkpoint(f"segment_{segment_index + 1}_state_bars", reduced_bars,
+                           objective_labels=objective_labels)
+        _database_support_nonfinite_checkpoint(
+            f"segment_{segment_index + 1}_support_increment", segment_support_bar_leaves
+        )
         segment_bad_rows = None
         if segment_input_diagnostics:
             segment_bad_rows = _batched_support_first_nonfinite_leaves(
@@ -6867,6 +6896,9 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
         support_bar_leaves = tuple(
             accumulated + increment
             for accumulated, increment in zip(support_bar_leaves, segment_support_bar_leaves)
+        )
+        _database_support_nonfinite_checkpoint(
+            f"segment_{segment_index + 1}_support_accumulated", support_bar_leaves
         )
         step_support_bar_leaves_accum = tuple(
             accumulated + increment
@@ -7263,6 +7295,8 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
             reduced_prev_stages_are_zero=True,
         )
         direct_initial_support_bars = jax.block_until_ready(direct_initial_support_bars)
+        reverse_checkpoint("initial_direct_rhs_increment", direct_initial_support_bars,
+                           objective_labels=objective_labels)
         direct_initial_support_bar_leaves = tuple(
             jax.tree_util.tree_leaves(direct_initial_support_bars)
         )
@@ -7279,6 +7313,7 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
             flush=True,
         )
         _report_optimization_phase("initial_direct_rhs_support_pullback")
+        _database_support_nonfinite_checkpoint("after_initial_direct_rhs_reduced_zero", support_bar_leaves)
     phase_start = time.perf_counter()
     initial_native_ntx_elapsed = None
     initial_direct_geometry_elapsed = None
@@ -7402,6 +7437,8 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
         flush=True,
     )
     _report_optimization_phase("initial_state_pullback")
+    reverse_checkpoint("initial_state_pullback_bars", initial_state_bars,
+                       objective_labels=objective_labels)
     if phase_timing_diagnostics and initial_state_warm_call is not None:
         warm_start = time.perf_counter()
         jax.block_until_ready(initial_state_warm_call())
@@ -7685,6 +7722,8 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
             )
         initial_state_bars = pre_root_initial_state_bars
 
+    reverse_checkpoint("after_initial_state_and_selected_root", initial_state_bars,
+                       objective_labels=objective_labels)
     phase_start = time.perf_counter()
     if persistent_root_profile_gradient is None:
         if profile_state_pullback is None:
@@ -7696,6 +7735,8 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
     else:
         gradient_matrix = persistent_root_profile_gradient
     gradient_matrix = jax.block_until_ready(gradient_matrix)
+    reverse_checkpoint("profile_parameter_gradient", gradient_matrix,
+                       objective_labels=objective_labels)
     print(
         f"{progress_prefix} progress: support reverse profile parameter pullback ready "
         f"elapsed_s={time.perf_counter() - phase_start:.3f}",
@@ -7703,6 +7744,8 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
     )
     _report_optimization_phase("profile_parameter_pullback")
     if initial_er_root_support_bars is not None:
+        reverse_checkpoint("initial_selected_root_support_increment", initial_er_root_support_bars,
+                           objective_labels=objective_labels)
         raw_initial_er_root_support_bar_leaves = tuple(initial_er_root_support_bars)
         if len(raw_initial_er_root_support_bar_leaves) != len(support_bar_leaves):
             raise ValueError(
@@ -7912,6 +7955,8 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
             lambda state_bar: initial_support_pullback(state_bar)[0]
         )(initial_state_bars)
         initial_support_bars = jax.block_until_ready(initial_support_bars)
+        reverse_checkpoint("initial_profile_support_increment", initial_support_bars,
+                           objective_labels=objective_labels)
         print(
             f"{progress_prefix} progress: support reverse initial-profile scan payload pullback ready "
             f"elapsed_s={time.perf_counter() - phase_start:.3f}",
@@ -7935,6 +7980,10 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
                 support_bars, initial_support_rows, strict=True
             )
         )
+    if reverse_diagnostics_active():
+        reverse_checkpoint("after_initial_profile_before_scan_fold", {
+            label: bar for label, bar in zip(objective_labels, support_bars, strict=True)
+        })
     return (
         objective_values,
         gradient_matrix,
