@@ -760,7 +760,134 @@ excerpt analysis does not prove a global profile limitation or justify
 calling the result a converged compromise. No physics solve or FD test was
 run for this additional analysis.
 
-## 5. Original geometry-stage reproducibility report
+## 5. Profile-only run and remaining temperature-floor cancellation (2026-10-16)
+
+The new profile-only console excerpt is archived byte-for-byte as
+[raw output](benchmarks/profiles_only_from_geometry_result_diagnostics_2026-10-16.txt),
+with a [nine-evaluation table](benchmarks/profiles_only_from_geometry_result_diagnostics_2026-10-16.csv).
+Its SHA256 is `e633c87a1a14ddbb741708fa12c57bc5bf3fa8e2f3fbb1627d2cc5a41a0809e2`.
+The source attachment is `1ba95249-e402-41cc-a64f-00dbbdd63c20/Pasted text.txt`.
+The excerpt ends after failed trial 9 and writing trial-10 inputs; it contains
+no final solver result. The remote diagnostic directory is
+`outputs/profiles_only_from_geometry_result_diagnostics/optimization_diagnostics/run_l_h39qze`.
+
+The optimizer has six parameters and an `(11,6)` Jacobian, and its geometry
+observables/costs stay fixed. Only trial 5 is marked accepted after the initial
+point. Trial 6 returns a larger cost and is not accepted. Trials 2, 3, 4, 7, 8,
+and 9 fail with all 5304 entries of the `(13,408)` transport state cotangent
+nonfinite. Their first bad boundaries are segments 4, 4, 3, 4, 5, and 5
+respectively. The failure therefore persists when geometry coordinates are
+fixed, before the initial-root and final geometry pullbacks.
+
+| Quantity | Initial | Accepted trial 5 |
+| --- | ---: | ---: |
+| Total cost | 3.58735782 | 1.73138136 |
+| Root radius, target 0.514 | 0.556547106 | 0.556556881 |
+| Location cost | 0.905128115 | 0.905544066 |
+| Bootstrap cost | 0.431876241 | 0.446222432 |
+| Net power, MW | 293.597137 | 299.999246 |
+| Power cost | 1.87073863 | 2.59642e-08 |
+
+Power-cost reduction is 1.87073860; location and bootstrap costs worsen by
+0.000415951 and 0.014346191 (bootstrap +3.32 percent). This explains the total
+cost reduction but does not establish a converged profile optimum. The six
+failed derivatives exclude most attempted candidates in this partial run.
+RSS rises from 6321.3 to 8003.9 MiB; the sampled GPU peak stays at 5879575296
+bytes. The console lacks the profile coordinates and per-row Jacobians needed
+to assess predicted versus actual changes for this particular run.
+
+### Confirmed numerical bug still present after the earlier packed-floor fix
+
+The historical fix is commit `dbb5c76`, "Stabilize transport temperature-floor
+pullback". It replaced a divide/multiply temperature-floor calculation only
+in `_transport_solvers._project_packed_transport_state_arrays`.
+The general helper `_state.apply_transport_temperature_floor` still used
+`safe_n * maximum(pressure / safe_n, T_floor)`.
+
+This remaining helper is on the current database reverse path:
+
+1. `_flat_rhs_direct_black_box_state_pullback_factory` calls the equation
+   system's `pullback_direct_rhs_state`.
+2. `ComposedEquationSystem.pullback_direct_rhs_state` accumulates direct and
+   flux state bars and calls `_prepare_working_state_pullback`.
+3. That method differentiates `_prepare_working_state`, which applies density
+   flooring, the fixed-temperature projection, and the general temperature
+   floor. The general floor is also called by the face-state/flux builders.
+
+Above the temperature floor, the pressure map is mathematically the identity.
+Its density derivative should therefore be zero. Differentiating the quotient
+and product separately instead creates opposing density bars. Roundoff leaves
+a spurious density contribution, and sufficiently large finite incoming bars
+produce overflowing intermediate terms and `inf - inf`.
+
+A small CPU-only reproducer using the original helper, at densities including
+`1e-6` and temperature 12.5, observed:
+
+- Unit incoming pressure bars: spurious density bars of order `1e-15`.
+- Incoming pressure bars `1e150`: spurious density bars of order `1e135`.
+- Incoming pressure bars `3e307`: NaN density bars in eager mode and infinite
+  density bars under JIT, although the true density bars are zero and the true
+  pressure bars are finite `3e307`.
+
+The helper now uses `maximum(pressure, safe_n * T_floor)`, matching the earlier
+packed projection fix. For positive floored density this is the same physical
+floor, including the half derivative selected at equality. It removes the
+cancelling quotient/product without clipping or replacing any cotangent.
+Floating-point round trips in the old inactive branch can differ by an ulp;
+bitwise equality of long adaptive trajectories is not claimed.
+
+`tests/test_temperature_floor_pullback_stability.py` checks inactive-floor
+identity derivatives through the large-bar range, scalar/species floors,
+equality derivatives, the disabled-floor no-op, and the actual composed RHS
+preparation transpose with a fixed helium temperature. The new inactive-floor
+test failed on the previous implementation before the patch. The patched
+floor/replay/diagnostics/lifecycle suite passes 31 small tests.
+
+An additional existing state/equation-helper selection returned 24 passes and
+two unrelated baseline failures: an obsolete assertion that the deliberately
+no-op `apply_er_dirichlet_boundary_state` should clamp cell centers, and a
+missing `jax` import in the floating-edge-node test. Those tests and the
+boundary helper were not changed. The prior packed-floor regression and the
+initial zero-density/fixed-temperature regression both pass in that selection.
+
+This establishes a numerical defect in a live reverse path. It does **not**
+yet prove that it is the only cause of the remote trial failures: the console
+does not record the arithmetic operation or incoming-bar magnitude inside the
+first failing compiled segment. A GPU evaluation of an existing failing point
+is still needed. Segment-state checkpoints now include finite magnitudes per
+objective, using the already-computed bars and no extra RHS/VJP evaluation.
+
+### Reevaluate one saved failing point instead of rerunning optimization
+
+The saved-result runner now accepts `--replay-diagnostics` and `--replay-trial`.
+It reads the coordinates directly from `trial` or `failed_trial` events,
+checks labels, physical scales, baseline profiles, and the coordinate mode,
+and runs one fresh full objective/AD evaluation after ordinary problem setup.
+There is no nominal objective evaluation, optimizer, plotting, or penalty
+fallback. This is a fresh adaptive trajectory at the saved coordinates, not
+a replay of the original recorded Radau stages. Source diagnostics are read
+only; new inputs and diagnostics are written under the replay output.
+
+After syncing this patch to the GPU machine:
+
+```bash
+cd ~/NEOPAX
+PYTHONPATH="$HOME/VMEX:$HOME/NTX/src" \
+python examples/optimization/optimize_geometry_profiles_from_geometry_result.py \
+  --geometry-result-dir outputs/geometry_qi_max_er_transition_bootstrap_net_power_initial_root_database_full_transport_optimization \
+  --profile-only \
+  --replay-diagnostics outputs/profiles_only_from_geometry_result_diagnostics/optimization_diagnostics/run_l_h39qze \
+  --replay-trial 2 \
+  --out-dir outputs/profiles_only_reverse_replay_trial_0002
+```
+
+`replay_summary.json` records success or the original error, and the new
+`replay_diagnostics/run_*/events.jsonl` records reverse checkpoints and the
+small residual/Jacobian snapshot when available. Nonfinite returned arrays
+are preserved separately, and exceptions propagate instead of becoming an
+artificial optimizer penalty. No such GPU evaluation has been run locally.
+
+## 6. Original geometry-stage reproducibility report
 
 The user also reported that phase 1 of the original two-stage script did not
 match the standalone geometry-only optimization result. Mocked setup checks

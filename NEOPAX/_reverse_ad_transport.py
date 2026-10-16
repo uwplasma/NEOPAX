@@ -6781,7 +6781,7 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
                 (reduced_bars, segment_support_bar_leaves)
             )
         reverse_checkpoint(f"segment_{segment_index + 1}_state_bars", reduced_bars,
-                           objective_labels=objective_labels)
+                           objective_labels=objective_labels, summarize=True)
         _database_support_nonfinite_checkpoint(
             f"segment_{segment_index + 1}_support_increment", segment_support_bar_leaves
         )

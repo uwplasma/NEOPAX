@@ -52,8 +52,13 @@ def apply_transport_temperature_floor(
     if density is None or pressure is None:
         return state
     safe_n = safe_density(density, density_floor)
-    safe_t = safe_temperature(pressure / safe_n, temperature_floor)
-    return dataclasses.replace(state, pressure=safe_n * safe_t)
+    # For positive safe_n, n * max(p / n, T_min) = max(p, n * T_min).
+    # Apply the floor in pressure space, as the packed Radau projection does.
+    # The divide/multiply form introduces cancelling density cotangents even
+    # when the floor is inactive. Large accumulated adjoints can turn that
+    # cancellation into inf - inf, contaminating an otherwise finite VJP.
+    pressure_floor = safe_n * _broadcast_species_floor(pressure, temperature_floor)
+    return dataclasses.replace(state, pressure=jnp.maximum(pressure, pressure_floor))
 
 
 @jax.jit

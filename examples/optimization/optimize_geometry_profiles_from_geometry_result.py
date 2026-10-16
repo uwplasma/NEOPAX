@@ -54,10 +54,19 @@ from examples.optimization import (  # noqa: E402
 class Stage2ArgumentParser(argparse.ArgumentParser):
     def parse_args(self, *args, **kwargs):
         parsed = super().parse_args(*args, **kwargs)
+        if (parsed.replay_diagnostics is None) != (parsed.replay_trial is None):
+            self.error("--replay-diagnostics and --replay-trial must be supplied together.")
+        if parsed.replay_trial is not None and parsed.replay_trial < 1:
+            self.error("--replay-trial must be positive.")
+        if parsed.plot_profiles_only and parsed.replay_trial is not None:
+            self.error("--plot-profiles-only cannot be combined with trial replay.")
         if parsed.out_dir is None:
-            parsed.out_dir = ROOT / "outputs" / (
+            name = (
                 "profiles_from_geometry_result" if parsed.profile_only else "combined_from_geometry_result"
             )
+            if parsed.replay_trial is not None:
+                name += f"_replay_trial_{parsed.replay_trial:04d}"
+            parsed.out_dir = ROOT / "outputs" / name
         return parsed
 
 
@@ -80,6 +89,10 @@ def parser():
                      help="Compare starting/optimized density and temperature at t=0; no extra transport solve.")
     out.add_argument("--plot-profiles-only", action="store_true",
                      help="Plot an existing stage-2 --out-dir and exit without building a physics problem.")
+    out.add_argument("--replay-diagnostics", type=Path,
+                     help="Existing diagnostics run directory or events.jsonl to read for a one-trial replay.")
+    out.add_argument("--replay-trial", type=int,
+                     help="Reevaluate this saved trial once, with reverse checks and no optimizer or initial evaluation.")
     out.add_argument("--enable-cuda-command-buffers", action="store_true",
                      help="Enable CUDA graphs; the default avoids the reported graph-instantiation OOM.")
     return out
@@ -327,6 +340,75 @@ def plot_saved_initial_profiles(out_dir, fallback_config):
     )
 
 
+def load_replay_trial(path, trial, problem):
+    """Read successful or failed coordinates from existing diagnostics."""
+    path = Path(path)
+    if path.is_dir():
+        path /= "events.jsonl"
+    setup = None
+    selected = None
+    with path.open(encoding="utf-8") as source:
+        for line in source:
+            event = json.loads(line)
+            if event["event"] == "setup":
+                setup = event
+            if event["event"] in {"trial", "failed_trial"} and event["trial"] == trial:
+                selected = event
+                break
+    if setup is None or selected is None:
+        raise ValueError(f"Missing setup or trial {trial} in {path}.")
+    if tuple(setup["parameter_labels"]) != tuple(problem.parameter_labels):
+        raise ValueError("Saved replay parameter labels differ; use the original --profile-only mode.")
+    if setup.get("profile_coordinate_mode") != problem.profile_coordinate_mode:
+        raise ValueError("Saved replay profile coordinate mode differs from this problem.")
+    np.testing.assert_allclose(setup["physical_scales"], jax.device_get(problem.x_scale), rtol=1e-12, atol=0)
+    if setup.get("baseline_profile_values") is not None:
+        np.testing.assert_allclose(setup["baseline_profile_values"],
+                                   jax.device_get(problem.baseline_profile_values), rtol=1e-12, atol=0)
+    x = np.asarray(selected["x"], dtype=float)
+    if x.shape != (problem.parameter_count,) or not np.all(np.isfinite(x)):
+        raise ValueError("Saved replay coordinates have an invalid shape or value.")
+    return path, setup, selected, x
+
+
+def replay_saved_trial(problem, *, source, trial, out_dir):
+    """One full evaluation of saved coordinates, with no penalty fallback."""
+    path, setup, previous, x = load_replay_trial(source, trial, problem)
+    out_dir = Path(out_dir)
+    sink = opt.LeastSquaresDiagnostics(
+        out_dir / "replay_diagnostics", problem,
+        bounds=combined.scaled_bounds(problem),
+        trust_scale=setup.get("trust_scales") or 1.,
+    )
+    summary = {"source_events": str(path.resolve()), "source_trial": int(trial),
+               "previous_event": previous["event"], "previous_reason": previous.get("reason"),
+               "parameter_labels": list(problem.parameter_labels), "x": x.tolist(),
+               "diagnostics_dir": str(sink.directory), "physics_evaluations": 1}
+    print(f"[trial replay] source_trial={trial} previous_event={previous['event']} "
+          f"parameter_count={problem.parameter_count} optimizer=skipped", flush=True)
+    try:
+        with sink.evaluation_scope():
+            evaluation = problem.evaluate(x)
+        residual, jacobian = jax.device_get((evaluation.residuals, evaluation.jacobian))
+        if not (np.all(np.isfinite(residual)) and np.all(np.isfinite(jacobian))):
+            np.savez(out_dir / "replay_nonfinite.npz", x=x, residuals=residual, jacobian=jacobian)
+            raise FloatingPointError("Trial replay returned a nonfinite residual or Jacobian.")
+        sink.evaluation(x, evaluation)
+        summary.update(success=True, cost=warm._cost(evaluation), jacobian_shape=list(jacobian.shape),
+                       elapsed_s=float(evaluation.elapsed_s),
+                       objective_values={name: float(jax.device_get(value))
+                                         for name, value in evaluation.result.objective_values.items()})
+        print(f"[trial replay] finite=True cost={summary['cost']:.8e} "
+              f"{combined.geometry_example.iteration_diagnostics(evaluation)}", flush=True)
+    except Exception as exc:
+        sink.failure(x, exc, phase="saved_trial_replay")
+        summary.update(success=False, reason=str(exc), exception_type=type(exc).__name__)
+        raise
+    finally:
+        (out_dir / "replay_summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
+    return 0
+
+
 def main():
     args = parser().parse_args()
     saved = load_geometry_result(args.geometry_result_dir)
@@ -358,10 +440,13 @@ def main():
     if args.profile_only:
         problem = ProfileOnlyProblem(problem, full_x0)
     x0 = np.asarray(problem.x0).copy() if args.profile_only else full_x0
-    problem = combined.TrialSavingProblem(problem, out_dir / "combined_inputs")
+    trial_subdir = "replay_inputs" if args.replay_trial is not None else "combined_inputs"
+    problem = combined.TrialSavingProblem(problem, out_dir / trial_subdir)
     if args.diagnose_memory:
         phase = "profiles_from_saved_geometry" if args.profile_only else "combined_from_saved_geometry"
         problem = warm.MemoryDiagnosticProblem(problem, phase)
+    if args.replay_trial is not None:
+        return replay_saved_trial(problem, source=args.replay_diagnostics, trial=args.replay_trial, out_dir=out_dir)
     problem.input_from_scaled_parameters(x0).to_indata(out_dir / "input.QI_combined_initial")
     initial_profiles = combined.profile_parameter_values(problem, x0)
     (out_dir / "profile_parameters_initial.json").write_text(json.dumps(initial_profiles, indent=2), encoding="utf-8")
