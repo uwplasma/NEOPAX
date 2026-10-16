@@ -945,6 +945,274 @@ not nonfinite returned optimizer residuals; the finite check above covers the
 actual residual and Jacobian arrays. No physics test was run locally to
 archive or analyze this result.
 
+### Restarted profile-only optimization still encounters nonfinite adjoints
+
+The subsequent partial GPU run is archived as
+[raw output](benchmarks/profiles_only_from_geometry_result_floor_fix_2026-10-16.txt)
+and a [six-evaluation table](benchmarks/profiles_only_from_geometry_result_floor_fix_2026-10-16.csv).
+Source attachment: `22b8a05a-a155-4a0d-bc44-6b0275e53624/Pasted text.txt`,
+26893 bytes, SHA256
+`c7533109a6ddd6d43aa204ac6de07ad58b4d74004d2e6eaea8bac65caaeaafbb`.
+The console shows the update from `85527a5` to `4925ed5`; that update archives
+the successful saved-point evaluation. Diagnostics are under
+`outputs/profiles_only_from_geometry_result_floor_fix/optimization_diagnostics/run_q_i_mrcl`.
+The excerpt ends after trial 6 and contains no final optimizer result.
+
+| Trial | Outcome | Cost | Accepted transport steps | First failure |
+| --- | --- | ---: | ---: | --- |
+| 1 | Initial | 3.58735728 | 262 | None |
+| 2 | Failed reverse | -- | 260 | Segment 5/6 state bars |
+| 3 | Accepted | 1.72184763 | 272 | None |
+| 4 | Failed forward guard | -- | 500 | Time 0.01926165, target 2.0 |
+| 5 | Returned, not accepted | 455.079736 | 211 | None |
+| 6 | Failed reverse | -- | 214 | Segment 3/5 state bars |
+
+Both reverse failures have all 5304 entries of the `(13,408)` state cotangent
+nonfinite at the first bad segment boundary, affecting all 13 objective rows.
+The initial-root and recorded-scan failures occur downstream of that boundary.
+This locates the failure within the transport reverse sweep, but does not yet
+identify the first arithmetic operation or distinguish growing finite bars
+from a local singular/nonfinite derivative.
+
+Trial 3 achieves 299.955995 MW, while root radius moves from 0.556547106 to
+0.556552745 and bootstrap cost grows from 0.431876249 to 0.436776359. Trial 5
+does move the root substantially, to 0.595853596, with geometry fixed; its
+399.374399 MW raises power cost to 450.62338 and it is rejected. Root dependence
+on profiles is therefore present, but this partial run does not establish a
+usable root-improving optimization trajectory.
+
+Memory samples return to approximately 48.49 MB in live device arrays after
+successful evaluations. Failed reverse evaluations retain approximately
+450.3 MB at the sample boundary, and RSS rises from 6333.2 to about 9588 MiB.
+The sampled device peak stays near 5.882 GB. These six evaluations do not
+establish that the earlier memory-growth issue is resolved, nor show the old
+CUDA-graph OOM failure recurring.
+
+### Saved and newly proposed trial 2 have different profile coordinates
+
+The user compared `replay_summary.json` from the passing saved-point evaluation
+with the new run's `failed_trial` event. The result is
+`Identical coordinates: False`. All six supplied coordinates and their
+physical conversions are saved in the
+[coordinate comparison](benchmarks/profiles_only_trial_0002_coordinate_comparison_2026-10-16.csv).
+The profile map is `physical = baseline * (1 + delta)`.
+
+| Parameter | Passing saved trial 2 | Failing new trial 2 |
+| --- | ---: | ---: |
+| Density shape power, delta | 0.13597657278247482 | 0.17562346680591331 |
+| Density shape power, physical | 11.35976572782475 | 11.756234668059133 |
+| Density shape alpha, delta | -0.28967563749252079 | -0.20675781451513051 |
+| Density shape alpha, physical | 0.7103243625074792 | 0.7932421854848695 |
+
+The ordinal trial number is not a shared parameter point. The passing saved
+point takes 268 transport steps after the floor patch, while the newly proposed
+failing point takes 260. Thus the new failure does not establish that the
+previously passing coordinates now fail. Equally, different coordinates alone
+do not prove that evaluation history is irrelevant: the new failed coordinates
+have not yet been reevaluated in a fresh process.
+
+The floor fix removes a confirmed cancellation defect and the saved-point
+evaluation now passes. It has not resolved nonfinite AD throughout profile
+optimization. Why the optimizer chooses a different first step is a separate
+question. The initial cost changes only by about `5.4e-7`, but the initial
+adaptive trajectory changes from 264 to 262 accepted steps. Comparing the
+existing initial-point residual/Jacobian snapshots can measure the derivative
+change without running transport:
+
+- Old: `outputs/profiles_only_from_geometry_result_diagnostics/optimization_diagnostics/run_l_h39qze/trial_0001.npz`.
+- New: `outputs/profiles_only_from_geometry_result_floor_fix/optimization_diagnostics/run_q_i_mrcl/trial_0001.npz`.
+
+Before attributing the step change to derivatives, compare the snapshots' `x`,
+parameter labels, residual labels and physical scales, plus the setup events'
+bounds and trust scales. The existing per-segment summaries in the new
+`events.jsonl` can also show whether finite cotangent magnitudes grow before
+the failing boundary. Neither analysis requires a new physics evaluation.
+
+### Starting Jacobians explain the changed optimizer proposal
+
+The user compared the two `trial_0001.npz` files. Assertions confirm identical
+starting coordinates, parameter labels, residual labels, and physical scales.
+The transcribed active-row residuals and printed Jacobian entries are saved in
+[the Jacobian comparison](benchmarks/profiles_only_initial_jacobian_comparison_2026-10-16.csv),
+and all six reported singular values in
+[the spectrum comparison](benchmarks/profiles_only_initial_jacobian_spectrum_2026-10-16.csv).
+These files preserve the precision printed by the user; they are not copies of
+the full-precision NPZ arrays.
+
+| Active weighted residual row | Old residual | New residual | Relative change in Jacobian row, 2-norm | New cost-gradient norm |
+| --- | ---: | ---: | ---: | ---: |
+| Root location moment | 1.345457628517308 | 1.345457627189546 | 1.8520% | 0.1012507 |
+| Bootstrap penalty | 0.929382849866232 | 0.9293828586068804 | 1.1875% | 3.2303542 |
+| Net power | -1.934289856848892 | -1.9342895731232934 | 1.0027% | 821.3169044 |
+
+Here the relative row change is `norm(J_new - J_old) / norm(J_old)`, and each
+cost-gradient norm is `abs(residual) * norm(J_row)` in the six relative profile
+coordinates. These are differences between two AD calculations, not FD error
+estimates or proof of long-trajectory derivative accuracy. The power row's
+density-shape entries change proportionally more: power derivative with respect
+to relative density-shape power changes from -0.635516939 to -0.5099569165
+(-19.76% in magnitude), and density-shape alpha from -0.05064997072 to
+-0.08083370919 (+59.59% in magnitude). Both entries are small compared with
+the power row's n0 and T0 entries.
+
+The reported full `(11,6)` Jacobian has only three effective singular values:
+about 424.6, 0.3160, and 0.01739 in the new run; the remaining values are at
+`3.3e-14` or below. Geometry is fixed, the raw root/strength diagnostic rows
+have zero weight, and the strength-deficit penalty is already satisfied. The
+three active transport rows therefore constrain only three combinations of
+six profile variables at first order. The largest-to-third singular-value
+ratio is approximately 24413. This expected local rank deficiency is not
+evidence of a broken AD calculation.
+
+A bounded linear TRF calculation reproduces both actual optimizer proposals
+using the printed active-row Jacobians, their residuals, the nominal profile
+bounds from the source, unit trust scaling, and 11 residual rows with active
+rows at positions 6, 9, and 10. Maximum absolute coordinate discrepancies are
+`2.19e-9` for the old step and `3.11e-9` for the new step. The nontransport
+constant costs and negligible inactive derivatives are omitted from this
+small model. This establishes that the supplied changes in the starting
+residual/Jacobian are sufficient to explain the different first steps; an
+optimizer-setting change is not needed to reproduce them. It does not explain
+the numerical origin of the derivative differences.
+
+Both steps target almost the same linearized objective change:
+
+| Model prediction using each run's own Jacobian | Old proposal | New proposal |
+| --- | ---: | ---: |
+| Root-radius change | -6.61325e-6 | -6.68047e-6 |
+| Net-power change, MW | +6.36183473 | +6.36181342 |
+
+Root-radius changes divide the weighted location residual change by
+`sqrt(1000)`. Power changes multiply the weighted power residual change by
+`331.0187969899648 / 100`. Approximately 97.47% of the squared difference
+between the two coordinate steps lies in the null space of either three-row
+linear model. Substantially different density shapes can therefore serve
+nearly the same predicted improvement. The new initial power cost-gradient
+norm is about 8112 times the root-location cost-gradient norm, and bootstrap
+and power sensitivity rows have cosine 0.995899. These are local properties;
+they do not establish behavior after power is matched or convergence of the
+full nonlinear optimization.
+
+The analysis is reproducible without importing JAX, NEOPAX, VMEC, or NTX:
+
+```bash
+python docs/benchmarks/analyze_profiles_only_initial_jacobians_2026-10-16.py --linear-trf
+```
+
+The tiny NumPy/SciPy analysis completed locally. It performs only matrix
+operations and two bounded linear least-squares calculations with six
+variables; no transport, geometry, or FD physics test was run. In this
+reconstruction it matters to keep 11 residual rows: SciPy's dense trust-region
+helper uses the original row count in its full-rank test. A three-row
+underdetermined toy problem follows a different numerical decision and is
+not used as the reconstruction above.
+
+The remaining nonfinite transport state adjoint in new trials 2 and 6 remains
+open. The small optimizer Jacobian's rank deficiency does not identify the
+failure mechanism in the large per-step Radau adjoint solve. Existing segment
+magnitude summaries can distinguish modest incoming bars from accumulation
+toward overflow before deciding whether further one-point instrumentation is
+needed.
+
+### Moderate segment inputs precede the remaining reverse failures
+
+The user extracted existing state-bar magnitude summaries from
+`run_q_i_mrcl/events.jsonl` for failed trials 2 and 6. All eleven supplied
+segment summaries are archived in
+[the segment-state table](benchmarks/profiles_only_floor_fix_segment_state_bars_2026-10-16.csv).
+
+| Trial | Last good reverse boundary | Minimum state bar | Maximum state bar | First bad boundary |
+| --- | --- | ---: | ---: | --- |
+| 2 | Segment 6 | -30.949954685288905 | 24.14319394675477 | Segment 5 |
+| 6 | Segment 4 | -29.595924348132215 | 24.709024827054503 | Segment 3 |
+
+Trial 6's earlier segment 5 is also finite, ranging from -35.68151748227225
+to 24.56835936834783. At every bad boundary the finite min/max fields are
+`null`, consistent with the previously reported all-5304-entry contamination.
+All earlier reverse boundaries remain bad after the first failure.
+
+The incoming state bars at the last good boundaries are modest. Already huge
+state bars arriving from a later segment are therefore not the observed
+starting condition. Each failing segment still contains 50 accepted steps;
+the summaries do not exclude rapid amplification within those steps or a
+single local nonfinite derivative/solve. They do not identify helium flooring
+as the cause of these new failures.
+
+The current example selects `reverse_stage_adjoint_solve_mode="block"`,
+`reverse_stage_adjoint_memory_mode="default"`, and
+`reverse_rhs_transpose_mode="explicit_database"`. In that lane the stage
+matrix uses forward-mode RHS Jacobians. The subsequent state transpose also
+uses forward-mode Jacobians; it does not use the compact direct-state VJP
+selected by the explicit-database-Jacobian alternatives. The earlier general
+floor fix changes live RHS preparation, but the current failing component
+must be identified rather than assumed to be that previous VJP defect.
+
+### Opt-in component checks for one saved failing point
+
+`NEOPAX_REVERSE_STEP_DIAGNOSTICS=1` enables finite-input/nonfinite-output
+checks in the existing objective-batched reverse step:
+
+- Final-state projection transpose.
+- Stage-adjoint RHS scaling.
+- Dense stage-adjoint solve and its already-built matrix summary.
+- RHS state pullback.
+- Addition of the direct and RHS state bars.
+
+Messages have prefix `[reverse-step-first-nonfinite]` and report the component,
+transport time, timestep, incoming absolute maximum, surviving finite-output
+absolute maximum and nonfinite count. The current dense block lane also
+reports matrix finiteness, nonfinite count/first row and column, finite
+absolute maximum, and minimum absolute diagonal. A finite matrix with a bad
+solve output is distinguished from an already nonfinite matrix; the summary
+does not compute or claim a condition number or identify a scalar operation
+inside matrix assembly.
+
+The scalar print condition is outside objective vmaps to avoid their batching
+rule executing both print branches. Already nonfinite inputs do not generate
+more transition messages. The stage solve can produce both its detailed
+matrix message and the enclosing step-component message at the same time.
+No full matrix, per-step history, or extra RHS, Jacobian, factorization, VJP,
+or frozen-adjoint comparison is recorded or evaluated. The flag adds scalar
+checks and debug effects and can change compilation; it is not an identical
+GPU executable. It must be set before starting a fresh process.
+
+After writing the first bad segment checkpoint, an instrumented run raises
+immediately rather than propagating its bad state bars through the remaining
+segments, initial-root pullback and recorded-scan fold. With the environment
+flag unset, the existing mathematics, solve layout and failure policy remain
+unchanged. This is diagnostic instrumentation, not a fix for the remaining AD
+failure.
+
+After syncing the patch to the GPU machine, reevaluate the **new** failed trial
+2, rather than the old trial 2 that already passed:
+
+```bash
+cd ~/NEOPAX
+set -o pipefail
+NEOPAX_REVERSE_STEP_DIAGNOSTICS=1 \
+PYTHONPATH="$HOME/VMEX:$HOME/NTX/src" \
+python examples/optimization/optimize_geometry_profiles_from_geometry_result.py \
+  --geometry-result-dir outputs/geometry_qi_max_er_transition_bootstrap_net_power_initial_root_database_full_transport_optimization \
+  --profile-only \
+  --replay-diagnostics outputs/profiles_only_from_geometry_result_floor_fix/optimization_diagnostics/run_q_i_mrcl \
+  --replay-trial 2 \
+  --out-dir outputs/profiles_only_floor_fix_trial_0002_step_diagnostics \
+  2>&1 | tee outputs/profiles_only_floor_fix_trial_0002_step_diagnostics.log
+```
+
+This is one fresh adaptive forward/reverse evaluation at the stored six
+coordinates, with fixed saved geometry and no optimizer or nominal objective
+evaluation. A fresh passing result would be evidence to investigate evaluation
+history or compilation/trajectory sensitivity, rather than a reproduced
+failure. The new GPU evaluation has not yet been run in this workspace.
+
+Local validation used only small arrays, synthetic four-state analytic RHS
+functions and mocked optimization/replay setup: 32 unittest checks and 20
+existing analytic Radau checks pass. The new checks cover a finite-to-NaN
+scan transition emitting once, finite-operand overflow, finite/singular/
+nonfinite 2x2 stage matrices with one matrix assembly, and the opt-in host
+segment guard. No expensive transport, VMEC, NTX or FD test was run locally.
+
 ## 6. Original geometry-stage reproducibility report
 
 The user also reported that phase 1 of the original two-stage script did not

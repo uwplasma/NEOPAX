@@ -22,6 +22,12 @@ import jax.numpy as jnp
 import numpy as np
 from scipy.special import roots_jacobi
 
+from ._reverse_step_diagnostics import (
+    reverse_step_diagnostics_enabled,
+    reverse_step_finite_transition,
+    reverse_step_matrix_summary,
+)
+
 
 TIME_SOLVER_REGISTRY: dict[str, Callable[..., "TransportSolver"]] = {}
 
@@ -7601,6 +7607,10 @@ def _execute_radau_accepted_step_next_reduced_cotangent_batched_bwd_with_support
         _, project_pullback = jax.vjp(physics_context.project_flat, primal_result.trial_y)
         trial_y_bars = jax.vmap(lambda bar: project_pullback(bar)[0])(trial_y_bars)
     _database_trace("after_state_projection_pullback", trial_y_bars)
+    reverse_step_finite_transition(
+        "state_projection_pullback", next_reduced_bars.y, trial_y_bars,
+        t=carry_in.t, dt=primal_result.trial_dt,
+    )
     shared_stage_jacobian = _radau_database_shared_stage_jacobian_enabled(
         physics_context, lagged_response
     )
@@ -7611,6 +7621,10 @@ def _execute_radau_accepted_step_next_reduced_cotangent_batched_bwd_with_support
         * trial_y_bars[:, None, :]
     )
     _database_trace("stage_adjoint_rhs_dz", dz_bars)
+    reverse_step_finite_transition(
+        "stage_adjoint_rhs", trial_y_bars, dz_bars,
+        t=carry_in.t, dt=primal_result.trial_dt,
+    )
     memory_mode = str(getattr(physics_context, "reverse_stage_adjoint_memory_mode", "default")).strip().lower()
     with _radau_reverse_profile_scope(
         physics_context, "reverse_segment/stage_adjoint_solve"
@@ -7641,6 +7655,10 @@ def _execute_radau_accepted_step_next_reduced_cotangent_batched_bwd_with_support
                 rhs=dz_bars.reshape((dz_bars.shape[0], -1)),
             )
     _database_trace("stage_adjoint_solution", residual_bars)
+    reverse_step_finite_transition(
+        "stage_adjoint_solution", dz_bars, residual_bars,
+        t=carry_in.t, dt=primal_result.trial_dt,
+    )
     if bool(getattr(physics_context, "reverse_segment_input_diagnostics", False)):
         component_values_finite = (
             jnp.all(jnp.isfinite(trial_y_bars))
@@ -7777,6 +7795,14 @@ def _execute_radau_accepted_step_next_reduced_cotangent_batched_bwd_with_support
     y_bars = trial_y_bars + jnp.asarray(residual_y_bars, dtype=kernel_context.dtype)
     _database_trace("after_rhs_state_pullback", residual_y_bars)
     _database_trace("step_outgoing_y_before_rebuild", y_bars)
+    reverse_step_finite_transition(
+        "rhs_state_pullback", residual_bars, residual_y_bars,
+        t=carry_in.t, dt=primal_result.trial_dt,
+    )
+    reverse_step_finite_transition(
+        "state_bar_addition", (trial_y_bars, residual_y_bars), y_bars,
+        t=carry_in.t, dt=primal_result.trial_dt,
+    )
     lagged_cache_bars = _add_tangent_trees(
         residual_lagged_bars,
         next_reduced_bars.lagged_response_cache,
@@ -15085,6 +15111,7 @@ def _radau_solve_exact_stage_residual_transpose_block(
     lagged_response,
     *,
     rhs,
+    return_matrix_summary: bool = False,
 ):
     """Solve the exact stage-residual transpose system from stage Jacobian blocks."""
     rhs_arr = jnp.asarray(rhs, dtype=kernel_context.dtype).reshape((-1,))
@@ -15095,7 +15122,10 @@ def _radau_solve_exact_stage_residual_transpose_block(
         primal_result,
         lagged_response,
     )
-    return jnp.linalg.solve(matrix.T, -rhs_arr).reshape((-1,))
+    solution = jnp.linalg.solve(matrix.T, -rhs_arr).reshape((-1,))
+    if return_matrix_summary:
+        return solution, reverse_step_matrix_summary(matrix)
+    return solution
 
 
 def _radau_diagnose_exact_vs_frozen_stage_adjoint_batched(
@@ -15872,6 +15902,22 @@ def _radau_solve_exact_stage_residual_transpose_batched(
         "block_frozen_forward_jacobian",
     }:
         raise ValueError(f"Unknown reverse_stage_adjoint_solve_mode '{mode}'.")
+    if reverse_step_diagnostics_enabled():
+        # Keep the existing objective-vmapped solve. Only reduce its already
+        # materialized matrix; never build a second matrix or frozen solve.
+        solution, matrix_summaries = jax.vmap(
+            lambda rhs_row: _radau_solve_exact_stage_residual_transpose_block(
+                kernel_context, physics_context, carry_in, primal_result,
+                lagged_response, rhs=rhs_row, return_matrix_summary=True,
+            )
+        )(rhs_arr)
+        matrix_summary = jax.tree_util.tree_map(lambda x: x[0], matrix_summaries)
+        # Outside the objective vmap, so one transition emits one message.
+        reverse_step_finite_transition(
+            "stage_adjoint_dense_solve", rhs_arr, solution,
+            t=carry_in.t, dt=primal_result.trial_dt, details=matrix_summary,
+        )
+        return solution
     solution = jax.vmap(
         lambda rhs_row: _radau_solve_exact_stage_residual_transpose_block(
             kernel_context,

@@ -24,6 +24,7 @@ import numpy as np
 
 from ._constants import elementary_charge
 from ._optimization_diagnostics import reverse_checkpoint, reverse_diagnostics_active, reverse_objective_values
+from ._reverse_step_diagnostics import check_reverse_segment_state
 from ._geometry_autodiff import (
     boundary_param_entries,
     build_neopax_geometry_and_ntx_exact_lij_support_from_state,
@@ -6782,6 +6783,7 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
             )
         reverse_checkpoint(f"segment_{segment_index + 1}_state_bars", reduced_bars,
                            objective_labels=objective_labels, summarize=True)
+        check_reverse_segment_state(reduced_bars.y, segment_index + 1)
         _database_support_nonfinite_checkpoint(
             f"segment_{segment_index + 1}_support_increment", segment_support_bar_leaves
         )

@@ -1,0 +1,12 @@
+trial,segment,all_finite,min_finite,max_finite
+2,6,True,-30.949954685288905,24.14319394675477
+2,5,False,,
+2,4,False,,
+2,3,False,,
+2,2,False,,
+2,1,False,,
+6,5,True,-35.68151748227225,24.56835936834783
+6,4,True,-29.595924348132215,24.709024827054503
+6,3,False,,
+6,2,False,,
+6,1,False,,
