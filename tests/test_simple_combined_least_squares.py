@@ -190,6 +190,39 @@ def test_simple_combined_postprocess_restores_forward_progress_flags():
     assert base["profiles"] == {"n0": 4.21, "T0": 17.8}
 
 
+def test_forward_transport_report_matches_optimizer_jacobian_reuse(monkeypatch, tmp_path):
+    """Build solver settings only; a fresh report must keep the optimized case."""
+    from examples.optimization import (
+        optimize_geometry_profiles_qi_max_er_transition_bootstrap_net_power_initial_root_database_full_transport_simple_least_squares
+        as example,
+    )
+    from NEOPAX._transport_solvers import build_time_solver
+
+    geometry = example.geometry_example
+    args = example.parser().parse_args(())
+    config = geometry.transport_config(args)
+    captured = {}
+
+    class Input:
+        def to_indata(self, path):
+            path.write_text("mock geometry input", encoding="utf-8")
+
+    def capture_report(report_config):
+        captured.update(report_config)
+        return "report-not-run"
+
+    monkeypatch.setattr(geometry, "run_config", capture_report)
+    assert geometry.write_transport_report(Input(), "optimized", config, tmp_path) == "report-not-run"
+    report_settings = captured["transport_solver"]
+    optimizer_settings = dict(report_settings)
+    optimizer_settings["radau_jacobian_reuse_mode"] = example._problem_kwargs(args, None)["radau_jacobian_reuse_mode"]
+    forward_solver = build_time_solver(report_settings)
+    optimizer_solver = build_time_solver(optimizer_settings)
+    assert forward_solver.jacobian_reuse_mode == optimizer_solver.jacobian_reuse_mode
+    assert report_settings["debug_stage_markers"] is True
+    assert report_settings["debug_walltime_attempts"] is True
+
+
 def test_simple_combined_profile_trust_multiplier_leaves_geometry_at_unit_scale():
     from examples.optimization import (
         optimize_geometry_profiles_qi_max_er_transition_bootstrap_net_power_initial_root_database_full_transport_simple_least_squares

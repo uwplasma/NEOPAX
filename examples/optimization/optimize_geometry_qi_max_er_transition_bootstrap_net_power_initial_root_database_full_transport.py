@@ -246,6 +246,9 @@ def transport_config(args: argparse.Namespace) -> dict:
     solver = config.setdefault("transport_solver", {})
     solver["t_final"] = float(TRANSPORT_FINAL_TIME)
     solver["max_steps"] = int(TRANSPORT_MAX_STEPS)
+    # The optimization API already forces this policy. Keep fresh forward
+    # reports on it too, instead of silently falling back to retry_only.
+    solver["radau_jacobian_reuse_mode"] = "legacy"
     return config
 
 
