@@ -4726,6 +4726,7 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
     objective_labels: Sequence[str],
     dependencies: RealtimeGeometrySupportReverseDependencies,
     progress_prefix: str = "[autodiff-gate]",
+    replay_jacobian_reuse_mode: str | None = None,
 ):
     """Return all objective values, profile gradients, and support cotangents.
 
@@ -4739,6 +4740,13 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
         raise TypeError(
             "dependencies must be a RealtimeGeometrySupportReverseDependencies instance."
         )
+    if replay_jacobian_reuse_mode not in {None, "legacy", "recorded_forward"}:
+        raise ValueError(f"Unknown replay Jacobian reuse mode: {replay_jacobian_reuse_mode!r}.")
+    replay_uses_forward_setup = (
+        replay_jacobian_reuse_mode == "recorded_forward"
+        or (replay_jacobian_reuse_mode is None
+            and dependencies.segment_replay_minimal_with_primal_records is not None)
+    )
     objective_labels = tuple(str(label) for label in objective_labels)
     if not objective_labels:
         raise ValueError("objective_labels must contain at least one objective.")
@@ -4788,7 +4796,19 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
             dependencies.segment_replay_minimal_with_primal_records
         )
         if optimization_replay is None:
-            # Exact existing benchmark path.
+            if force_jacobian_rebuild is not None:
+                result = _radau_segment_replay_minimal_with_primal_records_call(
+                    execution_context, segment_start_carry,
+                    (*segment_arrays, force_jacobian_rebuild), validate_primal=True,
+                )
+                active, valid = jax.device_get((segment_arrays[0], result[2].replay_valid))
+                bad = np.flatnonzero(np.asarray(active, dtype=bool) & ~np.asarray(valid, dtype=bool))
+                if bad.size:
+                    raise FloatingPointError(
+                        f"Invalid primal replay at slot={int(bad[0])}; transport adjoint was not evaluated."
+                    )
+                return result
+            # Exact existing benchmark path when replay reuse is unchanged.
             return _radau_segment_replay_minimal_with_primal_records_call(
                 execution_context,
                 segment_start_carry,
@@ -5197,8 +5217,12 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
     # Keep the recorded forward Newton rebuild choices without replaying or
     # differentiating rejected attempts. Only one boolean per attempt is stored.
     forward_rebuild_mask = None
+    if replay_jacobian_reuse_mode == "recorded_forward" and (
+        schedule_artifact is None or getattr(schedule_artifact, "jacobian_reused", None) is None
+    ):
+        raise ValueError("recorded_forward replay requires the recorded forward Newton reuse decisions.")
     if (
-        dependencies.segment_replay_minimal_with_primal_records is not None
+        replay_uses_forward_setup
         and schedule_artifact is not None
         and getattr(schedule_artifact, "jacobian_reused", None) is not None
     ):
@@ -8836,6 +8860,7 @@ def internal_realtime_geometry_transport_reverse_table_result_builder(
     max_reverse_accepted_steps: int | None = None,
     realtime_geometry_component_pullbacks: bool = False,
     progress_label: str | None = None,
+    reverse_replay_jacobian_reuse_mode: str | None = None,
     raw_block_solve: GeometryRawBlockSolve | None = None,
     segment_replay_optimization_stage_builder: Callable[..., object] | None = None,
     bootstrap_optimization_stage_builder: Callable[..., object] | None = None,
@@ -8894,6 +8919,7 @@ def internal_realtime_geometry_transport_reverse_table_result_builder(
         or configured_er_transition_rho_softness != 0.05
         or configured_er_transition_softmax_beta != 16.0
         or configured_objective_labels != TRANSPORT_REVERSE_OBJECTIVE_LABELS
+        or reverse_replay_jacobian_reuse_mode is not None
     ):
         # This callback is created once with the table builder, not once per
         # evaluation. Its identity is therefore stable across optimizer
@@ -8937,6 +8963,7 @@ def internal_realtime_geometry_transport_reverse_table_result_builder(
                 *args,
                 objective_labels=configured_objective_labels,
                 dependencies=configured_objective_dependencies,
+                replay_jacobian_reuse_mode=reverse_replay_jacobian_reuse_mode,
                 **kwargs,
             )
 
@@ -9495,6 +9522,7 @@ def internal_realtime_geometry_transport_reverse_table_result_builder(
                     *args,
                     objective_labels=configured_objective_labels,
                     dependencies=optimization_dependencies,
+                    replay_jacobian_reuse_mode=reverse_replay_jacobian_reuse_mode,
                     **kwargs,
                 )
 

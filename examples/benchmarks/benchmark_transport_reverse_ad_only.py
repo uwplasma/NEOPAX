@@ -4010,6 +4010,44 @@ def _make_realtime_geometry_support_segment_table_result_builder(
     )
 
 
+def _validate_replay_jacobian_reuse_mode(args, config) -> str:
+    """Select only the Newton-cache decisions used by accepted-step replay."""
+    mode = str(getattr(args, "reverse_replay_jacobian_reuse_mode", None) or "legacy")
+    if mode == "legacy":
+        return mode
+    if mode != "recorded_forward":
+        raise ValueError(f"Unknown replay Jacobian reuse mode: {mode!r}.")
+    if (
+        not args.full_transport_shared_payload_smoke
+        or args.reverse_parameter_mode != "profiles_plus_realtime_geometry"
+        or args.realtime_geometry_gradient_path != "reverse_payload"
+        or args.initial_er_root_only_optimization_smoke
+        or args.transport_solver_forward_smoke
+        or config.get("neoclassical", {}).get("flux_model") != "ntx_scan_runtime"
+    ):
+        raise ValueError(
+            "recorded_forward replay requires the ntx_scan_runtime "
+            "full-transport shared-payload smoke with realtime geometry reverse_payload."
+        )
+    solver = config.get("transport_solver", {})
+    if solver.get("transport_solver_backend", solver.get("integrator", "radau")) != "radau":
+        raise ValueError("recorded_forward replay requires the Radau solver.")
+    if (
+        args.reverse_segment_length is None
+        or args.reverse_segment_length <= 0
+        or args.reverse_segment_start_replay_mode != "minimal"
+        or args.reverse_segment_primal_record_mode != "reuse_segment_primal_record"
+        or args.reverse_schedule_artifact_mode != "reuse_static_probe"
+        or getattr(args, "reverse_database_segment_support_mode", "inline") != "inline"
+    ):
+        raise ValueError(
+            "recorded_forward replay requires a positive reverse segment "
+            "length, minimal segment-start replay, reuse_segment_primal_record and "
+            "reuse_static_probe with inline segment support so the recorded forward Newton setup is used."
+        )
+    return mode
+
+
 def _run_realtime_geometry_optimization_api_smoke(
     *,
     args,
@@ -4023,6 +4061,7 @@ def _run_realtime_geometry_optimization_api_smoke(
 ):
     """Exercise the production-style transport least-squares API on the benchmark path."""
 
+    replay_jacobian_reuse_mode = _validate_replay_jacobian_reuse_mode(args, config)
     geometry_param_specs = _geometry_param_specs_from_args(args, geometry_context)
     include_profile_dofs = str(getattr(args, "optimization_api_profile_dofs", "include")) == "include"
     profile_parameter_order = (
@@ -4097,6 +4136,7 @@ def _run_realtime_geometry_optimization_api_smoke(
     if bool(getattr(args, "full_transport_shared_payload_smoke", False)):
         print(
             "[autodiff-gate] progress: full-transport reverse stage-adjoint "
+            f"replay_jacobian_reuse_mode={replay_jacobian_reuse_mode} "
             f"solve mode={args.reverse_stage_adjoint_solve_mode} "
             f"rhs_pullback_mode={args.reverse_rhs_pullback_mode} "
             f"initial_cache_support_pullback_mode={args.reverse_initial_cache_support_pullback_mode} "
@@ -4221,6 +4261,7 @@ def _run_realtime_geometry_optimization_api_smoke(
                 args.realtime_geometry_component_pullbacks
             ),
             progress_label="[autodiff-gate] full-transport shared payload:",
+            reverse_replay_jacobian_reuse_mode=replay_jacobian_reuse_mode,
         )
         request = realtime_geometry_transport_reverse_table_request(
             objective_names=objective_names,
@@ -4294,6 +4335,8 @@ def _run_realtime_geometry_optimization_api_smoke(
         "reverse_table_timing_diagnostics": bool(args.reverse_table_timing_diagnostics),
         "reverse_segment_profiler_trace_dir": args.reverse_segment_profiler_trace_dir,
         "shared_payload_smoke": bool(getattr(args, "full_transport_shared_payload_smoke", False)),
+        "reverse_replay_jacobian_reuse_mode": replay_jacobian_reuse_mode,
+        "all_finite": bool(np.isfinite(residuals_np).all() and np.isfinite(jacobian_np).all()),
         "reverse_database_initial_support_mode": args.reverse_database_initial_support_mode,
         "reverse_database_initial_state_mode": args.reverse_database_initial_state_mode,
         "reverse_database_support_preparation_mode": args.reverse_database_support_preparation_mode,
@@ -4327,6 +4370,7 @@ def _run_realtime_geometry_optimization_api_smoke(
         f"objective={args.objective} "
         f"residual_count={len(result.residual_labels)} "
         f"parameter_count={len(result.parameter_labels)} "
+        f"replay_jacobian_reuse_mode={replay_jacobian_reuse_mode} all_finite={report['all_finite']} "
         f"elapsed_s={elapsed_s:.3f}",
         flush=True,
     )
@@ -4335,13 +4379,18 @@ def _run_realtime_geometry_optimization_api_smoke(
         print(f"  - {label}: residual={residuals_np[row_i]:.16e}")
         for parameter_name, value in zip(result.parameter_labels, jacobian_np[row_i].tolist()):
             print(f"      d{label}/d{parameter_name}: jac={value:.16e}")
-    outpath = _report_path(
+    report_name = (
         "full_transport_shared_payload_smoke"
         if bool(getattr(args, "full_transport_shared_payload_smoke", False))
         else "optimization_api_smoke"
     )
+    if replay_jacobian_reuse_mode != "legacy":
+        report_name += f"_replay_jacobian_{replay_jacobian_reuse_mode}"
+    outpath = _report_path(report_name)
     outpath.write_text(json.dumps(report, indent=2))
     print(f"Wrote {outpath.relative_to(ROOT)}")
+    if not report["all_finite"]:
+        raise FloatingPointError(f"Nonfinite AD residuals/Jacobian; raw values saved to {outpath}.")
 
 
 def _run_initial_er_root_only_optimization_api_smoke(
@@ -6065,6 +6114,17 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--reverse-replay-jacobian-reuse-mode",
+        choices=("legacy", "recorded_forward"),
+        default="legacy",
+        help=(
+            "Accepted-step replay's Newton Jacobian reuse decisions only. legacy "
+            "recomputes reuse from the replay cache; recorded_forward follows the "
+            "recorded forward rebuild decisions and checks reconstruction. "
+            "Root, bootstrap and geometry implementations stay on the benchmark path."
+        ),
+    )
+    parser.add_argument(
         "--max-reverse-accepted-steps",
         type=int,
         default=None,
@@ -6872,6 +6932,10 @@ def main() -> None:
         radau_jacobian_reuse_mode=args.radau_jacobian_reuse_mode,
     )
     _apply_transport_solver_backend_override(config, args.transport_solver_backend_override)
+    try:
+        _validate_replay_jacobian_reuse_mode(args, config)
+    except ValueError as exc:
+        parser.error(str(exc))
     if bool(args.diagnose_database_runtime_build_timing):
         config.setdefault("diagnostics", {})["database_runtime_build_timing"] = True
     if bool(args.transport_solver_forward_smoke) and args.accepted_step_limit is not None:

@@ -1757,6 +1757,98 @@ found matching configuration, objective definitions, builder arguments,
 starting coordinates, and least-squares options. That is a source/plumbing
 check, not numerical trajectory parity. This original report remains open.
 
+### Geometry-only optimization after the replay correction (2026-10-17)
+
+The user supplied the standalone geometry-only run at `c6a1cca`, using the
+corrected reverse implementation from `e83a143`. The complete supplied excerpt
+is archived as [raw output](benchmarks/geometry_only_net_power_root_bootstrap_replay_fix_2026-10-17.txt),
+with an [evaluation table](benchmarks/geometry_only_net_power_root_bootstrap_replay_fix_2026-10-17.csv)
+and [replay endpoint table](benchmarks/geometry_only_net_power_root_bootstrap_replay_fix_2026-10-17_segments.csv).
+Source attachment: `a1bed547-bce0-4e92-ba61-57c1a3ee3c04/Pasted text.txt`,
+134380 bytes, SHA256
+`b69e29806135e0b3e191aeeabf6acb7cf5b243dcfbbfb88710f13a5b3071f4b1`.
+
+The output directory is
+`outputs/geometry_only_net_power_root_bootstrap_replay_fix`.
+There are 24 RBC/ZBS variables, no profile DoFs, max mode 2, database grid
+`(25,25,33)`, and the surrogate QI backend. The new location/strength objectives
+are enabled with target radius 0.514 and strength 0.9. Old left/right targets
+and max-Er are disabled; bootstrap and net power are enabled. The log confirms
+the intended geometry-only setup. This is not an accidental profile-only run.
+
+| Quantity | Initial | Best/final report | Target |
+| --- | ---: | ---: | ---: |
+| Total cost | 17335.8986 | 2461.26980 | 0 |
+| Reported transition location | 0.117510582 | 0.371065463 | 0.514 |
+| Crossing strength | -3.26833863 | -1.18145509 | at least 0.9 |
+| Location cost | 78.6019292 | 10.2151409 | 0 |
+| Strength deficit cost | 868.752348 | 216.622766 | 0 |
+| Bootstrap penalty cost | 38.4796343 | 0.0919853288 | 0 |
+| Net power (reference-volume MW) | 898.570402 | 78.7782990 | 300 |
+| Net-power cost | 16349.1497 | 2233.16158 | 0 |
+
+The optimizer exhausts 30 function evaluations with first-order optimality
+`2.84e5`. This is a stalled, unsatisfactory result, despite its initial cost
+reduction. The crossing-strength condition is still violated; the reported
+soft transition location should not be interpreted as proof of an existing
+physical crossing. A much better saved geometry is already known: its
+nominal-profile evaluation in the stage-2 evidence gives cost about 3.58736,
+power 293.597 MW and positive strength 1.75939 with the current objective
+definitions. This run does not establish that the targets are incompatible.
+
+Two trials fail: evaluation 2 has a typed VMEC equilibrium/Jacobian failure;
+evaluation 4 fails to reach transport final time, stopping at
+`0.0018070356365332645` instead of 2. They must not both be described as VMEC
+failures. The CSV has an initial report, 30 optimizer evaluations (including
+those two failed trials), and the final report: 32 rows in total.
+
+All 44 reported replay endpoints have exactly zero absolute/scaled
+differences. The final report reproduces best evaluation 27's cost,
+transition location/strength, bootstrap cost and power at printed precision.
+There is no reported CUDA OOM or replay-endpoint mismatch. These observations
+support primal replay consistency at the checked boundaries; they do not
+independently validate the geometry objective Jacobian.
+
+Source/history inspection confirms that geometry-only coordinates still use
+the dedicated ESS parameterization, and unit SciPy trust scaling was introduced
+in `540ef7c8` on 2026-09-16, before the replay correction. The replay correction
+did not introduce that scaling convention. No causal attribution to scaling
+or to the replay correction is established by this log.
+
+There is a separate validation gap: `optimization.least_squares._jac` still
+uses `np.where(np.isfinite(jacobian), jacobian, 0.0)`. The standalone geometry
+runner does not enable `diagnostics_dir` or save raw Jacobian snapshots.
+Consequently finite costs and a lack of printed AD exceptions cannot prove
+that all Jacobian entries were finite. The log does not establish that this
+replacement actually occurred. The existing 16-step AD/FD checks concern a
+different trajectory and setup; full-time geometry derivatives at this
+stalled point remain unverified. Do not label the optimizer regression solved
+or prescribe more evaluations/changed weights as an established fix.
+
+This update only parses supplied logs and reviews source/history; no local
+VMEC, NTX, transport or finite-difference physics test was run. The log ends
+after the final objective report, before stage-input/summary/postprocessing
+completion messages, so those later artifacts are not confirmed by this
+excerpt.
+
+### Opt-in 16-step benchmark using the corrected replay
+
+The AD benchmark now has `--reverse-replay-jacobian-reuse-mode` with default
+`legacy` and opt-in `recorded_forward`. Only the accepted-step replay's Newton
+reuse/rebuild decisions change, with replay validity and endpoint checks.
+The root, bootstrap, geometry and adjoint implementations remain on the
+existing benchmark path; no optimization stage factories are substituted.
+Benchmark objectives and physical parameter columns remain the same, allowing
+comparison with the earlier 18-by-8 AD/FD case. Reports
+have separate filenames and record the mode and an all-entry finiteness check;
+nonfinite residuals/Jacobians are preserved in JSON and cause a failed exit.
+This does not change the optimizer adapter's nonfinite handling discussed
+above. See the [16-step GPU command and reuse selector](benchmarks/database_transition_objectives_ad_fd.md#replay-jacobian-reuse-comparison-2026-10-17).
+Local checks use mocked benchmark wiring/reporting plus tiny synthetic replay
+equations: 17 tests and 33 subtests, plus four existing mocked geometry/stage
+and tiny replay-cache checks pass. No local physics evaluation or remote AD
+result for this setting is claimed.
+
 ## Evidence
 
 Remote output directory:

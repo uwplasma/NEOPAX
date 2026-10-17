@@ -1,6 +1,9 @@
 """Scalar synthetic Radau replay/guard regressions; no transport or VMEC/NTX."""
 
 import dataclasses
+import ast
+import inspect
+from types import SimpleNamespace
 
 import jax
 import jax.numpy as jnp
@@ -10,6 +13,71 @@ import pytest
 from NEOPAX import _transport_solvers as solvers
 from NEOPAX._optimization_full_transport_stage import _validate_database_primal_replay
 from NEOPAX._reverse_step_diagnostics import check_primal_replay_endpoint
+from NEOPAX import _reverse_ad_transport as reverse
+
+
+def _core_replay_nodes():
+    source = inspect.getsource(reverse.realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_vector)
+    return ast.parse(source).body[0].body
+
+
+def _benchmark_segment_replay():
+    function = next(node for node in _core_replay_nodes()
+                    if isinstance(node, ast.FunctionDef) and node.name == "_segment_replay_minimal_with_primal_records")
+    namespace = {"jax": jax, "np": np,
+                 "dependencies": SimpleNamespace(segment_replay_minimal_with_primal_records=None),
+                 "_radau_segment_replay_minimal_with_primal_records_call":
+                     solvers._radau_segment_replay_minimal_with_primal_records_call}
+    exec(compile(ast.Module(body=[function], type_ignores=[]), "<benchmark-replay>", "exec"), namespace)
+    return namespace[function.name]
+
+
+def test_benchmark_reuse_selector_filters_rejected_attempts_and_preserves_production_default():
+    body = _core_replay_nodes()
+    selection = next(node for node in body if isinstance(node, ast.Assign)
+                     and any(isinstance(target, ast.Name) and target.id == "replay_uses_forward_setup"
+                             for target in node.targets))
+    start = next(i for i, node in enumerate(body) if isinstance(node, ast.Assign)
+                 and any(isinstance(target, ast.Name) and target.id == "forward_rebuild_mask"
+                         for target in node.targets))
+    code = compile(ast.Module(body=[selection, *body[start:start + 3]], type_ignores=[]), "<replay-mask>", "exec")
+    trace = SimpleNamespace(active_mask=np.array([True, True, True, True, False]),
+                            accepted_mask=np.array([True, False, True, True, False]),
+                            jacobian_reused=np.array([False, False, True, False, False]))
+    for mode, adapter in (("legacy", None), ("recorded_forward", None), (None, None), (None, object())):
+        namespace = {"np": np, "jax": jax, "replay_jacobian_reuse_mode": mode,
+                     "dependencies": SimpleNamespace(segment_replay_minimal_with_primal_records=adapter),
+                     "schedule_artifact": trace, "segmented_replay_arrays": (np.zeros((2, 2)),)}
+        exec(code, namespace)
+        if mode == "recorded_forward" or adapter is not None:
+            np.testing.assert_array_equal(namespace["forward_rebuild_mask"], [[True, False], [True, False]])
+        else:
+            assert namespace["forward_rebuild_mask"] is None
+    namespace["replay_jacobian_reuse_mode"] = "recorded_forward"
+    namespace["schedule_artifact"] = None
+    with pytest.raises(ValueError, match="requires the recorded forward Newton reuse decisions"):
+        exec(code, namespace)
+
+
+def test_benchmark_checked_replay_uses_existing_scalar_kernel_without_optimization_stages():
+    replay = _benchmark_segment_replay()
+    context, carry = _case()
+    schedule = _schedule([True, True, False])
+    legacy = replay(context, carry, schedule)
+    checked = replay(context, carry, schedule, force_jacobian_rebuild=jnp.array([True, False, False]))
+    assert legacy[2].replay_valid is None
+    np.testing.assert_array_equal(checked[2].replay_valid, [True, True, True])
+    for a, b in zip(jax.tree_util.tree_leaves(legacy[:2]), jax.tree_util.tree_leaves(checked[:2]), strict=True):
+        np.testing.assert_array_equal(a, b)
+
+
+def test_benchmark_recorded_replay_rejects_failed_scalar_reconstruction_before_ad():
+    replay = _benchmark_segment_replay()
+    context, carry = _case()
+    poisoned = dataclasses.replace(carry, prev_stages=jnp.full_like(carry.prev_stages, 1e200),
+                                   prev_dt=jnp.asarray(.01))
+    with pytest.raises(FloatingPointError, match="Invalid primal replay at slot=0"):
+        replay(context, poisoned, _schedule([True, True]), force_jacobian_rebuild=jnp.array([True, False]))
 
 
 def _case():

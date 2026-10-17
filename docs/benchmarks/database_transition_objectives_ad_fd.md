@@ -18,6 +18,91 @@ Both benchmarks use the scalar objective defaults: transition radial window
 1e-6, radial softness 0.05, and softmax beta 16. These are benchmark defaults;
 they differ from some optimization-script target/window settings.
 
+## Replay Jacobian reuse comparison (2026-10-17)
+
+The AD benchmark now accepts
+`--reverse-replay-jacobian-reuse-mode legacy|recorded_forward`. This changes
+only the Newton-cache reuse decisions in accepted-step replay. The default
+`legacy` recomputes reuse from the replay cache, as before. `recorded_forward`
+applies the original forward rebuild decisions, checks reconstructed Newton
+solves and compares segment endpoints with adaptive checkpoints. Rejected
+transport attempts are not replayed or differentiated.
+
+Both choices retain the same benchmark root, bootstrap, geometry and reverse
+implementations. No production optimization stage factories are substituted.
+The forward solver's separate `--radau-jacobian-reuse-mode legacy` setting is
+unchanged in this comparison; it still controls the actual adaptive solve.
+
+The recorded replay retains the existing benchmark configuration, eleven transport
+objectives (including the three new transition rows, bootstrap and net power),
+seven geometry rows, and physical parameter columns. With profiles included
+and `RBC:1:0,ZBS:1:0`, this gives the same 18-by-8 Jacobian used in the archived
+comparison. It does not apply the optimizer's ESS scaling, weights or root
+target/window overrides. The numerical comparison therefore concerns the
+16-step benchmark point, not the stalled full-time optimization point.
+
+After syncing this change to the GPU machine, use the existing `jax_env`:
+
+```bash
+cd ~/NEOPAX
+mkdir -p outputs
+set -o pipefail
+
+env -u JAX_COMPILATION_CACHE_DIR \
+JAX_ENABLE_COMPILATION_CACHE=0 \
+XLA_FLAGS="${XLA_FLAGS:-} --xla_gpu_enable_command_buffer=" \
+NEOPAX_REVERSE_STEP_DIAGNOSTICS=1 \
+PYTHONPATH="$HOME/VMEX:$HOME/NTX/src" \
+/usr/bin/time -v \
+python examples/benchmarks/benchmark_transport_reverse_ad_only.py \
+  --config examples/benchmarks/Solve_Transport_equations_wHe_radau_ntx_scan_runtime_database_vmec_realtime_geometry_benchmark_black_box.toml \
+  --reverse-parameter-mode profiles_plus_realtime_geometry \
+  --reverse-geometry-parameter RBC:1:0,ZBS:1:0 \
+  --realtime-geometry-gradient-path reverse_payload \
+  --optimization-api-profile-dofs include \
+  --objective all \
+  --accepted-step-limit 16 \
+  --reverse-segment-length 4 \
+  --radau-jacobian-reuse-mode legacy \
+  --timing-mode jit-warm \
+  --reverse-stage-adjoint-solve-mode block \
+  --reverse-rhs-transpose-mode explicit_database \
+  --reverse-step-bwd-mode reduced_cotangent_call_boundary \
+  --reverse-initial-cache-support-pullback-mode scalar \
+  --reverse-rebuild-support-pullback-mode separate \
+  --reverse-final-objective-cotangent-mode grouped_vjp \
+  --reverse-bootstrap-cotangent-mode joint_local_vjp_upar_only \
+  --initial-Er-root-ad jax_selected_root \
+  --full-transport-shared-payload-smoke \
+  --reverse-schedule-artifact-mode reuse_static_probe \
+  --reverse-replay-jacobian-reuse-mode recorded_forward \
+  2>&1 | tee outputs/database_transition_ad_16x4_recorded_reuse.log
+```
+
+The final banner and JSON record `reverse_replay_jacobian_reuse_mode` and `all_finite`.
+All 18 residuals and 144 Jacobian entries are checked. If any are nonfinite,
+the raw report is written and the benchmark raises instead of returning a
+successful exit status. The selected mode requires the database Radau shared
+payload lane, positive segment length, minimal segment-start replay,
+`reuse_segment_primal_record`, `reuse_static_probe` and inline segment support.
+
+The new mode writes
+`outputs/autodiff_transport_lagged_ntx/reverse_ad/transport_reverse_ad_only_full_transport_shared_payload_smoke_replay_jacobian_recorded_forward.json`.
+The legacy report retains its original filename. Compare
+objective values and derivative columns by label against that reference and
+the archived FD table before judging agreement. Local validation uses mocked
+benchmark routing, report checks and tiny synthetic replay equations; no local
+VMEC, NTX or full transport evaluation is required. The two lightweight test
+files `test_reverse_benchmark_root_objectives.py` and
+`test_checked_primal_replay.py` cover the selector, unchanged stage wiring,
+filtering accepted decisions, and invalid reconstruction. No GPU result for
+the recorded-forward benchmark has been supplied yet.
+
+Validation: those two files pass 17 tests and 33 subtests; four existing
+mocked geometry-scaling/stage and tiny replay-cache checks also pass. The
+broader stage-switching proposal was removed before any remote run: the
+final option only changes replay Jacobian reuse and its validity checks.
+
 ## Matching 16-step FD command
 
 On the GPU machine, from NEOPAX with `jax_env` active, use the same database

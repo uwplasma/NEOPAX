@@ -4,6 +4,7 @@ import argparse
 import ast
 from contextlib import nullcontext, redirect_stderr, redirect_stdout
 import io
+import json
 from pathlib import Path
 from types import SimpleNamespace
 import unittest
@@ -45,6 +46,11 @@ def _namespace():
                 for target in node.targets)
     )
     exec(compile(ast.Module(body=[labels], type_ignores=[]), str(BENCHMARK), "exec"), namespace)
+    mode_validator = next(
+        node for node in MODULE.body
+        if isinstance(node, ast.FunctionDef) and node.name == "_validate_replay_jacobian_reuse_mode"
+    )
+    exec(compile(ast.Module(body=[mode_validator], type_ignores=[]), str(BENCHMARK), "exec"), namespace)
     return namespace
 
 
@@ -84,6 +90,169 @@ class _EvaluationReached(Exception):
 
 
 class ReverseBenchmarkRootObjectiveTests(unittest.TestCase):
+    def test_recorded_jacobian_reuse_requires_the_database_recorded_replay_lane(self):
+        validate = _namespace()["_validate_replay_jacobian_reuse_mode"]
+        self.assertEqual(validate(SimpleNamespace(), {}), "legacy")
+        args = SimpleNamespace(
+            reverse_replay_jacobian_reuse_mode="recorded_forward",
+            full_transport_shared_payload_smoke=True,
+            reverse_parameter_mode="profiles_plus_realtime_geometry",
+            realtime_geometry_gradient_path="reverse_payload",
+            initial_er_root_only_optimization_smoke=False,
+            transport_solver_forward_smoke=False,
+            reverse_segment_length=4, reverse_segment_start_replay_mode="minimal",
+            reverse_segment_primal_record_mode="reuse_segment_primal_record",
+            reverse_schedule_artifact_mode="reuse_static_probe",
+            reverse_database_segment_support_mode="inline",
+        )
+        config = {"neoclassical": {"flux_model": "ntx_scan_runtime"}}
+        self.assertEqual(validate(args, config), args.reverse_replay_jacobian_reuse_mode)
+        for name, value in (
+            ("reverse_replay_jacobian_reuse_mode", "unknown"),
+            ("full_transport_shared_payload_smoke", False),
+            ("reverse_parameter_mode", "profiles"),
+            ("realtime_geometry_gradient_path", "support_pullback_probe"),
+            ("initial_er_root_only_optimization_smoke", True),
+            ("transport_solver_forward_smoke", True),
+            ("reverse_segment_length", None), ("reverse_segment_length", 0),
+            ("reverse_segment_start_replay_mode", "legacy"),
+            ("reverse_segment_primal_record_mode", "reconstruct"),
+            ("reverse_schedule_artifact_mode", "legacy"),
+            ("reverse_database_segment_support_mode", "deferred_segment_batch"),
+        ):
+            with self.subTest(option=name, value=value):
+                invalid = SimpleNamespace(**{**vars(args), name: value})
+                with self.assertRaises(ValueError):
+                    validate(invalid, config)
+        for config in (
+            {"neoclassical": {"flux_model": "ntx_exact"}},
+            {"neoclassical": {"flux_model": "ntx_scan_runtime"},
+             "transport_solver": {"integrator": "theta"}},
+        ):
+            with self.subTest(config=config), self.assertRaises(ValueError):
+                validate(args, config)
+
+        main = next(node for node in MODULE.body if isinstance(node, ast.FunctionDef) and node.name == "main")
+        declaration = next(
+            node for node in main.body
+            if isinstance(node, ast.Expr) and isinstance(node.value, ast.Call)
+            and isinstance(node.value.func, ast.Attribute) and node.value.func.attr == "add_argument"
+            and node.value.args and isinstance(node.value.args[0], ast.Constant)
+            and node.value.args[0].value == "--reverse-replay-jacobian-reuse-mode"
+        )
+        namespace = {"parser": argparse.ArgumentParser()}
+        exec(compile(ast.Module(body=[declaration], type_ignores=[]), str(BENCHMARK), "exec"), namespace)
+        self.assertEqual(namespace["parser"].parse_args([]).reverse_replay_jacobian_reuse_mode, "legacy")
+        self.assertEqual(namespace["parser"].parse_args([
+            "--reverse-replay-jacobian-reuse-mode", args.reverse_replay_jacobian_reuse_mode,
+        ]).reverse_replay_jacobian_reuse_mode, args.reverse_replay_jacobian_reuse_mode)
+
+    def test_reuse_option_does_not_switch_stages_and_reports_raw_nonfinite_values(self):
+        """Only replay reuse is forwarded; root/bootstrap/geometry stages stay untouched."""
+        import tempfile
+
+        function = next(
+            node for node in MODULE.body
+            if isinstance(node, ast.FunctionDef) and node.name == "_run_realtime_geometry_optimization_api_smoke"
+        )
+        for mode, finite in (("legacy", True), ("recorded_forward", True), ("recorded_forward", False)):
+            with self.subTest(mode=mode, finite=finite), tempfile.TemporaryDirectory() as directory:
+                namespace = _namespace()
+                labels = namespace["FULL_TRANSPORT_OBJECTIVE_LABELS"]
+                args = SimpleNamespace(**{
+                    node.attr: None for node in ast.walk(function)
+                    if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name)
+                    and node.value.id == "args"
+                })
+                vars(args).update(
+                    reverse_replay_jacobian_reuse_mode=mode, full_transport_shared_payload_smoke=True,
+                    optimization_api_profile_dofs="include", objective="all", config="synthetic.toml",
+                    reverse_parameter_mode="profiles_plus_realtime_geometry",
+                    realtime_geometry_gradient_path="reverse_payload",
+                    initial_er_root_only_optimization_smoke=False, transport_solver_forward_smoke=False,
+                    accepted_step_limit=16, reverse_segment_length=4,
+                    reverse_segment_start_replay_mode="minimal",
+                    reverse_segment_primal_record_mode="reuse_segment_primal_record",
+                    reverse_schedule_artifact_mode="reuse_static_probe",
+                    reverse_database_segment_support_mode="inline",
+                    initial_er_root_ad="jax_selected_root",
+                    reverse_database_root_interpolation_transpose_mode="established",
+                )
+                parameter_set = parameters.reverse_ad_optimization_parameter_set(
+                    include_profiles=True, profiles=parameters.PROFILE_PARAMETER_ORDER,
+                    vmec_boundary=(parameters.VmecBoundaryParameterSpec("RBC", 1, 0),
+                                   parameters.VmecBoundaryParameterSpec("ZBS", 1, 0)),
+                )
+                residual_labels = tuple(f"transport:{name}" for name in labels) + tuple(
+                    f"geometry:synthetic_{i}" for i in range(7)
+                )
+                jacobian = np.ones((18, 8))
+                if not finite:
+                    jacobian[0, 0] = np.nan
+                evaluation = SimpleNamespace(
+                    residuals=np.ones(18), jacobian=jacobian, elapsed_s=.1,
+                    result=SimpleNamespace(residual_labels=residual_labels,
+                                           parameter_labels=parameter_set.labels,
+                                           objective_values={name: 1. for name in labels}),
+                )
+                builder = Mock(return_value=object())
+                evaluate = Mock(return_value=evaluation)
+                root_dir = Path(directory)
+                namespace.update({
+                    "np": np, "jnp": np, "Path": Path, "json": json,
+                    "ROOT": root_dir, "jax": SimpleNamespace(device_get=lambda value: value),
+                    "PROFILE_PARAMETER_ORDER": parameters.PROFILE_PARAMETER_ORDER,
+                    "reverse_ad_optimization_parameter_set": parameters.reverse_ad_optimization_parameter_set,
+                    "VmecBoundaryParameterSpec": parameters.VmecBoundaryParameterSpec,
+                    "transport_least_squares_terms": optimization.transport_least_squares_terms,
+                    "LeastSquaresTerm": optimization.LeastSquaresTerm,
+                    "geometry_objectives": optimization.geometry,
+                    "_geometry_param_specs_from_args": lambda *_: (("RBC", 1, 0), ("ZBS", 1, 0)),
+                    "_baseline_geometry_delta_vector_for_specs": lambda *_: np.zeros(2),
+                    "_profile_cfg_scalar_value": lambda cfg, name: cfg[name],
+                    "_make_realtime_geometry_support_segment_builder_inputs": lambda **_: (object(), object()),
+                    "internal_realtime_geometry_transport_reverse_table_result_builder": builder,
+                    "realtime_geometry_transport_reverse_table_request": lambda **kwargs: SimpleNamespace(**kwargs),
+                    "_maybe_reverse_segment_profiler_trace": lambda _: nullcontext(),
+                    "evaluate_geometry_transport_realtime_geometry_least_squares": evaluate,
+                    "_report_path": lambda name: root_dir / f"{name}.json",
+                })
+                extracted = ast.Module(body=[
+                    ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0), function,
+                ], type_ignores=[])
+                exec(compile(ast.fix_missing_locations(extracted), str(BENCHMARK), "exec"), namespace)
+                runtime = SimpleNamespace(geometry=object(), species=SimpleNamespace(number_species=4))
+                with redirect_stdout(io.StringIO()):
+                    with nullcontext() if finite else self.assertRaises(FloatingPointError):
+                        namespace[function.name](
+                            args=args, config={"geometry": {}, "neoclassical": {"flux_model": "ntx_scan_runtime"}},
+                            geometry_context=object(), baseline_values=None, baseline_runtime=runtime,
+                            baseline_state=SimpleNamespace(pressure=np.ones((4, 5))),
+                            profile_cfg={name: 1. for name in parameters.PROFILE_PARAMETER_ORDER},
+                            neoclassical_cfg={},
+                        )
+                call = builder.call_args.kwargs
+                self.assertEqual(call["accepted_step_limit"], 16)
+                self.assertEqual(call["reverse_segment_length"], 4)
+                self.assertEqual(call["reverse_replay_jacobian_reuse_mode"], mode)
+                self.assertNotIn("reverse_stage_mode", evaluate.call_args.kwargs["options"])
+                self.assertNotIn("reverse_stage_mode", evaluate.call_args.kwargs["request"].options)
+                for key in ("segment_replay_optimization_stage_builder", "bootstrap_optimization_stage_builder",
+                            "initial_root_optimization_stage", "runtime_optimization_stage",
+                            "payload_assembly_optimization_stage"):
+                    self.assertNotIn(key, call)
+                report_name = "full_transport_shared_payload_smoke"
+                if mode != "legacy":
+                    report_name += f"_replay_jacobian_{mode}"
+                report = namespace["json"].loads((root_dir / f"{report_name}.json").read_text())
+                self.assertEqual(report["reverse_replay_jacobian_reuse_mode"], mode)
+                self.assertEqual(report["all_finite"], finite)
+                self.assertEqual(report["parameter_order"], list(parameter_set.labels))
+                self.assertEqual(report["objective_order"], list(labels))
+                self.assertEqual(np.asarray(report["jacobian"]).shape, (18, 8))
+                if not finite:
+                    self.assertTrue(np.isnan(report["jacobian"][0][0]))
+
     def test_geometry_context_uses_the_runtime_boozer_resolution_settings(self):
         """Omitted modes must not silently select a different FD geometry resolution."""
         function = next(

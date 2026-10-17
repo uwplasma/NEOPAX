@@ -1,0 +1,1029 @@
+  2>&1 | tee outputs/geometry_only_net_power_root_bootstrap_replay_fix.log
+M	NEOPAX/version.py
+Already on 'en/v0_new'
+Your branch is up to date with 'origin/en/v0_new'.
+remote: Enumerating objects: 21, done.
+remote: Counting objects: 100% (21/21), done.
+remote: Compressing objects: 100% (7/7), done.
+remote: Total 21 (delta 14), reused 21 (delta 14), pack-reused 0 (from 0)
+Unpacking objects: 100% (21/21), 26.42 KiB | 1.06 MiB/s, done.
+From https://github.com/uwplasma/NEOPAX
+ * branch            en/v0_new  -> FETCH_HEAD
+   e83a143..c6a1cca  en/v0_new  -> origin/en/v0_new
+Updating e83a143..c6a1cca
+Fast-forward
+ ...y_from_geometry_result_replay_fix_completion_2026-10-16.csv |   3 +
+ ...y_from_geometry_result_replay_fix_completion_2026-10-16.txt |  71 +++
+ ...geometry_result_replay_fix_completion_2026-10-16_memory.csv |   3 +
+ ...ometry_result_replay_fix_completion_2026-10-16_segments.csv |   6 +
+ ...only_from_geometry_result_replay_fix_partial_2026-10-16.csv |  20 +
+ ...only_from_geometry_result_replay_fix_partial_2026-10-16.txt | 824 ++++++++++++++++++++++++++++
+ ...om_geometry_result_replay_fix_partial_2026-10-16_memory.csv |  20 +
+ ..._geometry_result_replay_fix_partial_2026-10-16_segments.csv | 111 ++++
+ .../profiles_only_trial_0002_checked_replay_2026-10-16.csv     |   2 +
+ .../profiles_only_trial_0002_checked_replay_2026-10-16.txt     |  75 +++
+ ...iles_only_trial_0002_checked_replay_2026-10-16_segments.csv |   7 +
+ docs/combined_geometry_profile_optimization_issues.md          | 317 ++++++++++-
+ .../optimize_geometry_profiles_from_geometry_result.py         |   4 +-
+ tests/test_combined_from_geometry_result.py                    |   1 -
+ 14 files changed, 1456 insertions(+), 8 deletions(-)
+ create mode 100644 docs/benchmarks/profiles_only_from_geometry_result_replay_fix_completion_2026-10-16.csv
+ create mode 100644 docs/benchmarks/profiles_only_from_geometry_result_replay_fix_completion_2026-10-16.txt
+ create mode 100644 docs/benchmarks/profiles_only_from_geometry_result_replay_fix_completion_2026-10-16_memory.csv
+ create mode 100644 docs/benchmarks/profiles_only_from_geometry_result_replay_fix_completion_2026-10-16_segments.csv
+ create mode 100644 docs/benchmarks/profiles_only_from_geometry_result_replay_fix_partial_2026-10-16.csv
+ create mode 100644 docs/benchmarks/profiles_only_from_geometry_result_replay_fix_partial_2026-10-16.txt
+ create mode 100644 docs/benchmarks/profiles_only_from_geometry_result_replay_fix_partial_2026-10-16_memory.csv
+ create mode 100644 docs/benchmarks/profiles_only_from_geometry_result_replay_fix_partial_2026-10-16_segments.csv
+ create mode 100644 docs/benchmarks/profiles_only_trial_0002_checked_replay_2026-10-16.csv
+ create mode 100644 docs/benchmarks/profiles_only_trial_0002_checked_replay_2026-10-16.txt
+ create mode 100644 docs/benchmarks/profiles_only_trial_0002_checked_replay_2026-10-16_segments.csv
+
+===== vacuum database QI + max-Er/root/bootstrap/net-power full transport stage, max_mode=2, grid=(25,25,33), J_backend=surrogate =====
+[NEOPAX] built runtime NTX scan database: rho=7 nu_v=16 Er_tilde=11 grid=(25,25,33) backend=vmec
+[setup] parameter_count=24 parameters=['RBC:0:1', 'RBC:0:2', 'RBC:1:-2', 'RBC:1:-1', 'RBC:1:0', 'RBC:1:1', 'RBC:1:2', 'RBC:2:-2', 'RBC:2:-1', 'RBC:2:0', 'RBC:2:1', 'RBC:2:2', 'ZBS:0:1', 'ZBS:0:2', 'ZBS:1:-2', 'ZBS:1:-1', 'ZBS:1:0', 'ZBS:1:1', 'ZBS:1:2', 'ZBS:2:-2', 'ZBS:2:-1', 'ZBS:2:0', 'ZBS:2:1', 'ZBS:2:2']
+[setup] full_transport t_final=2.0 max_steps=1000 accepted_step_limit=None reverse_segment_length=50 max_reverse_accepted_steps=500 print_final_softmax_Er=True Er_transition_indices=(25,26) Er_transition_location=True Er_transition_rho_target=0.514 Er_transition_strength_target=0.9 Er_transition_rho_window=(0.05,0.9) Er_transition_rho_softness=0.05 Er_transition_softmax_beta=16.0
+wrote /home/exouser/NEOPAX/outputs/geometry_only_net_power_root_bootstrap_replay_fix/geometry_inputs_m2/input.QI_neopax_database_full_transport_net_power_eval_0000
+E1017 02:58:18.411106  455002 slow_operation_alarm.cc:73] 
+********************************
+[Compiling module jit_scan for GPU] Very slow compile? If you want to file a bug, run with envvar XLA_FLAGS=--xla_dump_to=/tmp/foo and attach the results.
+********************************
+E1017 02:58:37.131903  454895 slow_operation_alarm.cc:140] The operation took 2m18.72089645s
+
+********************************
+[Compiling module jit_scan for GPU] Very slow compile? If you want to file a bug, run with envvar XLA_FLAGS=--xla_dump_to=/tmp/foo and attach the results.
+********************************
+[autodiff-gate] progress: support reverse profile-state vjp ready elapsed_s=98.159
+[autodiff-gate] progress: support reverse initial carry reduced-zero-RHS forward ready elapsed_s=0.731
+[autodiff-gate] progress: support reverse reusing static schedule artifact (no second adaptive rollout; no per-step carry tape)
+[autodiff-gate] progress: support reverse realized-schedule vjp forward ready elapsed_s=2.124
+[autodiff-gate] progress: support reverse final-objective cotangents ready elapsed_s=141.598 ordinary_mode=grouped_joint_vjp bootstrap_mode=joint_local_vjp_upar_only database_bootstrap_interpolation_mode=legacy_sparse
+[autodiff-gate] progress: support reverse segmented cotangent sweep start segments=1 segment_length=50 objectives=13 cotangent_mode=full
+[autodiff-gate] progress: database segment reverse uses fixed-table table transpose plus compact local fixed-table geometry bars; only table bars cross the recorded scan (no scan owner in segments)
+[primal-replay] segment=1 endpoint_max_abs_difference=0.000000e+00 endpoint_max_scaled_difference=0.000000e+00
+[autodiff-gate] progress: support reverse segment 1/1 ready elapsed_s=662.336 active_steps=37 support_reuse=0 support_rebuild=37
+[autodiff-gate] progress: support reverse segmented cotangent sweep ready elapsed_s=662.337 support_reuse=0 support_rebuild=37
+[autodiff-gate] progress: support reverse reduced carry bars expanded ready elapsed_s=0.175
+[autodiff-gate] progress: support reverse initial direct-RHS support pullback ready elapsed_s=0.100 boundary=reduced_zero
+[autodiff-gate] progress: support reverse initial state pullback ready elapsed_s=0.092
+[autodiff-gate] progress: initial-Er root boundary compact pullback ready elapsed_s=12.230
+[autodiff-gate] progress: support reverse profile parameter pullback ready elapsed_s=0.000
+[autodiff-gate] progress: support reverse initial-profile scan payload pullback ready elapsed_s=0.824
+[autodiff-gate] progress: database final recorded-scan fold ready elapsed_s=232.997 objective_rows=5 groups=1 contract=one_batched_scan_transpose
+[geometry-fd-ad] progress: objective_table vmec implicit state/raw-block aux ready elapsed_s=0.124
+[geometry-fd-ad] progress: objective_table booz input tables ready elapsed_s=0.615
+[geometry-fd-ad] progress: objective_table booz_xform vjp ready elapsed_s=3.895
+[geometry-fd-ad] progress: objective_table vmec objective cotangents ready elapsed_s=12.296
+[geometry-fd-ad] progress: objective_table boozer light cotangents ready elapsed_s=0.549
+[geometry-fd-ad] progress: objective_table aspect proxy cotangents ready elapsed_s=0.065
+[geometry-fd-ad] progress: objective_table j-qi/maxj Boozer cotangents ready elapsed_s=7.455
+[geometry-fd-ad] progress: objective_table booz cotangents pulled to state elapsed_s=1.511
+[geometry-fd-ad] progress: objective_table final vmec parameter pullback ready elapsed_s=6.797
+[initial] elapsed_s=1593.401 total_cost=1.73358986e+04 aspect_ratio=9.99716248e+00 aspect_cost=4.02574663e-06 iota_mean=-5.48216905e-01 iota_cost=1.90857541e-03 mirror_ratio=nan mirror_penalty=0.00000000e+00 mirror_cost=0.00000000e+00 qi=1.35135567e+00 qi_cost=9.13081069e-01 maxJ=1.84726189e+02 maxJ_cost=0.00000000e+00 softmax_Er=nan Er_cost=nan Er_left=nan Er_left_cost=nan Er_right=nan Er_right_cost=nan Er_transition_rho=1.17510582e-01 Er_transition_location_moment=-3.96489418e-01 Er_transition_location_cost=7.86019292e+01 Er_transition_strength=-3.26833863e+00 Er_transition_strength_deficit=4.16833863e+00 Er_transition_strength_cost=8.68752348e+02 bootstrap_penalty=4.38632159e+00 bootstrap_cost=3.84796343e+01 net_power_average_MW_m3=2.71456005e+00 net_power_MW=8.98570402e+02 net_power_cost=1.63491497e+04
+  - geometry:boozer_qi_objective: value=1.3513556669017661e+00
+  - geometry:boozer_maxj_objective: value=1.8472618852316251e+02
+  - mirror_penalization: value=0.0000000000000000e+00
+  - geometry:vmec_aspect_ratio: value=9.9971624846684968e+00
+  - geometry:vmec_iota_mean: value=-5.4821690501901166e-01
+  - transport:Er_transition_rho: value=1.1751058217710576e-01
+  - transport:Er_transition_location_moment: value=-3.9648941782289426e-01
+  - transport:Er_transition_strength: value=-3.2683386335007905e+00
+  - Er_transition_strength_deficit: value=4.1683386335008503e+00
+  - bootstrap_current_penalty: value=4.3863215948428422e+00
+  - transport:net_total_power_volume_average_mw_m3: value=2.7145600511000576e+00
+  residual_norm=1.862036e+02
+  jacobian_shape=(11, 24)
+[NEOPAX least_squares] eval=1 cost=1.733590e+04 residual_norm=1.862036e+02 total_cost=1.73358986e+04 aspect_ratio=9.99716248e+00 aspect_cost=4.02574663e-06 iota_mean=-5.48216905e-01 iota_cost=1.90857541e-03 mirror_ratio=nan mirror_penalty=0.00000000e+00 mirror_cost=0.00000000e+00 qi=1.35135567e+00 qi_cost=9.13081069e-01 maxJ=1.84726189e+02 maxJ_cost=0.00000000e+00 softmax_Er=nan Er_cost=nan Er_left=nan Er_left_cost=nan Er_right=nan Er_right_cost=nan Er_transition_rho=1.17510582e-01 Er_transition_location_moment=-3.96489418e-01 Er_transition_location_cost=7.86019292e+01 Er_transition_strength=-3.26833863e+00 Er_transition_strength_deficit=4.16833863e+00 Er_transition_strength_cost=8.68752348e+02 bootstrap_penalty=4.38632159e+00 bootstrap_cost=3.84796343e+01 net_power_average_MW_m3=2.71456005e+00 net_power_MW=8.98570402e+02 net_power_cost=1.63491497e+04
+wrote /home/exouser/NEOPAX/outputs/geometry_only_net_power_root_bootstrap_replay_fix/geometry_inputs_m2/input.QI_neopax_database_full_transport_net_power_eval_0001
+ERROR:2026-10-17 03:19:40,355:jax._src.callback:94: jax.pure_callback failed
+Traceback (most recent call last):
+  File "/home/exouser/jax_env/lib/python3.12/site-packages/jax/_src/callback.py", line 92, in pure_callback_impl
+    return tree_util.tree_map(np.asarray, callback(*args))
+                                          ^^^^^^^^^^^^^^^
+  File "/home/exouser/jax_env/lib/python3.12/site-packages/jax/_src/callback.py", line 70, in __call__
+    return tree_util.tree_leaves(self.callback_func(*args, **kwargs))
+                                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/exouser/VMEX/vmex/core/implicit.py", line 975, in _host_solve_and_mask
+    raise RuntimeError(
+RuntimeError: host equilibrium solve failed with VmecJacobianError (re-raised typed at the pure_callback call site)
+E1017 03:19:40.357633  454895 pjrt_stream_executor_client.cc:3314] Execution of replica 0 failed: INTERNAL: CpuCallback error calling callback: Traceback (most recent call last):
+  File "/home/exouser/NEOPAX/examples/optimization/optimize_geometry_qi_max_er_transition_bootstrap_net_power_initial_root_database_full_transport.py", line 868, in <module>
+  File "/home/exouser/NEOPAX/examples/optimization/optimize_geometry_qi_max_er_transition_bootstrap_net_power_initial_root_database_full_transport.py", line 805, in main
+  File "/home/exouser/NEOPAX/NEOPAX/optimization.py", line 3396, in least_squares
+  File "/home/exouser/jax_env/lib/python3.12/site-packages/scipy/_lib/_util.py", line 696, in inner
+  File "/home/exouser/jax_env/lib/python3.12/site-packages/scipy/optimize/_lsq/least_squares.py", line 1019, in least_squares
+  File "/home/exouser/jax_env/lib/python3.12/site-packages/scipy/optimize/_lsq/trf.py", line 120, in trf
+  File "/home/exouser/jax_env/lib/python3.12/site-packages/scipy/optimize/_lsq/trf.py", line 514, in trf_no_bounds
+  File "/home/exouser/jax_env/lib/python3.12/site-packages/scipy/optimize/_differentiable_functions.py", line 734, in fun
+  File "/home/exouser/jax_env/lib/python3.12/site-packages/scipy/optimize/_differentiable_functions.py", line 698, in _update_fun
+  File "/home/exouser/jax_env/lib/python3.12/site-packages/scipy/optimize/_differentiable_functions.py", line 415, in __call__
+  File "/home/exouser/jax_env/lib/python3.12/site-packages/scipy/optimize/_lsq/least_squares.py", line 263, in __call__
+  File "/home/exouser/NEOPAX/NEOPAX/optimization.py", line 3278, in _fun
+  File "/home/exouser/NEOPAX/NEOPAX/optimization.py", line 3254, in _evaluate
+  File "/home/exouser/NEOPAX/NEOPAX/optimization.py", line 306, in evaluate
+  File "/home/exouser/NEOPAX/NEOPAX/optimization.py", line 1078, in evaluate
+  File "/home/exouser/NEOPAX/NEOPAX/_reverse_ad_optimization.py", line 4641, in evaluate_geometry_transport_realtime_geometry_least_squares
+  File "/home/exouser/NEOPAX/NEOPAX/_geometry_autodiff.py", line 1196, in geometry_raw_block_solve_from_param_vector
+  File "/home/exouser/jax_env/lib/python3.12/site-packages/jax/_src/callback.py", line 784, in _wrapped_callback
+  File "/home/exouser/jax_env/lib/python3.12/site-packages/jax/_src/callback.py", line 223, in _callback
+  File "/home/exouser/jax_env/lib/python3.12/site-packages/jax/_src/callback.py", line 95, in pure_callback_impl
+  File "/home/exouser/jax_env/lib/python3.12/site-packages/jax/_src/callback.py", line 70, in __call__
+  File "/home/exouser/VMEX/vmex/core/implicit.py", line 975, in _host_solve_and_mask
+RuntimeError: host equilibrium solve failed with VmecJacobianError (re-raised typed at the pure_callback call site)
+[NEOPAX least_squares] eval=2 trial solve failed -> penalty residual: INTERNAL: CpuCallback error calling callback: Traceback (most recent call last):
+  File "/home/exouser/NEOPAX/examples/optimization/optimize_geometry_qi_max_er_transition_bootstrap_net_power_initial_root_database_full_transport.py", line 868, in <module>
+  File "/home/exouser/NEOPAX/examples/optimization/optimize_geometry_qi_max_er_transition_bootstrap_net_power_initial_root_database_full_transport.py", line 805, in main
+  File "/home/exouser/NEOPAX/NEOPAX/optimization.py", line 3396, in least_squares
+  File "/home/exouser/jax_env/lib/python3.12/site-packages/scipy/_lib/_util.py", line 696, in inner
+  File "/home/exouser/jax_env/lib/python3.12/site-packages/scipy/optimize/_lsq/least_squares.py", line 1019, in least_squares
+  File "/home/exouser/jax_env/lib/python3.12/site-packages/scipy/optimize/_lsq/trf.py", line 120, in trf
+  File "/home/exouser/jax_env/lib/python3.12/site-packages/scipy/optimize/_lsq/trf.py", line 514, in trf_no_bounds
+  File "/home/exouser/jax_env/lib/python3.12/site-packages/scipy/optimize/_differentiable_functions.py", line 734, in fun
+  File "/home/exouser/jax_env/lib/python3.12/site-packages/scipy/optimize/_differentiable_functions.py", line 698, in _update_fun
+  File "/home/exouser/jax_env/lib/python3.12/site-packages/scipy/optimize/_differentiable_functions.py", line 415, in __call__
+  File "/home/exouser/jax_env/lib/python3.12/site-packages/scipy/optimize/_lsq/least_squares.py", line 263, in __call__
+  File "/home/exouser/NEOPAX/NEOPAX/optimization.py", line 3278, in _fun
+  File "/home/exouser/NEOPAX/NEOPAX/optimization.py", line 3254, in _evaluate
+  File "/home/exouser/NEOPAX/NEOPAX/optimization.py", line 306, in evaluate
+  File "/home/exouser/NEOPAX/NEOPAX/optimization.py", line 1078, in evaluate
+  File "/home/exouser/NEOPAX/NEOPAX/_reverse_ad_optimization.py", line 4641, in evaluate_geometry_transport_realtime_geometry_least_squares
+  File "/home/exouser/NEOPAX/NEOPAX/_geometry_autodiff.py", line 1196, in geometry_raw_block_solve_from_param_vector
+  File "/home/exouser/jax_env/lib/python3.12/site-packages/jax/_src/callback.py", line 784, in _wrapped_callback
+  File "/home/exouser/jax_env/lib/python3.12/site-packages/jax/_src/callback.py", line 223, in _callback
+  File "/home/exouser/jax_env/lib/python3.12/site-packages/jax/_src/callback.py", line 95, in pure_callback_impl
+  File "/home/exouser/jax_env/lib/python3.12/site-packages/jax/_src/callback.py", line 70, in __call__
+  File "/home/exouser/VMEX/vmex/core/implicit.py", line 975, in _host_solve_and_mask
+RuntimeError: host equilibrium solve failed with VmecJacobianError (re-raised typed at the pure_callback call site)
+wrote /home/exouser/NEOPAX/outputs/geometry_only_net_power_root_bootstrap_replay_fix/geometry_inputs_m2/input.QI_neopax_database_full_transport_net_power_eval_0002
+E1017 03:25:39.888383  455002 slow_operation_alarm.cc:73] 
+********************************
+[Compiling module jit__schedule_probe_kernel for GPU] Very slow compile? If you want to file a bug, run with envvar XLA_FLAGS=--xla_dump_to=/tmp/foo and attach the results.
+********************************
+E1017 03:26:17.696125  454895 slow_operation_alarm.cc:140] The operation took 2m37.807846383s
+
+********************************
+[Compiling module jit__schedule_probe_kernel for GPU] Very slow compile? If you want to file a bug, run with envvar XLA_FLAGS=--xla_dump_to=/tmp/foo and attach the results.
+********************************
+[NEOPAX] built runtime NTX scan database: rho=7 nu_v=16 Er_tilde=11 grid=(25,25,33) backend=vmec
+[optimization] final transport monitor: softmax_Er=-3.0064091689849644e-02
+[autodiff-gate] progress: support reverse profile-state vjp ready elapsed_s=4.277
+[autodiff-gate] progress: support reverse initial carry reduced-zero-RHS forward ready elapsed_s=0.806
+[autodiff-gate] progress: support reverse reusing static schedule artifact (no second adaptive rollout; no per-step carry tape)
+[autodiff-gate] progress: support reverse realized-schedule vjp forward ready elapsed_s=0.522
+[autodiff-gate] progress: support reverse final-objective cotangents ready elapsed_s=1.385 ordinary_mode=grouped_joint_vjp bootstrap_mode=joint_local_vjp_upar_only database_bootstrap_interpolation_mode=legacy_sparse
+[autodiff-gate] progress: support reverse segmented cotangent sweep start segments=1 segment_length=50 objectives=13 cotangent_mode=full
+[autodiff-gate] progress: database segment reverse uses fixed-table table transpose plus compact local fixed-table geometry bars; only table bars cross the recorded scan (no scan owner in segments)
+[primal-replay] segment=1 endpoint_max_abs_difference=0.000000e+00 endpoint_max_scaled_difference=0.000000e+00
+[autodiff-gate] progress: support reverse segment 1/1 ready elapsed_s=7.785 active_steps=32 support_reuse=0 support_rebuild=32
+[autodiff-gate] progress: support reverse segmented cotangent sweep ready elapsed_s=7.786 support_reuse=0 support_rebuild=32
+[autodiff-gate] progress: support reverse reduced carry bars expanded ready elapsed_s=0.031
+[autodiff-gate] progress: support reverse initial direct-RHS support pullback ready elapsed_s=0.024 boundary=reduced_zero
+[autodiff-gate] progress: support reverse initial state pullback ready elapsed_s=0.020
+[autodiff-gate] progress: initial-Er root boundary compact pullback ready elapsed_s=0.304
+[autodiff-gate] progress: support reverse profile parameter pullback ready elapsed_s=0.000
+[autodiff-gate] progress: support reverse initial-profile scan payload pullback ready elapsed_s=0.335
+[autodiff-gate] progress: database final recorded-scan fold ready elapsed_s=211.291 objective_rows=5 groups=1 contract=one_batched_scan_transpose
+[geometry-fd-ad] progress: objective_table vmec implicit state/raw-block aux ready elapsed_s=0.112
+[geometry-fd-ad] progress: objective_table booz input tables ready elapsed_s=0.229
+[geometry-fd-ad] progress: objective_table booz_xform vjp ready elapsed_s=0.606
+[geometry-fd-ad] progress: objective_table vmec objective cotangents ready elapsed_s=10.938
+[geometry-fd-ad] progress: objective_table boozer light cotangents ready elapsed_s=0.069
+[geometry-fd-ad] progress: objective_table aspect proxy cotangents ready elapsed_s=0.014
+[geometry-fd-ad] progress: objective_table j-qi/maxj Boozer cotangents ready elapsed_s=1.092
+[geometry-fd-ad] progress: objective_table booz cotangents pulled to state elapsed_s=0.334
+[geometry-fd-ad] progress: objective_table final vmec parameter pullback ready elapsed_s=0.398
+[NEOPAX least_squares] eval=3 cost=3.895018e+03 residual_norm=8.826118e+01 total_cost=3.89501827e+03 aspect_ratio=9.60015736e+00 aspect_cost=7.99370683e-02 iota_mean=-5.34578243e-01 iota_cost=2.84422072e-03 mirror_ratio=nan mirror_penalty=1.28334405e-01 mirror_cost=8.23485970e-01 qi=1.04258666e+00 qi_cost=5.43493474e-01 maxJ=9.28078373e+01 maxJ_cost=0.00000000e+00 softmax_Er=nan Er_cost=nan Er_left=nan Er_left_cost=nan Er_right=nan Er_right_cost=nan Er_transition_rho=3.96791823e-01 Er_transition_location_moment=-1.17208177e-01 Er_transition_location_cost=6.86887835e+00 Er_transition_strength=-1.05690207e+00 Er_transition_strength_deficit=1.95690207e+00 Er_transition_strength_cost=1.91473286e+02 bootstrap_penalty=0.00000000e+00 bootstrap_cost=0.00000000e+00 net_power_average_MW_m3=4.66155218e-02 net_power_MW=1.54306140e+01 net_power_cost=3.69522635e+03
+wrote /home/exouser/NEOPAX/outputs/geometry_only_net_power_root_bootstrap_replay_fix/geometry_inputs_m2/input.QI_neopax_database_full_transport_net_power_eval_0003
+[optimization] final transport monitor: softmax_Er=2.0190876384837591e+01
+[autodiff-gate] progress: support reverse profile-state vjp ready elapsed_s=4.065
+[autodiff-gate] progress: support reverse initial carry reduced-zero-RHS forward ready elapsed_s=0.832
+[autodiff-gate] progress: support reverse reusing static schedule artifact (no second adaptive rollout; no per-step carry tape)
+[autodiff-gate] progress: support reverse realized-schedule vjp forward ready elapsed_s=1.928
+[NEOPAX least_squares] eval=4 trial solve failed -> penalty residual: full transport reverse trial did not reach solver final time (final_time=1.8070356365332645e-03, target_time=2.0000000000000000e+00); treating trial as failed for optimization.
+wrote /home/exouser/NEOPAX/outputs/geometry_only_net_power_root_bootstrap_replay_fix/geometry_inputs_m2/input.QI_neopax_database_full_transport_net_power_eval_0004
+[optimization] final transport monitor: softmax_Er=-4.2026403297049791e-02
+[autodiff-gate] progress: support reverse profile-state vjp ready elapsed_s=3.876
+[autodiff-gate] progress: support reverse initial carry reduced-zero-RHS forward ready elapsed_s=0.819
+[autodiff-gate] progress: support reverse reusing static schedule artifact (no second adaptive rollout; no per-step carry tape)
+[autodiff-gate] progress: support reverse realized-schedule vjp forward ready elapsed_s=2.009
+[autodiff-gate] progress: support reverse final-objective cotangents ready elapsed_s=1.126 ordinary_mode=grouped_joint_vjp bootstrap_mode=joint_local_vjp_upar_only database_bootstrap_interpolation_mode=legacy_sparse
+[autodiff-gate] progress: support reverse segmented cotangent sweep start segments=1 segment_length=50 objectives=13 cotangent_mode=full
+[autodiff-gate] progress: database segment reverse uses fixed-table table transpose plus compact local fixed-table geometry bars; only table bars cross the recorded scan (no scan owner in segments)
+[primal-replay] segment=1 endpoint_max_abs_difference=0.000000e+00 endpoint_max_scaled_difference=0.000000e+00
+[autodiff-gate] progress: support reverse segment 1/1 ready elapsed_s=8.296 active_steps=35 support_reuse=0 support_rebuild=35
+[autodiff-gate] progress: support reverse segmented cotangent sweep ready elapsed_s=8.297 support_reuse=0 support_rebuild=35
+[autodiff-gate] progress: support reverse reduced carry bars expanded ready elapsed_s=0.025
+[autodiff-gate] progress: support reverse initial direct-RHS support pullback ready elapsed_s=0.023 boundary=reduced_zero
+[autodiff-gate] progress: support reverse initial state pullback ready elapsed_s=0.005
+[autodiff-gate] progress: initial-Er root boundary compact pullback ready elapsed_s=0.272
+[autodiff-gate] progress: support reverse profile parameter pullback ready elapsed_s=0.000
+[autodiff-gate] progress: support reverse initial-profile scan payload pullback ready elapsed_s=0.324
+[autodiff-gate] progress: database final recorded-scan fold ready elapsed_s=209.109 objective_rows=5 groups=1 contract=one_batched_scan_transpose
+[geometry-fd-ad] progress: objective_table vmec implicit state/raw-block aux ready elapsed_s=0.106
+[geometry-fd-ad] progress: objective_table booz input tables ready elapsed_s=0.199
+[geometry-fd-ad] progress: objective_table booz_xform vjp ready elapsed_s=0.609
+[geometry-fd-ad] progress: objective_table vmec objective cotangents ready elapsed_s=12.705
+[geometry-fd-ad] progress: objective_table boozer light cotangents ready elapsed_s=0.059
+[geometry-fd-ad] progress: objective_table aspect proxy cotangents ready elapsed_s=0.013
+[geometry-fd-ad] progress: objective_table j-qi/maxj Boozer cotangents ready elapsed_s=1.041
+[geometry-fd-ad] progress: objective_table booz cotangents pulled to state elapsed_s=0.321
+[geometry-fd-ad] progress: objective_table final vmec parameter pullback ready elapsed_s=0.393
+[NEOPAX least_squares] eval=5 cost=2.482691e+03 residual_norm=7.046547e+01 total_cost=2.48269124e+03 aspect_ratio=9.23369136e+00 aspect_cost=2.93614463e-01 iota_mean=-4.79222864e-01 iota_cost=8.55132961e-03 mirror_ratio=nan mirror_penalty=4.62912348e-02 mirror_cost=1.07143921e-01 qi=1.24022537e+00 qi_cost=7.69079481e-01 maxJ=3.07171079e+02 maxJ_cost=0.00000000e+00 softmax_Er=nan Er_cost=nan Er_left=nan Er_left_cost=nan Er_right=nan Er_right_cost=nan Er_transition_rho=3.70568761e-01 Er_transition_location_moment=-1.43431239e-01 Er_transition_location_cost=1.02862602e+01 Er_transition_strength=-1.18628206e+00 Er_transition_strength_deficit=2.08628206e+00 Er_transition_strength_cost=2.17628642e+02 bootstrap_penalty=2.01443656e-01 bootstrap_cost=8.11590931e-02 net_power_average_MW_m3=2.34948504e-01 net_power_MW=7.77723710e+01 net_power_cost=2.25351679e+03
+wrote /home/exouser/NEOPAX/outputs/geometry_only_net_power_root_bootstrap_replay_fix/geometry_inputs_m2/input.QI_neopax_database_full_transport_net_power_eval_0005
+[optimization] final transport monitor: softmax_Er=-5.7382714559061632e-03
+[autodiff-gate] progress: support reverse profile-state vjp ready elapsed_s=3.544
+[autodiff-gate] progress: support reverse initial carry reduced-zero-RHS forward ready elapsed_s=0.825
+[autodiff-gate] progress: support reverse reusing static schedule artifact (no second adaptive rollout; no per-step carry tape)
+[autodiff-gate] progress: support reverse realized-schedule vjp forward ready elapsed_s=1.954
+[autodiff-gate] progress: support reverse final-objective cotangents ready elapsed_s=1.101 ordinary_mode=grouped_joint_vjp bootstrap_mode=joint_local_vjp_upar_only database_bootstrap_interpolation_mode=legacy_sparse
+[autodiff-gate] progress: support reverse segmented cotangent sweep start segments=1 segment_length=50 objectives=13 cotangent_mode=full
+[autodiff-gate] progress: database segment reverse uses fixed-table table transpose plus compact local fixed-table geometry bars; only table bars cross the recorded scan (no scan owner in segments)
+[primal-replay] segment=1 endpoint_max_abs_difference=0.000000e+00 endpoint_max_scaled_difference=0.000000e+00
+[autodiff-gate] progress: support reverse segment 1/1 ready elapsed_s=11.475 active_steps=49 support_reuse=0 support_rebuild=49
+[autodiff-gate] progress: support reverse segmented cotangent sweep ready elapsed_s=11.476 support_reuse=0 support_rebuild=49
+[autodiff-gate] progress: support reverse reduced carry bars expanded ready elapsed_s=0.026
+[autodiff-gate] progress: support reverse initial direct-RHS support pullback ready elapsed_s=0.022 boundary=reduced_zero
+[autodiff-gate] progress: support reverse initial state pullback ready elapsed_s=0.005
+[autodiff-gate] progress: initial-Er root boundary compact pullback ready elapsed_s=0.278
+[autodiff-gate] progress: support reverse profile parameter pullback ready elapsed_s=0.000
+[autodiff-gate] progress: support reverse initial-profile scan payload pullback ready elapsed_s=0.328
+[autodiff-gate] progress: database final recorded-scan fold ready elapsed_s=208.765 objective_rows=5 groups=1 contract=one_batched_scan_transpose
+[geometry-fd-ad] progress: objective_table vmec implicit state/raw-block aux ready elapsed_s=0.097
+[geometry-fd-ad] progress: objective_table booz input tables ready elapsed_s=0.206
+[geometry-fd-ad] progress: objective_table booz_xform vjp ready elapsed_s=0.589
+[geometry-fd-ad] progress: objective_table vmec objective cotangents ready elapsed_s=10.511
+[geometry-fd-ad] progress: objective_table boozer light cotangents ready elapsed_s=0.058
+[geometry-fd-ad] progress: objective_table aspect proxy cotangents ready elapsed_s=0.016
+[geometry-fd-ad] progress: objective_table j-qi/maxj Boozer cotangents ready elapsed_s=1.059
+[geometry-fd-ad] progress: objective_table booz cotangents pulled to state elapsed_s=0.330
+[geometry-fd-ad] progress: objective_table final vmec parameter pullback ready elapsed_s=0.402
+[NEOPAX least_squares] eval=6 cost=4.404996e+03 residual_norm=9.386156e+01 total_cost=4.40499629e+03 aspect_ratio=9.60492806e+00 aspect_cost=7.80409181e-02 iota_mean=-5.11469624e-01 iota_cost=4.85411745e-03 mirror_ratio=nan mirror_penalty=1.59876923e-01 mirror_cost=1.27803153e+00 qi=1.12577775e+00 qi_cost=6.33687772e-01 maxJ=9.32966870e+01 maxJ_cost=0.00000000e+00 softmax_Er=nan Er_cost=nan Er_left=nan Er_left_cost=nan Er_right=nan Er_right_cost=nan Er_transition_rho=4.20412453e-01 Er_transition_location_moment=-9.35875466e-02 Er_transition_location_cost=4.37931444e+00 Er_transition_strength=-8.19220707e-01 Er_transition_strength_deficit=1.71922071e+00 Er_transition_strength_cost=1.47785992e+02 bootstrap_penalty=0.00000000e+00 bootstrap_cost=0.00000000e+00 net_power_average_MW_m3=-1.57522140e-02 net_power_MW=-5.21427893e+00 net_power_cost=4.25083637e+03
+wrote /home/exouser/NEOPAX/outputs/geometry_only_net_power_root_bootstrap_replay_fix/geometry_inputs_m2/input.QI_neopax_database_full_transport_net_power_eval_0006
+[optimization] final transport monitor: softmax_Er=-1.0278791039152604e-02
+[autodiff-gate] progress: support reverse profile-state vjp ready elapsed_s=3.488
+[autodiff-gate] progress: support reverse initial carry reduced-zero-RHS forward ready elapsed_s=0.785
+[autodiff-gate] progress: support reverse reusing static schedule artifact (no second adaptive rollout; no per-step carry tape)
+[autodiff-gate] progress: support reverse realized-schedule vjp forward ready elapsed_s=1.888
+[autodiff-gate] progress: support reverse final-objective cotangents ready elapsed_s=1.091 ordinary_mode=grouped_joint_vjp bootstrap_mode=joint_local_vjp_upar_only database_bootstrap_interpolation_mode=legacy_sparse
+[autodiff-gate] progress: support reverse segmented cotangent sweep start segments=8 segment_length=50 objectives=13 cotangent_mode=full
+[autodiff-gate] progress: database segment reverse uses fixed-table table transpose plus compact local fixed-table geometry bars; only table bars cross the recorded scan (no scan owner in segments)
+[primal-replay] segment=8 endpoint_max_abs_difference=0.000000e+00 endpoint_max_scaled_difference=0.000000e+00
+[autodiff-gate] progress: support reverse segment 8/8 ready elapsed_s=6.726 active_steps=26 support_reuse=0 support_rebuild=26
+[primal-replay] segment=7 endpoint_max_abs_difference=0.000000e+00 endpoint_max_scaled_difference=0.000000e+00
+[autodiff-gate] progress: support reverse segment 7/8 ready elapsed_s=11.821 active_steps=50 support_reuse=0 support_rebuild=50
+[primal-replay] segment=6 endpoint_max_abs_difference=0.000000e+00 endpoint_max_scaled_difference=0.000000e+00
+[autodiff-gate] progress: support reverse segment 6/8 ready elapsed_s=11.900 active_steps=50 support_reuse=0 support_rebuild=50
+[primal-replay] segment=5 endpoint_max_abs_difference=0.000000e+00 endpoint_max_scaled_difference=0.000000e+00
+[autodiff-gate] progress: support reverse segment 5/8 ready elapsed_s=11.826 active_steps=50 support_reuse=0 support_rebuild=50
+[primal-replay] segment=4 endpoint_max_abs_difference=0.000000e+00 endpoint_max_scaled_difference=0.000000e+00
+[autodiff-gate] progress: support reverse segment 4/8 ready elapsed_s=12.390 active_steps=50 support_reuse=0 support_rebuild=50
+[primal-replay] segment=3 endpoint_max_abs_difference=0.000000e+00 endpoint_max_scaled_difference=0.000000e+00
+[autodiff-gate] progress: support reverse segment 3/8 ready elapsed_s=12.026 active_steps=50 support_reuse=0 support_rebuild=50
+[primal-replay] segment=2 endpoint_max_abs_difference=0.000000e+00 endpoint_max_scaled_difference=0.000000e+00
+[autodiff-gate] progress: support reverse segment 2/8 ready elapsed_s=12.069 active_steps=50 support_reuse=0 support_rebuild=50
+[primal-replay] segment=1 endpoint_max_abs_difference=0.000000e+00 endpoint_max_scaled_difference=0.000000e+00
+[autodiff-gate] progress: support reverse segment 1/8 ready elapsed_s=11.998 active_steps=50 support_reuse=0 support_rebuild=50
+[autodiff-gate] progress: support reverse segmented cotangent sweep ready elapsed_s=90.756 support_reuse=0 support_rebuild=376
+[autodiff-gate] progress: support reverse reduced carry bars expanded ready elapsed_s=0.028
+[autodiff-gate] progress: support reverse initial direct-RHS support pullback ready elapsed_s=0.022 boundary=reduced_zero
+[autodiff-gate] progress: support reverse initial state pullback ready elapsed_s=0.007
+[autodiff-gate] progress: initial-Er root boundary compact pullback ready elapsed_s=0.276
+[autodiff-gate] progress: support reverse profile parameter pullback ready elapsed_s=0.000
+[autodiff-gate] progress: support reverse initial-profile scan payload pullback ready elapsed_s=0.327
+[autodiff-gate] progress: database final recorded-scan fold ready elapsed_s=209.064 objective_rows=5 groups=1 contract=one_batched_scan_transpose
+[geometry-fd-ad] progress: objective_table vmec implicit state/raw-block aux ready elapsed_s=0.100
+[geometry-fd-ad] progress: objective_table booz input tables ready elapsed_s=0.207
+[geometry-fd-ad] progress: objective_table booz_xform vjp ready elapsed_s=0.589
+[geometry-fd-ad] progress: objective_table vmec objective cotangents ready elapsed_s=10.427
+[geometry-fd-ad] progress: objective_table boozer light cotangents ready elapsed_s=0.059
+[geometry-fd-ad] progress: objective_table aspect proxy cotangents ready elapsed_s=0.011
+[geometry-fd-ad] progress: objective_table j-qi/maxj Boozer cotangents ready elapsed_s=1.047
+[geometry-fd-ad] progress: objective_table booz cotangents pulled to state elapsed_s=0.321
+[geometry-fd-ad] progress: objective_table final vmec parameter pullback ready elapsed_s=0.409
+[NEOPAX least_squares] eval=7 cost=3.895201e+03 residual_norm=8.826326e+01 total_cost=3.89520118e+03 aspect_ratio=9.19507926e+00 aspect_cost=3.23948697e-01 iota_mean=-4.79352282e-01 iota_cost=8.53441309e-03 mirror_ratio=nan mirror_penalty=7.91861977e-02 mirror_cost=3.13522695e-01 qi=1.21411396e+00 qi_cost=7.37036355e-01 maxJ=1.35821233e+02 maxJ_cost=0.00000000e+00 softmax_Er=nan Er_cost=nan Er_left=nan Er_left_cost=nan Er_right=nan Er_right_cost=nan Er_transition_rho=4.15334366e-01 Er_transition_location_moment=-9.86656343e-02 Er_transition_location_cost=4.86745369e+00 Er_transition_strength=-8.29925596e-01 Er_transition_strength_deficit=1.72992560e+00 Er_transition_strength_cost=1.49632128e+02 bootstrap_penalty=0.00000000e+00 bootstrap_cost=0.00000000e+00 net_power_average_MW_m3=4.15018064e-02 net_power_MW=1.37378780e+01 net_power_cost=3.73931856e+03
+wrote /home/exouser/NEOPAX/outputs/geometry_only_net_power_root_bootstrap_replay_fix/geometry_inputs_m2/input.QI_neopax_database_full_transport_net_power_eval_0007
+[optimization] final transport monitor: softmax_Er=-3.8587096916435179e-02
+[autodiff-gate] progress: support reverse profile-state vjp ready elapsed_s=3.444
+[autodiff-gate] progress: support reverse initial carry reduced-zero-RHS forward ready elapsed_s=0.823
+[autodiff-gate] progress: support reverse reusing static schedule artifact (no second adaptive rollout; no per-step carry tape)
+[autodiff-gate] progress: support reverse realized-schedule vjp forward ready elapsed_s=1.930
+[autodiff-gate] progress: support reverse final-objective cotangents ready elapsed_s=1.125 ordinary_mode=grouped_joint_vjp bootstrap_mode=joint_local_vjp_upar_only database_bootstrap_interpolation_mode=legacy_sparse
+[autodiff-gate] progress: support reverse segmented cotangent sweep start segments=1 segment_length=50 objectives=13 cotangent_mode=full
+[autodiff-gate] progress: database segment reverse uses fixed-table table transpose plus compact local fixed-table geometry bars; only table bars cross the recorded scan (no scan owner in segments)
+[primal-replay] segment=1 endpoint_max_abs_difference=0.000000e+00 endpoint_max_scaled_difference=0.000000e+00
+[autodiff-gate] progress: support reverse segment 1/1 ready elapsed_s=8.997 active_steps=38 support_reuse=0 support_rebuild=38
+[autodiff-gate] progress: support reverse segmented cotangent sweep ready elapsed_s=8.998 support_reuse=0 support_rebuild=38
+[autodiff-gate] progress: support reverse reduced carry bars expanded ready elapsed_s=0.027
+[autodiff-gate] progress: support reverse initial direct-RHS support pullback ready elapsed_s=0.026 boundary=reduced_zero
+[autodiff-gate] progress: support reverse initial state pullback ready elapsed_s=0.006
+[autodiff-gate] progress: initial-Er root boundary compact pullback ready elapsed_s=0.287
+[autodiff-gate] progress: support reverse profile parameter pullback ready elapsed_s=0.000
+[autodiff-gate] progress: support reverse initial-profile scan payload pullback ready elapsed_s=0.346
+[autodiff-gate] progress: database final recorded-scan fold ready elapsed_s=208.811 objective_rows=5 groups=1 contract=one_batched_scan_transpose
+[geometry-fd-ad] progress: objective_table vmec implicit state/raw-block aux ready elapsed_s=0.102
+[geometry-fd-ad] progress: objective_table booz input tables ready elapsed_s=0.197
+[geometry-fd-ad] progress: objective_table booz_xform vjp ready elapsed_s=0.594
+[geometry-fd-ad] progress: objective_table vmec objective cotangents ready elapsed_s=10.702
+[geometry-fd-ad] progress: objective_table boozer light cotangents ready elapsed_s=0.065
+[geometry-fd-ad] progress: objective_table aspect proxy cotangents ready elapsed_s=0.011
+[geometry-fd-ad] progress: objective_table j-qi/maxj Boozer cotangents ready elapsed_s=1.054
+[geometry-fd-ad] progress: objective_table booz cotangents pulled to state elapsed_s=0.369
+[geometry-fd-ad] progress: objective_table final vmec parameter pullback ready elapsed_s=0.391
+[NEOPAX least_squares] eval=8 cost=2.936869e+03 residual_norm=7.664031e+01 total_cost=2.93686870e+03 aspect_ratio=9.22563471e+00 aspect_cost=2.99820800e-01 iota_mean=-4.79654799e-01 iota_cost=8.49493570e-03 mirror_ratio=nan mirror_penalty=5.32959534e-02 mirror_cost=1.42022932e-01 qi=1.22689941e+00 qi_cost=7.52641082e-01 maxJ=2.44385353e+02 maxJ_cost=0.00000000e+00 softmax_Er=nan Er_cost=nan Er_left=nan Er_left_cost=nan Er_right=nan Er_right_cost=nan Er_transition_rho=3.80346180e-01 Er_transition_location_moment=-1.33653820e-01 Er_transition_location_cost=8.93167176e+00 Er_transition_strength=-1.11095090e+00 Er_transition_strength_deficit=2.01095090e+00 Er_transition_strength_cost=2.02196176e+02 bootstrap_penalty=7.15716541e-02 bootstrap_cost=1.02450033e-02 net_power_average_MW_m3=1.68115780e-01 net_power_MW=5.56494834e+01 net_power_cost=2.72452762e+03
+wrote /home/exouser/NEOPAX/outputs/geometry_only_net_power_root_bootstrap_replay_fix/geometry_inputs_m2/input.QI_neopax_database_full_transport_net_power_eval_0008
+[optimization] final transport monitor: softmax_Er=-4.2147741062960771e-02
+[autodiff-gate] progress: support reverse profile-state vjp ready elapsed_s=3.388
+[autodiff-gate] progress: support reverse initial carry reduced-zero-RHS forward ready elapsed_s=0.892
+[autodiff-gate] progress: support reverse reusing static schedule artifact (no second adaptive rollout; no per-step carry tape)
+[autodiff-gate] progress: support reverse realized-schedule vjp forward ready elapsed_s=1.855
+[autodiff-gate] progress: support reverse final-objective cotangents ready elapsed_s=1.107 ordinary_mode=grouped_joint_vjp bootstrap_mode=joint_local_vjp_upar_only database_bootstrap_interpolation_mode=legacy_sparse
+[autodiff-gate] progress: support reverse segmented cotangent sweep start segments=1 segment_length=50 objectives=13 cotangent_mode=full
+[autodiff-gate] progress: database segment reverse uses fixed-table table transpose plus compact local fixed-table geometry bars; only table bars cross the recorded scan (no scan owner in segments)
+[primal-replay] segment=1 endpoint_max_abs_difference=0.000000e+00 endpoint_max_scaled_difference=0.000000e+00
+[autodiff-gate] progress: support reverse segment 1/1 ready elapsed_s=8.499 active_steps=36 support_reuse=0 support_rebuild=36
+[autodiff-gate] progress: support reverse segmented cotangent sweep ready elapsed_s=8.499 support_reuse=0 support_rebuild=36
+[autodiff-gate] progress: support reverse reduced carry bars expanded ready elapsed_s=0.026
+[autodiff-gate] progress: support reverse initial direct-RHS support pullback ready elapsed_s=0.023 boundary=reduced_zero
+[autodiff-gate] progress: support reverse initial state pullback ready elapsed_s=0.005
+[autodiff-gate] progress: initial-Er root boundary compact pullback ready elapsed_s=0.272
+[autodiff-gate] progress: support reverse profile parameter pullback ready elapsed_s=0.000
+[autodiff-gate] progress: support reverse initial-profile scan payload pullback ready elapsed_s=0.326
+[autodiff-gate] progress: database final recorded-scan fold ready elapsed_s=208.509 objective_rows=5 groups=1 contract=one_batched_scan_transpose
+[geometry-fd-ad] progress: objective_table vmec implicit state/raw-block aux ready elapsed_s=0.103
+[geometry-fd-ad] progress: objective_table booz input tables ready elapsed_s=0.200
+[geometry-fd-ad] progress: objective_table booz_xform vjp ready elapsed_s=0.590
+[geometry-fd-ad] progress: objective_table vmec objective cotangents ready elapsed_s=10.681
+[geometry-fd-ad] progress: objective_table boozer light cotangents ready elapsed_s=0.059
+[geometry-fd-ad] progress: objective_table aspect proxy cotangents ready elapsed_s=0.012
+[geometry-fd-ad] progress: objective_table j-qi/maxj Boozer cotangents ready elapsed_s=1.092
+[geometry-fd-ad] progress: objective_table booz cotangents pulled to state elapsed_s=0.332
+[geometry-fd-ad] progress: objective_table final vmec parameter pullback ready elapsed_s=0.383
+[NEOPAX least_squares] eval=9 cost=2.489947e+03 residual_norm=7.056836e+01 total_cost=2.48994666e+03 aspect_ratio=9.23972045e+00 aspect_cost=2.89012497e-01 iota_mean=-4.79954532e-01 iota_cost=8.45591189e-03 mirror_ratio=nan mirror_penalty=4.64882926e-02 mirror_cost=1.08058067e-01 qi=1.22781171e+00 qi_cost=7.53760797e-01 maxJ=3.06653440e+02 maxJ_cost=0.00000000e+00 softmax_Er=nan Er_cost=nan Er_left=nan Er_left_cost=nan Er_right=nan Er_right_cost=nan Er_transition_rho=3.70158964e-01 Er_transition_location_moment=-1.43841036e-01 Er_transition_location_cost=1.03451218e+01 Er_transition_strength=-1.18892740e+00 Er_transition_strength_deficit=2.08892740e+00 Er_transition_strength_cost=2.18180885e+02 bootstrap_penalty=1.96809863e-01 bootstrap_cost=7.74682447e-02 net_power_average_MW_m3=2.33956139e-01 net_power_MW=7.74438797e+01 net_power_cost=2.26018390e+03
+wrote /home/exouser/NEOPAX/outputs/geometry_only_net_power_root_bootstrap_replay_fix/geometry_inputs_m2/input.QI_neopax_database_full_transport_net_power_eval_0009
+[optimization] final transport monitor: softmax_Er=-4.2219573357870438e-02
+[autodiff-gate] progress: support reverse profile-state vjp ready elapsed_s=3.827
+[autodiff-gate] progress: support reverse initial carry reduced-zero-RHS forward ready elapsed_s=0.927
+[autodiff-gate] progress: support reverse reusing static schedule artifact (no second adaptive rollout; no per-step carry tape)
+[autodiff-gate] progress: support reverse realized-schedule vjp forward ready elapsed_s=0.960
+[autodiff-gate] progress: support reverse final-objective cotangents ready elapsed_s=1.098 ordinary_mode=grouped_joint_vjp bootstrap_mode=joint_local_vjp_upar_only database_bootstrap_interpolation_mode=legacy_sparse
+[autodiff-gate] progress: support reverse segmented cotangent sweep start segments=1 segment_length=50 objectives=13 cotangent_mode=full
+[autodiff-gate] progress: database segment reverse uses fixed-table table transpose plus compact local fixed-table geometry bars; only table bars cross the recorded scan (no scan owner in segments)
+[primal-replay] segment=1 endpoint_max_abs_difference=0.000000e+00 endpoint_max_scaled_difference=0.000000e+00
+[autodiff-gate] progress: support reverse segment 1/1 ready elapsed_s=8.266 active_steps=35 support_reuse=0 support_rebuild=35
+[autodiff-gate] progress: support reverse segmented cotangent sweep ready elapsed_s=8.267 support_reuse=0 support_rebuild=35
+[autodiff-gate] progress: support reverse reduced carry bars expanded ready elapsed_s=0.026
+[autodiff-gate] progress: support reverse initial direct-RHS support pullback ready elapsed_s=0.022 boundary=reduced_zero
+[autodiff-gate] progress: support reverse initial state pullback ready elapsed_s=0.005
+[autodiff-gate] progress: initial-Er root boundary compact pullback ready elapsed_s=0.273
+[autodiff-gate] progress: support reverse profile parameter pullback ready elapsed_s=0.000
+[autodiff-gate] progress: support reverse initial-profile scan payload pullback ready elapsed_s=0.330
+[autodiff-gate] progress: database final recorded-scan fold ready elapsed_s=208.773 objective_rows=5 groups=1 contract=one_batched_scan_transpose
+[geometry-fd-ad] progress: objective_table vmec implicit state/raw-block aux ready elapsed_s=0.106
+[geometry-fd-ad] progress: objective_table booz input tables ready elapsed_s=0.203
+[geometry-fd-ad] progress: objective_table booz_xform vjp ready elapsed_s=0.583
+[geometry-fd-ad] progress: objective_table vmec objective cotangents ready elapsed_s=10.400
+[geometry-fd-ad] progress: objective_table boozer light cotangents ready elapsed_s=0.058
+[geometry-fd-ad] progress: objective_table aspect proxy cotangents ready elapsed_s=0.011
+[geometry-fd-ad] progress: objective_table j-qi/maxj Boozer cotangents ready elapsed_s=1.034
+[geometry-fd-ad] progress: objective_table booz cotangents pulled to state elapsed_s=0.322
+[geometry-fd-ad] progress: objective_table final vmec parameter pullback ready elapsed_s=0.395
+[NEOPAX least_squares] eval=10 cost=2.499119e+03 residual_norm=7.069821e+01 total_cost=2.49911874e+03 aspect_ratio=9.23520118e+00 aspect_cost=2.92458621e-01 iota_mean=-4.79405953e-01 iota_cost=8.52740257e-03 mirror_ratio=nan mirror_penalty=4.63389237e-02 mirror_cost=1.07364792e-01 qi=1.23710883e+00 qi_cost=7.65219133e-01 maxJ=3.07057827e+02 maxJ_cost=0.00000000e+00 softmax_Er=nan Er_cost=nan Er_left=nan Er_left_cost=nan Er_right=nan Er_right_cost=nan Er_transition_rho=3.70115815e-01 Er_transition_location_moment=-1.43884185e-01 Er_transition_location_cost=1.03513294e+01 Er_transition_strength=-1.19018761e+00 Er_transition_strength_deficit=2.09018761e+00 Er_transition_strength_cost=2.18444211e+02 bootstrap_penalty=1.96147004e-01 bootstrap_cost=7.69472945e-02 net_power_average_MW_m3=2.32635363e-01 net_power_MW=7.70066780e+01 net_power_cost=2.26907268e+03
+wrote /home/exouser/NEOPAX/outputs/geometry_only_net_power_root_bootstrap_replay_fix/geometry_inputs_m2/input.QI_neopax_database_full_transport_net_power_eval_0010
+[optimization] final transport monitor: softmax_Er=-4.2259187848142019e-02
+[autodiff-gate] progress: support reverse profile-state vjp ready elapsed_s=3.425
+[autodiff-gate] progress: support reverse initial carry reduced-zero-RHS forward ready elapsed_s=0.854
+[autodiff-gate] progress: support reverse reusing static schedule artifact (no second adaptive rollout; no per-step carry tape)
+[autodiff-gate] progress: support reverse realized-schedule vjp forward ready elapsed_s=0.952
+[autodiff-gate] progress: support reverse final-objective cotangents ready elapsed_s=1.103 ordinary_mode=grouped_joint_vjp bootstrap_mode=joint_local_vjp_upar_only database_bootstrap_interpolation_mode=legacy_sparse
+[autodiff-gate] progress: support reverse segmented cotangent sweep start segments=1 segment_length=50 objectives=13 cotangent_mode=full
+[autodiff-gate] progress: database segment reverse uses fixed-table table transpose plus compact local fixed-table geometry bars; only table bars cross the recorded scan (no scan owner in segments)
+[primal-replay] segment=1 endpoint_max_abs_difference=0.000000e+00 endpoint_max_scaled_difference=0.000000e+00
+[autodiff-gate] progress: support reverse segment 1/1 ready elapsed_s=8.732 active_steps=37 support_reuse=0 support_rebuild=37
+[autodiff-gate] progress: support reverse segmented cotangent sweep ready elapsed_s=8.734 support_reuse=0 support_rebuild=37
+[autodiff-gate] progress: support reverse reduced carry bars expanded ready elapsed_s=0.025
+[autodiff-gate] progress: support reverse initial direct-RHS support pullback ready elapsed_s=0.023 boundary=reduced_zero
+[autodiff-gate] progress: support reverse initial state pullback ready elapsed_s=0.006
+[autodiff-gate] progress: initial-Er root boundary compact pullback ready elapsed_s=0.283
+[autodiff-gate] progress: support reverse profile parameter pullback ready elapsed_s=0.000
+[autodiff-gate] progress: support reverse initial-profile scan payload pullback ready elapsed_s=0.336
+[autodiff-gate] progress: database final recorded-scan fold ready elapsed_s=208.626 objective_rows=5 groups=1 contract=one_batched_scan_transpose
+[geometry-fd-ad] progress: objective_table vmec implicit state/raw-block aux ready elapsed_s=0.098
+[geometry-fd-ad] progress: objective_table booz input tables ready elapsed_s=0.207
+[geometry-fd-ad] progress: objective_table booz_xform vjp ready elapsed_s=0.585
+[geometry-fd-ad] progress: objective_table vmec objective cotangents ready elapsed_s=12.770
+[geometry-fd-ad] progress: objective_table boozer light cotangents ready elapsed_s=0.061
+[geometry-fd-ad] progress: objective_table aspect proxy cotangents ready elapsed_s=0.011
+[geometry-fd-ad] progress: objective_table j-qi/maxj Boozer cotangents ready elapsed_s=1.085
+[geometry-fd-ad] progress: objective_table booz cotangents pulled to state elapsed_s=0.331
+[geometry-fd-ad] progress: objective_table final vmec parameter pullback ready elapsed_s=0.395
+[NEOPAX least_squares] eval=11 cost=2.503658e+03 residual_norm=7.076239e+01 total_cost=2.50365775e+03 aspect_ratio=9.23406879e+00 aspect_cost=2.93325305e-01 iota_mean=-4.79268641e-01 iota_cost=8.54534415e-03 mirror_ratio=nan mirror_penalty=4.63031241e-02 mirror_cost=1.07198965e-01 qi=1.23944553e+00 qi_cost=7.68112615e-01 maxJ=3.07143018e+02 maxJ_cost=0.00000000e+00 softmax_Er=nan Er_cost=nan Er_left=nan Er_left_cost=nan Er_right=nan Er_right_cost=nan Er_transition_rho=3.70021802e-01 Er_transition_location_moment=-1.43978198e-01 Er_transition_location_cost=1.03648608e+01 Er_transition_strength=-1.19081900e+00 Er_transition_strength_deficit=2.09081900e+00 Er_transition_strength_cost=2.18576204e+02 bootstrap_penalty=1.99377440e-01 bootstrap_cost=7.95027270e-02 net_power_average_MW_m3=2.31984409e-01 net_power_MW=7.67912000e+01 net_power_cost=2.27346000e+03
+wrote /home/exouser/NEOPAX/outputs/geometry_only_net_power_root_bootstrap_replay_fix/geometry_inputs_m2/input.QI_neopax_database_full_transport_net_power_eval_0011
+[optimization] final transport monitor: softmax_Er=-4.2323928092120176e-02
+[autodiff-gate] progress: support reverse profile-state vjp ready elapsed_s=3.471
+[autodiff-gate] progress: support reverse initial carry reduced-zero-RHS forward ready elapsed_s=0.814
+[autodiff-gate] progress: support reverse reusing static schedule artifact (no second adaptive rollout; no per-step carry tape)
+[autodiff-gate] progress: support reverse realized-schedule vjp forward ready elapsed_s=0.976
+[autodiff-gate] progress: support reverse final-objective cotangents ready elapsed_s=1.128 ordinary_mode=grouped_joint_vjp bootstrap_mode=joint_local_vjp_upar_only database_bootstrap_interpolation_mode=legacy_sparse
+[autodiff-gate] progress: support reverse segmented cotangent sweep start segments=1 segment_length=50 objectives=13 cotangent_mode=full
+[autodiff-gate] progress: database segment reverse uses fixed-table table transpose plus compact local fixed-table geometry bars; only table bars cross the recorded scan (no scan owner in segments)
+[primal-replay] segment=1 endpoint_max_abs_difference=0.000000e+00 endpoint_max_scaled_difference=0.000000e+00
+[autodiff-gate] progress: support reverse segment 1/1 ready elapsed_s=8.470 active_steps=36 support_reuse=0 support_rebuild=36
+[autodiff-gate] progress: support reverse segmented cotangent sweep ready elapsed_s=8.470 support_reuse=0 support_rebuild=36
+[autodiff-gate] progress: support reverse reduced carry bars expanded ready elapsed_s=0.027
+[autodiff-gate] progress: support reverse initial direct-RHS support pullback ready elapsed_s=0.021 boundary=reduced_zero
+[autodiff-gate] progress: support reverse initial state pullback ready elapsed_s=0.005
+[autodiff-gate] progress: initial-Er root boundary compact pullback ready elapsed_s=0.286
+[autodiff-gate] progress: support reverse profile parameter pullback ready elapsed_s=0.000
+[autodiff-gate] progress: support reverse initial-profile scan payload pullback ready elapsed_s=0.322
+[autodiff-gate] progress: database final recorded-scan fold ready elapsed_s=208.627 objective_rows=5 groups=1 contract=one_batched_scan_transpose
+[geometry-fd-ad] progress: objective_table vmec implicit state/raw-block aux ready elapsed_s=0.098
+[geometry-fd-ad] progress: objective_table booz input tables ready elapsed_s=0.203
+[geometry-fd-ad] progress: objective_table booz_xform vjp ready elapsed_s=0.602
+[geometry-fd-ad] progress: objective_table vmec objective cotangents ready elapsed_s=10.628
+[geometry-fd-ad] progress: objective_table boozer light cotangents ready elapsed_s=0.063
+[geometry-fd-ad] progress: objective_table aspect proxy cotangents ready elapsed_s=0.011
+[geometry-fd-ad] progress: objective_table j-qi/maxj Boozer cotangents ready elapsed_s=1.056
+[geometry-fd-ad] progress: objective_table booz cotangents pulled to state elapsed_s=0.344
+[geometry-fd-ad] progress: objective_table final vmec parameter pullback ready elapsed_s=0.407
+[NEOPAX least_squares] eval=12 cost=2.514318e+03 residual_norm=7.091288e+01 total_cost=2.51431802e+03 aspect_ratio=9.23378572e+00 aspect_cost=2.93542162e-01 iota_mean=-4.79234309e-01 iota_cost=8.54983303e-03 mirror_ratio=nan mirror_penalty=4.62942054e-02 mirror_cost=1.07157673e-01 qi=1.24003043e+00 qi_cost=7.68837735e-01 maxJ=3.07164032e+02 maxJ_cost=0.00000000e+00 softmax_Er=nan Er_cost=nan Er_left=nan Er_left_cost=nan Er_right=nan Er_right_cost=nan Er_transition_rho=3.70680438e-01 Er_transition_location_moment=-1.43319562e-01 Er_transition_location_cost=1.02702484e+01 Er_transition_strength=-1.19496554e+00 Er_transition_strength_deficit=2.09496554e+00 Er_transition_strength_cost=2.19444031e+02 bootstrap_penalty=2.08601475e-01 bootstrap_cost=8.70291505e-02 net_power_average_MW_m3=2.30520997e-01 net_power_MW=7.63067831e+01 net_power_cost=2.28333862e+03
+wrote /home/exouser/NEOPAX/outputs/geometry_only_net_power_root_bootstrap_replay_fix/geometry_inputs_m2/input.QI_neopax_database_full_transport_net_power_eval_0012
+[optimization] final transport monitor: softmax_Er=-4.3759498499049761e-02
+[autodiff-gate] progress: support reverse profile-state vjp ready elapsed_s=3.470
+[autodiff-gate] progress: support reverse initial carry reduced-zero-RHS forward ready elapsed_s=0.819
+[autodiff-gate] progress: support reverse reusing static schedule artifact (no second adaptive rollout; no per-step carry tape)
+[autodiff-gate] progress: support reverse realized-schedule vjp forward ready elapsed_s=2.124
+[autodiff-gate] progress: support reverse final-objective cotangents ready elapsed_s=1.128 ordinary_mode=grouped_joint_vjp bootstrap_mode=joint_local_vjp_upar_only database_bootstrap_interpolation_mode=legacy_sparse
+[autodiff-gate] progress: support reverse segmented cotangent sweep start segments=3 segment_length=50 objectives=13 cotangent_mode=full
+[autodiff-gate] progress: database segment reverse uses fixed-table table transpose plus compact local fixed-table geometry bars; only table bars cross the recorded scan (no scan owner in segments)
+[primal-replay] segment=3 endpoint_max_abs_difference=0.000000e+00 endpoint_max_scaled_difference=0.000000e+00
+[autodiff-gate] progress: support reverse segment 3/3 ready elapsed_s=5.511 active_steps=21 support_reuse=0 support_rebuild=21
+[primal-replay] segment=2 endpoint_max_abs_difference=0.000000e+00 endpoint_max_scaled_difference=0.000000e+00
+[autodiff-gate] progress: support reverse segment 2/3 ready elapsed_s=12.360 active_steps=50 support_reuse=0 support_rebuild=50
+[primal-replay] segment=1 endpoint_max_abs_difference=0.000000e+00 endpoint_max_scaled_difference=0.000000e+00
+[autodiff-gate] progress: support reverse segment 1/3 ready elapsed_s=12.007 active_steps=50 support_reuse=0 support_rebuild=50
+[autodiff-gate] progress: support reverse segmented cotangent sweep ready elapsed_s=29.879 support_reuse=0 support_rebuild=121
+[autodiff-gate] progress: support reverse reduced carry bars expanded ready elapsed_s=0.027
+[autodiff-gate] progress: support reverse initial direct-RHS support pullback ready elapsed_s=0.022 boundary=reduced_zero
+[autodiff-gate] progress: support reverse initial state pullback ready elapsed_s=0.006
+[autodiff-gate] progress: initial-Er root boundary compact pullback ready elapsed_s=0.273
+[autodiff-gate] progress: support reverse profile parameter pullback ready elapsed_s=0.000
+[autodiff-gate] progress: support reverse initial-profile scan payload pullback ready elapsed_s=0.331
+[autodiff-gate] progress: database final recorded-scan fold ready elapsed_s=209.085 objective_rows=5 groups=1 contract=one_batched_scan_transpose
+[geometry-fd-ad] progress: objective_table vmec implicit state/raw-block aux ready elapsed_s=0.115
+[geometry-fd-ad] progress: objective_table booz input tables ready elapsed_s=0.209
+[geometry-fd-ad] progress: objective_table booz_xform vjp ready elapsed_s=0.612
+[geometry-fd-ad] progress: objective_table vmec objective cotangents ready elapsed_s=10.804
+[geometry-fd-ad] progress: objective_table boozer light cotangents ready elapsed_s=0.063
+[geometry-fd-ad] progress: objective_table aspect proxy cotangents ready elapsed_s=0.011
+[geometry-fd-ad] progress: objective_table j-qi/maxj Boozer cotangents ready elapsed_s=1.058
+[geometry-fd-ad] progress: objective_table booz cotangents pulled to state elapsed_s=0.328
+[geometry-fd-ad] progress: objective_table final vmec parameter pullback ready elapsed_s=0.399
+[NEOPAX least_squares] eval=13 cost=2.631117e+03 residual_norm=7.254126e+01 total_cost=2.63111687e+03 aspect_ratio=9.23371495e+00 aspect_cost=2.93596387e-01 iota_mean=-4.79225726e-01 iota_cost=8.55095544e-03 mirror_ratio=nan mirror_penalty=4.62919769e-02 mirror_cost=1.07147356e-01 qi=1.24017665e+00 qi_cost=7.69019067e-01 maxJ=3.07169362e+02 maxJ_cost=0.00000000e+00 softmax_Er=nan Er_cost=nan Er_left=nan Er_left_cost=nan Er_right=nan Er_right_cost=nan Er_transition_rho=3.65321018e-01 Er_transition_location_moment=-1.48678982e-01 Er_transition_location_cost=1.10527199e+01 Er_transition_strength=-1.21821381e+00 Er_transition_strength_deficit=2.11821381e+00 Er_transition_strength_cost=2.24341487e+02 bootstrap_penalty=1.88423943e-01 bootstrap_cost=7.10071644e-02 net_power_average_MW_m3=2.14270785e-01 net_power_MW=7.09276576e+01 net_power_cost=2.39447334e+03
+wrote /home/exouser/NEOPAX/outputs/geometry_only_net_power_root_bootstrap_replay_fix/geometry_inputs_m2/input.QI_neopax_database_full_transport_net_power_eval_0013
+[optimization] final transport monitor: softmax_Er=-4.1986158260549522e-02
+[autodiff-gate] progress: support reverse profile-state vjp ready elapsed_s=3.635
+[autodiff-gate] progress: support reverse initial carry reduced-zero-RHS forward ready elapsed_s=0.818
+[autodiff-gate] progress: support reverse reusing static schedule artifact (no second adaptive rollout; no per-step carry tape)
+[autodiff-gate] progress: support reverse realized-schedule vjp forward ready elapsed_s=0.016
+[autodiff-gate] progress: support reverse final-objective cotangents ready elapsed_s=1.139 ordinary_mode=grouped_joint_vjp bootstrap_mode=joint_local_vjp_upar_only database_bootstrap_interpolation_mode=legacy_sparse
+[autodiff-gate] progress: support reverse segmented cotangent sweep start segments=1 segment_length=50 objectives=13 cotangent_mode=full
+[autodiff-gate] progress: database segment reverse uses fixed-table table transpose plus compact local fixed-table geometry bars; only table bars cross the recorded scan (no scan owner in segments)
+[primal-replay] segment=1 endpoint_max_abs_difference=0.000000e+00 endpoint_max_scaled_difference=0.000000e+00
+[autodiff-gate] progress: support reverse segment 1/1 ready elapsed_s=8.267 active_steps=35 support_reuse=0 support_rebuild=35
+[autodiff-gate] progress: support reverse segmented cotangent sweep ready elapsed_s=8.268 support_reuse=0 support_rebuild=35
+[autodiff-gate] progress: support reverse reduced carry bars expanded ready elapsed_s=0.027
+[autodiff-gate] progress: support reverse initial direct-RHS support pullback ready elapsed_s=0.023 boundary=reduced_zero
+[autodiff-gate] progress: support reverse initial state pullback ready elapsed_s=0.006
+[autodiff-gate] progress: initial-Er root boundary compact pullback ready elapsed_s=0.274
+[autodiff-gate] progress: support reverse profile parameter pullback ready elapsed_s=0.000
+[autodiff-gate] progress: support reverse initial-profile scan payload pullback ready elapsed_s=0.335
+[autodiff-gate] progress: database final recorded-scan fold ready elapsed_s=209.122 objective_rows=5 groups=1 contract=one_batched_scan_transpose
+[geometry-fd-ad] progress: objective_table vmec implicit state/raw-block aux ready elapsed_s=0.102
+[geometry-fd-ad] progress: objective_table booz input tables ready elapsed_s=0.204
+[geometry-fd-ad] progress: objective_table booz_xform vjp ready elapsed_s=0.594
+[geometry-fd-ad] progress: objective_table vmec objective cotangents ready elapsed_s=10.586
+[geometry-fd-ad] progress: objective_table boozer light cotangents ready elapsed_s=0.062
+[geometry-fd-ad] progress: objective_table aspect proxy cotangents ready elapsed_s=0.011
+[geometry-fd-ad] progress: objective_table j-qi/maxj Boozer cotangents ready elapsed_s=1.051
+[geometry-fd-ad] progress: objective_table booz cotangents pulled to state elapsed_s=0.331
+[geometry-fd-ad] progress: objective_table final vmec parameter pullback ready elapsed_s=0.398
+[NEOPAX least_squares] eval=14 cost=2.478999e+03 residual_norm=7.041305e+01 total_cost=2.47899895e+03 aspect_ratio=9.23369726e+00 aspect_cost=2.93609944e-01 iota_mean=-4.79223580e-01 iota_cost=8.55123606e-03 mirror_ratio=nan mirror_penalty=4.62914204e-02 mirror_cost=1.07144780e-01 qi=1.24021318e+00 qi_cost=7.69064368e-01 maxJ=3.07170646e+02 maxJ_cost=0.00000000e+00 softmax_Er=nan Er_cost=nan Er_left=nan Er_left_cost=nan Er_right=nan Er_right_cost=nan Er_transition_rho=3.70662991e-01 Er_transition_location_moment=-1.43337009e-01 Er_transition_location_cost=1.02727491e+01 Er_transition_strength=-1.18550706e+00 Er_transition_strength_deficit=2.08550706e+00 Er_transition_strength_cost=2.17466985e+02 bootstrap_penalty=2.02822779e-01 bootstrap_cost=8.22741598e-02 net_power_average_MW_m3=2.35472763e-01 net_power_MW=7.79459109e+01 net_power_cost=2.24999857e+03
+wrote /home/exouser/NEOPAX/outputs/geometry_only_net_power_root_bootstrap_replay_fix/geometry_inputs_m2/input.QI_neopax_database_full_transport_net_power_eval_0014
+[optimization] final transport monitor: softmax_Er=-4.1843094354864961e-02
+[autodiff-gate] progress: support reverse profile-state vjp ready elapsed_s=3.493
+[autodiff-gate] progress: support reverse initial carry reduced-zero-RHS forward ready elapsed_s=0.888
+[autodiff-gate] progress: support reverse reusing static schedule artifact (no second adaptive rollout; no per-step carry tape)
+[autodiff-gate] progress: support reverse realized-schedule vjp forward ready elapsed_s=0.336
+[autodiff-gate] progress: support reverse final-objective cotangents ready elapsed_s=1.140 ordinary_mode=grouped_joint_vjp bootstrap_mode=joint_local_vjp_upar_only database_bootstrap_interpolation_mode=legacy_sparse
+[autodiff-gate] progress: support reverse segmented cotangent sweep start segments=1 segment_length=50 objectives=13 cotangent_mode=full
+[autodiff-gate] progress: database segment reverse uses fixed-table table transpose plus compact local fixed-table geometry bars; only table bars cross the recorded scan (no scan owner in segments)
+[primal-replay] segment=1 endpoint_max_abs_difference=0.000000e+00 endpoint_max_scaled_difference=0.000000e+00
+[autodiff-gate] progress: support reverse segment 1/1 ready elapsed_s=8.515 active_steps=36 support_reuse=0 support_rebuild=36
+[autodiff-gate] progress: support reverse segmented cotangent sweep ready elapsed_s=8.516 support_reuse=0 support_rebuild=36
+[autodiff-gate] progress: support reverse reduced carry bars expanded ready elapsed_s=0.028
+[autodiff-gate] progress: support reverse initial direct-RHS support pullback ready elapsed_s=0.022 boundary=reduced_zero
+[autodiff-gate] progress: support reverse initial state pullback ready elapsed_s=0.006
+[autodiff-gate] progress: initial-Er root boundary compact pullback ready elapsed_s=0.293
+[autodiff-gate] progress: support reverse profile parameter pullback ready elapsed_s=0.000
+[autodiff-gate] progress: support reverse initial-profile scan payload pullback ready elapsed_s=0.325
+[autodiff-gate] progress: database final recorded-scan fold ready elapsed_s=208.671 objective_rows=5 groups=1 contract=one_batched_scan_transpose
+[geometry-fd-ad] progress: objective_table vmec implicit state/raw-block aux ready elapsed_s=0.103
+[geometry-fd-ad] progress: objective_table booz input tables ready elapsed_s=0.206
+[geometry-fd-ad] progress: objective_table booz_xform vjp ready elapsed_s=0.604
+[geometry-fd-ad] progress: objective_table vmec objective cotangents ready elapsed_s=10.809
+[geometry-fd-ad] progress: objective_table boozer light cotangents ready elapsed_s=0.064
+[geometry-fd-ad] progress: objective_table aspect proxy cotangents ready elapsed_s=0.014
+[geometry-fd-ad] progress: objective_table j-qi/maxj Boozer cotangents ready elapsed_s=1.069
+[geometry-fd-ad] progress: objective_table booz cotangents pulled to state elapsed_s=0.328
+[geometry-fd-ad] progress: objective_table final vmec parameter pullback ready elapsed_s=0.399
+[NEOPAX least_squares] eval=15 cost=2.466117e+03 residual_norm=7.022986e+01 total_cost=2.46611682e+03 aspect_ratio=9.23370895e+00 aspect_cost=2.93600986e-01 iota_mean=-4.79225007e-01 iota_cost=8.55104938e-03 mirror_ratio=nan mirror_penalty=4.62918036e-02 mirror_cost=1.07146554e-01 qi=1.24018912e+00 qi_cost=7.69034529e-01 maxJ=3.07169378e+02 maxJ_cost=0.00000000e+00 softmax_Er=nan Er_cost=nan Er_left=nan Er_left_cost=nan Er_right=nan Er_right_cost=nan Er_transition_rho=3.70978798e-01 Er_transition_location_moment=-1.43021202e-01 Er_transition_location_cost=1.02275321e+01 Er_transition_strength=-1.18273548e+00 Er_transition_strength_deficit=2.08273548e+00 Er_transition_strength_cost=2.16889354e+02 bootstrap_penalty=2.08909344e-01 bootstrap_cost=8.72862281e-02 net_power_average_MW_m3=2.37303510e-01 net_power_MW=7.85519225e+01 net_power_cost=2.23773431e+03
+wrote /home/exouser/NEOPAX/outputs/geometry_only_net_power_root_bootstrap_replay_fix/geometry_inputs_m2/input.QI_neopax_database_full_transport_net_power_eval_0015
+[optimization] final transport monitor: softmax_Er=-4.3401045004814648e-02
+[autodiff-gate] progress: support reverse profile-state vjp ready elapsed_s=3.653
+[autodiff-gate] progress: support reverse initial carry reduced-zero-RHS forward ready elapsed_s=0.877
+[autodiff-gate] progress: support reverse reusing static schedule artifact (no second adaptive rollout; no per-step carry tape)
+[autodiff-gate] progress: support reverse realized-schedule vjp forward ready elapsed_s=2.369
+[autodiff-gate] progress: support reverse final-objective cotangents ready elapsed_s=1.168 ordinary_mode=grouped_joint_vjp bootstrap_mode=joint_local_vjp_upar_only database_bootstrap_interpolation_mode=legacy_sparse
+[autodiff-gate] progress: support reverse segmented cotangent sweep start segments=1 segment_length=50 objectives=13 cotangent_mode=full
+[autodiff-gate] progress: database segment reverse uses fixed-table table transpose plus compact local fixed-table geometry bars; only table bars cross the recorded scan (no scan owner in segments)
+[primal-replay] segment=1 endpoint_max_abs_difference=0.000000e+00 endpoint_max_scaled_difference=0.000000e+00
+[autodiff-gate] progress: support reverse segment 1/1 ready elapsed_s=9.572 active_steps=39 support_reuse=0 support_rebuild=39
+[autodiff-gate] progress: support reverse segmented cotangent sweep ready elapsed_s=9.573 support_reuse=0 support_rebuild=39
+[autodiff-gate] progress: support reverse reduced carry bars expanded ready elapsed_s=0.029
+[autodiff-gate] progress: support reverse initial direct-RHS support pullback ready elapsed_s=0.024 boundary=reduced_zero
+[autodiff-gate] progress: support reverse initial state pullback ready elapsed_s=0.006
+[autodiff-gate] progress: initial-Er root boundary compact pullback ready elapsed_s=0.275
+[autodiff-gate] progress: support reverse profile parameter pullback ready elapsed_s=0.000
+[autodiff-gate] progress: support reverse initial-profile scan payload pullback ready elapsed_s=0.335
+[autodiff-gate] progress: database final recorded-scan fold ready elapsed_s=208.926 objective_rows=5 groups=1 contract=one_batched_scan_transpose
+[geometry-fd-ad] progress: objective_table vmec implicit state/raw-block aux ready elapsed_s=0.098
+[geometry-fd-ad] progress: objective_table booz input tables ready elapsed_s=0.206
+[geometry-fd-ad] progress: objective_table booz_xform vjp ready elapsed_s=0.593
+[geometry-fd-ad] progress: objective_table vmec objective cotangents ready elapsed_s=10.861
+[geometry-fd-ad] progress: objective_table boozer light cotangents ready elapsed_s=0.065
+[geometry-fd-ad] progress: objective_table aspect proxy cotangents ready elapsed_s=0.011
+[geometry-fd-ad] progress: objective_table j-qi/maxj Boozer cotangents ready elapsed_s=1.079
+[geometry-fd-ad] progress: objective_table booz cotangents pulled to state elapsed_s=0.360
+[geometry-fd-ad] progress: objective_table final vmec parameter pullback ready elapsed_s=0.408
+[NEOPAX least_squares] eval=16 cost=2.603462e+03 residual_norm=7.215901e+01 total_cost=2.60346161e+03 aspect_ratio=9.23373195e+00 aspect_cost=2.93583364e-01 iota_mean=-4.79227852e-01 iota_cost=8.55067733e-03 mirror_ratio=nan mirror_penalty=4.62925952e-02 mirror_cost=1.07150218e-01 qi=1.24014229e+00 qi_cost=7.68976446e-01 maxJ=3.07165412e+02 maxJ_cost=0.00000000e+00 softmax_Er=nan Er_cost=nan Er_left=nan Er_left_cost=nan Er_right=nan Er_right_cost=nan Er_transition_rho=3.67246102e-01 Er_transition_location_moment=-1.46753898e-01 Er_transition_location_cost=1.07683532e+01 Er_transition_strength=-1.21183388e+00 Er_transition_strength_deficit=2.11183388e+00 Er_transition_strength_cost=2.22992117e+02 bootstrap_penalty=1.63070623e-01 bootstrap_cost=5.31840559e-02 net_power_average_MW_m3=2.18038675e-01 net_power_MW=7.21748998e+01 net_power_cost=2.36846970e+03
+wrote /home/exouser/NEOPAX/outputs/geometry_only_net_power_root_bootstrap_replay_fix/geometry_inputs_m2/input.QI_neopax_database_full_transport_net_power_eval_0016
+[optimization] final transport monitor: softmax_Er=-4.3759522581761544e-02
+[autodiff-gate] progress: support reverse profile-state vjp ready elapsed_s=3.494
+[autodiff-gate] progress: support reverse initial carry reduced-zero-RHS forward ready elapsed_s=0.840
+[autodiff-gate] progress: support reverse reusing static schedule artifact (no second adaptive rollout; no per-step carry tape)
+[autodiff-gate] progress: support reverse realized-schedule vjp forward ready elapsed_s=2.059
+[autodiff-gate] progress: support reverse final-objective cotangents ready elapsed_s=1.136 ordinary_mode=grouped_joint_vjp bootstrap_mode=joint_local_vjp_upar_only database_bootstrap_interpolation_mode=legacy_sparse
+[autodiff-gate] progress: support reverse segmented cotangent sweep start segments=3 segment_length=50 objectives=13 cotangent_mode=full
+[autodiff-gate] progress: database segment reverse uses fixed-table table transpose plus compact local fixed-table geometry bars; only table bars cross the recorded scan (no scan owner in segments)
+[primal-replay] segment=3 endpoint_max_abs_difference=0.000000e+00 endpoint_max_scaled_difference=0.000000e+00
+[autodiff-gate] progress: support reverse segment 3/3 ready elapsed_s=5.744 active_steps=22 support_reuse=0 support_rebuild=22
+[primal-replay] segment=2 endpoint_max_abs_difference=0.000000e+00 endpoint_max_scaled_difference=0.000000e+00
+[autodiff-gate] progress: support reverse segment 2/3 ready elapsed_s=12.300 active_steps=50 support_reuse=0 support_rebuild=50
+[primal-replay] segment=1 endpoint_max_abs_difference=0.000000e+00 endpoint_max_scaled_difference=0.000000e+00
+[autodiff-gate] progress: support reverse segment 1/3 ready elapsed_s=12.034 active_steps=50 support_reuse=0 support_rebuild=50
+[autodiff-gate] progress: support reverse segmented cotangent sweep ready elapsed_s=30.080 support_reuse=0 support_rebuild=122
+[autodiff-gate] progress: support reverse reduced carry bars expanded ready elapsed_s=0.027
+[autodiff-gate] progress: support reverse initial direct-RHS support pullback ready elapsed_s=0.022 boundary=reduced_zero
+[autodiff-gate] progress: support reverse initial state pullback ready elapsed_s=0.005
+[autodiff-gate] progress: initial-Er root boundary compact pullback ready elapsed_s=0.274
+[autodiff-gate] progress: support reverse profile parameter pullback ready elapsed_s=0.000
+[autodiff-gate] progress: support reverse initial-profile scan payload pullback ready elapsed_s=0.335
+[autodiff-gate] progress: database final recorded-scan fold ready elapsed_s=208.622 objective_rows=5 groups=1 contract=one_batched_scan_transpose
+[geometry-fd-ad] progress: objective_table vmec implicit state/raw-block aux ready elapsed_s=0.098
+[geometry-fd-ad] progress: objective_table booz input tables ready elapsed_s=0.204
+[geometry-fd-ad] progress: objective_table booz_xform vjp ready elapsed_s=0.601
+[geometry-fd-ad] progress: objective_table vmec objective cotangents ready elapsed_s=13.203
+[geometry-fd-ad] progress: objective_table boozer light cotangents ready elapsed_s=0.156
+[geometry-fd-ad] progress: objective_table aspect proxy cotangents ready elapsed_s=0.017
+[geometry-fd-ad] progress: objective_table j-qi/maxj Boozer cotangents ready elapsed_s=1.061
+[geometry-fd-ad] progress: objective_table booz cotangents pulled to state elapsed_s=0.333
+[geometry-fd-ad] progress: objective_table final vmec parameter pullback ready elapsed_s=0.413
+[NEOPAX least_squares] eval=17 cost=2.631126e+03 residual_norm=7.254138e+01 total_cost=2.63112624e+03 aspect_ratio=9.23371470e+00 aspect_cost=2.93596581e-01 iota_mean=-4.79225718e-01 iota_cost=8.55095637e-03 mirror_ratio=nan mirror_penalty=4.62920016e-02 mirror_cost=1.07147470e-01 qi=1.24017741e+00 qi_cost=7.69020003e-01 maxJ=3.07168383e+02 maxJ_cost=0.00000000e+00 softmax_Er=nan Er_cost=nan Er_left=nan Er_left_cost=nan Er_right=nan Er_right_cost=nan Er_transition_rho=3.65321003e-01 Er_transition_location_moment=-1.48678997e-01 Er_transition_location_cost=1.10527221e+01 Er_transition_strength=-1.21821421e+00 Er_transition_strength_deficit=2.11821421e+00 Er_transition_strength_cost=2.24341571e+02 bootstrap_penalty=1.88425899e-01 bootstrap_cost=7.10086387e-02 net_power_average_MW_m3=2.14269444e-01 net_power_MW=7.09272136e+01 net_power_cost=2.39448262e+03
+wrote /home/exouser/NEOPAX/outputs/geometry_only_net_power_root_bootstrap_replay_fix/geometry_inputs_m2/input.QI_neopax_database_full_transport_net_power_eval_0017
+[optimization] final transport monitor: softmax_Er=-4.1810539833504405e-02
+[autodiff-gate] progress: support reverse profile-state vjp ready elapsed_s=3.789
+[autodiff-gate] progress: support reverse initial carry reduced-zero-RHS forward ready elapsed_s=0.849
+[autodiff-gate] progress: support reverse reusing static schedule artifact (no second adaptive rollout; no per-step carry tape)
+[autodiff-gate] progress: support reverse realized-schedule vjp forward ready elapsed_s=0.932
+[autodiff-gate] progress: support reverse final-objective cotangents ready elapsed_s=1.410 ordinary_mode=grouped_joint_vjp bootstrap_mode=joint_local_vjp_upar_only database_bootstrap_interpolation_mode=legacy_sparse
+[autodiff-gate] progress: support reverse segmented cotangent sweep start segments=1 segment_length=50 objectives=13 cotangent_mode=full
+[autodiff-gate] progress: database segment reverse uses fixed-table table transpose plus compact local fixed-table geometry bars; only table bars cross the recorded scan (no scan owner in segments)
+[primal-replay] segment=1 endpoint_max_abs_difference=0.000000e+00 endpoint_max_scaled_difference=0.000000e+00
+[autodiff-gate] progress: support reverse segment 1/1 ready elapsed_s=9.282 active_steps=39 support_reuse=0 support_rebuild=39
+[autodiff-gate] progress: support reverse segmented cotangent sweep ready elapsed_s=9.283 support_reuse=0 support_rebuild=39
+[autodiff-gate] progress: support reverse reduced carry bars expanded ready elapsed_s=0.029
+[autodiff-gate] progress: support reverse initial direct-RHS support pullback ready elapsed_s=0.024 boundary=reduced_zero
+[autodiff-gate] progress: support reverse initial state pullback ready elapsed_s=0.007
+[autodiff-gate] progress: initial-Er root boundary compact pullback ready elapsed_s=0.277
+[autodiff-gate] progress: support reverse profile parameter pullback ready elapsed_s=0.000
+[autodiff-gate] progress: support reverse initial-profile scan payload pullback ready elapsed_s=0.333
+[autodiff-gate] progress: database final recorded-scan fold ready elapsed_s=208.732 objective_rows=5 groups=1 contract=one_batched_scan_transpose
+[geometry-fd-ad] progress: objective_table vmec implicit state/raw-block aux ready elapsed_s=0.108
+[geometry-fd-ad] progress: objective_table booz input tables ready elapsed_s=0.206
+[geometry-fd-ad] progress: objective_table booz_xform vjp ready elapsed_s=0.729
+[geometry-fd-ad] progress: objective_table vmec objective cotangents ready elapsed_s=10.845
+[geometry-fd-ad] progress: objective_table boozer light cotangents ready elapsed_s=0.065
+[geometry-fd-ad] progress: objective_table aspect proxy cotangents ready elapsed_s=0.011
+[geometry-fd-ad] progress: objective_table j-qi/maxj Boozer cotangents ready elapsed_s=1.099
+[geometry-fd-ad] progress: objective_table booz cotangents pulled to state elapsed_s=0.336
+[geometry-fd-ad] progress: objective_table final vmec parameter pullback ready elapsed_s=0.422
+[NEOPAX least_squares] eval=18 cost=2.463380e+03 residual_norm=7.019089e+01 total_cost=2.46338043e+03 aspect_ratio=9.23371039e+00 aspect_cost=2.93599885e-01 iota_mean=-4.79225185e-01 iota_cost=8.55102612e-03 mirror_ratio=nan mirror_penalty=4.62918526e-02 mirror_cost=1.07146781e-01 qi=1.24018622e+00 qi_cost=7.69030933e-01 maxJ=3.07169145e+02 maxJ_cost=0.00000000e+00 softmax_Er=nan Er_cost=nan Er_left=nan Er_left_cost=nan Er_right=nan Er_right_cost=nan Er_transition_rho=3.71039807e-01 Er_transition_location_moment=-1.42960193e-01 Er_transition_location_cost=1.02188084e+01 Er_transition_strength=-1.18208834e+00 Er_transition_strength_deficit=2.08208834e+00 Er_transition_strength_cost=2.16754592e+02 bootstrap_penalty=2.10949763e-01 bootstrap_cost=8.89996050e-02 net_power_average_MW_m3=2.37691463e-01 net_power_MW=7.86803421e+01 net_power_cost=2.23513970e+03
+wrote /home/exouser/NEOPAX/outputs/geometry_only_net_power_root_bootstrap_replay_fix/geometry_inputs_m2/input.QI_neopax_database_full_transport_net_power_eval_0018
+[optimization] final transport monitor: softmax_Er=-4.3759224710122245e-02
+[autodiff-gate] progress: support reverse profile-state vjp ready elapsed_s=4.606
+[autodiff-gate] progress: support reverse initial carry reduced-zero-RHS forward ready elapsed_s=0.854
+[autodiff-gate] progress: support reverse reusing static schedule artifact (no second adaptive rollout; no per-step carry tape)
+[autodiff-gate] progress: support reverse realized-schedule vjp forward ready elapsed_s=1.247
+[autodiff-gate] progress: support reverse final-objective cotangents ready elapsed_s=1.152 ordinary_mode=grouped_joint_vjp bootstrap_mode=joint_local_vjp_upar_only database_bootstrap_interpolation_mode=legacy_sparse
+[autodiff-gate] progress: support reverse segmented cotangent sweep start segments=3 segment_length=50 objectives=13 cotangent_mode=full
+[autodiff-gate] progress: database segment reverse uses fixed-table table transpose plus compact local fixed-table geometry bars; only table bars cross the recorded scan (no scan owner in segments)
+[primal-replay] segment=3 endpoint_max_abs_difference=0.000000e+00 endpoint_max_scaled_difference=0.000000e+00
+[autodiff-gate] progress: support reverse segment 3/3 ready elapsed_s=5.563 active_steps=22 support_reuse=0 support_rebuild=22
+[primal-replay] segment=2 endpoint_max_abs_difference=0.000000e+00 endpoint_max_scaled_difference=0.000000e+00
+[autodiff-gate] progress: support reverse segment 2/3 ready elapsed_s=12.372 active_steps=50 support_reuse=0 support_rebuild=50
+[primal-replay] segment=1 endpoint_max_abs_difference=0.000000e+00 endpoint_max_scaled_difference=0.000000e+00
+[autodiff-gate] progress: support reverse segment 1/3 ready elapsed_s=12.092 active_steps=50 support_reuse=0 support_rebuild=50
+[autodiff-gate] progress: support reverse segmented cotangent sweep ready elapsed_s=30.028 support_reuse=0 support_rebuild=122
+[autodiff-gate] progress: support reverse reduced carry bars expanded ready elapsed_s=0.027
+[autodiff-gate] progress: support reverse initial direct-RHS support pullback ready elapsed_s=0.023 boundary=reduced_zero
+[autodiff-gate] progress: support reverse initial state pullback ready elapsed_s=0.005
+[autodiff-gate] progress: initial-Er root boundary compact pullback ready elapsed_s=0.271
+[autodiff-gate] progress: support reverse profile parameter pullback ready elapsed_s=0.000
+[autodiff-gate] progress: support reverse initial-profile scan payload pullback ready elapsed_s=0.363
+[autodiff-gate] progress: database final recorded-scan fold ready elapsed_s=208.756 objective_rows=5 groups=1 contract=one_batched_scan_transpose
+[geometry-fd-ad] progress: objective_table vmec implicit state/raw-block aux ready elapsed_s=0.106
+[geometry-fd-ad] progress: objective_table booz input tables ready elapsed_s=0.195
+[geometry-fd-ad] progress: objective_table booz_xform vjp ready elapsed_s=0.594
+[geometry-fd-ad] progress: objective_table vmec objective cotangents ready elapsed_s=10.444
+[geometry-fd-ad] progress: objective_table boozer light cotangents ready elapsed_s=0.059
+[geometry-fd-ad] progress: objective_table aspect proxy cotangents ready elapsed_s=0.012
+[geometry-fd-ad] progress: objective_table j-qi/maxj Boozer cotangents ready elapsed_s=1.065
+[geometry-fd-ad] progress: objective_table booz cotangents pulled to state elapsed_s=0.331
+[geometry-fd-ad] progress: objective_table final vmec parameter pullback ready elapsed_s=0.416
+[NEOPAX least_squares] eval=19 cost=2.631105e+03 residual_norm=7.254110e+01 total_cost=2.63110539e+03 aspect_ratio=9.23371326e+00 aspect_cost=2.93597687e-01 iota_mean=-4.79225541e-01 iota_cost=8.55097961e-03 mirror_ratio=nan mirror_penalty=4.62919519e-02 mirror_cost=1.07147241e-01 qi=1.24018037e+00 qi_cost=7.69023672e-01 maxJ=3.07168619e+02 maxJ_cost=0.00000000e+00 softmax_Er=nan Er_cost=nan Er_left=nan Er_left_cost=nan Er_right=nan Er_right_cost=nan Er_transition_rho=3.65322117e-01 Er_transition_location_moment=-1.48677883e-01 Er_transition_location_cost=1.10525564e+01 Er_transition_strength=-1.21821124e+00 Er_transition_strength_deficit=2.11821124e+00 Er_transition_strength_cost=2.24340943e+02 bootstrap_penalty=1.88351207e-01 bootstrap_cost=7.09523540e-02 net_power_average_MW_m3=2.14272334e-01 net_power_MW=7.09281703e+01 net_power_cost=2.39446262e+03
+wrote /home/exouser/NEOPAX/outputs/geometry_only_net_power_root_bootstrap_replay_fix/geometry_inputs_m2/input.QI_neopax_database_full_transport_net_power_eval_0019
+[optimization] final transport monitor: softmax_Er=-4.1788873826057622e-02
+[autodiff-gate] progress: support reverse profile-state vjp ready elapsed_s=3.937
+[autodiff-gate] progress: support reverse initial carry reduced-zero-RHS forward ready elapsed_s=0.800
+[autodiff-gate] progress: support reverse reusing static schedule artifact (no second adaptive rollout; no per-step carry tape)
+[autodiff-gate] progress: support reverse realized-schedule vjp forward ready elapsed_s=0.280
+[autodiff-gate] progress: support reverse final-objective cotangents ready elapsed_s=1.115 ordinary_mode=grouped_joint_vjp bootstrap_mode=joint_local_vjp_upar_only database_bootstrap_interpolation_mode=legacy_sparse
+[autodiff-gate] progress: support reverse segmented cotangent sweep start segments=1 segment_length=50 objectives=13 cotangent_mode=full
+[autodiff-gate] progress: database segment reverse uses fixed-table table transpose plus compact local fixed-table geometry bars; only table bars cross the recorded scan (no scan owner in segments)
+[primal-replay] segment=1 endpoint_max_abs_difference=0.000000e+00 endpoint_max_scaled_difference=0.000000e+00
+[autodiff-gate] progress: support reverse segment 1/1 ready elapsed_s=9.226 active_steps=39 support_reuse=0 support_rebuild=39
+[autodiff-gate] progress: support reverse segmented cotangent sweep ready elapsed_s=9.227 support_reuse=0 support_rebuild=39
+[autodiff-gate] progress: support reverse reduced carry bars expanded ready elapsed_s=0.029
+[autodiff-gate] progress: support reverse initial direct-RHS support pullback ready elapsed_s=0.022 boundary=reduced_zero
+[autodiff-gate] progress: support reverse initial state pullback ready elapsed_s=0.006
+[autodiff-gate] progress: initial-Er root boundary compact pullback ready elapsed_s=0.274
+[autodiff-gate] progress: support reverse profile parameter pullback ready elapsed_s=0.000
+[autodiff-gate] progress: support reverse initial-profile scan payload pullback ready elapsed_s=0.333
+[autodiff-gate] progress: database final recorded-scan fold ready elapsed_s=208.673 objective_rows=5 groups=1 contract=one_batched_scan_transpose
+[geometry-fd-ad] progress: objective_table vmec implicit state/raw-block aux ready elapsed_s=0.108
+[geometry-fd-ad] progress: objective_table booz input tables ready elapsed_s=0.205
+[geometry-fd-ad] progress: objective_table booz_xform vjp ready elapsed_s=0.586
+[geometry-fd-ad] progress: objective_table vmec objective cotangents ready elapsed_s=10.366
+[geometry-fd-ad] progress: objective_table boozer light cotangents ready elapsed_s=0.057
+[geometry-fd-ad] progress: objective_table aspect proxy cotangents ready elapsed_s=0.012
+[geometry-fd-ad] progress: objective_table j-qi/maxj Boozer cotangents ready elapsed_s=1.049
+[geometry-fd-ad] progress: objective_table booz cotangents pulled to state elapsed_s=0.330
+[geometry-fd-ad] progress: objective_table final vmec parameter pullback ready elapsed_s=0.406
+[NEOPAX least_squares] eval=20 cost=2.461729e+03 residual_norm=7.016736e+01 total_cost=2.46172893e+03 aspect_ratio=9.23371110e+00 aspect_cost=2.93599335e-01 iota_mean=-4.79225274e-01 iota_cost=8.55101451e-03 mirror_ratio=nan mirror_penalty=4.62918778e-02 mirror_cost=1.07146898e-01 qi=1.24018474e+00 qi_cost=7.69029089e-01 maxJ=3.07168999e+02 maxJ_cost=0.00000000e+00 softmax_Er=nan Er_cost=nan Er_left=nan Er_left_cost=nan Er_right=nan Er_right_cost=nan Er_transition_rho=3.71068886e-01 Er_transition_location_moment=-1.42931114e-01 Er_transition_location_cost=1.02146517e+01 Er_transition_strength=-1.18164314e+00 Er_transition_strength_deficit=2.08164314e+00 Er_transition_strength_cost=2.16661909e+02 bootstrap_penalty=2.12939603e-01 bootstrap_cost=9.06865492e-02 net_power_average_MW_m3=2.37924280e-01 net_power_MW=7.87574088e+01 net_power_cost=2.23358336e+03
+wrote /home/exouser/NEOPAX/outputs/geometry_only_net_power_root_bootstrap_replay_fix/geometry_inputs_m2/input.QI_neopax_database_full_transport_net_power_eval_0020
+[optimization] final transport monitor: softmax_Er=-4.3759095400913217e-02
+[autodiff-gate] progress: support reverse profile-state vjp ready elapsed_s=3.792
+[autodiff-gate] progress: support reverse initial carry reduced-zero-RHS forward ready elapsed_s=0.809
+[autodiff-gate] progress: support reverse reusing static schedule artifact (no second adaptive rollout; no per-step carry tape)
+[autodiff-gate] progress: support reverse realized-schedule vjp forward ready elapsed_s=1.903
+[autodiff-gate] progress: support reverse final-objective cotangents ready elapsed_s=1.106 ordinary_mode=grouped_joint_vjp bootstrap_mode=joint_local_vjp_upar_only database_bootstrap_interpolation_mode=legacy_sparse
+[autodiff-gate] progress: support reverse segmented cotangent sweep start segments=3 segment_length=50 objectives=13 cotangent_mode=full
+[autodiff-gate] progress: database segment reverse uses fixed-table table transpose plus compact local fixed-table geometry bars; only table bars cross the recorded scan (no scan owner in segments)
+[primal-replay] segment=3 endpoint_max_abs_difference=0.000000e+00 endpoint_max_scaled_difference=0.000000e+00
+[autodiff-gate] progress: support reverse segment 3/3 ready elapsed_s=5.778 active_steps=23 support_reuse=0 support_rebuild=23
+[primal-replay] segment=2 endpoint_max_abs_difference=0.000000e+00 endpoint_max_scaled_difference=0.000000e+00
+[autodiff-gate] progress: support reverse segment 2/3 ready elapsed_s=12.163 active_steps=50 support_reuse=0 support_rebuild=50
+[primal-replay] segment=1 endpoint_max_abs_difference=0.000000e+00 endpoint_max_scaled_difference=0.000000e+00
+[autodiff-gate] progress: support reverse segment 1/3 ready elapsed_s=12.090 active_steps=50 support_reuse=0 support_rebuild=50
+[autodiff-gate] progress: support reverse segmented cotangent sweep ready elapsed_s=30.032 support_reuse=0 support_rebuild=123
+[autodiff-gate] progress: support reverse reduced carry bars expanded ready elapsed_s=0.028
+[autodiff-gate] progress: support reverse initial direct-RHS support pullback ready elapsed_s=0.023 boundary=reduced_zero
+[autodiff-gate] progress: support reverse initial state pullback ready elapsed_s=0.006
+[autodiff-gate] progress: initial-Er root boundary compact pullback ready elapsed_s=0.272
+[autodiff-gate] progress: support reverse profile parameter pullback ready elapsed_s=0.000
+[autodiff-gate] progress: support reverse initial-profile scan payload pullback ready elapsed_s=0.322
+[autodiff-gate] progress: database final recorded-scan fold ready elapsed_s=208.959 objective_rows=5 groups=1 contract=one_batched_scan_transpose
+[geometry-fd-ad] progress: objective_table vmec implicit state/raw-block aux ready elapsed_s=0.101
+[geometry-fd-ad] progress: objective_table booz input tables ready elapsed_s=0.193
+[geometry-fd-ad] progress: objective_table booz_xform vjp ready elapsed_s=0.583
+[geometry-fd-ad] progress: objective_table vmec objective cotangents ready elapsed_s=10.403
+[geometry-fd-ad] progress: objective_table boozer light cotangents ready elapsed_s=0.060
+[geometry-fd-ad] progress: objective_table aspect proxy cotangents ready elapsed_s=0.011
+[geometry-fd-ad] progress: objective_table j-qi/maxj Boozer cotangents ready elapsed_s=1.055
+[geometry-fd-ad] progress: objective_table booz cotangents pulled to state elapsed_s=0.327
+[geometry-fd-ad] progress: objective_table final vmec parameter pullback ready elapsed_s=0.391
+[NEOPAX least_squares] eval=21 cost=2.631097e+03 residual_norm=7.254098e+01 total_cost=2.63109659e+03 aspect_ratio=9.23371254e+00 aspect_cost=2.93598236e-01 iota_mean=-4.79225452e-01 iota_cost=8.55099126e-03 mirror_ratio=nan mirror_penalty=4.62919274e-02 mirror_cost=1.07147127e-01 qi=1.24018182e+00 qi_cost=7.69025470e-01 maxJ=3.07168742e+02 maxJ_cost=0.00000000e+00 softmax_Er=nan Er_cost=nan Er_left=nan Er_left_cost=nan Er_right=nan Er_right_cost=nan Er_transition_rho=3.65322615e-01 Er_transition_location_moment=-1.48677385e-01 Er_transition_location_cost=1.10524824e+01 Er_transition_strength=-1.21821007e+00 Er_transition_strength_deficit=2.11821007e+00 Er_transition_strength_cost=2.24340696e+02 bootstrap_penalty=1.88319003e-01 bootstrap_cost=7.09280937e-02 net_power_average_MW_m3=2.14273557e-01 net_power_MW=7.09285752e+01 net_power_cost=2.39445416e+03
+wrote /home/exouser/NEOPAX/outputs/geometry_only_net_power_root_bootstrap_replay_fix/geometry_inputs_m2/input.QI_neopax_database_full_transport_net_power_eval_0021
+[optimization] final transport monitor: softmax_Er=-4.1779733696289970e-02
+[autodiff-gate] progress: support reverse profile-state vjp ready elapsed_s=3.762
+[autodiff-gate] progress: support reverse initial carry reduced-zero-RHS forward ready elapsed_s=0.855
+[autodiff-gate] progress: support reverse reusing static schedule artifact (no second adaptive rollout; no per-step carry tape)
+[autodiff-gate] progress: support reverse realized-schedule vjp forward ready elapsed_s=0.288
+[autodiff-gate] progress: support reverse final-objective cotangents ready elapsed_s=1.163 ordinary_mode=grouped_joint_vjp bootstrap_mode=joint_local_vjp_upar_only database_bootstrap_interpolation_mode=legacy_sparse
+[autodiff-gate] progress: support reverse segmented cotangent sweep start segments=1 segment_length=50 objectives=13 cotangent_mode=full
+[autodiff-gate] progress: database segment reverse uses fixed-table table transpose plus compact local fixed-table geometry bars; only table bars cross the recorded scan (no scan owner in segments)
+[primal-replay] segment=1 endpoint_max_abs_difference=0.000000e+00 endpoint_max_scaled_difference=0.000000e+00
+[autodiff-gate] progress: support reverse segment 1/1 ready elapsed_s=9.431 active_steps=39 support_reuse=0 support_rebuild=39
+[autodiff-gate] progress: support reverse segmented cotangent sweep ready elapsed_s=9.432 support_reuse=0 support_rebuild=39
+[autodiff-gate] progress: support reverse reduced carry bars expanded ready elapsed_s=0.026
+[autodiff-gate] progress: support reverse initial direct-RHS support pullback ready elapsed_s=0.025 boundary=reduced_zero
+[autodiff-gate] progress: support reverse initial state pullback ready elapsed_s=0.006
+[autodiff-gate] progress: initial-Er root boundary compact pullback ready elapsed_s=0.293
+[autodiff-gate] progress: support reverse profile parameter pullback ready elapsed_s=0.000
+[autodiff-gate] progress: support reverse initial-profile scan payload pullback ready elapsed_s=0.334
+[autodiff-gate] progress: database final recorded-scan fold ready elapsed_s=208.728 objective_rows=5 groups=1 contract=one_batched_scan_transpose
+[geometry-fd-ad] progress: objective_table vmec implicit state/raw-block aux ready elapsed_s=0.103
+[geometry-fd-ad] progress: objective_table booz input tables ready elapsed_s=0.199
+[geometry-fd-ad] progress: objective_table booz_xform vjp ready elapsed_s=0.585
+[geometry-fd-ad] progress: objective_table vmec objective cotangents ready elapsed_s=10.378
+[geometry-fd-ad] progress: objective_table boozer light cotangents ready elapsed_s=0.059
+[geometry-fd-ad] progress: objective_table aspect proxy cotangents ready elapsed_s=0.013
+[geometry-fd-ad] progress: objective_table j-qi/maxj Boozer cotangents ready elapsed_s=1.046
+[geometry-fd-ad] progress: objective_table booz cotangents pulled to state elapsed_s=0.325
+[geometry-fd-ad] progress: objective_table final vmec parameter pullback ready elapsed_s=0.384
+[NEOPAX least_squares] eval=22 cost=2.461298e+03 residual_norm=7.016121e+01 total_cost=2.46129751e+03 aspect_ratio=9.23371146e+00 aspect_cost=2.93599061e-01 iota_mean=-4.79225318e-01 iota_cost=8.55100868e-03 mirror_ratio=nan mirror_penalty=4.62918901e-02 mirror_cost=1.07146955e-01 qi=1.24018401e+00 qi_cost=7.69028191e-01 maxJ=3.07168940e+02 maxJ_cost=0.00000000e+00 softmax_Er=nan Er_cost=nan Er_left=nan Er_left_cost=nan Er_right=nan Er_right_cost=nan Er_transition_rho=3.71059459e-01 Er_transition_location_moment=-1.42940541e-01 Er_transition_location_cost=1.02159991e+01 Er_transition_strength=-1.18143336e+00 Er_transition_strength_deficit=2.08143336e+00 Er_transition_strength_cost=2.16618242e+02 bootstrap_penalty=2.14869721e-01 bootstrap_cost=9.23379940e-02 net_power_average_MW_m3=2.37982745e-01 net_power_MW=7.87767621e+01 net_power_cost=2.23319261e+03
+wrote /home/exouser/NEOPAX/outputs/geometry_only_net_power_root_bootstrap_replay_fix/geometry_inputs_m2/input.QI_neopax_database_full_transport_net_power_eval_0022
+[optimization] final transport monitor: softmax_Er=-4.1788931711672528e-02
+[autodiff-gate] progress: support reverse profile-state vjp ready elapsed_s=3.696
+[autodiff-gate] progress: support reverse initial carry reduced-zero-RHS forward ready elapsed_s=0.800
+[autodiff-gate] progress: support reverse reusing static schedule artifact (no second adaptive rollout; no per-step carry tape)
+[autodiff-gate] progress: support reverse realized-schedule vjp forward ready elapsed_s=0.012
+[autodiff-gate] progress: support reverse final-objective cotangents ready elapsed_s=1.094 ordinary_mode=grouped_joint_vjp bootstrap_mode=joint_local_vjp_upar_only database_bootstrap_interpolation_mode=legacy_sparse
+[autodiff-gate] progress: support reverse segmented cotangent sweep start segments=1 segment_length=50 objectives=13 cotangent_mode=full
+[autodiff-gate] progress: database segment reverse uses fixed-table table transpose plus compact local fixed-table geometry bars; only table bars cross the recorded scan (no scan owner in segments)
+[primal-replay] segment=1 endpoint_max_abs_difference=0.000000e+00 endpoint_max_scaled_difference=0.000000e+00
+[autodiff-gate] progress: support reverse segment 1/1 ready elapsed_s=9.245 active_steps=39 support_reuse=0 support_rebuild=39
+[autodiff-gate] progress: support reverse segmented cotangent sweep ready elapsed_s=9.246 support_reuse=0 support_rebuild=39
+[autodiff-gate] progress: support reverse reduced carry bars expanded ready elapsed_s=0.024
+[autodiff-gate] progress: support reverse initial direct-RHS support pullback ready elapsed_s=0.022 boundary=reduced_zero
+[autodiff-gate] progress: support reverse initial state pullback ready elapsed_s=0.006
+[autodiff-gate] progress: initial-Er root boundary compact pullback ready elapsed_s=0.273
+[autodiff-gate] progress: support reverse profile parameter pullback ready elapsed_s=0.000
+[autodiff-gate] progress: support reverse initial-profile scan payload pullback ready elapsed_s=0.327
+[autodiff-gate] progress: database final recorded-scan fold ready elapsed_s=208.662 objective_rows=5 groups=1 contract=one_batched_scan_transpose
+[geometry-fd-ad] progress: objective_table vmec implicit state/raw-block aux ready elapsed_s=0.103
+[geometry-fd-ad] progress: objective_table booz input tables ready elapsed_s=0.198
+[geometry-fd-ad] progress: objective_table booz_xform vjp ready elapsed_s=0.590
+[geometry-fd-ad] progress: objective_table vmec objective cotangents ready elapsed_s=10.454
+[geometry-fd-ad] progress: objective_table boozer light cotangents ready elapsed_s=0.059
+[geometry-fd-ad] progress: objective_table aspect proxy cotangents ready elapsed_s=0.011
+[geometry-fd-ad] progress: objective_table j-qi/maxj Boozer cotangents ready elapsed_s=1.054
+[geometry-fd-ad] progress: objective_table booz cotangents pulled to state elapsed_s=0.328
+[geometry-fd-ad] progress: objective_table final vmec parameter pullback ready elapsed_s=0.390
+[NEOPAX least_squares] eval=23 cost=2.461733e+03 residual_norm=7.016741e+01 total_cost=2.46173272e+03 aspect_ratio=9.23371111e+00 aspect_cost=2.93599329e-01 iota_mean=-4.79225274e-01 iota_cost=8.55101450e-03 mirror_ratio=nan mirror_penalty=4.62918781e-02 mirror_cost=1.07146899e-01 qi=1.24018470e+00 qi_cost=7.69029043e-01 maxJ=3.07169032e+02 maxJ_cost=0.00000000e+00 softmax_Er=nan Er_cost=nan Er_left=nan Er_left_cost=nan Er_right=nan Er_right_cost=nan Er_transition_rho=3.71068840e-01 Er_transition_location_moment=-1.42931160e-01 Er_transition_location_cost=1.02146582e+01 Er_transition_strength=-1.18164439e+00 Er_transition_strength_deficit=2.08164439e+00 Er_transition_strength_cost=2.16662167e+02 bootstrap_penalty=2.12932488e-01 bootstrap_cost=9.06804892e-02 net_power_average_MW_m3=2.37923752e-01 net_power_MW=7.87572341e+01 net_power_cost=2.23358688e+03
+wrote /home/exouser/NEOPAX/outputs/geometry_only_net_power_root_bootstrap_replay_fix/geometry_inputs_m2/input.QI_neopax_database_full_transport_net_power_eval_0023
+[optimization] final transport monitor: softmax_Er=-4.1781010595659709e-02
+[autodiff-gate] progress: support reverse profile-state vjp ready elapsed_s=3.586
+[autodiff-gate] progress: support reverse initial carry reduced-zero-RHS forward ready elapsed_s=0.799
+[autodiff-gate] progress: support reverse reusing static schedule artifact (no second adaptive rollout; no per-step carry tape)
+[autodiff-gate] progress: support reverse realized-schedule vjp forward ready elapsed_s=0.010
+[autodiff-gate] progress: support reverse final-objective cotangents ready elapsed_s=1.087 ordinary_mode=grouped_joint_vjp bootstrap_mode=joint_local_vjp_upar_only database_bootstrap_interpolation_mode=legacy_sparse
+[autodiff-gate] progress: support reverse segmented cotangent sweep start segments=1 segment_length=50 objectives=13 cotangent_mode=full
+[autodiff-gate] progress: database segment reverse uses fixed-table table transpose plus compact local fixed-table geometry bars; only table bars cross the recorded scan (no scan owner in segments)
+[primal-replay] segment=1 endpoint_max_abs_difference=0.000000e+00 endpoint_max_scaled_difference=0.000000e+00
+[autodiff-gate] progress: support reverse segment 1/1 ready elapsed_s=9.247 active_steps=39 support_reuse=0 support_rebuild=39
+[autodiff-gate] progress: support reverse segmented cotangent sweep ready elapsed_s=9.248 support_reuse=0 support_rebuild=39
+[autodiff-gate] progress: support reverse reduced carry bars expanded ready elapsed_s=0.024
+[autodiff-gate] progress: support reverse initial direct-RHS support pullback ready elapsed_s=0.021 boundary=reduced_zero
+[autodiff-gate] progress: support reverse initial state pullback ready elapsed_s=0.006
+[autodiff-gate] progress: initial-Er root boundary compact pullback ready elapsed_s=0.272
+[autodiff-gate] progress: support reverse profile parameter pullback ready elapsed_s=0.000
+[autodiff-gate] progress: support reverse initial-profile scan payload pullback ready elapsed_s=0.342
+[autodiff-gate] progress: database final recorded-scan fold ready elapsed_s=208.695 objective_rows=5 groups=1 contract=one_batched_scan_transpose
+[geometry-fd-ad] progress: objective_table vmec implicit state/raw-block aux ready elapsed_s=0.104
+[geometry-fd-ad] progress: objective_table booz input tables ready elapsed_s=0.194
+[geometry-fd-ad] progress: objective_table booz_xform vjp ready elapsed_s=0.583
+[geometry-fd-ad] progress: objective_table vmec objective cotangents ready elapsed_s=12.691
+[geometry-fd-ad] progress: objective_table boozer light cotangents ready elapsed_s=0.059
+[geometry-fd-ad] progress: objective_table aspect proxy cotangents ready elapsed_s=0.011
+[geometry-fd-ad] progress: objective_table j-qi/maxj Boozer cotangents ready elapsed_s=1.049
+[geometry-fd-ad] progress: objective_table booz cotangents pulled to state elapsed_s=0.321
+[geometry-fd-ad] progress: objective_table final vmec parameter pullback ready elapsed_s=0.413
+[NEOPAX least_squares] eval=24 cost=2.461281e+03 residual_norm=7.016097e+01 total_cost=2.46128120e+03 aspect_ratio=9.23371138e+00 aspect_cost=2.93599128e-01 iota_mean=-4.79225307e-01 iota_cost=8.55101015e-03 mirror_ratio=nan mirror_penalty=4.62918873e-02 mirror_cost=1.07146941e-01 qi=1.24018418e+00 qi_cost=7.69028394e-01 maxJ=3.07168957e+02 maxJ_cost=0.00000000e+00 softmax_Er=nan Er_cost=nan Er_left=nan Er_left_cost=nan Er_right=nan Er_right_cost=nan Er_transition_rho=3.71067280e-01 Er_transition_location_moment=-1.42932720e-01 Er_transition_location_cost=1.02148812e+01 Er_transition_strength=-1.18146885e+00 Er_transition_strength_deficit=2.08146885e+00 Er_transition_strength_cost=2.16625629e+02 bootstrap_penalty=2.14281801e-01 bootstrap_cost=9.18333803e-02 net_power_average_MW_m3=2.37986049e-01 net_power_MW=7.87778557e+01 net_power_cost=2.23317053e+03
+wrote /home/exouser/NEOPAX/outputs/geometry_only_net_power_root_bootstrap_replay_fix/geometry_inputs_m2/input.QI_neopax_database_full_transport_net_power_eval_0024
+[optimization] final transport monitor: softmax_Er=-4.1780649177468779e-02
+[autodiff-gate] progress: support reverse profile-state vjp ready elapsed_s=3.599
+[autodiff-gate] progress: support reverse initial carry reduced-zero-RHS forward ready elapsed_s=0.794
+[autodiff-gate] progress: support reverse reusing static schedule artifact (no second adaptive rollout; no per-step carry tape)
+[autodiff-gate] progress: support reverse realized-schedule vjp forward ready elapsed_s=0.014
+[autodiff-gate] progress: support reverse final-objective cotangents ready elapsed_s=1.073 ordinary_mode=grouped_joint_vjp bootstrap_mode=joint_local_vjp_upar_only database_bootstrap_interpolation_mode=legacy_sparse
+[autodiff-gate] progress: support reverse segmented cotangent sweep start segments=1 segment_length=50 objectives=13 cotangent_mode=full
+[autodiff-gate] progress: database segment reverse uses fixed-table table transpose plus compact local fixed-table geometry bars; only table bars cross the recorded scan (no scan owner in segments)
+[primal-replay] segment=1 endpoint_max_abs_difference=0.000000e+00 endpoint_max_scaled_difference=0.000000e+00
+[autodiff-gate] progress: support reverse segment 1/1 ready elapsed_s=9.293 active_steps=39 support_reuse=0 support_rebuild=39
+[autodiff-gate] progress: support reverse segmented cotangent sweep ready elapsed_s=9.293 support_reuse=0 support_rebuild=39
+[autodiff-gate] progress: support reverse reduced carry bars expanded ready elapsed_s=0.026
+[autodiff-gate] progress: support reverse initial direct-RHS support pullback ready elapsed_s=0.022 boundary=reduced_zero
+[autodiff-gate] progress: support reverse initial state pullback ready elapsed_s=0.005
+[autodiff-gate] progress: initial-Er root boundary compact pullback ready elapsed_s=0.272
+[autodiff-gate] progress: support reverse profile parameter pullback ready elapsed_s=0.000
+[autodiff-gate] progress: support reverse initial-profile scan payload pullback ready elapsed_s=0.321
+[autodiff-gate] progress: database final recorded-scan fold ready elapsed_s=208.616 objective_rows=5 groups=1 contract=one_batched_scan_transpose
+[geometry-fd-ad] progress: objective_table vmec implicit state/raw-block aux ready elapsed_s=0.106
+[geometry-fd-ad] progress: objective_table booz input tables ready elapsed_s=0.198
+[geometry-fd-ad] progress: objective_table booz_xform vjp ready elapsed_s=0.594
+[geometry-fd-ad] progress: objective_table vmec objective cotangents ready elapsed_s=10.441
+[geometry-fd-ad] progress: objective_table boozer light cotangents ready elapsed_s=0.058
+[geometry-fd-ad] progress: objective_table aspect proxy cotangents ready elapsed_s=0.011
+[geometry-fd-ad] progress: objective_table j-qi/maxj Boozer cotangents ready elapsed_s=1.062
+[geometry-fd-ad] progress: objective_table booz cotangents pulled to state elapsed_s=0.327
+[geometry-fd-ad] progress: objective_table final vmec parameter pullback ready elapsed_s=0.407
+[NEOPAX least_squares] eval=25 cost=2.461273e+03 residual_norm=7.016086e+01 total_cost=2.46127297e+03 aspect_ratio=9.23371140e+00 aspect_cost=2.93599110e-01 iota_mean=-4.79225310e-01 iota_cost=8.55100978e-03 mirror_ratio=nan mirror_penalty=4.62918880e-02 mirror_cost=1.07146945e-01 qi=1.24018413e+00 qi_cost=7.69028341e-01 maxJ=3.07168958e+02 maxJ_cost=0.00000000e+00 softmax_Er=nan Er_cost=nan Er_left=nan Er_left_cost=nan Er_right=nan Er_right_cost=nan Er_transition_rho=3.71066162e-01 Er_transition_location_moment=-1.42933838e-01 Er_transition_location_cost=1.02150410e+01 Er_transition_strength=-1.18145981e+00 Er_transition_strength_deficit=2.08145981e+00 Er_transition_strength_cost=2.16623748e+02 bootstrap_penalty=2.14395067e-01 bootstrap_cost=9.19304891e-02 net_power_average_MW_m3=2.37987037e-01 net_power_MW=7.87781827e+01 net_power_cost=2.23316393e+03
+wrote /home/exouser/NEOPAX/outputs/geometry_only_net_power_root_bootstrap_replay_fix/geometry_inputs_m2/input.QI_neopax_database_full_transport_net_power_eval_0025
+[optimization] final transport monitor: softmax_Er=-4.1780376103989353e-02
+[autodiff-gate] progress: support reverse profile-state vjp ready elapsed_s=3.514
+[autodiff-gate] progress: support reverse initial carry reduced-zero-RHS forward ready elapsed_s=0.778
+[autodiff-gate] progress: support reverse reusing static schedule artifact (no second adaptive rollout; no per-step carry tape)
+[autodiff-gate] progress: support reverse realized-schedule vjp forward ready elapsed_s=0.010
+[autodiff-gate] progress: support reverse final-objective cotangents ready elapsed_s=1.061 ordinary_mode=grouped_joint_vjp bootstrap_mode=joint_local_vjp_upar_only database_bootstrap_interpolation_mode=legacy_sparse
+[autodiff-gate] progress: support reverse segmented cotangent sweep start segments=1 segment_length=50 objectives=13 cotangent_mode=full
+[autodiff-gate] progress: database segment reverse uses fixed-table table transpose plus compact local fixed-table geometry bars; only table bars cross the recorded scan (no scan owner in segments)
+[primal-replay] segment=1 endpoint_max_abs_difference=0.000000e+00 endpoint_max_scaled_difference=0.000000e+00
+[autodiff-gate] progress: support reverse segment 1/1 ready elapsed_s=9.308 active_steps=39 support_reuse=0 support_rebuild=39
+[autodiff-gate] progress: support reverse segmented cotangent sweep ready elapsed_s=9.309 support_reuse=0 support_rebuild=39
+[autodiff-gate] progress: support reverse reduced carry bars expanded ready elapsed_s=0.030
+[autodiff-gate] progress: support reverse initial direct-RHS support pullback ready elapsed_s=0.026 boundary=reduced_zero
+[autodiff-gate] progress: support reverse initial state pullback ready elapsed_s=0.006
+[autodiff-gate] progress: initial-Er root boundary compact pullback ready elapsed_s=0.275
+[autodiff-gate] progress: support reverse profile parameter pullback ready elapsed_s=0.000
+[autodiff-gate] progress: support reverse initial-profile scan payload pullback ready elapsed_s=0.321
+[autodiff-gate] progress: database final recorded-scan fold ready elapsed_s=208.713 objective_rows=5 groups=1 contract=one_batched_scan_transpose
+[geometry-fd-ad] progress: objective_table vmec implicit state/raw-block aux ready elapsed_s=0.101
+[geometry-fd-ad] progress: objective_table booz input tables ready elapsed_s=0.211
+[geometry-fd-ad] progress: objective_table booz_xform vjp ready elapsed_s=0.601
+[geometry-fd-ad] progress: objective_table vmec objective cotangents ready elapsed_s=10.423
+[geometry-fd-ad] progress: objective_table boozer light cotangents ready elapsed_s=0.058
+[geometry-fd-ad] progress: objective_table aspect proxy cotangents ready elapsed_s=0.011
+[geometry-fd-ad] progress: objective_table j-qi/maxj Boozer cotangents ready elapsed_s=1.044
+[geometry-fd-ad] progress: objective_table booz cotangents pulled to state elapsed_s=0.325
+[geometry-fd-ad] progress: objective_table final vmec parameter pullback ready elapsed_s=0.385
+[NEOPAX least_squares] eval=26 cost=2.461270e+03 residual_norm=7.016081e+01 total_cost=2.46126991e+03 aspect_ratio=9.23371142e+00 aspect_cost=2.93599092e-01 iota_mean=-4.79225313e-01 iota_cost=8.55100941e-03 mirror_ratio=nan mirror_penalty=4.62918887e-02 mirror_cost=1.07146948e-01 qi=1.24018409e+00 qi_cost=7.69028286e-01 maxJ=3.07168964e+02 maxJ_cost=0.00000000e+00 softmax_Er=nan Er_cost=nan Er_left=nan Er_left_cost=nan Er_right=nan Er_right_cost=nan Er_transition_rho=3.71065043e-01 Er_transition_location_moment=-1.42934957e-01 Er_transition_location_cost=1.02152009e+01 Er_transition_strength=-1.18145274e+00 Er_transition_strength_deficit=2.08145274e+00 Er_transition_strength_cost=2.16622275e+02 bootstrap_penalty=2.14493830e-01 bootstrap_cost=9.20152064e-02 net_power_average_MW_m3=2.37987310e-01 net_power_MW=7.87782732e+01 net_power_cost=2.23316210e+03
+wrote /home/exouser/NEOPAX/outputs/geometry_only_net_power_root_bootstrap_replay_fix/geometry_inputs_m2/input.QI_neopax_database_full_transport_net_power_eval_0026
+[optimization] final transport monitor: softmax_Er=-4.1780466794556631e-02
+[autodiff-gate] progress: support reverse profile-state vjp ready elapsed_s=3.575
+[autodiff-gate] progress: support reverse initial carry reduced-zero-RHS forward ready elapsed_s=0.795
+[autodiff-gate] progress: support reverse reusing static schedule artifact (no second adaptive rollout; no per-step carry tape)
+[autodiff-gate] progress: support reverse realized-schedule vjp forward ready elapsed_s=1.272
+[autodiff-gate] progress: support reverse final-objective cotangents ready elapsed_s=1.084 ordinary_mode=grouped_joint_vjp bootstrap_mode=joint_local_vjp_upar_only database_bootstrap_interpolation_mode=legacy_sparse
+[autodiff-gate] progress: support reverse segmented cotangent sweep start segments=1 segment_length=50 objectives=13 cotangent_mode=full
+[autodiff-gate] progress: database segment reverse uses fixed-table table transpose plus compact local fixed-table geometry bars; only table bars cross the recorded scan (no scan owner in segments)
+[primal-replay] segment=1 endpoint_max_abs_difference=0.000000e+00 endpoint_max_scaled_difference=0.000000e+00
+[autodiff-gate] progress: support reverse segment 1/1 ready elapsed_s=9.478 active_steps=40 support_reuse=0 support_rebuild=40
+[autodiff-gate] progress: support reverse segmented cotangent sweep ready elapsed_s=9.479 support_reuse=0 support_rebuild=40
+[autodiff-gate] progress: support reverse reduced carry bars expanded ready elapsed_s=0.024
+[autodiff-gate] progress: support reverse initial direct-RHS support pullback ready elapsed_s=0.020 boundary=reduced_zero
+[autodiff-gate] progress: support reverse initial state pullback ready elapsed_s=0.005
+[autodiff-gate] progress: initial-Er root boundary compact pullback ready elapsed_s=0.270
+[autodiff-gate] progress: support reverse profile parameter pullback ready elapsed_s=0.000
+[autodiff-gate] progress: support reverse initial-profile scan payload pullback ready elapsed_s=0.320
+[autodiff-gate] progress: database final recorded-scan fold ready elapsed_s=208.528 objective_rows=5 groups=1 contract=one_batched_scan_transpose
+[geometry-fd-ad] progress: objective_table vmec implicit state/raw-block aux ready elapsed_s=0.097
+[geometry-fd-ad] progress: objective_table booz input tables ready elapsed_s=0.195
+[geometry-fd-ad] progress: objective_table booz_xform vjp ready elapsed_s=0.590
+[geometry-fd-ad] progress: objective_table vmec objective cotangents ready elapsed_s=10.267
+[geometry-fd-ad] progress: objective_table boozer light cotangents ready elapsed_s=0.058
+[geometry-fd-ad] progress: objective_table aspect proxy cotangents ready elapsed_s=0.011
+[geometry-fd-ad] progress: objective_table j-qi/maxj Boozer cotangents ready elapsed_s=1.040
+[geometry-fd-ad] progress: objective_table booz cotangents pulled to state elapsed_s=0.323
+[geometry-fd-ad] progress: objective_table final vmec parameter pullback ready elapsed_s=0.399
+[NEOPAX least_squares] eval=27 cost=2.461270e+03 residual_norm=7.016081e+01 total_cost=2.46126980e+03 aspect_ratio=9.23371145e+00 aspect_cost=2.93599071e-01 iota_mean=-4.79225315e-01 iota_cost=8.55100906e-03 mirror_ratio=nan mirror_penalty=4.62918893e-02 mirror_cost=1.07146951e-01 qi=1.24018404e+00 qi_cost=7.69028222e-01 maxJ=3.07168996e+02 maxJ_cost=0.00000000e+00 softmax_Er=nan Er_cost=nan Er_left=nan Er_left_cost=nan Er_right=nan Er_right_cost=nan Er_transition_rho=3.71065463e-01 Er_transition_location_moment=-1.42934537e-01 Er_transition_location_cost=1.02151409e+01 Er_transition_strength=-1.18145509e+00 Er_transition_strength_deficit=2.08145509e+00 Er_transition_strength_cost=2.16622766e+02 bootstrap_penalty=2.14459004e-01 bootstrap_cost=9.19853288e-02 net_power_average_MW_m3=2.37987388e-01 net_power_MW=7.87782990e+01 net_power_cost=2.23316158e+03
+wrote /home/exouser/NEOPAX/outputs/geometry_only_net_power_root_bootstrap_replay_fix/geometry_inputs_m2/input.QI_neopax_database_full_transport_net_power_eval_0027
+[optimization] final transport monitor: softmax_Er=-4.1779872766091283e-02
+[autodiff-gate] progress: support reverse profile-state vjp ready elapsed_s=4.339
+[autodiff-gate] progress: support reverse initial carry reduced-zero-RHS forward ready elapsed_s=0.802
+[autodiff-gate] progress: support reverse reusing static schedule artifact (no second adaptive rollout; no per-step carry tape)
+[autodiff-gate] progress: support reverse realized-schedule vjp forward ready elapsed_s=0.013
+[autodiff-gate] progress: support reverse final-objective cotangents ready elapsed_s=1.087 ordinary_mode=grouped_joint_vjp bootstrap_mode=joint_local_vjp_upar_only database_bootstrap_interpolation_mode=legacy_sparse
+[autodiff-gate] progress: support reverse segmented cotangent sweep start segments=1 segment_length=50 objectives=13 cotangent_mode=full
+[autodiff-gate] progress: database segment reverse uses fixed-table table transpose plus compact local fixed-table geometry bars; only table bars cross the recorded scan (no scan owner in segments)
+[primal-replay] segment=1 endpoint_max_abs_difference=0.000000e+00 endpoint_max_scaled_difference=0.000000e+00
+[autodiff-gate] progress: support reverse segment 1/1 ready elapsed_s=9.338 active_steps=39 support_reuse=0 support_rebuild=39
+[autodiff-gate] progress: support reverse segmented cotangent sweep ready elapsed_s=9.338 support_reuse=0 support_rebuild=39
+[autodiff-gate] progress: support reverse reduced carry bars expanded ready elapsed_s=0.027
+[autodiff-gate] progress: support reverse initial direct-RHS support pullback ready elapsed_s=0.023 boundary=reduced_zero
+[autodiff-gate] progress: support reverse initial state pullback ready elapsed_s=0.007
+[autodiff-gate] progress: initial-Er root boundary compact pullback ready elapsed_s=0.282
+[autodiff-gate] progress: support reverse profile parameter pullback ready elapsed_s=0.000
+[autodiff-gate] progress: support reverse initial-profile scan payload pullback ready elapsed_s=0.338
+[autodiff-gate] progress: database final recorded-scan fold ready elapsed_s=210.122 objective_rows=5 groups=1 contract=one_batched_scan_transpose
+[geometry-fd-ad] progress: objective_table vmec implicit state/raw-block aux ready elapsed_s=0.109
+[geometry-fd-ad] progress: objective_table booz input tables ready elapsed_s=0.207
+[geometry-fd-ad] progress: objective_table booz_xform vjp ready elapsed_s=0.596
+[geometry-fd-ad] progress: objective_table vmec objective cotangents ready elapsed_s=11.026
+[geometry-fd-ad] progress: objective_table boozer light cotangents ready elapsed_s=0.069
+[geometry-fd-ad] progress: objective_table aspect proxy cotangents ready elapsed_s=0.013
+[geometry-fd-ad] progress: objective_table j-qi/maxj Boozer cotangents ready elapsed_s=1.148
+[geometry-fd-ad] progress: objective_table booz cotangents pulled to state elapsed_s=0.355
+[geometry-fd-ad] progress: objective_table final vmec parameter pullback ready elapsed_s=0.424
+[NEOPAX least_squares] eval=28 cost=2.461282e+03 residual_norm=7.016098e+01 total_cost=2.46128153e+03 aspect_ratio=9.23371146e+00 aspect_cost=2.93599066e-01 iota_mean=-4.79225316e-01 iota_cost=8.55100897e-03 mirror_ratio=nan mirror_penalty=4.62918899e-02 mirror_cost=1.07146954e-01 qi=1.24018400e+00 qi_cost=7.69028171e-01 maxJ=3.07168983e+02 maxJ_cost=0.00000000e+00 softmax_Er=nan Er_cost=nan Er_left=nan Er_left_cost=nan Er_right=nan Er_right_cost=nan Er_transition_rho=3.71061506e-01 Er_transition_location_moment=-1.42938494e-01 Er_transition_location_cost=1.02157065e+01 Er_transition_strength=-1.18143833e+00 Er_transition_strength_deficit=2.08143833e+00 Er_transition_strength_cost=2.16619276e+02 bootstrap_penalty=2.14747675e-01 bootstrap_cost=9.22331278e-02 net_power_average_MW_m3=2.37985232e-01 net_power_MW=7.87775851e+01 net_power_cost=2.23317599e+03
+wrote /home/exouser/NEOPAX/outputs/geometry_only_net_power_root_bootstrap_replay_fix/geometry_inputs_m2/input.QI_neopax_database_full_transport_net_power_eval_0028
+[optimization] final transport monitor: softmax_Er=-4.1779958062438512e-02
+[autodiff-gate] progress: support reverse profile-state vjp ready elapsed_s=3.456
+[autodiff-gate] progress: support reverse initial carry reduced-zero-RHS forward ready elapsed_s=0.793
+[autodiff-gate] progress: support reverse reusing static schedule artifact (no second adaptive rollout; no per-step carry tape)
+[autodiff-gate] progress: support reverse realized-schedule vjp forward ready elapsed_s=0.012
+[autodiff-gate] progress: support reverse final-objective cotangents ready elapsed_s=1.074 ordinary_mode=grouped_joint_vjp bootstrap_mode=joint_local_vjp_upar_only database_bootstrap_interpolation_mode=legacy_sparse
+[autodiff-gate] progress: support reverse segmented cotangent sweep start segments=1 segment_length=50 objectives=13 cotangent_mode=full
+[autodiff-gate] progress: database segment reverse uses fixed-table table transpose plus compact local fixed-table geometry bars; only table bars cross the recorded scan (no scan owner in segments)
+[primal-replay] segment=1 endpoint_max_abs_difference=0.000000e+00 endpoint_max_scaled_difference=0.000000e+00
+[autodiff-gate] progress: support reverse segment 1/1 ready elapsed_s=9.252 active_steps=39 support_reuse=0 support_rebuild=39
+[autodiff-gate] progress: support reverse segmented cotangent sweep ready elapsed_s=9.253 support_reuse=0 support_rebuild=39
+[autodiff-gate] progress: support reverse reduced carry bars expanded ready elapsed_s=0.026
+[autodiff-gate] progress: support reverse initial direct-RHS support pullback ready elapsed_s=0.022 boundary=reduced_zero
+[autodiff-gate] progress: support reverse initial state pullback ready elapsed_s=0.006
+[autodiff-gate] progress: initial-Er root boundary compact pullback ready elapsed_s=0.272
+[autodiff-gate] progress: support reverse profile parameter pullback ready elapsed_s=0.000
+[autodiff-gate] progress: support reverse initial-profile scan payload pullback ready elapsed_s=0.324
+[autodiff-gate] progress: database final recorded-scan fold ready elapsed_s=209.055 objective_rows=5 groups=1 contract=one_batched_scan_transpose
+[geometry-fd-ad] progress: objective_table vmec implicit state/raw-block aux ready elapsed_s=0.105
+[geometry-fd-ad] progress: objective_table booz input tables ready elapsed_s=0.198
+[geometry-fd-ad] progress: objective_table booz_xform vjp ready elapsed_s=0.591
+[geometry-fd-ad] progress: objective_table vmec objective cotangents ready elapsed_s=10.509
+[geometry-fd-ad] progress: objective_table boozer light cotangents ready elapsed_s=0.059
+[geometry-fd-ad] progress: objective_table aspect proxy cotangents ready elapsed_s=0.012
+[geometry-fd-ad] progress: objective_table j-qi/maxj Boozer cotangents ready elapsed_s=1.083
+[geometry-fd-ad] progress: objective_table booz cotangents pulled to state elapsed_s=0.325
+[geometry-fd-ad] progress: objective_table final vmec parameter pullback ready elapsed_s=0.407
+[NEOPAX least_squares] eval=29 cost=2.461277e+03 residual_norm=7.016091e+01 total_cost=2.46127663e+03 aspect_ratio=9.23371145e+00 aspect_cost=2.93599070e-01 iota_mean=-4.79225316e-01 iota_cost=8.55100904e-03 mirror_ratio=nan mirror_penalty=4.62918897e-02 mirror_cost=1.07146953e-01 qi=1.24018401e+00 qi_cost=7.69028187e-01 maxJ=3.07168983e+02 maxJ_cost=0.00000000e+00 softmax_Er=nan Er_cost=nan Er_left=nan Er_left_cost=nan Er_right=nan Er_right_cost=nan Er_transition_rho=3.71062353e-01 Er_transition_location_moment=-1.42937647e-01 Er_transition_location_cost=1.02155855e+01 Er_transition_strength=-1.18144098e+00 Er_transition_strength_deficit=2.08144098e+00 Er_transition_strength_cost=2.16619827e+02 bootstrap_penalty=2.14692789e-01 bootstrap_cost=9.21859870e-02 net_power_average_MW_m3=2.37986023e-01 net_power_MW=7.87778470e+01 net_power_cost=2.23317070e+03
+wrote /home/exouser/NEOPAX/outputs/geometry_only_net_power_root_bootstrap_replay_fix/geometry_inputs_m2/input.QI_neopax_database_full_transport_net_power_eval_0029
+[optimization] final transport monitor: softmax_Er=-4.1780612757864974e-02
+[autodiff-gate] progress: support reverse profile-state vjp ready elapsed_s=3.459
+[autodiff-gate] progress: support reverse initial carry reduced-zero-RHS forward ready elapsed_s=0.813
+[autodiff-gate] progress: support reverse reusing static schedule artifact (no second adaptive rollout; no per-step carry tape)
+[autodiff-gate] progress: support reverse realized-schedule vjp forward ready elapsed_s=0.301
+[autodiff-gate] progress: support reverse final-objective cotangents ready elapsed_s=1.119 ordinary_mode=grouped_joint_vjp bootstrap_mode=joint_local_vjp_upar_only database_bootstrap_interpolation_mode=legacy_sparse
+[autodiff-gate] progress: support reverse segmented cotangent sweep start segments=1 segment_length=50 objectives=13 cotangent_mode=full
+[autodiff-gate] progress: database segment reverse uses fixed-table table transpose plus compact local fixed-table geometry bars; only table bars cross the recorded scan (no scan owner in segments)
+[primal-replay] segment=1 endpoint_max_abs_difference=0.000000e+00 endpoint_max_scaled_difference=0.000000e+00
+[autodiff-gate] progress: support reverse segment 1/1 ready elapsed_s=9.075 active_steps=38 support_reuse=0 support_rebuild=38
+[autodiff-gate] progress: support reverse segmented cotangent sweep ready elapsed_s=9.076 support_reuse=0 support_rebuild=38
+[autodiff-gate] progress: support reverse reduced carry bars expanded ready elapsed_s=0.027
+[autodiff-gate] progress: support reverse initial direct-RHS support pullback ready elapsed_s=0.022 boundary=reduced_zero
+[autodiff-gate] progress: support reverse initial state pullback ready elapsed_s=0.007
+[autodiff-gate] progress: initial-Er root boundary compact pullback ready elapsed_s=0.270
+[autodiff-gate] progress: support reverse profile parameter pullback ready elapsed_s=0.000
+[autodiff-gate] progress: support reverse initial-profile scan payload pullback ready elapsed_s=0.324
+[autodiff-gate] progress: database final recorded-scan fold ready elapsed_s=208.575 objective_rows=5 groups=1 contract=one_batched_scan_transpose
+[geometry-fd-ad] progress: objective_table vmec implicit state/raw-block aux ready elapsed_s=0.098
+[geometry-fd-ad] progress: objective_table booz input tables ready elapsed_s=0.194
+[geometry-fd-ad] progress: objective_table booz_xform vjp ready elapsed_s=0.581
+[geometry-fd-ad] progress: objective_table vmec objective cotangents ready elapsed_s=12.730
+[geometry-fd-ad] progress: objective_table boozer light cotangents ready elapsed_s=0.060
+[geometry-fd-ad] progress: objective_table aspect proxy cotangents ready elapsed_s=0.013
+[geometry-fd-ad] progress: objective_table j-qi/maxj Boozer cotangents ready elapsed_s=1.038
+[geometry-fd-ad] progress: objective_table booz cotangents pulled to state elapsed_s=0.324
+[geometry-fd-ad] progress: objective_table final vmec parameter pullback ready elapsed_s=0.392
+[NEOPAX least_squares] eval=30 cost=2.461271e+03 residual_norm=7.016083e+01 total_cost=2.46127129e+03 aspect_ratio=9.23371145e+00 aspect_cost=2.93599071e-01 iota_mean=-4.79225316e-01 iota_cost=8.55100905e-03 mirror_ratio=nan mirror_penalty=4.62918892e-02 mirror_cost=1.07146950e-01 qi=1.24018404e+00 qi_cost=7.69028228e-01 maxJ=3.07169001e+02 maxJ_cost=0.00000000e+00 softmax_Er=nan Er_cost=nan Er_left=nan Er_left_cost=nan Er_right=nan Er_right_cost=nan Er_transition_rho=3.71066018e-01 Er_transition_location_moment=-1.42933982e-01 Er_transition_location_cost=1.02150617e+01 Er_transition_strength=-1.18145862e+00 Er_transition_strength_deficit=2.08145862e+00 Er_transition_strength_cost=2.16623499e+02 bootstrap_penalty=2.14409885e-01 bootstrap_cost=9.19431974e-02 net_power_average_MW_m3=2.37987256e-01 net_power_MW=7.87782553e+01 net_power_cost=2.23316246e+03
+The maximum number of function evaluations is exceeded.
+Function evaluations 30, initial cost 1.7336e+04, final cost 2.4613e+03, first-order optimality 2.84e+05.
+[optimization] final transport monitor: softmax_Er=-4.1780466794556631e-02
+[autodiff-gate] progress: support reverse profile-state vjp ready elapsed_s=3.429
+[autodiff-gate] progress: support reverse initial carry reduced-zero-RHS forward ready elapsed_s=0.673
+[autodiff-gate] progress: support reverse reusing static schedule artifact (no second adaptive rollout; no per-step carry tape)
+[autodiff-gate] progress: support reverse realized-schedule vjp forward ready elapsed_s=0.013
+[autodiff-gate] progress: support reverse final-objective cotangents ready elapsed_s=0.870 ordinary_mode=grouped_joint_vjp bootstrap_mode=joint_local_vjp_upar_only database_bootstrap_interpolation_mode=legacy_sparse
+[autodiff-gate] progress: support reverse segmented cotangent sweep start segments=1 segment_length=50 objectives=13 cotangent_mode=full
+[autodiff-gate] progress: database segment reverse uses fixed-table table transpose plus compact local fixed-table geometry bars; only table bars cross the recorded scan (no scan owner in segments)
+[primal-replay] segment=1 endpoint_max_abs_difference=0.000000e+00 endpoint_max_scaled_difference=0.000000e+00
+[autodiff-gate] progress: support reverse segment 1/1 ready elapsed_s=9.512 active_steps=40 support_reuse=0 support_rebuild=40
+[autodiff-gate] progress: support reverse segmented cotangent sweep ready elapsed_s=9.513 support_reuse=0 support_rebuild=40
+[autodiff-gate] progress: support reverse reduced carry bars expanded ready elapsed_s=0.026
+[autodiff-gate] progress: support reverse initial direct-RHS support pullback ready elapsed_s=0.024 boundary=reduced_zero
+[autodiff-gate] progress: support reverse initial state pullback ready elapsed_s=0.006
+[autodiff-gate] progress: initial-Er root boundary compact pullback ready elapsed_s=0.273
+[autodiff-gate] progress: support reverse profile parameter pullback ready elapsed_s=0.000
+[autodiff-gate] progress: support reverse initial-profile scan payload pullback ready elapsed_s=0.252
+[autodiff-gate] progress: database final recorded-scan fold ready elapsed_s=208.679 objective_rows=5 groups=1 contract=one_batched_scan_transpose
+[geometry-fd-ad] progress: objective_table vmec implicit state/raw-block aux ready elapsed_s=0.114
+[geometry-fd-ad] progress: objective_table booz input tables ready elapsed_s=0.214
+[geometry-fd-ad] progress: objective_table booz_xform vjp ready elapsed_s=0.598
+[geometry-fd-ad] progress: objective_table vmec objective cotangents ready elapsed_s=10.423
+[geometry-fd-ad] progress: objective_table boozer light cotangents ready elapsed_s=0.060
+[geometry-fd-ad] progress: objective_table aspect proxy cotangents ready elapsed_s=0.011
+[geometry-fd-ad] progress: objective_table j-qi/maxj Boozer cotangents ready elapsed_s=1.028
+[geometry-fd-ad] progress: objective_table booz cotangents pulled to state elapsed_s=0.323
+[geometry-fd-ad] progress: objective_table final vmec parameter pullback ready elapsed_s=0.391
+[QI + database full-transport/net-power stage 2] elapsed_s=372.084 total_cost=2.46126980e+03 aspect_ratio=9.23371145e+00 aspect_cost=2.93599071e-01 iota_mean=-4.79225315e-01 iota_cost=8.55100906e-03 mirror_ratio=nan mirror_penalty=4.62918893e-02 mirror_cost=1.07146951e-01 qi=1.24018404e+00 qi_cost=7.69028222e-01 maxJ=3.07168996e+02 maxJ_cost=0.00000000e+00 softmax_Er=nan Er_cost=nan Er_left=nan Er_left_cost=nan Er_right=nan Er_right_cost=nan Er_transition_rho=3.71065463e-01 Er_transition_location_moment=-1.42934537e-01 Er_transition_location_cost=1.02151409e+01 Er_transition_strength=-1.18145509e+00 Er_transition_strength_deficit=2.08145509e+00 Er_transition_strength_cost=2.16622766e+02 bootstrap_penalty=2.14459004e-01 bootstrap_cost=9.19853288e-02 net_power_average_MW_m3=2.37987388e-01 net_power_MW=7.87782990e+01 net_power_cost=2.23316158e+03
+  - geometry:boozer_qi_objective: value=1.2401840363675138e+00
+  - geometry:boozer_maxj_objective: value=3.0716899612029783e+02
+  - mirror_penalization: value=4.6291889258592733e-02
+  - geometry:vmec_aspect_ratio: value=9.2337114499520201e+00
+  - geometry:vmec_iota_mean: value=-4.7922531543509622e-01
+  - transport:Er_transition_rho: value=3.7106546324391865e-01
+  - transport:Er_transition_location_moment: value=-1.4293453675608137e-01
+  - transport:Er_transition_strength: value=-1.1814550946713571e+00
+  - Er_transition_strength_deficit: value=2.0814550946714769e+00
+  - bootstrap_current_penalty: value=2.1445900403564463e-01
+  - transport:net_total_power_volume_average_mw_m3: value=2.3798738824007407e-01
+  residual_norm=7.016081e+01
+  jacobian_shape=(11, 24)
