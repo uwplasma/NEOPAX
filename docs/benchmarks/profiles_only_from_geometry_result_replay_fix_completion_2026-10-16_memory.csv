@@ -1,0 +1,3 @@
+﻿"evaluation","rss_MiB","live_jax_arrays","device_bytes_in_use","device_peak_bytes_in_use","stage_caches"
+"29","10760.9","746","48852224","5909524480","{'runtime_scan': 1, 'segment_replay': 1, 'segment_bwd': 1, 'schedule_probe': 1, 'bootstrap': 1}"
+"30","10912.7","746","48852224","5909524480","{'runtime_scan': 1, 'segment_replay': 1, 'segment_bwd': 1, 'schedule_probe': 1, 'bootstrap': 1}"

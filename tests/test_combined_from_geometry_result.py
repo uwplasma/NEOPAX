@@ -427,7 +427,6 @@ class InitialProfilePlotTests(unittest.TestCase):
                 return nominal * (1 + np.asarray(x))
 
         problem = Problem()
-        problem.profile_cfg = profile_cfg
         initial_x, optimized_x = np.zeros(6), np.asarray([.01, -.02, 0, 0, 0, 0])
         with (
             patch.object(reverse, "state_with_initial_er_root_ad", side_effect=AssertionError("must not solve initial Er")),

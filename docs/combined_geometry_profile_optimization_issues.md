@@ -1418,11 +1418,11 @@ stopping later slots, snapshot creation and endpoint mismatch detection.
 No expensive transport, VMEC, NTX or FD calculation was run locally.
 
 **Status:** the cache discrepancy is corrected in the optimization path and
-the scalar comparison passes. The saved GPU trial has not been reevaluated
-with this correction; elimination of its nonfinite failure is not claimed.
-Other cache/predictor differences are not ruled out. If reconstruction still
-fails, the convergence guard should identify its first failing accepted slot
-instead of reporting the downstream nonfinite stage-adjoint matrix.
+the scalar comparison passes. The GPU verification recorded below now also
+passes the previously failing saved trial. The partial stage-2 run below also
+shows stable sampled GPU memory and no failures through 19 completed
+evaluations; accepted root progress remains limited. A final optimization
+result is not present in the supplied excerpt.
 
 The existing saved-point replay can verify the correction without rerunning
 optimization. Preserve the previous evidence by using a new output directory:
@@ -1441,6 +1441,313 @@ python examples/optimization/optimize_geometry_profiles_from_geometry_result.py 
   --out-dir outputs/profiles_only_trial_0002_checked_replay \
   2>&1 | tee outputs/profiles_only_trial_0002_checked_replay.log
 ```
+
+### GPU verification: the previously failing saved trial now passes
+
+The user ran the checked replay command above. The complete output is saved
+as [raw output](benchmarks/profiles_only_trial_0002_checked_replay_2026-10-16.txt),
+with an [evaluation summary](benchmarks/profiles_only_trial_0002_checked_replay_2026-10-16.csv)
+and [per-segment comparisons](benchmarks/profiles_only_trial_0002_checked_replay_2026-10-16_segments.csv).
+Source attachment: `0f16712d-848f-4f31-afc9-ff575de21141/Pasted text.txt`,
+7524 bytes, SHA256
+`6c9d2002b71bb1eb4f13c49dfc4a52902925a1d75317ed4fe042129471e849ec`.
+The local checkout at archival time is commit
+`e83a143c908248d39541331e69f6ec96e3452cc5`,
+`Preserve forward Newton rebuild decisions in accepted-step replay`.
+The remote log shows an up-to-date pull but does not print its HEAD hash.
+New diagnostics are in
+`outputs/profiles_only_trial_0002_checked_replay/replay_diagnostics/run_3953akd7`.
+
+This evaluates the same new failed trial 2 from `run_q_i_mrcl`, with six
+profile coordinates, fixed saved geometry and no optimizer. All 260 accepted
+steps reconstruct successfully. Every one of the six segment endpoints has
+zero maximum absolute difference and zero scaled difference from its adaptive
+forward checkpoint, including segment 5 where the previous run failed.
+The segment sizes are 50, 50, 50, 50, 50 and 10 accepted steps. Endpoint
+agreement does not separately compare every internal stage with the forward
+stage values, which are not retained.
+
+The full reverse sweep, initial selected-root boundary, profile pullback,
+recorded database scan fold and geometry derivative calculations complete.
+The runner prints `finite=True` only after checking that every entry of the
+returned residual vector and Jacobian is finite. No failed-trial penalty
+fallback is used by this replay mode.
+
+| Returned metric at the saved trial | Value |
+| --- | ---: |
+| Total cost | 1.70831691 |
+| Transition radius | 0.556541236 |
+| Transition location cost | 0.904878400 |
+| Transition strength | 1.75667244 |
+| Bootstrap penalty | 0.459775064 |
+| Bootstrap cost | 0.422786219 |
+| Net power | 299.849217 MW |
+| Net-power cost | 0.00103745104 |
+
+The printed NaNs for unused `softmax_Er` and left/right Er report fields are
+not entries of the active residual/Jacobian checked above. The transition
+location and strength functions are the active root objectives here.
+
+This is GPU evidence that the correction resolves the reproduced nonfinite
+replay failure at these coordinates. It does not establish that every prior
+nonfinite trial is fixed. The root/bootstrap optimization question also remains:
+this single proposed point moves root radius by only about `-5.87e-6` from the
+starting radius 0.556547106, lowers bootstrap cost by about 2.10%, and brings
+net power close to its 300 MW target. It is not an optimization trajectory.
+
+After the evaluation, live device allocation is 48497408 bytes (46.25 MiB),
+with a peak of 5879726592 bytes (5.48 GiB), 692 live JAX arrays and host RSS
+10491.5 MiB. Runtime-scan, replay, reverse and bootstrap stage caches each
+have one entry; the persistent schedule-probe cache has zero entries. These
+are one-evaluation measurements, not evidence of a flat memory trend across
+iterations. The reverse sweep takes 703.421 seconds; its first processed
+segment takes 644.283 seconds including startup/compilation effects, whereas
+the remaining 50-step segments take 11.706-11.892 seconds each.
+
+The next comparison is the profile-only stage-2 optimization from the same
+saved geometry, with a new output directory and the existing optimization/
+memory diagnostics enabled by default:
+
+```bash
+cd ~/NEOPAX
+set -o pipefail
+NEOPAX_REVERSE_STEP_DIAGNOSTICS=1 \
+NEOPAX_REVERSE_STEP_SNAPSHOT_DIR=outputs/profiles_only_from_geometry_result_replay_fix/bad_steps \
+PYTHONPATH="$HOME/VMEX:$HOME/NTX/src" \
+python examples/optimization/optimize_geometry_profiles_from_geometry_result.py \
+  --geometry-result-dir outputs/geometry_qi_max_er_transition_bootstrap_net_power_initial_root_database_full_transport_optimization \
+  --profile-only \
+  --max-nfev 30 \
+  --out-dir outputs/profiles_only_from_geometry_result_replay_fix \
+  2>&1 | tee outputs/profiles_only_from_geometry_result_replay_fix.log
+```
+
+This starts profiles at the stage-2 initial point defined by the saved geometry
+result and current runner. It does not initialize the optimizer from the
+single replayed trial. The purpose is to assess accepted updates, root/
+bootstrap progress, remaining failures and live-memory/cache trends together.
+
+### Partial profile-only stage 2: stable memory, finite AD, limited accepted root progress
+
+The next attachment contains the profile-only optimization after the replay
+correction, with `--max-nfev 30`. It is archived as
+[raw output](benchmarks/profiles_only_from_geometry_result_replay_fix_partial_2026-10-16.txt),
+[evaluation/objective table](benchmarks/profiles_only_from_geometry_result_replay_fix_partial_2026-10-16.csv),
+[memory samples](benchmarks/profiles_only_from_geometry_result_replay_fix_partial_2026-10-16_memory.csv)
+and [segment comparisons](benchmarks/profiles_only_from_geometry_result_replay_fix_partial_2026-10-16_segments.csv).
+Source attachment: `57b38d68-7b26-4a1c-bdb1-cab9fd8029b2/Pasted text.txt`,
+110714 bytes, SHA256
+`afc8f3c1c3373fb77ae9cf4dfd8e74e25e227b0803ebb8419ea4bb1057e899be`.
+Diagnostics are in
+`outputs/profiles_only_from_geometry_result_replay_fix/optimization_diagnostics/run_s2w3mheh`.
+
+**This is a partial run.** There are 19 completed evaluations: the initial
+point, seven accepted updates (2, 6, 9, 12, 13, 16, 18), and eleven rejected
+returned trials. The excerpt ends during evaluation 20, after its reverse
+transport sweep and initial-root/profile pullbacks, before the final database
+scan fold and cost report. There is no terminal optimizer status or final
+optimized profile report. A rejected trial here returned residuals and a
+Jacobian; it did not fail reverse AD.
+
+All 110 reported segment endpoint comparisons have zero absolute and scaled
+differences: 105 belong to the 19 completed evaluations and five to the
+in-progress evaluation 20. The completed trajectories use 217-278 accepted
+transport steps. No nonfinite-AD exception, invalid primal replay, checkpoint
+mismatch, transport step-limit failure or CUDA OOM is reported in this excerpt.
+
+#### Memory after warmup
+
+| Sample | Host RSS (MiB) | Live JAX arrays | Live device bytes | Peak device bytes |
+| --- | ---: | ---: | ---: | ---: |
+| Evaluation 1 | 10232.2 | 691 | 48844288 | 5879747584 |
+| Evaluation 2 | 10294.8 | 720 | 48848384 | 5909524480 |
+| Evaluation 3 | 10296.1 | 746 | 48852224 | 5909524480 |
+| Evaluation 19 | 10308.0 | 746 | 48852736 | 5909524480 |
+
+Across evaluations 3-19, live GPU allocation stays between 48852224 and
+48852992 bytes: 46.5891-46.5898 MiB, a 768-byte range. The device peak stays
+at 5.50 GiB from evaluation 2 onward. Live JAX array count stays at 746 from
+evaluation 3. All five reported stage caches stay at one entry after the
+persistent schedule probe is first used in evaluation 2.
+
+Host RSS fluctuates between 10296.1 and 10308.0 MiB over evaluations 3-19,
+including decreases; it is 75.8 MiB higher than the first sample, with most
+of that rise in the first two evaluations. The earlier multi-gigabyte host
+growth and CUDA-graph OOM pattern are not reproduced in this observed interval.
+This does not establish a longer-term bound beyond the supplied samples.
+
+#### Why root-improving trials are rejected
+
+| Evaluation | Status | Root radius (target 0.514) | Location cost | Bootstrap cost | Net power (MW) | Power cost | Total cost |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | Initial | 0.556547106 | 0.905128113 | 0.431876249 | 293.597138 | 1.87073808 | 3.58735728 |
+| 2 | Accepted | 0.556541245 | 0.904878742 | 0.422797469 | 299.848913 | 0.001041643 | 1.70833269 |
+| 6 | Accepted | 0.556532140 | 0.904491456 | 0.422073708 | 300.055541 | 0.000140767 | 1.70632077 |
+| 7 | Rejected | 0.517263386 | 0.005324846 | 0.267194998 | 250.417504 | 112.181557 | 112.833691 |
+| 17 | Rejected | 0.536908480 | 0.262399231 | 0.337762235 | 275.651730 | 27.0520952 | 28.0318715 |
+| 18 | Accepted | 0.556530235 | 0.904410441 | 0.421609526 | 299.974662 | 0.000029296 | 1.70566410 |
+| 19 | Rejected | 0.536909026 | 0.262411733 | 0.338176914 | 275.818056 | 26.6837657 | 27.6639691 |
+
+The root objective responds substantially to profile changes. Trial 7 nearly
+reaches its target and also lowers bootstrap cost, but its power cost alone
+is 112.18, compared with total cost 1.7063 at its preceding accepted trial 6.
+The later proposals near root radius 0.5369 are also rejected because their
+power cost is roughly 27-36, outweighing their location/bootstrap improvements.
+These returned points demonstrate physical objective changes; they do not
+independently validate the local Jacobian entries.
+
+In the accepted sequence, total cost falls by 52.45%, mainly by satisfying
+power. Between initial evaluation 1 and accepted evaluation 18, root radius
+changes by only `-1.6871e-5`, location cost falls by 0.0793%, and bootstrap
+cost falls by 2.377%. This confirms that accepted root progress remains small
+even after the reproduced AD/replay failure has been removed in this excerpt.
+
+The late trial points form two recurring groups. Accepted evaluations 13, 16
+and 18 remain near radius 0.556530 and power 300 MW, while rejected evaluations
+14, 15, 17 and 19 remain near radius 0.53691 and power 275-276 MW. The accepted
+root moves by only `-8.4e-8` between evaluations 13 and 18. The radius gap
+between evaluations 18 and 19 is 0.019621209, and their power gap is 24.156606
+MW. These values show repeated proposals into the second region, not two
+demonstrated stationary minima or accepted cycling between them.
+
+If recorded parameter-step norms shrink toward zero while this finite jump
+persists, a branch boundary, sharp transition or numerical inconsistency is
+a stronger concern than ordinary overshooting. That conclusion requires the
+coordinate/model records; the console alone does not establish shrinking
+parameter steps or a discontinuity. The least-squares wrapper keys cached
+evaluations by the exact coordinate tuple, keeps only one successful point,
+and uses that same-point evaluation for residual/Jacobian requests. The
+profile-only wrapper copies its fixed full vector before inserting profile
+coordinates. This source inspection finds no obvious cache-key collision or
+in-place mutation there; it is not a same-coordinate repeatability test of
+the entire transport evaluator.
+
+The console proves why these particular trials fail the total-cost acceptance
+test. It does not show whether the saved local model predicted their power
+loss, whether bounds prevented compensation, or whether a sufficiently small
+feasible step can improve root/bootstrap while retaining power. It does not
+establish that the three physical targets are incompatible. Those questions
+require the already-saved `model` and bound records, not another transport or
+optimization run.
+
+The following host-only command reads those existing records for trials 7,
+17 and 19 and their accepted anchors. It imports only the Python standard library
+and can run while optimization continues. An unfinished final JSONL line is
+ignored; completed malformed records are reported as an error.
+
+```bash
+cd ~/NEOPAX
+python - <<'PY'
+import json
+from pathlib import Path
+
+path = Path('outputs/profiles_only_from_geometry_result_replay_fix/'
+            'optimization_diagnostics/run_s2w3mheh/events.jsonl')
+labels = []
+with path.open() as stream:
+    for line in stream:
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            if not line.endswith('\n'):
+                break
+            raise
+        trial = event.get('trial')
+        if event['event'] == 'setup':
+            labels = event['parameter_labels']
+        if event['event'] == 'accepted' and trial in (6, 16, 18):
+            print('Accepted anchor', trial, 'near lower bounds:',
+                  [labels[i] for i in event['lower_bound_near']], 'near upper bounds:',
+                  [labels[i] for i in event['upper_bound_near']])
+        if event['event'] != 'trial' or trial not in (7, 17, 19):
+            continue
+        model = event['model']
+        print('\nTrial', trial, 'from accepted', model['from_accepted_trial'])
+        print('Predicted / actual total reduction:', model['predicted_reduction'],
+              model['actual_reduction'], 'ratio:', model['actual_over_predicted'])
+        print('Coordinate step:', dict(zip(labels, model['step'], strict=True)))
+        print('Profile / trust step norm:', model['profile_step_norm'], model['trust_step_norm'])
+        actual = {row['label']: row['cost'] for row in event['rows']}
+        for i, row in enumerate(model['rows']):
+            label = row['label']
+            if any(key in label for key in ('transition_location', 'bootstrap', 'net_total_power')):
+                print(label, 'old / predicted / actual cost:', model['old_cost'][i],
+                      model['predicted_cost'][i], actual[label])
+PY
+```
+
+Only file parsing, table extraction and consistency checks were performed
+locally for this update. No physics solve, derivative replay or FD test was run.
+
+### Completed profile-only stage 2: plotting failure and late host-memory growth
+
+The completion tail is archived as
+[raw output](benchmarks/profiles_only_from_geometry_result_replay_fix_completion_2026-10-16.txt),
+[objective table](benchmarks/profiles_only_from_geometry_result_replay_fix_completion_2026-10-16.csv),
+[memory samples](benchmarks/profiles_only_from_geometry_result_replay_fix_completion_2026-10-16_memory.csv)
+and [segment comparisons](benchmarks/profiles_only_from_geometry_result_replay_fix_completion_2026-10-16_segments.csv).
+Source attachment: `0ef15958-2731-4ddb-af33-203d4c3c5f7f/Pasted text.txt`,
+8996 bytes, SHA256
+`99bee4ebffcc709fc1888e4fe4cf15d5cb71e76b432601da5ece06bf59d43e96`.
+This tail contains completed evaluations 29 and 30; evaluations 20-28 are
+not supplied as completed console records. Its five replay endpoint checks
+belong to evaluation 30, with 227 accepted transport steps; all five report
+zero absolute and scaled differences.
+
+The optimizer returned after 30 function evaluations with `ftol` termination,
+initial cost 3.58735728, final cost 1.70563781 and first-order optimality 2.90.
+The root radius is still 0.556530127 against target 0.514, versus initial
+0.556547106: a change of only -0.000016979. Final location cost is 0.904405851,
+bootstrap cost 0.421589492 and power cost 0.0000276351994, at 299.975391 MW.
+Small total-cost changes triggered termination; this does not demonstrate
+that the root target was reached or the first-order optimality was small.
+The missing coordinate/model records discussed above are still needed to
+explain the repeated unsuccessful root-improving proposals.
+
+| Sample | Host RSS (MiB) | Live JAX arrays | Live device bytes | Peak device bytes |
+| --- | ---: | ---: | ---: | ---: |
+| Evaluation 19 (earlier excerpt) | 10308.0 | 746 | 48852736 | 5909524480 |
+| Evaluation 29 | 10760.9 | 746 | 48852224 | 5909524480 |
+| Evaluation 30 | 10912.7 | 746 | 48852224 | 5909524480 |
+
+Host RSS rises 151.8 MiB between evaluations 29 and 30 and 680.5 MiB from
+evaluation 1 to 30. Live device bytes, device peak, live array count and all
+five reported one-entry stage caches are unchanged between 29 and 30.
+**Late host-memory growth remains open.** The earlier stable-memory finding
+applies only to evaluations 3-19; these counters do not identify the later
+host allocation source or establish that all memory growth was fixed.
+
+The subsequent traceback occurs in post-optimization plotting:
+`initial_profile_snapshot` reads `problem.profile_cfg`, but the actual
+`GeometryFullTransportLeastSquaresProblem` exposes profiles through
+`problem.config["profiles"]`. The plot helper now reads
+`problem.config.get("profiles", {})`, consistent with the problem interface.
+The analytical-profile regression fixture no longer adds the nonexistent
+attribute that had hidden this failure. The saved-result plotting fixture
+also uses configuration alone. All 10 tests in
+`tests/test_combined_from_geometry_result.py` pass; these are mocked setup
+checks and small analytical profile plots, with no transport/VMEC/NTX solve.
+
+Before calling the plot helper, the runner already writes
+`input.QI_combined_optimized`, `profile_parameters_optimized.json` and
+`optimization_summary.json`. Therefore the optimized result survives this
+plotting exception. After updating the script, recover only the plots from
+the existing output; no optimization or derivative replay is needed:
+
+```bash
+cd ~/NEOPAX
+JAX_PLATFORMS=cpu \
+PYTHONPATH="$HOME/VMEX:$HOME/NTX/src" \
+python examples/optimization/optimize_geometry_profiles_from_geometry_result.py \
+  --geometry-result-dir outputs/geometry_qi_max_er_transition_bootstrap_net_power_initial_root_database_full_transport_optimization \
+  --profile-only \
+  --plot-profiles-only \
+  --out-dir outputs/profiles_only_from_geometry_result_replay_fix
+```
+
+This produces `initial_profiles_initial_vs_optimized.png` and
+`initial_optimized_initial_profiles.csv` from the saved physical profile
+parameters. The CPU work is only analytical profile construction and plotting.
 
 ## 6. Original geometry-stage reproducibility report
 

@@ -233,7 +233,7 @@ def initial_profile_snapshot(problem, x):
 
     state = initial_state_for_parameter_vector_compact(
         problem.profile_values_from_scaled_parameters(x),
-        baseline_state=problem.baseline_state, profile_cfg=problem.profile_cfg,
+        baseline_state=problem.baseline_state, profile_cfg=problem.config.get("profiles", {}),
         geometry=problem.runtime.geometry, number_species=problem.runtime.species.number_species,
         config=problem.config, initial_er_root_ad="off",
     )
@@ -328,7 +328,7 @@ def plot_saved_initial_profiles(out_dir, fallback_config):
     rho = .5 * (faces[:-1] + faces[1:])
     geometry = SimpleNamespace(r_grid=rho, r_grid_half=faces, rho_grid=rho)
     problem = SimpleNamespace(
-        config=config, profile_cfg=config.get("profiles", {}),
+        config=config,
         runtime=SimpleNamespace(geometry=geometry, species=SimpleNamespace(number_species=n_species)),
         baseline_state=TransportState(density=jnp.zeros((n_species, n_radial)),
                                       pressure=jnp.ones((n_species, n_radial)), Er=jnp.zeros(n_radial)),
