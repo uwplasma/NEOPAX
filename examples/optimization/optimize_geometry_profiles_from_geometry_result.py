@@ -76,6 +76,7 @@ def parser():
     out.set_defaults(
         seed_input=None, out_dir=None,
         database_n_theta=None, database_n_phi=None, database_n_xi=None,
+        transport_max_steps=None,
         profile_trust_multiplier=1.0,
         max_er=None, root_objectives=None, transition_location_objective=None,
         bootstrap_penalty=None, net_power=None,
@@ -138,6 +139,11 @@ def configure_saved_settings(args, result):
 
     geometry = combined.geometry_example
     config = result.summary.get("config", {})
+    if args.transport_max_steps is None:
+        args.transport_max_steps = int(result.summary.get(
+            "transport_max_steps",
+            config.get("transport_solver", {}).get("max_steps", geometry.TRANSPORT_MAX_STEPS),
+        ))
     neo = config.get("neoclassical", {})
     grid = result.summary.get("database_grid", [
         neo.get("ntx_scan_n_theta", geometry.DATABASE_N_THETA),
@@ -430,6 +436,7 @@ def main():
         ntx_scan_n_zeta=args.database_n_phi,
         ntx_scan_n_xi=args.database_n_xi,
     )
+    config.setdefault("transport_solver", {})["max_steps"] = int(args.transport_max_steps)
     problem = combined._build_problem(
         args, config=config, vmec_input=args.seed_input.resolve(),
         max_mode=saved.max_mode,
@@ -452,6 +459,7 @@ def main():
     (out_dir / "profile_parameters_initial.json").write_text(json.dumps(initial_profiles, indent=2), encoding="utf-8")
     print(f"[setup] loaded_geometry_result={saved.summary_path} max_mode={saved.max_mode} "
           f"parameter_count={problem.parameter_count} profile_only={args.profile_only} geometry_stage=skipped "
+          f"transport_max_steps={args.transport_max_steps} "
           f"XLA_FLAGS={os.environ.get('XLA_FLAGS', '')}", flush=True)
     initial = combined.report("combined initial at saved geometry", problem, x0)
     options = combined._least_squares_options(
@@ -471,6 +479,7 @@ def main():
         "status": int(result.status), "message": str(result.message),
         "optimization_mode": "profiles_only" if args.profile_only else "geometry_and_profiles",
         "max_reverse_accepted_steps": int(args.max_reverse_accepted_steps),
+        "transport_max_steps": int(args.transport_max_steps),
         "full_parameter_labels": list(full_labels), "full_x0": full_x0.tolist(),
         "full_x": (problem.full_parameters(result.x) if args.profile_only else np.asarray(result.x)).tolist(),
         "initial_physical_profiles": initial_profiles,

@@ -14,6 +14,17 @@ from examples.optimization import optimize_geometry_profiles_from_geometry_resul
 
 
 class SavedGeometryTests(unittest.TestCase):
+    def test_saved_step_budget_is_preserved_unless_explicitly_overridden(self):
+        saved = SimpleNamespace(
+            summary={"config": {"transport_solver": {"max_steps": 2400}}},
+            baseline_input=Path("/original/input.seed"),
+        )
+        for flags, expected in (([], 2400), (["--transport-max-steps", "3000"], 3000)):
+            with self.subTest(flags=flags):
+                args = example.parser().parse_args(["--geometry-result-dir", "/saved", *flags])
+                example.configure_saved_settings(args, saved)
+                self.assertEqual(args.transport_max_steps, expected)
+
     def test_modes_have_distinct_defaults_and_explicit_output_takes_precedence(self):
         arguments = ["--geometry-result-dir", "/saved"]
         combined_args = example.parser().parse_args(arguments)
@@ -98,7 +109,8 @@ class SavedGeometryTests(unittest.TestCase):
             (saved / "optimization_summary.json").write_text(json.dumps(summary), encoding="utf-8")
             output = root / "combined"
             with (
-                patch("sys.argv", [example.__file__, "--geometry-result-dir", str(saved), "--out-dir", str(output)]),
+                patch("sys.argv", [example.__file__, "--geometry-result-dir", str(saved), "--out-dir", str(output),
+                                   "--transport-max-steps", "2000"]),
                 patch.object(example.combined.geometry_example, "transport_config", return_value={"geometry": {"n_radial": 51}}),
                 patch.object(example.combined, "_build_problem", side_effect=build),
                 patch.object(example.combined, "report", return_value=evaluation),
@@ -115,10 +127,12 @@ class SavedGeometryTests(unittest.TestCase):
 
             self.assertEqual(captured["build"]["vmec_input"], baseline)
             self.assertEqual(captured["build"]["max_mode"], 2)
+            self.assertEqual(captured["build"]["config"]["transport_solver"]["max_steps"], 2000)
             self.assertEqual(captured["switches"], (True, False))
             np.testing.assert_array_equal(captured["x0"], np.concatenate((np.zeros(6), accepted)))
             written = json.loads((output / "optimization_summary.json").read_text(encoding="utf-8"))
             self.assertEqual(written["nfev"], 2)
+            self.assertEqual(written["transport_max_steps"], 2000)
             self.assertEqual(written["geometry_result"], str(saved / "optimization_summary.json"))
             self.assertTrue((output / "input.QI_combined_optimized").is_file())
             self.assertTrue((output / "profile_parameters_optimized.json").is_file())

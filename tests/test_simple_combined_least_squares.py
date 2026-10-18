@@ -5,7 +5,12 @@ import numpy as np
 import pytest
 
 
-def test_reverse_accepted_step_cap_reaches_combined_problem(monkeypatch):
+@pytest.mark.parametrize("extra_args,expected_total", (
+    ((), 1000),
+    (("--transport-max-steps", "2000"), 2000),
+    (("--max-steps", "2000"), 2000),
+))
+def test_reverse_accepted_step_cap_reaches_combined_problem(monkeypatch, extra_args, expected_total):
     from examples.optimization import (
         optimize_geometry_profiles_qi_max_er_transition_bootstrap_net_power_initial_root_database_full_transport_simple_least_squares
         as example,
@@ -21,7 +26,8 @@ def test_reverse_accepted_step_cap_reaches_combined_problem(monkeypatch):
     monkeypatch.setattr(example.opt, "geometry_full_transport_least_squares_problem", build_problem)
     defaults = example.parser().parse_args(())
     assert defaults.max_reverse_accepted_steps == 500
-    args = example.parser().parse_args(("--max-reverse-accepted-steps", "900"))
+    assert defaults.transport_max_steps == 1000
+    args = example.parser().parse_args(("--max-reverse-accepted-steps", "900", *extra_args))
     config = example.geometry_example.transport_config(args)
     result = example._build_problem(
         args, config=config, vmec_input=args.seed_input.resolve(), max_mode=2,
@@ -31,19 +37,20 @@ def test_reverse_accepted_step_cap_reaches_combined_problem(monkeypatch):
     assert captured["kwargs"]["max_reverse_accepted_steps"] == 900
     assert captured["kwargs"]["accepted_step_limit"] is None
     assert captured["kwargs"]["reverse_segment_length"] == 50
-    assert captured["config"]["transport_solver"]["max_steps"] == 1000
+    assert captured["config"]["transport_solver"]["max_steps"] == expected_total
     assert captured["config"]["transport_solver"]["t_final"] == 2.0
 
 
 @pytest.mark.parametrize("value", ("0", "-1"))
-def test_reverse_accepted_step_cap_rejects_nonpositive_values(value):
+@pytest.mark.parametrize("option", ("--max-reverse-accepted-steps", "--transport-max-steps"))
+def test_step_caps_reject_nonpositive_values(option, value):
     from examples.optimization import (
         optimize_geometry_profiles_qi_max_er_transition_bootstrap_net_power_initial_root_database_full_transport_simple_least_squares
         as example,
     )
 
     with pytest.raises(SystemExit):
-        example.parser().parse_args(("--max-reverse-accepted-steps", value))
+        example.parser().parse_args((option, value))
 
 
 def test_simple_combined_baseline_uses_ess_nominal_delta_coordinates():

@@ -159,6 +159,12 @@ def parser() -> argparse.ArgumentParser:
     out.add_argument("--out-dir", type=Path, default=OUT_DIR)
     out.add_argument("--max-nfev", type=int, default=NFEV)
     out.add_argument(
+        "--transport-max-steps", "--max-steps",
+        type=_positive_step_count,
+        default=TRANSPORT_MAX_STEPS,
+        help="Maximum total attempted steps (accepted plus rejected) in the transport trace used by reverse AD (default: %(default)s).",
+    )
+    out.add_argument(
         "--max-reverse-accepted-steps",
         type=_positive_step_count,
         default=MAX_REVERSE_ACCEPTED_STEPS,
@@ -258,7 +264,7 @@ def transport_config(args: argparse.Namespace) -> dict:
     neoclassical["ntx_scan_n_xi"] = int(args.database_n_xi)
     solver = config.setdefault("transport_solver", {})
     solver["t_final"] = float(TRANSPORT_FINAL_TIME)
-    solver["max_steps"] = int(TRANSPORT_MAX_STEPS)
+    solver["max_steps"] = int(getattr(args, "transport_max_steps", TRANSPORT_MAX_STEPS))
     # The optimization API already forces this policy. Keep fresh forward
     # reports on it too, instead of silently falling back to retry_only.
     solver["radau_jacobian_reuse_mode"] = "legacy"
@@ -799,7 +805,7 @@ def main() -> int:
         )
         print(
             "[setup] full_transport "
-            f"t_final={TRANSPORT_FINAL_TIME} max_steps={TRANSPORT_MAX_STEPS} "
+            f"t_final={TRANSPORT_FINAL_TIME} max_steps={args.transport_max_steps} "
             f"accepted_step_limit={FULL_TRANSPORT_ACCEPTED_STEP_LIMIT} "
             f"reverse_segment_length={REVERSE_SEGMENT_LENGTH} "
             f"max_reverse_accepted_steps={args.max_reverse_accepted_steps} "
@@ -845,7 +851,7 @@ def main() -> int:
         "transport_config": str(TRANSPORT_CONFIG),
         "database_grid": [args.database_n_theta, args.database_n_phi, args.database_n_xi],
         "transport_final_time": TRANSPORT_FINAL_TIME,
-        "transport_max_steps": TRANSPORT_MAX_STEPS,
+        "transport_max_steps": int(args.transport_max_steps),
         "objectives": {
             "max_er": bool(args.max_er),
             "root_objectives": bool(args.root_objectives),

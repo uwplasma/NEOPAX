@@ -659,6 +659,7 @@ def main() -> int:
         "method": "geometry_warm_start_then_combined_scipy_least_squares_TRF",
         "max_reverse_accepted_steps": int(args.max_reverse_accepted_steps),
         "seed_input": str(seed_input),
+        "transport_max_steps": int(args.transport_max_steps),
         "transport_config": str(geometry_example.TRANSPORT_CONFIG),
         "database_grid": [
             int(args.database_n_theta),
