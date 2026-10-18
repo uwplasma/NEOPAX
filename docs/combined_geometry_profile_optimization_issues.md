@@ -1759,6 +1759,55 @@ check, not numerical trajectory parity. This original report remains open.
 
 ### Geometry-only optimization after the replay correction (2026-10-17)
 
+Subsequent steering: the user reports that the same script invoked without
+arguments now produces the intended behavior. The [exact-command audit](benchmarks/geometry_only_command_audit_2026-10-17.md)
+recovers the earlier assistant command and verifies that all optimization
+arguments match the script defaults; only the output directory differs.
+The earlier command also enabled reverse diagnostics, disabled CUDA command
+buffers, and overrode VMEX/NTX import paths. Their effect on this remote
+comparison is not isolated. The new report therefore weakens attribution of
+the earlier bad result to replay itself; neither a replay regression nor a
+specific environment-induced defect is established. No new successful-run
+optimization evaluations or internal-stage arrays are available in this
+audit. The subsequently supplied [successful postprocessing tail](benchmarks/geometry_only_bare_run_postprocessing_2026-10-17.txt)
+confirms the optimized geometry's transport report reaches `t=2`, reports
+`done=True` and `failed=False`, writes the bootstrap reports and returns to
+the shell. It contains no initial/final optimizer cost or evaluation history,
+so it does not isolate why the earlier diagnostic command diverged. The
+[command audit](benchmarks/geometry_only_command_audit_2026-10-17.md#supplied-successful-run-excerpt-and-combined-continuation)
+records the geometry-plus-profile continuation from this saved result,
+without a repeated geometry stage or expensive local tests.
+
+The subsequent audit reproduced an actual optimizer/report configuration
+mismatch: optimization forces Radau `legacy` (`dt_close`), while the original
+postprocessing config omitted the key and the forward solver defaulted to
+`retry_only`. The example configuration helper now explicitly sets `legacy`
+for both. This preserves the optimizer's existing mode and AD equations while
+aligning fresh reports. A mocked report/configuration regression test fails
+before the fix and passes after it; all 17 small checks in the simple-combined
+and warm-start test files pass. This setup mismatch is confirmed, but its
+effect on electron/ion branch selection and the difference between shell
+commands remain numerically unisolated. See the [updated command audit](benchmarks/geometry_only_command_audit_2026-10-17.md#optimizer-versus-plotted-forward-solver-confirmed-mismatch).
+
+The user also clarified that the next combined optimization must start from
+the usual initial geometry and nominal profiles, with all 30 DoFs active
+immediately. The single-stage simple-least-squares command in that audit is
+the requested case; saved-geometry stage-2 commands are not substitutes.
+
+On 2026-10-18 the user clarified that the requested larger step limit concerns
+the reverse sweep. The geometry/shared CLI now accepts
+`--max-reverse-accepted-steps` (positive integer, default 500). The single-stage
+combined runner, saved-geometry/profile-only runner and warm-start runner
+inherit it; the geometry and combined problem builders pass the supplied cap
+through to the reverse setup. Setup/summary output records the selected cap.
+This raises the guard on the accepted trajectory being differentiated; it
+does not add rejected steps to differentiation, change `t_final=2`, change the
+forward attempted-step budget of 1000, or replace the full-time solve with a
+fixed accepted-step prefix. The checkpoint segment length stays at 50.
+All 31 checks in the simple-combined, warm-start and saved-geometry test files
+pass, using configuration/mocks and a small analytical-profile plot. No
+transport, ambipolar-root, VMEX or NTX solve was run locally.
+
 The user supplied the standalone geometry-only run at `c6a1cca`, using the
 corrected reverse implementation from `e83a143`. The complete supplied excerpt
 is archived as [raw output](benchmarks/geometry_only_net_power_root_bootstrap_replay_fix_2026-10-17.txt),
@@ -1846,8 +1895,90 @@ This does not change the optimizer adapter's nonfinite handling discussed
 above. See the [16-step GPU command and reuse selector](benchmarks/database_transition_objectives_ad_fd.md#replay-jacobian-reuse-comparison-2026-10-17).
 Local checks use mocked benchmark wiring/reporting plus tiny synthetic replay
 equations: 17 tests and 33 subtests, plus four existing mocked geometry/stage
-and tiny replay-cache checks pass. No local physics evaluation or remote AD
-result for this setting is claimed.
+and tiny replay-cache checks pass. No local physics evaluation was run.
+
+The subsequent GPU benchmark succeeds with all 18 residuals/144 Jacobian
+entries finite and four exactly matching replay endpoints. The largest
+relative difference from the archived AD over all 88 transport derivatives
+is `4.217200e-7` (net power versus RBC:1:0); root/bootstrap/strength rows are
+also very close. QI/MaxJ geometry-only baselines and derivatives differ after
+the intervening Boozer-context correction, so those changes cannot be
+assigned to replay reuse. The [full comparison and artifacts](../reverse_ad_vs_fd_database.md#2026-10-17-recorded-forward-replay-ad-compared-with-the-archived-ad-and-fd)
+retain all pairs. This confirms no large transport-gradient change at the
+16-step benchmark point; it does not explain the stalled full-time optimizer
+or establish that the late-time replay-policy difference was exercised.
+
+### Replay invariance and incomplete cache reconstruction audit (2026-10-17)
+
+The user reports that the geometry-only optimizer satisfied the objectives
+before the replay change. This is an unresolved regression report. Different
+benchmark inputs do not explain that before/after result. At identical inputs,
+an accepted-step reconstruction change should preserve physical objective
+values and accurate derivatives within numerical tolerance. The successful
+16-step comparison only validates that tested prefix; it does not establish
+full-time derivative parity or resolve the optimization regression.
+
+Source inspection of `e83a143` confirms that the new metadata is an accepted
+step's Jacobian-reuse boolean. The checked replay clears `cache_valid` when
+the forward rebuilt, but otherwise still decides reuse from its own cache
+and `cache_dt`. Forward rejected attempts can update the Jacobian, LU factors,
+and cache time without advancing the physical state. Their matrix provenance
+is not fully represented by that single boolean. Consequently
+`recorded_forward` must not be described as reproducing every forward Newton
+setup exactly.
+
+A [scalar reproducer](benchmarks/probe_recorded_replay_lu_provenance_2026-10-17.py)
+uses `y'=-100*y`, one accepted step at `dt=0.001`, a rejected attempt at
+`dt=0.002`, and an accepted retry at `dt=0.001802`, with the existing legacy
+forward reuse policy. The actual checked segment replay receives the recorded
+rebuild mask and only the two accepted slots. Forward reuses the rejected
+attempt's LU, whereas replay refactors at the accepted timestep. Their Newton
+iteration counts differ, even though both converge and the physical endpoints
+agree to roundoff. See the [probe output](benchmarks/recorded_replay_lu_provenance_2026-10-17.txt).
+
+This demonstrates incomplete numerical-setup reconstruction. It does **not**
+demonstrate an incorrect objective derivative or explain the large optimization
+cost regression: for this scalar case the endpoint discrepancy is tiny, and
+the optimizer's `block` adjoint builds stage RHS Jacobians independently of
+the cached Newton factorization. A full-time, identical-input comparison is
+still missing. No production replay behavior was changed in this audit, and
+no local plasma-physics evaluation was run.
+
+Clarification: reproducing Newton iteration counts or the exact cached
+factorization is **not** required for a correct implicit accepted-step
+derivative. The geometry optimizer selects the `block` stage-adjoint mode,
+which forms the stage-residual derivative from RHS Jacobians at
+the reconstructed Radau stages, independently of the forward Newton cache.
+If both reconstructions reach the same stage solution and the adjoint solve
+is accurate, different Newton iteration counts should leave derivatives
+unchanged within numerical accuracy. The scalar LU audit is a numerical-setup
+fidelity observation, not a demonstrated defect requiring identical cache
+history. Matching step endpoints alone does not establish matching internal
+stages. Further regression diagnosis should compare stage solutions and their
+derivatives, rather than require identical Newton iteration counts.
+
+The scalar probe now checks this directly with the production block-transpose
+function. Despite 5 versus 2 Newton iterations, forward and replay internal
+stage states differ by at most `8.770761894538737e-15`. Both yield the implicit
+accepted-step derivative `0.8351031779295103`, equal to the independent
+three-stage Radau IIA stability-function reference. Altering only the cached
+Newton Jacobian and LU factors also leaves that derivative exactly unchanged.
+The executable assertions pass on the scalar CPU problem, with no plasma
+physics evaluation. This supports the user's point: different reconstruction
+iteration counts are not by themselves a gradient defect.
+
+Reinspection of the supplied GPU table finds 66 profile/transport AD-FD
+pairs, with maximum relative error `1.9358346865813661e-6`. The four 16-step
+benchmark replay endpoints match exactly. The benchmark and optimization
+wrapper call the same database segment reverse body and the exact `block`
+stage equations. The wrapper rebuilds the RHS from each trial's live support
+payload; `git blame` dates that behavior to `7e6fb463` on 2026-09-14, before
+the October replay correction. No new stale-first-trial RHS defect was found
+in this inspection. The supplied GPU log does not store internal stage arrays,
+so direct GPU stage-by-stage equality cannot be reconstructed from it. The
+16-step agreement remains strong positive evidence for that trajectory, not
+evidence of a cache-induced gradient regression. The full-time optimization
+regression is still unresolved.
 
 ## Evidence
 

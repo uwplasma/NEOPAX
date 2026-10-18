@@ -1,0 +1,15 @@
+ODE: y'=-100*y, y(0)=1; scalar CPU only
+accepted dt=0.001; rejected dt=0.002; accepted dt=0.001802
+rejected error norm: 1.1838615855093955
+forward accepted step reused Jacobian: True
+recorded replay valid: [ True  True]
+forward / recorded replay LU: [[1.05497777]] [[1.04953497]]
+forward / recorded replay Newton iterations: 5 2
+absolute final-state difference: [8.77076189e-15]
+The forward reused the rejected attempt's LU; replay refactored at the accepted dt.
+max absolute internal-stage-state difference: 8.770761894538737e-15
+forward / replay implicit block derivative: 0.8351031779295103 0.8351031779295103
+implicit derivative after changing only Newton caches: 0.8351031779295103
+Radau IIA stability-function reference: 0.8351031779295103
+Different Newton iteration counts preserve the implicit derivative in this scalar check.
+This does not establish full-time transport derivative parity or explain the optimization regression.

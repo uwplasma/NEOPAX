@@ -1,0 +1,1023 @@
+27008e-12 newton_metric=3.361637e-05 newton_tol=4.770583e-04 theta=2.393093e-02 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=11 fraction=1.0e-04 fd_norm=0.000000e+00 matrix_norm=1.373941e-06 relative_error=1.373941e+24 cosine=0.000000e+00
+[radau-solver] final_stage_residual_defect=8.427578e-13
+[radau-solver] final iter=11 converged=True diverged=False finite_initial_residual=True nonfinite_stage_state=False nonfinite_stage_residual=False residual_norm=1.647783e-07 delta_norm=1.396052e-06 newton_metric=3.361637e-05 newton_tol=4.770583e-04 theta=2.393093e-02 slow=False blowup=False newton_nonfinite=False
+[radau-solver] attempt t_start=3.779171e-02 dt_try=1.324625e-08 accepted=True failed=False fail_code=0 converged=True err_norm=2.199311e-01 growth=1.027525e+00 next_dt=1.361085e-08 stagnation_accepted=False stagnation_defect_norm=0.000000e+00 lagged_reused=False jacobian_reused=True
+[debug-walltime] radau.attempt #323 elapsed_s=0.112425
+[radau-solver] iter=1 delta_norm=2.539752e+06 residual_norm=2.665541e+06 stage_residual_defect=1.400813e+01 newton_metric=2.494373e+09 newton_tol=4.770583e-04 theta=0.000000e+00 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=1 fraction=1.0e-04 fd_norm=2.702441e+06 matrix_norm=2.665541e+06 relative_error=1.521716e-02 cosine=9.999771e-01
+[radau-solver] iter=2 delta_norm=4.243611e+04 residual_norm=4.404945e+04 stage_residual_defect=2.314917e-01 newton_metric=7.082193e+05 newton_tol=4.770583e-04 theta=1.670876e-02 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=2 fraction=1.0e-04 fd_norm=4.456702e+04 matrix_norm=4.404945e+04 relative_error=1.210695e-02 cosine=9.999941e-01
+[radau-solver] iter=3 delta_norm=5.265831e+02 residual_norm=5.390702e+02 stage_residual_defect=2.832959e-03 newton_metric=7.555684e+03 newton_tol=4.770583e-04 theta=1.439918e-02 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=3 fraction=1.0e-04 fd_norm=5.429416e+02 matrix_norm=5.390702e+02 relative_error=7.419027e-03 cosine=9.999979e-01
+[radau-solver] iter=4 delta_norm=3.989106e+00 residual_norm=4.028095e+00 stage_residual_defect=2.116872e-05 newton_metric=3.835720e+01 newton_tol=4.770583e-04 theta=9.695495e-03 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=4 fraction=1.0e-04 fd_norm=4.039942e+00 matrix_norm=4.028095e+00 relative_error=3.891920e-03 cosine=9.999967e-01
+[radau-solver] iter=5 delta_norm=1.586787e-02 residual_norm=1.572800e-02 stage_residual_defect=8.265487e-08 newton_metric=8.602116e-02 newton_tol=4.770583e-04 theta=5.489413e-03 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=5 fraction=1.0e-04 fd_norm=1.567238e-02 matrix_norm=1.572800e-02 relative_error=1.120105e-02 cosine=9.999438e-01
+[radau-solver] iter=6 delta_norm=1.776945e-04 residual_norm=1.853899e-04 stage_residual_defect=9.742735e-10 newton_metric=1.172604e-03 newton_tol=4.770583e-04 theta=6.674199e-03 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=6 fraction=1.0e-04 fd_norm=1.769513e-04 matrix_norm=1.853899e-04 relative_error=6.321535e-02 cosine=9.991782e-01
+[radau-solver] iter=7 delta_norm=2.658579e-06 residual_norm=2.738320e-06 stage_residual_defect=1.439061e-11 newton_metric=3.424075e-05 newton_tol=4.770583e-04 theta=1.294391e-02 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=7 fraction=1.0e-04 fd_norm=0.000000e+00 matrix_norm=2.738320e-06 relative_error=2.738320e+24 cosine=0.000000e+00
+[radau-solver] final_stage_residual_defect=1.440338e-13
+[radau-solver] final iter=7 converged=True diverged=False finite_initial_residual=True nonfinite_stage_state=False nonfinite_stage_residual=False residual_norm=2.740685e-08 delta_norm=2.658579e-06 newton_metric=3.424075e-05 newton_tol=4.770583e-04 theta=1.294391e-02 slow=False blowup=False newton_nonfinite=False
+[radau-solver] attempt t_start=3.779173e-02 dt_try=1.361085e-08 accepted=True failed=False fail_code=0 converged=True err_norm=7.883899e-04 growth=1.681813e+00 next_dt=2.289091e-08 stagnation_accepted=False stagnation_defect_norm=0.000000e+00 lagged_reused=False jacobian_reused=False
+[debug-walltime] radau.attempt #324 elapsed_s=0.083912
+[radau-solver] iter=1 delta_norm=1.286682e+06 residual_norm=1.514063e+06 stage_residual_defect=1.338185e+01 newton_metric=1.263693e+09 newton_tol=4.770583e-04 theta=0.000000e+00 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=1 fraction=1.0e-04 fd_norm=1.463749e+06 matrix_norm=1.514063e+06 relative_error=4.932101e-02 cosine=9.993953e-01
+[radau-solver] iter=2 delta_norm=6.193698e+04 residual_norm=6.988412e+04 stage_residual_defect=6.176618e-01 newton_metric=3.076269e+06 newton_tol=4.770583e-04 theta=4.813697e-02 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=2 fraction=1.0e-04 fd_norm=6.802482e+04 matrix_norm=6.988412e+04 relative_error=2.821696e-02 cosine=9.999761e-01
+[radau-solver] iter=3 delta_norm=1.773863e+03 residual_norm=1.917471e+03 stage_residual_defect=1.694732e-02 newton_metric=6.718108e+04 newton_tol=4.770583e-04 theta=3.712995e-02 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=3 fraction=1.0e-04 fd_norm=1.883050e+03 matrix_norm=1.917471e+03 relative_error=1.846905e-02 cosine=9.999966e-01
+[radau-solver] iter=4 delta_norm=3.284790e+01 residual_norm=3.477748e+01 stage_residual_defect=3.073762e-04 newton_metric=7.604576e+02 newton_tol=4.770583e-04 theta=2.302920e-02 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=4 fraction=1.0e-04 fd_norm=3.431005e+01 matrix_norm=3.477748e+01 relative_error=1.369191e-02 cosine=9.999991e-01
+[radau-solver] iter=5 delta_norm=4.491032e-01 residual_norm=4.697837e-01 stage_residual_defect=4.152123e-06 newton_metric=7.131735e+00 newton_tol=4.770583e-04 theta=1.591157e-02 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=5 fraction=1.0e-04 fd_norm=4.647137e-01 matrix_norm=4.697837e-01 relative_error=1.093326e-02 cosine=9.999997e-01
+[radau-solver] iter=6 delta_norm=4.869147e-03 residual_norm=5.053476e-03 stage_residual_defect=4.466449e-08 newton_metric=5.894074e-02 newton_tol=4.770583e-04 theta=1.217510e-02 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=6 fraction=1.0e-04 fd_norm=4.991489e-03 matrix_norm=5.053476e-03 relative_error=1.413339e-02 cosine=9.999775e-01
+[radau-solver] iter=7 delta_norm=4.375979e-05 residual_norm=4.516551e-05 stage_residual_defect=3.991895e-10 newton_metric=4.284677e-04 newton_tol=4.770583e-04 theta=9.871076e-03 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=7 fraction=1.0e-04 fd_norm=4.165001e-05 matrix_norm=4.516551e-05 relative_error=1.165139e-01 cosine=9.970255e-01
+[radau-solver] final_stage_residual_defect=3.048433e-12
+[radau-solver] final iter=7 converged=True diverged=False finite_initial_residual=True nonfinite_stage_state=False nonfinite_stage_residual=False residual_norm=3.449089e-07 delta_norm=4.375979e-05 newton_metric=4.284677e-04 newton_tol=4.770583e-04 theta=9.871076e-03 slow=False blowup=False newton_nonfinite=False
+[radau-solver] attempt t_start=3.779174e-02 dt_try=2.289091e-08 accepted=True failed=False fail_code=0 converged=True err_norm=6.320623e-04 growth=1.714652e+00 next_dt=3.924995e-08 stagnation_accepted=False stagnation_defect_norm=0.000000e+00 lagged_reused=False jacobian_reused=False
+[debug-walltime] radau.attempt #325 elapsed_s=0.084664
+[radau-solver] iter=1 delta_norm=1.376092e+06 residual_norm=1.598580e+06 stage_residual_defect=2.422599e+01 newton_metric=1.351505e+09 newton_tol=4.770583e-04 theta=0.000000e+00 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=1 fraction=1.0e-04 fd_norm=1.542908e+06 matrix_norm=1.598580e+06 relative_error=7.768875e-02 cosine=9.977156e-01
+[radau-solver] iter=2 delta_norm=9.668249e+04 residual_norm=1.127750e+05 stage_residual_defect=1.709071e+00 newton_metric=7.175567e+06 newton_tol=4.770583e-04 theta=7.025874e-02 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=2 fraction=1.0e-04 fd_norm=1.080533e+05 matrix_norm=1.127750e+05 relative_error=4.568033e-02 cosine=9.999151e-01
+[radau-solver] iter=3 delta_norm=4.484415e+03 residual_norm=4.920140e+03 stage_residual_defect=7.456322e-02 newton_metric=2.666447e+05 newton_tol=4.770583e-04 theta=5.708594e-02 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=3 fraction=1.0e-04 fd_norm=4.787714e+03 matrix_norm=4.920140e+03 relative_error=2.800174e-02 cosine=9.999907e-01
+[radau-solver] iter=4 delta_norm=1.254936e+02 residual_norm=1.340519e+02 stage_residual_defect=2.031516e-03 newton_metric=4.606426e+03 newton_tol=4.770583e-04 theta=3.602773e-02 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=4 fraction=1.0e-04 fd_norm=1.314130e+02 matrix_norm=1.340519e+02 relative_error=2.019418e-02 cosine=9.999978e-01
+[radau-solver] iter=5 delta_norm=2.521336e+00 residual_norm=2.653796e+00 stage_residual_defect=4.021747e-05 newton_metric=6.014301e+01 newton_tol=4.770583e-04 theta=2.371169e-02 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=5 fraction=1.0e-04 fd_norm=2.612694e+00 matrix_norm=2.653796e+00 relative_error=1.578336e-02 cosine=9.999992e-01
+[radau-solver] iter=6 delta_norm=3.958716e-02 residual_norm=4.127893e-02 stage_residual_defect=6.255697e-07 newton_metric=7.030295e-01 newton_tol=4.770583e-04 theta=1.776096e-02 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=6 fraction=1.0e-04 fd_norm=4.076957e-02 matrix_norm=4.127893e-02 relative_error=1.258033e-02 cosine=9.999989e-01
+[radau-solver] iter=7 delta_norm=5.106011e-04 residual_norm=5.289950e-04 stage_residual_defect=8.016757e-09 newton_metric=7.239391e-03 newton_tol=4.770583e-04 theta=1.423068e-02 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=7 fraction=1.0e-04 fd_norm=5.010135e-04 matrix_norm=5.289950e-04 relative_error=5.677493e-02 cosine=9.999507e-01
+[radau-solver] iter=8 delta_norm=5.594200e-06 residual_norm=5.768318e-06 stage_residual_defect=8.741711e-11 newton_metric=6.609881e-05 newton_tol=4.770583e-04 theta=1.188754e-02 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=8 fraction=1.0e-04 fd_norm=4.656613e-06 matrix_norm=5.768318e-06 relative_error=4.674069e-01 cosine=9.348232e-01
+[radau-solver] final_stage_residual_defect=7.653143e-13
+[radau-solver] final iter=8 converged=True diverged=False finite_initial_residual=True nonfinite_stage_state=False nonfinite_stage_residual=False residual_norm=5.050010e-08 delta_norm=5.594200e-06 newton_metric=6.609881e-05 newton_tol=4.770583e-04 theta=1.188754e-02 slow=False blowup=False newton_nonfinite=False
+[radau-solver] attempt t_start=3.779176e-02 dt_try=3.924995e-08 accepted=True failed=False fail_code=0 converged=True err_norm=1.480556e-03 growth=1.591587e+00 next_dt=6.246970e-08 stagnation_accepted=False stagnation_defect_norm=0.000000e+00 lagged_reused=False jacobian_reused=False
+[debug-walltime] radau.attempt #326 elapsed_s=0.090917
+[radau-solver] iter=1 delta_norm=1.277032e+06 residual_norm=1.371362e+06 stage_residual_defect=3.307710e+01 newton_metric=1.254215e+09 newton_tol=4.770583e-04 theta=0.000000e+00 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=1 fraction=1.0e-04 fd_norm=1.350355e+06 matrix_norm=1.371362e+06 relative_error=8.664890e-02 cosine=9.964226e-01
+[radau-solver] iter=2 delta_norm=9.117280e+04 residual_norm=1.109391e+05 stage_residual_defect=2.675838e+00 newton_metric=6.884422e+06 newton_tol=4.770583e-04 theta=7.139428e-02 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=2 fraction=1.0e-04 fd_norm=1.037993e+05 matrix_norm=1.109391e+05 relative_error=7.407182e-02 cosine=9.996466e-01
+[radau-solver] iter=3 delta_norm=6.821127e+03 residual_norm=7.656933e+03 stage_residual_defect=1.846844e-01 newton_metric=5.282183e+05 newton_tol=4.770583e-04 theta=7.308481e-02 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=3 fraction=1.0e-04 fd_norm=7.343448e+03 matrix_norm=7.656933e+03 relative_error=4.337545e-02 cosine=9.999717e-01
+[radau-solver] iter=4 delta_norm=2.937279e+02 residual_norm=3.184661e+02 stage_residual_defect=7.681369e-03 newton_metric=1.735933e+04 newton_tol=4.770583e-04 theta=5.675969e-02 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=4 fraction=1.0e-04 fd_norm=3.090536e+02 matrix_norm=3.184661e+02 relative_error=3.065725e-02 cosine=9.999940e-01
+[radau-solver] iter=5 delta_norm=8.903081e+00 residual_norm=9.474664e+00 stage_residual_defect=2.285279e-04 newton_metric=3.277427e+02 newton_tol=4.770583e-04 theta=3.612785e-02 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=5 fraction=1.0e-04 fd_norm=9.255663e+00 matrix_norm=9.474664e+00 relative_error=2.374628e-02 cosine=9.999980e-01
+[radau-solver] iter=6 delta_norm=2.089609e-01 residual_norm=2.198081e-01 stage_residual_defect=5.301747e-06 newton_metric=5.623880e+00 newton_tol=4.770583e-04 theta=2.667227e-02 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=6 fraction=1.0e-04 fd_norm=2.156233e-01 matrix_norm=2.198081e-01 relative_error=1.945353e-02 cosine=9.999991e-01
+[radau-solver] iter=7 delta_norm=4.008590e-03 residual_norm=4.183317e-03 stage_residual_defect=1.009012e-07 newton_metric=8.534969e-02 newton_tol=4.770583e-04 theta=2.121904e-02 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=7 fraction=1.0e-04 fd_norm=4.106491e-03 matrix_norm=4.183317e-03 relative_error=1.910310e-02 cosine=9.999927e-01
+[radau-solver] iter=8 delta_norm=6.508162e-05 residual_norm=6.752777e-05 stage_residual_defect=1.628762e-09 newton_metric=1.148307e-03 newton_tol=4.770583e-04 theta=1.764805e-02 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=8 fraction=1.0e-04 fd_norm=6.502606e-05 matrix_norm=6.752777e-05 relative_error=5.708472e-02 cosine=9.991437e-01
+[radau-solver] iter=9 delta_norm=9.176777e-07 residual_norm=9.477400e-07 stage_residual_defect=2.285939e-11 newton_metric=1.384620e-05 newton_tol=4.770583e-04 theta=1.513036e-02 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=9 fraction=1.0e-04 fd_norm=0.000000e+00 matrix_norm=9.477400e-07 relative_error=9.477400e+23 cosine=0.000000e+00
+[radau-solver] final_stage_residual_defect=2.747197e-13
+[radau-solver] final iter=9 converged=True diverged=False finite_initial_residual=True nonfinite_stage_state=False nonfinite_stage_residual=False residual_norm=1.138968e-08 delta_norm=9.176777e-07 newton_metric=1.384620e-05 newton_tol=4.770583e-04 theta=1.513036e-02 slow=False blowup=False newton_nonfinite=False
+[radau-solver] attempt t_start=3.779180e-02 dt_try=6.246970e-08 accepted=True failed=False fail_code=0 converged=True err_norm=8.280293e-05 growth=2.048394e+00 next_dt=1.279626e-07 stagnation_accepted=False stagnation_defect_norm=0.000000e+00 lagged_reused=False jacobian_reused=False
+[debug-walltime] radau.attempt #327 elapsed_s=0.091560
+[radau-solver] iter=1 delta_norm=9.197106e+05 residual_norm=1.048180e+06 stage_residual_defect=5.178703e+01 newton_metric=9.032777e+08 newton_tol=4.770583e-04 theta=0.000000e+00 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=1 fraction=1.0e-04 fd_norm=1.003181e+06 matrix_norm=1.048180e+06 relative_error=1.382166e-01 cosine=9.918210e-01
+[radau-solver] iter=2 delta_norm=1.033185e+05 residual_norm=1.313019e+05 stage_residual_defect=6.487186e+00 newton_metric=1.284184e+07 newton_tol=4.770583e-04 theta=1.123380e-01 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=2 fraction=1.0e-04 fd_norm=1.193424e+05 matrix_norm=1.313019e+05 relative_error=1.069182e-01 cosine=9.993687e-01
+[radau-solver] iter=3 delta_norm=1.096011e+04 residual_norm=1.268052e+04 stage_residual_defect=6.265019e-01 newton_metric=1.319074e+06 newton_tol=4.770583e-04 theta=1.091646e-01 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=3 fraction=1.0e-04 fd_norm=1.192519e+04 matrix_norm=1.268052e+04 relative_error=6.432012e-02 cosine=9.999411e-01
+[radau-solver] iter=4 delta_norm=6.914120e+02 residual_norm=7.667146e+02 stage_residual_defect=3.788080e-02 newton_metric=6.049947e+04 newton_tol=4.770583e-04 theta=8.180493e-02 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=4 fraction=1.0e-04 fd_norm=7.332407e+02 matrix_norm=7.667146e+02 relative_error=4.595129e-02 cosine=9.999869e-01
+[radau-solver] iter=5 delta_norm=3.110077e+01 residual_norm=3.369267e+01 stage_residual_defect=1.664642e-03 newton_metric=1.718672e+03 newton_tol=4.770583e-04 theta=5.326945e-02 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=5 fraction=1.0e-04 fd_norm=3.253306e+01 matrix_norm=3.369267e+01 relative_error=3.577226e-02 cosine=9.999956e-01
+[radau-solver] iter=6 delta_norm=1.090176e+00 residual_norm=1.163770e+00 stage_residual_defect=5.749795e-05 newton_metric=4.427344e+01 newton_tol=4.770583e-04 theta=3.970817e-02 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=6 fraction=1.0e-04 fd_norm=1.130716e+00 matrix_norm=1.163770e+00 relative_error=2.929875e-02 cosine=9.999981e-01
+[radau-solver] iter=7 delta_norm=3.134853e-02 residual_norm=3.312720e-02 stage_residual_defect=1.636704e-06 newton_metric=1.009537e+00 newton_tol=4.770583e-04 theta=3.174848e-02 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=7 fraction=1.0e-04 fd_norm=3.233907e-02 matrix_norm=3.312720e-02 relative_error=2.439467e-02 cosine=9.999994e-01
+[radau-solver] iter=8 delta_norm=7.647209e-04 residual_norm=8.021472e-04 stage_residual_defect=3.963141e-08 newton_metric=2.043307e-02 newton_tol=4.770583e-04 theta=2.648520e-02 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=8 fraction=1.0e-04 fd_norm=7.955656e-04 matrix_norm=8.021472e-04 relative_error=8.732893e-03 cosine=9.999961e-01
+[radau-solver] iter=9 delta_norm=1.620440e-05 residual_norm=1.690191e-05 stage_residual_defect=8.350669e-10 newton_metric=3.702532e-04 newton_tol=4.770583e-04 theta=2.273568e-02 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=9 fraction=1.0e-04 fd_norm=1.561875e-05 matrix_norm=1.690191e-05 relative_error=1.346824e-01 cosine=9.947374e-01
+[radau-solver] final_stage_residual_defect=1.560414e-11
+[radau-solver] final iter=9 converged=True diverged=False finite_initial_residual=True nonfinite_stage_state=False nonfinite_stage_residual=False residual_norm=3.158308e-07 delta_norm=1.620440e-05 newton_metric=3.702532e-04 newton_tol=4.770583e-04 theta=2.273568e-02 slow=False blowup=False newton_nonfinite=False
+[radau-solver] attempt t_start=3.779186e-02 dt_try=1.279626e-07 accepted=True failed=False fail_code=0 converged=True err_norm=2.455413e-04 growth=1.862544e+00 next_dt=2.383359e-07 stagnation_accepted=False stagnation_defect_norm=0.000000e+00 lagged_reused=False jacobian_reused=False
+[debug-walltime] radau.attempt #328 elapsed_s=0.091264
+[radau-solver] iter=1 delta_norm=7.369279e+05 residual_norm=7.910374e+05 stage_residual_defect=7.279175e+01 newton_metric=7.237609e+08 newton_tol=4.770583e-04 theta=0.000000e+00 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=1 fraction=1.0e-04 fd_norm=7.769499e+05 matrix_norm=7.910374e+05 relative_error=1.193874e-01 cosine=9.931617e-01
+[radau-solver] iter=2 delta_norm=6.749988e+04 residual_norm=8.766821e+04 stage_residual_defect=8.067288e+00 newton_metric=6.684550e+06 newton_tol=4.770583e-04 theta=9.159631e-02 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=2 fraction=1.0e-04 fd_norm=7.909826e+04 matrix_norm=8.766821e+04 relative_error=1.186578e-01 cosine=9.989440e-01
+[radau-solver] iter=3 delta_norm=7.974562e+03 residual_norm=9.323370e+03 stage_residual_defect=8.579428e-01 newton_metric=9.093316e+05 newton_tol=4.770583e-04 theta=1.040258e-01 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=3 fraction=1.0e-04 fd_norm=8.731980e+03 matrix_norm=9.323370e+03 relative_error=6.896371e-02 cosine=9.999208e-01
+[radau-solver] iter=4 delta_norm=5.396886e+02 residual_norm=6.019069e+02 stage_residual_defect=5.538788e-02 newton_metric=5.204919e+04 newton_tol=4.770583e-04 theta=8.941701e-02 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=4 fraction=1.0e-04 fd_norm=5.742629e+02 matrix_norm=6.019069e+02 relative_error=4.848535e-02 cosine=9.999840e-01
+[radau-solver] iter=5 delta_norm=2.560341e+01 residual_norm=2.784269e+01 stage_residual_defect=2.562104e-03 newton_metric=1.510415e+03 newton_tol=4.770583e-04 theta=5.666247e-02 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=5 fraction=1.0e-04 fd_norm=2.684110e+01 matrix_norm=2.784269e+01 relative_error=3.745869e-02 cosine=9.999948e-01
+[radau-solver] iter=6 delta_norm=9.391999e-01 residual_norm=1.005421e+00 stage_residual_defect=9.251953e-05 newton_metric=4.015517e+01 newton_tol=4.770583e-04 theta=4.171645e-02 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=6 fraction=1.0e-04 fd_norm=9.756914e-01 matrix_norm=1.005421e+00 relative_error=3.054339e-02 cosine=9.999978e-01
+[radau-solver] iter=7 delta_norm=2.814322e-02 residual_norm=2.980613e-02 stage_residual_defect=2.742780e-06 newton_metric=9.478173e-01 newton_tol=4.770583e-04 theta=3.315416e-02 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=7 fraction=1.0e-04 fd_norm=2.905960e-02 matrix_norm=2.980613e-02 relative_error=2.576610e-02 cosine=9.999981e-01
+[radau-solver] iter=8 delta_norm=7.135498e-04 residual_norm=7.498448e-04 stage_residual_defect=6.900123e-08 newton_metric=1.986398e-02 newton_tol=4.770583e-04 theta=2.756342e-02 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=8 fraction=1.0e-04 fd_norm=7.313199e-04 matrix_norm=7.498448e-04 relative_error=2.759128e-02 cosine=9.999417e-01
+[radau-solver] iter=9 delta_norm=1.568888e-05 residual_norm=1.638956e-05 stage_residual_defect=1.508179e-09 newton_metric=3.726047e-04 newton_tol=4.770583e-04 theta=2.361072e-02 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=9 fraction=1.0e-04 fd_norm=2.062885e-05 matrix_norm=1.638956e-05 relative_error=2.223997e-01 cosine=9.954498e-01
+[radau-solver] final_stage_residual_defect=2.919680e-11
+[radau-solver] final iter=9 converged=True diverged=False finite_initial_residual=True nonfinite_stage_state=False nonfinite_stage_residual=False residual_norm=3.172852e-07 delta_norm=1.568888e-05 newton_metric=3.726047e-04 newton_tol=4.770583e-04 theta=2.361072e-02 slow=False blowup=False newton_nonfinite=False
+[radau-solver] attempt t_start=3.779199e-02 dt_try=2.383359e-07 accepted=True failed=False fail_code=0 converged=True err_norm=9.267031e-04 growth=1.658193e+00 next_dt=3.952071e-07 stagnation_accepted=False stagnation_defect_norm=0.000000e+00 lagged_reused=False jacobian_reused=False
+[debug-walltime] radau.attempt #329 elapsed_s=0.091646
+[radau-solver] iter=1 delta_norm=4.808048e+05 residual_norm=5.056095e+05 stage_residual_defect=7.714797e+01 newton_metric=4.722140e+08 newton_tol=4.770583e-04 theta=0.000000e+00 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=1 fraction=1.0e-04 fd_norm=5.013985e+05 matrix_norm=5.056095e+05 relative_error=9.058559e-02 cosine=9.959663e-01
+[radau-solver] iter=2 delta_norm=3.371578e+04 residual_norm=4.284882e+04 stage_residual_defect=6.538058e+00 newton_metric=2.497138e+06 newton_tol=4.770583e-04 theta=7.012363e-02 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=2 fraction=1.0e-04 fd_norm=3.943962e+04 matrix_norm=4.284882e+04 relative_error=9.520440e-02 cosine=9.992674e-01
+[radau-solver] iter=3 delta_norm=3.243356e+03 residual_norm=3.734133e+03 stage_residual_defect=5.697702e-01 newton_metric=2.850345e+05 newton_tol=4.770583e-04 theta=8.213209e-02 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=3 fraction=1.0e-04 fd_norm=3.543879e+03 matrix_norm=3.734133e+03 relative_error=5.467296e-02 cosine=9.999492e-01
+[radau-solver] iter=4 delta_norm=1.756621e+02 residual_norm=1.936940e+02 stage_residual_defect=2.955466e-02 newton_metric=1.342169e+04 newton_tol=4.770583e-04 theta=7.218091e-02 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=4 fraction=1.0e-04 fd_norm=1.866010e+02 matrix_norm=1.936940e+02 relative_error=3.828355e-02 cosine=9.999900e-01
+[radau-solver] iter=5 delta_norm=6.628312e+00 residual_norm=7.143677e+00 stage_residual_defect=1.090013e-03 newton_metric=3.082250e+02 newton_tol=4.770583e-04 theta=4.520684e-02 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=5 fraction=1.0e-04 fd_norm=6.939507e+00 matrix_norm=7.143677e+00 relative_error=2.953305e-02 cosine=9.999968e-01
+[radau-solver] iter=6 delta_norm=1.928622e-01 residual_norm=2.049444e-01 stage_residual_defect=3.127131e-05 newton_metric=6.491362e+00 newton_tol=4.770583e-04 theta=3.313482e-02 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=6 fraction=1.0e-04 fd_norm=2.001326e-01 matrix_norm=2.049444e-01 relative_error=2.410282e-02 cosine=9.999986e-01
+[radau-solver] iter=7 delta_norm=4.577533e-03 residual_norm=4.817813e-03 stage_residual_defect=7.351228e-07 newton_metric=1.213337e-01 newton_tol=4.770583e-04 theta=2.627933e-02 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=7 fraction=1.0e-04 fd_norm=4.725327e-03 matrix_norm=4.817813e-03 relative_error=1.961232e-02 cosine=9.999992e-01
+[radau-solver] iter=8 delta_norm=9.185553e-05 residual_norm=9.600648e-05 stage_residual_defect=1.464908e-08 newton_metric=2.012739e-03 newton_tol=4.770583e-04 theta=2.182374e-02 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=8 fraction=1.0e-04 fd_norm=1.004145e-04 matrix_norm=9.600648e-05 relative_error=5.450857e-02 cosine=9.994540e-01
+[radau-solver] iter=9 delta_norm=1.596712e-06 residual_norm=1.660140e-06 stage_residual_defect=2.533113e-10 newton_metric=2.984573e-05 newton_tol=4.770583e-04 theta=1.867659e-02 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=9 fraction=1.0e-04 fd_norm=2.603126e-06 matrix_norm=1.660140e-06 relative_error=1.132892e+00 cosine=9.665250e-02
+[radau-solver] final_stage_residual_defect=3.876155e-12
+[radau-solver] final iter=9 converged=True diverged=False finite_initial_residual=True nonfinite_stage_state=False nonfinite_stage_residual=False residual_norm=2.540336e-08 delta_norm=1.596712e-06 newton_metric=2.984573e-05 newton_tol=4.770583e-04 theta=1.867659e-02 slow=False blowup=False newton_nonfinite=False
+[radau-solver] attempt t_start=3.779223e-02 dt_try=3.952071e-07 accepted=True failed=False fail_code=0 converged=True err_norm=1.950521e-03 growth=1.553654e+00 next_dt=6.140151e-07 stagnation_accepted=False stagnation_defect_norm=0.000000e+00 lagged_reused=False jacobian_reused=False
+[debug-walltime] radau.attempt #330 elapsed_s=0.095087
+[radau-solver] iter=1 delta_norm=2.946649e+05 residual_norm=3.109581e+05 stage_residual_defect=7.371392e+01 newton_metric=2.894001e+08 newton_tol=4.770583e-04 theta=0.000000e+00 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=1 fraction=1.0e-04 fd_norm=3.082566e+05 matrix_norm=3.109581e+05 relative_error=7.961949e-02 cosine=9.968960e-01
+[radau-solver] iter=2 delta_norm=1.861032e+04 residual_norm=2.313385e+04 stage_residual_defect=5.483997e+00 newton_metric=1.232204e+06 newton_tol=4.770583e-04 theta=6.315755e-02 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=2 fraction=1.0e-04 fd_norm=2.160398e+04 matrix_norm=2.313385e+04 relative_error=7.729389e-02 cosine=9.995519e-01
+[radau-solver] iter=3 delta_norm=1.463801e+03 residual_norm=1.662024e+03 stage_residual_defect=3.939912e-01 newton_metric=1.090112e+05 newton_tol=4.770583e-04 theta=7.048177e-02 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=3 fraction=1.0e-04 fd_norm=1.592253e+03 matrix_norm=1.662024e+03 relative_error=4.458189e-02 cosine=9.999677e-01
+[radau-solver] iter=4 delta_norm=6.498067e+01 residual_norm=7.097018e+01 stage_residual_defect=1.682385e-02 newton_metric=4.007942e+03 newton_tol=4.770583e-04 theta=5.909016e-02 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=4 fraction=1.0e-04 fd_norm=6.883016e+01 matrix_norm=7.097018e+01 relative_error=3.130638e-02 cosine=9.999935e-01
+[radau-solver] iter=5 delta_norm=2.013950e+00 residual_norm=2.154808e+00 stage_residual_defect=5.108082e-04 newton_metric=7.619343e+01 newton_tol=4.770583e-04 theta=3.709226e-02 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=5 fraction=1.0e-04 fd_norm=2.104118e+00 matrix_norm=2.154808e+00 relative_error=2.417980e-02 cosine=9.999979e-01
+[radau-solver] iter=6 delta_norm=4.816571e-02 residual_norm=5.088278e-02 stage_residual_defect=1.206203e-05 newton_metric=1.323954e+00 newton_tol=4.770583e-04 theta=2.722556e-02 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=6 fraction=1.0e-04 fd_norm=4.990417e-02 matrix_norm=5.088278e-02 relative_error=1.966898e-02 cosine=9.999989e-01
+[radau-solver] iter=7 delta_norm=9.398872e-04 residual_norm=9.843414e-04 stage_residual_defect=2.333432e-07 newton_metric=2.038188e-02 newton_tol=4.770583e-04 theta=2.160297e-02 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=7 fraction=1.0e-04 fd_norm=9.718919e-04 matrix_norm=9.843414e-04 relative_error=1.350879e-02 cosine=9.999909e-01
+[radau-solver] iter=8 delta_norm=1.550713e-05 residual_norm=1.613890e-05 stage_residual_defect=3.825809e-09 newton_metric=2.782669e-04 newton_tol=4.770583e-04 theta=1.794307e-02 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=8 fraction=1.0e-04 fd_norm=1.514518e-05 matrix_norm=1.613890e-05 relative_error=6.670889e-02 cosine=9.999319e-01
+[radau-solver] final_stage_residual_defect=5.446740e-11
+[radau-solver] final iter=8 converged=True diverged=False finite_initial_residual=True nonfinite_stage_state=False nonfinite_stage_residual=False residual_norm=2.297668e-07 delta_norm=1.550713e-05 newton_metric=2.782669e-04 newton_tol=4.770583e-04 theta=1.794307e-02 slow=False blowup=False newton_nonfinite=False
+[radau-solver] attempt t_start=3.779262e-02 dt_try=6.140151e-07 accepted=True failed=False fail_code=0 converged=True err_norm=5.109008e-05 growth=2.136796e+00 next_dt=1.312025e-06 stagnation_accepted=False stagnation_defect_norm=0.000000e+00 lagged_reused=False jacobian_reused=False
+[debug-walltime] radau.attempt #331 elapsed_s=0.084115
+[radau-solver] iter=1 delta_norm=1.970923e+05 residual_norm=2.338703e+05 stage_residual_defect=9.743593e+01 newton_metric=1.935708e+08 newton_tol=4.770583e-04 theta=0.000000e+00 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=1 fraction=1.0e-04 fd_norm=2.204541e+05 matrix_norm=2.338703e+05 relative_error=1.555796e-01 cosine=9.903374e-01
+[radau-solver] iter=2 delta_norm=2.444331e+04 residual_norm=3.209952e+04 stage_residual_defect=1.337353e+01 newton_metric=3.398801e+06 newton_tol=4.770583e-04 theta=1.240195e-01 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=2 fraction=1.0e-04 fd_norm=2.901429e+04 matrix_norm=3.209952e+04 relative_error=1.130645e-01 cosine=9.993327e-01
+[radau-solver] iter=3 delta_norm=2.751415e+03 residual_norm=3.252784e+03 stage_residual_defect=1.355198e+00 newton_metric=3.620561e+05 newton_tol=4.770583e-04 theta=1.181526e-01 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=3 fraction=1.0e-04 fd_norm=3.046463e+03 matrix_norm=3.252784e+03 relative_error=6.875748e-02 cosine=9.999340e-01
+[radau-solver] iter=4 delta_norm=1.858206e+02 residual_norm=2.093415e+02 stage_residual_defect=8.721732e-02 newton_metric=1.743214e+04 newton_tol=4.770583e-04 theta=8.719006e-02 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=4 fraction=1.0e-04 fd_norm=1.995464e+02 matrix_norm=2.093415e+02 relative_error=4.940716e-02 cosine=9.999850e-01
+[radau-solver] iter=5 delta_norm=8.988061e+00 residual_norm=9.858729e+00 stage_residual_defect=4.107413e-03 newton_metric=5.351196e+02 newton_tol=4.770583e-04 theta=5.715510e-02 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=5 fraction=1.0e-04 fd_norm=9.493823e+00 matrix_norm=9.858729e+00 relative_error=3.857450e-02 cosine=9.999949e-01
+[radau-solver] iter=6 delta_norm=3.395798e-01 residual_norm=3.662207e-01 stage_residual_defect=1.525775e-04 newton_metric=1.489395e+01 newton_tol=4.770583e-04 theta=4.274880e-02 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=6 fraction=1.0e-04 fd_norm=3.550213e-01 matrix_norm=3.662207e-01 relative_error=3.161709e-02 cosine=9.999978e-01
+[radau-solver] iter=7 delta_norm=1.053924e-02 residual_norm=1.123402e-02 stage_residual_defect=4.680396e-06 newton_metric=3.670147e-01 newton_tol=4.770583e-04 theta=3.424299e-02 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=7 fraction=1.0e-04 fd_norm=1.093870e-02 matrix_norm=1.123402e-02 relative_error=2.705852e-02 cosine=9.999984e-01
+[radau-solver] iter=8 delta_norm=2.777327e-04 residual_norm=2.935212e-04 stage_residual_defect=1.222889e-07 newton_metric=8.030471e-03 newton_tol=4.770583e-04 theta=2.859846e-02 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=8 fraction=1.0e-04 fd_norm=2.884284e-04 matrix_norm=2.935212e-04 relative_error=2.391775e-02 cosine=9.998721e-01
+[radau-solver] iter=9 delta_norm=6.361637e-06 residual_norm=6.679557e-06 stage_residual_defect=2.782884e-09 newton_metric=1.573700e-04 newton_tol=4.770583e-04 theta=2.456856e-02 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=9 fraction=1.0e-04 fd_norm=6.275909e-06 matrix_norm=6.679557e-06 relative_error=6.689386e-02 cosine=9.998412e-01
+[radau-solver] final_stage_residual_defect=5.599188e-11
+[radau-solver] final iter=9 converged=True diverged=False finite_initial_residual=True nonfinite_stage_state=False nonfinite_stage_residual=False residual_norm=1.343933e-07 delta_norm=6.361637e-06 newton_metric=1.573700e-04 newton_tol=4.770583e-04 theta=2.456856e-02 slow=False blowup=False newton_nonfinite=False
+[radau-solver] attempt t_start=3.779324e-02 dt_try=1.312025e-06 accepted=True failed=False fail_code=0 converged=True err_norm=2.165138e-04 growth=1.883161e+00 next_dt=2.470755e-06 stagnation_accepted=False stagnation_defect_norm=0.000000e+00 lagged_reused=False jacobian_reused=False
+[debug-walltime] radau.attempt #332 elapsed_s=0.091626
+[radau-solver] iter=1 delta_norm=1.642668e+05 residual_norm=1.800275e+05 stage_residual_defect=1.133381e+02 newton_metric=1.613319e+08 newton_tol=4.770583e-04 theta=0.000000e+00 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=1 fraction=1.0e-04 fd_norm=1.754691e+05 matrix_norm=1.800275e+05 relative_error=1.373818e-01 cosine=9.911310e-01
+[radau-solver] iter=2 delta_norm=1.622377e+04 residual_norm=2.233060e+04 stage_residual_defect=1.405867e+01 newton_metric=1.746164e+06 newton_tol=4.770583e-04 theta=9.876463e-02 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=2 fraction=1.0e-04 fd_norm=1.993228e+04 matrix_norm=2.233060e+04 relative_error=1.321949e-01 cosine=9.986621e-01
+[radau-solver] iter=3 delta_norm=2.151198e+03 residual_norm=2.606771e+03 stage_residual_defect=1.641144e+00 newton_metric=2.730210e+05 newton_tol=4.770583e-04 theta=1.144366e-01 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=3 fraction=1.0e-04 fd_norm=2.423672e+03 matrix_norm=2.606771e+03 relative_error=7.697526e-02 cosine=9.998987e-01
+[radau-solver] iter=4 delta_norm=1.630212e+02 residual_norm=1.864036e+02 stage_residual_defect=1.173540e-01 newton_metric=1.783752e+04 newton_tol=4.770583e-04 theta=1.002412e-01 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=4 fraction=1.0e-04 fd_norm=1.768838e+02 matrix_norm=1.864036e+02 relative_error=5.421880e-02 cosine=9.999795e-01
+[radau-solver] iter=5 delta_norm=8.651968e+00 residual_norm=9.589973e+00 stage_residual_defect=6.037555e-03 newton_metric=5.753826e+02 newton_tol=4.770583e-04 theta=6.341868e-02 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=5 fraction=1.0e-04 fd_norm=9.205480e+00 matrix_norm=9.589973e+00 relative_error=4.193154e-02 cosine=9.999934e-01
+[radau-solver] iter=6 delta_norm=3.550544e-01 residual_norm=3.860138e-01 stage_residual_defect=2.430226e-04 newton_metric=1.707051e+01 newton_tol=4.770583e-04 theta=4.666867e-02 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=6 fraction=1.0e-04 fd_norm=3.732798e-01 matrix_norm=3.860138e-01 relative_error=3.419655e-02 cosine=9.999973e-01
+[radau-solver] iter=7 delta_norm=1.190432e-02 residual_norm=1.277278e-02 stage_residual_defect=8.041352e-06 newton_metric=4.503864e-01 newton_tol=4.770583e-04 theta=3.709325e-02 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=7 fraction=1.0e-04 fd_norm=1.241283e-02 matrix_norm=1.277278e-02 relative_error=2.904969e-02 cosine=9.999985e-01
+[radau-solver] iter=8 delta_norm=3.377795e-04 residual_norm=3.589672e-04 stage_residual_defect=2.259949e-07 newton_metric=1.055793e-02 newton_tol=4.770583e-04 theta=3.084389e-02 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=8 fraction=1.0e-04 fd_norm=3.486777e-04 matrix_norm=3.589672e-04 relative_error=3.209775e-02 cosine=9.999226e-01
+[radau-solver] iter=9 delta_norm=8.313707e-06 residual_norm=8.771107e-06 stage_residual_defect=5.522023e-09 newton_metric=2.216365e-04 newton_tol=4.770583e-04 theta=2.642683e-02 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=9 fraction=1.0e-04 fd_norm=8.658084e-06 matrix_norm=8.771107e-06 relative_error=3.386921e-02 cosine=9.995179e-01
+[radau-solver] final_stage_residual_defect=1.192773e-10
+[radau-solver] final iter=9 converged=True diverged=False finite_initial_residual=True nonfinite_stage_state=False nonfinite_stage_residual=False residual_norm=1.894584e-07 delta_norm=8.313707e-06 newton_metric=2.216365e-04 newton_tol=4.770583e-04 theta=2.642683e-02 slow=False blowup=False newton_nonfinite=False
+[radau-solver] attempt t_start=3.779455e-02 dt_try=2.470755e-06 accepted=True failed=False fail_code=0 converged=True err_norm=3.559480e-04 growth=1.803002e+00 next_dt=4.454776e-06 stagnation_accepted=False stagnation_defect_norm=0.000000e+00 lagged_reused=False jacobian_reused=False
+[debug-walltime] radau.attempt #333 elapsed_s=0.093292
+[radau-solver] iter=1 delta_norm=1.064901e+05 residual_norm=1.163425e+05 stage_residual_defect=1.083978e+02 newton_metric=1.045877e+08 newton_tol=4.770583e-04 theta=0.000000e+00 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=1 fraction=1.0e-04 fd_norm=1.136656e+05 matrix_norm=1.163425e+05 relative_error=1.288617e-01 cosine=9.921593e-01
+[radau-solver] iter=2 delta_norm=9.581967e+03 residual_norm=1.344874e+04 stage_residual_defect=1.253076e+01 newton_metric=9.305032e+05 newton_tol=4.770583e-04 theta=8.997963e-02 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=2 fraction=1.0e-04 fd_norm=1.207031e+04 matrix_norm=1.344874e+04 relative_error=1.261297e-01 cosine=9.987134e-01
+[radau-solver] iter=3 delta_norm=1.226699e+03 residual_norm=1.504628e+03 stage_residual_defect=1.401927e+00 newton_metric=1.448538e+05 newton_tol=4.770583e-04 theta=1.073282e-01 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=3 fraction=1.0e-04 fd_norm=1.403510e+03 matrix_norm=1.504628e+03 relative_error=7.345215e-02 cosine=9.999047e-01
+[radau-solver] iter=4 delta_norm=8.934910e+01 residual_norm=1.029983e+02 stage_residual_defect=9.596789e-02 newton_metric=9.379526e+03 newton_tol=4.770583e-04 theta=9.656456e-02 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=4 fraction=1.0e-04 fd_norm=9.796746e+01 matrix_norm=1.029983e+02 relative_error=5.174010e-02 cosine=9.999810e-01
+[radau-solver] iter=5 delta_norm=4.545062e+00 residual_norm=5.068614e+00 stage_residual_defect=4.722644e-03 newton_metric=2.893243e+02 newton_tol=4.770583e-04 theta=6.086966e-02 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=5 fraction=1.0e-04 fd_norm=4.874321e+00 matrix_norm=5.068614e+00 relative_error=4.001897e-02 cosine=9.999939e-01
+[radau-solver] iter=6 delta_norm=1.785565e-01 residual_norm=1.950752e-01 stage_residual_defect=1.817599e-04 newton_metric=8.206357e+00 newton_tol=4.770583e-04 theta=4.470363e-02 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=6 fraction=1.0e-04 fd_norm=1.889228e-01 matrix_norm=1.950752e-01 relative_error=3.264589e-02 cosine=9.999975e-01
+[radau-solver] iter=7 delta_norm=5.727527e-03 residual_norm=6.170414e-03 stage_residual_defect=5.749239e-06 newton_metric=2.070371e-01 newton_tol=4.770583e-04 theta=3.549880e-02 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=7 fraction=1.0e-04 fd_norm=6.003756e-03 matrix_norm=6.170414e-03 relative_error=2.780418e-02 cosine=9.999988e-01
+[radau-solver] iter=8 delta_norm=1.554213e-04 residual_norm=1.657475e-04 stage_residual_defect=1.544340e-07 newton_metric=4.640385e-03 newton_tol=4.770583e-04 theta=2.950309e-02 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=8 fraction=1.0e-04 fd_norm=1.613635e-04 matrix_norm=1.657475e-04 relative_error=3.142369e-02 cosine=9.998786e-01
+[radau-solver] iter=9 delta_norm=3.657209e-06 residual_norm=3.870325e-06 stage_residual_defect=3.606147e-09 newton_metric=9.311646e-05 newton_tol=4.770583e-04 theta=2.526919e-02 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=9 fraction=1.0e-04 fd_norm=4.633820e-06 matrix_norm=3.870325e-06 relative_error=3.880157e-01 cosine=9.261234e-01
+[radau-solver] final_stage_residual_defect=7.431933e-11
+[radau-solver] final iter=9 converged=True diverged=False finite_initial_residual=True nonfinite_stage_state=False nonfinite_stage_residual=False residual_norm=7.976378e-08 delta_norm=3.657209e-06 newton_metric=9.311646e-05 newton_tol=4.770583e-04 theta=2.526919e-02 slow=False blowup=False newton_nonfinite=False
+[radau-solver] attempt t_start=3.779702e-02 dt_try=4.454776e-06 accepted=True failed=False fail_code=0 converged=True err_norm=5.912976e-04 growth=1.724684e+00 next_dt=7.683079e-06 stagnation_accepted=False stagnation_defect_norm=0.000000e+00 lagged_reused=False jacobian_reused=False
+[debug-walltime] radau.attempt #334 elapsed_s=0.091587
+[radau-solver] iter=1 delta_norm=6.574381e+04 residual_norm=7.300493e+04 stage_residual_defect=9.928430e+01 newton_metric=6.456983e+07 newton_tol=4.770583e-04 theta=0.000000e+00 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=1 fraction=1.0e-04 fd_norm=7.108622e+04 matrix_norm=7.300493e+04 relative_error=1.199636e-01 cosine=9.933482e-01
+[radau-solver] iter=2 delta_norm=5.378539e+03 residual_norm=7.711428e+03 stage_residual_defect=1.048699e+01 newton_metric=4.706593e+05 newton_tol=4.770583e-04 theta=8.180971e-02 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=2 fraction=1.0e-04 fd_norm=7.016481e+03 matrix_norm=7.711428e+03 relative_error=1.089622e-01 cosine=9.990615e-01
+[radau-solver] iter=3 delta_norm=6.071480e+02 residual_norm=7.545790e+02 stage_residual_defect=1.026174e+00 newton_metric=6.339590e+04 newton_tol=4.770583e-04 theta=9.609870e-02 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=3 fraction=1.0e-04 fd_norm=7.099420e+02 matrix_norm=7.545790e+02 relative_error=6.408342e-02 cosine=9.999278e-01
+[radau-solver] iter=4 delta_norm=3.906805e+01 residual_norm=4.545554e+01 stage_residual_defect=6.181628e-02 newton_metric=3.574846e+03 newton_tol=4.770583e-04 theta=8.522729e-02 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=4 fraction=1.0e-04 fd_norm=4.349612e+01 matrix_norm=4.545554e+01 relative_error=4.538620e-02 cosine=9.999854e-01
+[radau-solver] iter=5 delta_norm=1.757534e+00 residual_norm=1.974033e+00 stage_residual_defect=2.684543e-03 newton_metric=9.815143e+01 newton_tol=4.770583e-04 theta=5.380276e-02 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=5 fraction=1.0e-04 fd_norm=1.907152e+00 matrix_norm=1.974033e+00 relative_error=3.520760e-02 cosine=9.999953e-01
+[radau-solver] iter=6 delta_norm=6.110082e-02 residual_norm=6.714223e-02 stage_residual_defect=9.130864e-05 newton_metric=2.470891e+00 newton_tol=4.770583e-04 theta=3.954692e-02 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=6 fraction=1.0e-04 fd_norm=6.526798e-02 matrix_norm=6.714223e-02 relative_error=2.878584e-02 cosine=9.999981e-01
+[radau-solver] iter=7 delta_norm=1.735129e-03 residual_norm=1.878471e-03 stage_residual_defect=2.554587e-06 newton_metric=5.528161e-02 newton_tol=4.770583e-04 theta=3.142057e-02 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=7 fraction=1.0e-04 fd_norm=1.834344e-03 matrix_norm=1.878471e-03 relative_error=2.407420e-02 cosine=9.999996e-01
+[radau-solver] iter=8 delta_norm=4.169609e-05 residual_norm=4.465485e-05 stage_residual_defect=6.072741e-08 newton_metric=1.098463e-03 newton_tol=4.770583e-04 theta=2.612307e-02 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=8 fraction=1.0e-04 fd_norm=4.347822e-05 matrix_norm=4.465485e-05 relative_error=3.356002e-02 cosine=9.998082e-01
+[radau-solver] iter=9 delta_norm=8.686365e-07 residual_norm=9.226561e-07 stage_residual_defect=1.254746e-09 newton_metric=1.952490e-05 newton_tol=4.770583e-04 theta=2.237449e-02 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=9 fraction=1.0e-04 fd_norm=8.516294e-07 matrix_norm=9.226561e-07 relative_error=9.487863e-02 cosine=9.990556e-01
+[radau-solver] final_stage_residual_defect=2.313287e-11
+[radau-solver] final iter=9 converged=True diverged=False finite_initial_residual=True nonfinite_stage_state=False nonfinite_stage_residual=False residual_norm=1.701074e-08 delta_norm=8.686365e-07 newton_metric=1.952490e-05 newton_tol=4.770583e-04 theta=2.237449e-02 slow=False blowup=False newton_nonfinite=False
+[radau-solver] attempt t_start=3.780148e-02 dt_try=7.683079e-06 accepted=True failed=False fail_code=0 converged=True err_norm=2.391786e-04 growth=1.866828e+00 next_dt=1.434299e-05 stagnation_accepted=False stagnation_defect_norm=0.000000e+00 lagged_reused=False jacobian_reused=False
+[debug-walltime] radau.attempt #335 elapsed_s=0.091562
+[radau-solver] iter=1 delta_norm=4.029854e+04 residual_norm=5.019412e+04 stage_residual_defect=1.117708e+02 newton_metric=3.958030e+07 newton_tol=4.770583e-04 theta=0.000000e+00 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=1 fraction=1.0e-04 fd_norm=4.735358e+04 matrix_norm=5.019412e+04 relative_error=1.405079e-01 cosine=9.923847e-01
+[radau-solver] iter=2 delta_norm=3.733677e+03 residual_norm=5.783932e+03 stage_residual_defect=1.287168e+01 newton_metric=3.744194e+05 newton_tol=4.770583e-04 theta=9.264627e-02 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=2 fraction=1.0e-04 fd_norm=5.303127e+03 matrix_norm=5.783932e+03 relative_error=9.756884e-02 cosine=9.994042e-01
+[radau-solver] iter=3 delta_norm=3.859893e+02 residual_norm=5.070187e+02 stage_residual_defect=1.128330e+00 newton_metric=4.112517e+04 newton_tol=4.770583e-04 theta=9.786630e-02 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=3 fraction=1.0e-04 fd_norm=4.788202e+02 matrix_norm=5.070187e+02 relative_error=5.991275e-02 cosine=9.999427e-01
+[radau-solver] iter=4 delta_norm=2.360944e+01 residual_norm=2.864971e+01 stage_residual_defect=6.375764e-02 newton_metric=2.003161e+03 newton_tol=4.770583e-04 theta=7.951964e-02 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=4 fraction=1.0e-04 fd_norm=2.746279e+01 matrix_norm=2.864971e+01 relative_error=4.352996e-02 cosine=9.999871e-01
+[radau-solver] iter=5 delta_norm=1.029204e+00 residual_norm=1.195373e+00 stage_residual_defect=2.660207e-03 newton_metric=5.503772e+01 newton_tol=4.770583e-04 theta=5.163726e-02 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=5 fraction=1.0e-04 fd_norm=1.155987e+00 matrix_norm=1.195373e+00 relative_error=3.420436e-02 cosine=9.999956e-01
+[radau-solver] iter=6 delta_norm=3.499624e-02 residual_norm=3.953726e-02 stage_residual_defect=8.798700e-05 newton_metric=1.376291e+00 newton_tol=4.770583e-04 theta=3.850063e-02 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=6 fraction=1.0e-04 fd_norm=3.845223e-02 matrix_norm=3.953726e-02 relative_error=2.827863e-02 cosine=9.999983e-01
+[radau-solver] iter=7 delta_norm=9.771350e-04 residual_norm=1.083103e-03 stage_residual_defect=2.410360e-06 newton_metric=3.051008e-02 newton_tol=4.770583e-04 theta=3.081247e-02 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=7 fraction=1.0e-04 fd_norm=1.056160e-03 matrix_norm=1.083103e-03 relative_error=2.565807e-02 cosine=9.999963e-01
+[radau-solver] iter=8 delta_norm=2.316325e-05 residual_norm=2.532101e-05 stage_residual_defect=5.634988e-08 newton_metric=6.007281e-04 newton_tol=4.770583e-04 theta=2.572699e-02 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=8 fraction=1.0e-04 fd_norm=2.423998e-05 matrix_norm=2.532101e-05 relative_error=4.809300e-02 cosine=9.998449e-01
+[radau-solver] iter=9 delta_norm=4.775701e-07 residual_norm=5.165055e-07 stage_residual_defect=1.149444e-09 newton_metric=1.060371e-05 newton_tol=4.770583e-04 theta=2.210759e-02 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=9 fraction=1.0e-04 fd_norm=4.729374e-07 matrix_norm=5.165055e-07 relative_error=1.010150e-01 cosine=9.992137e-01
+[radau-solver] final_stage_residual_defect=2.119323e-11
+[radau-solver] final iter=9 converged=True diverged=False finite_initial_residual=True nonfinite_stage_state=False nonfinite_stage_residual=False residual_norm=9.524596e-09 delta_norm=4.775701e-07 newton_metric=1.060371e-05 newton_tol=4.770583e-04 theta=2.210759e-02 slow=False blowup=False newton_nonfinite=False
+[radau-solver] attempt t_start=3.780916e-02 dt_try=1.434299e-05 accepted=True failed=False fail_code=0 converged=True err_norm=4.463413e-04 growth=1.767651e+00 next_dt=2.535340e-05 stagnation_accepted=False stagnation_defect_norm=0.000000e+00 lagged_reused=False jacobian_reused=False
+[debug-walltime] radau.attempt #336 elapsed_s=0.091497
+[radau-solver] iter=1 delta_norm=2.554571e+04 residual_norm=3.225584e+04 stage_residual_defect=1.148721e+02 newton_metric=2.509203e+07 newton_tol=4.770583e-04 theta=0.000000e+00 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=1 fraction=1.0e-04 fd_norm=3.068996e+04 matrix_norm=3.225584e+04 relative_error=1.157637e-01 cosine=9.948631e-01
+[radau-solver] iter=2 delta_norm=1.595322e+03 residual_norm=2.888694e+03 stage_residual_defect=1.027072e+01 newton_metric=1.043530e+05 newton_tol=4.770583e-04 theta=6.244296e-02 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=2 fraction=1.0e-04 fd_norm=2.699762e+03 matrix_norm=2.888694e+03 relative_error=7.673549e-02 cosine=9.995369e-01
+[radau-solver] iter=3 delta_norm=1.371115e+02 residual_norm=2.011696e+02 stage_residual_defect=7.152556e-01 newton_metric=1.064487e+04 newton_tol=4.770583e-04 theta=7.325789e-02 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=3 fraction=1.0e-04 fd_norm=1.921698e+02 matrix_norm=2.011696e+02 relative_error=4.778895e-02 cosine=9.999568e-01
+[radau-solver] iter=4 delta_norm=6.996045e+00 residual_norm=9.169101e+00 stage_residual_defect=3.260062e-02 newton_metric=4.872834e+02 newton_tol=4.770583e-04 theta=6.622196e-02 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=4 fraction=1.0e-04 fd_norm=8.860946e+00 matrix_norm=9.169101e+00 relative_error=3.505786e-02 cosine=9.999905e-01
+[radau-solver] iter=5 delta_norm=2.522050e-01 residual_norm=3.106297e-01 stage_residual_defect=1.104440e-03 newton_metric=1.109945e+01 newton_tol=4.770583e-04 theta=4.288840e-02 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=5 fraction=1.0e-04 fd_norm=3.022879e-01 matrix_norm=3.106297e-01 relative_error=2.771425e-02 cosine=9.999968e-01
+[radau-solver] iter=6 delta_norm=7.068102e-03 residual_norm=8.372692e-03 stage_residual_defect=2.976900e-05 newton_metric=2.278907e-01 newton_tol=4.770583e-04 theta=3.178521e-02 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=6 fraction=1.0e-04 fd_norm=8.189704e-03 matrix_norm=8.372692e-03 relative_error=2.243413e-02 cosine=9.999980e-01
+[radau-solver] iter=7 delta_norm=1.624447e-04 residual_norm=1.873578e-04 stage_residual_defect=6.661483e-07 newton_metric=4.154477e-03 newton_tol=4.770583e-04 theta=2.537908e-02 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=7 fraction=1.0e-04 fd_norm=1.851035e-04 matrix_norm=1.873578e-04 relative_error=1.268551e-02 cosine=9.999938e-01
+[radau-solver] iter=8 delta_norm=3.168342e-06 residual_norm=3.584079e-06 stage_residual_defect=1.274315e-08 newton_metric=6.730710e-05 newton_tol=4.770583e-04 theta=2.117213e-02 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=8 fraction=1.0e-04 fd_norm=3.382015e-06 matrix_norm=3.584079e-06 relative_error=6.678423e-02 cosine=9.995799e-01
+[radau-solver] final_stage_residual_defect=2.121144e-10
+[radau-solver] final iter=8 converged=True diverged=False finite_initial_residual=True nonfinite_stage_state=False nonfinite_stage_residual=False residual_norm=5.964944e-08 delta_norm=3.168342e-06 newton_metric=6.730710e-05 newton_tol=4.770583e-04 theta=2.117213e-02 slow=False blowup=False newton_nonfinite=False
+[radau-solver] attempt t_start=3.782350e-02 dt_try=2.535340e-05 accepted=True failed=False fail_code=0 converged=True err_norm=2.663605e-04 growth=1.849328e+00 next_dt=4.688675e-05 stagnation_accepted=False stagnation_defect_norm=0.000000e+00 lagged_reused=False jacobian_reused=False
+[debug-walltime] radau.attempt #337 elapsed_s=0.094215
+[radau-solver] iter=1 delta_norm=1.289652e+04 residual_norm=1.759397e+04 stage_residual_defect=1.092986e+02 newton_metric=1.267000e+07 newton_tol=4.770583e-04 theta=0.000000e+00 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=1 fraction=1.0e-04 fd_norm=1.681952e+04 matrix_norm=1.759397e+04 relative_error=8.387859e-02 cosine=9.976504e-01
+[radau-solver] iter=2 delta_norm=4.482409e+02 residual_norm=1.030911e+03 stage_residual_defect=6.391836e+00 newton_metric=1.584822e+04 newton_tol=4.770583e-04 theta=3.474741e-02 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=2 fraction=1.0e-04 fd_norm=9.906233e+02 matrix_norm=1.030911e+03 relative_error=4.586594e-02 cosine=9.997839e-01
+[radau-solver] iter=3 delta_norm=2.284499e+01 residual_norm=4.364021e+01 stage_residual_defect=2.705823e-01 newton_metric=9.857284e+02 newton_tol=4.770583e-04 theta=4.208263e-02 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=3 fraction=1.0e-04 fd_norm=4.237287e+01 matrix_norm=4.364021e+01 relative_error=3.072138e-02 cosine=9.999761e-01
+[radau-solver] iter=4 delta_norm=8.218171e-01 residual_norm=1.299870e+00 stage_residual_defect=8.060726e-03 newton_metric=3.610770e+01 newton_tol=4.770583e-04 theta=4.281852e-02 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=4 fraction=1.0e-04 fd_norm=1.270620e+00 matrix_norm=1.299870e+00 relative_error=2.325327e-02 cosine=9.999947e-01
+[radau-solver] iter=5 delta_norm=2.078641e-02 residual_norm=2.954633e-02 stage_residual_defect=1.832506e-04 newton_metric=6.349735e-01 newton_tol=4.770583e-04 theta=3.016411e-02 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=5 fraction=1.0e-04 fd_norm=2.900933e-02 matrix_norm=2.954633e-02 relative_error=1.859962e-02 cosine=9.999984e-01
+[radau-solver] iter=6 delta_norm=4.072971e-04 residual_norm=5.415472e-04 stage_residual_defect=3.359162e-06 newton_metric=9.108286e-03 newton_tol=4.770583e-04 theta=2.226207e-02 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=6 fraction=1.0e-04 fd_norm=5.372052e-04 matrix_norm=5.415472e-04 relative_error=1.484950e-02 cosine=9.999230e-01
+[radau-solver] iter=7 delta_norm=6.540449e-06 residual_norm=8.309032e-06 stage_residual_defect=5.154491e-08 newton_metric=1.160077e-04 newton_tol=4.770583e-04 theta=1.773850e-02 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=7 fraction=1.0e-04 fd_norm=8.425690e-06 matrix_norm=8.309032e-06 relative_error=6.814823e-02 cosine=9.977425e-01
+[radau-solver] final_stage_residual_defect=6.829961e-10
+[radau-solver] final iter=7 converged=True diverged=False finite_initial_residual=True nonfinite_stage_state=False nonfinite_stage_residual=False residual_norm=1.099663e-07 delta_norm=6.540449e-06 newton_metric=1.160077e-04 newton_tol=4.770583e-04 theta=1.773850e-02 slow=False blowup=False newton_nonfinite=False
+[radau-solver] attempt t_start=3.784886e-02 dt_try=4.688675e-05 accepted=True failed=False fail_code=0 converged=True err_norm=3.163269e-04 growth=1.821716e+00 next_dt=8.541433e-05 stagnation_accepted=False stagnation_defect_norm=0.000000e+00 lagged_reused=False jacobian_reused=False
+[debug-walltime] radau.attempt #338 elapsed_s=0.083313
+[radau-solver] iter=1 delta_norm=4.818362e+03 residual_norm=6.454756e+03 stage_residual_defect=7.103499e+01 newton_metric=4.741177e+06 newton_tol=4.770583e-04 theta=0.000000e+00 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=1 fraction=1.0e-04 fd_norm=6.352164e+03 matrix_norm=6.454756e+03 relative_error=2.875799e-02 cosine=9.997214e-01
+[radau-solver] iter=2 delta_norm=7.186226e+01 residual_norm=1.226580e+02 stage_residual_defect=1.360518e+00 newton_metric=1.067819e+03 newton_tol=4.770583e-04 theta=1.489522e-02 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=2 fraction=1.0e-04 fd_norm=1.211160e+02 matrix_norm=1.226580e+02 relative_error=1.877810e-02 cosine=9.999059e-01
+[radau-solver] iter=3 delta_norm=7.756259e-01 residual_norm=2.231133e+00 stage_residual_defect=2.462931e-02 newton_metric=9.810838e+00 newton_tol=4.770583e-04 theta=1.268892e-02 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=3 fraction=1.0e-04 fd_norm=2.195587e+00 matrix_norm=2.231133e+00 relative_error=1.913483e-02 cosine=9.999488e-01
+[radau-solver] iter=4 delta_norm=1.789646e-02 residual_norm=4.200344e-02 stage_residual_defect=5.092776e-04 newton_metric=2.833345e-01 newton_tol=4.770583e-04 theta=1.580577e-02 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=4 fraction=1.0e-04 fd_norm=4.133526e-02 matrix_norm=4.200344e-02 relative_error=1.926412e-02 cosine=9.999460e-01
+[radau-solver] iter=5 delta_norm=3.954307e-04 residual_norm=8.063709e-04 stage_residual_defect=1.233614e-05 newton_metric=9.000808e-03 newton_tol=4.770583e-04 theta=2.258783e-02 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=5 fraction=1.0e-04 fd_norm=7.975118e-04 matrix_norm=8.063709e-04 relative_error=1.897005e-02 cosine=9.998831e-01
+[radau-solver] iter=6 delta_norm=1.039931e-05 residual_norm=1.855146e-05 stage_residual_defect=3.207541e-07 newton_metric=2.535694e-04 newton_tol=4.770583e-04 theta=2.411627e-02 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=6 fraction=1.0e-04 fd_norm=1.801679e-05 matrix_norm=1.855146e-05 relative_error=1.232602e-01 cosine=9.930500e-01
+[radau-solver] final_stage_residual_defect=7.284880e-09
+[radau-solver] final iter=6 converged=True diverged=False finite_initial_residual=True nonfinite_stage_state=False nonfinite_stage_residual=False residual_norm=4.105727e-07 delta_norm=1.039931e-05 newton_metric=2.535694e-04 newton_tol=4.770583e-04 theta=2.411627e-02 slow=False blowup=False newton_nonfinite=False
+[radau-solver] attempt t_start=3.789574e-02 dt_try=8.541433e-05 accepted=True failed=False fail_code=0 converged=True err_norm=4.059790e-04 growth=1.782372e+00 next_dt=1.522401e-04 stagnation_accepted=False stagnation_defect_norm=0.000000e+00 lagged_reused=False jacobian_reused=False
+[debug-walltime] radau.attempt #339 elapsed_s=0.087435
+[radau-solver] iter=1 delta_norm=1.321945e+03 residual_norm=1.995245e+03 stage_residual_defect=3.602786e+01 newton_metric=1.334503e+06 newton_tol=4.770583e-04 theta=0.000000e+00 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=1 fraction=1.0e-04 fd_norm=1.992476e+03 matrix_norm=1.995245e+03 relative_error=1.095563e-02 cosine=9.999410e-01
+[radau-solver] iter=2 delta_norm=7.377272e+00 residual_norm=1.953804e+01 stage_residual_defect=4.055689e-01 newton_metric=4.483266e+01 newton_tol=4.770583e-04 theta=5.779349e-03 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=2 fraction=1.0e-04 fd_norm=1.962595e+01 matrix_norm=1.953804e+01 relative_error=4.480180e-02 cosine=9.990020e-01
+[radau-solver] iter=3 delta_norm=3.426331e-01 residual_norm=8.784265e-01 stage_residual_defect=2.460239e-02 newton_metric=5.613984e+00 newton_tol=4.770583e-04 theta=1.605612e-02 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=3 fraction=1.0e-04 fd_norm=8.445570e-01 matrix_norm=8.784265e-01 relative_error=5.055569e-02 cosine=9.995445e-01
+[radau-solver] iter=4 delta_norm=1.638236e-02 residual_norm=4.269569e-02 stage_residual_defect=1.289085e-03 newton_metric=7.772589e-01 newton_tol=4.770583e-04 theta=4.581420e-02 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=4 fraction=1.0e-04 fd_norm=4.076264e-02 matrix_norm=4.269569e-02 relative_error=4.835042e-02 cosine=9.999576e-01
+[radau-solver] iter=5 delta_norm=8.691191e-04 residual_norm=1.967796e-03 stage_residual_defect=5.976859e-05 newton_metric=4.510623e-02 newton_tol=4.770583e-04 theta=4.994155e-02 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=5 fraction=1.0e-04 fd_norm=1.889426e-03 matrix_norm=1.967796e-03 relative_error=4.198527e-02 cosine=9.999797e-01
+[radau-solver] iter=6 delta_norm=3.992430e-05 residual_norm=8.184252e-05 stage_residual_defect=2.486968e-06 newton_metric=2.045940e-03 newton_tol=4.770583e-04 theta=4.934455e-02 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=6 fraction=1.0e-04 fd_norm=7.832796e-05 matrix_norm=8.184252e-05 relative_error=8.705342e-02 cosine=9.973370e-01
+[radau-solver] iter=7 delta_norm=1.653917e-06 residual_norm=3.132373e-06 stage_residual_defect=9.519090e-08 newton_metric=7.450155e-05 newton_tol=4.770583e-04 theta=4.362706e-02 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=7 fraction=1.0e-04 fd_norm=2.497200e-06 matrix_norm=3.132373e-06 relative_error=4.839787e-01 cosine=9.324195e-01
+[radau-solver] final_stage_residual_defect=3.362716e-09
+[radau-solver] final iter=7 converged=True diverged=False finite_initial_residual=True nonfinite_stage_state=False nonfinite_stage_residual=False residual_norm=1.105800e-07 delta_norm=1.653917e-06 newton_metric=7.450155e-05 newton_tol=4.770583e-04 theta=4.362706e-02 slow=False blowup=False newton_nonfinite=False
+[radau-solver] attempt t_start=3.798116e-02 dt_try=1.522401e-04 accepted=True failed=False fail_code=0 converged=True err_norm=1.832984e-04 growth=1.910804e+00 next_dt=2.909011e-04 stagnation_accepted=False stagnation_defect_norm=0.000000e+00 lagged_reused=False jacobian_reused=False
+[debug-walltime] radau.attempt #340 elapsed_s=0.097770
+[radau-solver] iter=1 delta_norm=1.418514e+03 residual_norm=2.529436e+03 stage_residual_defect=9.151988e+01 newton_metric=1.449164e+06 newton_tol=4.770583e-04 theta=0.000000e+00 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=1 fraction=1.0e-04 fd_norm=2.553555e+03 matrix_norm=2.529436e+03 relative_error=3.240082e-02 cosine=9.995151e-01
+[radau-solver] iter=2 delta_norm=1.587456e+01 residual_norm=7.831278e+01 stage_residual_defect=3.624334e+00 newton_metric=1.875940e+02 newton_tol=4.770583e-04 theta=1.131306e-02 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=2 fraction=1.0e-04 fd_norm=7.400751e+01 matrix_norm=7.831278e+01 relative_error=9.069561e-02 cosine=9.977123e-01
+[radau-solver] iter=3 delta_norm=1.172053e+00 residual_norm=6.707212e+00 stage_residual_defect=3.592484e-01 newton_metric=3.401871e+01 newton_tol=4.770583e-04 theta=2.835972e-02 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=3 fraction=1.0e-04 fd_norm=6.221043e+00 matrix_norm=6.707212e+00 relative_error=8.178680e-02 cosine=9.997302e-01
+[radau-solver] iter=4 delta_norm=1.065207e-01 residual_norm=5.089389e-01 stage_residual_defect=2.770527e-02 newton_metric=9.155971e+00 newton_tol=4.770583e-04 theta=8.009103e-02 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=4 fraction=1.0e-04 fd_norm=4.725561e-01 matrix_norm=5.089389e-01 relative_error=7.747131e-02 cosine=9.999656e-01
+[radau-solver] iter=5 delta_norm=9.214923e-03 residual_norm=3.661491e-02 stage_residual_defect=1.994946e-03 newton_metric=8.816859e-01 newton_tol=4.770583e-04 theta=8.835006e-02 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=5 fraction=1.0e-04 fd_norm=3.411520e-02 matrix_norm=3.661491e-02 relative_error=7.348201e-02 cosine=9.999857e-01
+[radau-solver] iter=6 delta_norm=7.240303e-04 residual_norm=2.505796e-03 stage_residual_defect=1.365287e-04 newton_metric=6.423101e-02 newton_tol=4.770583e-04 theta=8.244614e-02 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=6 fraction=1.0e-04 fd_norm=2.341352e-03 matrix_norm=2.505796e-03 relative_error=7.058686e-02 cosine=9.999768e-01
+[radau-solver] iter=7 delta_norm=5.312931e-05 residual_norm=1.639932e-04 stage_residual_defect=8.935256e-06 newton_metric=4.310034e-03 newton_tol=4.770583e-04 theta=7.593058e-02 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=7 fraction=1.0e-04 fd_norm=1.538454e-04 matrix_norm=1.639932e-04 relative_error=6.891866e-02 cosine=9.998129e-01
+[radau-solver] iter=8 delta_norm=3.660709e-06 residual_norm=1.025431e-05 stage_residual_defect=5.587114e-07 newton_metric=2.766487e-04 newton_tol=4.770583e-04 theta=7.110441e-02 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=8 fraction=1.0e-04 fd_norm=9.574673e-06 matrix_norm=1.025431e-05 relative_error=8.468717e-02 cosine=9.990040e-01
+[radau-solver] final_stage_residual_defect=3.338065e-08
+[radau-solver] final iter=8 converged=True diverged=False finite_initial_residual=True nonfinite_stage_state=False nonfinite_stage_residual=False residual_norm=6.125794e-07 delta_norm=3.660709e-06 newton_metric=2.766487e-04 newton_tol=4.770583e-04 theta=7.110441e-02 slow=False blowup=False newton_nonfinite=False
+[radau-solver] attempt t_start=3.813340e-02 dt_try=2.909011e-04 accepted=True failed=False fail_code=0 converged=True err_norm=2.775013e-04 growth=1.842709e+00 next_dt=5.360461e-04 stagnation_accepted=False stagnation_defect_norm=0.000000e+00 lagged_reused=False jacobian_reused=False
+[debug-walltime] radau.attempt #341 elapsed_s=0.101905
+[radau-solver] iter=1 delta_norm=1.334520e+03 residual_norm=2.949746e+03 stage_residual_defect=2.138302e+02 newton_metric=1.374322e+06 newton_tol=4.770583e-04 theta=0.000000e+00 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=1 fraction=1.0e-04 fd_norm=3.034014e+03 matrix_norm=2.949746e+03 relative_error=4.501445e-02 cosine=9.993546e-01
+[radau-solver] iter=2 delta_norm=1.484200e+01 residual_norm=1.277887e+02 stage_residual_defect=1.134841e+01 newton_metric=1.735277e+02 newton_tol=4.770583e-04 theta=1.117378e-02 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=2 fraction=1.0e-04 fd_norm=1.185648e+02 matrix_norm=1.277887e+02 relative_error=9.525956e-02 cosine=9.985980e-01
+[radau-solver] iter=3 delta_norm=1.004085e+00 residual_norm=1.132015e+01 stage_residual_defect=1.023234e+00 newton_metric=2.781173e+01 newton_tol=4.770583e-04 theta=2.700331e-02 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=3 fraction=1.0e-04 fd_norm=1.055980e+01 matrix_norm=1.132015e+01 relative_error=7.586096e-02 cosine=9.997340e-01
+[radau-solver] iter=4 delta_norm=7.910453e-02 residual_norm=8.015957e-01 stage_residual_defect=7.417744e-02 newton_metric=6.018379e+00 newton_tol=4.770583e-04 theta=7.139598e-02 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=4 fraction=1.0e-04 fd_norm=7.424099e-01 matrix_norm=8.015957e-01 relative_error=8.021718e-02 cosine=9.999633e-01
+[radau-solver] iter=5 delta_norm=7.127799e-03 residual_norm=5.955302e-02 stage_residual_defect=5.514086e-03 newton_metric=6.442602e-01 newton_tol=4.770583e-04 theta=8.382479e-02 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=5 fraction=1.0e-04 fd_norm=5.517136e-02 matrix_norm=5.955302e-02 relative_error=7.969856e-02 cosine=9.999794e-01
+[radau-solver] iter=6 delta_norm=6.242546e-04 residual_norm=4.395814e-03 stage_residual_defect=4.070113e-04 newton_metric=6.004042e-02 newton_tol=4.770583e-04 theta=8.874603e-02 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=6 fraction=1.0e-04 fd_norm=4.088511e-03 matrix_norm=4.395814e-03 relative_error=7.561298e-02 cosine=9.999684e-01
+[radau-solver] iter=7 delta_norm=5.278362e-05 residual_norm=3.197676e-04 stage_residual_defect=2.960740e-05 newton_metric=4.906354e-03 newton_tol=4.770583e-04 theta=8.603471e-02 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=7 fraction=1.0e-04 fd_norm=3.026089e-04 matrix_norm=3.197676e-04 relative_error=6.416971e-02 cosine=9.995729e-01
+[radau-solver] iter=8 delta_norm=4.295286e-06 residual_norm=2.281202e-05 stage_residual_defect=2.112180e-06 newton_metric=3.835802e-04 newton_tol=4.770583e-04 theta=8.294171e-02 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=8 fraction=1.0e-04 fd_norm=2.478604e-05 matrix_norm=2.281202e-05 relative_error=1.360795e-01 cosine=9.933859e-01
+[radau-solver] final_stage_residual_defect=1.473058e-07
+[radau-solver] final iter=8 converged=True diverged=False finite_initial_residual=True nonfinite_stage_state=False nonfinite_stage_residual=False residual_norm=1.590906e-06 delta_norm=4.295286e-06 newton_metric=3.835802e-04 newton_tol=4.770583e-04 theta=8.294171e-02 slow=False blowup=False newton_nonfinite=False
+[radau-solver] attempt t_start=3.842430e-02 dt_try=5.360461e-04 accepted=True failed=False fail_code=0 converged=True err_norm=1.855401e-04 growth=1.908773e+00 next_dt=1.023190e-03 stagnation_accepted=False stagnation_defect_norm=0.000000e+00 lagged_reused=False jacobian_reused=False
+[debug-walltime] radau.attempt #342 elapsed_s=0.086848
+[radau-solver] iter=1 delta_norm=9.720969e+02 residual_norm=2.877137e+03 stage_residual_defect=4.146577e+02 newton_metric=1.027610e+06 newton_tol=4.770583e-04 theta=0.000000e+00 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=1 fraction=1.0e-04 fd_norm=2.936177e+03 matrix_norm=2.877137e+03 relative_error=1.046041e-01 cosine=9.946230e-01
+[radau-solver] iter=2 delta_norm=2.132621e+01 residual_norm=2.759327e+02 stage_residual_defect=3.792673e+01 newton_metric=4.615026e+02 newton_tol=4.770583e-04 theta=2.096869e-02 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=2 fraction=1.0e-04 fd_norm=2.835417e+02 matrix_norm=2.759327e+02 relative_error=3.484610e-02 cosine=9.997461e-01
+[radau-solver] iter=3 delta_norm=9.362800e-01 residual_norm=9.645070e+00 stage_residual_defect=1.334098e+00 newton_metric=2.878730e+01 newton_tol=4.770583e-04 theta=3.006344e-02 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=3 fraction=1.0e-04 fd_norm=9.791552e+00 matrix_norm=9.645070e+00 relative_error=2.481956e-02 cosine=9.998009e-01
+[radau-solver] iter=4 delta_norm=3.246974e-02 residual_norm=2.433538e-01 stage_residual_defect=3.489519e-02 newton_metric=1.289810e+00 newton_tol=4.770583e-04 theta=3.860785e-02 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=4 fraction=1.0e-04 fd_norm=2.449171e-01 matrix_norm=2.433538e-01 relative_error=3.036380e-02 cosine=9.995566e-01
+[radau-solver] iter=5 delta_norm=1.426380e-03 residual_norm=7.442949e-03 stage_residual_defect=1.124412e-03 newton_metric=5.709973e-02 newton_tol=4.770583e-04 theta=3.894859e-02 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=5 fraction=1.0e-04 fd_norm=7.365269e-03 matrix_norm=7.442949e-03 relative_error=3.623317e-02 cosine=9.994055e-01
+[radau-solver] iter=6 delta_norm=6.548631e-05 residual_norm=2.648515e-04 stage_residual_defect=4.210574e-05 newton_metric=3.038155e-03 newton_tol=4.770583e-04 theta=4.487182e-02 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=6 fraction=1.0e-04 fd_norm=2.530658e-04 matrix_norm=2.648515e-04 relative_error=7.147953e-02 cosine=9.985952e-01
+[radau-solver] iter=7 delta_norm=3.197293e-06 residual_norm=1.071356e-05 stage_residual_defect=1.743320e-06 newton_metric=1.568531e-04 newton_tol=4.770583e-04 theta=4.733490e-02 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=7 fraction=1.0e-04 fd_norm=1.127116e-05 matrix_norm=1.071356e-05 relative_error=2.083636e-01 cosine=9.784499e-01
+[radau-solver] final_stage_residual_defect=7.518248e-08
+[radau-solver] final iter=7 converged=True diverged=False finite_initial_residual=True nonfinite_stage_state=False nonfinite_stage_residual=False residual_norm=4.590913e-07 delta_norm=3.197293e-06 newton_metric=1.568531e-04 newton_tol=4.770583e-04 theta=4.733490e-02 slow=False blowup=False newton_nonfinite=False
+[radau-solver] attempt t_start=3.896034e-02 dt_try=1.023190e-03 accepted=True failed=False fail_code=0 converged=True err_norm=2.468179e-04 growth=1.861699e+00 next_dt=1.904872e-03 stagnation_accepted=False stagnation_defect_norm=0.000000e+00 lagged_reused=False jacobian_reused=False
+[debug-walltime] radau.attempt #343 elapsed_s=0.078006
+[radau-solver] iter=1 delta_norm=6.092372e+02 residual_norm=2.931529e+03 stage_residual_defect=8.010444e+02 newton_metric=6.601853e+05 newton_tol=4.770583e-04 theta=0.000000e+00 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=1 fraction=1.0e-04 fd_norm=2.827254e+03 matrix_norm=2.931529e+03 relative_error=2.229018e-01 cosine=9.766970e-01
+[radau-solver] iter=2 delta_norm=1.617822e+01 residual_norm=5.125261e+02 stage_residual_defect=1.363164e+02 newton_metric=4.123264e+02 newton_tol=4.770583e-04 theta=2.468090e-02 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=2 fraction=1.0e-04 fd_norm=5.258214e+02 matrix_norm=5.125261e+02 relative_error=3.250420e-02 cosine=9.997860e-01
+[radau-solver] iter=3 delta_norm=9.374291e-01 residual_norm=1.614696e+01 stage_residual_defect=4.236114e+00 newton_metric=3.633158e+01 newton_tol=4.770583e-04 theta=3.755475e-02 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=3 fraction=1.0e-04 fd_norm=1.653907e+01 matrix_norm=1.614696e+01 relative_error=2.867283e-02 cosine=9.998668e-01
+[radau-solver] iter=4 delta_norm=3.170731e-02 residual_norm=4.753912e-01 stage_residual_defect=1.250834e-01 newton_metric=1.442951e+00 newton_tol=4.770583e-04 theta=4.391110e-02 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=4 fraction=1.0e-04 fd_norm=4.872852e-01 matrix_norm=4.753912e-01 relative_error=2.817808e-02 cosine=9.998984e-01
+[radau-solver] iter=5 delta_norm=1.242217e-03 residual_norm=1.371784e-02 stage_residual_defect=3.580384e-03 newton_metric=4.631158e-02 newton_tol=4.770583e-04 theta=3.632522e-02 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=5 fraction=1.0e-04 fd_norm=1.406729e-02 matrix_norm=1.371784e-02 relative_error=2.754141e-02 cosine=9.999275e-01
+[radau-solver] iter=6 delta_norm=3.068216e-05 residual_norm=3.821498e-04 stage_residual_defect=1.000944e-04 newton_metric=9.730498e-04 newton_tol=4.770583e-04 theta=3.107538e-02 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=6 fraction=1.0e-04 fd_norm=3.981000e-04 matrix_norm=3.821498e-04 relative_error=5.413707e-02 cosine=9.993096e-01
+[radau-solver] iter=7 delta_norm=9.414930e-07 residual_norm=1.101930e-05 stage_residual_defect=2.885957e-06 newton_metric=2.631825e-05 newton_tol=4.770583e-04 theta=2.751541e-02 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=7 fraction=1.0e-04 fd_norm=1.133475e-05 matrix_norm=1.101930e-05 relative_error=2.668181e-01 cosine=9.637834e-01
+[radau-solver] final_stage_residual_defect=7.997201e-08
+[radau-solver] final iter=7 converged=True diverged=False finite_initial_residual=True nonfinite_stage_state=False nonfinite_stage_residual=False residual_norm=3.037796e-07 delta_norm=9.414930e-07 newton_metric=2.631825e-05 newton_tol=4.770583e-04 theta=2.751541e-02 slow=False blowup=False newton_nonfinite=False
+[radau-solver] attempt t_start=3.998353e-02 dt_try=1.904872e-03 accepted=True failed=False fail_code=0 converged=True err_norm=4.669828e-04 growth=1.760673e+00 next_dt=3.353857e-03 stagnation_accepted=False stagnation_defect_norm=0.000000e+00 lagged_reused=False jacobian_reused=False
+[debug-walltime] radau.attempt #344 elapsed_s=0.077842
+[radau-solver] iter=1 delta_norm=3.998499e+02 residual_norm=1.713434e+03 stage_residual_defect=7.819770e+02 newton_metric=4.461842e+05 newton_tol=4.770583e-04 theta=0.000000e+00 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=1 fraction=1.0e-04 fd_norm=1.696970e+03 matrix_norm=1.713434e+03 relative_error=2.516082e-01 cosine=9.686974e-01
+[radau-solver] iter=2 delta_norm=1.603372e+01 residual_norm=3.571532e+02 stage_residual_defect=1.700007e+02 newton_metric=6.053149e+02 newton_tol=4.770583e-04 theta=3.616062e-02 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=2 fraction=1.0e-04 fd_norm=3.678104e+02 matrix_norm=3.571532e+02 relative_error=3.493106e-02 cosine=9.998040e-01
+[radau-solver] iter=3 delta_norm=1.290955e+00 residual_norm=1.245248e+01 stage_residual_defect=5.705040e+00 newton_metric=7.233696e+01 newton_tol=4.770583e-04 theta=5.353650e-02 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=3 fraction=1.0e-04 fd_norm=1.279575e+01 matrix_norm=1.245248e+01 relative_error=3.981796e-02 cosine=9.995552e-01
+[radau-solver] iter=4 delta_norm=8.670286e-02 residual_norm=5.099449e-01 stage_residual_defect=2.245249e-01 newton_metric=6.746299e+00 newton_tol=4.770583e-04 theta=7.291415e-02 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=4 fraction=1.0e-04 fd_norm=5.136245e-01 matrix_norm=5.099449e-01 relative_error=2.793781e-02 cosine=9.996328e-01
+[radau-solver] iter=5 delta_norm=4.984898e-03 residual_norm=1.435240e-02 stage_residual_defect=4.588183e-03 newton_metric=3.265086e-01 newton_tol=4.770583e-04 theta=6.209824e-02 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=5 fraction=1.0e-04 fd_norm=1.422921e-02 matrix_norm=1.435240e-02 relative_error=4.089483e-02 cosine=9.992081e-01
+[radau-solver] iter=6 delta_norm=2.359068e-04 residual_norm=5.861431e-04 stage_residual_defect=1.823119e-04 newton_metric=1.284048e-02 newton_tol=4.770583e-04 theta=5.215724e-02 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=6 fraction=1.0e-04 fd_norm=5.678136e-04 matrix_norm=5.861431e-04 relative_error=4.489623e-02 cosine=9.995284e-01
+[radau-solver] iter=7 delta_norm=9.999725e-06 residual_norm=1.856835e-05 stage_residual_defect=2.606110e-06 newton_metric=4.637552e-04 newton_tol=4.770583e-04 theta=4.478566e-02 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=7 fraction=1.0e-04 fd_norm=2.024584e-05 matrix_norm=1.856835e-05 relative_error=2.959267e-01 cosine=9.560006e-01
+[radau-solver] final_stage_residual_defect=1.219524e-07
+[radau-solver] final iter=7 converged=True diverged=False finite_initial_residual=True nonfinite_stage_state=False nonfinite_stage_residual=False residual_norm=6.556571e-07 delta_norm=9.999725e-06 newton_metric=4.637552e-04 newton_tol=4.770583e-04 theta=4.478566e-02 slow=False blowup=False newton_nonfinite=False
+[radau-solver] attempt t_start=4.188841e-02 dt_try=3.353857e-03 accepted=True failed=False fail_code=0 converged=True err_norm=4.769377e-04 growth=1.757426e+00 next_dt=5.894157e-03 stagnation_accepted=False stagnation_defect_norm=0.000000e+00 lagged_reused=False jacobian_reused=False
+[debug-walltime] radau.attempt #345 elapsed_s=0.077655
+[radau-solver] iter=1 delta_norm=2.884108e+02 residual_norm=1.487221e+03 stage_residual_defect=1.104240e+03 newton_metric=3.328710e+05 newton_tol=4.770583e-04 theta=0.000000e+00 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=1 fraction=1.0e-04 fd_norm=1.464582e+03 matrix_norm=1.487221e+03 relative_error=2.088026e-01 cosine=9.786502e-01
+[radau-solver] iter=2 delta_norm=1.326741e+01 residual_norm=2.659545e+02 stage_residual_defect=2.210810e+02 newton_metric=6.332948e+02 newton_tol=4.770583e-04 theta=4.267703e-02 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=2 fraction=1.0e-04 fd_norm=2.717047e+02 matrix_norm=2.659545e+02 relative_error=3.696785e-02 cosine=9.995307e-01
+[radau-solver] iter=3 delta_norm=1.285501e+00 residual_norm=9.815300e+00 stage_residual_defect=6.857300e+00 newton_metric=8.493184e+01 newton_tol=4.770583e-04 theta=6.208491e-02 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=3 fraction=1.0e-04 fd_norm=9.948563e+00 matrix_norm=9.815300e+00 relative_error=7.605847e-02 cosine=9.971592e-01
+[radau-solver] iter=4 delta_norm=1.241212e-01 residual_norm=7.562782e-01 stage_residual_defect=5.379820e-01 newton_metric=1.260883e+01 newton_tol=4.770583e-04 theta=9.302506e-02 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=4 fraction=1.0e-04 fd_norm=7.413471e-01 matrix_norm=7.562782e-01 relative_error=4.507627e-02 cosine=9.992029e-01
+[radau-solver] iter=5 delta_norm=1.054177e-02 residual_norm=3.341590e-02 stage_residual_defect=8.012527e-03 newton_metric=1.033867e+00 newton_tol=4.770583e-04 theta=9.016939e-02 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=5 fraction=1.0e-04 fd_norm=3.159041e-02 matrix_norm=3.341590e-02 relative_error=7.617077e-02 cosine=9.988359e-01
+[radau-solver] iter=6 delta_norm=7.755724e-04 residual_norm=2.402719e-03 stage_residual_defect=1.124193e-03 newton_metric=6.582491e-02 newton_tol=4.770583e-04 theta=7.900581e-02 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=6 fraction=1.0e-04 fd_norm=2.288212e-03 matrix_norm=2.402719e-03 relative_error=5.749943e-02 cosine=9.996181e-01
+[radau-solver] iter=7 delta_norm=5.120430e-05 residual_norm=1.245374e-04 stage_residual_defect=2.503300e-05 newton_metric=3.794449e-03 newton_tol=4.770583e-04 theta=6.968472e-02 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=7 fraction=1.0e-04 fd_norm=1.208459e-04 matrix_norm=1.245374e-04 relative_error=1.076816e-01 cosine=9.948269e-01
+[radau-solver] iter=8 delta_norm=3.042326e-06 residual_norm=7.044418e-06 stage_residual_defect=2.246411e-06 newton_metric=2.010827e-04 newton_tol=4.770583e-04 theta=6.262767e-02 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=8 fraction=1.0e-04 fd_norm=7.565293e-06 matrix_norm=7.044418e-06 relative_error=4.510601e-01 cosine=8.932959e-01
+[radau-solver] final_stage_residual_defect=7.930596e-08
+[radau-solver] final iter=8 converged=True diverged=False finite_initial_residual=True nonfinite_stage_state=False nonfinite_stage_residual=False residual_norm=3.448077e-07 delta_norm=3.042326e-06 newton_metric=2.010827e-04 newton_tol=4.770583e-04 theta=6.262767e-02 slow=False blowup=False newton_nonfinite=False
+[radau-solver] attempt t_start=4.524226e-02 dt_try=5.894157e-03 accepted=True failed=False fail_code=0 converged=True err_norm=3.650388e-04 growth=1.799028e+00 next_dt=1.060375e-02 stagnation_accepted=False stagnation_defect_norm=0.000000e+00 lagged_reused=False jacobian_reused=False
+[debug-walltime] radau.attempt #346 elapsed_s=0.084820
+[radau-solver] iter=1 delta_norm=2.401199e+02 residual_norm=1.694425e+03 stage_residual_defect=1.803302e+03 newton_metric=3.156648e+05 newton_tol=4.770583e-04 theta=0.000000e+00 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=1 fraction=1.0e-04 fd_norm=1.775725e+03 matrix_norm=1.694425e+03 relative_error=2.097790e-01 cosine=9.780390e-01
+[radau-solver] iter=2 delta_norm=1.590122e+01 residual_norm=3.300892e+02 stage_residual_defect=4.729332e+02 newton_metric=1.369407e+03 newton_tol=4.770583e-04 theta=6.373140e-02 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=2 fraction=1.0e-04 fd_norm=3.373359e+02 matrix_norm=3.300892e+02 relative_error=3.903592e-02 cosine=9.994572e-01
+[radau-solver] iter=3 delta_norm=1.460169e+00 residual_norm=1.287564e+01 stage_residual_defect=1.393297e+01 newton_metric=1.239622e+02 newton_tol=4.770583e-04 theta=7.144260e-02 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=3 fraction=1.0e-04 fd_norm=1.289248e+01 matrix_norm=1.287564e+01 relative_error=1.105413e-01 cosine=9.938832e-01
+[radau-solver] iter=4 delta_norm=1.695951e-01 residual_norm=1.423351e+00 stage_residual_defect=1.833698e+00 newton_metric=1.752716e+01 newton_tol=4.770583e-04 theta=9.246934e-02 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=4 fraction=1.0e-04 fd_norm=1.358716e+00 matrix_norm=1.423351e+00 relative_error=6.716819e-02 cosine=9.989267e-01
+[radau-solver] iter=5 delta_norm=1.995175e-02 residual_norm=9.125002e-02 stage_residual_defect=4.418208e-02 newton_metric=2.474562e+00 newton_tol=4.770583e-04 theta=1.109420e-01 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=5 fraction=1.0e-04 fd_norm=8.247758e-02 matrix_norm=9.125002e-02 relative_error=1.157207e-01 cosine=9.990607e-01
+[radau-solver] iter=6 delta_norm=2.145454e-03 residual_norm=9.545212e-03 stage_residual_defect=8.696613e-03 newton_metric=2.657262e-01 newton_tol=4.770583e-04 theta=1.111467e-01 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=6 fraction=1.0e-04 fd_norm=8.808297e-03 matrix_norm=9.545212e-03 relative_error=8.626663e-02 cosine=9.997957e-01
+[radau-solver] iter=7 delta_norm=2.120394e-04 residual_norm=7.553394e-04 stage_residual_defect=4.775528e-04 newton_metric=2.406682e-02 newton_tol=4.770583e-04 theta=1.028757e-01 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=7 fraction=1.0e-04 fd_norm=6.919265e-04 matrix_norm=7.553394e-04 relative_error=1.019358e-01 cosine=9.990877e-01
+[radau-solver] iter=8 delta_norm=1.932730e-05 residual_norm=6.342487e-05 stage_residual_defect=4.515005e-05 newton_metric=2.004617e-03 newton_tol=4.770583e-04 theta=9.486914e-02 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=8 fraction=1.0e-04 fd_norm=5.775522e-05 matrix_norm=6.342487e-05 relative_error=3.315639e-01 cosine=9.543340e-01
+[radau-solver] iter=9 delta_norm=1.641082e-06 residual_norm=4.818216e-06 stage_residual_defect=2.999721e-06 newton_metric=1.566172e-04 newton_tol=4.770583e-04 theta=8.796257e-02 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=9 fraction=1.0e-04 fd_norm=7.687452e-06 matrix_norm=4.818216e-06 relative_error=7.459171e-01 cosine=6.672693e-01
+[radau-solver] final_stage_residual_defect=2.185847e-07
+[radau-solver] final iter=9 converged=True diverged=False finite_initial_residual=True nonfinite_stage_state=False nonfinite_stage_residual=False residual_norm=3.543103e-07 delta_norm=1.641082e-06 newton_metric=1.566172e-04 newton_tol=4.770583e-04 theta=8.796257e-02 slow=False blowup=False newton_nonfinite=False
+[radau-solver] attempt t_start=5.113642e-02 dt_try=1.060375e-02 accepted=True failed=False fail_code=0 converged=True err_norm=3.039804e-03 growth=1.494492e+00 next_dt=1.584722e-02 stagnation_accepted=False stagnation_defect_norm=0.000000e+00 lagged_reused=False jacobian_reused=False
+[debug-walltime] radau.attempt #347 elapsed_s=0.094725
+[radau-solver] iter=1 delta_norm=1.973666e+02 residual_norm=2.283413e+03 stage_residual_defect=3.061787e+03 newton_metric=2.955578e+05 newton_tol=4.770583e-04 theta=0.000000e+00 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=1 fraction=1.0e-04 fd_norm=2.453129e+03 matrix_norm=2.283413e+03 relative_error=1.378167e-01 cosine=9.923685e-01
+[radau-solver] iter=2 delta_norm=1.496961e+01 residual_norm=3.116096e+02 stage_residual_defect=5.585605e+02 newton_metric=1.466942e+03 newton_tol=4.770583e-04 theta=6.801273e-02 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=2 fraction=1.0e-04 fd_norm=3.211665e+02 matrix_norm=3.116096e+02 relative_error=4.557644e-02 cosine=9.993859e-01
+[radau-solver] iter=3 delta_norm=1.408660e+00 residual_norm=1.457640e+01 stage_residual_defect=1.982864e+01 newton_metric=1.446098e+02 newton_tol=4.770583e-04 theta=7.672934e-02 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=3 fraction=1.0e-04 fd_norm=1.477333e+01 matrix_norm=1.457640e+01 relative_error=9.234773e-02 cosine=9.957684e-01
+[radau-solver] iter=4 delta_norm=1.469932e-01 residual_norm=1.362703e+00 stage_residual_defect=2.324544e+00 newton_metric=1.622242e+01 newton_tol=4.770583e-04 theta=9.021402e-02 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=4 fraction=1.0e-04 fd_norm=1.302970e+00 matrix_norm=1.362703e+00 relative_error=8.301901e-02 cosine=9.977097e-01
+[radau-solver] iter=5 delta_norm=1.742662e-02 residual_norm=1.081458e-01 stage_residual_defect=1.367880e-01 newton_metric=2.016308e+00 newton_tol=4.770583e-04 theta=1.013583e-01 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=5 fraction=1.0e-04 fd_norm=9.819666e-02 matrix_norm=1.081458e-01 relative_error=1.186808e-01 cosine=9.982659e-01
+[radau-solver] iter=6 delta_norm=2.095584e-03 residual_norm=1.164997e-02 stage_residual_defect=1.768497e-02 newton_metric=2.669170e-01 newton_tol=4.770583e-04 theta=1.131069e-01 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=6 fraction=1.0e-04 fd_norm=1.059030e-02 matrix_norm=1.164997e-02 relative_error=1.042021e-01 cosine=9.996155e-01
+[radau-solver] iter=7 delta_norm=2.396906e-04 residual_norm=1.105375e-03 stage_residual_defect=1.484166e-03 newton_metric=3.099479e-02 newton_tol=4.770583e-04 theta=1.153265e-01 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=7 fraction=1.0e-04 fd_norm=1.002434e-03 matrix_norm=1.105375e-03 relative_error=1.108018e-01 cosine=9.992148e-01
+[radau-solver] iter=8 delta_norm=2.572672e-05 residual_norm=1.060969e-04 stage_residual_defect=1.417205e-04 newton_metric=3.159808e-03 newton_tol=4.770583e-04 theta=1.103341e-01 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=8 fraction=1.0e-04 fd_norm=1.054563e-04 matrix_norm=1.060969e-04 relative_error=1.557218e-01 cosine=9.879669e-01
+[radau-solver] iter=9 delta_norm=2.595535e-06 residual_norm=9.585301e-06 stage_residual_defect=1.206563e-05 newton_metric=2.980784e-04 newton_tol=4.770583e-04 theta=1.039536e-01 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=9 fraction=1.0e-04 fd_norm=1.403728e-05 matrix_norm=9.585301e-06 relative_error=8.755313e-01 cosine=5.123582e-01
+[radau-solver] final_stage_residual_defect=1.015673e-06
+[radau-solver] final iter=9 converged=True diverged=False finite_initial_residual=True nonfinite_stage_state=False nonfinite_stage_residual=False residual_norm=8.355079e-07 delta_norm=2.595535e-06 newton_metric=2.980784e-04 newton_tol=4.770583e-04 theta=1.039536e-01 slow=False blowup=False newton_nonfinite=False
+[radau-solver] attempt t_start=6.174017e-02 dt_try=1.584722e-02 accepted=True failed=False fail_code=0 converged=True err_norm=7.565158e-03 growth=1.379895e+00 next_dt=2.186749e-02 stagnation_accepted=False stagnation_defect_norm=0.000000e+00 lagged_reused=False jacobian_reused=False
+[debug-walltime] radau.attempt #348 elapsed_s=0.093298
+[radau-solver] iter=1 delta_norm=1.488580e+02 residual_norm=2.330511e+03 stage_residual_defect=3.077115e+03 newton_metric=2.999415e+05 newton_tol=4.770583e-04 theta=0.000000e+00 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=1 fraction=1.0e-04 fd_norm=2.550214e+03 matrix_norm=2.330511e+03 relative_error=1.278736e-01 cosine=9.951142e-01
+[radau-solver] iter=2 delta_norm=1.178534e+01 residual_norm=3.076122e+02 stage_residual_defect=6.653901e+02 newton_metric=1.284269e+03 newton_tol=4.770583e-04 theta=6.332910e-02 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=2 fraction=1.0e-04 fd_norm=3.205516e+02 matrix_norm=3.076122e+02 relative_error=5.213714e-02 cosine=9.994327e-01
+[radau-solver] iter=3 delta_norm=1.230159e+00 residual_norm=1.671938e+01 stage_residual_defect=2.482829e+01 newton_metric=1.373147e+02 newton_tol=4.770583e-04 theta=7.509188e-02 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=3 fraction=1.0e-04 fd_norm=1.754407e+01 matrix_norm=1.671938e+01 relative_error=8.302158e-02 cosine=9.975430e-01
+[radau-solver] iter=4 delta_norm=1.303442e-01 residual_norm=1.455646e+00 stage_residual_defect=3.163267e+00 newton_metric=1.643944e+01 newton_tol=4.770583e-04 theta=9.227153e-02 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=4 fraction=1.0e-04 fd_norm=1.437302e+00 matrix_norm=1.455646e+00 relative_error=8.883068e-02 cosine=9.961847e-01
+[radau-solver] iter=5 delta_norm=1.658640e-02 residual_norm=1.276613e-01 stage_residual_defect=2.528115e-01 newton_metric=2.054818e+00 newton_tol=4.770583e-04 theta=1.029111e-01 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=5 fraction=1.0e-04 fd_norm=1.173828e-01 matrix_norm=1.276613e-01 relative_error=1.305187e-01 cosine=9.956933e-01
+[radau-solver] iter=6 delta_norm=2.375688e-03 residual_norm=1.532150e-02 stage_residual_defect=3.521320e-02 newton_metric=3.333175e-01 newton_tol=4.770583e-04 theta=1.218656e-01 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=6 fraction=1.0e-04 fd_norm=1.365781e-02 matrix_norm=1.532150e-02 relative_error=1.322973e-01 cosine=9.988125e-01
+[radau-solver] iter=7 delta_norm=3.351291e-04 residual_norm=1.803822e-03 stage_residual_defect=3.951461e-03 newton_metric=5.263620e-02 newton_tol=4.770583e-04 theta=1.364007e-01 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=7 fraction=1.0e-04 fd_norm=1.596349e-03 matrix_norm=1.803822e-03 relative_error=1.339974e-01 cosine=9.995292e-01
+[radau-solver] iter=8 delta_norm=4.478598e-05 residual_norm=2.122610e-04 stage_residual_defect=4.542454e-04 newton_metric=6.983472e-03 newton_tol=4.770583e-04 theta=1.359435e-01 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=8 fraction=1.0e-04 fd_norm=1.964899e-04 matrix_norm=2.122610e-04 relative_error=1.451967e-01 cosine=9.932240e-01
+[radau-solver] iter=9 delta_norm=5.640395e-06 residual_norm=2.391733e-05 stage_residual_defect=4.919296e-05 newton_metric=8.306541e-04 newton_tol=4.770583e-04 theta=1.294621e-01 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=9 fraction=1.0e-04 fd_norm=1.983469e-05 matrix_norm=2.391733e-05 relative_error=7.838316e-01 cosine=7.628096e-01
+[radau-solver] iter=10 delta_norm=6.727935e-07 residual_norm=2.595921e-06 stage_residual_defect=5.159378e-06 newton_metric=9.299614e-05 newton_tol=4.770583e-04 theta=1.225044e-01 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=10 fraction=1.0e-04 fd_norm=4.607845e-06 matrix_norm=2.595921e-06 relative_error=9.673580e-01 cosine=3.386799e-01
+[radau-solver] final_stage_residual_defect=5.239548e-07
+[radau-solver] final iter=10 converged=True diverged=False finite_initial_residual=True nonfinite_stage_state=False nonfinite_stage_residual=False residual_norm=2.712255e-07 delta_norm=6.727935e-07 newton_metric=9.299614e-05 newton_tol=4.770583e-04 theta=1.225044e-01 slow=False blowup=False newton_nonfinite=False
+[radau-solver] attempt t_start=7.758739e-02 dt_try=2.186749e-02 accepted=True failed=False fail_code=0 converged=True err_norm=4.458352e-03 growth=1.445239e+00 next_dt=3.160376e-02 stagnation_accepted=False stagnation_defect_norm=0.000000e+00 lagged_reused=False jacobian_reused=False
+[debug-walltime] radau.attempt #349 elapsed_s=0.100209
+[radau-solver] iter=1 delta_norm=1.229731e+02 residual_norm=3.171865e+03 stage_residual_defect=6.245878e+03 newton_metric=3.426187e+05 newton_tol=4.770583e-04 theta=0.000000e+00 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=1 fraction=1.0e-04 fd_norm=3.470307e+03 matrix_norm=3.171865e+03 relative_error=1.220845e-01 cosine=9.958923e-01
+[radau-solver] iter=2 delta_norm=1.195799e+01 residual_norm=4.039756e+02 stage_residual_defect=1.194962e+03 newton_metric=1.297977e+03 newton_tol=4.770583e-04 theta=5.968494e-02 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=2 fraction=1.0e-04 fd_norm=4.268351e+02 matrix_norm=4.039756e+02 relative_error=6.482539e-02 cosine=9.992952e-01
+[radau-solver] iter=3 delta_norm=1.468201e+00 residual_norm=2.759918e+01 stage_residual_defect=5.353795e+01 newton_metric=2.023696e+02 newton_tol=4.770583e-04 theta=8.155716e-02 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=3 fraction=1.0e-04 fd_norm=2.956783e+01 matrix_norm=2.759918e+01 relative_error=8.881905e-02 cosine=9.981488e-01
+[radau-solver] iter=4 delta_norm=1.828382e-01 residual_norm=2.624426e+00 stage_residual_defect=6.965734e+00 newton_metric=3.061653e+01 newton_tol=4.770583e-04 theta=1.100399e-01 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=4 fraction=1.0e-04 fd_norm=2.639966e+00 matrix_norm=2.624426e+00 relative_error=1.111284e-01 cosine=9.938061e-01
+[radau-solver] iter=5 delta_norm=3.124861e-02 residual_norm=2.933022e-01 stage_residual_defect=9.343457e-01 newton_metric=4.824436e+00 newton_tol=4.770583e-04 theta=1.229094e-01 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=5 fraction=1.0e-04 fd_norm=2.624764e-01 matrix_norm=2.933022e-01 relative_error=1.871946e-01 cosine=9.904920e-01
+[radau-solver] iter=6 delta_norm=6.570653e-03 residual_norm=4.912981e-02 stage_residual_defect=1.825007e-01 newton_metric=1.297021e+00 newton_tol=4.770583e-04 theta=1.636277e-01 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=6 fraction=1.0e-04 fd_norm=4.112381e-02 matrix_norm=4.912981e-02 relative_error=2.087427e-01 cosine=9.976257e-01
+[radau-solver] iter=7 delta_norm=1.370690e-03 residual_norm=8.582349e-03 stage_residual_defect=3.116616e-02 newton_metric=3.381419e-01 newton_tol=4.770583e-04 theta=1.988966e-01 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=7 fraction=1.0e-04 fd_norm=7.112308e-03 matrix_norm=8.582349e-03 relative_error=2.092709e-01 cosine=9.995551e-01
+[radau-solver] iter=8 delta_norm=2.706445e-04 residual_norm=1.487259e-03 stage_residual_defect=5.270529e-03 newton_metric=6.756597e-02 newton_tol=4.770583e-04 theta=2.011704e-01 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=8 fraction=1.0e-04 fd_norm=1.235881e-03 matrix_norm=1.487259e-03 relative_error=2.057021e-01 cosine=9.996088e-01
+[radau-solver] iter=9 delta_norm=5.045401e-05 residual_norm=2.480706e-04 stage_residual_defect=8.532156e-04 newton_metric=1.184618e-02 newton_tol=4.770583e-04 theta=1.915806e-01 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=9 fraction=1.0e-04 fd_norm=2.094372e-04 matrix_norm=2.480706e-04 relative_error=2.262925e-01 cosine=9.927470e-01
+[radau-solver] iter=10 delta_norm=8.925446e-06 residual_norm=3.987994e-05 stage_residual_defect=1.333744e-04 newton_metric=1.960662e-03 newton_tol=4.770583e-04 theta=1.815225e-01 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=10 fraction=1.0e-04 fd_norm=3.634355e-05 matrix_norm=3.987994e-05 relative_error=6.145902e-01 cosine=8.322011e-01
+[radau-solver] iter=11 delta_norm=1.504673e-06 residual_norm=6.180705e-06 stage_residual_defect=2.011240e-05 newton_metric=3.109511e-04 newton_tol=4.770583e-04 theta=1.726523e-01 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=11 fraction=1.0e-04 fd_norm=1.597420e-05 matrix_norm=6.180705e-06 relative_error=9.176214e-01 cosine=3.975991e-01
+[radau-solver] final_stage_residual_defect=2.934782e-06
+[radau-solver] final iter=11 converged=True diverged=False finite_initial_residual=True nonfinite_stage_state=False nonfinite_stage_residual=False residual_norm=9.244691e-07 delta_norm=1.504673e-06 newton_metric=3.109511e-04 newton_tol=4.770583e-04 theta=1.726523e-01 slow=False blowup=False newton_nonfinite=False
+[radau-solver] attempt t_start=9.945488e-02 dt_try=3.160376e-02 accepted=True failed=False fail_code=0 converged=True err_norm=5.801543e-03 growth=1.412318e+00 next_dt=4.463455e-02 stagnation_accepted=False stagnation_defect_norm=0.000000e+00 lagged_reused=False jacobian_reused=False
+[debug-walltime] radau.attempt #350 elapsed_s=0.108351
+[radau-solver] iter=1 delta_norm=1.081608e+02 residual_norm=4.519194e+03 stage_residual_defect=1.574195e+04 newton_metric=3.378808e+05 newton_tol=4.770583e-04 theta=0.000000e+00 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=1 fraction=1.0e-04 fd_norm=4.903762e+03 matrix_norm=4.519194e+03 relative_error=1.073997e-01 cosine=9.970786e-01
+[radau-solver] iter=2 delta_norm=1.127447e+01 residual_norm=5.096842e+02 stage_residual_defect=1.724607e+03 newton_metric=3.692868e+03 newton_tol=4.770583e-04 theta=9.922222e-02 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=2 fraction=1.0e-04 fd_norm=5.440374e+02 matrix_norm=5.096842e+02 relative_error=7.407373e-02 cosine=9.991996e-01
+[radau-solver] iter=3 delta_norm=1.555552e+00 residual_norm=4.045606e+01 stage_residual_defect=1.136718e+02 newton_metric=5.604452e+02 newton_tol=4.770583e-04 theta=1.137058e-01 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=3 fraction=1.0e-04 fd_norm=4.363337e+01 matrix_norm=4.045606e+01 relative_error=1.028445e-01 cosine=9.971556e-01
+[radau-solver] iter=4 delta_norm=2.903267e-01 residual_norm=4.482006e+00 stage_residual_defect=2.026855e+01 newton_metric=5.328384e+01 newton_tol=4.770583e-04 theta=1.121636e-01 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=4 fraction=1.0e-04 fd_norm=4.300246e+00 matrix_norm=4.482006e+00 relative_error=1.911870e-01 cosine=9.833220e-01
+[radau-solver] iter=5 delta_norm=9.347538e-02 residual_norm=8.215381e-01 stage_residual_defect=4.741606e+00 newton_metric=1.685397e+01 newton_tol=4.770583e-04 theta=1.486486e-01 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=5 fraction=1.0e-04 fd_norm=6.284107e-01 matrix_norm=8.215381e-01 relative_error=3.668496e-01 cosine=9.846523e-01
+[radau-solver] iter=6 delta_norm=3.188649e-02 residual_norm=2.304668e-01 stage_residual_defect=1.338327e+00 newton_metric=1.200599e+01 newton_tol=4.770583e-04 theta=2.743750e-01 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=6 fraction=1.0e-04 fd_norm=1.677006e-01 matrix_norm=2.304668e-01 relative_error=3.814517e-01 cosine=9.980268e-01
+[radau-solver] iter=7 delta_norm=1.025127e-02 residual_norm=6.396370e-02 stage_residual_defect=3.568786e-01 newton_metric=4.889850e+00 newton_tol=4.770583e-04 theta=3.246345e-01 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=7 fraction=1.0e-04 fd_norm=4.679167e-02 matrix_norm=6.396370e-02 relative_error=3.683153e-01 cosine=9.996433e-01
+[radau-solver] iter=8 delta_norm=3.100880e-03 residual_norm=1.723010e-02 stage_residual_defect=9.373706e-02 newton_metric=1.389467e+00 newton_tol=4.770583e-04 theta=3.112119e-01 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=8 fraction=1.0e-04 fd_norm=1.277783e-02 matrix_norm=1.723010e-02 relative_error=3.492001e-01 cosine=9.998025e-01
+[radau-solver] iter=9 delta_norm=8.873542e-04 residual_norm=4.459455e-03 stage_residual_defect=2.367626e-02 newton_metric=3.664463e-01 newton_tol=4.770583e-04 theta=2.940661e-01 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=9 fraction=1.0e-04 fd_norm=3.345038e-03 matrix_norm=4.459455e-03 relative_error=3.338383e-01 cosine=9.998291e-01
+[radau-solver] iter=10 delta_norm=2.414307e-04 residual_norm=1.111403e-03 stage_residual_defect=5.766668e-03 newton_metric=9.256295e-02 newton_tol=4.770583e-04 theta=2.789397e-01 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=10 fraction=1.0e-04 fd_norm=8.490033e-04 matrix_norm=1.111403e-03 relative_error=3.125055e-01 cosine=9.991838e-01
+[radau-solver] iter=11 delta_norm=6.270140e-05 residual_norm=2.669901e-04 stage_residual_defect=1.354768e-03 newton_metric=2.248584e-02 newton_tol=4.770583e-04 theta=2.657507e-01 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=11 fraction=1.0e-04 fd_norm=2.071671e-04 matrix_norm=2.669901e-04 relative_error=3.279931e-01 cosine=9.906139e-01
+[radau-solver] iter=12 delta_norm=1.559175e-05 residual_norm=6.189395e-05 stage_residual_defect=3.073134e-04 newton_metric=5.260956e-03 newton_tol=4.770583e-04 theta=2.540707e-01 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=12 fraction=1.0e-04 fd_norm=4.868855e-05 matrix_norm=6.189395e-05 relative_error=5.889859e-01 cosine=8.924880e-01
+[radau-solver] iter=13 delta_norm=3.720999e-06 residual_norm=1.385993e-05 stage_residual_defect=6.737137e-05 newton_metric=1.186685e-03 newton_tol=4.770583e-04 theta=2.435623e-01 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=13 fraction=1.0e-04 fd_norm=2.133153e-05 matrix_norm=1.385993e-05 relative_error=1.135115e+00 cosine=1.028683e-01
+[radau-solver] iter=14 delta_norm=8.543620e-07 residual_norm=3.001609e-06 stage_residual_defect=1.429694e-05 newton_metric=2.585446e-04 newton_tol=4.770583e-04 theta=2.340504e-01 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=14 fraction=1.0e-04 fd_norm=7.198331e-06 matrix_norm=3.001609e-06 relative_error=8.967504e-01 cosine=4.433195e-01
+[radau-solver] final_stage_residual_defect=2.925844e-06
+[radau-solver] final iter=14 converged=True diverged=False finite_initial_residual=True nonfinite_stage_state=False nonfinite_stage_residual=False residual_norm=6.274516e-07 delta_norm=8.543620e-07 newton_metric=2.585446e-04 newton_tol=4.770583e-04 theta=2.340504e-01 slow=False blowup=False newton_nonfinite=False
+[radau-solver] attempt t_start=1.310586e-01 dt_try=4.463455e-02 accepted=True failed=False fail_code=0 converged=True err_norm=7.022948e-03 growth=1.388903e+00 next_dt=6.199308e-02 stagnation_accepted=False stagnation_defect_norm=0.000000e+00 lagged_reused=False jacobian_reused=False
+[debug-walltime] radau.attempt #351 elapsed_s=0.129449
+[radau-solver] iter=1 delta_norm=8.661577e+01 residual_norm=4.619968e+03 stage_residual_defect=1.956308e+04 newton_metric=3.329334e+05 newton_tol=4.770583e-04 theta=0.000000e+00 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=1 fraction=1.0e-04 fd_norm=5.179324e+03 matrix_norm=4.619968e+03 relative_error=1.525114e-01 cosine=9.934999e-01
+[radau-solver] iter=2 delta_norm=1.291009e+01 residual_norm=7.640465e+02 stage_residual_defect=5.348692e+03 newton_metric=9.433072e+03 newton_tol=4.770583e-04 theta=1.547532e-01 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=2 fraction=1.0e-04 fd_norm=8.029975e+02 matrix_norm=7.640465e+02 relative_error=9.043951e-02 cosine=9.969383e-01
+[radau-solver] iter=3 delta_norm=5.957787e+00 residual_norm=7.098778e+01 stage_residual_defect=5.318337e+02 newton_metric=1.185664e+03 newton_tol=4.770583e-04 theta=1.449438e-01 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=3 fraction=1.0e-04 fd_norm=6.232172e+01 matrix_norm=7.098778e+01 relative_error=4.213281e-01 cosine=9.305645e-01
+[radau-solver] iter=4 delta_norm=3.007906e+00 residual_norm=2.522561e+01 stage_residual_defect=2.444742e+02 newton_metric=9.567070e+02 newton_tol=4.770583e-04 theta=2.414977e-01 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=4 fraction=1.0e-04 fd_norm=1.624514e+01 matrix_norm=2.522561e+01 relative_error=5.969460e-01 cosine=9.836600e-01
+[radau-solver] iter=5 delta_norm=1.262631e+00 residual_norm=9.507868e+00 stage_residual_defect=8.927669e+01 newton_metric=9.240929e+02 newton_tol=4.770583e-04 theta=4.238129e-01 slow=True blowup=False nonfinite=False diverged=True
+[radau-stage-direction-audit] iter=5 fraction=1.0e-04 fd_norm=6.103240e+00 matrix_norm=9.507868e+00 relative_error=5.628514e-01 cosine=9.981973e-01
+[radau-solver] final_stage_residual_defect=3.179197e+01
+[radau-solver] final iter=5 converged=False diverged=True finite_initial_residual=True nonfinite_stage_state=False nonfinite_stage_residual=False residual_norm=3.408378e+00 delta_norm=1.262631e+00 newton_metric=9.240929e+02 newton_tol=4.770583e-04 theta=4.238129e-01 slow=True blowup=False newton_nonfinite=False
+[radau-solver] attempt t_start=1.756932e-01 dt_try=6.199308e-02 accepted=False failed=False fail_code=0 converged=False err_norm=5.958546e-02 growth=5.000000e-01 next_dt=3.099654e-02 stagnation_accepted=False stagnation_defect_norm=0.000000e+00 lagged_reused=False jacobian_reused=False
+[debug-walltime] radau.attempt #352 elapsed_s=0.064931
+[radau-solver] iter=1 delta_norm=6.684691e+01 residual_norm=2.013799e+03 stage_residual_defect=5.104780e+03 newton_metric=2.398009e+05 newton_tol=4.770583e-04 theta=0.000000e+00 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=1 fraction=1.0e-04 fd_norm=2.097619e+03 matrix_norm=2.013799e+03 relative_error=5.993126e-02 cosine=9.989610e-01
+[radau-solver] iter=2 delta_norm=3.131974e+00 residual_norm=1.264650e+02 stage_residual_defect=4.720876e+02 newton_metric=8.417717e+02 newton_tol=4.770583e-04 theta=5.751858e-02 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=2 fraction=1.0e-04 fd_norm=1.299088e+02 matrix_norm=1.264650e+02 relative_error=4.160162e-02 cosine=9.994720e-01
+[radau-solver] iter=3 delta_norm=5.938490e-01 residual_norm=5.388710e+00 stage_residual_defect=2.640330e+01 newton_metric=4.660137e+01 newton_tol=4.770583e-04 theta=5.680456e-02 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=3 fraction=1.0e-04 fd_norm=5.100787e+00 matrix_norm=5.388710e+00 relative_error=1.517520e-01 cosine=9.906089e-01
+[radau-solver] iter=4 delta_norm=1.541229e-01 residual_norm=7.717440e-01 stage_residual_defect=3.455358e+00 newton_metric=1.812181e+01 newton_tol=4.770583e-04 theta=1.055285e-01 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=4 fraction=1.0e-04 fd_norm=6.313556e-01 matrix_norm=7.717440e-01 relative_error=2.348271e-01 cosine=9.976686e-01
+[radau-solver] iter=5 delta_norm=3.561569e-02 residual_norm=1.481717e-01 stage_residual_defect=6.136819e-01 newton_metric=9.599329e+00 newton_tol=4.770583e-04 theta=2.136697e-01 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=5 fraction=1.0e-04 fd_norm=1.212911e-01 matrix_norm=1.481717e-01 relative_error=2.233139e-01 cosine=9.996916e-01
+[radau-solver] iter=6 delta_norm=7.367542e-03 residual_norm=2.707546e-02 stage_residual_defect=1.078701e-01 newton_metric=2.036624e+00 newton_tol=4.770583e-04 theta=2.180535e-01 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=6 fraction=1.0e-04 fd_norm=2.249955e-02 matrix_norm=2.707546e-02 relative_error=2.041066e-01 cosine=9.998766e-01
+[radau-solver] iter=7 delta_norm=1.384440e-03 residual_norm=4.589688e-03 stage_residual_defect=1.766667e-02 newton_metric=3.366822e-01 newton_tol=4.770583e-04 theta=1.970607e-01 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=7 fraction=1.0e-04 fd_norm=3.868962e-03 matrix_norm=4.589688e-03 relative_error=1.868680e-01 cosine=9.999082e-01
+[radau-solver] iter=8 delta_norm=2.388669e-04 residual_norm=7.263108e-04 stage_residual_defect=2.709690e-03 newton_metric=5.194026e-02 newton_tol=4.770583e-04 theta=1.799969e-01 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=8 fraction=1.0e-04 fd_norm=6.139488e-04 matrix_norm=7.263108e-04 relative_error=1.880909e-01 cosine=9.992039e-01
+[radau-solver] iter=9 delta_norm=3.815333e-05 residual_norm=1.077118e-04 stage_residual_defect=3.900409e-04 newton_metric=7.518972e-03 newton_tol=4.770583e-04 theta=1.659638e-01 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=9 fraction=1.0e-04 fd_norm=8.854874e-05 matrix_norm=1.077118e-04 relative_error=3.471968e-01 cosine=9.697014e-01
+[radau-solver] iter=10 delta_norm=5.678745e-06 residual_norm=1.502957e-05 stage_residual_defect=5.289520e-05 newton_metric=1.024793e-03 newton_tol=4.770583e-04 theta=1.541550e-01 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=10 fraction=1.0e-04 fd_norm=2.281999e-05 matrix_norm=1.502957e-05 relative_error=6.159112e-01 cosine=8.004884e-01
+[radau-solver] iter=11 delta_norm=7.916462e-07 residual_norm=1.979223e-06 stage_residual_defect=6.775689e-06 newton_metric=1.318803e-04 newton_tol=4.770583e-04 theta=1.440247e-01 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=11 fraction=1.0e-04 fd_norm=9.456315e-06 matrix_norm=1.979223e-06 relative_error=1.104620e+00 cosine=-4.213501e-01
+[radau-solver] final_stage_residual_defect=8.377813e-07
+[radau-solver] final iter=11 converged=True diverged=False finite_initial_residual=True nonfinite_stage_state=False nonfinite_stage_residual=False residual_norm=2.476697e-07 delta_norm=7.916462e-07 newton_metric=1.318803e-04 newton_tol=4.770583e-04 theta=1.440247e-01 slow=False blowup=False newton_nonfinite=False
+[radau-solver] attempt t_start=1.756932e-01 dt_try=3.099654e-02 accepted=True failed=False fail_code=0 converged=True err_norm=5.178408e-03 growth=1.426430e+00 next_dt=4.421438e-02 stagnation_accepted=False stagnation_defect_norm=0.000000e+00 lagged_reused=False jacobian_reused=True
+[debug-walltime] radau.attempt #353 elapsed_s=0.103801
+[radau-solver] iter=1 delta_norm=4.198818e+01 residual_norm=1.231861e+03 stage_residual_defect=3.231034e+03 newton_metric=1.541640e+05 newton_tol=4.770583e-04 theta=0.000000e+00 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=1 fraction=1.0e-04 fd_norm=1.284123e+03 matrix_norm=1.231861e+03 relative_error=1.514524e-01 cosine=9.889078e-01
+[radau-solver] iter=2 delta_norm=1.009558e+01 residual_norm=1.872605e+02 stage_residual_defect=1.083169e+03 newton_metric=9.584320e+02 newton_tol=4.770583e-04 theta=7.580049e-02 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=2 fraction=1.0e-04 fd_norm=1.851222e+02 matrix_norm=1.872605e+02 relative_error=1.115438e-01 cosine=9.939160e-01
+[radau-solver] iter=3 delta_norm=1.167571e+00 residual_norm=1.898373e+01 stage_residual_defect=2.204850e+02 newton_metric=1.329371e+02 newton_tol=4.770583e-04 theta=9.216308e-02 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=3 fraction=1.0e-04 fd_norm=1.909908e+01 matrix_norm=1.898373e+01 relative_error=1.155441e-01 cosine=9.933026e-01
+[radau-solver] iter=4 delta_norm=1.205230e-01 residual_norm=2.165732e+00 stage_residual_defect=2.601368e+01 newton_metric=1.478718e+01 newton_tol=4.770583e-04 theta=1.042645e-01 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=4 fraction=1.0e-04 fd_norm=2.171197e+00 matrix_norm=2.165732e+00 relative_error=8.459543e-02 cosine=9.964160e-01
+[radau-solver] iter=5 delta_norm=1.338807e-02 residual_norm=1.837378e-01 stage_residual_defect=2.229978e+00 newton_metric=1.525029e+00 newton_tol=4.770583e-04 theta=1.015226e-01 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=5 fraction=1.0e-04 fd_norm=1.845797e-01 matrix_norm=1.837378e-01 relative_error=9.542804e-02 cosine=9.954363e-01
+[radau-solver] iter=6 delta_norm=1.362026e-03 residual_norm=1.760807e-02 stage_residual_defect=2.145558e-01 newton_metric=1.579760e-01 newton_tol=4.770583e-04 theta=1.036831e-01 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=6 fraction=1.0e-04 fd_norm=1.783078e-02 matrix_norm=1.760807e-02 relative_error=1.004094e-01 cosine=9.949742e-01
+[radau-solver] iter=7 delta_norm=1.320380e-04 residual_norm=1.771082e-03 stage_residual_defect=2.222396e-02 newton_metric=1.462331e-02 newton_tol=4.770583e-04 theta=9.919386e-02 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=7 fraction=1.0e-04 fd_norm=1.769739e-03 matrix_norm=1.771082e-03 relative_error=8.629089e-02 cosine=9.962801e-01
+[radau-solver] iter=8 delta_norm=1.213293e-05 residual_norm=1.782454e-04 stage_residual_defect=2.324379e-03 newton_metric=1.291088e-03 newton_tol=4.770583e-04 theta=9.493584e-02 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=8 fraction=1.0e-04 fd_norm=2.115114e-04 matrix_norm=1.782454e-04 relative_error=2.601760e-01 cosine=9.745140e-01
+[radau-solver] iter=9 delta_norm=1.055345e-06 residual_norm=1.812090e-05 stage_residual_defect=2.465832e-04 newton_metric=1.088008e-04 newton_tol=4.770583e-04 theta=9.065454e-02 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=9 fraction=1.0e-04 fd_norm=3.188521e-05 matrix_norm=1.812090e-05 relative_error=8.204412e-01 cosine=5.717412e-01
+[radau-solver] final_stage_residual_defect=2.632631e-05
+[radau-solver] final iter=9 converged=True diverged=False finite_initial_residual=True nonfinite_stage_state=False nonfinite_stage_residual=False residual_norm=1.864895e-06 delta_norm=1.055345e-06 newton_metric=1.088008e-04 newton_tol=4.770583e-04 theta=9.065454e-02 slow=False blowup=False newton_nonfinite=False
+[radau-solver] attempt t_start=2.066897e-01 dt_try=4.421438e-02 accepted=True failed=False fail_code=0 converged=True err_norm=4.799501e-02 growth=1.173918e+00 next_dt=5.190407e-02 stagnation_accepted=False stagnation_defect_norm=0.000000e+00 lagged_reused=False jacobian_reused=False
+[debug-walltime] radau.attempt #354 elapsed_s=0.093905
+[radau-solver] iter=1 delta_norm=6.199739e+01 residual_norm=2.136240e+03 stage_residual_defect=1.628185e+04 newton_metric=1.272079e+05 newton_tol=4.770583e-04 theta=0.000000e+00 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=1 fraction=1.0e-04 fd_norm=2.234725e+03 matrix_norm=2.136240e+03 relative_error=9.206394e-02 cosine=9.965826e-01
+[radau-solver] iter=2 delta_norm=8.079879e+01 residual_norm=4.190812e+02 stage_residual_defect=2.428066e+03 newton_metric=1.420228e+05 newton_tol=4.770583e-04 theta=6.367937e-01 slow=True blowup=False nonfinite=False diverged=True
+[radau-stage-direction-audit] iter=2 fraction=1.0e-04 fd_norm=8.861944e+02 matrix_norm=4.190812e+02 relative_error=5.439293e-01 cosine=9.809426e-01
+[radau-solver] final_stage_residual_defect=1.919500e+03
+[radau-solver] final iter=2 converged=False diverged=True finite_initial_residual=True nonfinite_stage_state=False nonfinite_stage_residual=False residual_norm=3.416350e+02 delta_norm=8.079879e+01 newton_metric=1.420228e+05 newton_tol=4.770583e-04 theta=6.367937e-01 slow=True blowup=False newton_nonfinite=False
+[radau-solver] attempt t_start=2.509041e-01 dt_try=5.190407e-02 accepted=False failed=False fail_code=0 converged=False err_norm=1.344722e-01 growth=5.000000e-01 next_dt=2.595204e-02 stagnation_accepted=False stagnation_defect_norm=0.000000e+00 lagged_reused=False jacobian_reused=False
+[debug-walltime] radau.attempt #355 elapsed_s=0.041449
+[radau-solver] iter=1 delta_norm=4.326906e+01 residual_norm=9.562009e+02 stage_residual_defect=4.052236e+03 newton_metric=1.136579e+05 newton_tol=4.770583e-04 theta=0.000000e+00 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=1 fraction=1.0e-04 fd_norm=9.687734e+02 matrix_norm=9.562009e+02 relative_error=3.695999e-02 cosine=9.993933e-01
+[radau-solver] iter=2 delta_norm=1.295405e+01 residual_norm=5.334047e+01 stage_residual_defect=1.372920e+02 newton_metric=1.771778e+03 newton_tol=4.770583e-04 theta=1.173034e-01 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=2 fraction=1.0e-04 fd_norm=6.684765e+01 matrix_norm=5.334047e+01 relative_error=2.324400e-01 cosine=9.917284e-01
+[radau-solver] iter=3 delta_norm=4.993302e+00 residual_norm=1.433901e+01 stage_residual_defect=3.671847e+01 newton_metric=1.307264e+03 newton_tol=4.770583e-04 theta=2.087792e-01 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=3 fraction=1.0e-04 fd_norm=1.760778e+01 matrix_norm=1.433901e+01 relative_error=1.874294e-01 cosine=9.995909e-01
+[radau-solver] iter=4 delta_norm=1.367930e+00 residual_norm=3.382215e+00 stage_residual_defect=7.630891e+00 newton_metric=6.346709e+02 newton_tol=4.770583e-04 theta=3.188758e-01 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=4 fraction=1.0e-04 fd_norm=4.089372e+00 matrix_norm=3.382215e+00 relative_error=1.735912e-01 cosine=9.998606e-01
+[radau-solver] iter=5 delta_norm=3.171510e-01 residual_norm=7.062653e-01 stage_residual_defect=1.504654e+00 newton_metric=1.057288e+02 newton_tol=4.770583e-04 theta=2.518121e-01 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=5 fraction=1.0e-04 fd_norm=8.350223e-01 matrix_norm=7.062653e-01 relative_error=1.545480e-01 cosine=9.999357e-01
+[radau-solver] iter=6 delta_norm=6.269916e-02 residual_norm=1.291768e-01 stage_residual_defect=2.634343e-01 newton_metric=1.690346e+01 newton_tol=4.770583e-04 theta=2.140005e-01 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=6 fraction=1.0e-04 fd_norm=1.503108e-01 matrix_norm=1.291768e-01 relative_error=1.408331e-01 cosine=9.999621e-01
+[radau-solver] iter=7 delta_norm=1.092985e-02 residual_norm=2.116640e-02 stage_residual_defect=4.154636e-02 newton_metric=2.465784e+00 newton_tol=4.770583e-04 theta=1.855910e-01 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=7 fraction=1.0e-04 fd_norm=2.430766e-02 matrix_norm=2.116640e-02 relative_error=1.294037e-01 cosine=9.999741e-01
+[radau-solver] iter=8 delta_norm=1.707286e-03 residual_norm=3.142971e-03 stage_residual_defect=5.965279e-03 newton_metric=3.338971e-01 newton_tol=4.770583e-04 theta=1.649839e-01 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=8 fraction=1.0e-04 fd_norm=3.572506e-03 matrix_norm=3.142971e-03 relative_error=1.207834e-01 cosine=9.999247e-01
+[radau-solver] iter=9 delta_norm=2.421032e-04 residual_norm=4.272221e-04 stage_residual_defect=7.868264e-04 newton_metric=4.189097e-02 newton_tol=4.770583e-04 theta=1.488111e-01 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=9 fraction=1.0e-04 fd_norm=4.807062e-04 matrix_norm=4.272221e-04 relative_error=1.306003e-01 cosine=9.973686e-01
+[radau-solver] iter=10 delta_norm=3.147834e-05 residual_norm=5.360889e-05 stage_residual_defect=9.611141e-05 newton_metric=4.894040e-03 newton_tol=4.770583e-04 theta=1.357719e-01 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=10 fraction=1.0e-04 fd_norm=6.312781e-05 matrix_norm=5.360889e-05 relative_error=4.108067e-01 cosine=9.140231e-01
+[radau-solver] iter=11 delta_norm=3.786040e-06 residual_norm=6.260552e-06 stage_residual_defect=1.096118e-05 newton_metric=5.354347e-04 newton_tol=4.770583e-04 theta=1.250433e-01 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=11 fraction=1.0e-04 fd_norm=2.426932e-05 matrix_norm=6.260552e-06 relative_error=9.189190e-01 cosine=4.305527e-01
+[radau-solver] iter=12 delta_norm=4.251101e-07 residual_norm=6.859824e-07 stage_residual_defect=1.177629e-06 newton_metric=5.531942e-05 newton_tol=4.770583e-04 theta=1.162109e-01 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=12 fraction=1.0e-04 fd_norm=4.248150e-06 matrix_norm=6.859824e-07 relative_error=9.963885e-01 cosine=1.030639e-01
+[radau-solver] final_stage_residual_defect=1.485679e-07
+[radau-solver] final iter=12 converged=True diverged=False finite_initial_residual=True nonfinite_stage_state=False nonfinite_stage_residual=False residual_norm=7.199396e-08 delta_norm=4.251101e-07 newton_metric=5.531942e-05 newton_tol=4.770583e-04 theta=1.162109e-01 slow=False blowup=False newton_nonfinite=False
+[radau-solver] attempt t_start=2.509041e-01 dt_try=2.595204e-02 accepted=True failed=False fail_code=0 converged=True err_norm=1.345192e-02 growth=1.312121e+00 next_dt=3.405221e-02 stagnation_accepted=False stagnation_defect_norm=0.000000e+00 lagged_reused=False jacobian_reused=True
+[debug-walltime] radau.attempt #356 elapsed_s=0.109814
+[radau-solver] iter=1 delta_norm=2.142161e+01 residual_norm=5.101847e+02 stage_residual_defect=1.399937e+03 newton_metric=7.509601e+04 newton_tol=4.770583e-04 theta=0.000000e+00 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=1 fraction=1.0e-04 fd_norm=4.995417e+02 matrix_norm=5.101847e+02 relative_error=9.877940e-02 cosine=9.954453e-01
+[radau-solver] iter=2 delta_norm=3.834159e+00 residual_norm=5.354972e+01 stage_residual_defect=2.601068e+02 newton_metric=3.706215e+02 newton_tol=4.770583e-04 theta=6.782738e-02 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=2 fraction=1.0e-04 fd_norm=6.571856e+01 matrix_norm=5.354972e+01 relative_error=2.549590e-01 cosine=9.811510e-01
+[radau-solver] iter=3 delta_norm=2.546110e+00 residual_norm=1.623623e+01 stage_residual_defect=6.608321e+01 newton_metric=5.735675e+02 newton_tol=4.770583e-04 theta=1.840268e-01 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=3 fraction=1.0e-04 fd_norm=2.238221e+01 matrix_norm=1.623623e+01 relative_error=2.802046e-01 cosine=9.978537e-01
+[radau-solver] iter=4 delta_norm=1.335965e+00 residual_norm=6.362865e+00 stage_residual_defect=2.314178e+01 newton_metric=1.384003e+03 newton_tol=4.770583e-04 theta=5.104653e-01 slow=True blowup=False nonfinite=False diverged=True
+[radau-stage-direction-audit] iter=4 fraction=1.0e-04 fd_norm=8.616560e+00 matrix_norm=6.362865e+00 relative_error=2.629954e-01 cosine=9.994880e-01
+[radau-solver] final_stage_residual_defect=7.698114e+00
+[radau-solver] final iter=4 converged=False diverged=True finite_initial_residual=True nonfinite_stage_state=False nonfinite_stage_residual=False residual_norm=2.254152e+00 delta_norm=1.335965e+00 newton_metric=1.384003e+03 newton_tol=4.770583e-04 theta=5.104653e-01 slow=True blowup=False newton_nonfinite=False
+[radau-solver] attempt t_start=2.768562e-01 dt_try=3.405221e-02 accepted=False failed=False fail_code=0 converged=False err_norm=6.800551e-03 growth=5.000000e-01 next_dt=1.702611e-02 stagnation_accepted=False stagnation_defect_norm=0.000000e+00 lagged_reused=False jacobian_reused=False
+[debug-walltime] radau.attempt #357 elapsed_s=0.055944
+[radau-solver] iter=1 delta_norm=1.933181e+01 residual_norm=1.863046e+02 stage_residual_defect=3.294507e+02 newton_metric=7.002299e+04 newton_tol=4.770583e-04 theta=0.000000e+00 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=1 fraction=1.0e-04 fd_norm=1.825670e+02 matrix_norm=1.863046e+02 relative_error=5.791648e-02 cosine=9.985618e-01
+[radau-solver] iter=2 delta_norm=1.172689e+00 residual_norm=1.120552e+01 stage_residual_defect=2.379657e+01 newton_metric=4.022924e+01 newton_tol=4.770583e-04 theta=2.368350e-02 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=2 fraction=1.0e-04 fd_norm=1.192611e+01 matrix_norm=1.120552e+01 relative_error=1.063792e-01 cosine=9.959206e-01
+[radau-solver] iter=3 delta_norm=3.139474e-01 residual_norm=1.255408e+00 stage_residual_defect=2.489083e+00 newton_metric=2.248957e+01 newton_tol=4.770583e-04 theta=6.691958e-02 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=3 fraction=1.0e-04 fd_norm=1.438698e+00 matrix_norm=1.255408e+00 relative_error=1.308107e-01 cosine=9.994953e-01
+[radau-solver] iter=4 delta_norm=6.215368e-02 residual_norm=1.885344e-01 stage_residual_defect=3.078938e-01 newton_metric=1.471272e+01 newton_tol=4.770583e-04 theta=1.927543e-01 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=4 fraction=1.0e-04 fd_norm=2.128011e-01 matrix_norm=1.885344e-01 relative_error=1.149782e-01 cosine=9.998780e-01
+[radau-solver] iter=5 delta_norm=9.563341e-03 residual_norm=2.446162e-02 stage_residual_defect=3.592134e-02 newton_metric=1.992313e+00 newton_tol=4.770583e-04 theta=1.737933e-01 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=5 fraction=1.0e-04 fd_norm=2.722877e-02 matrix_norm=2.446162e-02 relative_error=1.020996e-01 cosine=9.999463e-01
+[radau-solver] iter=6 delta_norm=1.221882e-03 residual_norm=2.781475e-03 stage_residual_defect=3.841245e-03 newton_metric=1.971136e-01 newton_tol=4.770583e-04 theta=1.401159e-01 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=6 fraction=1.0e-04 fd_norm=3.063601e-03 matrix_norm=2.781475e-03 relative_error=9.308981e-02 cosine=9.998980e-01
+[radau-solver] iter=7 delta_norm=1.348544e-04 residual_norm=2.812554e-04 stage_residual_defect=3.687254e-04 newton_metric=1.798007e-02 newton_tol=4.770583e-04 theta=1.187131e-01 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=7 fraction=1.0e-04 fd_norm=3.144144e-04 matrix_norm=2.812554e-04 relative_error=1.329686e-01 cosine=9.963343e-01
+[radau-solver] iter=8 delta_norm=1.317398e-05 residual_norm=2.564945e-05 stage_residual_defect=3.216730e-05 newton_metric=1.510318e-03 newton_tol=4.770583e-04 theta=1.038163e-01 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=8 fraction=1.0e-04 fd_norm=3.225584e-05 matrix_norm=2.564945e-05 relative_error=5.271538e-01 cosine=8.516432e-01
+[radau-solver] iter=9 delta_norm=1.157901e-06 residual_norm=2.131850e-06 stage_residual_defect=2.572969e-06 newton_metric=1.170033e-04 newton_tol=4.770583e-04 theta=9.265181e-02 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=9 fraction=1.0e-04 fd_norm=1.574267e-05 matrix_norm=2.131850e-06 relative_error=9.947016e-01 cosine=1.067315e-01
+[radau-solver] final_stage_residual_defect=1.936706e-07
+[radau-solver] final iter=9 converged=True diverged=False finite_initial_residual=True nonfinite_stage_state=False nonfinite_stage_residual=False residual_norm=1.630753e-07 delta_norm=1.157901e-06 newton_metric=1.170033e-04 newton_tol=4.770583e-04 theta=9.265181e-02 slow=False blowup=False newton_nonfinite=False
+[radau-solver] attempt t_start=2.768562e-01 dt_try=1.702611e-02 accepted=True failed=False fail_code=0 converged=True err_norm=4.197121e-03 growth=1.452895e+00 next_dt=2.473715e-02 stagnation_accepted=False stagnation_defect_norm=0.000000e+00 lagged_reused=False jacobian_reused=True
+[debug-walltime] radau.attempt #358 elapsed_s=0.087976
+[radau-solver] iter=1 delta_norm=1.302343e+01 residual_norm=2.136399e+02 stage_residual_defect=3.948104e+02 newton_metric=6.584608e+04 newton_tol=4.770583e-04 theta=0.000000e+00 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=1 fraction=1.0e-04 fd_norm=2.003556e+02 matrix_norm=2.136399e+02 relative_error=8.698578e-02 cosine=9.985134e-01
+[radau-solver] iter=2 delta_norm=7.555371e-01 residual_norm=1.805675e+01 stage_residual_defect=6.832517e+01 newton_metric=5.972754e+01 newton_tol=4.770583e-04 theta=2.966761e-02 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=2 fraction=1.0e-04 fd_norm=1.845192e+01 matrix_norm=1.805675e+01 relative_error=9.064838e-02 cosine=9.960359e-01
+[radau-solver] iter=3 delta_norm=2.438100e-01 residual_norm=1.661296e+00 stage_residual_defect=6.971471e+00 newton_metric=1.692226e+01 newton_tol=4.770583e-04 theta=6.223119e-02 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=3 fraction=1.0e-04 fd_norm=1.951160e+00 matrix_norm=1.661296e+00 relative_error=1.647365e-01 cosine=9.970238e-01
+[radau-solver] iter=4 delta_norm=6.854418e-02 residual_norm=3.218433e-01 stage_residual_defect=9.229117e-01 newton_metric=1.566986e+01 newton_tol=4.770583e-04 theta=1.868425e-01 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=4 fraction=1.0e-04 fd_norm=3.815803e-01 matrix_norm=3.218433e-01 relative_error=1.586457e-01 cosine=9.996087e-01
+[radau-solver] iter=5 delta_norm=1.602172e-02 residual_norm=6.052198e-02 stage_residual_defect=1.443162e-01 newton_metric=5.284526e+00 newton_tol=4.770583e-04 theta=2.496033e-01 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=5 fraction=1.0e-04 fd_norm=7.109167e-02 matrix_norm=6.052198e-02 relative_error=1.492237e-01 cosine=9.999043e-01
+[radau-solver] iter=6 delta_norm=3.243137e-03 residual_norm=1.061087e-02 stage_residual_defect=2.385846e-02 newton_metric=8.908761e-01 newton_tol=4.770583e-04 theta=2.170665e-01 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=6 fraction=1.0e-04 fd_norm=1.232002e-02 matrix_norm=1.061087e-02 relative_error=1.392975e-01 cosine=9.999083e-01
+[radau-solver] iter=7 delta_norm=5.843900e-04 residual_norm=1.709584e-03 stage_residual_defect=3.653713e-03 newton_metric=1.365318e-01 newton_tol=4.770583e-04 theta=1.908690e-01 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=7 fraction=1.0e-04 fd_norm=1.970471e-03 matrix_norm=1.709584e-03 relative_error=1.361446e-01 cosine=9.994202e-01
+[radau-solver] iter=8 delta_norm=9.540150e-05 residual_norm=2.551644e-04 stage_residual_defect=5.234750e-04 newton_metric=1.954767e-02 newton_tol=4.770583e-04 theta=1.714564e-01 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=8 fraction=1.0e-04 fd_norm=2.867442e-04 matrix_norm=2.551644e-04 relative_error=1.332351e-01 cosine=9.968408e-01
+[radau-solver] iter=9 delta_norm=1.428608e-05 residual_norm=3.547425e-05 stage_residual_defect=7.017518e-05 newton_metric=2.620376e-03 newton_tol=4.770583e-04 theta=1.563178e-01 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=9 fraction=1.0e-04 fd_norm=4.528268e-05 matrix_norm=3.547425e-05 relative_error=3.660081e-01 cosine=9.444441e-01
+[radau-solver] iter=10 delta_norm=1.980353e-06 residual_norm=4.616840e-06 stage_residual_defect=8.837246e-06 newton_metric=3.299187e-04 newton_tol=4.770583e-04 theta=1.440561e-01 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=10 fraction=1.0e-04 fd_norm=1.226180e-05 matrix_norm=4.616840e-06 relative_error=8.155879e-01 cosine=6.328779e-01
+[radau-solver] final_stage_residual_defect=1.051677e-06
+[radau-solver] final iter=10 converged=True diverged=False finite_initial_residual=True nonfinite_stage_state=False nonfinite_stage_residual=False residual_norm=5.645892e-07 delta_norm=1.980353e-06 newton_metric=3.299187e-04 newton_tol=4.770583e-04 theta=1.440561e-01 slow=False blowup=False newton_nonfinite=False
+[radau-solver] attempt t_start=2.938823e-01 dt_try=2.473715e-02 accepted=True failed=False fail_code=0 converged=True err_norm=7.218879e-03 growth=1.385563e+00 next_dt=3.427488e-02 stagnation_accepted=False stagnation_defect_norm=0.000000e+00 lagged_reused=False jacobian_reused=False
+[debug-walltime] radau.attempt #359 elapsed_s=0.099322
+[radau-solver] iter=1 delta_norm=1.262504e+01 residual_norm=3.950513e+02 stage_residual_defect=1.060780e+03 newton_metric=7.071305e+04 newton_tol=4.770583e-04 theta=0.000000e+00 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=1 fraction=1.0e-04 fd_norm=3.799213e+02 matrix_norm=3.950513e+02 relative_error=6.530981e-02 cosine=9.987116e-01
+[radau-solver] iter=2 delta_norm=7.518124e-01 residual_norm=2.561989e+01 stage_residual_defect=1.741472e+02 newton_metric=7.978893e+02 newton_tol=4.770583e-04 theta=1.007317e-01 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=2 fraction=1.0e-04 fd_norm=2.445986e+01 matrix_norm=2.561989e+01 relative_error=1.452141e-01 cosine=9.910075e-01
+[radau-solver] iter=3 delta_norm=1.588352e-01 residual_norm=3.532935e+00 stage_residual_defect=3.480774e+01 newton_metric=1.703919e+02 newton_tol=4.770583e-04 theta=1.280783e-01 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=3 fraction=1.0e-04 fd_norm=3.563876e+00 matrix_norm=3.532935e+00 relative_error=1.158555e-01 cosine=9.932680e-01
+[radau-solver] iter=4 delta_norm=4.641949e-02 residual_norm=4.128867e-01 stage_residual_defect=2.138943e+00 newton_metric=2.656173e+01 newton_tol=4.770583e-04 theta=1.470627e-01 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=4 fraction=1.0e-04 fd_norm=4.836486e-01 matrix_norm=4.128867e-01 relative_error=2.019998e-01 cosine=9.886389e-01
+[radau-solver] iter=5 delta_norm=1.371381e-02 residual_norm=9.767101e-02 stage_residual_defect=5.606647e-01 newton_metric=3.164310e+00 newton_tol=4.770583e-04 theta=1.332228e-01 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=5 fraction=1.0e-04 fd_norm=1.157622e-01 matrix_norm=9.767101e-02 relative_error=1.692014e-01 cosine=9.975074e-01
+[radau-solver] iter=6 delta_norm=3.661056e-03 residual_norm=1.957666e-02 stage_residual_defect=6.674156e-02 newton_metric=7.343897e-01 newton_tol=4.770583e-04 theta=1.588692e-01 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=6 fraction=1.0e-04 fd_norm=2.368477e-02 matrix_norm=1.957666e-02 relative_error=1.746863e-01 cosine=9.997395e-01
+[radau-solver] iter=7 delta_norm=8.875105e-04 residual_norm=4.133793e-03 stage_residual_defect=1.457003e-02 newton_metric=2.318983e-01 newton_tol=4.770583e-04 theta=2.074465e-01 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=7 fraction=1.0e-04 fd_norm=4.947669e-03 matrix_norm=4.133793e-03 relative_error=1.666540e-01 cosine=9.995725e-01
+[radau-solver] iter=8 delta_norm=1.981352e-04 residual_norm=8.151848e-04 stage_residual_defect=2.597784e-03 newton_metric=5.697503e-02 newton_tol=4.770583e-04 theta=2.247936e-01 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=8 fraction=1.0e-04 fd_norm=9.730164e-04 matrix_norm=8.151848e-04 relative_error=1.655444e-01 cosine=9.993475e-01
+[radau-solver] iter=9 delta_norm=4.119020e-05 residual_norm=1.537239e-04 stage_residual_defect=4.738187e-04 newton_metric=1.115160e-02 newton_tol=4.770583e-04 theta=2.146179e-01 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=9 fraction=1.0e-04 fd_norm=1.802388e-04 matrix_norm=1.537239e-04 relative_error=1.796831e-01 cosine=9.937597e-01
+[radau-solver] iter=10 delta_norm=8.039206e-06 residual_norm=2.759766e-05 stage_residual_defect=8.190783e-05 newton_metric=2.006987e-03 newton_tol=4.770583e-04 theta=2.013112e-01 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=10 fraction=1.0e-04 fd_norm=3.250767e-05 matrix_norm=2.759766e-05 relative_error=4.359279e-01 cosine=9.015149e-01
+[radau-solver] iter=11 delta_norm=1.482070e-06 residual_norm=4.732654e-06 stage_residual_defect=1.362100e-05 newton_metric=3.434673e-04 newton_tol=4.770583e-04 theta=1.896429e-01 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=11 fraction=1.0e-04 fd_norm=1.528124e-05 matrix_norm=4.732654e-06 relative_error=9.757883e-01 cosine=2.320824e-01
+[radau-solver] final_stage_residual_defect=2.168365e-06
+[radau-solver] final iter=11 converged=True diverged=False finite_initial_residual=True nonfinite_stage_state=False nonfinite_stage_residual=False residual_norm=7.760620e-07 delta_norm=1.482070e-06 newton_metric=3.434673e-04 newton_tol=4.770583e-04 theta=1.896429e-01 slow=False blowup=False newton_nonfinite=False
+[radau-solver] attempt t_start=3.186194e-01 dt_try=3.427488e-02 accepted=True failed=False fail_code=0 converged=True err_norm=9.912934e-03 growth=1.347643e+00 next_dt=4.619030e-02 stagnation_accepted=False stagnation_defect_norm=0.000000e+00 lagged_reused=False jacobian_reused=False
+[debug-walltime] radau.attempt #360 elapsed_s=0.106246
+[radau-solver] iter=1 delta_norm=1.308570e+01 residual_norm=6.463277e+02 stage_residual_defect=2.723551e+03 newton_metric=7.962031e+04 newton_tol=4.770583e-04 theta=0.000000e+00 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=1 fraction=1.0e-04 fd_norm=6.353140e+02 matrix_norm=6.463277e+02 relative_error=4.939402e-02 cosine=9.989486e-01
+[radau-solver] iter=2 delta_norm=1.079857e+00 residual_norm=3.219457e+01 stage_residual_defect=3.288465e+02 newton_metric=1.405063e+03 newton_tol=4.770583e-04 theta=1.243114e-01 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=2 fraction=1.0e-04 fd_norm=2.909686e+01 matrix_norm=3.219457e+01 relative_error=3.006012e-01 cosine=9.642884e-01
+[radau-solver] iter=3 delta_norm=2.248002e-01 residual_norm=8.760645e+00 stage_residual_defect=1.229985e+02 newton_metric=5.462732e+02 newton_tol=4.770583e-04 theta=1.779997e-01 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=3 fraction=1.0e-04 fd_norm=8.610300e+00 matrix_norm=8.760645e+00 relative_error=6.540634e-02 cosine=9.980475e-01
+[radau-solver] iter=4 delta_norm=5.689700e-02 residual_norm=5.631657e-01 stage_residual_defect=5.238679e+00 newton_metric=2.138329e+02 newton_tol=4.770583e-04 theta=2.527382e-01 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=4 fraction=1.0e-04 fd_norm=6.304275e-01 matrix_norm=5.631657e-01 relative_error=6.282704e-01 cosine=7.854376e-01
+[radau-solver] iter=5 delta_norm=1.284818e-02 residual_norm=3.962217e-01 stage_residual_defect=5.688065e+00 newton_metric=4.118900e+01 newton_tol=4.770583e-04 theta=2.322939e-01 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=5 fraction=1.0e-04 fd_norm=4.217189e-01 matrix_norm=3.962217e-01 relative_error=8.098216e-02 cosine=9.984553e-01
+[radau-solver] iter=6 delta_norm=2.804215e-03 residual_norm=3.420218e-02 stage_residual_defect=4.264359e-01 newton_metric=7.049993e+00 newton_tol=4.770583e-04 theta=2.068063e-01 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=6 fraction=1.0e-04 fd_norm=5.032949e-02 matrix_norm=3.420218e-02 relative_error=3.764238e-01 cosine=9.712931e-01
+[radau-solver] iter=7 delta_norm=5.990336e-04 residual_norm=1.890678e-02 stage_residual_defect=2.728211e-01 newton_metric=1.131896e+00 newton_tol=4.770583e-04 theta=1.889332e-01 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=7 fraction=1.0e-04 fd_norm=2.182010e-02 matrix_norm=1.890678e-02 relative_error=1.380172e-01 cosine=9.992946e-01
+[radau-solver] iter=8 delta_norm=1.286970e-04 residual_norm=2.995614e-03 stage_residual_defect=4.264527e-02 newton_metric=1.810585e-01 newton_tol=4.770583e-04 theta=1.766574e-01 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=8 fraction=1.0e-04 fd_norm=4.033276e-03 matrix_norm=2.995614e-03 relative_error=2.621864e-01 cosine=9.982825e-01
+[radau-solver] iter=9 delta_norm=2.741570e-05 residual_norm=1.026556e-03 stage_residual_defect=1.494243e-02 newton_metric=2.613348e-02 newton_tol=4.770583e-04 theta=1.649854e-01 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=9 fraction=1.0e-04 fd_norm=1.292602e-03 matrix_norm=1.026556e-03 relative_error=2.079697e-01 cosine=9.994405e-01
+[radau-solver] iter=10 delta_norm=5.801182e-06 residual_norm=2.242479e-04 stage_residual_defect=3.271113e-03 newton_metric=4.183826e-03 newton_tol=4.770583e-04 theta=1.608363e-01 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=10 fraction=1.0e-04 fd_norm=2.846084e-04 matrix_norm=2.242479e-04 relative_error=2.603700e-01 cosine=9.855229e-01
+[radau-solver] iter=11 delta_norm=1.193779e-06 residual_norm=6.293122e-05 stage_residual_defect=9.224459e-04 newton_metric=5.670062e-04 newton_tol=4.770583e-04 theta=1.536605e-01 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=11 fraction=1.0e-04 fd_norm=1.115551e-04 matrix_norm=6.293122e-05 relative_error=4.555031e-01 cosine=9.844916e-01
+[radau-solver] iter=12 delta_norm=2.402809e-07 residual_norm=1.554164e-05 stage_residual_defect=2.282213e-04 newton_metric=1.165363e-04 newton_tol=4.770583e-04 theta=1.646036e-01 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=12 fraction=1.0e-04 fd_norm=2.235571e-05 matrix_norm=1.554164e-05 relative_error=4.195996e-01 cosine=9.401901e-01
+[radau-solver] final_stage_residual_defect=6.030025e-05
+[radau-solver] final iter=12 converged=True diverged=False finite_initial_residual=True nonfinite_stage_state=False nonfinite_stage_residual=False residual_norm=4.101203e-06 delta_norm=2.402809e-07 newton_metric=1.165363e-04 newton_tol=4.770583e-04 theta=1.646036e-01 slow=False blowup=False newton_nonfinite=False
+[radau-solver] attempt t_start=3.528943e-01 dt_try=4.619030e-02 accepted=True failed=False fail_code=0 converged=True err_norm=3.191110e-02 growth=1.216599e+00 next_dt=5.619510e-02 stagnation_accepted=False stagnation_defect_norm=0.000000e+00 lagged_reused=False jacobian_reused=False
+[debug-walltime] radau.attempt #361 elapsed_s=0.113996
+[radau-solver] iter=1 delta_norm=1.399069e+01 residual_norm=8.848861e+02 stage_residual_defect=5.833321e+03 newton_metric=8.949540e+04 newton_tol=4.770583e-04 theta=0.000000e+00 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=1 fraction=1.0e-04 fd_norm=9.102452e+02 matrix_norm=8.848861e+02 relative_error=8.831105e-02 cosine=9.963880e-01
+[radau-solver] iter=2 delta_norm=1.562218e+00 residual_norm=7.799829e+01 stage_residual_defect=1.191820e+03 newton_metric=2.545136e+03 newton_tol=4.770583e-04 theta=1.550169e-01 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=2 fraction=1.0e-04 fd_norm=1.032573e+02 matrix_norm=7.799829e+01 relative_error=2.826036e-01 cosine=9.867452e-01
+[radau-solver] iter=3 delta_norm=1.261399e-01 residual_norm=3.039308e+01 stage_residual_defect=5.278775e+02 newton_metric=2.142952e+02 newton_tol=4.770583e-04 theta=1.278220e-01 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=3 fraction=1.0e-04 fd_norm=3.607714e+01 matrix_norm=3.039308e+01 relative_error=1.667705e-01 cosine=9.982258e-01
+[radau-solver] iter=4 delta_norm=6.434893e-02 residual_norm=5.976276e+00 stage_residual_defect=1.045031e+02 newton_metric=2.699591e+02 newton_tol=4.770583e-04 theta=2.449265e-01 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=4 fraction=1.0e-04 fd_norm=8.178083e+00 matrix_norm=5.976276e+00 relative_error=2.783163e-01 cosine=9.965969e-01
+[radau-solver] iter=5 delta_norm=1.456504e-02 residual_norm=2.283609e+00 stage_residual_defect=4.011572e+01 newton_metric=1.241075e+02 newton_tol=4.770583e-04 theta=3.756174e-01 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=5 fraction=1.0e-04 fd_norm=2.730653e+00 matrix_norm=2.283609e+00 relative_error=1.692301e-01 cosine=9.989018e-01
+[radau-solver] iter=6 delta_norm=4.320065e-03 residual_norm=4.617570e-01 stage_residual_defect=8.103427e+00 newton_metric=2.391256e+01 newton_tol=4.770583e-04 theta=2.751339e-01 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=6 fraction=1.0e-04 fd_norm=6.231426e-01 matrix_norm=4.617570e-01 relative_error=2.649656e-01 cosine=9.978862e-01
+[radau-solver] iter=7 delta_norm=1.070708e-03 residual_norm=1.651673e-01 stage_residual_defect=2.905575e+00 newton_metric=6.127314e+00 newton_tol=4.770583e-04 theta=2.778430e-01 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=7 fraction=1.0e-04 fd_norm=2.006307e-01 matrix_norm=1.651673e-01 relative_error=1.799974e-01 cosine=9.992984e-01
+[radau-solver] iter=8 delta_norm=2.759306e-04 residual_norm=3.609333e-02 stage_residual_defect=6.348936e-01 newton_metric=1.484952e+00 newton_tol=4.770583e-04 theta=2.594083e-01 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=8 fraction=1.0e-04 fd_norm=4.799848e-02 matrix_norm=3.609333e-02 relative_error=2.509468e-01 cosine=9.990329e-01
+[radau-solver] iter=9 delta_norm=6.354179e-05 residual_norm=1.201038e-02 stage_residual_defect=2.114794e-01 newton_metric=3.240133e-01 newton_tol=4.770583e-04 theta=2.482270e-01 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=9 fraction=1.0e-04 fd_norm=1.482024e-02 matrix_norm=1.201038e-02 relative_error=1.910889e-01 cosine=9.996493e-01
+[radau-solver] iter=10 delta_norm=1.548165e-05 residual_norm=2.842453e-03 stage_residual_defect=5.005706e-02 newton_metric=7.861853e-02 newton_tol=4.770583e-04 theta=2.414031e-01 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=10 fraction=1.0e-04 fd_norm=3.651334e-03 matrix_norm=2.842453e-03 relative_error=2.227894e-01 cosine=9.996407e-01
+[radau-solver] iter=11 delta_norm=3.276216e-06 residual_norm=8.853336e-04 stage_residual_defect=1.559640e-02 newton_metric=1.560050e-02 newton_tol=4.770583e-04 theta=2.304251e-01 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=11 fraction=1.0e-04 fd_norm=1.152352e-03 matrix_norm=8.853336e-04 relative_error=2.527341e-01 cosine=9.933734e-01
+[radau-solver] iter=12 delta_norm=7.808331e-07 residual_norm=2.233205e-04 stage_residual_defect=3.934457e-03 newton_metric=3.842794e-03 newton_tol=4.770583e-04 theta=2.289044e-01 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=12 fraction=1.0e-04 fd_norm=3.032977e-04 matrix_norm=2.233205e-04 relative_error=2.958066e-01 cosine=9.877985e-01
+[radau-solver] iter=13 delta_norm=1.500772e-07 residual_norm=6.624571e-05 stage_residual_defect=1.167227e-03 newton_metric=6.883439e-04 newton_tol=4.770583e-04 theta=2.178137e-01 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=13 fraction=1.0e-04 fd_norm=9.215796e-05 matrix_norm=6.624571e-05 relative_error=4.965072e-01 cosine=8.835176e-01
+[radau-solver] iter=14 delta_norm=3.666524e-08 residual_norm=1.745661e-05 stage_residual_defect=3.075895e-04 newton_metric=1.849488e-04 newton_tol=4.770583e-04 theta=2.230713e-01 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=14 fraction=1.0e-04 fd_norm=3.227404e-05 matrix_norm=1.745661e-05 relative_error=1.326085e+00 cosine=-4.307208e-01
+[radau-solver] final_stage_residual_defect=8.846796e-05
+[radau-solver] final iter=14 converged=True diverged=False finite_initial_residual=True nonfinite_stage_state=False nonfinite_stage_residual=False residual_norm=5.020697e-06 delta_norm=3.666524e-08 newton_metric=1.849488e-04 newton_tol=4.770583e-04 theta=2.230713e-01 slow=False blowup=False newton_nonfinite=False
+[radau-solver] attempt t_start=3.990846e-01 dt_try=5.619510e-02 accepted=True failed=False fail_code=0 converged=True err_norm=9.634139e-03 growth=1.351011e+00 next_dt=7.592019e-02 stagnation_accepted=False stagnation_defect_norm=0.000000e+00 lagged_reused=False jacobian_reused=False
+[debug-walltime] radau.attempt #362 elapsed_s=0.129121
+[radau-solver] iter=1 delta_norm=1.509903e+01 residual_norm=1.174519e+03 stage_residual_defect=1.181197e+04 newton_metric=1.007773e+05 newton_tol=4.770583e-04 theta=0.000000e+00 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=1 fraction=1.0e-04 fd_norm=1.314035e+03 matrix_norm=1.174519e+03 relative_error=1.974283e-01 cosine=9.845020e-01
+[radau-solver] iter=2 delta_norm=2.543021e+00 residual_norm=2.427606e+02 stage_residual_defect=5.111140e+03 newton_metric=7.049550e+03 newton_tol=4.770583e-04 theta=2.318107e-01 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=2 fraction=1.0e-04 fd_norm=3.192188e+02 matrix_norm=2.427606e+02 relative_error=2.548892e-01 cosine=9.950030e-01
+[radau-solver] iter=3 delta_norm=4.189112e-01 residual_norm=8.904965e+01 stage_residual_defect=2.058321e+03 newton_metric=1.060050e+03 newton_tol=4.770583e-04 theta=2.031342e-01 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=3 fraction=1.0e-04 fd_norm=1.170311e+02 matrix_norm=8.904965e+01 relative_error=2.424912e-01 cosine=9.989250e-01
+[radau-solver] iter=4 delta_norm=9.269219e-02 residual_norm=2.768591e+01 stage_residual_defect=6.462868e+02 newton_metric=2.905558e+02 newton_tol=4.770583e-04 theta=2.138366e-01 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=4 fraction=1.0e-04 fd_norm=3.539412e+01 matrix_norm=2.768591e+01 relative_error=2.185757e-01 cosine=9.997787e-01
+[radau-solver] iter=5 delta_norm=7.471158e-03 residual_norm=7.821217e+00 stage_residual_defect=1.827717e+02 newton_metric=1.316952e+01 newton_tol=4.770583e-04 theta=1.396697e-01 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=5 fraction=1.0e-04 fd_norm=9.793396e+00 matrix_norm=7.821217e+00 relative_error=2.022515e-01 cosine=9.997794e-01
+[radau-solver] iter=6 delta_norm=3.302022e-03 residual_norm=1.975796e+00 stage_residual_defect=4.618234e+01 newton_metric=1.317445e+01 newton_tol=4.770583e-04 theta=2.132863e-01 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=6 fraction=1.0e-04 fd_norm=2.483061e+00 matrix_norm=1.975796e+00 relative_error=2.048497e-01 cosine=9.998561e-01
+[radau-solver] iter=7 delta_norm=4.732055e-04 residual_norm=5.090618e-01 stage_residual_defect=1.189944e+01 newton_metric=3.877640e+00 newton_tol=4.770583e-04 theta=3.192562e-01 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=7 fraction=1.0e-04 fd_norm=6.297404e-01 matrix_norm=5.090618e-01 relative_error=1.923381e-01 cosine=9.998324e-01
+[radau-solver] iter=8 delta_norm=1.935505e-04 residual_norm=1.210903e-01 stage_residual_defect=2.830518e+00 newton_metric=1.142435e+00 newton_tol=4.770583e-04 theta=2.592074e-01 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=8 fraction=1.0e-04 fd_norm=1.518008e-01 matrix_norm=1.210903e-01 relative_error=2.028918e-01 cosine=9.998517e-01
+[radau-solver] iter=9 delta_norm=4.356065e-05 residual_norm=3.078958e-02 stage_residual_defect=7.197270e-01 newton_metric=3.300931e-01 newton_tol=4.770583e-04 theta=3.030263e-01 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=9 fraction=1.0e-04 fd_norm=3.790342e-02 matrix_norm=3.078958e-02 relative_error=1.883257e-01 cosine=9.998513e-01
+[radau-solver] iter=10 delta_norm=1.352235e-05 residual_norm=7.205303e-03 stage_residual_defect=1.684281e-01 newton_metric=8.823494e-02 newton_tol=4.770583e-04 theta=2.701829e-01 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=10 fraction=1.0e-04 fd_norm=8.942173e-03 matrix_norm=7.205303e-03 relative_error=1.950481e-01 cosine=9.998032e-01
+[radau-solver] iter=11 delta_norm=3.154860e-06 residual_norm=1.841846e-03 stage_residual_defect=4.305501e-02 newton_metric=2.095143e-02 newton_tol=4.770583e-04 theta=2.718637e-01 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=11 fraction=1.0e-04 fd_norm=2.325876e-03 matrix_norm=1.841846e-03 relative_error=2.098789e-01 cosine=9.995322e-01
+[radau-solver] iter=12 delta_norm=9.071359e-07 residual_norm=4.288269e-04 stage_residual_defect=1.002425e-02 newton_metric=5.806977e-03 newton_tol=4.770583e-04 theta=2.619831e-01 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=12 fraction=1.0e-04 fd_norm=5.946357e-04 matrix_norm=4.288269e-04 relative_error=3.270262e-01 cosine=9.797591e-01
+[radau-solver] iter=13 delta_norm=2.053217e-07 residual_norm=1.101895e-04 stage_residual_defect=2.575836e-03 newton_metric=1.289772e-03 newton_tol=4.770583e-04 theta=2.574651e-01 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=13 fraction=1.0e-04 fd_norm=1.434711e-04 matrix_norm=1.101895e-04 relative_error=3.709632e-01 cosine=9.454434e-01
+[radau-solver] iter=14 delta_norm=5.680139e-08 residual_norm=2.563616e-05 stage_residual_defect=5.992820e-04 newton_metric=3.517521e-04 newton_tol=4.770583e-04 theta=2.523817e-01 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=14 fraction=1.0e-04 fd_norm=2.485202e-05 matrix_norm=2.563616e-05 relative_error=1.571481e+00 cosine=-1.965257e-01
+[radau-solver] final_stage_residual_defect=1.540990e-04
+[radau-solver] final iter=14 converged=True diverged=False finite_initial_residual=True nonfinite_stage_state=False nonfinite_stage_residual=False residual_norm=6.591961e-06 delta_norm=5.680139e-08 newton_metric=3.517521e-04 newton_tol=4.770583e-04 theta=2.523817e-01 slow=False blowup=False newton_nonfinite=False
+[radau-solver] attempt t_start=4.552797e-01 dt_try=7.592019e-02 accepted=True failed=False fail_code=0 converged=True err_norm=8.350296e-03 growth=1.368024e+00 next_dt=1.038606e-01 stagnation_accepted=False stagnation_defect_norm=0.000000e+00 lagged_reused=False jacobian_reused=False
+[debug-walltime] radau.attempt #363 elapsed_s=0.128887
+[radau-solver] iter=1 delta_norm=1.506382e+01 residual_norm=1.529511e+03 stage_residual_defect=1.710435e+04 newton_metric=1.062824e+05 newton_tol=4.770583e-04 theta=0.000000e+00 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=1 fraction=1.0e-04 fd_norm=1.708901e+03 matrix_norm=1.529511e+03 relative_error=2.390923e-01 cosine=9.742211e-01
+[radau-solver] iter=2 delta_norm=2.282947e+00 residual_norm=3.486845e+02 stage_residual_defect=9.362520e+03 newton_metric=5.563538e+03 newton_tol=4.770583e-04 theta=2.041130e-01 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=2 fraction=1.0e-04 fd_norm=4.885064e+02 matrix_norm=3.486845e+02 relative_error=3.131206e-01 cosine=9.887074e-01
+[radau-solver] iter=3 delta_norm=4.946705e-01 residual_norm=1.690115e+02 stage_residual_defect=5.228779e+03 newton_metric=1.573887e+03 newton_tol=4.770583e-04 theta=2.255148e-01 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=3 fraction=1.0e-04 fd_norm=2.275839e+02 matrix_norm=1.690115e+02 relative_error=2.594905e-01 cosine=9.992607e-01
+[radau-solver] iter=4 delta_norm=1.037264e-01 residual_norm=5.617642e+01 stage_residual_defect=1.753893e+03 newton_metric=3.679588e+02 newton_tol=4.770583e-04 theta=2.349877e-01 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=4 fraction=1.0e-04 fd_norm=6.957756e+01 matrix_norm=5.617642e+01 relative_error=1.932093e-01 cosine=9.998561e-01
+[radau-solver] iter=5 delta_norm=1.835862e-02 residual_norm=1.371338e+01 stage_residual_defect=4.286470e+02 newton_metric=5.517244e+01 newton_tol=4.770583e-04 theta=2.012662e-01 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=5 fraction=1.0e-04 fd_norm=1.692529e+01 matrix_norm=1.371338e+01 relative_error=1.901301e-01 cosine=9.999155e-01
+[radau-solver] iter=6 delta_norm=3.253736e-03 residual_norm=3.202761e+00 stage_residual_defect=1.001599e+02 newton_metric=9.320414e+00 newton_tol=4.770583e-04 theta=1.850865e-01 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=6 fraction=1.0e-04 fd_norm=3.856416e+00 matrix_norm=3.202761e+00 relative_error=1.697458e-01 cosine=9.999494e-01
+[radau-solver] iter=7 delta_norm=4.925008e-04 residual_norm=6.553663e-01 stage_residual_defect=2.049796e+01 newton_metric=1.281670e+00 newton_tol=4.770583e-04 theta=1.694091e-01 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=7 fraction=1.0e-04 fd_norm=7.875706e-01 matrix_norm=6.553663e-01 relative_error=1.680141e-01 cosine=9.999696e-01
+[radau-solver] iter=8 delta_norm=8.151827e-05 residual_norm=1.322455e-01 stage_residual_defect=4.136551e+00 newton_metric=2.229130e-01 newton_tol=4.770583e-04 theta=1.654995e-01 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=8 fraction=1.0e-04 fd_norm=1.569726e-01 matrix_norm=1.322455e-01 relative_error=1.576288e-01 cosine=9.999806e-01
+[radau-solver] iter=9 delta_norm=1.117856e-05 residual_norm=2.480363e-02 stage_residual_defect=7.758581e-01 newton_metric=2.957810e-02 newton_tol=4.770583e-04 theta=1.582380e-01 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=9 fraction=1.0e-04 fd_norm=2.943494e-02 matrix_norm=2.480363e-02 relative_error=1.574147e-01 cosine=9.999861e-01
+[radau-solver] iter=10 delta_norm=1.886670e-06 residual_norm=4.662927e-03 stage_residual_defect=1.458585e-01 newton_metric=5.662178e-03 newton_tol=4.770583e-04 theta=1.616403e-01 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=10 fraction=1.0e-04 fd_norm=5.568168e-03 matrix_norm=4.662927e-03 relative_error=1.627058e-01 cosine=9.999744e-01
+[radau-solver] iter=11 delta_norm=2.501058e-07 residual_norm=8.380358e-04 stage_residual_defect=2.621426e-02 newton_metric=7.957979e-04 newton_tol=4.770583e-04 theta=1.618427e-01 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=11 fraction=1.0e-04 fd_norm=1.041044e-03 matrix_norm=8.380358e-04 relative_error=2.058186e-01 cosine=9.973078e-01
+[radau-solver] iter=12 delta_norm=4.603803e-08 residual_norm=1.520461e-04 stage_residual_defect=4.756110e-03 newton_metric=1.654800e-04 newton_tol=4.770583e-04 theta=1.674062e-01 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=12 fraction=1.0e-04 fd_norm=1.905422e-04 matrix_norm=1.520461e-04 relative_error=2.444167e-01 cosine=9.881438e-01
+[radau-solver] final_stage_residual_defect=8.383122e-04
+[radau-solver] final iter=12 converged=True diverged=False finite_initial_residual=True nonfinite_stage_state=False nonfinite_stage_residual=False residual_norm=2.679964e-05 delta_norm=4.603803e-08 newton_metric=1.654800e-04 newton_tol=4.770583e-04 theta=1.674062e-01 slow=False blowup=False newton_nonfinite=False
+[radau-solver] attempt t_start=5.311999e-01 dt_try=1.038606e-01 accepted=True failed=False fail_code=0 converged=True err_norm=6.122747e-03 growth=1.405674e+00 next_dt=1.459942e-01 stagnation_accepted=False stagnation_defect_norm=0.000000e+00 lagged_reused=False jacobian_reused=False
+[debug-walltime] radau.attempt #364 elapsed_s=0.114125
+[radau-solver] iter=1 delta_norm=1.333734e+01 residual_norm=2.080856e+03 stage_residual_defect=3.237981e+04 newton_metric=9.504516e+04 newton_tol=4.770583e-04 theta=0.000000e+00 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=1 fraction=1.0e-04 fd_norm=2.121027e+03 matrix_norm=2.080856e+03 relative_error=9.608165e-02 cosine=9.954779e-01
+[radau-solver] iter=2 delta_norm=8.150220e-01 residual_norm=1.890854e+02 stage_residual_defect=3.438446e+03 newton_metric=5.491081e+02 newton_tol=4.770583e-04 theta=7.317501e-02 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=2 fraction=1.0e-04 fd_norm=1.950313e+02 matrix_norm=1.890854e+02 relative_error=3.537569e-01 cosine=9.359398e-01
+[radau-solver] iter=3 delta_norm=8.840731e-02 residual_norm=6.793717e+01 stage_residual_defect=2.852459e+03 newton_metric=9.297297e+01 newton_tol=4.770583e-04 theta=9.598445e-02 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=3 fraction=1.0e-04 fd_norm=8.663793e+01 matrix_norm=6.793717e+01 relative_error=2.200365e-01 cosine=9.988363e-01
+[radau-solver] iter=4 delta_norm=1.114716e-02 residual_norm=1.870663e+01 stage_residual_defect=7.998965e+02 newton_metric=1.437811e+01 newton_tol=4.770583e-04 theta=1.219842e-01 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=4 fraction=1.0e-04 fd_norm=2.225783e+01 matrix_norm=1.870663e+01 relative_error=1.604540e-01 cosine=9.998276e-01
+[radau-solver] iter=5 delta_norm=1.604674e-03 residual_norm=3.593198e+00 stage_residual_defect=1.537889e+02 newton_metric=1.386721e+00 newton_tol=4.770583e-04 theta=1.120344e-01 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=5 fraction=1.0e-04 fd_norm=4.204334e+00 matrix_norm=3.593198e+00 relative_error=1.457592e-01 cosine=9.999318e-01
+[radau-solver] iter=6 delta_norm=2.708649e-04 residual_norm=6.120040e-01 stage_residual_defect=2.619896e+01 newton_metric=1.578510e-01 newton_tol=4.770583e-04 theta=1.106961e-01 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=6 fraction=1.0e-04 fd_norm=7.064416e-01 matrix_norm=6.120040e-01 relative_error=1.339397e-01 cosine=9.999600e-01
+[radau-solver] iter=7 delta_norm=4.773685e-05 residual_norm=9.459636e-02 stage_residual_defect=4.049528e+00 newton_metric=2.265585e-02 newton_tol=4.770583e-04 theta=1.218713e-01 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=7 fraction=1.0e-04 fd_norm=1.086410e-01 matrix_norm=9.459636e-02 relative_error=1.294773e-01 cosine=9.999701e-01
+[radau-solver] iter=8 delta_norm=8.431281e-06 residual_norm=1.408237e-02 stage_residual_defect=6.028294e-01 newton_metric=3.824261e-03 newton_tol=4.770583e-04 theta=1.375234e-01 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=8 fraction=1.0e-04 fd_norm=1.623789e-02 matrix_norm=1.408237e-02 relative_error=1.328469e-01 cosine=9.999846e-01
+[radau-solver] iter=9 delta_norm=1.473386e-06 residual_norm=2.041063e-03 stage_residual_defect=8.736792e-02 newton_metric=6.455029e-04 newton_tol=4.770583e-04 theta=1.498051e-01 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=9 fraction=1.0e-04 fd_norm=2.346818e-03 matrix_norm=2.041063e-03 relative_error=1.346306e-01 cosine=9.993381e-01
+[radau-solver] iter=10 delta_norm=2.545238e-07 residual_norm=2.927982e-04 stage_residual_defect=1.253240e-02 newton_metric=1.051211e-04 newton_tol=4.770583e-04 theta=1.547349e-01 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=10 fraction=1.0e-04 fd_norm=4.353007e-04 matrix_norm=2.927982e-04 relative_error=3.616852e-01 cosine=9.824214e-01
+[radau-solver] final_stage_residual_defect=1.785656e-03
+[radau-solver] final iter=10 converged=True diverged=False finite_initial_residual=True nonfinite_stage_state=False nonfinite_stage_residual=False residual_norm=4.172249e-05 delta_norm=2.545238e-07 newton_metric=1.051211e-04 newton_tol=4.770583e-04 theta=1.547349e-01 slow=False blowup=False newton_nonfinite=False
+[radau-solver] attempt t_start=6.350605e-01 dt_try=1.459942e-01 accepted=True failed=False fail_code=0 converged=True err_norm=1.930716e-03 growth=1.555042e+00 next_dt=2.270271e-01 stagnation_accepted=False stagnation_defect_norm=0.000000e+00 lagged_reused=False jacobian_reused=False
+[debug-walltime] radau.attempt #365 elapsed_s=0.099425
+[radau-solver] iter=1 delta_norm=1.246037e+01 residual_norm=3.884373e+03 stage_residual_defect=9.469051e+04 newton_metric=9.189942e+04 newton_tol=4.770583e-04 theta=0.000000e+00 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=1 fraction=1.0e-04 fd_norm=3.948369e+03 matrix_norm=3.884373e+03 relative_error=6.547751e-02 cosine=9.979545e-01
+[radau-solver] iter=2 delta_norm=6.591321e-01 residual_norm=2.444638e+02 stage_residual_defect=8.215571e+03 newton_metric=7.099736e+01 newton_tol=4.770583e-04 theta=2.741128e-02 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=2 fraction=1.0e-04 fd_norm=2.411542e+02 matrix_norm=2.444638e+02 relative_error=1.219909e-01 cosine=9.927527e-01
+[radau-solver] iter=3 delta_norm=1.094906e-01 residual_norm=2.817370e+01 stage_residual_defect=1.338120e+03 newton_metric=8.688787e+00 newton_tol=4.770583e-04 theta=4.486460e-02 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=3 fraction=1.0e-04 fd_norm=3.435405e+01 matrix_norm=2.817370e+01 relative_error=2.005955e-01 cosine=9.951994e-01
+[radau-solver] iter=4 delta_norm=2.058034e-02 residual_norm=6.883294e+00 stage_residual_defect=4.105427e+02 newton_metric=2.559242e+00 newton_tol=4.770583e-04 theta=9.716126e-02 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=4 fraction=1.0e-04 fd_norm=8.094061e+00 matrix_norm=6.883294e+00 relative_error=1.504500e-01 cosine=9.998478e-01
+[radau-solver] iter=5 delta_norm=3.743129e-03 residual_norm=1.219442e+00 stage_residual_defect=7.354670e+01 newton_metric=6.635327e-01 newton_tol=4.770583e-04 theta=1.452745e-01 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=5 fraction=1.0e-04 fd_norm=1.413104e+00 matrix_norm=1.219442e+00 relative_error=1.375510e-01 cosine=9.999199e-01
+[radau-solver] iter=6 delta_norm=6.680225e-04 residual_norm=1.944085e-01 stage_residual_defect=1.178168e+01 newton_metric=1.400663e-01 newton_tol=4.770583e-04 theta=1.697359e-01 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=6 fraction=1.0e-04 fd_norm=2.254467e-01 matrix_norm=1.944085e-01 relative_error=1.379802e-01 cosine=9.999511e-01
+[radau-solver] iter=7 delta_norm=1.168790e-04 residual_norm=3.097968e-02 stage_residual_defect=1.880943e+00 newton_metric=2.499825e-02 newton_tol=4.770583e-04 theta=1.742176e-01 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=7 fraction=1.0e-04 fd_norm=3.586217e-02 matrix_norm=3.097968e-02 relative_error=1.363801e-01 cosine=9.999630e-01
+[radau-solver] iter=8 delta_norm=2.012574e-05 residual_norm=4.909168e-03 stage_residual_defect=2.989584e-01 newton_metric=4.252502e-03 newton_tol=4.770583e-04 theta=1.725333e-01 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=8 fraction=1.0e-04 fd_norm=5.755088e-03 matrix_norm=4.909168e-03 relative_error=1.473717e-01 cosine=9.999335e-01
+[radau-solver] iter=9 delta_norm=3.417955e-06 residual_norm=7.722500e-04 stage_residual_defect=4.712124e-02 newton_metric=7.158901e-04 newton_tol=4.770583e-04 theta=1.710896e-01 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=9 fraction=1.0e-04 fd_norm=9.284045e-04 matrix_norm=7.722500e-04 relative_error=1.731657e-01 cosine=9.989804e-01
+[radau-solver] iter=10 delta_norm=5.734493e-07 residual_norm=1.209367e-04 stage_residual_defect=7.393989e-03 newton_metric=1.183876e-04 newton_tol=4.770583e-04 theta=1.689666e-01 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=10 fraction=1.0e-04 fd_norm=9.252393e-05 matrix_norm=1.209367e-04 relative_error=1.082401e+00 cosine=5.879041e-01
+[radau-solver] final_stage_residual_defect=1.158814e-03
+[radau-solver] final iter=10 converged=True diverged=False finite_initial_residual=True nonfinite_stage_state=False nonfinite_stage_residual=False residual_norm=1.891514e-05 delta_norm=5.734493e-07 newton_metric=1.183876e-04 newton_tol=4.770583e-04 theta=1.689666e-01 slow=False blowup=False newton_nonfinite=False
+[radau-solver] attempt t_start=7.810547e-01 dt_try=2.270271e-01 accepted=True failed=False fail_code=0 converged=True err_norm=4.569891e-03 growth=1.442118e+00 next_dt=3.273999e-01 stagnation_accepted=False stagnation_defect_norm=0.000000e+00 lagged_reused=False jacobian_reused=False
+[debug-walltime] radau.attempt #366 elapsed_s=0.099009
+[radau-solver] iter=1 delta_norm=1.165175e+01 residual_norm=5.774815e+03 stage_residual_defect=1.953629e+05 newton_metric=9.882971e+04 newton_tol=4.770583e-04 theta=0.000000e+00 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=1 fraction=1.0e-04 fd_norm=6.091616e+03 matrix_norm=5.774815e+03 relative_error=7.228921e-02 cosine=9.986703e-01
+[radau-solver] iter=2 delta_norm=8.718515e-01 residual_norm=5.007997e+02 stage_residual_defect=1.824942e+04 newton_metric=7.526819e+01 newton_tol=4.770583e-04 theta=2.721884e-02 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=2 fraction=1.0e-04 fd_norm=5.594064e+02 matrix_norm=5.007997e+02 relative_error=1.162220e-01 cosine=9.985860e-01
+[radau-solver] iter=3 delta_norm=1.287421e-01 residual_norm=6.463262e+01 stage_residual_defect=2.637516e+03 newton_metric=9.765243e+00 newton_tol=4.770583e-04 theta=4.551847e-02 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=3 fraction=1.0e-04 fd_norm=7.254108e+01 matrix_norm=6.463262e+01 relative_error=1.136698e-01 cosine=9.994190e-01
+[radau-solver] iter=4 delta_norm=2.102968e-02 residual_norm=8.256747e+00 stage_residual_defect=3.284555e+02 newton_metric=3.320045e+00 newton_tol=4.770583e-04 theta=1.034324e-01 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=4 fraction=1.0e-04 fd_norm=9.357317e+00 matrix_norm=8.256747e+00 relative_error=1.216173e-01 cosine=9.994576e-01
+[radau-solver] iter=5 delta_norm=3.229133e-03 residual_norm=1.137749e+00 stage_residual_defect=4.640498e+01 newton_metric=6.428645e-01 newton_tol=4.770583e-04 theta=1.392853e-01 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=5 fraction=1.0e-04 fd_norm=1.287042e+00 matrix_norm=1.137749e+00 relative_error=1.187037e-01 cosine=9.996406e-01
+[radau-solver] iter=6 delta_norm=4.729584e-04 residual_norm=1.527870e-01 stage_residual_defect=6.476887e+00 newton_metric=7.674538e-02 newton_tol=4.770583e-04 theta=1.322683e-01 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=6 fraction=1.0e-04 fd_norm=1.732572e-01 matrix_norm=1.527870e-01 relative_error=1.198936e-01 cosine=9.997646e-01
+[radau-solver] iter=7 delta_norm=6.711533e-05 residual_norm=2.076930e-02 stage_residual_defect=9.200872e-01 newton_metric=1.126877e-02 newton_tol=4.770583e-04 theta=1.348836e-01 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=7 fraction=1.0e-04 fd_norm=2.348772e-02 matrix_norm=2.076930e-02 relative_error=1.166706e-01 cosine=9.998774e-01
+[radau-solver] iter=8 delta_norm=9.260867e-06 residual_norm=2.748099e-03 stage_residual_defect=1.254513e-01 newton_metric=1.546596e-03 newton_tol=4.770583e-04 theta=1.383287e-01 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=8 fraction=1.0e-04 fd_norm=3.106575e-03 matrix_norm=2.748099e-03 relative_error=1.271008e-01 cosine=9.983952e-01
+[radau-solver] iter=9 delta_norm=1.249012e-06 residual_norm=3.556090e-04 stage_residual_defect=1.661819e-02 newton_metric=2.044337e-04 newton_tol=4.770583e-04 theta=1.347614e-01 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=9 fraction=1.0e-04 fd_norm=4.023884e-04 matrix_norm=3.556090e-04 relative_error=2.591817e-01 cosine=9.696405e-01
+[radau-solver] final_stage_residual_defect=2.127744e-03
+[radau-solver] final iter=9 converged=True diverged=False finite_initial_residual=True nonfinite_stage_state=False nonfinite_stage_residual=False residual_norm=4.468807e-05 delta_norm=1.249012e-06 newton_metric=2.044337e-04 newton_tol=4.770583e-04 theta=1.347614e-01 slow=False blowup=False newton_nonfinite=False
+[radau-solver] attempt t_start=1.008082e+00 dt_try=3.273999e-01 accepted=True failed=False fail_code=0 converged=True err_norm=8.561059e-03 growth=1.365043e+00 next_dt=4.469149e-01 stagnation_accepted=False stagnation_defect_norm=0.000000e+00 lagged_reused=False jacobian_reused=False
+[debug-walltime] radau.attempt #367 elapsed_s=0.091642
+[radau-solver] iter=1 delta_norm=1.132766e+01 residual_norm=7.316557e+03 stage_residual_defect=3.065722e+05 newton_metric=1.059370e+05 newton_tol=4.770583e-04 theta=0.000000e+00 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=1 fraction=1.0e-04 fd_norm=8.054089e+03 matrix_norm=7.316557e+03 relative_error=1.080042e-01 cosine=9.981950e-01
+[radau-solver] iter=2 delta_norm=9.589866e-01 residual_norm=9.297670e+02 stage_residual_defect=4.878758e+04 newton_metric=8.693915e+01 newton_tol=4.770583e-04 theta=2.823991e-02 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=2 fraction=1.0e-04 fd_norm=1.043335e+03 matrix_norm=9.297670e+02 relative_error=1.207352e-01 cosine=9.984691e-01
+[radau-solver] iter=3 delta_norm=1.201274e-01 residual_norm=1.245025e+02 stage_residual_defect=5.966576e+03 newton_metric=1.245532e+01 newton_tol=4.770583e-04 theta=4.818951e-02 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=3 fraction=1.0e-04 fd_norm=1.411641e+02 matrix_norm=1.245025e+02 relative_error=1.287390e-01 cosine=9.985019e-01
+[radau-solver] iter=4 delta_norm=2.267204e-02 residual_norm=1.820331e+01 stage_residual_defect=6.961079e+02 newton_metric=4.376800e+00 newton_tol=4.770583e-04 theta=1.092288e-01 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=4 fraction=1.0e-04 fd_norm=2.124375e+01 matrix_norm=1.820331e+01 relative_error=1.510603e-01 cosine=9.986372e-01
+[radau-solver] iter=5 delta_norm=5.891315e-03 residual_norm=3.208274e+00 stage_residual_defect=1.114792e+02 newton_metric=5.384557e+00 newton_tol=4.770583e-04 theta=2.537261e-01 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=5 fraction=1.0e-04 fd_norm=3.832507e+00 matrix_norm=3.208274e+00 relative_error=1.696883e-01 cosine=9.986473e-01
+[radau-solver] iter=6 delta_norm=1.600876e-03 residual_norm=6.503246e-01 stage_residual_defect=3.108310e+01 newton_metric=8.449635e-01 newton_tol=4.770583e-04 theta=2.597436e-01 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=6 fraction=1.0e-04 fd_norm=7.945076e-01 matrix_norm=6.503246e-01 relative_error=1.882516e-01 cosine=9.984694e-01
+[radau-solver] iter=7 delta_norm=4.360911e-04 residual_norm=1.496000e-01 stage_residual_defect=1.035250e+01 newton_metric=3.060251e-01 newton_tol=4.770583e-04 theta=2.444106e-01 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=7 fraction=1.0e-04 fd_norm=1.882362e-01 matrix_norm=1.496000e-01 relative_error=2.123187e-01 cosine=9.981441e-01
+[radau-solver] iter=8 delta_norm=1.162209e-04 residual_norm=4.013249e-02 stage_residual_defect=3.628325e+00 newton_metric=1.090443e-01 newton_tol=4.770583e-04 theta=3.143060e-01 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=8 fraction=1.0e-04 fd_norm=5.163867e-02 matrix_norm=4.013249e-02 relative_error=2.269779e-01 cosine=9.987971e-01
+[radau-solver] iter=9 delta_norm=3.077705e-05 residual_norm=1.192776e-02 stage_residual_defect=1.235111e+00 newton_metric=3.296546e-02 newton_tol=4.770583e-04 theta=2.912168e-01 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=9 fraction=1.0e-04 fd_norm=1.553691e-02 matrix_norm=1.192776e-02 relative_error=2.344198e-01 cosine=9.993542e-01
+[radau-solver] iter=10 delta_norm=8.052051e-06 residual_norm=3.768794e-03 stage_residual_defect=4.164802e-01 newton_metric=1.089856e-02 newton_tol=4.770583e-04 theta=3.153665e-01 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=10 fraction=1.0e-04 fd_norm=5.125696e-03 matrix_norm=3.768794e-03 relative_error=2.679348e-01 cosine=9.988375e-01
+[radau-solver] iter=11 delta_norm=2.096568e-06 residual_norm=1.217104e-03 stage_residual_defect=1.385815e-01 newton_metric=3.352161e-03 newton_tol=4.770583e-04 theta=3.070589e-01 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=11 fraction=1.0e-04 fd_norm=1.615104e-03 matrix_norm=1.217104e-03 relative_error=2.615945e-01 cosine=9.948864e-01
+[radau-solver] iter=12 delta_norm=5.423762e-07 residual_norm=3.966404e-04 stage_residual_defect=4.580516e-02 newton_metric=1.075356e-03 newton_tol=4.770583e-04 theta=3.146437e-01 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=12 fraction=1.0e-04 fd_norm=5.063714e-04 matrix_norm=3.966404e-04 relative_error=5.434457e-01 cosine=8.414565e-01
+[radau-solver] iter=13 delta_norm=1.401342e-07 residual_norm=1.293843e-04 stage_residual_defect=1.504419e-02 newton_metric=3.369464e-04 newton_tol=4.770583e-04 theta=3.128092e-01 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=13 fraction=1.0e-04 fd_norm=1.809944e-04 matrix_norm=1.293843e-04 relative_error=7.554890e-01 cosine=6.576534e-01
+[radau-solver] final_stage_residual_defect=4.920741e-03
+[radau-solver] final iter=13 converged=True diverged=False finite_initial_residual=True nonfinite_stage_state=False nonfinite_stage_residual=False residual_norm=4.217567e-05 delta_norm=1.401342e-07 newton_metric=3.369464e-04 newton_tol=4.770583e-04 theta=3.128092e-01 slow=False blowup=False newton_nonfinite=False
+[radau-solver] attempt t_start=1.335482e+00 dt_try=4.469149e-01 accepted=True failed=False fail_code=0 converged=True err_norm=1.178062e-02 growth=1.327441e+00 next_dt=5.932533e-01 stagnation_accepted=False stagnation_defect_norm=0.000000e+00 lagged_reused=False jacobian_reused=False
+[debug-walltime] radau.attempt #368 elapsed_s=0.121205
+[radau-solver] iter=1 delta_norm=6.764612e+00 residual_norm=2.354631e+03 stage_residual_defect=4.411094e+04 newton_metric=9.802172e+04 newton_tol=4.770583e-04 theta=0.000000e+00 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=1 fraction=1.0e-04 fd_norm=2.437646e+03 matrix_norm=2.354631e+03 relative_error=3.867971e-02 cosine=9.998259e-01
+[radau-solver] iter=2 delta_norm=1.446111e-01 residual_norm=9.331241e+01 stage_residual_defect=2.471731e+03 newton_metric=1.066122e+01 newton_tol=4.770583e-04 theta=1.037475e-02 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=2 fraction=1.0e-04 fd_norm=9.726464e+01 matrix_norm=9.331241e+01 relative_error=4.580475e-02 cosine=9.997671e-01
+[radau-solver] iter=3 delta_norm=1.131214e-02 residual_norm=4.461141e+00 stage_residual_defect=1.365572e+02 newton_metric=3.350858e+00 newton_tol=4.770583e-04 theta=3.210363e-02 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=3 fraction=1.0e-04 fd_norm=4.713557e+00 matrix_norm=4.461141e+00 relative_error=6.563627e-02 cosine=9.992391e-01
+[radau-solver] iter=4 delta_norm=1.310595e-03 residual_norm=3.088201e-01 stage_residual_defect=1.277722e+01 newton_metric=2.241003e+00 newton_tol=4.770583e-04 theta=1.244900e-01 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=4 fraction=1.0e-04 fd_norm=3.421178e-01 matrix_norm=3.088201e-01 relative_error=1.108508e-01 cosine=9.984407e-01
+[radau-solver] iter=5 delta_norm=1.661581e-04 residual_norm=3.806406e-02 stage_residual_defect=1.940475e+00 newton_metric=4.374022e-01 newton_tol=4.770583e-04 theta=1.541403e-01 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=5 fraction=1.0e-04 fd_norm=4.354402e-02 matrix_norm=3.806406e-02 relative_error=1.294305e-01 cosine=9.994770e-01
+[radau-solver] iter=6 delta_norm=2.249041e-05 residual_norm=5.589754e-03 stage_residual_defect=2.995688e-01 newton_metric=6.550195e-02 newton_tol=4.770583e-04 theta=1.521708e-01 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=6 fraction=1.0e-04 fd_norm=6.365970e-03 matrix_norm=5.589754e-03 relative_error=1.325192e-01 cosine=9.984660e-01
+[radau-solver] iter=7 delta_norm=3.229781e-06 residual_norm=8.298655e-04 stage_residual_defect=4.506294e-02 newton_metric=1.003600e-02 newton_tol=4.770583e-04 theta=1.524589e-01 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=7 fraction=1.0e-04 fd_norm=1.060855e-03 matrix_norm=8.298655e-04 relative_error=3.378269e-01 cosine=9.573564e-01
+[radau-solver] iter=8 delta_norm=4.731523e-07 residual_norm=1.213653e-04 stage_residual_defect=6.619225e-03 newton_metric=1.514708e-03 newton_tol=4.770583e-04 theta=1.521060e-01 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=8 fraction=1.0e-04 fd_norm=1.322599e-04 matrix_norm=1.213653e-04 relative_error=1.005631e+00 cosine=4.526596e-01
+[radau-solver] iter=9 delta_norm=6.975846e-08 residual_norm=1.758782e-05 stage_residual_defect=9.608977e-04 newton_metric=2.255638e-04 newton_tol=4.770583e-04 theta=1.508554e-01 slow=False blowup=False nonfinite=False diverged=False
+[radau-stage-direction-audit] iter=9 fraction=1.0e-04 fd_norm=2.055924e-04 matrix_norm=1.758782e-05 relative_error=1.051960e+00 cosine=-5.803963e-01
+[radau-solver] final_stage_residual_defect=1.391151e-04
+[radau-solver] final iter=9 converged=True diverged=False finite_initial_residual=True nonfinite_stage_state=False nonfinite_stage_residual=False residual_norm=2.544324e-06 delta_norm=6.975846e-08 newton_metric=2.255638e-04 newton_tol=4.770583e-04 theta=1.508554e-01 slow=False blowup=False newton_nonfinite=False
+[radau-solver] attempt t_start=1.782397e+00 dt_try=5.932533e-01 accepted=True failed=False fail_code=0 converged=True err_norm=1.247538e-02 growth=1.320802e+00 next_dt=2.874111e-01 stagnation_accepted=False stagnation_defect_norm=0.000000e+00 lagged_reused=False jacobian_reused=False
+[debug-walltime] radau.attempt #369 elapsed_s=0.091910
+[NEOPAX] solver timing: host_return_elapsed_s=292.670 synchronized_elapsed_s=292.680 device_tail_s=0.010
+[NEOPAX] solver step summary: accepted_saved=10/10 n_steps=217 failed_any=False done=True failed=False fail_code=0 final_time=2.000000e+00
+[NEOPAX] solver.solve(...) returned
+wrote /home/exouser/NEOPAX/outputs/geometry_qi_max_er_transition_bootstrap_net_power_initial_root_database_full_transport_optimization/optimized/transport/bootstrap_current_evolution.csv
+wrote /home/exouser/NEOPAX/outputs/geometry_qi_max_er_transition_bootstrap_net_power_initial_root_database_full_transport_optimization/optimized/transport/bootstrap_current_evolution.png
+[transport-report] wrote usual transport outputs in /home/exouser/NEOPAX/outputs/geometry_qi_max_er_transition_bootstrap_net_power_initial_root_database_full_transport_optimization/optimized/transport
+(jax_env) exouser@neopax-22:~/NEOPAX$ 

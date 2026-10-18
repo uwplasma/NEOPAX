@@ -2,6 +2,48 @@ import ast
 from pathlib import Path
 
 import numpy as np
+import pytest
+
+
+def test_reverse_accepted_step_cap_reaches_combined_problem(monkeypatch):
+    from examples.optimization import (
+        optimize_geometry_profiles_qi_max_er_transition_bootstrap_net_power_initial_root_database_full_transport_simple_least_squares
+        as example,
+    )
+
+    captured = {}
+    sentinel = object()
+
+    def build_problem(config, terms, **kwargs):
+        captured.update(config=config, kwargs=kwargs)
+        return sentinel
+
+    monkeypatch.setattr(example.opt, "geometry_full_transport_least_squares_problem", build_problem)
+    defaults = example.parser().parse_args(())
+    assert defaults.max_reverse_accepted_steps == 500
+    args = example.parser().parse_args(("--max-reverse-accepted-steps", "900"))
+    config = example.geometry_example.transport_config(args)
+    result = example._build_problem(
+        args, config=config, vmec_input=args.seed_input.resolve(), max_mode=2,
+        physical_pitches=None,
+    )
+    assert result is sentinel
+    assert captured["kwargs"]["max_reverse_accepted_steps"] == 900
+    assert captured["kwargs"]["accepted_step_limit"] is None
+    assert captured["kwargs"]["reverse_segment_length"] == 50
+    assert captured["config"]["transport_solver"]["max_steps"] == 1000
+    assert captured["config"]["transport_solver"]["t_final"] == 2.0
+
+
+@pytest.mark.parametrize("value", ("0", "-1"))
+def test_reverse_accepted_step_cap_rejects_nonpositive_values(value):
+    from examples.optimization import (
+        optimize_geometry_profiles_qi_max_er_transition_bootstrap_net_power_initial_root_database_full_transport_simple_least_squares
+        as example,
+    )
+
+    with pytest.raises(SystemExit):
+        example.parser().parse_args(("--max-reverse-accepted-steps", value))
 
 
 def test_simple_combined_baseline_uses_ess_nominal_delta_coordinates():

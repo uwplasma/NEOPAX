@@ -180,7 +180,7 @@ def _problem_kwargs(args: argparse.Namespace, physical_pitches):
         ),
         "reverse_segment_length": geometry_example.REVERSE_SEGMENT_LENGTH,
         "max_reverse_accepted_steps": (
-            geometry_example.MAX_REVERSE_ACCEPTED_STEPS
+            int(args.max_reverse_accepted_steps)
         ),
         "initial_er_root_ad": "jax_selected_root",
         "er_transition_left_index": int(args.er_transition_left_index),
@@ -526,7 +526,8 @@ def main() -> int:
             f"profile_coordinates={args.profile_coordinate_mode}_nominal "
             "optimizer=scipy_least_squares_TRF "
             f"profile_trust_multiplier={args.profile_trust_multiplier:.8g} "
-            "geometry_trust_multiplier=1",
+            "geometry_trust_multiplier=1 "
+            f"max_reverse_accepted_steps={args.max_reverse_accepted_steps}",
             flush=True,
         )
         initial_evaluation = report("initial", problem, x0)
@@ -597,6 +598,7 @@ def main() -> int:
         "profile_scale_mode": "nominal",
         "profile_coordinate_mode": str(args.profile_coordinate_mode),
         "profile_dofs_enabled": True,
+        "max_reverse_accepted_steps": int(args.max_reverse_accepted_steps),
         "initial_physical_profiles": initial_profiles,
         "optimized_physical_profiles": optimized_profiles,
         "parameter_labels": list(last_problem.parameter_labels),

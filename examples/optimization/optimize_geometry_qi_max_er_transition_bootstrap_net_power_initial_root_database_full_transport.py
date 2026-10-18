@@ -146,11 +146,24 @@ def qi_maxj_backend_settings(physical_pitches=None):
     )
 
 
+def _positive_step_count(value):
+    count = int(value)
+    if count < 1:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return count
+
+
 def parser() -> argparse.ArgumentParser:
     out = argparse.ArgumentParser(description=__doc__)
     out.add_argument("--seed-input", type=Path, default=SEED_INPUT)
     out.add_argument("--out-dir", type=Path, default=OUT_DIR)
     out.add_argument("--max-nfev", type=int, default=NFEV)
+    out.add_argument(
+        "--max-reverse-accepted-steps",
+        type=_positive_step_count,
+        default=MAX_REVERSE_ACCEPTED_STEPS,
+        help="Maximum accepted forward steps permitted in the reverse sweep (default: %(default)s).",
+    )
     out.add_argument("--database-n-theta", type=int, default=DATABASE_N_THETA)
     out.add_argument("--database-n-phi", type=int, default=DATABASE_N_PHI)
     out.add_argument("--database-n-xi", type=int, default=DATABASE_N_XI)
@@ -741,7 +754,7 @@ def main() -> int:
             device=SOLVER_DEVICE,
             accepted_step_limit=FULL_TRANSPORT_ACCEPTED_STEP_LIMIT,
             reverse_segment_length=REVERSE_SEGMENT_LENGTH,
-            max_reverse_accepted_steps=MAX_REVERSE_ACCEPTED_STEPS,
+            max_reverse_accepted_steps=args.max_reverse_accepted_steps,
             initial_er_root_ad="jax_selected_root",
             er_transition_left_index=args.er_transition_left_index,
             er_transition_right_index=args.er_transition_right_index,
@@ -789,7 +802,7 @@ def main() -> int:
             f"t_final={TRANSPORT_FINAL_TIME} max_steps={TRANSPORT_MAX_STEPS} "
             f"accepted_step_limit={FULL_TRANSPORT_ACCEPTED_STEP_LIMIT} "
             f"reverse_segment_length={REVERSE_SEGMENT_LENGTH} "
-            f"max_reverse_accepted_steps={MAX_REVERSE_ACCEPTED_STEPS} "
+            f"max_reverse_accepted_steps={args.max_reverse_accepted_steps} "
             f"print_final_softmax_Er={PRINT_FINAL_SOFTMAX_ER} "
             f"Er_transition_indices=({args.er_transition_left_index},"
             f"{args.er_transition_right_index}) "
@@ -844,7 +857,7 @@ def main() -> int:
         "max_mode_schedule": list(max_mode_schedule),
         "accepted_step_limit": FULL_TRANSPORT_ACCEPTED_STEP_LIMIT,
         "reverse_segment_length": REVERSE_SEGMENT_LENGTH,
-        "max_reverse_accepted_steps": MAX_REVERSE_ACCEPTED_STEPS,
+        "max_reverse_accepted_steps": int(args.max_reverse_accepted_steps),
         "parameter_labels": list(last_problem.parameter_labels),
         "x": np.asarray(last_result.x, dtype=float).tolist(),
         "cost": float(last_result.cost),

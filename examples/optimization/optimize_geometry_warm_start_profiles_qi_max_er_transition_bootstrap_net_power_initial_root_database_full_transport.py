@@ -134,7 +134,7 @@ def _geometry_problem_kwargs(args: argparse.Namespace, physical_pitches):
         "device": geometry_example.SOLVER_DEVICE,
         "accepted_step_limit": geometry_example.FULL_TRANSPORT_ACCEPTED_STEP_LIMIT,
         "reverse_segment_length": geometry_example.REVERSE_SEGMENT_LENGTH,
-        "max_reverse_accepted_steps": geometry_example.MAX_REVERSE_ACCEPTED_STEPS,
+        "max_reverse_accepted_steps": int(args.max_reverse_accepted_steps),
         "initial_er_root_ad": "jax_selected_root",
         "er_transition_left_index": int(args.er_transition_left_index),
         "er_transition_right_index": int(args.er_transition_right_index),
@@ -657,6 +657,7 @@ def main() -> int:
     warm_cost_difference = float(combined_initial_cost) - geometry_warm_cost
     summary = {
         "method": "geometry_warm_start_then_combined_scipy_least_squares_TRF",
+        "max_reverse_accepted_steps": int(args.max_reverse_accepted_steps),
         "seed_input": str(seed_input),
         "transport_config": str(geometry_example.TRANSPORT_CONFIG),
         "database_grid": [

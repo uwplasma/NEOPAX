@@ -28,6 +28,21 @@ applies the original forward rebuild decisions, checks reconstructed Newton
 solves and compares segment endpoints with adaptive checkpoints. Rejected
 transport attempts are not replayed or differentiated.
 
+The recorded metadata forces forward rebuilds; it does not retain complete
+Jacobian/LU provenance across skipped rejected attempts. A later
+[scalar audit](probe_recorded_replay_lu_provenance_2026-10-17.py) demonstrates
+different Newton iteration counts and LU factors despite converged endpoints
+agreeing to roundoff. This mode is therefore not proof of exact forward
+Newton-setup reconstruction, nor does that scalar finding establish a wrong
+transport derivative or the cause of the optimizer regression.
+
+The scalar probe also checks the production `block` adjoint: internal stage
+states agree within `8.77e-15`, and forward/replay implicit derivatives are
+both `0.8351031779295103`, equal to the Radau IIA stability-function reference.
+Changing only the cached Newton matrices leaves this derivative unchanged.
+Different reconstruction iteration counts therefore do not invalidate an
+implicit accepted-step gradient when the same stage solution is reached.
+
 Both choices retain the same benchmark root, bootstrap, geometry and reverse
 implementations. No production optimization stage factories are substituted.
 The forward solver's separate `--radau-jacobian-reuse-mode legacy` setting is
@@ -95,13 +110,21 @@ benchmark routing, report checks and tiny synthetic replay equations; no local
 VMEC, NTX or full transport evaluation is required. The two lightweight test
 files `test_reverse_benchmark_root_objectives.py` and
 `test_checked_primal_replay.py` cover the selector, unchanged stage wiring,
-filtering accepted decisions, and invalid reconstruction. No GPU result for
-the recorded-forward benchmark has been supplied yet.
+filtering accepted decisions, and invalid reconstruction.
 
 Validation: those two files pass 17 tests and 33 subtests; four existing
 mocked geometry-scaling/stage and tiny replay-cache checks also pass. The
 broader stage-switching proposal was removed before any remote run: the
 final option only changes replay Jacobian reuse and its validity checks.
+
+The user has now supplied a successful recorded-forward GPU run: all 144 AD
+entries are finite, and all four replay endpoints match exactly. Across 88
+transport derivatives, the largest change from the archived AD is
+`4.217200e-7` relative. QI/MaxJ geometry-only rows differ with their baseline
+values after the intervening Boozer-context correction; they are not a
+replay-only comparison against the older archive. See the
+[new AD/AD and AD/FD tables](../../reverse_ad_vs_fd_database.md#2026-10-17-recorded-forward-replay-ad-compared-with-the-archived-ad-and-fd)
+for all saved values and the limits of this 16-step check.
 
 ## Matching 16-step FD command
 

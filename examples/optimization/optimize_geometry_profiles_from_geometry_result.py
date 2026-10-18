@@ -470,6 +470,7 @@ def main():
         "cost": float(result.cost), "nfev": int(result.nfev),
         "status": int(result.status), "message": str(result.message),
         "optimization_mode": "profiles_only" if args.profile_only else "geometry_and_profiles",
+        "max_reverse_accepted_steps": int(args.max_reverse_accepted_steps),
         "full_parameter_labels": list(full_labels), "full_x0": full_x0.tolist(),
         "full_x": (problem.full_parameters(result.x) if args.profile_only else np.asarray(result.x)).tolist(),
         "initial_physical_profiles": initial_profiles,

@@ -1,5 +1,113 @@
 # Database reverse AD versus FD status
 
+## 2026-10-17 Recorded-forward replay: AD compared with the archived AD and FD
+
+The user reran the same 16-accepted-step, four-step-segment AD benchmark with
+`--reverse-replay-jacobian-reuse-mode recorded_forward`. The execution banner
+and `/usr/bin/time` footer confirm the selector; the pasted command header is
+truncated. The run exits successfully, all 18 residuals and 144 Jacobian
+entries are finite, and all four replay endpoint differences are exactly zero.
+Root/bootstrap/geometry stage implementations remain on the benchmark path.
+
+Evidence from attachment `1f79a189-8020-4488-8562-6046f2aec52e/Pasted text.txt`,
+23207 bytes, SHA256
+`b771aeb0b3ee1b34ab236608cc93ee0aef246695d039e706b0f4eb6a637d8399`:
+
+- [Raw command and output](docs/benchmarks/database_transition_objectives_ad_recorded_reuse_16x4_2026-10-17.txt).
+- [Full 18-by-8 AD matrix](docs/benchmarks/database_transition_objectives_ad_recorded_reuse_16x4_2026-10-17.csv).
+- [All 144 old/new AD gradient pairs](docs/benchmarks/database_transition_objectives_ad_recorded_reuse_16x4_2026-10-17_vs_previous_ad.csv).
+- [All 18 old/new baseline values](docs/benchmarks/database_transition_objectives_ad_recorded_reuse_16x4_2026-10-17_values.csv).
+- [New AD versus the 88 archived Boozer-aligned FD derivatives](docs/benchmarks/database_transition_objectives_ad_recorded_reuse_16x4_2026-10-17_vs_fd.csv).
+- [Per-objective comparison summary](docs/benchmarks/database_transition_objectives_ad_recorded_reuse_16x4_2026-10-17_summary.csv).
+
+The AD reference is the 2026-10-14 archive; FD is the 2026-10-15 aligned rerun.
+Relative differences below use `abs(a-b) / max(abs(a),abs(b))`, with zero for
+two zero entries. These are fractions, not percentages.
+
+### Transport AD agreement
+
+All 88 transport derivatives retain their signs. Their maximum relative
+old/new AD difference is `4.217200e-7`, for net power versus `RBC:1:0`, whose
+absolute change is only `2.424329e-11`. The largest relative transport
+baseline-value difference is `1.405655e-9`, in crossing strength. This run
+shows no large transport-gradient regression at the 16-step benchmark point.
+
+| Transport objective | Largest relative AD change over eight DoFs | Worst DoF | Largest relative error against archived FD |
+| --- | ---: | --- | ---: |
+| Transition radius | 1.262781e-8 | density_shape_alpha | 1.520333e-4 |
+| Transition location moment | 1.262781e-8 | density_shape_alpha | 1.520333e-4 |
+| Crossing strength | 1.088358e-7 | n0 | 5.968778e-4 |
+| Bootstrap | 1.866250e-9 | ZBS:1:0 | 7.550969e-3 |
+| Net power | 4.217200e-7 | RBC:1:0 | 4.994229e-4 |
+
+Raw geometry-column derivatives of the transport observables:
+
+| Objective | Parameter | Previous AD | Recorded-forward AD |
+| --- | --- | ---: | ---: |
+| Transition radius | RBC:1:0 | -1.1324538116205816e-2 | -1.1324538031763781e-2 |
+| Transition radius | ZBS:1:0 | 1.5717194578232549e-2 | 1.5717194480467933e-2 |
+| Crossing strength | RBC:1:0 | -2.9056647289399873e-1 | -2.9056646374061840e-1 |
+| Crossing strength | ZBS:1:0 | -1.9689043382835039 | -1.9689043731294491 |
+| Bootstrap | RBC:1:0 | -2.1363565358058780 | -2.1363565368732718 |
+| Bootstrap | ZBS:1:0 | -1.2135494721232387 | -1.2135494743880253 |
+| Net power | RBC:1:0 | 5.7486694403498812e-5 | 5.7486670160210472e-5 |
+| Net power | ZBS:1:0 | -6.4216000655884509e-3 | -6.4216000651759362e-3 |
+
+All six profile columns also remain very close to previous AD. Against the
+archived FD, their largest relative error is `1.935835e-6`, in location moment
+versus density_shape_alpha. FD values retain their seven-significant-digit
+console precision; no new FD run is included. The largest geometry-column FD
+discrepancy remains bootstrap versus ZBS, about 0.7551%, essentially unchanged.
+
+The six profile columns account for 66 transport derivatives. All are finite,
+none change sign, and their largest old/new relative change is `1.088358e-7`.
+The following entries are new raw objective derivatives with respect to the
+physical profile parameters, before optimizer scaling/weights. Root radius
+and location moment share the same profile gradients. Net power is the
+volume-average observable in MW/m^3. The last column is the largest change
+over all eleven transport objectives for that profile parameter.
+
+| Profile parameter | Root location | Crossing strength | Bootstrap | Net-power average | Max old/new relative change |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| n0 | -2.633738e-3 | 5.164756e-2 | 1.069766e-1 | 2.414499e-1 | 1.088358e-7 |
+| T0 | 1.528295e-3 | 9.816995e-2 | 1.747940e-1 | 8.101212e-2 | 3.079528e-8 |
+| density_shape_power | -2.112101e-5 | -2.481700e-2 | -1.199931e-2 | 1.001525e-3 | 1.382268e-8 |
+| temperature_shape_power | 4.680457e-3 | -1.042130e-1 | 7.078898e-1 | 2.745039e-1 | 8.406780e-8 |
+| density_shape_alpha | 3.102376e-5 | 6.469676e-2 | 4.157598e-2 | -2.450476e-4 | 2.121844e-8 |
+| temperature_shape_alpha | -2.403953e-3 | 1.257143 | -6.196724e-1 | -3.939094e-1 | 5.839670e-9 |
+
+### Geometry-only QI/MaxJ rows are a different comparison
+
+Five geometry-only rows have exactly the same gradients at printed precision.
+QI and MaxJ differ in both values and derivatives:
+
+| Quantity | Previous AD | New AD |
+| --- | ---: | ---: |
+| QI value | 0.21192029964274445 | 0.21317514754304986 |
+| MaxJ value | 443.87332574094023 | 443.40869398204353 |
+| QI derivative, RBC:1:0 | 5.9392891187371220 | 5.9901615979958933 |
+| QI derivative, ZBS:1:0 | -0.12365550088725286 | -0.13491267708855048 |
+| MaxJ derivative, RBC:1:0 | -3843.1351877650013 | -3795.0708501441404 |
+| MaxJ derivative, ZBS:1:0 | -1920.5082804169942 | -1884.9196385007381 |
+
+The largest normalized changes are 8.3440% for QI and 1.8531% for MaxJ.
+These are not a clean replay-only A/B: the archived AD predates the shared
+geometry-context correction documented in the
+[Boozer audit](docs/benchmarks/database_geometry_fd_context_mismatch_2026-10-15.md).
+That helper also supplies the geometry-only AD context; its implicit sizing
+changed from `(18,18)` to the runtime's automatic `(36,11)` for this input.
+The geometry-only objective branch does not use the transport replay. Its
+different baselines therefore must not be attributed to the replay selector.
+A same-code legacy/recorded comparison would isolate only that selector.
+
+This 16-step result does not resolve the stalled full-time optimization:
+the time horizon, geometry point and configuration differ. The raw log does
+not report how many accepted Newton-rebuild decisions differ between the
+two replay policies. Remote commit/dependency versions are not printed.
+Internal elapsed time is 2824.156 s, wall time 1:01:33, maximum RSS 12397992
+KiB; these are single-run timings/peak memory, not an iteration-memory trend.
+Only log parsing, numerical comparison and file checks were performed locally.
+
 ## 2026-10-15 Boozer-aligned FD rerun: all eight DoFs
 
 The user reran all eight FD parameters after the geometry-context default

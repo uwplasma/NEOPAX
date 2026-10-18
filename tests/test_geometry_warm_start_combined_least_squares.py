@@ -25,6 +25,14 @@ def test_warm_start_parser_uses_two_full_budgets_and_unit_profile_trust():
     assert args.profile_trust_multiplier == 1.0
 
 
+def test_warm_start_passes_requested_reverse_step_cap_to_geometry_phase():
+    example = _example()
+    args = example.parser().parse_args(("--max-reverse-accepted-steps", "900"))
+    kwargs = example._geometry_problem_kwargs(args, None)
+    assert kwargs["max_reverse_accepted_steps"] == 900
+    assert kwargs["accepted_step_limit"] is None
+
+
 def test_warm_start_geometry_phase_has_exact_geometry_only_keyword_bundle():
     example = _example()
     root = Path(__file__).resolve().parents[1]
