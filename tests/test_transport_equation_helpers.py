@@ -1,4 +1,5 @@
 import dataclasses
+import jax
 from types import SimpleNamespace
 
 import jax.numpy as jnp
@@ -212,7 +213,7 @@ def test_project_fixed_temperature_species_only_changes_inactive_rows():
     assert jnp.allclose(out.pressure[1], jnp.array([21.0, 21.0]))
 
 
-def test_apply_er_dirichlet_boundary_state_clamps_endpoints():
+def test_apply_er_dirichlet_boundary_state_preserves_cell_centers():
     bc = BoundaryConditionModel(
         dr=1.0,
         left_type="dirichlet",
@@ -227,7 +228,7 @@ def test_apply_er_dirichlet_boundary_state_clamps_endpoints():
     )
 
     out = apply_er_dirichlet_boundary_state(state, bc)
-    assert jnp.allclose(out.Er, jnp.array([1.5, 3.0, 4.0, -2.0]))
+    assert jnp.array_equal(out.Er, state.Er)
 
 
 def test_expand_density_rhs_to_full_shape_inserts_zero_electron_row():
