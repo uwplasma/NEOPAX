@@ -76,6 +76,15 @@ FD results evaluate a different endpoint and cannot validate this table.
 
 ## Matching full-time FD run
 
+The first full-time FD attempt exposed two implementation gaps: the selected
+contract omitted the recorded forward rebuild mask and marked every replayed
+step as converged unconditionally. It subsequently failed in the bootstrap
+objective with nonfinite Lineax inputs. The
+[FD failure audit and correction](database_transition_full_fd_replay_failure_2026-10-19.md)
+describe the narrowed FD fix. Sync that correction and retry `n0` first before
+launching all eight columns. The actual first failed remote step remains
+unknown from the original traceback.
+
 With `jax_env` active on the GPU machine, the saved
 [eight-parameter loop](run_database_transition_fd_full_t20_2026-10-19.sh) runs:
 

@@ -8,6 +8,12 @@ accepted-replay endpoint checks have exactly zero absolute and scaled
 differences. The 1,000-accepted-step guard did not bind. Full-time FD comparisons
 are pending; the archived 16-step FD numbers evaluate a different endpoint.
 
+The first full-time FD attempt failed before reporting gradients. Its helper
+omitted the recorded forward rebuild decisions and unconditionally marked
+steps converged. The [FD correction and validation scope](docs/benchmarks/database_transition_full_fd_replay_failure_2026-10-19.md)
+are recorded separately; the full-time AD reference is unchanged, and remote
+verification of the corrected FD endpoint is pending.
+
 - [Complete 18-by-8 values and gradients](docs/benchmarks/database_transition_objectives_ad_recorded_reuse_full_t20_2026-10-19.csv).
 - [Run evidence, root/bootstrap/net-power gradient table and FD instructions](docs/benchmarks/database_transition_objectives_ad_recorded_reuse_full_t20_2026-10-19.md).
 - [Full-time FD loop for all eight parameters](docs/benchmarks/run_database_transition_fd_full_t20_2026-10-19.sh).

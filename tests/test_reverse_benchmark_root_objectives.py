@@ -64,7 +64,10 @@ def _fd_namespace():
                     for target in node.targets)
         ) or (
             isinstance(node, ast.FunctionDef)
-            and node.name in {"_objective_vector", "_objectives_on_realtime_geometry_frozen_trace"}
+            and node.name in {
+                "_objective_vector", "_objectives_on_realtime_geometry_frozen_trace",
+                "_tree_all_finite",
+            }
         )
     ]
 
@@ -76,7 +79,7 @@ def _fd_namespace():
         # Other rows include bootstrap/NTX physics, which this test never runs.
         return jnp.asarray(index, dtype=state.Er.dtype)
 
-    namespace.update({"jnp": jnp, "objective_scalar_by_index": terminal_value})
+    namespace.update({"jax": jax, "np": np, "jnp": jnp, "objective_scalar_by_index": terminal_value})
     module = ast.Module(body=[
         ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0),
         *selected,

@@ -119,6 +119,7 @@ def _fd_reverse_frozen_metadata_accepted_rollout(
     endpoint_prepared_rollout,
     trace,
     endpoint_carry0,
+    endpoint_label: str = "endpoint",
 ):
     """FD-only accepted replay with reverse-fixed solver metadata.
 
@@ -130,6 +131,8 @@ def _fd_reverse_frozen_metadata_accepted_rollout(
     and copies its nonphysical carry fields into the perturbed endpoint after
     every step.  Only the endpoint physical state and (when present) the
     lagged-response physical payload are allowed to evolve independently.
+    Both solves honor the recorded forward rebuild mask. Unconverged or
+    nonfinite baseline/endpoint steps stop the replay before any objective.
 
     This helper is intentionally local to the FD benchmark.  It neither
     changes nor wraps the replay functions used by reverse AD or optimization.
@@ -145,6 +148,12 @@ def _fd_reverse_frozen_metadata_accepted_rollout(
     next_regrowth_cooldown = jax.lax.stop_gradient(trace.next_regrowth_cooldown)
     next_easy_growth_streak = jax.lax.stop_gradient(trace.next_easy_growth_streak)
     next_lagged_response_valid = jax.lax.stop_gradient(trace.next_lagged_response_valid)
+    recorded_reuse = getattr(trace, "jacobian_reused", None)
+    if recorded_reuse is None:
+        raise ValueError(
+            "reverse_frozen_metadata FD requires recorded forward Jacobian reuse decisions."
+        )
+    force_jacobian_rebuild = jax.lax.stop_gradient(~jnp.asarray(recorded_reuse, dtype=bool))
 
     def _step_with_trace_metadata(
         prepared_rollout,
@@ -155,8 +164,12 @@ def _fd_reverse_frozen_metadata_accepted_rollout(
         regrowth_cooldown_value,
         easy_growth_streak_value,
         lagged_response_valid_value,
+        rebuild_jacobian,
     ):
-        carry_for_step = dataclasses.replace(carry, dt=dt_value)
+        carry_for_step = dataclasses.replace(
+            carry, dt=dt_value,
+            cache_valid=jnp.logical_and(carry.cache_valid, ~rebuild_jacobian),
+        )
         attempt_context = _RadauAcceptedStepAttemptContext(
             t_final=carry.t + dt_value,
             use_transport_lagged_response=jnp.asarray(
@@ -180,6 +193,12 @@ def _fd_reverse_frozen_metadata_accepted_rollout(
         )
         return next_carry, result
 
+    def _valid_step(result):
+        finite = jnp.asarray(True)
+        for value in jax.tree_util.tree_leaves((result.next_carry, result.stage_history)):
+            finite = finite & jnp.all(jnp.isfinite(value))
+        return jnp.asarray(result.converged) & finite
+
     def _endpoint_carry_with_baseline_metadata(endpoint_carry, baseline_carry):
         # These are the physical/differentiable carry fields retained by the
         # reduced reverse contract. Everything else comes from the baseline
@@ -193,7 +212,7 @@ def _fd_reverse_frozen_metadata_accepted_rollout(
         )
 
     def _scan_body(scan_carry, xs):
-        baseline_carry, endpoint_carry = scan_carry
+        baseline_carry, endpoint_carry, healthy = scan_carry
         (
             active,
             dt_value,
@@ -202,10 +221,11 @@ def _fd_reverse_frozen_metadata_accepted_rollout(
             regrowth_cooldown_value,
             easy_growth_streak_value,
             lagged_response_valid_value,
+            rebuild_jacobian,
         ) = xs
 
         def _do_step(_):
-            baseline_next, _baseline_result = _step_with_trace_metadata(
+            baseline_next, baseline_result = _step_with_trace_metadata(
                 baseline_prepared_rollout,
                 baseline_carry,
                 dt_value,
@@ -214,6 +234,7 @@ def _fd_reverse_frozen_metadata_accepted_rollout(
                 regrowth_cooldown_value,
                 easy_growth_streak_value,
                 lagged_response_valid_value,
+                rebuild_jacobian,
             )
             endpoint_in = _endpoint_carry_with_baseline_metadata(
                 endpoint_carry,
@@ -228,18 +249,32 @@ def _fd_reverse_frozen_metadata_accepted_rollout(
                 regrowth_cooldown_value,
                 easy_growth_streak_value,
                 lagged_response_valid_value,
+                rebuild_jacobian,
             )
             endpoint_next = _endpoint_carry_with_baseline_metadata(
                 endpoint_raw_next,
                 baseline_next,
             )
+            baseline_valid = _valid_step(baseline_result)
+            endpoint_valid = _valid_step(endpoint_result)
+            step_valid = baseline_valid & endpoint_valid
+            next_baseline, next_endpoint = jax.lax.cond(
+                step_valid,
+                lambda _: (baseline_next, endpoint_next),
+                lambda _: (baseline_carry, endpoint_carry),
+                operand=None,
+            )
             scan_out = (
                 endpoint_result.accepted_y,
                 endpoint_result.err_norm,
-                jnp.asarray(True),
+                step_valid,
                 dt_value,
+                baseline_valid,
+                endpoint_valid,
+                jnp.asarray(baseline_result.converged),
+                jnp.asarray(endpoint_result.converged),
             )
-            return (baseline_next, endpoint_next), scan_out
+            return (next_baseline, next_endpoint, step_valid), scan_out
 
         def _skip(_):
             scan_out = (
@@ -247,14 +282,19 @@ def _fd_reverse_frozen_metadata_accepted_rollout(
                 jnp.asarray(jnp.inf, dtype=dtype),
                 jnp.asarray(False),
                 jnp.asarray(0.0, dtype=dtype),
+                jnp.asarray(True),
+                jnp.asarray(True),
+                jnp.asarray(True),
+                jnp.asarray(True),
             )
-            return (baseline_carry, endpoint_carry), scan_out
+            return (baseline_carry, endpoint_carry, healthy), scan_out
 
-        return jax.lax.cond(active, _do_step, _skip, operand=None)
+        return jax.lax.cond(active & healthy, _do_step, _skip, operand=None)
 
     initial_scan_carry = (
         baseline_prepared_rollout.initial_carry,
         endpoint_carry0,
+        jnp.asarray(True),
     )
     final_scan_carry, scan_outputs = jax.lax.scan(
         _scan_body,
@@ -267,10 +307,32 @@ def _fd_reverse_frozen_metadata_accepted_rollout(
             next_regrowth_cooldown,
             next_easy_growth_streak,
             next_lagged_response_valid,
+            force_jacobian_rebuild,
         ),
     )
-    _, final_endpoint_carry = final_scan_carry
-    trial_ys, err_norms, converged_mask, accepted_dts = scan_outputs
+    _, final_endpoint_carry, _ = final_scan_carry
+    trial_ys, err_norms, converged_mask, accepted_dts = scan_outputs[:4]
+    baseline_valid, endpoint_valid, baseline_converged, endpoint_converged = (
+        np.asarray(value, dtype=bool)
+        for value in jax.device_get(scan_outputs[4:])
+    )
+    active_np = np.asarray(jax.device_get(accepted_active_mask), dtype=bool)
+    bad_positions = np.flatnonzero(active_np & ~(baseline_valid & endpoint_valid))
+    if bad_positions.size:
+        slot = int(bad_positions[0])
+        accepted_step = int(np.count_nonzero(active_np[:slot + 1]))
+        role = "baseline" if not baseline_valid[slot] else "perturbed_endpoint"
+        converged = baseline_converged[slot] if role == "baseline" else endpoint_converged[slot]
+        dts_np = np.asarray(jax.device_get(attempted_dts), dtype=float)
+        initial_time = float(np.asarray(jax.device_get(endpoint_carry0.t)))
+        step_start_time = initial_time + float(np.sum(dts_np[:slot][active_np[:slot]]))
+        raise FloatingPointError(
+            f"Invalid FD accepted-step replay: endpoint={endpoint_label} role={role} "
+            f"accepted_step={accepted_step} attempt_slot={slot} "
+            f"t_start={step_start_time:.16e} dt={dts_np[slot]:.16e} "
+            f"newton_converged={bool(converged)}. "
+            "Stopped before objective evaluation."
+        )
     return _RadauAcceptedRolloutResult(
         final_carry=final_endpoint_carry,
         final_y=final_endpoint_carry.y,
@@ -284,6 +346,14 @@ def _fd_reverse_frozen_metadata_accepted_rollout(
 def _require_complete_frozen_metadata_replay(*, rollout, prepared_rollout, trace) -> None:
     """Reject an incomplete opt-in FD replay before evaluating objectives."""
 
+    expected_active = np.asarray(
+        jax.device_get(jnp.logical_and(trace.active_mask, trace.accepted_mask)), dtype=bool,
+    )
+    converged = np.asarray(jax.device_get(rollout.converged_mask), dtype=bool)
+    if converged.shape != expected_active.shape or np.any(expected_active & ~converged):
+        raise FloatingPointError("FD replay contains an unconverged accepted step.")
+    if not _tree_all_finite(rollout.final_y):
+        raise FloatingPointError("FD replay final state is nonfinite; refusing objective evaluation.")
     initial_time = float(
         np.asarray(jax.device_get(prepared_rollout.initial_carry.t))
     )
@@ -429,7 +499,10 @@ def _prepare_rollout(config: dict[str, Any], runtime, state0, *, solver_override
     return components, prepared_rollout, execution_context
 
 
-def _schedule_rollout(config: dict[str, Any], runtime, state0, *, accepted_step_limit: int | None):
+def _schedule_rollout(
+    config: dict[str, Any], runtime, state0, *, accepted_step_limit: int | None,
+    capture_newton_setup: bool = False,
+):
     components, prepared_rollout, execution_context = _prepare_rollout(config, runtime, state0)
     solver = components["solver"]
     stop_after_accepted_steps = (
@@ -448,6 +521,26 @@ def _schedule_rollout(config: dict[str, Any], runtime, state0, *, accepted_step_
         prepared_rollout.initial_carry,
         max_total_steps=max_total_steps,
         stop_after_accepted_steps=stop_after_accepted_steps,
+        capture_newton_setup=capture_newton_setup,
+    )
+    final_time = float(np.asarray(jax.device_get(rollout.final_carry.t)))
+    if bool(np.asarray(jax.device_get(rollout.failed))) or not bool(
+        np.asarray(jax.device_get(rollout.completed))
+    ) or (
+        stop_after_accepted_steps is None and final_time < float(solver.t1) - 1.0e-12
+    ):
+        raise RuntimeError(
+            f"FD adaptive baseline did not complete: final_time={final_time:.16e}, "
+            f"fail_code={int(np.asarray(jax.device_get(rollout.fail_code)))}."
+        )
+    if not _tree_all_finite(rollout.final_carry.y):
+        raise FloatingPointError("FD adaptive baseline final state is nonfinite.")
+    print(
+        "[fd-baseline] "
+        f"accepted_steps={int(np.asarray(jax.device_get(rollout.accepted_count)))} "
+        f"attempts={int(np.asarray(jax.device_get(rollout.attempt_count)))} "
+        f"final_time={final_time:.16e} recorded_newton_setup={capture_newton_setup}",
+        flush=True,
     )
     final_state = prepared_rollout.physics_context.unpack_flat(rollout.final_carry.y)
     return components, prepared_rollout, execution_context, rollout, final_state
@@ -523,6 +616,7 @@ def _objectives_on_realtime_geometry_frozen_trace(
                 endpoint_prepared_rollout=prepared_rollout,
                 trace=frozen_trace,
                 endpoint_carry0=prepared_rollout.initial_carry,
+                endpoint_label=endpoint_label,
             )
             _require_complete_frozen_metadata_replay(
                 rollout=rollout,
@@ -555,6 +649,11 @@ def _objectives_on_realtime_geometry_frozen_trace(
             frozen_trace,
             replay_mode=replay_mode_normalized,
             carry0=prepared_rollout.initial_carry,
+        )
+    if not _tree_all_finite(replay["final_state"]):
+        raise FloatingPointError(
+            f"FD endpoint={endpoint_label} has a nonfinite final state; "
+            "refusing objective evaluation."
         )
     if endpoint_diagnostics:
         _print_fd_endpoint_diagnostics(
@@ -1389,6 +1488,7 @@ def main() -> None:
         baseline_runtime,
         baseline_profile_state,
         accepted_step_limit=args.accepted_step_limit,
+        capture_newton_setup=(args.fd_accepted_replay_contract == "reverse_frozen_metadata"),
     )
     baseline_replay_reference = baseline_prepared_rollout
     frozen_trace = _truncate_rollout_trace_by_accepted_steps(
@@ -1810,6 +1910,10 @@ def main() -> None:
         "fd_step": float(h),
         "replay_mode": str(args.replay_mode),
         "fd_accepted_replay_contract": str(args.fd_accepted_replay_contract),
+        "fd_replay_jacobian_reuse_mode": (
+            "recorded_forward" if args.fd_accepted_replay_contract == "reverse_frozen_metadata"
+            else "legacy"
+        ),
         "geometry_fd_lane": str(geometry_fd_lane),
         "initial_er_root_ad": str(initial_er_root_ad),
         "initial_er_root_fd_root_lane": str(full_root_fd_lane),
@@ -1871,6 +1975,7 @@ def main() -> None:
         f"baseline_value={baseline_value:.6e} fd_step={h:.6e} "
         f"replay_mode={args.replay_mode} "
         f"fd_accepted_replay_contract={args.fd_accepted_replay_contract} "
+        f"fd_replay_jacobian_reuse_mode={report['fd_replay_jacobian_reuse_mode']} "
         f"geometry_fd_lane={geometry_fd_lane} "
         f"root_fd_lane={full_root_fd_lane}"
     )

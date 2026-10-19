@@ -12,6 +12,13 @@ uses the existing accepted-step frozen-metadata and frozen-root contracts with
 no accepted-step prefix limit. Full-time FD results remain pending; keep them
 separate from the sixteen-step comparisons below.
 
+The first full-time FD attempt failed in the bootstrap evaluator with
+nonfinite linear-system inputs. The [FD replay audit](database_transition_full_fd_replay_failure_2026-10-19.md)
+identifies missing recorded rebuild decisions and an unconditional `True`
+convergence mask. The FD helper now records/applies those decisions and checks
+the actual baseline/endpoint steps before objective evaluation. Verify the
+corrected `n0` column remotely before running the remaining seven columns.
+
 The full-transport shared-payload AD benchmark and realtime-geometry FD runner
 now use the same eleven transport objective rows. `Er_transition_left` and
 `Er_transition_right` are replaced by `Er_transition_rho`,
