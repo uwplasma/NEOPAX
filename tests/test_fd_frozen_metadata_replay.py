@@ -67,12 +67,13 @@ def _trace():
     )
 
 
-def _run(namespace, baseline, endpoint=None, trace=None):
+def _run(namespace, baseline, endpoint=None, trace=None, **kwargs):
     endpoint = baseline if endpoint is None else endpoint
     return namespace["_fd_reverse_frozen_metadata_accepted_rollout"](
         baseline_prepared_rollout=baseline, endpoint_prepared_rollout=endpoint,
         trace=_trace() if trace is None else trace,
         endpoint_carry0=endpoint.initial_carry, endpoint_label="n0:minus",
+        **kwargs,
     )
 
 
@@ -96,9 +97,14 @@ def _map_result(carry, *, y, converged):
     next_carry = dataclasses.replace(
         carry, t=carry.t + carry.dt, y=y, cache_valid=jnp.asarray(True),
     )
-    return SimpleNamespace(
-        next_carry=next_carry, accepted_y=y, err_norm=jnp.asarray(0.1),
+    return solvers._RadauAcceptedStepMapResult(
+        next_carry=next_carry, accepted_y=y, accepted_t=next_carry.t,
+        accepted_dt=carry.dt, err_norm=jnp.asarray(0.1),
         converged=converged, stage_history=carry.prev_stages,
+        theta_final=jnp.asarray(0.0), newton_iter_count=jnp.asarray(2, dtype=jnp.int32),
+        final_residual_norm=jnp.asarray(0.0), final_delta_norm=jnp.asarray(0.0),
+        density_err_norm=jnp.asarray(0.0), pressure_err_norm=jnp.asarray(0.0),
+        er_err_norm=jnp.asarray(0.0),
     )
 
 
@@ -152,6 +158,86 @@ def test_missing_forward_reuse_decisions_are_rejected():
     trace.jacobian_reused = None
     with pytest.raises(ValueError, match="requires recorded forward Jacobian reuse"):
         _run(namespace, _prepared(), trace=trace)
+
+
+def test_cold_restart_keeps_physical_input_and_timestep_and_reports_recovered_slot():
+    namespace = _namespace()
+    baseline, endpoint = _prepared(), _prepared(2.001)
+
+    def map_step(kernel, physics, carry, context):
+        bad = (
+            jnp.asarray(physics is endpoint.physics_context)
+            & (carry.t > 0.009) & (carry.t < 0.011)
+            & carry.cache_valid
+        )
+        # A failed trial must never become the input to the cold restart.
+        y = jnp.where(bad, 1e100, carry.y + 1.0)
+        result = _map_result(carry, y=y, converged=~bad)
+        result = dataclasses.replace(result, next_carry=dataclasses.replace(
+            result.next_carry, prev_dt=carry.dt, prev_stages=jnp.ones_like(carry.prev_stages),
+        ))
+        return result
+
+    namespace["_radau_apply_accepted_step_map"] = map_step
+    diagnostics = {}
+    result = _run(namespace, baseline, endpoint, diagnostics_out=diagnostics)
+    np.testing.assert_array_equal(result.final_y, [4.0])
+    np.testing.assert_allclose(result.accepted_dts, [0.01, 0.0, 0.01, 0.01, 0.0])
+    assert float(result.final_carry.t) == pytest.approx(0.03)
+    assert diagnostics == {
+        "accepted_steps": 3, "baseline_newton_retries": 0,
+        "endpoint_newton_retries": 1, "endpoint_retry_accepted_steps": [2],
+        "fixed_timesteps": True,
+    }
+
+
+def test_frozen_jacobian_failure_recovers_on_a_scalar_piecewise_rhs():
+    namespace = _namespace()
+    solver = solvers.RADAUSolver(
+        t0=0.0, t1=0.01, dt=0.01, rtol=1e-7, atol=1e-10,
+        num_stages=3, maxiter=4, max_steps=4, rhs_mode="black_box",
+        jacobian_reuse_mode="legacy",
+    )
+    prepared = solvers._build_prepared_radau_accepted_rollout(
+        solver=solver, state=jnp.array([-1e-4]),
+        vector_field=lambda t, y, *args: -100.0 * jnp.maximum(y, 0.0), species=None,
+    )
+    context = solvers._RadauAcceptedStepAttemptContext(
+        t_final=jnp.asarray(0.01), use_transport_lagged_response=jnp.asarray(False),
+    )
+    warm = solvers._radau_apply_accepted_step_map(
+        prepared.kernel_context, prepared.physics_context, prepared.initial_carry, context,
+    )
+    assert bool(warm.converged)
+    baseline = dataclasses.replace(prepared, initial_carry=dataclasses.replace(
+        warm.next_carry, t=jnp.asarray(0.0),
+    ))
+    endpoint = dataclasses.replace(prepared, initial_carry=dataclasses.replace(
+        baseline.initial_carry, y=jnp.array([1e-4]),
+    ))
+    # The frozen baseline has a zero Jacobian on the negative branch.
+    frozen_trial = solvers._radau_apply_accepted_step_map(
+        endpoint.kernel_context, endpoint.physics_context, endpoint.initial_carry, context,
+    )
+    assert not bool(frozen_trial.converged)
+    trace = _trace()
+    for key in vars(trace):
+        setattr(trace, key, getattr(trace, key)[:1])
+    trace.jacobian_reused = jnp.array([True])
+    diagnostics = {}
+    result = _run(namespace, baseline, endpoint, trace=trace, diagnostics_out=diagnostics)
+    assert diagnostics["endpoint_newton_retries"] == 1
+    assert diagnostics["baseline_newton_retries"] == 0
+    assert bool(result.converged_mask[0])
+    assert float(result.final_carry.t) == pytest.approx(0.01)
+    # The returned metadata is baseline-frozen; verify the physical endpoint
+    # independently with the three-stage Radau stability function at z=-1.
+    a = np.asarray(endpoint.kernel_context.a)
+    b = np.asarray(endpoint.kernel_context.b)
+    linear_stages = np.linalg.solve(np.eye(3) + a, np.ones(3))
+    assert np.all(linear_stages > 0.0)
+    stability = 1.0 - b @ linear_stages
+    np.testing.assert_allclose(result.final_y, [1e-4 * stability], rtol=1e-8, atol=1e-13)
 
 
 @pytest.mark.parametrize("failure", ["nonfinite", "unconverged", "incomplete"])

@@ -55,10 +55,48 @@ Only `benchmark_transport_realtime_geometry_forward_fd.py` is changed:
   execution banner when the frozen-metadata contract is selected.
 
 No new command-line mode, reverse-AD equation, production transport solver,
-root objective or bootstrap objective is introduced or changed. The GPU
-failure's exact first bad step is still unknown from the supplied traceback.
-Remote verification is needed to establish whether applying the recorded
-rebuild decisions resolves that failure or exposes an additional cause.
+root objective or bootstrap objective is introduced or changed. The initial
+callback traceback did not identify the first failed replay step. The remote
+rerun below establishes that the rebuild-mask correction alone was insufficient.
+
+## Remote rerun: perturbed Newton failure at accepted step 83
+
+The user reran the corrected `n0` FD command and obtained:
+
+```text
+[fd-baseline] accepted_steps=290 attempts=495 final_time=2.0000000000000000e+01 recorded_newton_setup=True
+Invalid FD accepted-step replay: endpoint=n0:minus role=perturbed_endpoint accepted_step=83 attempt_slot=156 t_start=5.5758482511664553e-03 dt=2.1380474331935400e-08 newton_converged=False.
+```
+
+Exit status was 1, wall time 24:52.00 and maximum host RSS 10,160,588 KiB.
+The adaptive baseline reached the required final time and the unperturbed
+replay solve at slot 156 was valid. The nearby minus-parameter solve did not
+converge under the frozen numerical setup. This error does not itself establish
+nonfinite physical state, an incorrect AD derivative, or a bootstrap defect.
+The failing step occurs early in physical time despite being step 83.
+
+### Same-timestep Newton recovery
+
+The FD helper now retries an invalid baseline or endpoint Newton solve once,
+from the original incoming physical state at the identical accepted timestep.
+The retry invalidates the cached Jacobian/LU setup and clears stage predictor
+history. It retains the physical state, lagged physical payload, model, stage
+equations, tolerances, iteration budget and accepted schedule. The unsuccessful
+trial state is discarded. After a successful solve, the endpoint continues to
+receive the baseline's frozen metadata as before.
+
+This is a bounded nonlinear-solver restart inside an existing accepted slot.
+It neither inserts a transport step nor replays/differentiates a rejected
+adaptive attempt. Cached Newton matrices and predictors are acceleration
+metadata; converged implicit-step sensitivities do not require identical
+acceleration history at neighboring FD parameters.
+
+The `[fd-replay]` banner reports baseline and endpoint restart counts, and the
+FD JSON additionally records endpoint restart step numbers and
+`fixed_timesteps=True`. If the restart remains invalid, the guard still stops
+before objective evaluation and now includes iteration count, residual norm
+and correction norm from the final unsuccessful solve. The remote full-time
+case has not yet validated this recovery.
 
 ## Validation and remote retry
 
@@ -66,6 +104,11 @@ rebuild decisions resolves that failure or exposes an additional cause.
 step failures. It checks central differences against the analytic full-time
 derivative, accepted-slot filtering and rebuilds, baseline/endpoint failure
 attribution, rejection of missing metadata, and convergence/finite/time guards.
+Recovery regressions verify that a failed trial is discarded, the original
+physical state/timestep is retained, and restart counts identify the recovered
+accepted slot. A scalar piecewise RHS reproduces a frozen-Jacobian Newton
+failure and checks the cold-restart solution against the independent Radau
+stability-function endpoint.
 Existing mocked objective-routing and parser tests are included in validation.
 No plasma transport, VMEC, NTX or FD benchmark is run locally.
 
@@ -78,13 +121,21 @@ JAX_PLATFORMS=cpu python -m pytest \
   tests/test_database_reverse_benchmark_plumbing.py -q
 ```
 
-Result: **65 passed, 33 subtests passed in 23.76 seconds**. The tests execute
-only scalar ODEs, synthetic states and mocked benchmark setup. They do not
-establish that the remote full-time FD endpoint is now valid.
+Before the same-timestep recovery addition, this suite passed **65 tests and
+33 subtests in 23.76 seconds**. The tests execute only scalar ODEs, synthetic
+states and mocked benchmark setup. They do not establish that the remote
+full-time FD endpoint is now valid.
+
+After adding same-timestep recovery, validation passes **67 tests and 33
+subtests**, run as 13 scalar/recovery tests (20.52 seconds) and 54 mocked
+objective-routing/parser tests plus 33 subtests (18.47 seconds). The scalar
+piecewise-RHS case confirms failure with the frozen baseline Jacobian and
+successful recovery with a fresh Jacobian at the unchanged timestep. Its
+physical endpoint agrees with the independent Radau stability-function value.
 
 After syncing the correction, retry just `--parameter n0` with the same
 full-time FD command and flags. The baseline banner should show 290 accepted
 steps, final time 20 seconds and recorded Newton setup. If the replay remains
-invalid, the new error identifies its first bad accepted step before bootstrap
-evaluation. Complete this one-column check before running the remaining
-seven columns; full-time FD errors remain pending.
+invalid, the error identifies its first bad accepted step after the bounded
+Newton restart, before bootstrap evaluation. Complete this one-column check
+before running the remaining seven columns; full-time FD errors remain pending.

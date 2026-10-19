@@ -120,6 +120,7 @@ def _fd_reverse_frozen_metadata_accepted_rollout(
     trace,
     endpoint_carry0,
     endpoint_label: str = "endpoint",
+    diagnostics_out: dict | None = None,
 ):
     """FD-only accepted replay with reverse-fixed solver metadata.
 
@@ -131,8 +132,9 @@ def _fd_reverse_frozen_metadata_accepted_rollout(
     and copies its nonphysical carry fields into the perturbed endpoint after
     every step.  Only the endpoint physical state and (when present) the
     lagged-response physical payload are allowed to evolve independently.
-    Both solves honor the recorded forward rebuild mask. Unconverged or
-    nonfinite baseline/endpoint steps stop the replay before any objective.
+    Both solves honor the recorded forward rebuild mask on the first attempt.
+    An invalid solve gets one cold Newton restart at exactly the same physical
+    state and timestep. Remaining failures stop before any objective.
 
     This helper is intentionally local to the FD benchmark.  It neither
     changes nor wraps the replay functions used by reverse AD or optimization.
@@ -182,6 +184,26 @@ def _fd_reverse_frozen_metadata_accepted_rollout(
             carry_for_step,
             attempt_context,
         )
+        retry_needed = ~_valid_step(result)
+
+        def _retry(_):
+            # Re-solve the same stage equations from the same physical state.
+            # Only acceleration metadata is reset. In particular, neither the
+            # failed trial state nor a changed dt enters this second attempt.
+            cold_carry = dataclasses.replace(
+                carry_for_step,
+                cache_valid=jnp.asarray(False),
+                prev_stages=jnp.zeros_like(carry_for_step.prev_stages),
+                prev_dt=jnp.zeros_like(carry_for_step.prev_dt),
+                prev_theta_final=jnp.zeros_like(carry_for_step.prev_theta_final),
+                prev_newton_iter_count=jnp.zeros_like(carry_for_step.prev_newton_iter_count),
+            )
+            return _radau_apply_accepted_step_map(
+                prepared_rollout.kernel_context, prepared_rollout.physics_context,
+                cold_carry, attempt_context,
+            )
+
+        result = jax.lax.cond(retry_needed, _retry, lambda _: result, operand=None)
         next_carry = dataclasses.replace(
             result.next_carry,
             dt=next_dt_value,
@@ -191,7 +213,7 @@ def _fd_reverse_frozen_metadata_accepted_rollout(
             easy_growth_streak=easy_growth_streak_value,
             lagged_response_valid=lagged_response_valid_value,
         )
-        return next_carry, result
+        return next_carry, result, retry_needed
 
     def _valid_step(result):
         finite = jnp.asarray(True)
@@ -225,7 +247,7 @@ def _fd_reverse_frozen_metadata_accepted_rollout(
         ) = xs
 
         def _do_step(_):
-            baseline_next, baseline_result = _step_with_trace_metadata(
+            baseline_next, baseline_result, baseline_retry = _step_with_trace_metadata(
                 baseline_prepared_rollout,
                 baseline_carry,
                 dt_value,
@@ -240,7 +262,7 @@ def _fd_reverse_frozen_metadata_accepted_rollout(
                 endpoint_carry,
                 baseline_carry,
             )
-            endpoint_raw_next, endpoint_result = _step_with_trace_metadata(
+            endpoint_raw_next, endpoint_result, endpoint_retry = _step_with_trace_metadata(
                 endpoint_prepared_rollout,
                 endpoint_in,
                 dt_value,
@@ -273,6 +295,14 @@ def _fd_reverse_frozen_metadata_accepted_rollout(
                 endpoint_valid,
                 jnp.asarray(baseline_result.converged),
                 jnp.asarray(endpoint_result.converged),
+                baseline_retry,
+                endpoint_retry,
+                baseline_result.newton_iter_count,
+                endpoint_result.newton_iter_count,
+                baseline_result.final_residual_norm,
+                endpoint_result.final_residual_norm,
+                baseline_result.final_delta_norm,
+                endpoint_result.final_delta_norm,
             )
             return (next_baseline, next_endpoint, step_valid), scan_out
 
@@ -286,6 +316,14 @@ def _fd_reverse_frozen_metadata_accepted_rollout(
                 jnp.asarray(True),
                 jnp.asarray(True),
                 jnp.asarray(True),
+                jnp.asarray(False),
+                jnp.asarray(False),
+                jnp.asarray(0, dtype=jnp.int32),
+                jnp.asarray(0, dtype=jnp.int32),
+                jnp.asarray(0.0, dtype=dtype),
+                jnp.asarray(0.0, dtype=dtype),
+                jnp.asarray(0.0, dtype=dtype),
+                jnp.asarray(0.0, dtype=dtype),
             )
             return (baseline_carry, endpoint_carry, healthy), scan_out
 
@@ -314,9 +352,23 @@ def _fd_reverse_frozen_metadata_accepted_rollout(
     trial_ys, err_norms, converged_mask, accepted_dts = scan_outputs[:4]
     baseline_valid, endpoint_valid, baseline_converged, endpoint_converged = (
         np.asarray(value, dtype=bool)
-        for value in jax.device_get(scan_outputs[4:])
+        for value in jax.device_get(scan_outputs[4:8])
     )
     active_np = np.asarray(jax.device_get(accepted_active_mask), dtype=bool)
+    baseline_retry, endpoint_retry = (
+        np.asarray(value, dtype=bool) for value in jax.device_get(scan_outputs[8:10])
+    )
+    replay_diagnostics = {
+        "accepted_steps": int(np.count_nonzero(active_np)),
+        "baseline_newton_retries": int(np.count_nonzero(baseline_retry)),
+        "endpoint_newton_retries": int(np.count_nonzero(endpoint_retry)),
+        "endpoint_retry_accepted_steps": (
+            np.cumsum(active_np, dtype=int)[endpoint_retry].tolist()
+        ),
+        "fixed_timesteps": True,
+    }
+    if diagnostics_out is not None:
+        diagnostics_out.update(replay_diagnostics)
     bad_positions = np.flatnonzero(active_np & ~(baseline_valid & endpoint_valid))
     if bad_positions.size:
         slot = int(bad_positions[0])
@@ -326,13 +378,27 @@ def _fd_reverse_frozen_metadata_accepted_rollout(
         dts_np = np.asarray(jax.device_get(attempted_dts), dtype=float)
         initial_time = float(np.asarray(jax.device_get(endpoint_carry0.t)))
         step_start_time = initial_time + float(np.sum(dts_np[:slot][active_np[:slot]]))
+        offset = 0 if role == "baseline" else 1
+        iterations = int(np.asarray(jax.device_get(scan_outputs[10 + offset]))[slot])
+        residual = float(np.asarray(jax.device_get(scan_outputs[12 + offset]))[slot])
+        delta = float(np.asarray(jax.device_get(scan_outputs[14 + offset]))[slot])
         raise FloatingPointError(
             f"Invalid FD accepted-step replay: endpoint={endpoint_label} role={role} "
             f"accepted_step={accepted_step} attempt_slot={slot} "
             f"t_start={step_start_time:.16e} dt={dts_np[slot]:.16e} "
-            f"newton_converged={bool(converged)}. "
+            f"newton_converged={bool(converged)} cold_restart=True "
+            f"newton_iterations={iterations} residual_norm={residual:.16e} "
+            f"delta_norm={delta:.16e}. "
             "Stopped before objective evaluation."
         )
+    print(
+        f"[fd-replay] endpoint={endpoint_label} "
+        f"accepted_steps={replay_diagnostics['accepted_steps']} "
+        f"baseline_newton_retries={replay_diagnostics['baseline_newton_retries']} "
+        f"endpoint_newton_retries={replay_diagnostics['endpoint_newton_retries']} "
+        "fixed_timesteps=True",
+        flush=True,
+    )
     return _RadauAcceptedRolloutResult(
         final_carry=final_endpoint_carry,
         final_y=final_endpoint_carry.y,
@@ -611,12 +677,14 @@ def _objectives_on_realtime_geometry_frozen_trace(
                     "reverse_frozen_metadata FD replay requires the unperturbed "
                     "baseline prepared rollout."
                 )
+            fd_newton_diagnostics = {}
             rollout = _fd_reverse_frozen_metadata_accepted_rollout(
                 baseline_prepared_rollout=baseline_replay_reference,
                 endpoint_prepared_rollout=prepared_rollout,
                 trace=frozen_trace,
                 endpoint_carry0=prepared_rollout.initial_carry,
                 endpoint_label=endpoint_label,
+                diagnostics_out=fd_newton_diagnostics,
             )
             _require_complete_frozen_metadata_replay(
                 rollout=rollout,
@@ -631,6 +699,7 @@ def _objectives_on_realtime_geometry_frozen_trace(
                 "rollout": rollout,
                 "replay_mode": "accepted",
                 "fd_accepted_replay_contract": accepted_contract,
+                "fd_newton_recovery": fd_newton_diagnostics,
             }
         else:
             raise ValueError(
@@ -1963,10 +2032,12 @@ def main() -> None:
         "minus_replay": {
             "final_state_finite": _tree_all_finite(minus_replay["final_state"]),
             "final_carry_finite": _tree_all_finite(minus_replay["final_carry"]),
+            "fd_newton_recovery": minus_replay.get("fd_newton_recovery"),
         },
         "plus_replay": {
             "final_state_finite": _tree_all_finite(plus_replay["final_state"]),
             "final_carry_finite": _tree_all_finite(plus_replay["final_carry"]),
+            "fd_newton_recovery": plus_replay.get("fd_newton_recovery"),
         },
     }
     print(

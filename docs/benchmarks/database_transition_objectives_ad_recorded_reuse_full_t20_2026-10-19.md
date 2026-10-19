@@ -85,6 +85,14 @@ describe the narrowed FD fix. Sync that correction and retry `n0` first before
 launching all eight columns. The actual first failed remote step remains
 unknown from the original traceback.
 
+The guarded rerun subsequently identifies an unconverged `n0:minus` solve at
+accepted step 83, attempt slot 156, `t=5.5758482511664553e-3`,
+`dt=2.1380474331935400e-8`. Its baseline reaches 20 seconds with 290 accepted
+steps / 495 attempts. The FD helper now permits one fresh-Jacobian, reset-
+predictor Newton restart from the same incoming physical state at the same
+timestep. It records recovery counts and retains the validity guard. Remote
+verification of this bounded recovery remains pending.
+
 With `jax_env` active on the GPU machine, the saved
 [eight-parameter loop](run_database_transition_fd_full_t20_2026-10-19.sh) runs:
 

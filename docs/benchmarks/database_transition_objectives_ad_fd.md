@@ -19,6 +19,12 @@ convergence mask. The FD helper now records/applies those decisions and checks
 the actual baseline/endpoint steps before objective evaluation. Verify the
 corrected `n0` column remotely before running the remaining seven columns.
 
+That guarded rerun localizes a perturbed-endpoint Newton failure at accepted
+step 83 while the baseline remains valid. The FD helper now retries such a
+failure once with fresh numerical setup at the identical physical input and
+accepted timestep. Scalar recovery tests pass; the full GPU FD result and
+AD/FD error table remain pending.
+
 The full-transport shared-payload AD benchmark and realtime-geometry FD runner
 now use the same eleven transport objective rows. `Er_transition_left` and
 `Er_transition_right` are replaced by `Er_transition_rho`,

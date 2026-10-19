@@ -14,6 +14,13 @@ steps converged. The [FD correction and validation scope](docs/benchmarks/databa
 are recorded separately; the full-time AD reference is unchanged, and remote
 verification of the corrected FD endpoint is pending.
 
+The guarded retry identifies an unconverged `n0:minus` solve at accepted step
+83 (`t=5.5758482511664553e-3`, `dt=2.1380474331935400e-8`); the baseline
+completes 290 accepted steps / 495 attempts at 20 seconds. A bounded FD-only
+Newton restart with fresh setup at the same state/timestep has been added
+and tested on a scalar reproducer. Its full-time GPU verification remains
+pending, so no FD error is assigned to the archived AD values yet.
+
 - [Complete 18-by-8 values and gradients](docs/benchmarks/database_transition_objectives_ad_recorded_reuse_full_t20_2026-10-19.csv).
 - [Run evidence, root/bootstrap/net-power gradient table and FD instructions](docs/benchmarks/database_transition_objectives_ad_recorded_reuse_full_t20_2026-10-19.md).
 - [Full-time FD loop for all eight parameters](docs/benchmarks/run_database_transition_fd_full_t20_2026-10-19.sh).
