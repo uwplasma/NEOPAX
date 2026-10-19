@@ -1,5 +1,25 @@
 # Database reverse AD versus FD status
 
+## 2026-10-19 Full-time recorded-forward AD reference
+
+The 20-second benchmark now completes with 290 accepted steps, six reverse
+segments, all 18 residuals / 144 derivatives finite, and exit status 0. All six
+accepted-replay endpoint checks have exactly zero absolute and scaled
+differences. The 1,000-accepted-step guard did not bind. Full-time FD comparisons
+are pending; the archived 16-step FD numbers evaluate a different endpoint.
+
+- [Complete 18-by-8 values and gradients](docs/benchmarks/database_transition_objectives_ad_recorded_reuse_full_t20_2026-10-19.csv).
+- [Run evidence, root/bootstrap/net-power gradient table and FD instructions](docs/benchmarks/database_transition_objectives_ad_recorded_reuse_full_t20_2026-10-19.md).
+- [Full-time FD loop for all eight parameters](docs/benchmarks/run_database_transition_fd_full_t20_2026-10-19.sh).
+
+| Observable | Full-time AD value | Full-time FD status |
+| --- | ---: | --- |
+| Transition radius | 5.1703593282774429e-01 | Pending |
+| Transition location moment | 1.7035932827744293e-02 | Pending |
+| Transition strength | 2.0149622433190042e+00 | Pending |
+| Bootstrap current softmax | 2.0426059244509895e+00 | Pending |
+| Net power volume average (MW/m^3) | 9.5305334313012002e-01 | Pending |
+
 ## 2026-10-17 Recorded-forward replay: AD compared with the archived AD and FD
 
 The user reran the same 16-accepted-step, four-step-segment AD benchmark with

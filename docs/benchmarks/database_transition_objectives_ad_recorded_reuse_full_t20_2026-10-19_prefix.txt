@@ -1,0 +1,37 @@
+ive_steps=50 support_reuse=0 support_rebuild=50
+[primal-replay] segment=1 endpoint_max_abs_difference=0.000000e+00 endpoint_max_scaled_difference=0.000000e+00
+[autodiff-gate] progress: support reverse segment 1/6 ready elapsed_s=10.660 active_steps=50 support_reuse=0 support_rebuild=50
+[autodiff-gate] progress: support reverse segmented cotangent sweep ready elapsed_s=588.497 support_reuse=0 support_rebuild=290
+[autodiff-gate] progress: support reverse reduced carry bars expanded ready elapsed_s=0.697
+[autodiff-gate] progress: support reverse initial direct-RHS support pullback ready elapsed_s=166.098 boundary=database_split
+[autodiff-gate] progress: support reverse initial state pullback ready elapsed_s=143.746
+[autodiff-gate] progress: initial-Er root boundary compact pullback ready elapsed_s=261.662
+[autodiff-gate] progress: support reverse profile parameter pullback ready elapsed_s=0.945
+[autodiff-gate] progress: support reverse initial-profile scan payload pullback ready elapsed_s=1.469
+[autodiff-gate] progress: database final recorded-scan fold ready elapsed_s=745.980 objective_rows=11 groups=1 contract=one_batched_scan_transpose
+[autodiff-gate] full-transport shared payload: ntx_scan_runtime_active_float_leaves=64
+[autodiff-gate] full-transport shared payload: compact_payload_tangent_contract=True native_vmec_coefficient_tangent_contract=False
+[autodiff-gate] full-transport shared payload: raw_block_param_bar_l2=4.817281e+02 raw_block_param_bar_all_finite=True raw_block_param_bar_first_nonfinite=None
+[geometry-fd-ad] progress: objective_table vmec implicit state/raw-block aux ready elapsed_s=0.012
+[geometry-fd-ad] progress: objective_table booz input tables ready elapsed_s=2.126
+[geometry-fd-ad] progress: objective_table booz_xform vjp ready elapsed_s=13.449
+[geometry-fd-ad] progress: objective_table vmec objective cotangents ready elapsed_s=16.623
+
+[autodiff-gate] mode=transport_reverse_ad_only_full_transport_shared_payload_smoke objective=all residual_count=18 parameter_count=8 replay_jacobian_reuse_mode=recorded_forward all_finite=True elapsed_s=2915.646
+[autodiff-gate] optimization API residuals/Jacobian rows:
+  - transport:softmax_Er: residual=4.0177643431476874e+01
+      dtransport:softmax_Er/dn0: jac=6.7328017620805474e+00
+      dtransport:softmax_Er/dT0: jac=-1.1513567637382458e-02
+      dtransport:softmax_Er/ddensity_shape_power: jac=-1.0644078257479594e-01
+      dtransport:softmax_Er/dtemperature_shape_power: jac=-2.7118551100992407e-02
+      dtransport:softmax_Er/ddensity_shape_alpha: jac=3.6496112406306147e-01
+      dtransport:softmax_Er/dtemperature_shape_alpha: jac=2.6830743898240465e-02
+      dtransport:softmax_Er/dvmec:RBC:1:0: jac=-2.2374188777274277e+01
+      dtransport:softmax_Er/dvmec:ZBS:1:0: jac=1.6055784527807418e+01
+  - transport:net_total_power_volume_average_mw_m3: residual=9.5305334313012002e-01
+      dtransport:net_total_power_volume_average_mw_m3/dn0: jac=1.0159391736863046e+00
+      dtransport:net_total_power_volume_average_mw_m3/dT0: jac=5.0817114351032827e-04
+      dtransport:net_total_power_volume_average_mw_m3/ddensity_shape_power: jac=1.6272728525997065e-03
+      dtransport:net_total_power_volume_average_mw_m3/dtemperature_shape_power: jac=1.1995750708314783e-03
+      dtransport:net_total_power_volume_average_mw_m3/ddensity_shape_alpha: jac=-1.2002451549893472e-02
+      dtransport:net_total_power_volume_average_mw_m3/dtemperature_shape_alpha: jac=-1.1901715575170437e-03

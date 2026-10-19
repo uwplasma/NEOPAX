@@ -1,0 +1,59 @@
+ cd ~/NEOPAX
+mkdir -p outputs
+set -o pipefail
+
+env -u JAX_COMPILATION_CACHE_DIR \
+JAX_ENABLE_COMPILATION_CACHE=0 \
+XLA_FLAGS="${XLA_FLAGS:-} --xla_gpu_enable_command_buffer=" \
+NEOPAX_REVERSE_STEP_DIAGNOSTICS=1 \
+PYTHONPATH="$HOME/VMEX:$HOME/NTX/src" \
+/usr/bin/time -v \
+python examples/benchmarks/benchmark_transport_reverse_ad_only.py \
+  --config examples/benchmarks/Solve_Transport_equations_wHe_radau_ntx_scan_runtime_database_vmec_realtime_geometry_benchmark_black_box.toml \
+  --reverse-parameter-mode profiles_plus_realtime_geometry \
+  --reverse-geometry-parameter RBC:1:0,ZBS:1:0 \
+  --realtime-geometry-gradient-path reverse_payload \
+  --optimization-api-profile-dofs include \
+  --objective all \
+  --max-reverse-accepted-steps 1000 \
+  --reverse-segment-length 50 \
+  --radau-jacobian-reuse-mode legacy \
+  --timing-mode jit-warm \
+  --reverse-stage-adjoint-solve-mode block \
+  --reverse-rhs-transpose-mode explicit_database \
+  2>&1 | tee outputs/database_transition_ad_full_recorded_reuse_guard1000.log
+
+[NEOPAX] built runtime NTX scan database: rho=7 nu_v=16 Er_tilde=11 grid=(25,31,64) backend=vmec
+[autodiff-gate] progress: realtime geometry runtime build ready elapsed_s=649.121
+[autodiff-gate] progress: realtime geometry solver components ready elapsed_s=0.486
+[autodiff-gate] realtime geometry device: default_backend=gpu baseline_values_device=cuda:0 local_devices=['cuda:0']
+[autodiff-gate] progress: running realtime geometry optimization API smoke
+[autodiff-gate] progress: full-transport reverse stage-adjoint replay_jacobian_reuse_mode=recorded_forward solve mode=block rhs_pullback_mode=separate initial_cache_support_pullback_mode=scalar rebuild_support_pullback_mode=separate database_initial_support_mode=split database_initial_state_mode=generic database_support_preparation_mode=shared database_center_geometry_mode=scalar_jvp database_stage_jacobian_mode=independent database_support_objective_mode=scalar database_segment_support_mode=inline database_interpolation_transpose_mode=legacy_sparse database_root_interpolation_transpose_mode=established database_bootstrap_interpolation_transpose_mode=established segment_jit_diagnostics=False segment_input_diagnostics=False segment_start_replay_mode=minimal segment_primal_record_mode=reuse_segment_primal_record step_bwd_mode=reduced_cotangent_call_boundary
+E1019 16:38:50.283697  154771 slow_operation_alarm.cc:73] 
+********************************
+[Compiling module jit_scan for GPU] Very slow compile? If you want to file a bug, run with envvar XLA_FLAGS=--xla_dump_to=/tmp/foo and attach the results.
+********************************
+E1019 16:39:03.833390  154730 slow_operation_alarm.cc:140] The operation took 2m13.549845701s
+
+********************************
+[Compiling module jit_scan for GPU] Very slow compile? If you want to file a bug, run with envvar XLA_FLAGS=--xla_dump_to=/tmp/foo and attach the results.
+********************************
+[autodiff-gate] progress: support reverse profile-state vjp ready elapsed_s=96.589
+[autodiff-gate] progress: support reverse initial carry vjp ready elapsed_s=0.733
+[autodiff-gate] progress: support reverse reusing static schedule artifact (no second adaptive rollout; no per-step carry tape)
+[autodiff-gate] progress: support reverse realized-schedule vjp forward ready elapsed_s=2.318
+[autodiff-gate] progress: support reverse final-objective cotangents ready elapsed_s=279.327 ordinary_mode=grouped_vjp bootstrap_mode=joint_local_vjp_upar_only database_bootstrap_interpolation_mode=established
+[autodiff-gate] progress: support reverse segmented cotangent sweep start segments=6 segment_length=50 objectives=11 cotangent_mode=full
+[autodiff-gate] progress: database segment reverse uses fixed-table table transpose plus compact local fixed-table geometry bars; only table bars cross the recorded scan (no scan owner in segments)
+[primal-replay] segment=6 endpoint_max_abs_difference=0.000000e+00 endpoint_max_scaled_difference=0.000000e+00
+[autodiff-gate] progress: support reverse segment 6/6 ready elapsed_s=534.648 active_steps=40 support_reuse=0 support_rebuild=40
+[primal-replay] segment=5 endpoint_max_abs_difference=0.000000e+00 endpoint_max_scaled_difference=0.000000e+00
+[autodiff-gate] progress: support reverse segment 5/6 ready elapsed_s=10.789 active_steps=50 support_reuse=0 support_rebuild=50
+[primal-replay] segment=4 endpoint_max_abs_difference=0.000000e+00 endpoint_max_scaled_difference=0.000000e+00
+[autodiff-gate] progress: support reverse segment 4/6 ready elapsed_s=10.783 active_steps=50 support_reuse=0 support_rebuild=50
+[primal-replay] segment=3 endpoint_max_abs_difference=0.000000e+00 endpoint_max_scaled_difference=0.000000e+00
+[autodiff-gate] progress: support reverse segment 3/6 ready elapsed_s=10.814 active_steps=50 support_reuse=0 support_rebuild=50
+[primal-replay] segment=2 endpoint_max_abs_difference=0.000000e+00 endpoint_max_scaled_difference=0.000000e+00
+[autodiff-gate] progress: support reverse segment 2/6 ready elapsed_s=10.802 active_steps=50 support_reuse=0 support_rebuild=50
+[primal-replay] segment=1 endpoint_max_abs_difference=0.000000e+00 endpoint_max_scaled_difference=0.000000e+00
+[autodiff-gate] progress: support reverse segment 1/6 ready elapsed_s=10.660 act

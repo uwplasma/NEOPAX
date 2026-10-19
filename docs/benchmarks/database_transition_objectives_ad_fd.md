@@ -1,5 +1,17 @@
 # Database transport transition-objective AD/FD comparison
 
+## Full-time comparison (2026-10-19)
+
+The full 20-second recorded-forward AD run succeeds: 290 accepted steps, six
+50-step segments (40 active steps in the final segment), all 18 residuals / 144
+Jacobian entries finite, and zero replay endpoint differences in all segments.
+The [full-time reference](database_transition_objectives_ad_recorded_reuse_full_t20_2026-10-19.md)
+archives the original output, complete value/gradient CSV, timing and the
+matching FD setup. The [eight-DoF full-time FD loop](run_database_transition_fd_full_t20_2026-10-19.sh)
+uses the existing accepted-step frozen-metadata and frozen-root contracts with
+no accepted-step prefix limit. Full-time FD results remain pending; keep them
+separate from the sixteen-step comparisons below.
+
 The full-transport shared-payload AD benchmark and realtime-geometry FD runner
 now use the same eleven transport objective rows. `Er_transition_left` and
 `Er_transition_right` are replaced by `Er_transition_rho`,
