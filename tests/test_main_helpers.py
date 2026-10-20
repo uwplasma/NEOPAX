@@ -472,7 +472,9 @@ def test_ntx_exact_runtime_quadratic_lagged_response_matches_live_reference(resp
     faces = build_face_transport_state(
         state, geometry, bc_density=density_bc, bc_temperature=temperature_bc,
     )
-    assert jnp.array_equal(faces.density[:, -1], density_bc.right_value)
+    # The physical zero-He boundary is floored by the transport-state contract.
+    assert jnp.array_equal(faces.density[:3, -1], density_bc.right_value[:3])
+    assert faces.density[3, -1] == flux_models_module.DEFAULT_TRANSPORT_DENSITY_FLOOR
     # With the benchmark spacing and lambda, the live Robin reconstruction is
     # close to the edge profile but is not the unused TOML ``value = 1.0``.
     assert bool(jnp.all(faces.temperature[:, -1] > 0.0))
@@ -882,8 +884,8 @@ def test_ntx_exact_runtime_quadratic_lagged_response_matches_live_reference(resp
         )
 
     direction = TransportState(
-        density=jnp.asarray([[0.04, -0.03], [-0.02, 0.01]]),
-        pressure=jnp.asarray([[0.06, -0.04], [-0.03, 0.02]]),
+        density=jnp.asarray([[0.04, -0.03], [-0.02, 0.01], [0.01, -0.005], [0.0, 0.0]]),
+        pressure=jnp.asarray([[0.06, -0.04], [-0.03, 0.02], [0.02, -0.01], [0.0, 0.0]]),
         Er=jnp.asarray([2.0e-5, -1.5e-5]),
     )
 
@@ -915,7 +917,9 @@ def test_ntx_exact_runtime_quadratic_lagged_response_matches_live_reference(resp
     def _relative_flux_error(scale):
         perturbed = _state_at(scale)
         direct_perturbed = model.evaluate_face_fluxes(
-            perturbed, build_face_transport_state(perturbed, geometry)
+            perturbed, build_face_transport_state(
+                perturbed, geometry, bc_density=density_bc, bc_temperature=temperature_bc,
+            )
         )
         full_perturbed = full_state_model.evaluate_with_lagged_response(
             perturbed, full_state_response
