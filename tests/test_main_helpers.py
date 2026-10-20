@@ -253,8 +253,9 @@ def test_ntx_quadratic_resolution_fallback_selects_only_flagged_radii():
         assert jnp.array_equal(selected_value[1], high_value[1])
 
 
-def test_ntx_exact_runtime_lagged_face_response_matches_reference_and_finite_difference():
-    """The exact NTX face response must agree locally with its live face flux."""
+@pytest.mark.parametrize("response_anchor_count", (2, 3))
+def test_ntx_exact_runtime_lagged_face_response_matches_reference_and_finite_difference(response_anchor_count):
+    """At every radial anchor, the NTX response agrees with its live flux."""
     geometry = types.SimpleNamespace(
         a_b=1.0,
         r_grid=jnp.asarray([0.3, 0.7]),
@@ -293,7 +294,7 @@ def test_ntx_exact_runtime_lagged_face_response_matches_reference_and_finite_dif
         boozer_file=None,
         support=support,
         center_response_mode="interpolate_from_faces",
-        response_anchor_count=2,
+        response_anchor_count=response_anchor_count,
     )
     state0 = TransportState(
         density=jnp.asarray([[1.0, 1.15], [1.0, 1.15]]),
@@ -311,23 +312,30 @@ def test_ntx_exact_runtime_lagged_face_response_matches_reference_and_finite_dif
         return model.evaluate_face_fluxes(state, faces)
 
     response = model.build_lagged_response(state0)
-    recorded_response, compact_record = model.build_lagged_response_with_compact_coefficient_record(state0)
-    for ordinary_leaf, recorded_leaf in zip(
-        jax.tree_util.tree_leaves(response),
-        jax.tree_util.tree_leaves(recorded_response),
-        strict=True,
-    ):
-        if jnp.issubdtype(jnp.asarray(ordinary_leaf).dtype, jnp.inexact):
-            assert jnp.allclose(recorded_leaf, ordinary_leaf, rtol=1.0e-9, atol=1.0e-11)
-    assert compact_record.face_anchor_coefficients.coefficient_scan.shape == (2, 2, 3, 5)
-    assert compact_record.face_anchor_coefficients.dcoefficient_scan_d_er.shape == (2, 2, 3, 5)
-    assert compact_record.face_anchor_coefficients.dcoefficient_scan_d_log_nu_star.shape == (2, 2, 3, 5)
+    if response_anchor_count == 2:
+        recorded_response, compact_record = model.build_lagged_response_with_compact_coefficient_record(state0)
+        for ordinary_leaf, recorded_leaf in zip(
+            jax.tree_util.tree_leaves(response),
+            jax.tree_util.tree_leaves(recorded_response),
+            strict=True,
+        ):
+            if jnp.issubdtype(jnp.asarray(ordinary_leaf).dtype, jnp.inexact):
+                assert jnp.allclose(recorded_leaf, ordinary_leaf, rtol=1.0e-9, atol=1.0e-11)
+        assert compact_record.face_anchor_coefficients.coefficient_scan.shape == (2, 2, 3, 5)
+        assert compact_record.face_anchor_coefficients.dcoefficient_scan_d_er.shape == (2, 2, 3, 5)
+        assert compact_record.face_anchor_coefficients.dcoefficient_scan_d_log_nu_star.shape == (2, 2, 3, 5)
+    else:
+        with pytest.raises(NotImplementedError, match="interpolated response-anchor lane"):
+            model.build_lagged_response_with_compact_coefficient_record(state0)
+    # The omitted middle face is an interpolated approximation in the reduced
+    # lane. Live-reference identities apply at anchors; the full lane tests all.
+    anchors = model._response_anchor_indices(3)
     lagged_at_reference = model.evaluate_with_lagged_response(state0, response)
     direct_at_reference = face_fluxes_from_state(state0)
     for name in ("Gamma", "Q", "Upar"):
         assert jnp.allclose(
-            lagged_at_reference[f"{name}_faces"],
-            direct_at_reference[name],
+            lagged_at_reference[f"{name}_faces"][:, anchors],
+            direct_at_reference[name][:, anchors],
             rtol=3.0e-6,
             atol=1.0e-12,
         )
@@ -355,8 +363,8 @@ def test_ntx_exact_runtime_lagged_face_response_matches_reference_and_finite_dif
     )
     for name in ("Gamma", "Q", "Upar"):
         assert jnp.allclose(
-            lagged_direction[f"{name}_faces"] / epsilon,
-            finite_difference[name],
+            lagged_direction[f"{name}_faces"][:, anchors] / epsilon,
+            finite_difference[name][:, anchors],
             rtol=2.0e-2,
             atol=1.0e-8,
         )
