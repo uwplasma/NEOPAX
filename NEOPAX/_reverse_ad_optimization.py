@@ -232,6 +232,9 @@ INITIAL_ER_ROOT_ONLY_OBJECTIVES: tuple[str, ...] = (
     "net_total_power_volume_average_mw_m3",
     "Er_transition_left",
     "Er_transition_right",
+    "Er_transition_rho",
+    "Er_transition_location_moment",
+    "Er_transition_strength",
     "Er2_volume_average",
     "Er_volume_average",
 )
@@ -1566,6 +1569,24 @@ def _initial_er_root_only_objective_values(
             return _er_at_index(transition_left_index)
         if name == "Er_transition_right":
             return _er_at_index(transition_right_index)
+        if name in {
+            "Er_transition_rho", "Er_transition_location_moment", "Er_transition_strength"
+        }:
+            # Use the same local objective as full transport, evaluated on the
+            # selected initial roots. Keep rho_grid in the geometry VJP too.
+            return _transport_reverse.objective_scalar_by_index(
+                state,
+                runtime,
+                0,
+                objective_labels=(name,),
+                er_transition_rho_min=float(opts.get("Er_transition_rho_min", 0.25)),
+                er_transition_rho_max=float(opts.get("Er_transition_rho_max", 0.75)),
+                er_transition_rho_target=float(opts.get("Er_transition_rho_target", 0.5)),
+                er_transition_temperature_kv_m=float(opts.get("Er_transition_temperature_kv_m", 2.0)),
+                er_transition_positive_part_eps=float(opts.get("Er_transition_positive_part_eps", 1.0e-6)),
+                er_transition_rho_softness=float(opts.get("Er_transition_rho_softness", 0.05)),
+                er_transition_softmax_beta=float(opts.get("Er_transition_softmax_beta", 16.0)),
+            )
         if name == "Er2_volume_average":
             return _initial_er_root_only_volume_average(er * er, geometry)
         if name == "Er_volume_average":

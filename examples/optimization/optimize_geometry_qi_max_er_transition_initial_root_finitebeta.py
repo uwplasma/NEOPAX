@@ -34,17 +34,14 @@ TRANSPORT_CONFIG = (
     / "benchmarks"
     / "Solve_Transport_equations_noHe_radau_ntx_exact_lagged_runtime_vmec_realtime_benchmark.toml"
 )
-OUT_DIR = ROOT / "outputs" / "geometry_qi_max_er_transition_initial_root_finitebeta_optimization"
+OUT_DIR = ROOT / "outputs" / "geometry_qi_max_er_transition_initial_root_finitebeta_electron_root_optimization"
 SURFACES = np.asarray([1 / 51, 5 / 51, 10 / 51, 15 / 51, 20 / 51, 25 / 51, 30 / 51, 35 / 51, 40 / 51, 45 / 51, 51 / 51], dtype=float)
 QI_MBOZ = QI_NBOZ = 18
 MAX_MODE_SCHEDULE = (4,)
 GEOMETRY_FAMILIES, SCALE_MODE, ESS_ALPHA = "RBC,ZBS", "ess", 1.2
 ASPECT_TARGET, IOTA_TARGET, MIRROR_TARGET = 10.0, -0.61, 0.19
-ER_TRANSITION_LEFT_INDEX, ER_TRANSITION_RIGHT_INDEX = 25, 26
-ER_TRANSITION_LEFT_TARGET, ER_TRANSITION_RIGHT_TARGET = 26.0, -10.0
 # Same base weights as optimize_geometry_qi_max_er_transition_initial_root.py.
 QI_WEIGHT, MAXJ_WEIGHT, ASPECT_WEIGHT, IOTA_WEIGHT, MIRROR_WEIGHT = 1.6, 0.001, 1.0, 1.0, 500.0
-ER_TRANSITION_LEFT_WEIGHT = ER_TRANSITION_RIGHT_WEIGHT = 0.09
 # VMEX finite-beta defaults used by optimize_geometry_qi_only_finitebeta.py.
 INCLUDE_BETA = True
 BETA_TARGET, BETA_WEIGHT = 0.05, 10.0
@@ -52,9 +49,20 @@ INCLUDE_DMERC = False
 DMERC_TARGET, DMERC_WEIGHT = 0.0, 0.05
 NFEV, FTOL, XTOL, SOLVER_DEVICE = 20, 1.0e-6, 1.0e-10, "default"
 REVERSE_STAGE_MODE = "optimization_payload_root_scan_geometry_experiment"
+ER_TRANSITION_RHO_TARGET = 0.514
+ER_TRANSITION_RHO_MIN, ER_TRANSITION_RHO_MAX = 0.05, 0.9
+ER_TRANSITION_TEMPERATURE_KV_M = 2.0
+ER_TRANSITION_RHO_SOFTNESS, ER_TRANSITION_SOFTMAX_BETA = 0.05, 16.0
+ER_TRANSITION_RHO_WEIGHT = 1000.0
+ER_TRANSITION_STRENGTH_TARGET, ER_TRANSITION_STRENGTH_WEIGHT = 0.90, 100.0
 ROOT_OPTIONS = {
-    "Er_transition_left_index": ER_TRANSITION_LEFT_INDEX,
-    "Er_transition_right_index": ER_TRANSITION_RIGHT_INDEX,
+    "Er_transition_rho_target": ER_TRANSITION_RHO_TARGET,
+    "Er_transition_rho_min": ER_TRANSITION_RHO_MIN,
+    "Er_transition_rho_max": ER_TRANSITION_RHO_MAX,
+    "Er_transition_temperature_kv_m": ER_TRANSITION_TEMPERATURE_KV_M,
+    "Er_transition_positive_part_eps": 1.0e-6,
+    "Er_transition_rho_softness": ER_TRANSITION_RHO_SOFTNESS,
+    "Er_transition_softmax_beta": ER_TRANSITION_SOFTMAX_BETA,
 }
 
 MAKE_WOUT_PLOTS = True
@@ -78,13 +86,27 @@ def mirror_penalty_value(value):
 mirror_penalty = opt.transformed_geometry_objective(opt.geometry.vmec_mirror_ratio, mirror_penalty_value, label="mirror_penalization")
 
 
+def transition_strength_deficit_value(strength):
+    deficit = ER_TRANSITION_STRENGTH_TARGET - strength
+    return 0.5 * (deficit + jnp.sqrt(deficit * deficit + 1.0e-12))
+
+
+transition_strength_deficit = opt.transformed_transport_objective(
+    opt.transport.Er_transition_strength,
+    transition_strength_deficit_value,
+    label="Er_transition_strength_deficit",
+)
+
+
 def active_terms():
     terms = [
         (opt.geometry.boozer_qi_objective, 0.0, QI_WEIGHT), (opt.geometry.boozer_maxj_objective, 0.0, MAXJ_WEIGHT),
         (mirror_penalty, 0.0, MIRROR_WEIGHT), (opt.geometry.vmec_aspect_ratio, ASPECT_TARGET, ASPECT_WEIGHT),
         (opt.geometry.vmec_iota_mean, IOTA_TARGET, IOTA_WEIGHT),
-        (opt.transport.Er_transition_left, ER_TRANSITION_LEFT_TARGET, ER_TRANSITION_LEFT_WEIGHT),
-        (opt.transport.Er_transition_right, ER_TRANSITION_RIGHT_TARGET, ER_TRANSITION_RIGHT_WEIGHT),
+        (opt.transport.Er_transition_rho, 0.0, 0.0),  # Report only.
+        (opt.transport.Er_transition_location_moment, 0.0, ER_TRANSITION_RHO_WEIGHT),
+        (opt.transport.Er_transition_strength, 0.0, 0.0),  # Report only.
+        (transition_strength_deficit, 0.0, ER_TRANSITION_STRENGTH_WEIGHT),
     ]
     if INCLUDE_BETA:
         terms.append((opt.geometry.vmec_beta_total, BETA_TARGET, BETA_WEIGHT))
@@ -143,10 +165,12 @@ def iteration_diagnostics(evaluation) -> str:
         f"qi_cost={component_cost('geometry:boozer_qi_objective', 'boozer_qi_objective'):.8e} "
         f"maxJ={value('geometry:boozer_maxj_objective', 'boozer_maxj_objective'):.8e} "
         f"maxJ_cost={component_cost('geometry:boozer_maxj_objective', 'boozer_maxj_objective'):.8e} "
-        f"Er_left={value('transport:Er_transition_left', 'Er_transition_left'):.8e} "
-        f"Er_left_cost={component_cost('transport:Er_transition_left', 'Er_transition_left'):.8e} "
-        f"Er_right={value('transport:Er_transition_right', 'Er_transition_right'):.8e} "
-        f"Er_right_cost={component_cost('transport:Er_transition_right', 'Er_transition_right'):.8e} "
+        f"Er_transition_rho={value('transport:Er_transition_rho', 'Er_transition_rho'):.8e} "
+        f"Er_transition_location_moment={value('transport:Er_transition_location_moment', 'Er_transition_location_moment'):.8e} "
+        f"Er_transition_location_cost={0.5 * residual_lookup.get('transport:Er_transition_location_moment', np.nan)**2:.8e} "
+        f"Er_transition_strength={value('transport:Er_transition_strength', 'Er_transition_strength'):.8e} "
+        f"Er_transition_strength_deficit={value('Er_transition_strength_deficit'):.8e} "
+        f"Er_transition_strength_cost={0.5 * residual_lookup.get('Er_transition_strength_deficit', np.nan)**2:.8e} "
         f"beta_total={value('geometry:vmec_beta_total', 'vmec_beta_total'):.8e} "
         f"beta_cost={component_cost('geometry:vmec_beta_total', 'vmec_beta_total'):.8e} "
         f"softmax_dmerc={value('geometry:vmec_dmerc_stability_softmax', 'vmec_dmerc_stability_softmax'):.8e} "
@@ -498,6 +522,7 @@ def main() -> int:
     args = parser().parse_args()
     INCLUDE_BETA = bool(INCLUDE_BETA or args.include_beta)
     INCLUDE_DMERC = bool(INCLUDE_DMERC or args.include_dmerc)
+    print("[setup] initial ambipolar roots only; electron-root options=" + json.dumps(ROOT_OPTIONS), flush=True)
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     current_input = SEED_INPUT
     initial_input = optimized_input = final_problem = final_result = initial_values = final_values = None
@@ -553,6 +578,9 @@ def main() -> int:
         np.asarray(final_result.x, dtype=float),
     )
     summary = {"seed_input": str(SEED_INPUT), "transport_config": str(TRANSPORT_CONFIG), "reverse_stage_mode": REVERSE_STAGE_MODE, "include_beta": INCLUDE_BETA, "include_dmerc": INCLUDE_DMERC, "parameter_labels": list(final_problem.parameter_labels), "x": np.asarray(final_result.x, dtype=float).tolist(), "cost": float(final_result.cost), "optimality": float(final_result.optimality), "status": int(final_result.status), "message": str(final_result.message)}
+    summary["electron_root_options"] = dict(ROOT_OPTIONS)
+    summary["electron_root_weights"] = {"location": ER_TRANSITION_RHO_WEIGHT, "strength": ER_TRANSITION_STRENGTH_WEIGHT}
+    summary["electron_root_strength_target"] = ER_TRANSITION_STRENGTH_TARGET
     (OUT_DIR / "optimization_summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
     print(f"wrote {OUT_DIR / 'optimization_summary.json'}")
     return 0

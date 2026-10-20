@@ -14,6 +14,7 @@ import numpy as np
 
 from NEOPAX import optimization as opt
 from NEOPAX import _reverse_ad_transport as reverse
+from NEOPAX import _reverse_ad_optimization as root_reverse
 from NEOPAX._constants import elementary_charge
 from examples.optimization import (
     optimize_geometry_qi_max_er_transition_bootstrap_net_power_initial_root_database_full_transport
@@ -88,6 +89,76 @@ def _numpy_bootstrap(upar, charge):
 
 
 class RootBootstrapDerivativeTests(unittest.TestCase):
+    def test_initial_root_transition_values_and_vjp_against_numpy_fd(self):
+        # Exercise the root-only dispatcher, including direct rho-grid bars.
+        # These numerical checks do not call an ambipolar or transport solver.
+        options = {
+            "Er_transition_rho_min": 0.05,
+            "Er_transition_rho_max": 0.9,
+            "Er_transition_rho_target": TARGET,
+            "Er_transition_temperature_kv_m": 2.0,
+            "Er_transition_positive_part_eps": 1e-6,
+            "Er_transition_rho_softness": 0.05,
+            "Er_transition_softmax_beta": 16.0,
+        }
+        self.assertEqual(
+            root_reverse.normalize_initial_er_root_only_objective_names(LABELS), LABELS,
+        )
+
+        def objective(er, rho):
+            return root_reverse._initial_er_root_only_objective_values(
+                SimpleNamespace(Er=er),
+                SimpleNamespace(geometry=SimpleNamespace(rho_grid=rho)),
+                LABELS, options=options,
+            )
+
+        rho = np.linspace(0.003, 0.997, 51)
+        cases = (
+            40 * np.tanh((0.55657 - rho) / 0.018),
+            np.full(51, -10.0),
+            np.zeros(51),
+        )
+        for er in cases:
+            with self.subTest(er_range=(float(er.min()), float(er.max()))):
+                values, (er_bars, rho_bars) = reverse._objective_vector_joint_vjp_rows(
+                    objective, jnp.asarray(er), jnp.asarray(rho),
+                )
+                numerical = _finite_difference(
+                    lambda x: _numpy_transition(x[:51], x[51:]),
+                    np.concatenate((er, rho)),
+                    np.concatenate((
+                        np.full(51, 2e-9 if not np.any(er) else 1e-5),
+                        np.full(51, 1e-6),
+                    )),
+                )
+                np.testing.assert_allclose(values, _numpy_transition(er, rho), rtol=2e-12, atol=2e-12)
+                np.testing.assert_allclose(
+                    np.concatenate((np.asarray(er_bars), np.asarray(rho_bars)), axis=1),
+                    numerical, rtol=3e-5, atol=5e-7,
+                )
+                self.assertGreater(float(jnp.linalg.norm(rho_bars)), 0.0)
+
+    def test_initial_root_transition_options_reach_shared_formula(self):
+        # Non-default settings catch silently ignored root_options entries.
+        er = jnp.asarray([4.0, 3.0, 1.0, -2.0, -5.0])
+        rho = jnp.linspace(0.1, 0.9, er.size)
+        kwargs = dict(
+            er_transition_rho_min=0.1, er_transition_rho_max=0.8,
+            er_transition_rho_target=0.63, er_transition_temperature_kv_m=3.0,
+            er_transition_positive_part_eps=0.02, er_transition_rho_softness=0.13,
+            er_transition_softmax_beta=7.0,
+        )
+        options = {"E" + name[1:]: value for name, value in kwargs.items()}
+        state = SimpleNamespace(Er=er)
+        runtime = SimpleNamespace(geometry=SimpleNamespace(rho_grid=rho))
+        actual = root_reverse._initial_er_root_only_objective_values(
+            state, runtime, LABELS, options=options,
+        )
+        expected = jnp.stack(tuple(reverse.objective_scalar_by_index(
+            state, runtime, index, objective_labels=LABELS, **kwargs,
+        ) for index in range(len(LABELS))))
+        np.testing.assert_allclose(actual, expected, rtol=1e-13, atol=1e-13)
+
     def test_transition_values_and_er_and_rho_derivatives_against_numpy_fd(self):
         rho = np.linspace(0.003, 0.997, 51)
         resolved = 40 * np.tanh((0.55657 - rho) / 0.018)

@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Profile-only optimization for initial-Er targets and bootstrap-current limit."""
+"""Profile-only max-Er + smooth initial electron-root transition + bootstrap."""
 
 from __future__ import annotations
 
@@ -26,7 +26,7 @@ TRANSPORT_CONFIG = (
     / "benchmarks"
     / "Solve_Transport_equations_noHe_radau_ntx_exact_lagged_runtime_vmec_realtime_benchmark.toml"
 )
-OUT_DIR = ROOT / "outputs" / "profiles_max_er_transition_bootstrap_initial_root_optimization"
+OUT_DIR = ROOT / "outputs" / "profiles_max_er_transition_bootstrap_initial_root_electron_root_optimization"
 
 PROFILE_PARAMETERS = (
     "n0,T0,density_shape_power,temperature_shape_power,"
@@ -51,24 +51,29 @@ PROFILE_PHYSICAL_UPPER = {
 }
 
 MAX_ER_TARGET = 25.0
-ER_TRANSITION_LEFT_INDEX = 25
-ER_TRANSITION_RIGHT_INDEX = 26
-ER_TRANSITION_LEFT_TARGET = 25.0
-ER_TRANSITION_RIGHT_TARGET = -10.0
 BOOTSTRAP_LIMIT_SCALED = 0.1  # 10 kA/m^2 in the scaled bootstrap-current objective.
 
 MAX_ER_WEIGHT = 10.0
-ER_TRANSITION_LEFT_WEIGHT = 0.1
-ER_TRANSITION_RIGHT_WEIGHT = 0.1
 BOOTSTRAP_WEIGHT = 10.0
 
 NFEV = 40
 FTOL = 1.0e-6
 XTOL = 1.0e-10
 SOLVER_DEVICE = "default"
+ER_TRANSITION_RHO_TARGET = 0.514
+ER_TRANSITION_RHO_MIN, ER_TRANSITION_RHO_MAX = 0.05, 0.9
+ER_TRANSITION_TEMPERATURE_KV_M = 2.0
+ER_TRANSITION_RHO_SOFTNESS, ER_TRANSITION_SOFTMAX_BETA = 0.05, 16.0
+ER_TRANSITION_RHO_WEIGHT = 1000.0
+ER_TRANSITION_STRENGTH_TARGET, ER_TRANSITION_STRENGTH_WEIGHT = 0.90, 100.0
 ROOT_OPTIONS = {
-    "Er_transition_left_index": ER_TRANSITION_LEFT_INDEX,
-    "Er_transition_right_index": ER_TRANSITION_RIGHT_INDEX,
+    "Er_transition_rho_target": ER_TRANSITION_RHO_TARGET,
+    "Er_transition_rho_min": ER_TRANSITION_RHO_MIN,
+    "Er_transition_rho_max": ER_TRANSITION_RHO_MAX,
+    "Er_transition_temperature_kv_m": ER_TRANSITION_TEMPERATURE_KV_M,
+    "Er_transition_positive_part_eps": 1.0e-6,
+    "Er_transition_rho_softness": ER_TRANSITION_RHO_SOFTNESS,
+    "Er_transition_softmax_beta": ER_TRANSITION_SOFTMAX_BETA,
 }
 
 
@@ -84,10 +89,24 @@ bootstrap_penalty = opt.transformed_transport_objective(
 )
 
 
+def transition_strength_deficit_value(strength):
+    deficit = ER_TRANSITION_STRENGTH_TARGET - strength
+    return 0.5 * (deficit + jnp.sqrt(deficit * deficit + 1.0e-12))
+
+
+transition_strength_deficit = opt.transformed_transport_objective(
+    opt.transport.Er_transition_strength,
+    transition_strength_deficit_value,
+    label="Er_transition_strength_deficit",
+)
+
+
 terms = [
     (opt.transport.softmax_Er, MAX_ER_TARGET, MAX_ER_WEIGHT),
-    (opt.transport.Er_transition_left, ER_TRANSITION_LEFT_TARGET, ER_TRANSITION_LEFT_WEIGHT),
-    (opt.transport.Er_transition_right, ER_TRANSITION_RIGHT_TARGET, ER_TRANSITION_RIGHT_WEIGHT),
+    (opt.transport.Er_transition_rho, 0.0, 0.0),  # Report only.
+    (opt.transport.Er_transition_location_moment, 0.0, ER_TRANSITION_RHO_WEIGHT),
+    (opt.transport.Er_transition_strength, 0.0, 0.0),  # Report only.
+    (transition_strength_deficit, 0.0, ER_TRANSITION_STRENGTH_WEIGHT),
     (bootstrap_penalty, 0.0, BOOTSTRAP_WEIGHT),
 ]
 
@@ -126,10 +145,12 @@ def iteration_diagnostics(evaluation):
         f"softmax_Er={value('transport:softmax_Er', 'softmax_Er'):.8e} "
         f"Er_residual={er_residual:.8e} "
         f"Er_cost={er_cost:.8e} "
-        f"Er_left={value('transport:Er_transition_left', 'Er_transition_left'):.8e} "
-        f"Er_left_residual={residual('transport:Er_transition_left', 'Er_transition_left'):.8e} "
-        f"Er_right={value('transport:Er_transition_right', 'Er_transition_right'):.8e} "
-        f"Er_right_residual={residual('transport:Er_transition_right', 'Er_transition_right'):.8e} "
+        f"Er_transition_rho={value('transport:Er_transition_rho', 'Er_transition_rho'):.8e} "
+        f"Er_transition_location_moment={value('transport:Er_transition_location_moment', 'Er_transition_location_moment'):.8e} "
+        f"Er_transition_location_cost={0.5 * residual_lookup.get('transport:Er_transition_location_moment', np.nan)**2:.8e} "
+        f"Er_transition_strength={value('transport:Er_transition_strength', 'Er_transition_strength'):.8e} "
+        f"Er_transition_strength_deficit={value('Er_transition_strength_deficit'):.8e} "
+        f"Er_transition_strength_cost={0.5 * residual_lookup.get('Er_transition_strength_deficit', np.nan)**2:.8e} "
         f"bootstrap_penalty={bootstrap_penalty_value:.8e} "
         f"bootstrap_residual={bootstrap_residual:.8e} "
         f"grad={gradient.tolist()}"
@@ -416,8 +437,13 @@ def save_initial_final_profile_overlay(initial, optimized, out_dir):
 
 # --------------------------- solve -----------------------------------------
 def main() -> int:
+    print("[setup] initial ambipolar roots only; electron-root options=" + json.dumps(ROOT_OPTIONS), flush=True)
     OUT_DIR.mkdir(parents=True, exist_ok=True)
-    active_terms = tuple(term for term in terms if float(term[2]) != 0.0)
+    active_terms = tuple(
+        term for term in terms
+        if float(term[2]) != 0.0
+        or term[0] in (opt.transport.Er_transition_rho, opt.transport.Er_transition_strength)
+    )
     problem = opt.geometry_initial_er_root_only_least_squares_problem(
         TRANSPORT_CONFIG,
         active_terms,
@@ -475,6 +501,9 @@ def main() -> int:
         "status": int(result.status),
         "message": str(result.message),
     }
+    summary["electron_root_options"] = dict(ROOT_OPTIONS)
+    summary["electron_root_weights"] = {"location": ER_TRANSITION_RHO_WEIGHT, "strength": ER_TRANSITION_STRENGTH_WEIGHT}
+    summary["electron_root_strength_target"] = ER_TRANSITION_STRENGTH_TARGET
     summary_path = OUT_DIR / "optimization_summary.json"
     summary_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
     print(f"wrote {summary_path}")

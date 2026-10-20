@@ -23,7 +23,7 @@ import optimize_geometry_qi_max_er_transition_bootstrap_initial_root as base
 # the vacuum seed.  This deck differs only by its finite Akima pressure
 # profile.
 SEED_INPUT = base.ROOT / "examples" / "inputs" / "input.QI_nfp2_initial_finitebeta"
-OUT_DIR = base.ROOT / "outputs" / "geometry_qi_max_er_transition_bootstrap_initial_root_dmerc_optimization"
+OUT_DIR = base.ROOT / "outputs" / "geometry_qi_max_er_transition_bootstrap_initial_root_dmerc_electron_root_optimization"
 
 # These are VMEX's documented/default smooth-Mercier settings.  The public
 # NEOPAX objective deliberately exposes that fixed default kernel, rather

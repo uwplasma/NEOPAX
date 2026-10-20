@@ -1,5 +1,87 @@
 # Live NTX-database initial-root optimization and memory plan
 
+## Rerunning the smooth electron-root examples (2026-10-20)
+
+The root-only API now accepts `Er_transition_rho`,
+`Er_transition_location_moment`, and `Er_transition_strength`. It calls the
+same local objective functions as full transport, on the **selected initial
+ambipolar roots**. Both Er cotangents and direct radial-grid cotangents remain
+in the reverse calculation. The established exact-Lij and database reverse
+stages are retained.
+
+The nine transition examples (vacuum/finite-beta, exact-Lij/database,
+with/without bootstrap, plus the profile-only example) replace the two
+fixed-cell Er targets with:
+
+- `Er_transition_location_moment`, target zero, weight 1000: move the smooth
+  positive-to-negative transition toward `rho = 0.514`.
+- `Er_transition_strength_deficit`, target zero, weight 100: smooth positive
+  part of `0.90 - Er_transition_strength`. This penalizes a weak or absent
+  transition without imposing an upper strength target.
+- Zero-weight reporting rows for the selected transition radius and strength.
+
+Their options use the radial window `[0.05, 0.9]`, Er scale 2 kV/m, radial
+softness 0.05, softmax beta 16, and smoothing epsilon `1e-6`. Settings are near
+the top of each script and saved in its optimization summary. Iteration
+reports include the new observables and separate location/strength costs.
+Output directories now end in `_electron_root_optimization`, including the
+DMerc wrapper that inherits the updated exact-Lij bootstrap example.
+
+The QI, geometry, bootstrap, profile bounds, seed inputs and resolution
+settings retain each example's previous defaults. In particular, the
+profile-only example still optimizes its maximum-Er target and uses
+`input.QI_nfp2_newNT_opt_hires`; the vacuum geometry examples start from
+`input.QI_nfp2_initial`. The separate maximum-Er-only examples retain their
+maximum-Er objective.
+
+These runs do **not** integrate transport in time, so Radau Jacobian replay,
+accepted-step limits and total attempted-step limits do not apply. Pulling
+the new source includes current shared flux/root implementations, but the
+recent full-transport replay corrections are not part of this root-only
+calculation.
+
+After syncing the changes, run on the remote GPU machine in `jax_env`:
+
+```bash
+cd ~/NEOPAX
+mkdir -p outputs
+set -o pipefail
+
+# Geometry + QI + initial electron-root transition.
+env XLA_FLAGS="${XLA_FLAGS:-} --xla_gpu_enable_command_buffer=" \
+PYTHONPATH="$HOME/VMEX:$HOME/NTX/src" \
+python examples/optimization/optimize_geometry_qi_max_er_transition_initial_root_database.py \
+  2>&1 | tee outputs/ambipolarity_electron_root_database.log
+
+# Same root-only calculation with the bootstrap-current penalty.
+env XLA_FLAGS="${XLA_FLAGS:-} --xla_gpu_enable_command_buffer=" \
+PYTHONPATH="$HOME/VMEX:$HOME/NTX/src" \
+python examples/optimization/optimize_geometry_qi_max_er_transition_bootstrap_initial_root_database.py \
+  2>&1 | tee outputs/ambipolarity_electron_root_bootstrap_database.log
+```
+
+For the finite-beta database counterparts, use the corresponding filenames
+ending in `_initial_root_database_finitebeta.py`. They retain their existing
+finite-beta seed, mode schedule and beta/DMerc switches. For exact-Lij, use
+the corresponding filenames without `_database`.
+
+To optimize only the six profile parameters on the profile example's fixed
+geometry:
+
+```bash
+env XLA_FLAGS="${XLA_FLAGS:-} --xla_gpu_enable_command_buffer=" \
+PYTHONPATH="$HOME/VMEX:$HOME/NTX/src" \
+python examples/optimization/optimize_profiles_max_er_transition_bootstrap_initial_root.py \
+  2>&1 | tee outputs/ambipolarity_profiles_electron_root_bootstrap.log
+```
+
+Validation: 33 lightweight tests plus 48 subtests passed. They check root-only
+objective values and Er/rho-grid derivatives against independent NumPy finite
+differences, non-default option forwarding, transformed residual/Jacobian
+assembly and example builders. No VMEC, NTX, ambipolar root, transport or
+optimization solve was run locally. Full optimization convergence and memory
+behavior with the new objective combination still need remote validation.
+
 ## Scope
 
 Make the geometry + initial-ambipolar-root optimization path support the

@@ -1712,6 +1712,11 @@ def geometry_initial_er_root_only_least_squares_problem(
     The returned problem is intentionally thin and script-friendly: users define
     least-squares terms in the optimization script, while this helper owns the
     transport runtime setup and validated reverse-table calls.
+
+    The smooth ``Er_transition_rho``, ``Er_transition_location_moment``, and
+    ``Er_transition_strength`` objectives use the same formulas and
+    ``Er_transition_*`` options as full transport, evaluated at the initial
+    selected roots. No transport time stepping or Radau replay is performed.
     """
 
     mode = str(reverse_stage_mode).strip().lower()
