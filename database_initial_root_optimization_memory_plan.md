@@ -75,12 +75,37 @@ python examples/optimization/optimize_profiles_max_er_transition_bootstrap_initi
   2>&1 | tee outputs/ambipolarity_profiles_electron_root_bootstrap.log
 ```
 
-Validation: 33 lightweight tests plus 48 subtests passed. They check root-only
+Validation: 37 lightweight tests plus 48 subtests passed. They check root-only
 objective values and Er/rho-grid derivatives against independent NumPy finite
 differences, non-default option forwarding, transformed residual/Jacobian
 assembly and example builders. No VMEC, NTX, ambipolar root, transport or
 optimization solve was run locally. Full optimization convergence and memory
 behavior with the new objective combination still need remote validation.
+
+### First GPU rerun: repeated-observable stage labels
+
+The first database/bootstrap rerun reached the root-to-database scan fold
+(`objective_rows=4`), then failed in the compiled-stage result adapter before
+the initial optimizer report. Its metadata contained five labels:
+`Er_transition_rho`, `Er_transition_location_moment`,
+`Er_transition_strength`, `Er_transition_strength`, and
+`bootstrap_current_softmax_abs_scaled`. The result requires unique labels.
+
+The reporting strength and transformed deficit intentionally share one raw
+observable. The evaluator already requested four unique backend rows, while
+root-stage setup and payload-result setup incorrectly retained both strength
+entries. Both setup lists now deduplicate names in first-occurrence order.
+The five transport residual rows, their targets, weights and chain rules
+remain separate.
+
+Four new lightweight regression cases exercise the real public problem
+constructor and result adapter for the three database root-stage variants
+and the staged exact-Lij variant. Physics kernels are stubbed; unique table
+labels, array shapes, reuse of the strength row and expansion to reporting
+plus deficit residuals are checked with production assembly code. The
+earlier tests stopped above this adapter and missed the mismatch. The same
+remote command can be rerun after syncing this fix; no GPU rerun has been
+performed locally.
 
 ## Scope
 

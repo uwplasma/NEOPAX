@@ -1868,11 +1868,14 @@ def geometry_initial_er_root_only_least_squares_problem(
     prepared_payload_static = None
     payload_assembly_stage = None
     if mode in database_root_modes:
-        database_transport_objectives = tuple(
+        # Several residuals may reuse one observable (e.g. report strength
+        # and penalize its deficit). Backend rows must match the evaluator's
+        # unique, first-occurrence objective order; residuals stay separate.
+        database_transport_objectives = tuple(dict.fromkeys(
             term.objective.name
             for term in normalized_terms
             if term.objective.family == "transport"
-        )
+        ))
         if not database_transport_objectives:
             raise ValueError("database root experiment requires at least one transport objective.")
         # The benchmark evaluator expands active profile values to the six
@@ -1957,11 +1960,11 @@ def geometry_initial_er_root_only_least_squares_problem(
     }:
         if raw_block_stage is None:
             raise ValueError("optimization initial-root stage requires VMEC boundary parameters.")
-        stage_transport_objectives = tuple(
+        stage_transport_objectives = tuple(dict.fromkeys(
             term.objective.name
             for term in normalized_terms
             if term.objective.family == "transport"
-        )
+        ))
         stage_profile_parameter_labels = tuple(PROFILE_PARAMETER_ORDER)
 
         def _stage_payload(
