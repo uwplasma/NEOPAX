@@ -4926,7 +4926,16 @@ class NTXDatabaseTransportModel(TransportFluxModelBase):
         complete radial flux table keeps that scan record and all unrelated
         equation/source work outside this boundary.
         """
-        zero = jnp.zeros_like(jnp.asarray(state.density))
+        supplied_bars = tuple(
+            jnp.asarray(value)
+            for value in flux_bar.values()
+            if value is not None
+            and jnp.asarray(value).ndim > 0
+            and jnp.asarray(value).dtype != jax.dtypes.float0
+        )
+        # Preserve a supplied objective axis even when Gamma is absent.
+        zero = (jnp.zeros_like(supplied_bars[0]) if supplied_bars
+                else jnp.zeros_like(jnp.asarray(state.density)))
 
         def _bar(name):
             value = flux_bar.get(name, None)
