@@ -12,6 +12,7 @@ from ntx import GridSpec, example_surface, prepare_monoenergetic_system
 import NEOPAX._reverse_ad_transport as reverse_transport_module
 import NEOPAX._reverse_ad_initial_er as initial_er_module
 import NEOPAX._transport_flux_models as flux_models_module
+import NEOPAX._orchestrator as orchestrator_module
 from NEOPAX._orchestrator import (
     _build_database,
     _build_flux_model,
@@ -1061,7 +1062,7 @@ def test_realtime_boundary_edge_response_matches_fresh_reference_near_observed_r
                 )
 
 
-def test_realtime_node_edge_explicit_tangent_matches_generic_cached_primal_jvp():
+def test_realtime_node_edge_explicit_tangent_matches_generic_cached_primal_jvp(monkeypatch):
     """Audit the edge column without a Radau time solve.
 
     The solver has two possible derivative routes for its private edge
@@ -1081,6 +1082,20 @@ def test_realtime_node_edge_explicit_tangent_matches_generic_cached_primal_jvp()
     )
     config = load_config(config_path)
     config["_config_dir"] = str(config_path.parent)
+    # This is a derivative wiring identity on a fixed cache, not a kinetic
+    # convergence or ambipolar-initialization test. Keep the real radial mesh
+    # and BCs while using a small NTX matrix and an explicit initial Er profile.
+    config["neoclassical"] = dict(config["neoclassical"])
+    config["neoclassical"].update(
+        ntx_exact_n_theta=3, ntx_exact_n_zeta=3, ntx_exact_n_xi=2,
+    )
+    config["profiles"] = dict(config["profiles"], er_initialization_mode="analytical")
+    # This test prescribes every cache/edge coordinate below. Root selection is
+    # tested separately; it must not launch an unrelated setup solve here.
+    monkeypatch.setattr(
+        orchestrator_module, "_initialize_floating_er_edge_node",
+        lambda *args, **kwargs: jnp.asarray(-35.0),
+    )
     config["ambipolarity"] = dict(config["ambipolarity"])
     config["ambipolarity"]["er_ambipolar_plot"] = False
     runtime, state = build_runtime_context(config)
@@ -1144,7 +1159,7 @@ def test_realtime_node_edge_explicit_tangent_matches_generic_cached_primal_jvp()
         ), (edge_value_float, "private_edge_rhs")
 
 
-def test_realtime_outer_face_local_cache_matches_direct_near_observed_edge_roots():
+def test_realtime_outer_face_local_cache_matches_direct_near_observed_edge_roots(monkeypatch):
     """Compare one known boundary state without building a radial response.
 
     Only the final prepared NTX face operator is used.  The cache consists of
@@ -1165,6 +1180,13 @@ def test_realtime_outer_face_local_cache_matches_direct_near_observed_edge_roots
         ntx_exact_n_theta=7,
         ntx_exact_n_zeta=25,
         ntx_exact_n_xi=31,
+        preload_support=False,
+    )
+    # The prescribed edge sweep does not use a radial ambipolar root solve.
+    config["profiles"] = dict(config["profiles"], er_initialization_mode="analytical")
+    monkeypatch.setattr(
+        orchestrator_module, "_initialize_floating_er_edge_node",
+        lambda *args, **kwargs: jnp.asarray(-35.0),
     )
     config["ambipolarity"] = dict(config["ambipolarity"])
     config["ambipolarity"]["er_ambipolar_plot"] = False
@@ -1176,7 +1198,14 @@ def test_realtime_outer_face_local_cache_matches_direct_near_observed_edge_roots
     equation_system = components["equation_system"]
     neo = equation_system.shared_flux_model.neoclassical_model
     er_equation = equation_system.er_equation
-    support = neo._static_support()
+    rho_center, rho_face = neo._rho_center_face()
+    # Prepare only the center/face consumed here, retaining the original NTX
+    # resolution and physical edge surface rather than allocating 103 operators.
+    support = flux_models_module.build_ntx_exact_lij_runtime_support(
+        neo.vmec_file, neo.boozer_file, rho_center[-1:], rho_face[-1:],
+        surface_backend=neo.surface_backend,
+        n_theta=neo.n_theta, n_zeta=neo.n_zeta, n_xi=neo.n_xi,
+    )
     prepared_edge = jax.tree_util.tree_map(
         lambda value: jax.lax.dynamic_index_in_dim(
             value, value.shape[0] - 1, axis=0, keepdims=False
