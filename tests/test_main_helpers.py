@@ -1806,13 +1806,23 @@ def test_ntx_exact_support_only_prepared_pullback_matches_joint_helper():
         vth_a=kwargs["vth_a"],
     )
     actual_prepared, actual_drds, actual_primal = support_only
-    for actual_leaf, expected_leaf in zip(
-        jax.tree_util.tree_leaves(actual_prepared),
+    for (path, actual_leaf), expected_leaf in zip(
+        jax.tree_util.tree_flatten_with_path(actual_prepared)[0],
         jax.tree_util.tree_leaves(joint[3]),
         strict=True,
     ):
         if jnp.issubdtype(jnp.asarray(expected_leaf).dtype, jnp.inexact):
-            assert jnp.allclose(actual_leaf, expected_leaf, rtol=1.0e-9, atol=1.0e-11)
+            difference = jnp.abs(actual_leaf - expected_leaf)
+            tolerance = 1.0e-11 + 1.0e-9 * jnp.abs(expected_leaf)
+            assert jnp.allclose(actual_leaf, expected_leaf, rtol=1.0e-9, atol=1.0e-11), (
+                f"joint/support path={jax.tree_util.keystr(path)} shape={expected_leaf.shape} "
+                f"max_abs={float(jnp.max(difference)):.16e} "
+                f"max_abs_expected={float(jnp.max(jnp.abs(expected_leaf))):.16e} "
+                f"max_error_over_tolerance={float(jnp.max(difference / tolerance)):.16e} "
+                f"worst_flat_index={int(jnp.argmax(difference / tolerance))} "
+                f"actual_at_worst={float(jnp.ravel(actual_leaf)[jnp.argmax(difference / tolerance)]):.16e} "
+                f"expected_at_worst={float(jnp.ravel(expected_leaf)[jnp.argmax(difference / tolerance)]):.16e}"
+            )
     assert jnp.allclose(actual_drds, joint[4], rtol=1.0e-9, atol=1.0e-11)
     for actual_field, expected_field in zip(actual_primal, expected_primal, strict=True):
         assert jnp.allclose(actual_field, expected_field, rtol=1.0e-9, atol=1.0e-11)
