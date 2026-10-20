@@ -6,6 +6,7 @@ from pathlib import Path
 import h5py
 import jax
 import jax.numpy as jnp
+import numpy as np
 import pytest
 from ntx import GridSpec, example_surface, prepare_monoenergetic_system
 
@@ -1082,16 +1083,13 @@ def test_realtime_node_edge_explicit_tangent_matches_generic_cached_primal_jvp(m
     )
     config = load_config(config_path)
     config["_config_dir"] = str(config_path.parent)
-    # This is a derivative wiring identity on a fixed cache, not a kinetic
-    # convergence or ambipolar-initialization test. Keep the real radial mesh
-    # and BCs while using a small NTX matrix and an explicit initial Er profile.
+    # Retain the radial mesh and BCs; the prescribed-cache identity needs
+    # neither a large NTX matrix nor an ambipolar initialization solve.
     config["neoclassical"] = dict(config["neoclassical"])
     config["neoclassical"].update(
         ntx_exact_n_theta=3, ntx_exact_n_zeta=3, ntx_exact_n_xi=2,
     )
     config["profiles"] = dict(config["profiles"], er_initialization_mode="analytical")
-    # This test prescribes every cache/edge coordinate below. Root selection is
-    # tested separately; it must not launch an unrelated setup solve here.
     monkeypatch.setattr(
         orchestrator_module, "_initialize_floating_er_edge_node",
         lambda *args, **kwargs: jnp.asarray(-35.0),
@@ -1812,16 +1810,9 @@ def test_ntx_exact_support_only_prepared_pullback_matches_joint_helper():
         strict=True,
     ):
         if jnp.issubdtype(jnp.asarray(expected_leaf).dtype, jnp.inexact):
-            difference = jnp.abs(actual_leaf - expected_leaf)
-            tolerance = 1.0e-11 + 1.0e-9 * jnp.abs(expected_leaf)
-            assert jnp.allclose(actual_leaf, expected_leaf, rtol=1.0e-9, atol=1.0e-11), (
-                f"joint/support path={jax.tree_util.keystr(path)} shape={expected_leaf.shape} "
-                f"max_abs={float(jnp.max(difference)):.16e} "
-                f"max_abs_expected={float(jnp.max(jnp.abs(expected_leaf))):.16e} "
-                f"max_error_over_tolerance={float(jnp.max(difference / tolerance)):.16e} "
-                f"worst_flat_index={int(jnp.argmax(difference / tolerance))} "
-                f"actual_at_worst={float(jnp.ravel(actual_leaf)[jnp.argmax(difference / tolerance)]):.16e} "
-                f"expected_at_worst={float(jnp.ravel(expected_leaf)[jnp.argmax(difference / tolerance)]):.16e}"
+            np.testing.assert_allclose(
+                actual_leaf, expected_leaf, rtol=1e-9, atol=1e-11, equal_nan=False,
+                err_msg=f"joint/support path={jax.tree_util.keystr(path)}",
             )
     assert jnp.allclose(actual_drds, joint[4], rtol=1.0e-9, atol=1.0e-11)
     for actual_field, expected_field in zip(actual_primal, expected_primal, strict=True):
@@ -1861,12 +1852,9 @@ def test_ntx_exact_support_only_prepared_pullback_matches_joint_helper():
         zip(batched_support_only, expected_batched, strict=True)
     ):
         if jnp.issubdtype(jnp.asarray(expected_leaf).dtype, jnp.inexact):
-            difference = jnp.abs(actual_leaf - expected_leaf)
-            tolerance = 1.0e-11 + 1.0e-9 * jnp.abs(expected_leaf)
-            assert jnp.allclose(actual_leaf, expected_leaf, rtol=1.0e-9, atol=1.0e-11), (
-                f"batched support leaf={leaf_index} shape={expected_leaf.shape} "
-                f"max_abs={float(jnp.max(difference)):.16e} "
-                f"max_error_over_tolerance={float(jnp.max(difference / tolerance)):.16e}"
+            np.testing.assert_allclose(
+                actual_leaf, expected_leaf, rtol=1e-9, atol=1e-11, equal_nan=False,
+                err_msg=f"batched support leaf={leaf_index}",
             )
 
 

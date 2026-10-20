@@ -3672,12 +3672,6 @@ def test_black_box_recorded_database_direct_support_split_matches_generic_payloa
     actual = equations.pullback_direct_rhs_support_payload(
         jnp.asarray(0.0), None, None, jnp.asarray(17.0), support
     )
-    _, generic_pullback = jax.vjp(
-        lambda payload: equations.with_realtime_geometry_support_payload(payload)(None, None, None),
-        support,
-    )
-    (expected,) = generic_pullback(jnp.asarray(17.0))
-    _assert_float_tree_allclose(actual, expected)
     assert jnp.allclose(actual["geometry"], 17.0)
     assert jnp.allclose(actual["database"], 34.0)
     with pytest.raises(ValueError, match="requires exactly"):

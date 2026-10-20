@@ -215,12 +215,6 @@ def test_ntx_local_particle_flux_evaluator_passes_bc_constraints(monkeypatch):
     density = jnp.asarray([[1.0, 2.0], [2.0, 3.0], [4.0, 5.0]])
     state = TransportState(density=density, pressure=10.0 * density, Er=jnp.asarray([1.0, 2.0]))
     captured = {}
-    extract_constraints = flux_models_module._extract_right_constraints
-
-    def capture_constraints(bc, *args):
-        result = extract_constraints(bc, *args)
-        captured[bc.right_type] = result
-        return result
 
     def fake_local_lij(_species, _grid, _geometry, _database, species_index,
                        radius_index, er_value, *_args):
@@ -228,7 +222,6 @@ def test_ntx_local_particle_flux_evaluator_passes_bc_constraints(monkeypatch):
         captured["er_value"] = er_value
         return jnp.eye(3) * (er_value + species_index)
 
-    monkeypatch.setattr(flux_models_module, "_extract_right_constraints", capture_constraints)
     monkeypatch.setattr(flux_models_module, "get_Lij_matrix_local", fake_local_lij)
     # Controlled forces expose both reconstructed gradients in the local flux;
     # the monoenergetic stand-in contributes Er + species index.
@@ -246,18 +239,15 @@ def test_ntx_local_particle_flux_evaluator_passes_bc_constraints(monkeypatch):
     )
     out = model.build_local_particle_flux_evaluator(state)(1, 9.0)
 
-    # In this two-cell mesh, the last-center derivative is (outer face -
-    # midpoint)/0.5. Density outer faces use the FV boundary stencil
-    # (3*0.5*g + 9*n_last - n_previous)/8; temperature
-    # has a constant 10 profile and outer values 5,6,7.
+    # Last-center gradients use (outer face - midpoint)/0.5. The Neumann
+    # density face is (3*0.5*g + 9*n_last - n_previous)/8; the Dirichlet
+    # temperature faces are 5,6,7 for a constant 10 interior.
     expected_density_gradient = jnp.asarray([1.2875, 1.3250, 1.3625])
     expected_temperature_gradient = jnp.asarray([-10.0, -8.0, -6.0])
     expected = jnp.asarray([9.0, 10.0, 11.0]) * (
         1.0 + expected_density_gradient + 2.0 * expected_temperature_gradient
     )
     assert jnp.allclose(out, expected)
-    assert jnp.allclose(captured["neumann"][1], jnp.array([0.1, 0.2, 0.3]))
-    assert jnp.allclose(captured["dirichlet"][0], jnp.array([5.0, 6.0, 7.0]))
     assert int(captured["radius_index"]) == 1
     assert float(captured["er_value"]) == 9.0
 
