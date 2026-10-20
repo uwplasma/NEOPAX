@@ -5819,7 +5819,6 @@ def build_realized_schedule_rollout_report(
     include_nan_debug: bool = False,
     nan_debug_mode: str = "minimal",
     nan_debug_include_one_step_compare: bool = False,
-    accepted_step_limit: int | None = None,
 ) -> dict[str, Any]:
     if parameter_name not in ALLOWED_PARAMETERS:
         raise ValueError(f"parameter_name must be one of {sorted(ALLOWED_PARAMETERS)}")
@@ -5842,28 +5841,15 @@ def build_realized_schedule_rollout_report(
         use_realized_schedule_jvp=True,
     )[0]
 
-    if accepted_step_limit is None:
-        baseline_objectives, baseline_rollout = _adaptive_rollout_objectives_for_parameter(
-            jnp.asarray(baseline_value),
-            config=config,
-            runtime=runtime,
-            baseline_state=baseline_state,
-            profile_cfg=profile_cfg,
-            parameter_name=parameter_name,
-            use_realized_schedule_jvp=True,
-        )
-    else:
-        baseline_final_state, baseline_rollout = _adaptive_rollout_final_state_for_parameter(
-            jnp.asarray(baseline_value),
-            config=config,
-            runtime=runtime,
-            baseline_state=baseline_state,
-            profile_cfg=profile_cfg,
-            parameter_name=parameter_name,
-            use_realized_schedule_jvp=False,
-            accepted_step_limit_override=accepted_step_limit,
-        )
-        baseline_objectives = _objective_vector(baseline_final_state, runtime)
+    baseline_objectives, baseline_rollout = _adaptive_rollout_objectives_for_parameter(
+        jnp.asarray(baseline_value),
+        config=config,
+        runtime=runtime,
+        baseline_state=baseline_state,
+        profile_cfg=profile_cfg,
+        parameter_name=parameter_name,
+        use_realized_schedule_jvp=True,
+    )
     print("[autodiff-gate] realized-schedule progress: baseline rollout complete; running fd_minus rollout", flush=True)
     objectives_minus, minus_rollout = _adaptive_rollout_objectives_for_parameter(
         jnp.asarray(minus_value),

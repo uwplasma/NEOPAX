@@ -6299,6 +6299,11 @@ def geometry_payload_pullback_from_param_vector_raw_block_transpose(
 
         compact_setup = _compact_initial_er_setup()
         if compact_setup is not None:
+            compact_setup.update(
+                active_float_leaf_indices=active_float_leaf_indices,
+                payload_template_paths_and_leaves=payload_template_paths_and_leaves,
+                payload_bar_leaves_by_objective=payload_bar_leaves_by_objective,
+            )
             return compact_setup
 
         def payload_float_leaves_from_state(state_inner):
