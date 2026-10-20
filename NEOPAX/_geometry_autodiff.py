@@ -5585,15 +5585,18 @@ def _native_vmec_coefficient_tangent_contraction(
         raise ValueError("Native VMEC bar/tangent tuple lengths must match.")
     if not native_bars:
         raise ValueError("Native VMEC coefficient tangent contraction requires bars.")
-    rhs_count = int(jnp.asarray(native_bars[0]).shape[0])
-    result = jnp.zeros((rhs_count,), dtype=jnp.asarray(native_bars[0]).dtype)
+    first_bars = jnp.asarray(native_bars[0])
+    if first_bars.ndim < 1:
+        raise ValueError("Native VMEC coefficient bars need a leading RHS axis.")
+    rhs_count = int(first_bars.shape[0])
+    result = jnp.zeros((rhs_count,), dtype=first_bars.dtype)
     for coefficient_bars, coefficient_tangent in zip(
         native_bars, coefficient_tangents, strict=True
     ):
         coefficient_bars = jnp.asarray(coefficient_bars)
         coefficient_tangent = jnp.asarray(coefficient_tangent)
-        if coefficient_bars.ndim < 2:
-            raise ValueError("Native VMEC coefficient bars need RHS and coefficient axes.")
+        if coefficient_bars.ndim < 1 or coefficient_bars.shape[0] != rhs_count:
+            raise ValueError("Native VMEC coefficient bars need a consistent leading RHS axis.")
         if coefficient_bars.shape[1:] != coefficient_tangent.shape:
             raise ValueError(
                 "Native VMEC coefficient bar/tangent shapes must agree after the RHS axis: "

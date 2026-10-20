@@ -1847,9 +1847,17 @@ def test_ntx_exact_support_only_prepared_pullback_matches_joint_helper():
         jnp.broadcast_to(value, (2,) + jnp.asarray(value).shape)
         for value in _sanitized_support_only(*kwargs["field_bars"])
     )
-    for actual_leaf, expected_leaf in zip(batched_support_only, expected_batched, strict=True):
+    for leaf_index, (actual_leaf, expected_leaf) in enumerate(
+        zip(batched_support_only, expected_batched, strict=True)
+    ):
         if jnp.issubdtype(jnp.asarray(expected_leaf).dtype, jnp.inexact):
-            assert jnp.allclose(actual_leaf, expected_leaf, rtol=1.0e-9, atol=1.0e-11)
+            difference = jnp.abs(actual_leaf - expected_leaf)
+            tolerance = 1.0e-11 + 1.0e-9 * jnp.abs(expected_leaf)
+            assert jnp.allclose(actual_leaf, expected_leaf, rtol=1.0e-9, atol=1.0e-11), (
+                f"batched support leaf={leaf_index} shape={expected_leaf.shape} "
+                f"max_abs={float(jnp.max(difference)):.16e} "
+                f"max_error_over_tolerance={float(jnp.max(difference / tolerance)):.16e}"
+            )
 
 
 def test_joint_local_pullback_primal_output_preserves_existing_bars():
@@ -2197,7 +2205,7 @@ def test_joint_lowdot_scalar_rhs_layout_does_not_hide_rhs_axis_from_anchor_scan(
     def _joint_with_batched_scan_carry(rhs_values):
         def _body(carry, anchor):
             state_bar, support_bar = carry
-            local_bar = jax.lax.dynamic_index_in_dim(rhs_values, anchor, axis=1)
+            local_bar = jax.lax.dynamic_index_in_dim(rhs_values, anchor, axis=1, keepdims=False)
             return (
                 state_bar + local_bar[:, None],
                 {"geometry": support_bar["geometry"] + local_bar[:, None]},
@@ -2216,7 +2224,7 @@ def test_joint_lowdot_scalar_rhs_layout_does_not_hide_rhs_axis_from_anchor_scan(
         def _one_rhs(one_rhs):
             def _body(carry, anchor):
                 state_bar, support_bar = carry
-                local_bar = jax.lax.dynamic_index_in_dim(one_rhs, anchor, axis=0)
+                local_bar = jax.lax.dynamic_index_in_dim(one_rhs, anchor, axis=0, keepdims=False)
                 return (
                     state_bar + local_bar,
                     {"geometry": support_bar["geometry"] + local_bar},
@@ -2238,17 +2246,20 @@ def test_joint_lowdot_scalar_rhs_layout_does_not_hide_rhs_axis_from_anchor_scan(
         scan_equations = [eqn for eqn in closed.jaxpr.eqns if eqn.primitive.name == "scan"]
         assert len(scan_equations) == 1
         scan = scan_equations[0]
-        carry_count = scan.params["num_carry"]
         body = scan.params["jaxpr"].jaxpr
-        return tuple(
-            tuple(invar.aval.shape)
-            for invar in body.invars[:carry_count]
-        )
+        # This toy returns two carry leaves, no ys, and scans one anchor.
+        # Captured constants precede the carry; the anchor is the final input.
+        assert len(body.outvars) == 2
+        return tuple(tuple(invar.aval.shape) for invar in body.invars[-3:-1])
 
     # The proposed outer-vmap arrangement has exactly the same batched carry
     # shapes: moving the vmap syntactically is not a valid production change.
     assert _scan_carry_shapes(_joint_with_batched_scan_carry) == ((3, 2), (3, 5))
     assert _scan_carry_shapes(_scalar_rhs_then_outer_vmap) == ((3, 2), (3, 5))
+
+    for joint, outer in zip(jax.tree_util.tree_leaves(_joint_with_batched_scan_carry(rhs)),
+                            jax.tree_util.tree_leaves(_scalar_rhs_then_outer_vmap(rhs)), strict=True):
+        assert jnp.array_equal(joint, outer)
 
 
 def test_normalize_solver_config_prefers_transport_solver_section():

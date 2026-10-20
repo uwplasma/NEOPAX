@@ -164,8 +164,9 @@ def test_composed_equation_system_expands_reduced_density_rhs_and_zeroes_electro
     class DummyErEq:
         name = "Er"
 
-        def __call__(self, working_state, fluxes=None):
+        def __call__(self, working_state, fluxes=None, *, er_edge_override=None):
             del fluxes
+            assert er_edge_override is None
             return 3.0 * jnp.ones_like(working_state.Er)
 
     eq_system = ComposedEquationSystem(
@@ -202,49 +203,63 @@ def test_extract_right_constraints_handles_bc_types():
 
 
 def test_ntx_local_particle_flux_evaluator_passes_bc_constraints(monkeypatch):
-    species = _dummy_species()
-    geometry = SimpleNamespace(r_grid_half=jnp.asarray([0.0, 0.5, 1.0]))
-    state = _dummy_state()
-
+    species = SimpleNamespace(
+        mass=jnp.asarray([1.0, 2.0, 3.0]),
+        charge=jnp.asarray([-1.0, 1.0, 1.0]),
+        species_indices=jnp.arange(3),
+    )
+    geometry = SimpleNamespace(
+        r_grid_half=jnp.asarray([0.0, 0.5, 1.0]),
+        r_grid=jnp.asarray([0.25, 0.75]), dr=0.5,
+    )
+    density = jnp.asarray([[1.0, 2.0], [2.0, 3.0], [4.0, 5.0]])
+    state = TransportState(density=density, pressure=10.0 * density, Er=jnp.asarray([1.0, 2.0]))
     captured = {}
+    extract_constraints = flux_models_module._extract_right_constraints
 
-    def fake_get_neoclassical_fluxes(
-        species_arg,
-        energy_grid_arg,
-        geometry_arg,
-        database_arg,
-        er_profile,
-        temperature,
-        density,
-        **kwargs,
-    ):
-        captured["kwargs"] = kwargs
-        captured["er_profile"] = er_profile
-        gamma = jnp.stack([er_profile, er_profile + 1.0, er_profile + 2.0], axis=0)
-        q = jnp.zeros_like(gamma)
-        upar = jnp.zeros_like(gamma)
-        return None, gamma, q, upar
+    def capture_constraints(bc, *args):
+        result = extract_constraints(bc, *args)
+        captured[bc.right_type] = result
+        return result
 
-    monkeypatch.setattr(flux_models_module, "get_Neoclassical_Fluxes", fake_get_neoclassical_fluxes)
+    def fake_local_lij(_species, _grid, _geometry, _database, species_index,
+                       radius_index, er_value, *_args):
+        captured["radius_index"] = radius_index
+        captured["er_value"] = er_value
+        return jnp.eye(3) * (er_value + species_index)
+
+    monkeypatch.setattr(flux_models_module, "_extract_right_constraints", capture_constraints)
+    monkeypatch.setattr(flux_models_module, "get_Lij_matrix_local", fake_local_lij)
+    # Controlled forces expose both reconstructed gradients in the local flux;
+    # the monoenergetic stand-in contributes Er + species index.
+    monkeypatch.setattr(flux_models_module, "get_Thermodynamical_Forces_A1",
+                        lambda charge, density, temperature, dndr, dtdr, er: -(1.0 + dndr + 2.0 * dtdr) / (1e20 * density))
+    monkeypatch.setattr(flux_models_module, "get_Thermodynamical_Forces_A2",
+                        lambda temperature, gradient: jnp.zeros_like(temperature))
+    monkeypatch.setattr(flux_models_module, "get_Thermodynamical_Forces_A3", jnp.zeros_like)
 
     bc_density = BoundaryConditionModel(dr=1.0, right_type="neumann", right_gradient=jnp.array([0.1, 0.2, 0.3]))
     bc_temperature = BoundaryConditionModel(dr=1.0, right_type="dirichlet", right_value=jnp.array([5.0, 6.0, 7.0]))
     model = flux_models_module.NTXDatabaseTransportModel(
-        species=species,
-        energy_grid="grid",
-        geometry=geometry,
-        database="db",
-        bc_density=bc_density,
-        bc_temperature=bc_temperature,
+        species=species, energy_grid="grid", geometry=geometry, database="db",
+        bc_density=bc_density, bc_temperature=bc_temperature,
     )
+    out = model.build_local_particle_flux_evaluator(state)(1, 9.0)
 
-    evaluator = model.build_local_particle_flux_evaluator(state)
-    out = evaluator(1, 9.0)
-
-    assert jnp.allclose(out, jnp.array([9.0, 10.0, 11.0]))
-    assert jnp.allclose(captured["kwargs"]["density_right_grad_constraint"], jnp.array([0.1, 0.2, 0.3]))
-    assert jnp.allclose(captured["kwargs"]["temperature_right_constraint"], jnp.array([5.0, 6.0, 7.0]))
-    assert float(captured["er_profile"][1]) == 9.0
+    # In this two-cell mesh, the last-center derivative is (outer face -
+    # midpoint)/0.5. Density outer faces use the FV boundary stencil
+    # (3*0.5*g + 9*n_last - n_previous)/8; temperature
+    # has a constant 10 profile and outer values 5,6,7.
+    expected_density_gradient = jnp.asarray([1.2875, 1.3250, 1.3625])
+    expected_temperature_gradient = jnp.asarray([-10.0, -8.0, -6.0])
+    expected = jnp.asarray([9.0, 10.0, 11.0]) * (
+        1.0 + expected_density_gradient + 2.0 * expected_temperature_gradient
+    )
+    assert jnp.allclose(out, expected)
+    assert jnp.allclose(captured["neumann"][1], jnp.array([0.1, 0.2, 0.3]))
+    assert jnp.allclose(captured["dirichlet"][0], jnp.array([5.0, 6.0, 7.0]))
+    assert int(captured["radius_index"]) == 1
+    assert float(captured["er_value"]) == 9.0
 
 
 def test_ntx_database_exposes_momentum_corrected_parallel_flow(monkeypatch):
@@ -271,6 +286,15 @@ def test_ntx_database_exposes_momentum_corrected_parallel_flow(monkeypatch):
         "get_Neoclassical_Fluxes_With_Momentum_Correction",
         fake_corrected_fluxes,
     )
+    def fake_corrected_upar(*args, **kwargs):
+        captured["upar_args"] = args
+        captured["upar_kwargs"] = kwargs
+        return jnp.full(state.density.shape, 3.0)
+
+    monkeypatch.setattr(
+        flux_models_module, "get_Neoclassical_Upar_With_Momentum_Correction",
+        fake_corrected_upar,
+    )
     model = flux_models_module.NTXDatabaseTransportModel(
         species=species,
         energy_grid="grid",
@@ -285,6 +309,9 @@ def test_ntx_database_exposes_momentum_corrected_parallel_flow(monkeypatch):
     assert jnp.allclose(model.evaluate_momentum_corrected_upar_only(state), 3.0)
     assert "density_right_constraint" in captured["kwargs"]
     assert "temperature_right_constraint" in captured["kwargs"]
+    assert captured["upar_args"][0] is species
+    for key in captured["kwargs"]:
+        assert jnp.array_equal(captured["upar_kwargs"][key], captured["kwargs"][key])
 
 
 def test_ntx_database_lagged_face_response_matches_reference_and_finite_difference(monkeypatch):

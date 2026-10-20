@@ -3312,6 +3312,15 @@ def test_native_vmec_coefficient_tangent_contraction_matches_vjp_duality():
     assert jnp.allclose(actual, expected, rtol=1e-12, atol=1e-12)
 
 
+@pytest.mark.parametrize("bars,tangents", [
+    ((jnp.asarray(0.2),), (jnp.asarray(1.0),)),
+    ((jnp.ones((3, 2)), jnp.ones((2,))), (jnp.ones((2,)), jnp.asarray(1.0))),
+])
+def test_native_vmec_coefficient_tangent_contraction_rejects_missing_or_mismatched_rhs(bars, tangents):
+    with pytest.raises(ValueError, match="RHS axis"):
+        _native_vmec_coefficient_tangent_contraction(bars, tangents)
+
+
 def test_native_vmec_bridge_forwards_bridge_only_flag_to_local_ntx_helper():
     """Catch a missing bridge-only keyword before a compiled Radau segment."""
 
@@ -3637,6 +3646,9 @@ def test_black_box_recorded_database_direct_support_split_matches_generic_payloa
         def __call__(self, _state):
             return jnp.asarray(3.0)
 
+        def pullback_direct_rhs_geometry_by_radius(self, _state, flux_bar, _geometry):
+            return flux_bar
+
         def pullback_direct_rhs_support_payload(self, _state, flux_bar, support):
             del support
             return {
@@ -3652,19 +3664,27 @@ def test_black_box_recorded_database_direct_support_split_matches_generic_payloa
         "with_realtime_geometry_support_payload",
         lambda payload: lambda _t, _state, _runtime: payload["geometry"] + 2.0 * payload["database"],
     )
-    support = {
-        "geometry": jnp.asarray(5.0),
-        "channels": jnp.asarray(7.0),
-        "surfaces": jnp.asarray(11.0),
-        "database": jnp.asarray(13.0),
-    }
+    object.__setattr__(
+        equations, "pullback_direct_rhs_database_equation_geometry_payload",
+        lambda *_args: {"geometry": jnp.asarray(0.0), "database": jnp.asarray(0.0)},
+    )
+    support = {"geometry": jnp.asarray(5.0), "database": jnp.asarray(13.0)}
     actual = equations.pullback_direct_rhs_support_payload(
         jnp.asarray(0.0), None, None, jnp.asarray(17.0), support
     )
+    _, generic_pullback = jax.vjp(
+        lambda payload: equations.with_realtime_geometry_support_payload(payload)(None, None, None),
+        support,
+    )
+    (expected,) = generic_pullback(jnp.asarray(17.0))
+    _assert_float_tree_allclose(actual, expected)
     assert jnp.allclose(actual["geometry"], 17.0)
     assert jnp.allclose(actual["database"], 34.0)
-    assert jnp.allclose(actual["channels"], 0.0)
-    assert jnp.allclose(actual["surfaces"], 0.0)
+    with pytest.raises(ValueError, match="requires exactly"):
+        equations.pullback_direct_rhs_support_payload(
+            jnp.asarray(0.0), None, None, jnp.asarray(17.0),
+            dict(support, channels=jnp.asarray(7.0), surfaces=jnp.asarray(11.0)),
+        )
 
 
 def test_database_direct_rhs_support_splits_fixed_table_and_geometry_bars():
