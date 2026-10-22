@@ -30,6 +30,7 @@ FD_MODULE = ast.parse(FD_BENCHMARK.read_text(encoding="utf-8"))
 NEW_ROOT_ROWS = (
     "Er_transition_rho", "Er_transition_location_moment", "Er_transition_strength",
 )
+LEGACY_ER_ROWS = ("Er_transition_left", "Er_transition_right")
 
 
 def _namespace():
@@ -72,7 +73,7 @@ def _fd_namespace():
     ]
 
     def terminal_value(state, runtime, index, *, objective_labels):
-        if objective_labels[index] in NEW_ROOT_ROWS:
+        if objective_labels[index] in (*NEW_ROOT_ROWS, *LEGACY_ER_ROWS):
             return transport.objective_scalar_by_index(
                 state, runtime, index, objective_labels=objective_labels,
             )
@@ -189,11 +190,11 @@ class ReverseBenchmarkRootObjectiveTests(unittest.TestCase):
                 residual_labels = tuple(f"transport:{name}" for name in labels) + tuple(
                     f"geometry:synthetic_{i}" for i in range(7)
                 )
-                jacobian = np.ones((18, 8))
+                jacobian = np.ones((len(residual_labels), 8))
                 if not finite:
                     jacobian[0, 0] = np.nan
                 evaluation = SimpleNamespace(
-                    residuals=np.ones(18), jacobian=jacobian, elapsed_s=.1,
+                    residuals=np.ones(len(residual_labels)), jacobian=jacobian, elapsed_s=.1,
                     result=SimpleNamespace(residual_labels=residual_labels,
                                            parameter_labels=parameter_set.labels,
                                            objective_values={name: 1. for name in labels}),
@@ -252,7 +253,7 @@ class ReverseBenchmarkRootObjectiveTests(unittest.TestCase):
                 self.assertEqual(report["all_finite"], finite)
                 self.assertEqual(report["parameter_order"], list(parameter_set.labels))
                 self.assertEqual(report["objective_order"], list(labels))
-                self.assertEqual(np.asarray(report["jacobian"]).shape, (18, 8))
+                self.assertEqual(np.asarray(report["jacobian"]).shape, (20, 8))
                 if not finite:
                     self.assertTrue(np.isnan(report["jacobian"][0][0]))
 
@@ -327,7 +328,7 @@ class ReverseBenchmarkRootObjectiveTests(unittest.TestCase):
             )
 
         values = np.asarray(objective_values(0.0))
-        self.assertEqual(values.shape, (11,))
+        self.assertEqual(values.shape, (13,))
         self.assertTrue(np.isfinite(values).all())
         indices = [labels.index(name) for name in NEW_ROOT_ROWS]
         radius, moment, strength = values[indices]
@@ -338,6 +339,12 @@ class ReverseBenchmarkRootObjectiveTests(unittest.TestCase):
         ad = np.asarray(jax.jacfwd(objective_values)(0.0))
         np.testing.assert_allclose(fd[indices], ad[indices], rtol=1e-5, atol=1e-8)
         self.assertTrue((np.abs(ad[indices]) > 1e-8).all())
+        # Check the restored fixed-cell rows against their independent value
+        # and directional derivative, not only agreement between AD and FD.
+        legacy_indices = [labels.index(name) for name in LEGACY_ER_ROWS]
+        np.testing.assert_array_equal(values[legacy_indices], np.asarray(er)[[20, 21]])
+        np.testing.assert_allclose(fd[legacy_indices], np.asarray(direction)[[20, 21]], rtol=1e-8, atol=1e-9)
+        np.testing.assert_array_equal(ad[legacy_indices], np.asarray(direction)[[20, 21]])
 
     def test_fd_replay_endpoints_return_all_new_objectives(self):
         namespace = _fd_namespace()
@@ -372,6 +379,36 @@ class ReverseBenchmarkRootObjectiveTests(unittest.TestCase):
                 self.assertIs(replay["final_state"], state)
                 np.testing.assert_array_equal(values, expected)
 
+    def test_failed_fd_endpoint_saves_snapshot_and_preserves_original_error(self):
+        namespace = _fd_namespace()
+        state = SimpleNamespace(Er=jnp.ones(3))
+        prepared = SimpleNamespace(initial_carry=object())
+        original_error = FloatingPointError("bad accepted step 83")
+
+        def fail_replay(**kwargs):
+            kwargs["diagnostics_out"]["failed_step"] = {"saved": True}
+            raise original_error
+
+        writer = Mock(side_effect=OSError("snapshot directory unavailable"))
+        objective = Mock(side_effect=AssertionError("invalid FD endpoint reached objective"))
+        namespace.update({
+            "_profile_state_from_values": lambda *_args, **_kwargs: state,
+            "_prepare_rollout": lambda *_args, **_kwargs: (None, prepared, object()),
+            "_fd_reverse_frozen_metadata_accepted_rollout": fail_replay,
+            "_save_fd_replay_failure_snapshot": writer,
+            "_objective_vector": objective,
+        })
+        with redirect_stdout(io.StringIO()), self.assertRaises(FloatingPointError) as error:
+            namespace["_objectives_on_realtime_geometry_frozen_trace"](
+                config={}, runtime=object(), baseline_state=state, profile_cfg={},
+                profile_values=None, frozen_trace=object(), replay_mode="accepted",
+                fd_accepted_replay_contract="reverse_frozen_metadata",
+                baseline_replay_reference=object(), endpoint_label="n0:minus",
+            )
+        self.assertIs(error.exception, original_error)
+        writer.assert_called_once()
+        objective.assert_not_called()
+
     def test_all_and_individual_root_rows_reach_the_reverse_builder(self):
         """Catch a new request list paired with the builder's old default rows."""
         function = next(
@@ -379,14 +416,18 @@ class ReverseBenchmarkRootObjectiveTests(unittest.TestCase):
             if isinstance(node, ast.FunctionDef)
             and node.name == "_run_realtime_geometry_optimization_api_smoke"
         )
-        for selected in ("all", *NEW_ROOT_ROWS):
-            with self.subTest(objective=selected):
+        for selected, accepted_limit in (
+            (name, limit)
+            for name in ("all", *NEW_ROOT_ROWS, *LEGACY_ER_ROWS)
+            for limit in (None, 16)
+        ):
+            with self.subTest(objective=selected, accepted_step_limit=accepted_limit):
                 namespace = _namespace()
                 labels = namespace["FULL_TRANSPORT_OBJECTIVE_LABELS"]
-                self.assertEqual(len(labels), 11)
-                self.assertEqual(len(set(labels)), 11)
-                self.assertNotIn("Er_transition_left", labels)
-                self.assertNotIn("Er_transition_right", labels)
+                self.assertEqual(len(labels), 13)
+                self.assertEqual(len(set(labels)), 13)
+                self.assertIn("Er_transition_left", labels)
+                self.assertIn("Er_transition_right", labels)
                 self.assertTrue(set(NEW_ROOT_ROWS).issubset(labels))
                 self.assertIn("bootstrap_current_softmax_abs_scaled", labels)
                 # Remaining modes are simply forwarded to the mocked builder.
@@ -398,7 +439,7 @@ class ReverseBenchmarkRootObjectiveTests(unittest.TestCase):
                 args.full_transport_shared_payload_smoke = True
                 args.optimization_api_profile_dofs = "include"
                 args.objective = selected
-                args.accepted_step_limit = 16
+                args.accepted_step_limit = accepted_limit
                 args.reverse_segment_length = 4
                 builder = Mock(return_value=object())
                 evaluate = Mock(side_effect=_EvaluationReached)
@@ -434,7 +475,7 @@ class ReverseBenchmarkRootObjectiveTests(unittest.TestCase):
                     )
                 expected = labels if selected == "all" else (selected,)
                 self.assertEqual(builder.call_args.kwargs["objective_labels"], labels)
-                self.assertEqual(builder.call_args.kwargs["accepted_step_limit"], 16)
+                self.assertEqual(builder.call_args.kwargs["accepted_step_limit"], accepted_limit)
                 self.assertEqual(builder.call_args.kwargs["reverse_segment_length"], 4)
                 call = evaluate.call_args.kwargs
                 self.assertEqual(call["request"].objective_names, expected)

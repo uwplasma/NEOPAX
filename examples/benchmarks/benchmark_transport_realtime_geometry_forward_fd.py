@@ -7,6 +7,7 @@ import dataclasses
 import inspect
 import json
 import sys
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -111,6 +112,54 @@ def _tree_all_finite(tree) -> bool:
         if np.issubdtype(arr.dtype, np.inexact) and not np.all(np.isfinite(arr)):
             return False
     return True
+
+
+def _save_fd_replay_failure_snapshot(
+    *, failure, config, profile_values, endpoint_label, directory=None,
+) -> Path:
+    """Save one failed slot's incoming carries, never a per-step carry tape."""
+
+    output_dir = Path(directory) if directory is not None else (
+        ROOT / "outputs" / "autodiff_transport_lagged_ntx" / "fd_replay_failures"
+    )
+    output_dir.mkdir(parents=True, exist_ok=True)
+    arrays = {}
+    metadata = {
+        "schema_version": 1, "endpoint_label": endpoint_label,
+        "config": config, "failure": {
+            name: (None if isinstance(value, float) and not np.isfinite(value) else value)
+            for name, value in failure["summary"].items()
+        },
+        "profile_values": np.asarray(jax.device_get(profile_values)).tolist(),
+        "carry_contracts": {},
+    }
+    for name in ("baseline_carry", "endpoint_carry"):
+        path_leaves, _ = jax.tree_util.tree_flatten_with_path(failure[name])
+        metadata["carry_contracts"][name] = [jax.tree_util.keystr(path) for path, _ in path_leaves]
+        for index, (_, value) in enumerate(path_leaves):
+            arrays[f"{name}_{index:04d}"] = np.asarray(jax.device_get(value))
+    for name, value in failure["slot_metadata"].items():
+        arrays[name] = np.asarray(jax.device_get(value))
+    for name in ("baseline_initial_y", "endpoint_initial_y"):
+        arrays[name] = np.asarray(jax.device_get(failure[name]))
+
+    def json_default(value):
+        if isinstance(value, Path):
+            return str(value)
+        if isinstance(value, (np.ndarray, np.generic, jax.Array)):
+            return np.asarray(value).tolist()
+        raise TypeError(f"Unsupported FD snapshot config value: {type(value).__name__}")
+
+    arrays["metadata_json"] = np.asarray(json.dumps(metadata, default=json_default, allow_nan=False))
+    safe_label = endpoint_label.replace(":", "_").replace("/", "_")
+    with tempfile.NamedTemporaryFile(
+        dir=output_dir, prefix=f"{safe_label}_step_{failure['summary']['accepted_step']:04d}_",
+        suffix=".npz", delete=False,
+    ) as stream:
+        np.savez_compressed(stream, **arrays)
+        snapshot_path = Path(stream.name)
+    print(f"[fd-replay-snapshot] wrote {snapshot_path}", flush=True)
+    return snapshot_path
 
 
 def _fd_reverse_frozen_metadata_accepted_rollout(
@@ -382,6 +431,34 @@ def _fd_reverse_frozen_metadata_accepted_rollout(
         iterations = int(np.asarray(jax.device_get(scan_outputs[10 + offset]))[slot])
         residual = float(np.asarray(jax.device_get(scan_outputs[12 + offset]))[slot])
         delta = float(np.asarray(jax.device_get(scan_outputs[14 + offset]))[slot])
+        if diagnostics_out is not None:
+            # The scan freezes both carries at the first bad slot. These are
+            # therefore its exact incoming carries, already available without
+            # retaining a history or repeating the preceding accepted steps.
+            diagnostics_out["failed_step"] = {
+                "baseline_carry": final_scan_carry[0],
+                "endpoint_carry": final_scan_carry[1],
+                "baseline_initial_y": baseline_prepared_rollout.initial_carry.y,
+                "endpoint_initial_y": endpoint_prepared_rollout.initial_carry.y,
+                "summary": {
+                    "role": role, "accepted_step": accepted_step, "attempt_slot": slot,
+                    "t_start": step_start_time, "dt": float(dts_np[slot]),
+                    "newton_iterations": iterations, "residual_norm": residual,
+                    "delta_norm": delta, "cold_restart_failed": True,
+                    "baseline_newton_iterations": int(np.asarray(jax.device_get(scan_outputs[10]))[slot]),
+                    "baseline_residual_norm": float(np.asarray(jax.device_get(scan_outputs[12]))[slot]),
+                    "baseline_delta_norm": float(np.asarray(jax.device_get(scan_outputs[14]))[slot]),
+                },
+                "slot_metadata": {
+                    "dt": attempted_dts[slot],
+                    "force_jacobian_rebuild": force_jacobian_rebuild[slot],
+                    "next_dt": next_dts[slot],
+                    "next_recent_reject_count": next_recent_reject_count[slot],
+                    "next_regrowth_cooldown": next_regrowth_cooldown[slot],
+                    "next_easy_growth_streak": next_easy_growth_streak[slot],
+                    "next_lagged_response_valid": next_lagged_response_valid[slot],
+                },
+            }
         raise FloatingPointError(
             f"Invalid FD accepted-step replay: endpoint={endpoint_label} role={role} "
             f"accepted_step={accepted_step} attempt_slot={slot} "
@@ -678,14 +755,25 @@ def _objectives_on_realtime_geometry_frozen_trace(
                     "baseline prepared rollout."
                 )
             fd_newton_diagnostics = {}
-            rollout = _fd_reverse_frozen_metadata_accepted_rollout(
-                baseline_prepared_rollout=baseline_replay_reference,
-                endpoint_prepared_rollout=prepared_rollout,
-                trace=frozen_trace,
-                endpoint_carry0=prepared_rollout.initial_carry,
-                endpoint_label=endpoint_label,
-                diagnostics_out=fd_newton_diagnostics,
-            )
+            try:
+                rollout = _fd_reverse_frozen_metadata_accepted_rollout(
+                    baseline_prepared_rollout=baseline_replay_reference,
+                    endpoint_prepared_rollout=prepared_rollout,
+                    trace=frozen_trace,
+                    endpoint_carry0=prepared_rollout.initial_carry,
+                    endpoint_label=endpoint_label,
+                    diagnostics_out=fd_newton_diagnostics,
+                )
+            except FloatingPointError:
+                if "failed_step" in fd_newton_diagnostics:
+                    try:
+                        _save_fd_replay_failure_snapshot(
+                            failure=fd_newton_diagnostics["failed_step"], config=config,
+                            profile_values=profile_values, endpoint_label=endpoint_label,
+                        )
+                    except Exception as snapshot_error:
+                        print(f"[fd-replay-snapshot] saving failed: {snapshot_error}", flush=True)
+                raise
             _require_complete_frozen_metadata_replay(
                 rollout=rollout,
                 prepared_rollout=prepared_rollout,

@@ -228,11 +228,7 @@ from NEOPAX._transport_solvers import (  # noqa: E402
 
 
 FULL_TRANSPORT_OBJECTIVE_LABELS = (
-    *(
-        name
-        for name in TRANSPORT_REVERSE_OBJECTIVE_LABELS
-        if name not in {"Er_transition_left", "Er_transition_right"}
-    ),
+    *TRANSPORT_REVERSE_OBJECTIVE_LABELS,
     *TRANSPORT_OPTIMIZATION_OPTIONAL_OBJECTIVE_LABELS,
 )
 

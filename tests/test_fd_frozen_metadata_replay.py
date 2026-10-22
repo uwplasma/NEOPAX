@@ -2,7 +2,10 @@
 
 import ast
 import dataclasses
+import importlib.util
+import json
 from pathlib import Path
+import tempfile
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -23,11 +26,13 @@ def _namespace():
     names = {
         "_tree_all_finite", "_fd_reverse_frozen_metadata_accepted_rollout",
         "_require_complete_frozen_metadata_replay", "_schedule_rollout",
+        "_save_fd_replay_failure_snapshot",
     }
     functions = [node for node in ast.parse(BENCHMARK.read_text()).body
                  if isinstance(node, ast.FunctionDef) and node.name in names]
     namespace = {
         "jax": jax, "jnp": jnp, "np": np, "dataclasses": dataclasses,
+        "Path": Path, "json": json, "tempfile": tempfile,
         "_RadauAcceptedRolloutResult": solvers._RadauAcceptedRolloutResult,
         "_RadauAcceptedStepAttemptContext": solvers._RadauAcceptedStepAttemptContext,
         "_radau_apply_accepted_step_map": solvers._radau_apply_accepted_step_map,
@@ -281,3 +286,115 @@ def test_schedule_records_reuse_without_prefix_or_checkpoint_bank():
         "max_total_steps": 20000, "stop_after_accepted_steps": None,
         "capture_newton_setup": True,
     }
+
+
+def _probe_module():
+    path = BENCHMARK.with_name("diagnose_transport_fd_replay_step.py")
+    spec = importlib.util.spec_from_file_location("fd_saved_step_diagnostic", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _failed_snapshot(tmp_path):
+    namespace = _namespace()
+    baseline, endpoint = _prepared(), _prepared(2.001)
+
+    def map_step(kernel, physics, carry, context):
+        bad = jnp.asarray(physics is endpoint.physics_context) & (carry.t > 0.009)
+        return _map_result(carry, y=jnp.where(bad, 1e100, carry.y + 1.0), converged=~bad)
+
+    namespace["_radau_apply_accepted_step_map"] = map_step
+    diagnostics = {}
+    with pytest.raises(FloatingPointError, match="accepted_step=2"):
+        _run(namespace, baseline, endpoint, diagnostics_out=diagnostics)
+    failure = diagnostics["failed_step"]
+    # These must be incoming states before the failed trial, not its output.
+    assert float(failure["baseline_carry"].t) == pytest.approx(0.01)
+    np.testing.assert_array_equal(failure["endpoint_carry"].y, [2.0])
+    path = namespace["_save_fd_replay_failure_snapshot"](
+        failure=failure,
+        config={"case_path": Path("case.toml"), "transport_solver": {"t_final": 20.0}},
+        profile_values=jnp.array([4.21, 17.8, 10.0, 2.0, 1.0, 1.0]),
+        endpoint_label="n0:minus", directory=tmp_path,
+    )
+    return path, baseline
+
+
+def test_failed_step_snapshot_roundtrip_preserves_incoming_carries_and_no_history(tmp_path):
+    path, prepared = _failed_snapshot(tmp_path)
+    probe = _probe_module()
+    with np.load(path, allow_pickle=False) as archive:
+        metadata = json.loads(archive["metadata_json"].item())
+        assert metadata["config"]["case_path"] == "case.toml"
+        assert metadata["failure"]["accepted_step"] == 2
+        assert metadata["failure"]["attempt_slot"] == 2
+        assert metadata["failure"]["cold_restart_failed"] is True
+        assert len(metadata["carry_contracts"]) == 2
+        restored = probe.restore_carry(archive, "endpoint_carry", prepared.initial_carry, metadata)
+        np.testing.assert_array_equal(restored.y, [2.0])
+        assert float(restored.t) == pytest.approx(0.01)
+        assert float(archive["dt"]) == pytest.approx(0.01)
+        expected_keys = {
+            "metadata_json", "baseline_initial_y", "endpoint_initial_y",
+            "dt", "force_jacobian_rebuild", "next_dt", "next_recent_reject_count",
+            "next_regrowth_cooldown", "next_easy_growth_streak", "next_lagged_response_valid",
+        }
+        for name, paths in metadata["carry_contracts"].items():
+            expected_keys.update(f"{name}_{index:04d}" for index in range(len(paths)))
+        assert set(archive.files) == expected_keys
+
+
+@pytest.mark.parametrize("mismatch", ["tree", "shape", "dtype"])
+def test_saved_step_restore_rejects_changed_model_layout(tmp_path, mismatch):
+    path, prepared = _failed_snapshot(tmp_path)
+    probe = _probe_module()
+    with np.load(path, allow_pickle=False) as archive:
+        metadata = json.loads(archive["metadata_json"].item())
+        template = prepared.initial_carry
+        if mismatch == "tree":
+            metadata["carry_contracts"]["endpoint_carry"][0] = "different"
+        elif mismatch == "shape":
+            template = dataclasses.replace(template, y=jnp.ones(2))
+        else:
+            template = dataclasses.replace(template, y=jnp.ones(1, dtype=jnp.float32))
+        with pytest.raises(ValueError, match="differs from the rebuilt model"):
+            probe.restore_carry(archive, "endpoint_carry", template, metadata)
+
+
+def test_saved_step_probe_solves_only_current_scalar_step(monkeypatch):
+    probe = _probe_module()
+    prepared = _prepared()
+    baseline = prepared.initial_carry
+    endpoint = dataclasses.replace(baseline, y=baseline.y + 1e-6)
+    monkeypatch.setattr(
+        solvers, "_radau_adaptive_schedule_rollout",
+        lambda *_args, **_kwargs: pytest.fail("saved-step probe entered adaptive rollout"),
+    )
+    report = probe.diagnose_saved_step(
+        {"failure": {"accepted_step": 83}, "endpoint_label": "n0:minus"},
+        baseline, endpoint, prepared, prepared, jnp.asarray(0.01), jnp.asarray(False),
+    )
+    assert set(report["trials"]) == {
+        "baseline_recorded_setup", "endpoint_recorded_setup", "endpoint_cold_setup",
+    }
+    for trial in report["trials"].values():
+        assert trial["converged"] is True
+        assert trial["t_start"] == 0.0
+        assert trial["dt"] == pytest.approx(0.01)
+        assert trial["initial_rhs"]["all_finite"] is True
+        assert trial["newton_real_matrix_condition_finite"] is True
+        assert trial["newton_real_matrix_condition"] == pytest.approx(1.0)
+
+
+def test_saved_step_cli_refuses_cpu_before_building_runtime(tmp_path, monkeypatch):
+    path, _ = _failed_snapshot(tmp_path)
+    probe = _probe_module()
+
+    def no_gpu(*_args, **_kwargs):
+        raise RuntimeError("No GPU")
+
+    monkeypatch.setattr(probe.jax, "local_devices", no_gpu)
+    with pytest.raises(SystemExit) as error:
+        probe.main([str(path)])
+    assert error.value.code == 2

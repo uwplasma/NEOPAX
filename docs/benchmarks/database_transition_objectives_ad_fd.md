@@ -1,5 +1,28 @@
 # Database transport transition-objective AD/FD comparison
 
+## Restored fixed-cell Er rows (2026-10-22)
+
+The full-transport AD benchmark again includes `Er_transition_left` and
+`Er_transition_right`, alongside the three smooth transition rows, bootstrap
+and net power. The FD runner imports the same objective list automatically.
+The fixed-cell rows use the existing scalar defaults: final-state `Er[20]`
+and `Er[21]` (zero-based indices), with unit weights and zero targets in this
+benchmark. These indices differ from the former optimization-script targets
+at cells 25 and 26.
+
+With `--full-transport-shared-payload-smoke --objective all`, the new table has
+13 transport rows plus seven geometry rows: 20 residuals and 160 derivatives
+for the usual eight parameters. Existing replay and full-simulation commands
+are unchanged; omitting `--accepted-step-limit` still runs to the configured
+final time. Historical 18-row / 144-entry results below retain their original
+objective set. No new full-simulation GPU results have been generated for
+the restored rows.
+
+Lightweight validation: 55 tests plus 41 subtests passed. They cover both
+accepted-prefix and full-simulation request plumbing, all/single-objective
+selection, matching AD/FD row order, and fixed-cell values and derivatives.
+No plasma simulation was run locally.
+
 ## Full-time comparison (2026-10-19)
 
 The full 20-second recorded-forward AD run succeeds: 290 accepted steps, six
@@ -22,12 +45,14 @@ corrected `n0` column remotely before running the remaining seven columns.
 That guarded rerun localizes a perturbed-endpoint Newton failure at accepted
 step 83 while the baseline remains valid. The FD helper now retries such a
 failure once with fresh numerical setup at the identical physical input and
-accepted timestep. Scalar recovery tests pass; the full GPU FD result and
-AD/FD error table remain pending.
+accepted timestep. Scalar recovery tests pass, but the GPU cold restart fails
+at the same slot. The failure audit now provides an 83-step prefix capture
+and saved-step diagnostic; the remaining cause and full-time AD/FD errors
+are unresolved.
 
-The full-transport shared-payload AD benchmark and realtime-geometry FD runner
-now use the same eleven transport objective rows. `Er_transition_left` and
-`Er_transition_right` are replaced by `Er_transition_rho`,
+The archived full-transport shared-payload AD and realtime-geometry FD runs
+used the same eleven transport objective rows. `Er_transition_left` and
+`Er_transition_right` were replaced by `Er_transition_rho`,
 `Er_transition_location_moment`, and `Er_transition_strength`. Bootstrap and
 net power remain included.
 

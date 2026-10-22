@@ -95,8 +95,70 @@ The `[fd-replay]` banner reports baseline and endpoint restart counts, and the
 FD JSON additionally records endpoint restart step numbers and
 `fixed_timesteps=True`. If the restart remains invalid, the guard still stops
 before objective evaluation and now includes iteration count, residual norm
-and correction norm from the final unsuccessful solve. The remote full-time
-case has not yet validated this recovery.
+and correction norm from the final unsuccessful solve. The subsequent remote
+run below confirms that this recovery also fails at the same slot.
+
+## Remote cold restart also fails: capture the actual incoming state
+
+The next user run again has 290 accepted baseline steps / 495 attempts at
+20 seconds. The cold restart fails at accepted step 83 / attempt slot 156:
+
+```text
+t_start=5.5758482511664553e-03 dt=2.1380474331935400e-08
+newton_converged=False cold_restart=True newton_iterations=2
+residual_norm=1.0663013333199972e+06 delta_norm=5.2937721381344218e+06
+```
+
+Exit status is 1, wall time 30:48.13, maximum host RSS 16,313,880 KiB.
+Two iterations did not exhaust the configured 20-iteration budget. The
+available log does not identify the early-stop flag, failing equation,
+physical species or radial location. A stale cache alone is therefore an
+insufficient explanation, and the scalar recovery regression is not proof
+that the plasma case is repaired. The actual remaining cause is unresolved.
+
+The FD helper now saves a compact NPZ automatically when that failure occurs.
+Because the checked scan freezes at its first bad slot, its final two carries
+are precisely the failed slot's incoming baseline and endpoint carries. Saving
+them requires no per-step carry history, extra replay, or JAX host callback.
+The snapshot also records the two initial packed states, solver/model config,
+profile values, timestep, forward rebuild decision and scalar failure data.
+It is written under `outputs/autodiff_transport_lagged_ntx/fd_replay_failures/`.
+The past failed process cannot be reconstructed from the scalar error text;
+one new capture is needed to obtain these arrays.
+
+After syncing, capture only the first 83 accepted steps on the GPU machine:
+
+```bash
+cd ~/NEOPAX
+bash docs/benchmarks/capture_database_transition_fd_step83_2026-10-19.sh
+```
+
+This is a diagnostic prefix, not a 20-second AD/FD comparison. The expected
+replay error still returns nonzero and prints `[fd-replay-snapshot] wrote ...`.
+It avoids continuing the adaptive baseline to 20 seconds for each investigation.
+
+To diagnose the most recently saved step-83 profile snapshot:
+
+```bash
+cd ~/NEOPAX
+neopax_snapshot=$(ls -t outputs/autodiff_transport_lagged_ntx/fd_replay_failures/n0_minus_step_0083_*.npz | head -n 1)
+PYTHONPATH="$HOME/VMEX:$HOME/NTX/src" \
+python examples/benchmarks/diagnose_transport_fd_replay_step.py "$neopax_snapshot"
+```
+
+The probe reconstructs runtime geometry/database and solver context, then
+restores the saved carries after checking their tree layout, shapes and dtypes.
+It solves only that one slot with the baseline recorded setup, endpoint
+recorded setup and endpoint cold setup. It reports incoming physical fields
+per species, initial RHS and trial/stage/Jacobian summaries, real Newton matrix
+conditioning and the actual divergence/contraction/nonfinite flags. It writes
+a `.diagnosis.json` beside the NPZ. It never executes an adaptive rollout,
+the preceding accepted steps, objectives or reverse AD. Runtime/model setup
+still costs time. This diagnostic currently supports profile snapshots and
+refuses CPU execution before constructing a physics runtime.
+
+No Newton tolerance, accepted timestep, FD perturbation size, physical floor,
+objective or production AD behavior was changed to hide the failure.
 
 ## Validation and remote retry
 
@@ -133,9 +195,13 @@ piecewise-RHS case confirms failure with the frozen baseline Jacobian and
 successful recovery with a fresh Jacobian at the unchanged timestep. Its
 physical endpoint agrees with the independent Radau stability-function value.
 
-After syncing the correction, retry just `--parameter n0` with the same
-full-time FD command and flags. The baseline banner should show 290 accepted
-steps, final time 20 seconds and recorded Newton setup. If the replay remains
-invalid, the error identifies its first bad accepted step after the bounded
-Newton restart, before bootstrap evaluation. Complete this one-column check
-before running the remaining seven columns; full-time FD errors remain pending.
+After the cold-restart failure, the next remote action is the bounded prefix
+capture and saved-step probe above. Another full 20-second FD retry is not
+justified until the actual failing state has been diagnosed. Full-time FD
+errors remain pending.
+
+Snapshot/probe validation: **74 tests and 33 subtests passed in 25.17 seconds**
+across the same three files. This includes NPZ round trips with
+`allow_pickle=False`, rejection of changed carry layouts/shapes/dtypes,
+preservation of the original exception if saving fails, a scalar single-step
+probe that forbids adaptive rollout, and CPU rejection before physics setup.

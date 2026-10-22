@@ -18,8 +18,11 @@ The guarded retry identifies an unconverged `n0:minus` solve at accepted step
 83 (`t=5.5758482511664553e-3`, `dt=2.1380474331935400e-8`); the baseline
 completes 290 accepted steps / 495 attempts at 20 seconds. A bounded FD-only
 Newton restart with fresh setup at the same state/timestep has been added
-and tested on a scalar reproducer. Its full-time GPU verification remains
-pending, so no FD error is assigned to the archived AD values yet.
+and tested on a scalar reproducer. The GPU retry also fails at step 83 after
+two Newton iterations, with residual norm `1.0663013333199972e6` and correction
+norm `5.2937721381344218e6`. A compact failed-step capture and standalone
+GPU probe are now available in the failure audit. The cause is unresolved;
+no FD error is assigned to the archived AD values yet.
 
 - [Complete 18-by-8 values and gradients](docs/benchmarks/database_transition_objectives_ad_recorded_reuse_full_t20_2026-10-19.csv).
 - [Run evidence, root/bootstrap/net-power gradient table and FD instructions](docs/benchmarks/database_transition_objectives_ad_recorded_reuse_full_t20_2026-10-19.md).
