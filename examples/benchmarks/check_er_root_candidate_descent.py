@@ -4,6 +4,8 @@ Run the candidate-only reverse benchmark first, then pass its JSON report.
 Each forward endpoint gets a fresh subprocess, avoiding accumulated GPU
 executables. Completed endpoints can be reused only for identical inputs.
 These are finite physical moves, not a frozen-schedule AD/FD oracle.
+Profile moves follow the AD map: fixed configuration, changed initial
+profile values, and the requested JAX selected-root initializer.
 """
 
 from __future__ import annotations
@@ -65,6 +67,7 @@ def plan_checks(report, steps, candidates=("local", "annular"), groups=("profile
         raise ValueError("Choose local/annular candidates and profiles/geometry groups.")
     base = dict(resolved_config=experiment["resolved_config"], parameter_labels=labels,
                 settings=audit["settings"], initial_er_root_ad=experiment["initial_er_root_ad"],
+                profile_contract="ad_initial_profiles_fixed_config_selected_root",
                 source_digest=source_digest(experiment["resolved_config"]))
     tasks = [dict(base, name="baseline", parameter_values=baseline.tolist())]
     for candidate in candidates:
@@ -86,17 +89,136 @@ def plan_checks(report, steps, candidates=("local", "annular"), groups=("profile
     return tasks
 
 
+def compare_initial_roots(baseline_er, selected_er, general_er, implicit_rate, step, rho, annulus):
+    """Compare actual selected roots against local fixed-root continuation.
+
+    The implicit rate uses a finite difference of the charge-flux residual
+    at the fixed baseline root and its AD derivative with respect to Er.
+    It does not differentiate the discrete minimum-entropy selection.
+    """
+    a, b, c, rate, rho = map(lambda value: np.asarray(value, dtype=float),
+                             (baseline_er, selected_er, general_er, implicit_rate, rho))
+    band = (rho >= annulus[0]) & (rho <= annulus[1])
+    usable = band & np.isfinite(rate)
+    observed = (b - a) / step
+    error = observed[usable] - rate[usable]
+    denominator = max(float(np.linalg.norm(observed[usable])), float(np.linalg.norm(rate[usable])), 1e-30)
+    return dict(selected_minus_general_max_abs=float(np.max(abs(b - c))),
+                selected_minus_general_annular_max_abs=float(np.max(abs(b[band] - c[band]))),
+                selected_initial_sign_change_indices=np.flatnonzero(band & (np.sign(a) != np.sign(b))).tolist(),
+                implicit_rate_valid_indices=np.flatnonzero(usable).tolist(),
+                annular_rate_error_l2_relative=float(np.linalg.norm(error) / denominator) if np.any(usable) else None,
+                annular_rate_error_max_abs=float(np.max(abs(error))) if np.any(usable) else None,
+                observed_initial_Er_change=(b - a).tolist(),
+                predicted_initial_Er_change=[float(step * value) if np.isfinite(value) else None for value in rate])
+
+
+def diagnose_profile_initialization(report, steps, candidate, out):
+    """Large-machine probe: one runtime build, initial roots only, no transport."""
+    import copy
+    import jax
+    import jax.numpy as jnp
+
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from benchmark_transport_reverse_ad_only import _benchmark_device_context
+    from NEOPAX._orchestrator import build_runtime_context, _maybe_initialize_er_from_ambipolarity
+    from NEOPAX._profiles import build_profiles
+    from NEOPAX._reverse_ad_parameters import PROFILE_PARAMETER_ORDER
+    from NEOPAX._reverse_ad_transport import initial_state_for_parameter_vector
+    from NEOPAX._reverse_ad_initial_er import (
+        initial_er_charge_flux_residuals, initial_er_charge_flux_residual_er_derivative,
+    )
+
+    tasks = plan_checks(report, steps, (candidate,), ("profiles",))
+    audit = report["root_loss_audit"]
+    cfg = copy.deepcopy(tasks[0]["resolved_config"])
+    cfg.setdefault("ambipolarity", {})["er_ambipolar_plot"] = False
+    names = report["parameter_order"]
+    profile_indices = [names.index(name) for name in PROFILE_PARAMETER_ORDER]
+    p0 = np.asarray(tasks[0]["parameter_values"])[profile_indices]
+    comparison = next(item for item in audit["comparisons"] if item["name"] == f"audit_root_{candidate}_cost")
+    direction = np.asarray(comparison["groups"]["profiles"]["physical_descent_direction"])[profile_indices]
+    epsilon = min(1e-6, min(map(float, steps)) / 100)
+    out.mkdir(parents=True, exist_ok=True)
+
+    with _benchmark_device_context(cfg):
+        print("[profile-initialization] building ONE baseline runtime; no transport solve", flush=True)
+        runtime, baseline = build_runtime_context(cfg)
+
+        def state_from_profiles(values, root_mode):
+            return initial_state_for_parameter_vector(
+                jnp.asarray(values), baseline_state=baseline, runtime=runtime,
+                profile_cfg=cfg.get("profiles", {}), config=cfg, initial_er_root_ad=root_mode,
+            )
+
+        pre0 = state_from_profiles(p0, "off")
+        selected0 = state_from_profiles(p0, "jax_selected_root")
+        er0 = selected0.Er
+        residual0 = np.asarray(jax.device_get(initial_er_charge_flux_residuals(pre0, er0, runtime=runtime)))
+        er_derivative = np.asarray(jax.device_get(initial_er_charge_flux_residual_er_derivative(pre0, er0, runtime=runtime)))
+        plus_residual = np.asarray(jax.device_get(initial_er_charge_flux_residuals(
+            state_from_profiles(p0 + epsilon * direction, "off"), er0, runtime=runtime)))
+        minus_residual = np.asarray(jax.device_get(initial_er_charge_flux_residuals(
+            state_from_profiles(p0 - epsilon * direction, "off"), er0, runtime=runtime)))
+        usable = np.isfinite(plus_residual) & np.isfinite(minus_residual) & np.isfinite(er_derivative) & (abs(er_derivative) > 1e-30)
+        rate = np.full_like(er_derivative, np.nan)
+        rate[usable] = -(plus_residual[usable] - minus_residual[usable]) / (2 * epsilon * er_derivative[usable])
+        rho = np.asarray(jax.device_get(runtime.geometry.rho_grid))
+        temperatures0 = np.asarray(jax.device_get(build_profiles(cfg.get("profiles", {}), runtime.geometry,
+                                                               runtime.species.number_species).temperature)) / 1e3
+        frozen = np.flatnonzero(~np.asarray(cfg.get("equations", {}).get(
+            "toggle_temperature", [True] * runtime.species.number_species), dtype=bool))
+        results = dict(
+            candidate=candidate, no_transport_solve=True, profile_direction=direction.tolist(), residual_fd_step=epsilon,
+            profile_parameter_labels=list(PROFILE_PARAMETER_ORDER), baseline_profile_values=p0.tolist(),
+            source_digest=tasks[0]["source_digest"], ambipolarity_config=cfg.get("ambipolarity", {}),
+            rho=rho.tolist(), baseline_selected_Er=np.asarray(er0).tolist(),
+            baseline_general_Er=np.asarray(baseline.Er).tolist(),
+            baseline_charge_flux_residual=[float(value) if np.isfinite(value) else None for value in residual0],
+            baseline_charge_flux_Er_derivative=[float(value) if np.isfinite(value) else None for value in er_derivative],
+            implicit_initial_Er_rate=[float(value) if np.isfinite(value) else None for value in rate],
+            frozen_temperature_species_indices=frozen.tolist(), endpoints=[],
+            interpretation="Selected-root differences are compared to local implicit continuation at the baseline root. "
+                           "The residual directional derivative is a fixed-root finite difference, not a new full AD benchmark.",
+        )
+        path = out / "initialization_diagnostic.json"
+        path.write_text(json.dumps(results, indent=2, allow_nan=False))
+        for task in tasks[1:]:
+            p = np.asarray(task["parameter_values"])[profile_indices]
+            print(f"[profile-initialization] step={task['step_size']:g}: comparing selected-root entrypoints", flush=True)
+            pre = state_from_profiles(p, "off")
+            selected = state_from_profiles(p, "jax_selected_root")
+            general = _maybe_initialize_er_from_ambipolarity(cfg, runtime, pre)
+            observation = compare_initial_roots(er0, selected.Er, general.Er, rate, task["step_size"], rho, audit["annulus"])
+            legacy_profiles = {**cfg.get("profiles", {}), **dict(zip(PROFILE_PARAMETER_ORDER, p.tolist(), strict=True))}
+            legacy_temperatures = np.asarray(jax.device_get(build_profiles(
+                legacy_profiles, runtime.geometry, runtime.species.number_species).temperature)) / 1e3
+            observation.update(
+                step_size=task["step_size"], profile_values=p.tolist(),
+                selected_Er=np.asarray(selected.Er).tolist(), general_Er=np.asarray(general.Er).tolist(),
+                legacy_frozen_temperature_max_abs_change_keV=(
+                    float(np.max(abs(legacy_temperatures[frozen] - temperatures0[frozen]))) if len(frozen) else 0.),
+            )
+            results["endpoints"].append(observation)
+            path.write_text(json.dumps(results, indent=2, allow_nan=False))
+            print("[profile-initialization] " + json.dumps({k: observation[k] for k in (
+                "step_size", "selected_minus_general_max_abs", "selected_initial_sign_change_indices",
+                "annular_rate_error_l2_relative", "legacy_frozen_temperature_max_abs_change_keV",
+            )}), flush=True)
+        print(f"Wrote {path}", flush=True)
+    return results
+
+
 def run_forward_task(task):
     """Worker only: rebuild the requested physical point and solve adaptively."""
     import copy
-    import dataclasses
     import jax
     import jax.numpy as jnp
 
     # Existing benchmark helpers use sibling imports when run as scripts.
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     from benchmark_transport_reverse_ad_only import _geometry_context_from_config, _benchmark_device_context
-    from benchmark_transport_realtime_geometry_forward_fd import _schedule_rollout
+    from benchmark_transport_realtime_geometry_forward_fd import _schedule_rollout, _adaptive_rollout_diagnostics
     from NEOPAX._geometry_autodiff import _input_with_boundary_deltas, boundary_param_entries
     from NEOPAX._orchestrator import build_runtime_context
     from NEOPAX._reverse_ad_parameters import PROFILE_PARAMETER_ORDER
@@ -107,7 +229,11 @@ def run_forward_task(task):
     cfg = copy.deepcopy(task["resolved_config"])
     labels, values = task["parameter_labels"], task["parameter_values"]
     physical = dict(zip(labels, values, strict=True))
-    cfg.setdefault("profiles", {}).update({name: physical[name] for name in PROFILE_PARAMETER_ORDER})
+    # The AD benchmark varies initial profile values under a fixed config.
+    # In particular, prepare_transport_solver_components builds the prescribed
+    # frozen-species temperature from config["profiles"]. Mutating that config
+    # here would change additional physics absent from the AD parameter map.
+    profile_cfg = cfg.get("profiles", {})
     cfg.setdefault("ambipolarity", {})["er_ambipolar_plot"] = False
     settings = RootLossAuditSettings(**task["settings"])
     geometry_labels = [label for label in labels if ":" in label]
@@ -123,15 +249,16 @@ def run_forward_task(task):
             cfg["geometry"]["vmec_input_file"] = str(input_path)
             cfg["geometry"]["vmec_param_delta"] = 0.0
         runtime, state = build_runtime_context(cfg)
-        # Match profile construction/floors in the production reverse builder.
-        # Runtime construction has already solved the selected initial Er for
-        # these changed profiles/geometry; reuse that concrete root profile.
-        initial_er = state.Er
+        runtime_initial_er = np.asarray(jax.device_get(state.Er), dtype=float)
+        # Match both profile/floor construction and the JAX root primal used
+        # by the production AD builder. Agreement at the baseline alone cannot
+        # justify substituting a different initializer at perturbed endpoints.
         state = initial_state_for_parameter_vector(
             jnp.asarray([physical[name] for name in PROFILE_PARAMETER_ORDER]), baseline_state=state,
-            runtime=runtime, profile_cfg=cfg["profiles"], config=cfg, initial_er_root_ad="off",
+            runtime=runtime, profile_cfg=profile_cfg, config=cfg, initial_er_root_ad=task["initial_er_root_ad"],
         )
-        state = dataclasses.replace(state, Er=initial_er)
+        initial_state = {name: np.asarray(jax.device_get(getattr(state, name)), dtype=float).tolist()
+                         for name in ("Er", "density", "pressure") if hasattr(state, name)}
         _, _, _, rollout, final = _schedule_rollout(cfg, runtime, state, accepted_step_limit=None)
         er = np.asarray(jax.device_get(final.Er), dtype=float)
         rho = np.asarray(jax.device_get(runtime.geometry.rho_grid), dtype=float)
@@ -140,7 +267,10 @@ def run_forward_task(task):
                     terminal_Er=er.tolist(), terminal_rho=rho.tolist(),
                     final_time=float(jax.device_get(rollout.final_carry.t)),
                     accepted_steps=int(jax.device_get(rollout.accepted_count)),
-                    attempts=int(jax.device_get(rollout.attempt_count)), parameter_values=values)
+                    attempts=int(jax.device_get(rollout.attempt_count)), parameter_values=values,
+                    initial_state=initial_state, runtime_initial_Er=runtime_initial_er.tolist(),
+                    adaptive_schedule=_adaptive_rollout_diagnostics(rollout),
+                    profile_contract="ad_initial_profiles_fixed_config_selected_root")
 
 
 def compare_endpoint(task, baseline, endpoint, audit):
@@ -153,7 +283,19 @@ def compare_endpoint(task, baseline, endpoint, audit):
     root_change = (after["nearest_downcrossing"] - before["nearest_downcrossing"]
                    if before["nearest_downcrossing"] is not None and after["nearest_downcrossing"] is not None else None)
     rms_change = after["annular_Er_rms"] - before["annular_Er_rms"]
+    initial_root_changes = None
+    if "initial_state" in baseline and "initial_state" in endpoint:
+        a = np.asarray(baseline["initial_state"]["Er"])
+        b = np.asarray(endpoint["initial_state"]["Er"])
+        initial_root_changes = dict(max_abs_change=float(np.max(abs(b - a))),
+                                    sign_change_indices=np.flatnonzero(np.sign(a) != np.sign(b)).tolist())
     return dict(name=task["name"], candidate=name, group=task["group"], step_size=task["step_size"],
+                observed_cost_directional_slope=cost_change / task["step_size"],
+                predicted_cost_directional_slope=task["prediction"]["predicted_cost_change_per_unit_descent"],
+                observed_root_directional_slope=root_change / task["step_size"] if root_change is not None else None,
+                predicted_root_directional_slope=task["prediction"].get("predicted_root_change_per_unit_descent"),
+                accepted_steps_change=(endpoint["accepted_steps"] - baseline["accepted_steps"])
+                    if "accepted_steps" in endpoint and "accepted_steps" in baseline else None,
                 cost_change=cost_change, zero_cost_change=after["candidates"][name]["zero_cost"] - before["candidates"][name]["zero_cost"],
                 sign_cost_change=after["candidates"][name]["sign_cost"] - before["candidates"][name]["sign_cost"],
                 position_cost_change=position_change, root_change=root_change,
@@ -166,6 +308,7 @@ def compare_endpoint(task, baseline, endpoint, audit):
                 root_created=before["nearest_downcrossing"] is None and after["nearest_downcrossing"] is not None,
                 root_lost=before["nearest_downcrossing"] is not None and after["nearest_downcrossing"] is None,
                 root_bracket_changed=before["nearest_downcrossing_bracket"] != after["nearest_downcrossing_bracket"],
+                initial_root_changes=initial_root_changes,
                 baseline_root_error=(before["nearest_downcrossing"] - audit["target"]) if before["nearest_downcrossing"] is not None else None,
                 endpoint_metrics=after)
 
@@ -200,6 +343,8 @@ def main():
     parser.add_argument("--step-sizes", default="0.01", help="Positive trust-coordinate step sizes, comma separated.")
     parser.add_argument("--candidates", default="local,annular")
     parser.add_argument("--groups", default="profiles,geometry")
+    parser.add_argument("--diagnose-profile-initialization", action="store_true",
+                        help="Build one runtime and compare initial-root entrypoints/implicit response; run no transport.")
     parser.add_argument("--worker-task", type=Path, help=argparse.SUPPRESS)
     parser.add_argument("--worker-output", type=Path, help=argparse.SUPPRESS)
     args = parser.parse_args()
@@ -210,6 +355,15 @@ def main():
     if args.ad_report is None:
         parser.error("--ad-report is required")
     report = json.loads(args.ad_report.read_text())
+    if args.diagnose_profile_initialization:
+        choices = args.candidates.split(",")
+        if len(choices) != 1 or choices[0] not in {"local", "annular"}:
+            parser.error("Initialization diagnostics require one candidate: --candidates local or annular.")
+        try:
+            diagnose_profile_initialization(report, args.step_sizes.split(","), choices[0], args.out_dir.resolve())
+        except (KeyError, ValueError) as exc:
+            parser.error(str(exc))
+        return
     try:
         tasks = plan_checks(report, args.step_sizes.split(","), args.candidates.split(","), args.groups.split(","))
     except (KeyError, ValueError) as exc:
@@ -218,6 +372,7 @@ def main():
     out.mkdir(parents=True, exist_ok=True)
     audit = report["root_loss_audit"]
     summary = dict(ad_report=str(args.ad_report.resolve()), results=[], failures=[],
+                   profile_contract="ad_initial_profiles_fixed_config_selected_root",
                    interpretation="Independent adaptive forward solves at finite downhill moves. Not a frozen-schedule AD/FD comparison.")
     baseline = None
     for task in tasks:

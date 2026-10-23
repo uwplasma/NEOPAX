@@ -1,0 +1,138 @@
+ cd ~/NEOPAX
+mkdir -p outputs/new_root_candidates
+set -o pipefail
+
+unset JAX_COMPILATION_CACHE_DIR
+export JAX_ENABLE_COMPILATION_CACHE=0
+export XLA_FLAGS="${XLA_FLAGS:-} --xla_gpu_enable_command_buffer="
+export PYTHONPATH="$HOME/VMEX:$HOME/NTX/src${PYTHONPATH:+:$PYTHONPATH}"
+
+# Compute gradients of the NEW candidates through all simulation steps.
+/usr/bin/time -v \
+python examples/benchmarks/benchmark_transport_reverse_ad_only.py \
+  --config examples/benchmarks/Solve_Transport_equations_wHe_radau_ntx_scan_runtime_database_vmec_realtime_geometry_benchmark_black_box.toml \
+  --reverse-parameter-mode profiles_plus_realtime_geometry \
+  --reverse-geometry-parameter RBC:1:0,ZBS:1:0 \
+  --realtime-geometry-gradient-path reverse_payload \
+  --optimization-api-profile-dofs include \
+  --objective all \
+  --max-reverse-accepted-steps 1000 \
+  --reverse-segment-length 50 \
+  --radau-jacobian-reuse-mode legacy \
+  --timing-mode jit-warm \
+  --reverse-stage-adjoint-solve-mode block \
+  2>&1 | tee outputs/new_root_candidates/ad.log7 \rward \al_record \
+[NEOPAX] built runtime NTX scan database: rho=7 nu_v=16 Er_tilde=11 grid=(25,31,64) backend=vmec
+[autodiff-gate] progress: realtime geometry runtime build ready elapsed_s=620.070
+[autodiff-gate] progress: realtime geometry solver components ready elapsed_s=0.479
+[autodiff-gate] realtime geometry device: default_backend=gpu baseline_values_device=cuda:0 local_devices=['cuda:0']
+[autodiff-gate] progress: running realtime geometry optimization API smoke
+[autodiff-gate] progress: full-transport reverse stage-adjoint replay_jacobian_reuse_mode=recorded_forward solve mode=block rhs_pullback_mode=separate initial_cache_support_pullback_mode=scalar rebuild_support_pullback_mode=separate database_initial_support_mode=split database_initial_state_mode=generic database_support_preparation_mode=shared database_center_geometry_mode=scalar_jvp database_stage_jacobian_mode=independent database_support_objective_mode=scalar database_segment_support_mode=inline database_interpolation_transpose_mode=legacy_sparse database_root_interpolation_transpose_mode=established database_bootstrap_interpolation_transpose_mode=established segment_jit_diagnostics=False segment_input_diagnostics=False segment_start_replay_mode=minimal segment_primal_record_mode=reuse_segment_primal_record step_bwd_mode=reduced_cotangent_call_boundary
+E1023 05:37:36.695045  170537 slow_operation_alarm.cc:73] 
+********************************
+[Compiling module jit_scan for GPU] Very slow compile? If you want to file a bug, run with envvar XLA_FLAGS=--xla_dump_to=/tmp/foo and attach the results.
+********************************
+E1023 05:37:50.451459  170496 slow_operation_alarm.cc:140] The operation took 2m13.756545642s
+
+********************************
+[Compiling module jit_scan for GPU] Very slow compile? If you want to file a bug, run with envvar XLA_FLAGS=--xla_dump_to=/tmp/foo and attach the results.
+********************************
+[autodiff-gate] progress: support reverse profile-state vjp ready elapsed_s=92.674
+[autodiff-gate] progress: support reverse initial carry vjp ready elapsed_s=0.680
+[autodiff-gate] progress: support reverse reusing static schedule artifact (no second adaptive rollout; no per-step carry tape)
+[autodiff-gate] progress: support reverse realized-schedule vjp forward ready elapsed_s=2.156
+[autodiff-gate] progress: support reverse final-objective cotangents ready elapsed_s=8.526 ordinary_mode=grouped_vjp bootstrap_mode=joint_local_vjp_upar_only database_bootstrap_interpolation_mode=established
+[autodiff-gate] progress: support reverse segmented cotangent sweep start segments=6 segment_length=50 objectives=4 cotangent_mode=full
+[autodiff-gate] progress: database segment reverse uses fixed-table table transpose plus compact local fixed-table geometry bars; only table bars cross the recorded scan (no scan owner in segments)
+[autodiff-gate] progress: support reverse segment 6/6 ready elapsed_s=518.037 active_steps=40 support_reuse=0 support_rebuild=40
+[autodiff-gate] progress: support reverse segment 5/6 ready elapsed_s=10.006 active_steps=50 support_reuse=0 support_rebuild=50
+[autodiff-gate] progress: support reverse segment 4/6 ready elapsed_s=10.065 active_steps=50 support_reuse=0 support_rebuild=50
+[autodiff-gate] progress: support reverse segment 3/6 ready elapsed_s=10.078 active_steps=50 support_reuse=0 support_rebuild=50
+[autodiff-gate] progress: support reverse segment 2/6 ready elapsed_s=10.044 active_steps=50 support_reuse=0 support_rebuild=50
+[autodiff-gate] progress: support reverse segment 1/6 ready elapsed_s=9.892 active_steps=50 support_reuse=0 support_rebuild=50
+[autodiff-gate] progress: support reverse segmented cotangent sweep ready elapsed_s=568.123 support_reuse=0 support_rebuild=290
+[autodiff-gate] progress: support reverse reduced carry bars expanded ready elapsed_s=0.677
+E1023 05:52:38.306521  170537 slow_operation_alarm.cc:73] 
+********************************
+[Compiling module jit__pullback for GPU] Very slow compile? If you want to file a bug, run with envvar XLA_FLAGS=--xla_dump_to=/tmp/foo and attach the results.
+********************************
+E1023 05:52:52.786207  170496 slow_operation_alarm.cc:140] The operation took 2m14.479882205s
+
+********************************
+[Compiling module jit__pullback for GPU] Very slow compile? If you want to file a bug, run with envvar XLA_FLAGS=--xla_dump_to=/tmp/foo and attach the results.
+********************************
+[autodiff-gate] progress: support reverse initial direct-RHS support pullback ready elapsed_s=203.808 boundary=database_split
+[autodiff-gate] progress: support reverse initial state pullback ready elapsed_s=160.803
+[autodiff-gate] progress: initial-Er root boundary compact pullback ready elapsed_s=250.844
+[autodiff-gate] progress: support reverse profile parameter pullback ready elapsed_s=0.864
+[autodiff-gate] progress: support reverse initial-profile scan payload pullback ready elapsed_s=1.468
+[autodiff-gate] progress: database final recorded-scan fold ready elapsed_s=687.114 objective_rows=4 groups=1 contract=one_batched_scan_transpose
+[autodiff-gate] full-transport shared payload: ntx_scan_runtime_active_float_leaves=56
+[autodiff-gate] full-transport shared payload: compact_payload_tangent_contract=True native_vmec_coefficient_tangent_contract=False
+[autodiff-gate] full-transport shared payload: raw_block_param_bar_l2=1.525509e+01 raw_block_param_bar_all_finite=True raw_block_param_bar_first_nonfinite=None
+[autodiff-gate] mode=transport_reverse_ad_only_full_transport_shared_payload_smoke objective=all residual_count=4 parameter_count=8 replay_jacobian_reuse_mode=recorded_forward all_finite=True elapsed_s=2451.028
+[root-loss-audit] NEW candidates only; physical gradients and root-descent directions:
+{"name": "audit_root_local_cost", "cost": 3.1729375142420033, "physical_parameter_gradient": {"n0": 1.6658636022246482, "T0": -0.007943804138815664, "density_shape_power": -0.04273614529490896, "temperature_shape_power": -0.018722314255420845, "density_shape_alpha": 0.179780982169571, "temperature_shape_alpha": 0.018538463778163674, "vmec:RBC:1:0": 4.125563184722872, "vmec:ZBS:1:0": 8.453072797961187}, "groups": {"profiles": {"parameter_labels": ["n0", "T0", "density_shape_power", "temperature_shape_power", "density_shape_alpha", "temperature_shape_alpha"], "coordinate_scales": [15.577, 65.86, 37.0, 7.4, 3.7, 3.7], "scaled_gradient_l2": 26.01151996679458, "scaled_root_gradient_l2": 0.0009035337065784408, "physical_descent_direction": [-15.539654133025687, 1.324665573974259, 2.249225842373566, 0.039414610523938014, -0.09461967809045042, -0.00975689115618935, 0.0, 0.0], "predicted_cost_change_per_unit_descent": -26.01151996679458, "predicted_root_change_per_unit_descent": -0.0008940855266240216, "predicted_position_cost_change": -2.714383601089099e-06, "predicted_Er_at_target_change": -20.651422352572876, "predicts_position_improvement": true}, "geometry": {"parameter_labels": ["vmec:RBC:1:0", "vmec:ZBS:1:0"], "coordinate_scales": [1.0, 1.0], "scaled_gradient_l2": 9.40609968684003, "scaled_root_gradient_l2": 0.001843800055156259, "physical_descent_direction": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, -0.4386050884082062, -0.8986799076547943], "predicted_cost_change_per_unit_descent": -9.40609968684003, "predicted_root_change_per_unit_descent": -0.0015887882398996384, "predicted_position_cost_change": -4.823454373845721e-06, "predicted_Er_at_target_change": -7.467819549571031, "predicts_position_improvement": true}}}
+{"name": "audit_root_annular_cost", "cost": 3.1729375142420033, "physical_parameter_gradient": {"n0": 1.6658636022246482, "T0": -0.007943804138815664, "density_shape_power": -0.04273614529490896, "temperature_shape_power": -0.018722314255420845, "density_shape_alpha": 0.179780982169571, "temperature_shape_alpha": 0.018538463778163674, "vmec:RBC:1:0": 4.125563184722872, "vmec:ZBS:1:0": 8.453072797961187}, "groups": {"profiles": {"parameter_labels": ["n0", "T0", "density_shape_power", "temperature_shape_power", "density_shape_alpha", "temperature_shape_alpha"], "coordinate_scales": [15.577, 65.86, 37.0, 7.4, 3.7, 3.7], "scaled_gradient_l2": 26.01151996679458, "scaled_root_gradient_l2": 0.0009035337065784408, "physical_descent_direction": [-15.539654133025687, 1.324665573974259, 2.249225842373566, 0.039414610523938014, -0.09461967809045042, -0.00975689115618935, 0.0, 0.0], "predicted_cost_change_per_unit_descent": -26.01151996679458, "predicted_root_change_per_unit_descent": -0.0008940855266240216, "predicted_position_cost_change": -2.714383601089099e-06, "predicted_Er_at_target_change": -20.651422352572876, "predicts_position_improvement": true}, "geometry": {"parameter_labels": ["vmec:RBC:1:0", "vmec:ZBS:1:0"], "coordinate_scales": [1.0, 1.0], "scaled_gradient_l2": 9.40609968684003, "scaled_root_gradient_l2": 0.001843800055156259, "physical_descent_direction": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, -0.4386050884082062, -0.8986799076547943], "predicted_cost_change_per_unit_descent": -9.40609968684003, "predicted_root_change_per_unit_descent": -0.0015887882398996384, "predicted_position_cost_change": -4.823454373845721e-06, "predicted_Er_at_target_change": -7.467819549571031, "predicts_position_improvement": true}}}
+[autodiff-gate] optimization API residuals/Jacobian rows:
+  - transport:audit_root_interpolated_Er: residual=5.0382040564010531e+00
+      dtransport:audit_root_interpolated_Er/dn0: jac=1.3225852574257848e+00
+      dtransport:audit_root_interpolated_Er/dT0: jac=-6.3068538314878554e-03
+      dtransport:audit_root_interpolated_Er/ddensity_shape_power: jac=-3.3929666060741687e-02
+      dtransport:audit_root_interpolated_Er/dtemperature_shape_power: jac=-1.4864276275324788e-02
+      dtransport:audit_root_interpolated_Er/ddensity_shape_alpha: jac=1.4273418079692002e-01
+      dtransport:audit_root_interpolated_Er/dtemperature_shape_alpha: jac=1.4718311184677020e-02
+      dtransport:audit_root_interpolated_Er/dvmec:RBC:1:0: jac=3.2754236537166435e+00
+      dtransport:audit_root_interpolated_Er/dvmec:ZBS:1:0: jac=6.7111793832104336e+00
+  - transport:audit_root_local_cost: residual=3.1729375142420033e+00
+      dtransport:audit_root_local_cost/dn0: jac=1.6658636022246482e+00
+      dtransport:audit_root_local_cost/dT0: jac=-7.9438041388156643e-03
+      dtransport:audit_root_local_cost/ddensity_shape_power: jac=-4.2736145294908962e-02
+      dtransport:audit_root_local_cost/dtemperature_shape_power: jac=-1.8722314255420845e-02
+      dtransport:audit_root_local_cost/ddensity_shape_alpha: jac=1.7978098216957100e-01
+      dtransport:audit_root_local_cost/dtemperature_shape_alpha: jac=1.8538463778163674e-02
+      dtransport:audit_root_local_cost/dvmec:RBC:1:0: jac=4.1255631847228722e+00
+      dtransport:audit_root_local_cost/dvmec:ZBS:1:0: jac=8.4530727979611875e+00
+  - transport:audit_root_annular_cost: residual=3.1729375142420033e+00
+      dtransport:audit_root_annular_cost/dn0: jac=1.6658636022246482e+00
+      dtransport:audit_root_annular_cost/dT0: jac=-7.9438041388156643e-03
+      dtransport:audit_root_annular_cost/ddensity_shape_power: jac=-4.2736145294908962e-02
+      dtransport:audit_root_annular_cost/dtemperature_shape_power: jac=-1.8722314255420845e-02
+      dtransport:audit_root_annular_cost/ddensity_shape_alpha: jac=1.7978098216957100e-01
+      dtransport:audit_root_annular_cost/dtemperature_shape_alpha: jac=1.8538463778163674e-02
+      dtransport:audit_root_annular_cost/dvmec:RBC:1:0: jac=4.1255631847228722e+00
+      dtransport:audit_root_annular_cost/dvmec:ZBS:1:0: jac=8.4530727979611875e+00
+  - transport:audit_root_nearest_downcrossing_rho: residual=5.1703593282774452e-01
+      dtransport:audit_root_nearest_downcrossing_rho/dn0: jac=5.6699915363322447e-05
+      dtransport:audit_root_nearest_downcrossing_rho/dT0: jac=-1.1307263101873234e-06
+      dtransport:audit_root_nearest_downcrossing_rho/ddensity_shape_power: jac=-4.0333156219508968e-06
+      dtransport:audit_root_nearest_downcrossing_rho/dtemperature_shape_power: jac=-2.6650224234992264e-06
+      dtransport:audit_root_nearest_downcrossing_rho/ddensity_shape_alpha: jac=2.4180930096076968e-05
+      dtransport:audit_root_nearest_downcrossing_rho/dtemperature_shape_alpha: jac=2.6389471029116338e-06
+      dtransport:audit_root_nearest_downcrossing_rho/dvmec:RBC:1:0: jac=-1.4395585787473138e-04
+      dtransport:audit_root_nearest_downcrossing_rho/dvmec:ZBS:1:0: jac=1.8381717423510170e-03
+Wrote outputs/autodiff_transport_lagged_ntx/reverse_ad/transport_reverse_ad_only_full_transport_shared_payload_smoke_root_loss_audit_replay_jacobian_recorded_forward.json
+	Command being timed: "python examples/benchmarks/benchmark_transport_reverse_ad_only.py --config examples/benchmarks/Solve_Transport_equations_wHe_radau_ntx_scan_runtime_database_vmec_realtime_geometry_benchmark_black_box.toml --reverse-parameter-mode profiles_plus_realtime_geometry --reverse-geometry-parameter RBC:1:0,ZBS:1:0 --realtime-geometry-gradient-path reverse_payload --optimization-api-profile-dofs include --objective all --max-reverse-accepted-steps 1000 --reverse-segment-length 50 --radau-jacobian-reuse-mode legacy --timing-mode jit-warm --reverse-stage-adjoint-solve-mode block --reverse-rhs-transpose-mode explicit_database --reverse-step-bwd-mode reduced_cotangent_call_boundary --reverse-initial-cache-support-pullback-mode scalar --reverse-rebuild-support-pullback-mode separate --reverse-final-objective-cotangent-mode grouped_vjp --reverse-bootstrap-cotangent-mode joint_local_vjp_upar_only --initial-Er-root-ad jax_selected_root --full-transport-shared-payload-smoke --reverse-segment-start-replay-mode minimal --reverse-segment-primal-record-mode reuse_segment_primal_record --reverse-schedule-artifact-mode reuse_static_probe --reverse-replay-jacobian-reuse-mode recorded_forward --root-loss-audit --root-loss-audit-target 0.514 --root-loss-audit-inner-radius 0.30 --root-loss-audit-outer-radius 0.90 --root-loss-audit-profile-trust-multiplier 3.7 --root-loss-audit-ess-alpha 1.2"
+	User time (seconds): 3887.35
+	System time (seconds): 222.29
+	Percent of CPU this job got: 122%
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 55:43.78
+	Average shared text size (kbytes): 0
+	Average unshared data size (kbytes): 0
+	Average stack size (kbytes): 0
+	Average total size (kbytes): 0
+	Maximum resident set size (kbytes): 11793504
+	Average resident set size (kbytes): 0
+	Major (requiring I/O) page faults: 0
+	Minor (reclaiming a frame) page faults: 12092888
+	Voluntary context switches: 5402896
+	Involuntary context switches: 326367
+	Swaps: 0
+	File system inputs: 0
+	File system outputs: 423904
+	Socket messages sent: 0
+	Socket messages received: 0
+	Signals delivered: 0
+	Page size (bytes): 4096
+	Exit status: 0
+(jax_env) exouser@neopax-24:~/NEOPAX$ 
