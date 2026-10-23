@@ -1790,9 +1790,10 @@ def test_ntx_exact_support_only_prepared_pullback_matches_joint_helper():
             jnp.asarray([0.1, 0.3, -0.2, 0.5, -0.4, 0.2]),
         ),
     )
-    joint = model._pullback_interpolated_moment_reduced_local_outputs_with_prepared_support_and_drds(
-        **kwargs
-    )
+    # Both production helpers run inside JIT; compare them at the same boundary.
+    joint = jax.jit(
+        lambda: model._pullback_interpolated_moment_reduced_local_outputs_with_prepared_support_and_drds(**kwargs)
+    )()
     support_only = jax.jit(
         lambda: model._pullback_interpolated_moment_prepared_support_and_drds_only(**kwargs)
     )()
@@ -1846,7 +1847,7 @@ def test_ntx_exact_support_only_prepared_pullback_matches_joint_helper():
     )
     expected_batched = tuple(
         jnp.broadcast_to(value, (2,) + jnp.asarray(value).shape)
-        for value in _sanitized_support_only(*kwargs["field_bars"])
+        for value in jax.jit(_sanitized_support_only)(*kwargs["field_bars"])
     )
     for leaf_index, (actual_leaf, expected_leaf) in enumerate(
         zip(batched_support_only, expected_batched, strict=True)

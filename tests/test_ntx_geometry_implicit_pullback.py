@@ -4868,7 +4868,8 @@ def test_native_vmec_face_rebuild_er_drds_chain_matches_local_response_vjp(
     )
     _surface, prepared = _small_vmec_prepared()
     drds_value = jnp.asarray(1.2)
-    er_value = jnp.asarray(-2.7e-3)
+    # Keep the Er chain above near-zero-field cancellation in this fixture.
+    er_value = jnp.asarray(-2.7e-1)
     temperature_local = jnp.asarray([1.4, 1.1])
     density_local = jnp.asarray([0.9, 0.9])
     # Match the production helper exactly.  In particular, temperatures are
