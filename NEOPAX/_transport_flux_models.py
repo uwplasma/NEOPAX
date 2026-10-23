@@ -13537,12 +13537,7 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             second_base_drds_bars,
             second_drds_bars,
         ) = direct_drds_bars
-        # As for the prepared bar above, the second base term belongs only to
-        # the nu_hat case cotangent of the log-nu direction. ``drds`` is not
-        # that direction, so every adapter excludes it.
-        direct_drds_bars = (
-            base_drds_bars + first_drds_bars + second_drds_bars
-        )
+        direct_drds_bars = base_drds_bars + first_drds_bars + second_drds_bars
         if not (native_compact_ntx_rhs and return_case_bars and compact_energy_streamed):
             direct_drds_bars = jnp.sum(direct_drds_bars, axis=0)
         coefficient_scan, first_coefficient_dot_scan, second_coefficient_dot_scan = primal_outputs

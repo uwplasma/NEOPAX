@@ -1599,66 +1599,6 @@ def _parameter_carry_diagnostic_enabled() -> bool:
     return raw_value.strip().lower() in {"1", "true", "yes", "on"}
 
 
-def _host_step_pullback_diagnostic_enabled() -> bool:
-    raw_value = os.environ.get("NEOPAX_TRANSPORT_REVERSE_HOST_STEP_PULLBACK_DIAGNOSTIC")
-    if raw_value is None:
-        return False
-    return raw_value.strip().lower() in {"1", "true", "yes", "on"}
-
-def _step_pullback_segment_index() -> int:
-    raw_value = os.environ.get("NEOPAX_TRANSPORT_REVERSE_STEP_PULLBACK_SEGMENT")
-    if raw_value is None:
-        return 1
-    return max(0, int(raw_value))
-
-
-def _step_pullback_step_index() -> int:
-    raw_value = os.environ.get("NEOPAX_TRANSPORT_REVERSE_STEP_PULLBACK_STEP")
-    if raw_value is None:
-        return 10
-    return max(0, int(raw_value))
-
-
-def _host_step_pullback_y_bar_path() -> str | None:
-    raw_value = os.environ.get("NEOPAX_TRANSPORT_REVERSE_HOST_STEP_PULLBACK_Y_BAR_PATH")
-    if raw_value is None:
-        return None
-    value = raw_value.strip()
-    return value or None
-
-
-def _host_step_pullback_replay_dy_bar_path() -> str | None:
-    raw_value = os.environ.get("NEOPAX_TRANSPORT_REVERSE_HOST_STEP_PULLBACK_REPLAY_DY_BAR_PATH")
-    if raw_value is None:
-        return None
-    value = raw_value.strip()
-    return value or None
-
-
-def _host_step_pullback_replay_inputs_path() -> str | None:
-    raw_value = os.environ.get("NEOPAX_TRANSPORT_REVERSE_HOST_STEP_PULLBACK_REPLAY_INPUTS_PATH")
-    if raw_value is None:
-        return None
-    value = raw_value.strip()
-    return value or None
-
-
-def _host_step_pullback_replay_lagged_cache_path() -> str | None:
-    raw_value = os.environ.get("NEOPAX_TRANSPORT_REVERSE_HOST_STEP_PULLBACK_REPLAY_LAGGED_CACHE_PATH")
-    if raw_value is None:
-        return None
-    value = raw_value.strip()
-    return value or None
-
-
-def _host_step_pullback_replay_primal_path() -> str | None:
-    raw_value = os.environ.get("NEOPAX_TRANSPORT_REVERSE_HOST_STEP_PULLBACK_REPLAY_PRIMAL_PATH")
-    if raw_value is None:
-        return None
-    value = raw_value.strip()
-    return value or None
-
-
 def _adaptive_rollout_objectives_realized_schedule_only_for_parameter_vector(
     parameter_values,
     *,

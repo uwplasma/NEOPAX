@@ -5599,26 +5599,32 @@ def test_native_multi_rhs_support_retains_local_drds_case_chain():
             collisionality_kind="unused",
         )
 
-    # The complete RHS below is linear.  Gate its three NTX-dependent output
-    # channels independently so a failure identifies the low-dot term that
-    # needs correction, rather than merely reporting a summed prepared bar.
+    def _fixed_case_response(prepared_value, drds_value, nu_value, epsi_value, vth_value):
+        return model._interpolated_moment_reduced_local_outputs_from_primitives(
+            prepared_value, drds_value=drds_value, nu_hat_a=nu_value,
+            epsi_hat_a=epsi_value, vth_a=vth_value,
+        )
+
+    _, fixed_pullback = jax.vjp(
+        _fixed_case_response, prepared, drds,
+        reference_nu_hat, reference_epsi_hat, vth_a,
+    )
+    _, response_pullback = jax.vjp(_response, prepared, drds)
+
+    # Check each linear output channel before comparing their combined pullback.
     component_names = (
         "transport_moments",
         "dtransport_moments_d_er",
         "dtransport_moments_d_log_nu_star",
     )
-    reference_field_bars = scalar_field_bars[0]
     native_channels = []
     direct_channels = [[] for _ in scalar_field_bars]
     for field_index, component_name in zip((1, 2, 3), component_names, strict=True):
-        component_field_bars = tuple(
-            value if index == field_index else jnp.zeros_like(value)
-            for index, value in enumerate(reference_field_bars)
-        )
         component_batch = tuple(
             value if index == field_index else jnp.zeros_like(value)
             for index, value in enumerate(batched_field_bars)
         )
+        component_field_bars = tuple(value[0] for value in component_batch)
         (
             generic_component_prepared,
             _generic_component_direct_drds,
@@ -5644,16 +5650,6 @@ def test_native_multi_rhs_support_retains_local_drds_case_chain():
             vth_a=vth_a,
             field_bars=component_batch,
             return_case_bars=True,
-        )
-        def _fixed_case_response(prepared_value, drds_value, nu_value, epsi_value, vth_value):
-            return model._interpolated_moment_reduced_local_outputs_from_primitives(
-                prepared_value, drds_value=drds_value, nu_hat_a=nu_value,
-                epsi_hat_a=epsi_value, vth_a=vth_value,
-            )
-
-        _, fixed_pullback = jax.vjp(
-            _fixed_case_response, prepared, drds,
-            reference_nu_hat, reference_epsi_hat, vth_a,
         )
         fixed_prepared, fixed_drds, fixed_nu, fixed_epsi, fixed_vth = fixed_pullback(component_field_bars)
         scalar_prepared, scalar_drds, _ = model._pullback_interpolated_moment_prepared_support_and_drds_only(
@@ -5681,10 +5677,9 @@ def test_native_multi_rhs_support_retains_local_drds_case_chain():
             _native_component_direct_drds
             + jnp.sum(_native_component_case_bars[1] * epsi_per_drds, axis=1)
         )
-        _response_value, component_pullback = jax.vjp(_response, prepared, drds)
         for rhs_index in range(len(scalar_field_bars)):
             one_component = tuple(value[rhs_index] for value in component_batch)
-            expected_prepared, expected_drds = component_pullback(one_component)
+            expected_prepared, expected_drds = response_pullback(one_component)
             direct_channels[rhs_index].append(expected_prepared)
             for adapter, actual_prepared in (
                 ("generic", generic_component_prepared),
@@ -5711,8 +5706,7 @@ def test_native_multi_rhs_support_retains_local_drds_case_chain():
 
     summed_native = _sum_channels(native_channels)
     for rhs_index, field_bars in enumerate(scalar_field_bars):
-        _response_value, pullback = jax.vjp(_response, prepared, drds)
-        expected_prepared, expected_drds = pullback(field_bars)
+        expected_prepared, expected_drds = response_pullback(field_bars)
         actual_prepared = jax.tree_util.tree_map(lambda value: value[rhs_index], native_prepared)
         # Each channel above retains the original error gate. A cancelled sum
         # needs a conditioning-aware relative scale: sum absolute channel bars.
