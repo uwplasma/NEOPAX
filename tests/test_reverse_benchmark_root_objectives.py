@@ -487,6 +487,89 @@ class ReverseBenchmarkRootObjectiveTests(unittest.TestCase):
                 self.assertEqual(transport_terms, expected)
                 self.assertIs(call["table_result_builder"], builder.return_value)
 
+    def test_root_loss_audit_evaluates_only_new_rows_and_keeps_geometry_dofs_and_replay_settings(self):
+        from examples.benchmarks._er_root_loss_audit import AUDIT_OBJECTIVES
+        function = next(node for node in MODULE.body if isinstance(node, ast.FunctionDef)
+                        and node.name == "_run_realtime_geometry_optimization_api_smoke")
+        args = SimpleNamespace(**{
+            node.attr: None for node in ast.walk(function)
+            if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name) and node.value.id == "args"
+        })
+        args.full_transport_shared_payload_smoke = True
+        args.optimization_api_profile_dofs = "include"
+        args.objective = "all"
+        args.accepted_step_limit = 16
+        args.reverse_segment_length = 50
+        args.reverse_replay_jacobian_reuse_mode = "legacy"
+        args.root_loss_audit = True
+        args.root_loss_audit_target = 0.514
+        args.root_loss_audit_inner_radius = 0.30
+        args.root_loss_audit_outer_radius = 0.9
+        args.root_loss_audit_profile_trust_multiplier = 3.7
+        args.root_loss_audit_ess_alpha = 1.2
+        namespace = _namespace()
+        builder = Mock(return_value=object())
+        evaluate = Mock(side_effect=_EvaluationReached)
+        namespace.update({
+            "np": np, "jnp": np, "PROFILE_PARAMETER_ORDER": parameters.PROFILE_PARAMETER_ORDER,
+            "reverse_ad_optimization_parameter_set": parameters.reverse_ad_optimization_parameter_set,
+            "VmecBoundaryParameterSpec": parameters.VmecBoundaryParameterSpec,
+            "transport_least_squares_terms": optimization.transport_least_squares_terms,
+            "LeastSquaresTerm": optimization.LeastSquaresTerm, "geometry_objectives": optimization.geometry,
+            "_geometry_param_specs_from_args": lambda *_: (("RBC", 1, 0), ("ZBS", 1, 0)),
+            "_baseline_geometry_delta_vector_for_specs": lambda *_: np.zeros(2),
+            "_profile_cfg_scalar_value": lambda cfg, name: cfg[name],
+            "_make_realtime_geometry_support_segment_builder_inputs": lambda **_: (object(), object()),
+            "internal_realtime_geometry_transport_reverse_table_result_builder": builder,
+            "realtime_geometry_transport_reverse_table_request": lambda **kwargs: SimpleNamespace(**kwargs),
+            "_maybe_reverse_segment_profiler_trace": lambda _: nullcontext(),
+            "evaluate_geometry_transport_realtime_geometry_least_squares": evaluate,
+        })
+        extracted = ast.Module(body=[ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0), function], type_ignores=[])
+        exec(compile(ast.fix_missing_locations(extracted), str(BENCHMARK), "exec"), namespace)
+        with redirect_stdout(io.StringIO()), self.assertRaises(_EvaluationReached):
+            namespace[function.name](
+                args=args, config={"geometry": {}, "neoclassical": {}}, geometry_context=object(),
+                baseline_values=None, baseline_runtime=object(), baseline_state=SimpleNamespace(pressure=np.ones((4, 51))),
+                profile_cfg={name: 1.0 for name in parameters.PROFILE_PARAMETER_ORDER}, neoclassical_cfg={},
+            )
+        call = builder.call_args.kwargs
+        expected = AUDIT_OBJECTIVES
+        self.assertEqual(call["objective_labels"], expected)
+        self.assertEqual(evaluate.call_args.kwargs["request"].objective_names, expected)
+        self.assertEqual(call["accepted_step_limit"], 16)
+        self.assertEqual(call["reverse_segment_length"], 50)
+        self.assertEqual(call["reverse_replay_jacobian_reuse_mode"], "legacy")
+        evaluation = evaluate.call_args.kwargs
+        self.assertEqual(tuple(term.objective.name for term in evaluation["terms"]), expected)
+        self.assertTrue(all(term.objective.family == "transport" for term in evaluation["terms"]))
+        self.assertEqual(len(evaluation["request"].parameter_set.labels), 8)
+        self.assertEqual(evaluation["request"].parameter_set.labels[-2:], ("RBC:1:0", "ZBS:1:0"))
+        self.assertTrue(callable(call["objective_scalar_evaluator"]))
+        self.assertTrue(callable(call["terminal_state_observer"]))
+
+    def test_root_audit_parser_guards_reject_wrong_lanes_and_invalid_windows_before_runtime(self):
+        main = next(node for node in MODULE.body if isinstance(node, ast.FunctionDef) and node.name == "main")
+        guards = [node for node in main.body if isinstance(node, ast.If) and isinstance(node.test, ast.BoolOp)
+                  and isinstance(node.test.values[0], ast.Attribute) and node.test.values[0].attr == "root_loss_audit"]
+        self.assertEqual(len(guards), 2)
+        valid = dict(root_loss_audit=True, objective="all", full_transport_shared_payload_smoke=True,
+                     reverse_parameter_mode="profiles_plus_realtime_geometry", realtime_geometry_gradient_path="reverse_payload",
+                     optimization_api_profile_dofs="include", initial_er_root_only_optimization_smoke=False,
+                     transport_solver_forward_smoke=False, root_loss_audit_inner_radius=0.3,
+                     root_loss_audit_target=0.514, root_loss_audit_outer_radius=0.9,
+                     root_loss_audit_profile_trust_multiplier=3.7, root_loss_audit_ess_alpha=1.2)
+        check = compile(ast.Module(body=guards, type_ignores=[]), str(BENCHMARK), "exec")
+        exec(check, {"args": SimpleNamespace(**valid), "parser": argparse.ArgumentParser(), "np": np})
+        for name, value in (("objective", "softmax_Er"), ("optimization_api_profile_dofs", "exclude"),
+                            ("full_transport_shared_payload_smoke", False), ("root_loss_audit_target", 0.1),
+                            ("root_loss_audit_outer_radius", 0.2), ("root_loss_audit_profile_trust_multiplier", 0),
+                            ("root_loss_audit_ess_alpha", np.nan)):
+            with self.subTest(option=name):
+                changed = {**valid, name: value}
+                with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                    exec(check, {"args": SimpleNamespace(**changed), "parser": argparse.ArgumentParser(), "np": np})
+
     def test_new_scalar_objectives_are_available_only_in_the_shared_transport_lane(self):
         main = next(node for node in MODULE.body if isinstance(node, ast.FunctionDef) and node.name == "main")
         declaration = next(

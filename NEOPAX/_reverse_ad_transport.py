@@ -769,6 +769,7 @@ class RealtimeGeometrySupportReverseDependencies:
     # Optional optimization-memory diagnostic. Production benchmark bundles
     # leave this unset, preserving their existing execution and synchronization.
     optimization_phase_probe: Callable[[str], None] | None = None
+    terminal_state_observer: Callable[..., None] | None = None
 
     def __post_init__(self) -> None:
         for field in dataclasses.fields(self):
@@ -780,6 +781,7 @@ class RealtimeGeometrySupportReverseDependencies:
                 "database_initial_root_selected_profile",
                 "database_initial_root_pullback",
                 "optimization_phase_probe",
+                "terminal_state_observer",
             } and value is None:
                 continue
             if not callable(value):
@@ -5239,6 +5241,12 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
         forward_rebuild_mask.reshape(-1)[:accepted_rebuilds.size] = accepted_rebuilds
 
     final_y_for_objective = segmented_final_carry.y
+    if dependencies.terminal_state_observer is not None:
+        # Observe the concrete primal once, outside terminal-objective AD.
+        dependencies.terminal_state_observer(
+            reverse_setup.prepared_rollout.physics_context.unpack_flat(final_y_for_objective),
+            runtime, segmented_final_carry.t,
+        )
     if bool(getattr(reverse_setup, "require_final_time", False)):
         final_time = jnp.asarray(segmented_final_carry.t)
         target_time = jnp.asarray(getattr(reverse_setup.solver, "t1", final_time), dtype=final_time.dtype)
@@ -8868,6 +8876,8 @@ def internal_realtime_geometry_transport_reverse_table_result_builder(
     initial_root_optimization_stage: object | None = None,
     runtime_optimization_stage: object | None = None,
     objective_labels: Sequence[str] = TRANSPORT_REVERSE_OBJECTIVE_LABELS,
+    objective_scalar_evaluator: Callable[[object, object, int], object] | None = None,
+    terminal_state_observer: Callable[..., None] | None = None,
 ) -> TransportReverseTableResultBuilder:
     """Build an experimental direct full transport reverse table builder.
 
@@ -8907,9 +8917,15 @@ def internal_realtime_geometry_transport_reverse_table_result_builder(
     configured_objective_dependencies = (
         default_realtime_geometry_support_reverse_dependencies()
     )
+    if terminal_state_observer is not None:
+        configured_objective_dependencies = dataclasses.replace(
+            configured_objective_dependencies, terminal_state_observer=terminal_state_observer,
+        )
     configured_support_reverse_callback = None
     if (
-        configured_er_transition_left_index != 20
+        objective_scalar_evaluator is not None
+        or terminal_state_observer is not None
+        or configured_er_transition_left_index != 20
         or configured_er_transition_right_index != 21
         or configured_er_transition_rho_min != 0.25
         or configured_er_transition_rho_max != 0.75
@@ -8929,6 +8945,8 @@ def internal_realtime_geometry_transport_reverse_table_result_builder(
             objective_runtime,
             objective_index,
         ):
+            if objective_scalar_evaluator is not None:
+                return objective_scalar_evaluator(final_state, objective_runtime, objective_index)
             return objective_scalar_by_index(
                 final_state,
                 objective_runtime,

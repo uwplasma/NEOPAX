@@ -4078,13 +4078,31 @@ def _run_realtime_geometry_optimization_api_smoke(
         if bool(getattr(args, "full_transport_shared_payload_smoke", False))
         else tuple(OBJECTIVE_LABELS)
     )
+    root_audit_kwargs = {}
+    root_audit_settings = None
+    root_audit_snapshot = None
+    if bool(getattr(args, "root_loss_audit", False)):
+        from examples.benchmarks._er_root_loss_audit import (
+            AUDIT_OBJECTIVES, RootLossAuditSettings, make_audit_callbacks,
+        )
+        if not bool(getattr(args, "full_transport_shared_payload_smoke", False)) or str(args.objective) != "all":
+            raise ValueError("Root-loss audit requires the existing shared-payload benchmark with --objective all.")
+        root_audit_settings = RootLossAuditSettings(
+            target=float(args.root_loss_audit_target), inner_radius=float(args.root_loss_audit_inner_radius),
+            outer_radius=float(args.root_loss_audit_outer_radius),
+            profile_trust_multiplier=float(args.root_loss_audit_profile_trust_multiplier),
+            geometry_ess_alpha=float(args.root_loss_audit_ess_alpha),
+        )
+        objective_labels = AUDIT_OBJECTIVES
+        evaluator, observer, root_audit_snapshot = make_audit_callbacks(objective_labels, root_audit_settings)
+        root_audit_kwargs = dict(objective_scalar_evaluator=evaluator, terminal_state_observer=observer)
     objective_names = (
         objective_labels
         if str(args.objective) == "all"
         else (str(args.objective),)
     )
     terms = transport_least_squares_terms(objective_names)
-    if bool(getattr(args, "full_transport_shared_payload_smoke", False)):
+    if bool(getattr(args, "full_transport_shared_payload_smoke", False)) and root_audit_settings is None:
         terms = tuple(terms) + (
             LeastSquaresTerm(geometry_objectives.boozer_qi_objective),
             LeastSquaresTerm(geometry_objectives.boozer_maxj_objective),
@@ -4182,6 +4200,7 @@ def _run_realtime_geometry_optimization_api_smoke(
         table_result_builder = internal_realtime_geometry_transport_reverse_table_result_builder(
             table_context=table_context,
             objective_labels=objective_labels,
+            **root_audit_kwargs,
             geometry_context=geometry_context,
             baseline_geometry_deltas=geometry_values0,
             combined_geometry_payload=True,
@@ -4370,6 +4389,19 @@ def _run_realtime_geometry_optimization_api_smoke(
         f"elapsed_s={elapsed_s:.3f}",
         flush=True,
     )
+    if root_audit_settings is not None:
+        from examples.benchmarks._er_root_loss_audit import summarize_audit, experiment_inputs
+        report["root_loss_audit"] = summarize_audit(
+            residual_labels=result.residual_labels, parameter_labels=result.parameter_labels,
+            values=residuals_np, jacobian=jacobian_np, profile_cfg=profile_cfg,
+            settings=root_audit_settings, snapshot=root_audit_snapshot,
+        )
+        report["root_loss_audit"]["experiment"] = experiment_inputs(
+            config, parameter_values, str(args.initial_er_root_ad),
+        )
+        print("[root-loss-audit] NEW candidates only; physical gradients and root-descent directions:", flush=True)
+        for comparison in report["root_loss_audit"]["comparisons"]:
+            print(json.dumps(comparison), flush=True)
     print("[autodiff-gate] optimization API residuals/Jacobian rows:")
     for row_i, label in enumerate(result.residual_labels):
         print(f"  - {label}: residual={residuals_np[row_i]:.16e}")
@@ -4380,6 +4412,8 @@ def _run_realtime_geometry_optimization_api_smoke(
         if bool(getattr(args, "full_transport_shared_payload_smoke", False))
         else "optimization_api_smoke"
     )
+    if root_audit_settings is not None:
+        report_name += "_root_loss_audit"
     if replay_jacobian_reuse_mode != "legacy":
         report_name += f"_replay_jacobian_{replay_jacobian_reuse_mode}"
     outpath = _report_path(report_name)
@@ -5785,10 +5819,17 @@ def main() -> None:
         help=(
             "Scalar objective for reverse mode. Use 'all' to return the "
             "objective-by-parameter reverse derivative matrix for every metric. "
-            "Full-transport shared-payload mode replaces the fixed left/right "
-            "Er rows with transition radius, location moment, and strength."
+            "Full-transport shared-payload mode includes fixed left/right Er "
+            "and transition radius, location moment, and strength."
         ),
     )
+    parser.add_argument("--root-loss-audit", action="store_true",
+                        help="Evaluate only the two NEW root candidates plus root diagnostics, with geometry and profile DoFs.")
+    parser.add_argument("--root-loss-audit-target", type=float, default=0.514)
+    parser.add_argument("--root-loss-audit-inner-radius", type=float, default=0.30)
+    parser.add_argument("--root-loss-audit-outer-radius", type=float, default=0.9)
+    parser.add_argument("--root-loss-audit-profile-trust-multiplier", type=float, default=3.7)
+    parser.add_argument("--root-loss-audit-ess-alpha", type=float, default=1.2)
     parser.add_argument(
         "--reverse-all-objectives-mode",
         type=str,
@@ -6876,6 +6917,23 @@ def main() -> None:
         ),
     )
     args = parser.parse_args()
+    if args.root_loss_audit and (
+        args.objective != "all" or not args.full_transport_shared_payload_smoke
+        or args.reverse_parameter_mode != "profiles_plus_realtime_geometry"
+        or args.realtime_geometry_gradient_path != "reverse_payload"
+        or args.optimization_api_profile_dofs != "include"
+        or args.initial_er_root_only_optimization_smoke or args.transport_solver_forward_smoke
+    ):
+        parser.error("--root-loss-audit requires --objective all, --full-transport-shared-payload-smoke, "
+                     "profiles_plus_realtime_geometry, reverse_payload and included profile DoFs.")
+    if args.root_loss_audit and not (
+        0 <= args.root_loss_audit_inner_radius < args.root_loss_audit_target
+        < args.root_loss_audit_outer_radius <= 1
+        and np.isfinite(args.root_loss_audit_profile_trust_multiplier)
+        and args.root_loss_audit_profile_trust_multiplier > 0
+        and np.isfinite(args.root_loss_audit_ess_alpha) and args.root_loss_audit_ess_alpha >= 0
+    ):
+        parser.error("Root audit requires ordered radii, a finite positive profile trust multiplier and finite nonnegative ESS alpha.")
     if args.objective in TRANSPORT_OPTIMIZATION_OPTIONAL_OBJECTIVE_LABELS and (
         not args.full_transport_shared_payload_smoke
         or args.reverse_parameter_mode != "profiles_plus_realtime_geometry"
