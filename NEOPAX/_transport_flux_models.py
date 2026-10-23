@@ -4926,7 +4926,12 @@ class NTXDatabaseTransportModel(TransportFluxModelBase):
         complete radial flux table keeps that scan record and all unrelated
         equation/source work outside this boundary.
         """
-        zero = jnp.zeros_like(jnp.asarray(state.density))
+        # Preserve a supplied objective axis even when Gamma is absent.
+        zero = jnp.zeros_like(next((
+            value for value in flux_bar.values()
+            if value is not None and jnp.ndim(value) > 0
+            and jnp.asarray(value).dtype != jax.dtypes.float0
+        ), state.density))
 
         def _bar(name):
             value = flux_bar.get(name, None)
@@ -12848,17 +12853,17 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             first_base_geometry_bar,
             first_geometry_bar,
             second_base_nu_hat_bar,
-            second_base_epsi_hat_bar,
+            _second_base_epsi_hat_bar,
             second_nu_hat_bar,
             second_epsi_hat_bar,
-            second_base_geometry_bar,
+            _second_base_geometry_bar,
             second_geometry_bar,
             direct_drds_bars,
         ) = jax.lax.map(
             _one_energy,
             (energy_indices, reference_nu_hat, reference_epsi_hat, epsi_hat_tangent),
         )
-        base_drds_bar, _first_base_drds_bar, first_drds_bar, second_base_drds_bar, second_drds_bar = (
+        base_drds_bar, _first_base_drds_bar, first_drds_bar, _second_base_drds_bar, second_drds_bar = (
             direct_drds_bars
         )
         log_nu_star_nu_hat_bar = self._pullback_log_nu_star_from_nu_hat(
@@ -12875,7 +12880,6 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         epsi_hat_bar = (
             base_epsi_hat_bar
             + first_epsi_hat_bar
-            + second_base_epsi_hat_bar
             + second_epsi_hat_bar
         )
         vth_a_bar = jnp.sum(
@@ -12883,7 +12887,7 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             axis=0,
         )
         # Every energy evaluation differentiates the same prepared NTX
-        # system. Combine its four directional contributions, then reduce the
+        # system. Combine its three directional contributions, then reduce the
         # mapped energy axis before returning a cotangent for that one system.
         prepared_bar = jax.tree_util.tree_map(
             lambda values: jnp.sum(values, axis=0),
@@ -12891,7 +12895,6 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                 prepared,
                 base_geometry_bar,
                 first_geometry_bar,
-                second_base_geometry_bar,
                 second_geometry_bar,
             ),
         )
@@ -12900,7 +12903,7 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         # cotangent must sum that axis before the species/objective maps and
         # the anchor scatter accumulation.
         direct_drds_bar = jnp.sum(
-            base_drds_bar + first_drds_bar + second_base_drds_bar + second_drds_bar,
+            base_drds_bar + first_drds_bar + second_drds_bar,
             axis=0,
         )
         return (
@@ -13042,7 +13045,7 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             base_geometry_bar,
             _first_base_geometry_bar,
             first_geometry_bar,
-            second_base_geometry_bar,
+            _second_base_geometry_bar,
             second_geometry_bar,
             auxiliary,
         ) = jax.lax.map(
@@ -13055,7 +13058,7 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             first_coefficient_dot_scan,
             second_coefficient_dot_scan,
         ) = auxiliary
-        base_drds_bar, _first_base_drds_bar, first_drds_bar, second_base_drds_bar, second_drds_bar = direct_drds_bars
+        base_drds_bar, _first_base_drds_bar, first_drds_bar, _second_base_drds_bar, second_drds_bar = direct_drds_bars
         if geometry_implicit_ntx_two_directional:
             geometry_bar = jax.tree_util.tree_map(
                 lambda values: jnp.sum(values, axis=0),
@@ -13063,7 +13066,6 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                     prepared.geometry,
                     base_geometry_bar,
                     first_geometry_bar,
-                    second_base_geometry_bar,
                     second_geometry_bar,
                 ),
             )
@@ -13078,12 +13080,11 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                     prepared,
                     base_geometry_bar,
                     first_geometry_bar,
-                    second_base_geometry_bar,
                     second_geometry_bar,
                 ),
             )
         direct_drds_bar = jnp.sum(
-            base_drds_bar + first_drds_bar + second_base_drds_bar + second_drds_bar,
+            base_drds_bar + first_drds_bar + second_drds_bar,
             axis=0,
         )
         primal_response = (
@@ -13131,7 +13132,6 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         native_per_energy_call_boundary: bool = False,
         stream_native_compact_energy: bool = False,
         return_case_bars: bool = False,
-        include_second_direction_base_prepared: bool = True,
     ):
         """Batched exact prepared/``drds`` transpose for one local species.
 
@@ -13502,12 +13502,9 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                 direct_drds_bars,
                 primal_outputs,
             ) = mapped_outputs
-        # ``second_base_prepared_bars`` is the extra base pullback required
-        # for the *nu_hat case bar* of d/dlog(nu_hat), because that tangent is
-        # itself nu_hat.  It is not a prepared-system derivative: the local
-        # prepared payload holds nu_hat fixed.  Keep the historical default
-        # for existing private callers, while the native exactness adapter
-        # explicitly excludes it.
+        # The second direction depends only on nu_hat. Its product-rule
+        # base term belongs only to the nu_hat cotangent, not to prepared
+        # support or direct drds, whose local case is held fixed.
         prepared_bar_terms = (
             (compact_prepared_bars,)
             if (
@@ -13520,13 +13517,6 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             (
                 base_prepared_bars,
                 first_prepared_bars,
-                second_prepared_bars,
-            )
-            if not include_second_direction_base_prepared
-            else (
-                base_prepared_bars,
-                first_prepared_bars,
-                second_base_prepared_bars,
                 second_prepared_bars,
             )
         )
@@ -13547,19 +13537,7 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             second_base_drds_bars,
             second_drds_bars,
         ) = direct_drds_bars
-        # As for the prepared bar above, the second base term belongs only to
-        # the nu_hat case cotangent of the log-nu direction. ``drds`` is not
-        # that direction, so the native exact adapter excludes it.
-        direct_drds_bars = (
-            base_drds_bars + first_drds_bars + second_drds_bars
-            if not include_second_direction_base_prepared
-            else (
-                base_drds_bars
-                + first_drds_bars
-                + second_base_drds_bars
-                + second_drds_bars
-            )
-        )
+        direct_drds_bars = base_drds_bars + first_drds_bars + second_drds_bars
         if not (native_compact_ntx_rhs and return_case_bars and compact_energy_streamed):
             direct_drds_bars = jnp.sum(direct_drds_bars, axis=0)
         coefficient_scan, first_coefficient_dot_scan, second_coefficient_dot_scan = primal_outputs
@@ -13693,7 +13671,6 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             field_bars=field_bars,
             native_factorized_ntx_rhs=True,
             return_case_bars=return_case_bars,
-            include_second_direction_base_prepared=False,
         )
 
     def _pullback_interpolated_moment_prepared_support_and_drds_only_native_multi_rhs_compact(
@@ -13719,7 +13696,6 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             native_factorized_ntx_rhs=True,
             native_compact_ntx_rhs=True,
             return_case_bars=return_case_bars,
-            include_second_direction_base_prepared=False,
         )
 
     def _pullback_interpolated_moment_prepared_support_and_drds_only_native_multi_rhs_reuse_moment_drds_jvp(
@@ -13752,7 +13728,6 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             native_factorized_ntx_rhs=True,
             reuse_joint_moment_drds_jvp=True,
             return_case_bars=return_case_bars,
-            include_second_direction_base_prepared=False,
         )
 
     def _pullback_interpolated_moment_prepared_support_and_drds_only_native_multi_rhs_reuse_moment_drds_jvp_with_vmec_coefficients(
@@ -13795,7 +13770,6 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             native_direct_coefficient_pullback=native_direct_coefficient_pullback,
             native_per_energy_call_boundary=native_per_energy_call_boundary,
             return_case_bars=return_case_bars,
-            include_second_direction_base_prepared=False,
         )
 
     def _pullback_interpolated_moment_prepared_support_and_drds_only_native_multi_rhs_compact_residual(
@@ -13820,7 +13794,6 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             native_factorized_ntx_rhs=True,
             native_compact_residual_ntx_rhs=True,
             return_case_bars=return_case_bars,
-            include_second_direction_base_prepared=False,
         )
 
     def _pullback_interpolated_moment_prepared_support_and_drds_only_native_multi_rhs_compact_residual_reuse_moment_drds_jvp(
@@ -13846,7 +13819,6 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
             native_compact_residual_ntx_rhs=True,
             reuse_joint_moment_drds_jvp=True,
             return_case_bars=return_case_bars,
-            include_second_direction_base_prepared=False,
         )
 
     def _pullback_local_scan_inputs_from_primitives(
@@ -14225,7 +14197,6 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                     native_vmec_coefficient_bars_only=(
                         return_native_vmec_coefficient_bars
                     ),
-                    include_second_direction_base_prepared=False,
                 )
                 if return_native_vmec_coefficient_bars:
                     (

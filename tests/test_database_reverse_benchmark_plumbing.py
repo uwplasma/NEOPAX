@@ -18,6 +18,45 @@ def _function(path, name):
     return next(node for node in module.body if isinstance(node, ast.FunctionDef) and node.name == name)
 
 
+def test_realized_rollout_report_compares_the_same_full_history():
+    """A baseline-only checkpoint would compare a different objective to FD/AD."""
+    import jax
+    import jax.numpy as jnp
+    import numpy as np
+
+    path = _ROOT / "examples/benchmarks/benchmark_transport_autodiff_lagged_ntx.py"
+    node = _function(path, "build_realized_schedule_rollout_report")
+    calls = []
+
+    def objectives(value, **kwargs):
+        calls.append(kwargs)
+        return jnp.asarray([value * value]), object()
+
+    namespace = dict(
+        Any=object, Path=Path, jax=jax, jnp=jnp, np=np,
+        ALLOWED_PARAMETERS={"density"}, OBJECTIVE_LABELS=("square",),
+        _prepare_benchmark_config=lambda *args, **kwargs: {},
+        build_runtime_context=lambda config: (None, None),
+        _baseline_profile_cfg=lambda config: {"density": 2.0},
+        _fd_step=lambda *args, **kwargs: 1.0e-3,
+        _adaptive_rollout_objectives_for_parameter=objectives,
+        _adaptive_rollout_diagnostics=lambda rollout: dict(
+            accepted_mask=[True], attempted_dts=[1.0], next_dts=[1.0],
+        ),
+        _sequence_allclose=np.allclose,
+    )
+    exec(compile(ast.Module(body=[node], type_ignores=[]), str(path), "exec"), namespace)
+    report = namespace[node.name](
+        config_path=Path("unused"), parameter_name="density", rel_fd_step=1e-3,
+        abs_fd_step=1e-6, device=None,
+    )
+    assert report["passed"]
+    np.testing.assert_allclose(report["baseline_objectives"], [4.0])
+    np.testing.assert_allclose(report["gradient_autodiff"], report["gradient_fd"], rtol=1e-3)
+    assert len(calls) == 4
+    assert all(call["use_realized_schedule_jvp"] for call in calls)
+
+
 def _callback(namespace):
     path = _ROOT / "examples/benchmarks/benchmark_transport_reverse_ad_only.py"
     node = _function(path, "_prepare_reverse_static_setup")

@@ -28,8 +28,8 @@ keywords = ["Plasma",
      "JAX"]
  
 dependencies = [
-    "jax",
-    "jaxlib",
+    "jax>=0.10.2",
+    "jaxlib>=0.10.2",
     "matplotlib",
     "equinox",
     "optimistix",
@@ -46,7 +46,7 @@ dependencies = [
     "ntx @ git+https://github.com/uwplasma/NTX.git@en/custom_rule_NEOPAX",
 ]
  
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 
 [project.urls]
 Homepage = "https://github.com/uwplasma/NEOPAX"

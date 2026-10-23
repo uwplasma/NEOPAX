@@ -257,3 +257,29 @@ def test_bremsstrahlung_relativistic_correction_reads_temperature_as_kev():
     ratio = Te_keV / electron_rest_mass_keV
     expected = (1.0 + 2.0 * ratio) * (1.0 + (2.0 / Zeff) * (1.0 - 1.0 / (1.0 + ratio)))
     assert jnp.allclose(corrected / plain, expected, rtol=1e-10)
+
+
+def test_temperature_equilibration_preserves_radial_and_species_permutations():
+    # Six pairs and six radial points used to broadcast silently along radius.
+    density = jnp.asarray([1.2, .35, .45, .2])[:, None] * jnp.linspace(.8, 1.2, 6)
+    temperature = jnp.asarray([8., 3., 5., 2.])[:, None] * jnp.linspace(.7, 1.3, 6)
+    state = TransportState(density=density, pressure=density * temperature, Er=jnp.zeros(6))
+    mass = jnp.asarray([.000544617, 2., 3., 4.])
+    charge = jnp.asarray([-1., 1., 1., 2.])
+    species = Species(number_species=4, species_indices=jnp.arange(4),
+                      mass_mp=mass, charge_qp=charge, names=("e", "D", "T", "He"))
+    src = TemperatureEquilibrationPowerExchangeSource(mode="all")
+    key = "power_exchange_temperature_equilibration"
+    result = src(state, species)[key]
+    radial = jnp.asarray([3, 0, 5, 1, 4, 2])
+    reordered = TransportState(density=density[:, radial], pressure=(density * temperature)[:, radial], Er=jnp.zeros(6))
+    assert jnp.allclose(src(reordered, species)[key], result[:, radial], rtol=1e-12, atol=1e-12)
+    order = jnp.asarray([2, 0, 3, 1])
+    reordered = TransportState(density=density[order], pressure=(density * temperature)[order], Er=jnp.zeros(6))
+    reordered_species = Species(number_species=4, species_indices=jnp.arange(4),
+                                mass_mp=mass[order], charge_qp=charge[order], names=("T", "e", "He", "D"))
+    assert jnp.allclose(src(reordered, reordered_species)[key], result[order], rtol=1e-12, atol=1e-12)
+    assert jnp.allclose(jnp.sum(result, axis=0), 0., atol=1e-11)
+    assert jnp.all(jnp.sum(result / temperature, axis=0) > 0.)
+    equilibrium = TransportState(density=density, pressure=4. * density, Er=jnp.zeros(6))
+    assert jnp.array_equal(src(equilibrium, species)[key], jnp.zeros_like(density))

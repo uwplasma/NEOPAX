@@ -6,12 +6,14 @@ from pathlib import Path
 import h5py
 import jax
 import jax.numpy as jnp
+import numpy as np
 import pytest
 from ntx import GridSpec, example_surface, prepare_monoenergetic_system
 
 import NEOPAX._reverse_ad_transport as reverse_transport_module
 import NEOPAX._reverse_ad_initial_er as initial_er_module
 import NEOPAX._transport_flux_models as flux_models_module
+import NEOPAX._orchestrator as orchestrator_module
 from NEOPAX._orchestrator import (
     _build_database,
     _build_flux_model,
@@ -253,8 +255,9 @@ def test_ntx_quadratic_resolution_fallback_selects_only_flagged_radii():
         assert jnp.array_equal(selected_value[1], high_value[1])
 
 
-def test_ntx_exact_runtime_lagged_face_response_matches_reference_and_finite_difference():
-    """The exact NTX face response must agree locally with its live face flux."""
+@pytest.mark.parametrize("response_anchor_count", (2, 3))
+def test_ntx_exact_runtime_lagged_face_response_matches_reference_and_finite_difference(response_anchor_count):
+    """At every radial anchor, the NTX response agrees with its live flux."""
     geometry = types.SimpleNamespace(
         a_b=1.0,
         r_grid=jnp.asarray([0.3, 0.7]),
@@ -293,7 +296,7 @@ def test_ntx_exact_runtime_lagged_face_response_matches_reference_and_finite_dif
         boozer_file=None,
         support=support,
         center_response_mode="interpolate_from_faces",
-        response_anchor_count=2,
+        response_anchor_count=response_anchor_count,
     )
     state0 = TransportState(
         density=jnp.asarray([[1.0, 1.15], [1.0, 1.15]]),
@@ -311,23 +314,30 @@ def test_ntx_exact_runtime_lagged_face_response_matches_reference_and_finite_dif
         return model.evaluate_face_fluxes(state, faces)
 
     response = model.build_lagged_response(state0)
-    recorded_response, compact_record = model.build_lagged_response_with_compact_coefficient_record(state0)
-    for ordinary_leaf, recorded_leaf in zip(
-        jax.tree_util.tree_leaves(response),
-        jax.tree_util.tree_leaves(recorded_response),
-        strict=True,
-    ):
-        if jnp.issubdtype(jnp.asarray(ordinary_leaf).dtype, jnp.inexact):
-            assert jnp.allclose(recorded_leaf, ordinary_leaf, rtol=1.0e-9, atol=1.0e-11)
-    assert compact_record.face_anchor_coefficients.coefficient_scan.shape == (2, 2, 3, 5)
-    assert compact_record.face_anchor_coefficients.dcoefficient_scan_d_er.shape == (2, 2, 3, 5)
-    assert compact_record.face_anchor_coefficients.dcoefficient_scan_d_log_nu_star.shape == (2, 2, 3, 5)
+    if response_anchor_count == 2:
+        recorded_response, compact_record = model.build_lagged_response_with_compact_coefficient_record(state0)
+        for ordinary_leaf, recorded_leaf in zip(
+            jax.tree_util.tree_leaves(response),
+            jax.tree_util.tree_leaves(recorded_response),
+            strict=True,
+        ):
+            if jnp.issubdtype(jnp.asarray(ordinary_leaf).dtype, jnp.inexact):
+                assert jnp.allclose(recorded_leaf, ordinary_leaf, rtol=1.0e-9, atol=1.0e-11)
+        assert compact_record.face_anchor_coefficients.coefficient_scan.shape == (2, 2, 3, 5)
+        assert compact_record.face_anchor_coefficients.dcoefficient_scan_d_er.shape == (2, 2, 3, 5)
+        assert compact_record.face_anchor_coefficients.dcoefficient_scan_d_log_nu_star.shape == (2, 2, 3, 5)
+    else:
+        with pytest.raises(NotImplementedError, match="interpolated response-anchor lane"):
+            model.build_lagged_response_with_compact_coefficient_record(state0)
+    # The omitted middle face is an interpolated approximation in the reduced
+    # lane. Live-reference identities apply at anchors; the full lane tests all.
+    anchors = model._response_anchor_indices(3)
     lagged_at_reference = model.evaluate_with_lagged_response(state0, response)
     direct_at_reference = face_fluxes_from_state(state0)
     for name in ("Gamma", "Q", "Upar"):
         assert jnp.allclose(
-            lagged_at_reference[f"{name}_faces"],
-            direct_at_reference[name],
+            lagged_at_reference[f"{name}_faces"][:, anchors],
+            direct_at_reference[name][:, anchors],
             rtol=3.0e-6,
             atol=1.0e-12,
         )
@@ -355,8 +365,8 @@ def test_ntx_exact_runtime_lagged_face_response_matches_reference_and_finite_dif
     )
     for name in ("Gamma", "Q", "Upar"):
         assert jnp.allclose(
-            lagged_direction[f"{name}_faces"] / epsilon,
-            finite_difference[name],
+            lagged_direction[f"{name}_faces"][:, anchors] / epsilon,
+            finite_difference[name][:, anchors],
             rtol=2.0e-2,
             atol=1.0e-8,
         )
@@ -464,7 +474,9 @@ def test_ntx_exact_runtime_quadratic_lagged_response_matches_live_reference(resp
     faces = build_face_transport_state(
         state, geometry, bc_density=density_bc, bc_temperature=temperature_bc,
     )
-    assert jnp.array_equal(faces.density[:, -1], density_bc.right_value)
+    # The physical zero-He boundary is floored by the transport-state contract.
+    assert jnp.array_equal(faces.density[:3, -1], density_bc.right_value[:3])
+    assert faces.density[3, -1] == flux_models_module.DEFAULT_TRANSPORT_DENSITY_FLOOR
     # With the benchmark spacing and lambda, the live Robin reconstruction is
     # close to the edge profile but is not the unused TOML ``value = 1.0``.
     assert bool(jnp.all(faces.temperature[:, -1] > 0.0))
@@ -874,8 +886,8 @@ def test_ntx_exact_runtime_quadratic_lagged_response_matches_live_reference(resp
         )
 
     direction = TransportState(
-        density=jnp.asarray([[0.04, -0.03], [-0.02, 0.01]]),
-        pressure=jnp.asarray([[0.06, -0.04], [-0.03, 0.02]]),
+        density=jnp.asarray([[0.04, -0.03], [-0.02, 0.01], [0.01, -0.005], [0.0, 0.0]]),
+        pressure=jnp.asarray([[0.06, -0.04], [-0.03, 0.02], [0.02, -0.01], [0.0, 0.0]]),
         Er=jnp.asarray([2.0e-5, -1.5e-5]),
     )
 
@@ -907,7 +919,9 @@ def test_ntx_exact_runtime_quadratic_lagged_response_matches_live_reference(resp
     def _relative_flux_error(scale):
         perturbed = _state_at(scale)
         direct_perturbed = model.evaluate_face_fluxes(
-            perturbed, build_face_transport_state(perturbed, geometry)
+            perturbed, build_face_transport_state(
+                perturbed, geometry, bc_density=density_bc, bc_temperature=temperature_bc,
+            )
         )
         full_perturbed = full_state_model.evaluate_with_lagged_response(
             perturbed, full_state_response
@@ -1049,7 +1063,7 @@ def test_realtime_boundary_edge_response_matches_fresh_reference_near_observed_r
                 )
 
 
-def test_realtime_node_edge_explicit_tangent_matches_generic_cached_primal_jvp():
+def test_realtime_node_edge_explicit_tangent_matches_generic_cached_primal_jvp(monkeypatch):
     """Audit the edge column without a Radau time solve.
 
     The solver has two possible derivative routes for its private edge
@@ -1069,6 +1083,17 @@ def test_realtime_node_edge_explicit_tangent_matches_generic_cached_primal_jvp()
     )
     config = load_config(config_path)
     config["_config_dir"] = str(config_path.parent)
+    # Retain the radial mesh and BCs; the prescribed-cache identity needs
+    # neither a large NTX matrix nor an ambipolar initialization solve.
+    config["neoclassical"] = dict(config["neoclassical"])
+    config["neoclassical"].update(
+        ntx_exact_n_theta=3, ntx_exact_n_zeta=3, ntx_exact_n_xi=2,
+    )
+    config["profiles"] = dict(config["profiles"], er_initialization_mode="analytical")
+    monkeypatch.setattr(
+        orchestrator_module, "_initialize_floating_er_edge_node",
+        lambda *args, **kwargs: jnp.asarray(-35.0),
+    )
     config["ambipolarity"] = dict(config["ambipolarity"])
     config["ambipolarity"]["er_ambipolar_plot"] = False
     runtime, state = build_runtime_context(config)
@@ -1132,7 +1157,7 @@ def test_realtime_node_edge_explicit_tangent_matches_generic_cached_primal_jvp()
         ), (edge_value_float, "private_edge_rhs")
 
 
-def test_realtime_outer_face_local_cache_matches_direct_near_observed_edge_roots():
+def test_realtime_outer_face_local_cache_matches_direct_near_observed_edge_roots(monkeypatch):
     """Compare one known boundary state without building a radial response.
 
     Only the final prepared NTX face operator is used.  The cache consists of
@@ -1153,6 +1178,13 @@ def test_realtime_outer_face_local_cache_matches_direct_near_observed_edge_roots
         ntx_exact_n_theta=7,
         ntx_exact_n_zeta=25,
         ntx_exact_n_xi=31,
+        preload_support=False,
+    )
+    # The prescribed edge sweep does not use a radial ambipolar root solve.
+    config["profiles"] = dict(config["profiles"], er_initialization_mode="analytical")
+    monkeypatch.setattr(
+        orchestrator_module, "_initialize_floating_er_edge_node",
+        lambda *args, **kwargs: jnp.asarray(-35.0),
     )
     config["ambipolarity"] = dict(config["ambipolarity"])
     config["ambipolarity"]["er_ambipolar_plot"] = False
@@ -1164,7 +1196,14 @@ def test_realtime_outer_face_local_cache_matches_direct_near_observed_edge_roots
     equation_system = components["equation_system"]
     neo = equation_system.shared_flux_model.neoclassical_model
     er_equation = equation_system.er_equation
-    support = neo._static_support()
+    rho_center, rho_face = neo._rho_center_face()
+    # Prepare only the center/face consumed here, retaining the original NTX
+    # resolution and physical edge surface rather than allocating 103 operators.
+    support = flux_models_module.build_ntx_exact_lij_runtime_support(
+        neo.vmec_file, neo.boozer_file, rho_center[-1:], rho_face[-1:],
+        surface_backend=neo.surface_backend,
+        n_theta=neo.n_theta, n_zeta=neo.n_zeta, n_xi=neo.n_xi,
+    )
     prepared_edge = jax.tree_util.tree_map(
         lambda value: jax.lax.dynamic_index_in_dim(
             value, value.shape[0] - 1, axis=0, keepdims=False
@@ -1751,9 +1790,10 @@ def test_ntx_exact_support_only_prepared_pullback_matches_joint_helper():
             jnp.asarray([0.1, 0.3, -0.2, 0.5, -0.4, 0.2]),
         ),
     )
-    joint = model._pullback_interpolated_moment_reduced_local_outputs_with_prepared_support_and_drds(
-        **kwargs
-    )
+    # Both production helpers run inside JIT; compare them at the same boundary.
+    joint = jax.jit(
+        lambda: model._pullback_interpolated_moment_reduced_local_outputs_with_prepared_support_and_drds(**kwargs)
+    )()
     support_only = jax.jit(
         lambda: model._pullback_interpolated_moment_prepared_support_and_drds_only(**kwargs)
     )()
@@ -1765,13 +1805,16 @@ def test_ntx_exact_support_only_prepared_pullback_matches_joint_helper():
         vth_a=kwargs["vth_a"],
     )
     actual_prepared, actual_drds, actual_primal = support_only
-    for actual_leaf, expected_leaf in zip(
-        jax.tree_util.tree_leaves(actual_prepared),
+    for (path, actual_leaf), expected_leaf in zip(
+        jax.tree_util.tree_flatten_with_path(actual_prepared)[0],
         jax.tree_util.tree_leaves(joint[3]),
         strict=True,
     ):
         if jnp.issubdtype(jnp.asarray(expected_leaf).dtype, jnp.inexact):
-            assert jnp.allclose(actual_leaf, expected_leaf, rtol=1.0e-9, atol=1.0e-11)
+            np.testing.assert_allclose(
+                actual_leaf, expected_leaf, rtol=1e-9, atol=1e-11, equal_nan=False,
+                err_msg=f"joint/support path={jax.tree_util.keystr(path)}",
+            )
     assert jnp.allclose(actual_drds, joint[4], rtol=1.0e-9, atol=1.0e-11)
     for actual_field, expected_field in zip(actual_primal, expected_primal, strict=True):
         assert jnp.allclose(actual_field, expected_field, rtol=1.0e-9, atol=1.0e-11)
@@ -1804,11 +1847,16 @@ def test_ntx_exact_support_only_prepared_pullback_matches_joint_helper():
     )
     expected_batched = tuple(
         jnp.broadcast_to(value, (2,) + jnp.asarray(value).shape)
-        for value in _sanitized_support_only(*kwargs["field_bars"])
+        for value in jax.jit(_sanitized_support_only)(*kwargs["field_bars"])
     )
-    for actual_leaf, expected_leaf in zip(batched_support_only, expected_batched, strict=True):
+    for leaf_index, (actual_leaf, expected_leaf) in enumerate(
+        zip(batched_support_only, expected_batched, strict=True)
+    ):
         if jnp.issubdtype(jnp.asarray(expected_leaf).dtype, jnp.inexact):
-            assert jnp.allclose(actual_leaf, expected_leaf, rtol=1.0e-9, atol=1.0e-11)
+            np.testing.assert_allclose(
+                actual_leaf, expected_leaf, rtol=1e-9, atol=1e-11, equal_nan=False,
+                err_msg=f"batched support leaf={leaf_index}",
+            )
 
 
 def test_joint_local_pullback_primal_output_preserves_existing_bars():
@@ -2156,7 +2204,7 @@ def test_joint_lowdot_scalar_rhs_layout_does_not_hide_rhs_axis_from_anchor_scan(
     def _joint_with_batched_scan_carry(rhs_values):
         def _body(carry, anchor):
             state_bar, support_bar = carry
-            local_bar = jax.lax.dynamic_index_in_dim(rhs_values, anchor, axis=1)
+            local_bar = jax.lax.dynamic_index_in_dim(rhs_values, anchor, axis=1, keepdims=False)
             return (
                 state_bar + local_bar[:, None],
                 {"geometry": support_bar["geometry"] + local_bar[:, None]},
@@ -2175,7 +2223,7 @@ def test_joint_lowdot_scalar_rhs_layout_does_not_hide_rhs_axis_from_anchor_scan(
         def _one_rhs(one_rhs):
             def _body(carry, anchor):
                 state_bar, support_bar = carry
-                local_bar = jax.lax.dynamic_index_in_dim(one_rhs, anchor, axis=0)
+                local_bar = jax.lax.dynamic_index_in_dim(one_rhs, anchor, axis=0, keepdims=False)
                 return (
                     state_bar + local_bar,
                     {"geometry": support_bar["geometry"] + local_bar},
@@ -2197,17 +2245,20 @@ def test_joint_lowdot_scalar_rhs_layout_does_not_hide_rhs_axis_from_anchor_scan(
         scan_equations = [eqn for eqn in closed.jaxpr.eqns if eqn.primitive.name == "scan"]
         assert len(scan_equations) == 1
         scan = scan_equations[0]
-        carry_count = scan.params["num_carry"]
         body = scan.params["jaxpr"].jaxpr
-        return tuple(
-            tuple(invar.aval.shape)
-            for invar in body.invars[:carry_count]
-        )
+        # This toy returns two carry leaves, no ys, and scans one anchor.
+        # Captured constants precede the carry; the anchor is the final input.
+        assert len(body.outvars) == 2
+        return tuple(tuple(invar.aval.shape) for invar in body.invars[-3:-1])
 
     # The proposed outer-vmap arrangement has exactly the same batched carry
     # shapes: moving the vmap syntactically is not a valid production change.
     assert _scan_carry_shapes(_joint_with_batched_scan_carry) == ((3, 2), (3, 5))
     assert _scan_carry_shapes(_scalar_rhs_then_outer_vmap) == ((3, 2), (3, 5))
+
+    for joint, outer in zip(jax.tree_util.tree_leaves(_joint_with_batched_scan_carry(rhs)),
+                            jax.tree_util.tree_leaves(_scalar_rhs_then_outer_vmap(rhs)), strict=True):
+        assert jnp.array_equal(joint, outer)
 
 
 def test_normalize_solver_config_prefers_transport_solver_section():

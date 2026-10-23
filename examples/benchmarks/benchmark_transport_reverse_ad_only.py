@@ -3368,6 +3368,7 @@ def _run_realtime_geometry_support_segment_probe(
         profile_gradient_matrix = support_cotangent_result.profile_gradient_matrix
         support_bars = support_cotangent_result.support_bars
         support_component_bars_by_name = support_cotangent_result.support_component_bars_by_name
+        support_component_names = tuple(support_component_bars_by_name)
         native_vmec_face_coefficient_bars = (
             support_cotangent_result.native_vmec_face_coefficient_bars
         )

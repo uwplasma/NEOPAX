@@ -114,6 +114,10 @@ def _live_jax_array_count() -> int | None:
     live_arrays = getattr(jax, "live_arrays", None)
     if live_arrays is None:
         return None
+    try:
+        return len(live_arrays())
+    except Exception:
+        return None
 
 
 def _term_summary(problem) -> str:
@@ -123,10 +127,6 @@ def _term_summary(problem) -> str:
         f"{term.objective.family}:{term.objective.name}"
         for term in problem.terms
     )
-    try:
-        return len(live_arrays())
-    except Exception:
-        return None
 
 
 def main() -> int:
