@@ -4044,6 +4044,21 @@ def _validate_replay_jacobian_reuse_mode(args, config) -> str:
     return mode
 
 
+def _root_audit_parameter_point(baseline, point, *, enabled):
+    """Vary initial profiles under fixed config for the candidate optimizer."""
+    if point is None:
+        return baseline
+    if not enabled:
+        raise ValueError("Explicit profile points require the root-loss audit.")
+    values, reference = np.asarray(point, dtype=float), np.asarray(baseline, dtype=float)
+    count = len(PROFILE_PARAMETER_ORDER)
+    if values.shape != reference.shape or not np.isfinite(values).all():
+        raise ValueError("Invalid root-loss profile parameter point.")
+    if np.any(values[:count] <= 0) or not np.array_equal(values[count:], reference[count:]):
+        raise ValueError("Root-loss profile points must stay positive and preserve geometry.")
+    return jnp.asarray(values, dtype=jnp.asarray(baseline).dtype)
+
+
 def _run_realtime_geometry_optimization_api_smoke(
     *,
     args,
@@ -4054,6 +4069,8 @@ def _run_realtime_geometry_optimization_api_smoke(
     baseline_state,
     profile_cfg: dict,
     neoclassical_cfg: dict[str, Any],
+    parameter_values_override=None,
+    write_report: bool = True,
 ):
     """Exercise the production-style transport least-squares API on the benchmark path."""
 
@@ -4196,6 +4213,9 @@ def _run_realtime_geometry_optimization_api_smoke(
             )
             + list(np.asarray(geometry_values0, dtype=float)),
             dtype=jnp.asarray(baseline_state.pressure).dtype,
+        )
+        parameter_values = _root_audit_parameter_point(
+            parameter_values, parameter_values_override, enabled=root_audit_settings is not None,
         )
         table_result_builder = internal_realtime_geometry_transport_reverse_table_result_builder(
             table_context=table_context,
@@ -4416,11 +4436,14 @@ def _run_realtime_geometry_optimization_api_smoke(
         report_name += "_root_loss_audit"
     if replay_jacobian_reuse_mode != "legacy":
         report_name += f"_replay_jacobian_{replay_jacobian_reuse_mode}"
-    outpath = _report_path(report_name)
-    outpath.write_text(json.dumps(report, indent=2))
-    print(f"Wrote {outpath.relative_to(ROOT)}")
+    if write_report:
+        outpath = _report_path(report_name)
+        outpath.write_text(json.dumps(report, indent=2))
+        print(f"Wrote {outpath.relative_to(ROOT)}")
     if not report["all_finite"]:
-        raise FloatingPointError(f"Nonfinite AD residuals/Jacobian; raw values saved to {outpath}.")
+        detail = f"; raw values saved to {outpath}" if write_report else " in the optimization API evaluation"
+        raise FloatingPointError(f"Nonfinite AD residuals/Jacobian{detail}.")
+    return report
 
 
 def _run_initial_er_root_only_optimization_api_smoke(
@@ -5801,7 +5824,7 @@ def _resolve_reverse_benchmark_mode_defaults(args, *, database_full_transport: b
     return args
 
 
-def main() -> None:
+def build_argument_parser():
     parser = argparse.ArgumentParser(
         description="Reverse-only adaptive benchmark lane using the current reverse-capable realized-schedule helper."
     )
@@ -6916,6 +6939,11 @@ def main() -> None:
             "grad(objective(final_y)) before the realized-schedule reverse rule."
         ),
     )
+    return parser
+
+
+def main() -> None:
+    parser = build_argument_parser()
     args = parser.parse_args()
     if args.root_loss_audit and (
         args.objective != "all" or not args.full_transport_shared_payload_smoke

@@ -52,6 +52,9 @@ def _namespace():
         if isinstance(node, ast.FunctionDef) and node.name == "_validate_replay_jacobian_reuse_mode"
     )
     exec(compile(ast.Module(body=[mode_validator], type_ignores=[]), str(BENCHMARK), "exec"), namespace)
+    point_validator = next(node for node in MODULE.body if isinstance(node, ast.FunctionDef)
+                           and node.name == "_root_audit_parameter_point")
+    exec(compile(ast.Module(body=[point_validator], type_ignores=[]), str(BENCHMARK), "exec"), namespace)
     return namespace
 
 
@@ -137,8 +140,10 @@ class ReverseBenchmarkRootObjectiveTests(unittest.TestCase):
                 validate(args, config)
 
         main = next(node for node in MODULE.body if isinstance(node, ast.FunctionDef) and node.name == "main")
+        parser_function = next(node for node in MODULE.body if isinstance(node, ast.FunctionDef)
+                               and node.name == "build_argument_parser")
         declaration = next(
-            node for node in main.body
+            node for node in parser_function.body
             if isinstance(node, ast.Expr) and isinstance(node.value, ast.Call)
             and isinstance(node.value.func, ast.Attribute) and node.value.func.attr == "add_argument"
             and node.value.args and isinstance(node.value.args[0], ast.Constant)
@@ -527,11 +532,13 @@ class ReverseBenchmarkRootObjectiveTests(unittest.TestCase):
         })
         extracted = ast.Module(body=[ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0), function], type_ignores=[])
         exec(compile(ast.fix_missing_locations(extracted), str(BENCHMARK), "exec"), namespace)
+        profile_point = np.array([1.1] * len(parameters.PROFILE_PARAMETER_ORDER) + [0., 0.])
         with redirect_stdout(io.StringIO()), self.assertRaises(_EvaluationReached):
             namespace[function.name](
                 args=args, config={"geometry": {}, "neoclassical": {}}, geometry_context=object(),
                 baseline_values=None, baseline_runtime=object(), baseline_state=SimpleNamespace(pressure=np.ones((4, 51))),
                 profile_cfg={name: 1.0 for name in parameters.PROFILE_PARAMETER_ORDER}, neoclassical_cfg={},
+                parameter_values_override=profile_point, write_report=False,
             )
         call = builder.call_args.kwargs
         expected = AUDIT_OBJECTIVES
@@ -541,6 +548,7 @@ class ReverseBenchmarkRootObjectiveTests(unittest.TestCase):
         self.assertEqual(call["reverse_segment_length"], 50)
         self.assertEqual(call["reverse_replay_jacobian_reuse_mode"], "legacy")
         evaluation = evaluate.call_args.kwargs
+        np.testing.assert_array_equal(evaluation["parameter_values"], profile_point)
         self.assertEqual(tuple(term.objective.name for term in evaluation["terms"]), expected)
         self.assertTrue(all(term.objective.family == "transport" for term in evaluation["terms"]))
         self.assertEqual(len(evaluation["request"].parameter_set.labels), 8)
@@ -572,8 +580,10 @@ class ReverseBenchmarkRootObjectiveTests(unittest.TestCase):
 
     def test_new_scalar_objectives_are_available_only_in_the_shared_transport_lane(self):
         main = next(node for node in MODULE.body if isinstance(node, ast.FunctionDef) and node.name == "main")
+        parser_function = next(node for node in MODULE.body if isinstance(node, ast.FunctionDef)
+                               and node.name == "build_argument_parser")
         declaration = next(
-            node for node in main.body
+            node for node in parser_function.body
             if isinstance(node, ast.Expr) and isinstance(node.value, ast.Call)
             and isinstance(node.value.func, ast.Attribute)
             and node.value.func.attr == "add_argument"
