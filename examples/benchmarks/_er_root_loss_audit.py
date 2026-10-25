@@ -28,6 +28,7 @@ AUDIT_OBJECTIVES = (
     "audit_root_nearest_downcrossing_rho",
 )
 CANDIDATE_OBJECTIVES = AUDIT_OBJECTIVES[1:3]
+ROOT_CREATION_OBJECTIVES = (*AUDIT_OBJECTIVES, "audit_root_inner_mean_Er")
 
 
 def experiment_inputs(config, values, initial_er_root_ad):
@@ -123,7 +124,16 @@ def terminal_metrics(er, rho, settings):
         costs[name] = dict(cost=float(0.5 * np.dot(block, block)),
                            zero_cost=float(0.5 * block[0]**2), sign_cost=float(0.5 * np.dot(block[1:], block[1:])))
     root = float(roots[nearest]) if nearest is not None else None
+    inner = mask & (rho < settings.target)
+    outer = mask & (rho > settings.target)
+    margin = candidates.MARGIN * candidates.ER_SCALE
     return dict(Er_at_target=float(np.interp(settings.target, rho, er)),
+                annular_max_Er=float(np.max(er[mask])), annular_min_Er=float(np.min(er[mask])),
+                inner_mean_Er=float(np.mean(er[inner])),
+                inner_positive_fraction=float(np.mean(er[inner] > 0)),
+                inner_positive_margin_fraction=float(np.mean(er[inner] >= margin)),
+                outer_negative_fraction=float(np.mean(er[outer] < 0)),
+                outer_negative_margin_fraction=float(np.mean(er[outer] <= -margin)),
                 annular_Er_rms=float(np.sqrt(np.mean(er[mask]**2))),
                 wrong_sign_fraction=float(np.mean(((rho[mask] < settings.target) & (er[mask] < 0))
                                                  | ((rho[mask] > settings.target) & (er[mask] > 0)))),
@@ -152,7 +162,7 @@ def nearest_downcrossing(er, rho, settings):
 def make_audit_callbacks(labels, settings):
     """Return a stable objective callback, a primal observer and one snapshot."""
     labels = tuple(labels)
-    if not labels or not set(labels).issubset(AUDIT_OBJECTIVES):
+    if not labels or not set(labels).issubset(ROOT_CREATION_OBJECTIVES):
         raise ValueError("Root-loss audit evaluates only new candidates and their diagnostics.")
     snapshot = {}
 
@@ -171,6 +181,9 @@ def make_audit_callbacks(labels, settings):
         er, rho = jnp.asarray(final_state.Er), jnp.asarray(runtime.geometry.rho_grid)
         if name == "audit_root_interpolated_Er":
             return jnp.interp(settings.target, rho, er)
+        if name == "audit_root_inner_mean_Er":
+            mask = (rho >= settings.inner_radius) & (rho < settings.target)
+            return jnp.sum(jnp.where(mask, er, 0.0)) / jnp.sum(mask)
         if name in CANDIDATE_OBJECTIVES:
             block = candidate_residuals(er, rho, settings)[name]
             return 0.5 * jnp.vdot(block, block)
@@ -201,6 +214,8 @@ def summarize_audit(*, residual_labels, parameter_labels, values, jacobian, prof
     has_root = root is not None
     root_gradient = jacobian[row["audit_root_nearest_downcrossing_rho"]]
     target_field_gradient = jacobian[row["audit_root_interpolated_Er"]]
+    inner_field_gradient = (jacobian[row["audit_root_inner_mean_Er"]]
+                            if "audit_root_inner_mean_Er" in row else None)
     scales = parameter_scales(parameter_labels, profile_cfg, settings)
 
     def observable(name):
@@ -232,6 +247,9 @@ def summarize_audit(*, residual_labels, parameter_labels, values, jacobian, prof
                                  predicted_position_cost_change=error_rate,
                                  predicted_Er_at_target_change=er_rate,
                                  predicts_position_improvement=(error_rate < 0) if error_rate is not None else None)
+            if inner_field_gradient is not None:
+                groups[group]["predicted_inner_mean_Er_change_per_unit_descent"] = (
+                    float(-np.dot(inner_field_gradient[indices] * scales[indices], g) / norm) if norm > 0 else None)
         comparisons.append(dict(name=name, cost=float(cost),
                                 physical_parameter_gradient=dict(zip(parameter_labels, map(float, gradient), strict=True)),
                                 groups=groups))

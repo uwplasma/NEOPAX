@@ -84,6 +84,24 @@ class RootCandidateDescentTests(unittest.TestCase):
         self.assertTrue(result["root_created"])
         self.assertFalse(result["root_lost"])
 
+    def test_root_creation_check_has_no_position_prediction_but_reports_inner_field_progress(self):
+        task = descent.plan_checks(example_report(), [.001])[1]
+        task["prediction"]["predicted_position_cost_change"] = None
+        name = task["candidate"]
+        metrics = dict(candidates={name: dict(cost=10., zero_cost=5., sign_cost=5.)},
+                       position_cost=None, nearest_downcrossing=None, nearest_downcrossing_bracket=None,
+                       annular_Er_rms=10., inner_mean_Er=-10., inner_positive_fraction=0., wrong_sign_fraction=.5)
+        baseline = dict(metrics=metrics)
+        endpoint = copy.deepcopy(baseline)
+        endpoint["metrics"].update(inner_mean_Er=-8., inner_positive_fraction=.1, wrong_sign_fraction=.4)
+        result = descent.compare_endpoint(task, baseline, endpoint, example_report()["root_loss_audit"])
+        self.assertIsNone(result["predicted_position_cost_change"])
+        self.assertIsNone(result["root_position_improved"])
+        self.assertFalse(result["root_created"])
+        self.assertEqual(result["inner_mean_Er_change"], 2.)
+        self.assertAlmostEqual(result["inner_positive_fraction_change"], .1)
+        self.assertAlmostEqual(result["wrong_sign_fraction_change"], -.1)
+
     def test_forward_worker_matches_fixed_config_profile_map_and_requested_root_initializer(self):
         from NEOPAX import _geometry_autodiff as geometry, _orchestrator as orchestrator, _reverse_ad_transport as reverse
         from NEOPAX._reverse_ad_parameters import PROFILE_PARAMETER_ORDER

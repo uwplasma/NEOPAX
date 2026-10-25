@@ -303,6 +303,12 @@ def compare_endpoint(task, baseline, endpoint, audit):
                 predicted_position_cost_change=task["step_size"] * rate if rate is not None else None,
                 annular_Er_rms_change=rms_change,
                 cost_decreased=cost_change < 0,
+                inner_mean_Er_change=(after["inner_mean_Er"] - before["inner_mean_Er"]
+                                      if "inner_mean_Er" in before and "inner_mean_Er" in after else None),
+                inner_positive_fraction_change=(after["inner_positive_fraction"] - before["inner_positive_fraction"]
+                                                 if "inner_positive_fraction" in before and "inner_positive_fraction" in after else None),
+                wrong_sign_fraction_change=(after["wrong_sign_fraction"] - before["wrong_sign_fraction"]
+                                             if "wrong_sign_fraction" in before and "wrong_sign_fraction" in after else None),
                 root_position_improved=position_change < 0 if position_change is not None else None,
                 cost_decreased_without_position_improvement=(cost_change < 0 and position_change >= 0) if position_change is not None else None,
                 root_created=before["nearest_downcrossing"] is None and after["nearest_downcrossing"] is not None,

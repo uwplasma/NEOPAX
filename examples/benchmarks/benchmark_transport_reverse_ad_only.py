@@ -4070,6 +4070,8 @@ def _run_realtime_geometry_optimization_api_smoke(
     profile_cfg: dict,
     neoclassical_cfg: dict[str, Any],
     parameter_values_override=None,
+    root_audit_objective_labels=None,
+    terminal_observer_check=None,
     write_report: bool = True,
 ):
     """Exercise the production-style transport least-squares API on the benchmark path."""
@@ -4110,8 +4112,15 @@ def _run_realtime_geometry_optimization_api_smoke(
             profile_trust_multiplier=float(args.root_loss_audit_profile_trust_multiplier),
             geometry_ess_alpha=float(args.root_loss_audit_ess_alpha),
         )
-        objective_labels = AUDIT_OBJECTIVES
+        objective_labels = tuple(root_audit_objective_labels or AUDIT_OBJECTIVES)
         evaluator, observer, root_audit_snapshot = make_audit_callbacks(objective_labels, root_audit_settings)
+        if terminal_observer_check is not None:
+            base_observer = observer
+
+            def observer(final_state, runtime, final_time):
+                base_observer(final_state, runtime, final_time)
+                terminal_observer_check(root_audit_snapshot)
+
         root_audit_kwargs = dict(objective_scalar_evaluator=evaluator, terminal_state_observer=observer)
     objective_names = (
         objective_labels

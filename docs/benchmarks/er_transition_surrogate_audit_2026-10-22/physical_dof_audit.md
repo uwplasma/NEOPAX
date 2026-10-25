@@ -509,6 +509,242 @@ repeated. Resuming after external VMEX/NTX/environment changes is not covered
 by the local source digest. The five-move pilot is a progress experiment,
 not a promise to reach the target within that budget.
 
+## First optimization progress: 2026-10-23 (partial)
+
+The user started the five-accepted-move profiles-only pilot on the GPU
+machine. The supplied excerpt shows two matching forward endpoints reused,
+three accepted moves after fresh AD evaluations, and the next forward trial
+undergoing its AD check. It does not yet show the end of iteration 4 or the
+final optimization status. The partial output is saved in
+[profiles_annular_optimization_progress_2026-10-23.txt](profiles_annular_optimization_progress_2026-10-23.txt),
+with reported and derived scalar values in
+[profiles_annular_optimization_progress_2026-10-23.csv](profiles_annular_optimization_progress_2026-10-23.csv).
+
+| Iteration | Reported state | Step | Candidate cost | Actual terminal crossing | Cumulative root-error reduction |
+| --- | --- | ---: | ---: | ---: | ---: |
+| 0 | Baseline | 0 | 3.1729375142 | 0.517035932828 | 0% |
+| 1 | Accepted | 0.001 | 3.1467304803 | 0.517035012248 | 0.030323% |
+| 2 | Accepted | 0.0015 | 3.1066267181 | 0.517033524101 | 0.079341% |
+| 3 | Accepted | 0.00225 | 3.0446550495 | 0.517031045629 | 0.160978% |
+| 4 | Forward trial; AD pending | 0.003375 | 2.9474599970 | 0.517026755396 | 0.302294% |
+
+The actual/predicted cost-reduction ratios of the accepted moves are
+1.0075164385680253, 1.0127018743975937, and 1.0179963582227247. Their full-transport AD tables
+passed the driver's finite-gradient, exact-parameter and forward-primal
+checks. All three ratios exceed 0.75, so the intended 1.5 growth factor
+raises steps from 0.001 to 0.0015, 0.00225, then 0.003375. No accepted
+move needed backtracking. The fourth forward trial has a derived reduction
+ratio of about 1.027146, but remains unaccepted until its AD checks finish.
+
+After three accepted moves, cost is down 4.04302% and the actual root has
+moved inward by 4.8871991e-6 toward target 0.514. This is measurable,
+consistent progress with recomputed gradients, although the root error is
+still 0.0030310456, above the 0.0001 success tolerance. The pending fourth
+trial would bring cumulative cost reduction to 7.10627% and root-error
+reduction to 0.302294%; those are forward observations, not a completed
+optimization result. Comparing the loss and position percentages alone
+does not diagnose a faulty surrogate.
+
+Let the existing five-move pilot finish before changing settings or
+launching another run. Its endpoint status and accepted history will show
+whether the increasing steps continue to give reliable progress or require
+backtracking near the previously observed bad finite move. This excerpt
+contains no memory measurements and establishes neither bounded memory nor
+final convergence.
+
+### What this establishes about candidate quality
+
+The pilot demonstrates that the annular candidate has usable local profile
+derivatives and repeatedly produces small actual root improvements from
+this particular baseline. It has not demonstrated efficient positioning to
+the target, performance from a missing root, or superiority over the other
+candidate or the old losses. Only the annular candidate is optimized here.
+The relative percentage changes in cost and root error are not directly
+comparable measures of candidate quality, but the absolute crossing motion
+is still small and target attainment remains unobserved.
+
+At the original baseline, local and annular candidates had identical
+values/gradients because their shared target-zero term dominated while
+their sign penalties were negligible. A trajectory confined to that regime
+does not discriminate between their sign-constraint designs. Later AD
+reports already contain both candidate rows, their zero/sign contributions,
+and projected root-progress rates separately for profiles and geometry.
+An offline inspection of those existing JSON files can establish whether
+the rows have separated along the trajectory without rerunning transport
+or AD. The later equality of the candidates cannot be inferred from these
+annular-only console lines.
+
+The initial annular profile direction was already close to the steepest
+root-moving direction in the chosen trust metric. Therefore slow root
+motion here does not by itself prove an incorrectly oriented loss: weak
+local physical controllability and limited useful finite steps remain
+possible. These findings support retaining the candidate for evaluation,
+not declaring it a validated replacement root-position objective.
+
+## Inspecting existing profiles: 2026-10-24
+
+The full terminal Er/rho arrays and later AD reports remain on the GPU
+machine. The local workspace contains the supplied scalar logs, not the
+remote evaluation JSON files. No full-profile conclusion has been inferred
+from unavailable arrays.
+
+The supplied small-step results nevertheless allow an exact scalar
+decomposition. Let q be the actual interpolated downcrossing, t the target,
+E the interpolated Er(t), and define A=E/(q-t). This A is the effective
+secant slope magnitude between target and crossing, not an independently
+measured differential slope. Then E=A*(q-t), and between two saved states:
+
+```
+Delta E = mean(A) * Delta q + mean(q-t) * Delta A
+```
+
+This symmetric split is exact for the two endpoints; it is not a separation
+of independent physical controls. If target and crossing share the same
+piecewise-linear cell, A equals the magnitude of that cell's Er slope.
+Otherwise it remains the secant defined above.
+
+For the first accepted move (the previously saved 0.001 endpoint), Er(t)
+drops from 5.0382040564010531 to 5.017354267167761 kV/m. The split gives:
+
+| Part of target-field change | Change (kV/m) | Fraction of the decrease |
+| --- | ---: | ---: |
+| Crossing displacement | -0.001524793785 | 7.3132% |
+| Effective secant-slope change | -0.019324995448 | 92.6868% |
+| Total | -0.020849789233 | 100% |
+
+The effective slope decreases from 1659.52421949 to 1653.15783166 kV/m per
+unit rho. The smaller 0.0001 endpoint gives a similar split: 7.1867% versus
+92.8133%. These calculations are saved in
+[target_field_change_decomposition_2026-10-24.csv](target_field_change_decomposition_2026-10-24.csv).
+They sharpen the observed behavior: the target-zero term mostly decreases
+with a weaker effective slope while the actual crossing moves little. They
+do not establish whether transport physics, the profile basis/scales, or
+spatial discretization causes this response. The nearly optimal local
+root-moving direction also prevents treating this result alone as proof
+that a differently oriented loss would solve the problem.
+
+The read-only tool examples/benchmarks/analyze_er_root_saved_profiles.py
+now inspects the already computed remote JSON reports. It imports no JAX
+or NEOPAX solver modules and changes no optimizer source/checkpoints. It:
+
+- Reconstructs off-grid downcrossings from the actual arrays, excluding the
+  core according to the saved annulus, and saves nearby cell values.
+- Reports the two crossing-cell Er values, their contrast, root fraction
+  inside the cell, local slope and target Er across saved points.
+- Computes the exact motion/slope split when its same-cell conditions hold,
+  plus a local common-rescaling fit; it does not call a missing or changed
+  bracket a successful zero-motion result.
+- Compares local and annular cost/sign contributions and their predicted
+  root movement for profile and geometry groups using existing AD rows.
+- Uses cached descent endpoints, when available, to compare initial Er
+  profiles and mark initial sign changes. Accepted and pending trials are
+  kept distinct using events.jsonl. A partial final event line is ignored
+  while a running optimizer completes its write.
+
+After syncing the reader to the GPU machine, this command needs no new
+physics calculation or compilation:
+
+```bash
+cd ~/NEOPAX
+python examples/benchmarks/analyze_er_root_saved_profiles.py \
+  --ad-report outputs/autodiff_transport_lagged_ntx/reverse_ad/transport_reverse_ad_only_full_transport_shared_payload_smoke_root_loss_audit_replay_jacobian_recorded_forward.json \
+  --run-dir outputs/new_root_candidates/profiles_annular_optimization \
+  --descent-dir outputs/new_root_candidates/descent_ad_contract \
+  --out-dir outputs/new_root_candidates/saved_profile_analysis \
+  --plot
+```
+
+It writes summary.json, crossing_summary.csv, crossing_cells.csv,
+candidate_comparison.csv, and optionally terminal_profiles.svg. A missing
+crossing is explicitly unavailable for root-direction interpretation.
+Staying inside one cell does not prove numerical pinning; separating a
+grid effect from a physical response requires evidence beyond this
+single-grid trajectory.
+
+## Root creation from the usual optimization start: 2026-10-24
+
+The user requested testing candidates from the usual unoptimized initial
+geometry/profiles, whose final transport state has no electron-root region.
+This is more informative about root creation than the existing benchmark
+near a resolved crossing. The absence of an electron region must still be
+verified for the actual selected configuration, rather than assumed from
+the input filename.
+
+examples/benchmarks/benchmark_er_root_candidates_optimization_start.py now
+resolves the real geometry-only example defaults, also shared by the
+combined geometry/profile example. It uses:
+
+- examples/inputs/input.QI_nfp2_initial, with zero geometry deltas and no
+  geometry warm start.
+- The unchanged analytical profiles from full_transport_database_vacuum_t2.toml:
+  n0=4.21, T0=17.8, density_shape_power=10, temperature_shape_power=2,
+  and the production defaults of 1 for both shape alpha parameters. Species
+  multipliers, floors, sources, boundary conditions and equation toggles are
+  preserved through the actual optimization config preparation helper.
+- The optimizer's effective NTX mesh (25,25,33), not the unoverridden mesh
+  stored in the TOML or the old benchmark's (25,31,64).
+- Full final time 2 seconds, 1000 attempted-step budget, 500 reverse accepted
+  step guard and recorded_forward replay. There is no accepted-step prefix.
+- The initial max-mode=2 geometry parameterization, ESS alpha=1.2, the
+  optimizer's derivative context (mboz/nboz=18/18 and its surfaces), and the
+  six profile columns. An explicit --geometry-parameters subset is optional.
+- Root target 0.514 and the optimizer's sign-constraint annulus 0.05--0.9;
+  the inner cutoff can be overridden explicitly. Each candidate retains one
+  overall root weight of one and the profile trust multiplier remains 3.7.
+
+Before the reverse sweep, a terminal observer saves the full baseline Er
+and checks the final time, the absence of a downcrossing, and nonpositive
+Er throughout the chosen annulus. An all-positive field is not mistaken
+for an absent electron region merely because it has no downcrossing. An
+unexpected positive region or crossing stops the experiment and retains
+baseline_forward_observation.json for inspection.
+
+The same AD computation evaluates both candidate costs and their shared
+target-field/chord-root diagnostics. It also evaluates a new diagnostic
+row, audit_root_inner_mean_Er, to assess whether descent raises the mean
+inner field before any crossing exists. This row is not an extra objective
+or a second weight. A missing actual crossing keeps projected root-position
+progress unavailable; the raw chord diagnostic's finite placeholder is
+not interpreted as root attainment. The ordinary benchmark keeps its
+original four audit rows by default.
+
+By default, the Python entrypoint runs that shared AD, then the existing
+independent forward checker for local/annular candidates with profiles and
+geometry separately. It checks baseline forward/AD agreement and reports
+inner-mean Er change, positive inner fraction, wrong-sign fraction, finite
+field margins and actual downcrossing creation, alongside loss and RMS.
+A cost decrease alone does not identify the winner. These independent
+diagnostic forward evaluations still use fresh processes; this experiment
+does not fix the persistent-compilation issue in the separate optimizer.
+
+After syncing the new script and helper changes to the GPU machine:
+
+```bash
+cd ~/NEOPAX
+env -u JAX_COMPILATION_CACHE_DIR \
+JAX_ENABLE_COMPILATION_CACHE=0 \
+XLA_FLAGS="${XLA_FLAGS:-} --xla_gpu_enable_command_buffer=" \
+PYTHONPATH="$HOME/VMEX:$HOME/NTX/src${PYTHONPATH:+:$PYTHONPATH}" \
+python examples/benchmarks/benchmark_er_root_candidates_optimization_start.py \
+  --out-dir outputs/new_root_candidates/optimization_start \
+  --step-sizes 0.001
+```
+
+This is a candidate-creation comparison, not a new optimization. For a
+smaller first job, add --ad-only to compute/inspect the shared baseline AD
+before deciding to run its forward endpoints. Then reuse that result with
+--ad-report outputs/new_root_candidates/optimization_start/ad_summary.json;
+AD is not recomputed. Physics/config overrides are rejected when reusing a
+report to avoid silently comparing a different case. More steps can be
+supplied to --step-sizes; existing matching forward endpoints are reused.
+
+The output directory contains case_manifest.json (resolved config, original
+seed SHA256, profile values and geometry parameter list), the baseline
+forward observation, ad.log, ad_summary.json, and the descent comparison.
+The AD report uses a separate filename rather than overwriting the previous
+near-root benchmark report. No physical result from this new start has
+been generated locally.
+
 ## Local verification and limits
 
 Only short-array and mocked tests run locally. They check new-cost
@@ -527,7 +763,8 @@ passes 40 tests and 59 subtests. Analytic/mocked workers verify backtracking,
 gradient recomputation, fixed geometry/configuration, nonfinite-AD rejection,
 root-loss and incomplete-forward rejection, cache matching, actual-crossing
 convergence reporting, checkpoint resume, and the explicit profile point
-reaching the existing reverse evaluator. No real optimization has been run.
+reaching the existing reverse evaluator. The physical pilot has now started
+on the user's GPU machine; only the partial progress above has been supplied.
 
 The GPU AD, original finite forward experiment, initialization-only
 diagnostic, and corrected small- and large-step profile transport checks
@@ -536,3 +773,11 @@ These assess the new formulas at the existing full-time benchmark state;
 they do not establish optimization convergence. This update only archives
 the supplied GPU results and computes scalar comparisons locally; it runs
 no local physics and changes no solver or objective implementation.
+
+The new optimization-start setup passed the targeted 45-test suite with
+59 subtests. Its additional tests check effective config parity against
+the actual example's source/defaults, reject all-positive baselines without
+calling them root-free, check the pre-crossing mean-field derivative on
+short arrays, and verify the original geometry context and terminal gate
+through mocked workers. The tests run no VMEC, NTX database, transport or
+physical optimization.

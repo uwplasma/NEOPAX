@@ -1,0 +1,21 @@
+Partial console output supplied by the user. Two accepted iterations; iteration 3 AD is still running in this excerpt.
+
+[root-optimization] reusing matching saved forward endpoint
+[root-optimization] reusing matching saved forward endpoint
+[root-optimization] {"event": "gradient_started", "iteration": 1, "trial": 1, "step": 0.001, "parameters": [4.1944603458669745, 17.801324665573976, 10.002249225842373, 2.000039414610524, 0.9999053803219096, 0.9999902431088438, 0.0, 0.0], "predicted_cost_change": -0.026011519966794582, "cost": 3.1467304802833174, "root": 0.5170350122481288}
+[root-optimization] ad evaluation; log=/home/exouser/NEOPAX/outputs/new_root_candidates/profiles_annular_optimization/evaluation_0001_ad.log
+[root-optimization] {"event": "accepted", "iteration": 1, "trial": 1, "step": 0.001, "parameters": [4.1944603458669745, 17.801324665573976, 10.002249225842373, 2.000039414610524, 0.9999053803219096, 0.9999902431088438, 0.0, 0.0], "predicted_cost_change": -0.026011519966794582, "cost": 3.1467304802833174, "root": 0.5170350122481288, "reduction_ratio": 1.0075164385680253, "root_error": 0.0030350122481287434}
+[root-optimization] forward evaluation; log=/home/exouser/NEOPAX/outputs/new_root_candidates/profiles_annular_optimization/evaluation_0002_forward.log
+[root-optimization] {"event": "gradient_started", "iteration": 2, "trial": 1, "step": 0.0015, "parameters": [4.171147157779756, 17.80294504547599, 10.005561267693848, 2.000087779474004, 0.9997674712421567, 0.9999767051121513, 0.0, 0.0], "predicted_cost_change": -0.039600758293334946, "cost": 3.106626718132091, "root": 0.5170335241005443}
+[root-optimization] ad evaluation; log=/home/exouser/NEOPAX/outputs/new_root_candidates/profiles_annular_optimization/evaluation_0003_ad.log
+[root-optimization] {"event": "accepted", "iteration": 2, "trial": 1, "step": 0.0015, "parameters": [4.171147157779756, 17.80294504547599, 10.005561267693848, 2.000087779474004, 0.9997674712421567, 0.9999767051121513, 0.0, 0.0], "predicted_cost_change": -0.039600758293334946, "cost": 3.106626718132091, "root": 0.5170335241005443, "reduction_ratio": 1.0127018743975937, "root_error": 0.0030335241005442493}
+[root-optimization] forward evaluation; log=/home/exouser/NEOPAX/outputs/new_root_candidates/profiles_annular_optimization/evaluation_0004_forward.log
+[root-optimization] {"event": "gradient_started", "iteration": 3, "trial": 1, "step": 0.0022500000000000003, "parameters": [4.136173575217316, 17.80563558392552, 10.01036923589487, 2.000167787459324, 0.9995701125482475, 0.9999561730897105, 0.0, 0.0], "predicted_cost_change": -0.060876120145760625, "cost": 3.0446550495209777, "root": 0.5170310456286614}
+[root-optimization] ad evaluation; log=/home/exouser/NEOPAX/outputs/new_root_candidates/profiles_annular_optimization/evaluation_0005_ad.log
+
+Subsequently supplied continuation: iteration 3 accepted; iteration 4 AD pending.
+
+[root-optimization] {"event": "accepted", "iteration": 3, "trial": 1, "step": 0.0022500000000000003, "parameters": [4.136173575217316, 17.80563558392552, 10.01036923589487, 2.000167787459324, 0.9995701125482475, 0.9999561730897105, 0.0, 0.0], "predicted_cost_change": -0.060876120145760625, "cost": 3.0446550495209777, "root": 0.5170310456286614, "reduction_ratio": 1.0179963582227247, "root_error": 0.0030310456286614107}
+[root-optimization] forward evaluation; log=/home/exouser/NEOPAX/outputs/new_root_candidates/profiles_annular_optimization/evaluation_0006_forward.log
+[root-optimization] {"event": "gradient_started", "iteration": 4, "trial": 1, "step": 0.0033750000000000004, "parameters": [4.083703651092457, 17.809735123997605, 10.017248510711628, 2.0002890424952176, 0.9992938727743944, 0.9999260741513246, 0.0, 0.0], "predicted_cost_change": -0.0946263340735075, "cost": 2.9474599969539383, "root": 0.5170267553963853}
+[root-optimization] ad evaluation; log=/home/exouser/NEOPAX/outputs/new_root_candidates/profiles_annular_optimization/evaluation_0007_ad.log
