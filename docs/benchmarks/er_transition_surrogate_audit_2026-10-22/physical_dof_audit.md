@@ -781,3 +781,200 @@ calling them root-free, check the pre-crossing mean-field derivative on
 short arrays, and verify the original geometry context and terminal gate
 through mocked workers. The tests run no VMEC, NTX database, transport or
 physical optimization.
+
+## Optimization-start forward results received 2026-10-25
+
+The supplied output reuses optimization_start/ad_summary.json and completes
+all four local/annular, profiles/geometry forward checks at trust step 0.001.
+The checker proceeds past its forward-versus-AD baseline gate and reports no
+failed endpoints. The raw output, including the physical gradients, is saved
+in optimization_start_descent_2026-10-25.txt; derived scalar comparisons are
+in optimization_start_descent_2026-10-25.csv. These files archive user-run
+GPU results. No local physics or new derivative test was run to analyze them.
+
+The starting target field reconstructed from the common target-zero term is
+-15.17613522331 kV/m; the starting inner mean is -6.40029809590 kV/m. Neither
+candidate creates a positive-Er region or a downcrossing at this step. Every
+endpoint has zero positive inner fraction and a negative annular maximum.
+Root-position changes and derivatives are correctly unavailable, rather
+than evidence of a zero physical root sensitivity before a root exists.
+
+| Candidate/group | Predicted cost change | Observed cost change | Inner mean Er change (kV/m) | Electron region created |
+| --- | ---: | ---: | ---: | --- |
+| Local/profiles | -0.139034329 | -0.138399310 | +0.007885898 | No |
+| Annular/profiles | -0.116052286 | -0.115580225 | +0.007752955 | No |
+| Local/geometry | -4.600034696 | -12.384914379 | +0.156838233 | No |
+| Annular/geometry | -3.286547120 | -10.834534241 | +0.161021861 | No |
+
+The profile cost slopes agree with AD to 0.4567% (local) and 0.4068%
+(annular), relative to the AD prediction. Their target-field increases,
++0.02802652 and +0.02807675 kV/m, also agree with the predicted +0.02810166
+and +0.02815128. The profile descent directions have cosine 0.999814 in
+the saved trust coordinates (angle 1.1049 degrees). These candidates
+therefore provide almost the same local profile control at this state.
+The shared target-zero term accounts for 76.76% of the local profile cost
+reduction and 92.08% of the annular profile reduction. The annular choice
+has not demonstrated better electron-region creation in this experiment.
+
+Geometry lowers both costs, but its reductions are 2.69235 and 3.29663
+times their linear AD predictions. The observed target-field increases
+(+3.11540 and +3.11344 kV/m) substantially exceed the predicted +0.79699
+and +0.79716. In contrast, the observed inner-mean increases are within
+about 2% of their predictions (+0.15397 and +0.15821). Thus the geometry
+discrepancy is particularly strong at the target, rather than uniform
+across the field observables. Initial Er changes by up to 4.165/4.172 kV/m,
+without initial sign changes. This single finite step cannot distinguish
+curvature, branch selection, and a derivative/forward mismatch; it does
+not establish an incorrect geometry derivative or a branch switch.
+
+The next focused check can reuse this AD report and the saved baseline:
+take the annular geometry direction at steps 0.0001 and 0.00001 and check
+whether its observed slope approaches the AD value. There is no need to
+repeat the already matching profile test or recompute AD for that check.
+Successful infinitesimal descent alone would still leave sustained
+electron-region creation untested. A later optimization comparison should
+judge actual positive inner-field formation and resolved downcrossings,
+alongside preservation of the negative outer field, rather than cost alone.
+
+### Smaller geometry steps received 2026-10-25
+
+The user completed the focused annular geometry check, reusing the saved
+AD report and matching cached baseline/0.001 endpoint. The additional
+0.0001 and 0.00001 endpoints both completed finite full adaptive solves.
+The supplied output is archived in optimization_start_geometry_steps_2026-10-25.txt;
+the derived comparisons are in optimization_start_geometry_steps_2026-10-25.csv.
+
+| Trust step | Observed cost directional slope | AD prediction | Relative difference |
+| ---: | ---: | ---: | ---: |
+| 0.001 | -10834.534241 | -3286.547120 | 229.6631% |
+| 0.0001 | -2938.245504 | -3286.547120 | 10.5978% |
+| 0.00001 | -3234.821593 | -3286.547120 | 1.5739% |
+
+Relative difference here is abs(observed - AD) / abs(AD). These are
+one-sided finite moves with fresh adaptive schedules, not a central or
+frozen-schedule FD Jacobian check. The shrinking-step agreement supports
+the local annular geometry directional derivative; it does not establish
+all geometry Jacobian entries or eliminate the remaining 1.57% difference.
+The much larger response at 0.001 is consistent with strong finite-step
+nonlinearity. It is not evidence, by itself, of an incorrect AD derivative.
+No specific initial-root branch switch has been demonstrated.
+
+The inner-mean Er changes likewise approach the predictions: at 0.0001,
+observed +0.014006221 versus predicted +0.015820729 kV/m; at 0.00001,
+observed +0.001561299 versus predicted +0.001582073 kV/m. The target-field
+increases are +0.071391768 and +0.007845200 kV/m, versus predictions of
++0.079716110 and +0.007971611. Initial Er max changes are 0.030141836
+and 0.006580411 kV/m, with no initial sign changes. Accepted step counts
+match the baseline for these two endpoints; matching counts do not prove
+identical adaptive schedules or Newton histories.
+
+Every endpoint still has negative Er throughout the chosen annulus, zero
+positive inner fraction, no downcrossing, and an unchanged wrong-sign
+fraction. Infinitesimal cost descent has now been checked for profiles
+and for this geometry direction. No winner for electron-region creation
+has been demonstrated. The next useful comparison is sustained descent
+from the no-root start, with gradients recomputed at accepted points,
+backtracking, and actual sign/root creation recorded. The older annular
+profile pilot explicitly requires an existing crossing and must not be
+used unchanged for this no-root experiment. Further smaller-step checks
+alone would not answer which loss creates an electron-root region.
+
+Only scalar analysis and documentation updates were performed locally.
+There were no local VMEC, NTX, transport, AD or optimization runs, and no
+solver or cost implementation changes in this archival update.
+
+## Root-creation optimization comparison prepared 2026-10-25
+
+examples/optimization/optimize_er_root_candidates.py now compares sustained
+optimization from the verified all-negative optimization-start AD report.
+It reuses the existing pilot's host descent/backtracking loop. Each selected
+candidate and DOF group starts independently from the exact same original
+point. The root weight is one, each scalar cost is minimized directly, and
+coordinate scales stay fixed to the saved report. There is no geometry warm
+start, accepted-step prefix, alternate solver or extra creation objective.
+
+The pilot now accepts an explicit candidate/group and --allow-root-creation.
+This experiment enables that option: finite, cost-decreasing full-time trials
+are eligible before a downcrossing exists. Crossings may also disappear at a
+later lower-cost point; their appearance/disappearance is observed rather
+than enforced as an extra acceptance constraint. The older annular pilot's
+default existing-crossing behavior is retained for its original command.
+
+Every eligible trial gets a fresh AD evaluation at its actual parameter
+vector before acceptance. Nonfinite or wrong-point AD, incomplete forward
+solves, inconsistent AD/independent-forward terminal fields, and insufficient
+cost reduction trigger backtracking. The original seed AD is reused.
+Matching forward endpoints from the descent checker and completed forward
+workers from the same optimization directory are reused, including after
+resume. Changed source/input digests invalidate reuse.
+
+For repeated AD, the worker preserves the initial experiment's exact geometry
+context (18/18 Boozer resolution and its original surfaces), geometry column
+order, five creation-audit rows, full-time transport configuration, fixed
+profile configuration and 500 accepted-step reverse guard. Geometry trials
+explicitly permit nonzero boundary parameters in the existing production
+table-result builder; the ordinary benchmark override still preserves
+geometry by default. No reverse-kernel/replay implementation was changed.
+
+Accepted history, events and summary report both cost components, actual
+off-grid downcrossings, root error when available, target Er, inner mean Er,
+positive inner fraction and negative outer fraction. Crossings are measured
+from the concrete terminal field, never from the missing-root diagnostic's
+placeholder. Target success requires a downcrossing within tolerance and
+strictly positive inner / negative outer signs. Zero or all-positive fields
+do not meet that success condition. Budget exhaustion and a stationary point
+without the requested root remain distinct from convergence.
+
+The comparison writes independent local_profiles/annular_profiles and/or
+local_geometry/annular_geometry subdirectories, each with checkpoints,
+history.csv, events.jsonl, summary.json and worker logs. comparison.csv/json
+record the first accepted iteration with a positive inner region and the
+first with a downcrossing, as well as final signs/root/status. The SVG compares
+initial/latest terminal Er and sign-fraction history. Root creation and final
+root/sign quality are the comparison criteria; raw costs have different
+numerical scales across the two formulas.
+
+After syncing the implementation to the GPU machine, run all four cases:
+
+```bash
+cd ~/NEOPAX
+mkdir -p outputs/new_root_candidates
+set -o pipefail
+
+env -u JAX_COMPILATION_CACHE_DIR \
+JAX_ENABLE_COMPILATION_CACHE=0 \
+XLA_FLAGS="${XLA_FLAGS:-} --xla_gpu_enable_command_buffer=" \
+PYTHONPATH="$HOME/VMEX:$HOME/NTX/src${PYTHONPATH:+:$PYTHONPATH}" \
+python examples/optimization/optimize_er_root_candidates.py \
+  --ad-report outputs/new_root_candidates/optimization_start/ad_summary.json \
+  --descent-dir outputs/new_root_candidates/optimization_start/descent \
+  --out-dir outputs/new_root_candidates/root_creation_optimization \
+  --groups profiles,geometry \
+  --max-iterations 10 \
+  --initial-step 0.001 \
+  --max-step 0.05 \
+  --growth-factor 2 \
+  2>&1 | tee outputs/new_root_candidates/root_creation_optimization.log
+```
+
+For the profile issue alone, select --groups profiles (the script default).
+Use --candidates annular or local to select one case. The accepted-iteration
+budget is a pilot limit, not an inference that a candidate cannot create a
+root. Add --resume with otherwise matching settings and a larger
+--max-iterations value to extend existing runs without restarting their
+accepted trajectory. Each case always starts from the shared seed unless
+explicitly resuming that case's checkpoint.
+
+This preparation does not fix compilation overhead: physics evaluations
+still use isolated workers and an accepted trial normally needs independent
+forward and AD solves. The baseline AD is not recomputed. No root-creation
+optimization result from the physical machine has yet been supplied.
+
+The final targeted local suite passed 56 tests and 59 subtests in 14.87 s.
+Tests use analytic fields, short arrays and mocked physics workers. New
+checks cover root-free accepted trajectories, recomputed gradients, actual
+root formation, the two independent candidate seeds, geometry-only moves,
+correct stationary/target statuses, zero/all-positive false-success cases,
+preserved AD geometry context, nonfinite diagnostic serialization, cached
+forward reuse and checkpoint resume. No local VMEC, NTX database, transport,
+physical reverse AD or physical optimization was run.

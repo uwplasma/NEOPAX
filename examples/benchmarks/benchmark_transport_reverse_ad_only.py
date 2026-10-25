@@ -4044,8 +4044,8 @@ def _validate_replay_jacobian_reuse_mode(args, config) -> str:
     return mode
 
 
-def _root_audit_parameter_point(baseline, point, *, enabled):
-    """Vary initial profiles under fixed config for the candidate optimizer."""
+def _root_audit_parameter_point(baseline, point, *, enabled, allow_geometry=False):
+    """Validate a candidate point, allowing boundary moves only when requested."""
     if point is None:
         return baseline
     if not enabled:
@@ -4054,7 +4054,7 @@ def _root_audit_parameter_point(baseline, point, *, enabled):
     count = len(PROFILE_PARAMETER_ORDER)
     if values.shape != reference.shape or not np.isfinite(values).all():
         raise ValueError("Invalid root-loss profile parameter point.")
-    if np.any(values[:count] <= 0) or not np.array_equal(values[count:], reference[count:]):
+    if np.any(values[:count] <= 0) or (not allow_geometry and not np.array_equal(values[count:], reference[count:])):
         raise ValueError("Root-loss profile points must stay positive and preserve geometry.")
     return jnp.asarray(values, dtype=jnp.asarray(baseline).dtype)
 
@@ -4224,7 +4224,7 @@ def _run_realtime_geometry_optimization_api_smoke(
             dtype=jnp.asarray(baseline_state.pressure).dtype,
         )
         parameter_values = _root_audit_parameter_point(
-            parameter_values, parameter_values_override, enabled=root_audit_settings is not None,
+            parameter_values, parameter_values_override, enabled=root_audit_settings is not None, allow_geometry=bool(getattr(args, "root_loss_audit_allow_geometry", False)),
         )
         table_result_builder = internal_realtime_geometry_transport_reverse_table_result_builder(
             table_context=table_context,
