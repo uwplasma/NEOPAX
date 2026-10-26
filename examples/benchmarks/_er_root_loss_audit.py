@@ -1,4 +1,4 @@
-"""Candidate root costs for the existing full-transport AD benchmark.
+"""Candidate and original root/bootstrap costs for the full-transport AD benchmark.
 
 The caller supplies the real terminal state and the established reverse
 kernel differentiates these rows. Synthetic-array tests do not validate
@@ -29,6 +29,70 @@ AUDIT_OBJECTIVES = (
 )
 CANDIDATE_OBJECTIVES = AUDIT_OBJECTIVES[1:3]
 ROOT_CREATION_OBJECTIVES = (*AUDIT_OBJECTIVES, "audit_root_inner_mean_Er")
+ORIGINAL_RAW_OBJECTIVES = ("Er_transition_location_moment", "Er_transition_strength",
+                           "bootstrap_current_softmax_abs_scaled")
+ORIGINAL_CONTROL_OBJECTIVES = (*ROOT_CREATION_OBJECTIVES, *ORIGINAL_RAW_OBJECTIVES)
+ORIGINAL_COST_OBJECTIVES = ("audit_root_original_cost", "audit_root_bootstrap_cost",
+                            "audit_root_original_bootstrap_cost")
+
+
+def original_objective_settings():
+    example = candidates.audit.example
+    return dict(position_weight=float(example.ER_TRANSITION_RHO_WEIGHT),
+                strength_weight=float(example.ER_TRANSITION_STRENGTH_WEIGHT),
+                strength_target=float(example.ER_TRANSITION_STRENGTH_TARGET),
+                bootstrap_weight=float(example.BOOTSTRAP_WEIGHT),
+                bootstrap_limit=float(example.BOOTSTRAP_LIMIT_SCALED),
+                temperature_kv_m=float(example.ER_TRANSITION_TEMPERATURE_KV_M),
+                rho_softness=float(example.ER_TRANSITION_RHO_SOFTNESS),
+                softmax_beta=float(example.ER_TRANSITION_SOFTMAX_BETA))
+
+
+def original_transition_values(er, rho, settings):
+    """Use the production selector, including its target-centered prior."""
+    from NEOPAX._reverse_ad_transport import smooth_positive_to_negative_er_transition_metrics
+    options = original_objective_settings()
+    location, strength = smooth_positive_to_negative_er_transition_metrics(
+        er, rho, rho_min=settings.inner_radius, rho_max=settings.outer_radius,
+        rho_prior=settings.target, temperature_kv_m=options["temperature_kv_m"],
+        rho_softness=options["rho_softness"], softmax_beta=options["softmax_beta"])
+    return jnp.stack((location-settings.target, strength))
+
+
+def original_cost_components(raw_values):
+    """Original weighted least-squares costs, never squared a second time."""
+    moment, strength, bootstrap = jnp.asarray(raw_values)
+    options = original_objective_settings()
+    deficit = candidates.audit.example.smooth_positive_part(options["strength_target"]-strength)
+    excess = jnp.maximum(bootstrap-options["bootstrap_limit"], 0.)
+    return jnp.stack((.5*options["position_weight"]*moment**2,
+                      .5*options["strength_weight"]*deficit**2,
+                      .5*options["bootstrap_weight"]*excess**2))
+
+
+def original_cost_vector(raw_values):
+    position, strength, bootstrap = original_cost_components(raw_values)
+    return jnp.stack((position+strength, bootstrap, position+strength+bootstrap))
+
+
+def add_original_metrics(metrics, raw_values):
+    """Attach original observable values and separate component costs."""
+    raw = np.asarray(raw_values, dtype=float)
+    position, strength, bootstrap = map(float, original_cost_components(raw))
+    options = original_objective_settings()
+    metrics["original_objectives"] = dict(
+        Er_transition_rho=float(raw[0]+metrics["target_rho"]),
+        Er_transition_location_moment=float(raw[0]), Er_transition_strength=float(raw[1]),
+        strength_deficit=float(candidates.audit.example.smooth_positive_part(options["strength_target"]-raw[1])),
+        bootstrap_current_softmax_abs_scaled=float(raw[2]),
+        bootstrap_penalty=float(max(raw[2]-options["bootstrap_limit"], 0.)),
+        **options)
+    metrics["candidates"].update({
+        ORIGINAL_COST_OBJECTIVES[0]: dict(cost=position+strength, position_cost=position, strength_cost=strength),
+        ORIGINAL_COST_OBJECTIVES[1]: dict(cost=bootstrap, bootstrap_cost=bootstrap),
+        ORIGINAL_COST_OBJECTIVES[2]: dict(cost=position+strength+bootstrap, position_cost=position,
+                                         strength_cost=strength, bootstrap_cost=bootstrap)})
+    return metrics
 
 
 def experiment_inputs(config, values, initial_er_root_ad):
@@ -162,8 +226,8 @@ def nearest_downcrossing(er, rho, settings):
 def make_audit_callbacks(labels, settings):
     """Return a stable objective callback, a primal observer and one snapshot."""
     labels = tuple(labels)
-    if not labels or not set(labels).issubset(ROOT_CREATION_OBJECTIVES):
-        raise ValueError("Root-loss audit evaluates only new candidates and their diagnostics.")
+    if not labels or not set(labels).issubset(ORIGINAL_CONTROL_OBJECTIVES):
+        raise ValueError("Root-loss audit evaluates only new candidates, original root/bootstrap controls and their diagnostics.")
     snapshot = {}
 
     def observe(final_state, runtime, final_time):
@@ -189,6 +253,14 @@ def make_audit_callbacks(labels, settings):
             return 0.5 * jnp.vdot(block, block)
         if name == "audit_root_nearest_downcrossing_rho":
             return nearest_downcrossing(er, rho, settings)
+        if name in ORIGINAL_RAW_OBJECTIVES[:2]:
+            return original_transition_values(er, rho, settings)[ORIGINAL_RAW_OBJECTIVES.index(name)]
+        if name == ORIGINAL_RAW_OBJECTIVES[2]:
+            # Keep the native name so the reverse kernel uses its established
+            # compact momentum-corrected bootstrap transpose, not an ordinary
+            # custom-objective VJP through the full flux calculation.
+            from NEOPAX._reverse_ad_transport import bootstrap_current_softmax_abs_scaled
+            return bootstrap_current_softmax_abs_scaled(final_state, runtime)
         raise ValueError(f"Unknown root-loss audit row: {name}")
 
     return evaluate, observe, snapshot
@@ -222,6 +294,17 @@ def summarize_audit(*, residual_labels, parameter_labels, values, jacobian, prof
         return float(values[row[name]]), jacobian[row[name]]
 
     costs = {name: observable(name) for name in CANDIDATE_OBJECTIVES}
+    if set(ORIGINAL_RAW_OBJECTIVES) & row.keys():
+        if not set(ORIGINAL_RAW_OBJECTIVES).issubset(row):
+            raise ValueError("The original controls require position, strength and native bootstrap rows.")
+        raw = np.asarray([values[row[name]] for name in ORIGINAL_RAW_OBJECTIVES])
+        raw_jacobian = np.asarray([jacobian[row[name]] for name in ORIGINAL_RAW_OBJECTIVES])
+        scalar_costs = np.asarray(original_cost_vector(raw))
+        gradients = np.asarray(jax.jacrev(original_cost_vector)(jnp.asarray(raw))) @ raw_jacobian
+        costs.update({name: (value, gradient) for name, value, gradient in
+                      zip(ORIGINAL_COST_OBJECTIVES, scalar_costs, gradients, strict=True)})
+        metrics["target_rho"] = settings.target
+        add_original_metrics(metrics, raw)
     comparisons = []
     for name, (cost, gradient) in costs.items():
         groups = {}
@@ -253,7 +336,7 @@ def summarize_audit(*, residual_labels, parameter_labels, values, jacobian, prof
         comparisons.append(dict(name=name, cost=float(cost),
                                 physical_parameter_gradient=dict(zip(parameter_labels, map(float, gradient), strict=True)),
                                 groups=groups))
-    return dict(target=settings.target, annulus=[settings.inner_radius, settings.outer_radius],
+    result = dict(target=settings.target, annulus=[settings.inner_radius, settings.outer_radius],
                 settings=dict(target=settings.target, inner_radius=settings.inner_radius, outer_radius=settings.outer_radius,
                               profile_trust_multiplier=settings.profile_trust_multiplier, geometry_ess_alpha=settings.geometry_ess_alpha),
                 coordinate_scales=scales.tolist(), baseline_metrics=metrics, terminal_time=snapshot["final_time"],
@@ -263,3 +346,6 @@ def summarize_audit(*, residual_labels, parameter_labels, values, jacobian, prof
                 interpretation="Negative predicted_position_cost_change improves the selected real chord root locally. "
                                "Conditional on this bracket; not a finite-step or convergence guarantee. "
                                "Profiles use nominal scales times the profile trust multiplier; geometry uses ESS scales.")
+    if "original_objectives" in metrics:
+        result["original_objective_settings"] = original_objective_settings()
+    return result

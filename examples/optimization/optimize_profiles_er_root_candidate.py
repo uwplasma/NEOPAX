@@ -1,4 +1,4 @@
-"""Optimize a new root loss through full-time transport.
+"""Optimize a candidate loss or original root/bootstrap control through transport.
 
 The default pilot preserves an existing crossing and varies profiles only.
 The creation comparison enables root-free trials and selects either loss
@@ -55,8 +55,8 @@ class PilotOptions:
     growth_factor: float = 1.5
 
     def __post_init__(self):
-        if self.candidate not in {"local", "annular"} or self.group not in {"profiles", "geometry"}:
-            raise ValueError("Choose a local/annular cost and profiles/geometry DOFs.")
+        if self.candidate not in descent.CANDIDATES or self.group not in {"profiles", "geometry"}:
+            raise ValueError("Choose a supported candidate/control cost and profiles/geometry DOFs.")
         values = (self.initial_step, self.min_step, self.max_step, self.armijo,
                   self.root_tolerance, self.gradient_tolerance)
         if not all(np.isfinite(v) and v > 0 for v in values):
@@ -123,7 +123,11 @@ def require_matching_forward(report, endpoint, candidate=CANDIDATE):
 
 def forward_key(task):
     # Names and first-order predictions do not affect the forward physics.
-    return descent.task_digest({key: task[key] for key in PHYSICS_KEYS})
+    key = {name: task[name] for name in PHYSICS_KEYS}
+    for name in ("objective_suite", "original_objective_settings"):
+        if name in task:
+            key[name] = task[name]
+    return descent.task_digest(key)
 
 
 def ad_arguments(template):
@@ -187,8 +191,9 @@ def run_ad_task(task):
     args.root_loss_audit_allow_geometry = True
     labels = None
     if metadata is not None:
-        from examples.benchmarks._er_root_loss_audit import ROOT_CREATION_OBJECTIVES
-        labels = ROOT_CREATION_OBJECTIVES
+        from examples.benchmarks._er_root_loss_audit import ROOT_CREATION_OBJECTIVES, ORIGINAL_CONTROL_OBJECTIVES
+        labels = (ORIGINAL_CONTROL_OBJECTIVES if metadata.get("objective_suite") == "original"
+                  else ROOT_CREATION_OBJECTIVES)
         args.max_reverse_accepted_steps = metadata["max_reverse_accepted_steps"]
     with benchmark._benchmark_device_context(cfg):
         runtime, state = build_runtime_context(cfg)
@@ -311,6 +316,8 @@ def optimize(seed, evaluator, options, *, state=None, save=lambda _: None, emit=
         block = endpoint["metrics"]["candidates"][selected_cost]
         return dict(iteration=iteration, cost=block["cost"], zero_cost=block.get("zero_cost"),
                     sign_cost=block.get("sign_cost"), **field_progress(endpoint, settings),
+                    component_costs={key: value for key, value in block.items() if key.endswith("_cost")},
+                    original_objectives=endpoint["metrics"].get("original_objectives"),
                     step=step, reduction_ratio=ratio, parameters=list(parameters))
 
     if state is None:
@@ -328,9 +335,16 @@ def optimize(seed, evaluator, options, *, state=None, save=lambda _: None, emit=
     while True:
         progress = field_progress(state["endpoint"], settings)
         root = progress["root"]
-        if (root is not None and abs(root - target) <= options.root_tolerance
-                and progress["inner_positive_fraction"] == 1 and progress["outer_negative_fraction"] == 1):
-            state.update(status="root_target_met", converged=True)
+        root_met = (root is not None and abs(root-target) <= options.root_tolerance
+                    and progress["inner_positive_fraction"] == 1 and progress["outer_negative_fraction"] == 1)
+        original = state["endpoint"]["metrics"].get("original_objectives", {})
+        bootstrap_met = (bool(original) and original["bootstrap_current_softmax_abs_scaled"] <= original["bootstrap_limit"])
+        strength_met = (bool(original) and original["Er_transition_strength"] >= original["strength_target"])
+        goal_met = (bootstrap_met if options.candidate == "bootstrap" else
+                    root_met and strength_met and bootstrap_met if options.candidate == "original_bootstrap" else
+                    root_met and strength_met if options.candidate == "original" else root_met)
+        if goal_met:
+            state.update(status="bootstrap_target_met" if options.candidate == "bootstrap" else "root_target_met", converged=True)
             break
         iteration = len(state["history"])
         if iteration > options.max_iterations:
@@ -360,6 +374,10 @@ def optimize(seed, evaluator, options, *, state=None, save=lambda _: None, emit=
                              zero_cost=metrics["candidates"][selected_cost].get("zero_cost"),
                              sign_cost=metrics["candidates"][selected_cost].get("sign_cost"),
                              **field_progress(endpoint, settings))
+                if "original_objectives" in metrics:
+                    event.update(original_objectives=metrics["original_objectives"],
+                                 component_costs={key: value for key, value in metrics["candidates"][selected_cost].items()
+                                                  if key.endswith("_cost")})
                 if not np.isfinite(trial_cost) or (not options.allow_root_creation and metrics["nearest_downcrossing"] is None):
                     raise ValueError("Trial has a nonfinite cost or loses the existing root.")
                 if not np.array_equal(endpoint["parameter_values"], candidate):
@@ -427,7 +445,7 @@ def main(argv=None):
     parser.add_argument("--descent-dir", type=Path, help="Reuse matching saved forward endpoints from the checker.")
     parser.add_argument("--out-dir", type=Path, default=ROOT / "outputs/profiles_annular_root_optimization")
     parser.add_argument("--resume", action="store_true")
-    parser.add_argument("--candidate", choices=("local", "annular"), default="annular")
+    parser.add_argument("--candidate", choices=descent.CANDIDATES, default="annular")
     parser.add_argument("--group", choices=("profiles", "geometry"), default="profiles")
     parser.add_argument("--allow-root-creation", action="store_true", help="Allow finite trials before a crossing exists.")
     for name, kind, default in (("max-iterations", int, 5), ("initial-step", float, .001),

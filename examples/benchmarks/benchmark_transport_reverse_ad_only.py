@@ -4428,7 +4428,7 @@ def _run_realtime_geometry_optimization_api_smoke(
         report["root_loss_audit"]["experiment"] = experiment_inputs(
             config, parameter_values, str(args.initial_er_root_ad),
         )
-        print("[root-loss-audit] NEW candidates only; physical gradients and root-descent directions:", flush=True)
+        print("[root-loss-audit] candidate/control costs; physical gradients and root-descent directions:", flush=True)
         for comparison in report["root_loss_audit"]["comparisons"]:
             print(json.dumps(comparison), flush=True)
     print("[autodiff-gate] optimization API residuals/Jacobian rows:")

@@ -1,4 +1,4 @@
-"""Compare the two root losses from an original or saved optimized geometry.
+"""Compare candidate losses or original root/bootstrap controls on one geometry.
 
 Each candidate/group starts independently from the same saved full-time AD
 point. No positive region or crossing is required to accept a trial. A trial
@@ -41,7 +41,7 @@ def validate_creation_seed(report):
         raise ValueError("The comparison must start without a positive-Er region or downcrossing in the annulus.")
 
 
-def geometry_result_ad_report(directory, out):
+def geometry_result_ad_report(directory, out, objective_suite="candidates"):
     """Prepare one new baseline AD for the accepted boundary, or reuse its report."""
     from examples.benchmarks import benchmark_er_root_candidates_optimization_start as baseline
     _, _, source = baseline.load_saved_geometry(directory)
@@ -50,6 +50,8 @@ def geometry_result_ad_report(directory, out):
         command = [sys.executable, str(Path(baseline.__file__).resolve()),
                    "--geometry-result-dir", str(Path(directory).resolve()),
                    "--out-dir", str(report_path.parent), "--ad-only"]
+        if objective_suite == "original":
+            command.extend(("--objective-suite", "original"))
         result = subprocess.run(command, cwd=ROOT)
         if result.returncode:
             raise ValueError(f"Saved-geometry baseline AD failed; see {report_path.parent / 'ad.log'}.")
@@ -62,6 +64,9 @@ def geometry_result_ad_report(directory, out):
     if (metadata.get("saved_geometry_runtime_contract") != "optimization_boozer_resolution_v1"
             or geometry.get("mboz") != metadata.get("mboz") or geometry.get("nboz") != metadata.get("nboz")):
         raise ValueError("This cached AD predates the saved-geometry runtime resolution fix; use a new output directory.")
+    if objective_suite == "original" and (metadata.get("objective_suite") != "original"
+            or "original_objective_settings" not in report.get("root_loss_audit", {})):
+        raise ValueError("This cached AD lacks the original root/bootstrap controls; use a new output directory.")
     return report_path
 
 
@@ -85,6 +90,14 @@ def save_comparison(out, seed_digest):
                          final_inner_positive_fraction=last["inner_positive_fraction"],
                          final_outer_negative_fraction=last["outer_negative_fraction"],
                          final_wrong_sign_fraction=last["wrong_sign_fraction"], summary=str(path)))
+        for prefix, point in (("initial", first), ("final", last)):
+            original = point.get("original_objectives") or {}
+            components = point.get("component_costs", {})
+            for label in ("Er_transition_location_moment", "Er_transition_strength", "strength_deficit",
+                          "bootstrap_current_softmax_abs_scaled", "bootstrap_penalty"):
+                rows[-1][f"{prefix}_{label}"] = original.get(label)
+            for label in ("position_cost", "strength_cost", "bootstrap_cost"):
+                rows[-1][f"{prefix}_{label}"] = components.get(label)
     pilot.write_json(out / "comparison.json", dict(seed_sha256=seed_digest, runs=rows,
         interpretation="Judge root creation when initially absent, or refinement when present; cost scales differ."))
     if rows:
@@ -134,7 +147,8 @@ def main(argv=None):
                         help="Prepare baseline AD from the exported geometry-only result, then compare losses.")
     parser.add_argument("--descent-dir", type=Path, help="Reuse identical saved baseline/first forward endpoints.")
     parser.add_argument("--out-dir", type=Path, default=ROOT / "outputs/root_creation_comparison")
-    parser.add_argument("--candidates", default="local,annular")
+    parser.add_argument("--candidates", default="local,annular",
+                        help="local, annular, original (position+strength), bootstrap, or original_bootstrap; comma separated.")
     parser.add_argument("--groups", default="profiles", help="profiles, geometry, or profiles,geometry")
     parser.add_argument("--resume", action="store_true", help="Resume existing runs and start any not yet created.")
     for name, kind, value in (("max-iterations", int, 10), ("initial-step", float, .001),
@@ -144,9 +158,9 @@ def main(argv=None):
         parser.add_argument("--" + name, type=kind, default=value)
     args = parser.parse_args(argv)
     candidates, groups = args.candidates.split(","), args.groups.split(",")
-    if (not set(candidates) <= {"local", "annular"} or len(candidates) != len(set(candidates))
+    if (not set(candidates) <= set(pilot.descent.CANDIDATES) or len(candidates) != len(set(candidates))
             or not set(groups) <= {"profiles", "geometry"} or len(groups) != len(set(groups))):
-        parser.error("Choose distinct local/annular candidates and profiles/geometry groups.")
+        parser.error("Choose distinct supported candidate/control costs and profiles/geometry groups.")
     out = args.out_dir.resolve()
     try:
         options_list = []
@@ -156,7 +170,8 @@ def main(argv=None):
                     **{key: getattr(args, key) for key in ("max_iterations", "initial_step", "max_step", "min_step",
                                                          "growth_factor", "max_backtracks", "root_tolerance")})
                 options_list.append(options)
-        report_path = (geometry_result_ad_report(args.geometry_result_dir, out)
+        suite = "original" if set(candidates) & {"original", "bootstrap", "original_bootstrap"} else "candidates"
+        report_path = (geometry_result_ad_report(args.geometry_result_dir, out, objective_suite=suite)
                        if args.geometry_result_dir is not None else args.ad_report)
         seed = json.loads(report_path.read_text())
         validate_creation_seed(seed)
@@ -171,7 +186,8 @@ def main(argv=None):
         parser.error("This directory belongs to a different AD seed; use a new output directory.")
     pilot.write_json(manifest_path, dict(seed_sha256=digest, ad_report=str(report_path.resolve()),
         optimization_start_case=seed["optimization_start_case"],
-        baseline_no_electron_region_verified=bool(seed.get("baseline_no_electron_region_verified")), root_weight=1.0))
+        baseline_no_electron_region_verified=bool(seed.get("baseline_no_electron_region_verified")), root_weight=1.0,
+        original_objective_settings=seed["root_loss_audit"].get("original_objective_settings")))
     cache_directory = args.descent_dir
     for candidate in candidates:
         for group in groups:

@@ -19,6 +19,7 @@ import numpy as np
 
 LOCAL = "audit_root_local_cost"
 ANNULAR = "audit_root_annular_cost"
+ORIGINAL = ("audit_root_original_cost", "audit_root_bootstrap_cost", "audit_root_original_bootstrap_cost")
 
 
 def read_json(path):
@@ -110,8 +111,11 @@ def candidate_rows(report, root):
     ge = jac[labels.index("audit_root_interpolated_Er")]
     costs = audit.get("baseline_metrics", {}).get("candidates", {})
     rows = []
-    for name in (LOCAL, ANNULAR):
-        gc = jac[labels.index(name)]
+    reported = {item["name"]: item for item in audit.get("comparisons", [])}
+    names = (LOCAL, ANNULAR, *(name for name in ORIGINAL if name in reported))
+    for name in names:
+        gc = (jac[labels.index(name)] if name in labels else
+              np.asarray([reported[name]["physical_parameter_gradient"][parameter] for parameter in parameters]))
         metadata = costs.get(name, {})
         zero = metadata.get("zero_cost")
         # d[0.5*(E/s)^2]/dp = (2*C_zero/E)*dE/dp, without guessing the saved Er scale.
@@ -136,6 +140,7 @@ def candidate_rows(report, root):
                                                  if improvement is not None and root_norm > 0 and error != 0 else None),
                        scaled_sign_gradient_l2=(float(np.linalg.norm((gc - gz)[indices] * scales[indices]))
                                                 if gz is not None else None))
+            row.update({key: metadata[key] for key in ("position_cost", "strength_cost", "bootstrap_cost") if key in metadata})
             if root["target_in_crossing_cell"] and q_rate is not None and e_rate is not None:
                 motion = root["downward_slope"] * q_rate
                 row.update(Er_rate_crossing_motion_component=motion, Er_rate_local_slope_component=e_rate - motion,

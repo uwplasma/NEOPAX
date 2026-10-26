@@ -1,4 +1,4 @@
-"""Check NEW candidate descent directions using independent full forward solves.
+"""Check candidate/control descent directions using independent full forward solves.
 
 Run the candidate-only reverse benchmark first, then pass its JSON report.
 Each forward endpoint gets a fresh subprocess, avoiding accumulated GPU
@@ -22,6 +22,8 @@ import numpy as np
 ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
+
+CANDIDATES = ("local", "annular", "original", "bootstrap", "original_bootstrap")
 
 
 def task_digest(task):
@@ -63,16 +65,20 @@ def plan_checks(report, steps, candidates=("local", "annular"), groups=("profile
     steps = tuple(float(step) for step in steps)
     if not steps or any(not np.isfinite(step) or step <= 0 for step in steps):
         raise ValueError("Descent step sizes must be finite and positive.")
-    if not candidates or not set(candidates) <= {"local", "annular"} or not groups or not set(groups) <= {"profiles", "geometry"}:
-        raise ValueError("Choose local/annular candidates and profiles/geometry groups.")
+    if not candidates or not set(candidates) <= set(CANDIDATES) or not groups or not set(groups) <= {"profiles", "geometry"}:
+        raise ValueError("Choose local/annular/original/bootstrap/original_bootstrap and profiles/geometry groups.")
     base = dict(resolved_config=experiment["resolved_config"], parameter_labels=labels,
                 settings=audit["settings"], initial_er_root_ad=experiment["initial_er_root_ad"],
                 profile_contract="ad_initial_profiles_fixed_config_selected_root",
                 source_digest=source_digest(experiment["resolved_config"]))
+    if "original_objective_settings" in audit:
+        base.update(objective_suite="original", original_objective_settings=audit["original_objective_settings"])
     tasks = [dict(base, name="baseline", parameter_values=baseline.tolist())]
     for candidate in candidates:
         name = f"audit_root_{candidate}_cost"
-        comparison = next(c for c in audit["comparisons"] if c["name"] == name)
+        comparison = next((c for c in audit["comparisons"] if c["name"] == name), None)
+        if comparison is None:
+            raise ValueError(f"The AD report lacks {name}; prepare a fresh --objective-suite original baseline for original controls.")
         for group in groups:
             direction = comparison["groups"][group]
             if direction["scaled_gradient_l2"] == 0:
@@ -236,6 +242,11 @@ def run_forward_task(task):
     profile_cfg = cfg.get("profiles", {})
     cfg.setdefault("ambipolarity", {})["er_ambipolar_plot"] = False
     settings = RootLossAuditSettings(**task["settings"])
+    original_controls = task.get("objective_suite") == "original"
+    if original_controls:
+        from examples.benchmarks._er_root_loss_audit import original_objective_settings
+        if task.get("original_objective_settings") != original_objective_settings():
+            raise ValueError("Original objective constants changed; prepare a matching baseline AD report.")
     geometry_labels = [label for label in labels if ":" in label]
     specs = [tuple([label.removeprefix("vmec:").split(":")[0],
                     *map(int, label.removeprefix("vmec:").split(":")[1:])]) for label in geometry_labels]
@@ -263,6 +274,13 @@ def run_forward_task(task):
         er = np.asarray(jax.device_get(final.Er), dtype=float)
         rho = np.asarray(jax.device_get(runtime.geometry.rho_grid), dtype=float)
         metrics = terminal_metrics(er, rho, settings)
+        if original_controls:
+            from NEOPAX._reverse_ad_transport import bootstrap_current_softmax_abs_scaled
+            from examples.benchmarks._er_root_loss_audit import original_transition_values, add_original_metrics
+            transition = original_transition_values(jnp.asarray(final.Er), runtime.geometry.rho_grid, settings)
+            bootstrap = bootstrap_current_softmax_abs_scaled(final, runtime)
+            metrics["target_rho"] = settings.target
+            add_original_metrics(metrics, jnp.concatenate((transition, jnp.atleast_1d(bootstrap))))
         return dict(task_digest=task_digest(task), name=task["name"], metrics=metrics,
                     terminal_Er=er.tolist(), terminal_rho=rho.tolist(),
                     final_time=float(jax.device_get(rollout.final_carry.t)),
@@ -289,6 +307,8 @@ def compare_endpoint(task, baseline, endpoint, audit):
         b = np.asarray(endpoint["initial_state"]["Er"])
         initial_root_changes = dict(max_abs_change=float(np.max(abs(b - a))),
                                     sign_change_indices=np.flatnonzero(np.sign(a) != np.sign(b)).tolist())
+    old, new = before["candidates"][name], after["candidates"][name]
+    changes = {key: new[key]-old[key] for key in old.keys() & new.keys() if key.endswith("_cost")}
     return dict(name=task["name"], candidate=name, group=task["group"], step_size=task["step_size"],
                 observed_cost_directional_slope=cost_change / task["step_size"],
                 predicted_cost_directional_slope=task["prediction"]["predicted_cost_change_per_unit_descent"],
@@ -296,8 +316,8 @@ def compare_endpoint(task, baseline, endpoint, audit):
                 predicted_root_directional_slope=task["prediction"].get("predicted_root_change_per_unit_descent"),
                 accepted_steps_change=(endpoint["accepted_steps"] - baseline["accepted_steps"])
                     if "accepted_steps" in endpoint and "accepted_steps" in baseline else None,
-                cost_change=cost_change, zero_cost_change=after["candidates"][name]["zero_cost"] - before["candidates"][name]["zero_cost"],
-                sign_cost_change=after["candidates"][name]["sign_cost"] - before["candidates"][name]["sign_cost"],
+                cost_change=cost_change, zero_cost_change=changes.get("zero_cost"),
+                sign_cost_change=changes.get("sign_cost"), component_cost_changes=changes,
                 position_cost_change=position_change, root_change=root_change,
                 predicted_cost_change=task["step_size"] * task["prediction"]["predicted_cost_change_per_unit_descent"],
                 predicted_position_cost_change=task["step_size"] * rate if rate is not None else None,
@@ -324,10 +344,13 @@ def plot_profiles(summary, out, audit):
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    fig, axes = plt.subplots(2, 2, figsize=(11, 7), sharex=True, sharey=True, constrained_layout=True)
+    choices = summary.get("candidates", ("local", "annular"))
+    groups = summary.get("groups", ("profiles", "geometry"))
+    fig, axes = plt.subplots(len(choices), len(groups), figsize=(5.5*len(groups), 3.5*len(choices)),
+                             sharex=True, sharey=True, constrained_layout=True, squeeze=False)
     baseline = summary["baseline"]
-    for i, candidate in enumerate(("local", "annular")):
-        for j, group in enumerate(("profiles", "geometry")):
+    for i, candidate in enumerate(choices):
+        for j, group in enumerate(groups):
             ax = axes[i, j]
             ax.plot(baseline["terminal_rho"], baseline["terminal_Er"], "k--", label="Baseline")
             for result in summary["results"]:
@@ -378,6 +401,7 @@ def main():
     out.mkdir(parents=True, exist_ok=True)
     audit = report["root_loss_audit"]
     summary = dict(ad_report=str(args.ad_report.resolve()), results=[], failures=[],
+                   candidates=args.candidates.split(","), groups=args.groups.split(","),
                    profile_contract="ad_initial_profiles_fixed_config_selected_root",
                    interpretation="Independent adaptive forward solves at finite downhill moves. Not a frozen-schedule AD/FD comparison.")
     baseline = None

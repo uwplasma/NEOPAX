@@ -133,6 +133,8 @@ def prepare_case(cli, *, example=None, prepare_config=None):
         geom["nboz"] = int(example.QI_NBOZ)
         metadata.update(case_kind="saved_geometry_result", saved_geometry_result=saved_metadata,
                         saved_geometry_runtime_contract="optimization_boozer_resolution_v1")
+    if getattr(cli, "objective_suite", None) == "original":
+        metadata["objective_suite"] = "original"
     return cfg, settings, metadata
 
 
@@ -153,7 +155,7 @@ def run_ad(cli, out):
     from NEOPAX._orchestrator import build_runtime_context
     from NEOPAX._reverse_ad_parameters import PROFILE_PARAMETER_ORDER
     from examples.benchmarks._er_root_loss_audit import (
-        ROOT_CREATION_OBJECTIVES, RootLossAuditSettings, experiment_inputs, terminal_metrics,
+        ROOT_CREATION_OBJECTIVES, ORIGINAL_CONTROL_OBJECTIVES, RootLossAuditSettings, experiment_inputs, terminal_metrics,
     )
     from examples.optimization.optimize_profiles_er_root_candidate import ad_arguments, write_json
     from examples.benchmarks.audit_saved_geometry_root_baseline import compare_saved_transport
@@ -214,7 +216,9 @@ def run_ad(cli, out):
         result = benchmark._run_realtime_geometry_optimization_api_smoke(
             args=args, config=cfg, geometry_context=context, baseline_values=jnp.asarray(values),
             baseline_runtime=runtime, baseline_state=state, profile_cfg=cfg["profiles"],
-            neoclassical_cfg=cfg["neoclassical"], root_audit_objective_labels=ROOT_CREATION_OBJECTIVES,
+            neoclassical_cfg=cfg["neoclassical"],
+            root_audit_objective_labels=(ORIGINAL_CONTROL_OBJECTIVES if metadata.get("objective_suite") == "original"
+                                         else ROOT_CREATION_OBJECTIVES),
             terminal_observer_check=observe, write_report=False)
     if not checked:
         raise RuntimeError("The baseline terminal observer was not called; absence of an electron region is unverified.")
@@ -232,6 +236,8 @@ def parser():
     out.add_argument("--ad-report", type=Path, help="Reuse this experiment's saved AD result; do not recompute AD.")
     out.add_argument("--step-sizes", default="0.001")
     out.add_argument("--groups", default="profiles,geometry")
+    out.add_argument("--objective-suite", choices=("candidates", "original"),
+                     help="Also differentiate the original position/strength and native bootstrap rows.")
     source = out.add_mutually_exclusive_group()
     source.add_argument("--seed-input", type=Path)
     source.add_argument("--geometry-result-dir", type=Path, help="Use the exported geometry-only result and its saved settings.")
@@ -248,7 +254,7 @@ def main(argv=None):
     command_parser = parser()
     cli = command_parser.parse_args(argv)
     override_names = ("seed_input", "database_n_theta", "database_n_phi", "database_n_xi", "t_final",
-                      "inner_radius", "geometry_parameters", "transport_max_steps", "max_reverse_accepted_steps", "geometry_result_dir")
+                      "inner_radius", "geometry_parameters", "transport_max_steps", "max_reverse_accepted_steps", "geometry_result_dir", "objective_suite")
     if cli.ad_report is not None and any(getattr(cli, name) is not None for name in override_names):
         command_parser.error("Physics overrides cannot be combined with --ad-report; its saved configuration defines the case.")
     for name in ("database_n_theta", "database_n_phi", "database_n_xi", "t_final", "transport_max_steps", "max_reverse_accepted_steps"):
@@ -298,7 +304,9 @@ def main(argv=None):
     if not cli.ad_only:
         command = [sys.executable, str(ROOT / "examples/benchmarks/check_er_root_candidate_descent.py"),
                    "--ad-report", str(report_path), "--out-dir", str(out / "descent"),
-                   "--step-sizes", cli.step_sizes, "--candidates", "local,annular", "--groups", cli.groups]
+                   "--step-sizes", cli.step_sizes, "--candidates",
+                   "original,bootstrap" if "original_objective_settings" in report["root_loss_audit"] else "local,annular",
+                   "--groups", cli.groups]
         raise SystemExit(subprocess.run(command, cwd=ROOT).returncode)
 
 
