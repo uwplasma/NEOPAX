@@ -57,6 +57,11 @@ def geometry_result_ad_report(directory, out):
     actual = report.get("optimization_start_case", {}).get("saved_geometry_result")
     if actual != source:
         raise ValueError("The saved geometry input/summary differs from this baseline AD; use a new output directory.")
+    metadata = report.get("optimization_start_case", {})
+    geometry = report.get("root_loss_audit", {}).get("experiment", {}).get("resolved_config", {}).get("geometry", {})
+    if (metadata.get("saved_geometry_runtime_contract") != "optimization_boozer_resolution_v1"
+            or geometry.get("mboz") != metadata.get("mboz") or geometry.get("nboz") != metadata.get("nboz")):
+        raise ValueError("This cached AD predates the saved-geometry runtime resolution fix; use a new output directory.")
     return report_path
 
 

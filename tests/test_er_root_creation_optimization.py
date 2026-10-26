@@ -1,6 +1,7 @@
 """Analytic fields and mocked workers only: never execute plasma physics."""
 
 import copy
+import ast
 from contextlib import nullcontext, redirect_stdout
 import io
 import json
@@ -111,6 +112,8 @@ class RootCreationOptimizationTests(unittest.TestCase):
                 _, _, source = baseline.load_saved_geometry(geometry)
                 saved = report()
                 saved["optimization_start_case"].update(case_kind="saved_geometry_result", saved_geometry_result=source)
+                saved["optimization_start_case"]["saved_geometry_runtime_contract"] = "optimization_boozer_resolution_v1"
+                saved["root_loss_audit"]["experiment"]["resolved_config"]["geometry"].update(mboz=18, nboz=18)
                 path = out / "baseline" / "ad_summary.json"
                 path.parent.mkdir(parents=True)
                 path.write_text(json.dumps(saved))
@@ -121,10 +124,32 @@ class RootCreationOptimizationTests(unittest.TestCase):
                 first = creation.geometry_result_ad_report(geometry, out)
                 self.assertEqual(first, creation.geometry_result_ad_report(geometry, out))
                 start.assert_called_once()
+                cached = json.loads(first.read_text())
+                del cached["optimization_start_case"]["saved_geometry_runtime_contract"]
+                first.write_text(json.dumps(cached))
+                with self.assertRaisesRegex(ValueError, "predates"):
+                    creation.geometry_result_ad_report(geometry, out)
                 boundary.write_text("changed boundary")
                 with self.assertRaisesRegex(ValueError, "differs"):
                     creation.geometry_result_ad_report(geometry, out)
                 start.assert_called_once()
+
+    def test_saved_geometry_selector_bundle_matches_the_actual_geometry_factory(self):
+        from NEOPAX import optimization
+        module = ast.parse(Path(optimization.__file__).read_text())
+        factory = next(node for node in module.body if isinstance(node, ast.FunctionDef)
+                       and node.name == "geometry_full_transport_least_squares_problem")
+        bundles = [ast.literal_eval(node.args[0]) for node in ast.walk(factory)
+                   if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                   and isinstance(node.func.value, ast.Name) and node.func.value.id == "options"
+                   and node.func.attr == "update" and node.args and isinstance(node.args[0], ast.Dict)]
+        self.assertEqual(len(bundles), 1)
+        seed = report()
+        seed["optimization_start_case"]["case_kind"] = "saved_geometry_result"
+        args = pilot.ad_arguments(seed)
+        for name, value in bundles[0].items():
+            with self.subTest(selector=name):
+                self.assertEqual(getattr(args, name), value)
 
     def test_root_free_seed_and_trials_are_allowed_explicitly(self):
         seed = report()

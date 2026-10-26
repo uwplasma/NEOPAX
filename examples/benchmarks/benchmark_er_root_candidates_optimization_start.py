@@ -126,7 +126,13 @@ def prepare_case(cli, *, example=None, prepare_config=None):
                     max_mode=stage, mboz=int(example.QI_MBOZ), nboz=int(example.QI_NBOZ),
                     surfaces=[float(v) for v in example.SURFACES], families=example.GEOMETRY_FAMILIES)
     if saved_metadata is not None:
-        metadata.update(case_kind="saved_geometry_result", saved_geometry_result=saved_metadata)
+        # Rebasing an accepted boundary makes all geometry deltas zero. The
+        # evaluator then reuses this runtime rather than the trial runtime
+        # built from the optimization context. Both must use its resolution.
+        geom["mboz"] = int(example.QI_MBOZ)
+        geom["nboz"] = int(example.QI_NBOZ)
+        metadata.update(case_kind="saved_geometry_result", saved_geometry_result=saved_metadata,
+                        saved_geometry_runtime_contract="optimization_boozer_resolution_v1")
     return cfg, settings, metadata
 
 
@@ -150,6 +156,7 @@ def run_ad(cli, out):
         ROOT_CREATION_OBJECTIVES, RootLossAuditSettings, experiment_inputs, terminal_metrics,
     )
     from examples.optimization.optimize_profiles_er_root_candidate import ad_arguments, write_json
+    from examples.benchmarks.audit_saved_geometry_root_baseline import compare_saved_transport
 
     cfg, raw_settings, metadata = prepare_case(cli)
     settings = RootLossAuditSettings(**raw_settings)
@@ -168,6 +175,7 @@ def run_ad(cli, out):
     values = profiles + [0.] * len(specs)
     experiment = experiment_inputs(cfg, values, "jax_selected_root")
     template = dict(parameter_order=[*PROFILE_PARAMETER_ORDER, *geometry_labels], reverse_segment_length=50,
+                    optimization_start_case=metadata,
                     root_loss_audit=dict(settings=raw_settings, experiment=experiment))
     args = ad_arguments(template)
     args.max_reverse_accepted_steps = metadata["max_reverse_accepted_steps"]
@@ -182,13 +190,21 @@ def run_ad(cli, out):
 
     def observe(snapshot):
         metrics = terminal_metrics(snapshot["Er"], snapshot["rho"], settings)
-        write_json(out / "baseline_forward_observation.json", dict(
+        observation = dict(
             final_time=snapshot["final_time"], terminal_Er=snapshot["Er"].tolist(),
-            terminal_rho=snapshot["rho"].tolist(), metrics=metrics))
+            terminal_rho=snapshot["rho"].tolist(), metrics=metrics)
+        write_json(out / "baseline_forward_observation.json", observation)
         print("[optimization-start-baseline] " + json.dumps(metrics), flush=True)
         if metadata.get("case_kind") == "saved_geometry_result":
             if not np.isclose(snapshot["final_time"], metadata["t_final"], rtol=0, atol=1e-10):
                 raise ValueError("Baseline transport did not reach the configured final time.")
+            source = metadata.get("saved_geometry_result", {})
+            if source.get("directory"):
+                parity = compare_saved_transport(source["directory"], observation, raw_settings)
+                write_json(out / "baseline_saved_forward_parity.json", parity)
+                if parity["available"] and not parity["matches"]:
+                    raise ValueError("Baseline does not reproduce the saved geometry transport report. "
+                                     "Stopped before reverse AD/optimization; inspect baseline_saved_forward_parity.json.")
         else:
             check_no_electron_region(metrics, snapshot["final_time"], metadata["t_final"])
         checked.append(metrics)

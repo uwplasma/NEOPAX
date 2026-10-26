@@ -156,6 +156,15 @@ def ad_arguments(template):
     args.config = template.get("config_path", args.config)
     args.accepted_step_limit = None
     args.reverse_segment_length = template["reverse_segment_length"]
+    if template.get("optimization_start_case", {}).get("case_kind") == "saved_geometry_result":
+        # Match geometry_full_transport_least_squares_problem's database
+        # selector bundle. These are existing kernel contracts, not a new lane.
+        args.reverse_database_initial_support_mode = "reduced_zero"
+        args.reverse_database_initial_state_mode = "reduced_zero_rhs"
+        args.reverse_database_interpolation_transpose_mode = "legacy_sparse"
+        args.reverse_database_root_interpolation_transpose_mode = "legacy_sparse"
+        args.reverse_database_bootstrap_interpolation_transpose_mode = "legacy_sparse"
+        args.reverse_final_objective_cotangent_mode = "grouped_joint_vjp"
     settings = template["root_loss_audit"]["settings"]
     for name, key in (("target", "target"), ("inner_radius", "inner_radius"),
                       ("outer_radius", "outer_radius"), ("profile_trust_multiplier", "profile_trust_multiplier"),

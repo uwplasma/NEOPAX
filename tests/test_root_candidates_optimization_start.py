@@ -66,6 +66,13 @@ class RootCandidatesOptimizationStartTests(unittest.TestCase):
             self.assertEqual(meta["database_mesh"], [11, 13, 17])
             self.assertEqual(meta["max_mode"], 2)
             self.assertEqual(meta["case_kind"], "saved_geometry_result")
+            self.assertEqual((cfg["geometry"]["mboz"], cfg["geometry"]["nboz"]), (18, 18))
+            from NEOPAX import _orchestrator, _geometry_autodiff
+            with patch.object(_geometry_autodiff, "build_geometry_autodiff_context", return_value="context") as build_context, \
+                 patch.object(_geometry_autodiff, "build_runtime_context_for_geometry_param", return_value=("runtime", "state")):
+                _orchestrator.build_runtime_context(cfg)
+            self.assertEqual(build_context.call_args.kwargs["mboz"], 18)
+            self.assertEqual(build_context.call_args.kwargs["nboz"], 18)
             original = case.transport_config(case.parser().parse_args([]))
             self.assertEqual(cfg["profiles"], original["profiles"])
 
@@ -214,7 +221,7 @@ class RootCandidatesOptimizationStartTests(unittest.TestCase):
         case = actual_case_without_solver_import()
         cli = experiment.parser().parse_args([])
         cfg, settings, meta = experiment.prepare_case(cli, example=case, prepare_config=lambda c, **_: c)
-        meta.update(case_kind="saved_geometry_result", saved_geometry_result={"accepted_geometry_sha256": "saved"})
+        meta.update(case_kind="saved_geometry_result", saved_geometry_result={"accepted_geometry_sha256": "saved", "directory": "saved"})
         spec = SimpleNamespace(family="RBC", m=1, n=0)
         def evaluate(**kwargs):
             rho = (np.arange(51) + .5) / 51
@@ -229,6 +236,7 @@ class RootCandidatesOptimizationStartTests(unittest.TestCase):
              patch.object(opt, "vmex_boundary_parameterization", return_value=SimpleNamespace(specs=(spec,))), \
              patch.object(orchestrator, "build_runtime_context", return_value=(object(), object())), \
              patch.object(pilot, "ad_arguments", return_value=SimpleNamespace()), \
+             patch("examples.benchmarks.audit_saved_geometry_root_baseline.compare_saved_transport", return_value={"available": False}), \
              patch.dict("sys.modules", {"benchmark_transport_reverse_ad_only": bench}):
             experiment.run_ad(cli, Path(directory))
             saved = json.loads((Path(directory) / "ad_summary.json").read_text())
@@ -236,6 +244,38 @@ class RootCandidatesOptimizationStartTests(unittest.TestCase):
             self.assertFalse(saved["baseline_no_electron_region_verified"])
             observation = json.loads((Path(directory) / "baseline_forward_observation.json").read_text())
             self.assertAlmostEqual(observation["metrics"]["nearest_downcrossing"], .6)
+
+    def test_saved_geometry_baseline_mismatch_stops_before_the_reverse_sweep(self):
+        from NEOPAX import optimization as opt, _orchestrator
+        from examples.optimization import optimize_profiles_er_root_candidate as pilot
+        case = actual_case_without_solver_import()
+        cli = experiment.parser().parse_args([])
+        cfg, settings, meta = experiment.prepare_case(cli, example=case, prepare_config=lambda c, **_: c)
+        meta.update(case_kind="saved_geometry_result", saved_geometry_result={"directory": "saved"})
+        spec = SimpleNamespace(family="RBC", m=1, n=0)
+        reverse_started = Mock()
+        def evaluate(**kwargs):
+            rho = (np.arange(51) + .5) / 51
+            kwargs["terminal_observer_check"](dict(Er=-np.ones(51), rho=rho, final_time=2.))
+            reverse_started()
+            return {}
+        bench = SimpleNamespace(_profile_cfg_scalar_value=lambda c, n: float(c.get(n, 1.)),
+            _benchmark_device_context=lambda _: nullcontext(), _run_realtime_geometry_optimization_api_smoke=evaluate)
+        with tempfile.TemporaryDirectory() as directory, redirect_stdout(io.StringIO()), \
+             patch.object(experiment, "prepare_case", return_value=(cfg, settings, meta)), \
+             patch.object(opt, "build_geometry_autodiff_context", return_value="context"), \
+             patch.object(opt, "vmex_boundary_parameterization", return_value=SimpleNamespace(specs=(spec,))), \
+             patch.object(_orchestrator, "build_runtime_context", return_value=(object(), object())), \
+             patch.object(pilot, "ad_arguments", return_value=SimpleNamespace()), \
+             patch("examples.benchmarks.audit_saved_geometry_root_baseline.compare_saved_transport", return_value={"available": True, "matches": False}), \
+             patch.dict("sys.modules", {"benchmark_transport_reverse_ad_only": bench}):
+            out = Path(directory)
+            with self.assertRaisesRegex(ValueError, "does not reproduce"):
+                experiment.run_ad(cli, out)
+            reverse_started.assert_not_called()
+            self.assertTrue((out / "baseline_forward_observation.json").exists())
+            self.assertTrue((out / "baseline_saved_forward_parity.json").exists())
+            self.assertFalse((out / "ad_summary.json").exists())
 
     def test_saved_geometry_override_cannot_be_combined_with_reused_ad(self):
         with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit), patch.object(experiment.subprocess, "Popen") as start:

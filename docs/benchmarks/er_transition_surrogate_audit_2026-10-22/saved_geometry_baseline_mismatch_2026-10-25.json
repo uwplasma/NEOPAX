@@ -1,0 +1,111 @@
+{
+  "reported_case": {
+    "seed_input": "/home/exouser/NEOPAX/outputs/geometry_qi_max_er_transition_bootstrap_net_power_initial_root_database_full_transport_optimization/input.QI_neopax_database_full_transport_net_power_optimized",
+    "seed_sha256": "c2b492828478b49431d5cd1c87a32281c172f380ae73bd04ebafdbfa7cabca85",
+    "config_source": "/home/exouser/NEOPAX/examples/optimization/full_transport_database_vacuum_t2.toml",
+    "t_final": 2,
+    "transport_max_steps": 1000,
+    "max_reverse_accepted_steps": 500,
+    "database_mesh": [
+      25,
+      25,
+      33
+    ],
+    "max_mode": 2,
+    "mboz": 18,
+    "nboz": 18,
+    "surfaces": [
+      0.0196078431372549,
+      0.09803921568627451,
+      0.19607843137254902,
+      0.29411764705882354,
+      0.39215686274509803,
+      0.49019607843137253,
+      0.5882352941176471,
+      0.6862745098039216,
+      0.7843137254901961,
+      0.8823529411764706,
+      1
+    ],
+    "families": "RBC,ZBS",
+    "case_kind": "saved_geometry_result",
+    "saved_geometry_result": {
+      "directory": "/home/exouser/NEOPAX/outputs/geometry_qi_max_er_transition_bootstrap_net_power_initial_root_database_full_transport_optimization",
+      "summary_path": "/home/exouser/NEOPAX/outputs/geometry_qi_max_er_transition_bootstrap_net_power_initial_root_database_full_transport_optimization/optimization_summary.json",
+      "summary_sha256": "91acd6ec9fbddb8c3bbdacf470fb445f20354bb6723cd16fd14183f9bc4d7344",
+      "accepted_geometry_input": "/home/exouser/NEOPAX/outputs/geometry_qi_max_er_transition_bootstrap_net_power_initial_root_database_full_transport_optimization/input.QI_neopax_database_full_transport_net_power_optimized",
+      "accepted_geometry_sha256": "c2b492828478b49431d5cd1c87a32281c172f380ae73bd04ebafdbfa7cabca85"
+    },
+    "profile_parameters": {
+      "n0": 4.21,
+      "T0": 17.8,
+      "density_shape_power": 10,
+      "temperature_shape_power": 2,
+      "density_shape_alpha": 1,
+      "temperature_shape_alpha": 1
+    },
+    "geometry_parameters": [
+      "vmec:RBC:0:1",
+      "vmec:RBC:0:2",
+      "vmec:RBC:1:-2",
+      "vmec:RBC:1:-1",
+      "vmec:RBC:1:0",
+      "vmec:RBC:1:1",
+      "vmec:RBC:1:2",
+      "vmec:RBC:2:-2",
+      "vmec:RBC:2:-1",
+      "vmec:RBC:2:0",
+      "vmec:RBC:2:1",
+      "vmec:RBC:2:2",
+      "vmec:ZBS:0:1",
+      "vmec:ZBS:0:2",
+      "vmec:ZBS:1:-2",
+      "vmec:ZBS:1:-1",
+      "vmec:ZBS:1:0",
+      "vmec:ZBS:1:1",
+      "vmec:ZBS:1:2",
+      "vmec:ZBS:2:-2",
+      "vmec:ZBS:2:-1",
+      "vmec:ZBS:2:0",
+      "vmec:ZBS:2:1",
+      "vmec:ZBS:2:2"
+    ],
+    "settings": {
+      "target": 0.514,
+      "inner_radius": 0.05,
+      "outer_radius": 0.9,
+      "profile_trust_multiplier": 3.7,
+      "geometry_ess_alpha": 1.2
+    }
+  },
+  "reported_baseline": {
+    "Er_at_target": -6.4032764358708425,
+    "annular_max_Er": -0.6972299567696846,
+    "annular_min_Er": -37.129066436839786,
+    "inner_mean_Er": -3.07654876829172,
+    "inner_positive_fraction": 0,
+    "inner_positive_margin_fraction": 0,
+    "outer_negative_fraction": 1,
+    "outer_negative_margin_fraction": 1,
+    "annular_Er_rms": 13.505661668932085,
+    "wrong_sign_fraction": 0.5348837209302325,
+    "actual_downcrossings": [],
+    "nearest_downcrossing": null,
+    "nearest_downcrossing_bracket": null,
+    "position_cost": null,
+    "candidates": {
+      "audit_root_local_cost": {
+        "cost": 9.00701668424693,
+        "zero_cost": 5.12524363927235,
+        "sign_cost": 3.881773044974579
+      },
+      "audit_root_annular_cost": {
+        "cost": 6.777546629809047,
+        "zero_cost": 5.12524363927235,
+        "sign_cost": 1.6523029905366964
+      }
+    }
+  },
+  "status": "baseline_mismatch_reported_by_user; no accepted optimization steps supplied",
+  "note": "Runtime resolution is inferred as a possible setup mismatch from source; read case_manifest.json to determine actual configured/effective values. The physical cause of the missing electron region is not yet established."
+}

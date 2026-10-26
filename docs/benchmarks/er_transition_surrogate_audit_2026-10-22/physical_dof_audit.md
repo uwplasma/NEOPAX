@@ -1142,4 +1142,98 @@ missing/wrong exports, observing a root already present, honest initial
 versus created crossing flags, one-time baseline AD preparation through a
 mocked subprocess, and invalidation after the accepted input changes. There
 were no local plasma, VMEC, NTX database, transport, physical AD or physical
-optimization runs. Physical results for this control remain pending.
+optimization runs. At preparation time the physical control was pending;
+the subsequent baseline discrepancy is recorded below.
+
+## Saved optimized boundary did not reproduce the electron-root baseline
+
+The next supplied GPU output selects the intended exported input under
+geometry_qi_max_er_transition_bootstrap_net_power_initial_root_database_full_transport_optimization.
+Its SHA256 is c2b492828478b49431d5cd1c87a32281c172f380ae73bd04ebafdbfa7cabca85;
+the summary SHA256 is 91acd6ec9fbddb8c3bbdacf470fb445f20354bb6723cd16fd14183f9bc4d7344.
+It reports the nominal six profile values, 2 seconds, mesh 25/25/33, 1000
+attempts and a 500-step reverse guard. Nevertheless the baseline is all
+negative in the test annulus: target Er -6.40327643587 kV/m, inner mean
+-3.07654876829 kV/m, annular maximum -0.697229956770 kV/m and no downcrossing.
+Local/annular costs are 9.00701668425/6.77754662981. The excerpt contains
+baseline AD progress, not an accepted optimization update. Raw output and
+extracted setup/metrics are archived as saved_geometry_baseline_mismatch_2026-10-25.txt/json.
+
+The user correctly rejected this as an unverified reproduction of the desired
+geometry-only result. Selecting the exported boundary filename did not prove
+that the complete numerical configuration was reproduced. Earlier unit tests
+verified routing/config metadata and mocked workers, not physical parity
+with the saved optimized transport field.
+
+### Concrete setup mismatch and correction
+
+The saved-geometry loader rebased the accepted boundary to zero geometry
+deltas. evaluate_geometry_transport_realtime_geometry_least_squares uses
+use_runtime_payload=True for an all-zero geometry vector. It therefore reuses
+the baseline runtime made by build_runtime_context rather than the trial
+runtime made from the optimization's geometry context. Nonzero geometry
+updates in the geometry-only optimizer use that trial context, with 18/18
+Boozer resolution.
+
+The loader previously left geometry.mboz/nboz unset, even though its manifest
+declared the separate derivative context's 18/18 values. The orchestrator's
+runtime constructor instead applies the input-dependent defaults: 6*mpol and
+2*ntor-1 (36/11 for mpol=ntor=6). Thus the manifest did not guarantee 18/18
+for the actually reused transport runtime. The loader now explicitly writes
+18/18 into the saved-geometry runtime configuration, and a regression checks
+the arguments passed through the real orchestrator runtime constructor with
+the expensive builders mocked. The original unoptimized-start path remains
+unchanged. Old saved-geometry AD caches lack the new runtime-contract marker
+and are rejected rather than silently reused.
+
+The setup also used generic/split initial-state/support selectors and
+established root/bootstrap transpose selectors, while the actual geometry
+factory uses reduced_zero_rhs/reduced_zero and legacy_sparse. The saved-case
+AD argument builder now matches the existing factory bundle, verified by
+extracting its actual options from source. These reverse-selector differences
+are not, by themselves, evidence explaining the terminal forward field:
+reduced_zero_rhs calls the same initial-carry forward function. The changed
+runtime resolution is a concrete forward setup discrepancy; its responsibility
+for the observed missing electron region has not been physically verified.
+Persistent versus benchmark runtime construction and the historical saved
+report's solver/config provenance also remain relevant until parity is read.
+
+### Read existing outputs before another solve
+
+audit_saved_geometry_root_baseline.py reads case_manifest.json,
+baseline_forward_observation.json and the geometry result's existing
+optimized/transport/transport_solution.h5. It prints actual configured and
+effective runtime resolution versus the declared context, both terminal
+field summaries, crossing locations and max absolute Er difference. It uses
+NumPy/stdlib plus h5py to read that file; it never imports NEOPAX, JAX, VMEX
+or NTX and performs no transport/geometry/AD solve. It works even if the
+baseline AD report is not yet complete.
+
+After syncing, the read-only physics audit command on the GPU host is:
+
+```bash
+cd /home/exouser/NEOPAX &&
+/home/exouser/jax_env/bin/python examples/benchmarks/audit_saved_geometry_root_baseline.py \
+  --geometry-result-dir outputs/geometry_qi_max_er_transition_bootstrap_net_power_initial_root_database_full_transport_optimization \
+  --baseline-dir outputs/new_root_candidates/profiles_on_optimized_geometry/baseline
+```
+
+The new baseline observer also checks that saved HDF5 reference when it is
+available. It writes baseline_saved_forward_parity.json and stops before
+the reverse sweep and candidate optimization if final time/grid/Er differ
+(Er rtol=1e-5, atol=1e-6). This is a reproduction check, not proof that the
+historical saved report used the same solver/dependency versions. Missing
+reference files are explicitly reported as unavailable; they do not establish
+physical parity. A corrected physical attempt must use a new output directory
+instead of resuming the old baseline/checkpoints. Do not rank losses using
+the unverified ion-root baseline or claim this geometry cannot support an
+electron root from this result.
+
+The focused suite passed 73 tests and 77 subtests in 17.63 s. New tests cover
+the real runtime-constructor arguments without a solve, selector parity with
+the geometry factory, early baseline mismatch rejection, old-cache rejection,
+stored HDF5 time/field selection, actual crossings, input-dependent Boozer
+defaults, and an isolated audit import proving no physics packages are loaded.
+Only short arrays, small stored files and mocked workers ran locally. The
+physical baseline discrepancy is still awaiting the stored-output audit;
+these tests do not establish that the corrected setup reproduces the root.
