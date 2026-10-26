@@ -1,4 +1,4 @@
-"""Compare electron-root creation by the two new losses from one root-free seed.
+"""Compare the two root losses from an original or saved optimized geometry.
 
 Each candidate/group starts independently from the same saved full-time AD
 point. No positive region or crossing is required to accept a trial. A trial
@@ -13,6 +13,7 @@ import csv
 import hashlib
 import json
 from pathlib import Path
+import subprocess
 import sys
 
 import numpy as np
@@ -25,15 +26,38 @@ from examples.optimization import optimize_profiles_er_root_candidate as pilot
 
 
 def validate_creation_seed(report):
-    if not report.get("baseline_no_electron_region_verified") or not report.get("optimization_start_case"):
+    metadata = report.get("optimization_start_case", {})
+    saved_geometry = metadata.get("case_kind") == "saved_geometry_result"
+    verified = report.get("baseline_case_verified") if saved_geometry else report.get("baseline_no_electron_region_verified")
+    if not verified or not metadata:
         raise ValueError("Use the verified optimization-start AD report, not the earlier existing-root benchmark.")
     audit = report["root_loss_audit"]
     rho, er = np.asarray(audit["terminal_rho"]), np.asarray(audit["terminal_Er"])
     settings = audit["settings"]
     mask = (rho >= settings["inner_radius"]) & (rho <= settings["outer_radius"])
-    if (rho.shape != er.shape or not np.isfinite(er).all() or not np.any(mask)
-            or np.any(er[mask] > 0) or audit.get("nearest_downcrossing") is not None):
+    if rho.shape != er.shape or not np.isfinite(er).all() or not np.any(mask):
+        raise ValueError("Invalid observed baseline field/grid.")
+    if not saved_geometry and (np.any(er[mask] > 0) or audit.get("nearest_downcrossing") is not None):
         raise ValueError("The comparison must start without a positive-Er region or downcrossing in the annulus.")
+
+
+def geometry_result_ad_report(directory, out):
+    """Prepare one new baseline AD for the accepted boundary, or reuse its report."""
+    from examples.benchmarks import benchmark_er_root_candidates_optimization_start as baseline
+    _, _, source = baseline.load_saved_geometry(directory)
+    report_path = out / "baseline" / "ad_summary.json"
+    if not report_path.exists():
+        command = [sys.executable, str(Path(baseline.__file__).resolve()),
+                   "--geometry-result-dir", str(Path(directory).resolve()),
+                   "--out-dir", str(report_path.parent), "--ad-only"]
+        result = subprocess.run(command, cwd=ROOT)
+        if result.returncode:
+            raise ValueError(f"Saved-geometry baseline AD failed; see {report_path.parent / 'ad.log'}.")
+    report = json.loads(report_path.read_text())
+    actual = report.get("optimization_start_case", {}).get("saved_geometry_result")
+    if actual != source:
+        raise ValueError("The saved geometry input/summary differs from this baseline AD; use a new output directory.")
+    return report_path
 
 
 def save_comparison(out, seed_digest):
@@ -45,7 +69,9 @@ def save_comparison(out, seed_digest):
                          converged=result["converged"], accepted_iterations=result["accepted_iterations"],
                          first_positive_inner_iteration=result["first_positive_inner_iteration"],
                          first_downcrossing_iteration=result["first_downcrossing_iteration"],
-                         downcrossing_created=result["first_downcrossing_iteration"] is not None,
+                         initial_has_downcrossing=first["has_downcrossing"], initial_root=first["root"],
+                         initial_root_error=first["root_error"],
+                         downcrossing_created=(not first["has_downcrossing"] and result["first_downcrossing_iteration"] is not None),
                          final_has_downcrossing=last["has_downcrossing"],
                          initial_cost=first["cost"], final_cost=last["cost"],
                          final_zero_cost=last["zero_cost"], final_sign_cost=last["sign_cost"],
@@ -55,7 +81,7 @@ def save_comparison(out, seed_digest):
                          final_outer_negative_fraction=last["outer_negative_fraction"],
                          final_wrong_sign_fraction=last["wrong_sign_fraction"], summary=str(path)))
     pilot.write_json(out / "comparison.json", dict(seed_sha256=seed_digest, runs=rows,
-        interpretation="Judge region/crossing creation and final signs; the two costs have different numerical scales."))
+        interpretation="Judge root creation when initially absent, or refinement when present; cost scales differ."))
     if rows:
         with (out / "comparison.csv").open("w", newline="") as stream:
             writer = csv.DictWriter(stream, fieldnames=list(rows[0]))
@@ -97,7 +123,10 @@ def plot_comparison(out, seed):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--ad-report", type=Path, required=True)
+    source = parser.add_mutually_exclusive_group(required=True)
+    source.add_argument("--ad-report", type=Path)
+    source.add_argument("--geometry-result-dir", type=Path,
+                        help="Prepare baseline AD from the exported geometry-only result, then compare losses.")
     parser.add_argument("--descent-dir", type=Path, help="Reuse identical saved baseline/first forward endpoints.")
     parser.add_argument("--out-dir", type=Path, default=ROOT / "outputs/root_creation_comparison")
     parser.add_argument("--candidates", default="local,annular")
@@ -113,40 +142,49 @@ def main(argv=None):
     if (not set(candidates) <= {"local", "annular"} or len(candidates) != len(set(candidates))
             or not set(groups) <= {"profiles", "geometry"} or len(groups) != len(set(groups))):
         parser.error("Choose distinct local/annular candidates and profiles/geometry groups.")
-    seed = json.loads(args.ad_report.read_text())
+    out = args.out_dir.resolve()
     try:
-        validate_creation_seed(seed)
+        options_list = []
         for candidate in candidates:
             for group in groups:
                 options = pilot.PilotOptions(candidate=candidate, group=group, allow_root_creation=True,
                     **{key: getattr(args, key) for key in ("max_iterations", "initial_step", "max_step", "min_step",
                                                          "growth_factor", "max_backtracks", "root_tolerance")})
-                pilot.validate_seed(seed, options)
+                options_list.append(options)
+        report_path = (geometry_result_ad_report(args.geometry_result_dir, out)
+                       if args.geometry_result_dir is not None else args.ad_report)
+        seed = json.loads(report_path.read_text())
+        validate_creation_seed(seed)
+        for options in options_list:
+            pilot.validate_seed(seed, options)
     except ValueError as exc:
         parser.error(str(exc))
-    out = args.out_dir.resolve()
     out.mkdir(parents=True, exist_ok=True)
-    digest = hashlib.sha256(args.ad_report.read_bytes()).hexdigest()
+    digest = hashlib.sha256(report_path.read_bytes()).hexdigest()
     manifest_path = out / "experiment.json"
     if manifest_path.exists() and json.loads(manifest_path.read_text())["seed_sha256"] != digest:
         parser.error("This directory belongs to a different AD seed; use a new output directory.")
-    pilot.write_json(manifest_path, dict(seed_sha256=digest, ad_report=str(args.ad_report.resolve()),
+    pilot.write_json(manifest_path, dict(seed_sha256=digest, ad_report=str(report_path.resolve()),
         optimization_start_case=seed["optimization_start_case"],
-        baseline_no_electron_region_verified=True, root_weight=1.0))
+        baseline_no_electron_region_verified=bool(seed.get("baseline_no_electron_region_verified")), root_weight=1.0))
+    cache_directory = args.descent_dir
     for candidate in candidates:
         for group in groups:
             run_dir = out / f"{candidate}_{group}"
-            command = ["--ad-report", str(args.ad_report.resolve()), "--out-dir", str(run_dir),
+            command = ["--ad-report", str(report_path.resolve()), "--out-dir", str(run_dir),
                        "--candidate", candidate, "--group", group, "--allow-root-creation"]
             for name in ("max_iterations", "initial_step", "max_step", "min_step", "growth_factor",
                          "max_backtracks", "root_tolerance"):
                 command.extend(("--" + name.replace("_", "-"), str(getattr(args, name))))
-            if args.descent_dir is not None:
-                command.extend(("--descent-dir", str(args.descent_dir.resolve())))
+            if cache_directory is not None:
+                command.extend(("--descent-dir", str(cache_directory.resolve())))
             if args.resume and (run_dir / "checkpoint.json").exists():
                 command.append("--resume")
-            print(f"[creation-comparison] starting {candidate}/{group} from the same root-free seed", flush=True)
+            label = "saved optimized geometry" if args.geometry_result_dir is not None else "saved AD point"
+            print(f"[creation-comparison] starting {candidate}/{group} from the same {label}", flush=True)
             pilot.main(command)
+            if cache_directory is None:
+                cache_directory = run_dir
             save_comparison(out, digest)
             plot_comparison(out, seed)
     print(f"[creation-comparison] saved {out / 'comparison.csv'}", flush=True)

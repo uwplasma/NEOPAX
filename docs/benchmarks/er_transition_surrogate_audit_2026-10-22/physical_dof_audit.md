@@ -967,8 +967,9 @@ explicitly resuming that case's checkpoint.
 
 This preparation does not fix compilation overhead: physics evaluations
 still use isolated workers and an accepted trial normally needs independent
-forward and AD solves. The baseline AD is not recomputed. No root-creation
-optimization result from the physical machine has yet been supplied.
+forward and AD solves. The baseline AD is not recomputed. At preparation
+time, no root-creation optimization result had been supplied; partial
+progress is recorded below.
 
 The final targeted local suite passed 56 tests and 59 subtests in 14.87 s.
 Tests use analytic fields, short arrays and mocked physics workers. New
@@ -978,3 +979,167 @@ correct stationary/target statuses, zero/all-positive false-success cases,
 preserved AD geometry context, nonfinite diagnostic serialization, cached
 forward reuse and checkpoint resume. No local VMEC, NTX database, transport,
 physical reverse AD or physical optimization was run.
+
+### First root-creation optimization progress received 2026-10-25
+
+The GPU run has started local/profiles, the first of the four independent
+cases. Both baseline and first trial forward endpoints were reused from
+the checker. Iteration 1 completed finite matching AD and was accepted:
+cost 41.43344461072115 -> 41.295045300924556, step 0.001, reduction ratio
+0.9954326449558978. The inner mean Er increased from -6.400298095898477 to
+-6.392412198060221 kV/m. There is no positive inner region or downcrossing.
+
+Iteration 2's independent forward trial at step 0.002 reached cost
+41.0220243009842, inner mean Er -6.376993919691591 and target field
+-15.09253029132828 kV/m. Its measured forward cost reduction is 0.2730210,
+versus predicted 0.2755325 (ratio 0.9908849). The next supplied excerpt
+confirms finite matching AD and acceptance of this second update. It is
+marked accepted in root_creation_local_profiles_progress_2026-10-25.csv.
+The next forward worker, evaluation_0004_forward.log, then completed the
+third trial at step 0.004. Its cost is 40.49079470185608, with target field
+-14.983337262135926 and inner mean -6.347421931015971 kV/m. The actual
+cost reduction from accepted iteration 2 is 0.5312295991 versus predicted
+0.5410593936 (ratio 0.9818323). The next supplied event confirms finite
+matching AD and acceptance of iteration 3, now marked accepted in the CSV.
+The evaluation_0006_forward.log worker has started the fourth trial; no
+fourth-point field metrics or acceptance have been supplied. The positive inner fraction remains zero,
+outer negative fraction one, and there is still no downcrossing.
+
+The third forward trial's cumulative cost reduction is about 2.28%, with
+a target Er increase of 0.1927980 kV/m and inner mean increase of 0.0528762
+kV/m from the original state. T0 has increased by about 2.33%. All three
+updates now have supplied acceptance events with finite matching AD.
+The configured fourth trial step is 0.008. No rerun with a larger initial
+step is needed to reach it. The run remains incomplete, with no observed
+positive inner region or downcrossing at the last accepted point.
+
+Across the first two accepted moves the mean inner field rises by 0.0233042
+kV/m and the target field by 0.0836049 kV/m. Positive inner fraction is
+still zero, outer negative fraction is one and wrong-sign fraction is
+unchanged at 0.5348837209302325. This is early cost descent toward less
+negative inner Er, not demonstrated electron-region creation. A null
+root/error correctly records that no crossing exists.
+
+The initial step has grown from 0.001 to 0.002 as configured. These are
+successive optimized points with a recomputed gradient, not repetitions
+of the original fixed-direction descent check. Every geometry parameter
+remains zero in this profile-only case; subsequent geometry cases start
+independently from the shared original seed. No other case or final
+convergence result has been supplied. Only scalar analysis and archival
+updates were performed locally.
+
+### Larger profile updates received 2026-10-25
+
+The next excerpt confirms acceptance of local/profiles iterations 4 and 5
+at steps 0.008 and 0.016, with reduction ratios 0.9639724260 and
+0.9315217209. No trial rejection or nonfinite AD failure is shown. The
+sixth forward trial at step 0.032 completed its cost check and started
+evaluation_0011_ad.log; acceptance of iteration 6 is not yet supplied.
+The CSV has five accepted updates and one explicitly pending forward
+trial. The supplied excerpt is saved in
+root_creation_local_profiles_progress_2026-10-25.txt.
+
+| Quantity | Initial | Accepted iteration 5 | Iteration 6, AD pending |
+| --- | ---: | ---: | ---: |
+| Local cost | 41.43344461 | 37.67956655 | 34.65432407 |
+| Target Er (kV/m) | -15.17613522 | -14.38769327 | -13.73685031 |
+| Inner mean Er (kV/m) | -6.40029810 | -6.18974958 | -5.97333194 |
+| T0 (keV) | 17.8 | 19.61952478 | 21.40402179 |
+| n0 | 4.21 | 4.08658155 | 3.89877786 |
+| Positive inner fraction | 0 | 0 | 0 |
+| Negative outer fraction | 1 | 1 | 1 |
+
+The accepted iteration-5 cost is 9.06% below the initial cost; T0 has risen
+10.22% and n0 fallen 2.93%. Trial 6 has a 16.36% cumulative cost decrease,
+T0 +20.25% and n0 -7.39%. Its actual forward cost reduction is 3.02524248
+versus predicted 3.37750533 (ratio 0.89570324). Both zero and sign costs
+fall: at trial 6 they are 23.58763206 and 11.06669202, respectively.
+
+The profile changes are now substantial, while the observed inner field
+remains negative everywhere in the test annulus. Small initial updates
+alone therefore no longer explain the distance from root creation. This
+trajectory shows continuous field/cost improvement with no demonstrated
+positive region, not evidence that AD has failed or that profile control
+is universally ineffective. The current candidate is still local/profiles;
+there are no supplied results from the three other cases. A winner and
+final root-creation outcome remain unresolved. If iteration 6 is accepted,
+its reported ratio schedules the next trial at the configured cap 0.05.
+No extra physics or derivative tests were run locally.
+
+## Profile comparison on the geometry-only optimized boundary: 2026-10-25
+
+The user proposed fixing the boundary to the accepted geometry-only result
+instead of the original unoptimized geometry. This is a useful control for
+the profile-sensitivity question. The incomplete original-geometry profile
+trajectory does not establish that its geometry can never support the desired
+root; it only records the tested loss direction and profile path. A root
+already present on the optimized geometry makes the new experiment a
+refinement/control test, not evidence of root creation from an absent region.
+
+The comparison runner now accepts --geometry-result-dir as an alternative
+to --ad-report. It reads geometry_phase_summary.json, or the standalone
+optimization_summary.json, and uses the exported accepted geometry input:
+accepted_geometry_input for a saved warm geometry phase, or
+input.QI_neopax_database_full_transport_net_power_optimized (with the final
+stage export as a fallback) for the standalone example. It does not use
+the original seed or reapply saved scaled coordinates to an already updated
+boundary. A missing accepted export or a result containing profile DOFs is
+an error. Relocated warm-phase exports can be resolved inside the result
+directory by their recorded basename.
+
+Saved config snapshots are preserved when available. The standalone geometry
+summary does not store a complete config snapshot; in that format the current
+geometry example supplies nominal profiles/config and the saved mesh, final
+time, attempt budget and reverse guard override its defaults. No profiles
+from the in-progress original-geometry optimization are loaded. The effective
+config, accepted input and summary hashes are recorded in the baseline case
+manifest. There is no geometry-only rerun, and geometry stays fixed throughout
+the recommended profile-only comparison.
+
+The runner prepares a new baseline full-time AD report for this different
+physical boundary, saves it under baseline/ad_summary.json and reuses it on
+later invocations only when the geometry input and summary still match.
+It observes the actual baseline signs and crossing instead of applying the
+original all-negative-field gate. Initial root presence/position/error are
+included in comparison.csv; a crossing present at iteration zero is not
+marked as newly created. If the baseline already meets the root/sign target,
+the pilot correctly reports that instead of forcing a profile change.
+
+After syncing these changes, run the two profile-only loss comparisons:
+
+```bash
+cd ~/NEOPAX
+mkdir -p outputs/new_root_candidates
+set -o pipefail
+
+env -u JAX_COMPILATION_CACHE_DIR \
+JAX_ENABLE_COMPILATION_CACHE=0 \
+XLA_FLAGS="${XLA_FLAGS:-} --xla_gpu_enable_command_buffer=" \
+PYTHONPATH="$HOME/VMEX:$HOME/NTX/src${PYTHONPATH:+:$PYTHONPATH}" \
+python examples/optimization/optimize_er_root_candidates.py \
+  --geometry-result-dir outputs/geometry_qi_max_er_transition_bootstrap_net_power_initial_root_database_full_transport_optimization \
+  --out-dir outputs/new_root_candidates/profiles_on_optimized_geometry \
+  --groups profiles \
+  --max-iterations 10 \
+  --initial-step 0.001 \
+  --max-step 0.05 \
+  --growth-factor 2 \
+  2>&1 | tee outputs/new_root_candidates/profiles_on_optimized_geometry.log
+```
+
+The two candidates start independently from the same accepted boundary and
+nominal profiles. Matching independent forward endpoints can be shared across
+the candidate runs. Each accepted-point AD retains the baseline geometry
+context and fixed profile configuration. Existing root-free reports and
+commands retain their all-negative baseline validation. The saved-geometry
+comparison uses a separate directory; its checkpoints cannot be confused
+with the original-geometry run.
+
+The local targeted suite passed 64 tests and 59 subtests in 15.51 s. New
+tests check accepted-input selection without double-applying geometry deltas,
+saved time/grid/budget/config parity, relocated phase exports, rejection of
+missing/wrong exports, observing a root already present, honest initial
+versus created crossing flags, one-time baseline AD preparation through a
+mocked subprocess, and invalidation after the accepted input changes. There
+were no local plasma, VMEC, NTX database, transport, physical AD or physical
+optimization runs. Physical results for this control remain pending.

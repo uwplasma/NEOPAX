@@ -45,6 +45,68 @@ def actual_case_without_solver_import():
 
 
 class RootCandidatesOptimizationStartTests(unittest.TestCase):
+    def test_saved_geometry_uses_the_exported_boundary_and_saved_time_grid_budgets(self):
+        case = actual_case_without_solver_import()
+        with tempfile.TemporaryDirectory() as directory:
+            folder = Path(directory)
+            accepted = folder / "input.QI_neopax_database_full_transport_net_power_optimized"
+            accepted.write_text("accepted boundary, not original plus scaled deltas")
+            summary = dict(parameter_labels=["RBC:1:0", "ZBS:1:0"], x=[999., -999.],
+                seed_input="never_use_this_original.input", max_mode_schedule=[1, 2],
+                database_grid=[11, 13, 17], transport_final_time=5.5,
+                transport_max_steps=2000, max_reverse_accepted_steps=777)
+            (folder / "optimization_summary.json").write_text(json.dumps(summary))
+            cli = experiment.parser().parse_args(["--geometry-result-dir", directory])
+            cfg, _, meta = experiment.prepare_case(cli, example=case, prepare_config=lambda c, **_: c)
+            self.assertEqual(cfg["geometry"]["vmec_input_file"], str(accepted.resolve()))
+            self.assertEqual(cfg["geometry"]["vmec_param_delta"], 0.)
+            self.assertEqual(cfg["transport_solver"]["t_final"], 5.5)
+            self.assertEqual(cfg["transport_solver"]["max_steps"], 2000)
+            self.assertEqual(meta["max_reverse_accepted_steps"], 777)
+            self.assertEqual(meta["database_mesh"], [11, 13, 17])
+            self.assertEqual(meta["max_mode"], 2)
+            self.assertEqual(meta["case_kind"], "saved_geometry_result")
+            original = case.transport_config(case.parser().parse_args([]))
+            self.assertEqual(cfg["profiles"], original["profiles"])
+
+    def test_saved_phase_preserves_profile_config_and_resolves_moved_export(self):
+        case = actual_case_without_solver_import()
+        saved_cfg = case.transport_config(case.parser().parse_args([]))
+        saved_cfg["profiles"]["T0"] = 11.
+        saved_cfg["transport_solver"].update(t_final=7., max_steps=3333)
+        saved_cfg["neoclassical"].update(ntx_scan_n_theta=5, ntx_scan_n_zeta=7, ntx_scan_n_xi=9)
+        with tempfile.TemporaryDirectory() as directory:
+            folder = Path(directory)
+            accepted = folder / "input.accepted_phase"
+            accepted.write_text("exported phase")
+            summary = dict(parameter_labels=["RBC:1:0"], max_mode_schedule=[3], config=saved_cfg,
+                accepted_geometry_input="/missing/old_machine/input.accepted_phase")
+            (folder / "geometry_phase_summary.json").write_text(json.dumps(summary))
+            cli = experiment.parser().parse_args(["--geometry-result-dir", directory, "--database-n-xi", "19"])
+            cfg, _, meta = experiment.prepare_case(cli, example=case, prepare_config=lambda c, **_: c)
+            self.assertEqual(cfg["profiles"]["T0"], 11.)
+            self.assertEqual(cfg["boundary"], saved_cfg["boundary"])
+            self.assertEqual(cfg["transport_solver"]["t_final"], 7.)
+            self.assertEqual(cfg["transport_solver"]["max_steps"], 3333)
+            self.assertEqual(meta["database_mesh"], [5, 7, 19])
+            self.assertEqual(meta["max_mode"], 3)
+            self.assertEqual(meta["seed_input"], str(accepted.resolve()))
+
+    def test_missing_export_never_falls_back_to_original_seed_or_profile_result(self):
+        with tempfile.TemporaryDirectory() as directory:
+            folder = Path(directory)
+            original = folder / "original.input"
+            original.write_text("original")
+            path = folder / "optimization_summary.json"
+            summary = dict(parameter_labels=["RBC:1:0"], seed_input=str(original), max_mode_schedule=[2])
+            path.write_text(json.dumps(summary))
+            with self.assertRaisesRegex(FileNotFoundError, "exported accepted"):
+                experiment.load_saved_geometry(folder)
+            summary["parameter_labels"].append("n0")
+            path.write_text(json.dumps(summary))
+            with self.assertRaisesRegex(ValueError, "only geometry"):
+                experiment.load_saved_geometry(folder)
+
     def test_case_matches_the_actual_optimization_seed_profiles_time_and_mesh(self):
         case = actual_case_without_solver_import()
         args = experiment.parser().parse_args([])
@@ -144,6 +206,40 @@ class RootCandidatesOptimizationStartTests(unittest.TestCase):
     def test_reused_ad_case_rejects_silent_physics_overrides_before_any_worker(self):
         with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit), patch.object(experiment.subprocess, "Popen") as start:
             experiment.main(["--ad-report", "not_read.json", "--t-final", "20"])
+        start.assert_not_called()
+
+    def test_saved_geometry_worker_observes_an_existing_root_without_rejecting_it(self):
+        from NEOPAX import optimization as opt, _orchestrator as orchestrator
+        from examples.optimization import optimize_profiles_er_root_candidate as pilot
+        case = actual_case_without_solver_import()
+        cli = experiment.parser().parse_args([])
+        cfg, settings, meta = experiment.prepare_case(cli, example=case, prepare_config=lambda c, **_: c)
+        meta.update(case_kind="saved_geometry_result", saved_geometry_result={"accepted_geometry_sha256": "saved"})
+        spec = SimpleNamespace(family="RBC", m=1, n=0)
+        def evaluate(**kwargs):
+            rho = (np.arange(51) + .5) / 51
+            kwargs["terminal_observer_check"](dict(Er=20*(.6-rho), rho=rho, final_time=2.))
+            return {"mock_ad": True}
+        bench = SimpleNamespace(_profile_cfg_scalar_value=lambda c, n: float(c.get(n, 1.)),
+            _benchmark_device_context=lambda _: nullcontext(),
+            _run_realtime_geometry_optimization_api_smoke=evaluate)
+        with tempfile.TemporaryDirectory() as directory, redirect_stdout(io.StringIO()), \
+             patch.object(experiment, "prepare_case", return_value=(cfg, settings, meta)), \
+             patch.object(opt, "build_geometry_autodiff_context", return_value="context"), \
+             patch.object(opt, "vmex_boundary_parameterization", return_value=SimpleNamespace(specs=(spec,))), \
+             patch.object(orchestrator, "build_runtime_context", return_value=(object(), object())), \
+             patch.object(pilot, "ad_arguments", return_value=SimpleNamespace()), \
+             patch.dict("sys.modules", {"benchmark_transport_reverse_ad_only": bench}):
+            experiment.run_ad(cli, Path(directory))
+            saved = json.loads((Path(directory) / "ad_summary.json").read_text())
+            self.assertTrue(saved["baseline_case_verified"])
+            self.assertFalse(saved["baseline_no_electron_region_verified"])
+            observation = json.loads((Path(directory) / "baseline_forward_observation.json").read_text())
+            self.assertAlmostEqual(observation["metrics"]["nearest_downcrossing"], .6)
+
+    def test_saved_geometry_override_cannot_be_combined_with_reused_ad(self):
+        with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit), patch.object(experiment.subprocess, "Popen") as start:
+            experiment.main(["--ad-report", "not_read.json", "--geometry-result-dir", "not_read"])
         start.assert_not_called()
 
 

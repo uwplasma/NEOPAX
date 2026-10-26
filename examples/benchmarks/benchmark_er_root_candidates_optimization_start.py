@@ -1,9 +1,9 @@
 """Compare new root losses from the usual full-transport optimization start.
 
 Uses the geometry-only example's effective configuration and unoptimized
-seed, shared by the combined example. Checks the terminal state has neither
-positive Er nor an actual downcrossing in the test annulus before reversing.
-An initial positive root near the excluded axis is not used as evidence.
+seed, or its saved optimized geometry. The original seed must have neither
+positive Er nor an actual downcrossing in the test annulus. Saved optimized
+geometry is observed without requiring the root to be absent.
 Physics runs only when this script is executed on the large machine.
 """
 
@@ -24,6 +24,39 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 
+def load_saved_geometry(directory):
+    """Read the exported accepted boundary, never reapply its scaled deltas."""
+    directory = Path(directory).resolve()
+    summary_path = directory / "geometry_phase_summary.json"
+    if not summary_path.is_file():
+        summary_path = directory / "optimization_summary.json"
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    labels = summary.get("geometry_phase", summary).get("parameter_labels", [])
+    if not labels or any(not label.startswith(("RBC:", "ZBS:")) for label in labels):
+        raise ValueError("The selected result must contain only geometry DOFs.")
+    recorded = summary.get("accepted_geometry_input")
+    if recorded is not None:
+        path = Path(recorded)
+        candidates = [path if path.is_absolute() else directory / path, directory / path.name]
+    else:
+        candidates = [directory / "input.QI_neopax_database_full_transport_net_power_optimized"]
+        modes = summary.get("max_mode_schedule", summary.get("geometry_max_mode_schedule", []))
+        if modes:
+            candidates.append(directory / f"input.QI_neopax_database_full_transport_net_power_stage_m{modes[-1]}")
+    accepted = next((path.resolve() for path in candidates if path.is_file()), None)
+    if accepted is None:
+        raise FileNotFoundError("The geometry result has no exported accepted VMEC input. "
+                                "The original seed must not be substituted for the optimized boundary.")
+    modes = summary.get("max_mode_schedule", summary.get("geometry_max_mode_schedule", []))
+    if not modes:
+        raise ValueError("The geometry result must record its max-mode schedule.")
+    metadata = dict(directory=str(directory), summary_path=str(summary_path),
+                    summary_sha256=hashlib.sha256(summary_path.read_bytes()).hexdigest(),
+                    accepted_geometry_input=str(accepted),
+                    accepted_geometry_sha256=hashlib.sha256(accepted.read_bytes()).hexdigest())
+    return summary, accepted, metadata
+
+
 def prepare_case(cli, *, example=None, prepare_config=None):
     """Resolve the real example defaults; never build a runtime here."""
     if example is None:
@@ -33,12 +66,33 @@ def prepare_case(cli, *, example=None, prepare_config=None):
     if prepare_config is None:
         from NEOPAX.optimization import _prepare_full_transport_config as prepare_config
     defaults = example.parser().parse_args([])
+    saved_summary, saved_metadata = None, None
+    if getattr(cli, "geometry_result_dir", None) is not None:
+        saved_summary, accepted, saved_metadata = load_saved_geometry(cli.geometry_result_dir)
+        defaults.seed_input = accepted
+        saved_config = saved_summary.get("config", {})
+        neo = saved_config.get("neoclassical", {})
+        grid = saved_summary.get("database_grid", [neo.get("ntx_scan_n_theta", defaults.database_n_theta),
+            neo.get("ntx_scan_n_zeta", defaults.database_n_phi), neo.get("ntx_scan_n_xi", defaults.database_n_xi)])
+        for name, value in zip(("database_n_theta", "database_n_phi", "database_n_xi"), grid, strict=True):
+            setattr(defaults, name, int(value))
+        defaults.transport_max_steps = int(saved_summary.get("transport_max_steps",
+            saved_config.get("transport_solver", {}).get("max_steps", defaults.transport_max_steps)))
+        defaults.max_reverse_accepted_steps = int(saved_summary.get("max_reverse_accepted_steps", defaults.max_reverse_accepted_steps))
     for name in ("seed_input", "database_n_theta", "database_n_phi", "database_n_xi",
                  "transport_max_steps", "max_reverse_accepted_steps"):
         value = getattr(cli, name, None)
         if value is not None:
             setattr(defaults, name, value)
-    cfg = prepare_config(example.transport_config(defaults), device=example.SOLVER_DEVICE)
+    base_config = (copy.deepcopy(saved_summary["config"]) if saved_summary is not None and saved_summary.get("config")
+                   else example.transport_config(defaults))
+    base_config.setdefault("neoclassical", {}).update(ntx_scan_n_theta=defaults.database_n_theta,
+        ntx_scan_n_zeta=defaults.database_n_phi, ntx_scan_n_xi=defaults.database_n_xi)
+    base_config.setdefault("transport_solver", {})["max_steps"] = defaults.transport_max_steps
+    base_config["transport_solver"]["radau_jacobian_reuse_mode"] = "legacy"
+    if saved_summary is not None and "transport_final_time" in saved_summary:
+        base_config["transport_solver"]["t_final"] = float(saved_summary["transport_final_time"])
+    cfg = prepare_config(base_config, device=example.SOLVER_DEVICE)
     cfg = copy.deepcopy(cfg)
     geom, neo = cfg.setdefault("geometry", {}), cfg.setdefault("neoclassical", {})
     geom["vmec_input_file"] = str(defaults.seed_input.resolve())
@@ -60,7 +114,8 @@ def prepare_case(cli, *, example=None, prepare_config=None):
                     inner_radius=float(defaults.er_transition_rho_min if cli.inner_radius is None else cli.inner_radius),
                     outer_radius=float(defaults.er_transition_rho_max),
                     profile_trust_multiplier=3.7, geometry_ess_alpha=float(example.ESS_ALPHA))
-    stage = int(example.max_mode_schedule_values()[0])
+    stage = (int(saved_summary.get("max_mode_schedule", saved_summary.get("geometry_max_mode_schedule"))[-1])
+             if saved_summary is not None else int(example.max_mode_schedule_values()[0]))
     metadata = dict(seed_input=str(defaults.seed_input.resolve()),
                     seed_sha256=hashlib.sha256(defaults.seed_input.read_bytes()).hexdigest(),
                     config_source=str(example.TRANSPORT_CONFIG),
@@ -70,6 +125,8 @@ def prepare_case(cli, *, example=None, prepare_config=None):
                     database_mesh=[defaults.database_n_theta, defaults.database_n_phi, defaults.database_n_xi],
                     max_mode=stage, mboz=int(example.QI_MBOZ), nboz=int(example.QI_NBOZ),
                     surfaces=[float(v) for v in example.SURFACES], families=example.GEOMETRY_FAMILIES)
+    if saved_metadata is not None:
+        metadata.update(case_kind="saved_geometry_result", saved_geometry_result=saved_metadata)
     return cfg, settings, metadata
 
 
@@ -129,8 +186,12 @@ def run_ad(cli, out):
             final_time=snapshot["final_time"], terminal_Er=snapshot["Er"].tolist(),
             terminal_rho=snapshot["rho"].tolist(), metrics=metrics))
         print("[optimization-start-baseline] " + json.dumps(metrics), flush=True)
-        check_no_electron_region(metrics, snapshot["final_time"], metadata["t_final"])
-        checked.append(True)
+        if metadata.get("case_kind") == "saved_geometry_result":
+            if not np.isclose(snapshot["final_time"], metadata["t_final"], rtol=0, atol=1e-10):
+                raise ValueError("Baseline transport did not reach the configured final time.")
+        else:
+            check_no_electron_region(metrics, snapshot["final_time"], metadata["t_final"])
+        checked.append(metrics)
 
     with benchmark._benchmark_device_context(cfg):
         runtime, state = build_runtime_context(cfg)
@@ -142,7 +203,9 @@ def run_ad(cli, out):
     if not checked:
         raise RuntimeError("The baseline terminal observer was not called; absence of an electron region is unverified.")
     result["optimization_start_case"] = metadata
-    result["baseline_no_electron_region_verified"] = True
+    result["baseline_case_verified"] = True
+    result["baseline_no_electron_region_verified"] = (
+        checked[-1]["nearest_downcrossing"] is None and checked[-1]["annular_max_Er"] <= 0)
     write_json(out / "ad_summary.json", result)
 
 
@@ -153,7 +216,9 @@ def parser():
     out.add_argument("--ad-report", type=Path, help="Reuse this experiment's saved AD result; do not recompute AD.")
     out.add_argument("--step-sizes", default="0.001")
     out.add_argument("--groups", default="profiles,geometry")
-    out.add_argument("--seed-input", type=Path)
+    source = out.add_mutually_exclusive_group()
+    source.add_argument("--seed-input", type=Path)
+    source.add_argument("--geometry-result-dir", type=Path, help="Use the exported geometry-only result and its saved settings.")
     out.add_argument("--t-final", type=float, help="Default is the optimization's t_final=2, not the old benchmark's 20.")
     out.add_argument("--inner-radius", type=float, help="Default is the optimization's root window lower bound, 0.05.")
     out.add_argument("--geometry-parameters", help="Optional harmonic subset; default matches the optimizer's first mode stage.")
@@ -167,7 +232,7 @@ def main(argv=None):
     command_parser = parser()
     cli = command_parser.parse_args(argv)
     override_names = ("seed_input", "database_n_theta", "database_n_phi", "database_n_xi", "t_final",
-                      "inner_radius", "geometry_parameters", "transport_max_steps", "max_reverse_accepted_steps")
+                      "inner_radius", "geometry_parameters", "transport_max_steps", "max_reverse_accepted_steps", "geometry_result_dir")
     if cli.ad_report is not None and any(getattr(cli, name) is not None for name in override_names):
         command_parser.error("Physics overrides cannot be combined with --ad-report; its saved configuration defines the case.")
     for name in ("database_n_theta", "database_n_phi", "database_n_xi", "t_final", "transport_max_steps", "max_reverse_accepted_steps"):
@@ -208,7 +273,8 @@ def main(argv=None):
     else:
         report_path = cli.ad_report.resolve()
     report = json.loads(report_path.read_text())
-    if not report.get("baseline_no_electron_region_verified"):
+    saved_geometry = report.get("optimization_start_case", {}).get("case_kind") == "saved_geometry_result"
+    if not report.get("baseline_no_electron_region_verified") and not (saved_geometry and report.get("baseline_case_verified")):
         raise SystemExit("The report has not verified the requested no-electron-root baseline.")
     for item in report["root_loss_audit"]["comparisons"]:
         print("[optimization-start-candidate] " + json.dumps(item), flush=True)

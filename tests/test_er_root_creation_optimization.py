@@ -75,6 +75,57 @@ class AnalyticEvaluator:
 
 
 class RootCreationOptimizationTests(unittest.TestCase):
+    def test_verified_saved_geometry_may_already_have_a_root(self):
+        seed = report([1., *BASE[1:]])
+        seed["optimization_start_case"].update(case_kind="saved_geometry_result")
+        seed.update(baseline_case_verified=True, baseline_no_electron_region_verified=False)
+        creation.validate_creation_seed(seed)
+        seed["baseline_case_verified"] = False
+        with self.assertRaises(ValueError):
+            creation.validate_creation_seed(seed)
+
+    def test_initial_crossing_is_not_counted_as_new_root_creation(self):
+        seed = report([1., *BASE[1:]])
+        state = pilot.optimize(seed, AnalyticEvaluator(), pilot.PilotOptions(allow_root_creation=True, max_iterations=1))
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            run = root / "annular_profiles"
+            run.mkdir()
+            pilot.save_outputs(run, state, "test")
+            rows = creation.save_comparison(root, "seed")
+            self.assertTrue(rows[0]["initial_has_downcrossing"])
+            self.assertFalse(rows[0]["downcrossing_created"])
+            self.assertAlmostEqual(rows[0]["initial_root"], .6)
+
+    def test_geometry_baseline_ad_is_prepared_once_and_rejects_changed_inputs(self):
+        from examples.benchmarks import benchmark_er_root_candidates_optimization_start as baseline
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            geometry, out = root / "geometry", root / "comparison"
+            geometry.mkdir()
+            boundary = geometry / "input.QI_neopax_database_full_transport_net_power_optimized"
+            boundary.write_text("accepted boundary")
+            (geometry / "optimization_summary.json").write_text(json.dumps(dict(
+                parameter_labels=["RBC:1:0"], max_mode_schedule=[2])))
+            def prepare(command, **kwargs):
+                _, _, source = baseline.load_saved_geometry(geometry)
+                saved = report()
+                saved["optimization_start_case"].update(case_kind="saved_geometry_result", saved_geometry_result=source)
+                path = out / "baseline" / "ad_summary.json"
+                path.parent.mkdir(parents=True)
+                path.write_text(json.dumps(saved))
+                self.assertIn("--ad-only", command)
+                self.assertIn("--geometry-result-dir", command)
+                return SimpleNamespace(returncode=0)
+            with patch.object(creation.subprocess, "run", side_effect=prepare) as start:
+                first = creation.geometry_result_ad_report(geometry, out)
+                self.assertEqual(first, creation.geometry_result_ad_report(geometry, out))
+                start.assert_called_once()
+                boundary.write_text("changed boundary")
+                with self.assertRaisesRegex(ValueError, "differs"):
+                    creation.geometry_result_ad_report(geometry, out)
+                start.assert_called_once()
+
     def test_root_free_seed_and_trials_are_allowed_explicitly(self):
         seed = report()
         with patch.object(pilot.descent, "source_digest", return_value="physics"):
