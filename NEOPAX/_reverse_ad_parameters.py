@@ -9,6 +9,7 @@ stable dialect.
 from __future__ import annotations
 
 import dataclasses
+import re
 from collections.abc import Mapping, Sequence
 from typing import Literal
 
@@ -38,7 +39,8 @@ class ProfileParameterSpec:
 
     def __post_init__(self) -> None:
         normalized = str(self.name).strip()
-        if normalized not in PROFILE_PARAMETER_ORDER:
+        base, species = split_profile_parameter_name(normalized)
+        if base not in PROFILE_PARAMETER_ORDER or (species is not None and not re.fullmatch(r"[A-Za-z0-9_]+", species)):
             allowed = ", ".join(PROFILE_PARAMETER_ORDER)
             raise ValueError(f"Unsupported profile parameter {self.name!r}; choices are: {allowed}.")
         object.__setattr__(self, "name", normalized)
@@ -50,6 +52,14 @@ class ProfileParameterSpec:
     @property
     def label(self) -> str:
         return self.name
+
+    @property
+    def base_name(self) -> str:
+        return split_profile_parameter_name(self.name)[0]
+
+    @property
+    def species(self) -> str | None:
+        return split_profile_parameter_name(self.name)[1]
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -239,6 +249,24 @@ def normalize_profile_parameter_name(name: str) -> str:
     return ProfileParameterSpec(name).name
 
 
+def split_profile_parameter_name(name: str) -> tuple[str, str | None]:
+    """Split a shared parameter or an explicit species label, e.g. T0[e]."""
+    match = re.fullmatch(r"([^\[\]]+)\[([^\[\]]+)\]", str(name))
+    return (match[1], match[2]) if match else (str(name), None)
+
+
+def configured_profile_parameter_order(config: Mapping | None) -> tuple[str, ...]:
+    """Opt-in packed species layout; the established shared layout is unchanged."""
+    raw = (config or {}).get("optimization", {}).get("species_profile_parameters")
+    if raw is None:
+        return PROFILE_PARAMETER_ORDER
+    specs = parse_profile_parameter_specs(raw)
+    labels = tuple(spec.name for spec in specs)
+    if not labels or len(set(labels)) != len(labels) or any(spec.species is None for spec in specs):
+        raise ValueError("species_profile_parameters must contain unique species-indexed profile labels.")
+    return labels
+
+
 def parse_profile_parameter_spec(text: str) -> ProfileParameterSpec:
     """Parse a profile parameter label."""
 
@@ -280,7 +308,7 @@ def parse_reverse_ad_parameter_spec(text: str) -> ReverseADParameterSpec:
     """Parse either a profile parameter or a VMEC boundary parameter."""
 
     raw = str(text).strip()
-    if raw in PROFILE_PARAMETER_ORDER:
+    if raw in PROFILE_PARAMETER_ORDER or "[" in raw:
         return parse_profile_parameter_spec(raw)
     return parse_vmec_boundary_parameter_spec(raw)
 

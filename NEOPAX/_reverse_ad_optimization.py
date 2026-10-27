@@ -23,6 +23,7 @@ from ._ambipolarity import AMBIPOLARITY_MODEL_REGISTRY, _ambipolarity_local_char
 from ._constants import elementary_charge
 from ._reverse_ad_parameters import (
     PROFILE_PARAMETER_ORDER,
+    configured_profile_parameter_order,
     ProfileParameterSpec,
     ReverseADParameterSet,
     VmecBoundaryParameterSpec,
@@ -819,6 +820,7 @@ def _database_initial_root_to_unfolded_support_bars(
     pre_root_state_from_profile_values: Callable[[object], object],
     objective_count: int,
     interpolation_transpose_mode: str = "established",
+    profile_parameter_order: Sequence[str] = PROFILE_PARAMETER_ORDER,
 ):
     """Map selected-root cotangents to unfurled database support bars.
 
@@ -852,7 +854,7 @@ def _database_initial_root_to_unfolded_support_bars(
     if profile_specs:
         _, profile_pullback = jax.vjp(pre_root_state_from_profile_values, profile_values_arr)
         all_profile_bars = jax.vmap(lambda bar: profile_pullback(bar)[0])(pre_root_state_bars)
-        canonical_profile_lookup = {name: i for i, name in enumerate(PROFILE_PARAMETER_ORDER)}
+        canonical_profile_lookup = {name: i for i, name in enumerate(profile_parameter_order)}
         profile_matrix = jnp.stack(
             [all_profile_bars[:, canonical_profile_lookup[spec.name]] for spec in profile_specs], axis=1
         )
@@ -1259,6 +1261,7 @@ def build_database_initial_root_experiment_stage(
                         "established",
                     )
                 ),
+                profile_parameter_order=configured_profile_parameter_order(config_static),
             )
 
         # Keep the outer selected-root profile un-jitted.  The reference

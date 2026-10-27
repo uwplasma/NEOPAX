@@ -382,6 +382,9 @@ def _build_state(config: dict, geometry, species: Species):
         profile_cfg["charge_qp"] = tuple(float(v) for v in jnp.asarray(species.charge_qp))
     profile_set = build_profiles(profile_cfg, geometry, species.number_species)
     density_state = profile_set.density / 1.0e20
+    if config.get("optimization", {}).get("species_profile_quasineutral", False):
+        from ._species_profile_parameters import quasineutral_initial_density
+        density_state = quasineutral_initial_density(density_state, config)
     temperature_state = profile_set.temperature / 1.0e3
     density_floor = float(
         config.get("transport_solver", {}).get(

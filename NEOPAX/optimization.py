@@ -81,6 +81,7 @@ from ._optimization_full_transport_stage import (
 )
 from ._reverse_ad_parameters import (
     PROFILE_PARAMETER_ORDER,
+    configured_profile_parameter_order,
     ProfileParameterSpec,
     VmexBoundaryParameterization,
     parse_profile_parameter_specs,
@@ -812,6 +813,7 @@ class ProfileFullTransportLeastSquaresProblem:
     run_grouped_report: object
     options: Mapping[str, object]
     table_result_builder: object | None = None
+    profile_coordinate_mode: str = "absolute"
 
     @property
     def parameter_count(self) -> int:
@@ -824,18 +826,18 @@ class ProfileFullTransportLeastSquaresProblem:
     @property
     def x0(self):
         values = []
-        profile_lookup = {name: i for i, name in enumerate(PROFILE_PARAMETER_ORDER)}
+        profile_lookup = {name: i for i, name in enumerate(configured_profile_parameter_order(self.config))}
         for spec in self.parameter_set.profile_specs:
             base_value = self.baseline_profile_values[profile_lookup[spec.name]]
             scale = self.profile_scales[profile_lookup[spec.name]]
-            values.append(base_value / scale)
+            values.append(0.0 if self.profile_coordinate_mode == "delta" else base_value / scale)
         return jnp.asarray(values, dtype=jnp.float64)
 
     @property
     def x_scale(self):
         profile_scale_lookup = {
             name: self.profile_scales[i]
-            for i, name in enumerate(PROFILE_PARAMETER_ORDER)
+            for i, name in enumerate(configured_profile_parameter_order(self.config))
         }
         return jnp.asarray(
             [profile_scale_lookup[spec.name] for spec in self.parameter_set.profile_specs],
@@ -849,7 +851,12 @@ class ProfileFullTransportLeastSquaresProblem:
                 "scaled_parameter_values must have shape "
                 f"({self.parameter_count},); got {tuple(scaled_values.shape)}."
             )
-        return scaled_values * self.x_scale
+        physical = scaled_values * self.x_scale
+        if self.profile_coordinate_mode == "delta":
+            lookup = {name: i for i, name in enumerate(configured_profile_parameter_order(self.config))}
+            physical = physical + jnp.asarray([self.baseline_profile_values[lookup[spec.name]]
+                                               for spec in self.parameter_set.profile_specs])
+        return physical
 
     def evaluate(self, scaled_parameter_values=None) -> LeastSquaresEvaluation:
         scaled_values = self.x0 if scaled_parameter_values is None else scaled_parameter_values
@@ -909,8 +916,14 @@ class ProfileFullTransportLeastSquaresProblem:
         physical_values = self._scaled_to_physical(self.x0 if scaled_parameter_values is None else scaled_parameter_values)
         config_eff = copy.deepcopy(self.config)
         profiles = config_eff.setdefault("profiles", {})
-        for spec, value in zip(self.parameter_set.profile_specs, physical_values, strict=True):
-            profiles[spec.name] = float(np.asarray(jax.device_get(value)))
+        if configured_profile_parameter_order(self.config) != PROFILE_PARAMETER_ORDER:
+            from ._species_profile_parameters import species_profile_config
+            profiles = species_profile_config(physical_values, config=self.config, profile_cfg=profiles)
+            config_eff["profiles"] = {name: (np.asarray(jax.device_get(value)).tolist()
+                if isinstance(value, (jax.Array, np.ndarray)) else value) for name, value in profiles.items()}
+        else:
+            for spec, value in zip(self.parameter_set.profile_specs, physical_values, strict=True):
+                profiles[spec.name] = float(np.asarray(jax.device_get(value)))
         return config_eff
 
     def final_transport_profiles_from_scaled_parameters(self, scaled_parameter_values=None):
@@ -1645,6 +1658,9 @@ def _prepare_initial_root_payload_static(
 
 
 def _profile_values_from_config(config: dict, dtype) -> jnp.ndarray:
+    if configured_profile_parameter_order(config) != PROFILE_PARAMETER_ORDER:
+        from ._species_profile_parameters import species_profile_values
+        return jnp.asarray(species_profile_values(config), dtype=dtype)
     profiles = config.get("profiles", {})
     defaults = {
         "n0": 4.21,
@@ -2249,6 +2265,8 @@ def full_transport_profile_least_squares_problem(
     print_final_softmax_er: bool = False,
     max_reverse_accepted_steps: int | None = None,
     reverse_stage_mode: str = "benchmark",
+    profile_coordinate_mode: str = "absolute",
+    terminal_state_observer: object | None = None,
 ) -> ProfileFullTransportLeastSquaresProblem:
     """Build a profile-only optimizer problem for full Radau transport objectives."""
 
@@ -2270,6 +2288,15 @@ def full_transport_profile_least_squares_problem(
         raise ValueError("er_transition_softmax_beta must be positive.")
 
     config_eff = _prepare_full_transport_config(config, device=device)
+    if profile_coordinate_mode not in {"absolute", "delta"}:
+        raise ValueError("profile_coordinate_mode must be 'absolute' or 'delta'.")
+    profile_order = configured_profile_parameter_order(config_eff)
+    if profile_order != PROFILE_PARAMETER_ORDER:
+        if reverse_stage_mode != "database_full_transport_optimization":
+            raise ValueError("Species profile DOFs require database_full_transport_optimization.")
+        selected = tuple(spec.name for spec in parse_profile_parameter_specs(profile_parameters))
+        if selected != profile_order:
+            raise ValueError("Species profile_parameters must match the configured species layout in order.")
     solver_cfg = config_eff.setdefault("transport_solver", {})
     solver_cfg["radau_jacobian_reuse_mode"] = str(radau_jacobian_reuse_mode)
     runtime, baseline_state = build_runtime_context(config_eff)
@@ -2427,7 +2454,7 @@ def full_transport_profile_least_squares_problem(
         )
         database_root_parameter_set = reverse_ad_optimization_parameter_set(
             include_profiles=True,
-            profiles=PROFILE_PARAMETER_ORDER,
+            profiles=profile_order,
             vmec_boundary=(),
         )
         database_root_stage = build_database_initial_root_experiment_stage(
@@ -2547,6 +2574,7 @@ def full_transport_profile_least_squares_problem(
                 ),
                 initial_root_optimization_stage=database_root_stage,
                 objective_labels=reverse_objective_labels,
+                terminal_state_observer=terminal_state_observer,
             )
         )
     else:
@@ -2588,6 +2616,7 @@ def full_transport_profile_least_squares_problem(
         run_grouped_report=run_grouped_report,
         options=options,
         table_result_builder=table_result_builder,
+        profile_coordinate_mode=profile_coordinate_mode,
     )
 
 

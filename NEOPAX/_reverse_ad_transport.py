@@ -59,6 +59,7 @@ from ._reverse_ad_initial_er import (
 )
 from ._reverse_ad_parameters import (
     PROFILE_PARAMETER_ORDER,
+    configured_profile_parameter_order,
     ReverseADParameterSet,
     discover_vmec_boundary_parameter_specs,
     normalize_vmec_boundary_families,
@@ -1209,7 +1210,12 @@ def initial_state_for_parameter_vector_compact(
     """
     cfg = dict(profile_cfg)
     values_arr = jnp.asarray(parameter_values)
-    if int(values_arr.shape[0]) == len(PROFILE_PARAMETER_ORDER):
+    species_order = configured_profile_parameter_order(config)
+    if species_order != PROFILE_PARAMETER_ORDER:
+        from ._species_profile_parameters import species_profile_config
+        cfg = species_profile_config(values_arr, config=config, profile_cfg=cfg)
+        parameter_order = ()
+    elif int(values_arr.shape[0]) == len(PROFILE_PARAMETER_ORDER):
         parameter_order = PROFILE_PARAMETER_ORDER
     else:
         parameter_order = TRANSPORT_REVERSE_PROFILE_PARAMETER_ORDER
@@ -1223,6 +1229,9 @@ def initial_state_for_parameter_vector_compact(
         parameter_value=cfg[TRANSPORT_REVERSE_PROFILE_PARAMETER_ORDER[0]],
     )
     density_state = jnp.asarray(profile_set.density, dtype=baseline_state.density.dtype) / 1.0e20
+    if species_order != PROFILE_PARAMETER_ORDER and config.get("optimization", {}).get("species_profile_quasineutral", False):
+        from ._species_profile_parameters import quasineutral_initial_density
+        density_state = quasineutral_initial_density(density_state, config)
     temperature_state = jnp.asarray(profile_set.temperature, dtype=baseline_state.pressure.dtype) / 1.0e3
     solver_cfg = {} if config is None else dict(config.get("transport_solver", {}))
     fallback_solver_cfg = {} if config is None else dict(config.get("solver", {}))
@@ -8888,8 +8897,10 @@ def internal_realtime_geometry_transport_reverse_table_result_builder(
 
     if not isinstance(table_context, RealtimeGeometryTransportReverseTableContext):
         raise TypeError("table_context must be a RealtimeGeometryTransportReverseTableContext.")
+    species_profile_order = configured_profile_parameter_order(table_context.config)
     baseline_profile_values = jnp.asarray(
-        table_context.baseline_values[: len(TRANSPORT_REVERSE_PROFILE_PARAMETER_ORDER)]
+        table_context.baseline_values if species_profile_order != PROFILE_PARAMETER_ORDER
+        else table_context.baseline_values[: len(TRANSPORT_REVERSE_PROFILE_PARAMETER_ORDER)]
     )
 
     configured_objective_labels = tuple(str(name) for name in objective_labels)
@@ -9573,7 +9584,11 @@ def internal_realtime_geometry_transport_reverse_table_result_builder(
             all_profile_gradient_matrix = jnp.asarray(
                 support_result.profile_gradient_matrix
             )
-            if int(all_profile_gradient_matrix.shape[1]) == len(
+            if species_profile_order != PROFILE_PARAMETER_ORDER:
+                if int(all_profile_gradient_matrix.shape[1]) != len(species_profile_order):
+                    raise ValueError("Species profile reverse table has the wrong column count.")
+                all_profile_parameter_labels = species_profile_order
+            elif int(all_profile_gradient_matrix.shape[1]) == len(
                 PROFILE_PARAMETER_ORDER
             ):
                 all_profile_parameter_labels = PROFILE_PARAMETER_ORDER
