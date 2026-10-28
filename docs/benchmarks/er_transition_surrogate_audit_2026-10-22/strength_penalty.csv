@@ -1,0 +1,2 @@
+strength,threshold,raw_parameter_derivative,deficit,d_deficit_d_strength,weighted_residual,d_weighted_residual_d_parameter,weighted_cost,d_weighted_cost_d_parameter
+2.014962243319004,0.9,0.47338579231761335,2.2426505097428162e-13,-2.0114465648646274e-13,2.2426505097428162e-12,-9.521902258129834e-13,2.5147406544248567e-24,-2.135429895291614e-24

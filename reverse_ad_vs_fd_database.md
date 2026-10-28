@@ -1,5 +1,30 @@
 # Database reverse AD versus FD status
 
+## 2026-10-22 Full-time AD with Er-left/right restored
+
+The [new full-time rerun](docs/benchmarks/database_transition_objectives_ad_recorded_reuse_full_t20_left_right_2026-10-22.md)
+reports all 20 residuals and 160 derivatives finite, using recorded-forward
+accepted replay. Its [complete matrix](docs/benchmarks/database_transition_objectives_ad_recorded_reuse_full_t20_left_right_2026-10-22.csv)
+and [144 common old/new derivative comparisons](docs/benchmarks/database_transition_objectives_ad_recorded_reuse_full_t20_left_right_2026-10-22_vs_previous_ad.csv)
+are archived alongside the original supplied output.
+
+All 18 common residual values and 108 common profile derivatives match the
+2026-10-19 reference exactly at printed precision. Common geometry derivative
+differences have maximum absolute error 7.974449545145035e-8 and maximum
+relative error 7.716718064310421e-10. These are old/new AD differences, not
+AD/FD errors.
+
+Er-left and Er-right are 39.311269029818902 and 39.894759548722909 kV/m at
+fixed indices 20 and 21. Both values are positive; they do not bracket the
+transition. Their amplitude sensitivities are much larger than the smooth
+position sensitivities at this state. Transition radius, location moment
+and strength remain 0.51703593282774429, 0.017035932827744293 and
+2.0149622433190042, respectively.
+
+The new excerpt does not include accepted-step counts, segment endpoint
+checks, peak RSS or exit status. The earlier run's measurements below are
+not new-run observations. Full-time FD validation remains unresolved.
+
 ## 2026-10-19 Full-time recorded-forward AD reference
 
 The 20-second benchmark now completes with 290 accepted steps, six reverse

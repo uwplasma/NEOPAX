@@ -151,6 +151,57 @@ class SavedRootProfileAnalysisTests(unittest.TestCase):
                 self.assertEqual(len(list(csv.DictReader(stream))), 8)
             self.assertTrue((out / "crossing_cells.csv").exists())
             self.assertTrue((out / "crossing_summary.csv").exists())
+            with (out / "initial_state_summary.csv").open() as stream:
+                initial_rows = list(csv.DictReader(stream))
+            self.assertEqual(len(initial_rows), 3)
+            self.assertEqual(initial_rows[-1]["initial_Er_max_abs_change"], "3.0")
+
+    def test_optimizer_packet_cache_supplies_shared_initial_state_and_solver_counts(self):
+        seed = report()
+        with tempfile.TemporaryDirectory() as directory:
+            folder = Path(directory)
+            run, cache = folder / "geometry", folder / "profiles"
+            run.mkdir()
+            cache.mkdir()
+            task = dict(parameter_values=[2., 1., 0.], resolved_config={},
+                        profile_contract="ad_initial_profiles_fixed_config_selected_root")
+            digest = hashlib.sha256(json.dumps(task, sort_keys=True, allow_nan=False).encode()).hexdigest()
+            initial = point(q=.58)["Er"]
+            baseline = dict(parameter_values=task["parameter_values"],
+                terminal_Er=seed["root_loss_audit"]["terminal_Er"], terminal_rho=RHO.tolist(),
+                initial_state=dict(Er=initial, density=[[1., 2.]], pressure=[[3., 4.]]),
+                runtime_initial_Er=initial, accepted_steps=10, attempts=15, final_time=20., task_digest=digest)
+            packet = dict(kind="forward", forward_task=task, seed_report=seed)
+            (cache / "evaluation_0001_forward_task.json").write_text(json.dumps(packet))
+            (cache / "evaluation_0001_forward.json").write_text(json.dumps(baseline))
+            # A cached AD packet is not an independent forward endpoint.
+            (cache / "evaluation_0002_ad_task.json").write_text(json.dumps({**packet, "kind": "ad"}))
+            (cache / "evaluation_0002_ad.json").write_text(json.dumps(seed))
+            trial = dict(baseline, parameter_values=[2., 1., .001],
+                terminal_Er=point(q=.35)["Er"], accepted_steps=12, attempts=20,
+                initial_state=dict(Er=point(q=.5799)["Er"], density=[[1., 2.]], pressure=[[3., 4.]]))
+            (run / "evaluation_0003_forward.json").write_text(json.dumps(trial))
+            (run / "events.jsonl").write_text(json.dumps(dict(event="rejected", iteration=1, step=.001,
+                parameters=trial["parameter_values"])))
+            saved = analysis.load_points(seed, run, cache)
+            a, b = saved["points"]
+            self.assertAlmostEqual(a["initial_crossing"]["root"], .58)
+            self.assertAlmostEqual(b["initial_crossing"]["root"], .5799)
+            self.assertNotEqual(a["crossing"]["bracket"], b["crossing"]["bracket"])
+            self.assertEqual(b["initial_state_change_from_baseline"]["density"]["max_abs_change"], 0.)
+            self.assertEqual(b["initial_state_change_from_baseline"]["pressure"]["max_abs_change"], 0.)
+            self.assertGreater(b["initial_state_change_from_baseline"]["Er"]["max_abs_change"], 0.)
+            self.assertEqual(b["initial_Er_annular_sign_change_indices"], [])
+            self.assertEqual(a["solver"], dict(accepted_steps=10, attempts=15, final_time=20.))
+            self.assertEqual(b["solver"]["attempts"], 20)
+            self.assertEqual(a["forward_AD_max_abs_difference"], 0.)
+            self.assertEqual(a["selected_minus_runtime_initial_Er_max_abs"], 0.)
+            out = folder / "analysis"
+            analysis.write_outputs(saved, out)
+            with (out / "initial_state_summary.csv").open() as stream:
+                rows = list(csv.DictReader(stream))
+            self.assertEqual(rows[1]["initial_density_max_abs_change"], "0.0")
+            self.assertEqual(rows[1]["attempts"], "20")
 
     def test_reader_has_no_solver_or_jax_imports(self):
         module = ast.parse(Path(analysis.__file__).read_text())

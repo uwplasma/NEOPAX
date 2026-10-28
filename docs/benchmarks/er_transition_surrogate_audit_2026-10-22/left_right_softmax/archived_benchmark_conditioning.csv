@@ -1,0 +1,4 @@
+parameter_group,mode,parameters,column_scales,row_cosine,largest_singular_value,smallest_singular_value,condition_number,benchmark_left_index,benchmark_right_index
+profiles,identity,n0|T0|density_shape_power|temperature_shape_power|density_shape_alpha|temperature_shape_alpha,1.0|1.0|1.0|1.0|1.0|1.0,0.9999967072949113,8.885829674455946,0.011389256997894132,780.1939736805423,20,21
+profiles,nominal,n0|T0|density_shape_power|temperature_shape_power|density_shape_alpha|temperature_shape_alpha,4.21|17.8|10.0|2.0|1.0|1.0,0.9999985738393433,37.386111957433506,0.03153674201613122,1185.477939931471,20,21
+benchmark_geometry,identity,vmec:RBC:1:0|vmec:ZBS:1:0,1.0|1.0,0.9977326595868123,40.31539851384062,1.3579681291303571,29.688029968463695,20,21

@@ -1,0 +1,2 @@
+left_target,peak_target,left_weight,peak_weight,simultaneous_zero_possible,joint_cost_lower_bound,shared_peak_at_bound
+26.0,25.0,0.09,0.5,False,0.038135593220338986,25.152542372881356

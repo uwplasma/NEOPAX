@@ -20,6 +20,7 @@ from examples.optimization import (
     optimize_geometry_qi_max_er_transition_bootstrap_net_power_initial_root_database_full_transport
     as geometry,
 )
+from examples.benchmarks import audit_er_transition_surrogate_objectives as surrogate_audit
 
 
 TARGET = 0.514
@@ -89,6 +90,79 @@ def _numpy_bootstrap(upar, charge):
 
 
 class RootBootstrapDerivativeTests(unittest.TestCase):
+    def test_surrogate_does_not_reproduce_fixed_cell_amplitude_targets(self):
+        rows = surrogate_audit.amplitude_probe()
+        np.testing.assert_allclose([row["location"] for row in rows], 0.5 + 0.02 * 26 / 36, atol=1e-14)
+        np.testing.assert_allclose([row["strength"] for row in rows], [2.5, 5.0, 7.5, 10.0], atol=1e-12)
+        at_one_and_a_half = rows[2]
+        self.assertAlmostEqual(at_one_and_a_half["fixed_cell_cost"], 8.73, places=12)
+        self.assertAlmostEqual(at_one_and_a_half["d_fixed_cell_cost_d_amplitude"], 34.92, places=12)
+        self.assertLess(abs(at_one_and_a_half["d_location_d_amplitude"]), 1e-12)
+        self.assertLess(abs(at_one_and_a_half["d_surrogate_cost_d_amplitude"]), 1e-12)
+        # Independent chord derivatives show that the small amplitude response
+        # coexists with nonzero local cotangents on both Er cells.
+        er = jnp.asarray([26.0, -10.0], dtype=jnp.float64)
+        rho = jnp.asarray([0.5, 0.52], dtype=jnp.float64)
+        bars = jax.grad(lambda value: surrogate_audit.metrics(value, rho)[0])(er)
+        np.testing.assert_allclose(bars, [0.02 * 10 / 36**2, 0.02 * 26 / 36**2], rtol=1e-12)
+
+    def test_strength_penalty_has_negligible_gradient_after_margin_is_satisfied(self):
+        satisfied = surrogate_audit.strength_penalty_probe(2.0149622433190042, 0.47338579231761335)
+        self.assertLess(abs(satisfied["d_deficit_d_strength"]), 3e-13)
+        self.assertLess(abs(satisfied["d_weighted_residual_d_parameter"]), 2e-12)
+        self.assertLess(abs(satisfied["d_weighted_cost_d_parameter"]), 3e-24)
+        unsatisfied = surrogate_audit.strength_penalty_probe(0.2, 0.47338579231761335)
+        self.assertGreater(abs(unsatisfied["d_deficit_d_strength"]), 0.99)
+        self.assertGreater(abs(unsatisfied["d_weighted_residual_d_parameter"]), 4.0)
+
+    def test_sharp_face_selection_can_suppress_switching_sensitivity(self):
+        rows = surrogate_audit.selection_probe()
+        broad, sharp = rows[1], rows[-1]
+        self.assertLess(abs(sharp["location"] - 0.46), 1e-7)
+        self.assertGreater(abs(broad["d_location_d_inner_bracket_amplitude"]), 1e-2)
+        self.assertLess(
+            abs(sharp["d_location_d_inner_bracket_amplitude"]),
+            1e-3 * abs(broad["d_location_d_inner_bracket_amplitude"]),
+        )
+
+    def test_surrogate_tracks_resolved_motion_but_grid_locks_a_sharp_crossing(self):
+        # This tests actual crossing displacement, not amplitude invariance.
+        rows = surrogate_audit.translation_probe()
+        for row in rows:
+            with self.subTest(width=row["width"]):
+                self.assertAlmostEqual(row["selected_root"], row["true_root"], places=12)
+                np.testing.assert_allclose(
+                    row["d_selected_root_d_q"], row["analytical_chord_tracking_factor"],
+                    rtol=1e-7, atol=1e-12,
+                )
+                np.testing.assert_allclose(
+                    row["chain_rule_er_bar_dot_direction"], row["d_selected_root_d_q"],
+                    rtol=1e-7, atol=1e-12,
+                )
+        self.assertGreater(rows[0]["d_selected_root_d_q"], 0.95)
+        self.assertLess(rows[-1]["d_selected_root_d_q"], 1e-6)
+        self.assertLess(
+            abs(rows[-1]["d_surrogate_cost_d_q"]),
+            1e-6 * abs(rows[-1]["d_true_position_cost_d_q"]),
+        )
+
+    def test_existing_root_can_starve_a_direction_that_builds_the_desired_crossing(self):
+        rows = surrogate_audit.target_region_probe()
+        before, after = rows[0], rows[-1]
+        self.assertGreater(before["selected_root"], 0.64)
+        self.assertGreater(before["strength"], 0.9)
+        self.assertLess(abs(before["d_surrogate_cost_d_p"]), 1e-15)
+        self.assertLess(before["d_target_sign_margin_cost_d_p"], -10.0)
+        self.assertGreater(before["surrogate_cost"], 100 * after["surrogate_cost"])
+        self.assertLess(abs(after["selected_root"] - 0.514), 0.01)
+        near_target = next(row for row in rows if row["p"] == 14.0)
+        self.assertTrue(near_target["target_bracket_exists"])
+        self.assertLess(abs(near_target["target_bracket_root"] - 0.514), 1e-4)
+        self.assertGreater(near_target["target_bracket_margin"], 0.9)
+        self.assertGreater(near_target["selected_root"], 0.64)
+        # The local sign proxy has no prescribed 26/-10 amplitude targets.
+        self.assertLess(after["target_sign_margin_cost"], 1e-20)
+
     def test_initial_root_transition_values_and_vjp_against_numpy_fd(self):
         # Exercise the root-only dispatcher, including direct rho-grid bars.
         # These numerical checks do not call an ambipolar or transport solver.

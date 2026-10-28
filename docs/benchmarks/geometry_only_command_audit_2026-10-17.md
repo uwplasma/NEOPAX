@@ -230,3 +230,32 @@ PY
 Those remote summaries have not been supplied or read here. Do not claim
 their coordinates agree, or that the report-mode fix resolves the original
 command comparison, without that evidence.
+
+## Step-budget options added on 2026-10-18
+
+The single-stage combined runner inherits two new positive-integer options
+from the geometry CLI:
+
+- `--max-reverse-accepted-steps`: reverse trajectory guard, default 500.
+- `--transport-max-steps` (alias `--max-steps`): total adaptive attempted-step
+  budget for the trajectory being differentiated, default 1000. It includes
+  accepted and rejected attempts; rejected steps are not differentiated.
+
+Increasing only the reverse cap can still leave a run constrained by the
+total attempted-step budget. Set both when allowing a longer trajectory:
+
+```bash
+python examples/optimization/optimize_geometry_profiles_qi_max_er_transition_bootstrap_net_power_initial_root_database_full_transport_simple_least_squares.py \
+  --seed-input examples/inputs/input.QI_nfp2_initial \
+  --out-dir outputs/combined_from_usual_initial_steps_2000 \
+  --max-reverse-accepted-steps 1000 \
+  --transport-max-steps 2000 \
+  --no-diagnose-optimization
+```
+
+The two limits are independent of the 30-evaluation optimizer budget, physical
+`t_final=2`, and checkpoint segment length 50. Setup and summary output record
+the requested limits. Warm-start and saved-geometry runners also inherit the
+options; saved configurations retain their recorded total budget unless
+explicitly overridden. Configuration and mocked-runner verification passes
+36 tests and two subtests; no expensive physics was run locally.

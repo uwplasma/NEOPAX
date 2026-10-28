@@ -1,0 +1,7 @@
+﻿"phase","evaluation","rss_MiB","live_jax_arrays","device_bytes_in_use","device_peak_bytes_in_use","cache_runtime_scan","cache_segment_replay","cache_segment_bwd","cache_schedule_probe","cache_bootstrap"
+"species_profiles_from_saved_geometry","4","9488.2","561","45871616","5257060352","0","1","1","1","1"
+"species_profiles_from_saved_geometry","5","9490.8","577","45874176","5257060352","0","1","1","1","1"
+"species_profiles_from_saved_geometry","6","9492.8","577","45874176","5257060352","0","1","1","1","1"
+"species_profiles_from_saved_geometry","7","9494.9","577","45874432","5257060352","0","1","1","1","1"
+"species_profiles_from_saved_geometry","8","9497.2","577","45874432","5257060352","0","1","1","1","1"
+"species_profiles_from_saved_geometry","9","9499.2","577","45874432","5257060352","0","1","1","1","1"

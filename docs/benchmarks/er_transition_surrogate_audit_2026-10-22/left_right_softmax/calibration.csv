@@ -1,0 +1,10 @@
+candidate,factor
+current,1.0
+capped_selector,1.0
+local_margins,1.0442016727540493
+target_zero_local,0.428589319991947
+target_zero_regional,0.6134448864530113
+Er_left_target,0.7888164111974489
+Er_right_target,0.504842503171255
+Er_left_right_targets,0.30783079461545587
+softmax_Er_target,0.1663006845592301

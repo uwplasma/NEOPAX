@@ -15,6 +15,39 @@ import re
 import numpy as np
 
 
+def file_provenance(path, recorded_sha256=None):
+    path = Path(path)
+    available = path.is_file()
+    digest = hashlib.sha256(path.read_bytes()).hexdigest() if available else None
+    return dict(path=str(path), available=available, current_sha256=digest,
+                recorded_sha256=recorded_sha256,
+                matches_recorded=(bool(available and digest == recorded_sha256)
+                                  if recorded_sha256 is not None else None))
+
+
+def source_provenance(manifest, directory):
+    """Compare recorded files with current files; hashes describe bytes only."""
+    source = manifest.get("saved_geometry_result", {})
+    seed = file_provenance(manifest["resolved_config"]["geometry"]["vmec_input_file"],
+                           manifest.get("seed_sha256"))
+    files = dict(baseline_input=seed)
+    for key, hash_key in (("accepted_geometry_input", "accepted_geometry_sha256"),
+                          ("summary_path", "summary_sha256")):
+        if source.get(key):
+            files[key] = file_provenance(source[key], source.get(hash_key))
+    transport_input = file_provenance(Path(directory) /
+        "optimized/transport/input.QI_neopax_geometry_full_transport_optimized")
+    transport_input["matches_current_baseline_input_bytes"] = (
+        bool(transport_input["current_sha256"] == seed["current_sha256"])
+        if transport_input["available"] and seed["available"] else None)
+    files["saved_transport_input"] = transport_input
+    checks = [item["matches_recorded"] for item in files.values()
+              if item["recorded_sha256"] is not None]
+    return dict(files=files, all_recorded_sources_unchanged=all(checks) if checks else None,
+                note="Different byte hashes can reflect formatting or numerical changes. "
+                     "The historical baseline input cannot be reconstructed from its hash.")
+
+
 def field_summary(er, rho, settings):
     er, rho = np.asarray(er, dtype=float), np.asarray(rho, dtype=float)
     if (er.ndim != 1 or er.shape != rho.shape or len(er) < 3 or not np.isfinite(er).all()
@@ -102,7 +135,8 @@ def main(argv=None):
     args = parser.parse_args(argv)
     manifest = json.loads((args.baseline_dir / "case_manifest.json").read_text())
     snapshot = json.loads((args.baseline_dir / "baseline_forward_observation.json").read_text())
-    summary = dict(runtime_resolution=runtime_resolution(manifest),
+    summary = dict(source_provenance=source_provenance(manifest, args.geometry_result_dir),
+                   runtime_resolution=runtime_resolution(manifest),
                    terminal_comparison=compare_saved_transport(args.geometry_result_dir, snapshot, manifest["settings"]),
                    note="Reads existing files only. A mismatch does not identify which solver, initializer or runtime change caused it.")
     text = json.dumps(summary, indent=2, allow_nan=False)

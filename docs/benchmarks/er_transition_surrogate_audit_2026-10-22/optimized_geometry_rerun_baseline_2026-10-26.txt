@@ -1,0 +1,43 @@
+examples/optimization/optimize_er_root_candidates.py \
+  --geometry-result-dir outputs/geometry_qi_max_er_transition_bootstrap_net_power_initial_root_database_full_transport_optimization \
+  --out-dir "$neopax_root_case" \
+  --candidates local,annular \
+  --groups profiles,geometry \
+  --max-iterations 10 \
+  --initial-step 0.001 \
+  --max-step 0.05 \
+  --growth-factor 2 \
+  2>&1 | tee "$neopax_root_case/run.log"
+From https://github.com/uwplasma/NEOPAX
+ * branch            en/v0_new  -> FETCH_HEAD
+Already up to date.
+[optimization-start-case] baseline/AD log=/home/exouser/NEOPAX/outputs/new_root_candidates/optimized_geometry_rerun_20261026/baseline/ad.log
+[optimization-start-case] {"seed_input": "/home/exouser/NEOPAX/outputs/geometry_qi_max_er_transition_bootstrap_net_power_initial_root_database_full_transport_optimization/input.QI_neopax_database_full_transport_net_power_optimized", "seed_sha256": "189dc88618cac19e9ec9bf91c312c27ef989f5e14951359d9ccb9ad618db3bf9", "config_source": "/home/exouser/NEOPAX/examples/optimization/full_transport_database_vacuum_t2.toml", "t_final": 2.0, "transport_max_steps": 1000, "max_reverse_accepted_steps": 500, "database_mesh": [25, 25, 33], "max_mode": 2, "mboz": 18, "nboz": 18, "surfaces": [0.0196078431372549, 0.09803921568627451, 0.19607843137254902, 0.29411764705882354, 0.39215686274509803, 0.49019607843137253, 0.5882352941176471, 0.6862745098039216, 0.7843137254901961, 0.8823529411764706, 1.0], "families": "RBC,ZBS", "case_kind": "saved_geometry_result", "saved_geometry_result": {"directory": "/home/exouser/NEOPAX/outputs/geometry_qi_max_er_transition_bootstrap_net_power_initial_root_database_full_transport_optimization", "summary_path": "/home/exouser/NEOPAX/outputs/geometry_qi_max_er_transition_bootstrap_net_power_initial_root_database_full_transport_optimization/optimization_summary.json", "summary_sha256": "e358b1a9f7ff630516e5b60d529cf3c987f526cb5294939b0b9a04c8b671f4da", "accepted_geometry_input": "/home/exouser/NEOPAX/outputs/geometry_qi_max_er_transition_bootstrap_net_power_initial_root_database_full_transport_optimization/input.QI_neopax_database_full_transport_net_power_optimized", "accepted_geometry_sha256": "189dc88618cac19e9ec9bf91c312c27ef989f5e14951359d9ccb9ad618db3bf9"}, "saved_geometry_runtime_contract": "optimization_boozer_resolution_v1", "profile_parameters": {"n0": 4.21, "T0": 17.8, "density_shape_power": 10.0, "temperature_shape_power": 2.0, "density_shape_alpha": 1.0, "temperature_shape_alpha": 1.0}, "geometry_parameters": ["vmec:RBC:0:1", "vmec:RBC:0:2", "vmec:RBC:1:-2", "vmec:RBC:1:-1", "vmec:RBC:1:0", "vmec:RBC:1:1", "vmec:RBC:1:2", "vmec:RBC:2:-2", "vmec:RBC:2:-1", "vmec:RBC:2:0", "vmec:RBC:2:1", "vmec:RBC:2:2", "vmec:ZBS:0:1", "vmec:ZBS:0:2", "vmec:ZBS:1:-2", "vmec:ZBS:1:-1", "vmec:ZBS:1:0", "vmec:ZBS:1:1", "vmec:ZBS:1:2", "vmec:ZBS:2:-2", "vmec:ZBS:2:-1", "vmec:ZBS:2:0", "vmec:ZBS:2:1", "vmec:ZBS:2:2"], "settings": {"target": 0.514, "inner_radius": 0.05, "outer_radius": 0.9, "profile_trust_multiplier": 3.7, "geometry_ess_alpha": 1.2}}
+[NEOPAX] built runtime NTX scan database: rho=7 nu_v=16 Er_tilde=11 grid=(25,25,33) backend=vmec
+[autodiff-gate] progress: running realtime geometry optimization API smoke
+[autodiff-gate] progress: full-transport reverse stage-adjoint replay_jacobian_reuse_mode=recorded_forward solve mode=block rhs_pullback_mode=separate initial_cache_support_pullback_mode=scalar rebuild_support_pullback_mode=separate database_initial_support_mode=reduced_zero database_initial_state_mode=reduced_zero_rhs database_support_preparation_mode=shared database_center_geometry_mode=scalar_jvp database_stage_jacobian_mode=independent database_support_objective_mode=scalar database_segment_support_mode=inline database_interpolation_transpose_mode=legacy_sparse database_root_interpolation_transpose_mode=legacy_sparse database_bootstrap_interpolation_transpose_mode=legacy_sparse segment_jit_diagnostics=False segment_input_diagnostics=False segment_start_replay_mode=minimal segment_primal_record_mode=reuse_segment_primal_record step_bwd_mode=reduced_cotangent_call_boundary
+E1026 08:47:19.296813  111590 slow_operation_alarm.cc:73] 
+********************************
+[Compiling module jit_scan for GPU] Very slow compile? If you want to file a bug, run with envvar XLA_FLAGS=--xla_dump_to=/tmp/foo and attach the results.
+********************************
+E1026 08:47:34.367549  111549 slow_operation_alarm.cc:140] The operation took 2m15.070854876s
+
+********************************
+[Compiling module jit_scan for GPU] Very slow compile? If you want to file a bug, run with envvar XLA_FLAGS=--xla_dump_to=/tmp/foo and attach the results.
+********************************
+[autodiff-gate] progress: support reverse profile-state vjp ready elapsed_s=94.461
+[autodiff-gate] progress: support reverse initial carry reduced-zero-RHS forward ready elapsed_s=0.765
+[autodiff-gate] progress: support reverse reusing static schedule artifact (no second adaptive rollout; no per-step carry tape)
+[autodiff-gate] progress: support reverse realized-schedule vjp forward ready elapsed_s=2.203
+[optimization-start-baseline] {"Er_at_target": 5.457709756549644, "annular_max_Er": 38.614706627396146, "annular_min_Er": -11.93332786437959, "inner_mean_Er": 23.63028927047991, "inner_positive_fraction": 1.0, "inner_positive_margin_fraction": 1.0, "outer_negative_fraction": 1.0, "outer_negative_margin_fraction": 1.0, "annular_Er_rms": 19.36718772969759, "wrong_sign_fraction": 0.0, "actual_downcrossings": [0.5174235897859059], "nearest_downcrossing": 0.5174235897859059, "nearest_downcrossing_bracket": 25, "position_cost": 5.860483511079415e-06, "candidates": {"audit_root_local_cost": {"cost": 3.723324473342151, "zero_cost": 3.723324473342151, "sign_cost": 2.2178178008199405e-26}, "audit_root_annular_cost": {"cost": 3.723324473342151, "zero_cost": 3.723324473342151, "sign_cost": 2.820016827853499e-26}}}
+[autodiff-gate] progress: support reverse final-objective cotangents ready elapsed_s=8.275 ordinary_mode=grouped_joint_vjp bootstrap_mode=joint_local_vjp_upar_only database_bootstrap_interpolation_mode=legacy_sparse
+[autodiff-gate] progress: support reverse segmented cotangent sweep start segments=4 segment_length=50 objectives=5 cotangent_mode=full
+[autodiff-gate] progress: database segment reverse uses fixed-table table transpose plus compact local fixed-table geometry bars; only table bars cross the recorded scan (no scan owner in segments)
+[autodiff-gate] progress: support reverse segment 4/4 ready elapsed_s=521.285 active_steps=29 support_reuse=0 support_rebuild=29
+[autodiff-gate] progress: support reverse segment 3/4 ready elapsed_s=9.963 active_steps=50 support_reuse=0 support_rebuild=50
+[autodiff-gate] progress: support reverse segment 2/4 ready elapsed_s=10.375 active_steps=50 support_reuse=0 support_rebuild=50
+[autodiff-gate] progress: support reverse segment 1/4 ready elapsed_s=10.302 active_steps=50 support_reuse=0 support_rebuild=50
+[autodiff-gate] progress: support reverse segmented cotangent sweep ready elapsed_s=551.930 support_reuse=0 support_rebuild=179
+[autodiff-gate] progress: support reverse reduced carry bars expanded ready elapsed_s=0.640
+[autodiff-gate] progress: support reverse initial direct-RHS support pullback ready elapsed_s=0.360 boundary=reduced_zero
+[autodiff-gate] progress: suppor

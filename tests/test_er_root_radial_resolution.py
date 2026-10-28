@@ -1,11 +1,12 @@
 """Small stored-array and mocked-worker checks; never solve plasma physics."""
 
 import copy
-from contextlib import redirect_stdout
+from contextlib import redirect_stdout, redirect_stderr
 import hashlib
 import io
 import json
 from pathlib import Path
+from types import SimpleNamespace
 import subprocess
 import sys
 import tempfile
@@ -64,6 +65,25 @@ def save_cached(directory, task, value=None, *, wrapper=True):
 
 
 class RadialResolutionTests(unittest.TestCase):
+    def test_attempt_budget_override_keeps_original_cache_keys_and_all_other_settings(self):
+        with tempfile.TemporaryDirectory() as directory:
+            report, checkpoint = inputs(directory)
+            ordinary = make_plan(report, checkpoint)
+            with patch.object(radial.forward, "source_digest", return_value="unchanged-physics"):
+                extended = radial.make_plan(report, checkpoint, [5, 9], 1, 20000)
+            for old, new in zip(ordinary["tasks"], extended["tasks"], strict=True):
+                if old["resolved_config"]["geometry"]["n_radial"] == 5:
+                    self.assertEqual(old, new)
+                    self.assertEqual(radial.forward_key(old), radial.forward_key(new))
+                else:
+                    self.assertEqual(new["resolved_config"]["transport_solver"]["max_steps"], 20000)
+                    restored = copy.deepcopy(new)
+                    restored["resolved_config"]["transport_solver"]["max_steps"] = 1000
+                    self.assertEqual(restored, old)
+            with self.assertRaises(ValueError):
+                with patch.object(radial.forward, "source_digest", return_value="code"):
+                    radial.make_plan(report, checkpoint, [5, 9], 1, 999)
+
     def test_only_radial_grid_changes_and_profile_vectors_remain_fixed(self):
         with tempfile.TemporaryDirectory() as directory:
             report, checkpoint = inputs(directory)
@@ -208,6 +228,74 @@ class RadialResolutionTests(unittest.TestCase):
         result = subprocess.run([sys.executable, "-c", code, str(Path(radial.__file__).resolve())],
                                 capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_worker_failure_shows_real_error_and_exit_code_in_parent_output(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            log_path = root / "worker.log"
+
+            def failing_process(*args, **kwargs):
+                kwargs["stdout"].write("Traceback (most recent call last):\nValueError: upstream shape mismatch\n")
+                return SimpleNamespace(returncode=2)
+
+            stderr = io.StringIO()
+            with patch.object(radial.subprocess, "run", side_effect=failing_process), \
+                 redirect_stdout(io.StringIO()), redirect_stderr(stderr), \
+                 self.assertRaisesRegex(ValueError, "exit code 2"):
+                radial.run_worker(dict(name="n101_baseline"), root / "task.json", root / "result.json", log_path)
+            self.assertIn("ValueError: upstream shape mismatch", stderr.getvalue())
+            self.assertIn("worker exit code=2", stderr.getvalue())
+            self.assertIn("Traceback", log_path.read_text())
+
+    def test_worker_value_error_preserves_traceback_instead_of_becoming_usage_error(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "task.json"
+            path.write_text("{}")
+            with patch.object(radial.forward, "run_forward_task", side_effect=ValueError("upstream shape mismatch")), \
+                 self.assertRaisesRegex(ValueError, "upstream shape mismatch"):
+                radial.main(["--worker-task", str(path), "--worker-output", str(path.with_name("result.json"))])
+
+    def test_incomplete_rollout_diagnostic_distinguishes_budget_exhaustion_from_solver_failure(self):
+        def _schedule_rollout(failed=False):
+            solver = SimpleNamespace(t1=2.)
+            max_total_steps = 1000
+            rollout = SimpleNamespace(final_carry=SimpleNamespace(t=.031984666),
+                final_step_state=SimpleNamespace(dt=1e-7), attempt_count=1000 if not failed else 27,
+                accepted_count=500 if not failed else 12, failed=failed, completed=False,
+                fail_code=0 if not failed else 3)
+            raise RuntimeError("FD adaptive baseline did not complete")
+
+        for failed in (False, True):
+            try:
+                _schedule_rollout(failed)
+            except RuntimeError as exc:
+                result = radial.incomplete_rollout_diagnostic(exc)
+            with self.subTest(failed=failed):
+                self.assertEqual(result["attempt_budget_exhausted"], not failed)
+                self.assertEqual(result["failed"], failed)
+                self.assertEqual(result["max_attempts"], 1000)
+                self.assertEqual(result["next_dt"], 1e-7)
+
+    def test_worker_retains_incomplete_counts_without_retrying_or_hiding_original_exception(self):
+        def _schedule_rollout(task):
+            solver = SimpleNamespace(t1=2.)
+            max_total_steps = 1000
+            rollout = SimpleNamespace(final_carry=SimpleNamespace(t=.03),
+                attempt_count=1000, accepted_count=600, failed=False, completed=False, fail_code=0)
+            raise RuntimeError("original incomplete rollout")
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "task.json").write_text("{}")
+            stderr = io.StringIO()
+            with patch.object(radial.forward, "run_forward_task", side_effect=_schedule_rollout) as solve, \
+                 redirect_stderr(stderr), self.assertRaisesRegex(RuntimeError, "original incomplete rollout"):
+                radial.main(["--worker-task", str(root / "task.json"), "--worker-output", str(root / "result.json")])
+            solve.assert_called_once()
+            result = json.loads((root / "result_failure.json").read_text())
+            self.assertTrue(result["attempt_budget_exhausted"])
+            self.assertEqual(result["accepted_steps"], 600)
+            self.assertIn("[radial-resolution-incomplete]", stderr.getvalue())
 
 
 if __name__ == "__main__":

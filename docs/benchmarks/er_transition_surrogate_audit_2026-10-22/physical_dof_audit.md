@@ -1235,5 +1235,562 @@ the geometry factory, early baseline mismatch rejection, old-cache rejection,
 stored HDF5 time/field selection, actual crossings, input-dependent Boozer
 defaults, and an isolated audit import proving no physics packages are loaded.
 Only short arrays, small stored files and mocked workers ran locally. The
-physical baseline discrepancy is still awaiting the stored-output audit;
-these tests do not establish that the corrected setup reproduces the root.
+physical baseline discrepancy was still awaiting the stored-output audit at
+that point; these tests do not establish that the corrected setup reproduces
+the root. The subsequent remote audit follows.
+
+### Stored-output audit received on 2026-10-26
+
+The supplied audit is archived in saved_geometry_output_audit_2026-10-26.txt.
+Both fields reach t=2 on the same grid. The existing geometry-only HDF5 has
+positive Er throughout the tested inner region, negative Er throughout the
+outer region, and a downcrossing at rho=0.5174235896040508. Its target Er is
++5.457708927447452 kV/m and inner mean is +23.630288155087445 kV/m. The
+candidate baseline has no downcrossing, target Er -6.4032764358708425 kV/m,
+and inner mean -3.07654876829172 kV/m. The maximum absolute field difference
+is 43.9112910165388 kV/m. Thus the candidate experiment did not reproduce
+the stored electron-root result. These candidate losses cannot be ranked on
+the assumption that it did.
+
+The saved manifest leaves runtime mboz/nboz unset while declaring the separate
+context's 18/18 resolution. Applying the defaults to the current input gives
+36/11. Explicit 18/18 configuration is already included in the loader fix;
+this audit reads the old baseline, so it does not test that corrected forward
+setup.
+
+There is also an input-provenance discrepancy. The earlier baseline recorded
+SHA256 c2b492828478b49431d5cd1c87a32281c172f380ae73bd04ebafdbfa7cabca85;
+the audit reads 189dc88618cac19e9ec9bf91c312c27ef989f5e14951359d9ccb9ad618db3bf9
+from the same path. The file bytes changed. This does not by itself prove a
+boundary change, since formatting/comments also affect a hash. Neither the
+historical effective resolution nor causal responsibility for the field
+difference is established from the changed input alone.
+
+The offline audit now prints source_provenance, comparing the baseline's
+recorded input and summary hashes with the current files. It also reports
+the input copy beside the saved HDF5 at
+optimized/transport/input.QI_neopax_geometry_full_transport_optimized and
+whether its bytes match the current baseline input. Missing hashes or files
+are explicitly unknown or unavailable. The audit still imports no physics
+packages and starts no solver. Source identity should be checked before a
+fresh baseline run, using a new output directory. The existing pre-reverse
+gate then requires time/grid/Er parity before any candidate optimization.
+
+The user then clarified that the geometry-only optimization had been rerun
+and its newly optimized result again has an electron root. That explains
+why the input at the same output path changed. The old candidate baseline
+must not be resumed or interpreted as a reproduction of this newer result.
+The requested next experiment uses the current exported optimized boundary
+from that directory and a fresh baseline/output directory. No further audit
+of the old baseline is required to start that experiment. Both local and
+annular losses, with profiles and geometry varied in separate runs, start
+from this same current result after the existing forward-parity check.
+
+### Fresh saved-geometry baseline reproduced the electron root
+
+The next supplied GPU excerpt is archived verbatim as
+optimized_geometry_rerun_baseline_2026-10-26.txt. It uses the fresh directory
+outputs/new_root_candidates/optimized_geometry_rerun_20261026, input hash
+189dc88618cac19e9ec9bf91c312c27ef989f5e14951359d9ccb9ad618db3bf9 and summary
+hash e358b1a9f7ff630516e5b60d529cf3c987f526cb5294939b0b9a04c8b671f4da.
+The new saved-geometry runtime contract is present, with explicit 18/18
+resolution and the geometry factory's reduced_zero/reduced_zero_rhs,
+legacy_sparse and grouped_joint_vjp selectors.
+
+The baseline has positive Er throughout the inner test region and negative
+Er throughout the outer test region. Its downcrossing is at
+rho=0.5174235897859059 versus 0.5174235896040508 in the saved HDF5, a difference
+of about 1.82e-10. Target Er is +5.457709756549644 versus +5.457708927447452
+kV/m, an absolute difference of about 8.29e-7 kV/m. Inner mean Er is
++23.63028927047991 kV/m. The run continues through final-objective cotangents
+and the segmented reverse sweep after the terminal observer, so the saved
+forward-parity gate did not reject this baseline. The old all-negative
+baseline is no longer the starting point for this experiment.
+
+Both candidate costs are initially 3.723324473342151, entirely dominated by
+the shared target-zero term. The local/annular sign contributions are only
+2.22e-26/2.82e-26 because the requested signs already hold. Equal starting
+costs are expected here; this observation does not rank the two losses.
+The existing root's distance from the target 0.514 is about 0.00342359.
+
+The initial reverse sweep processes 179 accepted steps in four segments
+(50+50+50+29). The first reverse segment takes 521.285 seconds, with later
+segments taking approximately 10 seconds each, consistent with substantial
+first-use compilation/setup overhead. The supplied excerpt contains no
+traceback, nonfinite report, failed comparison or accepted optimizer update.
+It ends during initial-state/support pullbacks. Full AD completion and the
+subsequent four candidate/group optimizations remain unobserved. No local
+physics run was performed to interpret this output. Since both the saved
+geometry and runtime setup changed relative to the old baseline, this is a
+successful reproduction control, not an isolated measurement of the effect
+of the Boozer-resolution fix alone.
+
+### Local loss decreases while the root moves away from its target
+
+The longer supplied output is archived verbatim as
+optimized_geometry_local_profiles_progress_2026-10-26.txt. Extracted endpoints
+are in optimized_geometry_local_profiles_progress_2026-10-26.csv, including
+the baseline, five accepted iterations, four rejected iteration-6 trials,
+and one iteration-6 endpoint whose AD is still pending. All 150 baseline
+Jacobian entries (five objectives by 30 physical parameters) are preserved
+in optimized_geometry_baseline_gradients_2026-10-26.csv.
+
+The baseline AD completes with all_finite=True, five rows and 30 columns in
+1566.205 seconds. Both losses initially have the same six profile gradients:
+n0 +1.6206550680707883, T0 +1.4168639203948246,
+density_shape_power -0.09605067300591752,
+temperature_shape_power +2.4287410777289704,
+density_shape_alpha +0.2595389353382458,
+temperature_shape_alpha +0.17410176205436656. The scaled cost-gradient norms
+are 98.39673308242583 (profiles) and 251.56117203171567 (geometry, local
+candidate). Finite AD is not itself a finite-difference validation.
+
+Only the local/profiles optimization is observed in this excerpt. Its target
+is rho=0.514. The accepted results are:
+
+| Iteration | Step | Cost | Root rho | Absolute root error | Target Er [kV/m] |
+| --- | --- | --- | --- | --- | --- |
+| 0 | 0 | 3.72332447334 | 0.517423589786 | 0.003423589786 | +5.45770975655 |
+| 1 | 0.001 | 2.54132162185 | 0.497803997032 | 0.016196002968 | -2.69784772993 |
+| 2 | 0.002 | 2.52376773032 | 0.497792273779 | 0.016207726221 | -2.68747295184 |
+| 3 | 0.004 | 2.48751990365 | 0.497768501968 | 0.016231498032 | -2.66600395627 |
+| 4 | 0.008 | 2.40923105292 | 0.497715089857 | 0.016284910143 | -2.62033072047 |
+| 5 | 0.016 | 1.52073710218 | 0.477939962401 | 0.036060037599 | -2.07210007171 |
+
+Thus cost falls 59.1565 percent but root error grows by a factor of 10.5328.
+The root moves substantially under profile DOFs in this saved geometry;
+weak or absent profile response does not describe these accepted steps.
+At accepted iteration 5 n0 is 10.4661 percent below its nominal value and
+T0 is 4.0320 percent lower. Both local zero and sign contributions decrease
+from accepted iteration 1 to 5 while the crossing error increases. The local
+candidate therefore does not reliably order these profiles by root-position
+error. The experiment optimizes only the candidate root cost, so the loss's
+finite-step behavior is isolated from competition with other objectives.
+
+At the first step AD predicts delta-rho=-1.4213463127761531e-5. The observed
+change is -0.01961959275424716: about 1380 times larger and 1.000599 times a
+1/51 radial spacing. Iteration 5 moves inward another 1.008532 spacings.
+These near-cell-sized moves warrant examining the stored initial and final
+Er arrays. They do not alone prove grid pinning, an initial selected-root
+branch switch, a solver error, or an AD error. The initial branch-conditioned
+derivative cannot predict a jump between branches from this evidence alone.
+
+Iteration 6 rejects step sizes 0.032, 0.016, 0.008 and 0.004 because costs
+1.70364702440, 1.97302823442, 2.09594465805 and 2.15347144369 exceed the current
+1.52073710218. All four rejected roots are around 0.4973--0.4975, closer to the
+target than the accepted 0.47794 root. This directly shows disagreement
+between scalar-cost acceptance and actual root-position improvement.
+The reduced step 0.002 has cost 1.50974982370 and root 0.477929045904; its AD
+has started, but acceptance is not shown. The rejection messages are ordinary
+cost backtracking, with no nonfinite-AD failure reported. Subsequent local
+iterations and all geometry/annular optimization results remain unobserved.
+
+The existing analyze_er_root_saved_profiles.py can read these saved worker
+JSON files without a transport or AD solve. Its output includes crossing
+cells, field contrasts/slopes, stored initial-Er sign changes, both cost and
+actual-crossing gradient directions, and independent forward/AD endpoint
+differences. A same-cell decomposition is only applied when the target and
+crossing share that cell; it cannot be used across the observed jumps.
+This read-only analysis can run alongside the ongoing GPU job:
+
+```bash
+cd /home/exouser/NEOPAX || exit 1
+neopax_case=outputs/new_root_candidates/optimized_geometry_rerun_20261026
+/home/exouser/jax_env/bin/python examples/benchmarks/analyze_er_root_saved_profiles.py \
+  --ad-report "$neopax_case/baseline/ad_summary.json" \
+  --run-dir "$neopax_case/local_profiles" \
+  --out-dir "$neopax_case/local_profiles/saved_profile_analysis" \
+  --plot
+```
+
+The acceptance rule is intentionally left unchanged for this diagnostic
+comparison. Adding a requirement that actual root error decrease would
+change the experiment and would not validate the candidate loss itself.
+No new expensive physics run was performed locally.
+
+### Stored gradient directions confirm local position misalignment
+
+The user ran the saved-profile analyzer on the remote machine. Its printed
+output is archived verbatim as
+optimized_geometry_saved_profile_analysis_2026-10-26.txt. Eleven concrete
+crossings are tabulated in optimized_geometry_saved_crossings_2026-10-26.csv;
+24 candidate/group directions at six AD points are preserved in
+optimized_geometry_saved_candidate_directions_2026-10-26.csv. These are
+evaluations along the local/profiles trajectory, not independent results
+from the annular or geometry-only optimizations.
+
+The interpolated crossing changes from bracket 25, spanning rho=0.5 to
+0.5196078431372548, to bracket 24 (0.48039215686274506 to 0.5) at the first
+accepted point, and to bracket 23 at accepted iteration 5. The fractional
+position within the crossing cell stays near 0.889, 0.888 and 0.875,
+respectively. Each observed endpoint has one downcrossing in the annulus.
+Thus the large reported shifts reflect changes in the terminal front's
+crossing cell, not selection between multiple simultaneous terminal roots.
+The supplied plot corroborates the lower positive-region amplitudes and
+the inward movement of the front. Its baseline-centered zoom omits the
+iteration-5 crossing near 0.478; that crossing is present in the full-domain
+plot and saved crossing table.
+
+At the first accepted profile point rho_root=0.497803997 is below the target
+0.514, so a locally improving direction must increase rho_root. Instead,
+the saved AD predicts these root rates for cost descent:
+
+| Candidate | DOF group | d rho_root / d trust-step | Alignment with decreasing root error |
+| --- | --- | --- | --- |
+| local | profiles | -0.00581170040823 | -0.854809815 |
+| annular | profiles | -0.00522191576482 | -0.768061761 |
+| local | geometry | -0.0191084400029 | -0.711614059 |
+| annular | geometry | -0.0111001303222 | -0.413378004 |
+
+Both candidate descent directions therefore worsen actual root error
+locally at this particular saved profile. This is stronger evidence of loss
+misalignment than a finite-step overshoot alone. Annular behavior is not
+uniformly adverse at every saved point: at accepted iteration 5 its profile
+direction has a small positive alignment of 0.0131673446, while the local
+profile direction remains adverse (-0.3471845124). No claim is made here
+about the completed independent annular optimization.
+
+The local/profiles gradient at iteration 1 predicts delta-rho=-1.16234008165e-5
+for the next step of 0.002. The observed delta is -1.17232522581e-5, within
+0.8591 percent. At iteration 2, the next 0.004 step predicts
+-2.37878557248e-5 versus observed -2.37718112108e-5, within 0.06745 percent.
+These are finite directional comparisons on adaptive forward endpoints,
+not symmetric FD validation of the complete Jacobian. They support the
+interpretation that the local AD is describing the same adverse motion,
+rather than a nonfinite reverse failure causing these two accepted moves.
+
+At the baseline, an exact same-cell differential decomposition attributes
+31.4194 percent of the profile direction's target-Er change to crossing
+motion and 68.5806 percent to a change in the local field slope. For geometry
+the corresponding fractions are 33.7013 and 66.2987 percent. After the front
+has moved inside the target radius, the target lies on the negative branch.
+Making that branch less negative can reduce the shared target-zero cost
+while the crossing moves farther inward. The crossing-cell slope decreases
+from 1594.1483 to 1138.7065 kV/m per unit rho between the baseline and
+accepted iteration 5. A same-cell target/crossing decomposition is not
+valid at those later points because the target is outside their crossing
+cell. The plotted shapes and the saved candidate directions support the
+amplitude-versus-position interpretation without extending that identity
+outside its domain.
+
+Increasing the overall weight cannot change a candidate's descent direction.
+A suitable next loss needs a position term insensitive to uniform field
+amplitude scaling when a crossing exists, while retaining a creation signal
+when no electron region exists. The already-recorded actual-crossing
+Jacobian can assess such a position term locally before another physics
+benchmark is requested. Whether profiles can continuously attain the exact
+target on this radial grid remains unverified; a position loss would order
+the observed jumps correctly but cannot guarantee physical attainability.
+The origin of the first front-cell jump is also unresolved: the printed
+output does not include the stored initial-Er sign-change diagnostics.
+No solver, replay, optimization acceptance rule or candidate formula was
+changed to produce this analysis.
+
+### Radial-resolution hypothesis raised by the user
+
+The user proposed that the observed behavior may arise from radial-grid
+resolution. This is a credible and unresolved contributor, and the candidate
+assessment above is conditional on the current discretization. It does not
+show that the same adverse directions or trajectory persist after radial
+convergence. A grid check should precede any general rejection of the losses
+or claim that the requested position cannot be attained.
+
+Source inspection confirms geometry.n_radial=51 in
+full_transport_database_vacuum_t2.toml. The VMEX-to-NEOPAX geometry constructor
+builds n_r+1 uniform faces on [0,1] and midpoint cell centers, so the spacing
+is 1/51=0.0196078431. The first root shift is -0.0196195928, approximately one
+cell. The steep positive-to-negative transition spans adjacent centers in
+the supplied plot, and its fractional crossing location changes much less
+than its crossing-cell index. These facts support investigating an
+under-resolved front, but do not demonstrate its continuum width or prove
+that radial discretization causes the branch changes.
+
+The radius diagnostic linearly interpolates the zero between adjacent Er
+values. It does not round it to a grid point, and the spacing is not a hard
+lower bound on possible interpolated motion. The initializer chooses
+ambipolar roots at radial sample locations. The subsequent Er evolution is
+not a collection of independent radius-only solves: ElectricFieldEquation
+includes finite-volume radial diffusion as well as the ambipolar source,
+with DEr=2.0 in this configuration. Its transition therefore needs a spatial
+resolution check. Neither the initializer nor the evolution has yet been
+identified as the origin of the first front-cell jump.
+
+The smallest useful physical follow-up is forward-only: evaluate the same
+saved optimized boundary and two fixed profile vectors (the baseline and
+first accepted local/profiles point) at 51, 101 and 201 radial cells. Reuse
+the completed 51-cell endpoints where their complete inputs match. Hold
+the physical profile parameters, diffusion coefficient, final time, solver
+tolerances, Boozer resolution, NTX database radii and angular/velocity mesh
+fixed. Rebuild the analytical initial profiles and selected-root initializer
+on each grid; interpolating the old Er output onto a denser grid would not
+test the PDE discretization. No optimization or reverse AD is needed for
+this first check. Compare the initial and final crossing cells/radii,
+physical transition width, target Er and changes between the two profile
+vectors. Extend refinement only if those values fail to converge.
+
+The local candidate's two sign probes are the grid nodes immediately beside
+the target, so changing n_radial also changes their physical positions.
+Its raw costs across resolutions alone cannot isolate spatial-solver error.
+Compare actual crossings and Er at the same physical target first, or keep
+sign probes at fixed physical radii for a cross-grid loss comparison.
+The field-amplitude dependence of the candidate formula remains a separate
+mathematical property, but the observed optimization consequences may depend
+strongly on resolution. No new physics solve was launched locally, and the
+ongoing four-case remote optimization was not modified or restarted.
+
+### Local/profiles progress through accepted iteration 6
+
+The next supplied log, archived as
+optimized_geometry_local_profiles_update_2026-10-26.txt, is a continuation of
+the original 51-cell optimization rather than output from the new radial
+convergence script. The existing progress CSV is updated to include six
+accepted iterations, six rejected trials and one iteration-7 endpoint with
+AD pending, in addition to the original baseline. The new raw archive
+preserves the earlier excerpt separately.
+
+Iteration 6 accepts its fifth trial at step 0.002: cost=1.509749823695421,
+root=0.47792904590370633, absolute root error=0.036070954096293684 and cost
+reduction ratio=0.9980227370340182. Thus that accepted-point reverse check
+completed without a reported nonfinite failure.
+
+Iteration 7 rejects step sizes 0.004 and 0.002, with costs 2.122336000801336
+and 2.15204698998079. Their roots 0.4975268217866157 and 0.4975426632934679
+are closer to the target than the current accepted root, while their costs
+are higher. The next smaller step, 0.001, has cost=1.5042234423010103,
+root=0.4779228032365286 and error=0.03607719676347143. Its AD has started but
+acceptance is not shown. All shown rejections are cost backtracking.
+
+There are no 101/201-cell endpoints or completed geometry/annular case
+results in this supplied excerpt. It reinforces the cost/position mismatch
+on the 51-cell trajectory but does not determine its resolution dependence.
+
+### Original root/bootstrap control baseline and first rejected profile moves
+
+The supplied original-control run is archived in
+original_root_bootstrap_baseline_2026-10-26.txt. Its baseline input/summary
+hashes match the verified optimized-geometry case (189dc886.../e358b1a9...),
+and it reproduces the same terminal crossing rho=0.5174235897859059 and
+target Er=5.457709756549644 kV/m. The full 179-accepted-step, eight-objective,
+30-parameter reverse pass completes with all_finite=True in 1781.243 seconds.
+The native momentum-corrected bootstrap row uses joint_local_vjp_upar_only
+with the legacy_sparse interpolation transpose. No nonfinite reverse error
+is reported.
+
+All 240 raw Jacobian entries are saved in
+original_root_bootstrap_baseline_jacobian_2026-10-26.csv; all 150 scalar-cost
+gradients in original_root_bootstrap_baseline_cost_gradients_2026-10-26.csv;
+ten candidate/control block directions in
+original_root_bootstrap_baseline_directions_2026-10-26.csv. Joint-cost rows
+are baseline diagnostics, not an additional selected optimization case.
+
+At the baseline:
+
+- Original soft position moment: 0.003423589785905512.
+- Original strength: 1.6247977735119645, above target 0.9.
+- Original root cost: 0.005860483511078274, dominated by position.
+- Bootstrap observable: 0.5380608878578748, above limit 0.1.
+- Bootstrap cost: 0.3837946829416591.
+
+The original soft location equals the actual selected chord crossing to
+the printed precision. With strength already satisfied, its position cost
+is approximately 0.5*1000*(rho_root-0.514)^2 at this baseline and the two
+reported trial points. Its block-normalized descent aligns with the
+actual-crossing gradient: predicted root rates are -0.014296418496599439
+for profiles and -0.03905190803700927 for geometry, equal to the negatives
+of the respective scaled root-gradient norms. Thus the original objective
+already provides the direct crossing-distance behavior proposed as a control
+for this particular branch. No replacement position term is necessary to
+obtain that local behavior here; this observation does not establish it for
+root-free profiles or multiple competing crossings.
+
+The profile block cost-gradient norm is 0.04894507233977527 for the original
+root pair and 30.90231911962548 for bootstrap. This is a weighted-cost scale
+difference, not proof that the original root cannot respond to profile DOFs.
+The test normalizes each objective's block descent direction. For example,
+the original root's first step changes T0 by -0.0638738967252485 keV, similar
+to the new local candidate's -0.0624584086280142 keV at the same trust step.
+The bootstrap norm is approximately 631.37 times larger, relevant if these
+weighted objectives are combined later, but the requested runs are separate.
+
+The original/profiles run correctly rejects its first two finite proposals:
+
+| Status | Step | Original root cost | Actual root | Absolute error |
+| --- | --- | --- | --- | --- |
+| Baseline | 0 | 0.00586048351108 | 0.517423589786 | 0.003423589786 |
+| Rejected trial 1 | 0.001 | 0.131148401396 | 0.497804420270 | 0.016195579730 |
+| Rejected trial 2 | 0.0005 | 0.131104484888 | 0.497807132132 | 0.016192867868 |
+
+The trial strengths remain above target at 1.53488696738/1.53581332096, so
+the strength costs are only 7.75e-24/7.73e-24. Their bootstrap values improve
+to 0.500214398328/0.502613046911, but bootstrap is monitored rather than
+included in this original-root run's acceptance cost. The root-pair objective
+penalizes the wrong-direction front jumps instead of rewarding them as the
+new local/annular losses did on their earlier trajectories.
+
+original_root_profiles_progress_2026-10-26.csv records the baseline and both
+rejected endpoints. The excerpt ends as the next forward evaluation begins;
+no accepted original-root iteration, geometry-only control or bootstrap-only
+optimization is yet observed. Ordinary backtracking should be allowed to
+test smaller moves. Whether those remain on the baseline branch and improve
+the target error is unresolved, as is the role of radial resolution in the
+front-cell jumps. These data support good cost ordering on the observed
+original-root trials, not a claim of completed convergence or full AD/FD
+validation.
+
+### Original controls: exhausted backtracking and improving bootstrap profiles
+
+Two subsequent excerpts are preserved verbatim as
+original_root_profiles_backtracking_2026-10-26.txt and
+original_root_geometry_bootstrap_progress_2026-10-26.txt. The profile progress
+CSV now contains all eight rejected original-root proposals. A matching
+original_root_geometry_progress_2026-10-26.csv records the eight geometry
+proposals; bootstrap_profiles_progress_2026-10-26.csv records three accepted
+bootstrap iterations and the fourth forward endpoint with AD still pending.
+
+Both original position+strength runs terminate with backtracking_exhausted,
+converged=False and zero accepted iterations. Each tests steps from 0.001 to
+0.0000078125, a factor of 128. The smallest profile step gives
+root=0.49781068525865185, cost=0.13104695589722182; the smallest geometry step
+gives root=0.4978104489927187, cost=0.13105078090868794. Both remain about one
+51-cell spacing inward of baseline root=0.5174235897859059, whose cost was
+0.005860483511078274. The root errors are approximately 0.01619 versus the
+baseline 0.00342359. The original soft-selected location continues to match
+the actual interpolated crossing to printed precision, and strength remains
+above its target. Rejecting these proposals is correct for the requested
+root-position objective.
+
+The baseline AD predicts root shifts of only -1.11690769505e-7 for the smallest
+profile move and -3.05093031539e-7 for the smallest geometry move. Observed
+shifts are approximately -0.0196129045 and -0.0196131408. Shrinking the tested
+steps has not recovered the baseline local response. These finite moves do
+not validate the root Jacobian at baseline; finite AD alone is not proof of
+agreement. It is premature to attribute the mismatch exclusively to radial
+resolution, initial-root selection, replay, or an incorrect derivative.
+
+Source inspection confirms that the first original/profiles evaluation is
+an independent zero-move forward solve. optimize() compares its terminal
+field, grid, final time and selected cost against the AD primal before
+testing proposals. That comparison passed; otherwise this log could not
+reach backtracking. Geometry and bootstrap reuse this same input-matched
+forward baseline. Thus there is no observed zero-move forward/AD mismatch
+in this run. A common baseline/worker mismatch should not be claimed from
+the nonzero-step jumps alone. In particular, profile-only proposals retain
+zero geometry deltas and use the same runtime-construction path as baseline.
+The logs do not contain the initial Er/density/pressure arrays or solver
+counts for each trial, so they cannot locate where the jump first develops.
+
+Bootstrap profiles behave differently:
+
+| Point | Bootstrap observable | Bootstrap cost | Actual root | Reduction ratio |
+| --- | --- | --- | --- | --- |
+| Baseline | 0.538060887858 | 0.383794682942 | 0.517423589786 | — |
+| Accepted 1 | 0.499613663931 | 0.319382160801 | 0.497803920457 | 2.08439120 |
+| Accepted 2 | 0.486106729205 | 0.298156812675 | 0.497790357030 | 0.98479762 |
+| Accepted 3 | 0.459824297453 | 0.258947050076 | 0.497761781845 | 0.95642721 |
+| Iteration 4, AD pending | 0.397584978982 | 0.177113639432 | 0.478063209937 | Not yet accepted |
+
+The first three accepted steps reduce bootstrap cost by 32.5298% and the
+raw observable by 14.5405%; the limit 0.1 is not met. Each acceptance requires
+finite accepted-point AD and agreement between its primal and the separate
+forward endpoint. The second and third actual cost reductions differ from
+their AD linear predictions by approximately 1.52% and 4.36%. These are useful
+directional checks at the new bootstrap points, not full Jacobian checks or
+validation of the baseline root gradient. The first step crosses the same
+front-cell change and its reduction ratio is 2.084. Bootstrap alone does not
+penalize the increased root-position error, so acceptance is consistent with
+that separate objective. The geometry-only bootstrap run has not started in
+these excerpts. No nonfinite AD error is shown.
+
+The next diagnosis uses saved files rather than a new physical experiment.
+analyze_er_root_saved_profiles.py now includes initial crossing/bracket,
+initial Er/density/pressure changes, accepted/attempt counts and final time
+in initial_state_summary.csv. Its console output includes saved-initial-state
+records, and it can read the optimizer's wrapped forward-task cache so later
+independent groups recover the initial baseline arrays from original_profiles.
+Initial sign changes would locate an initializer contribution; a terminal
+front change without an initial sign/cell change instead requires examining
+the evolution. Neither observation by itself proves that the derivative or
+the continuum physics is wrong. No physics settings or production loss
+definition were changed. All ten saved-array analyzer tests passed using
+NumPy and temporary JSON files only; no local physics solve was run.
+
+### Bootstrap profiles: five accepted steps and forward-worker failures
+
+The next excerpts are archived as bootstrap_profiles_update_2026-10-26.txt
+and original_controls_cumulative_update_2026-10-26.txt. The latter contains
+the same endpoint/status progression with more original-control history;
+neither reports a result after starting evaluation_0014_forward.log.
+bootstrap_profiles_progress_2026-10-26.csv is updated without double-counting
+overlapping excerpts or gradient_started/accepted records of the same trial.
+It now has one baseline, five accepted steps and three failed forward trials.
+Unknown costs for failed workers are left empty rather than assigned zero.
+
+Iterations 4 and 5 both complete accepted-point AD and are accepted:
+
+| Accepted iteration | Step | Bootstrap value | Bootstrap cost | Root | Cost reduction ratio |
+| --- | --- | --- | --- | --- | --- |
+| 4 | 0.008 | 0.397584978982 | 0.177113639432 | 0.478063209937 | 1.09887375243 |
+| 5 | 0.008 | 0.345857588616 | 0.120891907760 | 0.458316082559 | 1.05605171199 |
+
+Relative to baseline, bootstrap cost has fallen by 68.5009% and its raw
+observable by 35.7215%. The limit 0.1 is still unmet. The positive core
+remains present: inner_positive_fraction=0.8695652173913043, with all sampled
+outer Er values negative. Strength=1.187908560835505 still exceeds 0.9. The
+root has moved inward by 0.0591075072272, about three 51-cell spacings, while
+its target error has grown to 0.0556839174413 (16.2648 times the original
+error). The weighted position cost alone would be about 1.55035 instead of
+the original 0.00586048. Bootstrap-only acceptance does not constrain that
+position cost, so this tradeoff is consistent with the selected objective.
+These results show substantial profile control of bootstrap on this
+trajectory; they do not resolve the baseline root derivative/forward-jump
+mismatch or demonstrate convergence of any original-root run.
+
+Three trial evaluations fail inside the forward worker:
+
+- Iteration 5, trial 1, step 0.016: evaluation_0009_forward.log.
+- Iteration 6, trial 1, step 0.016: evaluation_0012_forward.log.
+- Iteration 6, trial 2, step 0.008: evaluation_0013_forward.log.
+
+At iteration 5, backtracking to 0.008 succeeds. At iteration 6, the excerpt
+ends as evaluation_0014_forward.log starts, before a third trial result.
+No reverse worker is launched for the three failed forward trials. Their
+only reported reason is "forward worker exited 1"; the actual exception is
+not in either attachment. It could be in runtime/initialization, transport,
+or the terminal observable calculation. It should not be labeled as another
+nonfinite reverse-AD failure, an attempt-budget failure, or an OOM without
+reading those saved logs. The five accepted steps have passed the existing
+finite-AD and independent forward/primal checks.
+
+The requested follow-up reads the last 60 lines of these three logs on the
+remote machine; it runs no simulation. Saved initial-state analysis from the
+preceding section remains the next check for the separate root-jump issue.
+No source code or physics setting was changed for this progress update and
+no local physics test was run.
+
+### Profile-only joint-objective continuation, 2026-10-27
+
+The requested existing SciPy stage-2 run from the saved optimized geometry
+has completed. Full evidence and a read-only diagnostic command are in
+[the joint-objective continuation report](profiles_only_root_bootstrap_net_power_2026-10-27.md).
+Total cost decreases by only 0.04893%; the accepted final root is effectively
+unchanged at 0.517423569, bootstrap slightly worsens, and net power moves
+from 299.890707 to 299.930314 MW. The ftol termination leaves first-order
+optimality 18.5. Many completed proposals still jump inward to root near
+0.497811 and power near 275.9 MW. The one reported failed solve hits the
+500-accepted-step guard before final time, with no reported nonfinite AD.
+Device counters/stage-cache sizes stabilize, but host RSS grows by 620.9 MiB;
+this finite run does not establish a complete memory fix. The next diagnosis
+uses already-saved step models and Jacobians, without a new physics run.
+
+### Independent-species stage-2 partial run, 2026-10-27
+
+[The partial independent-species report](species_profiles_root_bootstrap_net_power_partial_2026-10-27.md)
+archives evaluations 4-9 of the expanded-DOF run. Those proposals still show
+the same root near 0.49781 and power near 275.8 MW; at evaluation 9 net-power
+cost contributes about 98.31% of total cost. No accepted-step notification
+or final outcome is included, so these are not reported as optimized results.
+The reverse sweeps shown complete without a reported exception. Host RSS
+grows by only 11 MiB in this short window, device counters/cache sizes are
+nearly flat, and no OOM is reported. A read-only command in the report prints
+the already-saved independent parameter labels and trial prediction/actual
+reductions while the optimizer continues. No local physics run was made.

@@ -1,0 +1,62 @@
+User-supplied remote saved-output audit, 2026-10-26.
+Host: exouser@neopax-24. Git pull reported Already up to date.
+
+Command:
+cd /home/exouser/NEOPAX &&
+git pull --ff-only origin en/v0_new &&
+/home/exouser/jax_env/bin/python \
+  examples/benchmarks/audit_saved_geometry_root_baseline.py \
+  --geometry-result-dir outputs/geometry_qi_max_er_transition_bootstrap_net_power_initial_root_database_full_transport_optimization \
+  --baseline-dir outputs/new_root_candidates/profiles_on_optimized_geometry/baseline
+
+{
+  "runtime_resolution": {
+    "configured": {"mboz": null, "nboz": null},
+    "effective": {"mboz": 36, "nboz": 11},
+    "declared": {"mboz": 18, "nboz": 18},
+    "matches_declared": false,
+    "vmec_input": "/home/exouser/NEOPAX/outputs/geometry_qi_max_er_transition_bootstrap_net_power_initial_root_database_full_transport_optimization/input.QI_neopax_database_full_transport_net_power_optimized",
+    "input_sha256": "189dc88618cac19e9ec9bf91c312c27ef989f5e14951359d9ccb9ad618db3bf9"
+  },
+  "terminal_comparison": {
+    "available": true,
+    "reference": "outputs/geometry_qi_max_er_transition_bootstrap_net_power_initial_root_database_full_transport_optimization/optimized/transport/transport_solution.h5",
+    "reference_time": 2.0,
+    "baseline_time": 2.0,
+    "same_grid": true,
+    "same_time": true,
+    "terminal_Er_matches": false,
+    "matches": false,
+    "max_abs_Er_difference": 43.9112910165388,
+    "saved_field": {
+      "Er_at_target": 5.457708927447452,
+      "inner_mean_Er": 23.630288155087445,
+      "inner_positive_fraction": 1.0,
+      "outer_negative_fraction": 1.0,
+      "annular_min_Er": -11.933328250613389,
+      "annular_max_Er": 38.61470387268313,
+      "actual_downcrossings": [0.5174235896040508],
+      "nearest_downcrossing": 0.5174235896040508
+    },
+    "baseline_field": {
+      "Er_at_target": -6.4032764358708425,
+      "inner_mean_Er": -3.07654876829172,
+      "inner_positive_fraction": 0.0,
+      "outer_negative_fraction": 1.0,
+      "annular_min_Er": -37.129066436839786,
+      "annular_max_Er": -0.6972299567696846,
+      "actual_downcrossings": [],
+      "nearest_downcrossing": null
+    }
+  },
+  "note": "Reads existing files only. A mismatch does not identify which solver, initializer or runtime change caused it."
+}
+
+Investigation note:
+The earlier baseline manifest recorded input hash
+c2b492828478b49431d5cd1c87a32281c172f380ae73bd04ebafdbfa7cabca85.
+The current input bytes therefore differ from those recorded for that baseline.
+This alone does not establish a boundary-coefficient change; reformatting may
+also change a hash. The effective resolution above is reconstructed from the
+saved configuration and the current input, not read from a historical runtime.
+No corrected-resolution forward solve or candidate optimization is included.

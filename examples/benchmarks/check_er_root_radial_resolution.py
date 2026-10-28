@@ -29,7 +29,7 @@ from examples.optimization.optimize_profiles_er_root_candidate import (
 )
 
 
-def make_plan(report, checkpoint, grids, iteration):
+def make_plan(report, checkpoint, grids, iteration, transport_max_steps=None):
     audit = report["root_loss_audit"]
     experiment = audit["experiment"]
     config = experiment["resolved_config"]
@@ -68,6 +68,8 @@ def make_plan(report, checkpoint, grids, iteration):
     grids = tuple(int(n) for n in grids)
     if not grids or len(set(grids)) != len(grids) or any(n < 3 for n in grids):
         raise ValueError("Choose distinct radial cell counts of at least three.")
+    if transport_max_steps is not None and transport_max_steps < 1:
+        raise ValueError("--transport-max-steps must be positive.")
     rho = np.asarray(audit["terminal_rho"], dtype=float)
     if rho.shape != (int(config["geometry"]["n_radial"]),):
         raise ValueError("The saved baseline grid differs from its recorded configuration.")
@@ -89,6 +91,13 @@ def make_plan(report, checkpoint, grids, iteration):
         for name, values in (("baseline", baseline), (f"accepted_{iteration:04d}", point)):
             task = copy.deepcopy(base)
             task["resolved_config"]["geometry"]["n_radial"] = n
+            # Completed original-grid controls retain their exact cached task.
+            # This override only increases the allowed work on refined grids;
+            # it does not change the time interval or convergence tolerances.
+            if transport_max_steps is not None and n != len(rho):
+                if transport_max_steps < int(config["transport_solver"]["max_steps"]):
+                    raise ValueError("The refinement budget must not reduce the saved maximum attempts.")
+                task["resolved_config"]["transport_solver"]["max_steps"] = transport_max_steps
             task.update(name=f"n{n}_{name}", parameter_values=values.tolist())
             tasks.append(task)
     return dict(tasks=tasks, iteration=iteration, grids=list(grids), seed_sha256=digest,
@@ -96,7 +105,8 @@ def make_plan(report, checkpoint, grids, iteration):
                 baseline_reference=dict(n_radial=len(rho), terminal_rho=rho.tolist(),
                                         terminal_Er=audit["terminal_Er"], final_time=audit["terminal_time"]),
                 interpretation="Only geometry.n_radial changes. Initial profiles/roots are rebuilt on each grid. "
-                "Native local-cost sign probes move with the grid; compare actual crossings and fixed-radii Er.")
+                "Native local-cost sign probes move with the grid; compare actual crossings and fixed-radii Er. "
+                "An explicit attempt-budget override applies only off the original grid.")
 
 
 def validate_endpoint(task, endpoint):
@@ -157,7 +167,19 @@ def run_worker(task, task_path, result_path, log_path):
     with log_path.open("w") as log:
         result = subprocess.run(command, cwd=ROOT, stdout=log, stderr=subprocess.STDOUT)
     if result.returncode:
-        raise ValueError(f"Forward worker failed for {task['name']}; see {log_path}.")
+        # Keep the real worker error visible in the top-level tee log. Limit
+        # the read as solver diagnostics can make the worker log very large.
+        with log_path.open("rb") as log:
+            size = log.seek(0, 2)
+            start = max(0, size-65536)
+            log.seek(start)
+            tail = log.read().decode("utf-8", errors="replace")
+        if start:
+            tail = tail.partition("\n")[2]
+        tail = "\n".join(tail.splitlines()[-100:])
+        print(f"[radial-resolution] {task['name']} worker exit code={result.returncode}; "
+              f"last log lines:\n{tail or '(worker log is empty)'}", file=sys.stderr, flush=True)
+        raise ValueError(f"Forward worker failed for {task['name']} (exit code {result.returncode}); see {log_path}.")
     return saved.read_json(result_path)
 
 
@@ -196,6 +218,7 @@ def endpoint_row(task, endpoint, probes, result_path, reused_from):
                 native_local_cost=candidates["audit_root_local_cost"]["cost"],
                 native_annular_cost=candidates["audit_root_annular_cost"]["cost"],
                 accepted_steps=endpoint["accepted_steps"], attempts=endpoint["attempts"],
+                max_attempts=task["resolved_config"]["transport_solver"]["max_steps"],
                 final_time=endpoint["final_time"], endpoint_file=str(result_path), reused_from=reused_from)
 
 
@@ -304,6 +327,33 @@ def run_plan(plan, out, reuse_dirs, *, runner=run_worker, plot=True, plan_only=F
     return rows
 
 
+def incomplete_rollout_diagnostic(error):
+    """Read failed helper context without changing the solver or its cache key."""
+    traceback = error.__traceback__
+    while traceback is not None:
+        frame = traceback.tb_frame
+        if frame.f_code.co_name == "_schedule_rollout" and "rollout" in frame.f_locals:
+            context = frame.f_locals
+            rollout = context["rollout"]
+            count = lambda value: int(np.asarray(value))
+            summary = dict(final_time=float(np.asarray(rollout.final_carry.t)),
+                           target_time=float(context["solver"].t1),
+                           attempts=count(rollout.attempt_count), accepted_steps=count(rollout.accepted_count),
+                           max_attempts=int(context["max_total_steps"]),
+                           failed=bool(np.asarray(rollout.failed)), completed=bool(np.asarray(rollout.completed)),
+                           fail_code=count(rollout.fail_code))
+            summary["attempt_budget_exhausted"] = (not summary["failed"] and not summary["completed"]
+                                                     and summary["attempts"] >= summary["max_attempts"])
+            step = getattr(rollout, "final_step_state", None)
+            dt = getattr(step, "dt", None)
+            if dt is not None:
+                value = float(np.asarray(dt))
+                summary["next_dt"] = value if np.isfinite(value) else None
+            return summary
+        traceback = traceback.tb_next
+    return None
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--ad-report", type=Path)
@@ -311,23 +361,41 @@ def main(argv=None):
     parser.add_argument("--out-dir", type=Path)
     parser.add_argument("--n-radial", default="51,101,201")
     parser.add_argument("--iteration", type=int, default=1, help="Fixed accepted profile point to compare to the baseline.")
+    parser.add_argument("--transport-max-steps", type=int,
+                        help="Maximum attempted steps on refined grids; original-grid controls keep their saved budget for reuse.")
     parser.add_argument("--reuse-dir", type=Path, action="append", default=[])
     parser.add_argument("--plan-only", action="store_true", help="Inspect cache matches and required solves; start no physics.")
     parser.add_argument("--worker-task", type=Path, help=argparse.SUPPRESS)
     parser.add_argument("--worker-output", type=Path, help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
-    try:
-        if args.worker_task is not None:
-            if args.worker_output is None:
-                parser.error("--worker-output is required for a worker.")
-            task = saved.read_json(args.worker_task)
+    # Preserve worker tracebacks, including ValueError/KeyError/OSError from
+    # upstream physics. Only controller input errors become argparse errors.
+    if args.worker_task is not None:
+        if args.worker_output is None:
+            parser.error("--worker-output is required for a worker.")
+        task = saved.read_json(args.worker_task)
+        try:
             write_json(args.worker_output, forward.run_forward_task(task))
-            return
+        except Exception as exc:
+            # The existing forward helper raises before returning an incomplete
+            # rollout. Its traceback still contains the counters. Diagnostics
+            # must never replace the original exception or retry the solve.
+            try:
+                diagnostic = incomplete_rollout_diagnostic(exc)
+                if diagnostic is not None:
+                    write_json(args.worker_output.with_name(args.worker_output.stem+"_failure.json"), diagnostic)
+                    print("[radial-resolution-incomplete] " + json.dumps(diagnostic, allow_nan=False),
+                          file=sys.stderr, flush=True)
+            except Exception:
+                pass
+            raise
+        return
+    try:
         if any(value is None for value in (args.ad_report, args.run_dir, args.out_dir)):
             parser.error("--ad-report, --run-dir and --out-dir are required.")
         grids = [int(value) for value in args.n_radial.split(",")]
         plan = make_plan(saved.read_json(args.ad_report), saved.read_json(args.run_dir / "checkpoint.json"),
-                         grids, args.iteration)
+                         grids, args.iteration, args.transport_max_steps)
         run_plan(plan, args.out_dir.resolve(), [args.run_dir, *args.reuse_dir], plan_only=args.plan_only)
     except (ValueError, KeyError, OSError) as exc:
         parser.error(str(exc))

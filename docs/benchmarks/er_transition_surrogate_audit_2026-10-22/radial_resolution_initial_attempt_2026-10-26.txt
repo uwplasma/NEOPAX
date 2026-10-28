@@ -1,0 +1,48 @@
+Remote radial-convergence attempt supplied on 2026-10-26.
+Commit pulled: 5e5fcfa (from c3408aa).
+Output directory: outputs/new_root_candidates/radial_resolution_20261026
+Grids: 51,101,201. Fixed accepted profile iteration: 1.
+
+Both completed 51-cell forward endpoints were reused from local_profiles:
+evaluation_0001_forward.json (baseline), evaluation_0002_forward.json (accepted 1).
+
+n51_baseline:
+initial_root=0.5742164146563765 initial_bracket=28
+initial_Er_at_target=16.666710943564883
+root=0.5174235897859059 root_error=0.003423589785905845 bracket=25
+Er_at_target=5.457709756549644
+Er_left_fixed_probe=27.775785627160637 Er_right_fixed_probe=-3.4820237154316467
+interpolated_width_pm2=0.002509176880868269 centers_inside_pm2=0
+native_local_cost=3.723324473342151 native_annular_cost=3.723324473342151
+accepted_steps=179 attempts=303 final_time=2.0
+
+n51_accepted_0001:
+initial_root=0.5741455425450299 initial_bracket=28
+initial_Er_at_target=16.478034679094076
+root=0.49780399703165884 root_error=0.016196002968341172 bracket=24
+Er_at_target=-2.697847729926729
+Er_left_fixed_probe=-3.3092446801767803 Er_right_fixed_probe=-2.4529464305268522
+interpolated_width_pm2=0.0026543857352051003 centers_inside_pm2=0
+native_local_cost=2.5413216218536463 native_annular_cost=0.9544315136497508
+accepted_steps=222 attempts=380 final_time=2.0
+
+n101_baseline required a new solve. Parent reported:
+Forward worker failed for n101_baseline; see n101_baseline.log.
+
+Subsequently supplied worker tail:
+[Compiling module jit_scan for GPU] compilation took 2m22.234822584s.
+[NEOPAX] built runtime NTX scan database: rho=7 nu_v=16 Er_tilde=11 grid=(25,25,33) backend=vmec
+Traceback (most recent call last):
+  File "examples/benchmarks/check_er_root_radial_resolution.py", line 337, in <module>
+    main()
+  File "examples/benchmarks/check_er_root_radial_resolution.py", line 324, in main
+    write_json(args.worker_output, forward.run_forward_task(task))
+  File "examples/benchmarks/check_er_root_candidate_descent.py", line 262, in run_forward_task
+    _, _, _, rollout, final = _schedule_rollout(cfg, runtime, state, accepted_step_limit=None)
+  File "examples/benchmarks/benchmark_transport_realtime_geometry_forward_fd.py", line 675, in _schedule_rollout
+    raise RuntimeError(
+RuntimeError: FD adaptive baseline did not complete: final_time=3.1984666027806051e-02, fail_code=0.
+
+The inherited configured attempt guard is 1000. The log did not print
+actual attempt/accept counts or the next dt for the incomplete 101-cell solve.
+No valid 101-cell endpoint and no 201-cell result were supplied.

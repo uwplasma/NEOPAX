@@ -1808,6 +1808,21 @@ All 31 checks in the simple-combined, warm-start and saved-geometry test files
 pass, using configuration/mocks and a small analytical-profile plot. No
 transport, ambipolar-root, VMEX or NTX solve was run locally.
 
+The user then clarified that the total trace budget must also increase.
+The shared CLI now additionally exposes `--transport-max-steps` (alias
+`--max-steps`, positive integer, default 1000). `transport_config` passes it
+to the actual solver configuration, so it affects the adaptive trajectory
+recorded for reverse AD as well as fresh forward reports. Setup/summary
+output records both budgets. For example, use
+`--max-reverse-accepted-steps 1000 --transport-max-steps 2000`; the larger
+total includes accepted and rejected adaptive attempts, while the adjoint
+continues to differentiate accepted steps only. The physical final time and
+checkpoint segment length are unchanged. Saved-result continuations inherit
+their stored total budget unless the CLI explicitly overrides it. A fallback
+preserves older argument namespaces used by the legacy combined example.
+All 36 lightweight tests and two subtests in the three affected runner test
+files pass, with no expensive local physics evaluation.
+
 The user supplied the standalone geometry-only run at `c6a1cca`, using the
 corrected reverse implementation from `e83a143`. The complete supplied excerpt
 is archived as [raw output](benchmarks/geometry_only_net_power_root_bootstrap_replay_fix_2026-10-17.txt),

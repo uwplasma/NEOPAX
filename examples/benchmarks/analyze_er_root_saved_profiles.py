@@ -183,7 +183,12 @@ def load_points(seed, run_dir, descent_dir=None):
             entries[point_key(event["parameters"])]["event"] = event
     if descent_dir is not None:
         for path in descent_dir.glob("*_task.json"):
-            task = read_json(path)
+            packet = read_json(path)
+            # Optimizer workers wrap the same forward task in a kind/seed
+            # packet. Other DOF runs reuse its baseline without copying it.
+            if packet.get("kind") == "ad":
+                continue
+            task = packet.get("forward_task", packet)
             key = point_key(task.get("parameter_values", []))
             result_path = path.with_name(path.name.replace("_task.json", ".json"))
             if (key not in entries or not result_path.exists()
@@ -211,7 +216,17 @@ def load_points(seed, run_dir, descent_dir=None):
         if report is not None:
             point["candidates"] = candidate_rows(report, point["crossing"])
         if forward is not None:
-            point["initial_Er"] = forward.get("initial_state", {}).get("Er")
+            point["initial_state"] = forward.get("initial_state", {})
+            point["initial_Er"] = point["initial_state"].get("Er")
+            if point["initial_Er"] is not None:
+                point["initial_crossing"] = crossing(point["initial_Er"], rho, **settings)
+                runtime_er = forward.get("runtime_initial_Er")
+                if runtime_er is not None:
+                    a, b = np.asarray(runtime_er), np.asarray(point["initial_Er"])
+                    if a.shape == b.shape:
+                        point["selected_minus_runtime_initial_Er_max_abs"] = float(np.max(abs(b - a)))
+            point["solver"] = {name: forward[name] for name in
+                               ("accepted_steps", "attempts", "final_time") if name in forward}
             if report is not None:
                 af, aa = np.asarray(forward["terminal_Er"]), np.asarray(er)
                 point["forward_AD_max_abs_difference"] = float(np.max(abs(af - aa))) if af.shape == aa.shape else None
@@ -224,6 +239,24 @@ def load_points(seed, run_dir, descent_dir=None):
         point["change_from_previous_accepted"] = compare_profiles(previous, point, settings["target"])
         point["change_from_baseline"] = compare_profiles(points[0], point, settings["target"])
         initial = point.get("initial_Er")
+        initial_changes = {}
+        for field in ("Er", "density", "pressure"):
+            a = points[0].get("initial_state", {}).get(field)
+            b = point.get("initial_state", {}).get(field)
+            if a is None or b is None:
+                continue
+            a, b = np.asarray(a, dtype=float), np.asarray(b, dtype=float)
+            if a.shape != b.shape:
+                initial_changes[field] = dict(shape_matches=False)
+                continue
+            if not np.isfinite(a).all() or not np.isfinite(b).all():
+                initial_changes[field] = dict(shape_matches=True, all_finite=False)
+                continue
+            difference = b - a
+            initial_changes[field] = dict(shape_matches=True, all_finite=True,
+                max_abs_change=float(np.max(abs(difference))),
+                l2_change=float(np.linalg.norm(difference)))
+        point["initial_state_change_from_baseline"] = initial_changes
         if initial0 is not None and initial is not None and len(initial0) == len(initial):
             a, b = np.asarray(initial0), np.asarray(initial)
             band = (np.asarray(point["rho"]) >= settings["inner_radius"]) & (np.asarray(point["rho"]) <= settings["outer_radius"])
@@ -247,11 +280,21 @@ def write_csv(path, rows):
 def write_outputs(analysis, out):
     out.mkdir(parents=True, exist_ok=True)
     (out / "summary.json").write_text(json.dumps(analysis, indent=2, allow_nan=False))
-    summary, cells, candidates = [], [], []
+    summary, cells, candidates, initial = [], [], [], []
     for point in analysis["points"]:
         base = dict(label=point["label"], status=point["status"], iteration=point["iteration"])
         summary.append({**base, **{k: v for k, v in point["crossing"].items() if k != "downcrossings"},
                         **point.get("change_from_previous_accepted", {})})
+        row = {**base, "step": point["step"], **point.get("solver", {}),
+               "terminal_root": point["crossing"]["root"], "terminal_bracket": point["crossing"]["bracket"],
+               "forward_AD_max_abs_difference": point.get("forward_AD_max_abs_difference"),
+               "selected_minus_runtime_initial_Er_max_abs": point.get("selected_minus_runtime_initial_Er_max_abs")}
+        row.update({"initial_" + name: value for name, value in point.get("initial_crossing", {}).items()
+                    if name in ("root", "bracket", "Er_at_target")})
+        for field, change in point.get("initial_state_change_from_baseline", {}).items():
+            row.update({"initial_" + field + "_" + name: value for name, value in change.items()})
+        row["initial_Er_annular_sign_change_indices"] = json.dumps(point.get("initial_Er_annular_sign_change_indices"))
+        initial.append(row)
         candidates.extend({**base, **row} for row in point.get("candidates", []))
         bracket = point["crossing"]["bracket"]
         indices = range(max(0, bracket - 2), min(len(point["rho"]), bracket + 4)) if bracket is not None else []
@@ -260,6 +303,7 @@ def write_outputs(analysis, out):
     write_csv(out / "crossing_summary.csv", summary)
     write_csv(out / "crossing_cells.csv", cells)
     write_csv(out / "candidate_comparison.csv", candidates)
+    write_csv(out / "initial_state_summary.csv", initial)
 
 
 def plot_profiles(analysis, out):
@@ -309,9 +353,16 @@ def main(argv=None):
         print("[saved-root-analysis] " + json.dumps(dict(label=point["label"], status=point["status"], crossing=root)))
         if "change_from_previous_accepted" in point:
             print("[saved-root-change] " + json.dumps(point["change_from_previous_accepted"]))
+        if "initial_state" in point:
+            print("[saved-initial-state] " + json.dumps(dict(
+                label=point["label"], status=point["status"], step=point["step"],
+                initial_crossing=point.get("initial_crossing"),
+                initial_state_change_from_baseline=point.get("initial_state_change_from_baseline"),
+                initial_Er_annular_sign_change_indices=point.get("initial_Er_annular_sign_change_indices"),
+                solver=point.get("solver"), forward_AD_max_abs_difference=point.get("forward_AD_max_abs_difference"))))
         for candidate in point.get("candidates", []):
             print("[saved-root-candidate] " + json.dumps(candidate))
-    print(f"Wrote {out / 'summary.json'}; crossing_summary.csv, crossing_cells.csv, candidate_comparison.csv")
+    print(f"Wrote {out / 'summary.json'}; crossing_summary.csv, crossing_cells.csv, candidate_comparison.csv, initial_state_summary.csv")
 
 
 if __name__ == "__main__":

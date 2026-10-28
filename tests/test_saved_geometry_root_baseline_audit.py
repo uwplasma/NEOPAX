@@ -1,6 +1,7 @@
 """Read small saved arrays/HDF5 only; no plasma solves or physics AD."""
 
 from contextlib import redirect_stdout
+import hashlib
 import io
 import json
 from pathlib import Path
@@ -31,6 +32,60 @@ def write_reference(directory, er):
 
 
 class SavedGeometryBaselineAuditTests(unittest.TestCase):
+    def test_recorded_input_summary_and_saved_transport_input_match(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            seed, summary = root / "input.optimized", root / "optimization_summary.json"
+            seed.write_text("RBC(0,0)=12.\n")
+            summary.write_text("{}")
+            transport_input = root / "optimized/transport/input.QI_neopax_geometry_full_transport_optimized"
+            transport_input.parent.mkdir(parents=True)
+            transport_input.write_bytes(seed.read_bytes())
+            digest = hashlib.sha256(seed.read_bytes()).hexdigest()
+            manifest = dict(resolved_config=dict(geometry=dict(vmec_input_file=str(seed))),
+                seed_sha256=digest, saved_geometry_result=dict(accepted_geometry_input=str(seed),
+                accepted_geometry_sha256=digest, summary_path=str(summary),
+                summary_sha256=hashlib.sha256(summary.read_bytes()).hexdigest()))
+            result = audit.source_provenance(manifest, root)
+            self.assertTrue(result["all_recorded_sources_unchanged"])
+            self.assertTrue(result["files"]["saved_transport_input"]["matches_current_baseline_input_bytes"])
+
+            # An unchanged path does not make a cached baseline the same case.
+            seed.write_text("RBC(0,0)=13.\n")
+            result = audit.source_provenance(manifest, root)
+            self.assertFalse(result["all_recorded_sources_unchanged"])
+            self.assertFalse(result["files"]["baseline_input"]["matches_recorded"])
+            self.assertFalse(result["files"]["accepted_geometry_input"]["matches_recorded"])
+            self.assertFalse(result["files"]["saved_transport_input"]["matches_current_baseline_input_bytes"])
+            self.assertTrue(result["files"]["summary_path"]["matches_recorded"])
+
+    def test_missing_or_unrecorded_sources_do_not_establish_identity(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "missing.input"
+            manifest = dict(resolved_config=dict(geometry=dict(vmec_input_file=str(path))))
+            result = audit.source_provenance(manifest, directory)
+            self.assertIsNone(result["all_recorded_sources_unchanged"])
+            self.assertFalse(result["files"]["baseline_input"]["available"])
+            self.assertIsNone(result["files"]["saved_transport_input"]["matches_current_baseline_input_bytes"])
+            manifest["seed_sha256"] = "recorded"
+            self.assertFalse(audit.source_provenance(manifest, directory)["all_recorded_sources_unchanged"])
+
+    def test_summary_changes_are_distinguished_from_input_changes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            seed, summary = root / "input.optimized", root / "optimization_summary.json"
+            seed.write_text("unchanged input")
+            summary.write_text("old summary")
+            manifest = dict(resolved_config=dict(geometry=dict(vmec_input_file=str(seed))),
+                seed_sha256=hashlib.sha256(seed.read_bytes()).hexdigest(),
+                saved_geometry_result=dict(summary_path=str(summary),
+                    summary_sha256=hashlib.sha256(summary.read_bytes()).hexdigest()))
+            summary.write_text("new summary")
+            result = audit.source_provenance(manifest, root)
+            self.assertFalse(result["all_recorded_sources_unchanged"])
+            self.assertTrue(result["files"]["baseline_input"]["matches_recorded"])
+            self.assertFalse(result["files"]["summary_path"]["matches_recorded"])
+
     def test_saved_electron_region_and_new_ion_case_are_distinguished(self):
         with tempfile.TemporaryDirectory() as directory:
             write_reference(directory, 10*(.6-RHO))
@@ -90,6 +145,7 @@ class SavedGeometryBaselineAuditTests(unittest.TestCase):
             with redirect_stdout(io.StringIO()):
                 audit.main(["--geometry-result-dir", str(root), "--baseline-dir", str(baseline)])
             result = json.loads((baseline / "saved_geometry_baseline_audit.json").read_text())
+            self.assertIsNone(result["source_provenance"]["all_recorded_sources_unchanged"])
             self.assertFalse(result["runtime_resolution"]["matches_declared"])
             self.assertFalse(result["terminal_comparison"]["matches"])
             self.assertFalse((baseline / "ad_summary.json").exists())

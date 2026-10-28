@@ -15,8 +15,25 @@ With `--full-transport-shared-payload-smoke --objective all`, the new table has
 for the usual eight parameters. Existing replay and full-simulation commands
 are unchanged; omitting `--accepted-step-limit` still runs to the configured
 final time. Historical 18-row / 144-entry results below retain their original
-objective set. No new full-simulation GPU results have been generated for
-the restored rows.
+objective set.
+
+The user has now supplied the [full-time 20-row rerun](database_transition_objectives_ad_recorded_reuse_full_t20_left_right_2026-10-22.md):
+all 20 residuals and 160 derivatives are finite. All 18 common residual values
+and all 108 common profile derivatives match the previous full-time run
+exactly at printed precision. The maximum relative difference among common
+geometry derivatives is 7.716718064310421e-10. The restored left/right Er
+values are 39.311269029818902 and 39.894759548722909 kV/m; both are positive.
+They do not straddle the transition. The smooth transition radius remains
+0.51703593282774429, with the same weak profile sensitivities as before.
+The supplied excerpt omits accepted-step counts and replay endpoint checks.
+Full-time FD validation remains pending.
+
+The [surrogate formulation audit](er_transition_surrogate_audit_2026-10-22/README.md)
+demonstrates why its gradients need not match the old two-cell target loss:
+common amplitude scaling preserves a resolved chord location, the satisfied
+strength margin is almost inactive, and sharp face selection can suppress
+selection-weight derivatives. These are local objective properties; the
+audit does not run transport or validate the full-time AD sweep.
 
 Lightweight validation: 55 tests plus 41 subtests passed. They cover both
 accepted-prefix and full-simulation request plumbing, all/single-objective

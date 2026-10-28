@@ -104,3 +104,36 @@ chain rule, independent starts and frozen DOF blocks, cache separation and
 bootstrap-specific stopping. They do not validate the full physical
 transport Jacobian or establish a physical optimization result; those runs
 remain remote. No local VMEC, NTX or transport solve was performed.
+
+The supplied 2026-10-26 run exhausted eight backtracks in each original-root
+DOF block without accepting a move. Even the smallest step (0.0000078125)
+changed the final root from approximately 0.51742 to 0.49781. The original
+cost correctly increased and rejected those points. Bootstrap profiles have
+three accepted steps, reducing its cost from 0.383795 to 0.258947; a fourth
+forward endpoint is awaiting AD in the supplied log. This does not establish
+a physical cause for the root jump or a complete physical Jacobian check.
+
+Inspect the files already saved by this run, without another transport solve:
+
+```bash
+cd /home/exouser/NEOPAX || exit 1
+neopax_case=outputs/new_root_candidates/original_root_bootstrap_20261026
+set -o pipefail
+for neopax_run in original_profiles original_geometry bootstrap_profiles; do
+  /home/exouser/jax_env/bin/python examples/benchmarks/analyze_er_root_saved_profiles.py \
+    --ad-report "$neopax_case/baseline/ad_summary.json" \
+    --run-dir "$neopax_case/$neopax_run" \
+    --descent-dir "$neopax_case/original_profiles" \
+    --out-dir "$neopax_case/${neopax_run}_saved_analysis" \
+    2>&1 | tee "$neopax_case/${neopax_run}_saved_analysis.log" || break
+done
+```
+
+The analyzer imports NumPy only for its numerical work. It reads initial
+Er/density/pressure arrays, terminal fields and stored solver counts, and
+writes `initial_state_summary.csv`, crossing tables and a JSON summary.
+`saved-initial-state` console records expose initial root/bracket changes
+alongside the terminal changes. The shared baseline is loaded from the
+input-matched forward cache in `original_profiles`; no solver is launched.
+This distinguishes changes already present in the initializer from changes
+that appear during transport, without assuming either is responsible.
