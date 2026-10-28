@@ -5,12 +5,15 @@ Default e/D/T temperature and D/T density amplitude/shape DOFs give 15
 variables. Electron density follows quasineutrality; initially absent helium
 and frozen temperatures remain fixed. Uses the existing persistent full-time
 transport reverse AD and bounded SciPy least squares, with the geometry-only
-root/bootstrap/net-power targets and weights.
+root/bootstrap/net-power targets and default weights. CLI weight overrides
+allow the transport objectives to be rebalanced for a separate experiment.
 """
 
 from __future__ import annotations
 
+import argparse
 import csv
+from dataclasses import replace
 import json
 import os
 from pathlib import Path
@@ -83,6 +86,13 @@ def independent_parameters(config, requested=None):
     return tuple(labels)
 
 
+def nonnegative_weight(value):
+    weight = float(value)
+    if not np.isfinite(weight) or weight < 0.:
+        raise argparse.ArgumentTypeError("weight must be finite and non-negative")
+    return weight
+
+
 def parser():
     out = stage2.parser()
     out.description = __doc__
@@ -90,6 +100,12 @@ def parser():
                      profile_only=True, max_reverse_accepted_steps=None)
     out.add_argument("--species-profile-parameters", help="Optional comma-separated indexed DOFs; default 15 for e/D/T/He.")
     out.add_argument("--plan-only", action="store_true", help="Read saved inputs and print DOFs/targets; build no runtime.")
+    out.add_argument("--root-weight", type=nonnegative_weight,
+                     help="Override both root-position and strength-deficit weights; default keeps the geometry example's weights.")
+    out.add_argument("--bootstrap-weight", type=nonnegative_weight,
+                     help="Override the bootstrap-current penalty weight.")
+    out.add_argument("--net-power-weight", type=nonnegative_weight,
+                     help="Override the net-power weight (residual is in MW/m^3).")
     return out
 
 
@@ -105,8 +121,18 @@ def prepare(args):
     labels = independent_parameters(config, args.species_profile_parameters)
     config.setdefault("optimization", {}).update(species_profile_parameters=list(labels),
                                                 species_profile_quasineutral=True)
-    terms = tuple(term for term in geometry.active_terms(args)
-                  if getattr(term[0], "objective", term[0]).family == "transport")
+    overrides = {
+        "Er_transition_location_moment": args.root_weight,
+        "Er_transition_strength_deficit": args.root_weight,
+        "bootstrap_current_penalty": args.bootstrap_weight,
+        "net_total_power_volume_average_mw_m3": args.net_power_weight,
+    }
+    terms = []
+    for term in opt._normalize_initial_er_root_least_squares_terms(geometry.active_terms(args)):
+        if term.objective.family == "transport":
+            weight = overrides.get(term.label or term.objective.name)
+            terms.append(term if weight is None else replace(term, weight=weight))
+    terms = tuple(terms)
     values = np.asarray(species_profile_values(config), dtype=float)
     lower = np.asarray([stage2.combined.PROFILE_PHYSICAL_LOWER[ProfileParameterSpec(p).base_name] for p in labels])
     upper = np.asarray([stage2.combined.PROFILE_PHYSICAL_UPPER[ProfileParameterSpec(p).base_name] for p in labels])

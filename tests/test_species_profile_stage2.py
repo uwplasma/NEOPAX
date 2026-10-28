@@ -270,6 +270,53 @@ class SpeciesProfileTests(unittest.TestCase):
         self.assertEqual(weights["net_total_power_volume_average_mw_m3"], 10000.)
         self.assertEqual(source["seed_input"], "/saved/input.optimized")
 
+    def test_unit_weights_reach_residuals_and_jacobian_without_reweighting_monitors(self):
+        config, labels, values, runtime, baseline, state = fixture()
+        saved = SimpleNamespace(summary={"database_grid": [25, 25, 33]},
+                                baseline_input=Path("/original/input.seed"))
+        metadata = {"seed_input": "/saved/input.optimized", "max_reverse_accepted_steps": 900}
+        args = example.parser().parse_args([
+            "--geometry-result-dir", "/saved", "--transition-location-objective",
+            "--bootstrap-penalty", "--net-power", "--no-root-objectives", "--no-max-er",
+            "--root-weight", "1", "--bootstrap-weight", "1", "--net-power-weight", "1",
+        ])
+        with patch.object(example.stage2, "load_geometry_result", return_value=saved), \
+             patch.object(example.baseline, "prepare_case", return_value=(copy.deepcopy(config), {}, metadata)), \
+             patch.object(opt, "full_transport_profile_least_squares_problem", side_effect=AssertionError("physics forbidden")):
+            _, order, terms, _, _, _ = example.prepare(args)
+        self.assertEqual(order, labels)
+        weights = {t.label or t.objective.name: t.weight for t in terms}
+        self.assertEqual(weights, {
+            "Er_transition_rho": 0., "Er_transition_location_moment": 1.,
+            "Er_transition_strength": 0., "Er_transition_strength_deficit": 1.,
+            "bootstrap_current_penalty": 1., "net_total_power_volume_average_mw_m3": 1.,
+        })
+        raw_values = jnp.array([.52, .006, .5, .5, .6, .8])
+        raw_jacobian = jnp.arange(1., 91.).reshape(6, 15)
+        raw = SimpleNamespace(result=SimpleNamespace(parameter_labels=labels,
+                              residuals=raw_values, jacobian=raw_jacobian))
+        actual = opt._assemble_mixed_initial_er_root_result(terms, base_evaluation=raw)
+
+        def expected_residual(x):
+            v = raw_values + raw_jacobian @ x
+            deficit = .9-v[3]
+            return jnp.array([0., v[1], 0., .5*(deficit+jnp.hypot(deficit, 1e-6)),
+                              jnp.maximum(v[4]-.1, 0.), v[5]-example.geometry.NET_POWER_TARGET_MW_M3])
+
+        x = jnp.zeros(15)
+        np.testing.assert_allclose(actual.residuals, expected_residual(x), rtol=1e-13)
+        step = 1e-7
+        fd = np.column_stack([(expected_residual(x.at[i].set(step))-
+                               expected_residual(x.at[i].set(-step)))/(2*step) for i in range(15)])
+        np.testing.assert_allclose(actual.jacobian, fd, rtol=1e-9, atol=1e-9)
+
+    def test_invalid_weight_overrides_stop_at_argument_parsing(self):
+        for option in ("--root-weight", "--bootstrap-weight", "--net-power-weight"):
+            for value in ("-1", "nan", "inf"):
+                with self.subTest(option=option, value=value), \
+                     patch("sys.stderr", new=io.StringIO()), self.assertRaises(SystemExit):
+                    example.parser().parse_args(["--geometry-result-dir", "/saved", f"{option}={value}"])
+
 
 if __name__ == "__main__":
     unittest.main()

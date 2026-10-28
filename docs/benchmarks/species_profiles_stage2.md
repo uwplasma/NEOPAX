@@ -97,6 +97,52 @@ For a smaller subset, for example independent temperatures only, use:
 --species-profile-parameters 'T0[e],temperature_shape_power[e],temperature_shape_alpha[e],T0[D],temperature_shape_power[D],temperature_shape_alpha[D],T0[T],temperature_shape_power[T],temperature_shape_alpha[T]'
 ```
 
+## Weight 1 for power, bootstrap and root
+
+The species-profile example accepts `--root-weight`, `--bootstrap-weight`
+and `--net-power-weight`. Omit these options to retain the production
+weights above. `--root-weight` overrides both the location-moment and
+strength-deficit weights; the raw location/strength monitor rows retain
+zero weight. Targets, residual definitions and the fixed geometry are
+unchanged, and effective weights are saved in `case_manifest.json` and
+`optimization_summary.json`.
+
+```bash
+cd /home/exouser/NEOPAX || exit 1
+mkdir -p outputs
+set -o pipefail
+
+env -u JAX_COMPILATION_CACHE_DIR \
+JAX_ENABLE_COMPILATION_CACHE=0 \
+PYTHONPATH="$HOME/VMEX:$HOME/NTX/src${PYTHONPATH:+:$PYTHONPATH}" \
+/home/exouser/jax_env/bin/python \
+  examples/optimization/optimize_species_profiles_from_geometry_result.py \
+  --geometry-result-dir outputs/geometry_qi_max_er_transition_bootstrap_net_power_initial_root_database_full_transport_optimization \
+  --transition-location-objective \
+  --bootstrap-penalty \
+  --net-power \
+  --no-root-objectives \
+  --no-max-er \
+  --root-weight 1 \
+  --bootstrap-weight 1 \
+  --net-power-weight 1 \
+  --er-transition-rho-target 0.514 \
+  --er-transition-strength-target 0.9 \
+  --profile-trust-multiplier 1.0 \
+  --max-nfev 30 \
+  --out-dir outputs/species_profiles_unit_weights_20261027 \
+  2>&1 | tee outputs/species_profiles_unit_weights_20261027.log
+```
+
+This uses all 15 profile DOFs. Unit weights mean the cost is half the sum
+of the squared existing residuals; no new normalization is introduced.
+The power residual remains in MW/m^3, the position residual is a radial
+location moment, and the bootstrap residual is the excess over 0.1.
+Their magnitudes and derivatives can still differ substantially. At the
+saved baseline (root about 0.51742, bootstrap about 0.53806, power about
+299.89 MW), bootstrap dominates the unit-weight cost. This experiment
+changes their trade-off and does not give them equal influence.
+
 ## Outputs and checks
 
 The output includes a fixed-geometry input copy, case manifest, saved
