@@ -139,7 +139,10 @@ def _prepare_deck(
     tprim: float,
     fprim: float,
     run_dir: Path,
+    run_to: str = "t_max",
 ) -> tuple[Path, Path]:
+    if run_to not in ("t_max", "saturation"):
+        raise ValueError("run_to must be 't_max' or 'saturation'.")
     # Reload through JSON to copy this TOML-compatible tree without sharing
     # nested dictionaries between surfaces.
     data = json.loads(json.dumps(template))
@@ -166,7 +169,7 @@ def _prepare_deck(
     data["terms"] = terms
 
     time = dict(data.get("time", {}))
-    time.update(t_max=float(t_max), run_to="t_max")
+    time.update(t_max=float(t_max), run_to=run_to)
     data["time"] = time
 
     output_path = (run_dir / "gkx.out.nc").resolve()
@@ -190,6 +193,7 @@ def _prepare_deck(
         "tprim_a_over_L_T": float(tprim),
         "fprim_a_over_L_n": float(fprim),
         "t_max_normalized": float(t_max),
+        "run_to": run_to,
         "deck": str(deck_path.resolve()),
         "output": str(output_path),
     }
@@ -216,6 +220,15 @@ def _last_saved_time(path: Path) -> float | None:
         return None
 
 
+def _saved_saturation(output: Path) -> dict[str, Any] | None:
+    summary = output.with_name(output.name.removesuffix(".out.nc") + ".summary.json")
+    try:
+        data = json.loads(summary.read_text(encoding="utf-8")).get("saturation")
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
 def _run_deck(
     deck: Path,
     output: Path,
@@ -224,14 +237,18 @@ def _run_deck(
     gkx_root: Path,
     python: Path,
     rerun_complete: bool,
+    run_to: str = "t_max",
 ) -> None:
     saved_time = _last_saved_time(output)
+    saturation = _saved_saturation(output) if run_to == "saturation" else None
     if (
         saved_time is not None
-        and saved_time >= float(t_max) * (1.0 - 1.0e-7)
+        and (saved_time >= float(t_max) * (1.0 - 1.0e-7)
+             or bool(saturation and saturation.get("saturated")))
         and not rerun_complete
     ):
-        print(f"[GKX scan] complete; skipping {deck.parent.name}: t={saved_time:.8g}")
+        reason = "saturated" if saturation and saturation.get("saturated") else "complete"
+        print(f"[GKX scan] {reason}; skipping {deck.parent.name}: t={saved_time:.8g}")
         return
 
     env = os.environ.copy()
@@ -252,10 +269,11 @@ def _run_deck(
             bufsize=1,
         )
         assert process.stdout is not None
-        for line in process.stdout:
-            print(line, end="", flush=True)
-            log.write(line)
-            log.flush()
+        with process.stdout:
+            for line in process.stdout:
+                print(line, end="", flush=True)
+                log.write(line)
+                log.flush()
         return_code = process.wait()
     if return_code:
         raise subprocess.CalledProcessError(return_code, command)
@@ -511,7 +529,8 @@ def main() -> int:
                 Path(point["output"]),
                 t_max=args.t_max,
                 gkx_root=gkx_root,
-                python=args.gkx_python.expanduser().resolve(),
+                # Preserve the venv symlink; resolving it loses site-packages.
+                python=args.gkx_python.expanduser().absolute(),
                 rerun_complete=args.rerun_complete,
             )
     _plot_results(points, output_dir=output_dir, average_fraction=args.average_fraction)

@@ -101,8 +101,11 @@ def _write_comparison(points: list[dict], output_dir: Path, fraction: float) -> 
     for point in points:
         time, flux = scan._read_heat_flux(Path(point["output"]))
         stats = _late_statistics(time, flux, fraction)
+        saturation = scan._saved_saturation(Path(point["output"])) or {}
         histories.append((point, time, flux))
-        summaries.append({**point, **stats})
+        summaries.append({**point, **stats, "gkx_saturated": saturation.get("saturated"),
+                          "gkx_saturation_mean": saturation.get("mean"),
+                          "gkx_saturation_sem": saturation.get("sem")})
     with (output_dir / "heat_flux_history.csv").open("w", newline="", encoding="utf-8") as stream:
         writer = csv.writer(stream)
         writer.writerow(("equilibrium", "s", "alpha", "time", "ion_heat_flux"))
@@ -120,7 +123,9 @@ def _write_comparison(points: list[dict], output_dir: Path, fraction: float) -> 
 
     fig, axes = plt.subplots(1, 2, figsize=(11, 4), constrained_layout=True)
     for index, (point, time, flux) in enumerate(histories):
-        axes[0].plot(time, flux, label=point["equilibrium"])
+        verdict = summaries[index]["gkx_saturated"]
+        status = "" if verdict is None else (" (saturated)" if verdict else " (not saturated)")
+        axes[0].plot(time, flux, label=point["equilibrium"]+status)
         axes[1].bar(index, summaries[index]["ion_heat_flux_mean"],
                     yerr=summaries[index]["ion_heat_flux_std"], capsize=4)
     axes[0].set(xlabel="GKX normalized time", ylabel="Ion heat flux [GKX normalization]")
@@ -133,6 +138,9 @@ def _write_comparison(points: list[dict], output_dir: Path, fraction: float) -> 
     fig.savefig(output_dir / "heat_flux_comparison.png", dpi=200)
     plt.close(fig)
     print(f"[adiabatic comparison] mean heat flux: initial={initial:.8g} optimized={optimized:.8g}", flush=True)
+    for row in summaries:
+        print(f"[adiabatic comparison] {row['equilibrium']}: gkx_saturated={row['gkx_saturated']} "
+              f"gkx_saturation_mean={row['gkx_saturation_mean']} gkx_saturation_sem={row['gkx_saturation_sem']}", flush=True)
     print(f"[adiabatic comparison] wrote comparison.json, CSVs and heat_flux_comparison.png in {output_dir}")
 
 
@@ -141,11 +149,13 @@ def parser():
     out.add_argument("output_folder", type=Path, help="Geometry-only optimization output with initial/ and optimized/ wouts")
     out.add_argument("--initial-wout", type=Path)
     out.add_argument("--optimized-wout", type=Path)
-    out.add_argument("--s", type=float, default=.5, help="Normalized toroidal flux s, not rho (default: 0.5)")
+    out.add_argument("--s", type=float, default=.5, help="Normalized toroidal flux s in (0, 1], not rho (default: 0.5)")
     out.add_argument("--LT", "--tprim", dest="tprim", type=float, default=3., help="Ion normalized inverse temperature gradient a/L_T (default: 3)")
     out.add_argument("--Ln", "--fprim", dest="fprim", type=float, default=0., help="Ion normalized inverse density gradient a/L_n (default: 0)")
     out.add_argument("--alpha", type=float, default=0., help="Field-line label (default: 0)")
-    out.add_argument("--t-max", type=float, default=700., help="Fixed normalized GKX horizon (default: 700)")
+    out.add_argument("--t-max", type=float, default=700., help="Normalized time horizon, or cap with --until-saturated (default: 700)")
+    out.add_argument("--until-saturated", action="store_true",
+                     help="Enable GKX's heat-flux/Wphi/Wg saturation assessment and early stop, capped by --t-max.")
     out.add_argument("--average-fraction", type=float, default=.2, help="Final fraction of each history to average (default: 0.2)")
     out.add_argument("--gkx-root", type=Path, default=scan._default_gkx_root())
     out.add_argument("--gkx-python", type=Path, default=Path(sys.executable))
@@ -161,8 +171,9 @@ def main(argv=None):
     args = parser().parse_args(argv)
     if not all(math.isfinite(v) for v in (args.s, args.alpha, args.tprim, args.fprim, args.t_max, args.average_fraction)):
         raise ValueError("Surface, gradients, alpha, time and averaging fraction must be finite.")
-    if not 0. < args.s < 1. or args.t_max <= 0. or not 0. < args.average_fraction <= 1.:
-        raise ValueError("Require 0 < s < 1, t_max > 0, and 0 < average-fraction <= 1.")
+    if not 0. < args.s <= 1. or args.t_max <= 0. or not 0. < args.average_fraction <= 1.:
+        raise ValueError("Require 0 < s <= 1, t_max > 0, and 0 < average-fraction <= 1.")
+    run_to = "saturation" if args.until_saturated else "t_max"
     folder = args.output_folder.expanduser().resolve()
     gkx_root = args.gkx_root.expanduser().resolve()
     template_path = (args.template or gkx_root / "examples/common_input.toml").expanduser().resolve()
@@ -178,10 +189,12 @@ def main(argv=None):
                    deck=str(output_dir / label / "gkx.toml"), output=str(output_dir / label / "gkx.out.nc"))
               for label, wout in zip(("initial", "optimized"), wouts, strict=True)]
     manifest = dict(template=str(template_path), template_sha256=_sha256(template_path),
-                    t_max=args.t_max, points=points)
+                    t_max=args.t_max, run_to=run_to, points=points)
     manifest_path = output_dir / "case_manifest.json"
     if manifest_path.exists():
-        if json.loads(manifest_path.read_text(encoding="utf-8")) != manifest:
+        saved_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        saved_manifest.setdefault("run_to", "t_max")  # Original fixed-horizon comparisons.
+        if saved_manifest != manifest:
             raise ValueError("Saved comparison inputs differ; choose a fresh --out-dir to avoid reusing unrelated GKX output.")
     elif any(Path(point["output"]).exists() for point in points):
         raise ValueError("Existing GKX outputs have no comparison manifest; choose a fresh --out-dir.")
@@ -191,16 +204,19 @@ def main(argv=None):
         for point in points:
             scan._prepare_deck(template, wout=Path(point["wout"]), rho=point["rho"], torflux=args.s,
                                t_max=args.t_max, tprim=args.tprim, fprim=args.fprim,
-                               run_dir=output_dir / point["equilibrium"])
+                               run_dir=output_dir / point["equilibrium"], run_to=run_to)
             print(f"[adiabatic comparison] {point['equilibrium']}: {point['wout']}; "
-                  f"s={args.s:g} alpha={args.alpha:g} a/L_T={args.tprim:g} a/L_n={args.fprim:g}", flush=True)
+                  f"s={args.s:g} alpha={args.alpha:g} a/L_T={args.tprim:g} a/L_n={args.fprim:g} run_to={run_to}", flush=True)
     if args.prepare_only:
         print(f"[adiabatic comparison] prepared inputs only: {output_dir}")
         return 0
     if not args.plot_only:
         for point in points:
+            # Resolving a venv's Python symlink selects the system Python
+            # instead, losing the environment's installed packages.
             scan._run_deck(Path(point["deck"]), Path(point["output"]), t_max=args.t_max,
-                           gkx_root=gkx_root, python=args.gkx_python.expanduser().resolve(), rerun_complete=False)
+                           gkx_root=gkx_root, python=args.gkx_python.expanduser().absolute(),
+                           rerun_complete=False, run_to=run_to)
     _write_comparison(points, output_dir, args.average_fraction)
     return 0
 
