@@ -166,5 +166,140 @@ class WoutErBootstrapTests(unittest.TestCase):
             self.assertFalse((folder / "wout_test_initial_er_root_bootstrap_current.csv").exists())
 
 
+class WoutPressureProfileTests(unittest.TestCase):
+    @staticmethod
+    def write_wout(path, *, b0=9., pressure=None, field_variable="b0"):
+        from netCDF4 import Dataset
+
+        if pressure is None:
+            pressure = np.asarray([120000., 90000., 60000., 30000., 0.])
+        with Dataset(path, "w") as dataset:
+            dataset.createDimension("radius", len(pressure))
+            dataset.createVariable("presf", "f8", ("radius",))[:] = pressure
+            # Negative toroidal flux must still give increasing s=phi/phi_edge.
+            dataset.createVariable("phi", "f8", ("radius",))[:] = np.linspace(0., -2., len(pressure))
+            dataset.createVariable(field_variable, "f8")[...] = b0
+
+    def test_field_scaling_quasineutrality_and_total_pressure_on_correct_s_grid(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "wout.step780.nc"
+            for field in (9., -4.5):
+                with self.subTest(field=field):
+                    self.write_wout(path, b0=field)
+                    config = example.config_with_wout_pressure({"geometry": {"n_radial": 4}}, path)
+                    rho = (np.arange(4) + .5) / 4
+                    expected_p = 120000. * (1. - rho**2)
+                    density = np.asarray(config["profiles"]["density"])
+                    temperature = np.asarray(config["profiles"]["temperature"])
+                    ne_axis = 4.21e20 * abs(field) / 9.
+                    self.assertEqual(config["species"]["names"], ["e", "H"])
+                    self.assertEqual(config["species"]["mass_mp"][1], 1.)
+                    self.assertEqual(config["species"]["charge_qp"], [-1., 1.])
+                    np.testing.assert_array_equal(density[0], density[1])
+                    np.testing.assert_array_equal(temperature[0], temperature[1])
+                    np.testing.assert_allclose(density[0], ne_axis * np.sqrt(1. - rho**2))
+                    np.testing.assert_allclose(np.sum(density * temperature, axis=0) * 1.602176634e-19,
+                                               expected_p, rtol=1e-14)
+                    self.assertAlmostEqual(config["wout_pressure"]["ne_axis_m3"] / ne_axis, 1.)
+                    # Exercise the actual prescribed-profile state conversion,
+                    # without geometry construction, models or physics solves.
+                    from NEOPAX._orchestrator import _build_state
+                    state = _build_state(config, SimpleNamespace(r_grid=rho),
+                                         SimpleNamespace(number_species=2, charge_qp=np.asarray([-1., 1.])))
+                    np.testing.assert_allclose(np.asarray(state.density), density / 1e20)
+                    np.testing.assert_allclose(np.sum(np.asarray(state.pressure), axis=0) * 1e23 * 1.602176634e-19,
+                                               expected_p, rtol=1e-14)
+
+    def test_pressure_mode_replaces_old_species_settings_without_mutating_input(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "wout.step780.nc"
+            self.write_wout(path)
+            original = dict(geometry=dict(n_radial=3, rho_edge=.8),
+                            profiles=dict(n0=100.), species=dict(names=["e", "D", "T", "He"]),
+                            boundary=dict(density=dict(right=dict(value=dict(e=.3, D=.1, T=.2)))),
+                            equations=dict(toggle_temperature=[True] * 4),
+                            turbulence=dict(flux_model="turbulent_power_analytical", chi_density=[1.] * 4),
+                            sources=dict(temperature=["dt_reaction"]), optimization=dict(species_profile_quasineutral=True),
+                            neoclassical=dict(flux_model="ntx_exact_lij_runtime"))
+            before = copy.deepcopy(original)
+            config = example.config_with_wout_pressure(original, path)
+            self.assertEqual(original, before)
+            self.assertEqual(config["boundary"], {})
+            self.assertEqual(config["sources"], {})
+            self.assertEqual(config["turbulence"], {"flux_model": "none"})
+            self.assertNotIn("equations", config)
+            self.assertNotIn("optimization", config)
+            self.assertEqual(config["neoclassical"], original["neoclassical"])
+            self.assertEqual(np.asarray(config["profiles"]["density"]).shape, (2, 3))
+            np.testing.assert_allclose(config["wout_pressure"]["rho"], [(.5 + i) * .8 / 3 for i in range(3)])
+
+    def test_profiles_only_exports_reusable_toml_without_any_physics_or_boozer(self):
+        with tempfile.TemporaryDirectory() as directory:
+            folder = Path(directory)
+            path = folder / "wout.step780.nc"
+            self.write_wout(path, b0=3.)
+            template = folder / "base.toml"
+            template.write_text('[geometry]\nn_radial = 4\n[profiles]\nn0 = 99.0\n', encoding="utf-8")
+            out = folder / "new/step780.png"
+            forbidden = AssertionError("Profiles-only must not run any physics or Boozer transforms")
+            with patch.object(example, "build_runtime_context", side_effect=forbidden), \
+                 patch.object(example, "_resolve_boozer_file", side_effect=forbidden), \
+                 patch.object(example, "initial_er_selected_root_profile", side_effect=forbidden), \
+                 redirect_stdout(io.StringIO()):
+                self.assertEqual(example.main([str(path), "--config", str(template), "--out", str(out),
+                                               "--wout-pressure", "--profiles-only"]), 0)
+            generated = example.load_config(folder / "new/step780_profiles.toml")
+            self.assertEqual(generated["species"]["n_species"], 2)
+            self.assertEqual(generated["profiles"]["model"], "prescribed")
+            self.assertEqual(generated["geometry"]["vmec_file"], str(path.resolve()))
+            self.assertAlmostEqual(generated["wout_pressure"]["ne_axis_m3"] / 4.21e20, 1/3)
+            rows = np.genfromtxt(folder / "new/step780_profiles.csv", delimiter=",", names=True)
+            np.testing.assert_allclose(rows["ne_m3"], generated["profiles"]["density"][0])
+            np.testing.assert_allclose(rows["Te_keV"], np.asarray(generated["profiles"]["temperature"])[0] / 1e3)
+            self.assertFalse(out.exists())
+
+    def test_full_calculation_uses_the_exported_pressure_profiles(self):
+        with tempfile.TemporaryDirectory() as directory:
+            folder = Path(directory)
+            path = folder / "wout.step780.nc"
+            self.write_wout(path)
+            template = folder / "base.toml"
+            template.write_text('[geometry]\nn_radial = 3\n', encoding="utf-8")
+            boozer = folder / "boozmn.nc"
+            boozer.touch()
+            out = folder / "er.png"
+            seen = {}
+
+            def solve(_path, *, config_path, **kwargs):
+                seen.update(example.load_config(config_path))
+                return np.asarray([.1, .5, .9]), np.asarray([1., 0., -1.]), None, np.ones(3, dtype=bool)
+
+            with patch.object(example, "solve_initial_er_and_bootstrap_from_wout", side_effect=solve), \
+                 patch.object(example, "plot_er_profile"), redirect_stdout(io.StringIO()):
+                example.main([str(path), "--config", str(template), "--boozer-file", str(boozer),
+                              "--wout-pressure", "--out", str(out)])
+            self.assertEqual(seen["profiles"]["model"], "prescribed")
+            self.assertEqual(seen["species"]["names"], ["e", "H"])
+            self.assertEqual(seen["wout_pressure"]["field_abs_T"], 9.)
+
+    def test_vacuum_negative_pressure_zero_field_and_missing_field_are_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "wout.step780.nc"
+            for values in (dict(pressure=np.zeros(5)), dict(pressure=[10., 5., -1., 1., 0.]),
+                           dict(b0=0.), dict(b0=np.nan), dict(field_variable="volavgB")):
+                with self.subTest(values=values):
+                    self.write_wout(path, **values)
+                    with self.assertRaises(ValueError):
+                        example.config_with_wout_pressure({"geometry": {"n_radial": 3}}, path)
+
+    def test_volume_average_field_is_an_explicit_alternative(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "wout.step780.nc"
+            self.write_wout(path, b0=4.5, field_variable="volavgB")
+            result = example.config_with_wout_pressure({}, path, field_name="volavgB")
+            self.assertEqual(result["wout_pressure"]["field_variable"], "volavgB")
+            self.assertAlmostEqual(result["wout_pressure"]["ne_axis_m3"] / 4.21e20, .5)
+
+
 if __name__ == "__main__":
     unittest.main()

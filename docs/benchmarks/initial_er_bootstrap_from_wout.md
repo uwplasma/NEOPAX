@@ -74,3 +74,72 @@ the combined calculation with an error.
 Validation uses mocked runtimes/root solvers, small analytic flow arrays and
 temporary CSV/PNG files in `tests/test_initial_er_bootstrap_from_wout.py`.
 No physical VMEC, Boozer, NTX, ambipolarity or transport solve is run locally.
+
+## Electron + proton profiles from wout pressure
+
+`--wout-pressure` replaces the template's species and profiles with electrons and
+protons (`e`, `H`, proton mass exactly 1 in proton-mass units). It uses the VMEC
+full-mesh **total** pressure `presf` in Pa. Pressure alone does not determine
+density and temperature independently. This option assumes quasineutrality,
+equal electron/proton temperatures, and a square-root pressure shape:
+
+```text
+B_ref = abs(wout.b0) [T]
+ne(0) = np(0) = 4.21e20 * B_ref / 9 [m^-3]
+ne(s) = np(s) = ne(0) * sqrt(p(s)/p(0))
+Te(s) = Tp(s) = p(s) / (2 * ne(s) * elementary_charge) [eV]
+```
+
+Thus `ne*Te + np*Tp`, converted from eV/m³ to Pa, reproduces the interpolated
+wout pressure. The density normalization is **linear in field**, with the user's
+reference 4.21e20 m^-3 at 9 T. VMEC `b0` is the signed on-axis toroidal-field
+scalar (`rbtor0 / R_axis` at toroidal angle zero); its absolute value is used.
+It is not the entire varying field on a surface. `--wout-field volavgB` selects
+the wout's volume RMS field instead. No field or density value is silently
+inferred from a different equilibrium.
+
+Pressure is interpolated linearly against normalized toroidal flux `s=phi/phi_edge`
+at the NEOPAX cell centers using **s=rho²**. If `phi` is absent, the standard
+uniform full-mesh s grid is used. Vacuum/negative pressure and missing or zero
+field scalars are rejected. Pressure must be positive at the sampled cell
+centers; zero pressure at the boundary itself is allowed.
+
+To generate only a reusable TOML and a CSV for `wout.step780.nc`, without Boozer,
+NTX or root solves:
+
+```bash
+cd "$HOME/NEOPAX" || exit 1
+
+"$HOME/jax_env/bin/python" \
+  examples/optimization/plot_initial_er_root_from_wout.py \
+  wout.step780.nc \
+  --wout-pressure --profiles-only \
+  --out outputs/step780/Er.png
+```
+
+This writes `outputs/step780/Er_profiles.toml` and `Er_profiles.csv`. The TOML
+contains the full configuration with native `model="prescribed"` density arrays
+in **m^-3** and temperature arrays in **eV** (unlike the analytical-model inputs
+in 1e20 m^-3 and keV). The CSV reports density in m^-3 and temperature in keV.
+The `[wout_pressure]` metadata records the actual field scalar, normalization,
+axis density/temperature, radial grid and interpolated total pressure.
+
+The exporter removes old species-specific sources, turbulent/classical fluxes,
+boundary settings and transport/optimization toggles. Neoclassical, energy-grid
+and solver settings come from the template `--config`. The exported prescribed
+arrays belong to its configured `n_radial` and `rho_edge`; regenerate them if
+changing that grid. The Boozer filename in a profiles-only export is a future
+reference and may not exist yet.
+
+Remove `--profiles-only` to generate the profiles and immediately calculate Er
+and bootstrap using them; the matching Boozer file is then resolved/generated.
+Alternatively, reuse the exported profiles explicitly:
+
+```bash
+env PYTHONPATH="$HOME/VMEX:$HOME/NTX/src${PYTHONPATH:+:$PYTHONPATH}" \
+"$HOME/jax_env/bin/python" \
+  examples/optimization/plot_initial_er_root_from_wout.py \
+  wout.step780.nc \
+  --config outputs/step780/Er_profiles.toml \
+  --out outputs/step780/Er.png
+```

@@ -2,7 +2,9 @@
 """Calculate ambipolar Er and momentum-corrected bootstrap current from a wout.
 
 The wout supplies geometry; species and prescribed density/temperature profiles
-come from a TOML config. Both quantities use the same selected-root state, with
+come from a TOML config, or use --wout-pressure for electron/proton profiles
+derived from its pressure with density proportional to field strength.
+Both quantities use the same selected-root state, with
 no optimization, transport time evolution or reverse AD. Use --no-bootstrap for
 the original Er-only output. No black root-transition marker is drawn.
 """
@@ -126,6 +128,102 @@ def _config_for_wout(config_path: Path, wout_path: Path, boozer_path: Path) -> d
     return config
 
 
+def config_with_wout_pressure(config: dict, wout_path: Path, *, field_name: str = "b0"):
+    """Build electron/proton profiles satisfying total VMEC pressure [Pa].
+
+    Density scales linearly with |B|: ne(0) = 4.21e20 * |B|/9 [m^-3].
+    Assume ne=ni, Te=Ti and n(s)/n(0)=sqrt(p(s)/p(0)); then the pressure
+    determines T(s). Prescribed arrays use NEOPAX's physical m^-3/eV units.
+    This reads a netCDF file only; it builds no geometry or transport runtime.
+    """
+    from netCDF4 import Dataset
+    from NEOPAX._constants import elementary_charge, electron_mass, proton_mass
+
+    if field_name not in {"b0", "volavgB"}:
+        raise ValueError("The wout field must be 'b0' or 'volavgB'.")
+    with Dataset(wout_path, "r") as dataset:
+        if "presf" not in dataset.variables or field_name not in dataset.variables:
+            raise ValueError(f"Wout pressure profiles require presf [Pa] and {field_name} [T].")
+        pressure = np.asarray(np.ma.filled(dataset.variables["presf"][:], np.nan), dtype=float)
+        field = np.asarray(np.ma.filled(dataset.variables[field_name][...], np.nan), dtype=float)
+        s = (np.asarray(np.ma.filled(dataset.variables["phi"][:], np.nan), dtype=float)
+             if "phi" in dataset.variables else np.linspace(0., 1., pressure.size))
+    if field.size != 1 or not np.isfinite(field).all() or float(np.abs(field).item()) <= 0.:
+        raise ValueError(f"Wout {field_name} must be a finite nonzero scalar in tesla.")
+    b_ref = float(np.abs(field).item())
+    if pressure.ndim != 1 or pressure.size < 2 or not np.isfinite(pressure).all():
+        raise ValueError("Wout presf must be a finite one-dimensional full-mesh pressure profile.")
+    if pressure[0] <= 0. or np.min(pressure) < -1e-12 * max(1., np.max(np.abs(pressure))):
+        raise ValueError("Wout pressure must be nonnegative with positive on-axis pressure; vacuum pressure cannot set temperatures.")
+    pressure = np.maximum(pressure, 0.)
+    if s.shape != pressure.shape or not np.isfinite(s).all() or s[-1] == 0.:
+        raise ValueError("Wout phi must be finite and match the presf full mesh, with nonzero edge flux.")
+    s = s / s[-1]  # VMEC s is normalized toroidal flux; NEOPAX rho=sqrt(s).
+    if abs(s[0]) > 1e-10 or np.any(np.diff(s) <= 0.):
+        raise ValueError("Wout normalized toroidal flux must increase from zero to one.")
+    s[0] = 0.
+
+    result = copy.deepcopy(config)
+    geometry = result.setdefault("geometry", {})
+    n_radial = int(geometry.get("n_radial", 51))
+    rho_edge = float(geometry.get("rho_edge", 1.))
+    if n_radial < 2 or not np.isfinite(rho_edge) or not 0. < rho_edge <= 1.:
+        raise ValueError("Pressure-derived profiles require n_radial >= 2 and 0 < rho_edge <= 1.")
+    # Match the file-geometry finite-volume cell centers without constructing it.
+    rho = (np.arange(n_radial) + .5) * rho_edge / n_radial
+    p_cells = np.interp(rho**2, s, pressure)
+    if np.any(p_cells <= 0.):
+        raise ValueError("Wout pressure must be positive at all sampled cell centers to calculate finite-density/temperature fluxes.")
+    ne_axis = 4.21e20 * b_ref / 9.
+    ne = ne_axis * np.sqrt(p_cells / pressure[0])
+    te_ev = p_cells / (2. * ne * float(elementary_charge))
+
+    result["species"] = dict(n_species=2, names=["e", "H"],
+                             mass_mp=[float(electron_mass / proton_mass), 1.], charge_qp=[-1., 1.])
+    result["profiles"] = dict(model="prescribed", density=[ne.tolist(), ne.tolist()],
+                              temperature=[te_ev.tolist(), te_ev.tolist()], Er=np.zeros(n_radial).tolist(),
+                              er_initialization_mode="ambipolar_min_entropy")
+    # Strip old species-specific boundaries, sources and transport toggles: this
+    # is a fixed-profile ambipolarity calculation with exactly two species.
+    result.setdefault("general", {})["mode"] = "ambipolarity"
+    result["boundary"] = {}
+    result["sources"] = {}
+    result["turbulence"] = {"flux_model": "none"}
+    result["classical"] = {"flux_model": "none"}
+    for key in ("equations", "optimization", "transport_output"):
+        result.pop(key, None)
+    result["wout_pressure"] = dict(
+        source=str(wout_path.resolve()), field_variable=field_name, field_abs_T=b_ref,
+        reference_field_T=9., reference_ne_axis_m3=4.21e20, ne_axis_m3=ne_axis,
+        pressure_axis_Pa=float(pressure[0]), Te_axis_keV=float(pressure[0] / (2. * ne_axis * elementary_charge * 1e3)),
+        density_shape="sqrt(p(s)/p(0))", equal_electron_ion_temperature=True,
+        rho=rho.tolist(), pressure_Pa=p_cells.tolist(),
+    )
+    return result
+
+
+def save_wout_pressure_config(config: dict, output_path: Path) -> Path:
+    """Write a reusable full TOML and a physical-units profile CSV."""
+    import toml
+
+    config_path = output_path.with_name(output_path.stem + "_profiles.toml")
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    config_path.write_text(toml.dumps(config), encoding="utf-8")
+    info = config["wout_pressure"]
+    density = np.asarray(config["profiles"]["density"])
+    temperature = np.asarray(config["profiles"]["temperature"])
+    csv_path = config_path.with_suffix(".csv")
+    rho = np.asarray(info["rho"])
+    np.savetxt(csv_path, np.column_stack([rho, rho**2, info["pressure_Pa"],
+                                         density.T, temperature.T / 1e3]), delimiter=",",
+               header="rho,s,pressure_Pa,ne_m3,np_m3,Te_keV,Tp_keV", comments="")
+    print(f"[wout-pressure] |{info['field_variable']}|={info['field_abs_T']:.9g} T "
+          f"ne_axis=np_axis={info['ne_axis_m3']:.9e} m^-3 Te_axis=Tp_axis={info['Te_axis_keV']:.9g} keV")
+    print(f"[wout-pressure] wrote {config_path}")
+    print(f"[wout-pressure] wrote {csv_path}")
+    return config_path
+
+
 def solve_initial_er_root_from_wout(
     wout_path: Path,
     *,
@@ -243,10 +341,18 @@ def main(argv=None) -> int:
                         help="Also calculate momentum-corrected bootstrap current (default: enabled).")
     parser.add_argument("--bootstrap-out", type=Path, default=None,
                         help="Bootstrap PNG path; default <Er output stem>_bootstrap_current.png.")
+    parser.add_argument("--wout-pressure", action="store_true",
+                        help="Use wout pressure for e + proton profiles, with ne(0)=4.21e20*|B|/9 and Te=Tp.")
+    parser.add_argument("--wout-field", choices=("b0", "volavgB"), default="b0",
+                        help="Wout field scalar for density scaling; b0 is the axis toroidal field (default: b0).")
+    parser.add_argument("--profiles-only", action="store_true",
+                        help="With --wout-pressure, write profiles TOML/CSV without Boozer, NTX or ambipolarity solves.")
     parser.add_argument("--label", default="Er", help="Legend label. Use empty string to hide the legend.")
     args = parser.parse_args(argv)
     if args.bootstrap_out is not None and not args.bootstrap:
         parser.error("--bootstrap-out requires --bootstrap.")
+    if args.profiles_only and not args.wout_pressure:
+        parser.error("--profiles-only requires --wout-pressure.")
 
     wout_path = args.wout.resolve()
     if not wout_path.exists():
@@ -254,15 +360,6 @@ def main(argv=None) -> int:
     config_path = args.config.resolve()
     if not config_path.exists():
         raise FileNotFoundError(config_path)
-    boozer_path = _resolve_boozer_file(
-        wout_path,
-        args.boozer_file,
-        generate_boozer=bool(args.generate_boozer),
-        mboz=int(args.mboz),
-        nboz=int(args.nboz),
-        jit_boozer=bool(args.jit_boozer),
-        verbose_boozer=bool(args.verbose_boozer),
-    )
     output_path = args.out
     if output_path is None:
         output_path = wout_path.parent / f"{wout_path.stem}_initial_er_root.png"
@@ -272,6 +369,29 @@ def main(argv=None) -> int:
     )).resolve()
     if args.bootstrap and (bootstrap_path == output_path or bootstrap_path.with_suffix(".csv") == output_path.with_suffix(".csv")):
         parser.error("Er and bootstrap output paths must be distinct.")
+
+    pressure_config = None
+    if args.wout_pressure:
+        # This path is only a future geometry reference in --profiles-only mode;
+        # generating Boozer coordinates is unnecessary just to export profiles.
+        candidates = _candidate_boozer_files(wout_path)
+        case = wout_path.stem.removeprefix("wout_")
+        planned_boozer = (args.boozer_file or (candidates[0] if candidates else
+                          wout_path.parent / f"boozmn_{case}.nc")).resolve()
+        pressure_config = config_with_wout_pressure(
+            _config_for_wout(config_path, wout_path, planned_boozer), wout_path, field_name=args.wout_field,
+        )
+        if args.profiles_only:
+            save_wout_pressure_config(pressure_config, output_path)
+            return 0
+    boozer_path = _resolve_boozer_file(
+        wout_path, args.boozer_file,
+        generate_boozer=bool(args.generate_boozer), mboz=int(args.mboz), nboz=int(args.nboz),
+        jit_boozer=bool(args.jit_boozer), verbose_boozer=bool(args.verbose_boozer),
+    )
+    if pressure_config is not None:
+        pressure_config["geometry"]["boozer_file"] = str(boozer_path)
+        config_path = save_wout_pressure_config(pressure_config, output_path)
 
     print(f"[initial-er-root-plot] wout={wout_path}")
     print(f"[initial-er-root-plot] boozer_file={boozer_path}")
