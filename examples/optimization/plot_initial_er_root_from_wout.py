@@ -1,14 +1,17 @@
 #!/usr/bin/env python
-"""Solve initial ambipolar Er from a wout file and plot it like optimization scripts.
+"""Calculate ambipolar Er and momentum-corrected bootstrap current from a wout.
 
-The wout supplies the geometry. The transport/ambipolarity/profile settings are
-taken from a TOML config. No black root-transition marker is drawn.
+The wout supplies geometry; species and prescribed density/temperature profiles
+come from a TOML config. Both quantities use the same selected-root state, with
+no optimization, transport time evolution or reverse AD. Use --no-bootstrap for
+the original Er-only output. No black root-transition marker is drawn.
 """
 
 from __future__ import annotations
 
 import argparse
 import copy
+import dataclasses
 from pathlib import Path
 import sys
 
@@ -129,6 +132,27 @@ def solve_initial_er_root_from_wout(
     config_path: Path,
     boozer_path: Path,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Preserve the original Er-only Python interface."""
+    rho, er, _, finite_mask = solve_initial_er_and_bootstrap_from_wout(
+        wout_path, config_path=config_path, boozer_path=boozer_path,
+        include_bootstrap=False,
+    )
+    return rho, er, finite_mask
+
+
+def solve_initial_er_and_bootstrap_from_wout(
+    wout_path: Path,
+    *,
+    config_path: Path,
+    boozer_path: Path,
+    include_bootstrap: bool = True,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray | None, np.ndarray]:
+    """Return rho, Er [kV/m], Jboot [1e5 A/m^2] and the finite-root mask.
+
+    Bootstrap current is NaN where no finite ambipolar root was found. The Er
+    array retains the root selector's fallback at those radii for compatibility;
+    callers must use the mask. Only one runtime and one root solve are needed.
+    """
     config = _config_for_wout(config_path, wout_path, boozer_path)
     runtime, state = build_runtime_context(config)
     if state is None:
@@ -137,23 +161,54 @@ def solve_initial_er_root_from_wout(
     rho = getattr(runtime.geometry, "rho_grid", None)
     if rho is None:
         raise RuntimeError("Runtime geometry did not expose rho_grid.")
+    finite_mask = np.asarray(jax.device_get(finite_mask), dtype=bool)
+    jboot = None
+    if include_bootstrap:
+        if not np.any(finite_mask):
+            raise RuntimeError("No finite ambipolar roots were found; cannot calculate bootstrap current.")
+        # Reuse the optimizer's corrected-flux evaluator and unit conversion,
+        # without constructing or evaluating an optimization problem.
+        from NEOPAX.optimization import GeometryInitialErRootLeastSquaresProblem
+
+        rooted_state = dataclasses.replace(state, Er=er_profile)
+        jboot = GeometryInitialErRootLeastSquaresProblem._bootstrap_current_from_rooted_state_runtime(
+            rooted_state, runtime
+        )
+        jboot = np.asarray(jax.device_get(jboot), dtype=float)
+        if jboot.shape != finite_mask.shape:
+            raise ValueError("Bootstrap current and ambipolar-root radial shapes differ.")
+        if np.any(finite_mask & ~np.isfinite(jboot)):
+            raise FloatingPointError("Nonfinite momentum-corrected bootstrap current at a finite ambipolar root.")
+        jboot = np.where(finite_mask, jboot, np.nan)
     return (
         np.asarray(jax.device_get(rho), dtype=float),
         np.asarray(jax.device_get(er_profile), dtype=float),
-        np.asarray(jax.device_get(finite_mask), dtype=bool),
+        jboot,
+        finite_mask,
     )
 
 
 def plot_er_profile(rho: np.ndarray, er: np.ndarray, output_path: Path, *, label: str) -> None:
+    _plot_profile(rho, er, output_path, label=label, color="red",
+                  ylabel=r"$E_r$ [$\mathrm{kV}/\mathrm{m}$]")
+
+
+def plot_bootstrap_profile(rho: np.ndarray, jboot_scaled: np.ndarray, output_path: Path) -> None:
+    _plot_profile(rho, 100.0 * jboot_scaled, output_path,
+                  label="momentum-corrected bootstrap", color="tab:blue",
+                  ylabel=r"$J^{\mathrm{bootstrap}}$ [$\mathrm{kA}/\mathrm{m}^2$]")
+
+
+def _plot_profile(rho, values, output_path, *, label, color, ylabel) -> None:
     import matplotlib
 
     matplotlib.use("Agg", force=True)
     import matplotlib.pyplot as plt
 
     fig, ax = plt.subplots(figsize=(6.8, 5.6))
-    ax.plot(rho, er, color="red", linewidth=3.2, solid_capstyle="round", label=label)
+    ax.plot(rho, values, color=color, linewidth=3.2, solid_capstyle="round", label=label)
     ax.set_xlabel(r"$\rho$", fontsize=20)
-    ax.set_ylabel(r"$E_r$ [$\mathrm{kV}/\mathrm{m}$]", fontsize=20)
+    ax.set_ylabel(ylabel, fontsize=20)
     ax.tick_params(axis="both", labelsize=16, width=1.0, length=4)
     ax.grid(False)
     for spine in ax.spines.values():
@@ -168,7 +223,7 @@ def plot_er_profile(rho: np.ndarray, er: np.ndarray, output_path: Path, *, label
     plt.close(fig)
 
 
-def main() -> int:
+def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("wout", type=Path, help="Path to wout_*.nc.")
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG, help="Transport/ambipolarity TOML config.")
@@ -183,9 +238,15 @@ def main() -> int:
     parser.add_argument("--nboz", type=int, default=18, help="Generated Boozer toroidal resolution.")
     parser.add_argument("--jit-boozer", action="store_true", help="Use JIT inside booz_xform_jax generation.")
     parser.add_argument("--verbose-boozer", action="store_true", help="Print booz_xform_jax generation details.")
-    parser.add_argument("--out", type=Path, default=None, help="Output PNG path.")
+    parser.add_argument("--out", type=Path, default=None, help="Er output PNG path; CSV uses the same stem.")
+    parser.add_argument("--bootstrap", action=argparse.BooleanOptionalAction, default=True,
+                        help="Also calculate momentum-corrected bootstrap current (default: enabled).")
+    parser.add_argument("--bootstrap-out", type=Path, default=None,
+                        help="Bootstrap PNG path; default <Er output stem>_bootstrap_current.png.")
     parser.add_argument("--label", default="Er", help="Legend label. Use empty string to hide the legend.")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
+    if args.bootstrap_out is not None and not args.bootstrap:
+        parser.error("--bootstrap-out requires --bootstrap.")
 
     wout_path = args.wout.resolve()
     if not wout_path.exists():
@@ -206,15 +267,23 @@ def main() -> int:
     if output_path is None:
         output_path = wout_path.parent / f"{wout_path.stem}_initial_er_root.png"
     output_path = output_path.resolve()
+    bootstrap_path = (args.bootstrap_out or output_path.with_name(
+        output_path.stem + "_bootstrap_current.png"
+    )).resolve()
+    if args.bootstrap and (bootstrap_path == output_path or bootstrap_path.with_suffix(".csv") == output_path.with_suffix(".csv")):
+        parser.error("Er and bootstrap output paths must be distinct.")
 
     print(f"[initial-er-root-plot] wout={wout_path}")
     print(f"[initial-er-root-plot] boozer_file={boozer_path}")
     print(f"[initial-er-root-plot] config={config_path}")
-    rho, er, finite_mask = solve_initial_er_root_from_wout(
+    rho, er, jboot, finite_mask = solve_initial_er_and_bootstrap_from_wout(
         wout_path,
         config_path=config_path,
         boozer_path=boozer_path,
+        include_bootstrap=args.bootstrap,
     )
+    print(f"[initial-er-root-plot] finite ambipolar roots={np.count_nonzero(finite_mask)}/{finite_mask.size}")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
     csv_path = output_path.with_suffix(".csv")
     np.savetxt(
         csv_path,
@@ -223,9 +292,25 @@ def main() -> int:
         header="rho,Er,finite_mask",
         comments="",
     )
-    plot_er_profile(rho, er, output_path, label=args.label)
+    # Do not display the initializer's fallback Er as a solved ambipolar root.
+    plotted_er = np.where(finite_mask, er, np.nan)
+    plot_er_profile(rho, plotted_er, output_path, label=args.label)
     print(f"[initial-er-root-plot] wrote {csv_path}")
     print(f"[initial-er-root-plot] wrote {output_path}")
+    if jboot is not None:
+        bootstrap_path.parent.mkdir(parents=True, exist_ok=True)
+        bootstrap_csv = bootstrap_path.with_suffix(".csv")
+        np.savetxt(
+            bootstrap_csv,
+            np.column_stack([rho, plotted_er, jboot * 1.0e5, jboot * 100.0,
+                             jboot, finite_mask.astype(float)]),
+            delimiter=",",
+            header="rho,Er_kV_m,Jboot_A_m2,Jboot_kA_m2,Jboot_scaled_1e5_A_m2,finite_mask",
+            comments="",
+        )
+        plot_bootstrap_profile(rho, jboot, bootstrap_path)
+        print(f"[initial-er-root-plot] wrote {bootstrap_csv}")
+        print(f"[initial-er-root-plot] wrote {bootstrap_path}")
     return 0
 
 
