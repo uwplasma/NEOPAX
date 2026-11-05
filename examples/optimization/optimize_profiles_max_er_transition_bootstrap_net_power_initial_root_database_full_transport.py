@@ -1,17 +1,20 @@
 #!/usr/bin/env python
 """Standalone database full-transport optimization of plasma profiles.
 
-The fixed vacuum geometry is taken from ``--seed-input``. The optimized
-variables are the four profile parameters supported by the full-transport
-reverse table. Maximum Er, the two Er-transition values, bootstrap current,
-and 300 MW net power are independently selectable. Every accepted optimizer
-evaluation must complete the transport interval to ``t_final=2``.
+The default fixed vacuum geometry is the 51-surface version of the wHe
+realtime-geometry benchmark equilibrium; ``--seed-input`` can override it.
+The four profile parameters
+are optimized for root position/strength, bootstrap current and 300 MW net
+power. Every accepted optimizer evaluation must complete ``t_final=2``.
+Initial-profile comparisons use analytical maps only. ``--plot-profiles-only``
+plots saved profile parameters without VMEC, NTX, transport or optimization.
 """
 
 from __future__ import annotations
 
 import argparse
 import copy
+import csv
 import json
 from pathlib import Path
 import sys
@@ -29,7 +32,9 @@ from NEOPAX._orchestrator import load_config, run_config  # noqa: E402
 
 
 # --------------------------- user settings ---------------------------------
-SEED_INPUT = ROOT / "examples" / "inputs" / "input.QI_nfp2_initial"
+# Same physical equilibrium as the wHe benchmark, with VMEC NS_ARRAY=[24,51].
+# The *_true input continues that same equilibrium to 101 and 201 surfaces.
+SEED_INPUT = ROOT / "examples" / "inputs" / "input.QI_nfp2_newNT_opt_hires"
 TRANSPORT_CONFIG = (
     ROOT / "examples" / "optimization" / "full_transport_database_vacuum_t2.toml"
 )
@@ -42,6 +47,7 @@ OUT_DIR = (
 DATABASE_N_THETA = 25
 DATABASE_N_PHI = 31  # NTX calls this toroidal coordinate zeta.
 DATABASE_N_XI = 64
+TRANSPORT_RADIAL_POINTS = 51
 
 PROFILE_PARAMETERS = "n0,T0,density_shape_power,temperature_shape_power"
 PROFILE_SCALE_MODE = "nominal"
@@ -91,13 +97,13 @@ ER_TRANSITION_STRENGTH_WEIGHT = 100.0
 BOOTSTRAP_WEIGHT = 2.0
 NET_POWER_WEIGHT = 1.0
 
-# The maximum-Er target (25) conflicts with Er_left=26, so the default is an
-# apples-to-apples transition-only profile experiment. It remains selectable.
+# Use the coupled crossing location/existence terms by default. The older
+# fixed-cell left/right terms and maximum-Er term remain explicit opt-ins.
 USE_MAX_ER_OBJECTIVE = False
-USE_ER_TRANSITION_OBJECTIVES = True
-USE_ER_TRANSITION_LOCATION_OBJECTIVE = False
-USE_BOOTSTRAP_PENALTY = False
-USE_NET_POWER_OBJECTIVE = False
+USE_ER_TRANSITION_OBJECTIVES = False
+USE_ER_TRANSITION_LOCATION_OBJECTIVE = True
+USE_BOOTSTRAP_PENALTY = True
+USE_NET_POWER_OBJECTIVE = True
 
 NFEV = 30
 FTOL = 1.0e-6
@@ -105,6 +111,7 @@ XTOL = 1.0e-10
 SOLVER_DEVICE = "default"
 MAKE_INITIAL_TRANSPORT_REPORT = True
 MAKE_OPTIMIZED_TRANSPORT_REPORT = True
+PLOT_INITIAL_PROFILES = True
 
 
 def parser() -> argparse.ArgumentParser:
@@ -115,6 +122,15 @@ def parser() -> argparse.ArgumentParser:
     out.add_argument("--database-n-theta", type=int, default=DATABASE_N_THETA)
     out.add_argument("--database-n-phi", type=int, default=DATABASE_N_PHI)
     out.add_argument("--database-n-xi", type=int, default=DATABASE_N_XI)
+    out.add_argument(
+        "--plot-initial-profiles", action=argparse.BooleanOptionalAction,
+        default=PLOT_INITIAL_PROFILES,
+        help="Compare starting and optimized input density/temperature profiles (no transport solve).",
+    )
+    out.add_argument(
+        "--plot-profiles-only", action="store_true",
+        help="Plot existing saved profile parameters in --out-dir without running optimization or transport.",
+    )
     out.add_argument(
         "--er-transition-left-index",
         type=int,
@@ -137,7 +153,7 @@ def parser() -> argparse.ArgumentParser:
         "--root-objectives",
         action=argparse.BooleanOptionalAction,
         default=USE_ER_TRANSITION_OBJECTIVES,
-        help="Enable/disable both final-time Er transition objectives.",
+        help="Enable/disable the older fixed-cell Er-left/right objectives.",
     )
     out.add_argument(
         "--transition-location-objective",
@@ -206,9 +222,9 @@ def parser() -> argparse.ArgumentParser:
 
 def transport_config(args: argparse.Namespace) -> dict:
     config = copy.deepcopy(load_config(TRANSPORT_CONFIG))
-    config.setdefault("geometry", {})["vmec_input_file"] = str(
-        args.seed_input.resolve()
-    )
+    geometry = config.setdefault("geometry", {})
+    geometry["vmec_input_file"] = str(args.seed_input.resolve())
+    geometry["n_radial"] = int(TRANSPORT_RADIAL_POINTS)
     neoclassical = config.setdefault("neoclassical", {})
     neoclassical["ntx_scan_n_theta"] = int(args.database_n_theta)
     neoclassical["ntx_scan_n_zeta"] = int(args.database_n_phi)
@@ -432,8 +448,145 @@ def write_transport_report(problem, x, out_dir: Path, label: str):
     print(f"[transport-report] wrote usual outputs in {artifact_dir}", flush=True)
 
 
-def main() -> int:
-    args = parser().parse_args()
+def write_initial_profile_comparison(config, before, after, out_dir, *, geometry=None):
+    """Compare input n/T through the normal analytical profile map only."""
+    from types import SimpleNamespace
+    from matplotlib.backends.backend_agg import FigureCanvasAgg
+    from matplotlib.figure import Figure
+    from matplotlib.lines import Line2D
+    from NEOPAX._orchestrator import _build_species, _build_state
+    from NEOPAX._state import safe_density
+
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    if geometry is None:
+        # Live VMEC uses uniform rho cell centers. Absolute minor radius
+        # cancels from the analytical n/T map, which depends on r/a only.
+        n = int(config.get("geometry", {}).get("n_radial", 51))
+        faces = jnp.linspace(0., 1., n + 1)
+        rho = .5 * (faces[:-1] + faces[1:])
+        geometry = SimpleNamespace(r_grid=rho, r_grid_half=faces, rho_grid=rho)
+    rho = np.asarray(jax.device_get(geometry.rho_grid))
+    species = _build_species(config)
+    names = tuple(species.names)
+    snapshots = {}
+    for label, parameters in (("initial", before), ("optimized", after)):
+        current = copy.deepcopy(config)
+        current.setdefault("profiles", {}).update(parameters)
+        state = _build_state(current, geometry, species)
+        density_floor = current.get("transport_solver", {}).get("density_floor", 1.0e-6)
+        density, temperature = jax.device_get((
+            state.density, state.pressure / safe_density(state.density, density_floor),
+        ))
+        snapshots[label] = dict(density=np.asarray(density), temperature=np.asarray(temperature))
+
+    figure = Figure(figsize=(11.5, 8.2))
+    FigureCanvasAgg(figure)
+    axes = figure.subplots(2, 2, sharex=True)
+    columns = {"rho": rho}
+    for col, (quantity, unit) in enumerate((("density", r"$10^{20}$ m$^{-3}$"), ("temperature", "keV"))):
+        for i, name in enumerate(names):
+            color = f"C{i % 10}"
+            for label, style in (("initial", "--"), ("optimized", "-")):
+                values = snapshots[label][quantity][i]
+                axes[0, col].plot(rho, values, style, color=color)
+                columns[f"{label}_{name}_{quantity}"] = values
+            axes[1, col].plot(rho, snapshots["optimized"][quantity][i]-snapshots["initial"][quantity][i],
+                              color=color)
+        axes[0, col].set(title=quantity.capitalize(), ylabel=f"{quantity.capitalize()} [{unit}]")
+        axes[1, col].set(xlabel=r"$\rho$", ylabel=f"Optimized - initial [{unit}]")
+        axes[1, col].axhline(0., color="0.6", linewidth=.7)
+        for ax in axes[:, col]:
+            ax.grid(alpha=.2)
+    handles = [Line2D([], [], color=f"C{i % 10}", label=name) for i, name in enumerate(names)]
+    handles += [Line2D([], [], color="black", linestyle=style, label=label)
+                for label, style in (("Starting case", "--"), ("Optimized case", "-"))]
+    figure.legend(handles=handles, loc="lower center", ncol=3)
+    figure.suptitle("Input profiles (t = 0): starting and optimized cases")
+    figure.tight_layout(rect=(0, .09, 1, .96))
+    paths = {}
+    for suffix in ("png", "pdf"):
+        path = out_dir / f"initial_profiles_initial_vs_optimized.{suffix}"
+        figure.savefig(path, dpi=180, bbox_inches="tight")
+        paths[suffix] = str(path)
+    csv_path = out_dir / "initial_optimized_initial_profiles.csv"
+    with csv_path.open("w", newline="", encoding="utf-8") as stream:
+        writer = csv.writer(stream)
+        writer.writerow(columns)
+        writer.writerows(zip(*columns.values(), strict=True))
+    paths["csv"] = str(csv_path)
+    print(f"[profile-comparison] wrote {paths}", flush=True)
+    return paths
+
+
+def plot_saved_initial_profiles(args):
+    """Replot completed parameter files, including older report-crashed runs."""
+    out_dir = args.out_dir.resolve()
+    summary = json.loads((out_dir / "optimization_summary.json").read_text(encoding="utf-8"))
+    config = summary.get("profile_plot_config")
+    if config is None:
+        config_path = Path(summary.get("transport_config", TRANSPORT_CONFIG))
+        config = load_config(config_path if config_path.is_file() else TRANSPORT_CONFIG)
+    parameters = {}
+    for label in ("initial", "optimized"):
+        values = summary.get(f"{label}_physical_profiles")
+        if values is None:
+            path = out_dir / label / f"profile_parameters_{label}.json"
+            values = json.loads(path.read_text(encoding="utf-8"))
+        parameters[label] = values
+    return write_initial_profile_comparison(config, parameters["initial"], parameters["optimized"], out_dir)
+
+
+def write_final_profile_comparison(out_dir):
+    """Compare terminal density, temperature and Er from the two saved reports."""
+    import h5py
+    from matplotlib.backends.backend_agg import FigureCanvasAgg
+    from matplotlib.figure import Figure
+    from matplotlib.lines import Line2D
+
+    reports = {}
+    for label in ("initial", "optimized"):
+        with h5py.File(out_dir / label / "transport" / "transport_solution.h5") as stream:
+            reports[label] = {key:np.asarray(stream[key]) for key in ("rho", "ts", "density", "temperature", "Er")}
+    first, last = reports["initial"], reports["optimized"]
+    np.testing.assert_allclose(first["rho"], last["rho"], rtol=0, atol=1e-12)
+    np.testing.assert_allclose(first["ts"][-1], last["ts"][-1], rtol=0, atol=1e-12)
+    names = ("e", "D", "T", "He")
+    figure = Figure(figsize=(15, 4.7))
+    FigureCanvasAgg(figure)
+    axes = figure.subplots(1, 3)
+    for col, (quantity, unit) in enumerate((("density", r"$10^{20}$ m$^{-3}$"), ("temperature", "keV"))):
+        for i in range(first[quantity].shape[1]):
+            for label, style in (("initial", "--"), ("optimized", "-")):
+                axes[col].plot(reports[label]["rho"], reports[label][quantity][-1, i], style, color=f"C{i % 10}")
+        axes[col].set(title=quantity.capitalize(), xlabel=r"$\rho$", ylabel=f"{quantity.capitalize()} [{unit}]")
+    for label, style in (("initial", "--"), ("optimized", "-")):
+        axes[2].plot(reports[label]["rho"], reports[label]["Er"][-1], style, color="C4", label=label.capitalize())
+    axes[2].axhline(0., color="0.6", linewidth=.7)
+    axes[2].set(title="Electric field", xlabel=r"$\rho$", ylabel=r"$E_r$ [kV/m]")
+    for ax in axes:
+        ax.grid(alpha=.2)
+    handles = [Line2D([], [], color=f"C{i}", label=name)
+               for i,name in enumerate(names[:first["density"].shape[1]])]
+    handles += [Line2D([], [], color="black", linestyle=style, label=label)
+                for label, style in (("Starting case", "--"), ("Optimized case", "-"))]
+    figure.legend(handles=handles, loc="lower center", ncol=6)
+    figure.suptitle(f"Final transport profiles (t = {first['ts'][-1]:g} s)")
+    figure.tight_layout(rect=(0, .09, 1, .96))
+    paths = {}
+    for suffix in ("png", "pdf"):
+        path = out_dir / f"final_profiles_initial_vs_optimized.{suffix}"
+        figure.savefig(path, dpi=180, bbox_inches="tight")
+        paths[suffix] = str(path)
+    print(f"[profile-comparison] wrote {paths}", flush=True)
+    return paths
+
+
+def main(argv=None) -> int:
+    args = parser().parse_args(argv)
+    if args.plot_profiles_only:
+        plot_saved_initial_profiles(args)
+        return 0
     if args.max_nfev < 1:
         raise ValueError("--max-nfev must be positive.")
     for name in ("database_n_theta", "database_n_phi", "database_n_xi"):
@@ -483,6 +636,11 @@ def main() -> int:
         "\n===== database full-transport profile optimization "
         f"grid=({args.database_n_theta},{args.database_n_phi},"
         f"{args.database_n_xi}) =====",
+        flush=True,
+    )
+    print(
+        f"[setup] fixed_geometry seed_input={args.seed_input.resolve()} "
+        f"transport_n_radial={n_radial}",
         flush=True,
     )
     problem = opt.full_transport_profile_least_squares_problem(
@@ -566,6 +724,7 @@ def main() -> int:
         ],
         "transport_final_time": TRANSPORT_FINAL_TIME,
         "transport_max_steps": TRANSPORT_MAX_STEPS,
+        "transport_n_radial": n_radial,
         "accepted_step_limit": FULL_TRANSPORT_ACCEPTED_STEP_LIMIT,
         "reverse_segment_length": REVERSE_SEGMENT_LENGTH,
         "max_reverse_accepted_steps": MAX_REVERSE_ACCEPTED_STEPS,
@@ -576,9 +735,12 @@ def main() -> int:
         "objectives": {
             "max_er": bool(args.max_er),
             "root_objectives": bool(args.root_objectives),
+            "transition_location_objective": bool(args.transition_location_objective),
             "bootstrap_penalty": bool(args.bootstrap_penalty),
             "net_power": bool(args.net_power),
         },
+        "Er_transition_rho_target": args.er_transition_rho_target,
+        "Er_transition_strength_target": args.er_transition_strength_target,
         "parameter_labels": list(problem.parameter_labels),
         "initial_physical_profiles": physical_profile_values(problem, x0),
         "optimized_physical_profiles": physical_profile_values(problem, x_opt),
@@ -588,6 +750,16 @@ def main() -> int:
         "status": int(result.status),
         "message": str(result.message),
     }
+    summary["profile_plot_config"] = {
+        key: copy.deepcopy(config[key])
+        for key in ("geometry", "species", "profiles", "transport_solver", "equations")
+        if key in config
+    }
+    if args.plot_initial_profiles:
+        summary["initial_profile_comparison"] = write_initial_profile_comparison(
+            config, summary["initial_physical_profiles"], summary["optimized_physical_profiles"],
+            out_dir, geometry=problem.runtime.geometry,
+        )
     summary_path = out_dir / "optimization_summary.json"
     summary_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
     print(f"wrote {summary_path}")
@@ -596,6 +768,9 @@ def main() -> int:
         write_transport_report(problem, x0, out_dir, "initial")
     if args.optimized_transport_report:
         write_transport_report(problem, x_opt, out_dir, "optimized")
+    if args.initial_transport_report and args.optimized_transport_report:
+        summary["final_profile_comparison"] = write_final_profile_comparison(out_dir)
+        summary_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
     return 0
 
 

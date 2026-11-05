@@ -2363,6 +2363,33 @@ def test_qi_maxj_backend_settings_preserve_surrogate_default_and_aliases():
     assert explicit.trapping_depths == (0.25, 0.8)
 
 
+@pytest.mark.parametrize(
+    ("device", "expected"),
+    [("default", "auto"), (" DEFAULT ", "auto"), ("auto", "auto"),
+     ("cpu", "cpu"), ("gpu", "gpu")],
+)
+def test_profile_full_transport_export_is_valid_for_forward_reports(device, expected):
+    """Export to the forward runner without a runtime, device query, or solve."""
+    config = {"general": {"device": device}, "profiles": {"n0": 4.21, "T0": 17.8}}
+    baseline = jnp.asarray([4.21, 17.8, 10., 2., 1., 1.])
+    problem = optimization.ProfileFullTransportLeastSquaresProblem(
+        config=config, runtime=None, baseline_state=None,
+        profile_cfg=config["profiles"], neoclassical_cfg={},
+        baseline_profile_values=baseline, profile_scales=baseline,
+        parameter_set=optimization.reverse_ad_optimization_parameter_set(
+            include_profiles=True, profiles=("n0", "T0"),
+        ),
+        terms=(), table_context=None, run_grouped_report=None, options={},
+    )
+    exported = problem.config_from_scaled_parameters(jnp.asarray([.5, 1.25]))
+    assert exported["general"]["device"] == expected
+    assert orchestrator._normalized_general_device(exported) == expected
+    np.testing.assert_allclose(
+        [exported["profiles"]["n0"], exported["profiles"]["T0"]], [2.105, 22.25],
+    )
+    assert config == {"general": {"device": device}, "profiles": {"n0": 4.21, "T0": 17.8}}
+
+
 def test_database_full_transport_profile_problem_uses_configured_direct_builder(
     monkeypatch,
 ):

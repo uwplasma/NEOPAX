@@ -915,6 +915,11 @@ class ProfileFullTransportLeastSquaresProblem:
     def config_from_scaled_parameters(self, scaled_parameter_values=None):
         physical_values = self._scaled_to_physical(self.x0 if scaled_parameter_values is None else scaled_parameter_values)
         config_eff = copy.deepcopy(self.config)
+        general = config_eff.setdefault("general", {})
+        if str(general.get("device", "auto")).strip().lower() == "default":
+            # Match the geometry exporter: optimization's device selector
+            # must use the normal forward runner's vocabulary in reports.
+            general["device"] = "auto"
         profiles = config_eff.setdefault("profiles", {})
         if configured_profile_parameter_order(self.config) != PROFILE_PARAMETER_ORDER:
             from ._species_profile_parameters import species_profile_config
