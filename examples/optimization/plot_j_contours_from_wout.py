@@ -166,7 +166,7 @@ def _j_invariant_from_wout(
     nphi_int: int,
     jit_boozer: bool,
 ):
-    from vmex.core.omnigenity_j import j_invariant_qi_maxj_residual_from_boozer
+    from vmex.core.omnigenity import j_invariant_qi_maxj_residual_from_boozer
 
     booz = _boozer_tables_from_wout(
         wout_path,

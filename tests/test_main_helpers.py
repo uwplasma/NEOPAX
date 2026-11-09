@@ -3520,6 +3520,9 @@ def test_build_ntx_exact_lij_runtime_transport_model_accepts_quadratic_feature_g
 
 
 def test_build_ntx_runtime_scan_channels_uses_loader(monkeypatch):
+    import ntx.vmex_backend
+    from NEOPAX import _geometry_autodiff as geometry_ad
+
     monkeypatch.setattr(
         "NEOPAX._transport_flux_models._load_ntx_vmec_boozer_channels",
         lambda vmec_file, boozer_file, rho: {
@@ -3551,6 +3554,28 @@ def test_build_ntx_runtime_scan_channels_uses_loader(monkeypatch):
     assert jnp.allclose(channels.rho, jnp.array([0.25, 0.5]))
     assert channels.a_b == 1.5
     assert jnp.allclose(channels.dr_tildeds, jnp.array([8.25, 8.5]))
+
+    # The in-memory Boozer path passes the matching SolverRuntime to NTX,
+    # rather than NEOPAX's compatibility view of that runtime.
+    runtime = object()
+    context = types.SimpleNamespace(
+        static=types.SimpleNamespace(runtime=runtime),
+        indata=object(), signgs=-1, mboz=18, nboz=18,
+    )
+    state = object()
+    surfaces = (object(), object())
+
+    def build_surfaces(**kwargs):
+        assert kwargs == dict(
+            state=state, static=runtime, indata=context.indata,
+            signgs=-1, s_values=(0.25, 0.5), mboz=18, nboz=18, psi_p=2.5,
+        )
+        return surfaces
+
+    monkeypatch.setattr(ntx.vmex_backend, "surfaces_from_vmex_state", build_surfaces)
+    assert geometry_ad._ntx_boozer_surfaces_from_state(
+        context, state, s_values=(0.25, 0.5), psi_p=2.5,
+    ) is surfaces
 
 
 def test_build_ntx_runtime_scan_transport_model_can_preload_channels(monkeypatch):

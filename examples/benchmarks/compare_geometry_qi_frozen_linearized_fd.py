@@ -13,10 +13,8 @@ import numpy as np
 
 
 ROOT = Path(__file__).resolve().parents[2]
-WORKSPACE_ROOT = ROOT.parent
-for path in reversed((ROOT, WORKSPACE_ROOT / "VMEX", WORKSPACE_ROOT / "vmex", WORKSPACE_ROOT / "vmec_jax")):
-    if str(path) not in sys.path:
-        sys.path.insert(0, str(path))
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
 from NEOPAX._geometry_autodiff import (  # noqa: E402
     _geometry_full_ad_objectives_from_state,

@@ -591,7 +591,14 @@ def test_local_vmex_mercier_softmax_is_a_full_geometry_objective_row():
 
 
 def test_raw_block_solve_uses_prebuilt_stage_without_rebuilding_config(monkeypatch):
-    """Trial deltas must be dynamic while the stage configuration stays shared."""
+    """Main's full parameter schema survives trial deltas and shared setup."""
+
+    from vmex.core import implicit as vmex_implicit
+    from vmex.core.input import VmecInput
+
+    indata = VmecInput(mpol=2, ntor=1, ac_aux_f=np.asarray([0.2, 0.4]))
+    context = SimpleNamespace(indata=indata)
+    observed = {}
 
     entries = (
         {
@@ -605,9 +612,15 @@ def test_raw_block_solve_uses_prebuilt_stage_without_rebuilding_config(monkeypat
     )
 
     class Implicit:
+        def params_from_input(self, inp, *, device=None):
+            observed["solver_device"] = device
+            return vmex_implicit.params_from_input(inp, device=device)
+
         def solve_implicit_with_aux(self, params, cfg):
-            assert params == "trial-params"
             assert cfg is shared_cfg
+            np.testing.assert_allclose(params.ac_aux_f, indata.ac_aux_f)
+            np.testing.assert_allclose(params.rbc[1, 1], indata.rbc[1, 1] + 0.25)
+            assert params.rbc.device.platform == "cpu"
             return "trial-state", "dof-mask"
 
     shared_cfg = object()
@@ -616,19 +629,20 @@ def test_raw_block_solve_uses_prebuilt_stage_without_rebuilding_config(monkeypat
         implicit_cfg=shared_cfg,
         param_entries=entries,
     )
-    context = SimpleNamespace()
-    observed = {}
-
     monkeypatch.setattr(geometry_ad, "_using_current_vmec_jax_context", lambda _context: True)
 
-    def build_trial_params(_context, implicit, deltas, staged_entries, *, solver_device):
-        observed["implicit"] = implicit
-        observed["deltas"] = deltas
-        observed["entries"] = staged_entries
-        observed["solver_device"] = solver_device
-        return "trial-params"
-
-    monkeypatch.setattr(geometry_ad, "_implicit_params_with_boundary_deltas", build_trial_params)
+    for device in (None, "", "auto", "vmex", "default", "jax"):
+        params = geometry_ad._implicit_params_from_input(context, stage.implicit, device)
+        np.testing.assert_allclose(params.ac_aux_f, indata.ac_aux_f)
+        assert observed["solver_device"] is None
+    for device in ("gpu", "cuda", "rocm", "tpu"):
+        with monkeypatch.context() as patch:
+            patch.setattr(vmex_implicit, "params_from_input", lambda inp, *, device: device)
+            assert geometry_ad._implicit_params_from_input(context, stage.implicit, device) == (
+                "gpu" if device in {"cuda", "rocm"} else device
+            )
+    with pytest.raises(ValueError, match="implicit solver device"):
+        geometry_ad._implicit_params_from_input(context, stage.implicit, "unknown")
 
     result = geometry_ad.geometry_raw_block_solve_from_param_vector(
         context,
@@ -642,8 +656,11 @@ def test_raw_block_solve_uses_prebuilt_stage_without_rebuilding_config(monkeypat
     assert result.implicit_cfg is shared_cfg
     assert result.param_entries == entries
     assert result.state == "trial-state"
-    assert observed["entries"] == entries
     assert observed["solver_device"] == "cpu"
+    assert geometry_ad._implicit_params_from_input(
+        SimpleNamespace(indata=dataclasses.replace(indata, ac_aux_f=None)),
+        stage.implicit, "cpu",
+    ).ac_aux_f.shape == (0,)
 
 
 def test_raw_block_stage_rejects_a_different_parameter_layout(monkeypatch):

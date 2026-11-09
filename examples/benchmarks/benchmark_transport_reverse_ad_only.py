@@ -748,7 +748,7 @@ def _report_path(objective_name: str) -> Path:
 
 def _check_compact_ntx_derivative_pullback_available() -> None:
     try:
-        from ntx._solver_prepared import solve_prepared_coefficient_vector_derivative_vjp  # noqa: F401
+        from ntx import solve_prepared_coefficient_vector_derivative_vjp  # noqa: F401
     except ImportError as exc:
         raise SystemExit(
             "[autodiff-gate] the default compact NTX field pullback requires "

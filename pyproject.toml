@@ -27,9 +27,15 @@ keywords = ["Plasma",
      "Simulation",
      "JAX"]
  
-dependencies = [ "jax", "jaxlib", "matplotlib","equinox","optimistix","lineax", "diffrax","interpax","orthax", "scipy","h5py", "netcdf4","toml","tomli"]
+dependencies = [
+    "jax", "jaxlib", "matplotlib", "equinox", "optimistix", "lineax",
+    "diffrax", "interpax", "orthax", "scipy", "h5py", "netcdf4", "toml", "tomli",
+    "vmex @ git+https://github.com/uwplasma/vmex.git@main",
+    "ntx @ git+https://github.com/uwplasma/NTX.git@main",
+    "booz_xform_jax>=0.5.1",
+]
  
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 
 [project.urls]
 Homepage = "https://github.com/uwplasma/NEOPAX"

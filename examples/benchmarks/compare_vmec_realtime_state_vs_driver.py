@@ -153,7 +153,7 @@ def main() -> None:
         jacobian_penalty=float(geom_cfg.get("vmec_jacobian_penalty", 1.0e3)),
     )
 
-    import vmec_jax as vj
+    import vmex as vj
 
     run_kwargs: dict[str, Any] = {"verbose": False}
     if args.solver_device is not None:
@@ -183,7 +183,7 @@ def main() -> None:
             solve_kwargs["mode"] = args.driver_solver_mode
         if args.driver_solver is not None:
             print("[compare] --driver-solver is ignored by the current vmec_jax.solve API")
-        from vmec_jax.core.multigrid import solve_multigrid
+        from vmex.core.multigrid import solve_multigrid
 
         print(f"[compare] running vmec_jax.solve_multigrid with kwargs={solve_kwargs}")
         driver_run = solve_multigrid(inp, **solve_kwargs)

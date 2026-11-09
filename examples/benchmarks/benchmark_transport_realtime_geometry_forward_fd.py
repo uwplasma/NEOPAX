@@ -16,10 +16,8 @@ import jax.numpy as jnp
 import numpy as np
 
 ROOT = Path(__file__).resolve().parents[2]
-WORKSPACE_ROOT = ROOT.parent
-for path in (ROOT, WORKSPACE_ROOT / "vmec_jax"):
-    if str(path) not in sys.path:
-        sys.path.insert(0, str(path))
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
 from benchmark_transport_autodiff_lagged_ntx import (  # noqa: E402
     DEFAULT_CONFIG,

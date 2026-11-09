@@ -6,14 +6,27 @@ Getting started
 Installation
 ------------
 
-To use NEOPAX, there is no need to install it.
-You can simply clone the repository and install it using the following command:
+NEOPAX requires Python 3.11 or newer. VMEX and NTX are installed from their
+upstream ``main`` branches; Boozer is also a declared dependency. Clone and
+install NEOPAX with:
 
 .. code-block:: console
 
     $ git clone https://github.com/uwplasma/NEOPAX.git
     $ cd NEOPAX
     $ pip install .
+
+Geometry and NTX imports follow the active Python environment, including any
+explicit ``PYTHONPATH``. NEOPAX does not prepend sibling dependency checkouts
+or fall back to the retired ``vmec_jax`` package. For local dependency
+development, install the intended checkouts in that environment, for example
+``python -m pip install -e ../vmex-neopax-main -e ../NTX-neopax-main``.
+
+The full transport reverse path requires the NEOPAX utility additions in
+VMEX and NTX (block response, QI/max-J surrogate, factorized derivatives and
+recorded-scan transposes). Until those utility PRs are merged into ``main``,
+use the prepared dependency checkouts and install NEOPAX with
+``python -m pip install --no-deps -e .`` after installing its requirements.
 
 Run an example
 --------------

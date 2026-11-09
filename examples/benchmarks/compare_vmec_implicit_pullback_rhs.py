@@ -12,14 +12,12 @@ import numpy as np
 
 
 NEOPAX_ROOT = Path(__file__).resolve().parents[2]
-WORKSPACE_ROOT = NEOPAX_ROOT.parent
-for path in (NEOPAX_ROOT, WORKSPACE_ROOT / "vmec_jax"):
-    if str(path) not in sys.path:
-        sys.path.insert(0, str(path))
+if str(NEOPAX_ROOT) not in sys.path:
+    sys.path.insert(0, str(NEOPAX_ROOT))
 
-from vmec_jax.core import implicit as im  # noqa: E402
-from vmec_jax.core import optimize as opt  # noqa: E402
-from vmec_jax.core.input import VmecInput  # noqa: E402
+from vmex.core import implicit as im  # noqa: E402
+from vmex.core import optimize as opt  # noqa: E402
+from vmex.core.input import VmecInput  # noqa: E402
 
 
 DEFAULT_VMEC_INPUT = NEOPAX_ROOT / "examples" / "inputs" / "input.QI_nfp2_newNT_opt_hires_true"

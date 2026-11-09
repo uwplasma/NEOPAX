@@ -14,8 +14,6 @@ import jax.numpy as jnp
 import interpax
 import lineax
 import numpy as np
-import sys
-import types
 import warnings
 from pathlib import Path
 from ._cell_variable import (
@@ -6734,50 +6732,9 @@ def _as_float_array(value, *, name: str, positive: bool = False) -> jax.Array:
 
 
 def _import_ntx():
-    _install_vmec_jax_api_compat_for_ntx()
-    try:
-        import ntx
+    import ntx
 
-        return ntx
-    except ImportError:
-        repo_root = Path(__file__).resolve().parents[2]
-        ntx_src = repo_root / "NTX" / "src"
-        if ntx_src.is_dir() and str(ntx_src) not in sys.path:
-            sys.path.insert(0, str(ntx_src))
-        import ntx
-
-        return ntx
-
-
-def _install_vmec_jax_api_compat_for_ntx() -> None:
-    """Provide the legacy `vmec_jax.api.read_wout` import expected by NTX.
-
-    Newer vmec_jax versions export `read_wout` at the package top level instead
-    of through `vmec_jax.api`.  Keep the compatibility local to the NEOPAX
-    process so the NTX checkout itself remains untouched.
-    """
-
-    if "vmec_jax.api" in sys.modules:
-        return
-    try:
-        import vmec_jax
-    except ImportError:
-        return
-
-    read_wout = getattr(vmec_jax, "read_wout", None)
-    if read_wout is None:
-        try:
-            from vmec_jax.core.wout import read_wout as read_wout
-        except ImportError:
-            return
-
-    api_module = types.ModuleType("vmec_jax.api")
-    api_module.read_wout = read_wout
-    sys.modules["vmec_jax.api"] = api_module
-    try:
-        setattr(vmec_jax, "api", api_module)
-    except Exception:
-        pass
+    return ntx
 
 
 def _ntx_prepared_coefficient_vector_solver(ntx, derivative_mode: str):
@@ -6790,15 +6747,10 @@ def _ntx_prepared_coefficient_vector_derivative_pullback(ntx):
     solver = getattr(ntx, "solve_prepared_coefficient_vector_derivative_vjp", None)
     if solver is not None:
         return solver
-    try:
-        from ntx._solver_prepared import solve_prepared_coefficient_vector_derivative_vjp
-
-        return solve_prepared_coefficient_vector_derivative_vjp
-    except ImportError as exc:
-        raise AttributeError(
-            "ntx_exact_derivative_field_pullback_mode='compact_vjp' requires NTX "
-            "to provide solve_prepared_coefficient_vector_derivative_vjp."
-        ) from exc
+    raise AttributeError(
+        "ntx_exact_derivative_field_pullback_mode='compact_vjp' requires NTX "
+        "to provide solve_prepared_coefficient_vector_derivative_vjp."
+    )
 
 
 def _load_ntx_vmec_boozer_channels(wout_path: Path, boozmn_path: Path, rho: jax.Array) -> dict[str, jax.Array | float]:
@@ -10349,13 +10301,13 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         # Reuse NTX's lower-level adjoint algebra directly so this reverse lane
         # stays on the NEOPAX side and never pushes a traced `prepared` through
         # NTX's `custom_vjp(..., nondiff_argnums=(0,))` wrapper.
-        from ntx._solver_adjoint import (
+        from ntx._solver import (
             _coefficient_mode_pullback,
+            _operator_context,
             _parameter_gradient_from_adjoint,
             _prepared_implicit_vjp_primal,
+            _solve_factorized_adjoint,
         )
-        from ntx._solver_context import _operator_context
-        from ntx._solver_factorization import _solve_factorized_adjoint
 
         energy_indices = jnp.arange(reference_nu_hat.shape[0], dtype=jnp.int32)
 
@@ -10558,11 +10510,11 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
         epsi_hat_tangent,
         reference_transport_moments_bar,
     ):
-        from ntx._solver_adjoint import (
+        from ntx._solver import (
             _coefficient_mode_pullback,
+            _operator_context,
             _prepared_implicit_vjp_primal,
         )
-        from ntx._solver_context import _operator_context
         from ntx.operators import (
             apply_nullspace_condition,
             operator_blocks,
@@ -11822,11 +11774,11 @@ class NTXExactLijRuntimeTransportModel(TransportFluxModelBase):
                 ),
             )
 
-        from ntx._solver_adjoint import (
+        from ntx._solver import (
             _coefficient_mode_pullback,
+            _operator_context,
             _prepared_implicit_vjp_primal,
         )
-        from ntx._solver_context import _operator_context
         from ntx.operators import (
             parameter_derivative_blocks,
         )

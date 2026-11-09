@@ -3,7 +3,6 @@ from __future__ import annotations
 import dataclasses
 import functools
 import importlib
-import sys
 import time
 from copy import deepcopy
 from pathlib import Path
@@ -95,30 +94,9 @@ def normalize_qi_maxj_backend_settings(
     return resolved
 
 
-def _repo_root() -> Path:
-    return Path(__file__).resolve().parents[2]
-
-
-def _ensure_local_stack_on_path() -> None:
-    repo = _repo_root()
-    candidates = (
-        repo / "VMEX",
-        repo / "vmex",
-        repo / "vmec_jax",
-        repo / "booz_xform_jax" / "src",
-    )
-    for candidate in reversed(candidates):
-        candidate_str = str(candidate)
-        if candidate.exists() and candidate_str not in sys.path:
-            sys.path.insert(0, candidate_str)
-
-
 def _import_vmec_jax():
-    _ensure_local_stack_on_path()
-    try:
-        import vmex as vmec_backend
-    except ModuleNotFoundError:
-        import vmec_jax as vmec_backend
+    """Load VMEX from the environment without overriding installed packages."""
+    import vmex as vmec_backend
 
     return vmec_backend
 
@@ -148,9 +126,7 @@ _CURRENT_VMEX_MODULE_ALIASES = {
 
 
 def _import_vmec_module_any(module_names: Sequence[str]):
-    _ensure_local_stack_on_path()
     backend_name = _vmec_backend_package_name()
-    fallback_name = "vmec_jax" if backend_name == "vmex" else "vmex"
     errors = []
     backend_module_names: tuple[str, ...] = tuple(module_names)
     if backend_name == "vmex":
@@ -168,14 +144,6 @@ def _import_vmec_module_any(module_names: Sequence[str]):
                 raise
             errors.append(f"{candidate_name}: {exc}")
 
-    for module_name in module_names:
-        candidate_name = f"{fallback_name}.{module_name}"
-        try:
-            return importlib.import_module(candidate_name)
-        except ModuleNotFoundError as exc:
-            if exc.name != candidate_name:
-                raise
-            errors.append(f"{candidate_name}: {exc}")
     raise ModuleNotFoundError(
         "Could not import VMEC backend module from any candidate: " + "; ".join(errors)
     )
@@ -190,7 +158,6 @@ def _import_vmec_jax_optimization():
 
 
 def _import_booz_xform_jax_api():
-    _ensure_local_stack_on_path()
     from booz_xform_jax import jax_api
 
     return jax_api
@@ -701,32 +668,16 @@ def _input_with_boundary_delta(context: "GeometryAutodiffContext", param_delta):
 
 def _implicit_params_from_input(context: "GeometryAutodiffContext", implicit, solver_device: str | None = None):
     device_key = "auto" if solver_device is None else str(solver_device).strip().lower()
-    if device_key in {"", "auto", "vmex"}:
-        return implicit.params_from_input(context.indata)
-
-    def _arr(value):
-        raw = np.asarray(value, dtype=np.float64)
-        if device_key in {"default", "jax"}:
-            return jnp.asarray(raw)
-        if device_key in {"cpu", "gpu", "cuda", "rocm", "tpu"}:
-            platform = "gpu" if device_key in {"gpu", "cuda", "rocm"} else device_key
-            return jax.device_put(raw, jax.devices(platform)[0])
+    if device_key in {"", "auto", "vmex", "default", "jax"}:
+        # Preserve the existing default JAX placement for these aliases.
+        device = None
+    elif device_key in {"cpu", "gpu", "cuda", "rocm", "tpu"}:
+        device = "gpu" if device_key in {"cuda", "rocm"} else device_key
+    else:
         raise ValueError(
             "implicit solver device must be one of 'default', 'auto', 'cpu', or 'gpu'."
         )
-
-    return implicit.ImplicitParams(
-        rbc=_arr(context.indata.rbc),
-        rbs=_arr(context.indata.rbs),
-        zbc=_arr(context.indata.zbc),
-        zbs=_arr(context.indata.zbs),
-        phiedge=_arr(context.indata.phiedge),
-        pres_scale=_arr(context.indata.pres_scale),
-        curtor=_arr(context.indata.curtor),
-        am=_arr(context.indata.am),
-        ai=_arr(context.indata.ai),
-        ac=_arr(context.indata.ac),
-    )
+    return implicit.params_from_input(context.indata, device=device)
 
 
 def _implicit_params_with_boundary_delta(context: "GeometryAutodiffContext", implicit, param_delta, *, solver_device: str | None = None):
@@ -4805,16 +4756,7 @@ def _ntx_frozen_interp_mode_columns(interpolated_value, x_nodes, values, xq):
 def _vmec_jax_wout_surface_with_frozen_sampling(wout, *, s, source_path):
     """Build an NTX VMEC surface using the same sampling convention as NTX's frozen loader."""
 
-    import ntx
-
-    surface_fn = getattr(ntx, "surface_from_vmex_vmec_wout", None)
-    if surface_fn is None:
-        surface_fn = getattr(ntx, "surface_from_vmec_jax_vmec_wout", None)
-    if surface_fn is None:
-        try:
-            from ntx.vmex_vmec import surface_from_vmex_vmec_wout as surface_fn
-        except Exception:
-            from ntx.vmec_jax_vmec import surface_from_vmec_jax_vmec_wout as surface_fn
+    from ntx import surface_from_vmex_vmec_wout as surface_fn
     return surface_fn(
         wout,
         s=float(s),
@@ -5091,6 +5033,21 @@ def _positive_transport_s_values_from_rho(rho_values):
     return tuple(float((rho_value if rho_value > 0.0 else first_transport_rho) ** 2) for rho_value in rho_np)
 
 
+def _ntx_boozer_surfaces_from_state(context, state, *, s_values, psi_p):
+    from ntx.vmex_backend import surfaces_from_vmex_state
+
+    return surfaces_from_vmex_state(
+        state=state,
+        static=context.static.runtime,
+        indata=context.indata,
+        signgs=context.signgs,
+        s_values=s_values,
+        mboz=int(context.mboz),
+        nboz=int(context.nboz),
+        psi_p=psi_p,
+    )
+
+
 def _build_ntx_center_prepared_from_vmec_state(
     context: GeometryAutodiffContext,
     state,
@@ -5103,11 +5060,6 @@ def _build_ntx_center_prepared_from_vmec_state(
 ):
     """Build only the center prepared NTX system used by compact root pullbacks."""
 
-    _ensure_local_stack_on_path()
-    ntx_src = _repo_root() / "NTX" / "src"
-    ntx_src_str = str(ntx_src)
-    if ntx_src.exists() and ntx_src_str not in sys.path:
-        sys.path.insert(0, ntx_src_str)
     import ntx
 
     rho_center_sample = np.linspace(0.0, 1.0, int(center_count), dtype=float)
@@ -5121,17 +5073,6 @@ def _build_ntx_center_prepared_from_vmec_state(
             s_values=center_s_values,
         )
     elif surface_backend_key in {"auto", "booz", "boozer", "boozmn", "booz_xform", "booz_xform_jax"}:
-        surfaces_fn = getattr(ntx, "surfaces_from_vmec_jax_state", None)
-        if surfaces_fn is None:
-            try:
-                from ntx._vmec_jax_surfaces import surfaces_from_vmec_jax_state as surfaces_fn
-            except ImportError:
-                surface_fn = getattr(ntx, "surface_from_vmec_jax_state")
-
-                def surfaces_fn(**kwargs):
-                    s_values = kwargs.pop("s_values")
-                    return tuple(surface_fn(s=s_value, **kwargs) for s_value in s_values)
-
         static_phipf = jnp.asarray(context.flux.phipf, dtype=jnp.float64)
         static_s_full = jnp.asarray(context.static.s, dtype=jnp.float64)
         static_phi = jnp.concatenate(
@@ -5142,14 +5083,10 @@ def _build_ntx_center_prepared_from_vmec_state(
             axis=0,
         )
         static_ntx_psia = jnp.abs(static_phi[-1])
-        center_surfaces = surfaces_fn(
-            state=state,
-            static=context.static,
-            indata=context.indata,
-            signgs=context.signgs,
+        center_surfaces = _ntx_boozer_surfaces_from_state(
+            context,
+            state,
             s_values=center_s_values,
-            mboz=int(context.mboz),
-            nboz=int(context.nboz),
             psi_p=static_ntx_psia,
         )
     else:
@@ -5188,13 +5125,6 @@ def build_ntx_runtime_scan_inputs_from_vmec_state(
     a new transport model: the existing ``ntx_scan_runtime`` model remains the
     sole owner of NTX scan construction and database interpolation.
     """
-    _ensure_local_stack_on_path()
-    ntx_src = _repo_root() / "NTX" / "src"
-    ntx_src_str = str(ntx_src)
-    if ntx_src.exists() and ntx_src_str not in sys.path:
-        sys.path.insert(0, ntx_src_str)
-    import ntx
-
     # Scan locations are configuration, not VMEC-dependent quantities.  Keep
     # their validation on the host so this builder remains valid under a JVP
     # of the VMEC state (where every JAX operation in the body is traced).
@@ -5210,44 +5140,12 @@ def build_ntx_runtime_scan_inputs_from_vmec_state(
     if backend in {"vmec", "vmec_jax"}:
         surfaces = _traceable_vmec_surfaces_from_state(context, state, s_values=s_values)
     elif backend in {"auto", "booz", "boozer", "boozmn", "booz_xform", "booz_xform_jax"}:
-        surfaces_fn = getattr(ntx, "surfaces_from_vmec_jax_state", None)
-        if surfaces_fn is None:
-            try:
-                from ntx._vmec_jax_surfaces import surfaces_from_vmec_jax_state as surfaces_fn
-            except ImportError:
-                surface_fn = getattr(ntx, "surface_from_vmec_jax_state")
-                surfaces = tuple(
-                    surface_fn(
-                        state=state,
-                        static=context.static,
-                        indata=context.indata,
-                        signgs=context.signgs,
-                        s=s_value,
-                    )
-                    for s_value in s_values
-                )
-            else:
-                surfaces = surfaces_fn(
-                    state=state,
-                    static=context.static,
-                    indata=context.indata,
-                    signgs=context.signgs,
-                    s_values=s_values,
-                    mboz=int(context.mboz),
-                    nboz=int(context.nboz),
-                    psi_p=jnp.abs(jnp.asarray(geometry.Psia_value, dtype=jnp.float64) / (2.0 * jnp.pi)),
-                )
-        else:
-            surfaces = surfaces_fn(
-                state=state,
-                static=context.static,
-                indata=context.indata,
-                signgs=context.signgs,
-                s_values=s_values,
-                mboz=int(context.mboz),
-                nboz=int(context.nboz),
-                psi_p=jnp.abs(jnp.asarray(geometry.Psia_value, dtype=jnp.float64) / (2.0 * jnp.pi)),
-            )
+        surfaces = _ntx_boozer_surfaces_from_state(
+            context,
+            state,
+            s_values=s_values,
+            psi_p=jnp.abs(jnp.asarray(geometry.Psia_value, dtype=jnp.float64) / (2.0 * jnp.pi)),
+        )
     else:
         raise ValueError(
             "ntx_scan_surface_backend for realtime geometry must be one of "
@@ -5283,24 +5181,8 @@ def build_ntx_exact_lij_support_from_vmec_state(
     r00_booz_constants_grids=None,
     r00_booz_mode00: int | None = None,
 ):
-    _ensure_local_stack_on_path()
-    ntx_src = _repo_root() / "NTX" / "src"
-    ntx_src_str = str(ntx_src)
-    if ntx_src.exists() and ntx_src_str not in sys.path:
-        sys.path.insert(0, ntx_src_str)
     import ntx
     from NEOPAX._transport_flux_models import NTXExactLijRuntimeSupport
-
-    def _surfaces_from_vmec_jax_state(**kwargs):
-        surfaces_fn = getattr(ntx, "surfaces_from_vmec_jax_state", None)
-        if surfaces_fn is None:
-            try:
-                from ntx._vmec_jax_surfaces import surfaces_from_vmec_jax_state as surfaces_fn
-            except ImportError:
-                surface_fn = getattr(ntx, "surface_from_vmec_jax_state")
-                s_values = kwargs.pop("s_values")
-                return tuple(surface_fn(s=s_value, **kwargs) for s_value in s_values)
-        return surfaces_fn(**kwargs)
 
     vmec_wout_cache = None
 
@@ -5388,24 +5270,16 @@ def build_ntx_exact_lij_support_from_vmec_state(
                 f"{progress_label} ntx_surface_branch=booz_traceable",
                 flush=True,
             )
-        center_surfaces = _surfaces_from_vmec_jax_state(
-            state=state,
-            static=context.static,
-            indata=context.indata,
-            signgs=context.signgs,
+        center_surfaces = _ntx_boozer_surfaces_from_state(
+            context,
+            state,
             s_values=_positive_transport_s_values_from_rho(rho_center_sample),
-            mboz=int(context.mboz),
-            nboz=int(context.nboz),
             psi_p=static_ntx_psia,
         )
-        face_surfaces = _surfaces_from_vmec_jax_state(
-            state=state,
-            static=context.static,
-            indata=context.indata,
-            signgs=context.signgs,
+        face_surfaces = _ntx_boozer_surfaces_from_state(
+            context,
+            state,
             s_values=_positive_transport_s_values_from_rho(rho_face_sample),
-            mboz=int(context.mboz),
-            nboz=int(context.nboz),
             psi_p=static_ntx_psia,
         )
     else:

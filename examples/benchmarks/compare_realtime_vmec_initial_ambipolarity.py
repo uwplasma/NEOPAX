@@ -298,10 +298,7 @@ def _vmec_wout_roundtrip_surface_rows(
     )
     realtime_wout = _build_realtime_vmec_wout(realtime_config_path)
 
-    try:
-        from vmec_jax.wout import write_wout
-    except ModuleNotFoundError:
-        from vmec_jax.core.wout import write_wout
+    from vmex.core.wout import write_wout
 
     output_path = Path(output_path).expanduser().resolve()
     output_path.parent.mkdir(parents=True, exist_ok=True)
