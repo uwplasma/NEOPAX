@@ -3,6 +3,7 @@ Modular boundary condition (BC) abstraction for NEOPAX, inspired by torax.
 """
 import dataclasses
 
+import jax
 import jax.numpy as jnp
 
 class BoundaryCondition:
@@ -68,13 +69,14 @@ register_bc('neumann', NeumannBC)
 register_bc('robin', RobinBC)
 
 
+@jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True, eq=False)
 class BoundaryConditionModel:
     """Left/right radial BC for 1D arrays with optional species-wise values."""
 
     dr: float
-    left_type: str = "dirichlet"
-    right_type: str = "dirichlet"
+    left_type: str = dataclasses.field(default="dirichlet", metadata={"static": True})
+    right_type: str = dataclasses.field(default="dirichlet", metadata={"static": True})
     left_value: jnp.ndarray | None = None
     right_value: jnp.ndarray | None = None
     left_gradient: jnp.ndarray | None = None

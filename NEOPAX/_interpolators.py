@@ -8,6 +8,7 @@ config.update("jax_enable_x64", True)
 from jax import jit
 import interpax
 from interpax._coefs import A_BICUBIC
+from ._native_interpolation import _cubic_apply, bicubic_channels, cubic1d
 
 
 @jax.tree_util.register_dataclass
@@ -64,7 +65,7 @@ def interpolator_nu_low_Er0(index,grid_nu,database):
 
 
 def interpolator_nu_mid_Er0(index,grid_nu,database):
-    return interpax.Interpolator1D(database.nu_log,database.D11_log[index,:,0],extrap=False)(grid_nu)
+    return cubic1d(database.nu_log, database.D11_log[index, :, 0], grid_nu)
 
 
 def interpolator_nu_large_Er0(index,grid_nu,database):
@@ -75,7 +76,7 @@ def interpolator_nu_low_Er_finite(index,grid_nu,grid_Er,database):
     #Calculate Er_h
     Er_h=(database.nu_log[0]-grid_nu)/3.0+grid_Er  #This works with grid_Er as log(Er)
     return jnp.select(condlist=[Er_h<database.Er_list[index,-1],Er_h>=database.Er_list[index,-1]],
-                      choicelist=[interpax.Interpolator1D(database.Er_list[index,:],database.D11_log[index,0,:],extrap=False)(Er_h),database.D11_lower_limit],default=0)
+                      choicelist=[cubic1d(database.Er_list[index,:],database.D11_log[index,0,:],Er_h),database.D11_lower_limit],default=0)
 
 
 
@@ -83,7 +84,7 @@ def interpolator_nu_large_Er_finite(index,grid_nu,grid_Er,database):
     #This actually uses Tokamak + Er fit in NTSS!!! Have to update but for now I believe this is high collisionality so it will not affect much the comparison.
     # Thus mantaining general extrapolation 
     #TODO!! Create function for tokamak fit
-    return interpax.Interpolator2D(database.nu_log,database.Er_list[index,:],database.D11_log[index,:,:],extrap=True)(grid_nu,grid_Er)
+    return bicubic_channels(database.nu_log, database.Er_list[index], (database.D11_log[index],), grid_nu, grid_Er)[0]
 
 
 
@@ -97,9 +98,9 @@ def interpolator_nu_mid_Er_finite_npoints3_low(index,grid_nu,grid_Er,database):
                      (grid_Er>database.Er_list[index,0])&(grid_Er<=database.Er_list[index,-1]),
                      grid_Er>database.Er_list[index,-1]],
                      choicelist=[jnp.array([database.D11_log.at[index,0,0].get(),database.D11_log.at[index,1,0].get(),database.D11_log.at[index,2,0].get()]),
-                                  jnp.array([interpax.Interpolator1D(database.Er_list[index,:],database.D11_log[index,0,:],extrap=False)(grid_Er),
-                                   interpax.Interpolator1D(database.Er_list[index,:],database.D11_log[index,1,:],extrap=False)(grid_Er),
-                                   interpax.Interpolator1D(database.Er_list[index,:],database.D11_log[index,2,:],extrap=False)(grid_Er)]),
+                                  jnp.array([cubic1d(database.Er_list[index,:],database.D11_log[index,0,:],grid_Er),
+                                   cubic1d(database.Er_list[index,:],database.D11_log[index,1,:],grid_Er),
+                                   cubic1d(database.Er_list[index,:],database.D11_log[index,2,:],grid_Er)]),
                                   jnp.array([database.D11_lower_limit,database.D11_lower_limit,database.D11_lower_limit])],default=0)
     d11_0=d11_nu.at[0].get()
     d11_1=d11_nu.at[1].get()
@@ -127,9 +128,9 @@ def interpolator_nu_mid_Er_finite_npoints3_high(index,grid_nu,grid_Er,database):
                      (grid_Er>database.Er_list[index,0])&(grid_Er<=database.Er_list[index,-1]),
                      grid_Er>database.Er_list[index,-1] ],
                      choicelist=[jnp.array([database.D11_log.at[index,-3,0].get(),database.D11_log.at[index,-2,0].get(),database.D11_log.at[index,-1,0].get()]),
-                                  jnp.array([interpax.Interpolator1D(database.Er_list[index,:],database.D11_log[index,-3,:],extrap=False)(grid_Er),
-                                   interpax.Interpolator1D(database.Er_list[index,:],database.D11_log[index,-2,:],extrap=False)(grid_Er),
-                                   interpax.Interpolator1D(database.Er_list[index,:],database.D11_log[index,-1,:],extrap=False)(grid_Er)]),
+                                  jnp.array([cubic1d(database.Er_list[index,:],database.D11_log[index,-3,:],grid_Er),
+                                   cubic1d(database.Er_list[index,:],database.D11_log[index,-2,:],grid_Er),
+                                   cubic1d(database.Er_list[index,:],database.D11_log[index,-1,:],grid_Er)]),
                                   jnp.array([database.D11_lower_limit,database.D11_lower_limit,database.D11_lower_limit])],default=0)
     d11_0=d11_nu.at[0].get()
     d11_1=d11_nu.at[1].get()
@@ -165,10 +166,10 @@ def interpolator_nu_mid_Er_finite_npoints4(index,grid_nu,grid_Er,database):
                      (grid_Er>database.Er_list[index,0])&(grid_Er<=database.Er_list[index,-1]),
                      grid_Er>database.Er_list[index,-1] ],
                      choicelist=[jnp.array([database.D11_log.at[index,idx0,0].get(),database.D11_log.at[index,idx1,0].get(),database.D11_log.at[index,idx2,0].get(),database.D11_log.at[index,idx3,0].get()]),
-                                  jnp.array([interpax.Interpolator1D(database.Er_list[index,:],database.D11_log[index,idx0,:],extrap=False)(grid_Er),
-                                   interpax.Interpolator1D(database.Er_list[index,:],database.D11_log[index,idx1,:],extrap=False)(grid_Er),
-                                   interpax.Interpolator1D(database.Er_list[index,:],database.D11_log[index,idx2,:],extrap=False)(grid_Er),
-                                   interpax.Interpolator1D(database.Er_list[index,:],database.D11_log[index,idx3,:],extrap=False)(grid_Er)]),
+                                  jnp.array([cubic1d(database.Er_list[index,:],database.D11_log[index,idx0,:],grid_Er),
+                                   cubic1d(database.Er_list[index,:],database.D11_log[index,idx1,:],grid_Er),
+                                   cubic1d(database.Er_list[index,:],database.D11_log[index,idx2,:],grid_Er),
+                                   cubic1d(database.Er_list[index,:],database.D11_log[index,idx3,:],grid_Er)]),
                                   jnp.array([database.D11_lower_limit,database.D11_lower_limit,database.D11_lower_limit,database.D11_lower_limit])],default=0)
     d11_0=d11_nu.at[0].get()
     d11_1=d11_nu.at[1].get()
@@ -219,8 +220,7 @@ def interpolator_nu_Er_general_NTSS(index,grid_nu,grid_Er,database):
                                   #interpolator_nu_mid_Er_finite(index,grid_nu,grid_Er),                                  
                                   interpolator_nu_large_Er_finite(index,grid_nu,grid_Er)],default=0)
                                 ####interpax.Interpolator2D(nu_log,Er_list[index,:],D11_log[index,:,:],extrap=True)(grid_nu,grid_Er)],default=0)
-    x13=interpax.Interpolator2D(database.nu_log,database.Er_list[index,:],database.D13[index,:,:],extrap=True)(grid_nu,grid_Er)
-    x33=interpax.Interpolator2D(database.nu_log,database.Er_list[index,:],database.D33[index,:,:],extrap=True)(grid_nu,grid_Er)
+    x13,x33=bicubic_channels(database.nu_log, database.Er_list[index], (database.D13[index], database.D33[index]), grid_nu, grid_Er)
     return x11,x13,x33                                
 
 
@@ -230,91 +230,50 @@ def interpolator_nu_Er_general_NTSS(index,grid_nu,grid_Er,database):
 @jit
 #####Interpolators, which should go to the _interpolators.py
 def interpolator_nu_Er_general(index,grid_nu,grid_Er,database):
-    x11=interpax.Interpolator2D(database.nu_log,database.Er_list[index,:],database.D11_log[index,:,:],extrap=True)(grid_nu,grid_Er)
-    x13=interpax.Interpolator2D(database.nu_log,database.Er_list[index,:],database.D13[index,:,:],extrap=True)(grid_nu,grid_Er)
-    x33=interpax.Interpolator2D(database.nu_log,database.Er_list[index,:],database.D33[index,:,:],extrap=True)(grid_nu,grid_Er)
-    return x11,x13,x33
+    return bicubic_channels(
+        database.nu_log, database.Er_list[index],
+        (database.D11_log[index], database.D13[index], database.D33[index]),
+        grid_nu, grid_Er,
+    )
+
+def _interpolated_surfaces(indices, grid_nu, grid_Er, database):
+    """Evaluate one local radial stencil without separate per-surface graphs."""
+    values = jax.vmap(interpolator_nu_Er_general, in_axes=(0, None, None, None))(
+        indices, grid_nu, grid_Er, database
+    )
+    return jnp.stack(values, axis=-1)
+
 
 @jit
-def interpolation_small_r(grid_x,grid_nu,grid_Er,database):
-    xg=jnp.zeros(3)    
-    xr2=jnp.power(grid_x,2)
-    xr3=jnp.power(grid_x,3)
-    r12 = jnp.power(database.r1,2)
-    r22 = jnp.power(database.r2,2)
-    r32 = jnp.power(database.r3,2)
-    r13 = jnp.power(database.r1,3)
-    r23 = jnp.power(database.r2,3)
-    r33 = jnp.power(database.r3,3)
-    x11_0,x13_0,x33_0=interpolator_nu_Er_general(0,grid_nu,grid_Er,database)
-    x11_1,x13_1,x33_1=interpolator_nu_Er_general(1,grid_nu,grid_Er,database)
-    x11_2,x13_2,x33_2=interpolator_nu_Er_general(2,grid_nu,grid_Er,database)
-    ha1_11 = ((x11_2-x11_1)/(r33-r23)-(x11_2-x11_0)/(r33-r13))/((r32-r22)/(r33-r23)-(r32-r12)/(r33-r13))
-    hb1_11 = ((x11_2-x11_1)/(r32-r22)-(x11_2-x11_0)/(r32-r12))/((r33-r23)/(r32-r22)-(r33-r13)/(r32-r12))
-    hg1_11 = x11_0-r12*ha1_11-r13*hb1_11
-    #13
-    ha1_13 = ((x13_2-x13_1)/(r33-r23)-(x13_2-x13_0)/(r33-r13))/((r32-r22)/(r33-r23)-(r32-r12)/(r33-r13))
-    hb1_13 = ((x13_2-x13_1)/(r32-r22)-(x13_2-x13_0)/(r32-r12))/((r33-r23)/(r32-r22)-(r33-r13)/(r32-r12))
-    hg1_13 = x13_0-r12*ha1_13-r13*hb1_13
-    #33
-    ha1_33 = ((x33_2-x33_1)/(r33-r23)-(x33_2-x33_0)/(r33-r13))/((r32-r22)/(r33-r23)-(r32-r12)/(r33-r13))
-    hb1_33 = ((x33_2-x33_1)/(r32-r22)-(x33_2-x33_0)/(r32-r12))/((r33-r23)/(r32-r22)-(r33-r13)/(r32-r12))
-    hg1_33 = x33_0-r12*ha1_33-r13*hb1_33
-    #Final output
-    xg11  = hg1_11+xr2*ha1_11+xr3*hb1_11
-    xg13  = hg1_13+xr2*ha1_13+xr3*hb1_13
-    xg33  = hg1_33+xr2*ha1_33+xr3*hb1_33   
-    xg=xg.at[0].set(xg11)
-    xg=xg.at[1].set(xg13)
-    xg=xg.at[2].set(xg33)
-    return xg#xg11,xg13,xg33
+def interpolation_small_r(grid_x, grid_nu, grid_Er, database):
+    v0, v1, v2 = _interpolated_surfaces(jnp.arange(3, dtype=jnp.int32), grid_nu, grid_Er, database)
+    r12, r22, r32 = database.r1**2, database.r2**2, database.r3**2
+    r13, r23, r33 = database.r1**3, database.r2**3, database.r3**3
+    a = ((v2-v1)/(r33-r23) - (v2-v0)/(r33-r13)) / ((r32-r22)/(r33-r23) - (r32-r12)/(r33-r13))
+    b = ((v2-v1)/(r32-r22) - (v2-v0)/(r32-r12)) / ((r33-r23)/(r32-r22) - (r33-r13)/(r32-r12))
+    return (v0 - r12*a - r13*b) + grid_x**2*a + grid_x**3*b
 
 @jit
 def interpolation_large_r(grid_x,grid_nu,grid_Er,database):
-    xg=jnp.zeros(3)    
     hr0 = (grid_x-database.rnm2)*(grid_x-database.rnm1)/((database.rnm3-database.rnm2)*(database.rnm3-database.rnm1))
     hr1 = (grid_x-database.rnm3)*(grid_x-database.rnm1)/((database.rnm2-database.rnm3)*(database.rnm2-database.rnm1))
     hr2 = (grid_x-database.rnm3)*(grid_x-database.rnm2)/((database.rnm1-database.rnm3)*(database.rnm1-database.rnm2))
-    x11_m3,x13_m3,x33_m3=interpolator_nu_Er_general(-3,grid_nu,grid_Er,database)
-    x11_m2,x13_m2,x33_m2=interpolator_nu_Er_general(-2,grid_nu,grid_Er,database)
-    x11_m1,x13_m1,x33_m1=interpolator_nu_Er_general(-1,grid_nu,grid_Er,database)
-    xg11  = hr0*x11_m3+hr1*x11_m2+hr2*x11_m1
-    xg13  = hr0*x13_m3+hr1*x13_m2+hr2*x13_m1
-    xg33  = hr0*x33_m3+hr1*x33_m2+hr2*x33_m1 
-    xg=xg.at[0].set(xg11)
-    xg=xg.at[1].set(xg13)
-    xg=xg.at[2].set(xg33)
-    return xg#xg11,xg13,xg33
+    indices = jnp.arange(database.rho.size - 3, database.rho.size, dtype=jnp.int32)
+    v0, v1, v2 = _interpolated_surfaces(indices, grid_nu, grid_Er, database)
+    return hr0*v0 + hr1*v1 + hr2*v2
 
 @jit
 def interpolation_mid_r(grid_x,grid_nu,grid_Er,database):
-    xg=jnp.zeros(3)
     arr=grid_x-database.rho[1:-1]*database.a_b
     index = jnp.argmax(jnp.where(arr <= 0, arr, -jnp.inf))+1
-    idx0=index-2
-    idx1=index-1
-    idx2=index
-    idx3=index+1
-    ridx0=database.a_b*database.rho.at[idx0].get()
-    ridx1=database.a_b*database.rho.at[idx1].get()
-    ridx2=database.a_b*database.rho.at[idx2].get()
-    ridx3=database.a_b*database.rho.at[idx3].get()
-    #jax.debug.print("Pe {Pe} ", Pe=ind)
+    indices = index + jnp.asarray((-2, -1, 0, 1), dtype=jnp.int32)
+    ridx0, ridx1, ridx2, ridx3 = database.a_b * database.rho[indices]
     hr0 = (grid_x-ridx1)*(grid_x-ridx2)*(grid_x-ridx3)/((ridx0-ridx1)*(ridx0-ridx2)*(ridx0-ridx3))
     hr1 = (grid_x-ridx0)*(grid_x-ridx2)*(grid_x-ridx3)/((ridx1-ridx0)*(ridx1-ridx2)*(ridx1-ridx3))
     hr2 = (grid_x-ridx0)*(grid_x-ridx1)*(grid_x-ridx3)/((ridx2-ridx0)*(ridx2-ridx1)*(ridx2-ridx3))
     hr3 = (grid_x-ridx0)*(grid_x-ridx1)*(grid_x-ridx2)/((ridx3-ridx0)*(ridx3-ridx1)*(ridx3-ridx2))
-    x11_idx0,x13_idx0,x33_idx0=interpolator_nu_Er_general(idx0,grid_nu,grid_Er,database)
-    x11_idx1,x13_idx1,x33_idx1=interpolator_nu_Er_general(idx1,grid_nu,grid_Er,database)
-    x11_idx2,x13_idx2,x33_idx2=interpolator_nu_Er_general(idx2,grid_nu,grid_Er,database)
-    x11_idx3,x13_idx3,x33_idx3=interpolator_nu_Er_general(idx3,grid_nu,grid_Er,database) 
-    xg11  = hr0*x11_idx0+hr1*x11_idx1+hr2*x11_idx2+hr3*x11_idx3
-    xg13  = hr0*x13_idx0+hr1*x13_idx1+hr2*x13_idx2+hr3*x13_idx3
-    xg33  = hr0*x33_idx0+hr1*x33_idx1+hr2*x33_idx2+hr3*x33_idx3
-    xg=xg.at[0].set(xg11)
-    xg=xg.at[1].set(xg13)
-    xg=xg.at[2].set(xg33)
-    return xg#xg11,xg13,xg33
+    v0, v1, v2, v3 = _interpolated_surfaces(indices, grid_nu, grid_Er, database)
+    return hr0*v0 + hr1*v1 + hr2*v2 + hr3*v3
 
 
 #def get_Dij(grid_x, grid_nu, grid_Er):
@@ -375,24 +334,17 @@ def get_Dij_3d(grid_x, grid_nu, grid_Er, database):
 
 @jit
 def get_Dij(grid_x, grid_nu, grid_Er,database):
-    xg=jnp.zeros(3)
     grid_nu_internal=jnp.log10(jnp.maximum(1.e-12,grid_nu))
-    grid_Er_internal=jnp.select(condlist=[grid_x<=database.low_limit_r,grid_x>database.low_limit_r], 
-                              choicelist=[jnp.log10(database.Er_lower_limit),jnp.log10(jnp.maximum(database.Er_lower_limit,jnp.abs(grid_Er/grid_x)))],default=0)
-    I=jnp.identity(3)
-    array=jnp.select(condlist=[grid_x < database.r1_lim, (grid_x>=database.r1_lim) & (grid_x<database.rmn2_lim), grid_x >= database.rmn2_lim],
-                     choicelist=[I.at[0].get() ,I.at[1].get(),I.at[2].get() ],default=0)
-
-    xg=array.at[0].get()*interpolation_small_r(grid_x,grid_nu_internal,grid_Er_internal,database)+array.at[1].get()*interpolation_mid_r(grid_x,grid_nu_internal,grid_Er_internal,database)+array.at[2].get()*interpolation_large_r(grid_x,grid_nu_internal,grid_Er_internal,database)
-
-    #xg=jnp.select(condlist=[grid_x < r1_lim, (grid_x>=r1_lim) & (grid_x<rmn2_lim), grid_x >= rmn2_lim],
-    #                 choicelist=[interpolation_small_r(grid_x,grid_nu_internal,grid_Er_internal) ,
-    #                              interpolation_mid_r(grid_x,grid_nu_internal,grid_Er_internal) ,
-    #                              interpolation_large_r(grid_x,grid_nu_internal,grid_Er_internal) ],default=0)
-    #xg=xg.at[0].set(monodata1(grid_x,grid_nu_internal,grid_Er_internal))
-    #xg=xg.at[1].set(monodata2(grid_x,grid_nu_internal,grid_Er_internal))
-    #xg=xg.at[2].set(monodata3(grid_x,grid_nu_internal,grid_Er_internal))
-    return xg
+    safe_grid_x = jnp.where(grid_x == 0., 1., grid_x)
+    grid_Er_internal=jnp.select(condlist=[grid_x<=database.low_limit_r,grid_x>database.low_limit_r],
+                              choicelist=[jnp.log10(database.Er_lower_limit),jnp.log10(jnp.maximum(database.Er_lower_limit,jnp.abs(grid_Er/safe_grid_x)))],default=0)
+    branch = jnp.where(grid_x < database.r1_lim, 0, jnp.where(grid_x < database.rmn2_lim, 1, 2))
+    # A scalar radial query needs one closure, not all ten surface queries.
+    # The discrete branch remains frozen by AD, as in the previous mask rule.
+    return jax.lax.switch(
+        branch, (interpolation_small_r, interpolation_mid_r, interpolation_large_r),
+        grid_x, grid_nu_internal, grid_Er_internal, database,
+    )
 
 
 @jax.jit
@@ -850,118 +802,44 @@ def monoenergetic_interpolation_sparse_table_bar(
 
 
 @jax.jit
-def monoenergetic_interpolation_sparse_coordinate_bar(
-    stencil, local_bar, database
-):
-    """Transpose one ``get_Dij`` query to ``a_b`` and sparse ``Er_list``.
+def monoenergetic_interpolation_sparse_coordinate_bar(stencil, local_bar, database):
+    """Transpose a recorded query using only its local cubic knot support."""
+    offsets = jnp.arange(-2, 2, dtype=jnp.int32)
+    nu_upper = stencil.nu_upper_index
+    ix = jnp.clip(nu_upper + offsets, 0, database.nu_log.size - 1)
+    spacing = jnp.diff(database.nu_log[ix])
+    inverse = jnp.where(spacing == 0., 0., 1. / jnp.where(spacing == 0., 1., spacing))
+    x_geometry = (inverse, spacing[1], stencil.nu_fraction,
+                  nu_upper == 1, nu_upper == database.nu_log.size - 1)
 
-    Coefficient values and the physical query coordinates are fixed.  The
-    discrete radial and bicubic intervals are the ones recorded in
-    ``stencil``.  This is the same piecewise derivative contract used by the
-    established VJP, but its electric-field knot cotangent never has a dense
-    radius-by-Er shape per scalar query.
-    """
+    def surface(slot):
+        radius = stencil.radial_indices[slot]
+        upper = stencil.er_upper_indices[slot]
+        iy = jnp.clip(upper + offsets, 0, database.Er_list.shape[1] - 1)
+        knots = database.Er_list[radius, iy]
+        tables = jnp.stack(tuple(table[radius, ix[:, None], iy[None, :]]
+                                 for table in (database.D11_log, database.D13, database.D33)), axis=-1)
+        values = _cubic_apply(tables, x_geometry)
 
-    local_bar = jnp.asarray(local_bar)
-    support_offsets = jnp.asarray((-2, -1, 0, 1), dtype=jnp.int32)
-    nu_raw_indices = stencil.nu_upper_index + support_offsets
-    nu_active = (
-        (nu_raw_indices >= 0)
-        & (nu_raw_indices < database.nu_log.shape[0])
-    )
-    nu_indices = jnp.clip(
-        nu_raw_indices, 0, database.nu_log.shape[0] - 1
-    )
+        def coefficients(ys):
+            spacing = jnp.diff(ys)
+            inverse = jnp.where(spacing == 0., 0., 1. / jnp.where(spacing == 0., 1., spacing))
+            width = spacing[1]
+            t = (stencil.grid_er_internal - ys[1]) * inverse[1]
+            geometry = inverse, width, t, upper == 1, upper == database.Er_list.shape[1] - 1
+            value = _cubic_apply(values, geometry)
+            return value, value
 
-    def _surface_coordinate_bar(slot):
-        surface_index = stencil.radial_indices[slot]
-        er_grid = jax.lax.dynamic_index_in_dim(
-            database.Er_list, surface_index, axis=0, keepdims=False
-        )
-        er_raw_indices = stencil.er_upper_indices[slot] + support_offsets
-        er_active = (er_raw_indices >= 0) & (
-            er_raw_indices < er_grid.shape[0]
-        )
-        er_indices = jnp.clip(er_raw_indices, 0, er_grid.shape[0] - 1)
-        er_support = er_grid[er_indices]
+        jacobian, value = jax.jacfwd(coefficients, has_aux=True)(knots)
+        raw = jnp.vdot(local_bar, value)
+        bars = jnp.einsum("c,ck->k", local_bar, jacobian) * stencil.radial_weights[slot]
+        active = stencil.radial_active[slot]
+        return iy, jnp.where(active, bars, 0.), jnp.where(active, raw, 0.)
 
-        surface_tables = jnp.stack((
-            jax.lax.dynamic_index_in_dim(
-                database.D11_log, surface_index, axis=0, keepdims=False
-            ),
-            jax.lax.dynamic_index_in_dim(
-                database.D13, surface_index, axis=0, keepdims=False
-            ),
-            jax.lax.dynamic_index_in_dim(
-                database.D33, surface_index, axis=0, keepdims=False
-            ),
-        ))
-        table_support = surface_tables[
-            :, nu_indices[:, None], er_indices[None, :]
-        ]
-        support_active = nu_active[:, None] & er_active[None, :]
-
-        def _weighted_surface_objective(er_support_value):
-            support_delta = jnp.where(
-                er_active,
-                er_support_value - er_grid[er_indices],
-                0.0,
-            )
-            varied_er_grid = er_grid.at[er_indices].add(support_delta)
-            er_upper_index = stencil.er_upper_indices[slot]
-            er_dx = (
-                varied_er_grid[er_upper_index]
-                - varied_er_grid[er_upper_index - 1]
-            )
-            er_fraction = (
-                stencil.grid_er_internal
-                - varied_er_grid[er_upper_index - 1]
-            ) * jnp.where(er_dx == 0.0, 0.0, 1.0 / er_dx)
-            coefficient_weights = _monoenergetic_slice_sparse_table_bar(
-                database.nu_log,
-                varied_er_grid,
-                stencil.nu_upper_index,
-                er_upper_index,
-                stencil.nu_fraction,
-                er_fraction,
-                jnp.asarray(1.0, dtype=surface_tables.dtype),
-                surface_tables[0],
-            )
-            coefficient_weights = jnp.where(
-                support_active, coefficient_weights, 0.0
-            )
-            coefficient_values = jnp.einsum(
-                "ij,cij->c", coefficient_weights, table_support
-            )
-            unweighted_value = jnp.vdot(local_bar, coefficient_values)
-            return (
-                stencil.radial_weights[slot] * unweighted_value,
-                unweighted_value,
-            )
-
-        (_, unweighted_value), er_values_bar = jax.value_and_grad(
-            _weighted_surface_objective, has_aux=True
-        )(er_support)
-        active = stencil.radial_active[slot] & er_active
-        return (
-            er_indices,
-            jnp.where(active, er_values_bar, 0.0),
-            jnp.where(stencil.radial_active[slot], unweighted_value, 0.0),
-        )
-
-    er_indices, er_values, unweighted_values = jax.vmap(
-        _surface_coordinate_bar
-    )(jnp.arange(4, dtype=jnp.int32))
-    a_b_bar = jnp.vdot(
-        stencil.radial_weight_a_b_derivatives,
-        unweighted_values,
-    )
+    indices, bars, raw = jax.vmap(surface)(jnp.arange(4, dtype=jnp.int32))
     return MonoenergeticSparseCoordinateBar(
-        a_b=a_b_bar,
-        radial_indices=stencil.radial_indices,
-        er_indices=er_indices,
-        er_values=er_values,
-    )
+        a_b=jnp.vdot(stencil.radial_weight_a_b_derivatives, raw),
+        radial_indices=stencil.radial_indices, er_indices=indices, er_values=bars)
 
 
 @jax.jit

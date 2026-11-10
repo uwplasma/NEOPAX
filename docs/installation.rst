@@ -14,6 +14,14 @@ the available CUDA stack.  The CPU path is useful for small tests and
 documentation examples, but production NTX and reverse-AD benchmarks are
 intended for GPU execution.
 
+The following guide records the Linux virtual-machine setup used for the
+main-based VMEX and NTX dependency migration:
+
+.. toctree::
+   :maxdepth: 1
+
+   jax_gpu_environment
+
 After installation, check that the package imports:
 
 .. code-block:: console

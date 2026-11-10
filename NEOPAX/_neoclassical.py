@@ -567,6 +567,66 @@ def pullback_legacy_monoenergetic_queries_sparse(
 
 
 @jit
+def _particle_flux_interpolation_queries(
+    species, energy_grid, database, radius_values, Er, temperature, density, dndr, dtdr,
+    collisionality_kind=COLLISIONALITY_MODEL_DEFAULT,
+):
+    """Fixed-table query locations and unit particle-flux Dij cotangents.
+
+    Differentiate Gamma's first Lij row directly, including its log-D11
+    factor and parallel-force term. No heat/current matrix transpose is built.
+    """
+    vthermal = get_v_thermal(species.mass, temperature)
+    a1 = jax.vmap(get_Thermodynamical_Forces_A1, in_axes=(0, 0, 0, 0, 0, None))(
+        species.charge, density, temperature, dndr, dtdr, Er)
+    a2 = get_Thermodynamical_Forces_A2(temperature, dtdr)
+    a3 = get_Thermodynamical_Forces_A3(Er)
+    kernel = monoenergetic_interpolation_kernel(database)
+
+    def at_radius(radius):
+        def at_species(index):
+            vth = vthermal[index, radius]
+            velocity = energy_grid.v_norm * vth
+            nu = _nu_over_vnew_local(species, index, velocity, density[:, radius],
+                                     temperature[:, radius], vthermal[:, radius], collisionality_kind)
+            er = Er[radius] * 1.e3 / velocity
+            dij = jax.vmap(kernel, in_axes=(None, 0, 0, None))(radius_values[radius], nu, er, database)
+            mass_charge = species.mass[index] / species.charge[index]
+            l11 = -mass_charge**2 * vth**3 / jnp.sqrt(jnp.pi)
+            l13 = -mass_charge * vth**2 / jnp.sqrt(jnp.pi)
+            weighted_density = DENSITY_STATE_TO_PHYSICAL * density[index, radius] * energy_grid.xWeights
+            d11_bar = weighted_density * l11 * (
+                energy_grid.L11_weight * a1[index, radius] + energy_grid.L12_weight * a2[index, radius]
+            ) * jnp.log(10.) * 10.**dij[:, 0]
+            d13_bar = weighted_density * l13 * energy_grid.L13_weight * a3[radius]
+            return nu, er, jnp.stack((d11_bar, d13_bar, jnp.zeros_like(d11_bar)), axis=-1)
+
+        return jax.vmap(at_species)(species.species_indices)
+
+    query = jax.lax.map(at_radius, jnp.arange(radius_values.size, dtype=jnp.int32))
+    count = species.species_indices.size * radius_values.size
+    nu, er, bars = (jnp.swapaxes(value, 0, 1).reshape((count,) + value.shape[2:]) for value in query)
+    return jnp.tile(radius_values, species.species_indices.size), nu, er, bars
+
+
+@jit
+def _particle_flux_coordinate_basis(database, radius_values, nu, er, dij_bars):
+    """Accumulate local coordinate derivatives before objective contraction."""
+    query_count, energy_count = nu.shape
+    stencils = jax.vmap(monoenergetic_interpolation_stencil, in_axes=(0, 0, 0, None))(
+        jnp.repeat(radius_values, energy_count), nu.reshape(-1), er.reshape(-1), database)
+    coordinate = jax.vmap(monoenergetic_interpolation_sparse_coordinate_bar, in_axes=(0, 0, None))(
+        stencils, dij_bars.reshape(-1, 3), database)
+    scale_bar = jnp.sum(coordinate.a_b.reshape(query_count, energy_count), axis=1)
+    shape = coordinate.er_values.shape
+    queries = jnp.broadcast_to(jnp.repeat(jnp.arange(query_count), energy_count)[:, None, None], shape)
+    radii = jnp.broadcast_to(coordinate.radial_indices[:, :, None], shape)
+    er_bar = jnp.zeros((query_count,) + database.Er_list.shape, dtype=database.Er_list.dtype).at[
+        queries, radii, coordinate.er_indices].add(coordinate.er_values)
+    return scale_bar, er_bar
+
+
+@jit
 def _pullback_legacy_radial_database_flux_support_sparse(
     species,
     energy_grid,

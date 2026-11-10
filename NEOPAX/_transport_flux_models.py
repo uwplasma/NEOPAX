@@ -23,10 +23,13 @@ from ._cell_variable import (
 )
 from ._fem import cell_centered_from_faces, faces_from_cell_centered
 from ._boundary_conditions import (
+    BoundaryConditionModel,
     left_constraints_from_bc_model,
     right_constraints_from_bc_model,
 )
 from ._neoclassical import (
+    _particle_flux_coordinate_basis,
+    _particle_flux_interpolation_queries,
     _as_species_constraint,
     _collisionality_kind,
     _nu_over_vnew,
@@ -5145,11 +5148,25 @@ class NTXDatabaseTransportModel(TransportFluxModelBase):
         primal database construction.  ``Er_list`` is independent afterward:
         it is the scan-owned log-electric-field interpolation coordinate.
         """
-        zero = _float_delta_tree_like(database)
         if not isinstance(database, Monoenergetic):
             # The explicit runtime NTX scan builds Monoenergetic databases.
             # Other database kinds have no recorded scan-coordinate contract.
-            return zero
+            return _float_delta_tree_like(database)
+        if type(self) is not NTXDatabaseTransportModel or any(
+            bc is not None and type(bc) is not BoundaryConditionModel
+            for bc in (self.bc_density, self.bc_temperature)
+        ):
+            # Preserve subclass overrides and the existing custom-BC protocol.
+            return self._local_particle_flux_database_coordinate_bars(state, gamma_bar, database)
+        return _database_particle_flux_coordinate_pullback(
+            self.species, self.energy_grid, self.geometry, state, gamma_bar, database,
+            self.bc_density, self.bc_temperature, self.density_floor,
+            collisionality_model=self.collisionality_model,
+        )
+
+    def _local_particle_flux_database_coordinate_bars(self, state, gamma_bar, database):
+        """Coordinate VJP body, compiled with dynamic state and model arrays."""
+        zero = _float_delta_tree_like(database)
 
         gamma_bar = jnp.asarray(gamma_bar)
         state_density = jnp.asarray(state.density)
@@ -6386,22 +6403,9 @@ class NTXDatabaseTransportModel(TransportFluxModelBase):
             )
         )
 
-    def _build_local_database_flux_evaluator(
-        self, state, *, use_transport_boundary_constraints: bool
-    ):
-        """Return one centre-radius database flux triplet.
-
-        The direct-centre transport RHS and the local ambipolar-root problem
-        intentionally have different outer closures.  The former preserves
-        its established zero-gradient last-cell discrete closure.  The latter
-        is a physical root calculation and must use the configured transport
-        density/temperature boundary conditions, exactly as the runtime Lij
-        evaluator does.
-        """
-        species = self.species
-        energy_grid = self.energy_grid
+    def _local_database_flux_profiles(self, state, *, use_transport_boundary_constraints):
+        """Share the exact centre profiles/gradients used by local fluxes."""
         geometry = self.geometry
-        database = self.database
         density = safe_density(state.density, self.density_floor)
         temperature = state.temperature
         if use_transport_boundary_constraints:
@@ -6417,8 +6421,6 @@ class NTXDatabaseTransportModel(TransportFluxModelBase):
             density_right_grad_constraint = jnp.zeros_like(density_right_constraint)
             temperature_right_constraint = temperature[:, -1]
             temperature_right_grad_constraint = jnp.zeros_like(temperature_right_constraint)
-        v_thermal = get_v_thermal(species.mass, temperature)
-        collisionality_kind = _collisionality_kind(self.collisionality_model)
         dndr = jax.vmap(
             lambda density_a, n_rc, n_rg: get_gradient_density(
                 density_a,
@@ -6447,6 +6449,28 @@ class NTXDatabaseTransportModel(TransportFluxModelBase):
             temperature_right_constraint,
             temperature_right_grad_constraint,
         )
+        return density, temperature, dndr, dtdr
+
+    def _build_local_database_flux_evaluator(
+        self, state, *, use_transport_boundary_constraints: bool
+    ):
+        """Return one centre-radius database flux triplet.
+
+        The direct-centre transport RHS and the local ambipolar-root problem
+        intentionally have different outer closures.  The former preserves
+        its established zero-gradient last-cell discrete closure.  The latter
+        is a physical root calculation and must use the configured transport
+        density/temperature boundary conditions, exactly as the runtime Lij
+        evaluator does.
+        """
+        species = self.species
+        energy_grid = self.energy_grid
+        geometry = self.geometry
+        database = self.database
+        density, temperature, dndr, dtdr = self._local_database_flux_profiles(
+            state, use_transport_boundary_constraints=use_transport_boundary_constraints)
+        v_thermal = get_v_thermal(species.mass, temperature)
+        collisionality_kind = _collisionality_kind(self.collisionality_model)
         species_indices = jnp.asarray(species.species_indices, dtype=jnp.int32)
 
         def evaluator(radius_index, er_value):
@@ -6877,6 +6901,49 @@ def _ntx_runtime_scan_to_neopax_monoenergetic(scan, *, a_b):
         D13=d13,
         D33=d33,
     )
+
+
+@functools.partial(jax.jit, static_argnames=("collisionality_model",))
+def _database_particle_flux_coordinate_queries(
+    species, energy_grid, geometry, state, database,
+    bc_density, bc_temperature, density_floor, *, collisionality_model,
+):
+    model = NTXDatabaseTransportModel(
+        species, energy_grid, geometry, database, collisionality_model=collisionality_model,
+        bc_density=bc_density, bc_temperature=bc_temperature, density_floor=density_floor)
+    density, temperature, dndr, dtdr = model._local_database_flux_profiles(
+        state, use_transport_boundary_constraints=True)
+    return _particle_flux_interpolation_queries(
+        species, energy_grid, database, geometry.r_grid, state.Er, temperature, density, dndr, dtdr,
+        _collisionality_kind(collisionality_model))
+
+
+@jax.jit
+def _contract_database_particle_flux_coordinates(database, gamma_bar, scale_basis, er_basis):
+    batched = gamma_bar.ndim == 3
+    rows = gamma_bar if batched else gamma_bar[None]
+    flat = rows.reshape(rows.shape[0], -1)
+    scale = jnp.einsum("oq,q->o", flat, scale_basis)
+    er = jnp.einsum("oq,qij->oij", flat, er_basis)
+    zero = _float_delta_tree_like(database)
+    if batched:
+        zero = jax.tree.map(lambda x: jnp.broadcast_to(x, (rows.shape[0],) + x.shape), zero)
+    else:
+        scale, er = scale[0], er[0]
+    return dataclasses.replace(zero, a_b=scale, Er_list=er)
+
+
+def _database_particle_flux_coordinate_pullback(
+    species, energy_grid, geometry, state, gamma_bar, database,
+    bc_density, bc_temperature, density_floor, *, collisionality_model,
+):
+    # Keep the three compiled stages separate to bound compilation memory.
+    # All changing physical inputs remain dynamic; no derivative is stopped.
+    queries = _database_particle_flux_coordinate_queries(
+        species, energy_grid, geometry, state, database, bc_density, bc_temperature, density_floor,
+        collisionality_model=collisionality_model)
+    basis = _particle_flux_coordinate_basis(database, *queries)
+    return _contract_database_particle_flux_coordinates(database, gamma_bar, *basis)
 
 
 def _ntx_runtime_scan_with_live_channels(scan, *, channels, er_tilde):

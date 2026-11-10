@@ -440,7 +440,8 @@ def test_database_root_coordinate_pullback_matches_compact_query_vjp(monkeypatch
         D33=jnp.zeros((5, 2, 2)),
     )
     model = NTXDatabaseTransportModel(
-        species=object(), energy_grid=object(), geometry=object(), database=database
+        species=object(), energy_grid=object(), geometry=object(), database=database,
+        bc_density=object(),  # Keep this stub on the custom-model/BC VJP path.
     )
     state = TransportState(
         density=jnp.ones((2, 2)), pressure=jnp.ones((2, 2)),
