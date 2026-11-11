@@ -5152,6 +5152,8 @@ class NTXDatabaseTransportModel(TransportFluxModelBase):
             # The explicit runtime NTX scan builds Monoenergetic databases.
             # Other database kinds have no recorded scan-coordinate contract.
             return _float_delta_tree_like(database)
+        if monoenergetic_database_kind(database) != MONOENERGETIC_KIND_GENERIC:
+            return self._local_particle_flux_database_coordinate_bars(state, gamma_bar, database)
         if type(self) is not NTXDatabaseTransportModel or any(
             bc is not None and type(bc) is not BoundaryConditionModel
             for bc in (self.bc_density, self.bc_temperature)

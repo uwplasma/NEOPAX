@@ -1,15 +1,76 @@
-"""Local C1 cubic interpolation for scalar monoenergetic database queries.
+"""Local C1 tensor interpolation and compact scalar-query AD rules.
 
 The endpoint slopes are the adjacent secant; interior slopes are the mean
 of the two secants, matching Interpax's default ``cubic`` rule on nonuniform
-grids. Each value uses a local 4x4 coefficient stencil. All arithmetic stays in JAX so
+grids. Values use local 4x4 or 4x4x4 coefficient stencils. Arithmetic stays in JAX so
 query, coefficient, knot-coordinate and higher derivatives remain available.
 Knots must be sorted, with at least two entries (as required by the database).
 """
 
+from functools import wraps
+
 import jax
 import jax.numpy as jnp
-from jax.custom_derivatives import SymbolicZero
+from jax.custom_derivatives import SymbolicZero, zero_from_primal
+
+
+def contract_scalar_queries(function=None, *, argnums=(0, 1, 2), joint=False):
+    """Contract wide query tangents after the scalar interpolation derivative.
+
+    Data/coordinate tangents still differentiate the original expression.
+    Symbolic zeros avoid constructing those tangents for state-only AD; real
+    knot, table and fit derivatives remain available, including higher AD.
+    """
+    if function is None:
+        return lambda fn: contract_scalar_queries(fn, argnums=argnums, joint=joint)
+
+    @jax.custom_jvp
+    @wraps(function)
+    def contracted(*args):
+        return function(*args)
+
+    def rule(primals, tangents):
+        def varied(indices, values):
+            arguments = list(primals)
+            for index, value in zip(indices, values, strict=True):
+                arguments[index] = value
+            return function(*arguments)
+
+        active = tuple(i for i in argnums if not isinstance(tangents[i], SymbolicZero))
+        if joint and active:
+            def along_queries(values):
+                result = varied(active, values)
+                return result, result
+            partials, result = jax.jacfwd(along_queries, has_aux=True)(
+                jnp.stack(tuple(primals[i] for i in active)))
+            directions = jnp.stack(tuple(tangents[i] for i in active))
+            result_dot = jax.tree.map(lambda partial: jnp.sum(partial * directions, axis=-1), partials)
+        else:
+            result = function(*primals)
+            result_dot = jax.tree.map(jnp.zeros_like, result)
+            for index in active:
+                _, partial = jax.jvp(lambda value: varied((index,), (value,)),
+                                     (primals[index],), (jnp.ones_like(primals[index]),))
+                result_dot = jax.tree.map(
+                    lambda accumulated, slope: accumulated + slope * tangents[index],
+                    result_dot, partial)
+        data_indices = tuple(i for i in range(len(primals)) if i not in argnums)
+        data_primals = tuple(primals[i] for i in data_indices)
+        data_tangents = tuple(tangents[i] for i in data_indices)
+        if any(not isinstance(value, SymbolicZero) for value in jax.tree.leaves(data_tangents)):
+            data_dots = jax.tree.map(
+                lambda primal, dot: zero_from_primal(primal) if isinstance(dot, SymbolicZero) else dot,
+                data_primals, data_tangents)
+
+            def along_data(*values):
+                return varied(data_indices, values)
+
+            _, data_result_dot = jax.jvp(along_data, data_primals, data_dots)
+            result_dot = jax.tree.map(jnp.add, result_dot, data_result_dot)
+        return result, result_dot
+
+    contracted.defjvp(rule, symbolic_zeros=True)
+    return contracted
 
 
 def _cell_upper_index(knots, query):
@@ -85,7 +146,7 @@ def _bicubic_channels(x, y, tables, xq, yq):
     return tuple(result)
 
 
-@jax.custom_jvp
+@contract_scalar_queries(argnums=(3, 4))
 def bicubic_channels(x, y, tables, xq, yq):
     """Local bicubic values with query tangents contracted after interpolation.
 
@@ -97,34 +158,12 @@ def bicubic_channels(x, y, tables, xq, yq):
     return _bicubic_channels(x, y, tables, xq, yq)
 
 
-def _bicubic_channels_jvp(primals, tangents):
-    result = _bicubic_channels(*primals)
-    result_dot = jax.tree.map(jnp.zeros_like, result)
-    for index in (3, 4):
-        direction = tangents[index]
-        if isinstance(direction, SymbolicZero):
-            continue
-
-        def along_query(value):
-            arguments = list(primals)
-            arguments[index] = value
-            return _bicubic_channels(*arguments)
-
-        _, partial = jax.jvp(
-            along_query, (primals[index],), (jnp.ones_like(primals[index]),))
-        result_dot = jax.tree.map(
-            lambda accumulated, slope: accumulated + slope * direction,
-            result_dot, partial)
-    if any(not isinstance(value, SymbolicZero)
-           for value in jax.tree.leaves(tangents[:3])):
-        data_dots = jax.tree.map(
-            lambda primal, dot: jnp.zeros_like(primal) if isinstance(dot, SymbolicZero) else dot,
-            primals[:3], tangents[:3])
-        _, data_result_dot = jax.jvp(
-            lambda x, y, tables: _bicubic_channels(x, y, tables, *primals[3:]),
-            primals[:3], data_dots)
-        result_dot = jax.tree.map(jnp.add, result_dot, data_result_dot)
-    return result, result_dot
-
-
-bicubic_channels.defjvp(_bicubic_channels_jvp, symbolic_zeros=True)
+@contract_scalar_queries(argnums=(4, 5, 6))
+def tricubic_channels(x, y, z, tables, xq, yq, zq):
+    """The same tensor C1 cubic rule on a local 4x4x4 coefficient stencil."""
+    ix, gx = _cubic_geometry(x, xq)
+    iy, gy = _cubic_geometry(y, yq)
+    iz, gz = _cubic_geometry(z, zq)
+    local = jnp.stack(tuple(table[ix[:, None, None], iy[None, :, None], iz[None, None, :]]
+                            for table in tables), axis=-1)
+    return tuple(_cubic_apply(_cubic_apply(_cubic_apply(local, gx), gy), gz))

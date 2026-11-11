@@ -1,5 +1,75 @@
 # VMEX and NTX main-branch compatibility: 2026-11-08
 
+## Full benchmark primal-anchor audit: 2026-11-10
+
+The supplied successful GPU runs are finite, but not numerically equivalent.
+`v0_new` used 290 accepted steps and `v0_main` (`84e47ba`) used 285. The
+transport objective values differ by at most 0.000200%, while geometry-only
+QI/max-J values differ by 2.63%/1.46%. Bootstrap derivatives with respect to
+RBC(1,0)/ZBS(1,0) differ by 19.3%/55.9%. The T0 transport column is about
+3.38% smaller in magnitude on main. Those derivative differences are not
+validated merely by observing finite values or a small replay endpoint error.
+
+The source trace identifies a concrete primal/linearization inconsistency:
+
+1. The benchmark TOML selected `geometry.vmec_lane = "forward"`.
+   `_run_realtime_geometry_reverse_mode` calls `build_runtime_context`, whose
+   geometry builder uses the ordinary multigrid forward solve.
+2. The mixed least-squares evaluator separately calls
+   `geometry_raw_block_solve_from_param_vector`. That uses the implicit
+   solve with auxiliary data. New VMEX refines its returned state onto the
+   implicit residual root; old `en/local_test` returned the host-solver state
+   without that refinement.
+3. At zero geometry displacement the evaluator sets `use_runtime_payload`
+   true. Transport therefore continues with the existing forward runtime,
+   while its final support-to-geometry VJP and geometry-only objectives use
+   the implicit state. The zero-displacement shortcut does not check that
+   those two equilibrium states coincide.
+
+The shared benchmark TOML now selects `vmec_lane = "ad"`: its primal runtime
+and geometry pullback use the same implicit equilibrium definition. This also
+applies to the FD benchmark when using that same TOML. The AD report records
+the configured primal lane and pullback lane. The input equilibrium, profiles,
+grid, objectives, weights and accepted-step replay algorithm are unchanged.
+Older FD results must be regenerated before a comparison at this new primal
+anchor. This change does not establish parity with the old unrefined VMEX
+response, which also differs in held-mode parameter derivatives and block
+adjoint refinement/certification.
+
+The apparent adjoint-RHS change from an assembly transpose to `P(gbar)` is
+not by itself a missing term: the old assembly's derivative with respect to
+its free state is the symmetric projector P. Its parameter contribution
+remains a separate direct assembly VJP in the new implementation. The
+ported shared-J QI/max-J function and its ten local helpers are unchanged
+apart from placement/comments in the local dependency checkouts.
+
+The observed main replay mismatch is at most 3.20e-12 in absolute state and
+2.19e-7 after dividing by the solver's `atol + rtol * max(abs(states))`.
+That is a fraction of the allowed state tolerance, not a relative gradient
+error. It is far below the endpoint rejection threshold of 1, but endpoint
+agreement alone does not certify the derivative.
+
+Use the following bounded diagnostic on the remote GPU machine before
+another full transport reverse run:
+
+```bash
+cd "$HOME/NEOPAX" || exit 1
+JAX_PLATFORMS=cuda,cpu JAX_ENABLE_X64=true \
+  "$HOME/jax_env/bin/python" \
+  examples/benchmarks/check_vmex_primal_consistency.py \
+  --include-boozer \
+  --out-dir outputs/vmex_primal_consistency
+```
+
+It runs the forward and implicit VMEX solves, compares their state arrays
+and optional Boozer objectives, and writes CSV/NPZ artifacts. It builds no
+NTX scan and runs no ambipolarity or transport solve. Its comparison/error
+handling and end-to-end artifact writing passed three tiny tests using NumPy
+arrays and mocked solvers. The equilibrium diagnostic and
+the corrected full benchmark have not been run locally. The exact numerical
+share of each geometry discrepancy and the temperature-column discrepancy
+remain to be isolated; the two supplied runs alone cannot determine them.
+
 ## NEOPAX migration update: 2026-11-09
 
 The NEOPAX adapter changes are now in the isolated `NEOPAX-v0_main` checkout

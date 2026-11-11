@@ -39,12 +39,43 @@ def _flux_jacobian_worker(args, model, state, output):
     function = jax.jit(jax.vmap(jax.jacfwd(flux, argnums=0), in_axes=(0, None)))
     states = jnp.broadcast_to(flat, (7, flat.size))
     jax.block_until_ready((states, model.database))
+
+    def directional_reference():
+        @jax.jit
+        def directional(active_states, direction, database):
+            return jax.jvp(lambda value: jax.vmap(flux, in_axes=(0, None))(value, database),
+                           (active_states,), (direction,))[1]
+        directions = jnp.stack(tuple(states * .01 * jnp.sin(
+            jnp.arange(states.size).reshape(states.shape) * (.31 + index))
+            for index in range(3)))
+        derivatives = jnp.stack(tuple(jax.block_until_ready(
+            directional(states, direction, model.database)) for direction in directions))
+        if not np.isfinite(np.asarray(derivatives)).all():
+            raise FloatingPointError("Nonfinite uncontracted directional flux reference")
+        np.savez(output / "values.npz", directions=np.asarray(directions),
+                 directional_derivatives=np.asarray(derivatives))
+        print(f"[{args.worker_backend}] three directional references passed; "
+              "the oversized full reference Jacobian was not executed", flush=True)
+
+    if getattr(args, "directional_reference_only", False):
+        directional_reference()
+        return
     start = time.perf_counter()
     compiled = function.lower(states, model.database).compile()
     compile_s = time.perf_counter() - start
     temporary_bytes = compiled.memory_analysis().temp_size_in_bytes
     print(f"[{args.worker_backend}] flux_jacobian compile_s={compile_s:.6f} "
           f"temporary_bytes={temporary_bytes} memory={memory_stats()}", flush=True)
+    limit = getattr(args, "max_temp_bytes", None)
+    if limit is not None and temporary_bytes > limit:
+        with (output / "workspace.csv").open("w", newline="") as stream:
+            writer = csv.writer(stream)
+            writer.writerow(("temporary_bytes", "limit_bytes", "status"))
+            writer.writerow((temporary_bytes, limit, "execution_skipped"))
+        if not str(args.worker_backend).endswith("uncontracted"):
+            raise MemoryError(f"Optimized workspace {temporary_bytes} exceeds component-probe limit {limit}")
+        directional_reference()
+        return
     first_s = None
     samples = []
     for index in range(args.repeats + 1):
@@ -75,6 +106,7 @@ def _flux_jacobian_worker(args, model, state, output):
 def _worker(args):
     import dataclasses
     import functools
+    import inspect
     import os
 
     import h5py
@@ -103,6 +135,10 @@ def _worker(args):
         D13=jnp.asarray(d13 * drds[:, None, None]), D33=jnp.asarray(d33 * nu[None, :, None]),
     )
     model = dataclasses.replace(model, database=database)
+    if args.worker_backend in {"interpax", "native_uncontracted"}:
+        from NEOPAX._monoenergetic_interpolators import MONOENERGETIC_INTERPOLATION_KERNELS
+        MONOENERGETIC_INTERPOLATION_KERNELS["generic"] = jax.jit(
+            inspect.unwrap(MONOENERGETIC_INTERPOLATION_KERNELS["generic"]))
     if args.worker_backend == "native_uncontracted":
         from NEOPAX._native_interpolation import _bicubic_channels
         interpolation.bicubic_channels = _bicubic_channels

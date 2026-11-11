@@ -3,6 +3,7 @@ import jax.numpy as jnp
 import dataclasses
 from jax import config
 from ._interpolators_ntss_preprocessed import _inpold_fixed
+from ._native_interpolation import contract_scalar_queries
 
 # to use higher precision
 config.update("jax_enable_x64", True)
@@ -392,6 +393,7 @@ def _surface_ntss1d_fixed_er(table, ir, inu, ty, grid_er_internal, database):
 
 
 @jax.jit
+@contract_scalar_queries(joint=True)
 def get_Dij_preprocessed_3d(grid_x, grid_nu, grid_Er, database):
     grid_nu_internal = jnp.log10(jnp.maximum(1.0e-12, grid_nu))
     # ``where`` evaluates both operands under JAX.  Keep the inactive
@@ -479,6 +481,7 @@ def get_Dij_preprocessed_3d(grid_x, grid_nu, grid_Er, database):
 
 
 @jax.jit
+@contract_scalar_queries(joint=True)
 def get_Dij_preprocessed_3d_ntss_radius(grid_x, grid_nu, grid_Er, database):
     arr = database.r_grid
     nr = arr.shape[0]
@@ -604,6 +607,7 @@ def get_Dij_preprocessed_3d_ntss_radius(grid_x, grid_nu, grid_Er, database):
 
 
 @jax.jit
+@contract_scalar_queries(joint=True)
 def get_Dij_preprocessed_3d_ntss_radius_ntss1d(grid_x, grid_nu, grid_Er, database):
     arr = database.r_grid
     nr = arr.shape[0]
@@ -729,7 +733,10 @@ def get_Dij_preprocessed_3d_ntss_radius_ntss1d(grid_x, grid_nu, grid_Er, databas
 
 
 @jax.jit
+@contract_scalar_queries(joint=True)
 def get_Dij_preprocessed_3d_ntss_radius_ntss1d_fixednu(grid_x, grid_nu, grid_Er, database):
+    if database.Er_grid.shape[-1] != 12:
+        raise ValueError("preprocessed_3d_ntss1d_fixed requires exactly 12 electric-field nodes")
     arr = database.r_grid
     nr = arr.shape[0]
     xri = jax.lax.cond(nr == 1, lambda: arr[0], lambda: jnp.maximum(1.0e-2 * arr[0], grid_x))

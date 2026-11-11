@@ -4,6 +4,12 @@ Implemented in `en/v0_main` on 10 November 2026. The generic database query
 uses a native JAX implementation; no XLA guard-padding setting is required.
 The old `en/v0_new` and cleanup checkouts were not edited.
 
+The later [all-method AD comparison](monoenergetic_interpolation_ad_2026-11-10.md)
+adds a joint scalar-query derivative rule for all eight registered methods.
+It further reduces the generic flux/state-Jacobian temporary workspace from
+317.2 to 152.6 MiB. The root-coordinate allocation peak remains 288.3 MiB;
+these are separate component measurements.
+
 ## Implementation
 
 `NEOPAX/_native_interpolation.py` implements the same local C1 cubic rule as
@@ -18,8 +24,9 @@ forming differences before multiplication to limit cancellation in nearly
 constant tables. It constructs neither full-table slope arrays nor the
 generic 16x16 bicubic coefficient transformation per query. Native JAX AD
 retains derivatives with respect to queries, table entries and knot positions,
-including higher derivatives. No stopped-gradient cache or new custom AD rule
-was introduced.
+including higher derivatives. The initial implementation introduced no
+stopped-gradient cache or custom AD rule; the later exact query JVP is
+described in the state-Jacobian follow-up and all-method comparison.
 
 Cell lookup uses an arithmetic estimate plus an exact correction for strictly
 increasing, sufficiently uniform grids. Interpolation weights still use the

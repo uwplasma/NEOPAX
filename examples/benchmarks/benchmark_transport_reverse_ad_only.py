@@ -4364,6 +4364,8 @@ def _run_realtime_geometry_optimization_api_smoke(
         "objective_name": str(args.objective),
         "objective_order": list(objective_names),
         "residual_labels": list(result.residual_labels),
+        "vmec_primal_lane": str(config.get("geometry", {}).get("vmec_lane", "forward")),
+        "vmec_pullback_lane": "ad",
         "parameter_order": list(result.parameter_labels),
         "objective_values": objective_values_np,
         "residuals": residuals_np.tolist(),
@@ -5469,6 +5471,11 @@ def _run_realtime_geometry_reverse_mode(
     # Use the same entrypoint as the realtime forward solver for the primal
     # runtime.  Geometry-context helpers below are only for derivative-side
     # support-payload pullbacks against VMEC harmonics.
+    print(
+        "[autodiff-gate] realtime geometry VMEX lanes: "
+        f"primal={geom_cfg.get('vmec_lane', 'forward')} pullback=ad",
+        flush=True,
+    )
     phase_start = time.perf_counter()
     baseline_runtime, baseline_state = build_runtime_context(config)
     jax.block_until_ready(jax.tree_util.tree_leaves(baseline_state))

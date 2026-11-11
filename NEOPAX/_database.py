@@ -188,40 +188,15 @@ class Monoenergetic3D(Monoenergetic):
         D13,
         D33,
     ):
-        """Construct Field from BOOZ_XFORM file.
-
-        Parameters
-        ----------
-        ntx_file : path-like
-            Path to vmec wout file.
-        """
-
-        Er_ref=jnp.array(1.e-8)
-
-        Er_list=jnp.zeros((len(rho),len(Er.shape[2])))
-        for j in range(len(rho)):
-            D11[j,:,:]=D11[j,:,:]*jnp.power(drds[j],2)
-            D13[j,:,:]=D13[j,:,:]*drds[j]
-            for k in range(Er.shape[2]):
-                Er_list=Er_list.at[j,k].set(jnp.log10(jnp.maximum(1.e-8,jnp.abs(Er[0,k])/(a_b*rho.at[j].get()))))
-                D33[j,:,k]=D33[j,:,k]*nu_v  #Theres a B0^2*B^2_flux_average in NTSS TODO, probably not necessary 
-
-        D11 = _floor_positive_d11(D11)
-        D11_log=jnp.log10(D11)
-        nu_log=jnp.log10(nu_v)
-        D13=jnp.array(D13)
-        D33=jnp.array(D33)
-
-        data = {}
-        data["a_b"]=a_b
-        data["rho"] = rho
-        data["nu_log"] = nu_log
-        data["Er_list"] = Er_list
-        data["D11_log"] = D11_log
-        data["D13"] = D13
-        data["D33"] = D33
-
-        return cls(**data)
+        """Build the file-loader convention from arrays, retaining raw-data AD."""
+        rho, nu_v, Er, drds = map(jnp.asarray, (rho, nu_v, Er, drds))
+        return cls(
+            a_b=a_b, rho=rho, nu_log=jnp.log10(nu_v),
+            Er_list=jnp.log10(jnp.maximum(1.e-8, jnp.abs(Er[0])[None, :] / (a_b * rho[:, None]))),
+            D11_log=jnp.log10(_floor_positive_d11(jnp.asarray(D11) * drds[:, None, None]**2)),
+            D13=jnp.asarray(D13) * drds[:, None, None],
+            D33=jnp.asarray(D33) * nu_v[None, :, None],
+        )
 
 #    @classmethod
 #    def run_ntx(cls,

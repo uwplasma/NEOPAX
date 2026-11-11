@@ -10,7 +10,9 @@ import numpy as np
 from NEOPAX import _interpolators as interpolation
 from NEOPAX._database import Monoenergetic
 from NEOPAX._monoenergetic import database_with_geometry_scale
-from NEOPAX._native_interpolation import _cell_upper_index, bicubic_channels, cubic1d
+from NEOPAX._native_interpolation import (
+    _cell_upper_index, bicubic_channels, cubic1d, tricubic_channels, contract_scalar_queries,
+)
 
 jax.config.update("jax_enable_x64", True)
 
@@ -86,6 +88,12 @@ def test_bicubic_jvp_hessian_and_finite_difference():
     derivative = jax.jvp(functions[0], (point,), (direction,))[1]
     fd = (functions[0](point + 1e-5 * direction) - functions[0](point - 1e-5 * direction)) / 2e-5
     _assert_close(derivative, fd, rtol=2e-8, atol=2e-8)
+    joint_native = contract_scalar_queries(_native, argnums=(3, 4), joint=True)
+    joint_objective = lambda p: jnp.sum(joint_native(
+        x.at[1].set(p[2]), y.at[1].set(p[3]), values, p[0], p[1]) ** 2)
+    _assert_close(jax.jvp(joint_objective, (point,), (direction,)),
+                  jax.jvp(functions[1], (point,), (direction,)))
+    _assert_close(jax.hessian(joint_objective)(point), jax.hessian(functions[1])(point))
 
 
 def test_bicubic_two_knot_axes_and_repeated_knot_gradients():
@@ -122,6 +130,58 @@ def test_bicubic_batched_state_jacobian_matches_reference_for_query_and_data_dir
         actual = jax.jit(jax.vmap(lambda p: gradients(p, _native)))(points)
         expected = jax.jit(jax.vmap(lambda p: gradients(p, _reference)))(points)
         _assert_close(actual, expected)
+
+
+def test_tricubic_values_data_vjp_and_mixed_hessian_match_interpax():
+    x, y, _ = _surface_data()
+    z = jnp.asarray([-1.3, -.1, .8, 2.1])
+    tables = jnp.asarray(np.random.default_rng(31).normal(size=(2, x.size, y.size, z.size)))
+
+    def native(a, b, c, values, q):
+        return jnp.stack(tricubic_channels(a, b, c, tuple(values), *q))
+
+    def reference(a, b, c, values, q):
+        return jnp.stack(tuple(interpax.Interpolator3D(a, b, c, value, extrap=True)(*q)
+                               for value in values))
+
+    for point in ([-3.2, -5., -1.5], [-.23, -.67, .31], [2.2, 2., 2.4]):
+        point = jnp.asarray(point)
+        results = []
+        for evaluate in (native, reference):
+            objective = lambda a, b, c, values, q: jnp.vdot(
+                jnp.asarray([.3, -.7]), evaluate(a, b, c, values, q))
+            results.append(jax.value_and_grad(objective, argnums=(0, 1, 2, 3, 4))(
+                x, y, z, tables, point))
+        _assert_close(*results)
+
+    point = jnp.asarray([-.23, -.67, .31, .02, .01])
+    def objective(p, evaluate):
+        values = tables.at[0, 1, 2, 1].add(p[3])
+        return jnp.sum(evaluate(x.at[1].add(p[4]), y, z, values, p[:3]) ** 2)
+    _assert_close(jax.hessian(lambda p: objective(p, native))(point),
+                  jax.hessian(lambda p: objective(p, reference))(point))
+
+    # Integer coordinate metadata must supply float0 zeros when a table is
+    # differentiated; numerical zeros with the integer primal dtype are invalid.
+    knots = jnp.arange(3, dtype=jnp.int32)
+    cube = jnp.arange(27., dtype=jnp.float64).reshape((3, 3, 3))
+    gradient = jax.grad(lambda value: tricubic_channels(
+        knots, knots, knots, (value,), .7, .8, .9)[0])(cube)
+    assert np.isfinite(gradient).all()
+    _assert_close(jnp.sum(gradient), jnp.asarray(1.))
+
+
+def test_fixed_ntss_interpolator_rejects_wrong_field_node_count():
+    import inspect
+    import pytest
+    from types import SimpleNamespace
+    from NEOPAX._interpolators_preprocessed import get_Dij_preprocessed_3d_ntss_radius_ntss1d_fixednu
+
+    original = inspect.unwrap(get_Dij_preprocessed_3d_ntss_radius_ntss1d_fixednu)
+    for count in (11, 13):
+        database = SimpleNamespace(Er_grid=jnp.ones((5, count)))
+        with pytest.raises(ValueError, match="exactly 12 electric-field nodes"):
+            original(.5, .001, .001, database)
 
 
 def _database():
@@ -239,6 +299,9 @@ def test_coordinate_pullback_reuses_compilation_for_changed_arrays():
         pass
 
     compare(CustomModel(**vars(model)), state, bars)
+    from NEOPAX._database import Monoenergetic3D, MonoenergeticLogErNoR
+    for database_type in (Monoenergetic3D, MonoenergeticLogErNoR):
+        compare(dataclasses.replace(model, database=database_type(**vars(model.database))), state, bars)
     other_database = {"table": jnp.ones((2, 3))}
     fallback = model._pullback_local_particle_flux_database_coordinates(state, bars, other_database)
     np.testing.assert_array_equal(fallback["table"], np.zeros((2, 3)))

@@ -8,7 +8,9 @@ config.update("jax_enable_x64", True)
 from jax import jit
 import interpax
 from interpax._coefs import A_BICUBIC
-from ._native_interpolation import _cubic_apply, bicubic_channels, cubic1d
+from ._native_interpolation import (
+    _cubic_apply, bicubic_channels, cubic1d, tricubic_channels, contract_scalar_queries,
+)
 
 
 @jax.tree_util.register_dataclass
@@ -300,6 +302,7 @@ def get_Dij_alt(grid_x, grid_nu, grid_Er,database):
 
 
 @jit
+@contract_scalar_queries(joint=True)
 def get_Dij_3d(grid_x, grid_nu, grid_Er, database):
     grid_nu_internal = jnp.log10(jnp.maximum(1.0e-12, grid_nu))
     # A true 3D tensor grid cannot use database.Er_list directly because that
@@ -309,30 +312,13 @@ def get_Dij_3d(grid_x, grid_nu, grid_Er, database):
     r_grid = database.rho * database.a_b
     r_ref = jnp.max(r_grid)
     er_raw_log_grid = database.Er_list[0, :] + jnp.log10(jnp.maximum(r_ref, 1.0e-30))
-    xg11 = interpax.Interpolator3D(
-        r_grid,
-        database.nu_log,
-        er_raw_log_grid,
-        database.D11_log[:, :, :],
-        extrap=True,
-    )(grid_x, grid_nu_internal, grid_Er_internal)
-    xg13 = interpax.Interpolator3D(
-        r_grid,
-        database.nu_log,
-        er_raw_log_grid,
-        database.D13[:, :, :],
-        extrap=True,
-    )(grid_x, grid_nu_internal, grid_Er_internal)
-    xg33 = interpax.Interpolator3D(
-        r_grid,
-        database.nu_log,
-        er_raw_log_grid,
-        database.D33[:, :, :],
-        extrap=True,
-    )(grid_x, grid_nu_internal, grid_Er_internal)
-    return jnp.asarray([xg11, xg13, xg33])
+    return jnp.asarray(tricubic_channels(
+        r_grid, database.nu_log, er_raw_log_grid,
+        (database.D11_log, database.D13, database.D33),
+        grid_x, grid_nu_internal, grid_Er_internal))
 
 @jit
+@contract_scalar_queries(joint=True)
 def get_Dij(grid_x, grid_nu, grid_Er,database):
     grid_nu_internal=jnp.log10(jnp.maximum(1.e-12,grid_nu))
     safe_grid_x = jnp.where(grid_x == 0., 1., grid_x)
@@ -946,6 +932,7 @@ def monoenergetic_interpolation_table_bar(grid_x, grid_nu, grid_Er, local_bar, t
 
 
 @jit
+@contract_scalar_queries(joint=True)
 def get_Dij_loger_no_r(grid_x, grid_nu, grid_Er, database):
     xg = jnp.zeros(3)
     grid_nu_internal = jnp.log10(jnp.maximum(1.0e-12, grid_nu))

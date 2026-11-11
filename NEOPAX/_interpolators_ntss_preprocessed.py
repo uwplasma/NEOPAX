@@ -1,5 +1,6 @@
 import jax
 import jax.numpy as jnp
+from ._native_interpolation import contract_scalar_queries
 from jax import config
 
 # to use higher precision
@@ -735,6 +736,7 @@ def _eval_radius_node_fast(ir, xnu, xer, efield, db):
 
 
 @jax.jit
+@contract_scalar_queries(joint=True)
 def get_Dij_ntss_preprocessed(grid_x, grid_nu, grid_Er, db):
     arr = db.r_grid
     nr = arr.shape[0]
