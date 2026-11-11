@@ -99,6 +99,31 @@ def test_bicubic_two_knot_axes_and_repeated_knot_gradients():
         assert np.isfinite(bars).all()
 
 
+def test_bicubic_batched_state_jacobian_matches_reference_for_query_and_data_directions():
+    x, y, values = _surface_data()
+    point = jnp.linspace(-.03, .04, 9)
+    query_directions = jnp.asarray(np.random.default_rng(19).normal(size=(2, 9)))
+    for vary_queries, vary_data in ((True, False), (False, True), (True, True)):
+        def evaluate(p, surface):
+            queries = jnp.asarray([-.23, -.67])
+            if vary_queries:
+                queries = queries + query_directions @ p
+            knots_x, knots_y, tables = x, y, values
+            if vary_data:
+                knots_x = x.at[1].add(p[0])
+                knots_y = y.at[2].add(p[1])
+                tables = values.at[0, 2, 2].add(p[2])
+            return surface(knots_x, knots_y, tables, *queries)
+
+        def gradients(p, surface):
+            return jax.jacfwd(lambda value: evaluate(value, surface))(p)
+
+        points = jnp.stack((point, point * .8, point * 1.1))
+        actual = jax.jit(jax.vmap(lambda p: gradients(p, _native)))(points)
+        expected = jax.jit(jax.vmap(lambda p: gradients(p, _reference)))(points)
+        _assert_close(actual, expected)
+
+
 def _database():
     rho = jnp.asarray([.1, .3, .5, .7, .9])
     x, y, _ = _surface_data()

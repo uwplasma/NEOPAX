@@ -9,6 +9,7 @@ Knots must be sorted, with at least two entries (as required by the database).
 
 import jax
 import jax.numpy as jnp
+from jax.custom_derivatives import SymbolicZero
 
 
 def _cell_upper_index(knots, query):
@@ -70,7 +71,7 @@ def cubic1d(knots, values, query, *, extrap=False):
     return value
 
 
-def bicubic_channels(x, y, tables, xq, yq):
+def _bicubic_channels(x, y, tables, xq, yq):
     """Evaluate coefficient channels sharing one local 4x4 Hermite stencil.
 
     ``tables`` is a tuple of 2D coefficient tables on the same grid. Building
@@ -82,3 +83,48 @@ def bicubic_channels(x, y, tables, xq, yq):
     local = jnp.stack(tuple(table[ix[:, None], iy[None, :]] for table in tables), axis=-1)
     result = _cubic_apply(_cubic_apply(local, x_geometry), y_geometry)
     return tuple(result)
+
+
+@jax.custom_jvp
+def bicubic_channels(x, y, tables, xq, yq):
+    """Local bicubic values with query tangents contracted after interpolation.
+
+    A state Jacobian can have hundreds of directions. Differentiate the two
+    scalar queries once before multiplying those directions, so their leading
+    dimension does not expand the four-by-four interpolation stencil. Knot
+    and coefficient derivatives retain the same local JAX expression.
+    """
+    return _bicubic_channels(x, y, tables, xq, yq)
+
+
+def _bicubic_channels_jvp(primals, tangents):
+    result = _bicubic_channels(*primals)
+    result_dot = jax.tree.map(jnp.zeros_like, result)
+    for index in (3, 4):
+        direction = tangents[index]
+        if isinstance(direction, SymbolicZero):
+            continue
+
+        def along_query(value):
+            arguments = list(primals)
+            arguments[index] = value
+            return _bicubic_channels(*arguments)
+
+        _, partial = jax.jvp(
+            along_query, (primals[index],), (jnp.ones_like(primals[index]),))
+        result_dot = jax.tree.map(
+            lambda accumulated, slope: accumulated + slope * direction,
+            result_dot, partial)
+    if any(not isinstance(value, SymbolicZero)
+           for value in jax.tree.leaves(tangents[:3])):
+        data_dots = jax.tree.map(
+            lambda primal, dot: jnp.zeros_like(primal) if isinstance(dot, SymbolicZero) else dot,
+            primals[:3], tangents[:3])
+        _, data_result_dot = jax.jvp(
+            lambda x, y, tables: _bicubic_channels(x, y, tables, *primals[3:]),
+            primals[:3], data_dots)
+        result_dot = jax.tree.map(jnp.add, result_dot, data_result_dot)
+    return result, result_dot
+
+
+bicubic_channels.defjvp(_bicubic_channels_jvp, symbolic_zeros=True)

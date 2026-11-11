@@ -262,3 +262,82 @@ generic Interpax VJP comparison and comparison with the original ungrouped
 Interpax snapshots. Against the preceding native reusable VJP, its first
 call is about 4% slower and its repeated calls about 21% faster, with 28%
 less peak allocation.
+
+## Full reverse-segment failure and state-Jacobian follow-up
+
+The subsequent remote run at `1d6c309` still failed on the 10 GiB vGPU.
+Segment 6 completed with 37 active steps; after replaying segment 5, its
+reverse execution failed while allocating 3,653,600,000 bytes (3.40 GiB).
+It had not reached the initial-root coordinate pullback. The successful old
+`en/v0_new` log completed all six segments, 290 accepted steps and all
+Jacobian rows. The segment solver/replay source is unchanged between the
+branches, but its called interpolation expressions and the dependency
+environment differ. The supplied logs do not isolate one cause of the OOM.
+
+**The 288 MiB root-coordinate result above is not a memory bound for the
+reverse segments or the full benchmark.** In particular, the previous probes
+did not measure a dense forward-mode state Jacobian of the flux calculation.
+
+A GPU-only follow-up differentiated the actual local direct particle/heat
+flux evaluator with 51 radii, four species, four energy nodes, seven stage
+states and 459 state directions. Smooth synthetic 7x16x11 coefficient tables
+isolate the derivative graph; no transport, VMEC or NTX solve runs. The same
+JAX 0.10.0 environment, default XLA settings, x64, disabled compilation cache
+and disabled preallocation were used in fresh processes.
+
+| Flux/state Jacobian component | Compiled temporary workspace | Peak JAX allocation | Compile time |
+| --- | ---: | ---: | ---: |
+| Native, automatic stencil JVP | 3,847.6 MiB | 3,857.7 MiB | 9.897 s |
+| Native, contracted query JVP | 317.2 MiB | 876.4 MiB | 9.579 s |
+| Interpax control under JAX 0.10.0 | 3,222.1 MiB | 4,865.3 MiB during compilation | 11.479 s |
+
+The Interpax control ran out of memory before returning its first execution.
+Its compilation peak is not a completed-operation peak. Both native variants
+completed two calls with different input buffers and finite Jacobians. Their
+maximum scaled Jacobian difference was 1.88e-14, with the unchanged
+`rtol=atol=3e-10` comparison. These measurements explain a remaining large
+allocation in a relevant component; they do not prove which buffer caused
+the remote segment failure or establish a successful full remote rerun.
+
+The automatic JVP expanded state directions through the local 4x4 stencil.
+The new rule first evaluates the two scalar query derivatives, then contracts
+them with the query directions. Active knot and coefficient tangents still
+use the original local expression. It introduces no stopped derivatives,
+root changes, solver-mode changes or required XLA flags. Values, knot/table
+VJPs and mixed higher derivatives are covered by the focused interpolation
+tests.
+
+The existing component benchmark also supports this check with the saved
+physical coefficient table (7x16x12 in that file):
+
+```bash
+python examples/benchmarks/benchmark_native_database_interpolation.py \
+  --probe flux_jacobian \
+  --reference-backend native_uncontracted \
+  --repeats 5 \
+  --out-dir outputs/native_flux_jacobian_comparison
+```
+
+This compares before/after query JVPs in fresh GPU processes and checks the
+returned Jacobians. It is not a full reverse-AD benchmark.
+
+The integrated saved-table check passed with a maximum scaled Jacobian
+difference of 3.44e-14. Its before/after temporary workspace was again
+3,847.6/317.2 MiB, peak allocation 3,857.7/876.4 MiB, and median of five
+repeated executions 71.22/22.14 ms. First compilation took 10.30/12.03 s;
+this single cold observation is 17% slower, while the repeated component
+execution is about 69% faster. Compilation and execution timings are
+reported separately. The allocator pool reached 5,122/1,026 MiB.
+
+The integrated focused regression selection passed **33 checks**, including
+values, query/knot/table derivatives, mixed Hessians, batched state Jacobians,
+root-coordinate pullbacks, boundary constraints and changed dynamic inputs.
+These are small-array tests, not transport integrations. Full remote reverse
+validation remains outstanding.
+
+A final isolated root-coordinate regression retained the earlier 288.3 MiB
+peak and 514 MiB allocator pool: first call 6.692 s, repeated median 17.39 ms.
+Against the saved pre-fix root results, `a_b` and query values were bitwise
+identical; `Er_list` had maximum scaled difference 1.87e-14 and query
+Jacobians 2.23e-16. The larger state-Jacobian improvement therefore preserves
+the measured root-coordinate memory reduction.

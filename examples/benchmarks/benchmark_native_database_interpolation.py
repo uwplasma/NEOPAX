@@ -3,6 +3,8 @@
 Uses saved QI monoenergetic coefficients, 51 state radii, four species/energy
 nodes and 13 objective rows. No equilibrium, NTX or transport solve runs.
 Reports first-call coordinate-VJP time/peak memory and warmed query timings.
+The optional flux_jacobian probe measures seven stage flux/state Jacobians
+without a transport solve, including compiled temporary workspace.
 """
 
 import argparse
@@ -15,6 +17,59 @@ import time
 ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
+
+
+def _flux_jacobian_worker(args, model, state, output):
+    import dataclasses
+    import jax
+    import jax.numpy as jnp
+    import numpy as np
+    from jax.flatten_util import ravel_pytree
+    from examples.benchmarks.benchmark_initial_er_coordinate_pullback import memory_stats
+
+    flat, unpack = ravel_pytree(state)
+
+    def flux(y, database):
+        active_state = unpack(y)
+        evaluator = dataclasses.replace(model, database=database).build_local_direct_flux_evaluator(active_state)
+        result = jax.vmap(evaluator)(model.geometry.full_grid_indices, active_state.Er)
+        return jnp.concatenate((result["Gamma"].reshape(-1) / 1e20,
+                                result["Q"].reshape(-1) / 1e6))
+
+    function = jax.jit(jax.vmap(jax.jacfwd(flux, argnums=0), in_axes=(0, None)))
+    states = jnp.broadcast_to(flat, (7, flat.size))
+    jax.block_until_ready((states, model.database))
+    start = time.perf_counter()
+    compiled = function.lower(states, model.database).compile()
+    compile_s = time.perf_counter() - start
+    temporary_bytes = compiled.memory_analysis().temp_size_in_bytes
+    print(f"[{args.worker_backend}] flux_jacobian compile_s={compile_s:.6f} "
+          f"temporary_bytes={temporary_bytes} memory={memory_stats()}", flush=True)
+    first_s = None
+    samples = []
+    for index in range(args.repeats + 1):
+        active_states = states if index == 0 else states * jnp.asarray(1.000001)
+        jax.block_until_ready(active_states)
+        start = time.perf_counter()
+        result = jax.block_until_ready(compiled(active_states, model.database))
+        elapsed = time.perf_counter() - start
+        if index == 0:
+            first_s = elapsed
+            saved = np.asarray(result)
+            if not np.isfinite(saved).all():
+                raise FloatingPointError("Nonfinite flux/state Jacobian")
+            np.savez(output / "values.npz", flux_jacobian=saved)
+        else:
+            samples.append(elapsed)
+        del result
+    metrics = dict(backend=args.worker_backend, probe="flux_jacobian", compile_s=compile_s,
+                   temporary_bytes=temporary_bytes, first_execution_s=first_s,
+                   repeat_median_s=float(np.median(samples)), **memory_stats())
+    with (output / "measurements.csv").open("w", newline="") as stream:
+        writer = csv.DictWriter(stream, fieldnames=metrics)
+        writer.writeheader()
+        writer.writerow(metrics)
+    print(f"[{args.worker_backend}] {metrics}", flush=True)
 
 
 def _worker(args):
@@ -48,6 +103,9 @@ def _worker(args):
         D13=jnp.asarray(d13 * drds[:, None, None]), D33=jnp.asarray(d33 * nu[None, :, None]),
     )
     model = dataclasses.replace(model, database=database)
+    if args.worker_backend == "native_uncontracted":
+        from NEOPAX._native_interpolation import _bicubic_channels
+        interpolation.bicubic_channels = _bicubic_channels
     if args.worker_backend == "interpax":
         from NEOPAX._transport_flux_models import NTXDatabaseTransportModel
 
@@ -82,6 +140,9 @@ def _worker(args):
           f"state={state.density.shape} database={database.D11_log.shape}", flush=True)
     for name in ("XLA_FLAGS", "XLA_PYTHON_CLIENT_PREALLOCATE", "JAX_ENABLE_COMPILATION_CACHE"):
         print(f"[{backend}] {name}={os.environ.get(name, '<unset>')}", flush=True)
+    if getattr(args, "probe", "coordinate") == "flux_jacobian":
+        _flux_jacobian_worker(args, model, state, output)
+        return
     jax.block_until_ready((state, bars, database))
     coordinate_times = []
     for _ in range(getattr(args, "coordinate_repeats", 1)):
@@ -140,7 +201,10 @@ def main():
     parser.add_argument("--repeats", type=int, default=200)
     parser.add_argument("--coordinate-repeats", type=int, default=3,
                         help="Coordinate pullback calls, including its first compilation.")
-    parser.add_argument("--worker-backend", choices=("native", "interpax"), help=argparse.SUPPRESS)
+    parser.add_argument("--probe", choices=("coordinate", "flux_jacobian"), default="coordinate")
+    parser.add_argument("--reference-backend", choices=("interpax", "native_uncontracted"), default="interpax",
+                        help="Use native_uncontracted to compare against native interpolation before its query-JVP fix.")
+    parser.add_argument("--worker-backend", choices=("native", "interpax", "native_uncontracted"), help=argparse.SUPPRESS)
     args = parser.parse_args()
     if args.repeats < 1 or args.coordinate_repeats < 1:
         parser.error("repeat counts must be positive")
@@ -149,13 +213,14 @@ def main():
         return
     # Do not initialize JAX in the parent: GPU contexts and allocations must
     # be released between the two measurements.
-    for backend in ("interpax", "native"):
+    for backend in (args.reference_backend, "native"):
         subprocess.run([sys.executable, str(Path(__file__).resolve()), "--database", str(args.database),
                         "--out-dir", str(args.out_dir), "--repeats", str(args.repeats),
                         "--coordinate-repeats", str(args.coordinate_repeats),
+                        "--probe", args.probe,
                         "--worker-backend", backend], check=True)
     import numpy as np
-    with np.load(args.out_dir / "interpax/values.npz") as reference, np.load(args.out_dir / "native/values.npz") as actual:
+    with np.load(args.out_dir / args.reference_backend / "values.npz") as reference, np.load(args.out_dir / "native/values.npz") as actual:
         for key in reference.files:
             np.testing.assert_allclose(actual[key], reference[key], rtol=3e-10, atol=3e-10)
             scaled = np.max(np.abs(actual[key] - reference[key]) / np.maximum(1., np.abs(reference[key])))
