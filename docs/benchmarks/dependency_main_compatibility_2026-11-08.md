@@ -112,6 +112,27 @@ saved-state path calls neither equilibrium solver. The diagnostic deliberately
 compares `forward` against `ad` even when the corrected benchmark configuration
 selects `ad` for its runtime.
 
+The follow-up saved-state evaluation reproduced the main benchmark's implicit
+mean iota (-0.5935876720479774), magnetic well (-0.027481918565821245), and
+Mercier softmax (3.22768911172778). Its QI values 0.07901798840939844 /
+0.07836820772359807 and max-J values 172.64624537265053 / 169.796559543182
+used three surfaces, however: the diagnostic had inherited the general
+context builder's `(0.25, 0.5, 0.75)` default, whereas the AD benchmark
+factory selects `(0.1, 0.28, 0.46, 0.64, 0.82, 1.0)`. These are valid
+comparisons between the saved equilibria but are not the benchmark's QI/max-J
+aggregates. The mirror-ratio aggregate also depends on that selection.
+
+The diagnostic now calls the benchmark's context factory directly, preserving
+its surface selection, config aliases and Boozer resolution. It prints the
+resolved requested surfaces and Boozer resolution. Reuse the existing
+`states.npz` to evaluate the six-surface objectives; changing the objective
+surfaces does not require another equilibrium solve. The small end-to-end
+test executes the actual benchmark factory with its heavy builder replaced,
+checks the six defaults and explicit surface/resolution overrides, and still
+asserts that saved-state evaluation invokes neither solver. A separate real
+factory import/default check passed without building a geometry context or
+running any solve. Three diagnostic tests passed.
+
 ## NEOPAX migration update: 2026-11-09
 
 The NEOPAX adapter changes are now in the isolated `NEOPAX-v0_main` checkout

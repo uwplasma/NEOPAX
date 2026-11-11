@@ -16,6 +16,9 @@ import numpy as np
 ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
+BENCHMARKS = Path(__file__).resolve().parent
+if str(BENCHMARKS) not in sys.path:
+    sys.path.insert(0, str(BENCHMARKS))
 
 
 def compare_states(forward, implicit):
@@ -66,14 +69,16 @@ def main():
                         help="Evaluate saved states.npz using the same input deck; perform no equilibrium solves.")
     args = parser.parse_args()
     with args.config.open("rb") as stream:
-        geometry_cfg = tomllib.load(stream)["geometry"]
+        config = tomllib.load(stream)
+    geometry_cfg = config["geometry"]
 
     import jax
     import jax.numpy as jnp
     import vmex
+    from examples.benchmarks.benchmark_transport_reverse_ad_only import _geometry_context_from_config
     from NEOPAX._geometry_autodiff import (
         _geometry_full_ad_objectives_from_state, _solve_state_for_single_param,
-        _vmec_scalar_observables_from_state, build_geometry_autodiff_context,
+        _vmec_scalar_observables_from_state,
         geometry_raw_block_solve_from_param_vector,
     )
 
@@ -89,10 +94,12 @@ def main():
     print(f"[vmex-primal] configured_runtime_lane={geometry_cfg.get('vmec_lane', 'forward')} "
           "geometry_pullback_lane=ad", flush=True)
     with jax.default_device(gpu):
-        context = build_geometry_autodiff_context(
-            input_path, param_family=family, param_m=m, param_n=n,
-            mboz=geometry_cfg.get("mboz", geometry_cfg.get("vmec_mboz")),
-            nboz=geometry_cfg.get("nboz", geometry_cfg.get("vmec_nboz")))
+        # Reuse the benchmark factory: its six-surface default differs from
+        # the general context builder's three-surface default.
+        context_config = dict(config, geometry=dict(geometry_cfg, vmec_input_file=str(input_path)))
+        context = _geometry_context_from_config(context_config, f"{family}:{m}:{n}")
+        print(f"[vmex-primal] objective_surface_s={context.surface_s} "
+              f"mboz={context.mboz} nboz={context.nboz}", flush=True)
         if args.reuse_states:
             from vmex.core.solver import SpectralState
             arrays = load_state_arrays(args.reuse_states,

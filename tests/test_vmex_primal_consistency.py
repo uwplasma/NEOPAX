@@ -28,6 +28,7 @@ def test_state_comparison_rejects_invalid_reference_arrays(tmp_path):
 
 
 def test_diagnostic_writes_solver_state_and_boozer_comparisons(monkeypatch, tmp_path):
+    import ast
     import contextlib
     import dataclasses
     import sys
@@ -41,7 +42,27 @@ def test_diagnostic_writes_solver_state_and_boozer_comparisons(monkeypatch, tmp_
     calls = []
     forward, implicit = State(np.asarray([[3., 4.]])), State(np.asarray([[3., 5.]]))
     backend = types.ModuleType("NEOPAX._geometry_autodiff")
-    backend.build_geometry_autodiff_context = lambda path, **kw: (path, kw)
+    contexts = []
+
+    def build_context(path, **kwargs):
+        context = types.SimpleNamespace(input_path=path, **kwargs)
+        contexts.append(context)
+        return context
+
+    # Execute the real benchmark factory with only its heavyweight context
+    # builder replaced. This checks the actual defaults and config aliases.
+    benchmark_path = diagnostic.BENCHMARKS / "benchmark_transport_reverse_ad_only.py"
+    tree = ast.parse(benchmark_path.read_text())
+    factory = next(node for node in tree.body if isinstance(node, ast.FunctionDef)
+                   and node.name == "_geometry_context_from_config")
+    namespace = dict(Any=object, _REALTIME_GEOMETRY_BACKENDS={"vmec_jax_booz_xform_jax"},
+                     _parse_reverse_geometry_parameter=lambda value: (
+                         value.split(":")[0], int(value.split(":")[1]), int(value.split(":")[2])),
+                     _optional_config_int=lambda value: None if value is None else int(value),
+                     build_geometry_autodiff_context=build_context)
+    exec(compile(ast.Module(body=[factory], type_ignores=[]), str(benchmark_path), "exec"), namespace)
+    benchmark = types.ModuleType("examples.benchmarks.benchmark_transport_reverse_ad_only")
+    benchmark._geometry_context_from_config = namespace["_geometry_context_from_config"]
 
     def solve_forward(context, delta, **kwargs):
         calls.append((context, delta, kwargs))
@@ -72,11 +93,13 @@ def test_diagnostic_writes_solver_state_and_boozer_comparisons(monkeypatch, tmp_
     fake_solver.SpectralState = State
     for name, module in (("jax", fake_jax), ("jax.numpy", np), ("vmex", fake_vmex),
                          ("vmex.core", fake_core), ("vmex.core.solver", fake_solver),
+                         ("examples.benchmarks.benchmark_transport_reverse_ad_only", benchmark),
                          ("NEOPAX._geometry_autodiff", backend)):
         monkeypatch.setitem(sys.modules, name, module)
 
     config = tmp_path / "input.toml"
-    config.write_text('[geometry]\nvmec_input_file="input.vmec"\nvmec_lane="ad"\n'
+    config.write_text('[geometry]\nbackend="vmec_jax_booz_xform_jax"\n'
+                      'vmec_input_file="input.vmec"\nvmec_lane="ad"\nvmec_mboz=36\nvmec_nboz=11\n'
                       'vmec_param_family="ZBS"\nvmec_param_m=2\nvmec_param_n=1\nvmec_param_delta=0.02\n')
     output = tmp_path / "result"
     monkeypatch.setattr(sys, "argv", ["check", "--config", str(config), "--out-dir", str(output),
@@ -86,6 +109,8 @@ def test_diagnostic_writes_solver_state_and_boozer_comparisons(monkeypatch, tmp_
     assert calls[0][1] == calls[1][1][0] == .02
     assert calls[0][2]["lane"] == "forward"
     assert calls[1][2] == (("ZBS", 2, 1),)
+    assert contexts[0].surface_s == (0.1, 0.28, 0.46, 0.64, 0.82, 1.0)
+    assert (contexts[0].mboz, contexts[0].nboz) == (36, 11)
     with np.load(output / "states.npz") as saved:
         np.testing.assert_array_equal(saved["forward__R_cos"], forward.R_cos)
         np.testing.assert_array_equal(saved["implicit__R_cos"], implicit.R_cos)
@@ -94,8 +119,10 @@ def test_diagnostic_writes_solver_state_and_boozer_comparisons(monkeypatch, tmp_
     assert "R_cos,1.0,0.2" in (output / "state_comparison.csv").read_text()
 
     reused = tmp_path / "reused"
+    config.write_text(config.read_text() + 'vmec_surface_s="0.2, 0.5, 0.9"\n')
     monkeypatch.setattr(sys, "argv", ["check", "--config", str(config), "--out-dir", str(reused),
                                       "--reuse-states", str(output / "states.npz"), "--include-boozer"])
     diagnostic.main()
     assert len(calls) == 2  # The saved-state path must not call either solver.
+    assert contexts[1].surface_s == (0.2, 0.5, 0.9)
     assert (reused / "objective_comparison.csv").read_bytes() == (output / "objective_comparison.csv").read_bytes()
