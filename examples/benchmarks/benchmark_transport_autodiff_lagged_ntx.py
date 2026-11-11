@@ -1682,6 +1682,12 @@ def _run_host_local_step_pullback_diagnostic_for_parameter_vector(
     replay_lagged_cache_override = None
     replay_lagged_cache_path = _host_step_pullback_replay_lagged_cache_path()
     if replay_lagged_cache_path is not None:
+        # Unpickling runs arbitrary code, so only load a cache you produced yourself.
+        if os.environ.get("NEOPAX_ALLOW_PICKLE_REPLAY") != "1":
+            raise RuntimeError(
+                "the lagged-cache replay file is a pickle; set NEOPAX_ALLOW_PICKLE_REPLAY=1 "
+                "to load it (only for files you created)"
+            )
         with open(replay_lagged_cache_path, "rb") as f:
             replay_lagged_cache_override = pickle.load(f)
     replay_primal_override = None
