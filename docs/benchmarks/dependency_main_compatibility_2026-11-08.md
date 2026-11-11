@@ -70,6 +70,48 @@ the corrected full benchmark have not been run locally. The exact numerical
 share of each geometry discrepancy and the temperature-column discrepancy
 remain to be isolated; the two supplied runs alone cannot determine them.
 
+### Received GPU primal-state comparison
+
+The remote JAX 0.10.0 run confirmed a numerical difference between the two
+VMEX equilibrium paths using the same input deck:
+
+| State field | Maximum absolute difference | Relative L2 difference |
+| --- | ---: | ---: |
+| `R_cos` | 0.00152627 | 0.0190191% |
+| `Z_sin` | 0.00263024 | 0.0821938% |
+| `L_sin` | 0.00996239 | 6.34546% |
+
+`L_sin` contains VMEC's lambda angle-correction coefficients, so its relative
+change is not a percentage change in magnetic-field strength. The suppressed
+symmetry families remain zero to numerical precision.
+
+The implicit magnetic-well penalty is 0.027481918565822407. This agrees with
+the magnitude of the earlier main benchmark's magnetic-well scalar to about
+1.2e-15. The forward value, 0.027476134737736763, differs from the magnitude
+of the earlier `v0_new` value by about 6.0e-9. This is direct evidence for
+different primal anchors; it does not quantify their contribution to every
+transport derivative.
+
+The first diagnostic version's `--include-boozer` evaluated reduced Boozer
+observables and inadvertently omitted QI/max-J. The option now uses the full
+geometry objective helper, including both objectives. Existing state snapshots
+can be evaluated without repeating either equilibrium solve:
+
+```bash
+JAX_PLATFORMS=cuda,cpu JAX_ENABLE_X64=true \
+  "$HOME/jax_env/bin/python" \
+  examples/benchmarks/check_vmex_primal_consistency.py \
+  --reuse-states outputs/vmex_primal_consistency/states.npz \
+  --include-boozer \
+  --out-dir outputs/vmex_primal_consistency_full_objectives
+```
+
+Use the same input deck and harmonic point that produced the snapshot. The
+three tiny tests now also verify that both QI/max-J are written, and that the
+saved-state path calls neither equilibrium solver. The diagnostic deliberately
+compares `forward` against `ad` even when the corrected benchmark configuration
+selects `ad` for its runtime.
+
 ## NEOPAX migration update: 2026-11-09
 
 The NEOPAX adapter changes are now in the isolated `NEOPAX-v0_main` checkout

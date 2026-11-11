@@ -14,12 +14,17 @@ def test_state_comparison_detects_a_changed_equilibrium():
     assert all(row["max_abs_difference"] == 0. for row in compare_states(a, a))
 
 
-def test_state_comparison_rejects_invalid_reference_arrays():
+def test_state_comparison_rejects_invalid_reference_arrays(tmp_path):
+    from examples.benchmarks.check_vmex_primal_consistency import load_state_arrays
     a = {"R_cos": np.ones((1, 2))}
     for b, error in (({}, ValueError), ({"R_cos": np.ones((2, 2))}, ValueError),
                      ({"R_cos": np.asarray([[1., np.nan]])}, FloatingPointError)):
         with pytest.raises(error):
             compare_states(a, b)
+    snapshot = tmp_path / "incomplete.npz"
+    np.savez(snapshot, forward__R_cos=np.ones((1, 2)))
+    with pytest.raises(ValueError, match="implicit state is missing"):
+        load_state_arrays(snapshot, ("R_cos",))
 
 
 def test_diagnostic_writes_solver_state_and_boozer_comparisons(monkeypatch, tmp_path):
@@ -48,7 +53,8 @@ def test_diagnostic_writes_solver_state_and_boozer_comparisons(monkeypatch, tmp_
 
     backend._solve_state_for_single_param = solve_forward
     backend.geometry_raw_block_solve_from_param_vector = solve_implicit
-    backend._vmec_booz_scalar_observables_from_state = lambda ctx, state: {"qi": state.R_cos.sum()}
+    backend._geometry_full_ad_objectives_from_state = lambda ctx, state: {
+        "boozer_qi_objective": state.R_cos.sum(), "boozer_maxj_objective": state.R_cos.sum()**2}
     backend._vmec_scalar_observables_from_state = lambda *args: pytest.fail("Boozer option was ignored")
     fake_jax = types.ModuleType("jax")
     fake_jax.config = types.SimpleNamespace(update=lambda *args: None)
@@ -59,7 +65,13 @@ def test_diagnostic_writes_solver_state_and_boozer_comparisons(monkeypatch, tmp_
     fake_jax.numpy = np
     fake_vmex = types.ModuleType("vmex")
     fake_vmex.__file__ = "test/vmex.py"
+    fake_vmex.__path__ = []
+    fake_core = types.ModuleType("vmex.core")
+    fake_core.__path__ = []
+    fake_solver = types.ModuleType("vmex.core.solver")
+    fake_solver.SpectralState = State
     for name, module in (("jax", fake_jax), ("jax.numpy", np), ("vmex", fake_vmex),
+                         ("vmex.core", fake_core), ("vmex.core.solver", fake_solver),
                          ("NEOPAX._geometry_autodiff", backend)):
         monkeypatch.setitem(sys.modules, name, module)
 
@@ -77,5 +89,13 @@ def test_diagnostic_writes_solver_state_and_boozer_comparisons(monkeypatch, tmp_
     with np.load(output / "states.npz") as saved:
         np.testing.assert_array_equal(saved["forward__R_cos"], forward.R_cos)
         np.testing.assert_array_equal(saved["implicit__R_cos"], implicit.R_cos)
-    assert "qi,7.0,8.0,1.0" in (output / "objective_comparison.csv").read_text()
+    assert "boozer_qi_objective,7.0,8.0,1.0" in (output / "objective_comparison.csv").read_text()
+    assert "boozer_maxj_objective,49.0,64.0,15.0" in (output / "objective_comparison.csv").read_text()
     assert "R_cos,1.0,0.2" in (output / "state_comparison.csv").read_text()
+
+    reused = tmp_path / "reused"
+    monkeypatch.setattr(sys, "argv", ["check", "--config", str(config), "--out-dir", str(reused),
+                                      "--reuse-states", str(output / "states.npz"), "--include-boozer"])
+    diagnostic.main()
+    assert len(calls) == 2  # The saved-state path must not call either solver.
+    assert (reused / "objective_comparison.csv").read_bytes() == (output / "objective_comparison.csv").read_bytes()

@@ -1,8 +1,8 @@
 """Compare VMEX's forward equilibrium with the implicit AD equilibrium.
 
-Runs two equilibrium solves and optional Boozer diagnostics, without building
-an NTX scan, finding ambipolar roots or evolving transport. Intended for the
-remote GPU machine. Results are CSV and NPZ, including both state arrays.
+Runs two equilibrium solves, or reuses their saved states, with optional full
+geometry objectives. Builds no NTX scan and runs no ambipolarity or transport.
+Intended for the remote GPU machine. Results are CSV and NPZ.
 """
 import argparse
 import csv
@@ -43,6 +43,18 @@ def write_csv(path, rows):
         writer.writerows(rows)
 
 
+def load_state_arrays(path, names):
+    with np.load(path, allow_pickle=False) as saved:
+        arrays = []
+        for label in ("forward", "implicit"):
+            missing = [name for name in names if f"{label}__{name}" not in saved]
+            if missing:
+                raise ValueError(f"Saved {label} state is missing fields: {missing}")
+            arrays.append({name: saved[f"{label}__{name}"] for name in names})
+    compare_states(*arrays)
+    return arrays
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path, default=ROOT / "examples/benchmarks/"
@@ -50,6 +62,8 @@ def main():
     parser.add_argument("--out-dir", type=Path, default=ROOT / "outputs/vmex_primal_consistency")
     parser.add_argument("--include-boozer", action="store_true",
                         help="Also compare QI/max-J and the Boozer-derived observables.")
+    parser.add_argument("--reuse-states", type=Path,
+                        help="Evaluate saved states.npz using the same input deck; perform no equilibrium solves.")
     args = parser.parse_args()
     with args.config.open("rb") as stream:
         geometry_cfg = tomllib.load(stream)["geometry"]
@@ -58,7 +72,7 @@ def main():
     import jax.numpy as jnp
     import vmex
     from NEOPAX._geometry_autodiff import (
-        _solve_state_for_single_param, _vmec_booz_scalar_observables_from_state,
+        _geometry_full_ad_objectives_from_state, _solve_state_for_single_param,
         _vmec_scalar_observables_from_state, build_geometry_autodiff_context,
         geometry_raw_block_solve_from_param_vector,
     )
@@ -79,19 +93,28 @@ def main():
             input_path, param_family=family, param_m=m, param_n=n,
             mboz=geometry_cfg.get("mboz", geometry_cfg.get("vmec_mboz")),
             nboz=geometry_cfg.get("nboz", geometry_cfg.get("vmec_nboz")))
-        print("[vmex-primal] solving forward equilibrium", flush=True)
-        forward = _solve_state_for_single_param(
-            context, jnp.asarray(delta), lane="forward", max_iter=geometry_cfg.get("vmec_max_iter"),
-            step_size=geometry_cfg.get("vmec_step_size"))
-        jax.block_until_ready(forward)
-        print("[vmex-primal] solving implicit equilibrium with its AD auxiliary data", flush=True)
-        raw = geometry_raw_block_solve_from_param_vector(
-            context, jnp.asarray([delta]), ((family, m, n),),
-            max_iter=geometry_cfg.get("vmec_max_iter"),
-            solver_device=str(geometry_cfg.get("vmec_implicit_solver_device", "default")))
-        jax.block_until_ready(raw.state)
+        if args.reuse_states:
+            from vmex.core.solver import SpectralState
+            arrays = load_state_arrays(args.reuse_states,
+                                       tuple(field.name for field in dataclasses.fields(SpectralState)))
+            forward, implicit_state = (SpectralState(**{name: jnp.asarray(value) for name, value in state.items()})
+                                       for state in arrays)
+            print(f"[vmex-primal] reusing {args.reuse_states}; no equilibrium solves", flush=True)
+        else:
+            print("[vmex-primal] solving forward equilibrium", flush=True)
+            forward = _solve_state_for_single_param(
+                context, jnp.asarray(delta), lane="forward", max_iter=geometry_cfg.get("vmec_max_iter"),
+                step_size=geometry_cfg.get("vmec_step_size"))
+            jax.block_until_ready(forward)
+            print("[vmex-primal] solving implicit equilibrium with its AD auxiliary data", flush=True)
+            raw = geometry_raw_block_solve_from_param_vector(
+                context, jnp.asarray([delta]), ((family, m, n),),
+                max_iter=geometry_cfg.get("vmec_max_iter"),
+                solver_device=str(geometry_cfg.get("vmec_implicit_solver_device", "default")))
+            jax.block_until_ready(raw.state)
+            implicit_state = raw.state
         arrays = [{field.name: np.asarray(getattr(state, field.name)) for field in dataclasses.fields(state)}
-                  for state in (forward, raw.state)]
+                  for state in (forward, implicit_state)]
         rows = compare_states(*arrays)
         args.out_dir.mkdir(parents=True, exist_ok=True)
         write_csv(args.out_dir / "state_comparison.csv", rows)
@@ -102,9 +125,9 @@ def main():
         for row in rows:
             print(f"[vmex-primal] {row}", flush=True)
 
-        evaluate = (_vmec_booz_scalar_observables_from_state if args.include_boozer
+        evaluate = (_geometry_full_ad_objectives_from_state if args.include_boozer
                     else _vmec_scalar_observables_from_state)
-        values = [evaluate(context, state) for state in (forward, raw.state)]
+        values = [evaluate(context, state) for state in (forward, implicit_state)]
         objective_rows = [dict(objective=name, forward=float(values[0][name]),
                                implicit=float(values[1][name]),
                                difference=float(values[1][name] - values[0][name]))
