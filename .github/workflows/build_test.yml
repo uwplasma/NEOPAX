@@ -9,10 +9,29 @@ on:
 permissions:
   contents: read
 
-jobs:
-  build:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
+jobs:
+  lint:
+    # hosted job: runs for fork PRs too
     runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+    - uses: actions/checkout@v4
+    - uses: actions/setup-python@v5
+      with:
+        python-version: '3.12'
+    - name: Lint with flake8
+      run: |
+        pip install flake8
+        flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics --exclude=examples_old,build
+
+  build:
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, macOS, uwplasma-cpu]
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
@@ -21,33 +40,41 @@ jobs:
 
     steps:
     - uses: actions/checkout@v4
-    - name: Set up Python
-      uses: actions/setup-python@v3
+    - uses: astral-sh/setup-uv@v6
       with:
         python-version: ${{ matrix.python-version }}
+        enable-cache: false
     - name: Install NEOPAX
       run: |
-        python -m pip install --upgrade pip
-        pip install .
-    - name: Install dependencies
-      run: |
-        python -m pip install --upgrade pip
-        pip install flake8 pytest coverage pytest-cov
-        if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
-    - name: Lint with flake8
-      run: |
-        # stop the build if there are Python syntax errors or undefined names
-        flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics --exclude=examples_old,build
-        # exit-zero treats all errors as warnings. The GitHub editor is 127 chars wide
-        flake8 . --count --exit-zero --max-complexity=10 --max-line-length=127 --statistics --exclude=examples_old,build
-
+        uv venv
+        uv pip install . pytest pytest-cov pytest-xdist
+        if [ -f requirements.txt ]; then uv pip install -r requirements.txt; fi
     - name: Run tests with coverage
       run: |
-        pytest --cov-branch --cov-report=xml --cov=NEOPAX
-
+        uv run pytest -n 3 -m "not gpu" --cov-branch --cov-report=xml --cov=NEOPAX
     - name: Upload coverage reports to Codecov
       if: matrix.python-version == '3.12'
       uses: codecov/codecov-action@v5
       with:
         token: ${{ secrets.CODECOV_TOKEN }}
         slug: uwplasma/NEOPAX
+
+  gpu:
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, Linux, uwplasma-gpu]
+    timeout-minutes: 5
+    steps:
+    - uses: actions/checkout@v4
+    - uses: astral-sh/setup-uv@v6
+      with:
+        python-version: '3.12'
+        enable-cache: false
+    - name: Install
+      run: |
+        uv venv
+        uv pip install . pytest 'jax[cuda12]'
+    - name: Check backend
+      run: uv run python -c "import jax; assert jax.default_backend()=='gpu', jax.devices()"
+    - name: GPU tests
+      timeout-minutes: 1
+      run: uv run pytest -m gpu -q -x

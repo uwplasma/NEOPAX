@@ -57,3 +57,6 @@ neopax = "NEOPAX.cli:main"
 
 
  
+
+[tool.pytest.ini_options]
+markers = ["gpu: fast smoke test that needs a CUDA device (self-hosted GPU runner)"]
