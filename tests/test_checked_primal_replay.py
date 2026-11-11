@@ -1,4 +1,4 @@
-"""Scalar synthetic Radau replay/guard regressions; no transport or VMEC/NTX."""
+"""Small synthetic Radau replay/guard regressions; no transport or VMEC/NTX."""
 
 import dataclasses
 import ast
@@ -227,3 +227,76 @@ def test_adaptive_schedule_can_retain_scalar_forward_newton_decisions():
     assert result.trace.jacobian_reused.shape == result.trace.active_mask.shape == (8,)
     assert not bool(result.trace.jacobian_reused[0])
     assert result.trace.jacobian_reused.dtype == jnp.dtype(bool)
+
+
+@pytest.fixture
+def double_precision():
+    with jax.enable_x64():
+        yield
+
+
+def test_seven_stage_forward_and_minimal_replay_have_identical_endpoints(double_precision):
+    """GPU regression: identical stages previously produced different endpoints."""
+    from NEOPAX._native_interpolation import bicubic_channels
+
+    grid_x, grid_y = jnp.linspace(-5., -1., 7), jnp.linspace(-6., 0., 9)
+    tables = tuple(
+        jnp.sin(grid_x[:, None] * (.3 + i*.2))
+        + jnp.cos(grid_y[None, :] * (.2 + i*.3))
+        + .02*grid_x[:, None]*grid_y[None, :]
+        for i in range(3)
+    )
+    rates, scales = jnp.geomspace(1., 2000., 24), jnp.geomspace(1.e-3, 30., 24)
+
+    def rhs(t, y, *unused):
+        normalized = y / scales
+        values = jax.vmap(lambda x, z: jnp.stack(
+            bicubic_channels(grid_x, grid_y, tables, x, z)
+        ))(-3.7 + .9*normalized, -2.9 + .15*normalized)
+        correction = jnp.tanh(
+            values[:, 0] + .3*values[:, 1] + .1*values[:, 2]
+            + .5*jnp.roll(normalized, 1) - .1*normalized*normalized
+        )
+        return scales*rates*(.3 + .05*jnp.sin(t*9.) - normalized + .2*correction)
+
+    solver = solvers.RADAUSolver(
+        t0=0., t1=.05, dt=.001, rtol=1.e-6, atol=1.e-8,
+        num_stages=7, maxiter=12, max_steps=16, rhs_mode="black_box",
+        jacobian_reuse_mode="legacy", predictor_mode="collocation_transport_weighted",
+    )
+    prepared = solvers._build_prepared_radau_accepted_rollout(
+        solver=solver, state=jnp.linspace(.7, 1.4, 24)*scales,
+        vector_field=rhs, species=None,
+    )
+    context = solvers._build_prepared_radau_execution_context(solver=solver, prepared_rollout=prepared)
+    arguments = (context.kernel_context, context.physics_context,
+                 prepared.initial_carry, context.attempt_context)
+    forward = jax.jit(lambda carry: solvers._execute_radau_accepted_step_attempt(
+        arguments[0], arguments[1], carry, arguments[3]))(arguments[2])
+    replay = jax.jit(lambda carry: solvers._execute_radau_accepted_step_attempt_reverse_minimal(
+        arguments[0], arguments[1], carry, arguments[3], return_convergence=True))(arguments[2])
+    assert bool(forward.converged) and bool(replay.converged)
+    for field in ("stage_history", "jacobian_out", "real_lu_out", "complex_lu_out", "trial_y"):
+        np.testing.assert_array_equal(getattr(forward, field), getattr(replay, field))
+
+
+def test_endpoint_preserves_state_time_weight_and_stage_jvp_and_vjp(double_precision):
+    rng = np.random.default_rng(71)
+    y, weights, stages = map(jnp.asarray, (rng.normal(size=24), rng.normal(size=7),
+                                         rng.normal(size=(7, 24))))
+    step = jnp.asarray(.013)
+    primals = (y, step, weights, stages)
+    tangents = tuple(jnp.asarray(rng.normal(size=value.shape)) for value in primals)
+    value, tangent = jax.jit(lambda values, dots: jax.jvp(
+        solvers._radau_step_endpoint, values, dots))(primals, tangents)
+    dy, dh, dw, dz = tangents
+    np.testing.assert_allclose(value, y + step*(weights @ stages), rtol=2.e-14, atol=2.e-14)
+    np.testing.assert_allclose(tangent, dy + dh*(weights @ stages)
+                               + step*(dw @ stages + weights @ dz), rtol=2.e-14, atol=2.e-14)
+    cotangent = jnp.asarray(rng.normal(size=24))
+    bars = jax.jit(lambda values, bar: jax.vjp(
+        solvers._radau_step_endpoint, *values)[1](bar))(primals, cotangent)
+    expected = (cotangent, jnp.vdot(cotangent, weights @ stages),
+                step*(stages @ cotangent), step*weights[:, None]*cotangent[None, :])
+    for actual, reference in zip(bars, expected, strict=True):
+        np.testing.assert_allclose(actual, reference, rtol=2.e-14, atol=2.e-14)

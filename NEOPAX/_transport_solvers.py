@@ -18255,6 +18255,18 @@ def _radau_retry_failed_subsolve_with_exact_cached_jacobian(
     return jax.lax.cond(retry_allowed, retry, keep_failed, operand=None)
 
 
+def _radau_step_endpoint(flat_y, h_value, weights, stages):
+    """Keep forward and replay endpoint arithmetic independent of estimator fusion."""
+    # The forward step also reduces these stages for its error estimator.
+    # On GPU, those extra consumers can change the endpoint's fused arithmetic
+    # even when the converged stages and Newton setup are bitwise identical.
+    flat_y, h_value, weights, stages = jax.lax.optimization_barrier(
+        (flat_y, h_value, weights, stages)
+    )
+    weighted_stages = jax.lax.optimization_barrier(weights @ stages)
+    return jax.lax.optimization_barrier(flat_y + h_value * weighted_stages)
+
+
 def _radau_single_step_primal(
     kernel_context: _RadauAcceptedStepKernelContext,
     physics_context: _RadauAcceptedStepPhysicsContext,
@@ -18867,7 +18879,7 @@ def _radau_single_step_primal(
             blowup=subsolve_result.residual_blowup_final,
             newton_nonfinite=subsolve_result.newton_nonfinite_final,
         )
-    flat_next = flat_y + h_value * (kernel_context.b @ stages_final)
+    flat_next = _radau_step_endpoint(flat_y, h_value, kernel_context.b, stages_final)
     err_vec = h_value * (kernel_context.embedded_f0_weight * f0 + (kernel_context.b_error @ stages_final))
     scale_override = None
     if kernel_context.error_scale_mode == "ntss_transport" and (
@@ -19545,7 +19557,7 @@ def _radau_single_step_primal_reverse_minimal(
     complex_lu_out = subsolve_inputs.complex_lu_out
     complex_piv_out = subsolve_inputs.complex_piv_out
     stages_final = subsolve_result.z_final.reshape((kernel_context.num_stages, kernel_context.state_dim))
-    flat_next = flat_y + h_value * (kernel_context.b @ stages_final)
+    flat_next = _radau_step_endpoint(flat_y, h_value, kernel_context.b, stages_final)
     cache_valid_out = jnp.asarray(True)
     cache_dt_out = h_value
     cache_age_out = jnp.where(reuse_jacobian, cache_age + 1, jnp.asarray(0, dtype=jnp.int32))

@@ -133,6 +133,35 @@ asserts that saved-state evaluation invokes neither solver. A separate real
 factory import/default check passed without building a geometry context or
 running any solve. Three diagnostic tests passed.
 
+### Matched six-surface result
+
+The remote run after `10c3672` confirmed the benchmark selection
+`surface_s=(0.1, 0.28, 0.46, 0.64, 0.82, 1.0)`, `mboz=36`, `nboz=11`.
+It reused the same saved equilibrium states. The comparison now reproduces
+the geometry values in both original benchmark logs:
+
+| Objective | Earlier `v0_new` | Saved forward state | Earlier `v0_main` | Saved implicit state |
+| --- | ---: | ---: | ---: | ---: |
+| QI | 0.213175147543050 | 0.213175160462260 | 0.207574930396346 | 0.207574930396347 |
+| max-J | 443.408693982044 | 443.408763107004 | 436.936910365491 | 436.936910365507 |
+| Mean iota | -0.593652599661015 | -0.593652598527763 | -0.593587672047977 | -0.593587672047977 |
+| Magnetic well | -0.027476128749680 | -0.027476134737736 | -0.027481918565821 | -0.027481918565821 |
+| Mirror ratio | 0.211538034671637 | 0.211538030656737 | 0.211565418205833 | 0.211565418205833 |
+| Mercier softmax | 3.232961223588242 | 3.232961281863436 | 3.227689111727780 | 3.227689111727780 |
+
+The saved implicit QI/max-J values agree with the earlier main benchmark
+within 6.94e-16 / 1.53e-11 absolute difference. The saved forward values are
+within 6.1e-8 / 1.6e-7 relative difference of the old benchmark. This
+numerically explains the geometry-objective discrepancy through the changed
+equilibrium path; it is not an interpolation-loss definition change.
+
+No further VMEX primal diagnostic is needed before the corrected full AD run.
+The shared benchmark already selects `vmec_lane="ad"`. The corrected run is
+still needed to measure the resulting transport values and derivatives:
+these state/objective comparisons do not establish that all bootstrap or
+temperature-profile gradient differences are resolved. The newer VMEX also
+changes the held-mode parameter response and certified adjoint solve.
+
 ## NEOPAX migration update: 2026-11-09
 
 The NEOPAX adapter changes are now in the isolated `NEOPAX-v0_main` checkout
@@ -377,3 +406,49 @@ accepts the two scan keywords and main rejects them, and the current VMEX
 parameter schema matches NEOPAX's manual constructor while main additionally
 requires `ac_aux_f`. These are static compatibility checks, not numerical
 gradient tests. No physics libraries were imported by the audit scripts.
+
+## Seven-stage GPU replay endpoint investigation (2026-11-11)
+
+The corrected full-time main-dependency run completed with 325 accepted
+steps, 20 residual rows and eight parameters; all reported derivatives were
+finite. Its largest segment endpoint discrepancy was `2.186127e-10`
+absolute and `1.692562e-4` after state-tolerance scaling. Those checks compare
+reconstructed states against adaptive-forward checkpoints, not AD against
+finite differences. Passing the state tolerance does not validate gradients.
+
+A bounded JAX 0.10.0 GPU reproduction isolated numerical nonidentity in the
+seven-stage Radau kernel. With identical input carry, stage history, Jacobian
+and LU factors, the ordinary and minimal step kernels returned different
+`y + h*(b @ stages)` endpoints (maximum `3.552714e-15`). Replaying the same
+14 accepted steps gave nonzero endpoint differences in three of four
+segments. The three-stage reproduction had matched exactly; it was
+insufficient to rule out a seven-stage kernel issue.
+
+Both step kernels now use a shared endpoint helper with optimization
+barriers around its inputs, stage contraction and output. This isolates the
+contraction/update from the forward error estimator's additional consumers.
+It preserves the Radau weights, Newton solve, recorded schedule, controller
+and accepted-step derivative rules. The barriers have identity derivatives;
+they do not stop gradients. No global XLA setting is required.
+
+In the bounded GPU reproduction the fix restored exact endpoint equality
+for every segment and for the single-step forward/minimal comparison. Warm
+step medians were 6.93 versus 6.91 ms (ordinary step) and 5.63 versus
+5.51 ms (minimal step), within timing variation. These are component
+measurements, not full transport timings. Regression tests check the
+seven-stage endpoint equality and its state/time/weight/stage JVP and VJP.
+The Hairer-settings GPU comparison retained exact replay equality; compiled
+workspace increased by 256 bytes for both ordinary and minimal kernels.
+
+Before this fix, the Radau/replay source matched `en/v0_new`. The old run
+used JAX 0.7.2 and the old interpolation graph; the main-dependency run uses
+JAX 0.10.0 and native interpolation. The reproduction demonstrates that the
+new compiled context can expose different endpoint arithmetic. It does not
+isolate a JAX-only versus interpolation-only trigger: no controlled
+old/new-compiler comparison has been completed. The old run's exact matches
+therefore cannot be treated as a structural guarantee for other compiled
+contexts.
+
+This establishes and fixes a reproducible source of GPU replay
+nonidentity. The remote 325-step transport case has not yet been rerun with
+this fix; exact equality throughout that case remains to be confirmed.
