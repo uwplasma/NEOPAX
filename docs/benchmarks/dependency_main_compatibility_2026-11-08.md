@@ -579,8 +579,8 @@ With this change on JAX 0.10.0:
   between the forward/minimal executables by `2.992082511525034e-14` (norms
   about `1.5e-8`), although the states and stages were exactly identical.
 
-These are bounded local GPU results, not a claim that the remote full-time
-317-step benchmark has already passed. No expensive CPU transport solve or
+These were bounded local GPU results; the remote full-time benchmark had not
+yet been rerun at that point. No expensive CPU transport solve or
 new VMEX equilibrium, NTX database or ambipolar-root solve was run. The old
 checkouts and paused cleanup branch were left unchanged.
 
@@ -590,3 +590,137 @@ checks. One existing test, `test_power_exchange_temperature_equilibration`,
 still fails because the separate equilibration source broadcasts a six-pair
 condition against a `(6, 10)` array. That function is unchanged from HEAD
 and is not used by this benchmark; it was not modified as part of this fix.
+
+### Full-time remote confirmation (2026-11-11)
+
+The supplied log for
+`outputs/ad_ordered_exchange_guarded_full_t20_20261111` confirms a successful
+full-time run to the configured `t_final=20` with `recorded_forward` Jacobian
+reuse, 50-step segments and the ordered exchange-power reduction. The process
+exited with status 0. All 20 residual values and all 160 Jacobian entries
+(six profile and two geometry parameters) were finite.
+
+The adaptive run had 313 accepted steps: six 50-step segments and one 13-step
+segment. At all seven segment boundaries, both the absolute and scaled
+physical-state endpoint discrepancies were exactly zero. The corresponding
+`prev_stages` arrays also had zero differing entries. These are the checked
+segment endpoints and their saved stage histories, not a separate comparison
+of every intermediate accepted state.
+
+The cache diagnostics reported nonzero `dt`, Jacobian/LU and Newton metadata
+at segments 2, 3 and 6, while physical state, previous accepted step size and
+saved accepted stages remained identical. The diagnostic compares the replay
+immediately after an accepted segment with the original input to the next
+accepted attempt. The latter can include cache and step-size changes from
+intervening rejected attempts at the same physical time. Therefore these
+cache comparisons are not comparisons at the same attempt boundary and do
+not establish a replay failure. They do not require differentiating rejected
+attempts or changing the accepted-step derivative contract.
+
+The preceding OOM was caused by an omitted existing command option,
+`--max-reverse-accepted-steps 1000`. Without it, schedule discovery used the
+TOML's `max_steps=20000` to reserve 400 full checkpoint carries. The single
+real-block complex-LU checkpoint buffer required
+`400 * 3 * 816 * 816 * 8 = 6,392,217,600` bytes, exactly the reported 5.95 GiB
+allocation. With the 1000-accepted-step guard there are 20 reserved checkpoint
+slots instead of 400; the corresponding buffer is 319,610,880 bytes. The
+guard still requires reaching the full final time and raises an error if it
+is exceeded. The earlier successful commands already included this option.
+
+Recorded timings were 559.669 s for runtime construction, 182.329 s for the
+segmented cotangent sweep, and 709.805 s for the final recorded NTX-scan
+transpose. The API evaluation took 1774.869 s; process wall time was
+39:12.67. Maximum host RSS was 10,567,256 KiB (about 10.08 GiB). The log does
+not contain a peak GPU-memory measurement or a repeated-iteration memory
+trace, so it does not establish optimizer memory stability.
+
+The supplied values and derivatives are saved in
+[the full gradient table](ordered_exchange_full_transport_gradients_2026-11-11.csv).
+The seven endpoint checks and nonzero cache-field names are saved in
+[the replay table](ordered_exchange_full_transport_replay_2026-11-11.csv).
+This confirms exact accepted-primal segment replay for this full-time case;
+finite-difference agreement and between-run reproducibility remain separate
+checks. The number of accepted steps in a previous independent run is not a
+comparison of the forward and replay counts within this run.
+
+### Sixteen-step FD follow-up (2026-11-12)
+
+The updated supplied log contains all six completed profile jobs: `n0`, `T0`,
+`density_shape_power`, `temperature_shape_power`, `density_shape_alpha` and
+`temperature_shape_alpha`. Each has 16
+accepted steps in 25 attempts. Both perturbed endpoints converge at all 16
+accepted slots, with zero baseline/endpoint Newton retries and finite packed
+state, density, pressure, temperature and electric field. All 13 transport
+objectives and their printed central differences are finite. The geometry
+columns have not completed, and the new 16-step AD report has not yet been
+supplied.
+
+| Parameter | Baseline prefix final time | Process wall time |
+| --- | ---: | ---: |
+| n0 | 3.6692757033701093e-4 | 17:33.44 |
+| T0 | 3.6693474249138833e-4 | 17:44.55 |
+| density_shape_power | 3.6693474249138833e-4 | 17:34.57 |
+| temperature_shape_power | 3.6693474249138833e-4 | 17:59.90 |
+| density_shape_alpha | 3.6693474249138833e-4 | 17:48.77 |
+| temperature_shape_alpha | 3.6693474249138833e-4 | 18:03.14 |
+
+The T0 and density-shape-power baseline objective values match exactly as
+printed. The n0 job uses a slightly different independently discovered
+baseline: its prefix final time differs by about 7.17215e-9, mean Er by
+6.52922e-5 and transition radius by 5.33874e-9. Therefore comparison against
+the forthcoming AD run must check baseline observables and the realized
+prefix, not just compare derivative columns. The logs do not identify the
+cause of this between-process drift. It is a different comparison from the
+already verified within-run forward/replay segment equality.
+
+The diagnostic also reports a nonfinite `geometry.G_PS` leaf. The legacy
+VmecBoozer constructor computes a fractional power of signed iota, which is
+invalid for this negative-iota case; the differentiable geometry constructor
+already uses absolute iota there. This is not evidence of a nonfinite
+physical FD endpoint. G_PS enters the legacy NTSS radial particle/heat-flux
+correction, while this benchmark's uncorrected NTX transport fluxes and the
+bootstrap parallel-flow scalar do not consume that correction. The geometry
+field issue is recorded without changing the model during this comparison.
+
+The [profile FD table](ordered_exchange_16step_fd_2026-11-12.csv) stores all
+78 supplied objective/parameter entries and their individual baselines.
+Its derivative column is explicitly named `fd_gradient_printed`: these
+numbers were printed with six digits after the decimal in scientific
+notation. Full-precision error analysis should use the remote FD summary
+JSON files. The earlier full-time failure at accepted step 81 is not
+exercised by this successful prefix test.
+
+#### Geometry FD setup failure and repair
+
+The loop then stops at `RBC:1:0`, before a transport baseline or perturbed
+endpoint is run. The direct call to `vmex.core.implicit._dof_mask` in the
+frozen-linearized geometry bundle invokes the default force evaluator, which
+reaches SOLVAX's Pallas tridiagonal backend and fails to lower on the installed
+JAX 0.10.0 GPU stack. This is an unsupported code path, not evidence that CUDA
+is absent: all six profile FD jobs and the full-time AD benchmark used the GPU.
+`ZBS:1:0` was not reached because the loop stopped on the first failure.
+
+For a configured `vmec_lane="ad"`, the FD bundle now obtains the equilibrium,
+implicit parameters, configuration and DOF mask together from the same
+`geometry_raw_block_solve_from_param_vector` helper as the AD benchmark. It
+does not separately recompute the private mask with a different/default force
+evaluator. The diagnostic banner now prints the actual configured lane.
+The configured forward lane retains its original forward equilibrium and
+mask construction. No VMEX, NTX, SOLVAX, environment requirement or transport
+replay rule is changed.
+
+The frozen geometry endpoints still use the existing implicit VMEX tangent;
+their transport derivatives remain forward central differences. This does
+not independently validate VMEX's implicit tangent. No completed profile FD
+column needs repeating for this setup-only repair. Remote geometry FD results
+remain pending.
+
+Local validation passed 79 tests and 48 subtests in 28.03 s across the
+new geometry-bundle routing regressions, frozen-metadata FD replay tests,
+benchmark plumbing and objective-routing tests. The new tests cover both RBC
+and ZBS, forbid the unsupported private mask evaluator in the AD lane, check
+the reused primal/mask/configuration and unit parameter tangent, and preserve
+the forward-reference lane. Two existing parser-test lookups were updated to
+read declarations from the already-refactored `build_argument_parser` rather
+than `main`. These checks use mocked solves and tiny scalar ODEs; no local
+VMEX equilibrium, NTX database, plasma transport or FD benchmark was run.

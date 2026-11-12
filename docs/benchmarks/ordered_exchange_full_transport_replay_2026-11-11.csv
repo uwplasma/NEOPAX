@@ -1,0 +1,8 @@
+segment,accepted_steps,endpoint_max_abs_difference,endpoint_max_scaled_difference,state_different_entries,stage_different_entries,differing_cache_fields
+1,50,0.000000e+00,0.000000e+00,0,0,
+2,50,0.000000e+00,0.000000e+00,0,0,dt;jacobian;cache_dt;real_lu;real_piv;complex_lu;complex_piv;prev_newton_iter_count;prev_theta_final
+3,50,0.000000e+00,0.000000e+00,0,0,dt;jacobian;cache_dt;real_lu;real_piv;complex_lu;complex_piv;prev_newton_iter_count;prev_theta_final
+4,50,0.000000e+00,0.000000e+00,0,0,
+5,50,0.000000e+00,0.000000e+00,0,0,
+6,50,0.000000e+00,0.000000e+00,0,0,dt;jacobian;cache_dt;real_lu;real_piv;complex_lu;complex_piv;prev_newton_iter_count;prev_theta_final
+7,13,0.000000e+00,0.000000e+00,0,0,

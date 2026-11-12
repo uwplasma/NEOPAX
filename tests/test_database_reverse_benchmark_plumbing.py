@@ -98,7 +98,7 @@ def test_benchmark_callback_accepts_all_support_core_keywords():
 def _performance_args(**overrides):
     """Use the real parser declarations without executing a VMEC setup."""
     main = _function(
-        _ROOT / "examples/benchmarks/benchmark_transport_reverse_ad_only.py", "main"
+        _ROOT / "examples/benchmarks/benchmark_transport_reverse_ad_only.py", "build_argument_parser"
     )
     declarations = [
         node for node in main.body
@@ -134,7 +134,7 @@ def test_validated_full_transport_reverse_modes_are_cli_defaults():
     """The measured sparse/grouped modes require no command-line overrides."""
 
     main = _function(
-        _ROOT / "examples/benchmarks/benchmark_transport_reverse_ad_only.py", "main"
+        _ROOT / "examples/benchmarks/benchmark_transport_reverse_ad_only.py", "build_argument_parser"
     )
     selected_flags = {
         "--reverse-bootstrap-cotangent-mode",

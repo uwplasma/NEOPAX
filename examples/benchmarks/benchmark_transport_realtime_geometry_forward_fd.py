@@ -55,6 +55,7 @@ from NEOPAX._geometry_autodiff import (  # noqa: E402
     boundary_param_entries,
     build_runtime_context_for_geometry_param,
     build_runtime_context_for_vmec_state,
+    geometry_raw_block_solve_from_param_vector,
 )
 from NEOPAX._orchestrator import (  # noqa: E402
     _execution_device_context,
@@ -906,64 +907,51 @@ def _frozen_linearized_vmec_geometry_bundle(
         raise ValueError("This FD benchmark currently expects one geometry parameter.")
     (entry,) = boundary_param_entries(geometry_context, specs)
     solver_device = str(geom_cfg.get("vmec_implicit_solver_device", "default"))
-    params0 = _implicit_params_with_boundary_deltas(
-        geometry_context,
-        im,
-        jnp.asarray([0.0], dtype=jnp.float64),
-        (entry,),
-        solver_device=solver_device,
-    )
-    params = _implicit_params_with_boundary_deltas(
-        geometry_context,
-        im,
-        jnp.asarray([baseline_delta], dtype=jnp.float64),
-        (entry,),
-        solver_device=solver_device,
-    )
-    cfg_kwargs = {
-        "mode": "cli",
-        "multigrid": True,
-    }
-    if geom_cfg.get("vmec_max_iter") is not None:
-        cfg_kwargs["max_iterations"] = int(geom_cfg["vmec_max_iter"])
-    cfg = im.make_config(geometry_context.indata, **cfg_kwargs)
-
-    # The transport reverse benchmark's primal is built with the configured
-    # forward VMEC lane.  The frozen FD must use that *same* state as its zero
-    # point: using solve_implicit_with_aux() here instead gives a different
-    # nonlinear solve path and therefore a different transport/NTX baseline
-    # before the +/- h tangent endpoints are even formed.
+    lane = str(geom_cfg.get("vmec_lane", "forward")).strip().lower()
     print(
-        "[autodiff-gate] progress: baseline forward VMEC solve for "
+        f"[autodiff-gate] progress: baseline VMEC {lane} solve for "
         "frozen-linearized geometry FD "
         f"(mboz={geometry_context.mboz}, nboz={geometry_context.nboz})",
         flush=True,
     )
-    state_star = _solve_state_for_single_param(
-        geometry_context,
-        jnp.asarray(baseline_delta, dtype=jnp.float64),
-        lane=str(geom_cfg.get("vmec_lane", "forward")).strip().lower(),
-        max_iter=geom_cfg.get("vmec_max_iter"),
-        step_size=geom_cfg.get("vmec_step_size"),
-        jacobian_penalty=float(geom_cfg.get("vmec_jacobian_penalty", 1.0e3)),
-        solver_device=solver_device,
-    )
-
-    # The raw-block tangent needs the structural evolved-DOF mask, not the
-    # implicit solver's primal state.  VMEX defines that mask from the
-    # residual's structural support, so evaluate it at the forward state and
-    # retain the forward state above as the actual linearization point.
-    if not hasattr(im, "_dof_mask"):
-        raise RuntimeError(
-            "Frozen-linearized transport FD requires VMEX implicit._dof_mask "
-            "to form a raw-block tangent at the forward VMEC state."
+    if lane == "ad":
+        # Reuse the AD benchmark's primal/configuration/mask as one unit.
+        # A separate private _dof_mask call uses VMEX's default force evaluator,
+        # which can select a Pallas path unsupported by the installed JAX GPU.
+        raw_solve = geometry_raw_block_solve_from_param_vector(
+            geometry_context,
+            jnp.asarray([baseline_delta], dtype=jnp.float64),
+            specs,
+            max_iter=geom_cfg.get("vmec_max_iter"),
+            solver_device=solver_device,
         )
-    dof_mask = im._dof_mask(
-        state_star,
-        im.runtime_from_params(params, cfg),
-        cfg,
-    )
-    param_tangent = _param_unit_tangent_like(params0, entry)
+        params, cfg = raw_solve.implicit_params, raw_solve.implicit_cfg
+        state_star, dof_mask = raw_solve.state, raw_solve.dof_mask
+    else:
+        # Preserve the configured forward-lane primal for older reference cases.
+        params = _implicit_params_with_boundary_deltas(
+            geometry_context, im,
+            jnp.asarray([baseline_delta], dtype=jnp.float64), (entry,),
+            solver_device=solver_device,
+        )
+        cfg_kwargs = {"mode": "cli", "multigrid": True}
+        if geom_cfg.get("vmec_max_iter") is not None:
+            cfg_kwargs["max_iterations"] = int(geom_cfg["vmec_max_iter"])
+        cfg = im.make_config(geometry_context.indata, **cfg_kwargs)
+        state_star = _solve_state_for_single_param(
+            geometry_context, jnp.asarray(baseline_delta, dtype=jnp.float64),
+            lane=lane, max_iter=geom_cfg.get("vmec_max_iter"),
+            step_size=geom_cfg.get("vmec_step_size"),
+            jacobian_penalty=float(geom_cfg.get("vmec_jacobian_penalty", 1.0e3)),
+            solver_device=solver_device,
+        )
+        if not hasattr(im, "_dof_mask"):
+            raise RuntimeError(
+                "Frozen-linearized transport FD requires VMEX implicit._dof_mask "
+                "to form a raw-block tangent at the forward VMEC state."
+            )
+        dof_mask = im._dof_mask(state_star, im.runtime_from_params(params, cfg), cfg)
+    param_tangent = _param_unit_tangent_like(params, entry)
     state_tangent = _manual_implicit_forward_state_tangent(
         params=params,
         param_tangent=param_tangent,
