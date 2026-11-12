@@ -16,11 +16,39 @@ import numpy as np
 from NEOPAX import _transport_solvers as solvers
 from NEOPAX._reverse_step_diagnostics import (
     check_reverse_segment_state,
+    report_primal_replay_carry,
     reverse_step_finite_transition,
 )
 
 
 class ReverseStepDiagnosticsTests(unittest.TestCase):
+    def test_carry_report_distinguishes_stage_cache_and_state_without_mutation(self):
+        with patch.dict(os.environ, {"NEOPAX_REVERSE_STEP_DIAGNOSTICS": "0"}):
+            report_primal_replay_carry(object(), object(), segment_number=1)
+        expected = SimpleNamespace(
+            y=np.array([1., 2.]), prev_stages=np.array([[3., 4.]]),
+            jacobian=np.eye(2), complex_lu=np.array([[1. + 2.j]]),
+            cache_valid=np.array(True),
+        )
+        actual = SimpleNamespace(
+            y=expected.y.copy(), prev_stages=np.array([[3., 4.5]]),
+            jacobian=expected.jacobian.copy(), complex_lu=np.array([[4. + 6.j]]),
+            cache_valid=np.array(False),
+        )
+        before = {name: value.copy() for name, value in vars(actual).items()}
+        output = io.StringIO()
+        with patch.dict(os.environ, {"NEOPAX_REVERSE_STEP_DIAGNOSTICS": "1"}), redirect_stdout(output):
+            report_primal_replay_carry(actual, expected, segment_number=7)
+        lines = {line.split("field=")[1].split()[0]: line for line in output.getvalue().splitlines()}
+        self.assertIn("different_entries=0", lines["y"])
+        self.assertIn("different_entries=0", lines["jacobian"])
+        self.assertIn("max_abs_difference=5.0000000000000000e-01", lines["prev_stages"])
+        self.assertIn("first_difference=(0, 1)", lines["prev_stages"])
+        self.assertIn("max_abs_difference=5.0000000000000000e+00", lines["complex_lu"])
+        self.assertIn("different_entries=1", lines["cache_valid"])
+        for name, value in before.items():
+            np.testing.assert_array_equal(getattr(actual, name), value)
+
     def test_disabled_does_not_convert_inputs(self):
         sentinel = object()
         with patch.dict(os.environ, {"NEOPAX_REVERSE_STEP_DIAGNOSTICS": "0"}):

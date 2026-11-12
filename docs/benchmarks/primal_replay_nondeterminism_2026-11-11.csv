@@ -1,0 +1,9 @@
+neopax,vmex,ntx,jax,input,repeats,changed_stages,max_stage_difference,max_endpoint_difference
+en/v0_main,en/neopax-main-utilities,en/neopax-main-utilities,0.10.0,replay,30,30,3.552713678800501e-15,0
+en/v0_main,en/neopax-main-utilities,en/neopax-main-utilities,0.10.0,forward,30,30,3.552713678800501e-15,0
+en/v0_main,en/local_test,en/custom_rule_NEOPAX,0.10.0,replay,30,27,3.552713678800501e-15,0
+en/v0_main,en/local_test,en/custom_rule_NEOPAX,0.10.0,forward,30,21,3.552713678800501e-15,0
+en/v0_new,en/local_test,en/custom_rule_NEOPAX,0.7.2,replay,100,0,0,0
+en/v0_new,en/local_test,en/custom_rule_NEOPAX,0.7.2,forward,100,0,0,0
+en/v0_main ordered reduction,en/local_test,en/custom_rule_NEOPAX,0.10.0,replay,100,0,0,0
+en/v0_main ordered reduction,en/local_test,en/custom_rule_NEOPAX,0.10.0,forward,100,0,0,0

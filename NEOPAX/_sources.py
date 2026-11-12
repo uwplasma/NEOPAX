@@ -127,11 +127,13 @@ def _power_exchange_impl(state, species, pair_active_mask, use_ntssfusion_lnL):
     )
     pair_mask = jnp.asarray(pair_active_mask, dtype=Pab.dtype)[:, None]
     Pab = Pab * pair_mask
-    # For each pair (i, j): +Pab to i, -Pab to j
-    out = jnp.zeros((n_species,) + Pab.shape[1:], dtype=Pab.dtype)
-    out = out.at[idx_i].add(Pab)
-    out = out.at[idx_j].add(-Pab)
-    return out
+    # +Pab to i, -Pab to j. Duplicate-index scatter-adds can execute in
+    # different orders on GPU, including when fused into the pressure RHS.
+    species_indices = jnp.arange(n_species)[:, None]
+    incidence = (species_indices == idx_i).astype(Pab.dtype) - (
+        species_indices == idx_j
+    ).astype(Pab.dtype)
+    return jnp.sum(incidence[:, :, None] * Pab[None, :, :], axis=1)
 
 
 def power_exchange(state, species, pair_active_mask, coulomb_log_mode="neopax_simple"):

@@ -444,11 +444,149 @@ Before this fix, the Radau/replay source matched `en/v0_new`. The old run
 used JAX 0.7.2 and the old interpolation graph; the main-dependency run uses
 JAX 0.10.0 and native interpolation. The reproduction demonstrates that the
 new compiled context can expose different endpoint arithmetic. It does not
-isolate a JAX-only versus interpolation-only trigger: no controlled
-old/new-compiler comparison has been completed. The old run's exact matches
+isolate a JAX-only versus interpolation-only trigger: at that point no controlled
+old/new-stack comparison had been completed. The old run's exact matches
 therefore cannot be treated as a structural guarantee for other compiled
 contexts.
 
-This establishes and fixes a reproducible source of GPU replay
-nonidentity. The remote 325-step transport case has not yet been rerun with
-this fix; exact equality throughout that case remains to be confirmed.
+This fixes one reproducible component source of GPU replay nonidentity.
+The remote full-time rerun after `f315bb5` completed its segmented sweep
+with 317 accepted steps, but all seven segment endpoints still had nonzero
+differences. The largest absolute discrepancy was `3.048228e-12`; the
+largest state-tolerance-scaled discrepancy was `2.524059e-7`. The endpoint
+fix is therefore incomplete for the full transport case. Different adaptive
+trajectories also prevent attributing the change in discrepancy to that fix
+alone. Run flags have not been identified as the cause.
+
+With `NEOPAX_REVERSE_STEP_DIAGNOSTICS=1`, the existing endpoint check now also
+reports differences in the saved stage history, Jacobian, LU factors and
+associated cache metadata. These comparisons run on the host after replay,
+using the original adaptive checkpoints and the existing replay result.
+They introduce no new solver calls, device history or changes to either
+compiled numerical kernel. Cache comparisons are diagnostic only, because
+inactive cache contents need not match, and a later adaptive checkpoint can
+include cache updates from intervening rejected attempts. These endpoint
+cache comparisons therefore do not prove that the two kernels received the
+same Newton setup. They can distinguish state-update differences from
+differences in the saved stages; they do
+not locate the first differing operation within a segment or establish
+AD/FD agreement.
+
+## Repeated GPU execution and the original JAX stack (2026-11-11)
+
+A bounded saved-file fixture uses the production 51-cell, four-species,
+seven-stage transport equations (408 packed variables), the existing optimized
+wout/Boozer/database files and the NTSS initial electric field. It does not
+solve a VMEX equilibrium, build an NTX database, search for ambipolar roots or
+run the full-time simulation. A 50-accepted-step diagnostic first found stage
+differences at step 9 and state differences at step 13. Checkpoint inputs were
+saved for subsequent single-step tests.
+
+Repeated calls to the **same compiled forward executable** gave:
+
+| NEOPAX | VMEX / NTX | JAX | Input carry | Repeats | Runs with different stages | Largest stage difference | Largest endpoint difference |
+| --- | --- | --- | --- | ---: | ---: | ---: | ---: |
+| `en/v0_main` | main-based utility branches | 0.10.0 | replay | 30 | 30 | 3.552713678800501e-15 | 0 |
+| `en/v0_main` | main-based utility branches | 0.10.0 | forward | 30 | 30 | 3.552713678800501e-15 | 0 |
+| `en/v0_main` | `en/local_test` / `en/custom_rule_NEOPAX` | 0.10.0 | replay | 30 | 27 | 3.552713678800501e-15 | 0 |
+| `en/v0_main` | `en/local_test` / `en/custom_rule_NEOPAX` | 0.10.0 | forward | 30 | 21 | 3.552713678800501e-15 | 0 |
+| `en/v0_new` | `en/local_test` / `en/custom_rule_NEOPAX` | 0.7.2 | replay | 100 | 0 | 0 | 0 |
+| `en/v0_new` | `en/local_test` / `en/custom_rule_NEOPAX` | 0.7.2 | forward | 100 | 0 | 0 | 0 |
+
+The proper old-stack test used a separate Python 3.12.16 environment with
+JAX, jaxlib, `jax-cuda12-plugin` and `jax-cuda12-pjrt` all pinned to 0.7.2.
+Module paths were checked against the three original checkouts; no branch
+was switched or edited. The existing environment was retained. All numeric
+tests ran on the local RTX 5060 GPU, without CPU fallback.
+
+The two dependency-only comparisons on JAX 0.10.0 had identical numerical
+support/initial-state hashes, so the newer VMEX/NTX branches are not required
+to reproduce the variation. The original NEOPAX `en/v0_new` RHS on JAX 0.10.0
+also varied in one of 30 batched-stage evaluations (`3.552713678800501e-15`).
+The checked original stack on JAX 0.7.2 had exact forward/minimal equality in
+states, stages, Jacobians and LU factors. Its final residual-norm diagnostic
+differed by `1.551204080162494e-15` between those two executables; that is a
+different comparison from repeated execution of one executable.
+
+These observations support an execution-stack trigger, but by themselves do not
+identify a single responsible operation or prove a JAX-only cause. The old
+and new full-stack tests also differ in NEOPAX interpolation implementation,
+Python version and some supporting package versions. In particular, Lineax
+was 0.1.0 versus 0.1.1 and SOLVAX was 0.36.1 versus 0.35.1. The original
+remote machine's complete package lock and GPU environment were not recreated.
+Passing this checkpoint test is not a full-trajectory or gradient validation.
+
+Raw repeat counts are in
+`primal_replay_nondeterminism_2026-11-11.csv`. The isolated environment's full
+package list is saved outside the repositories in
+`D:/Github_Codes/.tmp/neopax-jax072-replay-20261111/installed_versions.txt`.
+
+### Identified source: pairwise exchange-power scatter accumulation
+
+Further tests on JAX 0.10.0 narrowed the repeated-executable variation to
+the electron pressure RHS. The seven-stage RHS differed in 65 of 100 repeats,
+by at most `3.552713678800501e-15`. Center neoclassical fluxes, density and
+temperature face fluxes, and standalone temperature-source outputs were each
+identical in 100 repeats. Holding all center/face flux values fixed still
+reproduced variation in the assembled pressure equation.
+
+The optimized GPU graph contained the two duplicate-index scatter additions
+from `_sources._power_exchange_impl`. It folded another electron source into
+the initial scatter operand, so even the active-three-species benchmark could
+sum multiple nonzero terms in different orders. This explains why testing the
+exchange source in isolation with helium excluded had not reproduced the
+full-equation issue. JAX documents that conflicting `.at[].add` updates can
+have an implementation-dependent, nondeterministic order; see the
+[JAX scatter-update documentation](https://docs.jax.dev/en/latest/_autosummary/jax.numpy.ndarray.at.html).
+
+Replace only this accumulation with a small species/pair incidence contraction:
+
+```text
+incidence[s, pair(i,j)] = (s == i) - (s == j)
+exchange_power[s, r] = sum_pair(incidence[s, pair] * pair_power[pair, r])
+```
+
+The pair powers, Coulomb logarithms, species masks, physical model and AD
+paths are unchanged. There is no new mode, TOML option or required XLA flag.
+The implementation uses an explicit small reduction, not a GPU matrix-library
+call: the matrix version tested correctly but requested about 32 MiB of
+workspace. The explicit reduction needs only 256 more workspace bytes than
+the original source kernel (18,192 versus 17,936 bytes, seven stages and
+51 cells). Warm source-call medians were 1.403 versus 1.409 ms with all
+species active, and 1.473 versus 1.406 ms with helium excluded; these small
+dispatch-inclusive measurements do not establish a full-run speedup.
+Against the original source, excluding helium gave exactly identical values,
+JVPs and VJPs in the isolated comparison. With all species active, maximum
+differences were `5.551115123125783e-17` in values,
+`1.734723475976807e-18` in JVPs and `2.5757174171303632e-14` in VJPs.
+The existing endpoint barriers are retained because they fix a separate
+forward/minimal arithmetic-context difference.
+
+With this change on JAX 0.10.0:
+
+* The ordered source was identical in 100 repeats, with and without helium
+  exchange enabled. The preliminary matrix form also removed the saved-stage
+  full-RHS variation in 100 repeats before the lower-workspace reduction was
+  selected.
+* The bounded 51-cell fixture took 50 accepted steps in 84 attempts. All 50
+  replayed physical states and stage histories matched the original adaptive
+  run exactly; previously the fixture first differed at stages in step 9 and
+  states in step 13.
+* Forward/minimal state, stages, Jacobian, LU factors, iteration count, theta
+  and final Newton correction matched at the final checkpoint. Repeating the
+  forward step 100 times for each input carry produced no state/stage changes.
+* The separately computed final residual-norm diagnostic still differed
+  between the forward/minimal executables by `2.992082511525034e-14` (norms
+  about `1.5e-8`), although the states and stages were exactly identical.
+
+These are bounded local GPU results, not a claim that the remote full-time
+317-step benchmark has already passed. No expensive CPU transport solve or
+new VMEX equilibrium, NTX database or ambipolar-root solve was run. The old
+checkouts and paused cleanup branch were left unchanged.
+
+The GPU source suite finished with 18 passing tests, including the added
+conservation/masking, finite-difference/JVP/VJP and fused-stage repeatability
+checks. One existing test, `test_power_exchange_temperature_equilibration`,
+still fails because the separate equilibration source broadcasts a six-pair
+condition against a `(6, 10)` array. That function is unchanged from HEAD
+and is not used by this benchmark; it was not modified as part of this fix.

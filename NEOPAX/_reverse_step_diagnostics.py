@@ -140,3 +140,35 @@ def check_primal_replay_endpoint(actual, expected, *, atol, rtol):
             "transport adjoint was not evaluated for this segment."
         )
     return float(peak), float(scaled_peak)
+
+
+def report_primal_replay_carry(actual, expected, *, segment_number):
+    """Compare existing checkpoint data on the host without retracing physics.
+
+    Cache contents are diagnostic, not an additional replay acceptance test:
+    inactive caches need not agree. No carries or host copies are retained.
+    """
+    if not reverse_step_diagnostics_enabled():
+        return
+    names = (
+        "t", "dt", "prev_dt", "y", "prev_stages", "jacobian",
+        "cache_valid", "cache_dt", "cache_age", "real_lu", "real_piv",
+        "complex_lu", "complex_piv", "prev_newton_iter_count", "prev_theta_final",
+    )
+    for name in names:
+        a, b = getattr(actual, name, None), getattr(expected, name, None)
+        if a is None or b is None:
+            continue
+        a, b = map(np.asarray, jax.device_get((a, b)))
+        different = a != b
+        count = int(np.count_nonzero(different))
+        # Boolean cache flags have no subtraction operation in NumPy.
+        delta = different if a.dtype.kind == "b" else np.abs(a - b)
+        peak = float(np.max(delta)) if delta.size else 0.0
+        first = tuple(int(i) for i in np.argwhere(different)[0]) if count else None
+        print(
+            f"[primal-replay-carry] segment={segment_number} field={name} "
+            f"different_entries={count} max_abs_difference={peak:.16e} "
+            f"first_difference={first}",
+            flush=True,
+        )

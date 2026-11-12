@@ -27,6 +27,7 @@ from ._optimization_diagnostics import reverse_checkpoint, reverse_diagnostics_a
 from ._reverse_step_diagnostics import (
     check_primal_replay_endpoint,
     check_reverse_segment_state,
+    report_primal_replay_carry,
     reverse_step_diagnostics_enabled,
 )
 from ._geometry_autodiff import (
@@ -6787,12 +6788,16 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
                 )
             )
             if database_step_primal_records.replay_valid is not None:
-                expected_final_y = (
-                    _take_tree_axis0(segment_start_carries, segment_index + 1).y
-                    if segment_index + 1 < segment_count else segmented_final_carry.y
+                expected_final_carry = (
+                    _take_tree_axis0(segment_start_carries, segment_index + 1)
+                    if segment_index + 1 < segment_count else segmented_final_carry
+                )
+                report_primal_replay_carry(
+                    database_replayed_final_carry, expected_final_carry,
+                    segment_number=segment_index + 1,
                 )
                 endpoint_absolute, endpoint_scaled = check_primal_replay_endpoint(
-                    database_replayed_final_carry.y, expected_final_y,
+                    database_replayed_final_carry.y, expected_final_carry.y,
                     atol=reverse_setup.execution_context.kernel_context.atol,
                     rtol=reverse_setup.execution_context.kernel_context.rtol,
                 )

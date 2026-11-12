@@ -1,5 +1,6 @@
 import jax
 import jax.numpy as jnp
+import numpy as np
 from NEOPAX._source_models import (
     AnalyticSource,
     BremsstrahlungRadiationSource,
@@ -177,6 +178,63 @@ def test_power_exchange():
     src = PowerExchangeSource(mode="all")
     result = src(state, species)
     assert result["power_exchange"].shape == state.temperature.shape
+
+
+def test_power_exchange_conservation_mask_and_derivatives():
+    species = make_dummy_species()
+    radius = jnp.linspace(0.0, 1.0, 10)
+    density = jnp.asarray([2.5, 1.2, 1.1, 0.1])[:, None] * (1.0 - 0.2 * radius)
+    pressure = density * (jnp.asarray([12.0, 8.0, 6.0, 5.0])[:, None] - radius)
+    direction = (0.01 * jnp.cos(density), 0.02 * jnp.sin(pressure))
+    cotangent = jnp.cos(pressure)
+    for mode in ("all", "exclude_frozen"):
+        for log_mode in ("neopax_simple", "ntssfusion"):
+            source = PowerExchangeSource(
+                species=species, mode=mode, coulomb_log_mode=log_mode,
+                temperature_active_mask=jnp.asarray([True, True, True, False]),
+            )
+
+            def exchange(n, p):
+                state = TransportState(density=n, pressure=p, Er=jnp.zeros(10))
+                return source(state)["power_exchange"]
+
+            value, tangent = jax.jvp(exchange, (density, pressure), direction)
+            roundoff = 4 * np.finfo(value.dtype).eps
+            np.testing.assert_allclose(value.sum(axis=0) / jnp.abs(value).sum(axis=0), 0.0, atol=roundoff)
+            np.testing.assert_allclose(tangent.sum(axis=0) / jnp.abs(tangent).sum(axis=0), 0.0, atol=roundoff)
+            if mode == "exclude_frozen":
+                np.testing.assert_array_equal(value[-1], 0.0)
+                np.testing.assert_array_equal(tangent[-1], 0.0)
+            epsilon = 1e-5
+            finite_difference = (
+                exchange(density + epsilon * direction[0], pressure + epsilon * direction[1])
+                - exchange(density - epsilon * direction[0], pressure - epsilon * direction[1])
+            ) / (2 * epsilon)
+            np.testing.assert_allclose(tangent, finite_difference, rtol=2e-7, atol=2e-9)
+            _, pullback = jax.vjp(exchange, density, pressure)
+            density_bar, pressure_bar = pullback(cotangent)
+            np.testing.assert_allclose(
+                jnp.vdot(cotangent, tangent),
+                jnp.vdot(density_bar, direction[0]) + jnp.vdot(pressure_bar, direction[1]),
+                rtol=2e-12, atol=2e-14,
+            )
+
+
+def test_power_exchange_fused_stage_repeats_are_identical():
+    species = make_dummy_species()
+    density = jnp.broadcast_to(jnp.asarray([2.5, 1.2, 1.1, 0.1])[:, None], (4, 51))
+    pressure = density * (jnp.asarray([12.0, 8.0, 6.0, 5.0])[:, None] - jnp.linspace(0.0, 1.0, 51))
+    source = PowerExchangeSource(species=species, mode="all")
+
+    def pressure_rhs(p):
+        state = TransportState(density=density, pressure=p, Er=jnp.zeros(51))
+        return jnp.sin(p) + source(state)["power_exchange"]
+
+    call = jax.jit(jax.vmap(pressure_rhs))
+    stages = pressure[None, :, :] + jnp.arange(7)[:, None, None] * 1e-3
+    expected = np.asarray(call(stages))
+    for _ in range(30):
+        np.testing.assert_array_equal(np.asarray(call(stages)), expected)
 
 
 def test_power_exchange_temperature_equilibration():
