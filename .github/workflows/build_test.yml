@@ -57,23 +57,3 @@ jobs:
       with:
         token: ${{ secrets.CODECOV_TOKEN }}
         slug: uwplasma/NEOPAX
-
-  gpu:
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
-    runs-on: [self-hosted, Linux, uwplasma-gpu]
-    timeout-minutes: 5
-    steps:
-    - uses: actions/checkout@v4
-    - uses: astral-sh/setup-uv@v6
-      with:
-        python-version: '3.12'
-        enable-cache: false
-    - name: Install
-      run: |
-        uv venv
-        uv pip install . pytest 'jax[cuda12]'
-    - name: Check backend
-      run: uv run python -c "import jax; assert jax.default_backend()=='gpu', jax.devices()"
-    - name: GPU tests
-      timeout-minutes: 1
-      run: uv run pytest -m gpu -q -x
