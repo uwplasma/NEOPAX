@@ -1,6 +1,7 @@
 import dataclasses
 from types import SimpleNamespace
 
+import jax
 import jax.numpy as jnp
 
 from NEOPAX._boundary_conditions import BoundaryConditionModel

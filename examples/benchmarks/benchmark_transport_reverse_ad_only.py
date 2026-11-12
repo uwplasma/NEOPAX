@@ -3693,6 +3693,7 @@ def _run_realtime_geometry_support_segment_probe(
                     print(f"      d{objective_name}/d{geometry_label}: ad={value:.6e}{branch_suffix}")
                     component_payload = report["geometry_gradient_reverse_ad_by_component"]
                     if component_payload:
+                        support_component_names = tuple(component_payload[objective_name])
                         component_parts = [
                             f"{component_name}={component_payload[objective_name][component_name][geometry_label]:.6e}"
                             for component_name in support_component_names
@@ -3748,6 +3749,7 @@ def _run_realtime_geometry_support_segment_probe(
                     print(f"      d{objective_name}/d{geometry_label}: ad={value:.6e}{branch_suffix}")
                     component_payload = report["geometry_gradient_reverse_ad_by_component"]
                     if component_payload:
+                        support_component_names = tuple(component_payload[objective_name])
                         component_parts = [
                             f"{component_name}={component_payload[objective_name][component_name][geometry_label]:.6e}"
                             for component_name in support_component_names
