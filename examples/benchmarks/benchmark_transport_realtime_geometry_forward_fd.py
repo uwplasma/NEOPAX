@@ -899,9 +899,11 @@ def _frozen_linearized_vmec_geometry_bundle(
     geometry_parameter: str,
     *,
     baseline_delta: float,
+    retain_raw_solve: bool = False,
 ):
     geom_cfg = config.get("geometry", {})
     geometry_context = _geometry_context_from_config(config, geometry_parameter)
+    raw_solve = None
     specs = _geometry_param_specs_from_parameter_name(geometry_parameter)
     if len(specs) != 1:
         raise ValueError("This FD benchmark currently expects one geometry parameter.")
@@ -964,6 +966,7 @@ def _frozen_linearized_vmec_geometry_bundle(
         "context": geometry_context,
         "state_star": state_star,
         "state_tangent": state_tangent,
+        "raw_block_solve": raw_solve if retain_raw_solve else None,
         "coefficient_value": coefficient_value,
         "n_r": int(geom_cfg.get("n_radial", 51)),
     }
@@ -1601,7 +1604,7 @@ def main() -> None:
             print(f"  - {label}: value={float(value):.16e}")
         print("[autodiff-gate] initial-Er root-only finite-difference gradients:")
         for label, value in zip(objective_names, gradient_np.tolist()):
-            print(f"  - {label}: fd={float(value):.6e}")
+            print(f"  - {label}: fd={float(value):.16e}")
         print(
             "[autodiff-gate] initial-Er root-only dEr/dr_param profile diagnostic: "
             f"min={er_fd_diagnostics['dEr_fd_min']:.6e} "
@@ -2071,6 +2074,8 @@ def main() -> None:
         ),
         "objective_labels": list(OBJECTIVE_LABELS),
         "objective_values": baseline_np.tolist(),
+        "objective_minus": np.asarray(jax.device_get(minus_objectives), dtype=float).tolist(),
+        "objective_plus": np.asarray(jax.device_get(plus_objectives), dtype=float).tolist(),
         "gradient_fd": gradient_np.tolist(),
         "fixed_final_state_objective_geometry_fd": None
         if fixed_final_state_geometry_fd_np is None
@@ -2129,7 +2134,7 @@ def main() -> None:
         print(f"  - {label}: value={float(value):.16e}")
     print("[autodiff-gate] objective finite-difference gradients:")
     for label, value in zip(OBJECTIVE_LABELS, gradient_np.tolist()):
-        print(f"  - {label}: fd={float(value):.6e}")
+        print(f"  - {label}: fd={float(value):.16e}")
     if fixed_final_state_geometry_fd_np is not None:
         print("[autodiff-gate] fixed-final-state explicit geometry finite-difference gradients:")
         for label, value in zip(OBJECTIVE_LABELS, fixed_final_state_geometry_fd_np.tolist()):
