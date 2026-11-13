@@ -1599,6 +1599,66 @@ def _parameter_carry_diagnostic_enabled() -> bool:
     return raw_value.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _host_step_pullback_diagnostic_enabled() -> bool:
+    raw_value = os.environ.get("NEOPAX_TRANSPORT_REVERSE_HOST_STEP_PULLBACK_DIAGNOSTIC")
+    if raw_value is None:
+        return False
+    return raw_value.strip().lower() in {"1", "true", "yes", "on"}
+
+def _step_pullback_segment_index() -> int:
+    raw_value = os.environ.get("NEOPAX_TRANSPORT_REVERSE_STEP_PULLBACK_SEGMENT")
+    if raw_value is None:
+        return 1
+    return max(0, int(raw_value))
+
+
+def _step_pullback_step_index() -> int:
+    raw_value = os.environ.get("NEOPAX_TRANSPORT_REVERSE_STEP_PULLBACK_STEP")
+    if raw_value is None:
+        return 10
+    return max(0, int(raw_value))
+
+
+def _host_step_pullback_y_bar_path() -> str | None:
+    raw_value = os.environ.get("NEOPAX_TRANSPORT_REVERSE_HOST_STEP_PULLBACK_Y_BAR_PATH")
+    if raw_value is None:
+        return None
+    value = raw_value.strip()
+    return value or None
+
+
+def _host_step_pullback_replay_dy_bar_path() -> str | None:
+    raw_value = os.environ.get("NEOPAX_TRANSPORT_REVERSE_HOST_STEP_PULLBACK_REPLAY_DY_BAR_PATH")
+    if raw_value is None:
+        return None
+    value = raw_value.strip()
+    return value or None
+
+
+def _host_step_pullback_replay_inputs_path() -> str | None:
+    raw_value = os.environ.get("NEOPAX_TRANSPORT_REVERSE_HOST_STEP_PULLBACK_REPLAY_INPUTS_PATH")
+    if raw_value is None:
+        return None
+    value = raw_value.strip()
+    return value or None
+
+
+def _host_step_pullback_replay_lagged_cache_path() -> str | None:
+    raw_value = os.environ.get("NEOPAX_TRANSPORT_REVERSE_HOST_STEP_PULLBACK_REPLAY_LAGGED_CACHE_PATH")
+    if raw_value is None:
+        return None
+    value = raw_value.strip()
+    return value or None
+
+
+def _host_step_pullback_replay_primal_path() -> str | None:
+    raw_value = os.environ.get("NEOPAX_TRANSPORT_REVERSE_HOST_STEP_PULLBACK_REPLAY_PRIMAL_PATH")
+    if raw_value is None:
+        return None
+    value = raw_value.strip()
+    return value or None
+
+
 def _adaptive_rollout_objectives_realized_schedule_only_for_parameter_vector(
     parameter_values,
     *,
@@ -5756,10 +5816,10 @@ def build_realized_schedule_rollout_report(
     rel_fd_step: float,
     abs_fd_step: float,
     device: str | None,
-    accepted_step_limit: int | None = None,
     include_nan_debug: bool = False,
     nan_debug_mode: str = "minimal",
     nan_debug_include_one_step_compare: bool = False,
+    accepted_step_limit: int | None = None,
 ) -> dict[str, Any]:
     if parameter_name not in ALLOWED_PARAMETERS:
         raise ValueError(f"parameter_name must be one of {sorted(ALLOWED_PARAMETERS)}")
@@ -6920,6 +6980,7 @@ def build_baseline_dt_path_safe_compose_scan_report(
         profile_cfg=profile_cfg,
         parameter_name=parameter_name,
         use_realized_schedule_jvp=False,
+        accepted_step_limit_override=None,
     )
     baseline_diag = _adaptive_rollout_diagnostics(baseline_rollout)
     safe_attempt_index = int(known_first_bad_attempt_index) - int(safe_attempt_margin)
@@ -7063,6 +7124,7 @@ def build_baseline_dt_path_safe_trajectory_compare_report(
         profile_cfg=profile_cfg,
         parameter_name=parameter_name,
         use_realized_schedule_jvp=False,
+        accepted_step_limit_override=None,
     )
     baseline_diag = _adaptive_rollout_diagnostics(baseline_rollout)
     safe_attempt_index = int(known_first_bad_attempt_index) - int(safe_attempt_margin)
@@ -7219,6 +7281,7 @@ def build_baseline_dt_path_safe_state_trajectory_compare_report(
         profile_cfg=profile_cfg,
         parameter_name=parameter_name,
         use_realized_schedule_jvp=False,
+        accepted_step_limit_override=None,
     )
     baseline_diag = _adaptive_rollout_diagnostics(baseline_rollout)
     safe_attempt_index = int(known_first_bad_attempt_index) - int(safe_attempt_margin)

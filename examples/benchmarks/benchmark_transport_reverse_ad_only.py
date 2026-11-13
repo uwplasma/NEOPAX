@@ -3368,6 +3368,7 @@ def _run_realtime_geometry_support_segment_probe(
         profile_gradient_matrix = support_cotangent_result.profile_gradient_matrix
         support_bars = support_cotangent_result.support_bars
         support_component_bars_by_name = support_cotangent_result.support_component_bars_by_name
+        support_component_names = tuple(support_component_bars_by_name)
         native_vmec_face_coefficient_bars = (
             support_cotangent_result.native_vmec_face_coefficient_bars
         )
@@ -3693,7 +3694,6 @@ def _run_realtime_geometry_support_segment_probe(
                     print(f"      d{objective_name}/d{geometry_label}: ad={value:.6e}{branch_suffix}")
                     component_payload = report["geometry_gradient_reverse_ad_by_component"]
                     if component_payload:
-                        support_component_names = tuple(component_payload[objective_name])
                         component_parts = [
                             f"{component_name}={component_payload[objective_name][component_name][geometry_label]:.6e}"
                             for component_name in support_component_names
@@ -3749,7 +3749,6 @@ def _run_realtime_geometry_support_segment_probe(
                     print(f"      d{objective_name}/d{geometry_label}: ad={value:.6e}{branch_suffix}")
                     component_payload = report["geometry_gradient_reverse_ad_by_component"]
                     if component_payload:
-                        support_component_names = tuple(component_payload[objective_name])
                         component_parts = [
                             f"{component_name}={component_payload[objective_name][component_name][geometry_label]:.6e}"
                             for component_name in support_component_names

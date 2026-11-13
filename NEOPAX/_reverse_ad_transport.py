@@ -2352,6 +2352,9 @@ def _theta_segment_reduced_cotangent_bwd_batched_with_support_call(
                 return _step_fn
 
             n_linearized_solves = 1 + (solver.n_corrector_steps if solver.use_predictor_corrector else 0)
+            lagged_response_reuse_mode = str(getattr(solver, "lagged_response_reuse_mode", "retry_only")).strip().lower()
+            lagged_response_reuse_rtol = jnp.asarray(getattr(solver, "lagged_response_reuse_rtol", 5.0e-2), dtype=dtype)
+            lagged_response_reuse_atol = jnp.asarray(getattr(solver, "lagged_response_reuse_atol", 1.0e-8), dtype=dtype)
             delta_reduction_factor = jnp.asarray(solver.delta_reduction_factor, dtype=dtype)
             tau_min = jnp.asarray(solver.tau_min, dtype=dtype)
             jacobian_reuse_rtol = jnp.asarray(getattr(solver, "jacobian_reuse_rtol", 0.1), dtype=dtype)

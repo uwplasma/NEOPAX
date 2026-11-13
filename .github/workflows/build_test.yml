@@ -14,11 +14,13 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+# Jobs take `runs-on` from the repository variable CI_RUNS_ON (a JSON runner
+# label or label list); unset, they run on ubuntu-latest. Fork pull requests
+# always use hosted runners.
 jobs:
   lint:
     if: github.event_name != 'pull_request' || !github.event.pull_request.draft
-    # hosted job: runs for fork PRs too
-    runs-on: ubuntu-24.04
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON(vars.CI_RUNS_ON || '"ubuntu-latest"') || 'ubuntu-latest' }}
     timeout-minutes: 10
     steps:
     - uses: actions/checkout@v4
@@ -32,7 +34,7 @@ jobs:
 
   build:
     if: github.event_name != 'pull_request' || !github.event.pull_request.draft
-    runs-on: ${{ (github.event_name != 'pull_request' || (github.event.pull_request.head.repo.full_name == github.repository && matrix.python-version == '3.12')) && fromJSON('["self-hosted","uwplasma-cpu"]') || 'ubuntu-latest' }}
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON(vars.CI_RUNS_ON || '"ubuntu-latest"') || 'ubuntu-latest' }}
     timeout-minutes: 60
     strategy:
       fail-fast: false
@@ -53,7 +55,7 @@ jobs:
         if [ -f requirements.txt ]; then uv pip install -r requirements.txt; fi
     - name: Run tests with coverage
       run: |
-        uv run pytest -n 3 -m "not gpu" --cov-branch --cov-report=xml --cov=NEOPAX
+        uv run pytest -n 3 --cov-branch --cov-report=xml --cov=NEOPAX
     - name: Upload coverage reports to Codecov
       if: matrix.python-version == '3.12'
       uses: codecov/codecov-action@v5

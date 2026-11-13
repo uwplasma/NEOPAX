@@ -7165,7 +7165,6 @@ def _radau_fixed_lagged_step_reverse_common(
         lagged_reference_y=primal_result.carry_after_attempt.lagged_reference_y,
     )
     trial_y_bars = jnp.asarray(next_reduced_bars.y, dtype=kernel_context.dtype)
-    objective_count = trial_y_bars.shape[0]
     if physics_context.project_flat is not None:
         _, project_pullback = jax.vjp(physics_context.project_flat, primal_result.trial_y)
         trial_y_bars = jax.vmap(lambda bar: project_pullback(bar)[0])(trial_y_bars)
@@ -7230,6 +7229,7 @@ def _radau_fixed_lagged_step_reverse_common(
         ).strip().lower()
         == "block"
     ):
+        objective_count = int(dz_bars.shape[0])
         support_bad_rows = jnp.zeros((objective_count,), dtype=bool)
         for support_bar_leaf in support_bar_leaves:
             support_leaf_rows = jnp.asarray(support_bar_leaf).reshape(
