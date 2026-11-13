@@ -1014,8 +1014,13 @@ def test_combined_joint_lagged_pullback_preserves_submodel_state_bars():
             state,
             response_bars,
             support,
+            *,
+            packed_support_directional_adjoint=False,
+            return_native_vmec_coefficient_bars=False,
         ):
             assert self.joint
+            assert not packed_support_directional_adjoint
+            assert not return_native_vmec_coefficient_bars
             return self.factor * response_bars, 11.0 * response_bars
 
     model = CombinedTransportFluxModel(

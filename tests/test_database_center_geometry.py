@@ -191,6 +191,30 @@ def test_database_center_mesh_jvp_preserves_custom_geometry_dependencies():
     assert jnp.allclose(actual.a_b, 0.0)
 
 
+@pytest.mark.parametrize("mode", [None, "radial_vjp"])
+@pytest.mark.parametrize("channel, factor", [("Q", 2.0), ("Upar", -1.0)])
+def test_database_custom_geometry_pullback_preserves_batched_single_channel(mode, channel, factor):
+    """Absent Gamma must retain the objective axis in the general VJP."""
+    class CustomModel(NTXDatabaseTransportModel):
+        def build_local_direct_flux_evaluator(self, state):
+            def evaluate(index, er):
+                value = self.geometry.metric * state.density[:, index] + er
+                return {"Gamma": value, "Q": 2 * value, "Upar": -value}
+            return evaluate
+
+    base, state, geometry = _fixture()
+    model = CustomModel(base.species, base.energy_grid, geometry, base.database)
+    bars = {channel: _bars(3)[channel]}
+    actual = jax.jit(lambda state, bars, geometry:
+        model.pullback_direct_rhs_geometry_by_radius(
+            state, bars, geometry, center_geometry_mode=mode
+        ))(state, bars, geometry)
+    expected_metric = factor * jnp.sum(state.density * bars[channel], axis=(-2, -1))
+    assert actual.metric.shape == (3,)
+    assert jnp.allclose(actual.metric, expected_metric)
+    assert jnp.allclose(actual.a_b, 0.0)
+
+
 @pytest.mark.parametrize("mode, expected", [(None, "scalar_jvp"), ("radial_vjp", "radial_vjp"), ("scalar_jvp", "scalar_jvp")])
 def test_database_center_geometry_modes_dispatch_through_composite_and_runtime(mode, expected):
     """Explicit modes traverse both wrappers; the omitted mode retains current dispatch."""

@@ -1834,6 +1834,13 @@ def test_radau_node_initial_carry_reverse_includes_selected_edge_root_state_bar(
             # fixed-branch pullback is therefore dE_edge/dE_last = 1.5.
             return er_edge - 1.5 * state.Er[-1]
 
+        def pullback_node_boundary_with_lagged_response_edge(
+            self, state, er_edge, transport_response, output_bar, *, er_edge_anchor
+        ):
+            del state, er_edge, transport_response, er_edge_anchor
+            # The public RHS is edge-independent; the scalar RHS is -0.5 E_edge.
+            return -0.5 * output_bar[1]
+
     state0 = TransportState(
         density=jnp.ones((1, 2)),
         pressure=jnp.ones((1, 2)),
@@ -3617,6 +3624,7 @@ def test_approximate_tangent_lift_preserves_minimal_segment_record_contract():
     minimal = transport_solvers._RadauAcceptedStepReverseMinimalAttemptResult(
         carry_after_attempt=carry, trial_dt=value, trial_y=jnp.asarray([value]),
         stage_history=jnp.asarray([value]), jacobian_out=jnp.asarray([[value]]),
+        final_stage_newton_delta=jnp.zeros((1,)), stage_secant_applied=jnp.asarray(False),
         cache_valid_out=value, cache_dt_out=value, cache_age_out=value,
         real_lu_out=jnp.asarray([[value]]), real_piv_out=jnp.asarray([value]),
         complex_lu_out=jnp.asarray([[value]]), complex_piv_out=jnp.asarray([value]),
@@ -3646,7 +3654,8 @@ def test_radau_controller_keeps_the_moderate_cap_on_an_easy_accepted_step():
     assert float(info.growth) == pytest.approx(1.5)
 
 
-def test_radau_joint_rebuild_support_pullback_accumulates_batched_bars(monkeypatch):
+@pytest.mark.parametrize("diagnostics_enabled", [False, True])
+def test_radau_joint_rebuild_support_pullback_accumulates_batched_bars(monkeypatch, diagnostics_enabled):
     """Exercise the Radau rebuild branch that dispatches the joint NTX hook.
 
     The stage residual kernels are deliberately zeroed here: their numerical
@@ -3687,6 +3696,8 @@ def test_radau_joint_rebuild_support_pullback_accumulates_batched_bars(monkeypat
         trial_dt=jnp.asarray(1.0, dtype=dtype),
         trial_y=y,
         stage_history=jnp.zeros((3, 1), dtype=dtype),
+        final_stage_newton_delta=jnp.zeros((3, 1), dtype=dtype),
+        stage_secant_applied=jnp.asarray(False),
         jacobian_out=jnp.zeros((1, 1), dtype=dtype),
         cache_valid_out=jnp.asarray(True),
         cache_dt_out=jnp.asarray(1.0, dtype=dtype),
@@ -3723,6 +3734,18 @@ def test_radau_joint_rebuild_support_pullback_accumulates_batched_bars(monkeypat
         "_radau_exact_stage_residual_support_pullback",
         lambda *args, **kwargs: {"x": jnp.asarray(0.0, dtype=dtype)},
     )
+    diagnostic_calls = []
+
+    def diagnose(*args, **kwargs):
+        assert kwargs["rhs"].shape == (2, 3)
+        assert kwargs["exact_solution"].shape == (2, 3)
+        diagnostic_calls.append(kwargs)
+
+    monkeypatch.setattr(
+        transport_solvers,
+        "_radau_diagnose_exact_vs_frozen_stage_adjoint_batched",
+        diagnose,
+    )
 
     def joint_rebuild_pullback(state, lagged_response_bars, support):
         assert state.shape == (1,)
@@ -3734,6 +3757,8 @@ def test_radau_joint_rebuild_support_pullback_accumulates_batched_bars(monkeypat
         reverse_rhs_pullback_mode="separate",
         reverse_stage_cotangent_mode="full",
         reverse_stage_adjoint_memory_mode="default",
+        reverse_stage_adjoint_solve_mode="block",
+        reverse_segment_input_diagnostics=diagnostics_enabled,
         reverse_rebuild_support_pullback_mode="ntx_joint_implicit_interpolated_faces",
         reverse_segment_profile_annotations=False,
         pullback_build_lagged_response=object(),
@@ -3791,3 +3816,10 @@ def test_radau_joint_rebuild_support_pullback_accumulates_batched_bars(monkeypat
     )
     assert jnp.allclose(reused_reduced_bars.y, reduced_bars.y)
     assert jnp.allclose(reused_support_leaves[0], support_leaves[0])
+    # The hoisted branch-independent helper is also used by compact replay.
+    transport_solvers._radau_fixed_lagged_step_reverse_common(
+        kernel_context, physics_context, carry, primal_result,
+        jnp.asarray(1.0, dtype=dtype), next_bars, {"x": jnp.asarray(0.0, dtype=dtype)},
+        collect_native_vmec_coefficients=False, native_vmec_zero_leaves=(),
+    )
+    assert len(diagnostic_calls) == (1 if diagnostics_enabled else 0)

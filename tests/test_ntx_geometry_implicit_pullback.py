@@ -3312,6 +3312,15 @@ def test_native_vmec_coefficient_tangent_contraction_matches_vjp_duality():
     assert jnp.allclose(actual, expected, rtol=1e-12, atol=1e-12)
 
 
+@pytest.mark.parametrize("bars,tangents", [
+    ((jnp.asarray(0.2),), (jnp.asarray(1.0),)),
+    ((jnp.ones((3, 2)), jnp.ones((2,))), (jnp.ones((2,)), jnp.asarray(1.0))),
+])
+def test_native_vmec_coefficient_tangent_contraction_rejects_missing_or_mismatched_rhs(bars, tangents):
+    with pytest.raises(ValueError, match="RHS axis"):
+        _native_vmec_coefficient_tangent_contraction(bars, tangents)
+
+
 def test_native_vmec_bridge_forwards_bridge_only_flag_to_local_ntx_helper():
     """Catch a missing bridge-only keyword before a compiled Radau segment."""
 
@@ -3637,6 +3646,9 @@ def test_black_box_recorded_database_direct_support_split_matches_generic_payloa
         def __call__(self, _state):
             return jnp.asarray(3.0)
 
+        def pullback_direct_rhs_geometry_by_radius(self, _state, flux_bar, _geometry):
+            return flux_bar
+
         def pullback_direct_rhs_support_payload(self, _state, flux_bar, support):
             del support
             return {
@@ -3652,19 +3664,21 @@ def test_black_box_recorded_database_direct_support_split_matches_generic_payloa
         "with_realtime_geometry_support_payload",
         lambda payload: lambda _t, _state, _runtime: payload["geometry"] + 2.0 * payload["database"],
     )
-    support = {
-        "geometry": jnp.asarray(5.0),
-        "channels": jnp.asarray(7.0),
-        "surfaces": jnp.asarray(11.0),
-        "database": jnp.asarray(13.0),
-    }
+    object.__setattr__(
+        equations, "pullback_direct_rhs_database_equation_geometry_payload",
+        lambda *_args: {"geometry": jnp.asarray(0.0), "database": jnp.asarray(0.0)},
+    )
+    support = {"geometry": jnp.asarray(5.0), "database": jnp.asarray(13.0)}
     actual = equations.pullback_direct_rhs_support_payload(
         jnp.asarray(0.0), None, None, jnp.asarray(17.0), support
     )
     assert jnp.allclose(actual["geometry"], 17.0)
     assert jnp.allclose(actual["database"], 34.0)
-    assert jnp.allclose(actual["channels"], 0.0)
-    assert jnp.allclose(actual["surfaces"], 0.0)
+    with pytest.raises(ValueError, match="requires exactly"):
+        equations.pullback_direct_rhs_support_payload(
+            jnp.asarray(0.0), None, None, jnp.asarray(17.0),
+            dict(support, channels=jnp.asarray(7.0), surfaces=jnp.asarray(11.0)),
+        )
 
 
 def test_database_direct_rhs_support_splits_fixed_table_and_geometry_bars():
@@ -4854,7 +4868,8 @@ def test_native_vmec_face_rebuild_er_drds_chain_matches_local_response_vjp(
     )
     _surface, prepared = _small_vmec_prepared()
     drds_value = jnp.asarray(1.2)
-    er_value = jnp.asarray(-2.7e-3)
+    # Keep the Er chain above near-zero-field cancellation in this fixture.
+    er_value = jnp.asarray(-2.7e-1)
     temperature_local = jnp.asarray([1.4, 1.1])
     density_local = jnp.asarray([0.9, 0.9])
     # Match the production helper exactly.  In particular, temperatures are
@@ -5585,21 +5600,32 @@ def test_native_multi_rhs_support_retains_local_drds_case_chain():
             collisionality_kind="unused",
         )
 
-    # The complete RHS below is linear.  Gate its three NTX-dependent output
-    # channels independently so a failure identifies the low-dot term that
-    # needs correction, rather than merely reporting a summed prepared bar.
+    def _fixed_case_response(prepared_value, drds_value, nu_value, epsi_value, vth_value):
+        return model._interpolated_moment_reduced_local_outputs_from_primitives(
+            prepared_value, drds_value=drds_value, nu_hat_a=nu_value,
+            epsi_hat_a=epsi_value, vth_a=vth_value,
+        )
+
+    _, fixed_pullback = jax.vjp(
+        _fixed_case_response, prepared, drds,
+        reference_nu_hat, reference_epsi_hat, vth_a,
+    )
+    _, response_pullback = jax.vjp(_response, prepared, drds)
+
+    # Check each linear output channel before comparing their combined pullback.
     component_names = (
         "transport_moments",
         "dtransport_moments_d_er",
         "dtransport_moments_d_log_nu_star",
     )
-    reference_field_bars = scalar_field_bars[0]
+    native_channels = []
+    direct_channels = [[] for _ in scalar_field_bars]
     for field_index, component_name in zip((1, 2, 3), component_names, strict=True):
-        component_field_bars = tuple(
+        component_batch = tuple(
             value if index == field_index else jnp.zeros_like(value)
-            for index, value in enumerate(reference_field_bars)
+            for index, value in enumerate(batched_field_bars)
         )
-        component_batch = tuple(value[None, ...] for value in component_field_bars)
+        component_field_bars = tuple(value[0] for value in component_batch)
         (
             generic_component_prepared,
             _generic_component_direct_drds,
@@ -5608,11 +5634,10 @@ def test_native_multi_rhs_support_retains_local_drds_case_chain():
             prepared,
             drds_value=drds,
             reference_nu_hat=reference_nu_hat,
-                reference_epsi_hat=reference_epsi_hat,
-                vth_a=vth_a,
-                field_bars=component_batch,
-                include_second_direction_base_prepared=False,
-            )
+            reference_epsi_hat=reference_epsi_hat,
+            vth_a=vth_a,
+            field_bars=component_batch,
+        )
         (
             native_component_prepared,
             _native_component_direct_drds,
@@ -5627,65 +5652,86 @@ def test_native_multi_rhs_support_retains_local_drds_case_chain():
             field_bars=component_batch,
             return_case_bars=True,
         )
-        _response_value, component_pullback = jax.vjp(_response, prepared, drds)
-        expected_component_prepared, _expected_component_drds = component_pullback(
-            component_field_bars
+        fixed_prepared, fixed_drds, fixed_nu, fixed_epsi, fixed_vth = fixed_pullback(component_field_bars)
+        scalar_prepared, scalar_drds, _ = model._pullback_interpolated_moment_prepared_support_and_drds_only(
+            prepared, drds_value=drds, reference_nu_hat=reference_nu_hat,
+            reference_epsi_hat=reference_epsi_hat, vth_a=vth_a,
+            field_bars=component_field_bars,
         )
-        try:
-            _assert_float_tree_allclose(
-                jax.tree_util.tree_map(
-                    lambda value: value[0], generic_component_prepared
-                ),
-                expected_component_prepared,
-                rtol=5e-9,
+        full_nu, full_epsi, full_vth, full_prepared, full_drds = (
+            model._pullback_interpolated_moment_reduced_local_outputs_with_prepared_support_and_drds(
+                prepared, drds_value=drds, reference_nu_hat=reference_nu_hat,
+                reference_epsi_hat=reference_epsi_hat, vth_a=vth_a,
+                field_bars=component_field_bars,
             )
-        except AssertionError as error:
-            raise AssertionError(
-                "Generic corrected low-dot mismatch in "
-                f"{component_name}; the remaining issue is shared algebra, "
-                "not native matrix-RHS packing."
-            ) from error
-        try:
-            _assert_float_tree_allclose(
-                jax.tree_util.tree_map(
-                    lambda value: value[0], native_component_prepared
-                ),
-                expected_component_prepared,
-                rtol=5e-9,
-            )
-        except AssertionError as error:
-            raise AssertionError(
-                "Native matrix-RHS prepared-support low-dot mismatch in "
-                f"{component_name}."
-            ) from error
-        native_component_epsi_hat = _native_component_case_bars[1]
+        )
+        for actual, expected in (
+            (scalar_prepared, fixed_prepared), (scalar_drds, fixed_drds),
+            (full_prepared, fixed_prepared), (full_drds, fixed_drds),
+            (full_nu, fixed_nu), (full_epsi, fixed_epsi), (full_vth, fixed_vth),
+            (_generic_component_direct_drds[0], fixed_drds),
+        ):
+            _assert_float_tree_allclose(actual, expected, rtol=5e-9)
+
+        native_channels.append(native_component_prepared)
         native_component_drds = (
             _native_component_direct_drds
-            + jnp.sum(native_component_epsi_hat * epsi_per_drds, axis=1)
+            + jnp.sum(_native_component_case_bars[1] * epsi_per_drds, axis=1)
         )
-        try:
-            _assert_float_tree_allclose(
-                native_component_drds[0],
-                _expected_component_drds,
-                rtol=5e-9,
-            )
-        except AssertionError as error:
-            raise AssertionError(
-                "Native matrix-RHS drds support-chain mismatch in "
-                f"{component_name}."
-            ) from error
+        for rhs_index in range(len(scalar_field_bars)):
+            one_component = tuple(value[rhs_index] for value in component_batch)
+            expected_prepared, expected_drds = response_pullback(one_component)
+            direct_channels[rhs_index].append(expected_prepared)
+            for adapter, actual_prepared in (
+                ("generic", generic_component_prepared),
+                ("native", native_component_prepared),
+            ):
+                try:
+                    _assert_float_tree_allclose(
+                        jax.tree_util.tree_map(lambda value: value[rhs_index], actual_prepared),
+                        expected_prepared, rtol=5e-9,
+                    )
+                except AssertionError as error:
+                    raise AssertionError(
+                        f"{adapter} prepared pullback mismatch: {component_name}, RHS{rhs_index}"
+                    ) from error
+            _assert_float_tree_allclose(native_component_drds[rhs_index], expected_drds, rtol=5e-9)
 
+    def _sum_channels(channels, *, absolute=False):
+        def _sum(*values):
+            if not jnp.issubdtype(jnp.asarray(values[0]).dtype, jnp.inexact):
+                return values[0]
+            stacked = jnp.stack(values)
+            return jnp.sum(jnp.abs(stacked) if absolute else stacked, axis=0)
+        return jax.tree_util.tree_map(_sum, *channels)
+
+    summed_native = _sum_channels(native_channels)
     for rhs_index, field_bars in enumerate(scalar_field_bars):
-        _response_value, pullback = jax.vjp(_response, prepared, drds)
-        expected_prepared, expected_drds = pullback(field_bars)
+        expected_prepared, expected_drds = response_pullback(field_bars)
+        actual_prepared = jax.tree_util.tree_map(lambda value: value[rhs_index], native_prepared)
+        # Each channel above retains the original error gate. A cancelled sum
+        # needs a conditioning-aware relative scale: sum absolute channel bars.
+        # Keep rtol=5e-9 and one atol=1e-11 (stricter than summing three atols).
+        # Independent linearity checks retain the original combined scale.
         _assert_float_tree_allclose(
-            jax.tree_util.tree_map(lambda value: value[rhs_index], native_prepared),
-            expected_prepared,
+            actual_prepared,
+            jax.tree_util.tree_map(lambda value: value[rhs_index], summed_native),
             rtol=5e-9,
         )
-        _assert_float_tree_allclose(
-            native_drds[rhs_index], expected_drds, rtol=5e-9
-        )
+        _assert_float_tree_allclose(expected_prepared, _sum_channels(direct_channels[rhs_index]), rtol=5e-9)
+        scale = _sum_channels(direct_channels[rhs_index], absolute=True)
+        for leaf_index, (actual, expected, channel_scale) in enumerate(zip(
+            jax.tree_util.tree_leaves(actual_prepared),
+            jax.tree_util.tree_leaves(expected_prepared),
+            jax.tree_util.tree_leaves(scale), strict=True,
+        )):
+            if jnp.issubdtype(jnp.asarray(expected).dtype, jnp.inexact):
+                normalized_error = jnp.abs(actual - expected) / (1e-11 + 5e-9 * channel_scale)
+                assert jnp.all(normalized_error <= 1.0), (
+                    f"combined prepared pullback mismatch: RHS{rhs_index}, leaf{leaf_index}, "
+                    f"max_error_over_channel_tolerance={float(jnp.max(normalized_error)):.16e}"
+                )
+        _assert_float_tree_allclose(native_drds[rhs_index], expected_drds, rtol=5e-9)
 
 
 def test_compact_local_coefficient_record_matches_ordinary_response():

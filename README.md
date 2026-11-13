@@ -40,6 +40,8 @@
 NEOPAX is a flexible JAX-native transport solver for the radial tranpsort equations in stellarators. It follows the modular philosophy of the tokamak transport solver torax, while specializing in stellarator physics. It can fulfill the roles of power balance steady state solver and predictive transport simulator using different solvers like kvaerno5 from diffrax, a custom implemented radau solver or a theta solver.
 
 ## Quick Start
+Requires Python 3.11+ and JAX 0.10.2+.
+
 To install NEOPAX you just need to:
 
 ```
