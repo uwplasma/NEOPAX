@@ -59,7 +59,6 @@ def _generate_boozer_file(
     *,
     mboz: int,
     nboz: int,
-    jit_boozer: bool,
     verbose: bool,
 ) -> Path:
     from vmex.core.boozer import run_booz_xform
@@ -74,7 +73,6 @@ def _generate_boozer_file(
         nbooz=int(nboz),
         surfaces=None,
         outdir=wout_path.parent,
-        jit=bool(jit_boozer),
         verbose=bool(verbose),
     ).resolve()
 
@@ -86,7 +84,6 @@ def _resolve_boozer_file(
     generate_boozer: bool,
     mboz: int,
     nboz: int,
-    jit_boozer: bool,
     verbose_boozer: bool,
 ) -> Path:
     if explicit_boozer is not None:
@@ -102,7 +99,6 @@ def _resolve_boozer_file(
             wout_path,
             mboz=mboz,
             nboz=nboz,
-            jit_boozer=jit_boozer,
             verbose=verbose_boozer,
         )
     raise FileNotFoundError(
@@ -181,7 +177,6 @@ def main() -> int:
     )
     parser.add_argument("--mboz", type=int, default=18, help="Generated Boozer poloidal resolution.")
     parser.add_argument("--nboz", type=int, default=18, help="Generated Boozer toroidal resolution.")
-    parser.add_argument("--jit-boozer", action="store_true", help="Use JIT inside booz_xform_jax generation.")
     parser.add_argument("--verbose-boozer", action="store_true", help="Print booz_xform_jax generation details.")
     parser.add_argument("--out", type=Path, default=None, help="Output PNG path.")
     parser.add_argument("--label", default="Er", help="Legend label. Use empty string to hide the legend.")
@@ -199,7 +194,6 @@ def main() -> int:
         generate_boozer=bool(args.generate_boozer),
         mboz=int(args.mboz),
         nboz=int(args.nboz),
-        jit_boozer=bool(args.jit_boozer),
         verbose_boozer=bool(args.verbose_boozer),
     )
     output_path = args.out
