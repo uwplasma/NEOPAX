@@ -355,6 +355,7 @@ def _project_fixed_temperature_output(
 ) -> Any:
     from ._transport_equations import project_fixed_temperature_species
     from ._state import apply_transport_density_floor, apply_transport_temperature_floor
+    from ._temperature_constraints import match_helium_temperature_state
 
     density = getattr(state_like, "density", None)
     ref_density = getattr(reference_state, "density", None)
@@ -370,6 +371,7 @@ def _project_fixed_temperature_output(
             density_floor=density_floor,
         )
         s = apply_transport_temperature_floor(s, temperature_floor, density_floor)
+        s = match_helium_temperature_state(s, fixed_temperature_profile, density_floor)
         return s
 
     if density.ndim == ref_density.ndim + 1:
@@ -427,6 +429,7 @@ def _project_state_to_quasi_neutrality(
 ) -> Any:
     from ._transport_equations import enforce_quasi_neutrality, project_fixed_temperature_species
     from ._state import apply_transport_density_floor, apply_transport_temperature_floor
+    from ._temperature_constraints import match_helium_temperature_state
 
     def _regularize_one(s):
         s = apply_transport_density_floor(s, density_floor)
@@ -437,6 +440,7 @@ def _project_state_to_quasi_neutrality(
             density_floor=density_floor,
         )
         s = apply_transport_temperature_floor(s, temperature_floor, density_floor)
+        s = match_helium_temperature_state(s, fixed_temperature_profile, density_floor)
         return s
 
     if species is None:
@@ -459,6 +463,7 @@ def _project_packed_transport_state_arrays(
 ) -> Any:
     """Project packed solver arrays without rebuilding a full TransportState."""
     from ._state import _broadcast_species_floor, safe_density
+    from ._temperature_constraints import fixed_temperature_values, match_helium_temperature_pressure
 
     if not (isinstance(state_like, tuple) and len(state_like) == 3):
         return state_like
@@ -498,7 +503,7 @@ def _project_packed_transport_state_arrays(
     projected_pressure = pressure
     if temperature_active_mask is not None and fixed_temperature_profile is not None:
         active_mask = jnp.asarray(temperature_active_mask, dtype=bool)
-        fixed_temperature = jnp.asarray(fixed_temperature_profile, dtype=pressure.dtype)
+        fixed_temperature = jnp.asarray(fixed_temperature_values(fixed_temperature_profile), dtype=pressure.dtype)
         active_mask = active_mask.reshape((1,) * (pressure.ndim - 2) + (active_mask.shape[0], 1))
         fixed_temperature = jnp.broadcast_to(fixed_temperature, pressure.shape)
         fixed_pressure = floored_density * fixed_temperature
@@ -519,6 +524,9 @@ def _project_packed_transport_state_arrays(
             temperature_floor,
         )
         projected_pressure = jnp.maximum(projected_pressure, pressure_floor)
+    projected_pressure = match_helium_temperature_pressure(
+        projected_pressure, floored_density, fixed_temperature_profile, density_floor
+    )
     return (packed_density, projected_pressure, er)
 
 

@@ -37,6 +37,11 @@ from ._state import (
 )
 from ._neoclassical import _collisionality_kind
 from ._monoenergetic import database_with_geometry_scale
+from ._temperature_constraints import (
+    fixed_temperature_values,
+    helium_work_match_indices,
+    match_helium_temperature_state,
+)
 
 DENSITY_STATE_TO_PHYSICAL = 1.0e20
 PARTICLE_FLUX_PHYSICAL_TO_STATE = 1.0e-20
@@ -209,7 +214,7 @@ def project_fixed_temperature_species(
     if active_mask.ndim == 0:
         active_mask = active_mask[None]
     active_mask = active_mask[:, None]
-    fixed_temperature = jnp.asarray(fixed_temperature_profile, dtype=state.pressure.dtype)
+    fixed_temperature = jnp.asarray(fixed_temperature_values(fixed_temperature_profile), dtype=state.pressure.dtype)
     fixed_pressure = safe_density(state.density, density_floor) * fixed_temperature
     pressure = jnp.where(active_mask, state.pressure, fixed_pressure)
     return dataclasses.replace(state, pressure=pressure)
@@ -647,6 +652,15 @@ def build_density_equation(
 
 # --- Example built-in equation: Pressure evolution ---
 
+def _validate_convection_temperature_mode(mode):
+    normalized = str(mode).strip().lower()
+    if normalized not in {"upwind", "face"}:
+        raise ValueError(
+            "temperature_convection_temperature_mode must be 'upwind' or 'face'."
+        )
+    return normalized
+
+
 # --- JAX-friendly, torax-style PressureEquation ---
 @register_equation("temperature")
 @jax.tree_util.register_dataclass
@@ -673,6 +687,29 @@ class TemperatureEquation(EquationBase):
     source_model: callable = dataclasses.field(repr=False, default=None)
     species: object = dataclasses.field(repr=False, default=None)
     name: str = "temperature"
+    match_workHe: bool = False
+    convection_temperature_mode: str = "upwind"
+    temperature_faces_builder: callable = dataclasses.field(repr=False, default=None)
+
+    def _convection_temperature_states(self, state):
+        if self.convection_temperature_mode == "face":
+            if not (self.include_neo_convection or self.include_turbulent_convection
+                    or self.include_classical_convection):
+                return None, None
+            if self.temperature_faces_builder is None:
+                raise ValueError(
+                    "Face convection temperature requires a temperature_faces_builder; "
+                    "use build_temperature_equation to share the transport face state."
+                )
+            return self.temperature_faces_builder(state), None
+        return _temperature_face_states(
+            self.temperature_ghost_builder(state.temperature), self.convection_reconstruction,
+        )
+
+    def _convective_temperature(self, gamma_faces, temperature_left, temperature_right):
+        if self.convection_temperature_mode == "face":
+            return temperature_left
+        return jnp.where(gamma_faces >= 0.0, temperature_left, temperature_right)
 
     def _mode_requests_face_fluxes(self, mode_value):
         mode = str(mode_value).strip().lower()
@@ -685,6 +722,9 @@ class TemperatureEquation(EquationBase):
         return self._mode_requests_face_fluxes(self.convection_reconstruction)
 
     def _use_face_completed_work_term(self):
+        if self.match_workHe:
+            # NTSS evaluates the completed work source at integer/centre points.
+            return False
         return str(self.work_term_reconstruction).strip().lower() in {
             "face_completed",
             "interpolate_completed_faces",
@@ -701,6 +741,25 @@ class TemperatureEquation(EquationBase):
         """
         if not self.include_work_term:
             return jnp.zeros_like(state.pressure)
+        if self.match_workHe:
+            gamma_neo = _get_center_flux(fluxes, "Gamma_neo")
+            if gamma_neo is None:
+                raise ValueError(
+                    "match_workHe=true requires Gamma_neo (or Gamma_neo_faces); "
+                    "total particle flux cannot substitute for neoclassical flux."
+                )
+            names = tuple(self.species.names)
+            he, d, t = (names.index(name) for name in ("He", "D", "T"))
+            work = (
+                self.charge_qp[:, None]
+                * PARTICLE_FLUX_PHYSICAL_TO_STATE
+                * gamma_neo
+                * state.Er[None, :]
+            )
+            # NTSS has no helium pressure equation: each fuel species receives
+            # half of Z_He * Gamma_He * Er. Keep the sign of the electric work.
+            helium_share = 0.5 * work[he]
+            return work.at[d].add(helium_share).at[t].add(helium_share).at[he].set(0.0)
         if not self._use_face_completed_work_term():
             return (
                 self.charge_qp[:, None]
@@ -746,7 +805,6 @@ class TemperatureEquation(EquationBase):
         )
         q_center = _get_center_flux(fluxes, "Q")
         Q = HEAT_FLUX_PHYSICAL_TO_STATE * q_center if q_center is not None else None
-        temperature_ghost = self.temperature_ghost_builder(state.temperature)
         Q_faces = (
             HEAT_FLUX_PHYSICAL_TO_STATE * (
                 _get_face_flux(face_fluxes, "Q")
@@ -754,10 +812,7 @@ class TemperatureEquation(EquationBase):
             if (face_fluxes is not None and use_face_q)
             else self.flux_faces_builder(Q, self.heat_flux_reconstruction)
         )
-        temperature_left, temperature_right = _temperature_face_states(
-            temperature_ghost,
-            self.convection_reconstruction,
-        )
+        temperature_left, temperature_right = self._convection_temperature_states(state)
 
         def _convective_component(gamma_key):
             gamma_face_key = f"{gamma_key}_faces"
@@ -772,8 +827,8 @@ class TemperatureEquation(EquationBase):
                 gamma_faces = PARTICLE_FLUX_PHYSICAL_TO_STATE * gamma_comp
             else:
                 gamma_faces = self.flux_faces_builder(PARTICLE_FLUX_PHYSICAL_TO_STATE * gamma_comp)
-            temperature_upwind = jnp.where(gamma_faces >= 0.0, temperature_left, temperature_right)
-            return gamma_faces, temperature_upwind * gamma_faces
+            temperature_used = self._convective_temperature(gamma_faces, temperature_left, temperature_right)
+            return gamma_faces, temperature_used * gamma_faces
 
         gamma_neo_faces, convective_neo_faces = (
             _convective_component("Gamma_neo")
@@ -854,16 +909,12 @@ class TemperatureEquation(EquationBase):
         )
         q_center = _get_center_flux(fluxes, "Q")
         Q = HEAT_FLUX_PHYSICAL_TO_STATE * q_center if q_center is not None else None
-        temperature_ghost = self.temperature_ghost_builder(state.temperature)
         Q_faces = (
             HEAT_FLUX_PHYSICAL_TO_STATE * _get_face_flux(face_fluxes, "Q")
             if (face_fluxes is not None and use_face_q)
             else self.flux_faces_builder(Q, self.heat_flux_reconstruction)
         )
-        temperature_left, temperature_right = _temperature_face_states(
-            temperature_ghost,
-            self.convection_reconstruction,
-        )
+        temperature_left, temperature_right = self._convection_temperature_states(state)
 
         def _convective_component(gamma_key):
             gamma_comp = (
@@ -877,8 +928,8 @@ class TemperatureEquation(EquationBase):
                 gamma_faces = PARTICLE_FLUX_PHYSICAL_TO_STATE * gamma_comp
             else:
                 gamma_faces = self.flux_faces_builder(PARTICLE_FLUX_PHYSICAL_TO_STATE * gamma_comp)
-            temperature_upwind = jnp.where(gamma_faces >= 0.0, temperature_left, temperature_right)
-            return temperature_upwind * gamma_faces
+            temperature_used = self._convective_temperature(gamma_faces, temperature_left, temperature_right)
+            return temperature_used * gamma_faces
 
         convective_flux_faces = jnp.zeros_like(Q_faces)
         if self.include_neo_convection:
@@ -1029,7 +1080,16 @@ def build_temperature_equation(
     reconstruction="linear",
     density_floor=DEFAULT_TRANSPORT_DENSITY_FLOOR,
     temperature_floor=DEFAULT_TRANSPORT_TEMPERATURE_FLOOR,
+    match_workHe=False,
+    convection_temperature_mode="upwind",
 ):
+    convection_temperature_mode = _validate_convection_temperature_mode(convection_temperature_mode)
+    if not isinstance(match_workHe, bool):
+        raise ValueError("match_workHe must be true or false.")
+    if match_workHe and any(
+        name not in tuple(getattr(species, "names", ())) for name in ("e", "D", "T", "He")
+    ):
+        raise ValueError("match_workHe=true requires species named 'e', 'D', 'T', and 'He'.")
     dr_cells = jnp.diff(field.r_grid_half)
     Vprime = field.Vprime
     Vprime_half = field.Vprime_half
@@ -1164,6 +1224,14 @@ def build_temperature_equation(
             density_floor=density_floor,
             temperature_floor=temperature_floor,
         ).Er
+    def temperature_faces_builder(state):
+        # Use the same face state, reconstruction, floors and BCs as the
+        # model's Q/Gamma evaluation; no transport flux is evaluated here.
+        return build_face_transport_state(
+            state, field, bc_density=bc_density, bc_temperature=bc_temperature,
+            bc_er=bc_er, reconstruction=reconstruction,
+            density_floor=density_floor, temperature_floor=temperature_floor,
+        ).temperature
     temperature_ghost_builder = _build_species_ghost_builder(field, bc_temperature)
     if active_species_mask is None:
         active_species_mask = jnp.ones(species.number_species, dtype=bool)
@@ -1188,11 +1256,23 @@ def build_temperature_equation(
         work_term_reconstruction=str(work_term_reconstruction).strip().lower(),
         convection_reconstruction=str(convection_reconstruction),
         heat_flux_reconstruction=str(heat_flux_reconstruction),
+        match_workHe=match_workHe,
+        convection_temperature_mode=convection_temperature_mode,
+        temperature_faces_builder=temperature_faces_builder,
     )
 
 # --- Example built-in equation: Electric field (Er) evolution ---
 
 # --- JAX-friendly, torax-style ElectricFieldEquation ---
+def _validate_er_diffusion_mode(mode):
+    normalized = str(mode).strip().lower()
+    if normalized not in {"neopax", "ntssfusion"}:
+        raise ValueError(
+            "Er_diffusion_mode must be 'neopax' or 'ntssfusion'."
+        )
+    return normalized
+
+
 @register_equation("Er")
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True, eq=False)
@@ -1222,6 +1302,7 @@ class ElectricFieldEquation(EquationBase):
     ntss_psfactor_mid: float = 1.0
     ntss_density_indices: jax.Array = dataclasses.field(repr=False, default=None)
     name: str = "Er"
+    diffusion_mode: str = "neopax"
 
     def _charge_flux_from_gamma(self, Gamma):
         mode = str(self.source_mode).strip().lower()
@@ -1490,7 +1571,9 @@ def build_electric_field_equation(
     permitivity_mode="neopax_local",
     reconstruction="linear",
     boundary_mode="standard",
+    diffusion_mode="neopax",
 ):
+    diffusion_mode = _validate_er_diffusion_mode(diffusion_mode)
     dr_cells = jnp.diff(field.r_grid_half)
     Vprime = field.Vprime
     Vprime_half = field.Vprime_half
@@ -1571,6 +1654,25 @@ def build_electric_field_equation(
                     ),
                 ).face_value(reconstruction=reconstruction)
             )(Gamma)
+    def complete_er_diffusive_flux(gradient_flux, er_faces):
+        # NTSS adds Er/r to the face flux before the volume-weighted
+        # divergence. Use a safe denominator even on the inactive axis branch
+        # so reverse AD never encounters 0/0. The regular axis flux is zero.
+        nonaxis = field.r_grid_half != 0.0
+        radius_safe = jnp.where(nonaxis, field.r_grid_half, 1.0)
+        return jnp.where(
+            nonaxis, gradient_flux + er_faces / radius_safe,
+            jnp.zeros_like(gradient_flux),
+        )
+
+    def cell_variable_er_diffusive_flux(er_cell_var):
+        gradient_flux = -er_cell_var.face_grad()
+        if diffusion_mode == "neopax":
+            return gradient_flux
+        return complete_er_diffusive_flux(
+            gradient_flux, er_cell_var.face_value(reconstruction=reconstruction)
+        )
+
     # Pre-build the diffusive Er face-flux builder for BC handling.
     if bc_er is not None and hasattr(bc_er, "right_type"):
         def er_diffusive_flux_builder(er_profile, er_edge=None):
@@ -1610,17 +1712,34 @@ def build_electric_field_equation(
                     left_face_grad_constraint=None if lg_er is None else jnp.asarray(lg_er).reshape(-1)[0],
                     right_face_grad_constraint=jnp.asarray(rg_er).reshape(-1)[0],
                 )
-            return -er_cell_var.face_grad()
+            return cell_variable_er_diffusive_flux(er_cell_var)
     elif bc_er is not None and hasattr(bc_er, "apply_ghost"):
         def er_diffusive_flux_builder(er_profile, er_edge=None):
             er_ghost = bc_er.apply_ghost(er_profile)
+            if diffusion_mode == "ntssfusion":
+                # N cells plus two ghost centres give N+1 face gradients.
+                centres = 0.5 * (field.r_grid_half[:-1] + field.r_grid_half[1:])
+                ghost_centres = jnp.concatenate([
+                    2.0 * field.r_grid_half[:1] - centres[:1], centres,
+                    2.0 * field.r_grid_half[-1:] - centres[-1:],
+                ])
+                flux = -jnp.diff(er_ghost) / jnp.diff(ghost_centres)
+                er_faces = 0.5 * (er_ghost[:-1] + er_ghost[1:])
+                if er_edge is not None:
+                    flux = flux.at[-1].set(
+                        -(jnp.asarray(er_edge) - er_profile[-1])
+                        / (field.r_grid_half[-1] - centres[-1])
+                    )
+                    er_faces = er_faces.at[-1].set(jnp.asarray(er_edge))
+                return complete_er_diffusive_flux(flux, er_faces)
+            # Preserve the pre-option ghost-boundary arithmetic verbatim.
             flux = -jnp.diff(er_ghost) / jnp.diff(field.r_grid_half)
-            if er_edge is None:
-                return flux
-            return flux.at[-1].set(
-                -(jnp.asarray(er_edge) - er_profile[-1])
-                / (field.r_grid_half[-1] - field.r_grid_half[-2])
-            )
+            if er_edge is not None:
+                flux = flux.at[-1].set(
+                    -(jnp.asarray(er_edge) - er_profile[-1])
+                    / (field.r_grid_half[-1] - field.r_grid_half[-2])
+                )
+            return flux
     else:
         def er_diffusive_flux_builder(er_profile, er_edge=None):
             er_cell_var = make_profile_cell_variable(
@@ -1632,7 +1751,7 @@ def build_electric_field_equation(
                     if er_profile.shape[0] >= 2 else er_profile[-1]
                 )),
             )
-            return -er_cell_var.face_grad()
+            return cell_variable_er_diffusive_flux(er_cell_var)
     def face_state_builder(state):
         return build_face_transport_state(
             state,
@@ -1663,6 +1782,7 @@ def build_electric_field_equation(
         ntss_B0_mid=ntss_B0_mid,
         ntss_psfactor_mid=ntss_psfactor_mid,
         ntss_density_indices=ntss_density_indices,
+        diffusion_mode=diffusion_mode,
     )
 
 
@@ -1696,6 +1816,7 @@ def build_equation_system(
         "temperature": equations_cfg.get("toggle_temperature", [True]*getattr(species, 'number_species', 3)),
         "Er": equations_cfg.get("toggle_Er", True),
     }
+    work_match_indices = helium_work_match_indices(config, getattr(species, "names", ()))
     equations_to_evolve = []
     species_mass = getattr(species, "mass", None)
     charge_qp = getattr(species, "charge_qp", None)
@@ -1719,6 +1840,7 @@ def build_equation_system(
         solver_cfg.get("Er_permitivity_mode", "neopax_local"),
     )
     Er_boundary_mode = _resolve_er_boundary_mode(config, solver_cfg)
+    Er_diffusion_mode = solver_cfg.get("Er_diffusion_mode", "neopax")
     density_flux_reconstruction = solver_cfg.get("density_flux_reconstruction", "closure_face_flux")
     density_particle_face_closure_mode = solver_cfg.get("density_particle_face_closure_mode", "reconstructed")
     include_neo_convection = solver_cfg.get("temperature_include_neo_convection", True)
@@ -1732,6 +1854,7 @@ def build_equation_system(
         "temperature_work_term_reconstruction", "center"
     )
     convection_reconstruction = solver_cfg.get("temperature_convection_reconstruction", "closure_face_flux")
+    convection_temperature_mode = solver_cfg.get("temperature_convection_temperature_mode", "upwind")
     heat_flux_reconstruction = solver_cfg.get("temperature_heat_flux_reconstruction", "closure_face_flux")
     density_floor = solver_cfg.get("density_floor", DEFAULT_TRANSPORT_DENSITY_FLOOR)
     temperature_floor = solver_cfg.get("temperature_floor", DEFAULT_TRANSPORT_TEMPERATURE_FLOOR)
@@ -1768,7 +1891,9 @@ def build_equation_system(
             include_classical_convection=include_classical_convection,
             include_work_term=include_work_term,
             work_term_reconstruction=work_term_reconstruction,
+            match_workHe=work_match_indices is not None,
             convection_reconstruction=convection_reconstruction,
+            convection_temperature_mode=convection_temperature_mode,
             heat_flux_reconstruction=heat_flux_reconstruction,
             density_floor=density_floor,
             temperature_floor=temperature_floor,
@@ -1789,6 +1914,7 @@ def build_equation_system(
             source_mode=Er_source_mode,
             permitivity_mode=Er_permitivity_mode,
             boundary_mode=Er_boundary_mode,
+            diffusion_mode=Er_diffusion_mode,
         ))
     return equations_to_evolve
 
@@ -3024,6 +3150,9 @@ class ComposedEquationSystem:
             working_state,
             self.temperature_floor,
             self.density_floor,
+        )
+        working_state = match_helium_temperature_state(
+            working_state, self.fixed_temperature_profile, self.density_floor
         )
         return working_state, eidx
 

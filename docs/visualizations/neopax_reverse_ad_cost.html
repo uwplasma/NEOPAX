@@ -1,0 +1,325 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>NEOPAX: the cost of checkpointed reverse AD</title>
+<style>
+:root{color-scheme:light;--paper:#fffefa;--bg:#f1f0eb;--ink:#172e3f;--muted:#5f707a;--line:#d8dfdf;--blue:#2466ad;--green:#17836b;--purple:#7951ac}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:16px/1.55 system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}main{max-width:1340px;margin:30px auto;padding:0 24px 32px}.eyebrow{color:var(--blue);font-size:12px;font-weight:750;letter-spacing:.16em;text-transform:uppercase}h1{font-size:clamp(25px,3.7vw,42px);line-height:1.15;letter-spacing:-.035em;margin:8px 0 12px}p{margin:8px 0}.intro{max-width:1000px;color:var(--muted)}.controls{display:flex;align-items:center;flex-wrap:wrap;gap:10px;margin:22px 0 14px}button,select{font:600 14px system-ui;border:1px solid #ccd5d8;border-radius:9px;background:var(--paper);padding:9px 14px;color:var(--ink)}button{cursor:pointer}button.primary{background:var(--ink);color:white;border-color:var(--ink)}button:hover{filter:brightness(.96)}button:focus-visible,select:focus-visible,input:focus-visible{outline:3px solid #c2943b;outline-offset:3px}button:disabled{opacity:.5;cursor:default}.setting{display:flex;align-items:center;gap:8px;margin-left:10px;font-size:13px}.setting select{padding:8px}.diagram{border:1px solid #d4dddd;border-radius:16px;overflow:hidden;background:var(--paper);box-shadow:0 8px 32px #172e3f06}.diagram svg{width:100%;height:auto;display:block}.scrub{display:flex;gap:14px;align-items:center;margin:14px 2px}.scrub label{font-size:13px;white-space:nowrap}.scrub input{width:100%;accent-color:var(--blue)}output{min-width:85px;font-size:13px;text-align:right;font-variant-numeric:tabular-nums}.phase-note{min-height:56px;font-size:15px;max-width:1050px}.phase-note strong{color:var(--ink)}.explanation{display:grid;grid-template-columns:repeat(3,1fr);gap:18px;margin-top:16px}.explanation article{background:var(--paper);border:1px solid var(--line);border-radius:12px;padding:18px}.explanation h2{font-size:16px;margin:0 0 8px}.explanation p{font-size:14px;color:var(--muted)}.footnote{font-size:13px;color:var(--muted);margin-top:16px}details{border-top:1px solid var(--line);padding-top:14px;margin-top:20px;font-size:14px}summary{cursor:pointer;font-weight:650}details p{max-width:1050px}code{font-size:12px;overflow-wrap:anywhere}a{color:var(--blue)}.sr-only{position:absolute;width:1px;height:1px;padding:0;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}@media(max-width:760px){main{padding:0 12px}.explanation{grid-template-columns:1fr;gap:10px}.setting{margin-left:0}.controls{gap:8px}button{padding:8px 10px}.scrub label{display:none}}@media(prefers-reduced-motion:reduce){*{scroll-behavior:auto}}
+</style>
+</head>
+<body>
+<main>
+<div class="eyebrow">NEOPAX / accepted-step adjoint / animated schematic</div>
+<h1>Why reverse AD costs roughly three forward solves</h1>
+<p class="intro">Compute the trajectory once. Reconstruct each segment from a checkpoint, then differentiate it backward. Only the current segment needs its detailed Radau records in memory.</p>
+<div class="controls" aria-label="Animation controls">
+  <button id="play" class="primary" type="button">Pause</button>
+  <button id="previous" type="button" aria-label="Previous animation step">&#8592; Step</button>
+  <button id="next" type="button" aria-label="Next animation step">Step &#8594;</button>
+  <button id="restart" type="button">Restart</button>
+  <label class="setting" for="appearance">Style <select id="appearance"><option value="detailed">Detailed</option><option value="arrows">Arrow scheme</option></select></label>
+  <label class="setting" for="segment">Steps per segment <select id="segment"><option value="2">2</option><option value="3">3</option><option value="4" selected>4</option><option value="6">6</option><option value="12">12</option></select></label>
+  <label class="setting" for="speed">Speed <select id="speed"><option value="0.5">0.5&#215;</option><option value="1" selected>1&#215;</option><option value="2">2&#215;</option></select></label>
+  <button id="jump" type="button">Jump to replay</button>
+  <button id="save-svg" type="button">Save this frame</button>
+</div>
+<div class="diagram" id="diagram" aria-label="Animated forward, replay and adjoint diagram"></div>
+<div class="scrub"><label for="position">Animation position</label><input id="position" type="range" min="0" max="1" step="1" value="0"><output id="position-value"></output></div>
+<p class="phase-note" id="phase-note" aria-live="polite"></p>
+<section class="explanation" aria-label="Three kinds of work">
+  <article><h2 style="color:var(--blue)">1. Adaptive forward solve</h2><p>Advance the physical solution to the final time. Record the accepted timesteps and sparse checkpoint carries. Rejected trials are discarded from the accepted trajectory.</p></article>
+  <article><h2 style="color:var(--green)">2. Forward reconstruction</h2><p>Restore a checkpoint and replay its accepted steps in the forward direction. Rebuild the internal stages and records needed by the local derivative. Do this for one segment at a time.</p></article>
+  <article><h2 style="color:var(--purple)">3. Backward adjoint sweep</h2><p>Move the objective sensitivity backward through the reconstructed steps and accumulate parameter sensitivities. Release the segment's temporary records, then repeat for the previous segment.</p></article>
+</section>
+<p class="footnote"><b>Approximately 3&#215; is a work estimate, not a measured runtime guarantee.</b> The meter assigns equal cost to a full forward trajectory, a full replay and a full adjoint sweep. Real costs differ; compilation, VMEC/NTX, objective batching, support pullbacks and checkpoint setup can add work. The two lower lanes run alternately, segment by segment.</p>
+<details><summary>What is actually saved, and how this maps to the current source</summary>
+  <p>The circles represent the evolving profiles, not a complete solver carry. A checkpoint also contains the numerical and transport state required for faithful replay. The stored schedule is lightweight metadata with O(N) entries; it is not a tape of every heavy carry or every Radau stage.</p>
+  <p>This animation shows the path that receives checkpoint carries from the adaptive run. In <code>NEOPAX/_transport_solvers.py</code>, <code>_radau_adaptive_final_y_realized_schedule_vjp_fwd_from_schedule_artifact</code> reuses <code>segment_start_carries_artifact</code> when available. Other paths can perform an additional accepted-schedule pass to build those checkpoints. Reusing a schedule alone does not prove that all such work was eliminated.</p>
+  <p>In <code>NEOPAX/_reverse_ad_transport.py</code>, the support reverse sweep restores each segment, obtains <code>step_start_carries</code> and <code>step_primal_records</code>, and runs accepted-step pullbacks in reverse order. In the recorded-forward reuse path, accepted-step Newton reuse decisions are retained without differentiating rejected attempts. The physical solution is not integrated backward in time, and the timestep controller is not differentiated in this accepted-schedule contract.</p>
+  <p>The schematic's three blocks do not claim that all reverse configurations have identical computation or memory. Checkpoint carries, stage records, shared database/support arrays and batched cotangents have different sizes. The buffer drawing counts records, not bytes. Increasing the segment size uses more temporary records and fewer checkpoint boundaries.</p>
+  <p>The final parameter pullback also includes initial profiles, the selected initial electric-field root, and geometry/database dependencies as applicable. Their cost is outside the equal-cost timeline. This page is an offline explanatory animation; it runs no transport, VMEC or NTX calculations.</p>
+  <p><a href="neopax_reverse_ad_cost.gif">Looping GIF</a> &middot; <a href="neopax_reverse_ad_cost.mp4">H.264 MP4 video</a> &middot; <a href="neopax_reverse_ad_cost.md">Notes and source references</a> &middot; <a href="accepted_step_ad.html">Accepted versus rejected steps animation</a></p>
+  <p>Minimal arrow style: <a href="neopax_reverse_ad_arrows.gif">GIF</a> &middot; <a href="neopax_reverse_ad_arrows.mp4">MP4</a> &middot; <a href="neopax_reverse_ad_arrows.svg">Static SVG</a>.</p>
+</details>
+</main>
+<script id="cost-model">
+(() => {
+  'use strict';
+  const colors={ink:'#172e3f',muted:'#61717a',blue:'#2466ad',green:'#17836b',purple:'#7951ac',line:'#d8dfdf',paper:'#fffefa',red:'#b65c55'};
+  const safe=text=>String(text).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&apos;'}[c]));
+  function timeline(length=4){
+    if(![2,3,4,6,12].includes(length))throw Error('Unsupported segment length');
+    const n=12,k=n/length;
+    const events=[{kind:'start'}];
+    for(let i=1;i<=n;i++)events.push({kind:'forward',i});
+    events.push({kind:'objective'});
+    for(let segment=k-1;segment>=0;segment--){
+      events.push({kind:'restore',segment});
+      for(let i=segment*length+1;i<=(segment+1)*length;i++)events.push({kind:'replay',i,segment});
+      for(let i=(segment+1)*length;i>segment*length;i--)events.push({kind:'adjoint',i,segment});
+      events.push({kind:'release',segment});
+    }
+    events.push({kind:'done'});
+    return {n,k,length,events};
+  }
+  function stateAt(model,index){
+    index=Math.max(0,Math.min(model.events.length-1,Math.floor(index)));
+    const state={index,event:model.events[index],forward:0,replay:0,adjoint:0,segment:null,buffer:[],reverseDone:[],completed:[],cost:0};
+    for(let j=0;j<=index;j++){
+      const e=model.events[j];
+      if(e.kind==='forward')state.forward=e.i;
+      if(e.kind==='restore'){state.segment=e.segment;state.buffer=[];state.reverseDone=[];}
+      if(e.kind==='replay'){state.replay++;state.buffer.push(e.i);}
+      if(e.kind==='adjoint'){state.adjoint++;state.reverseDone.push(e.i);}
+      if(e.kind==='release'){state.completed.push(e.segment);state.segment=null;state.buffer=[];state.reverseDone=[];}
+    }
+    state.cost=(state.forward+state.replay+state.adjoint)/model.n;
+    return state;
+  }
+  function describe(m,s){
+    const e=s.event,a=e.segment*m.length,b=a+m.length,segment=(e.segment??0)+1;
+    switch(e.kind){
+      case 'start':return {phase:'START',color:colors.ink,title:'A gradient needs the trajectory and its local derivatives',line:'Watch one adaptive solve, then a replay and an adjoint sweep for each segment.',note:'The blue lane advances the solution. Green reconstructs accepted steps. Purple carries the objective sensitivity backward.'};
+      case 'forward':return {phase:'FORWARD',color:colors.blue,title:`Adaptive solve: accepted step ${e.i} / ${m.n}`,line:'Advance the profiles; keep the accepted schedule and sparse checkpoint carries.',note:`Checkpoint boundaries occur every ${m.length} accepted steps. Full per-step Radau records are not retained across the whole trajectory.`};
+      case 'objective':return {phase:'OBJECTIVE',color:colors.purple,title:'Evaluate the objective at the final state',line:'Seed the terminal sensitivity: lambda_N = dJ / dy_N.',note:'The forward trajectory is complete. Now process the last segment first; the timestep schedule is held fixed.'};
+      case 'restore':return {phase:'RESTORE',color:colors.green,title:`Restore checkpoint C${e.segment}: segment ${segment} / ${m.k}`,line:`Load the carry at y${a}. The incoming adjoint is waiting at y${b}.`,note:'A checkpoint includes the solver and transport state required to reconstruct this segment, not just the plotted physical profiles.'};
+      case 'replay':return {phase:'REPLAY',color:colors.green,title:`Rebuild segment ${segment} / ${m.k}: step ${e.i-1} to ${e.i}`,line:'Replay this accepted step forward and retain its internal stages in the local buffer.',note:'Use the recorded accepted timestep and required numerical setup. No new adaptive search and no rejected-step derivative are shown here.'};
+      case 'adjoint':return {phase:'ADJOINT',color:colors.purple,title:`Differentiate segment ${segment} / ${m.k}: step ${e.i} to ${e.i-1}`,line:'Use the reconstructed stages to pass sensitivities backward and accumulate parameter sensitivities.',note:'This is a derivative pullback through the accepted step, including implicit-stage transpose solves; it is not a backward physical simulation.'};
+      case 'release':return {phase:'RELEASE',color:colors.green,title:`Segment ${segment} / ${m.k} finished: release its temporary records`,line:e.segment?'Keep the accumulated sensitivities and restore the previous checkpoint.':'All accepted-step sensitivities have reached the initial state.',note:'The local stage buffer is reused for the next segment. Completed segments do not accumulate another permanent stage tape.'};
+      case 'done':return {phase:'COMPLETE',color:colors.ink,title:'One forward + one replay + one adjoint: roughly 3x work',line:'All accepted steps were solved once, reconstructed once and differentiated once.',note:'Finish the initial-profile, initial-root and geometry/support pullbacks as applicable. Real runtime depends on their cost and on the selected reverse implementation.'};
+    }
+  }
+  function draw(model,index,progress=1){
+    const s=stateAt(model,index),d=describe(model,s),e=s.event,c=colors;
+    progress=Math.max(0,Math.min(1,progress));
+    const out=[];
+    const text=(x,y,str,size=16,fill=c.ink,weight=400,anchor='start',extra='')=>out.push(`<text x="${x}" y="${y}" fill="${fill}" font-size="${size}" font-weight="${weight}" text-anchor="${anchor}" ${extra}>${safe(str)}</text>`);
+    const rect=(x,y,w,h,fill,stroke='none',r=0,extra='')=>out.push(`<rect x="${x}" y="${y}" width="${w}" height="${h}" rx="${r}" fill="${fill}" stroke="${stroke}" ${extra}/>`);
+    const line=(x1,y1,x2,y2,stroke,width=2,extra='')=>out.push(`<line x1="${x1}" y1="${y1}" x2="${x2}" y2="${y2}" stroke="${stroke}" stroke-width="${width}" ${extra}/>`);
+    const circle=(x,y,r,fill,stroke='none',width=2)=>out.push(`<circle cx="${x}" cy="${y}" r="${r}" fill="${fill}" stroke="${stroke}" stroke-width="${width}"/>`);
+    const diamond=(x,y,fill,stroke=c.blue)=>out.push(`<path d="M ${x} ${y-8} l 8 8 l -8 8 l -8 -8 Z" fill="${fill}" stroke="${stroke}" stroke-width="1.8"/>`);
+    const arrow=(x1,y,x2,color,width=4)=>line(x1,y,x2,y,color,width,`marker-end="url(#arrow-${color.slice(1)})"`);
+    const x0=330,x1=1198,dx=(x1-x0)/model.n,x=i=>x0+i*dx;
+    out.push(`<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 888" role="img" aria-labelledby="svg-title svg-description"><title id="svg-title">NEOPAX checkpointed reverse AD: ${safe(d.phase)}</title><desc id="svg-description">${safe(d.title+'. '+d.line)}</desc><defs>`);
+    for(const color of [c.blue,c.green,c.purple])out.push(`<marker id="arrow-${color.slice(1)}" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 1 L 9 5 L 0 9 Z" fill="${color}"/></marker>`);
+    out.push('</defs><g font-family="Segoe UI, Arial, sans-serif">');
+    rect(0,0,1280,888,c.paper);
+    text(32,32,'NEOPAX   /   ~3x WORK WITH CHECKPOINTED REVERSE AD',12,c.muted,700,'start','letter-spacing="1"');
+    text(1246,32,'12 accepted steps · illustrative work, not measured seconds',12,c.muted,400,'end');
+    rect(24,48,1232,110,'#f2f5f4',c.line,12);
+    rect(42,65,110,25,d.color,'none',6);text(97,83,d.phase,12,'white',700,'middle','letter-spacing="1"');
+    text(170,85,d.title,20,c.ink,650);
+    text(42,124,d.line,17,c.muted);
+    text(330,185,'ACCEPTED STEP INDEX  (the recorded timesteps need not be equal)',11,c.muted,650,'start','letter-spacing=".6"');
+    for(let i=0;i<=model.n;i++)text(x(i),208,i,12,c.muted,500,'middle');
+    const lanes=[{y:253,title:'Adaptive forward',sub:'Physical trajectory',color:c.blue,step:s.forward},{y:392,title:'Forward replay',sub:'Rebuild one segment',color:c.green,step:s.replay},{y:518,title:'Reverse adjoint',sub:'Pass sensitivities back',color:c.purple,step:s.adjoint}];
+    const activeLane=e.kind==='forward'?0:['restore','replay','release'].includes(e.kind)?1:['adjoint','objective'].includes(e.kind)?2:-1;
+    for(let j=0;j<lanes.length;j++){
+      const l=lanes[j];
+      if(j===activeLane)rect(24,l.y-43,1232,95,l.color+'0a','none',12);
+      circle(56,l.y-6,19,j===activeLane?l.color:'#edf0ef');text(56,l.y+1,j+1,16,j===activeLane?'white':c.muted,700,'middle');
+      text(90,l.y-13,l.title,19,l.color,700);text(90,l.y+12,l.sub,13,c.muted);
+      line(x0,l.y,x1,l.y,'#d8e0df',3);
+    }
+    for(let seg=0;seg<model.k;seg++){
+      const left=x(seg*model.length),right=x((seg+1)*model.length),mid=(left+right)/2;
+      line(left+7,322,right-7,322,c.line,1.4);line(left+7,317,left+7,327,c.line,1.4);line(right-7,317,right-7,327,c.line,1.4);
+      text(mid,344,`SEGMENT ${seg+1}`,11,c.muted,650,'middle','letter-spacing="1"');
+      if(s.segment===seg){rect(left-15,361,right-left+30,66,c.green+'0a',c.green,10,'stroke-dasharray="5 5"');rect(left-15,484,right-left+30,67,c.purple+'07',c.purple,10,'stroke-dasharray="5 5"');}
+    }
+    for(let i=1;i<=s.forward;i++)arrow(x(i-1)+12,253,x(i)-14,c.blue);
+    for(let i=0;i<=model.n;i++)circle(x(i),253,8,i<=s.forward?c.blue:c.paper,i<=s.forward?c.blue:'#bfcaca');
+    for(const i of [3,8])if(s.forward>=i){
+      const xx=x(i)-27;line(xx-8,226,xx+8,210,c.red,2);line(xx-8,210,xx+8,226,c.red,2);
+      if(i===3)text(xx-12,218,'discarded trial',10,c.red,400,'end');
+    }
+    for(let j=0;j<=model.k;j++){
+      const i=j*model.length,ready=s.forward>=i;
+      diamond(x(i),287,ready?c.blue:c.paper,ready?c.blue:'#bfcaca');line(x(i),263,x(i),278,ready?c.blue:c.line,1.3);
+      text(x(i),310,j===model.k?'final':`C${j}`,12,ready?c.blue:c.muted,650,'middle');
+    }
+    for(let i=0;i<=model.n;i++){
+      const replayed=s.buffer.includes(i),reversePassed=(i===model.n&&s.forward===model.n)||(i<model.n&&s.adjoint>=model.n-i);
+      circle(x(i),392,6.5,replayed?c.green:c.paper,replayed?c.green:'#cbd4d4');
+      circle(x(i),518,6.5,reversePassed?c.purple:c.paper,reversePassed?c.purple:'#cbd4d4');
+    }
+    if(s.segment!==null){
+      const start=s.segment*model.length;
+      diamond(x(start),392,c.green,c.green);
+      for(const i of s.buffer)arrow(x(i-1)+12,392,x(i)-13,c.green);
+    }
+    for(let i=model.n;i>model.n-s.adjoint;i--)arrow(x(i)-12,518,x(i-1)+14,c.purple);
+    for(const seg of s.completed){const mid=(x(seg*model.length)+x((seg+1)*model.length))/2;text(mid,454,'records released',11,c.muted,400,'middle');}
+    if(s.forward===model.n){text(x1,238,'J(yN)',12,c.blue,700,'end');text(x1,479,'seed: dJ / dyN',12,c.purple,650,'end');}
+    if(e.kind==='adjoint')text(x(e.i)-dx/2,560,'local pullback',12,c.purple,650,'middle');
+    // The moving dot follows the current accepted step, not a rejected attempt.
+    if(['forward','replay','adjoint'].includes(e.kind)){
+      const j=e.kind==='forward'?0:e.kind==='replay'?1:2,l=lanes[j];
+      const from=e.kind==='adjoint'?e.i:e.i-1,to=e.kind==='adjoint'?e.i-1:e.i;
+      const xx=x(from)+(x(to)-x(from))*progress;
+      circle(xx,l.y,14,c.paper,l.color,2);circle(xx,l.y,5,l.color);
+    }
+    rect(24,592,610,162,'#f5f7f4',c.line,12);rect(650,592,606,162,'#f6f3f9',c.line,12);
+    text(44,621,'MEMORY: sparse checkpoints + one local stage buffer',14,c.ink,700);
+    const readyCheckpoints=Math.min(model.k,Math.floor(s.forward/model.length)+1);
+    for(let j=0;j<model.k;j++)diamond(54+j*27,648,j<readyCheckpoints?c.blue:c.paper,j<readyCheckpoints?c.blue:'#bac8cd');
+    text(54+model.k*27,653,`${readyCheckpoints} / ${model.k} start carries retained`,12,c.muted);
+    const slotWidth=27,slotX=44,slotY=673;
+    for(let j=0;j<model.n;j++)rect(slotX+j*(slotWidth+4),slotY,slotWidth,26,j<s.buffer.length?c.green:j<model.length?'#e4eee9':'#f5f7f4',j<model.length?c.green:'#d7dfdb',4,j>=model.length?'stroke-dasharray="3 3"':'');
+    text(44,719,`Temporary stage records: ${s.buffer.length} / ${model.length} slots used. Full tape: ${model.n}.`,13,c.muted);
+    text(44,739,'Record counts only; carries and records have different byte sizes.',11,c.muted);
+    text(671,621,'WHAT THE BACKWARD ARROW COMPUTES',14,c.ink,700);
+    text(671,650,'lambda_k = (dF_k / dy_k)^T lambda_(k+1)',16,c.purple,600);
+    text(671,679,'g += (dF_k / dp)^T lambda_(k+1)',16,c.purple,600);
+    text(671,709,'F_k is an accepted step; p denotes parameters.',13,c.muted);
+    text(671,736,'Full carry / shared-support dependencies are included in NEOPAX.',11,c.muted);
+    const meterX=40,meterY=799,meterWidth=1122/3;
+    text(40,784,'CUMULATIVE WORK  /  EQUAL-COST ILLUSTRATION',11,c.muted,700,'start','letter-spacing="1"');
+    for(let j=0;j<3;j++){
+      const l=lanes[j],fraction=l.step/model.n;
+      rect(meterX+j*meterWidth,meterY,meterWidth-6,23,'#e6ebe8','none',4);
+      if(fraction>0)rect(meterX+j*meterWidth,meterY,(meterWidth-6)*fraction,23,l.color,'none',4);
+      text(meterX+j*meterWidth+meterWidth/2-3,846,`${j===0?'Forward':j===1?'Replay':'Adjoint'}  ${(fraction).toFixed(2)}x`,13,l.color,700,'middle');
+    }
+    text(1240,818,`${s.cost.toFixed(2)}x`,25,c.ink,700,'end');
+    text(40,875,'Checkpoint reuse shown. Extra setup replay and unequal adjoint costs can change the total.',12,c.muted);
+    out.push('</g></svg>');return out.join('');
+  }
+  function drawArrows(model,index,progress=1){
+    const s=stateAt(model,index),e=s.event;
+    const green='#00b44b',orange='#ff7100',red='#d00000',ghost='#e7e7e7';
+    const left=90,right=1195,dx=(right-left)/model.n,x=i=>left+i*dx;
+    const rows={forward:160,replay:300,adjoint:448};
+    const out=['<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="588" viewBox="0 0 1280 588" role="img" aria-labelledby="arrow-title arrow-description">',
+      '<title id="arrow-title">NEOPAX: forward solve, checkpoint replay, reverse adjoint</title>',
+      '<desc id="arrow-description">Green arrows advance right. Red branches end in crosses for discarded trials. During the forward solve, green dots appear on the replay row to mark each recorded accepted timestep. Labeled black ticks mark saved checkpoint carries and the replay row is divided into numbered segments. Orange adjoint arrows advance left. A green replay segment disappears after its adjoint finishes and its temporary records are released; the accepted-schedule dots remain.</desc>',
+      '<rect width="1280" height="588" fill="white"/>'];
+    const line=(a,b,c,d,color,width=7)=>out.push(`<path d="M ${a} ${b} L ${c} ${d}" fill="none" stroke="${color}" stroke-width="${width}"/>`);
+    const arrow=(a,b,c,d,color)=>{
+      line(a,b,c,d,color);
+      const angle=Math.atan2(d-b,c-a),size=25,half=14;
+      const bx=c-size*Math.cos(angle),by=d-size*Math.sin(angle);
+      out.push(`<path d="M ${c} ${d} L ${bx-half*Math.sin(angle)} ${by+half*Math.cos(angle)} L ${bx+half*Math.sin(angle)} ${by-half*Math.cos(angle)} Z" fill="${color}"/>`);
+    };
+    for(let i=1;i<=model.n;i++){
+      arrow(x(i-1),rows.forward,x(i),rows.forward,i<=s.forward?green:ghost);
+      if(!s.completed.includes(Math.floor((i-1)/model.length))){
+        out.push(`<g data-lane="replay" data-step="${i}">`);
+        arrow(x(i-1),rows.replay,x(i),rows.replay,s.buffer.includes(i)?green:ghost);
+        out.push('</g>');
+      }
+      arrow(x(i),rows.adjoint,x(i-1),rows.adjoint,i>model.n-s.adjoint?orange:ghost);
+    }
+    // Discarded trial branches are illustrative, not a measured NEOPAX trace.
+    for(const i of [3,4,7,10,11])if(s.forward>=i){
+      const a=x(i-1)-12,b=rows.forward,c=a+95,d=b-75;
+      arrow(a,b,c,d,red);
+      for(const color of ['#710000',red]){
+        const width=color===red?7:11;
+        line(c-10,d-10,c+10,d+10,color,width);
+        line(c+10,d-10,c-10,d+10,color,width);
+      }
+    }
+    // These small persistent markers represent the accepted schedule, not a
+    // full carry/stage tape. Heavy carries are retained only at checkpoints.
+    for(let i=1;i<=s.forward;i++){
+      out.push(`<circle data-accepted-step="${i}" cx="${x(i)}" cy="${rows.replay}" r="7" fill="${green}" stroke="white" stroke-width="2.5"/>`);
+    }
+    for(let segment=0;segment<model.k;segment++){
+      const center=x((segment+.5)*model.length),active=s.segment===segment;
+      out.push(`<text x="${center}" y="270" text-anchor="middle" font-family="Arial, sans-serif" font-size="23" fill="${active?green:'#404040'}">Segment ${segment+1}</text>`);
+    }
+    for(let i=model.length;i<model.n;i+=model.length){
+      line(x(i),rows.replay-48,x(i),rows.replay+48,'#151515',2.5);
+      out.push(`<text x="${x(i)}" y="236" text-anchor="middle" font-family="Arial, sans-serif" font-size="19" fill="#151515">Checkpoint ${i/model.length}</text>`);
+    }
+    // A moving endpoint shows the currently executing accepted operation.
+    if(['forward','replay','adjoint'].includes(e.kind)&&progress<1){
+      const reverse=e.kind==='adjoint',a=x(reverse?e.i:e.i-1),b=x(reverse?e.i-1:e.i);
+      const color=reverse?orange:green;
+      const p=Math.max(0,Math.min(1,progress));
+      out.push(`<circle cx="${a+(b-a)*p}" cy="${rows[e.kind]}" r="8" fill="${color}"/>`);
+    }
+    out.push('</svg>');return out.join('');
+  }
+  function check(){
+    const runs=[];
+    for(const length of [2,3,4,6,12]){
+      const m=timeline(length);let maxBuffer=0;const reverseIndices=[];
+      for(let i=0;i<m.events.length;i++){
+        const s=stateAt(m,i),svg=draw(m,i),e=s.event;
+        if(s.buffer.length>length)throw Error('Stage buffer exceeded segment length');
+        maxBuffer=Math.max(maxBuffer,s.buffer.length);
+        if(s.buffer.some(k=>Math.floor((k-1)/length)!==s.segment))throw Error('Buffer crossed a segment boundary');
+        if(e.kind==='adjoint'){
+          if(s.buffer.length!==length)throw Error('Adjoint started before segment reconstruction');
+          reverseIndices.push(e.i);
+        }
+        if(/NaN|undefined/.test(svg))throw Error('Invalid SVG');
+        if((svg.match(/<svg\b/g)||[]).length!==1)throw Error('Invalid SVG root');
+      }
+      const end=stateAt(m,m.events.length-1);
+      if(end.forward!==12||end.replay!==12||end.adjoint!==12||end.cost!==3||end.buffer.length!==0)throw Error('Incorrect final work or retained records');
+      if(reverseIndices.some((v,i)=>v!==12-i))throw Error('Incorrect adjoint ordering');
+      runs.push({segmentLength:length,frames:m.events.length,maxStageRecords:maxBuffer,forwardSteps:end.forward,replayedSteps:end.replay,adjointSteps:end.adjoint,totalIllustratedCost:end.cost});
+    }
+    return runs;
+  }
+  globalThis.NEOPAXCost={timeline,stateAt,describe,draw,drawArrows,check};
+})();
+</script>
+<script id="cost-ui">
+(() => {
+  'use strict';
+  const $=id=>document.getElementById(id),api=globalThis.NEOPAXCost;
+  let model=api.timeline(4),index=0,playing=false,elapsed=0,last=null,appearance='detailed';
+  const reducedMotion=window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+  function render(progress=1){
+    $('diagram').innerHTML=(appearance==='arrows'?api.drawArrows:api.draw)(model,index,progress);
+    $('diagram').style.cssText=appearance==='arrows'?'border:0;border-radius:0;box-shadow:none;background:white':'';
+    $('position').max=model.events.length-1;$('position').value=index;
+    $('position-value').textContent=`${index+1} / ${model.events.length}`;
+    const d=api.describe(model,api.stateAt(model,index));
+    const strong=document.createElement('strong');strong.textContent=d.phase+': ';
+    $('phase-note').replaceChildren(strong,document.createTextNode(d.note));
+    $('previous').disabled=index===0;$('next').disabled=index===model.events.length-1;
+  }
+  function setPlaying(value){playing=value;last=null;$('play').textContent=playing?'Pause':'Play';}
+  function setFrame(value){setPlaying(false);elapsed=0;index=Math.max(0,Math.min(model.events.length-1,Math.floor(value)));render();}
+  function setStyle(value){appearance=value==='arrows'?'arrows':'detailed';$('appearance').value=appearance;render();}
+  $('appearance').addEventListener('change',()=>setStyle($('appearance').value));
+  $('play').addEventListener('click',()=>{if(index===model.events.length-1){index=0;elapsed=0;render();}setPlaying(!playing);});
+  $('previous').addEventListener('click',()=>setFrame(index-1));
+  $('next').addEventListener('click',()=>setFrame(index+1));
+  $('restart').addEventListener('click',()=>{index=0;elapsed=0;render();setPlaying(!reducedMotion);});
+  $('position').addEventListener('input',()=>setFrame(+$('position').value));
+  $('segment').addEventListener('change',()=>{model=api.timeline(+$('segment').value);index=0;elapsed=0;render();setPlaying(!reducedMotion);});
+  $('jump').addEventListener('click',()=>setFrame(model.events.findIndex(e=>e.kind==='restore')));
+  $('save-svg').addEventListener('click',()=>{
+    const blob=new Blob([(appearance==='arrows'?api.drawArrows:api.draw)(model,index)],{type:'image/svg+xml;charset=utf-8'}),url=URL.createObjectURL(blob);
+    const a=document.createElement('a');a.href=url;a.download=`neopax_reverse_ad_${String(index).padStart(3,'0')}.svg`;a.click();setTimeout(()=>URL.revokeObjectURL(url),1000);
+  });
+  function animate(now){
+    if(playing){
+      if(last!==null)elapsed+=(now-last)*Number($('speed').value);
+      last=now;
+      const kind=model.events[index].kind;
+      const duration=['forward','replay','adjoint'].includes(kind)?650:kind==='done'?3000:1200;
+      if(elapsed>=duration){elapsed=0;index=index===model.events.length-1?0:index+1;}
+      render(Math.min(1,elapsed/650));
+    }
+    requestAnimationFrame(animate);
+  }
+  // This small API also allows deterministic browser previews and GIF export.
+  globalThis.NEOPAXCostUI={setFrame,setStyle,render,model:()=>model,playing:()=>playing};
+  const params=new URLSearchParams(location.search);
+  if(params.get('style')==='arrows')setStyle('arrows');
+  if(params.has('frame'))setFrame(Number(params.get('frame')));else{render();setPlaying(!reducedMotion);}
+  document.documentElement.dataset.animationReady='true';
+  requestAnimationFrame(animate);
+})();
+</script>
+</body>
+</html>

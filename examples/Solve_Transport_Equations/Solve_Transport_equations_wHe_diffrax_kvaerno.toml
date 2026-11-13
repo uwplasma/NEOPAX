@@ -108,6 +108,8 @@ value = 0.0
 type = "floating_ambipolar_edge"
 
 [equations]
+match_THe = false # true: helium temperature and gradient follow evolving deuterium
+match_workHe = false # true: NTSS neoclassical electric work with He split equally into D/T
 toggle_density = [false, false, false, true]
 toggle_temperature = [true, true, true, false]
 toggle_Er = true

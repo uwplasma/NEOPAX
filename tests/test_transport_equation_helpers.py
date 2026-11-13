@@ -1,6 +1,7 @@
 import dataclasses
 from types import SimpleNamespace
 
+import jax
 import jax.numpy as jnp
 
 from NEOPAX._boundary_conditions import BoundaryConditionModel
@@ -212,7 +213,7 @@ def test_project_fixed_temperature_species_only_changes_inactive_rows():
     assert jnp.allclose(out.pressure[1], jnp.array([21.0, 21.0]))
 
 
-def test_apply_er_dirichlet_boundary_state_clamps_endpoints():
+def test_apply_er_dirichlet_boundary_state_preserves_cell_centres():
     bc = BoundaryConditionModel(
         dr=1.0,
         left_type="dirichlet",
@@ -227,7 +228,9 @@ def test_apply_er_dirichlet_boundary_state_clamps_endpoints():
     )
 
     out = apply_er_dirichlet_boundary_state(state, bc)
-    assert jnp.allclose(out.Er, jnp.array([1.5, 3.0, 4.0, -2.0]))
+    # Dirichlet values constrain FV faces; they do not overwrite cell centres.
+    assert out is state
+    assert jnp.allclose(out.Er, jnp.array([0.0, 3.0, 4.0, 5.0]))
 
 
 def test_expand_density_rhs_to_full_shape_inserts_zero_electron_row():

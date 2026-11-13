@@ -47,6 +47,14 @@ from ._transport_flux_models import (
     get_transport_flux_model,
 )
 from ._boundary_conditions import left_constraints_from_bc_model, right_constraints_from_bc_model
+from ._temperature_constraints import (
+    helium_temperature_match_indices,
+    helium_work_match_indices,
+    matched_helium_temperature_profile,
+    match_helium_temperature_boundary,
+    match_helium_temperature_row,
+    match_helium_temperature_state,
+)
 
 try:
     import tomli as toml
@@ -272,6 +280,8 @@ def _load_user_extensions(config: dict) -> None:
 
 
 def _normalize_solver_config(config: dict) -> dict:
+    from ._transport_equations import _validate_er_diffusion_mode, _validate_convection_temperature_mode
+
     solver_cfg = config.get("transport_solver", {})
     if not solver_cfg:
         solver_cfg = config.get("solver", config.get("transport", {}))
@@ -295,7 +305,20 @@ def _normalize_solver_config(config: dict) -> dict:
     solver_cfg["transport_center_flux_mode"] = _resolve_transport_center_flux_mode(config)
     solver_cfg.setdefault("Er_relax", 1.0)
     solver_cfg.setdefault("DEr", 1.0)
+    solver_cfg["Er_diffusion_mode"] = _validate_er_diffusion_mode(
+        solver_cfg.get("Er_diffusion_mode", "neopax")
+    )
+    solver_cfg["temperature_convection_temperature_mode"] = _validate_convection_temperature_mode(
+        solver_cfg.get("temperature_convection_temperature_mode", "upwind")
+    )
     solver_cfg.setdefault("density_floor", 1.0e-6)
+    match_indices = helium_temperature_match_indices(
+        config, config.get("species", {}).get("names", ("e", "D", "T"))
+    )
+    if match_indices is not None and "temperature_floor" in solver_cfg:
+        solver_cfg["temperature_floor"] = match_helium_temperature_row(
+            solver_cfg["temperature_floor"], match_indices
+        )
     return solver_cfg
 
 
@@ -325,6 +348,8 @@ def _build_species(config: dict) -> Species:
     mass_mp = jnp.asarray(species_cfg.get("mass_mp", [0.000544617, 2.0, 3.0]), dtype=float)
     charge_qp = jnp.asarray(species_cfg.get("charge_qp", [-1.0, 1.0, 1.0]), dtype=float)
     names = tuple(species_cfg.get("names", ["e", "D", "T"]))
+    helium_temperature_match_indices(config, names)
+    helium_work_match_indices(config, names)
     return Species(
         number_species=n_species,
         species_indices=jnp.arange(n_species),
@@ -396,14 +421,22 @@ def _build_state(config: dict, geometry, species: Species):
         "temperature_floor",
         config.get("solver", {}).get("temperature_floor"),
     )
+    match_indices = helium_temperature_match_indices(config, species.names)
+    temperature_floor = match_helium_temperature_row(temperature_floor, match_indices)
     temperature_state = safe_temperature(temperature_state, temperature_floor)
-    return TransportState(
+    state = TransportState(
         density=density_state,
         # Keep configured temperatures well-defined even when a species starts at
         # zero concentration, so downstream Er initialization does not collapse
         # that species to T=0 through the pressure/density representation.
         pressure=temperature_state * safe_density(density_state, density_floor),
         Er=profile_set.Er,
+    )
+    return match_helium_temperature_state(
+        # Initial raw densities may be zero. Match the public TransportState
+        # temperature representation here; the solver reapplies this closure
+        # after its configured density floor when preparing the working state.
+        state, matched_helium_temperature_profile(temperature_state, match_indices), None
     )
 
 
@@ -739,6 +772,9 @@ def _build_flux_model(config: dict, species, energy_grid, geometry, database, so
             dr,
             species_names=species.names,
         )
+    bc_temperature = match_helium_temperature_boundary(
+        bc_temperature, helium_temperature_match_indices(config, species.names)
+    )
 
     neoclassical_name = _model_name(neoclassical_cfg, "ntx_database")
     neoclassical_factory = get_transport_flux_model(neoclassical_name)
@@ -1082,6 +1118,7 @@ def prepare_transport_solver_components(
     from ._transport_equations import ComposedEquationSystem, build_equation_system
     from ._transport_solvers import build_time_solver
 
+    match_indices = helium_temperature_match_indices(config, runtime.species.names)
     field = runtime.geometry
     boundary_cfg = _normalized_boundary_cfg_for_transport(config.get("boundary", {}))
     bc = {}
@@ -1093,6 +1130,8 @@ def prepare_transport_solver_components(
                 dr,
                 species_names=runtime.species.names if key in {"density", "temperature", "gamma"} else None,
             )
+    if "temperature" in bc:
+        bc["temperature"] = match_helium_temperature_boundary(bc["temperature"], match_indices)
 
     er_bc_mode = _resolve_er_right_boundary_mode(config, runtime.solver_parameters)
     if er_bc_mode == "ambipolar_edge_root":
@@ -1185,6 +1224,9 @@ def prepare_transport_solver_components(
         fixed_temperature_profile = configured_profiles.temperature / 1.0e3
     except Exception:
         fixed_temperature_profile = state.temperature
+    fixed_temperature_profile = matched_helium_temperature_profile(
+        fixed_temperature_profile, match_indices
+    )
     equation_system = ComposedEquationSystem(
         tuple(equations_to_evolve),
         density_equation=next((eq for eq in equations_to_evolve if getattr(eq, "name", None) == "density"), None),
@@ -1785,6 +1827,11 @@ def run_transport(config: dict, runtime: RuntimeContext, state: TransportState):
                     dr,
                     species_names=runtime.species.names if key in {"density", "temperature", "gamma"} else None,
                 )
+        if "temperature" in transport_boundary_models:
+            transport_boundary_models["temperature"] = match_helium_temperature_boundary(
+                transport_boundary_models["temperature"],
+                helium_temperature_match_indices(config, runtime.species.names),
+            )
     if do_plot or do_hdf5 or do_bootstrap_evolution or do_residual_compare:
         if output_dir is None:
             output_dir = Path("outputs")
@@ -2106,7 +2153,7 @@ def _load_ntss_reference_profiles(path_value, rho):
                 ne_ref = _interp_dataset("ne")
                 te_ref = _interp_first("Te")
                 if zeff is not None and ne_ref is not None and te_ref is not None:
-                    pbrems_power = (3.16e-1 * zeff * ne_ref * ne_ref * jnp.sqrt(jnp.maximum(te_ref, 0.0))) / 62.422
+                    pbrems_power = (3.34e-1 * zeff * ne_ref * ne_ref * jnp.sqrt(jnp.maximum(te_ref, 0.0))) / 62.422
             if vr is not None:
                 if flux_ge_neo is not None:
                     profiles["flux_species"]["Gamma_neo"]["e"] = flux_ge_neo * vr
@@ -2175,6 +2222,9 @@ def _load_ntss_reference_profiles(path_value, rho):
             if he_source is not None:
                 profiles["scalar"]["he_source"] = he_source
             power_terms = [term for term in (alpha_power, ecrh_power, nbi_power_e, nbi_power_i) if term is not None]
+            if pbrems_power is not None:
+                # Match NEOPAX's signed source sum: heating minus radiation.
+                power_terms.append(-pbrems_power)
             if power_terms:
                 total_power_source = power_terms[0]
                 for term in power_terms[1:]:
@@ -2876,7 +2926,7 @@ def plot_transport_solution(
                     ne_ref = _interp_dataset("ne")
                     te_ref = _interp_first("Te")
                     if zeff is not None and ne_ref is not None and te_ref is not None:
-                        pbrems_power = (3.16e-1 * zeff * ne_ref * ne_ref * jnp.sqrt(jnp.maximum(te_ref, 0.0))) / 62.422
+                        pbrems_power = (3.34e-1 * zeff * ne_ref * ne_ref * jnp.sqrt(jnp.maximum(te_ref, 0.0))) / 62.422
                 if vr is not None:
                     if flux_ge_neo is not None:
                         profiles["flux_species"]["Gamma_neo"]["e"] = flux_ge_neo * vr
@@ -2945,6 +2995,9 @@ def plot_transport_solution(
                 if he_source is not None:
                     profiles["scalar"]["he_source"] = he_source
                 power_terms = [term for term in (alpha_power, ecrh_power, nbi_power_e, nbi_power_i) if term is not None]
+                if pbrems_power is not None:
+                    # The plotted NEOPAX source sum already includes this sink.
+                    power_terms.append(-pbrems_power)
                 if power_terms:
                     total_power_source = power_terms[0]
                     for term in power_terms[1:]:
@@ -3019,6 +3072,7 @@ def plot_transport_solution(
             "Pressure": r"$p$ [$10^{20} m^{-3} keV$]",
             "Er": r"$E_r$ [$\mathrm{kV}/\mathrm{m}$]",
             "Total Power Source [MW/m^3]": r"Total Power Source [$MW/m^3$]",
+            "Net Power Source [MW/m^3]": r"Net Power Source [$MW/m^3$]",
             "Alpha Particle Source [1e20 m^-3 s^-1]": r"Alpha Particle Source [$10^{20} m^{-3} s^{-1}$]",
             "Total Heat Flux [MW]": r"Total Heat Flux [$MW$]",
             "Neo Heat Flux [MW]": r"Neo Heat Flux [$MW$]",
@@ -3781,9 +3835,9 @@ def plot_transport_solution(
 
     power_sources_png = _plot_scalar_time_series(
         power_source_series,
-        "Total Power Source [MW/m^3]",
+        "Net Power Source [MW/m^3]",
         "transport_power_sources_total.png",
-        title="Summed Power Sources vs rho",
+        title="Net Power Sources vs rho",
         reference_key="power_sources_total",
     )
 

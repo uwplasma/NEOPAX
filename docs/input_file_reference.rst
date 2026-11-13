@@ -392,6 +392,8 @@ Common keys:
 - ``toggle_density``
 - ``toggle_temperature``
 - ``toggle_Er``
+- ``match_THe`` (default ``false``)
+- ``match_workHe`` (default ``false``)
 
 Example:
 
@@ -401,6 +403,55 @@ Example:
     toggle_density = [false, false, false]
     toggle_temperature = [true, true, true]
     toggle_Er = true
+
+For the NTSSfusion helium-temperature closure, use:
+
+.. code-block:: toml
+
+    [equations]
+    toggle_density = [false, false, false, true]
+    toggle_temperature = [true, true, true, false]
+    toggle_Er = true
+    match_THe = true
+
+With species named ``e``, ``D``, ``T``, and ``He``, this makes helium's
+temperature and temperature gradient follow the evolving deuterium profile.
+Species ordering may differ. Helium has no independent temperature equation;
+its temperature toggle must remain ``false``. The closure applies during flux
+and source evaluation, solver state projection, checkpoint reconstruction, and
+saved-state output. Species-specific helium thermal boundary values and
+temperature floors inherit the deuterium entries when matching is enabled.
+
+Leaving ``match_THe`` absent or setting it to ``false`` preserves the existing
+behavior, including a fixed initial helium temperature when its temperature
+equation is disabled. This option does not change radiation coefficients,
+electric-work conventions, or the configured source list.
+
+For NTSSfusion's electric-work convention, set ``match_workHe = true`` in
+``[equations]``. It is independent of ``match_THe``. With helium's temperature
+equation disabled, this uses neoclassical particle fluxes and assigns half of
+the signed helium electric work to D and half to T:
+
+.. math::
+
+    W_e &= -E_r\Gamma_e^\mathrm{neo},\\
+    W_D &= E_r(\Gamma_D^\mathrm{neo}+\Gamma_\mathrm{He}^\mathrm{neo}),\\
+    W_T &= E_r(\Gamma_T^\mathrm{neo}+\Gamma_\mathrm{He}^\mathrm{neo}).
+
+These expressions use the normalized transport units and standard charges
+``[-1, 1, 1, 2]``; the implementation uses the configured species charges.
+The helium work row is zero after redistribution. The pressure equations
+retain their existing ``2/3`` energy-to-pressure factor. This option selects
+the local centre work source, as NTSS does, including when a face-completed
+work reconstruction was otherwise configured. It requires species named
+``e``, ``D``, ``T`` and ``He``, with helium's temperature toggle ``false``.
+The flux model must expose ``Gamma_neo`` or ``Gamma_neo_faces``. Disabling
+``temperature_include_work_term`` still disables all electric work.
+
+With ``match_workHe = false`` or absent, the original total-particle-flux
+work calculation and its configured reconstruction are preserved. This switch
+does not change particle fluxes, ambipolarity, alpha heating, radiation, or
+the helium-temperature closure.
 
 
 ``[sources]`` and ``[sources.parameters.*]``
@@ -454,9 +505,53 @@ Common keys include:
 - ``save_n``
 - density/temperature floors
 - transport-physics toggles such as work/convection switches
+- ``Er_diffusion_mode`` (default ``"neopax"``)
+- ``temperature_convection_temperature_mode`` (default ``"upwind"``)
 
 For the solver algorithms themselves, especially the custom Radau backend and
 the shared ``rhs_mode`` options, see :doc:`solver_backends`.
+
+To use NTSSfusion's electric-field diffusion flux, set:
+
+.. code-block:: toml
+
+    [transport_solver]
+    Er_diffusion_mode = "ntssfusion"
+
+The default ``"neopax"`` retains the existing face flux ``-dEr/dr``.
+``"ntssfusion"`` uses ``-dEr/dr + Er/r`` before applying the same
+volume-weighted divergence, ``DEr`` and ``Er_relax`` factors. Face electric
+fields use the existing reconstruction and boundary constraints, including an
+explicit outer-face node when configured. At a face with radius zero the
+regular flux is set to zero without evaluating a singular division. The
+floating outer-edge ambipolar RHS remains the existing boundary condition.
+This option is independent of ``Er_permittivity_mode``, ``match_THe`` and
+``match_workHe``. Omitting it preserves the original operator. Forward and
+reverse calculations use the same selected diffusion flux.
+
+To multiply convective particle fluxes by the same reconstructed face
+temperature used in the transport model, set:
+
+.. code-block:: toml
+
+    [transport_solver]
+    temperature_convection_temperature_mode = "face"
+
+The default ``"upwind"`` retains the existing sign-based upstream
+temperature selection, including the configured TVD reconstruction where
+applicable. ``"face"`` uses the face-state temperature with the same
+reconstruction, temperature floor and boundary conditions as the model's
+face evaluation. It forms ``Gamma_face * T_face`` for every enabled
+neoclassical, turbulent or classical convection contribution, then adds it
+to ``Q_face`` before the same conservative divergence. It does not change
+which convection channels are enabled or how their particle fluxes are
+obtained; ``temperature_convection_reconstruction = "closure_face_flux"``
+continues to select model-evaluated face particle fluxes. The face
+temperature is reconstructed algebraically without an extra flux-model
+call, and its profile/geometry dependence is included in reverse AD.
+This option aligns the temperature used in convection and model fluxes;
+it does not change the underlying face-state construction to NTSS's
+midpoint-pressure-over-midpoint-density prescription.
 
 Example:
 

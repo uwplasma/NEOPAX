@@ -1,0 +1,235 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Cooling water: accepted-step AD and rejected trials</title>
+<style>
+:root{color-scheme:light;--ink:#182c43;--muted:#56667a;--blue:#1766a6;--orange:#b04e0b;--red:#bc3348;--line:#dce3eb;--paper:#fff;--bg:#f3f6fa}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:16px/1.5 system-ui,sans-serif}main{max-width:1220px;margin:30px auto;padding:0 22px 40px}h1{font-size:clamp(25px,4vw,38px);line-height:1.15;letter-spacing:-.025em;margin:8px 0 12px}h2{font-size:18px;margin:0 0 10px}p{margin:8px 0}.tag{font-size:12px;letter-spacing:.1em;text-transform:uppercase;color:var(--blue);font-weight:750}.muted{color:var(--muted)}.equation{font:20px/1.5 ui-monospace,monospace}.panel{background:var(--paper);border:1px solid var(--line);border-radius:14px;padding:20px}.controls{display:grid;grid-template-columns:1fr 1fr 1fr;gap:24px;margin:22px 0 14px}label{display:block;font-weight:650}input[type=range]{width:100%;accent-color:var(--blue)}output{float:right;color:var(--blue);font-variant-numeric:tabular-nums}small{font-size:12px;color:var(--muted)}.cards{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin-bottom:14px}.card strong{display:block;font:700 25px/1.4 ui-monospace,monospace}.card.selected{border:2px solid var(--blue);padding:19px}.card.orange.selected{border-color:var(--orange)}.card .value-label{font-size:13px;font-weight:650}.grid{display:grid;grid-template-columns:1.5fr 1fr;gap:14px}.chart-panel{min-width:0}.chart{width:100%;display:block}.legend{display:flex;flex-wrap:wrap;gap:14px;font-size:12px}.legend span:before{content:'●';margin-right:5px}.blue{color:var(--blue)}.red{color:var(--red)}.orange{color:var(--orange)}.gray{color:#718197}.playback{margin:16px 0 12px;display:flex;align-items:center;flex-wrap:wrap;gap:8px}button{background:#edf3fa;border:1px solid #cbd7e5;border-radius:7px;padding:8px 13px;color:var(--ink);font:600 14px system-ui;cursor:pointer}button.primary{background:var(--blue);color:white;border-color:var(--blue)}button:hover{filter:brightness(.95)}button:focus-visible,input:focus-visible{outline:3px solid #d39217;outline-offset:3px}.scrub-label{font-weight:400;font-size:13px}.mode{border:0;padding:0;margin:0 0 12px}.mode legend{font-weight:700;margin-bottom:8px}.mode label{font-size:14px;font-weight:450;margin:5px 0}.mode input{accent-color:var(--blue)}.phase{display:inline-block;padding:3px 10px;border-radius:20px;background:#edf3fa;font-size:12px;font-weight:750}.status{min-height:105px}.numbers{font:14px/1.8 ui-monospace,monospace;white-space:pre-wrap;border-top:1px solid var(--line);padding-top:10px}.explain{font-size:14px;margin-top:14px}.flow{width:100%;height:auto;margin:4px 0}.note{margin-top:14px;font-size:14px}.tablewrap{overflow:auto}table{border-collapse:collapse;width:100%;font-size:13px;margin-top:12px}th,td{text-align:right;padding:7px 8px;border-bottom:1px solid var(--line);white-space:nowrap}th:first-child,td:first-child{text-align:left}tr.current{background:#eaf2fb}details{margin-top:14px}summary{cursor:pointer;font-weight:650}.check{font-size:12px;line-height:1.6;margin-top:10px}.footer{margin-top:18px;font-size:13px}code{font-size:.95em}a{color:var(--blue)}@media(max-width:850px){.grid{grid-template-columns:1fr}.controls{gap:12px}.card strong{font-size:19px}.panel{padding:14px}.card.selected{padding:13px}}@media(max-width:560px){.controls,.cards{grid-template-columns:1fr}main{padding:0 12px}.status{min-height:85px}}
+</style>
+</head>
+<body>
+<main>
+<div class="tag">A physical example · interactive animation · runs offline</div>
+<h1>Cooling water: what are we differentiating?</h1>
+<p>A cup starts at <b>80 °C</b> in a <b>20 °C</b> room. How does its temperature after <b>10 minutes</b> change when heat loss becomes faster?</p>
+<p class="equation">dT/dt = −k(T − 20) &nbsp; → &nbsp; dT(10)/dk</p>
+<p class="muted">Compare accepted-only AD with AD over all attempted steps. Timesteps, the controller and accept/reject decisions are frozen in both. A rejected trial does not change the cup's accepted temperature.</p>
+
+<section class="controls panel" aria-label="Model and solver settings">
+<div><label for="rate">Heat-loss rate k <output id="rate-value"></output></label><input id="rate" type="range" min="0.05" max="0.5" step="0.01" value="0.2"><small>min⁻¹ · larger means faster cooling</small></div>
+<div><label for="tolerance">Allowed local error <output id="tolerance-value"></output></label><input id="tolerance" type="range" min="0.1" max="2" step="0.05" value="0.6"><small>°C · smaller means finer accepted steps</small></div>
+<div><label for="first-step">First trial timestep <output id="first-step-value"></output></label><input id="first-step" type="range" min="1" max="10" step="0.5" value="6"><small>minutes · a large first trial may be rejected</small></div>
+</section>
+
+<section class="cards" aria-label="Gradient comparison">
+<div id="frozen-card" class="card panel selected"><div class="value-label blue">Accepted steps only</div><strong id="frozen-gradient"></strong><small>Skip rejected trial computations during AD.</small></div>
+<div id="attempt-card" class="card panel orange"><div class="value-label orange">Accepted + rejected attempts</div><strong id="attempt-gradient"></strong><small>Differentiate the accept/reject state selection.</small></div>
+<div class="card panel"><div class="value-label muted">Exact continuous cooling law</div><strong id="exact-gradient"></strong><small>Reference: −10 × 60 × exp(−10k).</small></div>
+</section>
+
+<div class="grid">
+<section class="panel chart-panel">
+<h2 id="chart-title">Temperature versus time</h2>
+<svg id="trajectory" class="chart" viewBox="0 0 820 380" role="img" aria-labelledby="chart-title chart-desc"><desc id="chart-desc">Accepted cooling states, discarded trial temperatures, and the exact cooling curve.</desc></svg>
+<div class="legend"><span class="blue">Accepted state</span><span class="red">Rejected trial ×</span><span class="gray">Exact cooling curve</span></div>
+<div class="playback">
+<button id="play" class="primary" type="button">Play animation</button>
+<button id="previous" type="button" aria-label="Previous frame">←</button>
+<button id="next" type="button" aria-label="Next frame">→</button>
+<button id="reverse" type="button">Jump to reverse</button>
+<button id="reset" type="button">Reset</button>
+</div>
+<label class="scrub-label" for="frame">Animation frame <output id="frame-label"></output></label>
+<input id="frame" type="range" min="0" max="1" step="1" value="0">
+<p id="forward-summary" class="muted"></p>
+</section>
+
+<section class="panel">
+<fieldset class="mode"><legend>Which AD graph should the animation follow?</legend>
+<label><input type="radio" name="contract" value="frozen" checked> AD through accepted steps only</label>
+<label><input type="radio" name="contract" value="attempts"> AD through all attempts, masking rejected updates</label>
+</fieldset>
+<p class="muted"><b>Controller derivatives are OFF in both modes.</b></p>
+<div class="status" aria-live="polite"><span id="phase" class="phase"></span><h2 id="event-title"></h2><p id="event-text"></p></div>
+<svg id="flow" class="flow" viewBox="0 0 450 218" role="img" aria-label="A rejected trial has no state-update edge, but its error can feed the timestep controller"></svg>
+<div id="numbers" class="numbers"></div>
+<p id="contract-note" class="explain"></p>
+<div id="fd-check" class="check muted"></div>
+</section>
+</div>
+
+<details class="panel"><summary>Inspect every trial and its gradient contribution</summary>
+<p class="muted">Each contribution is the reverse-mode sensitivity arriving at k through operations in that trial. They sum to the corresponding gradient above.</p>
+<div class="tablewrap"><table><thead><tr><th>Trial</th><th>Decision</th><th>Start (min)</th><th>h (min)</th><th>Error (°C)</th><th>Accepted-only contribution</th><th>All-attempts contribution</th></tr></thead><tbody id="trace-table"></tbody></table></div>
+</details>
+
+<section class="panel note">
+<h2>How this connects to NEOPAX</h2>
+<p>This is a <b>toy implicit-Euler cooling solver</b>, not a NEOPAX measurement or Radau implementation. The accepted update solves the cooling equation implicitly. Step doubling estimates its error; a controller chooses the next timestep.</p>
+<p>NEOPAX's accepted-step adjoint holds the realized timestep schedule fixed. This animation compares omitting rejected trials from the AD calculation against retaining them with <code>T_next = where(accept, T_trial, T_old)</code>. On rejection, the state derivative is the identity and the cotangent into the discarded trial is zero. <b>For this finite, well-behaved example, both gradients agree.</b></p>
+<p>Diffrax's default checkpointed adjoint runs over attempted iterations, while its integrator selects the old physical state and old solver state on rejection. Its PID controller stops gradients through the error-based adaptation factor. See <a href="https://github.com/patrick-kidger/diffrax/blob/main/diffrax/_integrate.py">the rejection implementation</a>, <a href="https://github.com/patrick-kidger/diffrax/blob/main/diffrax/_step_size_controller/pid.py">the PID implementation</a>, and <a href="https://docs.kidger.site/diffrax/api/adjoints/">the adjoint documentation</a>. This toy tape is illustrative; its node counts do not measure Diffrax's compiled work or memory.</p>
+<p>Why can a real implementation still differ? A discarded computation can contain a singular or nonfinite derivative; a numerical VJP may then evaluate zero times infinity/NaN. Or auxiliary differentiable state may survive rejection and influence later accepted steps. Neither effect is present in this toy solver, and merely having rejected trials does not prove either problem.</p>
+<p>Real NEOPAX rejected attempts can also update numerical caches. That replay issue is absent from this memory-free toy. Accurate implicit stage derivatives require the correct converged stages, not identical Newton iteration counts.</p>
+<p><b>Historical NEOPAX caveat:</b> before commit <code>0fed61d</code> (June 23, 2026), the attempt replay preserved the plasma state but replaced cached transport/reference data with stopped-gradient rejected-attempt outputs. That is not the unchanged-memory assumption of this animation. See the <a href="kvaerno5_vs_neopax_attempt_map.md">source comparison and real Kvaerno5 scalar check</a>; the earlier large-gradient result is not explained by this animation alone.</p>
+</section>
+<p class="footer muted">No JAX, VMEC, NTX, transport solve, automatic network request or external library. The two gradients are computed by a small scalar reverse-mode AD engine and checked against finite differences with the same recorded accepted schedule.</p>
+</main>
+
+<script id="ad-core">
+/* Pure numeric core. Kept independent of the DOM for lightweight checks. */
+(() => {
+  'use strict';
+  class Tape {
+    constructor(){ this.nodes=[]; this.owner=-1; }
+    node(v, parents=[]){ const n={v, parents, bar:0, owner:this.owner}; this.nodes.push(n); return n; }
+    add(a,b){ return this.node(a.v+b.v, [[a,1],[b,1]]); }
+    sub(a,b){ return this.node(a.v-b.v, [[a,1],[b,-1]]); }
+    mul(a,b){ return this.node(a.v*b.v, [[a,b.v],[b,a.v]]); }
+    div(a,b){ return this.node(a.v/b.v, [[a,1/b.v],[b,-a.v/(b.v*b.v)]]); }
+    sqrt(a){ const v=Math.sqrt(a.v); return this.node(v,[[a,.5/v]]); }
+    abs(a){ return this.node(Math.abs(a.v), [[a,Math.sign(a.v)]]); }
+    select(keep,a,b){ return this.node(keep?a.v:b.v, [[a,keep?1:0],[b,keep?0:1]]); }
+    backward(out, parameter, count){
+      out.bar=1;
+      for(let i=this.nodes.length-1;i>=0;i--){ const n=this.nodes[i]; for(const [p,d] of n.parents) p.bar+=n.bar*d; }
+      const contributions=Array(count).fill(0);
+      for(const n of this.nodes) if(n.owner>=0) for(const [p,d] of n.parents) if(p===parameter) contributions[n.owner]+=n.bar*d;
+      return {gradient:parameter.bar, contributions};
+    }
+  }
+  const defaults={k:.2, tolerance:.6, firstStep:6, finalTime:10, initialTemperature:80, roomTemperature:20};
+  function simulate(options={}){
+    const o={...defaults,...options};
+    if(![o.k,o.tolerance,o.firstStep,o.finalTime].every(x=>Number.isFinite(x)&&x>0) || !Number.isFinite(o.initialTemperature)||!Number.isFinite(o.roomTemperature)||o.initialTemperature<=o.roomTemperature) throw Error('Require finite positive solver settings and a cup warmer than the room.');
+    let y=o.initialTemperature-o.roomTemperature, t=0, h=o.firstStep;
+    const attempts=[];
+    while(t<o.finalTime-1e-12){
+      if(attempts.length>=2000) throw Error('Too many toy-solver trials.');
+      const dt=Math.min(h,o.finalTime-t), full=y/(1+o.k*dt), refined=y/((1+o.k*dt/2)**2);
+      const error=Math.abs(full-refined), accepted=error<=o.tolerance;
+      const trial={t,h:dt,y,trialY:full,error,accepted};
+      if(accepted){t+=dt;y=full;}
+      h=dt*Math.min(2,Math.max(.2,.9*Math.sqrt(o.tolerance/Math.max(error,1e-18))));
+      trial.nextH=h;trial.nextY=y;attempts.push(trial);
+    }
+    function replay(includeRejected){
+      const tape=new Tape(), k=tape.node(o.k), one=tape.node(1);
+      let state=tape.node(o.initialTemperature-o.roomTemperature);
+      for(let i=0;i<attempts.length;i++)if(includeRejected||attempts[i].accepted){
+        tape.owner=i;
+        const trial=tape.div(state,tape.add(one,tape.mul(k,tape.node(attempts[i].h))));
+        state=includeRejected?tape.select(attempts[i].accepted,trial,state):trial;
+      }
+      return {...tape.backward(state,k,attempts.length),value:state.v,nodes:tape.nodes.length};
+    }
+    const acceptedAD=replay(false),attemptAD=replay(true);
+    return {options:o,attempts,finalTemperature:attemptAD.value+o.roomTemperature,frozenTemperature:acceptedAD.value+o.roomTemperature,
+      attemptGradient:attemptAD.gradient,frozenGradient:acceptedAD.gradient,
+      attemptContributions:attemptAD.contributions,frozenContributions:acceptedAD.contributions,
+      acceptedNodes:acceptedAD.nodes,attemptNodes:attemptAD.nodes,
+      exactTemperature:o.roomTemperature+(o.initialTemperature-o.roomTemperature)*Math.exp(-o.k*o.finalTime),
+      exactGradient:-o.finalTime*(o.initialTemperature-o.roomTemperature)*Math.exp(-o.k*o.finalTime)};
+  }
+  function frozenValue(k, run){
+    let y=run.options.initialTemperature-run.options.roomTemperature;
+    for(const a of run.attempts)if(a.accepted)y/=1+k*a.h;
+    return y+run.options.roomTemperature;
+  }
+  function finiteDifferences(run){
+    const eps=1e-6*Math.max(1,run.options.k);
+    return {frozen:(frozenValue(run.options.k+eps,run)-frozenValue(run.options.k-eps,run))/(2*eps)};
+  }
+  globalThis.CoolingAD={simulate,frozenValue,finiteDifferences,defaults};
+})();
+</script>
+
+<script id="ad-ui">
+(() => {
+  'use strict';
+  const $=id=>document.getElementById(id), num=(x,n=3)=>Number(x).toFixed(n), signed=x=>(x>=0?'+':'')+num(x,5);
+  let run, fd, frame=0, timer=null, contract='frozen';
+  const ink='#182c43', blue='#1766a6', orange='#b04e0b', red='#bc3348', gray='#9aa7b7';
+  function pause(){ if(timer!==null)clearInterval(timer);timer=null;$('play').textContent='Play animation'; }
+  function rebuild(){
+    pause();frame=0;
+    const k=+$('rate').value,tolerance=+$('tolerance').value,firstStep=+$('first-step').value;
+    run=CoolingAD.simulate({k,tolerance,firstStep});fd=CoolingAD.finiteDifferences(run);
+    $('rate-value').textContent=num(k,2);$('tolerance-value').textContent=num(tolerance,2)+' °C';$('first-step-value').textContent=num(firstStep,1)+' min';
+    $('frozen-gradient').textContent=signed(run.frozenGradient);$('attempt-gradient').textContent=signed(run.attemptGradient);$('exact-gradient').textContent=signed(run.exactGradient);
+    $('frame').max=2*run.attempts.length;
+    const accepted=run.attempts.filter(a=>a.accepted).length;
+    $('forward-summary').textContent=`Same endpoint: ${num(run.finalTemperature)} °C. ${accepted} accepted steps; ${run.attempts.length-accepted} rejected trials. Toy AD nodes: ${run.acceptedNodes} accepted-only versus ${run.attemptNodes} all-attempts (not a Diffrax performance measurement). Gradient units: °C per min⁻¹.`;
+    $('fd-check').textContent=`Finite difference with recorded accepted times fixed: ${signed(fd.frozen)}. Both AD calculations should agree with this value. The exact continuous derivative can differ at finite numerical resolution.`;
+    render();
+  }
+  function frameInfo(){const n=run.attempts.length;return frame===0?{phase:'start',index:-1}:frame<=n?{phase:'forward',index:frame-1}:{phase:'reverse',index:2*n-frame};}
+  function chart(info){
+    const x=t=>62+720*t/10,y=temperature=>322-270*(temperature-20)/60;
+    const path=points=>'M'+points.map(p=>x(p[0])+','+y(p[1])).join(' L');
+    let svg='';
+    for(let T=20;T<=80;T+=10)svg+=`<path d="M62 ${y(T)}H782" stroke="#e4eaf1"/><text x="50" y="${y(T)+5}" text-anchor="end" fill="${ink}" font-size="13">${T}</text>`;
+    for(let t=0;t<=10;t+=2)svg+=`<text x="${x(t)}" y="347" text-anchor="middle" fill="${ink}" font-size="13">${t}</text>`;
+    svg+='<text x="420" y="374" text-anchor="middle" font-size="14" fill="'+ink+'">Time (minutes)</text><text x="17" y="185" transform="rotate(-90 17 185)" text-anchor="middle" font-size="14" fill="'+ink+'">Temperature (°C)</text>';
+    const exact=Array.from({length:101},(_,i)=>[i/10,20+60*Math.exp(-run.options.k*i/10)]);
+    svg+=`<path d="${path(exact)}" fill="none" stroke="${gray}" stroke-width="2" stroke-dasharray="5 4"/>`;
+    const visible=info.phase==='reverse'?run.attempts.length:info.index+1,points=[[0,80]];
+    for(let i=0;i<visible;i++){
+      const a=run.attempts[i];if(a.accepted)points.push([a.t+a.h,20+a.trialY]);
+      else{const xx=x(a.t+a.h),yy=y(20+a.trialY);svg+=`<path d="M${x(a.t)},${y(20+a.y)}L${xx},${yy}" fill="none" stroke="${red}" stroke-width="1.3" stroke-dasharray="4 4" opacity=".6"/><path d="M${xx-4},${yy-4}l8,8m0,-8l-8,8" stroke="${red}" stroke-width="2"/>`;}
+    }
+    svg+=`<path d="${path(points)}" fill="none" stroke="${blue}" stroke-width="2.8"/>`;
+    for(const p of points)svg+=`<circle cx="${x(p[0])}" cy="${y(p[1])}" r="3.5" fill="${blue}"/>`;
+    if(info.index>=0){
+      const a=run.attempts[info.index],color=info.phase==='reverse'?(contract==='frozen'?blue:orange):(a.accepted?blue:red);
+      svg+=`<path d="M${x(a.t)},${y(20+a.y)}L${x(a.t+a.h)},${y(20+a.trialY)}" stroke="${color}" stroke-width="5" fill="none" opacity=".6"/><circle cx="${x(a.t)}" cy="${y(20+a.y)}" r="7" fill="white" stroke="${color}" stroke-width="2"/>`;
+      if(!a.accepted)svg+=`<text x="${Math.min(650,x(a.t+a.h)+10)}" y="${y(20+a.trialY)-12}" fill="${red}" font-size="13">discarded trial</text>`;
+    }
+    $('trajectory').innerHTML=svg;
+  }
+  function flow(info,a){
+    const reverse=info.phase==='reverse',allAttempts=contract==='attempts',selected=reverse?(allAttempts?orange:blue):blue;
+    const controllerColor=gray,stateColor=a&&!a.accepted?gray:selected;
+    const box=(x,y,w,label,color)=>`<rect x="${x}" y="${y}" width="${w}" height="36" rx="7" fill="white" stroke="${color}"/><text x="${x+w/2}" y="${y+23}" text-anchor="middle" font-size="12" fill="${ink}">${label}</text>`;
+    const arrow=(d,color,dashed=false)=>`<path d="${d}" fill="none" stroke="${color}" stroke-width="${color===gray?1.4:2.5}" ${dashed?'stroke-dasharray="5 4"':''}/>`;
+    let svg=box(8,10,128,'Accepted Tₙ',blue)+box(8,90,128,'Trial T*',a&&!a.accepted?red:blue)+box(290,10,148,'Accepted Tₙ₊₁',blue)+box(160,90,116,'Error estimate',controllerColor)+box(290,90,148,'Next timestep h',controllerColor);
+    svg+=arrow('M72 46V90',reverse&&a&&!a.accepted?gray:selected);
+    svg+=arrow('M136 108H160',controllerColor,true)+arrow('M276 108H290',controllerColor,true);
+    svg+=arrow('M364 126V163H72V126',controllerColor,true);
+    svg+=arrow('M136 108H145V28H290',stateColor,!a||!a.accepted);
+    if(a&&!a.accepted)svg+=arrow('M136 28H290',selected);
+    const caption=!a?'Play to inspect the accepted state and discarded trials.':!a.accepted?(allAttempts?'Discarded T* receives zero cotangent; state passes unchanged.':'Skip the rejected trial; state cotangent passes unchanged.'):'Only this accepted state update carries the gradient.';
+    svg+=`<text x="223" y="194" text-anchor="middle" fill="${ink}" font-size="11">${caption}</text><text x="223" y="213" text-anchor="middle" fill="${gray}" font-size="11">Solid: state path · loop: error → timestep feedback</text>`;
+    $('flow').innerHTML=svg;
+  }
+  function render(){
+    const info=frameInfo(),a=info.index<0?null:run.attempts[info.index];
+    $('frame').value=frame;$('frame-label').textContent=`${frame} / ${2*run.attempts.length}`;
+    $('frozen-card').classList.toggle('selected',contract==='frozen');$('attempt-card').classList.toggle('selected',contract==='attempts');
+    $('phase').textContent=info.phase==='start'?'READY':info.phase==='forward'?'FORWARD TRIALS':'REVERSE CONTRIBUTIONS';
+    const contributions=contract==='frozen'?run.frozenContributions:run.attemptContributions;
+    if(!a){$('event-title').textContent='Start with the same hot cup';$('event-text').textContent='Play the forward solve, then watch how sensitivity returns through the chosen computation.';$('numbers').textContent='Initial temperature: 80 °C\nRoom temperature:    20 °C\nQuestion: how does T(10) respond to k?';}
+    else{
+      $('event-title').textContent=`Trial ${info.index+1}: ${a.accepted?'accepted':'rejected'}`;
+      $('event-text').textContent=info.phase==='forward'?(a.accepted?'The error passes. Advance time and retain the trial temperature.':'The error is too large. Discard the trial temperature; retry from the same accepted state with a smaller timestep.'):(contract==='frozen'?(a.accepted?'Backpropagate through this accepted cooling update with its timestep held fixed.':'This rejected trial is absent from the AD replay. Pass the state sensitivity straight through.'):(a.accepted?'Differentiate the selected accepted update; h is a constant.':'Differentiate where(false, T_trial, T_old): the cotangent to T_trial is zero, and T_old receives the unchanged cotangent.'));
+      const accumulated=info.phase==='reverse'?contributions.slice(info.index).reduce((s,x)=>s+x,0):0;
+      $('numbers').textContent=`Start time:         ${num(a.t)} min\nTrial timestep:     ${num(a.h)} min\nAccepted T before:  ${num(20+a.y)} °C\nTrial temperature:  ${num(20+a.trialY)} °C\nAccepted T after:   ${num(20+a.nextY)} °C\nEstimated error:    ${num(a.error,5)} °C / ${num(run.options.tolerance,2)} allowed`+(info.phase==='reverse'?`\nTrial contribution: ${signed(contributions[info.index])}\nAccumulated dT/dk:  ${signed(accumulated)}`:'');
+    }
+    $('contract-note').textContent=contract==='frozen'?'Accepted-only replay omits rejected trial computations. The recorded accepted times and controller are constants.':'The tape includes rejected trial computations, but their state updates are masked out. Their cotangent is zero. The recorded timesteps and controller are still constants.';
+    $('trace-table').innerHTML=run.attempts.map((p,i)=>`<tr class="${i===info.index?'current':''}"><td>${i+1}</td><td class="${p.accepted?'blue':'red'}">${p.accepted?'Accepted':'Rejected'}</td><td>${num(p.t)}</td><td>${num(p.h)}</td><td>${num(p.error,4)}</td><td>${signed(run.frozenContributions[i])}</td><td>${signed(run.attemptContributions[i])}</td></tr>`).join('');
+    chart(info);flow(info,a);
+  }
+  for(const id of ['rate','tolerance','first-step'])$(id).addEventListener('input',rebuild);
+  document.querySelectorAll('input[name=contract]').forEach(input=>input.addEventListener('change',()=>{contract=input.value;render();}));
+  $('play').addEventListener('click',()=>{if(timer!==null){pause();return;}if(frame>=2*run.attempts.length)frame=0;$('play').textContent='Pause';timer=setInterval(()=>{frame++;render();if(frame>=2*run.attempts.length)pause();},650);});
+  $('previous').addEventListener('click',()=>{pause();frame=Math.max(0,frame-1);render();});
+  $('next').addEventListener('click',()=>{pause();frame=Math.min(2*run.attempts.length,frame+1);render();});
+  $('reverse').addEventListener('click',()=>{pause();frame=run.attempts.length+1;render();});
+  $('reset').addEventListener('click',()=>{pause();frame=0;render();});
+  $('frame').addEventListener('input',()=>{pause();frame=+$('frame').value;render();});
+  rebuild();
+})();
+</script>
+</body>
+</html>
