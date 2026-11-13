@@ -42,13 +42,13 @@ class VmecBoozer(GeometryModelBase):
     a_b: float
     Psia_value: float
     rho_grid: Float[Array, "n_r"]
-    rho_grid_half: Float[Array, "n_face"]
+    rho_grid_half: Float[Array, "n_r+1"]
     r_grid: Float[Array, "n_r"]
-    r_grid_half: Float[Array, "n_face"]
+    r_grid_half: Float[Array, "n_r+1"]
     full_grid_indices : Int[Array, "n_r"]   
     dr: float         
     Vprime: Float[Array, "n_r"]
-    Vprime_half: Float[Array, "n_face"]
+    Vprime_half: Float[Array, "n_r+1"]
     overVprime: Float[Array, "n_r"]
     epsilon_t: Float[Array, "n_r"]
     B0: Float[Array, "n_r"]

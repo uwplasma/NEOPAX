@@ -7229,6 +7229,7 @@ def _radau_fixed_lagged_step_reverse_common(
         ).strip().lower()
         == "block"
     ):
+        objective_count = int(dz_bars.shape[0])
         support_bad_rows = jnp.zeros((objective_count,), dtype=bool)
         for support_bar_leaf in support_bar_leaves:
             support_leaf_rows = jnp.asarray(support_bar_leaf).reshape(
@@ -16286,7 +16287,7 @@ def _radau_prepare_stage_subsolve_inputs_from_carry(
     real_piv_cache = carry_in.real_piv
     complex_lu_cache = carry_in.complex_lu
     complex_piv_cache = carry_in.complex_piv
-    lagged_response, _lagged_reference_y, _lagged_response_reused = _radau_prepare_lagged_response(
+    lagged_response, _lagged_reference_y, lagged_response_reused = _radau_prepare_lagged_response(
         kernel_context,
         carry_in,
         physics_context.unpack_flat,
