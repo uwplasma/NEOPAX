@@ -6349,6 +6349,9 @@ def geometry_payload_pullback_from_param_vector_raw_block_transpose(
             "active": True,
             "single_state_bar": _single_state_bar,
             "tangent_contraction": _tangent_contraction,
+            "active_float_leaf_indices": active_float_leaf_indices,
+            "payload_template_paths_and_leaves": payload_template_paths_and_leaves,
+            "payload_bar_leaves_by_objective": payload_bar_leaves_by_objective,
         }
 
     def _state_bar_batch_from_payload_branch(branch_name, payload_fn, branch_bars):
@@ -6367,12 +6370,12 @@ def geometry_payload_pullback_from_param_vector_raw_block_transpose(
                 f"{progress_label} isolating first nonfinite ntx_support payload leaf",
                 flush=True,
             )
-            for leaf_i in active_float_leaf_indices:
-                path, template_leaf = payload_template_paths_and_leaves[leaf_i]
+            for leaf_i in setup["active_float_leaf_indices"]:
+                path, template_leaf = setup["payload_template_paths_and_leaves"][leaf_i]
                 leaf_bars = jnp.stack(
                     [
                         jnp.asarray(
-                            payload_bar_leaves_by_objective[objective_i][leaf_i],
+                            setup["payload_bar_leaves_by_objective"][objective_i][leaf_i],
                             dtype=jnp.asarray(template_leaf).dtype,
                         )
                         for objective_i in range(len(branch_bars))
