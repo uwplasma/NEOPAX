@@ -84,7 +84,7 @@ from NEOPAX._interpolators import (
 )
 from NEOPAX._source_models import get_source_model
 from NEOPAX._species import Species
-from NEOPAX._state import TransportState, get_v_thermal
+from NEOPAX._state import DEFAULT_TRANSPORT_DENSITY_FLOOR, TransportState, get_v_thermal
 from NEOPAX._boundary_conditions import BoundaryConditionModel
 from NEOPAX._constants import elementary_charge
 from NEOPAX._transport_equations import _plasma_permitivity_from_prefactor
@@ -324,10 +324,12 @@ def test_ntx_exact_runtime_lagged_face_response_matches_reference_and_finite_dif
     assert compact_record.face_anchor_coefficients.dcoefficient_scan_d_log_nu_star.shape == (2, 2, 3, 5)
     lagged_at_reference = model.evaluate_with_lagged_response(state0, response)
     direct_at_reference = face_fluxes_from_state(state0)
+    # Only the two anchor faces are reproduced exactly; the middle face is
+    # interpolated from the anchors.
     for name in ("Gamma", "Q", "Upar"):
         assert jnp.allclose(
-            lagged_at_reference[f"{name}_faces"],
-            direct_at_reference[name],
+            lagged_at_reference[f"{name}_faces"][..., ::2],
+            direct_at_reference[name][..., ::2],
             rtol=3.0e-6,
             atol=1.0e-12,
         )
@@ -464,7 +466,9 @@ def test_ntx_exact_runtime_quadratic_lagged_response_matches_live_reference(resp
     faces = build_face_transport_state(
         state, geometry, bc_density=density_bc, bc_temperature=temperature_bc,
     )
-    assert jnp.array_equal(faces.density[:, -1], density_bc.right_value)
+    assert jnp.array_equal(
+        faces.density[:, -1], jnp.maximum(density_bc.right_value, DEFAULT_TRANSPORT_DENSITY_FLOOR)
+    )
     # With the benchmark spacing and lambda, the live Robin reconstruction is
     # close to the edge profile but is not the unused TOML ``value = 1.0``.
     assert bool(jnp.all(faces.temperature[:, -1] > 0.0))
@@ -874,8 +878,8 @@ def test_ntx_exact_runtime_quadratic_lagged_response_matches_live_reference(resp
         )
 
     direction = TransportState(
-        density=jnp.asarray([[0.04, -0.03], [-0.02, 0.01]]),
-        pressure=jnp.asarray([[0.06, -0.04], [-0.03, 0.02]]),
+        density=jnp.asarray([[0.04, -0.03], [-0.02, 0.01], [0.01, -0.01], [0.0, 0.0]]),
+        pressure=jnp.asarray([[0.06, -0.04], [-0.03, 0.02], [0.02, -0.02], [0.0, 0.0]]),
         Er=jnp.asarray([2.0e-5, -1.5e-5]),
     )
 
@@ -907,7 +911,10 @@ def test_ntx_exact_runtime_quadratic_lagged_response_matches_live_reference(resp
     def _relative_flux_error(scale):
         perturbed = _state_at(scale)
         direct_perturbed = model.evaluate_face_fluxes(
-            perturbed, build_face_transport_state(perturbed, geometry)
+            perturbed,
+            build_face_transport_state(
+                perturbed, geometry, bc_density=density_bc, bc_temperature=temperature_bc,
+            ),
         )
         full_perturbed = full_state_model.evaluate_with_lagged_response(
             perturbed, full_state_response

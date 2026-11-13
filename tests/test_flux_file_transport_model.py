@@ -1014,6 +1014,7 @@ def test_combined_joint_lagged_pullback_preserves_submodel_state_bars():
             state,
             response_bars,
             support,
+            **kwargs,
         ):
             assert self.joint
             return self.factor * response_bars, 11.0 * response_bars
