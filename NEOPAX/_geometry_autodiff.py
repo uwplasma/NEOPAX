@@ -14,6 +14,8 @@ import jax.numpy as jnp
 import interpax
 import numpy as np
 
+from ._optimization_diagnostics import save_gradient_audit
+
 
 @dataclasses.dataclass(frozen=True, slots=True)
 class QImaxJBackendSettings:
@@ -6573,6 +6575,9 @@ def geometry_payload_pullback_from_param_vector_raw_block_transpose(
         )
 
     _probe("before_raw_block_transpose")
+    save_gradient_audit("ad_vmec_transpose_input", state=state, params=implicit_params,
+        mask=dof_mask, state_bars=raw_block_state_bar_batch,
+        parameter_labels=tuple(f"{e['family']}:{e['m']}:{e['n']}" for e in param_entries))
     param_bar_batch = implicit.implicit_state_pullback_multi_rhs_raw_block_transpose(
         implicit_params,
         implicit_cfg,
@@ -6582,6 +6587,7 @@ def geometry_payload_pullback_from_param_vector_raw_block_transpose(
         probe_chunk_size=1,
     )
     _probe("after_raw_block_transpose")
+    save_gradient_audit("ad_vmec_transpose_output", parameter_bars=param_bar_batch)
     if progress_label is not None:
         param_bar_leaves = jax.tree_util.tree_leaves(param_bar_batch)
         first_bad = None

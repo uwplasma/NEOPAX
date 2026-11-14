@@ -8,6 +8,7 @@ adapter uses that boundary to distinguish accepted points from trial values.
 from contextlib import contextmanager
 from contextvars import ContextVar
 import json
+import os
 from pathlib import Path
 import tempfile
 import traceback
@@ -16,6 +17,36 @@ import numpy as np
 
 
 _ACTIVE = ContextVar("neopax_optimization_diagnostics", default=None)
+
+
+def save_gradient_audit(stage, **trees):
+    """Opt-in copies of existing derivative boundaries, without extra solves.
+
+    NEOPAX_GRADIENT_AUDIT_DIR enables NPZ files with named pytree leaves.
+    Unique files preserve repeated calls. No array is inspected when disabled.
+    """
+    directory = os.environ.get("NEOPAX_GRADIENT_AUDIT_DIR", "")
+    if not directory:
+        return None
+    import jax
+
+    arrays = {}
+    for name, tree in trees.items():
+        for path, value in jax.tree_util.tree_flatten_with_path(tree)[0]:
+            array = np.asarray(jax.device_get(value))
+            if array.dtype == jax.dtypes.float0:
+                continue
+            if array.dtype.kind not in "biufcSU":
+                raise TypeError(f"Unsupported gradient audit leaf: {name}{jax.tree_util.keystr(path)}")
+            arrays[name + jax.tree_util.keystr(path)] = array
+    directory = Path(directory)
+    directory.mkdir(parents=True, exist_ok=True)
+    prefix = "".join(c if c.isalnum() or c in "_-" else "_" for c in str(stage))
+    with tempfile.NamedTemporaryFile(dir=directory, prefix=prefix + "_", suffix=".npz", delete=False) as stream:
+        np.savez_compressed(stream, **arrays)
+        path = Path(stream.name)
+    print(f"[gradient-audit] wrote {path}", flush=True)
+    return path
 
 
 def _json_value(value):

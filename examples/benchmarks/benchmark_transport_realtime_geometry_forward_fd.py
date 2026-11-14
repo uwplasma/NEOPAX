@@ -49,6 +49,7 @@ from NEOPAX._reverse_ad_initial_er import (  # noqa: E402
     initial_er_charge_flux_residuals,
 )
 from NEOPAX._reverse_ad_transport import objective_scalar_by_index  # noqa: E402
+from NEOPAX._optimization_diagnostics import save_gradient_audit  # noqa: E402
 from NEOPAX._geometry_autodiff import (  # noqa: E402
     _implicit_params_with_boundary_deltas,
     _solve_state_for_single_param,
@@ -817,7 +818,12 @@ def _objectives_on_realtime_geometry_frozen_trace(
             replay=replay,
             runtime=runtime,
         )
-    return _objective_vector(replay["final_state"], runtime), replay
+    values = _objective_vector(replay["final_state"], runtime)
+    save_gradient_audit("fd_" + endpoint_label, labels=tuple(OBJECTIVE_LABELS), values=values,
+        initial_y=prepared_rollout.initial_carry.y, final_y=replay["final_carry"].y,
+        final_time=replay["final_carry"].t,
+        initial_state=state0, final_state=replay["final_state"], profile_values=profile_values)
+    return values, replay
 
 
 def _runtime_for_geometry_delta(config: dict[str, Any], geometry_parameter: str, delta_value):
@@ -1643,6 +1649,10 @@ def main() -> None:
     )
     baseline_objectives = _objective_vector(_baseline_final_state, baseline_runtime)
     baseline_objectives = jax.block_until_ready(baseline_objectives)
+    save_gradient_audit("fd_baseline", labels=tuple(OBJECTIVE_LABELS), values=baseline_objectives,
+        final_y=baseline_rollout.final_carry.y, final_state=_baseline_final_state,
+        final_time=baseline_rollout.final_carry.t,
+        initial_y=baseline_prepared_rollout.initial_carry.y, initial_state=baseline_profile_state)
     if args.diagnose_bootstrap_correction or args.diagnose_bootstrap_correction_only:
         print("[autodiff-gate] progress: diagnosing baseline bootstrap correction", flush=True)
         _print_bootstrap_correction_diagnostics(_baseline_final_state, baseline_runtime)

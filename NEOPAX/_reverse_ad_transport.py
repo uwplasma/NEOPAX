@@ -23,7 +23,7 @@ import jax.numpy as jnp
 import numpy as np
 
 from ._constants import elementary_charge
-from ._optimization_diagnostics import reverse_checkpoint, reverse_diagnostics_active, reverse_objective_values
+from ._optimization_diagnostics import reverse_checkpoint, reverse_diagnostics_active, reverse_objective_values, save_gradient_audit
 from ._reverse_step_diagnostics import (
     check_primal_replay_endpoint,
     check_reverse_segment_state,
@@ -5926,6 +5926,13 @@ def realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_v
     objective_values = jnp.stack(objective_values_rows, axis=0)
     reverse_objective_values(objective_values, objective_labels)
     final_y_bars = jnp.stack(final_y_bar_rows, axis=0)
+    if os.environ.get("NEOPAX_GRADIENT_AUDIT_DIR"):
+        save_gradient_audit("ad_terminal", labels=tuple(objective_labels), values=objective_values,
+            final_y=final_y_for_objective, final_y_bars=final_y_bars,
+            final_time=segmented_final_carry.t,
+            final_state=reverse_setup.prepared_rollout.physics_context.unpack_flat(final_y_for_objective),
+            initial_y=reverse_setup.prepared_rollout.initial_carry.y, support=support_payload,
+            explicit_support_bars=tuple(objective_payload_bar_rows))
     reverse_checkpoint("terminal_objective_state_bars", final_y_bars,
                        objective_labels=objective_labels)
     if reverse_diagnostics_active():
@@ -9645,6 +9652,10 @@ def internal_realtime_geometry_transport_reverse_table_result_builder(
             name: tuple(values[i] for i in rows)
             for name, values in support_result.support_component_bars_by_name.items()
         }
+        save_gradient_audit("ad_before_scan_fold", labels=tuple(objective_names),
+            values=support_result.objective_values, profile_gradients=support_result.profile_gradient_matrix,
+            support_bars=support_bars, components=component_bars,
+            native_vmec_face_coefficient_bars=native_vmec_face_coefficient_bars)
         # The recorded scan route accumulates a database bar during all
         # objective/segment VJPs.  Fold it once here, before the ordinary
         # VMEC payload transpose.  Legacy payloads have no database leaf and
