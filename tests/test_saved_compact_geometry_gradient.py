@@ -1,5 +1,7 @@
 """Saved-array bookkeeping only. Import no JAX or physics code."""
+import ast
 import importlib.util
+import inspect
 from pathlib import Path
 import unittest
 
@@ -12,6 +14,30 @@ spec.loader.exec_module(check)
 
 
 class SavedCompactGradientTests(unittest.TestCase):
+    def test_production_call_supplies_the_actual_required_arguments_and_configured_grid(self):
+        name = "geometry_payload_pullback_from_param_vector_raw_block_transpose"
+        source = path.parents[2] / "NEOPAX/_geometry_autodiff.py"
+        definition = next(node for node in ast.parse(source.read_text()).body
+                          if isinstance(node, ast.FunctionDef) and node.name == name)
+        parameters = [inspect.Parameter(arg.arg, inspect.Parameter.POSITIONAL_OR_KEYWORD)
+                      for arg in definition.args.args]
+        parameters.extend(inspect.Parameter(arg.arg, inspect.Parameter.KEYWORD_ONLY,
+                                            default=inspect.Parameter.empty if default is None else None)
+                          for arg, default in zip(definition.args.kwonlyargs,
+                                                  definition.args.kw_defaults, strict=True))
+        call = next(node for node in ast.walk(ast.parse(path.read_text()))
+                    if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                    and node.func.attr == name)
+        keywords = {kw.arg: kw.value for kw in call.keywords}
+        inspect.Signature(parameters).bind(*[None] * len(call.args),
+                                           **dict.fromkeys(keywords))
+        config = {"neoclassical": {"ntx_scan_n_theta": 7, "ntx_scan_n_zeta": 9,
+                                   "ntx_scan_n_xi": 11}}
+        for key, expected in (("n_theta", 7), ("n_zeta", 9), ("n_xi", 11)):
+            value = eval(compile(ast.Expression(keywords[key]), str(path), "eval"),
+                         {"config": config})
+            self.assertEqual(value, expected)
+
     def test_flat_field_prefix_does_not_capture_siblings_or_nested_fields(self):
         arrays = {"params.rbc": np.ones(2), "params_extra.rbc": np.zeros(2),
                   "params.nested.value": np.zeros(2)}

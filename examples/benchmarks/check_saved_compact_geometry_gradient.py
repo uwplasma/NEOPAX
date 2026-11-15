@@ -131,6 +131,9 @@ def main():
         geo.geometry_payload_pullback_from_param_vector_raw_block_transpose(
             context, jnp.zeros(len(specs)), specs, tuple(payload_bars),
             combined_payload=True, payload_kind="ntx_scan_runtime", n_r=n_r,
+            n_theta=int(config["neoclassical"]["ntx_scan_n_theta"]),
+            n_zeta=int(config["neoclassical"]["ntx_scan_n_zeta"]),
+            n_xi=int(config["neoclassical"]["ntx_scan_n_xi"]),
             scan_rho=config["neoclassical"]["ntx_scan_rho"], scan_surface_backend="vmec",
             raw_block_solve=raw, progress_label="[compact-replay]")))
     tangent_file = max(args.out_dir.glob("ad_compact_tangents_*.npz"), key=lambda p: p.stat().st_mtime_ns)
