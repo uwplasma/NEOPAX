@@ -14,6 +14,18 @@ spec.loader.exec_module(check)
 
 
 class SavedCompactGradientTests(unittest.TestCase):
+    def test_host_runtime_caches_are_initialized_before_the_traced_contraction(self):
+        main = next(node for node in ast.parse(path.read_text()).body
+                    if isinstance(node, ast.FunctionDef) and node.name == "main")
+        positions = {node.value.func.attr: node.lineno for node in main.body
+                     if isinstance(node, ast.Expr) and isinstance(node.value, ast.Call)
+                     and isinstance(node.value.func, ast.Attribute)}
+        call = next(node for node in ast.walk(main) if isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Attribute)
+                    and node.func.attr == "geometry_payload_pullback_from_param_vector_raw_block_transpose")
+        self.assertLess(positions["_template_runtime"], positions["_boundary_pack_tables"])
+        self.assertLess(positions["_boundary_pack_tables"], call.lineno)
+
     def test_original_b0_maximum_is_retained(self):
         source = path.parents[2] / "NEOPAX/_geometry_autodiff.py"
         builder = next(node for node in ast.parse(source.read_text()).body

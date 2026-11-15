@@ -129,6 +129,11 @@ def main():
                              for name, value in named_arrays(captured, "state.").items()})
     mask = SpectralState(**{name: jnp.asarray(value)
                             for name, value in named_arrays(captured, "mask.").items()})
+    # The skipped equilibrium solve normally primes these host-built caches.
+    # Prepare them before lax.map/JVP tracing, without solving equilibrium.
+    print("[compact-replay] initializing static VMEX caches outside tracing", flush=True)
+    implicit._template_runtime(cfg)
+    implicit._boundary_pack_tables(cfg)
     raw = geo.GeometryRawBlockSolve(implicit, params, cfg, state, mask, entries)
     n_r = captured["payload_bars[0]['geometry'].r_grid"].size
     surface_count = len(config["neoclassical"]["ntx_scan_rho"])
