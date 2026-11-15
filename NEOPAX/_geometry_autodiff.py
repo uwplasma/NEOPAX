@@ -5001,7 +5001,9 @@ def _traceable_vmec_surface_from_tables(tables, *, s, source_path, static):
         b_sub_zeta_cos=jnp.asarray(bsubvmnc, dtype=jnp.float64),
         b_sup_theta_cos=jnp.asarray(bsupumnc, dtype=jnp.float64),
         b_sup_zeta_cos=jnp.asarray(bsupvmnc, dtype=jnp.float64),
-        b0=jnp.max(jnp.abs(bmnc)),
+        # Gather the extremizing coefficient so its tangent follows that
+        # coefficient directly. Equal maxima select the first coefficient.
+        b0=jnp.abs(bmnc[jnp.argmax(jnp.abs(bmnc))]),
         psi_a_hat=psi_a_hat,
         phi_edge=phi_edge,
         r_n=r_n,
