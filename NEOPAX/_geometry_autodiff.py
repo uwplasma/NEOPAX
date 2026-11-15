@@ -3,6 +3,7 @@ from __future__ import annotations
 import dataclasses
 import functools
 import importlib
+import os
 import sys
 import time
 from copy import deepcopy
@@ -14,6 +15,8 @@ import jax
 import jax.numpy as jnp
 import interpax
 import numpy as np
+
+from ._optimization_diagnostics import save_gradient_audit
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -6337,18 +6340,23 @@ def geometry_payload_pullback_from_param_vector_raw_block_transpose(
             )
             return _payload_float_pullback()(tuple(payload_bar_leaves))[0]
 
-        def _tangent_contraction(state_tangent):
+        def _tangent_contraction(state_tangent, *, capture_leaves=False):
             _, tangent_leaves = jax.jvp(
                 payload_float_leaves_from_state,
                 (state,),
                 (state_tangent,),
             )
-            return _batched_bar_tangent_contract(batched_payload_float_bars, tangent_leaves)
+            total = _batched_bar_tangent_contract(batched_payload_float_bars, tangent_leaves)
+            return (total, tangent_leaves) if capture_leaves else total
 
         return {
             "active": True,
             "single_state_bar": _single_state_bar,
             "tangent_contraction": _tangent_contraction,
+            "active_leaf_paths": tuple(
+                jax.tree_util.keystr(payload_template_paths_and_leaves[i][0])
+                for i in active_float_leaf_indices
+            ),
         }
 
     def _state_bar_batch_from_payload_branch(branch_name, payload_fn, branch_bars):
@@ -6568,6 +6576,9 @@ def geometry_payload_pullback_from_param_vector_raw_block_transpose(
         if not param_entries:
             return jnp.zeros((len(payload_bars), 0), dtype=jnp.float64)
         param_tangent_batch = _implicit_param_tangent_batch()
+        capture_tangents = payload_kind == "ntx_scan_runtime" and scan_setup["active"] and bool(
+            os.environ.get("NEOPAX_GRADIENT_AUDIT_DIR")
+        )
 
         def _single_gradient_column(param_tangent):
             state_tangent = implicit.implicit_state_tangent_raw_block(
@@ -6578,6 +6589,11 @@ def geometry_payload_pullback_from_param_vector_raw_block_transpose(
                 param_tangent,
                 probe_chunk_size=1,
             )
+            if capture_tangents:
+                total, leaves = scan_setup["tangent_contraction"](
+                    state_tangent, capture_leaves=True
+                )
+                return total + _native_coefficient_tangent_contraction(state_tangent), state_tangent, leaves
             return (
                 _payload_tangent_contraction(state_tangent)
                 + _native_coefficient_tangent_contraction(state_tangent)
@@ -6588,6 +6604,11 @@ def geometry_payload_pullback_from_param_vector_raw_block_transpose(
             _single_gradient_column,
             param_tangent_batch,
         )
+        if capture_tangents:
+            gradient_columns, state_tangents, payload_tangents = gradient_columns
+            save_gradient_audit("ad_compact_tangents", state_tangents=state_tangents,
+                payload_tangents=payload_tangents, payload_paths=scan_setup["active_leaf_paths"],
+                parameter_labels=tuple(f"{e['family']}:{e['m']}:{e['n']}" for e in param_entries))
         _probe("after_compact_tangent_map")
         if progress_label is not None:
             print(
@@ -6605,6 +6626,10 @@ def geometry_payload_pullback_from_param_vector_raw_block_transpose(
     # state-bar batch used by the raw transpose fallback.
     streamed_gradient_matrix = _try_compact_payload_tangent_contract_to_param_matrix()
     if streamed_gradient_matrix is not None:
+        save_gradient_audit("ad_compact_geometry", state=state, params=implicit_params,
+            mask=dof_mask, payload_bars=tuple(payload_bars), geometry_gradients=streamed_gradient_matrix,
+            native_vmec_face_coefficient_bars=native_vmec_face_coefficient_bars,
+            parameter_labels=tuple(f"{e['family']}:{e['m']}:{e['n']}" for e in param_entries))
         if progress_label is not None:
             arr = np.asarray(jax.device_get(streamed_gradient_matrix))
             finite = np.isfinite(arr)
