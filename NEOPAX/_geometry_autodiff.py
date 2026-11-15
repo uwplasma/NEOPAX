@@ -6481,6 +6481,10 @@ def geometry_payload_pullback_from_param_vector_raw_block_transpose(
     # state-bar batch used by the raw transpose fallback.
     streamed_gradient_matrix = _try_compact_payload_tangent_contract_to_param_matrix()
     if streamed_gradient_matrix is not None:
+        save_gradient_audit("ad_compact_geometry", state=state, params=implicit_params,
+            mask=dof_mask, payload_bars=tuple(payload_bars), geometry_gradients=streamed_gradient_matrix,
+            native_vmec_face_coefficient_bars=native_vmec_face_coefficient_bars,
+            parameter_labels=tuple(f"{e['family']}:{e['m']}:{e['n']}" for e in param_entries))
         if progress_label is not None:
             arr = np.asarray(jax.device_get(streamed_gradient_matrix))
             finite = np.isfinite(arr)

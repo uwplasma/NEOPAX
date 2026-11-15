@@ -1,0 +1,14 @@
+objective,relative_l2_difference,max_abs_difference
+softmax_Er,0.0,0.0
+net_total_power_volume_average_mw_m3,7.024495867127362e-16,3.469446951953614e-17
+Er_transition_left,0.0,0.0
+Er_transition_right,0.0,0.0
+Er2_volume_average,8.018275718642838e-16,1.7763568394002505e-15
+Er_volume_average,7.666406803605648e-16,3.469446951953614e-17
+electron_temperature_volume_average_keV,7.338806101317195e-16,1.3877787807814457e-16
+total_pressure_volume_average,7.388193477339879e-16,1.6653345369377348e-16
+alpha_power_volume_average_mw_m3,7.073027295793727e-16,3.122502256758253e-17
+bootstrap_current_softmax_abs_scaled,9.736426022112254e-14,5.17808018685173e-13
+Er_transition_rho,1.591351040266613e-61,1.1394681294911758e-64
+Er_transition_location_moment,1.591351040266613e-61,1.1394681294911758e-64
+Er_transition_strength,4.32658262074514e-19,2.168404344971009e-19
