@@ -37,8 +37,6 @@ jobs:
     timeout-minutes: 60
     env:
       UV_SYSTEM_PYTHON: "0"
-      MPLCONFIGDIR: ${{ runner.temp }}/mpl
-      JAX_COMPILATION_CACHE_DIR: ${{ runner.temp }}/jax-cache
     strategy:
       fail-fast: false
       matrix:
@@ -47,6 +45,10 @@ jobs:
 
     steps:
     - uses: actions/checkout@v4
+    - name: Per-job cache directories
+      run: |
+        echo "MPLCONFIGDIR=$RUNNER_TEMP/mpl" >> "$GITHUB_ENV"
+        echo "JAX_COMPILATION_CACHE_DIR=$RUNNER_TEMP/jax-cache" >> "$GITHUB_ENV"
     - uses: astral-sh/setup-uv@v6
       with:
         python-version: ${{ matrix.python-version }}
