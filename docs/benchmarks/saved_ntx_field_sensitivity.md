@@ -65,3 +65,54 @@ On the large machine after pushing/pulling the script:
 
 Use a new empty output directory. This runs coefficient solves for the two
 saved cases, not another database scan or AD/FD transport benchmark.
+
+## Completed replay and reduced-system audit
+
+The remote run at `2e852fa` reproduces all ten saved D13 values exactly;
+identical-input repeats and the NumPy/production-GPU field reconstructions
+agree. At the outer point, the one-ULP field change reproduces a D13 gap of
+`9.517854824e-3`. Its raw D11 is negative, and Onsager's absolute discrepancy
+is about `2.53e1`, despite primary Schur RMS around `1e-9`.
+
+The optional `--audit-head` check investigates the retained three-block
+linear system. It records conditioning of the retained Schur factors and
+the combined head matrix; compares the production elimination with a dense
+pivoted head solve and a diagonally scaled dense solve; and measures residuals
+for both primary and parallel right-hand sides. The scaling changes variables
+and equations by invertible diagonal factors, not the underlying model.
+
+The last reduced diagonal block is reconstructed from its stored LU factors;
+the other head blocks come from the original NTX operator. Thus this tests
+the represented reduced system and does not independently certify tail
+elimination or the original full-system residual. Its production-head
+coefficient difference from the saved result is recorded because extra audit
+outputs can change compilation. A condition estimate is not itself proof
+that a solver or physical discretization is correct.
+
+At this grid the dense matrix is only 2325 by 2325, not the entire Legendre
+system. The audit rejects compiled buffer estimates above 4 GiB. This limit
+does not include all resident executables or compiler allocations. Each
+matrix/RHS snapshot is saved in `head_r*_*.npz` and all scalar diagnostics in
+`head_comparison.csv`. No production solver or AD rule changes.
+
+Use a new output directory and add the flag:
+
+```bash
+(
+  cd "$HOME/NEOPAX" || exit 1
+  git pull --ff-only origin en/v0_main || exit 1
+  set -o pipefail
+  env JAX_PLATFORMS=cuda,cpu JAX_ENABLE_X64=true \
+    XLA_PYTHON_CLIENT_PREALLOCATE=false \
+    "$HOME/jax_env/bin/python" \
+    examples/benchmarks/check_saved_ntx_field_sensitivity.py \
+    --run-dir outputs/generic_ntx_baselines_20261116 \
+    --out-dir outputs/generic_ntx_head_audit_20261116 \
+    --audit-head \
+    2>&1 | tee outputs/generic_ntx_head_audit_20261116.log
+) || printf '\nReduced-system audit stopped; terminal kept open.\n'
+```
+
+The two additional local NumPy checks compare the assembled reduced head to
+an independent full block-system solve and verify that scaling preserves the
+original equations. The actual GPU reduced-system audit remains pending.

@@ -60,10 +60,85 @@ def restore_surface(fields, context, surface_type, asarray):
     return surface_type(**values)
 
 
+def head_matrix(diagonal, lower, upper, last_schur, xp):
+    """Three original head rows with the eliminated tail folded into row two."""
+    zero = xp.zeros_like(last_schur)
+    return xp.concatenate((
+        xp.concatenate((diagonal[0], upper[0], zero), axis=1),
+        xp.concatenate((lower[1], diagonal[1], upper[1]), axis=1),
+        xp.concatenate((zero, lower[2], last_schur), axis=1)), axis=0)
+
+
+def scaled_solve(matrix, rhs, xp):
+    """Diagnostic diagonal scaling; solves the same reduced equations."""
+    a, b = matrix, rhs
+    columns = xp.ones(matrix.shape[1], dtype=matrix.dtype)
+    for _ in range(5):
+        row_max = xp.max(xp.abs(a), axis=1)
+        rows = 1./xp.sqrt(xp.where(row_max > 0., row_max, 1.))
+        a, b = rows[:, None]*a, rows[:, None]*b
+        column_max = xp.max(xp.abs(a), axis=0)
+        scale = 1./xp.sqrt(xp.where(column_max > 0., column_max, 1.))
+        a, columns = a*scale[None, :], columns*scale
+    return columns[:, None]*xp.linalg.solve(a, b), a
+
+
+def make_head_audit():
+    import jax
+    import jax.numpy as jnp
+    from ntx import _solver as solver
+    from solvax import direct
+
+    def audit(prepared, nu, es):
+        ctx = solver._operator_context(prepared.surface, prepared.geometry, prepared.grid, nu, es)
+        s1, s3 = solver.source_modes(ctx, prepared.grid.n_xi)
+        rhs_low = jnp.stack((s1[:3], s3[:3]), axis=-1)
+        block = solver._operator_block_fn(ctx, prepared.d_theta, prepared.d_zeta)
+        native, lu, piv, _, _ = direct._block_thomas_truncated_fn_state(
+            block, prepared.grid.n_xi+1, rhs_low, 3)
+        size = lu.shape[1]
+        pivoted = (jnp.tril(lu, -1)+jnp.eye(size)) @ jnp.triu(lu)
+        permutation = jax.lax.linalg.lu_pivots_to_permutation(piv[2], size)
+        last_schur = pivoted[2][jnp.argsort(permutation)]
+        lower, diagonal, upper = jax.lax.map(block, jnp.arange(3, dtype=jnp.int32))
+        matrix = head_matrix(diagonal, lower, upper, last_schur, jnp)
+        rhs = rhs_low.reshape(3*size, 2)
+        dense = jnp.linalg.solve(matrix, rhs)
+        scaled, scaled_matrix = scaled_solve(matrix, rhs, jnp)
+
+        def coefficients(value):
+            modes = value.reshape(3, size, 2)
+            return jnp.stack(solver.coefficients_from_modes(prepared.geometry,
+                modes[...,0], modes[...,1], nu))
+
+        def errors(value):
+            residual = jnp.linalg.norm(matrix @ value-rhs, axis=0)
+            tiny = jnp.finfo(matrix.dtype).tiny
+            rhs_norm = jnp.linalg.norm(rhs, axis=0)
+            relative = residual/jnp.maximum(rhs_norm, tiny)
+            backward = residual/jnp.maximum(jnp.linalg.norm(matrix)*jnp.linalg.norm(value, axis=0)+rhs_norm, tiny)
+            return relative, backward
+
+        def condition(value):
+            singular = jnp.linalg.svd(value, compute_uv=False)
+            return singular[...,0]/singular[...,-1]
+
+        values = (native.reshape(3*size, 2), dense, scaled)
+        return dict(matrix=matrix, rhs=rhs, pivots=piv,
+            coefficients=jnp.stack([coefficients(x) for x in values]),
+            relative_residual=jnp.stack([errors(x)[0] for x in values]),
+            backward_error=jnp.stack([errors(x)[1] for x in values]),
+            schur_condition=condition(pivoted), head_condition=condition(matrix),
+            scaled_head_condition=condition(scaled_matrix))
+    return jax.jit(audit)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--run-dir", type=Path, required=True)
     parser.add_argument("--out-dir", type=Path, required=True)
+    parser.add_argument("--audit-head", action="store_true",
+        help="Audit the retained Schur system and compare equivalent pivoted/scaled reduced solves.")
     args = parser.parse_args()
     config_path = args.run_dir/"config.toml"
     config = tomllib.loads(config_path.read_text())
@@ -118,6 +193,9 @@ def main():
         return values, result.residual_l2, result.onsager_residual
 
     rows = []
+    head_rows = []
+    audit_head = make_head_audit() if args.audit_head else None
+    head_executable = None
     with jax.default_device(jax.local_devices(backend="gpu")[0]):
         production_fields = {}
         for name, arrays in (("ad", a), ("fd_2", b)):
@@ -164,11 +242,52 @@ def main():
                     f"saved_gap={row['raw_D13_minus_saved']:.9e} "
                     f"diagnostic_gap={row['diagnostic_minus_scan_D13']:.9e} "
                     f"primary_schur_residual={row['primary_schur_residual_l2']:.9e}", flush=True)
+            if audit_head is not None:
+                previous_pivots = None
+                for label, arrays in (("ad", a), ("fd2", b)):
+                    es = jnp.asarray(production_fields["ad" if label == "ad" else "fd_2"][r,e])
+                    if head_executable is None:
+                        print("[head-audit] compiling bounded three-block audit", flush=True)
+                        head_executable = audit_head.lower(prepared, nu, es).compile()
+                        memory = head_executable.memory_analysis()
+                        needed = memory.temp_size_in_bytes+memory.argument_size_in_bytes+memory.output_size_in_bytes-memory.alias_size_in_bytes
+                        print(f"[head-audit] compiled buffer estimate={needed} bytes", flush=True)
+                        if needed > 4*1024**3:
+                            raise RuntimeError("Head-audit compiled buffers exceed the 4 GiB limit; audit not executed.")
+                    data = jax.device_get(head_executable(prepared, nu, es))
+                    np.savez_compressed(args.out_dir/f"head_r{r}_{label}.npz", **data)
+                    changed = 0 if previous_pivots is None else int(np.count_nonzero(data['pivots'] != previous_pivots))
+                    previous_pivots = data['pivots'].copy()
+                    print(f"[head-audit] r={r} case={label} Schur_conditions={data['schur_condition']} "
+                        f"head_condition={float(data['head_condition']):.9e} "
+                        f"scaled_condition={float(data['scaled_head_condition']):.9e} changed_head_pivots={changed}", flush=True)
+                    saved = float(arrays["support['database'].D13"][r,n,e])/float(arrays["scan_inputs['channels'].drds"][r])
+                    for i, method in enumerate(("production_head", "pivoted_head", "scaled_pivoted_head")):
+                        coeff = data['coefficients'][i]
+                        item = dict(radius_index=r, case=label, method=method,
+                            raw_D11=float(coeff[0]), raw_D31=float(coeff[1]), raw_D13=float(coeff[2]),
+                            raw_D33=float(coeff[3]), onsager_residual=float(abs(coeff[1]+coeff[2])),
+                            raw_D13_minus_saved=float(coeff[2])-saved,
+                            head_condition=float(data['head_condition']), scaled_condition=float(data['scaled_head_condition']),
+                            primary_relative_residual=float(data['relative_residual'][i,0]),
+                            parallel_relative_residual=float(data['relative_residual'][i,1]),
+                            primary_backward_error=float(data['backward_error'][i,0]),
+                            parallel_backward_error=float(data['backward_error'][i,1]))
+                        head_rows.append(item)
+                        print(f"[head-audit] r={r} case={label} method={method} D11={item['raw_D11']:.9e} "
+                            f"D13={item['raw_D13']:.16e} Onsager={item['onsager_residual']:.9e} "
+                            f"primary_relres={item['primary_relative_residual']:.9e} "
+                            f"parallel_relres={item['parallel_relative_residual']:.9e}", flush=True)
     with (args.out_dir/"comparison.csv").open("w", newline="") as stream:
         writer = csv.DictWriter(stream, fieldnames=list(rows[0]), lineterminator="\n")
         writer.writeheader()
         writer.writerows({k: f"{v:.16e}" if isinstance(v, float) else v for k,v in row.items()} for row in rows)
     print(f"[field-sensitivity] saved {args.out_dir/'comparison.csv'}", flush=True)
+    if head_rows:
+        with (args.out_dir/"head_comparison.csv").open("w", newline="") as stream:
+            writer = csv.DictWriter(stream, fieldnames=list(head_rows[0]), lineterminator="\n")
+            writer.writeheader()
+            writer.writerows({k: f"{v:.16e}" if isinstance(v, float) else v for k,v in row.items()} for row in head_rows)
 
 
 if __name__ == "__main__":

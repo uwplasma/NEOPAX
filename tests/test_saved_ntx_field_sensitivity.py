@@ -19,6 +19,37 @@ spec.loader.exec_module(check)
 
 
 class SavedNTXFieldTests(unittest.TestCase):
+    def test_reduced_head_matches_full_nonsymmetric_block_system(self):
+        rng = np.random.default_rng(7)
+        n, size = 5, 2
+        diagonal = 4*np.tile(np.eye(size), (n,1,1))+rng.normal(size=(n,size,size))*.1
+        lower, upper = (rng.normal(size=(n,size,size))*.2 for _ in range(2))
+        matrix = np.zeros((n*size,n*size))
+        for j in range(n):
+            matrix[j*size:(j+1)*size,j*size:(j+1)*size] = diagonal[j]
+            if j:
+                matrix[j*size:(j+1)*size,(j-1)*size:j*size] = lower[j]
+            if j+1 < n:
+                matrix[j*size:(j+1)*size,(j+1)*size:(j+2)*size] = upper[j]
+        rhs = np.zeros((n*size,2))
+        rhs[:3*size] = rng.normal(size=(3*size,2))
+        tail = diagonal[-1]
+        for j in range(n-2,1,-1):
+            tail = diagonal[j]-upper[j] @ np.linalg.solve(tail, lower[j+1])
+        head = check.head_matrix(diagonal, lower, upper, tail, np)
+        np.testing.assert_allclose(np.linalg.solve(head,rhs[:3*size]),
+            np.linalg.solve(matrix,rhs)[:3*size], rtol=1e-13, atol=1e-14)
+
+    def test_two_sided_scaling_preserves_original_equations(self):
+        matrix = np.diag([2.**-30,2.**30]) @ np.array([[4.,1.],[2.,3.]]) @ np.diag([2.**4,2.**-4])
+        expected = np.array([[.5,1.],[-.25,.5]])
+        rhs = matrix @ expected
+        actual, scaled = check.scaled_solve(matrix,rhs,np)
+        np.testing.assert_allclose(actual, expected, rtol=1e-12, atol=1e-12)
+        np.testing.assert_allclose(matrix @ actual, rhs, rtol=1e-14, atol=0.)
+        self.assertLess(np.max(np.abs(scaled))/np.min(np.abs(scaled)),
+                        np.max(np.abs(matrix))/np.min(np.abs(matrix)))
+
     def test_reported_field_values_remain_one_ulp_apart(self):
         before = np.float64(float.fromhex("0x1.c035ba9ccdac0p-7"))
         after = np.nextafter(before, -np.inf)
