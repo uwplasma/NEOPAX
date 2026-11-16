@@ -1,5 +1,6 @@
 """Saved-input and CPU-refusal checks; no real JAX import or physics solve."""
 from contextlib import redirect_stderr
+from dataclasses import dataclass
 import importlib.util
 import io
 from pathlib import Path
@@ -19,6 +20,38 @@ spec.loader.exec_module(check)
 
 
 class SavedNTXFieldTests(unittest.TestCase):
+    def test_aot_lowering_receives_flat_leaves_and_keeps_inputs_dynamic(self):
+        @dataclass
+        class Surface:
+            m: object
+            scale: object
+            def __post_init__(self):
+                len(self.m)
+
+        class ArgInfo:
+            pass
+
+        def rebuild(_, values):
+            return Surface(*values[:2]), *values[2:]
+
+        def jit(function):
+            def lower(*args):
+                for arg in args:
+                    if isinstance(arg, Surface):
+                        Surface(ArgInfo(), ArgInfo())  # Reproduce the old AOT metadata failure.
+                return SimpleNamespace(compile=lambda: function)
+            return SimpleNamespace(lower=lower)
+
+        backend = SimpleNamespace(jit=jit, tree_util=SimpleNamespace(tree_unflatten=rebuild))
+        function = lambda surface, nu, es: surface.scale*np.sum(surface.m)+nu+es
+        with self.assertRaisesRegex(TypeError, "ArgInfo"):
+            jit(function).lower(Surface(np.array([1.,2.]), 3.), .1, .2)
+        leaves = (np.array([1.,2.]), 3., .1, .2)
+        compiled = check.compile_flat_inputs(function, leaves, object(), backend)
+        self.assertAlmostEqual(compiled(*leaves), 9.3)
+        self.assertAlmostEqual(compiled(*leaves[:-1], .4), 9.5)
+        self.assertAlmostEqual(compiled(np.array([2.,3.]), *leaves[1:]), 15.3)
+
     def test_reduced_head_matches_full_nonsymmetric_block_system(self):
         rng = np.random.default_rng(7)
         n, size = 5, 2

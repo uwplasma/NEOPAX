@@ -116,3 +116,22 @@ Use a new output directory and add the flag:
 The two additional local NumPy checks compare the assembled reduced head to
 an independent full block-system solve and verify that scaling preserves the
 original equations. The actual GPU reduced-system audit remains pending.
+
+### Correction to the explicit compilation interface
+
+The `cd3c2c3` remote attempt stopped at `audit_head.lower(prepared, nu, es)`.
+JAX's ahead-of-time argument metadata reconstructed NTX's surface dataclass
+with `ArgInfo` placeholders; its `__post_init__` then called `len(self.m)`
+on a placeholder. The reduced audit never executed, so this failure adds
+no numerical evidence and is separate from the coefficient sensitivity.
+
+The diagnostic now lowers and calls the executable with flat array/scalar
+leaves. It reconstructs the same prepared-system tree inside tracing, where
+array shapes are available, and checks that the static tree structure is
+unchanged before reusing the executable. All numerical inputs remain dynamic.
+No NTX validation, operator, solver or AD rule changes. A NumPy/mock regression
+reproduces the old constructor failure and verifies the new interface and
+changing field/surface inputs.
+
+Preserve the failed output and use a new directory on rerun, for example
+`outputs/generic_ntx_head_audit_flat_inputs_20261116`.

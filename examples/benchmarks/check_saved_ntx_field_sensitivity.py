@@ -133,6 +133,14 @@ def make_head_audit():
     return jax.jit(audit)
 
 
+def compile_flat_inputs(function, leaves, structure, backend):
+    # AOT argument metadata contains ArgInfo objects, which fail NTX's surface
+    # validation. Rebuild the dataclasses only inside tracing, from array leaves.
+    def flat_function(*values):
+        return function(*backend.tree_util.tree_unflatten(structure, values))
+    return backend.jit(flat_function).lower(*leaves).compile()
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--run-dir", type=Path, required=True)
@@ -196,6 +204,7 @@ def main():
     head_rows = []
     audit_head = make_head_audit() if args.audit_head else None
     head_executable = None
+    head_input_structure = None
     with jax.default_device(jax.local_devices(backend="gpu")[0]):
         production_fields = {}
         for name, arrays in (("ad", a), ("fd_2", b)):
@@ -246,15 +255,19 @@ def main():
                 previous_pivots = None
                 for label, arrays in (("ad", a), ("fd2", b)):
                     es = jnp.asarray(production_fields["ad" if label == "ad" else "fd_2"][r,e])
+                    head_values, structure = jax.tree_util.tree_flatten((prepared, nu, es))
                     if head_executable is None:
                         print("[head-audit] compiling bounded three-block audit", flush=True)
-                        head_executable = audit_head.lower(prepared, nu, es).compile()
+                        head_input_structure = structure
+                        head_executable = compile_flat_inputs(audit_head, head_values, structure, jax)
                         memory = head_executable.memory_analysis()
                         needed = memory.temp_size_in_bytes+memory.argument_size_in_bytes+memory.output_size_in_bytes-memory.alias_size_in_bytes
                         print(f"[head-audit] compiled buffer estimate={needed} bytes", flush=True)
                         if needed > 4*1024**3:
                             raise RuntimeError("Head-audit compiled buffers exceed the 4 GiB limit; audit not executed.")
-                    data = jax.device_get(head_executable(prepared, nu, es))
+                    if structure != head_input_structure:
+                        raise ValueError("Prepared-system static structure changed between saved cases.")
+                    data = jax.device_get(head_executable(*head_values))
                     np.savez_compressed(args.out_dir/f"head_r{r}_{label}.npz", **data)
                     changed = 0 if previous_pivots is None else int(np.count_nonzero(data['pivots'] != previous_pivots))
                     previous_pivots = data['pivots'].copy()
