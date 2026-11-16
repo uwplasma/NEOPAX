@@ -36,6 +36,7 @@ from NEOPAX._transport_solvers import (  # noqa: E402
     _project_flat_state_if_needed,
     _RadauAcceptedStepAttemptContext,
     _radau_adaptive_final_state_rollout,
+    _radau_adaptive_payload_trace_rollout,
     _radau_adaptive_schedule_rollout,
     _radau_adaptive_final_y_realized_schedule,
     _radau_adaptive_final_y_realized_schedule_exact_jvp,

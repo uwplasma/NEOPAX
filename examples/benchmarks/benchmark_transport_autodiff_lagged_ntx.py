@@ -25,6 +25,7 @@ import copy
 import csv
 import dataclasses
 import json
+import os
 import sys
 import time
 from functools import partial
@@ -60,6 +61,7 @@ from NEOPAX._transport_solvers import (
     _make_radau_initial_step_state,
     _project_flat_state_if_needed,
     _radau_adaptive_final_state_rollout,
+    _radau_adaptive_payload_trace_rollout,
     _radau_adaptive_schedule_rollout,
     _radau_adaptive_final_y_realized_schedule,
     _radau_adaptive_final_y_realized_schedule_vjp,
@@ -1657,61 +1659,6 @@ def _host_step_pullback_replay_primal_path() -> str | None:
     return value or None
 
 
-def _run_host_local_step_pullback_diagnostic_for_parameter_vector(
-    parameter_values,
-    *,
-    config: dict[str, Any],
-    runtime,
-    baseline_state,
-    profile_cfg: dict[str, Any],
-    parameter_names: tuple[str, ...] = PROFILE_VECTOR_PARAMETERS,
-    accepted_step_limit_override: int | None = None,
-):
-    accepted_y_bar_override = None
-    y_bar_path = _host_step_pullback_y_bar_path()
-    if y_bar_path is not None:
-        accepted_y_bar_override = np.load(y_bar_path)
-    replay_dy_bar_override = None
-    replay_dy_bar_path = _host_step_pullback_replay_dy_bar_path()
-    if replay_dy_bar_path is not None:
-        replay_dy_bar_override = np.load(replay_dy_bar_path)
-    replay_inputs_override = None
-    replay_inputs_path = _host_step_pullback_replay_inputs_path()
-    if replay_inputs_path is not None:
-        replay_inputs_override = dict(np.load(replay_inputs_path))
-    replay_lagged_cache_override = None
-    replay_lagged_cache_path = _host_step_pullback_replay_lagged_cache_path()
-    if replay_lagged_cache_path is not None:
-        with open(replay_lagged_cache_path, "rb") as f:
-            replay_lagged_cache_override = pickle.load(f)
-    replay_primal_override = None
-    replay_primal_path = _host_step_pullback_replay_primal_path()
-    if replay_primal_path is not None:
-        replay_primal_override = dict(np.load(replay_primal_path))
-    execution_context, _prepared_rollout, initial_carry, max_total_steps, stop_after_accepted_steps, _solver, _solve_vector_field = (
-        _prepare_realized_schedule_profile_vector_rollout_option_a(
-            parameter_values,
-            config=config,
-            runtime=runtime,
-            baseline_state=baseline_state,
-            profile_cfg=profile_cfg,
-            parameter_names=parameter_names,
-            accepted_step_limit_override=accepted_step_limit_override,
-        )
-    )
-    return _radau_host_local_step_pullback_compare(
-        execution_context,
-        initial_carry,
-        max_total_steps=max_total_steps,
-        stop_after_accepted_steps=stop_after_accepted_steps,
-        segment_index=_step_pullback_segment_index(),
-        step_index=_step_pullback_step_index(),
-        accepted_y_bar_override=accepted_y_bar_override,
-        replay_dy_bar_override=replay_dy_bar_override,
-        replay_inputs_override=replay_inputs_override,
-        replay_lagged_cache_override=replay_lagged_cache_override,
-        replay_primal_override=replay_primal_override,
-    )
 def _adaptive_rollout_objectives_realized_schedule_only_for_parameter_vector(
     parameter_values,
     *,
@@ -3860,10 +3807,11 @@ def _write_figure(report: dict[str, Any], out: Path) -> None:
     plt.close(fig)
 
 
-def _print_terminal_summary(report: dict[str, Any]) -> None:
-    def _fmt_float(value) -> str:
-        return "na" if value is None else f"{float(value):.6e}"
+def _fmt_float(value) -> str:
+    return "na" if value is None else f"{float(value):.6e}"
 
+
+def _print_terminal_summary(report: dict[str, Any]) -> None:
     if report.get("small_step_only_check"):
         print(
             f"[autodiff-gate] mode=small_step_only "
@@ -5871,6 +5819,7 @@ def build_realized_schedule_rollout_report(
     include_nan_debug: bool = False,
     nan_debug_mode: str = "minimal",
     nan_debug_include_one_step_compare: bool = False,
+    accepted_step_limit: int | None = None,
 ) -> dict[str, Any]:
     if parameter_name not in ALLOWED_PARAMETERS:
         raise ValueError(f"parameter_name must be one of {sorted(ALLOWED_PARAMETERS)}")
@@ -7031,7 +6980,7 @@ def build_baseline_dt_path_safe_compose_scan_report(
         profile_cfg=profile_cfg,
         parameter_name=parameter_name,
         use_realized_schedule_jvp=False,
-        accepted_step_limit_override=max_checkpoint,
+        accepted_step_limit_override=None,
     )
     baseline_diag = _adaptive_rollout_diagnostics(baseline_rollout)
     safe_attempt_index = int(known_first_bad_attempt_index) - int(safe_attempt_margin)
@@ -7175,7 +7124,7 @@ def build_baseline_dt_path_safe_trajectory_compare_report(
         profile_cfg=profile_cfg,
         parameter_name=parameter_name,
         use_realized_schedule_jvp=False,
-        accepted_step_limit_override=checkpoint_index,
+        accepted_step_limit_override=None,
     )
     baseline_diag = _adaptive_rollout_diagnostics(baseline_rollout)
     safe_attempt_index = int(known_first_bad_attempt_index) - int(safe_attempt_margin)
@@ -7332,7 +7281,7 @@ def build_baseline_dt_path_safe_state_trajectory_compare_report(
         profile_cfg=profile_cfg,
         parameter_name=parameter_name,
         use_realized_schedule_jvp=False,
-        accepted_step_limit_override=checkpoint_index,
+        accepted_step_limit_override=None,
     )
     baseline_diag = _adaptive_rollout_diagnostics(baseline_rollout)
     safe_attempt_index = int(known_first_bad_attempt_index) - int(safe_attempt_margin)
