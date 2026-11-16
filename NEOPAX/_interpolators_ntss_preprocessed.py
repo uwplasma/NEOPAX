@@ -9,6 +9,11 @@ config.update("jax_enable_x64", True)
 SEGMENT_WIDTH = 16
 
 
+def _guarded_ratio(numerator, denominator, *, cutoff=1.0e-30):
+    small = jnp.abs(denominator) <= cutoff
+    return jnp.where(small, 0.0, numerator / jnp.where(small, 1.0, denominator))
+
+
 def _dkfttc(cmul, eps, xkn, xio, xrm, b0):
     a1 = 0.9733
     a2 = 0.3899
@@ -225,6 +230,11 @@ def _segment_arrays(xs_full, ys_full, start):
 
 
 def _inpold_fixed(x, xs, ys, n, icl, fcl, icu, fcu, fmix):
+    # Padding is used only for storage/search. Keep inactive polynomial
+    # branches finite when vmap evaluates both sides of a conditional.
+    indices = jnp.arange(xs.shape[0])
+    last = jnp.clip(n - 1, 0, xs.shape[0] - 1)
+    xs = jnp.where(indices <= last, xs, xs[last] + indices - last)
     kcl = jnp.clip(icl, 0, 4)
     kcu = jnp.clip(icu, 0, 4)
     amix = jnp.clip(fmix, 0.0, 1.0)
@@ -246,8 +256,8 @@ def _inpold_fixed(x, xs, ys, n, icl, fcl, icu, fcu, fmix):
         b1 = jnp.where(right_ge3, 1.0, xs[2] - xs[1])
         b2 = jnp.where(right_ge3, xs[2] - xs[1], 0.5 * (xs[2] - xs[1]) ** 2)
         det = a1 * b2 - a2 * b1
-        g1 = jnp.where(jnp.abs(det) <= 1.0e-30, 0.0, (a0 * b2 - a2 * b0) / det)
-        g2 = jnp.where(jnp.abs(det) <= 1.0e-30, 0.0, (a1 * b0 - a0 * b1) / det)
+        g1 = _guarded_ratio(a0 * b2 - a2 * b0, det)
+        g2 = _guarded_ratio(a1 * b0 - a0 * b1, det)
 
         def left():
             dy = g1 + g2 * (xs[0] - xs[1])
@@ -291,9 +301,9 @@ def _inpold_fixed(x, xs, ys, n, icl, fcl, icu, fcu, fmix):
 
             c0, c1, c2, c3 = bc_vals()
             det = a1 * (b2 * c3 - b3 * c2) - a2 * (b1 * c3 - b3 * c1) + a3 * (b1 * c2 - b2 * c1)
-            g1 = jnp.where(jnp.abs(det) <= 1.0e-30, 0.0, (a0 * (b2 * c3 - b3 * c2) - a2 * (b0 * c3 - b3 * c0) + a3 * (b0 * c2 - b2 * c0)) / det)
-            g2 = jnp.where(jnp.abs(det) <= 1.0e-30, 0.0, (a1 * (b0 * c3 - b3 * c0) - a0 * (b1 * c3 - b3 * c1) + a3 * (b1 * c0 - b0 * c1)) / det)
-            g3 = jnp.where(jnp.abs(det) <= 1.0e-30, 0.0, (a1 * (b2 * c0 - b0 * c2) - a2 * (b1 * c0 - b0 * c1) + a0 * (b1 * c2 - b2 * c1)) / det)
+            g1 = _guarded_ratio(a0 * (b2 * c3 - b3 * c2) - a2 * (b0 * c3 - b3 * c0) + a3 * (b0 * c2 - b2 * c0), det)
+            g2 = _guarded_ratio(a1 * (b0 * c3 - b3 * c0) - a0 * (b1 * c3 - b3 * c1) + a3 * (b1 * c0 - b0 * c1), det)
+            g3 = _guarded_ratio(a1 * (b2 * c0 - b0 * c2) - a2 * (b1 * c0 - b0 * c1) + a0 * (b1 * c2 - b2 * c1), det)
 
             def x_le_i1():
                 gx = xs[i1] - xs[i2]
@@ -320,7 +330,7 @@ def _inpold_fixed(x, xs, ys, n, icl, fcl, icu, fcu, fmix):
             b1 = xs[i1] - xl
             b2 = 0.5 * b1**2
             det = a1 * b2 - a2 * b1
-            dyl_raw = jnp.where(jnp.abs(det) <= 1.0e-30, 0.0, (a0 * b2 - b0 * a2) / det)
+            dyl_raw = _guarded_ratio(a0 * b2 - b0 * a2, det)
             dyl = jnp.where((yl - ys[i1]) * (yl - ys[i3]) >= 0.0, amix * dyl_raw, dyl_raw)
 
             def interior():
@@ -334,7 +344,7 @@ def _inpold_fixed(x, xs, ys, n, icl, fcl, icu, fcu, fmix):
                 b1u = xs[i2] - xu
                 b2u = 0.5 * b1u**2
                 detu = a1u * b2u - a2u * b1u
-                dyu_raw = jnp.where(jnp.abs(detu) <= 1.0e-30, 0.0, (a0u * b2u - b0u * a2u) / detu)
+                dyu_raw = _guarded_ratio(a0u * b2u - b0u * a2u, detu)
                 dyu = jnp.where((yu - ys[i2]) * (yu - ys[i4]) >= 0.0, amix * dyu_raw, dyu_raw)
                 return xl, yl, dyl, xu, yu, dyu
 
@@ -356,7 +366,7 @@ def _inpold_fixed(x, xs, ys, n, icl, fcl, icu, fcu, fmix):
                 c2 = jnp.where(kcu == 0, b1r, jnp.where(kcu == 1, 1.0, jnp.where(kcu == 2, 0.0, 1.0)))
                 c3 = jnp.where(kcu == 0, b1r**2, jnp.where(kcu == 1, 2.0 * b1r, jnp.where(kcu == 2, 2.0, jnp.where(kcu == 3, 2.0 * b2r, 2.0))))
                 detr = a1r * (b2r * c3 - b3r * c2) - a2r * (b1r * c3 - b3r * c1) + a3r * (b1r * c2 - b2r * c1)
-                g1r = jnp.where(jnp.abs(detr) <= 1.0e-30, 0.0, (a0r * (b2r * c3 - b3r * c2) - a2r * (b0r * c3 - b3r * c0) + a3r * (b0r * c2 - b2r * c0)) / detr)
+                g1r = _guarded_ratio(a0r * (b2r * c3 - b3r * c2) - a2r * (b0r * c3 - b3r * c0) + a3r * (b0r * c2 - b2r * c0), detr)
                 xu = xs[i2r]
                 yu = ys[i2r]
                 return xl, yl, dyl, xu, yu, g1r
@@ -373,8 +383,8 @@ def _inpold_fixed(x, xs, ys, n, icl, fcl, icu, fcu, fmix):
             b3c = dx2
             detc = a2c * b3c - a3c * b2c
             g1c = dyl2
-            g2c = jnp.where(jnp.abs(detc) <= 1.0e-30, 0.0, (a0c * b3c - a3c * b0c) / detc)
-            g3c = jnp.where(jnp.abs(detc) <= 1.0e-30, 0.0, (a2c * b0c - a0c * b2c) / detc)
+            g2c = _guarded_ratio(a0c * b3c - a3c * b0c, detc)
+            g3c = _guarded_ratio(a2c * b0c - a0c * b2c, detc)
             gx = x - xl
             return yl + gx * (g1c + gx * (0.5 * g2c + (1.0 / 3.0) * g3c * gx))
 

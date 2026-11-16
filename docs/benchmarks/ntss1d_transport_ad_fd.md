@@ -106,3 +106,37 @@ roundoff allowance of `1e-12*(1+abs(AD_value))`. A
 error at a common baseline; inspect the recorded differences first.
 
 No full GPU benchmark or numerical JAX derivative check was run locally.
+
+## GPU preflight failure and interpolation guard fix, 2026-11-16
+
+The remote run at `822607f` stopped in the kernel checks before launching any
+transport workers. The forward comparison and scan-conversion/coordinate AD
+check passed. The coefficient-table pullback check found a nonfinite result;
+the original assertion did not print its coefficient/query subcase.
+The [supplied log](ntss1d_preflight_failure_2026-11-16.txt) is retained.
+
+Source-only NumPy execution reproduced unsafe arithmetic for the upper-clamp
+query `(radius=1.6, nu/v=0.002, Er/v=0.1)`: `_inpold_fixed` evaluated `0/0`
+inside a `where` whose returned value was zero. Evaluating both conditional
+branches also exposed nonfinite arithmetic in the inactive interior branch,
+where the padded knot was `inf`. These computations can contaminate AD even
+when the selected forward value is finite.
+
+The fix guards the denominator before division, replaces only unused padding
+with finite increasing coordinates inside the polynomial, and makes inactive
+repeated-knot radial weights finite. The existing interpolation formula and
+determinant cutoff are retained. Geometry and transport solver code is
+unchanged.
+
+The local regression executes both sides of the conditionals with NumPy
+floating-point exceptions enabled. Six local interpolation checks pass;
+the three GPU checks are skipped locally. Against the pre-fix capture,
+[all 108 forward coefficient values](ntss1d_guard_forward_check_2026-11-16.csv)
+are bitwise identical. This is forward/arithmetic verification, not a GPU AD
+result. The GPU tests now label each coefficient/query subcase and also check
+the coordinate chain with batched interior, exact-node and clamped queries.
+
+After pushing/pulling the correction, rerun the Python comparison with a new
+directory, for example `outputs/ntss1d_ad_fd16_guard_fix_20261116`. The old
+directory records the previous source digest and failed preflight. The runner
+again starts transport AD/FD only after its GPU kernel checks pass.

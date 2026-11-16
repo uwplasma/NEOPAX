@@ -1,0 +1,95 @@
+    --accepted-step-limit 16 \
+    2>&1 | tee "$neopax_run/comparison.log"
+) || printf '\nComparison stopped after an error; terminal kept open.\n'
+M	NEOPAX/version.py
+Already on 'en/v0_main'
+Your branch is up to date with 'origin/en/v0_main'.
+remote: Enumerating objects: 22, done.
+remote: Counting objects: 100% (22/22), done.
+remote: Compressing objects: 100% (5/5), done.
+remote: Total 22 (delta 17), reused 22 (delta 17), pack-reused 0 (from 0)
+Unpacking objects: 100% (22/22), 15.53 KiB | 397.00 KiB/s, done.
+From https://github.com/uwplasma/NEOPAX
+ * branch            en/v0_main -> FETCH_HEAD
+   adb0413..822607f  en/v0_main -> origin/en/v0_main
+Updating adb0413..822607f
+Fast-forward
+ NEOPAX/_database.py                                |  36 ++++
+ NEOPAX/_monoenergetic.py                           |   3 +-
+ NEOPAX/_monoenergetic_interpolators.py             |  15 ++
+ NEOPAX/_neoclassical.py                            |  10 +-
+ NEOPAX/_transport_flux_models.py                   |  35 +++-
+ docs/benchmarks/ntss1d_transport_ad_fd.md          | 108 +++++++++++
+ docs/input_file_reference.rst                      |  15 ++
+ ...vmec_realtime_geometry_benchmark_black_box.toml |   2 +
+ ...se_vmec_realtime_geometry_benchmark_ntss1d.toml | 195 ++++++++++++++++++++
+ .../benchmarks/benchmark_transport_ntss1d_ad_fd.py | 205 +++++++++++++++++++++
+ ...hmark_transport_realtime_geometry_forward_fd.py |   5 +-
+ .../benchmark_transport_reverse_ad_only.py         |   6 +
+ tests/test_runtime_ntss1d_interpolation.py         | 200 ++++++++++++++++++++
+ tests/test_transport_ntss1d_ad_fd_runner.py        |  91 +++++++++
+ 14 files changed, 919 insertions(+), 7 deletions(-)
+ create mode 100644 docs/benchmarks/ntss1d_transport_ad_fd.md
+ create mode 100644 examples/benchmarks/Solve_Transport_equations_wHe_radau_ntx_scan_runtime_database_vmec_realtime_geometry_benchmark_ntss1d.toml
+ create mode 100644 examples/benchmarks/benchmark_transport_ntss1d_ad_fd.py
+ create mode 100644 tests/test_runtime_ntss1d_interpolation.py
+ create mode 100644 tests/test_transport_ntss1d_ad_fd_runner.py
+[ntss1d-comparison] /usr/bin/time -v /home/exouser/jax_env/bin/python -m unittest discover -s tests -p test_runtime_ntss1d_interpolation.py -v
+E1116 07:30:50.317826   59956 cuda_executor.cc:1639] Nvml call failed with 3(Not Supported). Assuming PCIe gen 3 x16 bandwidth.
+E1116 07:30:50.319035   59946 cuda_executor.cc:1639] Nvml call failed with 3(Not Supported). Assuming PCIe gen 3 x16 bandwidth.
+test_coefficient_table_pullbacks_agree_with_fd (test_runtime_ntss1d_interpolation.RuntimeNTSS1DGPUChecks.test_coefficient_table_pullbacks_agree_with_fd) ... FAIL
+test_primal_matches_existing_preprocessed_kernel (test_runtime_ntss1d_interpolation.RuntimeNTSS1DGPUChecks.test_primal_matches_existing_preprocessed_kernel) ... ok
+test_recorded_scan_conversion_and_coordinate_chain_agree_with_fd (test_runtime_ntss1d_interpolation.RuntimeNTSS1DGPUChecks.test_recorded_scan_conversion_and_coordinate_chain_agree_with_fd) ... ok
+test_all_three_table_transposes_use_ntss1d_rule (test_runtime_ntss1d_interpolation.RuntimeNTSS1DRoutingTests.test_all_three_table_transposes_use_ntss1d_rule) ... ok
+test_conversion_retains_scan_leaves_and_exposes_ntss_coordinates (test_runtime_ntss1d_interpolation.RuntimeNTSS1DRoutingTests.test_conversion_retains_scan_leaves_and_exposes_ntss_coordinates) ... ok
+test_live_views_match_the_existing_ntss1d_kernel_with_numpy (test_runtime_ntss1d_interpolation.RuntimeNTSS1DRoutingTests.test_live_views_match_the_existing_ntss1d_kernel_with_numpy) ... ok
+test_only_interpolation_changes_in_the_comparison_toml (test_runtime_ntss1d_interpolation.RuntimeNTSS1DRoutingTests.test_only_interpolation_changes_in_the_comparison_toml) ... ok
+test_recorded_scan_transposes_preserve_the_interpolation_choice (test_runtime_ntss1d_interpolation.RuntimeNTSS1DRoutingTests.test_recorded_scan_transposes_preserve_the_interpolation_choice) ... ok
+
+======================================================================
+FAIL: test_coefficient_table_pullbacks_agree_with_fd (test_runtime_ntss1d_interpolation.RuntimeNTSS1DGPUChecks.test_coefficient_table_pullbacks_agree_with_fd)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/exouser/NEOPAX/tests/test_runtime_ntss1d_interpolation.py", line 180, in test_coefficient_table_pullbacks_agree_with_fd
+    self.assertTrue(np.isfinite(np.asarray(bar)).all() and np.isfinite(float(fd)))
+AssertionError: np.False_ is not true
+
+----------------------------------------------------------------------
+Ran 8 tests in 67.645s
+
+FAILED (failures=1)
+Command exited with non-zero status 1
+	Command being timed: "/home/exouser/jax_env/bin/python -m unittest discover -s tests -p test_runtime_ntss1d_interpolation.py -v"
+	User time (seconds): 76.75
+	System time (seconds): 5.74
+	Percent of CPU this job got: 120%
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 1:08.67
+	Average shared text size (kbytes): 0
+	Average unshared data size (kbytes): 0
+	Average stack size (kbytes): 0
+	Average total size (kbytes): 0
+	Maximum resident set size (kbytes): 1721308
+	Average resident set size (kbytes): 0
+	Major (requiring I/O) page faults: 4
+	Minor (reclaiming a frame) page faults: 1101070
+	Voluntary context switches: 125780
+	Involuntary context switches: 13936
+	Swaps: 0
+	File system inputs: 24
+	File system outputs: 15944
+	Socket messages sent: 0
+	Socket messages received: 0
+	Signals delivered: 0
+	Page size (bytes): 4096
+	Exit status: 1
+Traceback (most recent call last):
+  File "/home/exouser/NEOPAX/examples/benchmarks/benchmark_transport_ntss1d_ad_fd.py", line 205, in <module>
+    main()
+  File "/home/exouser/NEOPAX/examples/benchmarks/benchmark_transport_ntss1d_ad_fd.py", line 178, in main
+    worker([sys.executable, "-m", "unittest", "discover", "-s", "tests",
+  File "/home/exouser/NEOPAX/examples/benchmarks/benchmark_transport_ntss1d_ad_fd.py", line 84, in worker
+    raise RuntimeError(f"Worker failed; see {directory/'run.log'}")
+RuntimeError: Worker failed; see /home/exouser/NEOPAX/outputs/ntss1d_ad_fd16_20261116/kernel_check/run.log
+
+Comparison stopped after an error; terminal kept open.
+(jax_env) exouser@neopax-31:~$ 

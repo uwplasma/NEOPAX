@@ -48,18 +48,29 @@ def scan_arrays(array_module=np):
         D11=1e-3*(1+i/80), D13=.01*array_module.sin(i/8), D33=2+i/100)
 
 
+def numpy_kernel_namespace(*, evaluate_both=False):
+    ns = numpy_namespace()
+    ns["jax"].jit = lambda function: function
+    def cond(flag, yes, no):
+        if evaluate_both:
+            a, b = yes(), no()
+            return a if flag else b
+        return (yes if flag else no)()
+    ns["jax"].lax = SimpleNamespace(cond=cond)
+    ns["jax"].vmap = lambda function: lambda values: np.stack([function(v) for v in values])
+    ns["contract_scalar_queries"] = lambda **kwargs: lambda function: function
+    ns["NTSS1D_WIDTH"] = 16
+    for name in ("_guarded_ratio", "_inpold_fixed"):
+        definition("NEOPAX/_interpolators_ntss_preprocessed.py", name, ns)
+    for name in ("_clamped_interval_index", "_fraction", "_lagrange3", "_lagrange4_weights", "_surface_ntss1d",
+                 "get_Dij_preprocessed_3d_ntss_radius_ntss1d"):
+        definition("NEOPAX/_interpolators_preprocessed.py", name, ns)
+    return ns
+
+
 class RuntimeNTSS1DRoutingTests(unittest.TestCase):
     def test_live_views_match_the_existing_ntss1d_kernel_with_numpy(self):
-        ns = numpy_namespace()
-        ns["jax"].jit = lambda function: function
-        ns["jax"].lax = SimpleNamespace(cond=lambda flag, yes, no: (yes if flag else no)())
-        ns["jax"].vmap = lambda function: lambda values: np.stack([function(v) for v in values])
-        ns["contract_scalar_queries"] = lambda **kwargs: lambda function: function
-        ns["NTSS1D_WIDTH"] = 16
-        definition("NEOPAX/_interpolators_ntss_preprocessed.py", "_inpold_fixed", ns)
-        for name in ("_clamped_interval_index", "_fraction", "_lagrange3", "_surface_ntss1d",
-                     "get_Dij_preprocessed_3d_ntss_radius_ntss1d"):
-            definition("NEOPAX/_interpolators_preprocessed.py", name, ns)
+        ns = numpy_kernel_namespace()
         for name in ("PreprocessedMonoenergetic3DNTSSRadius", "PreprocessedMonoenergetic3DNTSSRadiusNTSS1D",
                      "_add_ntss1d_padding"):
             definition("NEOPAX/_database_preprocessed.py", name, ns)
@@ -75,6 +86,15 @@ class RuntimeNTSS1DRoutingTests(unittest.TestCase):
                         value = kernel(r, nu, er, db)
                         self.assertTrue(np.isfinite(value).all())
                         np.testing.assert_allclose(value, kernel(r, nu, er, reference), rtol=0., atol=0.)
+
+    def test_inactive_clamp_and_padding_branches_have_finite_arithmetic(self):
+        ns = numpy_kernel_namespace(evaluate_both=True)
+        db = ns["_ntx_runtime_scan_to_neopax_monoenergetic"](scan_arrays(), a_b=1.7, interpolation_mode=MODE)
+        kernel = ns["get_Dij_preprocessed_3d_ntss_radius_ntss1d"]
+        with np.errstate(all="raise"):
+            for r in (.05, .79, 1.6, *db.r_grid):
+                for er in (0., 1e-4, .1):
+                    self.assertTrue(np.isfinite(kernel(r, 4e-5, er, db)).all())
 
     def test_only_interpolation_changes_in_the_comparison_toml(self):
         folder = ROOT/"examples/benchmarks"
@@ -171,29 +191,40 @@ class RuntimeNTSS1DGPUChecks(unittest.TestCase):
             table = getattr(db, field)
             direction = jnp.cos(jnp.arange(table.size)).reshape(table.shape) * jnp.maximum(jnp.max(jnp.abs(table)), 1e-8)
             for r, nu, er in ((.79, 4e-5, 1e-4), (.05, 1e-6, 0.), (1.6, 2e-3, .1)):
-                bar = self.table_bar(r, nu, er, .7, i, db)
-                def objective(epsilon):
-                    value = dataclasses.replace(db, **{field: table+epsilon*direction})
-                    return .7*self.kernel(value)(r, nu, er, value)[i]
-                h = 1e-6
-                fd = (objective(h)-objective(-h))/(2*h)
-                self.assertTrue(np.isfinite(np.asarray(bar)).all() and np.isfinite(float(fd)))
-                np.testing.assert_allclose(jnp.sum(bar*direction), fd, rtol=2e-5, atol=2e-7)
+                with self.subTest(field=field, radius=r, nu=nu, Er=er):
+                    bar = self.table_bar(r, nu, er, .7, i, db)
+                    def objective(epsilon):
+                        value = dataclasses.replace(db, **{field: table+epsilon*direction})
+                        return .7*self.kernel(value)(r, nu, er, value)[i]
+                    h = 1e-6
+                    fd = (objective(h)-objective(-h))/(2*h)
+                    nonfinite = int(np.count_nonzero(~np.isfinite(np.asarray(bar))))
+                    self.assertTrue(nonfinite == 0 and np.isfinite(float(fd)),
+                                    f"table_bar_nonfinite={nonfinite} fd={float(fd):.16e}")
+                    np.testing.assert_allclose(jnp.sum(bar*direction), fd, rtol=2e-5, atol=2e-7)
 
     def test_recorded_scan_conversion_and_coordinate_chain_agree_with_fd(self):
         jax, jnp, scan = self.jax, self.jnp, self.scan
-        def objective(epsilon):
+        def objective(epsilon, batched):
             changed = SimpleNamespace(rho=scan.rho, nu_v=scan.nu_v*jnp.exp(.2*epsilon),
                 Er=scan.Er*(1+.03*epsilon), drds=scan.drds*(1+.07*epsilon),
                 D11=scan.D11*(1+.1*epsilon), D13=scan.D13+.01*epsilon,
                 D33=scan.D33*(1+.05*epsilon))
             db = self.convert(changed, a_b=1.7*(1+.02*epsilon), interpolation_mode=MODE)
-            return jnp.dot(jnp.array([.7, -.4, 1.2]), self.kernel(db)(.79, 4e-5, 1e-4, db))
-        h = 1e-6
-        ad = jax.grad(objective)(jnp.array(0.))
-        fd = (objective(h)-objective(-h))/(2*h)
-        self.assertTrue(np.isfinite(float(ad)) and np.isfinite(float(fd)))
-        np.testing.assert_allclose(ad, fd, rtol=2e-5, atol=2e-7)
+            if batched:
+                queries = jnp.array([[.05, 1e-6, 0.], [.51, 4e-5, 1e-4],
+                                     [.79, 4e-5, 1e-4], [1.6, 2e-3, .1]])
+                values = jax.vmap(lambda q: self.kernel(db)(q[0], q[1], q[2], db))(queries)
+            else:
+                values = self.kernel(db)(.79, 4e-5, 1e-4, db)
+            return jnp.sum(values*jnp.array([.7, -.4, 1.2]))
+        for batched in (False, True):
+            with self.subTest(batched_queries=batched):
+                h = 1e-6
+                ad = jax.grad(lambda e: objective(e, batched))(jnp.array(0.))
+                fd = (objective(h, batched)-objective(-h, batched))/(2*h)
+                self.assertTrue(np.isfinite(float(ad)) and np.isfinite(float(fd)))
+                np.testing.assert_allclose(ad, fd, rtol=2e-5, atol=2e-7)
 
 
 if __name__ == "__main__":

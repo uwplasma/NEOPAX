@@ -2,7 +2,7 @@ import jax
 import jax.numpy as jnp
 import dataclasses
 from jax import config
-from ._interpolators_ntss_preprocessed import _inpold_fixed
+from ._interpolators_ntss_preprocessed import _inpold_fixed, _guarded_ratio
 from ._native_interpolation import contract_scalar_queries
 
 # to use higher precision
@@ -67,9 +67,9 @@ def _corner_cube(table, ir, inu0, inu1, ier0_lo, ier1_lo):
 
 
 def _lagrange3(x, x0, x1, x2, y0, y1, y2):
-    h0 = (x - x1) * (x - x2) / ((x0 - x1) * (x0 - x2))
-    h1 = (x - x0) * (x - x2) / ((x1 - x0) * (x1 - x2))
-    h2 = (x - x0) * (x - x1) / ((x2 - x0) * (x2 - x1))
+    h0 = _guarded_ratio((x - x1) * (x - x2), (x0 - x1) * (x0 - x2), cutoff=0.0)
+    h1 = _guarded_ratio((x - x0) * (x - x2), (x1 - x0) * (x1 - x2), cutoff=0.0)
+    h2 = _guarded_ratio((x - x0) * (x - x1), (x2 - x0) * (x2 - x1), cutoff=0.0)
     return h0 * y0 + h1 * y1 + h2 * y2
 
 
@@ -116,10 +116,10 @@ def _lagrange3_weights(x, x0, x1, x2):
 
 def _lagrange4_weights(x, x0, x1, x2, x3):
     return jnp.asarray((
-        (x - x1) * (x - x2) * (x - x3) / ((x0 - x1) * (x0 - x2) * (x0 - x3)),
-        (x - x0) * (x - x2) * (x - x3) / ((x1 - x0) * (x1 - x2) * (x1 - x3)),
-        (x - x0) * (x - x1) * (x - x3) / ((x2 - x0) * (x2 - x1) * (x2 - x3)),
-        (x - x0) * (x - x1) * (x - x2) / ((x3 - x0) * (x3 - x1) * (x3 - x2)),
+        _guarded_ratio((x - x1) * (x - x2) * (x - x3), (x0 - x1) * (x0 - x2) * (x0 - x3), cutoff=0.0),
+        _guarded_ratio((x - x0) * (x - x2) * (x - x3), (x1 - x0) * (x1 - x2) * (x1 - x3), cutoff=0.0),
+        _guarded_ratio((x - x0) * (x - x1) * (x - x3), (x2 - x0) * (x2 - x1) * (x2 - x3), cutoff=0.0),
+        _guarded_ratio((x - x0) * (x - x1) * (x - x2), (x3 - x0) * (x3 - x1) * (x3 - x2), cutoff=0.0),
     ))
 
 
@@ -689,9 +689,7 @@ def get_Dij_preprocessed_3d_ntss_radius_ntss1d(grid_x, grid_nu, grid_Er, databas
         )
 
     def edge3():
-        x0 = arr[nil]
-        x1 = arr[nil + 1]
-        x2 = arr[nil + 2]
+        x0, x1, x2 = arr[stencil_idx[:3]]
         return jnp.asarray(
             [
                 _lagrange3(xri, x0, x1, x2, atc[0, 0], atc[1, 0], atc[2, 0]),
@@ -701,16 +699,10 @@ def get_Dij_preprocessed_3d_ntss_radius_ntss1d(grid_x, grid_nu, grid_Er, databas
         )
 
     def interior4():
-        x0 = arr[nil]
-        x1 = arr[nil + 1]
-        x2 = arr[nil + 2]
-        x3 = arr[nil + 3]
+        x0, x1, x2, x3 = arr[stencil_idx]
 
         def lagrange4(y0, y1, y2, y3):
-            h0 = (xri - x1) * (xri - x2) * (xri - x3) / ((x0 - x1) * (x0 - x2) * (x0 - x3))
-            h1 = (xri - x0) * (xri - x2) * (xri - x3) / ((x1 - x0) * (x1 - x2) * (x1 - x3))
-            h2 = (xri - x0) * (xri - x1) * (xri - x3) / ((x2 - x0) * (x2 - x1) * (x2 - x3))
-            h3 = (xri - x0) * (xri - x1) * (xri - x2) / ((x3 - x0) * (x3 - x1) * (x3 - x2))
+            h0, h1, h2, h3 = _lagrange4_weights(xri, x0, x1, x2, x3)
             return h0 * y0 + h1 * y1 + h2 * y2 + h3 * y3
 
         return jnp.asarray(
