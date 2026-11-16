@@ -1024,6 +1024,7 @@ def build_runtime_context(config: dict) -> tuple[RuntimeContext, TransportState 
             param_n=int(geom_cfg.get("vmec_param_n", 0)),
             mboz=_optional_config_int(geom_cfg.get("mboz", geom_cfg.get("vmec_mboz"))),
             nboz=_optional_config_int(geom_cfg.get("nboz", geom_cfg.get("vmec_nboz"))),
+            vmec_response_mode=geom_cfg.get("vmec_response_mode", "raw_block"),
         )
         lane = str(geom_cfg.get("vmec_lane", "forward")).strip().lower()
         param_delta = float(geom_cfg.get("vmec_param_delta", 0.0))

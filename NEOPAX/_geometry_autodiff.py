@@ -805,7 +805,7 @@ def _param_vector_gradient_from_implicit_param_grads(
 
 @dataclasses.dataclass(frozen=True, slots=True)
 class GeometryRawBlockSolve:
-    """Shared VMEC implicit solve payload for raw-block transpose pullbacks."""
+    """Shared VMEC primal and selected linear-response route."""
 
     implicit: Any
     implicit_params: Any
@@ -813,6 +813,39 @@ class GeometryRawBlockSolve:
     state: Any
     dof_mask: Any
     param_entries: tuple[dict[str, Any], ...]
+    vmec_response_mode: str = "raw_block"
+
+
+def normalize_vmec_response_mode(mode):
+    mode = str(mode).strip().lower()
+    if mode not in {"raw_block", "main"}:
+        raise ValueError("vmec_response_mode must be 'raw_block' or 'main'.")
+    return mode
+
+
+def _main_vmec_state_tangent_batch(implicit, params, cfg, state, mask, tangent_batch):
+    """Use one main VMEX factorization for all geometry directions."""
+    tangents, report = implicit.implicit_state_tangent_multi_rhs(
+        params, cfg, state, mask, tangent_batch,
+        probe_chunk_size=1, response_chunk_size=1,
+    )
+    converged = jnp.all(report.converged)
+    if isinstance(converged, jax.core.Tracer):
+        # Preserve the certificate across a traced caller; failed columns
+        # must never silently become finite optimizer derivatives.
+        return jax.tree_util.tree_map(
+            lambda value: jnp.where(converged, value, jnp.nan), tangents)
+    if not bool(jax.device_get(converged)):
+        raise FloatingPointError("Main VMEX state tangent failed its convergence certificate.")
+    return tangents
+
+
+def _main_vmec_state_pullback_batch(raw_solve, state_bars):
+    return raw_solve.implicit.implicit_state_pullback_multi_rhs(
+        raw_solve.implicit_params, raw_solve.implicit_cfg,
+        raw_solve.state, raw_solve.dof_mask, state_bars,
+        solver="block", probe_chunk_size=1, response_chunk_size=1,
+    )
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -828,6 +861,7 @@ class GeometryRawBlockStage:
     implicit: Any
     implicit_cfg: Any
     param_entries: tuple[dict[str, Any], ...]
+    vmec_response_mode: str = "raw_block"
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -952,6 +986,8 @@ def geometry_raw_block_stage(
         implicit=implicit,
         implicit_cfg=implicit.make_config(context.indata, **config_kwargs),
         param_entries=boundary_param_entries(context, param_specs),
+        vmec_response_mode=normalize_vmec_response_mode(
+            getattr(context, "vmec_response_mode", "raw_block")),
     )
 
 
@@ -1144,6 +1180,10 @@ def geometry_raw_block_solve_from_param_vector(
         implicit_params = jax.tree_util.tree_map(_stop_gradient_if_jax_value, implicit_params)
     if dispatch_cache_probe is not None:
         dispatch_cache_probe("before_vmex_solve")
+    response_mode = normalize_vmec_response_mode(getattr(context, "vmec_response_mode", "raw_block"))
+    if response_mode == "main" and not all(hasattr(implicit, name) for name in (
+        "implicit_state_tangent_multi_rhs", "implicit_state_pullback_multi_rhs")):
+        raise AttributeError("Main VMEX response requires the public multi-RHS tangent and pullback APIs.")
     if solve_with_aux_runner is None:
         state, dof_mask = implicit.solve_implicit_with_aux(implicit_params, implicit_cfg)
     else:
@@ -1164,6 +1204,7 @@ def geometry_raw_block_solve_from_param_vector(
         state=state,
         dof_mask=dof_mask,
         param_entries=param_entries,
+        vmec_response_mode=response_mode,
     )
 
 
@@ -1227,6 +1268,9 @@ def geometry_raw_block_transpose_from_state_bars(
     """Pull a batch of VMEC-state cotangents back to raw boundary parameters."""
 
     implicit = raw_block_solve.implicit
+    if getattr(raw_block_solve, "vmec_response_mode", "raw_block") == "main":
+        param_bars = _main_vmec_state_pullback_batch(raw_block_solve, state_bar_batch)
+        return _param_vector_gradient_from_implicit_param_grads(param_bars, raw_block_solve.param_entries)
     if not hasattr(implicit, "implicit_state_pullback_multi_rhs_raw_block_transpose"):
         raise AttributeError(
             "The active VMEC backend does not expose implicit_state_pullback_multi_rhs_raw_block_transpose."
@@ -1408,6 +1452,7 @@ class GeometryAutodiffContext:
     vmec_default_max_iter: int
     vmec_default_step_size: float
     vmec_default_ftol: float | None
+    vmec_response_mode: str = "raw_block"
 
 
 def _boundary_kind_for_family(family: str) -> str:
@@ -1521,7 +1566,9 @@ def build_geometry_autodiff_context(
     nboz: int | None = None,
     surface_s: Sequence[float] = (0.25, 0.5, 0.75),
     qi_maxj_settings: QImaxJBackendSettings | Mapping[str, Any] | str | None = None,
+    vmec_response_mode: str = "raw_block",
 ) -> GeometryAutodiffContext:
+    response_mode = normalize_vmec_response_mode(vmec_response_mode)
     backend_settings = normalize_qi_maxj_backend_settings(qi_maxj_settings)
     vmec_backend = _import_vmec_jax()
     booz_api = _import_booz_xform_jax_api()
@@ -1621,6 +1668,7 @@ def build_geometry_autodiff_context(
         vmec_default_max_iter=_vmec_default_max_iter_from_indata(indata),
         vmec_default_step_size=_vmec_default_step_size_from_indata(indata),
         vmec_default_ftol=_vmec_default_ftol_from_indata(indata),
+        vmec_response_mode=response_mode,
     )
 
 
@@ -4061,7 +4109,8 @@ def geometry_full_ad_objective_table_pullback_from_param_vector(
     if bool(return_state_bars):
         return values_by_name, state_bar
     if final_mode == "raw_block_transpose":
-        if not hasattr(implicit, "implicit_state_pullback_multi_rhs_raw_block_transpose"):
+        if (getattr(raw_block_solve, "vmec_response_mode", "raw_block") != "main"
+            and not hasattr(implicit, "implicit_state_pullback_multi_rhs_raw_block_transpose")):
             raise AttributeError(
                 "The active VMEC backend does not expose implicit_state_pullback_multi_rhs_raw_block_transpose."
             )
@@ -5638,7 +5687,8 @@ def geometry_payload_pullback_from_param_vector_raw_block_transpose(
     state = raw_block_solve.state
     dof_mask = raw_block_solve.dof_mask
     param_entries = raw_block_solve.param_entries
-    if not hasattr(implicit, "implicit_state_pullback_multi_rhs_raw_block_transpose"):
+    response_mode = normalize_vmec_response_mode(getattr(raw_block_solve, "vmec_response_mode", "raw_block"))
+    if response_mode != "main" and not hasattr(implicit, "implicit_state_pullback_multi_rhs_raw_block_transpose"):
         raise AttributeError(
             "The active VMEC backend does not expose implicit_state_pullback_multi_rhs_raw_block_transpose."
         )
@@ -6362,7 +6412,8 @@ def geometry_payload_pullback_from_param_vector_raw_block_transpose(
             or return_state_bars
             or extra_state_bars is not None
             or extra_state_bars_factory is not None
-            or not hasattr(implicit, "implicit_state_tangent_raw_block")
+            or not hasattr(implicit, "implicit_state_tangent_multi_rhs" if response_mode == "main"
+                           else "implicit_state_tangent_raw_block")
         ):
             return None
         if payload_kind == "ntx_scan_runtime":
@@ -6456,15 +6507,7 @@ def geometry_payload_pullback_from_param_vector_raw_block_transpose(
             os.environ.get("NEOPAX_GRADIENT_AUDIT_DIR")
         )
 
-        def _single_gradient_column(param_tangent):
-            state_tangent = implicit.implicit_state_tangent_raw_block(
-                implicit_params,
-                implicit_cfg,
-                state,
-                dof_mask,
-                param_tangent,
-                probe_chunk_size=1,
-            )
+        def _contract_state_tangent(state_tangent):
             if capture_tangents:
                 total, leaves = scan_setup["tangent_contraction"](
                     state_tangent, capture_leaves=True
@@ -6476,19 +6519,29 @@ def geometry_payload_pullback_from_param_vector_raw_block_transpose(
             )
 
         _probe("before_compact_tangent_map")
-        gradient_columns = jax.lax.map(
-            _single_gradient_column,
-            param_tangent_batch,
-        )
+        if response_mode == "main":
+            state_tangent_batch = _main_vmec_state_tangent_batch(
+                implicit, implicit_params, implicit_cfg, state, dof_mask, param_tangent_batch)
+            gradient_columns = jax.lax.map(_contract_state_tangent, state_tangent_batch)
+        else:
+            def _single_gradient_column(param_tangent):
+                state_tangent = implicit.implicit_state_tangent_raw_block(
+                    implicit_params, implicit_cfg, state, dof_mask, param_tangent,
+                    probe_chunk_size=1,
+                )
+                return _contract_state_tangent(state_tangent)
+            gradient_columns = jax.lax.map(_single_gradient_column, param_tangent_batch)
         if capture_tangents:
             gradient_columns, state_tangents, payload_tangents = gradient_columns
             save_gradient_audit("ad_compact_tangents", state_tangents=state_tangents,
                 payload_tangents=payload_tangents, payload_paths=scan_setup["active_leaf_paths"],
+                vmec_response_mode=np.asarray(response_mode),
                 parameter_labels=tuple(f"{e['family']}:{e['m']}:{e['n']}" for e in param_entries))
         _probe("after_compact_tangent_map")
         if progress_label is not None:
             print(
                 f"{progress_label} compact_payload_tangent_contract=True "
+                f"vmec_response_mode={response_mode} "
                 f"native_vmec_coefficient_tangent_contract={native_bar_tuple is not None}",
                 flush=True,
             )
@@ -6503,6 +6556,7 @@ def geometry_payload_pullback_from_param_vector_raw_block_transpose(
     streamed_gradient_matrix = _try_compact_payload_tangent_contract_to_param_matrix()
     if streamed_gradient_matrix is not None:
         save_gradient_audit("ad_compact_geometry", state=state, params=implicit_params,
+            vmec_response_mode=np.asarray(response_mode),
             mask=dof_mask, payload_bars=tuple(payload_bars), geometry_gradients=streamed_gradient_matrix,
             native_vmec_face_coefficient_bars=native_vmec_face_coefficient_bars,
             parameter_labels=tuple(f"{e['family']}:{e['m']}:{e['n']}" for e in param_entries))
@@ -6603,14 +6657,13 @@ def geometry_payload_pullback_from_param_vector_raw_block_transpose(
     save_gradient_audit("ad_vmec_transpose_input", state=state, params=implicit_params,
         mask=dof_mask, state_bars=raw_block_state_bar_batch,
         parameter_labels=tuple(f"{e['family']}:{e['m']}:{e['n']}" for e in param_entries))
-    param_bar_batch = implicit.implicit_state_pullback_multi_rhs_raw_block_transpose(
-        implicit_params,
-        implicit_cfg,
-        state,
-        dof_mask,
-        raw_block_state_bar_batch,
-        probe_chunk_size=1,
-    )
+    if response_mode == "main":
+        param_bar_batch = _main_vmec_state_pullback_batch(raw_block_solve, raw_block_state_bar_batch)
+    else:
+        param_bar_batch = implicit.implicit_state_pullback_multi_rhs_raw_block_transpose(
+            implicit_params, implicit_cfg, state, dof_mask, raw_block_state_bar_batch,
+            probe_chunk_size=1,
+        )
     _probe("after_raw_block_transpose")
     save_gradient_audit("ad_vmec_transpose_output", parameter_bars=param_bar_batch)
     if progress_label is not None:

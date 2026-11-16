@@ -1811,6 +1811,7 @@ def geometry_initial_er_root_only_least_squares_problem(
         nboz=int(nboz),
         surface_s=tuple(float(s) for s in surfaces),
         qi_maxj_settings=qi_maxj_settings_eff,
+        vmec_response_mode=geom_cfg.get("vmec_response_mode", "raw_block"),
     )
     if parameters is not None:
         specs = parse_vmec_boundary_parameter_specs(
@@ -2744,6 +2745,7 @@ def geometry_full_transport_least_squares_problem(
         nboz=int(nboz),
         surface_s=tuple(float(s) for s in surfaces),
         qi_maxj_settings=qi_maxj_settings_eff,
+        vmec_response_mode=geom_cfg.get("vmec_response_mode", "raw_block"),
     )
     if parameters is not None:
         specs = parse_vmec_boundary_parameter_specs(

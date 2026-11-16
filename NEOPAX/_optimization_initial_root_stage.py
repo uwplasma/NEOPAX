@@ -723,6 +723,7 @@ def build_initial_root_payload_assembly_stage(
                 state=state,
                 dof_mask=static_dof_mask,
                 param_entries=raw_block_stage.param_entries,
+                vmec_response_mode=raw_block_stage.vmec_response_mode,
             )
             support_bars = support_bars_layout.rebuild(support_bars_floating_leaves)
             return payload_to_vmec_impl(
@@ -872,6 +873,7 @@ def raw_block_solve_from_dynamic_payload(
         state=state,
         dof_mask=dof_mask,
         param_entries=raw_block_stage.param_entries,
+        vmec_response_mode=raw_block_stage.vmec_response_mode,
     )
 
 

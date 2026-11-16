@@ -880,6 +880,7 @@ def _geometry_context_from_config(config: dict[str, Any], geometry_parameter: st
         mboz=_optional_config_int(geom_cfg.get("mboz", geom_cfg.get("vmec_mboz"))),
         nboz=_optional_config_int(geom_cfg.get("nboz", geom_cfg.get("vmec_nboz"))),
         surface_s=surface_s,
+        vmec_response_mode=geom_cfg.get("vmec_response_mode", "raw_block"),
     )
 
 
@@ -4366,6 +4367,7 @@ def _run_realtime_geometry_optimization_api_smoke(
         "residual_labels": list(result.residual_labels),
         "vmec_primal_lane": str(config.get("geometry", {}).get("vmec_lane", "forward")),
         "vmec_pullback_lane": "ad",
+        "vmec_response_mode": geometry_context.vmec_response_mode,
         "parameter_order": list(result.parameter_labels),
         "objective_values": objective_values_np,
         "residuals": residuals_np.tolist(),
@@ -4416,7 +4418,8 @@ def _run_realtime_geometry_optimization_api_smoke(
         f"objective={args.objective} "
         f"residual_count={len(result.residual_labels)} "
         f"parameter_count={len(result.parameter_labels)} "
-        f"replay_jacobian_reuse_mode={replay_jacobian_reuse_mode} all_finite={report['all_finite']} "
+        f"replay_jacobian_reuse_mode={replay_jacobian_reuse_mode} "
+        f"vmec_response_mode={geometry_context.vmec_response_mode} all_finite={report['all_finite']} "
         f"elapsed_s={elapsed_s:.3f}",
         flush=True,
     )
@@ -5473,7 +5476,8 @@ def _run_realtime_geometry_reverse_mode(
     # support-payload pullbacks against VMEC harmonics.
     print(
         "[autodiff-gate] realtime geometry VMEX lanes: "
-        f"primal={geom_cfg.get('vmec_lane', 'forward')} pullback=ad",
+        f"primal={geom_cfg.get('vmec_lane', 'forward')} pullback=ad "
+        f"response={geom_cfg.get('vmec_response_mode', 'raw_block')}",
         flush=True,
     )
     phase_start = time.perf_counter()
@@ -5893,6 +5897,12 @@ def build_argument_parser():
             "profile-only reverse lane. 'profiles_plus_realtime_geometry' adds "
             "selected realtime VMEC boundary parameters to the active profile parameters."
         ),
+    )
+    parser.add_argument(
+        "--vmec-response-mode",
+        choices=("raw_block", "main"),
+        default=None,
+        help="VMEX geometry derivatives: existing raw block or main's certified multi-RHS APIs.",
     )
     parser.add_argument(
         "--reverse-geometry-parameter",
@@ -7029,6 +7039,8 @@ def main() -> None:
         ntx_exact_derivative_pullback_algebra=args.ntx_exact_derivative_pullback_algebra,
         radau_jacobian_reuse_mode=args.radau_jacobian_reuse_mode,
     )
+    if args.vmec_response_mode is not None:
+        config.setdefault("geometry", {})["vmec_response_mode"] = args.vmec_response_mode
     _apply_transport_solver_backend_override(config, args.transport_solver_backend_override)
     try:
         _validate_replay_jacobian_reuse_mode(args, config)

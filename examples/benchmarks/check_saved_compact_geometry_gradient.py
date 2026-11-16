@@ -85,6 +85,8 @@ def main():
         config = tomllib.load(stream)
     input_path = Path(config["geometry"]["vmec_input_file"])
     config["geometry"]["vmec_input_file"] = str((ROOT / input_path).resolve())
+    response_mode = str(captured.get("vmec_response_mode", "raw_block"))
+    config["geometry"]["vmec_response_mode"] = response_mode
     print(f"[compact-replay] JAX={jax.__version__} device={jax.devices()[0]}; "
           "reconstructing context from input, without solving equilibrium", flush=True)
     context = _geometry_context_from_config(config, labels[0])
@@ -102,7 +104,8 @@ def main():
                              for name, value in named_arrays(captured, "state.").items()})
     mask = SpectralState(**{name: jnp.asarray(value)
                             for name, value in named_arrays(captured, "mask.").items()})
-    raw = geo.GeometryRawBlockSolve(implicit, params, cfg, state, mask, entries)
+    raw = geo.GeometryRawBlockSolve(
+        implicit, params, cfg, state, mask, entries, vmec_response_mode=response_mode)
     n_r = captured["payload_bars[0]['geometry'].r_grid"].size
     surface_count = len(config["neoclassical"]["ntx_scan_rho"])
     payload_bars = []

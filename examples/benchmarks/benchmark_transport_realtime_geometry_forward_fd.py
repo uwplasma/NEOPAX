@@ -51,6 +51,8 @@ from NEOPAX._reverse_ad_initial_er import (  # noqa: E402
 from NEOPAX._reverse_ad_transport import objective_scalar_by_index  # noqa: E402
 from NEOPAX._optimization_diagnostics import save_gradient_audit  # noqa: E402
 from NEOPAX._geometry_autodiff import (  # noqa: E402
+    _main_vmec_state_tangent_batch,
+    normalize_vmec_response_mode,
     _implicit_params_with_boundary_deltas,
     _solve_state_for_single_param,
     boundary_param_entries,
@@ -857,7 +859,13 @@ def _param_unit_tangent_like(params, entry: dict[str, Any]):
     return dataclasses.replace(params, **leaves)
 
 
-def _manual_implicit_forward_state_tangent(*, params, param_tangent, cfg, x_star, dof_mask):
+def _manual_implicit_forward_state_tangent(
+    *, params, param_tangent, cfg, x_star, dof_mask, vmec_response_mode="raw_block",
+):
+    if normalize_vmec_response_mode(vmec_response_mode) == "main":
+        batch = jax.tree_util.tree_map(lambda value: value[None], param_tangent)
+        tangents = _main_vmec_state_tangent_batch(im, params, cfg, x_star, dof_mask, batch)
+        return jax.tree_util.tree_map(lambda value: value[0], tangents)
     if hasattr(im, "implicit_state_tangent_raw_block"):
         return im.implicit_state_tangent_raw_block(
             params,
@@ -966,6 +974,7 @@ def _frozen_linearized_vmec_geometry_bundle(
         cfg=cfg,
         x_star=state_star,
         dof_mask=dof_mask,
+        vmec_response_mode=geometry_context.vmec_response_mode,
     )
     coefficient_value = float(entry["baseline_coefficient"]) + float(baseline_delta)
     return {
@@ -1240,6 +1249,12 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--vmec-response-mode",
+        choices=("raw_block", "main"),
+        default=None,
+        help="VMEX frozen geometry tangent: existing raw block or main's certified multi-RHS API.",
+    )
+    parser.add_argument(
         "--geometry-fd-lane",
         choices=("frozen_linearized", "nonlinear_resolve"),
         default="frozen_linearized",
@@ -1375,6 +1390,8 @@ def main() -> None:
         ntx_exact_derivative_mode="direct",
         radau_jacobian_reuse_mode=args.radau_jacobian_reuse_mode,
     )
+    if args.vmec_response_mode is not None:
+        config.setdefault("geometry", {})["vmec_response_mode"] = args.vmec_response_mode
     if device_arg == "default":
         default_backend = jax.default_backend()
         selected_device = jax.local_devices(backend=default_backend)[0]
@@ -2079,6 +2096,7 @@ def main() -> None:
         else str(args.radau_jacobian_reuse_mode),
         "geometry_backend": str(config.get("geometry", {}).get("backend")),
         "vmec_lane": str(config.get("geometry", {}).get("vmec_lane", "forward")),
+        "vmec_response_mode": config.get("geometry", {}).get("vmec_response_mode", "raw_block"),
         "ntx_exact_surface_backend": str(
             config.get("neoclassical", {}).get("ntx_exact_surface_backend", "booz")
         ),
