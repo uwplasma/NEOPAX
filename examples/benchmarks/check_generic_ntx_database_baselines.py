@@ -71,7 +71,7 @@ def load_named_state(path, names, prefix="implicit"):
     return result
 
 
-def trace_inputs(config, geometry_module, booz_api, build_runtime, fields, frozen_state=None):
+def trace_inputs(config, geometry_module, booz_api, build_runtime, fields, frozen_state=None, projection_module=None):
     """Observe the production input-building path, stopping before NTX construction."""
     captured = {}
     def record(name, value):
@@ -86,6 +86,7 @@ def trace_inputs(config, geometry_module, booz_api, build_runtime, fields, froze
     import_vmec = geometry_module._import_vmec_module
     boozer = booz_api.booz_xform_from_inputs
     calls = 0
+    projections = 0
     observing = False
 
     def observed(function, *args, **kwargs):
@@ -125,6 +126,22 @@ def trace_inputs(config, geometry_module, booz_api, build_runtime, fields, froze
                     record("volume_inputs", dict(volume=result.volume, vp=result.vp))
                     return result
                 replacements[function] = norms
+        if projection_module is not None:
+            preparation = {
+                "_geometry": ("R_even", "R_odd", "Z_even", "Z_odd", "dlambda_dtheta_even",
+                    "dlambda_dtheta_odd", "dlambda_dzeta_even", "dlambda_dzeta_odd"),
+                "half_mesh_jacobian": ("sqrt_g",),
+                "metric_elements": ("guu", "guv", "gvv"),
+                "magnetic_fields": ("total_pressure", "pressure", "bsubu", "bsubv", "lamscale", "chips"),
+            }
+            for function, names in preparation.items():
+                if hasattr(module, function):
+                    def prepared(*args, _function=getattr(module, function), _name=function, _names=names, **kwargs):
+                        result = _function(*args, **kwargs)
+                        data = result[-1] if _name == "_geometry" else result
+                        record(f"vmex_{_name.lstrip('_')}", {n: getattr(data, n) for n in _names if hasattr(data, n)})
+                        return result
+                    replacements[function] = prepared
         return SimpleNamespace(**(vars(module) | replacements)) if replacements else module
 
     def geometry(*args, **kwargs):
@@ -141,6 +158,18 @@ def trace_inputs(config, geometry_module, booz_api, build_runtime, fields, froze
         raise InputsReady
 
     with ExitStack() as stack:
+        if projection_module is not None:
+            einsum = projection_module.einsum
+            def projection(subscripts, *operands, **kwargs):
+                nonlocal projections
+                if not observing or not isinstance(subscripts, str) or subscripts != "rtz,tzm->rm":
+                    return einsum(subscripts, *operands, **kwargs)
+                index, projections = projections, projections+1
+                record(f"projection_{index:02d}_inputs", dict(values=operands[0], basis=operands[1], options=kwargs))
+                result = einsum(subscripts, *operands, **kwargs)
+                record(f"projection_{index:02d}_outputs", result)
+                return result
+            stack.enter_context(patch.object(projection_module, "einsum", projection))
         for target, name, function in (
             (geometry_module, "_solve_state_for_single_param", equilibrium),
             (geometry_module, "_build_neopax_geometry_from_state", geometry),
@@ -156,9 +185,10 @@ def trace_inputs(config, geometry_module, booz_api, build_runtime, fields, froze
     raise RuntimeError("Input trace did not reach the pre-NTX boundary.")
 
 
-def first_changed_stage(rows):
+def first_changed_stage(rows, bitwise=False):
     names = {row["leaf"].split("'", 2)[1] for row in rows
-        if not row["arrays_match"] and row["leaf"].startswith("trace[")}
+        if not row.get("bits_match" if bitwise else "arrays_match", row["arrays_match"])
+        and row["leaf"].startswith("trace[")}
     return min(names) if names else "none"
 
 
@@ -174,6 +204,7 @@ def compare(reference, actual, name):
         shape_matches = a is not None and b is not None and a.shape == b.shape
         match = shape_matches and a.dtype == b.dtype and np.array_equal(
             a, b, equal_nan=a.dtype.kind in "fc" and b.dtype.kind in "fc")
+        bits_match = shape_matches and a.dtype == b.dtype and a.tobytes() == b.tobytes()
         difference = 0. if match else float("inf")
         nonfinite_match = False
         index = ""
@@ -193,14 +224,14 @@ def compare(reference, actual, name):
                     for label, value in (("reference", a[i].item()), ("actual", b[i].item())):
                         values[f"{label}_value"] = str(value)
                         values[f"{label}_hex"] = value.hex() if isinstance(value, float) else ""
-        rows.append(dict(comparison=name, leaf=key, arrays_match=bool(match),
+        rows.append(dict(comparison=name, leaf=key, arrays_match=bool(match), bits_match=bool(bits_match),
             shape_matches=shape_matches, nonfinite_values_match=bool(nonfinite_match),
             max_abs_difference=difference, max_abs_index=index, **values))
     print(f"[generic-baseline] {name}: differing leaves={sum(not r['arrays_match'] for r in rows)}", flush=True)
     for row in rows:
-        if row["leaf"] in TABLES or not row["arrays_match"]:
+        if row["leaf"] in TABLES or not row["arrays_match"] or not row["bits_match"]:
             print(f"  {row['leaf']}: max_abs={row['max_abs_difference']:.16e} "
-                  f"match={row['arrays_match']} index={row['max_abs_index']}", flush=True)
+                  f"match={row['arrays_match']} bits_match={row['bits_match']} index={row['max_abs_index']}", flush=True)
     return rows
 
 
@@ -240,7 +271,8 @@ def worker(args):
                     jnp.asarray(config['neoclassical']['ntx_scan_er_tilde']), channels.as_mapping())
                 return dict(zip(("Er", "Es", "Er_to_ertilde"), values, strict=True))
             captured = trace_inputs(config, geometry_module, geometry_module._import_booz_xform_jax_api(),
-                build_runtime_context, fields, frozen)
+                build_runtime_context, fields, frozen,
+                projection_module=jnp if args.trace_projections else None)
             snapshot = save_gradient_audit("normalization_inputs", trace=captured)
             state = next(value for name, value in captured.items() if name.endswith("_geometry_equilibrium"))
             np.savez_compressed(args.out_dir/"state_reference.npz", **jax.device_get(state))
@@ -289,10 +321,13 @@ def main():
     parser.add_argument("--out-dir", type=Path, required=True)
     parser.add_argument("--worker", choices=("ad", "fd"), help=argparse.SUPPRESS)
     parser.add_argument("--trace-inputs", action="store_true", help="Capture input boundaries and stop before NTX coefficient solves.")
+    parser.add_argument("--trace-projections", action="store_true", help="Input trace only: also capture VMEC-to-Boozer Fourier projection operands/results.")
     parser.add_argument("--reuse-states", type=Path, help="Input trace only: reuse saved states.npz or state_reference.npz; skip equilibrium solves.")
     parser.add_argument("--state-prefix", default="implicit", help="Field prefix for a reused states.npz (default: implicit).")
     args = parser.parse_args()
     args.config, args.out_dir = args.config.resolve(), args.out_dir.resolve()
+    if args.trace_projections and not args.trace_inputs:
+        parser.error("--trace-projections requires --trace-inputs.")
     if args.reuse_states:
         args.reuse_states = args.reuse_states.resolve()
         if not args.trace_inputs or not args.reuse_states.is_file():
@@ -324,6 +359,8 @@ def main():
                    "--out-dir", str(folder), "--worker", route]
         if args.trace_inputs:
             command += ["--trace-inputs"]
+            if args.trace_projections:
+                command += ["--trace-projections"]
             if args.reuse_states:
                 command += ["--reuse-states", str(args.reuse_states), "--state-prefix", args.state_prefix]
         print(f"[generic-baseline] starting independent {name} process; log={folder/'run.log'}", flush=True)
@@ -346,7 +383,8 @@ def main():
             compared = compare(arrays[reference_name], arrays[name], comparison)
             rows.extend(compared)
             if args.trace_inputs:
-                print(f"[normalization-trace] {name}: first_changed_stage={first_changed_stage(compared)}", flush=True)
+                print(f"[normalization-trace] {name}: first_changed_stage={first_changed_stage(compared)} "
+                    f"first_changed_bit_stage={first_changed_stage(compared, bitwise=True)}", flush=True)
     rows.extend(compare(arrays[runs[1][0]], arrays[runs[2][0]], f"{runs[1][0]}_vs_{runs[2][0]}"))
     if args.reference is not None:
         reference = saved_arrays(args.reference)

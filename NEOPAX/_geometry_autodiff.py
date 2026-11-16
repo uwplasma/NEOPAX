@@ -431,9 +431,11 @@ def _neopax_vmex_boozer_table_inputs_from_state(*, state, static, surface_indice
         hi = project(mirror(phys_rows(even, odd, rows), parity), parity)
         m_even = jnp.asarray((xm % 2) == 0)
         interp_even = 0.5 * (lo + hi)
+        # Match VMEX/booz_xform at the axis: do not amplify projected zeros.
+        axis_safe = jnp.where(sqrt_s[rows - 1] > 0.0, sqrt_s[rows - 1], 1.0)
         interp_odd = (
             0.5
-            * (lo / jnp.maximum(sqrt_s[rows - 1, None], 1.0e-30) + hi / sqrt_s[rows, None])
+            * (lo / axis_safe[:, None] + hi / sqrt_s[rows, None])
             * jnp.sqrt(s_half)[:, None]
         )
         return jnp.where(m_even[None, :], interp_even, interp_odd)

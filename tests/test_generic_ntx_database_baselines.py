@@ -22,6 +22,29 @@ spec.loader.exec_module(check)
 
 
 class GenericDatabaseBaselineTests(unittest.TestCase):
+    def test_projection_trace_preserves_operands_and_restores_einsum(self):
+        values, basis = np.ones((1,2,2)), np.ones((2,2,1))
+        numerical = SimpleNamespace(einsum=np.einsum)
+        magnetic = SimpleNamespace(bsubu=values)
+        imported = SimpleNamespace(magnetic_fields=lambda **kw: magnetic)
+        def geometry(*args, **kwargs):
+            self.assertIs(geo._import_vmec_module('fields').magnetic_fields(), magnetic)
+            return numerical.einsum('rtz,tzm->rm', values, basis)
+        geo = SimpleNamespace(_solve_state_for_single_param=lambda *a, **kw: np.ones(1),
+            _build_neopax_geometry_from_state=geometry, _import_vmec_module=lambda _: imported,
+            build_ntx_runtime_scan_inputs_from_vmec_state=lambda *a, **kw: (a[2], ()))
+        api = SimpleNamespace(booz_xform_from_inputs=lambda **kw: {})
+        def runtime(_):
+            state = geo._solve_state_for_single_param(None, 0.)
+            result = geo._build_neopax_geometry_from_state(None, state)
+            geo.build_ntx_runtime_scan_inputs_from_vmec_state(None, state, result)
+        captured = check.trace_inputs({}, geo, api, runtime, lambda c: c, projection_module=numerical)
+        self.assertIs(captured['02_vmex_magnetic_fields']['bsubu'], values)
+        self.assertIs(captured['03_projection_00_inputs']['values'], values)
+        self.assertIs(captured['03_projection_00_inputs']['basis'], basis)
+        np.testing.assert_array_equal(captured['04_projection_00_outputs'], [[4.]])
+        self.assertIs(numerical.einsum, np.einsum)
+
     def test_input_trace_observes_real_boundaries_and_restores_hooks(self):
         @dataclass
         class State:
@@ -89,6 +112,13 @@ class GenericDatabaseBaselineTests(unittest.TestCase):
             rows = check.compare(reference, changed, 'extra')
         self.assertEqual(len(rows), 4)
         self.assertTrue(any(not r['shape_matches'] for r in rows))
+        # Numerical equality treats signed zero as equal; track byte equality separately.
+        positive = {"trace['00_equilibrium']['zero']": np.array([0.])}
+        negative = {"trace['00_equilibrium']['zero']": np.array([-0.])}
+        with redirect_stdout(io.StringIO()):
+            rows = check.compare(positive, negative, 'signed_zero')
+        self.assertEqual(check.first_changed_stage(rows), 'none')
+        self.assertEqual(check.first_changed_stage(rows, bitwise=True), '00_equilibrium')
 
     def test_reused_state_loader_accepts_both_saved_formats_and_rejects_invalid_data(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -111,13 +141,14 @@ class GenericDatabaseBaselineTests(unittest.TestCase):
                 folder = Path(command[command.index('--out-dir')+1])
                 self.assertEqual(command[command.index('--worker')+1], 'fd')
                 self.assertIn('--trace-inputs', command)
+                self.assertIn('--trace-projections', command)
                 self.assertEqual(command[command.index('--reuse-states')+1], str(state))
                 np.savez(folder/'normalization_inputs_saved.npz', **{"trace['00_equilibrium']['R_cos']": np.ones(1)})
                 (folder/'metadata.json').write_text(json.dumps(dict(config_sha256='config', input_sha256='input',
                     reused_state_sha256='state', versions={}, sources={})))
                 return SimpleNamespace(returncode=0)
             with patch.object(sys, 'argv', [str(check.__file__), '--out-dir', str(output),
-                    '--trace-inputs', '--reuse-states', str(state)]), \
+                    '--trace-inputs', '--trace-projections', '--reuse-states', str(state)]), \
                  patch.object(check.subprocess, 'run', side_effect=complete) as run, redirect_stdout(io.StringIO()) as log:
                 check.main()
             self.assertEqual(run.call_count, 3)
