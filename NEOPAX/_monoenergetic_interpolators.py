@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from typing import Any, Callable
+import dataclasses
+import jax
 
 from ._interpolators import get_Dij, get_Dij_3d, get_Dij_loger_no_r
 from ._interpolators_ntss_preprocessed import get_Dij_ntss_preprocessed
@@ -38,3 +40,16 @@ MONOENERGETIC_INTERPOLATION_KERNELS: dict[str, Callable[..., Any]] = {
 def monoenergetic_interpolation_kernel(database: Any) -> Callable[..., Any]:
     kind = monoenergetic_database_kind(database)
     return MONOENERGETIC_INTERPOLATION_KERNELS[kind]
+
+
+def ntss1d_interpolation_table_bar(grid_x, grid_nu, grid_Er, local_bar, table_index, database):
+    """Transpose the actual nonlinear NTSS1D rule for one coefficient table."""
+    field = ("D11_log", "D13", "D33")[table_index]
+
+    def scalar(table):
+        return get_Dij_preprocessed_3d_ntss_radius_ntss1d(
+            grid_x, grid_nu, grid_Er, dataclasses.replace(database, **{field: table})
+        )[table_index]
+
+    _, pullback = jax.vjp(scalar, getattr(database, field))
+    return pullback(local_bar)[0]

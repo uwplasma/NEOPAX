@@ -159,6 +159,42 @@ class Monoenergetic:
 
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(eq=False, init=False)
+class MonoenergeticRuntimeNTSS1D(Monoenergetic):
+    """Live scan tables with the established radial NTSS1D query rule.
+
+    Keep the same independent scan leaves as Monoenergetic. Derived query
+    coordinates are views, so their cotangents fold through the recorded scan
+    once, without retaining duplicate preprocessed tables.
+    """
+
+    @property
+    def r_grid(self):
+        return self.a_b * self.rho
+
+    @property
+    def Er_grid(self):
+        return self.Er_list
+
+    @property
+    def Er_grid_ntss1d(self):
+        pad = max(0, 16 - self.Er_list.shape[1])
+        return jnp.pad(self.Er_list, ((0, 0), (0, pad)), constant_values=jnp.inf)
+
+    @property
+    def er_count_ntss1d(self):
+        return self.Er_list.shape[1]
+
+    @property
+    def gmix_er_ntss1d(self):
+        return 0.1
+
+    @property
+    def del_r(self):
+        return 1.0e-3
+
+
+@jax.tree_util.register_dataclass
+@dataclasses.dataclass(eq=False, init=False)
 class MonoenergeticLogErNoR(Monoenergetic):
     """Monoenergetic database using log10(|Er|) instead of log10(|Er|/r).
 

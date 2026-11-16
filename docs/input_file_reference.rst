@@ -95,6 +95,21 @@ Example:
     boozer_file = "./examples/inputs/boozermn_wout_QI_nfp2_newNT_opt_hires.nc"
     n_radial = 51
 
+For realtime VMEX geometry derivatives, ``vmec_response_mode`` selects the
+linear-response implementation. The default is ``"raw_block"``, the
+``v0_new``-style direct block response. To use VMEX main's certified response,
+add this key to the existing geometry section:
+
+.. code-block:: toml
+
+    [geometry]
+    vmec_response_mode = "main"
+
+Omitting the key or setting it to ``"raw_block"`` uses the default response.
+This option changes the geometry derivatives; ``vmec_lane`` still controls
+the equilibrium solve. The AD and FD benchmarks also accept
+``--vmec-response-mode``, which overrides the TOML value when supplied.
+
 
 ``[neoclassical]``, ``[turbulence]``, ``[classical]``
 ------------------------------------------------------

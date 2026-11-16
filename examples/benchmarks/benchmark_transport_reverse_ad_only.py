@@ -4368,6 +4368,7 @@ def _run_realtime_geometry_optimization_api_smoke(
         "vmec_primal_lane": str(config.get("geometry", {}).get("vmec_lane", "forward")),
         "vmec_pullback_lane": "ad",
         "vmec_response_mode": geometry_context.vmec_response_mode,
+        "database_interpolation_mode": str(config.get("neoclassical", {}).get("interpolation_mode", "generic")),
         "parameter_order": list(result.parameter_labels),
         "objective_values": objective_values_np,
         "residuals": residuals_np.tolist(),
@@ -7064,6 +7065,11 @@ def main() -> None:
             and not bool(args.initial_er_root_only_optimization_smoke)
         ),
     )
+    if is_database_geometry_reverse and str(neoclassical_cfg.get("interpolation_mode", "generic")).strip().lower() == "preprocessed_3d_radial_ntss1d":
+        for suffix in ("", "root_", "bootstrap_"):
+            key = f"reverse_database_{suffix}interpolation_transpose_mode"
+            if getattr(args, key) != "established":
+                parser.error("NTSS1D requires --" + key.replace("_", "-") + " established.")
     database_performance_override = (
         args.reverse_database_initial_support_mode != "split"
         or args.reverse_database_initial_state_mode != "generic"

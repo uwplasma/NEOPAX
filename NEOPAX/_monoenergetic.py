@@ -6,7 +6,7 @@ from typing import Any
 
 import jax.numpy as jnp
 
-from ._database import Monoenergetic, Monoenergetic3D, MonoenergeticLogErNoR
+from ._database import Monoenergetic, Monoenergetic3D, MonoenergeticLogErNoR, MonoenergeticRuntimeNTSS1D
 from ._database_ntss_preprocessed import NTSSPreprocessedMonoenergetic
 from ._database_preprocessed import (
     PreprocessedMonoenergetic3D,
@@ -75,6 +75,7 @@ MONOENERGETIC_LOADERS: dict[str, Callable[[Any, str], Any]] = {
 
 
 MONOENERGETIC_KIND_BY_CLASS: dict[type[Any], str] = {
+    MonoenergeticRuntimeNTSS1D: MONOENERGETIC_KIND_PREPROCESSED_3D_RADIAL_NTSS1D,
     PreprocessedMonoenergetic3DNTSSRadiusNTSS1DFixedNU: MONOENERGETIC_KIND_PREPROCESSED_3D_NTSS1D_FIXED,
     PreprocessedMonoenergetic3DNTSSRadiusNTSS1D: MONOENERGETIC_KIND_PREPROCESSED_3D_RADIAL_NTSS1D,
     PreprocessedMonoenergetic3DNTSSRadius: MONOENERGETIC_KIND_PREPROCESSED_3D_RADIAL,

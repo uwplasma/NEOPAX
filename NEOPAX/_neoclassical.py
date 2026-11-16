@@ -30,7 +30,7 @@ from ._monoenergetic import (
     MONOENERGETIC_KIND_PREPROCESSED_NTSS,
     monoenergetic_database_kind,
 )
-from ._monoenergetic_interpolators import monoenergetic_interpolation_kernel
+from ._monoenergetic_interpolators import monoenergetic_interpolation_kernel, ntss1d_interpolation_table_bar
 from ._interpolators import (
     monoenergetic_interpolation_sparse_coordinate_bar,
     monoenergetic_interpolation_sparse_table_bar,
@@ -1106,6 +1106,10 @@ def pullback_preprocessed_radial_database_fluxes(
         is_legacy_monoenergetic = monoenergetic_database_kind(database) == MONOENERGETIC_KIND_GENERIC
 
         def _scatter_one(nu_value, er_value, d11_value, d13_value, d33_value):
+            if monoenergetic_database_kind(database) == MONOENERGETIC_KIND_PREPROCESSED_3D_RADIAL_NTSS1D:
+                return tuple(ntss1d_interpolation_table_bar(
+                    geometry.r_grid[radius_index], nu_value, er_value, bar, i, database
+                ) for i, bar in enumerate((d11_value, d13_value, d33_value)))
             if is_legacy_monoenergetic:
                 return (
                     monoenergetic_interpolation_table_bar(
@@ -1278,6 +1282,10 @@ def pullback_preprocessed_radial_database_face_fluxes(
         dij_bar = jax.vmap(dij_pullback)(lbar)[0] if batched_rhs else dij_pullback(lbar)[0]
 
         def _scatter_one(nu_value, er_value, d11_value, d13_value, d33_value):
+            if monoenergetic_database_kind(database) == MONOENERGETIC_KIND_PREPROCESSED_3D_RADIAL_NTSS1D:
+                return tuple(ntss1d_interpolation_table_bar(
+                    geometry.r_grid_half[radius_index], nu_value, er_value, bar, i, database
+                ) for i, bar in enumerate((d11_value, d13_value, d33_value)))
             if is_legacy:
                 return (
                     monoenergetic_interpolation_table_bar(

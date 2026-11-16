@@ -87,7 +87,7 @@ from ._second_order_response import (
     take as _jet_take,
     unary_power as _jet_power,
 )
-from ._database import D11_POSITIVE_FLOOR, Monoenergetic
+from ._database import D11_POSITIVE_FLOOR, Monoenergetic, MonoenergeticRuntimeNTSS1D
 from ._interpolators_preprocessed import (
     get_Dij_preprocessed_3d_ntss_radius,
     radial_preprocessed_interpolation_stencil,
@@ -96,10 +96,12 @@ from ._interpolators_preprocessed import (
 from ._interpolators import monoenergetic_interpolation_table_bar
 from ._monoenergetic import (
     MONOENERGETIC_KIND_GENERIC,
+    MONOENERGETIC_KIND_PREPROCESSED_3D_RADIAL_NTSS1D,
     database_with_geometry_scale,
     monoenergetic_database_kind,
+    normalize_interpolation_mode,
 )
-from ._monoenergetic_interpolators import monoenergetic_interpolation_kernel
+from ._monoenergetic_interpolators import monoenergetic_interpolation_kernel, ntss1d_interpolation_table_bar
 from ._source_models import assemble_pressure_source_components, sum_source_components
 from ._model_api import (
     ModelCapabilities,
@@ -3567,6 +3569,9 @@ class NTXDatabaseTransportModel(TransportFluxModelBase):
     def _legacy_sparse_support_bar(database, support, interpolation_bars):
         """Embed the five exact sparse-interpolation bars in ``support``."""
 
+        if isinstance(database, MonoenergeticRuntimeNTSS1D):
+            raise ValueError("NTSS1D requires interpolation transpose mode 'established', not 'legacy_sparse'.")
+
         a_b_bar, er_list_bar, d11_bar, d13_bar, d33_bar = interpolation_bars
         batched_rhs = (
             jnp.asarray(d11_bar).ndim
@@ -5945,6 +5950,11 @@ class NTXDatabaseTransportModel(TransportFluxModelBase):
             def _scatter_table(table_index, table):
                 def _one_species(species_index, nu_ratio, er_ratio, local_bar):
                     def _one_energy(nu_value, er_value, bar_value):
+                        if monoenergetic_database_kind(database) == MONOENERGETIC_KIND_PREPROCESSED_3D_RADIAL_NTSS1D:
+                            return ntss1d_interpolation_table_bar(
+                                self.geometry.r_grid[jnp.maximum(radius_index, 1)],
+                                nu_value, er_value, bar_value, table_index, database,
+                            )
                         if monoenergetic_database_kind(database) == MONOENERGETIC_KIND_GENERIC:
                             return monoenergetic_interpolation_table_bar(
                                 self.geometry.r_grid[jnp.maximum(radius_index, 1)],
@@ -5989,6 +5999,8 @@ class NTXDatabaseTransportModel(TransportFluxModelBase):
         """
 
         database = self.database
+        if isinstance(database, MonoenergeticRuntimeNTSS1D):
+            raise ValueError("NTSS1D requires bootstrap interpolation transpose mode 'established'.")
         if not isinstance(database, Monoenergetic):
             raise TypeError(
                 "The legacy_sparse bootstrap transpose requires a "
@@ -6882,7 +6894,10 @@ def _build_ntx_field_channels(rho: jax.Array, er_tilde: jax.Array, channels: dic
     return er, es, er_to_ertilde
 
 
-def _ntx_runtime_scan_to_neopax_monoenergetic(scan, *, a_b):
+def _ntx_runtime_scan_to_neopax_monoenergetic(scan, *, a_b, interpolation_mode="generic"):
+    mode = normalize_interpolation_mode(interpolation_mode)
+    if mode not in {MONOENERGETIC_KIND_GENERIC, MONOENERGETIC_KIND_PREPROCESSED_3D_RADIAL_NTSS1D}:
+        raise ValueError("Runtime NTX scans support 'generic' or 'preprocessed_3d_radial_ntss1d' interpolation.")
     rho = jnp.asarray(scan.rho, dtype=jnp.float64)
     nu_v = jnp.asarray(scan.nu_v, dtype=jnp.float64)
     er = jnp.asarray(scan.Er, dtype=jnp.float64)
@@ -6894,7 +6909,8 @@ def _ntx_runtime_scan_to_neopax_monoenergetic(scan, *, a_b):
     radius = a_b_value * rho[:, None]
     er_list = jnp.log10(jnp.maximum(1.0e-8, jnp.abs(er) / radius))
     d11 = jnp.where(d11 > D11_POSITIVE_FLOOR, d11, D11_POSITIVE_FLOOR)
-    return Monoenergetic(
+    database_type = Monoenergetic if mode == MONOENERGETIC_KIND_GENERIC else MonoenergeticRuntimeNTSS1D
+    return database_type(
         a_b=a_b_value,
         rho=rho,
         nu_log=jnp.log10(nu_v),
@@ -7440,8 +7456,13 @@ class NTXRuntimeScanTransportModel(TransportFluxModelBase):
     record_scan_primal: bool = False
     scan_primal_record: Any = None
     scan_primal: Any = None
+    interpolation_mode: str = "generic"
 
     def __post_init__(self):
+        if normalize_interpolation_mode(self.interpolation_mode) not in {
+            MONOENERGETIC_KIND_GENERIC, MONOENERGETIC_KIND_PREPROCESSED_3D_RADIAL_NTSS1D,
+        }:
+            raise ValueError("Runtime NTX scans support 'generic' or 'preprocessed_3d_radial_ntss1d' interpolation.")
         order = int(self.lagged_response_taylor_order)
         if order not in {1, 2, 3}:
             raise ValueError(
@@ -7636,11 +7657,13 @@ class NTXRuntimeScanTransportModel(TransportFluxModelBase):
             f"rho={int(rho.shape[0])} nu_v={int(nu_v.shape[0])} "
             f"Er_tilde={int(er_tilde.shape[0])} "
             f"grid=({grid.n_theta},{grid.n_zeta},{grid.n_xi}) backend={str(self.surface_backend).strip().lower()}"
+            f" interpolation_mode={normalize_interpolation_mode(self.interpolation_mode)}"
         )
         return (
             _ntx_runtime_scan_to_neopax_monoenergetic(
                 scan,
                 a_b=jnp.asarray(channels["a_b"], dtype=jnp.float64),
+                interpolation_mode=self.interpolation_mode,
             ),
             scan_primal_record,
             raw_scan if self.record_scan_primal else None,
@@ -7675,6 +7698,7 @@ class NTXRuntimeScanTransportModel(TransportFluxModelBase):
                     er_tilde=er_tilde,
                 ),
                 a_b=channel_value.a_b,
+                interpolation_mode=self.interpolation_mode,
             ),
             self.scan_primal,
             channels,
@@ -7774,6 +7798,7 @@ class NTXRuntimeScanTransportModel(TransportFluxModelBase):
                     er_tilde=er_tilde,
                 ),
                 a_b=channel_value.a_b,
+                interpolation_mode=self.interpolation_mode,
             ),
             self.scan_primal,
             channels,
@@ -21932,6 +21957,7 @@ def build_ntx_runtime_scan_transport_model(
     lagged_response_taylor_order=1,
     ntx_scan_coefficient_reverse_mode="generic",
     ntx_scan_record_primal=False,
+    interpolation_mode="generic",
     **kwargs,
 ):
     del kwargs
@@ -21958,6 +21984,7 @@ def build_ntx_runtime_scan_transport_model(
         lagged_response_taylor_order=int(lagged_response_taylor_order),
         coefficient_reverse_mode=str(ntx_scan_coefficient_reverse_mode),
         record_scan_primal=bool(ntx_scan_record_primal),
+        interpolation_mode=normalize_interpolation_mode(interpolation_mode),
     )
     if preload_channels:
         model = model.with_static_channels()

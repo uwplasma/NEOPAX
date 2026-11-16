@@ -1666,10 +1666,12 @@ def main() -> None:
     )
     baseline_objectives = _objective_vector(_baseline_final_state, baseline_runtime)
     baseline_objectives = jax.block_until_ready(baseline_objectives)
+    baseline_neoclassical = getattr(baseline_runtime.models.flux, "neoclassical_model", baseline_runtime.models.flux)
     save_gradient_audit("fd_baseline", labels=tuple(OBJECTIVE_LABELS), values=baseline_objectives,
         final_y=baseline_rollout.final_carry.y, final_state=_baseline_final_state,
         final_time=baseline_rollout.final_carry.t,
-        initial_y=baseline_prepared_rollout.initial_carry.y, initial_state=baseline_profile_state)
+        initial_y=baseline_prepared_rollout.initial_carry.y, initial_state=baseline_profile_state,
+        support={"geometry": baseline_runtime.geometry, "database": getattr(baseline_neoclassical, "database", None)})
     if args.diagnose_bootstrap_correction or args.diagnose_bootstrap_correction_only:
         print("[autodiff-gate] progress: diagnosing baseline bootstrap correction", flush=True)
         _print_bootstrap_correction_diagnostics(_baseline_final_state, baseline_runtime)
@@ -2097,6 +2099,7 @@ def main() -> None:
         "geometry_backend": str(config.get("geometry", {}).get("backend")),
         "vmec_lane": str(config.get("geometry", {}).get("vmec_lane", "forward")),
         "vmec_response_mode": config.get("geometry", {}).get("vmec_response_mode", "raw_block"),
+        "database_interpolation_mode": config.get("neoclassical", {}).get("interpolation_mode", "generic"),
         "ntx_exact_surface_backend": str(
             config.get("neoclassical", {}).get("ntx_exact_surface_backend", "booz")
         ),
