@@ -19,7 +19,83 @@ check = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(check)
 
 
+def numpy_scan(function, carry, values, reverse=False):
+    """Small-array reference for scan order, including an empty paired tail sweep."""
+    length = len(values[0] if isinstance(values, tuple) else values)
+    output = [None]*length
+    for i in reversed(range(length)) if reverse else range(length):
+        item = tuple(v[i] for v in values) if isinstance(values, tuple) else values[i]
+        carry, output[i] = function(carry, item)
+    def stack(items, template):
+        if isinstance(template, tuple):
+            return tuple(stack([item[j] for item in items], t) for j, t in enumerate(template))
+        return np.stack(items) if items else np.empty((0, *template.shape), dtype=template.dtype)
+    return carry, stack(output, output[0] if length else carry)
+
+
 class SavedNTXFieldTests(unittest.TestCase):
+    def test_paired_tail_allows_pivoting_across_a_singular_individual_mode(self):
+        # The final scalar diagonal cannot be inverted alone. Its two-mode
+        # block and the full system are nonsingular; grouping must preserve both sources.
+        diagonal = np.array([3., 4., 5., 1., 0.])
+        matrix = np.diag(diagonal)+np.diag(np.ones(4), 1)+np.diag(np.ones(4), -1)
+        block = lambda j: (np.ones((1,1)), diagonal[j].reshape(1,1), np.ones((1,1)))
+        rhs = np.array([[[1., 0.]], [[0., 1.]], [[.5, -.5]]])
+        factor = lambda a: (a, np.zeros(len(a), dtype=int))
+        solve = lambda a, b: np.linalg.solve(a[0], b)
+        with self.assertRaises(np.linalg.LinAlgError):
+            np.linalg.solve(diagonal[-1].reshape(1,1), np.ones((1,1)))
+        value, _ = check.paired_tail_solve(block, 5, rhs, np, factor, solve, numpy_scan)
+        full_rhs = np.concatenate((rhs[:,0], np.zeros((2,2))))
+        np.testing.assert_allclose(value[:,0], np.linalg.solve(matrix, full_rhs), rtol=1e-13, atol=1e-14)
+        errors = check.original_block_residual(block, value, rhs, np, numpy_scan)
+        self.assertLess(max(errors['relative_residual']), 1e-13)
+
+    def test_paired_tail_and_both_sources_match_independent_full_solve(self):
+        rng = np.random.default_rng(31)
+        for n, size in ((5, 1), (7, 2), (9, 3)):
+            with self.subTest(blocks=n, size=size):
+                diagonal = 3*np.tile(np.eye(size), (n,1,1))+rng.normal(size=(n,size,size))*.1
+                lower, upper = (rng.normal(size=(n,size,size))*.3 for _ in range(2))
+                block = lambda j: (lower[j], diagonal[j], upper[j])
+                matrix = np.zeros((n*size, n*size))
+                for j in range(n):
+                    matrix[j*size:(j+1)*size, j*size:(j+1)*size] = diagonal[j]
+                    if j:
+                        matrix[j*size:(j+1)*size, (j-1)*size:j*size] = lower[j]
+                    if j+1 < n:
+                        matrix[j*size:(j+1)*size, (j+1)*size:(j+2)*size] = upper[j]
+                rhs = rng.normal(size=(3,size,2))
+                full_rhs = np.zeros((n,size,2))
+                full_rhs[:3] = rhs
+                factor = lambda a: (a, np.zeros(a.shape[0], dtype=int))
+                solve = lambda a, b: np.linalg.solve(a[0], b)
+                value, schur = check.paired_tail_solve(block, n, rhs, np, factor, solve, numpy_scan)
+                expected = np.linalg.solve(matrix, full_rhs.reshape(n*size,2)).reshape(n,size,2)
+                np.testing.assert_allclose(value, expected, rtol=2e-13, atol=2e-14)
+                head = check.head_matrix(diagonal, lower, upper, schur, np)
+                np.testing.assert_allclose(head @ value[:3].reshape(3*size,2),
+                    rhs.reshape(3*size,2), rtol=2e-13, atol=2e-14)
+                errors = check.original_block_residual(block, value, rhs, np, numpy_scan)
+                self.assertLess(np.max(errors['relative_residual']), 2e-13)
+                # A wrong eliminated mode must fail even when all three head modes are unchanged.
+                broken = value.copy()
+                broken[-1,0,0] += .01
+                errors = check.original_block_residual(block, broken, rhs, np, numpy_scan)
+                residual = matrix @ broken.reshape(n*size,2)-full_rhs.reshape(n*size,2)
+                norm = np.linalg.norm(residual, axis=0)
+                source_norm = np.linalg.norm(full_rhs.reshape(n*size,2), axis=0)
+                np.testing.assert_allclose(errors['relative_residual'], norm/source_norm, rtol=1e-12, atol=1e-15)
+                denominator = np.linalg.norm(matrix)*np.linalg.norm(broken.reshape(n*size,2), axis=0)+source_norm
+                np.testing.assert_allclose(errors['backward_error'], norm/denominator, rtol=1e-12, atol=1e-15)
+                self.assertGreater(errors['row_residual_l2'][-1,0], .01)
+
+    def test_paired_tail_rejects_unsupported_block_counts(self):
+        block = lambda _: (np.zeros((1,1)),)*3
+        for count in (3, 4, 6):
+            with self.assertRaisesRegex(ValueError, "odd block count"):
+                check.paired_tail_solve(block, count, np.zeros((3,1,2)), np, None, None, None)
+
     def test_aot_lowering_receives_flat_leaves_and_keeps_inputs_dynamic(self):
         @dataclass
         class Surface:
@@ -117,14 +193,15 @@ class SavedNTXFieldTests(unittest.TestCase):
                 (root/name).mkdir()
                 np.savez(root/name/"generic_database_baseline_test.npz",
                     **{"scan_inputs['surfaces'][0].b_cos": np.ones(2)})
-            with patch.object(sys, "argv", [str(check.__file__), "--run-dir", str(root),
-                    "--out-dir", str(root/"unused")]), \
-                 patch.object(check, "POINTS", ((0,0,0),)), \
-                 patch.dict(sys.modules, jax=SimpleNamespace(default_backend=lambda: "cpu")), \
-                 redirect_stderr(io.StringIO()) as errors:
-                with self.assertRaises(SystemExit):
-                    check.main()
-                self.assertIn("no CPU fallback", errors.getvalue())
+            for mode in ([], ["--audit-tail"]):
+                with patch.object(sys, "argv", [str(check.__file__), "--run-dir", str(root),
+                        "--out-dir", str(root/"unused"), *mode]), \
+                     patch.object(check, "POINTS", ((0,0,0),)), \
+                     patch.dict(sys.modules, jax=SimpleNamespace(default_backend=lambda: "cpu")), \
+                     redirect_stderr(io.StringIO()) as errors:
+                    with self.assertRaises(SystemExit):
+                        check.main()
+                    self.assertIn("no CPU fallback", errors.getvalue())
             self.assertFalse((root/"unused").exists())
             self.assertNotIn("jax", sys.modules)
 

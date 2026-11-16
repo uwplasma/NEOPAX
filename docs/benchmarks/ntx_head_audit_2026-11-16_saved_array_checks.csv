@@ -1,0 +1,3 @@
+radius_index,theta_derivative_relative_mismatch,zeta_derivative_relative_mismatch,weighted_drift_mean_defect,unresolved_modes,largest_unresolved_relative_amplitude,head_row_0_relative_change,head_row_1_relative_change,tail_reduced_row_2_relative_change
+5,4.926669051e-14,1.347454228e-14,9.339950537e-17,0,0.000000000e+00,7.371677236e-18,2.295257607e-18,6.538709910e-08
+6,4.012155098e-14,1.359624672e-14,7.756621143e-17,0,0.000000000e+00,9.954022745e-18,3.099646354e-18,4.673156596e-08

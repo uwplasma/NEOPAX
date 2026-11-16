@@ -115,7 +115,8 @@ Use a new output directory and add the flag:
 
 The two additional local NumPy checks compare the assembled reduced head to
 an independent full block-system solve and verify that scaling preserves the
-original equations. The actual GPU reduced-system audit remains pending.
+original equations. The corrected GPU reduced-system audit completed at
+`6225cb9`; see the [results and saved-array readout](ntx_head_audit_2026-11-16.md).
 
 ### Correction to the explicit compilation interface
 
@@ -135,3 +136,70 @@ changing field/surface inputs.
 
 Preserve the failed output and use a new directory on rerun, for example
 `outputs/generic_ntx_head_audit_flat_inputs_20261116`.
+
+### Independent tail-elimination comparison
+
+The saved-array check finds roundoff-size changes (`1e-17` relative) in the
+original head rows but changes near `5e-8` in the row containing the eliminated
+tail. Input B derivatives agree near `1e-14`, with no unresolved input field
+harmonics. Improving only the reduced head solve still leaves negative D11
+and large Onsager discrepancies. This does not yet distinguish a poorly
+conditioned discretized system from unstable elimination.
+
+`--audit-tail` tests that distinction at the failing outer point only. Its
+`--run-dir` is the **completed head-audit directory**, containing the saved
+prepared arrays and exact hexadecimal field inputs. It does not prepare
+geometry again or rebuild the database. The same NTX block generator, sources,
+gauge, 25 by 31 angular grid and 65 Legendre modes are used. Adjacent tail
+modes are grouped into two-mode blocks, permitting pivoting across their
+boundary. A scaled pivoted three-mode head solve and upward recovery produce
+all modes, and residuals/backward errors are measured against **every original
+block equation**, for both sources. No derivatives are computed.
+
+Before interpreting coefficients, the audit compares its original first two
+head rows and both source vectors with the saved production head system. It
+rejects relative differences above `1e-13`. Collisionality is checked against
+the saved scalar report; field inputs retain the exact hexadecimal values.
+The CSV includes the saved production coefficients alongside the paired
+coefficients so the comparison does not depend on copying older printed values.
+
+The output includes full mode arrays and per-row residual norms in two NPZ
+files, plus `comparison.csv`. The paired factor tape is bounded by the given
+65-mode problem, but larger than the original selected-head tape. The program
+checks the compiled buffer estimate against 4 GiB before execution; this is
+not a bound on total compiler or process memory. Run only on the large GPU.
+No production solver, interpolation or time-step differentiation changes.
+
+```bash
+(
+  cd "$HOME/NEOPAX" || exit 1
+  git switch en/v0_main || exit 1
+  git pull --ff-only origin en/v0_main || exit 1
+  set -o pipefail
+  env JAX_PLATFORMS=cuda,cpu JAX_ENABLE_X64=true \
+    XLA_PYTHON_CLIENT_PREALLOCATE=false \
+    "$HOME/jax_env/bin/python" \
+    examples/benchmarks/check_saved_ntx_field_sensitivity.py \
+    --run-dir outputs/generic_ntx_head_audit_flat_inputs_20261116 \
+    --out-dir outputs/generic_ntx_paired_tail_controlled_20261116 \
+    --audit-tail \
+    2>&1 | tee outputs/generic_ntx_paired_tail_controlled_20261116.log
+) || printf '\nTail-elimination audit stopped; terminal kept open.\n'
+```
+
+Choose a new empty output directory. GPU results are pending. Nine local
+NumPy/mock tests pass; the paired recurrence is compared with independent
+full nonsymmetric small-system solves for multiple tail lengths and both
+sources. Corrupting a tail mode while preserving the head is detected by the
+full residual check. A nonsingular system whose final individual diagonal is
+singular checks the need for cross-mode pivoting. The real JAX compiler and
+physical solvers were not run locally.
+
+Interpret the GPU result by checking the unchanged-input controls, both
+full-system residuals, D11, Onsager discrepancy, and the D13 gap between the
+two saved fields. A smaller gap with consistent original-equation residuals
+would support a stability problem in the previous elimination. A small
+backward error alone does not certify coefficient accuracy when the system
+is ill-conditioned. If the gap or physical discrepancies persist, this test
+does not establish a fix; conditioning or an independent higher-precision
+reference still needs investigation.

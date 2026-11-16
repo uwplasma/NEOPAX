@@ -1,0 +1,66 @@
+erminal kept open.
+(jax_env) exouser@neopax-31:~$ (
+  cd "$HOME/NEOPAX" || exit 1
+  git pull --ff-only origin en/v0_main || exit 1
+  set -o pipefail
+
+  env JAX_PLATFORMS=cuda,cpu JAX_ENABLE_X64=true \
+    XLA_PYTHON_CLIENT_PREALLOCATE=false \
+    "$HOME/jax_env/bin/python" \
+    examples/benchmarks/check_saved_ntx_field_sensitivity.py \
+    --run-dir outputs/generic_ntx_baselines_20261116 \
+    --out-dir outputs/generic_ntx_head_audit_flat_inputs_20261116 \
+    --audit-head \
+    2>&1 | tee outputs/generic_ntx_head_audit_flat_inputs_20261116.log
+) || printf '\nReduced-system audit stopped; terminal kept open.\n'
+remote: Enumerating objects: 18, done.
+remote: Counting objects: 100% (18/18), done.
+remote: Compressing objects: 100% (2/2), done.
+remote: Total 10 (delta 8), reused 10 (delta 8), pack-reused 0 (from 0)
+Unpacking objects: 100% (10/10), 4.08 KiB | 597.00 KiB/s, done.
+From https://github.com/uwplasma/NEOPAX
+ * branch            en/v0_main -> FETCH_HEAD
+   cd3c2c3..6225cb9  en/v0_main -> origin/en/v0_main
+Updating cd3c2c3..6225cb9
+Fast-forward
+ docs/benchmarks/saved_ntx_field_sensitivity.md     | 19 +++++++++++++
+ .../check_saved_ntx_field_sensitivity.py           | 17 +++++++++--
+ tests/test_saved_ntx_field_sensitivity.py          | 33 ++++++++++++++++++++++
+ 3 files changed, 67 insertions(+), 2 deletions(-)
+E1116 18:56:35.466254  110696 cuda_executor.cc:1639] Nvml call failed with 3(Not Supported). Assuming PCIe gen 3 x16 bandwidth.
+E1116 18:56:35.467802  110686 cuda_executor.cc:1639] Nvml call failed with 3(Not Supported). Assuming PCIe gen 3 x16 bandwidth.
+[field-sensitivity] preparing saved surface 5; no equilibrium solve
+[gradient-audit] wrote /home/exouser/NEOPAX/outputs/generic_ntx_head_audit_flat_inputs_20261116/frozen_prepared_r5_g4qi5fhj.npz
+[field-sensitivity] r=5 case=ad_numpy Es=0x1.5c9b91249ff79p-8 raw_D13=-5.7486525507993991e-02 delta=0.000000000e+00 saved_gap=0.000000000e+00 diagnostic_gap=0.000000000e+00 primary_schur_residual=2.101517249e-13
+[field-sensitivity] r=5 case=ad_repeat Es=0x1.5c9b91249ff79p-8 raw_D13=-5.7486525507993991e-02 delta=0.000000000e+00 saved_gap=0.000000000e+00 diagnostic_gap=0.000000000e+00 primary_schur_residual=2.101517249e-13
+[field-sensitivity] r=5 case=fd2_numpy Es=0x1.5c9b91249ff77p-8 raw_D13=-5.7482860718402251e-02 delta=3.664789592e-06 saved_gap=0.000000000e+00 diagnostic_gap=0.000000000e+00 primary_schur_residual=2.231850344e-13
+[field-sensitivity] r=5 case=ad_production_field Es=0x1.5c9b91249ff79p-8 raw_D13=-5.7486525507993991e-02 delta=0.000000000e+00 saved_gap=0.000000000e+00 diagnostic_gap=0.000000000e+00 primary_schur_residual=2.101517249e-13
+[field-sensitivity] r=5 case=fd2_production_field Es=0x1.5c9b91249ff77p-8 raw_D13=-5.7482860718402251e-02 delta=3.664789592e-06 saved_gap=0.000000000e+00 diagnostic_gap=0.000000000e+00 primary_schur_residual=2.231850344e-13
+[head-audit] compiling bounded three-block audit
+[head-audit] compiled buffer estimate=269461180 bytes
+[head-audit] r=5 case=ad Schur_conditions=[3.95251234e+09 5.95565924e+09 1.55642680e+09] head_condition=3.246927090e+09 scaled_condition=8.113092652e+08 changed_head_pivots=0
+[head-audit] r=5 case=ad method=production_head D11=2.954226994e-06 D13=-5.7486525507993991e-02 Onsager=9.392033397e-03 primary_relres=9.033313817e-08 parallel_relres=2.468405039e-03
+[head-audit] r=5 case=ad method=pivoted_head D11=2.954225038e-06 D13=-5.7482325644753411e-02 Onsager=9.387823029e-03 primary_relres=2.495431365e-10 parallel_relres=2.705135944e-08
+[head-audit] r=5 case=ad method=scaled_pivoted_head D11=2.954225008e-06 D13=-5.7482325483792410e-02 Onsager=9.387822614e-03 primary_relres=1.647112802e-11 parallel_relres=3.967458331e-09
+[head-audit] r=5 case=fd2 Schur_conditions=[3.95251018e+09 5.95565709e+09 1.55642678e+09] head_condition=3.246926762e+09 scaled_condition=8.113092030e+08 changed_head_pivots=0
+[head-audit] r=5 case=fd2 method=production_head D11=2.954217400e-06 D13=-5.7482860718402251e-02 Onsager=9.388236420e-03 primary_relres=1.328767166e-07 parallel_relres=2.374051260e-03
+[head-audit] r=5 case=fd2 method=pivoted_head D11=2.954223597e-06 D13=-5.7483067018804922e-02 Onsager=9.388537565e-03 primary_relres=1.813238752e-10 parallel_relres=3.069272968e-08
+[head-audit] r=5 case=fd2 method=scaled_pivoted_head D11=2.954223605e-06 D13=-5.7483067234014057e-02 Onsager=9.388537811e-03 primary_relres=1.832546637e-11 parallel_relres=2.944371029e-09
+[field-sensitivity] preparing saved surface 6; no equilibrium solve
+[gradient-audit] wrote /home/exouser/NEOPAX/outputs/generic_ntx_head_audit_flat_inputs_20261116/frozen_prepared_r6_w1utuj70.npz
+[field-sensitivity] r=6 case=ad_numpy Es=0x1.c035ba9ccdac0p-7 raw_D13=2.9023985040432758e+00 delta=0.000000000e+00 saved_gap=0.000000000e+00 diagnostic_gap=0.000000000e+00 primary_schur_residual=9.862762158e-10
+[field-sensitivity] r=6 case=ad_repeat Es=0x1.c035ba9ccdac0p-7 raw_D13=2.9023985040432758e+00 delta=0.000000000e+00 saved_gap=0.000000000e+00 diagnostic_gap=0.000000000e+00 primary_schur_residual=9.862762158e-10
+[field-sensitivity] r=6 case=fd2_numpy Es=0x1.c035ba9ccdabfp-7 raw_D13=2.8928806492197472e+00 delta=-9.517854824e-03 saved_gap=0.000000000e+00 diagnostic_gap=0.000000000e+00 primary_schur_residual=1.037232908e-09
+[field-sensitivity] r=6 case=ad_production_field Es=0x1.c035ba9ccdac0p-7 raw_D13=2.9023985040432758e+00 delta=0.000000000e+00 saved_gap=0.000000000e+00 diagnostic_gap=0.000000000e+00 primary_schur_residual=9.862762158e-10
+[field-sensitivity] r=6 case=fd2_production_field Es=0x1.c035ba9ccdabfp-7 raw_D13=2.8928806492197472e+00 delta=-9.517854824e-03 saved_gap=0.000000000e+00 diagnostic_gap=0.000000000e+00 primary_schur_residual=1.037232908e-09
+[head-audit] r=6 case=ad Schur_conditions=[4.52105544e+11 2.32686171e+10 1.68940984e+09] head_condition=1.290596541e+12 scaled_condition=2.940226830e+11 changed_head_pivots=0
+[head-audit] r=6 case=ad method=production_head D11=-1.778982916e-04 D13=2.9023985040432758e+00 Onsager=2.532619408e+01 primary_relres=9.127401232e-04 parallel_relres=1.188526486e-01
+[head-audit] r=6 case=ad method=pivoted_head D11=-1.776922069e-04 D13=2.8984006181067072e+00 Onsager=2.529856435e+01 primary_relres=4.867152148e-08 parallel_relres=6.438222215e-06
+[head-audit] r=6 case=ad method=scaled_pivoted_head D11=-1.776924676e-04 D13=2.8984054856761987e+00 Onsager=2.529859873e+01 primary_relres=1.593447883e-08 parallel_relres=1.928845619e-06
+[head-audit] r=6 case=fd2 Schur_conditions=[4.50879346e+11 2.32686127e+10 1.68940965e+09] head_condition=1.289821827e+12 scaled_condition=2.938462042e+11 changed_head_pivots=0
+[head-audit] r=6 case=fd2 method=production_head D11=-1.773893447e-04 D13=2.8928806492197472e+00 Onsager=2.525750726e+01 primary_relres=8.034331423e-04 parallel_relres=1.029430536e-01
+[head-audit] r=6 case=fd2 method=pivoted_head D11=-1.775807084e-04 D13=2.8963300193226957e+00 Onsager=2.528340747e+01 primary_relres=4.765526719e-08 parallel_relres=5.908668893e-06
+[head-audit] r=6 case=fd2 method=scaled_pivoted_head D11=-1.775809808e-04 D13=2.8963350833336894e+00 Onsager=2.528344540e+01 primary_relres=1.675398615e-08 parallel_relres=2.107230032e-06
+[field-sensitivity] saved outputs/generic_ntx_head_audit_flat_inputs_20261116/comparison.csv
+(jax_env) exouser@neopax-31:~$ 
+

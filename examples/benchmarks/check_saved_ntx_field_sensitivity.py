@@ -141,13 +141,195 @@ def compile_flat_inputs(function, leaves, structure, backend):
     return backend.jit(flat_function).lower(*leaves).compile()
 
 
+def paired_tail_solve(block, n_blocks, rhs, xp, factor, solve, scan):
+    """Same block equations; pivot across adjacent tail modes, keeping head 0:3."""
+    if n_blocks < 5 or n_blocks % 2 != 1 or rhs.shape[0] != 3:
+        raise ValueError("Paired audit requires an odd block count >= 5 and three source rows.")
+    size = rhs.shape[1]
+    zero = xp.zeros_like(block(0)[1])
+
+    def pair(j, correction):
+        _, d0, u0 = block(j)
+        l1, d1, _ = block(j+1)
+        return xp.concatenate((xp.concatenate((d0, u0), axis=1),
+            xp.concatenate((l1, d1-correction), axis=1)), axis=0)
+
+    last = factor(pair(n_blocks-2, zero))
+
+    def down(next_factor, j):
+        transfer = solve(next_factor, xp.concatenate((block(j+2)[0], zero), axis=0))
+        current = factor(pair(j, block(j+1)[2] @ transfer[:size]))
+        return current, current
+
+    first, stored = scan(down, last, xp.arange(3, n_blocks-2, 2), reverse=True)
+    factors = tuple(xp.concatenate((part, tail[None]), axis=0) for part, tail in zip(stored, last))
+    transfer = solve(first, xp.concatenate((block(3)[0], zero), axis=0))
+    last_schur = block(2)[1]-block(2)[2] @ transfer[:size]
+    lower, diagonal, upper = zip(*(block(k) for k in range(3)))
+    matrix = head_matrix(diagonal, lower, upper, last_schur, xp)
+    head, _ = scaled_solve(matrix, rhs.reshape(3*size, -1), xp)
+    head = head.reshape(rhs.shape)
+
+    def up(previous, item):
+        j, lu, piv = item
+        source = -block(j)[0] @ previous
+        value = solve((lu, piv), xp.concatenate((source, xp.zeros_like(source)), axis=0))
+        return value[-size:], value.reshape(2, size, -1)
+
+    _, tail = scan(up, head[-1], (xp.arange(3, n_blocks, 2), *factors))
+    return xp.concatenate((head, tail.reshape(n_blocks-3, size, -1)), axis=0), last_schur
+
+
+def original_block_residual(block, solution, rhs, xp, scan):
+    """Check every original row, including the eliminated tail and both sources."""
+    count = solution.shape[0]
+
+    def row(_, k):
+        lower, diagonal, upper = block(k)
+        value = diagonal @ solution[k]
+        value = value+xp.where(k > 0, lower @ solution[xp.maximum(k-1, 0)], 0.)
+        value = value+xp.where(k+1 < count, upper @ solution[xp.minimum(k+1, count-1)], 0.)
+        value = value-xp.where(k < 3, rhs[xp.minimum(k, 2)], 0.)
+        norm2 = xp.sum(diagonal**2)+xp.where(k > 0, xp.sum(lower**2), 0.)
+        norm2 = norm2+xp.where(k+1 < count, xp.sum(upper**2), 0.)
+        return None, (xp.sum(value**2, axis=0), norm2)
+
+    _, (rows, matrix_norm2) = scan(row, None, xp.arange(count))
+    residual = xp.sqrt(xp.sum(rows, axis=0))
+    source_norm = xp.sqrt(xp.sum(rhs**2, axis=(0, 1)))
+    tiny = xp.finfo(solution.dtype).tiny
+    denominator = xp.sqrt(xp.sum(matrix_norm2)*xp.sum(solution**2, axis=(0, 1)))+source_norm
+    return dict(row_residual_l2=xp.sqrt(rows),
+        relative_residual=residual/xp.maximum(source_norm, tiny),
+        backward_error=residual/xp.maximum(denominator, tiny))
+
+
+def run_tail_audit(args, parser):
+    """Use existing prepared arrays; no geometry preparation or full database scan."""
+    import jax
+    if jax.default_backend() != "gpu" or not jax.config.x64_enabled:
+        parser.error("Run on the large GPU with JAX_ENABLE_X64=true; no CPU fallback.")
+    import jax.numpy as jnp
+    from jax.scipy.linalg import lu_factor, lu_solve
+    from types import SimpleNamespace
+    from ntx import operators, transport
+    from ntx import _solver as solver
+
+    if args.out_dir.exists() and any(args.out_dir.iterdir()):
+        parser.error("Choose a new empty output directory.")
+    config = tomllib.loads((args.run_dir/"config.toml").read_text())
+    count = int(config["neoclassical"]["ntx_scan_n_xi"])+1
+    metadata = json.loads((args.run_dir/"baseline_metadata.json").read_text())
+    for name in ("jax", "jaxlib", "ntx", "solvax"):
+        if importlib.metadata.version(name) != metadata["versions"][name]:
+            raise RuntimeError(f"Package version changed since the saved audit: {name}")
+    for name in ("ntx._solver", "solvax.direct"):
+        expected = metadata["sources"][name]["sha256"]
+        path = Path(importlib.import_module(name).__file__)
+        if hashlib.sha256(path.read_bytes()).hexdigest() != expected:
+            raise RuntimeError(f"Source changed since the saved audit: {name}")
+    rows = list(csv.DictReader((args.run_dir/"comparison.csv").open()))
+    args.out_dir.mkdir(parents=True, exist_ok=True)
+
+    def audit(geometry, dt, dz, nu, es, reference_rows, reference_rhs):
+        g = SimpleNamespace(**{k: v for k, v in geometry.items() if not k.startswith("grid.")},
+            grid=SimpleNamespace(dtheta=geometry["grid.dtheta"], dzeta=geometry["grid.dzeta"]))
+        params = {k: geometry[k] for k in operators.BLOCK_PARAMETER_NAMES if k not in ("nu_hat", "epsi_hat")}
+        params.update(nu_hat=nu, epsi_hat=es)
+        def block(k):
+            return solver._apply_nullspace_at_first_row(k,
+                *operators.operator_blocks_from_parameters(params, k, dt, dz))
+        sources = operators.source_modes(SimpleNamespace(geometry=g), count-1)
+        rhs = jnp.stack([s[:3] for s in sources], axis=-1)
+        lower, diagonal, upper = zip(*(block(k) for k in range(3)))
+        first_rows = head_matrix(diagonal, lower, upper, diagonal[2], jnp)[:2*rhs.shape[1]]
+        tiny = jnp.finfo(rhs.dtype).tiny
+        row_difference = jnp.linalg.norm(first_rows-reference_rows)/jnp.maximum(jnp.linalg.norm(reference_rows), tiny)
+        rhs_difference = jnp.linalg.norm(rhs.reshape(reference_rhs.shape)-reference_rhs)/jnp.maximum(jnp.linalg.norm(reference_rhs), tiny)
+        solution, schur = paired_tail_solve(block, count, rhs, jnp, lu_factor, lu_solve, jax.lax.scan)
+        coefficients = jnp.stack(transport.coefficients_from_modes(g, solution[:3, :, 0], solution[:3, :, 1], nu))
+        return dict(solution=solution, last_schur=schur, coefficients=coefficients,
+            original_head_rows_relative_difference=row_difference, source_relative_difference=rhs_difference,
+            **original_block_residual(block, solution, rhs, jnp, jax.lax.scan))
+
+    # Start with the failing outer point only; the same angular/Legendre grid is kept.
+    radius = 6
+    files = list(args.run_dir.glob(f"frozen_prepared_r{radius}_*.npz"))
+    if len(files) != 1:
+        parser.error("Expected exactly one saved outer prepared surface.")
+    with np.load(files[0], allow_pickle=False) as saved:
+        prefix = "prepared.geometry."
+        geometry = {k[len(prefix):]: jnp.asarray(saved[k]) for k in saved.files if k.startswith(prefix)}
+        dt, dz, nu = (jnp.asarray(saved[k]) for k in ("prepared.d_theta", "prepared.d_zeta", "nu"))
+    executable, structure, previous = None, None, None
+    results = []
+    for case, label in (("ad", "ad_production_field"), ("fd2", "fd2_production_field")):
+        row = next(r for r in rows if int(r["radius_index"]) == radius and r["case"] == label)
+        es = jnp.asarray(float.fromhex(row["Es_hex"]), dtype=jnp.float64)
+        if float(nu) != float(row["nu_over_v"]):
+            raise ValueError("Saved collisionality differs from the production point.")
+        with np.load(args.run_dir/f"head_r{radius}_{case}.npz", allow_pickle=False) as reference:
+            reference_rows = jnp.asarray(reference["matrix"][:2*dt.shape[0]])
+            reference_rhs = jnp.asarray(reference["rhs"])
+            production = reference["coefficients"][0].copy()
+        values, tree = jax.tree_util.tree_flatten((geometry, dt, dz, nu, es, reference_rows, reference_rhs))
+        if executable is None:
+            print("[tail-audit] compiling paired elimination and full original-row residual; no transport", flush=True)
+            structure = tree
+            executable = compile_flat_inputs(audit, values, tree, jax)
+            memory = executable.memory_analysis()
+            needed = memory.temp_size_in_bytes+memory.argument_size_in_bytes+memory.output_size_in_bytes-memory.alias_size_in_bytes
+            print(f"[tail-audit] compiled buffer estimate={needed} bytes", flush=True)
+            if needed > 4*1024**3:
+                raise MemoryError("Compiled buffer estimate exceeds 4 GiB; audit not executed.")
+        if tree != structure:
+            raise ValueError("Saved input structure changed.")
+        data = jax.device_get(executable(*values))
+        if any(not np.isfinite(value).all() for value in data.values()):
+            raise FloatingPointError(f"Nonfinite paired audit result: {case}")
+        if max(float(data["original_head_rows_relative_difference"]), float(data["source_relative_difference"])) > 1e-13:
+            raise ValueError("Original head rows or sources differ from the saved production system.")
+        np.savez_compressed(args.out_dir/f"paired_r{radius}_{case}.npz", **data)
+        coeff = data["coefficients"]
+        result = dict(case=case, Es_hex=row["Es_hex"], raw_D11=float(coeff[0]), raw_D31=float(coeff[1]),
+            raw_D13=float(coeff[2]), raw_D33=float(coeff[3]), onsager_residual=float(abs(coeff[1]+coeff[2])),
+            production_raw_D11=float(production[0]), production_raw_D31=float(production[1]),
+            production_raw_D13=float(production[2]), production_raw_D33=float(production[3]),
+            production_onsager_residual=float(abs(production[1]+production[2])),
+            D13_absolute_difference_from_production=float(abs(coeff[2]-production[2])),
+            original_head_rows_relative_difference=float(data["original_head_rows_relative_difference"]),
+            source_relative_difference=float(data["source_relative_difference"]),
+            primary_full_relative_residual=float(data["relative_residual"][0]),
+            parallel_full_relative_residual=float(data["relative_residual"][1]),
+            primary_full_backward_error=float(data["backward_error"][0]),
+            parallel_full_backward_error=float(data["backward_error"][1]))
+        results.append(result)
+        print("[tail-audit] "+json.dumps(result), flush=True)
+        if previous is not None:
+            difference = np.linalg.norm(data["last_schur"]-previous["last_schur"])/np.linalg.norm(previous["last_schur"])
+            print(f"[tail-audit] paired tail relative matrix change={difference:.9e} "
+                f"D13 absolute change={abs(coeff[2]-previous['coefficients'][2]):.9e}", flush=True)
+        previous = data
+    with (args.out_dir/"comparison.csv").open("w", newline="") as stream:
+        writer = csv.DictWriter(stream, fieldnames=list(results[0]), lineterminator="\n")
+        writer.writeheader()
+        writer.writerows(results)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--run-dir", type=Path, required=True)
     parser.add_argument("--out-dir", type=Path, required=True)
     parser.add_argument("--audit-head", action="store_true",
         help="Audit the retained Schur system and compare equivalent pivoted/scaled reduced solves.")
+    parser.add_argument("--audit-tail", action="store_true",
+        help="Use a saved --audit-head directory; test paired tail elimination and every original row.")
     args = parser.parse_args()
+    if args.audit_tail:
+        if args.audit_head:
+            parser.error("Use --audit-head or --audit-tail, not both.")
+        run_tail_audit(args, parser)
+        return
     config_path = args.run_dir/"config.toml"
     config = tomllib.loads(config_path.read_text())
     nc = config["neoclassical"]
