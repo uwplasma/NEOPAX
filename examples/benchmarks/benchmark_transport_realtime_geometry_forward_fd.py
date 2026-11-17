@@ -1370,7 +1370,17 @@ def main() -> None:
             + ", ".join(INITIAL_ER_ROOT_ONLY_EXPLICIT_OBJECTIVES)
         ),
     )
+    parser.add_argument(
+        "--baseline-only-dir", type=Path,
+        help="Run the original preparation and adaptive baseline, save setup/state/schedule, then stop before objectives or FD endpoints.",
+    )
     args = parser.parse_args()
+    if args.baseline_only_dir is not None:
+        if args.initial_er_root_only_fd:
+            parser.error("--baseline-only-dir cannot be combined with --initial-Er-root-only-fd")
+        if any((args.baseline_only_dir / name).exists() for name in
+               ("setup.npz", "native.npz", "physical_inputs.npz", "metadata.json")):
+            parser.error("--baseline-only-dir already contains a capture; choose a fresh directory")
     if (
         str(args.fd_accepted_replay_contract).strip().lower()
         == "reverse_frozen_metadata"
@@ -1659,6 +1669,15 @@ def main() -> None:
         accepted_step_limit=args.accepted_step_limit,
         capture_newton_setup=(args.fd_accepted_replay_contract == "reverse_frozen_metadata"),
     )
+    if args.baseline_only_dir is not None:
+        from check_saved_transport_baseline_repeatability import capture_fresh_baseline
+
+        capture_fresh_baseline(args.baseline_only_dir,
+            components=baseline_components, prepared=baseline_prepared_rollout,
+            execution=baseline_execution_context, rollout=baseline_rollout,
+            runtime=baseline_runtime, state=baseline_profile_state, parameter_name=parameter_name)
+        print(f"[fd-baseline] saved original {parameter_name} setup/trajectory in {args.baseline_only_dir}; no FD endpoints", flush=True)
+        return
     baseline_replay_reference = baseline_prepared_rollout
     frozen_trace = _truncate_rollout_trace_by_accepted_steps(
         baseline_rollout.trace,

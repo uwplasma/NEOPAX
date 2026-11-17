@@ -71,3 +71,87 @@ for each saved schedule field. Each process folder has `run.log`,
 `metadata.json`, `setup.npz`, and the three endpoint/schedule files.
 Host-only comparison tests are in
 `tests/test_saved_transport_baseline_repeatability.py`.
+
+## Remote result, 2026-11-17
+
+The user ran commit `20fceaa` on `neopax-31`; results are in
+`outputs/zbs_baseline_repeat_PgJe3r`.
+
+| Comparison | Observed differences |
+| --- | --- |
+| One jitted callable run twice, in each process | None |
+| Native versus additional jit, in each process | None |
+| Independent process setups | None in captured fields |
+| Independent native or jitted trajectories | None |
+| Native versus archived RBC | Eight error estimates differ, starting at attempt 6; maximum `2.168404345e-19`. All timesteps and endpoint arrays match exactly. |
+| Native versus archived ZBS | The existing timestep and endpoint differences remain: maximum final-state difference `7.126189274e-7`, time difference `1.385163667e-10`. |
+
+Thus the restored calculation is repeatable in this test and reaches the
+archived RBC trajectory. This does not reproduce the original ZBS drift or
+prove its cause. In particular, the result does not demonstrate general GPU
+nondeterminism or a failure in accepted-step replay.
+
+The original FD benchmark computes the selected VMEC tangent and builds its
+runtime/roots before preparing the same adaptive helper. The original
+snapshots did not include its full initial carry, RHS/cache or the complete
+model constants. These are the remaining preparation boundaries to compare.
+
+`benchmark_transport_realtime_geometry_forward_fd.py --baseline-only-dir DIR`
+now stops immediately after that benchmark's ordinary `_schedule_rollout`
+call. It runs the original preparation for the selected parameter and saves
+the setup, physical model data and native schedule/endpoint. Capture happens
+**after** the forward solve and adds no callbacks, scan outputs, jit wrappers,
+objective evaluations or FD endpoints. No production solver is changed.
+The setup capture includes JAX weak-type markers as well as numerical values.
+Older captures lack those markers; compare their common fields first.
+
+One original ZBS preparation/baseline, using the saved configuration:
+
+```bash
+(
+  cd "$HOME/NEOPAX" || exit 1
+  git pull --ff-only origin en/v0_main || exit 1
+  neopax_case=outputs/axis_fix_ad_fd16_20261116_RPTPxK
+  neopax_out=$(mktemp -d outputs/zbs_original_baseline_XXXXXX) || exit 1
+  set -o pipefail
+  env -u PYTHONPATH -u LD_LIBRARY_PATH -u JAX_PLATFORM_NAME \
+    -u JAX_COMPILATION_CACHE_DIR -u XLA_FLAGS -u XLA_PYTHON_CLIENT_ALLOCATOR \
+    -u NEOPAX_GRADIENT_AUDIT_DIR \
+    JAX_PLATFORMS=cuda,cpu JAX_ENABLE_X64=true JAX_ENABLE_COMPILATION_CACHE=0 \
+    XLA_PYTHON_CLIENT_PREALLOCATE=false NTX_DISABLE_COMPILATION_CACHE=1 \
+    VMEX_COMPILATION_CACHE=disabled NEOPAX_REVERSE_STEP_DIAGNOSTICS=1 \
+    "$HOME/jax_env/bin/python" \
+    examples/benchmarks/benchmark_transport_realtime_geometry_forward_fd.py \
+    --config "$neopax_case/config.toml" \
+    --parameter ZBS:1:0 --accepted-step-limit 16 \
+    --radau-jacobian-reuse-mode legacy \
+    --geometry-fd-lane frozen_linearized --replay-mode accepted \
+    --fd-accepted-replay-contract reverse_frozen_metadata \
+    --initial-Er-root-ad jax_selected_root \
+    --initial-Er-root-fd-root-lane frozen_linearized \
+    --baseline-only-dir "$neopax_out" \
+    2>&1 | tee "$neopax_out/run.log" || exit 1
+
+  "$HOME/jax_env/bin/python" - "$neopax_out" <<'PY'
+from pathlib import Path
+import sys
+sys.path.insert(0, 'examples/benchmarks')
+from check_saved_transport_baseline_repeatability import differences, read_one
+fresh = Path(sys.argv[1])
+control = Path('outputs/zbs_baseline_repeat_PgJe3r/process_1')
+for name in ('setup', 'native'):
+    a, b = read_one(control, name+'.npz'), read_one(fresh, name+'.npz')
+    common = a.keys() & b.keys()
+    rows = differences({k: a[k] for k in common}, {k: b[k] for k in common})
+    print(name, 'common fields:', len(common), 'differing fields:', len(rows))
+    for row in rows:
+        print(row)
+PY
+) || printf '\nOriginal baseline check stopped; terminal kept open.\n'
+```
+
+This run rebuilds VMEC, its selected tangent, NTX tables and initial roots;
+unlike the saved-input control, it preserves those preparation steps.
+Use the environment shown in the original archive command when reproducing
+that preparation, including its disabled compilation caches. This preserves
+the comparison conditions and is not evidence that caching caused the drift.

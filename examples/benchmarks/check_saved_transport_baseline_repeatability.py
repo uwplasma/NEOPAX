@@ -74,8 +74,48 @@ def numeric_leaves(value, prefix):
     if isinstance(value, (bool, int, float, complex, str, np.generic)) or hasattr(value, "shape"):
         array = np.asarray(value)
         if array.dtype.kind != "O":
-            return {prefix: array.copy()}
+            result = {prefix: array.copy()}
+            if hasattr(value, "weak_type"):
+                result[prefix + ".__weak_type__"] = np.asarray(value.weak_type)
+            return result
     return {}
+
+
+def setup_arrays(components, prepared, execution):
+    result = numeric_leaves(prepared.initial_carry, "initial_carry")
+    result.update(numeric_leaves(execution, "execution"))
+    result.update(numeric_leaves(components["equation_system"].fixed_temperature_profile,
+                                "fixed_temperature_profile"))
+    return result
+
+
+def rollout_arrays(rollout):
+    count = int(rollout.attempt_count)
+    result = {name: np.asarray(getattr(rollout.trace, name))[:count].copy()
+              for name in SCHEDULE_FIELDS if getattr(rollout.trace, name) is not None}
+    result.update(final_y=np.asarray(rollout.final_carry.y).copy(),
+                  final_time=np.asarray(rollout.final_carry.t).copy())
+    return result
+
+
+def capture_fresh_baseline(directory, *, components, prepared, execution, rollout,
+                           runtime, state, parameter_name):
+    """Copy existing outputs after the ordinary FD baseline has completed."""
+    directory = Path(directory)
+    directory.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(directory / "setup.npz", **setup_arrays(components, prepared, execution))
+    np.savez_compressed(directory / "native.npz", **rollout_arrays(rollout))
+    inputs = numeric_leaves(runtime, "runtime")
+    inputs.update(numeric_leaves(state, "initial_state"))
+    np.savez_compressed(directory / "physical_inputs.npz", **inputs)
+    write_json(directory / "metadata.json", dict(parameter_name=parameter_name,
+        accepted_count=int(rollout.accepted_count), attempt_count=int(rollout.attempt_count),
+        solver_parameters=runtime.solver_parameters,
+        versions={name: version(name) for name in ("jax", "jaxlib", "ntx", "vmex", "solvax")},
+        sources={name: hashlib.sha256(Path(module.__file__).read_bytes()).hexdigest()
+                 for name, module in tuple(sys.modules.items())
+                 if name in {"NEOPAX._orchestrator", "NEOPAX._transport_solvers",
+                             "NEOPAX._transport_flux_models", "NEOPAX._transport_equations"}}))
 
 
 def write_json(path, value):
@@ -150,11 +190,7 @@ def worker(run, out):
     components, prepared, execution = _prepare_rollout(config, runtime, state)
     if differences({"y": ad["initial_y"]}, {"y": np.asarray(prepared.initial_carry.y)}):
         raise ValueError("Restored packed initial state differs from the saved benchmark.")
-    setup = numeric_leaves(prepared.initial_carry, "initial_carry")
-    setup.update(numeric_leaves(execution, "execution"))
-    setup.update(numeric_leaves(components["equation_system"].fixed_temperature_profile,
-                                "fixed_temperature_profile"))
-    np.savez_compressed(out / "setup.npz", **setup)
+    np.savez_compressed(out / "setup.npz", **setup_arrays(components, prepared, execution))
     limit = int(report["accepted_step_limit"])
     slots = min(int(components["solver"].max_steps), max(limit * 16, limit + 16))
     if limit <= 0:
@@ -180,10 +216,7 @@ def worker(run, out):
         jax.block_until_ready(result)
         metadata["timings"][name] = time.perf_counter() - start
         count = int(result.attempt_count)
-        arrays = {field: np.asarray(getattr(result.trace, field))[:count].copy()
-                  for field in SCHEDULE_FIELDS}
-        arrays.update(final_y=np.asarray(result.final_carry.y).copy(),
-                      final_time=np.asarray(result.final_carry.t).copy())
+        arrays = rollout_arrays(result)
         if bool(result.failed) or not bool(result.completed) or int(result.accepted_count) != limit:
             raise RuntimeError(f"{name}: incomplete solve, fail_code={int(result.fail_code)}")
         if not np.isfinite(arrays["final_y"]).all():
