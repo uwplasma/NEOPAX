@@ -1,6 +1,8 @@
 """Generic baseline diagnostic checks using NumPy only; no physical solves."""
 from contextlib import redirect_stdout
 from dataclasses import dataclass
+import ast
+import contextlib
 import csv
 import importlib.util
 import io
@@ -22,6 +24,102 @@ spec.loader.exec_module(check)
 
 
 class GenericDatabaseBaselineTests(unittest.TestCase):
+    def test_original_fd_setup_branch_is_unchanged_and_capture_exits_before_profiles(self):
+        script = ROOT/'examples/benchmarks/benchmark_transport_realtime_geometry_forward_fd.py'
+        tree = ast.parse(script.read_text())
+        main = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == 'main')
+        start = next(i for i, node in enumerate(main.body) if isinstance(node, ast.Assign)
+                     and isinstance(node.targets[0], ast.Name) and node.targets[0].id == 'profile_cfg')
+        end = next(i for i, node in enumerate(main.body[start:], start) if isinstance(node, ast.Assign)
+                   and isinstance(node.targets[0], ast.Name) and node.targets[0].id == 'profile_values')
+        function = ast.parse('def setup():\n    pass\n').body[0]
+        function.body = main.body[start:end] + ast.parse('return baseline_runtime, baseline_state').body
+        with tempfile.TemporaryDirectory() as directory:
+            folder = Path(directory)
+            config_path = folder/'config.toml'
+            config_path.write_text('[general]\nmode="transport"\n')
+            args = SimpleNamespace(config=config_path, parameter='ZBS:1:0', geometry_fd_lane='frozen_linearized',
+                initial_er_root_only_fd=False, geometry_input_only_dir=None, geometry_input_reference=None)
+            state, geometry = np.ones(2), np.ones(1)
+            geo = SimpleNamespace(build_ntx_runtime_scan_inputs_from_vmec_state=lambda *a, **kw: (geometry, ()))
+            runtime = object()
+            def build(config, bundle, *, step_scale):
+                if args.geometry_input_only_dir is not None:
+                    geo.build_ntx_runtime_scan_inputs_from_vmec_state('context', state, geometry)
+                    self.fail('NTX construction must not be reached')
+                return runtime, state
+            save = Mock(return_value=folder/'capture.npz')
+            namespace = dict(args=args, Path=Path, config={'geometry':{'vmec_param_delta':.125}},
+                contextlib=contextlib, PARAMETER_ORDER=('n0',),
+                _baseline_profile_cfg=lambda config: {},
+                _frozen_linearized_vmec_geometry_bundle=Mock(return_value=object()),
+                _runtime_for_frozen_linearized_geometry_step=Mock(side_effect=build),
+                jnp=SimpleNamespace(asarray=np.asarray, float64=np.float64),
+                save_gradient_audit=save, build_runtime_context=Mock())
+            exec(compile(ast.fix_missing_locations(ast.Module(body=[function], type_ignores=[])), str(script), 'exec'), namespace)
+            result = namespace['setup']()
+            self.assertIs(result[0], runtime)
+            self.assertIs(result[1], state)
+            save.assert_not_called()
+            namespace['build_runtime_context'].assert_not_called()
+            args.geometry_input_only_dir = folder/'capture'
+            with patch.dict(sys.modules, NEOPAX=SimpleNamespace(_geometry_autodiff=geo),
+                    check_generic_ntx_database_baselines=check), redirect_stdout(io.StringIO()):
+                self.assertIsNone(namespace['setup']())
+            save.assert_called_once()
+            self.assertEqual((args.geometry_input_only_dir/'config.toml').read_text(), config_path.read_text())
+            namespace['_frozen_linearized_vmec_geometry_bundle'].assert_called_with(
+                namespace['config'], 'ZBS:1:0', baseline_delta=.125)
+            self.assertEqual(namespace['_runtime_for_frozen_linearized_geometry_step'].call_count, 2)
+
+    def test_terminal_capture_keeps_builders_unobserved_and_stops_only_after_scan(self):
+        state, geometry, channels = np.arange(2.), np.ones(2), np.ones(1)
+        build_geometry = Mock(return_value=geometry)
+        build_scan = Mock(return_value=(channels, (state,)))
+        geo = SimpleNamespace(_build_neopax_geometry_from_state=build_geometry,
+            build_ntx_runtime_scan_inputs_from_vmec_state=build_scan)
+        captured = {}
+        with check.capture_scan_boundary(geo, captured):
+            self.assertIs(geo._build_neopax_geometry_from_state, build_geometry)
+            self.assertEqual(captured, {})
+            result = geo._build_neopax_geometry_from_state('context', state)
+            self.assertEqual(captured, {})
+            geo.build_ntx_runtime_scan_inputs_from_vmec_state('context', state, result, rho_scan=[.5])
+            self.fail('The NTX coefficient builder must not be reached')
+        build_scan.assert_called_once_with('context', state, geometry, rho_scan=[.5])
+        self.assertIs(captured['00_geometry_equilibrium'], state)
+        self.assertIs(captured['01_geometry'], geometry)
+        self.assertIs(captured['02_channels'], channels)
+        self.assertIs(geo.build_ntx_runtime_scan_inputs_from_vmec_state, build_scan)
+        with self.assertRaisesRegex(RuntimeError, 'pre-NTX scan boundary'):
+            with check.capture_scan_boundary(geo, {}):
+                pass
+        with self.assertRaisesRegex(ValueError, 'original failure'):
+            with check.capture_scan_boundary(geo, {}):
+                raise ValueError('original failure')
+        self.assertIs(geo.build_ntx_runtime_scan_inputs_from_vmec_state, build_scan)
+
+    def test_common_boundary_comparison_aligns_detailed_and_terminal_stage_numbers(self):
+        reference = {"trace['02_geometry_equilibrium']['R_cos']": np.ones(1),
+            "trace['43_geometry']['a_b']": np.asarray(1.),
+            "trace['80_channels']['b00']": np.ones(2),
+            "trace['81_surfaces'][0]['b_cos']": np.ones(2),
+            "trace['42_boozer_0_outputs']['bmnc_b']": np.ones(2)}
+        captured = {key.replace('02_geometry_equilibrium', '00_geometry_equilibrium')
+            .replace('43_geometry', '01_geometry').replace('80_channels', '02_channels')
+            .replace('81_surfaces', '03_surfaces'): value for key, value in reference.items()}
+        a, b = map(check.common_input_boundaries, (reference, captured))
+        self.assertEqual(len(a), 4)
+        with redirect_stdout(io.StringIO()):
+            rows = check.compare(a, b, 'terminal')
+        self.assertTrue(all(row['arrays_match'] and row['bits_match'] for row in rows))
+        b["trace['01_geometry']['a_b']"] = np.nextafter(1., np.inf)
+        with redirect_stdout(io.StringIO()):
+            rows = check.compare(a, b, 'changed')
+        self.assertEqual(check.first_changed_stage(rows), '01_geometry')
+        with self.assertRaisesRegex(ValueError, 'no common'):
+            check.common_input_boundaries({})
+
     def test_geometry_comparison_uses_the_original_fd_setup_and_preserves_interpolation(self):
         config={"general":{"mode":"transport"},"geometry":{"vmec_param_delta":0.125},
                 "neoclassical":{"flux_model":"ntx_scan_runtime",

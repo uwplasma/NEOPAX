@@ -20,9 +20,10 @@ import importlib.metadata
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 import sys
-from contextlib import ExitStack
+from contextlib import ExitStack, contextmanager
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -81,6 +82,40 @@ def load_named_state(path, names, prefix="implicit"):
         result = {name: saved[key].copy() for name, key in zip(names, keys, strict=True)}
     if any(not np.isfinite(value).all() for value in result.values()):
         raise FloatingPointError("Saved equilibrium contains nonfinite values.")
+    return result
+
+
+@contextmanager
+def capture_scan_boundary(geometry_module, captured):
+    """Observe only the completed scan inputs; retain no geometry intermediates."""
+    original = geometry_module.build_ntx_runtime_scan_inputs_from_vmec_state
+    class InputsReady(Exception):
+        pass
+    def scan(context, state, geometry, **kwargs):
+        channels, surfaces = original(context, state, geometry, **kwargs)
+        for name, value in (("geometry_equilibrium", state), ("geometry", geometry),
+                            ("channels", channels), ("surfaces", surfaces)):
+            captured[f"{len(captured):02d}_{name}"] = capture_tree(value)
+        raise InputsReady
+    with patch.object(geometry_module, "build_ntx_runtime_scan_inputs_from_vmec_state", scan):
+        try:
+            yield
+        except InputsReady:
+            pass
+    if not captured:
+        raise RuntimeError("Input capture did not reach the pre-NTX scan boundary.")
+
+
+def common_input_boundaries(arrays):
+    """Align terminal captures and detailed traces, which number stages differently."""
+    result = {}
+    for i, stage in enumerate(("geometry_equilibrium", "geometry", "channels", "surfaces")):
+        for key, value in arrays.items():
+            match = re.match(r"trace\['\d+_" + stage + r"'\]", key)
+            if match:
+                result[f"trace['{i:02d}_{stage}']" + key[match.end():]] = value
+    if not result:
+        raise ValueError("Snapshot contains no common geometry/scan input boundaries.")
     return result
 
 

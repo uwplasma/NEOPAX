@@ -1374,7 +1374,18 @@ def main() -> None:
         "--baseline-only-dir", type=Path,
         help="Run the original preparation and adaptive baseline, save setup/state/schedule, then stop before objectives or FD endpoints.",
     )
+    parser.add_argument("--geometry-input-only-dir", type=Path,
+        help="Capture original geometry/scan inputs without intermediate observers, then stop before NTX, roots or transport.")
+    parser.add_argument("--geometry-input-reference", type=Path,
+        help="With --geometry-input-only-dir, compare against a saved normalization_inputs_*.npz trace.")
     args = parser.parse_args()
+    if args.geometry_input_reference is not None and (args.geometry_input_only_dir is None or not args.geometry_input_reference.is_file()):
+        parser.error("--geometry-input-reference requires --geometry-input-only-dir and an existing reference file")
+    if args.geometry_input_only_dir is not None:
+        if args.baseline_only_dir is not None or args.initial_er_root_only_fd:
+            parser.error("--geometry-input-only-dir cannot be combined with another early-stop option")
+        if args.geometry_input_only_dir.exists() and any(args.geometry_input_only_dir.iterdir()):
+            parser.error("--geometry-input-only-dir must be empty; choose a fresh directory")
     if args.baseline_only_dir is not None:
         if args.initial_er_root_only_fd:
             parser.error("--baseline-only-dir cannot be combined with --initial-Er-root-only-fd")
@@ -1400,6 +1411,11 @@ def main() -> None:
         ntx_exact_derivative_mode="direct",
         radau_jacobian_reuse_mode=args.radau_jacobian_reuse_mode,
     )
+    if args.geometry_input_only_dir is not None and (
+        config.get("neoclassical", {}).get("flux_model") != "ntx_scan_runtime"
+        or config.get("geometry", {}).get("backend") not in {"vmec_jax_booz_xform_jax", "vmec_runtime", "vmec_realtime"}
+    ):
+        parser.error("--geometry-input-only-dir requires realtime VMEC geometry and ntx_scan_runtime")
     if args.vmec_response_mode is not None:
         config.setdefault("geometry", {})["vmec_response_mode"] = args.vmec_response_mode
     if device_arg == "default":
@@ -1426,20 +1442,42 @@ def main() -> None:
     parameter_is_profile = parameter_name in PARAMETER_ORDER
     root_only_fd = bool(args.initial_er_root_only_fd)
     frozen_linearized_bundle = None
-    if parameter_is_profile or geometry_fd_lane != "frozen_linearized":
-        baseline_runtime, baseline_state = build_runtime_context(config)
-    else:
-        baseline_delta = float(config.get("geometry", {}).get("vmec_param_delta", 0.0))
-        frozen_linearized_bundle = _frozen_linearized_vmec_geometry_bundle(
-            config,
-            parameter_name,
-            baseline_delta=baseline_delta,
-        )
-        baseline_runtime, baseline_state = _runtime_for_frozen_linearized_geometry_step(
-            config,
-            frozen_linearized_bundle,
-            step_scale=0.0,
-        )
+    captured = {}
+    input_context = contextlib.nullcontext()
+    if args.geometry_input_only_dir is not None:
+        from NEOPAX import _geometry_autodiff as geometry_module
+        from check_generic_ntx_database_baselines import capture_scan_boundary
+        input_context = capture_scan_boundary(geometry_module, captured)
+    with input_context:
+        if parameter_is_profile or geometry_fd_lane != "frozen_linearized":
+            baseline_runtime, baseline_state = build_runtime_context(config)
+        else:
+            baseline_delta = float(config.get("geometry", {}).get("vmec_param_delta", 0.0))
+            frozen_linearized_bundle = _frozen_linearized_vmec_geometry_bundle(
+                config,
+                parameter_name,
+                baseline_delta=baseline_delta,
+            )
+            baseline_runtime, baseline_state = _runtime_for_frozen_linearized_geometry_step(
+                config,
+                frozen_linearized_bundle,
+                step_scale=0.0,
+            )
+    if args.geometry_input_only_dir is not None:
+        import os
+        from unittest.mock import patch
+        from check_generic_ntx_database_baselines import common_input_boundaries, compare, first_changed_stage, saved_arrays
+        args.geometry_input_only_dir.mkdir(parents=True, exist_ok=True)
+        with patch.dict(os.environ, NEOPAX_GRADIENT_AUDIT_DIR=str(args.geometry_input_only_dir)):
+            snapshot = save_gradient_audit("normalization_inputs", trace=captured)
+        (args.geometry_input_only_dir / "config.toml").write_bytes(Path(args.config).read_bytes())
+        if args.geometry_input_reference is not None:
+            rows = compare(common_input_boundaries(saved_arrays(args.geometry_input_reference)),
+                common_input_boundaries(saved_arrays(snapshot)), "saved_trace_vs_original_fd")
+            print(f"[geometry-input] first_changed_stage={first_changed_stage(rows)} "
+                  f"first_changed_bit_stage={first_changed_stage(rows, bitwise=True)}", flush=True)
+        print(f"[geometry-input] saved original {parameter_name} inputs; no NTX, root or transport solve", flush=True)
+        return
     profile_values = jnp.asarray(
         [_profile_cfg_scalar_value(profile_cfg, name) for name in PARAMETER_ORDER],
         dtype=jnp.float64,

@@ -87,9 +87,97 @@ boundary without assuming the support aggregate identifies its source.
 Four NumPy/mock regressions verify selection of the original FD helpers,
 alignment of the common boundaries, unmodified VMEC calls and the AD/FD/FD
 worker sequence.
-All 13 tests in the diagnostic's NumPy-only test module pass. The numerical
-GPU comparison of these exact paths has not yet run. If all inputs match again,
-that result must be reported as a non-reproduction, not as a solver fix.
+All 13 tests in the diagnostic's NumPy-only test module pass.
+
+### GPU result: exact paths agree in this run
+
+The remote run at commit `a8313d8`, saved in
+`outputs/ntss1d_zbs_input_paths_k4RToS`, completed all three independent workers:
+
+| Comparison | Differing numerical leaves | First differing bit stage |
+| --- | ---: | --- |
+| AD vs original ZBS FD setup 1 | 0 | none |
+| AD vs original ZBS FD setup 2 | 0 | none |
+| Original ZBS FD setup 1 vs 2 | 0 | none |
+
+This is a non-reproduction, not a fix of the earlier failing baseline.
+It shows that the parameter-specific setup paths can agree exactly; their
+structural differences alone do not establish a consistently different ZBS
+geometry calculation. It does not certify the subsequent NTX solves, roots
+or transport, which were intentionally skipped.
+
+The follow-up NumPy comparison reports identical TOML settings and all 25
+fresh traced geometry fields matching the saved AD baseline numerically.
+Against the earlier ZBS FD baseline, 18 of those fields differ. R0 differs
+by one ULP (`0x1.82d1eabcb3d91p+3` versus `0x1.82d1eabcb3d90p+3`), and a_b
+by one ULP in the opposite direction (`0x1.2d85eb2e9829ap+0` versus
+`0x1.2d85eb2e9829bp+0`). This establishes that the fresh matching setups
+reproduce the earlier AD geometry, rather than a third geometry. That
+readout checks numerical equality; it does not separately compare signed
+zeros or NaN payloads with the old snapshots.
+
+The trace preserves the arithmetic but retains intermediate device-array
+references until capture. This changes buffer lifetimes compared with the
+original benchmark. An observer effect or execution-context-dependent
+roundoff remains unproven. No numerical solver change is justified by this
+matching result.
+
+### Capture the original FD script without intermediate observers
+
+`benchmark_transport_realtime_geometry_forward_fd.py --geometry-input-only-dir`
+runs its unchanged baseline setup calls and installs only a stop at the
+completed scan-input boundary. No VMEC, volume, field, Boozer or Fourier
+operation is wrapped, and no intermediate arrays are retained during
+geometry construction. The normal transport configuration is preserved.
+After geometry and scan inputs are complete, the stop records their existing
+values and the supplied equilibrium, then returns before NTX coefficient
+construction, initialization roots, transport or FD endpoints.
+
+`--geometry-input-reference` compares these four common boundaries against
+the already-saved detailed trace. Stage numbers are normalized for comparison;
+array values and byte comparisons are unchanged. Three additional NumPy
+regressions verify the unobserved geometry builder, restoration/early stop,
+unmodified arguments, stage-number alignment and the original FD setup
+branch with and without capture. All 16 tests in the module pass. This
+diagnostic is prepared but its GPU control has not yet run.
+
+After publishing the change, run the original FD entry point on the GPU:
+
+```bash
+(
+  cd "$HOME/NEOPAX" || exit 1
+  git pull --ff-only origin en/v0_main || exit 1
+  neopax_out=$(mktemp -d outputs/zbs_original_inputs_XXXXXX) || exit 1
+  neopax_ref=(outputs/ntss1d_zbs_input_paths_k4RToS/ad/normalization_inputs_*.npz)
+  [ "${#neopax_ref[@]}" -eq 1 ] && [ -f "${neopax_ref[0]}" ] || exit 1
+  set -o pipefail
+  env -u PYTHONPATH -u LD_LIBRARY_PATH -u JAX_PLATFORM_NAME \
+    -u JAX_COMPILATION_CACHE_DIR -u XLA_FLAGS -u XLA_PYTHON_CLIENT_ALLOCATOR \
+    -u NEOPAX_GRADIENT_AUDIT_DIR \
+    JAX_PLATFORMS=cuda,cpu JAX_ENABLE_X64=true \
+    JAX_ENABLE_COMPILATION_CACHE=0 XLA_PYTHON_CLIENT_PREALLOCATE=false \
+    NTX_DISABLE_COMPILATION_CACHE=1 VMEX_COMPILATION_CACHE=disabled \
+    NEOPAX_REVERSE_STEP_DIAGNOSTICS=1 NEOPAX_TEST_RUNTIME_NTSS1D=1 \
+    "$HOME/jax_env/bin/python" \
+    examples/benchmarks/benchmark_transport_realtime_geometry_forward_fd.py \
+    --config examples/benchmarks/Solve_Transport_equations_wHe_radau_ntx_scan_runtime_database_vmec_realtime_geometry_benchmark_ntss1d.toml \
+    --parameter ZBS:1:0 --vmec-response-mode raw_block \
+    --accepted-step-limit 16 --radau-jacobian-reuse-mode legacy \
+    --geometry-fd-lane frozen_linearized --replay-mode accepted \
+    --fd-accepted-replay-contract reverse_frozen_metadata \
+    --initial-Er-root-ad jax_selected_root \
+    --initial-Er-root-fd-root-lane frozen_linearized --diagnose-fd-endpoint \
+    --geometry-input-only-dir "$neopax_out" \
+    --geometry-input-reference "${neopax_ref[0]}" \
+    2>&1 | tee "$neopax_out.log"
+) || printf '\nOriginal-script input capture stopped; terminal kept open.\n'
+```
+
+This runs no accepted steps despite retaining the original benchmark options.
+It tests whether the original script without intermediate observers reproduces
+the saved AD geometry or the differing ZBS geometry. A matching result would
+again be a non-reproduction; a mismatch would be localized to the first
+reported common boundary. It does not establish a library/backend cause.
 
 After publishing the diagnostic, run on the large machine:
 
