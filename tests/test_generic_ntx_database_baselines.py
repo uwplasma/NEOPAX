@@ -10,7 +10,7 @@ from types import SimpleNamespace
 import sys
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import numpy as np
 
@@ -22,6 +22,100 @@ spec.loader.exec_module(check)
 
 
 class GenericDatabaseBaselineTests(unittest.TestCase):
+    def test_geometry_comparison_uses_the_original_fd_setup_and_preserves_interpolation(self):
+        config={"general":{"mode":"transport"},"geometry":{"vmec_param_delta":0.125},
+                "neoclassical":{"flux_model":"ntx_scan_runtime",
+                                 "interpolation_mode":"preprocessed_3d_radial_ntss1d"}}
+        canonical=Mock(return_value=object())
+        bundle=object()
+        forward=SimpleNamespace(_frozen_linearized_vmec_geometry_bundle=Mock(return_value=bundle),
+                                _runtime_for_frozen_linearized_geometry_step=Mock(return_value=object()))
+        actual=check.build_comparison_runtime(config,'ad','ZBS:1:0',canonical,forward)
+        self.assertIs(actual,canonical.return_value)
+        forward._frozen_linearized_vmec_geometry_bundle.assert_not_called()
+        canonical.reset_mock()
+        actual=check.build_comparison_runtime(config,'fd','ZBS:1:0',canonical,forward)
+        canonical.assert_not_called()
+        forward._frozen_linearized_vmec_geometry_bundle.assert_called_once_with(config,'ZBS:1:0',baseline_delta=0.125)
+        forward._runtime_for_frozen_linearized_geometry_step.assert_called_once_with(config,bundle,step_scale=0.0)
+        self.assertIs(actual,forward._runtime_for_frozen_linearized_geometry_step.return_value)
+        traced=check.baseline_config(config,'fd',trace_inputs=True)
+        self.assertEqual(traced['neoclassical']['interpolation_mode'],'preprocessed_3d_radial_ntss1d')
+        self.assertEqual(config['general']['mode'],'transport')
+        self.assertEqual(traced['general']['mode'],'ambipolarity')
+
+    def test_pre_ntx_boundaries_align_when_only_one_builder_uses_the_scalar_solver(self):
+        state=np.asarray([1.,2.])
+        geometry=np.asarray([3.])
+        channels=np.asarray([4.])
+        geo=SimpleNamespace(_solve_state_for_single_param=Mock(return_value=state),
+            _build_neopax_geometry_from_state=lambda *a,**kw: geometry,
+            build_ntx_runtime_scan_inputs_from_vmec_state=lambda *a,**kw: (channels,()),
+            _import_vmec_module=lambda *a: SimpleNamespace())
+        api=SimpleNamespace(booz_xform_from_inputs=lambda **kw: {})
+        def build(config,scalar_solve):
+            value=geo._solve_state_for_single_param(None,0.) if scalar_solve else state
+            field=geo._build_neopax_geometry_from_state(None,value)
+            geo.build_ntx_runtime_scan_inputs_from_vmec_state(None,value,field)
+        a=check.trace_inputs({},geo,api,lambda cfg:build(cfg,True),lambda c:c,record_equilibrium=False)
+        b=check.trace_inputs({},geo,api,lambda cfg:build(cfg,False),lambda c:c,record_equilibrium=False)
+        self.assertEqual(tuple(a),tuple(b))
+        self.assertEqual(tuple(a)[0],'00_geometry_equilibrium')
+        for name in ('00_geometry_equilibrium','01_geometry','02_channels','04_electric_fields'):
+            np.testing.assert_array_equal(a[name],b[name])
+        self.assertEqual(geo._solve_state_for_single_param.call_count,1)
+
+    def test_parent_routes_ad_and_two_original_zbs_setups_to_input_trace(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            output=Path(temporary)/'trace'
+            def complete(command,**kwargs):
+                folder=Path(command[command.index('--out-dir')+1])
+                self.assertEqual(command[command.index('--fd-geometry-parameter')+1],'ZBS:1:0')
+                self.assertIn('--trace-inputs',command)
+                np.savez(folder/'normalization_inputs_saved.npz',
+                         **{"trace['00_geometry_equilibrium']['R_cos']":np.ones(1)})
+                (folder/'metadata.json').write_text(json.dumps(dict(config_sha256='config',input_sha256='input',
+                    reused_state_sha256=None,versions={},sources={})))
+                return SimpleNamespace(returncode=0)
+            with patch.object(sys,'argv',[str(check.__file__),'--out-dir',str(output),
+                    '--trace-inputs','--fd-geometry-parameter','ZBS:1:0']), \
+                 patch.object(check.subprocess,'run',side_effect=complete) as run,redirect_stdout(io.StringIO()) as log:
+                check.main()
+            self.assertEqual([call.args[0][call.args[0].index('--worker')+1] for call in run.call_args_list],['ad','fd','fd'])
+            self.assertIn('first_changed_stage=none',log.getvalue())
+
+    def test_vmec_primal_trace_separates_solve_output_from_zero_offset_assembly(self):
+        params, cfg, state, mask = np.ones(2), np.ones(1), np.arange(2.), np.ones(2)
+        implicit = SimpleNamespace(solve_implicit=Mock(return_value=state),
+            solve_implicit_with_aux=Mock(return_value=(state, mask)))
+        importer = lambda: implicit
+        geo = SimpleNamespace(_import_vmec_jax_implicit=importer,
+            _solve_state_for_single_param=lambda *a, **kw: None,
+            _build_neopax_geometry_from_state=lambda *a, **kw: a[1],
+            build_ntx_runtime_scan_inputs_from_vmec_state=lambda *a, **kw: (a[1], ()),
+            _import_vmec_module=lambda *a: SimpleNamespace())
+        api = SimpleNamespace(booz_xform_from_inputs=lambda **kw: {})
+        def build(config, aux):
+            module = geo._import_vmec_jax_implicit()
+            result = module.solve_implicit_with_aux(params, cfg) if aux else module.solve_implicit(params, cfg)
+            value = result[0] if aux else result
+            if aux:
+                self.assertIs(result[1], mask)
+                value = value + 0.0 * np.ones_like(value)
+            geometry = geo._build_neopax_geometry_from_state(None, value)
+            geo.build_ntx_runtime_scan_inputs_from_vmec_state(None, value, geometry)
+        traces = [check.trace_inputs({}, geo, api, lambda c: build(c, aux), lambda c: c,
+            record_equilibrium=False, trace_vmec_primal=True) for aux in (False, True)]
+        for trace in traces:
+            self.assertIs(trace['00_vmec_solve_inputs']['params'], params)
+            self.assertIs(trace['00_vmec_solve_inputs']['config'], cfg)
+            self.assertIs(trace['01_vmec_solve_outputs'], state)
+            np.testing.assert_array_equal(trace['02_geometry_equilibrium'], state)
+        self.assertEqual(tuple(traces[0]), tuple(traces[1]))
+        self.assertIs(geo._import_vmec_jax_implicit, importer)
+        implicit.solve_implicit.assert_called_once_with(params, cfg)
+        implicit.solve_implicit_with_aux.assert_called_once_with(params, cfg)
+
     def test_projection_trace_preserves_operands_and_restores_einsum(self):
         values, basis = np.ones((1,2,2)), np.ones((2,2,1))
         numerical = SimpleNamespace(einsum=np.einsum)

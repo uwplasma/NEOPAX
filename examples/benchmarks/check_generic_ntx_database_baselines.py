@@ -1,11 +1,13 @@
 """Compare generic-interpolation AD/FD baseline database builds on the GPU.
 
 Three independent processes build one AD-route and two FD-route baselines.
-No ambipolarity solve, transport integration, perturbation or derivative runs.
+No ambipolarity solve, transport integration or FD perturbation runs.
 The parent and saved-array comparison import no JAX. An archived generic AD
 snapshot is an additional reference, not a replacement for the fresh AD build.
 --trace-inputs instead repeats one configuration, captures upstream boundaries,
 and stops before NTX. --reuse-states also skips equilibrium solves.
+With --fd-geometry-parameter the input trace compares normal AD construction
+against the original geometry-FD construction, including its VMEC tangent.
 """
 from __future__ import annotations
 
@@ -32,10 +34,12 @@ PREFIXES = ("support['geometry'].", "support['database'].", "scan_inputs[", "tra
 TABLES = {f"support['database'].{name}" for name in ("D11_log", "D13", "D33")}
 
 
-def baseline_config(config, route):
+def baseline_config(config, route, *, trace_inputs=False):
     config = copy.deepcopy(config)
     nc = config["neoclassical"]
-    if nc.get("flux_model") != "ntx_scan_runtime" or nc.get("interpolation_mode", "generic") != "generic":
+    interpolation = nc.get("interpolation_mode", "generic")
+    supported = {"generic", "preprocessed_3d_radial_ntss1d"} if trace_inputs else {"generic"}
+    if nc.get("flux_model") != "ntx_scan_runtime" or interpolation not in supported:
         raise ValueError("This check requires runtime-built tables with GENERIC interpolation.")
     # Only initialization is skipped; table construction precedes this mode check.
     config.setdefault("general", {})["mode"] = "ambipolarity"
@@ -45,6 +49,15 @@ def baseline_config(config, route):
     elif route != "fd":
         raise ValueError(f"Unknown baseline route: {route}")
     return config
+
+
+def build_comparison_runtime(config, route, parameter, canonical, forward):
+    """Use the actual benchmark setup; do not substitute the normal FD route."""
+    if parameter is None or route == "ad":
+        return canonical(config)
+    bundle = forward._frozen_linearized_vmec_geometry_bundle(config, parameter,
+        baseline_delta=float(config.get("geometry", {}).get("vmec_param_delta", 0.0)))
+    return forward._runtime_for_frozen_linearized_geometry_step(config, bundle, step_scale=0.0)
 
 
 def capture_tree(value):
@@ -71,7 +84,8 @@ def load_named_state(path, names, prefix="implicit"):
     return result
 
 
-def trace_inputs(config, geometry_module, booz_api, build_runtime, fields, frozen_state=None, projection_module=None):
+def trace_inputs(config, geometry_module, booz_api, build_runtime, fields, frozen_state=None, projection_module=None,
+                 *, record_equilibrium=True, trace_vmec_primal=False):
     """Observe the production input-building path, stopping before NTX construction."""
     captured = {}
     def record(name, value):
@@ -99,7 +113,8 @@ def trace_inputs(config, geometry_module, booz_api, build_runtime, fields, froze
 
     def equilibrium(*args, **kwargs):
         result = solve(*args, **kwargs) if frozen_state is None else frozen_state
-        record("equilibrium", result)
+        if record_equilibrium:
+            record("equilibrium", result)
         return result
 
     def transform(*args, **kwargs):
@@ -158,6 +173,22 @@ def trace_inputs(config, geometry_module, booz_api, build_runtime, fields, froze
         raise InputsReady
 
     with ExitStack() as stack:
+        if trace_vmec_primal:
+            import_implicit = geometry_module._import_vmec_jax_implicit
+            def implicit_module():
+                module = import_implicit()
+                def solve_with_trace(function, with_aux):
+                    def run(params, cfg, *args, **kwargs):
+                        record("vmec_solve_inputs", dict(params=params, config=cfg))
+                        result = function(params, cfg, *args, **kwargs)
+                        record("vmec_solve_outputs", result[0] if with_aux else result)
+                        return result
+                    return run
+                return SimpleNamespace(**(vars(module) | {
+                    "solve_implicit": solve_with_trace(module.solve_implicit, False),
+                    "solve_implicit_with_aux": solve_with_trace(module.solve_implicit_with_aux, True),
+                }))
+            stack.enter_context(patch.object(geometry_module, "_import_vmec_jax_implicit", implicit_module))
         if projection_module is not None:
             einsum = projection_module.einsum
             def projection(subscripts, *operands, **kwargs):
@@ -248,7 +279,12 @@ def worker(args):
 
     config = _prepare_benchmark_config(args.config, device=None,
         ntx_exact_derivative_mode="direct", radau_jacobian_reuse_mode="legacy")
-    config = baseline_config(config, args.worker)
+    config = baseline_config(config, args.worker, trace_inputs=args.trace_inputs)
+    runtime_builder = build_runtime_context
+    if args.fd_geometry_parameter:
+        import benchmark_transport_realtime_geometry_forward_fd as forward
+        runtime_builder = lambda cfg: build_comparison_runtime(
+            cfg, args.worker, args.fd_geometry_parameter, build_runtime_context, forward)
     os.environ["NEOPAX_GRADIENT_AUDIT_DIR"] = str(args.out_dir)
     if args.trace_inputs:
         print(f"[normalization-trace] equilibrium={'saved' if args.reuse_states else 'fresh'}; "
@@ -271,8 +307,10 @@ def worker(args):
                     jnp.asarray(config['neoclassical']['ntx_scan_er_tilde']), channels.as_mapping())
                 return dict(zip(("Er", "Es", "Er_to_ertilde"), values, strict=True))
             captured = trace_inputs(config, geometry_module, geometry_module._import_booz_xform_jax_api(),
-                build_runtime_context, fields, frozen,
-                projection_module=jnp if args.trace_projections else None)
+                runtime_builder, fields, frozen,
+                projection_module=jnp if args.trace_projections else None,
+                record_equilibrium=not bool(args.fd_geometry_parameter),
+                trace_vmec_primal=bool(args.fd_geometry_parameter))
             snapshot = save_gradient_audit("normalization_inputs", trace=captured)
             state = next(value for name, value in captured.items() if name.endswith("_geometry_equilibrium"))
             np.savez_compressed(args.out_dir/"state_reference.npz", **jax.device_get(state))
@@ -289,7 +327,8 @@ def worker(args):
     metadata = dict(route=args.worker, interpolation_mode=nc.get('interpolation_mode', 'generic'),
         coefficient_reverse_mode=nc.get('ntx_scan_coefficient_reverse_mode', 'generic'),
         record_scan_primal=nc.get('ntx_scan_record_primal', False),
-        trace_inputs=args.trace_inputs, reused_state=str(args.reuse_states) if args.reuse_states else None,
+        trace_inputs=args.trace_inputs, fd_geometry_parameter=args.fd_geometry_parameter,
+        reused_state=str(args.reuse_states) if args.reuse_states else None,
         config_sha256=hashlib.sha256(args.config.read_bytes()).hexdigest(), snapshot=Path(snapshot).name,
         vmec_lane=config["geometry"].get("vmec_lane", "forward"),
         vmec_response_mode=config["geometry"].get("vmec_response_mode", "raw_block"), versions={}, sources={})
@@ -304,13 +343,21 @@ def worker(args):
     modules = ("NEOPAX._geometry_autodiff", "NEOPAX._transport_flux_models", "ntx._neopax_scan",
                  "ntx._solver", "ntx._solver_scan", "ntx._neopax_ad", "solvax.direct",
                  "booz_xform_jax.jax_api")
-    if args.trace_inputs:
+    if args.trace_inputs and not args.fd_geometry_parameter:
         modules += tuple(sorted(name for name in sys.modules if name.startswith("vmex.")))
+    elif args.trace_inputs:
+        # Different setup paths can import different auxiliary modules. Hash
+        # the same primary numerical modules in both manifests.
+        modules += ("vmex.core.implicit", "vmex.core.solver")
     for name in modules:
         module = sys.modules.get(name)
         path = Path(module.__file__) if module is not None else None
         if path is not None and path.is_file():
             metadata["sources"][name] = dict(path=str(path), sha256=hashlib.sha256(path.read_bytes()).hexdigest())
+    if args.fd_geometry_parameter:
+        path = ROOT/"examples/benchmarks/benchmark_transport_realtime_geometry_forward_fd.py"
+        metadata["sources"]["benchmark_transport_realtime_geometry_forward_fd"] = dict(
+            path=str(path), sha256=hashlib.sha256(path.read_bytes()).hexdigest())
     (args.out_dir/"metadata.json").write_text(json.dumps(metadata, indent=2)+"\n")
 
 
@@ -324,10 +371,14 @@ def main():
     parser.add_argument("--trace-projections", action="store_true", help="Input trace only: also capture VMEC-to-Boozer Fourier projection operands/results.")
     parser.add_argument("--reuse-states", type=Path, help="Input trace only: reuse saved states.npz or state_reference.npz; skip equilibrium solves.")
     parser.add_argument("--state-prefix", default="implicit", help="Field prefix for a reused states.npz (default: implicit).")
+    parser.add_argument("--fd-geometry-parameter",
+        help="With --trace-inputs, compare normal AD construction with two runs of the original frozen-linearized FD setup (e.g. ZBS:1:0).")
     args = parser.parse_args()
     args.config, args.out_dir = args.config.resolve(), args.out_dir.resolve()
     if args.trace_projections and not args.trace_inputs:
         parser.error("--trace-projections requires --trace-inputs.")
+    if args.fd_geometry_parameter and (not args.trace_inputs or args.reuse_states):
+        parser.error("--fd-geometry-parameter requires --trace-inputs and fresh equilibrium setup; omit --reuse-states.")
     if args.reuse_states:
         args.reuse_states = args.reuse_states.resolve()
         if not args.trace_inputs or not args.reuse_states.is_file():
@@ -350,7 +401,7 @@ def main():
         JAX_ENABLE_COMPILATION_CACHE="0", NTX_DISABLE_COMPILATION_CACHE="1", VMEX_COMPILATION_CACHE="disabled")
     arrays, rows = {}, []
     reference_controls = None
-    runs = (("baseline_1", "fd"), ("baseline_2", "fd"), ("baseline_3", "fd")) if args.trace_inputs else (("ad", "ad"), ("fd_1", "fd"), ("fd_2", "fd"))
+    runs = (("baseline_1", "fd"), ("baseline_2", "fd"), ("baseline_3", "fd")) if args.trace_inputs and not args.fd_geometry_parameter else (("ad", "ad"), ("fd_1", "fd"), ("fd_2", "fd"))
     reference_name = runs[0][0]
     for name, route in runs:
         folder = args.out_dir/name
@@ -359,6 +410,8 @@ def main():
                    "--out-dir", str(folder), "--worker", route]
         if args.trace_inputs:
             command += ["--trace-inputs"]
+            if args.fd_geometry_parameter:
+                command += ["--fd-geometry-parameter", args.fd_geometry_parameter]
             if args.trace_projections:
                 command += ["--trace-projections"]
             if args.reuse_states:

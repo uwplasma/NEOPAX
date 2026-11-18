@@ -32,6 +32,87 @@ active only during geometry/input construction, outside the equilibrium solve.
 Execution stops before NTX coefficient or database construction, root
 initialization and transport.
 
+## Trace the actual ZBS FD setup
+
+The earlier saved-input replay bypassed runtime construction. The original
+input trace repeated `build_runtime_context(config)` three times; it did not
+exercise the parameter-specific frozen-linearized geometry FD builder.
+Matching either check therefore does not rule out a difference in that builder.
+
+The saved-array readout from `outputs/ntss1d_ad_fd16_WFTo4W` confirms that
+the ZBS baseline difference is already present upstream of transport:
+
+| Saved field | Maximum absolute AD/FD difference |
+| --- | ---: |
+| geometry a_b | `2.220446049250313e-16` |
+| geometry R0 | `1.7763568394002505e-15` |
+| geometry B0 | `3.552713678800501e-15` |
+| database D11_log | `1.4103830707767884e-06` |
+| database D13 | `6.40592250133909e-03` |
+| database D33 | `4.3873442773900706e-04` |
+| packed initial state | `6.953623297517808e-03` |
+
+All printed finite masks match. D13's largest difference is at `(6, 0, 7)`,
+one of the previously isolated sensitive NTX points. This readout locates
+an upstream geometry difference; it does not identify the operation that
+introduced it or prove that a_b alone accounts for the table difference.
+
+The FD script selects a geometry context from `--parameter`, prepares a VMEC
+solve and its tangent, then builds its zero-offset runtime from
+`state_star + 0 * state_tangent`. The normal AD baseline calls
+`build_runtime_context(config)`. Both VMEX primal entry points ultimately use
+the same `_callback_solve` in the inspected VMEX source. Different public
+function names alone do not establish different equilibrium algorithms.
+The AD benchmark also reuses its known initial Er profile, whereas the FD
+baseline wrapper recomputes it. That latter difference cannot explain an
+already-different coefficient table.
+
+`--trace-inputs --fd-geometry-parameter ZBS:1:0` now compares one normal AD
+setup with two independent calls to the **actual** geometry FD helpers.
+It accepts either generic or radial NTSS1D interpolation and preserves the
+configured choice. The new comparison runs the original VMEC tangent setup
+but stops before NTX coefficient solves, root initialization and transport.
+It changes no production solver, interpolation, baseline or replay arithmetic.
+
+Trace stage names are aligned at the common geometry-equilibrium boundary;
+the scalar solver's extra return event is omitted in this comparison only.
+The trace also captures the actual VMEC parameters/configuration immediately
+before each primal call, and its returned state before the FD tangent setup.
+It can therefore distinguish different solve inputs, different returned
+equilibria, and a difference introduced by zero-offset state assembly. The
+observers forward the original objects to the original VMEC entry points.
+Both workers retain state, geometry, channel and native surface arrays, plus
+input fields and source/version hashes. This can locate the first changed
+boundary without assuming the support aggregate identifies its source.
+Four NumPy/mock regressions verify selection of the original FD helpers,
+alignment of the common boundaries, unmodified VMEC calls and the AD/FD/FD
+worker sequence.
+All 13 tests in the diagnostic's NumPy-only test module pass. The numerical
+GPU comparison of these exact paths has not yet run. If all inputs match again,
+that result must be reported as a non-reproduction, not as a solver fix.
+
+After publishing the diagnostic, run on the large machine:
+
+```bash
+(
+  cd "$HOME/NEOPAX" || exit 1
+  git pull --ff-only origin en/v0_main || exit 1
+  neopax_out=$(mktemp -d outputs/ntss1d_zbs_input_paths_XXXXXX) || exit 1
+  set -o pipefail
+  "$HOME/jax_env/bin/python" \
+    examples/benchmarks/check_generic_ntx_database_baselines.py \
+    --config examples/benchmarks/Solve_Transport_equations_wHe_radau_ntx_scan_runtime_database_vmec_realtime_geometry_benchmark_ntss1d.toml \
+    --trace-inputs --trace-projections \
+    --fd-geometry-parameter ZBS:1:0 \
+    --out-dir "$neopax_out" \
+    2>&1 | tee "$neopax_out.log"
+) || printf '\nZBS input-path trace stopped; terminal kept open.\n'
+```
+
+Read `first_changed_stage`, `first_changed_bit_stage` and `comparison.csv`.
+The script name retains "generic" for the existing database comparison;
+this input-only trace preserves the explicitly selected NTSS1D configuration.
+
 Each worker saves `normalization_inputs_*.npz`, `state_reference.npz`,
 `metadata.json` and `run.log`. Metadata records input/config/state hashes,
 package versions and source hashes, including loaded VMEX modules and the
@@ -152,8 +233,11 @@ the first half-mesh row. The adapter now uses an axis denominator of one,
 matching `vmex.core.boozer_tables.boozer_input_tables`. The ordinary nonaxis
 mesh formula and even-m interpolation are retained. Three NumPy regressions
 exercise the actual production interpolation kernel without importing JAX.
-GPU verification of this correction is pending; it is not a claimed fix for
-every last-bit input difference or downstream AD/FD discrepancy.
+The detailed GPU trace at `f45cdec` completed: all three fresh runs match in
+every captured numerical value and byte pattern. See the
+[post-fix result](normalization_trace_axis_fix_2026-11-16.md). This supports
+reproducibility in that experiment, not a claim that every intermittent
+input difference or downstream AD/FD discrepancy is fixed.
 
 `--trace-projections` adds observation of the real-space R/Z/lambda fields,
 Jacobian, metrics and magnetic fields consumed by the adapter, plus the exact
@@ -189,3 +273,39 @@ Matching projection operands with differing results would isolate variation
 in the contraction execution. Earlier differences in real-space preparation
 would point upstream of that contraction. Both are distinct from the known
 axis amplification, and neither should be inferred before inspecting output.
+
+## Next: generated tables without observation wrappers
+
+The fixed inputs must now be checked in the ordinary full database build.
+The existing mode below uses one AD-baseline configuration and two identical
+FD-baseline configurations. These labels describe setup/scan-recording
+settings only; no differentiation or FD perturbation is run. This performs
+three complete equilibrium/NTX database builds and stops before roots or
+transport. It uses the corrected source already in `f45cdec`, so no further
+executable code needs to be pushed. Historical pre-fix reference snapshots
+are deliberately not supplied.
+
+```bash
+(
+  cd "$HOME/NEOPAX" || exit 1
+  mkdir -p outputs
+  set -o pipefail
+  env JAX_PLATFORMS=cuda,cpu JAX_ENABLE_X64=true \
+    XLA_PYTHON_CLIENT_PREALLOCATE=false \
+    "$HOME/jax_env/bin/python" \
+    examples/benchmarks/check_generic_ntx_database_baselines.py \
+    --out-dir outputs/generic_ntx_baselines_axis_fix_20261116 \
+    2>&1 | tee outputs/generic_ntx_baselines_axis_fix_20261116.log
+) || printf '\nDatabase comparison stopped; terminal kept open.\n'
+```
+
+Passing this check would establish matching generated baselines for that run,
+not AD/FD gradient accuracy. Fresh paired AD16/FD16 validation remains a
+separate subsequent check.
+
+The ordinary post-fix database comparison has now completed: all three builds
+match in all captured leaves and all D11_log/D13/D33 table bytes. See the
+[recorded result](generic_ntx_baselines_axis_fix_2026-11-16.md). The supplied
+output is duplicated and is recorded once. The
+[fresh generic AD16/FD16 instructions](axis_fix_ad_fd16.md) preserve both sides
+and verify the actual transport baselines before recording derivative errors.
