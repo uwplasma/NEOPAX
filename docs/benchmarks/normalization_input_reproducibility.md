@@ -63,9 +63,11 @@ solve and its tangent, then builds its zero-offset runtime from
 `build_runtime_context(config)`. Both VMEX primal entry points ultimately use
 the same `_callback_solve` in the inspected VMEX source. Different public
 function names alone do not establish different equilibrium algorithms.
-The AD benchmark also reuses its known initial Er profile, whereas the FD
-baseline wrapper recomputes it. That latter difference cannot explain an
-already-different coefficient table.
+The outer AD script reuses its known initial Er profile during preliminary
+setup. This is not the initial state of the optimization API evaluation:
+the production evaluator builds profiles and selects a fresh root again.
+Confusing these stages led to the failed cached-root patch described below.
+Neither root setup can explain an already-different coefficient table.
 
 `--trace-inputs --fd-geometry-parameter ZBS:1:0` now compares one normal AD
 setup with two independent calls to the **actual** geometry FD helpers.
@@ -138,8 +140,130 @@ the already-saved detailed trace. Stage numbers are normalized for comparison;
 array values and byte comparisons are unchanged. Three additional NumPy
 regressions verify the unobserved geometry builder, restoration/early stop,
 unmodified arguments, stage-number alignment and the original FD setup
-branch with and without capture. All 16 tests in the module pass. This
-diagnostic is prepared but its GPU control has not yet run.
+branch with and without capture. All 16 tests in the module pass.
+
+The original-script GPU control subsequently completed in
+`outputs/zbs_original_inputs_0TjYww`, producing
+`normalization_inputs_bffsdunw.npz`. Compared with the saved matching trace,
+the equilibrium supplied to geometry construction, completed geometry,
+scan channels and native scan surfaces all match numerically and bitwise:
+`differing leaves=0`, `first_changed_stage=none`,
+`first_changed_bit_stage=none`. The pasted excerpt does not include Git HEAD.
+
+This reproduces the saved AD geometry without the detailed trace's
+intermediate observers. It does not support identifying those observers
+as the cause of the earlier differing ZBS evaluation. The cause remains
+unidentified, and no physics, interpolation or time-solver change follows
+from this result. The next distinct control, if needed, is the existing
+original-script `--baseline-only-dir`: complete NTX construction, root
+initialization and the 16-step baseline, then compare saved geometry,
+tables and initial state with the archived AD. It needs no new code and
+does not compute derivatives or FD endpoints. Repeating the already-matching
+pre-NTX captures is not an additional localization step.
+
+The complete original-script baseline then completed in
+`outputs/zbs_complete_baseline_UWRwqd`: 16 accepted steps, 23 attempts,
+final time `4.1195452419569767e-04`, with Newton setup recorded. The
+NumPy-only comparison against the archived AD run reports:
+
+| Captured group | Fields compared | Differing fields |
+| --- | ---: | ---: |
+| Geometry | 25 | 0 |
+| Interpolation database | 19 | 0 |
+| Packed initial state, final state and final time | 3 | 0 |
+
+This comparator checks array bytes as well as shapes and dtypes. The
+complete baseline agrees, including the NTX table and root-initialized
+state, without the pre-NTX stop or intermediate observers. No AD or FD
+endpoint was computed in this control. The earlier mismatching evaluation
+remains unexplained; this result does not establish a backend fix or
+validate a derivative. No further repetition of the same baseline controls
+is needed for this matching case. A single ZBS FD16 column can now be
+checked against the existing AD report, verifying its own fresh baseline
+before interpreting the gradient differences.
+
+### FD16 recheck: matching tables, remaining initialization drift
+
+The next ZBS FD16 run, `outputs/ntss1d_zbs_fd16_recheck_Rhdsg8`, reports
+zero geometry/database support difference, but an initial-state difference
+of `7.105427357601002e-15`. Its final state differs by
+`2.6708448785939254e-09` and final time by `5.796795335410998e-13`.
+Both perturbed endpoints converge for all 16 fixed accepted steps with no
+Newton retries. The baseline comparison correctly remains unvalidated.
+The [saved gradient table](ntss1d_zbs_fd16_recheck_2026-11-19.md) records
+the numerical differences with this qualification.
+
+The follow-up NumPy-only readout confirms identical packed density/pressure
+blocks and exactly three differing Er entries at radial indices 45, 46
+and 49, differing by one, two and one ULP respectively. This localizes the
+remaining initial-state mismatch to Er. It does not compare the FD runtime's
+root before the repeated solve with its root afterward.
+
+### Cached-root patch withdrawn: the outer setup was the wrong reference
+
+Commit `e0a90cc` changed FD to reuse its runtime's preliminary root, based
+on `_run_realtime_geometry_reverse_mode` doing so in the outer AD script.
+The GPU control in `outputs/zbs_root_reuse_baseline_HXmxwc` disproves the
+claimed baseline alignment. Geometry (25 fields) and tables (19 fields)
+match, but 14 initial Er entries differ by up to
+`1.2069774596730198e-03`. Final state differs by
+`3.0840242807084195e-04` and final time by `6.513128733174819e-10`.
+This is a failed patch, not a verified fix of the previous ULP drift.
+
+The actual AD path is:
+
+1. The outer runtime uses the TOML root setup, including scan mode `vmap`.
+2. `prepare_reverse_static_setup` in `_reverse_ad_transport.py` invokes the
+   production `initial_state_for_parameter_vector` constructor to record
+   the adaptive baseline. This rebuilds profiles and selects a fresh root.
+3. `realtime_geometry_reverse_all_objectives_support_payload_bar_for_parameter_vector`
+   also builds a pre-root profile state and evaluates the selected-root
+   primal separately when preparing the pullback. The shared
+   `initial_er_root_setup` overrides the root scan mode to `hybrid`.
+
+The AD terminal snapshot records the prepared static initial carry, not
+the outer script's preliminary root. The forward states and their root
+initialization must not be inferred from the outer setup call alone.
+The differing batch choices use the same intended root equation; their
+numerical effect on these particular saved states still needs a direct
+comparison, rather than an assumption based on the source.
+
+The corrective FD change removes cached-root reuse and invokes the **same
+production constructor as AD's adaptive schedule setup** for the enabled
+runtime-scan baseline. The benchmark's duplicate constructor remains on
+the existing endpoint, root-only and other-model paths. No root or time
+solver algorithm is modified. The earlier large geometry variation and
+the remaining derivative differences are not identified by this correction.
+
+The previous regressions checked the cache-argument plumbing against an
+incorrect expected contract. They have been replaced with tests that
+execute the actual AD schedule-constructor call and compare it with FD's
+constructor selection, using different preliminary and selected roots so
+wrong cache reuse is detected. Additional checks cover the shared hybrid
+setup and unchanged legacy/endpoint routes. All 25 NumPy/mock tests in the
+two relevant diagnostic modules pass. No local JAX or physics solve ran.
+Numerical verification of the corrective patch is pending. A focused GPU
+comparison can restore the existing saved geometry/tables and compare the
+runtime and evaluator root initializers without VMEC, an NTX scan or transport.
+
+### Saved-root replay restored the wrong interpolation class
+
+The subsequent root-only probe reported a maximum difference of
+`7.163548879044086e-01` for both recomputed initializers. That probe used
+`restore_runtime`, whose original implementation always instantiated
+`Monoenergetic`. This is correct for generic tables but wrong for this
+NTSS1D case: production builds `MonoenergeticRuntimeNTSS1D`. The query
+dispatcher selects the interpolation kernel from the database class,
+not the runtime wrapper's `interpolation_mode` string. Identical saved
+arrays therefore did not imply the same root equation in that probe.
+
+The diagnostic now restores the configured class, checks its dispatch kind
+and prints both. A NumPy/mock regression executes the actual dispatcher,
+checks all saved fields and preserves the generic restoration path.
+Unsupported modes fail before model construction. This changes diagnostic
+restoration only. The reported `0.716` root shift cannot establish a
+production initializer or batching defect. The earlier cached-root failure
+in the complete original FD entry point remains valid and separate.
 
 After publishing the change, run the original FD entry point on the GPU:
 

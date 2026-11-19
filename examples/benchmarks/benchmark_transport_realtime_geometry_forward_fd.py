@@ -48,7 +48,7 @@ from NEOPAX._reverse_ad_initial_er import (  # noqa: E402
     initial_er_charge_flux_residual_er_derivative,
     initial_er_charge_flux_residuals,
 )
-from NEOPAX._reverse_ad_transport import objective_scalar_by_index  # noqa: E402
+from NEOPAX._reverse_ad_transport import initial_state_for_parameter_vector, objective_scalar_by_index  # noqa: E402
 from NEOPAX._optimization_diagnostics import save_gradient_audit  # noqa: E402
 from NEOPAX._geometry_autodiff import (  # noqa: E402
     _main_vmec_state_tangent_batch,
@@ -614,7 +614,6 @@ def _profile_state_from_values(
     baseline_state,
     profile_cfg: dict[str, Any],
     initial_er_root_ad: str = "off",
-    known_initial_er_profile=None,
 ):
     return _initial_state_for_parameter_vector(
         values,
@@ -623,7 +622,6 @@ def _profile_state_from_values(
         baseline_state=baseline_state,
         profile_cfg=profile_cfg,
         runtime=runtime,
-        known_initial_er_profile=known_initial_er_profile,
     )
 
 
@@ -1484,22 +1482,24 @@ def main() -> None:
         [_profile_cfg_scalar_value(profile_cfg, name) for name in PARAMETER_ORDER],
         dtype=jnp.float64,
     )
-    baseline_profile_state = _profile_state_from_values(
+    # Match the constructor used to record the AD evaluator's adaptive baseline.
+    # The root in the outer runtime is only a preliminary initialization.
+    baseline_profile_builder = (
+        initial_state_for_parameter_vector
+        if (
+            not root_only_fd
+            and initial_er_root_ad != "off"
+            and str(config.get("neoclassical", {}).get("flux_model", "")).strip().lower() == "ntx_scan_runtime"
+        )
+        else _profile_state_from_values
+    )
+    baseline_profile_state = baseline_profile_builder(
         profile_values,
         config=config,
         initial_er_root_ad="off" if root_only_fd else initial_er_root_ad,
         runtime=baseline_runtime,
         baseline_state=baseline_state,
         profile_cfg=profile_cfg,
-        # Match the AD baseline: reuse this runtime's already-selected root.
-        # Endpoint calls keep their existing selected/frozen-linearized rules.
-        known_initial_er_profile=(
-            baseline_state.Er
-            if not root_only_fd
-            and str(config.get("neoclassical", {}).get("flux_model", "")).strip().lower()
-            == "ntx_scan_runtime"
-            else None
-        ),
     )
 
     if root_only_fd:

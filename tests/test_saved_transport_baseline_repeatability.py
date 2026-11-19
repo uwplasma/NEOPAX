@@ -24,7 +24,71 @@ _jax_after = "jax" in sys.modules
 
 
 class SavedBaselineTests(unittest.TestCase):
-    def test_fd_profile_wrapper_reuses_a_known_baseline_root_only_when_explicitly_supplied(self):
+    def test_saved_runtime_preserves_interpolation_dispatch_and_all_database_leaves(self):
+        class Monoenergetic:
+            def __init__(self, **fields):
+                self.__dict__.update(fields)
+        class MonoenergeticRuntimeNTSS1D(Monoenergetic):
+            pass
+        @dataclasses.dataclass
+        class Neo:
+            database: object = None
+        @dataclasses.dataclass
+        class Flux:
+            neoclassical_model: object
+
+        # Exercise the real class-based dispatcher without importing JAX.
+        source = SCRIPT.parents[2]/'NEOPAX/_monoenergetic.py'
+        functions = [node for node in ast.parse(source.read_text()).body
+                     if isinstance(node, ast.FunctionDef) and node.name in
+                     ('normalize_interpolation_mode', 'monoenergetic_database_kind')]
+        namespace = dict(Any=object, MONOENERGETIC_KIND_GENERIC='generic',
+            MONOENERGETIC_KIND_BY_CLASS={MonoenergeticRuntimeNTSS1D:'preprocessed_3d_radial_ntss1d',
+                                        Monoenergetic:'generic'})
+        exec(compile(ast.Module(body=functions, type_ignores=[]), str(source), 'exec'), namespace)
+        modules = {
+            'NEOPAX._database': SimpleNamespace(Monoenergetic=Monoenergetic,
+                MonoenergeticRuntimeNTSS1D=MonoenergeticRuntimeNTSS1D),
+            'NEOPAX._monoenergetic': SimpleNamespace(**namespace),
+            'NEOPAX._geometry_models': SimpleNamespace(VmecBoozer=SimpleNamespace),
+            'NEOPAX._state': SimpleNamespace(TransportState=SimpleNamespace),
+            'NEOPAX._transport_flux_models': SimpleNamespace(NTXRuntimeScanTransportModel=Neo),
+        }
+        database_source = ast.parse((SCRIPT.parents[2]/'NEOPAX/_database.py').read_text())
+        database_class = next(node for node in database_source.body
+                              if isinstance(node, ast.ClassDef) and node.name == 'Monoenergetic')
+        saved = {node.target.id:np.asarray([i+0.25]) for i, node in enumerate(database_class.body)
+                 if isinstance(node, ast.AnnAssign)}
+        ad = {"support['database']."+k:v for k, v in saved.items()}
+        ad["support['geometry'].a_b"] = np.asarray(1.2)
+        fd = {f'initial_state.{k}':np.asarray([i+1.])
+              for i, k in enumerate(('density', 'pressure', 'Er'))}
+        build = Mock(return_value=Flux(Neo()))
+        orch = SimpleNamespace(_build_species=lambda cfg:object(), _build_energy_grid=lambda cfg:object(),
+            build_source_models_from_config=lambda *args:object(), _build_flux_model=build,
+            RuntimeContext=SimpleNamespace, Models=SimpleNamespace, _normalize_solver_config=lambda cfg:{})
+        with patch.dict(sys.modules, modules), contextlib.redirect_stdout(io.StringIO()):
+            for mode, expected in ((None, Monoenergetic), ('generic', Monoenergetic),
+                                  (' preprocessed_3d_radial_ntss1d ', MonoenergeticRuntimeNTSS1D)):
+                with self.subTest(mode=mode):
+                    config = {'neoclassical':{'flux_model':'ntx_scan_runtime', 'interpolation_mode':mode}}
+                    runtime, state = check.restore_runtime(config, ad, fd, orch, np)
+                    self.assertIs(type(runtime.database), expected)
+                    self.assertIs(runtime.models.flux.neoclassical_model.database, runtime.database)
+                    self.assertEqual(set(vars(runtime.database)), set(saved))
+                    for key, value in saved.items():
+                        np.testing.assert_array_equal(getattr(runtime.database, key), value)
+                    np.testing.assert_array_equal(state.Er, fd['initial_state.Er'])
+                    self.assertFalse(config['neoclassical']['prebuild_database'])
+                    self.assertFalse(config['neoclassical']['preload_channels'])
+            for settings in ({'flux_model':'ntx_database'},
+                             {'flux_model':'ntx_scan_runtime', 'interpolation_mode':'unsupported'}):
+                build.reset_mock()
+                with self.assertRaises(ValueError):
+                    check.restore_runtime({'neoclassical':settings}, ad, fd, orch, np)
+                build.assert_not_called()
+
+    def test_fd_endpoint_profile_wrapper_keeps_its_existing_selected_root_rule(self):
         path = SCRIPT.with_name('benchmark_transport_realtime_geometry_forward_fd.py')
         function = next(node for node in ast.parse(path.read_text()).body
                         if isinstance(node, ast.FunctionDef) and node.name == '_profile_state_from_values')
@@ -32,43 +96,87 @@ class SavedBaselineTests(unittest.TestCase):
         namespace = dict(_initial_state_for_parameter_vector=constructor)
         future = ast.ImportFrom(module='__future__', names=[ast.alias(name='annotations')], level=0)
         exec(compile(ast.fix_missing_locations(ast.Module(body=[future, function], type_ignores=[])), str(path), 'exec'), namespace)
-        root = np.asarray([1., -2.])
         values, runtime, baseline = object(), object(), object()
         kwargs = dict(config={}, runtime=runtime, baseline_state=baseline, profile_cfg={},
                       initial_er_root_ad='jax_selected_root')
-        result = namespace['_profile_state_from_values'](values, **kwargs, known_initial_er_profile=root)
+        result = namespace['_profile_state_from_values'](values, **kwargs)
         self.assertIs(result, constructor.return_value)
-        self.assertIs(constructor.call_args.kwargs['known_initial_er_profile'], root)
         self.assertIs(constructor.call_args.kwargs['runtime'], runtime)
-        # An ordinary endpoint invocation must not inherit the baseline root.
-        namespace['_profile_state_from_values'](values, **kwargs)
-        self.assertIsNone(constructor.call_args.kwargs['known_initial_er_profile'])
+        self.assertNotIn('known_initial_er_profile', constructor.call_args.kwargs)
         self.assertEqual(constructor.call_args.kwargs['initial_er_root_ad'], 'jax_selected_root')
 
-    def test_fd_main_reuses_its_own_scan_root_and_preserves_other_initialization_paths(self):
+    def test_fd_baseline_uses_actual_ad_schedule_constructor_not_outer_runtime_cache(self):
         path = SCRIPT.with_name('benchmark_transport_realtime_geometry_forward_fd.py')
-        main = next(node for node in ast.parse(path.read_text()).body
+        module = ast.parse(path.read_text())
+        main = next(node for node in module.body
                     if isinstance(node, ast.FunctionDef) and node.name == 'main')
-        assignment = next(node for node in main.body if isinstance(node, ast.Assign)
-                          and isinstance(node.targets[0], ast.Name) and node.targets[0].id == 'baseline_profile_state')
-        root = np.asarray([1., -2.])
-        builder = Mock(return_value=object())
+        start = next(i for i, node in enumerate(main.body) if isinstance(node, ast.Assign)
+                     and isinstance(node.targets[0], ast.Name) and node.targets[0].id == 'baseline_profile_builder')
+        end = next(i for i, node in enumerate(main.body[start:], start) if isinstance(node, ast.Assign)
+                   and isinstance(node.targets[0], ast.Name) and node.targets[0].id == 'baseline_profile_state')
+        imports = next(node for node in module.body if isinstance(node, ast.ImportFrom)
+                       and node.module == 'NEOPAX._reverse_ad_transport')
+        self.assertIn('initial_state_for_parameter_vector', [name.name for name in imports.names])
+        @dataclasses.dataclass
+        class State:
+            Er: object
+        preliminary = State(np.asarray([1., -2.]))
+        root = np.asarray([1.001, -2.001])
+        constructor = Mock(return_value=State(root))
+        builder = Mock(return_value=preliminary)
         namespace = dict(_profile_state_from_values=builder, profile_values=object(),
             config={'neoclassical':{'flux_model':'ntx_scan_runtime'}}, root_only_fd=False,
             initial_er_root_ad='jax_selected_root', baseline_runtime=object(),
-            baseline_state=SimpleNamespace(Er=root), profile_cfg={})
-        code = compile(ast.Module(body=[assignment], type_ignores=[]), str(path), 'exec')
+            baseline_state=preliminary, profile_cfg={}, initial_state_for_parameter_vector=constructor)
+        code = compile(ast.Module(body=main.body[start:end+1], type_ignores=[]), str(path), 'exec')
         exec(code, namespace)
-        self.assertIs(builder.call_args.kwargs['known_initial_er_profile'], root)
-        self.assertEqual(builder.call_args.kwargs['initial_er_root_ad'], 'jax_selected_root')
-        namespace['config']['neoclassical']['flux_model'] = 'ntx_database'
-        exec(code, namespace)
-        self.assertIsNone(builder.call_args.kwargs['known_initial_er_profile'])
-        namespace['config']['neoclassical']['flux_model'] = 'ntx_scan_runtime'
-        namespace['root_only_fd'] = True
-        exec(code, namespace)
-        self.assertIsNone(builder.call_args.kwargs['known_initial_er_profile'])
-        self.assertEqual(builder.call_args.kwargs['initial_er_root_ad'], 'off')
+        builder.assert_not_called()
+        self.assertEqual(constructor.call_args.kwargs['initial_er_root_ad'], 'jax_selected_root')
+        self.assertNotIn('known_initial_er_profile', constructor.call_args.kwargs)
+        fd_state = namespace['baseline_profile_state']
+        fd_call = constructor.call_args
+
+        # Execute the constructor call that records the AD adaptive schedule.
+        transport = path.parents[2]/'NEOPAX/_reverse_ad_transport.py'
+        evaluator = next(node for node in ast.parse(transport.read_text()).body
+            if isinstance(node, ast.FunctionDef) and node.name == 'prepare_reverse_static_setup')
+        stage = next(node for node in evaluator.body if isinstance(node, ast.Assign)
+                     and isinstance(node.targets[0], ast.Name) and node.targets[0].id == 'state0_static')
+        ad = dict(initial_state_for_parameter_vector=constructor, parameter_values=namespace['profile_values'],
+            config=namespace['config'], runtime=namespace['baseline_runtime'], baseline_state=preliminary,
+            profile_cfg=namespace['profile_cfg'], initial_er_root_ad='jax_selected_root')
+        exec(compile(ast.Module(body=[stage], type_ignores=[]), str(transport), 'exec'), ad)
+        self.assertEqual(fd_call, constructor.call_args)
+        np.testing.assert_array_equal(fd_state.Er, ad['state0_static'].Er)
+        self.assertFalse(np.array_equal(fd_state.Er, preliminary.Er))
+
+        for flux, root_only, mode in (
+            ('ntx_database', False, 'jax_selected_root'),
+            ('ntx_scan_runtime', True, 'jax_selected_root'),
+            ('ntx_scan_runtime', False, 'off'),
+        ):
+            namespace['config']['neoclassical']['flux_model'] = flux
+            namespace['root_only_fd'] = root_only
+            namespace['initial_er_root_ad'] = mode
+            constructor.reset_mock()
+            exec(code, namespace)
+            constructor.assert_not_called()
+            self.assertEqual(builder.call_args.kwargs['initial_er_root_ad'], 'off' if root_only else mode)
+
+    def test_actual_evaluator_root_setup_uses_hybrid_without_changing_runtime_toml(self):
+        path = SCRIPT.parents[2]/'NEOPAX/_reverse_ad_initial_er.py'
+        function = next(node for node in ast.parse(path.read_text()).body
+                        if isinstance(node, ast.FunctionDef) and node.name == 'initial_er_root_setup')
+        namespace = dict(get_entropy_model=Mock(return_value=object()))
+        exec(compile(ast.Module(body=[function], type_ignores=[]), str(path), 'exec'), namespace)
+        config = {'ambipolarity':{'er_ambipolar_scan_batch_mode':'vmap', 'er_ambipolar_blocksize':1}}
+        runtime = SimpleNamespace(species=object(), energy_grid=object(), geometry=object(),
+                                  database=object(), solver_parameters={})
+        amb, method, entropy, params = namespace['initial_er_root_setup'](config, runtime)
+        self.assertEqual(amb['er_ambipolar_scan_batch_mode'], 'hybrid')
+        self.assertEqual(config['ambipolarity']['er_ambipolar_scan_batch_mode'], 'vmap')
+        self.assertEqual(method, 'two_stage')
+        self.assertIs(params['geometry'], runtime.geometry)
 
     def test_exact_comparison_catches_ulp_signed_zero_and_first_attempt(self):
         a = np.asarray([0., 1., 2., 3., 4., 5.])

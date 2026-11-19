@@ -124,23 +124,33 @@ def write_json(path, value):
 
 
 def restore_runtime(config, ad, fd, orch, jnp):
-    from NEOPAX._database import Monoenergetic
+    from NEOPAX._database import Monoenergetic, MonoenergeticRuntimeNTSS1D
     from NEOPAX._geometry_models import VmecBoozer
+    from NEOPAX._monoenergetic import monoenergetic_database_kind, normalize_interpolation_mode
     from NEOPAX._state import TransportState
     from NEOPAX._transport_flux_models import NTXRuntimeScanTransportModel
+
+    nc = config["neoclassical"]
+    if nc.get("flux_model") != "ntx_scan_runtime":
+        raise ValueError("This diagnostic requires the saved ntx_scan_runtime case.")
+    mode = normalize_interpolation_mode(nc.get("interpolation_mode"))
+    database_type = {"generic": Monoenergetic,
+                     "preprocessed_3d_radial_ntss1d": MonoenergeticRuntimeNTSS1D}.get(mode)
+    if database_type is None:
+        raise ValueError(f"Unsupported saved runtime interpolation: {mode}")
 
     def fields(prefix):
         return {key[len(prefix):]: jnp.asarray(value)
                 for key, value in ad.items() if key.startswith(prefix)}
     geometry = VmecBoozer(**fields("support['geometry']."))
-    database = Monoenergetic(**fields("support['database']."))
+    database = database_type(**fields("support['database']."))
+    if monoenergetic_database_kind(database) != mode:
+        raise ValueError("Restored database selects a different interpolation rule.")
+    print(f"[baseline-repeat] restored database={type(database).__name__} interpolation_mode={mode}", flush=True)
     species, energy = orch._build_species(config), orch._build_energy_grid(config)
     sources = orch.build_source_models_from_config(config, species)
     # Keep the scan-wrapper class and the original interpolation/physics.
     # The tables are already saved: prevent its builder from launching NTX.
-    nc = config["neoclassical"]
-    if nc.get("flux_model") != "ntx_scan_runtime":
-        raise ValueError("This diagnostic requires the saved ntx_scan_runtime case.")
     nc.update(prebuild_database=False, preload_channels=False)
     flux = orch._build_flux_model(config, species, energy, geometry, database, source_models=sources)
     neo = flux.neoclassical_model
