@@ -24,6 +24,52 @@ _jax_after = "jax" in sys.modules
 
 
 class SavedBaselineTests(unittest.TestCase):
+    def test_fd_profile_wrapper_reuses_a_known_baseline_root_only_when_explicitly_supplied(self):
+        path = SCRIPT.with_name('benchmark_transport_realtime_geometry_forward_fd.py')
+        function = next(node for node in ast.parse(path.read_text()).body
+                        if isinstance(node, ast.FunctionDef) and node.name == '_profile_state_from_values')
+        constructor = Mock(return_value=object())
+        namespace = dict(_initial_state_for_parameter_vector=constructor)
+        future = ast.ImportFrom(module='__future__', names=[ast.alias(name='annotations')], level=0)
+        exec(compile(ast.fix_missing_locations(ast.Module(body=[future, function], type_ignores=[])), str(path), 'exec'), namespace)
+        root = np.asarray([1., -2.])
+        values, runtime, baseline = object(), object(), object()
+        kwargs = dict(config={}, runtime=runtime, baseline_state=baseline, profile_cfg={},
+                      initial_er_root_ad='jax_selected_root')
+        result = namespace['_profile_state_from_values'](values, **kwargs, known_initial_er_profile=root)
+        self.assertIs(result, constructor.return_value)
+        self.assertIs(constructor.call_args.kwargs['known_initial_er_profile'], root)
+        self.assertIs(constructor.call_args.kwargs['runtime'], runtime)
+        # An ordinary endpoint invocation must not inherit the baseline root.
+        namespace['_profile_state_from_values'](values, **kwargs)
+        self.assertIsNone(constructor.call_args.kwargs['known_initial_er_profile'])
+        self.assertEqual(constructor.call_args.kwargs['initial_er_root_ad'], 'jax_selected_root')
+
+    def test_fd_main_reuses_its_own_scan_root_and_preserves_other_initialization_paths(self):
+        path = SCRIPT.with_name('benchmark_transport_realtime_geometry_forward_fd.py')
+        main = next(node for node in ast.parse(path.read_text()).body
+                    if isinstance(node, ast.FunctionDef) and node.name == 'main')
+        assignment = next(node for node in main.body if isinstance(node, ast.Assign)
+                          and isinstance(node.targets[0], ast.Name) and node.targets[0].id == 'baseline_profile_state')
+        root = np.asarray([1., -2.])
+        builder = Mock(return_value=object())
+        namespace = dict(_profile_state_from_values=builder, profile_values=object(),
+            config={'neoclassical':{'flux_model':'ntx_scan_runtime'}}, root_only_fd=False,
+            initial_er_root_ad='jax_selected_root', baseline_runtime=object(),
+            baseline_state=SimpleNamespace(Er=root), profile_cfg={})
+        code = compile(ast.Module(body=[assignment], type_ignores=[]), str(path), 'exec')
+        exec(code, namespace)
+        self.assertIs(builder.call_args.kwargs['known_initial_er_profile'], root)
+        self.assertEqual(builder.call_args.kwargs['initial_er_root_ad'], 'jax_selected_root')
+        namespace['config']['neoclassical']['flux_model'] = 'ntx_database'
+        exec(code, namespace)
+        self.assertIsNone(builder.call_args.kwargs['known_initial_er_profile'])
+        namespace['config']['neoclassical']['flux_model'] = 'ntx_scan_runtime'
+        namespace['root_only_fd'] = True
+        exec(code, namespace)
+        self.assertIsNone(builder.call_args.kwargs['known_initial_er_profile'])
+        self.assertEqual(builder.call_args.kwargs['initial_er_root_ad'], 'off')
+
     def test_exact_comparison_catches_ulp_signed_zero_and_first_attempt(self):
         a = np.asarray([0., 1., 2., 3., 4., 5.])
         b = a.copy()

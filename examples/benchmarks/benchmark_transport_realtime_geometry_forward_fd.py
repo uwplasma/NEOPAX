@@ -614,6 +614,7 @@ def _profile_state_from_values(
     baseline_state,
     profile_cfg: dict[str, Any],
     initial_er_root_ad: str = "off",
+    known_initial_er_profile=None,
 ):
     return _initial_state_for_parameter_vector(
         values,
@@ -622,6 +623,7 @@ def _profile_state_from_values(
         baseline_state=baseline_state,
         profile_cfg=profile_cfg,
         runtime=runtime,
+        known_initial_er_profile=known_initial_er_profile,
     )
 
 
@@ -1489,6 +1491,15 @@ def main() -> None:
         runtime=baseline_runtime,
         baseline_state=baseline_state,
         profile_cfg=profile_cfg,
+        # Match the AD baseline: reuse this runtime's already-selected root.
+        # Endpoint calls keep their existing selected/frozen-linearized rules.
+        known_initial_er_profile=(
+            baseline_state.Er
+            if not root_only_fd
+            and str(config.get("neoclassical", {}).get("flux_model", "")).strip().lower()
+            == "ntx_scan_runtime"
+            else None
+        ),
     )
 
     if root_only_fd:
