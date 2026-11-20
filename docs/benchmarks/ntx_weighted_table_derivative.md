@@ -252,9 +252,9 @@ repeat would leave endpoint construction and scan context unresolved.
 
 Five NumPy-only saved-geometry tests and eight coefficient-diagnostic tests
 pass. The new bookkeeping test detects a wrong parameter column, preserves
-nonzero tangent discrepancies, and rejects missing/invalid fields. GPU
-validation of the controlled FD-entrypoint comparison is pending. Production
-physics and transport methods are unchanged.
+nonzero tangent discrepancies, and rejects missing/invalid fields. The GPU
+comparison has now completed; see the result below. Production physics and
+transport methods are unchanged.
 
 Add `--fd-report RUN/fd_ZBS_1_0/summary.json` to quantify the tangent difference
 for all 13 costs in the same run. The diagnostic checks the original AD/FD
@@ -272,5 +272,121 @@ saved AD result closely before attributing a projected change to the VMEC
 direction. The printed `control_relative`, `original_relative` and
 `projected_relative` columns expose all three comparisons. The new NumPy test
 keeps control replay changes separate from effects of the direction and
-rejects mismatched objective order or invalid projections. GPU validation
-of this additional projection is pending.
+rejects mismatched objective order or invalid projections.
+
+## FD geometry direction result: not the main source of the gap
+
+Run `fd_direction_audit_ZBS_XSdhvU` completed on JAX 0.10.0 using the same
+geometry, VMEX implicit and Boozer source hashes as the earlier audit.
+The replay with the saved AD direction reproduces all 13 saved AD gradients
+within `1.982448e-15` relative. The new FD-entrypoint state tangent differs
+from AD by `1.124061e-08` relative L2 in R_cos, `1.165407e-09` in Z_sin and
+`8.700567e-09` in L_sin. The other three spectral fields match exactly.
+
+Projecting that fresh FD tangent through the same production payload mapper
+and recorded objective bars barely changes the observed discrepancies:
+
+| Objective | Original AD vs saved FD | Fresh FD direction vs saved FD |
+| --- | ---: | ---: |
+| softmax_Er | `2.494047e-05` | `2.494011e-05` |
+| net_total_power_volume_average_mw_m3 | `1.302500e-06` | `1.302154e-06` |
+| Er_transition_left | `6.101322e-05` | `6.101360e-05` |
+| Er_transition_right | `6.610191e-05` | `6.610244e-05` |
+| Er2_volume_average | `2.112375e-05` | `2.112154e-05` |
+| Er_volume_average | `1.602953e-05` | `1.602825e-05` |
+| electron_temperature_volume_average_keV | `2.344183e-06` | `2.344325e-06` |
+| total_pressure_volume_average | `2.345669e-06` | `2.345764e-06` |
+| alpha_power_volume_average_mw_m3 | `1.408631e-06` | `1.408329e-06` |
+| bootstrap_current_softmax_abs_scaled | `3.915224e-05` | `3.915179e-05` |
+| Er_transition_rho | `6.965993e-07` | `6.963135e-07` |
+| Er_transition_location_moment | `6.965993e-07` | `6.963135e-07` |
+| Er_transition_strength | `1.744869e-06` | `1.745136e-06` |
+
+These are relative differences, not percentages. This rules out the measured
+VMEX tangent difference as the principal explanation for this direction.
+It does not validate the entire geometry-to-table FD map. The exact original
+FD tangent was not saved, and the nonlinear endpoint construction and the
+coefficient scan execution context still require a controlled comparison.
+Elapsed time was 1:46.43; maximum host RSS was 3,072,108 KiB. GPU peak memory
+was not measured. Supplied attachment SHA256:
+`558c38275ac8c4dda13c3dca41a2f324a024ba6c73f99918ff0b7773360a1275`.
+
+## Repeat the actual geometry endpoints and separate the coefficient paths
+
+`check_saved_ntx_geometry_endpoints.py` reuses this saved equilibrium and
+`state_tangents.npz`, including its independently checked AD reference.
+It calls the original FD runtime entrypoint at zero and the original plus/minus
+step. A temporary observer stops that entrypoint immediately after it builds
+the transport geometry, channels and native scan surfaces, before any NTX,
+root or transport solve. All three numerical input sets are saved. The zero
+geometry must match the captured AD geometry byte for byte.
+
+For each selected radius, the checker then calls the same public
+`ntx.solve_monoenergetic_scan` used by generic FD construction with the full
+configured `(nu,Er)` grid. This retains the original scan shape instead of
+replacing it with a six-point scan. The scalar comparison receives all floating
+surface fields, the electric-field input and drds from exactly those endpoints.
+The JVP includes live drds in D11_log/D13 normalization and the complete native
+surface directions. It performs no VMEX equilibrium or implicit solve and
+does not change any production implementation, controller or replay contract.
+
+The default selects six previously identified nodes on three radii. It runs
+nine full single-radius scans (three endpoints on each radius), plus scalar
+and coefficient-JVP controls at those six nodes. It is not a transport run or
+a new full-table derivative validation. Its GPU execution is still pending.
+
+`endpoint_gaps.csv` gives a signed telescoping budget in derivative units:
+
+1. `audit_control_gap`: cached reference JVP minus the current scalar-kernel
+   JVP along the saved AD numerical-input direction. A large value prevents
+   attributing that difference to the upstream geometry map.
+2. `upstream_gap`: controlled AD-input JVP minus the JVP along the actual
+   endpoint numerical-input secant. This measures the effect of upstream
+   input changes through the local coefficient derivative.
+3. `scalar_fd_gap`: input-secant JVP minus scalar FD of the actual endpoints.
+   This combines finite-step coefficient bias and floating-point effects;
+   the diagnostic does not claim to distinguish those two effects.
+4. `scan_context_gap`: scalar FD minus production-scan FD with the same
+   numerical endpoints.
+5. `reproduction_gap`: fresh production-scan FD minus the original saved FD.
+   A large value means the original endpoints have not been reproduced.
+
+Their sum is `total_gap`, the cached JVP minus original saved FD. Baseline
+scalar/scan primal offsets are recorded separately. `selected_node_budget.csv`
+contracts these terms with all 13 original objective bars at the selected
+nodes only; other nodes and the coordinate fields are excluded. The checker
+never labels this partial budget as an explanation of the whole gradient.
+`sources.txt` records numerical source hashes, including the scan module, and
+the state-direction/config/equilibrium-input hashes.
+
+Four NumPy-only tests pass: an independent nonlinear composition with injected
+scan/reproduction errors, the interruption of the original constructor before
+NTX/root work, exact baseline guards, and an end-to-end mocked run with live
+normalization and a nonzero extra native-surface derivative. No real JAX or
+physics was run locally.
+
+After publishing the diagnostic, run on the large machine:
+
+```bash
+(
+  cd "$HOME/NEOPAX" || exit 1
+  git switch en/v0_main || exit 1
+  git pull --ff-only origin en/v0_main || exit 1
+  neopax_case=outputs/ntss1d_zbs_support_chain_UfR8XG
+  neopax_out=$(mktemp -d "$neopax_case/geometry_endpoint_audit_XXXXXX") || exit 1
+  set -o pipefail
+  env JAX_PLATFORMS=cuda,cpu JAX_ENABLE_X64=true \
+    JAX_ENABLE_COMPILATION_CACHE=0 XLA_PYTHON_CLIENT_PREALLOCATE=false \
+    NTX_DISABLE_COMPILATION_CACHE=1 VMEX_COMPILATION_CACHE=disabled \
+    "$HOME/jax_env/bin/python" examples/benchmarks/check_saved_ntx_geometry_endpoints.py \
+    --run-dir "$neopax_case" \
+    --state-tangents "$neopax_case/fd_direction_audit_ZBS_XSdhvU/state_tangents.npz" \
+    --table-audit "$neopax_case/ntx_table_ZBS_PXKHjE" \
+    --out-dir "$neopax_out" \
+    2>&1 | tee "$neopax_out.log"
+) || printf '\nEndpoint audit stopped; terminal kept open.\n'
+```
+
+The log stays outside the new output directory so it is still empty when the
+script checks it. The six selected points are defaults; the complete endpoint
+tables at their three radii are retained for further saved-array analysis.
