@@ -242,9 +242,8 @@ constructor selection, using different preliminary and selected roots so
 wrong cache reuse is detected. Additional checks cover the shared hybrid
 setup and unchanged legacy/endpoint routes. All 25 NumPy/mock tests in the
 two relevant diagnostic modules pass. No local JAX or physics solve ran.
-Numerical verification of the corrective patch is pending. A focused GPU
-comparison can restore the existing saved geometry/tables and compare the
-runtime and evaluator root initializers without VMEC, an NTX scan or transport.
+Full FD-baseline and gradient verification of the corrective patch is pending.
+The saved-table production-constructor control below verifies its initial state.
 
 ### Saved-root replay restored the wrong interpolation class
 
@@ -265,7 +264,148 @@ restoration only. The reported `0.716` root shift cannot establish a
 production initializer or batching defect. The earlier cached-root failure
 in the complete original FD entry point remains valid and separate.
 
-After publishing the change, run the original FD entry point on the GPU:
+The corrected GPU replay at `2310e7b` restored
+`MonoenergeticRuntimeNTSS1D` with dispatch kind
+`preprocessed_3d_radial_ntss1d`. The production
+`initial_state_for_parameter_vector(..., initial_er_root_ad="jax_selected_root")`
+returned finite Er values with zero differing entries and maximum absolute
+difference exactly `0.0` against the saved AD initial carry. Rebuilt density
+and pressure also match the saved FD arrays. The replay used existing
+geometry/tables with the NTX scan builder guarded against calls; it ran no
+equilibrium or transport solve. This verifies the restored initial-state
+construction, not the full fresh FD baseline, accepted-step replay or gradients.
+The next check is one fresh ZBS FD16 column against the existing AD, retaining
+the previous perturbation and frozen geometry/root/schedule contracts.
+
+That fresh column completed in `outputs/ntss1d_zbs_constructor_fix_ijOYvg`.
+All 13 objective values and all 13 FD gradients match the previous
+`ntss1d_zbs_fd16_recheck_Rhdsg8` log exactly at the printed full precision.
+The baseline differences are also unchanged: initial state
+`7.105427357601002e-15`, final state `2.6708448785939254e-09`, final time
+`5.796795335410998e-13`, and numerical geometry/database support difference
+zero. Both endpoints complete 16 fixed accepted steps with no Newton retries.
+The exact-baseline guard still rejects the gradient comparison. Therefore
+using the production constructor did not fix this remaining drift, and the
+successful saved-table root replay must not be described as a verified fix
+of the fresh FD initialization. The cause remains open. No additional full
+FD rerun is justified by these unchanged results. The next saved-array readout
+compares the FD pre-packing Er with its packed initial Er and checks support
+bytes/dtypes, which the maximum-absolute-difference summary does not record.
+
+That readout completed: FD Er before packing and its packed initial Er are
+identical. The pre-packing root already differs from the saved AD in three
+entries by at most `7.105427357601002e-15`. All 25 geometry fields and 19
+database fields also match in shape, dtype and array bytes. Packing and
+differences in those stored array payloads are excluded for this run.
+
+The restored-runtime control still does not preserve every original input:
+`restore_runtime` applies `jnp.asarray` to all saved fields. In production,
+geometry `n_r` is a Python integer; the database constructor keeps
+`Er_lower_limit` as a Python float and constructs `D11_lower_limit` and
+`Er_lower_limit_log` from weakly typed JAX scalar literals. NPZ captures
+neither Python-vs-JAX scalar identity nor JAX weak typing. This is a concrete
+reconstruction difference, not an established cause of the root discrepancy.
+The AD static setup also converts its live scan wrapper into a fixed-table
+model using `runtime_with_fixed_ntx_database_model`; FD retains the wrapper.
+Both ultimately call the same database flux evaluator. A saved-table
+root-only control can vary the known scalar representations and the existing
+wrapper/fixed-model boundary separately, while checking identical array bytes,
+before proposing any numerical production change.
+
+Executing the actual database constructor with NumPy confirms the
+representation gap: all 19 fields match in shape, dtype and bytes after
+restoration, while `Er_lower_limit` changes from Python `float` to an array.
+This check imports no JAX and does not test its numerical effect. The queued
+GPU control evaluates four cases (`restored_live`, `restored_fixed`,
+`fresh_scalar_types_live`, `fresh_scalar_types_fixed`) with the production
+initial-state constructor. The fresh-scalar cases preserve every saved
+geometry/database array byte while restoring the constructor's known scalar
+types. Every result is compared separately against the saved AD and FD Er.
+The NTX scan builder is guarded against calls; no equilibrium or transport
+is run. A numeric cause is not established until those results are available.
+
+The four-case GPU control completed: every case matches all saved AD Er
+values exactly and differs from the saved FD at indices `[45, 46, 49]`,
+with maximum absolute difference `7.105427357601002e-15`. The tested scalar
+representations and live-wrapper/fixed-table choice do not reproduce the
+fresh FD result in this controlled replay. Neither is an established cause.
+There is still no evidence that the root drift explains the gradient errors.
+
+The terminal snapshots do not capture the complete inputs to the root flux
+evaluator. In particular, `restore_runtime` regenerates species and energy
+quadrature from configuration and rebuilds the boundary models. The root
+evaluator also prepares centre temperatures, gradients and thermal speeds.
+Complete runtime captures already exist in
+`outputs/zbs_complete_baseline_UWRwqd/physical_inputs.npz` (the baseline
+that matched AD) and `outputs/zbs_root_reuse_baseline_HXmxwc/physical_inputs.npz`.
+Their stored runtime energy/species/boundary/solver fields can be compared
+with NumPy before requesting new GPU work. Their initial Er states are
+deliberately different because the second control tested cached-root reuse;
+that state difference must not be attributed to different runtime physics.
+These older captures do not by themselves establish the missing inputs of
+the current `ijOYvg` FD run. The next readout inventories and compares the
+stored runtime inputs only, without a root or transport evaluation.
+
+The saved-runtime comparison completed: all 155 checked energy, species,
+boundary and solver fields match, including the captured weak-type markers.
+This excludes that proposed input difference between the two older captures;
+it is not a complete capture of the current `ijOYvg` FD runtime.
+
+### Common AD initial-root control
+
+The FD benchmark now has an opt-in `--ad-baseline-reference` diagnostic.
+It first builds its ordinary fresh runtime and selected root. It validates
+the saved AD geometry and table fields byte for byte, plus every packed
+initial density/pressure value, then uses the **actual AD initial Er** from
+the saved `ad_terminal_*.npz`. This is not the preliminary outer runtime root
+that the withdrawn `e0a90cc` patch reused.
+
+The native adaptive baseline and original frozen-metadata FD replay remain
+in use. Before any objective or perturbed endpoint, the diagnostic requires
+the initial state, final state and final time to match AD exactly. A failed
+check stops and retains `fd_reference_baseline_*.npz` when audit capture is
+enabled. The subsequent frozen-linearized root endpoints use that common AD
+Er as their expansion point. The output summary records the reference path.
+The default command without this option keeps its existing behavior.
+
+This is a controlled comparison, not a root-solver fix or an explanation
+of the three ULP-scale differences. It tests whether the remaining gradient
+differences persist at the common AD baseline. It requires an accepted
+`reverse_frozen_metadata` replay with `jax_selected_root` and
+`frozen_linearized` initial-root FD; malformed references and other profile,
+geometry or table inputs are rejected. There is no change to production
+physics, the time integrator, or the AD implementation.
+
+All 29 NumPy/mock checks pass across the saved-baseline diagnostic (10),
+database setup diagnostic (16), and NTSS1D runner (3). Tests execute the
+actual mocked FD entry point, check replacement of only the initial Er,
+reject non-Er/support mismatches, and stop on a one-ULP terminal mismatch
+before objectives or endpoints. No local JAX or physical solve was run.
+GPU validation of this new diagnostic is pending.
+
+Use the same environment and FD options as the `ijOYvg` run, with:
+
+```bash
+(
+  cd "$HOME/NEOPAX" || exit 1
+  neopax_ref=(outputs/ntss1d_ad_fd16_WFTo4W/ad/snapshots/ad_terminal_*.npz)
+  [ "${#neopax_ref[@]}" -eq 1 ] && [ -f "${neopax_ref[0]}" ] || exit 1
+  "$HOME/jax_env/bin/python" \
+    examples/benchmarks/benchmark_transport_realtime_geometry_forward_fd.py \
+    --config outputs/ntss1d_ad_fd16_WFTo4W/config.toml \
+    --parameter ZBS:1:0 --vmec-response-mode raw_block \
+    --accepted-step-limit 16 --fd-rel-step 3e-7 --fd-abs-step 1e-10 \
+    --radau-jacobian-reuse-mode legacy --geometry-fd-lane frozen_linearized \
+    --replay-mode accepted --fd-accepted-replay-contract reverse_frozen_metadata \
+    --initial-Er-root-ad jax_selected_root \
+    --initial-Er-root-fd-root-lane frozen_linearized --diagnose-fd-endpoint \
+    --ad-baseline-reference "${neopax_ref[0]}"
+) || printf '\nCommon-root FD check stopped; terminal kept open.\n'
+```
+
+### Earlier original-script input-only controls
+
+The following commands document the earlier input captures:
 
 ```bash
 (

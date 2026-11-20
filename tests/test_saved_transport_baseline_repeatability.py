@@ -24,6 +24,63 @@ _jax_after = "jax" in sys.modules
 
 
 class SavedBaselineTests(unittest.TestCase):
+    def test_ad_reference_changes_only_er_and_requires_an_exact_forward_baseline(self):
+        @dataclasses.dataclass
+        class Geometry:
+            scale: object
+        @dataclasses.dataclass
+        class Database:
+            table: object
+        geometry, database = Geometry(np.asarray(1.2)), Database(np.asarray([1., 2.]))
+        reference = {"support['geometry'].scale":np.asarray(1.2),
+                     "support['database'].table":np.asarray([1., 2.]),
+                     'initial_y':np.asarray([1., 2., 3., 4., 5., 6.]),
+                     'final_y':np.asarray([2., 3., 4., 5., 6., 7.]),
+                     'final_time':np.asarray(1e-4)}
+        initial = reference['initial_y'].copy()
+        initial[-1] = np.nextafter(initial[-1], np.inf)
+        kwargs = dict(geometry=geometry, database=database, initial_y=initial, er_size=2)
+        er = check.ad_reference_initial_er(reference, **kwargs)
+        np.testing.assert_array_equal(er, reference['initial_y'][-2:])
+        er[0] = 100.
+        self.assertEqual(reference['initial_y'][-2], 5.)
+        for bad in (
+            dict(kwargs, database=None),
+            dict(kwargs, database=Database(np.asarray([1., 3.]))),
+            dict(kwargs, geometry=Geometry(np.asarray(1.2, dtype=np.float32))),
+            dict(kwargs, initial_y=initial[:-1]),
+            dict(kwargs, initial_y=np.asarray([9., 2., 3., 4., 5., 6.])),
+            dict(kwargs, er_size=0),
+        ):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                check.ad_reference_initial_er(reference, **bad)
+        for bad in ({k:v for k, v in reference.items() if k != 'final_time'},
+                    dict(reference, initial_y=np.asarray([1., 2., 3., 4., np.nan, 6.]))):
+            with self.assertRaises(ValueError):
+                check.ad_reference_initial_er(bad, **kwargs)
+        current = {k:reference[k].copy() for k in ('initial_y', 'final_y', 'final_time')}
+        with contextlib.redirect_stdout(io.StringIO()):
+            check.require_ad_reference_baseline(reference, **current)
+            for key in current:
+                changed = {k:v.copy() for k, v in current.items()}
+                changed[key].flat[0] = np.nextafter(changed[key].flat[0], np.inf)
+                with self.subTest(boundary=key), self.assertRaisesRegex(ValueError, 'before FD endpoints'):
+                    check.require_ad_reference_baseline(reference, **changed)
+
+        # Check the actual benchmark wiring: validate before evolution, then
+        # check its returned carry before objectives or endpoint construction.
+        source = SCRIPT.with_name('benchmark_transport_realtime_geometry_forward_fd.py')
+        main = next(node for node in ast.parse(source.read_text()).body
+                    if isinstance(node, ast.FunctionDef) and node.name == 'main')
+        calls = lambda node: {getattr(n.func, 'id', '') for n in ast.walk(node) if isinstance(n, ast.Call)}
+        reference_setup = next(i for i, node in enumerate(main.body) if 'ad_reference_initial_er' in calls(node))
+        rollout = next(i for i, node in enumerate(main.body) if '_schedule_rollout' in calls(node))
+        guard = next(i for i, node in enumerate(main.body) if 'require_ad_reference_baseline' in calls(node))
+        objective = next(i for i, node in enumerate(main.body) if '_objective_vector' in calls(node))
+        self.assertLess(reference_setup, rollout)
+        self.assertLess(rollout, guard)
+        self.assertLess(guard, objective)
+
     def test_saved_runtime_preserves_interpolation_dispatch_and_all_database_leaves(self):
         class Monoenergetic:
             def __init__(self, **fields):
@@ -310,6 +367,62 @@ class SavedBaselineTests(unittest.TestCase):
                  self.assertRaisesRegex(AssertionError, "ordinary objective path reached"):
                 namespace["main"]()
             capture.assert_not_called()
+
+            # Exercise the actual CLI path with an AD reference and prove that
+            # a changed terminal carry stops before objective/FD evaluation.
+            @dataclasses.dataclass
+            class Geo:
+                scale: object
+            @dataclasses.dataclass
+            class Database:
+                table: object
+            @dataclasses.dataclass
+            class State:
+                density: object
+                pressure: object
+                Er: object
+            state = State(np.asarray([[1., 2.]]), np.asarray([[3., 4.]]),
+                          np.asarray([5., np.nextafter(6., np.inf)]))
+            runtime = SimpleNamespace(geometry=Geo(np.asarray(1.2)), species=object(),
+                models=SimpleNamespace(flux=SimpleNamespace(neoclassical_model=
+                    SimpleNamespace(database=Database(np.asarray([1., 2.]))))))
+            ref = {'initial_y':np.arange(1., 7.), 'final_y':np.arange(2., 8.),
+                   'final_time':np.asarray(1e-4), "support['geometry'].scale":np.asarray(1.2),
+                   "support['database'].table":np.asarray([1., 2.])}
+            ref_path = Path(directory)/'ad_reference.npz'
+            np.savez(ref_path, **ref)
+            def schedule_reference(cfg, rt, selected, **kwargs):
+                np.testing.assert_array_equal(selected.Er, [5., 6.])
+                np.testing.assert_array_equal(selected.density, state.density)
+                return (components, SimpleNamespace(initial_carry=SimpleNamespace(y=ref['initial_y'])),
+                        execution, SimpleNamespace(trace=object(), final_carry=SimpleNamespace(
+                            y=ref['final_y'].copy(), t=ref['final_time'])), object())
+            namespace.update(np=np, dataclasses=dataclasses, save_gradient_audit=Mock(),
+                _pack_transport_state_arrays=lambda s, sp:(s.density, s.pressure, s.Er),
+                _runtime_for_frozen_linearized_geometry_step=Mock(return_value=(runtime, state)),
+                _profile_state_from_values=Mock(return_value=state),
+                _schedule_rollout=schedule_reference)
+            module = SimpleNamespace(capture_fresh_baseline=capture,
+                ad_reference_initial_er=check.ad_reference_initial_er,
+                require_ad_reference_baseline=check.require_ad_reference_baseline)
+            ref_args = arguments + ['--initial-Er-root-ad', 'jax_selected_root',
+                '--initial-Er-root-fd-root-lane', 'frozen_linearized',
+                '--ad-baseline-reference', str(ref_path), '--baseline-only-dir', directory]
+            objectives.reset_mock()
+            with patch.dict(sys.modules, {'check_saved_transport_baseline_repeatability':module}), \
+                 patch.object(sys, 'argv', ref_args), contextlib.redirect_stdout(io.StringIO()):
+                namespace['main']()
+                capture.reset_mock()
+                original_schedule = namespace['_schedule_rollout']
+                def mismatched_schedule(*args, **kwargs):
+                    parts = original_schedule(*args, **kwargs)
+                    parts[3].final_carry.y[0] = np.nextafter(parts[3].final_carry.y[0], np.inf)
+                    return parts
+                namespace['_schedule_rollout'] = mismatched_schedule
+                with self.assertRaisesRegex(ValueError, 'before FD endpoints'):
+                    namespace['main']()
+                capture.assert_not_called()
+                objectives.assert_not_called()
 
 
 if __name__ == "__main__":

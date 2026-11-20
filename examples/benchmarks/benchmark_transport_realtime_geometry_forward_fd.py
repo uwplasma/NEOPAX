@@ -70,6 +70,7 @@ from NEOPAX._transport_solvers import (  # noqa: E402
     _RadauAcceptedStepAttemptContext,
     _build_prepared_radau_accepted_rollout,
     _build_prepared_radau_execution_context,
+    _pack_transport_state_arrays,
     _radau_apply_accepted_step_map,
     _radau_adaptive_schedule_rollout,
     _radau_forward_fd_run_prepared_on_realized_trace,
@@ -1374,11 +1375,21 @@ def main() -> None:
         "--baseline-only-dir", type=Path,
         help="Run the original preparation and adaptive baseline, save setup/state/schedule, then stop before objectives or FD endpoints.",
     )
+    parser.add_argument("--ad-baseline-reference", type=Path,
+        help="Diagnostic: use saved AD initial Er after checking profiles/geometry/tables; require an exact baseline before FD endpoints.")
     parser.add_argument("--geometry-input-only-dir", type=Path,
         help="Capture original geometry/scan inputs without intermediate observers, then stop before NTX, roots or transport.")
     parser.add_argument("--geometry-input-reference", type=Path,
         help="With --geometry-input-only-dir, compare against a saved normalization_inputs_*.npz trace.")
     args = parser.parse_args()
+    if args.ad_baseline_reference is not None and (
+        not args.ad_baseline_reference.is_file() or args.initial_er_root_only_fd
+        or args.geometry_input_only_dir is not None
+        or args.initial_er_root_ad != "jax_selected_root"
+        or args.initial_er_root_fd_root_lane != "frozen_linearized"
+        or args.replay_mode != "accepted" or args.fd_accepted_replay_contract != "reverse_frozen_metadata"
+    ):
+        parser.error("--ad-baseline-reference requires an existing AD snapshot and full-transport accepted reverse_frozen_metadata replay with a frozen_linearized initial root")
     if args.geometry_input_reference is not None and (args.geometry_input_only_dir is None or not args.geometry_input_reference.is_file()):
         parser.error("--geometry-input-reference requires --geometry-input-only-dir and an existing reference file")
     if args.geometry_input_only_dir is not None:
@@ -1501,6 +1512,22 @@ def main() -> None:
         baseline_state=baseline_state,
         profile_cfg=profile_cfg,
     )
+    ad_baseline_reference = None
+    if args.ad_baseline_reference is not None:
+        from check_saved_transport_baseline_repeatability import ad_reference_initial_er, require_ad_reference_baseline
+
+        with np.load(args.ad_baseline_reference, allow_pickle=False) as saved:
+            ad_baseline_reference = {k: saved[k] for k in saved.files if k in
+                {"initial_y", "final_y", "final_time"} or k.startswith(("support['geometry'].", "support['database']."))}
+        neo = getattr(baseline_runtime.models.flux, "neoclassical_model", baseline_runtime.models.flux)
+        initial_y = np.concatenate([np.asarray(v).reshape(-1)
+            for v in _pack_transport_state_arrays(baseline_profile_state, baseline_runtime.species)])
+        er = ad_reference_initial_er(ad_baseline_reference, geometry=baseline_runtime.geometry,
+            database=getattr(neo, "database", None), initial_y=initial_y, er_size=baseline_profile_state.Er.size)
+        print("[fd-ad-reference] using saved AD initial Er; fresh-root max_abs_difference="
+              f"{np.max(np.abs(np.asarray(baseline_profile_state.Er)-er)):.16e}", flush=True)
+        baseline_profile_state = dataclasses.replace(baseline_profile_state,
+            Er=jnp.asarray(er, dtype=baseline_profile_state.Er.dtype))
 
     if root_only_fd:
         if initial_er_root_ad == "off":
@@ -1718,6 +1745,11 @@ def main() -> None:
         accepted_step_limit=args.accepted_step_limit,
         capture_newton_setup=(args.fd_accepted_replay_contract == "reverse_frozen_metadata"),
     )
+    if ad_baseline_reference is not None:
+        boundary = dict(initial_y=baseline_prepared_rollout.initial_carry.y,
+            final_y=baseline_rollout.final_carry.y, final_time=baseline_rollout.final_carry.t)
+        save_gradient_audit("fd_reference_baseline", **boundary)
+        require_ad_reference_baseline(ad_baseline_reference, **boundary)
     if args.baseline_only_dir is not None:
         from check_saved_transport_baseline_repeatability import capture_fresh_baseline
 
@@ -2147,6 +2179,7 @@ def main() -> None:
     report = {
         "mode": "transport_realtime_geometry_forward_fd",
         "config_path": str(Path(args.config)),
+        "ad_baseline_reference": None if args.ad_baseline_reference is None else str(args.ad_baseline_reference.resolve()),
         "parameter_name": parameter_name,
         "parameter_kind": parameter_kind,
         "baseline_value": float(baseline_value),

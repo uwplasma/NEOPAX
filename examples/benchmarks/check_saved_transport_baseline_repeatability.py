@@ -81,6 +81,38 @@ def numeric_leaves(value, prefix):
     return {}
 
 
+def ad_reference_initial_er(reference, *, geometry, database, initial_y, er_size):
+    """Check the common physical point before taking Er from the AD snapshot."""
+    if not {"initial_y", "final_y", "final_time"}.issubset(reference):
+        raise ValueError("AD reference must contain initial_y, final_y and final_time.")
+    prefixes = ("support['geometry'].", "support['database'].")
+    expected = {k: v for k, v in reference.items() if k.startswith(prefixes)}
+    current = {k: v for label, obj in (("geometry", geometry), ("database", database))
+               for k, v in numeric_leaves(obj, f"support['{label}']").items()
+               if not k.endswith(".__weak_type__")}
+    if database is None or not expected or differences(expected, current):
+        raise ValueError("AD reference geometry/database arrays differ from the fresh FD runtime.")
+    saved, initial_y = np.asarray(reference["initial_y"]), np.asarray(initial_y)
+    if (saved.ndim != 1 or saved.shape != initial_y.shape or saved.dtype != initial_y.dtype
+            or not 0 < er_size < saved.size or not np.isfinite(saved).all()):
+        raise ValueError("AD reference packed initial-state shape, dtype or values are invalid.")
+    if differences({"profiles": saved[:-er_size]}, {"profiles": initial_y[:-er_size]}):
+        raise ValueError("AD reference initial density/pressure differs from the fresh FD profiles.")
+    return saved[-er_size:].copy()
+
+
+def require_ad_reference_baseline(reference, **current):
+    """Reject a different initial/terminal state or time before FD endpoints."""
+    keys = ("initial_y", "final_y", "final_time")
+    rows = differences({k: np.asarray(reference[k]) for k in keys},
+                       {k: np.asarray(current[k]) for k in keys})
+    if rows:
+        for row in rows:
+            print("[fd-ad-reference]", row, flush=True)
+        raise ValueError("FD baseline differs from the AD reference; stopped before FD endpoints.")
+    print("[fd-ad-reference] initial_y, final_y and final_time match AD exactly", flush=True)
+
+
 def setup_arrays(components, prepared, execution):
     result = numeric_leaves(prepared.initial_carry, "initial_carry")
     result.update(numeric_leaves(execution, "execution"))
