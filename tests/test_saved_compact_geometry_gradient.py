@@ -14,6 +14,42 @@ spec.loader.exec_module(check)
 
 
 class SavedCompactGradientTests(unittest.TestCase):
+    def test_tangent_effect_is_quantified_for_every_cost_with_replay_control(self):
+        captured = {'parameter_labels[0]':np.asarray('ZBS:1:0'),
+            'geometry_gradients':np.asarray([[3.],[10.]])}
+        report = {'parameter_name':'ZBS:1:0','objective_labels':['Er','bootstrap'],'gradient_fd':[4.,12.]}
+        rows = check.gradient_direction_rows(captured,'ZBS:1:0',[[3.],[10.]],[[4.],[12.]],report,['Er','bootstrap'])
+        self.assertEqual([r['tangent_effect'] for r in rows],[1.,2.])
+        self.assertEqual([r['control_relative_difference'] for r in rows],[0.,0.])
+        self.assertEqual([r['projected_fd_relative_difference'] for r in rows],[0.,0.])
+        # A changed payload replay is exposed independently of tangent effects.
+        rows = check.gradient_direction_rows(captured,'ZBS:1:0',[[3.3],[10.]],[[4.],[12.]],report,['Er','bootstrap'])
+        self.assertAlmostEqual(rows[0]['control_relative_difference'],.1)
+        with self.assertRaises(ValueError):
+            check.gradient_direction_rows(captured,'ZBS:1:0',[[3.],[10.]],[[np.nan],[12.]],report,['Er','bootstrap'])
+        with self.assertRaises(ValueError):
+            check.gradient_direction_rows(captured,'ZBS:1:0',[[3.],[10.]],[[4.],[12.]],report,['bootstrap','Er'])
+
+    def test_fd_tangent_comparison_selects_parameter_and_preserves_mismatch(self):
+        captured = {'parameter_labels[0]':np.asarray('RBC:1:0'),
+            'parameter_labels[1]':np.asarray('ZBS:1:0'),
+            'state_tangents.R_cos':np.asarray([[7.,8.],[3.,4.]]),
+            'state_tangents.Z_sin':np.zeros((2,2))}
+        rows,reference = check.state_tangent_rows(captured,'ZBS:1:0',
+            {'R_cos':np.asarray([3.,4.5]),'Z_sin':np.zeros(2)})
+        self.assertEqual(rows[0]['different_entries'],1)
+        self.assertEqual(rows[0]['max_abs_difference'],.5)
+        self.assertAlmostEqual(rows[0]['relative_l2_difference'],.1)
+        self.assertEqual(rows[1]['relative_l2_difference'],0.)
+        np.testing.assert_array_equal(reference['R_cos'],[3.,4.])
+        with self.assertRaises(ValueError):
+            check.state_tangent_rows(captured,'missing',{'R_cos':np.zeros(2)})
+        for current in ({'R_cos':np.zeros(2)},
+                        {'R_cos':np.ones(3),'Z_sin':np.zeros(2)},
+                        {'R_cos':np.asarray([np.nan,4.]),'Z_sin':np.zeros(2)}):
+            with self.assertRaises(ValueError):
+                check.state_tangent_rows(captured,'ZBS:1:0',current)
+
     def test_production_call_supplies_the_actual_required_arguments_and_configured_grid(self):
         name = "geometry_payload_pullback_from_param_vector_raw_block_transpose"
         source = path.parents[2] / "NEOPAX/_geometry_autodiff.py"

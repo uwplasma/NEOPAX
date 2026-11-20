@@ -10,10 +10,12 @@ import argparse
 import csv
 import dataclasses
 import hashlib
+import json
 import os
 from pathlib import Path
 import sys
 import tomllib
+from unittest.mock import patch
 
 import numpy as np
 
@@ -48,12 +50,58 @@ def contraction_rows(captured, tangents, current):
     return rows, reconstructed
 
 
+def state_tangent_rows(tangents, parameter, current):
+    labels = [str(tangents[f'parameter_labels[{i}]'])
+              for i in range(sum(k.startswith('parameter_labels[') for k in tangents))]
+    column = labels.index(parameter)
+    reference = {key[len('state_tangents.'):]: value[column]
+                 for key,value in tangents.items() if key.startswith('state_tangents.')}
+    if not reference or set(reference) != set(current):
+        raise ValueError('Saved/current state tangent fields differ')
+    rows = []
+    for name,a in reference.items():
+        b = np.asarray(current[name])
+        if a.shape != b.shape or a.dtype != b.dtype or not np.isfinite(a).all() or not np.isfinite(b).all():
+            raise ValueError(f'Invalid state tangent: {name}')
+        error = float(np.linalg.norm(a-b))
+        norm = float(np.linalg.norm(a))
+        rows.append(dict(parameter=parameter,field=name,different_entries=int(np.count_nonzero(a!=b)),
+            max_abs_difference=float(np.max(np.abs(a-b),initial=0.)),
+            relative_l2_difference=error/norm if norm else (0. if error==0. else float('inf'))))
+    return rows,reference
+
+
+def gradient_direction_rows(captured, parameter, replay_ad, replay_fd, report, labels):
+    parameters = [str(captured[f'parameter_labels[{i}]']) for i in range(captured['geometry_gradients'].shape[1])]
+    if report['parameter_name'] != parameter or list(labels) != report['objective_labels']:
+        raise ValueError('FD report parameter/objective order differs')
+    saved = captured['geometry_gradients'][:,parameters.index(parameter)]
+    fd = np.asarray(report['gradient_fd'])
+    ad,other = np.asarray(replay_ad).reshape(-1),np.asarray(replay_fd).reshape(-1)
+    if any(x.shape != saved.shape or not np.isfinite(x).all() for x in (fd,ad,other)) or len(labels) != len(saved):
+        raise ValueError('Invalid gradient projection shape/values')
+    relative = lambda a,b: abs(a-b)/abs(b) if b else (0. if a==0. else float('inf'))
+    return [dict(objective=label,saved_ad=float(saved[i]),replayed_ad_direction=float(ad[i]),
+        projected_fd_direction=float(other[i]),original_fd=float(fd[i]),
+        tangent_effect=float(other[i]-ad[i]),
+        control_relative_difference=relative(ad[i],saved[i]),
+        original_relative_difference=relative(saved[i],fd[i]),
+        projected_fd_relative_difference=relative(other[i],fd[i])) for i,label in enumerate(labels)]
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--capture", type=Path, required=True)
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
     parser.add_argument("--out-dir", type=Path, required=True)
+    parser.add_argument("--fd-tangent-only", action="store_true",
+        help="Compare the original FD VMEX tangent entrypoint with saved AD at fixed state/params/mask; add --fd-report to quantify its cost-gradient effect")
+    parser.add_argument("--parameter", default="ZBS:1:0", help="Captured geometry parameter for --fd-tangent-only")
+    parser.add_argument("--fd-report",type=Path,
+        help="With --fd-tangent-only, also project saved/fresh directions through the recorded 13-row adjoints and compare with this FD summary")
     args = parser.parse_args()
+    if args.fd_report is not None and not args.fd_tangent_only:
+        parser.error('--fd-report requires --fd-tangent-only')
     with np.load(args.capture, allow_pickle=False) as data:
         captured = {key: data[key].copy() for key in data.files}
     if any(key.startswith("native_vmec_face_coefficient_bars") for key in captured):
@@ -79,31 +127,94 @@ def main():
 
     labels = tuple(str(captured[f"parameter_labels[{i}]"])
                    for i in range(captured["geometry_gradients"].shape[1]))
+    if args.fd_tangent_only and args.parameter not in labels:
+        parser.error('Requested parameter is absent from the compact capture')
     specs = tuple((family, int(m), int(n)) for family, m, n in
-                  (label.split(":") for label in labels))
-    with args.config.open("rb") as stream:
-        config = tomllib.load(stream)
+                  (label.split(":") for label in ((args.parameter,) if args.fd_tangent_only else labels)))
+    if args.fd_tangent_only:
+        from benchmark_transport_autodiff_lagged_ntx import _prepare_benchmark_config
+        config = _prepare_benchmark_config(args.config,device=None,
+            ntx_exact_derivative_mode='direct',radau_jacobian_reuse_mode='legacy')
+    else:
+        with args.config.open("rb") as stream:
+            config = tomllib.load(stream)
     input_path = Path(config["geometry"]["vmec_input_file"])
     config["geometry"]["vmec_input_file"] = str((ROOT / input_path).resolve())
     response_mode = str(captured.get("vmec_response_mode", "raw_block"))
+    if args.fd_report is not None and response_mode != 'raw_block':
+        parser.error('Weighted FD-direction projection currently requires a raw_block capture')
     config["geometry"]["vmec_response_mode"] = response_mode
     print(f"[compact-replay] JAX={jax.__version__} device={jax.devices()[0]}; "
           "reconstructing context from input, without solving equilibrium", flush=True)
-    context = _geometry_context_from_config(config, labels[0])
+    context = _geometry_context_from_config(config, args.parameter if args.fd_tangent_only else labels[0])
     entries = geo.boundary_param_entries(context, specs)
     implicit, params, cfg = geo._current_implicit_params_cfg_for_param_vector(
-        context, jnp.zeros(len(specs)), entries, solver_device="default")
+        context, jnp.zeros(len(specs)), entries,
+        max_iter=config['geometry'].get('vmec_max_iter') if args.fd_tangent_only else None,
+        solver_device=str(config['geometry'].get('vmec_implicit_solver_device','default')) if args.fd_tangent_only else "default")
     for module in (geo, implicit, geo._import_booz_xform_jax_api()):
         source = Path(module.__file__)
         print(f"[compact-replay] source={source} "
               f"sha256={hashlib.sha256(source.read_bytes()).hexdigest()}", flush=True)
-    params = dataclasses.replace(params, **{
-        field.name: jnp.asarray(captured["params." + field.name])
-        for field in dataclasses.fields(params)})
+    if args.fd_tangent_only:
+        # Keep the original FD constructor's scalar/weak types. Never silently
+        # substitute a different parameter point before comparing tangents.
+        for field in dataclasses.fields(params):
+            a,b = np.asarray(jax.device_get(getattr(params,field.name))),captured['params.'+field.name]
+            if a.shape != b.shape or a.dtype != b.dtype or a.tobytes() != b.tobytes():
+                parser.error(f'FD constructor parameters differ from captured AD: {field.name}')
+    else:
+        params = dataclasses.replace(params, **{
+            field.name: jnp.asarray(captured["params." + field.name])
+            for field in dataclasses.fields(params)})
     state = SpectralState(**{name: jnp.asarray(value)
                              for name, value in named_arrays(captured, "state.").items()})
     mask = SpectralState(**{name: jnp.asarray(value)
                             for name, value in named_arrays(captured, "mask.").items()})
+    if args.fd_tangent_only:
+        from benchmark_transport_realtime_geometry_forward_fd import (
+            _manual_implicit_forward_state_tangent, _param_unit_tangent_like,
+        )
+        if _manual_implicit_forward_state_tangent.__globals__['im'] is not implicit:
+            parser.error('FD entrypoint and captured-context setup resolved different VMEX implicit modules')
+        paths = list(args.capture.parent.glob('ad_compact_tangents_*.npz'))
+        if len(paths) != 1:
+            parser.error('Expected exactly one saved compact tangent alongside --capture')
+        with np.load(paths[0],allow_pickle=False) as data:
+            saved_tangents = {key:data[key] for key in data.files}
+        print('[fd-tangent] fixed captured state/parameters/mask; original FD tangent entrypoint; no equilibrium/NTX-coefficient/root/transport solve',flush=True)
+        current = jax.device_get(jax.block_until_ready(_manual_implicit_forward_state_tangent(
+            params=params,param_tangent=_param_unit_tangent_like(params,entries[0]),cfg=cfg,
+            x_star=state,dof_mask=mask,vmec_response_mode=response_mode)))
+        current = {field.name:np.asarray(getattr(current,field.name)) for field in dataclasses.fields(current)}
+        rows,reference = state_tangent_rows(saved_tangents,args.parameter,current)
+        args.out_dir.mkdir(parents=True,exist_ok=True)
+        np.savez_compressed(args.out_dir/'state_tangents.npz',parameter=np.asarray(args.parameter),
+            **{'fd.'+name:value for name,value in current.items()},
+            **{'ad.'+name:value for name,value in reference.items()})
+        with (args.out_dir/'state_tangents.csv').open('w',newline='') as stream:
+            writer = csv.DictWriter(stream,fieldnames=list(rows[0]));writer.writeheader();writer.writerows(rows)
+        for row in rows:
+            print(f"[fd-tangent] {row['field']} max_abs={row['max_abs_difference']:.12e} relative_l2={row['relative_l2_difference']:.12e} different_entries={row['different_entries']}",flush=True)
+        if args.fd_report is None:
+            return
+        terminal_paths = list(args.capture.parent.glob('ad_terminal_*.npz'))
+        baseline_paths = list((args.fd_report.parent/'snapshots').glob('fd_baseline_*.npz'))
+        if len(terminal_paths) != 1 or len(baseline_paths) != 1:
+            parser.error('Expected one AD terminal and one FD baseline capture')
+        report = json.loads(args.fd_report.read_text())
+        with np.load(terminal_paths[0],allow_pickle=False) as terminal, np.load(baseline_paths[0],allow_pickle=False) as baseline:
+            objective_labels = tuple(str(terminal[f'labels[{i}]']) for i in range(captured['geometry_gradients'].shape[0]))
+            for key in ('initial_y','final_y','final_time','values'):
+                a,b = terminal[key],baseline[key]
+                if a.shape != b.shape or a.dtype != b.dtype or a.tobytes() != b.tobytes():
+                    parser.error(f'AD/FD baseline differs: {key}')
+            if list(objective_labels) != report['objective_labels'] or not np.array_equal(terminal['values'],report['objective_values']):
+                parser.error('FD report does not match the saved AD point/objectives')
+        if report['parameter_name'] != args.parameter:
+            parser.error('FD report parameter differs')
+        ad_direction = SpectralState(**{name:jnp.asarray(value) for name,value in reference.items()})
+        fd_direction = SpectralState(**{name:jnp.asarray(value) for name,value in current.items()})
     raw = geo.GeometryRawBlockSolve(
         implicit, params, cfg, state, mask, entries, vmec_response_mode=response_mode)
     n_r = captured["payload_bars[0]['geometry'].r_grid"].size
@@ -130,8 +241,8 @@ def main():
         payload_bars.append(dict(geometry=geometry, channels=channels, surfaces=tuple(surfaces)))
     print("[compact-replay] captured state/parameters/mask and all objective rows; "
           "no equilibrium, NTX, root or transport solve", flush=True)
-    current = np.asarray(jax.device_get(
-        geo.geometry_payload_pullback_from_param_vector_raw_block_transpose(
+    def evaluate():
+        return np.asarray(jax.device_get(geo.geometry_payload_pullback_from_param_vector_raw_block_transpose(
             context, jnp.zeros(len(specs)), specs, tuple(payload_bars),
             combined_payload=True, payload_kind="ntx_scan_runtime", n_r=n_r,
             n_theta=int(config["neoclassical"]["ntx_scan_n_theta"]),
@@ -139,6 +250,20 @@ def main():
             n_xi=int(config["neoclassical"]["ntx_scan_n_xi"]),
             scan_rho=config["neoclassical"]["ntx_scan_rho"], scan_surface_backend="vmec",
             raw_block_solve=raw, progress_label="[compact-replay]")))
+    if args.fd_report is not None:
+        # Diagnostic injection at the existing linear-response boundary. The
+        # complete production payload contraction and saved bars stay intact.
+        with patch.object(implicit,'implicit_state_tangent_raw_block',lambda *a,**kw:ad_direction):
+            replay_ad = evaluate()
+        with patch.object(implicit,'implicit_state_tangent_raw_block',lambda *a,**kw:fd_direction):
+            replay_fd = evaluate()
+        rows = gradient_direction_rows(captured,args.parameter,replay_ad,replay_fd,report,objective_labels)
+        with (args.out_dir/'gradient_directions.csv').open('w',newline='') as stream:
+            writer = csv.DictWriter(stream,fieldnames=list(rows[0]));writer.writeheader();writer.writerows(rows)
+        for row in rows:
+            print(f"[fd-direction-cost] {row['objective']} saved_AD={row['saved_ad']:.12e} replay_AD={row['replayed_ad_direction']:.12e} projected_FD_direction={row['projected_fd_direction']:.12e} original_FD={row['original_fd']:.12e} control_relative={row['control_relative_difference']:.6e} original_relative={row['original_relative_difference']:.6e} projected_relative={row['projected_fd_relative_difference']:.6e}",flush=True)
+        return
+    current = evaluate()
     tangent_file = max(args.out_dir.glob("ad_compact_tangents_*.npz"), key=lambda p: p.stat().st_mtime_ns)
     with np.load(tangent_file, allow_pickle=False) as data:
         tangents = {key: data[key].copy() for key in data.files}

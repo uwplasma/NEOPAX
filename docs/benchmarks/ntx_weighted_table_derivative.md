@@ -160,5 +160,117 @@ evaluation context. A D11 floor switch is reported and must be assessed.
 Eight local tests pass without importing real JAX or physics. The new checks
 reject mismatched references and run the precision control flow against an
 independent analytic coefficient model with a nonzero extra-surface derivative
-and live normalization. This validates diagnostic wiring; numerical GPU
-validation of the targeted precision sweep is pending.
+and live normalization. This validates diagnostic wiring separately from the
+numerical GPU result below.
+
+## Targeted precision sweep result
+
+Run `ntx_precision_ZBS_vDo4al` completed at diagnostic commit `3874477`.
+It used JAX 0.10.0 and the same geometry/NTX source hashes as the weighted
+audit. All 72 rows completed in 43.91 s. Maximum host RSS was 1,970,512 KiB;
+GPU peak memory was not measured.
+
+Relative differences from the saved independent JVP at the principal fields:
+
+| Node | Field | h | 3h | 10h | 30h |
+| --- | --- | ---: | ---: | ---: | ---: |
+| `3:4:3` | D11_log | `2.441525e-07` | `1.215899e-07` | `4.656897e-08` | `1.642096e-08` |
+| `3:5:7` | D11_log | `1.433149e-07` | `1.131002e-07` | `7.623466e-09` | `4.161230e-10` |
+| `5:6:7` | D11_log | `3.194172e-08` | `8.845846e-09` | `8.625480e-08` | `7.986945e-07` |
+| `4:2:6` | D13 | `1.019053e-03` | `2.830533e-03` | `4.013351e-04` | `1.613987e-04` |
+| `5:4:2` | D13 | `6.976994e-05` | `1.093623e-04` | `3.454970e-06` | `5.133718e-06` |
+| `4:4:3` | D11_log | `1.051595e-06` | `2.258159e-07` | `7.830416e-08` | `5.822391e-08` |
+
+These are coefficient-level relative differences, not full objective-gradient
+errors. The printed log provides seven significant digits for these errors;
+the complete endpoint values, signed derivatives and floor flags are in the
+remote `precision.csv`.
+
+The numerical-input FD is demonstrably step-sensitive at the nodes responsible
+for the saved endpoint gaps. Larger steps help several entries, while the
+Er2-dominant `5:6:7` D11_log entry is best at 3h and worsens approximately with
+h squared at larger steps. The low-collisionality D13 node `4:2:6` remains
+inaccurate even at 30h and varies non-monotonically. The patterns are consistent
+with cancellation/precision limits combined with finite-step bias, rather than
+a uniform recommendation to multiply every full-transport FD step by 30.
+The log alone does not establish the D11-floor flags or a precise numerical
+error budget for the saved full geometry FD endpoints.
+
+The next readout contracts each local FD error with its actual objective bar
+and compares it with the saved endpoint error at the same six nodes. This
+uses existing CSV/NPZ files only. It is needed before asserting that local
+coefficient precision explains the entire observed gradient gap; upstream
+endpoint differences and unselected-node contributions remain distinguishable
+possibilities.
+
+Full result directory:
+`outputs/ntss1d_zbs_support_chain_UfR8XG/ntx_precision_ZBS_vDo4al`.
+Attachment SHA256:
+`767ae14ad533877c20ad5a66d41e78ef137bdb91a84c385df9745a918b6aa9ce`.
+
+## Weighted precision budget: local FD does not reproduce original endpoints
+
+The NumPy-only budget readout found no D11 floor-active endpoints in the local
+precision sweep. Comparing the same selected six nodes at the original step:
+
+| Objective | Whole saved table gap | Selected nodes: original FD gap | Selected nodes: local numerical-input FD gap at h |
+| --- | ---: | ---: | ---: |
+| softmax_Er | `-1.645743e-04` | `1.733452e-05` | `-1.231777e-05` |
+| Er2_volume_average | `6.946135e-03` | `6.166804e-03` | `-1.300859e-04` |
+| bootstrap_current_softmax_abs_scaled | `-1.404244e-04` | `-1.901320e-04` | `6.619114e-06` |
+| Er_transition_rho | `-9.497727e-09` | `6.852709e-09` | `-1.223632e-08` |
+
+Every column uses signed JVP-minus-FD contributions and the actual saved
+objective bars. The original and local selected-node gaps differ substantially
+and have opposite signs. The local coefficient precision evidence therefore
+does not establish an error budget for the original geometry FD endpoints.
+It is premature to resolve the full mismatch by changing the FD step alone.
+The original endpoint input direction and the full scan evaluation context
+remain to be checked; a passing weighted JVP/VJP test still supports the AD
+table derivative at its captured direction.
+
+The original FD benchmark computes its VMEC state tangent in
+`_manual_implicit_forward_state_tangent`. Production AD recorded its actual
+state tangent inside the compact payload contraction. The next controlled
+check compares those two at the saved AD state, parameter values and mask.
+It uses no finite perturbation and performs no equilibrium, NTX coefficient,
+root or transport solve. It does perform one VMEX linear-response calculation.
+
+Run `check_saved_compact_geometry_gradient.py --fd-tangent-only --parameter ZBS:1:0`
+with the archived `config.toml`, one saved `ad_compact_geometry_*.npz` as
+`--capture`, and a fresh `--out-dir`. The script reads the adjacent saved
+`ad_compact_tangents_*.npz`, uses the original FD configuration and tangent
+entrypoint, and checks that the constructed parameters match the captured
+values/dtypes/bytes. Constructor scalar/weak types are preserved. A different
+VMEX module or parameter point aborts before the linear solve.
+
+`state_tangents.csv` reports per-field maximum absolute and relative L2
+differences; `state_tangents.npz` retains both directions. The original FD
+run did not record its VMEC tangent, so this is a controlled repeat of that
+entrypoint, not a claim to have recovered the exact old FD tangent. A passing
+repeat would leave endpoint construction and scan context unresolved.
+
+Five NumPy-only saved-geometry tests and eight coefficient-diagnostic tests
+pass. The new bookkeeping test detects a wrong parameter column, preserves
+nonzero tangent discrepancies, and rejects missing/invalid fields. GPU
+validation of the controlled FD-entrypoint comparison is pending. Production
+physics and transport methods are unchanged.
+
+Add `--fd-report RUN/fd_ZBS_1_0/summary.json` to quantify the tangent difference
+for all 13 costs in the same run. The diagnostic checks the original AD/FD
+baseline arrays and objective values before using the FD report. It then
+temporarily supplies each fixed state direction to the existing production
+geometry payload contraction, retaining all recorded folded objective bars.
+No additional implicit solve or NTX coefficient solve is performed for these
+two projections. The temporary diagnostic substitution does not modify any
+production implementation or run a transport rollout.
+
+`gradient_directions.csv` records the saved AD gradient, the replay with the
+saved AD direction (a control), the projection of the fresh FD direction,
+and the original FD gradient for every cost. The control must reproduce the
+saved AD result closely before attributing a projected change to the VMEC
+direction. The printed `control_relative`, `original_relative` and
+`projected_relative` columns expose all three comparisons. The new NumPy test
+keeps control replay changes separate from effects of the direction and
+rejects mismatched objective order or invalid projections. GPU validation
+of this additional projection is pending.
