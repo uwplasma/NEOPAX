@@ -1,18 +1,22 @@
-"""Check the NTX derivative at important nodes of a captured AD16 run.
+"""Check NTX derivatives at selected or objective-weighted nodes of an AD16 run.
 
 GPU only. Reuses saved VMEC state and numerical surface/channel directions.
-No equilibrium, ambipolar root, transport integration or complete NTX scan.
-Compares raw-solver JVP, production database VJP and local finite differences.
+No equilibrium, ambipolar root or transport integration. Selected-node mode
+compares local FD/JVP/VJP; --audit-table differentiates raw solves at every
+active node and compares their weighted sum with the recorded table VJP.
 """
 from __future__ import annotations
 
 import argparse
 import csv
 import dataclasses
+import hashlib
 import json
+import math
 from pathlib import Path
 import sys
 import tomllib
+from types import SimpleNamespace
 
 import numpy as np
 
@@ -20,6 +24,10 @@ ROOT = Path(__file__).resolve().parents[2]
 SURFACE_FIELDS = ('b_cos', 'jacobian_cos', 'b_sub_theta_cos', 'b_sub_zeta_cos',
                   'b_sup_theta_cos', 'b_sup_zeta_cos', 'b0')
 COEFFICIENTS = (('D11', 0), ('D13', 2), ('D33', 3))
+TABLE_FIELDS = ('D11_log', 'D13', 'D33')
+EXTRA_SURFACE_FIELDS = ('iota', 'psi_a_hat', 'phi_edge', 'r_n', 'r_hat',
+                        'dpsi_hat_dr_hat', 'dr_hat_dpsi_hat', 'aminor_p',
+                        'transport_psi_scale', 'requested_psi_n', 'psi_n')
 
 
 def saved(directory, pattern):
@@ -33,6 +41,57 @@ def saved(directory, pattern):
 def fields(arrays, prefix):
     return {key[len(prefix):]: value for key, value in arrays.items()
             if key.startswith(prefix) and '.' not in key[len(prefix):]}
+
+
+def snapshot_directory(run_dir):
+    choices = [p for p in (run_dir/'ad_snapshots', run_dir/'ad/snapshots') if p.is_dir()]
+    if len(choices) != 1:
+        raise ValueError('Expected one AD snapshot directory: ad_snapshots or ad/snapshots')
+    return choices[0]
+
+
+def table_interpolation_mode(nc):
+    mode = nc.get('interpolation_mode', 'generic')
+    if mode not in ('generic', 'preprocessed_3d_radial_ntss1d'):
+        raise ValueError('Table audit requires generic or preprocessed_3d_radial_ntss1d runtime tables')
+    return mode
+
+
+def saved_database_direction(folder, database, h):
+    if not np.isfinite(h) or h <= 0:
+        raise ValueError('FD step must be finite and positive')
+    minus = saved(folder/'snapshots', 'fd_*_minus_*.npz')
+    plus = saved(folder/'snapshots', 'fd_*_plus_*.npz')
+    directions = {}
+    for name, anchor in database.items():
+        key = "support['database']."+name
+        if key not in minus or key not in plus:
+            raise ValueError(f'Missing endpoint support: {key}; use the FD capture with saved support')
+        a,b = minus[key],plus[key]
+        if any(x.shape != anchor.shape or x.dtype != anchor.dtype or not np.isfinite(x).all() for x in (a,b)):
+            raise ValueError(f'Invalid FD database field: {name}')
+        directions[name] = (b-a)/(2*h)
+        if not np.isfinite(directions[name]).all():
+            raise ValueError(f'Nonfinite FD database direction: {name}')
+    return directions
+
+
+def weighted_table_direction(before, prefix, directions):
+    terms = []
+    for name, direction in directions.items():
+        bar = before[prefix+"['database']."+name]
+        if bar.shape != direction.shape or not np.isfinite(bar).all() or not np.isfinite(direction).all():
+            raise ValueError(f'Invalid table direction/cotangent: {name}')
+        terms.append(math.fsum(np.real(bar*direction).reshape(-1)))
+    return math.fsum(terms)
+
+
+def fd_reference(args):
+    folder = args.fd_reference_dir or args.run_dir/f"fd_{args.parameter.replace(':', '_')}"
+    report = json.loads((folder/'summary.json').read_text())
+    if report['parameter_name'] != args.parameter:
+        raise ValueError('Saved FD report belongs to a different parameter')
+    return folder, report
 
 
 def point_indices(text):
@@ -55,24 +114,271 @@ def captured_direction(tangents, parameter):
             for i in range(sum(key.startswith('payload_paths[') for key in tangents))}
 
 
+def active_table_points(before, count):
+    active = np.zeros(before["support_bars[0]['database'].D11_log"].shape, dtype=bool)
+    for row in range(count):
+        for field in TABLE_FIELDS:
+            bar = before[f"support_bars[{row}]['database'].{field}"]
+            if bar.shape != active.shape or not np.isfinite(bar).all():
+                raise ValueError('Invalid captured table cotangent')
+            active |= bar != 0
+    return tuple(map(tuple, np.argwhere(active).tolist()))
+
+
+def project_saved_support(archive, prefix, direction):
+    result = 0.
+    for key, bar in archive.items():
+        if not key.startswith(prefix) or bar.dtype.kind not in 'fc':
+            continue
+        path = key[len(prefix):]
+        if path.startswith("['database']."):
+            continue
+        if path not in direction:
+            if np.any(bar != 0):
+                raise ValueError(f'Missing captured direction for nonzero bar: {key}')
+            continue
+        if bar.shape != direction[path].shape:
+            raise ValueError(f'Tangent/bar shape mismatch: {key}')
+        result += float(np.sum(bar*direction[path]))
+    return result
+
+
+def audit_table(args, *, terminal, capture, tangents, directions, nc, context, state, channels, surfaces, grid):
+    """Compare the entire captured table transpose against raw-solver JVPs."""
+    import jax
+    import jax.numpy as jnp
+    import ntx
+    from NEOPAX import _geometry_autodiff as geo
+    from NEOPAX._transport_flux_models import (
+        D11_POSITIVE_FLOOR, _build_ntx_field_channels,
+        _ntx_runtime_scan_to_neopax_monoenergetic,
+    )
+
+    before = saved(snapshot_directory(args.run_dir), 'ad_before_scan_fold_*.npz')
+    labels = [str(before[f'labels[{i}]']) for i in range(sum(key.startswith('labels[') for key in before))]
+    points = active_table_points(before, len(labels))
+    database = fields(terminal, "support['database'].")
+    mode = table_interpolation_mode(nc)
+    fd_folder,fd = fd_reference(args)
+    if fd['objective_labels'] != labels:
+        raise ValueError('Captured objective order differs from the saved FD reference')
+    fd_baseline = saved(fd_folder/'snapshots','fd_baseline_*.npz')
+    baseline_keys = ('initial_y','final_y','final_time')+tuple(
+        key for key in terminal if key.startswith(("support['geometry'].","support['database'].")))
+    fd_verified = all(key in fd_baseline and terminal[key].shape == fd_baseline[key].shape
+        and terminal[key].dtype == fd_baseline[key].dtype
+        and terminal[key].tobytes() == fd_baseline[key].tobytes() for key in baseline_keys)
+    if (args.fd_reference_dir is not None or args.compare_saved_fd) and not fd_verified:
+        raise ValueError('Selected FD reference does not share the saved AD baseline')
+    saved_fd_dot = saved_database_direction(fd_folder,database,float(fd['fd_step'])) if args.compare_saved_fd else None
+    shape = database['D11_log'].shape
+    if shape != (len(nc['ntx_scan_rho']),len(nc['ntx_scan_nu_v']),len(nc['ntx_scan_er_tilde'])):
+        raise ValueError('Captured table shape differs from the saved configuration')
+    drds = np.asarray(channels['drds'])
+    nu_grid = np.asarray(nc['ntx_scan_nu_v'])
+    raw = [np.where(database['D11_log'] > np.log10(D11_POSITIVE_FLOOR),
+                    10.**database['D11_log']/drds[:,None,None]**2, 0.),
+           database['D13']/drds[:,None,None], database['D33']/nu_grid[None,:,None]]
+    ordinary = [value.copy() for value in raw]
+    forward_primal = [value.copy() for value in raw]
+    raw_dot = [np.zeros(shape) for _ in raw]
+    names = SURFACE_FIELDS + EXTRA_SURFACE_FIELDS
+    column = [str(tangents[f'parameter_labels[{i}]']) for i in range(2)].index(args.parameter)
+    state_dot = type(state)(**{name: jnp.asarray(value[column])
+                               for name,value in fields(tangents,'state_tangents.').items()})
+    # Complete native directions also test fields that had zero captured bars.
+    def native_numbers(value):
+        native = geo._traceable_vmec_surfaces_from_state(
+            context, value, s_values=geo._positive_transport_s_values_from_rho(nc['ntx_scan_rho']))
+        return tuple(tuple(jnp.asarray(getattr(surface,name),dtype=jnp.float64) for name in names)
+                     for surface in native)
+    _, native_dots = jax.jvp(native_numbers, (state,), (state_dot,))
+    template = surfaces[0]
+    for surface in surfaces:
+        if int(surface.nfp) != int(template.nfp) or not np.array_equal(surface.m,template.m) or not np.array_equal(surface.n,template.n):
+            raise ValueError('Shared kernel requires identical native mode metadata')
+
+    def coefficient_vector(values, nu):
+        surface = dataclasses.replace(template, **dict(zip(names,values[:-1],strict=True)))
+        prepared = ntx.prepare_monoenergetic_system(surface,grid)
+        return ntx.solve_prepared_coefficient_vector(prepared,ntx.MonoenergeticCase(nu_hat=nu,epsi_hat=values[-1]))
+    primal = jax.jit(coefficient_vector)
+    forward = jax.jit(lambda values,direction,nu: jax.jvp(
+        lambda x:coefficient_vector(x,nu),(values,),(direction,)))
+    rho, ertilde = jnp.asarray(nc['ntx_scan_rho']), jnp.asarray(nc['ntx_scan_er_tilde'])
+    _, es, _ = _build_ntx_field_channels(rho,ertilde,channels)
+    print(f'[captured-table] {len(points)} active cases; one shared raw-solver/JVP kernel; no coefficient VJP rerun',flush=True)
+    case_rows=[]
+    for step,(radius,n,e) in enumerate(points,1):
+        surface=surfaces[radius]
+        es_dot=ertilde[e]*(directions["['channels'].dr_tildeds"][radius]*channels['b00'][radius]
+                           + channels['dr_tildeds'][radius]*directions["['channels'].b00"][radius])
+        values=tuple(jnp.asarray(getattr(surface,name),dtype=jnp.float64) for name in names)+(es[radius,e],)
+        direction=tuple(jnp.asarray(directions[f"['surfaces'][{radius}].{name}"])
+                        if name in SURFACE_FIELDS else native_dots[radius][i]
+                        for i,name in enumerate(names))+(es_dot,)
+        nu=jnp.asarray(nu_grid[n])
+        base=np.asarray(jax.block_until_ready(primal(values,nu)))
+        jvp_base,dot=map(np.asarray,jax.block_until_ready(forward(values,direction,nu)))
+        if not all(np.isfinite(value).all() for value in (base,jvp_base,dot)):
+            raise FloatingPointError(f'Nonfinite raw coefficient/JVP at {(radius,n,e)}')
+        for k,(coefficient,index) in enumerate(COEFFICIENTS):
+            ordinary[k][radius,n,e]=base[index]
+            forward_primal[k][radius,n,e]=jvp_base[index]
+            raw_dot[k][radius,n,e]=dot[index]
+            case_rows.append(dict(radius_index=radius,nu_index=n,field_index=e,coefficient=coefficient,
+                ordinary_primal=float(base[index]),jvp_primal=float(jvp_base[index]),raw_jvp=float(dot[index])))
+        if step == 1 or step % 50 == 0 or step == len(points):
+            print(f'[captured-table] cases={step}/{len(points)} last={(radius,n,e)}',flush=True)
+            np.savez_compressed(args.out_dir/'raw_direction.npz',active_points=np.asarray(points[:step]),
+                ordinary=np.asarray(ordinary),jvp_primal=np.asarray(forward_primal),raw_jvp=np.asarray(raw_dot))
+
+    channel_names=('a_b','b00','drds','dr_tildedr')
+    channel_values=tuple(jnp.asarray(channels[name]) for name in channel_names)
+    channel_dots=tuple(jnp.asarray(directions[f"['channels'].{name}"]) for name in channel_names)
+    database_names=tuple(database)
+    def converted(raw_values,channel_values):
+        local=dict(zip(channel_names,channel_values,strict=True))
+        er=ertilde[None,:]*local['dr_tildedr'][:,None]*local['b00'][:,None]
+        scan=SimpleNamespace(rho=rho,nu_v=jnp.asarray(nu_grid),Er=er,drds=local['drds'],
+                             D11=raw_values[0],D13=raw_values[1],D33=raw_values[2])
+        result=_ntx_runtime_scan_to_neopax_monoenergetic(scan,a_b=local['a_b'],interpolation_mode=mode)
+        return tuple(jnp.asarray(getattr(result,name),dtype=jnp.float64) for name in database_names)
+    baseline,database_dot=jax.jvp(converted,
+        (tuple(map(jnp.asarray,raw)),channel_values),(tuple(map(jnp.asarray,raw_dot)),channel_dots))
+    baseline,database_dot=map(lambda values:tuple(map(np.asarray,values)),jax.block_until_ready((baseline,database_dot)))
+    if not all(np.isfinite(value).all() for value in database_dot):
+        raise FloatingPointError('Nonfinite normalized database direction')
+    _, ab_dot=jax.jvp(converted,(tuple(map(jnp.asarray,raw)),channel_values),
+        (tuple(jnp.zeros_like(value) for value in raw),
+         tuple(dot if name == 'a_b' else jnp.zeros_like(dot)
+               for name,dot in zip(channel_names,channel_dots,strict=True))))
+    ab_dot=tuple(map(np.asarray,jax.block_until_ready(ab_dot)))
+    for name,value in zip(database_names,baseline,strict=True):
+        if not np.allclose(value,database[name],rtol=1e-12,atol=1e-12):
+            raise ValueError(f'Normalization anchor differs from captured database: {name}')
+    ordinary_db=tuple(map(np.asarray,jax.block_until_ready(converted(tuple(map(jnp.asarray,ordinary)),channel_values))))
+    jvp_db=tuple(map(np.asarray,jax.block_until_ready(converted(tuple(map(jnp.asarray,forward_primal)),channel_values))))
+    np.savez_compressed(args.out_dir/'database_direction.npz',**{
+        **{f'database.{name}':value for name,value in database.items()},
+        **{f'database_dot.{name}':dot for name,dot in zip(database_names,database_dot,strict=True)}})
+    database_direction = dict(zip(database_names,database_dot,strict=True))
+    def table_dot(prefix):
+        return weighted_table_direction(before,prefix,database_direction)
+    rows=[];component_rows=[];radius_rows=[];fd_field_rows=[]
+    for i,label in enumerate(labels):
+        complete=project_saved_support(capture,f'payload_bars[{i}]',directions)
+        direct=project_saved_support(before,f'support_bars[{i}]',directions)
+        reference=complete-direct
+        actual=table_dot(f'support_bars[{i}]')
+        captured_global=0.
+        if "['channels'].a_b" in directions:
+            captured_global=float(np.sum(capture[f"payload_bars[{i}]['channels'].a_b"]*directions["['channels'].a_b"]))
+        forward_global=sum(float(np.sum(before[f"support_bars[{i}]['database']."+name]*dot))
+                           for name,dot in zip(database_names,ab_dot,strict=True))
+        radius_rows.append(dict(objective=label,parameter=args.parameter,radius='global_a_b',
+            captured_table_vjp=captured_global,raw_solver_table_jvp=forward_global,
+            absolute_difference=abs(captured_global-forward_global)))
+        for radius in range(shape[0]):
+            captured_radius=0.
+            for path,dot in directions.items():
+                bar=capture[f'payload_bars[{i}]'+path]
+                if path.startswith(f"['surfaces'][{radius}]."):
+                    captured_radius += float(np.sum(bar*dot))
+                elif path.startswith("['channels'].") and np.ndim(dot) == 1:
+                    captured_radius += float(bar[radius]*dot[radius])
+            forward_radius=sum(float(np.sum(before[f"support_bars[{i}]['database']."+name][radius]*(dot-ab_dot[k])[radius]))
+                for k,(name,dot) in enumerate(zip(database_names,database_dot,strict=True))
+                if name in (*TABLE_FIELDS,'Er_list'))
+            radius_rows.append(dict(objective=label,parameter=args.parameter,radius=radius,
+                captured_table_vjp=captured_radius,raw_solver_table_jvp=forward_radius,
+                absolute_difference=abs(captured_radius-forward_radius)))
+        grouped=radius_rows[-(shape[0]+1):]
+        if not np.isclose(sum(row['captured_table_vjp'] for row in grouped),reference,rtol=1e-10,atol=1e-10):
+            raise ValueError('Incomplete saved table-radius transpose decomposition')
+        if not np.isclose(sum(row['raw_solver_table_jvp'] for row in grouped),actual,rtol=1e-10,atol=1e-10):
+            raise ValueError('Incomplete forward table-radius decomposition')
+        explicit_direct=project_saved_support(before,f"components['objective_explicit'][{i}]",directions)
+        explicit_table=table_dot(f"components['objective_explicit'][{i}]")
+        explicit=explicit_direct+explicit_table
+        rows.append(dict(objective=label,parameter=args.parameter,active_cases=len(points),
+            fd_baseline_verified=fd_verified,
+            captured_table_vjp=reference,raw_solver_table_jvp=actual,
+            absolute_difference=abs(actual-reference),
+            relative_difference=abs(actual-reference)/max(abs(reference),np.finfo(float).tiny),
+            explicit_geometry_plus_table=explicit,
+            fd_explicit_geometry=fd['fixed_final_state_objective_geometry_fd'][i],
+            captured_full_gradient=complete,independent_table_full_gradient=direct+actual,
+            state_chain_after_explicit=complete-explicit,
+            independent_state_chain=direct+actual-explicit,
+            fd_state_chain=fd['baseline_geometry_final_state_fd'][i],
+            weighted_ordinary_primal_offset=sum(float(np.sum(before[f"support_bars[{i}]['database']."+name]*(value-baseline[k])))
+                for k,(name,value) in enumerate(zip(database_names,ordinary_db,strict=True))),
+            weighted_jvp_primal_offset=sum(float(np.sum(before[f"support_bars[{i}]['database']."+name]*(value-baseline[k])))
+                for k,(name,value) in enumerate(zip(database_names,jvp_db,strict=True)))))
+        if saved_fd_dot is not None:
+            fd_table = weighted_table_direction(before,f'support_bars[{i}]',saved_fd_dot)
+            rows[-1].update(saved_table_fd=fd_table,
+                jvp_minus_recorded_table_vjp=actual-reference,
+                jvp_minus_saved_table_fd=actual-fd_table)
+            for name,dot in database_direction.items():
+                bar = before[f"support_bars[{i}]['database']."+name]
+                fd_field_rows.append(dict(objective=label,field=name,
+                    jvp_contribution=math.fsum(np.real(bar*dot).reshape(-1)),
+                    fd_contribution=math.fsum(np.real(bar*saved_fd_dot[name]).reshape(-1))))
+        print('[captured-table] '+json.dumps(rows[-1]),flush=True)
+        for component in ('initial_cache','initial_direct_rhs','initial_er_root','initial_profile','objective_explicit','transport_rhs'):
+            prefix=f"components['{component}'][{i}]"
+            component_rows.append(dict(objective=label,parameter=args.parameter,component=component,
+                geometry=project_saved_support(before,prefix,directions),table=table_dot(prefix)))
+    for name,values in (('table_comparison.csv',rows),('component_directions.csv',component_rows),
+                        ('radius_comparison.csv',radius_rows),('case_directions.csv',case_rows),
+                        ('table_fd_fields.csv',fd_field_rows)):
+        if not values:
+            continue
+        with (args.out_dir/name).open('w',newline='') as stream:
+            writer=csv.DictWriter(stream,fieldnames=list(values[0]));writer.writeheader()
+            writer.writerows({key:f'{value:.17e}' if isinstance(value,float) else value
+                             for key,value in row.items()} for row in values)
+    print(f'[captured-table] saved {len(rows)} weighted objective comparisons in {args.out_dir}',flush=True)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--run-dir', type=Path, required=True)
     parser.add_argument('--out-dir', type=Path, required=True)
     parser.add_argument('--parameter', choices=('RBC:1:0', 'ZBS:1:0'), default='RBC:1:0')
-    parser.add_argument('--points', type=point_indices, default=point_indices('4:4:2,4:4:3,4:4:5'))
+    selection=parser.add_mutually_exclusive_group()
+    selection.add_argument('--points', type=point_indices, default=point_indices('4:4:2,4:4:3,4:4:5'))
+    selection.add_argument('--audit-table',action='store_true',
+        help='Check all active table nodes against all captured objective cotangents; no local FD or coefficient VJP rerun')
+    parser.add_argument('--fd-reference-dir',type=Path,
+        help='Use an existing summary.json and snapshots directory without modifying the archived AD/FD run')
+    parser.add_argument('--compare-saved-fd',action='store_true',
+        help='With --audit-table, also compare against the saved FD endpoint database direction')
     args = parser.parse_args()
-    terminal = saved(args.run_dir/'ad_snapshots', 'ad_terminal_*.npz')
-    capture = saved(args.run_dir/'ad_snapshots', 'ad_compact_geometry_*.npz')
-    directions = captured_direction(saved(args.run_dir/'ad_snapshots', 'ad_compact_tangents_*.npz'), args.parameter)
-    fd = json.loads((args.run_dir/f"fd_{args.parameter.replace(':', '_')}"/'summary.json').read_text())
+    if args.compare_saved_fd and not args.audit_table:
+        parser.error('--compare-saved-fd requires --audit-table')
+    snapshots = snapshot_directory(args.run_dir)
+    terminal = saved(snapshots, 'ad_terminal_*.npz')
+    capture = saved(snapshots, 'ad_compact_geometry_*.npz')
+    tangents = saved(snapshots, 'ad_compact_tangents_*.npz')
+    directions = captured_direction(tangents, args.parameter)
+    _, fd = fd_reference(args)
     h0 = float(fd['fd_step'])
     if not np.isfinite(h0) or h0 <= 0:
         parser.error('Saved FD step must be finite and positive')
     with (args.run_dir/'config.toml').open('rb') as stream:
         config = tomllib.load(stream)
     nc = config['neoclassical']
-    for radius, nu_index, field_index in args.points:
+    if nc.get('ntx_scan_surface_backend','vmec') not in {'vmec','vmec_jax'}:
+        parser.error('This captured numerical surface check requires the VMEC scan backend')
+    if args.audit_table:
+        try:
+            table_interpolation_mode(nc)
+        except ValueError as error:
+            parser.error(str(error))
+    for radius, nu_index, field_index in (() if args.audit_table else args.points):
         if (radius >= len(nc['ntx_scan_rho']) or nu_index >= len(nc['ntx_scan_nu_v'])
                 or field_index >= len(nc['ntx_scan_er_tilde'])):
             parser.error('Point is outside the captured scan grid')
@@ -92,6 +398,10 @@ def main():
     from NEOPAX._geometry_models import VmecBoozer
     from NEOPAX._transport_flux_models import _build_ntx_field_channels
     from benchmark_transport_reverse_ad_only import _geometry_context_from_config
+
+    for module in (geo,native_ad,sys.modules[_prepared_implicit_vjp_primal.__module__]):
+        path=Path(module.__file__)
+        print(f'[captured-ntx] source={path} sha256={hashlib.sha256(path.read_bytes()).hexdigest()}',flush=True)
 
     config['geometry']['vmec_input_file'] = str((ROOT/config['geometry']['vmec_input_file']).resolve())
     context = _geometry_context_from_config(config, args.parameter)
@@ -114,6 +424,10 @@ def main():
     basis = jnp.eye(5, dtype=jnp.float64)[jnp.asarray([0, 2, 3])]
     print(f'[captured-ntx] JAX={jax.__version__} device={jax.devices()[0]} '
           f'parameter={args.parameter} grid=({grid.n_theta},{grid.n_zeta},{grid.n_xi})', flush=True)
+    if args.audit_table:
+        audit_table(args,terminal=terminal,capture=capture,tangents=tangents,directions=directions,
+            nc=nc,context=context,state=state,channels=channels,surfaces=surfaces,grid=grid)
+        return
 
     # One compiled shape for every case. VMEC metadata stays in the closure;
     # only flat numerical leaves enter lower/compile (avoids ArgInfo constructors).
