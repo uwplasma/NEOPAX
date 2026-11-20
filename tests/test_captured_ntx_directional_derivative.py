@@ -1,12 +1,17 @@
 """Saved-array preparation and API contracts; import no physics packages."""
 import ast
+import csv
+from contextlib import redirect_stdout
+import dataclasses
 import importlib.util
+import io
 import json
 from pathlib import Path
 import sys
 import tempfile
 from types import SimpleNamespace
 import unittest
+from unittest.mock import patch
 
 import numpy as np
 
@@ -19,6 +24,67 @@ JAX_AFTER_IMPORT = 'jax' in sys.modules
 
 
 class CapturedNTXPreparationTests(unittest.TestCase):
+    def test_precision_reference_rejects_different_direction_point_and_database(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            terminal = {'labels[0]':np.asarray('cost'),"support['database'].D13":np.asarray([2.])}
+            np.savez(root/'raw_direction.npz',active_points=np.asarray([[0,0,0]]))
+            np.savez(root/'database_direction.npz',**{'database.D13':np.asarray([2.])})
+            (root/'table_comparison.csv').write_text('objective,parameter\ncost,ZBS:1:0\n')
+            check.precision_reference(root,terminal,'ZBS:1:0',((0,0,0),))
+            for parameter,points in (('RBC:1:0',((0,0,0),)),('ZBS:1:0',((1,0,0),))):
+                with self.assertRaises(ValueError):
+                    check.precision_reference(root,terminal,parameter,points)
+            np.savez(root/'database_direction.npz',**{'database.D13':np.asarray([3.])})
+            with self.assertRaisesRegex(ValueError,'database differs'):
+                check.precision_reference(root,terminal,'ZBS:1:0',((0,0,0),))
+
+    def test_precision_sweep_includes_extra_surface_direction_and_live_normalization(self):
+        # Independent analytic model: D11=b^2+iota, D13=b*Es+iota^2,
+        # D33=iota^2+Es. Nonzero iota_dot tests the extra surface fields.
+        names = check.SURFACE_FIELDS+check.EXTRA_SURFACE_FIELDS
+        Surface = dataclasses.make_dataclass('Surface',[(name,object) for name in (*names,'m','n','nfp')])
+        values = dict.fromkeys(names,np.asarray(0.))
+        values.update(b_cos=np.asarray(2.),iota=np.asarray(.5),m=np.asarray([0]),n=np.asarray([0]),nfp=1)
+        surface = Surface(**values)
+        State = dataclasses.make_dataclass('State',[('x',object)])
+        state = State(np.asarray(0.))
+        native_dots = (tuple(np.asarray(.3 if name=='iota' else .2 if name=='b_cos' else 0.) for name in names),)
+        geometry = SimpleNamespace(_traceable_vmec_surfaces_from_state=lambda *a,**kw:(surface,),
+            _positive_transport_s_values_from_rho=lambda x:x)
+        field_channels = lambda *a:(np.zeros((1,1)),np.asarray([[3.]]),np.zeros((1,1)))
+        fake_jax = SimpleNamespace(numpy=np,jit=lambda f:f,block_until_ready=lambda x:x,
+            jvp=lambda f,p,t:(f(*p),native_dots))
+        def coefficients(s,case):
+            b,i,es = s.b_cos,s.iota,case.epsi_hat
+            return np.asarray([b*b+i,0.,b*es+i*i,i*i+es,0.])
+        fake_ntx = SimpleNamespace(prepare_monoenergetic_system=lambda s,g:s,
+            MonoenergeticCase=lambda **kw:SimpleNamespace(**kw),solve_prepared_coefficient_vector=coefficients)
+        modules = {'jax':fake_jax,'jax.numpy':np,'ntx':fake_ntx,
+            'NEOPAX':SimpleNamespace(_geometry_autodiff=geometry),
+            'NEOPAX._transport_flux_models':SimpleNamespace(D11_POSITIVE_FLOOR=1e-20,_build_ntx_field_channels=field_channels)}
+        directions = {f"['surfaces'][0].{name}":np.asarray(.2 if name=='b_cos' else 0.) for name in check.SURFACE_FIELDS}
+        directions.update({"['channels'].dr_tildeds":np.asarray([.1]),"['channels'].b00":np.asarray([.2]),
+                           "['channels'].drds":np.asarray([.1])})
+        raw = {'ordinary':np.asarray([4.5,6.25,3.25]).reshape(3,1,1,1),
+               'raw_jvp':np.asarray([1.1,2.7,1.2]).reshape(3,1,1,1)}
+        expected = [(1.1/4.5+.1)/np.log(10.),6.025,.84]
+        reference = {'database_dot.'+field:np.asarray([[[dot]]]) for field,dot in zip(check.TABLE_FIELDS,expected)}
+        with tempfile.TemporaryDirectory() as directory, patch.dict(sys.modules,modules), \
+             patch.object(check,'precision_reference',return_value=(raw,reference)), redirect_stdout(io.StringIO()):
+            args = SimpleNamespace(precision_from_table_audit=Path(directory),out_dir=Path(directory),
+                parameter='ZBS:1:0',points=((0,0,0),))
+            check.precision_sweep(args,terminal={},tangents={'parameter_labels[0]':np.asarray('ZBS:1:0'),
+                'state_tangents.x':np.asarray([.1])},directions=directions,
+                nc={'ntx_scan_rho':[.5],'ntx_scan_nu_v':[.7],'ntx_scan_er_tilde':[3.]},context=None,state=state,
+                channels={'b00':np.asarray([1.]),'dr_tildeds':np.asarray([1.]),'drds':np.asarray([2.])},
+                surfaces=(surface,),grid=None,h0=1e-6)
+            with (Path(directory)/'precision.csv').open() as stream:
+                rows = list(csv.DictReader(stream))
+            self.assertEqual(len(rows),12)
+            self.assertEqual({float(r['fd_scale']) for r in rows},{1.,3.,10.,30.})
+            self.assertLess(max(float(r['normalized_relative_difference']) for r in rows),1e-7)
+
     def test_snapshot_layouts_and_both_live_table_modes(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

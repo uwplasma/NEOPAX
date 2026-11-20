@@ -86,6 +86,101 @@ def weighted_table_direction(before, prefix, directions):
     return math.fsum(terms)
 
 
+def precision_reference(directory, terminal, parameter, points):
+    with (directory/'table_comparison.csv').open() as stream:
+        rows = list(csv.DictReader(stream))
+    labels = [str(terminal[f'labels[{i}]']) for i in range(sum(k.startswith('labels[') for k in terminal))]
+    if [r['objective'] for r in rows] != labels or any(r['parameter'] != parameter for r in rows):
+        raise ValueError('Precision reference objective/parameter differs')
+    raw = saved(directory,'raw_direction.npz')
+    database = saved(directory,'database_direction.npz')
+    active = {tuple(index) for index in raw['active_points'].tolist()}
+    if not set(points).issubset(active):
+        raise ValueError('Precision points must belong to the completed weighted audit')
+    for key,value in terminal.items():
+        if key.startswith("support['database']."):
+            field = 'database.'+key.split('.',1)[1]
+            if field not in database or value.shape != database[field].shape or value.dtype != database[field].dtype or value.tobytes() != database[field].tobytes():
+                raise ValueError(f'Precision reference database differs: {field}')
+    return raw,database
+
+
+def precision_sweep(args, *, terminal, tangents, directions, nc, context, state, channels, surfaces, grid, h0):
+    """FD of complete numerical NTX inputs against the already-saved full JVP."""
+    import jax
+    import jax.numpy as jnp
+    import ntx
+    from NEOPAX import _geometry_autodiff as geo
+    from NEOPAX._transport_flux_models import D11_POSITIVE_FLOOR, _build_ntx_field_channels
+
+    raw,reference = precision_reference(args.precision_from_table_audit,terminal,args.parameter,args.points)
+    names = SURFACE_FIELDS+EXTRA_SURFACE_FIELDS
+    column = [str(tangents[f'parameter_labels[{i}]']) for i in range(sum(k.startswith('parameter_labels[') for k in tangents))].index(args.parameter)
+    state_dot = type(state)(**{name:jnp.asarray(value[column]) for name,value in fields(tangents,'state_tangents.').items()})
+    def native_numbers(value):
+        native = geo._traceable_vmec_surfaces_from_state(context,value,
+            s_values=geo._positive_transport_s_values_from_rho(nc['ntx_scan_rho']))
+        return tuple(tuple(jnp.asarray(getattr(surface,name),dtype=jnp.float64) for name in names) for surface in native)
+    _,native_dots = jax.jvp(native_numbers,(state,),(state_dot,))
+    template = surfaces[0]
+    for surface in surfaces:
+        if int(surface.nfp) != int(template.nfp) or not np.array_equal(surface.m,template.m) or not np.array_equal(surface.n,template.n):
+            raise ValueError('Shared precision kernel requires identical native mode metadata')
+    @jax.jit
+    def primal(values,nu):
+        surface = dataclasses.replace(template,**dict(zip(names,values[:-1],strict=True)))
+        prepared = ntx.prepare_monoenergetic_system(surface,grid)
+        return ntx.solve_prepared_coefficient_vector(prepared,ntx.MonoenergeticCase(nu_hat=nu,epsi_hat=values[-1]))
+    @jax.jit
+    def normalized(value,drds,nu):
+        return jnp.stack((jnp.log10(jnp.maximum(D11_POSITIVE_FLOOR,value[0]*drds**2)),value[2]*drds,value[3]*nu))
+    _,es,_ = _build_ntx_field_channels(jnp.asarray(nc['ntx_scan_rho']),jnp.asarray(nc['ntx_scan_er_tilde']),channels)
+    rows = []
+    for radius,n,e in args.points:
+        surface = surfaces[radius]
+        nu = jnp.asarray(nc['ntx_scan_nu_v'][n],dtype=jnp.float64)
+        factor = nc['ntx_scan_er_tilde'][e]
+        es_dot = factor*(directions["['channels'].dr_tildeds"][radius]*channels['b00'][radius]
+                        + channels['dr_tildeds'][radius]*directions["['channels'].b00"][radius])
+        values = tuple(jnp.asarray(getattr(surface,name),dtype=jnp.float64) for name in names)+(es[radius,e],)
+        direction = tuple(jnp.asarray(directions[f"['surfaces'][{radius}].{name}"]) if name in SURFACE_FIELDS
+                          else native_dots[radius][i] for i,name in enumerate(names))+(es_dot,)
+        base = np.asarray(jax.block_until_ready(primal(values,nu)))
+        anchor = raw['ordinary'][:,radius,n,e]
+        if not np.allclose(base[[0,2,3]],anchor,rtol=1e-8,atol=1e-12):
+            raise ValueError(f'Precision primal differs from completed audit at {(radius,n,e)}')
+        drds = channels['drds'][radius]
+        drds_dot = directions["['channels'].drds"][radius]
+        for scale in (1.,3.,10.,30.):
+            h = h0*scale
+            minus = jax.block_until_ready(primal(tuple(x-h*d for x,d in zip(values,direction,strict=True)),nu))
+            plus = jax.block_until_ready(primal(tuple(x+h*d for x,d in zip(values,direction,strict=True)),nu))
+            norm_minus = np.asarray(jax.block_until_ready(normalized(minus,drds-h*drds_dot,nu)))
+            norm_plus = np.asarray(jax.block_until_ready(normalized(plus,drds+h*drds_dot,nu)))
+            raw_fd = (np.asarray(plus)-np.asarray(minus))/(2*h)
+            norm_fd = (norm_plus-norm_minus)/(2*h)
+            if not all(np.isfinite(value).all() for value in (minus,plus,raw_fd,norm_fd)):
+                raise FloatingPointError(f'Nonfinite precision endpoint at {(radius,n,e)}, scale={scale}')
+            errors = []
+            for k,((_,index),field) in enumerate(zip(COEFFICIENTS,TABLE_FIELDS,strict=True)):
+                derivative = float(reference['database_dot.'+field][radius,n,e])
+                absolute = abs(float(norm_fd[k])-derivative)
+                relative = absolute/abs(derivative) if derivative else (0. if absolute == 0. else None)
+                rows.append(dict(radius_index=radius,nu_index=n,field_index=e,field=field,fd_scale=scale,fd_step=h,
+                    raw_reference_jvp=float(raw['raw_jvp'][k,radius,n,e]),raw_fd=float(raw_fd[index]),
+                    normalized_reference_jvp=derivative,normalized_fd=float(norm_fd[k]),
+                    normalized_absolute_difference=absolute,normalized_relative_difference=relative,
+                    raw_primal=float(base[index]),saved_raw_primal=float(anchor[k]),
+                    normalized_minus=float(norm_minus[k]),normalized_plus=float(norm_plus[k]),
+                    d11_floor_minus=bool(float(minus[0])*(float(drds)-h*float(drds_dot))**2 <= D11_POSITIVE_FLOOR),
+                    d11_floor_plus=bool(float(plus[0])*(float(drds)+h*float(drds_dot))**2 <= D11_POSITIVE_FLOOR)))
+                errors.append(f'{field}={relative:.6e}' if relative is not None else f'{field}_absolute={absolute:.6e}')
+            print(f'[ntx-precision] point={radius}:{n}:{e} scale={scale:g} '+ ' '.join(errors),flush=True)
+            with (args.out_dir/'precision.csv').open('w',newline='') as stream:
+                writer = csv.DictWriter(stream,fieldnames=list(rows[0]));writer.writeheader();writer.writerows(rows)
+    print(f'[ntx-precision] saved {len(rows)} rows; complete numerical-input FD, no transport or coefficient VJP/JVP rerun',flush=True)
+
+
 def fd_reference(args):
     folder = args.fd_reference_dir or args.run_dir/f"fd_{args.parameter.replace(':', '_')}"
     report = json.loads((folder/'summary.json').read_text())
@@ -356,7 +451,11 @@ def main():
         help='Use an existing summary.json and snapshots directory without modifying the archived AD/FD run')
     parser.add_argument('--compare-saved-fd',action='store_true',
         help='With --audit-table, also compare against the saved FD endpoint database direction')
+    parser.add_argument('--precision-from-table-audit',type=Path,
+        help='At --points, reuse a completed weighted audit JVP and test numerical-input FD at 1,3,10,30 times the saved step')
     args = parser.parse_args()
+    if args.precision_from_table_audit is not None and args.audit_table:
+        parser.error('--precision-from-table-audit cannot be combined with --audit-table')
     if args.compare_saved_fd and not args.audit_table:
         parser.error('--compare-saved-fd requires --audit-table')
     snapshots = snapshot_directory(args.run_dir)
@@ -378,6 +477,8 @@ def main():
             table_interpolation_mode(nc)
         except ValueError as error:
             parser.error(str(error))
+    if args.precision_from_table_audit is not None:
+        precision_reference(args.precision_from_table_audit,terminal,args.parameter,args.points)
     for radius, nu_index, field_index in (() if args.audit_table else args.points):
         if (radius >= len(nc['ntx_scan_rho']) or nu_index >= len(nc['ntx_scan_nu_v'])
                 or field_index >= len(nc['ntx_scan_er_tilde'])):
@@ -427,6 +528,10 @@ def main():
     if args.audit_table:
         audit_table(args,terminal=terminal,capture=capture,tangents=tangents,directions=directions,
             nc=nc,context=context,state=state,channels=channels,surfaces=surfaces,grid=grid)
+        return
+    if args.precision_from_table_audit is not None:
+        precision_sweep(args,terminal=terminal,tangents=tangents,directions=directions,
+            nc=nc,context=context,state=state,channels=channels,surfaces=surfaces,grid=grid,h0=h0)
         return
 
     # One compiled shape for every case. VMEC metadata stays in the closure;
