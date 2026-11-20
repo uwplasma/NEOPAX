@@ -825,7 +825,10 @@ def _objectives_on_realtime_geometry_frozen_trace(
     save_gradient_audit("fd_" + endpoint_label, labels=tuple(OBJECTIVE_LABELS), values=values,
         initial_y=prepared_rollout.initial_carry.y, final_y=replay["final_carry"].y,
         final_time=replay["final_carry"].t,
-        initial_state=state0, final_state=replay["final_state"], profile_values=profile_values)
+        initial_state=state0, final_state=replay["final_state"], profile_values=profile_values,
+        fixed_inputs={"species": runtime.species, "energy_grid": runtime.energy_grid},
+        support={"geometry": runtime.geometry, "database": getattr(
+            getattr(runtime.models.flux, "neoclassical_model", runtime.models.flux), "database", None)})
     return values, replay
 
 
@@ -1771,6 +1774,7 @@ def main() -> None:
         final_y=baseline_rollout.final_carry.y, final_state=_baseline_final_state,
         final_time=baseline_rollout.final_carry.t,
         initial_y=baseline_prepared_rollout.initial_carry.y, initial_state=baseline_profile_state,
+        fixed_inputs={"species": baseline_runtime.species, "energy_grid": baseline_runtime.energy_grid},
         support={"geometry": baseline_runtime.geometry, "database": getattr(baseline_neoclassical, "database", None)})
     if args.diagnose_bootstrap_correction or args.diagnose_bootstrap_correction_only:
         print("[autodiff-gate] progress: diagnosing baseline bootstrap correction", flush=True)
