@@ -519,9 +519,11 @@ Eighteen NumPy-only tests pass, including the actual benchmark helper and CLI
 wiring with mocks, rejected mismatched references and unchanged default solve
 calls. An additional NumPy-only check restored the state and both named tangent
 columns byte-for-byte from a real archived AD capture. No JAX or physics ran
-locally. GPU validation of this new option is pending; it removes independent
-VMEC reconstruction from the comparison and is not a claimed cure for all
-finite-difference roundoff or truncation errors.
+locally. GPU validation was pending when this option was added. The completed
+FD16 result below confirms the saved-reference execution and common baseline,
+but does not resolve the gradient discrepancies. This option removes
+independent VMEC reconstruction from the comparison and is not a claimed cure
+for all finite-difference roundoff or truncation errors.
 
 After publishing, the following reuses the existing AD16 result and runs only
 the original ZBS FD16 benchmark with the recorded AD geometry linearization.
@@ -568,4 +570,187 @@ for r in rows:
           f"relative_error={r['relative_difference_to_fd']:.6e}")
 PY
 ) || printf '\nSaved-geometry FD check stopped; terminal kept open.\n'
+```
+
+## Shared AD geometry FD16 result: discrepancy remains
+
+Run `outputs/ntss1d_zbs_saved_ad_geometry_2_versy_` completed at benchmark commit
+`db8da34`, using the existing AD16 result. The log explicitly confirms loading
+the saved AD geometry linearization. It also records
+`fd_geometry_linearization_hust3ha2.npz`, so the FD state and tangent are now
+available for direct inspection. The fresh initial Er already agrees with AD
+before applying the saved-reference override.
+
+Baseline `initial_y`, `final_y`, `final_time`, geometry and database arrays
+match AD exactly. The baseline has 16 accepted steps and 23 attempts at
+`t=4.1195452419569767e-04`. Both perturbed accepted-step replays finish at this
+same time, with 16 active steps, no nonconverged active steps and zero baseline
+or endpoint Newton retries. Geometry and initial-root lanes remain
+`frozen_linearized`, and the accepted replay contract remains
+`reverse_frozen_metadata` with `recorded_forward` Jacobians.
+
+The following relative errors use `abs(AD-FD)/abs(FD)` at the same
+`h=3.3946185202503675e-07`. They are not percentages. The before column is the
+original `ntss1d_zbs_support_chain_UfR8XG` FD reference; AD is unchanged in both
+columns.
+
+| Objective | Independent VMEC reconstruction | Recorded AD VMEC state/tangent |
+| --- | ---: | ---: |
+| softmax_Er | `2.494047e-05` | `6.241382e-06` |
+| net_total_power_volume_average_mw_m3 | `1.302500e-06` | `8.953810e-07` |
+| Er_transition_left | `6.101322e-05` | `1.300480e-05` |
+| Er_transition_right | `6.610191e-05` | `1.282220e-05` |
+| Er2_volume_average | `2.112375e-05` | `2.349415e-05` |
+| Er_volume_average | `1.602953e-05` | `1.330842e-05` |
+| electron_temperature_volume_average_keV | `2.344183e-06` | `2.278717e-06` |
+| total_pressure_volume_average | `2.345669e-06` | `2.257583e-06` |
+| alpha_power_volume_average_mw_m3 | `1.408631e-06` | `9.816440e-07` |
+| bootstrap_current_softmax_abs_scaled | `3.915224e-05` | `4.598480e-05` |
+| Er_transition_rho | `6.965993e-07` | `4.889824e-06` |
+| Er_transition_location_moment | `6.965993e-07` | `4.889824e-06` |
+| Er_transition_strength | `1.744869e-06` | `1.839022e-06` |
+
+The printed AD/FD values independently reproduce all 13 reported relative
+errors within their printed precision. Some Er gradients improve, but the
+Er2 and bootstrap discrepancies persist and are slightly larger. The root
+position discrepancy also increases. This is not a successful gradient fix;
+independent VMEC reconstruction cannot explain the whole observed mismatch.
+The result does not by itself identify a bad AD rule or establish FD roundoff
+as the remaining cause. The exact-baseline and successful replay checks are
+distinct from gradient correctness.
+
+The run took 39:30.85 and reported maximum host RSS of 8,345,712 KiB. This is
+host process memory, not GPU peak usage. No additional physics run is needed
+for the next localization: apply the existing terminal/full-support saved-array
+comparison to this new FD output and the same original AD bars. The earlier
+support-chain agreement belongs to the earlier endpoint data and must not be
+assumed for this new FD run. That NumPy-only readout has now completed; see
+the new result below.
+
+Supplied attachment SHA256:
+`724c994184cc7993eb5272aa0438c259eaa7f0dee04faeed76284cf8556963db`.
+
+```bash
+(
+  cd "$HOME/NEOPAX" || exit 1
+  neopax_case=outputs/ntss1d_zbs_saved_ad_geometry_2_versy_
+  neopax_fold=("$neopax_case"/ad/snapshots/ad_before_scan_fold_*.npz)
+  [ "${#neopax_fold[@]}" -eq 1 ] && [ -f "${neopax_fold[0]}" ] || exit 1
+  OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 \
+  "$HOME/jax_env/bin/python" examples/benchmarks/compare_transport_gradient_audit.py \
+    --ad-dir "$neopax_case/ad/snapshots" \
+    --fd-dir "$neopax_case/fd_ZBS_1_0/snapshots" \
+    --fd-report "$neopax_case/fd_ZBS_1_0/summary.json" \
+    --ad-before-scan-fold "${neopax_fold[0]}" \
+    --out "$neopax_case/fd_ZBS_1_0/support_chain.csv"
+) || printf '\nSaved-array check stopped; terminal kept open.\n'
+```
+
+## Shared-geometry FD16 support chain: the transport boundary agrees
+
+The completed saved-array check for `ntss1d_zbs_saved_ad_geometry_2_versy_`
+matches baseline packed/physical states, time and objective values exactly.
+The full terminal chain includes each objective's explicit geometry/table
+contribution. The support chain contracts the pre-scan-fold adjoint with the
+actual new FD geometry and table secants, including the initial-root and
+transport contributions. Both comparisons use the new endpoints, rather
+than assuming that the earlier FD run's result still applies.
+
+All columns below are relative differences from this same full parameter FD:
+
+| Objective | Full parameter AD | Full terminal chain | Full support chain |
+| --- | ---: | ---: | ---: |
+| softmax_Er | `6.241382e-06` | `1.809514e-10` | `8.638691e-09` |
+| net_total_power_volume_average_mw_m3 | `8.953810e-07` | `5.536184e-09` | `1.255901e-08` |
+| Er_transition_left | `1.300480e-05` | `0.000000e+00` | `5.759969e-08` |
+| Er_transition_right | `1.282220e-05` | `0.000000e+00` | `2.222397e-08` |
+| Er2_volume_average | `2.349415e-05` | `4.368774e-12` | `8.083489e-10` |
+| Er_volume_average | `1.330842e-05` | `6.715926e-11` | `3.096932e-10` |
+| electron_temperature_volume_average_keV | `2.278717e-06` | `9.170539e-09` | `1.333907e-08` |
+| total_pressure_volume_average | `2.257583e-06` | `5.180900e-09` | `4.484248e-09` |
+| alpha_power_volume_average_mw_m3 | `9.816440e-07` | `3.035909e-08` | `1.360227e-08` |
+| bootstrap_current_softmax_abs_scaled | `4.598480e-05` | `1.948953e-09` | `6.687975e-11` |
+| Er_transition_rho | `4.889824e-06` | `5.617453e-09` | `6.529878e-09` |
+| Er_transition_location_moment | `4.889824e-06` | `5.617453e-09` | `6.529878e-09` |
+| Er_transition_strength | `1.839022e-06` | `3.080962e-10` | `4.266008e-09` |
+
+The largest support-chain discrepancy is `5.759969e-08`; bootstrap agrees to
+`6.687975e-11`. Thus the fixed-support transport adjoint reproduces this FD
+direction far more closely than the complete parameter gradient does. The
+larger discrepancy is localized to the parameter-to-geometry/table mapping
+or the difference between its derivative and its finite secant. This does
+not yet distinguish an incorrect derivative from finite-step or numerical
+precision effects at that mapping, and is not a validation of every parameter
+or later time prefix.
+
+The pressure terminal-state-only relative difference `5.282991e-04` concerns
+a small partial state contribution. Adding the explicit geometry/table term
+gives the full terminal-chain relative difference `5.180900e-09`. Those two
+numbers must not be interpreted as errors of the same complete derivative.
+Supplied attachment SHA256:
+`b60987ab182c0bcaf0b6cf3db2d563b7de4c5171e3fb0e27ef3344797d63b9fb`.
+
+## Check the input geometry map without coefficient or transport solves
+
+`check_saved_geometry_payload_fd.py` uses all 13 actual AD16 objective rows and
+their folded payload bars. It does not substitute arbitrary VMEC objectives.
+With these bars held fixed, it contracts finite secants of the transport
+geometry, normalization channels and native surfaces with exactly the bars
+whose cached JVP reconstructs the full saved parameter gradient.
+
+The checker reads the actual `fd_geometry_linearization_*.npz` from the new
+FD16 run. Before GPU initialization it requires its state, mask, parameters
+and named tangent to match the saved AD record byte-for-byte, and checks the
+AD/FD baseline. It then uses the original FD constructor, interrupting it
+immediately after native inputs are built and before NTX. It requires the
+zero, minus-h and plus-h geometries to reproduce the saved FD geometry arrays
+exactly. A mismatch aborts, rather than silently using a new reconstruction
+as the explanation of the earlier result.
+
+It applies the same step multipliers `1,3,10,30` to every input and objective.
+There are nine forward geometry/input evaluations and no equilibrium,
+implicit-linear-response, NTX coefficient, ambipolar-root or transport solve.
+It also performs no new AD sweep. This tests the geometry input map separately
+from the coefficient solve. Step sensitivity and a persistent derivative
+mismatch can then be investigated at that boundary; increasing h is not
+assumed to be uniformly better.
+
+`geometry_map_fd.csv` contains the saved AD gradient, reconstruction control,
+projected map FD, three input-group contributions and each relative difference
+`abs(map_FD-AD)/abs(AD)`. The printed output labels this `relative_to_ad`.
+The comparison against the previously saved full FD is defined only at the
+original h; larger-h rows leave that column empty. The checker also writes
+per-path contributions to `geometry_map_fields.csv`, the projected baseline/
+original-step input arrays to NPZ, and source/input hashes to `sources.txt`.
+The fixed bars are a local linearization: this check does not evaluate the
+nonlinear NTX coefficient map or a changed transport endpoint.
+
+Three new NumPy-only tests pass. An independent nonlinear input map checks
+all cost rows and groups against analytic secants, checks nonzero curvature
+at larger h, and rejects wrong cached derivatives or changed original-step
+geometry. Other tests reject unsupported paths, invalid arrays and a changed
+recorded spectral state before JAX is imported. The four existing pre-NTX
+endpoint tests also pass. No JAX or physics ran locally. GPU execution of
+this new geometry-only check is pending.
+
+After publishing these diagnostic files, run on the large machine:
+
+```bash
+(
+  cd "$HOME/NEOPAX" || exit 1
+  git switch en/v0_main || exit 1
+  git pull --ff-only origin en/v0_main || exit 1
+  neopax_case=outputs/ntss1d_zbs_saved_ad_geometry_2_versy_
+  neopax_out=$(mktemp -d "$neopax_case/geometry_input_fd_XXXXXX") || exit 1
+  set -o pipefail
+  env -u PYTHONPATH -u LD_LIBRARY_PATH -u JAX_PLATFORM_NAME \
+    -u XLA_FLAGS -u JAX_COMPILATION_CACHE_DIR -u XLA_PYTHON_CLIENT_ALLOCATOR \
+    JAX_PLATFORMS=cuda,cpu JAX_ENABLE_X64=true \
+    JAX_ENABLE_COMPILATION_CACHE=0 XLA_PYTHON_CLIENT_PREALLOCATE=false \
+    NTX_DISABLE_COMPILATION_CACHE=1 VMEX_COMPILATION_CACHE=disabled \
+    NEOPAX_TEST_RUNTIME_NTSS1D=1 \
+    "$HOME/jax_env/bin/python" examples/benchmarks/check_saved_geometry_payload_fd.py \
+    --run-dir "$neopax_case" --parameter ZBS:1:0 --out-dir "$neopax_out" \
+    2>&1 | tee "$neopax_out.log"
+) || printf '\nGeometry-input check stopped; terminal kept open.\n'
 ```
