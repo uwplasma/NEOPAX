@@ -66,7 +66,8 @@ def project(capture, direction):
     return np.asarray([math.fsum(r.values()) for r in rows]),rows,terms
 
 
-def run_sweep(build_inputs, *, capture, direction, parameter, report, references, out_dir):
+def run_sweep(build_inputs, *, capture, direction, parameter, report, references, out_dir,
+              step_scales=(1.,3.,10.,30.)):
     """NumPy-only bookkeeping around the supplied forward input constructor."""
     labels = report['objective_labels']
     params = [str(capture[f'parameter_labels[{i}]']) for i in range(capture['geometry_gradients'].shape[1])]
@@ -85,7 +86,7 @@ def run_sweep(build_inputs, *, capture, direction, parameter, report, references
     np.savez_compressed(out_dir/'payload_baseline.npz',**base)
     rows,field_rows = [],[]
     delta = float(report.get('baseline_value',0.))
-    for scale in (1.,3.,10.,30.):
+    for scale in step_scales:
         h = h0*scale
         print(f'[geometry-only] rebuilding input pair scale={scale:g}; no NTX solves',flush=True)
         minus = build_inputs((delta-h)-delta)
@@ -132,7 +133,15 @@ def main():
     parser.add_argument('--run-dir',type=Path,required=True,help='Completed FD16 run containing the shared AD reference')
     parser.add_argument('--out-dir',type=Path,required=True)
     parser.add_argument('--parameter',choices=('RBC:1:0','ZBS:1:0'),default='ZBS:1:0')
+    parser.add_argument('--native-precision',choices=('float64','extended'),default='float64')
+    parser.add_argument('--step-scales',default='1,3,10,30',help='Comma-separated positive FD multipliers; use 1 for only the original saved step')
     args = parser.parse_args()
+    try:
+        scales = tuple(float(value) for value in args.step_scales.split(','))
+        if not scales or not all(np.isfinite(value) and value > 0 for value in scales):
+            raise ValueError
+    except ValueError:
+        parser.error('--step-scales must contain positive finite numbers')
     if args.out_dir.exists() and any(args.out_dir.iterdir()):
         parser.error('Choose an empty output directory')
     snapshots = snapshot_directory(args.run_dir)
@@ -179,19 +188,22 @@ def main():
     context = forward._geometry_context_from_config(config,args.parameter)
     bundle = dict(context=context,n_r=int(config['geometry'].get('n_radial',51)),
         state_star=SpectralState(**{k:jnp.asarray(v) for k,v in fields(record,'state.').items()}),
-        state_tangent=SpectralState(**{k:jnp.asarray(v) for k,v in dot.items()}))
+        state_tangent=SpectralState(**{k:jnp.asarray(v) for k,v in dot.items()}),
+        native_precision=args.native_precision)
     args.out_dir.mkdir(parents=True,exist_ok=True)
-    provenance = [f'JAX={jax.__version__} device={jax.devices()[0]}']
+    provenance = [f'JAX={jax.__version__} device={jax.devices()[0]} native_precision={args.native_precision} step_scales={scales}']
     provenance_paths = (Path(geo.__file__),Path(forward.__file__),Path(__file__),args.run_dir/'config.toml',
         next((folder/'snapshots').glob('fd_geometry_linearization_*.npz')),
         next(snapshots.glob('ad_compact_geometry_*.npz')),next(snapshots.glob('ad_compact_tangents_*.npz')))
+    if args.native_precision == 'extended':
+        provenance_paths += (Path(__file__).with_name('_fd_native_precision.py'),)
     for path in provenance_paths:
         provenance.append(f'{path} sha256={hashlib.sha256(path.read_bytes()).hexdigest()}')
     (args.out_dir/'sources.txt').write_text('\n'.join(provenance)+'\n')
     print('[geometry-only] actual AD16 folded objective bars; no equilibrium/implicit/NTX/root/transport solve',flush=True)
     run_sweep(lambda step:collect_inputs(forward,geo,config,bundle,step),capture=capture,
         direction=captured_direction(tangents,args.parameter),parameter=args.parameter,
-        report=report,references=refs,out_dir=args.out_dir)
+        report=report,references=refs,out_dir=args.out_dir,step_scales=scales)
 
 
 if __name__ == '__main__':

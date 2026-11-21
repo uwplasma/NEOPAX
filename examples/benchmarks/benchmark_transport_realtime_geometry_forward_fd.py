@@ -1064,12 +1064,29 @@ def _runtime_for_frozen_linearized_geometry_step(
         bundle["state_star"],
         bundle["state_tangent"],
     )
-    runtime, state = build_runtime_context_for_vmec_state(
-        config,
-        bundle["context"],
-        state,
-        n_r=int(bundle["n_r"]),
-    )
+    precision_context = contextlib.nullcontext()
+    if bundle.get("native_precision") == "extended":
+        from unittest.mock import patch
+        from NEOPAX import _geometry_autodiff as geometry_module
+        from _fd_native_precision import NativePrecision
+        if "native_precision_evaluator" not in bundle:
+            bundle["native_precision_evaluator"] = NativePrecision(
+                geometry_module, bundle["state_star"], bundle["state_tangent"])
+        evaluator = bundle["native_precision_evaluator"]
+        def native_surfaces(context, vmec_state, *, s_values):
+            if not step_scale:
+                baseline = evaluator.original(context, vmec_state, s_values=s_values)
+                evaluator.remember(s_values, baseline)
+                return baseline
+            return evaluator.evaluate(context, step_scale, s_values=s_values)
+        precision_context = patch.object(geometry_module, "_traceable_vmec_surfaces_from_state", native_surfaces)
+    with precision_context:
+        runtime, state = build_runtime_context_for_vmec_state(
+            config,
+            bundle["context"],
+            state,
+            n_r=int(bundle["n_r"]),
+        )
     if fixed_initial_er is not None:
         state = dataclasses.replace(state, Er=jnp.asarray(fixed_initial_er, dtype=state.Er.dtype))
     return runtime, state
@@ -1443,11 +1460,17 @@ def main() -> None:
         help="Diagnostic: use saved AD initial Er after checking profiles/geometry/tables; require an exact baseline before FD endpoints.")
     parser.add_argument("--ad-geometry-reference", type=Path,
         help="Diagnostic: snapshot directory containing one AD compact geometry/tangent pair; reuse its exact VMEC state and parameter tangent without an equilibrium or implicit solve.")
+    parser.add_argument("--geometry-fd-native-precision", choices=("float64", "extended"), default="float64",
+        help="Use independent host extended-precision native VMEC field increments, recentered on the ordinary baseline. Does not use geometry AD or change the FD step.")
     parser.add_argument("--geometry-input-only-dir", type=Path,
         help="Capture original geometry/scan inputs without intermediate observers, then stop before NTX, roots or transport.")
     parser.add_argument("--geometry-input-reference", type=Path,
         help="With --geometry-input-only-dir, compare against a saved normalization_inputs_*.npz trace.")
     args = parser.parse_args()
+    if args.geometry_fd_native_precision == "extended" and (
+        args.parameter in PARAMETER_ORDER or args.geometry_fd_lane != "frozen_linearized"
+    ):
+        parser.error("Extended native precision requires a frozen_linearized geometry parameter")
     if args.ad_geometry_reference is not None and (
         not args.ad_geometry_reference.is_dir() or args.parameter in PARAMETER_ORDER
         or args.geometry_fd_lane != "frozen_linearized"
@@ -1493,6 +1516,11 @@ def main() -> None:
         ntx_exact_derivative_mode="direct",
         radau_jacobian_reuse_mode=args.radau_jacobian_reuse_mode,
     )
+    if args.geometry_fd_native_precision == "extended" and (
+        config.get("neoclassical", {}).get("flux_model") != "ntx_scan_runtime"
+        or config.get("neoclassical", {}).get("ntx_scan_surface_backend", "vmec") not in {"vmec", "vmec_jax"}
+    ):
+        parser.error("Extended native precision requires ntx_scan_runtime with native VMEC surfaces")
     if args.geometry_input_only_dir is not None and (
         config.get("neoclassical", {}).get("flux_model") != "ntx_scan_runtime"
         or config.get("geometry", {}).get("backend") not in {"vmec_jax_booz_xform_jax", "vmec_runtime", "vmec_realtime"}
@@ -1541,6 +1569,7 @@ def main() -> None:
                 baseline_delta=baseline_delta,
                 ad_geometry_reference=args.ad_geometry_reference,
             )
+            frozen_linearized_bundle["native_precision"] = args.geometry_fd_native_precision
             baseline_runtime, baseline_state = _runtime_for_frozen_linearized_geometry_step(
                 config,
                 frozen_linearized_bundle,
@@ -2254,6 +2283,7 @@ def main() -> None:
         "config_path": str(Path(args.config)),
         "ad_baseline_reference": None if args.ad_baseline_reference is None else str(args.ad_baseline_reference.resolve()),
         "ad_geometry_reference": None if args.ad_geometry_reference is None else str(args.ad_geometry_reference.resolve()),
+        "geometry_fd_native_precision": args.geometry_fd_native_precision,
         "parameter_name": parameter_name,
         "parameter_kind": parameter_kind,
         "baseline_value": float(baseline_value),

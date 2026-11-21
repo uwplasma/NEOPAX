@@ -731,7 +731,7 @@ at larger h, and rejects wrong cached derivatives or changed original-step
 geometry. Other tests reject unsupported paths, invalid arrays and a changed
 recorded spectral state before JAX is imported. The four existing pre-NTX
 endpoint tests also pass. No JAX or physics ran locally. GPU execution of
-this new geometry-only check is pending.
+this geometry-only check has now completed; see the result below.
 
 After publishing these diagnostic files, run on the large machine:
 
@@ -754,3 +754,449 @@ After publishing these diagnostic files, run on the large machine:
     2>&1 | tee "$neopax_out.log"
 ) || printf '\nGeometry-input check stopped; terminal kept open.\n'
 ```
+
+## Geometry-only sweep: native surface input FD dominates the remaining gap
+
+Run `geometry_input_fd_bQ2Z1t` under
+`outputs/ntss1d_zbs_saved_ad_geometry_2_versy_` completed at `a6afcc3` on JAX
+0.10.0/CUDA. Its preflight checks passed, including byte-identical baseline
+and original-step minus/plus geometry. There were no NTX coefficient, root,
+transport, equilibrium or implicit-response solves. It reused the actual AD16
+cost bars and checked all 13 objective rows. A standard-library readout
+independently verified all 52 printed relative differences at their printed
+precision and confirmed that the AD reference stayed unchanged across steps.
+
+These relative differences are `abs(geometry_map_FD-AD)/abs(AD)`, with the same
+multiplier for every objective and input, not percentages or full-transport
+FD errors at the larger steps:
+
+| Objective | h | 3h | 10h | 30h |
+| --- | ---: | ---: | ---: | ---: |
+| softmax_Er | `7.093370e-06` | `1.297093e-05` | `4.066287e-06` | `4.939542e-07` |
+| net_total_power_volume_average_mw_m3 | `9.607474e-07` | `5.591904e-07` | `1.760418e-07` | `9.336428e-09` |
+| Er_transition_left | `5.682992e-06` | `2.910831e-06` | `3.254192e-06` | `2.101201e-06` |
+| Er_transition_right | `2.769199e-06` | `2.133162e-06` | `1.614098e-06` | `1.940635e-06` |
+| Er2_volume_average | `2.529453e-05` | `4.496418e-06` | `3.597049e-07` | `8.464085e-08` |
+| Er_volume_average | `1.203892e-05` | `7.324737e-07` | `2.192127e-07` | `1.208383e-07` |
+| electron_temperature_volume_average_keV | `2.284889e-06` | `3.609252e-07` | `1.433240e-07` | `4.956710e-08` |
+| total_pressure_volume_average | `2.261780e-06` | `3.601831e-07` | `1.644115e-07` | `5.204319e-08` |
+| alpha_power_volume_average_mw_m3 | `1.068927e-06` | `5.469004e-07` | `1.769235e-07` | `1.297254e-08` |
+| bootstrap_current_softmax_abs_scaled | `4.221015e-05` | `1.171753e-05` | `6.581062e-06` | `8.730645e-07` |
+| Er_transition_rho | `2.271891e-06` | `6.275209e-06` | `7.090784e-07` | `1.720603e-07` |
+| Er_transition_location_moment | `2.271891e-06` | `6.275209e-06` | `7.090784e-07` | `1.720603e-07` |
+| Er_transition_strength | `1.276388e-06` | `2.698609e-06` | `6.834531e-07` | `1.610424e-07` |
+
+At the original h, the geometry-input map alone reproduces most of the full
+bootstrap and Er2 discrepancies. The signed derivative differences are:
+
+| Objective | Full FD minus AD | Input-map FD minus AD | Full FD minus input-map FD |
+| --- | ---: | ---: | ---: |
+| bootstrap_current_softmax_abs_scaled | `1.647363283e-04` | `1.512209250e-04` | `1.351540330e-05` |
+| Er2_volume_average | `-7.772153875e-03` | `-8.367543600e-03` | `5.953897247e-04` |
+
+The strong reduction and fluctuating signs with larger h support small-step
+finite-difference precision/cancellation in the upstream input construction
+as the main numerical explanation for these observed gaps. The left/right
+probe errors are less monotonic and are still about `2e-06` at 30h. This is
+not proof of exact AD for every input or of a universal best FD step.
+
+### Saved field contributions locate the native VMEC surfaces
+
+The CSV-only readout supplied in chat separates the three input groups.
+The entries below are signed FD-minus-AD contributions to the input-map
+derivative, not relative errors:
+
+| Objective | Input group | h | 30h |
+| --- | --- | ---: | ---: |
+| softmax_Er | geometry | `6.684934206e-07` | `-8.692424558e-10` |
+| softmax_Er | channels | `-3.836174400e-08` | `-2.180318148e-10` |
+| softmax_Er | surfaces | `-4.760686742e-05` | `-3.270186895e-06` |
+| Er2_volume_average | geometry | `-4.156917521e-05` | `1.560798637e-07` |
+| Er2_volume_average | channels | `1.299544792e-07` | `-4.117147512e-09` |
+| Er2_volume_average | surfaces | `-8.326104439e-03` | `2.784761159e-05` |
+| bootstrap_current_softmax_abs_scaled | geometry | `-1.557007305e-07` | `-5.013383375e-09` |
+| bootstrap_current_softmax_abs_scaled | channels | `-7.582476313e-10` | `1.551536677e-14` |
+| bootstrap_current_softmax_abs_scaled | surfaces | `1.513773836e-04` | `3.132830431e-06` |
+| Er_transition_rho | geometry | `-3.319018480e-10` | `-2.902521973e-13` |
+| Er_transition_rho | channels | `-3.920201316e-11` | `-9.558846770e-14` |
+| Er_transition_rho | surfaces | `-2.982149879e-08` | `2.287004868e-09` |
+
+The leading weighted errors are native-surface `b_cos` and
+`b_sup_theta_cos`. For Er2 at h, `surfaces[6].b_cos` contributes
+`-5.852596827e-03` and `surfaces[5].b_cos` contributes `-2.390727544e-03`.
+For bootstrap, `surfaces[5].b_cos` contributes `1.205430118e-04` and
+`surfaces[4].b_cos` contributes `5.072460803e-05`. These are sensitivity-weighted
+errors; large contributions need not imply large errors in the raw field
+values. Some large terms cancel, so a small total does not imply that every
+field derivative has individually converged.
+
+These arrays are constructed by
+`_traceable_vmec_field_tables_from_state` (VMEX real-space fields followed by
+Fourier projection) and `_traceable_vmec_surface_from_tables` (radial sampling
+into native surfaces). The former builds `bmnc` from magnetic-field magnitude
+and `bsupumnc` from the contravariant poloidal field; the latter exposes them
+as `b_cos` and `b_sup_theta_cos`. This evidence locates the sensitive input
+branch but does not isolate a single floating-point operation among field
+reconstruction, projection and interpolation.
+
+A source-only AST comparison of local `en/v0_new` at `117f797` and
+`en/v0_main` at `a6afcc3` found identical definitions for
+`_traceable_vmec_field_tables_from_state` and
+`_traceable_vmec_surfaces_from_state`. In `_traceable_vmec_surface_from_tables`,
+the only code difference is the already-recorded b0 correction from a maximum
+reduction to gathering the maximizing coefficient. The extraction formulas
+for the two dominant fields above are unchanged. This source check does not
+compare VMEX/JAX internals or establish that a particular JAX upgrade caused
+the changed FD behavior.
+
+No production physics, forward solver, AD rule or default FD step was changed
+in response. The main discrepancy is now reproducible before any NTX solve
+and diminishes substantially with a larger step. The full FD16 confirmation
+below also shows substantial improvement. Its results must be assessed
+separately from the input-map sweep because it includes nonlinear coefficient
+and transport effects. The earlier coefficient sweep also showed that
+excessively large steps can increase truncation error.
+
+Geometry-only sweep attachment SHA256:
+`04728f9b40f72fa09a4074f70aeebf0561cfe3bc606204d122d20f55782f2143`.
+
+### Full FD16 confirmation at the measured 30h step
+
+The full FD16 confirmation completed in
+`outputs/ntss1d_zbs_fd30h_1o6j_jep`, using the existing benchmark without
+another code change or AD run. It reused the same saved AD16 point, VMEC state
+and tangent, initial-root contract and frozen accepted-step replay contract.
+One uniform `--fd-rel-step 9e-6` was used for all 13 ZBS objective rows. This
+is 30 times the original relative increment; its absolute increment is
+approximately `1.018385556e-05` for this coefficient. The interpolation is
+`preprocessed_3d_radial_ntss1d` with 51 radial points and the runtime NTX grid
+`(25,31,64)`. These results concern `ZBS:1:0` only.
+
+The fresh initial Er matched saved AD before the reference override. The
+baseline initial state, terminal state and time matched AD exactly, with
+zero maximum support difference. The baseline had 16 accepted steps and 23
+attempts, ending at `4.1195452419569767e-04`. Both perturbed endpoints replayed
+16 accepted steps at those fixed timesteps, with no Newton retries or active
+nonconverged steps. All reported state and support arrays were finite.
+
+The table compares the original h and 30h full-transport FD errors against
+the unchanged AD16 reference. Both columns use `abs(AD-FD)/abs(FD)`, not the
+input-map sweep's `relative_to_ad` metric:
+
+| Objective | Full FD16 at h | Full FD16 at 30h |
+| --- | ---: | ---: |
+| softmax_Er | `6.241382e-06` | `1.298666e-07` |
+| net_total_power_volume_average_mw_m3 | `8.953810e-07` | `2.177318e-08` |
+| Er_transition_left | `1.300480e-05` | `6.451990e-06` |
+| Er_transition_right | `1.282220e-05` | `5.041166e-06` |
+| Er2_volume_average | `2.349415e-05` | `2.161232e-07` |
+| Er_volume_average | `1.330842e-05` | `1.870485e-06` |
+| electron_temperature_volume_average_keV | `2.278717e-06` | `4.969649e-08` |
+| total_pressure_volume_average | `2.257583e-06` | `4.145530e-08` |
+| alpha_power_volume_average_mw_m3 | `9.816440e-07` | `1.459823e-08` |
+| bootstrap_current_softmax_abs_scaled | `4.598480e-05` | `6.985355e-08` |
+| Er_transition_rho | `4.889824e-06` | `1.896401e-07` |
+| Er_transition_location_moment | `4.889824e-06` | `1.896401e-07` |
+| Er_transition_strength | `1.839022e-06` | `1.210307e-07` |
+
+The 13 printed relative errors were independently checked against the
+printed AD/FD gradients within their rounding precision, using only a
+standard-library readout. The run exited successfully after `40:01.37`.
+Maximum host RSS was `8,348,248 KiB`; this is not a measurement of GPU peak
+memory.
+
+Together with the geometry-only sweep, the large reduction in bootstrap and
+Er2 discrepancies supports small-step FD precision/cancellation in upstream
+native-surface construction as a major source of the earlier errors. The AD
+reference did not change. The left/right Er probes still differ by about
+`5e-06` to `6e-06`, and mean Er by `1.87e-06`. This is not an exact match for
+every cost or evidence of identical errors to the old branch. The full
+support-chain contraction should be checked on these new 30h snapshots to
+separate upstream secant errors from finite-step effects in the transport
+map; the successful h support-chain check does not automatically establish
+that result at 30h. No further simulation is needed for that readout.
+
+This is a validation point, not a change to the default FD step or a claim
+that 30h is the best step for every objective or transport prefix.
+
+Full FD16 attachment SHA256:
+`fedbc7e123036e5ed78b97abe3e5e9da1ea33e114d24720689f0caf1e73f1968`.
+
+Reproduction command:
+
+```bash
+(
+  cd "$HOME/NEOPAX" || exit 1
+  env -u PYTHONPATH -u LD_LIBRARY_PATH -u JAX_PLATFORM_NAME \
+    -u XLA_FLAGS -u JAX_COMPILATION_CACHE_DIR -u XLA_PYTHON_CLIENT_ALLOCATOR \
+    JAX_PLATFORMS=cuda,cpu JAX_ENABLE_X64=true \
+    JAX_ENABLE_COMPILATION_CACHE=0 XLA_PYTHON_CLIENT_PREALLOCATE=false \
+    NTX_DISABLE_COMPILATION_CACHE=1 VMEX_COMPILATION_CACHE=disabled \
+    NEOPAX_TEST_RUNTIME_NTSS1D=1 \
+    "$HOME/jax_env/bin/python" - <<'PY'
+from pathlib import Path
+import os, shutil, sys, tempfile
+sys.path.insert(0, 'examples/benchmarks')
+import benchmark_transport_ntss1d_ad_fd as check
+base = (check.ROOT/'outputs/ntss1d_zbs_saved_ad_geometry_2_versy_').resolve()
+snapshots = base/'ad/snapshots'
+terminals = list(snapshots.glob('ad_terminal_*.npz'))
+if len(terminals) != 1:
+    raise SystemExit('Expected exactly one saved AD terminal capture')
+out = Path(tempfile.mkdtemp(prefix='ntss1d_zbs_fd30h_', dir=check.ROOT/'outputs'))
+print('Results:', out, flush=True)
+shutil.copy2(base/'config.toml', out/'config.toml')
+(out/'ad').symlink_to((base/'ad').resolve(), target_is_directory=True)
+command = [sys.executable, check.FD_SCRIPT, '--config', str(out/'config.toml'),
+    '--parameter', 'ZBS:1:0', '--accepted-step-limit', '16', *check.FD_OPTIONS,
+    '--fd-rel-step', '9e-6', '--fd-abs-step', '1e-10',
+    '--ad-geometry-reference', str(snapshots),
+    '--ad-baseline-reference', str(terminals[0])]
+check.worker(command, out/'fd_ZBS_1_0', os.environ)
+shutil.copy2(check.FD_REPORTS/'ZBS_1_0_forward_fd_frozen_linearized_summary.json',
+             out/'fd_ZBS_1_0/summary.json')
+rows = check.compare(out)
+if not rows or not all(r['comparison_baseline_matches'] for r in rows):
+    raise SystemExit('Baseline mismatch: gradient comparison is not validated')
+for r in rows:
+    print(f"{r['objective']}: AD={r['gradient_ad']:.12e} FD={r['gradient_fd']:.12e} "
+          f"relative_error={r['relative_difference_to_fd']:.6e}")
+PY
+) || printf '\nLarger-step FD check stopped; terminal kept open.\n'
+```
+
+## Original-step arithmetic isolation on saved spectral data
+
+A subsequent NumPy-only source-algebra replay kept the original
+`h=3.3946185202503675e-07`. It used the existing local
+`axis_fix_saved_arrays_20261116_RPTPxK/ad_snapshots` capture: the actual
+201-surface, 72-mode equilibrium and its saved ZBS tangent and objective
+bars. This is an earlier generic-interpolation AD16 capture, not a local
+copy of the latest NTSS1D run. The numerical results below therefore must
+not be presented as that run's complete gradient errors.
+
+The scratch replay executes selected VMEX functions' source ASTs with a
+NumPy array namespace and functional copies replacing JAX indexed updates.
+It loads no JAX/NTX/VMEX modules and performs no equilibrium, implicit,
+coefficient, root or transport solve. It retains the benchmark's six
+poloidal modes, six toroidal modes, angular grid `(10,16)`, zero pressure,
+zero-current constraint, flux and original cubic Hermite radial sampling.
+The numerical experiment compares float64 arithmetic with NumPy
+`longdouble` (63 mantissa bits on this host, not IEEE binary128), using the
+same double-precision saved inputs and step. It is an independent algebra
+check, not a reproduction of CUDA kernels or their reduction ordering.
+
+### Perturbation addition already changes the realized direction
+
+With the original double-precision update used by FD,
+
+```
+x_plus  = float64(x + h*v)
+x_minus = float64(x - h*v)
+```
+
+the realized secant `(x_plus-x_minus)/(2*h)` is not exactly `v`, even when
+the captured baseline and intended tangent match byte-for-byte. Examples
+from this saved ZBS direction:
+
+| State field | Largest absolute direction error | Location (radial row, mode) |
+| --- | ---: | --- |
+| R_cos | `2.610084343e-09` | `(48,0)` |
+| Z_sin | `1.306524521e-09` | `(45,1)` |
+| L_sin | `3.080474764e-11` | `(200,1)` |
+
+At the first location the stored coordinate is `12.048933794228684`, the
+intended direction is `-0.06278770474858161`, and the realized secant is
+`-0.06278770213849727`. This is input rounding, not a different VMEC solve
+or a changed perturbation label.
+
+### Half-mesh radial differencing amplifies the small errors
+
+`vmex.core.geometry.half_mesh_jacobian` forms radial differences after
+real-space synthesis, including
+
+```
+rs_inner = ((R_even[j]-R_even[j-1])
+            + sh*(R_odd[j]-R_odd[j-1])) / hs
+```
+
+The equilibrium has `hs=1/200`; transport's 51-point grid does not set this
+spacing. On the seven sampled interior regions, the main-source float64
+FD secant differs from the extended-precision secant by relative L2
+`2.782592012e-08` in `R_even`, growing to `6.746020854e-06` in `dR_ds`.
+The corresponding maximum absolute differences are `8.783184197e-09` and
+`2.659368819e-06`. This then changes the Jacobian, contravariant fields and
+the projected native-surface coefficients.
+
+At the same original h, native-surface coefficient secants agree much more
+closely with the actual cached AD tangent when both perturbation addition
+and field algebra use extended precision:
+
+| Main-source surface field | Float64: max abs(secant - cached AD) | Extended precision: max abs(secant - cached AD) |
+| --- | ---: | ---: |
+| surface[5].b_cos | `1.600030096e-05` | `2.236664580e-09` |
+| surface[5].b_sup_theta_cos | `1.151732694e-06` | `1.927326333e-10` |
+| surface[6].b_cos | `5.267079912e-06` | `2.573963673e-09` |
+
+These are absolute coefficient-direction errors, not relative errors of
+full cost gradients. The bootstrap-weighted sum over all captured native
+surface fields changes from `1.255848171e-04` to `-5.045387896e-08` in
+signed FD-minus-AD contribution units. If only the state additions are
+rounded to float64 and the rest of the field calculation stays in extended
+precision, a `5.151033244e-05` bootstrap contribution gap returns.
+Rounding only `R_cos` gives `4.290833453e-05`, only `Z_sin` gives
+`8.542887373e-06`, and only `L_sin` gives `-4.492635623e-08`.
+Thus input quantization as well as subsequent arithmetic contributes.
+
+### What the old/main source comparison does and does not establish
+
+VMEX `en/local_test` uses a single phase-table contraction over signed
+helical modes. `en/neopax-main-utilities` repacks those coefficients and
+contracts toroidal and poloidal modes separately, including parity slices.
+This changes floating-point reduction order before the radial subtraction.
+On the *same captured main point*, NumPy execution of the old source also
+shows a float64 FD gap and a strong extended-precision improvement: its
+bootstrap native contribution gap is `1.741371605e-04` in float64 and
+`-8.598171243e-08` in extended precision. Main is not systematically worse
+in this independent calculation. This does not reproduce the old JAX
+0.7.2/CUDA benchmark and does not identify a JAX-version regression.
+
+A scratch variant that differences the spectral coefficients before
+synthesis reduces the main Er2 native contribution gap from
+`-4.536946143e-03` to `-8.772464021e-05`, but leaves a bootstrap gap of
+`5.527101428e-05`, consistent with remaining state-addition rounding.
+It is not a complete fix and was not applied to either production repository.
+
+The concrete mechanism reproduced here is loss of precision while forming
+and radially differentiating perturbed coordinates, before NTX or transport.
+It explains why a byte-identical baseline/intended direction is insufficient
+to certify a small-h FD reference. It does not establish that all remaining
+NTSS1D/CUDA errors share that cause. Production physics, time integration,
+AD rules and default FD increments remain unchanged.
+
+## Applied correction: preserve native-field increments at the original h
+
+The FD benchmark now accepts `--geometry-fd-native-precision extended`.
+It addresses the demonstrated precision loss in the validation reference;
+it is not a change to the production transport solver or reverse AD rule.
+The ordinary `float64` mode remains available and is the default so archived
+comparisons retain their original meaning. The chosen mode is saved in the
+FD report. It requires frozen-linearized geometry with native VMEC scan
+surfaces and a host whose `longdouble` is wider than float64; unsupported
+precision or configurations raise an error rather than silently falling back.
+
+`_fd_native_precision.py` executes the existing forward field functions in
+copied namespaces with a NumPy extended-precision array backend. It does
+not modify imported VMEX/NEOPAX modules or use a JVP/VJP to construct
+endpoints. The only separately expressed numerical rule is the same local
+cubic Hermite interpolation (arithmetic-mean adjacent slopes) used by
+`interpax` at these fixed radial queries. Its linear, interior quadratic
+and extrapolation behavior are independently checked.
+
+Both state addition and field reconstruction stay in extended precision
+until the native-surface finite increments are computed. For each field,
+
+```
+corrected_endpoint = ordinary_baseline
+                   + (extended_forward(x + h*v) - extended_forward(x))
+```
+
+The subtraction and addition above are performed in extended precision
+before the final result is cast back to the ordinary field's dtype. This
+recentring preserves the exact common CUDA baseline and excludes a static
+CPU/CUDA evaluation offset from the measured increment. It does not force
+an endpoint, derivative or cost to match AD. At zero step the hook returns
+the original surface arrays unchanged and remembers those exact objects
+used by the baseline scan. It performs no extended-precision evaluation.
+This avoids a second CUDA reconstruction when choosing the anchoring
+baseline. Recorded solver/replay metadata follow their original code path.
+
+The correction is deliberately limited to native VMEC surface inputs.
+Transport geometry and normalization channels retain their ordinary
+evaluation, and NTX coefficient construction, interpolation, initial-root
+linearization and accepted-step replay are unchanged. Their residual
+numerical errors are not removed by this option.
+
+### Saved-state verification before any new CUDA solve
+
+The helper itself was exercised on the actual saved equilibrium, tangent
+and all 13 objective bars from the earlier local generic AD16 capture,
+with the original `h=3.3946185202503675e-07`. The ordinary baseline remained
+byte-identical. Signed discrepancies of the *native-surface contribution*
+against the cached AD input directions were:
+
+| Objective | Ordinary float64 | Corrected, same original h |
+| --- | ---: | ---: |
+| softmax_Er | `4.021459880e-05` | `5.142721975e-08` |
+| net_total_power_volume_average_mw_m3 | `-4.379574555e-09` | `2.508268577e-12` |
+| Er_transition_left | `8.505867673e-05` | `9.160274125e-11` |
+| Er_transition_right | `7.920196296e-05` | `7.674621105e-09` |
+| Er2_volume_average | `-4.536946143e-03` | `-8.989954815e-07` |
+| Er_volume_average | `1.335733308e-04` | `2.853634644e-08` |
+| electron_temperature_volume_average_keV | `4.148143274e-09` | `-1.590191176e-13` |
+| total_pressure_volume_average | `5.937849814e-09` | `-1.679862356e-12` |
+| alpha_power_volume_average_mw_m3 | `-4.325671847e-09` | `2.479276067e-12` |
+| bootstrap_current_softmax_abs_scaled | `1.255848171e-04` | `-5.312602071e-08` |
+| Er_transition_rho | `2.593124034e-10` | `1.006688579e-11` |
+| Er_transition_location_moment | `2.593124036e-10` | `1.006688579e-11` |
+| Er_transition_strength | `2.330074807e-07` | `-1.871006909e-10` |
+
+These are absolute signed contribution errors, not full AD16/FD16 relative
+errors and not results from the latest NTSS1D CUDA run. Four new NumPy-only
+tests pass, covering the source-function backend, independent interpolation
+and nonlinear derivative oracles, preservation of baseline/displacement,
+and the actual FD runtime hook including its zero-step/default paths.
+The existing 11 baseline/replay and 3 geometry-map tests also pass without
+JAX imports. CUDA integration and the resulting full FD16 gradients remain
+unverified locally.
+
+After publishing the changes, the existing geometry-only checker can
+verify this correction on the current NTSS1D capture at *only the original
+step*, before committing time or memory to another transport run:
+
+Publish only the five intended files from the local `en/v0_main` checkout
+(the index may contain unrelated staged scratch files):
+
+```bash
+(
+  cd /mnt/d/Github_Codes/NEOPAX-v0_main || exit 1
+  git switch en/v0_main || exit 1
+  neopax_files=(
+    examples/benchmarks/_fd_native_precision.py
+    examples/benchmarks/benchmark_transport_realtime_geometry_forward_fd.py
+    examples/benchmarks/check_saved_geometry_payload_fd.py
+    tests/test_fd_native_precision.py
+    docs/benchmarks/ntx_weighted_table_derivative.md
+  )
+  git add -- "${neopax_files[@]}" || exit 1
+  git commit --only -m "Preserve native geometry increments in frozen FD checks" -- "${neopax_files[@]}" || exit 1
+  git push origin en/v0_main
+) || printf '\nPublish stopped; terminal kept open.\n'
+```
+
+On the large machine:
+
+```bash
+(
+  cd "$HOME/NEOPAX" || exit 1
+  git pull --ff-only origin en/v0_main || exit 1
+  neopax_case=outputs/ntss1d_zbs_saved_ad_geometry_2_versy_
+  neopax_out=$(mktemp -d "$neopax_case/native_precision_fix_XXXXXX") || exit 1
+  set -o pipefail
+  env -u PYTHONPATH -u LD_LIBRARY_PATH -u JAX_PLATFORM_NAME \
+    -u XLA_FLAGS -u JAX_COMPILATION_CACHE_DIR -u XLA_PYTHON_CLIENT_ALLOCATOR \
+    JAX_PLATFORMS=cuda,cpu JAX_ENABLE_X64=true \
+    JAX_ENABLE_COMPILATION_CACHE=0 XLA_PYTHON_CLIENT_PREALLOCATE=false \
+    NTX_DISABLE_COMPILATION_CACHE=1 VMEX_COMPILATION_CACHE=disabled \
+    NEOPAX_TEST_RUNTIME_NTSS1D=1 \
+    "$HOME/jax_env/bin/python" examples/benchmarks/check_saved_geometry_payload_fd.py \
+    --run-dir "$neopax_case" --parameter ZBS:1:0 \
+    --native-precision extended --step-scales 1 --out-dir "$neopax_out" \
+    2>&1 | tee "$neopax_out.log"
+) || printf '\nNative precision verification stopped; terminal kept open.\n'
+```
+
+It uses the saved state and tangent, with no equilibrium, implicit, NTX,
+root or transport solve. For the later full FD16 confirmation, the existing
+FD command takes `--geometry-fd-native-precision extended` at the original
+`--fd-rel-step 3e-7`; the same AD16 reference and all frozen contracts apply.
