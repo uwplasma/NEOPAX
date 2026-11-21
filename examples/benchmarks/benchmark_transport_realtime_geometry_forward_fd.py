@@ -912,12 +912,62 @@ def _manual_implicit_forward_state_tangent(
     )[1]
 
 
+def _saved_ad_geometry_linearization(context, entries, baseline_delta, geom_cfg, reference):
+    """Restore the actual AD primal/direction; do not solve VMEX again."""
+    from NEOPAX._geometry_autodiff import (
+        GeometryRawBlockSolve, _current_implicit_params_cfg_for_param_vector,
+    )
+    from vmex.core.solver import SpectralState
+    from check_saved_compact_geometry_gradient import named_arrays
+    from check_saved_transport_baseline_repeatability import read_one
+
+    capture = read_one(reference, "ad_compact_geometry_*.npz")
+    tangents = read_one(reference, "ad_compact_tangents_*.npz")
+    labels = [str(tangents[f"parameter_labels[{i}]"])
+              for i in range(sum(k.startswith("parameter_labels[") for k in tangents))]
+    if len(labels) != len(set(labels)) or labels != [str(capture[f"parameter_labels[{i}]"])
+                  for i in range(sum(k.startswith("parameter_labels[") for k in capture))]:
+        raise ValueError("Saved AD geometry/tangent parameter labels differ")
+    entry = entries[0]
+    label = f"{entry['family']}:{entry['m']}:{entry['n']}"
+    column = labels.index(label)
+    mode = normalize_vmec_response_mode(context.vmec_response_mode)
+    if str(capture.get("vmec_response_mode", "raw_block")) != mode:
+        raise ValueError("Saved AD geometry response mode differs from FD configuration")
+    if capture["payload_bars[0]['geometry'].r_grid"].size != int(geom_cfg.get("n_radial", 51)):
+        raise ValueError("Saved AD radial resolution differs from FD configuration")
+    implicit, params, cfg = _current_implicit_params_cfg_for_param_vector(
+        context, jnp.asarray([baseline_delta], dtype=jnp.float64), entries,
+        max_iter=geom_cfg.get("vmec_max_iter"),
+        solver_device=str(geom_cfg.get("vmec_implicit_solver_device", "default")))
+    for field in dataclasses.fields(params):
+        a, b = np.asarray(getattr(params, field.name)), capture["params."+field.name]
+        if a.shape != b.shape or a.dtype != b.dtype or a.tobytes() != b.tobytes():
+            raise ValueError(f"Saved AD VMEC parameters differ from FD: {field.name}")
+    state = named_arrays(capture, "state.")
+    mask = named_arrays(capture, "mask.")
+    dots = named_arrays(tangents, "state_tangents.")
+    names = {f.name for f in dataclasses.fields(SpectralState)}
+    if any(set(values) != names for values in (state, mask, dots)):
+        raise ValueError("Saved AD spectral state/mask/tangent fields differ")
+    for name in names:
+        if (dots[name].shape != (len(labels), *state[name].shape)
+            or dots[name].dtype != state[name].dtype or mask[name].shape != state[name].shape
+            or any(not np.isfinite(values[name]).all() for values in (state, mask, dots))):
+            raise ValueError(f"Invalid saved AD geometry linearization: {name}")
+    restore = lambda values: SpectralState(**{k:jnp.asarray(v) for k,v in values.items()})
+    raw = GeometryRawBlockSolve(implicit, params, cfg, restore(state), restore(mask), tuple(entries),
+                               vmec_response_mode=mode)
+    return raw, restore({k:v[column] for k,v in dots.items()})
+
+
 def _frozen_linearized_vmec_geometry_bundle(
     config: dict[str, Any],
     geometry_parameter: str,
     *,
     baseline_delta: float,
     retain_raw_solve: bool = False,
+    ad_geometry_reference: Path | None = None,
 ):
     geom_cfg = config.get("geometry", {})
     geometry_context = _geometry_context_from_config(config, geometry_parameter)
@@ -928,8 +978,10 @@ def _frozen_linearized_vmec_geometry_bundle(
     (entry,) = boundary_param_entries(geometry_context, specs)
     solver_device = str(geom_cfg.get("vmec_implicit_solver_device", "default"))
     lane = str(geom_cfg.get("vmec_lane", "forward")).strip().lower()
+    if ad_geometry_reference is not None and lane != "ad":
+        raise ValueError("--ad-geometry-reference requires the VMEC ad lane")
     print(
-        f"[autodiff-gate] progress: baseline VMEC {lane} solve for "
+        f"[autodiff-gate] progress: baseline VMEC {lane} {'saved linearization' if ad_geometry_reference is not None else 'solve'} for "
         "frozen-linearized geometry FD "
         f"(mboz={geometry_context.mboz}, nboz={geometry_context.nboz})",
         flush=True,
@@ -938,13 +990,17 @@ def _frozen_linearized_vmec_geometry_bundle(
         # Reuse the AD benchmark's primal/configuration/mask as one unit.
         # A separate private _dof_mask call uses VMEX's default force evaluator,
         # which can select a Pallas path unsupported by the installed JAX GPU.
-        raw_solve = geometry_raw_block_solve_from_param_vector(
-            geometry_context,
-            jnp.asarray([baseline_delta], dtype=jnp.float64),
-            specs,
-            max_iter=geom_cfg.get("vmec_max_iter"),
-            solver_device=solver_device,
-        )
+        if ad_geometry_reference is not None:
+            raw_solve, state_tangent = _saved_ad_geometry_linearization(
+                geometry_context, (entry,), baseline_delta, geom_cfg, ad_geometry_reference)
+        else:
+            raw_solve = geometry_raw_block_solve_from_param_vector(
+                geometry_context,
+                jnp.asarray([baseline_delta], dtype=jnp.float64),
+                specs,
+                max_iter=geom_cfg.get("vmec_max_iter"),
+                solver_device=solver_device,
+            )
         params, cfg = raw_solve.implicit_params, raw_solve.implicit_cfg
         state_star, dof_mask = raw_solve.state, raw_solve.dof_mask
     else:
@@ -971,15 +1027,20 @@ def _frozen_linearized_vmec_geometry_bundle(
                 "to form a raw-block tangent at the forward VMEC state."
             )
         dof_mask = im._dof_mask(state_star, im.runtime_from_params(params, cfg), cfg)
-    param_tangent = _param_unit_tangent_like(params, entry)
-    state_tangent = _manual_implicit_forward_state_tangent(
-        params=params,
-        param_tangent=param_tangent,
-        cfg=cfg,
-        x_star=state_star,
-        dof_mask=dof_mask,
+    if ad_geometry_reference is None:
+        param_tangent = _param_unit_tangent_like(params, entry)
+        state_tangent = _manual_implicit_forward_state_tangent(
+            params=params,
+            param_tangent=param_tangent,
+            cfg=cfg,
+            x_star=state_star,
+            dof_mask=dof_mask,
+            vmec_response_mode=geometry_context.vmec_response_mode,
+        )
+    save_gradient_audit("fd_geometry_linearization", parameter_label=str(geometry_parameter),
+        state=state_star, state_tangent=state_tangent, mask=dof_mask, params=params,
         vmec_response_mode=geometry_context.vmec_response_mode,
-    )
+        ad_geometry_reference=None if ad_geometry_reference is None else str(ad_geometry_reference.resolve()))
     coefficient_value = float(entry["baseline_coefficient"]) + float(baseline_delta)
     return {
         "context": geometry_context,
@@ -1380,11 +1441,18 @@ def main() -> None:
     )
     parser.add_argument("--ad-baseline-reference", type=Path,
         help="Diagnostic: use saved AD initial Er after checking profiles/geometry/tables; require an exact baseline before FD endpoints.")
+    parser.add_argument("--ad-geometry-reference", type=Path,
+        help="Diagnostic: snapshot directory containing one AD compact geometry/tangent pair; reuse its exact VMEC state and parameter tangent without an equilibrium or implicit solve.")
     parser.add_argument("--geometry-input-only-dir", type=Path,
         help="Capture original geometry/scan inputs without intermediate observers, then stop before NTX, roots or transport.")
     parser.add_argument("--geometry-input-reference", type=Path,
         help="With --geometry-input-only-dir, compare against a saved normalization_inputs_*.npz trace.")
     args = parser.parse_args()
+    if args.ad_geometry_reference is not None and (
+        not args.ad_geometry_reference.is_dir() or args.parameter in PARAMETER_ORDER
+        or args.geometry_fd_lane != "frozen_linearized"
+    ):
+        parser.error("--ad-geometry-reference requires a snapshot directory and a frozen_linearized geometry parameter")
     if args.ad_baseline_reference is not None and (
         not args.ad_baseline_reference.is_file() or args.initial_er_root_only_fd
         or args.geometry_input_only_dir is not None
@@ -1471,6 +1539,7 @@ def main() -> None:
                 config,
                 parameter_name,
                 baseline_delta=baseline_delta,
+                ad_geometry_reference=args.ad_geometry_reference,
             )
             baseline_runtime, baseline_state = _runtime_for_frozen_linearized_geometry_step(
                 config,
@@ -2184,6 +2253,7 @@ def main() -> None:
         "mode": "transport_realtime_geometry_forward_fd",
         "config_path": str(Path(args.config)),
         "ad_baseline_reference": None if args.ad_baseline_reference is None else str(args.ad_baseline_reference.resolve()),
+        "ad_geometry_reference": None if args.ad_geometry_reference is None else str(args.ad_geometry_reference.resolve()),
         "parameter_name": parameter_name,
         "parameter_kind": parameter_kind,
         "baseline_value": float(baseline_value),

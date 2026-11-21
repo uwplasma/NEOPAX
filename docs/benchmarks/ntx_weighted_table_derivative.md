@@ -333,7 +333,8 @@ does not change any production implementation, controller or replay contract.
 The default selects six previously identified nodes on three radii. It runs
 nine full single-radius scans (three endpoints on each radius), plus scalar
 and coefficient-JVP controls at those six nodes. It is not a transport run or
-a new full-table derivative validation. Its GPU execution is still pending.
+a new full-table derivative validation. GPU execution completed at commit
+`35430f1`; the result is recorded below.
 
 `endpoint_gaps.csv` gives a signed telescoping budget in derivative units:
 
@@ -390,3 +391,181 @@ After publishing the diagnostic, run on the large machine:
 The log stays outside the new output directory so it is still empty when the
 script checks it. The six selected points are defaults; the complete endpoint
 tables at their three radii are retained for further saved-array analysis.
+
+## Endpoint audit result: 2026-11-20
+
+The supplied GPU log contains all 18 coefficient rows and all 13 weighted
+objective budgets. It uses JAX 0.10.0, CUDA and
+`h=3.39461852025036750e-07`. The saved AD/FD baseline checks and reconstructed
+zero-step geometry guard passed. A standard-library readout verified that
+the five signed components sum to every printed total within rounding error.
+The log does not include the exact output subdirectory, timing or memory
+measurements. The new `sources.txt` and NPZ/CSV files remain on the remote
+machine; their additional contents have not yet been read.
+
+The following are signed contributions to objective derivatives at the six
+selected nodes, not relative errors or complete objective-gradient gaps:
+
+| Objective | Cached/current AD control | Geometry input secant | Scalar coefficient FD | Scalar versus scan | Fresh versus archived FD | Selected-node total |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| softmax_Er | `7.146570e-12` | `1.154426e-04` | `1.566293e-05` | `-1.800617e-08` | `-1.137530e-04` | `1.733452e-05` |
+| Er2_volume_average | `4.884435e-11` | `3.016728e-03` | `2.085807e-04` | `5.532240e-06` | `2.935963e-03` | `6.166804e-03` |
+| bootstrap_current_softmax_abs_scaled | `1.258304e-11` | `-2.905206e-06` | `1.107222e-05` | `-4.176763e-07` | `-1.978814e-04` | `-1.901320e-04` |
+
+The controlled AD-input JVP still agrees with its cached reference. For these
+weighted contributions, changing scalar execution to the full scan with
+identical numerical endpoints is much smaller than the unresolved gap.
+The Er2 contribution has substantial geometry-input-secant and endpoint
+reproduction terms. The selected bootstrap discrepancy is dominated by the
+failure of the fresh perturbed tables to reproduce the archived FD tables.
+The softmax terms partially cancel, so the final small total must not be
+mistaken for individually small errors at every boundary.
+
+This does not establish nondeterminism for identical inputs: the original
+FD run did not save its complete native scan surfaces/channels or VMEC state
+tangent. The audit reuses the captured AD equilibrium and the checked repeat
+of the FD tangent. Its exact zero-step transport geometry is a useful control,
+but does not establish byte-identical perturbed native inputs. Likewise, the
+`upstream_gap` combines finite-step geometry bias and floating-point effects;
+the single step does not separate them. No faulty transport derivative or
+NTX custom derivative follows from this result.
+
+The already-written `baseline_inputs.npz`, `minus_inputs.npz`, `plus_inputs.npz`
+and `endpoint_gaps.csv` permit the next boundary comparison without another
+simulation: compare fresh versus archived transport geometry at zero/minus/
+plus, then read the scalar/scan baseline offsets and both endpoint offsets.
+This distinguishes changed known geometry inputs from coefficient differences
+and exposes whether the new coefficient baseline itself reproduces the old
+one. Matching transport geometry alone would still leave the unsaved native
+scan inputs unresolved. That NumPy-only readout has now completed, as recorded
+below.
+
+Supplied attachment SHA256:
+`261219941270256ead90a4c8d5bd7586d115b34066025f25480dba2adbfa9318`.
+
+## Saved input readout: perturbed geometry already differs before NTX
+
+The completed audit directory is
+`outputs/ntss1d_zbs_support_chain_UfR8XG/geometry_endpoint_audit_6CAHcL`.
+Its zero-step geometry matches the archived FD geometry in all 25 arrays.
+All 18 sampled production-scan baseline coefficient values also match exactly.
+At both the minus and plus endpoints, however, 20 of the 25 transport-geometry
+arrays already differ from the archived FD values:
+
+| Field | Minus: maximum absolute difference | Plus: maximum absolute difference |
+| --- | ---: | ---: |
+| a_b | `2.220446049e-16` | `2.220446049e-16` |
+| B0 | `9.290346270e-13` | `8.935074902e-13` |
+| Vprime | `1.090256774e-10` | `4.979483492e-11` |
+| B0prime | `3.394096948e-10` | `8.558162790e-10` |
+| enlogation | `4.019877764e-09` | `2.529997545e-09` |
+
+These are input-array differences, not gradient relative errors. This locates
+a changed boundary before NTX and prevents interpreting the archived/fresh
+coefficient difference as a nondeterministic NTX solve on identical inputs.
+The output does not establish whether the old equilibrium, old tangent or
+their subsequent floating-point evaluation first differed: the original FD
+did not record its VMEC linearization. The first known changed boundary is
+the perturbed transport geometry, not a proven earlier spectral-state defect.
+
+The corresponding coefficient offsets are small in value but amplified by
+division by `2h`. For table D13 at node `4:2:6`, the fresh-minus-archived value
+offsets are `6.149235079e-10` at minus and `-4.809385078e-10` at plus. Therefore
+the change in its FD derivative is
+
+```math
+\frac{-4.809385078\times10^{-10}-6.149235079\times10^{-10}}
+     {2(3.3946185202503675\times10^{-7})}
+=-1.614116592428\times10^{-3}.
+```
+
+This independently reproduces the audit's `reproduction_gap` at that node.
+It explains the arithmetic amplification of changed endpoint values, not
+the entire origin of those changes or the complete objective gradient.
+The scalar baseline differs from the scan by up to `1.196820421e-12` at the
+sampled cells, while the production-scan baseline offsets are all zero.
+The newly supplied source manifest matches the known geometry, VMEX and NTX
+sources, including the sequential scan implementation hash
+`f63cd55041f9d2441ca087d856faa0a0c71f5c3f4b17b8a03464b5248afd9a55`.
+Attachment SHA256:
+`42f6a303fea21c26bbaca4d69ae0a25842e11ebbdbbfb3e1a087082a02a9415e`.
+
+## Reuse the recorded AD VMEC linearization in the original FD benchmark
+
+The ordinary frozen-linearized FD constructor still independently solves the
+baseline VMEC equilibrium and then its selected parameter tangent. The endpoint
+audit instead used the saved AD equilibrium and a checked repeat of the FD
+tangent. Matching final zero-step support does not prove that these underlying
+linearizations are byte-identical at perturbed points.
+
+The FD benchmark now has an optional `--ad-geometry-reference SNAPSHOT_DIR`.
+It restores the actual AD spectral state, mask and the named tangent column
+from one adjacent `ad_compact_geometry_*.npz` / `ad_compact_tangents_*.npz` pair.
+It checks parameter labels, VMEC response mode, radial resolution, every
+constructed VMEC parameter's shape/dtype/bytes, and finite compatible spectral
+arrays. There is no equilibrium or implicit solve on this path. The original
+`state_star +/- h*state_tangent` endpoint constructor, NTX scans, root contract,
+Radau accepted-step map, and objective evaluation are retained. The default
+path continues to make its existing solves.
+
+When gradient capture is enabled, both paths now save
+`fd_geometry_linearization_*.npz` with the actual state, tangent, mask, params
+and reference provenance. Future comparisons need not reconstruct this missing
+boundary after the fact. Full FD reports also record `ad_geometry_reference`.
+Use the existing `--ad-baseline-reference` simultaneously to retain the strict
+common initial-root/baseline guard.
+
+Eighteen NumPy-only tests pass, including the actual benchmark helper and CLI
+wiring with mocks, rejected mismatched references and unchanged default solve
+calls. An additional NumPy-only check restored the state and both named tangent
+columns byte-for-byte from a real archived AD capture. No JAX or physics ran
+locally. GPU validation of this new option is pending; it removes independent
+VMEC reconstruction from the comparison and is not a claimed cure for all
+finite-difference roundoff or truncation errors.
+
+After publishing, the following reuses the existing AD16 result and runs only
+the original ZBS FD16 benchmark with the recorded AD geometry linearization.
+It retains the existing root and accepted-step frozen-metadata contracts and
+prints all 13 full parameter-gradient comparisons:
+
+```bash
+(
+  cd "$HOME/NEOPAX" || exit 1
+  git switch en/v0_main || exit 1
+  git pull --ff-only origin en/v0_main || exit 1
+  env -u PYTHONPATH -u LD_LIBRARY_PATH -u JAX_PLATFORM_NAME \
+    -u XLA_FLAGS -u JAX_COMPILATION_CACHE_DIR -u XLA_PYTHON_CLIENT_ALLOCATOR \
+    JAX_PLATFORMS=cuda,cpu JAX_ENABLE_X64=true \
+    JAX_ENABLE_COMPILATION_CACHE=0 XLA_PYTHON_CLIENT_PREALLOCATE=false \
+    NTX_DISABLE_COMPILATION_CACHE=1 VMEX_COMPILATION_CACHE=disabled \
+    NEOPAX_TEST_RUNTIME_NTSS1D=1 \
+    "$HOME/jax_env/bin/python" - <<'PY'
+from pathlib import Path
+import os, shutil, sys, tempfile
+sys.path.insert(0, 'examples/benchmarks')
+import benchmark_transport_ntss1d_ad_fd as check
+base = (check.ROOT/'outputs/ntss1d_zbs_support_chain_UfR8XG').resolve()
+snapshots = base/'ad/snapshots'
+terminals = list(snapshots.glob('ad_terminal_*.npz'))
+if len(terminals) != 1:
+    raise SystemExit('Expected exactly one saved AD terminal capture')
+out = Path(tempfile.mkdtemp(prefix='ntss1d_zbs_saved_ad_geometry_', dir=check.ROOT/'outputs'))
+print('Results:', out, flush=True)
+shutil.copy2(base/'config.toml', out/'config.toml')
+(out/'ad').symlink_to((base/'ad').resolve(), target_is_directory=True)
+command = [sys.executable, check.FD_SCRIPT, '--config', str(out/'config.toml'),
+    '--parameter', 'ZBS:1:0', '--accepted-step-limit', '16', *check.FD_OPTIONS,
+    '--ad-geometry-reference', str(snapshots),
+    '--ad-baseline-reference', str(terminals[0])]
+check.worker(command, out/'fd_ZBS_1_0', os.environ)
+shutil.copy2(check.FD_REPORTS/'ZBS_1_0_forward_fd_frozen_linearized_summary.json',
+             out/'fd_ZBS_1_0/summary.json')
+rows = check.compare(out)
+if not rows or not all(r['comparison_baseline_matches'] for r in rows):
+    raise SystemExit('Baseline mismatch: gradient comparison is not validated')
+for r in rows:
+    print(f"{r['objective']}: AD={r['gradient_ad']:.12e} FD={r['gradient_fd']:.12e} "
+          f"relative_error={r['relative_difference_to_fd']:.6e}")
+PY
+) || printf '\nSaved-geometry FD check stopped; terminal kept open.\n'
+```

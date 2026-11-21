@@ -24,6 +24,93 @@ _jax_after = "jax" in sys.modules
 
 
 class SavedBaselineTests(unittest.TestCase):
+    def test_saved_ad_geometry_reuses_exact_state_and_named_direction_without_solves(self):
+        source = SCRIPT.with_name('benchmark_transport_realtime_geometry_forward_fd.py')
+        names = ('_saved_ad_geometry_linearization','_frozen_linearized_vmec_geometry_bundle')
+        functions = [n for n in ast.parse(source.read_text()).body
+                     if isinstance(n,ast.FunctionDef) and n.name in names]
+        State = dataclasses.make_dataclass('State',[('R_cos',object),('L_sin',object)])
+        Params = dataclasses.make_dataclass('Params',[('boundary',object)])
+        Raw = dataclasses.make_dataclass('Raw',[(n,object) for n in
+            ('implicit','implicit_params','implicit_cfg','state','dof_mask','param_entries','vmec_response_mode')])
+        params = Params(np.asarray([0.,2.]))
+        state = State(np.asarray([3.,4.]),np.asarray([5.,6.]))
+        mask = State(np.asarray([True,False]),np.asarray([True,True]))
+        tangent = State(np.asarray([.1,.2]),np.asarray([.3,.4]))
+        entry = dict(family='ZBS',m=1,n=0,baseline_coefficient=2.)
+        context = SimpleNamespace(vmec_response_mode='raw_block',mboz=36,nboz=11)
+        cfg,implicit = object(),object()
+        construct = Mock(return_value=(implicit,params,cfg))
+        raw = Raw(implicit,params,cfg,state,mask,(entry,),'raw_block')
+        solve,linearize,record = Mock(return_value=raw),Mock(return_value=tangent),Mock()
+        namespace = dict(np=np,jnp=np,Path=Path,Any=object,dataclasses=dataclasses,
+            normalize_vmec_response_mode=lambda x:x,
+            _geometry_context_from_config=lambda *a:context,
+            _geometry_param_specs_from_parameter_name=lambda p:(('ZBS',1,0),),
+            boundary_param_entries=lambda *a:(entry,),geometry_raw_block_solve_from_param_vector=solve,
+            _manual_implicit_forward_state_tangent=linearize,_param_unit_tangent_like=lambda *a:object(),
+            save_gradient_audit=record)
+        exec(compile(ast.Module(body=functions,type_ignores=[]),str(source),'exec'),namespace)
+        modules = {'NEOPAX._geometry_autodiff':SimpleNamespace(GeometryRawBlockSolve=Raw,
+                _current_implicit_params_cfg_for_param_vector=construct),
+            'vmex.core.solver':SimpleNamespace(SpectralState=State),
+            'check_saved_transport_baseline_repeatability':check,
+            'check_saved_compact_geometry_gradient':SimpleNamespace(named_arrays=lambda a,p:
+                {k[len(p):]:v for k,v in a.items() if k.startswith(p) and '.' not in k[len(p):]})}
+        config = dict(geometry=dict(vmec_lane='ad',n_radial=3))
+        with tempfile.TemporaryDirectory() as directory,patch.dict(sys.modules,modules),contextlib.redirect_stdout(io.StringIO()):
+            folder = Path(directory)
+            capture = {'parameter_labels[0]':np.asarray('RBC:1:0'),
+                'parameter_labels[1]':np.asarray('ZBS:1:0'),'vmec_response_mode':np.asarray('raw_block'),
+                "payload_bars[0]['geometry'].r_grid":np.arange(3.),'params.boundary':params.boundary}
+            dots = {'parameter_labels[0]':np.asarray('RBC:1:0'),'parameter_labels[1]':np.asarray('ZBS:1:0')}
+            for f in dataclasses.fields(State):
+                capture['state.'+f.name] = getattr(state,f.name)
+                capture['mask.'+f.name] = getattr(mask,f.name)
+                dots['state_tangents.'+f.name] = np.stack((np.ones(2)*7.,getattr(tangent,f.name)))
+            def write(a=capture,b=dots):
+                np.savez(folder/'ad_compact_geometry_one.npz',**a)
+                np.savez(folder/'ad_compact_tangents_one.npz',**b)
+            write()
+            bundle = namespace['_frozen_linearized_vmec_geometry_bundle'](config,'ZBS:1:0',
+                baseline_delta=0.,retain_raw_solve=True,ad_geometry_reference=folder)
+            for f in dataclasses.fields(State):
+                np.testing.assert_array_equal(getattr(bundle['state_star'],f.name),getattr(state,f.name))
+                np.testing.assert_array_equal(getattr(bundle['state_tangent'],f.name),getattr(tangent,f.name))
+            self.assertIs(bundle['raw_block_solve'].implicit_cfg,cfg)
+            self.assertEqual(bundle['coefficient_value'],2.)
+            solve.assert_not_called();linearize.assert_not_called()
+            self.assertEqual(record.call_args.args,('fd_geometry_linearization',))
+            self.assertEqual(record.call_args.kwargs['ad_geometry_reference'],str(folder.resolve()))
+            construct.assert_called_once()
+            # Reject incompatible references, including signed zero and dtype.
+            for bad in (
+                dict(capture,**{'params.boundary':np.asarray([1.,3.])}),
+                dict(capture,**{'params.boundary':np.asarray([-0.,2.])}),
+                dict(capture,**{'params.boundary':params.boundary.astype(np.float32)}),
+                dict(capture,vmec_response_mode=np.asarray('main')),
+                dict(capture,**{'state.R_cos':np.asarray([np.nan,4.])}),
+                dict(capture,**{'mask.R_cos':np.asarray([True])}),
+                dict(capture,**{"payload_bars[0]['geometry'].r_grid":np.arange(4.)}),
+            ):
+                write(bad)
+                with self.assertRaises(ValueError):
+                    namespace['_frozen_linearized_vmec_geometry_bundle'](config,'ZBS:1:0',baseline_delta=0.,ad_geometry_reference=folder)
+            write(capture,dict(dots,**{'parameter_labels[1]':np.asarray('wrong')}))
+            with self.assertRaisesRegex(ValueError,'labels'):
+                namespace['_frozen_linearized_vmec_geometry_bundle'](config,'ZBS:1:0',baseline_delta=0.,ad_geometry_reference=folder)
+            write(capture,dict(dots,**{'state_tangents.R_cos':np.ones((1,2))}))
+            with self.assertRaisesRegex(ValueError,'linearization'):
+                namespace['_frozen_linearized_vmec_geometry_bundle'](config,'ZBS:1:0',baseline_delta=0.,ad_geometry_reference=folder)
+            with self.assertRaisesRegex(ValueError,'ad lane'):
+                namespace['_frozen_linearized_vmec_geometry_bundle']({'geometry':{'vmec_lane':'forward'}},'ZBS:1:0',baseline_delta=0.,ad_geometry_reference=folder)
+            solve.assert_not_called();linearize.assert_not_called()
+            # No opt-in flag: retain the existing equilibrium and tangent calls.
+            bundle = namespace['_frozen_linearized_vmec_geometry_bundle'](config,'ZBS:1:0',baseline_delta=0.)
+            self.assertIs(bundle['state_star'],state)
+            self.assertIs(bundle['state_tangent'],tangent)
+            solve.assert_called_once();linearize.assert_called_once()
+
     def test_ad_reference_changes_only_er_and_requires_an_exact_forward_baseline(self):
         @dataclasses.dataclass
         class Geometry:
@@ -352,11 +439,14 @@ class SavedBaselineTests(unittest.TestCase):
                          "--fd-accepted-replay-contract", "reverse_frozen_metadata"]
             with patch.dict(sys.modules, {"check_saved_transport_baseline_repeatability":
                                           SimpleNamespace(capture_fresh_baseline=capture)}), \
-                 patch.object(sys, "argv", arguments + ["--baseline-only-dir", directory]), \
+                 patch.object(sys, "argv", arguments + ["--ad-geometry-reference", directory,
+                                                        "--baseline-only-dir", directory]), \
                  contextlib.redirect_stdout(io.StringIO()):
                 namespace["main"]()
             schedule.assert_called_once_with(config, runtime, state,
                                             accepted_step_limit=16, capture_newton_setup=True)
+            namespace['_frozen_linearized_vmec_geometry_bundle'].assert_called_once_with(
+                config,'ZBS:1:0',baseline_delta=0.,ad_geometry_reference=Path(directory))
             self.assertEqual(capture.call_args.kwargs["parameter_name"], "ZBS:1:0")
             self.assertIs(capture.call_args.kwargs["prepared"], prepared)
             self.assertIs(capture.call_args.kwargs["rollout"], rollout)
