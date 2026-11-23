@@ -20,6 +20,44 @@ spec.loader.exec_module(replay)
 
 
 class PointReplayTests(unittest.TestCase):
+    def test_prepare_only_parent_uses_four_fresh_contexts_and_rejects_remaining_drift(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory)
+            for drift in (False,True):
+                out=root/str(drift)
+                commands=[]
+                class Process:
+                    def __init__(self, command, **kwargs):
+                        commands.append(command)
+                        folder=Path(command[command.index('--out-dir')+1])
+                        mode=command[command.index('--worker')+1]
+                        folder.mkdir(parents=True)
+                        value=np.ones(2)
+                        if drift and mode=='production_1':
+                            value[0]=np.nextafter(1.,2.)
+                        np.savez(folder/'fresh_prepared.npz',**{'prepared.geometry.b':value})
+                        self.stdout=iter(['preparation saved\n'])
+                    def __enter__(self): return self
+                    def __exit__(self,*args): pass
+                    def wait(self): return 0
+                argv=['replay','--fd-run',str(root),'--input-reference',str(root),
+                    '--ad-dir',str(root),'--source-metadata',str(root/'metadata.json'),
+                    '--out-dir',str(out),'--prepare-only']
+                with patch.object(replay,'preflight',return_value=None),patch.object(replay.subprocess,'Popen',Process), \
+                     patch.object(sys,'argv',argv),redirect_stdout(io.StringIO()):
+                    if drift:
+                        with self.assertRaisesRegex(ValueError,'preparation still differs'):
+                            replay.main()
+                    else:
+                        replay.main()
+                self.assertEqual(len(commands),4)
+                for command,layout in zip(commands,('point','point','production','production'),strict=True):
+                    self.assertIn('--prepare-only',command)
+                    self.assertNotIn('--frozen-prepared',command)
+                    self.assertEqual(command[command.index('--scan-layout')+1],layout)
+                self.assertTrue((out/'preparation_comparison.csv').is_file())
+        self.assertNotIn('jax',sys.modules)
+
     def test_worker_replays_saved_preparation_through_flat_arguments_without_global_options(self):
         class Ready(np.ndarray):
             def block_until_ready(self):
@@ -52,6 +90,7 @@ class PointReplayTests(unittest.TestCase):
             'ntx.geometry':SimpleNamespace(VmecSurface=lambda **values:SimpleNamespace(**values)),
             'ntx':SimpleNamespace(GridSpec=lambda **values:SimpleNamespace(**values),prepare_monoenergetic_system=prepare),
             'ntx._solver_scan':SimpleNamespace(_scan_coefficients_sequential_impl=scan),
+            'ntx._geometry':SimpleNamespace(__file__=str(FILE),_sum_fourier_modes=lambda value:value),
             'NEOPAX._transport_flux_models':SimpleNamespace(_build_ntx_field_channels=lambda *args:(None,np.asarray([[.2,.3,.4]]),None))}
         # import jax.numpy also resolves numpy as an attribute of the fake parent.
         modules['jax'].numpy = np
@@ -68,7 +107,7 @@ class PointReplayTests(unittest.TestCase):
                 folder = root/mode
                 folder.mkdir()
                 args = SimpleNamespace(point=(0,0,0),out_dir=folder,worker=mode,
-                    frozen_prepared=None if mode=='native_1' else root/'native_1',scan_layout='point',repeats=2)
+                    frozen_prepared=None if mode=='native_1' else root/'native_1',scan_layout='point',repeats=2,prepare_only=False)
                 replay.worker(args,(config,expected,reference,expected,inputs))
                 with np.load(folder/'result.npz') as result:
                     np.testing.assert_array_equal(result['table_0'],[np.log10(8.),6.,.5])
@@ -81,7 +120,7 @@ class PointReplayTests(unittest.TestCase):
             folder = root/'production'
             folder.mkdir()
             args = SimpleNamespace(point=(0,1,2),out_dir=folder,worker='native_1',
-                frozen_prepared=root/'native_1',scan_layout='production',repeats=1)
+                frozen_prepared=root/'native_1',scan_layout='production',repeats=1,prepare_only=False)
             expected = {key:np.ones((1,2,3)) for key in expected}
             replay.worker(args,(config,expected,reference,expected,inputs))
             with np.load(folder/'result.npz') as z:
@@ -90,6 +129,14 @@ class PointReplayTests(unittest.TestCase):
                 self.assertEqual(float(z['table_0'][1]),16.)
                 self.assertEqual(z['scan_coefficients_0'].shape,(6,5))
                 self.assertNotIn('coefficients_1',z.files)
+            folder = root/'preparation_only'
+            folder.mkdir()
+            args = SimpleNamespace(point=(0,1,2),out_dir=folder,worker='native_1',
+                frozen_prepared=None,scan_layout='production',repeats=1,prepare_only=True)
+            replay.worker(args,(config,expected,reference,expected,inputs))
+            self.assertTrue((folder/'fresh_prepared.npz').is_file())
+            self.assertFalse((folder/'compiled_hlo.txt').exists())
+            self.assertFalse((folder/'result.npz').exists())
         self.assertEqual(compiled_options,[{},{},{'xla_gpu_deterministic_ops':True},{}])
         self.assertEqual(before,dict(replay.os.environ))
         self.assertNotIn('jax',sys.modules)

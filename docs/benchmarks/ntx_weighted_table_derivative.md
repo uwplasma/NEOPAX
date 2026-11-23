@@ -1598,3 +1598,74 @@ After publishing the script/test/documentation update:
     2>&1 | tee "$neopax_out.log"
 ) || printf '\nProduction-row replay stopped; terminal kept open.\n'
 ```
+
+### Production-row result and isolated Fourier candidate
+
+The CUDA production-row replay at `90353e1` returned
+`raw_D13=2.9023985030284756e+00` and
+`table_D13=1.9534380617407261e+00` on the frozen prepared arrays. Its
+absolute difference from archived AD was `6.830038757e-10`; the archived FD
+gap remained `2.531144173e-03`. Changing the scan length on these fixed
+arrays therefore did not reproduce the large archived discrepancy.
+
+Before restoring those frozen arrays, this process reported nine different
+fresh preparation fields: `b`, both covariant and both contravariant field
+components, `d_b_dtheta`, `d_b_dzeta`, `jacobian`, and
+`radial_drift_spatial`. The first eight are produced by NTX's Fourier
+evaluation; the drift is derived from them. The angular grids and derivative
+matrices were not reported as different. The original failing full FD build
+did not capture its prepared matrices, so this does not yet prove that the
+same arithmetic operation caused its table discrepancy.
+
+An isolated NTX candidate, `en/neopax-stable-fourier`, is based on
+`en/neopax-main-utilities` at `4f7aa88`. It replaces the Fourier mode reductions
+with explicit pairwise addition trees and local optimization barriers. The
+phase expression, equations, grid, coefficient normalization, linear solver,
+and custom AD rules are unchanged. This is a candidate for removing
+context-sensitive summation roundoff, not a verified numerical fix. It is
+kept outside the existing utilities checkout until tested.
+
+Three NumPy-only candidate tests passed, including a 162-mode scalar Fourier
+oracle and both angular derivatives. The optional GPU test is enabled with
+`NTX_TEST_ORDERED_FOURIER_GPU=1`; it checks JIT, JVP and the existing native
+coefficient transpose. That GPU test has not been run locally. No timing or
+memory improvement is claimed.
+
+The NEOPAX diagnostic now supports `--prepare-only`. It starts four sequential
+fresh processes: two point contexts and two production scan contexts. Each
+stops after preparation; there are no coefficient, equilibrium, root,
+transport, AD or FD solves. It saves every prepared array, source path/hash,
+and the presence of the candidate helper (`ordered_sum=True/False`). It
+prints field differences and magnitudes, writes `preparation_comparison.csv`,
+and fails if any preparation differs byte-for-byte. It never substitutes
+frozen matrices in this mode. Five NumPy/mock diagnostic tests pass.
+
+Use the same command before and after switching NTX to the candidate branch;
+choose a new empty output directory for each run:
+
+```bash
+(
+  cd "$HOME/NEOPAX" || exit 1
+  neopax_out=$(mktemp -d outputs/ntx_fresh_preparation_XXXXXX) || exit 1
+  set -o pipefail
+  env -u PYTHONPATH -u LD_LIBRARY_PATH -u JAX_PLATFORM_NAME \
+    -u XLA_FLAGS -u JAX_COMPILATION_CACHE_DIR -u XLA_PYTHON_CLIENT_ALLOCATOR \
+    JAX_PLATFORMS=cuda,cpu JAX_ENABLE_X64=true \
+    JAX_ENABLE_COMPILATION_CACHE=0 XLA_PYTHON_CLIENT_PREALLOCATE=false \
+    NTX_DISABLE_COMPILATION_CACHE=1 \
+    "$HOME/jax_env/bin/python" \
+    examples/benchmarks/check_saved_ntx_point_repeatability.py \
+    --fd-run outputs/ntss1d_zbs_fd16_nativefix_auto_qhrxybz6 \
+    --input-reference outputs/zbs_auto_geometry_WGuHfQ \
+    --ad-dir outputs/ntss1d_zbs_saved_ad_geometry_2_versy_/ad/snapshots \
+    --source-metadata outputs/ntss1d_zbs_input_paths_k4RToS/ad/metadata.json \
+    --point 6:0:7 --prepare-only --out-dir "$neopax_out" \
+    2>&1 | tee "$neopax_out.log"
+) || printf '\nFresh preparation check stopped; terminal kept open.\n'
+```
+
+Matching fresh arrays would validate this preparation boundary only. If the
+unmodified run does not reproduce the drift, this control cannot establish
+that the candidate fixed it. Full coefficient and AD16/FD16 validation still
+requires fresh common baselines after any arithmetic change; archived AD
+tables must not be forced into a new baseline.

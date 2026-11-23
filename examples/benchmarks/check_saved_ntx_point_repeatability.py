@@ -82,6 +82,27 @@ def normalized(coefficients, drds, nu):
                        coefficients[2]*drds, coefficients[3]*nu))
 
 
+def compare_preparations(results, out_dir):
+    base = next(iter(results.values()))
+    rows = []
+    for mode, arrays in results.items():
+        changed = changes(base, arrays)
+        print(f'[ntx-point] {mode} prepared_differing_fields={changed}',flush=True)
+        for key in changed or ['all']:
+            delta = 0. if key=='all' else float('nan')
+            if key in base and key in arrays and base[key].shape==arrays[key].shape:
+                delta = float(np.max(np.abs(base[key].astype(float)-arrays[key].astype(float)),initial=0.))
+            rows.append(dict(worker=mode,field=key,bitwise_equal=not changed,max_abs_difference=delta))
+            if changed:
+                print(f'[ntx-point] {mode} {key} max_abs_difference={delta:.16e}',flush=True)
+    with (out_dir/'preparation_comparison.csv').open('w',newline='') as stream:
+        writer=csv.DictWriter(stream,fieldnames=list(rows[0]))
+        writer.writeheader()
+        writer.writerows(rows)
+    if any(not row['bitwise_equal'] for row in rows):
+        raise ValueError('Fresh NTX preparation still differs across the tested contexts; saved arrays retained')
+
+
 def worker(args, data):
     config, fd, reference, ad, inputs = data
     # GPU work exists only behind the explicit worker boundary.
@@ -94,6 +115,12 @@ def worker(args, data):
     from ntx import GridSpec, prepare_monoenergetic_system
     from ntx._solver_scan import _scan_coefficients_sequential_impl
     from NEOPAX._transport_flux_models import _build_ntx_field_channels
+    geometry_module = importlib.import_module('ntx._geometry')
+    geometry_path = Path(geometry_module.__file__)
+    provenance = (f"geometry_source={geometry_path} sha256={hashlib.sha256(geometry_path.read_bytes()).hexdigest()} "
+                  f"ordered_sum={hasattr(geometry_module,'_sum_fourier_modes')}")
+    (args.out_dir/'geometry_source.txt').write_text(provenance+'\n')
+    print('[ntx-point] '+provenance,flush=True)
 
     r, n, e = args.point
     prefix = re.compile(r"trace\['\d+_surfaces'\]\["+str(r)+r"\]\['([^']+)'\]")
@@ -129,6 +156,9 @@ def worker(args, data):
         f"{name}\t{type(value).__name__}\tweak={getattr(value,'weak_type','python')}"
         f"\tdevice={getattr(value,'device','python')}\tcommitted={getattr(value,'committed','python')}"
         for name,value in zip(names,leaves,strict=True))+'\n')
+    if args.prepare_only:
+        print(f'[ntx-point] preparation saved: {len(arrays)} fields; no coefficient solve',flush=True)
+        return
     if args.frozen_prepared is not None:
         frozen = read_one(args.frozen_prepared, 'fresh_prepared.npz')
         if set(frozen) != set(arrays) or any(frozen[key].shape != value.shape or frozen[key].dtype != value.dtype
@@ -181,9 +211,12 @@ def main():
     parser.add_argument('--scan-layout',choices=('point','production'),default='point',
         help='Replay one entry or the original full nu/Er scan on this one prepared surface')
     parser.add_argument('--repeats',type=int,default=2,help='Executions of each compiled scan')
+    parser.add_argument('--prepare-only',action='store_true',
+        help='Compare fresh preparation in point/production contexts; stop before coefficient solves')
     parser.add_argument('--deterministic-control', action='store_true',
         help='Also test a kernel-local deterministic compilation; changes no production or environment options')
-    parser.add_argument('--worker', choices=('native_1','native_2','controlled_1','controlled_2'), help=argparse.SUPPRESS)
+    parser.add_argument('--worker', choices=('native_1','native_2','controlled_1','controlled_2',
+        'point_1','point_2','production_1','production_2'), help=argparse.SUPPRESS)
     parser.add_argument('--frozen-prepared', type=Path, help=argparse.SUPPRESS)
     args = parser.parse_args()
     args.point = tuple(int(value) for value in args.point.split(':'))
@@ -191,6 +224,8 @@ def main():
         parser.error('--point requires three indices')
     if args.repeats < 1:
         parser.error('--repeats must be positive')
+    if args.prepare_only and (args.frozen_prepared is not None or args.deterministic_control):
+        parser.error('--prepare-only requires fresh inputs without a coefficient compilation control')
     data = preflight(args)
     if args.out_dir.exists() and any(args.out_dir.iterdir()):
         parser.error('Choose an empty output directory')
@@ -202,15 +237,19 @@ def main():
     common = [sys.executable, str(Path(__file__).resolve()), '--fd-run', str(args.fd_run.resolve()),
         '--input-reference', str(args.input_reference.resolve()), '--ad-dir', str(args.ad_dir.resolve()),
         '--source-metadata', str(args.source_metadata.resolve()), '--point', ':'.join(map(str,args.point)),
-        '--scan-layout',args.scan_layout,'--repeats',str(args.repeats)]
-    modes = ['native_1','native_2'] + (['controlled_1','controlled_2'] if args.deterministic_control else [])
+        '--repeats',str(args.repeats)]
+    modes = (['point_1','point_2','production_1','production_2'] if args.prepare_only else
+        ['native_1','native_2'] + (['controlled_1','controlled_2'] if args.deterministic_control else []))
     results = {}
     env = {key:value for key,value in os.environ.items() if key not in ('PYTHONPATH','JAX_COMPILATION_CACHE_DIR')}
     env.update(JAX_ENABLE_COMPILATION_CACHE='0', NTX_DISABLE_COMPILATION_CACHE='1',
                JAX_ENABLE_X64='true', XLA_PYTHON_CLIENT_PREALLOCATE='false')
     for mode in modes:
-        command = [*common, '--out-dir', str((args.out_dir/mode).resolve()), '--worker', mode]
-        if mode != 'native_1':
+        layout=('production' if mode.startswith('production') else 'point') if args.prepare_only else args.scan_layout
+        command = [*common, '--out-dir', str((args.out_dir/mode).resolve()), '--worker', mode,'--scan-layout',layout]
+        if args.prepare_only:
+            command += ['--prepare-only']
+        elif mode != 'native_1':
             command += ['--frozen-prepared', str((args.out_dir/'native_1').resolve())]
         print(f'[ntx-point] starting {mode}; one saved surface/point; log={args.out_dir/(mode+".log")}', flush=True)
         with (args.out_dir/(mode+'.log')).open('w') as log:
@@ -223,7 +262,10 @@ def main():
                 status = process.wait()
         if status:
             raise RuntimeError(f'{mode} failed; see {args.out_dir/(mode+".log")}')
-        results[mode] = read_one(args.out_dir/mode, 'result.npz')
+        results[mode] = read_one(args.out_dir/mode, 'fresh_prepared.npz' if args.prepare_only else 'result.npz')
+    if args.prepare_only:
+        compare_preparations(results,args.out_dir)
+        return
     base = read_one(args.out_dir/'native_1', 'fresh_prepared.npz')
     rows = []
     for mode, result in results.items():
