@@ -1127,22 +1127,24 @@ against the cached AD input directions were:
 
 | Objective | Ordinary float64 | Corrected, same original h |
 | --- | ---: | ---: |
-| softmax_Er | `4.021459880e-05` | `5.142721975e-08` |
-| net_total_power_volume_average_mw_m3 | `-4.379574555e-09` | `2.508268577e-12` |
-| Er_transition_left | `8.505867673e-05` | `9.160274125e-11` |
-| Er_transition_right | `7.920196296e-05` | `7.674621105e-09` |
-| Er2_volume_average | `-4.536946143e-03` | `-8.989954815e-07` |
-| Er_volume_average | `1.335733308e-04` | `2.853634644e-08` |
-| electron_temperature_volume_average_keV | `4.148143274e-09` | `-1.590191176e-13` |
-| total_pressure_volume_average | `5.937849814e-09` | `-1.679862356e-12` |
-| alpha_power_volume_average_mw_m3 | `-4.325671847e-09` | `2.479276067e-12` |
-| bootstrap_current_softmax_abs_scaled | `1.255848171e-04` | `-5.312602071e-08` |
-| Er_transition_rho | `2.593124034e-10` | `1.006688579e-11` |
-| Er_transition_location_moment | `2.593124036e-10` | `1.006688579e-11` |
-| Er_transition_strength | `2.330074807e-07` | `-1.871006909e-10` |
+| softmax_Er | `4.021459880e-05` | `3.747713753e-08` |
+| net_total_power_volume_average_mw_m3 | `-4.379574555e-09` | `2.557398063e-12` |
+| Er_transition_left | `8.505867673e-05` | `1.506046783e-09` |
+| Er_transition_right | `7.920196296e-05` | `6.982253482e-09` |
+| Er2_volume_average | `-4.536946143e-03` | `-9.150915515e-07` |
+| Er_volume_average | `1.335733308e-04` | `2.534813189e-08` |
+| electron_temperature_volume_average_keV | `4.148143274e-09` | `-3.388874557e-13` |
+| total_pressure_volume_average | `5.937849814e-09` | `-1.653951438e-12` |
+| alpha_power_volume_average_mw_m3 | `-4.325671847e-09` | `2.527700865e-12` |
+| bootstrap_current_softmax_abs_scaled | `1.255848171e-04` | `-5.322614018e-08` |
+| Er_transition_rho | `2.593124034e-10` | `7.079154961e-12` |
+| Er_transition_location_moment | `2.593124036e-10` | `7.079154961e-12` |
+| Er_transition_strength | `2.330074807e-07` | `3.625366766e-10` |
 
 These are absolute signed contribution errors, not full AD16/FD16 relative
-errors and not results from the latest NTSS1D CUDA run. Four new NumPy-only
+errors and not results from the latest NTSS1D CUDA run. The table was
+recomputed after the nested-call traversal correction described below.
+Five new NumPy-only
 tests pass, covering the source-function backend, independent interpolation
 and nonlinear derivative oracles, preservation of baseline/displacement,
 and the actual FD runtime hook including its zero-step/default paths.
@@ -1200,3 +1202,28 @@ It uses the saved state and tangent, with no equilibrium, implicit, NTX,
 root or transport solve. For the later full FD16 confirmation, the existing
 FD command takes `--geometry-fd-native-precision extended` at the original
 `--fd-rel-step 3e-7`; the same AD16 reference and all frozen contracts apply.
+
+### First CUDA verification: missed generator dependency corrected
+
+The run at `66492e3` passed preparation and began the original-step minus
+input evaluation, but failed before any new comparison rows. Inside VMEX's
+`fourier_to_real`, `_toroidal_stage` is referenced by a generator expression.
+The namespace copier inspected only the outer function's `co_names`;
+generator/nested-function code objects have separate name tables. The
+uncopied `_toroidal_stage` therefore called JAX `concatenate` with host
+extended-precision arrays, which JAX correctly rejected as `float128`.
+This is a precision-helper bug, not a reported gradient mismatch.
+
+The focused correction recursively collects names from nested `CodeType`
+constants before copying dependencies. A new regression uses nested
+functions and comprehensions with an original backend that explicitly
+rejects extended inputs. It reproduces the reported failure before the
+patch and passes after it, while asserting that the original namespace
+was not mutated. All five precision regressions now pass without JAX.
+
+The earlier local saved-state wrapper used NumPy for original functions,
+which masked this backend leak; it was not a substitute for the CUDA
+integration check. After the traversal fix, the actual saved-state check
+again completes all 13 rows with an exact baseline; its updated results
+are in the table above. CUDA verification still requires rerunning the
+same original-step command in a fresh output directory.

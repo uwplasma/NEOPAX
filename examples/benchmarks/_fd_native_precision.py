@@ -8,7 +8,7 @@ as a parameter perturbation. This changes benchmark endpoint arithmetic only.
 from __future__ import annotations
 
 import dataclasses
-from types import FunctionType, SimpleNamespace
+from types import CodeType, FunctionType, SimpleNamespace
 
 import numpy as np
 
@@ -98,7 +98,13 @@ def extended_forward(function, import_vmec_module):
         result = FunctionType(fn.__code__, namespace, fn.__name__, fn.__defaults__, fn.__closure__)
         result.__kwdefaults__ = fn.__kwdefaults__
         cache[fn] = result
-        for name in fn.__code__.co_names:
+        # Comprehensions and nested functions own separate code objects.
+        names, pending = set(), [fn.__code__]
+        while pending:
+            code = pending.pop()
+            names.update(code.co_names)
+            pending.extend(value for value in code.co_consts if isinstance(value, CodeType))
+        for name in names:
             value = namespace.get(name)
             if isinstance(value, FunctionType) and 'jnp' in value.__globals__:
                 namespace[name] = copy(value)

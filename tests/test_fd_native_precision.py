@@ -33,6 +33,26 @@ class Surface:
 
 
 class NativePrecisionTests(unittest.TestCase):
+    def test_nested_comprehensions_cannot_call_original_array_backend(self):
+        legacy = Mock(side_effect=TypeError('float128 reached the original JAX backend'))
+        namespace = {'jnp':SimpleNamespace(concatenate=legacy)}
+        exec('''
+def stage(x):
+    return jnp.concatenate((x, x), axis=-1)
+def forward(rows):
+    def nested():
+        return [stage(row) for row in rows]
+    return tuple(value for value in nested())
+''', namespace)
+        copy = precision.extended_forward(namespace['forward'], lambda name: None)
+        value = np.asarray([[1., 2.], [3., 4.]], dtype=np.longdouble)
+        output = copy(value)
+        np.testing.assert_array_equal(output, [[1.,2.,1.,2.],[3.,4.,3.,4.]])
+        self.assertTrue(all(row.dtype == np.longdouble for row in output))
+        self.assertIsNot(copy.__globals__['stage'], namespace['stage'])
+        self.assertIs(namespace['jnp'].concatenate, legacy)
+        legacy.assert_not_called()
+
     def test_original_code_runs_with_independent_extended_backend(self):
         namespace = {'jnp': np}
         exec('''
