@@ -59,7 +59,7 @@ class SavedBaselineTests(unittest.TestCase):
                     namespace['_prepare_benchmark_config'] = Mock(side_effect=prepare)
                     args = SimpleNamespace(device=requested, config='unused.toml',
                         radau_jacobian_reuse_mode='legacy', geometry_fd_native_precision='float64',
-                        geometry_input_only_dir=None, vmec_response_mode=None)
+                        geometry_input_only_dir=None, vmec_response_mode=None, ntx_scan_audit_dir=None)
                     context, config = namespace['placement'](args)
                     with context as fd, namespace['_benchmark_device_context'](config) as ad:
                         self.assertEqual(fd, ad)

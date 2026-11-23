@@ -1472,6 +1472,10 @@ def main() -> None:
         help="Capture original geometry/scan inputs without intermediate observers, then stop before NTX, roots or transport.")
     parser.add_argument("--geometry-input-reference", type=Path,
         help="With --geometry-input-only-dir, compare against a saved normalization_inputs_*.npz trace.")
+    parser.add_argument("--ntx-scan-audit-dir", type=Path,
+        help="Capture actual baseline NTX scan inputs/results and stop before transport/FD replay.")
+    parser.add_argument("--ntx-scan-audit-reference", type=Path,
+        help="With --ntx-scan-audit-dir, compare surface 6 preparation against this saved NPZ.")
     args = parser.parse_args()
     if args.geometry_fd_native_precision == "extended" and (
         args.parameter in PARAMETER_ORDER or args.geometry_fd_lane != "frozen_linearized"
@@ -1492,6 +1496,15 @@ def main() -> None:
         parser.error("--ad-baseline-reference requires an existing AD snapshot and full-transport accepted reverse_frozen_metadata replay with a frozen_linearized initial root")
     if args.geometry_input_reference is not None and (args.geometry_input_only_dir is None or not args.geometry_input_reference.is_file()):
         parser.error("--geometry-input-reference requires --geometry-input-only-dir and an existing reference file")
+    if args.ntx_scan_audit_reference is not None and (args.ntx_scan_audit_dir is None or not args.ntx_scan_audit_reference.is_file()):
+        parser.error("--ntx-scan-audit-reference requires --ntx-scan-audit-dir and an existing NPZ")
+    if args.ntx_scan_audit_dir is not None:
+        if (args.geometry_input_only_dir is not None or args.baseline_only_dir is not None
+            or args.initial_er_root_only_fd or args.geometry_fd_lane != "frozen_linearized"
+            or args.parameter in PARAMETER_ORDER):
+            parser.error("--ntx-scan-audit-dir requires a frozen-linearized geometry baseline without another early-stop mode")
+        if args.ntx_scan_audit_dir.exists() and any(args.ntx_scan_audit_dir.iterdir()):
+            parser.error("--ntx-scan-audit-dir must be empty")
     if args.geometry_input_only_dir is not None:
         if args.baseline_only_dir is not None or args.initial_er_root_only_fd:
             parser.error("--geometry-input-only-dir cannot be combined with another early-stop option")
@@ -1527,6 +1540,8 @@ def main() -> None:
         or config.get("neoclassical", {}).get("ntx_scan_surface_backend", "vmec") not in {"vmec", "vmec_jax"}
     ):
         parser.error("Extended native precision requires ntx_scan_runtime with native VMEC surfaces")
+    if args.ntx_scan_audit_dir is not None and config.get("neoclassical", {}).get("flux_model") != "ntx_scan_runtime":
+        parser.error("--ntx-scan-audit-dir requires ntx_scan_runtime")
     if args.geometry_input_only_dir is not None and (
         config.get("neoclassical", {}).get("flux_model") != "ntx_scan_runtime"
         or config.get("geometry", {}).get("backend") not in {"vmec_jax_booz_xform_jax", "vmec_runtime", "vmec_realtime"}
@@ -1568,11 +1583,20 @@ def main() -> None:
                 ad_geometry_reference=args.ad_geometry_reference,
             )
             frozen_linearized_bundle["native_precision"] = args.geometry_fd_native_precision
-            baseline_runtime, baseline_state = _runtime_for_frozen_linearized_geometry_step(
-                config,
-                frozen_linearized_bundle,
-                step_scale=0.0,
-            )
+            scan_audit = contextlib.nullcontext()
+            if args.ntx_scan_audit_dir is not None:
+                from check_saved_ntx_point_repeatability import capture_production_scans
+                scan_audit = capture_production_scans(args.ntx_scan_audit_dir,
+                    reference=args.ntx_scan_audit_reference)
+            with scan_audit:
+                baseline_runtime, baseline_state = _runtime_for_frozen_linearized_geometry_step(
+                    config,
+                    frozen_linearized_bundle,
+                    step_scale=0.0,
+                )
+    if args.ntx_scan_audit_dir is not None:
+        print(f"[ntx-live] baseline scan capture complete: {args.ntx_scan_audit_dir}; no transport/FD replay",flush=True)
+        return
     if args.geometry_input_only_dir is not None:
         import os
         from unittest.mock import patch

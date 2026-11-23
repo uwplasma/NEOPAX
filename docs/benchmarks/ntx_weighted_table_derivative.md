@@ -1669,3 +1669,74 @@ unmodified run does not reproduce the drift, this control cannot establish
 that the candidate fixed it. Full coefficient and AD16/FD16 validation still
 requires fresh common baselines after any arithmetic change; archived AD
 tables must not be forced into a new baseline.
+
+### Fresh-process result: drift not reproduced
+
+Remote run `outputs/ntx_preparation_validation_QYmTZh` compared 48 prepared
+fields in four independent processes on each NTX branch. All four unmodified
+preparations matched byte-for-byte, and all four candidate preparations also
+matched within their branch. The candidate's four tests, including the GPU
+JVP/native-transpose check, passed on the remote GPU. The before/after check
+therefore does **not** demonstrate a fix: the unmodified control did not fail.
+The Fourier candidate remains isolated and is not adopted as a correction.
+
+The isolated worker prepares one restored surface directly. It does not
+observe preparation inside the actual seven-surface FD build. To capture that
+remaining boundary, the FD benchmark now accepts `--ntx-scan-audit-dir` and
+an optional `--ntx-scan-audit-reference` pointing to a saved
+`fresh_prepared.npz`. With a frozen-linearized geometry parameter it runs the
+actual baseline build, then stops before the transport rollout, objective
+evaluation, or FD endpoints.
+
+The diagnostic wraps the serial scan aliases used by the generic and recorded
+NTX builders. It retains references to their **actual** prepared systems,
+normalized scan inputs, and returned coefficient arrays. No arguments or
+results are replaced, no preparation is repeated, and no coefficient solve is
+added. Host copies are made after the original baseline build completes (or
+raises), not between its surface scans. This diagnostic retains the prepared
+arrays until that copy, so it uses additional memory during the build.
+
+Each `surface_NNNN.npz` contains the prepared fields, flat `nu`, flat `Es`, and
+raw coefficients. A companion text file records the actual call stack and
+array types, weak types, commitment, and devices. Surface 6 is compared against
+the supplied reference without relaxing equality or replacing fields. Its
+raw coefficients and exact hexadecimal scan inputs are printed. The generic
+and recorded aliases are restored even if the original build raises.
+
+The extra mocked test verifies original argument/result identity, copying only
+after the build, both aliases, restoration on failure, and preservation of the
+original build exception when the reference differs. Six NumPy/mock tests pass;
+the actual live-build capture still requires remote validation.
+
+For this check use the unmodified NTX utilities branch, the failed FD run's
+configuration, and the same saved AD geometry linearization:
+
+```bash
+(
+  cd "$HOME/NEOPAX" || exit 1
+  git pull --ff-only origin en/v0_main || exit 1
+  git -C "$HOME/NTX" switch en/neopax-main-utilities || exit 1
+  neopax_out=$(mktemp -d outputs/ntx_live_fd_build_XXXXXX) || exit 1
+  set -o pipefail
+  env -u PYTHONPATH -u LD_LIBRARY_PATH -u JAX_PLATFORM_NAME \
+    -u XLA_FLAGS -u JAX_COMPILATION_CACHE_DIR -u XLA_PYTHON_CLIENT_ALLOCATOR \
+    -u NEOPAX_GRADIENT_AUDIT_DIR \
+    JAX_PLATFORMS=cuda,cpu JAX_ENABLE_X64=true \
+    JAX_ENABLE_COMPILATION_CACHE=0 XLA_PYTHON_CLIENT_PREALLOCATE=false \
+    NTX_DISABLE_COMPILATION_CACHE=1 VMEX_COMPILATION_CACHE=disabled \
+    "$HOME/jax_env/bin/python" \
+    examples/benchmarks/benchmark_transport_realtime_geometry_forward_fd.py \
+    --config outputs/ntss1d_zbs_fd16_nativefix_auto_qhrxybz6/config.toml \
+    --device auto --parameter ZBS:1:0 --vmec-response-mode raw_block \
+    --geometry-fd-lane frozen_linearized --geometry-fd-native-precision extended \
+    --ad-geometry-reference outputs/ntss1d_zbs_saved_ad_geometry_2_versy_/ad/snapshots \
+    --ntx-scan-audit-dir "$neopax_out/scans" \
+    --ntx-scan-audit-reference outputs/ntx_preparation_validation_QYmTZh/before/point_1/fresh_prepared.npz \
+    2>&1 | tee "$neopax_out/run.log"
+) || printf '\nLive scan capture stopped; terminal kept open.\n'
+```
+
+This includes the baseline's seven NTX surface scans; it is not another
+preparation-only microbenchmark. The capture will distinguish live preparation
+drift from coefficient drift with matching prepared inputs. A matching run
+would not establish repeatability of a previously failing execution.

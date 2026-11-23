@@ -20,6 +20,48 @@ spec.loader.exec_module(replay)
 
 
 class PointReplayTests(unittest.TestCase):
+    def test_live_capture_keeps_original_arguments_results_and_restores_both_aliases_on_failure(self):
+        tree=SimpleNamespace(tree_flatten_with_path=lambda x:([('.matrix',x.matrix)],None)
+            if hasattr(x,'matrix') else ([('',x)],None), keystr=lambda path:path)
+        modules={'jax':SimpleNamespace(tree_util=tree,device_get=lambda x:x)}
+        calls=[]
+        prepared=SimpleNamespace(matrix=np.ones((2,2)))
+        nu,es=np.asarray([.1,.1]),np.asarray([.2,.3])
+        coefficients=np.arange(10,dtype=float).reshape(2,5)
+        def scan(p,n,e):
+            self.assertIs(p,prepared)
+            self.assertIs(n,nu)
+            self.assertIs(e,es)
+            calls.append((p,n,e))
+            return coefficients
+        for owner in ('ntx._solver_scan','ntx._neopax_ad'):
+            modules[owner]=SimpleNamespace(_scan_coefficients_serial=scan)
+        with tempfile.TemporaryDirectory() as directory,patch.dict(sys.modules,modules):
+            root=Path(directory)
+            reference=root/'reference.npz'
+            # A mismatch is evidence, not permission to replace an input or
+            # mask the original build error.
+            np.savez(reference,**{'prepared.matrix':np.zeros((2,2))})
+            out=root/'capture'
+            with redirect_stdout(io.StringIO()),self.assertRaisesRegex(RuntimeError,'original build failure'):
+                with replay.capture_production_scans(out,reference=reference,point=(1,0,1)):
+                    for owner in ('ntx._solver_scan','ntx._neopax_ad'):
+                        actual=modules[owner]._scan_coefficients_serial(prepared,nu,es)
+                        self.assertIs(actual,coefficients)
+                        self.assertFalse(out.exists())
+                    raise RuntimeError('original build failure')
+            self.assertEqual(len(calls),2)
+            for owner in ('ntx._solver_scan','ntx._neopax_ad'):
+                self.assertIs(modules[owner]._scan_coefficients_serial,scan)
+            for index in range(2):
+                with np.load(out/f'surface_{index:04d}.npz',allow_pickle=False) as z:
+                    np.testing.assert_array_equal(z['prepared.matrix'],prepared.matrix)
+                    np.testing.assert_array_equal(z['nu'],nu)
+                    np.testing.assert_array_equal(z['Es'],es)
+                    np.testing.assert_array_equal(z['coefficients'],coefficients)
+            self.assertTrue((out/'preparation_comparison.csv').exists())
+        self.assertNotIn('jax',sys.modules)
+
     def test_prepare_only_parent_uses_four_fresh_contexts_and_rejects_remaining_drift(self):
         with tempfile.TemporaryDirectory() as directory:
             root=Path(directory)

@@ -7,6 +7,7 @@ No equilibrium, geometry reconstruction, root, transport, AD or FD solve runs.
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager, ExitStack
 import csv
 import hashlib
 import importlib.metadata
@@ -82,7 +83,7 @@ def normalized(coefficients, drds, nu):
                        coefficients[2]*drds, coefficients[3]*nu))
 
 
-def compare_preparations(results, out_dir):
+def compare_preparations(results, out_dir, *, fail_on_difference=True):
     base = next(iter(results.values()))
     rows = []
     for mode, arrays in results.items():
@@ -99,8 +100,67 @@ def compare_preparations(results, out_dir):
         writer=csv.DictWriter(stream,fieldnames=list(rows[0]))
         writer.writeheader()
         writer.writerows(rows)
-    if any(not row['bitwise_equal'] for row in rows):
+    if fail_on_difference and any(not row['bitwise_equal'] for row in rows):
         raise ValueError('Fresh NTX preparation still differs across the tested contexts; saved arrays retained')
+
+
+@contextmanager
+def capture_production_scans(directory, *, reference=None, point=(6,0,7)):
+    """Retain actual serial-scan arguments/results; copy only after the build.
+
+    No preparation is repeated and no argument or result is replaced. The
+    generic and recorded builders import the serial kernel into different
+    modules, so both aliases must be observed.
+    """
+    import traceback
+    from unittest.mock import patch
+    import jax
+
+    records = []
+    def observe(original, owner):
+        def scan(prepared, nu, es):
+            record = dict(prepared=prepared, nu=nu, Es=es)
+            records.append((owner, traceback.format_stack(limit=8), record))
+            result = original(prepared, nu, es)
+            record['coefficients'] = result
+            return result
+        return scan
+    try:
+        with ExitStack() as patches:
+            for owner in ('ntx._solver_scan','ntx._neopax_ad'):
+                module = importlib.import_module(owner)
+                patches.enter_context(patch.object(module,'_scan_coefficients_serial',
+                    observe(module._scan_coefficients_serial,owner)))
+            yield
+    finally:
+        directory = Path(directory)
+        directory.mkdir(parents=True,exist_ok=True)
+        for index,(owner,stack,record) in enumerate(records):
+            arrays, types = {}, []
+            for name,tree in record.items():
+                for path,value in jax.tree_util.tree_flatten_with_path(tree)[0]:
+                    key = name+jax.tree_util.keystr(path)
+                    arrays[key] = np.asarray(jax.device_get(value))
+                    types.append(f'{key}\t{type(value).__name__}\tweak={getattr(value,"weak_type","python")}'
+                        f'\tcommitted={getattr(value,"committed","python")}\tdevice={getattr(value,"device","python")}')
+            stem = directory/f'surface_{index:04d}'
+            np.savez_compressed(stem.with_suffix('.npz'),**arrays)
+            stem.with_suffix('.txt').write_text(owner+'\n'+''.join(stack)+'\n'+'\n'.join(types)+'\n')
+            print(f'[ntx-live] surface={index} owner={owner} saved={stem}.npz',flush=True)
+            if index != point[0]:
+                continue
+            if 'coefficients' in arrays:
+                selected = point[1]*np.unique(arrays['Es']).size+point[2]
+                values = arrays['coefficients'][selected]
+                print(f'[ntx-live] point={point} nu={float(arrays["nu"][selected]).hex()} '
+                    f'Es={float(arrays["Es"][selected]).hex()} raw_coefficients={values.tolist()}',flush=True)
+            if reference is not None:
+                with np.load(reference,allow_pickle=False) as saved:
+                    expected = {key:saved[key] for key in saved.files if key.startswith('prepared')}
+                actual = {key:value for key,value in arrays.items() if key.startswith('prepared')}
+                compare_preparations({'reference':expected,'live':actual},directory,
+                    fail_on_difference=False)
+        print(f'[ntx-live] captured {len(records)} actual scan calls; no scan replay',flush=True)
 
 
 def worker(args, data):
