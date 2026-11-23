@@ -1740,3 +1740,53 @@ This includes the baseline's seven NTX surface scans; it is not another
 preparation-only microbenchmark. The capture will distinguish live preparation
 drift from coefficient drift with matching prepared inputs. A matching run
 would not establish repeatability of a previously failing execution.
+
+### Downloaded live capture: matching inputs, different coefficient output
+
+Remote run `outputs/ntx_live_fd_build_fXgmd1` at `4d5c23d` captured the seven
+actual generic-builder scan calls. The archive
+`ntx_live_scan_audit_20261123.tar.gz` was inspected locally with NumPy only.
+The following comparison is against the **earlier successful coefficient
+replay**, `ntx_point_replay_NF3Tpa/native_1`, not just the later preparation-only
+control:
+
+- All 48 numeric prepared leaves match byte-for-byte (shape and dtype included).
+- All 48 recorded types, weak types, devices and commitment values match.
+  Text columns were compared by name because their output order differs.
+- The selected `nu` matches exactly: `0x1.421f5f40d8376p-22`.
+- The selected `Es` matches exactly: `0x1.c035ba9ccdac0p-7`.
+- The later unmodified preparation-only control also matches those 48 leaves.
+
+Nevertheless, the **raw primal coefficients** at `(6,0,7)` differ. Relative
+errors below use `abs(live - earlier) / abs(earlier)`:
+
+| Coefficient | Earlier isolated replay | Actual FD build | Relative difference |
+| --- | ---: | ---: | ---: |
+| D11 | `-1.7789829157057398e-04` | `-1.7810425944545083e-04` | `1.157784446e-03` |
+| D31 | `-2.8228592588235419e+01` | `-2.8259907860060924e+01` | `1.109345842e-03` |
+| D13 | `2.9023985040432758e+00` | `2.9061592438827164e+00` | `1.295735177e-03` |
+| D33 | `1.2821370614165270e+06` | `1.2827089175242432e+06` | `4.460179219e-04` |
+| D33_spitzer | `2.1487620199910249e+06` | `2.1487620199910249e+06` | `0.000000000e+00` |
+
+This rules out changed numeric preparation inputs for these two captures. It
+does not identify the first differing arithmetic operation inside the solve,
+nor prove a derivative-rule error. The isolated replay compiled its own
+flat-argument wrapper; the actual FD build called NTX's production
+`_scan_coefficients_serial` entry, which selects the existing sequential JIT
+kernel. The earlier 176-entry control also used the flat wrapper, so changing
+scan length alone did not test this entry-point difference.
+
+The replay now accepts `--live-scan surface_NNNN.npz` to restore the captured
+prepared leaves and **complete** nu/Es row. `--scan-kernel production` calls
+the actual NTX entry from ordinary Python, without adding an outer JIT or
+using `.lower()` on its prepared dataclass. `--scan-kernel flat` retains the
+previous diagnostic compilation. Both use the same restored numeric inputs
+and retain the live coefficient output for comparison. Static pytree metadata
+are reconstructed from the saved surface/configuration, as in the original
+replay. No NTX production source or compilation options are changed.
+
+The extended mocked regression verifies both routes, full-row restoration,
+point indexing, repeated results, and that the production route avoids the
+diagnostic JIT. Six offline tests pass. Actual CUDA comparison of these two
+entry points is pending. This is a single-surface replay; it does not rebuild
+equilibrium, a seven-surface database, initial roots, or transport.

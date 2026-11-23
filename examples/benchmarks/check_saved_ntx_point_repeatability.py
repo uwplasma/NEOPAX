@@ -32,6 +32,20 @@ def read_one(folder, pattern):
         return {key: data[key].copy() for key in data.files}
 
 
+def read_live_scan(path, shape, point):
+    with np.load(path,allow_pickle=False) as saved:
+        arrays = {key:saved[key].copy() for key in saved.files}
+    nu, es, coefficients = (arrays[key] for key in ('nu','Es','coefficients'))
+    if (nu.shape != (shape[1]*shape[2],) or es.shape != nu.shape
+        or coefficients.shape != (nu.size,5)
+        or not any(key.startswith('prepared.') for key in arrays)):
+        raise ValueError('Live scan shape or prepared fields do not match this benchmark')
+    selected = point[1]*shape[2]+point[2]
+    if not np.isfinite(nu[selected]) or not np.isfinite(es[selected]):
+        raise ValueError('Live scan point is nonfinite')
+    return arrays, selected
+
+
 def scan_inputs(data):
     """Align the terminal dataclass capture and the input-only dict capture."""
     result = {}
@@ -75,6 +89,8 @@ def preflight(args):
     shape = fd["support['database'].D13"].shape
     if any(i < 0 or i >= size for i, size in zip(args.point, shape, strict=True)):
         raise ValueError(f'Point {args.point} outside the saved table {shape}')
+    if args.live_scan is not None:
+        read_live_scan(args.live_scan,shape,args.point)
     return config, fd, reference, ad, actual
 
 
@@ -174,6 +190,7 @@ def worker(args, data):
     from ntx.geometry import VmecSurface
     from ntx import GridSpec, prepare_monoenergetic_system
     from ntx._solver_scan import _scan_coefficients_sequential_impl
+    from ntx._solver_scan import _scan_coefficients_serial
     from NEOPAX._transport_flux_models import _build_ntx_field_channels
     geometry_module = importlib.import_module('ntx._geometry')
     geometry_path = Path(geometry_module.__file__)
@@ -206,6 +223,13 @@ def worker(args, data):
         nu_grid, es_grid = jnp.meshgrid(nu_axis, es_row, indexing='ij')
         scan_nu, scan_es = nu_grid.ravel(), es_grid.ravel()
         selected = n*int(es_row.size)+e
+    live = None
+    if args.live_scan is not None:
+        live, selected = read_live_scan(args.live_scan,fd["support['database'].D13"].shape,args.point)
+        if float(nu).hex()!=float(live['nu'][selected]).hex() or float(es).hex()!=float(live['Es'][selected]).hex():
+            raise ValueError('Selected live nu/Es point differs from the saved reference point')
+        scan_nu = jnp.asarray(live['nu'],dtype=live['nu'].dtype)
+        scan_es = jnp.asarray(live['Es'],dtype=live['Es'].dtype)
     prepared = prepare_monoenergetic_system(surface, grid)
     paths, structure = jax.tree_util.tree_flatten_with_path(prepared)
     names = ['prepared'+jax.tree_util.keystr(path) for path, _ in paths]
@@ -219,8 +243,9 @@ def worker(args, data):
     if args.prepare_only:
         print(f'[ntx-point] preparation saved: {len(arrays)} fields; no coefficient solve',flush=True)
         return
-    if args.frozen_prepared is not None:
-        frozen = read_one(args.frozen_prepared, 'fresh_prepared.npz')
+    if args.frozen_prepared is not None or live is not None:
+        frozen = ({key:value for key,value in live.items() if key.startswith('prepared.')}
+                  if live is not None else read_one(args.frozen_prepared, 'fresh_prepared.npz'))
         if set(frozen) != set(arrays) or any(frozen[key].shape != value.shape or frozen[key].dtype != value.dtype
                                            for key,value in arrays.items()):
             raise ValueError('Prepared tree structure changed')
@@ -238,9 +263,16 @@ def worker(args, data):
         current = jax.tree_util.tree_unflatten(structure, flat[:-2])
         return _scan_coefficients_sequential_impl(current, flat[-2], flat[-1])
     options = {'xla_gpu_deterministic_ops': True} if args.worker.startswith('controlled') else {}
-    print(f'[ntx-point] compiling {args.scan_layout} scan, entries={scan_nu.size}; local compiler options={options}', flush=True)
-    compiled = jax.jit(solve, compiler_options=options).lower(*leaves, scan_nu, scan_es).compile()
-    (args.out_dir/'compiled_hlo.txt').write_text(compiled.as_text())
+    print(f'[ntx-point] kernel={args.scan_kernel} entries={scan_nu.size} captured_scan={live is not None}; local compiler options={options}', flush=True)
+    if args.scan_kernel == 'production':
+        # Ordinary Python unpacking, followed by the actual production entry.
+        # Do not wrap this call in another jit or lower the prepared dataclass.
+        def compiled(*flat):
+            current = jax.tree_util.tree_unflatten(structure,flat[:-2])
+            return _scan_coefficients_serial(current,flat[-2],flat[-1])
+    else:
+        compiled = jax.jit(solve, compiler_options=options).lower(*leaves, scan_nu, scan_es).compile()
+        (args.out_dir/'compiled_hlo.txt').write_text(compiled.as_text())
     result = {'nu': np.asarray(nu), 'Es': np.asarray(es),
               'scan_nu':np.asarray(scan_nu),'scan_Es':np.asarray(scan_es),'selected':np.asarray(selected)}
     for repeat in range(args.repeats):
@@ -251,6 +283,11 @@ def worker(args, data):
         result[f'table_{repeat}'] = normalized(coeff, float(channels['drds'][r]), float(nu))
     result['expected_ad'] = np.asarray([ad["support['database']."+name][r,n,e] for name in ('D11_log','D13','D33')])
     result['expected_fd'] = np.asarray([fd["support['database']."+name][r,n,e] for name in ('D11_log','D13','D33')])
+    if live is not None:
+        result['expected_live_coefficients'] = live['coefficients']
+        print(f"[ntx-point] kernel={args.scan_kernel} raw_D13_minus_live="
+            f"{result['coefficients_0'][2]-live['coefficients'][selected,2]:.16e} "
+            f"all_coefficients_max_abs_difference={np.max(np.abs(result['scan_coefficients_0']-live['coefficients'])):.16e}",flush=True)
     np.savez_compressed(args.out_dir/'result.npz', **result)
     repeat_matches = all(result['scan_coefficients_0'].tobytes()==result[f'scan_coefficients_{i}'].tobytes()
                          for i in range(1,args.repeats)) if args.repeats>1 else 'not repeated'
@@ -271,6 +308,10 @@ def main():
     parser.add_argument('--scan-layout',choices=('point','production'),default='point',
         help='Replay one entry or the original full nu/Er scan on this one prepared surface')
     parser.add_argument('--repeats',type=int,default=2,help='Executions of each compiled scan')
+    parser.add_argument('--live-scan',type=Path,
+        help='Restore prepared fields and the complete nu/Es row from a captured surface_NNNN.npz')
+    parser.add_argument('--scan-kernel',choices=('flat','production'),default='flat',
+        help='Compile the diagnostic wrapper or call the unmodified production JIT entry directly')
     parser.add_argument('--prepare-only',action='store_true',
         help='Compare fresh preparation in point/production contexts; stop before coefficient solves')
     parser.add_argument('--deterministic-control', action='store_true',
@@ -286,6 +327,10 @@ def main():
         parser.error('--repeats must be positive')
     if args.prepare_only and (args.frozen_prepared is not None or args.deterministic_control):
         parser.error('--prepare-only requires fresh inputs without a coefficient compilation control')
+    if args.prepare_only and (args.live_scan is not None or args.scan_kernel != 'flat'):
+        parser.error('--prepare-only cannot restore a live scan or select a coefficient kernel')
+    if args.scan_kernel == 'production' and (args.deterministic_control or (args.worker or '').startswith('controlled')):
+        parser.error('The production kernel uses its unchanged compilation options')
     data = preflight(args)
     if args.out_dir.exists() and any(args.out_dir.iterdir()):
         parser.error('Choose an empty output directory')
@@ -297,7 +342,9 @@ def main():
     common = [sys.executable, str(Path(__file__).resolve()), '--fd-run', str(args.fd_run.resolve()),
         '--input-reference', str(args.input_reference.resolve()), '--ad-dir', str(args.ad_dir.resolve()),
         '--source-metadata', str(args.source_metadata.resolve()), '--point', ':'.join(map(str,args.point)),
-        '--repeats',str(args.repeats)]
+        '--repeats',str(args.repeats),'--scan-kernel',args.scan_kernel]
+    if args.live_scan is not None:
+        common += ['--live-scan',str(args.live_scan.resolve())]
     modes = (['point_1','point_2','production_1','production_2'] if args.prepare_only else
         ['native_1','native_2'] + (['controlled_1','controlled_2'] if args.deterministic_control else []))
     results = {}
@@ -309,7 +356,7 @@ def main():
         command = [*common, '--out-dir', str((args.out_dir/mode).resolve()), '--worker', mode,'--scan-layout',layout]
         if args.prepare_only:
             command += ['--prepare-only']
-        elif mode != 'native_1':
+        elif mode != 'native_1' and args.live_scan is None:
             command += ['--frozen-prepared', str((args.out_dir/'native_1').resolve())]
         print(f'[ntx-point] starting {mode}; one saved surface/point; log={args.out_dir/(mode+".log")}', flush=True)
         with (args.out_dir/(mode+'.log')).open('w') as log:

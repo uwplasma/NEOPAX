@@ -131,7 +131,8 @@ class PointReplayTests(unittest.TestCase):
                     tree_util=tree,device_get=lambda x:x,jit=jit), 'jax.numpy':np,
             'ntx.geometry':SimpleNamespace(VmecSurface=lambda **values:SimpleNamespace(**values)),
             'ntx':SimpleNamespace(GridSpec=lambda **values:SimpleNamespace(**values),prepare_monoenergetic_system=prepare),
-            'ntx._solver_scan':SimpleNamespace(_scan_coefficients_sequential_impl=scan),
+            'ntx._solver_scan':SimpleNamespace(_scan_coefficients_sequential_impl=scan,
+                _scan_coefficients_serial=unittest.mock.Mock(side_effect=lambda *args:scan(*args).view(Ready))),
             'ntx._geometry':SimpleNamespace(__file__=str(FILE),_sum_fourier_modes=lambda value:value),
             'NEOPAX._transport_flux_models':SimpleNamespace(_build_ntx_field_channels=lambda *args:(None,np.asarray([[.2,.3,.4]]),None))}
         # import jax.numpy also resolves numpy as an attribute of the fake parent.
@@ -149,7 +150,8 @@ class PointReplayTests(unittest.TestCase):
                 folder = root/mode
                 folder.mkdir()
                 args = SimpleNamespace(point=(0,0,0),out_dir=folder,worker=mode,
-                    frozen_prepared=None if mode=='native_1' else root/'native_1',scan_layout='point',repeats=2,prepare_only=False)
+                    frozen_prepared=None if mode=='native_1' else root/'native_1',scan_layout='point',
+                    repeats=2,prepare_only=False,live_scan=None,scan_kernel='flat')
                 replay.worker(args,(config,expected,reference,expected,inputs))
                 with np.load(folder/'result.npz') as result:
                     np.testing.assert_array_equal(result['table_0'],[np.log10(8.),6.,.5])
@@ -162,7 +164,8 @@ class PointReplayTests(unittest.TestCase):
             folder = root/'production'
             folder.mkdir()
             args = SimpleNamespace(point=(0,1,2),out_dir=folder,worker='native_1',
-                frozen_prepared=root/'native_1',scan_layout='production',repeats=1,prepare_only=False)
+                frozen_prepared=root/'native_1',scan_layout='production',repeats=1,
+                prepare_only=False,live_scan=None,scan_kernel='flat')
             expected = {key:np.ones((1,2,3)) for key in expected}
             replay.worker(args,(config,expected,reference,expected,inputs))
             with np.load(folder/'result.npz') as z:
@@ -174,12 +177,36 @@ class PointReplayTests(unittest.TestCase):
             folder = root/'preparation_only'
             folder.mkdir()
             args = SimpleNamespace(point=(0,1,2),out_dir=folder,worker='native_1',
-                frozen_prepared=None,scan_layout='production',repeats=1,prepare_only=True)
+                frozen_prepared=None,scan_layout='production',repeats=1,
+                prepare_only=True,live_scan=None,scan_kernel='flat')
             replay.worker(args,(config,expected,reference,expected,inputs))
             self.assertTrue((folder/'fresh_prepared.npz').is_file())
             self.assertFalse((folder/'compiled_hlo.txt').exists())
             self.assertFalse((folder/'result.npz').exists())
-        self.assertEqual(compiled_options,[{},{},{'xla_gpu_deterministic_ops':True},{}])
+            # Restore the actual scan, even if the newly prepared matrix
+            # differs. Call the production entry directly: no extra jit.
+            live=root/'live.npz'
+            live_nu=np.asarray([.1,.1,.1,.2,.2,.2])
+            live_es=np.asarray([.2,.3,.4,.2,.3,.4])
+            live_coeff=scan(SimpleNamespace(matrix=np.ones((1,1))),live_nu,live_es)
+            np.savez(live,**{'prepared.matrix':np.ones((1,1)),
+                'nu':live_nu,'Es':live_es,'coefficients':live_coeff})
+            for kernel in ('production','flat'):
+                folder=root/('live_'+kernel)
+                folder.mkdir()
+                args=SimpleNamespace(point=(0,1,2),out_dir=folder,worker='native_1',
+                    frozen_prepared=None,scan_layout='point',repeats=2,
+                    prepare_only=False,live_scan=live,scan_kernel=kernel)
+                replay.worker(args,(config,expected,reference,expected,inputs))
+                with np.load(folder/'result.npz',allow_pickle=False) as z:
+                    np.testing.assert_array_equal(z['scan_coefficients_0'],live_coeff)
+                    np.testing.assert_array_equal(z['expected_live_coefficients'],live_coeff)
+                    self.assertEqual(int(z['selected']),5)
+                self.assertEqual((folder/'compiled_hlo.txt').exists(),kernel=='flat')
+            self.assertEqual(modules['ntx._solver_scan']._scan_coefficients_serial.call_count,2)
+            with self.assertRaisesRegex(ValueError,'shape or prepared'):
+                replay.read_live_scan(live,(1,1,1),(0,0,0))
+        self.assertEqual(compiled_options,[{},{},{'xla_gpu_deterministic_ops':True},{},{}])
         self.assertEqual(before,dict(replay.os.environ))
         self.assertNotIn('jax',sys.modules)
 
@@ -200,7 +227,7 @@ class PointReplayTests(unittest.TestCase):
             (root/'fd_ZBS_1_0/snapshots').mkdir(parents=True)
             (root/'config.toml').write_text('[neoclassical]\n')
             args = SimpleNamespace(fd_run=root,input_reference=root,ad_dir=root,
-                source_metadata=root/'metadata.json',point=(0,0,0))
+                source_metadata=root/'metadata.json',point=(0,0,0),live_scan=None)
             source = root/'source.py'
             source.write_text('pass\n')
             args.source_metadata.write_text(json.dumps({'versions':{},'sources':{'ntx._solver':{
