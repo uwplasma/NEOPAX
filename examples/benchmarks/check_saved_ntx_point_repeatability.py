@@ -111,8 +111,14 @@ def worker(args, data):
                 for key, value in inputs.items() if key.startswith("channels['")}
     rho = jnp.asarray(nc['ntx_scan_rho'], dtype=jnp.float64)
     er = jnp.asarray(nc['ntx_scan_er_tilde'], dtype=jnp.float64)
-    es = _build_ntx_field_channels(rho, er, channels)[1][r, e]
-    nu = jnp.asarray(nc['ntx_scan_nu_v'][n], dtype=jnp.float64)
+    es_row = _build_ntx_field_channels(rho, er, channels)[1][r]
+    nu_axis = jnp.asarray(nc['ntx_scan_nu_v'], dtype=jnp.float64)
+    nu, es = nu_axis[n], es_row[e]
+    scan_nu, scan_es, selected = nu[None], es[None], 0
+    if args.scan_layout == 'production':
+        nu_grid, es_grid = jnp.meshgrid(nu_axis, es_row, indexing='ij')
+        scan_nu, scan_es = nu_grid.ravel(), es_grid.ravel()
+        selected = n*int(es_row.size)+e
     prepared = prepare_monoenergetic_system(surface, grid)
     paths, structure = jax.tree_util.tree_flatten_with_path(prepared)
     names = ['prepared'+jax.tree_util.keystr(path) for path, _ in paths]
@@ -128,6 +134,7 @@ def worker(args, data):
         if set(frozen) != set(arrays) or any(frozen[key].shape != value.shape or frozen[key].dtype != value.dtype
                                            for key,value in arrays.items()):
             raise ValueError('Prepared tree structure changed')
+        print(f'[ntx-point] fresh_vs_frozen_preparation_differences={changes(frozen,arrays)}',flush=True)
         def restore(old, value):
             if isinstance(old, (bool, int, float)):
                 return value.item()
@@ -141,20 +148,26 @@ def worker(args, data):
         current = jax.tree_util.tree_unflatten(structure, flat[:-2])
         return _scan_coefficients_sequential_impl(current, flat[-2], flat[-1])
     options = {'xla_gpu_deterministic_ops': True} if args.worker.startswith('controlled') else {}
-    print(f'[ntx-point] compiling one point; local compiler options={options}', flush=True)
-    compiled = jax.jit(solve, compiler_options=options).lower(*leaves, nu[None], es[None]).compile()
+    print(f'[ntx-point] compiling {args.scan_layout} scan, entries={scan_nu.size}; local compiler options={options}', flush=True)
+    compiled = jax.jit(solve, compiler_options=options).lower(*leaves, scan_nu, scan_es).compile()
     (args.out_dir/'compiled_hlo.txt').write_text(compiled.as_text())
-    result = {'nu': np.asarray(nu), 'Es': np.asarray(es)}
-    for repeat in range(2):
-        coeff = np.asarray(compiled(*leaves, nu[None], es[None]).block_until_ready())[0]
+    result = {'nu': np.asarray(nu), 'Es': np.asarray(es),
+              'scan_nu':np.asarray(scan_nu),'scan_Es':np.asarray(scan_es),'selected':np.asarray(selected)}
+    for repeat in range(args.repeats):
+        scan_coeff = np.asarray(compiled(*leaves, scan_nu, scan_es).block_until_ready())
+        result[f'scan_coefficients_{repeat}'] = scan_coeff
+        coeff = scan_coeff[selected]
         result[f'coefficients_{repeat}'] = coeff
         result[f'table_{repeat}'] = normalized(coeff, float(channels['drds'][r]), float(nu))
     result['expected_ad'] = np.asarray([ad["support['database']."+name][r,n,e] for name in ('D11_log','D13','D33')])
     result['expected_fd'] = np.asarray([fd["support['database']."+name][r,n,e] for name in ('D11_log','D13','D33')])
     np.savez_compressed(args.out_dir/'result.npz', **result)
+    repeat_matches = all(result['scan_coefficients_0'].tobytes()==result[f'scan_coefficients_{i}'].tobytes()
+                         for i in range(1,args.repeats)) if args.repeats>1 else 'not repeated'
     print(f"[ntx-point] {args.worker} Es={float(es).hex()} raw_D13={result['coefficients_0'][2]:.16e} "
-          f"table_D13={result['table_0'][1]:.16e} repeat_matches="
-          f"{result['coefficients_0'].tobytes()==result['coefficients_1'].tobytes()}", flush=True)
+          f"table_D13={result['table_0'][1]:.16e} repeat_matches={repeat_matches}", flush=True)
+    print(f"[ntx-point] minus_archived_ad={result['table_0'][1]-result['expected_ad'][1]:.9e} "
+          f"minus_archived_fd={result['table_0'][1]-result['expected_fd'][1]:.9e}",flush=True)
 
 
 def main():
@@ -165,6 +178,9 @@ def main():
     parser.add_argument('--source-metadata', type=Path, required=True)
     parser.add_argument('--out-dir', type=Path, required=True)
     parser.add_argument('--point', default='6:0:7', help='radius:nu:Er table indices')
+    parser.add_argument('--scan-layout',choices=('point','production'),default='point',
+        help='Replay one entry or the original full nu/Er scan on this one prepared surface')
+    parser.add_argument('--repeats',type=int,default=2,help='Executions of each compiled scan')
     parser.add_argument('--deterministic-control', action='store_true',
         help='Also test a kernel-local deterministic compilation; changes no production or environment options')
     parser.add_argument('--worker', choices=('native_1','native_2','controlled_1','controlled_2'), help=argparse.SUPPRESS)
@@ -173,6 +189,8 @@ def main():
     args.point = tuple(int(value) for value in args.point.split(':'))
     if len(args.point) != 3:
         parser.error('--point requires three indices')
+    if args.repeats < 1:
+        parser.error('--repeats must be positive')
     data = preflight(args)
     if args.out_dir.exists() and any(args.out_dir.iterdir()):
         parser.error('Choose an empty output directory')
@@ -183,7 +201,8 @@ def main():
     assert 'jax' not in sys.modules
     common = [sys.executable, str(Path(__file__).resolve()), '--fd-run', str(args.fd_run.resolve()),
         '--input-reference', str(args.input_reference.resolve()), '--ad-dir', str(args.ad_dir.resolve()),
-        '--source-metadata', str(args.source_metadata.resolve()), '--point', ':'.join(map(str,args.point))]
+        '--source-metadata', str(args.source_metadata.resolve()), '--point', ':'.join(map(str,args.point)),
+        '--scan-layout',args.scan_layout,'--repeats',str(args.repeats)]
     modes = ['native_1','native_2'] + (['controlled_1','controlled_2'] if args.deterministic_control else [])
     results = {}
     env = {key:value for key,value in os.environ.items() if key not in ('PYTHONPATH','JAX_COMPILATION_CACHE_DIR')}

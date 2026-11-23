@@ -1531,3 +1531,70 @@ On the large machine, after publishing the new diagnostic:
     2>&1 | tee "$neopax_out.log"
 ) || printf '\nOne-point replay stopped; terminal kept open.\n'
 ```
+
+### One-point CUDA result and production scan-context control
+
+Remote run `outputs/ntx_point_replay_NF3Tpa` at commit `b703ca9` completed
+all four workers. Fresh prepared arrays were bitwise equal in every worker;
+each executable also returned identical results on its two executions.
+
+| Compilation | Stored D13 | Absolute difference from archived AD |
+| --- | ---: | ---: |
+| native process 1 | `1.9534380624237300e+00` | `0.000000000e+00` |
+| native process 2 | `1.9534380624237300e+00` | `0.000000000e+00` |
+| controlled process 1 | `1.9534380522796293e+00` | `1.014410067e-08` |
+| controlled process 2 | `1.9534380522796293e+00` | `1.014410067e-08` |
+
+The ordinary replay reproduces the archived AD coefficient exactly. The
+controlled change is `5.192947e-09` relative to archived AD, far smaller than
+the failing full FD table's absolute gap `2.531143490e-03`. These are
+coefficient differences, not transport-gradient errors. This test gives no
+evidence for run-to-run nondeterminism in this one-point kernel or for making
+the compilation control a production setting.
+
+The outstanding boundaries are the full FD build's live preparation and its
+176-entry scan context. The one-point diagnostic did not capture that live
+build's prepared matrices. It therefore does not prove that an independently
+restored prepared system matches those original matrices, nor that changing
+scan length caused the discrepancy.
+
+The same script now accepts `--scan-layout production`. It constructs the
+original 16-by-11 collisionality/field mesh in `ij` order, retains all raw
+coefficient outputs, and extracts the requested point with index
+`nu_index * n_Er + Er_index`. The unmodified sequential scan body runs on
+the same frozen prepared matrices from the completed one-point test.
+`--repeats 1 --worker native_1` runs one production surface scan in one
+process, without geometry, equilibrium, root, transport or derivative work.
+This holds the numerical input matrices fixed while changing the scan context;
+it does not modify a production solver or replace a benchmark baseline.
+
+The mocked worker regression additionally checks production mesh ordering,
+selection of a nonzero collisionality/field index, preservation of all scan
+outputs, and one-execution bookkeeping. All four offline tests pass. CUDA
+validation of the production-row control is pending.
+
+After publishing the script/test/documentation update:
+
+```bash
+(
+  cd "$HOME/NEOPAX" || exit 1
+  git pull --ff-only origin en/v0_main || exit 1
+  neopax_out=$(mktemp -d outputs/ntx_production_row_XXXXXX) || exit 1
+  set -o pipefail
+  env -u PYTHONPATH -u LD_LIBRARY_PATH -u JAX_PLATFORM_NAME \
+    -u XLA_FLAGS -u JAX_COMPILATION_CACHE_DIR -u XLA_PYTHON_CLIENT_ALLOCATOR \
+    JAX_PLATFORMS=cuda,cpu JAX_ENABLE_X64=true \
+    JAX_ENABLE_COMPILATION_CACHE=0 XLA_PYTHON_CLIENT_PREALLOCATE=false \
+    NTX_DISABLE_COMPILATION_CACHE=1 \
+    "$HOME/jax_env/bin/python" \
+    examples/benchmarks/check_saved_ntx_point_repeatability.py \
+    --fd-run outputs/ntss1d_zbs_fd16_nativefix_auto_qhrxybz6 \
+    --input-reference outputs/zbs_auto_geometry_WGuHfQ \
+    --ad-dir outputs/ntss1d_zbs_saved_ad_geometry_2_versy_/ad/snapshots \
+    --source-metadata outputs/ntss1d_zbs_input_paths_k4RToS/ad/metadata.json \
+    --point 6:0:7 --scan-layout production --repeats 1 --worker native_1 \
+    --frozen-prepared outputs/ntx_point_replay_NF3Tpa/native_1 \
+    --out-dir "$neopax_out" \
+    2>&1 | tee "$neopax_out.log"
+) || printf '\nProduction-row replay stopped; terminal kept open.\n'
+```

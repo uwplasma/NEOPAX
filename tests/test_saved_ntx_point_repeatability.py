@@ -39,20 +39,24 @@ class PointReplayTests(unittest.TestCase):
             keystr=lambda path:path, tree_unflatten=lambda shape,values:SimpleNamespace(matrix=values[0]))
         def scan(prepared, nu, es):
             np.testing.assert_array_equal(prepared.matrix, [[1.]])
-            np.testing.assert_array_equal(nu,[.1])
-            np.testing.assert_array_equal(es,[.2])
-            return np.asarray([[2.,0.,3.,5.,0.]])
+            if nu.size==1:
+                np.testing.assert_array_equal(nu,[.1])
+                np.testing.assert_array_equal(es,[.2])
+                return np.asarray([[2.,0.,3.,5.,0.]])
+            np.testing.assert_array_equal(nu,[.1,.1,.1,.2,.2,.2])
+            np.testing.assert_array_equal(es,[.2,.3,.4,.2,.3,.4])
+            return np.column_stack((np.ones(6)*2,np.zeros(6),3+np.arange(6),np.ones(6)*5,np.zeros(6)))
         prepare = unittest.mock.Mock(return_value=SimpleNamespace(matrix=np.ones((1,1))))
         modules = {'jax':SimpleNamespace(default_backend=lambda:'gpu',config=SimpleNamespace(x64_enabled=True),
                     tree_util=tree,device_get=lambda x:x,jit=jit), 'jax.numpy':np,
             'ntx.geometry':SimpleNamespace(VmecSurface=lambda **values:SimpleNamespace(**values)),
             'ntx':SimpleNamespace(GridSpec=lambda **values:SimpleNamespace(**values),prepare_monoenergetic_system=prepare),
             'ntx._solver_scan':SimpleNamespace(_scan_coefficients_sequential_impl=scan),
-            'NEOPAX._transport_flux_models':SimpleNamespace(_build_ntx_field_channels=lambda *args:(None,np.asarray([[.2]]),None))}
+            'NEOPAX._transport_flux_models':SimpleNamespace(_build_ntx_field_channels=lambda *args:(None,np.asarray([[.2,.3,.4]]),None))}
         # import jax.numpy also resolves numpy as an attribute of the fake parent.
         modules['jax'].numpy = np
         config = {'neoclassical':{'ntx_scan_n_theta':25,'ntx_scan_n_zeta':31,'ntx_scan_n_xi':64,
-            'ntx_scan_rho':[.5],'ntx_scan_er_tilde':[.001],'ntx_scan_nu_v':[.1]}}
+            'ntx_scan_rho':[.5],'ntx_scan_er_tilde':[.001,.002,.003],'ntx_scan_nu_v':[.1,.2]}}
         reference = {"trace['03_surfaces'][0]['path']":np.asarray('input.vmec'),
             "trace['03_surfaces'][0]['b_cos']":np.ones(1)}
         expected = {'support[\'database\'].'+name:np.ones((1,1,1)) for name in ('D11_log','D13','D33')}
@@ -64,7 +68,7 @@ class PointReplayTests(unittest.TestCase):
                 folder = root/mode
                 folder.mkdir()
                 args = SimpleNamespace(point=(0,0,0),out_dir=folder,worker=mode,
-                    frozen_prepared=None if mode=='native_1' else root/'native_1')
+                    frozen_prepared=None if mode=='native_1' else root/'native_1',scan_layout='point',repeats=2)
                 replay.worker(args,(config,expected,reference,expected,inputs))
                 with np.load(folder/'result.npz') as result:
                     np.testing.assert_array_equal(result['table_0'],[np.log10(8.),6.,.5])
@@ -74,7 +78,19 @@ class PointReplayTests(unittest.TestCase):
                 prepare.return_value = SimpleNamespace(matrix=np.asarray([[9.]]))
             with np.load(root/'native_2/fresh_prepared.npz') as z:
                 np.testing.assert_array_equal(z['prepared.matrix'],[[9.]])
-        self.assertEqual(compiled_options,[{},{},{'xla_gpu_deterministic_ops':True}])
+            folder = root/'production'
+            folder.mkdir()
+            args = SimpleNamespace(point=(0,1,2),out_dir=folder,worker='native_1',
+                frozen_prepared=root/'native_1',scan_layout='production',repeats=1)
+            expected = {key:np.ones((1,2,3)) for key in expected}
+            replay.worker(args,(config,expected,reference,expected,inputs))
+            with np.load(folder/'result.npz') as z:
+                self.assertEqual(int(z['selected']),5)
+                self.assertEqual(float(z['coefficients_0'][2]),8.)
+                self.assertEqual(float(z['table_0'][1]),16.)
+                self.assertEqual(z['scan_coefficients_0'].shape,(6,5))
+                self.assertNotIn('coefficients_1',z.files)
+        self.assertEqual(compiled_options,[{},{},{'xla_gpu_deterministic_ops':True},{}])
         self.assertEqual(before,dict(replay.os.environ))
         self.assertNotIn('jax',sys.modules)
 
