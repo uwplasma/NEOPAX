@@ -113,10 +113,15 @@ def forward(x):
         original = Mock()
         geometry = SimpleNamespace(_traceable_vmec_surfaces_from_state=original)
         output = object()
+        surfaces = (SimpleNamespace(requested_psi_n=.5),)
+        runtime = SimpleNamespace(models=SimpleNamespace(flux=SimpleNamespace(
+            neoclassical_model=SimpleNamespace(scan_surfaces=surfaces))))
         def build(config, context, state, **kwargs):
+            if state.x == 1.:
+                self.assertIs(geometry._traceable_vmec_surfaces_from_state, original)
             if config.get('read_surface'):
                 return geometry._traceable_vmec_surfaces_from_state(context, state, s_values=(.5,)), output
-            return 'ordinary', output
+            return runtime, output
         namespace = dict(contextlib=contextlib, jnp=np, dataclasses=dataclasses,
             jax=SimpleNamespace(tree=SimpleNamespace(map=lambda fn,x,d: State(fn(x.x,d.x)))),
             build_runtime_context_for_vmec_state=Mock(side_effect=build))
@@ -129,17 +134,19 @@ def forward(x):
         modules = {'NEOPAX':SimpleNamespace(_geometry_autodiff=geometry),
                    '_fd_native_precision':SimpleNamespace(NativePrecision=factory)}
         with patch.dict(sys.modules, modules):
-            self.assertEqual(run({}, bundle, step_scale=0.), ('ordinary', output))
-            factory.return_value.evaluate.assert_not_called()
-            original.return_value='untouched baseline'
-            self.assertEqual(run({'read_surface':True}, bundle, step_scale=0.), ('untouched baseline', output))
-            factory.return_value.remember.assert_called_once_with((.5,), 'untouched baseline')
+            with self.assertRaisesRegex(ValueError, 'zero-step baseline first'):
+                run({}, bundle, step_scale=1e-7)
+            factory.assert_not_called()
+            self.assertEqual(run({}, bundle, step_scale=0.), (runtime, output))
+            factory.assert_not_called()
+            self.assertIs(bundle['native_baseline_surfaces'], surfaces)
             self.assertEqual(run({'read_surface':True}, bundle, step_scale=1e-7), ('corrected', output))
+            factory.return_value.remember.assert_called_once_with((.5,), surfaces)
             run({'read_surface':True}, bundle, step_scale=-1e-7)
             factory.assert_called_once()
             self.assertIs(geometry._traceable_vmec_surfaces_from_state, original)
             bundle['native_precision']='float64'
-            self.assertEqual(run({}, bundle, step_scale=1e-7), ('ordinary', output))
+            self.assertEqual(run({}, bundle, step_scale=1e-7), (runtime, output))
         self.assertNotIn('jax', sys.modules)
 
 

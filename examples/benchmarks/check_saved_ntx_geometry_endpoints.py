@@ -50,6 +50,8 @@ def collect_inputs(forward, geo, config, bundle, step):
         try:
             forward._runtime_for_frozen_linearized_geometry_step(config, bundle, step_scale=step)
         except InputsReady:
+            if not step:
+                bundle['native_baseline_surfaces'] = captured['surfaces']
             return captured
     raise RuntimeError('Original FD constructor did not reach the pre-NTX boundary')
 

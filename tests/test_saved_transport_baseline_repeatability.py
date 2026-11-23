@@ -131,6 +131,11 @@ class SavedBaselineTests(unittest.TestCase):
         np.testing.assert_array_equal(er, reference['initial_y'][-2:])
         er[0] = 100.
         self.assertEqual(reference['initial_y'][-2], 5.)
+        diagnostic = io.StringIO()
+        with contextlib.redirect_stdout(diagnostic), self.assertRaisesRegex(ValueError, 'geometry/database'):
+            check.ad_reference_initial_er(reference, **dict(kwargs, database=Database(np.asarray([1.,3.]))))
+        self.assertIn("support['database'].table",diagnostic.getvalue())
+        self.assertIn("'max_abs': 1.0",diagnostic.getvalue())
         for bad in (
             dict(kwargs, database=None),
             dict(kwargs, database=Database(np.asarray([1., 3.]))),
@@ -513,6 +518,21 @@ class SavedBaselineTests(unittest.TestCase):
                     namespace['main']()
                 capture.assert_not_called()
                 objectives.assert_not_called()
+
+            # A support mismatch must be saved and rejected before time stepping.
+            runtime.models.flux.neoclassical_model.database.table[0] += .125
+            audit = namespace['save_gradient_audit']
+            audit.reset_mock()
+            schedule = Mock(side_effect=AssertionError('time evolution reached'))
+            namespace['_schedule_rollout'] = schedule
+            with patch.dict(sys.modules, {'check_saved_transport_baseline_repeatability':module}), \
+                 patch.object(sys, 'argv', ref_args), contextlib.redirect_stdout(io.StringIO()), \
+                 self.assertRaisesRegex(ValueError, 'geometry/database'):
+                namespace['main']()
+            schedule.assert_not_called()
+            audit.assert_called_once()
+            self.assertEqual(audit.call_args.args,('fd_reference_support',))
+            self.assertIs(audit.call_args.kwargs['support']['database'],runtime.models.flux.neoclassical_model.database)
 
 
 if __name__ == "__main__":

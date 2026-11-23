@@ -1105,11 +1105,13 @@ The subtraction and addition above are performed in extended precision
 before the final result is cast back to the ordinary field's dtype. This
 recentring preserves the exact common CUDA baseline and excludes a static
 CPU/CUDA evaluation offset from the measured increment. It does not force
-an endpoint, derivative or cost to match AD. At zero step the hook returns
-the original surface arrays unchanged and remembers those exact objects
-used by the baseline scan. It performs no extended-precision evaluation.
-This avoids a second CUDA reconstruction when choosing the anchoring
-baseline. Recorded solver/replay metadata follow their original code path.
+an endpoint, derivative or cost to match AD. Following the baseline-isolation
+correction below, zero step installs no hook and constructs no precision
+evaluator. The exact native surfaces are retained from the completed ordinary
+runtime, or from the pre-NTX capture when that diagnostic stops early.
+The evaluator is initialized only for a nonzero perturbation and is seeded
+with those arrays, without another baseline reconstruction. Recorded
+solver/replay metadata follow their original code path.
 
 The correction is deliberately limited to native VMEC surface inputs.
 Transport geometry and normalization channels retain their ordinary
@@ -1227,3 +1229,139 @@ integration check. After the traversal fix, the actual saved-state check
 again completes all 13 rows with an exact baseline; its updated results
 are in the table above. CUDA verification still requires rerunning the
 same original-step command in a fresh output directory.
+
+### CUDA geometry-input verification passed at the original step
+
+The remote check completed at `6608dd1` with `--native-precision extended`
+and `--step-scales 1`, using the same saved AD16 reference and original
+FD increment. All 13 relative differences below were independently checked
+against the printed AD/FD contractions within their rounding precision.
+No equilibrium, implicit, coefficient, root or transport solve ran.
+
+The baseline and both original-step *transport geometry* endpoints matched
+the saved FD arrays byte-for-byte. That guard covers the geometry dataclass;
+it does not claim that the corrected native-surface increments equal the
+old float64 increments. The AD reference is unchanged.
+
+Both columns are geometry-input-map relative differences
+`abs(map_FD-AD)/abs(AD)`, comparing the original h float64 sweep with this
+same-h corrected run. They are not full nonlinear FD16 gradient errors.
+
+| Objective | Original float64 h | Corrected same h, CUDA preparation |
+| --- | ---: | ---: |
+| softmax_Er | `7.093370e-06` | `1.005708e-07` |
+| net_total_power_volume_average_mw_m3 | `9.607474e-07` | `1.857070e-06` |
+| Er_transition_left | `5.682992e-06` | `5.199269e-08` |
+| Er_transition_right | `2.769199e-06` | `5.854719e-08` |
+| Er2_volume_average | `2.529453e-05` | `1.282310e-07` |
+| Er_volume_average | `1.203892e-05` | `1.418525e-07` |
+| electron_temperature_volume_average_keV | `2.284889e-06` | `2.171312e-06` |
+| total_pressure_volume_average | `2.261780e-06` | `2.236654e-06` |
+| alpha_power_volume_average_mw_m3 | `1.068927e-06` | `1.895490e-06` |
+| bootstrap_current_softmax_abs_scaled | `4.221015e-05` | `6.030615e-08` |
+| Er_transition_rho | `2.271891e-06` | `2.768575e-08` |
+| Er_transition_location_moment | `2.271891e-06` | `2.768575e-08` |
+| Er_transition_strength | `1.276388e-06` | `8.809501e-07` |
+
+The native correction substantially reduces the Er and bootstrap gaps
+without changing the step. Temperature/pressure remain near their previous
+errors, and net/alpha power are worse in the total contraction. These rows
+also include the unmodified transport-geometry and normalization-channel
+secants; no claim is made that the native-only correction resolves them.
+The earlier per-field split already showed direct-geometry contributions
+of this size. The transition-strength residual also remains material.
+
+This is the first successful CUDA integration check of the native-field
+precision helper. The next necessary validation is a full nonlinear ZBS
+FD16 replay at this same original step and with the same saved AD16 point.
+No new AD sweep or code change is required for that test:
+
+```bash
+(
+  cd "$HOME/NEOPAX" || exit 1
+  set -o pipefail
+  env -u PYTHONPATH -u LD_LIBRARY_PATH -u JAX_PLATFORM_NAME \
+    -u XLA_FLAGS -u JAX_COMPILATION_CACHE_DIR -u XLA_PYTHON_CLIENT_ALLOCATOR \
+    JAX_PLATFORMS=cuda,cpu JAX_ENABLE_X64=true \
+    JAX_ENABLE_COMPILATION_CACHE=0 XLA_PYTHON_CLIENT_PREALLOCATE=false \
+    NTX_DISABLE_COMPILATION_CACHE=1 VMEX_COMPILATION_CACHE=disabled \
+    NEOPAX_TEST_RUNTIME_NTSS1D=1 \
+    "$HOME/jax_env/bin/python" - <<'PY'
+from pathlib import Path
+import os, shutil, sys, tempfile
+sys.path.insert(0, 'examples/benchmarks')
+import benchmark_transport_ntss1d_ad_fd as check
+base = (check.ROOT/'outputs/ntss1d_zbs_saved_ad_geometry_2_versy_').resolve()
+snapshots = base/'ad/snapshots'
+terminals = list(snapshots.glob('ad_terminal_*.npz'))
+if len(terminals) != 1:
+    raise SystemExit('Expected exactly one saved AD terminal capture')
+out = Path(tempfile.mkdtemp(prefix='ntss1d_zbs_fd16_nativefix_', dir=check.ROOT/'outputs'))
+print('Results:', out, flush=True)
+shutil.copy2(base/'config.toml', out/'config.toml')
+(out/'ad').symlink_to((base/'ad').resolve(), target_is_directory=True)
+command = [sys.executable, check.FD_SCRIPT, '--config', str(out/'config.toml'),
+    '--parameter', 'ZBS:1:0', '--accepted-step-limit', '16', *check.FD_OPTIONS,
+    '--fd-rel-step', '3e-7', '--fd-abs-step', '1e-10',
+    '--geometry-fd-native-precision', 'extended',
+    '--ad-geometry-reference', str(snapshots),
+    '--ad-baseline-reference', str(terminals[0])]
+check.worker(command, out/'fd_ZBS_1_0', os.environ)
+shutil.copy2(check.FD_REPORTS/'ZBS_1_0_forward_fd_frozen_linearized_summary.json',
+             out/'fd_ZBS_1_0/summary.json')
+rows = check.compare(out)
+if not rows or not all(r['comparison_baseline_matches'] for r in rows):
+    raise SystemExit('Baseline mismatch: gradient comparison is not validated')
+for r in rows:
+    print(f"{r['objective']}: AD={r['gradient_ad']:.12e} FD={r['gradient_fd']:.12e} "
+          f"relative_error={r['relative_difference_to_fd']:.6e}")
+PY
+) || printf '\nCorrected FD16 replay stopped; terminal kept open.\n'
+```
+
+### Full FD16 attempt stopped at the common-support guard
+
+Run `outputs/ntss1d_zbs_fd16_nativefix_z3nbr4hg` stopped in
+`ad_reference_initial_er`: fresh geometry/database support differed from
+the archived AD reference. It reached no time stepping or FD endpoints and
+produced no gradient comparison. Wall time was `16:51.71`; maximum host
+RSS was `2,671,276 KiB`, not a GPU peak measurement. The earlier
+geometry-only check stops before database construction and therefore
+could not establish this baseline coefficient-table equality.
+
+The previous guard message did not identify the differing fields and the
+fresh support was not captured at that early exit. The log alone cannot
+establish whether the geometry, normalized coordinates or coefficient
+tables differed. No claim is made that this failure is another AD error
+or that the zero-step wrapper is its demonstrated numerical cause.
+
+An avoidable zero-step instrumentation change was found and removed:
+the native precision wrapper was previously installed while constructing
+the ordinary baseline, even though it returned unmodified arrays. Now
+there is no precision helper initialization, import or function replacement
+until the first nonzero endpoint. The ordinary NTX model retains its
+`scan_surfaces`; the endpoint evaluator uses those exact objects as its
+anchor. The pre-NTX checker likewise retains the captured zero-step
+surfaces after its ordinary input call. Missing baseline surfaces raise
+an error rather than triggering an unobserved reconstruction.
+
+A strengthened runtime regression fails before this change because the
+baseline builder sees the replacement function. It passes afterwards,
+asserting original function identity throughout baseline construction,
+no helper instantiation at zero, reuse of the model's actual surface tuple
+and restoration after endpoint construction.
+
+Independently, the strict support guard now prints every differing field,
+its entry count/first index and maximum absolute difference. The FD worker
+saves `fd_reference_support_*.npz` before the check, including fresh
+geometry/database support, packed initial state and native scan inputs.
+This preserves the evidence even if the guard fails. Tests verify both
+the diagnostic output and capture-before-failure ordering, with no time
+evolution reached. No equality tolerances, reference fields, interpolation,
+AD rules or frozen replay contracts were relaxed or replaced.
+
+The next validation can rerun the same full FD16 command after publishing
+this focused patch. It will continue automatically if the baseline matches;
+otherwise the printed field differences and saved snapshot localize the
+failure without another blind rerun. A separate baseline-only run is not
+required. CUDA validation of this isolation change remains outstanding.

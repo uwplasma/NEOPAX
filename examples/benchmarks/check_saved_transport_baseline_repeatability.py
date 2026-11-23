@@ -90,7 +90,10 @@ def ad_reference_initial_er(reference, *, geometry, database, initial_y, er_size
     current = {k: v for label, obj in (("geometry", geometry), ("database", database))
                for k, v in numeric_leaves(obj, f"support['{label}']").items()
                if not k.endswith(".__weak_type__")}
-    if database is None or not expected or differences(expected, current):
+    rows = differences(expected, current)
+    if database is None or not expected or rows:
+        for row in rows:
+            print("[fd-ad-reference-support]", row, flush=True)
         raise ValueError("AD reference geometry/database arrays differ from the fresh FD runtime.")
     saved, initial_y = np.asarray(reference["initial_y"]), np.asarray(initial_y)
     if (saved.ndim != 1 or saved.shape != initial_y.shape or saved.dtype != initial_y.dtype

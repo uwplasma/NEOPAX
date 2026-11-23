@@ -70,6 +70,9 @@ class EndpointTests(unittest.TestCase):
         self.assertEqual(result,dict(geometry='geometry',channels='channels',surfaces='surfaces'))
         self.assertEqual(calls,[('entrypoint',-.1),('inputs','perturbed state')])
         self.assertIs(geo.build_ntx_runtime_scan_inputs_from_vmec_state,original)
+        bundle = {}
+        baseline = check.collect_inputs(forward,geo,{},bundle,0.)
+        self.assertIs(bundle['native_baseline_surfaces'],baseline['surfaces'])
         with self.assertRaisesRegex(RuntimeError,'pre-NTX'):
             check.collect_inputs(SimpleNamespace(_runtime_for_frozen_linearized_geometry_step=lambda *a,**kw:None),geo,{}, {},0.)
 

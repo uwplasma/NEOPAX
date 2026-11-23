@@ -1065,19 +1065,20 @@ def _runtime_for_frozen_linearized_geometry_step(
         bundle["state_tangent"],
     )
     precision_context = contextlib.nullcontext()
-    if bundle.get("native_precision") == "extended":
+    if step_scale and bundle.get("native_precision") == "extended":
         from unittest.mock import patch
         from NEOPAX import _geometry_autodiff as geometry_module
         from _fd_native_precision import NativePrecision
         if "native_precision_evaluator" not in bundle:
+            if "native_baseline_surfaces" not in bundle:
+                raise ValueError("Extended native FD requires the ordinary zero-step baseline first")
             bundle["native_precision_evaluator"] = NativePrecision(
                 geometry_module, bundle["state_star"], bundle["state_tangent"])
+            surfaces = bundle["native_baseline_surfaces"]
+            bundle["native_precision_evaluator"].remember(
+                tuple(float(surface.requested_psi_n) for surface in surfaces), surfaces)
         evaluator = bundle["native_precision_evaluator"]
         def native_surfaces(context, vmec_state, *, s_values):
-            if not step_scale:
-                baseline = evaluator.original(context, vmec_state, s_values=s_values)
-                evaluator.remember(s_values, baseline)
-                return baseline
             return evaluator.evaluate(context, step_scale, s_values=s_values)
         precision_context = patch.object(geometry_module, "_traceable_vmec_surfaces_from_state", native_surfaces)
     with precision_context:
@@ -1087,6 +1088,11 @@ def _runtime_for_frozen_linearized_geometry_step(
             state,
             n_r=int(bundle["n_r"]),
         )
+    if not step_scale and bundle.get("native_precision") == "extended":
+        flux = getattr(getattr(runtime, "models", None), "flux", None)
+        surfaces = getattr(getattr(flux, "neoclassical_model", flux), "scan_surfaces", None)
+        if surfaces is not None:
+            bundle["native_baseline_surfaces"] = surfaces
     if fixed_initial_er is not None:
         state = dataclasses.replace(state, Er=jnp.asarray(fixed_initial_er, dtype=state.Er.dtype))
     return runtime, state
@@ -1623,6 +1629,11 @@ def main() -> None:
         neo = getattr(baseline_runtime.models.flux, "neoclassical_model", baseline_runtime.models.flux)
         initial_y = np.concatenate([np.asarray(v).reshape(-1)
             for v in _pack_transport_state_arrays(baseline_profile_state, baseline_runtime.species)])
+        channels = getattr(neo, "channels", None)
+        save_gradient_audit("fd_reference_support", initial_y=initial_y,
+            support={"geometry": baseline_runtime.geometry, "database": getattr(neo, "database", None)},
+            scan_inputs={"surfaces": getattr(neo, "scan_surfaces", None),
+                "channels": channels.as_mapping() if hasattr(channels, "as_mapping") else None})
         er = ad_reference_initial_er(ad_baseline_reference, geometry=baseline_runtime.geometry,
             database=getattr(neo, "database", None), initial_y=initial_y, er_size=baseline_profile_state.Er.size)
         print("[fd-ad-reference] using saved AD initial Er; fresh-root max_abs_difference="
