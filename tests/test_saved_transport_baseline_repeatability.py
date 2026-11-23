@@ -24,6 +24,49 @@ _jax_after = "jax" in sys.modules
 
 
 class SavedBaselineTests(unittest.TestCase):
+    def test_fd_device_context_matches_ad_for_default_and_explicit_placement(self):
+        root = SCRIPT.parents[2]
+        namespace = dict(Any=object, contextlib=contextlib, Path=Path,
+            jax=SimpleNamespace(default_backend=lambda: 'gpu',
+                local_devices=lambda backend: [backend+':0'],
+                default_device=lambda device: contextlib.nullcontext(device)))
+        for filename, names in (
+            (root/'NEOPAX/_orchestrator.py', ('_normalized_general_device', '_execution_device_context')),
+            (SCRIPT.with_name('benchmark_transport_reverse_ad_only.py'), ('_benchmark_device_context',)),
+        ):
+            functions = [n for n in ast.parse(filename.read_text()).body
+                         if isinstance(n, ast.FunctionDef) and n.name in names]
+            exec(compile(ast.Module(body=functions, type_ignores=[]), str(filename), 'exec'), namespace)
+        source = SCRIPT.with_name('benchmark_transport_realtime_geometry_forward_fd.py')
+        main = next(n for n in ast.parse(source.read_text()).body
+                    if isinstance(n, ast.FunctionDef) and n.name == 'main')
+        start = next(i for i, n in enumerate(main.body) if isinstance(n, ast.Assign)
+                     and isinstance(n.targets[0], ast.Name) and n.targets[0].id == 'device_arg')
+        end = next(i for i, n in enumerate(main.body[start:], start) if isinstance(n, ast.Expr)
+                   and isinstance(n.value, ast.Call) and isinstance(n.value.func, ast.Attribute)
+                   and isinstance(n.value.func.value, ast.Name)
+                   and n.value.func.value.id == 'device_context')
+        function = ast.parse('def placement(args):\n    pass\n').body[0]
+        function.body = main.body[start:end] + ast.parse('return device_context, config').body
+        namespace['parser'] = SimpleNamespace(error=lambda message: self.fail(message))
+        exec(compile(ast.fix_missing_locations(ast.Module(body=[function], type_ignores=[])),
+                     str(source), 'exec'), namespace)
+        for configured in ('auto', 'cpu', 'gpu'):
+            for requested in (None, 'default', 'auto', 'cpu', 'gpu'):
+                with self.subTest(configured=configured, requested=requested):
+                    def prepare(*, device, **kwargs):
+                        return {'general': {'device': configured if device is None else device}}
+                    namespace['_prepare_benchmark_config'] = Mock(side_effect=prepare)
+                    args = SimpleNamespace(device=requested, config='unused.toml',
+                        radau_jacobian_reuse_mode='legacy', geometry_fd_native_precision='float64',
+                        geometry_input_only_dir=None, vmec_response_mode=None)
+                    context, config = namespace['placement'](args)
+                    with context as fd, namespace['_benchmark_device_context'](config) as ad:
+                        self.assertEqual(fd, ad)
+                    expected = None if requested in (None, 'default') else requested
+                    self.assertEqual(namespace['_prepare_benchmark_config'].call_args.kwargs['device'], expected)
+        self.assertEqual(_jax_before, 'jax' in sys.modules)
+
     def test_saved_ad_geometry_reuses_exact_state_and_named_direction_without_solves(self):
         source = SCRIPT.with_name('benchmark_transport_realtime_geometry_forward_fd.py')
         names = ('_saved_ad_geometry_linearization','_frozen_linearized_vmec_geometry_bundle')
@@ -425,6 +468,7 @@ class SavedBaselineTests(unittest.TestCase):
         capture = Mock()
         objectives = Mock(side_effect=AssertionError("ordinary objective path reached"))
         namespace = dict(argparse=argparse, Path=Path, contextlib=contextlib,
+            _execution_device_context=lambda config: contextlib.nullcontext(),
             atexit=SimpleNamespace(register=Mock()), jnp=np,
             jax=SimpleNamespace(default_backend=lambda: "gpu", local_devices=lambda **kw: ["cuda:0"],
                                 default_device=lambda device: contextlib.nullcontext()),

@@ -1332,7 +1332,7 @@ def main() -> None:
         type=str,
         default="default",
         help=(
-            "Benchmark placement. 'default' uses JAX's current default device, "
+            "Benchmark placement. 'default' follows general.device, as in AD; "
             "'auto' leaves placement untouched, and 'cpu'/'gpu' force that backend."
         ),
     )
@@ -1534,22 +1534,14 @@ def main() -> None:
         parser.error("--geometry-input-only-dir requires realtime VMEC geometry and ntx_scan_runtime")
     if args.vmec_response_mode is not None:
         config.setdefault("geometry", {})["vmec_response_mode"] = args.vmec_response_mode
-    if device_arg == "default":
-        default_backend = jax.default_backend()
-        selected_device = jax.local_devices(backend=default_backend)[0]
-        device_context = jax.default_device(selected_device)
-    elif device_arg == "auto":
-        selected_device = None
-        device_context = contextlib.nullcontext()
-    else:
-        selected_device = None
-        device_context = _execution_device_context(config)
+    # Match AD placement: auto leaves JAX's default-device context untouched.
+    device_context = _execution_device_context(config)
     device_context.__enter__()
     atexit.register(lambda: device_context.__exit__(None, None, None))
     print(
         "[autodiff-gate] device placement: "
         f"requested={device_arg} default_backend={jax.default_backend()} "
-        f"selected_device={selected_device}",
+        f"configured={config.get('general', {}).get('device', 'auto')}",
         flush=True,
     )
     profile_cfg = _baseline_profile_cfg(config)

@@ -1274,7 +1274,8 @@ of this size. The transition-strength residual also remains material.
 This is the first successful CUDA integration check of the native-field
 precision helper. The next necessary validation is a full nonlinear ZBS
 FD16 replay at this same original step and with the same saved AD16 point.
-No new AD sweep or code change is required for that test:
+No new AD sweep is required for that test. The command below includes the
+automatic device placement isolated in the subsequent baseline check:
 
 ```bash
 (
@@ -1296,11 +1297,12 @@ snapshots = base/'ad/snapshots'
 terminals = list(snapshots.glob('ad_terminal_*.npz'))
 if len(terminals) != 1:
     raise SystemExit('Expected exactly one saved AD terminal capture')
-out = Path(tempfile.mkdtemp(prefix='ntss1d_zbs_fd16_nativefix_', dir=check.ROOT/'outputs'))
+out = Path(tempfile.mkdtemp(prefix='ntss1d_zbs_fd16_nativefix_auto_', dir=check.ROOT/'outputs'))
 print('Results:', out, flush=True)
 shutil.copy2(base/'config.toml', out/'config.toml')
 (out/'ad').symlink_to((base/'ad').resolve(), target_is_directory=True)
 command = [sys.executable, check.FD_SCRIPT, '--config', str(out/'config.toml'),
+    '--device', 'auto',
     '--parameter', 'ZBS:1:0', '--accepted-step-limit', '16', *check.FD_OPTIONS,
     '--fd-rel-step', '3e-7', '--fd-abs-step', '1e-10',
     '--geometry-fd-native-precision', 'extended',
@@ -1365,3 +1367,167 @@ this focused patch. It will continue automatically if the baseline matches;
 otherwise the printed field differences and saved snapshot localize the
 failure without another blind rerun. A separate baseline-only run is not
 required. CUDA validation of this isolation change remains outstanding.
+
+### Device-context mismatch isolated in the FD baseline
+
+The subsequent run `outputs/ntss1d_zbs_fd16_nativefix_ffechzxt` still stopped
+before time stepping or FD endpoints. Its fresh support capture identifies
+last-bit changes in transport geometry (`a_b`: `2.220446049250313e-16`,
+`R0`: `1.7763568394002505e-15`) and a maximum `D13` change of
+`5.796837760485785e-03`. Removing the zero-step precision wrapper was
+therefore insufficient.
+
+A NumPy-only comparison against the successful geometry-only baseline found:
+
+| Boundary | Compared fields | Differing fields |
+| --- | ---: | ---: |
+| VMEC state, tangent, parameters and mask | 29 | 0 |
+| Floating transport-geometry payload | 10 | 8 |
+| Floating normalization-channel payload | 5 | 5 |
+| Floating native-surface payload | 49 | 0 |
+
+The FD benchmark's default explicitly entered
+`jax.default_device(jax.local_devices(backend=jax.default_backend())[0])`.
+The AD benchmark and the standalone geometry checker leave the device context
+untouched when the configuration uses automatic placement. These are different
+JAX execution contexts even with the same physical GPU and identical stored
+equilibrium arrays.
+
+Remote control `outputs/zbs_auto_geometry_WGuHfQ`, using the original FD
+entrypoint, the same saved AD geometry linearization and `--device auto`,
+reported `differing leaves=0`, `first_changed_stage=none` and
+`first_changed_bit_stage=none`. It stopped before NTX coefficients, roots and
+transport. This identifies device-context selection as a trigger for the
+baseline input drift in this configuration. It does not identify the particular
+compiled operation that changes rounding.
+
+FD's default now uses `_execution_device_context(config)`, respecting
+`general.device` in the same way as AD. Automatic placement still selects the
+GPU through JAX's default backend, without introducing an explicit device
+context. Explicit `--device cpu` and `--device gpu` remain supported. The CLI
+help and placement banner describe the configured selection.
+
+The regression exercises the actual FD setup statements, the production
+placement helper and AD's helper with mocked devices for all fifteen
+combinations of configured auto/CPU/GPU and absent/default/auto/CPU/GPU CLI
+selection. Before the correction it fails on automatic and CPU configurations
+with default CLI selection. Afterward it passes. All twenty focused baseline,
+native-precision and geometry-payload tests pass without importing JAX.
+
+No physics, time-stepping, root rule, AD rule, FD increment or exact comparison
+guard changed. Full FD16 validation remains outstanding. Its next run should
+retain the original `3e-7` relative step, extended native increments, saved AD
+geometry and baseline references, and exact support/state/time guards. An
+explicit `--device auto` can exercise the corrected placement on an existing
+remote checkout before the default correction is published.
+
+### Full automatic-placement run still rejects the coefficient tables
+
+Run `outputs/ntss1d_zbs_fd16_nativefix_auto_qhrxybz6` used `--device auto`
+and still stopped at the exact support guard, before transport and FD
+endpoints. Unlike the preceding failure, no stored transport-geometry or
+database-coordinate fields were reported as different. Only `D11_log`, `D13`
+and `D33` differed, with maxima `1.2061588448020188e-06`,
+`2.5311434897634655e-03` and `1.7155652727046666e-04`, respectively.
+Wall time was `11:48.67`; maximum host RSS was `2,669,484 KiB`.
+
+Thus the device-context correction does not establish common coefficient
+tables or validate any gradient. The support guard does not compare all live
+scan-channel/native-surface inputs. These are available in this run's
+`fd_reference_support_vrkvo31b.npz` and must be compared with the successful
+input-only capture, including the surface scalar fields omitted from the
+earlier 49-field differentiable-payload comparison. Source inspection also
+shows that generic and recorded NTX scans both call the same preparation and
+serial coefficient-scan kernels; the mode names alone do not demonstrate the
+cause of this remaining discrepancy. No solver or AD-rule change is justified
+by this log, and no full FD16 result has been produced by this attempt.
+
+### Uploaded-array audit and one-point preparation/compilation replay
+
+Archive `zbs_remaining_inputs_20261123.tar.gz` was inspected locally with
+NumPy only. Comparing its failing full-run capture against the passing
+`zbs_auto_geometry_WGuHfQ` input-only capture gives exact byte equality for
+all 25 stored transport-geometry fields, 19 stored scan-channel fields and
+147 stored native-surface fields. This includes the surface scalar fields
+omitted from the earlier differentiable-payload comparison. The 49 static
+surface metadata entries and channel rho are not leaves of the failing
+snapshot; the input-only capture retains those metadata values. The uploaded
+NEOPAX geometry/transport-model sources and four NTX source files match the
+source hashes in the earlier input-trace manifest.
+
+The reconstructed field at `(radius,nu,Er)=(6,0,7)` has the same hexadecimal
+value, `0x1.c035ba9ccdac0p-7`, in both input captures. Nevertheless the
+stored D13 values are `1.9534380624237300e+00` (archived AD) and
+`1.9559692059134934e+00` (failing FD), an absolute gap of
+`2.5311434897634655e-03`. Differences also occur in the zero-electric-field
+column at every radius, before any parameter perturbation. They therefore
+cannot be repaired by selecting a different FD increment or root branch.
+
+The passing input-only capture is not a capture of the original AD16
+prepared NTX matrices. Those matrices are absent from these files. Hence
+matching the current input captures does not demonstrate that the original
+AD16 coefficient solve used identical prepared arrays or that a particular
+GPU operation is nondeterministic. Source inspection shows generic and
+recorded coupling both reach `prepare_monoenergetic_system` and the same
+sequential coefficient-scan kernel.
+
+`check_saved_ntx_point_repeatability.py` isolates the next boundary with
+one saved native surface and one coefficient point. It verifies saved input
+and geometry equality, recorded library versions and numerical-source hashes
+before starting sequential GPU workers. Each worker saves its freshly
+prepared arrays. Subsequent workers then use the first worker's exact
+prepared bytes for the solve, and each compiled executable runs twice.
+Flat arguments to lowering avoid the known `ArgInfo`/surface constructor
+problem. The optimized HLO and input type/device descriptors are retained.
+
+`--deterministic-control` adds two workers with the kernel-local
+`xla_gpu_deterministic_ops` compilation option. This is an experimental
+control for compiler algorithm selection, not a production default or an
+environment requirement. The [OpenXLA option definition](https://github.com/openxla/xla/blob/main/xla/xla.proto)
+describes its deterministic algorithm-selection behavior. No solver,
+derivative rule or environment flag is patched by this diagnostic.
+
+Interpret the result in order: differing fresh preparation leaves identify
+upstream numerical preparation; different coefficients with identical frozen
+inputs identify a compilation/execution issue; stable one-point replays that
+differ from the archived full scans leave scan context or the original AD
+preparation unresolved. Neither a stable control nor a match to one archived
+coefficient validates transport gradients. The one-point scan has length one,
+whereas the archived production surface scans have length 176.
+At the selected point, stored D11 is floored to `1e-20` in both archived
+tables, so its normalized equality is uninformative. Raw D11 remains in the
+replay coefficient vectors and their repeatability check. The active-D11
+point `(5,0,6)` can be selected with `--point 5:0:6` when needed.
+
+Four NumPy/mock regressions cover exact input comparisons, preflight rejection,
+normalization and actual worker routing/restoration through flat arguments.
+The actual uploaded inputs also pass the diagnostic's local preflight after
+mapping manifest source paths to the uploaded/matching local copies; remote
+installed-version checks were intentionally omitted only for that local
+file readout. The uploaded `VmecSurface` constructor accepts the restored
+162-mode surface. JAX was not imported locally. CUDA validation of this new
+one-point replay is still pending.
+
+On the large machine, after publishing the new diagnostic:
+
+```bash
+(
+  cd "$HOME/NEOPAX" || exit 1
+  git pull --ff-only origin en/v0_main || exit 1
+  neopax_out=$(mktemp -d outputs/ntx_point_replay_XXXXXX) || exit 1
+  set -o pipefail
+  env -u PYTHONPATH -u LD_LIBRARY_PATH -u JAX_PLATFORM_NAME \
+    -u XLA_FLAGS -u JAX_COMPILATION_CACHE_DIR \
+    JAX_PLATFORMS=cuda,cpu JAX_ENABLE_X64=true \
+    JAX_ENABLE_COMPILATION_CACHE=0 XLA_PYTHON_CLIENT_PREALLOCATE=false \
+    NTX_DISABLE_COMPILATION_CACHE=1 \
+    "$HOME/jax_env/bin/python" \
+    examples/benchmarks/check_saved_ntx_point_repeatability.py \
+    --fd-run outputs/ntss1d_zbs_fd16_nativefix_auto_qhrxybz6 \
+    --input-reference outputs/zbs_auto_geometry_WGuHfQ \
+    --ad-dir outputs/ntss1d_zbs_saved_ad_geometry_2_versy_/ad/snapshots \
+    --source-metadata outputs/ntss1d_zbs_input_paths_k4RToS/ad/metadata.json \
+    --point 6:0:7 --deterministic-control --out-dir "$neopax_out" \
+    2>&1 | tee "$neopax_out.log"
+) || printf '\nOne-point replay stopped; terminal kept open.\n'
+```

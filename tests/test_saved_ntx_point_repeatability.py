@@ -1,0 +1,141 @@
+"""Saved-input validation for the point replay; no JAX or physical solves."""
+import importlib.util
+import hashlib
+import json
+from pathlib import Path
+import sys
+import tempfile
+from contextlib import redirect_stdout
+import io
+from types import SimpleNamespace
+import unittest
+from unittest.mock import patch
+
+import numpy as np
+
+FILE = Path(__file__).resolve().parents[1]/'examples/benchmarks/check_saved_ntx_point_repeatability.py'
+spec = importlib.util.spec_from_file_location('point_replay', FILE)
+replay = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(replay)
+
+
+class PointReplayTests(unittest.TestCase):
+    def test_worker_replays_saved_preparation_through_flat_arguments_without_global_options(self):
+        class Ready(np.ndarray):
+            def block_until_ready(self):
+                return self
+        compiled_options = []
+        class Executable:
+            def __init__(self, function):
+                self.function = function
+            def __call__(self, *args):
+                return self.function(*args).view(Ready)
+            def as_text(self):
+                return 'mock compiled scan'
+        def jit(function, *, compiler_options):
+            compiled_options.append(compiler_options)
+            return SimpleNamespace(lower=lambda *args:SimpleNamespace(compile=lambda:Executable(function)))
+        tree = SimpleNamespace(tree_flatten_with_path=lambda p:([('.matrix',p.matrix)], 'prepared'),
+            keystr=lambda path:path, tree_unflatten=lambda shape,values:SimpleNamespace(matrix=values[0]))
+        def scan(prepared, nu, es):
+            np.testing.assert_array_equal(prepared.matrix, [[1.]])
+            np.testing.assert_array_equal(nu,[.1])
+            np.testing.assert_array_equal(es,[.2])
+            return np.asarray([[2.,0.,3.,5.,0.]])
+        prepare = unittest.mock.Mock(return_value=SimpleNamespace(matrix=np.ones((1,1))))
+        modules = {'jax':SimpleNamespace(default_backend=lambda:'gpu',config=SimpleNamespace(x64_enabled=True),
+                    tree_util=tree,device_get=lambda x:x,jit=jit), 'jax.numpy':np,
+            'ntx.geometry':SimpleNamespace(VmecSurface=lambda **values:SimpleNamespace(**values)),
+            'ntx':SimpleNamespace(GridSpec=lambda **values:SimpleNamespace(**values),prepare_monoenergetic_system=prepare),
+            'ntx._solver_scan':SimpleNamespace(_scan_coefficients_sequential_impl=scan),
+            'NEOPAX._transport_flux_models':SimpleNamespace(_build_ntx_field_channels=lambda *args:(None,np.asarray([[.2]]),None))}
+        # import jax.numpy also resolves numpy as an attribute of the fake parent.
+        modules['jax'].numpy = np
+        config = {'neoclassical':{'ntx_scan_n_theta':25,'ntx_scan_n_zeta':31,'ntx_scan_n_xi':64,
+            'ntx_scan_rho':[.5],'ntx_scan_er_tilde':[.001],'ntx_scan_nu_v':[.1]}}
+        reference = {"trace['03_surfaces'][0]['path']":np.asarray('input.vmec'),
+            "trace['03_surfaces'][0]['b_cos']":np.ones(1)}
+        expected = {'support[\'database\'].'+name:np.ones((1,1,1)) for name in ('D11_log','D13','D33')}
+        inputs = {"channels['drds']":np.asarray([2.])}
+        before = dict(replay.os.environ)
+        with tempfile.TemporaryDirectory() as directory, patch.dict(sys.modules, modules), redirect_stdout(io.StringIO()):
+            root = Path(directory)
+            for mode in ('native_1','native_2','controlled_1'):
+                folder = root/mode
+                folder.mkdir()
+                args = SimpleNamespace(point=(0,0,0),out_dir=folder,worker=mode,
+                    frozen_prepared=None if mode=='native_1' else root/'native_1')
+                replay.worker(args,(config,expected,reference,expected,inputs))
+                with np.load(folder/'result.npz') as result:
+                    np.testing.assert_array_equal(result['table_0'],[np.log10(8.),6.,.5])
+                    np.testing.assert_array_equal(result['coefficients_0'],result['coefficients_1'])
+                # Later workers must retain this fresh drift as evidence but
+                # use the first worker's exact arrays for the coefficient solve.
+                prepare.return_value = SimpleNamespace(matrix=np.asarray([[9.]]))
+            with np.load(root/'native_2/fresh_prepared.npz') as z:
+                np.testing.assert_array_equal(z['prepared.matrix'],[[9.]])
+        self.assertEqual(compiled_options,[{},{},{'xla_gpu_deterministic_ops':True}])
+        self.assertEqual(before,dict(replay.os.environ))
+        self.assertNotIn('jax',sys.modules)
+
+    def test_exact_input_alignment_detects_ulp_signed_zero_dtype_and_missing_fields(self):
+        a = replay.scan_inputs({"trace['03_channels']['b00']":np.asarray([0.,2.]),
+            "trace['04_surfaces'][0]['b_cos']":np.asarray([3.]), 'irrelevant':np.zeros(1)})
+        b = replay.scan_inputs({"scan_inputs['channels']['b00']":np.asarray([0.,2.]),
+            "scan_inputs['surfaces'][0].b_cos":np.asarray([3.])})
+        self.assertEqual(replay.changes(a,b), [])
+        for changed in (np.asarray([-0.,2.]), np.asarray([0.,np.nextafter(2.,3.)]),
+                        np.asarray([0.,2.],dtype=np.float32), np.asarray([0.])):
+            self.assertEqual(replay.changes(a,dict(b,**{"channels['b00']":changed})), ["channels['b00']"])
+        self.assertEqual(replay.changes(a,{"channels['b00']":b["channels['b00']"]}), ["surfaces[0]['b_cos']"])
+
+    def test_preflight_rejects_changed_inputs_geometry_and_sources_before_jax(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root/'fd_ZBS_1_0/snapshots').mkdir(parents=True)
+            (root/'config.toml').write_text('[neoclassical]\n')
+            args = SimpleNamespace(fd_run=root,input_reference=root,ad_dir=root,
+                source_metadata=root/'metadata.json',point=(0,0,0))
+            source = root/'source.py'
+            source.write_text('pass\n')
+            args.source_metadata.write_text(json.dumps({'versions':{},'sources':{'ntx._solver':{
+                'path':str(source),'sha256':hashlib.sha256(source.read_bytes()).hexdigest()}}}))
+            geo = {"support['geometry'].a_b":np.asarray(1.)}
+            fd = dict(geo, **{"scan_inputs['channels']['b00']":np.ones(1),
+                "scan_inputs['surfaces'][0].b_cos":np.ones(1),
+                "support['database'].D13":np.ones((1,1,1))})
+            np.savez(root/'normalization_inputs_1.npz',**{
+                "trace['02_channels']['b00']":np.ones(1),
+                "trace['03_surfaces'][0]['b_cos']":np.ones(1)})
+            np.savez(root/'ad_terminal_1.npz',**geo)
+            path = root/'fd_ZBS_1_0/snapshots/fd_reference_support_1.npz'
+            np.savez(path,**fd)
+            self.assertEqual(len(replay.preflight(args)[-1]),2)
+            fd["scan_inputs['channels']['b00']"][0] = np.nextafter(1.,2.)
+            np.savez(path,**fd)
+            with self.assertRaisesRegex(ValueError,'input fields differ'):
+                replay.preflight(args)
+            fd["scan_inputs['channels']['b00']"][0] = 1.
+            fd["support['geometry'].a_b"] = np.asarray(2.)
+            np.savez(path,**fd)
+            with self.assertRaisesRegex(ValueError,'geometries differ'):
+                replay.preflight(args)
+            fd.update(geo)
+            np.savez(path,**fd)
+            source.write_text('changed\n')
+            with self.assertRaisesRegex(ValueError,'Source changed'):
+                replay.preflight(args)
+            source.write_text('pass\n')
+            args.point = (1,0,0)
+            with self.assertRaisesRegex(ValueError,'outside the saved table'):
+                replay.preflight(args)
+        self.assertNotIn('jax',sys.modules)
+
+    def test_table_projection_uses_the_production_factors_and_d11_floor(self):
+        np.testing.assert_array_equal(replay.normalized(np.asarray([2.,0.,3.,5.,0.]),2.,.1),
+                                      [np.log10(8.),6.,.5])
+        self.assertEqual(replay.normalized(np.asarray([-2.,0.,3.,5.,0.]),2.,.1)[0],-20.)
+
+
+if __name__ == '__main__':
+    unittest.main()
