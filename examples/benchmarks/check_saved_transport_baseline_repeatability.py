@@ -317,14 +317,18 @@ class ForwardBaselineCaptured(BaseException):
 
 
 @contextlib.contextmanager
-def capture_original_forward(main, directory):
+def capture_original_forward(main, directory, *, stop=True):
     """Observe the actual entry point's first adaptive call without rebuilding it."""
     from NEOPAX import _reverse_ad_transport as reverse
     from unittest.mock import patch
     directory.mkdir(parents=True, exist_ok=False)
     original = reverse._radau_adaptive_schedule_rollout
+    captured = False
 
     def observe(execution, carry, **options):
+        nonlocal captured
+        if captured:
+            return original(execution, carry, **options)
         # Compile/run the original call first, with the same objects and options.
         with capture_forward_compiler_ir(directory):
             rollout = original(execution, carry, **options)
@@ -336,12 +340,17 @@ def capture_original_forward(main, directory):
         write_json(directory / "metadata.json", dict(options=options,
             accepted_count=int(rollout.accepted_count), attempt_count=int(rollout.attempt_count),
             failed=bool(rollout.failed), completed=bool(rollout.completed),
+            stop_after_capture=stop,
             entry_point=main.__code__.co_filename,
             versions={name: version(name) for name in ("jax", "jaxlib", "ntx", "vmex", "solvax")}))
         if bool(rollout.failed) or not bool(rollout.completed) or not np.isfinite(arrays["final_y"]).all():
             raise RuntimeError("Original forward baseline failed; capture retained.")
-        print(f"[original-forward] saved {directory}; stopped before backward/FD endpoints", flush=True)
-        raise ForwardBaselineCaptured()
+        captured = True
+        if stop:
+            print(f"[original-forward] saved {directory}; stopped before backward/FD endpoints", flush=True)
+            raise ForwardBaselineCaptured()
+        print(f"[original-forward] saved {directory}; continuing the original benchmark", flush=True)
+        return rollout
 
     with contextlib.ExitStack() as stack:
         stack.enter_context(patch.object(reverse, "_radau_adaptive_schedule_rollout", observe))
@@ -352,7 +361,8 @@ def capture_original_forward(main, directory):
                 raise ValueError("Unexpected FD adaptive helper; refusing to change its call.")
             stack.enter_context(patch.dict(namespace, {"_radau_adaptive_schedule_rollout": observe}))
         yield
-        raise RuntimeError("Benchmark returned without an original adaptive baseline capture.")
+        if not captured:
+            raise RuntimeError("Benchmark returned without an original adaptive baseline capture.")
 
 
 def run_benchmark(main):
@@ -370,7 +380,8 @@ def run_benchmark(main):
         with contextlib.ExitStack() as stack:
             control = stack.enter_context(fixed_solver_means()) if mode == "fixed" else None
             if directory:
-                stack.enter_context(capture_original_forward(main, Path(directory)))
+                stack.enter_context(capture_original_forward(main, Path(directory),
+                    stop=os.environ.get("NEOPAX_ORIGINAL_FORWARD_STOP", "1") != "0"))
             result = main()
     except ForwardBaselineCaptured:
         result = None

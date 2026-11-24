@@ -458,3 +458,58 @@ created for a forward-only capture. The observer neither adds a JIT nor
 changes compiler flags. NumPy/mock tests check original-call identity,
 unchanged options, early exit/restoration, live-script dispatch and visible
 archive differences. Full GPU capture remains pending.
+
+### Original-call capture completed; the differing archived AD program is absent
+
+Archive `original_fixed_mean_forwards_a7u5YD.tar.gz` was inspected locally
+with NumPy and the standard library only. Both real entry points completed
+16 accepted steps in 25 attempts. Every initial-carry field and every saved
+trajectory array matches byte-for-byte between AD and FD, including error
+estimates, timestep choices and final state/time. Common final time is
+`3.6694279357176053e-4`. Numeric execution contexts differ only in expected
+reverse-AD selectors, not forward solver parameters.
+
+| Comparison | Maximum packed-state difference | Final-time difference |
+| --- | --- | --- |
+| Fresh AD vs fresh FD | `0` | `0` |
+| Fresh FD vs archived FD (`fixed_means_ad_fd16_iHwp8o`) | `0` | `0` |
+| Fresh AD vs archived AD (`fixed_means_ad_fd16_iHwp8o`) | `8.994706846e-8` | `1.749323597e-11` |
+
+The new compiled programs are not byte-identical. Among uniquely matched
+fusion operations, two mid-radius interpolation kernels use Triton in AD
+and the native GPU emitter in FD. Their complete trajectories nevertheless
+agree, so those dispatch differences alone do not establish the cause of
+the older drift. Both programs contain the fixed solver-reduction kernels.
+The source also confirms that this database path's terminal AD snapshot
+uses the adaptive probe's retained final carry: the subsequent backward
+sweep does not generate a different primal endpoint.
+
+The archive contains the two new matching programs, not the compiler output
+or initial cache from the original differing AD run. It cannot identify the
+first arithmetic difference in that older execution. None of these captures
+evaluated perturbed FD endpoints or completed the requested gradient table.
+
+The existing observer can now record once and return the identical rollout
+object, allowing the original benchmark to continue. Add `--capture-forward-ir`
+to the paired runner for this mode. Captures are retained under each worker's
+`forward` directory, including when its later baseline guard fails. Successful
+workers require nonempty compiler output and exact agreement between the
+captured forward point and their actual terminal audit snapshot. The
+forward-only command still stops at the same boundary by default. The
+normal runner clears inherited capture controls, and saved settings distinguish
+the requested recording mode. No integrator, stage count, controller,
+tolerance, nonlinear/linear method, numerical formula or acceptance criterion
+is changed by this recording option.
+
+```bash
+python examples/benchmarks/benchmark_transport_ntss1d_ad_fd.py \
+  --config examples/benchmarks/Solve_Transport_equations_wHe_radau_ntx_scan_runtime_database_vmec_realtime_geometry_benchmark_black_box.toml \
+  --solver-mean-reduction fixed --capture-forward-ir \
+  --accepted-step-limit 16 --out-dir outputs/generic_full_forward_capture
+```
+
+Use a fresh output directory. This runs the full AD/FD comparison, rather
+than another forward-only control, and retains the compiled programs that
+actually produced its reported primals. Existing strict baseline guards
+remain active. Twenty-one saved-baseline tests and ten paired-runner tests
+pass locally without importing JAX; full GPU validation is pending.

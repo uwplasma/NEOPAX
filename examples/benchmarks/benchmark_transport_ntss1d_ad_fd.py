@@ -88,7 +88,8 @@ def worker_environment():
     env = {k: v for k, v in os.environ.items() if k not in {
         "PYTHONPATH", "LD_LIBRARY_PATH", "JAX_PLATFORM_NAME", "JAX_COMPILATION_CACHE_DIR",
         "XLA_FLAGS", "XLA_PYTHON_CLIENT_ALLOCATOR", "NEOPAX_GRADIENT_AUDIT_DIR",
-        "NEOPAX_SOLVER_MEAN_REDUCTION", "NEOPAX_ORIGINAL_FORWARD_DIR"}}
+        "NEOPAX_SOLVER_MEAN_REDUCTION", "NEOPAX_ORIGINAL_FORWARD_DIR",
+        "NEOPAX_ORIGINAL_FORWARD_STOP", "NEOPAX_CAPTURE_FORWARD_IR"}}
     env.update(JAX_PLATFORMS="cuda,cpu", JAX_ENABLE_X64="true", JAX_ENABLE_COMPILATION_CACHE="0",
         XLA_PYTHON_CLIENT_PREALLOCATE="false", NTX_DISABLE_COMPILATION_CACHE="1",
         VMEX_COMPILATION_CACHE="disabled", NEOPAX_REVERSE_STEP_DIAGNOSTICS="1",
@@ -99,6 +100,11 @@ def worker_environment():
 def worker(command, directory, env):
     directory.mkdir(parents=True, exist_ok=True)
     local_env = dict(env, NEOPAX_GRADIENT_AUDIT_DIR=str(directory/"snapshots"))
+    if local_env.pop("NEOPAX_CAPTURE_FORWARD_IR", "0") == "1" and any(
+        item in (AD_SCRIPT, FD_SCRIPT) for item in command
+    ):
+        local_env.update(NEOPAX_ORIGINAL_FORWARD_DIR=str(directory/"forward"),
+                         NEOPAX_ORIGINAL_FORWARD_STOP="0")
     if Path("/usr/bin/time").exists():
         command = ["/usr/bin/time", "-v", *command]
     print("[ad-fd-comparison] " + shlex.join(command), flush=True)
@@ -111,6 +117,24 @@ def worker(command, directory, env):
                 stream.flush()
             if process.wait():
                 raise RuntimeError(f"Worker failed; see {directory/'run.log'}")
+
+
+def require_forward_capture(directory, *, ad):
+    """Verify that the retained program produced this worker's reported primal."""
+    from check_saved_transport_baseline_repeatability import differences, read_one
+    metadata = json.loads((directory/"forward/metadata.json").read_text())
+    if metadata.get("stop_after_capture") is not False:
+        raise ValueError("Expected a completed benchmark, not a forward-only capture.")
+    for filename in ("adaptive_stablehlo.mlir", "adaptive_compiled_hlo.txt"):
+        if not (directory/"forward"/filename).is_file() or not (directory/"forward"/filename).stat().st_size:
+            raise ValueError(f"Original forward compiler output missing: {directory/filename}")
+    setup = read_one(directory/"forward", "setup.npz")
+    native = read_one(directory/"forward", "native.npz")
+    snapshot = read_one(directory/"snapshots", "ad_terminal_*.npz" if ad else "fd_baseline_*.npz")
+    point = dict(initial_y=setup["initial_carry.y"], final_y=native["final_y"], final_time=native["final_time"])
+    rows = differences({k: snapshot[k] for k in point}, point)
+    if rows:
+        raise ValueError(f"Captured forward differs from the worker's reported primal: {rows}")
 
 
 def compare(out_dir, *, solver_mean_reduction="native"):
@@ -175,6 +199,8 @@ def main():
     parser.add_argument("--fd-rel-step", type=float, default=3e-7)
     parser.add_argument("--fd-abs-step", type=float, default=1e-10)
     parser.add_argument("--solver-mean-reduction", choices=("native", "fixed"), default="native")
+    parser.add_argument("--capture-forward-ir", action="store_true",
+        help="Record each original forward baseline and compiled program, then continue AD/FD normally.")
     parser.add_argument("--plan-only", action="store_true")
     args = parser.parse_args()
     args.config = args.config.resolve()
@@ -191,6 +217,8 @@ def main():
     if args.plan_only:
         for name, command, _ in tasks:
             prefix = "env NEOPAX_SOLVER_MEAN_REDUCTION=fixed " if args.solver_mean_reduction == "fixed" else ""
+            if args.capture_forward_ir:
+                prefix = (prefix or "env ") + "NEOPAX_ORIGINAL_FORWARD_STOP=0 NEOPAX_ORIGINAL_FORWARD_DIR=" + shlex.quote(str(args.out_dir/name/"forward")) + " "
             print(name + ": " + prefix + shlex.join(command))
         return
     args.out_dir.mkdir(parents=True, exist_ok=True)
@@ -201,13 +229,14 @@ def main():
                ("_fd_native_precision.py", "check_saved_transport_baseline_repeatability.py")]
     for path in sorted([*sources, *helpers, ROOT/AD_SCRIPT, ROOT/FD_SCRIPT, Path(__file__)]):
         digest.update(path.read_bytes())
-    settings = args.config.read_text() + f"\n# comparison: steps={args.accepted_step_limit} rel={args.fd_rel_step} abs={args.fd_abs_step} mean={args.solver_mean_reduction} source={digest.hexdigest()}\n"
+    settings = args.config.read_text() + f"\n# comparison: steps={args.accepted_step_limit} rel={args.fd_rel_step} abs={args.fd_abs_step} mean={args.solver_mean_reduction} capture_forward_ir={args.capture_forward_ir} source={digest.hexdigest()}\n"
     saved = args.out_dir/"config.toml"
     if saved.exists() and saved.read_text() != settings:
         parser.error("Saved run settings/source differ; choose a new output directory.")
     saved.write_text(settings)
     env = worker_environment()
     env["NEOPAX_SOLVER_MEAN_REDUCTION"] = args.solver_mean_reduction
+    env["NEOPAX_CAPTURE_FORWARD_IR"] = "1" if args.capture_forward_ir else "0"
     if mode == MODE:
         worker([sys.executable, "-m", "unittest", "discover", "-s", "tests",
                 "-p", "test_runtime_ntss1d_interpolation.py", "-v"], args.out_dir/"kernel_check", env)
@@ -218,6 +247,8 @@ def main():
             worker(command, folder, env)
             shutil.copy2(report_path, result)
         report = json.loads(result.read_text())
+        if args.capture_forward_ir:
+            require_forward_capture(folder, ad=name == "ad")
         if args.solver_mean_reduction == "fixed":
             mean_record = json.loads((folder/"solver_mean_reduction.json").read_text())
             if mean_record.get("solver_mean_reduction") != "fixed" or not mean_record.get("fixed_mean_sizes"):

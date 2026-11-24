@@ -9,7 +9,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import numpy as np
 
@@ -66,6 +66,12 @@ class NTSS1DComparisonRunnerTests(unittest.TestCase):
                 self.assertEqual(fixed.stdout.count("NEOPAX_SOLVER_MEAN_REDUCTION=fixed"), 9)
                 self.assertEqual(len(fixed.stdout.splitlines()), 9)
                 self.assertFalse(output.exists())
+                captured = subprocess.run([sys.executable, str(SCRIPT), "--config", str(config),
+                    "--out-dir", str(output), "--plan-only", "--capture-forward-ir"],
+                    cwd=ROOT, capture_output=True, text=True, check=True)
+                self.assertEqual(captured.stdout.count("NEOPAX_ORIGINAL_FORWARD_STOP=0"), 9)
+                self.assertEqual(captured.stdout.count("NEOPAX_ORIGINAL_FORWARD_DIR="), 9)
+                self.assertFalse(output.exists())
             a, b = (runner.tomllib.loads(config.read_text()) for config in (runner.CONFIG, generic))
             self.assertEqual(a["neoclassical"].pop("interpolation_mode"), runner.MODE)
             self.assertEqual(a, b)
@@ -73,16 +79,64 @@ class NTSS1DComparisonRunnerTests(unittest.TestCase):
     def test_workers_disable_cache_without_changing_parent_environment(self):
         with patch.dict(runner.os.environ, dict(XLA_FLAGS="old flags", PYTHONPATH="old path",
             JAX_COMPILATION_CACHE_DIR="old cache", JAX_ENABLE_COMPILATION_CACHE="1",
-            NEOPAX_SOLVER_MEAN_REDUCTION="fixed", NEOPAX_ORIGINAL_FORWARD_DIR="old capture"), clear=True):
+            NEOPAX_SOLVER_MEAN_REDUCTION="fixed", NEOPAX_ORIGINAL_FORWARD_DIR="old capture",
+            NEOPAX_ORIGINAL_FORWARD_STOP="0", NEOPAX_CAPTURE_FORWARD_IR="1"), clear=True):
             before = dict(runner.os.environ)
             env = runner.worker_environment()
             self.assertEqual(dict(runner.os.environ), before)
             for key in ("XLA_FLAGS", "PYTHONPATH", "JAX_COMPILATION_CACHE_DIR", "NEOPAX_SOLVER_MEAN_REDUCTION",
-                        "NEOPAX_ORIGINAL_FORWARD_DIR"):
+                        "NEOPAX_ORIGINAL_FORWARD_DIR", "NEOPAX_ORIGINAL_FORWARD_STOP", "NEOPAX_CAPTURE_FORWARD_IR"):
                 self.assertNotIn(key, env)
             self.assertEqual(env["JAX_ENABLE_COMPILATION_CACHE"], "0")
             self.assertEqual(env["JAX_ENABLE_X64"], "true")
         self.assertNotIn("jax", sys.modules)
+
+    def test_capture_worker_keeps_command_and_environment_but_does_not_stop_early(self):
+        process = Mock()
+        process.stdout = iter(["original benchmark completed\n"])
+        process.wait.return_value = 0
+        process.__enter__ = Mock(return_value=process)
+        process.__exit__ = Mock(return_value=False)
+        env = {'NEOPAX_CAPTURE_FORWARD_IR':'1', 'JAX_ENABLE_X64':'true'}
+        with tempfile.TemporaryDirectory() as temporary, redirect_stdout(io.StringIO()), \
+             patch.object(runner.subprocess, 'Popen', return_value=process) as launch:
+            folder = Path(temporary)/'ad'
+            command = ['python', runner.AD_SCRIPT, '--accepted-step-limit', '16']
+            runner.worker(command, folder, env)
+            passed = launch.call_args.kwargs['env']
+            self.assertEqual(passed['NEOPAX_ORIGINAL_FORWARD_DIR'], str(folder/'forward'))
+            self.assertEqual(passed['NEOPAX_ORIGINAL_FORWARD_STOP'], '0')
+            self.assertNotIn('NEOPAX_CAPTURE_FORWARD_IR', passed)
+            self.assertEqual(launch.call_args.args[0][-len(command):], command)
+            self.assertEqual(env, {'NEOPAX_CAPTURE_FORWARD_IR':'1', 'JAX_ENABLE_X64':'true'})
+            # Kernel-check workers run unittest, not either benchmark entry point.
+            process.stdout = iter([])
+            runner.worker(['python', '-m', 'unittest'], Path(temporary)/'kernel', env)
+            self.assertNotIn('NEOPAX_ORIGINAL_FORWARD_DIR', launch.call_args.kwargs['env'])
+
+    def test_forward_capture_must_match_the_actual_reported_primal_exactly(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            arrays = self.saved_case(root)
+            for name in ('ad', 'fd_n0'):
+                directory = root/name
+                forward = directory/'forward'
+                forward.mkdir()
+                (forward/'metadata.json').write_text(json.dumps({'stop_after_capture':False}))
+                for filename in ('adaptive_stablehlo.mlir', 'adaptive_compiled_hlo.txt'):
+                    (forward/filename).write_text('original compiler output')
+                np.savez(forward/'setup.npz', **{'initial_carry.y':arrays['initial_y']})
+                native = {k:arrays[k] for k in ('final_y','final_time')}
+                np.savez(forward/'native.npz', **native)
+                runner.require_forward_capture(directory, ad=name=='ad')
+                native['final_time'] = np.nextafter(native['final_time'], np.inf)
+                np.savez(forward/'native.npz', **native)
+                with self.assertRaisesRegex(ValueError, "worker's reported primal"):
+                    runner.require_forward_capture(directory, ad=name=='ad')
+                (forward/'metadata.json').write_text(json.dumps({'stop_after_capture':True}))
+                with self.assertRaisesRegex(ValueError, 'not a forward-only capture'):
+                    runner.require_forward_capture(directory, ad=name=='ad')
+        self.assertNotIn('jax', sys.modules)
 
     def test_saved_reference_is_exact_and_rejects_missing_ambiguous_or_changed_captures(self):
         with tempfile.TemporaryDirectory() as temporary:

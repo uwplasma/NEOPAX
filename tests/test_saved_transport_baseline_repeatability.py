@@ -87,6 +87,21 @@ class SavedBaselineTests(unittest.TestCase):
                 check.run_benchmark(namespace['main'])
             self.assertEqual(original.call_args.kwargs['capture_segment_length'], 4)
             self.assertIs(reverse._radau_adaptive_schedule_rollout, original)
+            # Continuing captures return the identical rollout and let the
+            # original benchmark finish, including subsequent solver calls.
+            namespace['rollout'] = rollout
+            exec("def main():\n    result = reverse._radau_adaptive_schedule_rollout(execution, carry, "
+                 "max_total_steps=32, stop_after_accepted_steps=2, capture_segment_length=4)\n"
+                 "    assert result is rollout\n"
+                 "    return reverse._radau_adaptive_schedule_rollout(execution, carry, "
+                 "max_total_steps=32, stop_after_accepted_steps=2)", namespace)
+            original.reset_mock()
+            with patch.dict(os.environ, {'NEOPAX_ORIGINAL_FORWARD_DIR':str(Path(directory)/'continue'),
+                    'NEOPAX_ORIGINAL_FORWARD_STOP':'0'}, clear=True):
+                self.assertIs(check.run_benchmark(namespace['main']), rollout)
+            self.assertEqual(original.call_count, 2)
+            self.assertEqual(json.loads((Path(directory)/'continue/metadata.json').read_text())['stop_after_capture'], False)
+            self.assertTrue(json.loads((Path(directory)/'continue/metadata.json').read_text())['options']['capture_segment_length']==4)
 
     def test_original_entry_pair_uses_live_scripts_and_preserves_archived_endpoint_differences(self):
         calls = []
