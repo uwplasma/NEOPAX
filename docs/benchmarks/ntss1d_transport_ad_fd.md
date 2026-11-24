@@ -513,3 +513,63 @@ than another forward-only control, and retains the compiled programs that
 actually produced its reported primals. Existing strict baseline guards
 remain active. Twenty-one saved-baseline tests and ten paired-runner tests
 pass locally without importing JAX; full GPU validation is pending.
+
+### Failing FD capture isolates a retunable stage sum
+
+Archive `full_capture_ad_fd16_8NznN1_audit.tar.gz` contains the successful
+`fd_n0` baseline and failed `fd_T0` baseline. Their complete saved setup
+arrays match byte-for-byte. Their exported StableHLO files also match
+byte-for-byte (SHA256
+`f889af4e8f89d861d8f720c927c59b923bd935aa0798d3bf11f3b2caab10d9c0`).
+After ignoring GPU dispatch configuration and the fusion-emitter kind, all
+compiled HLO lines match. This is an independent compilation difference,
+not a different DOF-specific mathematical program.
+
+The first recorded difference is the attempt-7 error estimate:
+`3.837114984735867e-2` versus `3.837114984737251e-2`. The next timestep
+changes immediately, and the timestep attempted at slot 8 then differs.
+Both runs retain identical accept/reject and Jacobian-reuse masks.
+Terminal differences are `8.994706846010558e-8` in packed state and
+`1.7493235972190074e-11` in time. The successful n0 comparison has 13
+valid gradient pairs; the other seven FD columns remain unvalidated.
+
+The endpoint's seven-by-408 weighted stage reduction is compiled as
+`fused_reduce.66`: the successful n0 job uses the native emitter; the T0
+job uses Triton. The other switched emitter kinds belong to pure
+transposes, integer predicates and the interpolation-grid uniformity
+predicate. All eight DOFs reach the shared `_radau_step_endpoint`; the
+selected parameter is not an argument to this helper. This is a shared
+compilation risk, not a dedicated CUDA implementation for each DOF.
+
+The focused correction replaces generic weighted-stage dots with an
+explicit balanced addition tree, separated by optimization barriers. The
+same helper is used for the endpoint and the embedded stage-error sum.
+The endpoint increment multiplication and final state addition are also
+separated. The equations remain
+`y_next = y + h * sum_i(b_i*K_i)` and
+`err = h * (embedded_f0_weight*f0 + sum_i(b_error_i*K_i))`.
+There is no change to the configured integrator, tableau, stage count,
+controller/error formula, tolerances, nonlinear/linear method or acceptance
+criteria. No dependency, compiler flag or persistent cache is introduced.
+This fixes the identified retunable reduction; sufficiency for the full
+benchmark still requires GPU validation.
+
+`tests/test_radau_endpoint.py` loads the production helpers without importing
+the NEOPAX package. Two local NumPy tests check the equation and FP error
+bound for stage counts 1/2/3/5/7 and FP32/FP64, plus storage-layout invariance.
+Three opt-in CUDA tests check exact endpoint bits across JIT/auxiliary/
+transpose/batched contexts, JVP/VJP and second derivatives, and report
+isolated runtime and compiled buffers against the previous endpoint.
+These tests run no VMEC, NTX, root or transport solve.
+
+```bash
+JAX_PLATFORMS=cuda,cpu JAX_ENABLE_X64=true \
+XLA_PYTHON_CLIENT_PREALLOCATE=false NEOPAX_TEST_RADAU_ENDPOINT_GPU=1 \
+python tests/test_radau_endpoint.py -v
+```
+
+Local NumPy checks pass; CUDA checks and the full paired AD/FD run are pending.
+Use a fresh output directory for the full benchmark because the numerical
+source fingerprint has changed. The fixed-mean benchmark control and exact
+baseline guards remain as before; this correction does not itself promote
+the experimental mean policy to a production default.

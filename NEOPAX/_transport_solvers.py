@@ -18255,16 +18255,27 @@ def _radau_retry_failed_subsolve_with_exact_cached_jacobian(
     return jax.lax.cond(retry_allowed, retry, keep_failed, operand=None)
 
 
+def _radau_weighted_stage_sum(weights, stages):
+    """Sum stage contributions with a fixed FP addition tree."""
+    # A barrier around a dot still permits native/Triton reduction autotuning.
+    # Explicit pairs with barriers between levels fix the FP addition order.
+    terms = jax.lax.optimization_barrier(weights[:, None] * stages)
+    while terms.shape[0] > 1:
+        paired = (terms.shape[0] // 2) * 2
+        summed = terms[:paired:2] + terms[1:paired:2]
+        if paired < terms.shape[0]:
+            summed = jnp.concatenate((summed, terms[-1:]), axis=0)
+        terms = jax.lax.optimization_barrier(summed)
+    return terms[0]
+
+
 def _radau_step_endpoint(flat_y, h_value, weights, stages):
-    """Keep forward and replay endpoint arithmetic independent of estimator fusion."""
-    # The forward step also reduces these stages for its error estimator.
-    # On GPU, those extra consumers can change the endpoint's fused arithmetic
-    # even when the converged stages and Newton setup are bitwise identical.
+    """Evaluate the unchanged Radau endpoint with fixed accumulation order."""
     flat_y, h_value, weights, stages = jax.lax.optimization_barrier(
         (flat_y, h_value, weights, stages)
     )
-    weighted_stages = jax.lax.optimization_barrier(weights @ stages)
-    return jax.lax.optimization_barrier(flat_y + h_value * weighted_stages)
+    increment = jax.lax.optimization_barrier(h_value * _radau_weighted_stage_sum(weights, stages))
+    return jax.lax.optimization_barrier(flat_y + increment)
 
 
 def _radau_single_step_primal(
@@ -18880,7 +18891,7 @@ def _radau_single_step_primal(
             newton_nonfinite=subsolve_result.newton_nonfinite_final,
         )
     flat_next = _radau_step_endpoint(flat_y, h_value, kernel_context.b, stages_final)
-    err_vec = h_value * (kernel_context.embedded_f0_weight * f0 + (kernel_context.b_error @ stages_final))
+    err_vec = h_value * (kernel_context.embedded_f0_weight * f0 + _radau_weighted_stage_sum(kernel_context.b_error, stages_final))
     scale_override = None
     if kernel_context.error_scale_mode == "ntss_transport" and (
         kernel_context.density_size + kernel_context.pressure_size + kernel_context.er_size == kernel_context.state_dim
