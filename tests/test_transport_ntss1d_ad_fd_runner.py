@@ -60,17 +60,24 @@ class NTSS1DComparisonRunnerTests(unittest.TestCase):
                 self.assertEqual(result.stdout.count("--geometry-fd-native-precision extended"), 2)
                 self.assertEqual(result.stdout.count("--device auto"), 8)
                 self.assertFalse(output.exists())
+                fixed = subprocess.run([sys.executable, str(SCRIPT), "--config", str(config),
+                    "--out-dir", str(output), "--plan-only", "--solver-mean-reduction", "fixed"],
+                    cwd=ROOT, capture_output=True, text=True, check=True)
+                self.assertEqual(fixed.stdout.count("NEOPAX_SOLVER_MEAN_REDUCTION=fixed"), 9)
+                self.assertEqual(len(fixed.stdout.splitlines()), 9)
+                self.assertFalse(output.exists())
             a, b = (runner.tomllib.loads(config.read_text()) for config in (runner.CONFIG, generic))
             self.assertEqual(a["neoclassical"].pop("interpolation_mode"), runner.MODE)
             self.assertEqual(a, b)
 
     def test_workers_disable_cache_without_changing_parent_environment(self):
         with patch.dict(runner.os.environ, dict(XLA_FLAGS="old flags", PYTHONPATH="old path",
-            JAX_COMPILATION_CACHE_DIR="old cache", JAX_ENABLE_COMPILATION_CACHE="1"), clear=True):
+            JAX_COMPILATION_CACHE_DIR="old cache", JAX_ENABLE_COMPILATION_CACHE="1",
+            NEOPAX_SOLVER_MEAN_REDUCTION="fixed"), clear=True):
             before = dict(runner.os.environ)
             env = runner.worker_environment()
             self.assertEqual(dict(runner.os.environ), before)
-            for key in ("XLA_FLAGS", "PYTHONPATH", "JAX_COMPILATION_CACHE_DIR"):
+            for key in ("XLA_FLAGS", "PYTHONPATH", "JAX_COMPILATION_CACHE_DIR", "NEOPAX_SOLVER_MEAN_REDUCTION"):
                 self.assertNotIn(key, env)
             self.assertEqual(env["JAX_ENABLE_COMPILATION_CACHE"], "0")
             self.assertEqual(env["JAX_ENABLE_X64"], "true")
@@ -149,9 +156,9 @@ class NTSS1DComparisonRunnerTests(unittest.TestCase):
                     self.assertEqual(row["baseline_support_max_abs_difference"], 0.)
 
     def test_both_modes_run_all_columns_and_stop_on_a_mismatched_baseline(self):
-        for mode in ("generic", runner.MODE):
+        for mode, mean in ((m, r) for m in ("generic", runner.MODE) for r in ("native", "fixed")):
             for drift in (False, True):
-                with self.subTest(mode=mode, drift=drift), tempfile.TemporaryDirectory() as temporary:
+                with self.subTest(mode=mode, mean=mean, drift=drift), tempfile.TemporaryDirectory() as temporary:
                     root = Path(temporary)
                     output = root/"run"
                     config = root/"case.toml"
@@ -167,6 +174,7 @@ class NTSS1DComparisonRunnerTests(unittest.TestCase):
                     def worker(command, directory, env):
                         jobs.append(directory.name)
                         self.assertEqual(env["JAX_ENABLE_COMPILATION_CACHE"], "0")
+                        self.assertEqual(env["NEOPAX_SOLVER_MEAN_REDUCTION"], mean)
                         if directory.name == "kernel_check":
                             return
                         (directory/"snapshots").mkdir(parents=True)
@@ -193,8 +201,12 @@ class NTSS1DComparisonRunnerTests(unittest.TestCase):
                                 current["final_time"] = np.array(.2)
                             np.savez(directory/"snapshots/fd_baseline_saved.npz", **current)
                         target.write_text(json.dumps(common))
+                        if mean == "fixed":
+                            (directory/"solver_mean_reduction.json").write_text(json.dumps(
+                                dict(solver_mean_reduction="fixed", fixed_mean_sizes=[51,408])))
 
-                    argv = [str(SCRIPT), "--config", str(config), "--out-dir", str(output)]
+                    argv = [str(SCRIPT), "--config", str(config), "--out-dir", str(output),
+                            "--solver-mean-reduction", mean]
                     with patch.object(runner, "worker", worker), patch.object(sys, "argv", argv), \
                          patch.object(runner, "AD_REPORT", root/"ad_report.json"), \
                          patch.object(runner, "FD_REPORTS", root/"fd_reports"), redirect_stdout(io.StringIO()):
@@ -211,8 +223,37 @@ class NTSS1DComparisonRunnerTests(unittest.TestCase):
                         rows = list(csv.DictReader(stream))
                     self.assertEqual(len(rows), 13 if drift else 104)
                     self.assertTrue(all(row["database_interpolation_mode"] == mode for row in rows))
+                    self.assertTrue(all(row["solver_mean_reduction"] == mean for row in rows))
                     self.assertTrue(all(row["comparison_baseline_matches"] == str(not drift) for row in rows))
+                    if not drift:
+                        changed=list(argv)
+                        changed[changed.index('--solver-mean-reduction')+1] = 'fixed' if mean=='native' else 'native'
+                        with patch.object(runner,'worker',side_effect=AssertionError('mixed-mode resume')) as worker_mock, \
+                             patch.object(sys,'argv',changed),redirect_stdout(io.StringIO()), \
+                             patch('sys.stderr',io.StringIO()),self.assertRaises(SystemExit):
+                            runner.main()
+                        worker_mock.assert_not_called()
         self.assertNotIn("jax", sys.modules)
+
+    def test_fixed_worker_without_reduction_evidence_stops_before_fd(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory)
+            config=root/'config.toml'
+            config.write_text('[geometry]\nvmec_lane="ad"\n[neoclassical]\nflux_model="ntx_scan_runtime"\ninterpolation_mode="generic"\n')
+            def worker(command,folder,env):
+                folder.mkdir()
+                (root/'ad_report.json').write_text('{}')
+                (folder/'solver_mean_reduction.json').write_text(json.dumps(
+                    dict(solver_mean_reduction='fixed',fixed_mean_sizes=[])))
+            argv=[str(SCRIPT),'--config',str(config),'--out-dir',str(root/'run'),
+                  '--solver-mean-reduction','fixed']
+            with patch.object(runner,'worker',side_effect=worker) as launched, \
+                 patch.object(runner,'AD_REPORT',root/'ad_report.json'),patch.object(sys,'argv',argv), \
+                 redirect_stdout(io.StringIO()),self.assertRaisesRegex(RuntimeError,'did not execute fixed'):
+                runner.main()
+            self.assertEqual(launched.call_count,1)
+            self.assertEqual(launched.call_args.args[1].name,'ad')
+        self.assertNotIn('jax',sys.modules)
 
 
 if __name__ == "__main__":

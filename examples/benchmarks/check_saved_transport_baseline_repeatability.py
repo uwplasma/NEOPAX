@@ -312,6 +312,26 @@ def capture_forward_compiler_ir(directory):
         write_json(directory / "compiler_programs.json", programs)
 
 
+def run_benchmark(main):
+    """Opt-in fixed solver means for an ordinary benchmark entry point."""
+    import os
+    mode = os.environ.get("NEOPAX_SOLVER_MEAN_REDUCTION", "native")
+    if mode == "native":
+        return main()
+    if mode != "fixed":
+        raise ValueError("NEOPAX_SOLVER_MEAN_REDUCTION must be native or fixed.")
+    print("[solver-means] fixed FP64 solver reductions enabled", flush=True)
+    with fixed_solver_means() as control:
+        result = main()
+    if not control.sizes:
+        raise RuntimeError("Fixed solver means were not traced in the benchmark.")
+    record = dict(solver_mean_reduction=mode, fixed_mean_sizes=sorted(control.sizes))
+    if directory := os.environ.get("NEOPAX_GRADIENT_AUDIT_DIR"):
+        write_json(Path(directory).parent / "solver_mean_reduction.json", record)
+    print("[solver-means]", record, flush=True)
+    return result
+
+
 def trace_forward_worker(run, out, variant, limit, *, capture_ir=False, mean_reduction="native"):
     """Execute an independent ordinary forward baseline from saved inputs."""
     import jax

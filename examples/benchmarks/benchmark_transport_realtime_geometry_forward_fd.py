@@ -2434,4 +2434,5 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    from check_saved_transport_baseline_repeatability import run_benchmark
+    run_benchmark(main)

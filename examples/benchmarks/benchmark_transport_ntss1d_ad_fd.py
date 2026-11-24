@@ -87,7 +87,8 @@ def prepare_ad_reference(out_dir):
 def worker_environment():
     env = {k: v for k, v in os.environ.items() if k not in {
         "PYTHONPATH", "LD_LIBRARY_PATH", "JAX_PLATFORM_NAME", "JAX_COMPILATION_CACHE_DIR",
-        "XLA_FLAGS", "XLA_PYTHON_CLIENT_ALLOCATOR", "NEOPAX_GRADIENT_AUDIT_DIR"}}
+        "XLA_FLAGS", "XLA_PYTHON_CLIENT_ALLOCATOR", "NEOPAX_GRADIENT_AUDIT_DIR",
+        "NEOPAX_SOLVER_MEAN_REDUCTION"}}
     env.update(JAX_PLATFORMS="cuda,cpu", JAX_ENABLE_X64="true", JAX_ENABLE_COMPILATION_CACHE="0",
         XLA_PYTHON_CLIENT_PREALLOCATE="false", NTX_DISABLE_COMPILATION_CACHE="1",
         VMEX_COMPILATION_CACHE="disabled", NEOPAX_REVERSE_STEP_DIAGNOSTICS="1",
@@ -112,7 +113,7 @@ def worker(command, directory, env):
                 raise RuntimeError(f"Worker failed; see {directory/'run.log'}")
 
 
-def compare(out_dir):
+def compare(out_dir, *, solver_mean_reduction="native"):
     from check_saved_transport_baseline_repeatability import differences, read_one
     ad = json.loads((out_dir/"ad/summary.json").read_text())
     columns = {label: i for i, label in enumerate(ad["parameter_order"])}
@@ -144,6 +145,7 @@ def compare(out_dir):
             difference = abs(gradient_ad-gradient_fd)
             relative = difference/abs(gradient_fd) if gradient_fd else (0. if not difference else float("inf"))
             rows.append(dict(database_interpolation_mode=ad.get("database_interpolation_mode", MODE),
+                solver_mean_reduction=solver_mean_reduction,
                 parameter=parameter, objective=objective, gradient_ad=gradient_ad,
                 gradient_fd=gradient_fd, absolute_difference=difference, relative_difference_to_fd=relative,
                 baseline_arrays_match=matched, initial_y_max_abs_difference=deltas["initial_y"],
@@ -172,6 +174,7 @@ def main():
     parser.add_argument("--accepted-step-limit", type=int, default=16)
     parser.add_argument("--fd-rel-step", type=float, default=3e-7)
     parser.add_argument("--fd-abs-step", type=float, default=1e-10)
+    parser.add_argument("--solver-mean-reduction", choices=("native", "fixed"), default="native")
     parser.add_argument("--plan-only", action="store_true")
     args = parser.parse_args()
     args.config = args.config.resolve()
@@ -187,7 +190,8 @@ def main():
     tasks = list(commands(args))
     if args.plan_only:
         for name, command, _ in tasks:
-            print(name + ": " + shlex.join(command))
+            prefix = "env NEOPAX_SOLVER_MEAN_REDUCTION=fixed " if args.solver_mean_reduction == "fixed" else ""
+            print(name + ": " + prefix + shlex.join(command))
         return
     args.out_dir.mkdir(parents=True, exist_ok=True)
     # A resumed comparison must retain the same input, increments and source.
@@ -197,12 +201,13 @@ def main():
                ("_fd_native_precision.py", "check_saved_transport_baseline_repeatability.py")]
     for path in sorted([*sources, *helpers, ROOT/AD_SCRIPT, ROOT/FD_SCRIPT, Path(__file__)]):
         digest.update(path.read_bytes())
-    settings = args.config.read_text() + f"\n# comparison: steps={args.accepted_step_limit} rel={args.fd_rel_step} abs={args.fd_abs_step} source={digest.hexdigest()}\n"
+    settings = args.config.read_text() + f"\n# comparison: steps={args.accepted_step_limit} rel={args.fd_rel_step} abs={args.fd_abs_step} mean={args.solver_mean_reduction} source={digest.hexdigest()}\n"
     saved = args.out_dir/"config.toml"
     if saved.exists() and saved.read_text() != settings:
         parser.error("Saved run settings/source differ; choose a new output directory.")
     saved.write_text(settings)
     env = worker_environment()
+    env["NEOPAX_SOLVER_MEAN_REDUCTION"] = args.solver_mean_reduction
     if mode == MODE:
         worker([sys.executable, "-m", "unittest", "discover", "-s", "tests",
                 "-p", "test_runtime_ntss1d_interpolation.py", "-v"], args.out_dir/"kernel_check", env)
@@ -213,6 +218,10 @@ def main():
             worker(command, folder, env)
             shutil.copy2(report_path, result)
         report = json.loads(result.read_text())
+        if args.solver_mean_reduction == "fixed":
+            mean_record = json.loads((folder/"solver_mean_reduction.json").read_text())
+            if mean_record.get("solver_mean_reduction") != "fixed" or not mean_record.get("fixed_mean_sizes"):
+                raise RuntimeError(f"Worker did not execute fixed solver means: {folder}")
         if report.get("database_interpolation_mode") != mode:
             raise RuntimeError(f"Worker did not report {mode} interpolation: {result}")
         if report.get("accepted_step_limit") != args.accepted_step_limit or report.get("vmec_response_mode") != "raw_block":
@@ -234,7 +243,7 @@ def main():
                 raise RuntimeError(f"FD values or gradients are nonfinite: {result}")
             if len(report["objective_labels"]) != 13 or set(report["objective_labels"]) != objectives:
                 raise RuntimeError(f"FD objectives differ from the AD transport objectives: {result}")
-            rows = compare(args.out_dir)
+            rows = compare(args.out_dir, solver_mean_reduction=args.solver_mean_reduction)
             if not all(row["comparison_baseline_matches"] for row in rows):
                 raise RuntimeError("FD baseline differs from AD; comparison CSV retained, next worker not started.")
     print(f"[ad-fd-comparison] {mode}: saved all 104 pairs: {args.out_dir/'ad_vs_fd.csv'}", flush=True)

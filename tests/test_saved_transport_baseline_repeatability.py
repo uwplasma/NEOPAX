@@ -24,6 +24,58 @@ _jax_after = "jax" in sys.modules
 
 
 class SavedBaselineTests(unittest.TestCase):
+    def test_benchmark_entry_keeps_main_and_scopes_fixed_mode_with_audit(self):
+        import os
+        active=[]
+        sizes={51,408}
+        @contextlib.contextmanager
+        def fixed():
+            active.append(True)
+            try:
+                yield SimpleNamespace(sizes=sizes)
+            finally:
+                active.pop()
+        result=object()
+        def original():
+            self.assertTrue(active)
+            return result
+        with tempfile.TemporaryDirectory() as directory,patch.object(check,'fixed_solver_means',fixed), \
+             contextlib.redirect_stdout(io.StringIO()):
+            with patch.dict(os.environ,{},clear=True):
+                ordinary=Mock(return_value=result)
+                self.assertIs(check.run_benchmark(ordinary),result)
+                self.assertEqual(active,[])
+                ordinary.assert_called_once_with()
+            snapshot=Path(directory)/'snapshots'
+            with patch.dict(os.environ,{'NEOPAX_SOLVER_MEAN_REDUCTION':'fixed',
+                    'NEOPAX_GRADIENT_AUDIT_DIR':str(snapshot)},clear=True):
+                self.assertIs(check.run_benchmark(original),result)
+                record=json.loads((Path(directory)/'solver_mean_reduction.json').read_text())
+                self.assertEqual(record,{'solver_mean_reduction':'fixed','fixed_mean_sizes':[51,408]})
+                def failing():
+                    raise RuntimeError('original benchmark failed')
+                with self.assertRaisesRegex(RuntimeError,'original benchmark failed'):
+                    check.run_benchmark(failing)
+                self.assertEqual(active,[])
+                sizes.clear()
+                with self.assertRaisesRegex(RuntimeError,'not traced'):
+                    check.run_benchmark(original)
+            with patch.dict(os.environ,{'NEOPAX_SOLVER_MEAN_REDUCTION':'invalid'},clear=True), \
+                 self.assertRaisesRegex(ValueError,'native or fixed'):
+                check.run_benchmark(Mock(side_effect=AssertionError('main should not run')))
+        # Execute only the two real entry-point guards, never import JAX.
+        for name in ('benchmark_transport_reverse_ad_only.py','benchmark_transport_realtime_geometry_forward_fd.py'):
+            path=SCRIPT.with_name(name)
+            guard=ast.parse(path.read_text()).body[-1]
+            original=Mock()
+            wrapper=Mock()
+            with patch.dict(sys.modules,{'check_saved_transport_baseline_repeatability':SimpleNamespace(run_benchmark=wrapper)}):
+                exec(compile(ast.Module(body=[guard],type_ignores=[]),str(path),'exec'),
+                     {'__name__':'__main__','main':original})
+            wrapper.assert_called_once_with(original)
+            original.assert_not_called()
+        self.assertEqual(_jax_before,'jax' in sys.modules)
+
     def test_fixed_means_are_scoped_to_solver_and_preserve_norm_formula(self):
         solvers=SimpleNamespace(jnp=np)
         product=Mock(side_effect=lambda a,b:a@b)

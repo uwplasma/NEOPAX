@@ -358,3 +358,55 @@ between the independent fixed-mean controls. GPU validation, performance
 and the subsequent full AD/FD comparison remain pending. Eighteen local
 NumPy/mock tests pass, including the actual production error-norm formula,
 proxy scope restoration, unchanged fallback reductions and CLI dispatch.
+
+### Fixed-mean control passed; paired AD/FD verification is next
+
+Remote run `forward_fixed_means_5XfmCX`, downloaded as
+`forward_fixed_means.tar.gz`, completed all four independent controls.
+Offline NumPy inspection found exact shape/dtype/byte equality in every
+saved trajectory array across all four variants, including error estimates,
+accept/reject and Jacobian-reuse masks, attempted/next timesteps, step times,
+final packed state and final time. All initial carries match. The maximum
+state and time differences are both `0.000000000e+00`; final time is
+`3.669427918687531e-4`. The AD endpoint also matches its native archived
+endpoint exactly. The old FD archive retains the earlier `1.101037483e-8`
+state and `2.141341737e-12` time differences; it is not the new common point.
+Compiler output confirms the fixed product kernel, and all workers report
+mean sizes `51, 153, 204, 408, 2856`. No AD or perturbed FD was evaluated in
+this control, so gradient correctness and performance remain unverified.
+
+The paired runner now accepts explicit `--solver-mean-reduction fixed` for
+both interpolation configurations. It applies the same tested scope to the
+ordinary AD and FD script entry points for the entire worker, including the
+forward preparation, accepted replay and backward sweep. The original main
+functions, parameter/objective lists, perturbation sizes, VMEX lane, frozen
+root/Newton contracts and all baseline guards are unchanged. No production
+NEOPAX package file or default is modified. Omitting the option retains the
+native benchmark. Each worker is a fresh process, so a mean policy is never
+switched after JIT compilation in a reused process.
+
+The runner owns `NEOPAX_SOLVER_MEAN_REDUCTION`; a caller's inherited value is
+cleared before the requested mode is set. Successful fixed workers record
+the reduction sizes actually traced in `solver_mean_reduction.json`; the
+runner rejects missing/empty evidence before continuing. Saved settings
+include the mean mode, and CSV rows identify it, preventing native/fixed
+results from being mixed on resume. Dry-run commands show the fixed scope.
+
+```bash
+python examples/benchmarks/benchmark_transport_ntss1d_ad_fd.py \
+  --config examples/benchmarks/Solve_Transport_equations_wHe_radau_ntx_scan_runtime_database_vmec_realtime_geometry_benchmark_black_box.toml \
+  --solver-mean-reduction fixed --accepted-step-limit 16 \
+  --out-dir outputs/generic_fixed_means_ad_fd16
+
+python examples/benchmarks/benchmark_transport_ntss1d_ad_fd.py \
+  --solver-mean-reduction fixed --accepted-step-limit 16 \
+  --out-dir outputs/ntss1d_fixed_means_ad_fd16
+```
+
+Use fresh directories. This is one AD16 plus eight FD16 workers per
+interpolator, 104 gradient pairs per mode. Full GPU AD/FD runs are pending.
+Nineteen saved-input/entry-point tests and eight paired-runner tests pass
+locally without importing JAX. They cover both mean modes and interpolators,
+strict failure on baseline drift, fixed-scope execution evidence and resume
+rejection when changing the mean mode. This integration is an opt-in
+benchmark verification step, not promotion of a production solver policy.
