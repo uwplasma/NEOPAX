@@ -24,6 +24,40 @@ _jax_after = "jax" in sys.modules
 
 
 class SavedBaselineTests(unittest.TestCase):
+    def test_raw_initial_state_roundtrip_preserves_zero_and_subfloor_helium(self):
+        source = ast.parse((SCRIPT.parents[2]/'NEOPAX/_transport_solvers.py').read_text())
+        functions = [n for n in source.body if isinstance(n,ast.FunctionDef)
+                     and n.name in {'_electron_density_index','_pack_transport_state_arrays'}]
+        namespace = dict(Any=object,dataclasses=dataclasses,jnp=np)
+        exec(compile(ast.Module(body=functions,type_ignores=[]),'production_packing','exec'),namespace)
+        State = dataclasses.make_dataclass('State',[('density',object),('pressure',object),('Er',object)])
+        for names in (('e','D','T','He'),('D','e','He'),('D','He')):
+            species = SimpleNamespace(names=names)
+            density = np.arange(len(names)*3,dtype=float).reshape(len(names),3)+1.
+            density[names.index('He')] = [0.,-0.,1e-12]
+            pressure = density*2
+            er = np.asarray([0.,-0.,-3.])
+            original = State(density,pressure,er)
+            packed = np.concatenate([a.reshape(-1) for a in namespace['_pack_transport_state_arrays'](original,species)])
+            reference = {'final_state.Er':np.ones(3)*99.,
+                         'final_state.pressure':np.ones_like(pressure)*99.}
+            restored = State(**check.raw_initial_state_arrays(reference,packed,names))
+            again = np.concatenate([a.reshape(-1) for a in namespace['_pack_transport_state_arrays'](restored,species)])
+            self.assertEqual(packed.tobytes(),again.tobytes())
+            self.assertEqual(restored.density[names.index('He')].tobytes(),density[names.index('He')].tobytes())
+            with self.assertRaisesRegex(ValueError,'layout'):
+                check.raw_initial_state_arrays(reference,packed[:-1],names)
+        # Reproduce why the former output-unpacker route was not lossless:
+        # passing None to the production density-floor helper means 1e-6.
+        source = ast.parse((SCRIPT.parents[2]/'NEOPAX/_state.py').read_text())
+        functions = [n for n in source.body if isinstance(n,ast.FunctionDef)
+                     and n.name in {'_broadcast_species_floor','safe_density','apply_transport_density_floor'}]
+        namespace = dict(Array=object,dataclasses=dataclasses,jnp=np,DEFAULT_TRANSPORT_DENSITY_FLOOR=1e-6)
+        exec(compile(ast.Module(body=functions,type_ignores=[]),'production_density_floor','exec'),namespace)
+        projected = namespace['apply_transport_density_floor'](restored,None)
+        np.testing.assert_array_equal(projected.density[names.index('He')],[1e-6]*3)
+        self.assertEqual(restored.density[names.index('He')].tobytes(),np.asarray([0.,-0.,1e-12]).tobytes())
+
     def test_first_attempt_difference_uses_time_order_and_exact_bits(self):
         reference = {name:np.ones(4) for name in check.SCHEDULE_FIELDS}
         current = {name:values.copy() for name, values in reference.items()}
@@ -88,12 +122,17 @@ class SavedBaselineTests(unittest.TestCase):
             # Failed workers halt before subsequent controls or comparisons.
             calls.clear()
             argv[argv.index('--out-dir')+1] = str(root/'failed')
+            def failed_worker(command, **kwargs):
+                kwargs['stdout'].write('Traceback: original worker failure\n')
+                return SimpleNamespace(returncode=1)
+            stderr = io.StringIO()
             with patch.dict(sys.modules, {'benchmark_transport_ntss1d_ad_fd':module}),patch.object(sys,'argv',argv), \
-                 patch.object(check.subprocess,'run',return_value=SimpleNamespace(returncode=1)) as launch, \
-                 contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()), \
+                 patch.object(check.subprocess,'run',side_effect=failed_worker) as launch, \
+                 contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(stderr), \
                  self.assertRaises(SystemExit):
                 check.main()
             self.assertEqual(launch.call_count, 1)
+            self.assertIn('Traceback: original worker failure', stderr.getvalue())
         self.assertEqual(_jax_before, 'jax' in sys.modules)
 
     def test_forward_workers_preserve_independent_schedules_and_change_one_setup_boundary(self):
@@ -415,7 +454,8 @@ class SavedBaselineTests(unittest.TestCase):
         fd = {f'initial_state.{k}':np.asarray([i+1.])
               for i, k in enumerate(('density', 'pressure', 'Er'))}
         build = Mock(return_value=Flux(Neo()))
-        orch = SimpleNamespace(_build_species=lambda cfg:object(), _build_energy_grid=lambda cfg:object(),
+        species = SimpleNamespace(names=('e','D','T','He'))
+        orch = SimpleNamespace(_build_species=lambda cfg:species, _build_energy_grid=lambda cfg:object(),
             build_source_models_from_config=lambda *args:object(), _build_flux_model=build,
             RuntimeContext=SimpleNamespace, Models=SimpleNamespace, _normalize_solver_config=lambda cfg:{})
         with patch.dict(sys.modules, modules), contextlib.redirect_stdout(io.StringIO()):
@@ -439,20 +479,24 @@ class SavedBaselineTests(unittest.TestCase):
                     check.restore_runtime({'neoclassical':settings}, ad, fd, orch, np)
                 build.assert_not_called()
 
-            # Aborted paired runs have packed initial_y but only a final-state
-            # shape template. They must never resume from that final state.
-            ad.update({f'final_state.{k}':np.asarray([99.]) for k in ('density','pressure','Er')})
-            packed = np.asarray([1.,2.,3.])
-            expected_state = object()
-            unpack = Mock(return_value=expected_state)
-            transform = Mock(return_value=(np.asarray([99.]),unpack,None,None,None))
-            with patch.dict(sys.modules, {'NEOPAX._transport_solvers':SimpleNamespace(
-                    _make_solver_state_transform=transform)}):
+            # Aborted paired runs provide packed initial_y. Preserve the raw
+            # zero-He condition instead of projecting from the final template.
+            ad.update({'final_state.Er':np.asarray([99.,99.]),
+                       'final_state.pressure':np.full((4,2),99.)})
+            ions = np.asarray([[1.,2.],[3.,4.],[0.,1e-12]])
+            pressure = np.arange(8,dtype=float).reshape(4,2)
+            packed = np.r_[ions.reshape(-1),pressure.reshape(-1),[-3.,-4.]]
+            def neutralize(state,species):
+                state.density[0] = state.density[1]+state.density[2]+2*state.density[3]
+                return state
+            with patch.dict(sys.modules, {'NEOPAX._transport_equations':SimpleNamespace(
+                    enforce_quasi_neutrality=neutralize)}):
                 _, state = check.restore_runtime({'neoclassical':{'flux_model':'ntx_scan_runtime'}},
                     ad, {'initial_y':packed}, orch, np)
-            self.assertIs(state, expected_state)
-            np.testing.assert_array_equal(unpack.call_args.args[0], packed)
-            np.testing.assert_array_equal(transform.call_args.args[0].Er, [99.])
+            np.testing.assert_array_equal(state.density[1:],ions)
+            np.testing.assert_array_equal(state.density[0],ions[0]+ions[1]+2*ions[2])
+            np.testing.assert_array_equal(state.pressure,pressure)
+            np.testing.assert_array_equal(state.Er,[-3.,-4.])
 
     def test_fd_endpoint_profile_wrapper_keeps_its_existing_selected_root_rule(self):
         path = SCRIPT.with_name('benchmark_transport_realtime_geometry_forward_fd.py')

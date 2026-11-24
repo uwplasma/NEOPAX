@@ -256,5 +256,15 @@ memory. No equilibrium, NTX scan, root solve, perturbed endpoint or reverse AD
 run is launched. The restored wrapper omits the retained scan record; if the
 controls do not reproduce the archived endpoints, their differences alone
 cannot establish the cause of the original run. GPU validation is pending.
-Fifteen NumPy/mock tests cover restoration, all four control paths, first
+The initial diagnostic's first worker stopped before solver preparation:
+the output-unpacking helper applied the default `1e-6` density floor to the
+raw zero-He initial condition. Restoration now decodes the packed arrays
+without projections and reconstructs only the omitted electron density.
+The normal solver's projections remain unchanged. A local saved w-He capture
+has 51 zero-He entries and now roundtrips byte-for-byte without importing JAX.
+This corrects diagnostic restoration, not the original AD/FD transport drift.
+Failed workers also print their traceback in the parent log automatically.
+Sixteen NumPy/mock tests cover restoration, all four control paths, first
 attempt ordering and exact bits, archive comparisons and worker failure.
+The restoration regression executes the production packing and density-floor
+functions with NumPy, including zero, signed-zero and sub-floor densities.

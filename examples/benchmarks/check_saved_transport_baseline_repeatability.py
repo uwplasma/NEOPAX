@@ -163,6 +163,23 @@ def write_json(path, value):
                               default=lambda item: np.asarray(item).tolist()) + "\n")
 
 
+def raw_initial_state_arrays(reference, initial_y, species_names):
+    """Invert the packed layout without applying any solver projections."""
+    names, flat = tuple(species_names), np.asarray(initial_y)
+    nr = np.asarray(reference["final_state.Er"]).size
+    shape = (len(names), nr)
+    ions = [i for i, name in enumerate(names) if name != "e"]
+    density_size, pressure_size = len(ions) * nr, len(names) * nr
+    if (flat.ndim != 1 or flat.size != density_size + pressure_size + nr
+            or np.asarray(reference["final_state.pressure"]).shape != shape):
+        raise ValueError("Saved packed initial state does not match the species/grid layout.")
+    density = np.zeros(shape, dtype=flat.dtype)
+    density[ions] = flat[:density_size].reshape(len(ions), nr)
+    return dict(density=density,
+        pressure=flat[density_size:density_size + pressure_size].reshape(shape).copy(),
+        Er=flat[density_size + pressure_size:].copy())
+
+
 def restore_runtime(config, ad, fd, orch, jnp):
     from NEOPAX._database import Monoenergetic, MonoenergeticRuntimeNTSS1D
     from NEOPAX._geometry_models import VmecBoozer
@@ -205,13 +222,14 @@ def restore_runtime(config, ad, fd, orch, jnp):
                                   for name in ("density", "pressure", "Er")})
     else:
         # A failed reference check saves packed initial_y, before fd_baseline
-        # is written. Unpack it with the production layout; final_state is
-        # only a shape template, never the initial physical state.
-        from NEOPAX._transport_solvers import _make_solver_state_transform
-        template = TransportState(**{name: jnp.asarray(ad[f"final_state.{name}"])
-                                     for name in ("density", "pressure", "Er")})
-        _, unpack, *_ = _make_solver_state_transform(template, species)
-        state = unpack(jnp.asarray(fd["initial_y"]))
+        # is written. The output unpacker applies a density floor, changing
+        # the raw zero-He initial condition. Restore raw arrays instead;
+        # only the omitted electron density is reconstructed here.
+        from NEOPAX._transport_equations import enforce_quasi_neutrality
+        arrays = raw_initial_state_arrays(ad, fd["initial_y"], species.names)
+        state = TransportState(**{name: jnp.asarray(value) for name, value in arrays.items()})
+        if "e" in species.names:
+            state = enforce_quasi_neutrality(state, species)
     return runtime, state
 
 
@@ -271,7 +289,9 @@ def trace_forward_worker(run, out, variant, limit):
         # Use the FD's own saved tables. No geometry, table or root is built.
         runtime, state = restore_runtime(config, {**ad, **fd}, fd, orch, jnp)
         initial, _ = jax.flatten_util.ravel_pytree(_pack_transport_state_arrays(state, runtime.species))
-        if differences({"initial_y": ad["initial_y"]}, {"initial_y": np.asarray(initial)}):
+        initial_changes = differences({"initial_y": ad["initial_y"]}, {"initial_y": np.asarray(initial)})
+        if initial_changes:
+            print("[forward-trace] restored initial-state differences:", initial_changes, flush=True)
             raise ValueError("Restored physical state differs before solver preparation.")
         if variant != "fd":
             runtime = runtime_with_fixed_ntx_database_model(runtime)
@@ -485,6 +505,8 @@ def main():
                     "--accepted-step-limit", str(args.accepted_step_limit), "--variant", name],
                     cwd=ROOT, env=worker_environment(), stdout=log, stderr=subprocess.STDOUT)
             if result.returncode:
+                print("\n".join((folder / "run.log").read_text().splitlines()[-70:]),
+                      file=sys.stderr, flush=True)
                 parser.error(f"{name} failed; see {folder/'run.log'}")
         compare_forward_variants(run, out)
         return
