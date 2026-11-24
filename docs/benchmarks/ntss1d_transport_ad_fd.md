@@ -199,3 +199,62 @@ zero and dtype differences), and full mocked execution of both modes with
 104 rows or immediate rejection of a drifted first FD baseline. The fresh
 NEOPAX GPU comparisons remain pending. Use fresh output directories after
 dependency changes; existing comparisons must not be resumed on a new stack.
+
+## First difference between independent forward baselines
+
+The first fresh generic FD worker in `fixed_products_ad_fd16_NBobrI` stopped
+before perturbations. Geometry, coefficient tables and the packed initial
+state match AD exactly. After sixteen accepted steps, the terminal packed
+state differs by `1.1010374834086178e-8` and time by
+`2.141341737173924e-12`. This is a failed bitwise reproducibility check, not
+an FD gradient result or an out-of-memory failure. The existing baseline
+guard has no numerical tolerance; the solver's local error tolerances are
+separate. No guard or transport/AD algorithm is changed here.
+
+Both independent baselines reach `_radau_adaptive_schedule_rollout`, but
+their setup differs. AD converts the scan wrapper to its fixed-table model
+and captures checkpoint carries every four accepted steps. FD retains the
+wrapper and does not capture checkpoint carries. These differences have not
+been established as the cause of the remaining drift. Copying AD's timestep
+map into FD would not identify that cause.
+
+The saved-input control uses the failed worker's own tables and packed
+initial state, after checking them against the AD capture. It executes four
+sequential processes, each doing only an ordinary sixteen-step forward solve:
+
+| Variant | Transport model | Context setup | Checkpoint capture |
+| --- | --- | --- | --- |
+| `fd` | Restored scan wrapper | FD preparation | None |
+| `fd_fixed_model` | Fixed-table model, same database | FD preparation | None |
+| `ad_no_checkpoints` | Fixed-table model, same database | Production AD static preparation | None |
+| `ad` | Fixed-table model, same database | Production AD static preparation | Every four accepted steps |
+
+All four compute their own adaptive schedule. The AD variants call the real
+`prepare_reverse_static_setup`, replacing only initial-state construction
+with the already-saved common physical state, so no root is solved. Their
+reverse-context flags match the paired run; no VJP or reverse sweep executes.
+The no-checkpoint control retains the same scalar Newton-reuse trace output.
+The full initial carry, numeric context and original initial RHS (stored in
+the initial predictor) are captured. `comparison.json` identifies the first
+different scalar attempt and reports exact endpoint comparisons to both
+archived baselines. An initial predictor difference alone need not explain
+the trajectory: with `prev_dt=0`, the stage predictor ignores that history.
+
+```bash
+python examples/benchmarks/check_saved_transport_baseline_repeatability.py \
+  --trace-ad-fd \
+  --run-dir outputs/fixed_products_ad_fd16_NBobrI/generic \
+  --out-dir outputs/independent_forward_trace \
+  --accepted-step-limit 16
+```
+
+Use the same GPU environment and dependency branches as the archived paired
+run, with a fresh output directory. The parent reuses the paired runner's
+worker environment (GPU, x64, compilation caches disabled, no XLA flags).
+Workers exit sequentially to release GPU
+memory. No equilibrium, NTX scan, root solve, perturbed endpoint or reverse AD
+run is launched. The restored wrapper omits the retained scan record; if the
+controls do not reproduce the archived endpoints, their differences alone
+cannot establish the cause of the original run. GPU validation is pending.
+Fifteen NumPy/mock tests cover restoration, all four control paths, first
+attempt ordering and exact bits, archive comparisons and worker failure.

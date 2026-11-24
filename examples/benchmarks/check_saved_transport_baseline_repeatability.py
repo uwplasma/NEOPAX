@@ -5,6 +5,10 @@ run one jitted callable twice from the same initial carry. No equilibrium,
 coefficient scan, root solve, objective evaluation or derivative is computed.
 The extra jit is a separate repeatability control, not the production graph.
 The parent and saved-array comparison import no JAX.
+
+--trace-ad-fd instead isolates forward setup differences in a failed paired
+run. Four independent processes change the model wrapper, AD context metadata,
+then checkpoint capture, without sharing a timestep schedule or rerunning AD.
 """
 from __future__ import annotations
 
@@ -24,6 +28,7 @@ import numpy as np
 ROOT = Path(__file__).resolve().parents[2]
 SCHEDULE_FIELDS = ("active_mask", "accepted_mask", "err_norms", "attempted_dts",
                    "next_dts", "step_ts", "jacobian_reused")
+FORWARD_VARIANTS = ("fd", "fd_fixed_model", "ad_no_checkpoints", "ad")
 
 
 def read_one(folder, pattern):
@@ -195,9 +200,159 @@ def restore_runtime(config, ad, fd, orch, jnp):
     runtime = orch.RuntimeContext(species=species, energy_grid=energy, geometry=geometry,
         database=database, solver_parameters=orch._normalize_solver_config(config),
         models=orch.Models(flux=flux, source=sources))
-    state = TransportState(**{name: jnp.asarray(fd[f"initial_state.{name}"])
-                              for name in ("density", "pressure", "Er")})
+    if "initial_state.density" in fd:
+        state = TransportState(**{name: jnp.asarray(fd[f"initial_state.{name}"])
+                                  for name in ("density", "pressure", "Er")})
+    else:
+        # A failed reference check saves packed initial_y, before fd_baseline
+        # is written. Unpack it with the production layout; final_state is
+        # only a shape template, never the initial physical state.
+        from NEOPAX._transport_solvers import _make_solver_state_transform
+        template = TransportState(**{name: jnp.asarray(ad[f"final_state.{name}"])
+                                     for name in ("density", "pressure", "Er")})
+        _, unpack, *_ = _make_solver_state_transform(template, species)
+        state = unpack(jnp.asarray(fd["initial_y"]))
     return runtime, state
+
+
+def first_attempt_difference(reference, current):
+    """Locate the first differing scalar attempt, including signed zero."""
+    changes = []
+    for name in SCHEDULE_FIELDS:
+        a, b = reference[name], current[name]
+        if a.ndim != 1 or b.ndim != 1 or a.dtype != b.dtype:
+            raise ValueError(f"Incompatible attempt field: {name}")
+        count = min(a.size, b.size)
+        changed = (np.frombuffer(a[:count].tobytes(), dtype=np.uint8)
+                   != np.frombuffer(b[:count].tobytes(), dtype=np.uint8))
+        indices = np.flatnonzero(changed.reshape(count, a.dtype.itemsize).any(axis=1))
+        if indices.size:
+            i = int(indices[0])
+            changes.append(dict(attempt=i + 1, field=name, reference=a[i].item(), current=b[i].item()))
+        elif a.size != b.size:
+            changes.append(dict(attempt=count + 1, field=name, reason="different attempt counts"))
+    first = min((row["attempt"] for row in changes), default=None)
+    return [row for row in changes if row["attempt"] == first]
+
+
+def trace_forward_worker(run, out, variant, limit):
+    """Execute an independent ordinary forward baseline from saved inputs."""
+    import jax
+    import jax.numpy as jnp
+    from unittest.mock import patch
+    sys.path.insert(0, str(ROOT))
+    from NEOPAX import _orchestrator as orch, _reverse_ad_transport as reverse
+    from NEOPAX._transport_solvers import _pack_transport_state_arrays
+    from NEOPAX._reverse_ad_initial_er import runtime_with_fixed_ntx_database_model
+    from benchmark_transport_realtime_geometry_forward_fd import _schedule_rollout
+    from benchmark_transport_autodiff_lagged_ntx import _prepare_benchmark_config, _baseline_profile_cfg
+    from benchmark_transport_reverse_ad_only import PARAMETER_ORDER, _profile_cfg_scalar_value
+
+    if not jax.config.x64_enabled or jax.default_backend() != "gpu":
+        raise RuntimeError("Run on the GPU machine with JAX_ENABLE_X64=true.")
+    ad = read_one(run / "ad/snapshots", "ad_terminal_*.npz")
+    fd_dir = run / "fd_n0/snapshots"
+    fd = read_one(fd_dir, "fd_reference_support_*.npz")
+    fd.update(read_one(fd_dir, "fd_reference_baseline_*.npz"))
+    physical = lambda data: {k: v for k, v in data.items()
+                             if k == "initial_y" or k.startswith(("support['geometry'].", "support['database']."))}
+    if differences(physical(ad), physical(fd)):
+        raise ValueError("Saved AD/FD physical inputs differ; this control requires an identical physical point.")
+    report = json.loads((run / "ad/summary.json").read_text())
+    if report["accepted_step_limit"] != limit:
+        raise ValueError("Requested step limit differs from the saved AD run.")
+    config = _prepare_benchmark_config(run / "config.toml", device=None,
+        ntx_exact_derivative_mode="direct", radau_jacobian_reuse_mode="legacy")
+    if orch._resolve_er_right_boundary_mode(config, orch._normalize_solver_config(config)) in {
+        "ambipolar_edge_root", "floating_ambipolar_edge_node",
+    }:
+        raise ValueError("This diagnostic must not launch a boundary root solve.")
+    with orch._execution_device_context(config):
+        # Use the FD's own saved tables. No geometry, table or root is built.
+        runtime, state = restore_runtime(config, {**ad, **fd}, fd, orch, jnp)
+        initial, _ = jax.flatten_util.ravel_pytree(_pack_transport_state_arrays(state, runtime.species))
+        if differences({"initial_y": ad["initial_y"]}, {"initial_y": np.asarray(initial)}):
+            raise ValueError("Restored physical state differs before solver preparation.")
+        if variant != "fd":
+            runtime = runtime_with_fixed_ntx_database_model(runtime)
+        if variant.startswith("ad"):
+            captured = {}
+            def probe(execution, carry, **options):
+                if variant == "ad_no_checkpoints":
+                    options["capture_segment_length"] = None
+                    # Keep the same scalar Newton-reuse output; change only
+                    # the checkpoint-carry capture, not that output contract.
+                    result = reverse._radau_adaptive_schedule_rollout(
+                        execution, carry, capture_newton_setup=True, **options)
+                else:
+                    result = reverse._reverse_adaptive_schedule_rollout(execution, carry, **options)
+                captured["rollout"] = result
+                return result
+            profiles = _baseline_profile_cfg(config)
+            values = jnp.asarray([_profile_cfg_scalar_value(profiles, name) for name in PARAMETER_ORDER])
+            # Only initial-state construction is replaced by the already-saved
+            # common state, skipping roots. The production AD preparation,
+            # contexts and adaptive solver execute normally; no VJP is run.
+            with patch.object(reverse, "initial_state_for_parameter_vector", return_value=state):
+                setup = reverse.prepare_reverse_static_setup(values, config=config,
+                    runtime=runtime, baseline_state=state, profile_cfg=profiles,
+                    initial_er_root_ad="jax_selected_root", accepted_step_limit_override=limit,
+                    reverse_segment_length=4, reverse_direct_stage_adjoint=True,
+                    reverse_stage_adjoint_solve_mode="block", reverse_rhs_transpose_mode="explicit_database",
+                    reverse_segment_start_replay_mode="minimal",
+                    reverse_segment_primal_record_mode="reuse_segment_primal_record",
+                    reverse_final_objective_cotangent_mode="grouped_vjp",
+                    reverse_bootstrap_cotangent_mode="joint_local_vjp_upar_only",
+                    reverse_step_bwd_mode="reduced_cotangent_call_boundary",
+                    reverse_schedule_artifact_mode="reuse_static_probe", schedule_probe_runner=probe)
+            prepared, execution, rollout = setup.prepared_rollout, setup.execution_context, captured["rollout"]
+            components = {"equation_system": setup.solve_vector_field.__self__}
+        else:
+            components, prepared, execution, rollout, _ = _schedule_rollout(
+                config, runtime, state, accepted_step_limit=limit, capture_newton_setup=True)
+        initial = np.asarray(prepared.initial_carry.y)
+        if differences({"initial_y": ad["initial_y"]}, {"initial_y": initial}):
+            raise ValueError("Restored initial state does not reproduce the saved packed state.")
+        arrays = rollout_arrays(rollout)
+        if (bool(rollout.failed) or not bool(rollout.completed)
+                or int(rollout.accepted_count) != limit or not np.isfinite(arrays["final_y"]).all()):
+            raise RuntimeError("Independent baseline did not complete the requested finite prefix.")
+        inputs = setup_arrays(components, prepared, execution)
+        inputs["initial_rhs"] = np.asarray(prepared.initial_carry.prev_stages).reshape(-1, initial.size)[0].copy()
+        np.savez_compressed(out / "setup.npz", **inputs)
+        np.savez_compressed(out / "native.npz", **arrays)
+        write_json(out / "metadata.json", dict(variant=variant, accepted_step_limit=limit,
+            versions={name: version(name) for name in ("jax", "jaxlib", "ntx", "vmex", "solvax")},
+            sources={name: hashlib.sha256(Path(module.__file__).read_bytes()).hexdigest()
+                     for name, module in tuple(sys.modules.items()) if name.startswith("NEOPAX.")
+                     and getattr(module, "__file__", None)}))
+        print(f"[forward-trace] {variant}: attempts={int(rollout.attempt_count)} "
+              f"final_time={float(arrays['final_time']):.17e}", flush=True)
+
+
+def compare_forward_variants(run, out):
+    rows = []
+    for left, right in zip(FORWARD_VARIANTS, FORWARD_VARIANTS[1:]):
+        setup_a, setup_b = (read_one(out / name, "setup.npz") for name in (left, right))
+        a, b = (read_one(out / name, "native.npz") for name in (left, right))
+        carry = lambda data: {k: v for k, v in data.items() if k.startswith("initial_carry.") or k == "initial_rhs"}
+        row = dict(comparison=f"{left} vs {right}", initial=differences(carry(setup_a), carry(setup_b)),
+                   context=differences({k: v for k, v in setup_a.items() if not k.startswith("initial_carry.")},
+                                       {k: v for k, v in setup_b.items() if not k.startswith("initial_carry.")}),
+                   first_attempt=first_attempt_difference(a, b), trajectory=differences(a, b))
+        rows.append(row)
+        print(f"[forward-trace] {row['comparison']}: initial={row['initial']} "
+              f"first_attempt={row['first_attempt']}", flush=True)
+    for name, folder, pattern in (("ad", "ad/snapshots", "ad_terminal_*.npz"),
+                                  ("fd", "fd_n0/snapshots", "fd_reference_baseline_*.npz")):
+        saved = read_one(run / folder, pattern)
+        current = read_one(out / name, "native.npz")
+        changed = differences({k: saved[k] for k in ("final_y", "final_time")},
+                              {k: current[k] for k in ("final_y", "final_time")})
+        rows.append(dict(comparison=f"{name} vs archived {name}", differences=changed))
+        print(f"[forward-trace] {name} vs archived {name}: {changed}", flush=True)
+    write_json(out / "comparison.json", rows)
+    print("[forward-trace] Controls locate a cause only if the archived AD and FD trajectories reproduce.", flush=True)
 
 
 def worker(run, out):
@@ -303,10 +458,36 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--run-dir", type=Path, required=True)
     parser.add_argument("--out-dir", type=Path, required=True)
+    parser.add_argument("--trace-ad-fd", action="store_true",
+        help="Compare independent AD/FD forward setup paths from a failed paired run, without new physics preparation.")
+    parser.add_argument("--accepted-step-limit", type=int, default=16)
+    parser.add_argument("--variant", choices=FORWARD_VARIANTS, help=argparse.SUPPRESS)
     parser.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
     run, out = args.run_dir.resolve(), args.out_dir.resolve()
     out.mkdir(parents=True, exist_ok=True)
+    if args.trace_ad_fd:
+        from benchmark_transport_ntss1d_ad_fd import worker_environment
+        if args.accepted_step_limit <= 0:
+            parser.error("--accepted-step-limit must be positive")
+        if args.variant:
+            trace_forward_worker(run, out, args.variant, args.accepted_step_limit)
+            return
+        for name in FORWARD_VARIANTS:
+            folder = out / name
+            if folder.exists():
+                parser.error(f"{folder} already exists; choose a fresh output directory.")
+            folder.mkdir()
+            print(f"[forward-trace] starting {name}; saved physical inputs only; log={folder/'run.log'}", flush=True)
+            with (folder / "run.log").open("w") as log:
+                result = subprocess.run([sys.executable, str(Path(__file__).resolve()),
+                    "--run-dir", str(run), "--out-dir", str(folder), "--trace-ad-fd",
+                    "--accepted-step-limit", str(args.accepted_step_limit), "--variant", name],
+                    cwd=ROOT, env=worker_environment(), stdout=log, stderr=subprocess.STDOUT)
+            if result.returncode:
+                parser.error(f"{name} failed; see {folder/'run.log'}")
+        compare_forward_variants(run, out)
+        return
     if args.worker:
         worker(run, out)
         return

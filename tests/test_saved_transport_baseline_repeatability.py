@@ -24,6 +24,165 @@ _jax_after = "jax" in sys.modules
 
 
 class SavedBaselineTests(unittest.TestCase):
+    def test_first_attempt_difference_uses_time_order_and_exact_bits(self):
+        reference = {name:np.ones(4) for name in check.SCHEDULE_FIELDS}
+        current = {name:values.copy() for name, values in reference.items()}
+        self.assertEqual(check.first_attempt_difference(reference, current), [])
+        current['attempted_dts'][3] += .25
+        current['err_norms'][1] = np.nextafter(1., np.inf)
+        current['jacobian_reused'][1] = 0.
+        rows = check.first_attempt_difference(reference, current)
+        self.assertEqual({r['attempt'] for r in rows}, {2})
+        self.assertEqual({r['field'] for r in rows}, {'err_norms','jacobian_reused'})
+        reference['step_ts'][0], current['step_ts'][0] = 0., -0.
+        self.assertEqual(check.first_attempt_difference(reference, current)[0]['attempt'], 1)
+        current = {name:values[:2].copy() for name, values in reference.items()}
+        self.assertEqual({r['attempt'] for r in check.first_attempt_difference(reference,current)}, {3})
+        current['step_ts'] = np.zeros(2, dtype=np.float32)
+        with self.assertRaisesRegex(ValueError, 'step_ts'):
+            check.first_attempt_difference(reference, current)
+
+    def test_forward_trace_runs_only_sequential_saved_input_controls_and_checks_archives(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            run, out = root/'saved', root/'trace'
+            (run/'ad/snapshots').mkdir(parents=True)
+            (run/'fd_n0/snapshots').mkdir(parents=True)
+            endpoint = dict(final_y=np.asarray([2.]), final_time=np.asarray(.1))
+            np.savez(run/'ad/snapshots/ad_terminal_a.npz', **endpoint)
+            np.savez(run/'fd_n0/snapshots/fd_reference_baseline_b.npz', **endpoint)
+            calls = []
+            def launch(command, **kwargs):
+                name = command[command.index('--variant')+1]
+                folder = out/name
+                calls.append(name)
+                self.assertTrue(folder.is_dir())
+                self.assertIn('--trace-ad-fd', command)
+                self.assertEqual(Path(command[1]), SCRIPT)
+                self.assertEqual(kwargs['env'], {'same_environment_as_paired_run':'1'})
+                setup = {'initial_carry.y':np.asarray([1.]), 'initial_rhs':np.asarray([3.]),
+                         'execution.reverse_direct_stage_adjoint':np.asarray(name.startswith('ad'))}
+                if name == 'fd':
+                    setup['initial_rhs'][0] = np.nextafter(3.,np.inf)
+                np.savez(folder/'setup.npz', **setup)
+                trajectory = {k:np.ones(3) for k in check.SCHEDULE_FIELDS}
+                if name == 'ad':
+                    trajectory['err_norms'][1] += .125
+                np.savez(folder/'native.npz', **trajectory, **endpoint)
+                return SimpleNamespace(returncode=0)
+            argv = [str(SCRIPT),'--run-dir',str(run),'--out-dir',str(out),'--trace-ad-fd']
+            module = SimpleNamespace(worker_environment=lambda:{'same_environment_as_paired_run':'1'})
+            with patch.dict(sys.modules, {'benchmark_transport_ntss1d_ad_fd':module}), \
+                 patch.object(sys,'argv',argv), patch.object(check.subprocess,'run',side_effect=launch), \
+                 contextlib.redirect_stdout(io.StringIO()):
+                check.main()
+            self.assertEqual(calls, list(check.FORWARD_VARIANTS))
+            rows = json.loads((out/'comparison.json').read_text())
+            self.assertEqual(rows[0]['initial'][0]['field'], 'initial_rhs')
+            self.assertEqual(rows[0]['first_attempt'], [])
+            self.assertEqual(rows[1]['initial'], [])
+            self.assertTrue(rows[1]['context'])
+            self.assertEqual(rows[2]['first_attempt'][0]['attempt'], 2)
+            self.assertEqual(rows[-1]['differences'], [])
+            self.assertEqual(rows[-2]['differences'], [])
+            # Failed workers halt before subsequent controls or comparisons.
+            calls.clear()
+            argv[argv.index('--out-dir')+1] = str(root/'failed')
+            with patch.dict(sys.modules, {'benchmark_transport_ntss1d_ad_fd':module}),patch.object(sys,'argv',argv), \
+                 patch.object(check.subprocess,'run',return_value=SimpleNamespace(returncode=1)) as launch, \
+                 contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()), \
+                 self.assertRaises(SystemExit):
+                check.main()
+            self.assertEqual(launch.call_count, 1)
+        self.assertEqual(_jax_before, 'jax' in sys.modules)
+
+    def test_forward_workers_preserve_independent_schedules_and_change_one_setup_boundary(self):
+        @dataclasses.dataclass
+        class Carry:
+            y: object
+            prev_stages: object
+        @dataclasses.dataclass
+        class Execution:
+            reverse_direct_stage_adjoint: bool
+        state, live, fixed = object(), SimpleNamespace(species=object()), SimpleNamespace(species=object())
+        carry = Carry(np.asarray([1.,2.]),np.asarray([3.,4.,3.,4.]))
+        prepared = SimpleNamespace(initial_carry=carry)
+        equation = SimpleNamespace(fixed_temperature_profile=np.asarray([5.]))
+        trajectory = SimpleNamespace(trace=SimpleNamespace(**{k:np.ones(3) for k in check.SCHEDULE_FIELDS}),
+            final_carry=SimpleNamespace(y=np.asarray([2.,3.]),t=np.asarray(.1)),
+            failed=False,completed=True,accepted_count=16,attempt_count=3)
+        schedule_calls = []
+        def adaptive(execution, carry_arg, **options):
+            self.assertIs(carry_arg, carry)
+            self.assertTrue(options['capture_newton_setup'])
+            self.assertEqual(options['stop_after_accepted_steps'],16)
+            schedule_calls.append((execution.reverse_direct_stage_adjoint,options.get('capture_segment_length')))
+            return trajectory
+        reverse = SimpleNamespace(initial_state_for_parameter_vector=Mock(side_effect=AssertionError('root evaluated')))
+        reverse._radau_adaptive_schedule_rollout = adaptive
+        reverse._reverse_adaptive_schedule_rollout = lambda execution, carry, **opts: adaptive(
+            execution, carry, capture_newton_setup=opts.get('capture_segment_length') is not None,**opts)
+        production = ast.parse((SCRIPT.parents[2]/'NEOPAX/_reverse_ad_transport.py').read_text())
+        definition = next(n for n in production.body if isinstance(n,ast.FunctionDef)
+                          and n.name=='prepare_reverse_static_setup')
+        allowed = {a.arg for a in definition.args.kwonlyargs}
+        def prepare(values, **options):
+            self.assertTrue(set(options).issubset(allowed))
+            self.assertIs(options['runtime'],fixed)
+            self.assertIs(reverse.initial_state_for_parameter_vector(values),state)
+            self.assertEqual(options['reverse_stage_adjoint_solve_mode'],'block')
+            self.assertEqual(options['reverse_schedule_artifact_mode'],'reuse_static_probe')
+            execution = Execution(True)
+            options['schedule_probe_runner'](execution,carry,max_total_steps=256,
+                stop_after_accepted_steps=16,capture_segment_length=4)
+            return SimpleNamespace(prepared_rollout=prepared,execution_context=execution,
+                solve_vector_field=SimpleNamespace(__self__=equation))
+        reverse.prepare_reverse_static_setup = prepare
+        def fd_schedule(config, runtime, state_arg, **options):
+            self.assertIn(runtime,(live,fixed))
+            self.assertIs(state_arg,state)
+            execution = Execution(False)
+            adaptive(execution,carry,max_total_steps=256,stop_after_accepted_steps=options['accepted_step_limit'],
+                capture_newton_setup=options['capture_newton_setup'])
+            return {'equation_system':equation},prepared,execution,trajectory,state
+        config = {'neoclassical':{'flux_model':'ntx_scan_runtime'}}
+        orch = SimpleNamespace(_resolve_er_right_boundary_mode=lambda *a:'floating_ambipolar_edge',
+            _normalize_solver_config=lambda c:{},_execution_device_context=lambda c:contextlib.nullcontext())
+        modules = {
+            'jax':SimpleNamespace(numpy=np,config=SimpleNamespace(x64_enabled=True),default_backend=lambda:'gpu',
+                flatten_util=SimpleNamespace(ravel_pytree=lambda parts:(np.concatenate(parts),None))),
+            'jax.numpy':np,
+            'NEOPAX':SimpleNamespace(_orchestrator=orch,_reverse_ad_transport=reverse),
+            'NEOPAX._transport_solvers':SimpleNamespace(_pack_transport_state_arrays=lambda *a:(carry.y,)),
+            'NEOPAX._reverse_ad_initial_er':SimpleNamespace(runtime_with_fixed_ntx_database_model=lambda r:fixed),
+            'benchmark_transport_realtime_geometry_forward_fd':SimpleNamespace(_schedule_rollout=fd_schedule),
+            'benchmark_transport_autodiff_lagged_ntx':SimpleNamespace(
+                _prepare_benchmark_config=lambda *a,**k:config,_baseline_profile_cfg=lambda c:{}),
+            'benchmark_transport_reverse_ad_only':SimpleNamespace(PARAMETER_ORDER=('n0',),
+                _profile_cfg_scalar_value=lambda *a:1.),
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory)
+            for name in ('ad/snapshots','fd_n0/snapshots'):
+                (root/name).mkdir(parents=True)
+            physical={'initial_y':carry.y,"support['geometry'].a_b":np.asarray(1.),
+                      "support['database'].D13":np.asarray([2.])}
+            np.savez(root/'ad/snapshots/ad_terminal_a.npz',**physical)
+            np.savez(root/'fd_n0/snapshots/fd_reference_support_b.npz',**physical)
+            np.savez(root/'fd_n0/snapshots/fd_reference_baseline_c.npz',initial_y=carry.y)
+            (root/'ad/summary.json').write_text(json.dumps({'accepted_step_limit':16}))
+            before={p:p.read_bytes() for p in root.rglob('*') if p.is_file()}
+            with patch.dict(sys.modules,modules),patch.object(check,'restore_runtime',return_value=(live,state)), \
+                 patch.object(check,'version',return_value='test'),contextlib.redirect_stdout(io.StringIO()):
+                for variant in check.FORWARD_VARIANTS:
+                    out=root/variant
+                    out.mkdir(exist_ok=True)
+                    check.trace_forward_worker(root,out,variant,16)
+                    np.testing.assert_array_equal(check.read_one(out,'setup.npz')['initial_rhs'],[3.,4.])
+            self.assertEqual(schedule_calls,[(False,None),(False,None),(True,None),(True,4)])
+            self.assertTrue(all(p.read_bytes()==value for p,value in before.items()))
+        self.assertEqual(_jax_before,'jax' in sys.modules)
+
     def test_fd_device_context_matches_ad_for_default_and_explicit_placement(self):
         root = SCRIPT.parents[2]
         namespace = dict(Any=object, contextlib=contextlib, Path=Path,
@@ -279,6 +438,21 @@ class SavedBaselineTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     check.restore_runtime({'neoclassical':settings}, ad, fd, orch, np)
                 build.assert_not_called()
+
+            # Aborted paired runs have packed initial_y but only a final-state
+            # shape template. They must never resume from that final state.
+            ad.update({f'final_state.{k}':np.asarray([99.]) for k in ('density','pressure','Er')})
+            packed = np.asarray([1.,2.,3.])
+            expected_state = object()
+            unpack = Mock(return_value=expected_state)
+            transform = Mock(return_value=(np.asarray([99.]),unpack,None,None,None))
+            with patch.dict(sys.modules, {'NEOPAX._transport_solvers':SimpleNamespace(
+                    _make_solver_state_transform=transform)}):
+                _, state = check.restore_runtime({'neoclassical':{'flux_model':'ntx_scan_runtime'}},
+                    ad, {'initial_y':packed}, orch, np)
+            self.assertIs(state, expected_state)
+            np.testing.assert_array_equal(unpack.call_args.args[0], packed)
+            np.testing.assert_array_equal(transform.call_args.args[0].Er, [99.])
 
     def test_fd_endpoint_profile_wrapper_keeps_its_existing_selected_root_rule(self):
         path = SCRIPT.with_name('benchmark_transport_realtime_geometry_forward_fd.py')
