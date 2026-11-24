@@ -13,6 +13,7 @@ then checkpoint capture, without sharing a timestep schedule or rerunning AD.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import dataclasses
 import gc
 import hashlib
@@ -233,10 +234,10 @@ def restore_runtime(config, ad, fd, orch, jnp):
     return runtime, state
 
 
-def first_attempt_difference(reference, current):
+def first_attempt_difference(reference, current, fields=SCHEDULE_FIELDS):
     """Locate the first differing scalar attempt, including signed zero."""
     changes = []
-    for name in SCHEDULE_FIELDS:
+    for name in fields:
         a, b = reference[name], current[name]
         if a.ndim != 1 or b.ndim != 1 or a.dtype != b.dtype:
             raise ValueError(f"Incompatible attempt field: {name}")
@@ -253,7 +254,37 @@ def first_attempt_difference(reference, current):
     return [row for row in changes if row["attempt"] == first]
 
 
-def trace_forward_worker(run, out, variant, limit):
+@contextlib.contextmanager
+def capture_forward_compiler_ir(directory):
+    """Observe original scan compilations; do not re-jit or change options."""
+    from jax._src import compiler
+    from unittest.mock import patch
+    original = compiler.compile_or_get_cached
+    programs, largest = [], 0
+
+    def observe(*args, **kwargs):
+        nonlocal largest
+        executable = original(*args, **kwargs)
+        computation = args[1] if len(args) > 1 else kwargs["computation"]
+        name = str(computation.operation.attributes["sym_name"])
+        if "scan" in name:
+            text = str(computation)
+            programs.append(dict(name=name, stablehlo_bytes=len(text.encode())))
+            if len(text) > largest:
+                largest = len(text)
+                (directory / "adaptive_stablehlo.mlir").write_text(text)
+                hlo = "\n\n".join(module.to_string() for module in executable.hlo_modules())
+                (directory / "adaptive_compiled_hlo.txt").write_text(hlo)
+        return executable
+
+    try:
+        with patch.object(compiler, "compile_or_get_cached", observe):
+            yield
+    finally:
+        write_json(directory / "compiler_programs.json", programs)
+
+
+def trace_forward_worker(run, out, variant, limit, *, capture_ir=False):
     """Execute an independent ordinary forward baseline from saved inputs."""
     import jax
     import jax.numpy as jnp
@@ -285,7 +316,9 @@ def trace_forward_worker(run, out, variant, limit):
         "ambipolar_edge_root", "floating_ambipolar_edge_node",
     }:
         raise ValueError("This diagnostic must not launch a boundary root solve.")
-    with orch._execution_device_context(config):
+    with orch._execution_device_context(config), (
+        capture_forward_compiler_ir(out) if capture_ir else contextlib.nullcontext()
+    ):
         # Use the FD's own saved tables. No geometry, table or root is built.
         runtime, state = restore_runtime(config, {**ad, **fd}, fd, orch, jnp)
         initial, _ = jax.flatten_util.ravel_pytree(_pack_transport_state_arrays(state, runtime.species))
@@ -298,6 +331,7 @@ def trace_forward_worker(run, out, variant, limit):
         if variant.startswith("ad"):
             captured = {}
             def probe(execution, carry, **options):
+                captured["execution"] = execution
                 if variant == "ad_no_checkpoints":
                     options["capture_segment_length"] = None
                     # Keep the same scalar Newton-reuse output; change only
@@ -325,7 +359,7 @@ def trace_forward_worker(run, out, variant, limit):
                     reverse_bootstrap_cotangent_mode="joint_local_vjp_upar_only",
                     reverse_step_bwd_mode="reduced_cotangent_call_boundary",
                     reverse_schedule_artifact_mode="reuse_static_probe", schedule_probe_runner=probe)
-            prepared, execution, rollout = setup.prepared_rollout, setup.execution_context, captured["rollout"]
+            prepared, execution, rollout = setup.prepared_rollout, captured["execution"], captured["rollout"]
             components = {"equation_system": setup.solve_vector_field.__self__}
         else:
             components, prepared, execution, rollout, _ = _schedule_rollout(
@@ -342,6 +376,7 @@ def trace_forward_worker(run, out, variant, limit):
         np.savez_compressed(out / "setup.npz", **inputs)
         np.savez_compressed(out / "native.npz", **arrays)
         write_json(out / "metadata.json", dict(variant=variant, accepted_step_limit=limit,
+            compiler_ir_captured=capture_ir,
             versions={name: version(name) for name in ("jax", "jaxlib", "ntx", "vmex", "solvax")},
             sources={name: hashlib.sha256(Path(module.__file__).read_bytes()).hexdigest()
                      for name, module in tuple(sys.modules.items()) if name.startswith("NEOPAX.")
@@ -360,9 +395,14 @@ def compare_forward_variants(run, out):
                    context=differences({k: v for k, v in setup_a.items() if not k.startswith("initial_carry.")},
                                        {k: v for k, v in setup_b.items() if not k.startswith("initial_carry.")}),
                    first_attempt=first_attempt_difference(a, b), trajectory=differences(a, b))
+        row["first_time_map"] = first_attempt_difference(a, b, ("next_dts", "attempted_dts", "step_ts"))
+        for change in row["first_time_map"]:
+            i = change["attempt"] - 1
+            change["reference_error"] = str(a["err_norms"][i]) if i < a["err_norms"].size else None
+            change["current_error"] = str(b["err_norms"][i]) if i < b["err_norms"].size else None
         rows.append(row)
         print(f"[forward-trace] {row['comparison']}: initial={row['initial']} "
-              f"first_attempt={row['first_attempt']}", flush=True)
+              f"first_attempt={row['first_attempt']} first_time_map={row['first_time_map']}", flush=True)
     for name, folder, pattern in (("ad", "ad/snapshots", "ad_terminal_*.npz"),
                                   ("fd", "fd_n0/snapshots", "fd_reference_baseline_*.npz")):
         saved = read_one(run / folder, pattern)
@@ -481,6 +521,8 @@ def main():
     parser.add_argument("--trace-ad-fd", action="store_true",
         help="Compare independent AD/FD forward setup paths from a failed paired run, without new physics preparation.")
     parser.add_argument("--accepted-step-limit", type=int, default=16)
+    parser.add_argument("--capture-compiler-ir", action="store_true",
+        help="Save original scan compiler IR without changing its inputs, compilation options or JIT nesting.")
     parser.add_argument("--variant", choices=FORWARD_VARIANTS, help=argparse.SUPPRESS)
     parser.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
@@ -491,7 +533,8 @@ def main():
         if args.accepted_step_limit <= 0:
             parser.error("--accepted-step-limit must be positive")
         if args.variant:
-            trace_forward_worker(run, out, args.variant, args.accepted_step_limit)
+            trace_forward_worker(run, out, args.variant, args.accepted_step_limit,
+                                 capture_ir=args.capture_compiler_ir)
             return
         for name in FORWARD_VARIANTS:
             folder = out / name
@@ -502,7 +545,8 @@ def main():
             with (folder / "run.log").open("w") as log:
                 result = subprocess.run([sys.executable, str(Path(__file__).resolve()),
                     "--run-dir", str(run), "--out-dir", str(folder), "--trace-ad-fd",
-                    "--accepted-step-limit", str(args.accepted_step_limit), "--variant", name],
+                    "--accepted-step-limit", str(args.accepted_step_limit), "--variant", name,
+                    *(["--capture-compiler-ir"] if args.capture_compiler_ir else [])],
                     cwd=ROOT, env=worker_environment(), stdout=log, stderr=subprocess.STDOUT)
             if result.returncode:
                 print("\n".join((folder / "run.log").read_text().splitlines()[-70:]),

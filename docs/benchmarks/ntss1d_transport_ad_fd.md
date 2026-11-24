@@ -268,3 +268,43 @@ Sixteen NumPy/mock tests cover restoration, all four control paths, first
 attempt ordering and exact bits, archive comparisons and worker failure.
 The restoration regression executes the production packing and density-floor
 functions with NumPy, including zero, signed-zero and sub-floor densities.
+
+### Completed independent controls: first timestep divergence
+
+Remote run `independent_forward_trace_OoidNV` completed all four controls.
+Its full `comparison.json` reports:
+
+| Comparison | First `next_dt` difference | First attempted-`dt` difference | Final time max abs | Final state max abs |
+| --- | --- | --- | --- | --- |
+| Scan wrapper vs fixed-table model | None | None | `0` | `0` |
+| Fixed-table FD setup vs AD setup without checkpoints | Attempt 23 | Attempt 24 | `2.141341737e-12` | `1.101037483e-8` |
+| AD setup without vs with checkpoints | Attempt 7 | Attempt 8 | `8.654673874e-12` | `4.450080127e-8` |
+
+The checkpoint pair's saved initial carry and numeric context match exactly.
+All controls retain identical active/accepted and Jacobian-reuse masks. The
+first saved scalar difference is an error estimate at attempt 2:
+`2.0413663173335623e-14` vs `2.0413663173335626e-14`. The controller clamps
+the error used in its growth formula to at least `1e-12`, so that particular
+last-bit difference alone does not establish the cause of the timestep split.
+The wrapper's initial-RHS difference also does not change its trajectory.
+
+The archived AD and FD endpoints are not reproduced exactly. These controls
+isolate sensitivity of the ordinary numerical forward execution to its
+surrounding graph; they do not identify a faulty arithmetic operation, prove
+that checkpoint capture alone explains the archived run, or validate AD/FD
+gradients. The next comparison retains the original compiled programs to
+distinguish GPU product choices and arithmetic reassociation from a source
+input difference. The source now captures the context actually passed to the
+adaptive probe, before static setup attaches reverse-sweep schedule metadata.
+First timestep differences and their contemporaneous error estimates are also
+printed directly, rather than only the first differing diagnostic scalar.
+
+Add `--capture-compiler-ir` to the same `--trace-ad-fd` command. The observer
+returns the original executable from JAX's compiler, without recompilation,
+extra JIT nesting, compiler options or XLA flags. It retains the largest
+original scan program in each worker as `adaptive_stablehlo.mlir` and
+`adaptive_compiled_hlo.txt`; `compiler_programs.json` lists observed scan
+compilations. This diagnostic uses JAX's internal compiler API, inspected in
+the local JAX 0.10 source. Its pass-through behavior and context capture pass
+17 NumPy/mock tests; GPU IR capture remains pending. No transport method,
+AD rule, model or baseline tolerance is changed.

@@ -24,6 +24,49 @@ _jax_after = "jax" in sys.modules
 
 
 class SavedBaselineTests(unittest.TestCase):
+    def test_compiler_observer_preserves_calls_results_and_restores_hook(self):
+        class Computation:
+            def __init__(self,name,text):
+                self.operation=SimpleNamespace(attributes={'sym_name':name})
+                self.text=text
+            def __str__(self):
+                return self.text
+        options, backend = object(),object()
+        calls,executables=[],[]
+        def compile_program(*args,**kwargs):
+            calls.append((args,kwargs))
+            computation=args[1] if len(args)>1 else kwargs['computation']
+            executable=SimpleNamespace(hlo_modules=lambda:[SimpleNamespace(to_string=lambda:'compiled '+str(computation))])
+            executables.append(executable)
+            return executable
+        original=Mock(side_effect=compile_program)
+        compiler=SimpleNamespace(compile_or_get_cached=original)
+        modules={'jax._src':SimpleNamespace(compiler=compiler)}
+        with tempfile.TemporaryDirectory() as directory,patch.dict(sys.modules,modules):
+            out=Path(directory)
+            with check.capture_forward_compiler_ir(out):
+                result=compiler.compile_or_get_cached(backend,Computation('jit_add','ignored'),options)
+                self.assertIs(result,executables[0])
+                first=compiler.compile_or_get_cached(backend,Computation('jit_scan','small'),options)
+                last=compiler.compile_or_get_cached(backend=backend,
+                    computation=Computation('jit_scan','largest native program'),compile_options=options)
+                self.assertEqual(first.hlo_modules()[0].to_string(),'compiled small')
+                self.assertEqual(last.hlo_modules()[0].to_string(),'compiled largest native program')
+                self.assertIs(first,executables[1])
+                self.assertIs(last,executables[2])
+            self.assertIs(compiler.compile_or_get_cached,original)
+            self.assertEqual(original.call_count,3)
+            self.assertIs(calls[0][0][2],options)
+            self.assertIs(calls[2][1]['compile_options'],options)
+            self.assertEqual((out/'adaptive_stablehlo.mlir').read_text(),'largest native program')
+            self.assertEqual((out/'adaptive_compiled_hlo.txt').read_text(),'compiled largest native program')
+            self.assertEqual(len(json.loads((out/'compiler_programs.json').read_text())),2)
+            with self.assertRaisesRegex(RuntimeError,'original failure'):
+                with check.capture_forward_compiler_ir(out):
+                    raise RuntimeError('original failure')
+            self.assertIs(compiler.compile_or_get_cached,original)
+        self.assertEqual(_jax_before,'jax' in sys.modules)
+
     def test_raw_initial_state_roundtrip_preserves_zero_and_subfloor_helium(self):
         source = ast.parse((SCRIPT.parents[2]/'NEOPAX/_transport_solvers.py').read_text())
         functions = [n for n in source.body if isinstance(n,ast.FunctionDef)
@@ -92,6 +135,7 @@ class SavedBaselineTests(unittest.TestCase):
                 calls.append(name)
                 self.assertTrue(folder.is_dir())
                 self.assertIn('--trace-ad-fd', command)
+                self.assertIn('--capture-compiler-ir', command)
                 self.assertEqual(Path(command[1]), SCRIPT)
                 self.assertEqual(kwargs['env'], {'same_environment_as_paired_run':'1'})
                 setup = {'initial_carry.y':np.asarray([1.]), 'initial_rhs':np.asarray([3.]),
@@ -102,9 +146,11 @@ class SavedBaselineTests(unittest.TestCase):
                 trajectory = {k:np.ones(3) for k in check.SCHEDULE_FIELDS}
                 if name == 'ad':
                     trajectory['err_norms'][1] += .125
+                if name == 'ad_no_checkpoints':
+                    trajectory['next_dts'][2] += 1e-6
                 np.savez(folder/'native.npz', **trajectory, **endpoint)
                 return SimpleNamespace(returncode=0)
-            argv = [str(SCRIPT),'--run-dir',str(run),'--out-dir',str(out),'--trace-ad-fd']
+            argv = [str(SCRIPT),'--run-dir',str(run),'--out-dir',str(out),'--trace-ad-fd','--capture-compiler-ir']
             module = SimpleNamespace(worker_environment=lambda:{'same_environment_as_paired_run':'1'})
             with patch.dict(sys.modules, {'benchmark_transport_ntss1d_ad_fd':module}), \
                  patch.object(sys,'argv',argv), patch.object(check.subprocess,'run',side_effect=launch), \
@@ -116,6 +162,8 @@ class SavedBaselineTests(unittest.TestCase):
             self.assertEqual(rows[0]['first_attempt'], [])
             self.assertEqual(rows[1]['initial'], [])
             self.assertTrue(rows[1]['context'])
+            self.assertEqual(rows[1]['first_time_map'][0]['attempt'],3)
+            self.assertEqual(rows[1]['first_time_map'][0]['reference_error'],'1.0')
             self.assertEqual(rows[2]['first_attempt'][0]['attempt'], 2)
             self.assertEqual(rows[-1]['differences'], [])
             self.assertEqual(rows[-2]['differences'], [])
@@ -174,7 +222,9 @@ class SavedBaselineTests(unittest.TestCase):
             execution = Execution(True)
             options['schedule_probe_runner'](execution,carry,max_total_steps=256,
                 stop_after_accepted_steps=16,capture_segment_length=4)
-            return SimpleNamespace(prepared_rollout=prepared,execution_context=execution,
+            # Setup can add reverse metadata after its probe. The snapshot
+            # must retain the context actually passed to the forward call.
+            return SimpleNamespace(prepared_rollout=prepared,execution_context=Execution(False),
                 solve_vector_field=SimpleNamespace(__self__=equation))
         reverse.prepare_reverse_static_setup = prepare
         def fd_schedule(config, runtime, state_arg, **options):
@@ -218,6 +268,8 @@ class SavedBaselineTests(unittest.TestCase):
                     out.mkdir(exist_ok=True)
                     check.trace_forward_worker(root,out,variant,16)
                     np.testing.assert_array_equal(check.read_one(out,'setup.npz')['initial_rhs'],[3.,4.])
+                    self.assertEqual(bool(check.read_one(out,'setup.npz')['execution.reverse_direct_stage_adjoint']),
+                                     variant.startswith('ad'))
             self.assertEqual(schedule_calls,[(False,None),(False,None),(True,None),(True,4)])
             self.assertTrue(all(p.read_bytes()==value for p,value in before.items()))
         self.assertEqual(_jax_before,'jax' in sys.modules)
