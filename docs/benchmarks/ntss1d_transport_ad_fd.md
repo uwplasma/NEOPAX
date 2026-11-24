@@ -308,3 +308,53 @@ compilations. This diagnostic uses JAX's internal compiler API, inspected in
 the local JAX 0.10 source. Its pass-through behavior and context capture pass
 17 NumPy/mock tests; GPU IR capture remains pending. No transport method,
 AD rule, model or baseline tolerance is changed.
+
+### Original compiler programs: scalar reduction dispatch differs
+
+The downloaded `forward_compiler_ir.tar.gz` contains completed run
+`forward_compiler_ir_davv7R`. Offline NumPy/stdlib inspection imports no JAX
+and executes no physics. The exported StableHLO text for `fd`,
+`fd_fixed_model` and `ad_no_checkpoints` is byte-identical: 6,467,817 bytes,
+SHA256 `226a2cca350b0e247253b6e824cafa69ee70441d08296ace57e661e11aaebf5a`.
+Their compiled programs differ. All four cuBLAS matmuls select algorithm 0,
+while several scalar reductions switch between native input-fusion and
+Triton kernels. For `fd` versus `fd_fixed_model`, the changed sum-of-squares
+kernels include:
+
+| Compiled fusion | Input reduction | FD implementation | Fixed-model FD implementation |
+| --- | --- | --- | --- |
+| `input_reduce_fusion.36` | 204 FP64 entries squared and summed | Native | Triton, one warp |
+| `input_reduce_fusion.38` | 51 FP64 entries squared and summed | Native | Triton, one warp |
+| `input_reduce_fusion.39` | First 153 entries of a 408-entry FP64 vector, squared and summed | Native | Triton, one warp |
+
+The pair's saved initial carry is identical, its accept/reject and
+Jacobian-reuse masks match, and its terminal difference reproduces the
+original failure's `1.1010374834086178e-8` state and
+`2.141341737173924e-12` time gaps. In this new compilation, AD without and
+with checkpoints have identical timesteps and terminal states; AD also
+matches its archived endpoint exactly. Checkpoint recording alone is
+therefore not a consistent explanation. Backend selection in ordinary
+forward numerical execution is now a concrete discrepancy. These artifacts
+do not yet prove that the three listed reductions alone cause all the drift:
+some interpolation transpose fusions also choose different implementations.
+
+The diagnostic-only `--solver-mean-reduction fixed` control specifies a fixed
+GPU implementation of FP64, one-dimensional, default-argument means in
+`NEOPAX._transport_solvers`. It uses `solvax._reproducible.schur_product`
+already available in `en/neopax-reproducible-products`: summing a vector via
+an all-ones row product, then dividing by its length. The same mean, RMS,
+predictor and controller formulas remain in place. A module-local proxy
+leaves JAX's global `mean`, the physics modules, non-FP64 means and explicit
+axis/keyword reductions unchanged. No production solver source or default
+changes; the control is restored on exit. Metadata reports the reduction
+sizes actually traced. The existing native behavior is the default.
+
+Run the same saved-input control in a fresh directory with both
+`--solver-mean-reduction fixed` and `--capture-compiler-ir`. All four workers
+still compute their own adaptive schedule. The comparison reports native
+archived endpoints for reference: fixed floating-point reduction order can
+change those last bits, so the candidate must first be judged by agreement
+between the independent fixed-mean controls. GPU validation, performance
+and the subsequent full AD/FD comparison remain pending. Eighteen local
+NumPy/mock tests pass, including the actual production error-norm formula,
+proxy scope restoration, unchanged fallback reductions and CLI dispatch.

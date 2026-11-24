@@ -24,6 +24,47 @@ _jax_after = "jax" in sys.modules
 
 
 class SavedBaselineTests(unittest.TestCase):
+    def test_fixed_means_are_scoped_to_solver_and_preserve_norm_formula(self):
+        solvers=SimpleNamespace(jnp=np)
+        product=Mock(side_effect=lambda a,b:a@b)
+        modules={'NEOPAX':SimpleNamespace(_transport_solvers=solvers),
+                 'solvax._reproducible':SimpleNamespace(schur_product=product)}
+        real_mean=np.mean
+        with patch.dict(sys.modules,modules):
+            with check.fixed_solver_means() as control:
+                self.assertIs(np.mean,real_mean)
+                self.assertIsNot(solvers.jnp,np)
+                for size in (51,153,204,408,2856):
+                    values=np.linspace(.1,2.,size,dtype=np.float64)**2
+                    np.testing.assert_allclose(solvers.jnp.mean(values),np.mean(values),rtol=3e-15)
+                    a,b=product.call_args.args
+                    self.assertEqual(a.shape,(1,size))
+                    self.assertEqual(b.shape,(size,1))
+                    np.testing.assert_array_equal(a,np.ones_like(a))
+                    np.testing.assert_array_equal(b[:,0],values)
+                self.assertEqual(control.sizes,{51,153,204,408,2856})
+                count=product.call_count
+                values=np.arange(6,dtype=np.float32).reshape(2,3)
+                np.testing.assert_array_equal(solvers.jnp.mean(values,axis=1),np.mean(values,axis=1))
+                self.assertEqual(solvers.jnp.mean(values[0]),np.mean(values[0]))
+                self.assertEqual(solvers.jnp.mean([1.,2.]),1.5)
+                self.assertEqual(product.call_count,count)
+                source=ast.parse((SCRIPT.parents[2]/'NEOPAX/_transport_solvers.py').read_text())
+                norm=next(n for n in source.body if isinstance(n,ast.FunctionDef) and n.name=='_solver_error_norm')
+                namespace={'jnp':solvers.jnp}
+                exec(compile(ast.Module(body=[norm],type_ignores=[]),'production_error_norm','exec'),namespace)
+                values=np.linspace(.1,2.,408)
+                result=namespace['_solver_error_norm'](values,values,values,atol=1e-8,rtol=1e-6)
+                expected=np.sqrt(np.mean((values/(1e-8+1e-6*values))**2)+1e-30)
+                np.testing.assert_allclose(result,expected,rtol=3e-15)
+                self.assertGreater(product.call_count,count)
+            self.assertIs(solvers.jnp,np)
+            with self.assertRaisesRegex(RuntimeError,'restore scope'):
+                with check.fixed_solver_means():
+                    raise RuntimeError('restore scope')
+            self.assertIs(solvers.jnp,np)
+        self.assertEqual(_jax_before,'jax' in sys.modules)
+
     def test_compiler_observer_preserves_calls_results_and_restores_hook(self):
         class Computation:
             def __init__(self,name,text):
@@ -136,6 +177,7 @@ class SavedBaselineTests(unittest.TestCase):
                 self.assertTrue(folder.is_dir())
                 self.assertIn('--trace-ad-fd', command)
                 self.assertIn('--capture-compiler-ir', command)
+                self.assertEqual(command[command.index('--solver-mean-reduction')+1],'fixed')
                 self.assertEqual(Path(command[1]), SCRIPT)
                 self.assertEqual(kwargs['env'], {'same_environment_as_paired_run':'1'})
                 setup = {'initial_carry.y':np.asarray([1.]), 'initial_rhs':np.asarray([3.]),
@@ -150,7 +192,8 @@ class SavedBaselineTests(unittest.TestCase):
                     trajectory['next_dts'][2] += 1e-6
                 np.savez(folder/'native.npz', **trajectory, **endpoint)
                 return SimpleNamespace(returncode=0)
-            argv = [str(SCRIPT),'--run-dir',str(run),'--out-dir',str(out),'--trace-ad-fd','--capture-compiler-ir']
+            argv = [str(SCRIPT),'--run-dir',str(run),'--out-dir',str(out),'--trace-ad-fd','--capture-compiler-ir',
+                    '--solver-mean-reduction','fixed']
             module = SimpleNamespace(worker_environment=lambda:{'same_environment_as_paired_run':'1'})
             with patch.dict(sys.modules, {'benchmark_transport_ntss1d_ad_fd':module}), \
                  patch.object(sys,'argv',argv), patch.object(check.subprocess,'run',side_effect=launch), \

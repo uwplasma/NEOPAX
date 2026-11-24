@@ -255,6 +255,34 @@ def first_attempt_difference(reference, current, fields=SCHEDULE_FIELDS):
 
 
 @contextlib.contextmanager
+def fixed_solver_means():
+    """Diagnostic-only fixed-order FP64 means in the solver module."""
+    from NEOPAX import _transport_solvers as solvers
+    from solvax._reproducible import schur_product
+    from unittest.mock import patch
+    original = solvers.jnp
+
+    class MeanControl:
+        def __init__(self):
+            self.sizes = set()
+
+        def __getattr__(self, name):
+            return getattr(original, name)
+
+        def mean(self, value, *args, **kwargs):
+            if (not args and not kwargs and getattr(value, "ndim", None) == 1 and value.size
+                    and value.dtype == np.dtype("float64")):
+                self.sizes.add(value.size)
+                total = schur_product(original.ones((1, value.size), dtype=value.dtype), value[:, None])[0, 0]
+                return total / original.asarray(value.size, dtype=value.dtype)
+            return original.mean(value, *args, **kwargs)
+
+    control = MeanControl()
+    with patch.object(solvers, "jnp", control):
+        yield control
+
+
+@contextlib.contextmanager
 def capture_forward_compiler_ir(directory):
     """Observe original scan compilations; do not re-jit or change options."""
     from jax._src import compiler
@@ -284,7 +312,7 @@ def capture_forward_compiler_ir(directory):
         write_json(directory / "compiler_programs.json", programs)
 
 
-def trace_forward_worker(run, out, variant, limit, *, capture_ir=False):
+def trace_forward_worker(run, out, variant, limit, *, capture_ir=False, mean_reduction="native"):
     """Execute an independent ordinary forward baseline from saved inputs."""
     import jax
     import jax.numpy as jnp
@@ -318,7 +346,7 @@ def trace_forward_worker(run, out, variant, limit, *, capture_ir=False):
         raise ValueError("This diagnostic must not launch a boundary root solve.")
     with orch._execution_device_context(config), (
         capture_forward_compiler_ir(out) if capture_ir else contextlib.nullcontext()
-    ):
+    ), (fixed_solver_means() if mean_reduction == "fixed" else contextlib.nullcontext()) as means:
         # Use the FD's own saved tables. No geometry, table or root is built.
         runtime, state = restore_runtime(config, {**ad, **fd}, fd, orch, jnp)
         initial, _ = jax.flatten_util.ravel_pytree(_pack_transport_state_arrays(state, runtime.species))
@@ -375,8 +403,11 @@ def trace_forward_worker(run, out, variant, limit, *, capture_ir=False):
         inputs["initial_rhs"] = np.asarray(prepared.initial_carry.prev_stages).reshape(-1, initial.size)[0].copy()
         np.savez_compressed(out / "setup.npz", **inputs)
         np.savez_compressed(out / "native.npz", **arrays)
+        if mean_reduction == "fixed" and not means.sizes:
+            raise RuntimeError("Fixed solver means were not traced; the requested control did not execute.")
         write_json(out / "metadata.json", dict(variant=variant, accepted_step_limit=limit,
             compiler_ir_captured=capture_ir,
+            solver_mean_reduction=mean_reduction, fixed_mean_sizes=sorted(means.sizes) if means else [],
             versions={name: version(name) for name in ("jax", "jaxlib", "ntx", "vmex", "solvax")},
             sources={name: hashlib.sha256(Path(module.__file__).read_bytes()).hexdigest()
                      for name, module in tuple(sys.modules.items()) if name.startswith("NEOPAX.")
@@ -385,13 +416,14 @@ def trace_forward_worker(run, out, variant, limit, *, capture_ir=False):
               f"final_time={float(arrays['final_time']):.17e}", flush=True)
 
 
-def compare_forward_variants(run, out):
+def compare_forward_variants(run, out, *, mean_reduction="native"):
     rows = []
     for left, right in zip(FORWARD_VARIANTS, FORWARD_VARIANTS[1:]):
         setup_a, setup_b = (read_one(out / name, "setup.npz") for name in (left, right))
         a, b = (read_one(out / name, "native.npz") for name in (left, right))
         carry = lambda data: {k: v for k, v in data.items() if k.startswith("initial_carry.") or k == "initial_rhs"}
-        row = dict(comparison=f"{left} vs {right}", initial=differences(carry(setup_a), carry(setup_b)),
+        row = dict(comparison=f"{left} vs {right}", solver_mean_reduction=mean_reduction,
+                   initial=differences(carry(setup_a), carry(setup_b)),
                    context=differences({k: v for k, v in setup_a.items() if not k.startswith("initial_carry.")},
                                        {k: v for k, v in setup_b.items() if not k.startswith("initial_carry.")}),
                    first_attempt=first_attempt_difference(a, b), trajectory=differences(a, b))
@@ -412,7 +444,11 @@ def compare_forward_variants(run, out):
         rows.append(dict(comparison=f"{name} vs archived {name}", differences=changed))
         print(f"[forward-trace] {name} vs archived {name}: {changed}", flush=True)
     write_json(out / "comparison.json", rows)
-    print("[forward-trace] Controls locate a cause only if the archived AD and FD trajectories reproduce.", flush=True)
+    if mean_reduction == "native":
+        print("[forward-trace] Controls locate a cause only if the archived AD and FD trajectories reproduce.", flush=True)
+    else:
+        print("[forward-trace] Fixed means retain the formula with a fixed reduction kernel; native archive comparisons are references. "
+              "Check the independent fixed-control time maps and states before claiming a correction.", flush=True)
 
 
 def worker(run, out):
@@ -523,6 +559,8 @@ def main():
     parser.add_argument("--accepted-step-limit", type=int, default=16)
     parser.add_argument("--capture-compiler-ir", action="store_true",
         help="Save original scan compiler IR without changing its inputs, compilation options or JIT nesting.")
+    parser.add_argument("--solver-mean-reduction", choices=("native", "fixed"), default="native",
+        help="Diagnostic control: fixed-order FP64 one-dimensional means in the solver only; default native.")
     parser.add_argument("--variant", choices=FORWARD_VARIANTS, help=argparse.SUPPRESS)
     parser.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
@@ -534,7 +572,7 @@ def main():
             parser.error("--accepted-step-limit must be positive")
         if args.variant:
             trace_forward_worker(run, out, args.variant, args.accepted_step_limit,
-                                 capture_ir=args.capture_compiler_ir)
+                                 capture_ir=args.capture_compiler_ir, mean_reduction=args.solver_mean_reduction)
             return
         for name in FORWARD_VARIANTS:
             folder = out / name
@@ -546,13 +584,14 @@ def main():
                 result = subprocess.run([sys.executable, str(Path(__file__).resolve()),
                     "--run-dir", str(run), "--out-dir", str(folder), "--trace-ad-fd",
                     "--accepted-step-limit", str(args.accepted_step_limit), "--variant", name,
+                    "--solver-mean-reduction", args.solver_mean_reduction,
                     *(["--capture-compiler-ir"] if args.capture_compiler_ir else [])],
                     cwd=ROOT, env=worker_environment(), stdout=log, stderr=subprocess.STDOUT)
             if result.returncode:
                 print("\n".join((folder / "run.log").read_text().splitlines()[-70:]),
                       file=sys.stderr, flush=True)
                 parser.error(f"{name} failed; see {folder/'run.log'}")
-        compare_forward_variants(run, out)
+        compare_forward_variants(run, out, mean_reduction=args.solver_mean_reduction)
         return
     if args.worker:
         worker(run, out)
