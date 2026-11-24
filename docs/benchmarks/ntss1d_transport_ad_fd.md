@@ -140,3 +140,62 @@ After pushing/pulling the correction, rerun the Python comparison with a new
 directory, for example `outputs/ntss1d_ad_fd16_guard_fix_20261116`. The old
 directory records the previous source digest and failed preflight. The runner
 again starts transport AD/FD only after its GPU kernel checks pass.
+
+## Completed remote comparison at 417fd67
+
+All nine preflight checks now pass, including the three GPU derivative checks.
+The complete AD16 and eight FD16 workers also finish successfully.
+The [saved results and all relative differences](ntss1d_ad_fd16_2026-11-16.md) distinguish
+remaining geometry-gradient differences from the temperature_shape_power
+baseline coefficient-table mismatch. Kernel checks passing is not a
+certificate of complete transport-gradient agreement.
+
+## Both interpolators after the fixed-order SOLVAX component checks
+
+The SOLVAX candidate's seven component checks have now passed remotely across
+the full run and the corrected FP32 fallback rerun. This validates the FP64
+product, nested compilation, JVP/VJP, mapped operands and a small generated
+solve/gradient, not the full NEOPAX Jacobian. The next comparison uses
+NEOPAX `en/v0_main`, VMEX/NTX main-utility branches and SOLVAX
+`en/neopax-reproducible-products` on JAX 0.10, without a compilation cache.
+
+The existing runner now accepts the generic `black_box` TOML as well as its
+NTSS1D counterpart. The configurations differ only in interpolation mode.
+Each uses 51 radial points, NTX `25x31x64`, the same VMEX `ad` equilibrium and
+`raw_block` response, sixteen accepted steps, all eight DOFs and all thirteen
+transport objectives. The original relative/absolute FD increments remain
+`3e-7` and `1e-10`. Different interpolation modes have separate baselines and
+schedules; AD and FD are compared only within each mode.
+
+Each FD worker uses the established `--ad-baseline-reference` contract. It
+independently builds its runtime and coefficient tables and must match the AD
+geometry/database and density/pressure exactly before taking the saved
+unperturbed AD Er. The original fresh root is retained in the audit and its
+difference is printed. A different initial state, terminal state or final time
+stops the worker before perturbed endpoints. Saved AD coefficient tables are
+never substituted into FD. The selected-root branch is still differentiated
+through the existing frozen-linearized root lane.
+
+The two geometry columns additionally use the saved AD equilibrium and raw
+parameter tangent through `--ad-geometry-reference`, with the previously
+validated extended-precision native geometry increments and `--device auto`.
+This retains the original perturbation size and native geometry formulas.
+The accepted-step replay still freezes the recorded Newton/Jacobian metadata.
+No transport or derivative implementation changes in this runner update.
+
+The saved-array comparison now checks bytes, shapes and dtypes, including
+identical nonfinite diagnostics and signed zero. A zero finite maximum
+difference alone cannot label differing arrays a match. A baseline mismatch
+retains the CSV and stops subsequent workers. Per-mode outputs contain 104
+gradient pairs, including AD/FD objective values and baseline-match flags,
+with relative differences `abs(AD-FD)/abs(FD)` in scientific notation. The CSV
+now identifies `database_interpolation_mode`. Worker logs retain wall time
+and maximum RSS through `/usr/bin/time -v` when available.
+
+Seven local NumPy/mock tests pass without importing JAX. They check both
+nine-command plans, the sole TOML difference, cache-disabled worker settings,
+saved-reference integrity, matching/nonmatching arrays (including NaNs, signed
+zero and dtype differences), and full mocked execution of both modes with
+104 rows or immediate rejection of a drifted first FD baseline. The fresh
+NEOPAX GPU comparisons remain pending. Use fresh output directories after
+dependency changes; existing comparisons must not be resumed on a new stack.

@@ -9,11 +9,13 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 import numpy as np
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT/"examples/benchmarks/benchmark_transport_ntss1d_ad_fd.py"
+sys.path.insert(0, str(SCRIPT.parent))
 spec = importlib.util.spec_from_file_location("ntss1d_runner", SCRIPT)
 runner = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(runner)
@@ -31,6 +33,7 @@ class NTSS1DComparisonRunnerTests(unittest.TestCase):
             residuals=[2., 3.], jacobian=jacobian)))
         arrays = dict(initial_y=np.array([1., 2., 3.]), final_y=np.array([2., 3., 4.]),
             final_time=np.array(.1), **{"support['geometry'].r_grid": np.array([.1, .5, .9]),
+            "support['geometry'].G_PS": np.array([np.nan, 0.]),
             "support['database'].D11_log": np.array([-2., -1.])})
         np.savez(ad/"snapshots/ad_terminal_saved.npz", **arrays)
         for i, parameter in enumerate(runner.PARAMETERS):
@@ -43,13 +46,53 @@ class NTSS1DComparisonRunnerTests(unittest.TestCase):
 
     def test_plan_prints_nine_commands_without_creating_outputs(self):
         with tempfile.TemporaryDirectory() as temporary:
-            output = Path(temporary)/"unused"
-            result = subprocess.run([sys.executable, str(SCRIPT), "--out-dir", str(output), "--plan-only"],
-                cwd=ROOT, capture_output=True, text=True, check=True)
-            self.assertEqual(len(result.stdout.splitlines()), 9)
-            self.assertIn("--accepted-step-limit 16", result.stdout)
-            self.assertIn("--reverse-database-interpolation-transpose-mode established", result.stdout)
-            self.assertFalse(output.exists())
+            generic = runner.CONFIG.with_name(runner.CONFIG.name.replace("ntss1d.toml", "black_box.toml"))
+            for config in (runner.CONFIG, generic):
+                output = Path(temporary)/config.stem
+                result = subprocess.run([sys.executable, str(SCRIPT), "--config", str(config),
+                    "--out-dir", str(output), "--plan-only"], cwd=ROOT,
+                    capture_output=True, text=True, check=True)
+                self.assertEqual(len(result.stdout.splitlines()), 9)
+                self.assertIn("--accepted-step-limit 16", result.stdout)
+                self.assertIn("--reverse-database-interpolation-transpose-mode established", result.stdout)
+                self.assertEqual(result.stdout.count("--ad-baseline-reference"), 8)
+                self.assertEqual(result.stdout.count("--ad-geometry-reference"), 2)
+                self.assertEqual(result.stdout.count("--geometry-fd-native-precision extended"), 2)
+                self.assertEqual(result.stdout.count("--device auto"), 8)
+                self.assertFalse(output.exists())
+            a, b = (runner.tomllib.loads(config.read_text()) for config in (runner.CONFIG, generic))
+            self.assertEqual(a["neoclassical"].pop("interpolation_mode"), runner.MODE)
+            self.assertEqual(a, b)
+
+    def test_workers_disable_cache_without_changing_parent_environment(self):
+        with patch.dict(runner.os.environ, dict(XLA_FLAGS="old flags", PYTHONPATH="old path",
+            JAX_COMPILATION_CACHE_DIR="old cache", JAX_ENABLE_COMPILATION_CACHE="1"), clear=True):
+            before = dict(runner.os.environ)
+            env = runner.worker_environment()
+            self.assertEqual(dict(runner.os.environ), before)
+            for key in ("XLA_FLAGS", "PYTHONPATH", "JAX_COMPILATION_CACHE_DIR"):
+                self.assertNotIn(key, env)
+            self.assertEqual(env["JAX_ENABLE_COMPILATION_CACHE"], "0")
+            self.assertEqual(env["JAX_ENABLE_X64"], "true")
+        self.assertNotIn("jax", sys.modules)
+
+    def test_saved_reference_is_exact_and_rejects_missing_ambiguous_or_changed_captures(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            with self.assertRaisesRegex(ValueError, "Expected one AD"):
+                runner.prepare_ad_reference(root)
+            self.saved_case(root)
+            runner.prepare_ad_reference(root)
+            capture = root/"ad/snapshots/ad_terminal_saved.npz"
+            reference = root/"ad/baseline_reference.npz"
+            self.assertEqual(reference.read_bytes(), capture.read_bytes())
+            runner.prepare_ad_reference(root)
+            reference.write_bytes(b"changed")
+            with self.assertRaisesRegex(ValueError, "differs from its AD capture"):
+                runner.prepare_ad_reference(root)
+            (capture.parent/"ad_terminal_duplicate.npz").write_bytes(capture.read_bytes())
+            with self.assertRaisesRegex(ValueError, "found 2"):
+                runner.prepare_ad_reference(root)
 
     def test_matching_saved_arrays_produce_scientific_notation_comparisons(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -85,6 +128,91 @@ class NTSS1DComparisonRunnerTests(unittest.TestCase):
                 mismatch = row["parameter"] in ("n0", "T0") or (
                     row["parameter"] == "density_shape_power" and row["objective"] == "softmax_Er")
                 self.assertEqual(row["comparison_baseline_matches"], not mismatch)
+
+    def test_signed_zero_and_dtype_differences_are_not_hidden_by_zero_absolute_difference(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            arrays = self.saved_case(root)
+            for name in ("n0", "T0"):
+                changed = dict(arrays)
+                changed["support['geometry'].G_PS"] = arrays["support['geometry'].G_PS"].copy()
+                if name == "n0":
+                    changed["support['geometry'].G_PS"][1] = -0.
+                else:
+                    changed["support['geometry'].G_PS"] = changed["support['geometry'].G_PS"].astype("float32")
+                np.savez(root/f"fd_{name}/snapshots/fd_baseline_saved.npz", **changed)
+            with redirect_stdout(io.StringIO()):
+                rows = runner.compare(root)
+            for row in rows:
+                self.assertEqual(row["baseline_support_arrays_match"], row["parameter"] not in ("n0", "T0"))
+                if row["parameter"] == "n0":
+                    self.assertEqual(row["baseline_support_max_abs_difference"], 0.)
+
+    def test_both_modes_run_all_columns_and_stop_on_a_mismatched_baseline(self):
+        for mode in ("generic", runner.MODE):
+            for drift in (False, True):
+                with self.subTest(mode=mode, drift=drift), tempfile.TemporaryDirectory() as temporary:
+                    root = Path(temporary)
+                    output = root/"run"
+                    config = root/"case.toml"
+                    config.write_text(f'[geometry]\nvmec_lane="ad"\n[neoclassical]\n'
+                                      f'flux_model="ntx_scan_runtime"\ninterpolation_mode="{mode}"\n')
+                    labels = [f"objective_{i}" for i in range(13)]
+                    columns = ["vmec:"+p if ":" in p else p for p in runner.PARAMETERS]
+                    jacobian = [[float(i+j+1) for j in range(8)] for i in range(13)]
+                    arrays = dict(initial_y=np.ones(3), final_y=np.ones(3), final_time=np.array(.1),
+                                  **{"support['database'].D11_log": np.array([-1.])})
+                    jobs = []
+
+                    def worker(command, directory, env):
+                        jobs.append(directory.name)
+                        self.assertEqual(env["JAX_ENABLE_COMPILATION_CACHE"], "0")
+                        if directory.name == "kernel_check":
+                            return
+                        (directory/"snapshots").mkdir(parents=True)
+                        common = dict(database_interpolation_mode=mode,
+                                      accepted_step_limit=16, vmec_response_mode="raw_block")
+                        if directory.name == "ad":
+                            common.update(all_finite=True, parameter_order=columns,
+                                residual_labels=["transport:"+label for label in labels],
+                                residuals=list(range(13)), jacobian=jacobian)
+                            target = root/"ad_report.json"
+                            np.savez(directory/"snapshots/ad_terminal_saved.npz", **arrays)
+                        else:
+                            parameter = command[command.index("--parameter")+1]
+                            reference = Path(command[command.index("--ad-baseline-reference")+1])
+                            self.assertTrue(reference.exists())
+                            self.assertEqual("--ad-geometry-reference" in command, ":" in parameter)
+                            common.update(parameter_name=parameter, objective_labels=labels,
+                                objective_values=list(range(13)),
+                                gradient_fd=[r[runner.PARAMETERS.index(parameter)] for r in jacobian])
+                            target = root/"fd_reports"/f"{parameter.replace(':','_')}_forward_fd_frozen_linearized_summary.json"
+                            target.parent.mkdir(exist_ok=True)
+                            current = dict(arrays)
+                            if drift:
+                                current["final_time"] = np.array(.2)
+                            np.savez(directory/"snapshots/fd_baseline_saved.npz", **current)
+                        target.write_text(json.dumps(common))
+
+                    argv = [str(SCRIPT), "--config", str(config), "--out-dir", str(output)]
+                    with patch.object(runner, "worker", worker), patch.object(sys, "argv", argv), \
+                         patch.object(runner, "AD_REPORT", root/"ad_report.json"), \
+                         patch.object(runner, "FD_REPORTS", root/"fd_reports"), redirect_stdout(io.StringIO()):
+                        if drift:
+                            with self.assertRaisesRegex(RuntimeError, "FD baseline differs from AD"):
+                                runner.main()
+                        else:
+                            runner.main()
+                    workers = [name for name in jobs if name != "kernel_check"]
+                    self.assertEqual(workers, ["ad", "fd_n0"] if drift else
+                                     ["ad", *[f"fd_{p.replace(':','_')}" for p in runner.PARAMETERS]])
+                    self.assertEqual("kernel_check" in jobs, mode == runner.MODE)
+                    with (output/"ad_vs_fd.csv").open() as stream:
+                        rows = list(csv.DictReader(stream))
+                    self.assertEqual(len(rows), 13 if drift else 104)
+                    self.assertTrue(all(row["database_interpolation_mode"] == mode for row in rows))
+                    self.assertTrue(all(row["comparison_baseline_matches"] == str(not drift) for row in rows))
+        self.assertNotIn("jax", sys.modules)
 
 
 if __name__ == "__main__":

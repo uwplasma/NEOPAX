@@ -1,4 +1,4 @@
-"""Run the existing AD/FD benchmarks with radial NTSS1D interpolation only.
+"""Run the existing AD/FD benchmarks with generic or radial NTSS1D interpolation.
 
 The parent process imports no JAX. Workers run sequentially on the GPU.
 --plan-only prints the commands without importing JAX or starting workers.
@@ -47,6 +47,7 @@ AD_OPTIONS = (
     "--reverse-schedule-artifact-mode", "reuse_static_probe",
 )
 FD_OPTIONS = (
+    "--device", "auto",
     "--vmec-response-mode", "raw_block", "--radau-jacobian-reuse-mode", "legacy",
     "--geometry-fd-lane", "frozen_linearized", "--replay-mode", "accepted",
     "--fd-accepted-replay-contract", "reverse_frozen_metadata",
@@ -62,9 +63,36 @@ def commands(args):
     yield "ad", [sys.executable, AD_SCRIPT, *common, *AD_OPTIONS], AD_REPORT
     for parameter in PARAMETERS:
         safe = parameter.replace(":", "_")
+        reference = ["--ad-baseline-reference", str(args.out_dir/"ad/baseline_reference.npz")]
+        if ":" in parameter:
+            reference += ["--ad-geometry-reference", str(args.out_dir/"ad/snapshots"),
+                          "--geometry-fd-native-precision", "extended"]
         yield f"fd_{safe}", [sys.executable, FD_SCRIPT, *common, *FD_OPTIONS,
+            *reference,
             "--parameter", parameter, "--fd-rel-step", str(args.fd_rel_step),
             "--fd-abs-step", str(args.fd_abs_step)], FD_REPORTS/f"{safe}_forward_fd_frozen_linearized_summary.json"
+
+
+def prepare_ad_reference(out_dir):
+    captures = list((out_dir/"ad/snapshots").glob("ad_terminal_*.npz"))
+    if len(captures) != 1:
+        raise ValueError(f"Expected one AD terminal capture; found {len(captures)}")
+    reference = out_dir/"ad/baseline_reference.npz"
+    if reference.exists() and reference.read_bytes() != captures[0].read_bytes():
+        raise ValueError("Saved baseline reference differs from its AD capture")
+    if not reference.exists():
+        shutil.copy2(captures[0], reference)
+
+
+def worker_environment():
+    env = {k: v for k, v in os.environ.items() if k not in {
+        "PYTHONPATH", "LD_LIBRARY_PATH", "JAX_PLATFORM_NAME", "JAX_COMPILATION_CACHE_DIR",
+        "XLA_FLAGS", "XLA_PYTHON_CLIENT_ALLOCATOR", "NEOPAX_GRADIENT_AUDIT_DIR"}}
+    env.update(JAX_PLATFORMS="cuda,cpu", JAX_ENABLE_X64="true", JAX_ENABLE_COMPILATION_CACHE="0",
+        XLA_PYTHON_CLIENT_PREALLOCATE="false", NTX_DISABLE_COMPILATION_CACHE="1",
+        VMEX_COMPILATION_CACHE="disabled", NEOPAX_REVERSE_STEP_DIAGNOSTICS="1",
+        NEOPAX_TEST_RUNTIME_NTSS1D="1")
+    return env
 
 
 def worker(command, directory, env):
@@ -72,7 +100,7 @@ def worker(command, directory, env):
     local_env = dict(env, NEOPAX_GRADIENT_AUDIT_DIR=str(directory/"snapshots"))
     if Path("/usr/bin/time").exists():
         command = ["/usr/bin/time", "-v", *command]
-    print("[ntss1d-comparison] " + shlex.join(command), flush=True)
+    print("[ad-fd-comparison] " + shlex.join(command), flush=True)
     with (directory/"run.log").open("w") as stream:
         with subprocess.Popen(command, cwd=ROOT, env=local_env, stdout=subprocess.PIPE,
                               stderr=subprocess.STDOUT, text=True, bufsize=1) as process:
@@ -85,26 +113,28 @@ def worker(command, directory, env):
 
 
 def compare(out_dir):
-    import numpy as np
+    from check_saved_transport_baseline_repeatability import differences, read_one
     ad = json.loads((out_dir/"ad/summary.json").read_text())
     columns = {label: i for i, label in enumerate(ad["parameter_order"])}
     rows_by_label = {label: i for i, label in enumerate(ad["residual_labels"])}
-    with np.load(next((out_dir/"ad/snapshots").glob("ad_terminal_*.npz")), allow_pickle=False) as data:
-        reference = {k: data[k].copy() for k in ("initial_y", "final_y", "final_time")}
-        support = {k: data[k].copy() for k in data.files
-                   if k.startswith(("support['geometry'].", "support['database']."))}
+    data = read_one(out_dir/"ad/snapshots", "ad_terminal_*.npz")
+    reference = {k: data[k] for k in ("initial_y", "final_y", "final_time")}
+    prefixes = ("support['geometry'].", "support['database'].")
+    support = {k: v for k, v in data.items() if k.startswith(prefixes)}
     rows = []
     for parameter in PARAMETERS:
         folder = out_dir/f"fd_{parameter.replace(':', '_')}"
         if not (folder/"summary.json").exists():
             continue
         fd = json.loads((folder/"summary.json").read_text())
-        with np.load(next((folder/"snapshots").glob("fd_baseline_*.npz")), allow_pickle=False) as data:
-            differences = {k: float(np.max(np.abs(reference[k]-data[k]))) for k in reference}
-            support_available = bool(support) and all(k in data for k in support)
-            support_difference = max(float(np.max(np.abs(value-data[k])))
-                for k, value in support.items()) if support_available else float("inf")
-        matched = all(value == 0. for value in differences.values())
+        data = read_one(folder/"snapshots", "fd_baseline_*.npz")
+        state_rows = differences(reference, {k: data[k] for k in reference if k in data})
+        support_rows = differences(support, {k: v for k, v in data.items() if k.startswith(prefixes)})
+        deltas = {k: 0. for k in reference}
+        deltas.update({row["field"]: row.get("max_abs", float("inf")) for row in state_rows})
+        support_difference = max((row.get("max_abs", float("inf")) for row in support_rows), default=0.)
+        support_matched = bool(support) and not support_rows
+        matched = not state_rows
         column = columns["vmec:"+parameter if ":" in parameter else parameter]
         for objective, value, gradient_fd in zip(fd["objective_labels"], fd["objective_values"], fd["gradient_fd"], strict=True):
             row = rows_by_label["transport:"+objective]
@@ -113,18 +143,19 @@ def compare(out_dir):
             objective_matches = objective_difference <= 1e-12*(1+abs(ad["residuals"][row]))
             difference = abs(gradient_ad-gradient_fd)
             relative = difference/abs(gradient_fd) if gradient_fd else (0. if not difference else float("inf"))
-            rows.append(dict(parameter=parameter, objective=objective, gradient_ad=gradient_ad,
+            rows.append(dict(database_interpolation_mode=ad.get("database_interpolation_mode", MODE),
+                parameter=parameter, objective=objective, gradient_ad=gradient_ad,
                 gradient_fd=gradient_fd, absolute_difference=difference, relative_difference_to_fd=relative,
-                baseline_arrays_match=matched, initial_y_max_abs_difference=differences["initial_y"],
-                baseline_support_arrays_match=support_difference == 0.,
+                baseline_arrays_match=matched, initial_y_max_abs_difference=deltas["initial_y"],
+                baseline_support_arrays_match=support_matched,
                 baseline_support_max_abs_difference=support_difference,
                 baseline_objective_matches=objective_matches,
-                comparison_baseline_matches=matched and support_difference == 0. and objective_matches,
-                final_y_max_abs_difference=differences["final_y"],
-                final_time_abs_difference=differences["final_time"],
+                comparison_baseline_matches=matched and support_matched and objective_matches,
+                final_y_max_abs_difference=deltas["final_y"],
+                final_time_abs_difference=deltas["final_time"],
                 baseline_objective_abs_difference=objective_difference))
-        print(f"[ntss1d-comparison] {parameter}: baseline_arrays_match={matched} "
-              f"support_max_abs_difference={support_difference:.9e} {differences}", flush=True)
+        print(f"[ad-fd-comparison] {parameter}: baseline_arrays_match={matched} "
+              f"support_arrays_match={support_matched} support_max_abs_difference={support_difference:.9e} {deltas}", flush=True)
     if rows:
         with (out_dir/"ad_vs_fd.csv").open("w", newline="") as stream:
             writer = csv.DictWriter(stream, fieldnames=list(rows[0]), lineterminator="\n")
@@ -146,8 +177,9 @@ def main():
     args.config = args.config.resolve()
     args.out_dir = args.out_dir.resolve()
     config = tomllib.loads(args.config.read_text())
-    if config.get("neoclassical", {}).get("interpolation_mode") != MODE:
-        parser.error("This comparison requires preprocessed_3d_radial_ntss1d interpolation.")
+    mode = config.get("neoclassical", {}).get("interpolation_mode", "generic")
+    if mode not in ("generic", MODE):
+        parser.error("This comparison requires generic or preprocessed_3d_radial_ntss1d interpolation.")
     if config["neoclassical"].get("flux_model") != "ntx_scan_runtime" or config.get("geometry", {}).get("vmec_lane") != "ad":
         parser.error("This comparison requires the live NTX scan and the common VMEC ad-lane equilibrium.")
     if args.accepted_step_limit <= 0 or args.fd_rel_step <= 0 or args.fd_abs_step <= 0:
@@ -161,22 +193,19 @@ def main():
     # A resumed comparison must retain the same input, increments and source.
     digest = hashlib.sha256()
     sources = [path for path in (ROOT/"NEOPAX").glob("*.py") if path.name != "version.py"]
-    for path in sorted([*sources, ROOT/AD_SCRIPT, ROOT/FD_SCRIPT, Path(__file__)]):
+    helpers = [ROOT/"examples/benchmarks"/name for name in
+               ("_fd_native_precision.py", "check_saved_transport_baseline_repeatability.py")]
+    for path in sorted([*sources, *helpers, ROOT/AD_SCRIPT, ROOT/FD_SCRIPT, Path(__file__)]):
         digest.update(path.read_bytes())
     settings = args.config.read_text() + f"\n# comparison: steps={args.accepted_step_limit} rel={args.fd_rel_step} abs={args.fd_abs_step} source={digest.hexdigest()}\n"
     saved = args.out_dir/"config.toml"
     if saved.exists() and saved.read_text() != settings:
         parser.error("Saved run settings/source differ; choose a new output directory.")
     saved.write_text(settings)
-    env = {k: v for k, v in os.environ.items() if k not in {
-        "PYTHONPATH", "LD_LIBRARY_PATH", "JAX_PLATFORM_NAME", "JAX_COMPILATION_CACHE_DIR",
-        "XLA_FLAGS", "XLA_PYTHON_CLIENT_ALLOCATOR", "NEOPAX_GRADIENT_AUDIT_DIR"}}
-    env.update(JAX_PLATFORMS="cuda,cpu", JAX_ENABLE_X64="true", JAX_ENABLE_COMPILATION_CACHE="0",
-        XLA_PYTHON_CLIENT_PREALLOCATE="false", NTX_DISABLE_COMPILATION_CACHE="1",
-        VMEX_COMPILATION_CACHE="disabled", NEOPAX_REVERSE_STEP_DIAGNOSTICS="1",
-        NEOPAX_TEST_RUNTIME_NTSS1D="1")
-    worker([sys.executable, "-m", "unittest", "discover", "-s", "tests",
-            "-p", "test_runtime_ntss1d_interpolation.py", "-v"], args.out_dir/"kernel_check", env)
+    env = worker_environment()
+    if mode == MODE:
+        worker([sys.executable, "-m", "unittest", "discover", "-s", "tests",
+                "-p", "test_runtime_ntss1d_interpolation.py", "-v"], args.out_dir/"kernel_check", env)
     for name, command, report_path in tasks:
         folder = args.out_dir/name
         result = folder/"summary.json"
@@ -184,21 +213,31 @@ def main():
             worker(command, folder, env)
             shutil.copy2(report_path, result)
         report = json.loads(result.read_text())
-        if report.get("database_interpolation_mode") != MODE:
-            raise RuntimeError(f"Worker did not report NTSS1D interpolation: {result}")
+        if report.get("database_interpolation_mode") != mode:
+            raise RuntimeError(f"Worker did not report {mode} interpolation: {result}")
         if report.get("accepted_step_limit") != args.accepted_step_limit or report.get("vmec_response_mode") != "raw_block":
             raise RuntimeError(f"Worker settings differ from the requested comparison: {result}")
         if name == "ad":
             expected = {"vmec:"+p if ":" in p else p for p in PARAMETERS}
-            if not report["all_finite"] or set(report["parameter_order"]) != expected:
+            if (not report["all_finite"] or len(report["parameter_order"]) != len(PARAMETERS)
+                    or set(report["parameter_order"]) != expected):
                 raise RuntimeError("AD must provide finite gradients for all eight requested DOFs.")
+            objectives = {label.removeprefix("transport:") for label in report["residual_labels"]
+                          if label.startswith("transport:")}
+            if len(objectives) != 13:
+                raise RuntimeError("AD must provide all thirteen transport objectives.")
+            prepare_ad_reference(args.out_dir)
         if name != "ad":
             if report["parameter_name"].replace(":", "_") != name[3:]:
                 raise RuntimeError(f"FD report belongs to a different parameter: {result}")
             if not all(math.isfinite(value) for value in (*report["objective_values"], *report["gradient_fd"])):
                 raise RuntimeError(f"FD values or gradients are nonfinite: {result}")
-            compare(args.out_dir)
-    print(f"[ntss1d-comparison] saved all eight columns: {args.out_dir/'ad_vs_fd.csv'}", flush=True)
+            if len(report["objective_labels"]) != 13 or set(report["objective_labels"]) != objectives:
+                raise RuntimeError(f"FD objectives differ from the AD transport objectives: {result}")
+            rows = compare(args.out_dir)
+            if not all(row["comparison_baseline_matches"] for row in rows):
+                raise RuntimeError("FD baseline differs from AD; comparison CSV retained, next worker not started.")
+    print(f"[ad-fd-comparison] {mode}: saved all 104 pairs: {args.out_dir/'ad_vs_fd.csv'}", flush=True)
 
 
 if __name__ == "__main__":
