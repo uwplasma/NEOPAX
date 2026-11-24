@@ -24,6 +24,116 @@ _jax_after = "jax" in sys.modules
 
 
 class SavedBaselineTests(unittest.TestCase):
+    def test_original_capture_runs_same_adaptive_call_once_then_stops_and_restores(self):
+        import os
+        @dataclasses.dataclass
+        class Carry:
+            y: object
+            t: object
+        execution = SimpleNamespace(dtype=np.float64)
+        carry = Carry(np.asarray([1., 2.]), np.asarray(0.))
+        trace = SimpleNamespace(**{name: np.ones(4) for name in check.SCHEDULE_FIELDS})
+        rollout = SimpleNamespace(trace=trace, final_carry=Carry(np.asarray([3., 4.]), np.asarray(.1)),
+            attempt_count=3, accepted_count=2, completed=True, failed=False)
+        original = Mock(return_value=rollout)
+        reverse = SimpleNamespace(_radau_adaptive_schedule_rollout=original)
+        namespace = {'_radau_adaptive_schedule_rollout':original, 'execution':execution, 'carry':carry}
+        exec("def main():\n    try:\n        _radau_adaptive_schedule_rollout(execution, carry, "
+             "max_total_steps=32, stop_after_accepted_steps=2, capture_newton_setup=True)\n"
+             "    except Exception:\n        return 'failed trial handler swallowed the stop'\n"
+             "    raise AssertionError('backward or perturbation reached')", namespace)
+        with tempfile.TemporaryDirectory() as directory, patch.dict(sys.modules,
+                {'NEOPAX':SimpleNamespace(_reverse_ad_transport=reverse)}), \
+             patch.object(check, 'capture_forward_compiler_ir', lambda _: contextlib.nullcontext()), \
+             patch.object(check, 'version', return_value='test'), contextlib.redirect_stdout(io.StringIO()):
+            out = Path(directory)/'forward'
+            with patch.dict(os.environ, {'NEOPAX_ORIGINAL_FORWARD_DIR':str(out)}, clear=True):
+                self.assertIsNone(check.run_benchmark(namespace['main']))
+            original.assert_called_once_with(execution, carry, max_total_steps=32,
+                stop_after_accepted_steps=2, capture_newton_setup=True)
+            self.assertIs(reverse._radau_adaptive_schedule_rollout, original)
+            self.assertIs(namespace['_radau_adaptive_schedule_rollout'], original)
+            saved = check.read_one(out, 'native.npz')
+            np.testing.assert_array_equal(saved['final_y'], rollout.final_carry.y)
+            self.assertEqual(saved['err_norms'].size, 3)
+            setup = check.read_one(out, 'setup.npz')
+            np.testing.assert_array_equal(setup['initial_carry.y'], carry.y)
+            record = json.loads((out/'metadata.json').read_text())
+            self.assertEqual(record['accepted_count'], 2)
+            self.assertTrue(record['options']['capture_newton_setup'])
+            # A real solver error must propagate, with the hook restored.
+            # Use an entry point without a failed-trial handler for this check.
+            exec("def failing():\n    _radau_adaptive_schedule_rollout(execution, carry, "
+                 "max_total_steps=32, stop_after_accepted_steps=2)", namespace)
+            original.side_effect = RuntimeError('original solver failed')
+            with patch.dict(os.environ, {'NEOPAX_ORIGINAL_FORWARD_DIR':str(Path(directory)/'failed')}, clear=True), \
+                 self.assertRaisesRegex(RuntimeError, 'original solver failed'):
+                check.run_benchmark(namespace['failing'])
+            self.assertIs(reverse._radau_adaptive_schedule_rollout, original)
+            self.assertIs(namespace['_radau_adaptive_schedule_rollout'], original)
+            original.side_effect = None
+            rollout.failed = True
+            with patch.dict(os.environ, {'NEOPAX_ORIGINAL_FORWARD_DIR':str(Path(directory)/'incomplete')}, clear=True), \
+                 self.assertRaisesRegex(RuntimeError, 'baseline failed'):
+                check.run_benchmark(namespace['failing'])
+            self.assertTrue((Path(directory)/'incomplete/native.npz').is_file())
+            # The AD wrapper resolves the same helper in the reverse module.
+            namespace.pop('_radau_adaptive_schedule_rollout')
+            namespace['reverse'] = reverse
+            exec("def main():\n    reverse._radau_adaptive_schedule_rollout(execution, carry, "
+                 "max_total_steps=32, stop_after_accepted_steps=2, capture_segment_length=4)", namespace)
+            rollout.failed = False
+            with patch.dict(os.environ, {'NEOPAX_ORIGINAL_FORWARD_DIR':str(Path(directory)/'ad')}, clear=True):
+                check.run_benchmark(namespace['main'])
+            self.assertEqual(original.call_args.kwargs['capture_segment_length'], 4)
+            self.assertIs(reverse._radau_adaptive_schedule_rollout, original)
+
+    def test_original_entry_pair_uses_live_scripts_and_preserves_archived_endpoint_differences(self):
+        calls = []
+        args_seen = []
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            run, out = root/'run', root/'out'
+            for label, value in (('ad', .1), ('fd_n0', .2)):
+                folder = run/label/'snapshots'
+                folder.mkdir(parents=True)
+                np.savez(folder/('ad_terminal_a.npz' if label=='ad' else 'fd_reference_baseline_a.npz'),
+                         final_y=np.asarray([value]), final_time=np.asarray(value))
+            def commands(args):
+                args_seen.append(args)
+                return [('ad', ['python', 'real_ad.py'], None),
+                        ('fd_n0', ['python', 'real_fd.py'], None),
+                        ('fd_T0', ['python', 'must_not_run.py'], None)]
+            def launch(command, folder, env):
+                calls.append((command, env))
+                f = Path(env['NEOPAX_ORIGINAL_FORWARD_DIR'])
+                f.mkdir(parents=True)
+                value = .1 if folder.name == 'ad' else .2
+                np.savez(f/'setup.npz', **{'initial_carry.y':np.ones(2)})
+                trajectory = {k: np.ones(3) for k in check.SCHEDULE_FIELDS}
+                trajectory['next_dts'][1] = value
+                np.savez(f/'native.npz', **trajectory, final_y=np.asarray([value]), final_time=np.asarray(value))
+                check.write_json(f/'metadata.json', {'accepted_count':16})
+            module = SimpleNamespace(commands=commands, worker=launch, worker_environment=lambda:{'gpu':'1'})
+            with patch.dict(sys.modules, {'benchmark_transport_ntss1d_ad_fd':module}), \
+                 contextlib.redirect_stdout(io.StringIO()):
+                out.mkdir()
+                check.trace_original_forwards(run, out, 16, 'fixed')
+            self.assertEqual([c[0][1] for c in calls], ['real_ad.py', 'real_fd.py'])
+            self.assertEqual(args_seen[0].out_dir, run) # FD reads the original AD root reference.
+            self.assertEqual(args_seen[0].config, run/'config.toml')
+            self.assertTrue(all(c[1]['NEOPAX_SOLVER_MEAN_REDUCTION']=='fixed' for c in calls))
+            rows = json.loads((out/'comparison.json').read_text())
+            self.assertEqual(rows[0]['initial'], [])
+            self.assertEqual(rows[0]['first_time_map'][0]['attempt'], 2)
+            self.assertTrue(rows[0]['trajectory'])
+            self.assertEqual(rows[1]['differences'], [])
+            self.assertEqual(rows[2]['differences'], [])
+            with patch.dict(sys.modules, {'benchmark_transport_ntss1d_ad_fd':module}), \
+                 self.assertRaisesRegex(ValueError, 'fresh directory'):
+                check.trace_original_forwards(run, out, 16, 'fixed')
+        self.assertEqual(_jax_before, 'jax' in sys.modules)
+
     def test_benchmark_entry_keeps_main_and_scopes_fixed_mode_with_audit(self):
         import os
         active=[]

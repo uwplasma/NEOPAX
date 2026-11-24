@@ -410,3 +410,51 @@ locally without importing JAX. They cover both mean modes and interpolators,
 strict failure on baseline drift, fixed-scope execution evidence and resume
 rejection when changing the mean mode. This integration is an opt-in
 benchmark verification step, not promotion of a production solver policy.
+
+### Full fixed-mean benchmark still fails before FD perturbations
+
+Run `fixed_means_ad_fd16_iHwp8o` used commit `c34eda9`. Generic AD16
+completed with finite gradients and zero replayed state-endpoint differences.
+Wall time was `51:28.00` and maximum host RSS was `9,603,072` KiB.
+The first FD worker (`n0`) used the fixed scope too, but its independently
+computed baseline differed by `1.7493235972190074e-11` in final time and
+`8.994706846010558e-8` in packed state. The exact baseline guard stopped
+before either perturbed endpoint; the remaining DOFs and NTSS1D did not run.
+There are no valid AD/FD gradient comparisons from this run. This is not OOM.
+
+The earlier four-worker success was conditional on restoring saved runtime
+arrays and compiling in that diagnostic's context. It did not capture the
+original full script calls. Fixed one-dimensional means therefore remain an
+incomplete control; no additional numerical policy or baseline tolerance is
+changed on the strength of that result. The current evidence does not locate
+the first remaining differing arithmetic operation in the full benchmark.
+
+`--trace-original-ad-fd` now launches just the ordinary AD entry point and
+the first FD entry point with the failed run's configuration, original AD
+root reference, original flags and chosen mean mode. Each script performs
+its live preparation and its own adaptive forward solve. A pass-through
+observer calls the original adaptive helper once with identical input
+objects/options and captures its original compiler output. Afterward it
+saves the initial carry/numeric execution context and active trajectory,
+then exits before the transport backward sweep or FD perturbations.
+No restored runtime or shared adaptive schedule is used. Fresh equilibrium,
+NTX database and root preparation still occur, so this is not a NumPy-only
+check. Workers run sequentially. Both fresh endpoints are compared against
+their respective failed-run archives; failed reproduction remains visible.
+
+```bash
+python examples/benchmarks/check_saved_transport_baseline_repeatability.py \
+  --trace-original-ad-fd --solver-mean-reduction fixed \
+  --run-dir outputs/fixed_means_ad_fd16_iHwp8o/generic \
+  --out-dir outputs/original_fixed_mean_forwards \
+  --accepted-step-limit 16
+```
+
+Captures are under `ad/forward` and `fd/forward`: `setup.npz`, `native.npz`,
+compiler IR and metadata, with `comparison.json` at the output root.
+`NEOPAX_ORIGINAL_FORWARD_DIR` is reserved for this explicit diagnostic;
+normal paired workers clear any inherited value. No benchmark summary is
+created for a forward-only capture. The observer neither adds a JIT nor
+changes compiler flags. NumPy/mock tests check original-call identity,
+unchanged options, early exit/restoration, live-script dispatch and visible
+archive differences. Full GPU capture remains pending.

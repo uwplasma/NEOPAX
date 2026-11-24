@@ -312,17 +312,70 @@ def capture_forward_compiler_ir(directory):
         write_json(directory / "compiler_programs.json", programs)
 
 
+class ForwardBaselineCaptured(BaseException):
+    """Stop a requested capture even across ordinary failed-trial handlers."""
+
+
+@contextlib.contextmanager
+def capture_original_forward(main, directory):
+    """Observe the actual entry point's first adaptive call without rebuilding it."""
+    from NEOPAX import _reverse_ad_transport as reverse
+    from unittest.mock import patch
+    directory.mkdir(parents=True, exist_ok=False)
+    original = reverse._radau_adaptive_schedule_rollout
+
+    def observe(execution, carry, **options):
+        # Compile/run the original call first, with the same objects and options.
+        with capture_forward_compiler_ir(directory):
+            rollout = original(execution, carry, **options)
+        arrays = rollout_arrays(rollout)
+        np.savez_compressed(directory / "native.npz", **arrays)
+        np.savez_compressed(directory / "setup.npz",
+            **numeric_leaves(carry, "initial_carry"),
+            **numeric_leaves(execution, "execution"))
+        write_json(directory / "metadata.json", dict(options=options,
+            accepted_count=int(rollout.accepted_count), attempt_count=int(rollout.attempt_count),
+            failed=bool(rollout.failed), completed=bool(rollout.completed),
+            entry_point=main.__code__.co_filename,
+            versions={name: version(name) for name in ("jax", "jaxlib", "ntx", "vmex", "solvax")}))
+        if bool(rollout.failed) or not bool(rollout.completed) or not np.isfinite(arrays["final_y"]).all():
+            raise RuntimeError("Original forward baseline failed; capture retained.")
+        print(f"[original-forward] saved {directory}; stopped before backward/FD endpoints", flush=True)
+        raise ForwardBaselineCaptured()
+
+    with contextlib.ExitStack() as stack:
+        stack.enter_context(patch.object(reverse, "_radau_adaptive_schedule_rollout", observe))
+        # FD imported the helper directly; AD's wrapper resolves it in reverse.
+        namespace = main.__globals__
+        if "_radau_adaptive_schedule_rollout" in namespace:
+            if namespace["_radau_adaptive_schedule_rollout"] is not original:
+                raise ValueError("Unexpected FD adaptive helper; refusing to change its call.")
+            stack.enter_context(patch.dict(namespace, {"_radau_adaptive_schedule_rollout": observe}))
+        yield
+        raise RuntimeError("Benchmark returned without an original adaptive baseline capture.")
+
+
 def run_benchmark(main):
-    """Opt-in fixed solver means for an ordinary benchmark entry point."""
+    """Opt-in fixed means and observation of the ordinary benchmark entry point."""
     import os
     mode = os.environ.get("NEOPAX_SOLVER_MEAN_REDUCTION", "native")
-    if mode == "native":
+    directory = os.environ.get("NEOPAX_ORIGINAL_FORWARD_DIR")
+    if mode == "native" and not directory:
         return main()
-    if mode != "fixed":
+    if mode not in {"native", "fixed"}:
         raise ValueError("NEOPAX_SOLVER_MEAN_REDUCTION must be native or fixed.")
-    print("[solver-means] fixed FP64 solver reductions enabled", flush=True)
-    with fixed_solver_means() as control:
-        result = main()
+    if mode == "fixed":
+        print("[solver-means] fixed FP64 solver reductions enabled", flush=True)
+    try:
+        with contextlib.ExitStack() as stack:
+            control = stack.enter_context(fixed_solver_means()) if mode == "fixed" else None
+            if directory:
+                stack.enter_context(capture_original_forward(main, Path(directory)))
+            result = main()
+    except ForwardBaselineCaptured:
+        result = None
+    if control is None:
+        return result
     if not control.sizes:
         raise RuntimeError("Fixed solver means were not traced in the benchmark.")
     record = dict(solver_mean_reduction=mode, fixed_mean_sizes=sorted(control.sizes))
@@ -330,6 +383,44 @@ def run_benchmark(main):
         write_json(Path(directory).parent / "solver_mean_reduction.json", record)
     print("[solver-means]", record, flush=True)
     return result
+
+
+def trace_original_forwards(run, out, limit, mean_reduction):
+    """Run only the two real entry points' forward calls, with their live setup."""
+    from benchmark_transport_ntss1d_ad_fd import commands, worker, worker_environment
+    args = argparse.Namespace(config=run / "config.toml", out_dir=run,
+        accepted_step_limit=limit, fd_rel_step=3e-7, fd_abs_step=1e-10)
+    tasks = list(commands(args))[:2]
+    for label, command, _ in tasks:
+        name = "ad" if label == "ad" else "fd"
+        folder = out / name
+        if folder.exists():
+            raise ValueError(f"{folder} already exists; choose a fresh directory.")
+        env = worker_environment()
+        env.update(NEOPAX_SOLVER_MEAN_REDUCTION=mean_reduction,
+                   NEOPAX_ORIGINAL_FORWARD_DIR=str(folder / "forward"))
+        worker(command, folder, env)
+        metadata = json.loads((folder / "forward/metadata.json").read_text())
+        if metadata["accepted_count"] != limit:
+            raise ValueError(f"{name} did not complete exactly {limit} accepted steps.")
+    a, b = (read_one(out / name / "forward", "native.npz") for name in ("ad", "fd"))
+    setup_a, setup_b = (read_one(out / name / "forward", "setup.npz") for name in ("ad", "fd"))
+    carry = lambda data: {k: v for k, v in data.items() if k.startswith("initial_carry.")}
+    row = dict(comparison="original AD vs original FD", solver_mean_reduction=mean_reduction,
+        initial=differences(carry(setup_a), carry(setup_b)), trajectory=differences(a, b),
+        first_attempt=first_attempt_difference(a, b),
+        first_time_map=first_attempt_difference(a, b, ("next_dts", "attempted_dts", "step_ts")))
+    rows = [row]
+    print("[original-forward]", row, flush=True)
+    for name, folder, pattern in (("ad", "ad/snapshots", "ad_terminal_*.npz"),
+                                  ("fd", "fd_n0/snapshots", "fd_reference_baseline_*.npz")):
+        saved = read_one(run / folder, pattern)
+        current = a if name == "ad" else b
+        change = differences({k: saved[k] for k in ("final_y", "final_time")},
+                             {k: current[k] for k in ("final_y", "final_time")})
+        rows.append(dict(comparison=f"{name} vs archived {name}", differences=change))
+        print(f"[original-forward] {name} vs archived {name}: {change}", flush=True)
+    write_json(out / "comparison.json", rows)
 
 
 def trace_forward_worker(run, out, variant, limit, *, capture_ir=False, mean_reduction="native"):
@@ -576,6 +667,8 @@ def main():
     parser.add_argument("--out-dir", type=Path, required=True)
     parser.add_argument("--trace-ad-fd", action="store_true",
         help="Compare independent AD/FD forward setup paths from a failed paired run, without new physics preparation.")
+    parser.add_argument("--trace-original-ad-fd", action="store_true",
+        help="Capture the real AD and FD entry points through their forward baselines only, including live preparation.")
     parser.add_argument("--accepted-step-limit", type=int, default=16)
     parser.add_argument("--capture-compiler-ir", action="store_true",
         help="Save original scan compiler IR without changing its inputs, compilation options or JIT nesting.")
@@ -586,6 +679,11 @@ def main():
     args = parser.parse_args()
     run, out = args.run_dir.resolve(), args.out_dir.resolve()
     out.mkdir(parents=True, exist_ok=True)
+    if args.trace_original_ad_fd:
+        if args.trace_ad_fd or args.accepted_step_limit <= 0:
+            parser.error("Choose one trace mode and a positive step limit.")
+        trace_original_forwards(run, out, args.accepted_step_limit, args.solver_mean_reduction)
+        return
     if args.trace_ad_fd:
         from benchmark_transport_ntss1d_ad_fd import worker_environment
         if args.accepted_step_limit <= 0:

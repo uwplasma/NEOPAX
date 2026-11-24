@@ -73,11 +73,12 @@ class NTSS1DComparisonRunnerTests(unittest.TestCase):
     def test_workers_disable_cache_without_changing_parent_environment(self):
         with patch.dict(runner.os.environ, dict(XLA_FLAGS="old flags", PYTHONPATH="old path",
             JAX_COMPILATION_CACHE_DIR="old cache", JAX_ENABLE_COMPILATION_CACHE="1",
-            NEOPAX_SOLVER_MEAN_REDUCTION="fixed"), clear=True):
+            NEOPAX_SOLVER_MEAN_REDUCTION="fixed", NEOPAX_ORIGINAL_FORWARD_DIR="old capture"), clear=True):
             before = dict(runner.os.environ)
             env = runner.worker_environment()
             self.assertEqual(dict(runner.os.environ), before)
-            for key in ("XLA_FLAGS", "PYTHONPATH", "JAX_COMPILATION_CACHE_DIR", "NEOPAX_SOLVER_MEAN_REDUCTION"):
+            for key in ("XLA_FLAGS", "PYTHONPATH", "JAX_COMPILATION_CACHE_DIR", "NEOPAX_SOLVER_MEAN_REDUCTION",
+                        "NEOPAX_ORIGINAL_FORWARD_DIR"):
                 self.assertNotIn(key, env)
             self.assertEqual(env["JAX_ENABLE_COMPILATION_CACHE"], "0")
             self.assertEqual(env["JAX_ENABLE_X64"], "true")
