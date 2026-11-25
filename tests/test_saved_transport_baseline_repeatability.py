@@ -946,6 +946,82 @@ class SavedBaselineTests(unittest.TestCase):
             self.assertEqual(metadata["accepted_count"], 2)
             self.assertEqual(metadata["parameter_name"], "ZBS:1:0")
 
+    def test_original_fd_scan_capture_keeps_profile_runtime_constructor_and_stops_before_transport(self):
+        source = SCRIPT.with_name('benchmark_transport_realtime_geometry_forward_fd.py')
+        main = next(n for n in ast.parse(source.read_text()).body
+                    if isinstance(n,ast.FunctionDef) and n.name == 'main')
+        config = {'geometry':{},'neoclassical':{'flux_model':'ntx_scan_runtime'}}
+        channels = SimpleNamespace(as_mapping=Mock(return_value={'drds':np.ones(1)}))
+        neo = SimpleNamespace(database=object(),scan_surfaces=object(),channels=channels)
+        runtime = SimpleNamespace(geometry=object(),models=SimpleNamespace(flux=neo))
+        state = object()
+        active, capture_calls = [], []
+        @contextlib.contextmanager
+        def capture(directory, **options):
+            capture_calls.append((directory,options))
+            active.append('capture')
+            try:
+                yield
+            finally:
+                active.pop()
+        def build(cfg):
+            self.assertIs(cfg,config)
+            self.assertEqual(active,['capture'])
+            return runtime,state
+        namespace = dict(argparse=argparse,Path=Path,contextlib=contextlib,np=np,json=json,
+            DEFAULT_CONFIG=Path('unused.toml'),PARAMETER_ORDER=('n0','density_shape_alpha'),
+            INITIAL_ER_ROOT_ONLY_EXPLICIT_OBJECTIVES=(),
+            _initial_er_root_ad_mode=lambda x:x,_prepare_benchmark_config=Mock(return_value=config),
+            _execution_device_context=lambda cfg:contextlib.nullcontext(),
+            atexit=SimpleNamespace(register=Mock()),jax=SimpleNamespace(default_backend=lambda:'gpu'),
+            _baseline_profile_cfg=lambda cfg:{},build_runtime_context=Mock(side_effect=build),
+            _frozen_linearized_vmec_geometry_bundle=Mock(side_effect=AssertionError('different geometry path')),
+            _schedule_rollout=Mock(side_effect=AssertionError('transport reached')),save_gradient_audit=Mock())
+        exec(compile(ast.Module(body=[main],type_ignores=[]),str(source),'exec'),namespace)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            cfg_path = root/'input.toml'
+            cfg_path.write_text('[neoclassical]\nflux_model="ntx_scan_runtime"\n')
+            reference = root/'ad.npz'
+            np.savez(reference,**{"support['geometry'].a_b":np.asarray(1.),
+                                  "support['database'].D13":np.ones(1)})
+            for parameter in ('n0','density_shape_alpha'):
+                out = root/parameter
+                out.mkdir()
+                argv = ['fd','--config',str(cfg_path),'--parameter',parameter,
+                        '--ntx-scan-audit-dir',str(out),'--ntx-scan-audit-compiler-ir']
+                if parameter == 'density_shape_alpha':
+                    argv += ['--ad-baseline-reference',str(reference),'--initial-Er-root-ad','jax_selected_root',
+                             '--initial-Er-root-fd-root-lane','frozen_linearized',
+                             '--replay-mode','accepted','--fd-accepted-replay-contract','reverse_frozen_metadata']
+                    snapshot = root/'ntx_live_support_test.npz'
+                    np.savez(snapshot,**{"support['geometry'].a_b":np.asarray(1.),
+                                         "support['database'].D13":np.asarray([2.])})
+                    namespace['save_gradient_audit'].return_value = snapshot
+                with patch.object(sys,'argv',argv), patch.dict(sys.modules,{
+                        'check_saved_ntx_point_repeatability':SimpleNamespace(capture_production_scans=capture),
+                        'check_saved_transport_baseline_repeatability':check}), \
+                     contextlib.redirect_stdout(io.StringIO()):
+                    namespace['main']()
+                self.assertEqual((out/'config.toml').read_bytes(),cfg_path.read_bytes())
+                saved = namespace['save_gradient_audit'].call_args
+                self.assertEqual(saved.args,('ntx_live_support',))
+                self.assertIs(saved.kwargs['support']['geometry'],runtime.geometry)
+                self.assertIs(saved.kwargs['support']['database'],neo.database)
+                self.assertIs(saved.kwargs['scan_inputs']['surfaces'],neo.scan_surfaces)
+                if parameter == 'density_shape_alpha':
+                    rows = json.loads((out/'ad_support_comparison.json').read_text())
+                    self.assertEqual(len(rows),1)
+                    self.assertEqual(rows[0]['field'],"support['database'].D13")
+                    self.assertEqual(rows[0]['max_abs'],1.)
+        self.assertEqual(namespace['build_runtime_context'].call_count,2)
+        namespace['_frozen_linearized_vmec_geometry_bundle'].assert_not_called()
+        namespace['_schedule_rollout'].assert_not_called()
+        self.assertEqual([options for _,options in capture_calls],
+                         [dict(reference=None,compiler_ir=True)]*2)
+        self.assertEqual(active,[])
+        self.assertEqual(_jax_before,'jax' in sys.modules)
+
     def test_original_fd_baseline_only_stops_after_unchanged_schedule_call(self):
         source = SCRIPT.with_name("benchmark_transport_realtime_geometry_forward_fd.py")
         main = next(node for node in ast.parse(source.read_text()).body

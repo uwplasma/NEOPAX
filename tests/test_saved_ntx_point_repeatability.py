@@ -104,6 +104,55 @@ class PointReplayTests(unittest.TestCase):
                 self.assertTrue((out/'preparation_comparison.csv').is_file())
         self.assertNotIn('jax',sys.modules)
 
+    def test_live_ir_capture_observes_actual_prepare_and_scan_calls_and_restores_on_failure(self):
+        active, observed = [], []
+        prepared = SimpleNamespace(matrix=np.ones((2,2)))
+        surface, grid = object(), object()
+        nu, es = np.ones(1), np.zeros(1)
+        coefficients = np.ones((1,5))
+        def prepare(s, g):
+            self.assertIs(s,surface)
+            self.assertIs(g,grid)
+            self.assertTrue(active[-1].startswith('preparation_'))
+            observed.append('prepare')
+            return prepared
+        def scan(p, n, e):
+            self.assertIs(p,prepared)
+            self.assertIs(n,nu)
+            self.assertIs(e,es)
+            self.assertEqual(active[-1],'surface_0000_compiler')
+            observed.append('scan')
+            return coefficients
+        @replay.contextmanager
+        def ir(directory, compiler):
+            active.append(directory.name)
+            try:
+                yield
+            finally:
+                active.pop()
+        modules = {name:SimpleNamespace(prepare_monoenergetic_system=prepare,
+                    _scan_coefficients_serial=scan) for name in ('ntx','ntx._solver_scan','ntx._neopax_ad')}
+        modules.update({'jax':SimpleNamespace(device_get=lambda x:x,tree_util=SimpleNamespace(
+            tree_flatten_with_path=lambda x:([('.matrix',x.matrix)],'matrix') if hasattr(x,'matrix') else ([('',x)],'array'),
+            keystr=lambda p:p)), 'jax._src':SimpleNamespace(compiler=object())})
+        with tempfile.TemporaryDirectory() as directory, patch.dict(sys.modules,modules), \
+             patch.object(replay,'capture_ntx_ir',side_effect=ir), redirect_stdout(io.StringIO()):
+            out = Path(directory)/'capture'
+            with self.assertRaisesRegex(ValueError,'original failure'):
+                with replay.capture_production_scans(out,compiler_ir=True):
+                    for name in ('ntx','ntx._solver_scan','ntx._neopax_ad'):
+                        self.assertIs(modules[name].prepare_monoenergetic_system(surface,grid),prepared)
+                    self.assertIs(modules['ntx._solver_scan']._scan_coefficients_serial(prepared,nu,es),coefficients)
+                    raise ValueError('original failure')
+            for name in ('ntx','ntx._solver_scan','ntx._neopax_ad'):
+                self.assertIs(modules[name].prepare_monoenergetic_system,prepare)
+                self.assertIs(modules[name]._scan_coefficients_serial,scan)
+            self.assertTrue((out/'surface_0000.npz').exists())
+            self.assertIn('prepared.__treedef__',(out/'surface_0000.txt').read_text())
+        self.assertEqual(observed,['prepare','prepare','prepare','scan'])
+        self.assertEqual(active,[])
+        self.assertNotIn('jax',sys.modules)
+
     def test_worker_replays_saved_preparation_through_flat_arguments_without_global_options(self):
         class Ready(np.ndarray):
             def block_until_ready(self):

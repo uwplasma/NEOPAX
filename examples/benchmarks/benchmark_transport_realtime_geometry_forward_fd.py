@@ -1476,6 +1476,8 @@ def main() -> None:
         help="Capture actual baseline NTX scan inputs/results and stop before transport/FD replay.")
     parser.add_argument("--ntx-scan-audit-reference", type=Path,
         help="With --ntx-scan-audit-dir, compare surface 6 preparation against this saved NPZ.")
+    parser.add_argument("--ntx-scan-audit-compiler-ir", action="store_true",
+        help="With --ntx-scan-audit-dir, observe actual NTX preparation and scan compilations without another JIT.")
     args = parser.parse_args()
     if args.geometry_fd_native_precision == "extended" and (
         args.parameter in PARAMETER_ORDER or args.geometry_fd_lane != "frozen_linearized"
@@ -1498,11 +1500,12 @@ def main() -> None:
         parser.error("--geometry-input-reference requires --geometry-input-only-dir and an existing reference file")
     if args.ntx_scan_audit_reference is not None and (args.ntx_scan_audit_dir is None or not args.ntx_scan_audit_reference.is_file()):
         parser.error("--ntx-scan-audit-reference requires --ntx-scan-audit-dir and an existing NPZ")
+    if args.ntx_scan_audit_compiler_ir and args.ntx_scan_audit_dir is None:
+        parser.error("--ntx-scan-audit-compiler-ir requires --ntx-scan-audit-dir")
     if args.ntx_scan_audit_dir is not None:
         if (args.geometry_input_only_dir is not None or args.baseline_only_dir is not None
-            or args.initial_er_root_only_fd or args.geometry_fd_lane != "frozen_linearized"
-            or args.parameter in PARAMETER_ORDER):
-            parser.error("--ntx-scan-audit-dir requires a frozen-linearized geometry baseline without another early-stop mode")
+            or args.initial_er_root_only_fd):
+            parser.error("--ntx-scan-audit-dir cannot be combined with another early-stop mode")
         if args.ntx_scan_audit_dir.exists() and any(args.ntx_scan_audit_dir.iterdir()):
             parser.error("--ntx-scan-audit-dir must be empty")
     if args.geometry_input_only_dir is not None:
@@ -1571,7 +1574,12 @@ def main() -> None:
         from NEOPAX import _geometry_autodiff as geometry_module
         from check_generic_ntx_database_baselines import capture_scan_boundary
         input_context = capture_scan_boundary(geometry_module, captured)
-    with input_context:
+    scan_audit = contextlib.nullcontext()
+    if args.ntx_scan_audit_dir is not None:
+        from check_saved_ntx_point_repeatability import capture_production_scans
+        scan_audit = capture_production_scans(args.ntx_scan_audit_dir,
+            reference=args.ntx_scan_audit_reference, compiler_ir=args.ntx_scan_audit_compiler_ir)
+    with input_context, scan_audit:
         if parameter_is_profile or geometry_fd_lane != "frozen_linearized":
             baseline_runtime, baseline_state = build_runtime_context(config)
         else:
@@ -1583,18 +1591,32 @@ def main() -> None:
                 ad_geometry_reference=args.ad_geometry_reference,
             )
             frozen_linearized_bundle["native_precision"] = args.geometry_fd_native_precision
-            scan_audit = contextlib.nullcontext()
-            if args.ntx_scan_audit_dir is not None:
-                from check_saved_ntx_point_repeatability import capture_production_scans
-                scan_audit = capture_production_scans(args.ntx_scan_audit_dir,
-                    reference=args.ntx_scan_audit_reference)
-            with scan_audit:
-                baseline_runtime, baseline_state = _runtime_for_frozen_linearized_geometry_step(
-                    config,
-                    frozen_linearized_bundle,
-                    step_scale=0.0,
-                )
+            baseline_runtime, baseline_state = _runtime_for_frozen_linearized_geometry_step(
+                config,
+                frozen_linearized_bundle,
+                step_scale=0.0,
+            )
     if args.ntx_scan_audit_dir is not None:
+        import os
+        from unittest.mock import patch
+        neo = getattr(baseline_runtime.models.flux, "neoclassical_model", baseline_runtime.models.flux)
+        channels = getattr(neo, "channels", None)
+        with patch.dict(os.environ, NEOPAX_GRADIENT_AUDIT_DIR=str(args.ntx_scan_audit_dir)):
+            snapshot = save_gradient_audit("ntx_live_support",
+                support={"geometry": baseline_runtime.geometry, "database": getattr(neo, "database", None)},
+                scan_inputs={"surfaces": getattr(neo, "scan_surfaces", None),
+                    "channels": channels.as_mapping() if hasattr(channels, "as_mapping") else None})
+        (args.ntx_scan_audit_dir / "config.toml").write_bytes(Path(args.config).read_bytes())
+        if args.ad_baseline_reference is not None:
+            from check_saved_transport_baseline_repeatability import differences
+            prefixes = ("support['geometry'].", "support['database'].")
+            with np.load(args.ad_baseline_reference, allow_pickle=False) as expected, np.load(snapshot, allow_pickle=False) as actual:
+                rows = differences({k:expected[k] for k in expected.files if k.startswith(prefixes)},
+                                   {k:actual[k] for k in actual.files if k.startswith(prefixes)})
+            (args.ntx_scan_audit_dir / "ad_support_comparison.json").write_text(json.dumps(rows, indent=2))
+            print(f"[ntx-live] normalized geometry/database matches archived AD: {not rows}",flush=True)
+            for row in rows:
+                print(f"[ntx-live] {row}",flush=True)
         print(f"[ntx-live] baseline scan capture complete: {args.ntx_scan_audit_dir}; no transport/FD replay",flush=True)
         return
     if args.geometry_input_only_dir is not None:

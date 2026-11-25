@@ -7,7 +7,7 @@ No equilibrium, geometry reconstruction, root, transport, AD or FD solve runs.
 from __future__ import annotations
 
 import argparse
-from contextlib import contextmanager, ExitStack
+from contextlib import contextmanager, ExitStack, nullcontext
 import csv
 import hashlib
 import importlib.metadata
@@ -132,7 +132,7 @@ def compare_preparations(results, out_dir, *, fail_on_difference=True):
 
 
 @contextmanager
-def capture_production_scans(directory, *, reference=None, point=(6,0,7)):
+def capture_production_scans(directory, *, reference=None, point=(6,0,7), compiler_ir=False):
     """Retain actual serial-scan arguments/results; copy only after the build.
 
     No preparation is repeated and no argument or result is replaced. The
@@ -144,16 +144,39 @@ def capture_production_scans(directory, *, reference=None, point=(6,0,7)):
     import jax
 
     records = []
+    preparation_count = 0
+    def compile_context(name):
+        if not compiler_ir:
+            return nullcontext()
+        from jax._src import compiler
+        return capture_ntx_ir(Path(directory)/name, compiler)
+
+    def observe_preparation(original):
+        def prepare(*args, **kwargs):
+            nonlocal preparation_count
+            index = preparation_count
+            preparation_count += 1
+            with compile_context(f'preparation_{index:04d}_compiler'):
+                return original(*args, **kwargs)
+        return prepare
+
     def observe(original, owner):
         def scan(prepared, nu, es):
             record = dict(prepared=prepared, nu=nu, Es=es)
+            index = len(records)
             records.append((owner, traceback.format_stack(limit=8), record))
-            result = original(prepared, nu, es)
+            with compile_context(f'surface_{index:04d}_compiler'):
+                result = original(prepared, nu, es)
             record['coefficients'] = result
             return result
         return scan
     try:
         with ExitStack() as patches:
+            if compiler_ir:
+                for owner in ('ntx', 'ntx._solver_scan', 'ntx._neopax_ad'):
+                    module = importlib.import_module(owner)
+                    patches.enter_context(patch.object(module, 'prepare_monoenergetic_system',
+                        observe_preparation(module.prepare_monoenergetic_system)))
             for owner in ('ntx._solver_scan','ntx._neopax_ad'):
                 module = importlib.import_module(owner)
                 patches.enter_context(patch.object(module,'_scan_coefficients_serial',
@@ -165,7 +188,9 @@ def capture_production_scans(directory, *, reference=None, point=(6,0,7)):
         for index,(owner,stack,record) in enumerate(records):
             arrays, types = {}, []
             for name,tree in record.items():
-                for path,value in jax.tree_util.tree_flatten_with_path(tree)[0]:
+                leaves, structure = jax.tree_util.tree_flatten_with_path(tree)
+                types.append(f'{name}.__treedef__\t{structure}')
+                for path,value in leaves:
                     key = name+jax.tree_util.keystr(path)
                     arrays[key] = np.asarray(jax.device_get(value))
                     types.append(f'{key}\t{type(value).__name__}\tweak={getattr(value,"weak_type","python")}'
@@ -188,6 +213,11 @@ def capture_production_scans(directory, *, reference=None, point=(6,0,7)):
                 compare_preparations({'reference':expected,'live':actual},directory,
                     fail_on_difference=False)
         print(f'[ntx-live] captured {len(records)} actual scan calls; no scan replay',flush=True)
+        sources = {name: dict(path=module.__file__, sha256=hashlib.sha256(Path(module.__file__).read_bytes()).hexdigest())
+            for name, module in tuple(sys.modules.items())
+            if name.startswith(('ntx.', 'solvax.', 'NEOPAX.')) and getattr(module, '__file__', None)
+            and Path(module.__file__).suffix == '.py'}
+        (directory/'loaded_sources.json').write_text(json.dumps(sources, indent=2))
 
 
 @contextmanager

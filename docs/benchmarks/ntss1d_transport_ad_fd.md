@@ -857,7 +857,8 @@ Then run the saved-input capture on the **large machine**:
     --source-metadata "$neopax_case/geometry/fd/metadata.json" \
     --point 4:0:0 --scan-layout production --scan-kernel production \
     --repeats 2 --capture-compiler-ir --out-dir "$neopax_out" \
-    2>&1 | tee "$neopax_out/comparison.log" || exit 1
+    2>&1 | tee "$neopax_out.log" || exit 1
+  cp "$neopax_out.log" "$neopax_out/comparison.log" || exit 1
   tar -czf outputs/fixed_projection_ntx_row.tar.gz -C "$neopax_out" . || exit 1
   printf 'Saved: %s\n' "$neopax_out"
 ) || printf '\nNTX row check stopped; terminal kept open.\n'
@@ -868,3 +869,131 @@ index 0 / field index 0. Fresh prepared differences locate an earlier boundary;
 identical prepared inputs with different scan outputs locate a later one. If
 neither difference reproduces, this diagnostic has not explained the archived
 failure. It must not be presented as a full AD/FD validation or as a fix.
+
+The live log is a sibling of the fresh output directory. Writing it inside
+the directory with `tee` would race the replay's empty-directory guard and
+stop it before any GPU solve. Copy the log inside only after the replay exits.
+
+### One-surface production replay result, 2026-11-25
+
+`outputs/fixed_projection_ntx_row_mpI1u1` completed both independent workers.
+Their fresh prepared arrays match exactly. Within each worker, both full
+176-entry raw coefficient scans match byte-for-byte. The printed selected
+point `(4,0,0)` agrees between processes and with archived AD:
+
+| Quantity | Both replay workers |
+| --- | ---: |
+| Es | `0` |
+| Raw D13 | `-1.7579014626257539e+00` |
+| Normalized D13 | `-1.6563997918341022e+00` |
+| Difference from archived AD | `0` |
+| Difference from failed FD | `-2.230284554e-05` |
+
+The received archive confirms byte equality of all 48 prepared leaves and all
+176 x 5 raw coefficient outputs between processes and within repeated calls.
+Loaded NTX/SOLVAX sources also agree. Normalizing the saved raw row with host
+arithmetic gives the following maximum absolute differences over all 176 points:
+
+| Field | Versus successful archived NTSS1D | Versus failed archived NTSS1D |
+| --- | ---: | ---: |
+| D11_log | `8.881784197e-16` | `2.983333642e-7` |
+| D13 | `0` | `2.230284554e-5` |
+| D33 | `0` | `1.741881010e-7` |
+
+The tiny D11_log difference is from checking GPU-built tables with host
+normalization arithmetic. D13 and D33 match the successful table at every
+point. All 176 D13 values differ from the failed table. The
+[row comparison CSV](fixed_projection_ntx_row_2026-11-25.csv) retains the values.
+
+Both workers compiled 94 programs. For the main coefficient scan the saved
+StableHLO is identical. Exactly three lines of compiled HLO differ: its
+fingerprint, and unroll factors 2 versus 4 for two transpose fusions. After
+removing only those fields, the text is identical. Their raw outputs are
+identical, so these observed compiler differences do not explain the failed
+table and are not a basis for a numerical-method change.
+
+The standalone context reproduces the successful build across this surface,
+not the failed build. No correction has been established. The failed original
+FD producer did not retain its prepared arrays or raw coefficients, so its
+first differing operation cannot be located from either archive alone.
+
+### Capture the original profile FD producer
+
+The original FD script's existing `--ntx-scan-audit-dir` now also observes the
+ordinary profile route, including density shape alpha. It calls the same
+`build_runtime_context(config)` as the failed worker. The new optional
+`--ntx-scan-audit-compiler-ir` observes compilation around actual NTX preparation
+and scan calls, without another JIT, replaced arguments, changed options or
+repeated coefficient solves. Both NTX module aliases and the public preparation
+alias are restored on failure. Prepared trees, types, raw coefficients, source
+hashes and the completed normalized geometry/database payload are saved.
+
+This runs one original runtime initialization: the configured VMEC equilibrium,
+all seven NTX surface scans, and configured initial-state construction. It stops
+before the profile FD constructor, transport evolution, reverse AD, and either
+perturbed endpoint. It does not freeze or replace the equilibrium. Default
+benchmark execution is unchanged. All 30 local NumPy/AST/mock tests pass; no
+local JAX import or physical solve was performed. GPU capture is pending.
+
+Publish from the local WSL checkout:
+
+```bash
+(
+  cd /mnt/d/Github_Codes/NEOPAX-v0_main || exit 1
+  git switch en/v0_main || exit 1
+  neopax_files=(
+    examples/benchmarks/check_saved_ntx_point_repeatability.py
+    examples/benchmarks/benchmark_transport_realtime_geometry_forward_fd.py
+    tests/test_saved_ntx_point_repeatability.py
+    tests/test_saved_transport_baseline_repeatability.py
+    docs/benchmarks/ntss1d_transport_ad_fd.md
+    docs/benchmarks/fixed_projection_ntx_row_2026-11-25.csv
+  )
+  git add -- "${neopax_files[@]}" || exit 1
+  git commit --only -m "Capture the original profile FD coefficient build" \
+    -- "${neopax_files[@]}" || exit 1
+  git push origin en/v0_main
+) || printf '\nPublish stopped; terminal kept open.\n'
+```
+
+Then on the large machine:
+
+```bash
+(
+  cd "$HOME/NEOPAX" || exit 1
+  git switch en/v0_main || exit 1
+  git pull --ff-only origin en/v0_main || exit 1
+  neopax_case=outputs/fixed_projection_ad_fd16_gu6ZO2/ntss1d
+  neopax_out=$(mktemp -d outputs/original_fd_ntx_capture_XXXXXX) || exit 1
+  set -o pipefail
+  env -u PYTHONPATH -u LD_LIBRARY_PATH -u JAX_PLATFORM_NAME \
+    -u XLA_FLAGS -u JAX_COMPILATION_CACHE_DIR -u XLA_PYTHON_CLIENT_ALLOCATOR \
+    -u NEOPAX_ORIGINAL_FORWARD_DIR -u NEOPAX_ORIGINAL_FORWARD_STOP \
+    JAX_PLATFORMS=cuda,cpu JAX_ENABLE_X64=true JAX_ENABLE_COMPILATION_CACHE=0 \
+    XLA_PYTHON_CLIENT_PREALLOCATE=false NTX_DISABLE_COMPILATION_CACHE=1 \
+    VMEX_COMPILATION_CACHE=disabled NEOPAX_SOLVER_MEAN_REDUCTION=fixed \
+    NEOPAX_GRADIENT_AUDIT_DIR="$neopax_out/audit" \
+    "$HOME/jax_env/bin/python" \
+    examples/benchmarks/benchmark_transport_realtime_geometry_forward_fd.py \
+    --config "$neopax_case/config.toml" --parameter density_shape_alpha \
+    --device auto --vmec-response-mode raw_block --accepted-step-limit 16 \
+    --radau-jacobian-reuse-mode legacy --geometry-fd-lane frozen_linearized \
+    --replay-mode accepted --fd-accepted-replay-contract reverse_frozen_metadata \
+    --initial-Er-root-ad jax_selected_root --initial-Er-root-fd-root-lane frozen_linearized \
+    --ad-baseline-reference "$neopax_case/ad/baseline_reference.npz" \
+    --fd-rel-step 3e-7 --fd-abs-step 1e-10 \
+    --ntx-scan-audit-dir "$neopax_out/scans" --ntx-scan-audit-compiler-ir \
+    2>&1 | tee "$neopax_out.log" || exit 1
+  cp "$neopax_out.log" "$neopax_out/run.log" || exit 1
+  tar -czf outputs/original_fd_ntx_capture.tar.gz -C "$neopax_out" . || exit 1
+  printf 'Saved: %s\n' "$neopax_out"
+) || printf '\nOriginal FD initialization capture stopped; terminal kept open.\n'
+```
+
+The AD reference argument supplies a read-only comparison of the captured
+normalized geometry/database payload. Matches and any differing fields are
+printed and saved as `scans/ad_support_comparison.json`. Capture returns before
+that reference can replace initial Er or impose its baseline guard. Compare
+the actual prepared/scan pairs with the standalone replay as well. If the
+failed value does not reproduce, this capture has not fixed or explained it.
+Do not relax equality guards or infer a gradient correction.
