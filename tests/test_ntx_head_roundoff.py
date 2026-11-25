@@ -73,6 +73,15 @@ class HeadRoundoffTests(unittest.TestCase):
         self.assertLess(max(abs(value) for key,value in result.items()
                             if key!='adjoint_relative_residual'),2e-16)
 
+    def test_optional_residual_keeps_the_existing_error_budget(self):
+        inputs=fixture('lu_application',1e-5)
+        original=audit.row_budget(*inputs)
+        result,residual=audit.row_budget(*inputs,return_application_residual=True)
+        self.assertEqual(original,result)
+        self.assertEqual(residual.shape,(2,))
+        self.assertTrue(np.isfinite(residual).all())
+        self.assertGreater(float(np.linalg.norm(residual)),1e-8)
+
     def test_saved_report_keeps_observed_primal_mismatch_visible(self):
         state,heads,_=fixture('none',0.)
         geometry=dict(jacobian=np.ones((1,2)),volume_prime=np.asarray(1.),

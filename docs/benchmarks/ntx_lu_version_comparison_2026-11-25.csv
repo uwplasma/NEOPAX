@@ -1,0 +1,7 @@
+jax,phase,matrix_matches_capture,source_matches_capture,matrix_max_abs_difference,lu_application_functional
+0.7.2,baseline,True,True,0.0,-3.768821976301751e-09
+0.7.2,minus,True,True,0.0,1.8118060551668951e-09
+0.7.2,plus,True,True,0.0,3.733376163085697e-09
+0.10.0,baseline,True,True,0.0,-3.768821976301751e-09
+0.10.0,minus,True,True,0.0,1.8118060551668951e-09
+0.10.0,plus,True,True,0.0,3.733376163085697e-09

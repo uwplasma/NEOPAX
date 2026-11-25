@@ -893,3 +893,76 @@ The next run repeats only the original one-point, three-phase observation.
 It retains the original step to determine which arithmetic correction is
 justified before changing production code. It does not rerun either full
 transport benchmark or change any numerical method.
+
+## Actual head operands: LU application dominates
+
+`outputs/ntx_head_roundoff_HYcBHI` at `5bcdd71` completed on the same JAX
+0.10.0 CUDA configuration. All five captured coefficients match ordinary
+execution exactly at the baseline and both original-step endpoints. Both
+observed and ordinary raw D13 FD are `4.110026248372e-01`.
+
+The [reported error budget](ntx_head_roundoff_2026-11-25.csv) attributes
+`2.899943116521e-03` to application of the existing LU factors. Schur
+matrix-product rounding contributes `7.457797203255e-06`, and LU
+factorization error contributes `7.695330058631e-08`. The total original
+row-1 contribution is `2.971047609855e-03`; the decomposition residual is
+`7.082697704579e-08`. The three transpose-adjoint relative residuals are
+`1.430096e-12`, `1.465988e-12` and `1.557363e-12`.
+
+This distinguishes the two operations in the same elimination step:
+applying a block LU inverse, and multiplying its result to form the next
+Schur complement. The previously published fixed-product patch addresses
+reproducibility of the latter. This result locates the dominant remaining
+error at this point in the former. It does not establish a JAX regression,
+an incorrect physical model, or an error in NTSS1D interpolation.
+
+The candidate correction is one residual-correction step using the same
+LU factors and pivots, with more accurate residual accumulation.
+This adds linear-solve refinement, so its implementation and execution
+require the user's explicit numerical-method approval under the workspace
+AGENTS.md. No refinement has been implemented or run. Validation must first
+check the captured raw point at its original step, derivative consistency,
+runtime and memory, before claiming an improvement to full transport
+gradients for either interpolator.
+
+## Fixed-input LU comparison across JAX releases
+
+`outputs/lu_version_comparison_PaftTE` replays exactly the same captured
+LU factors, pivots, matrix RHS and source RHS under JAX/jaxlib 0.7.2 and
+0.10.0. No matrix is refactorized. The [six phase comparisons](ntx_lu_version_comparison_2026-11-25.csv)
+match the captured matrix and source solutions bit-for-bit, with zero
+maximum absolute difference. Both versions give the same raw D13
+LU-application FD error contribution, `2.899943116521e-03`.
+
+Both environments use cuBLAS `12.9.3.13`, CUDA runtime `12.9.79`, and
+cuSOLVER `11.7.5.82` on the same GPU. This excludes a difference between
+those two JAX releases in this isolated LU application under these CUDA
+libraries. It does not test whether upstream operator formation or
+factorization differs between versions, or reconstruct the complete
+historical v0_new case/environment. The factors being replayed belong to
+the current generic case. It also does not prove that the configured
+mathematical method is incorrect.
+
+The refinement proposal remains on hold; the user has not approved a
+method change. An implementation-only candidate is to process independent
+RHS columns in fixed panels using the same `jax.scipy.linalg.lu_solve`
+calls, factors and pivots. This adds no iterations or alternative solver.
+Its accuracy is a hypothesis, not a demonstrated correction.
+
+`check_saved_lu_rhs_layout.py` replays the same saved applications with
+native batching and with 1, 16 and 64 columns per call. The native control
+must first reproduce all captured solutions exactly. Each layout reports
+the LU-application error contribution, the maximum absolute phase error
+functional and the factored-system residual action norm. These additional
+metrics help distinguish improved accuracy from cancellation in the FD
+error contribution. It also reports actual execution time, compiled
+buffers and fixed-input repeatability, and saves its generated compiler IR
+and output arrays. Because the Schur matrices and other calculation stages
+remain frozen, the reported error contribution tests only the LU
+application; it is not a new full cost-function gradient comparison.
+Only a successful result can justify applying this batching change in
+SOLVAX, followed by derivative checks and the actual transport comparison.
+Three NumPy tests check column order, unchanged factors, partial panels,
+empty inputs, invalid shapes and strict dtype/signed-zero comparisons
+without importing JAX. A regression test also verifies that exposing the
+existing application residual leaves every previous budget value unchanged.

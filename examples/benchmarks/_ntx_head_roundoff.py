@@ -21,7 +21,7 @@ def transpose_action(lu, pivots, rhs):
     return result
 
 
-def row_budget(state, heads, weights):
+def row_budget(state, heads, weights, *, return_application_residual=False):
     """Split the original row-1 residual using its actual saved operands."""
     cast=lambda x:np.asarray(x,dtype=np.longdouble)
     lu,piv,lower,sigma=(state[key] for key in ('head_lu','head_pivots','head_lower','head_sigma'))
@@ -49,18 +49,21 @@ def row_budget(state, heads, weights):
     y=x_action-t
     action=(np.tril(factor,-1)+np.eye(len(p),dtype=np.longdouble))@(np.triu(factor)@y)
     factor_action=np.empty_like(action);factor_action[p]=action
+    application_residual=factor_action-lower[2]@modes[1]+next_sigma
     result={
         'head1_substitution':dot(bar,a1@modes[1]+lower[1]@modes[0]-sigma[1]),
         'schur_matrix_product':dot(bar,(d-a1)@modes[1]-u@x_action),
         'schur_source_product':dot(bar,sigma[1]-b+u@t),
         'head2_substitution':dot(q,a2@modes[2]+lower[2]@modes[1]-next_sigma),
         'lu_factorization':-dot(q,factor_action-a2@y),
-        'lu_application':dot(q,factor_action-lower[2]@modes[1]+next_sigma),
+        'lu_application':dot(q,application_residual),
         'original_row1':dot(bar,d@modes[1]+lower[1]@modes[0]+u@modes[2]-b),
     }
     result['decomposition_residual']=sum(result[key] for key in tuple(result)[:6])-result['original_row1']
     residual=a2.T@q-u.T@bar
     result['adjoint_relative_residual']=float(np.sqrt(np.sum(residual**2)/np.sum((u.T@bar)**2)))
+    if return_application_residual:
+        return result,application_residual
     return result
 
 

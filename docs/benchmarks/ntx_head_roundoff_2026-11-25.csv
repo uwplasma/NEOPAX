@@ -1,0 +1,9 @@
+component,raw_D13_fd_error_contribution
+head1_substitution,6.292445737225e-05
+schur_matrix_product,7.457797203255e-06
+schur_source_product,0.000000000000e+00
+head2_substitution,7.161124344098e-07
+lu_factorization,7.695330058631e-08
+lu_application,2.899943116521e-03
+original_row1,2.971047609855e-03
+decomposition_residual,7.082697704579e-08
