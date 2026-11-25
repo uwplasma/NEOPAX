@@ -365,6 +365,9 @@ def capture_original_forward(main, directory, *, stop=True):
             raise RuntimeError("Benchmark returned without an original adaptive baseline capture.")
 
 
+PRE_TRANSPORT_CAPTURE = object()
+
+
 def run_benchmark(main):
     """Opt-in fixed means and observation of the ordinary benchmark entry point."""
     import os
@@ -387,9 +390,11 @@ def run_benchmark(main):
         result = None
     if control is None:
         return result
-    if not control.sizes:
+    if not control.sizes and result is not PRE_TRANSPORT_CAPTURE:
         raise RuntimeError("Fixed solver means were not traced in the benchmark.")
     record = dict(solver_mean_reduction=mode, fixed_mean_sizes=sorted(control.sizes))
+    if result is PRE_TRANSPORT_CAPTURE:
+        record["stopped_before_transport"] = True
     if directory := os.environ.get("NEOPAX_GRADIENT_AUDIT_DIR"):
         write_json(Path(directory).parent / "solver_mean_reduction.json", record)
     print("[solver-means]", record, flush=True)

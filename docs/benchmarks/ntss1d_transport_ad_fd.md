@@ -997,3 +997,56 @@ that reference can replace initial Er or impose its baseline guard. Compare
 the actual prepared/scan pairs with the standalone replay as well. If the
 failed value does not reproduce, this capture has not fixed or explained it.
 Do not relax equality guards or infer a gradient correction.
+
+### Original profile capture result and wrapper postcondition
+
+At `4d04164`, `outputs/original_fd_ntx_capture_lq73VM` completed the original
+density-alpha runtime initialization and saved all seven actual NTX scans.
+Its captured transport geometry and all normalized database fields match
+archived AD exactly. This is a baseline-support comparison, not a transport
+trajectory or gradient validation, and the earlier failed table did not recur.
+
+The subsequent `Fixed solver means were not traced in the benchmark` error
+was a wrapper postcondition: capture intentionally stops before the time
+solver, so there are no solver means to trace. All capture data was already
+written. The failed shell pipeline skipped only the subsequent packaging.
+
+Completed NTX-only captures now return an explicit `PRE_TRANSPORT_CAPTURE`
+marker. The wrapper accepts that marker with empty solver-reduction sizes
+and records `stopped_before_transport: true`. Ordinary full benchmarks still
+raise if fixed means were not traced; failures from the original calculation
+still propagate. The updated 22-test NumPy/AST/mock baseline suite passes.
+No numerical method, controller, tolerance, or equality guard was changed.
+
+Recover the existing files on the large machine without rerunning anything:
+
+```bash
+(
+  cd "$HOME/NEOPAX" || exit 1
+  neopax_out=outputs/original_fd_ntx_capture_lq73VM
+  [ -f "$neopax_out/scans/ntx_live_support_5_uks9nq.npz" ] || exit 1
+  if [ -f "$neopax_out.log" ]; then
+    cp "$neopax_out.log" "$neopax_out/run.log" || exit 1
+  fi
+  tar -czf outputs/original_fd_ntx_capture.tar.gz -C "$neopax_out" . || exit 1
+  printf 'Archive: %s\n' "$HOME/NEOPAX/outputs/original_fd_ntx_capture.tar.gz"
+) || printf '\nPackaging stopped; terminal kept open.\n'
+```
+
+While waiting for this archive, an additional NumPy-only reconstruction of
+the existing AD16 compact contractions matched stored production AD gradients
+for all 13 costs and both geometry parameters to `1.837413e-13` relative in
+generic mode and `4.573911e-13` in NTSS1D mode. The saved tangents are the
+ones used by that production contraction, so this checks aggregation and
+indexing only. It is not an independent VMEX or NTX derivative test and does
+not resolve the full AD/FD gradient differences.
+
+The original-capture archive has now been inspected. Its full upstream
+inputs and normalized support match the successful build, and surface 4's
+actual prepared arrays and raw coefficients match the standalone replay.
+The remaining generic gradient gap is dominated by the database derivative,
+not the direct geometry contribution. The
+[current diagnosis and derivative-only commands](current_ntx_derivative_diagnosis_2026-11-25.md)
+record the evidence and a focused JVP/VJP check at two influential table
+nodes, using all 13 captured objective RHS rows. It changes no solver and
+runs no equilibrium, root, transport trajectory or FD perturbations.

@@ -185,6 +185,11 @@ class SavedBaselineTests(unittest.TestCase):
                 sizes.clear()
                 with self.assertRaisesRegex(RuntimeError,'not traced'):
                     check.run_benchmark(original)
+                capture = Mock(return_value=check.PRE_TRANSPORT_CAPTURE)
+                self.assertIs(check.run_benchmark(capture),check.PRE_TRANSPORT_CAPTURE)
+                capture.assert_called_once_with()
+                self.assertEqual(json.loads((Path(directory)/'solver_mean_reduction.json').read_text()),
+                    dict(solver_mean_reduction='fixed',fixed_mean_sizes=[],stopped_before_transport=True))
             with patch.dict(os.environ,{'NEOPAX_SOLVER_MEAN_REDUCTION':'invalid'},clear=True), \
                  self.assertRaisesRegex(ValueError,'native or fixed'):
                 check.run_benchmark(Mock(side_effect=AssertionError('main should not run')))
@@ -1002,7 +1007,7 @@ class SavedBaselineTests(unittest.TestCase):
                         'check_saved_ntx_point_repeatability':SimpleNamespace(capture_production_scans=capture),
                         'check_saved_transport_baseline_repeatability':check}), \
                      contextlib.redirect_stdout(io.StringIO()):
-                    namespace['main']()
+                    self.assertIs(namespace['main'](),check.PRE_TRANSPORT_CAPTURE)
                 self.assertEqual((out/'config.toml').read_bytes(),cfg_path.read_bytes())
                 saved = namespace['save_gradient_audit'].call_args
                 self.assertEqual(saved.args,('ntx_live_support',))

@@ -24,6 +24,47 @@ JAX_AFTER_IMPORT = 'jax' in sys.modules
 
 
 class CapturedNTXPreparationTests(unittest.TestCase):
+    def test_captured_objective_bars_include_raw_normalization_and_d11_floor(self):
+        before = {f'labels[{i}]':np.asarray(name) for i,name in enumerate(('Er','bootstrap'))}
+        weights = ((2.,3.,-4.),(-1.,5.,6.))
+        for i,row in enumerate(weights):
+            before.update({f"support_bars[{i}]['database'].{name}":np.asarray([[[value]]])
+                           for name,value in zip(('D11_log','D13','D33'),row,strict=True)})
+        raw = np.asarray([1.2,0.,3.4,5.6,0.])
+        dot = np.asarray([.4,0.,.6,.8,0.])
+        bars,labels = check.captured_coefficient_bars(before,(0,0,0),raw,2.,.3)
+        self.assertEqual(labels,['Er','bootstrap'])
+        np.testing.assert_allclose(bars@dot,[a*.4/(np.log(10.)*1.2)+b*.6*2.+c*.8*.3
+                                           for a,b,c in weights],rtol=1e-15)
+        np.testing.assert_array_equal(bars[:,(1,4)],0.)
+        raw[0] = -1.
+        floored,_ = check.captured_coefficient_bars(before,(0,0,0),raw,2.,.3)
+        np.testing.assert_array_equal(floored[:,0],0.)
+        np.testing.assert_array_equal(floored[:,(2,3)],bars[:,(2,3)])
+        with self.assertRaisesRegex(ValueError,'Invalid raw'):
+            check.captured_coefficient_bars(before,(0,0,0),raw[:-1],2.,.3)
+        self.assertEqual(JAX_ALREADY_LOADED,'jax' in sys.modules)
+
+    def test_derivative_only_performs_no_fd_evaluations_and_default_retains_existing_scales(self):
+        values = (np.asarray(2.),np.asarray(-.5))
+        direction = (np.asarray(.3),np.asarray(.2))
+        calls = []
+        def evaluate(x):
+            calls.append(x)
+            return np.asarray([x[0]*x[1],x[0]**2])
+        self.assertEqual(list(check.local_fd_samples(evaluate,values,direction,1e-5,jvp_vjp_only=True)),[(None,None)])
+        self.assertEqual(calls,[])
+        samples = list(check.local_fd_samples(evaluate,values,direction,1e-5))
+        self.assertEqual(len(calls),6)
+        self.assertEqual([h for h,_ in samples],[1e-5*scale for scale in (10.,3.,1.)])
+        for step,((h,derivative),scale) in enumerate(zip(samples,(10.,3.,1.),strict=True)):
+            for sign,actual in zip((-1,1),calls[2*step:2*step+2],strict=True):
+                np.testing.assert_array_equal(actual,tuple(x+sign*scale*1e-5*d for x,d in zip(values,direction,strict=True)))
+            np.testing.assert_allclose(derivative,[.25,1.2],rtol=1e-9,atol=1e-10)
+        with self.assertRaisesRegex(FloatingPointError,'Nonfinite local'):
+            list(check.local_fd_samples(lambda x:np.asarray([np.nan]),values,direction,1e-5))
+        self.assertEqual(JAX_ALREADY_LOADED,'jax' in sys.modules)
+
     def test_precision_reference_rejects_different_direction_point_and_database(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

@@ -1618,7 +1618,8 @@ def main() -> None:
             for row in rows:
                 print(f"[ntx-live] {row}",flush=True)
         print(f"[ntx-live] baseline scan capture complete: {args.ntx_scan_audit_dir}; no transport/FD replay",flush=True)
-        return
+        from check_saved_transport_baseline_repeatability import PRE_TRANSPORT_CAPTURE
+        return PRE_TRANSPORT_CAPTURE
     if args.geometry_input_only_dir is not None:
         import os
         from unittest.mock import patch

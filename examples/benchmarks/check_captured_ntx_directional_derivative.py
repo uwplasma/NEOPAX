@@ -30,6 +30,37 @@ EXTRA_SURFACE_FIELDS = ('iota', 'psi_a_hat', 'phi_edge', 'r_n', 'r_hat',
                         'transport_psi_scale', 'requested_psi_n', 'psi_n')
 
 
+def local_fd_samples(evaluate, values, direction, h0, *, jvp_vjp_only=False):
+    """Retain ordinary FD scales, or perform no perturbed evaluations at all."""
+    if jvp_vjp_only:
+        yield None, None
+        return
+    for scale in (10., 3., 1.):
+        h = h0*scale
+        minus = evaluate(tuple(x-h*d for x,d in zip(values,direction,strict=True)))
+        plus = evaluate(tuple(x+h*d for x,d in zip(values,direction,strict=True)))
+        if not np.isfinite(minus).all() or not np.isfinite(plus).all():
+            raise FloatingPointError('Nonfinite local coefficient FD endpoint')
+        yield h, (plus-minus)/(2*h)
+
+
+def captured_coefficient_bars(before, point, raw, drds, nu, *, d11_floor=1e-20):
+    """Map the actual 13 objective table bars to raw-coefficient RHS columns."""
+    labels = [str(before[f'labels[{i}]']) for i in range(sum(k.startswith('labels[') for k in before))]
+    if np.shape(raw) != (5,) or not labels or not np.isfinite(raw).all():
+        raise ValueError('Invalid raw coefficient vector or captured objective labels')
+    bars = np.zeros((len(labels),5),dtype=np.float64)
+    for i in range(len(labels)):
+        prefix = f"support_bars[{i}]['database']."
+        if raw[0]*drds**2 > d11_floor:
+            bars[i,0] = before[prefix+'D11_log'][point]/(np.log(10.)*raw[0])
+        bars[i,2] = before[prefix+'D13'][point]*drds
+        bars[i,3] = before[prefix+'D33'][point]*nu
+    if not np.isfinite(bars).all():
+        raise ValueError('Nonfinite captured coefficient bars')
+    return bars,labels
+
+
 def saved(directory, pattern):
     paths = list(directory.glob(pattern))
     if len(paths) != 1:
@@ -451,15 +482,20 @@ def main():
         help='Use an existing summary.json and snapshots directory without modifying the archived AD/FD run')
     parser.add_argument('--compare-saved-fd',action='store_true',
         help='With --audit-table, also compare against the saved FD endpoint database direction')
+    parser.add_argument('--jvp-vjp-only',action='store_true',
+        help='At --points, compare forward/reverse derivatives for all captured objective RHS rows without FD perturbations')
     parser.add_argument('--precision-from-table-audit',type=Path,
         help='At --points, reuse a completed weighted audit JVP and test numerical-input FD at 1,3,10,30 times the saved step')
     args = parser.parse_args()
+    if args.jvp_vjp_only and (args.audit_table or args.precision_from_table_audit is not None):
+        parser.error('--jvp-vjp-only requires selected-point mode without a precision sweep')
     if args.precision_from_table_audit is not None and args.audit_table:
         parser.error('--precision-from-table-audit cannot be combined with --audit-table')
     if args.compare_saved_fd and not args.audit_table:
         parser.error('--compare-saved-fd requires --audit-table')
     snapshots = snapshot_directory(args.run_dir)
     terminal = saved(snapshots, 'ad_terminal_*.npz')
+    before = saved(snapshots, 'ad_before_scan_fold_*.npz') if args.jvp_vjp_only else None
     capture = saved(snapshots, 'ad_compact_geometry_*.npz')
     tangents = saved(snapshots, 'ad_compact_tangents_*.npz')
     directions = captured_direction(tangents, args.parameter)
@@ -497,7 +533,7 @@ def main():
     from vmex.core.solver import SpectralState
     from NEOPAX import _geometry_autodiff as geo
     from NEOPAX._geometry_models import VmecBoozer
-    from NEOPAX._transport_flux_models import _build_ntx_field_channels
+    from NEOPAX._transport_flux_models import D11_POSITIVE_FLOOR, _build_ntx_field_channels
     from benchmark_transport_reverse_ad_only import _geometry_context_from_config
 
     for module in (geo,native_ad,sys.modules[_prepared_implicit_vjp_primal.__module__]):
@@ -551,17 +587,17 @@ def main():
             return jax.jvp(lambda x: primal(x, nu), (values,), (direction,))
 
         @jax.jit
-        def adjoint(values, direction, nu):
+        def adjoint(values, direction, nu, coefficient_bars=basis):
             prepared = ntx.prepare_monoenergetic_system(local_surface(values), grid)
             implicit_primal = _prepared_implicit_vjp_primal(prepared, nu, values[7])[0]
             case_bars, geometry_bars = native_ad.pullback_prepared_database_coefficients_to_vmec_primitive_multi_rhs(
-                prepared, ntx.MonoenergeticCase(nu_hat=nu, epsi_hat=values[7]), basis)
+                prepared, ntx.MonoenergeticCase(nu_hat=nu, epsi_hat=values[7]), coefficient_bars)
             _, pullback = jax.vjp(lambda x: geometry_on_grid(local_surface(x), grid), values)
             def contract(index):
                 one = jax.tree_util.tree_map(lambda value: value[index], geometry_bars)
                 (bars,) = pullback(one)
                 return sum(jnp.vdot(bar, dot).real for bar, dot in zip(bars, direction, strict=True)) + case_bars.epsi_hat[index]*direction[7]
-            return implicit_primal, jax.vmap(contract)(jnp.arange(3))
+            return implicit_primal, jax.vmap(contract)(jnp.arange(coefficient_bars.shape[0]))
 
         primal_jit = jax.jit(primal)
         for _, nu_index, field_index in (point for point in args.points if point[0] == radius):
@@ -585,27 +621,44 @@ def main():
             if not np.allclose(actual, expected, rtol=1e-8, atol=1e-12):
                 raise ValueError('Reconstructed NTX primal differs from the captured table; stop before comparing derivatives')
             print('[captured-ntx] production database transpose', flush=True)
-            implicit_primal, reverse = map(np.asarray, jax.block_until_ready(adjoint(values, direction, nu)))
+            coefficient_names = COEFFICIENTS
+            if args.jvp_vjp_only:
+                weights,labels = captured_coefficient_bars(before,(radius,nu_index,field_index),
+                    baseline,drds,float(nu),d11_floor=D11_POSITIVE_FLOOR)
+                print(f'[captured-ntx] actual captured objective RHS rows={len(labels)}; no FD perturbations',flush=True)
+                result = adjoint(values,direction,nu,jnp.asarray(weights))
+                coefficient_names = tuple((label,i) for i,label in enumerate(labels))
+            else:
+                result = adjoint(values,direction,nu)
+            implicit_primal, reverse = map(np.asarray, jax.block_until_ready(result))
             if not all(np.isfinite(value).all() for value in (baseline, jvp_primal, implicit_primal, tangent, reverse)):
                 raise FloatingPointError('Nonfinite coefficient or derivative')
-            for scale in (10., 3., 1.):
-                h = h0*scale
-                minus = np.asarray(jax.block_until_ready(primal_jit(tuple(x-h*d for x,d in zip(values,direction,strict=True)), nu)))
-                plus = np.asarray(jax.block_until_ready(primal_jit(tuple(x+h*d for x,d in zip(values,direction,strict=True)), nu)))
-                if not np.isfinite(minus).all() or not np.isfinite(plus).all():
-                    raise FloatingPointError('Nonfinite local coefficient FD endpoint')
-                for channel, (name, index) in enumerate(COEFFICIENTS):
-                    fd_value = float((plus[index]-minus[index])/(2*h))
-                    jvp_value, vjp_value = float(tangent[index]), float(reverse[channel])
+            if args.jvp_vjp_only:
+                print('[captured-ntx] forward versus pullback raw-primal relative differences='
+                      f'{np.abs(baseline[[0,2,3]]-implicit_primal[[0,2,3]])/np.maximum(np.abs(baseline[[0,2,3]]),np.finfo(float).tiny)}',flush=True)
+                np.savez_compressed(args.out_dir/f'point_{radius}_{nu_index}_{field_index}.npz',
+                    forward_primal=baseline,jvp_primal=jvp_primal,pullback_primal=implicit_primal,
+                    raw_solver_jvp=tangent,production_vjp=reverse,coefficient_bars=weights,objective_labels=np.asarray(labels))
+            forward_values,implicit_values,jvp_values,tangent_values = baseline,implicit_primal,jvp_primal,tangent
+            if args.jvp_vjp_only:
+                forward_values,implicit_values,jvp_values,tangent_values = (weights@x for x in
+                    (baseline,implicit_primal,jvp_primal,tangent))
+            evaluate = lambda x: np.asarray(jax.block_until_ready(primal_jit(x,nu)))
+            for h, fd_vector in local_fd_samples(evaluate,values,direction,h0,jvp_vjp_only=args.jvp_vjp_only):
+                for channel, (name, index) in enumerate(coefficient_names):
+                    fd_value = None if fd_vector is None else float(fd_vector[index])
+                    jvp_value, vjp_value = float(tangent_values[index]), float(reverse[channel])
                     relative = abs(vjp_value-jvp_value)/max(abs(jvp_value),np.finfo(float).tiny)
                     row = dict(radius_index=radius, nu_index=nu_index, field_index=field_index,
                         parameter=args.parameter, coefficient=name, fd_step=h, raw_solver_jvp=jvp_value,
                         production_vjp=vjp_value, gradient_fd=fd_value, jvp_vjp_relative_difference=relative,
-                        forward_primal=float(baseline[index]), implicit_pullback_primal=float(implicit_primal[index]),
-                        raw_jvp_primal=float(jvp_primal[index]),
-                        raw_jvp_primal_relative_difference=float(abs(baseline[index]-jvp_primal[index])/max(abs(baseline[index]),np.finfo(float).tiny)),
-                        forward_pullback_primal_relative_difference=float(abs(baseline[index]-implicit_primal[index])/max(abs(baseline[index]),np.finfo(float).tiny)),
-                        fd_vjp_absolute_difference=abs(fd_value-vjp_value))
+                        forward_primal=float(forward_values[index]), implicit_pullback_primal=float(implicit_values[index]),
+                        raw_jvp_primal=float(jvp_values[index]),
+                        raw_jvp_primal_relative_difference=float(abs(forward_values[index]-jvp_values[index])/max(abs(forward_values[index]),np.finfo(float).tiny)),
+                        forward_pullback_primal_relative_difference=float(abs(forward_values[index]-implicit_values[index])/max(abs(forward_values[index]),np.finfo(float).tiny)),
+                        fd_vjp_absolute_difference=None if fd_value is None else abs(fd_value-vjp_value))
+                    if args.jvp_vjp_only:
+                        row.update(objective=name,coefficient='objective_weighted_raw_coefficients',rhs_count=len(labels))
                     rows.append(row)
                     print('[captured-ntx] '+json.dumps(row), flush=True)
             with (args.out_dir/'comparison.csv').open('w',newline='') as stream:
