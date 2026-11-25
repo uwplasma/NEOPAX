@@ -17,14 +17,20 @@ def observe_head(directory, phase, retained, *, jax, direct):
     original_factor = direct.lu_factor
     source = Path(direct.__file__).resolve()
 
-    def write_head(index, matrix):
-        np.savez_compressed(directory/f'{phase[0]}_head_{int(index)}.npz',matrix=np.asarray(matrix))
+    def write_head(index, matrix, operands):
+        # Row 1 dominates the captured D13 error budget. Keep its actual
+        # operands to separate Schur-product rounding from LU-solve error.
+        extra = operands if int(index) == 1 else ({'u_j':operands['u_j']} if int(index) == 0 else {})
+        np.savez_compressed(directory/f'{phase[0]}_head_{int(index)}.npz',
+            matrix=np.asarray(matrix),**{key:np.asarray(value) for key,value in extra.items()})
 
     def factor(matrix, *args, **kwargs):
         frame = inspect.currentframe().f_back
         try:
             if frame.f_code.co_name == 'head_step' and Path(frame.f_code.co_filename).resolve() == source:
-                jax.debug.callback(write_head,frame.f_locals['j'],matrix,ordered=True)
+                operands = {key:frame.f_locals[key] for key in
+                    ('d_j','u_j','x','solved_sigma','b_j','sigma_next')}
+                jax.debug.callback(write_head,frame.f_locals['j'],matrix,operands,ordered=True)
         finally:
             del frame
         return original_factor(matrix,*args,**kwargs)
@@ -96,4 +102,6 @@ def capture_forward_stages(directory, *, template, names, grid, values, minus, p
                 coefficients=coefficients,ordinary_coefficients=reference,nu=np.asarray(nu),fd_step=fd_step)
             print(f'[ntx-stages] phase={label} coefficients_equal={np.array_equal(coefficients,reference)} '
                   f'max_abs_difference={np.max(np.abs(coefficients-reference)):.9e} saved={directory}',flush=True)
+    from _ntx_head_roundoff import report_head_roundoff
+    report_head_roundoff(directory)
     return directory

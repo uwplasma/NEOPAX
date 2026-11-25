@@ -822,3 +822,74 @@ Retrieve from local WSL:
 scp exouser@149.165.170.203:/home/exouser/NEOPAX/outputs/ntx_prepared_field_check.tar.gz \
   /mnt/d/Github_Codes/
 ```
+
+## Prepared-field result and original-row error budget
+
+`outputs/ntx_prepared_field_check_6cRGVm` at `f417325` completed. The
+[saved comparisons](ntx_prepared_fields_2026-11-25.csv) use the original
+RBC step and saved endpoints. Every geometry-preparation JVP primal field
+matches the captured baseline byte-for-byte.
+
+| Raw coefficient | Forward JVP | Production VJP | Saved raw FD | Effect of replacing the preparation JVP by saved field FD |
+| --- | ---: | ---: | ---: | ---: |
+| D11 | `-6.747153934427e-06` | `-6.747149177403e-06` | `-6.762969330465e-06` | `-1.763836e-15` |
+| D13 | `4.075899759189e-01` | `4.075911457049e-01` | `4.110026248372e-01` | `1.492051e-09` |
+| D33 | `4.428216132000e+05` | `4.428224202001e+05` | `4.424463877703e+05` | `-3.332454e-03` |
+
+The D13 VJP/JVP relative difference is `2.870007e-06`. Replacing the true
+preparation direction by the actual saved field secant changes that result
+by only `3.660667e-09` relative to the JVP. The remaining raw FD difference
+is `8.369876e-03` relative. Field preparation therefore does not explain
+the dominant discrepancy at this point. The implicit-pullback primal
+offsets are retained in the CSV; forward/reverse agreement is not exact.
+
+NumPy-only analysis of the saved original operator equations adds a more
+specific location. It uses the recorded modes and LU factors, and applies
+those factors only to transpose error-functional vectors. It introduces
+no new physical primal, factorization or solver. The original-row residual
+is evaluated with extended accumulation and contracted with the transformed
+head adjoint at each endpoint. Its estimated FD contributions are:
+
+| Raw coefficient | Observed FD minus JVP | Original row 0 residual contribution | Original row 1 residual contribution |
+| --- | ---: | ---: | ---: |
+| D11 | `-1.581540e-08` | `-1.471636e-08` | `-2.126766e-10` |
+| D13 | `3.412649e-03` | `8.923602e-05` | `2.971047e-03` |
+| D33 | `-3.752254e+02` | `2.446679e+01` | `-5.416524e+01` |
+
+These are approximate error-functional estimates, not rigorous bounds or
+an exact decomposition of the entire derivative discrepancy. They locate
+most of the D13 discrepancy at original Legendre row 1 and most of D11 at
+row 0. They do not explain most of D33. The earlier reduced-equation
+substitution errors and coefficient-averaging errors were too small to
+explain D13. This points to arithmetic in the head elimination that builds
+the reduced equations. Reproducible products alone do not establish their
+accuracy in this low-collisionality system.
+
+The existing `--capture-forward-stages` observation now also saves the
+actual `d_j`, `u_j`, matrix-RHS solve `x`, source-RHS solve `solved_sigma`,
+`b_j` and `sigma_next` at head row 1, plus `u_j` at row 0. The public
+configured forward solver is called unchanged, and observed/ordinary
+coefficient comparisons remain visible at all three phases. Only the
+three retained rows are captured; no tail matrix tape is added.
+
+`_ntx_head_roundoff.py` reads these operands and the existing retained
+factors using NumPy. It prints a D13 FD error budget separating:
+
+- Schur matrix-product and source-product rounding;
+- final head substitutions;
+- the next block's LU factorization error and LU-application error.
+
+The decomposition residual and transpose-adjoint residual are reported,
+because this error-functional analysis uses recorded factors rather than
+an exact inverse. An observed/ordinary mismatch prevents attributing the
+new capture's budget to the old ordinary result. Host extended precision
+is required. Three manufactured tests independently inject product,
+factorization and LU-application errors, verify budget closure, and check
+pivot order; a saved-file report test keeps a mismatched observed primal
+visible. Three mocked observation tests verify unchanged calls and
+visible primal drift. All seven pass without JAX or a simulation.
+
+The next run repeats only the original one-point, three-phase observation.
+It retains the original step to determine which arithmetic correction is
+justified before changing production code. It does not rerun either full
+transport benchmark or change any numerical method.

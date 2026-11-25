@@ -29,6 +29,8 @@ def fake_solver():
         matrix=np.asarray([[2.,.1],[.2,3.]])
         direct.lu_factor(matrix)  # A non-head call must not be captured.
         def head_step(j):
+            d_j,u_j,x = matrix.copy(),matrix.copy()*2,matrix.copy()*3
+            solved_sigma,b_j,sigma_next = np.ones((2,2)),np.ones((2,2))*4,np.ones((2,2))*5
             return direct.lu_factor(matrix+j)
         values=[head_step(j) for j in range(3)]
         return np.ones((3,2,2)),np.stack([v[0] for v in values]),np.stack([v[1] for v in values]),np.ones((3,2,2)),np.zeros((3,2,2))
@@ -55,6 +57,14 @@ class ForwardStageCaptureTests(unittest.TestCase):
                 for j in range(3):
                     with np.load(root/f'baseline_head_{j}.npz',allow_pickle=False) as z:
                         np.testing.assert_array_equal(z['matrix'],np.asarray([[2.,.1],[.2,3.]])+j)
+                        if j == 1:
+                            np.testing.assert_array_equal(z['x'],np.asarray([[2.,.1],[.2,3.]])*3)
+                            np.testing.assert_array_equal(z['sigma_next'],np.ones((2,2))*5)
+                            self.assertEqual(set(z.files),{'matrix','d_j','u_j','x','solved_sigma','b_j','sigma_next'})
+                        elif j == 0:
+                            self.assertEqual(set(z.files),{'matrix','u_j'})
+                        else:
+                            self.assertEqual(z.files,['matrix'])
                 retained.clear()
                 phase[0]='minus'
                 direct._block_thomas_truncated_fn_state()
@@ -103,7 +113,9 @@ class ForwardStageCaptureTests(unittest.TestCase):
         numbers=tuple((np.asarray(b),np.asarray(.1)) for b in (2.,1.9,2.1))
         ordinary=[np.asarray([b*b,b+.1,b-.1,3*b,1e6]) for b in (2.,1.9,2.1)]
         ordinary[-1]=ordinary[-1].copy();ordinary[-1][2]+=1e-3
-        modules={'jax':jax,'jax.numpy':np,'ntx':ntx,'solvax':SimpleNamespace(direct=direct)}
+        reports=[]
+        modules={'jax':jax,'jax.numpy':np,'ntx':ntx,'solvax':SimpleNamespace(direct=direct),
+                 '_ntx_head_roundoff':SimpleNamespace(report_head_roundoff=lambda path:reports.append(path))}
         with tempfile.TemporaryDirectory() as directory,patch.dict(sys.modules,modules),redirect_stdout(io.StringIO()) as output:
             root=Path(directory)
             capture.capture_forward_stages(root,template=template,names=names,grid=None,
@@ -118,6 +130,7 @@ class ForwardStageCaptureTests(unittest.TestCase):
                     self.assertEqual(float(z['fd_step']),.1)
             self.assertIn('phase=plus coefficients_equal=False',output.getvalue())
         self.assertEqual(barriers,[True]*3)
+        self.assertEqual(reports,[root])
 
 
 if __name__=='__main__':
