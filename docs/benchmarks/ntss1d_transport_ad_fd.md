@@ -749,3 +749,122 @@ the success criterion for changed source. The full AD/FD benchmark's strict
 new-baseline guards remain untouched. Full comparisons still need fresh run
 directories for all eight DOFs and both interpolators after the short checks
 pass; neither archive analysis nor isolated GPU checks validate those gradients.
+
+### GPU validation and the next remaining failure
+
+Run `outputs/fixed_projection_ad_fd16_gu6ZO2` at `6cbe394` passed the four
+projection tests on CUDA/JAX 0.10.0, including JVP/VJP and second derivatives.
+The isolated projection median was `1.291130e-4 s`, compared with
+`1.459950e-4 s` for the native reference. Compiled temporary buffers were
+`0` versus `5,013,520` bytes. These measurements are not full-run GPU peaks.
+The original-equilibrium/current-FD geometry trace matched exactly.
+
+Generic AD16/FD16 completed all 104 pairs with exactly matching baseline
+state, time, geometry and database arrays for all eight DOFs. Geometry
+gradient differences remain, especially bootstrap current: relative errors
+`4.647558915e-3` (RBC) and `5.635140498e-4` (ZBS). The
+[generic report](fixed_projection_generic_ad_fd16_2026-11-25.md) retains the
+full comparison and its validation limits.
+
+NTSS1D AD16 and the n0/T0/density-power/temperature-power FD16 columns
+completed, yielding 52 pairs with exact baseline equality. The next worker,
+density shape alpha, stopped at the reference-support guard before transport
+stepping or parameter perturbation. Only D11_log, D13 and D33 were reported
+as different, with maximum absolute gaps `1.2163237483875378e-6`,
+`2.230284553617068e-5` and `1.160430045499261e-6`. The failed build saved
+`ntss1d/fd_density_shape_alpha/snapshots/fd_reference_support_88r1__hh.npz`.
+The remaining four FD columns are unvalidated. See the
+[partial NTSS1D table](fixed_projection_ntss1d_partial_ad_fd16_2026-11-25.md).
+
+The received archive shows exact equality of the failed and successful
+builds' 25 geometry, 19 scan-channel and 147 native-surface numeric fields.
+Successful generic and NTSS1D captures also have identical coefficient tables.
+The failure is inside the preparation/solve/normalization interval, before
+any interpolation query, transport step or FD perturbation. Actual prepared
+NTX arrays and raw coefficients were not retained. The
+[partial NTSS1D report](fixed_projection_ntss1d_partial_ad_fd16_2026-11-25.md)
+records those comparisons and their limits.
+
+NumPy-only generic support-chain checks independently locate the larger
+geometry-gradient discrepancy upstream of the fixed-support transport
+adjoint: its bootstrap contractions along the saved FD support direction
+agree with FD to `1.455171e-8` (RBC) and `3.970949e-10` (ZBS), while the
+production parameter gradients differ by `4.647559e-3` and `5.635140e-4`.
+See the [saved chain report](fixed_projection_generic_ad_fd16_2026-11-25.md#saved-support-chain-localization).
+
+### Current saved-input NTX replay
+
+The existing point replay now accepts a failed profile worker and an
+original-entry geometry capture. It validates all saved numeric scan inputs,
+transport geometry, all five recorded package versions and each source hash
+present in the supplied metadata before launching GPU workers. Current loaded
+NTX/SOLVAX source hashes are saved separately; the archive's geometry metadata
+does not contain historical NTX/SOLVAX source hashes, so it cannot certify those.
+
+The command below prepares one native surface in two independent workers and
+runs its actual production 176-entry scan twice in each worker. The second
+worker retains its fresh preparation for comparison, then also uses the first
+worker's exact prepared arrays as a diagnostic control. This is not a cache
+or a replacement baseline in the AD/FD benchmark. All preparation/scan compiler
+programs are observed after normal compilation, with unchanged inputs, options,
+and JIT nesting. No equilibrium, implicit geometry, root or transport solve runs.
+
+Publish the diagnostic and reports from the **local WSL checkout**, not the
+large machine. The scoped commit excludes unrelated staged files:
+
+```bash
+(
+  cd /mnt/d/Github_Codes/NEOPAX-v0_main || exit 1
+  git switch en/v0_main || exit 1
+  neopax_files=(
+    examples/benchmarks/check_saved_ntx_point_repeatability.py
+    tests/test_saved_ntx_point_repeatability.py
+    docs/benchmarks/ntss1d_transport_ad_fd.md
+    docs/benchmarks/fixed_projection_generic_ad_fd16_2026-11-25.md
+    docs/benchmarks/fixed_projection_generic_ad_fd16_2026-11-25.csv
+    docs/benchmarks/fixed_projection_ntss1d_partial_ad_fd16_2026-11-25.md
+    docs/benchmarks/fixed_projection_ntss1d_partial_ad_fd16_2026-11-25.csv
+    docs/benchmarks/fixed_projection_support_chain_2026-11-25.csv
+  )
+  git add -- "${neopax_files[@]}" || exit 1
+  git commit --only -m "Capture remaining NTX baseline drift and localize geometry gradients" \
+    -- "${neopax_files[@]}" || exit 1
+  git push origin en/v0_main
+) || printf '\nPublish stopped; terminal kept open.\n'
+```
+
+Then run the saved-input capture on the **large machine**:
+
+```bash
+(
+  cd "$HOME/NEOPAX" || exit 1
+  git switch en/v0_main || exit 1
+  git pull --ff-only origin en/v0_main || exit 1
+  neopax_case=outputs/fixed_projection_ad_fd16_gu6ZO2
+  neopax_out=$(mktemp -d outputs/fixed_projection_ntx_row_XXXXXX) || exit 1
+  set -o pipefail
+  env -u PYTHONPATH -u LD_LIBRARY_PATH -u JAX_PLATFORM_NAME \
+    -u XLA_FLAGS -u JAX_COMPILATION_CACHE_DIR -u XLA_PYTHON_CLIENT_ALLOCATOR \
+    JAX_PLATFORMS=cuda,cpu JAX_ENABLE_X64=true \
+    JAX_ENABLE_COMPILATION_CACHE=0 XLA_PYTHON_CLIENT_PREALLOCATE=false \
+    NTX_DISABLE_COMPILATION_CACHE=1 \
+    "$HOME/jax_env/bin/python" \
+    examples/benchmarks/check_saved_ntx_point_repeatability.py \
+    --fd-run "$neopax_case/ntss1d" --fd-parameter density_shape_alpha \
+    --input-reference "$neopax_case/geometry/fd/snapshots" \
+    --input-pattern 'geometry_build_*.npz' \
+    --ad-dir "$neopax_case/ntss1d/ad/snapshots" \
+    --source-metadata "$neopax_case/geometry/fd/metadata.json" \
+    --point 4:0:0 --scan-layout production --scan-kernel production \
+    --repeats 2 --capture-compiler-ir --out-dir "$neopax_out" \
+    2>&1 | tee "$neopax_out/comparison.log" || exit 1
+  tar -czf outputs/fixed_projection_ntx_row.tar.gz -C "$neopax_out" . || exit 1
+  printf 'Saved: %s\n' "$neopax_out"
+) || printf '\nNTX row check stopped; terminal kept open.\n'
+```
+
+The selected point is the largest saved D13 discrepancy, radius 4 / frequency
+index 0 / field index 0. Fresh prepared differences locate an earlier boundary;
+identical prepared inputs with different scan outputs locate a later one. If
+neither difference reproduces, this diagnostic has not explained the archived
+failure. It must not be presented as a full AD/FD validation or as a fix.

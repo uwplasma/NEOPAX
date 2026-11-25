@@ -67,8 +67,9 @@ def changes(a, b):
 
 def preflight(args):
     config = tomllib.loads((args.fd_run/'config.toml').read_text())
-    fd = read_one(args.fd_run/'fd_ZBS_1_0/snapshots', 'fd_reference_support_*.npz')
-    reference = read_one(args.input_reference, 'normalization_inputs_*.npz')
+    parameter = getattr(args, 'fd_parameter', 'ZBS:1:0').replace(':', '_')
+    fd = read_one(args.fd_run/f'fd_{parameter}/snapshots', 'fd_reference_support_*.npz')
+    reference = read_one(args.input_reference, getattr(args, 'input_pattern', 'normalization_inputs_*.npz'))
     ad = read_one(args.ad_dir, 'ad_terminal_*.npz')
     expected, actual = scan_inputs(reference), scan_inputs(fd)
     if not actual or changes({key: expected[key] for key in actual if key in expected}, actual):
@@ -77,14 +78,24 @@ def preflight(args):
     if not geometry or changes(geometry, {key:fd[key] for key in geometry if key in fd}):
         raise ValueError('Saved AD/FD transport geometries differ')
     metadata = json.loads(args.source_metadata.read_text())
-    for name, expected_version in metadata['versions'].items():
+    versions = dict(metadata['versions'])
+    forward_metadata = args.fd_run/'ad/forward/metadata.json'
+    if forward_metadata.is_file():
+        for name, version in json.loads(forward_metadata.read_text())['versions'].items():
+            if name in versions and versions[name] != version:
+                raise ValueError(f'Conflicting saved package versions: {name}')
+            versions[name] = version
+    for name, expected_version in versions.items():
         if expected_version is not None and importlib.metadata.version(name) != expected_version:
             raise ValueError(f'Package version changed since the recorded audit: {name}')
     for name, item in metadata['sources'].items():
-        if name.startswith(('ntx.', 'solvax.', 'NEOPAX.')):
+        if isinstance(item, str):  # Original-entry geometry captures use path -> hash.
+            path, digest = Path(name), item
+        else:
             path = Path(item['path'])
-            if not path.is_file() or hashlib.sha256(path.read_bytes()).hexdigest() != item['sha256']:
-                raise ValueError(f'Source changed since the recorded audit: {name}')
+            digest = item['sha256']
+        if not path.is_file() or hashlib.sha256(path.read_bytes()).hexdigest() != digest:
+            raise ValueError(f'Source changed since the recorded audit: {name}')
     r, n, e = args.point
     shape = fd["support['database'].D13"].shape
     if any(i < 0 or i >= size for i, size in zip(args.point, shape, strict=True)):
@@ -179,7 +190,42 @@ def capture_production_scans(directory, *, reference=None, point=(6,0,7)):
         print(f'[ntx-live] captured {len(records)} actual scan calls; no scan replay',flush=True)
 
 
+@contextmanager
+def capture_ntx_ir(directory, compiler):
+    """Observe actual preparation/scan compilations without another JIT or options."""
+    from unittest.mock import patch
+    directory.mkdir(parents=True, exist_ok=True)
+    original = compiler.compile_or_get_cached
+    programs = []
+
+    def observe(*args, **kwargs):
+        executable = original(*args, **kwargs)
+        computation = args[1] if len(args) > 1 else kwargs['computation']
+        stable = str(computation)
+        prefix = f'program_{len(programs):04d}'
+        (directory/f'{prefix}.mlir').write_text(stable)
+        (directory/f'{prefix}.txt').write_text('\n\n'.join(m.to_string() for m in executable.hlo_modules()))
+        programs.append(dict(prefix=prefix, name=str(computation.operation.attributes['sym_name']),
+                             sha256=hashlib.sha256(stable.encode()).hexdigest()))
+        return executable
+
+    try:
+        with patch.object(compiler, 'compile_or_get_cached', observe):
+            yield
+    finally:
+        (directory/'programs.json').write_text(json.dumps(programs, indent=2))
+
+
 def worker(args, data):
+    if getattr(args, 'capture_compiler_ir', False):
+        from jax._src import compiler
+        with capture_ntx_ir(args.out_dir/'compiler', compiler):
+            _worker(args, data)
+    else:
+        _worker(args, data)
+
+
+def _worker(args, data):
     config, fd, reference, ad, inputs = data
     # GPU work exists only behind the explicit worker boundary.
     import jax
@@ -192,6 +238,11 @@ def worker(args, data):
     from ntx._solver_scan import _scan_coefficients_sequential_impl
     from ntx._solver_scan import _scan_coefficients_serial
     from NEOPAX._transport_flux_models import _build_ntx_field_channels
+    sources = {name: dict(path=module.__file__, sha256=hashlib.sha256(Path(module.__file__).read_bytes()).hexdigest())
+        for name, module in tuple(sys.modules.items())
+        if name.startswith(('ntx.', 'solvax.')) and getattr(module, '__file__', None)
+        and Path(module.__file__).suffix == '.py'}
+    (args.out_dir/'loaded_sources.json').write_text(json.dumps(sources, indent=2))
     geometry_module = importlib.import_module('ntx._geometry')
     geometry_path = Path(geometry_module.__file__)
     provenance = (f"geometry_source={geometry_path} sha256={hashlib.sha256(geometry_path.read_bytes()).hexdigest()} "
@@ -300,7 +351,11 @@ def worker(args, data):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--fd-run', type=Path, required=True)
+    parser.add_argument('--fd-parameter', default='ZBS:1:0',
+        help='Select the saved fd_PARAMETER baseline, including a failed coefficient build')
     parser.add_argument('--input-reference', type=Path, required=True)
+    parser.add_argument('--input-pattern', default='normalization_inputs_*.npz',
+        help='Snapshot pattern in --input-reference; geometry_build_*.npz also contains native scan inputs')
     parser.add_argument('--ad-dir', type=Path, required=True)
     parser.add_argument('--source-metadata', type=Path, required=True)
     parser.add_argument('--out-dir', type=Path, required=True)
@@ -314,6 +369,8 @@ def main():
         help='Compile the diagnostic wrapper or call the unmodified production JIT entry directly')
     parser.add_argument('--prepare-only',action='store_true',
         help='Compare fresh preparation in point/production contexts; stop before coefficient solves')
+    parser.add_argument('--capture-compiler-ir', action='store_true',
+        help='Save actual preparation and scan executables without changing JIT nesting or compiler options')
     parser.add_argument('--deterministic-control', action='store_true',
         help='Also test a kernel-local deterministic compilation; changes no production or environment options')
     parser.add_argument('--worker', choices=('native_1','native_2','controlled_1','controlled_2',
@@ -340,9 +397,12 @@ def main():
         return
     assert 'jax' not in sys.modules
     common = [sys.executable, str(Path(__file__).resolve()), '--fd-run', str(args.fd_run.resolve()),
+        '--fd-parameter', args.fd_parameter, '--input-pattern', args.input_pattern,
         '--input-reference', str(args.input_reference.resolve()), '--ad-dir', str(args.ad_dir.resolve()),
         '--source-metadata', str(args.source_metadata.resolve()), '--point', ':'.join(map(str,args.point)),
         '--repeats',str(args.repeats),'--scan-kernel',args.scan_kernel]
+    if args.capture_compiler_ir:
+        common += ['--capture-compiler-ir']
     if args.live_scan is not None:
         common += ['--live-scan',str(args.live_scan.resolve())]
     modes = (['point_1','point_2','production_1','production_2'] if args.prepare_only else

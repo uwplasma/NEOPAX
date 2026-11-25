@@ -84,7 +84,8 @@ class PointReplayTests(unittest.TestCase):
                     def wait(self): return 0
                 argv=['replay','--fd-run',str(root),'--input-reference',str(root),
                     '--ad-dir',str(root),'--source-metadata',str(root/'metadata.json'),
-                    '--out-dir',str(out),'--prepare-only']
+                    '--out-dir',str(out),'--prepare-only','--fd-parameter','density_shape_alpha',
+                    '--input-pattern','geometry_build_*.npz','--capture-compiler-ir']
                 with patch.object(replay,'preflight',return_value=None),patch.object(replay.subprocess,'Popen',Process), \
                      patch.object(sys,'argv',argv),redirect_stdout(io.StringIO()):
                     if drift:
@@ -97,6 +98,9 @@ class PointReplayTests(unittest.TestCase):
                     self.assertIn('--prepare-only',command)
                     self.assertNotIn('--frozen-prepared',command)
                     self.assertEqual(command[command.index('--scan-layout')+1],layout)
+                    self.assertEqual(command[command.index('--fd-parameter')+1],'density_shape_alpha')
+                    self.assertEqual(command[command.index('--input-pattern')+1],'geometry_build_*.npz')
+                    self.assertIn('--capture-compiler-ir',command)
                 self.assertTrue((out/'preparation_comparison.csv').is_file())
         self.assertNotIn('jax',sys.modules)
 
@@ -261,6 +265,53 @@ class PointReplayTests(unittest.TestCase):
             args.point = (1,0,0)
             with self.assertRaisesRegex(ValueError,'outside the saved table'):
                 replay.preflight(args)
+            args.point = (0,0,0)
+            # The current failed profile build and original-entry geometry
+            # capture have different folder/pattern and source metadata forms.
+            (root/'fd_density_shape_alpha/snapshots').mkdir(parents=True)
+            path.rename(root/'fd_density_shape_alpha/snapshots'/path.name)
+            (root/'normalization_inputs_1.npz').rename(root/'geometry_build_1.npz')
+            args.fd_parameter = 'density_shape_alpha'
+            args.input_pattern = 'geometry_build_*.npz'
+            args.source_metadata.write_text(json.dumps({'versions':{'jax':'0.10.0'},
+                'sources':{str(source):hashlib.sha256(source.read_bytes()).hexdigest()}}))
+            (root/'ad/forward').mkdir(parents=True)
+            (root/'ad/forward/metadata.json').write_text(json.dumps({'versions':{
+                'jax':'0.10.0','ntx':'0.3.0','solvax':'0.36.2'}}))
+            with patch.object(replay.importlib.metadata,'version',side_effect=lambda name:{
+                    'jax':'0.10.0','ntx':'0.3.0','solvax':'0.36.2'}[name]) as version:
+                self.assertEqual(len(replay.preflight(args)[-1]),2)
+                self.assertEqual({call.args[0] for call in version.call_args_list},{'jax','ntx','solvax'})
+                source.write_text('changed\n')
+                with self.assertRaisesRegex(ValueError,'Source changed'):
+                    replay.preflight(args)
+            with patch.object(replay.importlib.metadata,'version',return_value='0.7.2'):
+                with self.assertRaisesRegex(ValueError,'Package version changed'):
+                    replay.preflight(args)
+            (root/'ad/forward/metadata.json').write_text(json.dumps({'versions':{'jax':'0.7.2'}}))
+            with self.assertRaisesRegex(ValueError,'Conflicting saved package versions'):
+                replay.preflight(args)
+        self.assertNotIn('jax',sys.modules)
+
+    def test_compiler_capture_keeps_arguments_options_result_and_restores_on_failure(self):
+        computation = SimpleNamespace(operation=SimpleNamespace(attributes={'sym_name':'jit__scan_coefficients_serial'}))
+        executable = SimpleNamespace(hlo_modules=lambda:[SimpleNamespace(to_string=lambda:'actual executable')])
+        compile_call = unittest.mock.Mock(return_value=executable)
+        compiler = SimpleNamespace(compile_or_get_cached=compile_call)
+        backend, options = object(), object()
+        with tempfile.TemporaryDirectory() as directory:
+            out = Path(directory)/'compiler'
+            with self.assertRaisesRegex(RuntimeError,'original worker failure'):
+                with replay.capture_ntx_ir(out,compiler):
+                    actual = compiler.compile_or_get_cached(backend,computation,compile_options=options)
+                    self.assertIs(actual,executable)
+                    compile_call.assert_called_once_with(backend,computation,compile_options=options)
+                    raise RuntimeError('original worker failure')
+            self.assertIs(compiler.compile_or_get_cached,compile_call)
+            programs = json.loads((out/'programs.json').read_text())
+            self.assertEqual(programs[0]['name'],'jit__scan_coefficients_serial')
+            self.assertEqual((out/'program_0000.txt').read_text(),'actual executable')
+            self.assertEqual((out/'program_0000.mlir').read_text(),str(computation))
         self.assertNotIn('jax',sys.modules)
 
     def test_table_projection_uses_the_production_factors_and_d11_floor(self):
