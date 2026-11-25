@@ -654,3 +654,33 @@ of repeated trace boundaries. The existing trace-routing tests also run
 without JAX; their mock FD arguments now include the current saved-geometry
 and scan-audit options. No production calculation or baseline guard changes.
 Remote reproduction and compiler analysis remain outstanding.
+
+The uploaded `saved_geometry_build_audit.tar.gz` from
+`outputs/saved_geometry_build_YD2V2G` did not reproduce the archived AD
+geometry. Both captured paths agree byte-for-byte at all shared numerical
+boundaries and match the archived FD geometry. Their six state arrays have
+identical GPU placement, weak types and layouts. All thirteen captured
+einsum/Boozer StableHLO programs match; after omitting diagnostic metadata,
+the only optimized-instruction differences are transpose unroll factors.
+Thus this control identifies no changing arithmetic operation and is not
+validation of a correction. Its exit status 1 is the reproduction guard.
+
+Restoring the saved callback output also omitted the original equilibrium
+solve's compilation/execution history. `--fresh-equilibrium` now keeps that
+configured AD solve completely untouched, including its callback, refinement
+and device selection. FD retains the recorded linearization as in the failed
+benchmark. Both paths still stop before NTX, roots and transport. The new
+metadata also checks whether the first primal's actual geometry-input state
+matches the later recorded derivative state used by FD. That equality is an
+investigation result, not an assumption: reproducing the two archived geometry
+outputs is the condition for attributing their difference. A mock
+regression verifies that the fresh option leaves the original solve and
+callback objects in place, while the saved option prevents an equilibrium
+solve. This option changes only the diagnostic, not production methods.
+
+```bash
+python examples/benchmarks/check_saved_geometry_build.py \
+  --fresh-equilibrium \
+  --run-dir outputs/fixed_stage_sums_ad_fd16_KEiUFg/black_box \
+  --out-dir outputs/fixed_stage_sums_geometry_original_history
+```

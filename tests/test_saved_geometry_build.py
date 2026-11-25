@@ -10,10 +10,23 @@ import unittest
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]/'examples/benchmarks'))
-from check_saved_geometry_build import aligned_trace, capture_geometry_ir, saved_equilibrium
+from check_saved_geometry_build import aligned_trace, capture_geometry_ir, equilibrium_context, saved_equilibrium
 
 
 class SavedGeometryBuildTests(unittest.TestCase):
+    def test_original_history_control_does_not_replace_the_configured_equilibrium_solve(self):
+        solve, callback, restore = (lambda: 'solve'), (lambda: 'callback'), (lambda: 'recorded')
+        implicit = SimpleNamespace(_host_solve=solve, _host_solve_and_mask_impl=callback)
+        with equilibrium_context(implicit, restore, fresh=True):
+            self.assertIs(implicit._host_solve, solve)
+            self.assertIs(implicit._host_solve_and_mask_impl, callback)
+        with equilibrium_context(implicit, restore, fresh=False):
+            self.assertIs(implicit._host_solve_and_mask_impl, restore)
+            with self.assertRaisesRegex(AssertionError, 'disabled'):
+                implicit._host_solve()
+        self.assertIs(implicit._host_solve, solve)
+        self.assertIs(implicit._host_solve_and_mask_impl, callback)
+
     def test_callback_restores_exact_arrays_and_rejects_changed_parameters(self):
         @dataclasses.dataclass
         class Params:

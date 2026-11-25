@@ -3,6 +3,8 @@
 The opaque VMEX callback returns the recorded state/mask, retaining its normal
 placement and caller. Stop before NTX coefficients, roots and transport. Exact
 agreement with each archived geometry is required before interpreting the trace.
+--fresh-equilibrium retains the original AD equilibrium solve and its compilation
+history; the FD path still reads the archived linearization.
 """
 from __future__ import annotations
 
@@ -11,7 +13,6 @@ from contextlib import contextmanager
 import dataclasses
 import hashlib
 import json
-import os
 from pathlib import Path
 import re
 import runpy
@@ -40,6 +41,17 @@ def saved_equilibrium(capture, state_type):
         return state, mask
     restore.calls = 0
     return restore
+
+
+@contextmanager
+def equilibrium_context(implicit, restore, *, fresh):
+    """Keep the ordinary solve untouched for the original-history control."""
+    if fresh:
+        yield
+    else:
+        with patch.object(implicit, '_host_solve_and_mask_impl', restore), \
+             patch.object(implicit, '_host_solve', side_effect=AssertionError('Equilibrium solves are disabled in this capture.')):
+            yield
 
 
 @contextmanager
@@ -124,10 +136,10 @@ def worker(args):
             jnp.asarray(nc['ntx_scan_er_tilde']), channels.as_mapping())
         return dict(zip(('Er', 'Es', 'Er_to_ertilde'), values, strict=True))
 
-    print('[geometry-build] original entrypoint; recorded equilibrium; no NTX/root/transport solve', flush=True)
+    fresh = args.fresh_equilibrium and args.worker == 'ad'
+    print(f"[geometry-build] original entrypoint; equilibrium={'original solve' if fresh else 'recorded'}; no NTX/root/transport solve", flush=True)
     restore = saved_equilibrium(capture, SpectralState)
-    with patch.object(implicit, '_host_solve_and_mask_impl', restore), \
-         patch.object(implicit, '_host_solve', side_effect=AssertionError('Equilibrium solves are disabled in this capture.')), \
+    with equilibrium_context(implicit, restore, fresh=fresh), \
          capture_geometry_ir(out/'compiler', compiler):
         trace = trace_inputs(config, geo, geo._import_booz_xform_jax_api(), original_entrypoint,
             fields, projection_module=jnp, trace_vmec_primal=True)
@@ -139,25 +151,34 @@ def worker(args):
               if not k.endswith('.__weak_type__')}
     changed = differences(geometry_arrays(expected), geometry_arrays(actual))
     placement = {}
+    state_changes = None
     for stage, value in trace.items():
         if stage.endswith('_geometry_equilibrium'):
+            actual_state = {k: v for k, v in numeric_leaves(value, 'state').items()
+                            if not k.endswith('.__weak_type__')}
+            state_changes = differences({k: v for k, v in capture.items() if k.startswith('state.')}, actual_state)
             for name, array in capture_tree(value).items():
                 placement[name] = {k: str(getattr(array, k, None))
                                    for k in ('committed', 'weak_type', 'sharding', 'format')}
     sources = {str(Path(module.__file__).resolve()): hashlib.sha256(Path(module.__file__).read_bytes()).hexdigest()
                for module in (geo, implicit, geo._import_booz_xform_jax_api())}
     metadata = dict(archived_geometry_matches=not changed, differences=changed,
+        recorded_derivative_state_matches=state_changes == [], state_differences=state_changes,
+        equilibrium_mode='original' if fresh else 'recorded',
         state_placement=placement, restored_callbacks=restore.calls,
         default_device=str(jax.config.jax_default_device), sources=sources,
         versions=dict(jax=jax.__version__), command=command)
     (out/'metadata.json').write_text(json.dumps(metadata, indent=2))
-    print(f'[geometry-build] {args.worker}: archived_geometry_matches={not changed} differences={changed}', flush=True)
+    print(f'[geometry-build] {args.worker}: archived_geometry_matches={not changed} '
+          f'recorded_derivative_state_matches={state_changes == []} differences={changed}', flush=True)
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--run-dir', type=Path, required=True, help='The generic AD16 comparison folder')
     parser.add_argument('--out-dir', type=Path, required=True)
+    parser.add_argument('--fresh-equilibrium', action='store_true',
+                        help='Run the original AD equilibrium solve to retain its compilation history; stop before NTX')
     parser.add_argument('--worker', choices=('ad', 'fd'), help=argparse.SUPPRESS)
     args = parser.parse_args()
     args.run_dir, args.out_dir = args.run_dir.resolve(), args.out_dir.resolve()
@@ -176,7 +197,8 @@ def main():
     env['NEOPAX_SOLVER_MEAN_REDUCTION'] = policy[1]
     for route in ('ad', 'fd'):
         launch([sys.executable, str(Path(__file__).resolve()), '--worker', route,
-                '--run-dir', str(args.run_dir.resolve()), '--out-dir', str((args.out_dir/route).resolve())],
+                '--run-dir', str(args.run_dir.resolve()), '--out-dir', str((args.out_dir/route).resolve()),
+                *(['--fresh-equilibrium'] if args.fresh_equilibrium else [])],
                args.out_dir/route, env)
     a, b = [aligned_trace(read_one(args.out_dir/route/'snapshots', 'geometry_build_*.npz'))
             for route in ('ad', 'fd')]
@@ -185,8 +207,8 @@ def main():
     (args.out_dir/'differences.json').write_text(json.dumps(changed, indent=2))
     stages = list(dict.fromkeys(k.split(':', 1)[0] for k in a))
     first = next((stage for stage in stages if any(r['field'].startswith(stage+':') for r in changed)), 'none')
-    matched = all(json.loads((args.out_dir/route/'metadata.json').read_text())['archived_geometry_matches']
-                  for route in ('ad', 'fd'))
+    records = [json.loads((args.out_dir/route/'metadata.json').read_text()) for route in ('ad', 'fd')]
+    matched = all(record['archived_geometry_matches'] for record in records)
     print(f'[geometry-build] archived_paths_reproduced={matched} first_changed_stage={first}', flush=True)
     if not matched:
         raise SystemExit('Archived geometry did not reproduce; do not attribute its drift to this trace.')
