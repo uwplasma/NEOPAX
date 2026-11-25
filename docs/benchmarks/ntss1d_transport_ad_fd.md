@@ -568,8 +568,89 @@ XLA_PYTHON_CLIENT_PREALLOCATE=false NEOPAX_TEST_RADAU_ENDPOINT_GPU=1 \
 python tests/test_radau_endpoint.py -v
 ```
 
-Local NumPy checks pass; CUDA checks and the full paired AD/FD run are pending.
+Commit `ff7cc30` passed all five endpoint checks on the remote CUDA machine
+with JAX 0.10.0 in 6.000 seconds. Exact endpoint bits agree across the tested
+JIT/layout/batched contexts; JVP, VJP and second derivatives pass as well.
+
+| Isolated compiled endpoint | Previous native reference | Fixed tree |
+| --- | --- | --- |
+| Median call time | `1.400935e-4 s` | `1.329005e-4 s` |
+| Temporary device buffers | `32` bytes | `36,160` bytes |
+| Generated code | `5,096` bytes | `11,752` bytes |
+
+These timings are comparable in scale; they do not establish a full-solver
+speedup or peak-memory change. The isolated temporary-buffer increase is
+`36,128` bytes (about 35 KiB). The reported compile times are not a fair
+cold-compile comparison: the fixed endpoint was already compiled by the
+preceding reproducibility test. Full paired AD/FD validation remains pending.
 Use a fresh output directory for the full benchmark because the numerical
 source fingerprint has changed. The fixed-mean benchmark control and exact
 baseline guards remain as before; this correction does not itself promote
 the experimental mean policy to a production default.
+
+### Full fixed-stage-sum run: six generic profile columns complete
+
+Run `outputs/fixed_stage_sums_ad_fd16_KEiUFg` completed generic AD16 and
+all six profile FD16 columns. Each independently computed baseline has
+exactly matching initial state, final state, final time, geometry and
+database arrays. All 78 gradient pairs are finite. Relative errors below
+are `abs(AD-FD)/abs(FD)`, calculated from the full-precision printed values.
+
+| Profile DOF | softmax Er | Bootstrap | Largest of 13 objective errors |
+| --- | ---: | ---: | ---: |
+| n0 | `5.108973e-9` | `1.995435e-8` | `3.135474e-7` |
+| T0 | `9.041301e-10` | `1.111838e-9` | `3.343179e-8` |
+| density_shape_power | `5.973674e-8` | `7.773003e-8` | `1.206375e-6` |
+| temperature_shape_power | `3.512750e-8` | `5.171317e-9` | `3.512750e-8` |
+| density_shape_alpha | `8.255685e-8` | `2.867540e-7` | `1.325398e-5` |
+| temperature_shape_alpha | `9.260181e-9` | `1.146692e-8` | `1.837706e-8` |
+
+The largest error is `Er_transition_right` versus `density_shape_alpha`.
+These results establish exact baseline agreement for these six columns;
+they do not establish zero gradient error or validate the geometry columns.
+
+RBC FD stopped at the geometry/database support guard before transport
+stepping or any parameter perturbation. Fresh `a_b` differs by
+`2.220446049250313e-16`, `R0` by `1.7763568394002505e-15`, and D13 by up to
+`4.790996367580513e-3`. Its saved `fd_geometry_linearization` and
+`fd_reference_support` captures must be compared against this same run's
+AD captures before attributing a cause. The log does not establish whether
+the equilibrium state, geometry evaluation context or compiled arithmetic
+first differs. ZBS and the NTSS1D comparison were not reached. This failure
+does not provide a new measurement of the Radau stage-sum correction.
+
+The uploaded `fixed_stage_sums_geometry_audit.tar.gz` confirms byte equality
+for all 23 saved VMEC state/parameter/mask arrays and the six RBC state-tangent
+arrays. A NumPy evaluation of the zero-step state expression changes no bits,
+including signed zeros. The state is also identical to the earlier successful
+`zbs_auto_geometry_WGuHfQ` input capture. All 147 stored native-surface fields
+in the new FD support match that older input capture; 15 of 19 normalization
+channel fields differ. The new AD transport geometry matches all 25 fields
+of the older capture, while the new FD geometry differs in 18. This narrows
+the remaining failure to transport-geometry evaluation and its normalization;
+the archive does not retain the intermediate Boozer projections or their
+compiled programs and therefore cannot identify the changing operation.
+
+`check_saved_geometry_build.py` observes the original AD and RBC-FD entrypoints
+through that boundary. The existing VMEX callback returns the saved state/mask
+and validates the complete parameter arrays, preserving its ordinary caller
+and placement. A separate guard disables equilibrium solves. Observation stops
+before NTX coefficients, roots, transport or derivatives. The trace retains
+volume inputs, VMEX fields, Fourier projection operands/results, Boozer
+inputs/outputs, state-placement descriptors and actual Boozer/einsum compiler
+output. It neither adds a JIT nor changes compilation options. Both geometry
+outputs must reproduce their respective archived targets exactly before the
+trace can localize that archived failure.
+
+```bash
+python examples/benchmarks/check_saved_geometry_build.py \
+  --run-dir outputs/fixed_stage_sums_ad_fd16_KEiUFg/black_box \
+  --out-dir outputs/fixed_stage_sums_geometry_build_capture
+```
+
+The three new NumPy/mock checks cover exact callback inputs (including signed
+zero), preservation of the original compiler call/executable and alignment
+of repeated trace boundaries. The existing trace-routing tests also run
+without JAX; their mock FD arguments now include the current saved-geometry
+and scan-audit options. No production calculation or baseline guard changes.
+Remote reproduction and compiler analysis remain outstanding.

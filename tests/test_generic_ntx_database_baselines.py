@@ -39,7 +39,8 @@ class GenericDatabaseBaselineTests(unittest.TestCase):
             config_path = folder/'config.toml'
             config_path.write_text('[general]\nmode="transport"\n')
             args = SimpleNamespace(config=config_path, parameter='ZBS:1:0', geometry_fd_lane='frozen_linearized',
-                initial_er_root_only_fd=False, geometry_input_only_dir=None, geometry_input_reference=None)
+                initial_er_root_only_fd=False, geometry_input_only_dir=None, geometry_input_reference=None,
+                ad_geometry_reference=None, geometry_fd_native_precision='float64', ntx_scan_audit_dir=None)
             state, geometry = np.ones(2), np.ones(1)
             geo = SimpleNamespace(build_ntx_runtime_scan_inputs_from_vmec_state=lambda *a, **kw: (geometry, ()))
             runtime = object()
@@ -52,7 +53,7 @@ class GenericDatabaseBaselineTests(unittest.TestCase):
             namespace = dict(args=args, Path=Path, config={'geometry':{'vmec_param_delta':.125}},
                 contextlib=contextlib, PARAMETER_ORDER=('n0',),
                 _baseline_profile_cfg=lambda config: {},
-                _frozen_linearized_vmec_geometry_bundle=Mock(return_value=object()),
+                _frozen_linearized_vmec_geometry_bundle=Mock(return_value={}),
                 _runtime_for_frozen_linearized_geometry_step=Mock(side_effect=build),
                 jnp=SimpleNamespace(asarray=np.asarray, float64=np.float64),
                 save_gradient_audit=save, build_runtime_context=Mock())
@@ -69,7 +70,7 @@ class GenericDatabaseBaselineTests(unittest.TestCase):
             save.assert_called_once()
             self.assertEqual((args.geometry_input_only_dir/'config.toml').read_text(), config_path.read_text())
             namespace['_frozen_linearized_vmec_geometry_bundle'].assert_called_with(
-                namespace['config'], 'ZBS:1:0', baseline_delta=.125)
+                namespace['config'], 'ZBS:1:0', baseline_delta=.125, ad_geometry_reference=None)
             self.assertEqual(namespace['_runtime_for_frozen_linearized_geometry_step'].call_count, 2)
 
     def test_terminal_capture_keeps_builders_unobserved_and_stops_only_after_scan(self):
