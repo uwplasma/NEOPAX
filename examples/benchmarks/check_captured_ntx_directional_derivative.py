@@ -213,6 +213,12 @@ def precision_sweep(args, *, terminal, tangents, directions, nc, context, state,
         values = tuple(jnp.asarray(getattr(surface,name),dtype=jnp.float64) for name in names)+(es[radius,e],)
         direction = tuple(jnp.asarray(directions[f"['surfaces'][{radius}].{name}"]) if name in SURFACE_FIELDS
                           else native_dots[radius][i] for i,name in enumerate(names))+(es_dot,)
+        if getattr(args,'prepared_field_reference',None) is not None:
+            from _ntx_prepared_field_check import check_prepared_fields
+            check_prepared_fields(args.out_dir/f'prepared_{radius}_{n}_{e}',args.prepared_field_reference,
+                template=template,names=names,grid=grid,values=values,direction=direction,nu=nu,h=h0,
+                raw_jvp=raw['raw_jvp'][:,radius,n,e],raw_baseline=raw['ordinary'][:,radius,n,e])
+            continue
         base = np.asarray(jax.block_until_ready(primal(values,nu)))
         anchor = raw['ordinary'][:,radius,n,e]
         require_precision_primal(args.out_dir,(radius,n,e),base,anchor,names+('epsi_hat',),values,direction,nu)
@@ -279,6 +285,9 @@ def precision_sweep(args, *, terminal, tangents, directions, nc, context, state,
                 capture_forward_stages(args.out_dir/f'forward_stages_{radius}_{n}_{e}_scale_{scale:g}',
                     template=template,names=names,grid=grid,values=values,minus=minus_values,plus=plus_values,
                     nu=nu,ordinary=(base,minus,plus),fd_step=h)
+    if getattr(args,'prepared_field_reference',None) is not None:
+        print(f'[ntx-prepared] saved comparisons for {len(args.points)} point(s); reused saved FD endpoints; no transport',flush=True)
+        return
     print(f'[ntx-precision] saved {len(rows)} rows; complete numerical-input FD, no transport or coefficient VJP; '
           f'endpoint_jvps={getattr(args,"precision_endpoint_jvps",False)}',flush=True)
 
@@ -563,6 +572,8 @@ def main():
         help='With --precision-from-table-audit, record baseline/endpoint JVPs, rounded-input JVP and their primal secant at the same FD step')
     parser.add_argument('--capture-forward-stages',action='store_true',
         help='With --precision-from-table-audit, observe the same forward solver geometry, head factorization and retained modes at the baseline and endpoints')
+    parser.add_argument('--prepared-field-reference',type=Path,
+        help='With --precision-from-table-audit, compare the saved prepared-field FD against the production pullback; reuse baseline/minus/plus stage snapshots without new FD endpoints')
     args = parser.parse_args()
     if any(not math.isfinite(scale) or scale <= 0 for scale in args.precision_step_scales):
         parser.error('--precision-step-scales must be finite and positive')
@@ -570,6 +581,10 @@ def main():
         parser.error('--precision-endpoint-jvps requires --precision-from-table-audit')
     if args.capture_forward_stages and args.precision_from_table_audit is None:
         parser.error('--capture-forward-stages requires --precision-from-table-audit')
+    if args.prepared_field_reference is not None and args.precision_from_table_audit is None:
+        parser.error('--prepared-field-reference requires --precision-from-table-audit')
+    if args.prepared_field_reference is not None and (args.capture_forward_stages or args.precision_endpoint_jvps):
+        parser.error('--prepared-field-reference reuses saved endpoints; choose it without endpoint capture flags')
     if args.jvp_vjp_only and (args.audit_table or args.precision_from_table_audit is not None):
         parser.error('--jvp-vjp-only requires selected-point mode without a precision sweep')
     if args.precision_from_table_audit is not None and args.audit_table:

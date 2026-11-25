@@ -673,3 +673,152 @@ Retrieve the archive from local WSL:
 scp exouser@149.165.170.203:/home/exouser/NEOPAX/outputs/ntx_forward_stages.tar.gz \
   /mnt/d/Github_Codes/
 ```
+
+## Forward-stage capture result
+
+`outputs/ntx_forward_stages_klS68a` at `526f8b7` completed successfully.
+All five observed raw coefficients match ordinary execution bit-for-bit at
+the baseline and both endpoints. The archive includes nine actual pre-LU
+matrices and the retained factors, sources, lower blocks, modes and fields.
+All four recorded NTX/SOLVAX source hashes match the patched local sources.
+The archive was analyzed with NumPy only, without a new factorization,
+equilibrium, NTX primal or transport calculation.
+
+The captured native numerical inputs are byte-identical to the previous
+endpoint-control run in every phase. Nevertheless the minus-endpoint D13
+coefficient differs between those two compilations by `5.521608e-09`; their
+baseline and plus coefficients agree. This is evidence of sensitivity across
+compilations with identical recorded numerical inputs, not a demonstration
+that one executable returns different results on repeated identical calls.
+
+The [postprocessing table](ntx_forward_stages_2026-11-25_postprocessing.csv)
+recomputes the unchanged NTX coefficient formula on the captured modes in
+host extended precision. At D13, its difference from the GPU coefficient is
+`4.031792e-17` at baseline, `9.021579e-17` at minus and `5.634802e-17` at plus.
+Thus coefficient averaging cannot explain the main FD discrepancy:
+
+| Raw coefficient | Forward JVP reference | Saved raw FD | FD minus JVP | Change from extended coefficient averaging |
+| --- | ---: | ---: | ---: | ---: |
+| D11 | `-6.747154e-06` | `-6.762969e-06` | `-1.581540e-08` | `1.006491e-14` |
+| D13 | `4.075900e-01` | `4.110026e-01` | `3.412649e-03` | `5.111164e-11` |
+| D33 | `4.428216e+05` | `4.424464e+05` | `-3.752254e+02` | `1.464786e-05` |
+
+The [actual head matrices](ntx_forward_stages_2026-11-25_head_checks.csv)
+have baseline condition numbers `1.705728e08`, `5.013085e08` and
+`1.314891e08` for modes 0, 1 and 2. Across all phases, backward errors for
+the reduced substitution equations are between `2.904348e-16` and
+`9.483563e-16`. A small backward error does not certify coefficient accuracy
+for these ill-conditioned matrices, nor does it test the eliminated tail.
+
+Error-functional analysis applies the **already-recorded pivoted LU factors**
+to transpose/error vectors, with wider host accumulation. It performs no new
+factorization and replaces no physical primal or configured solver. The
+estimated final head-substitution contribution to the D13 FD is
+`9.482471e-06`, much smaller than the observed `3.412649e-03` gap. This is
+an approximate error budget, not a rigorous error bound; the D13 adjoint
+relative residual in that analysis is about `1.6e-12`. The
+[FD budget table](ntx_forward_stages_2026-11-25_fd_budget.csv) retains the
+averaging, substitution and observed-matrix sensitivity results.
+
+The observed head-matrix/source/geometry secants, contracted with the saved
+head adjoint, predict a D13 derivative `4.109945e-01`, close to the observed
+FD `4.110026e-01` rather than the forward JVP `4.075900e-01`. Most of this
+point's discrepancy therefore appears before the final substitution and
+coefficient averaging, in the represented fields/eliminated matrices/sources.
+The data do not yet identify which of field preparation, operator formation
+and Schur elimination is responsible. No solver correction is claimed.
+
+## Saved prepared-field comparison
+
+The optional `--prepared-field-reference` diagnostic reuses those exact
+baseline/minus/plus snapshots. It computes one baseline production NTX
+multi-RHS pullback and a geometry-preparation JVP, then contracts the same
+geometry bars with both the true preparation direction and the **saved**
+prepared-field FD secant. Three unit raw-coefficient RHS rows cover D11,
+D13 and D33. No new FD endpoints or perturbation sizes are introduced.
+
+Input bytes, exact captured coefficient-baseline equality with the completed
+audit, step, collisionality, observed/ordinary coefficient equality and
+recorded solver source hashes are checked. This saved-data diagnostic uses
+its captured baseline rather than another standalone forward replay; the
+existing fresh-primal checks in all other modes are unchanged. Captured geometry arrays and
+derivative matrices enter the production pullback as **dynamic** values.
+Its implicit-primal coefficient offsets and any preparation-JVP primal byte
+mismatches are reported; agreement is not assumed merely because the API is
+shared. The prepared-field contraction can distinguish field-preparation
+sensitivity from a discrepancy arising later in the raw solve, provided
+these primal and forward/reverse controls are consistent.
+
+Two analytic/mocked tests cover row contractions, an injected preparation
+error and rejection of mismatched inputs/steps. The existing twelve
+coefficient-diagnostic tests also pass. No production numerical method,
+acceptance criterion or tolerance is changed.
+
+Publish from local WSL:
+
+```bash
+(
+  cd /mnt/d/Github_Codes/NEOPAX-v0_main || exit 1
+  git switch en/v0_main || exit 1
+  neopax_files=(
+    examples/benchmarks/check_captured_ntx_directional_derivative.py
+    examples/benchmarks/_ntx_prepared_field_check.py
+    tests/test_ntx_prepared_field_check.py
+    docs/benchmarks/current_ntx_derivative_diagnosis_2026-11-25.md
+    docs/benchmarks/ntx_forward_stages_2026-11-25_postprocessing.csv
+    docs/benchmarks/ntx_forward_stages_2026-11-25_head_checks.csv
+    docs/benchmarks/ntx_forward_stages_2026-11-25_fd_budget.csv
+  )
+  git add -- "${neopax_files[@]}" || exit 1
+  git commit --only -m "Localize NTX prepared-field sensitivity using saved endpoints" \
+    -- "${neopax_files[@]}" || exit 1
+  git push origin en/v0_main
+) || printf '\nPublish stopped; terminal kept open.\n'
+```
+
+On the large machine, reuse the saved RBC point's fields and endpoints:
+
+```bash
+(
+  cd "$HOME/NEOPAX" || exit 1
+  git switch en/v0_main || exit 1
+  git pull --ff-only origin en/v0_main || exit 1
+  set -o pipefail
+  neopax_out=$(mktemp -d outputs/ntx_prepared_field_check_XXXXXX) || exit 1
+  printf 'Results: %s\n' "$neopax_out"
+
+  if env -u PYTHONPATH -u LD_LIBRARY_PATH -u JAX_PLATFORM_NAME \
+    -u XLA_FLAGS -u JAX_COMPILATION_CACHE_DIR -u XLA_PYTHON_CLIENT_ALLOCATOR \
+    -u NEOPAX_GRADIENT_AUDIT_DIR -u NEOPAX_ORIGINAL_FORWARD_DIR \
+    -u NEOPAX_ORIGINAL_FORWARD_STOP \
+    OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 \
+    JAX_PLATFORMS=cuda,cpu JAX_ENABLE_X64=true JAX_ENABLE_COMPILATION_CACHE=0 \
+    XLA_PYTHON_CLIENT_PREALLOCATE=false NTX_DISABLE_COMPILATION_CACHE=1 \
+    VMEX_COMPILATION_CACHE=disabled \
+    "$HOME/jax_env/bin/python" \
+    examples/benchmarks/check_captured_ntx_directional_derivative.py \
+    --run-dir outputs/fixed_projection_ad_fd16_gu6ZO2/black_box \
+    --parameter RBC:1:0 --points 3:1:6 \
+    --precision-from-table-audit outputs/ntx_full_table_jvp_ThvCQo/RBC_1_0 \
+    --prepared-field-reference outputs/ntx_forward_stages_klS68a/data/forward_stages_3_1_6_scale_1 \
+    --out-dir "$neopax_out/data" \
+    2>&1 | tee "$neopax_out/run.log"
+  then
+    neopax_status=0
+  else
+    neopax_status=$?
+  fi
+
+  tar -czf outputs/ntx_prepared_field_check.tar.gz -C "$neopax_out" . || exit 1
+  printf 'Diagnostic exit status: %s\nArchive: %s\n' \
+    "$neopax_status" "$HOME/NEOPAX/outputs/ntx_prepared_field_check.tar.gz"
+  exit "$neopax_status"
+) || printf '\nDiagnostic stopped; saved archive retained; terminal kept open.\n'
+```
+
+Retrieve from local WSL:
+
+```bash
+scp exouser@149.165.170.203:/home/exouser/NEOPAX/outputs/ntx_prepared_field_check.tar.gz \
+  /mnt/d/Github_Codes/
+```
