@@ -24,6 +24,32 @@ JAX_AFTER_IMPORT = 'jax' in sys.modules
 
 
 class CapturedNTXPreparationTests(unittest.TestCase):
+    def test_endpoint_controls_distinguish_curvature_rounded_inputs_and_primal_cancellation(self):
+        def cubic(x,d):
+            return np.asarray([x[0]**3]),np.asarray([3*x[0]**2*d[0]])
+        values,direction,h = (np.asarray(2.),),(np.asarray(1.),),.1
+        curve = check.precision_curve_controls(cubic,values,direction,(values[0]-h,),(values[0]+h,),h)
+        np.testing.assert_allclose(curve['center_jvp'],[12.],rtol=1e-14)
+        np.testing.assert_allclose(curve['jvp_primal_fd'],[12.01],rtol=1e-14)
+        np.testing.assert_allclose(curve['simpson_jvp'],curve['jvp_primal_fd'],rtol=1e-14)
+        # A sub-ULP input displacement: the rounded secant direction vanishes.
+        large = (np.asarray(1e16),)
+        rounded = check.precision_curve_controls(lambda x,d:(np.asarray(x),np.asarray(d)),
+            large,direction,(large[0]-h,),(large[0]+h,),h)
+        np.testing.assert_array_equal(rounded['center_jvp'],[1.])
+        np.testing.assert_array_equal(rounded['rounded_input_jvp'],[0.])
+        np.testing.assert_array_equal(rounded['jvp_primal_fd'],[0.])
+        # The input displacement survives, but adding it to a large output loses it.
+        cancelled = check.precision_curve_controls(lambda x,d:(np.asarray([1e16+x[0]]),np.asarray(d)),
+            (np.asarray(0.),),direction,(-h,),(h,),h)
+        np.testing.assert_array_equal(cancelled['rounded_input_jvp'],[1.])
+        np.testing.assert_array_equal(cancelled['simpson_jvp'],[1.])
+        np.testing.assert_array_equal(cancelled['jvp_primal_fd'],[0.])
+        with self.assertRaisesRegex(FloatingPointError,'Nonfinite'):
+            check.precision_curve_controls(lambda x,d:(np.asarray([np.nan]),np.asarray(d)),
+                values,direction,(values[0]-h,),(values[0]+h,),h)
+        self.assertEqual(JAX_ALREADY_LOADED,'jax' in sys.modules)
+
     def test_captured_objective_bars_include_raw_normalization_and_d11_floor(self):
         before = {f'labels[{i}]':np.asarray(name) for i,name in enumerate(('Er','bootstrap'))}
         weights = ((2.,3.,-4.),(-1.,5.,6.))
@@ -94,8 +120,16 @@ class CapturedNTXPreparationTests(unittest.TestCase):
         geometry = SimpleNamespace(_traceable_vmec_surfaces_from_state=lambda *a,**kw:(surface,),
             _positive_transport_s_values_from_rho=lambda x:x)
         field_channels = lambda *a:(np.zeros((1,1)),np.asarray([[3.]]),np.zeros((1,1)))
-        fake_jax = SimpleNamespace(numpy=np,jit=lambda f:f,block_until_ready=lambda x:x,
-            jvp=lambda f,p,t:(f(*p),native_dots))
+        def analytic_jvp(f,p,t):
+            if isinstance(p[0],State):
+                return f(*p),native_dots
+            numbers,dots = p[0],t[0]
+            b,i,es,r = numbers[0],numbers[names.index('iota')],numbers[-2],numbers[-1]
+            bd,idot,ed,rd = dots[0],dots[names.index('iota')],dots[-2],dots[-1]
+            c11,c13 = b*b+i,b*es+i*i
+            cd11,cd13,cd33 = 2*b*bd+idot,bd*es+b*ed+2*i*idot,2*i*idot+ed
+            return f(*p),np.asarray([(cd11/c11+2*rd/r)/np.log(10.),cd13*r+c13*rd,.7*cd33])
+        fake_jax = SimpleNamespace(numpy=np,jit=lambda f:f,block_until_ready=lambda x:x,jvp=analytic_jvp)
         coefficient_calls = []
         def coefficients(s,case):
             coefficient_calls.append((s,case))
@@ -139,6 +173,23 @@ class CapturedNTXPreparationTests(unittest.TestCase):
             self.assertEqual(original_step,[r for r in rows if float(r['fd_scale']) == 1.])
             self.assertEqual(len(coefficient_calls),3)  # baseline and the original two endpoints only.
             self.assertEqual({float(r['fd_step']) for r in original_step},{1e-6})
+            coefficient_calls.clear()
+            args.precision_endpoint_jvps = True
+            check.precision_sweep(args,terminal={},tangents={'parameter_labels[0]':np.asarray('ZBS:1:0'),
+                'state_tangents.x':np.asarray([.1])},directions=directions,
+                nc={'ntx_scan_rho':[.5],'ntx_scan_nu_v':[.7],'ntx_scan_er_tilde':[3.]},context=None,state=state,
+                channels={'b00':np.asarray([1.]),'dr_tildeds':np.asarray([1.]),'drds':np.asarray([2.])},
+                surfaces=(surface,),grid=None,h0=1e-6)
+            with (Path(directory)/'precision.csv').open() as stream:
+                controlled = list(csv.DictReader(stream))
+            self.assertEqual(len(coefficient_calls),7)
+            self.assertEqual(len(controlled),3)
+            np.testing.assert_allclose([float(r['curve_center_jvp']) for r in controlled],expected,rtol=1e-14)
+            with np.load(Path(directory)/'curve_0_0_0_scale_1.npz',allow_pickle=False) as z:
+                self.assertEqual(float(z['fd_step']),1e-6)
+                self.assertEqual(float(z['plus.b_cos']),2.+1e-6*.2)
+                self.assertEqual(float(z['minus.b_cos']),2.-1e-6*.2)
+                np.testing.assert_allclose(z['simpson_jvp'],z['jvp_primal_fd'],rtol=1e-8)
 
     def test_snapshot_layouts_and_both_live_table_modes(self):
         with tempfile.TemporaryDirectory() as directory:

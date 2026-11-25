@@ -371,3 +371,119 @@ Then run only the six point/direction combinations on the large machine:
   printf 'Saved: %s\n' "$neopax_out"
 ) || printf '\nOriginal-step coefficient check stopped; terminal kept open.\n'
 ```
+
+## Direct numerical-input FD result at the original perturbation
+
+`outputs/ntx_original_step_nodes_smlYWZ` completed all six point/direction
+combinations at `94008df`. The supplied archive was inspected with NumPy
+only. Both FD steps equal their original saved values exactly; all 18 raw
+baseline coefficient checks are bit-identical to the complete table audit.
+
+The [18-row comparison](ntx_original_step_nodes_2026-11-25.csv) retains the
+raw and normalized derivatives, the original geometry-FD direction and the
+new affine numerical-input FD. The latter perturbs every numerical surface
+input plus the electric-field and radial-normalization channels directly.
+Geometry conversion, root selection and transport replay are outside this
+coefficient calculation.
+
+| Direction | Field / `(radius,nu,Er)` | Saved JVP | Direct numerical-input FD | Relative difference from JVP |
+| --- | --- | ---: | ---: | ---: |
+| RBC | D11_log / `(3,1,6)` | `-1.123294e+00` | `-1.127111e+00` | `3.397588e-03` |
+| RBC | D11_log / `(5,1,6)` | `5.804422e-02` | `5.679761e-02` | `2.147676e-02` |
+| RBC | D13 / `(6,1,7)` | `1.478986e+02` | `1.433183e+02` | `3.096931e-02` |
+| ZBS | D11_log / `(3,1,6)` | `1.454973e+00` | `1.456197e+00` | `8.413315e-04` |
+| ZBS | D11_log / `(5,1,6)` | `1.523587e+00` | `1.444534e+00` | `5.188624e-02` |
+| ZBS | D13 / `(5,1,6)` | `-5.611849e-01` | `-4.482131e-01` | `2.013093e-01` |
+| ZBS | D13 / `(6,1,7)` | `1.273567e+02` | `1.213744e+02` | `4.697278e-02` |
+
+The raw D13 derivatives also disagree, before radial normalization: their
+relative differences at `(6,1,7)` are `3.095690e-02` (RBC) and `4.695239e-02`
+(ZBS). Normalization alone therefore cannot explain the discrepancy.
+D11 at this node is floor-active at both endpoints; its zero normalized
+derivative is a consequence of that floor, not an accuracy certificate.
+No floor-mask change was observed at the selected points.
+
+This result reproduces a coefficient-level FD/JVP discrepancy without the
+original geometry-to-native conversion or a transport trajectory. It does
+not establish which of finite-step curvature, rounded input displacement,
+operator/solve arithmetic, or the derivative implementation explains it.
+No numerical-method change follows from this test.
+
+## Fixed-step endpoint-derivative control
+
+The optional `--precision-endpoint-jvps` diagnostic keeps the original
+coefficient solver and perturbation. At each existing point it records:
+
+- JVPs at the center and the same two endpoints, along the same direction.
+- A center JVP along the actual rounded input secant `(x_plus-x_minus)/(2h)`.
+- A secant from the primal outputs of that JVP executable, compared with the
+  separately compiled ordinary forward outputs already evaluated.
+- The Simpson average `(JVP_minus+4*JVP_center+JVP_plus)/6`, as a smooth-curve
+  diagnostic. This is not a rigorous quadrature-error bound.
+
+These controls test different explanations at a single unchanged step. An
+endpoint derivative variation can indicate curvature; a rounded-direction
+response can indicate input-displacement sensitivity; a different primal
+secant from the JVP executable can expose compilation-context sensitivity.
+Agreement of those derivatives alongside a discrepant FD would support
+numerical error in coefficient evaluation, while an inconsistent center JVP
+would require examining the AD implementation. The values and numerical
+inputs are saved in `curve_*.npz`; no full table or transport solve is run.
+
+Eleven local NumPy/mocked API tests pass. They include a cubic with a known
+finite-step curvature contribution, a sub-ULP input displacement and primal
+output cancellation, plus the complete capture path on an analytic model.
+No local JAX import or physical solve was used. The actual CUDA endpoint
+derivative results remain pending.
+
+Publish from local WSL:
+
+```bash
+(
+  cd /mnt/d/Github_Codes/NEOPAX-v0_main || exit 1
+  git switch en/v0_main || exit 1
+  neopax_files=(
+    examples/benchmarks/check_captured_ntx_directional_derivative.py
+    tests/test_captured_ntx_directional_derivative.py
+    docs/benchmarks/current_ntx_derivative_diagnosis_2026-11-25.md
+    docs/benchmarks/ntx_original_step_nodes_2026-11-25.csv
+  )
+  git add -- "${neopax_files[@]}" || exit 1
+  git commit --only -m "Audit NTX endpoint derivatives at the unchanged FD step" \
+    -- "${neopax_files[@]}" || exit 1
+  git push origin en/v0_main
+) || printf '\nPublish stopped; terminal kept open.\n'
+```
+
+Then run the endpoint controls on the large machine:
+
+```bash
+(
+  cd "$HOME/NEOPAX" || exit 1
+  git switch en/v0_main || exit 1
+  git pull --ff-only origin en/v0_main || exit 1
+  set -o pipefail
+  neopax_out=$(mktemp -d outputs/ntx_endpoint_jvps_XXXXXX) || exit 1
+  for neopax_parameter in RBC:1:0 ZBS:1:0; do
+    neopax_safe=${neopax_parameter//:/_}
+    env -u PYTHONPATH -u LD_LIBRARY_PATH -u JAX_PLATFORM_NAME \
+      -u XLA_FLAGS -u JAX_COMPILATION_CACHE_DIR -u XLA_PYTHON_CLIENT_ALLOCATOR \
+      -u NEOPAX_GRADIENT_AUDIT_DIR -u NEOPAX_ORIGINAL_FORWARD_DIR \
+      -u NEOPAX_ORIGINAL_FORWARD_STOP \
+      JAX_PLATFORMS=cuda,cpu JAX_ENABLE_X64=true JAX_ENABLE_COMPILATION_CACHE=0 \
+      XLA_PYTHON_CLIENT_PREALLOCATE=false NTX_DISABLE_COMPILATION_CACHE=1 \
+      VMEX_COMPILATION_CACHE=disabled \
+      "$HOME/jax_env/bin/python" \
+      examples/benchmarks/check_captured_ntx_directional_derivative.py \
+      --run-dir outputs/fixed_projection_ad_fd16_gu6ZO2/black_box \
+      --parameter "$neopax_parameter" \
+      --points 3:1:6,5:1:6,6:1:7 \
+      --precision-from-table-audit "outputs/ntx_full_table_jvp_ThvCQo/$neopax_safe" \
+      --precision-step-scales 1 --precision-endpoint-jvps \
+      --out-dir "$neopax_out/$neopax_safe" \
+      2>&1 | tee "$neopax_out/$neopax_safe.log" || exit 1
+  done
+  tar -czf outputs/ntx_endpoint_jvps.tar.gz -C "$neopax_out" . || exit 1
+  printf 'Saved: %s\n' "$neopax_out"
+) || printf '\nEndpoint derivative check stopped; terminal kept open.\n'
+```

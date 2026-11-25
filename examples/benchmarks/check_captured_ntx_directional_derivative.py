@@ -136,6 +136,26 @@ def precision_reference(directory, terminal, parameter, points):
     return raw,database
 
 
+def precision_curve_controls(evaluate, values, direction, minus, plus, h):
+    """Compare one fixed-step secant with endpoint and rounded-input JVPs.
+
+    ``evaluate`` returns (primal, JVP). Simpson's average is a smooth-curve
+    diagnostic, not a bound on the finite-difference error.
+    """
+    rounded = tuple((np.asarray(b)-np.asarray(a))/(2*h) for a,b in zip(minus,plus,strict=True))
+    center,center_dot = map(np.asarray,evaluate(values,direction))
+    left,left_dot = map(np.asarray,evaluate(minus,direction))
+    right,right_dot = map(np.asarray,evaluate(plus,direction))
+    _,rounded_dot = map(np.asarray,evaluate(values,rounded))
+    result = dict(center_primal=center,minus_primal=left,plus_primal=right,
+        center_jvp=center_dot,minus_jvp=left_dot,plus_jvp=right_dot,
+        rounded_input_jvp=rounded_dot,jvp_primal_fd=(right-left)/(2*h),
+        simpson_jvp=(left_dot+4*center_dot+right_dot)/6)
+    if not all(np.isfinite(value).all() for value in result.values()):
+        raise FloatingPointError('Nonfinite fixed-step curve control')
+    return result
+
+
 def precision_sweep(args, *, terminal, tangents, directions, nc, context, state, channels, surfaces, grid, h0):
     """FD of complete numerical NTX inputs against the already-saved full JVP."""
     import jax
@@ -165,6 +185,9 @@ def precision_sweep(args, *, terminal, tangents, directions, nc, context, state,
     @jax.jit
     def normalized(value,drds,nu):
         return jnp.stack((jnp.log10(jnp.maximum(D11_POSITIVE_FLOOR,value[0]*drds**2)),value[2]*drds,value[3]*nu))
+    @jax.jit
+    def curve_forward(numbers,tangent,nu):
+        return jax.jvp(lambda x:normalized(primal(x[:-1],nu),x[-1],nu),(numbers,),(tangent,))
     _,es,_ = _build_ntx_field_channels(jnp.asarray(nc['ntx_scan_rho']),jnp.asarray(nc['ntx_scan_er_tilde']),channels)
     rows = []
     for radius,n,e in args.points:
@@ -184,14 +207,32 @@ def precision_sweep(args, *, terminal, tangents, directions, nc, context, state,
         drds_dot = directions["['channels'].drds"][radius]
         for scale in getattr(args,'precision_step_scales',(1.,3.,10.,30.)):
             h = h0*scale
-            minus = jax.block_until_ready(primal(tuple(x-h*d for x,d in zip(values,direction,strict=True)),nu))
-            plus = jax.block_until_ready(primal(tuple(x+h*d for x,d in zip(values,direction,strict=True)),nu))
-            norm_minus = np.asarray(jax.block_until_ready(normalized(minus,drds-h*drds_dot,nu)))
-            norm_plus = np.asarray(jax.block_until_ready(normalized(plus,drds+h*drds_dot,nu)))
+            minus_values = tuple(x-h*d for x,d in zip(values,direction,strict=True))
+            minus = jax.block_until_ready(primal(minus_values,nu))
+            plus_values = tuple(x+h*d for x,d in zip(values,direction,strict=True))
+            plus = jax.block_until_ready(primal(plus_values,nu))
+            minus_drds = drds-h*drds_dot
+            norm_minus = np.asarray(jax.block_until_ready(normalized(minus,minus_drds,nu)))
+            plus_drds = drds+h*drds_dot
+            norm_plus = np.asarray(jax.block_until_ready(normalized(plus,plus_drds,nu)))
             raw_fd = (np.asarray(plus)-np.asarray(minus))/(2*h)
             norm_fd = (norm_plus-norm_minus)/(2*h)
             if not all(np.isfinite(value).all() for value in (minus,plus,raw_fd,norm_fd)):
                 raise FloatingPointError(f'Nonfinite precision endpoint at {(radius,n,e)}, scale={scale}')
+            controls = {}
+            if getattr(args,'precision_endpoint_jvps',False):
+                def evaluate(x,d):
+                    return jax.block_until_ready(curve_forward(tuple(map(jnp.asarray,x)),tuple(map(jnp.asarray,d)),nu))
+                controls = precision_curve_controls(evaluate,values+(drds,),direction+(drds_dot,),
+                    minus_values+(minus_drds,),plus_values+(plus_drds,),h)
+                inputs = {f'{prefix}.{name}':np.asarray(value)
+                    for prefix,data in (('center',values+(drds,)),('direction',direction+(drds_dot,)),
+                                        ('minus',minus_values+(minus_drds,)),('plus',plus_values+(plus_drds,)))
+                    for name,value in zip(names+('epsi_hat','drds'),data,strict=True)}
+                np.savez_compressed(args.out_dir/f'curve_{radius}_{n}_{e}_scale_{scale:g}.npz',
+                    **inputs,**controls,nu=np.asarray(nu),fd_step=h,
+                    raw_ordinary_primal=np.asarray(base)[[0,2,3]],raw_ordinary_minus=np.asarray(minus)[[0,2,3]],
+                    raw_ordinary_plus=np.asarray(plus)[[0,2,3]],normalized_fd=norm_fd)
             errors = []
             for k,((_,index),field) in enumerate(zip(COEFFICIENTS,TABLE_FIELDS,strict=True)):
                 derivative = float(reference['database_dot.'+field][radius,n,e])
@@ -205,11 +246,23 @@ def precision_sweep(args, *, terminal, tangents, directions, nc, context, state,
                     normalized_minus=float(norm_minus[k]),normalized_plus=float(norm_plus[k]),
                     d11_floor_minus=bool(float(minus[0])*(float(drds)-h*float(drds_dot))**2 <= D11_POSITIVE_FLOOR),
                     d11_floor_plus=bool(float(plus[0])*(float(drds)+h*float(drds_dot))**2 <= D11_POSITIVE_FLOOR)))
+                rows[-1].update({'curve_'+name:float(value[k]) for name,value in controls.items()})
+                if controls:
+                    denominator = max(abs(derivative),np.finfo(float).tiny)
+                    variation = max(abs(controls['minus_jvp'][k]-controls['center_jvp'][k]),
+                                    abs(controls['plus_jvp'][k]-controls['center_jvp'][k]))/denominator
+                    print(f'[ntx-curve] point={radius}:{n}:{e} scale={scale:g} field={field} '
+                          f'center_jvp={controls["center_jvp"][k]:.12e} '
+                          f'endpoint_jvp_variation={variation:.6e} '
+                          f'rounded_input_jvp={controls["rounded_input_jvp"][k]:.12e} '
+                          f'jvp_primal_fd={controls["jvp_primal_fd"][k]:.12e} '
+                          f'simpson_jvp={controls["simpson_jvp"][k]:.12e}',flush=True)
                 errors.append(f'{field}={relative:.6e}' if relative is not None else f'{field}_absolute={absolute:.6e}')
             print(f'[ntx-precision] point={radius}:{n}:{e} scale={scale:g} '+ ' '.join(errors),flush=True)
             with (args.out_dir/'precision.csv').open('w',newline='') as stream:
                 writer = csv.DictWriter(stream,fieldnames=list(rows[0]));writer.writeheader();writer.writerows(rows)
-    print(f'[ntx-precision] saved {len(rows)} rows; complete numerical-input FD, no transport or coefficient VJP/JVP rerun',flush=True)
+    print(f'[ntx-precision] saved {len(rows)} rows; complete numerical-input FD, no transport or coefficient VJP; '
+          f'endpoint_jvps={getattr(args,"precision_endpoint_jvps",False)}',flush=True)
 
 
 def fd_reference(args):
@@ -488,9 +541,13 @@ def main():
         help='At --points, reuse a completed weighted audit JVP and test numerical-input FD at 1,3,10,30 times the saved step')
     parser.add_argument('--precision-step-scales',type=float,nargs='+',default=(1.,3.,10.,30.),
         help='With --precision-from-table-audit, select positive FD step multipliers; use 1 for the original saved perturbation only')
+    parser.add_argument('--precision-endpoint-jvps',action='store_true',
+        help='With --precision-from-table-audit, record baseline/endpoint JVPs, rounded-input JVP and their primal secant at the same FD step')
     args = parser.parse_args()
     if any(not math.isfinite(scale) or scale <= 0 for scale in args.precision_step_scales):
         parser.error('--precision-step-scales must be finite and positive')
+    if args.precision_endpoint_jvps and args.precision_from_table_audit is None:
+        parser.error('--precision-endpoint-jvps requires --precision-from-table-audit')
     if args.jvp_vjp_only and (args.audit_table or args.precision_from_table_audit is not None):
         parser.error('--jvp-vjp-only requires selected-point mode without a precision sweep')
     if args.precision_from_table_audit is not None and args.audit_table:
