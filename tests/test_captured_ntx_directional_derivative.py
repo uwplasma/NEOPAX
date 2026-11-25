@@ -96,7 +96,9 @@ class CapturedNTXPreparationTests(unittest.TestCase):
         field_channels = lambda *a:(np.zeros((1,1)),np.asarray([[3.]]),np.zeros((1,1)))
         fake_jax = SimpleNamespace(numpy=np,jit=lambda f:f,block_until_ready=lambda x:x,
             jvp=lambda f,p,t:(f(*p),native_dots))
+        coefficient_calls = []
         def coefficients(s,case):
+            coefficient_calls.append((s,case))
             b,i,es = s.b_cos,s.iota,case.epsi_hat
             return np.asarray([b*b+i,0.,b*es+i*i,i*i+es,0.])
         fake_ntx = SimpleNamespace(prepare_monoenergetic_system=lambda s,g:s,
@@ -125,6 +127,18 @@ class CapturedNTXPreparationTests(unittest.TestCase):
             self.assertEqual(len(rows),12)
             self.assertEqual({float(r['fd_scale']) for r in rows},{1.,3.,10.,30.})
             self.assertLess(max(float(r['normalized_relative_difference']) for r in rows),1e-7)
+            coefficient_calls.clear()
+            args.precision_step_scales = (1.,)
+            check.precision_sweep(args,terminal={},tangents={'parameter_labels[0]':np.asarray('ZBS:1:0'),
+                'state_tangents.x':np.asarray([.1])},directions=directions,
+                nc={'ntx_scan_rho':[.5],'ntx_scan_nu_v':[.7],'ntx_scan_er_tilde':[3.]},context=None,state=state,
+                channels={'b00':np.asarray([1.]),'dr_tildeds':np.asarray([1.]),'drds':np.asarray([2.])},
+                surfaces=(surface,),grid=None,h0=1e-6)
+            with (Path(directory)/'precision.csv').open() as stream:
+                original_step = list(csv.DictReader(stream))
+            self.assertEqual(original_step,[r for r in rows if float(r['fd_scale']) == 1.])
+            self.assertEqual(len(coefficient_calls),3)  # baseline and the original two endpoints only.
+            self.assertEqual({float(r['fd_step']) for r in original_step},{1e-6})
 
     def test_snapshot_layouts_and_both_live_table_modes(self):
         with tempfile.TemporaryDirectory() as directory:

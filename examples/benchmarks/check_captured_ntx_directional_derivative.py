@@ -182,7 +182,7 @@ def precision_sweep(args, *, terminal, tangents, directions, nc, context, state,
             raise ValueError(f'Precision primal differs from completed audit at {(radius,n,e)}')
         drds = channels['drds'][radius]
         drds_dot = directions["['channels'].drds"][radius]
-        for scale in (1.,3.,10.,30.):
+        for scale in getattr(args,'precision_step_scales',(1.,3.,10.,30.)):
             h = h0*scale
             minus = jax.block_until_ready(primal(tuple(x-h*d for x,d in zip(values,direction,strict=True)),nu))
             plus = jax.block_until_ready(primal(tuple(x+h*d for x,d in zip(values,direction,strict=True)),nu))
@@ -486,7 +486,11 @@ def main():
         help='At --points, compare forward/reverse derivatives for all captured objective RHS rows without FD perturbations')
     parser.add_argument('--precision-from-table-audit',type=Path,
         help='At --points, reuse a completed weighted audit JVP and test numerical-input FD at 1,3,10,30 times the saved step')
+    parser.add_argument('--precision-step-scales',type=float,nargs='+',default=(1.,3.,10.,30.),
+        help='With --precision-from-table-audit, select positive FD step multipliers; use 1 for the original saved perturbation only')
     args = parser.parse_args()
+    if any(not math.isfinite(scale) or scale <= 0 for scale in args.precision_step_scales):
+        parser.error('--precision-step-scales must be finite and positive')
     if args.jvp_vjp_only and (args.audit_table or args.precision_from_table_audit is not None):
         parser.error('--jvp-vjp-only requires selected-point mode without a precision sweep')
     if args.precision_from_table_audit is not None and args.audit_table:
