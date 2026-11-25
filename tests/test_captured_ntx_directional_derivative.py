@@ -24,6 +24,26 @@ JAX_AFTER_IMPORT = 'jax' in sys.modules
 
 
 class CapturedNTXPreparationTests(unittest.TestCase):
+    def test_primal_guard_keeps_its_tolerance_and_saves_failed_inputs(self):
+        actual = np.asarray([1.,0.,2.,3.,0.])
+        expected = actual[[0,2,3]].copy()
+        values,direction = (np.asarray([4.,5.]),np.asarray(.2)),(np.asarray([.1,.2]),np.asarray(.3))
+        with tempfile.TemporaryDirectory() as directory, redirect_stdout(io.StringIO()):
+            root=Path(directory)
+            check.require_precision_primal(root,(5,1,6),actual,expected,('b_cos','epsi_hat'),values,direction,1e-6)
+            self.assertEqual(list(root.iterdir()),[])
+            actual[2] += 1e-5
+            with self.assertRaisesRegex(ValueError,'Precision primal differs.*saved'):
+                check.require_precision_primal(root,(5,1,6),actual,expected,('b_cos','epsi_hat'),values,direction,1e-6)
+            with np.load(root/'primal_mismatch_5_1_6.npz',allow_pickle=False) as z:
+                np.testing.assert_array_equal(z['actual'],actual)
+                np.testing.assert_array_equal(z['expected'],expected)
+                np.testing.assert_array_equal(z['center.b_cos'],values[0])
+                np.testing.assert_array_equal(z['direction.b_cos'],direction[0])
+                self.assertEqual(float(z['center.epsi_hat']),.2)
+                self.assertEqual(float(z['nu']),1e-6)
+        self.assertEqual(JAX_ALREADY_LOADED,'jax' in sys.modules)
+
     def test_endpoint_controls_distinguish_curvature_rounded_inputs_and_primal_cancellation(self):
         def cubic(x,d):
             return np.asarray([x[0]**3]),np.asarray([3*x[0]**2*d[0]])

@@ -156,6 +156,20 @@ def precision_curve_controls(evaluate, values, direction, minus, plus, h):
     return result
 
 
+def require_precision_primal(directory, point, actual, expected, names, values, direction, nu):
+    """Keep the baseline guard strict and retain its evidence on failure."""
+    if np.allclose(actual[[0,2,3]],expected,rtol=1e-8,atol=1e-12):
+        return
+    path = directory/('primal_mismatch_'+'_'.join(map(str,point))+'.npz')
+    inputs = {f'{prefix}.{name}':np.asarray(value)
+        for prefix,data in (('center',values),('direction',direction))
+        for name,value in zip(names,data,strict=True)}
+    np.savez_compressed(path,**inputs,actual=actual,expected=expected,nu=np.asarray(nu))
+    print(f'[ntx-precision] baseline mismatch point={point} actual={actual[[0,2,3]].tolist()} '
+          f'expected={expected.tolist()} saved={path}',flush=True)
+    raise ValueError(f'Precision primal differs from completed audit at {point}; saved {path}')
+
+
 def precision_sweep(args, *, terminal, tangents, directions, nc, context, state, channels, surfaces, grid, h0):
     """FD of complete numerical NTX inputs against the already-saved full JVP."""
     import jax
@@ -201,8 +215,7 @@ def precision_sweep(args, *, terminal, tangents, directions, nc, context, state,
                           else native_dots[radius][i] for i,name in enumerate(names))+(es_dot,)
         base = np.asarray(jax.block_until_ready(primal(values,nu)))
         anchor = raw['ordinary'][:,radius,n,e]
-        if not np.allclose(base[[0,2,3]],anchor,rtol=1e-8,atol=1e-12):
-            raise ValueError(f'Precision primal differs from completed audit at {(radius,n,e)}')
+        require_precision_primal(args.out_dir,(radius,n,e),base,anchor,names+('epsi_hat',),values,direction,nu)
         drds = channels['drds'][radius]
         drds_dot = directions["['channels'].drds"][radius]
         for scale in getattr(args,'precision_step_scales',(1.,3.,10.,30.)):
@@ -261,6 +274,11 @@ def precision_sweep(args, *, terminal, tangents, directions, nc, context, state,
             print(f'[ntx-precision] point={radius}:{n}:{e} scale={scale:g} '+ ' '.join(errors),flush=True)
             with (args.out_dir/'precision.csv').open('w',newline='') as stream:
                 writer = csv.DictWriter(stream,fieldnames=list(rows[0]));writer.writeheader();writer.writerows(rows)
+            if getattr(args,'capture_forward_stages',False):
+                from _ntx_forward_stages import capture_forward_stages
+                capture_forward_stages(args.out_dir/f'forward_stages_{radius}_{n}_{e}_scale_{scale:g}',
+                    template=template,names=names,grid=grid,values=values,minus=minus_values,plus=plus_values,
+                    nu=nu,ordinary=(base,minus,plus),fd_step=h)
     print(f'[ntx-precision] saved {len(rows)} rows; complete numerical-input FD, no transport or coefficient VJP; '
           f'endpoint_jvps={getattr(args,"precision_endpoint_jvps",False)}',flush=True)
 
@@ -543,11 +561,15 @@ def main():
         help='With --precision-from-table-audit, select positive FD step multipliers; use 1 for the original saved perturbation only')
     parser.add_argument('--precision-endpoint-jvps',action='store_true',
         help='With --precision-from-table-audit, record baseline/endpoint JVPs, rounded-input JVP and their primal secant at the same FD step')
+    parser.add_argument('--capture-forward-stages',action='store_true',
+        help='With --precision-from-table-audit, observe the same forward solver geometry, head factorization and retained modes at the baseline and endpoints')
     args = parser.parse_args()
     if any(not math.isfinite(scale) or scale <= 0 for scale in args.precision_step_scales):
         parser.error('--precision-step-scales must be finite and positive')
     if args.precision_endpoint_jvps and args.precision_from_table_audit is None:
         parser.error('--precision-endpoint-jvps requires --precision-from-table-audit')
+    if args.capture_forward_stages and args.precision_from_table_audit is None:
+        parser.error('--capture-forward-stages requires --precision-from-table-audit')
     if args.jvp_vjp_only and (args.audit_table or args.precision_from_table_audit is not None):
         parser.error('--jvp-vjp-only requires selected-point mode without a precision sweep')
     if args.precision_from_table_audit is not None and args.audit_table:

@@ -487,3 +487,189 @@ Then run the endpoint controls on the large machine:
   printf 'Saved: %s\n' "$neopax_out"
 ) || printf '\nEndpoint derivative check stopped; terminal kept open.\n'
 ```
+
+## Partial endpoint-control result and strict baseline stop
+
+At `d279e29`, the RBC worker completed `(3,1,6)` and then stopped because
+its ordinary raw baseline at `(5,1,6)` failed the existing `rtol=1e-8`,
+`atol=1e-12` reference check. ZBS was never started and no final archive
+was created by the shell loop. The completed point's CSV and `curve_*.npz`
+were saved before the exception. The old error did not report the failed
+coefficient values or preserve that failed point's numerical inputs.
+
+The [three printed rows](ntx_endpoint_jvps_partial_2026-11-25.csv) give these
+relative differences, all normalized by the magnitude of the center JVP:
+
+| Field at RBC `(3,1,6)` | Maximum sampled endpoint JVP variation | Rounded-input JVP minus center | Simpson JVP minus center | JVP-executable primal FD minus center |
+| --- | ---: | ---: | ---: | ---: |
+| D11_log | `4.290721e-05` | `4.401765e-06` | `7.809538e-07` | `8.768693e-03` |
+| D13 | `8.184102e-05` | `2.239268e-05` | `1.847505e-07` | `2.942359e-02` |
+| D33 | `3.099355e-05` | `5.331185e-07` | `4.983101e-07` | `4.697381e-04` |
+
+The center JVPs reproduce the full-table reference to printed precision.
+At D13, the endpoint derivatives and rounded-input response do not exhibit
+changes comparable with the FD discrepancy. This strongly supports numerical
+error in coefficient evaluation rather than an ordinary smooth-curvature
+explanation at this point. Simpson's three-sample average is not a rigorous
+error bound, and this result does not identify a particular operator-build,
+factorization, substitution or coefficient-reduction operation as the cause.
+It also does not validate the failed point or unrun ZBS controls.
+
+The separately compiled ordinary FD reports the same absolute relative
+discrepancy to the printed precision. The signed comparison and exact input
+bytes require the already-saved partial NPZ/CSV. No rerun is required to
+retrieve those files. From local WSL:
+
+```bash
+scp -r 'exouser@149.165.170.203:/home/exouser/NEOPAX/outputs/ntx_endpoint_jvps_*' \
+  /mnt/d/Github_Codes/
+```
+
+The diagnostic now preserves the actual/reference raw coefficients, numerical
+surface/electric-field values and direction, and collisionality in
+`primal_mismatch_*.npz` before raising the same baseline error. Its tolerance
+and stop behavior are unchanged. Twelve NumPy/mocked tests pass, including
+an explicit test that a mismatched baseline is saved and still rejected.
+This is a diagnostic capture correction, not a numerical-method correction;
+no new CUDA run has been performed for it.
+
+## Copied endpoint arrays and interpolation-path verification
+
+The copied partial directory is `ntx_endpoint_jvps_LnXAeu`. It contains only
+RBC `(3,1,6)`; no failed-point or ZBS arrays are present. NumPy-only checks
+against the saved full benchmark establish the following; the
+[array-derived CSV](ntx_endpoint_arrays_2026-11-25.csv) retains the numerical
+comparisons independently of the earlier rounded stdout values:
+
+- All 20 numerical baseline inputs match the original scan references
+  byte-for-byte, including the electric field, seven active native fields,
+  geometry metadata and radial normalization. The seven active surface
+  directions and the radial-normalization direction match their saved AD
+  directions byte-for-byte.
+- Ordinary and JVP-executable primal outputs match byte-for-byte at both
+  endpoints, for all three observed coefficients. Their FD derivatives
+  therefore agree exactly within this execution.
+- Extended-precision subtraction/division changes the D13 FD by only
+  `2.530781e-17` relative to the center JVP. Recomputing normalization and
+  differencing in extended precision changes it by `8.036726e-12`, versus
+  the actual discrepancy `2.942359e-02`.
+- The discrepancy is therefore present in the raw NTX coefficient values
+  before final normalization/differencing. This comparison does not identify
+  the geometry-preparation, elimination or coefficient-averaging operation
+  responsible for their numerical sensitivity.
+
+This is a **generic interpolation** reference: the checker uses
+`fixed_projection_ad_fd16_gu6ZO2/black_box`. The generic full comparison
+completed with bootstrap relative differences `4.647559e-03` (RBC) and
+`5.635140e-04` (ZBS); completion and exact unperturbed baselines did not
+mean that its geometry derivatives passed the desired accuracy target.
+
+A separate NumPy/source verification confirms that the two saved TOMLs
+differ only by `neoclassical.interpolation_mode`: absent/default `generic`
+versus `preprocessed_3d_radial_ntss1d`. Their saved successful `n0` baselines
+have 25 byte-identical geometry fields, 19 byte-identical database fields
+and 166 byte-identical scan-input fields. These are corresponding baselines,
+not a comparison of gradients belonging to different interpolators.
+
+`NTXRuntimeScanTransportModel._build_runtime_database_and_record` calls
+`ntx.build_ntx_neopax_scan_from_surfaces` before applying the interpolation
+choice in `_ntx_runtime_scan_to_neopax_monoenergetic`. The raw scan and the
+standalone coefficient test both reach
+`ntx._solver._solve_prepared_coefficient_vector_raw`, then the same SOLVAX
+selected-head solver. The four fixed-order Schur products therefore apply
+to both interpolation cases. Recorded source hashes for `ntx._solver`,
+`ntx._solver_scan`, `solvax.direct` and `solvax._reproducible` match the local
+patched sources. No unpatched alternate NTX route was found for NTSS1D.
+
+## Observation of the common forward stages
+
+The optional `--capture-forward-stages` mode observes one point's ordinary
+forward baseline and endpoints using the same NTX public forward solver.
+It records the actual pre-LU head matrices, retained LU/pivots/eliminated
+sources/lower blocks, retained modes and prepared geometry. It wraps the
+existing solver calls for observation and restores them afterwards; it adds
+no alternate solver, iteration, tolerance or physical approximation.
+
+The ordinary coefficient results are retained as controls. Returning extra
+data and adding callbacks can affect compilation layout, so observed versus
+ordinary coefficient equality is printed and saved, rather than assumed.
+Only the already-diagnosed point `(3,1,6)` is needed initially. These arrays
+will allow coefficient averaging to be recomputed independently and the
+actual head matrices/factors to be checked without an alternative solve.
+
+Fifteen local tests pass: twelve coefficient-diagnostic tests and three new
+NumPy/mocked observation tests covering exact captured arrays, restoration
+on exceptions, phase labels, and explicit retention of any observed primal
+drift. No local JAX import, GPU run or physical solve was performed.
+
+Publish these diagnostic/evidence files from local WSL:
+
+```bash
+(
+  cd /mnt/d/Github_Codes/NEOPAX-v0_main || exit 1
+  git switch en/v0_main || exit 1
+  neopax_files=(
+    examples/benchmarks/check_captured_ntx_directional_derivative.py
+    examples/benchmarks/_ntx_forward_stages.py
+    tests/test_captured_ntx_directional_derivative.py
+    tests/test_ntx_forward_stages.py
+    docs/benchmarks/current_ntx_derivative_diagnosis_2026-11-25.md
+    docs/benchmarks/ntx_endpoint_jvps_partial_2026-11-25.csv
+    docs/benchmarks/ntx_endpoint_arrays_2026-11-25.csv
+  )
+  git add -- "${neopax_files[@]}" || exit 1
+  git commit --only -m "Observe NTX forward stages at the unchanged FD step" \
+    -- "${neopax_files[@]}" || exit 1
+  git push origin en/v0_main
+) || printf '\nPublish stopped; terminal kept open.\n'
+```
+
+Run only RBC `(3,1,6)` on the large machine. This captures the original-step
+baseline and endpoints; it performs no equilibrium, root or transport solve.
+The archive is produced even if the diagnostic stops, to preserve its partial
+results and failure evidence:
+
+```bash
+(
+  cd "$HOME/NEOPAX" || exit 1
+  git switch en/v0_main || exit 1
+  git pull --ff-only origin en/v0_main || exit 1
+  set -o pipefail
+  neopax_out=$(mktemp -d outputs/ntx_forward_stages_XXXXXX) || exit 1
+  printf 'Results: %s\n' "$neopax_out"
+
+  if env -u PYTHONPATH -u LD_LIBRARY_PATH -u JAX_PLATFORM_NAME \
+    -u XLA_FLAGS -u JAX_COMPILATION_CACHE_DIR -u XLA_PYTHON_CLIENT_ALLOCATOR \
+    -u NEOPAX_GRADIENT_AUDIT_DIR -u NEOPAX_ORIGINAL_FORWARD_DIR \
+    -u NEOPAX_ORIGINAL_FORWARD_STOP \
+    OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 \
+    JAX_PLATFORMS=cuda,cpu JAX_ENABLE_X64=true JAX_ENABLE_COMPILATION_CACHE=0 \
+    XLA_PYTHON_CLIENT_PREALLOCATE=false NTX_DISABLE_COMPILATION_CACHE=1 \
+    VMEX_COMPILATION_CACHE=disabled \
+    "$HOME/jax_env/bin/python" \
+    examples/benchmarks/check_captured_ntx_directional_derivative.py \
+    --run-dir outputs/fixed_projection_ad_fd16_gu6ZO2/black_box \
+    --parameter RBC:1:0 --points 3:1:6 \
+    --precision-from-table-audit outputs/ntx_full_table_jvp_ThvCQo/RBC_1_0 \
+    --precision-step-scales 1 --capture-forward-stages \
+    --out-dir "$neopax_out/data" \
+    2>&1 | tee "$neopax_out/run.log"
+  then
+    neopax_status=0
+  else
+    neopax_status=$?
+  fi
+
+  tar -czf outputs/ntx_forward_stages.tar.gz -C "$neopax_out" . || exit 1
+  printf 'Diagnostic exit status: %s\nArchive: %s\n' \
+    "$neopax_status" "$HOME/NEOPAX/outputs/ntx_forward_stages.tar.gz"
+  exit "$neopax_status"
+) || printf '\nDiagnostic stopped; saved archive retained; terminal kept open.\n'
+```
+
+Retrieve the archive from local WSL:
+
+```bash
+scp exouser@149.165.170.203:/home/exouser/NEOPAX/outputs/ntx_forward_stages.tar.gz \
+  /mnt/d/Github_Codes/
+```
