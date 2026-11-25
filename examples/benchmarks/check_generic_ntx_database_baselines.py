@@ -236,6 +236,18 @@ def trace_inputs(config, geometry_module, booz_api, build_runtime, fields, froze
                 record(f"projection_{index:02d}_outputs", result)
                 return result
             stack.enter_context(patch.object(projection_module, "einsum", projection))
+            fixed_project = getattr(geometry_module, "_vmec_boozer_fourier_projection", None)
+            if fixed_project is not None:
+                def fixed_projection(values, basis):
+                    nonlocal projections
+                    if not observing:
+                        return fixed_project(values, basis)
+                    index, projections = projections, projections+1
+                    record(f"projection_{index:02d}_inputs", dict(values=values, basis=basis, options={}))
+                    result = fixed_project(values, basis)
+                    record(f"projection_{index:02d}_outputs", result)
+                    return result
+                stack.enter_context(patch.object(geometry_module, "_vmec_boozer_fourier_projection", fixed_projection))
         for target, name, function in (
             (geometry_module, "_solve_state_for_single_param", equilibrium),
             (geometry_module, "_build_neopax_geometry_from_state", geometry),

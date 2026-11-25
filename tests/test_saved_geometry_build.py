@@ -10,10 +10,20 @@ import unittest
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]/'examples/benchmarks'))
-from check_saved_geometry_build import aligned_trace, capture_geometry_ir, equilibrium_context, saved_equilibrium
+from check_saved_geometry_build import aligned_trace, capture_geometry_ir, current_trace_matches, equilibrium_context, saved_equilibrium
 
 
 class SavedGeometryBuildTests(unittest.TestCase):
+    def test_post_correction_guard_requires_complete_exact_current_inputs_and_the_recorded_state(self):
+        from check_saved_transport_baseline_repeatability import differences
+        a = {'geometry:0.R0': np.array(1.), 'geometry_equilibrium:0.R': np.array([2.])}
+        records = [dict(archived_geometry_matches=False, recorded_derivative_state_matches=True)]*2
+        self.assertTrue(current_trace_matches(a, a, [], records))
+        b = dict(a, **{'geometry:0.R0': np.nextafter(a['geometry:0.R0'], 2.)})
+        self.assertFalse(current_trace_matches(a, b, differences(a,b), records))
+        self.assertFalse(current_trace_matches(a, {'geometry:0.R0':a['geometry:0.R0']}, [], records))
+        self.assertFalse(current_trace_matches(a, a, [], [dict(recorded_derivative_state_matches=False)]))
+
     def test_original_history_control_does_not_replace_the_configured_equilibrium_solve(self):
         solve, callback, restore = (lambda: 'solve'), (lambda: 'callback'), (lambda: 'recorded')
         implicit = SimpleNamespace(_host_solve=solve, _host_solve_and_mask_impl=callback)

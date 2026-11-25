@@ -684,3 +684,68 @@ python examples/benchmarks/check_saved_geometry_build.py \
   --run-dir outputs/fixed_stage_sums_ad_fd16_KEiUFg/black_box \
   --out-dir outputs/fixed_stage_sums_geometry_original_history
 ```
+
+### Fourier contraction isolated by comparing the two uploaded captures
+
+In `saved_geometry_original_history_3vVKpe`, both the original AD equilibrium
+and FD's restored state match the recorded derivative state byte-for-byte.
+Both new paths produce the archived AD geometry, so this capture does not
+reproduce the archived FD geometry. Its exit status 1 is the archive guard,
+not a solve failure. The AD solve took `3:08.72`, with `3,363,488 KiB` maximum
+host RSS; the saved FD build took `0:27.51`, with `1,892,188 KiB` host RSS.
+
+Comparing the **FD path across the two captures** nevertheless reproduces
+both original geometry values and isolates the first changing operation:
+
+| Boundary | Earlier FD capture | New FD capture |
+| --- | --- | --- |
+| Equilibrium, VMEX fields, volume inputs | Exact common bytes | Exact common bytes |
+| First projection values `(200,18,16)` and basis `(18,16,128)` | Exact common bytes | Exact common bytes |
+| StableHLO for the projection | Same SHA256 | Same SHA256 |
+| Matrix products | Four identical cuBLAS partial products, algorithm 0 | Same |
+| Sum of four partial products | Triton reduction | Native GPU reduction |
+| Projection output | 2,999 differing entries | Maximum absolute gap `4.547473508864641e-13` |
+
+All 18 observed Fourier projections differ; their inputs match. The first
+Boozer input coefficient differences follow these contractions. The compiled
+Boozer-transform programs themselves match byte-for-byte between the two FD
+captures. Thus the changing arithmetic is in NEOPAX's
+`_neopax_vmex_boozer_table_inputs_from_state.project`, before the Boozer
+transform. This conclusion uses matching-input FD-to-FD captures and does not
+depend on claiming either individual AD/FD pair reproduced both archives.
+
+The focused production correction flattens the same angular contraction and
+uses `solvax._reproducible.schur_product`, already provided by the installed
+`en/neopax-reproducible-products` candidate. Its CUDA FP64 kernel owns the
+accumulation order. The projection remains
+`weights[m] * sum_tz(values[r,t,z] * basis[t,z,m])`; its basis, grid, weights,
+radial interpolation and ordinary bilinear derivatives are unchanged. No
+time integrator, root or equilibrium method, tolerance or acceptance rule is
+changed. CPU and non-FP64 products use SOLVAX's ordinary JAX product fallback.
+
+`tests/test_vmec_boozer_projection.py` checks the actual production helper
+and weighted even/odd caller through AST loading. Its NumPy check covers
+FP32/FP64 and noncontiguous logical grids. Three opt-in CUDA checks exercise
+bit equality across JIT/layout/batched contexts, value/JVP/VJP/second
+derivatives, and isolated timing/compiled buffers. Set
+`NEOPAX_VMEC_PROJECTION_CAPTURE` to either uploaded `geometry_build_*.npz`
+to use the real operands instead of synthetic arrays. No physical solve
+runs in these tests. GPU validation remains pending.
+
+```bash
+NEOPAX_TEST_VMEC_PROJECTION_GPU=1 JAX_PLATFORMS=cuda,cpu JAX_ENABLE_X64=true \
+python tests/test_vmec_boozer_projection.py -v
+
+python examples/benchmarks/check_saved_geometry_build.py \
+  --fresh-equilibrium --require-current-match \
+  --run-dir outputs/fixed_stage_sums_ad_fd16_KEiUFg/black_box \
+  --out-dir outputs/fixed_projection_geometry_check
+```
+
+The post-correction mode requires complete, exactly matching current AD/FD
+geometry, channels, native surfaces, projections and equilibrium states.
+Previous geometry rounding is retained as an archive reference rather than
+the success criterion for changed source. The full AD/FD benchmark's strict
+new-baseline guards remain untouched. Full comparisons still need fresh run
+directories for all eight DOFs and both interpolators after the short checks
+pass; neither archive analysis nor isolated GPU checks validate those gradients.

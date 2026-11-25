@@ -65,7 +65,7 @@ def capture_geometry_ir(directory, compiler):
         executable = original(*args, **kwargs)
         computation = args[1] if len(args) > 1 else kwargs['computation']
         name = str(computation.operation.attributes['sym_name'])
-        if any(word in name.lower() for word in ('booz', 'einsum')):
+        if any(word in name.lower() for word in ('booz', 'einsum', 'solvax_fixed_order')):
             prefix = f'program_{len(programs):03d}'
             stable = str(computation)
             (directory/f'{prefix}.mlir').write_text(stable)
@@ -98,6 +98,15 @@ def aligned_trace(arrays):
 def geometry_arrays(arrays):
     return {k[len("support['geometry']."):]: v for k, v in arrays.items()
             if k.startswith("support['geometry'].")}
+
+
+def current_trace_matches(a, b, changed, records):
+    prefixes = ('geometry_equilibrium:', 'geometry:', 'channels:', 'surfaces:',
+                'electric_fields:', 'projection_', 'boozer_')
+    required_a = {k for k in a if k.startswith(prefixes)}
+    required_b = {k for k in b if k.startswith(prefixes)}
+    return (bool(required_a) and required_a == required_b and not changed
+            and all(record['recorded_derivative_state_matches'] for record in records))
 
 
 def worker(args):
@@ -169,8 +178,13 @@ def worker(args):
         default_device=str(jax.config.jax_default_device), sources=sources,
         versions=dict(jax=jax.__version__), command=command)
     (out/'metadata.json').write_text(json.dumps(metadata, indent=2))
-    print(f'[geometry-build] {args.worker}: archived_geometry_matches={not changed} '
-          f'recorded_derivative_state_matches={state_changes == []} differences={changed}', flush=True)
+    if args.require_current_match:
+        reference_gap = max((r.get('max_abs', float('inf')) for r in changed), default=0.)
+        print(f'[geometry-build] {args.worker}: recorded_derivative_state_matches={state_changes == []} '
+              f'previous_geometry_reference_max_abs={reference_gap:.6e}', flush=True)
+    else:
+        print(f'[geometry-build] {args.worker}: archived_geometry_matches={not changed} '
+              f'recorded_derivative_state_matches={state_changes == []} differences={changed}', flush=True)
 
 
 def main():
@@ -179,6 +193,8 @@ def main():
     parser.add_argument('--out-dir', type=Path, required=True)
     parser.add_argument('--fresh-equilibrium', action='store_true',
                         help='Run the original AD equilibrium solve to retain its compilation history; stop before NTX')
+    parser.add_argument('--require-current-match', action='store_true',
+                        help='After a source correction, require exact current AD/FD inputs and states; report archived geometry as a reference')
     parser.add_argument('--worker', choices=('ad', 'fd'), help=argparse.SUPPRESS)
     args = parser.parse_args()
     args.run_dir, args.out_dir = args.run_dir.resolve(), args.out_dir.resolve()
@@ -198,7 +214,8 @@ def main():
     for route in ('ad', 'fd'):
         launch([sys.executable, str(Path(__file__).resolve()), '--worker', route,
                 '--run-dir', str(args.run_dir.resolve()), '--out-dir', str((args.out_dir/route).resolve()),
-                *(['--fresh-equilibrium'] if args.fresh_equilibrium else [])],
+                *(['--fresh-equilibrium'] if args.fresh_equilibrium else []),
+                *(['--require-current-match'] if args.require_current_match else [])],
                args.out_dir/route, env)
     a, b = [aligned_trace(read_one(args.out_dir/route/'snapshots', 'geometry_build_*.npz'))
             for route in ('ad', 'fd')]
@@ -209,8 +226,14 @@ def main():
     first = next((stage for stage in stages if any(r['field'].startswith(stage+':') for r in changed)), 'none')
     records = [json.loads((args.out_dir/route/'metadata.json').read_text()) for route in ('ad', 'fd')]
     matched = all(record['archived_geometry_matches'] for record in records)
-    print(f'[geometry-build] archived_paths_reproduced={matched} first_changed_stage={first}', flush=True)
-    if not matched:
+    current_matches = current_trace_matches(a, b, changed, records)
+    if args.require_current_match:
+        print(f'[geometry-build] current_paths_match={current_matches} first_changed_stage={first}', flush=True)
+    else:
+        print(f'[geometry-build] archived_paths_reproduced={matched} first_changed_stage={first}', flush=True)
+    if args.require_current_match and not current_matches:
+        raise SystemExit('Current AD/FD geometry inputs or states differ; correction is not validated.')
+    if not args.require_current_match and not matched:
         raise SystemExit('Archived geometry did not reproduce; do not attribute its drift to this trace.')
 
 

@@ -327,6 +327,13 @@ def _neopax_vmex_booz_xform_inputs_from_state(*, state, static) -> SimpleNamespa
     )
 
 
+def _vmec_boozer_fourier_projection(values, basis):
+    """Keep the Fourier contraction's FP64 CUDA accumulation order fixed."""
+    from solvax._reproducible import schur_product
+
+    return schur_product(values.reshape(values.shape[0], -1), basis.reshape(-1, basis.shape[-1]))
+
+
 def _neopax_vmex_boozer_table_inputs_from_state(*, state, static, surface_indices=None) -> SimpleNamespace:
     """Batched current-VMEX version of ``vmex.core.boozer_tables.boozer_input_tables``."""
     rt = static.runtime
@@ -414,7 +421,7 @@ def _neopax_vmex_boozer_table_inputs_from_state(*, state, static, surface_indice
 
     def project(values, parity):
         basis = cos_t if parity == "even" else sin_t
-        return weights_j[None, :] * jnp.einsum("rtz,tzm->rm", values, basis)
+        return weights_j[None, :] * _vmec_boozer_fourier_projection(values, basis)
 
     pressure = jnp.asarray(fields.pressure)
     bsq2 = 2.0 * (jnp.asarray(fields.total_pressure)[rows] - pressure[rows, None, None])

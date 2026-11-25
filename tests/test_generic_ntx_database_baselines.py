@@ -238,6 +238,30 @@ class GenericDatabaseBaselineTests(unittest.TestCase):
         np.testing.assert_array_equal(captured['04_projection_00_outputs'], [[4.]])
         self.assertIs(numerical.einsum, np.einsum)
 
+    def test_fixed_projection_observer_calls_the_fixed_kernel_and_retains_its_output(self):
+        values, basis, result = np.ones((1,2,2)), np.ones((2,2,1)), np.array([[9.]])
+        fixed = Mock(return_value=result)
+        einsum = Mock(side_effect=AssertionError('The observer must not substitute einsum for the fixed kernel'))
+        numerical = SimpleNamespace(einsum=einsum)
+        def geometry(*args, **kwargs):
+            return geo._vmec_boozer_fourier_projection(values, basis)
+        geo = SimpleNamespace(_solve_state_for_single_param=lambda *a, **kw: np.ones(1),
+            _build_neopax_geometry_from_state=geometry, _import_vmec_module=lambda _: SimpleNamespace(),
+            _vmec_boozer_fourier_projection=fixed,
+            build_ntx_runtime_scan_inputs_from_vmec_state=lambda *a, **kw: (a[2], ()))
+        api = SimpleNamespace(booz_xform_from_inputs=lambda **kw: {})
+        def runtime(_):
+            state = geo._solve_state_for_single_param(None, 0.)
+            g = geo._build_neopax_geometry_from_state(None, state)
+            geo.build_ntx_runtime_scan_inputs_from_vmec_state(None, state, g)
+        captured = check.trace_inputs({}, geo, api, runtime, lambda c: c, projection_module=numerical)
+        fixed.assert_called_once_with(values, basis)
+        einsum.assert_not_called()
+        self.assertIs(captured['02_projection_00_inputs']['values'], values)
+        self.assertIs(captured['03_projection_00_outputs'], result)
+        self.assertIs(geo._vmec_boozer_fourier_projection, fixed)
+        self.assertIs(numerical.einsum, einsum)
+
     def test_input_trace_observes_real_boundaries_and_restores_hooks(self):
         @dataclass
         class State:
