@@ -1021,9 +1021,66 @@ class SavedBaselineTests(unittest.TestCase):
                     self.assertEqual(rows[0]['max_abs'],1.)
         self.assertEqual(namespace['build_runtime_context'].call_count,2)
         namespace['_frozen_linearized_vmec_geometry_bundle'].assert_not_called()
+        # Retain the real failing guard, rather than declaring success after
+        # merely capturing a build. Neither outcome may reach transport.
+        @dataclasses.dataclass
+        class Geometry:
+            a_b: object
+        @dataclasses.dataclass
+        class Database:
+            D13: object
+        @dataclasses.dataclass
+        class State:
+            density: object
+            pressure: object
+            Er: object
+        runtime.geometry = Geometry(np.asarray(1.))
+        runtime.species = object()
+        neo.database = Database(np.ones(1))
+        state = State(np.asarray([1.]), np.asarray([2.]), np.asarray([3.]))
+        constructor = Mock(return_value=state)
+        namespace.update(jnp=np, dataclasses=dataclasses,
+            _profile_cfg_scalar_value=lambda *args:1.,
+            initial_state_for_parameter_vector=constructor,
+            _pack_transport_state_arrays=lambda state, species:(state.density,state.pressure,state.Er))
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            cfg_path = root/'input.toml'
+            cfg_path.write_text('[neoclassical]\nflux_model="ntx_scan_runtime"\n')
+            reference = root/'ad.npz'
+            expected = {"support['geometry'].a_b":np.asarray(1.),
+                        "support['database'].D13":np.ones(1)}
+            np.savez(reference, **expected, initial_y=np.asarray([1.,2.,3.]),
+                     final_y=np.asarray([1.,2.,3.]), final_time=np.asarray(0.))
+            for mismatch in (False,True):
+                neo.database.D13 = np.asarray([np.nextafter(1.,2.) if mismatch else 1.])
+                snapshot = root/f'live_{mismatch}.npz'
+                np.savez(snapshot, **dict(expected, **{"support['database'].D13":neo.database.D13}))
+                namespace['save_gradient_audit'].return_value = snapshot
+                out = root/str(mismatch)
+                argv = ['fd','--config',str(cfg_path),'--parameter','density_shape_alpha',
+                    '--ntx-scan-audit-dir',str(out),'--ntx-scan-audit-compiler-ir',
+                    '--ntx-scan-audit-until-reference','--ad-baseline-reference',str(reference),
+                    '--initial-Er-root-ad','jax_selected_root',
+                    '--initial-Er-root-fd-root-lane','frozen_linearized',
+                    '--replay-mode','accepted','--fd-accepted-replay-contract','reverse_frozen_metadata']
+                # The real capture context creates the directory on exit.
+                out.mkdir()
+                with patch.object(sys,'argv',argv), patch.dict(sys.modules,{
+                        'check_saved_ntx_point_repeatability':SimpleNamespace(capture_production_scans=capture),
+                        'check_saved_transport_baseline_repeatability':check}), \
+                     contextlib.redirect_stdout(io.StringIO()):
+                    if mismatch:
+                        with self.assertRaisesRegex(ValueError,'geometry/database arrays differ'):
+                            namespace['main']()
+                    else:
+                        self.assertIs(namespace['main'](),check.PRE_TRANSPORT_CAPTURE)
+                self.assertEqual(bool(json.loads((out/'ad_support_comparison.json').read_text())),mismatch)
+        self.assertEqual(constructor.call_count,2)
+        self.assertNotIn('jax',sys.modules)
         namespace['_schedule_rollout'].assert_not_called()
         self.assertEqual([options for _,options in capture_calls],
-                         [dict(reference=None,compiler_ir=True)]*2)
+                         [dict(reference=None,compiler_ir=True)]*4)
         self.assertEqual(active,[])
         self.assertEqual(_jax_before,'jax' in sys.modules)
 

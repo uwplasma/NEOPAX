@@ -1478,6 +1478,8 @@ def main() -> None:
         help="With --ntx-scan-audit-dir, compare surface 6 preparation against this saved NPZ.")
     parser.add_argument("--ntx-scan-audit-compiler-ir", action="store_true",
         help="With --ntx-scan-audit-dir, observe actual NTX preparation and scan compilations without another JIT.")
+    parser.add_argument("--ntx-scan-audit-until-reference", action="store_true",
+        help="Continue the scan capture through the original profile constructor and AD baseline-support guard, then stop before transport. Guard failures still propagate.")
     args = parser.parse_args()
     if args.geometry_fd_native_precision == "extended" and (
         args.parameter in PARAMETER_ORDER or args.geometry_fd_lane != "frozen_linearized"
@@ -1502,6 +1504,8 @@ def main() -> None:
         parser.error("--ntx-scan-audit-reference requires --ntx-scan-audit-dir and an existing NPZ")
     if args.ntx_scan_audit_compiler_ir and args.ntx_scan_audit_dir is None:
         parser.error("--ntx-scan-audit-compiler-ir requires --ntx-scan-audit-dir")
+    if args.ntx_scan_audit_until_reference and (args.ntx_scan_audit_dir is None or args.ad_baseline_reference is None):
+        parser.error("--ntx-scan-audit-until-reference requires --ntx-scan-audit-dir and --ad-baseline-reference")
     if args.ntx_scan_audit_dir is not None:
         if (args.geometry_input_only_dir is not None or args.baseline_only_dir is not None
             or args.initial_er_root_only_fd):
@@ -1617,9 +1621,10 @@ def main() -> None:
             print(f"[ntx-live] normalized geometry/database matches archived AD: {not rows}",flush=True)
             for row in rows:
                 print(f"[ntx-live] {row}",flush=True)
-        print(f"[ntx-live] baseline scan capture complete: {args.ntx_scan_audit_dir}; no transport/FD replay",flush=True)
         from check_saved_transport_baseline_repeatability import PRE_TRANSPORT_CAPTURE
-        return PRE_TRANSPORT_CAPTURE
+        if not args.ntx_scan_audit_until_reference:
+            print(f"[ntx-live] baseline scan capture complete: {args.ntx_scan_audit_dir}; no transport/FD replay",flush=True)
+            return PRE_TRANSPORT_CAPTURE
     if args.geometry_input_only_dir is not None:
         import os
         from unittest.mock import patch
@@ -1679,6 +1684,9 @@ def main() -> None:
               f"{np.max(np.abs(np.asarray(baseline_profile_state.Er)-er)):.16e}", flush=True)
         baseline_profile_state = dataclasses.replace(baseline_profile_state,
             Er=jnp.asarray(er, dtype=baseline_profile_state.Er.dtype))
+        if args.ntx_scan_audit_until_reference:
+            print("[ntx-live] original baseline-support guard passed; saved actual scan inputs/kernels; no transport/FD replay",flush=True)
+            return PRE_TRANSPORT_CAPTURE
 
     if root_only_fd:
         if initial_er_root_ad == "off":

@@ -1050,3 +1050,52 @@ not the direct geometry contribution. The
 record the evidence and a focused JVP/VJP check at two influential table
 nodes, using all 13 captured objective RHS rows. It changes no solver and
 runs no equilibrium, root, transport trajectory or FD perturbations.
+
+### Resume investigation of the failed NTSS1D baseline build
+
+The bootstrap gradient discrepancy and this baseline failure are separate.
+The user accepts an order-`1e-3` gradient discrepancy for this investigation
+and requested leaving LU correction out. No correction is enabled or used
+by this capture.
+
+A fresh NumPy-only inspection of the received archives confirms that all
+191 native-input/channel/geometry fields match between the successful n0
+build, failed density-alpha build, and later original-entry capture. Only
+three of the 19 stored database fields differ in the failed build. Normalizing
+the later actual raw D13 scans independently of either interpolator reproduces
+every successful D13 table entry exactly. All 1,232 failed D13 entries differ;
+the largest difference is `2.230284553617068e-5` at `(4,0,0)`.
+
+The conversion computes the same coefficient arrays before choosing the
+database class. `MonoenergeticRuntimeNTSS1D` inherits the constructor that
+stores those supplied arrays; its interpolation properties do not rewrite
+them. All profile parameters take the same original runtime constructor
+before the parameter-specific FD perturbation. These source checks identify
+no interpolation-specific arithmetic or density-alpha perturbation that
+could explain the failed unperturbed table.
+
+The production `_database.py`, `_transport_flux_models.py` and `_orchestrator.py`
+have no changes between failed-run commit `6cbe394` and successful-capture
+commit `4d04164`. The intervening benchmark changes add observations; they
+do not change the ordinary profile runtime constructor.
+
+The failed worker saved neither its prepared NTX fields nor its compiler
+program. The later capture reproduced the successful result. Comparisons
+between successful replays therefore cannot identify the failed operation,
+and the isolated LU correction result does not establish its cause.
+
+The optional `--ntx-scan-audit-until-reference` flag, together with the
+existing scan capture and AD reference arguments, continues through the
+original profile constructor and original baseline-support guard. The guard
+still rejects any array difference; an unchanged baseline returns the
+existing pre-transport marker only after that check. Actual preparation and
+scan programs, prepared arrays and raw coefficients are saved in either
+case. No additional coefficient replay, changed JIT arguments/options,
+equilibrium replacement, correction, tolerance change, time evolution,
+transport adjoint or perturbed endpoint is introduced.
+
+The 22 NumPy/mock/AST baseline tests pass. The CLI regression exercises both
+the matching case and a one-ULP coefficient mismatch through the real guard,
+verifying that both retain capture data and neither reaches time stepping.
+Reproducing the failed build with this capture on the large machine remains
+necessary before attributing it to preparation or a particular GPU kernel.
