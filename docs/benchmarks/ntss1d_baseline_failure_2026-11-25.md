@@ -109,3 +109,56 @@ copies, failure evidence, hook restoration and the original CLI prefix's
 stop before NTX. No correction or algebraic rewrite is activated by this
 diagnostic. It is required to distinguish a change in the Boozer transform
 inputs from a change inside the transform or its later interpolation.
+
+## Upstream capture result, 2026-11-26
+
+Archive `boozer_geometry_drift_0uRP9E.tar.gz` contains three independent
+geometry-only initializations at NEOPAX `781fa68`. Every one of the 23
+captured boundaries matches byte-for-byte across all three builds: the
+full equilibrium state, both VMEC-to-Boozer input bundles, 18 Fourier
+projections, and the two Boozer transforms' arguments and outputs. The
+six equilibrium-state arrays also match the archived AD compact state.
+All recorded loaded-source hashes agree between builds.
+
+The 297 captured compiler records align. Nine records differ in compiled
+backend text per build pair, including transpose-loop unroll choices and
+reduction dispatch. These differences produced identical captured results.
+Both Boozer mathematical programs match, and their cuBLASLt algorithm
+selections agree. Consequently these passing captures do not establish
+that the observed compiler differences cause the earlier geometry drift.
+They did not reproduce that drift.
+
+The exact installed Boozer API has SHA256
+`0ebfddebdcd4522cb2c08aa334e92397a79a719befb43dce6244be6a0190b3cb`.
+Its full transform uses ordinary Fourier matrix contractions, including
+cuBLASLt FP64 products in the captured program. The split magnetic-only
+projection in the source is a different path. Neither this source review
+nor three equal outputs proves or disproves nondeterminism in those
+products. The first operation responsible for the failed build remains
+unidentified; no correction is established.
+
+### Identical-input Boozer replay
+
+`check_saved_boozer_repeatability.py` takes one completed actual Boozer-call
+capture. Two fresh, sequential CUDA processes each call the original
+`booz_xform_from_inputs` API 20 times using the same restored argument
+objects. It retains the original input shapes, dtypes, static constants,
+surface indices, and weak array types. In particular, the captured angular
+grids are weakly typed; silently strengthening them would change the JIT
+signature. Byte/type checks run before the first transform, and recorded
+Boozer source hashes must match the loaded code.
+
+The replay saves first outputs, the first changed output if any, all
+output comparisons, and actual compiler programs. It requires exactly
+one compilation of `booz_xform_jax_impl` per worker. Within-worker changes
+would therefore be repeated-execution differences, not different input
+arrays or different JIT signatures. Between-process and archived-output
+comparisons are reported separately. A passing replay would narrow this
+control only; it would not invalidate the earlier failed initialization
+or establish AD/FD gradient accuracy.
+
+No extra outer JIT, compiler options, solver changes, equilibrium, NTX,
+root, transport, or derivative calculation is introduced. Local tests
+use NumPy and mocks only. Both real saved Boozer captures pass the local
+argument/schema preflight; CUDA repeatability remains to be tested on
+the large machine.
