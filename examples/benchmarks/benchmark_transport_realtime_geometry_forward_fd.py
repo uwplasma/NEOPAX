@@ -1472,6 +1472,8 @@ def main() -> None:
         help="Capture original geometry/scan inputs without intermediate observers, then stop before NTX, roots or transport.")
     parser.add_argument("--geometry-input-reference", type=Path,
         help="With --geometry-input-only-dir, compare against a saved normalization_inputs_*.npz trace.")
+    parser.add_argument("--geometry-input-compiler-ir", action="store_true",
+        help="With --geometry-input-only-dir, capture actual geometry/Boozer boundaries and compilations before NTX, roots or transport.")
     parser.add_argument("--ntx-scan-audit-dir", type=Path,
         help="Capture actual baseline NTX scan inputs/results and stop before transport/FD replay.")
     parser.add_argument("--ntx-scan-audit-reference", type=Path,
@@ -1500,6 +1502,8 @@ def main() -> None:
         parser.error("--ad-baseline-reference requires an existing AD snapshot and full-transport accepted reverse_frozen_metadata replay with a frozen_linearized initial root")
     if args.geometry_input_reference is not None and (args.geometry_input_only_dir is None or not args.geometry_input_reference.is_file()):
         parser.error("--geometry-input-reference requires --geometry-input-only-dir and an existing reference file")
+    if args.geometry_input_compiler_ir and args.geometry_input_only_dir is None:
+        parser.error("--geometry-input-compiler-ir requires --geometry-input-only-dir")
     if args.ntx_scan_audit_reference is not None and (args.ntx_scan_audit_dir is None or not args.ntx_scan_audit_reference.is_file()):
         parser.error("--ntx-scan-audit-reference requires --ntx-scan-audit-dir and an existing NPZ")
     if args.ntx_scan_audit_compiler_ir and args.ntx_scan_audit_dir is None:
@@ -1574,16 +1578,20 @@ def main() -> None:
     frozen_linearized_bundle = None
     captured = {}
     input_context = contextlib.nullcontext()
+    geometry_audit = contextlib.nullcontext()
     if args.geometry_input_only_dir is not None:
         from NEOPAX import _geometry_autodiff as geometry_module
         from check_generic_ntx_database_baselines import capture_scan_boundary
         input_context = capture_scan_boundary(geometry_module, captured)
+        if args.geometry_input_compiler_ir:
+            from check_saved_ntx_point_repeatability import capture_geometry_boundaries
+            geometry_audit = capture_geometry_boundaries(args.geometry_input_only_dir/'geometry', geometry_module)
     scan_audit = contextlib.nullcontext()
     if args.ntx_scan_audit_dir is not None:
         from check_saved_ntx_point_repeatability import capture_production_scans
         scan_audit = capture_production_scans(args.ntx_scan_audit_dir,
             reference=args.ntx_scan_audit_reference, compiler_ir=args.ntx_scan_audit_compiler_ir)
-    with input_context, scan_audit:
+    with input_context, geometry_audit, scan_audit:
         if parameter_is_profile or geometry_fd_lane != "frozen_linearized":
             baseline_runtime, baseline_state = build_runtime_context(config)
         else:
@@ -1639,7 +1647,8 @@ def main() -> None:
             print(f"[geometry-input] first_changed_stage={first_changed_stage(rows)} "
                   f"first_changed_bit_stage={first_changed_stage(rows, bitwise=True)}", flush=True)
         print(f"[geometry-input] saved original {parameter_name} inputs; no NTX, root or transport solve", flush=True)
-        return
+        from check_saved_transport_baseline_repeatability import PRE_TRANSPORT_CAPTURE
+        return PRE_TRANSPORT_CAPTURE
     profile_values = jnp.asarray(
         [_profile_cfg_scalar_value(profile_cfg, name) for name in PARAMETER_ORDER],
         dtype=jnp.float64,

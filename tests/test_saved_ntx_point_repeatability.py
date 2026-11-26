@@ -20,6 +20,80 @@ spec.loader.exec_module(replay)
 
 
 class PointReplayTests(unittest.TestCase):
+    def test_geometry_capture_keeps_actual_calls_and_saves_boundaries_after_failure(self):
+        active, calls = [], []
+        state = SimpleNamespace(R_cos=np.asarray([[1.,2.]]))
+        basis = np.eye(2)
+        tables = SimpleNamespace(bmnc=np.asarray([[3.,4.]]), nfp=2)
+        result = {'bmnc_b':np.asarray([[5.,6.]]), 'gmnc_b':np.asarray([[7.,8.]])}
+        geometry = SimpleNamespace(B0=np.asarray([5.]))
+        compiler = object()
+        api = SimpleNamespace()
+        geo = SimpleNamespace(_import_booz_xform_jax_api=lambda:api)
+        def project(values, actual_basis):
+            self.assertIs(values,state.R_cos)
+            self.assertIs(actual_basis,basis)
+            self.assertTrue(active[-1].endswith('_projection_compiler'))
+            calls.append('project')
+            return values@actual_basis
+        def inputs(**kwargs):
+            self.assertIs(kwargs['state'],state)
+            self.assertTrue(active[-1].endswith('_boozer_inputs_compiler'))
+            calls.append('inputs')
+            geo._vmec_boozer_fourier_projection(state.R_cos,basis)
+            return tables
+        def boozer(**kwargs):
+            self.assertIs(kwargs['inputs'],tables)
+            self.assertIs(kwargs['jit'],True)
+            self.assertTrue(active[-1].endswith('_boozer_compiler'))
+            calls.append('boozer')
+            return result
+        def build(context, actual_state, **kwargs):
+            self.assertIs(actual_state,state)
+            self.assertEqual(kwargs,{'n_r':51})
+            calls.append('geometry')
+            actual_tables = geo._booz_xform_inputs_from_state(state=state,static=context)
+            self.assertIs(api.booz_xform_from_inputs(inputs=actual_tables,jit=True),result)
+            return geometry
+        geo._build_neopax_geometry_from_state=build
+        geo._booz_xform_inputs_from_state=inputs
+        geo._vmec_boozer_fourier_projection=project
+        api.booz_xform_from_inputs=boozer
+        @replay.contextmanager
+        def ir(directory, actual_compiler):
+            self.assertIs(actual_compiler,compiler)
+            active.append(directory.name)
+            try:
+                yield
+            finally:
+                active.pop()
+        modules={'jax':SimpleNamespace(), 'jax._src':SimpleNamespace(compiler=compiler)}
+        with tempfile.TemporaryDirectory() as directory,patch.dict(sys.modules,modules), \
+             patch.object(sys,'path',[str(FILE.parent),*sys.path]), \
+             patch.object(replay,'capture_ntx_ir',side_effect=ir),redirect_stdout(io.StringIO()):
+            out=Path(directory)/'geometry'
+            with self.assertRaisesRegex(ValueError,'original guard failure'):
+                with replay.capture_geometry_boundaries(out,geo):
+                    self.assertIs(geo._build_neopax_geometry_from_state(object(),state,n_r=51),geometry)
+                    self.assertEqual(list(out.glob('*.npz')),[])
+                    raise ValueError('original guard failure')
+            manifest=json.loads((out/'boundaries.json').read_text())
+            self.assertEqual([r['stage'] for r in manifest],['geometry','boozer_inputs','projection','boozer'])
+            self.assertTrue(all(r['completed'] and r['fields'] for r in manifest))
+            with np.load(out/manifest[1]['file'],allow_pickle=False) as z:
+                np.testing.assert_array_equal(z['capture.state.R_cos'],state.R_cos)
+                np.testing.assert_array_equal(z['capture.outputs.bmnc'],tables.bmnc)
+            with np.load(out/manifest[3]['file'],allow_pickle=False) as z:
+                np.testing.assert_array_equal(z['capture.inputs.bmnc'],tables.bmnc)
+                np.testing.assert_array_equal(z['capture.outputs.bmnc_b'],result['bmnc_b'])
+            self.assertIs(geo._build_neopax_geometry_from_state,build)
+            self.assertIs(geo._booz_xform_inputs_from_state,inputs)
+            self.assertIs(geo._vmec_boozer_fourier_projection,project)
+            self.assertIs(api.booz_xform_from_inputs,boozer)
+        self.assertEqual(calls,['geometry','inputs','project','boozer'])
+        self.assertEqual(active,[])
+        self.assertNotIn('jax',sys.modules)
+
     def test_live_capture_keeps_original_arguments_results_and_restores_both_aliases_on_failure(self):
         tree=SimpleNamespace(tree_flatten_with_path=lambda x:([('.matrix',x.matrix)],None)
             if hasattr(x,'matrix') else ([('',x)],None), keystr=lambda path:path)

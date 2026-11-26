@@ -1084,6 +1084,66 @@ class SavedBaselineTests(unittest.TestCase):
         self.assertEqual(active,[])
         self.assertEqual(_jax_before,'jax' in sys.modules)
 
+    def test_original_profile_geometry_capture_stops_before_ntx_without_replacing_state(self):
+        source = SCRIPT.with_name('benchmark_transport_realtime_geometry_forward_fd.py')
+        main = next(n for n in ast.parse(source.read_text()).body
+                    if isinstance(n,ast.FunctionDef) and n.name == 'main')
+        config = {'geometry':{'backend':'vmec_jax_booz_xform_jax'},
+                  'neoclassical':{'flux_model':'ntx_scan_runtime'}}
+        state = SimpleNamespace(R_cos=np.asarray([[1.,2.]]))
+        geometry = SimpleNamespace(B0=np.asarray([3.]))
+        channels = SimpleNamespace(b00=np.asarray([4.]))
+        surfaces = (SimpleNamespace(b_cos=np.asarray([5.])),)
+        original = Mock(return_value=(channels,surfaces))
+        geo = SimpleNamespace(build_ntx_runtime_scan_inputs_from_vmec_state=original)
+        context, active = object(), []
+        @contextlib.contextmanager
+        def observer(folder, module):
+            self.assertIs(module,geo)
+            active.append(folder)
+            try:
+                yield
+            finally:
+                active.pop()
+        def build(cfg):
+            self.assertIs(cfg,config)
+            self.assertTrue(active)
+            geo.build_ntx_runtime_scan_inputs_from_vmec_state(context,state,geometry,
+                rho_scan=(.5,),surface_backend='vmec')
+            raise AssertionError('NTX construction reached')
+        namespace = dict(argparse=argparse,Path=Path,contextlib=contextlib,np=np,json=json,
+            DEFAULT_CONFIG=Path('unused.toml'),PARAMETER_ORDER=('density_shape_alpha',),
+            INITIAL_ER_ROOT_ONLY_EXPLICIT_OBJECTIVES=(),
+            _initial_er_root_ad_mode=lambda x:x,_prepare_benchmark_config=lambda **kwargs:config,
+            _execution_device_context=lambda cfg:contextlib.nullcontext(),
+            atexit=SimpleNamespace(register=Mock()),jax=SimpleNamespace(default_backend=lambda:'gpu'),
+            _baseline_profile_cfg=lambda cfg:{},build_runtime_context=Mock(side_effect=build),
+            _frozen_linearized_vmec_geometry_bundle=Mock(side_effect=AssertionError('geometry path replaced')),
+            _schedule_rollout=Mock(side_effect=AssertionError('transport reached')),save_gradient_audit=Mock())
+        exec(compile(ast.Module(body=[main],type_ignores=[]),str(source),'exec'),namespace)
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory)
+            cfg_path=root/'input.toml';cfg_path.write_text('[neoclassical]\nflux_model="ntx_scan_runtime"\n')
+            out=root/'capture'
+            namespace['save_gradient_audit'].return_value=out/'normalization_inputs_test.npz'
+            modules={'NEOPAX':SimpleNamespace(_geometry_autodiff=geo),
+                     'check_saved_ntx_point_repeatability':SimpleNamespace(capture_geometry_boundaries=observer),
+                     'check_saved_transport_baseline_repeatability':check}
+            with patch.object(sys,'argv',['fd','--config',str(cfg_path),'--parameter','density_shape_alpha',
+                    '--geometry-input-only-dir',str(out),'--geometry-input-compiler-ir']), \
+                 patch.object(sys,'path',[str(SCRIPT.parent),*sys.path]),patch.dict(sys.modules,modules), \
+                 contextlib.redirect_stdout(io.StringIO()):
+                self.assertIs(namespace['main'](),check.PRE_TRANSPORT_CAPTURE)
+            trace=namespace['save_gradient_audit'].call_args.kwargs['trace']
+            self.assertIs(trace['00_geometry_equilibrium']['R_cos'],state.R_cos)
+            self.assertIs(trace['01_geometry']['B0'],geometry.B0)
+            self.assertEqual((out/'config.toml').read_bytes(),cfg_path.read_bytes())
+        original.assert_called_once_with(context,state,geometry,rho_scan=(.5,),surface_backend='vmec')
+        namespace['_schedule_rollout'].assert_not_called()
+        namespace['_frozen_linearized_vmec_geometry_bundle'].assert_not_called()
+        self.assertEqual(active,[])
+        self.assertNotIn('jax',sys.modules)
+
     def test_original_fd_baseline_only_stops_after_unchanged_schedule_call(self):
         source = SCRIPT.with_name("benchmark_transport_realtime_geometry_forward_fd.py")
         main = next(node for node in ast.parse(source.read_text()).body

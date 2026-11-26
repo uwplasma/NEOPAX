@@ -132,6 +132,64 @@ def compare_preparations(results, out_dir, *, fail_on_difference=True):
 
 
 @contextmanager
+def capture_geometry_boundaries(directory, geometry_module):
+    """Observe the actual geometry/Boozer path; defer array copies until exit."""
+    from unittest.mock import patch
+    from check_generic_ntx_database_baselines import capture_tree
+    from check_saved_transport_baseline_repeatability import numeric_leaves
+    from jax._src import compiler
+
+    directory = Path(directory)
+    records = []
+    api = geometry_module._import_booz_xform_jax_api()
+    def observed(stage, original):
+        def call(*args, **kwargs):
+            if stage == 'geometry':
+                payload = dict(state=args[1], options=kwargs)
+            elif stage == 'projection':
+                payload = dict(values=args[0], basis=args[1])
+            elif stage == 'boozer_inputs':
+                payload = dict(state=kwargs['state'])
+            else:
+                payload = dict(kwargs)
+            index = len(records)
+            records.append((stage, payload))
+            # The geometry scope also observes input preparation and any
+            # interpolation after the transform. Nested scopes retain the
+            # actual compilations, never a newly lowered/replayed program.
+            with capture_ntx_ir(directory/f'{index:04d}_{stage}_compiler', compiler):
+                result = original(*args, **kwargs)
+            payload['outputs'] = result
+            return result
+        return call
+    try:
+        with ExitStack() as patches:
+            for owner, name, stage in (
+                (geometry_module, '_build_neopax_geometry_from_state', 'geometry'),
+                (geometry_module, '_booz_xform_inputs_from_state', 'boozer_inputs'),
+                (geometry_module, '_vmec_boozer_fourier_projection', 'projection'),
+                (api, 'booz_xform_from_inputs', 'boozer'),
+            ):
+                patches.enter_context(patch.object(owner, name, observed(stage, getattr(owner, name))))
+            yield
+    finally:
+        directory.mkdir(parents=True, exist_ok=True)
+        manifest = []
+        for index, (stage, payload) in enumerate(records):
+            stem = f'{index:04d}_{stage}'
+            arrays = numeric_leaves(capture_tree(payload), 'capture')
+            np.savez_compressed(directory/f'{stem}.npz', **arrays)
+            manifest.append(dict(stage=stage, file=stem+'.npz', fields=len(arrays), completed='outputs' in payload))
+        (directory/'boundaries.json').write_text(json.dumps(manifest, indent=2))
+        sources = {name: dict(path=module.__file__, sha256=hashlib.sha256(Path(module.__file__).read_bytes()).hexdigest())
+            for name, module in tuple(sys.modules.items())
+            if name.startswith(('NEOPAX.', 'vmex.', 'booz_xform_jax.', 'solvax.'))
+            and getattr(module, '__file__', None) and Path(module.__file__).suffix == '.py'}
+        (directory/'loaded_sources.json').write_text(json.dumps(sources, indent=2))
+        print(f'[geometry-live] saved {len(records)} actual geometry/projection/Boozer boundaries in {directory}; no replay', flush=True)
+
+
+@contextmanager
 def capture_production_scans(directory, *, reference=None, point=(6,0,7), compiler_ir=False):
     """Retain actual serial-scan arguments/results; copy only after the build.
 
@@ -173,6 +231,9 @@ def capture_production_scans(directory, *, reference=None, point=(6,0,7), compil
     try:
         with ExitStack() as patches:
             if compiler_ir:
+                geometry_module = sys.modules.get('NEOPAX._geometry_autodiff')
+                if geometry_module is not None:
+                    patches.enter_context(capture_geometry_boundaries(Path(directory)/'geometry', geometry_module))
                 for owner in ('ntx', 'ntx._solver_scan', 'ntx._neopax_ad'):
                     module = importlib.import_module(owner)
                     patches.enter_context(patch.object(module, 'prepare_monoenergetic_system',
@@ -215,7 +276,7 @@ def capture_production_scans(directory, *, reference=None, point=(6,0,7), compil
         print(f'[ntx-live] captured {len(records)} actual scan calls; no scan replay',flush=True)
         sources = {name: dict(path=module.__file__, sha256=hashlib.sha256(Path(module.__file__).read_bytes()).hexdigest())
             for name, module in tuple(sys.modules.items())
-            if name.startswith(('ntx.', 'solvax.', 'NEOPAX.')) and getattr(module, '__file__', None)
+            if name.startswith(('ntx.', 'solvax.', 'NEOPAX.', 'booz_xform_jax.')) and getattr(module, '__file__', None)
             and Path(module.__file__).suffix == '.py'}
         (directory/'loaded_sources.json').write_text(json.dumps(sources, indent=2))
 
